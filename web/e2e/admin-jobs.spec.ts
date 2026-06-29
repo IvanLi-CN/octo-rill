@@ -1934,15 +1934,15 @@ test("admin can manage jobs center", async ({ page }) => {
 		page.getByText("octo/private-repo · attempt 1 · terminal"),
 	).toBeVisible();
 	await expect(
-		page.getByRole("button", { name: "配置订阅同步 worker 数量" }),
+		page.getByRole("button", { name: "配置订阅同步设置" }),
 	).toBeVisible();
-	await page.getByRole("button", { name: "配置订阅同步 worker 数量" }).click();
+	await page.getByRole("button", { name: "配置订阅同步设置" }).click();
 	const syncSettingsDialog = page.getByRole("dialog", {
 		name: "订阅同步设置",
 	});
 	await expect(syncSettingsDialog).toBeVisible();
 	await expect(
-		syncSettingsDialog.getByRole("slider", { name: "Release worker 数量" }),
+		syncSettingsDialog.getByRole("slider", { name: "Release 抓取并发" }),
 	).toBeVisible();
 	await expect(
 		syncSettingsDialog.getByText("task-subscriptions-skipped"),
@@ -1951,6 +1951,10 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(syncSettingsDialog).toHaveCount(0);
 	await page.getByRole("button", { name: "返回订阅同步列表" }).click();
 	await expect(page).toHaveURL(/\/admin\/jobs\/subscriptions$/);
+	await expect(
+		page.getByRole("heading", { name: "订阅同步工作流详情" }),
+	).toHaveCount(0);
+	await expect(page.getByRole("heading", { name: "订阅同步" })).toBeVisible();
 
 	await llmTab.click();
 	await expect(page).toHaveURL(/\/admin\/jobs\/llm$/);

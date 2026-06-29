@@ -67,6 +67,8 @@ const NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE: usize = 100;
 const STARRED_RECENT_WINDOW_SIZE: usize = 50;
 const STARRED_WATERMARK_KEY: &str = "starred_sync_watermark";
 const STARRED_FULL_SYNC_KEY: &str = "starred_full_sync_at";
+const REPO_REFRESH_SYSTEM_WINDOW_MINUTES: i64 = 10;
+const REPO_REFRESH_URGENCY_CAP: f64 = 4.0;
 
 static REPO_RELEASE_CLAIM_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -308,12 +310,19 @@ struct ReleaseVisibleRepoAggregationRow {
     repo_id: i64,
     full_name: String,
     is_private: i64,
+    relation_count: i64,
 }
 
 #[derive(Debug, sqlx::FromRow)]
 struct EligibleUserRow {
     id: String,
     last_active_at: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct EligibleUserRepoTotalRow {
+    user_id: String,
+    repo_total: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -484,6 +493,7 @@ struct StarredEdge {
 struct OwnedRepoNode {
     database_id: Option<i64>,
     name_with_owner: String,
+    stargazer_count: Option<i64>,
     open_graph_image_url: Option<String>,
     uses_custom_open_graph_image: Option<bool>,
     owner: RepoOwner,
@@ -504,6 +514,7 @@ struct RepoNode {
     description: Option<String>,
     url: String,
     is_private: bool,
+    stargazer_count: Option<i64>,
     open_graph_image_url: Option<String>,
     uses_custom_open_graph_image: Option<bool>,
     owner: RepoOwner,
@@ -532,6 +543,7 @@ struct StarredRepoSnapshot {
     html_url: String,
     stargazed_at: String,
     is_private: bool,
+    repo_stargazer_count: Option<i64>,
     owner_avatar_url: Option<String>,
     open_graph_image_url: Option<String>,
     uses_custom_open_graph_image: bool,
@@ -549,6 +561,7 @@ struct GitHubActor {
 struct OwnedRepoSnapshot {
     repo_id: i64,
     full_name: String,
+    repo_stargazer_count: Option<i64>,
     owner_avatar_url: Option<String>,
     open_graph_image_url: Option<String>,
     uses_custom_open_graph_image: bool,
@@ -707,15 +720,6 @@ struct ExistingRepoReleaseRow {
     react_eyes: i64,
 }
 
-#[derive(Debug, Deserialize)]
-struct GitHubPublicRepo {
-    id: i64,
-    full_name: String,
-    name: String,
-    owner: RepoOwner,
-    private: bool,
-}
-
 #[derive(Debug, Clone)]
 struct DiscussionAnnouncementRepo {
     repo_id: i64,
@@ -762,6 +766,7 @@ struct NotificationRepo {
 struct RelatedUserRef {
     user_id: String,
     last_active_at: Option<String>,
+    relation_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -770,6 +775,23 @@ struct AggregatedRepo {
     full_name: String,
     is_private: bool,
     related_users: Vec<RelatedUserRef>,
+}
+
+#[derive(Debug, Clone)]
+struct RepoRefreshCandidate {
+    repo_id: i64,
+    full_name: String,
+    is_private: bool,
+    watcher_user_count: usize,
+    watcher_repo_total_sum: usize,
+    cached_stargazer_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct RepoRefreshSelectionRow {
+    repo_id: i64,
+    repo_full_name: String,
+    urgency_score: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -2227,12 +2249,41 @@ async fn load_user_release_visible_repo_aggregation_rows(
 ) -> Result<Vec<ReleaseVisibleRepoAggregationRow>> {
     sqlx::query_as::<_, ReleaseVisibleRepoAggregationRow>(
         r#"
-        SELECT repo_id, full_name, is_private
-        FROM user_release_visible_repos
-        WHERE user_id = ?
+        WITH effective_pool AS (
+          SELECT
+            sr.repo_id,
+            sr.full_name,
+            sr.is_private,
+            1 AS relation_count
+          FROM starred_repos sr
+          JOIN users u
+            ON u.id = sr.user_id
+          WHERE sr.user_id = ?
+            AND u.is_disabled = 0
+          UNION ALL
+          SELECT
+            ob.repo_id,
+            ob.repo_full_name AS full_name,
+            0 AS is_private,
+            1 AS relation_count
+          FROM owned_repo_star_baselines ob
+          JOIN users u
+            ON u.id = ob.user_id
+          WHERE ob.user_id = ?
+            AND u.is_disabled = 0
+            AND u.include_own_releases != 0
+        )
+        SELECT
+          repo_id,
+          full_name,
+          MAX(is_private) AS is_private,
+          SUM(relation_count) AS relation_count
+        FROM effective_pool
+        GROUP BY repo_id, full_name
         ORDER BY full_name ASC, repo_id ASC
         "#,
     )
+    .bind(user_id)
     .bind(user_id)
     .fetch_all(&state.pool)
     .await
@@ -2732,6 +2783,8 @@ async fn upsert_owned_repo_star_baseline_tx(
           user_id,
           repo_id,
           repo_full_name,
+          repo_stargazer_count,
+          repo_stargazer_count_updated_at,
           owner_avatar_url,
           open_graph_image_url,
           uses_custom_open_graph_image,
@@ -2739,9 +2792,11 @@ async fn upsert_owned_repo_star_baseline_tx(
           initialized_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, repo_id) DO UPDATE
         SET repo_full_name = excluded.repo_full_name,
+            repo_stargazer_count = excluded.repo_stargazer_count,
+            repo_stargazer_count_updated_at = excluded.repo_stargazer_count_updated_at,
             owner_avatar_url = excluded.owner_avatar_url,
             open_graph_image_url = excluded.open_graph_image_url,
             uses_custom_open_graph_image = excluded.uses_custom_open_graph_image,
@@ -2753,6 +2808,8 @@ async fn upsert_owned_repo_star_baseline_tx(
     .bind(user_id)
     .bind(repo.repo_id)
     .bind(repo.full_name.as_str())
+    .bind(repo.repo_stargazer_count)
+    .bind(repo.repo_stargazer_count.map(|_| now))
     .bind(repo.owner_avatar_url.as_deref())
     .bind(repo.open_graph_image_url.as_deref())
     .bind(repo.uses_custom_open_graph_image as i64)
@@ -4645,6 +4702,7 @@ fn aggregate_repos(users: &[StarPhaseSuccess]) -> Vec<AggregatedRepo> {
             entry.related_users.push(RelatedUserRef {
                 user_id: user.user_id.clone(),
                 last_active_at: user.last_active_at.clone(),
+                relation_count: 1,
             });
         }
     }
@@ -4690,38 +4748,9 @@ async fn aggregate_release_visible_repos(
             entry.related_users.push(RelatedUserRef {
                 user_id: user.user_id.clone(),
                 last_active_at: user.last_active_at.clone(),
+                relation_count: usize::try_from(repo.relation_count).unwrap_or(1).max(1),
             });
         }
-    }
-
-    if let Err(err) = refresh_public_release_usage_repo_metadata(context.state.as_ref()).await {
-        tracing::warn!(
-            ?err,
-            "sync.subscriptions: refresh public repo release metadata failed"
-        );
-    }
-
-    let public_repos = sqlx::query_as::<_, ReleaseVisibleRepoAggregationRow>(
-        r#"
-        SELECT repo_id, full_name, 0 AS is_private
-        FROM public_repo_release_usage
-        WHERE repo_id IS NOT NULL
-          AND last_sync_status != 'inaccessible'
-        ORDER BY last_requested_at DESC, full_name ASC
-        "#,
-    )
-    .fetch_all(&context.state.pool)
-    .await
-    .context("failed to query public release usage repos for aggregation")?;
-    for repo in public_repos {
-        grouped
-            .entry(repo.repo_id)
-            .or_insert_with(|| AggregatedRepo {
-                repo_id: repo.repo_id,
-                full_name: repo.full_name,
-                is_private: false,
-                related_users: Vec::new(),
-            });
     }
 
     let mut repos = grouped.into_values().collect::<Vec<_>>();
@@ -4729,18 +4758,681 @@ async fn aggregate_release_visible_repos(
     Ok(repos)
 }
 
+fn build_repo_refresh_candidates(repos: &[AggregatedRepo]) -> Vec<RepoRefreshCandidate> {
+    repos
+        .iter()
+        .map(|repo| RepoRefreshCandidate {
+            repo_id: repo.repo_id,
+            full_name: repo.full_name.clone(),
+            is_private: repo.is_private,
+            watcher_user_count: repo.related_users.len(),
+            watcher_repo_total_sum: 0,
+            cached_stargazer_count: None,
+        })
+        .collect()
+}
+
+async fn load_effective_repo_totals_by_user(state: &AppState) -> Result<HashMap<String, usize>> {
+    let rows = sqlx::query_as::<_, EligibleUserRepoTotalRow>(
+        r#"
+        WITH repo_totals AS (
+          SELECT
+            repo_sources.user_id,
+            COUNT(DISTINCT repo_sources.repo_id) AS repo_total
+          FROM (
+            SELECT user_id, repo_id
+            FROM starred_repos
+            UNION ALL
+            SELECT ob.user_id, ob.repo_id
+            FROM owned_repo_star_baselines ob
+            JOIN users owned_users ON owned_users.id = ob.user_id
+            WHERE owned_users.is_disabled = 0
+              AND owned_users.include_own_releases != 0
+          ) repo_sources
+          GROUP BY repo_sources.user_id
+        )
+        SELECT users.id AS user_id, COALESCE(repo_totals.repo_total, 0) AS repo_total
+        FROM users
+        LEFT JOIN repo_totals ON repo_totals.user_id = users.id
+        WHERE users.is_disabled = 0
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to load effective repo totals by user")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.user_id,
+                usize::try_from(row.repo_total).unwrap_or_default(),
+            )
+        })
+        .collect())
+}
+
+async fn hydrate_repo_refresh_candidates(
+    state: &AppState,
+    repos: &[AggregatedRepo],
+) -> Result<Vec<RepoRefreshCandidate>> {
+    let user_repo_totals = load_effective_repo_totals_by_user(state).await?;
+    let mut candidates = build_repo_refresh_candidates(repos);
+
+    for candidate in &mut candidates {
+        if let Some(repo) = repos.iter().find(|repo| repo.repo_id == candidate.repo_id) {
+            candidate.watcher_repo_total_sum = repo
+                .related_users
+                .iter()
+                .map(|user| {
+                    user_repo_totals
+                        .get(&user.user_id)
+                        .copied()
+                        .unwrap_or_default()
+                        .saturating_mul(user.relation_count)
+                })
+                .sum();
+        }
+    }
+
+    let mut known_stargazers = HashMap::<i64, (Option<i64>, Option<String>)>::new();
+    let starred_rows = sqlx::query(
+        r#"
+        SELECT repo_id, repo_stargazer_count, repo_stargazer_count_updated_at
+        FROM starred_repos
+        WHERE repo_stargazer_count IS NOT NULL
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to load starred repo stargazer cache")?;
+    for row in starred_rows {
+        let repo_id: i64 = row.get("repo_id");
+        let count: Option<i64> = row.get("repo_stargazer_count");
+        let updated_at: Option<String> = row.get("repo_stargazer_count_updated_at");
+        match known_stargazers.get(&repo_id) {
+            Some((_, current_updated_at))
+                if current_updated_at.as_deref().unwrap_or_default()
+                    >= updated_at.as_deref().unwrap_or_default() => {}
+            _ => {
+                known_stargazers.insert(repo_id, (count, updated_at));
+            }
+        }
+    }
+
+    let owned_rows = sqlx::query(
+        r#"
+        SELECT repo_id, repo_stargazer_count, repo_stargazer_count_updated_at
+        FROM owned_repo_star_baselines
+        WHERE repo_stargazer_count IS NOT NULL
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to load owned repo stargazer cache")?;
+    for row in owned_rows {
+        let repo_id: i64 = row.get("repo_id");
+        let count: Option<i64> = row.get("repo_stargazer_count");
+        let updated_at: Option<String> = row.get("repo_stargazer_count_updated_at");
+        match known_stargazers.get(&repo_id) {
+            Some((_, current_updated_at))
+                if current_updated_at.as_deref().unwrap_or_default()
+                    >= updated_at.as_deref().unwrap_or_default() => {}
+            _ => {
+                known_stargazers.insert(repo_id, (count, updated_at));
+            }
+        }
+    }
+
+    for candidate in &mut candidates {
+        candidate.cached_stargazer_count = known_stargazers
+            .get(&candidate.repo_id)
+            .and_then(|(count, _)| *count);
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .watcher_user_count
+            .cmp(&left.watcher_user_count)
+            .then_with(|| {
+                left.watcher_repo_total_sum
+                    .cmp(&right.watcher_repo_total_sum)
+            })
+            .then_with(
+                || match (left.cached_stargazer_count, right.cached_stargazer_count) {
+                    (Some(left_value), Some(right_value)) => right_value.cmp(&left_value),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => Ordering::Equal,
+                },
+            )
+            .then_with(|| left.full_name.cmp(&right.full_name))
+            .then_with(|| left.repo_id.cmp(&right.repo_id))
+    });
+
+    Ok(candidates)
+}
+
+fn current_repo_refresh_window_index(now: DateTime<Utc>) -> i64 {
+    now.timestamp()
+        .div_euclid(REPO_REFRESH_SYSTEM_WINDOW_MINUTES * 60)
+}
+
+async fn rebuild_repo_refresh_governance_snapshots(
+    state: &AppState,
+    candidates: &[RepoRefreshCandidate],
+    budget_per_window: i64,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let now_rfc3339 = now.to_rfc3339();
+    let budget = admin_runtime::normalize_repo_refresh_system_budget_per_window(budget_per_window);
+    let now_window_index = current_repo_refresh_window_index(now);
+
+    state
+        .sqlite_writer
+        .write("repo_refresh_governance_rebuild", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin repo refresh governance rebuild tx")?;
+
+            let candidate_repo_ids = candidates.iter().map(|candidate| candidate.repo_id).collect::<Vec<_>>();
+            if !candidate_repo_ids.is_empty() {
+                let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "DELETE FROM repo_refresh_governance_snapshots WHERE repo_id NOT IN (",
+                );
+                {
+                    let mut separated = builder.separated(", ");
+                    for repo_id in &candidate_repo_ids {
+                        separated.push_bind(repo_id);
+                    }
+                }
+                builder.push(")");
+                builder
+                    .build()
+                    .execute(&mut *tx)
+                    .await
+                    .context("delete stale repo refresh governance snapshots")?;
+            } else {
+                sqlx::query("DELETE FROM repo_refresh_governance_snapshots")
+                    .execute(&mut *tx)
+                    .await
+                    .context("clear repo refresh governance snapshots")?;
+            }
+
+            for (index, candidate) in candidates.iter().enumerate() {
+                let priority_rank = i64::try_from(index + 1).unwrap_or(i64::MAX);
+                let target_window = ((priority_rank - 1) / budget) + 1;
+                let target_interval_minutes = target_window * REPO_REFRESH_SYSTEM_WINDOW_MINUTES;
+                let target_interval_minutes_real = (target_interval_minutes.max(1)) as f64;
+
+                sqlx::query(
+                    r#"
+                    INSERT INTO repo_refresh_governance_snapshots (
+                      repo_id,
+                      repo_full_name,
+                      is_private,
+                      watcher_user_count,
+                      watcher_repo_total_sum,
+                      cached_stargazer_count,
+                      cached_stargazer_count_updated_at,
+                      priority_rank,
+                      target_window,
+                      target_interval_minutes,
+                      urgency_score,
+                      urgency_bucket,
+                      updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, (
+                      SELECT MAX(updated_at_source) FROM (
+                        SELECT MAX(repo_stargazer_count_updated_at) AS updated_at_source
+                        FROM starred_repos
+                        WHERE repo_id = ?
+                        UNION ALL
+                        SELECT MAX(repo_stargazer_count_updated_at) AS updated_at_source
+                        FROM owned_repo_star_baselines
+                        WHERE repo_id = ?
+                      )
+                    ), ?, ?, ?,
+                    CASE
+                      WHEN (
+                        SELECT existing.system_last_success_at
+                        FROM repo_refresh_governance_snapshots existing
+                        WHERE existing.repo_id = ?
+                      ) IS NULL THEN ?
+                      ELSE MIN(
+                        ?,
+                        CAST(
+                          (julianday(?) - julianday((
+                            SELECT existing.system_last_success_at
+                            FROM repo_refresh_governance_snapshots existing
+                            WHERE existing.repo_id = ?
+                          ))) * 24.0 * 60.0
+                          / ?
+                        AS REAL)
+                      )
+                    END,
+                    CASE
+                      WHEN (
+                        SELECT existing.system_last_success_at
+                        FROM repo_refresh_governance_snapshots existing
+                        WHERE existing.repo_id = ?
+                      ) IS NULL THEN 'critical'
+                      WHEN MIN(
+                        ?,
+                        CAST(
+                          (julianday(?) - julianday((
+                            SELECT existing.system_last_success_at
+                            FROM repo_refresh_governance_snapshots existing
+                            WHERE existing.repo_id = ?
+                          ))) * 24.0 * 60.0
+                          / ?
+                        AS REAL)
+                      ) >= ? THEN 'critical'
+                      WHEN MIN(
+                        ?,
+                        CAST(
+                          (julianday(?) - julianday((
+                            SELECT existing.system_last_success_at
+                            FROM repo_refresh_governance_snapshots existing
+                            WHERE existing.repo_id = ?
+                          ))) * 24.0 * 60.0
+                          / ?
+                        AS REAL)
+                      ) >= ? THEN 'due'
+                      ELSE 'active'
+                    END,
+                    ?)
+                    ON CONFLICT(repo_id) DO UPDATE SET
+                      repo_full_name = excluded.repo_full_name,
+                      is_private = excluded.is_private,
+                      watcher_user_count = excluded.watcher_user_count,
+                      watcher_repo_total_sum = excluded.watcher_repo_total_sum,
+                      cached_stargazer_count = excluded.cached_stargazer_count,
+                      cached_stargazer_count_updated_at = excluded.cached_stargazer_count_updated_at,
+                      priority_rank = excluded.priority_rank,
+                      target_window = excluded.target_window,
+                      target_interval_minutes = excluded.target_interval_minutes,
+                      urgency_score = excluded.urgency_score,
+                      urgency_bucket = excluded.urgency_bucket,
+                      updated_at = excluded.updated_at
+                    "#,
+                )
+                .bind(candidate.repo_id)
+                .bind(candidate.full_name.as_str())
+                .bind(candidate.is_private as i64)
+                .bind(i64::try_from(candidate.watcher_user_count).unwrap_or(i64::MAX))
+                .bind(i64::try_from(candidate.watcher_repo_total_sum).unwrap_or(i64::MAX))
+                .bind(candidate.cached_stargazer_count)
+                .bind(candidate.repo_id)
+                .bind(candidate.repo_id)
+                .bind(priority_rank)
+                .bind(target_window)
+                .bind(target_interval_minutes)
+                .bind(candidate.repo_id)
+                .bind(REPO_REFRESH_URGENCY_CAP)
+                .bind(REPO_REFRESH_URGENCY_CAP)
+                .bind(now_rfc3339.as_str())
+                .bind(candidate.repo_id)
+                .bind(target_interval_minutes_real)
+                .bind(candidate.repo_id)
+                .bind(REPO_REFRESH_URGENCY_CAP)
+                .bind(now_rfc3339.as_str())
+                .bind(candidate.repo_id)
+                .bind(target_interval_minutes_real)
+                .bind(REPO_REFRESH_URGENCY_CAP)
+                .bind(REPO_REFRESH_URGENCY_CAP)
+                .bind(now_rfc3339.as_str())
+                .bind(candidate.repo_id)
+                .bind(target_interval_minutes_real)
+                .bind(2.0_f64)
+                .bind(now_rfc3339.as_str())
+                .execute(&mut *tx)
+                .await
+                .with_context(|| {
+                    format!(
+                        "upsert repo refresh governance snapshot for {}",
+                        candidate.full_name
+                    )
+                })?;
+            }
+
+            sqlx::query(
+                r#"
+                UPDATE repo_refresh_governance_cycles
+                SET
+                  completed_repo_count = (
+                    SELECT COUNT(*)
+                    FROM repo_refresh_governance_cycle_members members
+                    LEFT JOIN repo_refresh_governance_snapshots snapshots
+                      ON snapshots.repo_id = members.repo_id
+                    WHERE members.cycle_id = repo_refresh_governance_cycles.id
+                      AND (
+                        members.completed_at IS NOT NULL
+                        OR snapshots.repo_id IS NULL
+                        OR snapshots.active_cycle_id IS NULL
+                        OR snapshots.active_cycle_id != repo_refresh_governance_cycles.id
+                      )
+                  ),
+                  status = CASE
+                    WHEN frozen_repo_count = (
+                      SELECT COUNT(*)
+                      FROM repo_refresh_governance_cycle_members members
+                      LEFT JOIN repo_refresh_governance_snapshots snapshots
+                        ON snapshots.repo_id = members.repo_id
+                      WHERE members.cycle_id = repo_refresh_governance_cycles.id
+                        AND (
+                          members.completed_at IS NOT NULL
+                          OR snapshots.repo_id IS NULL
+                          OR snapshots.active_cycle_id IS NULL
+                          OR snapshots.active_cycle_id != repo_refresh_governance_cycles.id
+                        )
+                    ) THEN 'completed'
+                    ELSE status
+                  END,
+                  window_index_completed_at = CASE
+                    WHEN frozen_repo_count = (
+                      SELECT COUNT(*)
+                      FROM repo_refresh_governance_cycle_members members
+                      LEFT JOIN repo_refresh_governance_snapshots snapshots
+                        ON snapshots.repo_id = members.repo_id
+                      WHERE members.cycle_id = repo_refresh_governance_cycles.id
+                        AND (
+                          members.completed_at IS NOT NULL
+                          OR snapshots.repo_id IS NULL
+                          OR snapshots.active_cycle_id IS NULL
+                          OR snapshots.active_cycle_id != repo_refresh_governance_cycles.id
+                        )
+                    ) THEN ?
+                    ELSE window_index_completed_at
+                  END,
+                  completed_at = CASE
+                    WHEN frozen_repo_count = (
+                      SELECT COUNT(*)
+                      FROM repo_refresh_governance_cycle_members members
+                      LEFT JOIN repo_refresh_governance_snapshots snapshots
+                        ON snapshots.repo_id = members.repo_id
+                      WHERE members.cycle_id = repo_refresh_governance_cycles.id
+                        AND (
+                          members.completed_at IS NOT NULL
+                          OR snapshots.repo_id IS NULL
+                          OR snapshots.active_cycle_id IS NULL
+                          OR snapshots.active_cycle_id != repo_refresh_governance_cycles.id
+                        )
+                    ) THEN COALESCE(completed_at, ?)
+                    ELSE completed_at
+                  END,
+                  updated_at = ?
+                WHERE status = 'active'
+                "#,
+            )
+            .bind(now_window_index)
+            .bind(now_rfc3339.as_str())
+            .bind(now_rfc3339.as_str())
+            .execute(&mut *tx)
+            .await
+            .context("reconcile repo refresh governance cycles after pool rebuild")?;
+
+            tx.commit()
+                .await
+                .context("commit repo refresh governance rebuild tx")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+
+    Ok(())
+}
+
+async fn ensure_active_repo_refresh_cycle(
+    state: &AppState,
+    budget_per_window: i64,
+    now: DateTime<Utc>,
+) -> Result<String> {
+    let existing = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT id
+        FROM repo_refresh_governance_cycles
+        WHERE status = 'active'
+        ORDER BY started_at DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .context("failed to load active repo refresh cycle")?;
+
+    if let Some(existing) = existing {
+        return Ok(existing);
+    }
+
+    let cycle_id = local_id::generate_local_id();
+    let now_rfc3339 = now.to_rfc3339();
+    let frozen_repo_rows = sqlx::query_as::<_, RepoRefreshSelectionRow>(
+        r#"
+        SELECT repo_id, repo_full_name, target_interval_minutes, priority_rank, urgency_score
+        FROM repo_refresh_governance_snapshots
+        ORDER BY priority_rank ASC, repo_id ASC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to freeze repo refresh cycle members")?;
+
+    state
+        .sqlite_writer
+        .write("repo_refresh_cycle_create", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin repo refresh cycle create tx")?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO repo_refresh_governance_cycles (
+                  id,
+                  status,
+                  window_budget,
+                  frozen_repo_count,
+                  completed_repo_count,
+                  window_index_started_at,
+                  started_at,
+                  updated_at
+                )
+                VALUES (?, 'active', ?, ?, 0, ?, ?, ?)
+                "#,
+            )
+            .bind(cycle_id.as_str())
+            .bind(budget_per_window)
+            .bind(i64::try_from(frozen_repo_rows.len()).unwrap_or(i64::MAX))
+            .bind(current_repo_refresh_window_index(now))
+            .bind(now_rfc3339.as_str())
+            .bind(now_rfc3339.as_str())
+            .execute(&mut *tx)
+            .await
+            .context("insert repo refresh governance cycle")?;
+
+            for row in &frozen_repo_rows {
+                sqlx::query(
+                    r#"
+                    INSERT INTO repo_refresh_governance_cycle_members (
+                      cycle_id,
+                      repo_id,
+                      repo_full_name,
+                      updated_at
+                    )
+                    VALUES (?, ?, ?, ?)
+                    "#,
+                )
+                .bind(cycle_id.as_str())
+                .bind(row.repo_id)
+                .bind(row.repo_full_name.as_str())
+                .bind(now_rfc3339.as_str())
+                .execute(&mut *tx)
+                .await
+                .with_context(|| {
+                    format!(
+                        "insert repo refresh governance cycle member {}",
+                        row.repo_full_name
+                    )
+                })?;
+
+                sqlx::query(
+                    r#"
+                    UPDATE repo_refresh_governance_snapshots
+                    SET active_cycle_id = ?,
+                        active_cycle_window_index = NULL,
+                        active_cycle_completed = 0,
+                        updated_at = ?
+                    WHERE repo_id = ?
+                    "#,
+                )
+                .bind(cycle_id.as_str())
+                .bind(now_rfc3339.as_str())
+                .bind(row.repo_id)
+                .execute(&mut *tx)
+                .await
+                .context("tag repo refresh snapshot with active cycle")?;
+            }
+
+            tx.commit()
+                .await
+                .context("commit repo refresh cycle create tx")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+
+    Ok(cycle_id)
+}
+
+async fn select_budgeted_system_release_repos(
+    state: &AppState,
+    budget_per_window: i64,
+    now: DateTime<Utc>,
+) -> Result<Vec<ReleaseDemandRepo>> {
+    let cycle_id = ensure_active_repo_refresh_cycle(state, budget_per_window, now).await?;
+    let now_rfc3339 = now.to_rfc3339();
+    let now_window_index = current_repo_refresh_window_index(now);
+
+    let rows = sqlx::query_as::<_, RepoRefreshSelectionRow>(
+        r#"
+        SELECT
+          snapshots.repo_id,
+          snapshots.repo_full_name,
+          snapshots.target_interval_minutes,
+          snapshots.priority_rank,
+          CASE
+            WHEN snapshots.system_last_success_at IS NULL THEN ?
+            ELSE MIN(
+              ?,
+              CAST(
+                (julianday(?) - julianday(snapshots.system_last_success_at)) * 24.0 * 60.0
+                / CAST(MAX(snapshots.target_interval_minutes, 1) AS REAL)
+              AS REAL)
+            )
+          END AS urgency_score
+        FROM repo_refresh_governance_snapshots snapshots
+        JOIN repo_refresh_governance_cycle_members members
+          ON members.cycle_id = ?
+         AND members.repo_id = snapshots.repo_id
+        WHERE snapshots.active_cycle_id = ?
+          AND snapshots.active_cycle_completed = 0
+          AND members.completed_at IS NULL
+        ORDER BY
+          CASE WHEN snapshots.system_last_success_at IS NULL THEN 0 ELSE 1 END ASC,
+          urgency_score DESC,
+          snapshots.priority_rank ASC,
+          snapshots.repo_id ASC
+        LIMIT ?
+        "#,
+    )
+    .bind(REPO_REFRESH_URGENCY_CAP)
+    .bind(REPO_REFRESH_URGENCY_CAP)
+    .bind(now_rfc3339.as_str())
+    .bind(cycle_id.as_str())
+    .bind(cycle_id.as_str())
+    .bind(budget_per_window)
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to select budgeted system release repos")?;
+
+    state
+        .sqlite_writer
+        .write("repo_refresh_selection_mark", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin repo refresh selection mark tx")?;
+
+            for row in &rows {
+                let urgency_bucket = if row.urgency_score >= REPO_REFRESH_URGENCY_CAP {
+                    "critical"
+                } else if row.urgency_score >= 2.0 {
+                    "due"
+                } else {
+                    "active"
+                };
+                sqlx::query(
+                    r#"
+                    UPDATE repo_refresh_governance_snapshots
+                    SET system_last_selected_at = ?,
+                        urgency_score = ?,
+                        urgency_bucket = ?,
+                        active_cycle_window_index = ?,
+                        updated_at = ?
+                    WHERE repo_id = ?
+                    "#,
+                )
+                .bind(now_rfc3339.as_str())
+                .bind(row.urgency_score)
+                .bind(urgency_bucket)
+                .bind(now_window_index)
+                .bind(now_rfc3339.as_str())
+                .bind(row.repo_id)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| {
+                    format!("mark repo refresh selection for {}", row.repo_full_name)
+                })?;
+            }
+
+            tx.commit()
+                .await
+                .context("commit repo refresh selection mark tx")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ReleaseDemandRepo {
+            repo_id: row.repo_id,
+            full_name: row.repo_full_name,
+            is_new_repo: false,
+        })
+        .collect())
+}
+
 async fn run_release_phase(
     context: &SubscriptionRunContext,
     repos: Vec<AggregatedRepo>,
 ) -> Result<(SyncSubscriptionReleaseSummary, usize)> {
-    let demand_repos = repos
-        .iter()
-        .map(|repo| ReleaseDemandRepo {
-            repo_id: repo.repo_id,
-            full_name: repo.full_name.clone(),
-            is_new_repo: false,
-        })
-        .collect::<Vec<_>>();
+    let budget_per_window =
+        admin_runtime::load_repo_refresh_system_budget_per_window(&context.state.pool).await?;
+    let candidates = hydrate_repo_refresh_candidates(context.state.as_ref(), &repos).await?;
+    let now = Utc::now();
+    rebuild_repo_refresh_governance_snapshots(
+        context.state.as_ref(),
+        &candidates,
+        budget_per_window,
+        now,
+    )
+    .await?;
+    let demand_repos =
+        select_budgeted_system_release_repos(context.state.as_ref(), budget_per_window, now)
+            .await?;
     let attached = attach_release_demand(
         context.state.as_ref(),
         Some(context.task_id.as_str()),
@@ -4759,6 +5451,7 @@ async fn run_release_phase(
             "subscription release demand attached to shared repo queue",
             json!({
                 "repos": attached.repos,
+                "budget_per_window": budget_per_window,
                 "queued": attached.queued,
                 "reused_running": attached.reused_running,
                 "reused_fresh": attached.reused_fresh,
@@ -5501,6 +6194,8 @@ async fn process_repo_release_work_item(
             if updated > 0 {
                 mark_repo_release_watchers(state.as_ref(), &work_item.id, "succeeded", None, &now)
                     .await?;
+                record_repo_refresh_governance_success(state.as_ref(), &work_item.id, now.as_str())
+                    .await?;
             }
         }
         Err(err) => {
@@ -6114,6 +6809,184 @@ async fn mark_repo_release_watchers(
             Ok::<(), anyhow::Error>(())
         })
         .await?;
+    Ok(())
+}
+
+async fn record_repo_refresh_governance_success(
+    state: &AppState,
+    work_item_id: &str,
+    now_rfc3339: &str,
+) -> Result<()> {
+    state
+        .sqlite_writer
+        .write("repo_refresh_governance_success", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin repo refresh governance success tx")?;
+
+            let repo_row = sqlx::query(
+                r#"
+                SELECT repo_id, request_origin
+                FROM repo_release_work_items
+                WHERE id = ?
+                LIMIT 1
+                "#,
+            )
+            .bind(work_item_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .context("load repo release work item for governance success")?;
+
+            let Some(repo_row) = repo_row else {
+                tx.rollback().await.ok();
+                return Ok::<_, anyhow::Error>(());
+            };
+
+            let repo_id: i64 = repo_row.get("repo_id");
+            let request_origin: String = repo_row.get("request_origin");
+
+            sqlx::query(
+                r#"
+                UPDATE repo_refresh_governance_snapshots
+                SET actual_last_success_at = ?,
+                    actual_last_success_source = ?,
+                    system_last_success_at = CASE
+                      WHEN ? = 'system' THEN ?
+                      ELSE system_last_success_at
+                    END,
+                    updated_at = ?
+                WHERE repo_id = ?
+                "#,
+            )
+            .bind(now_rfc3339)
+            .bind(request_origin.as_str())
+            .bind(request_origin.as_str())
+            .bind(now_rfc3339)
+            .bind(now_rfc3339)
+            .bind(repo_id)
+            .execute(&mut *tx)
+            .await
+            .context("update repo refresh governance snapshot success state")?;
+
+            if request_origin == RepoReleaseOrigin::System.as_str() {
+                let active_cycle_id: Option<String> = sqlx::query_scalar(
+                    r#"
+                    SELECT active_cycle_id
+                    FROM repo_refresh_governance_snapshots
+                    WHERE repo_id = ?
+                    LIMIT 1
+                    "#,
+                )
+                .bind(repo_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .context("load repo refresh active cycle id")?
+                .flatten();
+
+                if let Some(active_cycle_id) = active_cycle_id {
+                    sqlx::query(
+                        r#"
+                        UPDATE repo_refresh_governance_cycle_members
+                        SET completed_at = COALESCE(completed_at, ?),
+                            updated_at = ?
+                        WHERE cycle_id = ? AND repo_id = ?
+                        "#,
+                    )
+                    .bind(now_rfc3339)
+                    .bind(now_rfc3339)
+                    .bind(active_cycle_id.as_str())
+                    .bind(repo_id)
+                    .execute(&mut *tx)
+                    .await
+                    .context("mark repo refresh cycle member completed")?;
+
+                    sqlx::query(
+                        r#"
+                        UPDATE repo_refresh_governance_snapshots
+                        SET active_cycle_completed = 1,
+                            updated_at = ?
+                        WHERE repo_id = ?
+                        "#,
+                    )
+                    .bind(now_rfc3339)
+                    .bind(repo_id)
+                    .execute(&mut *tx)
+                    .await
+                    .context("mark repo refresh snapshot cycle completion")?;
+
+                    let completed_repo_count: i64 = sqlx::query_scalar(
+                        r#"
+                        SELECT COUNT(*)
+                        FROM repo_refresh_governance_cycle_members
+                        WHERE cycle_id = ?
+                          AND completed_at IS NOT NULL
+                        "#,
+                    )
+                    .bind(active_cycle_id.as_str())
+                    .fetch_one(&mut *tx)
+                    .await
+                    .context("count completed repo refresh cycle members")?;
+                    let frozen_repo_count: i64 = sqlx::query_scalar(
+                        r#"
+                        SELECT frozen_repo_count
+                        FROM repo_refresh_governance_cycles
+                        WHERE id = ?
+                        LIMIT 1
+                        "#,
+                    )
+                    .bind(active_cycle_id.as_str())
+                    .fetch_one(&mut *tx)
+                    .await
+                    .context("load repo refresh cycle frozen repo count")?;
+
+                    if completed_repo_count >= frozen_repo_count {
+                        sqlx::query(
+                            r#"
+                            UPDATE repo_refresh_governance_cycles
+                            SET status = 'completed',
+                                completed_repo_count = ?,
+                                window_index_completed_at = ?,
+                                completed_at = ?,
+                                updated_at = ?
+                            WHERE id = ?
+                            "#,
+                        )
+                        .bind(completed_repo_count)
+                        .bind(current_repo_refresh_window_index(Utc::now()))
+                        .bind(now_rfc3339)
+                        .bind(now_rfc3339)
+                        .bind(active_cycle_id.as_str())
+                        .execute(&mut *tx)
+                        .await
+                        .context("complete repo refresh governance cycle")?;
+                    } else {
+                        sqlx::query(
+                            r#"
+                            UPDATE repo_refresh_governance_cycles
+                            SET completed_repo_count = ?,
+                                updated_at = ?
+                            WHERE id = ?
+                            "#,
+                        )
+                        .bind(completed_repo_count)
+                        .bind(now_rfc3339)
+                        .bind(active_cycle_id.as_str())
+                        .execute(&mut *tx)
+                        .await
+                        .context("update repo refresh governance cycle progress")?;
+                    }
+                }
+            }
+
+            tx.commit()
+                .await
+                .context("commit repo refresh governance success tx")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+
     Ok(())
 }
 
@@ -6848,165 +7721,6 @@ async fn fetch_github_rest_page<T: DeserializeOwned>(
     .await
 }
 
-async fn fetch_github_public_rest<T: DeserializeOwned>(
-    state: &AppState,
-    url: &str,
-    operation: &str,
-) -> Result<T, SyncRequestError> {
-    with_subscription_timeout(operation, async {
-        let response = state
-            .github_rest_http
-            .get(url)
-            .header(USER_AGENT, "OctoRill")
-            .header(ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", API_VERSION)
-            .send()
-            .await
-            .map_err(|err| classify_reqwest_error(operation, err))?;
-
-        fetch_json_response::<T>(response, operation).await
-    })
-    .await
-}
-
-async fn refresh_public_release_usage_repo_metadata(state: &AppState) -> Result<()> {
-    #[derive(Debug, sqlx::FromRow)]
-    struct PendingPublicRepoRow {
-        owner_login: String,
-        repo_name: String,
-        full_name: String,
-    }
-
-    let pending = sqlx::query_as::<_, PendingPublicRepoRow>(
-        r#"
-        SELECT owner_login, repo_name, full_name
-        FROM public_repo_release_usage
-        WHERE repo_id IS NULL
-          AND last_sync_status != 'inaccessible'
-        ORDER BY last_requested_at DESC, created_at ASC
-        LIMIT 100
-        "#,
-    )
-    .fetch_all(&state.pool)
-    .await
-    .context("failed to query pending public release repos")?;
-
-    for repo in pending {
-        let now = Utc::now().to_rfc3339();
-        let url = github_rest_url_anyhow(
-            state,
-            format!(
-                "repos/{}/{}",
-                urlencoding::encode(repo.owner_login.as_str()),
-                urlencoding::encode(repo.repo_name.as_str())
-            )
-            .as_str(),
-        )?;
-        let operation = format!("sync public repo metadata {}", repo.full_name);
-        match fetch_github_public_rest::<GitHubPublicRepo>(state, &url, operation.as_str()).await {
-            Ok(public_repo) if !public_repo.private => {
-                let full_name_lower = public_repo.full_name.to_ascii_lowercase();
-                let owner_login = public_repo.owner.login;
-                state
-                    .sqlite_writer
-                    .write("public_repo_release_usage_metadata_ready", |_| async {
-                        sqlx::query(
-                            r#"
-                            UPDATE public_repo_release_usage
-                            SET repo_id = ?,
-                                owner_login = ?,
-                                repo_name = ?,
-                                full_name = ?,
-                                full_name_lower = ?,
-                                last_sync_status = 'pending',
-                                last_sync_error = NULL,
-                                updated_at = ?
-                            WHERE lower(full_name) = lower(?)
-                            "#,
-                        )
-                        .bind(public_repo.id)
-                        .bind(owner_login.as_str())
-                        .bind(public_repo.name.as_str())
-                        .bind(public_repo.full_name.as_str())
-                        .bind(full_name_lower.as_str())
-                        .bind(now.as_str())
-                        .bind(repo.full_name.as_str())
-                        .execute(&state.pool)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to update public repo metadata for {}",
-                                repo.full_name
-                            )
-                        })?;
-                        Ok::<_, anyhow::Error>(())
-                    })
-                    .await?;
-            }
-            Ok(_) => {
-                state
-                    .sqlite_writer
-                    .write("public_repo_release_usage_metadata_private", |_| async {
-                        sqlx::query(
-                            r#"
-                            UPDATE public_repo_release_usage
-                            SET last_sync_status = 'inaccessible',
-                                last_sync_error = 'repository is private',
-                                updated_at = ?
-                            WHERE lower(full_name) = lower(?)
-                            "#,
-                        )
-                        .bind(now.as_str())
-                        .bind(repo.full_name.as_str())
-                        .execute(&state.pool)
-                        .await
-                        .with_context(|| {
-                            format!("failed to mark private public repo {}", repo.full_name)
-                        })?;
-                        Ok::<_, anyhow::Error>(())
-                    })
-                    .await?;
-            }
-            Err(err) => {
-                let status = if err.reason_code == "repo_inaccessible" {
-                    "inaccessible"
-                } else {
-                    "failed"
-                };
-                state
-                    .sqlite_writer
-                    .write("public_repo_release_usage_metadata_error", |_| async {
-                        sqlx::query(
-                            r#"
-                            UPDATE public_repo_release_usage
-                            SET last_sync_status = ?,
-                                last_sync_error = ?,
-                                updated_at = ?
-                            WHERE lower(full_name) = lower(?)
-                            "#,
-                        )
-                        .bind(status)
-                        .bind(format!("{}: {}", err.reason_code, err.message))
-                        .bind(now.as_str())
-                        .bind(repo.full_name.as_str())
-                        .execute(&state.pool)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to mark public repo metadata error for {}",
-                                repo.full_name
-                            )
-                        })?;
-                        Ok::<_, anyhow::Error>(())
-                    })
-                    .await?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
 async fn fetch_owned_repo_snapshot(
     state: &AppState,
     access_token: &str,
@@ -7025,6 +7739,7 @@ async fn fetch_owned_repo_snapshot(
             nodes {
               databaseId
               nameWithOwner
+              stargazerCount
               openGraphImageUrl
               usesCustomOpenGraphImage
               owner {
@@ -7117,6 +7832,7 @@ fn owned_repo_snapshot_from_node(
     Some(OwnedRepoSnapshot {
         repo_id,
         full_name: node.name_with_owner,
+        repo_stargazer_count: node.stargazer_count,
         owner_avatar_url: node.owner.avatar_url,
         open_graph_image_url: node.open_graph_image_url,
         uses_custom_open_graph_image,
@@ -7703,6 +8419,7 @@ async fn insert_feed_activity_events(
         let repo_visual = event.repo_id.map(|repo_id| OwnedRepoSnapshot {
             repo_id,
             full_name: event.repo_full_name.clone().unwrap_or_default(),
+            repo_stargazer_count: None,
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
@@ -7917,6 +8634,7 @@ async fn fetch_starred_snapshot_with_token(
                 description
                 url
                 isPrivate
+                stargazerCount
                 openGraphImageUrl
                 usesCustomOpenGraphImage
                 owner {
@@ -7991,6 +8709,7 @@ async fn fetch_starred_snapshot_with_token(
                 html_url: edge.node.url,
                 stargazed_at: edge.starred_at,
                 is_private: edge.node.is_private,
+                repo_stargazer_count: edge.node.stargazer_count,
                 owner_avatar_url: edge.node.owner.avatar_url,
                 open_graph_image_url: edge.node.open_graph_image_url,
                 uses_custom_open_graph_image,
@@ -8065,8 +8784,8 @@ async fn replace_starred_repos_with_priority(
             INSERT INTO starred_repos (
               id, user_id, repo_id, full_name, owner_login, name, description, html_url,
               stargazed_at, is_private, updated_at, owner_avatar_url, open_graph_image_url,
-              uses_custom_open_graph_image
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              uses_custom_open_graph_image, repo_stargazer_count, repo_stargazer_count_updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(local_id::generate_local_id())
@@ -8083,6 +8802,8 @@ async fn replace_starred_repos_with_priority(
         .bind(repo.owner_avatar_url.as_deref())
         .bind(repo.open_graph_image_url.as_deref())
         .bind(repo.uses_custom_open_graph_image as i64)
+        .bind(repo.repo_stargazer_count)
+        .bind(repo.repo_stargazer_count.map(|_| now.as_str()))
         .execute(&mut *tx)
         .await
         .with_context(|| format!("failed to insert starred repo {}", repo.full_name))?;
@@ -8115,8 +8836,8 @@ async fn upsert_starred_repos(
             INSERT INTO starred_repos (
               id, user_id, repo_id, full_name, owner_login, name, description, html_url,
               stargazed_at, is_private, updated_at, owner_avatar_url, open_graph_image_url,
-              uses_custom_open_graph_image
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              uses_custom_open_graph_image, repo_stargazer_count, repo_stargazer_count_updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id, repo_id) DO UPDATE SET
               full_name = excluded.full_name,
               owner_login = excluded.owner_login,
@@ -8128,7 +8849,9 @@ async fn upsert_starred_repos(
               updated_at = excluded.updated_at,
               owner_avatar_url = excluded.owner_avatar_url,
               open_graph_image_url = excluded.open_graph_image_url,
-              uses_custom_open_graph_image = excluded.uses_custom_open_graph_image
+              uses_custom_open_graph_image = excluded.uses_custom_open_graph_image,
+              repo_stargazer_count = excluded.repo_stargazer_count,
+              repo_stargazer_count_updated_at = excluded.repo_stargazer_count_updated_at
             "#,
         )
         .bind(local_id::generate_local_id())
@@ -8145,6 +8868,8 @@ async fn upsert_starred_repos(
         .bind(repo.owner_avatar_url.as_deref())
         .bind(repo.open_graph_image_url.as_deref())
         .bind(repo.uses_custom_open_graph_image as i64)
+        .bind(repo.repo_stargazer_count)
+        .bind(repo.repo_stargazer_count.map(|_| now.as_str()))
         .execute(&mut *tx)
         .await
         .with_context(|| format!("failed to upsert starred repo {}", repo.full_name))?;
@@ -9146,15 +9871,16 @@ mod tests {
         RepoReleaseWriteStats, RepoStargazerFetchResult, RepoStargazerSnapshot,
         SocialActivityEventInsert, StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot,
         SubscriptionEventRecord, SubscriptionPrunePhaseOutcome, SubscriptionRunContext,
-        SyncRequestError, aggregate_repos, announcement_category_id_from_repo_value,
-        append_subscription_event, apply_social_activity_snapshot,
-        apply_social_activity_snapshot_partial, apply_social_activity_snapshot_with_options,
-        attach_and_wait_for_user_release_demand, attach_release_demand,
-        claim_next_repo_release_work_item, classify_github_http_error, cmp_last_active_desc,
-        collect_repo_stargazer_snapshots_with, discussion_announcement_from_node,
-        execute_subscription_prune_phases, expire_repo_release_deadlines,
-        fail_repo_release_work_item, feed_activity_event_from_github,
-        fetch_repo_releases_with_optional_token, insert_feed_activity_events,
+        SyncRequestError, aggregate_release_visible_repos, aggregate_repos,
+        announcement_category_id_from_repo_value, append_subscription_event,
+        apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
+        apply_social_activity_snapshot_with_options, attach_and_wait_for_user_release_demand,
+        attach_release_demand, claim_next_repo_release_work_item, classify_github_http_error,
+        cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
+        discussion_announcement_from_node, execute_subscription_prune_phases,
+        expire_repo_release_deadlines, fail_repo_release_work_item,
+        feed_activity_event_from_github, fetch_repo_releases_with_optional_token,
+        hydrate_repo_refresh_candidates, insert_feed_activity_events,
         insert_social_activity_event_tx, install_social_activity_snapshot_after_reads_hook,
         is_terminal_notification_thread_error, owned_repo_snapshot_from_node,
         process_repo_release_work_item, prune_subscription_sync_history,
@@ -9199,6 +9925,7 @@ mod tests {
             OwnedRepoNode {
                 database_id: Some(42),
                 name_with_owner: "octo/rocket".to_owned(),
+                stargazer_count: None,
                 open_graph_image_url: Some(
                     "https://repository-images.githubusercontent.com/42/rocket".to_owned(),
                 ),
@@ -9231,6 +9958,7 @@ mod tests {
             OwnedRepoNode {
                 database_id: Some(42),
                 name_with_owner: "octo/rocket".to_owned(),
+                stargazer_count: None,
                 open_graph_image_url: Some(
                     "https://repository-images.githubusercontent.com/42/rocket".to_owned(),
                 ),
@@ -9253,6 +9981,7 @@ mod tests {
             OwnedRepoNode {
                 database_id: Some(99),
                 name_with_owner: "acme/shared".to_owned(),
+                stargazer_count: None,
                 open_graph_image_url: Some(
                     "https://repository-images.githubusercontent.com/99/shared".to_owned(),
                 ),
@@ -9485,6 +10214,7 @@ mod tests {
                         owner_avatar_url: None,
                         open_graph_image_url: None,
                         uses_custom_open_graph_image: false,
+                        repo_stargazer_count: None,
                     },
                     StarredRepoSnapshot {
                         repo_id: 1,
@@ -9498,6 +10228,7 @@ mod tests {
                         owner_avatar_url: None,
                         open_graph_image_url: None,
                         uses_custom_open_graph_image: false,
+                        repo_stargazer_count: None,
                     },
                 ],
             },
@@ -9517,6 +10248,7 @@ mod tests {
                     owner_avatar_url: None,
                     open_graph_image_url: None,
                     uses_custom_open_graph_image: false,
+                    repo_stargazer_count: None,
                 }],
             },
         ];
@@ -9527,6 +10259,146 @@ mod tests {
         assert_eq!(repos[0].related_users.len(), 2);
         assert_eq!(repos[0].related_users[0].user_id, test_user_id("1"));
         assert_eq!(repos[1].full_name, "octo/beta");
+    }
+
+    #[tokio::test]
+    async fn hydrate_repo_refresh_candidates_counts_duplicate_relation_sources_in_repo_total_sum() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("repo-governance-dup-relations");
+        seed_user(&pool, user_id.as_str()).await;
+        seed_sync_task(&state, "task-governance-dup-relations").await;
+        seed_starred_repo_row(&pool, user_id.as_str(), 42, "octo/alpha").await;
+        seed_starred_repo_row(&pool, user_id.as_str(), 43, "octo/beta").await;
+        seed_owned_repo_baseline_row(&pool, user_id.as_str(), 42, "octo/alpha").await;
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET include_own_releases = 1, updated_at = '2026-03-06T00:30:00Z'
+            WHERE id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("enable owned releases");
+
+        let context = SubscriptionRunContext::new(state.as_ref(), "task-governance-dup-relations")
+            .await
+            .expect("build subscription context");
+        let repos = aggregate_release_visible_repos(
+            &context,
+            &[StarPhaseSuccess {
+                user_id: user_id.clone(),
+                last_active_at: Some("2026-03-06T12:00:00Z".to_owned()),
+                repo_count: 2,
+                repos: vec![],
+            }],
+        )
+        .await
+        .expect("aggregate effective repos");
+
+        let candidates = hydrate_repo_refresh_candidates(state.as_ref(), &repos)
+            .await
+            .expect("hydrate repo refresh candidates");
+        let alpha = candidates
+            .iter()
+            .find(|candidate| candidate.repo_id == 42)
+            .expect("alpha candidate");
+        assert_eq!(alpha.watcher_user_count, 1);
+        assert_eq!(alpha.watcher_repo_total_sum, 4);
+    }
+
+    #[tokio::test]
+    async fn rebuild_repo_refresh_governance_snapshots_updates_existing_system_success_repo() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = chrono::DateTime::parse_from_rfc3339("2026-03-06T12:30:00Z")
+            .expect("parse rebuild now")
+            .with_timezone(&chrono::Utc);
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_refresh_governance_snapshots (
+              repo_id,
+              repo_full_name,
+              is_private,
+              watcher_user_count,
+              watcher_repo_total_sum,
+              cached_stargazer_count,
+              cached_stargazer_count_updated_at,
+              priority_rank,
+              target_window,
+              target_interval_minutes,
+              urgency_score,
+              urgency_bucket,
+              system_last_success_at,
+              actual_last_success_at,
+              actual_last_success_source,
+              updated_at
+            )
+            VALUES (?, ?, 0, 1, 4, NULL, NULL, 5, 1, 10, 4.0, 'critical', ?, ?, 'system', ?)
+            "#,
+        )
+        .bind(42_i64)
+        .bind("octo/alpha")
+        .bind("2026-03-06T12:20:00Z")
+        .bind("2026-03-06T12:20:00Z")
+        .bind("2026-03-06T12:20:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed existing governance snapshot");
+
+        super::rebuild_repo_refresh_governance_snapshots(
+            state.as_ref(),
+            &[super::RepoRefreshCandidate {
+                repo_id: 42,
+                full_name: "octo/alpha".to_owned(),
+                is_private: false,
+                watcher_user_count: 1,
+                watcher_repo_total_sum: 4,
+                cached_stargazer_count: Some(9),
+            }],
+            1000,
+            now,
+        )
+        .await
+        .expect("rebuild governance snapshots");
+
+        let row = sqlx::query_as::<_, (i64, i64, i64, f64, String, String)>(
+            r#"
+            SELECT
+              priority_rank,
+              target_window,
+              target_interval_minutes,
+              urgency_score,
+              urgency_bucket,
+              updated_at
+            FROM repo_refresh_governance_snapshots
+            WHERE repo_id = 42
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load rebuilt governance snapshot");
+        let (
+            priority_rank,
+            target_window,
+            target_interval_minutes,
+            urgency_score,
+            urgency_bucket,
+            updated_at,
+        ) = row;
+
+        assert_eq!(priority_rank, 1);
+        assert_eq!(target_window, 1);
+        assert_eq!(target_interval_minutes, 10);
+        assert!(
+            (urgency_score - 1.0).abs() < 0.01,
+            "unexpected urgency score: {urgency_score}"
+        );
+        assert_eq!(urgency_bucket, "active");
+        assert_eq!(updated_at, now.to_rfc3339());
     }
 
     #[test]
@@ -10586,6 +11458,7 @@ mod tests {
                 "https://repository-images.githubusercontent.com/100/alpha".to_owned(),
             ),
             uses_custom_open_graph_image: true,
+            repo_stargazer_count: None,
         }];
 
         let result = sync_starred_for_user_with_fetch(
@@ -10784,6 +11657,7 @@ mod tests {
                                     owner_avatar_url: None,
                                     open_graph_image_url: None,
                                     uses_custom_open_graph_image: false,
+                                    repo_stargazer_count: None,
                                 }],
                                 is_full_snapshot: true,
                                 watermark: Some("2026-03-06T13:00:00Z".to_owned()),
@@ -10992,6 +11866,7 @@ mod tests {
                 owner_avatar_url: None,
                 open_graph_image_url: None,
                 uses_custom_open_graph_image: false,
+                repo_stargazer_count: None,
             }],
             &[(
                 OwnedRepoSnapshot {
@@ -11000,6 +11875,7 @@ mod tests {
                     owner_avatar_url: None,
                     open_graph_image_url: None,
                     uses_custom_open_graph_image: false,
+                    repo_stargazer_count: None,
                 },
                 vec![RepoStargazerSnapshot {
                     repo_id: 42,
@@ -11173,6 +12049,7 @@ mod tests {
                 "https://repository-images.githubusercontent.com/42/alpha".to_owned(),
             ),
             uses_custom_open_graph_image: true,
+            repo_stargazer_count: None,
         };
 
         sqlx::query(
@@ -11494,6 +12371,7 @@ mod tests {
                 "https://repository-images.githubusercontent.com/42/alpha".to_owned(),
             ),
             uses_custom_open_graph_image: true,
+            repo_stargazer_count: None,
         };
 
         sqlx::query(
@@ -11725,6 +12603,7 @@ mod tests {
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
+            repo_stargazer_count: None,
         };
 
         apply_social_activity_snapshot(
@@ -11836,6 +12715,7 @@ mod tests {
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
+            repo_stargazer_count: None,
         };
         let follower = FollowerSnapshot {
             actor: GitHubActor {
@@ -11993,6 +12873,7 @@ mod tests {
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
+            repo_stargazer_count: None,
         };
         let old_follower = FollowerSnapshot {
             actor: GitHubActor {
@@ -12115,6 +12996,7 @@ mod tests {
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
+            repo_stargazer_count: None,
         };
         let repo_members = vec![(
             repo.clone(),
@@ -12600,6 +13482,7 @@ mod tests {
                 owner_avatar_url: None,
                 open_graph_image_url: None,
                 uses_custom_open_graph_image: false,
+                repo_stargazer_count: None,
             },
             OwnedRepoSnapshot {
                 repo_id: 43,
@@ -12607,6 +13490,7 @@ mod tests {
                 owner_avatar_url: None,
                 open_graph_image_url: None,
                 uses_custom_open_graph_image: false,
+                repo_stargazer_count: None,
             },
         ];
 
@@ -12652,6 +13536,7 @@ mod tests {
                 owner_avatar_url: None,
                 open_graph_image_url: None,
                 uses_custom_open_graph_image: false,
+                repo_stargazer_count: None,
             },
             OwnedRepoSnapshot {
                 repo_id: 43,
@@ -12659,6 +13544,7 @@ mod tests {
                 owner_avatar_url: None,
                 open_graph_image_url: None,
                 uses_custom_open_graph_image: false,
+                repo_stargazer_count: None,
             },
         ];
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
@@ -12724,6 +13610,7 @@ mod tests {
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
+            repo_stargazer_count: None,
         };
         let skipped_repo = OwnedRepoSnapshot {
             repo_id: 43,
@@ -12731,6 +13618,7 @@ mod tests {
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
+            repo_stargazer_count: None,
         };
 
         apply_social_activity_snapshot(
@@ -12899,6 +13787,7 @@ mod tests {
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
+            repo_stargazer_count: None,
         };
         let new_repo = OwnedRepoSnapshot {
             repo_id: 43,
@@ -12906,6 +13795,7 @@ mod tests {
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
+            repo_stargazer_count: None,
         };
         let initial_repos = vec![initial_repo.clone()];
         let initial_repo_members = vec![(initial_repo, vec![])];
@@ -12994,6 +13884,7 @@ mod tests {
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
+            repo_stargazer_count: None,
         };
         let events = apply_social_activity_snapshot(
             state.as_ref(),
@@ -13050,6 +13941,7 @@ mod tests {
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
+            repo_stargazer_count: None,
         };
         let new_repo = OwnedRepoSnapshot {
             repo_id: 43,
@@ -13057,6 +13949,7 @@ mod tests {
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
+            repo_stargazer_count: None,
         };
 
         apply_social_activity_snapshot(
@@ -13154,6 +14047,7 @@ mod tests {
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
+            repo_stargazer_count: None,
         };
         let churn_repo = OwnedRepoSnapshot {
             repo_id: 43,
@@ -13161,6 +14055,7 @@ mod tests {
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
+            repo_stargazer_count: None,
         };
         let churn_member = RepoStargazerSnapshot {
             repo_id: churn_repo.repo_id,
@@ -15055,6 +15950,7 @@ mod tests {
                     owner_avatar_url: None,
                     open_graph_image_url: None,
                     uses_custom_open_graph_image: false,
+                    repo_stargazer_count: None,
                 },
                 StarredRepoSnapshot {
                     repo_id: 102,
@@ -15068,6 +15964,7 @@ mod tests {
                     owner_avatar_url: None,
                     open_graph_image_url: None,
                     uses_custom_open_graph_image: false,
+                    repo_stargazer_count: None,
                 },
             ],
         )
@@ -15089,6 +15986,7 @@ mod tests {
                 owner_avatar_url: None,
                 open_graph_image_url: None,
                 uses_custom_open_graph_image: false,
+                repo_stargazer_count: None,
             }],
         )
         .await
@@ -15140,6 +16038,7 @@ mod tests {
                         owner_avatar_url: None,
                         open_graph_image_url: None,
                         uses_custom_open_graph_image: false,
+                        repo_stargazer_count: None,
                     }],
                 )
                 .await
@@ -15190,6 +16089,7 @@ mod tests {
                 owner_avatar_url: None,
                 open_graph_image_url: None,
                 uses_custom_open_graph_image: false,
+                repo_stargazer_count: None,
             }],
         )
         .await
@@ -15225,6 +16125,7 @@ mod tests {
                         owner_avatar_url: None,
                         open_graph_image_url: None,
                         uses_custom_open_graph_image: false,
+                        repo_stargazer_count: None,
                     }],
                 )
                 .await
@@ -15963,6 +16864,75 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed user");
+    }
+
+    async fn seed_starred_repo_row(
+        pool: &SqlitePool,
+        user_id: &str,
+        repo_id: i64,
+        full_name: &str,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO starred_repos (
+              id,
+              user_id,
+              repo_id,
+              full_name,
+              owner_login,
+              name,
+              description,
+              html_url,
+              stargazed_at,
+              is_private,
+              updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 0, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id)
+        .bind(repo_id)
+        .bind(full_name)
+        .bind(full_name.split('/').next().unwrap_or(full_name))
+        .bind(full_name.split('/').nth(1).unwrap_or(full_name))
+        .bind(format!("https://github.com/{full_name}"))
+        .bind("2026-03-06T12:00:00Z")
+        .bind("2026-03-06T12:00:00Z")
+        .execute(pool)
+        .await
+        .expect("seed starred repo row");
+    }
+
+    async fn seed_owned_repo_baseline_row(
+        pool: &SqlitePool,
+        user_id: &str,
+        repo_id: i64,
+        full_name: &str,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO owned_repo_star_baselines (
+              id,
+              user_id,
+              repo_id,
+              repo_full_name,
+              members_snapshot_initialized,
+              initialized_at,
+              updated_at
+            )
+            VALUES (?, ?, ?, ?, 1, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id)
+        .bind(repo_id)
+        .bind(full_name)
+        .bind("2026-03-06T12:00:00Z")
+        .bind("2026-03-06T12:00:00Z")
+        .execute(pool)
+        .await
+        .expect("seed owned repo baseline row");
     }
 
     fn mock_notification(

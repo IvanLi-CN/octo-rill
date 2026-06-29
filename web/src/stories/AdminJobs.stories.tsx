@@ -1389,6 +1389,7 @@ type AdminJobsPreviewProps = {
 	llmSourceFilter?: string;
 	translationState?: "default" | "busy" | "recovered" | "failed";
 	taskIntervalSettingsDialogDefaultOpen?: boolean;
+	subscriptionSyncSettingsDialogDefaultOpen?: boolean;
 	syncSettingsHelpTooltipsOpen?: boolean;
 };
 
@@ -1426,6 +1427,7 @@ function AdminJobsPreview({
 	llmSourceFilter = "",
 	translationState = "default",
 	taskIntervalSettingsDialogDefaultOpen = false,
+	subscriptionSyncSettingsDialogDefaultOpen = false,
 	syncSettingsHelpTooltipsOpen = false,
 }: AdminJobsPreviewProps) {
 	const [ready, setReady] = useState(false);
@@ -1480,6 +1482,7 @@ function AdminJobsPreview({
 			sync_auto_fetch_interval_minutes: 10,
 			retry_recent_failures_interval_minutes: 10,
 			repo_release_worker_concurrency: 12,
+			repo_refresh_system_budget_per_window: 1000,
 			recent_sync_tasks: scheduledRuns
 				.filter((item) => item.task_type === "sync.subscriptions")
 				.filter((item) => item.id !== "task-subscription-skipped")
@@ -1844,6 +1847,7 @@ function AdminJobsPreview({
 					sync_auto_fetch_interval_minutes?: number;
 					retry_recent_failures_interval_minutes?: number;
 					repo_release_worker_concurrency?: number;
+					repo_refresh_system_budget_per_window?: number;
 				};
 				syncRuntimeConfig = {
 					...syncRuntimeConfig,
@@ -1857,6 +1861,10 @@ function AdminJobsPreview({
 					repo_release_worker_concurrency: Number(
 						body.repo_release_worker_concurrency ??
 							syncRuntimeConfig.repo_release_worker_concurrency,
+					),
+					repo_refresh_system_budget_per_window: Number(
+						body.repo_refresh_system_budget_per_window ??
+							syncRuntimeConfig.repo_refresh_system_budget_per_window,
 					),
 				};
 				return new Response(JSON.stringify(syncRuntimeConfig), {
@@ -2324,6 +2332,9 @@ function AdminJobsPreview({
 			taskIntervalSettingsDialogDefaultOpen={
 				taskIntervalSettingsDialogDefaultOpen
 			}
+			subscriptionSyncSettingsDialogDefaultOpen={
+				subscriptionSyncSettingsDialogDefaultOpen
+			}
 			syncSettingsHelpTooltipsOpen={syncSettingsHelpTooltipsOpen}
 		/>
 	);
@@ -2378,7 +2389,7 @@ export const ScheduledTab: Story = {
 		).toBeVisible();
 		await expect(canvas.getByText("失败数据重试")).toBeVisible();
 		await expect(
-			canvas.queryByRole("button", { name: "配置订阅同步 worker 数量" }),
+			canvas.queryByRole("button", { name: "打开订阅同步设置" }),
 		).not.toBeInTheDocument();
 		await waitFor(() =>
 			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
@@ -2394,7 +2405,7 @@ export const SubscriptionSyncWorkflow: Story = {
 		docs: {
 			description: {
 				story:
-					"订阅同步专用视图，展示 sync.subscriptions 列表、阶段概览与共享 worker 设置入口。",
+					"订阅同步专用视图，展示 sync.subscriptions 列表、阶段概览与统一设置入口。",
 			},
 		},
 	},
@@ -2403,7 +2414,7 @@ export const SubscriptionSyncWorkflow: Story = {
 		await expect(
 			canvas.getByRole("heading", { name: "订阅同步" }),
 		).toBeVisible();
-		await expect(canvas.getByText("Release workers")).toBeVisible();
+		await expect(canvas.getByText("Release 抓取并发")).toBeVisible();
 		await expect(canvas.getAllByText("订阅同步工作流")[0]).toBeVisible();
 		const skippedWorkflowCard = canvas
 			.getByText("ID: task-subscription-skipped")
@@ -2416,14 +2427,18 @@ export const SubscriptionSyncWorkflow: Story = {
 		).not.toBeInTheDocument();
 		await expect(canvas.getByText("Release")).toBeVisible();
 		await userEvent.click(
-			canvas.getByRole("button", { name: "配置订阅同步 worker 数量" }),
+			canvas.getByRole("button", { name: "打开订阅同步设置" }),
 		);
 		await expect(
 			await canvas.findByRole("dialog", { name: "订阅同步设置" }),
 		).toBeVisible();
 		await expect(
-			canvas.getByRole("slider", { name: "Release worker 数量" }),
+			canvas.getByRole("slider", { name: "Release 抓取并发" }),
 		).toHaveAttribute("aria-valuenow", "12");
+		await expect(canvas.getByLabelText("10 分钟系统预算")).toHaveValue(1000);
+		await expect(
+			canvas.getByRole("button", { name: "将 Release 抓取并发设为 16" }),
+		).toBeVisible();
 		await waitFor(() =>
 			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
 				"/admin/jobs/subscriptions",
@@ -2480,6 +2495,38 @@ export const SubscriptionSyncDetail: Story = {
 				"/admin/jobs/subscriptions/task-subscription-1430",
 			),
 		);
+	},
+};
+
+export const SubscriptionSyncBackNavigation: Story = {
+	render: () => (
+		<AdminJobsPreview routeUrl="/admin/jobs/subscriptions/task-subscription-1430" />
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"验证订阅同步详情页的返回按钮会退回订阅同步列表，而不是只更新地址栏。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		await expect(
+			await body.findByRole("heading", { name: "订阅同步工作流详情" }),
+		).toBeVisible();
+		await userEvent.click(
+			body.getByRole("button", { name: "返回订阅同步列表" }),
+		);
+		await waitFor(() =>
+			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
+				"/admin/jobs/subscriptions",
+			),
+		);
+		await expect(body.getByRole("heading", { name: "订阅同步" })).toBeVisible();
+		expect(
+			body.queryByRole("heading", { name: "订阅同步工作流详情" }),
+		).not.toBeInTheDocument();
 	},
 };
 
@@ -2569,7 +2616,8 @@ export const ScheduledTaskIntervalSettings: Story = {
 		await expect(
 			canvas.getByRole("slider", { name: "失败数据重试间隔（分钟）" }),
 		).toHaveAttribute("aria-valuenow", "10");
-		expect(canvas.queryByLabelText("Release worker 数量输入")).toBeNull();
+		expect(canvas.queryByLabelText("Release 抓取并发输入")).toBeNull();
+		expect(canvas.queryByLabelText("10 分钟系统预算")).toBeNull();
 		expect(canvas.queryByText("最近三次链路用时")).toBeNull();
 	},
 };
@@ -2594,8 +2642,35 @@ export const TaskIntervalSettingsCleanDialog: Story = {
 		await expect(
 			await canvas.findByRole("dialog", { name: "任务间隔设置" }),
 		).toBeVisible();
-		expect(canvas.queryByText("Release worker 数量")).toBeNull();
+		expect(canvas.queryByText("Release 抓取并发")).toBeNull();
+		expect(canvas.queryByText("10 分钟系统预算")).toBeNull();
 		expect(canvas.queryByText("最近三次链路用时")).toBeNull();
+	},
+};
+
+export const SubscriptionSyncSettingsAutoOpen: Story = {
+	render: () => (
+		<AdminJobsPreview
+			routeUrl="/admin/jobs/subscriptions"
+			subscriptionSyncSettingsDialogDefaultOpen
+			syncSettingsHelpTooltipsOpen
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"治理页 CTA 落点：直接进入订阅同步页签并自动展开设置弹窗，验证预算入口的单跳闭环。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			await canvas.findByRole("dialog", { name: "订阅同步设置" }),
+		).toBeVisible();
+		await expect(canvas.getByText("10 分钟系统预算")).toBeVisible();
+		await expect(canvas.getByText("最近三次链路用时")).toBeVisible();
 	},
 };
 
