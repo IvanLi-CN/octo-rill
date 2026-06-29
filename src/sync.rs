@@ -5071,8 +5071,6 @@ async fn rebuild_repo_refresh_governance_snapshots(
                 .bind(target_window)
                 .bind(target_interval_minutes)
                 .bind(candidate.repo_id)
-                .bind(candidate.repo_id)
-                .bind(candidate.repo_id)
                 .bind(REPO_REFRESH_URGENCY_CAP)
                 .bind(REPO_REFRESH_URGENCY_CAP)
                 .bind(now_rfc3339.as_str())
@@ -10309,6 +10307,98 @@ mod tests {
             .expect("alpha candidate");
         assert_eq!(alpha.watcher_user_count, 1);
         assert_eq!(alpha.watcher_repo_total_sum, 4);
+    }
+
+    #[tokio::test]
+    async fn rebuild_repo_refresh_governance_snapshots_updates_existing_system_success_repo() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = chrono::DateTime::parse_from_rfc3339("2026-03-06T12:30:00Z")
+            .expect("parse rebuild now")
+            .with_timezone(&chrono::Utc);
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_refresh_governance_snapshots (
+              repo_id,
+              repo_full_name,
+              is_private,
+              watcher_user_count,
+              watcher_repo_total_sum,
+              cached_stargazer_count,
+              cached_stargazer_count_updated_at,
+              priority_rank,
+              target_window,
+              target_interval_minutes,
+              urgency_score,
+              urgency_bucket,
+              system_last_success_at,
+              actual_last_success_at,
+              actual_last_success_source,
+              updated_at
+            )
+            VALUES (?, ?, 0, 1, 4, NULL, NULL, 5, 1, 10, 4.0, 'critical', ?, ?, 'system', ?)
+            "#,
+        )
+        .bind(42_i64)
+        .bind("octo/alpha")
+        .bind("2026-03-06T12:20:00Z")
+        .bind("2026-03-06T12:20:00Z")
+        .bind("2026-03-06T12:20:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed existing governance snapshot");
+
+        super::rebuild_repo_refresh_governance_snapshots(
+            state.as_ref(),
+            &[super::RepoRefreshCandidate {
+                repo_id: 42,
+                full_name: "octo/alpha".to_owned(),
+                is_private: false,
+                watcher_user_count: 1,
+                watcher_repo_total_sum: 4,
+                cached_stargazer_count: Some(9),
+            }],
+            1000,
+            now,
+        )
+        .await
+        .expect("rebuild governance snapshots");
+
+        let row = sqlx::query_as::<_, (i64, i64, i64, f64, String, String)>(
+            r#"
+            SELECT
+              priority_rank,
+              target_window,
+              target_interval_minutes,
+              urgency_score,
+              urgency_bucket,
+              updated_at
+            FROM repo_refresh_governance_snapshots
+            WHERE repo_id = 42
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load rebuilt governance snapshot");
+        let (
+            priority_rank,
+            target_window,
+            target_interval_minutes,
+            urgency_score,
+            urgency_bucket,
+            updated_at,
+        ) = row;
+
+        assert_eq!(priority_rank, 1);
+        assert_eq!(target_window, 1);
+        assert_eq!(target_interval_minutes, 10);
+        assert!(
+            (urgency_score - 1.0).abs() < 0.01,
+            "unexpected urgency score: {urgency_score}"
+        );
+        assert_eq!(urgency_bucket, "active");
+        assert_eq!(updated_at, now.to_rfc3339());
     }
 
     #[test]

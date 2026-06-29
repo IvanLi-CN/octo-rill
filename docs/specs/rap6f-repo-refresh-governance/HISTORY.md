@@ -14,3 +14,4 @@
 - 2026-06-29: 预算编辑入口进一步收口到任务中心“订阅同步设置”弹窗；`/admin/repos` 改为只读治理视图，移除重复预算编辑卡与定时任务设置中的重复预算项。
 - 2026-06-29: 治理页补齐活动图 a11y 等价信息、概览/明细分离状态、深色语义色与预算 CTA 单跳自动展开；订阅同步设置弹窗同步收紧术语并提升触达可用性。
 - 2026-06-29: 治理页进一步改为中文优先术语，补活动图 decoder，并把仓库明细收口成更易比较的排序/目标窗口/迫切值结构；订阅同步设置弹窗同步统一“Release 抓取并发”命名。
+- 2026-06-29: 修复 `rebuild_repo_refresh_governance_snapshots` 在已有 `system_last_success_at` 的 repo 上把 `urgency_score` 绑定错位为 `NULL` 的问题；线上症状是 `sync.subscriptions` 每轮在 `upsert repo refresh governance snapshot` 阶段失败。新增最小回归测试覆盖“已存在 system success 的快照重建”路径。
