@@ -80,6 +80,7 @@ type FeedMode =
 	| "smart-ready-body"
 	| "smart-ready-diff"
 	| "smart-loading"
+	| "translated-upstream-retry"
 	| "smart-upstream-retry"
 	| "smart-retry-error"
 	| "smart-insufficient";
@@ -1863,7 +1864,9 @@ function SocialCardsMatrixPreview(props: {
 						currentViewer={currentViewer}
 						activeLane={DEFAULT_PAGE_LANE}
 						isTranslating={false}
+						isTranslationAutoRetrying={false}
 						isSmartGenerating={false}
+						isSmartAutoRetrying={false}
 						isReactionBusy={false}
 						reactionError={null}
 						onSelectLane={() => {}}
@@ -2096,6 +2099,25 @@ function makeSmartLoadingFeed(): FeedItem[] {
 	];
 }
 
+function makeTranslatedUpstreamRetryFeed(): FeedItem[] {
+	return [
+		buildFeedItem("50007", {
+			title: "v5.2.3",
+			body: "- Upstream rejected the previous translation request",
+			translated: {
+				lang: "zh-CN",
+				status: "error",
+				title: null,
+				summary: null,
+				error_code: "upstream_rejected",
+				error_summary: "上游模型拒绝请求",
+				error_detail: "AI returned 403 Forbidden: Chat upstream returned 403",
+				auto_translate: false,
+			},
+		}),
+	];
+}
+
 function makeSmartUpstreamRetryFeed(): FeedItem[] {
 	return [
 		buildFeedItem("50006", {
@@ -2103,10 +2125,13 @@ function makeSmartUpstreamRetryFeed(): FeedItem[] {
 			body: "- Upstream rejected the previous smart summary request",
 			smart: {
 				lang: "zh-CN",
-				status: "missing",
+				status: "error",
 				title: null,
 				summary: null,
-				auto_translate: true,
+				error_code: "upstream_rejected",
+				error_summary: "上游模型拒绝请求",
+				error_detail: "AI returned 403 Forbidden: Chat upstream returned 403",
+				auto_translate: false,
 			},
 		}),
 	];
@@ -2696,13 +2721,15 @@ function DashboardPreview(props: {
 									? makeSmartReadyDiffFeed()
 									: feedMode === "smart-loading"
 										? makeSmartLoadingFeed()
-										: feedMode === "smart-upstream-retry"
-											? makeSmartUpstreamRetryFeed()
-											: feedMode === "smart-retry-error"
-												? makeSmartRetryErrorFeed()
-												: feedMode === "smart-insufficient"
-													? makeSmartInsufficientFeed()
-													: makeVisibleWindowFeed(feedMode);
+										: feedMode === "translated-upstream-retry"
+											? makeTranslatedUpstreamRetryFeed()
+											: feedMode === "smart-upstream-retry"
+												? makeSmartUpstreamRetryFeed()
+												: feedMode === "smart-retry-error"
+													? makeSmartRetryErrorFeed()
+													: feedMode === "smart-insufficient"
+														? makeSmartInsufficientFeed()
+														: makeVisibleWindowFeed(feedMode);
 	const notifications = showEmptyInbox ? [] : mockNotifs;
 	const translationInFlightKeys =
 		emptyState !== "content" ||
@@ -2712,14 +2739,33 @@ function DashboardPreview(props: {
 		feedMode === "smart-ready-body" ||
 		feedMode === "smart-ready-diff" ||
 		feedMode === "smart-loading" ||
+		feedMode === "translated-upstream-retry" ||
 		feedMode === "smart-upstream-retry" ||
 		feedMode === "smart-retry-error" ||
 		feedMode === "smart-insufficient"
 			? new Set<string>()
 			: makeVisibleWindowInFlightKeys(feedMode);
+	const translationAutoRetryingKeys = useMemo(() => {
+		if (feedMode !== "translated-upstream-retry") {
+			return new Set<string>();
+		}
+		const item = items.find(
+			(entry): entry is ReleaseFeedItem => entry.kind === "release",
+		);
+		return item ? new Set<string>([feedItemKey(item)]) : new Set<string>();
+	}, [feedMode, items]);
 	const [smartInFlightKeys, setSmartInFlightKeys] = useState<Set<string>>(() =>
 		makeSmartInFlightKeys(feedMode),
 	);
+	const smartAutoRetryingKeys = useMemo(() => {
+		if (feedMode !== "smart-upstream-retry") {
+			return new Set<string>();
+		}
+		const item = items.find(
+			(entry): entry is ReleaseFeedItem => entry.kind === "release",
+		);
+		return item ? new Set<string>([feedItemKey(item)]) : new Set<string>();
+	}, [feedMode, items]);
 	const reactionBusyKeys = new Set<string>();
 	const aiDisabledHint = items.some(
 		(it) =>
@@ -3024,7 +3070,9 @@ function DashboardPreview(props: {
 					loadingMore={false}
 					hasMore={false}
 					translationInFlightKeys={translationInFlightKeys}
+					translationAutoRetryingKeys={translationAutoRetryingKeys}
 					smartInFlightKeys={smartInFlightKeys}
+					smartAutoRetryingKeys={smartAutoRetryingKeys}
 					registerItemRef={() => () => {}}
 					onLoadMore={() => {}}
 					onRetryInitial={() => {}}
@@ -5211,7 +5259,9 @@ export const SmartUpstreamRetrying: Story = {
 						currentViewer={STORYBOOK_VIEWER}
 						activeLane="smart"
 						isTranslating={false}
+						isTranslationAutoRetrying={false}
 						isSmartGenerating
+						isSmartAutoRetrying
 						isReactionBusy={false}
 						reactionError={null}
 						onSelectLane={() => {}}
@@ -5227,7 +5277,7 @@ export const SmartUpstreamRetrying: Story = {
 		docs: {
 			description: {
 				story:
-					"上游聊天通道 403 旧错误会被 read model 重新暴露为可自动生成状态；卡片保留原文回退并显示润色生成中，而不是继续展示润色失败终态。",
+					"上游聊天通道 403 这类可重试错误进入页面会触发一次自动补救；卡片正文改成居中的中性等待面，直到这次自动补救结束。",
 			},
 		},
 	},
@@ -5235,13 +5285,74 @@ export const SmartUpstreamRetrying: Story = {
 		const canvas = within(canvasElement);
 		await expect(canvas.getByRole("heading", { name: "v5.2.2" })).toBeVisible();
 		await expect(
-			canvas.getByText(/Upstream rejected the previous smart summary request/),
+			canvas.getByText("润色结果准备中", { exact: true }),
+		).toBeVisible();
+		await expect(
+			canvas.getByText("刚发现这条结果还没准备好，正在自动重试，请稍候。", {
+				exact: true,
+			}),
 		).toBeVisible();
 		await expect(canvas.queryByText("润色失败")).not.toBeInTheDocument();
-		const smartTrigger = canvasElement.querySelector(
-			'[data-feed-lane-trigger="smart"][data-feed-lane-loading="true"]',
+		expect(
+			canvasElement.querySelector('[data-feed-auto-retry-pending="smart"]'),
+		).not.toBeNull();
+	},
+};
+
+export const TranslatedUpstreamRetrying: Story = {
+	args: {
+		initialTab: "releases",
+		feedMode: "translated-upstream-retry",
+	},
+	render: () => {
+		const item = makeTranslatedUpstreamRetryFeed()[0] as ReleaseFeedItem;
+		return (
+			<div className="bg-background min-h-screen px-4 py-6">
+				<div className="mx-auto w-full max-w-2xl">
+					<FeedItemCard
+						item={item}
+						currentViewer={STORYBOOK_VIEWER}
+						activeLane="translated"
+						isTranslating
+						isTranslationAutoRetrying
+						isSmartGenerating={false}
+						isSmartAutoRetrying={false}
+						isReactionBusy={false}
+						reactionError={null}
+						onSelectLane={() => {}}
+						onTranslateNow={() => {}}
+						onSmartNow={() => {}}
+						onToggleReaction={() => {}}
+					/>
+				</div>
+			</div>
 		);
-		expect(smartTrigger).not.toBeNull();
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"翻译 lane 遇到 retryable 错误时，也会进入同一套会话级自动补救和中性等待态，不再等用户切换 lane 后手动补救。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByRole("heading", { name: "v5.2.3" })).toBeVisible();
+		await expect(
+			canvas.getByText("翻译结果准备中", { exact: true }),
+		).toBeVisible();
+		await expect(
+			canvas.getByText("刚发现这条结果还没准备好，正在自动重试，请稍候。", {
+				exact: true,
+			}),
+		).toBeVisible();
+		await expect(canvas.queryByText("翻译失败")).not.toBeInTheDocument();
+		expect(
+			canvasElement.querySelector(
+				'[data-feed-auto-retry-pending="translated"]',
+			),
+		).not.toBeNull();
 	},
 };
 
