@@ -1,4 +1,8 @@
-import { createLazyFileRoute, getRouteApi } from "@tanstack/react-router";
+import {
+	createLazyFileRoute,
+	getRouteApi,
+	useLocation,
+} from "@tanstack/react-router";
 
 import { AdminJobsRoutePage } from "./-helpers";
 
@@ -10,7 +14,8 @@ export const Route = createLazyFileRoute("/admin/jobs/subscriptions")({
 
 function AdminJobsSubscriptionsRouteComponent() {
 	const search = routeApi.useSearch();
-	const detailMatch = window.location.pathname.match(
+	const pathname = useLocation({ select: (location) => location.pathname });
+	const detailMatch = pathname.match(
 		/^\/admin\/jobs\/subscriptions\/([^/]+?)$/,
 	);
 
