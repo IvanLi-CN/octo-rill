@@ -643,9 +643,9 @@ export function UserManagement({
 												<div className="min-w-0 space-y-1">
 													<p
 														className="truncate font-medium text-sm whitespace-nowrap"
-														title={`项目处理仓库总数：${user.repo_total}`}
+														title={`有效关注仓库数：${user.repo_total}`}
 													>
-														总数：{user.repo_total}
+														有效关注：{user.repo_total}
 													</p>
 													<p
 														className="text-muted-foreground truncate text-xs whitespace-nowrap"
@@ -809,7 +809,7 @@ export function UserManagement({
 								<p className="mt-1 font-medium">
 									{profileUser?.is_disabled ? "已禁用" : "已启用"} ·{" "}
 									{profileUser?.is_admin ? "管理员" : "普通用户"} ·
-									项目处理仓库总数 {profileUser?.repo_total ?? 0}
+									有效关注仓库数 {profileUser?.repo_total ?? 0}
 								</p>
 								<p className="text-muted-foreground mt-1 text-xs">
 									我的发布：

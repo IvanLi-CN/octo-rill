@@ -14,6 +14,7 @@ import { TranslationWorkerBoard } from "@/admin/TranslationWorkerBoard";
 import {
 	ADMIN_JOBS_BASE_PATH,
 	ADMIN_JOBS_SUBSCRIPTIONS_PATH,
+	ADMIN_SUBSCRIPTION_SETTINGS_AUTO_OPEN_SESSION_KEY,
 	buildAdminJobsRouteUrl,
 	parseAdminJobsRoute,
 	type AdminJobsPrimaryTab,
@@ -130,6 +131,8 @@ const RETRY_RECENT_FAILURES_INTERVAL_DEFAULT = 10;
 const REPO_RELEASE_WORKER_MIN = 1;
 const REPO_RELEASE_WORKER_MAX = 32;
 const REPO_RELEASE_WORKER_MARKS = [1, 5, 10, 16, 24, 32];
+const REPO_REFRESH_SYSTEM_BUDGET_MIN = 1;
+const REPO_REFRESH_SYSTEM_BUDGET_MAX = 20000;
 let llmModelInputIdCounter = 0;
 
 type LlmModelInputRow = {
@@ -206,6 +209,13 @@ function clampRepoReleaseWorkerConcurrency(value: number) {
 	return Math.min(
 		REPO_RELEASE_WORKER_MAX,
 		Math.max(REPO_RELEASE_WORKER_MIN, Math.round(value)),
+	);
+}
+
+function clampRepoRefreshSystemBudget(value: number) {
+	return Math.min(
+		REPO_REFRESH_SYSTEM_BUDGET_MAX,
+		Math.max(REPO_REFRESH_SYSTEM_BUDGET_MIN, Math.round(value)),
 	);
 }
 
@@ -1340,6 +1350,7 @@ type JobManagementProps = {
 		},
 	) => void;
 	taskIntervalSettingsDialogDefaultOpen?: boolean;
+	subscriptionSyncSettingsDialogDefaultOpen?: boolean;
 	syncSettingsHelpTooltipsOpen?: boolean;
 };
 
@@ -3111,7 +3122,7 @@ function SubscriptionWorkflowDetailPage(props: {
 					type="button"
 					variant="outline"
 					size="icon"
-					aria-label="配置订阅同步 worker 数量"
+					aria-label="配置订阅同步设置"
 					onClick={onOpenSettings}
 					disabled={!runtimeConfig}
 				>
@@ -3397,6 +3408,7 @@ export function JobManagement({
 	routeState: controlledRouteState,
 	onNavigateRoute,
 	taskIntervalSettingsDialogDefaultOpen = false,
+	subscriptionSyncSettingsDialogDefaultOpen = false,
 	syncSettingsHelpTooltipsOpen = false,
 }: JobManagementProps) {
 	const isRouteControlled = controlledRouteState !== undefined;
@@ -3446,7 +3458,7 @@ export function JobManagement({
 	const [
 		subscriptionSyncSettingsDialogOpen,
 		setSubscriptionSyncSettingsDialogOpen,
-	] = useState(false);
+	] = useState(subscriptionSyncSettingsDialogDefaultOpen);
 	const [syncAutoFetchIntervalInput, setSyncAutoFetchIntervalInput] =
 		useState(60);
 	const [
@@ -3457,6 +3469,8 @@ export function JobManagement({
 		repoReleaseWorkerConcurrencyInput,
 		setRepoReleaseWorkerConcurrencyInput,
 	] = useState(5);
+	const [repoRefreshSystemBudgetInput, setRepoRefreshSystemBudgetInput] =
+		useState(1000);
 
 	const [llmStatus, setLlmStatus] =
 		useState<AdminLlmSchedulerStatusResponse | null>(null);
@@ -3894,6 +3908,9 @@ export function JobManagement({
 					RETRY_RECENT_FAILURES_INTERVAL_DEFAULT,
 			);
 			setRepoReleaseWorkerConcurrencyInput(res.repo_release_worker_concurrency);
+			setRepoRefreshSystemBudgetInput(
+				res.repo_refresh_system_budget_per_window,
+			);
 			syncRuntimeConfigLoadedOnceRef.current = true;
 		} catch (err) {
 			if (requestId !== syncRuntimeConfigRequestIdRef.current) {
@@ -3928,6 +3945,9 @@ export function JobManagement({
 					RETRY_RECENT_FAILURES_INTERVAL_DEFAULT,
 			);
 			setRepoReleaseWorkerConcurrencyInput(res.repo_release_worker_concurrency);
+			setRepoRefreshSystemBudgetInput(
+				res.repo_refresh_system_budget_per_window,
+			);
 			setTaskIntervalSettingsDialogOpen(false);
 			await Promise.all([
 				loadScheduledRuns({ background: true }),
@@ -3961,6 +3981,9 @@ export function JobManagement({
 			const res = await apiPatchAdminSyncRuntimeConfig({
 				sync_auto_fetch_interval_minutes: currentInterval,
 				repo_release_worker_concurrency: nextWorkerConcurrency,
+				repo_refresh_system_budget_per_window: clampRepoRefreshSystemBudget(
+					repoRefreshSystemBudgetInput,
+				),
 			});
 			setSyncRuntimeConfig(res);
 			setSyncAutoFetchIntervalInput(res.sync_auto_fetch_interval_minutes);
@@ -3969,6 +3992,9 @@ export function JobManagement({
 					RETRY_RECENT_FAILURES_INTERVAL_DEFAULT,
 			);
 			setRepoReleaseWorkerConcurrencyInput(res.repo_release_worker_concurrency);
+			setRepoRefreshSystemBudgetInput(
+				res.repo_refresh_system_budget_per_window,
+			);
 			setSubscriptionSyncSettingsDialogOpen(false);
 			await Promise.all([
 				loadSubscriptionRuns({ background: true }),
@@ -3983,6 +4009,7 @@ export function JobManagement({
 		loadOverview,
 		loadSubscriptionRuns,
 		repoReleaseWorkerConcurrencyInput,
+		repoRefreshSystemBudgetInput,
 		syncAutoFetchIntervalInput,
 		syncRuntimeConfig,
 	]);
@@ -3996,9 +4023,6 @@ export function JobManagement({
 			syncRuntimeConfig?.retry_recent_failures_interval_minutes ??
 				RETRY_RECENT_FAILURES_INTERVAL_DEFAULT,
 		);
-		setRepoReleaseWorkerConcurrencyInput(
-			syncRuntimeConfig?.repo_release_worker_concurrency ?? 5,
-		);
 		setTaskIntervalSettingsDialogOpen(true);
 	}, [syncRuntimeConfig]);
 
@@ -4007,8 +4031,35 @@ export function JobManagement({
 		setRepoReleaseWorkerConcurrencyInput(
 			syncRuntimeConfig?.repo_release_worker_concurrency ?? 5,
 		);
+		setRepoRefreshSystemBudgetInput(
+			syncRuntimeConfig?.repo_refresh_system_budget_per_window ?? 1000,
+		);
 		setSubscriptionSyncSettingsDialogOpen(true);
 	}, [syncRuntimeConfig]);
+
+	useEffect(() => {
+		if (subscriptionSyncSettingsDialogDefaultOpen) return;
+		if (routeState.primaryTab !== "subscriptions") return;
+		try {
+			if (
+				window.sessionStorage.getItem(
+					ADMIN_SUBSCRIPTION_SETTINGS_AUTO_OPEN_SESSION_KEY,
+				) !== "1"
+			) {
+				return;
+			}
+			window.sessionStorage.removeItem(
+				ADMIN_SUBSCRIPTION_SETTINGS_AUTO_OPEN_SESSION_KEY,
+			);
+			openSubscriptionSyncSettingsDialog();
+		} catch {
+			// ignore storage failures
+		}
+	}, [
+		openSubscriptionSyncSettingsDialog,
+		routeState.primaryTab,
+		subscriptionSyncSettingsDialogDefaultOpen,
+	]);
 
 	const loadLlmSchedulerStatus = useCallback(async (options?: LoadOptions) => {
 		if (
@@ -5270,7 +5321,7 @@ export function JobManagement({
 									type="button"
 									variant="outline"
 									size="icon"
-									aria-label="配置订阅同步 worker 数量"
+									aria-label="打开订阅同步设置"
 									onClick={openSubscriptionSyncSettingsDialog}
 									disabled={!syncRuntimeConfig || syncRuntimeConfigSaving}
 								>
@@ -5278,10 +5329,10 @@ export function JobManagement({
 								</Button>
 							</CardHeader>
 							<CardContent className="space-y-4">
-								<div className="grid gap-3 md:grid-cols-3">
+								<div className="grid gap-3 md:grid-cols-4">
 									<div className="rounded-lg border bg-card/70 p-3">
 										<p className="text-muted-foreground text-xs">
-											Release workers
+											Release 抓取并发
 										</p>
 										<p className="mt-1 text-xl font-semibold">
 											{formatCount(
@@ -5304,6 +5355,19 @@ export function JobManagement({
 										</p>
 										<p className="text-muted-foreground mt-1 text-xs">
 											频率保持独立配置
+										</p>
+									</div>
+									<div className="rounded-lg border bg-card/70 p-3">
+										<p className="text-muted-foreground text-xs">
+											10 分钟系统预算
+										</p>
+										<p className="mt-1 text-xl font-semibold">
+											{formatCount(
+												syncRuntimeConfig?.repo_refresh_system_budget_per_window,
+											)}
+										</p>
+										<p className="text-muted-foreground mt-1 text-xs">
+											系统选仓窗口上限
 										</p>
 									</div>
 									<div className="rounded-lg border bg-card/70 p-3">
@@ -5935,7 +5999,7 @@ export function JobManagement({
 										type="button"
 										variant="ghost"
 										size="icon"
-										className="text-muted-foreground size-7 rounded-full"
+										className="text-muted-foreground size-11 rounded-full"
 									>
 										<CircleHelp className="size-4" />
 										<span className="sr-only">订阅同步配置说明</span>
@@ -5951,21 +6015,21 @@ export function JobManagement({
 									side={syncSettingsHelpTooltipsOpen ? "top" : "bottom"}
 									sideOffset={6}
 								>
-									只调整 `sync.subscriptions` 的 Release worker
-									数量，并保留最近三次链路记录。
+									这里统一调整订阅同步的 Release 抓取并发、仓库刷新系统预算，
+									并保留最近三次链路记录。
 								</TooltipContent>
 							</Tooltip>
 						</div>
 						<DialogDescription className="sr-only">
-							保存后立即生效；配置作用于订阅同步 worker 数量与运行记录查看。
+							保存后立即生效；配置作用于订阅同步并发、系统刷新预算与运行记录查看。
 						</DialogDescription>
 					</DialogHeader>
 
-					<div className="grid gap-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-						<div className="space-y-3 rounded-lg border bg-card/70 px-3 py-4">
+					<div className="grid gap-6 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+						<div className="space-y-5 lg:border-r lg:border-border/70 lg:pr-6">
 							<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
 								<Label htmlFor="repo-release-worker-concurrency">
-									Release worker 数量
+									Release 抓取并发
 								</Label>
 								<div className="flex items-center gap-2">
 									<input
@@ -5981,10 +6045,10 @@ export function JobManagement({
 												),
 											)
 										}
-										aria-label="Release worker 数量输入"
+										aria-label="Release 抓取并发输入"
 										className="h-8 w-20 rounded-md border bg-background px-2 font-mono text-sm"
 									/>
-									<span className="text-muted-foreground text-xs">workers</span>
+									<span className="text-muted-foreground text-xs">路</span>
 								</div>
 							</div>
 							<input
@@ -6001,11 +6065,11 @@ export function JobManagement({
 										),
 									)
 								}
-								aria-label="Release worker 数量"
+								aria-label="Release 抓取并发"
 								aria-valuemin={REPO_RELEASE_WORKER_MIN}
 								aria-valuemax={REPO_RELEASE_WORKER_MAX}
 								aria-valuenow={repoReleaseWorkerConcurrencyInput}
-								aria-valuetext={`${repoReleaseWorkerConcurrencyInput} 个 Release worker`}
+								aria-valuetext={`${repoReleaseWorkerConcurrencyInput} 路 Release 抓取并发`}
 								className="h-2 w-full cursor-pointer accent-primary"
 							/>
 							<div className="relative h-11 text-[11px] text-muted-foreground">
@@ -6013,6 +6077,7 @@ export function JobManagement({
 									<button
 										key={mark}
 										type="button"
+										aria-label={`将 Release 抓取并发设为 ${mark}`}
 										className="-translate-x-1/2 absolute top-0 flex min-h-11 min-w-11 flex-col items-center gap-1 rounded-md px-1 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
 										style={{
 											left: `${((mark - REPO_RELEASE_WORKER_MIN) / (REPO_RELEASE_WORKER_MAX - REPO_RELEASE_WORKER_MIN)) * 100}%`,
@@ -6025,9 +6090,41 @@ export function JobManagement({
 								))}
 							</div>
 							<p className="text-muted-foreground text-xs">
-								只影响共享 repo release
-								队列吞吐；保存后当前进程会按目标数量收敛。
+								只影响共享 Release
+								队列的抓取吞吐；保存后当前进程会按目标并发收敛。
 							</p>
+							<div className="space-y-3 border-t border-border/70 pt-4">
+								<div className="flex items-start justify-between gap-3">
+									<div className="space-y-1">
+										<Label htmlFor="repo-refresh-budget-worker-input">
+											10 分钟系统预算
+										</Label>
+										<p className="text-muted-foreground text-xs leading-5">
+											控制系统每 10 分钟可选中的仓库上限，不会改变 Release
+											抓取并发。
+										</p>
+									</div>
+									<span className="rounded-full border border-border/70 bg-background px-3 py-1 font-mono text-sm font-semibold">
+										{repoRefreshSystemBudgetInput}
+									</span>
+								</div>
+								<Input
+									id="repo-refresh-budget-worker-input"
+									type="number"
+									min={REPO_REFRESH_SYSTEM_BUDGET_MIN}
+									max={REPO_REFRESH_SYSTEM_BUDGET_MAX}
+									value={repoRefreshSystemBudgetInput}
+									onChange={(event) =>
+										setRepoRefreshSystemBudgetInput(
+											clampRepoRefreshSystemBudget(Number(event.target.value)),
+										)
+									}
+									inputMode="numeric"
+								/>
+								<p className="text-muted-foreground text-xs">
+									这是唯一预算编辑入口；保存后会立刻影响下一轮系统选仓。
+								</p>
+							</div>
 							{syncRuntimeConfigError ? (
 								<p className="text-destructive text-sm">
 									{syncRuntimeConfigError}
@@ -6047,7 +6144,7 @@ export function JobManagement({
 												type="button"
 												variant="ghost"
 												size="icon"
-												className="text-muted-foreground size-6 rounded-full"
+												className="text-muted-foreground size-11 rounded-full"
 											>
 												<CircleHelp className="size-3.5" />
 												<span className="sr-only">链路用时说明</span>
