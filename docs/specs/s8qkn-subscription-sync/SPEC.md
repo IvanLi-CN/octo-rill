@@ -38,7 +38,7 @@
 
 ### Non-goals
 
-- 不新增专门的 repo release 管理后台页面。
+- 不在本 spec 内继续扩展 repo release 管理后台；独立“仓库治理”页与 budget 调度合同已由 [#rap6f](../rap6f-repo-refresh-governance/SPEC.md) 接管。
 - 不引入跨实例分布式锁或 leader election。
 - 不引入 GitHub webhook / upstream push 模式。
 - 不通过降低 `sync.subscriptions` 频率或扩大 freshness window 解决慢同步。
@@ -78,7 +78,7 @@
 ### Out of scope
 
 - 删除历史 `releases` 表或一次性清理所有遗留测试数据。
-- 新增专门的 repo release 管理后台页面。
+- 新增或演进专门的 repo release 管理后台页面；该方向现由 [#rap6f](../rap6f-repo-refresh-governance/SPEC.md) 负责。
 
 ## 接口契约（Interfaces & Contracts）
 

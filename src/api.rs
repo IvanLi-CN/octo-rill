@@ -16,6 +16,7 @@ use chrono::{Datelike, TimeZone};
 use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use sqlx::Row;
 use tokio::{io::AsyncReadExt, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
@@ -676,9 +677,16 @@ pub async fn admin_list_users(
             repo_sources.user_id,
             COUNT(DISTINCT repo_sources.repo_id) AS repo_total
           FROM (
-            SELECT user_id, repo_id FROM starred_repos
+            SELECT sr.user_id, sr.repo_id
+            FROM starred_repos sr
+            JOIN users starred_users ON starred_users.id = sr.user_id
+            WHERE starred_users.is_disabled = 0
             UNION ALL
-            SELECT user_id, repo_id FROM owned_repo_star_baselines
+            SELECT ob.user_id, ob.repo_id
+            FROM owned_repo_star_baselines ob
+            JOIN users owned_users ON owned_users.id = ob.user_id
+            WHERE owned_users.is_disabled = 0
+              AND owned_users.include_own_releases != 0
           ) repo_sources
           GROUP BY repo_sources.user_id
         )
@@ -852,9 +860,16 @@ pub async fn admin_patch_user(
             repo_sources.user_id,
             COUNT(DISTINCT repo_sources.repo_id) AS repo_total
           FROM (
-            SELECT user_id, repo_id FROM starred_repos
+            SELECT sr.user_id, sr.repo_id
+            FROM starred_repos sr
+            JOIN users starred_users ON starred_users.id = sr.user_id
+            WHERE starred_users.is_disabled = 0
             UNION ALL
-            SELECT user_id, repo_id FROM owned_repo_star_baselines
+            SELECT ob.user_id, ob.repo_id
+            FROM owned_repo_star_baselines ob
+            JOIN users owned_users ON owned_users.id = ob.user_id
+            WHERE owned_users.is_disabled = 0
+              AND owned_users.include_own_releases != 0
           ) repo_sources
           GROUP BY repo_sources.user_id
         )
@@ -1126,6 +1141,7 @@ pub struct SyncRuntimeConfigResponse {
     sync_auto_fetch_interval_minutes: i64,
     retry_recent_failures_interval_minutes: i64,
     repo_release_worker_concurrency: usize,
+    repo_refresh_system_budget_per_window: i64,
     recent_sync_tasks: Vec<SyncAutoFetchTaskItem>,
 }
 
@@ -1134,6 +1150,72 @@ pub struct SyncRuntimeConfigPatchRequest {
     sync_auto_fetch_interval_minutes: i64,
     retry_recent_failures_interval_minutes: Option<i64>,
     repo_release_worker_concurrency: Option<i64>,
+    repo_refresh_system_budget_per_window: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminRepoGovernanceSummary {
+    dedup_repo_count: i64,
+    pressure_windows: f64,
+    last_full_cycle_completed_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminRepoGovernanceCycleSummary {
+    active_cycle_id: Option<String>,
+    active_cycle_started_at: Option<String>,
+    active_cycle_repo_count: i64,
+    active_cycle_completed_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminRepoGovernanceGridCell {
+    repo_id: i64,
+    age_bucket: String,
+    band_label: String,
+    urgency_score: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminRepoGovernanceOverviewResponse {
+    summary: AdminRepoGovernanceSummary,
+    cycle: AdminRepoGovernanceCycleSummary,
+    settings: SyncRuntimeConfigResponse,
+    grid_cells: Vec<AdminRepoGovernanceGridCell>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct AdminRepoGovernanceListItem {
+    repo_id: i64,
+    repo_full_name: String,
+    watcher_user_count: i64,
+    watcher_repo_total_sum: i64,
+    cached_stargazer_count: Option<i64>,
+    priority_rank: i64,
+    target_window: i64,
+    target_interval_minutes: i64,
+    urgency_score: f64,
+    urgency_bucket: String,
+    system_last_selected_at: Option<String>,
+    system_last_success_at: Option<String>,
+    actual_last_success_at: Option<String>,
+    actual_last_success_source: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminRepoGovernanceListResponse {
+    items: Vec<AdminRepoGovernanceListItem>,
+    page: i64,
+    page_size: i64,
+    total: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminRepoGovernanceListQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    query: Option<String>,
+    aging: Option<String>,
 }
 
 async fn load_sync_runtime_config(state: &AppState) -> Result<SyncRuntimeConfigResponse, ApiError> {
@@ -1148,11 +1230,16 @@ async fn load_sync_runtime_config(state: &AppState) -> Result<SyncRuntimeConfigR
         admin_runtime::load_retry_recent_failures_interval_minutes(&state.pool)
             .await
             .map_err(ApiError::internal)?;
+    let repo_refresh_system_budget_per_window =
+        admin_runtime::load_repo_refresh_system_budget_per_window(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
 
     Ok(SyncRuntimeConfigResponse {
         sync_auto_fetch_interval_minutes: interval,
         retry_recent_failures_interval_minutes,
         repo_release_worker_concurrency,
+        repo_refresh_system_budget_per_window,
         recent_sync_tasks: load_recent_sync_auto_fetch_tasks(state).await?,
     })
 }
@@ -1180,6 +1267,13 @@ async fn persist_sync_runtime_config(
             "repo_release_worker_concurrency must be between 1 and 32",
         ));
     }
+    if let Some(budget) = req.repo_refresh_system_budget_per_window
+        && !(1..=20_000).contains(&budget)
+    {
+        return Err(ApiError::bad_request(
+            "repo_refresh_system_budget_per_window must be between 1 and 20000",
+        ));
+    }
 
     admin_runtime::update_sync_auto_fetch_interval_minutes(
         &state.pool,
@@ -1194,6 +1288,11 @@ async fn persist_sync_runtime_config(
     }
     if let Some(concurrency) = req.repo_release_worker_concurrency {
         admin_runtime::update_repo_release_worker_concurrency(&state.pool, concurrency)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    if let Some(budget) = req.repo_refresh_system_budget_per_window {
+        admin_runtime::update_repo_refresh_system_budget_per_window(&state.pool, budget)
             .await
             .map_err(ApiError::internal)?;
     }
@@ -1218,6 +1317,238 @@ pub async fn admin_patch_sync_runtime_config(
     Ok(Json(
         persist_sync_runtime_config(state.as_ref(), req).await?,
     ))
+}
+
+pub async fn admin_get_repo_governance_overview(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<AdminRepoGovernanceOverviewResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let settings = load_sync_runtime_config(state.as_ref()).await?;
+
+    let dedup_repo_count =
+        sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM repo_refresh_governance_snapshots"#)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+
+    let pressure_windows = sqlx::query_scalar::<_, f64>(
+        r#"
+        SELECT COALESCE(
+          SUM(
+            MAX(
+              0,
+              MIN(COALESCE(urgency_score, 1), 4.0) - 1.0
+            )
+          ) / CAST(? AS REAL),
+          0
+        )
+        FROM repo_refresh_governance_snapshots
+        "#,
+    )
+    .bind(settings.repo_refresh_system_budget_per_window)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let last_full_cycle_completed_at = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT completed_at
+        FROM repo_refresh_governance_cycles
+        WHERE status = 'completed'
+        ORDER BY completed_at DESC, updated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .flatten();
+
+    let active_cycle_row = sqlx::query(
+        r#"
+        SELECT id, started_at, frozen_repo_count, completed_repo_count
+        FROM repo_refresh_governance_cycles
+        WHERE status = 'active'
+        ORDER BY started_at DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let cycle = if let Some(row) = active_cycle_row {
+        AdminRepoGovernanceCycleSummary {
+            active_cycle_id: row.get("id"),
+            active_cycle_started_at: row.get("started_at"),
+            active_cycle_repo_count: row.get("frozen_repo_count"),
+            active_cycle_completed_count: row.get("completed_repo_count"),
+        }
+    } else {
+        AdminRepoGovernanceCycleSummary {
+            active_cycle_id: None,
+            active_cycle_started_at: None,
+            active_cycle_repo_count: 0,
+            active_cycle_completed_count: 0,
+        }
+    };
+
+    let grid_rows = sqlx::query(
+        r#"
+        SELECT
+          repo_id,
+          actual_last_success_at,
+          target_interval_minutes,
+          urgency_score
+        FROM repo_refresh_governance_snapshots
+        ORDER BY priority_rank ASC, repo_id ASC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let now = chrono::Utc::now();
+    let grid_cells = grid_rows
+        .into_iter()
+        .map(|row| {
+            let actual_last_success_at: Option<String> = row.get("actual_last_success_at");
+            let target_interval_minutes: i64 = row.get("target_interval_minutes");
+            let urgency_score: f64 = row.get("urgency_score");
+            let age_bucket = actual_last_success_at
+                .as_deref()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| {
+                    now.signed_duration_since(value.with_timezone(&chrono::Utc))
+                        .num_minutes()
+                })
+                .map(|age_minutes| {
+                    if age_minutes <= 30 {
+                        "fresh"
+                    } else if age_minutes <= 6 * 60 {
+                        "warm"
+                    } else if age_minutes <= 24 * 60 {
+                        "aging"
+                    } else {
+                        "stale"
+                    }
+                })
+                .unwrap_or("unknown")
+                .to_owned();
+            let band_label = if target_interval_minutes <= 10 {
+                "10m"
+            } else if target_interval_minutes <= 60 {
+                "1h"
+            } else if target_interval_minutes <= 6 * 60 {
+                "6h"
+            } else {
+                "long"
+            }
+            .to_owned();
+            AdminRepoGovernanceGridCell {
+                repo_id: row.get("repo_id"),
+                age_bucket,
+                band_label,
+                urgency_score,
+            }
+        })
+        .collect();
+
+    Ok(Json(AdminRepoGovernanceOverviewResponse {
+        summary: AdminRepoGovernanceSummary {
+            dedup_repo_count,
+            pressure_windows,
+            last_full_cycle_completed_at,
+        },
+        cycle,
+        settings,
+        grid_cells,
+    }))
+}
+
+pub async fn admin_list_repo_governance(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Query(query): Query<AdminRepoGovernanceListQuery>,
+) -> Result<Json<AdminRepoGovernanceListResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(100).clamp(1, 500);
+    let offset = (page - 1) * page_size;
+    let query_text = query.query.unwrap_or_default().trim().to_lowercase();
+    let query_like = format!("%{query_text}%");
+
+    let aging = query.aging.unwrap_or_else(|| "all".to_owned());
+    let total = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM repo_refresh_governance_snapshots
+        WHERE (? = '' OR lower(repo_full_name) LIKE ?)
+          AND (
+            ? = 'all'
+            OR (? = 'stale' AND actual_last_success_at IS NOT NULL AND julianday(actual_last_success_at) <= julianday('now', '-1 day'))
+            OR (? = 'missing' AND actual_last_success_at IS NULL)
+          )
+        "#,
+    )
+    .bind(query_text.as_str())
+    .bind(query_like.as_str())
+    .bind(aging.as_str())
+    .bind(aging.as_str())
+    .bind(aging.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let items = sqlx::query_as::<_, AdminRepoGovernanceListItem>(
+        r#"
+        SELECT
+          repo_id,
+          repo_full_name,
+          watcher_user_count,
+          watcher_repo_total_sum,
+          cached_stargazer_count,
+          priority_rank,
+          target_window,
+          target_interval_minutes,
+          urgency_score,
+          urgency_bucket,
+          system_last_selected_at,
+          system_last_success_at,
+          actual_last_success_at,
+          actual_last_success_source
+        FROM repo_refresh_governance_snapshots
+        WHERE (? = '' OR lower(repo_full_name) LIKE ?)
+          AND (
+            ? = 'all'
+            OR (? = 'stale' AND actual_last_success_at IS NOT NULL AND julianday(actual_last_success_at) <= julianday('now', '-1 day'))
+            OR (? = 'missing' AND actual_last_success_at IS NULL)
+          )
+        ORDER BY
+          urgency_score DESC,
+          priority_rank ASC,
+          repo_id ASC
+        LIMIT ? OFFSET ?
+        "#,
+    )
+    .bind(query_text.as_str())
+    .bind(query_like.as_str())
+    .bind(aging.as_str())
+    .bind(aging.as_str())
+    .bind(aging.as_str())
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(Json(AdminRepoGovernanceListResponse {
+        items,
+        page,
+        page_size,
+        total,
+    }))
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -17054,6 +17385,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_list_users_excludes_disabled_user_repos_from_effective_pool_totals() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        seed_star_for_user_with_privacy(&pool, 1, 42, false).await;
+        set_include_own_releases(&pool, true).await;
+
+        seed_user(&pool, 2, "disabled-viewer", 0, 0).await;
+        seed_star_for_user_with_privacy(&pool, 2, 77, false).await;
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET is_disabled = 1, updated_at = '2026-02-24T00:00:00Z'
+            WHERE id = ?
+            "#,
+        )
+        .bind(test_user_id(2))
+        .execute(&pool)
+        .await
+        .expect("disable viewer");
+
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+
+        let Json(response) = admin_list_users(
+            State(state),
+            session,
+            Query(AdminUsersQuery {
+                query: None,
+                role: None,
+                status: None,
+                page: None,
+                page_size: None,
+            }),
+        )
+        .await
+        .expect("admin list users should succeed");
+
+        let disabled_user = response
+            .items
+            .iter()
+            .find(|item| item.id == test_user_id(2))
+            .expect("disabled viewer item");
+        assert_eq!(disabled_user.repo_total, 0);
+        assert!(disabled_user.is_disabled);
+    }
+
+    #[tokio::test]
     async fn admin_patch_user_rejects_demoting_last_admin_via_handler() {
         let pool = setup_pool().await;
         sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
@@ -24710,6 +25092,7 @@ echo should_not_be_in_excerpt
                 sync_auto_fetch_interval_minutes: 10,
                 retry_recent_failures_interval_minutes: Some(15),
                 repo_release_worker_concurrency: Some(12),
+                repo_refresh_system_budget_per_window: None,
             },
         )
         .await
@@ -24747,6 +25130,7 @@ echo should_not_be_in_excerpt
                     sync_auto_fetch_interval_minutes: interval,
                     retry_recent_failures_interval_minutes: None,
                     repo_release_worker_concurrency: None,
+                    repo_refresh_system_budget_per_window: None,
                 },
             )
             .await
@@ -24771,6 +25155,7 @@ echo should_not_be_in_excerpt
                 sync_auto_fetch_interval_minutes: 10,
                 retry_recent_failures_interval_minutes: Some(0),
                 repo_release_worker_concurrency: None,
+                repo_refresh_system_budget_per_window: None,
             },
         )
         .await
@@ -24794,6 +25179,7 @@ echo should_not_be_in_excerpt
                 sync_auto_fetch_interval_minutes: 10,
                 retry_recent_failures_interval_minutes: None,
                 repo_release_worker_concurrency: Some(33),
+                repo_refresh_system_budget_per_window: None,
             },
         )
         .await

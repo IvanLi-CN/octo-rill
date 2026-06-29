@@ -22,6 +22,7 @@ import { Route as FocusReposRouteImport } from './routes/focus/repos'
 import { Route as FocusMineRouteImport } from './routes/focus/mine'
 import { Route as BindGithubRouteImport } from './routes/bind/github'
 import { Route as AdminUsersRouteImport } from './routes/admin/users'
+import { Route as AdminReposRouteImport } from './routes/admin/repos'
 import { Route as AdminPublicReleasesRouteImport } from './routes/admin/public-releases'
 import { Route as AdminJobsRouteRouteImport } from './routes/admin/jobs/route'
 import { Route as FocusReposIndexRouteImport } from './routes/focus/repos/index'
@@ -113,6 +114,11 @@ const AdminUsersRoute = AdminUsersRouteImport.update({
   path: '/users',
   getParentRoute: () => AdminRouteRoute,
 } as any).lazy(() => import('./routes/admin/users.lazy').then((d) => d.Route))
+const AdminReposRoute = AdminReposRouteImport.update({
+  id: '/repos',
+  path: '/repos',
+  getParentRoute: () => AdminRouteRoute,
+} as any).lazy(() => import('./routes/admin/repos.lazy').then((d) => d.Route))
 const AdminPublicReleasesRoute = AdminPublicReleasesRouteImport.update({
   id: '/public-releases',
   path: '/public-releases',
@@ -310,6 +316,7 @@ export interface FileRoutesByFullPath {
   '/stars': typeof StarsRoute
   '/admin/jobs': typeof AdminJobsRouteRouteWithChildren
   '/admin/public-releases': typeof AdminPublicReleasesRoute
+  '/admin/repos': typeof AdminReposRoute
   '/admin/users': typeof AdminUsersRoute
   '/bind/github': typeof BindGithubRoute
   '/focus/mine': typeof FocusMineRouteWithChildren
@@ -348,6 +355,7 @@ export interface FileRoutesByTo {
   '/settings': typeof SettingsRoute
   '/stars': typeof StarsRoute
   '/admin/public-releases': typeof AdminPublicReleasesRoute
+  '/admin/repos': typeof AdminReposRoute
   '/admin/users': typeof AdminUsersRoute
   '/bind/github': typeof BindGithubRoute
   '/admin': typeof AdminIndexRoute
@@ -383,6 +391,7 @@ export interface FileRoutesById {
   '/stars': typeof StarsRoute
   '/admin/jobs': typeof AdminJobsRouteRouteWithChildren
   '/admin/public-releases': typeof AdminPublicReleasesRoute
+  '/admin/repos': typeof AdminReposRoute
   '/admin/users': typeof AdminUsersRoute
   '/bind/github': typeof BindGithubRoute
   '/focus/mine': typeof FocusMineRouteWithChildren
@@ -425,6 +434,7 @@ export interface FileRouteTypes {
     | '/stars'
     | '/admin/jobs'
     | '/admin/public-releases'
+    | '/admin/repos'
     | '/admin/users'
     | '/bind/github'
     | '/focus/mine'
@@ -463,6 +473,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/stars'
     | '/admin/public-releases'
+    | '/admin/repos'
     | '/admin/users'
     | '/bind/github'
     | '/admin'
@@ -497,6 +508,7 @@ export interface FileRouteTypes {
     | '/stars'
     | '/admin/jobs'
     | '/admin/public-releases'
+    | '/admin/repos'
     | '/admin/users'
     | '/bind/github'
     | '/focus/mine'
@@ -636,6 +648,13 @@ declare module '@tanstack/react-router' {
       path: '/users'
       fullPath: '/admin/users'
       preLoaderRoute: typeof AdminUsersRouteImport
+      parentRoute: typeof AdminRouteRoute
+    }
+    '/admin/repos': {
+      id: '/admin/repos'
+      path: '/repos'
+      fullPath: '/admin/repos'
+      preLoaderRoute: typeof AdminReposRouteImport
       parentRoute: typeof AdminRouteRoute
     }
     '/admin/public-releases': {
@@ -871,6 +890,7 @@ const AdminJobsRouteRouteWithChildren = AdminJobsRouteRoute._addFileChildren(
 interface AdminRouteRouteChildren {
   AdminJobsRouteRoute: typeof AdminJobsRouteRouteWithChildren
   AdminPublicReleasesRoute: typeof AdminPublicReleasesRoute
+  AdminReposRoute: typeof AdminReposRoute
   AdminUsersRoute: typeof AdminUsersRoute
   AdminIndexRoute: typeof AdminIndexRoute
 }
@@ -878,6 +898,7 @@ interface AdminRouteRouteChildren {
 const AdminRouteRouteChildren: AdminRouteRouteChildren = {
   AdminJobsRouteRoute: AdminJobsRouteRouteWithChildren,
   AdminPublicReleasesRoute: AdminPublicReleasesRoute,
+  AdminReposRoute: AdminReposRoute,
   AdminUsersRoute: AdminUsersRoute,
   AdminIndexRoute: AdminIndexRoute,
 }
