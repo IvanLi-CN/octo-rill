@@ -10,3 +10,4 @@
 
 - 2026-04-04: 建立该主题规格并冻结基础范围。
 - 2026-04-16: 已交付；top-level tab copy aligned to 发布; spec wording refreshed for current dashboard labels
+- 2026-06-29: 补充历史日组生成失败原位报错 / 重试的 current truth，并移除错误引入的“降级摘要”第四态表述。
