@@ -171,7 +171,9 @@ function FeedGroupedListPreview(props: {
 					loadingMore={false}
 					hasMore={false}
 					translationInFlightKeys={new Set()}
+					translationAutoRetryingKeys={new Set()}
 					smartInFlightKeys={new Set()}
+					smartAutoRetryingKeys={new Set()}
 					registerItemRef={() => () => {}}
 					selectedLaneByKey={selectedLaneByKey}
 					onLoadMore={() => {}}

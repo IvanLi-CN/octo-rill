@@ -422,7 +422,9 @@ function ReleaseList(props: {
 							item={feedItem}
 							activeLane={itemLane}
 							isTranslating={false}
+							isTranslationAutoRetrying={false}
 							isSmartGenerating={false}
+							isSmartAutoRetrying={false}
 							isReactionBusy={false}
 							reactionError={null}
 							showReactions={false}
@@ -509,7 +511,9 @@ function ReleaseDetail({ detail }: { detail: ReleaseDetailResponse }) {
 					item={feedItem}
 					activeLane={selectedLane}
 					isTranslating={false}
+					isTranslationAutoRetrying={false}
 					isSmartGenerating={false}
+					isSmartAutoRetrying={false}
 					isReactionBusy={false}
 					reactionError={null}
 					showReactions={false}

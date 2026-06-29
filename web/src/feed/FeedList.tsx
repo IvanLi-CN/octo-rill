@@ -20,7 +20,9 @@ export type FeedCardListProps = {
 	currentViewer?: FeedViewer | null;
 	sourceTab?: DashboardTab | null;
 	translationInFlightKeys: Set<string>;
+	translationAutoRetryingKeys: Set<string>;
 	smartInFlightKeys: Set<string>;
+	smartAutoRetryingKeys: Set<string>;
 	registerItemRef: (item: FeedItem) => (el: HTMLElement | null) => void;
 	selectedLaneByKey: Record<string, FeedLane>;
 	onSelectLane: (item: FeedItem, lane: FeedLane) => void;
@@ -38,7 +40,9 @@ export function FeedItems(props: FeedCardListProps) {
 		currentViewer,
 		sourceTab = null,
 		translationInFlightKeys,
+		translationAutoRetryingKeys,
 		smartInFlightKeys,
+		smartAutoRetryingKeys,
 		registerItemRef,
 		selectedLaneByKey,
 		onSelectLane,
@@ -54,7 +58,9 @@ export function FeedItems(props: FeedCardListProps) {
 		const key = keyOf(item);
 		const activeLane = selectedLaneByKey[key] ?? "original";
 		const isTranslating = translationInFlightKeys.has(key);
+		const isTranslationAutoRetrying = translationAutoRetryingKeys.has(key);
 		const isSmartGenerating = smartInFlightKeys.has(key);
+		const isSmartAutoRetrying = smartAutoRetryingKeys.has(key);
 		const isReactionBusy = reactionBusyKeys.has(key);
 		const reactionError = reactionErrorByKey[key] ?? null;
 		return (
@@ -65,7 +71,9 @@ export function FeedItems(props: FeedCardListProps) {
 					sourceTab={sourceTab}
 					activeLane={activeLane}
 					isTranslating={isTranslating}
+					isTranslationAutoRetrying={isTranslationAutoRetrying}
 					isSmartGenerating={isSmartGenerating}
+					isSmartAutoRetrying={isSmartAutoRetrying}
 					isReactionBusy={isReactionBusy}
 					reactionError={reactionError}
 					isFresh={freshKeys.has(key)}
@@ -97,7 +105,9 @@ export function FeedList(
 		loadingMore,
 		hasMore,
 		translationInFlightKeys,
+		translationAutoRetryingKeys,
 		smartInFlightKeys,
+		smartAutoRetryingKeys,
 		registerItemRef,
 		freshKeys,
 		onLoadMore,
@@ -164,7 +174,9 @@ export function FeedList(
 				items={items}
 				currentViewer={currentViewer}
 				translationInFlightKeys={translationInFlightKeys}
+				translationAutoRetryingKeys={translationAutoRetryingKeys}
 				smartInFlightKeys={smartInFlightKeys}
+				smartAutoRetryingKeys={smartAutoRetryingKeys}
 				registerItemRef={registerItemRef}
 				freshKeys={freshKeys}
 				{...feedCardProps}
