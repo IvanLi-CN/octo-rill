@@ -35,7 +35,11 @@ const GRID_ULTRA_DENSE_GAP = 0;
 const GRID_IDEAL_CELL = 8;
 const GRID_MIN_CELL = 1;
 const GRID_DENSE_CELL = 3;
-const GRID_ULTRA_DENSE_CELL = 1;
+const GRID_ULTRA_DENSE_CELL = 3;
+const GRID_COMPACT_BLOCK_THRESHOLD = 8000;
+const GRID_COMPACT_TARGET_ASPECT_RATIO = 3.2;
+const GRID_COMPACT_MIN_WIDTH = 300;
+const GRID_COMPACT_MAX_WIDTH = 420;
 const GRID_HEIGHT_TARGET_RATIO = 0.52;
 const GRID_ULTRA_DENSE_HEIGHT_TARGET_RATIO = 0.28;
 const GRID_LEGEND_SKELETON_IDS = [
@@ -216,45 +220,71 @@ function GovernanceGrid(props: {
 
 		const dpr = window.devicePixelRatio || 1;
 		const totalCells = Math.max(1, cells.length);
+		const isCompactBlock = totalCells >= GRID_COMPACT_BLOCK_THRESHOLD;
 		const densityRatio = Math.min(1, totalCells / 4000);
-		const isUltraDense = totalCells >= 8000;
+		const isUltraDense = !isCompactBlock && totalCells >= 8000;
 		const isDense = !isUltraDense && densityRatio > 0.35;
-		const gap = isUltraDense
-			? GRID_ULTRA_DENSE_GAP
-			: isDense
-				? GRID_DENSE_GAP
-				: GRID_BASE_GAP;
-		const compactCell = isUltraDense
-			? GRID_ULTRA_DENSE_CELL
-			: isDense
-				? GRID_DENSE_CELL
-				: GRID_DENSE_CELL;
-		const targetHeightRatio = isUltraDense
-			? GRID_ULTRA_DENSE_HEIGHT_TARGET_RATIO
-			: GRID_HEIGHT_TARGET_RATIO;
-		const minimumColumns = Math.max(
-			1,
-			Math.floor((hostWidth + gap) / (compactCell + gap)),
-		);
-		const targetColumnsFromArea = Math.ceil(
-			Math.sqrt(
-				totalCells * (hostWidth / Math.max(1, hostWidth * targetHeightRatio)),
-			),
-		);
-		const preferredColumns = Math.max(
-			1,
-			Math.floor((hostWidth + gap) / (GRID_IDEAL_CELL + gap)),
-		);
-		const columns = Math.max(
-			Math.min(totalCells, minimumColumns),
-			Math.min(totalCells, Math.max(preferredColumns, targetColumnsFromArea)),
-		);
-		const rawCell =
-			columns > 1 ? (hostWidth - (columns - 1) * gap) / columns : hostWidth;
-		const cell = Math.max(GRID_MIN_CELL, rawCell);
-		const rows = Math.max(1, Math.ceil(cells.length / columns));
-		const width = hostWidth;
-		const height = rows * cell + (rows - 1) * gap;
+		let gap: number;
+		let columns: number;
+		let cell: number;
+		let width: number;
+		let height: number;
+
+		if (isCompactBlock) {
+			gap = GRID_ULTRA_DENSE_GAP;
+			columns = Math.max(
+				1,
+				Math.ceil(Math.sqrt(totalCells * GRID_COMPACT_TARGET_ASPECT_RATIO)),
+			);
+			const targetWidth = Math.min(
+				hostWidth,
+				Math.max(
+					GRID_COMPACT_MIN_WIDTH,
+					Math.min(GRID_COMPACT_MAX_WIDTH, hostWidth * 0.48),
+				),
+			);
+			cell = Math.max(GRID_MIN_CELL, targetWidth / columns);
+			width = columns * cell;
+			const rows = Math.max(1, Math.ceil(cells.length / columns));
+			height = rows * cell;
+		} else {
+			gap = isUltraDense
+				? GRID_ULTRA_DENSE_GAP
+				: isDense
+					? GRID_DENSE_GAP
+					: GRID_BASE_GAP;
+			const compactCell = isUltraDense
+				? GRID_ULTRA_DENSE_CELL
+				: isDense
+					? GRID_DENSE_CELL
+					: GRID_DENSE_CELL;
+			const targetHeightRatio = isUltraDense
+				? GRID_ULTRA_DENSE_HEIGHT_TARGET_RATIO
+				: GRID_HEIGHT_TARGET_RATIO;
+			const minimumColumns = Math.max(
+				1,
+				Math.floor((hostWidth + gap) / (compactCell + gap)),
+			);
+			const targetColumnsFromArea = Math.ceil(
+				Math.sqrt(
+					totalCells * (hostWidth / Math.max(1, hostWidth * targetHeightRatio)),
+				),
+			);
+			const preferredColumns = Math.max(
+				1,
+				Math.floor((hostWidth + gap) / (GRID_IDEAL_CELL + gap)),
+			);
+			columns = Math.max(
+				Math.min(totalCells, minimumColumns),
+				Math.min(totalCells, Math.max(preferredColumns, targetColumnsFromArea)),
+			);
+			const rawCell =
+				columns > 1 ? (hostWidth - (columns - 1) * gap) / columns : hostWidth;
+			cell = Math.max(GRID_MIN_CELL, rawCell);
+			const rows = Math.max(1, Math.ceil(cells.length / columns));
+			width = hostWidth;
+			height = rows * cell + (rows - 1) * gap;
+		}
 		canvas.width = Math.round(width * dpr);
 		canvas.height = Math.round(height * dpr);
 		canvas.style.width = `${width}px`;
@@ -284,7 +314,7 @@ function GovernanceGrid(props: {
 		<div ref={hostRef} className="w-full">
 			<canvas
 				ref={canvasRef}
-				className="block w-full"
+				className="block"
 				tabIndex={-1}
 				title="颜色按实际最后成功刷新时间分桶；顺序按治理优先级。"
 			/>

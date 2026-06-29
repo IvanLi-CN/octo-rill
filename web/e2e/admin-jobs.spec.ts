@@ -1934,15 +1934,15 @@ test("admin can manage jobs center", async ({ page }) => {
 		page.getByText("octo/private-repo · attempt 1 · terminal"),
 	).toBeVisible();
 	await expect(
-		page.getByRole("button", { name: "配置订阅同步 worker 数量" }),
+		page.getByRole("button", { name: "配置订阅同步设置" }),
 	).toBeVisible();
-	await page.getByRole("button", { name: "配置订阅同步 worker 数量" }).click();
+	await page.getByRole("button", { name: "配置订阅同步设置" }).click();
 	const syncSettingsDialog = page.getByRole("dialog", {
 		name: "订阅同步设置",
 	});
 	await expect(syncSettingsDialog).toBeVisible();
 	await expect(
-		syncSettingsDialog.getByRole("slider", { name: "Release worker 数量" }),
+		syncSettingsDialog.getByRole("slider", { name: "Release 抓取并发" }),
 	).toBeVisible();
 	await expect(
 		syncSettingsDialog.getByText("task-subscriptions-skipped"),

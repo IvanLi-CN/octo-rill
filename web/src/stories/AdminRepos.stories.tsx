@@ -27,6 +27,16 @@ const STORY_GRID_TOTAL = Object.values(STORY_GRID_BUCKET_COUNTS).reduce(
 	(sum, count) => sum + count,
 	0,
 );
+const STORY_GRID_BUCKET_ORDER = [
+	"fresh",
+	"warm",
+	"aging",
+	"stale",
+	"missing",
+] as const;
+const STORY_GRID_BUCKETS = STORY_GRID_BUCKET_ORDER.flatMap((bucket) =>
+	Array.from({ length: STORY_GRID_BUCKET_COUNTS[bucket] }, () => bucket),
+);
 
 const STORY_VERSION_STATE: VersionMonitorValue = {
 	loadedVersion: "v2.9.0",
@@ -93,23 +103,7 @@ const governanceOverviewSeed: AdminRepoGovernanceOverviewResponse = {
 		],
 	},
 	grid_cells: Array.from({ length: STORY_GRID_TOTAL }, (_, index) => {
-		const ageBucket =
-			index < STORY_GRID_BUCKET_COUNTS.fresh
-				? "fresh"
-				: index < STORY_GRID_BUCKET_COUNTS.fresh + STORY_GRID_BUCKET_COUNTS.warm
-					? "warm"
-					: index <
-							STORY_GRID_BUCKET_COUNTS.fresh +
-								STORY_GRID_BUCKET_COUNTS.warm +
-								STORY_GRID_BUCKET_COUNTS.aging
-						? "aging"
-						: index <
-								STORY_GRID_BUCKET_COUNTS.fresh +
-									STORY_GRID_BUCKET_COUNTS.warm +
-									STORY_GRID_BUCKET_COUNTS.aging +
-									STORY_GRID_BUCKET_COUNTS.stale
-							? "stale"
-							: "missing";
+		const ageBucket = STORY_GRID_BUCKETS[(index * 97) % STORY_GRID_TOTAL];
 		return {
 			repo_id: index + 1,
 			age_bucket: ageBucket,
