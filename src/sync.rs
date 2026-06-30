@@ -69,6 +69,10 @@ const STARRED_WATERMARK_KEY: &str = "starred_sync_watermark";
 const STARRED_FULL_SYNC_KEY: &str = "starred_full_sync_at";
 const REPO_REFRESH_SYSTEM_WINDOW_MINUTES: i64 = 10;
 const REPO_REFRESH_URGENCY_CAP: f64 = 4.0;
+const SUBSCRIPTION_PRUNE_WATCHERS_BATCH_SIZE: i64 = 10_000;
+const SUBSCRIPTION_PRUNE_EVENTS_BATCH_SIZE: i64 = 2_000;
+const SUBSCRIPTION_PRUNE_WATCHERS_MAX_BATCHES: usize = 20;
+const SUBSCRIPTION_PRUNE_EVENTS_MAX_BATCHES: usize = 8;
 
 static REPO_RELEASE_CLAIM_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -4927,6 +4931,7 @@ async fn rebuild_repo_refresh_governance_snapshots(
     let now_rfc3339 = now.to_rfc3339();
     let budget = admin_runtime::normalize_repo_refresh_system_budget_per_window(budget_per_window);
     let now_window_index = current_repo_refresh_window_index(now);
+    let started_at = Instant::now();
 
     state
         .sqlite_writer
@@ -5181,6 +5186,27 @@ async fn rebuild_repo_refresh_governance_snapshots(
         })
         .await?;
 
+    let elapsed_ms = started_at.elapsed().as_millis();
+    if elapsed_ms >= 1_000 {
+        tracing::warn!(
+            event = "sqlite.write",
+            operation = "sync.repo_refresh_governance_rebuild",
+            candidate_repos = candidates.len(),
+            budget_per_window = budget,
+            elapsed_ms,
+            "repo refresh governance rebuild completed slowly"
+        );
+    } else {
+        tracing::info!(
+            event = "sqlite.write",
+            operation = "sync.repo_refresh_governance_rebuild",
+            candidate_repos = candidates.len(),
+            budget_per_window = budget,
+            elapsed_ms,
+            "repo refresh governance rebuild completed"
+        );
+    }
+
     Ok(())
 }
 
@@ -5419,6 +5445,7 @@ async fn run_release_phase(
     context: &SubscriptionRunContext,
     repos: Vec<AggregatedRepo>,
 ) -> Result<(SyncSubscriptionReleaseSummary, usize)> {
+    let governance_started_at = Instant::now();
     let budget_per_window =
         admin_runtime::load_repo_refresh_system_budget_per_window(&context.state.pool).await?;
     let candidates = hydrate_repo_refresh_candidates(context.state.as_ref(), &repos).await?;
@@ -5433,6 +5460,7 @@ async fn run_release_phase(
     let demand_repos =
         select_budgeted_system_release_repos(context.state.as_ref(), budget_per_window, now)
             .await?;
+    let governance_elapsed_ms = governance_started_at.elapsed().as_millis();
     let attached = attach_release_demand(
         context.state.as_ref(),
         Some(context.task_id.as_str()),
@@ -5452,6 +5480,9 @@ async fn run_release_phase(
             json!({
                 "repos": attached.repos,
                 "budget_per_window": budget_per_window,
+                "candidate_repos": repos.len(),
+                "governance_candidate_repos": candidates.len(),
+                "governance_elapsed_ms": governance_elapsed_ms,
                 "queued": attached.queued,
                 "reused_running": attached.reused_running,
                 "reused_fresh": attached.reused_fresh,
@@ -7387,7 +7418,7 @@ where
     Events: FnMut() -> EventsFut,
     EventsFut: Future<Output = Result<SubscriptionPrunePhaseOutcome>>,
 {
-    for _ in 0..10 {
+    for _ in 0..SUBSCRIPTION_PRUNE_WATCHERS_MAX_BATCHES {
         match prune_watchers().await? {
             SubscriptionPrunePhaseOutcome::Deleted(0) | SubscriptionPrunePhaseOutcome::Skipped => {
                 break;
@@ -7396,7 +7427,7 @@ where
         }
     }
 
-    for _ in 0..5 {
+    for _ in 0..SUBSCRIPTION_PRUNE_EVENTS_MAX_BATCHES {
         match prune_events().await? {
             SubscriptionPrunePhaseOutcome::Deleted(0) => break,
             SubscriptionPrunePhaseOutcome::Deleted(_) => {}
@@ -7408,11 +7439,11 @@ where
 }
 
 async fn prune_subscription_sync_history(state: &AppState) -> Result<()> {
-    const BATCH_SIZE: i64 = 1000;
     let now = Utc::now();
     let succeeded_cutoff = (now - chrono::Duration::days(14)).to_rfc3339();
     let failed_cutoff = (now - chrono::Duration::days(30)).to_rfc3339();
     let event_cutoff = (now - chrono::Duration::days(30)).to_rfc3339();
+    let started_at = Instant::now();
 
     execute_subscription_prune_phases(
         || {
@@ -7430,15 +7461,15 @@ async fn prune_subscription_sync_history(state: &AppState) -> Result<()> {
                             WHERE id IN (
                               SELECT id
                               FROM repo_release_watchers
-                              WHERE (status = 'succeeded' AND julianday(updated_at) < julianday(?))
-                                 OR (status = 'failed' AND julianday(updated_at) < julianday(?))
+                              WHERE (status = 'succeeded' AND updated_at < ?)
+                                 OR (status = 'failed' AND updated_at < ?)
                               LIMIT ?
                             )
                             "#,
                         )
                         .bind(succeeded_cutoff.as_str())
                         .bind(failed_cutoff.as_str())
-                        .bind(BATCH_SIZE)
+                        .bind(SUBSCRIPTION_PRUNE_WATCHERS_BATCH_SIZE)
                         .execute(&state.pool)
                         .await
                         .context("prune repo release watchers")?
@@ -7468,7 +7499,7 @@ async fn prune_subscription_sync_history(state: &AppState) -> Result<()> {
                             "#,
                         )
                         .bind(event_cutoff.as_str())
-                        .bind(BATCH_SIZE)
+                        .bind(SUBSCRIPTION_PRUNE_EVENTS_BATCH_SIZE)
                         .execute(&state.pool)
                         .await
                         .context("prune sync subscription events")?
@@ -7478,7 +7509,20 @@ async fn prune_subscription_sync_history(state: &AppState) -> Result<()> {
             )
         },
     )
-    .await
+    .await?;
+
+    tracing::info!(
+        event = "sqlite.write",
+        operation = "sync.subscription_history_prune",
+        watchers_batch_size = SUBSCRIPTION_PRUNE_WATCHERS_BATCH_SIZE,
+        events_batch_size = SUBSCRIPTION_PRUNE_EVENTS_BATCH_SIZE,
+        watchers_max_batches = SUBSCRIPTION_PRUNE_WATCHERS_MAX_BATCHES,
+        events_max_batches = SUBSCRIPTION_PRUNE_EVENTS_MAX_BATCHES,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "subscription history prune completed"
+    );
+
+    Ok(())
 }
 
 fn classify_reqwest_error(operation: &str, err: reqwest::Error) -> SyncRequestError {
@@ -9842,6 +9886,7 @@ fn fallback_notification_open_url(thread_id: Option<&str>, repo_full_name: Optio
 #[cfg(test)]
 mod tests {
     use anyhow::{Context, anyhow};
+    use sqlx::Row;
     use std::{
         collections::HashSet,
         fs,
@@ -16443,6 +16488,40 @@ mod tests {
         .await
         .expect("count preserved subscription event");
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn subscription_watcher_retention_query_plan_uses_retention_index() {
+        let pool = setup_pool().await;
+        let plan_rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            DELETE FROM repo_release_watchers
+            WHERE id IN (
+              SELECT id
+              FROM repo_release_watchers
+              WHERE (status = 'succeeded' AND updated_at < ?)
+                 OR (status = 'failed' AND updated_at < ?)
+              LIMIT ?
+            )
+            "#,
+        )
+        .bind("2026-04-01T00:00:00Z")
+        .bind("2026-03-01T00:00:00Z")
+        .bind(10_000_i64)
+        .fetch_all(&pool)
+        .await
+        .expect("load query plan");
+
+        let details = plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_repo_release_watchers_retention"))
+        );
     }
 
     async fn setup_pool() -> SqlitePool {
