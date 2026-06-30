@@ -141,7 +141,7 @@
 ### Source
 
 - Storybook canvas (`iframe.html`) only; evidence is captured from stable story states without the Storybook manager chrome.
-- Evidence is bound to commit `1fbe5a781d39eb8a71c0a0b7e5578eeb7f69fb50`.
+- Evidence is bound to commit `8251a60e687e7138b756f7bf1c2f55d7cf7a2b7b` and its follow-up verification patch.
 
 ### Captured states
 

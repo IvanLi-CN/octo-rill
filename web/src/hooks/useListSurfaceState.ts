@@ -19,12 +19,17 @@ export function useListSurfaceState(options: UseListSurfaceStateOptions) {
 	const [showRefreshing, setShowRefreshing] = useState(false);
 	const timerRef = useRef<number | null>(null);
 	const hasResolvedOnceRef = useRef(false);
+	const hasRequestedOnceRef = useRef(loading);
 
 	useEffect(() => {
-		if (!loading) {
+		if (loading) {
+			hasRequestedOnceRef.current = true;
+			return;
+		}
+		if (hasRequestedOnceRef.current || hasData || hasError) {
 			hasResolvedOnceRef.current = true;
 		}
-	}, [loading]);
+	}, [hasData, hasError, loading]);
 
 	useEffect(() => {
 		if (!loading || !hasResolvedOnceRef.current) {
