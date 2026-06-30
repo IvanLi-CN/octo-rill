@@ -31,6 +31,13 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
+	ListBlockingErrorState,
+	ListEmptyState,
+	ListInlineError,
+	ListRefreshingNotice,
+	ListSurfaceShell,
+} from "@/components/feedback/listSurface";
+import {
 	Card,
 	CardContent,
 	CardDescription,
@@ -54,6 +61,7 @@ import {
 	TableRow,
 } from "@/components/ui/table";
 import { useInternalNavigate } from "@/lib/internalNavigation";
+import { useListSurfaceState } from "@/hooks/useListSurfaceState";
 import {
 	Sheet,
 	SheetContent,
@@ -441,7 +449,11 @@ export function UserManagement({
 		total,
 	]);
 
-	const showStartupSkeleton = loading && items.length === 0 && error === null;
+	const listSurface = useListSurfaceState({
+		loading,
+		hasData: items.length > 0,
+		hasError: error !== null,
+	});
 
 	return (
 		<Card>
@@ -504,244 +516,268 @@ export function UserManagement({
 					</Button>
 				</div>
 
-				{error ? <p className="text-destructive text-sm">{error}</p> : null}
-
-				<div
-					className="overflow-hidden rounded-xl border"
-					data-admin-users-table-shell
+				<ListSurfaceShell
+					state={listSurface.state}
+					refreshing={listSurface.showRefreshing}
+					className="space-y-3"
 				>
-					{showStartupSkeleton ? (
-						<Table
-							className="min-w-[65rem] table-fixed"
-							containerClassName="overflow-x-auto"
-						>
-							<TableHeader className="bg-muted/40">
-								<TableRow>
-									<TableHead className="w-[18rem] px-3 py-2">用户</TableHead>
-									<TableHead className="w-[9rem] px-3 py-2">仓库</TableHead>
-									<TableHead className="w-[13rem] px-3 py-2">状态</TableHead>
-									<TableHead className="w-[10rem] px-3 py-2">时间</TableHead>
-									<TableHead className="w-[15rem] px-3 py-2 text-right">
-										操作
-									</TableHead>
-								</TableRow>
-							</TableHeader>
-							<TableBody>
-								{USER_ROW_SKELETON_KEYS.map((key) => (
-									<TableRow key={key}>
-										<TableCell className="px-3 py-3">
-											<div className="space-y-2">
-												<div className="bg-muted h-4 w-32 animate-pulse rounded-full" />
-												<div className="bg-muted h-3 w-48 animate-pulse rounded-full" />
-											</div>
-										</TableCell>
-										<TableCell className="px-3 py-3">
-											<div className="space-y-2">
-												<div className="bg-muted h-4 w-16 animate-pulse rounded-full" />
-												<div className="bg-muted h-3 w-28 animate-pulse rounded-full" />
-											</div>
-										</TableCell>
-										<TableCell className="px-3 py-3">
-											<div className="space-y-2">
-												<div className="bg-muted h-4 w-20 animate-pulse rounded-full" />
-												<div className="bg-muted h-3 w-20 animate-pulse rounded-full" />
-											</div>
-										</TableCell>
-										<TableCell className="px-3 py-3">
-											<div className="space-y-2">
-												<div className="bg-muted h-4 w-20 animate-pulse rounded-full" />
-												<div className="bg-muted h-3 w-24 animate-pulse rounded-full" />
-											</div>
-										</TableCell>
-										<TableCell className="px-3 py-3">
-											<div className="ml-auto flex justify-end gap-2">
-												<div className="bg-muted h-9 w-14 animate-pulse rounded-xl" />
-												<div className="bg-muted h-9 w-20 animate-pulse rounded-xl" />
-												<div className="bg-muted h-9 w-16 animate-pulse rounded-xl" />
-											</div>
-										</TableCell>
+					{listSurface.showRefreshing ? (
+						<ListRefreshingNotice label="用户列表更新中..." />
+					) : null}
+					{error && items.length > 0 ? (
+						<ListInlineError
+							title="用户列表刷新失败"
+							summary={error}
+							actionLabel="重试"
+							onAction={() => void loadUsers()}
+						/>
+					) : null}
+
+					<div
+						className="overflow-hidden rounded-xl border"
+						data-admin-users-table-shell
+					>
+						{listSurface.state === "blocking-error" ? (
+							<div className="p-3">
+								<ListBlockingErrorState
+									title="用户列表加载失败"
+									summary={error ?? "当前无法读取用户列表。"}
+									actionLabel="重试"
+									onAction={() => void loadUsers()}
+								/>
+							</div>
+						) : listSurface.state === "initial-loading" ? (
+							<Table
+								className="min-w-[65rem] table-fixed"
+								containerClassName="overflow-x-auto"
+							>
+								<TableHeader className="bg-muted/40">
+									<TableRow>
+										<TableHead className="w-[18rem] px-3 py-2">用户</TableHead>
+										<TableHead className="w-[9rem] px-3 py-2">仓库</TableHead>
+										<TableHead className="w-[13rem] px-3 py-2">状态</TableHead>
+										<TableHead className="w-[10rem] px-3 py-2">时间</TableHead>
+										<TableHead className="w-[15rem] px-3 py-2 text-right">
+											操作
+										</TableHead>
 									</TableRow>
-								))}
-							</TableBody>
-						</Table>
-					) : loading ? (
-						<p className="text-muted-foreground px-3 py-4 text-sm">
-							正在刷新用户列表...
-						</p>
-					) : items.length === 0 ? (
-						<p className="text-muted-foreground px-3 py-4 text-sm">
-							没有匹配的用户。
-						</p>
-					) : (
-						<Table
-							className="min-w-[65rem] table-fixed"
-							containerClassName="overflow-x-auto"
-						>
-							<TableHeader className="bg-muted/40">
-								<TableRow>
-									<TableHead className="w-[18rem] px-3 py-2">用户</TableHead>
-									<TableHead className="w-[9rem] px-3 py-2">仓库</TableHead>
-									<TableHead className="w-[13rem] px-3 py-2">状态</TableHead>
-									<TableHead className="w-[10rem] px-3 py-2">时间</TableHead>
-									<TableHead className="w-[15rem] px-3 py-2 text-right">
-										操作
-									</TableHead>
-								</TableRow>
-							</TableHeader>
-							<TableBody>
-								{items.map((user) => {
-									const busy = actionBusyUserId === user.id;
-									const isSelf = user.id === currentUserId;
-									const isLastAdmin =
-										user.is_admin && guardSummary.admin_total <= 1;
-									const isLastActiveAdmin =
-										user.is_admin &&
-										!user.is_disabled &&
-										guardSummary.active_admin_total <= 1;
-									const adminActionBlocked = user.is_admin
-										? isLastAdmin || isLastActiveAdmin
-										: false;
-									const disableActionBlocked =
-										(isSelf && !user.is_disabled) || isLastActiveAdmin;
-									const adminActionHint =
-										user.is_admin && isLastAdmin
-											? "唯一管理员，不能撤销"
-											: user.is_admin && isLastActiveAdmin
-												? "最后一名启用管理员，不能撤销"
-												: null;
-									const disableActionHint =
-										!user.is_disabled && isSelf
-											? "不能禁用自己"
-											: !user.is_disabled && isLastActiveAdmin
-												? "最后一名启用管理员，不能禁用"
-												: null;
-									const guardHint = adminActionHint ?? disableActionHint;
-									return (
-										<TableRow
-											key={user.id}
-											data-user-row
-											data-user-id={user.id}
-										>
+								</TableHeader>
+								<TableBody>
+									{USER_ROW_SKELETON_KEYS.map((key) => (
+										<TableRow key={key}>
 											<TableCell className="px-3 py-3">
-												<div className="min-w-0 space-y-1">
-													<p
-														className="truncate font-medium text-sm whitespace-nowrap"
-														title={`${user.login}${isSelf ? "（你）" : ""}`}
-													>
-														{user.login}
-														{isSelf ? "（你）" : ""}
-													</p>
-													<p
-														className="text-muted-foreground truncate text-xs whitespace-nowrap"
-														title={`${user.name ?? "-"} · ${user.email ?? "-"}`}
-													>
-														{user.name ?? "-"} · {user.email ?? "-"}
-													</p>
+												<div className="space-y-2">
+													<div className="bg-muted h-4 w-32 animate-pulse rounded-full" />
+													<div className="bg-muted h-3 w-48 animate-pulse rounded-full" />
 												</div>
 											</TableCell>
 											<TableCell className="px-3 py-3">
-												<div className="min-w-0 space-y-1">
-													<p
-														className="truncate font-medium text-sm whitespace-nowrap"
-														title={`有效关注仓库数：${user.repo_total}`}
-													>
-														有效关注：{user.repo_total}
-													</p>
-													<p
-														className="text-muted-foreground truncate text-xs whitespace-nowrap"
-														title={
-															user.include_own_releases
-																? "我的发布：已纳入"
-																: "我的发布：未纳入"
-														}
-													>
-														我的发布：
-														{user.include_own_releases ? "已纳入" : "未纳入"}
-													</p>
+												<div className="space-y-2">
+													<div className="bg-muted h-4 w-16 animate-pulse rounded-full" />
+													<div className="bg-muted h-3 w-28 animate-pulse rounded-full" />
 												</div>
 											</TableCell>
 											<TableCell className="px-3 py-3">
-												<div className="min-w-0 space-y-1">
-													<div className="min-w-0">
-														<Badge
-															variant="outline"
-															className={`max-w-full truncate whitespace-nowrap ${userRoleBadgeClass(user.is_admin)}`}
-															title={user.is_admin ? "管理员" : "普通用户"}
-														>
-															{user.is_admin ? "管理员" : "普通用户"}
-														</Badge>
-													</div>
-													<p
-														className="text-muted-foreground truncate text-xs whitespace-nowrap"
-														title={
-															guardHint
-																? `${user.is_disabled ? "已禁用" : "已启用"} · ${guardHint}`
-																: user.is_disabled
-																	? "已禁用"
-																	: "已启用"
-														}
-													>
-														{user.is_disabled ? "已禁用" : "已启用"}
-														{guardHint ? ` · ${guardHint}` : ""}
-													</p>
+												<div className="space-y-2">
+													<div className="bg-muted h-4 w-20 animate-pulse rounded-full" />
+													<div className="bg-muted h-3 w-20 animate-pulse rounded-full" />
 												</div>
 											</TableCell>
 											<TableCell className="px-3 py-3">
-												<div className="min-w-0 space-y-1">
-													<p
-														className="truncate font-medium text-sm whitespace-nowrap"
-														title={`最后活动：${formatLocalHm(user.last_active_at)}`}
-													>
-														最后活动：{formatLocalHm(user.last_active_at)}
-													</p>
-													<p
-														className="text-muted-foreground truncate text-xs whitespace-nowrap"
-														title={`创建时间：${formatLocalDateTime(user.created_at)}`}
-													>
-														创建时间：{formatLocalDateTime(user.created_at)}
-													</p>
+												<div className="space-y-2">
+													<div className="bg-muted h-4 w-20 animate-pulse rounded-full" />
+													<div className="bg-muted h-3 w-24 animate-pulse rounded-full" />
 												</div>
 											</TableCell>
 											<TableCell className="px-3 py-3">
-												<div className="flex justify-end gap-1.5 whitespace-nowrap">
-													<Button
-														variant="outline"
-														size="sm"
-														className="shrink-0"
-														disabled={busy}
-														onClick={() => void onOpenProfile(user)}
-													>
-														详情
-													</Button>
-													<Button
-														variant="outline"
-														size="sm"
-														className="shrink-0"
-														disabled={busy || adminActionBlocked}
-														onClick={() => void onToggleAdmin(user)}
-													>
-														{user.is_admin ? "撤销管理员" : "设为管理员"}
-													</Button>
-													<Button
-														variant={
-															user.is_disabled ? "secondary" : "destructive"
-														}
-														size="sm"
-														className="shrink-0"
-														disabled={busy || disableActionBlocked}
-														onClick={() => void onToggleDisabled(user)}
-													>
-														{user.is_disabled ? "启用" : "禁用"}
-													</Button>
+												<div className="ml-auto flex justify-end gap-2">
+													<div className="bg-muted h-9 w-14 animate-pulse rounded-xl" />
+													<div className="bg-muted h-9 w-20 animate-pulse rounded-xl" />
+													<div className="bg-muted h-9 w-16 animate-pulse rounded-xl" />
 												</div>
 											</TableCell>
 										</TableRow>
-									);
-								})}
-							</TableBody>
-						</Table>
-					)}
-				</div>
+									))}
+								</TableBody>
+							</Table>
+						) : listSurface.state === "empty" ? (
+							<div className="p-3">
+								<ListEmptyState
+									title="没有匹配的用户"
+									description="调整关键词、角色或状态筛选后再试一次；列表只展示当前可访问的用户结果。"
+								/>
+							</div>
+						) : (
+							<Table
+								className="min-w-[65rem] table-fixed"
+								containerClassName="overflow-x-auto"
+							>
+								<TableHeader className="bg-muted/40">
+									<TableRow>
+										<TableHead className="w-[18rem] px-3 py-2">用户</TableHead>
+										<TableHead className="w-[9rem] px-3 py-2">仓库</TableHead>
+										<TableHead className="w-[13rem] px-3 py-2">状态</TableHead>
+										<TableHead className="w-[10rem] px-3 py-2">时间</TableHead>
+										<TableHead className="w-[15rem] px-3 py-2 text-right">
+											操作
+										</TableHead>
+									</TableRow>
+								</TableHeader>
+								<TableBody>
+									{items.map((user) => {
+										const busy = actionBusyUserId === user.id;
+										const isSelf = user.id === currentUserId;
+										const isLastAdmin =
+											user.is_admin && guardSummary.admin_total <= 1;
+										const isLastActiveAdmin =
+											user.is_admin &&
+											!user.is_disabled &&
+											guardSummary.active_admin_total <= 1;
+										const adminActionBlocked = user.is_admin
+											? isLastAdmin || isLastActiveAdmin
+											: false;
+										const disableActionBlocked =
+											(isSelf && !user.is_disabled) || isLastActiveAdmin;
+										const adminActionHint =
+											user.is_admin && isLastAdmin
+												? "唯一管理员，不能撤销"
+												: user.is_admin && isLastActiveAdmin
+													? "最后一名启用管理员，不能撤销"
+													: null;
+										const disableActionHint =
+											!user.is_disabled && isSelf
+												? "不能禁用自己"
+												: !user.is_disabled && isLastActiveAdmin
+													? "最后一名启用管理员，不能禁用"
+													: null;
+										const guardHint = adminActionHint ?? disableActionHint;
+										return (
+											<TableRow
+												key={user.id}
+												data-user-row
+												data-user-id={user.id}
+											>
+												<TableCell className="px-3 py-3">
+													<div className="min-w-0 space-y-1">
+														<p
+															className="truncate font-medium text-sm whitespace-nowrap"
+															title={`${user.login}${isSelf ? "（你）" : ""}`}
+														>
+															{user.login}
+															{isSelf ? "（你）" : ""}
+														</p>
+														<p
+															className="text-muted-foreground truncate text-xs whitespace-nowrap"
+															title={`${user.name ?? "-"} · ${user.email ?? "-"}`}
+														>
+															{user.name ?? "-"} · {user.email ?? "-"}
+														</p>
+													</div>
+												</TableCell>
+												<TableCell className="px-3 py-3">
+													<div className="min-w-0 space-y-1">
+														<p
+															className="truncate font-medium text-sm whitespace-nowrap"
+															title={`有效关注仓库数：${user.repo_total}`}
+														>
+															有效关注：{user.repo_total}
+														</p>
+														<p
+															className="text-muted-foreground truncate text-xs whitespace-nowrap"
+															title={
+																user.include_own_releases
+																	? "我的发布：已纳入"
+																	: "我的发布：未纳入"
+															}
+														>
+															我的发布：
+															{user.include_own_releases ? "已纳入" : "未纳入"}
+														</p>
+													</div>
+												</TableCell>
+												<TableCell className="px-3 py-3">
+													<div className="min-w-0 space-y-1">
+														<div className="min-w-0">
+															<Badge
+																variant="outline"
+																className={`max-w-full truncate whitespace-nowrap ${userRoleBadgeClass(user.is_admin)}`}
+																title={user.is_admin ? "管理员" : "普通用户"}
+															>
+																{user.is_admin ? "管理员" : "普通用户"}
+															</Badge>
+														</div>
+														<p
+															className="text-muted-foreground truncate text-xs whitespace-nowrap"
+															title={
+																guardHint
+																	? `${user.is_disabled ? "已禁用" : "已启用"} · ${guardHint}`
+																	: user.is_disabled
+																		? "已禁用"
+																		: "已启用"
+															}
+														>
+															{user.is_disabled ? "已禁用" : "已启用"}
+															{guardHint ? ` · ${guardHint}` : ""}
+														</p>
+													</div>
+												</TableCell>
+												<TableCell className="px-3 py-3">
+													<div className="min-w-0 space-y-1">
+														<p
+															className="truncate font-medium text-sm whitespace-nowrap"
+															title={`最后活动：${formatLocalHm(user.last_active_at)}`}
+														>
+															最后活动：{formatLocalHm(user.last_active_at)}
+														</p>
+														<p
+															className="text-muted-foreground truncate text-xs whitespace-nowrap"
+															title={`创建时间：${formatLocalDateTime(user.created_at)}`}
+														>
+															创建时间：{formatLocalDateTime(user.created_at)}
+														</p>
+													</div>
+												</TableCell>
+												<TableCell className="px-3 py-3">
+													<div className="flex justify-end gap-1.5 whitespace-nowrap">
+														<Button
+															variant="outline"
+															size="sm"
+															className="shrink-0"
+															disabled={busy}
+															onClick={() => void onOpenProfile(user)}
+														>
+															详情
+														</Button>
+														<Button
+															variant="outline"
+															size="sm"
+															className="shrink-0"
+															disabled={busy || adminActionBlocked}
+															onClick={() => void onToggleAdmin(user)}
+														>
+															{user.is_admin ? "撤销管理员" : "设为管理员"}
+														</Button>
+														<Button
+															variant={
+																user.is_disabled ? "secondary" : "destructive"
+															}
+															size="sm"
+															className="shrink-0"
+															disabled={busy || disableActionBlocked}
+															onClick={() => void onToggleDisabled(user)}
+														>
+															{user.is_disabled ? "启用" : "禁用"}
+														</Button>
+													</div>
+												</TableCell>
+											</TableRow>
+										);
+									})}
+								</TableBody>
+							</Table>
+						)}
+					</div>
+				</ListSurfaceShell>
 
 				<div className="flex items-center justify-between">
 					<p className="text-muted-foreground text-xs">

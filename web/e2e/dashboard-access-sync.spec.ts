@@ -2631,10 +2631,11 @@ test("dashboard keeps inbox sync reachable when inbox is empty", async ({
 	await page.goto("/?tab=inbox");
 
 	const syncInboxButton = page.getByRole("button", { name: "Sync inbox" });
+	const inboxEmptyState = page.locator('[data-list-empty-state="true"]');
 	await expect(syncInboxButton).toBeVisible();
-	await expect(
-		page.getByText("暂无通知。可以点击 Sync inbox 拉取最新数据。"),
-	).toBeVisible();
+	await expect(inboxEmptyState.getByText("暂无通知")).toBeVisible();
+	await expect(inboxEmptyState.getByText("可以点击")).toBeVisible();
+	await expect(inboxEmptyState.getByText("拉取最新数据。")).toBeVisible();
 	await expect(
 		page.getByRole("link", { name: "GitHub" }).first(),
 	).toHaveAttribute("href", "https://github.com/notifications");

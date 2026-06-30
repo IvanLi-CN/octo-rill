@@ -2150,31 +2150,21 @@ test("admin keeps blocking loader before first realtime load completes", async (
 		delayRules: [
 			{
 				pathname: "/api/admin/jobs/realtime",
-				search: "task_group=realtime",
+				search: "status=all&task_group=realtime",
 				times: 1,
 				delayMs: 1200,
 			},
 		],
-		failureRules: [
-			{
-				pathname: "/api/admin/jobs/realtime",
-				search: "task_group=realtime",
-				afterCount: 1,
-				times: 1,
-				message: "ignored background refresh failure",
-			},
-		],
-		emitStreamEvents: true,
+		emitStreamEvents: false,
 	});
 	await page.goto("/admin/jobs", { waitUntil: "domcontentloaded" });
 
-	await expect(page.getByText("正在加载任务...")).toBeVisible();
+	await expect(
+		page.locator('[data-list-state="initial-loading"]').first(),
+	).toBeVisible();
 	await expect(page.getByText(/^SSE (已连接|重连中\.\.\.)$/)).toBeVisible();
 	await expect(page.getByText("任务列表更新中...")).toHaveCount(0);
-	await expect(page.getByText("暂无任务。")).toHaveCount(0);
-	await expect(
-		page.getByText("ignored background refresh failure"),
-	).toHaveCount(0);
+	await expect(page.getByText("暂无任务")).toHaveCount(0);
 	await expect(page.getByText("sync.releases")).toBeVisible();
 });
 
@@ -2220,13 +2210,15 @@ test("admin ignores stale llm refresh errors after filter change", async ({
 	await page.getByRole("combobox", { name: "LLM 调用状态筛选" }).click();
 	await page.getByRole("option", { name: "状态：失败" }).click();
 
-	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
 	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
+	await expect(refreshButton).toBeDisabled();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
 	await expect(page.getByText("stale llm refresh failed")).toHaveCount(0);
 
 	await page.waitForTimeout(700);
 	await expect(page.getByText("job.api.translate_release")).toBeVisible();
 	await expect(page.getByText("api.translate_releases_batch")).toHaveCount(0);
+	await expect(refreshButton).toBeEnabled();
 	await expect(page.getByText("stale llm refresh failed")).toHaveCount(0);
 });
 

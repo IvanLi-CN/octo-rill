@@ -1,7 +1,14 @@
 import { ArrowUpRight, Inbox, RefreshCcw } from "lucide-react";
 
-import { ErrorStatePanel } from "@/components/feedback/ErrorStatePanel";
+import {
+	ListBlockingErrorState,
+	ListEmptyState,
+	ListInlineError,
+	ListRefreshingNotice,
+	ListSurfaceShell,
+} from "@/components/feedback/listSurface";
 import { Button } from "@/components/ui/button";
+import { useListSurfaceState } from "@/hooks/useListSurfaceState";
 import { formatIsoShortLocal } from "@/lib/datetime";
 import { cn } from "@/lib/utils";
 import {
@@ -35,6 +42,11 @@ export function InboxList(props: {
 		onRetry,
 	} = props;
 	const showSync = Boolean(onSync);
+	const listSurface = useListSurfaceState({
+		loading: loading || syncing,
+		hasData: notifications.length > 0,
+		hasError: error !== null,
+	});
 
 	return (
 		<Card className="bg-card/80 shadow-sm">
@@ -84,79 +96,117 @@ export function InboxList(props: {
 			</CardHeader>
 
 			<CardContent className="pt-0">
-				{error && notifications.length === 0 ? (
-					<ErrorStatePanel
-						title="Inbox 加载失败"
-						summary={error}
-						size="compact"
-						actionLabel={onRetry ? "重试" : undefined}
-						onAction={onRetry}
-					/>
-				) : loading && notifications.length === 0 ? (
-					<p className="text-muted-foreground text-sm">正在加载收件箱…</p>
-				) : notifications.length === 0 ? (
-					showSync ? (
-						<p className="text-muted-foreground text-sm">
-							暂无通知。可以点击 <span className="font-mono">Sync inbox</span>{" "}
-							拉取最新数据。
-						</p>
-					) : (
-						<p className="text-muted-foreground text-sm">
-							暂无通知。请点击顶部的 <span className="font-mono">同步</span>{" "}
-							拉取最新数据。
-						</p>
-					)
-				) : (
-					<div className="space-y-3">
-						{notifications.map((n) => {
-							const isFresh = freshKeys.has(`notification:${n.thread_id}`);
-							return (
-								<a
-									key={n.thread_id}
-									className={cn(
-										"group block rounded-lg border bg-background/40 px-3 py-2 transition-[background-color,border-color,box-shadow] duration-200 hover:bg-background",
-										isFresh && "dashboard-fresh-surface hover:bg-background/70",
-									)}
-									data-inbox-item-fresh={isFresh ? "true" : "false"}
-									href={resolveNotificationHref(n)}
-									target="_blank"
-									rel="noreferrer"
+				<ListSurfaceShell
+					state={listSurface.state}
+					refreshing={listSurface.showRefreshing}
+					className="space-y-3"
+				>
+					{listSurface.showRefreshing ? (
+						<ListRefreshingNotice label="Inbox 更新中..." />
+					) : null}
+					{error && notifications.length > 0 ? (
+						<ListInlineError
+							title="Inbox 刷新失败"
+							summary={error}
+							actionLabel={onRetry ? "重试" : undefined}
+							onAction={onRetry}
+							loading={busy}
+						/>
+					) : null}
+
+					{listSurface.state === "blocking-error" ? (
+						<ListBlockingErrorState
+							title="Inbox 加载失败"
+							summary={error ?? "当前无法读取通知列表。"}
+							actionLabel={onRetry ? "重试" : undefined}
+							onAction={onRetry}
+							loading={busy}
+						/>
+					) : listSurface.state === "initial-loading" ? (
+						<div className="space-y-3">
+							{Array.from({ length: 4 }, (_, index) => (
+								<div
+									key={`inbox-skeleton-${index + 1}`}
+									className="rounded-lg border bg-background/30 px-3 py-3"
 								>
-									<div className="min-w-0">
-										<div className="flex items-center gap-2">
-											{n.unread ? (
-												<span className="bg-primary size-1.5 shrink-0 rounded-full" />
-											) : (
-												<span className="bg-muted size-1.5 shrink-0 rounded-full" />
-											)}
-											<span className="font-mono text-muted-foreground truncate text-[11px]">
-												{n.repo_full_name ?? "(unknown repo)"}
-											</span>
-										</div>
-										<div className="mt-1 line-clamp-2 text-sm font-medium">
-											{n.subject_title ?? "(no title)"}
-											{isFresh ? (
-												<span
-													className="dashboard-fresh-cue ml-2 inline-flex size-2 rounded-full align-middle"
-													title="刚刚同步"
-												>
-													<span className="sr-only">刚刚同步</span>
-												</span>
-											) : null}
-										</div>
-										<div className="text-muted-foreground mt-1 font-mono text-[11px]">
-											{n.reason ? n.reason : "update"}
-											{n.subject_type ? ` · ${n.subject_type}` : ""}
-											{n.updated_at
-												? ` · ${formatIsoShortLocal(n.updated_at)}`
-												: ""}
-										</div>
+									<div className="space-y-2">
+										<div className="bg-muted h-3 w-28 animate-pulse rounded-full" />
+										<div className="bg-muted h-4 w-full animate-pulse rounded-full" />
+										<div className="bg-muted h-3 w-3/4 animate-pulse rounded-full" />
 									</div>
-								</a>
-							);
-						})}
-					</div>
-				)}
+								</div>
+							))}
+						</div>
+					) : listSurface.state === "empty" ? (
+						<ListEmptyState
+							title="暂无通知"
+							description={
+								showSync ? (
+									<>
+										可以点击 <span className="font-mono">Sync inbox</span>{" "}
+										拉取最新数据。
+									</>
+								) : (
+									<>
+										请点击顶部的 <span className="font-mono">同步</span>{" "}
+										拉取最新数据。
+									</>
+								)
+							}
+						/>
+					) : (
+						<div className="space-y-3">
+							{notifications.map((n) => {
+								const isFresh = freshKeys.has(`notification:${n.thread_id}`);
+								return (
+									<a
+										key={n.thread_id}
+										className={cn(
+											"group block rounded-lg border bg-background/40 px-3 py-2 transition-[background-color,border-color,box-shadow] duration-200 hover:bg-background",
+											isFresh &&
+												"dashboard-fresh-surface hover:bg-background/70",
+										)}
+										data-inbox-item-fresh={isFresh ? "true" : "false"}
+										href={resolveNotificationHref(n)}
+										target="_blank"
+										rel="noreferrer"
+									>
+										<div className="min-w-0">
+											<div className="flex items-center gap-2">
+												{n.unread ? (
+													<span className="bg-primary size-1.5 shrink-0 rounded-full" />
+												) : (
+													<span className="bg-muted size-1.5 shrink-0 rounded-full" />
+												)}
+												<span className="font-mono text-muted-foreground truncate text-[11px]">
+													{n.repo_full_name ?? "(unknown repo)"}
+												</span>
+											</div>
+											<div className="mt-1 line-clamp-2 text-sm font-medium">
+												{n.subject_title ?? "(no title)"}
+												{isFresh ? (
+													<span
+														className="dashboard-fresh-cue ml-2 inline-flex size-2 rounded-full align-middle"
+														title="刚刚同步"
+													>
+														<span className="sr-only">刚刚同步</span>
+													</span>
+												) : null}
+											</div>
+											<div className="text-muted-foreground mt-1 font-mono text-[11px]">
+												{n.reason ? n.reason : "update"}
+												{n.subject_type ? ` · ${n.subject_type}` : ""}
+												{n.updated_at
+													? ` · ${formatIsoShortLocal(n.updated_at)}`
+													: ""}
+											</div>
+										</div>
+									</a>
+								);
+							})}
+						</div>
+					)}
+				</ListSurfaceShell>
 			</CardContent>
 		</Card>
 	);
