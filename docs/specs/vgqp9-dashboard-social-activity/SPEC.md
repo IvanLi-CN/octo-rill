@@ -64,6 +64,7 @@
 - `发布` tab 必须继续只展示 release cards，保留原文 / 翻译 / 润色 lane 与 reactions。
 - `加星` tab 必须只展示 `repo_star_received` 记录；`关注` tab 必须只展示 `follower_received` 记录；公告与 Fork 不得进入任何独立筛选 tab。
 - 社交记录卡片必须展示对方头像、login 与 GitHub CTA；Fork 必须展示目标仓库名；公告必须使用内容卡片形式展示标题、正文与 GitHub CTA。
+- 桌面宽度下，Release 内容卡片与公告内容卡片必须在项目名称同一行后显示视觉居中对齐的类型图标：Release 使用发布/标签图标，公告使用公告图标；移动端不得为该图标挤占项目名称行。
 - `repo_star_received` 记录必须展示目标仓库名。
 - `repo_star_received` 记录必须展示真实 `starred_at`。
 - `follower_received` 记录不得显示时间文案；内部仍保留检测时间用于排序与去重。
@@ -155,6 +156,14 @@
   When 页面渲染完成
   Then 历史日组的 brief 只概括 release，公告、Fork 与其它社交记录仍在同日组中单独显示。
 
+- Given Dashboard `全部` tab 在桌面宽度渲染 release 与 announcement 内容卡片
+  When 用户扫描项目名称行
+  Then release 项目名称后显示 Release 类型图标，announcement 项目名称后显示公告类型图标，且图标与项目名称文字在视觉中心线上对齐。
+
+- Given Dashboard `全部` tab 在移动端宽度渲染 release 与 announcement 内容卡片
+  When 用户扫描项目名称行
+  Then 类型图标隐藏，项目名称、移动端 lane 控制与 GitHub CTA 不被额外标识挤占。
+
 - Given 某条 `repo_star_received` 记录
   When 卡片渲染完成
   Then 必须可见 stargazer 头像、login、目标仓库名、发生时间与单个 GitHub CTA。
@@ -221,11 +230,17 @@
 
 ![All mixed timeline with announcement and Fork](./assets/dashboard-all-announcement-fork-feed.png)
 
+### Release and announcement type icons
+
+PR: include
+
+![Dashboard release and announcement type icons](./assets/dashboard-release-announcement-type-icons.png)
+
 ## 方案概述（Approach, high-level）
 
 - 在同步层新增“本人个人仓库 stargazers + 本人 followers”的快照拉取与写入，首次与增量 snapshot 都进入 append-only `social_activity_events`。
 - `/api/feed` 改为 release + social events 的统一 union query，并让分页 cursor 以 `sort_ts + kind_rank + id_key` 稳定排序；`发布 / 加星 / 关注` 通过 `types` 请求服务端专属数据集，公告与 Fork 仅随默认 `全部` 数据集返回。
-- 前端保持 release card 行为不变，为 star / follower / Fork 新增轻量只读动态卡片，并在头像缺失或加载失败时回退到稳定占位头像；followers 卡片不渲染时间行，Fork 卡片显示目标仓库名和对应动作图标；公告使用内容卡片展示标题与 Markdown 正文。
+- 前端保持 release card 行为不变，为 star / follower / Fork 新增轻量只读动态卡片，并在头像缺失或加载失败时回退到稳定占位头像；followers 卡片不渲染时间行，Fork 卡片显示目标仓库名和对应动作图标；公告使用内容卡片展示标题与 Markdown 正文；桌面端 release / announcement 内容卡片在项目名称行后显示居中对齐的类型图标以降低混排扫描歧义。
 - 历史日报组继续只概括 release，社交记录在同日组中以原始卡片单独呈现。
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
