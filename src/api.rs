@@ -16,7 +16,7 @@ use chrono::{Datelike, TimeZone};
 use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
-use sqlx::Row;
+use sqlx::{QueryBuilder, Row};
 use tokio::{io::AsyncReadExt, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
@@ -976,6 +976,7 @@ async fn load_recent_sync_auto_fetch_tasks(
           FROM job_tasks child
           JOIN recent_roots root ON root.id = child.parent_task_id
           WHERE child.task_type IN (?, ?)
+            AND child.parent_task_id IS NOT NULL
         ),
         chain_rollup AS (
           SELECT
@@ -1977,9 +1978,11 @@ pub async fn admin_jobs_overview(
         SELECT COUNT(*)
         FROM job_tasks
         WHERE status = 'failed'
-          AND datetime(finished_at) >= datetime('now', '-1 day')
+          AND finished_at IS NOT NULL
+          AND finished_at >= ?
         "#,
     )
+    .bind((chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339())
     .fetch_one(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -1988,9 +1991,11 @@ pub async fn admin_jobs_overview(
         SELECT COUNT(*)
         FROM job_tasks
         WHERE status = 'succeeded'
-          AND datetime(finished_at) >= datetime('now', '-1 day')
+          AND finished_at IS NOT NULL
+          AND finished_at >= ?
         "#,
     )
+    .bind((chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339())
     .fetch_one(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -2714,8 +2719,8 @@ async fn load_admin_dashboard_llm_health(
         r#"
         SELECT COUNT(*)
         FROM llm_calls
-        WHERE julianday({health_window_timestamp_expr}) >= julianday(?)
-          AND julianday({health_window_timestamp_expr}) <= julianday(?)
+        WHERE {health_window_timestamp_expr} >= ?
+          AND {health_window_timestamp_expr} <= ?
         "#,
     ))
     .bind(since.as_str())
@@ -2727,8 +2732,8 @@ async fn load_admin_dashboard_llm_health(
         r#"
         SELECT COUNT(*)
         FROM llm_calls
-        WHERE julianday({health_window_timestamp_expr}) >= julianday(?)
-          AND julianday({health_window_timestamp_expr}) <= julianday(?)
+        WHERE {health_window_timestamp_expr} >= ?
+          AND {health_window_timestamp_expr} <= ?
           AND status = 'failed'
         "#,
     ))
@@ -2741,8 +2746,8 @@ async fn load_admin_dashboard_llm_health(
         r#"
         SELECT MAX({health_window_timestamp_expr})
         FROM llm_calls
-        WHERE julianday({health_window_timestamp_expr}) >= julianday(?)
-          AND julianday({health_window_timestamp_expr}) <= julianday(?)
+        WHERE {health_window_timestamp_expr} >= ?
+          AND {health_window_timestamp_expr} <= ?
           AND status = 'failed'
         "#,
     ))
@@ -2757,8 +2762,8 @@ async fn load_admin_dashboard_llm_health(
           COALESCE(NULLIF(TRIM(error_text), ''), '未记录错误文本') AS label,
           COUNT(*) AS count
         FROM llm_calls
-        WHERE julianday({health_window_timestamp_expr}) >= julianday(?)
-          AND julianday({health_window_timestamp_expr}) <= julianday(?)
+        WHERE {health_window_timestamp_expr} >= ?
+          AND {health_window_timestamp_expr} <= ?
           AND status = 'failed'
         GROUP BY label
         ORDER BY count DESC, label ASC
@@ -2777,8 +2782,8 @@ async fn load_admin_dashboard_llm_health(
         r#"
         SELECT source AS label, COUNT(*) AS count
         FROM llm_calls
-        WHERE julianday({health_window_timestamp_expr}) >= julianday(?)
-          AND julianday({health_window_timestamp_expr}) <= julianday(?)
+        WHERE {health_window_timestamp_expr} >= ?
+          AND {health_window_timestamp_expr} <= ?
           AND status = 'failed'
         GROUP BY source
         ORDER BY count DESC, label ASC
@@ -3174,41 +3179,27 @@ pub async fn admin_list_realtime_tasks(
     let scheduled_daily_task = jobs::SCHEDULED_TASK_TYPES[0];
     let scheduled_subscription_task = jobs::SCHEDULED_TASK_TYPES[1];
     let scheduled_retry_task = jobs::SCHEDULED_TASK_TYPES[2];
+    let mut total_query =
+        QueryBuilder::<sqlx::Sqlite>::new("SELECT COUNT(*) FROM job_tasks WHERE 1 = 1");
+    append_admin_realtime_task_filters(
+        &mut total_query,
+        status.clone(),
+        task_type.clone(),
+        exclude_task_type.clone(),
+        task_group.clone(),
+        [
+            scheduled_daily_task.to_owned(),
+            scheduled_subscription_task.to_owned(),
+            scheduled_retry_task.to_owned(),
+        ],
+    );
+    let total = total_query
+        .build_query_scalar::<i64>()
+        .fetch_one(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
 
-    let total = sqlx::query_scalar::<_, i64>(
-        r#"
-        SELECT COUNT(*)
-        FROM job_tasks
-        WHERE (? = 'all' OR status = ?)
-          AND (? = '' OR task_type = ?)
-          AND (? = '' OR task_type != ?)
-          AND (
-            ? = 'all'
-            OR (? = 'scheduled' AND task_type IN (?, ?, ?))
-            OR (? = 'realtime' AND task_type NOT IN (?, ?, ?))
-          )
-        "#,
-    )
-    .bind(status.as_str())
-    .bind(status.as_str())
-    .bind(task_type.as_str())
-    .bind(task_type.as_str())
-    .bind(exclude_task_type.as_str())
-    .bind(exclude_task_type.as_str())
-    .bind(task_group.as_str())
-    .bind(task_group.as_str())
-    .bind(scheduled_daily_task)
-    .bind(scheduled_subscription_task)
-    .bind(scheduled_retry_task)
-    .bind(task_group.as_str())
-    .bind(scheduled_daily_task)
-    .bind(scheduled_subscription_task)
-    .bind(scheduled_retry_task)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
-
-    let items = sqlx::query_as::<_, AdminRealtimeTaskItem>(
+    let mut items_query = QueryBuilder::<sqlx::Sqlite>::new(
         r#"
         SELECT
           id,
@@ -3225,41 +3216,30 @@ pub async fn admin_list_realtime_tasks(
           finished_at,
           updated_at
         FROM job_tasks
-        WHERE (? = 'all' OR status = ?)
-          AND (? = '' OR task_type = ?)
-          AND (? = '' OR task_type != ?)
-          AND (
-            ? = 'all'
-            OR (? = 'scheduled' AND task_type IN (?, ?, ?))
-            OR (? = 'realtime' AND task_type NOT IN (?, ?, ?))
-          )
-        ORDER BY
-          unixepoch(created_at) DESC,
-          created_at DESC,
-          id DESC
-        LIMIT ? OFFSET ?
+        WHERE 1 = 1
         "#,
-    )
-    .bind(status.as_str())
-    .bind(status.as_str())
-    .bind(task_type.as_str())
-    .bind(task_type.as_str())
-    .bind(exclude_task_type.as_str())
-    .bind(exclude_task_type.as_str())
-    .bind(task_group.as_str())
-    .bind(task_group.as_str())
-    .bind(jobs::TASK_BRIEF_DAILY_SLOT)
-    .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
-    .bind(jobs::TASK_RETRY_RECENT_FAILURES)
-    .bind(task_group.as_str())
-    .bind(jobs::TASK_BRIEF_DAILY_SLOT)
-    .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
-    .bind(jobs::TASK_RETRY_RECENT_FAILURES)
-    .bind(page_size)
-    .bind(offset)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    );
+    append_admin_realtime_task_filters(
+        &mut items_query,
+        status,
+        task_type,
+        exclude_task_type,
+        task_group.clone(),
+        [
+            jobs::TASK_BRIEF_DAILY_SLOT.to_owned(),
+            jobs::TASK_SYNC_SUBSCRIPTIONS.to_owned(),
+            jobs::TASK_RETRY_RECENT_FAILURES.to_owned(),
+        ],
+    );
+    items_query.push(" ORDER BY created_at DESC, id DESC LIMIT ");
+    items_query.push_bind(page_size);
+    items_query.push(" OFFSET ");
+    items_query.push_bind(offset);
+    let items = items_query
+        .build_query_as::<AdminRealtimeTaskItem>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
 
     let items = items
         .into_iter()
@@ -3276,6 +3256,47 @@ pub async fn admin_list_realtime_tasks(
         page_size,
         total,
     }))
+}
+
+fn append_admin_realtime_task_filters(
+    query: &mut QueryBuilder<'_, sqlx::Sqlite>,
+    status: String,
+    task_type: String,
+    exclude_task_type: String,
+    task_group: String,
+    scheduled_tasks: [String; 3],
+) {
+    if status != "all" {
+        query.push(" AND status = ");
+        query.push_bind(status);
+    }
+    if !task_type.is_empty() {
+        query.push(" AND task_type = ");
+        query.push_bind(task_type);
+    }
+    if !exclude_task_type.is_empty() {
+        query.push(" AND task_type != ");
+        query.push_bind(exclude_task_type);
+    }
+    match task_group.as_str() {
+        "scheduled" => {
+            query.push(" AND task_type IN (");
+            let mut separated = query.separated(", ");
+            for task in scheduled_tasks {
+                separated.push_bind(task);
+            }
+            separated.push_unseparated(")");
+        }
+        "realtime" => {
+            query.push(" AND task_type NOT IN (");
+            let mut separated = query.separated(", ");
+            for task in scheduled_tasks {
+                separated.push_bind(task);
+            }
+            separated.push_unseparated(")");
+        }
+        _ => {}
+    }
 }
 
 #[derive(Clone, Debug, Serialize, sqlx::FromRow)]
@@ -18519,6 +18540,107 @@ mod tests {
             !details
                 .iter()
                 .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY"))
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_jobs_overview_recent_finished_counts_use_finished_status_index() {
+        let pool = setup_pool().await;
+        let plan_rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE status = 'succeeded'
+              AND finished_at IS NOT NULL
+              AND finished_at >= ?
+            "#,
+        )
+        .bind("2026-04-27T00:00:00Z")
+        .fetch_all(&pool)
+        .await
+        .expect("load query plan");
+
+        let details = plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_job_tasks_finished_status"))
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_list_realtime_tasks_query_plan_avoids_temp_btree_sort() {
+        let pool = setup_pool().await;
+        let plan_rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT
+              id,
+              task_type,
+              status,
+              created_at
+            FROM job_tasks
+            WHERE status = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            "#,
+        )
+        .bind("running")
+        .bind(20_i64)
+        .bind(0_i64)
+        .fetch_all(&pool)
+        .await
+        .expect("load query plan");
+
+        let details = plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_job_tasks_status_created_at"))
+                || details
+                    .iter()
+                    .any(|detail| detail.contains("idx_job_tasks_realtime_created"))
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY"))
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_dashboard_llm_health_query_plan_uses_coalesced_timestamp_index() {
+        let pool = setup_pool().await;
+        let plan_rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT COUNT(*)
+            FROM llm_calls
+            WHERE COALESCE(finished_at, updated_at, created_at) >= ?
+              AND COALESCE(finished_at, updated_at, created_at) <= ?
+            "#,
+        )
+        .bind("2026-04-26T00:00:00Z")
+        .bind("2026-04-27T00:00:00Z")
+        .fetch_all(&pool)
+        .await
+        .expect("load query plan");
+
+        let details = plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_llm_calls_finished_updated_created"))
         );
     }
 
