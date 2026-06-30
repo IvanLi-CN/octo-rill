@@ -199,6 +199,29 @@ function displayTitleForLane(item: ReleaseFeedItem, lane: FeedLane) {
 	return originalTitle;
 }
 
+function FeedItemTypeIcon(props: {
+	type: "announcement" | "release";
+	className?: string;
+}) {
+	const { type, className } = props;
+	const Icon = type === "announcement" ? Megaphone : Tag;
+	const label = type === "announcement" ? "公告" : "Release";
+
+	return (
+		<span
+			aria-hidden="true"
+			className={cn(
+				"hidden shrink-0 items-center justify-center text-muted-foreground sm:inline-flex",
+				className,
+			)}
+			data-feed-item-type-icon={type}
+			title={label}
+		>
+			<Icon className="size-3.5" strokeWidth={1.75} aria-hidden="true" />
+		</span>
+	);
+}
+
 function OriginalLane(props: { item: ReleaseFeedItem }) {
 	const { item } = props;
 	if (item.body?.trim()) {
@@ -1173,6 +1196,7 @@ function AnnouncementContentCard(props: {
 												className="min-w-0 min-h-8"
 												labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
 												visualClassName="size-8"
+												labelSuffix={<FeedItemTypeIcon type="announcement" />}
 											/>
 										</InternalLink>
 									) : (
@@ -1182,12 +1206,9 @@ function AnnouncementContentCard(props: {
 											className="min-w-0 min-h-8"
 											labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
 											visualClassName="size-8"
+											labelSuffix={<FeedItemTypeIcon type="announcement" />}
 										/>
 									)}
-									<span className="inline-flex items-center gap-1 rounded-full border border-border/70 bg-muted/35 px-2 py-1 text-[11px] font-medium text-muted-foreground">
-										<Megaphone className="size-3.5" />
-										公告
-									</span>
 								</div>
 
 								<CardTitle className="mt-2 text-balance text-[1.35rem] leading-tight sm:mt-2.5 sm:text-lg">
@@ -1342,6 +1363,7 @@ export function ReleaseFeedCard(props: {
 											className="min-w-0 min-h-8"
 											labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
 											visualClassName="size-8"
+											labelSuffix={<FeedItemTypeIcon type="release" />}
 										/>
 									</InternalLink>
 								) : (
@@ -1351,6 +1373,7 @@ export function ReleaseFeedCard(props: {
 										className="min-w-0 min-h-8"
 										labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
 										visualClassName="size-8"
+										labelSuffix={<FeedItemTypeIcon type="release" />}
 									/>
 								)}
 							</div>

@@ -5,8 +5,8 @@
 - Lifecycle: active
 - Implementation: 已交付
 - Created: 2026-04-10
-- Last: 2026-04-26
-- Summary: 已交付；全部 tab 已扩展公告与 Fork 混排，专属 tabs 保持发布 / 加星 / 关注 / 日报 / 收件箱口径
+- Last: 2026-06-30
+- Summary: 已交付；全部 tab 已扩展公告与 Fork 混排，专属 tabs 保持发布 / 加星 / 关注 / 日报 / 收件箱口径；桌面内容卡片项目名后补充 Release / 公告类型图标
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -26,3 +26,4 @@
 - [x] M3: 落地 Dashboard 新 tabs、社交卡片、头像 fallback 与日组行为。
 - [x] M4: 完成 Storybook、视觉证据、回归测试与 merge-ready 收口。
 - [x] M5: 公告与 Fork 作为 ambient feed 事件进入 `全部` tab，不新增独立 tab。
+- [x] M6: 桌面宽度下，Release 与公告内容卡片在项目名称后显示类型图标；移动端保持隐藏以避免挤占标题行。

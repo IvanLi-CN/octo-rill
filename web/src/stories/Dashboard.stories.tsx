@@ -217,6 +217,36 @@ const HISTORY_RAW_MARKER = "raw-history-guardrails-marker";
 const FALLBACK_RAW_MARKER = "raw-fallback-release-marker";
 const OWNER_RELEASE_OPT_IN_TITLE = "v2.64.0 · 仓库可见性更新";
 
+function expectFeedTypeIconAlignedWithRepoLabel(icon: HTMLElement) {
+	const labelRow = icon.closest<HTMLElement>(
+		'[data-repo-identity-label-row="true"]',
+	);
+	expect(labelRow).not.toBeNull();
+	const label = labelRow?.querySelector<HTMLElement>(
+		'[data-repo-identity-label="true"]',
+	);
+	expect(label).not.toBeNull();
+	if (!label) return;
+
+	const iconRect = icon.getBoundingClientRect();
+	const labelRect = label.getBoundingClientRect();
+	const iconCenterY = iconRect.top + iconRect.height / 2;
+	const labelCenterY = labelRect.top + labelRect.height / 2;
+	expect(Math.abs(iconCenterY - labelCenterY)).toBeLessThanOrEqual(1.5);
+}
+
+function expectFeedTypeIconHasNoBadgeChrome(icon: HTMLElement) {
+	const style = window.getComputedStyle(icon);
+	expect(icon.getAttribute("aria-hidden")).toBe("true");
+	expect(icon.getAttribute("role")).toBeNull();
+	expect(style.borderTopWidth).toBe("0px");
+	expect(style.backgroundColor).toBe("rgba(0, 0, 0, 0)");
+	expect(icon.classList.contains("text-muted-foreground")).toBe(true);
+	const svg = icon.querySelector("svg");
+	expect(svg?.getAttribute("stroke-width")).toBe("1.75");
+	expect(svg?.classList.contains("size-3.5")).toBe(true);
+}
+
 function filterStoryFeedItemsForTab(
 	items: FeedItem[],
 	tab: "all" | "releases" | "stars" | "followers",
@@ -1577,6 +1607,14 @@ function makeMixedSocialFeed(): FeedItem[] {
 
 function makeAnnouncementAndForkFocusFeed(): FeedItem[] {
 	return [
+		buildFeedItem("release-type-icon-focus", {
+			ts: "2026-04-04T16:48:00+08:00",
+			repo_full_name: "acme/rocket",
+			repo_visual: repoVisualFixtures.social,
+			title: "v3.2.0 类型标识检查",
+			body: "- Release 卡片在桌面项目名后展示类型图标",
+			html_url: "https://github.com/acme/rocket/releases/tag/v3.2.0",
+		}),
 		buildAnnouncementItem("announcement-focus", {
 			ts: "2026-04-04T16:30:00+08:00",
 			title: "公告以内容卡片进入全部流",
@@ -5694,7 +5732,75 @@ export const AnnouncementAndForkAllTab: Story = {
 		docs: {
 			description: {
 				story:
-					"聚焦展示本次变更：公告在 `全部` tab 中以内容卡片展示，Fork 仍以活动卡展示；两者都没有独立 tab。",
+					"聚焦展示公告、Release 与 Fork 的信息流区分：公告和 Release 在桌面项目名后显示类型图标，Fork 仍以活动卡展示；公告和 Fork 都没有独立 tab。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "v3.2.0 类型标识检查" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("heading", { name: "公告以内容卡片进入全部流" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByText(
+				"这条 Story 专门展示 Discussions Announcements 公告卡。",
+			),
+		).toBeVisible();
+		await expect(
+			canvas.getByText("octocat/content-card-demo-fork", { exact: true }),
+		).toBeVisible();
+		expect(
+			canvasElement.querySelectorAll<HTMLElement>("[data-announcement-card]")
+				.length,
+		).toBe(1);
+		expect(
+			canvasElement.querySelector('[data-social-card-kind="announcement"]'),
+		).toBeNull();
+		expect(
+			canvasElement.querySelectorAll('[data-social-card-kind="repo_forked"]')
+				.length,
+		).toBe(1);
+		const releaseTypeIcon = canvasElement.querySelector<HTMLElement>(
+			'[data-feed-item-type-icon="release"]',
+		);
+		const announcementTypeIcon = canvasElement.querySelector<HTMLElement>(
+			'[data-feed-item-type-icon="announcement"]',
+		);
+		expect(releaseTypeIcon).not.toBeNull();
+		expect(announcementTypeIcon).not.toBeNull();
+		if (releaseTypeIcon) {
+			expectFeedTypeIconAlignedWithRepoLabel(releaseTypeIcon);
+			expectFeedTypeIconHasNoBadgeChrome(releaseTypeIcon);
+		}
+		if (announcementTypeIcon) {
+			expectFeedTypeIconAlignedWithRepoLabel(announcementTypeIcon);
+			expectFeedTypeIconHasNoBadgeChrome(announcementTypeIcon);
+		}
+		await expect(
+			canvas.queryByRole("tab", { name: "公告" }),
+		).not.toBeInTheDocument();
+		await expect(
+			canvas.queryByRole("tab", { name: "Fork" }),
+		).not.toBeInTheDocument();
+	},
+};
+
+export const MobileAnnouncementAndForkAllTab: Story = {
+	name: "Mobile / Announcement content card + Fork",
+	render: () => (
+		<DashboardPreview feedItems={makeAnnouncementAndForkFocusFeed()} />
+	),
+	parameters: {
+		viewport: {
+			defaultViewport: "dashboardMobile390",
+		},
+		docs: {
+			description: {
+				story:
+					"窄屏下类型图标不挤占项目名行，公告仍以内容卡片展示，Fork 仍以活动卡展示。",
 			},
 		},
 	},
@@ -5705,7 +5811,7 @@ export const AnnouncementAndForkAllTab: Story = {
 		).toBeVisible();
 		await expect(
 			canvas.getByText(
-				"这条 Story 专门展示本次变更的核心：公告不是社交桥接卡。",
+				"这条 Story 专门展示 Discussions Announcements 公告卡。",
 			),
 		).toBeVisible();
 		await expect(
@@ -5728,6 +5834,20 @@ export const AnnouncementAndForkAllTab: Story = {
 		await expect(
 			canvas.queryByRole("tab", { name: "Fork" }),
 		).not.toBeInTheDocument();
+		const releaseTypeIcon = canvasElement.querySelector<HTMLElement>(
+			'[data-feed-item-type-icon="release"]',
+		);
+		const announcementTypeIcon = canvasElement.querySelector<HTMLElement>(
+			'[data-feed-item-type-icon="announcement"]',
+		);
+		expect(releaseTypeIcon).not.toBeNull();
+		expect(announcementTypeIcon).not.toBeNull();
+		if (releaseTypeIcon) {
+			await expect(releaseTypeIcon).not.toBeVisible();
+		}
+		if (announcementTypeIcon) {
+			await expect(announcementTypeIcon).not.toBeVisible();
+		}
 	},
 };
 
