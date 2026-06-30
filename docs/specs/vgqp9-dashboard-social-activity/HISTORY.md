@@ -4,10 +4,11 @@
 
 - Lifecycle: active
 - Created: 2026-04-10
-- Last: 2026-04-26
+- Last: 2026-06-30
 
 ## 历史摘要
 
 - 2026-04-10: 建立该主题规格并冻结基础范围。
 - 2026-04-16: 已交付；dashboard social activity labels aligned to 发布 / 加星 / 关注 / 收件箱; spec wording refreshed for current top-level tabs
 - 2026-04-26: `全部` tab ambient feed 扩展为公告与 Fork 混排；公告/Fork 不新增独立 tab，`types` 仍只保留 releases / stars / followers。
+- 2026-06-30: 桌面宽度下，Release 与公告内容卡片在项目名称后显示类型图标，解决混排流中公告与 Release 难以一眼区分的问题；移动端保持隐藏，避免挤占项目名称行。

@@ -11,6 +11,7 @@ export function RepoIdentity(props: {
 	className?: string;
 	labelClassName?: string;
 	visualClassName?: string;
+	labelSuffix?: ReactNode;
 	children?: ReactNode;
 }) {
 	const {
@@ -19,6 +20,7 @@ export function RepoIdentity(props: {
 		className,
 		labelClassName,
 		visualClassName,
+		labelSuffix,
 		children,
 	} = props;
 
@@ -39,6 +41,7 @@ export function RepoIdentity(props: {
 			className={className}
 			labelClassName={labelClassName}
 			visualClassName={visualClassName}
+			labelSuffix={labelSuffix}
 		>
 			{children}
 		</RepoIdentityContent>
@@ -51,6 +54,7 @@ function RepoIdentityContent(props: {
 	className?: string;
 	labelClassName?: string;
 	visualClassName?: string;
+	labelSuffix?: ReactNode;
 	children?: ReactNode;
 }) {
 	const {
@@ -59,6 +63,7 @@ function RepoIdentityContent(props: {
 		className,
 		labelClassName,
 		visualClassName,
+		labelSuffix,
 		children,
 	} = props;
 	const candidates = useMemo(
@@ -152,8 +157,17 @@ function RepoIdentityContent(props: {
 				)}
 			</span>
 			<span className="flex min-w-0 flex-col justify-center">
-				<span className={cn("block truncate", labelClassName)}>
-					{repoFullName}
+				<span
+					className="flex min-w-0 items-center gap-1.5"
+					data-repo-identity-label-row="true"
+				>
+					<span
+						className={cn("block min-w-0 truncate", labelClassName)}
+						data-repo-identity-label="true"
+					>
+						{repoFullName}
+					</span>
+					{labelSuffix}
 				</span>
 				{children}
 			</span>
