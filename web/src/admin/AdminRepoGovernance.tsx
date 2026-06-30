@@ -38,8 +38,6 @@ const GRID_DENSE_CELL = 3;
 const GRID_ULTRA_DENSE_CELL = 3;
 const GRID_COMPACT_BLOCK_THRESHOLD = 8000;
 const GRID_COMPACT_TARGET_ASPECT_RATIO = 3.2;
-const GRID_COMPACT_MIN_WIDTH = 300;
-const GRID_COMPACT_MAX_WIDTH = 420;
 const GRID_HEIGHT_TARGET_RATIO = 0.52;
 const GRID_ULTRA_DENSE_HEIGHT_TARGET_RATIO = 0.28;
 const GRID_LEGEND_SKELETON_IDS = [
@@ -236,15 +234,8 @@ function GovernanceGrid(props: {
 				1,
 				Math.ceil(Math.sqrt(totalCells * GRID_COMPACT_TARGET_ASPECT_RATIO)),
 			);
-			const targetWidth = Math.min(
-				hostWidth,
-				Math.max(
-					GRID_COMPACT_MIN_WIDTH,
-					Math.min(GRID_COMPACT_MAX_WIDTH, hostWidth * 0.48),
-				),
-			);
-			cell = Math.max(GRID_MIN_CELL, targetWidth / columns);
-			width = columns * cell;
+			cell = Math.max(GRID_MIN_CELL, hostWidth / columns);
+			width = hostWidth;
 			const rows = Math.max(1, Math.ceil(cells.length / columns));
 			height = rows * cell;
 		} else {
@@ -326,8 +317,8 @@ function RepoRow(props: { item: AdminRepoGovernanceListItem }) {
 	const { item } = props;
 
 	return (
-		<div className="rounded-2xl border border-border/70 bg-card/70 p-4 transition-colors duration-200 hover:bg-card/90">
-			<div className="min-w-0 space-y-2">
+		<article className="rounded-2xl border border-border/70 bg-card/70 p-4 transition-colors duration-200 hover:bg-card/90">
+			<div className="grid gap-3">
 				<div className="flex flex-wrap items-center gap-2">
 					<p className="truncate font-medium text-sm text-foreground">
 						{item.repo_full_name}
@@ -336,7 +327,7 @@ function RepoRow(props: { item: AdminRepoGovernanceListItem }) {
 						{urgencyLabel(item.urgency_bucket)}
 					</Badge>
 				</div>
-				<dl className="flex flex-wrap gap-x-4 gap-y-2 text-sm">
+				<dl className="grid gap-x-4 gap-y-2 text-sm sm:grid-cols-3">
 					<div className="inline-flex items-baseline gap-1.5">
 						<dt className="text-muted-foreground">排序</dt>
 						<dd className="font-semibold text-foreground">
@@ -356,7 +347,7 @@ function RepoRow(props: { item: AdminRepoGovernanceListItem }) {
 						</dd>
 					</div>
 				</dl>
-				<dl className="flex flex-wrap gap-x-4 gap-y-2 text-xs">
+				<dl className="grid gap-x-4 gap-y-2 text-xs sm:grid-cols-3">
 					<div className="inline-flex items-baseline gap-1.5">
 						<dt className="text-muted-foreground">关注人数</dt>
 						<dd className="font-medium text-foreground">
@@ -382,7 +373,7 @@ function RepoRow(props: { item: AdminRepoGovernanceListItem }) {
 					{sourceLabel(item.actual_last_success_source)}
 				</p>
 			</div>
-		</div>
+		</article>
 	);
 }
 
@@ -777,46 +768,46 @@ export function AdminRepoGovernance() {
 							))}
 						</div>
 					) : (
-						<div className="space-y-3">
+						<div className="grid gap-3 lg:grid-cols-2">
 							{(list?.items ?? []).map((item) => (
 								<RepoRow key={item.repo_id} item={item} />
 							))}
 							{(list?.items ?? []).length === 0 ? (
-								<p className="rounded-2xl border border-dashed border-border/70 bg-muted/20 px-4 py-6 text-center text-muted-foreground text-sm">
+								<p className="rounded-2xl border border-dashed border-border/70 bg-muted/20 px-4 py-6 text-center text-muted-foreground text-sm lg:col-span-2">
 									没有匹配的仓库。
 								</p>
 							) : null}
-							<div className="flex items-center justify-between gap-3 border-t border-border/70 pt-3 text-sm">
-								<p className="text-muted-foreground">
-									共 {list?.total ?? 0} 个仓库 · 第 {page}/{totalPages} 页
-								</p>
-								<div className="flex gap-2">
-									<Button
-										type="button"
-										variant="outline"
-										size="sm"
-										disabled={page <= 1 || listLoading}
-										onClick={() =>
-											setPage((current) => Math.max(1, current - 1))
-										}
-									>
-										上一页
-									</Button>
-									<Button
-										type="button"
-										variant="outline"
-										size="sm"
-										disabled={page >= totalPages || listLoading}
-										onClick={() =>
-											setPage((current) => Math.min(totalPages, current + 1))
-										}
-									>
-										下一页
-									</Button>
-								</div>
-							</div>
 						</div>
 					)}
+					{!listLoading || list ? (
+						<div className="flex items-center justify-between gap-3 border-t border-border/70 pt-3 text-sm">
+							<p className="text-muted-foreground">
+								共 {list?.total ?? 0} 个仓库 · 第 {page}/{totalPages} 页
+							</p>
+							<div className="flex gap-2">
+								<Button
+									type="button"
+									variant="outline"
+									size="sm"
+									disabled={page <= 1 || listLoading}
+									onClick={() => setPage((current) => Math.max(1, current - 1))}
+								>
+									上一页
+								</Button>
+								<Button
+									type="button"
+									variant="outline"
+									size="sm"
+									disabled={page >= totalPages || listLoading}
+									onClick={() =>
+										setPage((current) => Math.min(totalPages, current + 1))
+									}
+								>
+									下一页
+								</Button>
+							</div>
+						</div>
+					) : null}
 				</CardContent>
 			</Card>
 		</div>

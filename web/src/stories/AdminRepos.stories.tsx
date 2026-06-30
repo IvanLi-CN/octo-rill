@@ -407,6 +407,8 @@ export const EvidenceDesktop: Story = {
 			canvas.getByRole("link", { name: /打开订阅同步设置，当前系统预算/i }),
 		).toBeVisible();
 		await expect(canvas.getByText("octo-rill/octo-rill")).toBeVisible();
+		await expect(canvas.getByText("openai/openai-openapi")).toBeVisible();
+		await expect(canvas.getByText("microsoft/typescript")).toBeVisible();
 	},
 	parameters: {
 		docs: {
@@ -437,6 +439,7 @@ export const EvidenceNarrowTablet: Story = {
 		await expect(canvas.getByText("仓库明细")).toBeVisible();
 		await expect(canvas.getByPlaceholderText("搜索仓库全名")).toBeVisible();
 		await expect(canvas.getByText("openai/openai-openapi")).toBeVisible();
+		await expect(canvas.getByText("vercel/next.js")).toBeVisible();
 	},
 	parameters: {
 		docs: {
