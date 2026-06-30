@@ -7461,8 +7461,8 @@ async fn prune_subscription_sync_history(state: &AppState) -> Result<()> {
                             WHERE id IN (
                               SELECT id
                               FROM repo_release_watchers
-                              WHERE (status = 'succeeded' AND julianday(updated_at) < julianday(?))
-                                 OR (status = 'failed' AND julianday(updated_at) < julianday(?))
+                              WHERE (status = 'succeeded' AND updated_at < ?)
+                                 OR (status = 'failed' AND updated_at < ?)
                               LIMIT ?
                             )
                             "#,
@@ -16500,8 +16500,8 @@ mod tests {
             WHERE id IN (
               SELECT id
               FROM repo_release_watchers
-              WHERE (status = 'succeeded' AND julianday(updated_at) < julianday(?))
-                 OR (status = 'failed' AND julianday(updated_at) < julianday(?))
+              WHERE (status = 'succeeded' AND updated_at < ?)
+                 OR (status = 'failed' AND updated_at < ?)
               LIMIT ?
             )
             "#,
