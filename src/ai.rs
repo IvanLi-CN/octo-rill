@@ -933,6 +933,7 @@ pub fn spawn_model_catalog_sync_task(state: Arc<AppState>) -> tokio::task::Abort
 async fn cleanup_expired_llm_calls(state: &AppState) -> Result<u64> {
     let retention_seconds = i64::try_from(LLM_CALL_LOG_RETENTION.as_secs()).unwrap_or(i64::MAX);
     let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(retention_seconds)).to_rfc3339();
+    let started_at = Instant::now();
     match state
         .sqlite_writer
         .try_write("llm_call_retention_cleanup", || async {
@@ -947,12 +948,24 @@ async fn cleanup_expired_llm_calls(state: &AppState) -> Result<u64> {
         })
         .await
     {
-        Ok(Some(deleted)) => Ok(deleted),
+        Ok(Some(deleted)) => {
+            tracing::info!(
+                event = "sqlite.write",
+                operation = "ai.llm_call_retention_cleanup",
+                cutoff = cutoff.as_str(),
+                deleted,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "llm call retention cleanup completed"
+            );
+            Ok(deleted)
+        }
         Ok(None) => {
             tracing::warn!(
                 event = "sqlite.write",
                 operation = "ai.llm_call_retention_cleanup",
                 downgrade_reason = "sqlite_writer_busy",
+                cutoff = cutoff.as_str(),
+                elapsed_ms = started_at.elapsed().as_millis(),
                 "skipped llm call retention cleanup under sqlite writer pressure"
             );
             Ok(0)
@@ -962,6 +975,8 @@ async fn cleanup_expired_llm_calls(state: &AppState) -> Result<u64> {
                 event = "sqlite.write",
                 operation = "ai.llm_call_retention_cleanup",
                 downgrade_reason = "sqlite_busy",
+                cutoff = cutoff.as_str(),
+                elapsed_ms = started_at.elapsed().as_millis(),
                 error_chain = %observability::error_chain_summary(err.as_ref()),
                 "skipped llm call retention cleanup after sqlite busy"
             );
