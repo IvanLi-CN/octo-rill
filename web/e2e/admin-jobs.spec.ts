@@ -1915,10 +1915,13 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(subscriptionsTab).toHaveAttribute("aria-selected", "true");
 	const subscriptionWorkflowCard = page
 		.getByText("ID: task-subscriptions-1")
-		.locator("xpath=ancestor::div[.//a[normalize-space()='工作流详情']][1]");
-	await subscriptionWorkflowCard
-		.getByRole("link", { name: "工作流详情" })
-		.click();
+		.locator("xpath=ancestor::a[@data-testid='subscription-workflow-card'][1]");
+	await expect(subscriptionWorkflowCard).toBeVisible();
+	await expect(subscriptionWorkflowCard).toHaveAttribute(
+		"href",
+		"/admin/jobs/subscriptions/task-subscriptions-1",
+	);
+	await subscriptionWorkflowCard.click();
 	await expect(page).toHaveURL(
 		/\/admin\/jobs\/subscriptions\/task-subscriptions-1$/,
 	);

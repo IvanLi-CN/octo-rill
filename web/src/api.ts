@@ -592,6 +592,7 @@ export type AdminRealtimeTaskItem = {
 	started_at: string | null;
 	finished_at: string | null;
 	updated_at: string;
+	diagnostics?: AdminTaskDiagnostics | null;
 };
 export type AdminRealtimeTasksResponse = {
 	items: AdminRealtimeTaskItem[];
