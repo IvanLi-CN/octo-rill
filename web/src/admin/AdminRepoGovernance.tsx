@@ -6,6 +6,13 @@ import {
 	ADMIN_SUBSCRIPTION_SETTINGS_AUTO_OPEN_SESSION_KEY,
 } from "@/admin/jobsRouteState";
 import {
+	ListBlockingErrorState,
+	ListEmptyState,
+	ListInlineError,
+	ListRefreshingNotice,
+	ListSurfaceShell,
+} from "@/components/feedback/listSurface";
+import {
 	type AdminRepoGovernanceGridCell,
 	type AdminRepoGovernanceListItem,
 	type AdminRepoGovernanceListResponse,
@@ -17,6 +24,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useListSurfaceState } from "@/hooks/useListSurfaceState";
 import { Input } from "@/components/ui/input";
 import { InternalLink } from "@/lib/internalNavigation";
 import { useOptionalTheme } from "@/theme/ThemeProvider";
@@ -535,6 +543,12 @@ export function AdminRepoGovernance() {
 		}
 	}
 
+	const listSurface = useListSurfaceState({
+		loading: listLoading,
+		hasData: (list?.items?.length ?? 0) > 0,
+		hasError: listError !== null,
+	});
+
 	return (
 		<div className="space-y-4">
 			<Card
@@ -737,48 +751,58 @@ export function AdminRepoGovernance() {
 							</Button>
 						</div>
 					</div>
-					<div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-						<p className="text-muted-foreground">
-							先看排序、目标窗口和迫切值，再补充实际刷新时间。
-						</p>
-						{listLoading && list ? (
-							<p className="text-muted-foreground inline-flex items-center gap-2">
-								<span className="size-2 rounded-full bg-amber-500/80" />
-								明细更新中…
+					<ListSurfaceShell
+						state={listSurface.state}
+						refreshing={listSurface.showRefreshing}
+						className="space-y-3"
+					>
+						<div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+							<p className="text-muted-foreground">
+								先看排序、目标窗口和迫切值，再补充实际刷新时间。
 							</p>
-						) : null}
-					</div>
-
-					{listError ? (
-						<ErrorPanel
-							title="仓库明细加载失败"
-							message={listError}
-							actionLabel="重试明细"
-							onRetry={() => void loadList()}
-						/>
-					) : null}
-
-					{listLoading && !list ? (
-						<div className="space-y-3">
-							{REPO_ROW_SKELETON_IDS.map((id) => (
-								<div
-									key={`repo-row-skeleton-${id}`}
-									className="h-28 animate-pulse rounded-2xl border border-border/70 bg-muted/45"
-								/>
-							))}
-						</div>
-					) : (
-						<div className="grid gap-3 lg:grid-cols-2">
-							{(list?.items ?? []).map((item) => (
-								<RepoRow key={item.repo_id} item={item} />
-							))}
-							{(list?.items ?? []).length === 0 ? (
-								<p className="rounded-2xl border border-dashed border-border/70 bg-muted/20 px-4 py-6 text-center text-muted-foreground text-sm lg:col-span-2">
-									没有匹配的仓库。
-								</p>
+							{listSurface.showRefreshing ? (
+								<ListRefreshingNotice label="仓库明细更新中..." />
 							) : null}
 						</div>
-					)}
+
+						{listError && (list?.items?.length ?? 0) > 0 ? (
+							<ListInlineError
+								title="仓库明细刷新失败"
+								summary={listError}
+								actionLabel="重试"
+								onAction={() => void loadList()}
+							/>
+						) : null}
+
+						{listSurface.state === "blocking-error" ? (
+							<ListBlockingErrorState
+								title="仓库明细加载失败"
+								summary={listError ?? "当前无法读取仓库明细。"}
+								actionLabel="重试"
+								onAction={() => void loadList()}
+							/>
+						) : listSurface.state === "initial-loading" ? (
+							<div className="space-y-3">
+								{REPO_ROW_SKELETON_IDS.map((id) => (
+									<div
+										key={`repo-row-skeleton-${id}`}
+										className="h-28 animate-pulse rounded-2xl border border-border/70 bg-muted/45"
+									/>
+								))}
+							</div>
+						) : listSurface.state === "empty" ? (
+							<ListEmptyState
+								title="没有匹配的仓库"
+								description="调整关键词或老化筛选后再试一次；仓库明细会按照当前治理优先级返回。"
+							/>
+						) : (
+							<div className="grid gap-3 lg:grid-cols-2">
+								{(list?.items ?? []).map((item) => (
+									<RepoRow key={item.repo_id} item={item} />
+								))}
+							</div>
+						)}
+					</ListSurfaceShell>
 					{!listLoading || list ? (
 						<div className="flex items-center justify-between gap-3 border-t border-border/70 pt-3 text-sm">
 							<p className="text-muted-foreground">

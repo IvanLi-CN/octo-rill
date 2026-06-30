@@ -108,6 +108,14 @@ import {
 	TooltipContent,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
+import {
+	ListBlockingErrorState,
+	ListEmptyState,
+	ListInlineError,
+	ListRefreshingNotice,
+	ListSurfaceShell,
+} from "@/components/feedback/listSurface";
+import { useListSurfaceState } from "@/hooks/useListSurfaceState";
 
 const HM_FORMATTER = new Intl.DateTimeFormat(undefined, {
 	hour: "2-digit",
@@ -954,6 +962,53 @@ function LoadingMessage(props: { children: string }) {
 	);
 }
 
+function CardListSkeleton(props: { count?: number; itemClassName?: string }) {
+	const { count = 3, itemClassName = "h-28" } = props;
+	return (
+		<div className="space-y-2">
+			{Array.from({ length: count }, (_, index) => (
+				<div
+					key={`card-list-skeleton-${index + 1}`}
+					className={`animate-pulse rounded-lg border bg-muted/40 ${itemClassName}`}
+				/>
+			))}
+		</div>
+	);
+}
+
+function TranslationTableSkeleton() {
+	return (
+		<div className="rounded-lg border">
+			<div className="grid grid-cols-[18%_16%_10%_17%_13%_13%_11%_88px] gap-0 border-b bg-muted/35 px-3 py-3">
+				{Array.from({ length: 8 }, (_, index) => (
+					<div
+						key={`translation-table-head-skeleton-${index + 1}`}
+						className="h-4 animate-pulse rounded-full bg-muted"
+					/>
+				))}
+			</div>
+			<div className="space-y-0">
+				{Array.from({ length: 4 }, (_, rowIndex) => (
+					<div
+						key={`translation-table-row-skeleton-${rowIndex + 1}`}
+						className="grid grid-cols-[18%_16%_10%_17%_13%_13%_11%_88px] gap-3 border-b px-3 py-4 last:border-b-0"
+					>
+						{Array.from({ length: 8 }, (_, cellIndex) => (
+							<div
+								key={`translation-table-cell-skeleton-${rowIndex + 1}-${cellIndex + 1}`}
+								className="space-y-2"
+							>
+								<div className="h-4 animate-pulse rounded-full bg-muted" />
+								<div className="h-3 w-4/5 animate-pulse rounded-full bg-muted/80" />
+							</div>
+						))}
+					</div>
+				))}
+			</div>
+		</div>
+	);
+}
+
 function taskTypeLabel(taskType: string) {
 	switch (taskType) {
 		case "brief.daily_slot":
@@ -1607,7 +1662,8 @@ function TranslationSchedulerSection(props: {
 	const [batchDetail, setBatchDetail] =
 		useState<AdminTranslationBatchDetailResponse | null>(null);
 	const [drawerLoading, setDrawerLoading] = useState(false);
-	const [error, setError] = useState<string | null>(null);
+	const [listError, setListError] = useState<string | null>(null);
+	const [detailError, setDetailError] = useState<string | null>(null);
 	const [settingsDialogOpen, setSettingsDialogOpen] = useState(false);
 	const [generalWorkerInput, setGeneralWorkerInput] = useState("");
 	const [dedicatedWorkerInput, setDedicatedWorkerInput] = useState("");
@@ -1625,10 +1681,16 @@ function TranslationSchedulerSection(props: {
 		() => Math.max(1, Math.ceil(batchTotal / TASK_PAGE_SIZE)),
 		[batchTotal],
 	);
-	const requestsRefreshing = requestLoadPhase === "refreshing";
-	const requestsInitialLoading = requestLoadPhase === "initial";
-	const batchesRefreshing = batchLoadPhase === "refreshing";
-	const batchesInitialLoading = batchLoadPhase === "initial";
+	const requestListSurface = useListSurfaceState({
+		loading: requestLoadPhase !== "idle",
+		hasData: requests.length > 0,
+		hasError: listError !== null,
+	});
+	const batchListSurface = useListSurfaceState({
+		loading: batchLoadPhase !== "idle",
+		hasData: batches.length > 0,
+		hasError: listError !== null,
+	});
 	const selectedWorker = useMemo(() => {
 		if (drawer?.kind !== "worker") {
 			return null;
@@ -1714,12 +1776,12 @@ function TranslationSchedulerSection(props: {
 	const openRequestDetail = useCallback(async (requestId: string) => {
 		setDrawer({ kind: "request", id: requestId });
 		setDrawerLoading(true);
-		setError(null);
+		setDetailError(null);
 		try {
 			setBatchDetail(null);
 			setRequestDetail(await apiGetAdminTranslationRequestDetail(requestId));
 		} catch (err) {
-			setError(normalizeErrorMessage(err));
+			setDetailError(normalizeErrorMessage(err));
 		} finally {
 			setDrawerLoading(false);
 		}
@@ -1728,12 +1790,12 @@ function TranslationSchedulerSection(props: {
 	const openBatchDetail = useCallback(async (batchId: string) => {
 		setDrawer({ kind: "batch", id: batchId });
 		setDrawerLoading(true);
-		setError(null);
+		setDetailError(null);
 		try {
 			setRequestDetail(null);
 			setBatchDetail(await apiGetAdminTranslationBatchDetail(batchId));
 		} catch (err) {
-			setError(normalizeErrorMessage(err));
+			setDetailError(normalizeErrorMessage(err));
 		} finally {
 			setDrawerLoading(false);
 		}
@@ -1744,7 +1806,7 @@ function TranslationSchedulerSection(props: {
 		setRequestDetail(null);
 		setBatchDetail(null);
 		setDrawerLoading(false);
-		setError(null);
+		setDetailError(null);
 	}, []);
 
 	const openSettingsDialog = useCallback(() => {
@@ -1790,23 +1852,23 @@ function TranslationSchedulerSection(props: {
 
 	useEffect(() => {
 		if (refreshNonce < 0) return;
-		setError(null);
+		setListError(null);
 		void loadStatus().catch((err) => {
-			setError(normalizeErrorMessage(err));
+			setListError(normalizeErrorMessage(err));
 		});
 	}, [loadStatus, refreshNonce]);
 
 	useEffect(() => {
-		setError(null);
+		setListError(null);
 		void loadRequests(refreshNonce > 0).catch((err) => {
-			setError(normalizeErrorMessage(err));
+			setListError(normalizeErrorMessage(err));
 		});
 	}, [loadRequests, refreshNonce]);
 
 	useEffect(() => {
-		setError(null);
+		setListError(null);
 		void loadBatches(refreshNonce > 0).catch((err) => {
-			setError(normalizeErrorMessage(err));
+			setListError(normalizeErrorMessage(err));
 		});
 	}, [loadBatches, refreshNonce]);
 
@@ -1843,7 +1905,7 @@ function TranslationSchedulerSection(props: {
 				}
 			} catch (err) {
 				if (!canceled) {
-					setError(normalizeErrorMessage(err));
+					setDetailError(normalizeErrorMessage(err));
 				}
 			} finally {
 				if (!canceled) {
@@ -1859,7 +1921,9 @@ function TranslationSchedulerSection(props: {
 
 	return (
 		<>
-			{error ? <p className="text-destructive text-sm">{error}</p> : null}
+			{detailError ? (
+				<p className="text-destructive text-sm">{detailError}</p>
+			) : null}
 			<Card>
 				<CardHeader>
 					<CardTitle>翻译调度</CardTitle>
@@ -1971,147 +2035,168 @@ function TranslationSchedulerSection(props: {
 									共 {formatCount(requestTotal)} 条
 								</span>
 							</div>
-							{requestsRefreshing ? (
-								<p className="text-muted-foreground inline-flex items-center gap-2 text-xs">
-									<span className="size-2 rounded-full bg-amber-500/80" />
-									需求队列更新中...
-								</p>
-							) : null}
-							{requestsInitialLoading ? (
-								<LoadingMessage>正在加载需求队列...</LoadingMessage>
-							) : requests.length === 0 ? (
-								<p className="text-muted-foreground text-sm">暂无需求。</p>
-							) : (
-								<>
-									<div className="hidden md:block">
-										<Table
-											containerClassName="rounded-lg border"
-											className="w-full table-fixed text-sm"
-										>
-											<TableHeader>
-												<TableRow>
-													<TableHead className="w-[18%]">来源</TableHead>
-													<TableHead className="w-[16%]">请求</TableHead>
-													<TableHead className="w-[10%]">状态</TableHead>
-													<TableHead className="w-[17%]">请求ID</TableHead>
-													<TableHead className="w-[13%]">请求人</TableHead>
-													<TableHead className="w-[13%]">作用域</TableHead>
-													<TableHead className="w-[11%]">更新时间</TableHead>
-													<TableHead className="w-[88px] text-right">
-														操作
-													</TableHead>
-												</TableRow>
-											</TableHeader>
-											<TableBody>
-												{requests.map((request) => (
-													<TableRow key={request.id}>
-														<TableCell className="px-3 py-3">
-															<div className="truncate whitespace-nowrap">
-																{request.source}
-															</div>
-															<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
-																{request.producer_ref}
-															</p>
-														</TableCell>
-														<TableCell className="px-3 py-3">
-															<p className="truncate whitespace-nowrap">
-																{request.kind} · {request.variant}
-															</p>
-															<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
-																entity {request.entity_id} ·{" "}
-																{translationRequestOriginLabel(
-																	request.request_origin,
-																)}
-															</p>
-														</TableCell>
-														<TableCell className="px-3 py-3 whitespace-nowrap">
-															<StatusBadge
-																label={translationRunStatusLabel(
-																	request.status,
-																)}
-																tone={translationRunTone(request.status)}
-															/>
-														</TableCell>
-														<TableCell className="px-3 py-3">
-															<div className="truncate whitespace-nowrap font-mono text-xs">
-																{request.id}
-															</div>
-														</TableCell>
-														<TableCell className="px-3 py-3">
-															<div className="truncate whitespace-nowrap font-mono text-xs">
-																{request.requested_by ?? "-"}
-															</div>
-														</TableCell>
-														<TableCell className="px-3 py-3">
-															<div className="truncate whitespace-nowrap font-mono text-xs">
-																#{request.scope_user_id}
-															</div>
-														</TableCell>
-														<TableCell className="px-3 py-3 whitespace-nowrap text-xs">
-															{formatLocalDateTime(request.updated_at)}
-														</TableCell>
-														<TableCell className="px-3 py-3 text-right">
-															<Button
-																variant="outline"
-																size="sm"
-																onClick={() =>
-																	void openRequestDetail(request.id)
-																}
-															>
-																详情
-															</Button>
-														</TableCell>
+							<ListSurfaceShell
+								state={requestListSurface.state}
+								refreshing={requestListSurface.showRefreshing}
+								className="space-y-3"
+							>
+								{requestListSurface.showRefreshing ? (
+									<ListRefreshingNotice label="需求队列更新中..." />
+								) : null}
+								{listError && requests.length > 0 ? (
+									<ListInlineError
+										title="需求队列刷新失败"
+										summary={listError}
+										actionLabel="重试"
+										onAction={() => void loadRequests(true)}
+									/>
+								) : null}
+								{requestListSurface.state === "blocking-error" ? (
+									<ListBlockingErrorState
+										title="需求队列加载失败"
+										summary={listError ?? "当前无法读取需求队列。"}
+										actionLabel="重试"
+										onAction={() => void loadRequests()}
+									/>
+								) : requestListSurface.state === "initial-loading" ? (
+									<TranslationTableSkeleton />
+								) : requestListSurface.state === "empty" ? (
+									<ListEmptyState
+										title="暂无需求"
+										description="当前筛选条件下没有待展示的翻译请求。"
+									/>
+								) : (
+									<>
+										<div className="hidden md:block">
+											<Table
+												containerClassName="rounded-lg border"
+												className="w-full table-fixed text-sm"
+											>
+												<TableHeader>
+													<TableRow>
+														<TableHead className="w-[18%]">来源</TableHead>
+														<TableHead className="w-[16%]">请求</TableHead>
+														<TableHead className="w-[10%]">状态</TableHead>
+														<TableHead className="w-[17%]">请求ID</TableHead>
+														<TableHead className="w-[13%]">请求人</TableHead>
+														<TableHead className="w-[13%]">作用域</TableHead>
+														<TableHead className="w-[11%]">更新时间</TableHead>
+														<TableHead className="w-[88px] text-right">
+															操作
+														</TableHead>
 													</TableRow>
-												))}
-											</TableBody>
-										</Table>
-									</div>
-									<div className="space-y-2 md:hidden">
-										{requests.map((request) => (
-											<div key={request.id} className="rounded-lg border p-3">
-												<div className="flex items-center gap-2">
-													<p className="truncate whitespace-nowrap font-medium text-sm">
-														{request.source}
+												</TableHeader>
+												<TableBody>
+													{requests.map((request) => (
+														<TableRow key={request.id}>
+															<TableCell className="px-3 py-3">
+																<div className="truncate whitespace-nowrap">
+																	{request.source}
+																</div>
+																<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
+																	{request.producer_ref}
+																</p>
+															</TableCell>
+															<TableCell className="px-3 py-3">
+																<p className="truncate whitespace-nowrap">
+																	{request.kind} · {request.variant}
+																</p>
+																<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
+																	entity {request.entity_id} ·{" "}
+																	{translationRequestOriginLabel(
+																		request.request_origin,
+																	)}
+																</p>
+															</TableCell>
+															<TableCell className="px-3 py-3 whitespace-nowrap">
+																<StatusBadge
+																	label={translationRunStatusLabel(
+																		request.status,
+																	)}
+																	tone={translationRunTone(request.status)}
+																/>
+															</TableCell>
+															<TableCell className="px-3 py-3">
+																<div className="truncate whitespace-nowrap font-mono text-xs">
+																	{request.id}
+																</div>
+															</TableCell>
+															<TableCell className="px-3 py-3">
+																<div className="truncate whitespace-nowrap font-mono text-xs">
+																	{request.requested_by ?? "-"}
+																</div>
+															</TableCell>
+															<TableCell className="px-3 py-3">
+																<div className="truncate whitespace-nowrap font-mono text-xs">
+																	#{request.scope_user_id}
+																</div>
+															</TableCell>
+															<TableCell className="px-3 py-3 whitespace-nowrap text-xs">
+																{formatLocalDateTime(request.updated_at)}
+															</TableCell>
+															<TableCell className="px-3 py-3 text-right">
+																<Button
+																	variant="outline"
+																	size="sm"
+																	onClick={() =>
+																		void openRequestDetail(request.id)
+																	}
+																>
+																	详情
+																</Button>
+															</TableCell>
+														</TableRow>
+													))}
+												</TableBody>
+											</Table>
+										</div>
+										<div className="space-y-2 md:hidden">
+											{requests.map((request) => (
+												<div key={request.id} className="rounded-lg border p-3">
+													<div className="flex items-center gap-2">
+														<p className="truncate whitespace-nowrap font-medium text-sm">
+															{request.source}
+														</p>
+														<StatusBadge
+															label={translationRunStatusLabel(request.status)}
+															tone={translationRunTone(request.status)}
+														/>
+													</div>
+													<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
+														{request.kind} · {request.variant} · entity{" "}
+														{request.entity_id}
 													</p>
-													<StatusBadge
-														label={translationRunStatusLabel(request.status)}
-														tone={translationRunTone(request.status)}
-													/>
+													<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
+														{translationRequestOriginLabel(
+															request.request_origin,
+														)}{" "}
+														· requested_by {request.requested_by ?? "-"}
+													</p>
+													<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
+														scope #{request.scope_user_id} · producer_ref{" "}
+														{request.producer_ref}
+													</p>
+													<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
+														{request.batch_id
+															? `batch ${request.batch_id} · `
+															: ""}
+														更新 {formatLocalDateTime(request.updated_at)}
+													</p>
+													<div className="mt-2 flex justify-end">
+														<Button
+															variant="outline"
+															size="sm"
+															onClick={() => void openRequestDetail(request.id)}
+														>
+															详情
+														</Button>
+													</div>
 												</div>
-												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
-													{request.kind} · {request.variant} · entity{" "}
-													{request.entity_id}
-												</p>
-												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
-													{translationRequestOriginLabel(
-														request.request_origin,
-													)}{" "}
-													· requested_by {request.requested_by ?? "-"}
-												</p>
-												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
-													scope #{request.scope_user_id} · producer_ref{" "}
-													{request.producer_ref}
-												</p>
-												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
-													{request.batch_id
-														? `batch ${request.batch_id} · `
-														: ""}
-													更新 {formatLocalDateTime(request.updated_at)}
-												</p>
-												<div className="mt-2 flex justify-end">
-													<Button
-														variant="outline"
-														size="sm"
-														onClick={() => void openRequestDetail(request.id)}
-													>
-														详情
-													</Button>
-												</div>
-											</div>
-										))}
-									</div>
-								</>
-							)}
+											))}
+										</div>
+									</>
+								)}
+							</ListSurfaceShell>
 
 							<div className="flex items-center justify-between">
 								<p className="text-muted-foreground text-xs">
@@ -2174,150 +2259,172 @@ function TranslationSchedulerSection(props: {
 									共 {formatCount(batchTotal)} 条
 								</span>
 							</div>
-							{batchesRefreshing ? (
-								<p className="text-muted-foreground inline-flex items-center gap-2 text-xs">
-									<span className="size-2 rounded-full bg-amber-500/80" />
-									任务记录更新中...
-								</p>
-							) : null}
-							{batchesInitialLoading ? (
-								<LoadingMessage>正在加载任务记录...</LoadingMessage>
-							) : batches.length === 0 ? (
-								<p className="text-muted-foreground text-sm">暂无任务记录。</p>
-							) : (
-								<>
-									<div className="hidden md:block">
-										<Table
-											containerClassName="rounded-lg border"
-											className="w-full table-fixed text-sm"
-										>
-											<TableHeader>
-												<TableRow>
-													<TableHead className="w-[11%]">触发原因</TableHead>
-													<TableHead className="w-[11%]">状态</TableHead>
-													<TableHead className="w-[7%]">槽位</TableHead>
-													<TableHead className="w-[7%]">请求数</TableHead>
-													<TableHead className="w-[7%]">Items</TableHead>
-													<TableHead className="w-[9%]">预算</TableHead>
-													<TableHead className="w-[20%]">批次ID</TableHead>
-													<TableHead className="w-[10%]">更新时间</TableHead>
-													<TableHead className="w-[88px] text-right">
-														操作
-													</TableHead>
-												</TableRow>
-											</TableHeader>
-											<TableBody>
-												{batches.map((batch) => (
-													<TableRow key={batch.id}>
-														<TableCell className="px-3 py-3">
-															<div className="truncate whitespace-nowrap">
-																{batch.trigger_reason}
-															</div>
-														</TableCell>
-														<TableCell className="px-3 py-3 whitespace-nowrap">
-															<div className="flex flex-wrap items-center gap-2">
-																<StatusBadge
-																	label={translationRunStatusLabel(
-																		batch.status,
-																	)}
-																	tone={translationRunTone(batch.status)}
-																/>
-																<StatusBadge
-																	label={batch.business_outcome.label}
-																	tone={translationBusinessOutcomeTone(
-																		batch.business_outcome.code,
-																	)}
-																/>
-															</div>
-															<p className="text-muted-foreground mt-1 whitespace-normal text-[11px] leading-5">
-																{translationBatchResultSummaryText(
-																	batch.result_summary,
-																)}
-															</p>
-														</TableCell>
-														<TableCell className="px-3 py-3 whitespace-nowrap">
-															{translationWorkerSlotLabel(batch.worker_slot)}
-														</TableCell>
-														<TableCell className="px-3 py-3 whitespace-nowrap text-sm">
-															{formatCount(batch.request_count)}
-														</TableCell>
-														<TableCell className="px-3 py-3 whitespace-nowrap text-sm">
-															{formatCount(batch.item_count)}
-														</TableCell>
-														<TableCell className="px-3 py-3 whitespace-nowrap text-sm">
-															{formatCount(batch.estimated_input_tokens)}
-														</TableCell>
-														<TableCell className="px-3 py-3">
-															<div className="truncate whitespace-nowrap font-mono text-xs">
-																{batch.id}
-															</div>
-														</TableCell>
-														<TableCell className="px-3 py-3 whitespace-nowrap text-xs">
-															{formatLocalDateTime(batch.updated_at)}
-														</TableCell>
-														<TableCell className="px-3 py-3 text-right">
-															<Button
-																variant="outline"
-																size="sm"
-																onClick={() => void openBatchDetail(batch.id)}
-															>
-																详情
-															</Button>
-														</TableCell>
+							<ListSurfaceShell
+								state={batchListSurface.state}
+								refreshing={batchListSurface.showRefreshing}
+								className="space-y-3"
+							>
+								{batchListSurface.showRefreshing ? (
+									<ListRefreshingNotice label="任务记录更新中..." />
+								) : null}
+								{listError && batches.length > 0 ? (
+									<ListInlineError
+										title="任务记录刷新失败"
+										summary={listError}
+										actionLabel="重试"
+										onAction={() => void loadBatches(true)}
+									/>
+								) : null}
+								{batchListSurface.state === "blocking-error" ? (
+									<ListBlockingErrorState
+										title="任务记录加载失败"
+										summary={listError ?? "当前无法读取翻译任务记录。"}
+										actionLabel="重试"
+										onAction={() => void loadBatches()}
+									/>
+								) : batchListSurface.state === "initial-loading" ? (
+									<TranslationTableSkeleton />
+								) : batchListSurface.state === "empty" ? (
+									<ListEmptyState
+										title="暂无任务记录"
+										description="当前筛选条件下没有匹配的翻译批次记录。"
+									/>
+								) : (
+									<>
+										<div className="hidden md:block">
+											<Table
+												containerClassName="rounded-lg border"
+												className="w-full table-fixed text-sm"
+											>
+												<TableHeader>
+													<TableRow>
+														<TableHead className="w-[11%]">触发原因</TableHead>
+														<TableHead className="w-[11%]">状态</TableHead>
+														<TableHead className="w-[7%]">槽位</TableHead>
+														<TableHead className="w-[7%]">请求数</TableHead>
+														<TableHead className="w-[7%]">Items</TableHead>
+														<TableHead className="w-[9%]">预算</TableHead>
+														<TableHead className="w-[20%]">批次ID</TableHead>
+														<TableHead className="w-[10%]">更新时间</TableHead>
+														<TableHead className="w-[88px] text-right">
+															操作
+														</TableHead>
 													</TableRow>
-												))}
-											</TableBody>
-										</Table>
-									</div>
-									<div className="space-y-2 md:hidden">
-										{batches.map((batch) => (
-											<div key={batch.id} className="rounded-lg border p-3">
-												<div className="flex items-center gap-2">
-													<p className="truncate whitespace-nowrap font-medium text-sm">
-														{batch.trigger_reason}
+												</TableHeader>
+												<TableBody>
+													{batches.map((batch) => (
+														<TableRow key={batch.id}>
+															<TableCell className="px-3 py-3">
+																<div className="truncate whitespace-nowrap">
+																	{batch.trigger_reason}
+																</div>
+															</TableCell>
+															<TableCell className="px-3 py-3 whitespace-nowrap">
+																<div className="flex flex-wrap items-center gap-2">
+																	<StatusBadge
+																		label={translationRunStatusLabel(
+																			batch.status,
+																		)}
+																		tone={translationRunTone(batch.status)}
+																	/>
+																	<StatusBadge
+																		label={batch.business_outcome.label}
+																		tone={translationBusinessOutcomeTone(
+																			batch.business_outcome.code,
+																		)}
+																	/>
+																</div>
+																<p className="text-muted-foreground mt-1 whitespace-normal text-[11px] leading-5">
+																	{translationBatchResultSummaryText(
+																		batch.result_summary,
+																	)}
+																</p>
+															</TableCell>
+															<TableCell className="px-3 py-3 whitespace-nowrap">
+																{translationWorkerSlotLabel(batch.worker_slot)}
+															</TableCell>
+															<TableCell className="px-3 py-3 whitespace-nowrap text-sm">
+																{formatCount(batch.request_count)}
+															</TableCell>
+															<TableCell className="px-3 py-3 whitespace-nowrap text-sm">
+																{formatCount(batch.item_count)}
+															</TableCell>
+															<TableCell className="px-3 py-3 whitespace-nowrap text-sm">
+																{formatCount(batch.estimated_input_tokens)}
+															</TableCell>
+															<TableCell className="px-3 py-3">
+																<div className="truncate whitespace-nowrap font-mono text-xs">
+																	{batch.id}
+																</div>
+															</TableCell>
+															<TableCell className="px-3 py-3 whitespace-nowrap text-xs">
+																{formatLocalDateTime(batch.updated_at)}
+															</TableCell>
+															<TableCell className="px-3 py-3 text-right">
+																<Button
+																	variant="outline"
+																	size="sm"
+																	onClick={() => void openBatchDetail(batch.id)}
+																>
+																	详情
+																</Button>
+															</TableCell>
+														</TableRow>
+													))}
+												</TableBody>
+											</Table>
+										</div>
+										<div className="space-y-2 md:hidden">
+											{batches.map((batch) => (
+												<div key={batch.id} className="rounded-lg border p-3">
+													<div className="flex items-center gap-2">
+														<p className="truncate whitespace-nowrap font-medium text-sm">
+															{batch.trigger_reason}
+														</p>
+														<StatusBadge
+															label={translationRunStatusLabel(batch.status)}
+															tone={translationRunTone(batch.status)}
+														/>
+														<StatusBadge
+															label={batch.business_outcome.label}
+															tone={translationBusinessOutcomeTone(
+																batch.business_outcome.code,
+															)}
+														/>
+													</div>
+													<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
+														{translationWorkerSlotLabel(batch.worker_slot)} ·
+														请求 {formatCount(batch.request_count)} · work items{" "}
+														{formatCount(batch.item_count)}
 													</p>
-													<StatusBadge
-														label={translationRunStatusLabel(batch.status)}
-														tone={translationRunTone(batch.status)}
-													/>
-													<StatusBadge
-														label={batch.business_outcome.label}
-														tone={translationBusinessOutcomeTone(
-															batch.business_outcome.code,
+													<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
+														预算 {formatCount(batch.estimated_input_tokens)}{" "}
+														tokens · 更新{" "}
+														{formatLocalDateTime(batch.updated_at)}
+													</p>
+													<p className="text-muted-foreground mt-1 text-xs">
+														{translationBatchResultSummaryText(
+															batch.result_summary,
 														)}
-													/>
+													</p>
+													<p className="text-muted-foreground mt-1 truncate whitespace-nowrap font-mono text-[11px]">
+														{batch.id}
+													</p>
+													<div className="mt-2 flex justify-end">
+														<Button
+															variant="outline"
+															size="sm"
+															onClick={() => void openBatchDetail(batch.id)}
+														>
+															详情
+														</Button>
+													</div>
 												</div>
-												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
-													{translationWorkerSlotLabel(batch.worker_slot)} · 请求{" "}
-													{formatCount(batch.request_count)} · work items{" "}
-													{formatCount(batch.item_count)}
-												</p>
-												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
-													预算 {formatCount(batch.estimated_input_tokens)}{" "}
-													tokens · 更新 {formatLocalDateTime(batch.updated_at)}
-												</p>
-												<p className="text-muted-foreground mt-1 text-xs">
-													{translationBatchResultSummaryText(
-														batch.result_summary,
-													)}
-												</p>
-												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap font-mono text-[11px]">
-													{batch.id}
-												</p>
-												<div className="mt-2 flex justify-end">
-													<Button
-														variant="outline"
-														size="sm"
-														onClick={() => void openBatchDetail(batch.id)}
-													>
-														详情
-													</Button>
-												</div>
-											</div>
-										))}
-									</div>
-								</>
-							)}
+											))}
+										</div>
+									</>
+								)}
+							</ListSurfaceShell>
 
 							<div className="flex items-center justify-between">
 								<p className="text-muted-foreground text-xs">
@@ -3512,6 +3619,7 @@ export function JobManagement({
 	const [detailTask, setDetailTask] =
 		useState<AdminRealtimeTaskDetailResponse | null>(null);
 	const [detailLoading, setDetailLoading] = useState(false);
+	const [listError, setListError] = useState<string | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [streamStatus, setStreamStatus] = useState<StreamStatus>("connecting");
 	const [refreshNonce, setRefreshNonce] = useState(0);
@@ -3604,21 +3712,33 @@ export function JobManagement({
 	const detailBusinessOutcome =
 		activeTaskDetail?.diagnostics?.business_outcome ?? null;
 	const detailEventMeta = activeTaskDetail?.event_meta ?? null;
-	const tasksInitialLoading = tasksLoadPhase === "initial";
-	const tasksRefreshing = tasksLoadPhase === "refreshing";
 	const tasksActionsDisabled = detailLoading || tasksLoadPhase !== "idle";
-	const scheduledRunsInitialLoading = scheduledRunsLoadPhase === "initial";
-	const scheduledRunsRefreshing = scheduledRunsLoadPhase === "refreshing";
 	const scheduledRunActionsDisabled =
 		detailLoading || scheduledRunsLoadPhase !== "idle";
-	const subscriptionRunsInitialLoading =
-		subscriptionRunsLoadPhase === "initial";
-	const subscriptionRunsRefreshing = subscriptionRunsLoadPhase === "refreshing";
-	const llmCallsInitialLoading = llmCallsLoadPhase === "initial";
 	const llmCallsRefreshing = llmCallsLoadPhase === "refreshing";
 	const llmStatusRefreshing = llmStatusLoading && llmStatus !== null;
 	const llmRefreshing = llmStatusRefreshing || llmCallsRefreshing;
 	const llmCallActionsDisabled = llmDetailLoading || llmRefreshing;
+	const realtimeListSurface = useListSurfaceState({
+		loading: tasksLoadPhase !== "idle",
+		hasData: tasks.length > 0,
+		hasError: listError !== null,
+	});
+	const scheduledListSurface = useListSurfaceState({
+		loading: scheduledRunsLoadPhase !== "idle",
+		hasData: scheduledRuns.length > 0,
+		hasError: listError !== null,
+	});
+	const subscriptionListSurface = useListSurfaceState({
+		loading: subscriptionRunsLoadPhase !== "idle" || syncRuntimeConfigLoading,
+		hasData: subscriptionRuns.length > 0,
+		hasError: listError !== null,
+	});
+	const llmListSurface = useListSurfaceState({
+		loading: llmCallsLoadPhase !== "idle" || llmStatusLoading,
+		hasData: llmCalls.length > 0,
+		hasError: listError !== null,
+	});
 	const isRefreshingData =
 		overviewLoading ||
 		tasksLoadPhase !== "idle" ||
@@ -4220,7 +4340,7 @@ export function JobManagement({
 
 	const loadAll = useCallback(
 		async (options?: LoadOptions) => {
-			setError(null);
+			setListError(null);
 			try {
 				await Promise.all([
 					loadOverview({ background: true }),
@@ -4232,7 +4352,7 @@ export function JobManagement({
 					loadLlmCalls(options),
 				]);
 			} catch (err) {
-				setError(normalizeErrorMessage(err));
+				setListError(normalizeErrorMessage(err));
 			}
 		},
 		[
@@ -4394,54 +4514,54 @@ export function JobManagement({
 	);
 
 	useEffect(() => {
-		setError(null);
+		setListError(null);
 		void loadOverview().catch((err) => {
-			setError(normalizeErrorMessage(err));
+			setListError(normalizeErrorMessage(err));
 		});
 	}, [loadOverview]);
 
 	useEffect(() => {
-		setError(null);
+		setListError(null);
 		const options = tasksLoadedOnceRef.current
 			? { background: true }
 			: undefined;
 		void loadRealtimeTasks(options).catch((err) => {
-			setError(normalizeErrorMessage(err));
+			setListError(normalizeErrorMessage(err));
 		});
 	}, [loadRealtimeTasks]);
 
 	useEffect(() => {
-		setError(null);
+		setListError(null);
 		const options = scheduledRunsLoadedOnceRef.current
 			? { background: true }
 			: undefined;
 		void loadScheduledRuns(options).catch((err) => {
-			setError(normalizeErrorMessage(err));
+			setListError(normalizeErrorMessage(err));
 		});
 	}, [loadScheduledRuns]);
 
 	useEffect(() => {
-		setError(null);
+		setListError(null);
 		const options = subscriptionRunsLoadedOnceRef.current
 			? { background: true }
 			: undefined;
 		void loadSubscriptionRuns(options).catch((err) => {
-			setError(normalizeErrorMessage(err));
+			setListError(normalizeErrorMessage(err));
 		});
 	}, [loadSubscriptionRuns]);
 
 	useEffect(() => {
-		setError(null);
+		setListError(null);
 		const options = syncRuntimeConfigLoadedOnceRef.current
 			? { background: true }
 			: undefined;
 		void loadSyncRuntimeConfig(options).catch((err) => {
-			setError(normalizeErrorMessage(err));
+			setListError(normalizeErrorMessage(err));
 		});
 	}, [loadSyncRuntimeConfig]);
 
 	useEffect(() => {
-		setError(null);
+		setListError(null);
 		const llmStatusOptions = llmStatusLoadedOnceRef.current
 			? { background: true }
 			: undefined;
@@ -4452,7 +4572,7 @@ export function JobManagement({
 			loadLlmSchedulerStatus(llmStatusOptions),
 			loadLlmCalls(llmCallOptions),
 		]).catch((err) => {
-			setError(normalizeErrorMessage(err));
+			setListError(normalizeErrorMessage(err));
 		});
 	}, [loadLlmSchedulerStatus, loadLlmCalls]);
 
@@ -4818,6 +4938,7 @@ export function JobManagement({
 		async (taskId: string) => {
 			setTaskActionBusyId(taskId);
 			setError(null);
+			setListError(null);
 			try {
 				await apiRetryAdminRealtimeTask(taskId);
 				await loadAll({ background: true });
@@ -4834,6 +4955,7 @@ export function JobManagement({
 		async (taskId: string) => {
 			setTaskActionBusyId(taskId);
 			setError(null);
+			setListError(null);
 			try {
 				await apiCancelAdminRealtimeTask(taskId);
 				await loadAll({ background: true });
@@ -4985,106 +5107,131 @@ export function JobManagement({
 								</span>
 							</div>
 
-							<div className="space-y-2">
-								{tasksRefreshing ? (
-									<p className="text-muted-foreground inline-flex items-center gap-2 text-xs">
-										<span className="size-2 rounded-full bg-amber-500/80" />
-										任务列表更新中...
-									</p>
+							<ListSurfaceShell
+								state={realtimeListSurface.state}
+								refreshing={realtimeListSurface.showRefreshing}
+								className="space-y-3"
+							>
+								{realtimeListSurface.showRefreshing ? (
+									<ListRefreshingNotice label="任务列表更新中..." />
 								) : null}
-								{tasksInitialLoading ? (
-									<LoadingMessage>正在加载任务...</LoadingMessage>
-								) : tasks.length === 0 ? (
-									<p className="text-muted-foreground text-sm">暂无任务。</p>
+								{listError && tasks.length > 0 ? (
+									<ListInlineError
+										title="实时任务刷新失败"
+										summary={listError}
+										actionLabel="重试"
+										onAction={() =>
+											void loadRealtimeTasks({ background: true })
+										}
+									/>
+								) : null}
+								{realtimeListSurface.state === "blocking-error" ? (
+									<ListBlockingErrorState
+										title="实时任务加载失败"
+										summary={listError ?? "当前无法读取实时任务列表。"}
+										actionLabel="重试"
+										onAction={() => void loadRealtimeTasks()}
+									/>
+								) : realtimeListSurface.state === "initial-loading" ? (
+									<CardListSkeleton count={4} />
+								) : realtimeListSurface.state === "empty" ? (
+									<ListEmptyState
+										title="暂无任务"
+										description="当前筛选条件下没有匹配的实时异步任务。"
+									/>
 								) : (
-									tasks.map((task) => {
-										const busy = taskActionBusyId === task.id;
-										const displayStatus = realtimeTaskDisplayStatus(task);
-										const tone = taskStatusTone(displayStatus);
-										return (
-											<div
-												key={task.id}
-												className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between"
-											>
-												<div className="min-w-0">
-													<div className="flex flex-wrap items-center gap-2">
-														<p className="font-medium text-sm">
-															{taskTypeLabel(task.task_type)}
-														</p>
-														<StatusBadge
-															label={taskStatusLabel(displayStatus)}
-															tone={tone}
-														/>
-														{task.cancel_requested ? (
-															<FlagBadge
-																label="已请求取消"
-																className={cancelRequestedBadgeClass}
+									<div className="space-y-2">
+										{tasks.map((task) => {
+											const busy = taskActionBusyId === task.id;
+											const displayStatus = realtimeTaskDisplayStatus(task);
+											const tone = taskStatusTone(displayStatus);
+											return (
+												<div
+													key={task.id}
+													className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between"
+												>
+													<div className="min-w-0">
+														<div className="flex flex-wrap items-center gap-2">
+															<p className="font-medium text-sm">
+																{taskTypeLabel(task.task_type)}
+															</p>
+															<StatusBadge
+																label={taskStatusLabel(displayStatus)}
+																tone={tone}
 															/>
+															{task.cancel_requested ? (
+																<FlagBadge
+																	label="已请求取消"
+																	className={cancelRequestedBadgeClass}
+																/>
+															) : null}
+														</div>
+														<p className="text-muted-foreground mt-1 text-xs">
+															类型：
+															<span className="font-mono">
+																{task.task_type}
+															</span>
+														</p>
+														<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
+															ID: {task.id}
+														</p>
+														<div className="mt-1 flex flex-wrap gap-1.5 text-xs">
+															<span className="bg-muted/60 rounded px-2 py-0.5">
+																创建 {formatLocalHm(task.created_at)}
+															</span>
+															<span className="bg-muted/60 rounded px-2 py-0.5">
+																开始 {formatLocalHm(task.started_at)}
+															</span>
+															<span className="bg-muted/60 rounded px-2 py-0.5">
+																完成 {formatLocalHm(task.finished_at)}
+															</span>
+														</div>
+														{task.error_message ? (
+															<p className="text-destructive mt-1 text-xs font-medium">
+																失败原因：{task.error_message}
+															</p>
 														) : null}
 													</div>
-													<p className="text-muted-foreground mt-1 text-xs">
-														类型：
-														<span className="font-mono">{task.task_type}</span>
-													</p>
-													<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
-														ID: {task.id}
-													</p>
-													<div className="mt-1 flex flex-wrap gap-1.5 text-xs">
-														<span className="bg-muted/60 rounded px-2 py-0.5">
-															创建 {formatLocalHm(task.created_at)}
-														</span>
-														<span className="bg-muted/60 rounded px-2 py-0.5">
-															开始 {formatLocalHm(task.started_at)}
-														</span>
-														<span className="bg-muted/60 rounded px-2 py-0.5">
-															完成 {formatLocalHm(task.finished_at)}
-														</span>
+													<div className="flex flex-wrap gap-2">
+														<Button
+															variant="outline"
+															disabled={tasksActionsDisabled}
+															onClick={() => void onOpenTaskDetail(task.id)}
+														>
+															详情
+														</Button>
+														<Button
+															variant="outline"
+															disabled={
+																tasksActionsDisabled ||
+																busy ||
+																task.status === "queued" ||
+																task.status === "running"
+															}
+															onClick={() => void onRetryTask(task.id)}
+														>
+															重试
+														</Button>
+														<Button
+															variant="destructive"
+															disabled={
+																tasksActionsDisabled ||
+																busy ||
+																task.status === "succeeded" ||
+																task.status === "failed" ||
+																task.status === "canceled"
+															}
+															onClick={() => void onCancelTask(task.id)}
+														>
+															取消
+														</Button>
 													</div>
-													{task.error_message ? (
-														<p className="text-destructive mt-1 text-xs font-medium">
-															失败原因：{task.error_message}
-														</p>
-													) : null}
 												</div>
-												<div className="flex flex-wrap gap-2">
-													<Button
-														variant="outline"
-														disabled={tasksActionsDisabled}
-														onClick={() => void onOpenTaskDetail(task.id)}
-													>
-														详情
-													</Button>
-													<Button
-														variant="outline"
-														disabled={
-															tasksActionsDisabled ||
-															busy ||
-															task.status === "queued" ||
-															task.status === "running"
-														}
-														onClick={() => void onRetryTask(task.id)}
-													>
-														重试
-													</Button>
-													<Button
-														variant="destructive"
-														disabled={
-															tasksActionsDisabled ||
-															busy ||
-															task.status === "succeeded" ||
-															task.status === "failed" ||
-															task.status === "canceled"
-														}
-														onClick={() => void onCancelTask(task.id)}
-													>
-														取消
-													</Button>
-												</div>
-											</div>
-										);
-									})
+											);
+										})}
+									</div>
 								)}
-							</div>
+							</ListSurfaceShell>
 
 							<div className="flex items-center justify-between">
 								<p className="text-muted-foreground text-xs">
@@ -5156,105 +5303,128 @@ export function JobManagement({
 								</p>
 							</div>
 
-							<div className="space-y-2">
-								{scheduledRunsRefreshing ? (
-									<p className="text-muted-foreground inline-flex items-center gap-2 text-xs">
-										<span className="size-2 rounded-full bg-amber-500/80" />
-										运行记录更新中...
-									</p>
+							<ListSurfaceShell
+								state={scheduledListSurface.state}
+								refreshing={scheduledListSurface.showRefreshing}
+								className="space-y-3"
+							>
+								{scheduledListSurface.showRefreshing ? (
+									<ListRefreshingNotice label="运行记录更新中..." />
 								) : null}
-								{scheduledRunsInitialLoading ? (
-									<LoadingMessage>正在加载运行记录...</LoadingMessage>
-								) : scheduledRuns.length === 0 ? (
-									<p className="text-muted-foreground text-sm">
-										暂无运行记录。
-									</p>
+								{listError && scheduledRuns.length > 0 ? (
+									<ListInlineError
+										title="定时任务刷新失败"
+										summary={listError}
+										actionLabel="重试"
+										onAction={() =>
+											void loadScheduledRuns({ background: true })
+										}
+									/>
+								) : null}
+								{scheduledListSurface.state === "blocking-error" ? (
+									<ListBlockingErrorState
+										title="定时任务加载失败"
+										summary={listError ?? "当前无法读取定时任务记录。"}
+										actionLabel="重试"
+										onAction={() => void loadScheduledRuns()}
+									/>
+								) : scheduledListSurface.state === "initial-loading" ? (
+									<CardListSkeleton count={4} />
+								) : scheduledListSurface.state === "empty" ? (
+									<ListEmptyState
+										title="暂无运行记录"
+										description="当前筛选条件下没有匹配的定时任务记录。"
+									/>
 								) : (
-									scheduledRuns.map((task) => {
-										const busy = taskActionBusyId === task.id;
-										const displayStatus = realtimeTaskDisplayStatus(task);
-										const tone = taskStatusTone(displayStatus);
-										return (
-											<div
-												key={task.id}
-												className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between"
-											>
-												<div className="min-w-0">
-													<div className="flex flex-wrap items-center gap-2">
-														<p className="font-medium text-sm">
-															{taskTypeLabel(task.task_type)}
-														</p>
-														<StatusBadge
-															label={taskStatusLabel(displayStatus)}
-															tone={tone}
-														/>
-														{task.cancel_requested ? (
-															<FlagBadge
-																label="已请求取消"
-																className={cancelRequestedBadgeClass}
+									<div className="space-y-2">
+										{scheduledRuns.map((task) => {
+											const busy = taskActionBusyId === task.id;
+											const displayStatus = realtimeTaskDisplayStatus(task);
+											const tone = taskStatusTone(displayStatus);
+											return (
+												<div
+													key={task.id}
+													className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between"
+												>
+													<div className="min-w-0">
+														<div className="flex flex-wrap items-center gap-2">
+															<p className="font-medium text-sm">
+																{taskTypeLabel(task.task_type)}
+															</p>
+															<StatusBadge
+																label={taskStatusLabel(displayStatus)}
+																tone={tone}
 															/>
+															{task.cancel_requested ? (
+																<FlagBadge
+																	label="已请求取消"
+																	className={cancelRequestedBadgeClass}
+																/>
+															) : null}
+														</div>
+														<p className="text-muted-foreground mt-1 text-xs">
+															类型：
+															<span className="font-mono">
+																{task.task_type}
+															</span>
+														</p>
+														<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
+															ID: {task.id}
+														</p>
+														<div className="mt-1 flex flex-wrap gap-1.5 text-xs">
+															<span className="bg-muted/60 rounded px-2 py-0.5">
+																创建 {formatLocalHm(task.created_at)}
+															</span>
+															<span className="bg-muted/60 rounded px-2 py-0.5">
+																完成 {formatLocalHm(task.finished_at)}
+															</span>
+														</div>
+														{task.error_message ? (
+															<p className="text-destructive mt-1 text-xs font-medium">
+																失败原因：{task.error_message}
+															</p>
 														) : null}
 													</div>
-													<p className="text-muted-foreground mt-1 text-xs">
-														类型：
-														<span className="font-mono">{task.task_type}</span>
-													</p>
-													<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
-														ID: {task.id}
-													</p>
-													<div className="mt-1 flex flex-wrap gap-1.5 text-xs">
-														<span className="bg-muted/60 rounded px-2 py-0.5">
-															创建 {formatLocalHm(task.created_at)}
-														</span>
-														<span className="bg-muted/60 rounded px-2 py-0.5">
-															完成 {formatLocalHm(task.finished_at)}
-														</span>
+													<div className="flex flex-wrap gap-2">
+														<Button
+															variant="outline"
+															disabled={scheduledRunActionsDisabled}
+															onClick={() => void onOpenTaskDetail(task.id)}
+														>
+															详情
+														</Button>
+														<Button
+															variant="outline"
+															disabled={
+																scheduledRunActionsDisabled ||
+																busy ||
+																task.status === "queued" ||
+																task.status === "running"
+															}
+															onClick={() => void onRetryTask(task.id)}
+														>
+															重试
+														</Button>
+														<Button
+															variant="destructive"
+															disabled={
+																scheduledRunActionsDisabled ||
+																busy ||
+																task.status === "succeeded" ||
+																task.status === "failed" ||
+																task.status === "canceled"
+															}
+															onClick={() => void onCancelTask(task.id)}
+														>
+															取消
+														</Button>
 													</div>
-													{task.error_message ? (
-														<p className="text-destructive mt-1 text-xs font-medium">
-															失败原因：{task.error_message}
-														</p>
-													) : null}
 												</div>
-												<div className="flex flex-wrap gap-2">
-													<Button
-														variant="outline"
-														disabled={scheduledRunActionsDisabled}
-														onClick={() => void onOpenTaskDetail(task.id)}
-													>
-														详情
-													</Button>
-													<Button
-														variant="outline"
-														disabled={
-															scheduledRunActionsDisabled ||
-															busy ||
-															task.status === "queued" ||
-															task.status === "running"
-														}
-														onClick={() => void onRetryTask(task.id)}
-													>
-														重试
-													</Button>
-													<Button
-														variant="destructive"
-														disabled={
-															scheduledRunActionsDisabled ||
-															busy ||
-															task.status === "succeeded" ||
-															task.status === "failed" ||
-															task.status === "canceled"
-														}
-														onClick={() => void onCancelTask(task.id)}
-													>
-														取消
-													</Button>
-												</div>
-											</div>
-										);
-									})
+											);
+										})}
+									</div>
 								)}
-							</div>
+							</ListSurfaceShell>
 
 							<div className="flex items-center justify-between">
 								<p className="text-muted-foreground text-xs">
@@ -5381,126 +5551,154 @@ export function JobManagement({
 									</div>
 								</div>
 
-								{subscriptionRunsRefreshing || syncRuntimeConfigLoading ? (
-									<p className="text-muted-foreground inline-flex items-center gap-2 text-xs">
-										<span className="size-2 rounded-full bg-amber-500/80" />
-										订阅同步列表更新中...
-									</p>
-								) : null}
-
-								<div className="space-y-2">
-									{subscriptionRunsInitialLoading ? (
-										<LoadingMessage>正在加载订阅同步...</LoadingMessage>
-									) : subscriptionRuns.length === 0 ? (
-										<p className="text-muted-foreground text-sm">
-											暂无订阅同步任务。
-										</p>
+								<ListSurfaceShell
+									state={subscriptionListSurface.state}
+									refreshing={subscriptionListSurface.showRefreshing}
+									className="space-y-3"
+								>
+									{subscriptionListSurface.showRefreshing ? (
+										<ListRefreshingNotice label="订阅同步列表更新中..." />
+									) : null}
+									{listError && subscriptionRuns.length > 0 ? (
+										<ListInlineError
+											title="订阅同步刷新失败"
+											summary={listError}
+											actionLabel="重试"
+											onAction={() =>
+												void Promise.all([
+													loadSubscriptionRuns({ background: true }),
+													loadSyncRuntimeConfig({ background: true }),
+												])
+											}
+										/>
+									) : null}
+									{subscriptionListSurface.state === "blocking-error" ? (
+										<ListBlockingErrorState
+											title="订阅同步加载失败"
+											summary={listError ?? "当前无法读取订阅同步列表。"}
+											actionLabel="重试"
+											onAction={() =>
+												void Promise.all([
+													loadSubscriptionRuns(),
+													loadSyncRuntimeConfig(),
+												])
+											}
+										/>
+									) : subscriptionListSurface.state === "initial-loading" ? (
+										<CardListSkeleton count={3} itemClassName="h-56" />
+									) : subscriptionListSurface.state === "empty" ? (
+										<ListEmptyState
+											title="暂无订阅同步任务"
+											description="当前还没有可展示的订阅同步工作流记录。"
+										/>
 									) : (
-										subscriptionRuns.map((task) => {
-											const displayStatus = realtimeTaskDisplayStatus(task);
-											const tone = taskStatusTone(displayStatus);
-											const diagnostics =
-												task.id === activeTaskDetail?.task.id
-													? activeTaskDetail?.diagnostics?.sync_subscriptions
-													: null;
-											return (
-												<div
-													key={task.id}
-													className="rounded-xl border bg-card/70 p-5 transition-colors duration-200 hover:bg-card/90"
-												>
-													<div className="grid gap-4">
-														<div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
-															<div className="min-w-0 space-y-2">
-																<div className="flex flex-wrap items-center gap-2">
-																	<p className="font-medium text-base">
-																		订阅同步工作流
+										<div className="space-y-2">
+											{subscriptionRuns.map((task) => {
+												const displayStatus = realtimeTaskDisplayStatus(task);
+												const tone = taskStatusTone(displayStatus);
+												const diagnostics =
+													task.id === activeTaskDetail?.task.id
+														? activeTaskDetail?.diagnostics?.sync_subscriptions
+														: null;
+												return (
+													<div
+														key={task.id}
+														className="rounded-xl border bg-card/70 p-5 transition-colors duration-200 hover:bg-card/90"
+													>
+														<div className="grid gap-4">
+															<div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
+																<div className="min-w-0 space-y-2">
+																	<div className="flex flex-wrap items-center gap-2">
+																		<p className="font-medium text-base">
+																			订阅同步工作流
+																		</p>
+																		<StatusBadge
+																			label={taskStatusLabel(displayStatus)}
+																			tone={tone}
+																		/>
+																		<span className="rounded-md border bg-background px-2 py-0.5 font-mono text-[11px]">
+																			{sourceLabel(task.source)}
+																		</span>
+																	</div>
+																	<p className="text-muted-foreground truncate font-mono text-[11px]">
+																		ID: {task.id}
 																	</p>
-																	<StatusBadge
-																		label={taskStatusLabel(displayStatus)}
-																		tone={tone}
-																	/>
-																	<span className="rounded-md border bg-background px-2 py-0.5 font-mono text-[11px]">
-																		{sourceLabel(task.source)}
-																	</span>
 																</div>
-																<p className="text-muted-foreground truncate font-mono text-[11px]">
-																	ID: {task.id}
-																</p>
+																<div className="flex flex-wrap items-center gap-2 lg:justify-end">
+																	<div className="flex flex-wrap gap-1.5 text-xs">
+																		<span className="rounded bg-muted/60 px-2 py-0.5">
+																			创建 {formatLocalHm(task.created_at)}
+																		</span>
+																		<span className="rounded bg-muted/60 px-2 py-0.5">
+																			开始 {formatLocalHm(task.started_at)}
+																		</span>
+																		<span className="rounded bg-muted/60 px-2 py-0.5">
+																			完成 {formatLocalHm(task.finished_at)}
+																		</span>
+																	</div>
+																	<Button variant="outline" asChild>
+																		<a
+																			href={`${ADMIN_JOBS_SUBSCRIPTIONS_PATH}/${encodeURIComponent(task.id)}`}
+																		>
+																			工作流详情
+																		</a>
+																	</Button>
+																</div>
 															</div>
-															<div className="flex flex-wrap items-center gap-2 lg:justify-end">
-																<div className="flex flex-wrap gap-1.5 text-xs">
-																	<span className="rounded bg-muted/60 px-2 py-0.5">
-																		创建 {formatLocalHm(task.created_at)}
-																	</span>
-																	<span className="rounded bg-muted/60 px-2 py-0.5">
-																		开始 {formatLocalHm(task.started_at)}
-																	</span>
-																	<span className="rounded bg-muted/60 px-2 py-0.5">
-																		完成 {formatLocalHm(task.finished_at)}
-																	</span>
-																</div>
-																<Button variant="outline" asChild>
-																	<a
-																		href={`${ADMIN_JOBS_SUBSCRIPTIONS_PATH}/${encodeURIComponent(task.id)}`}
+															<div className="grid w-full grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+																{[
+																	["Collect", "用户与调度键"],
+																	[
+																		"Star",
+																		diagnostics
+																			? `${diagnostics.star.succeeded_users}/${diagnostics.star.total_users}`
+																			: "-",
+																	],
+																	[
+																		"Repo",
+																		diagnostics
+																			? `${diagnostics.star.total_repos}`
+																			: "-",
+																	],
+																	[
+																		"Release",
+																		diagnostics
+																			? `${diagnostics.release.succeeded_repos}/${diagnostics.release.total_repos}`
+																			: "-",
+																	],
+																	[
+																		"Social",
+																		diagnostics
+																			? `${diagnostics.social.succeeded_users}/${diagnostics.social.total_users}`
+																			: "-",
+																	],
+																	[
+																		"Inbox",
+																		diagnostics
+																			? `${diagnostics.notifications.succeeded_users}/${diagnostics.notifications.total_users}`
+																			: "-",
+																	],
+																].map(([label, value]) => (
+																	<div
+																		key={label}
+																		className="min-h-[74px] rounded-lg border bg-background/70 px-4 py-3"
 																	>
-																		工作流详情
-																	</a>
-																</Button>
+																		<p className="text-muted-foreground text-xs">
+																			{label}
+																		</p>
+																		<p className="mt-2 font-mono text-sm font-semibold">
+																			{value}
+																		</p>
+																	</div>
+																))}
 															</div>
-														</div>
-														<div className="grid w-full grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
-															{[
-																["Collect", "用户与调度键"],
-																[
-																	"Star",
-																	diagnostics
-																		? `${diagnostics.star.succeeded_users}/${diagnostics.star.total_users}`
-																		: "-",
-																],
-																[
-																	"Repo",
-																	diagnostics
-																		? `${diagnostics.star.total_repos}`
-																		: "-",
-																],
-																[
-																	"Release",
-																	diagnostics
-																		? `${diagnostics.release.succeeded_repos}/${diagnostics.release.total_repos}`
-																		: "-",
-																],
-																[
-																	"Social",
-																	diagnostics
-																		? `${diagnostics.social.succeeded_users}/${diagnostics.social.total_users}`
-																		: "-",
-																],
-																[
-																	"Inbox",
-																	diagnostics
-																		? `${diagnostics.notifications.succeeded_users}/${diagnostics.notifications.total_users}`
-																		: "-",
-																],
-															].map(([label, value]) => (
-																<div
-																	key={label}
-																	className="min-h-[74px] rounded-lg border bg-background/70 px-4 py-3"
-																>
-																	<p className="text-muted-foreground text-xs">
-																		{label}
-																	</p>
-																	<p className="mt-2 font-mono text-sm font-semibold">
-																		{value}
-																	</p>
-																</div>
-															))}
 														</div>
 													</div>
-												</div>
-											);
-										})
+												);
+											})}
+										</div>
 									)}
-								</div>
+								</ListSurfaceShell>
 								<div className="flex flex-wrap items-center justify-between gap-2 border-t pt-3 text-sm">
 									<p className="text-muted-foreground">
 										第 {subscriptionRunPage}/{subscriptionRunTotalPages} 页
@@ -5694,72 +5892,103 @@ export function JobManagement({
 								共 {formatCount(llmCallTotal)} 条调用
 							</p>
 
-							<div className="space-y-2">
-								{llmRefreshing ? (
-									<p className="text-muted-foreground inline-flex items-center gap-2 text-xs">
-										<span className="size-2 rounded-full bg-amber-500/80" />
-										LLM 调度更新中...
-									</p>
+							<ListSurfaceShell
+								state={llmListSurface.state}
+								refreshing={llmListSurface.showRefreshing}
+								className="space-y-3"
+							>
+								{llmListSurface.showRefreshing ? (
+									<ListRefreshingNotice label="LLM 调度更新中..." />
 								) : null}
-								{llmCallsInitialLoading ? (
-									<LoadingMessage>正在加载调用记录...</LoadingMessage>
-								) : llmCalls.length === 0 ? (
-									<p className="text-muted-foreground text-sm">
-										暂无调用记录。
-									</p>
+								{listError && llmCalls.length > 0 ? (
+									<ListInlineError
+										title="LLM 调用刷新失败"
+										summary={listError}
+										actionLabel="重试"
+										onAction={() =>
+											void Promise.all([
+												loadLlmSchedulerStatus({ background: true }),
+												loadLlmCalls({ background: true }),
+											])
+										}
+									/>
+								) : null}
+								{llmListSurface.state === "blocking-error" ? (
+									<ListBlockingErrorState
+										title="LLM 调用加载失败"
+										summary={listError ?? "当前无法读取 LLM 调用记录。"}
+										actionLabel="重试"
+										onAction={() =>
+											void Promise.all([
+												loadLlmSchedulerStatus(),
+												loadLlmCalls(),
+											])
+										}
+									/>
+								) : llmListSurface.state === "initial-loading" ? (
+									<CardListSkeleton count={4} />
+								) : llmListSurface.state === "empty" ? (
+									<ListEmptyState
+										title="暂无调用记录"
+										description="当前筛选条件下没有匹配的 LLM 调用。"
+									/>
 								) : (
-									llmCalls.map((call) => {
-										const tone = taskStatusTone(call.status);
-										return (
-											<div
-												key={call.id}
-												className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between"
-											>
-												<div className="min-w-0">
-													<div className="flex flex-wrap items-center gap-2">
-														<p className="font-medium text-sm">{call.source}</p>
-														<StatusBadge
-															label={taskStatusLabel(call.status)}
-															tone={tone}
-														/>
+									<div className="space-y-2">
+										{llmCalls.map((call) => {
+											const tone = taskStatusTone(call.status);
+											return (
+												<div
+													key={call.id}
+													className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between"
+												>
+													<div className="min-w-0">
+														<div className="flex flex-wrap items-center gap-2">
+															<p className="font-medium text-sm">
+																{call.source}
+															</p>
+															<StatusBadge
+																label={taskStatusLabel(call.status)}
+																tone={tone}
+															/>
+														</div>
+														<p className="text-muted-foreground mt-1 text-xs">
+															模型：
+															<span className="font-mono">{call.model}</span>
+														</p>
+														<p className="text-muted-foreground mt-1 text-xs">
+															用户：{call.requested_by ?? "-"} · 重试次数：
+															{formatCount(call.attempt_count)}
+														</p>
+														<p className="text-muted-foreground mt-1 text-xs">
+															等待 {formatDurationMs(call.scheduler_wait_ms)} ·
+															首字 {formatDurationMs(call.first_token_wait_ms)}{" "}
+															· 耗时 {formatDurationMs(call.duration_ms)}
+														</p>
+														<p className="text-muted-foreground mt-1 text-xs">
+															Token 输入/输出/缓存：
+															{formatCount(call.input_tokens)} /{" "}
+															{formatCount(call.output_tokens)} /{" "}
+															{formatCount(call.cached_input_tokens)}
+														</p>
+														<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
+															ID: {call.id}
+														</p>
 													</div>
-													<p className="text-muted-foreground mt-1 text-xs">
-														模型：
-														<span className="font-mono">{call.model}</span>
-													</p>
-													<p className="text-muted-foreground mt-1 text-xs">
-														用户：{call.requested_by ?? "-"} · 重试次数：
-														{formatCount(call.attempt_count)}
-													</p>
-													<p className="text-muted-foreground mt-1 text-xs">
-														等待 {formatDurationMs(call.scheduler_wait_ms)} ·
-														首字 {formatDurationMs(call.first_token_wait_ms)} ·
-														耗时 {formatDurationMs(call.duration_ms)}
-													</p>
-													<p className="text-muted-foreground mt-1 text-xs">
-														Token 输入/输出/缓存：
-														{formatCount(call.input_tokens)} /{" "}
-														{formatCount(call.output_tokens)} /{" "}
-														{formatCount(call.cached_input_tokens)}
-													</p>
-													<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
-														ID: {call.id}
-													</p>
+													<div className="flex flex-wrap gap-2">
+														<Button
+															variant="outline"
+															disabled={llmCallActionsDisabled}
+															onClick={() => void onOpenLlmCallDetail(call.id)}
+														>
+															详情
+														</Button>
+													</div>
 												</div>
-												<div className="flex flex-wrap gap-2">
-													<Button
-														variant="outline"
-														disabled={llmCallActionsDisabled}
-														onClick={() => void onOpenLlmCallDetail(call.id)}
-													>
-														详情
-													</Button>
-												</div>
-											</div>
-										);
-									})
+											);
+										})}
+									</div>
 								)}
-							</div>
+							</ListSurfaceShell>
 
 							<div className="flex items-center justify-between">
 								<p className="text-muted-foreground text-xs">
