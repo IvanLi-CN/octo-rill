@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 
 import type { UserManagementStoryState } from "@/admin/UserManagement";
 import type { AdminUserItem } from "@/admin/UserManagement";
+import type { AdminUsersWarmSnapshot } from "@/auth/startupCache";
 import { AuthBootstrapProvider } from "@/auth/AuthBootstrap";
 import { AdminPanel } from "@/pages/AdminPanel";
 
@@ -60,14 +61,27 @@ const mockAdminUsers: AdminUserItem[] = [
 
 type AdminPanelPreviewProps = {
 	storyState?: UserManagementStoryState;
+	mode?:
+		| "ready"
+		| "initial-loading"
+		| "refreshing"
+		| "empty"
+		| "blocking-error";
 };
 
-function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
+function AdminPanelPreview({
+	storyState,
+	mode = "ready",
+}: AdminPanelPreviewProps) {
 	const [ready, setReady] = useState(false);
+	const [warmStart, setWarmStart] = useState<AdminUsersWarmSnapshot | null>(
+		null,
+	);
 
 	useEffect(() => {
 		const originalFetch = window.fetch.bind(window);
 		let users = mockAdminUsers.map((item) => ({ ...item }));
+		let requestCount = 0;
 		const profiles = new Map(
 			users.map((user) => [
 				user.id,
@@ -120,6 +134,28 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 			}
 
 			if (url.pathname === "/api/admin/users" && req.method === "GET") {
+				requestCount += 1;
+				if (mode === "initial-loading") {
+					await new Promise((resolve) => window.setTimeout(resolve, 60_000));
+				}
+				if (mode === "blocking-error") {
+					return new Response(
+						JSON.stringify({
+							ok: false,
+							error: {
+								code: "admin_users_failed",
+								message: "用户列表加载失败",
+							},
+						}),
+						{
+							status: 500,
+							headers: { "content-type": "application/json" },
+						},
+					);
+				}
+				if (mode === "refreshing" && requestCount >= 1) {
+					await new Promise((resolve) => window.setTimeout(resolve, 2_000));
+				}
 				const query = (url.searchParams.get("query") ?? "").toLowerCase();
 				const role = url.searchParams.get("role") ?? "all";
 				const status = url.searchParams.get("status") ?? "all";
@@ -135,12 +171,13 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 						(user.email ?? "").toLowerCase().includes(query)
 					);
 				});
+				const storyItems = mode === "empty" ? [] : filtered;
 				return new Response(
 					JSON.stringify({
-						items: filtered,
+						items: storyItems,
 						page: 1,
 						page_size: 20,
-						total: filtered.length,
+						total: storyItems.length,
 						guard: {
 							admin_total: users.filter((item) => item.is_admin).length,
 							active_admin_total: users.filter(
@@ -269,12 +306,33 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 
 			return originalFetch(input, init);
 		};
+		if (mode === "refreshing") {
+			setWarmStart({
+				savedAt: Date.now(),
+				userId: CURRENT_USER_ID,
+				queryInput: "",
+				query: "",
+				role: "all",
+				status: "all",
+				page: 1,
+				items: mockAdminUsers,
+				total: mockAdminUsers.length,
+				guardSummary: {
+					admin_total: mockAdminUsers.filter((item) => item.is_admin).length,
+					active_admin_total: mockAdminUsers.filter(
+						(item) => item.is_admin && !item.is_disabled,
+					).length,
+				},
+			});
+		} else {
+			setWarmStart(null);
+		}
 		setReady(true);
 
 		return () => {
 			window.fetch = originalFetch;
 		};
-	}, []);
+	}, [mode]);
 
 	if (!ready) {
 		return null;
@@ -307,6 +365,7 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 					},
 				}}
 				userManagementStoryState={storyState}
+				userManagementWarmStart={warmStart}
 			/>
 		</AuthBootstrapProvider>
 	);
@@ -315,6 +374,9 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 const meta = {
 	title: "Admin/Admin Panel",
 	component: AdminPanelPreview,
+	args: {
+		mode: "ready",
+	},
 	parameters: {
 		layout: "fullscreen",
 		docs: {
@@ -340,8 +402,33 @@ export const Default: Story = {
 	},
 };
 
+export const InitialLoading: Story = {
+	args: {
+		mode: "initial-loading",
+	},
+};
+
+export const Refreshing: Story = {
+	args: {
+		mode: "refreshing",
+	},
+};
+
+export const Empty: Story = {
+	args: {
+		mode: "empty",
+	},
+};
+
+export const BlockingError: Story = {
+	args: {
+		mode: "blocking-error",
+	},
+};
+
 export const Filtered: Story = {
 	args: {
+		mode: "ready",
 		storyState: {
 			queryInput: "octo",
 			query: "octo",
@@ -366,6 +453,21 @@ export const EvidenceCompactList: Story = {
 			description: {
 				story:
 					"紧凑双层列表布局证据，覆盖超长 login/name/email、仓库总数、我的发布纳入状态，以及单行截断策略。",
+			},
+		},
+	},
+};
+
+export const EvidenceRefreshingState: Story = {
+	name: "Evidence / Refreshing State",
+	args: {
+		mode: "refreshing",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"用户列表 warm refresh 证据：保留旧表格内容，只追加延迟出现的局部刷新提示。",
 			},
 		},
 	},

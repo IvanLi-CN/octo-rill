@@ -471,7 +471,7 @@ test("dashboard sync click creates the same access-refresh task visible in admin
 		"aria-selected",
 		"true",
 	);
-	await expect(page.getByText("暂无任务。")).toBeVisible();
+	await expect(page.getByText("暂无任务")).toBeVisible();
 
 	await page.goto("/");
 	const syncButton = page.getByRole("banner").getByRole("button", {
