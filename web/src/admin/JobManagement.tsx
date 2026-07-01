@@ -13,7 +13,6 @@ import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
 import { TranslationWorkerBoard } from "@/admin/TranslationWorkerBoard";
 import {
 	ADMIN_JOBS_BASE_PATH,
-	ADMIN_JOBS_SUBSCRIPTIONS_PATH,
 	ADMIN_SUBSCRIPTION_SETTINGS_AUTO_OPEN_SESSION_KEY,
 	buildAdminJobsRouteUrl,
 	parseAdminJobsRoute,
@@ -28,6 +27,7 @@ import {
 	type AdminLlmSchedulerStatusResponse,
 	type AdminJobsOverviewResponse,
 	type AdminJobsStreamEvent,
+	type AdminBusinessOutcome,
 	type AdminRealtimeTaskDetailResponse,
 	type AdminRealtimeTaskItem,
 	type AdminTaskEventItem,
@@ -63,13 +63,7 @@ import {
 } from "@/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-	Card,
-	CardContent,
-	CardDescription,
-	CardHeader,
-	CardTitle,
-} from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
 	Dialog,
 	DialogContent,
@@ -1927,9 +1921,6 @@ function TranslationSchedulerSection(props: {
 			<Card>
 				<CardHeader>
 					<CardTitle>翻译调度</CardTitle>
-					<CardDescription>
-						统一查看真实工作者槽位、需求队列与任务记录，并保留现有详情抽屉链路。
-					</CardDescription>
 				</CardHeader>
 				<CardContent className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
 					<div className="bg-card/70 rounded-lg border p-3">
@@ -2014,9 +2005,6 @@ function TranslationSchedulerSection(props: {
 					<Card>
 						<CardHeader>
 							<CardTitle>需求队列</CardTitle>
-							<CardDescription>
-								按请求对象查看全部翻译需求，默认按活跃优先排序。
-							</CardDescription>
 						</CardHeader>
 						<CardContent className="space-y-4">
 							<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -2238,9 +2226,6 @@ function TranslationSchedulerSection(props: {
 					<Card>
 						<CardHeader>
 							<CardTitle>任务记录</CardTitle>
-							<CardDescription>
-								按真实 translation batch 历史查看 worker 执行结果。
-							</CardDescription>
 						</CardHeader>
 						<CardContent className="space-y-4">
 							<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -2966,21 +2951,139 @@ function subscriptionStageTone(
 	stage: SubscriptionWorkflowStage,
 ): TaskStatusTone {
 	if (stage.skipped) return taskStatusTone("skipped");
+	if (stage.failed > 0) return taskStatusTone("failed");
 	if (stage.total > 0 && stage.done >= stage.total) {
-		if (stage.failed > 0) return taskStatusTone("failed");
 		return taskStatusTone("succeeded");
 	}
 	if (stage.done > 0) return taskStatusTone("running");
-	if (stage.failed > 0) return taskStatusTone("failed");
 	return taskStatusTone("queued");
 }
 
 function subscriptionStageStatusLabel(stage: SubscriptionWorkflowStage) {
 	if (stage.skipped) return "已跳过";
+	if (stage.failed > 0) return "部分失败";
 	if (stage.total > 0 && stage.done >= stage.total) return "完成";
 	if (stage.done > 0) return "运行中";
-	if (stage.failed > 0) return "部分失败";
 	return "等待";
+}
+
+function subscriptionStageCompactLabel(stage: SubscriptionWorkflowStage) {
+	switch (stage.id) {
+		case "repo":
+			return "Repo";
+		case "release":
+			return "Release";
+		case "notifications":
+			return "Inbox";
+		default:
+			return stage.label;
+	}
+}
+
+function subscriptionStagePending(stage: SubscriptionWorkflowStage) {
+	return Math.max(0, stage.total - stage.succeeded - stage.failed);
+}
+
+function subscriptionBusinessStatus(
+	task: AdminRealtimeTaskItem,
+	diagnostics: AdminSyncSubscriptionsDiagnostics | null | undefined,
+	businessOutcome: AdminBusinessOutcome | null | undefined,
+	stages: SubscriptionWorkflowStage[],
+) {
+	if (task.status === "queued") return "queued";
+	if (task.status === "running") return "running";
+	if (diagnostics?.skipped || task.skipped) return "skipped";
+	if (task.status === "failed") return "failed";
+	if (!diagnostics || !businessOutcome) return "diagnostics_missing";
+	if (task.status === "canceled") return "canceled";
+	if (businessOutcome.code === "failed") return "failed";
+	if (businessOutcome.code === "disabled") return "skipped";
+	if (businessOutcome.code === "unknown") return "running";
+
+	const hasFailed = stages.some((stage) => stage.failed > 0);
+	const hasPending = stages.some(
+		(stage) => !stage.skipped && subscriptionStagePending(stage) > 0,
+	);
+	if (
+		hasFailed ||
+		hasPending ||
+		diagnostics.critical_events > 0 ||
+		businessOutcome.code === "partial"
+	) {
+		return "partial";
+	}
+
+	return "succeeded";
+}
+
+function subscriptionBusinessStatusLabel(status: string) {
+	switch (status) {
+		case "queued":
+			return "排队中";
+		case "running":
+			return "运行中";
+		case "partial":
+			return "部分完成";
+		case "failed":
+			return "失败";
+		case "canceled":
+			return "已取消";
+		case "skipped":
+			return "已跳过";
+		case "succeeded":
+			return "成功";
+		case "diagnostics_missing":
+			return "诊断未加载";
+		default:
+			return status;
+	}
+}
+
+function subscriptionBusinessStatusTone(status: string): TaskStatusTone {
+	if (status === "partial" || status === "diagnostics_missing") {
+		return taskStatusTone("queued");
+	}
+	return taskStatusTone(status);
+}
+
+function subscriptionIssueSummary(
+	diagnostics: AdminSyncSubscriptionsDiagnostics | null | undefined,
+	stages: SubscriptionWorkflowStage[],
+) {
+	if (!diagnostics) return "列表诊断未加载，无法判断业务完成度。";
+	if (diagnostics.skipped) {
+		return diagnostics.skip_reason === "previous_run_active"
+			? "上一轮仍在执行，本轮未开始业务同步。"
+			: `本轮已跳过：${diagnostics.skip_reason ?? "未提供原因"}`;
+	}
+	const parts = stages.flatMap((stage) => {
+		const pending = subscriptionStagePending(stage);
+		const stageParts = [];
+		if (stage.failed > 0) {
+			stageParts.push(`${stage.label} 失败 ${formatCount(stage.failed)}`);
+		}
+		if (pending > 0) {
+			stageParts.push(`${stage.label} 剩余 ${formatCount(pending)}`);
+		}
+		return stageParts;
+	});
+	if (diagnostics.critical_events > 0) {
+		parts.push(`关键事件 ${formatCount(diagnostics.critical_events)}`);
+	}
+	return parts.length > 0 ? parts.join(" · ") : "全阶段已完成且无失败。";
+}
+
+function subscriptionRecentEventSummary(
+	diagnostics: AdminSyncSubscriptionsDiagnostics | null | undefined,
+) {
+	const event = diagnostics?.recent_events.find(
+		(item) => item.severity === "error" || item.severity === "warning",
+	);
+	if (!event) return null;
+	const target = event.repo_full_name ?? event.user_id ?? null;
+	return [event.stage, event.event_type, target, event.message]
+		.filter(Boolean)
+		.join(" · ");
 }
 
 function buildSubscriptionWorkflowStages(
@@ -3179,10 +3282,15 @@ function SubscriptionWorkflowDetailPage(props: {
 	const diagnostics = detail?.diagnostics?.sync_subscriptions ?? null;
 	const businessOutcome = detail?.diagnostics?.business_outcome ?? null;
 	const stages = buildSubscriptionWorkflowStages(diagnostics);
-	const displayStatus = diagnostics?.skipped
-		? "skipped"
-		: (detail?.task.status ?? "");
-	const tone = taskStatusTone(displayStatus);
+	const displayStatus = detail
+		? subscriptionBusinessStatus(
+				detail.task,
+				diagnostics,
+				businessOutcome,
+				stages,
+			)
+		: "";
+	const tone = subscriptionBusinessStatusTone(displayStatus);
 	const recentFailures = diagnostics?.recent_events.filter(
 		(event) => event.severity === "error" || event.severity === "warning",
 	);
@@ -3217,7 +3325,10 @@ function SubscriptionWorkflowDetailPage(props: {
 					<div className="space-y-1">
 						<div className="flex flex-wrap items-center gap-2">
 							<h2 className="font-semibold text-xl">订阅同步工作流详情</h2>
-							<StatusBadge label={taskStatusLabel(displayStatus)} tone={tone} />
+							<StatusBadge
+								label={subscriptionBusinessStatusLabel(displayStatus)}
+								tone={tone}
+							/>
 							<Badge variant="outline">sync.subscriptions</Badge>
 						</div>
 						<p className="text-muted-foreground truncate font-mono text-xs">
@@ -3307,9 +3418,6 @@ function SubscriptionWorkflowDetailPage(props: {
 			<Card>
 				<CardHeader>
 					<CardTitle>阶段总览</CardTitle>
-					<CardDescription>
-						按订阅同步执行顺序展示每个阶段的整体进度与失败分布。
-					</CardDescription>
 				</CardHeader>
 				<CardContent className="space-y-3">
 					{stages.map((stage, index) => {
@@ -3396,9 +3504,6 @@ function SubscriptionWorkflowDetailPage(props: {
 				<Card>
 					<CardHeader>
 						<CardTitle>最近关键事件</CardTitle>
-						<CardDescription>
-							聚焦本轮订阅同步事件，按阶段定位失败主因。
-						</CardDescription>
 					</CardHeader>
 					<CardContent className="space-y-2">
 						{diagnostics?.recent_events.length ? (
@@ -3433,9 +3538,6 @@ function SubscriptionWorkflowDetailPage(props: {
 				<Card>
 					<CardHeader>
 						<CardTitle>子任务 / Worker 关联</CardTitle>
-						<CardDescription>
-							展示当前任务派生出的翻译、润色等后续处理链路。
-						</CardDescription>
 					</CardHeader>
 					<CardContent className="space-y-2">
 						{relatedLlmCallsLoading ? (
@@ -3478,9 +3580,6 @@ function SubscriptionWorkflowDetailPage(props: {
 			<Card>
 				<CardHeader>
 					<CardTitle>执行时间线</CardTitle>
-					<CardDescription>
-						保留原始任务事件，便于核对阶段诊断与后端日志。
-					</CardDescription>
 				</CardHeader>
 				<CardContent className="space-y-2">
 					{taskEvents.length === 0 ? (
@@ -4985,29 +5084,36 @@ export function JobManagement({
 
 	return (
 		<div className="space-y-4">
-			<Card>
-				<CardHeader>
+			<Card className="border-0 bg-transparent shadow-none sm:border sm:bg-card sm:shadow-sm">
+				<CardHeader className="px-0 pb-3 sm:px-6 sm:pb-6">
 					<CardTitle>任务总览</CardTitle>
-					<CardDescription>
-						展示实时异步任务与定时任务运行概览。
-					</CardDescription>
 				</CardHeader>
-				<CardContent className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-					<div className="bg-card/70 rounded-lg border p-3">
-						<p className="text-muted-foreground text-xs">队列中</p>
-						<p className="mt-1 text-xl font-semibold">
+				<CardContent
+					className="grid grid-cols-3 gap-2 px-4 pb-4 pt-0 sm:grid-cols-2 sm:gap-3 sm:px-6 sm:pb-6 lg:grid-cols-3"
+					data-testid="job-overview-metrics"
+				>
+					<div className="min-w-0 px-1 py-1 sm:rounded-lg sm:border sm:bg-card/70 sm:p-3">
+						<p className="truncate text-[10px] text-muted-foreground leading-tight sm:text-xs">
+							队列中
+						</p>
+						<p className="mt-0.5 truncate text-base font-semibold sm:mt-1 sm:text-xl">
 							{formatCount(overview?.queued)}
 						</p>
 					</div>
-					<div className="bg-card/70 rounded-lg border p-3">
-						<p className="text-muted-foreground text-xs">运行中</p>
-						<p className="mt-1 text-xl font-semibold">
+					<div className="min-w-0 px-1 py-1 sm:rounded-lg sm:border sm:bg-card/70 sm:p-3">
+						<p className="truncate text-[10px] text-muted-foreground leading-tight sm:text-xs">
+							运行中
+						</p>
+						<p className="mt-0.5 truncate text-base font-semibold sm:mt-1 sm:text-xl">
 							{formatCount(overview?.running)}
 						</p>
 					</div>
-					<div className="bg-card/70 rounded-lg border p-3">
-						<p className="text-muted-foreground text-xs">近24h 成功 / 失败</p>
-						<p className="mt-1 text-xl font-semibold">
+					<div className="min-w-0 px-1 py-1 sm:rounded-lg sm:border sm:bg-card/70 sm:p-3">
+						<p className="truncate text-[10px] text-muted-foreground leading-tight sm:text-xs">
+							<span className="sm:hidden">近24h成/败</span>
+							<span className="hidden sm:inline">近24h 成功 / 失败</span>
+						</p>
+						<p className="mt-0.5 truncate text-base font-semibold sm:mt-1 sm:text-xl">
 							{formatCount(overview?.succeeded_24h)} /{" "}
 							{formatCount(overview?.failed_24h)}
 						</p>
@@ -5028,20 +5134,35 @@ export function JobManagement({
 				className="space-y-4"
 			>
 				<div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-					<TabsList className="grid w-full grid-cols-2 sm:grid-cols-5 lg:inline-flex lg:w-auto">
-						<TabsTrigger value="realtime" className="font-mono text-xs">
+					<TabsList className="grid !h-[72px] w-full grid-cols-3 auto-rows-[32px] sm:!h-auto sm:grid-cols-5 lg:inline-flex lg:w-auto">
+						<TabsTrigger
+							value="realtime"
+							className="!h-8 font-mono text-[11px] sm:text-xs"
+						>
 							实时异步任务
 						</TabsTrigger>
-						<TabsTrigger value="scheduled" className="font-mono text-xs">
+						<TabsTrigger
+							value="scheduled"
+							className="!h-8 font-mono text-[11px] sm:text-xs"
+						>
 							定时任务
 						</TabsTrigger>
-						<TabsTrigger value="subscriptions" className="font-mono text-xs">
+						<TabsTrigger
+							value="subscriptions"
+							className="!h-8 font-mono text-[11px] sm:text-xs"
+						>
 							订阅同步
 						</TabsTrigger>
-						<TabsTrigger value="llm" className="font-mono text-xs">
+						<TabsTrigger
+							value="llm"
+							className="!h-8 font-mono text-[11px] sm:text-xs"
+						>
 							LLM调度
 						</TabsTrigger>
-						<TabsTrigger value="translations" className="font-mono text-xs">
+						<TabsTrigger
+							value="translations"
+							className="!h-8 font-mono text-[11px] sm:text-xs"
+						>
 							翻译调度
 						</TabsTrigger>
 					</TabsList>
@@ -5085,9 +5206,6 @@ export function JobManagement({
 									</TooltipContent>
 								</Tooltip>
 							</div>
-							<CardDescription>
-								按状态查看实时任务队列，并保留当前用户上下文与详情入口。
-							</CardDescription>
 						</CardHeader>
 						<CardContent className="space-y-4">
 							<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -5269,10 +5387,6 @@ export function JobManagement({
 						<CardHeader className="flex flex-row items-start justify-between gap-4">
 							<div className="space-y-1.5">
 								<CardTitle>定时任务</CardTitle>
-								<CardDescription>
-									查看 `brief.daily_slot`、`sync.subscriptions` 与
-									`retry.recent_failures` 运行记录。
-								</CardDescription>
 							</div>
 							<Button
 								type="button"
@@ -5478,14 +5592,10 @@ export function JobManagement({
 							onOpenLlmCallDetail={onOpenLlmCallDetail}
 						/>
 					) : (
-						<Card>
-							<CardHeader className="flex flex-row items-start justify-between gap-4">
+						<Card className="border-0 bg-transparent shadow-none sm:border sm:bg-card sm:shadow-sm">
+							<CardHeader className="flex flex-row items-start justify-between gap-4 px-0 pb-3 sm:px-6 sm:pb-6">
 								<div className="space-y-1.5">
 									<CardTitle>订阅同步</CardTitle>
-									<CardDescription>
-										按工作流查看 `sync.subscriptions` 的 Star、Release、Social
-										与 Inbox 阶段。
-									</CardDescription>
 								</div>
 								<Button
 									type="button"
@@ -5498,55 +5608,63 @@ export function JobManagement({
 									<Settings2 />
 								</Button>
 							</CardHeader>
-							<CardContent className="space-y-4">
-								<div className="grid gap-3 md:grid-cols-4">
-									<div className="rounded-lg border bg-card/70 p-3">
-										<p className="text-muted-foreground text-xs">
-											Release 抓取并发
+							<CardContent className="space-y-4 px-0 pb-0 pt-0 sm:px-6 sm:pb-6">
+								<div
+									className="grid grid-cols-3 gap-2 md:grid-cols-4 md:gap-3"
+									data-testid="subscription-sync-metrics"
+								>
+									<div className="min-w-0 px-1 py-1 md:rounded-lg md:border md:bg-card/70 md:p-3">
+										<p className="truncate text-[10px] text-muted-foreground leading-tight md:text-xs">
+											<span className="md:hidden">Release 并发</span>
+											<span className="hidden md:inline">Release 抓取并发</span>
 										</p>
-										<p className="mt-1 text-xl font-semibold">
+										<p className="mt-0.5 truncate text-base font-semibold md:mt-1 md:text-xl">
 											{formatCount(
 												syncRuntimeConfig?.repo_release_worker_concurrency,
 											)}
 										</p>
-										<p className="text-muted-foreground mt-1 text-xs">
+										<p className="mt-1 hidden text-muted-foreground text-xs md:block">
 											目标并发，保存后热生效
 										</p>
 									</div>
-									<div className="rounded-lg border bg-card/70 p-3">
-										<p className="text-muted-foreground text-xs">
-											自动获取间隔
+									<div className="min-w-0 px-1 py-1 md:rounded-lg md:border md:bg-card/70 md:p-3">
+										<p className="truncate text-[10px] text-muted-foreground leading-tight md:text-xs">
+											<span className="md:hidden">获取间隔</span>
+											<span className="hidden md:inline">自动获取间隔</span>
 										</p>
-										<p className="mt-1 text-xl font-semibold">
+										<p className="mt-0.5 truncate text-base font-semibold md:mt-1 md:text-xl">
 											{formatCount(
 												syncRuntimeConfig?.sync_auto_fetch_interval_minutes,
 											)}{" "}
 											分钟
 										</p>
-										<p className="text-muted-foreground mt-1 text-xs">
+										<p className="mt-1 hidden text-muted-foreground text-xs md:block">
 											频率保持独立配置
 										</p>
 									</div>
-									<div className="rounded-lg border bg-card/70 p-3">
-										<p className="text-muted-foreground text-xs">
-											10 分钟系统预算
+									<div className="min-w-0 px-1 py-1 md:rounded-lg md:border md:bg-card/70 md:p-3">
+										<p className="truncate text-[10px] text-muted-foreground leading-tight md:text-xs">
+											<span className="md:hidden">系统预算</span>
+											<span className="hidden md:inline">10 分钟系统预算</span>
 										</p>
-										<p className="mt-1 text-xl font-semibold">
+										<p className="mt-0.5 truncate text-base font-semibold md:mt-1 md:text-xl">
 											{formatCount(
 												syncRuntimeConfig?.repo_refresh_system_budget_per_window,
 											)}
 										</p>
-										<p className="text-muted-foreground mt-1 text-xs">
+										<p className="mt-1 hidden text-muted-foreground text-xs md:block">
 											系统选仓窗口上限
 										</p>
 									</div>
-									<div className="rounded-lg border bg-card/70 p-3">
-										<p className="text-muted-foreground text-xs">最近链路</p>
-										<p className="mt-1 text-xl font-semibold">
+									<div className="min-w-0 px-1 py-1 md:rounded-lg md:border md:bg-card/70 md:p-3">
+										<p className="truncate text-[10px] text-muted-foreground leading-tight md:text-xs">
+											最近任务
+										</p>
+										<p className="mt-0.5 truncate text-base font-semibold md:mt-1 md:text-xl">
 											{formatCount(syncRuntimeConfig?.recent_sync_tasks.length)}
 										</p>
-										<p className="text-muted-foreground mt-1 text-xs">
-											可直接打开任务详情
+										<p className="mt-1 hidden text-muted-foreground text-xs md:block">
+											最近订阅同步记录
 										</p>
 									</div>
 								</div>
@@ -5585,7 +5703,7 @@ export function JobManagement({
 											}
 										/>
 									) : subscriptionListSurface.state === "initial-loading" ? (
-										<CardListSkeleton count={3} itemClassName="h-56" />
+										<CardListSkeleton count={3} itemClassName="h-48" />
 									) : subscriptionListSurface.state === "empty" ? (
 										<ListEmptyState
 											title="暂无订阅同步任务"
@@ -5594,106 +5712,193 @@ export function JobManagement({
 									) : (
 										<div className="space-y-2">
 											{subscriptionRuns.map((task) => {
-												const displayStatus = realtimeTaskDisplayStatus(task);
-												const tone = taskStatusTone(displayStatus);
+												const taskDiagnostics =
+													task.diagnostics ??
+													(task.id === activeTaskDetail?.task.id
+														? activeTaskDetail?.diagnostics
+														: null);
 												const diagnostics =
-													task.id === activeTaskDetail?.task.id
-														? activeTaskDetail?.diagnostics?.sync_subscriptions
-														: null;
+													taskDiagnostics?.sync_subscriptions ?? null;
+												const businessOutcome =
+													taskDiagnostics?.business_outcome ?? null;
+												const stages =
+													buildSubscriptionWorkflowStages(diagnostics);
+												const displayStatus = subscriptionBusinessStatus(
+													task,
+													diagnostics,
+													businessOutcome,
+													stages,
+												);
+												const tone =
+													subscriptionBusinessStatusTone(displayStatus);
+												const issueSummary = subscriptionIssueSummary(
+													diagnostics,
+													stages,
+												);
+												const compactTaskId = task.id.startsWith(
+													"task-subscription-",
+												)
+													? `#${task.id.slice("task-subscription-".length)}`
+													: `...${task.id.slice(-8)}`;
+												const recentEventSummary =
+													subscriptionRecentEventSummary(diagnostics);
+												const hasIssue = displayStatus !== "succeeded";
+												const detailHref = buildAdminJobsRouteUrl({
+													primaryTab: "subscriptions",
+													translationView,
+													taskDrawerRoute: null,
+													drawerFromTab: null,
+													subscriptionDetailTaskId: task.id,
+												});
 												return (
-													<div
+													<a
 														key={task.id}
-														className="rounded-xl border bg-card/70 p-5 transition-colors duration-200 hover:bg-card/90"
+														aria-label={`打开订阅同步工作流 ${task.id}`}
+														className={`max-h-[200px] cursor-pointer overflow-hidden border-b bg-transparent py-2 transition-colors duration-200 last:border-b-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 sm:rounded-xl sm:border sm:bg-card/70 sm:p-3 sm:hover:bg-card/90 ${tone.cardAccentClass}`}
+														data-task-id={task.id}
+														data-testid="subscription-workflow-card"
+														href={detailHref}
+														onClick={(event) => {
+															if (
+																event.defaultPrevented ||
+																event.button !== 0 ||
+																event.metaKey ||
+																event.altKey ||
+																event.ctrlKey ||
+																event.shiftKey
+															) {
+																return;
+															}
+															event.preventDefault();
+															onOpenTaskDetail(task.id);
+														}}
 													>
-														<div className="grid gap-4">
-															<div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
-																<div className="min-w-0 space-y-2">
-																	<div className="flex flex-wrap items-center gap-2">
-																		<p className="font-medium text-base">
-																			订阅同步工作流
-																		</p>
-																		<StatusBadge
-																			label={taskStatusLabel(displayStatus)}
-																			tone={tone}
-																		/>
-																		<span className="rounded-md border bg-background px-2 py-0.5 font-mono text-[11px]">
-																			{sourceLabel(task.source)}
-																		</span>
-																	</div>
-																	<p className="text-muted-foreground truncate font-mono text-[11px]">
-																		ID: {task.id}
+														<div className="grid gap-1 sm:gap-1.5">
+															<div className="flex items-start justify-between gap-2 border-b pb-1.5 sm:gap-3 sm:pb-2">
+																<div className="flex min-w-0 items-center gap-2">
+																	<p className="shrink-0 font-medium text-[13px] sm:text-sm">
+																		订阅同步工作流
 																	</p>
+																	<StatusBadge
+																		label={subscriptionBusinessStatusLabel(
+																			displayStatus,
+																		)}
+																		tone={tone}
+																	/>
+																	<span className="hidden rounded-md border bg-background px-1.5 py-0.5 font-mono text-[11px] sm:inline">
+																		{sourceLabel(task.source)}
+																	</span>
 																</div>
-																<div className="flex flex-wrap items-center gap-2 lg:justify-end">
-																	<div className="flex flex-wrap gap-1.5 text-xs">
-																		<span className="rounded bg-muted/60 px-2 py-0.5">
+																<div className="min-w-0 shrink text-right">
+																	<p
+																		className="truncate font-mono text-[11px] text-muted-foreground"
+																		title={`ID: ${task.id}`}
+																	>
+																		<span className="sm:hidden">
+																			ID: {compactTaskId}
+																		</span>
+																		<span className="hidden sm:inline">
+																			ID: {task.id}
+																		</span>
+																	</p>
+																	<div className="mt-1 hidden grid-cols-3 gap-1 text-[11px] text-muted-foreground sm:grid">
+																		<span className="rounded bg-muted/50 px-1.5 py-0.5">
 																			创建 {formatLocalHm(task.created_at)}
 																		</span>
-																		<span className="rounded bg-muted/60 px-2 py-0.5">
+																		<span className="rounded bg-muted/50 px-1.5 py-0.5">
 																			开始 {formatLocalHm(task.started_at)}
 																		</span>
-																		<span className="rounded bg-muted/60 px-2 py-0.5">
+																		<span className="rounded bg-muted/50 px-1.5 py-0.5">
 																			完成 {formatLocalHm(task.finished_at)}
 																		</span>
 																	</div>
-																	<Button variant="outline" asChild>
-																		<a
-																			href={`${ADMIN_JOBS_SUBSCRIPTIONS_PATH}/${encodeURIComponent(task.id)}`}
-																		>
-																			工作流详情
-																		</a>
-																	</Button>
+																	<p className="mt-1 text-[11px] text-muted-foreground sm:hidden">
+																		{formatLocalHm(
+																			task.finished_at ?? task.created_at,
+																		)}
+																	</p>
 																</div>
 															</div>
-															<div className="grid w-full grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
-																{[
-																	["Collect", "用户与调度键"],
-																	[
-																		"Star",
-																		diagnostics
-																			? `${diagnostics.star.succeeded_users}/${diagnostics.star.total_users}`
-																			: "-",
-																	],
-																	[
-																		"Repo",
-																		diagnostics
-																			? `${diagnostics.star.total_repos}`
-																			: "-",
-																	],
-																	[
-																		"Release",
-																		diagnostics
-																			? `${diagnostics.release.succeeded_repos}/${diagnostics.release.total_repos}`
-																			: "-",
-																	],
-																	[
-																		"Social",
-																		diagnostics
-																			? `${diagnostics.social.succeeded_users}/${diagnostics.social.total_users}`
-																			: "-",
-																	],
-																	[
-																		"Inbox",
-																		diagnostics
-																			? `${diagnostics.notifications.succeeded_users}/${diagnostics.notifications.total_users}`
-																			: "-",
-																	],
-																].map(([label, value]) => (
-																	<div
-																		key={label}
-																		className="min-h-[74px] rounded-lg border bg-background/70 px-4 py-3"
-																	>
-																		<p className="text-muted-foreground text-xs">
-																			{label}
-																		</p>
-																		<p className="mt-2 font-mono text-sm font-semibold">
-																			{value}
-																		</p>
+															{diagnostics ? (
+																<div className="overflow-hidden border-y bg-transparent sm:rounded-lg sm:border sm:bg-border sm:overflow-x-auto">
+																	<div className="grid grid-cols-3 gap-px bg-border text-[10px] sm:min-w-[672px] sm:grid-cols-6 sm:gap-0 sm:divide-x sm:text-[11px]">
+																		{stages.map((stage) => {
+																			const pending =
+																				subscriptionStagePending(stage);
+																			const stageTone =
+																				subscriptionStageTone(stage);
+																			const compactLabel =
+																				subscriptionStageCompactLabel(stage);
+																			return (
+																				<div
+																					key={stage.id}
+																					className="grid min-h-10 min-w-0 grid-rows-[auto_1fr] gap-0.5 overflow-hidden bg-background/70 px-1.5 py-1 sm:min-h-12 sm:gap-1 sm:px-2 sm:py-1.5"
+																				>
+																					<div className="flex min-w-0 items-center justify-between gap-1">
+																						<div className="flex min-w-0 items-center gap-1.5">
+																							<span
+																								className={`size-1.5 shrink-0 rounded-full ${stageTone.dotClass}`}
+																							/>
+																							<span
+																								className="truncate font-medium"
+																								title={stage.label}
+																							>
+																								{compactLabel}
+																							</span>
+																						</div>
+																						<span className="hidden text-muted-foreground sm:inline">
+																							{stage.skipped ? "跳过" : ""}
+																						</span>
+																					</div>
+																					<div className="flex min-w-0 flex-col items-start gap-0 sm:flex-row sm:items-end sm:justify-between sm:gap-2">
+																						<span className="min-w-0 truncate font-mono font-semibold text-foreground">
+																							{stage.skipped
+																								? "skip"
+																								: `${formatCount(stage.done)}/${formatCount(stage.total)}`}
+																						</span>
+																						<span className="font-mono text-[9px] text-muted-foreground sm:hidden">
+																							F{formatCount(stage.failed)}/R
+																							{formatCount(pending)}
+																						</span>
+																						<span className="hidden font-mono text-[10px] text-muted-foreground sm:inline">
+																							F{formatCount(stage.failed)} · R
+																							{formatCount(pending)}
+																						</span>
+																					</div>
+																				</div>
+																			);
+																		})}
 																	</div>
-																))}
-															</div>
+																</div>
+															) : (
+																<div className="rounded-lg border border-amber-500/35 bg-amber-500/5 px-3 py-2 text-sm">
+																	<p className="font-medium">诊断未加载</p>
+																</div>
+															)}
+															{hasIssue || recentEventSummary ? (
+																<p className="line-clamp-1 border-t pt-1 text-[11px] text-muted-foreground sm:hidden">
+																	<span className="font-medium text-foreground">
+																		异常焦点：
+																	</span>
+																	{issueSummary}
+																	{recentEventSummary
+																		? ` · 最近事件：${recentEventSummary}`
+																		: ""}
+																</p>
+															) : null}
+															{hasIssue || recentEventSummary ? (
+																<p className="hidden truncate border-t pt-1.5 text-xs text-muted-foreground sm:block">
+																	<span className="font-medium text-foreground">
+																		异常焦点：
+																	</span>
+																	{issueSummary}
+																	{recentEventSummary
+																		? ` · 最近事件：${recentEventSummary}`
+																		: ""}
+																</p>
+															) : null}
 														</div>
-													</div>
+													</a>
 												);
 											})}
 										</div>
@@ -5744,9 +5949,6 @@ export function JobManagement({
 						<CardHeader className="flex flex-row items-start justify-between gap-4">
 							<div className="space-y-1.5">
 								<CardTitle>LLM 调度</CardTitle>
-								<CardDescription>
-									查看调度状态与调用级日志，支持按状态/来源/用户/时间筛选。
-								</CardDescription>
 							</div>
 							<Button
 								type="button"

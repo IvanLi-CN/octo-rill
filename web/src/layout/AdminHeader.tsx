@@ -219,7 +219,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 
 				<div
 					className={cn(
-						"flex items-center gap-2 self-start lg:self-auto",
+						"flex w-full min-w-0 items-center justify-between gap-2 self-start lg:w-auto lg:self-auto lg:justify-start",
 						!disableHeaderMotion &&
 							"motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
 						disableHeaderMotion && "transition-none",
@@ -284,7 +284,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 					</Button>
 					<div
 						className={cn(
-							"flex min-w-0 items-center gap-1",
+							"flex min-w-0 shrink items-center justify-end gap-1",
 							useMobileCompact && "gap-0.5",
 						)}
 						style={
@@ -298,7 +298,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 						<span
 							data-admin-login-label
 							className={cn(
-								"text-muted-foreground min-w-0 max-w-[8.5rem] truncate text-sm sm:max-w-[10rem] lg:max-w-none",
+								"text-muted-foreground min-w-0 max-w-[5.5rem] truncate text-sm sm:max-w-[10rem] lg:max-w-none",
 								!disableHeaderMotion &&
 									"motion-safe:transition-[font-size,transform] motion-safe:duration-200 motion-safe:ease-out",
 								disableHeaderMotion && "transition-none",
