@@ -459,3 +459,45 @@ state=release-incremental-stats
 evidence_note=验证 Release Queue 阶段展示“扫描 / 新增 / 更新 / 未变”的真实统计口径，不再把 GitHub 返回条数标成写入量。
 
 ![Release incremental stats](./assets/admin-jobs-release-incremental-stats.png)
+
+source_type=storybook_canvas
+target_program=mock-only
+capture_scope=browser-viewport
+requested_viewport=1440x900
+viewport_strategy=storybook-viewport
+sensitive_exclusion=N/A
+submission_gate=approved
+story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
+state=subscription-sync-observability-desktop
+evidence_note=验证桌面端订阅同步列表保留高密度业务状态、阶段统计、异常焦点与配置统计，未把部分完成或失败记录显示为成功。
+
+PR: include
+![Subscription sync observability desktop](./assets/subscription-sync-workflow-desktop-1440.png)
+
+source_type=storybook_canvas
+target_program=mock-only
+capture_scope=browser-viewport
+requested_viewport=390x900
+viewport_strategy=storybook-viewport
+sensitive_exclusion=N/A
+submission_gate=approved
+story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
+state=subscription-sync-observability-mobile-390
+evidence_note=验证 390px 窄屏下任务总览、订阅同步统计和工作流记录均为扁平布局，无卡片套卡片、无横向溢出。
+
+PR: include
+![Subscription sync observability mobile 390](./assets/subscription-sync-workflow-mobile-390.png)
+
+source_type=storybook_canvas
+target_program=mock-only
+capture_scope=browser-viewport
+requested_viewport=320x900
+viewport_strategy=storybook-viewport
+sensitive_exclusion=N/A
+submission_gate=approved
+story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
+state=subscription-sync-observability-mobile-320
+evidence_note=验证 320px 窄屏下统计保持紧凑并列，订阅同步记录高度受控，阶段指标与异常摘要不遮挡、不溢出。
+
+PR: include
+![Subscription sync observability mobile 320](./assets/subscription-sync-workflow-mobile-320.png)

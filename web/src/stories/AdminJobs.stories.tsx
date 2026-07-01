@@ -4,6 +4,7 @@ import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import type {
 	AdminLlmCallDetailResponse,
+	AdminTaskDiagnostics,
 	AdminRealtimeTaskDetailResponse,
 	AdminRealtimeTaskItem,
 	AdminSyncSubscriptionsDiagnostics,
@@ -943,6 +944,232 @@ function buildTaskDetail(
 				},
 			};
 		}
+		if (task.id === "task-subscription-1420") {
+			return {
+				task: {
+					...task,
+					payload_json: JSON.stringify({
+						trigger: "schedule",
+						schedule_key: "2026-02-27T14:20",
+					}),
+					result_json: JSON.stringify({
+						skipped: false,
+						skip_reason: null,
+						star: {
+							total_users: 12,
+							succeeded_users: 12,
+							failed_users: 0,
+							total_repos: 340,
+						},
+						release: {
+							total_repos: 128,
+							succeeded_repos: 128,
+							failed_repos: 0,
+							candidate_failures: 0,
+							fetched_count: 1764,
+							inserted_count: 212,
+							updated_count: 36,
+							unchanged_count: 1516,
+							pages_fetched: 128,
+						},
+						social: {
+							total_users: 12,
+							succeeded_users: 12,
+							failed_users: 0,
+							repo_stars: 52,
+							followers: 21,
+							events: 70,
+						},
+						notifications: {
+							total_users: 12,
+							succeeded_users: 12,
+							failed_users: 0,
+							notifications: 188,
+						},
+						releases_written: 1764,
+						critical_events: 0,
+					}),
+				},
+				events: [
+					{
+						id: "evt-task-1420-1",
+						event_type: "task.completed",
+						payload_json: JSON.stringify({ status: task.status }),
+						created_at: task.finished_at ?? task.updated_at,
+					},
+				],
+				diagnostics: {
+					business_outcome: {
+						code: "ok",
+						label: "业务成功",
+						message: "订阅同步任务已完成。",
+					},
+					sync_subscriptions: {
+						trigger: "schedule",
+						schedule_key: "2026-02-27T14:20",
+						skipped: false,
+						skip_reason: null,
+						log_available: true,
+						log_download_path:
+							"/api/admin/jobs/realtime/task-subscription-1420/log",
+						star: {
+							total_users: 12,
+							succeeded_users: 12,
+							failed_users: 0,
+							total_repos: 340,
+						},
+						release: {
+							total_repos: 128,
+							succeeded_repos: 128,
+							failed_repos: 0,
+							candidate_failures: 0,
+							fetched_count: 1764,
+							inserted_count: 212,
+							updated_count: 36,
+							unchanged_count: 1516,
+							pages_fetched: 128,
+						},
+						social: {
+							total_users: 12,
+							succeeded_users: 12,
+							failed_users: 0,
+							repo_stars: 52,
+							followers: 21,
+							events: 70,
+						},
+						notifications: {
+							total_users: 12,
+							succeeded_users: 12,
+							failed_users: 0,
+							notifications: 188,
+						},
+						releases_written: 1764,
+						critical_events: 0,
+						recent_events: [],
+					},
+				},
+			};
+		}
+		if (task.id === "task-subscription-1410") {
+			return {
+				task: {
+					...task,
+					payload_json: JSON.stringify({
+						trigger: "schedule",
+						schedule_key: "2026-02-27T14:10",
+					}),
+					result_json: JSON.stringify({
+						skipped: false,
+						star: {
+							total_users: 12,
+							succeeded_users: 9,
+							failed_users: 3,
+							total_repos: 220,
+						},
+						release: {
+							total_repos: 88,
+							succeeded_repos: 0,
+							failed_repos: 88,
+							candidate_failures: 22,
+							fetched_count: 0,
+							inserted_count: 0,
+							updated_count: 0,
+							unchanged_count: 0,
+							pages_fetched: 0,
+						},
+						social: {
+							total_users: 0,
+							succeeded_users: 0,
+							failed_users: 0,
+							repo_stars: 0,
+							followers: 0,
+							events: 0,
+						},
+						notifications: {
+							total_users: 0,
+							succeeded_users: 0,
+							failed_users: 0,
+							notifications: 0,
+						},
+						releases_written: 0,
+						critical_events: 12,
+					}),
+				},
+				events: [
+					{
+						id: "evt-task-1410-1",
+						event_type: "task.failed",
+						payload_json: JSON.stringify({ error: task.error_message }),
+						created_at: task.finished_at ?? task.updated_at,
+					},
+				],
+				diagnostics: {
+					business_outcome: {
+						code: "failed",
+						label: "业务失败",
+						message: task.error_message ?? "订阅同步任务在 Release 阶段失败。",
+					},
+					sync_subscriptions: {
+						trigger: "schedule",
+						schedule_key: "2026-02-27T14:10",
+						skipped: false,
+						skip_reason: null,
+						log_available: true,
+						log_download_path:
+							"/api/admin/jobs/realtime/task-subscription-1410/log",
+						star: {
+							total_users: 12,
+							succeeded_users: 9,
+							failed_users: 3,
+							total_repos: 220,
+						},
+						release: {
+							total_repos: 88,
+							succeeded_repos: 0,
+							failed_repos: 88,
+							candidate_failures: 22,
+							fetched_count: 0,
+							inserted_count: 0,
+							updated_count: 0,
+							unchanged_count: 0,
+							pages_fetched: 0,
+						},
+						social: {
+							total_users: 0,
+							succeeded_users: 0,
+							failed_users: 0,
+							repo_stars: 0,
+							followers: 0,
+							events: 0,
+						},
+						notifications: {
+							total_users: 0,
+							succeeded_users: 0,
+							failed_users: 0,
+							notifications: 0,
+						},
+						releases_written: 0,
+						critical_events: 12,
+						recent_events: [
+							{
+								id: "evt-sync-1410-1",
+								stage: "release",
+								event_type: "graphql_error",
+								severity: "error",
+								recoverable: false,
+								attempt: 2,
+								user_id: RECENT_EVENT_USER_ID,
+								repo_id: 9002,
+								repo_full_name: "octo/private-repo",
+								message:
+									"GraphQL error while fetching releases for octo/private-repo",
+								created_at: "2026-02-27T14:10:58Z",
+							},
+						],
+					},
+				},
+			};
+		}
 		if (task.status === "running") {
 			return {
 				task: {
@@ -1383,6 +1610,13 @@ function paginate<T>(
 	return { page, pageSize, pageItems, total: items.length };
 }
 
+function listDiagnosticsForTask(
+	item: AdminRealtimeTaskItem,
+): AdminTaskDiagnostics | null {
+	if (item.task_type !== "sync.subscriptions") return null;
+	return buildTaskDetail(item).diagnostics ?? null;
+}
+
 type AdminJobsPreviewProps = {
 	routeUrl?: string;
 	autoOpenConversation?: boolean;
@@ -1729,6 +1963,7 @@ function AdminJobsPreview({
 						items: pageItems.map((item) => ({
 							...item,
 							skipped: item.id === "task-subscription-skipped",
+							diagnostics: listDiagnosticsForTask(item),
 						})),
 						page: Number(page ?? "1") || 1,
 						page_size: Number(pageSize ?? "20") || 20,
@@ -2414,12 +2649,144 @@ export const SubscriptionSyncWorkflow: Story = {
 		await expect(
 			canvas.getByRole("heading", { name: "订阅同步" }),
 		).toBeVisible();
-		await expect(canvas.getByText("Release 抓取并发")).toBeVisible();
+		expect(canvasElement.innerText).not.toContain("按工作流查看");
+		expect(canvasElement.innerText).not.toContain("展示实时异步任务");
+		expect(canvasElement.innerText).not.toContain("按状态查看");
+		expect(canvasElement.innerText).not.toContain("查看 `brief.daily_slot`");
+		expect(canvasElement.innerText).not.toContain("查看调度状态");
+		expect(canvasElement.innerText).toContain("Release");
 		await expect(canvas.getAllByText("订阅同步工作流")[0]).toBeVisible();
-		const skippedWorkflowCard = canvas
-			.getByText("ID: task-subscription-skipped")
-			.closest("div.rounded-xl");
+		const assertMobileFlatMetrics = () => {
+			const storyWindow = canvasElement.ownerDocument.defaultView;
+			if (!storyWindow || storyWindow.innerWidth >= 640) return;
+			const overviewPanel = canvasElement.querySelector<HTMLElement>(
+				'[data-testid="job-overview-metrics"]',
+			)?.parentElement;
+			expect(overviewPanel).toBeTruthy();
+			if (overviewPanel) {
+				const panelStyle = storyWindow.getComputedStyle(overviewPanel);
+				expect(panelStyle.borderTopWidth).toBe("0px");
+				expect(panelStyle.boxShadow).toBe("none");
+			}
+			const overviewMetrics = canvasElement.querySelector<HTMLElement>(
+				'[data-testid="job-overview-metrics"]',
+			);
+			expect(overviewMetrics).toBeTruthy();
+			const overviewItems = Array.from(
+				overviewMetrics?.children ?? [],
+			) as HTMLElement[];
+			expect(overviewItems).toHaveLength(3);
+			const overviewTops = overviewItems.map((item) =>
+				Math.round(item.getBoundingClientRect().top),
+			);
+			expect(new Set(overviewTops).size).toBe(1);
+			for (const item of overviewItems) {
+				const style = storyWindow.getComputedStyle(item);
+				expect(style.borderTopWidth).toBe("0px");
+				expect(item.getBoundingClientRect().height).toBeLessThan(48);
+			}
+
+			const subscriptionMetrics = canvasElement.querySelector<HTMLElement>(
+				'[data-testid="subscription-sync-metrics"]',
+			);
+			expect(subscriptionMetrics).toBeTruthy();
+			const subscriptionPanel = subscriptionMetrics?.closest(
+				'[data-slot="card"]',
+			) as HTMLElement | null;
+			expect(subscriptionPanel).toBeTruthy();
+			if (subscriptionPanel) {
+				const panelStyle = storyWindow.getComputedStyle(subscriptionPanel);
+				expect(panelStyle.borderTopWidth).toBe("0px");
+				expect(panelStyle.boxShadow).toBe("none");
+			}
+			const subscriptionItems = Array.from(
+				subscriptionMetrics?.children ?? [],
+			) as HTMLElement[];
+			expect(subscriptionItems).toHaveLength(4);
+			const firstRowTops = subscriptionItems
+				.slice(0, 3)
+				.map((item) => Math.round(item.getBoundingClientRect().top));
+			expect(new Set(firstRowTops).size).toBe(1);
+			for (const item of subscriptionItems) {
+				const style = storyWindow.getComputedStyle(item);
+				expect(style.borderTopWidth).toBe("0px");
+				expect(item.getBoundingClientRect().height).toBeLessThan(48);
+			}
+		};
+		assertMobileFlatMetrics();
+		const workflowCardFor = (taskId: string) => {
+			return canvasElement.querySelector<HTMLDivElement>(
+				`[data-testid="subscription-workflow-card"][data-task-id="${taskId}"]`,
+			);
+		};
+		const assertCompactWorkflowCard = (card: HTMLElement) => {
+			expect(card.innerText).not.toContain("工作流详情");
+			expect(card.innerText).not.toContain("打开详情");
+			expect(card.innerText).not.toContain("f/i/u/s");
+			expect(card.innerText).not.toContain("任务正在 Release Queue 阶段执行");
+			expect(card.innerText).not.toContain("任务已完成，但存在失败");
+			expect(card.innerText).not.toContain("上一轮订阅同步仍在执行");
+			expect(card.innerText).not.toContain("订阅同步任务已完成");
+			expect(card.tagName).toBe("A");
+			expect(card.getAttribute("href")).toContain("/admin/jobs/subscriptions/");
+			expect((card.innerText.match(/ID:/g) ?? []).length).toBe(1);
+			expect(
+				(card.innerText.match(/创建 (?=\d|-)/g) ?? []).length,
+			).toBeLessThanOrEqual(1);
+			expect(
+				(card.innerText.match(/开始 (?=\d|-)/g) ?? []).length,
+			).toBeLessThanOrEqual(1);
+			expect(
+				(card.innerText.match(/完成 (?=\d|-)/g) ?? []).length,
+			).toBeLessThanOrEqual(1);
+			expect(card.getBoundingClientRect().height <= 200).toBe(true);
+			const stagePanel = Array.from(card.querySelectorAll("div")).find(
+				(element) =>
+					element.textContent?.includes("Collect") &&
+					element.textContent?.includes("Inbox"),
+			);
+			expect(stagePanel).toBeTruthy();
+			const storyWindow = canvasElement.ownerDocument.defaultView;
+			if (storyWindow && storyWindow.innerWidth < 640) {
+				const style = storyWindow.getComputedStyle(card);
+				expect(style.borderTopWidth).toBe("0px");
+				expect(style.borderLeftWidth).toBe("0px");
+				expect(style.borderRightWidth).toBe("0px");
+				expect(style.borderRadius).toBe("0px");
+				expect(style.backgroundColor).toBe("rgba(0, 0, 0, 0)");
+				expect(
+					(stagePanel as HTMLElement).scrollWidth <=
+						(stagePanel as HTMLElement).clientWidth + 1,
+				).toBe(true);
+			}
+		};
+		const workflowCards = [
+			"task-subscription-1440",
+			"task-subscription-1430",
+			"task-subscription-skipped",
+			"task-subscription-1420",
+			"task-subscription-1410",
+		].map((taskId) => workflowCardFor(taskId));
+		expect(workflowCards.every(Boolean)).toBe(true);
+		for (const card of workflowCards) {
+			assertCompactWorkflowCard(card as HTMLElement);
+		}
+		const partialWorkflowCard = workflowCardFor("task-subscription-1430");
+		expect(partialWorkflowCard).not.toBeNull();
+		assertCompactWorkflowCard(partialWorkflowCard as HTMLElement);
+		const partialWorkflowCardScope = within(partialWorkflowCard as HTMLElement);
+		await expect(partialWorkflowCardScope.getByText("部分完成")).toBeVisible();
+		expect(
+			partialWorkflowCardScope.queryByText(/^成功$/),
+		).not.toBeInTheDocument();
+		const successWorkflowCard = workflowCardFor("task-subscription-1420");
+		expect(successWorkflowCard).not.toBeNull();
+		assertCompactWorkflowCard(successWorkflowCard as HTMLElement);
+		const successWorkflowCardScope = within(successWorkflowCard as HTMLElement);
+		await expect(successWorkflowCardScope.getByText(/^成功$/)).toBeVisible();
+		const skippedWorkflowCard = workflowCardFor("task-subscription-skipped");
 		expect(skippedWorkflowCard).not.toBeNull();
+		assertCompactWorkflowCard(skippedWorkflowCard as HTMLElement);
 		const skippedWorkflowCardScope = within(skippedWorkflowCard as HTMLElement);
 		await expect(skippedWorkflowCardScope.getByText("已跳过")).toBeVisible();
 		expect(

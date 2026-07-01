@@ -3117,7 +3117,7 @@ pub struct AdminRealtimeTasksQuery {
     page_size: Option<i64>,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
 pub struct AdminRealtimeTaskItem {
     id: String,
     task_type: String,
@@ -3132,6 +3132,46 @@ pub struct AdminRealtimeTaskItem {
     started_at: Option<String>,
     finished_at: Option<String>,
     updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<AdminTaskDiagnostics>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AdminRealtimeTaskRow {
+    id: String,
+    task_type: String,
+    status: String,
+    source: String,
+    skipped: bool,
+    requested_by: Option<String>,
+    parent_task_id: Option<String>,
+    cancel_requested: bool,
+    error_message: Option<String>,
+    created_at: String,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    updated_at: String,
+}
+
+impl From<AdminRealtimeTaskRow> for AdminRealtimeTaskItem {
+    fn from(row: AdminRealtimeTaskRow) -> Self {
+        Self {
+            id: row.id,
+            task_type: row.task_type,
+            status: row.status,
+            source: row.source,
+            skipped: row.skipped,
+            requested_by: row.requested_by,
+            parent_task_id: row.parent_task_id,
+            cancel_requested: row.cancel_requested,
+            error_message: row.error_message,
+            created_at: row.created_at,
+            started_at: row.started_at,
+            finished_at: row.finished_at,
+            updated_at: row.updated_at,
+            diagnostics: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -3236,12 +3276,15 @@ pub async fn admin_list_realtime_tasks(
     items_query.push(" OFFSET ");
     items_query.push_bind(offset);
     let items = items_query
-        .build_query_as::<AdminRealtimeTaskItem>()
+        .build_query_as::<AdminRealtimeTaskRow>()
         .fetch_all(&state.pool)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .map(AdminRealtimeTaskItem::from)
+        .collect::<Vec<_>>();
 
-    let items = items
+    let mut items = items
         .into_iter()
         .filter(|item| match task_group.as_str() {
             "scheduled" => jobs::is_scheduled_task_type(&item.task_type),
@@ -3249,6 +3292,7 @@ pub async fn admin_list_realtime_tasks(
             _ => true,
         })
         .collect::<Vec<_>>();
+    attach_subscription_list_diagnostics(state.as_ref(), &mut items).await?;
 
     Ok(Json(AdminRealtimeTasksResponse {
         items,
@@ -3307,6 +3351,26 @@ pub struct AdminTaskEventItem {
     created_at: String,
 }
 
+#[derive(Clone, Debug, sqlx::FromRow)]
+struct AdminTaskDiagnosticEventRow {
+    task_id: String,
+    id: String,
+    event_type: String,
+    payload_json: String,
+    created_at: String,
+}
+
+impl From<AdminTaskDiagnosticEventRow> for AdminTaskEventItem {
+    fn from(row: AdminTaskDiagnosticEventRow) -> Self {
+        Self {
+            id: row.id,
+            event_type: row.event_type,
+            payload_json: row.payload_json,
+            created_at: row.created_at,
+        }
+    }
+}
+
 const ADMIN_TASK_DETAIL_EVENT_LIMIT: i64 = 200;
 const ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT: i64 = 20;
 
@@ -3316,6 +3380,203 @@ pub struct AdminTaskEventMeta {
     total: i64,
     limit: i64,
     truncated: bool,
+}
+
+async fn load_subscription_diagnostic_progress_events(
+    state: &AppState,
+    task_id: &str,
+) -> Result<Vec<AdminTaskEventItem>, ApiError> {
+    sqlx::query_as::<_, AdminTaskEventItem>(
+        r#"
+        SELECT id, event_type, payload_json, created_at
+        FROM job_task_events
+        WHERE task_id = ?
+          AND event_type = 'task.progress'
+          AND json_valid(payload_json)
+          AND json_extract(payload_json, '$.stage') IN (
+            'collect',
+            'star_progress',
+            'star_summary',
+            'repo_collect',
+            'release_attached',
+            'release_progress',
+            'release_summary',
+            'social_progress',
+            'social_summary',
+            'notifications_progress',
+            'notifications_summary'
+          )
+        ORDER BY rowid ASC
+        "#,
+    )
+    .bind(task_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+async fn load_subscription_diagnostic_progress_events_for_tasks(
+    state: &AppState,
+    task_ids: &[String],
+) -> Result<HashMap<String, Vec<AdminTaskEventItem>>, ApiError> {
+    if task_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut query = QueryBuilder::<sqlx::Sqlite>::new(
+        r#"
+        SELECT task_id, id, event_type, payload_json, created_at
+        FROM job_task_events
+        WHERE task_id IN (
+        "#,
+    );
+    {
+        let mut separated = query.separated(", ");
+        for task_id in task_ids {
+            separated.push_bind(task_id);
+        }
+    }
+    query.push(
+        r#"
+        )
+          AND event_type = 'task.progress'
+          AND json_valid(payload_json)
+          AND json_extract(payload_json, '$.stage') IN (
+            'collect',
+            'star_progress',
+            'star_summary',
+            'repo_collect',
+            'release_attached',
+            'release_progress',
+            'release_summary',
+            'social_progress',
+            'social_summary',
+            'notifications_progress',
+            'notifications_summary'
+          )
+        ORDER BY task_id ASC, rowid ASC
+        "#,
+    );
+
+    let rows = query
+        .build_query_as::<AdminTaskDiagnosticEventRow>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut grouped = HashMap::<String, Vec<AdminTaskEventItem>>::new();
+    for row in rows {
+        grouped
+            .entry(row.task_id.clone())
+            .or_default()
+            .push(AdminTaskEventItem::from(row));
+    }
+    Ok(grouped)
+}
+
+async fn load_recent_sync_subscription_events(
+    state: &AppState,
+    task_id: &str,
+) -> Result<Vec<AdminSyncSubscriptionEventItem>, ApiError> {
+    let rows = sqlx::query_as::<_, AdminSyncSubscriptionEventRow>(
+        r#"
+        SELECT
+          id,
+          task_id,
+          stage,
+          event_type,
+          severity,
+          recoverable,
+          attempt,
+          user_id,
+          repo_id,
+          repo_full_name,
+          payload_json,
+          created_at
+        FROM sync_subscription_events
+        WHERE task_id = ?
+        ORDER BY rowid DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(task_id)
+    .bind(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(rows.into_iter().map(map_sync_subscription_event).collect())
+}
+
+async fn load_recent_sync_subscription_events_for_tasks(
+    state: &AppState,
+    task_ids: &[String],
+) -> Result<HashMap<String, Vec<AdminSyncSubscriptionEventItem>>, ApiError> {
+    if task_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut query = QueryBuilder::<sqlx::Sqlite>::new(
+        r#"
+        SELECT
+          id,
+          task_id,
+          stage,
+          event_type,
+          severity,
+          recoverable,
+          attempt,
+          user_id,
+          repo_id,
+          repo_full_name,
+          payload_json,
+          created_at
+        FROM (
+          SELECT
+            id,
+            task_id,
+            stage,
+            event_type,
+            severity,
+            recoverable,
+            attempt,
+            user_id,
+            repo_id,
+            repo_full_name,
+            payload_json,
+            created_at,
+            ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY rowid DESC) AS task_event_rank
+          FROM sync_subscription_events
+          WHERE task_id IN (
+        "#,
+    );
+    {
+        let mut separated = query.separated(", ");
+        for task_id in task_ids {
+            separated.push_bind(task_id);
+        }
+    }
+    query.push(
+        r#"
+          )
+        )
+        WHERE task_event_rank <=
+        "#,
+    );
+    query.push_bind(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT);
+    query.push(" ORDER BY task_id ASC, created_at DESC, id DESC");
+
+    let rows = query
+        .build_query_as::<AdminSyncSubscriptionEventRow>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut grouped = HashMap::<String, Vec<AdminSyncSubscriptionEventItem>>::new();
+    for row in rows {
+        grouped
+            .entry(row.task_id.clone())
+            .or_default()
+            .push(map_sync_subscription_event(row));
+    }
+    Ok(grouped)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3572,6 +3833,7 @@ pub struct AdminSyncSubscriptionsDiagnostics {
 #[derive(Debug, sqlx::FromRow)]
 struct AdminSyncSubscriptionEventRow {
     id: String,
+    task_id: String,
     stage: String,
     event_type: String,
     severity: String,
@@ -4768,6 +5030,13 @@ fn build_sync_subscriptions_diagnostics(
     );
     let log_available = realtime_task_log_available(task);
     let log_download_path = log_available.then(|| realtime_task_log_download_path(&task.id));
+    let star_pending = (star.total_users - star.succeeded_users - star.failed_users).max(0);
+    let release_pending =
+        (release.total_repos - release.succeeded_repos - release.failed_repos).max(0);
+    let social_pending = (social.total_users - social.succeeded_users - social.failed_users).max(0);
+    let notifications_pending =
+        (notifications.total_users - notifications.succeeded_users - notifications.failed_users)
+            .max(0);
 
     let outcome = if task.status == jobs::STATUS_FAILED {
         business_outcome(
@@ -4811,12 +5080,16 @@ fn build_sync_subscriptions_diagnostics(
         || release.failed_repos > 0
         || social.failed_users > 0
         || notifications.failed_users > 0
+        || star_pending > 0
+        || release_pending > 0
+        || social_pending > 0
+        || notifications_pending > 0
         || critical_events > 0
     {
         business_outcome(
             "partial",
-            "部分成功",
-            "任务已完成，但存在失败或关键告警，请查看最近关键事件。",
+            "部分完成",
+            "任务已结束，但仍存在失败、剩余工作项或关键告警，请查看阶段摘要与最近关键事件。",
         )
     } else if release.total_repos == 0 {
         business_outcome(
@@ -5172,6 +5445,80 @@ fn build_task_diagnostics(
     }
 }
 
+async fn attach_subscription_list_diagnostics(
+    state: &AppState,
+    items: &mut [AdminRealtimeTaskItem],
+) -> Result<(), ApiError> {
+    let task_ids = items
+        .iter()
+        .filter(|item| item.task_type == jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    if task_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut tasks_query = QueryBuilder::<sqlx::Sqlite>::new(
+        r#"
+        SELECT
+          id,
+          task_type,
+          status,
+          source,
+          requested_by,
+          parent_task_id,
+          cancel_requested,
+          error_message,
+          payload_json,
+          result_json,
+          log_file_path,
+          created_at,
+          started_at,
+          finished_at,
+          updated_at
+        FROM job_tasks
+        WHERE id IN (
+        "#,
+    );
+    {
+        let mut separated = tasks_query.separated(", ");
+        for task_id in &task_ids {
+            separated.push_bind(task_id);
+        }
+    }
+    tasks_query.push(")");
+    let tasks = tasks_query
+        .build_query_as::<AdminRealtimeTaskDetailItem>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .map(|task| (task.id.clone(), task))
+        .collect::<HashMap<_, _>>();
+    let mut diagnostic_events =
+        load_subscription_diagnostic_progress_events_for_tasks(state, &task_ids).await?;
+    let mut subscription_events =
+        load_recent_sync_subscription_events_for_tasks(state, &task_ids).await?;
+
+    for item in items
+        .iter_mut()
+        .filter(|item| item.task_type == jobs::TASK_SYNC_SUBSCRIPTIONS)
+    {
+        let Some(task) = tasks.get(item.id.as_str()) else {
+            continue;
+        };
+        let diagnostic_events = diagnostic_events
+            .remove(item.id.as_str())
+            .unwrap_or_default();
+        let subscription_events = subscription_events
+            .remove(item.id.as_str())
+            .unwrap_or_default();
+        item.diagnostics = build_task_diagnostics(task, &diagnostic_events, &subscription_events);
+    }
+
+    Ok(())
+}
+
 pub async fn admin_get_realtime_task_detail(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -5254,64 +5601,13 @@ async fn load_realtime_task_detail_response(
     };
 
     let subscription_events = if task.task_type == jobs::TASK_SYNC_SUBSCRIPTIONS {
-        let rows = sqlx::query_as::<_, AdminSyncSubscriptionEventRow>(
-            r#"
-            SELECT
-              id,
-              stage,
-              event_type,
-              severity,
-              recoverable,
-              attempt,
-              user_id,
-              repo_id,
-              repo_full_name,
-              payload_json,
-              created_at
-            FROM sync_subscription_events
-            WHERE task_id = ?
-            ORDER BY rowid DESC
-            LIMIT ?
-            "#,
-        )
-        .bind(task_id)
-        .bind(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
-        rows.into_iter().map(map_sync_subscription_event).collect()
+        load_recent_sync_subscription_events(state, task_id).await?
     } else {
         Vec::new()
     };
 
     let diagnostic_events = if task.task_type == jobs::TASK_SYNC_SUBSCRIPTIONS {
-        sqlx::query_as::<_, AdminTaskEventItem>(
-            r#"
-            SELECT id, event_type, payload_json, created_at
-            FROM job_task_events
-            WHERE task_id = ?
-              AND event_type = 'task.progress'
-              AND json_valid(payload_json)
-              AND json_extract(payload_json, '$.stage') IN (
-                'collect',
-                'star_progress',
-                'star_summary',
-                'repo_collect',
-                'release_attached',
-                'release_progress',
-                'release_summary',
-                'social_progress',
-                'social_summary',
-                'notifications_progress',
-                'notifications_summary'
-              )
-            ORDER BY rowid ASC
-            "#,
-        )
-        .bind(task_id)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(ApiError::internal)?
+        load_subscription_diagnostic_progress_events(state, task_id).await?
     } else {
         events.clone()
     };
@@ -17711,6 +18007,84 @@ mod tests {
             .find(|item| item.id == "task-skipped-subscriptions")
             .expect("skipped subscription task item");
         assert!(skipped_item.skipped);
+    }
+
+    #[tokio::test]
+    async fn admin_list_realtime_tasks_attaches_subscription_partial_diagnostics() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at
+            )
+            VALUES (?, ?, 'succeeded', 'tests', ?, NULL, ?, ?, NULL, 0, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("task-subscription-partial")
+        .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .bind(test_user_id(1))
+        .bind(r#"{"trigger":"schedule","schedule_key":"2026-03-06T14:30"}"#)
+        .bind(
+            r#"{"skipped":false,"star":{"total_users":12,"succeeded_users":12,"failed_users":0,"total_repos":340},"release":{"total_repos":128,"succeeded_repos":120,"failed_repos":8,"candidate_failures":4,"fetched_count":900,"inserted_count":12,"updated_count":3,"unchanged_count":885,"pages_fetched":128},"social":{"total_users":12,"succeeded_users":11,"failed_users":1,"repo_stars":20,"followers":5,"events":44},"notifications":{"total_users":12,"succeeded_users":11,"failed_users":1,"notifications":17},"releases_written":900,"critical_events":0}"#,
+        )
+        .bind("2026-03-06T14:30:00Z")
+        .bind("2026-03-06T14:30:01Z")
+        .bind("2026-03-06T14:37:00Z")
+        .bind("2026-03-06T14:37:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed partial subscription task");
+
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+        let resp = admin_list_realtime_tasks(
+            State(state),
+            session,
+            Query(AdminRealtimeTasksQuery {
+                status: Some("all".to_owned()),
+                task_type: Some(jobs::TASK_SYNC_SUBSCRIPTIONS.to_owned()),
+                exclude_task_type: None,
+                task_group: None,
+                page: Some(1),
+                page_size: Some(20),
+            }),
+        )
+        .await
+        .expect("admin realtime task list should succeed")
+        .0;
+
+        let item = resp
+            .items
+            .iter()
+            .find(|item| item.id == "task-subscription-partial")
+            .expect("subscription task item");
+        let diagnostics = item.diagnostics.as_ref().expect("list diagnostics");
+        assert_eq!(diagnostics.business_outcome.code, "partial");
+        let sync = diagnostics
+            .sync_subscriptions
+            .as_ref()
+            .expect("sync subscriptions diagnostics");
+        assert_eq!(sync.release.failed_repos, 8);
+        assert_eq!(sync.social.failed_users, 1);
+        assert_eq!(sync.notifications.failed_users, 1);
     }
 
     #[tokio::test]
