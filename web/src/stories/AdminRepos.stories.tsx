@@ -473,11 +473,12 @@ export const EvidenceDesktop: Story = {
 		await expect(canvas.getByText("octo-rill/octo-rill")).toBeVisible();
 		await expect(canvas.getByText("openai/openai-openapi")).toBeVisible();
 		await expect(canvas.getByText("microsoft/typescript")).toBeVisible();
+		const body = within(document.body);
 		await userEvent.click(
 			canvas.getByRole("combobox", { name: "刷新状态筛选，当前 全部" }),
 		);
 		await userEvent.click(
-			await canvas.findByRole("option", { name: "仅未成功" }),
+			await body.findByRole("option", { name: "仅未成功" }),
 		);
 		await waitFor(() => {
 			const request = readAdminReposListRequest();
@@ -488,16 +489,16 @@ export const EvidenceDesktop: Story = {
 				name: "刷新状态筛选，当前 仅未成功",
 			}),
 		);
-		await userEvent.click(await canvas.findByRole("option", { name: "全部" }));
+		await userEvent.click(await body.findByRole("option", { name: "全部" }));
 		await userEvent.click(
 			canvas.getByRole("button", { name: /目标窗口筛选/i }),
 		);
-		await userEvent.click(await canvas.findByLabelText(/W2/i));
+		await userEvent.click(await body.findByLabelText(/W2/i));
 		await expect(canvas.getByText("redis/redis")).toBeVisible();
 		await userEvent.click(
 			canvas.getByRole("button", { name: /迫切值范围筛选/i }),
 		);
-		const minSlider = await canvas.findByLabelText("迫切值下限");
+		const minSlider = await body.findByLabelText("迫切值下限");
 		fireEvent.change(minSlider, { target: { value: "1.8" } });
 		await waitFor(() => {
 			const request = readAdminReposListRequest();
