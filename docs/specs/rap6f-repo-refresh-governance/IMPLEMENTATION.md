@@ -5,8 +5,8 @@
 - Lifecycle: active
 - Implementation: 已交付
 - Created: 2026-06-29
-- Last: 2026-06-29
-- Summary: 已交付；effective repo pool、10 分钟 budgeted governance snapshots、`/admin/repos` 独立治理页、预算编辑收口到订阅同步设置弹窗、Storybook 视觉证据与 build validation 已完成
+- Last: 2026-07-02
+- Summary: 已交付；effective repo pool、10 分钟 budgeted governance snapshots、attempt-based system cycle ledger、`/admin/repos` 独立治理页、预算编辑收口到订阅同步设置弹窗、Storybook 视觉证据与 build validation 已完成
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -19,6 +19,7 @@
 - [x] M5: `/admin/repos` route, nav entry, budget entry hint, summary, activity grid, detail list
 - [x] M6: Storybook fallback and owner-facing visual evidence
 - [x] M7: final frontend build / storybook / e2e validation sweep
+- [x] M8: system attempt ledger, failure recording, and active cycle reconciliation
 
 ## 本轮收口
 
@@ -27,3 +28,11 @@
 - 预算入口从静态提示改为真实 CTA：跳转到任务中心订阅同步页签并自动展开“订阅同步设置”弹窗。
 - “订阅同步设置”弹窗统一系统预算术语，放大帮助 icon 触达面积，并为 Release worker 刻度按钮补齐可访问标签。
 - 治理页文案收口到中文优先表达，补充“颜色 / 目标窗口 / 迫切值”解码说明，并把仓库明细改成以排序、目标窗口与迫切值为先的比较型信息结构。
+
+## Attempt 账本收口
+
+- `repo_refresh_governance_snapshots` 记录 `system_last_attempt_at/status/error`，用于区分 system 最近尝试、system 最近成功与实际刷新新鲜度。
+- `repo_refresh_governance_cycle_members` 记录 `attempt_status/error`，cycle member 在本轮 system 选中后只要对应 release work item 到达 `succeeded` 或 `failed` 终态即完成；成功才更新 `system_last_success_at`。
+- release work item 成功、失败、deadline/recovery 失败都会调用同一 governance attempt 记录路径；interactive demand 复用或提升 system 已选中的 work item 时，不会吞掉 system selection credit。
+- 治理快照重建会 reconciliation 历史 active cycle：只补结算 system 选中时间之后的终态 work item，避免选中前的旧成功误完成当前轮。
+- `/api/admin/repos` 与 `/admin/repos` 返回并展示 system attempt 状态；活动图保留实际新鲜度颜色，同时用失败角标和明细 badge 解释 system 尝试结果。
