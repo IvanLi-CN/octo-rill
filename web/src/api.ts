@@ -266,6 +266,7 @@ export type AdminRepoGovernanceGridCell = {
 	age_bucket: string;
 	band_label: string;
 	urgency_score: number;
+	system_attempt_status: string | null;
 };
 export type AdminRepoGovernanceOverviewResponse = {
 	summary: {
@@ -295,6 +296,9 @@ export type AdminRepoGovernanceListItem = {
 	urgency_bucket: string;
 	system_last_selected_at: string | null;
 	system_last_success_at: string | null;
+	system_last_attempt_at: string | null;
+	system_last_attempt_status: string | null;
+	system_last_attempt_error: string | null;
 	actual_last_success_at: string | null;
 	actual_last_success_source: string | null;
 };

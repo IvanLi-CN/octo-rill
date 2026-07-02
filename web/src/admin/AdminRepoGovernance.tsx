@@ -118,6 +118,28 @@ function sourceLabel(source: string | null | undefined) {
 	}
 }
 
+function systemAttemptLabel(status: string | null | undefined) {
+	switch (status) {
+		case "succeeded":
+			return "系统尝试成功";
+		case "failed":
+			return "系统尝试失败";
+		default:
+			return "尚未完成系统尝试";
+	}
+}
+
+function systemAttemptTone(status: string | null | undefined) {
+	switch (status) {
+		case "succeeded":
+			return "border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-400/40 dark:bg-emerald-500/15 dark:text-emerald-100";
+		case "failed":
+			return "border-rose-300 bg-rose-50 text-rose-800 dark:border-rose-400/40 dark:bg-rose-500/15 dark:text-rose-100";
+		default:
+			return "border-border bg-muted/35 text-muted-foreground";
+	}
+}
+
 function ageBucketColor(bucket: string, isDark: boolean) {
 	switch (bucket) {
 		case "fresh":
@@ -306,6 +328,11 @@ function GovernanceGrid(props: {
 				cell,
 				ageBucketColor(cellItem.age_bucket, isDark),
 			);
+			if (cellItem.system_attempt_status === "failed" && cell >= 3) {
+				context.fillStyle = isDark ? "#fecdd3" : "#be123c";
+				const markerSize = Math.max(1, Math.floor(cell / 3));
+				context.fillRect(x + cell - markerSize, y, markerSize, markerSize);
+			}
 		});
 	}, [cells, hostWidth, isDark]);
 
@@ -315,7 +342,7 @@ function GovernanceGrid(props: {
 				ref={canvasRef}
 				className="block"
 				tabIndex={-1}
-				title="颜色按实际最后成功刷新时间分桶；顺序按治理优先级。"
+				title="颜色按实际最后成功刷新时间分桶；顺序按治理优先级；角标表示本轮系统尝试失败。"
 			/>
 		</div>
 	);
@@ -333,6 +360,12 @@ function RepoRow(props: { item: AdminRepoGovernanceListItem }) {
 					</p>
 					<Badge variant="outline" className={urgencyTone(item.urgency_bucket)}>
 						{urgencyLabel(item.urgency_bucket)}
+					</Badge>
+					<Badge
+						variant="outline"
+						className={systemAttemptTone(item.system_last_attempt_status)}
+					>
+						{systemAttemptLabel(item.system_last_attempt_status)}
 					</Badge>
 				</div>
 				<dl className="grid gap-x-4 gap-y-2 text-sm sm:grid-cols-3">
@@ -376,9 +409,16 @@ function RepoRow(props: { item: AdminRepoGovernanceListItem }) {
 					</div>
 				</dl>
 				<p className="text-muted-foreground text-xs">
-					系统刷新 {formatDateTime(item.system_last_success_at)} · 实际刷新{" "}
-					{formatDateTime(item.actual_last_success_at)} · 最近来源{" "}
+					系统选择 {formatDateTime(item.system_last_selected_at)} · 系统尝试{" "}
+					{formatDateTime(item.system_last_attempt_at)} · 系统成功{" "}
+					{formatDateTime(item.system_last_success_at)}
+				</p>
+				<p className="text-muted-foreground text-xs">
+					实际刷新 {formatDateTime(item.actual_last_success_at)} · 最近来源{" "}
 					{sourceLabel(item.actual_last_success_source)}
+					{item.system_last_attempt_error
+						? ` · 失败原因 ${item.system_last_attempt_error}`
+						: ""}
 				</p>
 			</div>
 		</article>
@@ -561,7 +601,7 @@ export function AdminRepoGovernance() {
 				<CardContent className="space-y-4">
 					<div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
 						<p className="max-w-3xl text-muted-foreground text-sm leading-6">
-							这里展示有效关注池、系统预算、闭环批次和仓库老化。交互刷新会更新实际新鲜度，但不会提前完成系统目标窗口。
+							这里展示有效关注池、系统预算、闭环批次和仓库老化。系统窗口是按排序和预算推导的软目标；交互刷新只代表实际新鲜度，系统尝试单独结算闭环。
 						</p>
 						<Button
 							type="button"
@@ -630,8 +670,8 @@ export function AdminRepoGovernance() {
 									id="repo-governance-grid-summary"
 									className="text-muted-foreground text-xs leading-5"
 								>
-									颜色看实际刷新时间；W* 看系统目标窗口；迫切值大于 1
-									表示已超出目标窗口。
+									颜色看实际刷新时间；W* 看系统软目标窗口；系统尝试看本轮 system
+									账本；迫切值大于 1 表示已超出软目标。
 								</p>
 								<p className="sr-only">{gridSummary.sentence}</p>
 							</div>
