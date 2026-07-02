@@ -1,7 +1,14 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useState } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
-import { expect, fn, within } from "storybook/test";
+import {
+	expect,
+	fireEvent,
+	fn,
+	userEvent,
+	waitFor,
+	within,
+} from "storybook/test";
 
 import type {
 	AdminRepoGovernanceListResponse,
@@ -48,6 +55,8 @@ const STORY_VERSION_STATE: VersionMonitorValue = {
 	refreshPage: fn(),
 	promptInstallPwa: async () => {},
 };
+
+const ADMIN_REPOS_LAST_LIST_REQUEST_KEY = "__adminReposLastListRequest";
 
 const STORY_ME: MeResponse = {
 	user: {
@@ -132,6 +141,12 @@ const governanceListSeed: AdminRepoGovernanceListResponse = {
 	page: 1,
 	page_size: 60,
 	total: STORY_REPO_TOTAL,
+	target_window_options: [
+		{ target_window: 1, repo_count: 4_100 },
+		{ target_window: 2, repo_count: 2_900 },
+		{ target_window: 3, repo_count: 1_800 },
+		{ target_window: 4, repo_count: 1_200 },
+	],
 	items: [
 		{
 			repo_id: 1,
@@ -216,8 +231,8 @@ const governanceListSeed: AdminRepoGovernanceListResponse = {
 			watcher_repo_total_sum: 141,
 			cached_stargazer_count: 990,
 			priority_rank: 126,
-			target_window: 1,
-			target_interval_minutes: 10,
+			target_window: 2,
+			target_interval_minutes: 20,
 			urgency_score: 1.84,
 			urgency_bucket: "due",
 			system_last_selected_at: "2026-06-29T09:50:00Z",
@@ -257,6 +272,14 @@ function buildListResponse(mode: AdminReposPreviewProps["listMode"]) {
 	return governanceListSeed;
 }
 
+function rememberAdminReposListRequest(search: string) {
+	window.sessionStorage.setItem(ADMIN_REPOS_LAST_LIST_REQUEST_KEY, search);
+}
+
+function readAdminReposListRequest() {
+	return window.sessionStorage.getItem(ADMIN_REPOS_LAST_LIST_REQUEST_KEY) ?? "";
+}
+
 function AdminReposPreview(props: AdminReposPreviewProps) {
 	const { listMode = "all" } = props;
 	const [ready, setReady] = useState(false);
@@ -293,14 +316,32 @@ function AdminReposPreview(props: AdminReposPreviewProps) {
 			}
 
 			if (url.pathname === "/api/admin/repos" && req.method === "GET") {
+				rememberAdminReposListRequest(url.search);
 				const aging = url.searchParams.get("aging");
 				const query = (url.searchParams.get("query") ?? "").toLowerCase();
+				const targetWindows = (url.searchParams.get("target_windows") ?? "")
+					.split(",")
+					.map((value) => Number(value))
+					.filter((value) => Number.isFinite(value) && value > 0);
+				const urgencyMin = Number(url.searchParams.get("urgency_min") ?? "0");
+				const urgencyMax = Number(url.searchParams.get("urgency_max") ?? "4");
 				const seeded = buildListResponse(
 					aging === "stale" || aging === "missing" ? aging : listMode,
 				);
-				const items = seeded.items.filter((item) =>
-					query ? item.repo_full_name.toLowerCase().includes(query) : true,
-				);
+				const items = seeded.items.filter((item) => {
+					if (query && !item.repo_full_name.toLowerCase().includes(query)) {
+						return false;
+					}
+					if (
+						targetWindows.length > 0 &&
+						!targetWindows.includes(item.target_window)
+					) {
+						return false;
+					}
+					return (
+						item.urgency_score >= urgencyMin && item.urgency_score <= urgencyMax
+					);
+				});
 				return new Response(
 					JSON.stringify({
 						...seeded,
@@ -432,6 +473,37 @@ export const EvidenceDesktop: Story = {
 		await expect(canvas.getByText("octo-rill/octo-rill")).toBeVisible();
 		await expect(canvas.getByText("openai/openai-openapi")).toBeVisible();
 		await expect(canvas.getByText("microsoft/typescript")).toBeVisible();
+		await userEvent.click(
+			canvas.getByRole("combobox", { name: "刷新状态筛选，当前 全部" }),
+		);
+		await userEvent.click(
+			await canvas.findByRole("option", { name: "仅未成功" }),
+		);
+		await waitFor(() => {
+			const request = readAdminReposListRequest();
+			expect(request).toContain("aging=missing");
+		});
+		await userEvent.click(
+			canvas.getByRole("combobox", {
+				name: "刷新状态筛选，当前 仅未成功",
+			}),
+		);
+		await userEvent.click(await canvas.findByRole("option", { name: "全部" }));
+		await userEvent.click(
+			canvas.getByRole("button", { name: /目标窗口筛选/i }),
+		);
+		await userEvent.click(await canvas.findByLabelText(/W2/i));
+		await expect(canvas.getByText("redis/redis")).toBeVisible();
+		await userEvent.click(
+			canvas.getByRole("button", { name: /迫切值范围筛选/i }),
+		);
+		const minSlider = await canvas.findByLabelText("迫切值下限");
+		fireEvent.change(minSlider, { target: { value: "1.8" } });
+		await waitFor(() => {
+			const request = readAdminReposListRequest();
+			expect(request).toContain("target_windows=2");
+			expect(request).toContain("urgency_min=1.8");
+		});
 	},
 	parameters: {
 		docs: {
