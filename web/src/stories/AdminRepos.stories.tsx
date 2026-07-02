@@ -118,6 +118,12 @@ const governanceOverviewSeed: AdminRepoGovernanceOverviewResponse = {
 							: ageBucket === "stale"
 								? 3.14
 								: 4,
+			system_attempt_status:
+				index > 0 && index % 37 === 0
+					? "failed"
+					: index % 11 === 0
+						? "succeeded"
+						: null,
 		};
 	}),
 };
@@ -140,6 +146,9 @@ const governanceListSeed: AdminRepoGovernanceListResponse = {
 			urgency_bucket: "critical",
 			system_last_selected_at: "2026-06-29T10:10:01Z",
 			system_last_success_at: "2026-06-29T08:30:00Z",
+			system_last_attempt_at: "2026-06-29T10:11:12Z",
+			system_last_attempt_status: "succeeded",
+			system_last_attempt_error: null,
 			actual_last_success_at: "2026-06-29T09:58:00Z",
 			actual_last_success_source: "interactive",
 		},
@@ -156,6 +165,9 @@ const governanceListSeed: AdminRepoGovernanceListResponse = {
 			urgency_bucket: "due",
 			system_last_selected_at: "2026-06-29T10:10:01Z",
 			system_last_success_at: "2026-06-29T09:10:00Z",
+			system_last_attempt_at: "2026-06-29T10:12:00Z",
+			system_last_attempt_status: "failed",
+			system_last_attempt_error: "github returned 404 Not Found",
 			actual_last_success_at: "2026-06-29T09:10:00Z",
 			actual_last_success_source: "system",
 		},
@@ -172,6 +184,9 @@ const governanceListSeed: AdminRepoGovernanceListResponse = {
 			urgency_bucket: "healthy",
 			system_last_selected_at: "2026-06-29T10:00:00Z",
 			system_last_success_at: "2026-06-29T09:56:00Z",
+			system_last_attempt_at: "2026-06-29T10:00:22Z",
+			system_last_attempt_status: "succeeded",
+			system_last_attempt_error: null,
 			actual_last_success_at: "2026-06-29T09:56:00Z",
 			actual_last_success_source: "system",
 		},
@@ -188,6 +203,9 @@ const governanceListSeed: AdminRepoGovernanceListResponse = {
 			urgency_bucket: "critical",
 			system_last_selected_at: null,
 			system_last_success_at: null,
+			system_last_attempt_at: null,
+			system_last_attempt_status: null,
+			system_last_attempt_error: null,
 			actual_last_success_at: null,
 			actual_last_success_source: null,
 		},
@@ -204,6 +222,9 @@ const governanceListSeed: AdminRepoGovernanceListResponse = {
 			urgency_bucket: "due",
 			system_last_selected_at: "2026-06-29T09:50:00Z",
 			system_last_success_at: "2026-06-29T09:18:00Z",
+			system_last_attempt_at: "2026-06-29T09:51:19Z",
+			system_last_attempt_status: "succeeded",
+			system_last_attempt_error: null,
 			actual_last_success_at: "2026-06-29T09:18:00Z",
 			actual_last_success_source: "system",
 		},
@@ -400,9 +421,11 @@ export const EvidenceDesktop: Story = {
 		await expect(canvas.getByText("10000")).toBeVisible();
 		await expect(
 			canvas.getByText(
-				"颜色看实际刷新时间；W* 看系统目标窗口；迫切值大于 1 表示已超出目标窗口。",
+				"颜色看实际刷新时间；W* 看系统软目标窗口；系统尝试看本轮 system 账本；迫切值大于 1 表示已超出软目标。",
 			),
 		).toBeVisible();
+		await expect(canvas.getAllByText("系统尝试成功")[0]).toBeVisible();
+		await expect(canvas.getByText("系统尝试失败")).toBeVisible();
 		await expect(
 			canvas.getByRole("link", { name: /打开订阅同步设置，当前系统预算/i }),
 		).toBeVisible();

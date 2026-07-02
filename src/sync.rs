@@ -3454,6 +3454,7 @@ async fn attach_release_demand(
     let now_rfc3339 = now.to_rfc3339();
     let deadline_at = repo_release_deadline_at(now, origin);
     let freshness_cutoff = repo_release_fresh_cutoff(now);
+    let mut reused_fresh_system_work_items = Vec::new();
 
     for repo in repos {
         let (_sqlite_write, mut tx) = state
@@ -3550,6 +3551,10 @@ async fn attach_release_demand(
                 .await
                 .with_context(|| format!("failed to refresh fresh repo release work item {}", repo.full_name))?;
                 result.reused_fresh += 1;
+                if origin == RepoReleaseOrigin::System {
+                    reused_fresh_system_work_items
+                        .push((existing.id.clone(), existing.last_success_at.clone()));
+                }
                 existing.id
             } else {
                 let next_status = if existing.status == jobs::STATUS_RUNNING {
@@ -3682,6 +3687,18 @@ async fn attach_release_demand(
 
         tx.commit().await.context("commit repo release attach tx")?;
         result.work_item_ids.push(work_item_id);
+    }
+
+    for (work_item_id, actual_success_at) in reused_fresh_system_work_items {
+        record_repo_refresh_governance_attempt(
+            state,
+            work_item_id.as_str(),
+            jobs::STATUS_SUCCEEDED,
+            None,
+            actual_success_at.as_deref(),
+            now_rfc3339.as_str(),
+        )
+        .await?;
     }
 
     Ok(result)
@@ -5105,6 +5122,165 @@ async fn rebuild_repo_refresh_governance_snapshots(
 
             sqlx::query(
                 r#"
+                UPDATE repo_refresh_governance_cycle_members
+                SET completed_at = COALESCE(
+                      completed_at,
+                      (
+                        SELECT COALESCE(work_items.finished_at, work_items.updated_at)
+                        FROM repo_release_work_items work_items
+                        JOIN repo_refresh_governance_snapshots snapshots
+                          ON snapshots.repo_id = repo_refresh_governance_cycle_members.repo_id
+                         AND snapshots.active_cycle_id = repo_refresh_governance_cycle_members.cycle_id
+                        WHERE work_items.repo_id = repo_refresh_governance_cycle_members.repo_id
+                          AND work_items.status IN ('succeeded', 'failed')
+                          AND snapshots.system_last_selected_at IS NOT NULL
+                          AND julianday(COALESCE(work_items.finished_at, work_items.updated_at))
+                              >= julianday(snapshots.system_last_selected_at)
+                        ORDER BY julianday(COALESCE(work_items.finished_at, work_items.updated_at)) ASC
+                        LIMIT 1
+                      )
+                    ),
+                    attempt_status = COALESCE(
+                      attempt_status,
+                      (
+                        SELECT work_items.status
+                        FROM repo_release_work_items work_items
+                        JOIN repo_refresh_governance_snapshots snapshots
+                          ON snapshots.repo_id = repo_refresh_governance_cycle_members.repo_id
+                         AND snapshots.active_cycle_id = repo_refresh_governance_cycle_members.cycle_id
+                        WHERE work_items.repo_id = repo_refresh_governance_cycle_members.repo_id
+                          AND work_items.status IN ('succeeded', 'failed')
+                          AND snapshots.system_last_selected_at IS NOT NULL
+                          AND julianday(COALESCE(work_items.finished_at, work_items.updated_at))
+                              >= julianday(snapshots.system_last_selected_at)
+                        ORDER BY julianday(COALESCE(work_items.finished_at, work_items.updated_at)) ASC
+                        LIMIT 1
+                      )
+                    ),
+                    attempt_error = COALESCE(
+                      attempt_error,
+                      (
+                        SELECT work_items.error_text
+                        FROM repo_release_work_items work_items
+                        JOIN repo_refresh_governance_snapshots snapshots
+                          ON snapshots.repo_id = repo_refresh_governance_cycle_members.repo_id
+                         AND snapshots.active_cycle_id = repo_refresh_governance_cycle_members.cycle_id
+                        WHERE work_items.repo_id = repo_refresh_governance_cycle_members.repo_id
+                          AND work_items.status IN ('succeeded', 'failed')
+                          AND snapshots.system_last_selected_at IS NOT NULL
+                          AND julianday(COALESCE(work_items.finished_at, work_items.updated_at))
+                              >= julianday(snapshots.system_last_selected_at)
+                        ORDER BY julianday(COALESCE(work_items.finished_at, work_items.updated_at)) ASC
+                        LIMIT 1
+                      )
+                    ),
+                    updated_at = ?
+                WHERE completed_at IS NULL
+                  AND EXISTS (
+                    SELECT 1
+                    FROM repo_refresh_governance_snapshots snapshots
+                    JOIN repo_release_work_items work_items
+                      ON work_items.repo_id = snapshots.repo_id
+                    WHERE snapshots.repo_id = repo_refresh_governance_cycle_members.repo_id
+                      AND snapshots.active_cycle_id = repo_refresh_governance_cycle_members.cycle_id
+                      AND snapshots.system_last_selected_at IS NOT NULL
+                      AND work_items.status IN ('succeeded', 'failed')
+                      AND julianday(COALESCE(work_items.finished_at, work_items.updated_at))
+                          >= julianday(snapshots.system_last_selected_at)
+                  )
+                "#,
+            )
+            .bind(now_rfc3339.as_str())
+            .execute(&mut *tx)
+            .await
+            .context("reconcile completed repo refresh governance attempts")?;
+
+            sqlx::query(
+                r#"
+                UPDATE repo_refresh_governance_cycle_members
+                SET attempt_status = 'succeeded',
+                    updated_at = ?
+                WHERE completed_at IS NOT NULL
+                  AND attempt_status IS NULL
+                "#,
+            )
+            .bind(now_rfc3339.as_str())
+            .execute(&mut *tx)
+            .await
+            .context("backfill completed repo refresh governance attempt statuses")?;
+
+            sqlx::query(
+                r#"
+                UPDATE repo_refresh_governance_snapshots
+                SET active_cycle_completed = 1,
+                    system_last_attempt_at = COALESCE(
+                      system_last_attempt_at,
+                      (
+                        SELECT members.completed_at
+                        FROM repo_refresh_governance_cycle_members members
+                        WHERE members.cycle_id = repo_refresh_governance_snapshots.active_cycle_id
+                          AND members.repo_id = repo_refresh_governance_snapshots.repo_id
+                          AND members.completed_at IS NOT NULL
+                        LIMIT 1
+                      )
+                    ),
+                    system_last_attempt_status = COALESCE(
+                      system_last_attempt_status,
+                      (
+                        SELECT members.attempt_status
+                        FROM repo_refresh_governance_cycle_members members
+                        WHERE members.cycle_id = repo_refresh_governance_snapshots.active_cycle_id
+                          AND members.repo_id = repo_refresh_governance_snapshots.repo_id
+                          AND members.completed_at IS NOT NULL
+                        LIMIT 1
+                      )
+                    ),
+                    system_last_attempt_error = COALESCE(
+                      system_last_attempt_error,
+                      (
+                        SELECT members.attempt_error
+                        FROM repo_refresh_governance_cycle_members members
+                        WHERE members.cycle_id = repo_refresh_governance_snapshots.active_cycle_id
+                          AND members.repo_id = repo_refresh_governance_snapshots.repo_id
+                          AND members.completed_at IS NOT NULL
+                        LIMIT 1
+                      )
+                    ),
+                    system_last_success_at = COALESCE(
+                      (
+                        SELECT members.completed_at
+                        FROM repo_refresh_governance_cycle_members members
+                        WHERE members.cycle_id = repo_refresh_governance_snapshots.active_cycle_id
+                          AND members.repo_id = repo_refresh_governance_snapshots.repo_id
+                          AND members.completed_at IS NOT NULL
+                          AND members.attempt_status = 'succeeded'
+                        LIMIT 1
+                      ),
+                      system_last_success_at
+                    ),
+                    updated_at = ?
+                WHERE active_cycle_id IS NOT NULL
+                  AND (
+                    active_cycle_completed = 0
+                    OR system_last_attempt_at IS NULL
+                    OR system_last_attempt_status IS NULL
+                  )
+                  AND EXISTS (
+                    SELECT 1
+                    FROM repo_refresh_governance_cycle_members members
+                    WHERE members.cycle_id = repo_refresh_governance_snapshots.active_cycle_id
+                      AND members.repo_id = repo_refresh_governance_snapshots.repo_id
+                      AND members.completed_at IS NOT NULL
+                  )
+                "#,
+            )
+            .bind(now_rfc3339.as_str())
+            .execute(&mut *tx)
+            .await
+            .context("reconcile repo refresh governance snapshot completion")?;
+
+            sqlx::query(
+                r#"
                 UPDATE repo_refresh_governance_cycles
                 SET
                   completed_repo_count = (
@@ -5310,6 +5486,9 @@ async fn ensure_active_repo_refresh_cycle(
                     SET active_cycle_id = ?,
                         active_cycle_window_index = NULL,
                         active_cycle_completed = 0,
+                        system_last_attempt_at = NULL,
+                        system_last_attempt_status = NULL,
+                        system_last_attempt_error = NULL,
                         updated_at = ?
                     WHERE repo_id = ?
                     "#,
@@ -5407,6 +5586,9 @@ async fn select_budgeted_system_release_repos(
                         urgency_score = ?,
                         urgency_bucket = ?,
                         active_cycle_window_index = ?,
+                        system_last_attempt_at = NULL,
+                        system_last_attempt_status = NULL,
+                        system_last_attempt_error = NULL,
                         updated_at = ?
                     WHERE repo_id = ?
                     "#,
@@ -6225,8 +6407,15 @@ async fn process_repo_release_work_item(
             if updated > 0 {
                 mark_repo_release_watchers(state.as_ref(), &work_item.id, "succeeded", None, &now)
                     .await?;
-                record_repo_refresh_governance_success(state.as_ref(), &work_item.id, now.as_str())
-                    .await?;
+                record_repo_refresh_governance_attempt(
+                    state.as_ref(),
+                    &work_item.id,
+                    "succeeded",
+                    None,
+                    Some(now.as_str()),
+                    now.as_str(),
+                )
+                .await?;
             }
         }
         Err(err) => {
@@ -6281,6 +6470,15 @@ async fn process_repo_release_work_item(
                     "failed",
                     Some(error_message.as_str()),
                     &now,
+                )
+                .await?;
+                record_repo_refresh_governance_attempt(
+                    state.as_ref(),
+                    &work_item.id,
+                    "failed",
+                    Some(error_message.as_str()),
+                    None,
+                    now.as_str(),
                 )
                 .await?;
             }
@@ -6843,19 +7041,22 @@ async fn mark_repo_release_watchers(
     Ok(())
 }
 
-async fn record_repo_refresh_governance_success(
+async fn record_repo_refresh_governance_attempt(
     state: &AppState,
     work_item_id: &str,
+    attempt_status: &str,
+    attempt_error: Option<&str>,
+    actual_success_at: Option<&str>,
     now_rfc3339: &str,
 ) -> Result<()> {
     state
         .sqlite_writer
-        .write("repo_refresh_governance_success", |_| async {
+        .write("repo_refresh_governance_attempt", |_| async {
             let mut tx = state
                 .pool
                 .begin_with("BEGIN IMMEDIATE")
                 .await
-                .context("begin repo refresh governance success tx")?;
+                .context("begin repo refresh governance attempt tx")?;
 
             let repo_row = sqlx::query(
                 r#"
@@ -6868,7 +7069,7 @@ async fn record_repo_refresh_governance_success(
             .bind(work_item_id)
             .fetch_optional(&mut *tx)
             .await
-            .context("load repo release work item for governance success")?;
+            .context("load repo release work item for governance attempt")?;
 
             let Some(repo_row) = repo_row else {
                 tx.rollback().await.ok();
@@ -6877,104 +7078,185 @@ async fn record_repo_refresh_governance_success(
 
             let repo_id: i64 = repo_row.get("repo_id");
             let request_origin: String = repo_row.get("request_origin");
+            let attempt_succeeded = attempt_status == jobs::STATUS_SUCCEEDED;
+            let actual_succeeded = actual_success_at.is_some();
 
             sqlx::query(
                 r#"
                 UPDATE repo_refresh_governance_snapshots
-                SET actual_last_success_at = ?,
-                    actual_last_success_source = ?,
+                SET actual_last_success_at = CASE
+                      WHEN ? = 1 THEN ?
+                      ELSE actual_last_success_at
+                    END,
+                    actual_last_success_source = CASE
+                      WHEN ? = 1 THEN ?
+                      ELSE actual_last_success_source
+                    END,
                     system_last_success_at = CASE
-                      WHEN ? = 'system' THEN ?
+                      WHEN ? = 1
+                       AND active_cycle_id IS NOT NULL
+                       AND system_last_selected_at IS NOT NULL
+                       AND active_cycle_completed = 0
+                       AND EXISTS (
+                         SELECT 1
+                         FROM repo_refresh_governance_cycle_members members
+                         WHERE members.cycle_id = repo_refresh_governance_snapshots.active_cycle_id
+                           AND members.repo_id = repo_refresh_governance_snapshots.repo_id
+                           AND members.completed_at IS NULL
+                       ) THEN ?
                       ELSE system_last_success_at
+                    END,
+                    system_last_attempt_at = CASE
+                      WHEN active_cycle_id IS NOT NULL
+                       AND system_last_selected_at IS NOT NULL
+                       AND active_cycle_completed = 0
+                       AND EXISTS (
+                         SELECT 1
+                         FROM repo_refresh_governance_cycle_members members
+                         WHERE members.cycle_id = repo_refresh_governance_snapshots.active_cycle_id
+                           AND members.repo_id = repo_refresh_governance_snapshots.repo_id
+                           AND members.completed_at IS NULL
+                       ) THEN ?
+                      ELSE system_last_attempt_at
+                    END,
+                    system_last_attempt_status = CASE
+                      WHEN active_cycle_id IS NOT NULL
+                       AND system_last_selected_at IS NOT NULL
+                       AND active_cycle_completed = 0
+                       AND EXISTS (
+                         SELECT 1
+                         FROM repo_refresh_governance_cycle_members members
+                         WHERE members.cycle_id = repo_refresh_governance_snapshots.active_cycle_id
+                           AND members.repo_id = repo_refresh_governance_snapshots.repo_id
+                           AND members.completed_at IS NULL
+                       ) THEN ?
+                      ELSE system_last_attempt_status
+                    END,
+                    system_last_attempt_error = CASE
+                      WHEN active_cycle_id IS NOT NULL
+                       AND system_last_selected_at IS NOT NULL
+                       AND active_cycle_completed = 0
+                       AND EXISTS (
+                         SELECT 1
+                         FROM repo_refresh_governance_cycle_members members
+                         WHERE members.cycle_id = repo_refresh_governance_snapshots.active_cycle_id
+                           AND members.repo_id = repo_refresh_governance_snapshots.repo_id
+                           AND members.completed_at IS NULL
+                       ) THEN ?
+                      ELSE system_last_attempt_error
                     END,
                     updated_at = ?
                 WHERE repo_id = ?
                 "#,
             )
-            .bind(now_rfc3339)
+            .bind(if actual_succeeded { 1_i64 } else { 0_i64 })
+            .bind(actual_success_at)
+            .bind(if actual_succeeded { 1_i64 } else { 0_i64 })
             .bind(request_origin.as_str())
-            .bind(request_origin.as_str())
+            .bind(if attempt_succeeded { 1_i64 } else { 0_i64 })
             .bind(now_rfc3339)
+            .bind(now_rfc3339)
+            .bind(attempt_status)
+            .bind(attempt_error)
             .bind(now_rfc3339)
             .bind(repo_id)
             .execute(&mut *tx)
             .await
-            .context("update repo refresh governance snapshot success state")?;
+            .context("update repo refresh governance snapshot attempt state")?;
 
-            if request_origin == RepoReleaseOrigin::System.as_str() {
-                let active_cycle_id: Option<String> = sqlx::query_scalar(
+            let active_cycle_id: Option<String> = sqlx::query_scalar(
+                r#"
+                SELECT active_cycle_id
+                FROM repo_refresh_governance_snapshots
+                WHERE repo_id = ?
+                  AND active_cycle_id IS NOT NULL
+                  AND system_last_selected_at IS NOT NULL
+                  AND active_cycle_completed = 0
+                  AND EXISTS (
+                    SELECT 1
+                    FROM repo_refresh_governance_cycle_members members
+                    WHERE members.cycle_id = repo_refresh_governance_snapshots.active_cycle_id
+                      AND members.repo_id = repo_refresh_governance_snapshots.repo_id
+                      AND members.completed_at IS NULL
+                  )
+                LIMIT 1
+                "#,
+            )
+            .bind(repo_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .context("load repo refresh active cycle id")?
+            .flatten();
+
+            if let Some(active_cycle_id) = active_cycle_id {
+                sqlx::query(
                     r#"
-                    SELECT active_cycle_id
-                    FROM repo_refresh_governance_snapshots
-                    WHERE repo_id = ?
-                    LIMIT 1
-                    "#,
-                )
-                .bind(repo_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .context("load repo refresh active cycle id")?
-                .flatten();
-
-                if let Some(active_cycle_id) = active_cycle_id {
-                    sqlx::query(
-                        r#"
                         UPDATE repo_refresh_governance_cycle_members
                         SET completed_at = COALESCE(completed_at, ?),
+                            attempt_status = COALESCE(attempt_status, ?),
+                            attempt_error = COALESCE(attempt_error, ?),
                             updated_at = ?
                         WHERE cycle_id = ? AND repo_id = ?
                         "#,
-                    )
-                    .bind(now_rfc3339)
-                    .bind(now_rfc3339)
-                    .bind(active_cycle_id.as_str())
-                    .bind(repo_id)
-                    .execute(&mut *tx)
-                    .await
-                    .context("mark repo refresh cycle member completed")?;
+                )
+                .bind(now_rfc3339)
+                .bind(attempt_status)
+                .bind(attempt_error)
+                .bind(now_rfc3339)
+                .bind(active_cycle_id.as_str())
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await
+                .context("mark repo refresh cycle member completed")?;
 
-                    sqlx::query(
-                        r#"
+                sqlx::query(
+                    r#"
                         UPDATE repo_refresh_governance_snapshots
                         SET active_cycle_completed = 1,
+                            system_last_attempt_at = COALESCE(system_last_attempt_at, ?),
+                            system_last_attempt_status = COALESCE(system_last_attempt_status, ?),
+                            system_last_attempt_error = COALESCE(system_last_attempt_error, ?),
                             updated_at = ?
                         WHERE repo_id = ?
                         "#,
-                    )
-                    .bind(now_rfc3339)
-                    .bind(repo_id)
-                    .execute(&mut *tx)
-                    .await
-                    .context("mark repo refresh snapshot cycle completion")?;
+                )
+                .bind(now_rfc3339)
+                .bind(attempt_status)
+                .bind(attempt_error)
+                .bind(now_rfc3339)
+                .bind(repo_id)
+                .execute(&mut *tx)
+                .await
+                .context("mark repo refresh snapshot cycle completion")?;
 
-                    let completed_repo_count: i64 = sqlx::query_scalar(
-                        r#"
+                let completed_repo_count: i64 = sqlx::query_scalar(
+                    r#"
                         SELECT COUNT(*)
                         FROM repo_refresh_governance_cycle_members
                         WHERE cycle_id = ?
                           AND completed_at IS NOT NULL
                         "#,
-                    )
-                    .bind(active_cycle_id.as_str())
-                    .fetch_one(&mut *tx)
-                    .await
-                    .context("count completed repo refresh cycle members")?;
-                    let frozen_repo_count: i64 = sqlx::query_scalar(
-                        r#"
+                )
+                .bind(active_cycle_id.as_str())
+                .fetch_one(&mut *tx)
+                .await
+                .context("count completed repo refresh cycle members")?;
+                let frozen_repo_count: i64 = sqlx::query_scalar(
+                    r#"
                         SELECT frozen_repo_count
                         FROM repo_refresh_governance_cycles
                         WHERE id = ?
                         LIMIT 1
                         "#,
-                    )
-                    .bind(active_cycle_id.as_str())
-                    .fetch_one(&mut *tx)
-                    .await
-                    .context("load repo refresh cycle frozen repo count")?;
+                )
+                .bind(active_cycle_id.as_str())
+                .fetch_one(&mut *tx)
+                .await
+                .context("load repo refresh cycle frozen repo count")?;
 
-                    if completed_repo_count >= frozen_repo_count {
-                        sqlx::query(
-                            r#"
+                if completed_repo_count >= frozen_repo_count {
+                    sqlx::query(
+                        r#"
                             UPDATE repo_refresh_governance_cycles
                             SET status = 'completed',
                                 completed_repo_count = ?,
@@ -6983,37 +7265,36 @@ async fn record_repo_refresh_governance_success(
                                 updated_at = ?
                             WHERE id = ?
                             "#,
-                        )
-                        .bind(completed_repo_count)
-                        .bind(current_repo_refresh_window_index(Utc::now()))
-                        .bind(now_rfc3339)
-                        .bind(now_rfc3339)
-                        .bind(active_cycle_id.as_str())
-                        .execute(&mut *tx)
-                        .await
-                        .context("complete repo refresh governance cycle")?;
-                    } else {
-                        sqlx::query(
-                            r#"
+                    )
+                    .bind(completed_repo_count)
+                    .bind(current_repo_refresh_window_index(Utc::now()))
+                    .bind(now_rfc3339)
+                    .bind(now_rfc3339)
+                    .bind(active_cycle_id.as_str())
+                    .execute(&mut *tx)
+                    .await
+                    .context("complete repo refresh governance cycle")?;
+                } else {
+                    sqlx::query(
+                        r#"
                             UPDATE repo_refresh_governance_cycles
                             SET completed_repo_count = ?,
                                 updated_at = ?
                             WHERE id = ?
                             "#,
-                        )
-                        .bind(completed_repo_count)
-                        .bind(now_rfc3339)
-                        .bind(active_cycle_id.as_str())
-                        .execute(&mut *tx)
-                        .await
-                        .context("update repo refresh governance cycle progress")?;
-                    }
+                    )
+                    .bind(completed_repo_count)
+                    .bind(now_rfc3339)
+                    .bind(active_cycle_id.as_str())
+                    .execute(&mut *tx)
+                    .await
+                    .context("update repo refresh governance cycle progress")?;
                 }
             }
 
             tx.commit()
                 .await
-                .context("commit repo refresh governance success tx")?;
+                .context("commit repo refresh governance attempt tx")?;
             Ok::<_, anyhow::Error>(())
         })
         .await?;
@@ -7108,6 +7389,15 @@ async fn fail_repo_release_work_item(
 
     if updated > 0 {
         mark_repo_release_watchers(state, work_item_id, "failed", Some(error_text), now).await?;
+        record_repo_refresh_governance_attempt(
+            state,
+            work_item_id,
+            "failed",
+            Some(error_text),
+            None,
+            now,
+        )
+        .await?;
     }
 
     Ok(updated > 0)
@@ -9912,11 +10202,11 @@ mod tests {
         NOTIFICATION_OPEN_URL_REPAIR_KEY, NOTIFICATION_OPEN_URL_REPAIR_PENDING,
         NOTIFICATIONS_SINCE_KEY, NotificationRepo, NotificationSubject, OwnedRepoNode,
         OwnedRepoSnapshot, REPO_RELEASE_DEADLINE_EXPIRED_ERROR, ReleaseDemandRepo, RepoOwner,
-        RepoReleaseFetchOutcome, RepoReleaseHttpState, RepoReleaseOrigin, RepoReleaseWorkItemRow,
-        RepoReleaseWriteStats, RepoStargazerFetchResult, RepoStargazerSnapshot,
-        SocialActivityEventInsert, StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot,
-        SubscriptionEventRecord, SubscriptionPrunePhaseOutcome, SubscriptionRunContext,
-        SyncRequestError, aggregate_release_visible_repos, aggregate_repos,
+        RepoRefreshCandidate, RepoReleaseFetchOutcome, RepoReleaseHttpState, RepoReleaseOrigin,
+        RepoReleaseWorkItemRow, RepoReleaseWriteStats, RepoStargazerFetchResult,
+        RepoStargazerSnapshot, SocialActivityEventInsert, StarPhaseSuccess, StarredFetchResult,
+        StarredRepoSnapshot, SubscriptionEventRecord, SubscriptionPrunePhaseOutcome,
+        SubscriptionRunContext, SyncRequestError, aggregate_release_visible_repos, aggregate_repos,
         announcement_category_id_from_repo_value, append_subscription_event,
         apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
         apply_social_activity_snapshot_with_options, attach_and_wait_for_user_release_demand,
@@ -9929,6 +10219,7 @@ mod tests {
         insert_social_activity_event_tx, install_social_activity_snapshot_after_reads_hook,
         is_terminal_notification_thread_error, owned_repo_snapshot_from_node,
         process_repo_release_work_item, prune_subscription_sync_history,
+        rebuild_repo_refresh_governance_snapshots, record_repo_refresh_governance_attempt,
         record_repo_release_sync_success, recover_repo_release_runtime_state_on_startup,
         replace_starred_repos, repo_release_deadline_at, resolve_notification_open_url,
         store_sync_state_value, subscription_event_counts_as_critical, subscription_timeout_error,
@@ -10444,6 +10735,513 @@ mod tests {
         );
         assert_eq!(urgency_bucket, "active");
         assert_eq!(updated_at, now.to_rfc3339());
+    }
+
+    #[tokio::test]
+    async fn repo_refresh_governance_completes_system_selected_interactive_success() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_repo_refresh_governance_active_member(&pool, 42, "octo/alpha").await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-interactive-success",
+                repo_id: 42,
+                repo_full_name: "octo/alpha",
+                status: jobs::STATUS_SUCCEEDED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 1,
+                last_candidate_failures: 0,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE repo_release_work_items
+            SET request_origin = ?, priority = ?, last_success_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(RepoReleaseOrigin::Interactive.as_str())
+        .bind(RepoReleaseOrigin::Interactive.priority())
+        .bind("2026-03-06T12:10:00Z")
+        .bind("repo-work-interactive-success")
+        .execute(&pool)
+        .await
+        .expect("mark work item interactive");
+
+        record_repo_refresh_governance_attempt(
+            state.as_ref(),
+            "repo-work-interactive-success",
+            jobs::STATUS_SUCCEEDED,
+            None,
+            Some("2026-03-06T12:10:00Z"),
+            "2026-03-06T12:10:00Z",
+        )
+        .await
+        .expect("record interactive success as system attempt");
+
+        let row = sqlx::query_as::<_, (i64, Option<String>, Option<String>, Option<String>)>(
+            r#"
+            SELECT snapshots.active_cycle_completed,
+                   snapshots.system_last_success_at,
+                   snapshots.actual_last_success_source,
+                   members.completed_at
+            FROM repo_refresh_governance_snapshots snapshots
+            JOIN repo_refresh_governance_cycle_members members
+              ON members.cycle_id = snapshots.active_cycle_id
+             AND members.repo_id = snapshots.repo_id
+            WHERE snapshots.repo_id = 42
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load governance completion");
+        assert_eq!(row.0, 1);
+        assert_eq!(row.1.as_deref(), Some("2026-03-06T12:10:00Z"));
+        assert_eq!(
+            row.2.as_deref(),
+            Some(RepoReleaseOrigin::Interactive.as_str())
+        );
+        assert_eq!(row.3.as_deref(), Some("2026-03-06T12:10:00Z"));
+    }
+
+    #[tokio::test]
+    async fn repo_refresh_governance_completes_system_selected_failure_attempt() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_repo_refresh_governance_active_member(&pool, 43, "octo/beta").await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-system-failed",
+                repo_id: 43,
+                repo_full_name: "octo/beta",
+                status: jobs::STATUS_FAILED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 0,
+                last_candidate_failures: 1,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+
+        record_repo_refresh_governance_attempt(
+            state.as_ref(),
+            "repo-work-system-failed",
+            jobs::STATUS_FAILED,
+            Some("github returned 404 Not Found"),
+            None,
+            "2026-03-06T12:12:00Z",
+        )
+        .await
+        .expect("record system failure attempt");
+
+        let row = sqlx::query_as::<_, (i64, Option<String>, Option<String>, Option<String>)>(
+            r#"
+            SELECT snapshots.active_cycle_completed,
+                   snapshots.system_last_success_at,
+                   snapshots.system_last_attempt_status,
+                   members.attempt_error
+            FROM repo_refresh_governance_snapshots snapshots
+            JOIN repo_refresh_governance_cycle_members members
+              ON members.cycle_id = snapshots.active_cycle_id
+             AND members.repo_id = snapshots.repo_id
+            WHERE snapshots.repo_id = 43
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load failed governance attempt");
+        assert_eq!(row.0, 1);
+        assert!(row.1.is_none());
+        assert_eq!(row.2.as_deref(), Some(jobs::STATUS_FAILED));
+        assert_eq!(row.3.as_deref(), Some("github returned 404 Not Found"));
+    }
+
+    #[tokio::test]
+    async fn repo_refresh_governance_preserves_completed_attempt_after_later_success() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_repo_refresh_governance_active_member(&pool, 46, "octo/epsilon").await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-preserve-attempt",
+                repo_id: 46,
+                repo_full_name: "octo/epsilon",
+                status: jobs::STATUS_FAILED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 0,
+                last_candidate_failures: 1,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+
+        record_repo_refresh_governance_attempt(
+            state.as_ref(),
+            "repo-work-preserve-attempt",
+            jobs::STATUS_FAILED,
+            Some("github returned 500"),
+            None,
+            "2026-03-06T12:12:00Z",
+        )
+        .await
+        .expect("record system failure attempt");
+        sqlx::query(
+            r#"
+            UPDATE repo_release_work_items
+            SET status = ?, request_origin = ?, priority = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(jobs::STATUS_SUCCEEDED)
+        .bind(RepoReleaseOrigin::Interactive.as_str())
+        .bind(RepoReleaseOrigin::Interactive.priority())
+        .bind("repo-work-preserve-attempt")
+        .execute(&pool)
+        .await
+        .expect("mark later interactive success");
+
+        record_repo_refresh_governance_attempt(
+            state.as_ref(),
+            "repo-work-preserve-attempt",
+            jobs::STATUS_SUCCEEDED,
+            None,
+            Some("2026-03-06T12:30:00Z"),
+            "2026-03-06T12:30:00Z",
+        )
+        .await
+        .expect("record later interactive success");
+
+        let row = sqlx::query_as::<
+            _,
+            (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
+            r#"
+            SELECT system_last_attempt_at,
+                   system_last_attempt_status,
+                   system_last_success_at,
+                   actual_last_success_at
+            FROM repo_refresh_governance_snapshots
+            WHERE repo_id = 46
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load preserved governance attempt");
+        assert_eq!(row.0.as_deref(), Some("2026-03-06T12:12:00Z"));
+        assert_eq!(row.1.as_deref(), Some(jobs::STATUS_FAILED));
+        assert!(row.2.is_none());
+        assert_eq!(row.3.as_deref(), Some("2026-03-06T12:30:00Z"));
+    }
+
+    #[tokio::test]
+    async fn repo_refresh_governance_reused_fresh_attempt_preserves_actual_freshness() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_repo_refresh_governance_active_member(&pool, 48, "octo/zeta").await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-reused-fresh",
+                repo_id: 48,
+                repo_full_name: "octo/zeta",
+                status: jobs::STATUS_SUCCEEDED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 1,
+                last_candidate_failures: 0,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE repo_release_work_items
+            SET request_origin = ?, priority = ?, last_success_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(RepoReleaseOrigin::System.as_str())
+        .bind(RepoReleaseOrigin::System.priority())
+        .bind("2026-03-06T12:00:00Z")
+        .bind("repo-work-reused-fresh")
+        .execute(&pool)
+        .await
+        .expect("seed fresh system cache");
+
+        record_repo_refresh_governance_attempt(
+            state.as_ref(),
+            "repo-work-reused-fresh",
+            jobs::STATUS_SUCCEEDED,
+            None,
+            Some("2026-03-06T12:00:00Z"),
+            "2026-03-06T12:29:00Z",
+        )
+        .await
+        .expect("record reused fresh system attempt");
+
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+            r#"
+            SELECT system_last_attempt_at,
+                   system_last_success_at,
+                   actual_last_success_at
+            FROM repo_refresh_governance_snapshots
+            WHERE repo_id = 48
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load reused fresh governance attempt");
+        assert_eq!(row.0.as_deref(), Some("2026-03-06T12:29:00Z"));
+        assert_eq!(row.1.as_deref(), Some("2026-03-06T12:29:00Z"));
+        assert_eq!(row.2.as_deref(), Some("2026-03-06T12:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn rebuild_repo_refresh_governance_snapshots_reconciles_processed_active_members() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_repo_refresh_governance_active_member(&pool, 44, "octo/gamma").await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-reconcile",
+                repo_id: 44,
+                repo_full_name: "octo/gamma",
+                status: jobs::STATUS_SUCCEEDED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 1,
+                last_candidate_failures: 0,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE repo_release_work_items
+            SET finished_at = ?, updated_at = ?, last_success_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("2026-03-06T12:15:00Z")
+        .bind("2026-03-06T12:15:00Z")
+        .bind("2026-03-06T12:15:00Z")
+        .bind("repo-work-reconcile")
+        .execute(&pool)
+        .await
+        .expect("seed processed work item");
+        sqlx::query(
+            r#"
+            UPDATE repo_refresh_governance_snapshots
+            SET system_last_success_at = ?
+            WHERE repo_id = ?
+            "#,
+        )
+        .bind("2026-03-06T11:00:00Z")
+        .bind(44_i64)
+        .execute(&pool)
+        .await
+        .expect("seed previous system success");
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-03-06T12:20:00Z")
+            .expect("parse rebuild now")
+            .with_timezone(&chrono::Utc);
+        rebuild_repo_refresh_governance_snapshots(
+            state.as_ref(),
+            &[RepoRefreshCandidate {
+                repo_id: 44,
+                full_name: "octo/gamma".to_owned(),
+                is_private: false,
+                watcher_user_count: 1,
+                watcher_repo_total_sum: 1,
+                cached_stargazer_count: None,
+            }],
+            1000,
+            now,
+        )
+        .await
+        .expect("rebuild governance snapshots");
+
+        let row = sqlx::query_as::<_, (String, i64, i64, Option<String>, Option<String>)>(
+            r#"
+            SELECT cycles.status,
+                   cycles.completed_repo_count,
+                   snapshots.active_cycle_completed,
+                   snapshots.system_last_attempt_at,
+                   snapshots.system_last_success_at
+            FROM repo_refresh_governance_cycles cycles
+            JOIN repo_refresh_governance_snapshots snapshots
+              ON snapshots.active_cycle_id = cycles.id
+            WHERE snapshots.repo_id = 44
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load reconciled governance state");
+        assert_eq!(row.0, "completed");
+        assert_eq!(row.1, 1);
+        assert_eq!(row.2, 1);
+        assert_eq!(row.3.as_deref(), Some("2026-03-06T12:15:00Z"));
+        assert_eq!(row.4.as_deref(), Some("2026-03-06T12:15:00Z"));
+    }
+
+    #[tokio::test]
+    async fn rebuild_repo_refresh_governance_snapshots_ignores_pre_selection_terminal_items() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_repo_refresh_governance_active_member(&pool, 45, "octo/delta").await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-before-selection",
+                repo_id: 45,
+                repo_full_name: "octo/delta",
+                status: jobs::STATUS_SUCCEEDED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 1,
+                last_candidate_failures: 0,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE repo_release_work_items
+            SET finished_at = ?, updated_at = ?, last_success_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("2026-03-06T12:01:00Z")
+        .bind("2026-03-06T12:01:00Z")
+        .bind("2026-03-06T12:01:00Z")
+        .bind("repo-work-before-selection")
+        .execute(&pool)
+        .await
+        .expect("seed stale terminal work item");
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-03-06T12:20:00Z")
+            .expect("parse rebuild now")
+            .with_timezone(&chrono::Utc);
+        rebuild_repo_refresh_governance_snapshots(
+            state.as_ref(),
+            &[RepoRefreshCandidate {
+                repo_id: 45,
+                full_name: "octo/delta".to_owned(),
+                is_private: false,
+                watcher_user_count: 1,
+                watcher_repo_total_sum: 1,
+                cached_stargazer_count: None,
+            }],
+            1000,
+            now,
+        )
+        .await
+        .expect("rebuild governance snapshots");
+
+        let row = sqlx::query_as::<_, (String, i64, i64, Option<String>)>(
+            r#"
+            SELECT cycles.status,
+                   cycles.completed_repo_count,
+                   snapshots.active_cycle_completed,
+                   snapshots.system_last_attempt_at
+            FROM repo_refresh_governance_cycles cycles
+            JOIN repo_refresh_governance_snapshots snapshots
+              ON snapshots.active_cycle_id = cycles.id
+            WHERE snapshots.repo_id = 45
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load unreconciled governance state");
+        assert_eq!(row.0, "active");
+        assert_eq!(row.1, 0);
+        assert_eq!(row.2, 0);
+        assert!(row.3.is_none());
+    }
+
+    #[tokio::test]
+    async fn rebuild_repo_refresh_governance_snapshots_backfills_legacy_completed_attempts() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_repo_refresh_governance_active_member(&pool, 47, "octo/epsilon").await;
+        sqlx::query(
+            r#"
+            UPDATE repo_refresh_governance_cycle_members
+            SET completed_at = ?
+            WHERE cycle_id = ? AND repo_id = ?
+            "#,
+        )
+        .bind("2026-03-06T12:18:00Z")
+        .bind("cycle-governance-test")
+        .bind(47_i64)
+        .execute(&pool)
+        .await
+        .expect("seed legacy completed member");
+        sqlx::query(
+            r#"
+            UPDATE repo_refresh_governance_snapshots
+            SET active_cycle_completed = 1,
+                system_last_success_at = ?
+            WHERE repo_id = ?
+            "#,
+        )
+        .bind("2026-03-06T12:18:00Z")
+        .bind(47_i64)
+        .execute(&pool)
+        .await
+        .expect("seed legacy completed snapshot");
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-03-06T12:20:00Z")
+            .expect("parse rebuild now")
+            .with_timezone(&chrono::Utc);
+        rebuild_repo_refresh_governance_snapshots(
+            state.as_ref(),
+            &[RepoRefreshCandidate {
+                repo_id: 47,
+                full_name: "octo/epsilon".to_owned(),
+                is_private: false,
+                watcher_user_count: 1,
+                watcher_repo_total_sum: 1,
+                cached_stargazer_count: None,
+            }],
+            1000,
+            now,
+        )
+        .await
+        .expect("rebuild governance snapshots");
+
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+            r#"
+            SELECT snapshots.system_last_attempt_at,
+                   snapshots.system_last_attempt_status,
+                   members.attempt_status
+            FROM repo_refresh_governance_snapshots snapshots
+            JOIN repo_refresh_governance_cycle_members members
+              ON members.cycle_id = snapshots.active_cycle_id
+             AND members.repo_id = snapshots.repo_id
+            WHERE snapshots.repo_id = 47
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load backfilled legacy governance state");
+        assert_eq!(row.0.as_deref(), Some("2026-03-06T12:18:00Z"));
+        assert_eq!(row.1.as_deref(), Some(jobs::STATUS_SUCCEEDED));
+        assert_eq!(row.2.as_deref(), Some(jobs::STATUS_SUCCEEDED));
     }
 
     #[test]
@@ -15784,6 +16582,86 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed repo release work item");
+    }
+
+    async fn seed_repo_refresh_governance_active_member(
+        pool: &SqlitePool,
+        repo_id: i64,
+        repo_full_name: &str,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO repo_refresh_governance_cycles (
+              id,
+              status,
+              window_budget,
+              frozen_repo_count,
+              completed_repo_count,
+              window_index_started_at,
+              started_at,
+              updated_at
+            )
+            VALUES (?, 'active', 1000, 1, 0, 2954976, ?, ?)
+            "#,
+        )
+        .bind("cycle-governance-test")
+        .bind("2026-03-06T12:00:00Z")
+        .bind("2026-03-06T12:00:00Z")
+        .execute(pool)
+        .await
+        .expect("seed governance cycle");
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_refresh_governance_snapshots (
+              repo_id,
+              repo_full_name,
+              is_private,
+              watcher_user_count,
+              watcher_repo_total_sum,
+              cached_stargazer_count,
+              cached_stargazer_count_updated_at,
+              priority_rank,
+              target_window,
+              target_interval_minutes,
+              urgency_score,
+              urgency_bucket,
+              system_last_selected_at,
+              active_cycle_id,
+              active_cycle_window_index,
+              active_cycle_completed,
+              updated_at
+            )
+            VALUES (?, ?, 0, 1, 1, NULL, NULL, 1, 1, 10, 4.0, 'critical', ?, ?, 2954976, 0, ?)
+            "#,
+        )
+        .bind(repo_id)
+        .bind(repo_full_name)
+        .bind("2026-03-06T12:05:00Z")
+        .bind("cycle-governance-test")
+        .bind("2026-03-06T12:05:00Z")
+        .execute(pool)
+        .await
+        .expect("seed governance snapshot");
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_refresh_governance_cycle_members (
+              cycle_id,
+              repo_id,
+              repo_full_name,
+              updated_at
+            )
+            VALUES (?, ?, ?, ?)
+            "#,
+        )
+        .bind("cycle-governance-test")
+        .bind(repo_id)
+        .bind(repo_full_name)
+        .bind("2026-03-06T12:05:00Z")
+        .execute(pool)
+        .await
+        .expect("seed governance cycle member");
     }
 
     async fn seed_repo_release_watcher(

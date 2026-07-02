@@ -13,7 +13,7 @@
   - `starred_repos` 恒纳入；
   - owned repo 仅当 `users.include_own_releases=1` 时纳入；
   - `users.is_disabled=1` 的用户整池排除。
-- system release 调度改为“每 10 分钟预算窗口内挑仓库”，默认预算字段为 `repo_refresh_system_budget_per_window`，并与 Admin Jobs 共用同一 runtime config。
+- system release 调度改为“每 10 分钟预算窗口内最多挑选一批仓库”，默认预算字段为 `repo_refresh_system_budget_per_window`，并与 Admin Jobs 共用同一 runtime config。10 分钟是调度预算窗口，不是全池刷新完成 SLA。
 - 排序合同固定为：
   - `watcher_user_count DESC`
   - `watcher_repo_total_sum ASC`
@@ -48,7 +48,7 @@
   - repo governance snapshot rebuild
   - fixed-order priority ranking
   - budgeted system repo selection
-  - system full-cycle freeze/complete semantics
+  - system full-cycle freeze/attempt/complete semantics
 - admin HTTP APIs:
   - `GET /api/admin/repos/overview`
   - `GET /api/admin/repos`
@@ -78,25 +78,29 @@
 
 ### Budget 调度
 
-- system window 固定为 10 分钟。
+- system window 固定为 10 分钟；其语义是“本窗口最多选中多少个 repo 发起 system release 尝试”，不是“10 分钟内刷新完整个仓库池”。
 - 每次 scheduler window 先用 set-based SQL 重建 active pool 快照，并按固定排序写入 `priority_rank`。
 - 软目标频段定义为：
   - `target_window = ceil(priority_rank / budget_per_window)`
   - `target_interval_minutes = target_window * 10`
+- 目标频段是按当前排序和预算推导的软目标窗口，用于解释 repo 在 system 预算下大约应多久被再次尝试；它不承诺 GitHub API 一定成功，也不代表全池必须在 10 分钟内完成。
 - system 选仓顺序固定为：
   - 未有 system success 的 repo 优先；
   - 其后按 `system_age / target_interval` 形成的 `urgency_score` 倒序；
   - 再按 `priority_rank ASC`
 - 每轮最多挑选 `repo_refresh_system_budget_per_window` 个 repo 挂入 shared repo release queue。
-- 交互式/手动 demand 不消费该 budget，也不会提前结算 repo 的 system success。
+- 交互式/手动 demand 不消费该 budget；如果某 repo 已被本轮 system 选中，而对应 release work item 后续被交互式需求复用或提升，work item 到达 `succeeded` 或 `failed` 终态时仍必须结算本轮 system attempt。
+- 失败的 system attempt 记录 `system_last_attempt_at/status/error`，但不更新 `system_last_success_at`；成功的 attempt 同时更新 `system_last_success_at` 和实际刷新成功时间。
 
 ### 全量 cycle
 
 - system full-cycle 在开始时冻结成员集。
+- cycle member 的完成条件是“本轮 system 选中后，对应 release work item 已处理到终态”，不是“必须成功刷新”。终态包括 `succeeded` 与 `failed`。
 - cycle 完成条件只看冻结成员：
   - 新入池 repo 进入下一轮；
   - 离池 repo 不得永久阻塞当前轮完成；
   - 当前轮完成后写入“上次完成全量更新时间”。
+- 已选中但卡在旧语义下的 active cycle 必须在治理快照重建时自动 reconciliation：若系统选中时间之后已经存在终态 release work item，则补写 member `completed_at/attempt_status/attempt_error` 与 snapshot `system_last_attempt_*`，并按新语义推进 cycle 计数。
 
 ### 治理页
 
@@ -112,10 +116,16 @@
   - 顺序按治理优先级
   - 颜色按实际最后成功刷新时间（任意来源）分桶
   - 不把交互 demand 的表面新鲜度误当成 system 频段完成
+  - 需要能暴露 system attempt 失败状态，避免绿色新鲜度掩盖 system 闭环卡住或失败事实
 - 明细列表：
   - 按迫切值与优先级排序
   - 支持搜索 repo full name
   - 支持老化筛选
+  - 同时解释实际刷新时间、system 最近尝试、system 最近成功与目标窗口：
+    - 实际刷新时间：任意来源成功刷新后的表面新鲜度
+    - system 最近尝试：本轮或最近一次 system 账本终态，可成功也可失败
+    - system 最近成功：最近一次 system 尝试成功时间
+    - 目标窗口：按排序和预算推导的软目标，不是硬 SLA
   - 桌面与窄屏均需稳定展示
 
 ## 验收标准（Acceptance Criteria）
@@ -131,6 +141,18 @@
 - Given 某 repo 仅被交互刷新而未被本轮 system 选中
   When 查看治理页
   Then 活动图颜色可显示为新，但其 system `urgency/band/full-cycle` 不提前结算。
+
+- Given 某 repo 已被本轮 system 选中
+  When 该 repo 的 release work item 被 interactive demand 复用并最终成功
+  Then 当前 cycle member 完成，`system_last_attempt_status=succeeded`，`system_last_success_at` 更新，同时实际刷新来源保留 interactive 事实。
+
+- Given 某 repo 已被本轮 system 选中
+  When 对应 release work item 最终失败
+  Then 当前 cycle member 完成，`system_last_attempt_status=failed` 且记录错误，但 `system_last_success_at` 不更新；该 repo 不得在同一个 active cycle 内重复抢占 system budget。
+
+- Given 历史 active cycle 中存在已选中且选中后已有终态 work item 的 member
+  When 治理快照重建
+  Then reconciliation 自动补写 attempt 与 completed 状态，不需要人工 SQL 修复。
 
 - Given active cycle 开始后新增或移除 repo
   When 当前轮继续推进
@@ -154,6 +176,19 @@
   state: `narrow tablet governance`
   evidence_note: 证明 `/admin/repos` 在窄平板视口下仍能稳定展示 summary、预算 CTA、活动图图例与明细列表，不退化为不可滚动的密集表格。
   ![仓库治理窄屏证据](./assets/admin-repos-narrow-tablet.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `admin-admin-repos--evidence-desktop`
+  state: `desktop governance with system attempts`
+  evidence_note: 证明 `/admin/repos` 在桌面视口下明确区分实际刷新新鲜度、system 尝试成功/失败、system 成功时间与软目标窗口。
+  PR: include
+  ![仓库治理桌面 system 尝试证据](./assets/admin-repos-desktop-attempts.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `admin-admin-repos--evidence-narrow-tablet`
+  state: `narrow tablet governance with system attempts`
+  evidence_note: 证明 `/admin/repos` 在窄平板视口下仍能展示 system 尝试成功/失败、失败原因与软目标窗口说明。
+  ![仓库治理窄屏 system 尝试证据](./assets/admin-repos-narrow-attempts.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `admin-admin-jobs--subscription-sync-settings-auto-open`
