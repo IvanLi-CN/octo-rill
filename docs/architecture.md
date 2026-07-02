@@ -35,6 +35,7 @@ OctoRill 当前由 4 个长期维护面组成：
 - **LinuxDO**：补充身份绑定来源，不替代 GitHub 作为主账号约束
 - **AI provider**：只负责翻译 / 润色等 LLM 能力
 - **SQLite**：本地缓存、派生数据与会话存储；不是最终事实源
+- **Machine 101 host ops**：OctoRill 生产 rollout 由 `192.168.31.11` 上的 stack + host-side reconcile timer 接住，不由仓库内 GitHub Actions 直接 SSH 部署
 
 ## 启动与应用装配
 
@@ -141,6 +142,8 @@ Storybook 在这个仓库里不是展示橱窗，而是**稳定验证面**。改
 - `src/server.rs`
 - `src/sqlite_write.rs`
 - `src/session_store.rs`
+- `192.168.31.11:/home/ivan/srv/octo-rill/octo-rill.md`
+- `systemctl --user status octo-rill-rollout.timer`（在 101 上）
 
 维护约束：
 
@@ -148,6 +151,11 @@ Storybook 在这个仓库里不是展示橱窗，而是**稳定验证面**。改
 - 默认只记录慢请求与错误请求的 `http.access`，快速 `2xx` 不记 access log。
 - 运行时日志只保留 `request_id`、`task_id`、`user_id`、`repo_id`、`operation`、`attempt`、`elapsed_ms`、`error_chain` 等排障必要字段。
 - 不记录 body、token、cookie、email、login、完整 query string；生产默认不输出 Rust backtrace。
+
+Release / rollout 边界：
+
+- `.github/workflows/release.yml` 只负责版本决策、GitHub Release 和 GHCR 镜像发布。
+- 生产实例是否实际切到新版本，要以 101 上 `octo-rill` stack 的 reconcile 结果为准，而不是只看 GitHub Release 是否存在。
 
 ### 登录 / 绑定 / 会话问题
 

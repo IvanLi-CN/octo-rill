@@ -411,11 +411,52 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+  verify-prod-rollout:
+    name: Verify production rollout
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [plan, await-ci, prepare, docker-release, pr-release-comment]
+    if: >-
+      ${{
+        github.event_name == 'push' &&
+        needs.prepare.outputs.should_release == 'true' &&
+        needs.prepare.outputs.app_is_prerelease != 'true'
+      }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout workflow revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+
+      - name: Verify production health version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ./.github/scripts/verify_release_rollout.py \
+            --url "https://octo-rill.ivanli.cc/api/health" \
+            --expected-version "${{ needs.prepare.outputs.app_effective_version }}" \
+            --timeout-seconds 900 \
+            --poll-interval 15 \
+            --request-timeout 15
+
+      - name: Write summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Production rollout verification"
+            echo "- release_head_sha: ${{ needs.plan.outputs.release_head_sha }}"
+            echo "- expected_version: ${{ needs.prepare.outputs.app_effective_version }}"
+            echo "- health_url: https://octo-rill.ivanli.cc/api/health"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   audit-backfill:
     name: Dispatch next backfill
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [plan, await-ci, prepare, docker-release, pr-release-comment]
+    needs: [plan, await-ci, prepare, docker-release, pr-release-comment, verify-prod-rollout]
     if: >-
       always() &&
       github.event_name == 'push' &&
@@ -423,7 +464,8 @@ jobs:
       needs.await-ci.result == 'success' &&
       (needs.prepare.result == 'success' || needs.await-ci.outputs.allow_release == 'false') &&
       (needs.docker-release.result == 'success' || needs.docker-release.result == 'skipped') &&
-      (needs.pr-release-comment.result == 'success' || needs.pr-release-comment.result == 'skipped')
+      (needs.pr-release-comment.result == 'success' || needs.pr-release-comment.result == 'skipped') &&
+      (needs.verify-prod-rollout.result == 'success' || needs.verify-prod-rollout.result == 'skipped')
     permissions:
       contents: read
       issues: read
@@ -478,7 +520,7 @@ jobs:
 
   notify-on-failure:
     name: Notify manual release failure
-    needs: [plan, await-ci, prepare, docker-release, pr-release-comment, audit-backfill]
+    needs: [plan, await-ci, prepare, docker-release, pr-release-comment, verify-prod-rollout, audit-backfill]
     if: >-
       always() &&
       github.event_name == 'workflow_dispatch' &&
@@ -488,6 +530,7 @@ jobs:
         needs.prepare.result == 'failure' ||
         needs.docker-release.result == 'failure' ||
         needs.pr-release-comment.result == 'failure' ||
+        needs.verify-prod-rollout.result == 'failure' ||
         needs.audit-backfill.result == 'failure'
       )
     permissions: {}
