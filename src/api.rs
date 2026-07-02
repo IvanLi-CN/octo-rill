@@ -1213,6 +1213,13 @@ pub struct AdminRepoGovernanceListResponse {
     page: i64,
     page_size: i64,
     total: i64,
+    target_window_options: Vec<AdminRepoGovernanceTargetWindowOption>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct AdminRepoGovernanceTargetWindowOption {
+    target_window: i64,
+    repo_count: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1221,6 +1228,60 @@ pub struct AdminRepoGovernanceListQuery {
     page_size: Option<i64>,
     query: Option<String>,
     aging: Option<String>,
+    target_windows: Option<String>,
+    urgency_min: Option<f64>,
+    urgency_max: Option<f64>,
+}
+
+fn parse_admin_repo_target_windows(raw: Option<&str>) -> Result<Vec<i64>, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut windows = Vec::new();
+    let mut seen = HashSet::new();
+    for part in trimmed.split(',') {
+        let window = part.trim().parse::<i64>().map_err(|_| {
+            ApiError::bad_request("target_windows must be comma-separated positive integers")
+        })?;
+        if window <= 0 {
+            return Err(ApiError::bad_request(
+                "target_windows must be comma-separated positive integers",
+            ));
+        }
+        if seen.insert(window) {
+            windows.push(window);
+        }
+    }
+    Ok(windows)
+}
+
+fn validate_admin_repo_urgency_range(
+    urgency_min: Option<f64>,
+    urgency_max: Option<f64>,
+) -> Result<(), ApiError> {
+    if urgency_min.is_some_and(|value| !value.is_finite() || value < 0.0) {
+        return Err(ApiError::bad_request(
+            "urgency_min must be a finite number >= 0",
+        ));
+    }
+    if urgency_max.is_some_and(|value| !value.is_finite() || value < 0.0) {
+        return Err(ApiError::bad_request(
+            "urgency_max must be a finite number >= 0",
+        ));
+    }
+    if let (Some(min), Some(max)) = (urgency_min, urgency_max)
+        && min > max
+    {
+        return Err(ApiError::bad_request(
+            "urgency_min must be less than or equal to urgency_max",
+        ));
+    }
+    Ok(())
 }
 
 async fn load_sync_runtime_config(state: &AppState) -> Result<SyncRuntimeConfigResponse, ApiError> {
@@ -1485,30 +1546,84 @@ pub async fn admin_list_repo_governance(
     let offset = (page - 1) * page_size;
     let query_text = query.query.unwrap_or_default().trim().to_lowercase();
     let query_like = format!("%{query_text}%");
-
     let aging = query.aging.unwrap_or_else(|| "all".to_owned());
-    let total = sqlx::query_scalar::<_, i64>(
+    if !matches!(aging.as_str(), "all" | "stale" | "missing") {
+        return Err(ApiError::bad_request("invalid aging filter"));
+    }
+    let target_windows = parse_admin_repo_target_windows(query.target_windows.as_deref())?;
+    validate_admin_repo_urgency_range(query.urgency_min, query.urgency_max)?;
+
+    let target_window_options = sqlx::query_as::<_, AdminRepoGovernanceTargetWindowOption>(
         r#"
-        SELECT COUNT(*)
+        SELECT target_window, COUNT(*) AS repo_count
         FROM repo_refresh_governance_snapshots
-        WHERE (? = '' OR lower(repo_full_name) LIKE ?)
-          AND (
-            ? = 'all'
-            OR (? = 'stale' AND actual_last_success_at IS NOT NULL AND julianday(actual_last_success_at) <= julianday('now', '-1 day'))
-            OR (? = 'missing' AND actual_last_success_at IS NULL)
-          )
+        GROUP BY target_window
+        ORDER BY target_window ASC
         "#,
     )
-    .bind(query_text.as_str())
-    .bind(query_like.as_str())
-    .bind(aging.as_str())
-    .bind(aging.as_str())
-    .bind(aging.as_str())
-    .fetch_one(&state.pool)
+    .fetch_all(&state.pool)
     .await
     .map_err(ApiError::internal)?;
 
-    let items = sqlx::query_as::<_, AdminRepoGovernanceListItem>(
+    let append_repo_governance_filters =
+        |builder: &mut QueryBuilder<'_, sqlx::Sqlite>, include_limit: bool| {
+            builder.push(" WHERE (");
+            builder.push_bind(query_text.clone());
+            builder.push(" = '' OR lower(repo_full_name) LIKE ");
+            builder.push_bind(query_like.clone());
+            builder.push(")");
+            builder.push(" AND (");
+            builder.push_bind(aging.clone());
+            builder.push(" = 'all' OR (");
+            builder.push_bind(aging.clone());
+            builder.push(" = 'stale' AND actual_last_success_at IS NOT NULL AND julianday(actual_last_success_at) <= julianday('now', '-1 day')) OR (");
+            builder.push_bind(aging.clone());
+            builder.push(" = 'missing' AND actual_last_success_at IS NULL))");
+            if !target_windows.is_empty() {
+                builder.push(" AND target_window IN (");
+                let mut separated = builder.separated(", ");
+                for window in &target_windows {
+                    separated.push_bind(*window);
+                }
+                separated.push_unseparated(")");
+            }
+            if let Some(urgency_min) = query.urgency_min {
+                builder.push(" AND urgency_score >= ");
+                builder.push_bind(urgency_min);
+            }
+            if let Some(urgency_max) = query.urgency_max {
+                builder.push(" AND urgency_score <= ");
+                builder.push_bind(urgency_max);
+            }
+            if include_limit {
+                builder.push(
+                    r#"
+        ORDER BY
+          urgency_score DESC,
+          priority_rank ASC,
+          repo_id ASC
+        LIMIT "#,
+                );
+                builder.push_bind(page_size);
+                builder.push(" OFFSET ");
+                builder.push_bind(offset);
+            }
+        };
+
+    let mut total_query = QueryBuilder::new(
+        r#"
+        SELECT COUNT(*)
+        FROM repo_refresh_governance_snapshots
+        "#,
+    );
+    append_repo_governance_filters(&mut total_query, false);
+    let total = total_query
+        .build_query_scalar::<i64>()
+        .fetch_one(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+
+    let mut items_query = QueryBuilder::new(
         r#"
         SELECT
           repo_id,
@@ -1529,35 +1644,21 @@ pub async fn admin_list_repo_governance(
           actual_last_success_at,
           actual_last_success_source
         FROM repo_refresh_governance_snapshots
-        WHERE (? = '' OR lower(repo_full_name) LIKE ?)
-          AND (
-            ? = 'all'
-            OR (? = 'stale' AND actual_last_success_at IS NOT NULL AND julianday(actual_last_success_at) <= julianday('now', '-1 day'))
-            OR (? = 'missing' AND actual_last_success_at IS NULL)
-          )
-        ORDER BY
-          urgency_score DESC,
-          priority_rank ASC,
-          repo_id ASC
-        LIMIT ? OFFSET ?
         "#,
-    )
-    .bind(query_text.as_str())
-    .bind(query_like.as_str())
-    .bind(aging.as_str())
-    .bind(aging.as_str())
-    .bind(aging.as_str())
-    .bind(page_size)
-    .bind(offset)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    );
+    append_repo_governance_filters(&mut items_query, true);
+    let items = items_query
+        .build_query_as::<AdminRepoGovernanceListItem>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
 
     Ok(Json(AdminRepoGovernanceListResponse {
         items,
         page,
         page_size,
         total,
+        target_window_options,
     }))
 }
 
@@ -15924,32 +16025,32 @@ mod tests {
         ACCESS_SYNC_REASON_INACTIVE_OVER_1H, ADMIN_DASHBOARD_PREAGGREGATE_DAYS,
         ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT, ADMIN_TASK_DETAIL_EVENT_LIMIT, AdminDashboardQuery,
         AdminLlmCallListScope, AdminLlmCallsQuery, AdminLlmRuntimeConfigUpdateRequest,
-        AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery, AdminSyncSubscriptionEventItem,
-        AdminTaskEventItem, AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery,
-        BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, DashboardUpdatesQuery, DashboardUpdatesToken,
-        FeedQuery, FeedReactionRefreshRequest, FeedRow, GitHubCompareCommit,
-        GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse, GraphQlError,
-        LLM_CALL_ORDER_BY_CREATED_DESC, LiveReleaseReactions, PublicReleaseQuery,
-        RELEASE_FEED_BODY_MAX_CHARS, ReleaseReactionCounts, ReleaseReactionRow,
+        AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery, AdminRepoGovernanceListQuery,
+        AdminSyncSubscriptionEventItem, AdminTaskEventItem, AdminUserPatchRequest,
+        AdminUserUpdateGuard, AdminUsersQuery, BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT,
+        DashboardUpdatesQuery, DashboardUpdatesToken, FeedQuery, FeedReactionRefreshRequest,
+        FeedRow, GitHubCompareCommit, GitHubCompareCommitDetail, GitHubCompareFile,
+        GitHubCompareResponse, GraphQlError, LLM_CALL_ORDER_BY_CREATED_DESC, LiveReleaseReactions,
+        PublicReleaseQuery, RELEASE_FEED_BODY_MAX_CHARS, ReleaseReactionCounts, ReleaseReactionRow,
         ReleaseReactionViewer, ReturnModeQuery, SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem,
         TranslationCacheRow, TranslationUpsert, admin_dashboard, admin_delete_public_release_repo,
         admin_download_realtime_task_log, admin_get_llm_call_detail,
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
-        admin_list_realtime_tasks, admin_list_users, admin_patch_llm_runtime_config,
-        admin_patch_user, admin_users_offset, ai_error_is_non_retryable,
-        brief_contains_release_link, build_compare_digest, build_feed_reaction_refresh_item,
-        build_task_diagnostics, compact_dashboard_signatures, dashboard_updates,
-        encode_dashboard_updates_token, ensure_account_enabled, execute_sync_all_sync_with,
-        extract_brief_release_ids, extract_translation_fields, feed_item_from_row,
-        get_release_detail, get_release_detail_by_repo_tag, github_access_restricted_error,
-        github_graphql_errors_to_api_error, github_graphql_http_error, github_rate_limited_error,
-        github_reauth_required_error, guard_admin_user_update, has_repo_scope,
-        last_active_is_stale, list_briefs, list_feed, list_releases, llm_call_order_by_clause,
-        load_admin_dashboard_today_live_snapshot, load_pending_access_sync_reason,
-        looks_like_json_blob, map_job_action_error, map_public_compare_fallback_error,
-        mark_translation_requested, markdown_structure_preserved, me, me_delete_passkey,
-        normalize_markdown_translation_output, normalize_translation_fields,
-        parse_batch_notification_translation_payload,
+        admin_list_realtime_tasks, admin_list_repo_governance, admin_list_users,
+        admin_patch_llm_runtime_config, admin_patch_user, admin_users_offset,
+        ai_error_is_non_retryable, brief_contains_release_link, build_compare_digest,
+        build_feed_reaction_refresh_item, build_task_diagnostics, compact_dashboard_signatures,
+        dashboard_updates, encode_dashboard_updates_token, ensure_account_enabled,
+        execute_sync_all_sync_with, extract_brief_release_ids, extract_translation_fields,
+        feed_item_from_row, get_release_detail, get_release_detail_by_repo_tag,
+        github_access_restricted_error, github_graphql_errors_to_api_error,
+        github_graphql_http_error, github_rate_limited_error, github_reauth_required_error,
+        guard_admin_user_update, has_repo_scope, last_active_is_stale, list_briefs, list_feed,
+        list_releases, llm_call_order_by_clause, load_admin_dashboard_today_live_snapshot,
+        load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
+        map_public_compare_fallback_error, mark_translation_requested,
+        markdown_structure_preserved, me, me_delete_passkey, normalize_markdown_translation_output,
+        normalize_translation_fields, parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_feed_types, parse_llm_models, parse_positive_admin_concurrency,
         parse_release_id_param, parse_release_smart_summary_payload,
@@ -17759,6 +17860,185 @@ mod tests {
             .expect("disabled viewer item");
         assert_eq!(disabled_user.repo_total, 0);
         assert!(disabled_user.is_disabled);
+    }
+
+    struct RepoGovernanceSnapshotSeed<'a> {
+        repo_id: i64,
+        repo_full_name: &'a str,
+        priority_rank: i64,
+        target_window: i64,
+        urgency_score: f64,
+        urgency_bucket: &'a str,
+        actual_last_success_at: Option<&'a str>,
+    }
+
+    async fn seed_repo_governance_snapshot(
+        pool: &SqlitePool,
+        seed: RepoGovernanceSnapshotSeed<'_>,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO repo_refresh_governance_snapshots (
+              repo_id,
+              repo_full_name,
+              is_private,
+              watcher_user_count,
+              watcher_repo_total_sum,
+              cached_stargazer_count,
+              priority_rank,
+              target_window,
+              target_interval_minutes,
+              urgency_score,
+              urgency_bucket,
+              system_last_selected_at,
+              system_last_success_at,
+              actual_last_success_at,
+              actual_last_success_source,
+              updated_at
+            )
+            VALUES (?, ?, 0, 1, 1, NULL, ?, ?, ?, ?, ?, NULL, NULL, ?, 'system', '2026-02-24T00:00:00Z')
+            "#,
+        )
+        .bind(seed.repo_id)
+        .bind(seed.repo_full_name)
+        .bind(seed.priority_rank)
+        .bind(seed.target_window)
+        .bind(seed.target_window * 10)
+        .bind(seed.urgency_score)
+        .bind(seed.urgency_bucket)
+        .bind(seed.actual_last_success_at)
+        .execute(pool)
+        .await
+        .expect("seed repo governance snapshot");
+    }
+
+    #[tokio::test]
+    async fn admin_list_repo_governance_filters_target_windows_and_urgency_range() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        seed_repo_governance_snapshot(
+            &pool,
+            RepoGovernanceSnapshotSeed {
+                repo_id: 1,
+                repo_full_name: "owner/match-window-one",
+                priority_rank: 1,
+                target_window: 1,
+                urgency_score: 3.5,
+                urgency_bucket: "critical",
+                actual_last_success_at: Some("2026-02-20T00:00:00Z"),
+            },
+        )
+        .await;
+        seed_repo_governance_snapshot(
+            &pool,
+            RepoGovernanceSnapshotSeed {
+                repo_id: 2,
+                repo_full_name: "owner/outside-urgency",
+                priority_rank: 2,
+                target_window: 1,
+                urgency_score: 1.2,
+                urgency_bucket: "healthy",
+                actual_last_success_at: Some("2026-02-20T00:00:00Z"),
+            },
+        )
+        .await;
+        seed_repo_governance_snapshot(
+            &pool,
+            RepoGovernanceSnapshotSeed {
+                repo_id: 3,
+                repo_full_name: "owner/match-window-three",
+                priority_rank: 3,
+                target_window: 3,
+                urgency_score: 2.2,
+                urgency_bucket: "due",
+                actual_last_success_at: Some("2026-02-20T00:00:00Z"),
+            },
+        )
+        .await;
+        seed_repo_governance_snapshot(
+            &pool,
+            RepoGovernanceSnapshotSeed {
+                repo_id: 4,
+                repo_full_name: "owner/outside-window",
+                priority_rank: 4,
+                target_window: 4,
+                urgency_score: 3.8,
+                urgency_bucket: "critical",
+                actual_last_success_at: Some("2026-02-20T00:00:00Z"),
+            },
+        )
+        .await;
+
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+
+        let Json(response) = admin_list_repo_governance(
+            State(state),
+            session,
+            Query(AdminRepoGovernanceListQuery {
+                page: None,
+                page_size: Some(10),
+                query: Some("owner/".to_owned()),
+                aging: Some("all".to_owned()),
+                target_windows: Some("1,3".to_owned()),
+                urgency_min: Some(2.0),
+                urgency_max: Some(4.0),
+            }),
+        )
+        .await
+        .expect("admin repo governance list should succeed");
+
+        assert_eq!(response.total, 2);
+        assert_eq!(
+            response
+                .items
+                .iter()
+                .map(|item| item.repo_full_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["owner/match-window-one", "owner/match-window-three"]
+        );
+        assert_eq!(
+            response
+                .target_window_options
+                .iter()
+                .map(|option| (option.target_window, option.repo_count))
+                .collect::<Vec<_>>(),
+            vec![(1, 2), (3, 1), (4, 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_list_repo_governance_rejects_invalid_urgency_range() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+
+        let err = admin_list_repo_governance(
+            State(state),
+            session,
+            Query(AdminRepoGovernanceListQuery {
+                page: None,
+                page_size: None,
+                query: None,
+                aging: Some("all".to_owned()),
+                target_windows: Some("1,3".to_owned()),
+                urgency_min: Some(4.0),
+                urgency_max: Some(2.0),
+            }),
+        )
+        .await
+        .expect_err("invalid urgency range should fail");
+
+        assert_eq!(err.code(), "bad_request");
     }
 
     #[tokio::test]

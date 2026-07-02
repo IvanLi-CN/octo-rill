@@ -18,3 +18,5 @@
 - 2026-07-02: 将 system cycle 结算语义从“system 成功才完成”修正为“本轮 system 选中后的 release work item 尝试到达终态即完成”。该决策保留成功/失败事实，防止失败 repo 或被 interactive demand 复用的 repo 在同一 active cycle 中长期卡住闭环。
 - 2026-07-02: 为历史 active cycle 增加自动 reconciliation：治理快照重建只根据 system 选中时间之后的终态 work item 补写 attempt 与 member completion，避免人工 SQL，也避免选中前旧成功被误算作当前轮完成。
 - 2026-07-02: `/admin/repos` 解释面拆分实际刷新新鲜度、system 最近尝试、system 最近成功与目标窗口；10 分钟被明确为预算窗口和软目标推导单位，不再暗示全池必须 10 分钟完成。
+- 2026-07-02: 仓库明细新增服务端全量目标窗口多选与迫切值范围筛选；前端搜索、老化、窗口和迫切值筛选统一为 300ms 防抖自动应用，并将老化状态三按钮收口为单个下拉选择后刷新 Storybook 视觉证据。
+- 2026-07-02: 仓库明细筛选控件视觉继续收敛：目标窗口与迫切值仍打开各自面板，但触发器右侧补齐下拉箭头并保持浅色 outline。
