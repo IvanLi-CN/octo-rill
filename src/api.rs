@@ -1175,6 +1175,7 @@ pub struct AdminRepoGovernanceGridCell {
     age_bucket: String,
     band_label: String,
     urgency_score: f64,
+    system_attempt_status: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1199,6 +1200,9 @@ pub struct AdminRepoGovernanceListItem {
     urgency_bucket: String,
     system_last_selected_at: Option<String>,
     system_last_success_at: Option<String>,
+    system_last_attempt_at: Option<String>,
+    system_last_attempt_status: Option<String>,
+    system_last_attempt_error: Option<String>,
     actual_last_success_at: Option<String>,
     actual_last_success_source: Option<String>,
 }
@@ -1401,7 +1405,8 @@ pub async fn admin_get_repo_governance_overview(
           repo_id,
           actual_last_success_at,
           target_interval_minutes,
-          urgency_score
+          urgency_score,
+          system_last_attempt_status
         FROM repo_refresh_governance_snapshots
         ORDER BY priority_rank ASC, repo_id ASC
         "#,
@@ -1451,6 +1456,7 @@ pub async fn admin_get_repo_governance_overview(
                 age_bucket,
                 band_label,
                 urgency_score,
+                system_attempt_status: row.get("system_last_attempt_status"),
             }
         })
         .collect();
@@ -1517,6 +1523,9 @@ pub async fn admin_list_repo_governance(
           urgency_bucket,
           system_last_selected_at,
           system_last_success_at,
+          system_last_attempt_at,
+          system_last_attempt_status,
+          system_last_attempt_error,
           actual_last_success_at,
           actual_last_success_source
         FROM repo_refresh_governance_snapshots
