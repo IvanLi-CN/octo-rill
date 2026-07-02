@@ -120,7 +120,10 @@
 - 明细列表：
   - 按迫切值与优先级排序
   - 支持搜索 repo full name
-  - 支持老化筛选
+  - 支持老化筛选，`全部 / 仅超 24 小时 / 仅未成功` 三个互斥状态收口为单个下拉选择
+  - 支持按目标窗口多选筛选，选项来自 `GET /api/admin/repos` 返回的真实 `target_window_options`
+  - 支持按迫切值范围筛选，前端用滑杆表达范围，API 使用 `urgency_min` / `urgency_max`
+  - 搜索、老化、目标窗口与迫切值筛选在用户停止操作后 300ms 自动应用，并重置到第 1 页；状态下拉、目标窗口筛选、迫切值筛选作为三个并列控件展示，右侧均提供下拉箭头提示，其中目标窗口与迫切值打开各自的筛选面板
   - 同时解释实际刷新时间、system 最近尝试、system 最近成功与目标窗口：
     - 实际刷新时间：任意来源成功刷新后的表面新鲜度
     - system 最近尝试：本轮或最近一次 system 账本终态，可成功也可失败
@@ -162,19 +165,35 @@
   When 用户关闭 `include_own_releases` 或账号被 disabled
   Then owned baseline 不再虚增其有效关注仓库数，disabled 用户的有效关注仓库数归零。
 
+- Given 管理员在仓库明细中选择目标窗口 `W1` 与 `W3`，并把迫切值范围设为 `2.0-4.0`
+  When 前端防抖后请求 `GET /api/admin/repos`
+  Then 请求包含 `target_windows=1,3`、`urgency_min=2.0`、`urgency_max=4.0`，返回的 `items` 与 `total` 都只统计匹配全量筛选条件的仓库。
+
 ## Visual Evidence
 
 - source_type: `storybook_canvas`
   story_id_or_title: `admin-admin-repos--evidence-desktop`
   state: `desktop governance`
-  evidence_note: 证明 `/admin/repos` 在桌面视口下同时展示有效关注池 summary、可访问活动图图例、单跳预算 CTA 和按迫切值排序的仓库明细。
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `1440x1200`
+  viewport_strategy: `playwright-viewport`
+  sensitive_exclusion: `N/A`
+  submission_gate: `pending-owner-approval`
+  evidence_note: 证明 `/admin/repos` 在桌面视口下同时展示有效关注池 summary、可访问活动图图例、单跳预算 CTA，以及使用状态下拉、目标窗口与迫切值范围筛选的仓库明细。
   PR: include
   ![仓库治理桌面证据](./assets/admin-repos-desktop.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `admin-admin-repos--evidence-narrow-tablet`
   state: `narrow tablet governance`
-  evidence_note: 证明 `/admin/repos` 在窄平板视口下仍能稳定展示 summary、预算 CTA、活动图图例与明细列表，不退化为不可滚动的密集表格。
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `768x1180`
+  viewport_strategy: `playwright-viewport`
+  sensitive_exclusion: `N/A`
+  submission_gate: `pending-owner-approval`
+  evidence_note: 证明 `/admin/repos` 在窄平板视口下仍能稳定展示 summary、预算 CTA、活动图图例与明细筛选，不退化为不可滚动的密集表格。
   ![仓库治理窄屏证据](./assets/admin-repos-narrow-tablet.png)
 
 - source_type: `storybook_canvas`

@@ -307,6 +307,10 @@ export type AdminRepoGovernanceListResponse = {
 	page: number;
 	page_size: number;
 	total: number;
+	target_window_options: {
+		target_window: number;
+		repo_count: number;
+	}[];
 };
 export type AdminPublicReleaseRepoItem = {
 	id: string;
