@@ -638,6 +638,38 @@ export type AdminTranslateReleaseBatchDiagnostics = {
 		last_event_at: string;
 	}>;
 };
+export type AdminReleaseCompositeBatchDiagnostics = {
+	target_user_id: LocalUserId | null;
+	release_total: number;
+	translation: {
+		total: number;
+		ready: number;
+		missing: number;
+		disabled: number;
+		error: number;
+	};
+	smart: {
+		total: number;
+		ready: number;
+		missing: number;
+		disabled: number;
+		error: number;
+	};
+	diff_fallback_count: number;
+	progress: {
+		processed: number;
+		last_stage: string | null;
+	};
+	items: Array<{
+		release_id: string;
+		translation_status: string;
+		translation_error: string | null;
+		smart_status: string;
+		smart_error: string | null;
+		diff_fallback_used: boolean;
+		last_event_at: string;
+	}>;
+};
 export type AdminBriefDailySlotDiagnostics = {
 	hour_utc: number | null;
 	summary: {
@@ -791,6 +823,7 @@ export type AdminSyncAccessRefreshDiagnostics = {
 export type AdminTaskDiagnostics = {
 	business_outcome: AdminBusinessOutcome;
 	translate_release_batch?: AdminTranslateReleaseBatchDiagnostics | null;
+	release_composite_batch?: AdminReleaseCompositeBatchDiagnostics | null;
 	brief_daily_slot?: AdminBriefDailySlotDiagnostics | null;
 	brief_generate?: AdminBriefGenerateDiagnostics | null;
 	brief_history_recompute?: AdminBriefHistoryRecomputeDiagnostics | null;

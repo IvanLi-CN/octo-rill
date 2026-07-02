@@ -18,7 +18,7 @@
 - 新建统一翻译调度器，接收单条或多条翻译需求并按 `max_wait_ms` + token 窗口统一组批。
 - 翻译工作从 `job_tasks` 域中剥离，形成独立的 requests / work items / batches 领域模型；request 单条结果契约由后续 `#apras` 继续收口。
 - 提供统一生产者 API，支持 `async` / `wait` / `stream` 三种交付方式。
-- 支持同一批次内混合 `release_summary`、`release_detail`、`notification`，并与后续单-request 合同兼容。
+- 支持同一批次内混合 `release_composite`、`release_detail`、`notification`，并保留旧 `release_summary` / `release_smart` 入口到 `release_composite` 的 shim。
 - 在 `/admin/jobs` 新增“翻译调度”标签页，提供调度状态、请求视图、批次视图与 LLM 调用追链。
 - 停止为新的翻译工作创建 `translate.release*` / `translate.notification` 类 `job_tasks`。
 
@@ -69,9 +69,21 @@
   When 错误被判定为 retryable terminal error
   Then 调度器必须把该 request、work item 与结果表状态重置回 `queued`，而不是把本次失败沉成 owner-facing `error` 终态。
 
-- Given 一个批次同时包含 `release_summary`、`release_detail`、`notification`
+- Given 一个批次同时包含 `release_composite`、`release_detail`、`notification`
   When 管理员查看批次详情
   Then 页面显示批次触发原因、item kinds、token 预算、LLM 调用与每项结果。
+
+- Given 生产者提交 `release_summary/feed_body` 或 `release_smart/feed_card`
+  When 请求进入统一调度器
+  Then 服务端必须把它们规范化并归并到同一个 `release_composite/feed_card` work item，而不是继续维护两条独立的 release 正文首跳 work item。
+
+- Given `release_composite` work item 完成一次正文首跳
+  When `translation` 与 `smart` 只部分成功
+  Then 两个槽位仍分别写回各自的 `ai_translations` 结果行，并允许 `translation=ready + smart=missing|error` 或 `translation=error + smart=ready` 的独立终态组合。
+
+- Given `release_composite` 的 smart 正文判定 `valuable=false`
+  When 同轮补跑 `compare diff` 第二跳
+  Then 调度域必须把它记为同一条 composite 流程中的 smart fallback，而不是回退成旧 `release_smart` 正文首跳任务。
 
 - Given 新翻译工作由统一调度器处理
   When 管理员查看旧的实时任务列表
@@ -94,3 +106,9 @@
 - [x] `cargo test`
 - [x] `cd web && bun run build`
 - [x] `cd web && bun run e2e -- release-detail.spec.ts admin-jobs.spec.ts`
+
+## Visual Evidence
+
+复合 Release 批处理在 Admin Jobs 详情页中独立展示 translation、smart 与 compare diff fallback 统计，而不是退回旧的单槽位翻译摘要。
+
+![Release composite task detail](./assets/release-composite-task-detail.png)

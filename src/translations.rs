@@ -789,7 +789,7 @@ fn release_translation_item_allows_upstream_chat_403_retry(
 ) -> bool {
     matches!(
         item.kind.as_str(),
-        "release_summary" | "release_detail" | "release_smart"
+        "release_summary" | "release_detail" | "release_smart" | "release_composite"
     )
 }
 
@@ -2472,6 +2472,370 @@ async fn create_translation_requests_batch_with_origin(
     Ok(out)
 }
 
+fn release_composite_slot_request_item(
+    kind: &str,
+    entity_id: &str,
+    target_lang: &str,
+) -> TranslationRequestItemInput {
+    TranslationRequestItemInput {
+        producer_ref: format!("release.composite:{kind}:{entity_id}"),
+        kind: kind.to_owned(),
+        variant: if kind == "release_smart" {
+            "feed_card".to_owned()
+        } else {
+            "feed_body".to_owned()
+        },
+        entity_id: entity_id.to_owned(),
+        target_lang: target_lang.to_owned(),
+        max_wait_ms: 0,
+        source_blocks: Vec::new(),
+        target_slots: vec!["title_zh".to_owned(), "body_md".to_owned()],
+    }
+}
+
+fn slot_allows_terminal_reuse(
+    item: &TranslationRequestItemInput,
+    existing: &TranslationStateRow,
+    source_hash: &str,
+    retry_on_error: bool,
+) -> bool {
+    if existing.source_hash != source_hash {
+        return false;
+    }
+    match existing.status.as_str() {
+        "ready" | "disabled" | "missing" => true,
+        "error" => !should_retry_translation_terminal_error(
+            retry_on_error,
+            item,
+            existing.error_text.as_deref(),
+        ),
+        _ => false,
+    }
+}
+
+fn slot_needs_composite_demand_refresh(
+    item: &TranslationRequestItemInput,
+    existing: Option<&TranslationStateRow>,
+    source_hash: &str,
+    retry_on_error: bool,
+) -> bool {
+    match existing {
+        None => true,
+        Some(existing) if existing.source_hash != source_hash => true,
+        Some(existing) if matches!(existing.status.as_str(), "queued" | "running") => true,
+        Some(existing) if existing.status == "error" => should_retry_translation_terminal_error(
+            retry_on_error,
+            item,
+            existing.error_text.as_deref(),
+        ),
+        _ => false,
+    }
+}
+
+async fn upsert_release_composite_slot_demands(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    original_item: &TranslationRequestItemInput,
+    original_source_hash: &str,
+    paired_source_hash: &str,
+    work_item_id: &str,
+    now: &str,
+) -> Result<(), ApiError> {
+    let paired_kind = if original_item.kind == "release_smart" {
+        "release_summary"
+    } else {
+        "release_smart"
+    };
+    let paired_item = release_composite_slot_request_item(
+        paired_kind,
+        original_item.entity_id.as_str(),
+        original_item.target_lang.as_str(),
+    );
+
+    let original_existing = load_translation_state_row(tx, user_id, original_item).await?;
+    if slot_needs_composite_demand_refresh(
+        original_item,
+        original_existing.as_ref(),
+        original_source_hash,
+        true,
+    ) {
+        upsert_translation_demand_state(
+            tx,
+            user_id,
+            original_item,
+            original_source_hash,
+            "queued",
+            work_item_id,
+            now,
+        )
+        .await?;
+    }
+
+    let paired_existing = load_translation_state_row(tx, user_id, &paired_item).await?;
+    if slot_needs_composite_demand_refresh(
+        &paired_item,
+        paired_existing.as_ref(),
+        paired_source_hash,
+        false,
+    ) {
+        upsert_translation_demand_state(
+            tx,
+            user_id,
+            &paired_item,
+            paired_source_hash,
+            "queued",
+            work_item_id,
+            now,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn insert_release_composite_request(
+    state: &AppState,
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    mode: &str,
+    item: &TranslationRequestItemInput,
+    request_origin: &str,
+    now: &str,
+) -> Result<CreatedTranslationRequest, ApiError> {
+    let source_hash = build_source_hash(item);
+    let request_id = insert_translation_request_record(
+        tx,
+        user_id,
+        mode,
+        item,
+        request_origin,
+        source_hash.as_str(),
+        now,
+    )
+    .await?;
+
+    let existing_state = load_translation_state_row(tx, user_id, item).await?;
+    if let Some(existing) = existing_state.as_ref()
+        && slot_allows_terminal_reuse(item, existing, source_hash.as_str(), false)
+    {
+        let result = existing.to_result(item);
+        let status = request_status_from_result_status(result.status.as_str()).to_owned();
+        apply_request_result(
+            tx,
+            request_id.as_str(),
+            existing.active_work_item_id.as_deref(),
+            &result,
+            now,
+        )
+        .await?;
+        return Ok(CreatedTranslationRequest {
+            request_id,
+            status,
+            result,
+        });
+    }
+
+    let Some(composite) = build_release_composite_work_item(tx, user_id, item).await? else {
+        let result = missing_result(item);
+        apply_request_result(tx, request_id.as_str(), None, &result, now).await?;
+        return Ok(CreatedTranslationRequest {
+            request_id,
+            status: "completed".to_owned(),
+            result,
+        });
+    };
+    let composite_source_hash = build_source_hash(&composite.item);
+
+    let work_item_id = if let Some(work_item_id) = create_work_item(
+        state,
+        tx,
+        user_id,
+        &composite.item,
+        composite_source_hash.as_str(),
+        now,
+    )
+    .await?
+    {
+        work_item_id
+    } else {
+        load_existing_work_item(tx, user_id, &composite.item, composite_source_hash.as_str())
+            .await?
+            .ok_or_else(|| {
+                ApiError::internal("release composite work item missing after dedupe conflict")
+            })?
+            .id
+    };
+
+    let work_item = load_work_item_by_id(tx, work_item_id.as_str())
+        .await?
+        .ok_or_else(|| ApiError::internal("release composite work item missing after attach"))?;
+
+    if let Some(existing) = existing_state.as_ref()
+        && slot_allows_terminal_reuse(item, existing, source_hash.as_str(), false)
+    {
+        let result = existing.to_result(item);
+        let status = request_status_from_result_status(result.status.as_str()).to_owned();
+        apply_request_result(
+            tx,
+            request_id.as_str(),
+            Some(work_item.id.as_str()),
+            &result,
+            now,
+        )
+        .await?;
+        return Ok(CreatedTranslationRequest {
+            request_id,
+            status,
+            result,
+        });
+    }
+
+    if let Some(existing) = existing_state.as_ref()
+        && existing.source_hash == source_hash
+        && existing.status == "error"
+        && should_retry_translation_terminal_error(false, item, existing.error_text.as_deref())
+        && work_item.result_status.is_some()
+        && matches!(work_item.status.as_str(), "completed" | "failed")
+    {
+        reset_retryable_terminal_work_item(tx, work_item.id.as_str(), now).await?;
+    }
+
+    let request_status = request_status_from_work_item_status(work_item.status.as_str()).to_owned();
+    attach_request_to_work_item(
+        tx,
+        request_id.as_str(),
+        work_item.id.as_str(),
+        request_status.as_str(),
+        now,
+    )
+    .await?;
+    upsert_release_composite_slot_demands(
+        tx,
+        user_id,
+        item,
+        source_hash.as_str(),
+        if item.kind == "release_smart" {
+            composite.translation_source_hash.as_str()
+        } else {
+            composite.smart_source_hash.as_str()
+        },
+        work_item.id.as_str(),
+        now,
+    )
+    .await?;
+    if let Some(batch_id) = work_item.batch_id.as_deref() {
+        refresh_batch_request_counters(tx, batch_id, work_item.id.as_str(), now).await?;
+    }
+
+    let result = pending_result_from_work_row(&work_item, item);
+    Ok(CreatedTranslationRequest {
+        request_id,
+        status: request_status,
+        result,
+    })
+}
+
+async fn ensure_release_composite_result_demand(
+    state: &AppState,
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    item: &TranslationRequestItemInput,
+    request_id: &str,
+    retry_on_error: bool,
+    now: &str,
+) -> Result<TranslationResultItem, ApiError> {
+    let source_hash = build_source_hash(item);
+    let existing_state = load_translation_state_row(tx, user_id, item).await?;
+    if let Some(existing) = existing_state.as_ref()
+        && slot_allows_terminal_reuse(item, existing, source_hash.as_str(), retry_on_error)
+    {
+        let result = existing.to_result(item);
+        apply_request_result(
+            tx,
+            request_id,
+            existing.active_work_item_id.as_deref(),
+            &result,
+            now,
+        )
+        .await?;
+        return Ok(result);
+    }
+
+    let Some(composite) = build_release_composite_work_item(tx, user_id, item).await? else {
+        let result = missing_result(item);
+        apply_request_result(tx, request_id, None, &result, now).await?;
+        return Ok(result);
+    };
+    let composite_source_hash = build_source_hash(&composite.item);
+
+    let work_item_id = if let Some(work_item_id) = create_work_item(
+        state,
+        tx,
+        user_id,
+        &composite.item,
+        composite_source_hash.as_str(),
+        now,
+    )
+    .await?
+    {
+        work_item_id
+    } else {
+        load_existing_work_item(tx, user_id, &composite.item, composite_source_hash.as_str())
+            .await?
+            .ok_or_else(|| {
+                ApiError::internal("release composite work item missing after dedupe conflict")
+            })?
+            .id
+    };
+
+    let work_item = load_work_item_by_id(tx, work_item_id.as_str())
+        .await?
+        .ok_or_else(|| ApiError::internal("release composite work item missing after attach"))?;
+
+    if let Some(existing) = existing_state.as_ref()
+        && existing.source_hash == source_hash
+        && existing.status == "error"
+        && should_retry_translation_terminal_error(
+            retry_on_error,
+            item,
+            existing.error_text.as_deref(),
+        )
+        && work_item.result_status.is_some()
+        && matches!(work_item.status.as_str(), "completed" | "failed")
+    {
+        reset_retryable_terminal_work_item(tx, work_item.id.as_str(), now).await?;
+    }
+
+    let request_status = request_status_from_work_item_status(work_item.status.as_str()).to_owned();
+    attach_request_to_work_item(
+        tx,
+        request_id,
+        work_item.id.as_str(),
+        request_status.as_str(),
+        now,
+    )
+    .await?;
+    upsert_release_composite_slot_demands(
+        tx,
+        user_id,
+        item,
+        source_hash.as_str(),
+        if item.kind == "release_smart" {
+            composite.translation_source_hash.as_str()
+        } else {
+            composite.smart_source_hash.as_str()
+        },
+        work_item.id.as_str(),
+        now,
+    )
+    .await?;
+    if let Some(batch_id) = work_item.batch_id.as_deref() {
+        refresh_batch_request_counters(tx, batch_id, work_item.id.as_str(), now).await?;
+    }
+
+    Ok(pending_result_from_work_row(&work_item, item))
+}
+
 async fn ensure_translation_result_for_item(
     state: &AppState,
     tx: &mut Transaction<'_, Sqlite>,
@@ -2481,6 +2845,33 @@ async fn ensure_translation_result_for_item(
     now: &str,
     retry_on_error: bool,
 ) -> Result<TranslationResultItem, ApiError> {
+    if build_release_composite_work_item(tx, user_id, item)
+        .await?
+        .is_some()
+    {
+        let source_hash = build_source_hash(item);
+        let request_id = insert_translation_request_record(
+            tx,
+            user_id,
+            "async",
+            item,
+            request_origin,
+            source_hash.as_str(),
+            now,
+        )
+        .await?;
+        return ensure_release_composite_result_demand(
+            state,
+            tx,
+            user_id,
+            item,
+            request_id.as_str(),
+            retry_on_error,
+            now,
+        )
+        .await;
+    }
+
     let source_hash = build_source_hash(item);
     if matches!(
         (item.kind.as_str(), item.variant.as_str()),
@@ -2711,6 +3102,21 @@ async fn insert_translation_request(
     now: &str,
 ) -> Result<CreatedTranslationRequest, ApiError> {
     let canonical_item = canonicalize_translation_result_item(tx, user_id, item).await?;
+    if build_release_composite_work_item(tx, user_id, &canonical_item)
+        .await?
+        .is_some()
+    {
+        return insert_release_composite_request(
+            state,
+            tx,
+            user_id,
+            mode,
+            &canonical_item,
+            request_origin,
+            now,
+        )
+        .await;
+    }
     let source_hash = build_source_hash(&canonical_item);
     let request_id = insert_translation_request_record(
         tx,
@@ -2866,7 +3272,17 @@ async fn ensure_translation_result_demand(
         now,
     } = context;
 
-    if let Some(work_item_id) = create_work_item(state, tx, user_id, item, source_hash, now).await?
+    let canonical_work_item = canonicalize_translation_work_item(tx, user_id, item).await?;
+    let work_item_source_hash = build_source_hash(&canonical_work_item);
+    if let Some(work_item_id) = create_work_item(
+        state,
+        tx,
+        user_id,
+        &canonical_work_item,
+        work_item_source_hash.as_str(),
+        now,
+    )
+    .await?
     {
         attach_request_to_work_item(tx, request_id, &work_item_id, "queued", now).await?;
         upsert_translation_demand_state(
@@ -2882,9 +3298,14 @@ async fn ensure_translation_result_demand(
         return Ok(queued_request_result(item, Some(work_item_id)));
     }
 
-    let existing = load_existing_work_item(tx, user_id, item, source_hash)
-        .await?
-        .ok_or_else(|| ApiError::internal("translation work item missing after dedupe conflict"))?;
+    let existing = load_existing_work_item(
+        tx,
+        user_id,
+        &canonical_work_item,
+        work_item_source_hash.as_str(),
+    )
+    .await?
+    .ok_or_else(|| ApiError::internal("translation work item missing after dedupe conflict"))?;
 
     if existing.result_status.is_some()
         && matches!(existing.status.as_str(), "completed" | "failed")
@@ -4163,14 +4584,21 @@ async fn resolve_batch_results(
     let mut out = Vec::with_capacity(batch.items.len());
 
     let mut release_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
+    let mut release_summary_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
     let mut release_smart_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
     let mut detail_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
     let mut notification_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
 
     for item in &batch.items {
         match item.kind.as_str() {
-            "release_summary" => {
+            "release_composite" => {
                 release_groups
+                    .entry(item.scope_user_id.clone())
+                    .or_default()
+                    .push(item);
+            }
+            "release_summary" => {
+                release_summary_groups
                     .entry(item.scope_user_id.clone())
                     .or_default()
                     .push(item);
@@ -4206,7 +4634,7 @@ async fn resolve_batch_results(
         }
     }
 
-    for (user_id, items) in release_groups {
+    for (user_id, items) in release_summary_groups {
         let release_ids = items
             .iter()
             .filter_map(|item| item.entity_id.parse::<i64>().ok())
@@ -4251,6 +4679,37 @@ async fn resolve_batch_results(
         for item in items {
             let result = if let Some(translated) = by_id.get(&item.entity_id) {
                 terminal_result_from_batch_item(item, translated)
+            } else {
+                TerminalWorkResult {
+                    work_item_id: item.id.clone(),
+                    result_status: "error".to_owned(),
+                    title_zh: None,
+                    summary_md: None,
+                    body_md: None,
+                    error: Some("translation result missing".to_owned()),
+                }
+            };
+            out.push(result);
+        }
+    }
+
+    for (user_id, items) in release_groups {
+        let release_ids = items
+            .iter()
+            .filter_map(|item| item.entity_id.parse::<i64>().ok())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let composite =
+            api::run_release_composite_batch_for_user(state, user_id.as_str(), &release_ids)
+                .await?;
+        let by_id = composite
+            .into_iter()
+            .map(|(release_id, result)| (release_id.to_string(), result))
+            .collect::<HashMap<_, _>>();
+        for item in items {
+            let result = if let Some(composite) = by_id.get(&item.entity_id) {
+                terminal_result_from_release_composite(item, composite)
             } else {
                 TerminalWorkResult {
                     work_item_id: item.id.clone(),
@@ -4348,6 +4807,19 @@ fn terminal_result_from_batch_item(
         out.summary_md = translated.summary.clone();
     }
     out
+}
+
+fn terminal_result_from_release_composite(
+    item: &WorkItemRow,
+    composite: &api::ReleaseCompositeCandidateResult,
+) -> TerminalWorkResult {
+    match item.kind.as_str() {
+        "release_smart" => terminal_result_from_batch_item(item, &composite.smart),
+        "release_summary" | "release_composite" => {
+            terminal_result_from_batch_item(item, &composite.translation)
+        }
+        _ => terminal_result_from_batch_item(item, &composite.translation),
+    }
 }
 
 fn terminal_result_from_single_response(
@@ -5519,6 +5991,7 @@ fn derive_item_source(item: &TranslationRequestItemInput) -> Option<String> {
         ("release_summary", "feed_card" | "feed_body") => Some("feed.auto_translate".to_owned()),
         ("release_detail", "feed_body") => Some("feed.auto_translate".to_owned()),
         ("release_smart", "feed_card") => Some("feed.smart".to_owned()),
+        ("release_composite", "feed_card") => Some("feed.composite".to_owned()),
         ("release_detail", _) => Some("release_detail".to_owned()),
         ("notification", _) => Some("notification".to_owned()),
         _ => Some(item.kind.clone()),
@@ -5542,6 +6015,18 @@ fn uses_release_detail_translation_state(kind: &str, variant: &str) -> bool {
     kind == "release_detail" || matches!((kind, variant), ("release_summary", "feed_body"))
 }
 
+fn uses_release_composite_work_item(kind: &str, variant: &str) -> bool {
+    matches!((kind, variant), ("release_composite", "feed_card"))
+}
+
+fn routes_to_release_composite(kind: &str, variant: &str) -> bool {
+    uses_release_composite_work_item(kind, variant)
+        || matches!(
+            (kind, variant),
+            ("release_summary", "feed_body") | ("release_smart", "feed_card")
+        )
+}
+
 fn map_entity_type(kind: &str, variant: &str) -> Option<&'static str> {
     if uses_release_detail_translation_state(kind, variant) {
         return Some("release_detail");
@@ -5561,6 +6046,13 @@ struct CanonicalFeedReleaseRow {
     name: Option<String>,
     body: Option<String>,
     previous_tag_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseCompositeWorkItemInput {
+    item: TranslationRequestItemInput,
+    translation_source_hash: String,
+    smart_source_hash: String,
 }
 
 fn release_smart_metadata_text(
@@ -5615,6 +6107,172 @@ pub(crate) fn release_smart_feed_source_hash(
     })
 }
 
+fn release_composite_metadata_text(
+    repo_full_name: &str,
+    tag_name: &str,
+    previous_tag_name: Option<&str>,
+) -> String {
+    let mut metadata = release_smart_metadata_text(repo_full_name, tag_name, previous_tag_name);
+    if !repo_full_name.trim().is_empty() && !metadata.starts_with("repo=") {
+        metadata.insert_str(0, &format!("repo={repo_full_name}\n"));
+    }
+    metadata
+}
+
+fn normalize_release_composite_body(body: Option<&str>) -> Option<String> {
+    body.map(|value| value.replace("\r\n", "\n"))
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn build_release_composite_request_item(
+    entity_id: &str,
+    repo_full_name: &str,
+    tag_name: &str,
+    previous_tag_name: Option<&str>,
+    title: &str,
+    body: Option<&str>,
+) -> TranslationRequestItemInput {
+    let mut source_blocks = vec![TranslationSourceBlock {
+        slot: "title".to_owned(),
+        text: title.trim().to_owned(),
+    }];
+    if let Some(body) = body.map(str::trim).filter(|value| !value.is_empty()) {
+        source_blocks.push(TranslationSourceBlock {
+            slot: "body_markdown".to_owned(),
+            text: body.to_owned(),
+        });
+    }
+    source_blocks.push(TranslationSourceBlock {
+        slot: "metadata".to_owned(),
+        text: release_composite_metadata_text(repo_full_name, tag_name, previous_tag_name),
+    });
+
+    TranslationRequestItemInput {
+        producer_ref: format!("feed.composite:release:{entity_id}"),
+        kind: "release_composite".to_owned(),
+        variant: "feed_card".to_owned(),
+        entity_id: entity_id.to_owned(),
+        target_lang: "zh-CN".to_owned(),
+        max_wait_ms: 0,
+        source_blocks,
+        target_slots: vec!["title_zh".to_owned(), "body_md".to_owned()],
+    }
+}
+
+async fn build_release_composite_work_item(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    item: &TranslationRequestItemInput,
+) -> Result<Option<ReleaseCompositeWorkItemInput>, ApiError> {
+    if !routes_to_release_composite(item.kind.as_str(), item.variant.as_str()) {
+        return Ok(None);
+    }
+
+    let Some(row) = build_canonical_feed_request_item(tx, user_id, item).await? else {
+        return Ok(None);
+    };
+    let Ok(release_id) = row.entity_id.parse::<i64>() else {
+        return Ok(None);
+    };
+
+    let source_row = sqlx::query_as::<_, CanonicalFeedReleaseRow>(
+        r#"
+        WITH target_release AS (
+          SELECT
+            r.repo_id AS repo_id,
+            r.release_id AS release_id,
+            r.tag_name AS tag_name,
+            r.name AS name,
+            r.body AS body,
+            COALESCE(r.published_at, r.created_at, r.updated_at) AS sort_ts
+          FROM repo_releases r
+          WHERE r.release_id = ?
+        )
+        SELECT
+          sr.full_name AS full_name,
+          tr.tag_name AS tag_name,
+          tr.name AS name,
+          tr.body AS body,
+          (
+            SELECT prev.tag_name
+            FROM repo_releases prev
+            WHERE prev.repo_id = tr.repo_id
+              AND (
+                COALESCE(prev.published_at, prev.created_at, prev.updated_at) < tr.sort_ts
+                OR (
+                  COALESCE(prev.published_at, prev.created_at, prev.updated_at) = tr.sort_ts
+                  AND prev.release_id < tr.release_id
+                )
+              )
+            ORDER BY
+              COALESCE(prev.published_at, prev.created_at, prev.updated_at) DESC,
+              prev.release_id DESC
+            LIMIT 1
+          ) AS previous_tag_name
+        FROM target_release tr
+        JOIN user_release_visible_repos sr
+          ON sr.user_id = ? AND sr.repo_id = tr.repo_id
+        LIMIT 1
+        "#,
+    )
+    .bind(release_id)
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some(source_row) = source_row else {
+        return Ok(None);
+    };
+
+    let title = source_row
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&source_row.tag_name)
+        .to_owned();
+    let body = normalize_release_composite_body(source_row.body.as_deref());
+    let item = build_release_composite_request_item(
+        row.entity_id.as_str(),
+        source_row.full_name.trim(),
+        source_row.tag_name.trim(),
+        source_row.previous_tag_name.as_deref(),
+        title.as_str(),
+        body.as_deref(),
+    );
+
+    Ok(Some(ReleaseCompositeWorkItemInput {
+        translation_source_hash: build_source_hash(&TranslationRequestItemInput {
+            kind: "release_summary".to_owned(),
+            variant: "feed_body".to_owned(),
+            ..row.clone()
+        }),
+        smart_source_hash: release_smart_feed_source_hash(
+            row.entity_id.as_str(),
+            source_row.full_name.trim(),
+            title.as_str(),
+            body.as_deref(),
+            source_row.tag_name.trim(),
+            source_row.previous_tag_name.as_deref(),
+        ),
+        item,
+    }))
+}
+
+async fn canonicalize_translation_work_item(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    item: &TranslationRequestItemInput,
+) -> Result<TranslationRequestItemInput, ApiError> {
+    if routes_to_release_composite(item.kind.as_str(), item.variant.as_str())
+        && let Some(composite) = build_release_composite_work_item(tx, user_id, item).await?
+    {
+        return Ok(composite.item);
+    }
+    canonicalize_translation_result_item(tx, user_id, item).await
+}
+
 async fn build_canonical_feed_request_item(
     tx: &mut Transaction<'_, Sqlite>,
     user_id: &str,
@@ -5624,6 +6282,7 @@ async fn build_canonical_feed_request_item(
         (item.kind.as_str(), item.variant.as_str()),
         ("release_summary", "feed_card" | "feed_body")
             | ("release_smart", "feed_card")
+            | ("release_composite", "feed_card")
             | ("release_detail", "feed_body" | "detail_card")
     ) {
         return Ok(None);
@@ -5690,7 +6349,7 @@ async fn build_canonical_feed_request_item(
         .filter(|value| !value.is_empty())
         .unwrap_or(&row.tag_name)
         .to_owned();
-    let metadata = if item.kind == "release_smart" {
+    let metadata = if matches!(item.kind.as_str(), "release_smart" | "release_composite") {
         release_smart_metadata_text(
             row.full_name.trim(),
             row.tag_name.trim(),
@@ -5701,7 +6360,9 @@ async fn build_canonical_feed_request_item(
     };
     let body = if matches!(
         (item.kind.as_str(), item.variant.as_str()),
-        ("release_summary", "feed_body") | ("release_detail", "feed_body" | "detail_card")
+        ("release_summary", "feed_body")
+            | ("release_detail", "feed_body" | "detail_card")
+            | ("release_smart", "feed_card")
     ) {
         row.body
             .as_deref()
@@ -8294,7 +8955,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("count work items");
-        assert_eq!(request_count, 0);
+        assert_eq!(request_count, 1);
         assert_eq!(work_item_count, 0);
     }
 
@@ -8343,8 +9004,8 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("load translation work item");
-        assert_eq!(work_row.get::<String, _>("kind"), "release_summary");
-        assert_eq!(work_row.get::<String, _>("variant"), "feed_body");
+        assert_eq!(work_row.get::<String, _>("kind"), "release_composite");
+        assert_eq!(work_row.get::<String, _>("variant"), "feed_card");
 
         let state_row = sqlx::query(
             r#"
@@ -8368,10 +9029,15 @@ mod tests {
                 "- current body",
             ),
         );
-        assert_eq!(
-            work_row.get::<String, _>("source_hash"),
-            state_row.get::<String, _>("source_hash"),
-        );
+        let composite_hash = build_source_hash(&build_release_composite_request_item(
+            "420",
+            "openai/codex",
+            "Release v2.0.0",
+            None,
+            "Release v2.0.0",
+            Some("- current body"),
+        ));
+        assert_eq!(work_row.get::<String, _>("source_hash"), composite_hash);
     }
 
     #[tokio::test]
@@ -8444,7 +9110,7 @@ mod tests {
 
         let work_row = sqlx::query(
             r#"
-            SELECT source_hash
+            SELECT kind, variant, source_hash
             FROM translation_work_items
             WHERE entity_id = ?
             LIMIT 1
@@ -8454,7 +9120,17 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("load work row");
-        assert_eq!(work_row.get::<String, _>("source_hash"), expected_hash);
+        let composite_hash = build_source_hash(&build_release_composite_request_item(
+            "421",
+            "openai/codex",
+            "Release v2.0.1",
+            None,
+            "Release v2.0.1",
+            Some(full_body.as_str()),
+        ));
+        assert_eq!(work_row.get::<String, _>("kind"), "release_composite");
+        assert_eq!(work_row.get::<String, _>("variant"), "feed_card");
+        assert_eq!(work_row.get::<String, _>("source_hash"), composite_hash);
 
         let state_row = sqlx::query(
             r#"
@@ -8572,7 +9248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_translation_request_reuses_release_detail_work_item_across_request_kinds() {
+    async fn create_translation_request_reuses_ready_release_translation_across_request_kinds() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         seed_user(&pool, 1, "octo").await;
@@ -8616,15 +9292,34 @@ mod tests {
         .await
         .expect("complete shared work item");
 
+        sqlx::query(
+            r#"
+            UPDATE ai_translations
+            SET
+              status = 'ready',
+              title = ?,
+              summary = ?,
+              error_text = NULL,
+              active_work_item_id = NULL,
+              updated_at = ?
+            WHERE user_id = ? AND entity_type = 'release_detail' AND entity_id = ? AND lang = 'zh-CN'
+            "#,
+        )
+        .bind("版本 422")
+        .bind("共享译文")
+        .bind("2026-03-30T00:00:02Z")
+        .bind("1")
+        .bind("422")
+        .execute(&pool)
+        .await
+        .expect("promote release detail cache to ready");
+
         let detail_created = create_translation_request(state.as_ref(), "1", "async", &detail_item)
             .await
-            .expect("reuse shared release translation");
+            .expect("reuse ready release translation");
 
         assert_eq!(detail_created.status, "completed");
-        assert_eq!(
-            detail_created.result.work_item_id.as_deref(),
-            Some(work_item_id.as_str())
-        );
+        assert!(detail_created.result.work_item_id.is_none());
         assert_eq!(detail_created.result.kind, "release_detail");
         assert_eq!(detail_created.result.variant, "feed_body");
         assert_eq!(detail_created.result.body_md.as_deref(), Some("共享译文"));

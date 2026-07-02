@@ -783,6 +783,132 @@ export const TranslateReleaseBatch: Story = {
 	},
 };
 
+export const ReleaseCompositeBatch: Story = {
+	args: {
+		detail: buildDetail(
+			"release.composite.batch",
+			{
+				user_id: TARGET_USER_ID,
+				release_ids: ["290836643", "290822914", "290757276", "290724601"],
+			},
+			{
+				total: 4,
+				translation: { total: 4, ready: 3, missing: 1, disabled: 0, error: 0 },
+				smart: { total: 4, ready: 2, missing: 1, disabled: 0, error: 1 },
+				diff_fallback_count: 2,
+			},
+			[
+				{ stage: "collect", total_releases: 4 },
+				{ stage: "release", release_id: "290836643", item_status: "ready" },
+				{
+					stage: "release",
+					release_id: "290822914",
+					item_status: "ready",
+					diff_fallback_used: true,
+				},
+				{
+					stage: "release",
+					release_id: "290757276",
+					item_status: "missing",
+					item_error: "no_valuable_version_info",
+					diff_fallback_used: true,
+				},
+				{
+					stage: "release",
+					release_id: "290724601",
+					item_status: "error",
+					item_error: "smart parse failed",
+				},
+			],
+			{
+				eventMeta: {
+					returned: 4,
+					total: 4,
+					limit: 200,
+					truncated: false,
+				},
+				diagnostics: {
+					business_outcome: {
+						code: "partial",
+						label: "部分成功",
+						message:
+							"复合 Release 批处理已完成，翻译与润色结果按槽位独立收敛。",
+					},
+					release_composite_batch: {
+						target_user_id: TARGET_USER_ID,
+						release_total: 4,
+						translation: {
+							total: 4,
+							ready: 3,
+							missing: 1,
+							disabled: 0,
+							error: 0,
+						},
+						smart: {
+							total: 4,
+							ready: 2,
+							missing: 1,
+							disabled: 0,
+							error: 1,
+						},
+						diff_fallback_count: 2,
+						progress: {
+							processed: 4,
+							last_stage: "release",
+						},
+						items: [
+							{
+								release_id: "290836643",
+								translation_status: "ready",
+								translation_error: null,
+								smart_status: "ready",
+								smart_error: null,
+								diff_fallback_used: false,
+								last_event_at: "2026-02-26T12:00:15Z",
+							},
+							{
+								release_id: "290822914",
+								translation_status: "ready",
+								translation_error: null,
+								smart_status: "ready",
+								smart_error: null,
+								diff_fallback_used: true,
+								last_event_at: "2026-02-26T12:00:20Z",
+							},
+							{
+								release_id: "290757276",
+								translation_status: "ready",
+								translation_error: null,
+								smart_status: "missing",
+								smart_error: "no_valuable_version_info",
+								diff_fallback_used: true,
+								last_event_at: "2026-02-26T12:00:25Z",
+							},
+							{
+								release_id: "290724601",
+								translation_status: "ready",
+								translation_error: null,
+								smart_status: "error",
+								smart_error: "smart parse failed",
+								diff_fallback_used: false,
+								last_event_at: "2026-02-26T12:00:30Z",
+							},
+						],
+					},
+				},
+			},
+		),
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"复合 Release 批处理状态，验证 Admin Jobs 详情页能以新 task type 展示批量翻译/润色结果。",
+			},
+		},
+	},
+};
+
 export const TranslateReleaseDetail: Story = {
 	args: {
 		detail: buildDetail(

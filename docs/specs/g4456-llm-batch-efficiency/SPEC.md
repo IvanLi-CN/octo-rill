@@ -52,7 +52,7 @@
 - 若结果表里仍保留旧 source hash 的 `ready` 译文，且新的 source hash 已经挂上活跃 work item，则普通读取接口必须继续返回这份旧 `ready` 译文，直到 refresh work item 进入终态，而不是先退回 `missing`。
 - 前端必须按真实 DOM 视口几何持续重算 demand window，不再在前端执行 token 装箱或优先级拆批。
 - feed 自动翻译的用户侧等待预算必须保持短窗口；默认 `max_wait_ms=500`，避免页面首次打开后长时间停留在 `queued`。
-- 后端调度器继续以 work item token 预算与现有 worker 分流规则决定实际批次，但单批输入预算必须被 `1800 tokens` 硬上限截断，不得随模型上下文上限膨胀到数千 token。
+- 后端调度器继续以 work item token 预算与现有 worker 分流规则决定实际批次；但 release composite 路径必须使用独立的中等 budget 档位，目标区间 `8k-12k`，不再沿用 `1800 tokens` 的 release 小批硬上限。
 - 同一条 release 处于 `queued/running/ready/disabled/error` 任一状态时，前端不得重复制造新的自动翻译记录。
 - 自动结果轮询不得把 `error` 条目重新加入队列。
 - 手动“翻译”必须复用同一套结果聚合接口；仅当调用方显式声明重试意图时，后端才允许把旧 `error` request/work item 重置并重新入队。
@@ -73,7 +73,7 @@
 - Feed 自动翻译：前端在首载、滚动、resize、feed 追加与卡片高度变化后重算真实视口；把当前可见 release 与最后一个可见卡片之后连续 10 条按原顺序交给结果聚合接口。若候选数超过单次 `60` 条限制，则前端继续按顺序拆成多次 resolve 调用。接口先读取结果表：`ready/disabled/missing/error` 直接返回；`queued/running` 会继续核对活跃 work item；只有结果缺失或 pending 漂移时才在后端 ensure 队列任务。
 - Feed 自动翻译：若结果表已经存在当前 source hash 的 `queued/running` 状态，且运行时命中 writer / worker / LLM 背压信号，则接口可以直接返回该 pending 快照，不需要先进入新的 `BEGIN IMMEDIATE` 写事务。
 - Feed 自动翻译：`release_summary/feed_card` 的 source hash 以服务端当前 release 数据为准；若旧页面带来的旧 source blocks 晚到，后端必须先 canonicalize 到当前 release，再决定复用/建队列，旧 source 不得覆盖当前结果行。
-- Feed 自动翻译：当前可见窗口的自动任务默认只给后端约 `500ms` 聚合时间；若窗口内请求足够多，调度器优先按 `1800 tokens` 左右切成多个小批，以便更多 worker 并行启动，而不是等待大批次攒满再跑。
+- Feed 自动翻译 / 润色：当前可见窗口的自动任务默认只给后端约 `500ms` 聚合时间；release 正文首跳改为按 `release_composite` 装箱，优先在 `8k-12k` budget 内聚合多条 release，一次同时产出 translation 与 smart，避免把同一正文拆成两套小批调用。
 - Release detail 翻译：详情 Markdown chunk 批量翻译，失败 chunk 再单条重试。
 - Notification 翻译：支持线程批量翻译，缓存命中时直接返回。
 - Brief 生成：多个 repo 的 release 摘要可在同一批次请求中处理。
@@ -130,9 +130,9 @@
   When 当前可见窗口只产生少量 release 任务
   Then 首批 work item 应在约 `500ms` 聚合窗口后开始 claim，不得继续等待 `4s` 级别的 deadline。
 
-- Given 可见窗口与后续 10 条合计形成大量待翻译 release
+- Given 可见窗口与后续 10 条合计形成大量待处理 release
   When 调度器装箱 batch
-  Then 单个 translation batch 的输入预算必须被 `1800 tokens` 截断，避免只生成 1-2 个超大 batch 而闲置其余 worker。
+  Then `release_composite` batch 的输入预算必须显著高于旧 `1800`，但也不得无限贴近模型上下文上限；装箱测试需要证明它通常形成中等批次，而不是退化回 1-3 条的小碎批。
 
 - Given 某条 release 已进入 `error`
   When 自动可见窗口继续调用结果聚合接口

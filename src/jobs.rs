@@ -45,6 +45,7 @@ pub const TASK_RETRY_RECENT_FAILURES: &str = "retry.recent_failures";
 pub const TASK_TRANSLATE_RELEASE: &str = "translate.release";
 pub const TASK_TRANSLATE_RELEASE_BATCH: &str = "translate.release.batch";
 pub const TASK_SUMMARIZE_RELEASE_SMART_BATCH: &str = "summarize.release.smart.batch";
+pub const TASK_RELEASE_COMPOSITE_BATCH: &str = "release.composite.batch";
 pub const TASK_TRANSLATE_RELEASE_DETAIL: &str = "translate.release_detail";
 pub const TASK_TRANSLATE_NOTIFICATION: &str = "translate.notification";
 
@@ -1962,6 +1963,15 @@ async fn execute_task(
                 .map_err(|err| anyhow!("translate_releases_batch failed: {}", err.code()))?;
             Ok(translate_batch_task_result_json(res.items))
         }
+        TASK_RELEASE_COMPOSITE_BATCH => {
+            let user_id = payload_local_id(payload, "user_id")?;
+            let release_ids = payload_i64_array(payload, "release_ids")?;
+            let res =
+                api::run_release_composite_batch_for_user(state, user_id.as_str(), &release_ids)
+                    .await
+                    .map_err(|err| anyhow!("release_composite_batch failed: {}", err.code()))?;
+            Ok(release_composite_task_result_json(res))
+        }
         TASK_SUMMARIZE_RELEASE_SMART_BATCH => {
             let user_id = payload_local_id(payload, "user_id")?;
             let release_ids = payload_i64_array(payload, "release_ids")?;
@@ -3706,6 +3716,71 @@ fn translate_batch_task_result_json(items: Vec<api::TranslateBatchItem>) -> Valu
         "disabled": disabled,
         "error": error,
         "items": items,
+    })
+}
+
+fn release_composite_task_result_json(
+    items: HashMap<i64, api::ReleaseCompositeCandidateResult>,
+) -> Value {
+    let mut translation_ready = 0_i64;
+    let mut translation_missing = 0_i64;
+    let mut translation_disabled = 0_i64;
+    let mut translation_error = 0_i64;
+    let mut smart_ready = 0_i64;
+    let mut smart_missing = 0_i64;
+    let mut smart_disabled = 0_i64;
+    let mut smart_error = 0_i64;
+    let mut diff_fallback_count = 0_i64;
+
+    let mut rows = items
+        .into_iter()
+        .map(|(release_id, result)| {
+            match result.translation.status.as_str() {
+                "ready" => translation_ready += 1,
+                "missing" => translation_missing += 1,
+                "disabled" => translation_disabled += 1,
+                "error" => translation_error += 1,
+                _ => {}
+            }
+            match result.smart.status.as_str() {
+                "ready" => smart_ready += 1,
+                "missing" => smart_missing += 1,
+                "disabled" => smart_disabled += 1,
+                "error" => smart_error += 1,
+                _ => {}
+            }
+            if result.diff_fallback_used {
+                diff_fallback_count += 1;
+            }
+            json!({
+                "id": release_id.to_string(),
+                "translation_status": result.translation.status,
+                "translation_error": result.translation.error,
+                "smart_status": result.smart.status,
+                "smart_error": result.smart.error,
+                "diff_fallback_used": result.diff_fallback_used,
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+    let total = i64::try_from(rows.len()).unwrap_or(i64::MAX);
+
+    json!({
+        "total": total,
+        "translation": {
+            "ready": translation_ready,
+            "missing": translation_missing,
+            "disabled": translation_disabled,
+            "error": translation_error,
+        },
+        "smart": {
+            "ready": smart_ready,
+            "missing": smart_missing,
+            "disabled": smart_disabled,
+            "error": smart_error,
+        },
+        "diff_fallback_count": diff_fallback_count,
+        "items": rows,
     })
 }
 

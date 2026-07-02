@@ -706,6 +706,58 @@ function buildTaskDetailPageModel(
 				),
 			};
 		}
+		case "release.composite.batch": {
+			const diagnostics = detail.diagnostics?.release_composite_batch ?? null;
+			const releaseIds = readIdArray(payload, "release_ids");
+			const targetUser =
+				diagnostics?.target_user_id !== null &&
+				diagnostics?.target_user_id !== undefined
+					? `#${diagnostics.target_user_id}`
+					: userId
+						? `#${userId}`
+						: null;
+			return {
+				pageTitle: "批量翻译/润色 Release 详情页",
+				pageSummary:
+					"展示复合批处理任务的目标 Release 数量、进度与翻译/润色结果分布。",
+				fields: buildFields(
+					field("目标用户", targetUser),
+					field(
+						"目标 Release 数",
+						`${
+							diagnostics?.release_total !== undefined
+								? diagnostics.release_total
+								: releaseIds.length
+						}`,
+					),
+					field(
+						"事件已处理条数",
+						`${
+							diagnostics?.progress.processed !== undefined
+								? diagnostics.progress.processed
+								: 0
+						}`,
+					),
+					field("最后阶段", diagnostics?.progress.last_stage ?? null),
+					field(
+						"翻译 ready / missing / disabled / error",
+						diagnostics
+							? `${diagnostics.translation.ready} / ${diagnostics.translation.missing} / ${diagnostics.translation.disabled} / ${diagnostics.translation.error}`
+							: null,
+					),
+					field(
+						"润色 ready / missing / disabled / error",
+						diagnostics
+							? `${diagnostics.smart.ready} / ${diagnostics.smart.missing} / ${diagnostics.smart.disabled} / ${diagnostics.smart.error}`
+							: null,
+					),
+					field(
+						"Compare diff fallback",
+						diagnostics ? `${diagnostics.diff_fallback_count}` : null,
+					),
+				),
+			};
+		}
 		case "translate.release_detail": {
 			const releaseId = readString(payload, "release_id");
 			const status = readString(result, "status");
@@ -950,6 +1002,49 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 					</div>
 				))}
 			</div>
+			{diagnostics?.release_composite_batch?.items?.length ? (
+				<div className={detailCardClass}>
+					<p className="text-muted-foreground text-[11px]">
+						Release 翻译/润色明细
+					</p>
+					<div className="mt-2 space-y-2">
+						{diagnostics.release_composite_batch.items.map((item) => (
+							<div key={item.release_id} className="rounded-md border p-2">
+								<div className="flex flex-wrap items-center justify-between gap-2">
+									<p className="font-mono text-xs">#{item.release_id}</p>
+									<span className="text-xs font-medium">
+										翻译 {translateItemStatusLabel(item.translation_status)} /
+										润色 {translateItemStatusLabel(item.smart_status)}
+									</span>
+								</div>
+								<div className="mt-1 space-y-1 text-sm">
+									<p>
+										翻译错误原因：
+										<span className="font-medium">
+											{item.translation_error ?? "无"}
+										</span>
+									</p>
+									<p>
+										润色错误原因：
+										<span className="font-medium">
+											{item.smart_error ?? "无"}
+										</span>
+									</p>
+									<p>
+										Compare diff fallback：
+										<span className="font-medium">
+											{item.diff_fallback_used ? "已触发" : "未触发"}
+										</span>
+									</p>
+								</div>
+								<p className="text-muted-foreground mt-1 text-[11px]">
+									最后事件：{item.last_event_at}
+								</p>
+							</div>
+						))}
+					</div>
+				</div>
+			) : null}
 			{diagnostics?.translate_release_batch?.items?.length ? (
 				<div className={detailCardClass}>
 					<p className="text-muted-foreground text-[11px]">Release 翻译明细</p>

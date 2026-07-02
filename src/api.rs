@@ -41,7 +41,7 @@ const SESSION_ACTIVITY_TOUCHED_AT: &str = "activity_touched_at";
 const SESSION_ACTIVITY_TOUCH_INTERVAL_SECS: i64 = 15 * 60;
 const ACCESS_SYNC_REASON_INACTIVE_OVER_1H: &str = "inactive_over_1h";
 const ADMIN_DASHBOARD_TASK_TYPES: [(&str, &str); 3] = [
-    (jobs::TASK_TRANSLATE_RELEASE_BATCH, "翻译"),
+    (jobs::TASK_RELEASE_COMPOSITE_BATCH, "翻译/润色"),
     (jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH, "润色"),
     (jobs::TASK_BRIEF_DAILY_SLOT, "日报"),
 ];
@@ -2190,6 +2190,7 @@ struct AdminDashboardStatusCountRow {
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct AdminDashboardReleaseTaskRow {
+    task_type: String,
     status: String,
     payload_json: String,
     result_json: Option<String>,
@@ -2330,16 +2331,23 @@ async fn load_admin_dashboard_release_task_status_counts(
     let rows = sqlx::query_as::<_, AdminDashboardReleaseTaskRow>(
         r#"
         SELECT
+          task_type,
           status,
           payload_json,
           result_json
         FROM job_tasks
-        WHERE task_type = ?
+        WHERE (
+            task_type = ?
+            OR (? = ? AND task_type = ?)
+          )
           AND julianday(created_at) >= julianday(?)
           AND julianday(created_at) <= julianday(?)
         "#,
     )
     .bind(task_type)
+    .bind(task_type)
+    .bind(jobs::TASK_RELEASE_COMPOSITE_BATCH)
+    .bind(jobs::TASK_TRANSLATE_RELEASE_BATCH)
     .bind(start_at)
     .bind(end_at)
     .fetch_all(pool)
@@ -2363,8 +2371,15 @@ async fn load_admin_dashboard_release_task_status_counts(
             .and_then(serde_json::Value::as_object);
         let result_value = parse_json_value(row.result_json.as_deref());
         let result_object = result_value.as_ref().and_then(serde_json::Value::as_object);
-        let summary = derive_release_batch_summary(payload_object, result_object);
-        match release_batch_business_code(row.status.as_str(), &summary) {
+        let business_code = if row.task_type == jobs::TASK_RELEASE_COMPOSITE_BATCH {
+            let translation = release_composite_slot_summary(result_object, "translation", 0);
+            let smart = release_composite_slot_summary(result_object, "smart", 0);
+            release_composite_business_outcome(row.status.as_str(), &translation, &smart, None).code
+        } else {
+            let summary = derive_release_batch_summary(payload_object, result_object);
+            release_batch_business_code(row.status.as_str(), &summary).to_owned()
+        };
+        match business_code.as_str() {
             "ok" => counts.business_ok_count += 1,
             "partial" => counts.business_partial_count += 1,
             "failed" => counts.business_failed_count += 1,
@@ -2438,7 +2453,9 @@ async fn load_admin_dashboard_task_status_counts(
     end_at: &str,
 ) -> Result<AdminDashboardStatusCountRow, ApiError> {
     match task_type {
-        jobs::TASK_TRANSLATE_RELEASE_BATCH | jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH => {
+        jobs::TASK_RELEASE_COMPOSITE_BATCH
+        | jobs::TASK_TRANSLATE_RELEASE_BATCH
+        | jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH => {
             load_admin_dashboard_release_task_status_counts(pool, task_type, start_at, end_at).await
         }
         jobs::TASK_BRIEF_DAILY_SLOT => {
@@ -2658,10 +2675,11 @@ async fn load_admin_dashboard_ongoing_counts(
         SELECT task_type, COUNT(*) AS total
         FROM job_tasks
         WHERE status IN ('queued', 'running')
-          AND task_type IN (?, ?, ?)
+          AND task_type IN (?, ?, ?, ?)
         GROUP BY task_type
         "#,
     )
+    .bind(jobs::TASK_RELEASE_COMPOSITE_BATCH)
     .bind(jobs::TASK_TRANSLATE_RELEASE_BATCH)
     .bind(jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
     .bind(jobs::TASK_BRIEF_DAILY_SLOT)
@@ -2674,7 +2692,9 @@ async fn load_admin_dashboard_ongoing_counts(
     let mut briefs = 0_i64;
     for (task_type, total) in rows {
         match task_type.as_str() {
-            jobs::TASK_TRANSLATE_RELEASE_BATCH => translations = total,
+            jobs::TASK_RELEASE_COMPOSITE_BATCH | jobs::TASK_TRANSLATE_RELEASE_BATCH => {
+                translations += total
+            }
             jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH => summaries = total,
             jobs::TASK_BRIEF_DAILY_SLOT => briefs = total,
             _ => {}
@@ -2696,10 +2716,11 @@ async fn count_admin_dashboard_live_tasks_by_status(
         SELECT COUNT(*)
         FROM job_tasks
         WHERE status = ?
-          AND task_type IN (?, ?, ?)
+          AND task_type IN (?, ?, ?, ?)
         "#,
     )
     .bind(status)
+    .bind(jobs::TASK_RELEASE_COMPOSITE_BATCH)
     .bind(jobs::TASK_TRANSLATE_RELEASE_BATCH)
     .bind(jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
     .bind(jobs::TASK_BRIEF_DAILY_SLOT)
@@ -2978,15 +2999,15 @@ pub async fn admin_dashboard(
         point.total_users = row.total_users;
         point.active_users = row.active_users;
         match row.task_type.as_str() {
-            jobs::TASK_TRANSLATE_RELEASE_BATCH => {
-                point.translations_total = row.queued_count
+            jobs::TASK_RELEASE_COMPOSITE_BATCH | jobs::TASK_TRANSLATE_RELEASE_BATCH => {
+                point.translations_total += row.queued_count
                     + row.running_count
                     + row.succeeded_count
                     + row.failed_count
                     + row.canceled_count;
-                point.translations_failed = row.failed_count;
-                point.translations_partial = row.business_partial_count;
-                point.translations_business_failed = row.business_failed_count;
+                point.translations_failed += row.failed_count;
+                point.translations_partial += row.business_partial_count;
+                point.translations_business_failed += row.business_failed_count;
             }
             jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH => {
                 point.summaries_total = row.queued_count
@@ -3039,7 +3060,7 @@ pub async fn admin_dashboard(
     today_point.active_users = today_live.active_users;
     for item in &status_breakdown.items {
         match item.task_type.as_str() {
-            jobs::TASK_TRANSLATE_RELEASE_BATCH => {
+            jobs::TASK_RELEASE_COMPOSITE_BATCH | jobs::TASK_TRANSLATE_RELEASE_BATCH => {
                 today_point.translations_total = item.total;
                 today_point.translations_failed = item.failed;
                 today_point.translations_partial = item.business_counts.partial;
@@ -3592,6 +3613,8 @@ pub struct AdminTaskDiagnostics {
     #[serde(skip_serializing_if = "Option::is_none")]
     translate_release_batch: Option<AdminTranslateReleaseBatchDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    release_composite_batch: Option<AdminReleaseCompositeBatchDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     brief_daily_slot: Option<AdminBriefDailySlotDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     brief_generate: Option<AdminBriefGenerateDiagnostics>,
@@ -3636,6 +3659,28 @@ pub struct AdminTranslateReleaseBatchItemDiagnostic {
     release_id: String,
     item_status: String,
     item_error: Option<String>,
+    last_event_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminReleaseCompositeBatchDiagnostics {
+    target_user_id: Option<String>,
+    release_total: i64,
+    translation: AdminTranslateReleaseBatchSummary,
+    smart: AdminTranslateReleaseBatchSummary,
+    diff_fallback_count: i64,
+    progress: AdminTranslateReleaseBatchProgress,
+    items: Vec<AdminReleaseCompositeBatchItemDiagnostic>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminReleaseCompositeBatchItemDiagnostic {
+    release_id: String,
+    translation_status: String,
+    translation_error: Option<String>,
+    smart_status: String,
+    smart_error: Option<String>,
+    diff_fallback_used: bool,
     last_event_at: String,
 }
 
@@ -4036,7 +4081,16 @@ fn derive_release_batch_summary(
         }
     }
 
-    let counted_total = summary.ready + summary.missing + summary.disabled + summary.error;
+    let mut counted_total = summary.ready + summary.missing + summary.disabled + summary.error;
+    if counted_total == 0
+        && let Some(translation_object) = json_object_get_object(result_object, "translation")
+    {
+        summary.ready = json_object_get_i64(Some(translation_object), "ready").unwrap_or(0);
+        summary.missing = json_object_get_i64(Some(translation_object), "missing").unwrap_or(0);
+        summary.disabled = json_object_get_i64(Some(translation_object), "disabled").unwrap_or(0);
+        summary.error = json_object_get_i64(Some(translation_object), "error").unwrap_or(0);
+        counted_total = summary.ready + summary.missing + summary.disabled + summary.error;
+    }
     summary.total = summary
         .total
         .max(payload_total)
@@ -4223,6 +4277,172 @@ fn build_translate_release_batch_diagnostics(
             target_user_id,
             release_total,
             summary,
+            progress,
+            items,
+        },
+    )
+}
+
+fn release_composite_slot_summary(
+    result_object: Option<&serde_json::Map<String, serde_json::Value>>,
+    slot_key: &str,
+    fallback_total: i64,
+) -> AdminTranslateReleaseBatchSummary {
+    let slot_object = json_object_get_object(result_object, slot_key);
+    let mut summary = AdminTranslateReleaseBatchSummary {
+        total: json_object_get_i64(slot_object, "total").unwrap_or(fallback_total),
+        ready: json_object_get_i64(slot_object, "ready").unwrap_or(0),
+        missing: json_object_get_i64(slot_object, "missing").unwrap_or(0),
+        disabled: json_object_get_i64(slot_object, "disabled").unwrap_or(0),
+        error: json_object_get_i64(slot_object, "error").unwrap_or(0),
+    };
+    if summary.total == 0 {
+        summary.total = summary.ready + summary.missing + summary.disabled + summary.error;
+    }
+    summary
+}
+
+fn release_composite_business_outcome(
+    task_status: &str,
+    translation: &AdminTranslateReleaseBatchSummary,
+    smart: &AdminTranslateReleaseBatchSummary,
+    task_error: Option<&str>,
+) -> AdminBusinessOutcome {
+    if task_status == jobs::STATUS_FAILED {
+        return business_outcome(
+            "failed",
+            "任务失败",
+            task_error.unwrap_or("复合 Release 批处理任务执行失败。"),
+        );
+    }
+
+    let total = translation.total.max(smart.total);
+    if total == 0 {
+        return business_outcome(
+            "unknown",
+            "结果未知",
+            "任务状态显示成功，但缺少可判定的复合批处理结果统计。",
+        );
+    }
+
+    let non_ready = translation.missing
+        + translation.disabled
+        + translation.error
+        + smart.missing
+        + smart.disabled
+        + smart.error;
+    if non_ready > 0 {
+        return business_outcome(
+            "partial",
+            "部分成功",
+            "复合 Release 批处理已完成，翻译与润色结果按槽位独立收敛。",
+        );
+    }
+
+    business_outcome(
+        "ok",
+        "全部成功",
+        "复合 Release 批处理已完成，翻译与润色结果均已就绪。",
+    )
+}
+
+fn build_release_composite_batch_diagnostics(
+    task: &AdminRealtimeTaskDetailItem,
+    events: &[AdminTaskEventItem],
+) -> (AdminBusinessOutcome, AdminReleaseCompositeBatchDiagnostics) {
+    let payload_value = parse_json_value(Some(task.payload_json.as_str()));
+    let payload_object = payload_value
+        .as_ref()
+        .and_then(serde_json::Value::as_object);
+    let result_value = parse_json_value(task.result_json.as_deref());
+    let result_object = result_value.as_ref().and_then(serde_json::Value::as_object);
+
+    let target_user_id = json_object_get_local_id(payload_object, "user_id");
+    let fallback_total = json_object_get_i64(result_object, "total")
+        .or_else(|| json_object_get_array_len(payload_object, "release_ids"))
+        .unwrap_or(0);
+    let translation = release_composite_slot_summary(result_object, "translation", fallback_total);
+    let smart = release_composite_slot_summary(result_object, "smart", fallback_total);
+    let diff_fallback_count =
+        json_object_get_i64(result_object, "diff_fallback_count").unwrap_or(0);
+
+    let ordered_events = task_events_for_diagnostics(events);
+    let mut processed = 0_i64;
+    let mut last_stage: Option<String> = None;
+    for event in ordered_events {
+        if event.event_type != "task.progress" {
+            continue;
+        }
+        let payload_value = parse_json_value(Some(event.payload_json.as_str()));
+        let payload_object = payload_value
+            .as_ref()
+            .and_then(serde_json::Value::as_object);
+        let Some(stage) = json_object_get_string(payload_object, "stage") else {
+            continue;
+        };
+        last_stage = Some(stage.clone());
+        if stage == "release" {
+            processed += 1;
+        }
+    }
+
+    let fallback_item_time = task
+        .finished_at
+        .clone()
+        .unwrap_or_else(|| task.updated_at.clone());
+    let mut items: Vec<AdminReleaseCompositeBatchItemDiagnostic> = Vec::new();
+    if let Some(result_items) = result_object
+        .and_then(|obj| obj.get("items"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for item in result_items {
+            let item_object = item.as_object();
+            items.push(AdminReleaseCompositeBatchItemDiagnostic {
+                release_id: json_object_get_string(item_object, "id")
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                translation_status: json_object_get_string(item_object, "translation_status")
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                translation_error: json_object_get_string(item_object, "translation_error"),
+                smart_status: json_object_get_string(item_object, "smart_status")
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                smart_error: json_object_get_string(item_object, "smart_error"),
+                diff_fallback_used: json_object_get_bool(item_object, "diff_fallback_used")
+                    .unwrap_or(false),
+                last_event_at: fallback_item_time.clone(),
+            });
+        }
+    }
+
+    if processed == 0 {
+        processed = i64::try_from(items.len()).unwrap_or(i64::MAX);
+    }
+    if last_stage.is_none() && !items.is_empty() {
+        last_stage = Some("release".to_owned());
+    }
+
+    let release_total = fallback_total
+        .max(translation.total)
+        .max(smart.total)
+        .max(processed);
+    let progress = AdminTranslateReleaseBatchProgress {
+        processed,
+        last_stage,
+    };
+    let outcome = release_composite_business_outcome(
+        task.status.as_str(),
+        &translation,
+        &smart,
+        task.error_message.as_deref(),
+    );
+
+    (
+        outcome,
+        AdminReleaseCompositeBatchDiagnostics {
+            target_user_id,
+            release_total,
+            translation,
+            smart,
+            diff_fallback_count,
             progress,
             items,
         },
@@ -5330,6 +5550,23 @@ fn build_task_diagnostics(
             Some(AdminTaskDiagnostics {
                 business_outcome,
                 translate_release_batch: Some(diagnostics),
+                release_composite_batch: None,
+                brief_daily_slot: None,
+                brief_generate: None,
+                brief_history_recompute: None,
+                brief_refresh_content: None,
+                retry_recent_failures: None,
+                sync_access_refresh: None,
+                sync_subscriptions: None,
+            })
+        }
+        jobs::TASK_RELEASE_COMPOSITE_BATCH => {
+            let (business_outcome, diagnostics) =
+                build_release_composite_batch_diagnostics(task, events);
+            Some(AdminTaskDiagnostics {
+                business_outcome,
+                translate_release_batch: None,
+                release_composite_batch: Some(diagnostics),
                 brief_daily_slot: None,
                 brief_generate: None,
                 brief_history_recompute: None,
@@ -5344,6 +5581,7 @@ fn build_task_diagnostics(
             Some(AdminTaskDiagnostics {
                 business_outcome,
                 translate_release_batch: None,
+                release_composite_batch: None,
                 brief_daily_slot: Some(diagnostics),
                 brief_generate: None,
                 brief_history_recompute: None,
@@ -5358,6 +5596,7 @@ fn build_task_diagnostics(
             Some(AdminTaskDiagnostics {
                 business_outcome,
                 translate_release_batch: None,
+                release_composite_batch: None,
                 brief_daily_slot: None,
                 brief_generate: Some(diagnostics),
                 brief_history_recompute: None,
@@ -5373,6 +5612,7 @@ fn build_task_diagnostics(
             Some(AdminTaskDiagnostics {
                 business_outcome,
                 translate_release_batch: None,
+                release_composite_batch: None,
                 brief_daily_slot: None,
                 brief_generate: None,
                 brief_history_recompute: Some(diagnostics),
@@ -5388,6 +5628,7 @@ fn build_task_diagnostics(
             Some(AdminTaskDiagnostics {
                 business_outcome,
                 translate_release_batch: None,
+                release_composite_batch: None,
                 brief_daily_slot: None,
                 brief_generate: None,
                 brief_history_recompute: None,
@@ -5402,6 +5643,7 @@ fn build_task_diagnostics(
             Some(AdminTaskDiagnostics {
                 business_outcome,
                 translate_release_batch: None,
+                release_composite_batch: None,
                 brief_daily_slot: None,
                 brief_generate: None,
                 brief_history_recompute: None,
@@ -5417,6 +5659,7 @@ fn build_task_diagnostics(
             Some(AdminTaskDiagnostics {
                 business_outcome,
                 translate_release_batch: None,
+                release_composite_batch: None,
                 brief_daily_slot: None,
                 brief_generate: None,
                 brief_history_recompute: None,
@@ -5432,6 +5675,7 @@ fn build_task_diagnostics(
             Some(AdminTaskDiagnostics {
                 business_outcome,
                 translate_release_batch: None,
+                release_composite_batch: None,
                 brief_daily_slot: None,
                 brief_generate: None,
                 brief_history_recompute: None,
@@ -12605,6 +12849,19 @@ struct ReleaseBatchCandidate {
 }
 
 #[derive(Debug, Clone)]
+struct ReleaseCompositeBatchCandidate {
+    release_id: i64,
+    entity_id: String,
+    full_name: String,
+    tag_name: String,
+    previous_tag_name: Option<String>,
+    title: String,
+    body: String,
+    translation_source_hash: String,
+    smart_source_hash: String,
+}
+
+#[derive(Debug, Clone)]
 struct ReleaseBatchTerminalState {
     status: String,
     error: Option<String>,
@@ -12612,6 +12869,8 @@ struct ReleaseBatchTerminalState {
 
 const RELEASE_BATCH_MAX_TOKENS: u32 = 1_400;
 const RELEASE_BATCH_OVERHEAD_TOKENS: u32 = 260;
+const RELEASE_COMPOSITE_BATCH_MAX_TOKENS: u32 = 10_000;
+const RELEASE_COMPOSITE_BATCH_OVERHEAD_TOKENS: u32 = 480;
 const NOTIFICATION_BATCH_MAX_TOKENS: u32 = 1_100;
 const NOTIFICATION_BATCH_OVERHEAD_TOKENS: u32 = 220;
 
@@ -12736,11 +12995,56 @@ body_markdown:
     prompt
 }
 
+fn build_release_composite_batch_prompt(batch: &[ReleaseCompositeBatchCandidate]) -> String {
+    let mut prompt = String::from(
+        "请对下面一批 GitHub Release 同时完成两件事：\n\
+1) 生成可展示的中文翻译（title_zh + body_md）；\n\
+2) 判断正文是否足以支撑版本变化要点卡片，并为 smart 返回 valuable/title_zh/summary_bullets。\n\
+\n\
+输出严格 JSON（不要 markdown code block）：\n\
+{\"items\":[{\"release_id\":123,\"translation\":{\"title_zh\":\"...\",\"body_md\":\"...\"},\"smart\":{\"valuable\":true,\"title_zh\":\"...\",\"summary_bullets\":[\"...\",\"...\"]}}]}\n\
+\n\
+规则：\n\
+- translation 只能根据输入正文翻译，不得省略关键信息；\n\
+- smart 仅在正文有真实版本变化信息时返回 valuable=true；\n\
+- smart 的 summary_bullets 必须是 1-4 条中文要点；\n\
+- 若正文只有模板、链接、空话、版本占位或“查看 commits”等无实质变更说明，则 smart.valuable=false，summary_bullets=[]；\n\
+- 不输出 URL，不脑补，不要为缺失信息编造内容。\n",
+    );
+    for item in batch {
+        prompt.push_str("\n---\n");
+        prompt.push_str(&format!(
+            "release_id: {}\nrepo: {}\nrelease_tag: {}\nprevious_tag: {}\ntitle: {}\nbody_markdown:\n{}\n",
+            item.release_id,
+            item.full_name,
+            item.tag_name,
+            item.previous_tag_name.as_deref().unwrap_or("(none)"),
+            item.title,
+            item.body,
+        ));
+    }
+    prompt
+}
+
 fn estimate_release_batch_candidate_tokens(item: &ReleaseBatchCandidate) -> u32 {
     ai::estimate_text_tokens(item.full_name.as_str())
         .saturating_add(ai::estimate_text_tokens(item.title.as_str()))
         .saturating_add(ai::estimate_text_tokens(item.body.as_str()))
         .saturating_add(48)
+}
+
+fn estimate_release_composite_batch_candidate_tokens(item: &ReleaseCompositeBatchCandidate) -> u32 {
+    ai::estimate_text_tokens(item.full_name.as_str())
+        .saturating_add(ai::estimate_text_tokens(item.tag_name.as_str()))
+        .saturating_add(
+            item.previous_tag_name
+                .as_deref()
+                .map(ai::estimate_text_tokens)
+                .unwrap_or(0),
+        )
+        .saturating_add(ai::estimate_text_tokens(item.title.as_str()))
+        .saturating_add(ai::estimate_text_tokens(item.body.as_str()))
+        .saturating_add(72)
 }
 
 fn release_candidate_can_batch(
@@ -13362,23 +13666,11 @@ pub async fn translate_releases_batch_for_user(
 
 #[derive(Debug, Clone)]
 struct ReleaseSmartBatchCandidate {
-    release_id: i64,
-    entity_id: String,
     full_name: String,
     tag_name: String,
     previous_tag_name: Option<String>,
     title: String,
     body: String,
-    source_hash: String,
-}
-
-#[derive(Debug)]
-struct PreparedReleaseSmartBatch {
-    candidates: Vec<ReleaseSmartBatchCandidate>,
-    pending: Vec<ReleaseSmartBatchCandidate>,
-    smart: HashMap<i64, (Option<String>, Option<String>)>,
-    terminal: HashMap<i64, ReleaseBatchTerminalState>,
-    missing: HashSet<i64>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -13396,6 +13688,39 @@ struct ReleaseSmartSummaryPayload {
     valuable: bool,
     title_zh: Option<String>,
     summary_bullets: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseCompositeBatchPayload {
+    items: Vec<ReleaseCompositeBatchPayloadItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseCompositeBatchPayloadItem {
+    release_id: i64,
+    translation: Option<ReleaseCompositeTranslationPayload>,
+    smart: Option<ReleaseCompositeSmartPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseCompositeTranslationPayload {
+    title_zh: Option<String>,
+    body_md: Option<String>,
+    summary_md: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseCompositeSmartPayload {
+    valuable: bool,
+    title_zh: Option<String>,
+    summary_bullets: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReleaseCompositeCandidateResult {
+    pub(crate) translation: TranslateBatchItem,
+    pub(crate) smart: TranslateBatchItem,
+    pub(crate) diff_fallback_used: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -13498,6 +13823,11 @@ fn parse_release_smart_summary_payload(raw: &str) -> Option<ReleaseSmartSummaryP
         title_zh,
         summary_bullets,
     })
+}
+
+fn parse_release_composite_batch_payload(raw: &str) -> Option<ReleaseCompositeBatchPayload> {
+    let value = parse_json_value_relaxed(raw)?;
+    serde_json::from_value(value).ok()
 }
 
 fn release_smart_body_prompt(item: &ReleaseSmartBatchCandidate) -> String {
@@ -13840,19 +14170,13 @@ async fn summarize_release_smart_candidate_with_ai(
     Ok(Some((parsed.title_zh, Some(summary))))
 }
 
-async fn prepare_release_smart_batch(
+async fn prepare_release_composite_batch(
     state: &AppState,
     user_id: &str,
     release_ids: &[i64],
-) -> Result<PreparedReleaseSmartBatch, ApiError> {
+) -> Result<Vec<ReleaseCompositeBatchCandidate>, ApiError> {
     if state.config.ai.is_none() {
-        return Ok(PreparedReleaseSmartBatch {
-            candidates: Vec::new(),
-            pending: Vec::new(),
-            smart: HashMap::new(),
-            terminal: HashMap::new(),
-            missing: HashSet::new(),
-        });
+        return Ok(Vec::new());
     }
 
     let mut source_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
@@ -13909,25 +14233,21 @@ async fn prepare_release_smart_batch(
     source_query.push_bind(user_id);
     source_query.push(" AND sr.repo_id = tr.repo_id");
 
-    let source_rows = source_query
+    let rows = source_query
         .build_query_as::<ReleaseSmartBatchSourceRow>()
         .fetch_all(&state.pool)
         .await
         .map_err(ApiError::internal)?;
-
-    let mut source_by_id = HashMap::new();
-    for row in source_rows {
-        source_by_id.insert(row.release_id, row);
+    let mut by_id = HashMap::new();
+    for row in rows {
+        by_id.insert(row.release_id, row);
     }
 
-    let mut candidates = Vec::new();
-    let mut missing = HashSet::new();
+    let mut out = Vec::new();
     for release_id in release_ids {
-        let Some(row) = source_by_id.get(release_id) else {
-            missing.insert(*release_id);
+        let Some(row) = by_id.get(release_id) else {
             continue;
         };
-        let entity_id = release_id.to_string();
         let title = row
             .name
             .as_deref()
@@ -13935,323 +14255,346 @@ async fn prepare_release_smart_batch(
             .filter(|value| !value.is_empty())
             .unwrap_or(&row.tag_name)
             .to_owned();
-        let body = release_feed_body(row.body.as_deref()).unwrap_or_default();
-        let source_hash = crate::translations::release_smart_feed_source_hash(
-            entity_id.as_str(),
-            row.full_name.as_str(),
-            title.as_str(),
-            Some(body.as_str()),
-            row.tag_name.as_str(),
-            row.previous_tag_name.as_deref(),
-        );
-        candidates.push(ReleaseSmartBatchCandidate {
+        let body = row
+            .body
+            .as_deref()
+            .map(|value| value.replace("\r\n", "\n"))
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default();
+        out.push(ReleaseCompositeBatchCandidate {
             release_id: *release_id,
-            entity_id,
+            entity_id: release_id.to_string(),
             full_name: row.full_name.clone(),
             tag_name: row.tag_name.clone(),
             previous_tag_name: row.previous_tag_name.clone(),
-            title,
-            body,
-            source_hash,
+            title: title.clone(),
+            body: body.clone(),
+            translation_source_hash: release_detail_source_hash(
+                row.full_name.as_str(),
+                title.as_str(),
+                body.as_str(),
+            ),
+            smart_source_hash: crate::translations::release_smart_feed_source_hash(
+                release_id.to_string().as_str(),
+                row.full_name.as_str(),
+                title.as_str(),
+                Some(body.as_str()),
+                row.tag_name.as_str(),
+                row.previous_tag_name.as_deref(),
+            ),
         });
     }
-
-    let mut cache_by_entity = HashMap::<String, TranslationCacheRow>::new();
-    if !candidates.is_empty() {
-        let mut cache_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            r#"
-            SELECT entity_id, source_hash, status, title, summary, error_text
-            FROM ai_translations
-            WHERE user_id = "#,
-        );
-        cache_query.push_bind(user_id);
-        cache_query.push(" AND entity_type = 'release_smart' AND lang = 'zh-CN' AND status IN ('ready', 'disabled', 'missing', 'error') AND entity_id IN (");
-        {
-            let mut separated = cache_query.separated(", ");
-            for item in &candidates {
-                separated.push_bind(&item.entity_id);
-            }
-        }
-        cache_query.push(")");
-
-        let cache_rows = cache_query
-            .build_query_as::<TranslationCacheRow>()
-            .fetch_all(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-        for row in cache_rows {
-            cache_by_entity.insert(row.entity_id.clone(), row);
-        }
-    }
-
-    let mut pending = Vec::new();
-    let mut smart = HashMap::<i64, (Option<String>, Option<String>)>::new();
-    let mut terminal = HashMap::<i64, ReleaseBatchTerminalState>::new();
-
-    for item in &candidates {
-        if let Some(cache) = cache_by_entity.get(&item.entity_id)
-            && cache.source_hash == item.source_hash
-        {
-            if cache.status == "disabled"
-                || (cache.status == "missing"
-                    && cache.error_text.as_deref() == Some(SMART_NO_VALUABLE_VERSION_INFO))
-            {
-                terminal.insert(
-                    item.release_id,
-                    ReleaseBatchTerminalState {
-                        status: cache.status.clone(),
-                        error: cache.error_text.clone(),
-                    },
-                );
-                continue;
-            }
-            if cache.status == "error" {
-                if smart_error_is_retryable(cache.error_text.as_deref()) {
-                    pending.push(item.clone());
-                    continue;
-                }
-                terminal.insert(
-                    item.release_id,
-                    ReleaseBatchTerminalState {
-                        status: cache.status.clone(),
-                        error: cache.error_text.clone(),
-                    },
-                );
-                continue;
-            }
-            if cache.status == "ready" {
-                let ready = smart_ready_item(cache.title.clone(), cache.summary.clone(), None);
-                if let Some(ready) = ready {
-                    smart.insert(item.release_id, (ready.title, ready.summary));
-                    continue;
-                }
-            }
-        }
-        pending.push(item.clone());
-    }
-
-    Ok(PreparedReleaseSmartBatch {
-        candidates,
-        pending,
-        smart,
-        terminal,
-        missing,
-    })
+    Ok(out)
 }
 
-async fn mark_release_smart_requested(
-    state: &AppState,
-    user_id: &str,
-    requested_at: &str,
-    candidates: &[ReleaseSmartBatchCandidate],
-) -> Result<(), ApiError> {
-    for item in candidates {
-        mark_translation_requested(
-            state,
-            user_id,
-            requested_at,
-            TranslationUpsert {
-                entity_type: "release_smart",
-                entity_id: &item.entity_id,
-                lang: "zh-CN",
-                source_hash: &item.source_hash,
-                title: None,
-                summary: None,
-            },
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-async fn upsert_release_smart_results(
-    state: &AppState,
-    user_id: &str,
-    requested_at: &str,
-    candidates: &[ReleaseSmartBatchCandidate],
-    smart: &HashMap<i64, (Option<String>, Option<String>)>,
-) -> Result<(), ApiError> {
-    for item in candidates {
-        if let Some((title, summary)) = smart.get(&item.release_id) {
-            upsert_translation(
-                state,
-                user_id,
-                requested_at,
-                TranslationUpsert {
-                    entity_type: "release_smart",
-                    entity_id: &item.entity_id,
-                    lang: "zh-CN",
-                    source_hash: &item.source_hash,
-                    title: title.as_deref(),
-                    summary: summary.as_deref(),
-                },
-            )
-            .await?;
-        }
-    }
-    Ok(())
-}
-
-async fn upsert_release_smart_terminal_states(
-    state: &AppState,
-    user_id: &str,
-    requested_at: &str,
-    candidates: &[ReleaseSmartBatchCandidate],
-    terminal: &HashMap<i64, ReleaseBatchTerminalState>,
-) -> Result<(), ApiError> {
-    for item in candidates {
-        let Some(terminal_state) = terminal.get(&item.release_id) else {
-            continue;
-        };
-        upsert_translation_terminal_status(
-            state,
-            user_id,
-            requested_at,
-            TranslationUpsert {
-                entity_type: "release_smart",
-                entity_id: &item.entity_id,
-                lang: "zh-CN",
-                source_hash: &item.source_hash,
-                title: None,
-                summary: None,
-            },
-            terminal_state.status.as_str(),
-            terminal_state.error.as_deref(),
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-fn build_release_smart_batch_item(
-    release_id: i64,
-    missing: &HashSet<i64>,
-    terminal: &HashMap<i64, ReleaseBatchTerminalState>,
-    smart: &HashMap<i64, (Option<String>, Option<String>)>,
-) -> TranslateBatchItem {
-    if missing.contains(&release_id) {
-        return TranslateBatchItem {
-            id: release_id.to_string(),
-            lang: "zh-CN".to_owned(),
-            status: "missing".to_owned(),
-            title: None,
-            summary: None,
-            error: Some("release not found".to_owned()),
-        };
-    }
-
-    if let Some(terminal_state) = terminal.get(&release_id) {
-        return TranslateBatchItem {
-            id: release_id.to_string(),
-            lang: "zh-CN".to_owned(),
-            status: terminal_state.status.clone(),
-            title: None,
-            summary: None,
-            error: terminal_state.error.clone().or_else(|| {
-                (terminal_state.status == "missing")
-                    .then_some("translation result missing".to_owned())
-            }),
-        };
-    }
-
-    if let Some((title, summary)) = smart.get(&release_id) {
-        return TranslateBatchItem {
-            id: release_id.to_string(),
-            lang: "zh-CN".to_owned(),
-            status: "ready".to_owned(),
-            title: title.clone(),
-            summary: summary.clone(),
-            error: None,
-        };
-    }
-
-    TranslateBatchItem {
-        id: release_id.to_string(),
-        lang: "zh-CN".to_owned(),
-        status: "error".to_owned(),
-        title: None,
-        summary: None,
-        error: Some("release smart summary failed".to_owned()),
-    }
-}
-
-async fn summarize_releases_smart_batch_internal(
+pub(crate) async fn run_release_composite_batch_for_user(
     state: &AppState,
     user_id: &str,
     release_ids: &[i64],
-) -> Result<Vec<TranslateBatchItem>, ApiError> {
+) -> Result<HashMap<i64, ReleaseCompositeCandidateResult>, ApiError> {
     if state.config.ai.is_none() {
         return Ok(release_ids
             .iter()
-            .map(|release_id| TranslateBatchItem {
-                id: release_id.to_string(),
-                lang: "zh-CN".to_owned(),
-                status: "disabled".to_owned(),
-                title: None,
-                summary: None,
-                error: None,
+            .map(|release_id| {
+                (
+                    *release_id,
+                    ReleaseCompositeCandidateResult {
+                        translation: TranslateBatchItem {
+                            id: release_id.to_string(),
+                            lang: "zh-CN".to_owned(),
+                            status: "disabled".to_owned(),
+                            title: None,
+                            summary: None,
+                            error: None,
+                        },
+                        smart: TranslateBatchItem {
+                            id: release_id.to_string(),
+                            lang: "zh-CN".to_owned(),
+                            status: "disabled".to_owned(),
+                            title: None,
+                            summary: None,
+                            error: None,
+                        },
+                        diff_fallback_used: false,
+                    },
+                )
             })
             .collect());
     }
 
-    let requested_at = chrono::Utc::now().to_rfc3339();
-    let mut prepared = prepare_release_smart_batch(state, user_id, release_ids).await?;
-    mark_release_smart_requested(state, user_id, requested_at.as_str(), &prepared.pending).await?;
+    let candidates = prepare_release_composite_batch(state, user_id, release_ids).await?;
+    let candidate_by_id = candidates
+        .iter()
+        .map(|item| (item.release_id, item.clone()))
+        .collect::<HashMap<_, _>>();
+    let estimated = candidates
+        .iter()
+        .map(estimate_release_composite_batch_candidate_tokens)
+        .collect::<Vec<_>>();
+    let input_budget =
+        ai::compute_input_budget_with_source(state, RELEASE_COMPOSITE_BATCH_MAX_TOKENS)
+            .await
+            .input_budget
+            .clamp(1, RELEASE_COMPOSITE_BATCH_MAX_TOKENS);
+    let groups = ai::pack_batch_indices(
+        &estimated,
+        input_budget,
+        RELEASE_COMPOSITE_BATCH_OVERHEAD_TOKENS,
+    );
 
-    for item in &prepared.pending {
-        match summarize_release_smart_candidate_with_ai(state, user_id, item).await {
-            Ok(Some(result)) => {
-                prepared.smart.insert(item.release_id, result);
+    let mut out = HashMap::<i64, ReleaseCompositeCandidateResult>::new();
+    let mut pending_diff = Vec::<ReleaseCompositeBatchCandidate>::new();
+    for batch_indices in groups {
+        let batch = batch_indices
+            .iter()
+            .map(|idx| candidates[*idx].clone())
+            .collect::<Vec<_>>();
+        let prompt = build_release_composite_batch_prompt(&batch);
+        let raw = ai::chat_completion(
+            state,
+            "你是一个严谨的 GitHub Release 中文整理助手，负责在一次请求里同时给出翻译与版本变化要点判断。只能根据给定证据输出，不得脑补。",
+            &prompt,
+            RELEASE_COMPOSITE_BATCH_MAX_TOKENS,
+        )
+        .await
+        .map_err(ApiError::internal)?;
+        let payload = parse_release_composite_batch_payload(&raw)
+            .ok_or_else(|| ApiError::internal("release composite batch json decode failed"))?;
+        let payload_by_id = payload
+            .items
+            .into_iter()
+            .map(|item| (item.release_id, item))
+            .collect::<HashMap<_, _>>();
+
+        for candidate in batch {
+            let mut translation = TranslateBatchItem {
+                id: candidate.release_id.to_string(),
+                lang: "zh-CN".to_owned(),
+                status: "error".to_owned(),
+                title: None,
+                summary: None,
+                error: Some("release composite translation missing".to_owned()),
+            };
+            let mut smart = TranslateBatchItem {
+                id: candidate.release_id.to_string(),
+                lang: "zh-CN".to_owned(),
+                status: "error".to_owned(),
+                title: None,
+                summary: None,
+                error: Some("release composite smart missing".to_owned()),
+            };
+
+            if let Some(item) = payload_by_id.get(&candidate.release_id) {
+                if let Some(translation_payload) = item.translation.as_ref() {
+                    let (title, summary) = normalize_translation_fields(
+                        translation_payload.title_zh.clone(),
+                        translation_payload
+                            .body_md
+                            .clone()
+                            .or(translation_payload.summary_md.clone()),
+                    );
+                    let summary = summary.map(|value| {
+                        normalize_markdown_translation_output(candidate.body.as_str(), value)
+                    });
+                    let markdown_ok = candidate.body.trim().is_empty()
+                        || summary.as_deref().is_some_and(|value| {
+                            markdown_structure_preserved(candidate.body.as_str(), value)
+                        });
+                    if (title.is_some() || summary.is_some())
+                        && release_detail_translation_ready(
+                            Some(candidate.body.as_str()),
+                            summary.as_deref(),
+                        )
+                        && markdown_ok
+                    {
+                        translation = TranslateBatchItem {
+                            id: candidate.release_id.to_string(),
+                            lang: "zh-CN".to_owned(),
+                            status: "ready".to_owned(),
+                            title,
+                            summary,
+                            error: None,
+                        };
+                    }
+                }
+                if let Some(smart_payload) = item.smart.as_ref() {
+                    if smart_payload.valuable {
+                        let summary = render_smart_summary_markdown(&smart_payload.summary_bullets);
+                        if let Some(summary) = summary {
+                            smart = TranslateBatchItem {
+                                id: candidate.release_id.to_string(),
+                                lang: "zh-CN".to_owned(),
+                                status: "ready".to_owned(),
+                                title: smart_payload.title_zh.clone(),
+                                summary: Some(summary),
+                                error: None,
+                            };
+                        }
+                    } else {
+                        pending_diff.push(candidate.clone());
+                        smart = TranslateBatchItem {
+                            id: candidate.release_id.to_string(),
+                            lang: "zh-CN".to_owned(),
+                            status: "missing".to_owned(),
+                            title: None,
+                            summary: None,
+                            error: Some(SMART_NO_VALUABLE_VERSION_INFO.to_owned()),
+                        };
+                    }
+                }
+            }
+
+            out.insert(
+                candidate.release_id,
+                ReleaseCompositeCandidateResult {
+                    translation,
+                    smart,
+                    diff_fallback_used: false,
+                },
+            );
+        }
+    }
+
+    for item in pending_diff {
+        let result = out
+            .get_mut(&item.release_id)
+            .ok_or_else(|| ApiError::internal("release composite diff fallback target missing"))?;
+        match summarize_release_smart_candidate_with_ai(
+            state,
+            user_id,
+            &ReleaseSmartBatchCandidate {
+                full_name: item.full_name.clone(),
+                tag_name: item.tag_name.clone(),
+                previous_tag_name: item.previous_tag_name.clone(),
+                title: item.title.clone(),
+                body: release_feed_body(Some(item.body.as_str())).unwrap_or_default(),
+            },
+        )
+        .await
+        {
+            Ok(Some((title, summary))) => {
+                result.smart = TranslateBatchItem {
+                    id: item.release_id.to_string(),
+                    lang: "zh-CN".to_owned(),
+                    status: "ready".to_owned(),
+                    title,
+                    summary,
+                    error: None,
+                };
+                result.diff_fallback_used = true;
             }
             Ok(None) => {
-                prepared.terminal.insert(
-                    item.release_id,
-                    ReleaseBatchTerminalState {
-                        status: "missing".to_owned(),
-                        error: Some(SMART_NO_VALUABLE_VERSION_INFO.to_owned()),
-                    },
-                );
+                result.smart = TranslateBatchItem {
+                    id: item.release_id.to_string(),
+                    lang: "zh-CN".to_owned(),
+                    status: "missing".to_owned(),
+                    title: None,
+                    summary: None,
+                    error: Some(SMART_NO_VALUABLE_VERSION_INFO.to_owned()),
+                };
+                result.diff_fallback_used = true;
             }
             Err(err) => {
-                prepared.terminal.insert(
-                    item.release_id,
-                    ReleaseBatchTerminalState {
-                        status: "error".to_owned(),
-                        error: Some(err.to_string()),
-                    },
-                );
+                result.smart = TranslateBatchItem {
+                    id: item.release_id.to_string(),
+                    lang: "zh-CN".to_owned(),
+                    status: "error".to_owned(),
+                    title: None,
+                    summary: None,
+                    error: Some(err.to_string()),
+                };
+                result.diff_fallback_used = true;
             }
         }
     }
 
-    upsert_release_smart_results(
-        state,
-        user_id,
-        requested_at.as_str(),
-        &prepared.candidates,
-        &prepared.smart,
-    )
-    .await?;
-    upsert_release_smart_terminal_states(
-        state,
-        user_id,
-        requested_at.as_str(),
-        &prepared.candidates,
-        &prepared.terminal,
-    )
-    .await?;
+    let requested_at = chrono::Utc::now().to_rfc3339();
+    for release_id in release_ids {
+        let Some(candidate) = candidate_by_id.get(release_id) else {
+            continue;
+        };
+        let Some(result) = out.get(release_id) else {
+            continue;
+        };
 
-    Ok(release_ids
-        .iter()
-        .map(|release_id| {
-            build_release_smart_batch_item(
-                *release_id,
-                &prepared.missing,
-                &prepared.terminal,
-                &prepared.smart,
-            )
-        })
-        .collect())
+        match result.translation.status.as_str() {
+            "ready" => {
+                upsert_translation(
+                    state,
+                    user_id,
+                    requested_at.as_str(),
+                    TranslationUpsert {
+                        entity_type: "release_detail",
+                        entity_id: candidate.entity_id.as_str(),
+                        lang: "zh-CN",
+                        source_hash: candidate.translation_source_hash.as_str(),
+                        title: result.translation.title.as_deref(),
+                        summary: result.translation.summary.as_deref(),
+                    },
+                )
+                .await?;
+            }
+            "disabled" | "missing" | "error" => {
+                upsert_translation_terminal_status(
+                    state,
+                    user_id,
+                    requested_at.as_str(),
+                    TranslationUpsert {
+                        entity_type: "release_detail",
+                        entity_id: candidate.entity_id.as_str(),
+                        lang: "zh-CN",
+                        source_hash: candidate.translation_source_hash.as_str(),
+                        title: None,
+                        summary: None,
+                    },
+                    result.translation.status.as_str(),
+                    result.translation.error.as_deref(),
+                )
+                .await?;
+            }
+            _ => {}
+        }
+
+        match result.smart.status.as_str() {
+            "ready" => {
+                upsert_translation(
+                    state,
+                    user_id,
+                    requested_at.as_str(),
+                    TranslationUpsert {
+                        entity_type: "release_smart",
+                        entity_id: candidate.entity_id.as_str(),
+                        lang: "zh-CN",
+                        source_hash: candidate.smart_source_hash.as_str(),
+                        title: result.smart.title.as_deref(),
+                        summary: result.smart.summary.as_deref(),
+                    },
+                )
+                .await?;
+            }
+            "disabled" | "missing" | "error" => {
+                upsert_translation_terminal_status(
+                    state,
+                    user_id,
+                    requested_at.as_str(),
+                    TranslationUpsert {
+                        entity_type: "release_smart",
+                        entity_id: candidate.entity_id.as_str(),
+                        lang: "zh-CN",
+                        source_hash: candidate.smart_source_hash.as_str(),
+                        title: None,
+                        summary: None,
+                    },
+                    result.smart.status.as_str(),
+                    result.smart.error.as_deref(),
+                )
+                .await?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(out)
 }
 
 pub async fn summarize_releases_smart_batch_for_user(
@@ -14259,7 +14602,11 @@ pub async fn summarize_releases_smart_batch_for_user(
     user_id: &str,
     release_ids: &[i64],
 ) -> Result<TranslateBatchResponse, ApiError> {
-    let items = summarize_releases_smart_batch_internal(state, user_id, release_ids).await?;
+    let items = run_release_composite_batch_for_user(state, user_id, release_ids)
+        .await?
+        .into_values()
+        .map(|result| result.smart)
+        .collect::<Vec<_>>();
     Ok(TranslateBatchResponse { items })
 }
 
@@ -18670,7 +19017,7 @@ mod tests {
             .status_breakdown
             .items
             .iter()
-            .find(|item| item.task_type == jobs::TASK_TRANSLATE_RELEASE_BATCH)
+            .find(|item| item.task_type == jobs::TASK_RELEASE_COMPOSITE_BATCH)
             .expect("translation task item");
         assert_eq!(summary_item.business_counts.partial, 1);
         assert_eq!(summary_item.business_counts.failed, 0);
@@ -18748,7 +19095,7 @@ mod tests {
             "#,
         )
         .bind(today_local.format("%Y-%m-%d").to_string())
-        .bind(jobs::TASK_TRANSLATE_RELEASE_BATCH)
+        .bind(jobs::TASK_RELEASE_COMPOSITE_BATCH)
         .fetch_one(&pool)
         .await
         .expect("load translation rollup counts");
@@ -18814,7 +19161,7 @@ mod tests {
         let translation_item = status_breakdown
             .items
             .iter()
-            .find(|item| item.task_type == jobs::TASK_TRANSLATE_RELEASE_BATCH)
+            .find(|item| item.task_type == jobs::TASK_RELEASE_COMPOSITE_BATCH)
             .expect("translation item should exist");
         assert_eq!(translation_item.total, 1);
         let summary_item = status_breakdown
@@ -20405,6 +20752,75 @@ mod tests {
         let diagnostics = build_task_diagnostics(&task, &events, &[]).expect("diagnostics");
         assert_eq!(diagnostics.business_outcome.code, "unknown");
         assert_eq!(diagnostics.business_outcome.label, "处理中");
+    }
+
+    #[test]
+    fn task_diagnostics_release_composite_batch_surfaces_slot_breakdown() {
+        let task = test_task_detail_item(
+            jobs::TASK_RELEASE_COMPOSITE_BATCH,
+            jobs::STATUS_SUCCEEDED,
+            r#"{"user_id":1,"release_ids":[291058027,291042015]}"#,
+            Some(
+                r#"{
+                  "total":2,
+                  "translation":{"ready":2,"missing":0,"disabled":0,"error":0},
+                  "smart":{"ready":1,"missing":1,"disabled":0,"error":0},
+                  "diff_fallback_count":1,
+                  "items":[
+                    {
+                      "id":"291058027",
+                      "translation_status":"ready",
+                      "translation_error":null,
+                      "smart_status":"ready",
+                      "smart_error":null,
+                      "diff_fallback_used":false
+                    },
+                    {
+                      "id":"291042015",
+                      "translation_status":"ready",
+                      "translation_error":null,
+                      "smart_status":"missing",
+                      "smart_error":"no_valuable_version_info",
+                      "diff_fallback_used":true
+                    }
+                  ]
+                }"#,
+            ),
+            None,
+        );
+        let events = vec![
+            test_task_event(
+                1,
+                "task.progress",
+                r#"{"stage":"collect","total_releases":2}"#,
+            ),
+            test_task_event(
+                2,
+                "task.progress",
+                r#"{"stage":"release","release_id":"291058027","item_status":"ready"}"#,
+            ),
+            test_task_event(
+                3,
+                "task.progress",
+                r#"{"stage":"release","release_id":"291042015","item_status":"missing","item_error":"no_valuable_version_info"}"#,
+            ),
+        ];
+
+        let diagnostics = build_task_diagnostics(&task, &events, &[]).expect("diagnostics");
+        assert_eq!(diagnostics.business_outcome.code, "partial");
+        assert!(diagnostics.translate_release_batch.is_none());
+        let composite = diagnostics
+            .release_composite_batch
+            .expect("release composite diagnostics");
+        assert_eq!(composite.release_total, 2);
+        assert_eq!(composite.translation.ready, 2);
+        assert_eq!(composite.smart.missing, 1);
+        assert_eq!(composite.diff_fallback_count, 1);
+        assert_eq!(composite.progress.processed, 2);
+        assert_eq!(composite.items.len(), 2);
+        assert_eq!(composite.items[1].release_id, "291042015");
+        assert_eq!(composite.items[1].smart_status, "missing");
+        assert!(composite.items[1].diff_fallback_used);
     }
 
     #[test]

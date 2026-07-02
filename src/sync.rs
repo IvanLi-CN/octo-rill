@@ -1448,8 +1448,8 @@ pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleas
     if let Err(err) = enqueue_background_release_translation_task(
         state,
         user_id,
-        &new_release_ids,
-        "sync.releases.auto_translate",
+        &smart_preheat_release_ids,
+        "sync.releases.auto_composite",
         None,
         Some(user_id),
     )
@@ -1459,22 +1459,6 @@ pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleas
             ?err,
             user_id,
             "sync.releases: enqueue background translation failed"
-        );
-    }
-    if let Err(err) = enqueue_background_release_smart_task(
-        state,
-        user_id,
-        &smart_preheat_release_ids,
-        "sync.releases.auto_smart",
-        None,
-        Some(user_id),
-    )
-    .await
-    {
-        tracing::warn!(
-            ?err,
-            user_id,
-            "sync.releases: enqueue background smart summary failed"
         );
     }
 
@@ -3307,7 +3291,7 @@ async fn enqueue_background_release_translation_task(
     let task = jobs::enqueue_task(
         state,
         jobs::NewTask {
-            task_type: jobs::TASK_TRANSLATE_RELEASE_BATCH.to_owned(),
+            task_type: jobs::TASK_RELEASE_COMPOSITE_BATCH.to_owned(),
             payload: json!({
                 "user_id": user_id,
                 "release_ids": release_ids,
@@ -3322,6 +3306,7 @@ async fn enqueue_background_release_translation_task(
     Ok(Some(task.task_id))
 }
 
+#[allow(dead_code)]
 async fn enqueue_background_release_smart_task(
     state: &AppState,
     user_id: &str,
@@ -3330,26 +3315,15 @@ async fn enqueue_background_release_smart_task(
     parent_task_id: Option<&str>,
     requested_by: Option<&str>,
 ) -> Result<Option<String>> {
-    if release_ids.is_empty() || state.config.ai.is_none() {
-        return Ok(None);
-    }
-
-    let task = jobs::enqueue_task(
+    let _ = (
         state,
-        jobs::NewTask {
-            task_type: jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH.to_owned(),
-            payload: json!({
-                "user_id": user_id,
-                "release_ids": release_ids,
-            }),
-            source: source.to_owned(),
-            requested_by: requested_by.map(str::to_owned),
-            parent_task_id: parent_task_id.map(str::to_owned),
-        },
-    )
-    .await
-    .context("failed to enqueue background release smart task")?;
-    Ok(Some(task.task_id))
+        user_id,
+        release_ids,
+        source,
+        parent_task_id,
+        requested_by,
+    );
+    Ok(None)
 }
 
 async fn attach_and_wait_for_user_release_demand(
@@ -4174,12 +4148,12 @@ pub async fn sync_subscriptions(
                     Vec::new()
                 }),
             );
-            if !user_release_ids.is_empty()
+            if !smart_preheat_release_ids.is_empty()
                 && let Err(err) = enqueue_background_release_translation_task(
                     state,
                     user.user_id.as_str(),
-                    &user_release_ids,
-                    "sync.subscriptions.auto_translate",
+                    &smart_preheat_release_ids,
+                    "sync.subscriptions.auto_composite",
                     Some(task_id),
                     None,
                 )
@@ -4189,23 +4163,6 @@ pub async fn sync_subscriptions(
                     ?err,
                     user_id = user.user_id.as_str(),
                     "sync.subscriptions: enqueue background translation failed"
-                );
-            }
-            if !smart_preheat_release_ids.is_empty()
-                && let Err(err) = enqueue_background_release_smart_task(
-                    state,
-                    user.user_id.as_str(),
-                    &smart_preheat_release_ids,
-                    "sync.subscriptions.auto_smart",
-                    Some(task_id),
-                    None,
-                )
-                .await
-            {
-                tracing::warn!(
-                    ?err,
-                    user_id = user.user_id.as_str(),
-                    "sync.subscriptions: enqueue background smart summary failed"
                 );
             }
         }
@@ -15448,7 +15405,7 @@ mod tests {
         )
         .await
         .expect("enqueue translation preheat");
-        super::enqueue_background_release_smart_task(
+        let smart_task = super::enqueue_background_release_smart_task(
             state.as_ref(),
             user_id.as_str(),
             &[101, 102],
@@ -15457,7 +15414,8 @@ mod tests {
             Some(user_id.as_str()),
         )
         .await
-        .expect("enqueue smart preheat");
+        .expect("smart shim should succeed");
+        assert!(smart_task.is_none());
 
         let rows = sqlx::query_as::<_, (String, String, String, Option<String>)>(
             r#"
@@ -15470,23 +15428,17 @@ mod tests {
         .await
         .expect("load enqueued tasks");
 
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0, jobs::TASK_TRANSLATE_RELEASE_BATCH);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, jobs::TASK_RELEASE_COMPOSITE_BATCH);
         assert_eq!(rows[0].1, "sync.releases.auto_translate");
         assert_eq!(rows[0].3.as_deref(), Some(user_id.as_str()));
-        assert_eq!(rows[1].0, jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH);
-        assert_eq!(rows[1].1, "sync.releases.auto_smart");
-        assert_eq!(rows[1].3.as_deref(), Some(user_id.as_str()));
         let expected_payload = serde_json::json!({
             "user_id": user_id.as_str(),
             "release_ids": [101, 102],
         });
         let first_payload: serde_json::Value =
             serde_json::from_str(&rows[0].2).expect("parse translation payload");
-        let second_payload: serde_json::Value =
-            serde_json::from_str(&rows[1].2).expect("parse smart payload");
         assert_eq!(first_payload, expected_payload);
-        assert_eq!(second_payload, expected_payload);
     }
 
     #[test]

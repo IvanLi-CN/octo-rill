@@ -1027,6 +1027,8 @@ function taskTypeLabel(taskType: string) {
 			return "同步通知";
 		case "translate.release":
 			return "翻译 Release";
+		case "release.composite.batch":
+			return "批量翻译/润色 Release";
 		case "translate.release.batch":
 			return "批量翻译 Release";
 		case "summarize.release.smart.batch":

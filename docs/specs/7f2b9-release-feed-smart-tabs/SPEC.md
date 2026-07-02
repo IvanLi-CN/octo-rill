@@ -16,7 +16,7 @@
 - 新 release 在 sync 流程完成后，`润色` 需像 `翻译` 一样走后台预生成，优先命中缓存而不是等首次可见时才补算。
 - `润色` 内容专门服务于“帮助快速理解版本变化”，输出纯要点列表，不做长段落直译。
 - 润色工作流遵循：`正文有价值 -> 直接生成`，`正文无价值 -> 按需拉 compare diff`，`仍无价值 -> 折叠为仅版本号卡片`。
-- 新增独立的 `release_smart` 调度/缓存语义，与现有 release 翻译缓存隔离。
+- 新增独立的 `release_smart` 读模型/缓存语义，但 release 正文首跳执行模型收口到共享的 `release_composite`。
 - 卡片内 lane selector 改为 icon-only，但保留 tooltip 与可访问标签。
 - 当 `翻译` / `润色` 正在生成时，卡片正文继续显示原文；加载反馈仅通过对应 option 的呼吸态表达，不再把正文区替换成空白加载面板。
 - Release detail 弹窗补齐 `原文 / 翻译 / 润色` 三态阅读模式，打开时默认选中 `润色`，并复用 `release_smart/feed_card` 缓存与请求链路。
@@ -62,10 +62,15 @@
 
 ### 翻译/生成请求语义
 
-- 新 kind：`release_smart`
+- 新主 kind：`release_composite`
+- 兼容 kind：`release_summary`、`release_smart`
 - 固定 variant：`feed_card`
-- entity_type：`release_smart`
-- target slots：`title_zh` + `body_md`
+- `release_composite` 一次正文调用内同时产出两个结果槽位：
+  - `translation.title_zh` + `translation.body_md`
+  - `smart.title_zh` + `smart.body_md`
+- 落库仍分开写入：
+  - translation -> `entity_type=release_detail`
+  - smart -> `entity_type=release_smart`
 
 ### `/api/releases/{id}/detail` release detail 扩展
 
@@ -88,22 +93,33 @@
 ### 1. Body-first
 
 - 输入：repo、release 标题/标签、规范化后的 release body。
-- LLM 输出固定 JSON：
+- `release_composite` 正文首跳的 LLM 输出固定 JSON，并为每条 release 同时返回翻译与 smart 判定：
 
 ```json
 {
-  "valuable": true,
-  "title_zh": "...",
-  "summary_bullets": ["...", "..."]
+  "items": [
+    {
+      "release_id": 123,
+      "translation": {
+        "title_zh": "...",
+        "body_md": "..."
+      },
+      "smart": {
+        "valuable": true,
+        "title_zh": "...",
+        "summary_bullets": ["...", "..."]
+      }
+    }
+  ]
 }
 ```
 
-- 目标：判断正文是否足以支撑“快速理解版本变化”的中文要点卡片。
+- 目标：在同一次正文调用中同时得到可展示的中文翻译与“是否足以支撑版本变化要点卡片”的 smart 判定。
 - 若正文只有模板、链接、空话或无实际改动说明，则返回 `valuable=false`。
 
 ### 2. Diff fallback
 
-- 仅在正文被判定为 `valuable=false` 时触发。
+- 仅在 `release_composite` 的 smart 槽位被判定为 `valuable=false` 时触发。
 - compare base 取同仓库上一条 release tag；若无上一条 release，则直接结束为 `insufficient`。
 - 程序生成精简 diff payload，包含：
   - compare range
@@ -113,6 +129,14 @@
 - 默认跳过 binary / lockfile / minified / generated 噪声文件。
 - GitHub OAuth 登录默认申请 `public_repo`；对于历史旧 token 触发的 public compare scope 错误，后端需先回退匿名 compare 再决定终态，避免把可恢复的公共仓库错误直接暴露成失败卡片。
 - 若 GitHub compare 拉取失败（鉴权 / 限流 / 网络 / 404），smart lane 进入 `error`，允许重试。
+
+### Composite 状态机
+
+- `translation` 与 `smart` 共享一次正文 LLM 请求，但终态独立：
+  - `translation`: `ready | disabled | missing | error`
+  - `smart`: `ready | disabled | insufficient | error`
+- `translation` 成功时不得被 smart 的 `missing/error` 拖住。
+- smart 命中 `insufficient` 时继续保持既有折叠语义，不影响 translation 结果可读性。
 
 ### 3. Collapse
 
@@ -237,6 +261,10 @@
 - Given 同一 release 同时存在 translated 与 smart 结果
   When feed 刷新
   Then 两者互不覆盖，分别保持独立缓存与状态。
+
+- Given 同一批可见 release 需要同时补翻译和润色
+  When 后端触发正文首跳
+  Then translation 与 smart 必须共用一套 `release_composite` 正文 LLM 调用，而不是再分别发起两套 release 正文请求。
 
 - Given Release detail 同时存在 translated 与 smart 结果
   When 用户打开 Release 详情弹窗
