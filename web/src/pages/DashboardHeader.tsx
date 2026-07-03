@@ -1,6 +1,5 @@
 import type * as React from "react";
 import {
-	ArrowUpRight,
 	Eye,
 	LogOut,
 	RefreshCcw,
@@ -149,7 +148,7 @@ function DashboardUserInfoCard(props: {
 	isAdmin: boolean;
 	aiDisabledHint: boolean;
 	logoutHref: string;
-	showMobileAdminLink: boolean;
+	showAdminLink: boolean;
 	showMineEntry: boolean;
 	mineHref: string;
 	mineLabel: string;
@@ -162,7 +161,7 @@ function DashboardUserInfoCard(props: {
 		isAdmin,
 		aiDisabledHint,
 		logoutHref,
-		showMobileAdminLink,
+		showAdminLink,
 		showMineEntry,
 		mineHref,
 		mineLabel,
@@ -225,21 +224,6 @@ function DashboardUserInfoCard(props: {
 				</p>
 			) : null}
 
-			{showMobileAdminLink ? (
-				<div className="mt-4 border-t border-border/70 pt-3 sm:hidden">
-					<Button asChild variant="ghost" className="w-full justify-start px-2">
-						<InternalLink
-							href="/admin"
-							to="/admin"
-							data-dashboard-mobile-admin-entry="true"
-						>
-							<ArrowUpRight className="size-4" />
-							管理员面板
-						</InternalLink>
-					</Button>
-				</div>
-			) : null}
-
 			<div className="mt-4 border-t border-border/70 pt-3">
 				{showMineEntry ? (
 					<Button
@@ -267,6 +251,22 @@ function DashboardUserInfoCard(props: {
 						设置
 					</InternalLink>
 				</Button>
+				{showAdminLink ? (
+					<Button
+						asChild
+						variant="ghost"
+						className="mt-2 w-full justify-start px-2"
+					>
+						<InternalLink
+							href="/admin"
+							to="/admin"
+							data-dashboard-admin-entry="true"
+						>
+							<ShieldCheck className="size-4" />
+							管理员面板
+						</InternalLink>
+					</Button>
+				) : null}
 			</div>
 
 			<div className="mt-2 border-t border-border/70 pt-3">
@@ -294,7 +294,7 @@ function DashboardUserMenu(props: {
 	aiDisabledHint: boolean;
 	logoutHref: string;
 	headerProgress: number;
-	showMobileAdminLink: boolean;
+	showAdminLink: boolean;
 	showMineEntry: boolean;
 	mineHref: string;
 	mineLabel: string;
@@ -308,7 +308,7 @@ function DashboardUserMenu(props: {
 		aiDisabledHint,
 		logoutHref,
 		headerProgress,
-		showMobileAdminLink,
+		showAdminLink,
 		showMineEntry,
 		mineHref,
 		mineLabel,
@@ -398,7 +398,7 @@ function DashboardUserMenu(props: {
 						isAdmin={isAdmin}
 						aiDisabledHint={aiDisabledHint}
 						logoutHref={logoutHref}
-						showMobileAdminLink={showMobileAdminLink}
+						showAdminLink={showAdminLink}
 						showMineEntry={showMineEntry}
 						mineHref={mineHref}
 						mineLabel={mineLabel}
@@ -704,7 +704,7 @@ export function DashboardHeader({
 						aiDisabledHint={aiDisabledHint}
 						logoutHref={logoutHref}
 						headerProgress={mobileHeaderProgress}
-						showMobileAdminLink={isAdmin}
+						showAdminLink={isAdmin}
 						showMineEntry={showMineEntry}
 						mineHref={mineHref}
 						mineLabel={mineLabel}

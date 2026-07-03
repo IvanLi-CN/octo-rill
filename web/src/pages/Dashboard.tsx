@@ -2799,18 +2799,6 @@ export function Dashboard(props: {
 									{busy}…
 								</span>
 							) : null}
-							{isAdmin ? (
-								<Button
-									asChild
-									variant="outline"
-									size="sm"
-									className="h-8 rounded-lg border-border/60 bg-muted/35 px-3 font-mono text-xs text-foreground/75 shadow-none hover:bg-muted/60 hover:text-foreground"
-								>
-									<InternalLink href="/admin" to="/admin">
-										管理员面板
-									</InternalLink>
-								</Button>
-							) : null}
 						</div>
 					</div>
 

@@ -476,29 +476,16 @@ function expectDashboardLaneSelectorPolish(controlBand: HTMLElement | null) {
 	);
 	const adminEntry = controlBand.querySelector<HTMLElement>("a[href='/admin']");
 	expect(laneSelector).not.toBeNull();
-	expect(adminEntry).not.toBeNull();
-	if (!laneSelector || !adminEntry) {
-		throw new Error("Expected lane selector and admin entry in control band");
+	expect(adminEntry).toBeNull();
+	if (!laneSelector) {
+		throw new Error("Expected lane selector in control band");
 	}
 
 	const selectorRect = laneSelector.getBoundingClientRect();
-	const adminRect = adminEntry.getBoundingClientRect();
-	expect(Math.abs(selectorRect.height - adminRect.height)).toBeLessThanOrEqual(
-		1,
-	);
-	expect(
-		Math.abs(
-			selectorRect.top +
-				selectorRect.height / 2 -
-				(adminRect.top + adminRect.height / 2),
-		),
-	).toBeLessThanOrEqual(1);
 	expect(Math.round(selectorRect.height)).toBe(32);
 
 	const selectorStyles = window.getComputedStyle(laneSelector);
-	const adminStyles = window.getComputedStyle(adminEntry);
 	expect(parseFloat(selectorStyles.borderRadius)).toBeLessThanOrEqual(14);
-	expect(parseFloat(adminStyles.borderRadius)).toBeLessThanOrEqual(14);
 	expect(selectorStyles.boxShadow).toBe("none");
 
 	const activeLane = laneSelector.querySelector<HTMLElement>(
@@ -3313,16 +3300,6 @@ function DashboardPreview(props: {
 									className="hidden sm:inline-flex"
 								/>
 							) : null}
-							<Button
-								asChild
-								variant="outline"
-								size="sm"
-								className="h-8 rounded-lg border-border/60 bg-muted/35 px-3 font-mono text-xs text-foreground/75 shadow-none hover:bg-muted/60 hover:text-foreground"
-							>
-								<InternalLink href="/admin" to="/admin">
-									管理员面板
-								</InternalLink>
-							</Button>
 						</div>
 					</div>
 
