@@ -11,7 +11,7 @@
 ### Goals
 
 - 将 Dashboard 头部操作收敛为 `同步` 与 `Logout`，不再保留单独的 `Refresh`。
-- 主同步按钮使用左侧刷新 icon，并且只在全量同步执行中旋转；同步中按钮保持可点击，悬浮提示展示阶段进度与已完成工作量。
+- 主同步按钮使用左侧刷新 icon，并且只在全量同步执行中旋转；同步中按钮保持可点击，进度气泡展示阶段进度与已完成工作量，并可由用户主动收起。
 - 保证客户端全量同步顺序固定为 `starred -> releases -> notifications -> refreshAll`。
 - 更新 Storybook 审阅入口，并保留一张默认态视觉证据。
 
@@ -48,6 +48,7 @@
 - `同步` 按钮左侧必须有刷新系 icon，并在全量同步执行中旋转。
 - 全量同步进行中，顶部 `同步` 按钮必须保持可点击；重复点击不得新建第二个同步任务，只提示后台同步正在进行。
 - 全量同步进行中，悬浮在顶部 `同步` 按钮上必须显示阶段进度，进度来源只能使用现有 `task.progress` SSE 事件。
+- 全量同步进行中，进度气泡打开后点击页面空白处或按 `Escape` 必须关闭气泡；关闭只影响当前同步中的本地显示状态，不取消后台任务，下一次全量同步开始时应重新自动展示。
 - `Sync starred`、`Sync releases`、`Sync inbox` 的顶部按钮必须移除。
 - Feed 空态仅保留一个页面内 `同步` CTA，不再展示拆分同步按钮。
 - Inbox 空态与 release reaction `sync_required` 场景不得再渲染局部同步按钮。
@@ -67,7 +68,8 @@
 ### Core flows
 
 - 用户在 Dashboard 顶部点击 `同步`，页面进入 busy 状态；按钮保持可点击并展示旋转 icon。
-- 同步中悬浮在按钮上时，tooltip 展示“正在后台同步你的 GitHub 数据”、当前阶段、`0/4` 到 `4/4` 阶段进度，以及 SSE payload 中已有的仓库、Release、社交事件或 Inbox 通知计数。
+- 同步中 tooltip 展示“正在后台同步你的 GitHub 数据”、当前阶段、`0/4` 到 `4/4` 阶段进度，以及 SSE payload 中已有的仓库、Release、社交事件或 Inbox 通知计数。
+- 同步中 tooltip 支持 outside-click dismissal：点击同步按钮与气泡自身不关闭，点击页面其它空白区域或按 `Escape` 关闭当前气泡；当 `syncingAll` 回到 false 后清除本地 dismissal 状态，保证后续同步仍能重新展示进度提示。
 - 同步中再次点击 `同步` 时，前端只发出轻量 toast，不再次调用 `/api/sync/all?return_mode=task_id`。
 - 同步流程依次请求 starred、releases、notifications 三个端点；任一步失败时沿用既有 `run/busy` 错误处理，不继续后续请求。
 - Feed 空态仍可提供一个页面内 `同步` CTA，但其行为与顶部主按钮完全一致。
@@ -92,6 +94,10 @@
 - Given 用户触发全量同步
   When `同步` 流程进行中
   Then 顶部 `同步` 按钮可点击，左侧 icon 旋转，悬浮 tooltip 展示阶段进度与已完成工作量，且重复点击不会新建第二个同步任务。
+
+- Given 全量同步进度气泡已经显示
+  When 用户点击页面空白处或按 `Escape`
+  Then 气泡关闭，后台同步继续运行，且下一次全量同步开始时气泡可再次自动显示。
 
 - Given Feed 为空
   When 空态卡片显示
