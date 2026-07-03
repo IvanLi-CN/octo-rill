@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Settings2 } from "lucide-react";
+import { ChevronDown, Settings2 } from "lucide-react";
 
 import {
 	ADMIN_JOBS_SUBSCRIPTIONS_PATH,
@@ -26,6 +26,19 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useListSurfaceState } from "@/hooks/useListSurfaceState";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+	Popover,
+	PopoverContent,
+	PopoverTrigger,
+} from "@/components/ui/popover";
+import {
+	Select,
+	SelectContent,
+	SelectItem,
+	SelectTrigger,
+	SelectValue,
+} from "@/components/ui/select";
 import { InternalLink } from "@/lib/internalNavigation";
 import { useOptionalTheme } from "@/theme/ThemeProvider";
 
@@ -56,6 +69,10 @@ const GRID_LEGEND_SKELETON_IDS = [
 	"missing",
 ] as const;
 const REPO_ROW_SKELETON_IDS = ["one", "two", "three", "four"] as const;
+const LIST_FILTER_DEBOUNCE_MS = 300;
+const URGENCY_RANGE_MIN = 0;
+const URGENCY_RANGE_MAX = 4;
+const URGENCY_RANGE_STEP = 0.1;
 
 const AGE_BUCKET_LABELS = {
 	fresh: "4 小时内",
@@ -66,6 +83,68 @@ const AGE_BUCKET_LABELS = {
 } as const;
 
 type AgeBucketKey = keyof typeof AGE_BUCKET_LABELS;
+type AgingFilter = "all" | "stale" | "missing";
+const AGING_FILTER_LABELS: Record<AgingFilter, string> = {
+	all: "全部",
+	stale: "仅超 24 小时",
+	missing: "仅未成功",
+};
+type RepoListFilters = {
+	query: string;
+	aging: AgingFilter;
+	targetWindows: number[];
+	urgencyMin: number;
+	urgencyMax: number;
+};
+
+function normalizeTargetWindows(values: number[]) {
+	return Array.from(
+		new Set(values.filter((value) => Number.isInteger(value) && value > 0)),
+	).sort((a, b) => a - b);
+}
+
+function filtersEqual(left: RepoListFilters, right: RepoListFilters) {
+	return (
+		left.query.trim() === right.query.trim() &&
+		left.aging === right.aging &&
+		left.urgencyMin === right.urgencyMin &&
+		left.urgencyMax === right.urgencyMax &&
+		left.targetWindows.length === right.targetWindows.length &&
+		left.targetWindows.every(
+			(value, index) => value === right.targetWindows[index],
+		)
+	);
+}
+
+const DEFAULT_LIST_FILTERS: RepoListFilters = {
+	query: "",
+	aging: "all",
+	targetWindows: [],
+	urgencyMin: URGENCY_RANGE_MIN,
+	urgencyMax: URGENCY_RANGE_MAX,
+};
+
+function buildRepoListParams(filters: RepoListFilters, page: number) {
+	const params = new URLSearchParams();
+	params.set("page", String(page));
+	params.set("page_size", String(PAGE_SIZE));
+	if (filters.query.trim()) {
+		params.set("query", filters.query.trim());
+	}
+	if (filters.aging !== "all") {
+		params.set("aging", filters.aging);
+	}
+	if (filters.targetWindows.length > 0) {
+		params.set("target_windows", filters.targetWindows.join(","));
+	}
+	if (filters.urgencyMin > URGENCY_RANGE_MIN) {
+		params.set("urgency_min", filters.urgencyMin.toFixed(1));
+	}
+	if (filters.urgencyMax < URGENCY_RANGE_MAX) {
+		params.set("urgency_max", filters.urgencyMax.toFixed(1));
+	}
+	return params;
+}
 
 function formatDateTime(value: string | null | undefined) {
 	if (!value) return "-";
@@ -425,6 +504,236 @@ function RepoRow(props: { item: AdminRepoGovernanceListItem }) {
 	);
 }
 
+function TargetWindowFilter(props: {
+	options: AdminRepoGovernanceListResponse["target_window_options"];
+	selected: number[];
+	disabled?: boolean;
+	onChange: (next: number[]) => void;
+}) {
+	const { options, selected, disabled = false, onChange } = props;
+	const selectedSet = useMemo(() => new Set(selected), [selected]);
+	const selectedLabel =
+		selected.length === 0
+			? "目标窗口"
+			: selected.length <= 2
+				? selected.map((window) => `W${window}`).join("、")
+				: `目标窗口 ${selected.length}`;
+
+	return (
+		<Popover>
+			<PopoverTrigger asChild>
+				<Button
+					type="button"
+					variant="outline"
+					size="sm"
+					disabled={disabled || options.length === 0}
+					className="bg-background"
+					aria-label={`目标窗口筛选，当前${
+						selected.length === 0 ? "不限" : selectedLabel
+					}`}
+				>
+					{selectedLabel}
+					<ChevronDown className="size-4 opacity-50" aria-hidden="true" />
+				</Button>
+			</PopoverTrigger>
+			<PopoverContent align="end" className="w-[min(calc(100vw-2rem),18rem)]">
+				<div className="space-y-3">
+					<div className="flex items-start justify-between gap-3">
+						<div>
+							<p className="font-medium text-sm text-foreground">目标窗口</p>
+							<p className="mt-1 text-muted-foreground text-xs">
+								空选表示不过滤。
+							</p>
+						</div>
+						<Button
+							type="button"
+							variant="ghost"
+							size="sm"
+							disabled={selected.length === 0}
+							onClick={() => onChange([])}
+						>
+							清空
+						</Button>
+					</div>
+					<div className="grid gap-2">
+						{options.map((option) => {
+							const checked = selectedSet.has(option.target_window);
+							return (
+								<label
+									key={option.target_window}
+									className="flex cursor-pointer items-center justify-between gap-3 rounded-md border border-border/70 px-3 py-2 text-sm transition-colors hover:bg-muted/55 has-[:checked]:border-primary/45 has-[:checked]:bg-primary/8"
+								>
+									<span className="inline-flex items-center gap-2">
+										<input
+											type="checkbox"
+											className="size-4 accent-primary"
+											checked={checked}
+											onChange={(event) => {
+												const next = event.target.checked
+													? [...selected, option.target_window]
+													: selected.filter(
+															(window) => window !== option.target_window,
+														);
+												onChange(normalizeTargetWindows(next));
+											}}
+										/>
+										<span className="font-medium">W{option.target_window}</span>
+									</span>
+									<span className="text-muted-foreground text-xs">
+										{option.repo_count} 个
+									</span>
+								</label>
+							);
+						})}
+					</div>
+				</div>
+			</PopoverContent>
+		</Popover>
+	);
+}
+
+function UrgencyRangeFilter(props: {
+	min: number;
+	max: number;
+	disabled?: boolean;
+	onChange: (next: { min: number; max: number }) => void;
+}) {
+	const { min, max, disabled = false, onChange } = props;
+	const hasUrgencyFilter = min > URGENCY_RANGE_MIN || max < URGENCY_RANGE_MAX;
+	const minPercent =
+		((min - URGENCY_RANGE_MIN) / (URGENCY_RANGE_MAX - URGENCY_RANGE_MIN)) * 100;
+	const maxPercent =
+		((max - URGENCY_RANGE_MIN) / (URGENCY_RANGE_MAX - URGENCY_RANGE_MIN)) * 100;
+
+	function updateMin(rawValue: number) {
+		const nextMin = Math.min(rawValue, max);
+		onChange({ min: Number(nextMin.toFixed(1)), max });
+	}
+
+	function updateMax(rawValue: number) {
+		const nextMax = Math.max(rawValue, min);
+		onChange({ min, max: Number(nextMax.toFixed(1)) });
+	}
+
+	return (
+		<Popover>
+			<PopoverTrigger asChild>
+				<Button
+					type="button"
+					variant="outline"
+					size="sm"
+					disabled={disabled}
+					className="bg-background"
+					aria-label={`迫切值范围筛选，当前 ${min.toFixed(1)} 到 ${max.toFixed(1)}`}
+				>
+					迫切值 {min.toFixed(1)}-{max.toFixed(1)}
+					<ChevronDown className="size-4 opacity-50" aria-hidden="true" />
+				</Button>
+			</PopoverTrigger>
+			<PopoverContent align="end" className="w-[min(calc(100vw-2rem),20rem)]">
+				<div className="space-y-4">
+					<div className="flex items-start justify-between gap-3">
+						<div>
+							<p className="font-medium text-sm text-foreground">迫切值范围</p>
+							<p className="mt-1 text-muted-foreground text-xs">
+								拖动后 300ms 自动应用。
+							</p>
+						</div>
+						<Button
+							type="button"
+							variant="ghost"
+							size="sm"
+							disabled={!hasUrgencyFilter}
+							onClick={() =>
+								onChange({ min: URGENCY_RANGE_MIN, max: URGENCY_RANGE_MAX })
+							}
+						>
+							重置
+						</Button>
+					</div>
+					<div className="space-y-3">
+						<div className="flex items-center justify-between gap-3 text-sm">
+							<span className="text-muted-foreground">
+								下限 {min.toFixed(1)}
+							</span>
+							<span className="text-muted-foreground">
+								上限 {max.toFixed(1)}
+							</span>
+						</div>
+						<div className="relative h-8">
+							<div className="absolute top-1/2 right-0 left-0 h-1.5 -translate-y-1/2 rounded-full bg-border" />
+							<div
+								className="absolute top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-primary"
+								style={{
+									left: `${minPercent}%`,
+									right: `${100 - maxPercent}%`,
+								}}
+							/>
+							<Label htmlFor="repo-urgency-min" className="sr-only">
+								迫切值下限
+							</Label>
+							<input
+								id="repo-urgency-min"
+								type="range"
+								min={URGENCY_RANGE_MIN}
+								max={URGENCY_RANGE_MAX}
+								step={URGENCY_RANGE_STEP}
+								value={min}
+								disabled={disabled}
+								onChange={(event) => updateMin(Number(event.target.value))}
+								className="pointer-events-none absolute inset-x-0 top-1/2 z-20 h-8 w-full -translate-y-1/2 appearance-none bg-transparent accent-primary [--thumb-size:1rem] [&::-moz-range-thumb]:pointer-events-auto [&::-moz-range-thumb]:size-[var(--thumb-size)] [&::-moz-range-thumb]:appearance-none [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-card [&::-moz-range-thumb]:bg-primary [&::-moz-range-thumb]:shadow-sm [&::-moz-range-track]:appearance-none [&::-moz-range-track]:bg-transparent [&::-webkit-slider-runnable-track]:appearance-none [&::-webkit-slider-runnable-track]:bg-transparent [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:size-[var(--thumb-size)] [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-card [&::-webkit-slider-thumb]:bg-primary [&::-webkit-slider-thumb]:shadow-sm"
+							/>
+							<Label htmlFor="repo-urgency-max" className="sr-only">
+								迫切值上限
+							</Label>
+							<input
+								id="repo-urgency-max"
+								type="range"
+								min={URGENCY_RANGE_MIN}
+								max={URGENCY_RANGE_MAX}
+								step={URGENCY_RANGE_STEP}
+								value={max}
+								disabled={disabled}
+								onChange={(event) => updateMax(Number(event.target.value))}
+								className="pointer-events-none absolute inset-x-0 top-1/2 z-10 h-8 w-full -translate-y-1/2 appearance-none bg-transparent accent-primary [--thumb-size:1rem] [&::-moz-range-thumb]:pointer-events-auto [&::-moz-range-thumb]:size-[var(--thumb-size)] [&::-moz-range-thumb]:appearance-none [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-card [&::-moz-range-thumb]:bg-primary [&::-moz-range-thumb]:shadow-sm [&::-moz-range-track]:appearance-none [&::-moz-range-track]:bg-transparent [&::-webkit-slider-runnable-track]:appearance-none [&::-webkit-slider-runnable-track]:bg-transparent [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:size-[var(--thumb-size)] [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-card [&::-webkit-slider-thumb]:bg-primary [&::-webkit-slider-thumb]:shadow-sm"
+							/>
+						</div>
+					</div>
+				</div>
+			</PopoverContent>
+		</Popover>
+	);
+}
+
+function AgingFilterSelect(props: {
+	value: AgingFilter;
+	disabled?: boolean;
+	onChange: (next: AgingFilter) => void;
+}) {
+	const { value, disabled = false, onChange } = props;
+
+	return (
+		<Select
+			value={value}
+			disabled={disabled}
+			onValueChange={(next) => onChange(next as AgingFilter)}
+		>
+			<SelectTrigger
+				size="sm"
+				className="bg-background"
+				aria-label={`刷新状态筛选，当前 ${AGING_FILTER_LABELS[value]}`}
+			>
+				<SelectValue />
+			</SelectTrigger>
+			<SelectContent align="end">
+				<SelectItem value="all">{AGING_FILTER_LABELS.all}</SelectItem>
+				<SelectItem value="stale">{AGING_FILTER_LABELS.stale}</SelectItem>
+				<SelectItem value="missing">{AGING_FILTER_LABELS.missing}</SelectItem>
+			</SelectContent>
+		</Select>
+	);
+}
+
 export function AdminRepoGovernance() {
 	const theme = useOptionalTheme();
 	const isDark = theme?.resolvedTheme === "dark";
@@ -437,9 +746,10 @@ export function AdminRepoGovernance() {
 	);
 	const [listLoading, setListLoading] = useState(true);
 	const [listError, setListError] = useState<string | null>(null);
-	const [queryInput, setQueryInput] = useState("");
-	const [query, setQuery] = useState("");
-	const [aging, setAging] = useState<"all" | "stale" | "missing">("all");
+	const [draftFilters, setDraftFilters] =
+		useState<RepoListFilters>(DEFAULT_LIST_FILTERS);
+	const [appliedFilters, setAppliedFilters] =
+		useState<RepoListFilters>(DEFAULT_LIST_FILTERS);
 	const [page, setPage] = useState(1);
 
 	const loadOverview = useCallback(async () => {
@@ -462,11 +772,7 @@ export function AdminRepoGovernance() {
 			}
 			setListError(null);
 			try {
-				const params = new URLSearchParams();
-				params.set("page", String(page));
-				params.set("page_size", String(PAGE_SIZE));
-				if (query.trim()) params.set("query", query.trim());
-				if (aging !== "all") params.set("aging", aging);
+				const params = buildRepoListParams(appliedFilters, page);
 				const listRes = await apiGetAdminRepoGovernanceList(params);
 				setList(listRes);
 			} catch (err) {
@@ -475,7 +781,7 @@ export function AdminRepoGovernance() {
 				setListLoading(false);
 			}
 		},
-		[aging, list, page, query],
+		[appliedFilters, list, page],
 	);
 
 	useEffect(() => {
@@ -508,11 +814,7 @@ export function AdminRepoGovernance() {
 
 		void (async () => {
 			try {
-				const params = new URLSearchParams();
-				params.set("page", String(page));
-				params.set("page_size", String(PAGE_SIZE));
-				if (query.trim()) params.set("query", query.trim());
-				if (aging !== "all") params.set("aging", aging);
+				const params = buildRepoListParams(appliedFilters, page);
 				const listRes = await apiGetAdminRepoGovernanceList(params);
 				if (cancelled) return;
 				setList(listRes);
@@ -527,7 +829,23 @@ export function AdminRepoGovernance() {
 		return () => {
 			cancelled = true;
 		};
-	}, [aging, list, page, query]);
+	}, [appliedFilters, list, page]);
+
+	useEffect(() => {
+		if (filtersEqual(draftFilters, appliedFilters)) return;
+		const timeout = window.setTimeout(() => {
+			setPage(1);
+			setAppliedFilters({
+				...draftFilters,
+				query: draftFilters.query.trim(),
+				targetWindows: normalizeTargetWindows(draftFilters.targetWindows),
+			});
+		}, LIST_FILTER_DEBOUNCE_MS);
+
+		return () => {
+			window.clearTimeout(timeout);
+		};
+	}, [appliedFilters, draftFilters]);
 
 	const totalPages = Math.max(1, Math.ceil((list?.total ?? 0) / PAGE_SIZE));
 	const gridSummary = useMemo(() => {
@@ -567,9 +885,15 @@ export function AdminRepoGovernance() {
 		};
 	}, [isDark, overview?.grid_cells]);
 
-	function onApplyFilters() {
+	function applyFiltersNow() {
+		const nextFilters = {
+			...draftFilters,
+			query: draftFilters.query.trim(),
+			targetWindows: normalizeTargetWindows(draftFilters.targetWindows),
+		};
 		setPage(1);
-		setQuery(queryInput.trim());
+		setDraftFilters(nextFilters);
+		setAppliedFilters(nextFilters);
 	}
 
 	function onOpenBudgetSettings() {
@@ -744,51 +1068,50 @@ export function AdminRepoGovernance() {
 				<CardContent className="space-y-4">
 					<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
 						<Input
-							value={queryInput}
-							onChange={(event) => setQueryInput(event.target.value)}
+							value={draftFilters.query}
+							onChange={(event) =>
+								setDraftFilters((current) => ({
+									...current,
+									query: event.target.value,
+								}))
+							}
 							onKeyDown={(event) => {
-								if (event.key === "Enter") onApplyFilters();
+								if (event.key === "Enter") applyFiltersNow();
 							}}
 							placeholder="搜索仓库全名"
 							className="sm:max-w-sm"
 						/>
 						<div className="flex flex-wrap items-center gap-2">
-							<Button
-								type="button"
-								variant={aging === "all" ? "default" : "outline"}
-								size="sm"
-								onClick={() => {
-									setPage(1);
-									setAging("all");
-								}}
-							>
-								全部
-							</Button>
-							<Button
-								type="button"
-								variant={aging === "stale" ? "default" : "outline"}
-								size="sm"
-								onClick={() => {
-									setPage(1);
-									setAging("stale");
-								}}
-							>
-								仅超 24 小时
-							</Button>
-							<Button
-								type="button"
-								variant={aging === "missing" ? "default" : "outline"}
-								size="sm"
-								onClick={() => {
-									setPage(1);
-									setAging("missing");
-								}}
-							>
-								仅未成功
-							</Button>
-							<Button type="button" variant="outline" onClick={onApplyFilters}>
-								筛选
-							</Button>
+							<AgingFilterSelect
+								value={draftFilters.aging}
+								disabled={listLoading && !list}
+								onChange={(aging) =>
+									setDraftFilters((current) => ({ ...current, aging }))
+								}
+							/>
+							<TargetWindowFilter
+								options={list?.target_window_options ?? []}
+								selected={draftFilters.targetWindows}
+								disabled={listLoading && !list}
+								onChange={(targetWindows) =>
+									setDraftFilters((current) => ({
+										...current,
+										targetWindows,
+									}))
+								}
+							/>
+							<UrgencyRangeFilter
+								min={draftFilters.urgencyMin}
+								max={draftFilters.urgencyMax}
+								disabled={listLoading && !list}
+								onChange={(range) =>
+									setDraftFilters((current) => ({
+										...current,
+										urgencyMin: range.min,
+										urgencyMax: range.max,
+									}))
+								}
+							/>
 						</div>
 					</div>
 					<ListSurfaceShell
@@ -833,7 +1156,7 @@ export function AdminRepoGovernance() {
 						) : listSurface.state === "empty" ? (
 							<ListEmptyState
 								title="没有匹配的仓库"
-								description="调整关键词或老化筛选后再试一次；仓库明细会按照当前治理优先级返回。"
+								description="调整关键词或筛选条件后再试一次；仓库明细会按照当前治理优先级返回。"
 							/>
 						) : (
 							<div className="grid gap-3 lg:grid-cols-2">
