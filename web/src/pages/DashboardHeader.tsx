@@ -452,6 +452,45 @@ export function DashboardHeader({
 	const shouldRenderMobileControlBand = Boolean(
 		mobileControlBand && mobileChromeEnabled && isMobileViewport,
 	);
+	const syncTriggerRef = useRef<HTMLButtonElement | null>(null);
+	const [syncTooltipDismissed, setSyncTooltipDismissed] = useState(false);
+	const showSyncTooltip = syncingAll && !syncTooltipDismissed;
+
+	useEffect(() => {
+		if (!syncingAll) {
+			setSyncTooltipDismissed(false);
+		}
+	}, [syncingAll]);
+
+	useEffect(() => {
+		if (!showSyncTooltip) return;
+
+		const handlePointerDown = (event: PointerEvent) => {
+			const target = event.target;
+			if (!(target instanceof Node)) return;
+			if (syncTriggerRef.current?.contains(target)) return;
+			if (
+				target instanceof Element &&
+				target.closest("[data-dashboard-sync-tooltip-content]")
+			) {
+				return;
+			}
+			setSyncTooltipDismissed(true);
+		};
+
+		const handleKeyDown = (event: KeyboardEvent) => {
+			if (event.key === "Escape") {
+				setSyncTooltipDismissed(true);
+			}
+		};
+
+		window.addEventListener("pointerdown", handlePointerDown, true);
+		window.addEventListener("keydown", handleKeyDown);
+		return () => {
+			window.removeEventListener("pointerdown", handlePointerDown, true);
+			window.removeEventListener("keydown", handleKeyDown);
+		};
+	}, [showSyncTooltip]);
 
 	return (
 		<div
@@ -615,9 +654,10 @@ export function DashboardHeader({
 							)}
 						/>
 					</div>
-					<Tooltip open={syncingAll}>
+					<Tooltip open={showSyncTooltip}>
 						<TooltipTrigger asChild>
 							<Button
+								ref={syncTriggerRef}
 								disabled={busy && !syncingAll}
 								onClick={onSyncAll}
 								size={hideSubtitle ? "sm" : "default"}
@@ -644,8 +684,13 @@ export function DashboardHeader({
 								同步
 							</Button>
 						</TooltipTrigger>
-						{syncingAll ? (
-							<TooltipContent side="bottom" align="center" sideOffset={8}>
+						{showSyncTooltip ? (
+							<TooltipContent
+								side="bottom"
+								align="center"
+								sideOffset={8}
+								data-dashboard-sync-tooltip-content
+							>
 								<DashboardSyncTooltipContent progress={syncProgress} />
 							</TooltipContent>
 						) : null}
