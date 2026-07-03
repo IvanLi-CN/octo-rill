@@ -325,7 +325,6 @@ story_id_or_title=Pages/Dashboard Header / Warmup
 state=task.running warmup
 evidence_note=验证 access sync 在 task.running 到 star_refreshed 之间显示独立 warmup 态：后台任务已启动 / 正在准备 Star 阶段 / 0/4。
 
-PR: include
 ![Dashboard header warmup](./assets/dashboard-header-warmup.png)
 
 
@@ -349,7 +348,6 @@ story_id_or_title=Admin/Task Type Detail/SyncSubscriptions
 state=scheduler-social-and-inbox-summary  
 evidence_note=验证 Admin Jobs 的 sync.subscriptions 详情页已展示 Star、Release、Social、Inbox 四阶段摘要与最近关键事件。
 
-PR: include
 ![Admin sync subscriptions detail](./assets/admin-sync-subscriptions-detail.png)
 
 source_type=storybook_canvas
@@ -363,7 +361,6 @@ story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
 state=subscription-sync-list
 evidence_note=验证 `/admin/jobs/subscriptions` 专用列表页展示 sync.subscriptions 工作流列表、Release worker 当前配置与统一设置入口。
 
-PR: include
 ![Subscription sync list](./assets/subscription-sync-list.png)
 
 source_type=storybook_canvas
@@ -377,7 +374,6 @@ story_id_or_title=Admin/Admin Jobs/Subscription Sync Detail
 state=subscription-sync-detail
 evidence_note=验证订阅同步独立详情页可见 Star、Release、Social、Inbox 阶段摘要、失败主因、最近关键事件与子任务链路。
 
-PR: include
 ![Subscription sync detail](./assets/subscription-sync-detail.png)
 
 source_type=storybook_canvas
@@ -391,7 +387,6 @@ state=subscription-sync-detail-running
 submission_gate=approved
 evidence_note=验证运行中的订阅同步详情页按真实工作流推进：Collect、Star、Repo Collect 已完成，Release Queue 正在处理，Social 与 Notifications 等待上游阶段结束。
 
-PR: include
 ![Subscription sync detail running](./assets/admin-sync-subscriptions-detail-running.png)
 
 source_type=storybook_canvas
@@ -405,7 +400,6 @@ story_id_or_title=Admin/Admin Jobs/Subscription Sync Settings
 state=subscription-sync-settings
 evidence_note=验证列表页和详情语义共用的设置面板包含 Release worker 数量滑块与数字输入，且说明该设置不改变同步频率。
 
-PR: include
 ![Subscription sync settings](./assets/subscription-sync-settings.png)
 
 source_type=storybook_canvas
@@ -471,8 +465,21 @@ story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
 state=subscription-sync-observability-desktop
 evidence_note=验证桌面端订阅同步列表保留高密度业务状态、阶段统计、异常焦点与配置统计，未把部分完成或失败记录显示为成功。
 
-PR: include
 ![Subscription sync observability desktop](./assets/subscription-sync-workflow-desktop-1440.png)
+
+source_type=storybook_canvas
+target_program=mock-only
+capture_scope=element
+requested_viewport=1440x900
+viewport_strategy=storybook-viewport
+sensitive_exclusion=N/A
+submission_gate=approved
+story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
+state=subscription-sync-neutral-frame
+evidence_note=验证订阅同步工作流卡片使用统一中性外框，不再出现左上角异常图案或左侧额外装饰，状态仅通过 badge 与阶段摘要表达。
+
+PR: include
+![Subscription sync neutral frame accent](./assets/subscription-sync-workflow-neutral-frame-storybook.png)
 
 source_type=storybook_canvas
 target_program=mock-only
@@ -485,7 +492,6 @@ story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
 state=subscription-sync-observability-mobile-390
 evidence_note=验证 390px 窄屏下任务总览、订阅同步统计和工作流记录均为扁平布局，无卡片套卡片、无横向溢出。
 
-PR: include
 ![Subscription sync observability mobile 390](./assets/subscription-sync-workflow-mobile-390.png)
 
 source_type=storybook_canvas
@@ -499,5 +505,4 @@ story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
 state=subscription-sync-observability-mobile-320
 evidence_note=验证 320px 窄屏下统计保持紧凑并列，订阅同步记录高度受控，阶段指标与异常摘要不遮挡、不溢出。
 
-PR: include
 ![Subscription sync observability mobile 320](./assets/subscription-sync-workflow-mobile-320.png)
