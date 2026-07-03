@@ -2010,6 +2010,91 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(llmSheet).not.toBeVisible();
 });
 
+test("subscription workflow cards keep a neutral frame without extra left-edge decoration", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page);
+
+	await page.goto("/admin/jobs/subscriptions");
+
+	const taskIds = ["task-subscriptions-1", "task-subscriptions-skipped"];
+	const cards = taskIds.map((taskId) =>
+		page.locator(
+			`[data-testid="subscription-workflow-card"][data-task-id="${taskId}"]`,
+		),
+	);
+	for (const card of cards) {
+		await expect(card).toBeVisible();
+	}
+
+	const frameStyles = await Promise.all(
+		cards.map((card) =>
+			card.evaluate((element) => {
+				const style = getComputedStyle(element);
+				return {
+					borderLeftColor: style.borderLeftColor,
+					borderLeftWidth: style.borderLeftWidth,
+					borderRightColor: style.borderRightColor,
+					borderRightWidth: style.borderRightWidth,
+					borderTopColor: style.borderTopColor,
+					borderTopWidth: style.borderTopWidth,
+					borderRadius: style.borderRadius,
+				};
+			}),
+		),
+	);
+	expect(
+		new Set(frameStyles.map((styles) => styles.borderLeftColor)).size,
+	).toBe(1);
+	for (const styles of frameStyles) {
+		expect(styles.borderTopColor).toBe(styles.borderLeftColor);
+		expect(styles.borderRightColor).toBe(styles.borderLeftColor);
+		expect(styles.borderTopWidth).toBe("0px");
+		expect(styles.borderLeftWidth).toBe("0px");
+		expect(styles.borderRightWidth).toBe("0px");
+		expect(styles.borderRadius).toBe("0px");
+	}
+	for (const card of cards) {
+		await expect(
+			card.getByTestId("subscription-workflow-card-accent"),
+		).toHaveCount(0);
+		const stageGrid = card.getByTestId("subscription-workflow-stage-grid");
+		if ((await stageGrid.count()) > 0) {
+			const stageGridStyles = await stageGrid.evaluate((element) => {
+				const style = getComputedStyle(element);
+				return {
+					borderLeftWidth: style.borderLeftWidth,
+					borderRightWidth: style.borderRightWidth,
+					borderTopWidth: style.borderTopWidth,
+					borderRadius: style.borderRadius,
+				};
+			});
+			expect(stageGridStyles.borderLeftWidth).toBe("0px");
+			expect(stageGridStyles.borderRightWidth).toBe("0px");
+			expect(stageGridStyles.borderTopWidth).toBe("0px");
+			expect(stageGridStyles.borderRadius).toBe("0px");
+		}
+		const issueSummaryBorderWidths = await card.evaluate((element) => {
+			return Array.from(element.querySelectorAll("p"))
+				.filter((node) => node.textContent?.includes("异常焦点"))
+				.map((node) => {
+					const style = getComputedStyle(node);
+					return {
+						borderLeftWidth: style.borderLeftWidth,
+						borderTopWidth: style.borderTopWidth,
+					};
+				});
+		});
+		expect(issueSummaryBorderWidths.length).toBeGreaterThan(0);
+		expect(
+			issueSummaryBorderWidths.every(
+				(widths) =>
+					widths.borderLeftWidth === "0px" && widths.borderTopWidth === "0px",
+			),
+		).toBe(true);
+	}
+});
+
 test("admin jobs tabs are URL-driven and support deep links plus history", async ({
 	page,
 }) => {

@@ -2746,7 +2746,29 @@ export const SubscriptionSyncWorkflow: Story = {
 					element.textContent?.includes("Inbox"),
 			);
 			expect(stagePanel).toBeTruthy();
+			const stageGrid = card.querySelector<HTMLElement>(
+				'[data-testid="subscription-workflow-stage-grid"]',
+			);
+			expect(stageGrid).toBeTruthy();
+			const issueSummary = Array.from(card.querySelectorAll("p")).find(
+				(element) => element.textContent?.includes("异常焦点"),
+			);
 			const storyWindow = canvasElement.ownerDocument.defaultView;
+			if (storyWindow && issueSummary) {
+				expect(storyWindow.getComputedStyle(issueSummary).borderTopWidth).toBe(
+					"0px",
+				);
+				expect(storyWindow.getComputedStyle(issueSummary).borderLeftWidth).toBe(
+					"0px",
+				);
+			}
+			if (storyWindow && stageGrid) {
+				const stageGridStyle = storyWindow.getComputedStyle(stageGrid);
+				expect(stageGridStyle.borderTopWidth).toBe("0px");
+				expect(stageGridStyle.borderLeftWidth).toBe("0px");
+				expect(stageGridStyle.borderRightWidth).toBe("0px");
+				expect(stageGridStyle.borderRadius).toBe("0px");
+			}
 			if (storyWindow && storyWindow.innerWidth < 640) {
 				const style = storyWindow.getComputedStyle(card);
 				expect(style.borderTopWidth).toBe("0px");
@@ -2758,6 +2780,17 @@ export const SubscriptionSyncWorkflow: Story = {
 					(stagePanel as HTMLElement).scrollWidth <=
 						(stagePanel as HTMLElement).clientWidth + 1,
 				).toBe(true);
+			} else if (storyWindow) {
+				const style = storyWindow.getComputedStyle(card);
+				expect(style.borderTopWidth).toBe("0px");
+				expect(style.borderLeftWidth).toBe("0px");
+				expect(style.borderRightWidth).toBe("0px");
+				expect(style.borderRadius).toBe("0px");
+				expect(
+					card.querySelector(
+						'[data-testid="subscription-workflow-card-accent"]',
+					),
+				).toBeNull();
 			}
 		};
 		const workflowCards = [
@@ -2770,6 +2803,14 @@ export const SubscriptionSyncWorkflow: Story = {
 		expect(workflowCards.every(Boolean)).toBe(true);
 		for (const card of workflowCards) {
 			assertCompactWorkflowCard(card as HTMLElement);
+		}
+		const storyWindow = canvasElement.ownerDocument.defaultView;
+		if (storyWindow && storyWindow.innerWidth >= 640) {
+			const frameColors = workflowCards.map(
+				(card) =>
+					storyWindow.getComputedStyle(card as HTMLElement).borderLeftColor,
+			);
+			expect(new Set(frameColors).size).toBe(1);
 		}
 		const partialWorkflowCard = workflowCardFor("task-subscription-1430");
 		expect(partialWorkflowCard).not.toBeNull();
