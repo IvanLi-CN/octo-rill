@@ -1703,19 +1703,48 @@ function makeOwnReleaseOptInFeed(includeOwnRelease: boolean): FeedItem[] {
 	return items;
 }
 
-function makeScopedRepoFocusFeed(): FeedItem[] {
-	return [
+function makeScopedRepoFocusFeed(options?: {
+	repoFullName?: string;
+	repoUrl?: string;
+	releaseTitle?: string;
+	releaseTag?: string;
+	releaseOnly?: boolean;
+}): FeedItem[] {
+	const repoFullName = options?.repoFullName ?? PROJECT_REPO_FULL_NAME;
+	const repoUrl = options?.repoUrl ?? PROJECT_REPO_URL;
+	const releaseTitle = options?.releaseTitle ?? "v2.65.0 · 阅读体验更新";
+	const releaseTag = options?.releaseTag ?? "v2.65.0";
+
+	const releases: FeedItem[] = [
 		buildFeedItem("focus-repo-release", {
 			ts: "2026-04-04T18:12:00+08:00",
-			repo_full_name: PROJECT_REPO_FULL_NAME,
+			repo_full_name: repoFullName,
 			repo_visual: repoVisualFixtures.social,
-			title: "v2.65.0 · 阅读体验更新",
+			title: releaseTitle,
 			body: "- 发布页与详情页跳转保持连贯\n- 仓库范围阅读支持稳定回跳",
-			html_url: `${PROJECT_REPO_URL}/releases/tag/v2.65.0`,
+			html_url: `${repoUrl}/releases/tag/${releaseTag}`,
 		}),
+	];
+
+	if (options?.releaseOnly) {
+		return [
+			...releases,
+			buildFeedItem("focus-repo-release-history", {
+				ts: "2026-04-03T18:10:00+08:00",
+				repo_full_name: repoFullName,
+				repo_visual: repoVisualFixtures.social,
+				title: "AFFiNE 0.23.0",
+				body: "- 历史发布仍按日期分组展示\n- scoped 阅读面不提供按天生成日报动作",
+				html_url: `${repoUrl}/releases/tag/v0.23.0`,
+			}),
+		];
+	}
+
+	return [
+		...releases,
 		buildRepoStarItem("focus-repo-star", {
 			ts: "2026-04-04T17:40:00+08:00",
-			repo_full_name: PROJECT_REPO_FULL_NAME,
+			repo_full_name: repoFullName,
 			repo_visual: repoVisualFixtures.social,
 			actor: {
 				login: "gaearon",
@@ -1726,36 +1755,15 @@ function makeScopedRepoFocusFeed(): FeedItem[] {
 		}),
 		buildAnnouncementItem("focus-repo-announcement", {
 			ts: "2026-04-04T17:18:00+08:00",
-			repo_full_name: PROJECT_REPO_FULL_NAME,
+			repo_full_name: repoFullName,
 			repo_visual: repoVisualFixtures.social,
 			title: "范围阅读说明",
 		}),
 		buildReleaseUpdateItem("focus-repo-release-update", {
 			ts: "2026-04-04T16:55:00+08:00",
-			repo_full_name: PROJECT_REPO_FULL_NAME,
+			repo_full_name: repoFullName,
 			repo_visual: repoVisualFixtures.social,
 			title: "发布详情同步说明",
-		}),
-		buildForkItem("focus-repo-fork", {
-			ts: "2026-04-04T16:24:00+08:00",
-			repo_full_name: "IvanLi-CN/octo-rill-fork",
-			repo_visual: repoVisualFixtures.avatar,
-			title: "IvanLi-CN/octo-rill-fork",
-			html_url: "https://github.com/IvanLi-CN/octo-rill-fork",
-			actor: {
-				login: "octocat",
-				avatar_url: githubAvatarUrl("octocat"),
-				html_url: "https://github.com/octocat",
-			},
-		}),
-		buildFollowerItem("focus-repo-follower-ignored", {
-			ts: "2026-04-04T16:02:00+08:00",
-			actor: {
-				login: "yyx990803",
-				avatar_url: githubAvatarUrl("yyx990803"),
-				html_url: "https://github.com/yyx990803",
-			},
-			html_url: "https://github.com/yyx990803",
 		}),
 	];
 }
@@ -3173,7 +3181,7 @@ function DashboardPreview(props: {
 						mode === "all" ? openReleaseDetail : undefined
 					}
 					onGenerateBriefForDate={
-						mode === "all" ? generateBriefForDate : undefined
+						mode === "all" && !scope ? generateBriefForDate : undefined
 					}
 					initialBriefErrorSummariesByDate={
 						mode === "all" ? initialBriefErrorSummariesByDate : undefined
@@ -6481,12 +6489,20 @@ export const ScopedFocusRepoAll: Story = {
 	name: "Evidence / Scoped Focus Repo All",
 	args: {
 		initialTab: "all",
-		feedItems: makeScopedRepoFocusFeed(),
+		feedItems: makeScopedRepoFocusFeed({
+			repoFullName: "toeverything/AFFiNE",
+			repoUrl: "https://github.com/toeverything/AFFiNE",
+			releaseTitle: "AFFiNE 0.24.0",
+			releaseTag: "v0.24.0",
+			releaseOnly: true,
+		}),
+		briefs: [],
+		now: new Date("2026-04-05T12:00:00+08:00"),
 		showFooter: false,
 		scope: {
 			kind: "repo",
-			owner: "IvanLi-CN",
-			repo: "octo-rill",
+			owner: "toeverything",
+			repo: "AFFiNE",
 		},
 		includeOwnReleases: true,
 	},
@@ -6500,22 +6516,26 @@ export const ScopedFocusRepoAll: Story = {
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		await expect(canvas.getByText("IvanLi-CN/octo-rill")).toBeVisible();
+		await expect(canvas.getByText("toeverything/AFFiNE")).toBeVisible();
 		await expect(
 			canvasElement.querySelector('[data-dashboard-scope-summary="repo"]'),
 		).not.toBeNull();
 		await expect(
 			canvasElement.querySelector('[data-dashboard-sidebar-inbox="true"]'),
 		).toBeNull();
-		await expect(canvas.queryByText("yyx990803")).not.toBeInTheDocument();
 		await expect(
-			canvas.getByRole("link", { name: /IvanLi-CN\/octo-rill/ }),
-		).toHaveAttribute("href", "/focus/repo/IvanLi-CN/octo-rill");
+			canvas.getByRole("link", { name: /toeverything\/AFFiNE/ }),
+		).toHaveAttribute("href", "/focus/repo/toeverything/AFFiNE");
 		await expect(canvas.getByText("1 个仓库")).toBeVisible();
-		await expect(
-			canvas.queryByText("IvanLi-CN/octo-rill-fork"),
-		).not.toBeInTheDocument();
 		await expect(canvas.queryByText("可见性")).not.toBeInTheDocument();
+		await expect(canvas.queryByText("gaearon")).not.toBeInTheDocument();
+		await expect(canvas.queryByText("范围阅读说明")).not.toBeInTheDocument();
+		await expect(
+			canvas.queryByText("发布详情同步说明"),
+		).not.toBeInTheDocument();
+		await expect(
+			canvas.queryByRole("button", { name: "生成日报" }),
+		).not.toBeInTheDocument();
 	},
 };
 

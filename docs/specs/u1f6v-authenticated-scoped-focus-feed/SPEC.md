@@ -80,6 +80,7 @@
 - 桌面端右侧不再显示全局 Inbox quick list，而是显示当前 scope 摘要卡。
 - 移动端在 feed 顶部展示同等摘要信息。
 - lane selector 继续复用 `全部 / 发布` 两个 feed-backed tab 的现有行为。
+- scoped 页面是只读范围聚焦面；即使 `全部` tab 中存在缺少日报的历史日组，也不得显示按天“生成日报”动作。
 
 ### Scoped `全部`
 
@@ -157,6 +158,14 @@
   When `include_own_releases` 未开启
   Then 页面仍可访问，但显示 scoped empty state，不回退到全局 Dashboard。
 
+- Given 用户访问 `/focus/repo/owner/repo` 或 `/focus/org/org`
+  When `全部` tab 中存在缺少日报的历史日组
+  Then 页面不显示“生成日报”按钮，历史原始列表仍可阅读。
+
+- Given 用户先在全局 `全部` tab 触发某个历史日组的“生成日报”
+  When 该生成仍处于 pending 或 error 状态，且用户站内导航到 `/focus/repo/owner/repo` 或 `/focus/org/org`
+  Then scoped 页面不得显示 pending 日报占位、错误日报面板或重试/生成动作，只展示该 scope 的原始列表。
+
 - Given 多个 scope 页面先后访问
   When 页面 warm start 或 updates 轮询命中
   Then 不会出现跨 scope 的旧 feed、旧 summary 或错误的新内容提示。
@@ -189,6 +198,12 @@
   scenario: `scoped repo all`
   evidence_note: 证明聚焦页桌面态只保留 `全部 / 发布`，右侧改为 scope 摘要卡，不再显示全局 Inbox。
   ![Scoped repo all](./assets/scoped-focus-repo-all-20260627.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `pages-dashboard--scoped-focus-repo-all`
+  scenario: `scoped repo all without daily brief generation for toeverything/AFFiNE`
+  evidence_note: 证明 `/focus/repo/toeverything/AFFiNE` 的 `全部` 页即使遇到缺少日报的历史日组，也不会显示“生成日报”动作，且证据数据只包含该仓库范围内的动态。
+  ![Scoped repo all without daily brief generation](./assets/scoped-focus-repo-no-daily-report.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `pages-dashboard--scoped-focus-repo-releases`
