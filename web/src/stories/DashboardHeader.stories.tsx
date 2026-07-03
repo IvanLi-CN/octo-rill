@@ -2,7 +2,7 @@ import type * as React from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useState } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
-import { expect, screen, userEvent, within } from "storybook/test";
+import { expect, screen, userEvent, waitFor, within } from "storybook/test";
 
 import { DEFAULT_PAGE_LANE } from "@/feed/laneOptions";
 import type { FeedLane } from "@/feed/types";
@@ -364,6 +364,12 @@ export const Syncing: Story = {
 		await expect(
 			screen.getAllByText("写入 42 条 Release · 覆盖 18 个仓库")[0],
 		).toBeVisible();
+		await userEvent.click(canvasElement);
+		await waitFor(() => {
+			expect(
+				screen.queryByText("正在后台同步你的 GitHub 数据"),
+			).not.toBeInTheDocument();
+		});
 	},
 	parameters: {
 		docs: {
