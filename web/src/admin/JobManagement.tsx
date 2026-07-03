@@ -5754,7 +5754,7 @@ export function JobManagement({
 													<a
 														key={task.id}
 														aria-label={`打开订阅同步工作流 ${task.id}`}
-														className={`max-h-[200px] cursor-pointer overflow-hidden border-b bg-transparent py-2 transition-colors duration-200 last:border-b-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 sm:rounded-xl sm:border sm:bg-card/70 sm:p-3 sm:hover:bg-card/90 ${tone.cardAccentClass}`}
+														className="block cursor-pointer border-b border-border/70 bg-transparent py-2 transition-colors duration-200 last:border-b-0 hover:bg-muted/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 sm:px-1"
 														data-task-id={task.id}
 														data-testid="subscription-workflow-card"
 														href={detailHref}
@@ -5820,8 +5820,11 @@ export function JobManagement({
 																</div>
 															</div>
 															{diagnostics ? (
-																<div className="overflow-hidden border-y bg-transparent sm:rounded-lg sm:border sm:bg-border sm:overflow-x-auto">
-																	<div className="grid grid-cols-3 gap-px bg-border text-[10px] sm:min-w-[672px] sm:grid-cols-6 sm:gap-0 sm:divide-x sm:text-[11px]">
+																<div className="overflow-x-auto">
+																	<div
+																		className="grid grid-cols-3 gap-px bg-border/70 text-[10px] sm:min-w-[672px] sm:grid-cols-6 sm:text-[11px]"
+																		data-testid="subscription-workflow-stage-grid"
+																	>
 																		{stages.map((stage) => {
 																			const pending =
 																				subscriptionStagePending(stage);
@@ -5876,7 +5879,7 @@ export function JobManagement({
 																</div>
 															)}
 															{hasIssue || recentEventSummary ? (
-																<p className="line-clamp-1 border-t pt-1 text-[11px] text-muted-foreground sm:hidden">
+																<p className="mt-1 line-clamp-1 text-[11px] text-muted-foreground sm:hidden">
 																	<span className="font-medium text-foreground">
 																		异常焦点：
 																	</span>
@@ -5887,7 +5890,7 @@ export function JobManagement({
 																</p>
 															) : null}
 															{hasIssue || recentEventSummary ? (
-																<p className="hidden truncate border-t pt-1.5 text-xs text-muted-foreground sm:block">
+																<p className="mt-1.5 hidden truncate text-xs text-muted-foreground sm:block">
 																	<span className="font-medium text-foreground">
 																		异常焦点：
 																	</span>
