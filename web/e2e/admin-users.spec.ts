@@ -54,6 +54,13 @@ async function installFrozenNow(page: Page, isoString: string) {
 	}, fixedTime);
 }
 
+async function openAdminPanelFromDashboard(page: Page) {
+	await page.getByRole("button", { name: "查看账号信息" }).click();
+	const userCard = page.locator("[data-dashboard-user-card]");
+	await expect(userCard).toBeVisible();
+	await userCard.getByRole("link", { name: "管理员面板" }).click();
+}
+
 async function installBaseMocks(
 	page: Page,
 	options: {
@@ -370,7 +377,7 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 	await installBaseMocks(page, { isAdmin: true });
 	await page.goto("/");
 
-	await page.getByRole("link", { name: "管理员面板" }).click();
+	await openAdminPanelFromDashboard(page);
 	await expect(page).toHaveURL(/\/admin$/);
 	await expect(page.locator("[data-admin-header-main-row]")).toBeVisible({
 		timeout: 10_000,
@@ -441,7 +448,7 @@ test("admin action error remains visible after list refresh", async ({
 	});
 	await page.goto("/");
 
-	await page.getByRole("link", { name: "管理员面板" }).click();
+	await openAdminPanelFromDashboard(page);
 	await page.getByRole("link", { name: "用户管理" }).click();
 	await expect(page).toHaveURL(/\/admin\/users$/);
 	await expect(page.getByRole("heading", { name: "用户管理" })).toBeVisible();
@@ -460,7 +467,7 @@ test("self-demoted admin is redirected out of admin panel", async ({
 	await installBaseMocks(page, { isAdmin: true });
 	await page.goto("/");
 
-	await page.getByRole("link", { name: "管理员面板" }).click();
+	await openAdminPanelFromDashboard(page);
 	await page.getByRole("link", { name: "用户管理" }).click();
 	await expect(page).toHaveURL(/\/admin\/users$/);
 	await expect(
@@ -737,7 +744,7 @@ test.describe("daily brief time formatting", () => {
 			await installBaseMocks(page, { isAdmin: true });
 			await page.goto("/");
 
-			await page.getByRole("link", { name: "管理员面板" }).click();
+			await openAdminPanelFromDashboard(page);
 			await page.getByRole("link", { name: "用户管理" }).click();
 			const standardUserRow = userRow(page, STANDARD_USER_ID);
 			await standardUserRow.getByRole("button", { name: "详情" }).click();
@@ -760,7 +767,7 @@ test.describe("daily brief time formatting", () => {
 			await installBaseMocks(page, { isAdmin: true });
 			await page.goto("/");
 
-			await page.getByRole("link", { name: "管理员面板" }).click();
+			await openAdminPanelFromDashboard(page);
 			await page.getByRole("link", { name: "用户管理" }).click();
 			const standardUserRow = userRow(page, STANDARD_USER_ID);
 			await standardUserRow.getByRole("button", { name: "详情" }).click();
