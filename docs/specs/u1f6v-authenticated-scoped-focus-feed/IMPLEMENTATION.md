@@ -14,6 +14,7 @@
 - [x] repo-bearing feed 卡片站内跳转 focus route
 - [x] 账号菜单常驻“我的仓库动态”入口
 - [x] scoped shell：双 tab + summary sidebar/mobile summary + empty state
+- [x] scoped `全部` 页隐藏按日“生成日报”动作，并在 scoped 渲染时屏蔽全局页遗留的 pending/error 生成状态，保留历史原始列表阅读
 - [x] Storybook page/app-shell fallback 场景
 - [x] E2E 覆盖与最终视觉证据
 

@@ -2595,7 +2595,7 @@ export function Dashboard(props: {
 						mode === "all" ? onOpenReleaseDetail : undefined
 					}
 					onGenerateBriefForDate={
-						mode === "all" ? onGenerateBriefForDate : undefined
+						mode === "all" && !scope ? onGenerateBriefForDate : undefined
 					}
 					newContentBoundaries={activeFeedNotices.map((notice, index) => ({
 						id: notice.boundaryId,

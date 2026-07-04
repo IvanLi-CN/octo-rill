@@ -676,6 +676,7 @@ export function FeedGroupedList(
 		Map<string, HistoricalBriefErrorState>
 	>(() => toHistoricalBriefErrorMap(initialBriefErrorSummariesByDate));
 	const [loadMoreBubbleOpen, setLoadMoreBubbleOpen] = useState(false);
+	const briefGenerationEnabled = Boolean(onGenerateBriefForDate);
 	const blockingError =
 		error?.phase === "initial" && items.length === 0 ? error : null;
 	const appendError = error?.phase === "append" ? error : null;
@@ -831,14 +832,17 @@ export function FeedGroupedList(
 						? briefByDate.get(group.briefDate)
 						: null) ??
 					null;
-				const briefError = briefErrorsByDate.get(group.briefDate) ?? null;
+				const briefError = briefGenerationEnabled
+					? (briefErrorsByDate.get(group.briefDate) ?? null)
+					: null;
 				const hasReleases = group.releaseCount > 0;
 				const isHistoricalRawGroup =
 					mode === "all" &&
 					group.kind === "raw" &&
 					!group.isCurrent &&
 					hasReleases;
-				const pendingBrief = pendingGroupIds.has(group.id);
+				const pendingBrief =
+					briefGenerationEnabled && pendingGroupIds.has(group.id);
 				const showBriefPanel =
 					mode === "all" &&
 					!group.isCurrent &&

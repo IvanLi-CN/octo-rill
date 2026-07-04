@@ -71,9 +71,11 @@ async function installScopedFocusMocks(
 	page: Page,
 	options?: {
 		includeOwnReleases?: boolean;
+		holdBriefGeneration?: boolean;
 	},
 ) {
 	const includeOwnReleases = options?.includeOwnReleases ?? false;
+	const holdBriefGeneration = options?.holdBriefGeneration ?? false;
 
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
@@ -158,6 +160,12 @@ async function installScopedFocusMocks(
 			return json(route, {
 				items: [
 					buildScopedRelease(
+						"global-current-release",
+						"lobehub/lobe-chat",
+						"桌面版 Stable v2.1.48",
+						new Date().toISOString(),
+					),
+					buildScopedRelease(
 						"global-release-1",
 						"lobehub/lobe-chat",
 						"桌面版 Stable v2.1.47",
@@ -170,6 +178,23 @@ async function installScopedFocusMocks(
 
 		if (req.method() === "GET" && pathname === "/api/briefs") {
 			return json(route, []);
+		}
+
+		if (req.method() === "POST" && pathname === "/api/briefs/generate") {
+			if (holdBriefGeneration) {
+				return new Promise(() => {});
+			}
+			return json(route, {
+				id: "generated-brief",
+				date: "2026-04-30",
+				window_start: null,
+				window_end: null,
+				effective_time_zone: "UTC",
+				effective_local_boundary: "00:00",
+				release_count: 1,
+				release_ids: ["global-release-1"],
+				content_markdown: "Generated brief",
+			});
 		}
 
 		if (req.method() === "GET" && pathname === "/api/notifications") {
@@ -331,6 +356,59 @@ test("repo identity on release card opens scoped focus route and keeps releases 
 	await expect(
 		page.locator("[data-dashboard-sidebar-inbox='true']"),
 	).toHaveCount(0);
+});
+
+test("scoped repo and org feeds hide per-day daily brief generation", async ({
+	page,
+}) => {
+	await installScopedFocusMocks(page);
+
+	await page.goto("/focus/repo/lobehub/lobe-chat");
+	await expect(
+		page.locator(
+			'[data-dashboard-scope-summary="repo"][data-dashboard-scope-summary-layout="desktop"]',
+		),
+	).toBeVisible();
+	await expect(page.getByRole("button", { name: "生成日报" })).toHaveCount(0);
+
+	await page.goto("/focus/org/acme");
+	await expect(
+		page.locator(
+			'[data-dashboard-scope-summary="org"][data-dashboard-scope-summary-layout="desktop"]',
+		),
+	).toBeVisible();
+	await expect(page.getByRole("button", { name: "生成日报" })).toHaveCount(0);
+});
+
+test("scoped feeds ignore stale pending daily brief generation state from the global feed", async ({
+	page,
+}) => {
+	await installScopedFocusMocks(page, { holdBriefGeneration: true });
+
+	await page.goto("/");
+	const generateButton = page.getByRole("button", { name: "生成日报" });
+	await expect(generateButton).toBeVisible();
+	await generateButton.click();
+	await expect(generateButton).toBeDisabled();
+
+	await page
+		.locator('[data-feed-item-key="release:global-release-1"]')
+		.getByRole("link", { name: /^lobehub\/lobe-chat$/ })
+		.click();
+	await expect(page).toHaveURL("/focus/repo/lobehub/lobe-chat");
+	await expect(
+		page.locator(
+			'[data-dashboard-scope-summary="repo"][data-dashboard-scope-summary-layout="desktop"]',
+		),
+	).toBeVisible();
+	await expect(page.getByRole("button", { name: "生成日报" })).toHaveCount(0);
+	await expect(page.locator('[data-feed-group-view="brief"]')).toHaveCount(0);
+	await expect(page.getByText("桌面版 Stable v2.1.47")).toBeVisible();
+	await expect(
+		page.locator('[data-social-card-primary-full-label="true"]', {
+			hasText: "gaearon",
+		}),
+	).toBeVisible();
 });
 
 test("account menu keeps mine entry available regardless of include_own_releases", async ({
