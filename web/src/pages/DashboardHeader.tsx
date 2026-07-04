@@ -527,7 +527,7 @@ export function DashboardHeader({
 			>
 				<InternalLink
 					className={cn(
-						"flex min-w-0 flex-1 items-start gap-3 rounded-2xl text-left no-underline outline-none focus-visible:ring-2 focus-visible:ring-[#495675]/45 focus-visible:ring-offset-2 focus-visible:ring-offset-background dark:focus-visible:ring-[#dbe7ff]/50",
+						"flex min-h-11 min-w-0 flex-1 items-start gap-3 rounded-2xl text-left no-underline outline-none focus-visible:ring-2 focus-visible:ring-[#495675]/45 focus-visible:ring-offset-2 focus-visible:ring-offset-background dark:focus-visible:ring-[#dbe7ff]/50 sm:min-h-0",
 						disableHeaderMotion
 							? "transition-none"
 							: "motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
