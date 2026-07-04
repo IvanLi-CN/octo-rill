@@ -515,6 +515,11 @@ export const EvidenceMobileShell: Story = {
 			"data-app-shell-header-interacting",
 			"false",
 		);
+		const brandLink = canvas.getByRole("link", {
+			name: "打开 OctoRill 首页",
+		});
+		await expect(brandLink).toHaveAttribute("href", "/");
+		expect(brandLink.getBoundingClientRect().height).toBeGreaterThanOrEqual(44);
 
 		const laneMenuTrigger = canvas.getByRole("button", {
 			name: "当前阅读模式：润色",
