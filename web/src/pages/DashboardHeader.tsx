@@ -422,7 +422,7 @@ export function DashboardHeader({
 	onSyncAll,
 	logoutHref = "/auth/logout",
 	mobileControlBand = null,
-	showMineEntry = false,
+	showMineEntry = true,
 	mineHref = "/focus/mine",
 	mineLabel = "我的仓库动态",
 }: DashboardHeaderProps) {

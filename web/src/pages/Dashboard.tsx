@@ -2745,7 +2745,6 @@ export function Dashboard(props: {
 					syncingAll={syncingAll}
 					syncProgress={accessSyncProgress}
 					onSyncAll={onSyncAll}
-					showMineEntry={me.dashboard.include_own_releases}
 					mineHref={buildDashboardScopeHref({ kind: "mine" })}
 					mineLabel={DASHBOARD_MINE_ENTRY_LABEL}
 					mobileControlBand={

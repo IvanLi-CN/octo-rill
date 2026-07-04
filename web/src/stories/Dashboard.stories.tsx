@@ -560,7 +560,9 @@ const STORYBOOK_VIEWER_AVATAR = avatarDataUrl("IL", "#6f89b6", "#fffaf0");
 
 const STORYBOOK_VIEWER = {
 	login: PROJECT_OWNER_LOGIN,
+	name: "Ivan Li",
 	avatar_url: STORYBOOK_VIEWER_AVATAR,
+	email: "ivanli2048@gmail.com",
 	html_url: "https://github.com/IvanLi-CN",
 } as const;
 
@@ -2706,7 +2708,6 @@ function DashboardPreview(props: {
 		freshBriefKeys = EMPTY_STORY_FRESH_KEYS,
 		freshNotificationKeys = EMPTY_STORY_FRESH_KEYS,
 		scope = null,
-		includeOwnReleases = false,
 		generateBriefFailureDates = EMPTY_STORY_BRIEF_FAILURE_DATES,
 		initialBriefErrorSummariesByDate,
 	} = props;
@@ -3246,7 +3247,9 @@ function DashboardPreview(props: {
 				header={
 					<DashboardHeader
 						login={STORYBOOK_VIEWER.login}
+						name={STORYBOOK_VIEWER.name}
 						avatarUrl={STORYBOOK_VIEWER.avatar_url}
+						email={STORYBOOK_VIEWER.email}
 						isAdmin
 						aiDisabledHint={aiDisabledHint}
 						busy={syncingAll}
@@ -3254,7 +3257,6 @@ function DashboardPreview(props: {
 						syncProgress={syncProgress}
 						onSyncAll={() => {}}
 						logoutHref="#"
-						showMineEntry={includeOwnReleases}
 						mineHref={buildDashboardScopeHref({ kind: "mine" })}
 						mineLabel={DASHBOARD_MINE_ENTRY_LABEL}
 						mobileControlBand={
@@ -3268,7 +3270,9 @@ function DashboardPreview(props: {
 									setSelectedLaneByKey({});
 								}}
 								layout="stacked"
-								tabOptions={scopedMode ? SCOPED_STORY_TAB_OPTIONS : undefined}
+								tabOptions={
+									scopedMode ? SCOPED_STORY_TAB_OPTIONS : DASHBOARD_TAB_OPTIONS
+								}
 							/>
 						}
 					/>
@@ -3284,7 +3288,9 @@ function DashboardPreview(props: {
 				>
 					<div className="hidden flex-wrap items-center justify-between gap-2 sm:flex">
 						<DashboardTabsList
-							options={scopedMode ? SCOPED_STORY_TAB_OPTIONS : undefined}
+							options={
+								scopedMode ? SCOPED_STORY_TAB_OPTIONS : DASHBOARD_TAB_OPTIONS
+							}
 						/>
 						<div
 							className="flex min-h-8 items-center gap-2 self-center"
@@ -3299,6 +3305,16 @@ function DashboardPreview(props: {
 									}}
 									className="hidden sm:inline-flex"
 								/>
+							) : null}
+							{aiDisabledHint ? (
+								<span className="inline-flex h-8 items-center rounded-lg border border-border/45 bg-muted/35 px-3 font-mono text-xs text-muted-foreground">
+									AI 未配置，将只显示原文
+								</span>
+							) : null}
+							{syncingAll ? (
+								<span className="inline-flex h-8 items-center rounded-lg border border-border/45 bg-muted/35 px-3 font-mono text-xs text-muted-foreground">
+									{SYNC_ALL_LABEL}…
+								</span>
 							) : null}
 						</div>
 					</div>
@@ -4562,7 +4578,12 @@ export const Syncing: Story = {
 		await expect(
 			canvas.getAllByRole("button", { name: SYNC_ALL_LABEL }),
 		).toHaveLength(1);
-		expect(secondaryControls?.textContent).not.toContain(SYNC_ALL_LABEL);
+		expect(
+			secondaryControls?.querySelector(
+				'button[aria-label="同步"], a[aria-label="同步"]',
+			),
+		).toBeNull();
+		expect(secondaryControls?.textContent).toContain(`${SYNC_ALL_LABEL}…`);
 		await expect(syncButton).toBeDisabled();
 		const icon = syncButton.querySelector("svg");
 		expect(icon).not.toBeNull();
@@ -6604,7 +6625,7 @@ export const ScopedFocusMineMenuEntryVisible: Story = {
 	parameters: {
 		docs: {
 			description: {
-				story: "“我的发布”开启时，账号菜单显示“我的仓库动态”入口。",
+				story: "账号菜单显示“我的仓库动态”入口，并落到 `/focus/mine`。",
 			},
 		},
 	},
@@ -6617,8 +6638,8 @@ export const ScopedFocusMineMenuEntryVisible: Story = {
 	},
 };
 
-export const ScopedFocusMineMenuEntryHidden: Story = {
-	name: "Evidence / Scoped Focus Mine Entry Hidden",
+export const ScopedFocusMineMenuEntryVisibleWhenOptedOut: Story = {
+	name: "Evidence / Scoped Focus Mine Entry Visible When Opted Out",
 	args: {
 		initialTab: "all",
 		feedItems: makeOwnReleaseOptInFeed(false),
@@ -6628,7 +6649,8 @@ export const ScopedFocusMineMenuEntryHidden: Story = {
 	parameters: {
 		docs: {
 			description: {
-				story: "“我的发布”关闭时，账号菜单不显示“我的仓库动态”入口。",
+				story:
+					"“我的发布”关闭时，账号菜单仍显示“我的仓库动态”入口；进入后按当前可见性显示内容或空态。",
 			},
 		},
 	},
@@ -6636,8 +6658,8 @@ export const ScopedFocusMineMenuEntryHidden: Story = {
 		const canvas = within(canvasElement);
 		await userEvent.click(canvas.getByRole("button", { name: "查看账号信息" }));
 		await expect(
-			canvas.queryByRole("link", { name: DASHBOARD_MINE_ENTRY_LABEL }),
-		).not.toBeInTheDocument();
+			canvas.getByRole("link", { name: DASHBOARD_MINE_ENTRY_LABEL }),
+		).toHaveAttribute("href", "/focus/mine");
 	},
 };
 

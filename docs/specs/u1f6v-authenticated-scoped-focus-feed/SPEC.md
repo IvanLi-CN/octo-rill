@@ -13,7 +13,7 @@
 - 新阅读面复用现有 Dashboard shell、同步入口、lane selector 与 release detail surface，但顶部 tabs 只保留 `全部 / 发布`。
 - scoped `全部` 只展示当前 scope 命中的 release 与带 repo 归属的社交项；`follower_received` 这类无 repo 归属项不进入新页。
 - 让 route state、release detail close/restore、warm snapshot 与 dashboard updates 全部 scope-aware，避免不同 scope 串缓存或串提示。
-- 所有带 repo identity 的 feed 卡片都提供一致的站内 focus 入口；账号菜单在“我的发布”开启时提供“我的仓库动态”快捷入口。
+- 所有带 repo identity 的 feed 卡片都提供一致的站内 focus 入口；账号菜单提供“我的仓库动态”快捷入口。
 
 ## Non-goals
 
@@ -105,7 +105,7 @@
 - Release 卡片 repo identity 区域点击后进入对应 repo focus 页。
 - 所有带 `repo_full_name` 的社交卡片 repo identity / repo 目标段点击后进入对应 repo focus 页。
 - GitHub 外链按钮保持原行为，不改成站内跳转。
-- 账号菜单仅在 `include_own_releases = true` 时显示“我的仓库动态”，入口落到 `/focus/mine`。
+- 账号菜单始终显示“我的仓库动态”，入口落到 `/focus/mine`；`include_own_releases` 只决定 `/focus/mine` 的内容是否命中，不决定入口是否存在。
 
 ### Empty state
 
@@ -180,7 +180,7 @@
   - 桌面 summary sidebar
   - 移动端 summary
   - scoped empty state
-  - “我的仓库动态”入口显示 / 隐藏
+  - “我的仓库动态”入口在 `include_own_releases` 开启 / 关闭时都显示
 
 ## Visual Evidence
 
@@ -211,8 +211,14 @@
 - source_type: `storybook_canvas`
   story_id_or_title: `pages-dashboard--scoped-focus-mine-menu-entry-visible`
   scenario: `mine menu entry visible`
-  evidence_note: 证明“我的发布”开启后，账号菜单会出现“我的仓库动态”入口并落到 `/focus/mine`。
+  evidence_note: 证明账号菜单会出现“我的仓库动态”入口并落到 `/focus/mine`。
   ![Mine menu entry visible](./assets/scoped-focus-mine-entry-visible.png)
+
+- source_type: `mock_ui`
+  story_id_or_title: `production dashboard route with mocked API`
+  scenario: `dashboard account menu entries`
+  evidence_note: 证明真实 Dashboard 路由的账号菜单同时保留“我的仓库动态”“设置”“管理员面板”“退出登录”，顶部不再暴露额外“我的动态”入口。
+  ![Dashboard account menu entries](./assets/dashboard-user-menu-production-route-20260704.png)
 
 ## 方案概述
 
