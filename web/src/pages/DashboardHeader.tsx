@@ -525,15 +525,19 @@ export function DashboardHeader({
 				}
 				data-dashboard-header-main-row
 			>
-				<div
+				<InternalLink
 					className={cn(
-						"flex min-w-0 flex-1 items-start gap-3",
+						"flex min-w-0 flex-1 items-start gap-3 rounded-2xl text-left no-underline outline-none focus-visible:ring-2 focus-visible:ring-[#495675]/45 focus-visible:ring-offset-2 focus-visible:ring-offset-background dark:focus-visible:ring-[#dbe7ff]/50",
 						disableHeaderMotion
 							? "transition-none"
 							: "motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
 						useSingleLineHeader && "items-center gap-2.5",
 						hideSubtitle && "items-center",
 					)}
+					href="/"
+					to="/"
+					aria-label="打开 OctoRill 首页"
+					data-app-shell-gesture-guard
 					style={
 						hideSubtitle
 							? {
@@ -612,7 +616,7 @@ export function DashboardHeader({
 							GitHub 动态 · 中文翻译 · 日报与 Inbox
 						</p>
 					</div>
-				</div>
+				</InternalLink>
 
 				<div
 					className={cn(
