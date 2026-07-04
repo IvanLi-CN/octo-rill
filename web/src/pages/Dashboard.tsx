@@ -2745,7 +2745,6 @@ export function Dashboard(props: {
 					syncingAll={syncingAll}
 					syncProgress={accessSyncProgress}
 					onSyncAll={onSyncAll}
-					showMineEntry={me.dashboard.include_own_releases}
 					mineHref={buildDashboardScopeHref({ kind: "mine" })}
 					mineLabel={DASHBOARD_MINE_ENTRY_LABEL}
 					mobileControlBand={
@@ -2798,18 +2797,6 @@ export function Dashboard(props: {
 								<span className="inline-flex h-8 items-center rounded-lg border border-border/45 bg-muted/35 px-3 font-mono text-xs text-muted-foreground">
 									{busy}…
 								</span>
-							) : null}
-							{isAdmin ? (
-								<Button
-									asChild
-									variant="outline"
-									size="sm"
-									className="h-8 rounded-lg border-border/60 bg-muted/35 px-3 font-mono text-xs text-foreground/75 shadow-none hover:bg-muted/60 hover:text-foreground"
-								>
-									<InternalLink href="/admin" to="/admin">
-										管理员面板
-									</InternalLink>
-								</Button>
 							) : null}
 						</div>
 					</div>

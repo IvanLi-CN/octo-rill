@@ -411,7 +411,7 @@ test("scoped feeds ignore stale pending daily brief generation state from the gl
 	).toBeVisible();
 });
 
-test("account menu shows mine entry only when include_own_releases is enabled", async ({
+test("account menu keeps mine entry available regardless of include_own_releases", async ({
 	page,
 }) => {
 	await installScopedFocusMocks(page, { includeOwnReleases: true });
@@ -430,7 +430,10 @@ test("account menu shows mine entry only when include_own_releases is enabled", 
 	await installScopedFocusMocks(page, { includeOwnReleases: false });
 	await page.goto("/");
 	await page.getByRole("button", { name: "查看账号信息" }).click();
-	await expect(page.getByRole("link", { name: "我的仓库动态" })).toHaveCount(0);
+	await expect(page.getByRole("link", { name: "我的仓库动态" })).toBeVisible();
+	await page.getByRole("link", { name: "我的仓库动态" }).click();
+	await expect(page).toHaveURL("/focus/mine");
+	await expect(page.getByText("当前范围暂无更新")).toBeVisible();
 });
 
 test("scoped release detail closes back to the original focus route", async ({

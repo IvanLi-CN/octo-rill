@@ -332,6 +332,11 @@ test("dashboard keeps sync as a single header action for admins", async ({
 	).toBeVisible();
 	await expect(
 		page.locator("[data-dashboard-user-card]").getByRole("link", {
+			name: "管理员面板",
+		}),
+	).toBeVisible();
+	await expect(
+		page.locator("[data-dashboard-user-card]").getByRole("link", {
 			name: "退出登录",
 		}),
 	).toBeVisible();
@@ -353,7 +358,7 @@ test("dashboard keeps sync as a single header action for admins", async ({
 	).toBeVisible();
 	await expect(
 		secondaryControls.getByRole("link", { name: "管理员面板" }),
-	).toBeVisible();
+	).toHaveCount(0);
 });
 
 test("dashboard keeps header utilities inline on tablet widths", async ({

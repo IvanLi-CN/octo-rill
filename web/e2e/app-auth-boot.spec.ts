@@ -563,10 +563,10 @@ test("dashboard to admin to dashboard stays in SPA mode and does not re-bootstra
 		() => performance.getEntriesByType("navigation").length,
 	);
 
-	await page
-		.locator("[data-dashboard-secondary-controls]")
-		.getByRole("link", { name: "管理员面板" })
-		.click();
+	await page.getByRole("button", { name: "查看账号信息" }).click();
+	const userCard = page.locator("[data-dashboard-user-card]");
+	await expect(userCard).toBeVisible();
+	await userCard.getByRole("link", { name: "管理员面板" }).click();
 	await expect(page).toHaveURL(/\/admin$/);
 	await expect(page.getByRole("img", { name: "OctoRill" })).toBeVisible();
 	await expect(
