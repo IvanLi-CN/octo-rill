@@ -280,6 +280,9 @@ export const Default: Story = {
 			canvas.getByRole("heading", { name: "OctoRill" }),
 		).toBeVisible();
 		await expect(
+			canvas.getByRole("link", { name: "打开 OctoRill 首页" }),
+		).toHaveAttribute("href", "/");
+		await expect(
 			canvas.getByText("GitHub 动态 · 中文翻译 · 日报与 Inbox"),
 		).toBeVisible();
 		await expect(canvas.getByRole("group", { name: "主题模式" })).toBeVisible();
