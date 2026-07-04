@@ -380,6 +380,27 @@ test("scoped repo and org feeds hide per-day daily brief generation", async ({
 	await expect(page.getByRole("button", { name: "生成日报" })).toHaveCount(0);
 });
 
+test("dashboard brand link opens the home feed from scoped routes", async ({
+	page,
+}) => {
+	await installScopedFocusMocks(page);
+
+	await page.goto("/focus/repo/lobehub/lobe-chat");
+	await expect(
+		page.locator(
+			'[data-dashboard-scope-summary="repo"][data-dashboard-scope-summary-layout="desktop"]',
+		),
+	).toBeVisible();
+	await page.getByRole("link", { name: "打开 OctoRill 首页" }).click();
+	await expect(page).toHaveURL("/");
+	await expect(page.getByText("桌面版 Stable v2.1.48")).toBeVisible();
+	await expect(
+		page.locator(
+			'[data-dashboard-scope-summary="repo"][data-dashboard-scope-summary-layout="desktop"]',
+		),
+	).toHaveCount(0);
+});
+
 test("scoped feeds ignore stale pending daily brief generation state from the global feed", async ({
 	page,
 }) => {
