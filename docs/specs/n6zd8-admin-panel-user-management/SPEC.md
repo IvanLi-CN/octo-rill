@@ -194,6 +194,13 @@
   evidence_note: 证明窄屏下仍保持双层单行字段与横向滚动，不退化回卡片或多行换行。
   ![管理员用户列表窄屏证据](./assets/admin-users-compact-list-tablet.png)
 
+- source_type: `storybook_canvas`
+  story_id_or_title: `pages-dashboard-header--default`
+  state: `dashboard account menu admin divider`
+  evidence_note: 证明 Dashboard 账号浮层将“管理员面板”作为运维入口独立分组，并在“设置”和“管理员面板”之间保留分隔线。
+  PR: include
+  ![管理员面板入口分隔线](./assets/dashboard-admin-menu-divider.png)
+
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
 - 风险：历史数据可能存在异常时间字段，回填逻辑需有 id 兜底排序。

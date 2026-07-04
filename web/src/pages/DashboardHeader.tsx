@@ -252,20 +252,25 @@ function DashboardUserInfoCard(props: {
 					</InternalLink>
 				</Button>
 				{showAdminLink ? (
-					<Button
-						asChild
-						variant="ghost"
-						className="mt-2 w-full justify-start px-2"
+					<div
+						className="mt-2 border-t border-border/70 pt-2"
+						data-dashboard-admin-entry-group="true"
 					>
-						<InternalLink
-							href="/admin"
-							to="/admin"
-							data-dashboard-admin-entry="true"
+						<Button
+							asChild
+							variant="ghost"
+							className="w-full justify-start px-2"
 						>
-							<ShieldCheck className="size-4" />
-							管理员面板
-						</InternalLink>
-					</Button>
+							<InternalLink
+								href="/admin"
+								to="/admin"
+								data-dashboard-admin-entry="true"
+							>
+								<ShieldCheck className="size-4" />
+								管理员面板
+							</InternalLink>
+						</Button>
+					</div>
 				) : null}
 			</div>
 
