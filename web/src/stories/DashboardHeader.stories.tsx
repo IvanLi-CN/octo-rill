@@ -301,6 +301,9 @@ export const Default: Story = {
 		await expect(
 			canvas.getByRole("link", { name: "管理员面板" }),
 		).toBeVisible();
+		expect(
+			userCard.querySelector("[data-dashboard-admin-entry-group]"),
+		).not.toBeNull();
 		await expect(canvas.getByRole("link", { name: "退出登录" })).toBeVisible();
 	},
 	parameters: {
