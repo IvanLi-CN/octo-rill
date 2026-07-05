@@ -1,0 +1,37 @@
+# API Key 用户接口调用实现状态（#84nup）
+
+> 当前有效规范仍以 `./SPEC.md` 为准；这里记录实现覆盖、交付进度与 rollout 相关事实，避免这些细节散落到 PR / Git 历史里。
+
+## Current Status
+
+- Implementation: implemented
+- Lifecycle: active
+- Catalog note: fast-track / API Key user business API access
+
+## Coverage / rollout summary
+
+- 新增 `user_api_keys` 迁移，Key 明文使用 `orill_ak_` 前缀并以 SHA-256 hash 存储，列表只保留掩码和元数据。
+- 新增 session-only `/api/me/api-keys` 管理接口；创建响应只返回一次明文，撤销使用 `revoked_at` 软删除并立即失效。
+- 新增 Bearer API Key 业务认证 helper，允许用户态业务接口复用当前 user id，并继续拒绝禁用账号。
+- 设置页新增 `api-keys` section，覆盖空态、创建成功一次性复制态、列表、撤销错误态。
+- Storybook、Playwright settings E2E 与 Rust API Key tests 已覆盖核心行为。
+
+## Remaining Gaps
+
+- None for this delivery scope.
+
+## Related Changes
+
+- `migrations/0055_user_api_keys.sql`
+- `src/api_keys.rs`
+- `src/api.rs`
+- `src/server.rs`
+- `src/translations.rs`
+- `web/src/pages/Settings.tsx`
+- `web/src/stories/Settings.stories.tsx`
+- `web/e2e/settings.spec.ts`
+
+## References
+
+- `./SPEC.md`
+- `./HISTORY.md`

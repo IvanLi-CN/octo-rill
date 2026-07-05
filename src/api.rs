@@ -8,7 +8,7 @@ use std::time::Instant;
 use anyhow::Context;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, extract::State};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -26,7 +26,7 @@ use crate::release_links::{
     parse_internal_release_ref, parse_release_locator_from_github_release_url,
     parse_repo_full_name_from_release_url, resolve_release_refs,
 };
-use crate::{admin_runtime, ai, briefs, jobs, local_id, sync};
+use crate::{admin_runtime, ai, api_keys, briefs, jobs, local_id, sync};
 use crate::{
     error::ApiError,
     passkeys::{
@@ -1135,6 +1135,161 @@ pub async fn me_patch_profile(
     Ok(Json(
         persist_daily_brief_profile(state.as_ref(), &user_id, req).await?,
     ))
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct ApiKeySummary {
+    id: String,
+    name: String,
+    masked_key: String,
+    created_at: String,
+    last_used_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MeApiKeysResponse {
+    items: Vec<ApiKeySummary>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateApiKeyRequest {
+    name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateApiKeyResponse {
+    item: ApiKeySummary,
+    api_key: String,
+}
+
+pub async fn me_get_api_keys(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<MeApiKeysResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    Ok(Json(MeApiKeysResponse {
+        items: load_api_key_summaries(state.as_ref(), &user_id).await?,
+    }))
+}
+
+pub async fn me_create_api_key(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(req): Json<CreateApiKeyRequest>,
+) -> Result<Json<CreateApiKeyResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let name = api_keys::normalize_name(req.name.as_deref())?;
+    let api_key = api_keys::generate_api_key_plaintext();
+    let key_hash = api_keys::hash_api_key(&api_key);
+    let key_prefix = api_keys::key_prefix(&api_key);
+    let masked_key = api_keys::mask_api_key(&api_key);
+    let id = local_id::generate_local_id();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    sqlx::query(
+        r#"
+        INSERT INTO user_api_keys (
+          id,
+          user_id,
+          name,
+          key_hash,
+          key_prefix,
+          masked_key,
+          created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(id.as_str())
+    .bind(user_id.as_str())
+    .bind(name.as_str())
+    .bind(key_hash.as_str())
+    .bind(key_prefix.as_str())
+    .bind(masked_key.as_str())
+    .bind(now.as_str())
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let item = load_api_key_summary(state.as_ref(), &user_id, &id).await?;
+    Ok(Json(CreateApiKeyResponse { item, api_key }))
+}
+
+pub async fn me_delete_api_key(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(api_key_id): Path<String>,
+) -> Result<Json<MeApiKeysResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let api_key_id = parse_local_id_param(api_key_id, "api_key_id")?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        r#"
+        UPDATE user_api_keys
+        SET revoked_at = ?
+        WHERE id = ?
+          AND user_id = ?
+          AND revoked_at IS NULL
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(api_key_id.as_str())
+    .bind(user_id.as_str())
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "api_key_not_found",
+            "API key not found",
+        ));
+    }
+
+    Ok(Json(MeApiKeysResponse {
+        items: load_api_key_summaries(state.as_ref(), &user_id).await?,
+    }))
+}
+
+async fn load_api_key_summaries(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Vec<ApiKeySummary>, ApiError> {
+    sqlx::query_as::<_, ApiKeySummary>(
+        r#"
+        SELECT id, name, masked_key, created_at, last_used_at
+        FROM user_api_keys
+        WHERE user_id = ?
+          AND revoked_at IS NULL
+        ORDER BY created_at DESC, id DESC
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+async fn load_api_key_summary(
+    state: &AppState,
+    user_id: &str,
+    api_key_id: &str,
+) -> Result<ApiKeySummary, ApiError> {
+    sqlx::query_as::<_, ApiKeySummary>(
+        r#"
+        SELECT id, name, masked_key, created_at, last_used_at
+        FROM user_api_keys
+        WHERE user_id = ?
+          AND id = ?
+          AND revoked_at IS NULL
+        "#,
+    )
+    .bind(user_id)
+    .bind(api_key_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)
 }
 
 #[derive(Debug, Serialize)]
@@ -6735,8 +6890,9 @@ pub struct StarredRepoItem {
 pub async fn list_starred(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<StarredRepoItem>>, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
 
     let repos = sqlx::query_as::<_, StarredRepoItem>(
         r#"
@@ -6769,8 +6925,9 @@ pub struct ReleaseItem {
 pub async fn list_releases(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<ReleaseItem>>, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
 
     let items = sqlx::query_as::<_, ReleaseItem>(
         r#"
@@ -7131,9 +7288,10 @@ async fn build_release_detail_response(
 pub async fn get_release_detail(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Path(release_id_raw): Path<String>,
 ) -> Result<Json<ReleaseDetailResponse>, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let release_id = parse_release_id_param(&release_id_raw)?;
 
     let row = fetch_release_detail_row_by_release_id(state.as_ref(), &user_id, release_id)
@@ -7148,9 +7306,10 @@ pub async fn get_release_detail(
 pub async fn get_release_detail_by_repo_tag(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Path((owner_raw, repo_raw, tag_raw)): Path<(String, String, String)>,
 ) -> Result<Json<ReleaseDetailResponse>, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let locator = ReleaseLocator {
         owner: owner_raw,
         repo: repo_raw,
@@ -8276,8 +8435,9 @@ pub struct NotificationItem {
 pub async fn list_notifications(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<NotificationItem>>, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
 
     let items = sqlx::query_as::<_, NotificationItem>(
         r#"
@@ -8329,8 +8489,9 @@ pub struct BriefSummaryItem {
 pub async fn list_briefs(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<BriefSummaryItem>>, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
 
     #[derive(Debug, sqlx::FromRow)]
     struct BriefRow {
@@ -8484,9 +8645,10 @@ pub struct BriefDetailItem {
 pub async fn get_brief(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Path(brief_id): Path<String>,
 ) -> Result<Json<BriefDetailItem>, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
 
     #[derive(Debug, sqlx::FromRow)]
     struct BriefRow {
@@ -8925,9 +9087,10 @@ async fn load_dashboard_notification_signatures(
 pub async fn dashboard_updates(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Query(q): Query<DashboardUpdatesQuery>,
 ) -> Result<Json<DashboardUpdatesResponse>, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let viewer = load_viewer_user(state.as_ref(), &user_id).await?;
     let previous = decode_dashboard_updates_token(q.token.as_deref())?;
     let include = parse_dashboard_update_include(q.include.as_deref())?;
@@ -9076,9 +9239,10 @@ async fn enqueue_singleton_or_stream_task(
 pub async fn task_events_sse(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Path(task_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let task_exists = sqlx::query_scalar::<_, i64>(
         r#"
         SELECT COUNT(*)
@@ -9121,9 +9285,10 @@ where
 pub async fn sync_starred(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Query(mode_query): Query<ReturnModeQuery>,
 ) -> Result<Response, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let mode = ReturnMode::from_query(&mode_query)?;
 
     if matches!(mode, ReturnMode::Sync) {
@@ -9150,9 +9315,10 @@ pub async fn sync_starred(
 pub async fn sync_all(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Query(mode_query): Query<ReturnModeQuery>,
 ) -> Result<Response, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let mode = ReturnMode::from_query(&mode_query)?;
 
     if matches!(mode, ReturnMode::Sync) {
@@ -9233,9 +9399,10 @@ where
 pub async fn sync_releases(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Query(mode_query): Query<ReturnModeQuery>,
 ) -> Result<Response, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let mode = ReturnMode::from_query(&mode_query)?;
 
     if matches!(mode, ReturnMode::Sync) {
@@ -9262,9 +9429,10 @@ pub async fn sync_releases(
 pub async fn sync_notifications(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Query(mode_query): Query<ReturnModeQuery>,
 ) -> Result<Response, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let mode = ReturnMode::from_query(&mode_query)?;
 
     if matches!(mode, ReturnMode::Sync) {
@@ -9309,10 +9477,11 @@ pub struct BriefGenerateRequest {
 pub async fn generate_brief(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Query(mode_query): Query<ReturnModeQuery>,
     payload: Option<Json<BriefGenerateRequest>>,
 ) -> Result<Response, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let mode = ReturnMode::from_query(&mode_query)?;
     let requested_date = payload.and_then(|Json(body)| body.date);
     let key_date = requested_date
@@ -11481,10 +11650,11 @@ fn feed_item_from_row(
 pub async fn list_feed(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Query(q): Query<FeedQuery>,
 ) -> Result<Json<FeedResponse>, ApiError> {
     let started_at = Instant::now();
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let viewer = load_viewer_user(state.as_ref(), &user_id).await?;
     let types = parse_feed_types(q.types.as_deref())?;
     let scope = parse_feed_scope(q.scope.as_deref(), q.items.as_deref(), q.org.as_deref())?;
@@ -11555,10 +11725,11 @@ struct ReleaseReactionRow {
 pub async fn refresh_feed_reactions(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Json(req): Json<FeedReactionRefreshRequest>,
 ) -> Result<Json<FeedReactionRefreshResponse>, ApiError> {
     let started_at = Instant::now();
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let release_ids = parse_unique_release_ids(&req.release_ids, 100)?;
 
     let db_started_at = Instant::now();
@@ -11855,9 +12026,10 @@ async fn mutate_release_reaction(
 pub async fn toggle_release_reaction(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Json(req): Json<ToggleReleaseReactionRequest>,
 ) -> Result<Json<ToggleReleaseReactionResponse>, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let release_id_raw = req.release_id.trim();
     if release_id_raw.is_empty() {
         return Err(ApiError::bad_request("release_id is required"));
@@ -14830,9 +15002,10 @@ async fn translate_releases_batch_stream_worker(
 pub async fn translate_releases_batch(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Json(req): Json<TranslateReleasesBatchRequest>,
 ) -> Result<Json<TranslateBatchResponse>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let release_ids = parse_unique_release_ids(&req.release_ids, 60)?;
     let items = run_with_api_llm_context(
         "api.translate_releases_batch",
@@ -14849,9 +15022,10 @@ pub async fn translate_releases_batch(
 pub async fn translate_releases_batch_stream(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Json(req): Json<TranslateReleasesBatchRequest>,
 ) -> Result<Response, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let release_ids = parse_unique_release_ids(&req.release_ids, 60)?;
     let tracking_task = jobs::start_inline_task(
         state.as_ref(),
@@ -14915,10 +15089,11 @@ pub async fn translate_release_for_user(
 pub async fn translate_release(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Query(mode_query): Query<ReturnModeQuery>,
     Json(req): Json<TranslateReleaseRequest>,
 ) -> Result<Response, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let release_id = req.release_id.trim().to_owned();
     let mode = ReturnMode::from_query(&mode_query)?;
 
@@ -15394,10 +15569,11 @@ async fn translate_release_detail_internal(
 pub async fn translate_release_detail(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Query(mode_query): Query<ReturnModeQuery>,
     Json(req): Json<TranslateReleaseDetailRequest>,
 ) -> Result<Response, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let release_id = req.release_id.trim().to_owned();
     let mode = ReturnMode::from_query(&mode_query)?;
 
@@ -15493,9 +15669,10 @@ async fn translate_release_detail_batch_internal(
 pub async fn translate_release_detail_batch(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Json(req): Json<TranslateReleaseDetailBatchRequest>,
 ) -> Result<Json<TranslateBatchResponse>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let release_ids = parse_unique_release_ids(&req.release_ids, 20)?;
     let items = run_with_api_llm_context(
         "api.translate_release_detail_batch",
@@ -15942,9 +16119,10 @@ async fn translate_notifications_batch_internal(
 pub async fn translate_notifications_batch(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Json(req): Json<TranslateNotificationsBatchRequest>,
 ) -> Result<Json<TranslateBatchResponse>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let thread_ids = parse_unique_thread_ids(&req.thread_ids, 60)?;
     let items = run_with_api_llm_context(
         "api.translate_notifications_batch",
@@ -15961,10 +16139,11 @@ pub async fn translate_notifications_batch(
 pub async fn translate_notification(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Query(mode_query): Query<ReturnModeQuery>,
     Json(req): Json<TranslateNotificationRequest>,
 ) -> Result<Response, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let thread_id = req.thread_id.trim().to_owned();
     let mode = ReturnMode::from_query(&mode_query)?;
 
@@ -16113,6 +16292,45 @@ pub(crate) async fn require_active_user_id(
     Ok(user_id)
 }
 
+pub(crate) async fn require_business_user_id(
+    state: &AppState,
+    session: &Session,
+    headers: &HeaderMap,
+) -> Result<String, ApiError> {
+    if let Some(value) = headers.get(header::AUTHORIZATION) {
+        let value = value.to_str().map_err(|_| {
+            ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid_api_key",
+                "invalid API key",
+            )
+        })?;
+        if let Some(api_key) = value
+            .strip_prefix("Bearer ")
+            .map(str::trim)
+            .filter(|api_key| api_key.starts_with(api_keys::API_KEY_PREFIX))
+        {
+            let user_id = api_keys::authenticate_api_key(state, api_key).await?;
+            touch_user_last_active_at(state, &user_id).await?;
+            return Ok(user_id);
+        }
+
+        match require_active_user_id(state, session).await {
+            Ok(user_id) => return Ok(user_id),
+            Err(_) if value.trim_start().starts_with("Bearer ") => {
+                return Err(ApiError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_api_key",
+                    "invalid API key",
+                ));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    require_active_user_id(state, session).await
+}
+
 pub(crate) async fn require_admin_user_id(
     state: &AppState,
     session: &Session,
@@ -16166,16 +16384,16 @@ mod tests {
         AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery, AdminRepoGovernanceListQuery,
         AdminSyncSubscriptionEventItem, AdminTaskEventItem, AdminUserPatchRequest,
         AdminUserUpdateGuard, AdminUsersQuery, BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT,
-        DashboardUpdatesQuery, DashboardUpdatesToken, FeedQuery, FeedReactionRefreshRequest,
-        FeedRow, GitHubCompareCommit, GitHubCompareCommitDetail, GitHubCompareFile,
-        GitHubCompareResponse, GraphQlError, LLM_CALL_ORDER_BY_CREATED_DESC, LiveReleaseReactions,
-        PublicReleaseQuery, RELEASE_FEED_BODY_MAX_CHARS, ReleaseReactionCounts, ReleaseReactionRow,
-        ReleaseReactionViewer, ReturnModeQuery, SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem,
-        TranslationCacheRow, TranslationUpsert, admin_dashboard, admin_delete_public_release_repo,
-        admin_download_realtime_task_log, admin_get_llm_call_detail,
-        admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
-        admin_list_realtime_tasks, admin_list_repo_governance, admin_list_users,
-        admin_patch_llm_runtime_config, admin_patch_user, admin_users_offset,
+        CreateApiKeyRequest, DashboardUpdatesQuery, DashboardUpdatesToken, FeedQuery,
+        FeedReactionRefreshRequest, FeedRow, GitHubCompareCommit, GitHubCompareCommitDetail,
+        GitHubCompareFile, GitHubCompareResponse, GraphQlError, LLM_CALL_ORDER_BY_CREATED_DESC,
+        LiveReleaseReactions, PublicReleaseQuery, RELEASE_FEED_BODY_MAX_CHARS,
+        ReleaseReactionCounts, ReleaseReactionRow, ReleaseReactionViewer, ReturnModeQuery,
+        SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslationCacheRow, TranslationUpsert,
+        admin_dashboard, admin_delete_public_release_repo, admin_download_realtime_task_log,
+        admin_get_llm_call_detail, admin_get_llm_scheduler_status, admin_get_realtime_task_detail,
+        admin_list_llm_calls, admin_list_realtime_tasks, admin_list_repo_governance,
+        admin_list_users, admin_patch_llm_runtime_config, admin_patch_user, admin_users_offset,
         ai_error_is_non_retryable, brief_contains_release_link, build_compare_digest,
         build_feed_reaction_refresh_item, build_task_diagnostics, compact_dashboard_signatures,
         dashboard_updates, encode_dashboard_updates_token, ensure_account_enabled,
@@ -16187,8 +16405,9 @@ mod tests {
         list_releases, llm_call_order_by_clause, load_admin_dashboard_today_live_snapshot,
         load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
         map_public_compare_fallback_error, mark_translation_requested,
-        markdown_structure_preserved, me, me_delete_passkey, normalize_markdown_translation_output,
-        normalize_translation_fields, parse_batch_notification_translation_payload,
+        markdown_structure_preserved, me, me_create_api_key, me_delete_api_key, me_delete_passkey,
+        me_get_api_keys, normalize_markdown_translation_output, normalize_translation_fields,
+        parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_feed_types, parse_llm_models, parse_positive_admin_concurrency,
         parse_release_id_param, parse_release_smart_summary_payload,
@@ -16197,11 +16416,11 @@ mod tests {
         public_get_repo_release_detail, public_list_repo_releases, refresh_admin_dashboard_rollups,
         refresh_feed_reactions, release_cache_entry_reusable, release_detail_source_hash,
         release_detail_translation_ready, release_excerpt, release_feed_body,
-        release_reactions_status, require_active_user_id, resolve_release_full_name,
-        should_retry_public_compare_without_auth, smart_error_is_retryable, split_markdown_chunks,
-        sync_all, sync_notifications, sync_releases, sync_starred,
-        translate_release_detail_for_user, translate_releases_batch_for_user,
-        translate_response_from_batch_item, upsert_translation,
+        release_reactions_status, require_active_user_id, require_business_user_id,
+        resolve_release_full_name, should_retry_public_compare_without_auth,
+        smart_error_is_retryable, split_markdown_chunks, sync_all, sync_notifications,
+        sync_releases, sync_starred, translate_release_detail_for_user,
+        translate_releases_batch_for_user, translate_response_from_batch_item, upsert_translation,
     };
     use crate::ai;
     use crate::error::ApiError;
@@ -16735,6 +16954,181 @@ mod tests {
         .expect("set last_active_at");
     }
 
+    fn bearer_headers(api_key: &str) -> HeaderMap {
+        authorization_headers(&format!("Bearer {api_key}"))
+    }
+
+    fn authorization_headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(value).expect("valid authorization header"),
+        );
+        headers
+    }
+
+    fn empty_session() -> Session {
+        let store = Arc::new(MemoryStore::default());
+        Session::new(None, store, None)
+    }
+
+    #[tokio::test]
+    async fn api_key_create_lists_once_and_never_stores_plaintext() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        let Json(created) = me_create_api_key(
+            State(state.clone()),
+            setup_session(1).await,
+            Json(CreateApiKeyRequest {
+                name: Some("Deploy bot".to_owned()),
+            }),
+        )
+        .await
+        .expect("create api key");
+
+        assert!(created.api_key.starts_with(crate::api_keys::API_KEY_PREFIX));
+        assert_eq!(created.item.name, "Deploy bot");
+        assert_ne!(created.item.masked_key, created.api_key);
+
+        let stored_plaintext_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM user_api_keys WHERE key_hash = ? OR masked_key = ?",
+        )
+        .bind(created.api_key.as_str())
+        .bind(created.api_key.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("query stored key material");
+        assert_eq!(stored_plaintext_count, 0);
+
+        let Json(listed) = me_get_api_keys(State(state), setup_session(1).await)
+            .await
+            .expect("list api keys");
+        assert_eq!(listed.items.len(), 1);
+        assert_eq!(listed.items[0].id, created.item.id);
+        assert_eq!(listed.items[0].masked_key, created.item.masked_key);
+    }
+
+    #[tokio::test]
+    async fn api_key_authenticates_business_helpers_and_tracks_last_use() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let Json(created) = me_create_api_key(
+            State(state.clone()),
+            setup_session(1).await,
+            Json(CreateApiKeyRequest { name: None }),
+        )
+        .await
+        .expect("create api key");
+        let session = empty_session();
+
+        let resolved = require_business_user_id(
+            state.as_ref(),
+            &session,
+            &bearer_headers(created.api_key.as_str()),
+        )
+        .await
+        .expect("authenticate api key");
+        assert_eq!(resolved, test_user_id(1));
+
+        let last_used_at = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT last_used_at FROM user_api_keys WHERE id = ?",
+        )
+        .bind(created.item.id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("query last used at");
+        assert!(last_used_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn business_auth_preserves_session_for_non_api_key_authorization_headers() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+
+        let resolved = require_business_user_id(
+            state.as_ref(),
+            &session,
+            &authorization_headers("Basic proxy-token"),
+        )
+        .await
+        .expect("session auth should survive unrelated authorization header");
+        assert_eq!(resolved, test_user_id(1));
+
+        let err = require_business_user_id(
+            state.as_ref(),
+            &empty_session(),
+            &authorization_headers("Bearer external-provider-token"),
+        )
+        .await
+        .expect_err("invalid bearer without session should fail as api key");
+        assert_eq!(err.code(), "invalid_api_key");
+    }
+
+    #[tokio::test]
+    async fn revoked_and_disabled_user_api_keys_fail() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let Json(created) = me_create_api_key(
+            State(state.clone()),
+            setup_session(1).await,
+            Json(CreateApiKeyRequest { name: None }),
+        )
+        .await
+        .expect("create api key");
+
+        let _ = me_delete_api_key(
+            State(state.clone()),
+            setup_session(1).await,
+            Path(created.item.id.clone()),
+        )
+        .await
+        .expect("revoke api key");
+
+        let session = empty_session();
+        let err = require_business_user_id(
+            state.as_ref(),
+            &session,
+            &bearer_headers(created.api_key.as_str()),
+        )
+        .await
+        .expect_err("revoked api key should fail");
+        assert_eq!(err.code(), "invalid_api_key");
+
+        let Json(created_again) = me_create_api_key(
+            State(state.clone()),
+            setup_session(1).await,
+            Json(CreateApiKeyRequest { name: None }),
+        )
+        .await
+        .expect("create second api key");
+        sqlx::query("UPDATE users SET is_disabled = 1 WHERE id = ?")
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("disable user");
+        let err = require_business_user_id(
+            state.as_ref(),
+            &session,
+            &bearer_headers(created_again.api_key.as_str()),
+        )
+        .await
+        .expect_err("disabled user api key should fail");
+        assert_eq!(err.code(), "account_disabled");
+    }
+
+    #[tokio::test]
+    async fn api_key_management_remains_session_only() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+
+        let err = me_get_api_keys(State(state), empty_session())
+            .await
+            .expect_err("api key list requires session");
+        assert_eq!(err.code(), "unauthorized");
+    }
+
     #[tokio::test]
     async fn stale_visit_marker_survives_until_me_bootstraps_access_sync() {
         let pool = setup_pool().await;
@@ -16820,6 +17214,7 @@ mod tests {
         let response = sync_all(
             State(state.clone()),
             setup_session(1).await,
+            HeaderMap::new(),
             Query(ReturnModeQuery {
                 return_mode: Some("task_id".to_owned()),
             }),
@@ -16840,6 +17235,7 @@ mod tests {
         let response = sync_all(
             State(state.clone()),
             setup_session(1).await,
+            HeaderMap::new(),
             Query(ReturnModeQuery {
                 return_mode: Some("task_id".to_owned()),
             }),
@@ -16946,6 +17342,7 @@ mod tests {
             sync_starred(
                 State(state.clone()),
                 setup_session(1).await,
+                HeaderMap::new(),
                 Query(ReturnModeQuery {
                     return_mode: Some("task_id".to_owned()),
                 }),
@@ -16959,6 +17356,7 @@ mod tests {
             sync_starred(
                 State(state.clone()),
                 setup_session(1).await,
+                HeaderMap::new(),
                 Query(ReturnModeQuery {
                     return_mode: Some("task_id".to_owned()),
                 }),
@@ -16997,6 +17395,7 @@ mod tests {
             sync_releases(
                 State(state.clone()),
                 setup_session(1).await,
+                HeaderMap::new(),
                 Query(ReturnModeQuery {
                     return_mode: Some("task_id".to_owned()),
                 }),
@@ -17010,6 +17409,7 @@ mod tests {
             sync_releases(
                 State(state.clone()),
                 setup_session(1).await,
+                HeaderMap::new(),
                 Query(ReturnModeQuery {
                     return_mode: Some("task_id".to_owned()),
                 }),
@@ -17048,6 +17448,7 @@ mod tests {
             sync_notifications(
                 State(state.clone()),
                 setup_session(1).await,
+                HeaderMap::new(),
                 Query(ReturnModeQuery {
                     return_mode: Some("task_id".to_owned()),
                 }),
@@ -17061,6 +17462,7 @@ mod tests {
             sync_notifications(
                 State(state.clone()),
                 setup_session(1).await,
+                HeaderMap::new(),
                 Query(ReturnModeQuery {
                     return_mode: Some("task_id".to_owned()),
                 }),
@@ -22856,6 +23258,7 @@ line two",
         let Json(feed) = list_feed(
             State(state.clone()),
             setup_session(1).await,
+            HeaderMap::new(),
             Query(FeedQuery {
                 cursor: None,
                 limit: Some(30),
@@ -22905,6 +23308,7 @@ line two",
         let Json(first_page) = list_feed(
             State(state.clone()),
             setup_session(1).await,
+            HeaderMap::new(),
             Query(FeedQuery {
                 cursor: None,
                 limit: Some(2),
@@ -22928,6 +23332,7 @@ line two",
         let Json(second_page) = list_feed(
             State(state.clone()),
             setup_session(1).await,
+            HeaderMap::new(),
             Query(FeedQuery {
                 cursor: Some(cursor),
                 limit: Some(30),
@@ -22951,6 +23356,7 @@ line two",
         let Json(stars_only) = list_feed(
             State(state.clone()),
             setup_session(1).await,
+            HeaderMap::new(),
             Query(FeedQuery {
                 cursor: None,
                 limit: Some(30),
@@ -22969,6 +23375,7 @@ line two",
         let Json(releases_only) = list_feed(
             State(state.clone()),
             setup_session(1).await,
+            HeaderMap::new(),
             Query(FeedQuery {
                 cursor: None,
                 limit: Some(30),
@@ -22986,6 +23393,7 @@ line two",
         let announcements_only = list_feed(
             State(state.clone()),
             setup_session(1).await,
+            HeaderMap::new(),
             Query(FeedQuery {
                 cursor: None,
                 limit: Some(30),
@@ -23020,6 +23428,7 @@ line two",
         let Json(feed) = list_feed(
             State(state),
             setup_session(1).await,
+            HeaderMap::new(),
             Query(FeedQuery {
                 cursor: None,
                 limit: Some(30),
@@ -23094,6 +23503,7 @@ line two",
         let err = dashboard_updates(
             State(state),
             session,
+            HeaderMap::new(),
             Query(DashboardUpdatesQuery {
                 token: None,
                 feed_type: None,
@@ -23128,6 +23538,7 @@ line two",
         let Json(initial) = dashboard_updates(
             State(state.clone()),
             setup_session(1).await,
+            HeaderMap::new(),
             Query(DashboardUpdatesQuery {
                 token: None,
                 feed_type: Some("all".to_owned()),
@@ -23169,6 +23580,7 @@ line two",
         let Json(changed) = dashboard_updates(
             State(state),
             setup_session(1).await,
+            HeaderMap::new(),
             Query(DashboardUpdatesQuery {
                 token: Some(initial.token),
                 feed_type: Some("all".to_owned()),
@@ -23237,6 +23649,7 @@ line two",
         let Json(initial) = dashboard_updates(
             State(state.clone()),
             setup_session(1).await,
+            HeaderMap::new(),
             Query(DashboardUpdatesQuery {
                 token: None,
                 feed_type: Some("releases".to_owned()),
@@ -23262,6 +23675,7 @@ line two",
         let Json(changed) = dashboard_updates(
             State(state),
             setup_session(1).await,
+            HeaderMap::new(),
             Query(DashboardUpdatesQuery {
                 token: Some(initial.token),
                 feed_type: Some("releases".to_owned()),
@@ -23299,6 +23713,7 @@ line two",
         let Json(initial) = dashboard_updates(
             State(state),
             setup_session(1).await,
+            HeaderMap::new(),
             Query(DashboardUpdatesQuery {
                 token: None,
                 feed_type: Some("all".to_owned()),
@@ -23353,6 +23768,7 @@ line two",
         let Json(stars) = dashboard_updates(
             State(state),
             setup_session(1).await,
+            HeaderMap::new(),
             Query(DashboardUpdatesQuery {
                 token: None,
                 feed_type: Some("stars".to_owned()),
@@ -23384,6 +23800,7 @@ line two",
         let Json(resp) = refresh_feed_reactions(
             State(state),
             setup_session(1).await,
+            HeaderMap::new(),
             Json(FeedReactionRefreshRequest {
                 release_ids: vec!["120".to_owned()],
             }),
@@ -23479,6 +23896,7 @@ line two",
         let Json(feed) = list_feed(
             State(state),
             setup_session(1).await,
+            HeaderMap::new(),
             Query(FeedQuery {
                 cursor: None,
                 limit: Some(30),
@@ -23512,7 +23930,7 @@ line two",
         seed_star(&pool, 42).await;
         let state = setup_state(pool);
 
-        let Json(items) = list_releases(State(state), setup_session(1).await)
+        let Json(items) = list_releases(State(state), setup_session(1).await, HeaderMap::new())
             .await
             .expect("list releases");
 
@@ -23529,7 +23947,7 @@ line two",
         seed_owned_repo_baseline(&pool, 42, "IvanLi-CN/octo-rill").await;
         let state = setup_state(pool);
 
-        let Json(items) = list_releases(State(state), setup_session(1).await)
+        let Json(items) = list_releases(State(state), setup_session(1).await, HeaderMap::new())
             .await
             .expect("list releases");
 
@@ -23544,7 +23962,7 @@ line two",
         set_include_own_releases(&pool, true).await;
         let state = setup_state(pool);
 
-        let Json(items) = list_releases(State(state), setup_session(1).await)
+        let Json(items) = list_releases(State(state), setup_session(1).await, HeaderMap::new())
             .await
             .expect("list releases");
 
@@ -23560,10 +23978,14 @@ line two",
         seed_star(&pool, 42).await;
         let state = setup_state(pool);
 
-        let Json(detail) =
-            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
-                .await
-                .expect("get release detail");
+        let Json(detail) = get_release_detail(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Path("120".to_owned()),
+        )
+        .await
+        .expect("get release detail");
 
         assert_eq!(detail.release_id, "120");
         assert_eq!(detail.repo_full_name.as_deref(), Some("openai/codex"));
@@ -24445,6 +24867,7 @@ line two",
         let Json(detail) = get_release_detail_by_repo_tag(
             State(state),
             setup_session(1).await,
+            HeaderMap::new(),
             Path((
                 "openai".to_owned(),
                 "codex".to_owned(),
@@ -24523,7 +24946,7 @@ line two",
         .await;
         let state = setup_state(pool);
 
-        let Json(items) = list_briefs(State(state), setup_session(1).await)
+        let Json(items) = list_briefs(State(state), setup_session(1).await, HeaderMap::new())
             .await
             .expect("list briefs");
 
@@ -24545,7 +24968,7 @@ line two",
         seed_brief(&pool, user_id.as_str(), "2026-02-23", &large_markdown).await;
         let state = setup_state(pool);
 
-        let Json(items) = list_briefs(State(state), setup_session(1).await)
+        let Json(items) = list_briefs(State(state), setup_session(1).await, HeaderMap::new())
             .await
             .expect("list briefs");
 
@@ -24572,6 +24995,7 @@ line two",
         let Json(item) = get_brief(
             State(state),
             setup_session(1).await,
+            HeaderMap::new(),
             Path("brief-2026-02-23".to_owned()),
         )
         .await
@@ -24599,7 +25023,7 @@ line two",
         .await;
         let state = setup_state(pool);
 
-        let Json(items) = list_briefs(State(state), setup_session(1).await)
+        let Json(items) = list_briefs(State(state), setup_session(1).await, HeaderMap::new())
             .await
             .expect("list briefs");
 
@@ -24682,7 +25106,7 @@ line two",
         .await;
         let state = setup_state(pool);
 
-        let Json(items) = list_briefs(State(state), setup_session(1).await)
+        let Json(items) = list_briefs(State(state), setup_session(1).await, HeaderMap::new())
             .await
             .expect("list briefs");
 
@@ -24714,9 +25138,14 @@ line two",
         seed_owned_repo_baseline(&pool, 42, "IvanLi-CN/octo-rill").await;
         let state = setup_state(pool);
 
-        let err = get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
-            .await
-            .expect_err("owned-only release should stay hidden");
+        let err = get_release_detail(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Path("120".to_owned()),
+        )
+        .await
+        .expect_err("owned-only release should stay hidden");
 
         assert_eq!(err.code(), "not_found");
     }
@@ -24729,10 +25158,14 @@ line two",
         set_include_own_releases(&pool, true).await;
         let state = setup_state(pool);
 
-        let Json(detail) =
-            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
-                .await
-                .expect("get owned release detail");
+        let Json(detail) = get_release_detail(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Path("120".to_owned()),
+        )
+        .await
+        .expect("get owned release detail");
 
         assert_eq!(
             detail.repo_full_name.as_deref(),
@@ -24764,10 +25197,14 @@ line two",
         .await;
         let state = setup_state(pool);
 
-        let Json(detail) =
-            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
-                .await
-                .expect("get release detail from brief link");
+        let Json(detail) = get_release_detail(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Path("120".to_owned()),
+        )
+        .await
+        .expect("get release detail from brief link");
 
         assert_eq!(detail.release_id, "120");
         assert_eq!(detail.repo_full_name.as_deref(), Some("openai/codex"));
@@ -24799,10 +25236,14 @@ line two",
         .expect("insert failed refresh brief");
         let state = setup_state(pool);
 
-        let Json(detail) =
-            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
-                .await
-                .expect("get release detail from failed refresh brief link");
+        let Json(detail) = get_release_detail(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Path("120".to_owned()),
+        )
+        .await
+        .expect("get release detail from failed refresh brief link");
 
         assert_eq!(detail.release_id, "120");
         assert_eq!(detail.repo_full_name.as_deref(), Some("openai/codex"));
@@ -25486,10 +25927,14 @@ line two",
         .await
         .expect("seed terminal missing detail translation");
 
-        let Json(detail) =
-            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
-                .await
-                .expect("get release detail");
+        let Json(detail) = get_release_detail(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Path("120".to_owned()),
+        )
+        .await
+        .expect("get release detail");
 
         let translated = detail.translated.expect("translated detail");
         assert_eq!(translated.status, "missing");
@@ -25550,10 +25995,14 @@ line two",
         .await
         .expect("seed stale ready detail translation");
 
-        let Json(detail) =
-            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
-                .await
-                .expect("get release detail");
+        let Json(detail) = get_release_detail(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Path("120".to_owned()),
+        )
+        .await
+        .expect("get release detail");
 
         let translated = detail.translated.expect("translated detail");
         assert_eq!(translated.status, "ready");
@@ -25589,10 +26038,14 @@ line two",
         .await
         .expect("seed invalid ready detail translation");
 
-        let Json(detail) =
-            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
-                .await
-                .expect("get release detail");
+        let Json(detail) = get_release_detail(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Path("120".to_owned()),
+        )
+        .await
+        .expect("get release detail");
 
         let translated = detail.translated.expect("translated detail");
         assert_eq!(translated.status, "error");
@@ -25618,9 +26071,14 @@ line two",
         seed_repo_release(&pool, 42, 120).await;
         let state = setup_state(pool);
 
-        let err = get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
-            .await
-            .expect_err("release detail should stay hidden");
+        let err = get_release_detail(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Path("120".to_owned()),
+        )
+        .await
+        .expect_err("release detail should stay hidden");
 
         assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
     }

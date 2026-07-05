@@ -4,6 +4,7 @@ import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, userEvent, within } from "storybook/test";
 
 import type {
+	ApiKeySummary,
 	GitHubConnectionResponse,
 	LinuxDoConnectionResponse,
 	MeProfileResponse,
@@ -117,6 +118,8 @@ type SettingsStoryArgs = {
 	linuxdoConnection: LinuxDoConnectionResponse | null;
 	githubConnections: GitHubConnectionResponse[];
 	passkeys: PasskeySummary[];
+	apiKeys: ApiKeySummary[];
+	apiKeyDeleteError: boolean;
 	passkeySupportOverride: boolean;
 	reactionTokenStatus: ReactionTokenStatusResponse;
 	profile: MeProfileResponse;
@@ -132,6 +135,7 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 		args.githubConnections,
 	);
 	const [passkeys, setPasskeys] = useState(args.passkeys);
+	const [apiKeys, setApiKeys] = useState(args.apiKeys);
 	const [reactionTokenStatus, setReactionTokenStatus] = useState(
 		args.reactionTokenStatus,
 	);
@@ -151,6 +155,10 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 	useEffect(() => {
 		setPasskeys(args.passkeys);
 	}, [args.passkeys]);
+
+	useEffect(() => {
+		setApiKeys(args.apiKeys);
+	}, [args.apiKeys]);
 
 	useEffect(() => {
 		setReactionTokenStatus(args.reactionTokenStatus);
@@ -190,6 +198,46 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 		}
 		if (request.pathname === "/api/me/passkeys" && method === "GET") {
 			return jsonResponse({ items: passkeys });
+		}
+		if (request.pathname === "/api/me/api-keys" && method === "GET") {
+			return jsonResponse({ items: apiKeys });
+		}
+		if (request.pathname === "/api/me/api-keys" && method === "POST") {
+			const body = init?.body ? JSON.parse(String(init.body)) : {};
+			const createdAt = "2026-04-18T08:05:00+08:00";
+			const item: ApiKeySummary = {
+				id: `api_key_${apiKeys.length + 1}`,
+				name: String(body.name || "API Key"),
+				masked_key: "orill_ak_storybook...A1b2C3",
+				created_at: createdAt,
+				last_used_at: null,
+			};
+			const nextApiKeys = [item, ...apiKeys];
+			setApiKeys(nextApiKeys);
+			return jsonResponse({
+				item,
+				api_key: "orill_ak_storybook_created_plaintext_A1b2C3",
+			});
+		}
+		if (
+			request.pathname.startsWith("/api/me/api-keys/") &&
+			method === "DELETE"
+		) {
+			if (args.apiKeyDeleteError) {
+				return jsonResponse(
+					{
+						error: {
+							code: "api_key_revoke_failed",
+							message: "撤销 API Key 失败，请稍后重试。",
+						},
+					},
+					500,
+				);
+			}
+			const apiKeyId = request.pathname.split("/").at(-1);
+			const nextApiKeys = apiKeys.filter((apiKey) => apiKey.id !== apiKeyId);
+			setApiKeys(nextApiKeys);
+			return jsonResponse({ items: nextApiKeys });
 		}
 		if (
 			request.pathname.startsWith("/api/me/passkeys/") &&
@@ -354,6 +402,8 @@ const meta = {
 		linuxdoConnection: null,
 		githubConnections: baseGitHubConnections,
 		passkeys: [],
+		apiKeys: [],
+		apiKeyDeleteError: false,
 		passkeySupportOverride: true,
 		reactionTokenStatus: {
 			configured: false,
@@ -383,12 +433,16 @@ export const Default: Story = {
 		await expect(canvas.getByText("日报设置")).toBeVisible();
 		await expect(canvas.getByText("我的发布")).toBeVisible();
 		await expect(canvas.getByText("GitHub PAT")).toBeVisible();
+		await expect(canvas.getByText("API Key")).toBeVisible();
 		await expect(canvas.getByText("LinuxDO 绑定")).toBeVisible();
 		await expect(canvas.getByAltText("storybook-user avatar")).toBeVisible();
 		await expect(canvas.getByAltText("storybook-ops avatar")).toBeVisible();
 
 		await userEvent.click(canvas.getByRole("link", { name: "GitHub PAT" }));
 		await expect(canvas.getByTestId("github-pat-guide-card")).toBeVisible();
+
+		await userEvent.click(canvas.getByRole("link", { name: "API Key" }));
+		await expect(canvas.getByText("还没有 API Key。")).toBeVisible();
 
 		await userEvent.click(canvas.getByRole("link", { name: "我的发布" }));
 		await expect(
@@ -486,6 +540,92 @@ export const PasskeysMultipleDevices: Story = {
 		await expect(canvas.getAllByRole("button", { name: "移除" })).toHaveLength(
 			2,
 		);
+	},
+};
+
+export const ApiKeysEmpty: Story = {
+	args: {
+		section: "api-keys",
+		apiKeys: [],
+	},
+	parameters: {
+		docs: {
+			description: {
+				story: "API Key 空态：展示业务接口权限边界、命名输入与创建入口。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("API Key")).toBeVisible();
+		await expect(canvas.getByText("还没有 API Key。")).toBeVisible();
+		await expect(
+			canvas.getByRole("button", { name: "创建 API Key" }),
+		).toBeVisible();
+	},
+};
+
+export const ApiKeysCreatedOnce: Story = {
+	args: {
+		section: "api-keys",
+		apiKeys: [],
+	},
+	parameters: {
+		docs: {
+			description: {
+				story: "创建成功态：明文只在创建响应后出现一次，列表仍只展示掩码。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await userEvent.type(canvas.getByLabelText("名称"), "local sync script");
+		await userEvent.click(canvas.getByRole("button", { name: "创建 API Key" }));
+		await expect(await canvas.findByText("API Key 已创建")).toBeVisible();
+		await expect(
+			canvas.getByText("orill_ak_storybook_created_plaintext_A1b2C3"),
+		).toBeVisible();
+		await expect(canvas.getByText("orill_ak_storybook...A1b2C3")).toBeVisible();
+	},
+};
+
+export const ApiKeysListAndRevokeError: Story = {
+	args: {
+		section: "api-keys",
+		apiKeyDeleteError: true,
+		apiKeys: [
+			{
+				id: "api_key_cli",
+				name: "CLI sync",
+				masked_key: "orill_ak_cli_prod...x9Y8z7",
+				created_at: "2026-04-12T08:00:00+08:00",
+				last_used_at: "2026-04-18T07:40:00+08:00",
+			},
+			{
+				id: "api_key_worker",
+				name: "brief worker",
+				masked_key: "orill_ak_worker...k3LmN4",
+				created_at: "2026-04-14T12:20:00+08:00",
+				last_used_at: null,
+			},
+		],
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"API Key 列表与撤销错误态：验证列表 metadata、掩码展示和失败反馈。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("CLI sync")).toBeVisible();
+		await expect(canvas.getByText("brief worker")).toBeVisible();
+		await userEvent.click(canvas.getAllByRole("button", { name: "撤销" })[0]);
+		await expect(
+			await canvas.findByText("撤销 API Key 失败，请稍后重试。"),
+		).toBeVisible();
 	},
 };
 
