@@ -5,6 +5,8 @@ CREATE TABLE IF NOT EXISTS user_api_keys (
   user_id TEXT NOT NULL,
   name TEXT NOT NULL,
   key_hash TEXT NOT NULL UNIQUE,
+  key_ciphertext BLOB NOT NULL,
+  key_nonce BLOB NOT NULL,
   key_prefix TEXT NOT NULL,
   masked_key TEXT NOT NULL,
   created_at TEXT NOT NULL,

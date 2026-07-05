@@ -1137,10 +1137,22 @@ pub async fn me_patch_profile(
     ))
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
 pub struct ApiKeySummary {
     id: String,
     name: String,
+    api_key: String,
+    masked_key: String,
+    created_at: String,
+    last_used_at: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ApiKeySummaryRow {
+    id: String,
+    name: String,
+    key_ciphertext: Vec<u8>,
+    key_nonce: Vec<u8>,
     masked_key: String,
     created_at: String,
     last_used_at: Option<String>,
@@ -1181,6 +1193,10 @@ pub async fn me_create_api_key(
     let name = api_keys::normalize_name(req.name.as_deref())?;
     let api_key = api_keys::generate_api_key_plaintext();
     let key_hash = api_keys::hash_api_key(&api_key);
+    let encrypted = state
+        .encryption_key
+        .encrypt_str(&api_key)
+        .map_err(ApiError::internal)?;
     let key_prefix = api_keys::key_prefix(&api_key);
     let masked_key = api_keys::mask_api_key(&api_key);
     let id = local_id::generate_local_id();
@@ -1193,17 +1209,21 @@ pub async fn me_create_api_key(
           user_id,
           name,
           key_hash,
+          key_ciphertext,
+          key_nonce,
           key_prefix,
           masked_key,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(id.as_str())
     .bind(user_id.as_str())
     .bind(name.as_str())
     .bind(key_hash.as_str())
+    .bind(encrypted.ciphertext)
+    .bind(encrypted.nonce)
     .bind(key_prefix.as_str())
     .bind(masked_key.as_str())
     .bind(now.as_str())
@@ -1256,9 +1276,9 @@ async fn load_api_key_summaries(
     state: &AppState,
     user_id: &str,
 ) -> Result<Vec<ApiKeySummary>, ApiError> {
-    sqlx::query_as::<_, ApiKeySummary>(
+    let rows = sqlx::query_as::<_, ApiKeySummaryRow>(
         r#"
-        SELECT id, name, masked_key, created_at, last_used_at
+        SELECT id, name, key_ciphertext, key_nonce, masked_key, created_at, last_used_at
         FROM user_api_keys
         WHERE user_id = ?
           AND revoked_at IS NULL
@@ -1268,7 +1288,11 @@ async fn load_api_key_summaries(
     .bind(user_id)
     .fetch_all(&state.pool)
     .await
-    .map_err(ApiError::internal)
+    .map_err(ApiError::internal)?;
+
+    rows.into_iter()
+        .map(|row| api_key_summary_from_row(state, row))
+        .collect()
 }
 
 async fn load_api_key_summary(
@@ -1276,9 +1300,9 @@ async fn load_api_key_summary(
     user_id: &str,
     api_key_id: &str,
 ) -> Result<ApiKeySummary, ApiError> {
-    sqlx::query_as::<_, ApiKeySummary>(
+    let row = sqlx::query_as::<_, ApiKeySummaryRow>(
         r#"
-        SELECT id, name, masked_key, created_at, last_used_at
+        SELECT id, name, key_ciphertext, key_nonce, masked_key, created_at, last_used_at
         FROM user_api_keys
         WHERE user_id = ?
           AND id = ?
@@ -1289,7 +1313,27 @@ async fn load_api_key_summary(
     .bind(api_key_id)
     .fetch_one(&state.pool)
     .await
-    .map_err(ApiError::internal)
+    .map_err(ApiError::internal)?;
+
+    api_key_summary_from_row(state, row)
+}
+
+fn api_key_summary_from_row(
+    state: &AppState,
+    row: ApiKeySummaryRow,
+) -> Result<ApiKeySummary, ApiError> {
+    let api_key = state
+        .encryption_key
+        .decrypt_str(&row.key_ciphertext, &row.key_nonce)
+        .map_err(ApiError::internal)?;
+    Ok(ApiKeySummary {
+        id: row.id,
+        name: row.name,
+        api_key,
+        masked_key: row.masked_key,
+        created_at: row.created_at,
+        last_used_at: row.last_used_at,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -16973,7 +17017,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_key_create_lists_once_and_never_stores_plaintext() {
+    async fn api_key_create_lists_and_never_stores_plaintext() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
 
@@ -16989,11 +17033,19 @@ mod tests {
 
         assert!(created.api_key.starts_with(crate::api_keys::API_KEY_PREFIX));
         assert_eq!(created.item.name, "Deploy bot");
+        assert_eq!(created.item.api_key, created.api_key);
         assert_ne!(created.item.masked_key, created.api_key);
 
         let stored_plaintext_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM user_api_keys WHERE key_hash = ? OR masked_key = ?",
+            r#"
+            SELECT COUNT(*)
+            FROM user_api_keys
+            WHERE key_hash = ?
+               OR masked_key = ?
+               OR CAST(key_ciphertext AS TEXT) = ?
+            "#,
         )
+        .bind(created.api_key.as_str())
         .bind(created.api_key.as_str())
         .bind(created.api_key.as_str())
         .fetch_one(&pool)
@@ -17001,11 +17053,28 @@ mod tests {
         .expect("query stored key material");
         assert_eq!(stored_plaintext_count, 0);
 
+        let (ciphertext, nonce) = sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
+            "SELECT key_ciphertext, key_nonce FROM user_api_keys WHERE id = ?",
+        )
+        .bind(created.item.id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("query encrypted key material");
+        assert_ne!(ciphertext, created.api_key.as_bytes());
+        assert_eq!(
+            state
+                .encryption_key
+                .decrypt_str(&ciphertext, &nonce)
+                .expect("decrypt api key"),
+            created.api_key
+        );
+
         let Json(listed) = me_get_api_keys(State(state), setup_session(1).await)
             .await
             .expect("list api keys");
         assert_eq!(listed.items.len(), 1);
         assert_eq!(listed.items[0].id, created.item.id);
+        assert_eq!(listed.items[0].api_key, created.api_key);
         assert_eq!(listed.items[0].masked_key, created.item.masked_key);
     }
 

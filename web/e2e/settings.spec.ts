@@ -123,6 +123,7 @@ async function installSettingsMocks(
 		apiKeys?: Array<{
 			id: string;
 			name: string;
+			api_key: string;
 			masked_key: string;
 			created_at: string;
 			last_used_at: string | null;
@@ -196,6 +197,7 @@ async function installSettingsMocks(
 			const item = {
 				id: `api_key_${apiKeys.length + 1}`,
 				name: payload?.name || "API Key",
+				api_key: "orill_ak_e2e_created_plaintext_A1b2C3",
 				masked_key: "orill_ak_e2e_created...A1b2C3",
 				created_at: "2026-04-18T08:05:00+08:00",
 				last_used_at: null,
@@ -426,7 +428,7 @@ test("settings deep link focuses github pat section", async ({ page }) => {
 	await expect(page.getByText("@storybook-ops", { exact: true })).toBeVisible();
 });
 
-test("settings api key section creates once-only key and shows revoke errors", async ({
+test("settings api key section persists key display and confirms revoke", async ({
 	page,
 }) => {
 	await installPasskeyBrowserMock(page);
@@ -436,6 +438,7 @@ test("settings api key section creates once-only key and shows revoke errors", a
 			{
 				id: "api_key_cli",
 				name: "CLI sync",
+				api_key: "orill_ak_cli_prod_full_plaintext_x9Y8z7",
 				masked_key: "orill_ak_cli_prod...x9Y8z7",
 				created_at: "2026-04-12T08:00:00+08:00",
 				last_used_at: "2026-04-18T07:40:00+08:00",
@@ -448,16 +451,18 @@ test("settings api key section creates once-only key and shows revoke errors", a
 	await expect(page).toHaveURL(/section=api-keys/);
 	const section = page.locator('[data-settings-section="api-keys"]');
 	await expect(section).toContainText("CLI sync");
-	await expect(section).toContainText("orill_ak_cli_prod...x9Y8z7");
+	await expect(section).toContainText(
+		"orill_ak_cli_prod_full_plaintext_x9Y8z7",
+	);
 
 	await section.getByLabel("名称").fill("local sync script");
 	await section.getByRole("button", { name: "创建 API Key" }).click();
 	await expect(section.getByText("API Key 已创建")).toBeVisible();
 	await expect(
 		section.getByText("orill_ak_e2e_created_plaintext_A1b2C3"),
-	).toBeVisible();
+	).toHaveCount(2);
 	await expect(
-		section.getByText("orill_ak_e2e_created...A1b2C3"),
+		section.getByText("之后仍可在本页查看和复制完整 Key。"),
 	).toBeVisible();
 
 	await section
@@ -466,6 +471,8 @@ test("settings api key section creates once-only key and shows revoke errors", a
 			name: "撤销",
 		})
 		.click();
+	await expect(page.getByRole("alertdialog")).toContainText("确认撤销 API Key");
+	await page.getByRole("button", { name: "确认撤销" }).click();
 	await expect(
 		section.getByText("撤销 API Key 失败，请稍后重试。"),
 	).toBeVisible();

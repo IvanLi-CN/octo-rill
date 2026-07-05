@@ -400,6 +400,7 @@ export type MePasskeysResponse = {
 export type ApiKeySummary = {
 	id: string;
 	name: string;
+	api_key: string;
 	masked_key: string;
 	created_at: string;
 	last_used_at: string | null;

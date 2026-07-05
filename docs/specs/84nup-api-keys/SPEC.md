@@ -15,7 +15,7 @@
 - 用户可在设置页创建、查看和撤销多把命名 API Key。
 - API Key 通过 `Authorization: Bearer <key>` 调用现有 `/api/...` 用户态业务接口。
 - API Key 只代表当前用户的业务调用身份，不具备账号设置、凭据管理、登录或 admin 能力。
-- API Key 明文只在创建响应中出现一次；后端只保存 hash、掩码和元数据。
+- API Key 可在设置页持续回显；后端使用 hash 做认证，并用 AES-256-GCM 加密保存回显所需明文。
 
 ### Non-goals
 
@@ -44,7 +44,7 @@
 ### MUST
 
 - API Key 明文格式必须带 OctoRill 专用前缀，便于用户识别和服务端快速拒绝非本产品 token。
-- 服务端不得存储 API Key 明文或可逆密文；只能保存 hash、短前缀/掩码、创建时间、更新时间和最近使用时间。
+- 服务端不得存储 API Key 明文；必须保存 hash 用于认证，并保存加密密文与 nonce 用于 session-only 设置页回显。
 - `GET /api/me/api-keys`、`POST /api/me/api-keys`、`DELETE /api/me/api-keys/{api_key_id}` 必须只接受网页登录 session，不接受 API Key。
 - Bearer API Key 只能调用业务数据与任务接口：release/feed/notification/brief 读取、sync、translation、brief generation、reaction refresh/toggle、task/translation stream。
 - Bearer API Key 调用 `/api/me*`、`/api/reaction-token*`、`/api/auth*`、`/api/admin*`、`/auth*` 必须失败。
@@ -54,8 +54,9 @@
 ### SHOULD
 
 - 创建 API Key 时允许用户填写简短名称；名称为空时使用稳定默认名称。
-- 列表按创建时间倒序展示，显示名称、掩码、创建时间、最近使用时间和撤销入口。
-- 创建成功态应提供一次性复制能力，并清楚提示刷新或离开后无法再次查看明文。
+- 列表按创建时间倒序展示，显示名称、完整 Key、创建时间、最近使用时间和撤销入口。
+- 创建成功态应提供复制能力，并清楚提示之后仍可在本页查看完整 Key。
+- 撤销入口必须在发起 DELETE 前提供二次确认。
 
 ### COULD
 
@@ -66,8 +67,8 @@
 ### Core flows
 
 - 用户打开 `/settings?section=api-keys`，若没有 Key，看到空态说明和创建入口。
-- 用户输入名称并创建 API Key，后端返回新 Key 明文和列表项；前端展示一次性复制区和最新列表。
-- 用户刷新页面或重新打开列表，只能看到掩码和元数据，不能取回明文。
+- 用户输入名称并创建 API Key，后端返回新 Key 明文和列表项；前端展示复制区和最新列表。
+- 用户刷新页面或重新打开列表，仍能看到完整 Key 并复制。
 - 外部客户端携带 `Authorization: Bearer <key>` 调用允许的 `/api/...` 业务接口，后端按 Key 归属用户执行业务逻辑。
 - 用户撤销某把 Key 后，该 Key 后续调用返回未授权。
 
@@ -85,9 +86,9 @@
 
 | 接口（Name） | 类型（Kind） | 范围（Scope） | 变更（Change） | 契约文档（Contract Doc） | 负责人（Owner） | 使用方（Consumers） | 备注（Notes） |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `user_api_keys` | DB | internal | New | ./contracts/db.md | backend | backend | 存 Key hash 与元数据 |
+| `user_api_keys` | DB | internal | New | ./contracts/db.md | backend | backend | 存 Key hash、加密密文与元数据 |
 | `GET /api/me/api-keys` | HTTP API | external | New | ./contracts/http-apis.md | backend | web | session-only |
-| `POST /api/me/api-keys` | HTTP API | external | New | ./contracts/http-apis.md | backend | web | 创建响应含一次性明文 |
+| `POST /api/me/api-keys` | HTTP API | external | New | ./contracts/http-apis.md | backend | web | 创建响应含完整 Key |
 | `DELETE /api/me/api-keys/{api_key_id}` | HTTP API | external | New | ./contracts/http-apis.md | backend | web | session-only revoke |
 | `Authorization: Bearer <api_key>` | HTTP auth | external | Modify | ./contracts/http-apis.md | backend | external clients | 仅允许用户态业务接口 |
 | `/settings?section=api-keys` | Web route | internal | Modify | ./contracts/http-apis.md | web | user | 新增设置页 section |
@@ -105,7 +106,7 @@
 
 - Given 用户创建 API Key
   When 创建成功响应返回
-  Then 页面只在本次成功态显示完整明文，并可复制；刷新后只显示掩码。
+  Then 页面显示完整 Key，并可在刷新后继续查看和复制。
 
 - Given 客户端携带有效 API Key
   When 调用允许的用户态业务接口
@@ -131,8 +132,8 @@
 ### Testing
 
 - Rust tests: Key 生成/存储不落明文、有效 Key 调用允许接口、撤销/禁用/禁止路由失败。
-- Web tests: settings API Key section 空态、创建成功一次性明文态、列表态、撤销态。
-- E2E tests: `/settings?section=api-keys` 深链、创建/撤销 mock flow、禁止恢复明文。
+- Web tests: settings API Key section 空态、创建成功回显态、列表态、撤销二次确认态。
+- E2E tests: `/settings?section=api-keys` 深链、创建/撤销确认 mock flow、完整 Key 回显。
 
 ### UI / Storybook (if applicable)
 
@@ -160,7 +161,7 @@
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
 - 风险：现有 handler 大量直接消费 session 用户 id，接入 Bearer Key 时必须避免误开放账号管理与 admin 路由。
-- 风险：API Key 明文一次性展示必须与 Storybook/E2E mock 同步，否则前端容易误导用户以为可以再次查看。
+- 风险：API Key 可回显依赖服务端加密密文；设置页必须提示只在可信设备打开。
 - 需要决策的问题：None
 - 假设（已确定）：本轮不做 per-key scope、强制过期时间或全局限流。
 

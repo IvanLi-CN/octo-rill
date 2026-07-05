@@ -208,6 +208,7 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 			const item: ApiKeySummary = {
 				id: `api_key_${apiKeys.length + 1}`,
 				name: String(body.name || "API Key"),
+				api_key: "orill_ak_storybook_created_plaintext_A1b2C3",
 				masked_key: "orill_ak_storybook...A1b2C3",
 				created_at: createdAt,
 				last_used_at: null,
@@ -573,7 +574,7 @@ export const ApiKeysCreatedOnce: Story = {
 	parameters: {
 		docs: {
 			description: {
-				story: "创建成功态：明文只在创建响应后出现一次，列表仍只展示掩码。",
+				story: "创建成功态：完整 Key 会加入列表，用户之后仍可回显和复制。",
 			},
 		},
 	},
@@ -585,7 +586,9 @@ export const ApiKeysCreatedOnce: Story = {
 		await expect(
 			canvas.getByText("orill_ak_storybook_created_plaintext_A1b2C3"),
 		).toBeVisible();
-		await expect(canvas.getByText("orill_ak_storybook...A1b2C3")).toBeVisible();
+		await expect(
+			canvas.getByText("之后仍可在本页查看和复制完整 Key。"),
+		).toBeVisible();
 	},
 };
 
@@ -597,6 +600,7 @@ export const ApiKeysListAndRevokeError: Story = {
 			{
 				id: "api_key_cli",
 				name: "CLI sync",
+				api_key: "orill_ak_cli_prod_full_plaintext_x9Y8z7",
 				masked_key: "orill_ak_cli_prod...x9Y8z7",
 				created_at: "2026-04-12T08:00:00+08:00",
 				last_used_at: "2026-04-18T07:40:00+08:00",
@@ -604,6 +608,7 @@ export const ApiKeysListAndRevokeError: Story = {
 			{
 				id: "api_key_worker",
 				name: "brief worker",
+				api_key: "orill_ak_worker_full_plaintext_k3LmN4",
 				masked_key: "orill_ak_worker...k3LmN4",
 				created_at: "2026-04-14T12:20:00+08:00",
 				last_used_at: null,
@@ -614,7 +619,7 @@ export const ApiKeysListAndRevokeError: Story = {
 		docs: {
 			description: {
 				story:
-					"API Key 列表与撤销错误态：验证列表 metadata、掩码展示和失败反馈。",
+					"API Key 列表与撤销错误态：验证完整 Key 回显、metadata、二次确认和失败反馈。",
 			},
 		},
 	},
@@ -622,7 +627,12 @@ export const ApiKeysListAndRevokeError: Story = {
 		const canvas = within(canvasElement);
 		await expect(canvas.getByText("CLI sync")).toBeVisible();
 		await expect(canvas.getByText("brief worker")).toBeVisible();
+		await expect(
+			canvas.getByText("orill_ak_cli_prod_full_plaintext_x9Y8z7"),
+		).toBeVisible();
 		await userEvent.click(canvas.getAllByRole("button", { name: "撤销" })[0]);
+		await expect(await canvas.findByText("确认撤销 API Key")).toBeVisible();
+		await userEvent.click(canvas.getByRole("button", { name: "确认撤销" }));
 		await expect(
 			await canvas.findByText("撤销 API Key 失败，请稍后重试。"),
 		).toBeVisible();

@@ -13,6 +13,8 @@
   - `user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE`
   - `name TEXT NOT NULL`
   - `key_hash TEXT NOT NULL UNIQUE`
+  - `key_ciphertext BLOB NOT NULL`
+  - `key_nonce BLOB NOT NULL`
   - `key_prefix TEXT NOT NULL`
   - `masked_key TEXT NOT NULL`
   - `created_at TEXT NOT NULL`
@@ -27,4 +29,4 @@
 - 向后兼容窗口（Backward compatibility window）: additive migration，不影响现有用户与 session。
 - 发布/上线步骤（Rollout steps）: 先应用 migration，再发布后端与前端。
 - 回滚策略（Rollback strategy）: 回滚应用代码后，该表可保留不用；不要求自动删除用户已创建 Key。
-- 回填/数据迁移（Backfill / data migration）: None。
+- 回填/数据迁移（Backfill / data migration）: None；新创建 Key 同时写入 hash 与加密密文。

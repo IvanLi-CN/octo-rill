@@ -15,7 +15,8 @@
 ### 响应（Response）
 
 - Success: `{ items: ApiKeySummary[] }`
-- `ApiKeySummary`: `{ id, name, masked_key, created_at, last_used_at }`
+- `ApiKeySummary`: `{ id, name, api_key, masked_key, created_at, last_used_at }`
+- `api_key` 由服务端解密后返回；该接口仍为 session only。
 
 ### 错误（Errors）
 
@@ -36,7 +37,7 @@
 ### 响应（Response）
 
 - Success: `{ item: ApiKeySummary, api_key: string }`
-- `api_key` 只在创建响应中返回一次。
+- `item.api_key` 与顶层 `api_key` 都包含完整 Key，便于当前创建成功态与列表态复用。
 
 ### 错误（Errors）
 
@@ -105,5 +106,6 @@
 ### 行为
 
 - 新增 `api-keys` settings section。
-- 展示创建表单、一次性明文成功态、列表、空态和撤销入口。
-- 该 section 不读取或展示任何 API Key 明文历史值。
+- 展示创建表单、完整 Key 成功态、列表、空态和撤销入口。
+- 列表显示完整 Key，并提供复制入口。
+- 撤销入口必须先展示二次确认对话框，确认后才调用 DELETE。

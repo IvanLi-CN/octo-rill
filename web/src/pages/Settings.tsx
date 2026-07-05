@@ -56,6 +56,17 @@ import {
 } from "@/briefs/DailyBriefProfileForm";
 import { AuthProviderIcon } from "@/components/brand/AuthProviderIcon";
 import { BrandLogo } from "@/components/brand/BrandLogo";
+import {
+	AlertDialog,
+	AlertDialogAction,
+	AlertDialogCancel,
+	AlertDialogContent,
+	AlertDialogDescription,
+	AlertDialogFooter,
+	AlertDialogHeader,
+	AlertDialogTitle,
+	AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -325,7 +336,10 @@ export function SettingsPage(props: {
 	const [apiKeyName, setApiKeyName] = useState("");
 	const [createdApiKey, setCreatedApiKey] =
 		useState<CreateApiKeyResponse | null>(null);
-	const [copiedApiKey, setCopiedApiKey] = useState(false);
+	const [copiedApiKeyId, setCopiedApiKeyId] = useState<string | null>(null);
+	const [pendingApiKeyRevokeId, setPendingApiKeyRevokeId] = useState<
+		string | null
+	>(null);
 	const [linuxdoLoading, setLinuxdoLoading] = useState(true);
 	const [linuxdoBusy, setLinuxdoBusy] = useState(false);
 	const [linuxdoError, setLinuxdoError] = useState<string | null>(null);
@@ -460,7 +474,8 @@ export function SettingsPage(props: {
 	useEffect(() => {
 		if (section !== "api-keys") {
 			setCreatedApiKey(null);
-			setCopiedApiKey(false);
+			setCopiedApiKeyId(null);
+			setPendingApiKeyRevokeId(null);
 		}
 	}, [section]);
 
@@ -557,7 +572,7 @@ export function SettingsPage(props: {
 			event.preventDefault();
 			setApiKeysCreating(true);
 			setApiKeysError(null);
-			setCopiedApiKey(false);
+			setCopiedApiKeyId(null);
 			void apiCreateMeApiKey({
 				name: apiKeyName.trim() || undefined,
 			})
@@ -579,15 +594,14 @@ export function SettingsPage(props: {
 		[apiKeyName],
 	);
 
-	const onCopyCreatedApiKey = useCallback(() => {
-		if (!createdApiKey) return;
+	const onCopyApiKey = useCallback((apiKeyId: string, apiKey: string) => {
 		void navigator.clipboard
-			.writeText(createdApiKey.api_key)
-			.then(() => setCopiedApiKey(true))
+			.writeText(apiKey)
+			.then(() => setCopiedApiKeyId(apiKeyId))
 			.catch((err) => {
 				setApiKeysError(err instanceof Error ? err.message : String(err));
 			});
-	}, [createdApiKey]);
+	}, []);
 
 	const onDeleteApiKey = useCallback((apiKeyId: string) => {
 		setApiKeysBusyId(apiKeyId);
@@ -598,6 +612,7 @@ export function SettingsPage(props: {
 				setCreatedApiKey((current) =>
 					current?.item.id === apiKeyId ? null : current,
 				);
+				setPendingApiKeyRevokeId(null);
 			})
 			.catch((err) => {
 				setApiKeysError(err instanceof Error ? err.message : String(err));
@@ -1561,6 +1576,7 @@ export function SettingsPage(props: {
 									<div className="rounded-2xl border border-border/70 bg-muted/20 px-4 py-3 text-sm text-muted-foreground">
 										API Key
 										只能调用发布、Feed、通知、日报、同步、翻译与任务流等用户态业务接口；账号设置、凭据管理、登录与管理员接口仍需网页登录。
+										列表会显示完整 Key，请只在可信设备上打开本页。
 									</div>
 
 									<form
@@ -1599,17 +1615,24 @@ export function SettingsPage(props: {
 														API Key 已创建
 													</p>
 													<p className="text-muted-foreground text-sm leading-6">
-														明文只显示这一次；离开或刷新设置页后无法再次查看。
+														已加入下方列表，之后仍可在本页查看和复制完整 Key。
 													</p>
 												</div>
 												<Button
 													type="button"
 													size="sm"
 													variant="outline"
-													onClick={onCopyCreatedApiKey}
+													onClick={() =>
+														onCopyApiKey(
+															createdApiKey.item.id,
+															createdApiKey.api_key,
+														)
+													}
 												>
 													<Copy className="size-4" />
-													{copiedApiKey ? "已复制" : "复制"}
+													{copiedApiKeyId === createdApiKey.item.id
+														? "已复制"
+														: "复制"}
 												</Button>
 											</div>
 											<div className="rounded-xl border border-emerald-500/25 bg-background/90 px-3 py-2 font-mono text-sm break-all text-foreground">
@@ -1647,23 +1670,72 @@ export function SettingsPage(props: {
 																	{apiKey.name}
 																</p>
 																<p className="font-mono text-sm break-all text-muted-foreground">
-																	{apiKey.masked_key}
+																	{apiKey.api_key}
 																</p>
 															</div>
-															<Button
-																type="button"
-																variant="outline"
-																size="sm"
-																disabled={isBusy}
-																onClick={() => onDeleteApiKey(apiKey.id)}
-															>
-																{isBusy ? (
-																	<LoaderCircle className="size-4 animate-spin" />
-																) : (
-																	<Trash2 className="size-4" />
-																)}
-																撤销
-															</Button>
+															<div className="flex shrink-0 flex-wrap gap-2">
+																<Button
+																	type="button"
+																	variant="outline"
+																	size="sm"
+																	onClick={() =>
+																		onCopyApiKey(apiKey.id, apiKey.api_key)
+																	}
+																>
+																	<Copy className="size-4" />
+																	{copiedApiKeyId === apiKey.id
+																		? "已复制"
+																		: "复制"}
+																</Button>
+																<AlertDialog
+																	open={pendingApiKeyRevokeId === apiKey.id}
+																	onOpenChange={(open) =>
+																		setPendingApiKeyRevokeId(
+																			open ? apiKey.id : null,
+																		)
+																	}
+																>
+																	<AlertDialogTrigger asChild>
+																		<Button
+																			type="button"
+																			variant="outline"
+																			size="sm"
+																			disabled={isBusy}
+																		>
+																			{isBusy ? (
+																				<LoaderCircle className="size-4 animate-spin" />
+																			) : (
+																				<Trash2 className="size-4" />
+																			)}
+																			撤销
+																		</Button>
+																	</AlertDialogTrigger>
+																	<AlertDialogContent>
+																		<AlertDialogHeader>
+																			<AlertDialogTitle>
+																				确认撤销 API Key
+																			</AlertDialogTitle>
+																			<AlertDialogDescription>
+																				撤销后 {apiKey.name} 会立即失效，使用该
+																				Key
+																				的脚本和外部客户端将无法继续调用接口。
+																			</AlertDialogDescription>
+																		</AlertDialogHeader>
+																		<AlertDialogFooter>
+																			<AlertDialogCancel>
+																				取消
+																			</AlertDialogCancel>
+																			<AlertDialogAction
+																				onClick={() =>
+																					onDeleteApiKey(apiKey.id)
+																				}
+																			>
+																				确认撤销
+																			</AlertDialogAction>
+																		</AlertDialogFooter>
+																	</AlertDialogContent>
+																</AlertDialog>
+															</div>
 														</div>
 														<div className="grid gap-3 sm:grid-cols-2">
 															<DetailItem
@@ -1673,7 +1745,7 @@ export function SettingsPage(props: {
 															<DetailItem
 																label="最近使用"
 																value={formatDateTime(apiKey.last_used_at)}
-																hint="撤销后立即失效，列表中不再显示。"
+																hint={`掩码：${apiKey.masked_key}`}
 															/>
 														</div>
 													</div>
