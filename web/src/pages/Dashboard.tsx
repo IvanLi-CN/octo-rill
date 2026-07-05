@@ -356,6 +356,36 @@ type DashboardSessionState = {
 
 const dashboardSessionStateByUser = new Map<string, DashboardSessionState>();
 
+function mergeBriefSummariesWithCachedDetails(
+	summaries: BriefItem[],
+	cached: BriefItem[],
+) {
+	const cachedById = new Map(cached.map((brief) => [brief.id, brief]));
+	return summaries.map((summary) => {
+		const existing = cachedById.get(summary.id);
+		if (
+			existing?.content_markdown &&
+			existing.updated_at &&
+			summary.updated_at &&
+			existing.updated_at === summary.updated_at
+		) {
+			return {
+				...summary,
+				content_markdown: existing.content_markdown,
+			};
+		}
+		return summary;
+	});
+}
+
+function resolveSelectedBrief(briefs: BriefItem[], selectedId: string | null) {
+	if (selectedId) {
+		const found = briefs.find((brief) => brief.id === selectedId);
+		if (found) return found;
+	}
+	return briefs[0] ?? null;
+}
+
 function ScopedSummaryCard(props: {
 	scope: DashboardScope;
 	feedItems: FeedItem[];
@@ -868,6 +898,13 @@ export function Dashboard(props: {
 	const [briefs, setBriefs] = useState<BriefItem[]>(
 		() => sessionState?.briefs ?? warmStart?.briefs ?? [],
 	);
+	const briefDetailRequestInFlightRef = useRef<Set<string>>(new Set());
+	const [briefDetailLoadingIds, setBriefDetailLoadingIds] = useState<
+		Set<string>
+	>(() => new Set());
+	const [briefDetailErrors, setBriefDetailErrors] = useState<
+		Record<string, string | undefined>
+	>({});
 	const allowReleaseItemLaneOverride = useMediaQuery("(min-width: 640px)");
 	const [briefsError, setBriefsError] = useState<DashboardSectionError | null>(
 		null,
@@ -988,7 +1025,9 @@ export function Dashboard(props: {
 					throw briefsResult.reason;
 				}
 				const b = briefsResult.value;
-				setBriefs(b);
+				setBriefs((current) =>
+					mergeBriefSummariesWithCachedDetails(b, current),
+				);
 				setSelectedBriefId((prev) => {
 					if (
 						options?.preferredBriefId &&
@@ -1039,6 +1078,69 @@ export function Dashboard(props: {
 		},
 		[loadNotifications],
 	);
+	const selectedBrief = useMemo(
+		() => resolveSelectedBrief(briefs, selectedBriefId),
+		[briefs, selectedBriefId],
+	);
+	const selectedBriefDetailLoading = selectedBrief
+		? briefDetailLoadingIds.has(selectedBrief.id)
+		: false;
+	const selectedBriefDetailError = selectedBrief
+		? (briefDetailErrors[selectedBrief.id] ?? null)
+		: null;
+	const loadBriefDetail = useCallback(
+		async (briefId: string) => {
+			if (briefDetailRequestInFlightRef.current.has(briefId)) {
+				return;
+			}
+			briefDetailRequestInFlightRef.current.add(briefId);
+			setBriefDetailLoadingIds((current) => {
+				const next = new Set(current);
+				next.add(briefId);
+				return next;
+			});
+			setBriefDetailErrors((current) => ({
+				...current,
+				[briefId]: undefined,
+			}));
+			try {
+				const detail = await apiGet<BriefItem>(
+					`/api/briefs/${encodeURIComponent(briefId)}`,
+				);
+				setBriefs((current) =>
+					current.map((brief) =>
+						brief.id === detail.id ? { ...brief, ...detail } : brief,
+					),
+				);
+			} catch (error) {
+				const message = describeUnknownError(
+					error,
+					"日报正文加载失败，请稍后重试。",
+				);
+				setBriefDetailErrors((current) => ({
+					...current,
+					[briefId]: message,
+				}));
+				notifyGlobalError("日报正文加载失败", error, message);
+			} finally {
+				briefDetailRequestInFlightRef.current.delete(briefId);
+				setBriefDetailLoadingIds((current) => {
+					const next = new Set(current);
+					next.delete(briefId);
+					return next;
+				});
+			}
+		},
+		[notifyGlobalError],
+	);
+	const selectedBriefContent = selectedBrief?.content_markdown ?? null;
+
+	useEffect(() => {
+		if (!selectedBrief || selectedBriefContent) {
+			return;
+		}
+		void loadBriefDetail(selectedBrief.id);
+	}, [loadBriefDetail, selectedBrief?.id, selectedBrief, selectedBriefContent]);
 
 	const refreshAll = useCallback(async () => {
 		const tasks: Array<Promise<unknown>> = [refreshFeed()];
@@ -2844,12 +2946,19 @@ export function Dashboard(props: {
 											? briefsError.message
 											: null
 									}
+									detailLoading={selectedBriefDetailLoading}
+									detailError={selectedBriefDetailError}
 									onGenerate={onGenerateBrief}
 									onRetry={() =>
 										void refreshSidebar({
 											includeNotifications:
 												hasDesktopSidebarInbox || tab === "inbox",
 										})
+									}
+									onRetryDetail={
+										selectedBrief
+											? () => void loadBriefDetail(selectedBrief.id)
+											: undefined
 									}
 									onOpenRelease={onOpenReleaseDetail}
 								/>

@@ -38,7 +38,10 @@ type BriefLike = BriefSnapshotCandidate & {
 	effective_time_zone?: string | null;
 	effective_local_boundary?: string | null;
 	release_count?: number;
-	content_markdown: string;
+	preview_markdown?: string | null;
+	covers_repo_stars?: boolean;
+	covers_followers?: boolean;
+	content_markdown?: string | null;
 	created_at: string;
 };
 
@@ -326,6 +329,22 @@ function briefHasSection(markdown: string | undefined, heading: string) {
 	return new RegExp(`^${escaped}$`, "m").test(markdown);
 }
 
+function briefFullMarkdown(brief: BriefLike | null) {
+	return brief?.content_markdown ?? "";
+}
+
+function briefDisplayMarkdown(brief: BriefLike | null) {
+	return brief?.content_markdown ?? brief?.preview_markdown ?? "";
+}
+
+function briefCoversSection(
+	brief: BriefLike | null,
+	sectionFlag: boolean | undefined,
+	heading: string,
+) {
+	return sectionFlag ?? briefHasSection(briefFullMarkdown(brief), heading);
+}
+
 function formatGroupCountLabel(releaseCount: number, activityCount: number) {
 	if (releaseCount > 0 && activityCount > 0) {
 		return `${releaseCount + activityCount} 条动态`;
@@ -448,7 +467,7 @@ function FeedBriefBody(props: {
 		<div className="px-4 pb-4 pt-4 sm:px-6 sm:pb-5">
 			{brief ? (
 				<Markdown
-					content={brief.content_markdown}
+					content={briefDisplayMarkdown(brief)}
 					onInternalReleaseClick={onOpenRelease}
 				/>
 			) : (
@@ -482,7 +501,10 @@ function HistoricalBriefPanel(props: {
 		retryBusy = false,
 		onOpenReleaseFromBrief,
 	} = props;
-	const showBriefBody = !errorState;
+	const showBriefBody =
+		!errorState && (!brief || Boolean(briefDisplayMarkdown(brief)));
+	const hasSummaryWithoutBody =
+		!errorState && Boolean(brief?.preview_markdown) && !brief?.content_markdown;
 	return (
 		<div className={FEED_BRIEF_PANEL_CLASS}>
 			<div className="flex items-center gap-2 border-b border-dashed border-border/55 px-4 py-[10px] text-foreground/82 sm:px-6">
@@ -502,6 +524,11 @@ function HistoricalBriefPanel(props: {
 				) : null}
 				{showBriefBody ? (
 					<FeedBriefBody brief={brief} onOpenRelease={onOpenReleaseFromBrief} />
+				) : null}
+				{hasSummaryWithoutBody ? (
+					<p className="text-muted-foreground mt-3 text-sm">
+						显示的是日报摘要，完整正文会在日报列表选中后加载。
+					</p>
 				) : null}
 			</div>
 		</div>
@@ -555,12 +582,14 @@ function FeedHistoricalDayGroup(props: {
 	}
 
 	const hiddenReleaseIds = new Set(brief?.release_ids ?? []);
-	const briefCoversRepoStars = briefHasSection(
-		brief?.content_markdown,
+	const briefCoversRepoStars = briefCoversSection(
+		brief,
+		brief?.covers_repo_stars,
 		"### 获星",
 	);
-	const briefCoversFollowers = briefHasSection(
-		brief?.content_markdown,
+	const briefCoversFollowers = briefCoversSection(
+		brief,
+		brief?.covers_followers,
 		"### 关注",
 	);
 	const shouldHideItem = (item: FeedItem) => {

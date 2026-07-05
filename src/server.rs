@@ -343,6 +343,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             post(api::toggle_release_reaction),
         )
         .route("/briefs", get(api::list_briefs))
+        .route("/briefs/{brief_id}", get(api::get_brief))
         .route("/briefs/generate", post(api::generate_brief))
         .route(
             "/translate/requests",

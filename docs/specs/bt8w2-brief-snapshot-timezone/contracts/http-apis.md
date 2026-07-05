@@ -58,6 +58,8 @@ Dashboard 启动字段改为读取当前用户已保存的日报偏好：
 
 ## GET /api/briefs
 
+默认返回 Dashboard sidebar 摘要列表，不包含完整 `content_markdown`：
+
 ```json
 [
   {
@@ -69,8 +71,11 @@ Dashboard 启动字段改为读取当前用户已保存的日报偏好：
     "effective_local_boundary": "08:00",
     "release_count": 2,
     "release_ids": ["123", "124"],
-    "content_markdown": "...",
-    "created_at": "2026-04-12T00:00:03Z"
+    "preview_markdown": "## 摘要\n\n...",
+    "covers_repo_stars": true,
+    "covers_followers": true,
+    "created_at": "2026-04-12T00:00:03Z",
+    "updated_at": "2026-04-12T00:00:03Z"
   }
 ]
 ```
@@ -79,6 +84,33 @@ Dashboard 启动字段改为读取当前用户已保存的日报偏好：
 
 - `date` 保留为展示标签，不再承担业务主键语义
 - `release_ids` 顺序与 brief 正文中的 release 顺序一致
+- `preview_markdown` 是用于首屏列表/选中项预览的短 Markdown，不能替代完整正文
+- `covers_repo_stars` / `covers_followers` 是从完整正文派生的轻量去重元数据，用于避免前端把截断 preview 当完整正文解析
+- 默认列表响应不得包含 `content_markdown`
+- `updated_at` 是前端详情缓存的版本戳；同一 `id` 的 brief 被原位刷新时必须变化
+
+## GET /api/briefs/{brief_id}
+
+返回单条完整 snapshot，用于 Dashboard 选中后懒加载正文：
+
+```json
+{
+  "id": "brief_01",
+  "date": "2026-04-12",
+  "window_start": "2026-04-11T00:00:00Z",
+  "window_end": "2026-04-12T00:00:00Z",
+  "effective_time_zone": "Asia/Shanghai",
+  "effective_local_boundary": "08:00",
+  "release_count": 2,
+  "release_ids": ["123", "124"],
+  "preview_markdown": "## 摘要\n\n...",
+  "covers_repo_stars": true,
+  "covers_followers": true,
+  "content_markdown": "...",
+  "created_at": "2026-04-12T00:00:03Z",
+  "updated_at": "2026-04-12T00:00:03Z"
+}
+```
 
 ## POST /api/briefs/generate
 
