@@ -1,6 +1,7 @@
 mod admin_runtime;
 mod ai;
 mod api;
+mod api_keys;
 mod auth;
 mod briefs;
 mod config;

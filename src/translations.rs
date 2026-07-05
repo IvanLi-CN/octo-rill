@@ -10,7 +10,7 @@ use axum::{
     Json,
     body::Body,
     extract::{Path, Query, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
@@ -1687,9 +1687,10 @@ pub async fn recover_runtime_state_on_startup(state: &AppState) -> Result<()> {
 pub async fn submit_translation_request(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Json(req): Json<TranslationSubmitRequest>,
 ) -> Result<Response, ApiError> {
-    let user_id = api::require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = api::require_business_user_id(state.as_ref(), &session, &headers).await?;
     let mode = normalize_mode(req.mode.trim())?;
 
     match normalize_submit_payload(mode, req)? {
@@ -1733,9 +1734,10 @@ pub async fn submit_translation_request(
 pub async fn get_translation_request(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Path(request_id): Path<String>,
 ) -> Result<Json<TranslationRequestResponse>, ApiError> {
-    let user_id = api::require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = api::require_business_user_id(state.as_ref(), &session, &headers).await?;
     let request_id = api::parse_local_id_param(request_id, "request_id")?;
     let detail = load_translation_request_detail(state.as_ref(), &user_id, &request_id).await?;
     Ok(Json(detail_to_public_response(detail)))
@@ -1744,9 +1746,10 @@ pub async fn get_translation_request(
 pub async fn resolve_translation_results(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Json(req): Json<TranslationResolveRequest>,
 ) -> Result<Json<TranslationResolveResponse>, ApiError> {
-    let user_id = api::require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = api::require_business_user_id(state.as_ref(), &session, &headers).await?;
     let items = normalize_request_items(&req.items)?;
     let items =
         resolve_translation_results_for_user(state.as_ref(), &user_id, &items, req.retry_on_error)
@@ -1762,9 +1765,10 @@ pub async fn resolve_translation_results(
 pub async fn stream_translation_request(
     State(state): State<Arc<AppState>>,
     session: Session,
+    headers: HeaderMap,
     Path(request_id): Path<String>,
 ) -> Result<Response, ApiError> {
-    let user_id = api::require_active_user_id(state.as_ref(), &session).await?;
+    let user_id = api::require_business_user_id(state.as_ref(), &session, &headers).await?;
     let request_id = api::parse_local_id_param(request_id, "request_id")?;
     ensure_request_owner(state.as_ref(), &user_id, &request_id).await?;
     Ok(stream_translation_request_response(

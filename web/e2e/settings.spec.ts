@@ -120,6 +120,15 @@ async function installSettingsMocks(
 			created_at: string;
 			last_used_at: string | null;
 		}>;
+		apiKeys?: Array<{
+			id: string;
+			name: string;
+			api_key: string;
+			masked_key: string;
+			created_at: string;
+			last_used_at: string | null;
+		}>;
+		apiKeyDeleteFails?: boolean;
 		reactionTokenConfigured?: boolean;
 		reactionTokenMasked?: string | null;
 		reactionTokenState?: "idle" | "valid" | "invalid" | "error";
@@ -127,12 +136,14 @@ async function installSettingsMocks(
 		reactionTokenOwnerLogin?: string | null;
 		includeOwnReleases?: boolean;
 		withReactionFeed?: boolean;
+		onApiKeysGet?: () => void;
 	},
 ) {
 	let includeOwnReleases = options?.includeOwnReleases ?? false;
 	let githubConnections =
 		options?.githubConnections ?? defaultGitHubConnections;
 	let passkeys = options?.passkeys ?? [];
+	let apiKeys = options?.apiKeys ?? [];
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
 		const url = new URL(req.url());
@@ -178,6 +189,28 @@ async function installSettingsMocks(
 			return json(route, { items: passkeys });
 		}
 
+		if (req.method() === "GET" && pathname === "/api/me/api-keys") {
+			options?.onApiKeysGet?.();
+			return json(route, { items: apiKeys });
+		}
+
+		if (req.method() === "POST" && pathname === "/api/me/api-keys") {
+			const payload = req.postDataJSON() as { name?: string } | undefined;
+			const item = {
+				id: `api_key_${apiKeys.length + 1}`,
+				name: payload?.name || "API Key",
+				api_key: "orill_ak_e2e_created_plaintext_A1b2C3",
+				masked_key: "orill_ak_e2e_created...A1b2C3",
+				created_at: "2026-04-18T08:05:00+08:00",
+				last_used_at: null,
+			};
+			apiKeys = [item, ...apiKeys];
+			return json(route, {
+				item,
+				api_key: "orill_ak_e2e_created_plaintext_A1b2C3",
+			});
+		}
+
 		if (
 			req.method() === "DELETE" &&
 			pathname.startsWith("/api/me/github-connections/")
@@ -193,6 +226,24 @@ async function installSettingsMocks(
 			const passkeyId = pathname.split("/").at(-1);
 			passkeys = passkeys.filter((passkey) => passkey.id !== passkeyId);
 			return json(route, { items: passkeys });
+		}
+
+		if (req.method() === "DELETE" && pathname.startsWith("/api/me/api-keys/")) {
+			if (options?.apiKeyDeleteFails) {
+				return json(
+					route,
+					{
+						error: {
+							code: "api_key_revoke_failed",
+							message: "撤销 API Key 失败，请稍后重试。",
+						},
+					},
+					500,
+				);
+			}
+			const apiKeyId = pathname.split("/").at(-1);
+			apiKeys = apiKeys.filter((apiKey) => apiKey.id !== apiKeyId);
+			return json(route, { items: apiKeys });
 		}
 
 		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
@@ -377,6 +428,77 @@ test("settings deep link focuses github pat section", async ({ page }) => {
 		guide.getByRole("button", { name: "No expiration" }),
 	).toBeVisible();
 	await expect(page.getByText("@storybook-ops", { exact: true })).toBeVisible();
+});
+
+test("settings github pat section does not fetch plaintext api keys", async ({
+	page,
+}) => {
+	await installPasskeyBrowserMock(page);
+	let apiKeysGetCount = 0;
+	await installSettingsMocks(page, {
+		reactionTokenConfigured: true,
+		reactionTokenMasked: "ghp_****_saved",
+		onApiKeysGet: () => {
+			apiKeysGetCount += 1;
+		},
+	});
+
+	await page.goto("/settings?section=github-pat");
+
+	await expect(
+		page.locator('[data-settings-section="github-pat"]'),
+	).toBeVisible();
+	await expect.poll(() => apiKeysGetCount).toBe(0);
+});
+
+test("settings api key section persists key display and confirms revoke", async ({
+	page,
+}) => {
+	await installPasskeyBrowserMock(page);
+	await installSettingsMocks(page, {
+		apiKeyDeleteFails: true,
+		apiKeys: [
+			{
+				id: "api_key_cli",
+				name: "CLI sync",
+				api_key: "orill_ak_cli_prod_full_plaintext_x9Y8z7",
+				masked_key: "orill_ak_cli_prod...x9Y8z7",
+				created_at: "2026-04-12T08:00:00+08:00",
+				last_used_at: "2026-04-18T07:40:00+08:00",
+			},
+		],
+	});
+
+	await page.goto("/settings?section=api-keys");
+
+	await expect(page).toHaveURL(/section=api-keys/);
+	const section = page.locator('[data-settings-section="api-keys"]');
+	await expect(section).toContainText("CLI sync");
+	await expect(section).toContainText(
+		"orill_ak_cli_prod_full_plaintext_x9Y8z7",
+	);
+
+	await section.getByLabel("名称").fill("local sync script");
+	await section.getByRole("button", { name: "创建 API Key" }).click();
+	await expect(section.getByText("API Key 已创建")).toBeVisible();
+	await expect(
+		section.getByText("orill_ak_e2e_created_plaintext_A1b2C3"),
+	).toHaveCount(2);
+	await expect(
+		section.getByText("之后仍可在本页查看和复制完整 Key。"),
+	).toBeVisible();
+
+	await section
+		.locator('[data-api-key-item="api_key_cli"]')
+		.getByRole("button", {
+			name: "撤销",
+		})
+		.click();
+	await expect(page.getByRole("alertdialog")).toContainText("确认撤销 API Key");
+	await page.getByRole("button", { name: "确认撤销" }).click();
+	await expect(
+		section.getByText("撤销 API Key 失败，请稍后重试。"),
+	).toBeVisible();
 });
 
 test("settings desktop layout uses the app shell content width", async ({

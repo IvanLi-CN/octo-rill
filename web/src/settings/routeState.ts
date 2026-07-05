@@ -4,6 +4,7 @@ export const SETTINGS_SECTIONS = [
 	"github-accounts",
 	"my-releases",
 	"github-pat",
+	"api-keys",
 	"daily-brief",
 ] as const;
 
