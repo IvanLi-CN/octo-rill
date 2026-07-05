@@ -333,6 +333,10 @@ function briefFullMarkdown(brief: BriefLike | null) {
 	return brief?.content_markdown ?? "";
 }
 
+function briefDisplayMarkdown(brief: BriefLike | null) {
+	return brief?.content_markdown ?? brief?.preview_markdown ?? "";
+}
+
 function briefCoversSection(
 	brief: BriefLike | null,
 	sectionFlag: boolean | undefined,
@@ -463,7 +467,7 @@ function FeedBriefBody(props: {
 		<div className="px-4 pb-4 pt-4 sm:px-6 sm:pb-5">
 			{brief ? (
 				<Markdown
-					content={briefFullMarkdown(brief)}
+					content={briefDisplayMarkdown(brief)}
 					onInternalReleaseClick={onOpenRelease}
 				/>
 			) : (
@@ -498,9 +502,9 @@ function HistoricalBriefPanel(props: {
 		onOpenReleaseFromBrief,
 	} = props;
 	const showBriefBody =
-		!errorState && (!brief || Boolean(brief.content_markdown));
+		!errorState && (!brief || Boolean(briefDisplayMarkdown(brief)));
 	const hasSummaryWithoutBody =
-		!errorState && Boolean(brief) && !brief?.content_markdown;
+		!errorState && Boolean(brief?.preview_markdown) && !brief?.content_markdown;
 	return (
 		<div className={FEED_BRIEF_PANEL_CLASS}>
 			<div className="flex items-center gap-2 border-b border-dashed border-border/55 px-4 py-[10px] text-foreground/82 sm:px-6">
@@ -522,8 +526,8 @@ function HistoricalBriefPanel(props: {
 					<FeedBriefBody brief={brief} onOpenRelease={onOpenReleaseFromBrief} />
 				) : null}
 				{hasSummaryWithoutBody ? (
-					<p className="text-muted-foreground text-sm">
-						日报已生成，完整正文会在日报列表选中后加载。
+					<p className="text-muted-foreground mt-3 text-sm">
+						显示的是日报摘要，完整正文会在日报列表选中后加载。
 					</p>
 				) : null}
 			</div>
