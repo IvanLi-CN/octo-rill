@@ -453,7 +453,7 @@ export function SettingsStartupSkeleton(_props: { me: MeResponse }) {
 			mobileChrome
 		>
 			<div
-				className="mx-auto max-w-3xl space-y-4"
+				className="mx-auto w-full max-w-6xl space-y-4"
 				data-settings-startup-skeleton
 			>
 				<div className="rounded-2xl border border-border/70 bg-card/95 p-2 shadow-sm">
