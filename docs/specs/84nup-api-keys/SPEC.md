@@ -152,7 +152,13 @@
 
 ## Visual Evidence
 
-![API Key settings created-once state](./visual-evidence/api-keys-settings-storybook.png)
+创建成功后，完整 API Key 会出现在成功提示和下方列表中，可继续查看与复制。
+
+![API Key settings created state](./visual-evidence/api-keys-settings-created.png)
+
+点击撤销后会先出现二次确认弹窗，确认前不会删除 Key。
+
+![API Key settings revoke confirmation](./visual-evidence/api-keys-settings-revoke-confirm.png)
 
 ## Related PRs
 

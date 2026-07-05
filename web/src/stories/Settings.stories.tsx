@@ -1,7 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useRef, useState } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
-import { expect, userEvent, within } from "storybook/test";
+import { expect, screen, userEvent, within } from "storybook/test";
 
 import type {
 	ApiKeySummary,
@@ -566,7 +566,7 @@ export const ApiKeysEmpty: Story = {
 	},
 };
 
-export const ApiKeysCreatedOnce: Story = {
+export const ApiKeysCreatedPersisted: Story = {
 	args: {
 		section: "api-keys",
 		apiKeys: [],
@@ -588,6 +588,42 @@ export const ApiKeysCreatedOnce: Story = {
 		).toBeVisible();
 		await expect(
 			canvas.getByText("之后仍可在本页查看和复制完整 Key。"),
+		).toBeVisible();
+	},
+};
+
+export const ApiKeysRevokeConfirm: Story = {
+	args: {
+		section: "api-keys",
+		apiKeys: [
+			{
+				id: "api_key_cli",
+				name: "CLI sync",
+				api_key: "orill_ak_cli_prod_full_plaintext_x9Y8z7",
+				masked_key: "orill_ak_cli_prod...x9Y8z7",
+				created_at: "2026-04-12T08:00:00+08:00",
+				last_used_at: "2026-04-18T07:40:00+08:00",
+			},
+		],
+	},
+	parameters: {
+		docs: {
+			description: {
+				story: "撤销确认态：点击撤销后必须二次确认，确认前不会删除 Key。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByText("orill_ak_cli_prod_full_plaintext_x9Y8z7"),
+		).toBeVisible();
+		await expect(canvas.getByRole("button", { name: "撤销" })).toBeVisible();
+		await userEvent.click(canvas.getByRole("button", { name: "撤销" }));
+		await expect(await screen.findByText("确认撤销 API Key")).toBeVisible();
+		await expect(screen.getByRole("button", { name: "取消" })).toBeVisible();
+		await expect(
+			screen.getByRole("button", { name: "确认撤销" }),
 		).toBeVisible();
 	},
 };
@@ -631,8 +667,8 @@ export const ApiKeysListAndRevokeError: Story = {
 			canvas.getByText("orill_ak_cli_prod_full_plaintext_x9Y8z7"),
 		).toBeVisible();
 		await userEvent.click(canvas.getAllByRole("button", { name: "撤销" })[0]);
-		await expect(await canvas.findByText("确认撤销 API Key")).toBeVisible();
-		await userEvent.click(canvas.getByRole("button", { name: "确认撤销" }));
+		await expect(await screen.findByText("确认撤销 API Key")).toBeVisible();
+		await userEvent.click(screen.getByRole("button", { name: "确认撤销" }));
 		await expect(
 			await canvas.findByText("撤销 API Key 失败，请稍后重试。"),
 		).toBeVisible();
