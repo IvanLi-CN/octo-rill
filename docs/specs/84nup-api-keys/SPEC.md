@@ -154,9 +154,13 @@
 
 创建成功后，完整 API Key 会出现在成功提示和下方列表中，可继续查看与复制。
 
+PR: include
+
 ![API Key settings created state](./visual-evidence/api-keys-settings-created.png)
 
 点击撤销后会先出现二次确认弹窗，确认前不会删除 Key。
+
+PR: include
 
 ![API Key settings revoke confirmation](./visual-evidence/api-keys-settings-revoke-confirm.png)
 
