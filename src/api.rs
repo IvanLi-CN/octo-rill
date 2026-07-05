@@ -16350,8 +16350,10 @@ pub(crate) async fn require_business_user_id(
             )
         })?;
         let value = value.trim_start();
-        if value == "Bearer" || value.starts_with("Bearer ") {
-            let api_key = value.strip_prefix("Bearer ").unwrap_or("").trim();
+        let mut auth_parts = value.splitn(2, char::is_whitespace);
+        let scheme = auth_parts.next().unwrap_or("");
+        if scheme.eq_ignore_ascii_case("Bearer") {
+            let api_key = auth_parts.next().unwrap_or("").trim();
             if !api_key.starts_with(api_keys::API_KEY_PREFIX) {
                 return Err(ApiError::new(
                     StatusCode::UNAUTHORIZED,
@@ -17089,7 +17091,7 @@ mod tests {
         let resolved = require_business_user_id(
             state.as_ref(),
             &session,
-            &bearer_headers(created.api_key.as_str()),
+            &authorization_headers(&format!("bearer {}", created.api_key)),
         )
         .await
         .expect("authenticate api key");
@@ -17132,7 +17134,7 @@ mod tests {
         let err = require_business_user_id(
             state.as_ref(),
             &session,
-            &authorization_headers("Bearer external-provider-token"),
+            &authorization_headers("bEaReR external-provider-token"),
         )
         .await
         .expect_err("invalid bearer with session should fail as api key");
