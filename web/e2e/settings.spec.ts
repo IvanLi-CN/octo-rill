@@ -379,6 +379,19 @@ test("settings deep link focuses github pat section", async ({ page }) => {
 	await expect(page.getByText("@storybook-ops", { exact: true })).toBeVisible();
 });
 
+test("settings desktop layout uses the app shell content width", async ({
+	page,
+}) => {
+	await installPasskeyBrowserMock(page);
+	await installSettingsMocks(page);
+	await page.setViewportSize({ width: 1280, height: 1000 });
+
+	await page.goto("/settings?section=github-pat");
+
+	const layoutBox = await page.locator("[data-settings-layout]").boundingBox();
+	expect(layoutBox?.width ?? 0).toBeGreaterThan(1000);
+});
+
 test("settings github pat hidden mode preserves undo history after visible edits", async ({
 	page,
 }) => {
