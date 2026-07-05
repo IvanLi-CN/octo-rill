@@ -11,7 +11,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     middleware::{self, Next},
     response::Response,
-    routing::{get, patch, post, put},
+    routing::{delete, get, patch, post, put},
 };
 use serde_json::json;
 use sqlx::{
@@ -190,6 +190,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/me/profile",
             get(api::me_get_profile).patch(api::me_patch_profile),
         )
+        .route(
+            "/me/api-keys",
+            get(api::me_get_api_keys).post(api::me_create_api_key),
+        )
+        .route("/me/api-keys/{api_key_id}", delete(api::me_delete_api_key))
         .route("/tasks/{task_id}/events", get(api::task_events_sse))
         .route("/starred", get(api::list_starred))
         .route("/releases", get(api::list_releases))
@@ -412,8 +417,17 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let cors = CorsLayer::new()
         .allow_origin(cors_origin)
         .allow_credentials(true)
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH])
-        .allow_headers([axum::http::header::CONTENT_TYPE]);
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+        ]);
 
     let (set_request_id, propagate_request_id) = observability::request_id_layers();
     let access_log = middleware::from_fn(observability::access_log_middleware);

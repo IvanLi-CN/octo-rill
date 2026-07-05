@@ -397,6 +397,24 @@ export type PasskeySummary = {
 export type MePasskeysResponse = {
 	items: PasskeySummary[];
 };
+export type ApiKeySummary = {
+	id: string;
+	name: string;
+	api_key: string;
+	masked_key: string;
+	created_at: string;
+	last_used_at: string | null;
+};
+export type MeApiKeysResponse = {
+	items: ApiKeySummary[];
+};
+export type CreateApiKeyRequest = {
+	name?: string;
+};
+export type CreateApiKeyResponse = {
+	item: ApiKeySummary;
+	api_key: string;
+};
 export type PasskeyCredentialDescriptorJSON = {
 	id: string;
 	type: PublicKeyCredentialType;
@@ -967,6 +985,21 @@ export async function apiGetAuthBindContext(): Promise<AuthBindContextResponse> 
 }
 export async function apiGetMePasskeys(): Promise<MePasskeysResponse> {
 	return apiGet<MePasskeysResponse>("/api/me/passkeys");
+}
+export async function apiGetMeApiKeys(): Promise<MeApiKeysResponse> {
+	return apiGet<MeApiKeysResponse>("/api/me/api-keys");
+}
+export async function apiCreateMeApiKey(
+	body: CreateApiKeyRequest,
+): Promise<CreateApiKeyResponse> {
+	return apiPostJson<CreateApiKeyResponse>("/api/me/api-keys", body);
+}
+export async function apiDeleteMeApiKey(
+	apiKeyId: string,
+): Promise<MeApiKeysResponse> {
+	return apiDeleteJson<MeApiKeysResponse>(
+		`/api/me/api-keys/${encodeURIComponent(apiKeyId)}`,
+	);
 }
 export async function apiDeleteMePasskey(
 	passkeyId: string,

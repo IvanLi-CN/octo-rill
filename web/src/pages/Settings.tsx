@@ -1,16 +1,20 @@
 import {
 	ArrowLeft,
 	CalendarClock,
+	Copy,
 	Fingerprint,
 	Github,
 	KeyRound,
 	LoaderCircle,
 	Link2,
 	Package,
+	Plus,
 	ShieldAlert,
+	Trash2,
 	Unlink2,
 } from "lucide-react";
 import {
+	type FormEvent,
 	type ReactNode,
 	useCallback,
 	useEffect,
@@ -19,15 +23,20 @@ import {
 } from "react";
 
 import {
+	type ApiKeySummary,
+	type CreateApiKeyResponse,
 	type DailyBriefProfilePatchRequest,
 	type GitHubConnectionResponse,
 	type LinuxDoConnectionResponse,
 	type MeResponse,
 	type PasskeySummary,
 	type MeProfileResponse,
+	apiCreateMeApiKey,
+	apiDeleteMeApiKey,
 	apiDeleteMePasskey,
 	apiDeleteMeGitHubConnection,
 	apiDeleteMeLinuxDo,
+	apiGetMeApiKeys,
 	apiGetMeGitHubConnections,
 	apiGetMeLinuxDo,
 	apiGetMePasskeys,
@@ -47,9 +56,21 @@ import {
 } from "@/briefs/DailyBriefProfileForm";
 import { AuthProviderIcon } from "@/components/brand/AuthProviderIcon";
 import { BrandLogo } from "@/components/brand/BrandLogo";
+import {
+	AlertDialog,
+	AlertDialogAction,
+	AlertDialogCancel,
+	AlertDialogContent,
+	AlertDialogDescription,
+	AlertDialogFooter,
+	AlertDialogHeader,
+	AlertDialogTitle,
+	AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
@@ -97,6 +118,10 @@ const SECTION_META: Record<
 		label: "GitHub PAT",
 		description:
 			"配置 release feedback 所需的 GitHub PAT，保留 800ms 防抖校验。",
+	},
+	"api-keys": {
+		label: "API Key",
+		description: "创建用于调用用户态业务接口的 Bearer token。",
 	},
 	"daily-brief": {
 		label: "日报设置",
@@ -303,6 +328,18 @@ export function SettingsPage(props: {
 	const [passkeyFlashStatus, setPasskeyFlashStatus] = useState<string | null>(
 		passkeyStatus,
 	);
+	const [apiKeysLoading, setApiKeysLoading] = useState(true);
+	const [apiKeysCreating, setApiKeysCreating] = useState(false);
+	const [apiKeysBusyId, setApiKeysBusyId] = useState<string | null>(null);
+	const [apiKeysError, setApiKeysError] = useState<string | null>(null);
+	const [apiKeys, setApiKeys] = useState<ApiKeySummary[]>([]);
+	const [apiKeyName, setApiKeyName] = useState("");
+	const [createdApiKey, setCreatedApiKey] =
+		useState<CreateApiKeyResponse | null>(null);
+	const [copiedApiKeyId, setCopiedApiKeyId] = useState<string | null>(null);
+	const [pendingApiKeyRevokeId, setPendingApiKeyRevokeId] = useState<
+		string | null
+	>(null);
 	const [linuxdoLoading, setLinuxdoLoading] = useState(true);
 	const [linuxdoBusy, setLinuxdoBusy] = useState(false);
 	const [linuxdoError, setLinuxdoError] = useState<string | null>(null);
@@ -395,6 +432,19 @@ export function SettingsPage(props: {
 		}
 	}, []);
 
+	const loadApiKeys = useCallback(async () => {
+		setApiKeysLoading(true);
+		setApiKeysError(null);
+		try {
+			const res = await apiGetMeApiKeys();
+			setApiKeys(res.items);
+		} catch (err) {
+			setApiKeysError(err instanceof Error ? err.message : String(err));
+		} finally {
+			setApiKeysLoading(false);
+		}
+	}, []);
+
 	const loadBriefProfile = useCallback(async () => {
 		setBriefProfileLoading(true);
 		setBriefProfileError(null);
@@ -422,13 +472,32 @@ export function SettingsPage(props: {
 	}, [passkeySupportOverride]);
 
 	useEffect(() => {
-		void Promise.all([
+		if (section !== "api-keys") {
+			setCreatedApiKey(null);
+			setCopiedApiKeyId(null);
+			setPendingApiKeyRevokeId(null);
+		}
+	}, [section]);
+
+	useEffect(() => {
+		const loaders = [
 			loadGitHubConnections(),
 			loadPasskeys(),
 			loadLinuxDo(),
 			loadBriefProfile(),
-		]);
-	}, [loadBriefProfile, loadGitHubConnections, loadLinuxDo, loadPasskeys]);
+		];
+		if (section === "api-keys") {
+			loaders.push(loadApiKeys());
+		}
+		void Promise.all(loaders);
+	}, [
+		loadApiKeys,
+		loadBriefProfile,
+		loadGitHubConnections,
+		loadLinuxDo,
+		loadPasskeys,
+		section,
+	]);
 
 	const onConnectGitHub = useCallback(() => {
 		window.location.assign("/auth/github/connect");
@@ -499,6 +568,61 @@ export function SettingsPage(props: {
 			})
 			.finally(() => {
 				setPasskeysBusyId(null);
+			});
+	}, []);
+
+	const onCreateApiKey = useCallback(
+		(event: FormEvent<HTMLFormElement>) => {
+			event.preventDefault();
+			setApiKeysCreating(true);
+			setApiKeysError(null);
+			setCopiedApiKeyId(null);
+			void apiCreateMeApiKey({
+				name: apiKeyName.trim() || undefined,
+			})
+				.then((res) => {
+					setCreatedApiKey(res);
+					setApiKeys((current) => [
+						res.item,
+						...current.filter((item) => item.id !== res.item.id),
+					]);
+					setApiKeyName("");
+				})
+				.catch((err) => {
+					setApiKeysError(err instanceof Error ? err.message : String(err));
+				})
+				.finally(() => {
+					setApiKeysCreating(false);
+				});
+		},
+		[apiKeyName],
+	);
+
+	const onCopyApiKey = useCallback((apiKeyId: string, apiKey: string) => {
+		void navigator.clipboard
+			.writeText(apiKey)
+			.then(() => setCopiedApiKeyId(apiKeyId))
+			.catch((err) => {
+				setApiKeysError(err instanceof Error ? err.message : String(err));
+			});
+	}, []);
+
+	const onDeleteApiKey = useCallback((apiKeyId: string) => {
+		setApiKeysBusyId(apiKeyId);
+		setApiKeysError(null);
+		void apiDeleteMeApiKey(apiKeyId)
+			.then((res) => {
+				setApiKeys(res.items);
+				setCreatedApiKey((current) =>
+					current?.item.id === apiKeyId ? null : current,
+				);
+				setPendingApiKeyRevokeId(null);
+			})
+			.catch((err) => {
+				setApiKeysError(err instanceof Error ? err.message : String(err));
+			})
+			.finally(() => {
+				setApiKeysBusyId(null);
 			});
 	}, []);
 
@@ -635,6 +759,15 @@ export function SettingsPage(props: {
 				}
 			: { label: "未添加", variant: "outline" as const };
 
+	const apiKeyStatusBadge = apiKeysLoading
+		? { label: "读取中", variant: "outline" as const }
+		: apiKeys.length > 0
+			? {
+					label: apiKeys.length === 1 ? "1 把 Key" : `${apiKeys.length} 把 Key`,
+					variant: "secondary" as const,
+				}
+			: { label: "未创建", variant: "outline" as const };
+
 	const sectionNavItems = [
 		{
 			id: "passkeys" as const,
@@ -654,6 +787,10 @@ export function SettingsPage(props: {
 		},
 		{
 			id: "github-pat" as const,
+			icon: <KeyRound className="size-4" />,
+		},
+		{
+			id: "api-keys" as const,
 			icon: <KeyRound className="size-4" />,
 		},
 		{
@@ -1408,6 +1545,218 @@ export function SettingsPage(props: {
 									</div>
 
 									<GitHubPatGuideCard compact />
+								</CardContent>
+							</Card>
+						</section>
+					) : null}
+
+					{section === "api-keys" ? (
+						<section id="settings-api-keys" data-settings-section="api-keys">
+							<Card className="border-border/70 shadow-sm max-md:rounded-none max-md:border-0 max-md:bg-transparent max-md:shadow-none">
+								<CardHeader className="border-b border-border/60 p-5 max-md:border-b-0 max-md:px-0 max-md:pb-4 max-md:pt-0">
+									<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+										<div className="flex flex-wrap items-center gap-2">
+											<CardTitle className="text-lg">
+												{SECTION_META["api-keys"].label}
+											</CardTitle>
+											<Badge variant={apiKeyStatusBadge.variant}>
+												{apiKeyStatusBadge.label}
+											</Badge>
+										</div>
+									</div>
+								</CardHeader>
+								<CardContent className="space-y-4 p-5 max-md:px-0 max-md:pb-0">
+									{apiKeysError ? (
+										<div
+											className={cn(
+												"rounded-xl border px-3 py-2.5 text-sm",
+												statusToneClassName("error"),
+											)}
+										>
+											{apiKeysError}
+										</div>
+									) : null}
+
+									<div className="rounded-2xl border border-border/70 bg-muted/20 px-4 py-3 text-sm text-muted-foreground">
+										API Key
+										只能调用发布、Feed、通知、日报、同步、翻译与任务流等用户态业务接口；账号设置、凭据管理、登录与管理员接口仍需网页登录。
+										列表会显示完整 Key，请只在可信设备上打开本页。
+									</div>
+
+									<form
+										className="grid gap-3 rounded-2xl border border-border/70 bg-background/80 p-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end"
+										onSubmit={onCreateApiKey}
+									>
+										<div className="space-y-2">
+											<Label htmlFor="settings-api-key-name">名称</Label>
+											<Input
+												id="settings-api-key-name"
+												value={apiKeyName}
+												maxLength={80}
+												onChange={(event) => setApiKeyName(event.target.value)}
+												placeholder="例如：local sync script"
+												autoComplete="off"
+											/>
+										</div>
+										<Button type="submit" disabled={apiKeysCreating}>
+											{apiKeysCreating ? (
+												<LoaderCircle className="size-4 animate-spin" />
+											) : (
+												<Plus className="size-4" />
+											)}
+											创建 API Key
+										</Button>
+									</form>
+
+									{createdApiKey ? (
+										<div
+											className="space-y-3 rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-4"
+											data-api-key-created
+										>
+											<div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+												<div className="space-y-1">
+													<p className="text-sm font-semibold text-foreground">
+														API Key 已创建
+													</p>
+													<p className="text-muted-foreground text-sm leading-6">
+														已加入下方列表，之后仍可在本页查看和复制完整 Key。
+													</p>
+												</div>
+												<Button
+													type="button"
+													size="sm"
+													variant="outline"
+													onClick={() =>
+														onCopyApiKey(
+															createdApiKey.item.id,
+															createdApiKey.api_key,
+														)
+													}
+												>
+													<Copy className="size-4" />
+													{copiedApiKeyId === createdApiKey.item.id
+														? "已复制"
+														: "复制"}
+												</Button>
+											</div>
+											<div className="rounded-xl border border-emerald-500/25 bg-background/90 px-3 py-2 font-mono text-sm break-all text-foreground">
+												{createdApiKey.api_key}
+											</div>
+										</div>
+									) : null}
+
+									{apiKeysLoading ? (
+										<div className="text-muted-foreground flex items-center gap-2 text-sm">
+											<LoaderCircle className="size-4 animate-spin" />
+											正在读取 API Key 列表…
+										</div>
+									) : apiKeys.length === 0 ? (
+										<div className="rounded-2xl border border-border/70 bg-background/80 px-4 py-4 text-sm leading-6 text-foreground">
+											<p className="font-medium">还没有 API Key。</p>
+											<p className="text-muted-foreground mt-1">
+												创建后可用 Authorization: Bearer
+												调用允许的用户态业务接口。
+											</p>
+										</div>
+									) : (
+										<div className="space-y-3">
+											{apiKeys.map((apiKey) => {
+												const isBusy = apiKeysBusyId === apiKey.id;
+												return (
+													<div
+														key={apiKey.id}
+														className="space-y-3 rounded-2xl border border-border/70 bg-background/80 p-4 sm:p-5"
+														data-api-key-item={apiKey.id}
+													>
+														<div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+															<div className="min-w-0 space-y-1.5">
+																<p className="truncate text-base font-semibold text-foreground">
+																	{apiKey.name}
+																</p>
+																<p className="font-mono text-sm break-all text-muted-foreground">
+																	{apiKey.api_key}
+																</p>
+															</div>
+															<div className="flex shrink-0 flex-wrap gap-2">
+																<Button
+																	type="button"
+																	variant="outline"
+																	size="sm"
+																	onClick={() =>
+																		onCopyApiKey(apiKey.id, apiKey.api_key)
+																	}
+																>
+																	<Copy className="size-4" />
+																	{copiedApiKeyId === apiKey.id
+																		? "已复制"
+																		: "复制"}
+																</Button>
+																<AlertDialog
+																	open={pendingApiKeyRevokeId === apiKey.id}
+																	onOpenChange={(open) =>
+																		setPendingApiKeyRevokeId(
+																			open ? apiKey.id : null,
+																		)
+																	}
+																>
+																	<AlertDialogTrigger asChild>
+																		<Button
+																			type="button"
+																			variant="outline"
+																			size="sm"
+																			disabled={isBusy}
+																		>
+																			{isBusy ? (
+																				<LoaderCircle className="size-4 animate-spin" />
+																			) : (
+																				<Trash2 className="size-4" />
+																			)}
+																			撤销
+																		</Button>
+																	</AlertDialogTrigger>
+																	<AlertDialogContent>
+																		<AlertDialogHeader>
+																			<AlertDialogTitle>
+																				确认撤销 API Key
+																			</AlertDialogTitle>
+																			<AlertDialogDescription>
+																				撤销后 {apiKey.name} 会立即失效，使用该
+																				Key
+																				的脚本和外部客户端将无法继续调用接口。
+																			</AlertDialogDescription>
+																		</AlertDialogHeader>
+																		<AlertDialogFooter>
+																			<AlertDialogCancel>
+																				取消
+																			</AlertDialogCancel>
+																			<AlertDialogAction
+																				onClick={() =>
+																					onDeleteApiKey(apiKey.id)
+																				}
+																			>
+																				确认撤销
+																			</AlertDialogAction>
+																		</AlertDialogFooter>
+																	</AlertDialogContent>
+																</AlertDialog>
+															</div>
+														</div>
+														<div className="grid gap-3 sm:grid-cols-2">
+															<DetailItem
+																label="创建时间"
+																value={formatDateTime(apiKey.created_at)}
+															/>
+															<DetailItem
+																label="最近使用"
+																value={formatDateTime(apiKey.last_used_at)}
+																hint={`掩码：${apiKey.masked_key}`}
+															/>
+														</div>
+													</div>
+												);
+											})}
+										</div>
+									)}
 								</CardContent>
 							</Card>
 						</section>
