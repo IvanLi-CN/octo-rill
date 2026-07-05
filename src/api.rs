@@ -16349,27 +16349,22 @@ pub(crate) async fn require_business_user_id(
                 "invalid API key",
             )
         })?;
-        if let Some(api_key) = value
-            .strip_prefix("Bearer ")
-            .map(str::trim)
-            .filter(|api_key| api_key.starts_with(api_keys::API_KEY_PREFIX))
-        {
-            let user_id = api_keys::authenticate_api_key(state, api_key).await?;
-            touch_user_last_active_at(state, &user_id).await?;
-            return Ok(user_id);
-        }
-
-        match require_active_user_id(state, session).await {
-            Ok(user_id) => return Ok(user_id),
-            Err(_) if value.trim_start().starts_with("Bearer ") => {
+        let value = value.trim_start();
+        if value == "Bearer" || value.starts_with("Bearer ") {
+            let api_key = value.strip_prefix("Bearer ").unwrap_or("").trim();
+            if !api_key.starts_with(api_keys::API_KEY_PREFIX) {
                 return Err(ApiError::new(
                     StatusCode::UNAUTHORIZED,
                     "invalid_api_key",
                     "invalid API key",
                 ));
             }
-            Err(err) => return Err(err),
+            let user_id = api_keys::authenticate_api_key(state, api_key).await?;
+            touch_user_last_active_at(state, &user_id).await?;
+            return Ok(user_id);
         }
+
+        return require_active_user_id(state, session).await;
     }
 
     require_active_user_id(state, session).await
@@ -17132,6 +17127,15 @@ mod tests {
         )
         .await
         .expect_err("invalid bearer without session should fail as api key");
+        assert_eq!(err.code(), "invalid_api_key");
+
+        let err = require_business_user_id(
+            state.as_ref(),
+            &session,
+            &authorization_headers("Bearer external-provider-token"),
+        )
+        .await
+        .expect_err("invalid bearer with session should fail as api key");
         assert_eq!(err.code(), "invalid_api_key");
     }
 
