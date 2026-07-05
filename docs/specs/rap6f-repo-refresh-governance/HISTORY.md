@@ -4,7 +4,7 @@
 
 - Lifecycle: active
 - Created: 2026-06-29
-- Last: 2026-07-02
+- Last: 2026-07-05
 
 ## 变更记录
 
@@ -20,3 +20,4 @@
 - 2026-07-02: `/admin/repos` 解释面拆分实际刷新新鲜度、system 最近尝试、system 最近成功与目标窗口；10 分钟被明确为预算窗口和软目标推导单位，不再暗示全池必须 10 分钟完成。
 - 2026-07-02: 仓库明细新增服务端全量目标窗口多选与迫切值范围筛选；前端搜索、老化、窗口和迫切值筛选统一为 300ms 防抖自动应用，并将老化状态三按钮收口为单个下拉选择后刷新 Storybook 视觉证据。
 - 2026-07-02: 仓库明细筛选控件视觉继续收敛：目标窗口与迫切值仍打开各自面板，但触发器右侧补齐下拉箭头并保持浅色 outline。
+- 2026-07-05: 将 `repo_refresh_governance_rebuild` 拆成 cleanup、500 行 snapshot upsert chunks、500 行 member reconciliation chunks、snapshot completion 与 cycle reconciliation 阶段，并在 telemetry 中记录 chunk count 与最大 chunk elapsed，避免全池重建长时间占用 SQLite writer。

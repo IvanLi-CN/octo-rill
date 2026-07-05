@@ -23,8 +23,12 @@ export type BriefItem = {
 	effective_local_boundary?: string | null;
 	release_count: number;
 	release_ids: string[];
-	content_markdown: string;
+	preview_markdown?: string | null;
+	covers_repo_stars?: boolean;
+	covers_followers?: boolean;
+	content_markdown?: string | null;
 	created_at: string;
+	updated_at?: string | null;
 };
 
 function formatWindow(brief: BriefItem) {
@@ -40,9 +44,12 @@ export function ReleaseDailyCard(props: {
 	selectedId: string | null;
 	busy: boolean;
 	error?: string | null;
+	detailLoading?: boolean;
+	detailError?: string | null;
 	freshKeys?: Set<string>;
 	onGenerate: () => void;
 	onRetry?: () => void;
+	onRetryDetail?: () => void;
 	onOpenRelease?: (target: DashboardReleaseTarget) => void;
 }) {
 	const {
@@ -50,9 +57,12 @@ export function ReleaseDailyCard(props: {
 		selectedId,
 		busy,
 		error = null,
+		detailLoading = false,
+		detailError = null,
 		freshKeys = new Set<string>(),
 		onGenerate,
 		onRetry,
+		onRetryDetail,
 		onOpenRelease,
 	} = props;
 
@@ -138,10 +148,35 @@ export function ReleaseDailyCard(props: {
 								</span>
 							</div>
 						) : null}
-						<Markdown
-							content={selected.content_markdown}
-							onInternalReleaseClick={onOpenRelease}
-						/>
+						{detailError ? (
+							<ErrorStatePanel
+								title="日报正文加载失败"
+								summary={detailError}
+								size="compact"
+								actionLabel={onRetryDetail ? "重试" : undefined}
+								onAction={onRetryDetail}
+							/>
+						) : (
+							<>
+								{selected.content_markdown || selected.preview_markdown ? (
+									<Markdown
+										content={
+											selected.content_markdown ??
+											selected.preview_markdown ??
+											""
+										}
+										onInternalReleaseClick={onOpenRelease}
+									/>
+								) : null}
+								{detailLoading && !selected.content_markdown ? (
+									<div className="mt-3 space-y-2">
+										<div className="bg-muted h-3 w-full animate-pulse rounded" />
+										<div className="bg-muted h-3 w-11/12 animate-pulse rounded" />
+										<div className="bg-muted h-3 w-8/12 animate-pulse rounded" />
+									</div>
+								) : null}
+							</>
+						)}
 					</div>
 				) : (
 					<p className="text-muted-foreground text-sm">
