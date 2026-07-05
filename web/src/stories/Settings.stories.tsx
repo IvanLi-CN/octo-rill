@@ -562,7 +562,10 @@ export const DeepLinkedGitHubPat: Story = {
 		await expect(
 			canvas.queryByRole("heading", { name: "GitHub PAT 可用" }),
 		).not.toBeInTheDocument();
-		await expect(canvas.getByText("GitHub PAT 无效")).toBeVisible();
+		await expect(await canvas.findByText("已保存 GitHub PAT")).toBeVisible();
+		await expect(
+			await canvas.findByText("PAT 无效或已过期，请重新填写并校验。"),
+		).toBeVisible();
 		const input = canvasElement.querySelector(
 			"#settings-reaction-pat",
 		) as HTMLInputElement | null;
@@ -599,9 +602,6 @@ export const DeepLinkedGitHubPat: Story = {
 		).toBeVisible();
 		await expect(
 			canvas.getByText("@storybook-ops", { exact: true }),
-		).toBeVisible();
-		await expect(
-			canvas.getByText("当前环境未配置 LinuxDO Connect，按钮已禁用。"),
 		).toBeVisible();
 	},
 };

@@ -175,6 +175,14 @@ GitHub PAT section 深链态（保留 masked token / 校验状态，输入框默
 ![Settings GitHub PAT section](./assets/settings-github-pat-section.png)
 
 PR: include
+GitHub PAT section 桌面宽版深链态（设置页内容宽度对齐 AppShell）
+![Settings GitHub PAT wide desktop](./assets/settings-github-pat-wide-desktop.png)
+
+PR: include
+GitHub PAT section 移动端深链态（保持单列布局且无横向溢出）
+![Settings GitHub PAT wide mobile](./assets/settings-github-pat-wide-mobile.png)
+
+PR: include
 设置页移动端总览
 ![Settings page mobile overview](./assets/settings-page-mobile-overview.png)
 
