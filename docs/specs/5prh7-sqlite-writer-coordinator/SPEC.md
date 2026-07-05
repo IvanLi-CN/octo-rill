@@ -15,6 +15,7 @@
 - 保留高并发 worker 能力；只在进入 SQLite 写入段时协调单 writer。
 - 读请求继续使用现有 `SqlitePool`，不得因为写协调退化为全局单连接。
 - 高竞争写路径必须通过统一 coordinator 获取 writer permit，并记录 lane、priority、等待时长、attempt 与写入耗时。
+- 大集合重建类写入不得把全量 delete/upsert/reconcile 包在单个 writer permit 内；必须先完成读侧候选聚合，再用固定 chunk 的短事务提交写入，并记录 chunk count 与最大 chunk elapsed。
 - coordinator 必须区分 `foreground`、`background`、`best_effort` 语义，保证用户可见写入不会长期排在后台 heartbeat/finalize 后面。
 - SQLite busy/locked 必须作为可恢复背压处理，经过有界退避重试后再决定是否失败。
 - `last_active_at` 等用户热路径 best-effort 写入不得等待后台 writer 排队，也不得把 `/api/me` 类请求打成 500。
@@ -55,7 +56,7 @@
 
 ### SHOULD
 
-- 事务仍应尽量短小，批量写优先在单次 permit 内完成。
+- 事务仍应尽量短小；小批量写可以在单次 permit 内完成，生产量级全量重建必须拆成多个短 permit。
 - 对 best-effort 写入失败路径记录 warning/debug，但不破坏用户主要读流程。
 
 ### COULD
@@ -70,6 +71,7 @@
 - 登录/session、手动触发任务、job enqueue 与取消任务走 foreground lane；后台 claim/heartbeat/finalize/recovery 走 background lane；非关键活跃时间和清理类写入走 best-effort lane。
 - translation batch 的启动状态切换必须在单个短事务内完成：`translation_batches` 的 `queued -> running`、关联 `translation_work_items` 的 `running` 标记与 lease 元数据更新都要在 writer permit 内提交，AI 调用与后续长计算继续留在 permit 外。
 - feed reaction refresh 的 counts 持久化属于非关键后台写入；当 writer permit 不可得或 SQLite busy 时允许跳过持久化，但必须保留 live payload 返回与结构化降级证据。
+- repo refresh governance rebuild 属于生产量级集合重建路径：候选聚合留在 writer permit 外，stale cleanup、snapshot upsert、member reconciliation、snapshot completion 与 cycle reconciliation 分阶段提交；snapshot/member 写入固定 500 行 chunk。
 - HTTP 请求读取数据时不需要 writer permit；更新用户活跃时间等 best-effort 写入使用非阻塞 writer 尝试，拿不到 permit 时直接跳过。
 - 如果 SQLite 返回 busy/locked，coordinator 使用短退避重试，并在耗尽后返回原始错误上下文。
 
@@ -116,6 +118,10 @@
 - Given feed reaction refresh 已经拿到 GitHub live payload
   When counts 持久化阶段遇到 writer backlog 或 SQLite busy
   Then 非关键持久化允许跳过，但接口仍返回 live payload，且日志能区分 `sqlite_writer_busy` 或 `sqlite_busy` 降级原因。
+
+- Given repo refresh governance rebuild 需要处理生产量级 candidate repo 与 active cycle members
+  When 重建 governance snapshots 与 reconciliation
+  Then 单个 writer permit 只覆盖一个短阶段或一个 500 行 chunk，日志包含 `snapshot_upsert_chunks`、member reconciliation chunk count 与 `max_writer_chunk_elapsed_ms`。
 
 ## 验收清单（Acceptance checklist）
 

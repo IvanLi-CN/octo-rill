@@ -8296,8 +8296,21 @@ pub async fn list_notifications(
     Ok(Json(items))
 }
 
+const BRIEF_PREVIEW_MARKDOWN_MAX_CHARS: usize = 600;
+
+fn brief_preview_markdown(content_markdown: &str) -> String {
+    content_markdown
+        .chars()
+        .take(BRIEF_PREVIEW_MARKDOWN_MAX_CHARS)
+        .collect()
+}
+
+fn brief_markdown_has_section(markdown: &str, heading: &str) -> bool {
+    markdown.lines().any(|line| line.trim() == heading)
+}
+
 #[derive(Debug, Serialize, sqlx::FromRow)]
-pub struct BriefItem {
+pub struct BriefSummaryItem {
     id: String,
     date: String,
     window_start: Option<String>,
@@ -8306,14 +8319,17 @@ pub struct BriefItem {
     effective_local_boundary: Option<String>,
     release_count: usize,
     release_ids: Vec<String>,
-    content_markdown: String,
+    preview_markdown: String,
+    covers_repo_stars: bool,
+    covers_followers: bool,
     created_at: String,
+    updated_at: String,
 }
 
 pub async fn list_briefs(
     State(state): State<Arc<AppState>>,
     session: Session,
-) -> Result<Json<Vec<BriefItem>>, ApiError> {
+) -> Result<Json<Vec<BriefSummaryItem>>, ApiError> {
     let user_id = require_active_user_id(state.as_ref(), &session).await?;
 
     #[derive(Debug, sqlx::FromRow)]
@@ -8327,6 +8343,7 @@ pub async fn list_briefs(
         generation_source: String,
         content_markdown: String,
         created_at: String,
+        updated_at: String,
     }
 
     #[derive(Debug, sqlx::FromRow)]
@@ -8346,7 +8363,8 @@ pub async fn list_briefs(
           effective_local_boundary,
           generation_source,
           content_markdown,
-          created_at
+          created_at,
+          updated_at
         FROM briefs
         WHERE user_id = ?
         ORDER BY COALESCE(window_end_utc, created_at) DESC, created_at DESC, id DESC
@@ -8424,7 +8442,7 @@ pub async fn list_briefs(
                 .remove(&r.id)
                 .or_else(|| markdown_release_ids_by_brief.remove(&r.id))
                 .unwrap_or_default();
-            BriefItem {
+            BriefSummaryItem {
                 id: r.id,
                 date: r.date,
                 window_start: r.window_start_utc,
@@ -8433,13 +8451,133 @@ pub async fn list_briefs(
                 effective_local_boundary: r.effective_local_boundary,
                 release_count: release_ids.len(),
                 release_ids,
-                content_markdown: r.content_markdown,
+                preview_markdown: brief_preview_markdown(&r.content_markdown),
+                covers_repo_stars: brief_markdown_has_section(&r.content_markdown, "### 获星"),
+                covers_followers: brief_markdown_has_section(&r.content_markdown, "### 关注"),
                 created_at: r.created_at,
+                updated_at: r.updated_at,
             }
         })
         .collect::<Vec<_>>();
 
     Ok(Json(items))
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct BriefDetailItem {
+    id: String,
+    date: String,
+    window_start: Option<String>,
+    window_end: Option<String>,
+    effective_time_zone: Option<String>,
+    effective_local_boundary: Option<String>,
+    release_count: usize,
+    release_ids: Vec<String>,
+    preview_markdown: String,
+    covers_repo_stars: bool,
+    covers_followers: bool,
+    content_markdown: String,
+    created_at: String,
+    updated_at: String,
+}
+
+pub async fn get_brief(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(brief_id): Path<String>,
+) -> Result<Json<BriefDetailItem>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct BriefRow {
+        id: String,
+        date: String,
+        window_start_utc: Option<String>,
+        window_end_utc: Option<String>,
+        effective_time_zone: Option<String>,
+        effective_local_boundary: Option<String>,
+        generation_source: String,
+        content_markdown: String,
+        created_at: String,
+        updated_at: String,
+    }
+
+    let row = sqlx::query_as::<_, BriefRow>(
+        r#"
+        SELECT
+          id,
+          date,
+          window_start_utc,
+          window_end_utc,
+          effective_time_zone,
+          effective_local_boundary,
+          generation_source,
+          content_markdown,
+          created_at,
+          updated_at
+        FROM briefs
+        WHERE user_id = ? AND id = ?
+        "#,
+    )
+    .bind(&user_id)
+    .bind(&brief_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "brief not found"))?;
+
+    let mut release_ids = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT m.release_id
+        FROM brief_release_memberships m
+        WHERE m.brief_id = ?
+        ORDER BY m.ordinal ASC
+        "#,
+    )
+    .bind(&row.id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .into_iter()
+    .map(|value| value.to_string())
+    .collect::<Vec<_>>();
+
+    if release_ids.is_empty() && brief_uses_markdown_release_fallback(&row.generation_source) {
+        let refs = extract_brief_release_refs(&row.content_markdown);
+        if !refs.is_empty() {
+            let resolved_ids_by_ref = resolve_brief_release_refs_batched(&state.pool, &refs)
+                .await
+                .map_err(ApiError::internal)?;
+            let mut seen_release_ids = HashSet::<i64>::new();
+            release_ids = refs
+                .into_iter()
+                .filter_map(|reference| resolved_ids_by_ref.get(&reference).copied())
+                .filter(|release_id| seen_release_ids.insert(*release_id))
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>();
+        }
+    }
+
+    let preview_markdown = brief_preview_markdown(&row.content_markdown);
+    let covers_repo_stars = brief_markdown_has_section(&row.content_markdown, "### 获星");
+    let covers_followers = brief_markdown_has_section(&row.content_markdown, "### 关注");
+
+    Ok(Json(BriefDetailItem {
+        id: row.id,
+        date: row.date,
+        window_start: row.window_start_utc,
+        window_end: row.window_end_utc,
+        effective_time_zone: row.effective_time_zone,
+        effective_local_boundary: row.effective_local_boundary,
+        release_count: release_ids.len(),
+        release_ids,
+        preview_markdown,
+        covers_repo_stars,
+        covers_followers,
+        content_markdown: row.content_markdown,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -16042,7 +16180,7 @@ mod tests {
         build_feed_reaction_refresh_item, build_task_diagnostics, compact_dashboard_signatures,
         dashboard_updates, encode_dashboard_updates_token, ensure_account_enabled,
         execute_sync_all_sync_with, extract_brief_release_ids, extract_translation_fields,
-        feed_item_from_row, get_release_detail, get_release_detail_by_repo_tag,
+        feed_item_from_row, get_brief, get_release_detail, get_release_detail_by_repo_tag,
         github_access_restricted_error, github_graphql_errors_to_api_error,
         github_graphql_http_error, github_rate_limited_error, github_reauth_required_error,
         guard_admin_user_update, has_repo_scope, last_active_is_stale, list_briefs, list_feed,
@@ -24394,6 +24532,54 @@ line two",
         assert_eq!(items[0].release_ids, vec!["121".to_owned()]);
         assert_eq!(items[1].date, "2026-02-23");
         assert_eq!(items[1].release_ids, vec!["120".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn list_briefs_returns_summary_without_full_markdown() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        let large_markdown = format!(
+            "## 概览\n\n{}TAIL_MARKER_SHOULD_NOT_LEAK",
+            "正文 ".repeat(400)
+        );
+        seed_brief(&pool, user_id.as_str(), "2026-02-23", &large_markdown).await;
+        let state = setup_state(pool);
+
+        let Json(items) = list_briefs(State(state), setup_session(1).await)
+            .await
+            .expect("list briefs");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].date, "2026-02-23");
+        assert!(items[0].preview_markdown.starts_with("## 概览"));
+        assert!(!items[0].covers_repo_stars);
+        assert!(!items[0].covers_followers);
+        assert!(
+            !items[0]
+                .preview_markdown
+                .contains("TAIL_MARKER_SHOULD_NOT_LEAK")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_brief_returns_full_markdown_for_selected_item() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        let full_markdown = "## 完整日报\n\n- keep full content\nTAIL_MARKER_INCLUDED";
+        seed_brief(&pool, user_id.as_str(), "2026-02-23", full_markdown).await;
+        let state = setup_state(pool);
+
+        let Json(item) = get_brief(
+            State(state),
+            setup_session(1).await,
+            Path("brief-2026-02-23".to_owned()),
+        )
+        .await
+        .expect("get brief");
+
+        assert_eq!(item.id, "brief-2026-02-23");
+        assert!(item.preview_markdown.starts_with("## 完整日报"));
+        assert_eq!(item.content_markdown, full_markdown);
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@
 - LLM call retention cleanup 改为 best-effort writer lane；writer permit 不可得或 SQLite busy 时跳过本轮清理，并留下结构化 `sqlite.write` downgrade 日志，而不是把后台保留任务放大成周期性 warning spam 或主流程失败；完成态额外记录 cutoff、删除行数与 elapsed_ms，便于区分“无事可做”“writer pressure 跳过”“真实慢删除”。
 - runtime owner register/heartbeat 已接入 writer coordinator；`touch_user_last_active_at` 使用非阻塞 best-effort writer 尝试，拿不到 permit 时跳过，SQLite busy/locked 时记录 warning 并继续用户请求。
 - feed reaction refresh 的 counts 持久化改为 best-effort writer lane；writer permit 不可得或 SQLite busy 时跳过持久化，但保留 live payload 返回与结构化 warning。
+- repo refresh governance rebuild 已拆成 cleanup、snapshot upsert chunks、terminal member reconciliation chunks、legacy member backfill chunks、snapshot completion 与 cycle reconciliation 阶段；snapshot/member chunk size 固定为 500，并输出 chunk count 与最大 writer chunk elapsed telemetry。
 - subscription sync 的 `sync_subscription_events` 插入已接入 writer coordinator；`repo_release_watchers` / `sync_subscription_events` 历史裁剪改为 best-effort writer lane，在 writer permit 不可得或 SQLite busy 时跳过本轮清理并留下结构化 downgrade 日志。
 - 对超大 retention 表的运行态补丁继续落在同一 contract 内：watcher / event 裁剪批次扩大，并追加完成耗时、batch 配置与降级原因埋点，避免“小批次永远追不上存量”时把 writer contract 正确性问题和 backlog 问题混在一起。
 - subscription sync history prune 的两个 retention 相位现在彼此独立：`repo_release_watchers` 裁剪即使因为 writer pressure / SQLite busy 降级跳过，也不会短路后续 `sync_subscription_events` 裁剪，避免一个 best-effort 相位把另一相位一起饿死。
@@ -47,6 +48,7 @@
 - `src/translations.rs` 新增 batch 启动写段在 writer 压力下串行化回归，以及结果聚合在 writer 背压下直接复用 pending 快照的回归。
 - `src/sync.rs` 新增 social activity snapshot 与 feed activity event 在 competing writer 下等待并成功提交的并发回归。
 - `src/api.rs` 新增 feed reaction refresh 在 SQLite writer 压力下跳过持久化但继续返回 live item 的回归。
+- `src/sync.rs` 新增 governance rebuild 对超过 500 个候选 repo 的 chunk stats 回归，并保留 active member reconciliation 语义回归。
 - `src/jobs.rs` 新增后台 writer 压力下 `enqueue_task` 等待 coordinator 而不是绕过写入背压的回归测试。
 - `src/jobs.rs` 新增 daily slot dispatch、scheduled dispatch state 与 brief failure mark 在 competing writer 下等待成功提交的并发回归测试。
 - `src/sync.rs` 新增 subscription event 写入在 competing writer 下等待成功提交，以及 subscription history prune 在 writer permit 不可得或 SQLite busy 时降级跳过的回归测试。

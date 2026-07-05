@@ -62,11 +62,13 @@ Keep this targeted to write-intent paths such as:
 - retention / cleanup paths such as `repo_release_watchers`, `sync_subscription_events`, or `llm_calls` pruning, which should use best-effort lanes and degrade to observable skips when writer pressure or SQLite busy would otherwise starve foreground claims or heartbeats
 - incremental sync writes such as `starred_repos` upsert batches, notification inbox upsert / open-url repair, and `public_repo_release_usage` metadata refresh, which may look harmless in isolation but still bypass the single-writer contract when they run per page, per user, or per background worker
 - scheduler bookkeeping such as `daily_brief_hour_slots.last_dispatch_at`, `scheduled_task_dispatch_state`, or brief retry failure marks, because these low-payload writes still run on periodic background cadences and can starve claim / heartbeat paths if they bypass the coordinator
+- materialized governance or scheduler-pool rebuilds such as `repo_refresh_governance_snapshots`, where candidate aggregation may be large but the SQLite writer permit must cover only short cleanup/upsert/reconcile chunks
 
 ## Guardrails / Reuse Notes
 
 - For `replace_starred_repos` and similar full-replacement write paths, acquire the writer permit with `BEGIN IMMEDIATE` before deleting/replacing rows. That keeps the stale snapshot upgrade from surfacing as `failed to clear starred_repos` under concurrent access refresh or subscription sync.
 - For `store_sync_state_value` and related sync watermark writes, use the same coordinator lane and `BEGIN IMMEDIATE` contract. These upserts are high-contention write-intent paths during access refresh and subscription sync, and they should not bypass the writer coordinator by writing straight to the pool.
+- For production-size materialized rebuilds, do all expensive candidate reads and ranking outside the writer permit, then split writes into fixed-size chunks. `repo_refresh_governance_rebuild` uses 500-row snapshot/member chunks and records chunk counts plus max chunk elapsed so an HTTP hot path is not blocked behind a single 10s-class governance transaction.
 - Do not solve this by forcing `OCTORILL_SQLITE_POOL_MAX_CONNECTIONS=1`; that hides the race by serializing the whole app and can starve HTTP reads.
 - Do not lower worker/LLM concurrency as the durable database fix. Keep network and AI concurrency high; coordinate only the SQLite write section.
 - Do not preserve direct high-frequency writes to the pool in worker lifecycle paths. If a path can run per worker or per heartbeat, it needs a coordinator lane.

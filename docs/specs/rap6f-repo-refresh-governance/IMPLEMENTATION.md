@@ -5,8 +5,8 @@
 - Lifecycle: active
 - Implementation: 已交付
 - Created: 2026-06-29
-- Last: 2026-07-02
-- Summary: 已交付；effective repo pool、10 分钟 budgeted governance snapshots、attempt-based system cycle ledger、`/admin/repos` 独立治理页、预算编辑收口到订阅同步设置弹窗、仓库明细目标窗口/迫切值筛选、Storybook 视觉证据与 build validation 已完成
+- Last: 2026-07-05
+- Summary: 已交付；effective repo pool、10 分钟 budgeted governance snapshots、attempt-based system cycle ledger、chunked governance rebuild、`/admin/repos` 独立治理页、预算编辑收口到订阅同步设置弹窗、仓库明细目标窗口/迫切值筛选、Storybook 视觉证据与 build validation 已完成
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -20,6 +20,7 @@
 - [x] M6: Storybook fallback and owner-facing visual evidence
 - [x] M7: final frontend build / storybook / e2e validation sweep
 - [x] M8: system attempt ledger, failure recording, and active cycle reconciliation
+- [x] M9: governance rebuild 分阶段 chunked writer，避免大候选池与 cycle member reconciliation 长时间占用 SQLite writer。
 
 ## 本轮收口
 
@@ -35,6 +36,7 @@
 - `repo_refresh_governance_cycle_members` 记录 `attempt_status/error`，cycle member 在本轮 system 选中后只要对应 release work item 到达 `succeeded` 或 `failed` 终态即完成；成功才更新 `system_last_success_at`。
 - release work item 成功、失败、deadline/recovery 失败都会调用同一 governance attempt 记录路径；interactive demand 复用或提升 system 已选中的 work item 时，不会吞掉 system selection credit。
 - 治理快照重建会 reconciliation 历史 active cycle：只补结算 system 选中时间之后的终态 work item，避免选中前的旧成功误完成当前轮。
+- 治理快照重建分为 stale cleanup、snapshot upsert chunks、member reconciliation chunks、snapshot completion 与 cycle reconciliation 阶段；snapshot/member chunk size 固定为 500，并在 tracing 中记录 chunk count 与最大 chunk elapsed。
 - `/api/admin/repos` 与 `/admin/repos` 返回并展示 system attempt 状态；活动图保留实际新鲜度颜色，同时用失败角标和明细 badge 解释 system 尝试结果。
 
 ## 明细筛选收口

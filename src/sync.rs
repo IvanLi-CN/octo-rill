@@ -69,6 +69,7 @@ const STARRED_WATERMARK_KEY: &str = "starred_sync_watermark";
 const STARRED_FULL_SYNC_KEY: &str = "starred_full_sync_at";
 const REPO_REFRESH_SYSTEM_WINDOW_MINUTES: i64 = 10;
 const REPO_REFRESH_URGENCY_CAP: f64 = 4.0;
+const REPO_REFRESH_GOVERNANCE_REBUILD_CHUNK_SIZE: usize = 500;
 const SUBSCRIPTION_PRUNE_WATCHERS_BATCH_SIZE: i64 = 10_000;
 const SUBSCRIPTION_PRUNE_EVENTS_BATCH_SIZE: i64 = 2_000;
 const SUBSCRIPTION_PRUNE_WATCHERS_MAX_BATCHES: usize = 20;
@@ -789,6 +790,18 @@ struct RepoRefreshCandidate {
     watcher_user_count: usize,
     watcher_repo_total_sum: usize,
     cached_stargazer_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RepoRefreshGovernanceRebuildStats {
+    candidate_repos: usize,
+    stale_cleanup_chunks: usize,
+    snapshot_upsert_chunks: usize,
+    terminal_member_reconcile_chunks: usize,
+    legacy_member_backfill_chunks: usize,
+    snapshot_completion_chunks: usize,
+    cycle_reconcile_chunks: usize,
+    max_writer_chunk_elapsed_ms: u128,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -4939,27 +4952,231 @@ fn current_repo_refresh_window_index(now: DateTime<Utc>) -> i64 {
         .div_euclid(REPO_REFRESH_SYSTEM_WINDOW_MINUTES * 60)
 }
 
+async fn upsert_repo_refresh_governance_snapshot(
+    tx: &mut sqlx::SqliteConnection,
+    candidate: &RepoRefreshCandidate,
+    priority_rank: i64,
+    budget: i64,
+    now_rfc3339: &str,
+) -> Result<()> {
+    let target_window = ((priority_rank - 1) / budget) + 1;
+    let target_interval_minutes = target_window * REPO_REFRESH_SYSTEM_WINDOW_MINUTES;
+    let target_interval_minutes_real = (target_interval_minutes.max(1)) as f64;
+
+    sqlx::query(
+        r#"
+        INSERT INTO repo_refresh_governance_snapshots (
+          repo_id,
+          repo_full_name,
+          is_private,
+          watcher_user_count,
+          watcher_repo_total_sum,
+          cached_stargazer_count,
+          cached_stargazer_count_updated_at,
+          priority_rank,
+          target_window,
+          target_interval_minutes,
+          urgency_score,
+          urgency_bucket,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, (
+          SELECT MAX(updated_at_source) FROM (
+            SELECT MAX(repo_stargazer_count_updated_at) AS updated_at_source
+            FROM starred_repos
+            WHERE repo_id = ?
+            UNION ALL
+            SELECT MAX(repo_stargazer_count_updated_at) AS updated_at_source
+            FROM owned_repo_star_baselines
+            WHERE repo_id = ?
+          )
+        ), ?, ?, ?,
+        CASE
+          WHEN (
+            SELECT existing.system_last_success_at
+            FROM repo_refresh_governance_snapshots existing
+            WHERE existing.repo_id = ?
+          ) IS NULL THEN ?
+          ELSE MIN(
+            ?,
+            CAST(
+              (julianday(?) - julianday((
+                SELECT existing.system_last_success_at
+                FROM repo_refresh_governance_snapshots existing
+                WHERE existing.repo_id = ?
+              ))) * 24.0 * 60.0
+              / ?
+            AS REAL)
+          )
+        END,
+        CASE
+          WHEN (
+            SELECT existing.system_last_success_at
+            FROM repo_refresh_governance_snapshots existing
+            WHERE existing.repo_id = ?
+          ) IS NULL THEN 'critical'
+          WHEN MIN(
+            ?,
+            CAST(
+              (julianday(?) - julianday((
+                SELECT existing.system_last_success_at
+                FROM repo_refresh_governance_snapshots existing
+                WHERE existing.repo_id = ?
+              ))) * 24.0 * 60.0
+              / ?
+            AS REAL)
+          ) >= ? THEN 'critical'
+          WHEN MIN(
+            ?,
+            CAST(
+              (julianday(?) - julianday((
+                SELECT existing.system_last_success_at
+                FROM repo_refresh_governance_snapshots existing
+                WHERE existing.repo_id = ?
+              ))) * 24.0 * 60.0
+              / ?
+            AS REAL)
+          ) >= ? THEN 'due'
+          ELSE 'active'
+        END,
+        ?)
+        ON CONFLICT(repo_id) DO UPDATE SET
+          repo_full_name = excluded.repo_full_name,
+          is_private = excluded.is_private,
+          watcher_user_count = excluded.watcher_user_count,
+          watcher_repo_total_sum = excluded.watcher_repo_total_sum,
+          cached_stargazer_count = excluded.cached_stargazer_count,
+          cached_stargazer_count_updated_at = excluded.cached_stargazer_count_updated_at,
+          priority_rank = excluded.priority_rank,
+          target_window = excluded.target_window,
+          target_interval_minutes = excluded.target_interval_minutes,
+          urgency_score = excluded.urgency_score,
+          urgency_bucket = excluded.urgency_bucket,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(candidate.repo_id)
+    .bind(candidate.full_name.as_str())
+    .bind(candidate.is_private as i64)
+    .bind(i64::try_from(candidate.watcher_user_count).unwrap_or(i64::MAX))
+    .bind(i64::try_from(candidate.watcher_repo_total_sum).unwrap_or(i64::MAX))
+    .bind(candidate.cached_stargazer_count)
+    .bind(candidate.repo_id)
+    .bind(candidate.repo_id)
+    .bind(priority_rank)
+    .bind(target_window)
+    .bind(target_interval_minutes)
+    .bind(candidate.repo_id)
+    .bind(REPO_REFRESH_URGENCY_CAP)
+    .bind(REPO_REFRESH_URGENCY_CAP)
+    .bind(now_rfc3339)
+    .bind(candidate.repo_id)
+    .bind(target_interval_minutes_real)
+    .bind(candidate.repo_id)
+    .bind(REPO_REFRESH_URGENCY_CAP)
+    .bind(now_rfc3339)
+    .bind(candidate.repo_id)
+    .bind(target_interval_minutes_real)
+    .bind(REPO_REFRESH_URGENCY_CAP)
+    .bind(REPO_REFRESH_URGENCY_CAP)
+    .bind(now_rfc3339)
+    .bind(candidate.repo_id)
+    .bind(target_interval_minutes_real)
+    .bind(2.0_f64)
+    .bind(now_rfc3339)
+    .execute(tx)
+    .await
+    .with_context(|| {
+        format!(
+            "upsert repo refresh governance snapshot for {}",
+            candidate.full_name
+        )
+    })?;
+
+    Ok(())
+}
+
+async fn load_repo_refresh_governance_terminal_member_rowids(state: &AppState) -> Result<Vec<i64>> {
+    let rowids = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT members.rowid
+        FROM repo_refresh_governance_cycle_members members
+        JOIN repo_refresh_governance_snapshots snapshots
+          ON snapshots.repo_id = members.repo_id
+         AND snapshots.active_cycle_id = members.cycle_id
+        WHERE members.completed_at IS NULL
+          AND snapshots.system_last_selected_at IS NOT NULL
+          AND EXISTS (
+            SELECT 1
+            FROM repo_release_work_items work_items
+            WHERE work_items.repo_id = members.repo_id
+              AND work_items.status IN ('succeeded', 'failed')
+              AND julianday(COALESCE(work_items.finished_at, work_items.updated_at))
+                  >= julianday(snapshots.system_last_selected_at)
+          )
+        ORDER BY members.cycle_id, members.repo_id
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .context("load repo refresh governance terminal member rowids")?;
+
+    Ok(rowids)
+}
+
+async fn load_repo_refresh_governance_legacy_member_rowids(state: &AppState) -> Result<Vec<i64>> {
+    let rowids = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT rowid
+        FROM repo_refresh_governance_cycle_members
+        WHERE completed_at IS NOT NULL
+          AND attempt_status IS NULL
+        ORDER BY cycle_id, repo_id
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .context("load legacy completed repo refresh governance member rowids")?;
+
+    Ok(rowids)
+}
+
+fn record_repo_refresh_governance_writer_chunk(
+    stats: &mut RepoRefreshGovernanceRebuildStats,
+    elapsed: std::time::Duration,
+) {
+    stats.max_writer_chunk_elapsed_ms = stats.max_writer_chunk_elapsed_ms.max(elapsed.as_millis());
+}
+
 async fn rebuild_repo_refresh_governance_snapshots(
     state: &AppState,
     candidates: &[RepoRefreshCandidate],
     budget_per_window: i64,
     now: DateTime<Utc>,
-) -> Result<()> {
+) -> Result<RepoRefreshGovernanceRebuildStats> {
     let now_rfc3339 = now.to_rfc3339();
     let budget = admin_runtime::normalize_repo_refresh_system_budget_per_window(budget_per_window);
     let now_window_index = current_repo_refresh_window_index(now);
     let started_at = Instant::now();
+    let mut stats = RepoRefreshGovernanceRebuildStats {
+        candidate_repos: candidates.len(),
+        ..RepoRefreshGovernanceRebuildStats::default()
+    };
 
+    let cleanup_started = Instant::now();
     state
         .sqlite_writer
-        .write("repo_refresh_governance_rebuild", |_| async {
+        .write("repo_refresh_governance_rebuild_cleanup", |_| async {
             let mut tx = state
                 .pool
                 .begin_with("BEGIN IMMEDIATE")
                 .await
-                .context("begin repo refresh governance rebuild tx")?;
+                .context("begin repo refresh governance cleanup tx")?;
 
-            let candidate_repo_ids = candidates.iter().map(|candidate| candidate.repo_id).collect::<Vec<_>>();
+            let candidate_repo_ids = candidates
+                .iter()
+                .map(|candidate| candidate.repo_id)
+                .collect::<Vec<_>>();
             if !candidate_repo_ids.is_empty() {
                 let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
                     "DELETE FROM repo_refresh_governance_snapshots WHERE repo_id NOT IN (",
@@ -4983,145 +5200,70 @@ async fn rebuild_repo_refresh_governance_snapshots(
                     .context("clear repo refresh governance snapshots")?;
             }
 
-            for (index, candidate) in candidates.iter().enumerate() {
-                let priority_rank = i64::try_from(index + 1).unwrap_or(i64::MAX);
-                let target_window = ((priority_rank - 1) / budget) + 1;
-                let target_interval_minutes = target_window * REPO_REFRESH_SYSTEM_WINDOW_MINUTES;
-                let target_interval_minutes_real = (target_interval_minutes.max(1)) as f64;
-
-                sqlx::query(
-                    r#"
-                    INSERT INTO repo_refresh_governance_snapshots (
-                      repo_id,
-                      repo_full_name,
-                      is_private,
-                      watcher_user_count,
-                      watcher_repo_total_sum,
-                      cached_stargazer_count,
-                      cached_stargazer_count_updated_at,
-                      priority_rank,
-                      target_window,
-                      target_interval_minutes,
-                      urgency_score,
-                      urgency_bucket,
-                      updated_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, (
-                      SELECT MAX(updated_at_source) FROM (
-                        SELECT MAX(repo_stargazer_count_updated_at) AS updated_at_source
-                        FROM starred_repos
-                        WHERE repo_id = ?
-                        UNION ALL
-                        SELECT MAX(repo_stargazer_count_updated_at) AS updated_at_source
-                        FROM owned_repo_star_baselines
-                        WHERE repo_id = ?
-                      )
-                    ), ?, ?, ?,
-                    CASE
-                      WHEN (
-                        SELECT existing.system_last_success_at
-                        FROM repo_refresh_governance_snapshots existing
-                        WHERE existing.repo_id = ?
-                      ) IS NULL THEN ?
-                      ELSE MIN(
-                        ?,
-                        CAST(
-                          (julianday(?) - julianday((
-                            SELECT existing.system_last_success_at
-                            FROM repo_refresh_governance_snapshots existing
-                            WHERE existing.repo_id = ?
-                          ))) * 24.0 * 60.0
-                          / ?
-                        AS REAL)
-                      )
-                    END,
-                    CASE
-                      WHEN (
-                        SELECT existing.system_last_success_at
-                        FROM repo_refresh_governance_snapshots existing
-                        WHERE existing.repo_id = ?
-                      ) IS NULL THEN 'critical'
-                      WHEN MIN(
-                        ?,
-                        CAST(
-                          (julianday(?) - julianday((
-                            SELECT existing.system_last_success_at
-                            FROM repo_refresh_governance_snapshots existing
-                            WHERE existing.repo_id = ?
-                          ))) * 24.0 * 60.0
-                          / ?
-                        AS REAL)
-                      ) >= ? THEN 'critical'
-                      WHEN MIN(
-                        ?,
-                        CAST(
-                          (julianday(?) - julianday((
-                            SELECT existing.system_last_success_at
-                            FROM repo_refresh_governance_snapshots existing
-                            WHERE existing.repo_id = ?
-                          ))) * 24.0 * 60.0
-                          / ?
-                        AS REAL)
-                      ) >= ? THEN 'due'
-                      ELSE 'active'
-                    END,
-                    ?)
-                    ON CONFLICT(repo_id) DO UPDATE SET
-                      repo_full_name = excluded.repo_full_name,
-                      is_private = excluded.is_private,
-                      watcher_user_count = excluded.watcher_user_count,
-                      watcher_repo_total_sum = excluded.watcher_repo_total_sum,
-                      cached_stargazer_count = excluded.cached_stargazer_count,
-                      cached_stargazer_count_updated_at = excluded.cached_stargazer_count_updated_at,
-                      priority_rank = excluded.priority_rank,
-                      target_window = excluded.target_window,
-                      target_interval_minutes = excluded.target_interval_minutes,
-                      urgency_score = excluded.urgency_score,
-                      urgency_bucket = excluded.urgency_bucket,
-                      updated_at = excluded.updated_at
-                    "#,
-                )
-                .bind(candidate.repo_id)
-                .bind(candidate.full_name.as_str())
-                .bind(candidate.is_private as i64)
-                .bind(i64::try_from(candidate.watcher_user_count).unwrap_or(i64::MAX))
-                .bind(i64::try_from(candidate.watcher_repo_total_sum).unwrap_or(i64::MAX))
-                .bind(candidate.cached_stargazer_count)
-                .bind(candidate.repo_id)
-                .bind(candidate.repo_id)
-                .bind(priority_rank)
-                .bind(target_window)
-                .bind(target_interval_minutes)
-                .bind(candidate.repo_id)
-                .bind(REPO_REFRESH_URGENCY_CAP)
-                .bind(REPO_REFRESH_URGENCY_CAP)
-                .bind(now_rfc3339.as_str())
-                .bind(candidate.repo_id)
-                .bind(target_interval_minutes_real)
-                .bind(candidate.repo_id)
-                .bind(REPO_REFRESH_URGENCY_CAP)
-                .bind(now_rfc3339.as_str())
-                .bind(candidate.repo_id)
-                .bind(target_interval_minutes_real)
-                .bind(REPO_REFRESH_URGENCY_CAP)
-                .bind(REPO_REFRESH_URGENCY_CAP)
-                .bind(now_rfc3339.as_str())
-                .bind(candidate.repo_id)
-                .bind(target_interval_minutes_real)
-                .bind(2.0_f64)
-                .bind(now_rfc3339.as_str())
-                .execute(&mut *tx)
+            tx.commit()
                 .await
-                .with_context(|| {
-                    format!(
-                        "upsert repo refresh governance snapshot for {}",
-                        candidate.full_name
-                    )
-                })?;
-            }
+                .context("commit repo refresh governance cleanup tx")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    stats.stale_cleanup_chunks = 1;
+    record_repo_refresh_governance_writer_chunk(&mut stats, cleanup_started.elapsed());
 
-            sqlx::query(
-                r#"
+    for (chunk_index, chunk) in candidates
+        .chunks(REPO_REFRESH_GOVERNANCE_REBUILD_CHUNK_SIZE)
+        .enumerate()
+    {
+        let chunk_started = Instant::now();
+        state
+            .sqlite_writer
+            .write(
+                "repo_refresh_governance_rebuild_snapshots_chunk",
+                |_| async {
+                    let mut tx = state
+                        .pool
+                        .begin_with("BEGIN IMMEDIATE")
+                        .await
+                        .context("begin repo refresh governance snapshot chunk tx")?;
+
+                    for (index, candidate) in chunk.iter().enumerate() {
+                        let absolute_index =
+                            chunk_index * REPO_REFRESH_GOVERNANCE_REBUILD_CHUNK_SIZE + index;
+                        let priority_rank = i64::try_from(absolute_index + 1).unwrap_or(i64::MAX);
+                        upsert_repo_refresh_governance_snapshot(
+                            &mut tx,
+                            candidate,
+                            priority_rank,
+                            budget,
+                            now_rfc3339.as_str(),
+                        )
+                        .await?;
+                    }
+
+                    tx.commit()
+                        .await
+                        .context("commit repo refresh governance snapshot chunk tx")?;
+                    Ok::<_, anyhow::Error>(())
+                },
+            )
+            .await?;
+        stats.snapshot_upsert_chunks += 1;
+        record_repo_refresh_governance_writer_chunk(&mut stats, chunk_started.elapsed());
+    }
+
+    let terminal_member_rowids = load_repo_refresh_governance_terminal_member_rowids(state).await?;
+    for rowid_chunk in terminal_member_rowids.chunks(REPO_REFRESH_GOVERNANCE_REBUILD_CHUNK_SIZE) {
+        let chunk_started = Instant::now();
+        state
+            .sqlite_writer
+            .write("repo_refresh_governance_reconcile_members_chunk", |_| async {
+                let mut tx = state
+                    .pool
+                    .begin_with("BEGIN IMMEDIATE")
+                    .await
+                    .context("begin repo refresh governance member reconcile tx")?;
+
+                let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    r#"
                 UPDATE repo_refresh_governance_cycle_members
                 SET completed_at = COALESCE(
                       completed_at,
@@ -5174,41 +5316,101 @@ async fn rebuild_repo_refresh_governance_snapshots(
                         LIMIT 1
                       )
                     ),
-                    updated_at = ?
-                WHERE completed_at IS NULL
-                  AND EXISTS (
-                    SELECT 1
-                    FROM repo_refresh_governance_snapshots snapshots
-                    JOIN repo_release_work_items work_items
-                      ON work_items.repo_id = snapshots.repo_id
-                    WHERE snapshots.repo_id = repo_refresh_governance_cycle_members.repo_id
-                      AND snapshots.active_cycle_id = repo_refresh_governance_cycle_members.cycle_id
-                      AND snapshots.system_last_selected_at IS NOT NULL
-                      AND work_items.status IN ('succeeded', 'failed')
-                      AND julianday(COALESCE(work_items.finished_at, work_items.updated_at))
-                          >= julianday(snapshots.system_last_selected_at)
-                  )
+                    updated_at =
                 "#,
-            )
-            .bind(now_rfc3339.as_str())
-            .execute(&mut *tx)
-            .await
-            .context("reconcile completed repo refresh governance attempts")?;
+                );
+                builder.push_bind(now_rfc3339.as_str());
+                builder.push(
+                    r#"
+                WHERE completed_at IS NULL
+                  AND rowid IN (
+                "#,
+                );
+                {
+                    let mut separated = builder.separated(", ");
+                    for rowid in rowid_chunk {
+                        separated.push_bind(rowid);
+                    }
+                }
+                builder.push(")");
+                builder
+                    .build()
+                    .execute(&mut *tx)
+                    .await
+                    .context("reconcile completed repo refresh governance attempts")?;
 
-            sqlx::query(
-                r#"
+                tx.commit()
+                    .await
+                    .context("commit repo refresh governance member reconcile tx")?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await?;
+        stats.terminal_member_reconcile_chunks += 1;
+        record_repo_refresh_governance_writer_chunk(&mut stats, chunk_started.elapsed());
+    }
+
+    let legacy_member_rowids = load_repo_refresh_governance_legacy_member_rowids(state).await?;
+    for rowid_chunk in legacy_member_rowids.chunks(REPO_REFRESH_GOVERNANCE_REBUILD_CHUNK_SIZE) {
+        let chunk_started = Instant::now();
+        state
+            .sqlite_writer
+            .write(
+                "repo_refresh_governance_backfill_members_chunk",
+                |_| async {
+                    let mut tx = state
+                        .pool
+                        .begin_with("BEGIN IMMEDIATE")
+                        .await
+                        .context("begin legacy repo refresh governance member backfill tx")?;
+
+                    let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                        r#"
                 UPDATE repo_refresh_governance_cycle_members
                 SET attempt_status = 'succeeded',
-                    updated_at = ?
+                    updated_at =
+                "#,
+                    );
+                    builder.push_bind(now_rfc3339.as_str());
+                    builder.push(
+                        r#"
                 WHERE completed_at IS NOT NULL
                   AND attempt_status IS NULL
+                  AND rowid IN (
                 "#,
-            )
-            .bind(now_rfc3339.as_str())
-            .execute(&mut *tx)
-            .await
-            .context("backfill completed repo refresh governance attempt statuses")?;
+                    );
+                    {
+                        let mut separated = builder.separated(", ");
+                        for rowid in rowid_chunk {
+                            separated.push_bind(rowid);
+                        }
+                    }
+                    builder.push(")");
+                    builder
+                        .build()
+                        .execute(&mut *tx)
+                        .await
+                        .context("backfill completed repo refresh governance attempt statuses")?;
 
+                    tx.commit()
+                        .await
+                        .context("commit legacy repo refresh governance member backfill tx")?;
+                    Ok::<_, anyhow::Error>(())
+                },
+            )
+            .await?;
+        stats.legacy_member_backfill_chunks += 1;
+        record_repo_refresh_governance_writer_chunk(&mut stats, chunk_started.elapsed());
+    }
+
+    let snapshot_completion_started = Instant::now();
+    state
+        .sqlite_writer
+        .write("repo_refresh_governance_reconcile_snapshots", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin repo refresh governance snapshot completion tx")?;
             sqlx::query(
                 r#"
                 UPDATE repo_refresh_governance_snapshots
@@ -5279,6 +5481,24 @@ async fn rebuild_repo_refresh_governance_snapshots(
             .await
             .context("reconcile repo refresh governance snapshot completion")?;
 
+            tx.commit()
+                .await
+                .context("commit repo refresh governance snapshot completion tx")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    stats.snapshot_completion_chunks = 1;
+    record_repo_refresh_governance_writer_chunk(&mut stats, snapshot_completion_started.elapsed());
+
+    let cycle_reconcile_started = Instant::now();
+    state
+        .sqlite_writer
+        .write("repo_refresh_governance_reconcile_cycles", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin repo refresh governance cycle reconcile tx")?;
             sqlx::query(
                 r#"
                 UPDATE repo_refresh_governance_cycles
@@ -5357,18 +5577,28 @@ async fn rebuild_repo_refresh_governance_snapshots(
 
             tx.commit()
                 .await
-                .context("commit repo refresh governance rebuild tx")?;
+                .context("commit repo refresh governance cycle reconcile tx")?;
             Ok::<_, anyhow::Error>(())
         })
         .await?;
+    stats.cycle_reconcile_chunks = 1;
+    record_repo_refresh_governance_writer_chunk(&mut stats, cycle_reconcile_started.elapsed());
 
     let elapsed_ms = started_at.elapsed().as_millis();
     if elapsed_ms >= 1_000 {
         tracing::warn!(
             event = "sqlite.write",
             operation = "sync.repo_refresh_governance_rebuild",
-            candidate_repos = candidates.len(),
+            candidate_repos = stats.candidate_repos,
             budget_per_window = budget,
+            chunk_size = REPO_REFRESH_GOVERNANCE_REBUILD_CHUNK_SIZE,
+            stale_cleanup_chunks = stats.stale_cleanup_chunks,
+            snapshot_upsert_chunks = stats.snapshot_upsert_chunks,
+            terminal_member_reconcile_chunks = stats.terminal_member_reconcile_chunks,
+            legacy_member_backfill_chunks = stats.legacy_member_backfill_chunks,
+            snapshot_completion_chunks = stats.snapshot_completion_chunks,
+            cycle_reconcile_chunks = stats.cycle_reconcile_chunks,
+            max_writer_chunk_elapsed_ms = stats.max_writer_chunk_elapsed_ms,
             elapsed_ms,
             "repo refresh governance rebuild completed slowly"
         );
@@ -5376,14 +5606,22 @@ async fn rebuild_repo_refresh_governance_snapshots(
         tracing::info!(
             event = "sqlite.write",
             operation = "sync.repo_refresh_governance_rebuild",
-            candidate_repos = candidates.len(),
+            candidate_repos = stats.candidate_repos,
             budget_per_window = budget,
+            chunk_size = REPO_REFRESH_GOVERNANCE_REBUILD_CHUNK_SIZE,
+            stale_cleanup_chunks = stats.stale_cleanup_chunks,
+            snapshot_upsert_chunks = stats.snapshot_upsert_chunks,
+            terminal_member_reconcile_chunks = stats.terminal_member_reconcile_chunks,
+            legacy_member_backfill_chunks = stats.legacy_member_backfill_chunks,
+            snapshot_completion_chunks = stats.snapshot_completion_chunks,
+            cycle_reconcile_chunks = stats.cycle_reconcile_chunks,
+            max_writer_chunk_elapsed_ms = stats.max_writer_chunk_elapsed_ms,
             elapsed_ms,
             "repo refresh governance rebuild completed"
         );
     }
 
-    Ok(())
+    Ok(stats)
 }
 
 async fn ensure_active_repo_refresh_cycle(
@@ -10201,12 +10439,13 @@ mod tests {
         GitHubReleaseEventPayload, NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE,
         NOTIFICATION_OPEN_URL_REPAIR_KEY, NOTIFICATION_OPEN_URL_REPAIR_PENDING,
         NOTIFICATIONS_SINCE_KEY, NotificationRepo, NotificationSubject, OwnedRepoNode,
-        OwnedRepoSnapshot, REPO_RELEASE_DEADLINE_EXPIRED_ERROR, ReleaseDemandRepo, RepoOwner,
-        RepoRefreshCandidate, RepoReleaseFetchOutcome, RepoReleaseHttpState, RepoReleaseOrigin,
-        RepoReleaseWorkItemRow, RepoReleaseWriteStats, RepoStargazerFetchResult,
-        RepoStargazerSnapshot, SocialActivityEventInsert, StarPhaseSuccess, StarredFetchResult,
-        StarredRepoSnapshot, SubscriptionEventRecord, SubscriptionPrunePhaseOutcome,
-        SubscriptionRunContext, SyncRequestError, aggregate_release_visible_repos, aggregate_repos,
+        OwnedRepoSnapshot, REPO_REFRESH_GOVERNANCE_REBUILD_CHUNK_SIZE,
+        REPO_RELEASE_DEADLINE_EXPIRED_ERROR, ReleaseDemandRepo, RepoOwner, RepoRefreshCandidate,
+        RepoReleaseFetchOutcome, RepoReleaseHttpState, RepoReleaseOrigin, RepoReleaseWorkItemRow,
+        RepoReleaseWriteStats, RepoStargazerFetchResult, RepoStargazerSnapshot,
+        SocialActivityEventInsert, StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot,
+        SubscriptionEventRecord, SubscriptionPrunePhaseOutcome, SubscriptionRunContext,
+        SyncRequestError, aggregate_release_visible_repos, aggregate_repos,
         announcement_category_id_from_repo_value, append_subscription_event,
         apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
         apply_social_activity_snapshot_with_options, attach_and_wait_for_user_release_demand,
@@ -10735,6 +10974,54 @@ mod tests {
         );
         assert_eq!(urgency_bucket, "active");
         assert_eq!(updated_at, now.to_rfc3339());
+    }
+
+    #[tokio::test]
+    async fn rebuild_repo_refresh_governance_snapshots_chunks_large_candidate_pool() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = chrono::DateTime::parse_from_rfc3339("2026-03-06T12:30:00Z")
+            .expect("parse rebuild now")
+            .with_timezone(&chrono::Utc);
+        let candidates = (0..(REPO_REFRESH_GOVERNANCE_REBUILD_CHUNK_SIZE * 2 + 1))
+            .map(|index| RepoRefreshCandidate {
+                repo_id: 10_000 + i64::try_from(index).expect("candidate index fits"),
+                full_name: format!("octo/repo-{index}"),
+                is_private: false,
+                watcher_user_count: 1,
+                watcher_repo_total_sum: 1,
+                cached_stargazer_count: None,
+            })
+            .collect::<Vec<_>>();
+
+        let stats =
+            rebuild_repo_refresh_governance_snapshots(state.as_ref(), &candidates, 1000, now)
+                .await
+                .expect("rebuild governance snapshots");
+
+        assert_eq!(stats.candidate_repos, candidates.len());
+        assert_eq!(stats.snapshot_upsert_chunks, 3);
+        assert!(
+            stats.snapshot_upsert_chunks * REPO_REFRESH_GOVERNANCE_REBUILD_CHUNK_SIZE
+                >= stats.candidate_repos
+        );
+        let row = sqlx::query_as::<_, (i64, i64)>(
+            r#"
+            SELECT COUNT(*), MAX(priority_rank)
+            FROM repo_refresh_governance_snapshots
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load governance snapshot count");
+        assert_eq!(
+            row.0,
+            i64::try_from(candidates.len()).expect("candidate count fits")
+        );
+        assert_eq!(
+            row.1,
+            i64::try_from(candidates.len()).expect("candidate count fits")
+        );
     }
 
     #[tokio::test]

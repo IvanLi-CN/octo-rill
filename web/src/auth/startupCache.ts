@@ -123,6 +123,12 @@ function stripPrivilegedStartupFields(me: MeResponse): MeResponse {
 	};
 }
 
+function stripBriefDetailContent(briefs: BriefItem[]): BriefItem[] {
+	return briefs.map(
+		({ content_markdown: _contentMarkdown, ...brief }) => brief,
+	);
+}
+
 export function deriveStartupRouteFamily(pathname: string): StartupRouteFamily {
 	if (pathname.startsWith("/admin/jobs")) {
 		return "admin-jobs";
@@ -229,7 +235,7 @@ export function persistDashboardWarmSnapshot(
 		feedItems: snapshot.feedItems.slice(0, MAX_WARM_FEED_ITEMS),
 		nextCursor: snapshot.nextCursor,
 		notifications: snapshot.notifications.slice(0, MAX_WARM_NOTIFICATIONS),
-		briefs: snapshot.briefs.slice(0, MAX_WARM_BRIEFS),
+		briefs: stripBriefDetailContent(snapshot.briefs.slice(0, MAX_WARM_BRIEFS)),
 		selectedBriefId: snapshot.selectedBriefId,
 	});
 }
