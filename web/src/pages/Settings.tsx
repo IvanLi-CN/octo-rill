@@ -480,19 +480,23 @@ export function SettingsPage(props: {
 	}, [section]);
 
 	useEffect(() => {
-		void Promise.all([
-			loadApiKeys(),
+		const loaders = [
 			loadGitHubConnections(),
 			loadPasskeys(),
 			loadLinuxDo(),
 			loadBriefProfile(),
-		]);
+		];
+		if (section === "api-keys") {
+			loaders.push(loadApiKeys());
+		}
+		void Promise.all(loaders);
 	}, [
 		loadApiKeys,
 		loadBriefProfile,
 		loadGitHubConnections,
 		loadLinuxDo,
 		loadPasskeys,
+		section,
 	]);
 
 	const onConnectGitHub = useCallback(() => {

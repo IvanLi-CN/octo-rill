@@ -136,6 +136,7 @@ async function installSettingsMocks(
 		reactionTokenOwnerLogin?: string | null;
 		includeOwnReleases?: boolean;
 		withReactionFeed?: boolean;
+		onApiKeysGet?: () => void;
 	},
 ) {
 	let includeOwnReleases = options?.includeOwnReleases ?? false;
@@ -189,6 +190,7 @@ async function installSettingsMocks(
 		}
 
 		if (req.method() === "GET" && pathname === "/api/me/api-keys") {
+			options?.onApiKeysGet?.();
 			return json(route, { items: apiKeys });
 		}
 
@@ -426,6 +428,27 @@ test("settings deep link focuses github pat section", async ({ page }) => {
 		guide.getByRole("button", { name: "No expiration" }),
 	).toBeVisible();
 	await expect(page.getByText("@storybook-ops", { exact: true })).toBeVisible();
+});
+
+test("settings github pat section does not fetch plaintext api keys", async ({
+	page,
+}) => {
+	await installPasskeyBrowserMock(page);
+	let apiKeysGetCount = 0;
+	await installSettingsMocks(page, {
+		reactionTokenConfigured: true,
+		reactionTokenMasked: "ghp_****_saved",
+		onApiKeysGet: () => {
+			apiKeysGetCount += 1;
+		},
+	});
+
+	await page.goto("/settings?section=github-pat");
+
+	await expect(
+		page.locator('[data-settings-section="github-pat"]'),
+	).toBeVisible();
+	await expect.poll(() => apiKeysGetCount).toBe(0);
 });
 
 test("settings api key section persists key display and confirms revoke", async ({
