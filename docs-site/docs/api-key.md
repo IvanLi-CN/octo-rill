@@ -363,7 +363,8 @@ Body：
 | HTTP | code | 说明 |
 | --- | --- | --- |
 | `400` | `bad_request` | 参数、body 或 mode 不合法。 |
-| `401` | `invalid_api_key` | Bearer API Key 缺失、格式错误、已撤销或不存在。 |
+| `401` | `unauthorized` | 未提供可用 session，且请求没有携带 `Authorization`。 |
+| `401` | `invalid_api_key` | Bearer API Key 格式错误、已撤销或不存在。 |
 | `403` | `account_disabled` | API Key 所属用户已禁用。 |
 | `403` | `pat_required` | reaction toggle 需要 GitHub PAT。 |
 | `404` | `not_found` | 资源不存在或不属于当前用户范围。 |
