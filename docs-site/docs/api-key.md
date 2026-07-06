@@ -20,7 +20,7 @@ curl "$OCTORILL_ORIGIN/api/feed?scope=mine&limit=20" \
   -H "Authorization: Bearer orill_ak_xxx"
 ```
 
-浏览器端外部程序可以带 `Authorization` header 发起 CORS 请求；后端允许常见 HTTP method 与 `Content-Type`、`Authorization` header。
+浏览器端程序只有在页面 origin 等于 OctoRill 配置的 `public_base_url` origin 时，才能通过 CORS 携带 `Authorization` header 访问；后端允许常见 HTTP method 与 `Content-Type`、`Authorization` header，但不会放开任意第三方 origin。其它外部程序应从服务端、CLI 或同源前端调用。
 
 API Key 被撤销后会立即失效。用户账号被禁用后，即使 API Key 仍存在，也会返回 `403 account_disabled`。
 
