@@ -164,6 +164,12 @@ PR: include
 
 ![API Key settings revoke confirmation](./visual-evidence/api-keys-settings-revoke-confirm.png)
 
+API Key 外部 API 文档页提供 Bearer 用法、可访问接口目录、scoped focus feed 映射、字段级响应与错误码说明。
+
+PR: include
+
+![API Key external API docs](./visual-evidence/docs-api-key-external-api-docs.png)
+
 ## Related PRs
 
 - None

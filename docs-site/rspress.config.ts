@@ -38,6 +38,7 @@ export default defineConfig({
 			{ text: "快速开始", link: "/quick-start" },
 			{ text: "配置", link: "/config" },
 			{ text: "公开 Release", link: "/public-releases" },
+			{ text: "API Key", link: "/api-key" },
 			{ text: "产品", link: "/product" },
 			{ text: "Storybook", link: "/storybook.html" },
 			{ text: "GitHub", link: "https://github.com/IvanLi-CN/octo-rill" },
@@ -51,6 +52,7 @@ export default defineConfig({
 						{ text: "快速开始", link: "/quick-start" },
 						{ text: "配置参考", link: "/config" },
 						{ text: "公开 Release 接入", link: "/public-releases" },
+						{ text: "API Key 与外部 API", link: "/api-key" },
 					],
 				},
 				{
