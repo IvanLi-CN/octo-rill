@@ -750,20 +750,35 @@ pub(crate) fn translation_error_is_retryable(error_text: Option<&str>) -> bool {
         return false;
     };
     let normalized = raw.trim().to_ascii_lowercase();
-    normalized.contains("runtime_lease_expired")
-        || normalized.contains("repo scope required; re-login via github oauth")
-        || normalized.contains("database is locked")
-        || normalized.contains("busy")
-        || normalized.contains("ai returned 429")
-        || normalized.contains("too many requests")
-        || normalized.contains("rate limit")
-        || normalized.contains("rpm exhausted")
-        || normalized.contains("token plan limit exhausted")
-        || normalized.contains("timed out")
-        || normalized.contains("timeout")
-        || normalized.contains("temporarily unavailable")
-        || normalized.contains("connection reset")
-        || normalized.contains("connection refused")
+    const RETRYABLE_ERROR_FRAGMENTS: &[&str] = &[
+        "runtime_lease_expired",
+        "repo scope required; re-login via github oauth",
+        "database is locked",
+        "busy",
+        "ai returned 429",
+        "too many requests",
+        "rate limit",
+        "rpm exhausted",
+        "token plan limit exhausted",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "connection refused",
+        "error decoding response body",
+        "error sending request for url",
+        "ai response missing content",
+        "transport request failed",
+        "connection closed abruptly",
+        "could not resolve host",
+        "tls connect error",
+        "connect tunnel failed, response 503",
+        "chat upstream returned 500",
+    ];
+
+    RETRYABLE_ERROR_FRAGMENTS
+        .iter()
+        .any(|fragment| normalized.contains(fragment))
 }
 
 pub(crate) fn translation_error_is_upstream_chat_403(error_text: Option<&str>) -> bool {
@@ -7190,6 +7205,23 @@ mod tests {
         assert!(translation_error_is_retryable(Some(
             "repo scope required; re-login via GitHub OAuth",
         )));
+        for retryable in [
+            "error decoding response body",
+            "AI request failed: error sending request for url (http://axonhub/v1/chat/completions)",
+            "GitHub request failed: error sending request for url (https://api.github.com/repos/owner/repo/compare/v1...v2)",
+            "AI response missing content",
+            "Transport request failed",
+            "Connection closed abruptly",
+            "Could not resolve host",
+            "TLS connect error",
+            "CONNECT tunnel failed, response 503",
+            "Chat upstream returned 500",
+        ] {
+            assert!(
+                translation_error_is_retryable(Some(retryable)),
+                "expected retryable: {retryable}",
+            );
+        }
         assert!(!translation_error_is_retryable(Some(
             "AI returned 403 Forbidden: Chat upstream returned 403",
         )));
@@ -7199,18 +7231,24 @@ mod tests {
         assert!(release_translation_error_is_retryable(Some(
             "AI returned 403 Forbidden: Chat upstream returned 403",
         )));
-        assert!(!translation_error_is_retryable(Some(
+        for non_retryable in [
             "private repository compare requires repo scope; re-login via GitHub OAuth",
-        )));
-        assert!(!translation_error_is_retryable(Some(
             "invalid_model_error: model not found",
-        )));
-        assert!(!translation_error_is_retryable(Some(
+            "AI returned 422 Unprocessable Entity: model not found",
             "AI returned 401 Unauthorized",
-        )));
-        assert!(!translation_error_is_retryable(Some(
+            "401 Invalid API key",
             "AI returned 403 Forbidden: insufficient_quota",
-        )));
+            "AI returned 404 Not Found",
+            "GitHub compare returned 404 Not Found",
+            "GitHub compare returned 301 Moved Permanently",
+            "release detail translation failed to preserve markdown structure",
+            "release body too large for translation",
+        ] {
+            assert!(
+                !translation_error_is_retryable(Some(non_retryable)),
+                "expected non-retryable: {non_retryable}",
+            );
+        }
     }
 
     #[tokio::test]

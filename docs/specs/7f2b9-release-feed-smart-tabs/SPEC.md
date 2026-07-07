@@ -133,7 +133,7 @@
 - 润色 / 翻译 lane 缺数据但仍会自动生成时，正文区继续显示原文；正在加载的 lane 只在 selector option 上显示呼吸态。
 - sync 新写入的 release：后台同时预热 `翻译` 与 `润色` 两条 lane；smart 预热除了本次新增 release，还要补覆盖当前 feed 最近一屏的未完成 smart 卡片，避免老数据长期停留在 missing。
 - subscription sync 的 smart 预热必须使用“本次新增 + 最近窗口”的并集；即使某个用户本轮没有新增命中的 release，也不能跳过其 recent smart preheat。
-- 若 smart cache 命中的是可重试的瞬时错误（如 `runtime_lease_expired`、`database is locked`、历史旧 token 触发的 `repo scope required; re-login via GitHub OAuth`、上游聊天通道返回的 `AI returned 403 Forbidden: Chat upstream returned 403`），前端首屏预加载与后台预热都必须把它重新视作待生成，而不是把旧错误卡片直接钉死在界面上。
+- 若 smart cache 命中的是可重试的瞬时错误（如 `runtime_lease_expired`、`database is locked`、历史旧 token 触发的 `repo scope required; re-login via GitHub OAuth`、上游聊天通道返回的 `AI returned 403 Forbidden: Chat upstream returned 403`、`error decoding response body`、AI/GitHub `error sending request for url`、`AI response missing content`、DNS/TLS/proxy/connection closed 这类传输失败或 `Chat upstream returned 500`），前端首屏预加载与后台预热都必须把它重新视作待生成，而不是把旧错误卡片直接钉死在界面上。
 - Dashboard feed 对 `smart` lane 的 retryable `error` 采用“当前页面会话内一次性自动补救”语义：首屏加载、分页追加、feed 替换和 live update 合并后都会重扫当前已加载 release items，并按 `lane:item-key` 去重，只自动补救一次。
 - `smart` lane 进入本页自动补救后，正文区改为居中的中性等待面与轻量 loading，文案统一为“刚发现这条结果还没准备好，正在自动重试，请稍候”；本次自动补救若仍返回 `error`，则立刻恢复现有 `润色失败` 错误块与 `重试润色` 按钮。
 - 上游聊天通道 403 只在 release 翻译 / 润色链路中视为可恢复终态：feed/detail read model 可重新暴露为 `missing + auto_translate`，`retry.recent_failures` 可定时重排队；底层 AI 客户端单次调用仍快速失败，不扩大 403 的同请求重试预算。
@@ -169,6 +169,10 @@
 - Given 当前页面已加载的 release smart lane 命中了 retryable `error`
   When Dashboard feed 完成首屏或分页合并后的自动补救扫描
   Then 本页会自动补救该 lane 一次，并在补救期间显示中性等待面，而不是继续展示 `润色失败` 终态。
+
+- Given 当前页面已加载的 release smart lane 命中了 `error decoding response body` 这类传输/响应解码瞬时错误
+  When Dashboard feed 完成自动补救扫描
+  Then 前端按 retryable 错误处理并调用 `/api/translate/results` 补救一次，而不是要求用户手动点击 `重试润色`。
 
 - Given 翻译或润色 lane 之前落过上游聊天通道 403
   When 用户重新打开 feed/detail 或 `retry.recent_failures` 定时任务运行

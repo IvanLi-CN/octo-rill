@@ -6,6 +6,7 @@ import {
 	type TranslationResultItem,
 	isPendingTranslationResultStatus,
 } from "@/api";
+import { translationErrorIsRetryable } from "@/feed/retryableErrors";
 import {
 	isReleaseFeedItem,
 	type FeedItem,
@@ -22,25 +23,6 @@ const REQUEST_STATUS_POLL_WINDOW_MS = 20_000;
 const REQUEST_RESUME_WINDOW_MAX_RETRIES = 15;
 const REQUEST_PENDING_MAX_AGE_MS =
 	REQUEST_STATUS_POLL_WINDOW_MS * REQUEST_RESUME_WINDOW_MAX_RETRIES;
-
-function translationErrorIsRetryable(error?: string | null) {
-	if (!error) return false;
-	const normalized = error.trim().toLowerCase();
-	return (
-		normalized.includes("runtime_lease_expired") ||
-		normalized.includes("repo scope required; re-login via github oauth") ||
-		normalized.includes("database is locked") ||
-		normalized.includes("busy") ||
-		normalized.includes("timeout") ||
-		normalized.includes("timed out") ||
-		normalized.includes("temporarily unavailable") ||
-		normalized.includes("connection reset") ||
-		normalized.includes("connection refused") ||
-		normalized.includes("chat upstream returned 403") ||
-		(normalized.includes("403 forbidden") &&
-			(normalized.includes("chat") || normalized.includes("upstream")))
-	);
-}
 
 function feedTranslationIsRetryable(item: FeedItem) {
 	return translationErrorIsRetryable(
