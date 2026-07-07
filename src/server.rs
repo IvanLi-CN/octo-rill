@@ -186,6 +186,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(api_version).layer(middleware::from_fn(version_no_store_cache)),
         )
         .route("/me", get(api::me))
+        .route("/me/personal-repos", get(api::list_personal_repos))
         .route(
             "/me/profile",
             get(api::me_get_profile).patch(api::me_patch_profile),

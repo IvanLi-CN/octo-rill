@@ -10525,6 +10525,39 @@ pub struct FeedResponse {
     next_cursor: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct PersonalRepoListResponse {
+    owner_login: String,
+    total_count: usize,
+    repos: Vec<PersonalRepoItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PersonalRepoItem {
+    repo_id: i64,
+    full_name: String,
+    owner_login: String,
+    name: String,
+    html_url: String,
+    updated_at: String,
+    release_count: i64,
+    repo_visual: Option<RepoVisual>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct PersonalRepoRow {
+    repo_id: i64,
+    full_name: String,
+    owner_login: String,
+    name: String,
+    html_url: String,
+    updated_at: String,
+    release_count: i64,
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: i64,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct FeedReactionRefreshRequest {
     release_ids: Vec<String>,
@@ -10850,6 +10883,76 @@ fn repo_visual_from_parts(
     })
 }
 
+async fn load_personal_repo_rows(
+    state: &AppState,
+    user_id: &str,
+    owner_login: &str,
+) -> Result<Vec<PersonalRepoRow>, ApiError> {
+    sqlx::query_as::<_, PersonalRepoRow>(
+        r#"
+        SELECT
+          ob.repo_id AS repo_id,
+          ob.repo_full_name AS full_name,
+          substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1) AS owner_login,
+          substr(ob.repo_full_name, instr(ob.repo_full_name, '/') + 1) AS name,
+          'https://github.com/' || ob.repo_full_name AS html_url,
+          ob.updated_at AS updated_at,
+          COALESCE((
+            SELECT COUNT(*)
+            FROM repo_releases r
+            WHERE r.repo_id = ob.repo_id
+              AND COALESCE(r.is_draft, 0) = 0
+          ), 0) AS release_count,
+          ob.owner_avatar_url AS owner_avatar_url,
+          ob.open_graph_image_url AS open_graph_image_url,
+          ob.uses_custom_open_graph_image AS uses_custom_open_graph_image
+        FROM owned_repo_star_baselines ob
+        WHERE ob.user_id = ?
+          AND instr(ob.repo_full_name, '/') > 1
+          AND lower(substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1)) = lower(?)
+        ORDER BY lower(ob.repo_full_name) ASC
+        "#,
+    )
+    .bind(user_id)
+    .bind(owner_login)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+pub async fn list_personal_repos(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    headers: HeaderMap,
+) -> Result<Json<PersonalRepoListResponse>, ApiError> {
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
+    let viewer = load_viewer_user(state.as_ref(), &user_id).await?;
+    let rows = load_personal_repo_rows(state.as_ref(), &user_id, viewer.login.as_str()).await?;
+    let repos = rows
+        .into_iter()
+        .map(|row| PersonalRepoItem {
+            repo_id: row.repo_id,
+            full_name: row.full_name,
+            owner_login: row.owner_login,
+            name: row.name,
+            html_url: row.html_url,
+            updated_at: row.updated_at,
+            release_count: row.release_count,
+            repo_visual: repo_visual_from_parts(
+                row.owner_avatar_url,
+                row.open_graph_image_url,
+                row.uses_custom_open_graph_image != 0,
+            ),
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(PersonalRepoListResponse {
+        owner_login: viewer.login,
+        total_count: repos.len(),
+        repos,
+    }))
+}
+
 pub(crate) fn release_detail_source_hash(
     repo_full_name: &str,
     original_title: &str,
@@ -11122,9 +11225,17 @@ async fn fetch_feed_items(
 ) -> Result<Vec<FeedRow>, ApiError> {
     let sql = r#"
         WITH scoped_visible_repos AS (
-          SELECT *
+          SELECT
+            vr.repo_id,
+            vr.full_name,
+            vr.owner_login,
+            vr.name,
+            vr.owner_avatar_url,
+            vr.open_graph_image_url,
+            vr.uses_custom_open_graph_image
           FROM user_release_visible_repos vr
           WHERE vr.user_id = ?
+            AND ? != 'mine'
             AND (
               ? = ''
               OR (? = 'repo' AND lower(vr.full_name) = lower(?))
@@ -11139,6 +11250,20 @@ async fn fetch_feed_items(
               OR (? = 'org' AND lower(vr.owner_login) = lower(?))
               OR (? = 'mine' AND lower(vr.owner_login) = lower(?))
             )
+          UNION
+          SELECT
+            ob.repo_id AS repo_id,
+            ob.repo_full_name AS full_name,
+            substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1) AS owner_login,
+            substr(ob.repo_full_name, instr(ob.repo_full_name, '/') + 1) AS name,
+            ob.owner_avatar_url AS owner_avatar_url,
+            ob.open_graph_image_url AS open_graph_image_url,
+            ob.uses_custom_open_graph_image AS uses_custom_open_graph_image
+          FROM owned_repo_star_baselines ob
+          WHERE ob.user_id = ?
+            AND ? = 'mine'
+            AND instr(ob.repo_full_name, '/') > 1
+            AND lower(substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1)) = lower(?)
         ),
         items AS (
           SELECT
@@ -11357,11 +11482,15 @@ async fn fetch_feed_items(
         .bind(user_id)
         .bind(scope_kind)
         .bind(scope_kind)
+        .bind(scope_kind)
         .bind(scope_repo_item.as_deref())
         .bind(scope_kind)
         .bind(scope_repo_items_json.as_deref())
         .bind(scope_kind)
         .bind(scope_org.as_deref())
+        .bind(scope_kind)
+        .bind(scope_mine_owner.as_deref())
+        .bind(user_id)
         .bind(scope_kind)
         .bind(scope_mine_owner.as_deref())
         .bind(user_id)
@@ -13568,7 +13697,10 @@ struct ReleaseBatchTerminalState {
     error: Option<String>,
 }
 
-const RELEASE_BATCH_MAX_TOKENS: u32 = 1_400;
+type ReleaseBatchTranslationMap = HashMap<i64, (Option<String>, Option<String>)>;
+
+const RELEASE_BATCH_MIN_OUTPUT_TOKENS: u32 = 1_400;
+const RELEASE_BATCH_MAX_OUTPUT_TOKENS: u32 = 16_000;
 const RELEASE_BATCH_OVERHEAD_TOKENS: u32 = 260;
 const NOTIFICATION_BATCH_MAX_TOKENS: u32 = 1_100;
 const NOTIFICATION_BATCH_OVERHEAD_TOKENS: u32 = 220;
@@ -13694,22 +13826,127 @@ body_markdown:
     prompt
 }
 
-fn estimate_release_batch_candidate_tokens(item: &ReleaseBatchCandidate) -> u32 {
+fn estimate_release_batch_candidate_input_tokens(item: &ReleaseBatchCandidate) -> u32 {
     ai::estimate_text_tokens(item.full_name.as_str())
         .saturating_add(ai::estimate_text_tokens(item.title.as_str()))
         .saturating_add(ai::estimate_text_tokens(item.body.as_str()))
         .saturating_add(48)
 }
 
+fn estimate_release_batch_candidate_output_tokens(item: &ReleaseBatchCandidate) -> u32 {
+    ai::estimate_text_tokens(item.title.as_str())
+        .saturating_add(ai::estimate_text_tokens(item.body.as_str()))
+        .saturating_add(64)
+}
+
 fn release_candidate_can_batch(
     item: &ReleaseBatchCandidate,
     chunk_char_budget: usize,
     batch_input_budget: u32,
+    batch_output_budget: u32,
 ) -> bool {
     split_markdown_chunks(item.body.as_str(), chunk_char_budget).len() <= 1
-        && estimate_release_batch_candidate_tokens(item)
+        && estimate_release_batch_candidate_input_tokens(item)
             .saturating_add(RELEASE_BATCH_OVERHEAD_TOKENS)
             <= batch_input_budget
+        && estimate_release_batch_candidate_output_tokens(item)
+            .saturating_add(RELEASE_BATCH_OVERHEAD_TOKENS)
+            <= batch_output_budget
+}
+
+fn pack_release_batch_indices(
+    input_estimates: &[u32],
+    output_estimates: &[u32],
+    input_budget: u32,
+    output_budget: u32,
+    fixed_overhead: u32,
+) -> Vec<Vec<usize>> {
+    if input_estimates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut current = Vec::new();
+    let mut current_input = fixed_overhead;
+    let mut current_output = fixed_overhead;
+    let hard_input_budget = input_budget.max(fixed_overhead + 1);
+    let hard_output_budget = output_budget.max(fixed_overhead + 1);
+
+    for (idx, input_tokens) in input_estimates.iter().copied().enumerate() {
+        let output_tokens = output_estimates.get(idx).copied().unwrap_or(1);
+        if current.is_empty() {
+            current.push(idx);
+            current_input = fixed_overhead.saturating_add(input_tokens);
+            current_output = fixed_overhead.saturating_add(output_tokens);
+            continue;
+        }
+
+        let next_input = current_input.saturating_add(input_tokens);
+        let next_output = current_output.saturating_add(output_tokens);
+        if next_input > hard_input_budget || next_output > hard_output_budget {
+            out.push(current);
+            current = vec![idx];
+            current_input = fixed_overhead.saturating_add(input_tokens);
+            current_output = fixed_overhead.saturating_add(output_tokens);
+            continue;
+        }
+
+        current.push(idx);
+        current_input = next_input;
+        current_output = next_output;
+    }
+
+    if !current.is_empty() {
+        out.push(current);
+    }
+
+    out
+}
+
+fn release_batch_output_budget_for_group(output_estimates: &[u32], group: &[usize]) -> u32 {
+    let estimated_output = group
+        .iter()
+        .filter_map(|idx| output_estimates.get(*idx))
+        .copied()
+        .fold(RELEASE_BATCH_OVERHEAD_TOKENS, u32::saturating_add);
+    estimated_output.clamp(
+        RELEASE_BATCH_MIN_OUTPUT_TOKENS,
+        RELEASE_BATCH_MAX_OUTPUT_TOKENS,
+    )
+}
+
+fn collect_release_batch_translation_results(
+    batch: &[ReleaseBatchCandidate],
+    raw: &str,
+) -> Option<ReleaseBatchTranslationMap> {
+    let payload = parse_batch_release_translation_payload(raw)?;
+    let mut translated = ReleaseBatchTranslationMap::new();
+    for item in payload.items {
+        let Some(candidate) = batch
+            .iter()
+            .find(|candidate| candidate.release_id == item.release_id)
+        else {
+            continue;
+        };
+        let (title, summary) = normalize_translation_fields(item.title_zh, item.summary_md);
+        let summary = summary
+            .map(|value| normalize_markdown_translation_output(candidate.body.as_str(), value));
+        let markdown_ok = candidate.body.trim().is_empty()
+            || summary
+                .as_deref()
+                .is_some_and(|value| markdown_structure_preserved(candidate.body.as_str(), value));
+        if (title.is_some() || summary.is_some())
+            && release_detail_translation_ready(Some(candidate.body.as_str()), summary.as_deref())
+            && markdown_ok
+        {
+            translated.insert(candidate.release_id, (title, summary));
+        }
+    }
+
+    batch
+        .iter()
+        .all(|candidate| translated.contains_key(&candidate.release_id))
+        .then_some(translated)
 }
 
 async fn translate_pending_release_batch_candidates(
@@ -13721,39 +13958,53 @@ async fn translate_pending_release_batch_candidates(
         return Ok(Vec::new());
     }
 
-    let batch_budget = ai::compute_input_budget_with_source(state, RELEASE_BATCH_MAX_TOKENS).await;
+    let batch_budget =
+        ai::compute_input_budget_with_source(state, RELEASE_BATCH_MAX_OUTPUT_TOKENS).await;
     let chunk_budget = release_detail_chunk_budget(state).await;
     let mut batchable = Vec::new();
     let mut fallback = HashMap::<i64, ReleaseBatchCandidate>::new();
     for candidate in pending {
-        if release_candidate_can_batch(candidate, chunk_budget.max_chars, batch_budget.input_budget)
-        {
+        if release_candidate_can_batch(
+            candidate,
+            chunk_budget.max_chars,
+            batch_budget.input_budget,
+            RELEASE_BATCH_MAX_OUTPUT_TOKENS,
+        ) {
             batchable.push(candidate.clone());
         } else {
             fallback.insert(candidate.release_id, candidate.clone());
         }
     }
 
-    let estimated = batchable
+    let input_estimated = batchable
         .iter()
-        .map(estimate_release_batch_candidate_tokens)
+        .map(estimate_release_batch_candidate_input_tokens)
         .collect::<Vec<_>>();
-    let groups = ai::pack_batch_indices(
-        &estimated,
+    let output_estimated = batchable
+        .iter()
+        .map(estimate_release_batch_candidate_output_tokens)
+        .collect::<Vec<_>>();
+    let groups = pack_release_batch_indices(
+        &input_estimated,
+        &output_estimated,
         batch_budget.input_budget,
+        RELEASE_BATCH_MAX_OUTPUT_TOKENS,
         RELEASE_BATCH_OVERHEAD_TOKENS,
     );
     if !batchable.is_empty() {
         let split_count = groups.len().saturating_sub(1);
         let saved_calls = batchable.len().saturating_sub(groups.len());
-        let estimated_tokens = estimated.iter().copied().sum::<u32>();
+        let estimated_input_tokens = input_estimated.iter().copied().sum::<u32>();
+        let estimated_output_tokens = output_estimated.iter().copied().sum::<u32>();
         tracing::info!(
             batch_size = batchable.len(),
-            estimated_tokens,
+            estimated_input_tokens,
+            estimated_output_tokens,
             split_count,
             saved_calls,
             fallback_source = batch_budget.fallback_source,
             input_budget = batch_budget.input_budget,
+            output_budget = RELEASE_BATCH_MAX_OUTPUT_TOKENS,
             model_input_limit = batch_budget.model_input_limit,
             "release detail batch plan"
         );
@@ -13762,7 +14013,8 @@ async fn translate_pending_release_batch_candidates(
     let mut translated = HashMap::<i64, (Option<String>, Option<String>)>::new();
     let mut non_retryable_error_text: Option<String> = None;
     let mut abort_remaining_batches = false;
-    for batch_indices in groups {
+    let mut pending_groups = groups;
+    while let Some(batch_indices) = pending_groups.pop() {
         if abort_remaining_batches {
             break;
         }
@@ -13770,44 +14022,32 @@ async fn translate_pending_release_batch_candidates(
             .iter()
             .map(|idx| batchable[*idx].clone())
             .collect::<Vec<_>>();
+        let max_tokens = release_batch_output_budget_for_group(&output_estimated, &batch_indices);
         let prompt = build_release_batch_prompt(&batch);
         let raw = ai::chat_completion(
             state,
             "你是一个批量翻译助手，负责把 GitHub Release 标题与 Markdown 正文翻译成自然中文。",
             &prompt,
-            RELEASE_BATCH_MAX_TOKENS,
+            max_tokens,
         )
         .await;
 
         match raw {
             Ok(raw) => {
-                if let Some(payload) = parse_batch_release_translation_payload(&raw) {
-                    for item in payload.items {
-                        let Some(candidate) = batch
-                            .iter()
-                            .find(|candidate| candidate.release_id == item.release_id)
-                        else {
-                            continue;
-                        };
-                        let (title, summary) =
-                            normalize_translation_fields(item.title_zh, item.summary_md);
-                        let summary = summary.map(|value| {
-                            normalize_markdown_translation_output(candidate.body.as_str(), value)
-                        });
-                        let markdown_ok = candidate.body.trim().is_empty()
-                            || summary.as_deref().is_some_and(|value| {
-                                markdown_structure_preserved(candidate.body.as_str(), value)
-                            });
-                        if (title.is_some() || summary.is_some())
-                            && release_detail_translation_ready(
-                                Some(candidate.body.as_str()),
-                                summary.as_deref(),
-                            )
-                            && markdown_ok
-                        {
-                            translated.insert(candidate.release_id, (title, summary));
-                        }
-                    }
+                if let Some(batch_translated) =
+                    collect_release_batch_translation_results(&batch, &raw)
+                {
+                    translated.extend(batch_translated);
+                    continue;
+                } else if batch_indices.len() > 1 {
+                    let mid = batch_indices.len() / 2;
+                    pending_groups.push(batch_indices[mid..].to_vec());
+                    pending_groups.push(batch_indices[..mid].to_vec());
+                    tracing::warn!(
+                        batch_size = batch_indices.len(),
+                        "release detail batch translation response parse failed or missed items; retrying split batch"
+                    );
+                    continue;
                 } else {
                     tracing::warn!(
                         "release detail batch translation response parse failed; fallback to single"
@@ -13822,6 +14062,16 @@ async fn translate_pending_release_batch_candidates(
                         ?err,
                         "release detail batch translation upstream error is non-retryable; skipping remaining batch calls"
                     );
+                } else if batch_indices.len() > 1 {
+                    let mid = batch_indices.len() / 2;
+                    pending_groups.push(batch_indices[mid..].to_vec());
+                    pending_groups.push(batch_indices[..mid].to_vec());
+                    tracing::warn!(
+                        ?err,
+                        batch_size = batch_indices.len(),
+                        "release detail batch translation failed; retrying split batch"
+                    );
+                    continue;
                 } else {
                     tracing::warn!(
                         ?err,
@@ -16937,12 +17187,12 @@ mod tests {
         get_repo_public_release_status, github_access_restricted_error,
         github_graphql_errors_to_api_error, github_graphql_http_error, github_rate_limited_error,
         github_reauth_required_error, guard_admin_user_update, has_repo_scope,
-        last_active_is_stale, list_briefs, list_feed, list_releases, llm_call_order_by_clause,
-        load_admin_dashboard_today_live_snapshot, load_pending_access_sync_reason,
-        looks_like_json_blob, map_job_action_error, map_public_compare_fallback_error,
-        mark_translation_requested, markdown_structure_preserved, me, me_create_api_key,
-        me_delete_api_key, me_delete_passkey, me_get_api_keys,
-        normalize_markdown_translation_output, normalize_translation_fields,
+        last_active_is_stale, list_briefs, list_feed, list_personal_repos, list_releases,
+        llm_call_order_by_clause, load_admin_dashboard_today_live_snapshot,
+        load_pending_access_sync_reason, load_viewer_user, looks_like_json_blob,
+        map_job_action_error, map_public_compare_fallback_error, mark_translation_requested,
+        markdown_structure_preserved, me, me_create_api_key, me_delete_api_key, me_delete_passkey,
+        me_get_api_keys, normalize_markdown_translation_output, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_feed_types, parse_llm_models, parse_positive_admin_concurrency,
@@ -23754,6 +24004,161 @@ line two",
     }
 
     #[tokio::test]
+    async fn list_personal_repos_returns_all_current_viewer_owner_repos() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+        let viewer = load_viewer_user(state.as_ref(), user_id.as_str())
+            .await
+            .expect("load viewer");
+        let release_repo = format!("{}/release-repo", viewer.login);
+        let empty_repo = format!("{}/empty-repo", viewer.login);
+        let other_owner_repo = format!("{}-other/legacy-repo", viewer.login);
+
+        seed_repo_release(&pool, 501, 9001).await;
+        seed_owned_repo_baseline(&pool, 501, release_repo.as_str()).await;
+        seed_owned_repo_baseline(&pool, 502, empty_repo.as_str()).await;
+        seed_owned_repo_baseline(&pool, 503, other_owner_repo.as_str()).await;
+
+        let Json(resp) =
+            list_personal_repos(State(state), setup_session(1).await, HeaderMap::new())
+                .await
+                .expect("list personal repos");
+
+        assert_eq!(resp.owner_login, viewer.login);
+        assert_eq!(resp.total_count, 2);
+        let names = resp
+            .repos
+            .iter()
+            .map(|repo| repo.full_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![empty_repo.as_str(), release_repo.as_str()]);
+        assert!(
+            resp.repos
+                .iter()
+                .all(|repo| repo.owner_login == viewer.login)
+        );
+        assert_eq!(
+            resp.repos
+                .iter()
+                .find(|repo| repo.full_name == empty_repo)
+                .expect("empty repo included")
+                .release_count,
+            0
+        );
+        assert_eq!(
+            resp.repos
+                .iter()
+                .find(|repo| repo.full_name == release_repo)
+                .expect("release repo included")
+                .release_count,
+            1
+        );
+        assert!(
+            !resp
+                .repos
+                .iter()
+                .any(|repo| repo.full_name == other_owner_repo)
+        );
+    }
+
+    #[tokio::test]
+    async fn list_feed_mine_uses_current_viewer_owner_repo_baseline() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+        let viewer = load_viewer_user(state.as_ref(), user_id.as_str())
+            .await
+            .expect("load viewer");
+        let viewer_repo = format!("{}/release-repo", viewer.login);
+        let empty_repo = format!("{}/empty-repo", viewer.login);
+        let other_owner_repo = format!("{}-other/legacy-repo", viewer.login);
+
+        seed_repo_release(&pool, 511, 9101).await;
+        seed_repo_release(&pool, 513, 9103).await;
+        seed_owned_repo_baseline(&pool, 511, viewer_repo.as_str()).await;
+        seed_owned_repo_baseline(&pool, 512, empty_repo.as_str()).await;
+        seed_owned_repo_baseline(&pool, 513, other_owner_repo.as_str()).await;
+        seed_social_event(
+            &pool,
+            user_id.as_str(),
+            SeedSocialEventArgs {
+                kind: "repo_star_received",
+                event_id: "viewer-owner-star",
+                repo_id: Some(511),
+                repo_full_name: Some(viewer_repo.as_str()),
+                repo_owner_avatar_url: None,
+                repo_open_graph_image_url: None,
+                repo_uses_custom_open_graph_image: None,
+                title: None,
+                body: None,
+                html_url: None,
+                actor_login: "octocat",
+                occurred_at: "2026-02-24T08:00:00Z",
+            },
+        )
+        .await;
+        seed_social_event(
+            &pool,
+            user_id.as_str(),
+            SeedSocialEventArgs {
+                kind: "repo_star_received",
+                event_id: "other-owner-star",
+                repo_id: Some(513),
+                repo_full_name: Some(other_owner_repo.as_str()),
+                repo_owner_avatar_url: None,
+                repo_open_graph_image_url: None,
+                repo_uses_custom_open_graph_image: None,
+                title: None,
+                body: None,
+                html_url: None,
+                actor_login: "octocat",
+                occurred_at: "2026-02-24T09:00:00Z",
+            },
+        )
+        .await;
+
+        let Json(feed) = list_feed(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(30),
+                types: None,
+                scope: Some("mine".to_owned()),
+                items: None,
+                org: None,
+            }),
+        )
+        .await
+        .expect("list mine feed");
+
+        assert_eq!(
+            feed.items
+                .iter()
+                .map(|item| (item.kind.as_str(), item.repo_full_name.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("repo_star_received", Some(viewer_repo.as_str())),
+                ("release", Some(viewer_repo.as_str())),
+            ]
+        );
+        assert!(
+            !feed
+                .items
+                .iter()
+                .any(|item| item.repo_full_name.as_deref() == Some(empty_repo.as_str()))
+        );
+        assert!(
+            !feed
+                .items
+                .iter()
+                .any(|item| item.repo_full_name.as_deref() == Some(other_owner_repo.as_str()))
+        );
+    }
+
+    #[tokio::test]
     async fn list_feed_returns_mixed_items_and_supports_social_filters() {
         let pool = setup_pool().await;
         let user_id = test_user_id(1);
@@ -26243,6 +26648,230 @@ line two",
             .expect("user prompt should be present");
         assert!(prompt.contains("release_id: 120"));
         assert!(prompt.contains("release_id: 121"));
+    }
+
+    #[tokio::test]
+    async fn translate_releases_batch_for_user_splits_truncated_batch_before_single_fallback() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        for release_id in 120..126 {
+            seed_repo_release(&pool, 42, release_id).await;
+        }
+        seed_star(&pool, 42).await;
+        for release_id in 120..126 {
+            sqlx::query(
+                r#"
+                UPDATE repo_releases
+                SET body = ?, name = ?, tag_name = ?
+                WHERE release_id = ?
+                "#,
+            )
+            .bind(format!("- item {release_id}"))
+            .bind(format!("Release v{release_id}"))
+            .bind(format!("v{release_id}"))
+            .bind(i64::from(release_id))
+            .execute(&pool)
+            .await
+            .expect("update release body");
+        }
+
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let title_calls = Arc::new(AtomicUsize::new(0));
+        let chunk_calls = Arc::new(AtomicUsize::new(0));
+        let seen_batch_sizes = Arc::new(tokio::sync::Mutex::new(Vec::<usize>::new()));
+        let route_batch_calls = Arc::clone(&batch_calls);
+        let route_title_calls = Arc::clone(&title_calls);
+        let route_chunk_calls = Arc::clone(&chunk_calls);
+        let route_seen_batch_sizes = Arc::clone(&seen_batch_sizes);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                let route_batch_calls = Arc::clone(&route_batch_calls);
+                let route_title_calls = Arc::clone(&route_title_calls);
+                let route_chunk_calls = Arc::clone(&route_chunk_calls);
+                let route_seen_batch_sizes = Arc::clone(&route_seen_batch_sizes);
+                async move {
+                    let system_prompt = payload["messages"][0]["content"]
+                        .as_str()
+                        .unwrap_or_default();
+                    let user_prompt = payload["messages"][1]["content"]
+                        .as_str()
+                        .unwrap_or_default();
+                    let content = if system_prompt.contains("批量翻译助手") {
+                        route_batch_calls.fetch_add(1, Ordering::SeqCst);
+                        let release_ids = (120..126)
+                            .filter(|release_id| {
+                                user_prompt.contains(&format!("release_id: {release_id}"))
+                            })
+                            .collect::<Vec<_>>();
+                        route_seen_batch_sizes.lock().await.push(release_ids.len());
+                        if release_ids.len() > 3 {
+                            r#"{"items":[{"release_id":120,"title_zh":"截断标题","summary_md":"#
+                                .to_owned()
+                        } else {
+                            serde_json::json!({
+                                "items": release_ids
+                                    .iter()
+                                    .map(|release_id| {
+                                        serde_json::json!({
+                                            "release_id": release_id,
+                                            "title_zh": format!("版本 {release_id}"),
+                                            "summary_md": format!("- 条目 {release_id}")
+                                        })
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .to_string()
+                        }
+                    } else if system_prompt.contains("只把 GitHub Release 标题翻译成自然中文")
+                    {
+                        route_title_calls.fetch_add(1, Ordering::SeqCst);
+                        "unexpected title fallback".to_owned()
+                    } else {
+                        route_chunk_calls.fetch_add(1, Ordering::SeqCst);
+                        "unexpected chunk fallback".to_owned()
+                    };
+                    let response = serde_json::json!({
+                        "choices": [{"message": {"content": content}}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
+                    });
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        Json(response),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_state_with_ai_base_url(pool.clone(), base_url);
+
+        let release_ids = (120..126).map(i64::from).collect::<Vec<_>>();
+        let translated =
+            translate_releases_batch_for_user(state.as_ref(), user_id.as_str(), &release_ids)
+                .await
+                .expect("translate release batch");
+
+        assert_eq!(translated.items.len(), 6);
+        assert!(translated.items.iter().all(|item| item.status == "ready"));
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(title_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(chunk_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(seen_batch_sizes.lock().await.as_slice(), &[6, 3, 3]);
+    }
+
+    #[tokio::test]
+    async fn translate_releases_batch_for_user_groups_by_estimated_output_budget() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        for release_id in 120..126 {
+            seed_repo_release(&pool, 42, release_id).await;
+        }
+        seed_star(&pool, 42).await;
+        let large_body = "- item\n".repeat(8_000);
+        for release_id in 120..126 {
+            sqlx::query(
+                r#"
+                UPDATE repo_releases
+                SET body = ?, name = ?, tag_name = ?
+                WHERE release_id = ?
+                "#,
+            )
+            .bind(large_body.as_str())
+            .bind(format!("Release v{release_id}"))
+            .bind(format!("v{release_id}"))
+            .bind(i64::from(release_id))
+            .execute(&pool)
+            .await
+            .expect("update release body");
+        }
+
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let seen_batch_sizes = Arc::new(tokio::sync::Mutex::new(Vec::<usize>::new()));
+        let seen_max_tokens = Arc::new(tokio::sync::Mutex::new(Vec::<u32>::new()));
+        let response_body = Arc::new(large_body.clone());
+        let route_batch_calls = Arc::clone(&batch_calls);
+        let route_seen_batch_sizes = Arc::clone(&seen_batch_sizes);
+        let route_seen_max_tokens = Arc::clone(&seen_max_tokens);
+        let route_response_body = Arc::clone(&response_body);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                let route_batch_calls = Arc::clone(&route_batch_calls);
+                let route_seen_batch_sizes = Arc::clone(&route_seen_batch_sizes);
+                let route_seen_max_tokens = Arc::clone(&route_seen_max_tokens);
+                let route_response_body = Arc::clone(&route_response_body);
+                async move {
+                    let user_prompt = payload["messages"][1]["content"]
+                        .as_str()
+                        .unwrap_or_default();
+                    let release_ids = (120..126)
+                        .filter(|release_id| {
+                            user_prompt.contains(&format!("release_id: {release_id}"))
+                        })
+                        .collect::<Vec<_>>();
+                    route_batch_calls.fetch_add(1, Ordering::SeqCst);
+                    route_seen_batch_sizes.lock().await.push(release_ids.len());
+                    route_seen_max_tokens.lock().await.push(
+                        payload["max_tokens"]
+                            .as_u64()
+                            .and_then(|value| u32::try_from(value).ok())
+                            .expect("max_tokens should be set"),
+                    );
+                    let content = serde_json::json!({
+                        "items": release_ids
+                            .iter()
+                            .map(|release_id| {
+                                serde_json::json!({
+                                    "release_id": release_id,
+                                    "title_zh": format!("版本 {release_id}"),
+                                    "summary_md": route_response_body.as_str()
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .to_string();
+                    let response = serde_json::json!({
+                        "choices": [{"message": {"content": content}}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
+                    });
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        Json(response),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_state_with_ai_base_url(pool.clone(), base_url);
+
+        let release_ids = (120..126).map(i64::from).collect::<Vec<_>>();
+        let translated =
+            translate_releases_batch_for_user(state.as_ref(), user_id.as_str(), &release_ids)
+                .await
+                .expect("translate release batch");
+
+        assert_eq!(translated.items.len(), 6);
+        assert!(translated.items.iter().all(|item| item.status == "ready"));
+        assert!(batch_calls.load(Ordering::SeqCst) > 1);
+        assert!(
+            seen_batch_sizes
+                .lock()
+                .await
+                .iter()
+                .all(|batch_size| *batch_size < 6)
+        );
+        assert!(
+            seen_max_tokens
+                .lock()
+                .await
+                .iter()
+                .all(
+                    |max_tokens| *max_tokens > crate::api::RELEASE_BATCH_MIN_OUTPUT_TOKENS
+                        && *max_tokens <= crate::api::RELEASE_BATCH_MAX_OUTPUT_TOKENS
+                )
+        );
     }
 
     #[tokio::test]

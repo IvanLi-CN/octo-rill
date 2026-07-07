@@ -1,6 +1,6 @@
 import type { DashboardScope } from "@/dashboard/routeState";
 
-export const DASHBOARD_MINE_ENTRY_LABEL = "我的仓库动态";
+export const DASHBOARD_MINE_ENTRY_LABEL = "个人仓库";
 
 export function resolveDashboardScopeRepoNames(
 	scope: DashboardScope,
@@ -54,9 +54,9 @@ export function buildDashboardScopeSummary(
 		case "mine":
 			return {
 				title: DASHBOARD_MINE_ENTRY_LABEL,
-				kicker: "我的",
-				description: "查看你的仓库发布与相关动态。",
-				chip: "我的",
+				kicker: "个人",
+				description: "查看当前 GitHub 登录账号的个人仓库发布与相关动态。",
+				chip: "个人",
 				secondary: itemLabel,
 			};
 	}

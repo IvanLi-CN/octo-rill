@@ -3,6 +3,7 @@ import { ArrowDownToLine, RefreshCcw, WifiOff } from "lucide-react";
 
 import {
 	type MeResponse,
+	type PersonalReposResponse,
 	type RepoPublicReleasePublicationStatusResponse,
 	ApiError,
 	apiGet,
@@ -411,8 +412,18 @@ function ScopedSummaryCard(props: {
 	scope: DashboardScope;
 	feedItems: FeedItem[];
 	desktop?: boolean;
+	personalRepos?: PersonalReposResponse | null;
+	personalReposLoading?: boolean;
+	personalReposError?: string | null;
 }) {
-	const { scope, feedItems, desktop = false } = props;
+	const {
+		scope,
+		feedItems,
+		desktop = false,
+		personalRepos = null,
+		personalReposLoading = false,
+		personalReposError = null,
+	} = props;
 	const { pushErrorToast, pushToast } = useAppToast();
 	const [publicationStatus, setPublicationStatus] =
 		useState<RepoPublicReleasePublicationStatusResponse | null>(null);
@@ -428,12 +439,23 @@ function ScopedSummaryCard(props: {
 				.filter((value): value is string => Boolean(value)),
 		),
 	);
-	const repoNames = resolveDashboardScopeRepoNames(scope, feedRepoNames);
+	const repoNames =
+		scope.kind === "mine" && personalRepos
+			? personalRepos.repos.map((repo) => repo.full_name)
+			: resolveDashboardScopeRepoNames(scope, feedRepoNames);
+	const repoCount =
+		scope.kind === "mine" && personalRepos
+			? personalRepos.total_count
+			: repoNames.length;
 	const releaseCount = feedItems.filter(
 		(item) => item.kind === "release",
 	).length;
 	const activityCount = feedItems.length - releaseCount;
-	const summary = buildDashboardScopeSummary(scope, repoNames.length);
+	const summary = buildDashboardScopeSummary(scope, repoCount);
+	const repoChipLimit = desktop ? 8 : 6;
+	const personalRepoItems =
+		scope.kind === "mine" && personalRepos ? personalRepos.repos : [];
+	const visibleRepoNames = repoNames.slice(0, repoChipLimit);
 	const publicReleaseUrl = resolveRepoPublicReleaseUrl(
 		publicationStatus,
 		scope,
@@ -580,19 +602,99 @@ function ScopedSummaryCard(props: {
 				</div>
 			</div>
 
-			{repoNames.length > 0 ? (
+			{scope.kind === "mine" && personalReposLoading && !personalRepos ? (
+				<p className="mt-4 rounded-2xl border border-dashed border-border/65 px-3 py-2 text-sm text-muted-foreground">
+					正在加载个人仓库…
+				</p>
+			) : null}
+
+			{scope.kind === "mine" && personalReposError ? (
+				<p className="mt-4 rounded-2xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+					个人仓库清单加载失败，当前动态仍可继续浏览。
+				</p>
+			) : null}
+
+			{personalRepoItems.length > 0 ? (
+				<div className="mt-4 overflow-hidden rounded-2xl border border-border/65 bg-background/72">
+					<div className="flex items-center justify-between border-b border-border/60 px-3 py-2">
+						<p className="text-sm font-medium text-foreground">仓库列表</p>
+						<p className="font-mono text-[11px] text-muted-foreground">
+							{personalRepos?.total_count ?? personalRepoItems.length} 个
+						</p>
+					</div>
+					<ul
+						className="max-h-80 scroll-pb-3 overflow-y-auto pb-3"
+						data-dashboard-personal-repo-list="true"
+					>
+						{personalRepoItems.map((repo) => {
+							const href = buildDashboardScopeHref({
+								kind: "repo",
+								owner: repo.owner_login,
+								repo: repo.name,
+							});
+							const releaseLabel =
+								repo.release_count > 0
+									? `${repo.release_count} 个发布`
+									: "暂无发布";
+							return (
+								<li
+									key={repo.full_name}
+									className="border-b border-border/50 last:border-b-0"
+								>
+									<InternalLink
+										href={href}
+										to={href}
+										className="group flex min-w-0 items-center justify-between gap-3 px-3 py-2.5 text-left transition-colors hover:bg-muted/35 focus-visible:bg-muted/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/45"
+									>
+										<span className="min-w-0">
+											<span className="block truncate font-mono text-[12px] font-medium text-foreground">
+												{repo.full_name}
+											</span>
+											<span className="mt-0.5 block truncate text-xs text-muted-foreground">
+												更新 {formatPersonalRepoUpdatedAt(repo.updated_at)}
+											</span>
+										</span>
+										<span className="shrink-0 rounded-full border border-border/65 bg-card/70 px-2 py-0.5 text-[11px] text-muted-foreground group-hover:text-foreground">
+											{releaseLabel}
+										</span>
+									</InternalLink>
+								</li>
+							);
+						})}
+					</ul>
+				</div>
+			) : repoNames.length > 0 ? (
 				<div className="mt-4 flex flex-wrap gap-2">
-					{repoNames.slice(0, desktop ? 8 : 6).map((repo) => (
-						<span
-							key={repo}
-							className="inline-flex items-center rounded-full border border-border/65 bg-background/72 px-3 py-1 font-mono text-[11px] text-foreground/78"
-						>
-							{repo}
-						</span>
-					))}
-					{repoNames.length > (desktop ? 8 : 6) ? (
+					{visibleRepoNames.map((repo) => {
+						const [owner, repoName] = repo.split("/", 2);
+						const href =
+							owner && repoName
+								? buildDashboardScopeHref({
+										kind: "repo",
+										owner,
+										repo: repoName,
+									})
+								: null;
+						const className =
+							"inline-flex items-center rounded-full border border-border/65 bg-background/72 px-3 py-1 font-mono text-[11px] text-foreground/78";
+						return href ? (
+							<InternalLink
+								key={repo}
+								href={href}
+								to={href}
+								className={className}
+							>
+								{repo}
+							</InternalLink>
+						) : (
+							<span key={repo} className={className}>
+								{repo}
+							</span>
+						);
+					})}
+					{repoNames.length > repoChipLimit ? (
 						<span className="inline-flex items-center rounded-full border border-dashed border-border/65 px-3 py-1 font-mono text-[11px] text-muted-foreground">
-							+{repoNames.length - (desktop ? 8 : 6)} 个仓库
+							+{repoNames.length - repoChipLimit} 个仓库
 						</span>
 					) : null}
 				</div>
@@ -760,6 +862,13 @@ function formatDateTime(value: string | null | undefined) {
 	if (!value) return "—";
 	const date = new Date(value);
 	return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function formatPersonalRepoUpdatedAt(value: string | null | undefined) {
+	if (!value) return "—";
+	const date = new Date(value);
+	if (Number.isNaN(date.getTime())) return value;
+	return date.toLocaleDateString();
 }
 
 function buildOptimisticReactions(
@@ -948,6 +1057,12 @@ export function Dashboard(props: {
 	});
 	const loadInitialFeed = feed.loadInitial;
 	const refreshFeed = feed.refresh;
+	const [personalRepos, setPersonalRepos] =
+		useState<PersonalReposResponse | null>(null);
+	const [personalReposLoading, setPersonalReposLoading] = useState(false);
+	const [personalReposError, setPersonalReposError] = useState<string | null>(
+		null,
+	);
 	const [liveNotices, setLiveNotices] = useState<DashboardLiveNoticeState>({});
 	const activeFeedNotices = liveNotices.feed?.[feedRequestType] ?? [];
 	const activeFeedNotice = activeFeedNotices[0];
@@ -1013,6 +1128,39 @@ export function Dashboard(props: {
 		},
 		[],
 	);
+
+	useEffect(() => {
+		if (scope?.kind !== "mine") {
+			setPersonalRepos(null);
+			setPersonalReposLoading(false);
+			setPersonalReposError(null);
+			return;
+		}
+
+		let cancelled = false;
+		setPersonalReposLoading(true);
+		setPersonalReposError(null);
+		void apiGet<PersonalReposResponse>("/api/me/personal-repos")
+			.then((response) => {
+				if (cancelled) return;
+				setPersonalRepos(response);
+			})
+			.catch((error) => {
+				if (cancelled) return;
+				setPersonalReposError(
+					describeUnknownError(error, "个人仓库清单加载失败。"),
+				);
+			})
+			.finally(() => {
+				if (cancelled) return;
+				setPersonalReposLoading(false);
+			});
+
+		return () => {
+			cancelled = true;
+		};
+	}, [me.user.id, scope?.kind]);
+
 	const {
 		reactionTokenMasked,
 		patInput,
@@ -3046,7 +3194,17 @@ export function Dashboard(props: {
 						<section className="min-w-0">
 							{scopedMode && scope ? (
 								<div className="lg:hidden">
-									<ScopedSummaryCard scope={scope} feedItems={feed.items} />
+									<ScopedSummaryCard
+										scope={scope}
+										feedItems={feed.items}
+										personalRepos={scope.kind === "mine" ? personalRepos : null}
+										personalReposLoading={
+											scope.kind === "mine" && personalReposLoading
+										}
+										personalReposError={
+											scope.kind === "mine" ? personalReposError : null
+										}
+									/>
 								</div>
 							) : null}
 							<TabsContent value="all" className="mt-0 min-w-0">
@@ -3140,6 +3298,13 @@ export function Dashboard(props: {
 								<ScopedSummaryCard
 									scope={scope}
 									feedItems={feed.items}
+									personalRepos={scope.kind === "mine" ? personalRepos : null}
+									personalReposLoading={
+										scope.kind === "mine" && personalReposLoading
+									}
+									personalReposError={
+										scope.kind === "mine" ? personalReposError : null
+									}
 									desktop
 								/>
 							</aside>
