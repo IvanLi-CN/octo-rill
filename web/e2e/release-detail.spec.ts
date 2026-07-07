@@ -43,6 +43,7 @@ type ApiOptions = {
 	autoTranslateDisabledIds?: string[];
 	autoTranslateResolveStatuses?: Record<string, "ready" | "missing" | "error">;
 	autoTranslateResolveFailureCount?: number;
+	autoTranslateResolveDelayMs?: number;
 	autoTranslateAppendPageErrorIds?: string[];
 	autoTranslateAppendCursor?: string | null;
 	smartFeedCount?: number;
@@ -766,6 +767,14 @@ async function installApiMocks(
 			) {
 				await new Promise((resolve) =>
 					setTimeout(resolve, cfg.smartResolveDelayMs),
+				);
+			}
+			if (
+				cfg.autoTranslateResolveDelayMs &&
+				items.some((item) => item.kind === "release_summary")
+			) {
+				await new Promise((resolve) =>
+					setTimeout(resolve, cfg.autoTranslateResolveDelayMs),
 				);
 			}
 			return json(route, {
@@ -1843,6 +1852,47 @@ test("feed smart upstream rejected error auto retries on page load", async ({
 	).toBeVisible();
 });
 
+test("feed smart response body decode error auto retries on page load", async ({
+	page,
+}) => {
+	const releaseId = makeAutoTranslateReleaseId(0);
+	const tracker = await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 1,
+		smartInitialErrorIds: [releaseId],
+		smartInitialErrorPayloads: {
+			[releaseId]: {
+				error_code: "response_body_decode",
+				error_summary: "润色失败",
+				error_detail: "error decoding response body",
+			},
+		},
+		smartResolveStatuses: {
+			[releaseId]: "ready",
+		},
+		smartResolveDelayMs: 3000,
+	});
+
+	await page.goto("/?tab=releases");
+	await expect
+		.poll(() =>
+			tracker.translationResolveRequests.some(
+				(request) =>
+					request.kinds.every((kind) => kind === "release_smart") &&
+					request.entityIds.includes(releaseId),
+			),
+		)
+		.toBe(true);
+	await expect(page.getByText("润色结果准备中", { exact: true })).toBeVisible();
+	await expect(
+		page.getByText("刚发现这条结果还没准备好，正在自动重试，请稍候。", {
+			exact: true,
+		}),
+	).toBeVisible();
+	await expect(page.getByText("润色失败", { exact: true })).toHaveCount(0);
+	await expect(page.getByRole("button", { name: "重试润色" })).toHaveCount(0);
+});
+
 test("feed translated upstream rejected error auto retries on page load", async ({
 	page,
 }) => {
@@ -1881,6 +1931,87 @@ test("feed translated upstream rejected error auto retries on page load", async 
 	await expect(
 		page.getByRole("heading", { name: `发布说明 ${releaseId}` }),
 	).toBeVisible();
+});
+
+test("feed translated response body decode error auto retries on page load", async ({
+	page,
+}) => {
+	const releaseId = makeAutoTranslateReleaseId(0);
+	const tracker = await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 1,
+		autoTranslateInitialErrorIds: [releaseId],
+		autoTranslateInitialErrorPayloads: {
+			[releaseId]: {
+				error_code: "response_body_decode",
+				error_summary: "翻译失败",
+				error_detail: "error decoding response body",
+			},
+		},
+		autoTranslateResolveStatuses: {
+			[releaseId]: "ready",
+		},
+		autoTranslateResolveDelayMs: 3000,
+	});
+
+	await page.goto("/?tab=releases");
+	await expect
+		.poll(() =>
+			tracker.translationResolveRequests.some(
+				(request) =>
+					request.kinds.every((kind) => kind === "release_summary") &&
+					request.entityIds.includes(releaseId),
+			),
+		)
+		.toBe(true);
+	const releaseCard = page
+		.locator('[data-feed-item-key="release:20001"]')
+		.first();
+	await releaseCard.locator('[data-feed-lane-trigger="translated"]').click();
+	await expect(page.getByText("翻译结果准备中", { exact: true })).toBeVisible();
+	await expect(
+		page.getByText("刚发现这条结果还没准备好，正在自动重试，请稍候。", {
+			exact: true,
+		}),
+	).toBeVisible();
+	await expect(page.getByText("翻译失败", { exact: true })).toHaveCount(0);
+	await expect(page.getByRole("button", { name: "重试翻译" })).toHaveCount(0);
+});
+
+test("feed smart non-retryable upstream error stays on the error panel", async ({
+	page,
+}) => {
+	const releaseId = makeAutoTranslateReleaseId(0);
+	const tracker = await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 1,
+		smartInitialErrorIds: [releaseId],
+		smartInitialErrorPayloads: {
+			[releaseId]: {
+				error_code: "upstream_not_found",
+				error_summary: "上游模型不可用",
+				error_detail: "AI returned 404 Not Found",
+			},
+		},
+		smartResolveStatuses: {
+			[releaseId]: "ready",
+		},
+	});
+
+	await page.goto("/?tab=releases");
+	await expect(page.getByText("润色失败", { exact: true })).toBeVisible();
+	await expect(page.getByRole("button", { name: "重试润色" })).toBeVisible();
+	await expect(page.getByText("润色结果准备中", { exact: true })).toHaveCount(
+		0,
+	);
+	await page.waitForTimeout(750);
+	expect(
+		tracker.translationResolveRequests.some(
+			(request) =>
+				request.kinds.every((kind) => kind === "release_smart") &&
+				request.entityIds.includes(releaseId),
+		),
+	).toBe(false);
 });
 
 test("feed auto retry falls back to the existing error panel after one failed automatic rescue", async ({
