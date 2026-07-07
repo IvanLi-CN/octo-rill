@@ -12,6 +12,7 @@
 
 - 在 `/settings?section=my-releases` 新增“我的发布”开关，并通过现有 `/api/me/profile` / `/api/admin/users/{user_id}/profile` 契约持久化 `include_own_releases`。
 - 将 Release 可见性统一改为：`starred_repos` +（开关开启时）`owned_repo_star_baselines` 的去重并集。
+- `owned_repo_star_baselines` 必须持久化 GitHub GraphQL `isPrivate`，`user_release_visible_repos` 的 owned 分支使用真实 private flag。
 - 让 `发布 / 全部`、Release 详情、翻译、润色、reaction、日报、手动同步与定时同步都使用同一套 Release 可见性来源。
 - 保持 `/api/starred`、社交 `加星` tab、真实 starred snapshot 语义不变。
 
@@ -59,7 +60,7 @@
 
 - 新增 `user_release_visible_repos` view：
   - 基础来源：`starred_repos`
-  - 增量来源：`owned_repo_star_baselines`（仅当 `users.include_own_releases = 1`）
+  - 增量来源：`owned_repo_star_baselines`（仅当 `users.include_own_releases = 1`），并保留 `owned_repo_star_baselines.is_private`
   - 去重规则：若某 repo 已在 `starred_repos` 中存在，则忽略同 repo 的 owned baseline 行。
 - Release 列表、详情、翻译、润色、reaction、日报与润色预热都从该 view 获取 repo membership。
 
@@ -86,6 +87,10 @@
 - Given 用户开启“我的发布”
   When 访问 `发布 / 全部`
   Then 本人 owner 的个人仓库 Release 会进入 Release 时间线，并与真实 star 仓库一起按时间排序。
+
+- Given owned baseline 对应 private repo
+  When `user_release_visible_repos` 输出该 repo
+  Then `is_private` 必须为真实 private flag，公开 Release 发布权限与匿名公开 API 不得把它当作 GitHub public repo。
 
 - Given 某 repo 同时属于真实 star 与 owned baseline
   When 访问 Release 时间线或详情
@@ -137,6 +142,32 @@
   evidence_note: 开启“我的发布”后，owner-only repo release 会进入 `全部` 时间线，与真实 starred repo release 并列展示。
 
 ![Dashboard owner releases in all tab](./assets/dashboard-owned-releases-all.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  route: `/focus/repo/IvanLi-CN/octo-rill`
+  viewport: `1600x1000`
+  state: `private-owner-repo-unpublished`
+  evidence_note: 验证当前 viewer 拥有的个人私有仓库在未发布时，focus 摘要卡展示“私有仓库 · 未发布”，说明发布只公开 Release 页且不改变 GitHub 仓库权限，并提供“发布公开页”操作。
+  PR: include
+  image:
+  ![私有仓库公开 Release 页未发布状态](./assets/private-public-release-focus-unpublished-1600x1000.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  route: `/focus/repo/IvanLi-CN/octo-rill`
+  viewport: `1600x1000`
+  state: `private-owner-repo-published`
+  evidence_note: 验证当前 viewer 拥有的个人私有仓库发布后，focus 摘要卡展示“已发布 OctoRill 公开页”与 `READY` 状态，并提供“复制地址”“跳转查看”“取消发布”操作。
+  PR: include
+  image:
+  ![私有仓库公开 Release 页已发布状态](./assets/private-public-release-focus-published-1600x1000.png)
 
 ## 方案概述（Approach, high-level）
 
