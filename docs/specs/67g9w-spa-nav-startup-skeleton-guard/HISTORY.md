@@ -4,7 +4,7 @@
 
 - Lifecycle: active
 - Created: 2026-04-17
-- Last: 2026-04-17
+- Last: 2026-07-08
 
 ## 变更记录
 
@@ -12,3 +12,4 @@
 - 2026-04-17: 实现完成；Dashboard shell hydration guard、Storybook pending story、Playwright 回归与视觉证据路径已补齐。
 - 2026-04-17: 主人确认本轮不需要截图资产，最终以本地浏览器手测替代截图落盘。
 - 2026-04-24: path-backed tab surface 上线后，补齐跨 route remount 的会话态保留，继续保证 `/stars` 等 tab 切换只显示局部 skeleton、不会回退全局 startup skeleton，也不会重复触发 sidebar / reaction-token 启动链路。
+- 2026-07-08: Dashboard server-state cache 改用 React Query；已访问 route 的 Back/Forward 命中直接恢复 feed 内容，briefs/notifications/reaction-token status 进入 1 小时 Dashboard query 持久化白名单，并保持 Service Worker 私有 API bypass 边界不变。

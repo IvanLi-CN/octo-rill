@@ -1,5 +1,6 @@
 import type { MeResponse } from "@/api";
 import type { FeedItem } from "@/feed/types";
+import { clearDashboardQueryCache } from "@/query/queryClient";
 import type { NotificationItem } from "@/sidebar/InboxQuickList";
 import type { BriefItem } from "@/sidebar/ReleaseDailyCard";
 import type { DashboardWarmRouteState } from "@/dashboard/routeState";
@@ -187,6 +188,7 @@ export function clearAllWarmStartupCaches() {
 	clearStartupAuth();
 	removeStorageRecord(DASHBOARD_CACHE_KEY);
 	removeStorageRecord(ADMIN_USERS_CACHE_KEY);
+	clearDashboardQueryCache();
 }
 
 export function readDashboardWarmSnapshot(input: {

@@ -1,6 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { apiGet } from "@/api";
+import {
+	buildDashboardScopeSignature,
+	type DashboardScope,
+} from "@/dashboard/routeState";
 import type {
 	FeedItem,
 	FeedResponse,
@@ -9,11 +14,16 @@ import type {
 	TranslatedItem,
 } from "@/feed/types";
 import { isReleaseFeedItem, isSocialFeedItem } from "@/feed/types";
-import type { DashboardScope } from "@/dashboard/routeState";
 import {
 	describeNetworkAwareError,
 	type NetworkErrorKind,
 } from "@/lib/errorPresentation";
+import {
+	DASHBOARD_QUERY_MAX_AGE_MS,
+	DASHBOARD_QUERY_STALE_MS,
+	dashboardFeedQueryKey,
+	type DashboardFeedQueryData,
+} from "@/query/dashboardQueryKeys";
 
 export type FeedRequestType = "all" | "releases" | "stars" | "followers";
 export type FeedLoadErrorPhase = "initial" | "append";
@@ -126,6 +136,7 @@ function buildFeedUrl(
 export function useFeed(
 	type: FeedRequestType = "all",
 	options?: {
+		userId?: string;
 		scope?: DashboardScope | null;
 		initialData?: {
 			type: FeedRequestType;
@@ -134,48 +145,62 @@ export function useFeed(
 		} | null;
 	},
 ) {
+	const queryClient = useQueryClient();
 	const initialData = options?.initialData;
+	const userId = options?.userId ?? "anonymous";
 	const scope = options?.scope ?? null;
+	const scopeSignature = useMemo(
+		() => buildDashboardScopeSignature(scope),
+		[scope],
+	);
+	const queryKey = useMemo(
+		() => dashboardFeedQueryKey({ userId, type, scope, cursor: null }),
+		[scope, type, userId],
+	);
 	const initialStateMatches = initialData?.type === type;
-	const [dataType, setDataType] = useState<FeedRequestType>(
-		initialStateMatches ? initialData.type : type,
-	);
-	const [items, setItems] = useState<FeedItem[]>(
-		initialStateMatches ? initialData.items : [],
-	);
-	const [nextCursor, setNextCursor] = useState<string | null>(
-		initialStateMatches ? initialData.nextCursor : null,
-	);
-	const [loadingInitial, setLoadingInitial] = useState(!initialStateMatches);
 	const [loadingMore, setLoadingMore] = useState(false);
-	const [error, setError] = useState<FeedLoadError | null>(null);
+	const [appendError, setAppendError] = useState<FeedLoadError | null>(null);
 	const [freshKeys, setFreshKeys] = useState<Set<string>>(() => new Set());
 
 	const reqIdRef = useRef(0);
-	const dataTypeRef = useRef(type);
-	const scopeRef = useRef(scope);
-	const isCurrentType = dataType === type;
-	const currentItems = isCurrentType ? items : [];
-	const currentNextCursor = isCurrentType ? nextCursor : null;
-	const currentError = isCurrentType ? error : null;
-	const currentLoadingInitial = !isCurrentType || loadingInitial;
-	const hasMore = Boolean(currentNextCursor);
+	const query = useQuery<DashboardFeedQueryData>({
+		queryKey,
+		queryFn: async () => {
+			const current =
+				queryClient.getQueryData<DashboardFeedQueryData>(queryKey);
+			const res = await apiGet<FeedResponse>(buildFeedUrl(30, type, scope));
+			return {
+				type,
+				scopeSignature,
+				items: preserveReleaseViewers(current?.items ?? [], res.items),
+				nextCursor: res.next_cursor,
+			};
+		},
+		initialData: initialStateMatches
+			? {
+					type: initialData.type,
+					scopeSignature,
+					items: initialData.items,
+					nextCursor: initialData.nextCursor,
+				}
+			: undefined,
+		staleTime: DASHBOARD_QUERY_STALE_MS,
+		gcTime: DASHBOARD_QUERY_MAX_AGE_MS,
+	});
 
-	useEffect(() => {
-		if (dataTypeRef.current === type && scopeRef.current === scope) {
-			return;
-		}
-		dataTypeRef.current = type;
-		scopeRef.current = scope;
-		reqIdRef.current += 1;
-		setDataType(type);
-		setItems([]);
-		setNextCursor(null);
-		setLoadingInitial(false);
-		setLoadingMore(false);
-		setError(null);
-		setFreshKeys(new Set());
-	}, [scope, type]);
+	const currentData = query.data ?? null;
+	const currentItems = currentData?.items ?? [];
+	const currentNextCursor = currentData?.nextCursor ?? null;
+	const currentLoadingInitial = !currentData && query.isPending;
+	const hasMore = Boolean(currentNextCursor);
+	const currentInitialError = query.error
+		? {
+				phase: "initial" as const,
+				...describeNetworkAwareError(query.error, "动态加载失败，请稍后重试。"),
+				at: query.errorUpdatedAt || Date.now(),
+			}
+		: null;
+	const currentError = appendError ?? currentInitialError;
 
 	const loadInitial = useCallback(
 		async (options?: { freshKeys?: string[]; throwOnError?: boolean }) => {
@@ -184,61 +209,64 @@ export function useFeed(
 
 			// Cancel any in-flight "load more" state; we are replacing the list.
 			setLoadingMore(false);
-
-			setLoadingInitial(true);
-			setError(null);
-			try {
-				const res = await apiGet<FeedResponse>(buildFeedUrl(30, type, scope));
-				if (reqId !== reqIdRef.current) return;
-				setDataType(type);
-				setItems((prev) => preserveReleaseViewers(prev, res.items));
-				setNextCursor(res.next_cursor);
-				setFreshKeys(new Set(options?.freshKeys ?? []));
-			} catch (err) {
-				if (reqId !== reqIdRef.current) return;
-				const description = describeNetworkAwareError(
-					err,
-					"动态加载失败，请稍后重试。",
-				);
-				setError({
-					phase: "initial",
-					message: description.message,
-					kind: description.kind,
-					detail: description.detail,
-					at: Date.now(),
-				});
+			setAppendError(null);
+			const result = await query.refetch();
+			if (reqId !== reqIdRef.current) return;
+			if (result.error) {
 				if (options?.throwOnError) {
-					throw err;
+					throw result.error;
 				}
-			} finally {
-				if (reqId === reqIdRef.current) {
-					setLoadingInitial(false);
-				}
+				return;
+			}
+			if (result.data) {
+				setFreshKeys(new Set(options?.freshKeys ?? []));
 			}
 		},
-		[scope, type],
+		[query.refetch],
 	);
 
 	const loadMore = useCallback(async () => {
 		if (!currentNextCursor || loadingMore || currentLoadingInitial) return;
 		const reqId = reqIdRef.current;
 		setLoadingMore(true);
-		setError(null);
+		setAppendError(null);
 		try {
-			const res = await apiGet<FeedResponse>(
-				buildFeedUrl(30, type, scope, currentNextCursor),
-			);
+			const pageQueryKey = dashboardFeedQueryKey({
+				userId,
+				type,
+				scope,
+				cursor: currentNextCursor,
+			});
+			const page = await queryClient.fetchQuery<DashboardFeedQueryData>({
+				queryKey: pageQueryKey,
+				queryFn: async () => {
+					const res = await apiGet<FeedResponse>(
+						buildFeedUrl(30, type, scope, currentNextCursor),
+					);
+					return {
+						type,
+						scopeSignature,
+						items: res.items,
+						nextCursor: res.next_cursor,
+					};
+				},
+				staleTime: DASHBOARD_QUERY_STALE_MS,
+				gcTime: DASHBOARD_QUERY_MAX_AGE_MS,
+			});
 			if (reqId !== reqIdRef.current) return;
-			setDataType(type);
-			setItems((prev) => mergeByKey(prev, res.items));
-			setNextCursor(res.next_cursor);
+			queryClient.setQueryData<DashboardFeedQueryData>(queryKey, (current) => ({
+				type,
+				scopeSignature,
+				items: mergeByKey(current?.items ?? [], page.items),
+				nextCursor: page.nextCursor,
+			}));
 		} catch (err) {
 			if (reqId !== reqIdRef.current) return;
 			const description = describeNetworkAwareError(
 				err,
 				"更多动态加载失败，请稍后重试。",
 			);
-			setError({
+			setAppendError({
 				phase: "append",
 				message: description.message,
 				kind: description.kind,
@@ -250,7 +278,17 @@ export function useFeed(
 				setLoadingMore(false);
 			}
 		}
-	}, [currentLoadingInitial, currentNextCursor, loadingMore, scope, type]);
+	}, [
+		currentLoadingInitial,
+		currentNextCursor,
+		loadingMore,
+		queryClient,
+		queryKey,
+		scope,
+		scopeSignature,
+		type,
+		userId,
+	]);
 
 	const refresh = useCallback(
 		async (options?: { freshKeys?: string[]; throwOnError?: boolean }) => {
@@ -262,52 +300,67 @@ export function useFeed(
 	const applyTranslation = useCallback(
 		(item: Pick<FeedItem, "kind" | "id">, translated: TranslatedItem) => {
 			const key = itemKey(item);
-			setItems((prev) =>
-				prev.map((it) => {
-					if (itemKey(it) !== key) return it;
-					if (!isReleaseFeedItem(it)) return it;
-					return {
-						...it,
-						translated: { ...translated },
-					};
-				}),
+			queryClient.setQueryData<DashboardFeedQueryData>(queryKey, (current) =>
+				current
+					? {
+							...current,
+							items: current.items.map((it) => {
+								if (itemKey(it) !== key) return it;
+								if (!isReleaseFeedItem(it)) return it;
+								return {
+									...it,
+									translated: { ...translated },
+								};
+							}),
+						}
+					: current,
 			);
 		},
-		[],
+		[queryClient, queryKey],
 	);
 
 	const applySmart = useCallback(
 		(item: Pick<FeedItem, "kind" | "id">, smart: SmartItem) => {
 			const key = itemKey(item);
-			setItems((prev) =>
-				prev.map((it) => {
-					if (itemKey(it) !== key) return it;
-					if (!isReleaseFeedItem(it)) return it;
-					return {
-						...it,
-						smart: { ...smart },
-					};
-				}),
+			queryClient.setQueryData<DashboardFeedQueryData>(queryKey, (current) =>
+				current
+					? {
+							...current,
+							items: current.items.map((it) => {
+								if (itemKey(it) !== key) return it;
+								if (!isReleaseFeedItem(it)) return it;
+								return {
+									...it,
+									smart: { ...smart },
+								};
+							}),
+						}
+					: current,
 			);
 		},
-		[],
+		[queryClient, queryKey],
 	);
 
 	const applyReactions = useCallback(
 		(item: Pick<FeedItem, "kind" | "id">, reactions: ReleaseReactions) => {
 			const key = itemKey(item);
-			setItems((prev) =>
-				prev.map((it) => {
-					if (itemKey(it) !== key) return it;
-					if (!isReleaseFeedItem(it)) return it;
-					return {
-						...it,
-						reactions,
-					};
-				}),
+			queryClient.setQueryData<DashboardFeedQueryData>(queryKey, (current) =>
+				current
+					? {
+							...current,
+							items: current.items.map((it) => {
+								if (itemKey(it) !== key) return it;
+								if (!isReleaseFeedItem(it)) return it;
+								return {
+									...it,
+									reactions,
+								};
+							}),
+						}
+					: current,
 			);
 		},
-		[],
+		[queryClient, queryKey],
 	);
 
 	const stats = useMemo(() => {
@@ -325,7 +378,7 @@ export function useFeed(
 
 	return {
 		items: currentItems,
-		freshKeys: isCurrentType ? freshKeys : new Set<string>(),
+		freshKeys,
 		nextCursor: currentNextCursor,
 		hasMore,
 		loadingInitial: currentLoadingInitial,
