@@ -5,8 +5,8 @@
 - Lifecycle: active
 - Implementation: 已交付
 - Created: 2026-04-13
-- Last: 2026-04-13
-- Summary: 已交付；local implementation completed; runtime ai_model_context_limit; release_detail chunk translation unified; visual evidence landed
+- Last: 2026-07-07
+- Summary: 已交付；local implementation completed; runtime ai_model_context_limit; release_detail chunk translation unified; visual evidence landed; release batch translation now accounts for output budget and retries split batches before falling back to single-release detail translation
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -33,3 +33,4 @@ None
 - [x] M1: 后端 runtime setting、状态接口与输入预算解析改成 `ai_model_context_limit`
 - [x] M2: release feed / batch preheat 统一切到 `release_detail` 分块译文，不再按正文长度拒绝翻译
 - [x] M3: 文档、Storybook/E2E 与视觉证据收口
+- [x] M4: release detail batch 翻译按输入与输出预算共同分组，batch 响应截断或缺项时先拆小重试，再退回单条 detail/chunk 路径
