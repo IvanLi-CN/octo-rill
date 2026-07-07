@@ -142,6 +142,32 @@
 
 ![Dashboard owner releases in all tab](./assets/dashboard-owned-releases-all.png)
 
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  route: `/focus/repo/IvanLi-CN/octo-rill`
+  viewport: `1600x1000`
+  state: `private-owner-repo-unpublished`
+  evidence_note: 验证当前 viewer 拥有的个人私有仓库在未发布时，focus 摘要卡展示“私有仓库 · 未发布”，说明发布只公开 Release 页且不改变 GitHub 仓库权限，并提供“发布公开页”操作。
+  PR: include
+  image:
+  ![私有仓库公开 Release 页未发布状态](./assets/private-public-release-focus-unpublished-1600x1000.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  route: `/focus/repo/IvanLi-CN/octo-rill`
+  viewport: `1600x1000`
+  state: `private-owner-repo-published`
+  evidence_note: 验证当前 viewer 拥有的个人私有仓库发布后，focus 摘要卡展示“已发布 OctoRill 公开页”与 `READY` 状态，并提供“复制地址”“跳转查看”“取消发布”操作。
+  PR: include
+  image:
+  ![私有仓库公开 Release 页已发布状态](./assets/private-public-release-focus-published-1600x1000.png)
+
 ## 方案概述（Approach, high-level）
 
 - 通过数据库 view 把“真实 star 可见性”和“owner repo opt-in 可见性”合并成一个统一读面，避免在每个 Release 接口里各自拼接条件。

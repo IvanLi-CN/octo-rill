@@ -171,3 +171,17 @@
   PR: include
   image:
   ![管理后台公开端点仓库删除确认](./assets/public-release-evidence-admin-v1.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  route: `/public/IvanLi-CN/octo-rill/releases`
+  final_url: `/IvanLi-CN/octo-rill/releases`
+  viewport: `1440x1000`
+  state: `legacy-public-release-route-redirect`
+  evidence_note: 验证旧 `/public/:owner/:repo/releases` 列表路径不再进入前端 404，而是 replace 到 canonical `/:owner/:repo/releases` 并展示公开 Release 落地页；public-only tag 详情路由语义不受此截图覆盖，由路由测试覆盖。
+  PR: include
+  image:
+  ![公开 Release 旧列表路径跳转到 canonical 落地页](./assets/public-release-legacy-redirect-browser-1440x1000.png)
