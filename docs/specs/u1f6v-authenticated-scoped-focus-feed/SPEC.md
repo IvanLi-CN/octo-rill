@@ -249,6 +249,7 @@
   story_id_or_title: `pages-dashboard--scoped-focus-mine-personal-repos`
   scenario: `mine personal repos list`
   evidence_note: 证明 `/focus/mine` 摘要标题为“个人仓库”，仓库总数来自个人仓库清单，且右侧以完整仓库列表展示无发布仓库。
+  PR: include
   ![Personal repos focus summary](./assets/personal-repos-focus-storybook.png)
 
 - source_type: `mock_ui`
