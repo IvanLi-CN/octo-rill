@@ -4,7 +4,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, fn, userEvent, waitFor, within } from "storybook/test";
 
-import type { ReleaseDetailResponse } from "@/api";
+import type { PersonalReposResponse, ReleaseDetailResponse } from "@/api";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -277,8 +277,18 @@ function StoryScopedSummaryCard(props: {
 	scope: DashboardScope;
 	feedItems: FeedItem[];
 	desktop?: boolean;
+	personalRepos?: PersonalReposResponse | null;
+	personalReposLoading?: boolean;
+	personalReposError?: string | null;
 }) {
-	const { scope, feedItems, desktop = false } = props;
+	const {
+		scope,
+		feedItems,
+		desktop = false,
+		personalRepos = null,
+		personalReposLoading = false,
+		personalReposError = null,
+	} = props;
 	const feedRepoNames = Array.from(
 		new Set(
 			feedItems
@@ -286,12 +296,23 @@ function StoryScopedSummaryCard(props: {
 				.filter((value): value is string => Boolean(value)),
 		),
 	);
-	const repoNames = resolveDashboardScopeRepoNames(scope, feedRepoNames);
+	const repoNames =
+		scope.kind === "mine" && personalRepos
+			? personalRepos.repos.map((repo) => repo.full_name)
+			: resolveDashboardScopeRepoNames(scope, feedRepoNames);
+	const repoCount =
+		scope.kind === "mine" && personalRepos
+			? personalRepos.total_count
+			: repoNames.length;
 	const releaseCount = feedItems.filter(
 		(item) => item.kind === "release",
 	).length;
 	const activityCount = feedItems.length - releaseCount;
-	const summary = buildDashboardScopeSummary(scope, repoNames.length);
+	const summary = buildDashboardScopeSummary(scope, repoCount);
+	const repoChipLimit = desktop ? 8 : 6;
+	const personalRepoItems =
+		scope.kind === "mine" && personalRepos ? personalRepos.repos : [];
+	const visibleRepoNames = repoNames.slice(0, repoChipLimit);
 
 	return (
 		<div
@@ -341,25 +362,112 @@ function StoryScopedSummaryCard(props: {
 				</div>
 			</div>
 
-			{repoNames.length > 0 ? (
+			{scope.kind === "mine" && personalReposLoading && !personalRepos ? (
+				<p className="mt-4 rounded-2xl border border-dashed border-border/65 px-3 py-2 text-sm text-muted-foreground">
+					正在加载个人仓库…
+				</p>
+			) : null}
+
+			{scope.kind === "mine" && personalReposError ? (
+				<p className="mt-4 rounded-2xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+					个人仓库清单加载失败，当前动态仍可继续浏览。
+				</p>
+			) : null}
+
+			{personalRepoItems.length > 0 ? (
+				<div className="mt-4 overflow-hidden rounded-2xl border border-border/65 bg-background/72">
+					<div className="flex items-center justify-between border-b border-border/60 px-3 py-2">
+						<p className="text-sm font-medium text-foreground">仓库列表</p>
+						<p className="font-mono text-[11px] text-muted-foreground">
+							{personalRepos?.total_count ?? personalRepoItems.length} 个
+						</p>
+					</div>
+					<ul
+						className="max-h-80 scroll-pb-3 overflow-y-auto pb-3"
+						data-dashboard-personal-repo-list="true"
+					>
+						{personalRepoItems.map((repo) => {
+							const href = buildDashboardScopeHref({
+								kind: "repo",
+								owner: repo.owner_login,
+								repo: repo.name,
+							});
+							const releaseLabel =
+								repo.release_count > 0
+									? `${repo.release_count} 个发布`
+									: "暂无发布";
+							return (
+								<li
+									key={repo.full_name}
+									className="border-b border-border/50 last:border-b-0"
+								>
+									<InternalLink
+										href={href}
+										to={href}
+										className="group flex min-w-0 items-center justify-between gap-3 px-3 py-2.5 text-left transition-colors hover:bg-muted/35 focus-visible:bg-muted/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/45"
+									>
+										<span className="min-w-0">
+											<span className="block truncate font-mono text-[12px] font-medium text-foreground">
+												{repo.full_name}
+											</span>
+											<span className="mt-0.5 block truncate text-xs text-muted-foreground">
+												更新 {storyFormatPersonalRepoUpdatedAt(repo.updated_at)}
+											</span>
+										</span>
+										<span className="shrink-0 rounded-full border border-border/65 bg-card/70 px-2 py-0.5 text-[11px] text-muted-foreground group-hover:text-foreground">
+											{releaseLabel}
+										</span>
+									</InternalLink>
+								</li>
+							);
+						})}
+					</ul>
+				</div>
+			) : repoNames.length > 0 ? (
 				<div className="mt-4 flex flex-wrap gap-2">
-					{repoNames.slice(0, desktop ? 8 : 6).map((repo) => (
-						<span
-							key={repo}
-							className="inline-flex items-center rounded-full border border-border/65 bg-background/72 px-3 py-1 font-mono text-[11px] text-foreground/78"
-						>
-							{repo}
-						</span>
-					))}
-					{repoNames.length > (desktop ? 8 : 6) ? (
+					{visibleRepoNames.map((repo) => {
+						const [owner, repoName] = repo.split("/", 2);
+						const href =
+							owner && repoName
+								? buildDashboardScopeHref({
+										kind: "repo",
+										owner,
+										repo: repoName,
+									})
+								: null;
+						const className =
+							"inline-flex items-center rounded-full border border-border/65 bg-background/72 px-3 py-1 font-mono text-[11px] text-foreground/78";
+						return href ? (
+							<InternalLink
+								key={repo}
+								href={href}
+								to={href}
+								className={className}
+							>
+								{repo}
+							</InternalLink>
+						) : (
+							<span key={repo} className={className}>
+								{repo}
+							</span>
+						);
+					})}
+					{repoNames.length > repoChipLimit ? (
 						<span className="inline-flex items-center rounded-full border border-dashed border-border/65 px-3 py-1 font-mono text-[11px] text-muted-foreground">
-							+{repoNames.length - (desktop ? 8 : 6)} 个仓库
+							+{repoNames.length - repoChipLimit} 个仓库
 						</span>
 					) : null}
 				</div>
 			) : null}
 		</div>
 	);
+}
+
+function storyFormatPersonalRepoUpdatedAt(value: string | null | undefined) {
+	if (!value) return "—";
+	const date = new Date(value);
+	if (Number.isNaN(date.getTime())) return value;
+	return date.toLocaleDateString();
 }
 
 function storyBriefReleaseHref(owner: string, repo: string, tag: string) {
@@ -1692,6 +1800,77 @@ function makeOwnReleaseOptInFeed(includeOwnRelease: boolean): FeedItem[] {
 	return items;
 }
 
+function makePersonalRepoFocusFeed(): FeedItem[] {
+	const owner = STORYBOOK_VIEWER.login;
+	return [
+		buildFeedItem("personal-repo-release-01", {
+			ts: "2026-04-04T18:12:00+08:00",
+			repo_full_name: `${owner}/dockrev`,
+			repo_visual: repoVisualFixtures.social,
+			title: "dockrev 0.56.0 版本更新",
+			body: "- 新增发布说明生成功能",
+			html_url: `https://github.com/${owner}/dockrev/releases/tag/v0.56.0`,
+		}),
+		buildFeedItem("personal-repo-release-02", {
+			ts: "2026-04-04T17:50:00+08:00",
+			repo_full_name: `${owner}/iso-usb-hub`,
+			repo_visual: repoVisualFixtures.social,
+			title: "开发版 dev-20260404",
+			body: "- 固件构建更新",
+			html_url: `https://github.com/${owner}/iso-usb-hub/releases/tag/dev-20260404`,
+		}),
+		buildRepoStarItem("personal-repo-star-01", {
+			ts: "2026-04-04T17:25:00+08:00",
+			repo_full_name: `${owner}/dockrev`,
+			repo_visual: repoVisualFixtures.social,
+			actor: {
+				login: "octocat",
+				avatar_url: githubAvatarUrl("octocat"),
+				html_url: "https://github.com/octocat",
+			},
+		}),
+	];
+}
+
+function makePersonalReposResponse(): PersonalReposResponse {
+	const owner = STORYBOOK_VIEWER.login;
+	const names = [
+		"dockrev",
+		"iso-usb-hub",
+		"xp",
+		"tavily-hikari",
+		"octo-rill",
+		"codex-vibe-monitor",
+		"isolapurr-usb-hub",
+		"tuckmark",
+		"no-release-sandbox",
+		"release-notes-lab",
+		"firmware-playground",
+		"agent-ops",
+		"kaisoumail",
+		"loadlynx",
+		"mcu-agentd",
+		"storybook-fixtures",
+		"daily-briefs",
+		"repo-baseline-audit",
+	];
+	const repos = names.map((name, index) => ({
+		repo_id: 70_000 + index,
+		full_name: `${owner}/${name}`,
+		owner_login: owner,
+		name,
+		html_url: `https://github.com/${owner}/${name}`,
+		updated_at: `2026-04-${String(4 + (index % 20)).padStart(2, "0")}T08:00:00Z`,
+		release_count: name === "no-release-sandbox" ? 0 : index % 3,
+		repo_visual: repoVisualFixtures.social,
+	}));
+	return {
+		owner_login: owner,
+		total_count: repos.length,
+		repos,
+	};
+}
+
 function makeScopedRepoFocusFeed(options?: {
 	repoFullName?: string;
 	repoUrl?: string;
@@ -2679,6 +2858,9 @@ function DashboardPreview(props: {
 	freshNotificationKeys?: string[];
 	scope?: DashboardScope | null;
 	includeOwnReleases?: boolean;
+	personalRepos?: PersonalReposResponse | null;
+	personalReposLoading?: boolean;
+	personalReposError?: string | null;
 	generateBriefFailureDates?: string[];
 	initialBriefErrorSummariesByDate?: Record<string, string>;
 }) {
@@ -2716,6 +2898,9 @@ function DashboardPreview(props: {
 		freshBriefKeys = EMPTY_STORY_FRESH_KEYS,
 		freshNotificationKeys = EMPTY_STORY_FRESH_KEYS,
 		scope = null,
+		personalRepos = null,
+		personalReposLoading = false,
+		personalReposError = null,
 		generateBriefFailureDates = EMPTY_STORY_BRIEF_FAILURE_DATES,
 		initialBriefErrorSummariesByDate,
 	} = props;
@@ -3331,7 +3516,17 @@ function DashboardPreview(props: {
 						<section className="min-w-0">
 							{scopedMode && scope ? (
 								<div className="lg:hidden">
-									<StoryScopedSummaryCard scope={scope} feedItems={items} />
+									<StoryScopedSummaryCard
+										scope={scope}
+										feedItems={items}
+										personalRepos={scope.kind === "mine" ? personalRepos : null}
+										personalReposLoading={
+											scope.kind === "mine" && personalReposLoading
+										}
+										personalReposError={
+											scope.kind === "mine" ? personalReposError : null
+										}
+									/>
 								</div>
 							) : null}
 							<TabsContent value="all" className="mt-0 min-w-0">
@@ -3392,6 +3587,13 @@ function DashboardPreview(props: {
 								<StoryScopedSummaryCard
 									scope={scope}
 									feedItems={items}
+									personalRepos={scope.kind === "mine" ? personalRepos : null}
+									personalReposLoading={
+										scope.kind === "mine" && personalReposLoading
+									}
+									personalReposError={
+										scope.kind === "mine" ? personalReposError : null
+									}
 									desktop
 								/>
 							</aside>
@@ -6612,6 +6814,7 @@ export const ScopedFocusEmptyState: Story = {
 		scope: {
 			kind: "mine",
 		},
+		personalRepos: makePersonalReposResponse(),
 		includeOwnReleases: false,
 	},
 	parameters: {
@@ -6634,6 +6837,49 @@ export const ScopedFocusEmptyState: Story = {
 	},
 };
 
+export const ScopedFocusMinePersonalRepos: Story = {
+	name: "Evidence / Scoped Focus Mine Personal Repos",
+	args: {
+		initialTab: "all",
+		feedItems: makePersonalRepoFocusFeed(),
+		showFooter: false,
+		scope: {
+			kind: "mine",
+		},
+		personalRepos: makePersonalReposResponse(),
+		includeOwnReleases: false,
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"`/focus/mine` 使用当前 viewer 的个人仓库清单作为摘要真相源：总数和右侧仓库列表不再由首屏 feed 去重产生，空发布仓库仍会出现在清单里。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getAllByText(DASHBOARD_MINE_ENTRY_LABEL)[0],
+		).toBeVisible();
+		await expect(canvas.getAllByText("18 个仓库")[0]).toBeVisible();
+		await expect(canvas.getAllByText("仓库列表")[0]).toBeVisible();
+		expect(
+			canvasElement.querySelector('[data-dashboard-personal-repo-list="true"]'),
+		).not.toBeNull();
+		await expect(canvas.getAllByText("发布")[0]).toBeVisible();
+		await expect(canvas.getAllByText("2")[0]).toBeVisible();
+		const noReleaseLinks = canvas.getAllByRole("link", {
+			name: `${STORYBOOK_VIEWER.login}/no-release-sandbox`,
+		});
+		await expect(noReleaseLinks[0]).toHaveAttribute(
+			"href",
+			`/focus/repo/${STORYBOOK_VIEWER.login}/no-release-sandbox`,
+		);
+		await expect(canvas.queryByText("我的仓库动态")).not.toBeInTheDocument();
+	},
+};
+
 export const ScopedFocusMineMenuEntryVisible: Story = {
 	name: "Evidence / Scoped Focus Mine Entry Visible",
 	args: {
@@ -6645,7 +6891,7 @@ export const ScopedFocusMineMenuEntryVisible: Story = {
 	parameters: {
 		docs: {
 			description: {
-				story: "账号菜单显示“我的仓库动态”入口，并落到 `/focus/mine`。",
+				story: "账号菜单显示“个人仓库”入口，并落到 `/focus/mine`。",
 			},
 		},
 	},
@@ -6670,7 +6916,7 @@ export const ScopedFocusMineMenuEntryVisibleWhenOptedOut: Story = {
 		docs: {
 			description: {
 				story:
-					"“我的发布”关闭时，账号菜单仍显示“我的仓库动态”入口；进入后按当前可见性显示内容或空态。",
+					"“我的发布”关闭时，账号菜单仍显示“个人仓库”入口；进入后按当前 viewer 的个人仓库范围显示内容或空态。",
 			},
 		},
 	},

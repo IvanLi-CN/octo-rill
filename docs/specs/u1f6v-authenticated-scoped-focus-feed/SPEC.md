@@ -13,14 +13,14 @@
 - 新阅读面复用现有 Dashboard shell、同步入口、lane selector 与 release detail surface，但顶部 tabs 只保留 `全部 / 发布`。
 - scoped `全部` 只展示当前 scope 命中的 release 与带 repo 归属的社交项；`follower_received` 这类无 repo 归属项不进入新页。
 - 让 route state、release detail close/restore、warm snapshot 与 dashboard updates 全部 scope-aware，避免不同 scope 串缓存或串提示。
-- 所有带 repo identity 的 feed 卡片都提供一致的站内 focus 入口；账号菜单提供“我的仓库动态”快捷入口。
+- 所有带 repo identity 的 feed 卡片都提供一致的站内 focus 入口；账号菜单提供“个人仓库”快捷入口。
 
 ## Non-goals
 
 - 不改变主 Dashboard 的 6 个全局 tabs、全局 Inbox 右栏或其语义。
 - 不新增页内可编辑过滤器、saved views、scope 管理器或 query builder。
 - 不把 org scope 扩展到当前可见仓库集合之外。
-- 不新增第二套“我的仓库”判定逻辑；`mine` 必须严格复用 `#w5gaz` 的 owner baseline / `includeOwnReleases` 语义。
+- 不把组织仓库纳入 `/focus/mine` 的“个人仓库”范围；`#w5gaz` 继续只定义全局 Release 阅读面的“我的发布”开关。
 
 ## 范围
 
@@ -99,14 +99,14 @@
 - `repo`：只匹配当前用户可见集合里该 `owner/repo`。
 - `repos`：只匹配 `items` 指定的去重后仓库集合；最多 12 项；空集合不是 404，而是空范围。
 - `org`：只匹配当前可见集合里 `owner_login == org` 的仓库。
-- `mine`：复用 `includeOwnReleases` 背后的 owner baseline 语义；若开关关闭或当前无命中仓库，页面仍可访问，但为空态。
+- `mine`：使用当前 session 对应 GitHub viewer 的 owner repository baseline。摘要卡的仓库总数与右侧仓库列表来自后端个人仓库清单接口，不从当前 feed 页倒推；没有 release 的个人仓库也必须出现在列表里。`include_own_releases` 不决定 `/focus/mine` 的仓库清单或入口可见性，它只继续影响全局 Release 阅读面。
 
 ### Entry behavior
 
 - Release 卡片 repo identity 区域点击后进入对应 repo focus 页。
 - 所有带 `repo_full_name` 的社交卡片 repo identity / repo 目标段点击后进入对应 repo focus 页。
 - GitHub 外链按钮保持原行为，不改成站内跳转。
-- 账号菜单始终显示“我的仓库动态”，入口落到 `/focus/mine`；`include_own_releases` 只决定 `/focus/mine` 的内容是否命中，不决定入口是否存在。
+- 账号菜单始终显示“个人仓库”，入口落到 `/focus/mine`；`include_own_releases` 不决定入口是否存在。
 
 ### Empty state
 
@@ -124,7 +124,18 @@
 - scoped 请求时：
   - release 读取必须基于 `user_release_visible_repos` 再做 scope 过滤
   - repo-bearing 社交项也必须先受当前可见 repo 集合约束，再做 scope 过滤
+  - `scope=mine` 例外使用当前 GitHub viewer 的 owner repo baseline 作为 release 与 repo-bearing 社交项的聚焦范围，确保个人仓库页不被全局“我的发布”开关折叠成空范围
   - `followers` 在 scoped 模式下必须被排除
+
+### `GET /api/me/personal-repos`
+
+- 返回当前 session 用户绑定 GitHub viewer 的个人仓库清单：
+  - `owner_login`
+  - `total_count`
+  - `repos[]`
+- 该接口只读本地 `owned_repo_star_baselines`，按当前 viewer login 过滤 `repo_full_name` 的 owner 段。
+- 该接口不得硬编码任意 GitHub login，也不得把 org-owned 仓库纳入结果。
+- `total_count` 是 `/focus/mine` summary chip 的仓库总数真相源，不能随 `/api/feed` 分页变化。
 
 ### `GET /api/dashboard/updates`
 
@@ -155,8 +166,12 @@
   Then 进入对应 repo focus 页面，而 GitHub 外链按钮仍打开 GitHub。
 
 - Given 用户访问 `/focus/mine`
-  When `include_own_releases` 未开启
-  Then 页面仍可访问，但显示 scoped empty state，不回退到全局 Dashboard。
+  When 当前 viewer 有个人仓库但没有任何真实动态
+  Then 页面仍可访问，summary 显示完整个人仓库清单，feed 显示 scoped empty state，不回退到全局 Dashboard。
+
+- Given 用户访问 `/focus/mine`
+  When feed 首屏只包含部分个人仓库
+  Then summary chip 与右侧仓库列表仍来自 `/api/me/personal-repos` 的完整清单，不随 feed 首屏分页变化。
 
 - Given 用户访问 `/focus/repo/owner/repo` 或 `/focus/org/org`
   When `全部` tab 中存在缺少日报的历史日组
@@ -189,7 +204,8 @@
   - 桌面 summary sidebar
   - 移动端 summary
   - scoped empty state
-  - “我的仓库动态”入口在 `include_own_releases` 开启 / 关闭时都显示
+  - “个人仓库”入口在 `include_own_releases` 开启 / 关闭时都显示
+  - `/focus/mine` 展示当前 viewer 的完整个人仓库清单，包括无 release 仓库
 
 ## Visual Evidence
 
@@ -226,8 +242,14 @@
 - source_type: `storybook_canvas`
   story_id_or_title: `pages-dashboard--scoped-focus-mine-menu-entry-visible`
   scenario: `mine menu entry visible`
-  evidence_note: 证明账号菜单会出现“我的仓库动态”入口并落到 `/focus/mine`。
+  evidence_note: 证明账号菜单会出现“个人仓库”入口并落到 `/focus/mine`。
   ![Mine menu entry visible](./assets/scoped-focus-mine-entry-visible.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `pages-dashboard--scoped-focus-mine-personal-repos`
+  scenario: `mine personal repos list`
+  evidence_note: 证明 `/focus/mine` 摘要标题为“个人仓库”，仓库总数来自个人仓库清单，且右侧以完整仓库列表展示无发布仓库。
+  ![Personal repos focus summary](./assets/personal-repos-focus-storybook.png)
 
 - source_type: `mock_ui`
   story_id_or_title: `production dashboard route with mocked API`
@@ -239,6 +261,7 @@
 
 - 继续以 `DashboardRouteState` 作为唯一前端阅读真相源，只扩展 `scope`，不再造第二套路由状态。
 - 后端通过统一 `FeedScope` 与 `user_release_visible_repos` 做“先可见、后 scope”的过滤收口，避免不同 feed 分支各自发明规则。
+- `/focus/mine` 的个人仓库清单通过独立只读接口提供；feed 仍只渲染真实存在的发布与 repo-bearing 动态。
 - 新 focus 页面只是现有 Dashboard shell 的 scoped 变体：tabs 缩成两项、侧栏换成 summary、entries 指向 scoped route。
 
 ## 风险 / 假设
