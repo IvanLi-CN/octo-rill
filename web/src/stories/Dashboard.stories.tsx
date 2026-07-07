@@ -6223,6 +6223,31 @@ export const PostBootStarsTabSwitchKeepsShell: Story = {
 	},
 };
 
+export const HistoryStarsCacheHitKeepsContent: Story = {
+	render: () => (
+		<DashboardPreview initialTab="stars" feedItems={makeMixedSocialFeed()} />
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"模拟浏览器 Forward 回到已访问过的 `加星` route：React Query 缓存同步恢复星标列表，主列不回到 loading skeleton，Dashboard shell 也不重启。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("torvalds", { exact: true })).toBeVisible();
+		expect(
+			canvasElement.querySelector('[data-feed-loading-skeleton="true"]'),
+		).toBeNull();
+		expect(
+			canvasElement.querySelector("[data-dashboard-boot-header]"),
+		).toBeNull();
+		expect(canvasElement.querySelector("[data-app-boot]")).toBeNull();
+	},
+};
+
 export const EvidencePostBootStarsTabLoading: Story = {
 	name: "Evidence / Post-Boot Stars Tab Loading",
 	render: () => (

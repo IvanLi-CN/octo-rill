@@ -8,6 +8,7 @@
 - Version notice now surfaces both Service Worker refresh and native install prompt actions in one shared shell surface.
 - Anonymous boot now presents network-aware offline copy when the cached app shell loads but `/api/me` cannot be reached, and keeps login-only actions visibly unavailable until retry.
 - Authenticated boot now preserves recent dashboard warm feed content even when lazy route loading races auth reconciliation, and distinguishes active-page no-cache offline state from cached-content offline state.
+- Dashboard server-state now has a React Query persisted cache for whitelisted Dashboard query keys with a 1 hour max age; this improves Back/Forward and short-lived PWA restores without putting private API responses into the Service Worker cache.
 - Feed initial and append failures carry network-aware kind/detail metadata so offline API misses do not look like empty data or auth failures.
 - Precache generation uses an explicit allowlist for app shell, PWA, brand/favicon, static reaction icons, and Vite build assets instead of broad extension-based inclusion.
 - Version monitoring can ask the registered Service Worker to check for updates on page visibility and observed version drift while preserving user-confirmed activation.
