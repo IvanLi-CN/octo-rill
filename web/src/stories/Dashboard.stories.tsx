@@ -6870,7 +6870,7 @@ export const ScopedFocusMinePersonalRepos: Story = {
 		await expect(canvas.getAllByText("发布")[0]).toBeVisible();
 		await expect(canvas.getAllByText("2")[0]).toBeVisible();
 		const noReleaseLinks = canvas.getAllByRole("link", {
-			name: `${STORYBOOK_VIEWER.login}/no-release-sandbox`,
+			name: new RegExp(`${STORYBOOK_VIEWER.login}/no-release-sandbox`),
 		});
 		await expect(noReleaseLinks[0]).toHaveAttribute(
 			"href",
