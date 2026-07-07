@@ -79,6 +79,7 @@
 - scoped 页面沿用现有 authenticated Dashboard shell。
 - 桌面端右侧不再显示全局 Inbox quick list，而是显示当前 scope 摘要卡。
 - 移动端在 feed 顶部展示同等摘要信息。
+- 单仓 `repo` scope 摘要卡展示公开 Release 页入口：GitHub public repo 显示“公开仓库 · 可直接访问”与复制/跳转；viewer-owned private repo 显示发布状态，未发布时可发布，已发布时可复制、跳转、取消发布。
 - lane selector 继续复用 `全部 / 发布` 两个 feed-backed tab 的现有行为。
 - scoped 页面是只读范围聚焦面；即使 `全部` tab 中存在缺少日报的历史日组，也不得显示按天“生成日报”动作。
 
@@ -156,6 +157,14 @@
 - Given 用户访问 `/focus/repo/owner/repo`
   When 页面加载完成
   Then 只显示该仓库命中的发布与带 repo 归属的动态，且右侧显示 repo 摘要而不是全局 Inbox。
+
+- Given 用户访问 `/focus/repo/owner/repo`
+  When 该仓库是 GitHub public repo
+  Then 摘要卡不显示发布/取消发布开关，只提供公开 Release 页复制与跳转入口。
+
+- Given 用户访问 `/focus/repo/owner/repo`
+  When 该仓库是当前 viewer-owned personal private repo
+  Then 摘要卡显示私有公开页发布状态，并按状态提供发布、复制、跳转、取消发布动作。
 
 - Given 用户从 scoped 页面打开 release detail
   When 关闭 detail

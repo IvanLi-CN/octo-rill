@@ -38,6 +38,7 @@ import { Route as AdminJobsLlmRouteImport } from './routes/admin/jobs/llm'
 import { Route as OwnerRepoReleasesRouteImport } from './routes/$owner/$repo/releases'
 import { Route as FocusOrgOrgIndexRouteImport } from './routes/focus/org/$org/index'
 import { Route as OwnerRepoReleasesIndexRouteImport } from './routes/$owner/$repo/releases/index'
+import { Route as PublicOwnerRepoReleasesRouteImport } from './routes/public/$owner/$repo/releases'
 import { Route as FocusRepoOwnerRepoRouteImport } from './routes/focus/repo/$owner/$repo'
 import { Route as FocusOrgOrgReleasesRouteImport } from './routes/focus/org/$org/releases'
 import { Route as AdminJobsSubscriptionsTaskIdRouteImport } from './routes/admin/jobs/subscriptions/$taskId'
@@ -222,6 +223,11 @@ const OwnerRepoReleasesIndexRoute = OwnerRepoReleasesIndexRouteImport.update({
 } as any).lazy(() =>
   import('./routes/$owner/$repo/releases/index.lazy').then((d) => d.Route),
 )
+const PublicOwnerRepoReleasesRoute = PublicOwnerRepoReleasesRouteImport.update({
+  id: '/public/$owner/$repo/releases',
+  path: '/public/$owner/$repo/releases',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const FocusRepoOwnerRepoRoute = FocusRepoOwnerRepoRouteImport.update({
   id: '/focus/repo/$owner/$repo',
   path: '/focus/repo/$owner/$repo',
@@ -286,9 +292,9 @@ const OwnerRepoReleasesTagTagRoute = OwnerRepoReleasesTagTagRouteImport.update({
 )
 const PublicOwnerRepoReleasesTagTagRoute =
   PublicOwnerRepoReleasesTagTagRouteImport.update({
-    id: '/public/$owner/$repo/releases/tag/$tag',
-    path: '/public/$owner/$repo/releases/tag/$tag',
-    getParentRoute: () => rootRouteImport,
+    id: '/tag/$tag',
+    path: '/tag/$tag',
+    getParentRoute: () => PublicOwnerRepoReleasesRoute,
   } as any).lazy(() =>
     import('./routes/public/$owner/$repo/releases/tag/$tag.lazy').then(
       (d) => d.Route,
@@ -337,6 +343,7 @@ export interface FileRoutesByFullPath {
   '/admin/jobs/subscriptions/$taskId': typeof AdminJobsSubscriptionsTaskIdRoute
   '/focus/org/$org/releases': typeof FocusOrgOrgReleasesRoute
   '/focus/repo/$owner/$repo': typeof FocusRepoOwnerRepoRouteWithChildren
+  '/public/$owner/$repo/releases': typeof PublicOwnerRepoReleasesRouteWithChildren
   '/$owner/$repo/releases/': typeof OwnerRepoReleasesIndexRoute
   '/focus/org/$org/': typeof FocusOrgOrgIndexRoute
   '/$owner/$repo/releases/tag/$tag': typeof OwnerRepoReleasesTagTagRoute
@@ -370,6 +377,7 @@ export interface FileRoutesByTo {
   '/focus/repos': typeof FocusReposIndexRoute
   '/admin/jobs/subscriptions/$taskId': typeof AdminJobsSubscriptionsTaskIdRoute
   '/focus/org/$org/releases': typeof FocusOrgOrgReleasesRoute
+  '/public/$owner/$repo/releases': typeof PublicOwnerRepoReleasesRouteWithChildren
   '/$owner/$repo/releases': typeof OwnerRepoReleasesIndexRoute
   '/focus/org/$org': typeof FocusOrgOrgIndexRoute
   '/$owner/$repo/releases/tag/$tag': typeof OwnerRepoReleasesTagTagRoute
@@ -412,6 +420,7 @@ export interface FileRoutesById {
   '/admin/jobs/subscriptions/$taskId': typeof AdminJobsSubscriptionsTaskIdRoute
   '/focus/org/$org/releases': typeof FocusOrgOrgReleasesRoute
   '/focus/repo/$owner/$repo': typeof FocusRepoOwnerRepoRouteWithChildren
+  '/public/$owner/$repo/releases': typeof PublicOwnerRepoReleasesRouteWithChildren
   '/$owner/$repo/releases/': typeof OwnerRepoReleasesIndexRoute
   '/focus/org/$org/': typeof FocusOrgOrgIndexRoute
   '/$owner/$repo/releases/tag/$tag': typeof OwnerRepoReleasesTagTagRoute
@@ -455,6 +464,7 @@ export interface FileRouteTypes {
     | '/admin/jobs/subscriptions/$taskId'
     | '/focus/org/$org/releases'
     | '/focus/repo/$owner/$repo'
+    | '/public/$owner/$repo/releases'
     | '/$owner/$repo/releases/'
     | '/focus/org/$org/'
     | '/$owner/$repo/releases/tag/$tag'
@@ -488,6 +498,7 @@ export interface FileRouteTypes {
     | '/focus/repos'
     | '/admin/jobs/subscriptions/$taskId'
     | '/focus/org/$org/releases'
+    | '/public/$owner/$repo/releases'
     | '/$owner/$repo/releases'
     | '/focus/org/$org'
     | '/$owner/$repo/releases/tag/$tag'
@@ -529,6 +540,7 @@ export interface FileRouteTypes {
     | '/admin/jobs/subscriptions/$taskId'
     | '/focus/org/$org/releases'
     | '/focus/repo/$owner/$repo'
+    | '/public/$owner/$repo/releases'
     | '/$owner/$repo/releases/'
     | '/focus/org/$org/'
     | '/$owner/$repo/releases/tag/$tag'
@@ -554,7 +566,7 @@ export interface RootRouteChildren {
   OwnerRepoReleasesRoute: typeof OwnerRepoReleasesRouteWithChildren
   FocusOrgOrgRoute: typeof FocusOrgOrgRouteWithChildren
   FocusRepoOwnerRepoRoute: typeof FocusRepoOwnerRepoRouteWithChildren
-  PublicOwnerRepoReleasesTagTagRoute: typeof PublicOwnerRepoReleasesTagTagRoute
+  PublicOwnerRepoReleasesRoute: typeof PublicOwnerRepoReleasesRouteWithChildren
 }
 
 declare module '@tanstack/react-router' {
@@ -762,6 +774,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof OwnerRepoReleasesIndexRouteImport
       parentRoute: typeof OwnerRepoReleasesRoute
     }
+    '/public/$owner/$repo/releases': {
+      id: '/public/$owner/$repo/releases'
+      path: '/public/$owner/$repo/releases'
+      fullPath: '/public/$owner/$repo/releases'
+      preLoaderRoute: typeof PublicOwnerRepoReleasesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/focus/repo/$owner/$repo': {
       id: '/focus/repo/$owner/$repo'
       path: '/focus/repo/$owner/$repo'
@@ -820,10 +839,10 @@ declare module '@tanstack/react-router' {
     }
     '/public/$owner/$repo/releases/tag/$tag': {
       id: '/public/$owner/$repo/releases/tag/$tag'
-      path: '/public/$owner/$repo/releases/tag/$tag'
+      path: '/tag/$tag'
       fullPath: '/public/$owner/$repo/releases/tag/$tag'
       preLoaderRoute: typeof PublicOwnerRepoReleasesTagTagRouteImport
-      parentRoute: typeof rootRouteImport
+      parentRoute: typeof PublicOwnerRepoReleasesRoute
     }
     '/admin/jobs/tasks/$taskId/llm/$callId': {
       id: '/admin/jobs/tasks/$taskId/llm/$callId'
@@ -975,6 +994,20 @@ const FocusRepoOwnerRepoRouteChildren: FocusRepoOwnerRepoRouteChildren = {
 const FocusRepoOwnerRepoRouteWithChildren =
   FocusRepoOwnerRepoRoute._addFileChildren(FocusRepoOwnerRepoRouteChildren)
 
+interface PublicOwnerRepoReleasesRouteChildren {
+  PublicOwnerRepoReleasesTagTagRoute: typeof PublicOwnerRepoReleasesTagTagRoute
+}
+
+const PublicOwnerRepoReleasesRouteChildren: PublicOwnerRepoReleasesRouteChildren =
+  {
+    PublicOwnerRepoReleasesTagTagRoute: PublicOwnerRepoReleasesTagTagRoute,
+  }
+
+const PublicOwnerRepoReleasesRouteWithChildren =
+  PublicOwnerRepoReleasesRoute._addFileChildren(
+    PublicOwnerRepoReleasesRouteChildren,
+  )
+
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AdminRouteRoute: AdminRouteRouteWithChildren,
@@ -990,7 +1023,7 @@ const rootRouteChildren: RootRouteChildren = {
   OwnerRepoReleasesRoute: OwnerRepoReleasesRouteWithChildren,
   FocusOrgOrgRoute: FocusOrgOrgRouteWithChildren,
   FocusRepoOwnerRepoRoute: FocusRepoOwnerRepoRouteWithChildren,
-  PublicOwnerRepoReleasesTagTagRoute: PublicOwnerRepoReleasesTagTagRoute,
+  PublicOwnerRepoReleasesRoute: PublicOwnerRepoReleasesRouteWithChildren,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

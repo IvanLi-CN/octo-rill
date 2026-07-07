@@ -17,6 +17,7 @@
 - [x] `/focus/mine` summary 使用后端个人仓库总数与右侧完整仓库列表，不再从当前 feed 首屏去重倒推
 - [x] `/focus/mine` feed 使用同一 viewer owner repo baseline 作为聚焦范围，仍只展示真实动态
 - [x] scoped shell：双 tab + summary sidebar/mobile summary + empty state
+- [x] 单仓 focus 摘要卡公开 Release 页入口与 private owner repo 发布/取消发布控件
 - [x] scoped `全部` 页隐藏按日“生成日报”动作，并在 scoped 渲染时屏蔽全局页遗留的 pending/error 生成状态，保留历史原始列表阅读
 - [x] Storybook page/app-shell fallback 场景
 - [x] E2E 覆盖与最终视觉证据
@@ -39,3 +40,6 @@
   - `pages-dashboard--scoped-focus-empty-state`
   - `pages-dashboard--scoped-focus-mine-menu-entry-visible`
   - `pages-dashboard--scoped-focus-mine-personal-repos`
+  - `dashboard-repopublicreleasecontrols--public-repo`
+  - `dashboard-repopublicreleasecontrols--private-unpublished`
+  - `dashboard-repopublicreleasecontrols--private-published`

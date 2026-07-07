@@ -4,10 +4,14 @@ import { ArrowDownToLine, RefreshCcw, WifiOff } from "lucide-react";
 import {
 	type MeResponse,
 	type PersonalReposResponse,
+	type RepoPublicReleasePublicationStatusResponse,
 	ApiError,
 	apiGet,
+	apiGetRepoPublicReleasePublication,
 	apiPost,
 	apiPostJson,
+	apiPublishRepoPublicRelease,
+	apiUnpublishRepoPublicRelease,
 } from "@/api";
 import {
 	persistDashboardWarmSnapshot,
@@ -74,6 +78,7 @@ import {
 	DASHBOARD_MINE_ENTRY_LABEL,
 	resolveDashboardScopeRepoNames,
 } from "@/dashboard/scopeSummary";
+import { RepoPublicReleaseControls } from "@/dashboard/RepoPublicReleaseControls";
 import {
 	type DashboardLiveUpdateNotice,
 	useDashboardLiveUpdates,
@@ -393,6 +398,16 @@ function resolveSelectedBrief(briefs: BriefItem[], selectedId: string | null) {
 	return briefs[0] ?? null;
 }
 
+function resolveRepoPublicReleaseUrl(
+	status: RepoPublicReleasePublicationStatusResponse | null,
+	scope: DashboardScope,
+) {
+	if (scope.kind !== "repo") return null;
+	const path = status?.public_path ?? `/${scope.owner}/${scope.repo}/releases`;
+	if (typeof window === "undefined") return path;
+	return new URL(path, window.location.origin).toString();
+}
+
 function ScopedSummaryCard(props: {
 	scope: DashboardScope;
 	feedItems: FeedItem[];
@@ -409,6 +424,14 @@ function ScopedSummaryCard(props: {
 		personalReposLoading = false,
 		personalReposError = null,
 	} = props;
+	const { pushErrorToast, pushToast } = useAppToast();
+	const [publicationStatus, setPublicationStatus] =
+		useState<RepoPublicReleasePublicationStatusResponse | null>(null);
+	const [publicationLoading, setPublicationLoading] = useState(false);
+	const [publicationBusy, setPublicationBusy] = useState<
+		"publish" | "unpublish" | null
+	>(null);
+	const [publicationError, setPublicationError] = useState<string | null>(null);
 	const feedRepoNames = Array.from(
 		new Set(
 			feedItems
@@ -433,6 +456,103 @@ function ScopedSummaryCard(props: {
 	const personalRepoItems =
 		scope.kind === "mine" && personalRepos ? personalRepos.repos : [];
 	const visibleRepoNames = repoNames.slice(0, repoChipLimit);
+	const publicReleaseUrl = resolveRepoPublicReleaseUrl(
+		publicationStatus,
+		scope,
+	);
+	const repoScope =
+		scope.kind === "repo"
+			? {
+					owner: scope.owner,
+					repo: scope.repo,
+				}
+			: null;
+
+	useEffect(() => {
+		if (!repoScope) {
+			setPublicationStatus(null);
+			setPublicationError(null);
+			setPublicationLoading(false);
+			return;
+		}
+		let cancelled = false;
+		setPublicationLoading(true);
+		setPublicationError(null);
+		apiGetRepoPublicReleasePublication(repoScope)
+			.then((response) => {
+				if (cancelled) return;
+				setPublicationStatus(response);
+			})
+			.catch((err: unknown) => {
+				if (cancelled) return;
+				const message =
+					err instanceof Error ? err.message : "无法读取公开发布状态";
+				setPublicationError(message);
+			})
+			.finally(() => {
+				if (!cancelled) setPublicationLoading(false);
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [repoScope?.owner, repoScope?.repo]);
+
+	const publishRepo = useCallback(() => {
+		if (!repoScope) return;
+		setPublicationBusy("publish");
+		apiPublishRepoPublicRelease(repoScope)
+			.then((response) => {
+				setPublicationStatus(response);
+				setPublicationError(null);
+				pushToast({
+					title: "公开页已发布",
+					description: "这个私有仓库的 Release 页现在可以匿名访问。",
+				});
+			})
+			.catch((err: unknown) => {
+				pushErrorToast(
+					"发布公开页失败",
+					describeUnknownError(err, "请稍后重试"),
+				);
+			})
+			.finally(() => setPublicationBusy(null));
+	}, [pushErrorToast, pushToast, repoScope]);
+
+	const unpublishRepo = useCallback(() => {
+		if (!repoScope) return;
+		setPublicationBusy("unpublish");
+		apiUnpublishRepoPublicRelease(repoScope)
+			.then((response) => {
+				setPublicationStatus(response);
+				setPublicationError(null);
+				pushToast({
+					title: "公开页已取消",
+					description: "未登录用户将不再能访问这个私有仓库的 Release 页。",
+				});
+			})
+			.catch((err: unknown) => {
+				pushErrorToast("取消发布失败", describeUnknownError(err, "请稍后重试"));
+			})
+			.finally(() => setPublicationBusy(null));
+	}, [pushErrorToast, pushToast, repoScope]);
+
+	const copyPublicReleaseUrl = useCallback(() => {
+		if (!publicReleaseUrl) return;
+		void navigator.clipboard
+			.writeText(publicReleaseUrl)
+			.then(() => {
+				pushToast({
+					title: "地址已复制",
+					description: publicReleaseUrl,
+				});
+			})
+			.catch((err: unknown) => {
+				pushErrorToast(
+					"复制地址失败",
+					describeUnknownError(err, "请手动复制地址"),
+				);
+			});
+	}, [publicReleaseUrl, pushErrorToast, pushToast]);
 
 	return (
 		<div
@@ -578,6 +698,19 @@ function ScopedSummaryCard(props: {
 						</span>
 					) : null}
 				</div>
+			) : null}
+
+			{scope.kind === "repo" ? (
+				<RepoPublicReleaseControls
+					status={publicationStatus}
+					publicUrl={publicReleaseUrl}
+					loading={publicationLoading}
+					busy={publicationBusy}
+					error={publicationError}
+					onPublish={publishRepo}
+					onUnpublish={unpublishRepo}
+					onCopy={copyPublicReleaseUrl}
+				/>
 			) : null}
 		</div>
 	);

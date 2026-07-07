@@ -498,6 +498,7 @@ struct StarredEdge {
 struct OwnedRepoNode {
     database_id: Option<i64>,
     name_with_owner: String,
+    is_private: bool,
     stargazer_count: Option<i64>,
     open_graph_image_url: Option<String>,
     uses_custom_open_graph_image: Option<bool>,
@@ -566,6 +567,7 @@ struct GitHubActor {
 struct OwnedRepoSnapshot {
     repo_id: i64,
     full_name: String,
+    is_private: bool,
     repo_stargazer_count: Option<i64>,
     owner_avatar_url: Option<String>,
     open_graph_image_url: Option<String>,
@@ -2800,6 +2802,7 @@ async fn upsert_owned_repo_star_baseline_tx(
           user_id,
           repo_id,
           repo_full_name,
+          is_private,
           repo_stargazer_count,
           repo_stargazer_count_updated_at,
           owner_avatar_url,
@@ -2809,9 +2812,10 @@ async fn upsert_owned_repo_star_baseline_tx(
           initialized_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, repo_id) DO UPDATE
         SET repo_full_name = excluded.repo_full_name,
+            is_private = excluded.is_private,
             repo_stargazer_count = excluded.repo_stargazer_count,
             repo_stargazer_count_updated_at = excluded.repo_stargazer_count_updated_at,
             owner_avatar_url = excluded.owner_avatar_url,
@@ -2825,6 +2829,7 @@ async fn upsert_owned_repo_star_baseline_tx(
     .bind(user_id)
     .bind(repo.repo_id)
     .bind(repo.full_name.as_str())
+    .bind(repo.is_private as i64)
     .bind(repo.repo_stargazer_count)
     .bind(repo.repo_stargazer_count.map(|_| now))
     .bind(repo.owner_avatar_url.as_deref())
@@ -6730,31 +6735,12 @@ async fn execute_repo_release_work_item(
     state: &AppState,
     work_item: &RepoReleaseWorkItemRow,
 ) -> Result<(RepoReleaseWriteStats, usize)> {
-    let public_usage_repo = public_release_usage_repo_exists(state, work_item.repo_id).await?;
-    let candidates = sqlx::query_as::<_, ReleaseCandidateUserRow>(
-        r#"
-        SELECT DISTINCT u.id AS user_id, u.last_active_at
-        FROM user_release_visible_repos sr
-        JOIN users u ON u.id = sr.user_id
-        WHERE sr.repo_id = ?
-          AND u.is_disabled = 0
-        ORDER BY
-          CASE WHEN u.last_active_at IS NULL THEN 1 ELSE 0 END ASC,
-          u.last_active_at DESC,
-          u.id ASC
-        "#,
-    )
-    .bind(work_item.repo_id)
-    .fetch_all(&state.pool)
-    .await
-    .with_context(|| {
-        format!(
-            "failed to load repo release candidates for {}",
-            work_item.repo_full_name
-        )
-    })?;
+    let public_usage = load_public_release_usage_sync_access(state, work_item.repo_id).await?;
+    let candidates =
+        load_repo_release_candidate_users(state, work_item.repo_id, &work_item.repo_full_name)
+            .await?;
 
-    if candidates.is_empty() && !public_usage_repo {
+    if candidates.is_empty() && !public_usage.exists {
         return Err(anyhow!(
             "no active candidate users remain for {}",
             work_item.repo_full_name
@@ -6763,6 +6749,7 @@ async fn execute_repo_release_work_item(
 
     let mut candidate_failures = 0usize;
     let mut authenticated_stats: Option<RepoReleaseWriteStats> = None;
+    let mut last_authenticated_error: Option<SyncRequestError> = None;
     'candidate_users: for candidate in candidates {
         for attempt in 1..=SUBSCRIPTION_RETRY_LIMIT {
             match fetch_repo_releases_for_user(
@@ -6787,7 +6774,7 @@ async fn execute_repo_release_work_item(
                         &stats,
                     )
                     .await?;
-                    if public_usage_repo {
+                    if public_usage.exists {
                         authenticated_stats = Some(stats);
                         break 'candidate_users;
                     }
@@ -6806,7 +6793,7 @@ async fn execute_repo_release_work_item(
                         &stats,
                     )
                     .await?;
-                    if public_usage_repo {
+                    if public_usage.exists {
                         authenticated_stats = Some(stats);
                         break 'candidate_users;
                     }
@@ -6814,17 +6801,19 @@ async fn execute_repo_release_work_item(
                 }
                 Err(err) if err.retryable && attempt < SUBSCRIPTION_RETRY_LIMIT => {
                     candidate_failures += 1;
+                    last_authenticated_error = Some(err.clone());
                     tokio::time::sleep(subscription_retry_delay(attempt)).await;
                 }
-                Err(_) => {
+                Err(err) => {
                     candidate_failures += 1;
+                    last_authenticated_error = Some(err);
                     break;
                 }
             }
         }
     }
 
-    if public_usage_repo {
+    if public_usage.needs_public_fallback {
         match fetch_repo_releases_public(
             state,
             work_item.repo_id,
@@ -6890,16 +6879,90 @@ async fn execute_repo_release_work_item(
         }
     }
 
+    if let Some(stats) = authenticated_stats {
+        mark_public_release_usage_sync_success(state, work_item.repo_id).await?;
+        return Ok((stats, candidate_failures));
+    }
+
+    if public_usage.exists && !public_usage.needs_public_fallback {
+        let error = last_authenticated_error.unwrap_or_else(|| {
+            SyncRequestError::non_retryable(
+                "no_authenticated_release_candidate",
+                format!(
+                    "no active authenticated candidate users remain for {}",
+                    work_item.repo_full_name
+                ),
+                None,
+            )
+        });
+        mark_public_release_usage_sync_failure(state, work_item.repo_id, &error).await?;
+    }
+
     Err(anyhow!(
         "all candidate users failed to sync {}",
         work_item.repo_full_name
     ))
 }
 
-async fn public_release_usage_repo_exists(state: &AppState, repo_id: i64) -> Result<bool> {
-    let count = sqlx::query_scalar::<_, i64>(
+async fn load_repo_release_candidate_users(
+    state: &AppState,
+    repo_id: i64,
+    repo_full_name: &str,
+) -> Result<Vec<ReleaseCandidateUserRow>> {
+    sqlx::query_as::<_, ReleaseCandidateUserRow>(
         r#"
-        SELECT COUNT(*)
+        SELECT DISTINCT u.id AS user_id, u.last_active_at
+        FROM users u
+        WHERE u.is_disabled = 0
+          AND (
+            EXISTS (
+              SELECT 1
+              FROM user_release_visible_repos sr
+              WHERE sr.user_id = u.id
+                AND sr.repo_id = ?
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM public_repo_release_usage pu
+              WHERE pu.repo_id = ?
+                AND pu.access_kind = 'private_owner_published'
+                AND pu.published_by_user_id = u.id
+                AND pu.last_sync_status != 'inaccessible'
+            )
+          )
+        ORDER BY
+          CASE WHEN u.last_active_at IS NULL THEN 1 ELSE 0 END ASC,
+          u.last_active_at DESC,
+          u.id ASC
+        "#,
+    )
+    .bind(repo_id)
+    .bind(repo_id)
+    .fetch_all(&state.pool)
+    .await
+    .with_context(|| {
+        format!(
+            "failed to load repo release candidates for {}",
+            repo_full_name
+        )
+    })
+}
+
+#[derive(Debug, Default)]
+struct PublicReleaseUsageSyncAccess {
+    exists: bool,
+    needs_public_fallback: bool,
+}
+
+async fn load_public_release_usage_sync_access(
+    state: &AppState,
+    repo_id: i64,
+) -> Result<PublicReleaseUsageSyncAccess> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+          COUNT(*) AS total_count,
+          COALESCE(SUM(CASE WHEN access_kind = 'github_public' THEN 1 ELSE 0 END), 0) AS public_count
         FROM public_repo_release_usage
         WHERE repo_id = ?
           AND last_sync_status != 'inaccessible'
@@ -6909,7 +6972,12 @@ async fn public_release_usage_repo_exists(state: &AppState, repo_id: i64) -> Res
     .fetch_one(&state.pool)
     .await
     .context("failed to query public release usage repo")?;
-    Ok(count > 0)
+    let total_count = row.get::<i64, _>("total_count");
+    let public_count = row.get::<i64, _>("public_count");
+    Ok(PublicReleaseUsageSyncAccess {
+        exists: total_count > 0,
+        needs_public_fallback: public_count > 0,
+    })
 }
 
 async fn mark_public_release_usage_sync_success(state: &AppState, repo_id: i64) -> Result<()> {
@@ -8311,6 +8379,7 @@ async fn fetch_owned_repo_snapshot(
             nodes {
               databaseId
               nameWithOwner
+              isPrivate
               stargazerCount
               openGraphImageUrl
               usesCustomOpenGraphImage
@@ -8404,6 +8473,7 @@ fn owned_repo_snapshot_from_node(
     Some(OwnedRepoSnapshot {
         repo_id,
         full_name: node.name_with_owner,
+        is_private: node.is_private,
         repo_stargazer_count: node.stargazer_count,
         owner_avatar_url: node.owner.avatar_url,
         open_graph_image_url: node.open_graph_image_url,
@@ -8991,6 +9061,7 @@ async fn insert_feed_activity_events(
         let repo_visual = event.repo_id.map(|repo_id| OwnedRepoSnapshot {
             repo_id,
             full_name: event.repo_full_name.clone().unwrap_or_default(),
+            is_private: false,
             repo_stargazer_count: None,
             owner_avatar_url: None,
             open_graph_image_url: None,
@@ -10451,17 +10522,19 @@ mod tests {
         apply_social_activity_snapshot_with_options, attach_and_wait_for_user_release_demand,
         attach_release_demand, claim_next_repo_release_work_item, classify_github_http_error,
         cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
-        discussion_announcement_from_node, execute_subscription_prune_phases,
-        expire_repo_release_deadlines, fail_repo_release_work_item,
-        feed_activity_event_from_github, fetch_repo_releases_with_optional_token,
-        hydrate_repo_refresh_candidates, insert_feed_activity_events,
-        insert_social_activity_event_tx, install_social_activity_snapshot_after_reads_hook,
-        is_terminal_notification_thread_error, owned_repo_snapshot_from_node,
-        process_repo_release_work_item, prune_subscription_sync_history,
-        rebuild_repo_refresh_governance_snapshots, record_repo_refresh_governance_attempt,
-        record_repo_release_sync_success, recover_repo_release_runtime_state_on_startup,
-        replace_starred_repos, repo_release_deadline_at, resolve_notification_open_url,
-        store_sync_state_value, subscription_event_counts_as_critical, subscription_timeout_error,
+        discussion_announcement_from_node, execute_repo_release_work_item,
+        execute_subscription_prune_phases, expire_repo_release_deadlines,
+        fail_repo_release_work_item, feed_activity_event_from_github,
+        fetch_repo_releases_with_optional_token, hydrate_repo_refresh_candidates,
+        insert_feed_activity_events, insert_social_activity_event_tx,
+        install_social_activity_snapshot_after_reads_hook, is_terminal_notification_thread_error,
+        load_public_release_usage_sync_access, load_repo_release_candidate_users,
+        owned_repo_snapshot_from_node, process_repo_release_work_item,
+        prune_subscription_sync_history, rebuild_repo_refresh_governance_snapshots,
+        record_repo_refresh_governance_attempt, record_repo_release_sync_success,
+        recover_repo_release_runtime_state_on_startup, replace_starred_repos,
+        repo_release_deadline_at, resolve_notification_open_url, store_sync_state_value,
+        subscription_event_counts_as_critical, subscription_timeout_error,
         sync_notifications_with_fetch, sync_starred_for_user_with_fetch, upsert_notifications,
         upsert_repo_releases, upsert_starred_repos, wait_for_release_demand,
     };
@@ -10500,6 +10573,7 @@ mod tests {
             OwnedRepoNode {
                 database_id: Some(42),
                 name_with_owner: "octo/rocket".to_owned(),
+                is_private: true,
                 stargazer_count: None,
                 open_graph_image_url: Some(
                     "https://repository-images.githubusercontent.com/42/rocket".to_owned(),
@@ -10516,6 +10590,7 @@ mod tests {
 
         assert_eq!(snapshot.repo_id, 42);
         assert_eq!(snapshot.full_name, "octo/rocket");
+        assert!(snapshot.is_private);
         assert_eq!(
             snapshot.owner_avatar_url.as_deref(),
             Some("https://avatars.githubusercontent.com/u/42")
@@ -10533,6 +10608,7 @@ mod tests {
             OwnedRepoNode {
                 database_id: Some(42),
                 name_with_owner: "octo/rocket".to_owned(),
+                is_private: false,
                 stargazer_count: None,
                 open_graph_image_url: Some(
                     "https://repository-images.githubusercontent.com/42/rocket".to_owned(),
@@ -10556,6 +10632,7 @@ mod tests {
             OwnedRepoNode {
                 database_id: Some(99),
                 name_with_owner: "acme/shared".to_owned(),
+                is_private: false,
                 stargazer_count: None,
                 open_graph_image_url: Some(
                     "https://repository-images.githubusercontent.com/99/shared".to_owned(),
@@ -10577,6 +10654,7 @@ mod tests {
         let node: OwnedRepoNode = serde_json::from_value(json!({
             "databaseId": 42,
             "nameWithOwner": "octo/rocket",
+            "isPrivate": false,
             "openGraphImageUrl": "https://repository-images.githubusercontent.com/42/rocket",
             "usesCustomOpenGraphImage": null,
             "owner": {
@@ -12993,6 +13071,7 @@ mod tests {
             &[OwnedRepoSnapshot {
                 repo_id: 42,
                 full_name: "octo/alpha".to_owned(),
+                is_private: false,
                 owner_avatar_url: None,
                 open_graph_image_url: None,
                 uses_custom_open_graph_image: false,
@@ -13002,6 +13081,7 @@ mod tests {
                 OwnedRepoSnapshot {
                     repo_id: 42,
                     full_name: "octo/alpha".to_owned(),
+                    is_private: false,
                     owner_avatar_url: None,
                     open_graph_image_url: None,
                     uses_custom_open_graph_image: false,
@@ -13174,6 +13254,7 @@ mod tests {
         let repo = OwnedRepoSnapshot {
             repo_id: 42,
             full_name: "octo/alpha".to_owned(),
+            is_private: false,
             owner_avatar_url: Some("https://avatars.example/octo.png".to_owned()),
             open_graph_image_url: Some(
                 "https://repository-images.githubusercontent.com/42/alpha".to_owned(),
@@ -13496,6 +13577,7 @@ mod tests {
         let repo = OwnedRepoSnapshot {
             repo_id: 42,
             full_name: "octo/alpha".to_owned(),
+            is_private: false,
             owner_avatar_url: Some("https://avatars.example/octo.png".to_owned()),
             open_graph_image_url: Some(
                 "https://repository-images.githubusercontent.com/42/alpha".to_owned(),
@@ -13730,6 +13812,7 @@ mod tests {
         let repo = OwnedRepoSnapshot {
             repo_id: 42,
             full_name: "octo/alpha".to_owned(),
+            is_private: false,
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
@@ -13842,6 +13925,7 @@ mod tests {
         let repo = OwnedRepoSnapshot {
             repo_id: 42,
             full_name: "octo/alpha".to_owned(),
+            is_private: false,
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
@@ -14000,6 +14084,7 @@ mod tests {
         let repo = OwnedRepoSnapshot {
             repo_id: 42,
             full_name: "octo/alpha".to_owned(),
+            is_private: false,
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
@@ -14123,6 +14208,7 @@ mod tests {
         let repo = OwnedRepoSnapshot {
             repo_id: 42,
             full_name: "octo/alpha".to_owned(),
+            is_private: false,
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
@@ -14609,6 +14695,7 @@ mod tests {
             OwnedRepoSnapshot {
                 repo_id: 42,
                 full_name: "octo/fail".to_owned(),
+                is_private: false,
                 owner_avatar_url: None,
                 open_graph_image_url: None,
                 uses_custom_open_graph_image: false,
@@ -14617,6 +14704,7 @@ mod tests {
             OwnedRepoSnapshot {
                 repo_id: 43,
                 full_name: "octo/pass".to_owned(),
+                is_private: false,
                 owner_avatar_url: None,
                 open_graph_image_url: None,
                 uses_custom_open_graph_image: false,
@@ -14663,6 +14751,7 @@ mod tests {
             OwnedRepoSnapshot {
                 repo_id: 42,
                 full_name: "octo/alpha".to_owned(),
+                is_private: false,
                 owner_avatar_url: None,
                 open_graph_image_url: None,
                 uses_custom_open_graph_image: false,
@@ -14671,6 +14760,7 @@ mod tests {
             OwnedRepoSnapshot {
                 repo_id: 43,
                 full_name: "octo/beta".to_owned(),
+                is_private: false,
                 owner_avatar_url: None,
                 open_graph_image_url: None,
                 uses_custom_open_graph_image: false,
@@ -14737,6 +14827,7 @@ mod tests {
         let stable_repo = OwnedRepoSnapshot {
             repo_id: 42,
             full_name: "octo/alpha".to_owned(),
+            is_private: false,
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
@@ -14745,6 +14836,7 @@ mod tests {
         let skipped_repo = OwnedRepoSnapshot {
             repo_id: 43,
             full_name: "octo/beta".to_owned(),
+            is_private: false,
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
@@ -14914,6 +15006,7 @@ mod tests {
         let initial_repo = OwnedRepoSnapshot {
             repo_id: 42,
             full_name: "octo/alpha".to_owned(),
+            is_private: false,
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
@@ -14922,6 +15015,7 @@ mod tests {
         let new_repo = OwnedRepoSnapshot {
             repo_id: 43,
             full_name: "octo/beta".to_owned(),
+            is_private: false,
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
@@ -15011,6 +15105,7 @@ mod tests {
         let first_repo = OwnedRepoSnapshot {
             repo_id: 44,
             full_name: "octo/first".to_owned(),
+            is_private: false,
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
@@ -15068,6 +15163,7 @@ mod tests {
         let initial_repo = OwnedRepoSnapshot {
             repo_id: 42,
             full_name: "octo/alpha".to_owned(),
+            is_private: false,
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
@@ -15076,6 +15172,7 @@ mod tests {
         let new_repo = OwnedRepoSnapshot {
             repo_id: 43,
             full_name: "octo/beta".to_owned(),
+            is_private: false,
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
@@ -15174,6 +15271,7 @@ mod tests {
         let stable_repo = OwnedRepoSnapshot {
             repo_id: 42,
             full_name: "octo/stable".to_owned(),
+            is_private: false,
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
@@ -15182,6 +15280,7 @@ mod tests {
         let churn_repo = OwnedRepoSnapshot {
             repo_id: 43,
             full_name: "octo/churn".to_owned(),
+            is_private: false,
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: false,
@@ -15349,6 +15448,185 @@ mod tests {
         assert_eq!(result.failed, 1);
         assert_eq!(result.releases, 0);
         assert_eq!(result.candidate_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn public_release_usage_sync_access_skips_public_fallback_for_private_publish() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-03-06T12:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO public_repo_release_usage (
+              id,
+              repo_id,
+              owner_login,
+              repo_name,
+              full_name,
+              full_name_lower,
+              first_registered_at,
+              last_requested_at,
+              last_sync_status,
+              access_kind,
+              published_by_user_id,
+              published_at,
+              created_at,
+              updated_at
+            )
+            VALUES (?, 42, 'octo', 'private', 'octo/private', 'octo/private', ?, ?, 'pending', 'private_owner_published', ?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(now)
+        .bind(now)
+        .bind("user-1")
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed private publish usage");
+
+        let private_access = load_public_release_usage_sync_access(state.as_ref(), 42)
+            .await
+            .expect("load private publish access");
+        assert!(private_access.exists);
+        assert!(!private_access.needs_public_fallback);
+
+        sqlx::query(
+            r#"
+            UPDATE public_repo_release_usage
+            SET access_kind = 'github_public'
+            WHERE repo_id = 42
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("switch to github public usage");
+        let public_access = load_public_release_usage_sync_access(state.as_ref(), 42)
+            .await
+            .expect("load github public access");
+        assert!(public_access.exists);
+        assert!(public_access.needs_public_fallback);
+    }
+
+    #[tokio::test]
+    async fn repo_release_candidates_include_private_publish_owner_without_visibility() {
+        let pool = setup_pool().await;
+        seed_user(&pool, "publisher-user").await;
+        let state = setup_state(pool.clone());
+        let now = "2026-03-06T12:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO public_repo_release_usage (
+              id,
+              repo_id,
+              owner_login,
+              repo_name,
+              full_name,
+              full_name_lower,
+              first_registered_at,
+              last_requested_at,
+              last_sync_status,
+              access_kind,
+              published_by_user_id,
+              published_at,
+              created_at,
+              updated_at
+            )
+            VALUES (?, 77, 'octo', 'private', 'octo/private', 'octo/private', ?, ?, 'pending', 'private_owner_published', 'publisher-user', ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed private publish usage");
+
+        let candidates = load_repo_release_candidate_users(state.as_ref(), 77, "octo/private")
+            .await
+            .expect("load release candidates");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].user_id, "publisher-user");
+    }
+
+    #[tokio::test]
+    async fn private_public_release_sync_failure_marks_usage_failed_without_candidates() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-03-06T12:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO public_repo_release_usage (
+              id,
+              repo_id,
+              owner_login,
+              repo_name,
+              full_name,
+              full_name_lower,
+              first_registered_at,
+              last_requested_at,
+              last_sync_status,
+              access_kind,
+              published_by_user_id,
+              published_at,
+              created_at,
+              updated_at
+            )
+            VALUES (?, 78, 'octo', 'private', 'octo/private', 'octo/private', ?, ?, 'pending', 'private_owner_published', 'missing-user', ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed private publish usage without candidate");
+
+        let work_item = RepoReleaseWorkItemRow {
+            id: "repo-work-private-no-candidate".to_owned(),
+            repo_id: 78,
+            repo_full_name: "octo/private".to_owned(),
+            status: jobs::STATUS_QUEUED.to_owned(),
+            request_origin: RepoReleaseOrigin::Interactive.as_str().to_owned(),
+            priority: RepoReleaseOrigin::Interactive.priority(),
+            has_new_repo_watchers: 0,
+            deadline_at: "2999-01-01T00:00:00Z".to_owned(),
+            last_success_at: None,
+            started_at: None,
+        };
+
+        let err = execute_repo_release_work_item(state.as_ref(), &work_item)
+            .await
+            .expect_err("private publish without candidates should fail");
+        assert!(
+            err.to_string()
+                .contains("all candidate users failed to sync octo/private")
+        );
+        let row: (String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT last_sync_status, last_sync_error
+            FROM public_repo_release_usage
+            WHERE repo_id = 78
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("private usage status");
+        assert_eq!(row.0, "failed");
+        assert!(
+            row.1
+                .as_deref()
+                .is_some_and(|error| error.contains("no_authenticated_release_candidate"))
+        );
     }
 
     #[tokio::test]

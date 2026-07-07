@@ -10,6 +10,9 @@
 
 - 提供未登录可访问的公开 Release 列表页与详情页。
 - 提供未登录 REST API：公开仓库 Release 列表与 tag 详情。
+- GitHub public repo 默认可通过 `/:owner/:repo/releases` 访问，不需要用户发布。
+- 当前 GitHub viewer-owned personal private repo 可由拥有者登录后显式发布，发布后复用同一个公开 Release 落地页 `/:owner/:repo/releases`；取消发布后匿名访问不得继续暴露该私有仓库内容。
+- `/public/:owner/:repo/releases` 作为旧列表路径兼容入口，必须 replace 跳转到 `/:owner/:repo/releases`。
 - 公开 Release 页面页脚展示当前 OctoRill 前端加载版本，并链接到 OctoRill 自身 public-only Release 详情页，登录态不得把该链接切到 Dashboard。
 - 首次访问先登记仓库 usage；若本地已有近期刷新且明确公开的仓库 metadata 与非草稿 Release 缓存，则直接复用共享缓存返回 ready；若只有近期公开 metadata 但尚无 Release 缓存，则回填 `repo_id` 并返回可重试 pending 响应；若本地无法确认近期公开 metadata，则返回 metadata pending。
 - 公开端点与登录用户视图复用同一份仓库级 `repo_releases` 主数据。
@@ -18,7 +21,9 @@
 ### Non-goals
 
 - 不为首次访问做请求内 GitHub 拉取。
-- 不开放私有仓库或用户私有 viewer 状态。
+- 不开放未由拥有者显式发布的私有仓库或用户私有 viewer 状态。
+- 不开放组织私有仓库发布。
+- 不新增 `/repo/:owner/:repo`。
 - 不复制 Release 主数据到 public-only 表。
 - 删除公开登记记录时不清理仍被登录用户视图或其他公开登记使用的共享缓存。
 - 不新增除 `zh-CN` 以外的翻译语言。
@@ -37,6 +42,21 @@
   - `202`: 仓库登记或同步尚未完成。
   - `404 release_not_found_or_not_cached`: 仓库已有同步结果但指定 tag 未命中。
 
+- `GET /api/repos/{owner}/{repo}/public-release`
+  - 登录会话 required。
+  - 返回当前仓库公开 Release 页状态、canonical `public_path`、是否可发布/取消发布。
+  - GitHub public repo 返回 `publication_state=github_public`；viewer-owned private repo 未发布返回 `private_owner_unpublished`。
+
+- `POST /api/repos/{owner}/{repo}/public-release`
+  - 登录会话 required。
+  - 仅允许当前 viewer-owned personal private repo。
+  - 创建或更新 `private_owner_published` usage，并按需触发 Release 同步。
+
+- `DELETE /api/repos/{owner}/{repo}/public-release`
+  - 登录会话 required。
+  - 仅允许当前 viewer-owned personal private repo。
+  - 删除 `private_owner_published` usage；共享缓存只在无其他公开 usage、登录用户可见性或 brief 引用时清理。
+
 - `GET /api/admin/public-release-repos`
   - 管理员会话 required。
   - 返回登记仓库、访问计数、同步状态、release 数量、翻译/润色 ready/missing 数量。
@@ -48,7 +68,8 @@
 
 ## 数据契约
 
-- `public_repo_release_usage` 只保存登记、统计、`repo_id` 映射、同步状态和错误。
+- `public_repo_release_usage` 只保存登记、统计、`repo_id` 映射、同步状态和错误，并通过 `access_kind` 区分 `github_public` 与 `private_owner_published`。
+- `private_owner_published` usage 必须记录发布者与发布时间；匿名公开 API 只有在该 usage 存在且未撤销时才可读取私有 repo 的共享 `repo_releases`。
 - Release 主数据只写入并读取 `repo_releases`。
 - 全局 `sync.subscriptions` 将已登记公开仓库纳入现有 repo release queue；没有用户 token 候选时可对公开仓库使用匿名 GitHub REST fallback。
 
@@ -57,6 +78,26 @@
 - Given 未登录用户首次访问公开列表页
   When 仓库尚未缓存
   Then 页面展示等待同步状态并自动重试。
+
+- Given 未登录用户访问 GitHub public repo 的 `/:owner/:repo/releases`
+  When 该 repo 尚未由任何用户手动发布
+  Then 仍按公开仓库默认流程登记 usage，并返回 ready 或可重试 pending。
+
+- Given 未登录用户访问未发布的 private owner repo `/:owner/:repo/releases`
+  When 服务端无法找到有效 `private_owner_published` usage
+  Then 不得返回该私有仓库 Release 内容。
+
+- Given private owner repo 已发布
+  When 未登录用户访问 `/:owner/:repo/releases`
+  Then 可读取同一份共享 `repo_releases` 列表或 pending sync 状态。
+
+- Given private owner repo 取消发布
+  When 未登录用户再次访问 `/:owner/:repo/releases`
+  Then 不再暴露该私有仓库内容。
+
+- Given 用户访问 `/public/:owner/:repo/releases`
+  When 前端路由加载
+  Then replace 跳转到 `/:owner/:repo/releases`；`/public/:owner/:repo/releases/tag/:tag` 详情路径不被该跳转拦截。
 
 - Given 未登录用户在移动端访问公开 Release 列表或详情页
   When 页脚可见
@@ -130,3 +171,17 @@
   PR: include
   image:
   ![管理后台公开端点仓库删除确认](./assets/public-release-evidence-admin-v1.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  route: `/public/IvanLi-CN/octo-rill/releases`
+  final_url: `/IvanLi-CN/octo-rill/releases`
+  viewport: `1440x1000`
+  state: `legacy-public-release-route-redirect`
+  evidence_note: 验证旧 `/public/:owner/:repo/releases` 列表路径不再进入前端 404，而是 replace 到 canonical `/:owner/:repo/releases` 并展示公开 Release 落地页；public-only tag 详情路由语义不受此截图覆盖，由路由测试覆盖。
+  PR: include
+  image:
+  ![公开 Release 旧列表路径跳转到 canonical 落地页](./assets/public-release-legacy-redirect-browser-1440x1000.png)
