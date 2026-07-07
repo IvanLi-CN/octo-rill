@@ -216,6 +216,21 @@ export type MeResponse = {
 		include_own_releases: boolean;
 	};
 };
+export type PersonalRepoItem = {
+	repo_id: number;
+	full_name: string;
+	owner_login: string;
+	name: string;
+	html_url: string;
+	updated_at: string;
+	release_count: number;
+	repo_visual: RepoVisual | null;
+};
+export type PersonalReposResponse = {
+	owner_login: string;
+	total_count: number;
+	repos: PersonalRepoItem[];
+};
 export type DashboardUpdateList = {
 	changed: boolean;
 	new_count: number;

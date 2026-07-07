@@ -69,6 +69,7 @@
 - 开关关闭时：用户只能看到真实加星仓库的 Release。
 - 开关开启时：当前 GitHub 账号本人 owner 的个人仓库 Release 会像已加星仓库一样进入 Release 阅读面。
 - 该开关只影响 Release 维度，不影响 `加星` tab、`/api/starred` 与社交事件。
+- 该开关不定义 `/focus/mine` 的“个人仓库”清单；`/focus/mine` 按当前 session 的 GitHub viewer owner repos 展示个人仓库清单，是否有 release 只影响 feed 动态，不影响清单归属。
 
 ### 同步链路
 

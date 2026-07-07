@@ -76,6 +76,19 @@ async function installScopedFocusMocks(
 ) {
 	const includeOwnReleases = options?.includeOwnReleases ?? false;
 	const holdBriefGeneration = options?.holdBriefGeneration ?? false;
+	const viewerLogin = "story-viewer";
+	const personalRepos = ["octo-rill", "dockrev", "no-release-repo"].map(
+		(name, index) => ({
+			repo_id: 9_000 + index,
+			full_name: `${viewerLogin}/${name}`,
+			owner_login: viewerLogin,
+			name,
+			html_url: `https://github.com/${viewerLogin}/${name}`,
+			updated_at: "2026-04-30T08:00:00Z",
+			release_count: name === "no-release-repo" ? 0 : 1,
+			repo_visual: null,
+		}),
+	);
 
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
@@ -89,7 +102,7 @@ async function installScopedFocusMocks(
 					{
 						id: "story-user",
 						github_user_id: 42,
-						login: "IvanLi-CN",
+						login: viewerLogin,
 						name: "Ivan Li",
 						avatar_url: null,
 						email: "ivan@example.com",
@@ -98,6 +111,14 @@ async function installScopedFocusMocks(
 					{ include_own_releases: includeOwnReleases },
 				),
 			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/me/personal-repos") {
+			return json(route, {
+				owner_login: viewerLogin,
+				total_count: personalRepos.length,
+				repos: personalRepos,
+			});
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {
@@ -138,7 +159,7 @@ async function installScopedFocusMocks(
 						? [
 								buildScopedRelease(
 									"mine-release-1",
-									"IvanLi-CN/octo-rill",
+									`${viewerLogin}/octo-rill`,
 									"v2.65.0",
 								),
 							]
@@ -439,22 +460,40 @@ test("account menu keeps mine entry available regardless of include_own_releases
 
 	await page.goto("/");
 	await page.getByRole("button", { name: "查看账号信息" }).click();
-	await expect(page.getByRole("link", { name: "我的仓库动态" })).toBeVisible();
-	await page.getByRole("link", { name: "我的仓库动态" }).click();
+	await expect(page.getByRole("link", { name: "个人仓库" })).toBeVisible();
+	await page.getByRole("link", { name: "个人仓库" }).click();
 	await expect(page).toHaveURL("/focus/mine");
+	const enabledSummary = page.locator(
+		'[data-dashboard-scope-summary="mine"][data-dashboard-scope-summary-layout="desktop"]',
+	);
+	await expect(enabledSummary).toBeVisible();
+	await expect(enabledSummary.getByText("3 个仓库")).toBeVisible();
+	await expect(enabledSummary.getByText("仓库列表")).toBeVisible();
 	await expect(
-		page.locator(
-			'[data-dashboard-scope-summary="mine"][data-dashboard-scope-summary-layout="desktop"]',
-		),
+		enabledSummary.locator('[data-dashboard-personal-repo-list="true"]'),
+	).toBeVisible();
+	await expect(
+		enabledSummary.getByText("story-viewer/no-release-repo"),
 	).toBeVisible();
 
 	await installScopedFocusMocks(page, { includeOwnReleases: false });
 	await page.goto("/");
 	await page.getByRole("button", { name: "查看账号信息" }).click();
-	await expect(page.getByRole("link", { name: "我的仓库动态" })).toBeVisible();
-	await page.getByRole("link", { name: "我的仓库动态" }).click();
+	await expect(page.getByRole("link", { name: "个人仓库" })).toBeVisible();
+	await page.getByRole("link", { name: "个人仓库" }).click();
 	await expect(page).toHaveURL("/focus/mine");
 	await expect(page.getByText("当前范围暂无更新")).toBeVisible();
+	const optedOutSummary = page.locator(
+		'[data-dashboard-scope-summary="mine"][data-dashboard-scope-summary-layout="desktop"]',
+	);
+	await expect(optedOutSummary.getByText("3 个仓库")).toBeVisible();
+	await expect(optedOutSummary.getByText("仓库列表")).toBeVisible();
+	await expect(
+		optedOutSummary.locator('[data-dashboard-personal-repo-list="true"]'),
+	).toBeVisible();
+	await expect(
+		optedOutSummary.getByText("story-viewer/no-release-repo"),
+	).toBeVisible();
 });
 
 test("scoped release detail closes back to the original focus route", async ({

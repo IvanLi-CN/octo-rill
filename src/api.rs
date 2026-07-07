@@ -10031,6 +10031,39 @@ pub struct FeedResponse {
     next_cursor: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct PersonalRepoListResponse {
+    owner_login: String,
+    total_count: usize,
+    repos: Vec<PersonalRepoItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PersonalRepoItem {
+    repo_id: i64,
+    full_name: String,
+    owner_login: String,
+    name: String,
+    html_url: String,
+    updated_at: String,
+    release_count: i64,
+    repo_visual: Option<RepoVisual>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct PersonalRepoRow {
+    repo_id: i64,
+    full_name: String,
+    owner_login: String,
+    name: String,
+    html_url: String,
+    updated_at: String,
+    release_count: i64,
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: i64,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct FeedReactionRefreshRequest {
     release_ids: Vec<String>,
@@ -10356,6 +10389,76 @@ fn repo_visual_from_parts(
     })
 }
 
+async fn load_personal_repo_rows(
+    state: &AppState,
+    user_id: &str,
+    owner_login: &str,
+) -> Result<Vec<PersonalRepoRow>, ApiError> {
+    sqlx::query_as::<_, PersonalRepoRow>(
+        r#"
+        SELECT
+          ob.repo_id AS repo_id,
+          ob.repo_full_name AS full_name,
+          substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1) AS owner_login,
+          substr(ob.repo_full_name, instr(ob.repo_full_name, '/') + 1) AS name,
+          'https://github.com/' || ob.repo_full_name AS html_url,
+          ob.updated_at AS updated_at,
+          COALESCE((
+            SELECT COUNT(*)
+            FROM repo_releases r
+            WHERE r.repo_id = ob.repo_id
+              AND COALESCE(r.is_draft, 0) = 0
+          ), 0) AS release_count,
+          ob.owner_avatar_url AS owner_avatar_url,
+          ob.open_graph_image_url AS open_graph_image_url,
+          ob.uses_custom_open_graph_image AS uses_custom_open_graph_image
+        FROM owned_repo_star_baselines ob
+        WHERE ob.user_id = ?
+          AND instr(ob.repo_full_name, '/') > 1
+          AND lower(substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1)) = lower(?)
+        ORDER BY lower(ob.repo_full_name) ASC
+        "#,
+    )
+    .bind(user_id)
+    .bind(owner_login)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+pub async fn list_personal_repos(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    headers: HeaderMap,
+) -> Result<Json<PersonalRepoListResponse>, ApiError> {
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
+    let viewer = load_viewer_user(state.as_ref(), &user_id).await?;
+    let rows = load_personal_repo_rows(state.as_ref(), &user_id, viewer.login.as_str()).await?;
+    let repos = rows
+        .into_iter()
+        .map(|row| PersonalRepoItem {
+            repo_id: row.repo_id,
+            full_name: row.full_name,
+            owner_login: row.owner_login,
+            name: row.name,
+            html_url: row.html_url,
+            updated_at: row.updated_at,
+            release_count: row.release_count,
+            repo_visual: repo_visual_from_parts(
+                row.owner_avatar_url,
+                row.open_graph_image_url,
+                row.uses_custom_open_graph_image != 0,
+            ),
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(PersonalRepoListResponse {
+        owner_login: viewer.login,
+        total_count: repos.len(),
+        repos,
+    }))
+}
+
 pub(crate) fn release_detail_source_hash(
     repo_full_name: &str,
     original_title: &str,
@@ -10628,9 +10731,17 @@ async fn fetch_feed_items(
 ) -> Result<Vec<FeedRow>, ApiError> {
     let sql = r#"
         WITH scoped_visible_repos AS (
-          SELECT *
+          SELECT
+            vr.repo_id,
+            vr.full_name,
+            vr.owner_login,
+            vr.name,
+            vr.owner_avatar_url,
+            vr.open_graph_image_url,
+            vr.uses_custom_open_graph_image
           FROM user_release_visible_repos vr
           WHERE vr.user_id = ?
+            AND ? != 'mine'
             AND (
               ? = ''
               OR (? = 'repo' AND lower(vr.full_name) = lower(?))
@@ -10645,6 +10756,20 @@ async fn fetch_feed_items(
               OR (? = 'org' AND lower(vr.owner_login) = lower(?))
               OR (? = 'mine' AND lower(vr.owner_login) = lower(?))
             )
+          UNION
+          SELECT
+            ob.repo_id AS repo_id,
+            ob.repo_full_name AS full_name,
+            substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1) AS owner_login,
+            substr(ob.repo_full_name, instr(ob.repo_full_name, '/') + 1) AS name,
+            ob.owner_avatar_url AS owner_avatar_url,
+            ob.open_graph_image_url AS open_graph_image_url,
+            ob.uses_custom_open_graph_image AS uses_custom_open_graph_image
+          FROM owned_repo_star_baselines ob
+          WHERE ob.user_id = ?
+            AND ? = 'mine'
+            AND instr(ob.repo_full_name, '/') > 1
+            AND lower(substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1)) = lower(?)
         ),
         items AS (
           SELECT
@@ -10863,11 +10988,15 @@ async fn fetch_feed_items(
         .bind(user_id)
         .bind(scope_kind)
         .bind(scope_kind)
+        .bind(scope_kind)
         .bind(scope_repo_item.as_deref())
         .bind(scope_kind)
         .bind(scope_repo_items_json.as_deref())
         .bind(scope_kind)
         .bind(scope_org.as_deref())
+        .bind(scope_kind)
+        .bind(scope_mine_owner.as_deref())
+        .bind(user_id)
         .bind(scope_kind)
         .bind(scope_mine_owner.as_deref())
         .bind(user_id)
@@ -16443,8 +16572,9 @@ mod tests {
         github_access_restricted_error, github_graphql_errors_to_api_error,
         github_graphql_http_error, github_rate_limited_error, github_reauth_required_error,
         guard_admin_user_update, has_repo_scope, last_active_is_stale, list_briefs, list_feed,
-        list_releases, llm_call_order_by_clause, load_admin_dashboard_today_live_snapshot,
-        load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
+        list_personal_repos, list_releases, llm_call_order_by_clause,
+        load_admin_dashboard_today_live_snapshot, load_pending_access_sync_reason,
+        load_viewer_user, looks_like_json_blob, map_job_action_error,
         map_public_compare_fallback_error, mark_translation_requested,
         markdown_structure_preserved, me, me_create_api_key, me_delete_api_key, me_delete_passkey,
         me_get_api_keys, normalize_markdown_translation_output, normalize_translation_fields,
@@ -23244,6 +23374,161 @@ line two",
         .await
         .expect("count releases with opt-in");
         assert_eq!(count_with_opt_in, 1);
+    }
+
+    #[tokio::test]
+    async fn list_personal_repos_returns_all_current_viewer_owner_repos() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+        let viewer = load_viewer_user(state.as_ref(), user_id.as_str())
+            .await
+            .expect("load viewer");
+        let release_repo = format!("{}/release-repo", viewer.login);
+        let empty_repo = format!("{}/empty-repo", viewer.login);
+        let other_owner_repo = format!("{}-other/legacy-repo", viewer.login);
+
+        seed_repo_release(&pool, 501, 9001).await;
+        seed_owned_repo_baseline(&pool, 501, release_repo.as_str()).await;
+        seed_owned_repo_baseline(&pool, 502, empty_repo.as_str()).await;
+        seed_owned_repo_baseline(&pool, 503, other_owner_repo.as_str()).await;
+
+        let Json(resp) =
+            list_personal_repos(State(state), setup_session(1).await, HeaderMap::new())
+                .await
+                .expect("list personal repos");
+
+        assert_eq!(resp.owner_login, viewer.login);
+        assert_eq!(resp.total_count, 2);
+        let names = resp
+            .repos
+            .iter()
+            .map(|repo| repo.full_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![empty_repo.as_str(), release_repo.as_str()]);
+        assert!(
+            resp.repos
+                .iter()
+                .all(|repo| repo.owner_login == viewer.login)
+        );
+        assert_eq!(
+            resp.repos
+                .iter()
+                .find(|repo| repo.full_name == empty_repo)
+                .expect("empty repo included")
+                .release_count,
+            0
+        );
+        assert_eq!(
+            resp.repos
+                .iter()
+                .find(|repo| repo.full_name == release_repo)
+                .expect("release repo included")
+                .release_count,
+            1
+        );
+        assert!(
+            !resp
+                .repos
+                .iter()
+                .any(|repo| repo.full_name == other_owner_repo)
+        );
+    }
+
+    #[tokio::test]
+    async fn list_feed_mine_uses_current_viewer_owner_repo_baseline() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+        let viewer = load_viewer_user(state.as_ref(), user_id.as_str())
+            .await
+            .expect("load viewer");
+        let viewer_repo = format!("{}/release-repo", viewer.login);
+        let empty_repo = format!("{}/empty-repo", viewer.login);
+        let other_owner_repo = format!("{}-other/legacy-repo", viewer.login);
+
+        seed_repo_release(&pool, 511, 9101).await;
+        seed_repo_release(&pool, 513, 9103).await;
+        seed_owned_repo_baseline(&pool, 511, viewer_repo.as_str()).await;
+        seed_owned_repo_baseline(&pool, 512, empty_repo.as_str()).await;
+        seed_owned_repo_baseline(&pool, 513, other_owner_repo.as_str()).await;
+        seed_social_event(
+            &pool,
+            user_id.as_str(),
+            SeedSocialEventArgs {
+                kind: "repo_star_received",
+                event_id: "viewer-owner-star",
+                repo_id: Some(511),
+                repo_full_name: Some(viewer_repo.as_str()),
+                repo_owner_avatar_url: None,
+                repo_open_graph_image_url: None,
+                repo_uses_custom_open_graph_image: None,
+                title: None,
+                body: None,
+                html_url: None,
+                actor_login: "octocat",
+                occurred_at: "2026-02-24T08:00:00Z",
+            },
+        )
+        .await;
+        seed_social_event(
+            &pool,
+            user_id.as_str(),
+            SeedSocialEventArgs {
+                kind: "repo_star_received",
+                event_id: "other-owner-star",
+                repo_id: Some(513),
+                repo_full_name: Some(other_owner_repo.as_str()),
+                repo_owner_avatar_url: None,
+                repo_open_graph_image_url: None,
+                repo_uses_custom_open_graph_image: None,
+                title: None,
+                body: None,
+                html_url: None,
+                actor_login: "octocat",
+                occurred_at: "2026-02-24T09:00:00Z",
+            },
+        )
+        .await;
+
+        let Json(feed) = list_feed(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(30),
+                types: None,
+                scope: Some("mine".to_owned()),
+                items: None,
+                org: None,
+            }),
+        )
+        .await
+        .expect("list mine feed");
+
+        assert_eq!(
+            feed.items
+                .iter()
+                .map(|item| (item.kind.as_str(), item.repo_full_name.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("repo_star_received", Some(viewer_repo.as_str())),
+                ("release", Some(viewer_repo.as_str())),
+            ]
+        );
+        assert!(
+            !feed
+                .items
+                .iter()
+                .any(|item| item.repo_full_name.as_deref() == Some(empty_repo.as_str()))
+        );
+        assert!(
+            !feed
+                .items
+                .iter()
+                .any(|item| item.repo_full_name.as_deref() == Some(other_owner_repo.as_str()))
+        );
     }
 
     #[tokio::test]
