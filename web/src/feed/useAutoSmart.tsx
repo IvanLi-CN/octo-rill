@@ -6,6 +6,7 @@ import {
 	type TranslationResultItem,
 	isPendingTranslationResultStatus,
 } from "@/api";
+import { translationErrorIsRetryable } from "@/feed/retryableErrors";
 import { isReleaseFeedItem, type FeedItem, type SmartItem } from "@/feed/types";
 
 const RESOLVE_RESULTS_MAX_ITEMS = 60;
@@ -20,27 +21,8 @@ const REQUEST_PENDING_MAX_AGE_MS =
 	REQUEST_STATUS_POLL_WINDOW_MS * REQUEST_RESUME_WINDOW_MAX_RETRIES;
 const SMART_INSUFFICIENT_REASON = "no_valuable_version_info";
 
-function smartErrorIsRetryable(error?: string | null) {
-	if (!error) return false;
-	const normalized = error.trim().toLowerCase();
-	return (
-		normalized.includes("runtime_lease_expired") ||
-		normalized.includes("repo scope required; re-login via github oauth") ||
-		normalized.includes("database is locked") ||
-		normalized.includes("busy") ||
-		normalized.includes("timeout") ||
-		normalized.includes("timed out") ||
-		normalized.includes("temporarily unavailable") ||
-		normalized.includes("connection reset") ||
-		normalized.includes("connection refused") ||
-		normalized.includes("chat upstream returned 403") ||
-		(normalized.includes("403 forbidden") &&
-			(normalized.includes("chat") || normalized.includes("upstream")))
-	);
-}
-
 function feedSmartIsRetryable(item: FeedItem) {
-	return smartErrorIsRetryable(
+	return translationErrorIsRetryable(
 		item.smart?.error_detail ??
 			item.smart?.error_summary ??
 			item.smart?.error_code,

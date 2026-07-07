@@ -31,6 +31,7 @@
   - 卡片正文读 `body`，中文视图读翻译后的正文字段。
   - 当 `body_truncated=true` 时显示“列表正文已截断显示”的提示。
   - 当自动翻译终态为不可自动重试时，不再提供“翻译”按钮重试入口。
+  - `translated.error` 的 retryable 判定与后端翻译结果补救一致：`error decoding response body`、AI/GitHub `error sending request for url`、`AI response missing content`、DNS/TLS/proxy/连接中断、`Transport request failed` 与 `Chat upstream returned 500` 等瞬时失败可自动补救；`401 Invalid API key`、`model not found`、AI/GitHub `404`、GitHub compare `301/404`、Markdown 结构不匹配和 release body 过大等永久失败保持错误面板。
   - Dashboard feed 对 `translated` lane 的 retryable `error` 采用“当前页面会话内一次性自动补救”语义：首屏加载、分页追加、feed 替换和 live update 合并后都会重扫当前已加载 release items，并按 `lane:item-key` 去重，只自动补救一次。
   - `translated` lane 进入本页自动补救后，正文区改为居中的中性等待面与轻量 loading，文案统一为“刚发现这条结果还没准备好，正在自动重试，请稍候”；本次自动补救若仍返回 `error`，则立刻恢复现有 `翻译失败` 错误块与 `重试翻译` 按钮。
 - 翻译:
@@ -49,6 +50,7 @@
 - 正文超过 3000 字符的 release 不进入分块翻译；后台记录明确 `error` 终态。
 - `release_summary.feed_body` 因 Markdown 结构不一致失败时，后台保留分类后的短提示与原始错误原因，不再只显示 `translation failed`。
 - Dashboard feed 当前已加载 release items 中若存在 retryable `translated.error`，首屏和分页追加后都会在本页自动补救一次；补救期间不再显示红色 `翻译失败` 大错误块。
+- Dashboard feed 当前已加载 release items 中若存在 `error decoding response body` 这类传输/响应解码瞬时失败，会自动调用 `/api/translate/results` 补救一次；非 retryable 配置、模型、GitHub compare 与 Markdown 结构错误继续展示现有错误面板。
 
 ## Visual Evidence
 
