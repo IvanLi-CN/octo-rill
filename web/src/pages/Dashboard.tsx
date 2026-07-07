@@ -967,6 +967,7 @@ export function Dashboard(props: {
 	const scopeSignature = buildDashboardScopeSignature(initialRouteState.scope);
 	const storedSessionState =
 		dashboardSessionStateByUser.get(me.user.id) ?? null;
+	const hasHydratedSessionShell = storedSessionState?.shellHydrated === true;
 	const sessionState =
 		storedSessionState?.scopeSignature === scopeSignature
 			? storedSessionState
@@ -977,10 +978,10 @@ export function Dashboard(props: {
 		warmStart ? "warm-cache" : "network",
 	);
 	const [bootedFromWarmStart] = useState(
-		() => warmStart !== null || sessionState?.shellHydrated === true,
+		() => warmStart !== null || hasHydratedSessionShell,
 	);
 	const [shellHydrated, setShellHydrated] = useState(
-		() => warmStart !== null || sessionState?.shellHydrated === true,
+		() => warmStart !== null || hasHydratedSessionShell,
 	);
 	const [accessTaskStream, setAccessTaskStream] =
 		useState<TaskStreamState | null>(initialAccessTask);
@@ -1071,6 +1072,7 @@ export function Dashboard(props: {
 					type: warmStart.feedRequestType,
 					items: warmStart.feedItems,
 					nextCursor: warmStart.nextCursor,
+					updatedAt: 0,
 				}
 			: null;
 	const feed = useFeed(feedRequestType, {
@@ -1300,9 +1302,7 @@ export function Dashboard(props: {
 	);
 	const notificationsBootstrapCompletedRef = useRef(
 		sessionState?.notificationsBootstrapped ??
-			queryClient.getQueryData<DashboardNotificationsQueryData>(
-				notificationsQueryKey,
-			) !== undefined,
+			Boolean(warmStart && warmStart.notifications.length > 0),
 	);
 	const reactionTokenBootstrapCompletedRef = useRef(
 		sessionState?.reactionTokenBootstrapped ??
@@ -1361,6 +1361,12 @@ export function Dashboard(props: {
 		reactionTokenBootstrapCompletedRef.current = true;
 	}, [reactionTokenCacheQuery.data]);
 	useEffect(() => {
+		if (
+			!notificationsBootstrapCompletedRef.current &&
+			notifications.length === 0
+		) {
+			return;
+		}
 		queryClient.setQueryData<DashboardNotificationsQueryData>(
 			notificationsQueryKey,
 			{ items: notifications },
@@ -1623,10 +1629,7 @@ export function Dashboard(props: {
 		feedType: feedRequestType,
 		includeBriefs: !scopedMode,
 		includeNotifications:
-			!scopedMode &&
-			(hasDesktopSidebarInbox ||
-				tab === "inbox" ||
-				notificationsBootstrapCompletedRef.current),
+			!scopedMode && notificationsBootstrapCompletedRef.current,
 		scope,
 		onUpdate: onDashboardLiveUpdate,
 	});

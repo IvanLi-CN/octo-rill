@@ -142,6 +142,7 @@ export function useFeed(
 			type: FeedRequestType;
 			items: FeedItem[];
 			nextCursor: string | null;
+			updatedAt?: number;
 		} | null;
 	},
 ) {
@@ -155,7 +156,7 @@ export function useFeed(
 	);
 	const queryKey = useMemo(
 		() => dashboardFeedQueryKey({ userId, type, scope, cursor: null }),
-		[scope, type, userId],
+		[scopeSignature, type, userId],
 	);
 	const initialStateMatches = initialData?.type === type;
 	const [loadingMore, setLoadingMore] = useState(false);
@@ -184,6 +185,10 @@ export function useFeed(
 					nextCursor: initialData.nextCursor,
 				}
 			: undefined,
+		initialDataUpdatedAt:
+			initialStateMatches && initialData.updatedAt !== undefined
+				? initialData.updatedAt
+				: undefined,
 		staleTime: DASHBOARD_QUERY_STALE_MS,
 		gcTime: DASHBOARD_QUERY_MAX_AGE_MS,
 	});
