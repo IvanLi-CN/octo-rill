@@ -341,6 +341,22 @@ export type AdminPublicReleaseCacheCleanup = {
 	deleted_ai_cache_count: number;
 	skipped_reason: string | null;
 };
+export type RepoPublicReleasePublicationStatusResponse = {
+	repo_full_name: string;
+	public_path: string;
+	visibility: "github_public" | "private" | "unknown";
+	publication_state:
+		| "github_public"
+		| "private_owner_published"
+		| "private_owner_unpublished"
+		| "not_publishable";
+	can_publish: boolean;
+	can_unpublish: boolean;
+	last_sync_status: "pending" | "ready" | "failed" | "inaccessible" | null;
+	published_at: string | null;
+	reason: string | null;
+	cache_cleanup?: AdminPublicReleaseCacheCleanup | null;
+};
 export type AdminPublicReleaseReposResponse = {
 	items: AdminPublicReleaseRepoItem[];
 	page: number;
@@ -1225,6 +1241,30 @@ export async function apiGetReleaseDetailByRepoTag(input: {
 }): Promise<ReleaseDetailResponse> {
 	return apiGet<ReleaseDetailResponse>(
 		`/api/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases/tag/${encodeURIComponent(input.tag)}/detail`,
+	);
+}
+export async function apiGetRepoPublicReleasePublication(input: {
+	owner: string;
+	repo: string;
+}): Promise<RepoPublicReleasePublicationStatusResponse> {
+	return apiGet<RepoPublicReleasePublicationStatusResponse>(
+		`/api/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/public-release`,
+	);
+}
+export async function apiPublishRepoPublicRelease(input: {
+	owner: string;
+	repo: string;
+}): Promise<RepoPublicReleasePublicationStatusResponse> {
+	return apiPostJson<RepoPublicReleasePublicationStatusResponse>(
+		`/api/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/public-release`,
+	);
+}
+export async function apiUnpublishRepoPublicRelease(input: {
+	owner: string;
+	repo: string;
+}): Promise<RepoPublicReleasePublicationStatusResponse> {
+	return apiDeleteJson<RepoPublicReleasePublicationStatusResponse>(
+		`/api/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/public-release`,
 	);
 }
 export type PublicReleaseListItem = {

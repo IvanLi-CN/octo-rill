@@ -7430,6 +7430,43 @@ struct PublicReleaseLocalRepoRow {
 }
 
 #[derive(Debug, sqlx::FromRow)]
+struct RepoPublicReleaseVisibleRow {
+    full_name: String,
+    is_private: Option<i64>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct RepoPublicReleaseOwnedRow {
+    repo_id: i64,
+    full_name: String,
+    is_private: Option<i64>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct RepoPublicReleaseUsageStatusRow {
+    full_name: String,
+    last_sync_status: String,
+    access_kind: String,
+    published_by_user_id: Option<String>,
+    published_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RepoPublicReleasePublicationStatusResponse {
+    repo_full_name: String,
+    public_path: String,
+    visibility: String,
+    publication_state: String,
+    can_publish: bool,
+    can_unpublish: bool,
+    last_sync_status: Option<String>,
+    published_at: Option<String>,
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_cleanup: Option<AdminPublicRepoCacheCleanup>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
 struct PublicReleaseRow {
     release_id: i64,
     sort_ts: String,
@@ -7587,7 +7624,11 @@ async fn upsert_public_release_usage(
 
     let row = sqlx::query_as::<_, PublicReleaseUsageRow>(
         r#"
-        SELECT repo_id, full_name, last_requested_at, last_sync_status
+        SELECT
+          repo_id,
+          full_name,
+          last_requested_at,
+          last_sync_status
         FROM public_repo_release_usage
         WHERE full_name_lower = ?
         LIMIT 1
@@ -7728,7 +7769,11 @@ async fn resolve_public_release_usage_from_local_metadata(
 
     sqlx::query_as::<_, PublicReleaseUsageRow>(
         r#"
-        SELECT repo_id, full_name, last_requested_at, last_sync_status
+        SELECT
+          repo_id,
+          full_name,
+          last_requested_at,
+          last_sync_status
         FROM public_repo_release_usage
         WHERE full_name_lower = ?
         LIMIT 1
@@ -7775,6 +7820,455 @@ fn ensure_public_release_usage_accessible(row: &PublicReleaseUsageRow) -> Result
 
 fn public_release_usage_should_retry_without_rows(row: &PublicReleaseUsageRow) -> bool {
     row.last_sync_status == "pending" || row.last_sync_status == "failed"
+}
+
+fn public_release_path_for_repo(full_name: &str) -> String {
+    format!("/{full_name}/releases")
+}
+
+async fn load_repo_public_release_usage_status(
+    state: &AppState,
+    full_name_lower: &str,
+) -> Result<Option<RepoPublicReleaseUsageStatusRow>, ApiError> {
+    sqlx::query_as::<_, RepoPublicReleaseUsageStatusRow>(
+        r#"
+        SELECT
+          full_name,
+          last_sync_status,
+          access_kind,
+          published_by_user_id,
+          published_at
+        FROM public_repo_release_usage
+        WHERE full_name_lower = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(full_name_lower)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+async fn load_repo_public_release_visible_row(
+    state: &AppState,
+    user_id: &str,
+    full_name_lower: &str,
+) -> Result<Option<RepoPublicReleaseVisibleRow>, ApiError> {
+    sqlx::query_as::<_, RepoPublicReleaseVisibleRow>(
+        r#"
+        SELECT full_name, is_private
+        FROM user_release_visible_repos
+        WHERE user_id = ?
+          AND lower(full_name) = ?
+        ORDER BY is_private IS NULL ASC, is_private ASC, updated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(full_name_lower)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+async fn load_repo_public_release_owned_row(
+    state: &AppState,
+    user_id: &str,
+    full_name_lower: &str,
+) -> Result<Option<RepoPublicReleaseOwnedRow>, ApiError> {
+    sqlx::query_as::<_, RepoPublicReleaseOwnedRow>(
+        r#"
+        SELECT repo_id, repo_full_name AS full_name, is_private
+        FROM owned_repo_star_baselines
+        WHERE user_id = ?
+          AND lower(repo_full_name) = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(full_name_lower)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+fn repo_public_release_status_response(
+    requested_full_name: String,
+    user_id: &str,
+    visible: Option<RepoPublicReleaseVisibleRow>,
+    owned: Option<RepoPublicReleaseOwnedRow>,
+    usage: Option<RepoPublicReleaseUsageStatusRow>,
+    cache_cleanup: Option<AdminPublicRepoCacheCleanup>,
+) -> RepoPublicReleasePublicationStatusResponse {
+    let full_name = usage
+        .as_ref()
+        .map(|row| row.full_name.clone())
+        .or_else(|| owned.as_ref().map(|row| row.full_name.clone()))
+        .or_else(|| visible.as_ref().map(|row| row.full_name.clone()))
+        .unwrap_or(requested_full_name);
+    let public_path = public_release_path_for_repo(full_name.as_str());
+    let usage_is_private_publish = usage
+        .as_ref()
+        .is_some_and(|row| row.access_kind == "private_owner_published");
+    let usage_published_by_current_user = usage
+        .as_ref()
+        .and_then(|row| row.published_by_user_id.as_deref())
+        .is_some_and(|publisher| publisher == user_id);
+    let last_sync_status = usage.as_ref().map(|row| row.last_sync_status.clone());
+    let published_at = usage.as_ref().and_then(|row| row.published_at.clone());
+
+    if visible
+        .as_ref()
+        .is_some_and(|row| row.is_private == Some(0))
+        || owned.as_ref().is_some_and(|row| row.is_private == Some(0))
+    {
+        return RepoPublicReleasePublicationStatusResponse {
+            repo_full_name: full_name,
+            public_path,
+            visibility: "github_public".to_owned(),
+            publication_state: "github_public".to_owned(),
+            can_publish: false,
+            can_unpublish: false,
+            last_sync_status,
+            published_at: None,
+            reason: Some("github_public_default".to_owned()),
+            cache_cleanup,
+        };
+    }
+
+    if owned
+        .as_ref()
+        .is_some_and(|row| row.is_private.is_some_and(|is_private| is_private != 0))
+    {
+        if usage_is_private_publish {
+            return RepoPublicReleasePublicationStatusResponse {
+                repo_full_name: full_name,
+                public_path,
+                visibility: "private".to_owned(),
+                publication_state: "private_owner_published".to_owned(),
+                can_publish: false,
+                can_unpublish: usage_published_by_current_user || owned.is_some(),
+                last_sync_status,
+                published_at,
+                reason: None,
+                cache_cleanup,
+            };
+        }
+        return RepoPublicReleasePublicationStatusResponse {
+            repo_full_name: full_name,
+            public_path,
+            visibility: "private".to_owned(),
+            publication_state: "private_owner_unpublished".to_owned(),
+            can_publish: true,
+            can_unpublish: false,
+            last_sync_status,
+            published_at: None,
+            reason: Some("owner_private_repo_unpublished".to_owned()),
+            cache_cleanup,
+        };
+    }
+
+    if owned.as_ref().is_some_and(|row| row.is_private.is_none()) {
+        return RepoPublicReleasePublicationStatusResponse {
+            repo_full_name: full_name,
+            public_path,
+            visibility: "unknown".to_owned(),
+            publication_state: "not_publishable".to_owned(),
+            can_publish: false,
+            can_unpublish: false,
+            last_sync_status,
+            published_at: None,
+            reason: Some("repo_privacy_unknown".to_owned()),
+            cache_cleanup,
+        };
+    }
+
+    if usage_is_private_publish && usage_published_by_current_user {
+        return RepoPublicReleasePublicationStatusResponse {
+            repo_full_name: full_name,
+            public_path,
+            visibility: "private".to_owned(),
+            publication_state: "private_owner_published".to_owned(),
+            can_publish: false,
+            can_unpublish: true,
+            last_sync_status,
+            published_at,
+            reason: Some("owned_metadata_missing".to_owned()),
+            cache_cleanup,
+        };
+    }
+
+    RepoPublicReleasePublicationStatusResponse {
+        repo_full_name: full_name,
+        public_path,
+        visibility: "unknown".to_owned(),
+        publication_state: "not_publishable".to_owned(),
+        can_publish: false,
+        can_unpublish: false,
+        last_sync_status,
+        published_at: None,
+        reason: Some("not_viewer_owned_private_repo".to_owned()),
+        cache_cleanup,
+    }
+}
+
+pub async fn get_repo_public_release_status(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<Json<RepoPublicReleasePublicationStatusResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let (owner, repo) = normalize_public_repo_path(owner, repo)?;
+    let requested_full_name = format!("{owner}/{repo}");
+    let full_name_lower = requested_full_name.to_ascii_lowercase();
+    let visible = load_repo_public_release_visible_row(
+        state.as_ref(),
+        user_id.as_str(),
+        full_name_lower.as_str(),
+    )
+    .await?;
+    let owned = load_repo_public_release_owned_row(
+        state.as_ref(),
+        user_id.as_str(),
+        full_name_lower.as_str(),
+    )
+    .await?;
+    let usage =
+        load_repo_public_release_usage_status(state.as_ref(), full_name_lower.as_str()).await?;
+
+    Ok(Json(repo_public_release_status_response(
+        requested_full_name,
+        user_id.as_str(),
+        visible,
+        owned,
+        usage,
+        None,
+    )))
+}
+
+pub async fn publish_repo_public_release(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<Json<RepoPublicReleasePublicationStatusResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let (owner, repo) = normalize_public_repo_path(owner, repo)?;
+    let requested_full_name = format!("{owner}/{repo}");
+    let full_name_lower = requested_full_name.to_ascii_lowercase();
+    let owned = load_repo_public_release_owned_row(
+        state.as_ref(),
+        user_id.as_str(),
+        full_name_lower.as_str(),
+    )
+    .await?
+    .ok_or_else(|| {
+        ApiError::new(
+            StatusCode::FORBIDDEN,
+            "repo_not_publishable",
+            "only viewer-owned private repositories can be published",
+        )
+    })?;
+    if owned.is_private == Some(0) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "public_repo_does_not_require_publish",
+            "public GitHub repositories are public by default",
+        ));
+    }
+    if owned.is_private.is_none_or(|is_private| is_private == 0) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "repo_privacy_unknown",
+            "repository privacy must be refreshed before it can be published",
+        ));
+    }
+
+    let release_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM repo_releases
+        WHERE repo_id = ?
+          AND is_draft = 0
+        "#,
+    )
+    .bind(owned.repo_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let initial_status = if release_count > 0 {
+        "ready"
+    } else {
+        "pending"
+    };
+
+    sqlx::query(
+        r#"
+        INSERT INTO public_repo_release_usage (
+          id,
+          repo_id,
+          owner_login,
+          repo_name,
+          full_name,
+          full_name_lower,
+          first_registered_at,
+          last_requested_at,
+          last_sync_status,
+          last_sync_error,
+          access_kind,
+          published_by_user_id,
+          published_at,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'private_owner_published', ?, ?, ?, ?)
+        ON CONFLICT(full_name_lower) DO UPDATE SET
+          repo_id = excluded.repo_id,
+          owner_login = excluded.owner_login,
+          repo_name = excluded.repo_name,
+          full_name = excluded.full_name,
+          last_sync_status = excluded.last_sync_status,
+          last_sync_error = NULL,
+          access_kind = 'private_owner_published',
+          published_by_user_id = excluded.published_by_user_id,
+          published_at = COALESCE(public_repo_release_usage.published_at, excluded.published_at),
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(local_id::generate_local_id())
+    .bind(owned.repo_id)
+    .bind(owner.as_str())
+    .bind(repo.as_str())
+    .bind(owned.full_name.as_str())
+    .bind(full_name_lower.as_str())
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(initial_status)
+    .bind(user_id.as_str())
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    if release_count == 0
+        && sync::enqueue_public_repo_release_sync(
+            state.as_ref(),
+            owned.repo_id,
+            owned.full_name.as_str(),
+        )
+        .await
+        .map_err(ApiError::internal)?
+    {
+        sqlx::query(
+            r#"
+            UPDATE public_repo_release_usage
+            SET last_sync_status = 'ready',
+                last_sync_error = NULL,
+                updated_at = ?
+            WHERE full_name_lower = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(full_name_lower.as_str())
+        .execute(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    }
+
+    let visible = load_repo_public_release_visible_row(
+        state.as_ref(),
+        user_id.as_str(),
+        full_name_lower.as_str(),
+    )
+    .await?;
+    let usage =
+        load_repo_public_release_usage_status(state.as_ref(), full_name_lower.as_str()).await?;
+
+    Ok(Json(repo_public_release_status_response(
+        requested_full_name,
+        user_id.as_str(),
+        visible,
+        Some(owned),
+        usage,
+        None,
+    )))
+}
+
+pub async fn unpublish_repo_public_release(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<Json<RepoPublicReleasePublicationStatusResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let (owner, repo) = normalize_public_repo_path(owner, repo)?;
+    let requested_full_name = format!("{owner}/{repo}");
+    let full_name_lower = requested_full_name.to_ascii_lowercase();
+    let owned = load_repo_public_release_owned_row(
+        state.as_ref(),
+        user_id.as_str(),
+        full_name_lower.as_str(),
+    )
+    .await?;
+    if owned
+        .as_ref()
+        .is_none_or(|row| row.is_private.is_none_or(|is_private| is_private == 0))
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "repo_not_publishable",
+            "only viewer-owned private repositories can be unpublished",
+        ));
+    }
+    let deleted_usage = sqlx::query_as::<_, (Option<i64>, String)>(
+        r#"
+        SELECT repo_id, full_name
+        FROM public_repo_release_usage
+        WHERE full_name_lower = ?
+          AND access_kind = 'private_owner_published'
+        LIMIT 1
+        "#,
+    )
+    .bind(full_name_lower.as_str())
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let cache_cleanup = if let Some((repo_id, full_name)) = deleted_usage {
+        sqlx::query(
+            r#"
+            DELETE FROM public_repo_release_usage
+            WHERE full_name_lower = ?
+              AND access_kind = 'private_owner_published'
+            "#,
+        )
+        .bind(full_name_lower.as_str())
+        .execute(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+        Some(cleanup_public_release_repo_cache_if_unused(state.as_ref(), repo_id, full_name).await?)
+    } else {
+        None
+    };
+
+    let visible = load_repo_public_release_visible_row(
+        state.as_ref(),
+        user_id.as_str(),
+        full_name_lower.as_str(),
+    )
+    .await?;
+    let usage =
+        load_repo_public_release_usage_status(state.as_ref(), full_name_lower.as_str()).await?;
+
+    Ok(Json(repo_public_release_status_response(
+        requested_full_name,
+        user_id.as_str(),
+        visible,
+        owned,
+        usage,
+        cache_cleanup,
+    )))
 }
 
 fn public_translation_item(row: &PublicReleaseRow, content: &str) -> Option<TranslatedItem> {
@@ -16440,28 +16934,30 @@ mod tests {
         dashboard_updates, encode_dashboard_updates_token, ensure_account_enabled,
         execute_sync_all_sync_with, extract_brief_release_ids, extract_translation_fields,
         feed_item_from_row, get_brief, get_release_detail, get_release_detail_by_repo_tag,
-        github_access_restricted_error, github_graphql_errors_to_api_error,
-        github_graphql_http_error, github_rate_limited_error, github_reauth_required_error,
-        guard_admin_user_update, has_repo_scope, last_active_is_stale, list_briefs, list_feed,
-        list_releases, llm_call_order_by_clause, load_admin_dashboard_today_live_snapshot,
-        load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
-        map_public_compare_fallback_error, mark_translation_requested,
-        markdown_structure_preserved, me, me_create_api_key, me_delete_api_key, me_delete_passkey,
-        me_get_api_keys, normalize_markdown_translation_output, normalize_translation_fields,
+        get_repo_public_release_status, github_access_restricted_error,
+        github_graphql_errors_to_api_error, github_graphql_http_error, github_rate_limited_error,
+        github_reauth_required_error, guard_admin_user_update, has_repo_scope,
+        last_active_is_stale, list_briefs, list_feed, list_releases, llm_call_order_by_clause,
+        load_admin_dashboard_today_live_snapshot, load_pending_access_sync_reason,
+        looks_like_json_blob, map_job_action_error, map_public_compare_fallback_error,
+        mark_translation_requested, markdown_structure_preserved, me, me_create_api_key,
+        me_delete_api_key, me_delete_passkey, me_get_api_keys,
+        normalize_markdown_translation_output, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_feed_types, parse_llm_models, parse_positive_admin_concurrency,
         parse_release_id_param, parse_release_smart_summary_payload,
         parse_repo_full_name_from_release_url, parse_translation_json, parse_unique_release_ids,
         parse_unique_thread_ids, prepare_release_batch, preserve_chunk_edge_newlines,
-        public_get_repo_release_detail, public_list_repo_releases, refresh_admin_dashboard_rollups,
-        refresh_feed_reactions, release_cache_entry_reusable, release_detail_source_hash,
-        release_detail_translation_ready, release_excerpt, release_feed_body,
-        release_reactions_status, require_active_user_id, require_business_user_id,
-        resolve_release_full_name, should_retry_public_compare_without_auth,
-        smart_error_is_retryable, split_markdown_chunks, sync_all, sync_notifications,
-        sync_releases, sync_starred, translate_release_detail_for_user,
-        translate_releases_batch_for_user, translate_response_from_batch_item, upsert_translation,
+        public_get_repo_release_detail, public_list_repo_releases, publish_repo_public_release,
+        refresh_admin_dashboard_rollups, refresh_feed_reactions, release_cache_entry_reusable,
+        release_detail_source_hash, release_detail_translation_ready, release_excerpt,
+        release_feed_body, release_reactions_status, require_active_user_id,
+        require_business_user_id, resolve_release_full_name,
+        should_retry_public_compare_without_auth, smart_error_is_retryable, split_markdown_chunks,
+        sync_all, sync_notifications, sync_releases, sync_starred,
+        translate_release_detail_for_user, translate_releases_batch_for_user,
+        translate_response_from_batch_item, unpublish_repo_public_release, upsert_translation,
     };
     use crate::ai;
     use crate::error::ApiError;
@@ -17814,6 +18310,15 @@ mod tests {
     }
 
     async fn seed_owned_repo_baseline(pool: &SqlitePool, repo_id: i64, full_name: &str) {
+        seed_owned_repo_baseline_with_privacy(pool, repo_id, full_name, false).await;
+    }
+
+    async fn seed_owned_repo_baseline_with_privacy(
+        pool: &SqlitePool,
+        repo_id: i64,
+        full_name: &str,
+        is_private: bool,
+    ) {
         let now = "2026-02-23T00:00:00Z";
         sqlx::query(
             r#"
@@ -17822,6 +18327,7 @@ mod tests {
               user_id,
               repo_id,
               repo_full_name,
+              is_private,
               initialized_at,
               updated_at,
               members_snapshot_initialized,
@@ -17829,13 +18335,14 @@ mod tests {
               open_graph_image_url,
               uses_custom_open_graph_image
             )
-            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
             "#,
         )
         .bind(format!("owned-repo-{repo_id}"))
         .bind(test_user_id(1))
         .bind(repo_id)
         .bind(full_name)
+        .bind(if is_private { 1_i64 } else { 0_i64 })
         .bind(now)
         .bind(now)
         .bind("https://avatars.githubusercontent.com/u/30215105")
@@ -24339,6 +24846,198 @@ line two",
         .expect("public usage row");
         assert_eq!(row.0, None);
         assert_eq!(row.1, "pending");
+    }
+
+    #[tokio::test]
+    async fn public_release_owner_private_repo_publish_exposes_shared_release_cache() {
+        let pool = setup_pool().await;
+        set_include_own_releases(&pool, true).await;
+        seed_owned_repo_baseline_with_privacy(&pool, 42, "openai/codex", true).await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool.clone());
+
+        let Json(status) = get_repo_public_release_status(
+            State(state.clone()),
+            setup_session(1).await,
+            Path(("openai".to_owned(), "codex".to_owned())),
+        )
+        .await
+        .expect("private repo status");
+        assert_eq!(status.publication_state, "private_owner_unpublished");
+        assert!(status.can_publish);
+        assert_eq!(status.public_path, "/openai/codex/releases");
+
+        let Json(published) = publish_repo_public_release(
+            State(state.clone()),
+            setup_session(1).await,
+            Path(("openai".to_owned(), "codex".to_owned())),
+        )
+        .await
+        .expect("publish private repo");
+        assert_eq!(published.publication_state, "private_owner_published");
+        assert!(published.can_unpublish);
+        assert_eq!(published.last_sync_status.as_deref(), Some("ready"));
+
+        let response = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: Some("page".to_owned()),
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("published private repo public list");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["status"], json!("ready"));
+        assert_eq!(body["repo_full_name"], json!("openai/codex"));
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+
+        let row: (String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT access_kind, published_by_user_id
+            FROM public_repo_release_usage
+            WHERE full_name_lower = 'openai/codex'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("private publish usage");
+        assert_eq!(row.0, "private_owner_published");
+        assert_eq!(row.1.as_deref(), Some(test_user_id(1).as_str()));
+    }
+
+    #[tokio::test]
+    async fn public_release_owner_private_repo_unpublish_stops_anonymous_access() {
+        let pool = setup_pool().await;
+        set_include_own_releases(&pool, true).await;
+        seed_owned_repo_baseline_with_privacy(&pool, 42, "openai/codex", true).await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool.clone());
+
+        let _ = publish_repo_public_release(
+            State(state.clone()),
+            setup_session(1).await,
+            Path(("openai".to_owned(), "codex".to_owned())),
+        )
+        .await
+        .expect("publish private repo");
+
+        let Json(unpublished) = unpublish_repo_public_release(
+            State(state.clone()),
+            setup_session(1).await,
+            Path(("openai".to_owned(), "codex".to_owned())),
+        )
+        .await
+        .expect("unpublish private repo");
+        assert_eq!(unpublished.publication_state, "private_owner_unpublished");
+        assert!(unpublished.can_publish);
+        assert_eq!(
+            unpublished
+                .cache_cleanup
+                .as_ref()
+                .and_then(|cleanup| cleanup.skipped_reason.as_deref()),
+            Some("still_used_by_user_release_visibility")
+        );
+
+        let response = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: Some("page".to_owned()),
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("unpublished private repo should not expose cache");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["reason"],
+            json!("repository_registered_metadata_pending")
+        );
+
+        let row: (Option<i64>, String) = sqlx::query_as(
+            r#"
+            SELECT repo_id, access_kind
+            FROM public_repo_release_usage
+            WHERE full_name_lower = 'openai/codex'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("replacement public usage row");
+        assert_eq!(row.0, None);
+        assert_eq!(row.1, "github_public");
+    }
+
+    #[tokio::test]
+    async fn public_release_non_owner_private_repo_cannot_be_published() {
+        let pool = setup_pool().await;
+        seed_star_with_privacy(&pool, 42, true).await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool);
+
+        let err = publish_repo_public_release(
+            State(state),
+            setup_session(1).await,
+            Path(("openai".to_owned(), "codex".to_owned())),
+        )
+        .await
+        .expect_err("starred private repo must not be publishable");
+
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["code"], json!("repo_not_publishable"));
+    }
+
+    #[tokio::test]
+    async fn public_release_owned_repo_unknown_privacy_cannot_be_published() {
+        let pool = setup_pool().await;
+        set_include_own_releases(&pool, true).await;
+        seed_owned_repo_baseline_with_privacy(&pool, 42, "openai/codex", false).await;
+        sqlx::query(
+            r#"
+            UPDATE owned_repo_star_baselines
+            SET is_private = NULL
+            WHERE repo_id = 42
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("clear privacy flag");
+        let state = setup_state(pool);
+
+        let Json(status) = get_repo_public_release_status(
+            State(state.clone()),
+            setup_session(1).await,
+            Path(("openai".to_owned(), "codex".to_owned())),
+        )
+        .await
+        .expect("unknown privacy status");
+        assert_eq!(status.publication_state, "not_publishable");
+        assert!(!status.can_publish);
+        assert_eq!(status.reason.as_deref(), Some("repo_privacy_unknown"));
+
+        let err = publish_repo_public_release(
+            State(state),
+            setup_session(1).await,
+            Path(("openai".to_owned(), "codex".to_owned())),
+        )
+        .await
+        .expect_err("unknown privacy repo must not be publishable");
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["code"], json!("repo_privacy_unknown"));
     }
 
     #[tokio::test]

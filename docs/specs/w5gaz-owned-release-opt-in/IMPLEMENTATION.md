@@ -24,4 +24,5 @@
 - [x] M1: 新增 spec、README 索引、`include_own_releases` migration 与 profile 契约扩展。
 - [x] M2: Release 可见性统一改到 `user_release_visible_repos`，并接通同步 / 详情 / 翻译 / 润色 / 日报。
 - [x] M3: Settings / Dashboard Storybook、Playwright 与 owner-facing 视觉证据完成。
+- [x] M3.5: owner repo baseline 持久化 `is_private`，`user_release_visible_repos` owned 分支使用真实 private flag，并供私有仓库公开发布权限判定复用。
 - [ ] M4: 提交、推送、PR、review-loop 收敛到 merge-ready。

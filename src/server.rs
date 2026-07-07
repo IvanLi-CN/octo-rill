@@ -207,6 +207,12 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(api::get_release_detail_by_repo_tag),
         )
         .route(
+            "/repos/{owner}/{repo}/public-release",
+            get(api::get_repo_public_release_status)
+                .post(api::publish_repo_public_release)
+                .delete(api::unpublish_repo_public_release),
+        )
+        .route(
             "/public/repos/{owner}/{repo}/releases",
             get(api::public_list_repo_releases),
         )

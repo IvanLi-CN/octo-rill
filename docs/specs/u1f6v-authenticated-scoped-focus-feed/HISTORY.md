@@ -9,3 +9,7 @@
 
 - 明确 scoped focus 页是只读范围聚焦面，不暴露全局历史日组的按天“生成日报”动作；补齐 Storybook 断言、Playwright 覆盖与视觉证据。
 - 收紧 scoped focus 页的状态隔离：全局 `全部` tab 遗留的 pending/error 日报生成状态不得在 scoped 页渲染为占位或错误面板。
+
+## 2026-07-07
+
+- 单仓 focus 摘要卡接入公开 Release 页状态；GitHub public repo 仅显示复制/跳转入口，viewer-owned private repo 支持发布、复制、跳转与取消发布。
