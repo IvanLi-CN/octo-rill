@@ -79,6 +79,9 @@ export function PublicReleasePage(props: {
 
 	const load = useCallback(async () => {
 		try {
+			setState((current) =>
+				current.status === "error" ? { status: "loading" } : current,
+			);
 			setAppendError(null);
 			const data = tag
 				? await apiGetPublicRepoReleaseDetail({
@@ -199,7 +202,12 @@ export function PublicReleasePage(props: {
 				)}
 
 				{state.status === "loading" ? (
-					<WaitingCard title="正在读取公开 Release" onRetry={load} />
+					<WaitingCard
+						title="正在读取公开 Release"
+						description="正在读取这个仓库的已知 Release 数据；若本地已有共享缓存，页面会直接显示结果。"
+						statusLabel="正在加载已知数据"
+						onRetry={load}
+					/>
 				) : null}
 
 				{state.status === "pending" ? (
@@ -218,7 +226,7 @@ export function PublicReleasePage(props: {
 							<CardTitle>暂时无法展示</CardTitle>
 							<CardDescription>
 								{state.code ? `${state.code}: ` : ""}
-								{state.message}
+								{state.message || "请求失败，请稍后重试。"}
 							</CardDescription>
 						</CardHeader>
 						<CardContent>
@@ -299,7 +307,7 @@ function WaitingCard(props: {
 				<CardTitle>{props.title}</CardTitle>
 				<CardDescription>
 					{props.description ??
-						"首次访问会先登记仓库，Release 数据会随全局订阅同步更新。"}
+						"正在读取这个仓库的已知 Release 数据；若本地已有共享缓存，页面会直接显示结果。"}
 				</CardDescription>
 			</CardHeader>
 			<CardContent className="flex flex-wrap items-center gap-3">
