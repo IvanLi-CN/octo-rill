@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDownToLine, RefreshCcw, WifiOff } from "lucide-react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
 	type MeResponse,
@@ -107,6 +108,14 @@ import {
 } from "@/sidebar/InboxQuickList";
 import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
 import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
+import {
+	dashboardBriefsQueryKey,
+	dashboardNotificationsQueryKey,
+	dashboardReactionTokenQueryKey,
+	type DashboardBriefsQueryData,
+	type DashboardNotificationsQueryData,
+	type DashboardReactionTokenQueryData,
+} from "@/query/dashboardQueryKeys";
 
 type TaskAcceptedResponse = {
 	mode: "task_id";
@@ -929,6 +938,7 @@ export function Dashboard(props: {
 		onRetryBoot,
 	} = props;
 	const { pushErrorToast, pushToast } = useAppToast();
+	const queryClient = useQueryClient();
 	const isRouteControlled = controlledRouteState !== undefined;
 	const isAdmin = me.user.is_admin;
 	const [dailyBoundaryLocal, _setDailyBoundaryLocal] = useState(
@@ -957,6 +967,7 @@ export function Dashboard(props: {
 	const scopeSignature = buildDashboardScopeSignature(initialRouteState.scope);
 	const storedSessionState =
 		dashboardSessionStateByUser.get(me.user.id) ?? null;
+	const hasHydratedSessionShell = storedSessionState?.shellHydrated === true;
 	const sessionState =
 		storedSessionState?.scopeSignature === scopeSignature
 			? storedSessionState
@@ -967,10 +978,10 @@ export function Dashboard(props: {
 		warmStart ? "warm-cache" : "network",
 	);
 	const [bootedFromWarmStart] = useState(
-		() => warmStart !== null || sessionState?.shellHydrated === true,
+		() => warmStart !== null || hasHydratedSessionShell,
 	);
 	const [shellHydrated, setShellHydrated] = useState(
-		() => warmStart !== null || sessionState?.shellHydrated === true,
+		() => warmStart !== null || hasHydratedSessionShell,
 	);
 	const [accessTaskStream, setAccessTaskStream] =
 		useState<TaskStreamState | null>(initialAccessTask);
@@ -1003,6 +1014,18 @@ export function Dashboard(props: {
 	const scope = routeState.scope;
 	const scopedMode = isScopedDashboardRouteState(routeState);
 	const currentScopeSignature = buildDashboardScopeSignature(scope);
+	const briefsQueryKey = useMemo(
+		() => dashboardBriefsQueryKey(me.user.id),
+		[me.user.id],
+	);
+	const notificationsQueryKey = useMemo(
+		() => dashboardNotificationsQueryKey(me.user.id),
+		[me.user.id],
+	);
+	const reactionTokenQueryKey = useMemo(
+		() => dashboardReactionTokenQueryKey(me.user.id),
+		[me.user.id],
+	);
 	const activeReleaseId = routeState.activeReleaseId;
 	const activeReleaseLocator = routeState.activeReleaseLocator;
 	const releaseReturnTab = routeState.releaseReturnTab;
@@ -1049,13 +1072,14 @@ export function Dashboard(props: {
 					type: warmStart.feedRequestType,
 					items: warmStart.feedItems,
 					nextCursor: warmStart.nextCursor,
+					updatedAt: 0,
 				}
 			: null;
 	const feed = useFeed(feedRequestType, {
+		userId: me.user.id,
 		initialData: warmFeedData,
 		scope,
 	});
-	const loadInitialFeed = feed.loadInitial;
 	const refreshFeed = feed.refresh;
 	const [personalRepos, setPersonalRepos] =
 		useState<PersonalReposResponse | null>(null);
@@ -1077,6 +1101,44 @@ export function Dashboard(props: {
 	const [selectedLaneByKey, setSelectedLaneByKey] = useState<
 		Record<string, FeedLane>
 	>({});
+	const cachedReactionTokenStatus =
+		queryClient.getQueryData<DashboardReactionTokenQueryData>(
+			reactionTokenQueryKey,
+		);
+	const briefsCacheQuery = useQuery<DashboardBriefsQueryData>({
+		queryKey: briefsQueryKey,
+		queryFn: () =>
+			queryClient.getQueryData<DashboardBriefsQueryData>(briefsQueryKey) ?? {
+				items: [],
+				selectedBriefId: null,
+			},
+		enabled: false,
+	});
+	const notificationsCacheQuery = useQuery<DashboardNotificationsQueryData>({
+		queryKey: notificationsQueryKey,
+		queryFn: () =>
+			queryClient.getQueryData<DashboardNotificationsQueryData>(
+				notificationsQueryKey,
+			) ?? { items: [] },
+		enabled: false,
+	});
+	const reactionTokenCacheQuery = useQuery<DashboardReactionTokenQueryData>({
+		queryKey: reactionTokenQueryKey,
+		queryFn: () =>
+			queryClient.getQueryData<DashboardReactionTokenQueryData>(
+				reactionTokenQueryKey,
+			) ?? {
+				configured: false,
+				masked_token: null,
+				owner: null,
+				check: {
+					state: "idle",
+					message: "未配置 GitHub PAT。",
+					checked_at: null,
+				},
+			},
+		enabled: false,
+	});
 	const [pageDefaultLane, setPageDefaultLane] = useState<FeedLane>(
 		readStoredPageDefaultLane,
 	);
@@ -1085,7 +1147,12 @@ export function Dashboard(props: {
 		[feed.items, pageDefaultLane],
 	);
 	const [selectedBriefId, setSelectedBriefId] = useState<string | null>(
-		() => sessionState?.selectedBriefId ?? warmStart?.selectedBriefId ?? null,
+		() =>
+			queryClient.getQueryData<DashboardBriefsQueryData>(briefsQueryKey)
+				?.selectedBriefId ??
+			sessionState?.selectedBriefId ??
+			warmStart?.selectedBriefId ??
+			null,
 	);
 	const [reactionBusyKeys, setReactionBusyKeys] = useState<Set<string>>(
 		() => new Set<string>(),
@@ -1109,7 +1176,12 @@ export function Dashboard(props: {
 	const reactionRefreshingKeysRef = useRef<Set<string>>(new Set<string>());
 	const [reactionTokenConfigured, setReactionTokenConfigured] = useState<
 		boolean | null
-	>(() => sessionState?.reactionTokenConfigured ?? null);
+	>(
+		() =>
+			(cachedReactionTokenStatus
+				? isReactionTokenUsable(cachedReactionTokenStatus)
+				: sessionState?.reactionTokenConfigured) ?? null,
+	);
 	const [patGuideOpen, setPatGuideOpen] = useState<boolean>(false);
 	const [patGuideMessage, setPatGuideMessage] = useState<string | null>(null);
 	const pendingReactionRef = useRef<{
@@ -1118,15 +1190,23 @@ export function Dashboard(props: {
 	} | null>(null);
 	const handleReactionTokenStatusLoaded = useCallback(
 		(status: Parameters<typeof isReactionTokenUsable>[0]) => {
+			queryClient.setQueryData<DashboardReactionTokenQueryData>(
+				reactionTokenQueryKey,
+				status,
+			);
 			setReactionTokenConfigured(isReactionTokenUsable(status));
 		},
-		[],
+		[queryClient, reactionTokenQueryKey],
 	);
 	const handleReactionTokenSaved = useCallback(
 		(status: Parameters<typeof isReactionTokenUsable>[0]) => {
+			queryClient.setQueryData<DashboardReactionTokenQueryData>(
+				reactionTokenQueryKey,
+				status,
+			);
 			setReactionTokenConfigured(isReactionTokenUsable(status));
 		},
-		[],
+		[queryClient, reactionTokenQueryKey],
 	);
 
 	useEffect(() => {
@@ -1175,15 +1255,27 @@ export function Dashboard(props: {
 		clearPatDraft,
 	} = useReactionTokenEditor({
 		autoLoad: false,
+		initialStatus: cachedReactionTokenStatus,
 		onStatusLoaded: handleReactionTokenStatusLoaded,
 		onPatSaved: handleReactionTokenSaved,
 	});
 
 	const [notifications, setNotifications] = useState<NotificationItem[]>(
-		() => sessionState?.notifications ?? warmStart?.notifications ?? [],
+		() =>
+			queryClient.getQueryData<DashboardNotificationsQueryData>(
+				notificationsQueryKey,
+			)?.items ??
+			sessionState?.notifications ??
+			warmStart?.notifications ??
+			[],
 	);
 	const [briefs, setBriefs] = useState<BriefItem[]>(
-		() => sessionState?.briefs ?? warmStart?.briefs ?? [],
+		() =>
+			queryClient.getQueryData<DashboardBriefsQueryData>(briefsQueryKey)
+				?.items ??
+			sessionState?.briefs ??
+			warmStart?.briefs ??
+			[],
 	);
 	const briefDetailRequestInFlightRef = useRef<Set<string>>(new Set());
 	const [briefDetailLoadingIds, setBriefDetailLoadingIds] = useState<
@@ -1203,32 +1295,98 @@ export function Dashboard(props: {
 	const initialNotificationBootstrapRef = useRef(
 		hasDesktopSidebarInbox || tab === "inbox",
 	);
+	const hasCachedBriefs =
+		queryClient.getQueryData<DashboardBriefsQueryData>(briefsQueryKey) !==
+		undefined;
+	const hasCachedNotifications =
+		queryClient.getQueryData<DashboardNotificationsQueryData>(
+			notificationsQueryKey,
+		) !== undefined;
 	const sidebarBootstrapCompletedRef = useRef(
-		sessionState?.sidebarBootstrapped ?? false,
+		sessionState?.sidebarBootstrapped ?? hasCachedBriefs,
 	);
 	const notificationsBootstrapCompletedRef = useRef(
-		sessionState?.notificationsBootstrapped ?? false,
+		sessionState?.notificationsBootstrapped ??
+			(hasCachedNotifications ||
+				Boolean(warmStart && warmStart.notifications.length > 0)),
 	);
 	const reactionTokenBootstrapCompletedRef = useRef(
-		sessionState?.reactionTokenBootstrapped ?? false,
+		sessionState?.reactionTokenBootstrapped ??
+			cachedReactionTokenStatus !== undefined,
 	);
 	const startupBootstrapRequestedRef = useRef(
-		sidebarBootstrapCompletedRef.current,
+		sessionState?.sidebarBootstrapped === true,
 	);
 	const startupSidebarRetriedRef = useRef(false);
 	const notificationsBootstrapRequestedRef = useRef(
-		notificationsBootstrapCompletedRef.current ||
+		sessionState?.notificationsBootstrapped === true ||
 			(initialNotificationBootstrapRef.current &&
 				!startupBootstrapRequestedRef.current),
 	);
 	const reactionTokenBootstrapRequestedRef = useRef(
-		reactionTokenBootstrapCompletedRef.current,
+		sessionState?.reactionTokenBootstrapped === true,
 	);
 	const notificationsRequestInFlightRef = useRef(false);
 	const [sidebarLoading, setSidebarLoading] = useState(
-		() => !bootedFromWarmStart,
+		() => !bootedFromWarmStart && !hasCachedBriefs,
 	);
 	const [notificationsLoading, setNotificationsLoading] = useState(false);
+	useEffect(() => {
+		if (!notificationsCacheQuery.data) return;
+		setNotifications(notificationsCacheQuery.data.items);
+		notificationsBootstrapCompletedRef.current = true;
+	}, [notificationsCacheQuery.data]);
+	useEffect(() => {
+		if (!briefsCacheQuery.data) return;
+		setBriefs(briefsCacheQuery.data.items);
+		setSelectedBriefId((current) => {
+			const cachedSelectedId = briefsCacheQuery.data.selectedBriefId;
+			if (
+				cachedSelectedId &&
+				briefsCacheQuery.data.items.some(
+					(brief) => brief.id === cachedSelectedId,
+				)
+			) {
+				return cachedSelectedId;
+			}
+			if (
+				current &&
+				briefsCacheQuery.data.items.some((brief) => brief.id === current)
+			) {
+				return current;
+			}
+			return briefsCacheQuery.data.items[0]?.id ?? null;
+		});
+		sidebarBootstrapCompletedRef.current = true;
+	}, [briefsCacheQuery.data]);
+	useEffect(() => {
+		if (!reactionTokenCacheQuery.data) return;
+		setReactionTokenConfigured(
+			isReactionTokenUsable(reactionTokenCacheQuery.data),
+		);
+		reactionTokenBootstrapCompletedRef.current = true;
+	}, [reactionTokenCacheQuery.data]);
+	useEffect(() => {
+		if (
+			!notificationsBootstrapCompletedRef.current &&
+			notifications.length === 0
+		) {
+			return;
+		}
+		queryClient.setQueryData<DashboardNotificationsQueryData>(
+			notificationsQueryKey,
+			{ items: notifications },
+		);
+	}, [notifications, notificationsQueryKey, queryClient]);
+	useEffect(() => {
+		if (!sidebarBootstrapCompletedRef.current && briefs.length === 0) {
+			return;
+		}
+		queryClient.setQueryData<DashboardBriefsQueryData>(briefsQueryKey, {
+			items: briefs,
+			selectedBriefId,
+		});
+	}, [briefs, briefsQueryKey, queryClient, selectedBriefId]);
 	const notifyGlobalError = useCallback(
 		(
 			title: string,
@@ -1480,10 +1638,7 @@ export function Dashboard(props: {
 		feedType: feedRequestType,
 		includeBriefs: !scopedMode,
 		includeNotifications:
-			!scopedMode &&
-			(hasDesktopSidebarInbox ||
-				tab === "inbox" ||
-				notificationsBootstrapCompletedRef.current),
+			!scopedMode && notificationsBootstrapCompletedRef.current,
 		scope,
 		onUpdate: onDashboardLiveUpdate,
 	});
@@ -1828,10 +1983,6 @@ export function Dashboard(props: {
 	});
 
 	useEffect(() => {
-		void loadInitialFeed();
-	}, [loadInitialFeed]);
-
-	useEffect(() => {
 		if (scopedMode) {
 			setSidebarLoading(false);
 			sidebarBootstrapCompletedRef.current = false;
@@ -1843,7 +1994,7 @@ export function Dashboard(props: {
 		const startSidebarBootstrap = (allowRetry: boolean) => {
 			startupBootstrapRequestedRef.current = true;
 			void refreshSidebar({
-				background: bootedFromWarmStart,
+				background: bootedFromWarmStart || hasCachedBriefs,
 				includeNotifications: initialNotificationBootstrapRef.current,
 			}).catch(() => {
 				startupBootstrapRequestedRef.current = false;
@@ -1855,7 +2006,7 @@ export function Dashboard(props: {
 			});
 		};
 		startSidebarBootstrap(true);
-	}, [bootedFromWarmStart, refreshSidebar, scopedMode]);
+	}, [bootedFromWarmStart, hasCachedBriefs, refreshSidebar, scopedMode]);
 
 	useEffect(() => {
 		if (reactionTokenBootstrapRequestedRef.current) {

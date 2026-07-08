@@ -21,6 +21,9 @@
 	"dependencies": {
 		"@radix-ui/react-slot": "^1.2.0",
 		"@tailwindcss/vite": "^4.1.5",
+		"@tanstack/query-sync-storage-persister": "^5.101.2",
+		"@tanstack/react-query": "^5.101.2",
+		"@tanstack/react-query-persist-client": "^5.101.2",
 		"@tanstack/react-router": "^1.168.22",
 		"class-variance-authority": "^0.7.1",
 		"clsx": "^2.1.1",

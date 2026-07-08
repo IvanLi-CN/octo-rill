@@ -5,6 +5,7 @@
 - Dashboard 在首次 hydration 完成后，用户通过 SPA 直接切换 `全部 / 发布 / 加星 / 关注` 这类 feed-backed tabs 时，URL 已经完成前端导航，但主页面仍会因为新的 feed 请求短暂回退到 `DashboardStartupSkeleton`。
 - 这种“整页骨架回退”会把 header、tabs、notice 与 footer 一并卸载，看起来像整页重启，而不是同一工作台内部的局部加载。
 - 现有 warm skeleton 语义只应该用于首屏启动阶段；一旦 AppShell 已经稳定挂载，后续 tab 切换应降级为内容区局部 loading，而不是再次显示全局启动骨架。
+- Dashboard 已访问过的 route 在浏览器 Back/Forward 中还必须复用 server-state 缓存。PWA 体感要求是“旧内容立即回来，后台再刷新”，而不是每次历史导航都重新进入数据加载态。
 
 ## 目标 / 非目标
 
@@ -12,6 +13,7 @@
 
 - 将 Dashboard 的“首次 shell hydration”与“后续 feed tab 切换”明确拆分成两层 loading 语义。
 - 保证 `DashboardStartupSkeleton` 只在首屏启动阶段出现，后续 SPA 导航始终保留现有 AppShell。
+- 使用 `@tanstack/react-query` 作为 Dashboard server-state 缓存层，让已访问 feed route、briefs、notifications 与 reaction-token status 在当前会话和 1 小时短期持久化窗口内可恢复。
 - 为局部 feed loading 补稳定的 Storybook 入口、视觉证据与 Playwright 回归。
 - 顺手审计 admin 相关 startup skeleton guard，确认本轮问题没有在同类 SPA 导航里复现。
 
@@ -19,6 +21,7 @@
 
 - 不改冷启动 `AppBoot` 或硬刷新的 auth bootstrap 语义。
 - 不改 Rust 后端、API、数据库、分页契约或路由 contract。
+- 不把私有 `/api/**` response 放进 Service Worker cache；React Query 持久化只保存 Dashboard 白名单 query。
 - 不顺手重构无复现证据的 Admin Users / Admin Jobs loading 结构。
 
 ## 范围（Scope）
@@ -45,9 +48,11 @@
 ### MUST
 
 - 首次 hydrated 之后，Dashboard 任意 feed-backed tab 切换都不得再次显示 `DashboardStartupSkeleton`。
+- 浏览器 Back/Forward 回到 1 小时内已访问过的 Dashboard route 时，缓存内容必须同步可见，不得显示 `data-feed-loading-skeleton="true"`。
 - `全部 -> 加星` 的延迟请求期间，AppShell、header、tabs、notice、footer 必须持续可见。
 - tab 切换期间只允许 feed 主列出现局部 loading skeleton；旧数据需要先清空，避免串 tab 残留。
 - `refreshSidebar` 与 `loadReactionTokenStatus` 不得因为普通 feed tab 切换重复触发；它们只在页面初次进入或显式刷新时运行。
+- 登出、`/api/me` 返回 401、或识别到用户 id 切换时，必须清理 React Query persisted Dashboard cache 与现有 warm startup cache。
 - Storybook 必须提供稳定的“post-boot tab pending without global skeleton”入口。
 - Playwright 必须回归已复现路径，并断言 `data-dashboard-boot-header` / `data-app-boot` 在 SPA 切换期间都不会再出现。
 
@@ -67,7 +72,9 @@
 - 用户首次进入 Dashboard 且 feed / sidebar 仍未就绪时，页面继续允许显示 `DashboardStartupSkeleton`，直到 shell hydration 完成。
 - 一旦 shell hydration 完成，用户切换 `全部 / 发布 / 加星 / 关注` 任意 feed-backed tab 时，路由与顶部壳层保持原位，只让 feed panel 切到局部 skeleton。
 - 当新的 feed 数据返回后，局部 skeleton 消失并切换到目标 tab 的真实数据集，不保留上一 tab 的残留条目。
+- 当用户通过浏览器历史回到已访问过的 feed-backed route 时，React Query 缓存先恢复对应 route 的 feed 数据；若缓存仍在 `staleTime` 内，不需要阻塞式刷新，若变 stale 则后台刷新并保留旧内容。
 - Storybook `Evidence / Post-Boot Stars Tab Loading` 直接固定在“首屏已就绪、stars 数据待回包”的状态，用于稳定截图与人工审阅。
+- Storybook `HistoryStarsCacheHitKeepsContent` 固定“已缓存 stars route”状态，用于证明缓存命中时没有 feed skeleton 或全局启动骨架。
 
 ### Edge cases / errors
 
@@ -88,6 +95,10 @@
 - Given stars 数据返回
   When 页面完成本次切换
   Then 新数据集（如 `octocat-new` / Storybook 中的 `torvalds`）可见，且局部 skeleton 消失。
+
+- Given 用户已经访问过 `/` 与 `/stars`
+  When 使用浏览器 Back 回 `/`、再 Forward 回 `/stars`
+  Then 对应旧数据立即可见，`data-feed-loading-skeleton="true"`、`data-dashboard-boot-header` 与 `data-app-boot` 均保持为 0。
 
 - Given 用户切换 `全部 -> 加星`
   When 检查 sidebar / reaction bootstrap 请求
@@ -117,19 +128,27 @@
 
 - Stories to add/update: `web/src/stories/Dashboard.stories.tsx`
 - Docs pages / state galleries to add/update: `Pages/Dashboard` autodocs
-- `play` / interaction coverage to add/update: `PostBootStarsTabSwitchKeepsShell`
+- `play` / interaction coverage to add/update: `PostBootStarsTabSwitchKeepsShell`, `HistoryStarsCacheHitKeepsContent`
 - Visual evidence source: `storybook_canvas`
-- Owner-facing screenshot persistence: 不要求；主人通过本地浏览器手测验收
+- Owner-facing screenshot persistence: `docs/specs/67g9w-spa-nav-startup-skeleton-guard/assets/dashboard-history-stars-cache-hit.png`
 
 ## Visual Evidence
 
-- 主人已明确选择“不需要截图”；本轮以稳定 Storybook pending story 作为回归入口，并通过本地浏览器手测完成验收。
-- 主人已在真实应用页 `http://127.0.0.1:55174/` 手测 `全部 -> 加星` 的 SPA 切换链路，确认壳层持续保留且未再回退全局 startup skeleton。
-- 验收关注点：Dashboard 已完成首屏 hydration 后，切到 `加星` 时只让主列进入局部 skeleton；页头、tabs、notice 与 footer 继续保留，不再回退到全局 startup skeleton。
+- source_type: `storybook_canvas`
+- story_id_or_title: `Pages/Dashboard/HistoryStarsCacheHitKeepsContent`
+- scenario: browser Forward 回到已访问过的 `加星` route，Dashboard 使用 React Query cache 同步显示星标列表。
+- evidence_note: `torvalds` 星标内容立即可见，`data-feed-loading-skeleton="true"`、`data-dashboard-boot-header`、`data-app-boot` 均不存在。
+
+PR: include
+
+![Dashboard history stars cache hit](./assets/dashboard-history-stars-cache-hit.png)
 
 ## 方案概述（Approach, high-level）
 
 - 在 Dashboard 内引入 `shellHydrated` 门槛，让 `DashboardStartupSkeleton` 仅在首屏 feed + sidebar 都未完成前可见。
+- 在 app 根部引入 `@tanstack/react-query` persisted provider；只 dehydrate `dashboard` query key，并用 1 小时 `maxAge/gcTime` 对齐现有 warm cache TTL。
+- 将 `useFeed` 改为 React Query-backed hook，query key 包含 `userId + feed type + scopeSignature + cursor`；已缓存数据作为同步渲染源，刷新只更新 query cache。
+- 将 briefs、notifications、reaction-token status 同步进 Dashboard query cache，作为历史导航和短期 PWA 恢复的 server-state 来源。
 - 将 `loadInitialFeed` 与 sidebar / reaction-token bootstrap 拆成独立 effect，避免 feed type 变化重新触发整套“启动期”副作用。
 - 在 `FeedList` / `FeedGroupedList` 内为局部 loading skeleton 提供统一 selector 与可访问性标记，方便交互断言与稳定截图。
 - 通过 Storybook pending story 与 Playwright 延迟接口回归，把“URL 已切换但壳层不卸载”固定成长期约束。
@@ -146,6 +165,7 @@
 - 2026-04-17: 实现完成；Dashboard shell hydration guard、Storybook pending story、Playwright 回归与视觉证据路径已补齐。
 - 2026-04-17: 主人确认本轮不需要截图资产，最终以本地浏览器手测替代截图落盘。
 - 2026-04-22: 同步 Dashboard 主 tab current truth；SPA tab 切换的 canonical URL 已切到 pathname-driven `/stars` 等路径。
+- 2026-07-08: 引入 React Query 作为 Dashboard server-state 缓存层；浏览器 Back/Forward 命中已访问 route 时直接恢复缓存内容，并以 1 小时短期本地持久化支持 PWA 恢复。
 
 ## 参考（References）
 

@@ -22,6 +22,8 @@ function socialPrimaryDesktop(page: Locator | Page, text: string) {
 		.filter({ hasText: text });
 }
 
+test.describe.configure({ mode: "serial" });
+
 async function expectInlineSocialCard(
 	card: Locator,
 	options?: { maxActionCenterOffsetX?: number | null },
@@ -1279,6 +1281,26 @@ test("switching social tabs clears stale feed items before the next dataset reso
 	await expect(page.locator('[data-feed-loading-skeleton="true"]')).toHaveCount(
 		0,
 	);
+	await expect.poll(() => _briefsCalls).toBe(1);
+	await expect.poll(() => _reactionTokenStatusCalls).toBe(1);
+
+	await page.goBack();
+	await expect(page).toHaveURL(/\/$/);
+	await expect(socialPrimaryDesktop(page, "octocat-old")).toBeVisible();
+	await expect(page.locator('[data-feed-loading-skeleton="true"]')).toHaveCount(
+		0,
+	);
+	await expect(page.locator("[data-dashboard-boot-header]")).toHaveCount(0);
+	await expect(page.locator("[data-app-boot]")).toHaveCount(0);
+
+	await page.goForward();
+	await expect(page).toHaveURL(/\/stars$/);
+	await expect(socialPrimaryDesktop(page, "octocat-new")).toBeVisible();
+	await expect(page.locator('[data-feed-loading-skeleton="true"]')).toHaveCount(
+		0,
+	);
+	await expect(page.locator("[data-dashboard-boot-header]")).toHaveCount(0);
+	await expect(page.locator("[data-app-boot]")).toHaveCount(0);
 	await expect.poll(() => _briefsCalls).toBe(1);
 	await expect.poll(() => _reactionTokenStatusCalls).toBe(1);
 });
