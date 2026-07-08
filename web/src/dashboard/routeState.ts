@@ -24,6 +24,9 @@ export type DashboardScope =
 	  }
 	| {
 			kind: "mine";
+	  }
+	| {
+			kind: "following";
 	  };
 
 export type DashboardScopedTab = Extract<DashboardTab, "all" | "releases">;
@@ -197,6 +200,8 @@ export function buildDashboardScopeSignature(scope: DashboardScope | null) {
 			return `org:${scope.org.toLowerCase()}`;
 		case "mine":
 			return "mine";
+		case "following":
+			return "following";
 	}
 }
 
@@ -256,6 +261,10 @@ export function buildDashboardScopePath(
 		}
 		case "mine":
 			return tab === "releases" ? "/focus/mine/releases" : "/focus/mine";
+		case "following":
+			return tab === "releases"
+				? "/focus/following/releases"
+				: "/focus/following";
 	}
 }
 
@@ -390,6 +399,14 @@ export function buildDashboardRouteNavigation(
 					to: tab === "releases" ? "/focus/mine/releases" : "/focus/mine",
 					search: searchObjectFromParams(searchParams),
 				};
+			case "following":
+				return {
+					to:
+						tab === "releases"
+							? "/focus/following/releases"
+							: "/focus/following",
+					search: searchObjectFromParams(searchParams),
+				};
 		}
 	}
 
@@ -478,6 +495,12 @@ function parseDashboardScopePathname(
 			tab: segments[2] === "releases" ? "releases" : "all",
 		};
 	}
+	if (segments[1] === "following") {
+		return {
+			scope: { kind: "following" },
+			tab: segments[2] === "releases" ? "releases" : "all",
+		};
+	}
 	return null;
 }
 
@@ -537,6 +560,8 @@ function parseDashboardScopeFromSearch(
 		}
 		case "mine":
 			return { kind: "mine" };
+		case "following":
+			return { kind: "following" };
 		default:
 			return null;
 	}

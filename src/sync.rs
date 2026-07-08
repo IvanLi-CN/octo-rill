@@ -574,6 +574,53 @@ struct OwnedRepoSnapshot {
     uses_custom_open_graph_image: bool,
 }
 
+fn user_repo_association_from_starred_snapshot(
+    repo: &StarredRepoSnapshot,
+    now: &str,
+) -> crate::api::UserRepoAssociationUpsert {
+    crate::api::UserRepoAssociationUpsert {
+        repo_id: Some(repo.repo_id),
+        repo_full_name: repo.full_name.clone(),
+        owner_login: repo.owner_login.clone(),
+        repo_name: repo.name.clone(),
+        html_url: Some(repo.html_url.clone()),
+        description: repo.description.clone(),
+        is_private: Some(repo.is_private),
+        owner_avatar_url: repo.owner_avatar_url.clone(),
+        open_graph_image_url: repo.open_graph_image_url.clone(),
+        uses_custom_open_graph_image: repo.uses_custom_open_graph_image,
+        first_associated_at: repo.stargazed_at.clone(),
+        last_seen_at: now.to_owned(),
+        source: crate::api::UserRepoAssociationSource::GitHubStar,
+    }
+}
+
+fn user_repo_association_from_owned_snapshot(
+    repo: &OwnedRepoSnapshot,
+    now: &str,
+) -> crate::api::UserRepoAssociationUpsert {
+    let (owner_login, repo_name) = repo
+        .full_name
+        .split_once('/')
+        .map(|(owner, name)| (owner.to_owned(), name.to_owned()))
+        .unwrap_or_else(|| (repo.full_name.clone(), repo.full_name.clone()));
+    crate::api::UserRepoAssociationUpsert {
+        repo_id: Some(repo.repo_id),
+        repo_full_name: repo.full_name.clone(),
+        owner_login,
+        repo_name,
+        html_url: Some(format!("https://github.com/{}", repo.full_name)),
+        description: None,
+        is_private: Some(repo.is_private),
+        owner_avatar_url: repo.owner_avatar_url.clone(),
+        open_graph_image_url: repo.open_graph_image_url.clone(),
+        uses_custom_open_graph_image: repo.uses_custom_open_graph_image,
+        first_associated_at: now.to_owned(),
+        last_seen_at: now.to_owned(),
+        source: crate::api::UserRepoAssociationSource::PersonalOwned,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct GitHubStargazer {
     starred_at: Option<String>,
@@ -2248,11 +2295,10 @@ async fn load_user_release_visible_repo_rows(
     sqlx::query_as::<_, ReleaseVisibleRepoRow>(
         r#"
         SELECT repo_id, full_name
-        FROM user_release_visible_repos
+        FROM user_following_repos
         WHERE user_id = ?
         ORDER BY
-          CASE WHEN stargazed_at IS NULL THEN 1 ELSE 0 END ASC,
-          stargazed_at DESC,
+          updated_at DESC,
           full_name ASC
         "#,
     )
@@ -2270,27 +2316,15 @@ async fn load_user_release_visible_repo_aggregation_rows(
         r#"
         WITH effective_pool AS (
           SELECT
-            sr.repo_id,
-            sr.full_name,
-            sr.is_private,
+            fr.repo_id,
+            fr.full_name,
+            COALESCE(fr.is_private, 0) AS is_private,
             1 AS relation_count
-          FROM starred_repos sr
+          FROM user_following_repos fr
           JOIN users u
-            ON u.id = sr.user_id
-          WHERE sr.user_id = ?
+            ON u.id = fr.user_id
+          WHERE fr.user_id = ?
             AND u.is_disabled = 0
-          UNION ALL
-          SELECT
-            ob.repo_id,
-            ob.repo_full_name AS full_name,
-            0 AS is_private,
-            1 AS relation_count
-          FROM owned_repo_star_baselines ob
-          JOIN users u
-            ON u.id = ob.user_id
-          WHERE ob.user_id = ?
-            AND u.is_disabled = 0
-            AND u.include_own_releases != 0
         )
         SELECT
           repo_id,
@@ -2302,7 +2336,6 @@ async fn load_user_release_visible_repo_aggregation_rows(
         ORDER BY full_name ASC, repo_id ASC
         "#,
     )
-    .bind(user_id)
     .bind(user_id)
     .fetch_all(&state.pool)
     .await
@@ -2580,6 +2613,14 @@ async fn apply_social_activity_snapshot_with_options(
     }
 
     if let Some(owned_repos) = owned_repos {
+        crate::api::clear_user_repo_association_source_tx(
+            &mut tx,
+            user_id,
+            crate::api::UserRepoAssociationSource::PersonalOwned,
+            now.as_str(),
+        )
+        .await
+        .context("clear personal_owned repo associations before owned snapshot refresh")?;
         let current_owned_repo_ids = owned_repos
             .iter()
             .map(|repo| repo.repo_id)
@@ -2672,6 +2713,21 @@ async fn apply_social_activity_snapshot_with_options(
             )
             .await
             .with_context(|| format!("upsert repo star baseline for {}", repo.full_name))?;
+
+            let association = user_repo_association_from_owned_snapshot(repo, now.as_str());
+            crate::api::upsert_user_repo_association_tx(
+                &mut tx,
+                user_id,
+                &association,
+                now.as_str(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to upsert user repo association for owned repo {}",
+                    repo.full_name
+                )
+            })?;
         }
 
         for (repo, members) in repo_members.unwrap_or(&[]) {
@@ -3173,7 +3229,7 @@ async fn load_release_ids_for_user(state: &AppState, user_id: &str) -> Result<Ha
         r#"
         SELECT DISTINCT r.release_id
         FROM repo_releases r
-        JOIN user_release_visible_repos sr
+        JOIN user_following_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
         "#,
     )
@@ -3231,7 +3287,7 @@ async fn load_user_relevant_release_ids(
         r#"
         SELECT DISTINCT r.release_id
         FROM repo_releases r
-        JOIN user_release_visible_repos sr
+        JOIN user_following_repos sr
           ON sr.user_id = 
         "#,
     );
@@ -3265,7 +3321,7 @@ async fn load_recent_release_ids_for_user(
         r#"
         SELECT DISTINCT r.release_id
         FROM repo_releases r
-        JOIN user_release_visible_repos sr
+        JOIN user_following_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
         ORDER BY COALESCE(r.published_at, r.created_at, r.updated_at) DESC, r.release_id DESC
         LIMIT ?
@@ -4816,19 +4872,10 @@ async fn load_effective_repo_totals_by_user(state: &AppState) -> Result<HashMap<
         r#"
         WITH repo_totals AS (
           SELECT
-            repo_sources.user_id,
-            COUNT(DISTINCT repo_sources.repo_id) AS repo_total
-          FROM (
-            SELECT user_id, repo_id
-            FROM starred_repos
-            UNION ALL
-            SELECT ob.user_id, ob.repo_id
-            FROM owned_repo_star_baselines ob
-            JOIN users owned_users ON owned_users.id = ob.user_id
-            WHERE owned_users.is_disabled = 0
-              AND owned_users.include_own_releases != 0
-          ) repo_sources
-          GROUP BY repo_sources.user_id
+            fr.user_id,
+            COUNT(DISTINCT fr.repo_id) AS repo_total
+          FROM user_following_repos fr
+          GROUP BY fr.user_id
         )
         SELECT users.id AS user_id, COALESCE(repo_totals.repo_total, 0) AS repo_total
         FROM users
@@ -6917,7 +6964,7 @@ async fn load_repo_release_candidate_users(
           AND (
             EXISTS (
               SELECT 1
-              FROM user_release_visible_repos sr
+              FROM user_following_repos sr
               WHERE sr.user_id = u.id
                 AND sr.repo_id = ?
             )
@@ -9042,7 +9089,7 @@ async fn insert_feed_activity_events(
                 r#"
                 SELECT COUNT(*)
                 FROM repo_releases r
-                JOIN user_release_visible_repos vr
+                JOIN user_following_repos vr
                   ON vr.user_id = ? AND vr.repo_id = r.repo_id
                 WHERE r.html_url = ?
                 "#,
@@ -9415,6 +9462,14 @@ async fn replace_starred_repos_with_priority(
         .begin_immediate_with_priority(&state.pool, lane, priority)
         .await
         .context("begin replace starred_repos tx")?;
+    crate::api::clear_user_repo_association_source_tx(
+        &mut tx,
+        user_id,
+        crate::api::UserRepoAssociationSource::GitHubStar,
+        now.as_str(),
+    )
+    .await
+    .context("clear github_star repo associations before replace")?;
     sqlx::query(r#"DELETE FROM starred_repos WHERE user_id = ?"#)
         .bind(user_id)
         .execute(&mut *tx)
@@ -9450,6 +9505,16 @@ async fn replace_starred_repos_with_priority(
         .execute(&mut *tx)
         .await
         .with_context(|| format!("failed to insert starred repo {}", repo.full_name))?;
+
+        let association = user_repo_association_from_starred_snapshot(repo, now.as_str());
+        crate::api::upsert_user_repo_association_tx(&mut tx, user_id, &association, now.as_str())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to upsert user repo association for starred repo {}",
+                    repo.full_name
+                )
+            })?;
     }
 
     tx.commit()
@@ -9516,6 +9581,16 @@ async fn upsert_starred_repos(
         .execute(&mut *tx)
         .await
         .with_context(|| format!("failed to upsert starred repo {}", repo.full_name))?;
+
+        let association = user_repo_association_from_starred_snapshot(repo, now.as_str());
+        crate::api::upsert_user_repo_association_tx(&mut tx, user_id, &association, now.as_str())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to upsert user repo association for starred repo {}",
+                    repo.full_name
+                )
+            })?;
     }
     tx.commit()
         .await

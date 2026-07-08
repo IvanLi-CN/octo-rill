@@ -16,7 +16,7 @@ use chrono::{Datelike, TimeZone};
 use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
-use sqlx::{QueryBuilder, Row};
+use sqlx::{QueryBuilder, Row, Sqlite};
 use tokio::{io::AsyncReadExt, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
@@ -7494,6 +7494,37 @@ struct PublicReleaseRow {
     smart_error_text: Option<String>,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct PublicReleaseBaseRow {
+    release_id: i64,
+    sort_ts: String,
+    tag_name: String,
+    name: Option<String>,
+    body: Option<String>,
+    html_url: String,
+    published_at: Option<String>,
+    is_prerelease: i64,
+    is_draft: i64,
+    previous_tag_name: Option<String>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct PublicReleaseRepoVisualRow {
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: Option<i64>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct PublicReleaseTranslationRow {
+    release_id: i64,
+    source_hash: String,
+    status: String,
+    title: Option<String>,
+    summary: Option<String>,
+    error_text: Option<String>,
+}
+
 #[derive(Debug)]
 struct PublicReleaseCursor {
     sort_ts: String,
@@ -7890,6 +7921,171 @@ async fn load_repo_public_release_owned_row(
     .fetch_optional(&state.pool)
     .await
     .map_err(ApiError::internal)
+}
+
+fn repo_association_input_for_full_name(
+    repo_id: Option<i64>,
+    full_name: &str,
+    source: UserRepoAssociationSource,
+    now: &str,
+) -> Result<UserRepoAssociationUpsert, ApiError> {
+    let (owner_login, repo_name) = split_public_repo_full_name(full_name)
+        .ok_or_else(|| ApiError::bad_request("invalid repo full name"))?;
+    Ok(UserRepoAssociationUpsert {
+        repo_id,
+        repo_full_name: full_name.to_owned(),
+        owner_login: owner_login.to_owned(),
+        repo_name: repo_name.to_owned(),
+        html_url: Some(format!("https://github.com/{full_name}")),
+        description: None,
+        is_private: None,
+        owner_avatar_url: None,
+        open_graph_image_url: None,
+        uses_custom_open_graph_image: false,
+        first_associated_at: now.to_owned(),
+        last_seen_at: now.to_owned(),
+        source,
+    })
+}
+
+async fn register_manual_feed_repo_association(
+    state: &AppState,
+    user_id: &str,
+    full_name: &str,
+    repo_id: Option<i64>,
+) -> Result<(), ApiError> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let input = repo_association_input_for_full_name(
+        repo_id,
+        full_name,
+        UserRepoAssociationSource::ManualFeed,
+        now.as_str(),
+    )?;
+    state
+        .sqlite_writer
+        .write_foreground("user_repo_associations_manual_feed", |_| {
+            let input = input.clone();
+            let now = now.clone();
+            async move {
+                let mut tx = state.pool.begin().await?;
+                upsert_user_repo_association_tx(&mut tx, user_id, &input, now.as_str()).await?;
+                tx.commit().await?;
+                Ok::<(), anyhow::Error>(())
+            }
+        })
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+async fn prepare_repo_scope_public_repo_access(
+    state: &AppState,
+    user_id: &str,
+    scope: &FeedScope,
+) -> Result<bool, ApiError> {
+    let repo_items = match scope {
+        FeedScope::Repo { owner, repo } => vec![format!("{owner}/{repo}")],
+        FeedScope::Repos { items } => items.clone(),
+        _ => return Ok(false),
+    };
+
+    let mut needs_warmup = false;
+    for item in repo_items {
+        let Some((owner_raw, repo_raw)) = item.split_once('/') else {
+            continue;
+        };
+        let (owner, repo) = normalize_public_repo_path(owner_raw.to_owned(), repo_raw.to_owned())?;
+        let full_name_lower = format!("{owner}/{repo}").to_ascii_lowercase();
+        if let Some(existing) =
+            load_following_repo_row(state, user_id, full_name_lower.as_str()).await?
+            && existing.repo_id.is_some()
+            && existing.is_private == Some(1)
+        {
+            continue;
+        }
+        let usage =
+            upsert_public_release_usage(state, owner.clone(), repo.clone(), false, false).await?;
+        register_manual_feed_repo_association(
+            state,
+            user_id,
+            usage.full_name.as_str(),
+            usage.repo_id,
+        )
+        .await?;
+        if usage.repo_id.is_none() || usage.last_sync_status != "ready" {
+            needs_warmup = true;
+        }
+        if usage.last_sync_status == "inaccessible" {
+            ensure_public_release_usage_accessible(&usage)?;
+        }
+    }
+
+    Ok(needs_warmup)
+}
+
+async fn set_repo_following_state(
+    state: &AppState,
+    user_id: &str,
+    owner: &str,
+    repo: &str,
+    is_following: bool,
+) -> Result<FollowingRepoItem, ApiError> {
+    let (owner, repo) = normalize_public_repo_path(owner.to_owned(), repo.to_owned())?;
+    let full_name = format!("{owner}/{repo}");
+    let full_name_lower = full_name.to_ascii_lowercase();
+
+    let existing = load_following_repo_row(state, user_id, full_name_lower.as_str()).await?;
+    if existing.is_none() {
+        let usage =
+            upsert_public_release_usage(state, owner.clone(), repo.clone(), false, false).await?;
+        register_manual_feed_repo_association(
+            state,
+            user_id,
+            usage.full_name.as_str(),
+            usage.repo_id,
+        )
+        .await?;
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    state
+        .sqlite_writer
+        .write_foreground("user_repo_associations_follow_state", |_| {
+            let now = now.clone();
+            let full_name_lower = full_name_lower.clone();
+            async move {
+                sqlx::query(
+                    r#"
+                    UPDATE user_repo_associations
+                    SET is_following = ?,
+                        follow_state_source = 'user_explicit',
+                        last_seen_at = CASE
+                          WHEN last_seen_at < ? THEN ?
+                          ELSE last_seen_at
+                        END,
+                        updated_at = ?
+                    WHERE user_id = ?
+                      AND repo_full_name_lower = ?
+                    "#,
+                )
+                .bind(if is_following { 1_i64 } else { 0_i64 })
+                .bind(now.as_str())
+                .bind(now.as_str())
+                .bind(now.as_str())
+                .bind(user_id)
+                .bind(full_name_lower.as_str())
+                .execute(&state.pool)
+                .await?;
+                Ok::<(), anyhow::Error>(())
+            }
+        })
+        .await
+        .map_err(ApiError::internal)?;
+
+    let row = load_following_repo_row(state, user_id, full_name_lower.as_str())
+        .await?
+        .ok_or_else(|| ApiError::bad_request("repository association not found"))?;
+    Ok(following_repo_item_from_row(row))
 }
 
 fn repo_public_release_status_response(
@@ -8358,22 +8554,18 @@ fn public_list_item_from_row(row: PublicReleaseRow, content: &str) -> PublicRele
     }
 }
 
-async fn load_public_release_rows(
+async fn load_public_release_base_rows(
     state: &AppState,
     repo_id: i64,
     tag: Option<&str>,
     cursor: Option<&PublicReleaseCursor>,
     limit: i64,
-) -> Result<Vec<PublicReleaseRow>, ApiError> {
-    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+) -> Result<Vec<PublicReleaseBaseRow>, ApiError> {
+    let mut query = QueryBuilder::<sqlx::Sqlite>::new(
         r#"
         SELECT
           r.release_id,
           COALESCE(r.published_at, r.created_at, r.updated_at, '') AS sort_ts,
-          COALESCE(pu.full_name, printf('unknown/%d', r.repo_id)) AS repo_full_name,
-          COALESCE(sr.owner_avatar_url, ob.owner_avatar_url) AS owner_avatar_url,
-          COALESCE(sr.open_graph_image_url, ob.open_graph_image_url) AS open_graph_image_url,
-          COALESCE(sr.uses_custom_open_graph_image, ob.uses_custom_open_graph_image, 0) AS uses_custom_open_graph_image,
           r.tag_name,
           r.name,
           r.body,
@@ -8381,73 +8573,26 @@ async fn load_public_release_rows(
           r.published_at,
           r.is_prerelease,
           r.is_draft,
-          rp.previous_tag_name,
-          t.source_hash AS trans_source_hash,
-          t.status AS trans_status,
-          t.title AS trans_title,
-          t.summary AS trans_summary,
-          t.error_text AS trans_error_text,
-          s.source_hash AS smart_source_hash,
-          s.status AS smart_status,
-          s.title AS smart_title,
-          s.summary AS smart_summary,
-          s.error_text AS smart_error_text
+          (
+            SELECT prev.tag_name
+            FROM repo_releases prev
+            WHERE prev.repo_id = r.repo_id
+              AND prev.is_draft = 0
+              AND (
+                COALESCE(prev.published_at, prev.created_at, prev.updated_at, '')
+                  < COALESCE(r.published_at, r.created_at, r.updated_at, '')
+                OR (
+                  COALESCE(prev.published_at, prev.created_at, prev.updated_at, '')
+                    = COALESCE(r.published_at, r.created_at, r.updated_at, '')
+                  AND prev.release_id < r.release_id
+                )
+              )
+            ORDER BY
+              COALESCE(prev.published_at, prev.created_at, prev.updated_at, '') DESC,
+              prev.release_id DESC
+            LIMIT 1
+          ) AS previous_tag_name
         FROM repo_releases r
-        JOIN public_repo_release_usage pu
-          ON pu.repo_id = r.repo_id
-        LEFT JOIN (
-          SELECT
-            repo_id,
-            MAX(owner_avatar_url) AS owner_avatar_url,
-            MAX(open_graph_image_url) AS open_graph_image_url,
-            MAX(uses_custom_open_graph_image) AS uses_custom_open_graph_image
-          FROM starred_repos
-          WHERE is_private = 0
-          GROUP BY repo_id
-        ) sr
-          ON sr.repo_id = r.repo_id
-        LEFT JOIN (
-          SELECT
-            repo_id,
-            MAX(owner_avatar_url) AS owner_avatar_url,
-            MAX(open_graph_image_url) AS open_graph_image_url,
-            MAX(uses_custom_open_graph_image) AS uses_custom_open_graph_image
-          FROM owned_repo_star_baselines
-          GROUP BY repo_id
-        ) ob
-          ON ob.repo_id = r.repo_id
-        LEFT JOIN (
-          SELECT
-            release_id,
-            LAG(tag_name) OVER (
-              PARTITION BY repo_id
-              ORDER BY COALESCE(published_at, created_at, updated_at) ASC, release_id ASC
-            ) AS previous_tag_name
-          FROM repo_releases
-        ) rp
-          ON rp.release_id = r.release_id
-        LEFT JOIN ai_translations t
-          ON t.id = (
-            SELECT t2.id
-            FROM ai_translations t2
-            WHERE t2.entity_type = 'release_detail'
-              AND t2.entity_id = CAST(r.release_id AS TEXT)
-              AND t2.lang = 'zh-CN'
-              AND t2.status IN ('ready', 'disabled', 'missing', 'error')
-            ORDER BY CASE WHEN t2.status = 'ready' THEN 0 ELSE 1 END, t2.updated_at DESC
-            LIMIT 1
-          )
-        LEFT JOIN ai_translations s
-          ON s.id = (
-            SELECT s2.id
-            FROM ai_translations s2
-            WHERE s2.entity_type = 'release_smart'
-              AND s2.entity_id = CAST(r.release_id AS TEXT)
-              AND s2.lang = 'zh-CN'
-              AND s2.status IN ('ready', 'disabled', 'missing', 'error')
-            ORDER BY CASE WHEN s2.status = 'ready' THEN 0 ELSE 1 END, s2.updated_at DESC
-            LIMIT 1
-          )
         WHERE r.repo_id =
         "#,
     );
@@ -8475,6 +8620,170 @@ async fn load_public_release_rows(
         .fetch_all(&state.pool)
         .await
         .map_err(ApiError::internal)
+}
+
+async fn load_public_release_repo_visual(
+    state: &AppState,
+    repo_id: i64,
+) -> Result<Option<PublicReleaseRepoVisualRow>, ApiError> {
+    if let Some(row) = sqlx::query_as::<_, PublicReleaseRepoVisualRow>(
+        r#"
+        SELECT owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image
+        FROM starred_repos
+        WHERE repo_id = ?
+          AND is_private = 0
+        ORDER BY updated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    {
+        return Ok(Some(row));
+    }
+
+    sqlx::query_as::<_, PublicReleaseRepoVisualRow>(
+        r#"
+        SELECT owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image
+        FROM owned_repo_star_baselines
+        WHERE repo_id = ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+async fn load_public_release_translation_rows(
+    state: &AppState,
+    release_ids: &[i64],
+    entity_type: &str,
+) -> Result<HashMap<i64, PublicReleaseTranslationRow>, ApiError> {
+    if release_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut query = QueryBuilder::<sqlx::Sqlite>::new(
+        r#"
+        SELECT release_id, source_hash, status, title, summary, error_text
+        FROM (
+          SELECT
+            CAST(entity_id AS INTEGER) AS release_id,
+            source_hash,
+            status,
+            title,
+            summary,
+            error_text,
+            ROW_NUMBER() OVER (
+              PARTITION BY entity_id
+              ORDER BY CASE WHEN status = 'ready' THEN 0 ELSE 1 END, updated_at DESC
+            ) AS row_rank
+          FROM ai_translations
+          WHERE entity_type =
+        "#,
+    );
+    query.push_bind(entity_type);
+    query.push(
+        " AND lang = 'zh-CN' AND status IN ('ready', 'disabled', 'missing', 'error') AND entity_id IN (",
+    );
+    {
+        let mut separated = query.separated(", ");
+        for release_id in release_ids {
+            separated.push_bind(release_id.to_string());
+        }
+    }
+    query.push(
+        r#"
+        )
+        ) ranked
+        WHERE row_rank = 1
+        "#,
+    );
+
+    let rows = query
+        .build_query_as::<PublicReleaseTranslationRow>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(rows.into_iter().map(|row| (row.release_id, row)).collect())
+}
+
+fn public_release_row_from_parts(
+    base: PublicReleaseBaseRow,
+    repo_full_name: &str,
+    repo_visual: Option<&PublicReleaseRepoVisualRow>,
+    translated: Option<&PublicReleaseTranslationRow>,
+    smart: Option<&PublicReleaseTranslationRow>,
+) -> PublicReleaseRow {
+    PublicReleaseRow {
+        release_id: base.release_id,
+        sort_ts: base.sort_ts,
+        repo_full_name: repo_full_name.to_owned(),
+        owner_avatar_url: repo_visual.and_then(|row| row.owner_avatar_url.clone()),
+        open_graph_image_url: repo_visual.and_then(|row| row.open_graph_image_url.clone()),
+        uses_custom_open_graph_image: repo_visual.and_then(|row| row.uses_custom_open_graph_image),
+        tag_name: base.tag_name,
+        name: base.name,
+        body: base.body,
+        html_url: base.html_url,
+        published_at: base.published_at,
+        is_prerelease: base.is_prerelease,
+        is_draft: base.is_draft,
+        previous_tag_name: base.previous_tag_name,
+        trans_source_hash: translated.map(|row| row.source_hash.clone()),
+        trans_status: translated.map(|row| row.status.clone()),
+        trans_title: translated.and_then(|row| row.title.clone()),
+        trans_summary: translated.and_then(|row| row.summary.clone()),
+        trans_error_text: translated.and_then(|row| row.error_text.clone()),
+        smart_source_hash: smart.map(|row| row.source_hash.clone()),
+        smart_status: smart.map(|row| row.status.clone()),
+        smart_title: smart.and_then(|row| row.title.clone()),
+        smart_summary: smart.and_then(|row| row.summary.clone()),
+        smart_error_text: smart.and_then(|row| row.error_text.clone()),
+    }
+}
+
+async fn load_public_release_rows(
+    state: &AppState,
+    repo_full_name: &str,
+    repo_id: i64,
+    tag: Option<&str>,
+    cursor: Option<&PublicReleaseCursor>,
+    limit: i64,
+) -> Result<Vec<PublicReleaseRow>, ApiError> {
+    let base_rows = load_public_release_base_rows(state, repo_id, tag, cursor, limit).await?;
+    if base_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let repo_visual = load_public_release_repo_visual(state, repo_id).await?;
+    let release_ids = base_rows
+        .iter()
+        .map(|row| row.release_id)
+        .collect::<Vec<_>>();
+    let translated =
+        load_public_release_translation_rows(state, &release_ids, "release_detail").await?;
+    let smart = load_public_release_translation_rows(state, &release_ids, "release_smart").await?;
+
+    Ok(base_rows
+        .into_iter()
+        .map(|base| {
+            let detail_row = translated.get(&base.release_id);
+            let smart_row = smart.get(&base.release_id);
+            public_release_row_from_parts(
+                base,
+                repo_full_name,
+                repo_visual.as_ref(),
+                detail_row,
+                smart_row,
+            )
+        })
+        .collect())
 }
 
 pub async fn public_list_repo_releases(
@@ -8505,6 +8814,7 @@ pub async fn public_list_repo_releases(
         .transpose()?;
     let mut rows = load_public_release_rows(
         state.as_ref(),
+        usage.full_name.as_str(),
         repo_id,
         None,
         cursor.as_ref(),
@@ -8554,8 +8864,15 @@ pub async fn public_get_repo_release_detail(
     let Some(repo_id) = usage.repo_id else {
         return Ok(public_pending_response(&usage));
     };
-    let mut rows =
-        load_public_release_rows(state.as_ref(), repo_id, Some(tag.as_str()), None, 1).await?;
+    let mut rows = load_public_release_rows(
+        state.as_ref(),
+        usage.full_name.as_str(),
+        repo_id,
+        Some(tag.as_str()),
+        None,
+        1,
+    )
+    .await?;
     let Some(row) = rows.pop() else {
         if public_release_usage_should_retry_without_rows(&usage) {
             return Ok(public_pending_response(&usage));
@@ -9327,6 +9644,7 @@ enum FeedScope {
     Repos { items: Vec<String> },
     Org { org: String },
     Mine,
+    Following,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -9397,6 +9715,231 @@ fn normalize_repo_scope_item(raw: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UserRepoAssociationSource {
+    PersonalOwned,
+    GitHubStar,
+    ManualFeed,
+}
+
+impl UserRepoAssociationSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PersonalOwned => "personal_owned",
+            Self::GitHubStar => "github_star",
+            Self::ManualFeed => "manual_feed",
+        }
+    }
+
+    fn priority_rank(self) -> i64 {
+        match self {
+            Self::PersonalOwned => 0,
+            Self::GitHubStar => 1,
+            Self::ManualFeed => 2,
+        }
+    }
+
+    fn default_is_following(self) -> bool {
+        matches!(self, Self::PersonalOwned | Self::GitHubStar)
+    }
+
+    fn source_flags(self) -> (i64, i64, i64) {
+        match self {
+            Self::PersonalOwned => (1, 0, 0),
+            Self::GitHubStar => (0, 1, 0),
+            Self::ManualFeed => (0, 0, 1),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UserRepoAssociationUpsert {
+    pub repo_id: Option<i64>,
+    pub repo_full_name: String,
+    pub owner_login: String,
+    pub repo_name: String,
+    pub html_url: Option<String>,
+    pub description: Option<String>,
+    pub is_private: Option<bool>,
+    pub owner_avatar_url: Option<String>,
+    pub open_graph_image_url: Option<String>,
+    pub uses_custom_open_graph_image: bool,
+    pub first_associated_at: String,
+    pub last_seen_at: String,
+    pub source: UserRepoAssociationSource,
+}
+
+pub(crate) async fn upsert_user_repo_association_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    user_id: &str,
+    input: &UserRepoAssociationUpsert,
+    now: &str,
+) -> Result<(), sqlx::Error> {
+    let (has_personal_owned_source, has_github_star_source, has_manual_feed_source) =
+        input.source.source_flags();
+    sqlx::query(
+        r#"
+        INSERT INTO user_repo_associations (
+          id,
+          user_id,
+          repo_id,
+          repo_full_name,
+          repo_full_name_lower,
+          owner_login,
+          repo_name,
+          html_url,
+          description,
+          is_private,
+          owner_avatar_url,
+          open_graph_image_url,
+          uses_custom_open_graph_image,
+          first_source,
+          first_associated_at,
+          last_seen_at,
+          is_following,
+          follow_state_source,
+          has_personal_owned_source,
+          has_github_star_source,
+          has_manual_feed_source,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, lower(?), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'system_default', ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, repo_full_name_lower) DO UPDATE SET
+          repo_id = COALESCE(excluded.repo_id, user_repo_associations.repo_id),
+          repo_full_name = excluded.repo_full_name,
+          owner_login = excluded.owner_login,
+          repo_name = excluded.repo_name,
+          html_url = COALESCE(excluded.html_url, user_repo_associations.html_url),
+          description = COALESCE(excluded.description, user_repo_associations.description),
+          is_private = COALESCE(excluded.is_private, user_repo_associations.is_private),
+          owner_avatar_url = COALESCE(excluded.owner_avatar_url, user_repo_associations.owner_avatar_url),
+          open_graph_image_url = COALESCE(excluded.open_graph_image_url, user_repo_associations.open_graph_image_url),
+          uses_custom_open_graph_image = CASE
+            WHEN excluded.owner_avatar_url IS NOT NULL
+              OR excluded.open_graph_image_url IS NOT NULL
+              OR excluded.uses_custom_open_graph_image != 0
+              THEN excluded.uses_custom_open_graph_image
+            ELSE user_repo_associations.uses_custom_open_graph_image
+          END,
+          first_source = CASE
+            WHEN excluded.first_associated_at < user_repo_associations.first_associated_at
+              OR (
+                excluded.first_associated_at = user_repo_associations.first_associated_at
+                AND ? < CASE user_repo_associations.first_source
+                  WHEN 'personal_owned' THEN 0
+                  WHEN 'github_star' THEN 1
+                  ELSE 2
+                END
+              )
+              THEN excluded.first_source
+            ELSE user_repo_associations.first_source
+          END,
+          first_associated_at = CASE
+            WHEN excluded.first_associated_at < user_repo_associations.first_associated_at
+              THEN excluded.first_associated_at
+            ELSE user_repo_associations.first_associated_at
+          END,
+          last_seen_at = CASE
+            WHEN excluded.last_seen_at > user_repo_associations.last_seen_at
+              THEN excluded.last_seen_at
+            ELSE user_repo_associations.last_seen_at
+          END,
+          is_following = CASE
+            WHEN user_repo_associations.follow_state_source = 'user_explicit'
+              THEN user_repo_associations.is_following
+            WHEN excluded.is_following != 0
+              THEN 1
+            ELSE user_repo_associations.is_following
+          END,
+          has_personal_owned_source = MAX(user_repo_associations.has_personal_owned_source, excluded.has_personal_owned_source),
+          has_github_star_source = MAX(user_repo_associations.has_github_star_source, excluded.has_github_star_source),
+          has_manual_feed_source = MAX(user_repo_associations.has_manual_feed_source, excluded.has_manual_feed_source),
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(local_id::generate_local_id())
+    .bind(user_id)
+    .bind(input.repo_id)
+    .bind(input.repo_full_name.as_str())
+    .bind(input.repo_full_name.as_str())
+    .bind(input.owner_login.as_str())
+    .bind(input.repo_name.as_str())
+    .bind(input.html_url.as_deref())
+    .bind(input.description.as_deref())
+    .bind(input.is_private.map(|value| if value { 1_i64 } else { 0_i64 }))
+    .bind(input.owner_avatar_url.as_deref())
+    .bind(input.open_graph_image_url.as_deref())
+    .bind(input.uses_custom_open_graph_image as i64)
+    .bind(input.source.as_str())
+    .bind(input.first_associated_at.as_str())
+    .bind(input.last_seen_at.as_str())
+    .bind(input.source.default_is_following() as i64)
+    .bind(has_personal_owned_source)
+    .bind(has_github_star_source)
+    .bind(has_manual_feed_source)
+    .bind(now)
+    .bind(now)
+    .bind(input.source.priority_rank())
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+pub(crate) async fn clear_user_repo_association_source_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    user_id: &str,
+    source: UserRepoAssociationSource,
+    now: &str,
+) -> Result<(), sqlx::Error> {
+    let column = match source {
+        UserRepoAssociationSource::PersonalOwned => "has_personal_owned_source",
+        UserRepoAssociationSource::GitHubStar => "has_github_star_source",
+        UserRepoAssociationSource::ManualFeed => "has_manual_feed_source",
+    };
+    let sql =
+        format!("UPDATE user_repo_associations SET {column} = 0, updated_at = ? WHERE user_id = ?");
+    sqlx::query(sql.as_str())
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE user_repo_associations
+        SET is_following = CASE
+              WHEN has_personal_owned_source != 0 OR has_github_star_source != 0 THEN 1
+              ELSE 0
+            END,
+            updated_at = ?
+        WHERE user_id = ?
+          AND follow_state_source = 'system_default'
+        "#,
+    )
+    .bind(now)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM user_repo_associations
+        WHERE user_id = ?
+          AND has_personal_owned_source = 0
+          AND has_github_star_source = 0
+          AND has_manual_feed_source = 0
+          AND is_following = 0
+        "#,
+    )
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
 fn parse_feed_scope(
     scope: Option<&str>,
     items: Option<&str>,
@@ -9452,6 +9995,7 @@ fn parse_feed_scope(
             }))
         }
         "mine" => Ok(Some(FeedScope::Mine)),
+        "following" => Ok(Some(FeedScope::Following)),
         value => Err(ApiError::bad_request(format!("invalid scope: {value}"))),
     }
 }
@@ -10544,6 +11088,39 @@ pub struct PersonalRepoItem {
     repo_visual: Option<RepoVisual>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub struct FollowingRepoSourceSummary {
+    personal_owned: bool,
+    github_star: bool,
+    manual_feed: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct FollowingRepoItem {
+    repo_id: Option<i64>,
+    full_name: String,
+    owner_login: String,
+    name: String,
+    html_url: String,
+    description: Option<String>,
+    is_private: Option<bool>,
+    first_source: String,
+    first_associated_at: String,
+    last_seen_at: String,
+    is_following: bool,
+    follow_state_source: String,
+    repo_visual: Option<RepoVisual>,
+    sources: FollowingRepoSourceSummary,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FollowingReposResponse {
+    following_count: usize,
+    associated_count: usize,
+    items: Vec<FollowingRepoItem>,
+    associated_items: Vec<FollowingRepoItem>,
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct PersonalRepoRow {
     repo_id: i64,
@@ -10556,6 +11133,28 @@ struct PersonalRepoRow {
     owner_avatar_url: Option<String>,
     open_graph_image_url: Option<String>,
     uses_custom_open_graph_image: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct FollowingRepoRow {
+    repo_id: Option<i64>,
+    full_name: String,
+    owner_login: String,
+    name: String,
+    html_url: String,
+    description: Option<String>,
+    is_private: Option<i64>,
+    first_source: String,
+    first_associated_at: String,
+    last_seen_at: String,
+    is_following: i64,
+    follow_state_source: String,
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: i64,
+    has_personal_owned_source: i64,
+    has_github_star_source: i64,
+    has_manual_feed_source: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -10953,6 +11552,127 @@ pub async fn list_personal_repos(
     }))
 }
 
+fn following_repo_item_from_row(row: FollowingRepoRow) -> FollowingRepoItem {
+    FollowingRepoItem {
+        repo_id: row.repo_id,
+        full_name: row.full_name,
+        owner_login: row.owner_login,
+        name: row.name,
+        html_url: row.html_url,
+        description: row.description,
+        is_private: row.is_private.map(|value| value != 0),
+        first_source: row.first_source,
+        first_associated_at: row.first_associated_at,
+        last_seen_at: row.last_seen_at,
+        is_following: row.is_following != 0,
+        follow_state_source: row.follow_state_source,
+        repo_visual: repo_visual_from_parts(
+            row.owner_avatar_url,
+            row.open_graph_image_url,
+            row.uses_custom_open_graph_image != 0,
+        ),
+        sources: FollowingRepoSourceSummary {
+            personal_owned: row.has_personal_owned_source != 0,
+            github_star: row.has_github_star_source != 0,
+            manual_feed: row.has_manual_feed_source != 0,
+        },
+    }
+}
+
+async fn load_following_repo_row(
+    state: &AppState,
+    user_id: &str,
+    full_name_lower: &str,
+) -> Result<Option<FollowingRepoRow>, ApiError> {
+    sqlx::query_as::<_, FollowingRepoRow>(
+        r#"
+        SELECT
+          repo_id,
+          repo_full_name AS full_name,
+          owner_login,
+          repo_name AS name,
+          COALESCE(html_url, 'https://github.com/' || repo_full_name) AS html_url,
+          description,
+          is_private,
+          first_source,
+          first_associated_at,
+          last_seen_at,
+          is_following,
+          follow_state_source,
+          owner_avatar_url,
+          open_graph_image_url,
+          uses_custom_open_graph_image,
+          has_personal_owned_source,
+          has_github_star_source,
+          has_manual_feed_source
+        FROM user_repo_associations
+        WHERE user_id = ?
+          AND repo_full_name_lower = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(full_name_lower)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+pub async fn list_following_repos(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    headers: HeaderMap,
+) -> Result<Json<FollowingReposResponse>, ApiError> {
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
+    let rows = sqlx::query_as::<_, FollowingRepoRow>(
+        r#"
+        SELECT
+          repo_id,
+          repo_full_name AS full_name,
+          owner_login,
+          repo_name AS name,
+          COALESCE(html_url, 'https://github.com/' || repo_full_name) AS html_url,
+          description,
+          is_private,
+          first_source,
+          first_associated_at,
+          last_seen_at,
+          is_following,
+          follow_state_source,
+          owner_avatar_url,
+          open_graph_image_url,
+          uses_custom_open_graph_image,
+          has_personal_owned_source,
+          has_github_star_source,
+          has_manual_feed_source
+        FROM user_repo_associations
+        WHERE user_id = ?
+        ORDER BY is_following DESC, lower(repo_full_name) ASC
+        "#,
+    )
+    .bind(&user_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let associated_items = rows
+        .into_iter()
+        .map(following_repo_item_from_row)
+        .collect::<Vec<_>>();
+    let items = associated_items
+        .iter()
+        .filter(|repo| repo.is_following)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    Ok(Json(FollowingReposResponse {
+        following_count: items.len(),
+        associated_count: associated_items.len(),
+        items,
+        associated_items,
+    }))
+}
+
 pub(crate) fn release_detail_source_hash(
     repo_full_name: &str,
     original_title: &str,
@@ -11237,18 +11957,73 @@ async fn fetch_feed_items(
           WHERE vr.user_id = ?
             AND ? != 'mine'
             AND (
-              ? = ''
-              OR (? = 'repo' AND lower(vr.full_name) = lower(?))
+              (? = '' )
+              OR (? = 'org' AND lower(vr.owner_login) = lower(?))
+            )
+          UNION
+          SELECT
+            fr.repo_id,
+            fr.full_name,
+            fr.owner_login,
+            fr.name,
+            fr.owner_avatar_url,
+            fr.open_graph_image_url,
+            fr.uses_custom_open_graph_image
+          FROM user_following_repos fr
+          WHERE fr.user_id = ?
+            AND ? = 'following'
+          UNION
+          SELECT
+            ura.repo_id,
+            ura.repo_full_name AS full_name,
+            ura.owner_login,
+            ura.repo_name AS name,
+            ura.owner_avatar_url,
+            ura.open_graph_image_url,
+            ura.uses_custom_open_graph_image
+          FROM user_repo_associations ura
+          WHERE ura.user_id = ?
+            AND ura.repo_id IS NOT NULL
+            AND (
+              (? = 'repo' AND lower(ura.repo_full_name) = lower(?))
               OR (
                 ? = 'repos'
                 AND EXISTS (
                   SELECT 1
                   FROM json_each(?)
-                  WHERE lower(json_each.value) = lower(vr.full_name)
+                  WHERE lower(json_each.value) = lower(ura.repo_full_name)
                 )
               )
-              OR (? = 'org' AND lower(vr.owner_login) = lower(?))
-              OR (? = 'mine' AND lower(vr.owner_login) = lower(?))
+              OR (? = 'org' AND lower(ura.owner_login) = lower(?))
+            )
+          UNION
+          SELECT
+            sr.repo_id,
+            sr.full_name,
+            sr.owner_login,
+            sr.name,
+            sr.owner_avatar_url,
+            sr.open_graph_image_url,
+            sr.uses_custom_open_graph_image
+          FROM starred_repos sr
+          WHERE sr.user_id = ?
+            AND NOT EXISTS (
+              SELECT 1
+              FROM user_repo_associations ura
+              WHERE ura.user_id = sr.user_id
+                AND ura.repo_full_name_lower = lower(sr.full_name)
+            )
+            AND (
+              (? = 'repo' AND lower(sr.full_name) = lower(?))
+              OR (
+                ? = 'repos'
+                AND EXISTS (
+                  SELECT 1
+                  FROM json_each(?)
+                  WHERE lower(json_each.value) = lower(sr.full_name)
+                )
+              )
+              OR (? = 'org' AND lower(sr.owner_login) = lower(?))
             )
           UNION
           SELECT
@@ -11455,6 +12230,7 @@ async fn fetch_feed_items(
         Some(FeedScope::Repos { .. }) => "repos",
         Some(FeedScope::Org { .. }) => "org",
         Some(FeedScope::Mine) => "mine",
+        Some(FeedScope::Following) => "following",
         None => "",
     };
     let scope_repo_item = match scope {
@@ -11483,13 +12259,23 @@ async fn fetch_feed_items(
         .bind(scope_kind)
         .bind(scope_kind)
         .bind(scope_kind)
+        .bind(scope_org.as_deref())
+        .bind(user_id)
+        .bind(scope_kind)
+        .bind(user_id)
+        .bind(scope_kind)
         .bind(scope_repo_item.as_deref())
         .bind(scope_kind)
         .bind(scope_repo_items_json.as_deref())
         .bind(scope_kind)
         .bind(scope_org.as_deref())
+        .bind(user_id)
         .bind(scope_kind)
-        .bind(scope_mine_owner.as_deref())
+        .bind(scope_repo_item.as_deref())
+        .bind(scope_kind)
+        .bind(scope_repo_items_json.as_deref())
+        .bind(scope_kind)
+        .bind(scope_org.as_deref())
         .bind(user_id)
         .bind(scope_kind)
         .bind(scope_mine_owner.as_deref())
@@ -12314,6 +13100,30 @@ fn feed_item_from_row(
     }
 }
 
+pub async fn head_feed(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    headers: HeaderMap,
+    Query(q): Query<FeedQuery>,
+) -> Result<Response, ApiError> {
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
+    let scope = parse_feed_scope(q.scope.as_deref(), q.items.as_deref(), q.org.as_deref())?
+        .ok_or_else(|| ApiError::bad_request("HEAD /api/feed requires scope=repo|repos"))?;
+    if !matches!(scope, FeedScope::Repo { .. } | FeedScope::Repos { .. }) {
+        return Err(ApiError::bad_request(
+            "HEAD /api/feed only supports scope=repo|repos",
+        ));
+    }
+
+    let needs_warmup =
+        prepare_repo_scope_public_repo_access(state.as_ref(), &user_id, &scope).await?;
+    Ok(if needs_warmup {
+        StatusCode::ACCEPTED.into_response()
+    } else {
+        StatusCode::NO_CONTENT.into_response()
+    })
+}
+
 pub async fn list_feed(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -12325,6 +13135,11 @@ pub async fn list_feed(
     let viewer = load_viewer_user(state.as_ref(), &user_id).await?;
     let types = parse_feed_types(q.types.as_deref())?;
     let scope = parse_feed_scope(q.scope.as_deref(), q.items.as_deref(), q.org.as_deref())?;
+    if let Some(scope_ref) = scope.as_ref()
+        && matches!(scope_ref, FeedScope::Repo { .. } | FeedScope::Repos { .. })
+    {
+        prepare_repo_scope_public_repo_access(state.as_ref(), &user_id, scope_ref).await?;
+    }
 
     let limit = q.limit.unwrap_or(30).clamp(1, 100);
     let cursor = q.cursor.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -12369,6 +13184,42 @@ pub async fn list_feed(
     );
 
     Ok(Json(FeedResponse { items, next_cursor }))
+}
+
+pub async fn follow_repo(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    headers: HeaderMap,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<Json<FollowingRepoItem>, ApiError> {
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
+    let item = set_repo_following_state(
+        state.as_ref(),
+        &user_id,
+        owner.as_str(),
+        repo.as_str(),
+        true,
+    )
+    .await?;
+    Ok(Json(item))
+}
+
+pub async fn unfollow_repo(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    headers: HeaderMap,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<Json<FollowingRepoItem>, ApiError> {
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
+    let item = set_repo_following_state(
+        state.as_ref(),
+        &user_id,
+        owner.as_str(),
+        repo.as_str(),
+        false,
+    )
+    .await?;
+    Ok(Json(item))
 }
 
 #[derive(Debug, Deserialize)]
@@ -25055,6 +25906,18 @@ line two",
         assert_eq!(body["repo_full_name"], json!("openai/codex"));
         assert_eq!(body["items"].as_array().unwrap().len(), 1);
         assert_eq!(body["items"][0]["release_id"], json!("120"));
+        assert_eq!(
+            body["items"][0]["repo_visual"]["owner_avatar_url"],
+            json!("https://avatars.githubusercontent.com/u/14957082")
+        );
+        assert_eq!(
+            body["items"][0]["repo_visual"]["open_graph_image_url"],
+            json!("https://repository-images.githubusercontent.com/14957082/codex")
+        );
+        assert_eq!(
+            body["items"][0]["repo_visual"]["uses_custom_open_graph_image"],
+            json!(true)
+        );
 
         let row: (Option<i64>, String, Option<String>) = sqlx::query_as(
             r#"

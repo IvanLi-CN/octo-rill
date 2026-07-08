@@ -29,7 +29,16 @@ function toApiError(res: Response, body: unknown) {
 			String(payload.error?.code ?? "unknown_error"),
 		);
 	}
-	return new ApiError(res.status, res.statusText);
+	if (typeof body === "string" && body.trim()) {
+		return new ApiError(res.status, body.trim());
+	}
+	const statusText = res.statusText.trim();
+	return new ApiError(
+		res.status,
+		statusText && statusText.toLowerCase() !== "unknown"
+			? statusText
+			: `Request failed (HTTP ${res.status})`,
+	);
 }
 
 export async function apiGet<T>(path: string): Promise<T> {
@@ -39,6 +48,13 @@ export async function apiGet<T>(path: string): Promise<T> {
 		throw toApiError(res, body);
 	}
 	return (await res.json()) as T;
+}
+export async function apiHead(path: string): Promise<number> {
+	const res = await fetch(path, { method: "HEAD", credentials: "include" });
+	if (!res.ok && res.status !== 202 && res.status !== 204) {
+		throw toApiError(res, await parseJson(res));
+	}
+	return res.status;
 }
 export async function apiPost<T>(path: string): Promise<T> {
 	return apiPostJson<T>(path);
@@ -231,6 +247,32 @@ export type PersonalReposResponse = {
 	total_count: number;
 	repos: PersonalRepoItem[];
 };
+export type FollowingRepoItem = {
+	repo_id: number | null;
+	full_name: string;
+	owner_login: string;
+	name: string;
+	html_url: string;
+	description: string | null;
+	is_private: boolean | null;
+	first_source: string;
+	first_associated_at: string;
+	last_seen_at: string;
+	is_following: boolean;
+	follow_state_source: string;
+	repo_visual: RepoVisual | null;
+	sources: {
+		personal_owned: boolean;
+		github_star: boolean;
+		manual_feed: boolean;
+	};
+};
+export type FollowingReposResponse = {
+	following_count: number;
+	associated_count: number;
+	items: FollowingRepoItem[];
+	associated_items: FollowingRepoItem[];
+};
 export type DashboardUpdateList = {
 	changed: boolean;
 	new_count: number;
@@ -372,6 +414,22 @@ export type RepoPublicReleasePublicationStatusResponse = {
 	reason: string | null;
 	cache_cleanup?: AdminPublicReleaseCacheCleanup | null;
 };
+
+export async function apiGetFollowingRepos() {
+	return apiGet<FollowingReposResponse>("/api/repos/following");
+}
+
+export async function apiFollowRepo(scope: { owner: string; repo: string }) {
+	return apiPutJson<FollowingRepoItem>(
+		`/api/repos/${encodeURIComponent(scope.owner)}/${encodeURIComponent(scope.repo)}/following`,
+	);
+}
+
+export async function apiUnfollowRepo(scope: { owner: string; repo: string }) {
+	return apiDeleteJson<FollowingRepoItem>(
+		`/api/repos/${encodeURIComponent(scope.owner)}/${encodeURIComponent(scope.repo)}/following`,
+	);
+}
 export type AdminPublicReleaseReposResponse = {
 	items: AdminPublicReleaseRepoItem[];
 	page: number;
@@ -1327,20 +1385,12 @@ export async function apiGetPublicRepoReleases(input: {
 	if (input.source) params.set("source", input.source);
 	if (input.limit) params.set("limit", String(input.limit));
 	if (input.cursor) params.set("cursor", input.cursor);
-	try {
-		return await apiGet<PublicReleaseResponse>(
-			`/api/public/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases?${params.toString()}`,
-		);
-	} catch (err) {
-		if (err instanceof ApiError && err.status === 202) {
-			const res = await fetch(
-				`/api/public/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases?${params.toString()}`,
-				{ credentials: "include" },
-			);
-			return (await res.json()) as PublicReleasePendingResponse;
-		}
-		throw err;
-	}
+	const path = `/api/public/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases?${params.toString()}`;
+	const res = await fetch(path, { credentials: "include" });
+	const body = await parseJson(res);
+	if (res.status === 202) return body as PublicReleasePendingResponse;
+	if (!res.ok) throw toApiError(res, body);
+	return body as PublicReleaseResponse;
 }
 export async function apiGetPublicRepoReleaseDetail(input: {
 	owner: string;

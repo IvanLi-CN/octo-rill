@@ -185,6 +185,44 @@ test("public release pending page hides backend retry details", async ({
 	await expectNoHorizontalOverflow(page);
 });
 
+test("public release loading page does not imply first visit while known data is loading", async ({
+	page,
+}) => {
+	await installBaseApiMocks(page, () => new Promise<Response>(() => {}));
+
+	await page.goto("/octo-rill/example/releases");
+
+	await expect(page.getByText("正在读取公开 Release")).toBeVisible();
+	await expect(
+		page.getByText(
+			"正在读取这个仓库的已知 Release 数据；若本地已有共享缓存，页面会直接显示结果。",
+		),
+	).toBeVisible();
+	await expect(
+		page.getByText("首次访问会先登记仓库，Release 数据会随全局订阅同步更新。"),
+	).not.toBeVisible();
+	await expectPublicChrome(page, "octo-rill", "example");
+});
+
+test("public release error page shows http status when edge returns an empty error", async ({
+	page,
+}) => {
+	await installBaseApiMocks(page, (route) =>
+		route.fulfill({
+			status: 554,
+			body: "",
+		}),
+	);
+
+	await page.goto("/octo-rill/example/releases");
+
+	await expect(page.getByText("暂时无法展示")).toBeVisible();
+	await expect(
+		page.getByText("unknown_error: Request failed (HTTP 554)"),
+	).toBeVisible();
+	await expectPublicChrome(page, "octo-rill", "example");
+});
+
 test("public release list requests six cached releases before loading more", async ({
 	page,
 }) => {
