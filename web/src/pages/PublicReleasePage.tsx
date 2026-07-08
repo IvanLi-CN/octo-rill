@@ -31,6 +31,7 @@ import {
 } from "@/components/ui/card";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
 import type { FeedLane, ReleaseFeedItem } from "@/feed/types";
+import { cn } from "@/lib/utils";
 import { buildVersionReleaseHref } from "@/version/versionReleaseLink";
 import { useVersionMonitor } from "@/version/versionMonitor";
 
@@ -65,6 +66,16 @@ function isPendingResponse(
 
 function releaseTitle(item: Pick<PublicReleaseListItem, "name" | "tag_name">) {
 	return item.name?.trim() || item.tag_name;
+}
+
+function PulseBlock(props: { className?: string; rounded?: string }) {
+	const { className, rounded = "rounded-2xl" } = props;
+	return (
+		<div
+			className={cn("bg-muted/70 animate-pulse", rounded, className)}
+			data-testid="public-release-skeleton-block"
+		/>
+	);
 }
 
 export function PublicReleasePage(props: {
@@ -202,20 +213,15 @@ export function PublicReleasePage(props: {
 				)}
 
 				{state.status === "loading" ? (
-					<WaitingCard
-						title="正在读取公开 Release"
-						description="正在读取这个仓库的已知 Release 数据；若本地已有共享缓存，页面会直接显示结果。"
-						statusLabel="正在加载已知数据"
-						onRetry={load}
-					/>
+					<PublicReleaseLoadingSkeleton hasTag={Boolean(tag)} />
 				) : null}
 
 				{state.status === "pending" ? (
 					<WaitingCard
-						title="正在准备 Release 数据"
-						description="这是这个仓库第一次通过公开入口访问。OctoRill 已经登记请求，会随全局同步补齐 Release 缓存。"
+						title="Release 数据同步中"
+						description="这个仓库的 Release 数据还在同步中，稍后会自动重试。"
 						retryAfter={state.pending.retry_after_seconds}
-						statusLabel="同步排队中"
+						statusLabel="同步中"
 						onRetry={load}
 					/>
 				) : null}
@@ -257,6 +263,93 @@ export function PublicReleasePage(props: {
 				<PublicReleaseFooter owner={owner} repo={repo} />
 			</div>
 		</main>
+	);
+}
+
+function PublicReleaseLoadingSkeleton(props: { hasTag: boolean }) {
+	const { hasTag } = props;
+
+	if (hasTag) {
+		return (
+			<section
+				className="space-y-4"
+				aria-label="Release loading skeleton"
+				data-testid="public-release-loading-skeleton"
+			>
+				<div className="rounded-[28px] border border-border/70 bg-card/82 p-5 shadow-sm sm:p-6">
+					<div className="flex flex-wrap items-start justify-between gap-4">
+						<div className="min-w-0 flex-1 space-y-3">
+							<PulseBlock className="h-5 w-28 rounded-full" />
+							<PulseBlock className="h-9 w-3/4 max-w-xl rounded-3xl" />
+							<PulseBlock className="h-4 w-48 rounded-full" />
+						</div>
+						<div className="flex gap-2">
+							<PulseBlock className="h-10 w-20 rounded-xl" />
+							<PulseBlock className="h-10 w-20 rounded-xl" />
+							<PulseBlock className="h-10 w-20 rounded-xl" />
+						</div>
+					</div>
+					<div className="mt-6 space-y-3">
+						<PulseBlock className="h-4 w-full rounded-full" />
+						<PulseBlock className="h-4 w-[94%] rounded-full" />
+						<PulseBlock className="h-4 w-[88%] rounded-full" />
+						<PulseBlock className="h-4 w-[76%] rounded-full" />
+						<PulseBlock className="h-40 w-full rounded-[24px]" />
+					</div>
+				</div>
+			</section>
+		);
+	}
+
+	return (
+		<section
+			className="space-y-4"
+			aria-label="Release loading skeleton"
+			data-testid="public-release-loading-skeleton"
+		>
+			<div className="flex flex-wrap items-center justify-between gap-3 rounded-[28px] border border-border/70 bg-card/82 p-5 shadow-sm sm:p-6">
+				<div className="space-y-3">
+					<PulseBlock className="h-4 w-24 rounded-full" />
+					<PulseBlock className="h-8 w-48 rounded-3xl" />
+				</div>
+				<div className="flex gap-2">
+					<PulseBlock className="h-10 w-20 rounded-xl" />
+					<PulseBlock className="h-10 w-20 rounded-xl" />
+					<PulseBlock className="h-10 w-20 rounded-xl" />
+				</div>
+			</div>
+
+			{Array.from({ length: 3 }, (_, index) => (
+				<div
+					key={`public-release-loading-card-${index}`}
+					className="rounded-[28px] border border-border/70 bg-card/82 p-5 shadow-sm sm:p-6"
+				>
+					<div className="flex flex-wrap items-start justify-between gap-4">
+						<div className="min-w-0 flex-1 space-y-3">
+							<div className="flex items-center gap-3">
+								<PulseBlock className="size-11 rounded-full" />
+								<div className="min-w-0 flex-1 space-y-2">
+									<PulseBlock className="h-4 w-44 rounded-full" />
+									<PulseBlock className="h-3 w-28 rounded-full" />
+								</div>
+							</div>
+							<PulseBlock className="h-8 w-3/4 rounded-3xl" />
+						</div>
+						<div className="flex gap-2">
+							<PulseBlock className="h-9 w-16 rounded-xl" />
+							<PulseBlock className="h-9 w-16 rounded-xl" />
+							<PulseBlock className="h-9 w-16 rounded-xl" />
+						</div>
+					</div>
+					<div className="mt-6 space-y-3">
+						<PulseBlock className="h-4 w-full rounded-full" />
+						<PulseBlock className="h-4 w-[95%] rounded-full" />
+						<PulseBlock className="h-4 w-[82%] rounded-full" />
+						<PulseBlock className="h-24 w-full rounded-[22px]" />
+					</div>
+				</div>
+			))}
+		</section>
 	);
 }
 
@@ -509,7 +602,13 @@ function truncatePublicReleaseListBody(body: string | null) {
 }
 
 function ReleaseDetail({ detail }: { detail: ReleaseDetailResponse }) {
-	const [selectedLane, setSelectedLane] = useState<FeedLane>("smart");
+	const initialLane =
+		detail.smart?.status === "ready"
+			? "smart"
+			: detail.translated?.status === "ready"
+				? "translated"
+				: "original";
+	const [selectedLane, setSelectedLane] = useState<FeedLane>(initialLane);
 	const feedItem = publicReleaseDetailToFeedItem(detail);
 
 	return (

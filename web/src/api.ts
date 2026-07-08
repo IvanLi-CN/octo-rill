@@ -1378,9 +1378,10 @@ export async function apiGetPublicRepoReleases(input: {
 	source?: "page";
 	limit?: number;
 	cursor?: string | null;
+	content?: "original" | "translated" | "polished" | "all";
 }): Promise<PublicReleaseResponse> {
 	const params = new URLSearchParams();
-	params.set("content", "all");
+	params.set("content", input.content ?? "all");
 	params.set("lang", "zh-CN");
 	if (input.source) params.set("source", input.source);
 	if (input.limit) params.set("limit", String(input.limit));
@@ -1397,9 +1398,10 @@ export async function apiGetPublicRepoReleaseDetail(input: {
 	repo: string;
 	tag: string;
 	source?: "page";
+	content?: "original" | "translated" | "polished" | "all";
 }): Promise<ReleaseDetailResponse | PublicReleasePendingResponse> {
 	const params = new URLSearchParams();
-	params.set("content", "all");
+	params.set("content", input.content ?? "all");
 	params.set("lang", "zh-CN");
 	if (input.source) params.set("source", input.source);
 	const path = `/api/public/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases/tag/${encodeURIComponent(input.tag)}?${params.toString()}`;
