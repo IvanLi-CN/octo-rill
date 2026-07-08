@@ -8668,49 +8668,84 @@ async fn load_public_release_translation_rows(
         return Ok(HashMap::new());
     }
 
-    let mut query = QueryBuilder::<sqlx::Sqlite>::new(
+    let mut ready_query = QueryBuilder::<sqlx::Sqlite>::new(
         r#"
-        SELECT release_id, source_hash, status, title, summary, error_text
-        FROM (
-          SELECT
-            CAST(entity_id AS INTEGER) AS release_id,
-            source_hash,
-            status,
-            title,
-            summary,
-            error_text,
-            ROW_NUMBER() OVER (
-              PARTITION BY entity_id
-              ORDER BY CASE WHEN status = 'ready' THEN 0 ELSE 1 END, updated_at DESC
-            ) AS row_rank
-          FROM ai_translations
-          WHERE entity_type =
+        SELECT
+          CAST(entity_id AS INTEGER) AS release_id,
+          source_hash,
+          status,
+          title,
+          summary,
+          error_text
+        FROM ai_translations
+        WHERE entity_type =
         "#,
     );
-    query.push_bind(entity_type);
-    query.push(
-        " AND lang = 'zh-CN' AND status IN ('ready', 'disabled', 'missing', 'error') AND entity_id IN (",
-    );
+    ready_query.push_bind(entity_type);
+    ready_query.push(" AND lang = 'zh-CN' AND status = 'ready' AND entity_id IN (");
     {
-        let mut separated = query.separated(", ");
+        let mut separated = ready_query.separated(", ");
         for release_id in release_ids {
             separated.push_bind(release_id.to_string());
         }
     }
-    query.push(
-        r#"
-        )
-        ) ranked
-        WHERE row_rank = 1
-        "#,
-    );
+    ready_query.push(") ORDER BY entity_id, updated_at DESC");
 
-    let rows = query
+    let ready_rows = ready_query
         .build_query_as::<PublicReleaseTranslationRow>()
         .fetch_all(&state.pool)
         .await
         .map_err(ApiError::internal)?;
-    Ok(rows.into_iter().map(|row| (row.release_id, row)).collect())
+
+    let mut results = HashMap::new();
+    for row in ready_rows {
+        results.entry(row.release_id).or_insert(row);
+    }
+
+    let missing_ids = release_ids
+        .iter()
+        .copied()
+        .filter(|release_id| !results.contains_key(release_id))
+        .collect::<Vec<_>>();
+    if missing_ids.is_empty() {
+        return Ok(results);
+    }
+
+    let mut fallback_query = QueryBuilder::<sqlx::Sqlite>::new(
+        r#"
+        SELECT
+          CAST(entity_id AS INTEGER) AS release_id,
+          source_hash,
+          status,
+          title,
+          summary,
+          error_text
+        FROM ai_translations
+        WHERE entity_type =
+        "#,
+    );
+    fallback_query.push_bind(entity_type);
+    fallback_query.push(
+        " AND lang = 'zh-CN' AND status IN ('disabled', 'missing', 'error') AND entity_id IN (",
+    );
+    {
+        let mut separated = fallback_query.separated(", ");
+        for release_id in &missing_ids {
+            separated.push_bind(release_id.to_string());
+        }
+    }
+    fallback_query.push(") ORDER BY entity_id, updated_at DESC");
+
+    let fallback_rows = fallback_query
+        .build_query_as::<PublicReleaseTranslationRow>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    for row in fallback_rows {
+        results.entry(row.release_id).or_insert(row);
+    }
+
+    Ok(results)
 }
 
 fn public_release_row_from_parts(
@@ -8755,6 +8790,7 @@ async fn load_public_release_rows(
     tag: Option<&str>,
     cursor: Option<&PublicReleaseCursor>,
     limit: i64,
+    content: &str,
 ) -> Result<Vec<PublicReleaseRow>, ApiError> {
     let base_rows = load_public_release_base_rows(state, repo_id, tag, cursor, limit).await?;
     if base_rows.is_empty() {
@@ -8766,9 +8802,18 @@ async fn load_public_release_rows(
         .iter()
         .map(|row| row.release_id)
         .collect::<Vec<_>>();
-    let translated =
-        load_public_release_translation_rows(state, &release_ids, "release_detail").await?;
-    let smart = load_public_release_translation_rows(state, &release_ids, "release_smart").await?;
+    let load_translated = content == "all" || content == "translated";
+    let load_smart = content == "all" || content == "polished";
+    let translated = if load_translated {
+        load_public_release_translation_rows(state, &release_ids, "release_detail").await?
+    } else {
+        HashMap::new()
+    };
+    let smart = if load_smart {
+        load_public_release_translation_rows(state, &release_ids, "release_smart").await?
+    } else {
+        HashMap::new()
+    };
 
     Ok(base_rows
         .into_iter()
@@ -8819,6 +8864,7 @@ pub async fn public_list_repo_releases(
         None,
         cursor.as_ref(),
         limit.saturating_add(1),
+        query.content.as_deref().unwrap_or("all"),
     )
     .await?;
     if rows.is_empty() && public_release_usage_should_retry_without_rows(&usage) {
@@ -8871,6 +8917,7 @@ pub async fn public_get_repo_release_detail(
         Some(tag.as_str()),
         None,
         1,
+        query.content.as_deref().unwrap_or("all"),
     )
     .await?;
     let Some(row) = rows.pop() else {

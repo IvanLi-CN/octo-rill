@@ -172,8 +172,8 @@ test("public release pending page hides backend retry details", async ({
 
 	await page.goto("/octo-rill/example/releases");
 
-	await expect(page.getByText("正在准备 Release 数据")).toBeVisible();
-	await expect(page.getByText("同步排队中")).toBeVisible();
+	await expect(page.getByText("Release 数据同步中")).toBeVisible();
+	await expect(page.getByText("同步中", { exact: true })).toBeVisible();
 	await expect(page.getByText("约 60s 后重试")).toBeVisible();
 	await expect(
 		page.getByText("Release data is being prepared"),
@@ -185,22 +185,21 @@ test("public release pending page hides backend retry details", async ({
 	await expectNoHorizontalOverflow(page);
 });
 
-test("public release loading page does not imply first visit while known data is loading", async ({
+test("public release loading page uses a skeleton instead of loading copy", async ({
 	page,
 }) => {
 	await installBaseApiMocks(page, () => new Promise<Response>(() => {}));
 
 	await page.goto("/octo-rill/example/releases");
 
-	await expect(page.getByText("正在读取公开 Release")).toBeVisible();
 	await expect(
-		page.getByText(
-			"正在读取这个仓库的已知 Release 数据；若本地已有共享缓存，页面会直接显示结果。",
-		),
+		page.getByTestId("public-release-loading-skeleton"),
 	).toBeVisible();
 	await expect(
-		page.getByText("首次访问会先登记仓库，Release 数据会随全局订阅同步更新。"),
-	).not.toBeVisible();
+		page.getByTestId("public-release-skeleton-block").first(),
+	).toBeVisible();
+	await expect(page.getByText("正在读取公开 Release")).not.toBeVisible();
+	await expect(page.getByText("Release 数据同步中")).not.toBeVisible();
 	await expectPublicChrome(page, "octo-rill", "example");
 });
 

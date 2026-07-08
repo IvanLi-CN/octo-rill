@@ -372,10 +372,11 @@ export const LoadingKnownData: Story = {
 	args: { mode: "loading" },
 	play: async ({ canvas, canvasElement }) => {
 		await expect(
-			canvas.getByText(
-				"正在读取这个仓库的已知 Release 数据；若本地已有共享缓存，页面会直接显示结果。",
-			),
+			canvas.getByTestId("public-release-loading-skeleton"),
 		).toBeVisible();
+		expect(
+			canvas.getAllByTestId("public-release-skeleton-block").length,
+		).toBeGreaterThan(0);
 		await expectPublicReleaseFooterVersion(canvasElement);
 	},
 };
