@@ -1,5 +1,35 @@
 import { expect, test } from "@playwright/test";
 
+test("demo auth affordances stay inside mock runtime", async ({ page }) => {
+	await page.goto("/?demo=landing-welcome");
+
+	const loginLink = page.getByRole("link", { name: "使用 GitHub 登录" });
+	await expect(loginLink).toHaveAttribute("href", /demo=landing-welcome/);
+	const href = await loginLink.getAttribute("href");
+	expect(href).not.toBeNull();
+
+	await page.goto(href!);
+
+	await expect(page).toHaveURL(/demo=landing-welcome/);
+	await expect(
+		page.locator('[data-dashboard-brand-heading="true"]'),
+	).toBeVisible();
+});
+
+test("settings scene share url preserves existing route query", async ({
+	page,
+}) => {
+	await page.goto("/settings?section=my-releases&demo=settings-my-releases");
+
+	await expect(page).toHaveURL(/section=my-releases/);
+	await expect(
+		page.locator('[data-demo-inspector-chrome="desktop"]'),
+	).toContainText("/settings?section=my-releases&demo=settings-my-releases");
+	await expect(
+		page.locator('[data-demo-inspector-chrome="desktop"]'),
+	).not.toContainText("/settings?section=my-releases?demo=");
+});
+
 test("demo inspector stays fully usable when toast feedback appears", async ({
 	page,
 }) => {

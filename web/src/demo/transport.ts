@@ -9,10 +9,13 @@ import type {
 	AdminUserProfileResponse,
 	CreateApiKeyResponse,
 	FollowingReposResponse,
+	PasskeyAuthenticateVerifyResponse,
+	PasskeyRequestOptionsJSON,
 	PasskeyRegisterVerifyResponse,
 	ReactionTokenCheckResponse,
 	ReactionTokenStatusResponse,
 } from "@/api";
+import { buildDemoHref } from "@/demo/registry";
 import type {
 	FeedReactionRefreshResponse,
 	ReleaseReactions,
@@ -54,6 +57,43 @@ function currentModel() {
 		throw new Error("Demo model is not ready");
 	}
 	return model;
+}
+
+function buildDemoAuthRedirect(intent: "login" | "connect" | "logout") {
+	const snapshot = currentSnapshot();
+	if (intent === "logout") {
+		return buildDemoHref(
+			{
+				...snapshot.shareState,
+				sceneId: "landing-welcome",
+				personaId: "guest",
+				includeOwnReleases: false,
+				publicationState: "unpublished",
+			},
+			snapshot.basepath,
+		);
+	}
+
+	return buildDemoHref(
+		{
+			...snapshot.shareState,
+			personaId:
+				snapshot.shareState.personaId === "guest"
+					? "member"
+					: snapshot.shareState.personaId,
+		},
+		snapshot.basepath,
+	);
+}
+
+function redirectToDemoAuth(
+	requestUrl: string,
+	intent: "login" | "connect" | "logout",
+) {
+	return HttpResponse.redirect(
+		new URL(buildDemoAuthRedirect(intent), requestUrl).toString(),
+		302,
+	);
 }
 
 async function applyNetworkProfile(pathname: string) {
@@ -562,6 +602,26 @@ function updateAdminTask(
 }
 
 export const demoHandlers = [
+	http.get("/auth/github/login", async ({ request }) => {
+		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		if (network) return network;
+		return redirectToDemoAuth(request.url, "login");
+	}),
+	http.get("/auth/linuxdo/login", async ({ request }) => {
+		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		if (network) return network;
+		return redirectToDemoAuth(request.url, "login");
+	}),
+	http.get("/auth/github/connect", async ({ request }) => {
+		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		if (network) return network;
+		return redirectToDemoAuth(request.url, "connect");
+	}),
+	http.get("/auth/logout", async ({ request }) => {
+		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		if (network) return network;
+		return redirectToDemoAuth(request.url, "logout");
+	}),
 	http.get("/api/version", async ({ request }) => {
 		const network = await applyNetworkProfile(new URL(request.url).pathname);
 		if (network) return network;
@@ -929,21 +989,52 @@ export const demoHandlers = [
 		return json({ items: currentModel().passkeys });
 	}),
 	http.post("/api/auth/passkeys/register/options", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const url = new URL(request.url);
+		const network = await applyNetworkProfile(url.pathname);
 		if (network) return network;
 		return json({
 			publicKey: {
-				rp: { id: "demo.local", name: "OctoRill Demo" },
+				rp: { id: url.hostname, name: "OctoRill Demo" },
 				user: {
-					id: "demo-passkey-user",
+					id: "ZGVtby1wYXNza2V5LXVzZXI",
 					name: "octo-demo",
 					displayName: "Octo Demo",
 				},
-				challenge: "demo-passkey-challenge",
+				challenge: "ZGVtby1wYXNza2V5LWNoYWxsZW5nZQ",
 				pubKeyCredParams: [{ alg: -7, type: "public-key" }],
 				timeout: 60000,
 			},
 		});
+	}),
+	http.post("/api/auth/passkeys/authenticate/options", async ({ request }) => {
+		const url = new URL(request.url);
+		const network = await applyNetworkProfile(url.pathname);
+		if (network) return network;
+		const response: PasskeyRequestOptionsJSON = {
+			publicKey: {
+				challenge: "ZGVtby1wYXNza2V5LWF1dGg",
+				rpId: url.hostname,
+				allowCredentials: [
+					{
+						id: "ZGVtby1wYXNza2V5LWNyZWQ",
+						type: "public-key",
+						transports: ["internal"],
+					},
+				],
+				userVerification: "preferred",
+				hints: ["client-device"],
+			},
+		};
+		return json(response);
+	}),
+	http.post("/api/auth/passkeys/authenticate/verify", async ({ request }) => {
+		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		if (network) return network;
+		const response: PasskeyAuthenticateVerifyResponse = {
+			status: "authenticated",
+			next_path: buildDemoAuthRedirect("login"),
+		};
+		return json(response);
 	}),
 	http.post("/api/auth/passkeys/register/verify", async ({ request }) => {
 		const network = await applyNetworkProfile(new URL(request.url).pathname);

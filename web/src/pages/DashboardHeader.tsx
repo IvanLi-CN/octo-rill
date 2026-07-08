@@ -12,6 +12,7 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { BrandLogo } from "@/components/brand/BrandLogo";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { Button } from "@/components/ui/button";
+import { resolveDemoSafeAuthHref } from "@/demo/auth";
 import {
 	Tooltip,
 	TooltipContent,
@@ -468,6 +469,7 @@ export function DashboardHeader({
 	followingHref = "/focus/following",
 	followingLabel = "关注仓库",
 }: DashboardHeaderProps) {
+	const safeLogoutHref = resolveDemoSafeAuthHref(logoutHref, "logout");
 	const {
 		compactHeader,
 		headerInteracting,
@@ -748,7 +750,7 @@ export function DashboardHeader({
 						email={email}
 						isAdmin={isAdmin}
 						aiDisabledHint={aiDisabledHint}
-						logoutHref={logoutHref}
+						logoutHref={safeLogoutHref}
 						headerProgress={mobileHeaderProgress}
 						showAdminLink={isAdmin}
 						showMineEntry={showMineEntry}

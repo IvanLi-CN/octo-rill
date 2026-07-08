@@ -146,7 +146,8 @@ export function readDemoShareState(url: URL, basepath: string): DemoShareState {
 
 export function buildDemoHref(state: DemoShareState, basepath: string): string {
 	const scene = getDemoScene(state.sceneId);
-	const params = new URLSearchParams();
+	const [scenePath, sceneSearch = ""] = scene.path.split("?", 2);
+	const params = new URLSearchParams(sceneSearch);
 	params.set("demo", state.sceneId);
 	params.set("d_persona", state.personaId);
 	if (state.networkMode !== "normal") {
@@ -158,7 +159,7 @@ export function buildDemoHref(state: DemoShareState, basepath: string): string {
 	if (state.publicationState === "published") {
 		params.set("d_pub", "published");
 	}
-	const path = `${normalizeBasepath(basepath)}${scene.path}` || "/";
+	const path = `${normalizeBasepath(basepath)}${scenePath}` || "/";
 	const query = params.toString();
 	return query ? `${path}?${query}` : path;
 }

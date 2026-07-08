@@ -48,6 +48,8 @@ const listeners = new Set<() => void>();
 let demoDependencies: DemoRuntimeDependencies | null = null;
 let demoDependenciesPromise: Promise<DemoRuntimeDependencies> | null = null;
 let demoEventSourceFactory: DemoEventSourceFactory | null = null;
+let demoWorker: ReturnType<DemoRuntimeDependencies["setupWorker"]> | null =
+	null;
 let workerStartPromise: Promise<void> | null = null;
 
 const runtimeState: DemoSnapshot = {
@@ -180,6 +182,15 @@ function seedModel(shareState: DemoShareState): DemoModel {
 	});
 }
 
+function stopDemoWorker() {
+	if (!demoWorker) {
+		return;
+	}
+	demoWorker.stop();
+	workerStartPromise = null;
+	demoEventSourceFactory = null;
+}
+
 function parseHref(href: string) {
 	return new URL(href, window.location.origin);
 }
@@ -208,8 +219,8 @@ async function ensureWorkerStarted() {
 	}
 
 	const dependencies = requireDemoDependencies();
-	const worker = dependencies.setupWorker(...dependencies.demoHandlers);
-	workerStartPromise = worker
+	demoWorker ??= dependencies.setupWorker(...dependencies.demoHandlers);
+	workerStartPromise = demoWorker
 		.start({
 			quiet: true,
 			serviceWorker: {
@@ -275,7 +286,9 @@ export async function prepareDemoRuntime() {
 	runtimeState.active = active;
 
 	if (!active) {
+		stopDemoWorker();
 		runtimeState.model = null;
+		runtimeState.mutations = [];
 		runtimeSnapshot = { ...runtimeState };
 		return;
 	}
@@ -347,6 +360,9 @@ export function syncDemoRuntimeWithHref(href: string) {
 
 	const next = nextSnapshotFromUrl(parseHref(nextHref));
 	runtimeState.lastSyncedHref = nextHref;
+	if (!next.active && !runtimeState.demoBuild) {
+		stopDemoWorker();
+	}
 	runtimeState.active = next.active;
 	runtimeState.shareState = next.shareState;
 	runtimeState.model = next.model;

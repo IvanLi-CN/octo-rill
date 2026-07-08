@@ -4,6 +4,7 @@ import { AuthProviderIcon } from "@/components/brand/AuthProviderIcon";
 import { BrandLogo } from "@/components/brand/BrandLogo";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { resolveDemoSafeAuthHref } from "@/demo/auth";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { InternalLink } from "@/lib/internalNavigation";
@@ -14,6 +15,10 @@ export function NotFoundPage(props: {
 	pathname?: string | null;
 }) {
 	const { isAuthenticated, pathname } = props;
+	const githubLoginHref = resolveDemoSafeAuthHref(
+		"/auth/github/login",
+		"login",
+	);
 	const missingPath = pathname?.trim() ? pathname : null;
 
 	return (
@@ -86,7 +91,7 @@ export function NotFoundPage(props: {
 									size="lg"
 									className="rounded-2xl"
 								>
-									<a href="/auth/github/login">
+									<a href={githubLoginHref}>
 										<AuthProviderIcon provider="github" />
 										使用 GitHub 登录
 									</a>

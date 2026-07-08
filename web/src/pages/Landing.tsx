@@ -21,6 +21,7 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
+import { resolveDemoSafeAuthHref } from "@/demo/auth";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
@@ -68,6 +69,14 @@ export function Landing({
 	onRetryBoot,
 	passkeySupportOverride = null,
 }: LandingProps) {
+	const githubLoginHref = resolveDemoSafeAuthHref(
+		"/auth/github/login",
+		"login",
+	);
+	const linuxdoLoginHref = resolveDemoSafeAuthHref(
+		"/auth/linuxdo/login",
+		"login",
+	);
 	const [passkeySupported, setPasskeySupported] = useState(
 		() => passkeySupportOverride ?? browserSupportsPasskeys(),
 	);
@@ -205,7 +214,7 @@ export function Landing({
 									data-landing-login-cta
 								>
 									<a
-										href="/auth/github/login"
+										href={githubLoginHref}
 										aria-disabled={loginLinkDisabled ? "true" : undefined}
 										tabIndex={loginLinkDisabled ? -1 : undefined}
 										onClick={(event) => {
@@ -226,7 +235,7 @@ export function Landing({
 									data-landing-linuxdo-cta
 								>
 									<a
-										href="/auth/linuxdo/login"
+										href={linuxdoLoginHref}
 										aria-disabled={loginLinkDisabled ? "true" : undefined}
 										tabIndex={loginLinkDisabled ? -1 : undefined}
 										onClick={(event) => {

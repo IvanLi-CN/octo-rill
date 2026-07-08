@@ -30,6 +30,7 @@ import {
 	CardTitle,
 } from "@/components/ui/card";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
+import { InternalLink } from "@/lib/internalNavigation";
 import type { FeedLane, ReleaseFeedItem } from "@/feed/types";
 import { cn } from "@/lib/utils";
 import { buildVersionReleaseHref } from "@/version/versionReleaseLink";
@@ -189,9 +190,13 @@ export function PublicReleasePage(props: {
 		<main className="min-h-dvh bg-background text-foreground">
 			<div className="mx-auto flex min-h-dvh w-full max-w-5xl flex-col px-4 py-5 sm:px-6 lg:px-8">
 				<header className="flex flex-wrap items-center justify-between gap-3 border-b pb-4">
-					<a href="/" className="inline-flex items-center gap-3">
+					<InternalLink
+						href="/"
+						to="/"
+						className="inline-flex items-center gap-3"
+					>
 						<BrandLogo variant="wordmark" className="h-6 sm:h-5" />
-					</a>
+					</InternalLink>
 					<Button asChild variant="outline" size="sm">
 						<a
 							href={`https://github.com/${owner}/${repo}/releases`}
