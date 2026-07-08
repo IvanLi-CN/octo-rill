@@ -110,8 +110,15 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -f web/package.json ]]; then
+            owner="${GITHUB_REPOSITORY%%/*}"
+            repo="${GITHUB_REPOSITORY##*/}"
+            if [[ "${repo}" == "${owner}.github.io" ]]; then
+              docs_base="/"
+            else
+              docs_base="/${repo}/"
+            fi
             cd web
-            bun run build:demo
+            DOCS_BASE="${docs_base}" bun run build:demo
           else
             echo "No web/ package; skipping"
           fi
@@ -157,6 +164,8 @@ jobs:
             test -f .tmp/pages-site/storybook.html
             grep -q "${DOCS_BASE:-/}storybook.html" .tmp/pages-site/index.html
             grep -q '/demo/' .tmp/pages-site/index.html
+            grep -q "${DOCS_BASE:-/}demo/assets/" .tmp/pages-site/demo/index.html
+            grep -q "${DOCS_BASE:-/}demo-404-recovery.js" .tmp/pages-site/404.html
           else
             echo "docs-site/doc_build, web/storybook-static, or web/dist-demo missing; skipping"
           fi

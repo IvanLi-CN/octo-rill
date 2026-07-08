@@ -78,13 +78,19 @@ cp -R "$storybook_dir"/. "$output_dir/storybook"/
 cp -R "$demo_dir"/. "$output_dir/demo"/
 cp ".github/assets/demo-404-recovery.js" "$output_dir/demo-404-recovery.js"
 
-python3 - "$output_dir/404.html" <<'PY'
+python3 - "$output_dir/404.html" "${DOCS_BASE:-/}" <<'PY'
 from pathlib import Path
 import sys
 
 path = Path(sys.argv[1])
+docs_base = sys.argv[2].strip() or "/"
+if docs_base != "/":
+    if not docs_base.startswith("/"):
+        docs_base = f"/{docs_base}"
+    if not docs_base.endswith("/"):
+        docs_base = f"{docs_base}/"
 content = path.read_text(encoding="utf-8")
-snippet = '<script src="/demo-404-recovery.js" data-demo-404-recovery="true"></script>'
+snippet = f'<script src="{docs_base}demo-404-recovery.js" data-demo-404-recovery="true"></script>'
 
 if snippet in content:
     raise SystemExit(0)

@@ -106,6 +106,18 @@ jobs:
         with:
           bun-version: 1.3.9
 
+      - name: Compute DOCS_BASE
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repo="${GITHUB_REPOSITORY##*/}"
+          if [[ "${repo}" == "${owner}.github.io" ]]; then
+            echo "DOCS_BASE=/" >> "$GITHUB_ENV"
+          else
+            echo "DOCS_BASE=/${repo}/" >> "$GITHUB_ENV"
+          fi
+
       - name: Install demo dependencies
         run: bun install --cwd web --frozen-lockfile
 
@@ -114,7 +126,7 @@ jobs:
         run: |
           set -euo pipefail
           cd web
-          bun run build:demo
+          DOCS_BASE="${DOCS_BASE}" bun run build:demo
 
       - name: Upload demo artifact
         uses: actions/upload-artifact@v4
@@ -130,6 +142,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Compute DOCS_BASE
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repo="${GITHUB_REPOSITORY##*/}"
+          if [[ "${repo}" == "${owner}.github.io" ]]; then
+            echo "DOCS_BASE=/" >> "$GITHUB_ENV"
+          else
+            echo "DOCS_BASE=/${repo}/" >> "$GITHUB_ENV"
+          fi
 
       - name: Download docs artifact
         uses: actions/download-artifact@v4
@@ -167,10 +191,11 @@ jobs:
           test -f .tmp/pages-site/demo-404-recovery.js
           grep -q '/storybook.html' .tmp/pages-site/index.html
           grep -q '/demo/' .tmp/pages-site/index.html
+          grep -q "${DOCS_BASE}demo/assets/" .tmp/pages-site/demo/index.html
           grep -q '正在跳转到 Storybook' .tmp/pages-site/storybook.html
           grep -q './sb-manager/runtime.js' .tmp/pages-site/storybook/index.html
           grep -q './sb-common-assets/nunito-sans-regular.woff2' .tmp/pages-site/storybook/index.html
-          grep -q 'demo-404-recovery.js' .tmp/pages-site/404.html
+          grep -q "${DOCS_BASE}demo-404-recovery.js" .tmp/pages-site/404.html
 
       - name: Upload assembled Pages site artifact
         uses: actions/upload-artifact@v4

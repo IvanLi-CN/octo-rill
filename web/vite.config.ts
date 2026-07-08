@@ -14,12 +14,28 @@ const embeddedAppVersion = resolveEmbeddedAppVersion(
 	readCargoPackageVersion(repoRoot),
 );
 
+function normalizeBase(base: string | undefined): string {
+	const raw = (base ?? "/").trim();
+	if (!raw || raw === "/") return "/";
+	const withLeading = raw.startsWith("/") ? raw : `/${raw}`;
+	return withLeading.endsWith("/") ? withLeading : `${withLeading}/`;
+}
+
+function buildDemoBase(base: string | undefined): string {
+	const normalized = normalizeBase(base);
+	return normalized === "/" ? "/demo/" : `${normalized}demo/`;
+}
+
 // https://vite.dev/config/
 export default defineConfig(({ mode }) => {
 	const isDemoBuild = mode === "demo";
+	const demoBase = buildDemoBase(process.env.DOCS_BASE);
+	const demoRouterBasepath = demoBase.endsWith("/")
+		? demoBase.slice(0, -1)
+		: demoBase;
 
 	return {
-		base: isDemoBuild ? "/demo/" : "/",
+		base: isDemoBuild ? demoBase : "/",
 		build: {
 			outDir: isDemoBuild ? "dist-demo" : "dist",
 		},
@@ -27,7 +43,7 @@ export default defineConfig(({ mode }) => {
 			__APP_LOADED_VERSION__: JSON.stringify(embeddedAppVersion),
 			__OCTO_RILL_DEMO_APP__: JSON.stringify(isDemoBuild),
 			__OCTO_RILL_ROUTER_BASEPATH__: JSON.stringify(
-				isDemoBuild ? "/demo" : "/",
+				isDemoBuild ? demoRouterBasepath : "/",
 			),
 		},
 		plugins: [
