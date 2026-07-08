@@ -1,10 +1,20 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { ArrowDownToLine, RefreshCcw, WifiOff } from "lucide-react";
+import {
+	ArrowDownToLine,
+	Eye,
+	EyeOff,
+	RefreshCcw,
+	WifiOff,
+} from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, fn, userEvent, waitFor, within } from "storybook/test";
 
-import type { PersonalReposResponse, ReleaseDetailResponse } from "@/api";
+import type {
+	FollowingReposResponse,
+	PersonalReposResponse,
+	ReleaseDetailResponse,
+} from "@/api";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -48,6 +58,7 @@ import {
 	type DashboardReleaseTarget,
 } from "@/dashboard/routeState";
 import {
+	DASHBOARD_FOLLOWING_ENTRY_LABEL,
 	buildDashboardScopeSummary,
 	DASHBOARD_MINE_ENTRY_LABEL,
 	resolveDashboardScopeRepoNames,
@@ -273,6 +284,102 @@ function filterStoryFeedItemsForTab(
 	}
 }
 
+function storyFollowingRepoSourceText(
+	repo: FollowingReposResponse["items"][number],
+) {
+	const labels: string[] = [];
+	if (repo.sources.personal_owned) labels.push("个人仓库");
+	if (repo.sources.github_star) labels.push("GitHub Star");
+	if (repo.sources.manual_feed) labels.push("手动 Feed");
+	return labels.join(" · ");
+}
+
+function cloneStoryFollowingRepos(
+	response: FollowingReposResponse | null,
+): FollowingReposResponse | null {
+	if (!response) {
+		return null;
+	}
+	return {
+		...response,
+		items: response.items.map((repo) => ({
+			...repo,
+			sources: { ...repo.sources },
+		})),
+		associated_items: response.associated_items.map((repo) => ({
+			...repo,
+			sources: { ...repo.sources },
+		})),
+	};
+}
+
+function normalizeStoryFollowingRepoKey(fullName: string) {
+	return fullName.trim().toLowerCase();
+}
+
+function updateStoryFollowingReposState(
+	response: FollowingReposResponse | null,
+	fullName: string,
+	isFollowing: boolean,
+): FollowingReposResponse | null {
+	if (!response) {
+		return null;
+	}
+	const associatedItems = response.associated_items.map((repo) =>
+		repo.full_name === fullName
+			? {
+					...repo,
+					is_following: isFollowing,
+					follow_state_source: "user_explicit",
+					sources: { ...repo.sources },
+				}
+			: { ...repo, sources: { ...repo.sources } },
+	);
+	const followingItems = associatedItems.filter((repo) => repo.is_following);
+	return {
+		...response,
+		items: followingItems,
+		associated_items: associatedItems,
+		following_count: followingItems.length,
+		associated_count: associatedItems.length,
+	};
+}
+
+function updateStoryFollowingRepoSnapshot(
+	items: FollowingReposResponse["associated_items"],
+	fullName: string,
+	isFollowing: boolean,
+) {
+	const normalizedFullName = normalizeStoryFollowingRepoKey(fullName);
+	return items.map((repo) =>
+		normalizeStoryFollowingRepoKey(repo.full_name) === normalizedFullName
+			? {
+					...repo,
+					is_following: isFollowing,
+					follow_state_source: "user_explicit",
+				}
+			: repo,
+	);
+}
+
+function mergeStoryFollowingRepoSnapshot(
+	items: FollowingReposResponse["associated_items"] | null,
+	response: FollowingReposResponse | null,
+) {
+	if (!items) {
+		return null;
+	}
+	return items.map((repo) => {
+		const normalizedFullName = normalizeStoryFollowingRepoKey(repo.full_name);
+		return (
+			response?.associated_items.find(
+				(item) =>
+					normalizeStoryFollowingRepoKey(item.full_name) === normalizedFullName,
+			) ?? repo
+		);
+	});
+}
+
 function StoryScopedSummaryCard(props: {
 	scope: DashboardScope;
 	feedItems: FeedItem[];
@@ -280,6 +387,9 @@ function StoryScopedSummaryCard(props: {
 	personalRepos?: PersonalReposResponse | null;
 	personalReposLoading?: boolean;
 	personalReposError?: string | null;
+	followingRepos?: FollowingReposResponse | null;
+	followingReposLoading?: boolean;
+	followingReposError?: string | null;
 }) {
 	const {
 		scope,
@@ -288,7 +398,28 @@ function StoryScopedSummaryCard(props: {
 		personalRepos = null,
 		personalReposLoading = false,
 		personalReposError = null,
+		followingRepos = null,
+		followingReposLoading = false,
+		followingReposError = null,
 	} = props;
+	const [followingListView, setFollowingListView] = useState<
+		"following" | "associated"
+	>("following");
+	const [storyFollowingRepos, setStoryFollowingRepos] =
+		useState<FollowingReposResponse | null>(() =>
+			cloneStoryFollowingRepos(followingRepos),
+		);
+	const [followingListSnapshots, setFollowingListSnapshots] = useState<{
+		following: FollowingReposResponse["associated_items"] | null;
+		associated: FollowingReposResponse["associated_items"] | null;
+	}>({
+		following: null,
+		associated: null,
+	});
+	const followingReposSignature = useMemo(
+		() => JSON.stringify(followingRepos),
+		[followingRepos],
+	);
 	const feedRepoNames = Array.from(
 		new Set(
 			feedItems
@@ -299,11 +430,15 @@ function StoryScopedSummaryCard(props: {
 	const repoNames =
 		scope.kind === "mine" && personalRepos
 			? personalRepos.repos.map((repo) => repo.full_name)
-			: resolveDashboardScopeRepoNames(scope, feedRepoNames);
+			: scope.kind === "following" && storyFollowingRepos
+				? storyFollowingRepos.items.map((repo) => repo.full_name)
+				: resolveDashboardScopeRepoNames(scope, feedRepoNames);
 	const repoCount =
 		scope.kind === "mine" && personalRepos
 			? personalRepos.total_count
-			: repoNames.length;
+			: scope.kind === "following" && storyFollowingRepos
+				? storyFollowingRepos.following_count
+				: repoNames.length;
 	const releaseCount = feedItems.filter(
 		(item) => item.kind === "release",
 	).length;
@@ -312,7 +447,55 @@ function StoryScopedSummaryCard(props: {
 	const repoChipLimit = desktop ? 8 : 6;
 	const personalRepoItems =
 		scope.kind === "mine" && personalRepos ? personalRepos.repos : [];
+	const followingRepoItems =
+		scope.kind === "following" && storyFollowingRepos
+			? storyFollowingRepos.items
+			: [];
+	const associatedRepoItems =
+		scope.kind === "following" && storyFollowingRepos
+			? storyFollowingRepos.associated_items
+			: [];
+	const stickyFollowingItems = mergeStoryFollowingRepoSnapshot(
+		followingListSnapshots.following,
+		storyFollowingRepos,
+	);
+	const stickyAssociatedItems = mergeStoryFollowingRepoSnapshot(
+		followingListSnapshots.associated,
+		storyFollowingRepos,
+	);
+	const followingListItems =
+		followingListView === "associated"
+			? (stickyAssociatedItems ?? associatedRepoItems)
+			: (stickyFollowingItems ?? followingRepoItems);
 	const visibleRepoNames = repoNames.slice(0, repoChipLimit);
+
+	useEffect(() => {
+		if (scope.kind !== "following") {
+			setFollowingListView("following");
+		}
+		setFollowingListSnapshots({
+			following: null,
+			associated: null,
+		});
+	}, [scope.kind]);
+
+	useEffect(() => {
+		setStoryFollowingRepos(cloneStoryFollowingRepos(followingRepos));
+		setFollowingListSnapshots({
+			following: null,
+			associated: null,
+		});
+	}, [followingReposSignature]);
+
+	const handleFollowingListViewChange = (
+		nextView: "following" | "associated",
+	) => {
+		setFollowingListView(nextView);
+		setFollowingListSnapshots({
+			following: null,
+			associated: null,
+		});
+	};
 
 	return (
 		<div
@@ -343,24 +526,72 @@ function StoryScopedSummaryCard(props: {
 				{summary.description}
 			</p>
 
-			<div className="mt-4 grid gap-3 sm:grid-cols-2">
-				<div className="rounded-2xl border border-border/65 bg-background/72 px-4 py-3">
-					<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-						发布
-					</p>
-					<p className="mt-1 text-lg font-semibold text-foreground">
-						{releaseCount}
-					</p>
+			{scope.kind === "following" ? (
+				<div
+					className="mt-4 grid gap-2 sm:grid-cols-2"
+					data-dashboard-following-stat-grid="true"
+				>
+					<button
+						type="button"
+						aria-pressed={followingListView === "following"}
+						data-dashboard-following-stat="following"
+						onClick={() => handleFollowingListViewChange("following")}
+						className={[
+							"rounded-xl px-4 py-3 text-left transition-colors",
+							followingListView === "following"
+								? "bg-muted/38 text-foreground"
+								: "bg-transparent text-muted-foreground hover:bg-muted/20 hover:text-foreground",
+						].join(" ")}
+					>
+						<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+							关注仓库
+						</p>
+						<p className="mt-1 text-lg font-semibold text-foreground">
+							{storyFollowingRepos?.following_count ??
+								followingRepoItems.length}
+						</p>
+					</button>
+					<button
+						type="button"
+						aria-pressed={followingListView === "associated"}
+						data-dashboard-following-stat="associated"
+						onClick={() => handleFollowingListViewChange("associated")}
+						className={[
+							"rounded-xl px-4 py-3 text-left transition-colors",
+							followingListView === "associated"
+								? "bg-muted/38 text-foreground"
+								: "bg-transparent text-muted-foreground hover:bg-muted/20 hover:text-foreground",
+						].join(" ")}
+					>
+						<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+							关联仓库
+						</p>
+						<p className="mt-1 text-lg font-semibold text-foreground">
+							{storyFollowingRepos?.associated_count ??
+								associatedRepoItems.length}
+						</p>
+					</button>
 				</div>
-				<div className="rounded-2xl border border-border/65 bg-background/72 px-4 py-3">
-					<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-						动态
-					</p>
-					<p className="mt-1 text-lg font-semibold text-foreground">
-						{activityCount}
-					</p>
+			) : (
+				<div className="mt-4 grid gap-3 sm:grid-cols-2">
+					<div className="rounded-2xl border border-border/65 bg-background/72 px-4 py-3">
+						<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+							发布
+						</p>
+						<p className="mt-1 text-lg font-semibold text-foreground">
+							{releaseCount}
+						</p>
+					</div>
+					<div className="rounded-2xl border border-border/65 bg-background/72 px-4 py-3">
+						<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+							动态
+						</p>
+						<p className="mt-1 text-lg font-semibold text-foreground">
+							{activityCount}
+						</p>
+					</div>
 				</div>
-			</div>
+			)}
 
 			{scope.kind === "mine" && personalReposLoading && !personalRepos ? (
 				<p className="mt-4 rounded-2xl border border-dashed border-border/65 px-3 py-2 text-sm text-muted-foreground">
@@ -371,6 +602,20 @@ function StoryScopedSummaryCard(props: {
 			{scope.kind === "mine" && personalReposError ? (
 				<p className="mt-4 rounded-2xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
 					个人仓库清单加载失败，当前动态仍可继续浏览。
+				</p>
+			) : null}
+
+			{scope.kind === "following" &&
+			followingReposLoading &&
+			!followingRepos ? (
+				<p className="mt-4 rounded-2xl border border-dashed border-border/65 px-3 py-2 text-sm text-muted-foreground">
+					正在加载关注 / 关联仓库…
+				</p>
+			) : null}
+
+			{scope.kind === "following" && followingReposError ? (
+				<p className="mt-4 rounded-2xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+					仓库清单加载失败，当前动态仍可继续浏览。
 				</p>
 			) : null}
 
@@ -418,6 +663,84 @@ function StoryScopedSummaryCard(props: {
 											{releaseLabel}
 										</span>
 									</InternalLink>
+								</li>
+							);
+						})}
+					</ul>
+				</div>
+			) : scope.kind === "following" ? (
+				<div className="mt-4 border-t border-border/60 pt-4">
+					<div className="flex items-center justify-between gap-3">
+						<p className="text-sm font-medium text-foreground">
+							{followingListView === "following" ? "关注仓库" : "关联仓库"}
+						</p>
+						<p className="font-mono text-[11px] text-muted-foreground">
+							{followingListItems.length} 个
+						</p>
+					</div>
+					<ul
+						className="mt-3 max-h-80 divide-y divide-border/50 overflow-y-auto"
+						data-dashboard-following-repo-list={followingListView}
+					>
+						{followingListItems.map((repo) => {
+							const href = buildDashboardScopeHref({
+								kind: "repo",
+								owner: repo.owner_login,
+								repo: repo.name,
+							});
+							return (
+								<li key={repo.full_name} className="py-3 first:pt-0 last:pb-0">
+									<div className="flex items-start justify-between gap-3">
+										<div className="min-w-0">
+											<InternalLink
+												href={href}
+												to={href}
+												className="block truncate font-mono text-[12px] font-medium text-foreground"
+											>
+												{repo.full_name}
+											</InternalLink>
+											<p className="mt-0.5 text-xs text-muted-foreground">
+												{storyFollowingRepoSourceText(repo)}
+											</p>
+											<p className="mt-0.5 text-xs text-muted-foreground">
+												首次关联{" "}
+												{storyFormatPersonalRepoUpdatedAt(
+													repo.first_associated_at,
+												)}
+											</p>
+										</div>
+										<Button
+											type="button"
+											size="icon"
+											variant="outline"
+											className="rounded-full border-border/70 bg-background/72 text-foreground hover:bg-background/72 hover:text-foreground"
+											aria-label={repo.is_following ? "取消关注" : "关注仓库"}
+											title={repo.is_following ? "取消关注" : "关注仓库"}
+											onClick={() => {
+												setFollowingListSnapshots((current) => ({
+													...current,
+													[followingListView]: updateStoryFollowingRepoSnapshot(
+														followingListItems,
+														repo.full_name,
+														!repo.is_following,
+													),
+												}));
+												setStoryFollowingRepos((current) =>
+													updateStoryFollowingReposState(
+														current,
+														repo.full_name,
+														!repo.is_following,
+													),
+												);
+											}}
+										>
+											{repo.is_following ? (
+												<Eye className="size-4" />
+											) : (
+												<EyeOff className="size-4" />
+											)}
+										</Button>
+									</div>
 								</li>
 							);
 						})}
@@ -1960,6 +2283,137 @@ function makeScopedOrgFocusFeed(): FeedItem[] {
 	];
 }
 
+function makeFollowingReposResponse(): FollowingReposResponse {
+	return {
+		following_count: 2,
+		associated_count: 4,
+		items: [
+			{
+				repo_id: 2001,
+				full_name: "acme/rocket",
+				owner_login: "acme",
+				name: "rocket",
+				html_url: "https://github.com/acme/rocket",
+				description: "Flight systems release train",
+				is_private: false,
+				first_source: "github_star",
+				first_associated_at: "2026-03-18T10:00:00+08:00",
+				last_seen_at: "2026-04-04T18:24:00+08:00",
+				is_following: true,
+				follow_state_source: "system_default",
+				repo_visual: repoVisualFixtures.social,
+				sources: {
+					personal_owned: false,
+					github_star: true,
+					manual_feed: false,
+				},
+			},
+			{
+				repo_id: 2002,
+				full_name: "acme/satellite",
+				owner_login: "acme",
+				name: "satellite",
+				html_url: "https://github.com/acme/satellite",
+				description: "Canary branch for satellite tooling",
+				is_private: false,
+				first_source: "manual_feed",
+				first_associated_at: "2026-03-20T09:30:00+08:00",
+				last_seen_at: "2026-04-04T17:56:00+08:00",
+				is_following: true,
+				follow_state_source: "user_explicit",
+				repo_visual: repoVisualFixtures.avatar,
+				sources: {
+					personal_owned: false,
+					github_star: false,
+					manual_feed: true,
+				},
+			},
+		],
+		associated_items: [
+			{
+				repo_id: 2001,
+				full_name: "acme/rocket",
+				owner_login: "acme",
+				name: "rocket",
+				html_url: "https://github.com/acme/rocket",
+				description: "Flight systems release train",
+				is_private: false,
+				first_source: "github_star",
+				first_associated_at: "2026-03-18T10:00:00+08:00",
+				last_seen_at: "2026-04-04T18:24:00+08:00",
+				is_following: true,
+				follow_state_source: "system_default",
+				repo_visual: repoVisualFixtures.social,
+				sources: {
+					personal_owned: false,
+					github_star: true,
+					manual_feed: false,
+				},
+			},
+			{
+				repo_id: 2002,
+				full_name: "acme/satellite",
+				owner_login: "acme",
+				name: "satellite",
+				html_url: "https://github.com/acme/satellite",
+				description: "Canary branch for satellite tooling",
+				is_private: false,
+				first_source: "manual_feed",
+				first_associated_at: "2026-03-20T09:30:00+08:00",
+				last_seen_at: "2026-04-04T17:56:00+08:00",
+				is_following: true,
+				follow_state_source: "user_explicit",
+				repo_visual: repoVisualFixtures.avatar,
+				sources: {
+					personal_owned: false,
+					github_star: false,
+					manual_feed: true,
+				},
+			},
+			{
+				repo_id: 2003,
+				full_name: "acme/mission-control",
+				owner_login: "acme",
+				name: "mission-control",
+				html_url: "https://github.com/acme/mission-control",
+				description: "Ops dashboard for launch support",
+				is_private: false,
+				first_source: "personal_owned",
+				first_associated_at: "2026-03-12T08:00:00+08:00",
+				last_seen_at: "2026-04-03T09:12:00+08:00",
+				is_following: false,
+				follow_state_source: "user_explicit",
+				repo_visual: repoVisualFixtures.social,
+				sources: {
+					personal_owned: true,
+					github_star: false,
+					manual_feed: false,
+				},
+			},
+			{
+				repo_id: 2004,
+				full_name: "orbit-labs/telemetry-kit",
+				owner_login: "orbit-labs",
+				name: "telemetry-kit",
+				html_url: "https://github.com/orbit-labs/telemetry-kit",
+				description: "Shared telemetry primitives",
+				is_private: false,
+				first_source: "manual_feed",
+				first_associated_at: "2026-03-28T14:18:00+08:00",
+				last_seen_at: "2026-04-02T11:40:00+08:00",
+				is_following: false,
+				follow_state_source: "system_default",
+				repo_visual: repoVisualFixtures.avatar,
+				sources: {
+					personal_owned: false,
+					github_star: false,
+					manual_feed: true,
+				},
+			},
+		],
+	};
+}
+
 function makeMobileCompactSocialFeed(): FeedItem[] {
 	return [
 		buildRepoStarItem("mobile-star-proof", {
@@ -2861,6 +3315,9 @@ function DashboardPreview(props: {
 	personalRepos?: PersonalReposResponse | null;
 	personalReposLoading?: boolean;
 	personalReposError?: string | null;
+	followingRepos?: FollowingReposResponse | null;
+	followingReposLoading?: boolean;
+	followingReposError?: string | null;
 	generateBriefFailureDates?: string[];
 	initialBriefErrorSummariesByDate?: Record<string, string>;
 }) {
@@ -2901,6 +3358,9 @@ function DashboardPreview(props: {
 		personalRepos = null,
 		personalReposLoading = false,
 		personalReposError = null,
+		followingRepos = null,
+		followingReposLoading = false,
+		followingReposError = null,
 		generateBriefFailureDates = EMPTY_STORY_BRIEF_FAILURE_DATES,
 		initialBriefErrorSummariesByDate,
 	} = props;
@@ -3526,6 +3986,15 @@ function DashboardPreview(props: {
 										personalReposError={
 											scope.kind === "mine" ? personalReposError : null
 										}
+										followingRepos={
+											scope.kind === "following" ? followingRepos : null
+										}
+										followingReposLoading={
+											scope.kind === "following" && followingReposLoading
+										}
+										followingReposError={
+											scope.kind === "following" ? followingReposError : null
+										}
 									/>
 								</div>
 							) : null}
@@ -3593,6 +4062,15 @@ function DashboardPreview(props: {
 									}
 									personalReposError={
 										scope.kind === "mine" ? personalReposError : null
+									}
+									followingRepos={
+										scope.kind === "following" ? followingRepos : null
+									}
+									followingReposLoading={
+										scope.kind === "following" && followingReposLoading
+									}
+									followingReposError={
+										scope.kind === "following" ? followingReposError : null
 									}
 									desktop
 								/>
@@ -6926,6 +7404,9 @@ export const ScopedFocusMineMenuEntryVisible: Story = {
 		await expect(
 			canvas.getByRole("link", { name: DASHBOARD_MINE_ENTRY_LABEL }),
 		).toHaveAttribute("href", "/focus/mine");
+		await expect(
+			canvas.getByRole("link", { name: DASHBOARD_FOLLOWING_ENTRY_LABEL }),
+		).toHaveAttribute("href", "/focus/following");
 	},
 };
 
@@ -6951,6 +7432,109 @@ export const ScopedFocusMineMenuEntryVisibleWhenOptedOut: Story = {
 		await expect(
 			canvas.getByRole("link", { name: DASHBOARD_MINE_ENTRY_LABEL }),
 		).toHaveAttribute("href", "/focus/mine");
+		await expect(
+			canvas.getByRole("link", { name: DASHBOARD_FOLLOWING_ENTRY_LABEL }),
+		).toHaveAttribute("href", "/focus/following");
+	},
+};
+
+export const ScopedFocusFollowingDefault: Story = {
+	name: "Evidence / Scoped Focus Following Default",
+	args: {
+		initialTab: "all",
+		feedItems: makeScopedOrgFocusFeed(),
+		showFooter: false,
+		scope: {
+			kind: "following",
+		},
+		followingRepos: makeFollowingReposResponse(),
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"`/focus/following` 左侧持续显示关注仓库的信息流；右侧摘要卡展示关注/关联仓库数，并通过点击统计卡切换下方仓库列表。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getAllByText(DASHBOARD_FOLLOWING_ENTRY_LABEL)[0],
+		).toBeVisible();
+		await expect(canvas.getAllByText("关注")[0]).toBeVisible();
+		await expect(
+			canvas.getByRole("button", { name: /关注仓库\s*2/i }),
+		).toHaveAttribute("aria-pressed", "true");
+		await expect(
+			canvas.getByRole("button", { name: /关联仓库\s*4/i }),
+		).toHaveAttribute("aria-pressed", "false");
+		await expect(
+			canvas.getByText("acme/satellite", { selector: "a" }),
+		).toBeVisible();
+		const rocketRow = canvas
+			.getByText("acme/rocket", { selector: "a" })
+			.closest("li");
+		if (!rocketRow) {
+			throw new Error("expected rocket row");
+		}
+		await userEvent.click(
+			within(rocketRow).getByRole("button", { name: "取消关注" }),
+		);
+		await expect(
+			within(rocketRow).getByRole("button", { name: "关注仓库" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("button", { name: /关注仓库\s*1/i }),
+		).toBeVisible();
+		await expect(
+			canvas.getByText("acme/rocket", { selector: "a" }),
+		).toBeVisible();
+		await userEvent.click(
+			canvas.getByRole("button", { name: /关联仓库\s*4/i }),
+		);
+		await expect(
+			canvas.getByRole("button", { name: /关联仓库\s*4/i }),
+		).toHaveAttribute("aria-pressed", "true");
+		await expect(
+			canvas.getByText("orbit-labs/telemetry-kit", { selector: "a" }),
+		).toBeVisible();
+		const telemetryKitRow = canvas
+			.getByText("orbit-labs/telemetry-kit", { selector: "a" })
+			.closest("li");
+		if (!telemetryKitRow) {
+			throw new Error("expected telemetry-kit row");
+		}
+		await userEvent.click(
+			within(telemetryKitRow).getByRole("button", { name: "关注仓库" }),
+		);
+		await expect(
+			canvas.getByRole("button", { name: /关注仓库\s*2/i }),
+		).toBeVisible();
+		await expect(
+			within(telemetryKitRow).getByRole("button", { name: "取消关注" }),
+		).toBeVisible();
+	},
+};
+
+export const ScopedFocusFollowingManualDemo: Story = {
+	name: "Demo / Scoped Focus Following Manual",
+	args: {
+		initialTab: "all",
+		feedItems: makeScopedOrgFocusFeed(),
+		showFooter: false,
+		scope: {
+			kind: "following",
+		},
+		followingRepos: makeFollowingReposResponse(),
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"手动演示用：当前列表在切换关注状态后不会立即消失，只有主动切换关注/关联统计卡时才按新的筛选结果重排。",
+			},
+		},
 	},
 };
 

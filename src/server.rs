@@ -207,6 +207,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/repos/{owner}/{repo}/releases/tag/{tag}/detail",
             get(api::get_release_detail_by_repo_tag),
         )
+        .route("/repos/following", get(api::list_following_repos))
+        .route(
+            "/repos/{owner}/{repo}/following",
+            put(api::follow_repo).delete(api::unfollow_repo),
+        )
         .route(
             "/repos/{owner}/{repo}/public-release",
             get(api::get_repo_public_release_status)
@@ -223,7 +228,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route("/notifications", get(api::list_notifications))
         .route("/dashboard/updates", get(api::dashboard_updates))
-        .route("/feed", get(api::list_feed))
+        .route("/feed", get(api::list_feed).head(api::head_feed))
         .route("/feed/reactions/refresh", post(api::refresh_feed_reactions))
         .route("/admin/users", get(api::admin_list_users))
         .route("/admin/users/{user_id}", patch(api::admin_patch_user))

@@ -1,6 +1,7 @@
 import type { DashboardScope } from "@/dashboard/routeState";
 
 export const DASHBOARD_MINE_ENTRY_LABEL = "个人仓库";
+export const DASHBOARD_FOLLOWING_ENTRY_LABEL = "关注仓库";
 
 export function resolveDashboardScopeRepoNames(
 	scope: DashboardScope,
@@ -13,6 +14,7 @@ export function resolveDashboardScopeRepoNames(
 			return scope.items;
 		case "org":
 		case "mine":
+		case "following":
 			return feedRepoNames;
 	}
 }
@@ -57,6 +59,14 @@ export function buildDashboardScopeSummary(
 				kicker: "个人",
 				description: "查看当前 GitHub 登录账号的个人仓库发布与相关动态。",
 				chip: "个人",
+				secondary: itemLabel,
+			};
+		case "following":
+			return {
+				title: DASHBOARD_FOLLOWING_ENTRY_LABEL,
+				kicker: "关注",
+				description: "查看你当前关注仓库的发布与相关动态。",
+				chip: "关注",
 				secondary: itemLabel,
 			};
 	}

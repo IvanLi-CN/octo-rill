@@ -65,7 +65,9 @@ function buildBaselineKey(options: {
 				? `repos:${options.scope.items.join(",")}`
 				: options.scope.kind === "org"
 					? `org:${options.scope.org}`
-					: "mine";
+					: options.scope.kind === "mine"
+						? "mine"
+						: "following";
 	return `${options.feedType}|briefs:${options.includeBriefs ? "1" : "0"}|notifications:${options.includeNotifications ? "1" : "0"}|scope:${scopeKey}`;
 }
 

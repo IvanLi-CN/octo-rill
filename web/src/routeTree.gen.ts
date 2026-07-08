@@ -20,6 +20,7 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as AdminIndexRouteImport } from './routes/admin/index'
 import { Route as FocusReposRouteImport } from './routes/focus/repos'
 import { Route as FocusMineRouteImport } from './routes/focus/mine'
+import { Route as FocusFollowingRouteImport } from './routes/focus/following'
 import { Route as BindGithubRouteImport } from './routes/bind/github'
 import { Route as AdminUsersRouteImport } from './routes/admin/users'
 import { Route as AdminReposRouteImport } from './routes/admin/repos'
@@ -27,10 +28,12 @@ import { Route as AdminPublicReleasesRouteImport } from './routes/admin/public-r
 import { Route as AdminJobsRouteRouteImport } from './routes/admin/jobs/route'
 import { Route as FocusReposIndexRouteImport } from './routes/focus/repos/index'
 import { Route as FocusMineIndexRouteImport } from './routes/focus/mine/index'
+import { Route as FocusFollowingIndexRouteImport } from './routes/focus/following/index'
 import { Route as AdminJobsIndexRouteImport } from './routes/admin/jobs/index'
 import { Route as FocusReposReleasesRouteImport } from './routes/focus/repos/releases'
 import { Route as FocusOrgOrgRouteImport } from './routes/focus/org/$org'
 import { Route as FocusMineReleasesRouteImport } from './routes/focus/mine/releases'
+import { Route as FocusFollowingReleasesRouteImport } from './routes/focus/following/releases'
 import { Route as AdminJobsTranslationsRouteImport } from './routes/admin/jobs/translations'
 import { Route as AdminJobsSubscriptionsRouteImport } from './routes/admin/jobs/subscriptions'
 import { Route as AdminJobsScheduledRouteImport } from './routes/admin/jobs/scheduled'
@@ -105,6 +108,13 @@ const FocusMineRoute = FocusMineRouteImport.update({
   path: '/focus/mine',
   getParentRoute: () => rootRouteImport,
 } as any).lazy(() => import('./routes/focus/mine.lazy').then((d) => d.Route))
+const FocusFollowingRoute = FocusFollowingRouteImport.update({
+  id: '/focus/following',
+  path: '/focus/following',
+  getParentRoute: () => rootRouteImport,
+} as any).lazy(() =>
+  import('./routes/focus/following.lazy').then((d) => d.Route),
+)
 const BindGithubRoute = BindGithubRouteImport.update({
   id: '/bind/github',
   path: '/bind/github',
@@ -146,6 +156,13 @@ const FocusMineIndexRoute = FocusMineIndexRouteImport.update({
 } as any).lazy(() =>
   import('./routes/focus/mine/index.lazy').then((d) => d.Route),
 )
+const FocusFollowingIndexRoute = FocusFollowingIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => FocusFollowingRoute,
+} as any).lazy(() =>
+  import('./routes/focus/following/index.lazy').then((d) => d.Route),
+)
 const AdminJobsIndexRoute = AdminJobsIndexRouteImport.update({
   id: '/',
   path: '/',
@@ -173,6 +190,13 @@ const FocusMineReleasesRoute = FocusMineReleasesRouteImport.update({
   getParentRoute: () => FocusMineRoute,
 } as any).lazy(() =>
   import('./routes/focus/mine/releases.lazy').then((d) => d.Route),
+)
+const FocusFollowingReleasesRoute = FocusFollowingReleasesRouteImport.update({
+  id: '/releases',
+  path: '/releases',
+  getParentRoute: () => FocusFollowingRoute,
+} as any).lazy(() =>
+  import('./routes/focus/following/releases.lazy').then((d) => d.Route),
 )
 const AdminJobsTranslationsRoute = AdminJobsTranslationsRouteImport.update({
   id: '/translations',
@@ -325,6 +349,7 @@ export interface FileRoutesByFullPath {
   '/admin/repos': typeof AdminReposRoute
   '/admin/users': typeof AdminUsersRoute
   '/bind/github': typeof BindGithubRoute
+  '/focus/following': typeof FocusFollowingRouteWithChildren
   '/focus/mine': typeof FocusMineRouteWithChildren
   '/focus/repos': typeof FocusReposRouteWithChildren
   '/admin/': typeof AdminIndexRoute
@@ -333,10 +358,12 @@ export interface FileRoutesByFullPath {
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
   '/admin/jobs/subscriptions': typeof AdminJobsSubscriptionsRouteWithChildren
   '/admin/jobs/translations': typeof AdminJobsTranslationsRoute
+  '/focus/following/releases': typeof FocusFollowingReleasesRoute
   '/focus/mine/releases': typeof FocusMineReleasesRoute
   '/focus/org/$org': typeof FocusOrgOrgRouteWithChildren
   '/focus/repos/releases': typeof FocusReposReleasesRoute
   '/admin/jobs/': typeof AdminJobsIndexRoute
+  '/focus/following/': typeof FocusFollowingIndexRoute
   '/focus/mine/': typeof FocusMineIndexRoute
   '/focus/repos/': typeof FocusReposIndexRoute
   '/admin/jobs/tasks/$taskId': typeof AdminJobsTasksTaskIdRouteRouteWithChildren
@@ -370,9 +397,11 @@ export interface FileRoutesByTo {
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
   '/admin/jobs/subscriptions': typeof AdminJobsSubscriptionsRouteWithChildren
   '/admin/jobs/translations': typeof AdminJobsTranslationsRoute
+  '/focus/following/releases': typeof FocusFollowingReleasesRoute
   '/focus/mine/releases': typeof FocusMineReleasesRoute
   '/focus/repos/releases': typeof FocusReposReleasesRoute
   '/admin/jobs': typeof AdminJobsIndexRoute
+  '/focus/following': typeof FocusFollowingIndexRoute
   '/focus/mine': typeof FocusMineIndexRoute
   '/focus/repos': typeof FocusReposIndexRoute
   '/admin/jobs/subscriptions/$taskId': typeof AdminJobsSubscriptionsTaskIdRoute
@@ -402,6 +431,7 @@ export interface FileRoutesById {
   '/admin/repos': typeof AdminReposRoute
   '/admin/users': typeof AdminUsersRoute
   '/bind/github': typeof BindGithubRoute
+  '/focus/following': typeof FocusFollowingRouteWithChildren
   '/focus/mine': typeof FocusMineRouteWithChildren
   '/focus/repos': typeof FocusReposRouteWithChildren
   '/admin/': typeof AdminIndexRoute
@@ -410,10 +440,12 @@ export interface FileRoutesById {
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
   '/admin/jobs/subscriptions': typeof AdminJobsSubscriptionsRouteWithChildren
   '/admin/jobs/translations': typeof AdminJobsTranslationsRoute
+  '/focus/following/releases': typeof FocusFollowingReleasesRoute
   '/focus/mine/releases': typeof FocusMineReleasesRoute
   '/focus/org/$org': typeof FocusOrgOrgRouteWithChildren
   '/focus/repos/releases': typeof FocusReposReleasesRoute
   '/admin/jobs/': typeof AdminJobsIndexRoute
+  '/focus/following/': typeof FocusFollowingIndexRoute
   '/focus/mine/': typeof FocusMineIndexRoute
   '/focus/repos/': typeof FocusReposIndexRoute
   '/admin/jobs/tasks/$taskId': typeof AdminJobsTasksTaskIdRouteRouteWithChildren
@@ -446,6 +478,7 @@ export interface FileRouteTypes {
     | '/admin/repos'
     | '/admin/users'
     | '/bind/github'
+    | '/focus/following'
     | '/focus/mine'
     | '/focus/repos'
     | '/admin/'
@@ -454,10 +487,12 @@ export interface FileRouteTypes {
     | '/admin/jobs/scheduled'
     | '/admin/jobs/subscriptions'
     | '/admin/jobs/translations'
+    | '/focus/following/releases'
     | '/focus/mine/releases'
     | '/focus/org/$org'
     | '/focus/repos/releases'
     | '/admin/jobs/'
+    | '/focus/following/'
     | '/focus/mine/'
     | '/focus/repos/'
     | '/admin/jobs/tasks/$taskId'
@@ -491,9 +526,11 @@ export interface FileRouteTypes {
     | '/admin/jobs/scheduled'
     | '/admin/jobs/subscriptions'
     | '/admin/jobs/translations'
+    | '/focus/following/releases'
     | '/focus/mine/releases'
     | '/focus/repos/releases'
     | '/admin/jobs'
+    | '/focus/following'
     | '/focus/mine'
     | '/focus/repos'
     | '/admin/jobs/subscriptions/$taskId'
@@ -522,6 +559,7 @@ export interface FileRouteTypes {
     | '/admin/repos'
     | '/admin/users'
     | '/bind/github'
+    | '/focus/following'
     | '/focus/mine'
     | '/focus/repos'
     | '/admin/'
@@ -530,10 +568,12 @@ export interface FileRouteTypes {
     | '/admin/jobs/scheduled'
     | '/admin/jobs/subscriptions'
     | '/admin/jobs/translations'
+    | '/focus/following/releases'
     | '/focus/mine/releases'
     | '/focus/org/$org'
     | '/focus/repos/releases'
     | '/admin/jobs/'
+    | '/focus/following/'
     | '/focus/mine/'
     | '/focus/repos/'
     | '/admin/jobs/tasks/$taskId'
@@ -561,6 +601,7 @@ export interface RootRouteChildren {
   SettingsRoute: typeof SettingsRoute
   StarsRoute: typeof StarsRoute
   BindGithubRoute: typeof BindGithubRoute
+  FocusFollowingRoute: typeof FocusFollowingRouteWithChildren
   FocusMineRoute: typeof FocusMineRouteWithChildren
   FocusReposRoute: typeof FocusReposRouteWithChildren
   OwnerRepoReleasesRoute: typeof OwnerRepoReleasesRouteWithChildren
@@ -648,6 +689,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof FocusMineRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/focus/following': {
+      id: '/focus/following'
+      path: '/focus/following'
+      fullPath: '/focus/following'
+      preLoaderRoute: typeof FocusFollowingRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/bind/github': {
       id: '/bind/github'
       path: '/bind/github'
@@ -697,6 +745,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof FocusMineIndexRouteImport
       parentRoute: typeof FocusMineRoute
     }
+    '/focus/following/': {
+      id: '/focus/following/'
+      path: '/'
+      fullPath: '/focus/following/'
+      preLoaderRoute: typeof FocusFollowingIndexRouteImport
+      parentRoute: typeof FocusFollowingRoute
+    }
     '/admin/jobs/': {
       id: '/admin/jobs/'
       path: '/'
@@ -724,6 +779,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/focus/mine/releases'
       preLoaderRoute: typeof FocusMineReleasesRouteImport
       parentRoute: typeof FocusMineRoute
+    }
+    '/focus/following/releases': {
+      id: '/focus/following/releases'
+      path: '/releases'
+      fullPath: '/focus/following/releases'
+      preLoaderRoute: typeof FocusFollowingReleasesRouteImport
+      parentRoute: typeof FocusFollowingRoute
     }
     '/admin/jobs/translations': {
       id: '/admin/jobs/translations'
@@ -926,6 +988,20 @@ const AdminRouteRouteWithChildren = AdminRouteRoute._addFileChildren(
   AdminRouteRouteChildren,
 )
 
+interface FocusFollowingRouteChildren {
+  FocusFollowingReleasesRoute: typeof FocusFollowingReleasesRoute
+  FocusFollowingIndexRoute: typeof FocusFollowingIndexRoute
+}
+
+const FocusFollowingRouteChildren: FocusFollowingRouteChildren = {
+  FocusFollowingReleasesRoute: FocusFollowingReleasesRoute,
+  FocusFollowingIndexRoute: FocusFollowingIndexRoute,
+}
+
+const FocusFollowingRouteWithChildren = FocusFollowingRoute._addFileChildren(
+  FocusFollowingRouteChildren,
+)
+
 interface FocusMineRouteChildren {
   FocusMineReleasesRoute: typeof FocusMineReleasesRoute
   FocusMineIndexRoute: typeof FocusMineIndexRoute
@@ -1018,6 +1094,7 @@ const rootRouteChildren: RootRouteChildren = {
   SettingsRoute: SettingsRoute,
   StarsRoute: StarsRoute,
   BindGithubRoute: BindGithubRoute,
+  FocusFollowingRoute: FocusFollowingRouteWithChildren,
   FocusMineRoute: FocusMineRouteWithChildren,
   FocusReposRoute: FocusReposRouteWithChildren,
   OwnerRepoReleasesRoute: OwnerRepoReleasesRouteWithChildren,
