@@ -209,7 +209,13 @@ const publicReleaseItems = [
 	}),
 ];
 
-type PublicReleaseStoryMode = "pending" | "list" | "detail" | "detail-long";
+type PublicReleaseStoryMode =
+	| "loading"
+	| "pending"
+	| "list"
+	| "detail"
+	| "detail-long"
+	| "error";
 
 function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 	const storyWindow = window as StoryWindow;
@@ -223,6 +229,9 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 				: input;
 		const url = new URL(req.url, window.location.origin);
 		if (url.pathname.startsWith("/api/public/repos/")) {
+			if (mode === "loading") {
+				return new Promise<Response>(() => {});
+			}
 			if (mode === "pending") {
 				return new Response(
 					JSON.stringify({
@@ -239,6 +248,9 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 						headers: { "content-type": "application/json" },
 					},
 				);
+			}
+			if (mode === "error") {
+				return new Response("", { status: 554 });
 			}
 			if (mode === "detail" || mode === "detail-long") {
 				return new Response(
@@ -356,9 +368,32 @@ export const PendingSync: Story = {
 	},
 };
 
+export const LoadingKnownData: Story = {
+	args: { mode: "loading" },
+	play: async ({ canvas, canvasElement }) => {
+		await expect(
+			canvas.getByText(
+				"正在读取这个仓库的已知 Release 数据；若本地已有共享缓存，页面会直接显示结果。",
+			),
+		).toBeVisible();
+		await expectPublicReleaseFooterVersion(canvasElement);
+	},
+};
+
 export const ReleaseList: Story = {
 	args: { mode: "list" },
 	play: async ({ canvasElement }) => {
+		await expectPublicReleaseFooterVersion(canvasElement);
+	},
+};
+
+export const ErrorEdgeTimeout: Story = {
+	args: { mode: "error" },
+	play: async ({ canvas, canvasElement }) => {
+		await expect(canvas.getByText("暂时无法展示")).toBeVisible();
+		await expect(
+			canvas.getByText("unknown_error: Request failed (HTTP 554)"),
+		).toBeVisible();
 		await expectPublicReleaseFooterVersion(canvasElement);
 	},
 };

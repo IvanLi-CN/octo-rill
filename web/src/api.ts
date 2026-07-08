@@ -29,7 +29,16 @@ function toApiError(res: Response, body: unknown) {
 			String(payload.error?.code ?? "unknown_error"),
 		);
 	}
-	return new ApiError(res.status, res.statusText);
+	if (typeof body === "string" && body.trim()) {
+		return new ApiError(res.status, body.trim());
+	}
+	const statusText = res.statusText.trim();
+	return new ApiError(
+		res.status,
+		statusText && statusText.toLowerCase() !== "unknown"
+			? statusText
+			: `Request failed (HTTP ${res.status})`,
+	);
 }
 
 export async function apiGet<T>(path: string): Promise<T> {
@@ -1327,20 +1336,12 @@ export async function apiGetPublicRepoReleases(input: {
 	if (input.source) params.set("source", input.source);
 	if (input.limit) params.set("limit", String(input.limit));
 	if (input.cursor) params.set("cursor", input.cursor);
-	try {
-		return await apiGet<PublicReleaseResponse>(
-			`/api/public/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases?${params.toString()}`,
-		);
-	} catch (err) {
-		if (err instanceof ApiError && err.status === 202) {
-			const res = await fetch(
-				`/api/public/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases?${params.toString()}`,
-				{ credentials: "include" },
-			);
-			return (await res.json()) as PublicReleasePendingResponse;
-		}
-		throw err;
-	}
+	const path = `/api/public/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases?${params.toString()}`;
+	const res = await fetch(path, { credentials: "include" });
+	const body = await parseJson(res);
+	if (res.status === 202) return body as PublicReleasePendingResponse;
+	if (!res.ok) throw toApiError(res, body);
+	return body as PublicReleaseResponse;
 }
 export async function apiGetPublicRepoReleaseDetail(input: {
 	owner: string;

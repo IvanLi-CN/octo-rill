@@ -7494,6 +7494,37 @@ struct PublicReleaseRow {
     smart_error_text: Option<String>,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct PublicReleaseBaseRow {
+    release_id: i64,
+    sort_ts: String,
+    tag_name: String,
+    name: Option<String>,
+    body: Option<String>,
+    html_url: String,
+    published_at: Option<String>,
+    is_prerelease: i64,
+    is_draft: i64,
+    previous_tag_name: Option<String>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct PublicReleaseRepoVisualRow {
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: Option<i64>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct PublicReleaseTranslationRow {
+    release_id: i64,
+    source_hash: String,
+    status: String,
+    title: Option<String>,
+    summary: Option<String>,
+    error_text: Option<String>,
+}
+
 #[derive(Debug)]
 struct PublicReleaseCursor {
     sort_ts: String,
@@ -8358,22 +8389,18 @@ fn public_list_item_from_row(row: PublicReleaseRow, content: &str) -> PublicRele
     }
 }
 
-async fn load_public_release_rows(
+async fn load_public_release_base_rows(
     state: &AppState,
     repo_id: i64,
     tag: Option<&str>,
     cursor: Option<&PublicReleaseCursor>,
     limit: i64,
-) -> Result<Vec<PublicReleaseRow>, ApiError> {
-    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+) -> Result<Vec<PublicReleaseBaseRow>, ApiError> {
+    let mut query = QueryBuilder::<sqlx::Sqlite>::new(
         r#"
         SELECT
           r.release_id,
           COALESCE(r.published_at, r.created_at, r.updated_at, '') AS sort_ts,
-          COALESCE(pu.full_name, printf('unknown/%d', r.repo_id)) AS repo_full_name,
-          COALESCE(sr.owner_avatar_url, ob.owner_avatar_url) AS owner_avatar_url,
-          COALESCE(sr.open_graph_image_url, ob.open_graph_image_url) AS open_graph_image_url,
-          COALESCE(sr.uses_custom_open_graph_image, ob.uses_custom_open_graph_image, 0) AS uses_custom_open_graph_image,
           r.tag_name,
           r.name,
           r.body,
@@ -8381,73 +8408,26 @@ async fn load_public_release_rows(
           r.published_at,
           r.is_prerelease,
           r.is_draft,
-          rp.previous_tag_name,
-          t.source_hash AS trans_source_hash,
-          t.status AS trans_status,
-          t.title AS trans_title,
-          t.summary AS trans_summary,
-          t.error_text AS trans_error_text,
-          s.source_hash AS smart_source_hash,
-          s.status AS smart_status,
-          s.title AS smart_title,
-          s.summary AS smart_summary,
-          s.error_text AS smart_error_text
+          (
+            SELECT prev.tag_name
+            FROM repo_releases prev
+            WHERE prev.repo_id = r.repo_id
+              AND prev.is_draft = 0
+              AND (
+                COALESCE(prev.published_at, prev.created_at, prev.updated_at, '')
+                  < COALESCE(r.published_at, r.created_at, r.updated_at, '')
+                OR (
+                  COALESCE(prev.published_at, prev.created_at, prev.updated_at, '')
+                    = COALESCE(r.published_at, r.created_at, r.updated_at, '')
+                  AND prev.release_id < r.release_id
+                )
+              )
+            ORDER BY
+              COALESCE(prev.published_at, prev.created_at, prev.updated_at, '') DESC,
+              prev.release_id DESC
+            LIMIT 1
+          ) AS previous_tag_name
         FROM repo_releases r
-        JOIN public_repo_release_usage pu
-          ON pu.repo_id = r.repo_id
-        LEFT JOIN (
-          SELECT
-            repo_id,
-            MAX(owner_avatar_url) AS owner_avatar_url,
-            MAX(open_graph_image_url) AS open_graph_image_url,
-            MAX(uses_custom_open_graph_image) AS uses_custom_open_graph_image
-          FROM starred_repos
-          WHERE is_private = 0
-          GROUP BY repo_id
-        ) sr
-          ON sr.repo_id = r.repo_id
-        LEFT JOIN (
-          SELECT
-            repo_id,
-            MAX(owner_avatar_url) AS owner_avatar_url,
-            MAX(open_graph_image_url) AS open_graph_image_url,
-            MAX(uses_custom_open_graph_image) AS uses_custom_open_graph_image
-          FROM owned_repo_star_baselines
-          GROUP BY repo_id
-        ) ob
-          ON ob.repo_id = r.repo_id
-        LEFT JOIN (
-          SELECT
-            release_id,
-            LAG(tag_name) OVER (
-              PARTITION BY repo_id
-              ORDER BY COALESCE(published_at, created_at, updated_at) ASC, release_id ASC
-            ) AS previous_tag_name
-          FROM repo_releases
-        ) rp
-          ON rp.release_id = r.release_id
-        LEFT JOIN ai_translations t
-          ON t.id = (
-            SELECT t2.id
-            FROM ai_translations t2
-            WHERE t2.entity_type = 'release_detail'
-              AND t2.entity_id = CAST(r.release_id AS TEXT)
-              AND t2.lang = 'zh-CN'
-              AND t2.status IN ('ready', 'disabled', 'missing', 'error')
-            ORDER BY CASE WHEN t2.status = 'ready' THEN 0 ELSE 1 END, t2.updated_at DESC
-            LIMIT 1
-          )
-        LEFT JOIN ai_translations s
-          ON s.id = (
-            SELECT s2.id
-            FROM ai_translations s2
-            WHERE s2.entity_type = 'release_smart'
-              AND s2.entity_id = CAST(r.release_id AS TEXT)
-              AND s2.lang = 'zh-CN'
-              AND s2.status IN ('ready', 'disabled', 'missing', 'error')
-            ORDER BY CASE WHEN s2.status = 'ready' THEN 0 ELSE 1 END, s2.updated_at DESC
-            LIMIT 1
-          )
         WHERE r.repo_id =
         "#,
     );
@@ -8475,6 +8455,170 @@ async fn load_public_release_rows(
         .fetch_all(&state.pool)
         .await
         .map_err(ApiError::internal)
+}
+
+async fn load_public_release_repo_visual(
+    state: &AppState,
+    repo_id: i64,
+) -> Result<Option<PublicReleaseRepoVisualRow>, ApiError> {
+    if let Some(row) = sqlx::query_as::<_, PublicReleaseRepoVisualRow>(
+        r#"
+        SELECT owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image
+        FROM starred_repos
+        WHERE repo_id = ?
+          AND is_private = 0
+        ORDER BY updated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    {
+        return Ok(Some(row));
+    }
+
+    sqlx::query_as::<_, PublicReleaseRepoVisualRow>(
+        r#"
+        SELECT owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image
+        FROM owned_repo_star_baselines
+        WHERE repo_id = ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+async fn load_public_release_translation_rows(
+    state: &AppState,
+    release_ids: &[i64],
+    entity_type: &str,
+) -> Result<HashMap<i64, PublicReleaseTranslationRow>, ApiError> {
+    if release_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut query = QueryBuilder::<sqlx::Sqlite>::new(
+        r#"
+        SELECT release_id, source_hash, status, title, summary, error_text
+        FROM (
+          SELECT
+            CAST(entity_id AS INTEGER) AS release_id,
+            source_hash,
+            status,
+            title,
+            summary,
+            error_text,
+            ROW_NUMBER() OVER (
+              PARTITION BY entity_id
+              ORDER BY CASE WHEN status = 'ready' THEN 0 ELSE 1 END, updated_at DESC
+            ) AS row_rank
+          FROM ai_translations
+          WHERE entity_type =
+        "#,
+    );
+    query.push_bind(entity_type);
+    query.push(
+        " AND lang = 'zh-CN' AND status IN ('ready', 'disabled', 'missing', 'error') AND entity_id IN (",
+    );
+    {
+        let mut separated = query.separated(", ");
+        for release_id in release_ids {
+            separated.push_bind(release_id.to_string());
+        }
+    }
+    query.push(
+        r#"
+        )
+        ) ranked
+        WHERE row_rank = 1
+        "#,
+    );
+
+    let rows = query
+        .build_query_as::<PublicReleaseTranslationRow>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(rows.into_iter().map(|row| (row.release_id, row)).collect())
+}
+
+fn public_release_row_from_parts(
+    base: PublicReleaseBaseRow,
+    repo_full_name: &str,
+    repo_visual: Option<&PublicReleaseRepoVisualRow>,
+    translated: Option<&PublicReleaseTranslationRow>,
+    smart: Option<&PublicReleaseTranslationRow>,
+) -> PublicReleaseRow {
+    PublicReleaseRow {
+        release_id: base.release_id,
+        sort_ts: base.sort_ts,
+        repo_full_name: repo_full_name.to_owned(),
+        owner_avatar_url: repo_visual.and_then(|row| row.owner_avatar_url.clone()),
+        open_graph_image_url: repo_visual.and_then(|row| row.open_graph_image_url.clone()),
+        uses_custom_open_graph_image: repo_visual.and_then(|row| row.uses_custom_open_graph_image),
+        tag_name: base.tag_name,
+        name: base.name,
+        body: base.body,
+        html_url: base.html_url,
+        published_at: base.published_at,
+        is_prerelease: base.is_prerelease,
+        is_draft: base.is_draft,
+        previous_tag_name: base.previous_tag_name,
+        trans_source_hash: translated.map(|row| row.source_hash.clone()),
+        trans_status: translated.map(|row| row.status.clone()),
+        trans_title: translated.and_then(|row| row.title.clone()),
+        trans_summary: translated.and_then(|row| row.summary.clone()),
+        trans_error_text: translated.and_then(|row| row.error_text.clone()),
+        smart_source_hash: smart.map(|row| row.source_hash.clone()),
+        smart_status: smart.map(|row| row.status.clone()),
+        smart_title: smart.and_then(|row| row.title.clone()),
+        smart_summary: smart.and_then(|row| row.summary.clone()),
+        smart_error_text: smart.and_then(|row| row.error_text.clone()),
+    }
+}
+
+async fn load_public_release_rows(
+    state: &AppState,
+    repo_full_name: &str,
+    repo_id: i64,
+    tag: Option<&str>,
+    cursor: Option<&PublicReleaseCursor>,
+    limit: i64,
+) -> Result<Vec<PublicReleaseRow>, ApiError> {
+    let base_rows = load_public_release_base_rows(state, repo_id, tag, cursor, limit).await?;
+    if base_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let repo_visual = load_public_release_repo_visual(state, repo_id).await?;
+    let release_ids = base_rows
+        .iter()
+        .map(|row| row.release_id)
+        .collect::<Vec<_>>();
+    let translated =
+        load_public_release_translation_rows(state, &release_ids, "release_detail").await?;
+    let smart = load_public_release_translation_rows(state, &release_ids, "release_smart").await?;
+
+    Ok(base_rows
+        .into_iter()
+        .map(|base| {
+            let detail_row = translated.get(&base.release_id);
+            let smart_row = smart.get(&base.release_id);
+            public_release_row_from_parts(
+                base,
+                repo_full_name,
+                repo_visual.as_ref(),
+                detail_row,
+                smart_row,
+            )
+        })
+        .collect())
 }
 
 pub async fn public_list_repo_releases(
@@ -8505,6 +8649,7 @@ pub async fn public_list_repo_releases(
         .transpose()?;
     let mut rows = load_public_release_rows(
         state.as_ref(),
+        usage.full_name.as_str(),
         repo_id,
         None,
         cursor.as_ref(),
@@ -8554,8 +8699,15 @@ pub async fn public_get_repo_release_detail(
     let Some(repo_id) = usage.repo_id else {
         return Ok(public_pending_response(&usage));
     };
-    let mut rows =
-        load_public_release_rows(state.as_ref(), repo_id, Some(tag.as_str()), None, 1).await?;
+    let mut rows = load_public_release_rows(
+        state.as_ref(),
+        usage.full_name.as_str(),
+        repo_id,
+        Some(tag.as_str()),
+        None,
+        1,
+    )
+    .await?;
     let Some(row) = rows.pop() else {
         if public_release_usage_should_retry_without_rows(&usage) {
             return Ok(public_pending_response(&usage));
@@ -25055,6 +25207,18 @@ line two",
         assert_eq!(body["repo_full_name"], json!("openai/codex"));
         assert_eq!(body["items"].as_array().unwrap().len(), 1);
         assert_eq!(body["items"][0]["release_id"], json!("120"));
+        assert_eq!(
+            body["items"][0]["repo_visual"]["owner_avatar_url"],
+            json!("https://avatars.githubusercontent.com/u/14957082")
+        );
+        assert_eq!(
+            body["items"][0]["repo_visual"]["open_graph_image_url"],
+            json!("https://repository-images.githubusercontent.com/14957082/codex")
+        );
+        assert_eq!(
+            body["items"][0]["repo_visual"]["uses_custom_open_graph_image"],
+            json!(true)
+        );
 
         let row: (Option<i64>, String, Option<String>) = sqlx::query_as(
             r#"
