@@ -9,6 +9,7 @@ import {
 	type ReactNode,
 } from "react";
 
+import { isDemoMode } from "@/demo/runtime";
 import { registerPwaServiceWorker } from "@/pwa/serviceWorkerRegistration";
 
 type HealthResponse = {
@@ -177,6 +178,9 @@ function useVersionMonitorController(
 	}, []);
 
 	useEffect(() => {
+		if (isDemoMode()) {
+			return;
+		}
 		registerPwaServiceWorker({
 			onNeedRefresh(controller) {
 				serviceWorkerRefreshRef.current = controller.applyUpdate;

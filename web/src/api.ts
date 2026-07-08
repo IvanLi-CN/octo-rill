@@ -1,4 +1,5 @@
 import type { RepoVisual } from "@/lib/repoVisual";
+import { openAppEventSource } from "@/demo/eventSource";
 
 export class ApiError extends Error {
 	public status: number;
@@ -1187,7 +1188,9 @@ export async function apiCancelAdminRealtimeTask(
 	);
 }
 export function apiOpenAdminJobsEventsStream(): EventSource {
-	return new EventSource("/api/admin/jobs/events", { withCredentials: true });
+	return openAppEventSource("/api/admin/jobs/events", {
+		withCredentials: true,
+	});
 }
 export async function apiGetAdminScheduledSlots(): Promise<AdminScheduledSlotsResponse> {
 	return apiGet<AdminScheduledSlotsResponse>("/api/admin/jobs/scheduled");

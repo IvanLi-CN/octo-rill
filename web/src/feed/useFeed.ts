@@ -137,6 +137,7 @@ export function useFeed(
 	type: FeedRequestType = "all",
 	options?: {
 		userId?: string;
+		viewerStateKey?: string | null;
 		scope?: DashboardScope | null;
 		initialData?: {
 			type: FeedRequestType;
@@ -149,14 +150,22 @@ export function useFeed(
 	const queryClient = useQueryClient();
 	const initialData = options?.initialData;
 	const userId = options?.userId ?? "anonymous";
+	const viewerStateKey = options?.viewerStateKey ?? null;
 	const scope = options?.scope ?? null;
 	const scopeSignature = useMemo(
 		() => buildDashboardScopeSignature(scope),
 		[scope],
 	);
 	const queryKey = useMemo(
-		() => dashboardFeedQueryKey({ userId, type, scope, cursor: null }),
-		[scopeSignature, type, userId],
+		() =>
+			dashboardFeedQueryKey({
+				userId,
+				type,
+				scope,
+				viewerStateKey,
+				cursor: null,
+			}),
+		[scopeSignature, type, userId, viewerStateKey],
 	);
 	const initialStateMatches = initialData?.type === type;
 	const [loadingMore, setLoadingMore] = useState(false);
@@ -247,6 +256,7 @@ export function useFeed(
 				userId,
 				type,
 				scope,
+				viewerStateKey,
 				cursor: currentNextCursor,
 			});
 			const page = await queryClient.fetchQuery<DashboardFeedQueryData>({
@@ -300,6 +310,7 @@ export function useFeed(
 		scopeSignature,
 		type,
 		userId,
+		viewerStateKey,
 	]);
 
 	const refresh = useCallback(

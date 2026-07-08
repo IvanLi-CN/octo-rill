@@ -15,30 +15,42 @@ const embeddedAppVersion = resolveEmbeddedAppVersion(
 );
 
 // https://vite.dev/config/
-export default defineConfig({
-	define: {
-		__APP_LOADED_VERSION__: JSON.stringify(embeddedAppVersion),
-	},
-	plugins: [
-		tanstackRouter({
-			target: "react",
-			autoCodeSplitting: true,
-		}),
-		react(),
-		tailwindcss(),
-	],
-	resolve: {
-		alias: {
-			"@": path.resolve(__dirname, "./src"),
+export default defineConfig(({ mode }) => {
+	const isDemoBuild = mode === "demo";
+
+	return {
+		base: isDemoBuild ? "/demo/" : "/",
+		build: {
+			outDir: isDemoBuild ? "dist-demo" : "dist",
 		},
-	},
-	server: {
-		host: "127.0.0.1",
-		port: 55174,
-		strictPort: true,
-		proxy: {
-			"/api": "http://127.0.0.1:58090",
-			"/auth": "http://127.0.0.1:58090",
+		define: {
+			__APP_LOADED_VERSION__: JSON.stringify(embeddedAppVersion),
+			__OCTO_RILL_DEMO_APP__: JSON.stringify(isDemoBuild),
+			__OCTO_RILL_ROUTER_BASEPATH__: JSON.stringify(
+				isDemoBuild ? "/demo" : "/",
+			),
 		},
-	},
+		plugins: [
+			tanstackRouter({
+				target: "react",
+				autoCodeSplitting: true,
+			}),
+			react(),
+			tailwindcss(),
+		],
+		resolve: {
+			alias: {
+				"@": path.resolve(__dirname, "./src"),
+			},
+		},
+		server: {
+			host: "127.0.0.1",
+			port: 55174,
+			strictPort: true,
+			proxy: {
+				"/api": "http://127.0.0.1:58090",
+				"/auth": "http://127.0.0.1:58090",
+			},
+		},
+	};
 });

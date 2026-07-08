@@ -26,7 +26,9 @@ import {
 	apiPublishRepoPublicRelease,
 	apiUnpublishRepoPublicRelease,
 } from "@/api";
+import { openAppEventSource } from "@/demo/eventSource";
 import {
+	buildDashboardWarmViewerStateKey,
 	persistDashboardWarmSnapshot,
 	type DashboardWarmSnapshot,
 } from "@/auth/startupCache";
@@ -1604,8 +1606,10 @@ export function Dashboard(props: {
 					updatedAt: 0,
 				}
 			: null;
+	const viewerStateKey = buildDashboardWarmViewerStateKey(me);
 	const feed = useFeed(feedRequestType, {
 		userId: me.user.id,
+		viewerStateKey,
 		initialData: warmFeedData,
 		scope,
 	});
@@ -2730,7 +2734,7 @@ export function Dashboard(props: {
 	useEffect(() => {
 		if (!accessTaskStream) return;
 
-		const source = new EventSource(accessTaskStream.eventPath);
+		const source = openAppEventSource(accessTaskStream.eventPath);
 		let reconnectTimer: number | null = null;
 		const clearReconnectTimer = () => {
 			if (reconnectTimer === null) return;
@@ -2901,7 +2905,7 @@ export function Dashboard(props: {
 				continue;
 			}
 
-			const source = new EventSource(task.eventPath);
+			const source = openAppEventSource(task.eventPath);
 			let reconnectTimer: number | null = null;
 			const clearReconnectTimer = () => {
 				if (reconnectTimer === null) return;
@@ -3782,6 +3786,7 @@ export function Dashboard(props: {
 		}
 		persistDashboardWarmSnapshot({
 			userId: me.user.id,
+			viewerStateKey: buildDashboardWarmViewerStateKey(me),
 			routeState: buildDashboardWarmRouteState(routeState),
 			feedRequestType,
 			feedItems: feed.items,

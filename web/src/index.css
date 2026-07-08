@@ -34,6 +34,9 @@
 	--ring: oklch(0.7 0.05 240);
 	--surface-radial: rgb(0 0 0 / 3%);
 	--surface-grid-line: rgb(0 0 0 / 3%);
+	--dashboard-fresh-cue-border: oklch(0.68 0.15 198 / 0.42);
+	--dashboard-fresh-cue-fill: oklch(0.77 0.12 192 / 0.1);
+	--dashboard-fresh-cue-spark: oklch(0.99 0.028 180 / 0.9);
 }
 
 .dark {
@@ -57,6 +60,9 @@
 	--ring: oklch(0.556 0 0);
 	--surface-radial: rgb(147 197 253 / 10%);
 	--surface-grid-line: rgb(255 255 255 / 5%);
+	--dashboard-fresh-cue-border: oklch(0.7 0.13 197 / 0.52);
+	--dashboard-fresh-cue-fill: oklch(0.71 0.11 192 / 0.16);
+	--dashboard-fresh-cue-spark: oklch(0.96 0.03 186 / 0.92);
 }
 
 @theme inline {
@@ -242,9 +248,9 @@
 	.dashboard-fresh-cue::before {
 		position: absolute;
 		inset: -6px;
-		border: 1px solid oklch(0.68 0.15 198 / 0.42);
+		border: 1px solid var(--dashboard-fresh-cue-border);
 		border-radius: inherit;
-		background: oklch(0.77 0.12 192 / 0.1);
+		background: var(--dashboard-fresh-cue-fill);
 		opacity: 0;
 		transform: scale(0.68);
 		animation: dashboard-fresh-cue-breathe 1800ms cubic-bezier(0.22, 1, 0.36, 1)
@@ -260,7 +266,7 @@
 		width: 3px;
 		height: 3px;
 		border-radius: inherit;
-		background: oklch(0.99 0.028 180 / 0.9);
+		background: var(--dashboard-fresh-cue-spark);
 		animation: dashboard-fresh-cue-spark 1800ms ease-in-out infinite;
 		content: "";
 		will-change: opacity, transform;

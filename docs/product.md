@@ -81,6 +81,10 @@ Dashboard 采用主列 + 侧栏结构，核心标签为：
 
 右侧侧栏长期承担 Inbox 快捷入口；在 `日报` 标签下还同时承担日报列表。Release 详情的 canonical deep link 采用 `/<owner>/<repo>/releases/tag/<tag>?from=<tab>`，其中 `from` 只表达返回上下文，默认 `briefs`。
 
+### Web Demo
+
+`/demo/` 是公开页面级验收面，不承担真实业务写路径。它复用同一套路由与页面组件，但在 `demo=<scene-id>` 下强制进入 mock-only runtime，并通过 inspector 暴露 persona、network、关键 toggle 与 simulated write 行为。
+
 #### 全部
 
 用统一时间线混排发布更新、获星与关注动态。历史日组会优先折叠成日报卡片；当用户切换到列表视图时，再展开原始活动卡片。

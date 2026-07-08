@@ -1,12 +1,15 @@
 import { RouterProvider } from "@tanstack/react-router";
 
 import { AuthBootstrapProvider } from "@/auth/AuthBootstrap";
+import { DemoBootstrapBoundary } from "@/demo/runtime";
 import { router } from "@/router";
 
 function App() {
 	return (
 		<AuthBootstrapProvider>
-			<RouterProvider router={router} />
+			<DemoBootstrapBoundary>
+				<RouterProvider router={router} />
+			</DemoBootstrapBoundary>
 		</AuthBootstrapProvider>
 	);
 }

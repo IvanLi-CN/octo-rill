@@ -5,7 +5,7 @@ description: 用一条最短路径在本地启动 OctoRill。
 
 # 快速开始
 
-这份快速开始只覆盖一条最短可用路径：启动后端、启动前端，然后进入登录页或 Dashboard。可选工具（Storybook、docs-site）放在文末。
+这份快速开始只覆盖一条最短可用路径：启动后端、启动前端，然后进入登录页或 Dashboard。可选工具（Web Demo、Storybook、docs-site）放在文末。
 
 ## 准备环境
 
@@ -106,6 +106,15 @@ bun run storybook
 打开 `http://127.0.0.1:55176`。
 
 适合在改 UI、补 stories、核对边界状态时使用。
+
+### Web Demo
+
+```bash
+cd web
+bun run build:demo
+```
+
+构建完成后，最终静态产物会落在 `web/dist-demo/`，并在 GitHub Pages 上公开到 `/demo/`。它适合做页面级 mock-only 验收、视觉证据和 deep-link 复现。
 
 ### 文档站
 

@@ -16,10 +16,12 @@
 		"includes": [
 			"**",
 			"!**/dist",
+			"!**/dist-demo",
 			"!**/dist-ssr",
 			"!**/storybook-static",
 			"!**/test-results",
 			"!**/playwright-report",
+			"!**/mockServiceWorker.js",
 			"!**/src/routeTree.gen.ts"
 		]
 	},
