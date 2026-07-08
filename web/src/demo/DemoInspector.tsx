@@ -52,6 +52,7 @@ const DESKTOP_PANEL_MIN_HEIGHT = 360;
 const DESKTOP_PANEL_TARGET_HEIGHT = 640;
 const DESKTOP_PANEL_COLLAPSED_HEIGHT = 52;
 const DESKTOP_PANEL_TOAST_GAP = 12;
+const INSPECTOR_SCROLL_CUE_THRESHOLD = 12;
 
 function getOpenToastBottomInViewport(bounds: { left: number; right: number }) {
 	if (typeof document === "undefined") return 0;
@@ -279,9 +280,14 @@ function DesktopInspectorChrome(props: {
 	const { headerHeight, viewportBottomInset, viewportTopInset } =
 		useAppShellChrome();
 	const panelRef = useRef<HTMLDivElement | null>(null);
+	const scrollerRef = useRef<HTMLDivElement | null>(null);
 	const dragOffsetRef = useRef<{ x: number; y: number } | null>(null);
 	const [dragging, setDragging] = useState(false);
 	const [viewportRevision, setViewportRevision] = useState(0);
+	const [scrollCues, setScrollCues] = useState({
+		showTop: false,
+		showBottom: false,
+	});
 
 	useEffect(() => {
 		if (typeof window === "undefined") return;
@@ -312,6 +318,64 @@ function DesktopInspectorChrome(props: {
 		});
 		return () => observer.disconnect();
 	}, []);
+
+	useEffect(() => {
+		if (collapsed) {
+			setScrollCues({ showTop: false, showBottom: false });
+			return;
+		}
+		const scroller = scrollerRef.current;
+		if (!scroller) return;
+
+		const syncScrollCues = () => {
+			const remainingScroll = scroller.scrollHeight - scroller.clientHeight;
+			const nextShowTop =
+				remainingScroll > INSPECTOR_SCROLL_CUE_THRESHOLD &&
+				scroller.scrollTop > INSPECTOR_SCROLL_CUE_THRESHOLD;
+			const nextShowBottom =
+				remainingScroll > INSPECTOR_SCROLL_CUE_THRESHOLD &&
+				scroller.scrollTop < remainingScroll - INSPECTOR_SCROLL_CUE_THRESHOLD;
+			setScrollCues((current) =>
+				current.showTop === nextShowTop && current.showBottom === nextShowBottom
+					? current
+					: {
+							showTop: nextShowTop,
+							showBottom: nextShowBottom,
+						},
+			);
+		};
+
+		syncScrollCues();
+		scroller.addEventListener("scroll", syncScrollCues, { passive: true });
+		const resizeObserver =
+			typeof ResizeObserver === "undefined"
+				? null
+				: new ResizeObserver(syncScrollCues);
+		resizeObserver?.observe(scroller);
+		const content = scroller.firstElementChild;
+		if (content) {
+			resizeObserver?.observe(content);
+		}
+		const mutationObserver = new MutationObserver(syncScrollCues);
+		mutationObserver.observe(scroller, {
+			subtree: true,
+			childList: true,
+			characterData: true,
+			attributes: true,
+		});
+		window.addEventListener("resize", syncScrollCues);
+		const visualViewport = window.visualViewport;
+		visualViewport?.addEventListener("resize", syncScrollCues);
+		visualViewport?.addEventListener("scroll", syncScrollCues);
+		return () => {
+			scroller.removeEventListener("scroll", syncScrollCues);
+			resizeObserver?.disconnect();
+			mutationObserver.disconnect();
+			window.removeEventListener("resize", syncScrollCues);
+			visualViewport?.removeEventListener("resize", syncScrollCues);
+			visualViewport?.removeEventListener("scroll", syncScrollCues);
+		};
+	}, [collapsed, viewportRevision]);
 
 	const frameWidth =
 		panelRef.current?.offsetWidth ?? (collapsed ? 176 : DESKTOP_PANEL_WIDTH);
@@ -473,11 +537,33 @@ function DesktopInspectorChrome(props: {
 						<Minimize2 className="size-4" />
 					</Button>
 				</div>
-				<div
-					className="min-h-0 flex-1 overflow-y-auto p-4"
-					data-demo-inspector-scroller="true"
-				>
-					{children}
+				<div className="relative min-h-0 flex-1">
+					{scrollCues.showTop ? (
+						<div
+							className="pointer-events-none absolute inset-x-0 top-0 z-10 h-5 bg-linear-to-b from-background via-background/85 to-transparent"
+							data-demo-inspector-scroll-cue="top"
+						/>
+					) : null}
+					<div
+						ref={scrollerRef}
+						className="h-full min-h-0 overflow-y-auto p-4 pb-5"
+						data-demo-inspector-scroller="true"
+					>
+						{children}
+					</div>
+					{scrollCues.showBottom ? (
+						<>
+							<div
+								className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-12 bg-linear-to-t from-background via-background/86 to-transparent"
+								data-demo-inspector-scroll-cue="bottom"
+							/>
+							<div className="pointer-events-none absolute inset-x-0 bottom-3 z-10 flex justify-center">
+								<div className="rounded-full border bg-background/92 px-2.5 py-1 font-medium text-[10px] text-muted-foreground shadow-sm backdrop-blur">
+									向下滚动查看更多
+								</div>
+							</div>
+						</>
+					) : null}
 				</div>
 			</div>
 		</div>

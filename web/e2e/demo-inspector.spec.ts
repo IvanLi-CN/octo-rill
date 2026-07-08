@@ -11,6 +11,9 @@ test("demo inspector stays fully usable when toast feedback appears", async ({
 
 	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
 	await expect(inspector).toBeVisible();
+	await expect(
+		page.locator('[data-demo-inspector-scroll-cue="bottom"]'),
+	).toBeVisible();
 
 	await page.getByRole("button", { name: "发布公开页" }).click();
 
@@ -75,4 +78,20 @@ test("demo inspector stays fully usable when toast feedback appears", async ({
 	if (overlapsToastHorizontally) {
 		expect(geometry.titleTop).toBeGreaterThanOrEqual(geometry.toastBottom + 4);
 	}
+
+	await page
+		.locator('[data-demo-inspector-scroller="true"]')
+		.evaluate((element) => {
+			element.scrollTo({
+				top: element.scrollHeight,
+				behavior: "instant",
+			});
+		});
+
+	await expect(
+		page.locator('[data-demo-inspector-scroll-cue="top"]'),
+	).toBeVisible();
+	await expect(
+		page.locator('[data-demo-inspector-scroll-cue="bottom"]'),
+	).toBeHidden();
 });
