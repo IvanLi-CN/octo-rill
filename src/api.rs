@@ -6977,7 +6977,7 @@ pub async fn list_releases(
         r#"
         SELECT sr.full_name, r.tag_name, r.name, r.published_at, r.html_url, r.is_prerelease, r.is_draft
         FROM repo_releases r
-        JOIN user_following_repos sr
+        JOIN user_release_visible_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
         ORDER BY COALESCE(r.published_at, r.created_at) DESC
         LIMIT 200
@@ -7083,7 +7083,7 @@ async fn fetch_release_detail_row_by_release_id(
           FROM repo_releases
         ) rp
           ON rp.release_id = r.release_id
-        LEFT JOIN user_repo_associations sr
+        LEFT JOIN user_release_visible_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
         LEFT JOIN ai_translations t
           ON t.user_id = ?
@@ -7160,7 +7160,7 @@ async fn fetch_release_detail_row_by_locator(
           FROM repo_releases
         ) rp
           ON rp.release_id = r.release_id
-        LEFT JOIN user_repo_associations sr
+        LEFT JOIN user_release_visible_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
         LEFT JOIN ai_translations t
           ON t.user_id = ?
@@ -11946,6 +11946,34 @@ async fn fetch_feed_items(
     let sql = r#"
         WITH scoped_visible_repos AS (
           SELECT
+            vr.repo_id,
+            vr.full_name,
+            vr.owner_login,
+            vr.name,
+            vr.owner_avatar_url,
+            vr.open_graph_image_url,
+            vr.uses_custom_open_graph_image
+          FROM user_release_visible_repos vr
+          WHERE vr.user_id = ?
+            AND ? != 'mine'
+            AND (
+              (? = '' )
+              OR (? = 'org' AND lower(vr.owner_login) = lower(?))
+            )
+          UNION
+          SELECT
+            fr.repo_id,
+            fr.full_name,
+            fr.owner_login,
+            fr.name,
+            fr.owner_avatar_url,
+            fr.open_graph_image_url,
+            fr.uses_custom_open_graph_image
+          FROM user_following_repos fr
+          WHERE fr.user_id = ?
+            AND ? = 'following'
+          UNION
+          SELECT
             ura.repo_id,
             ura.repo_full_name AS full_name,
             ura.owner_login,
@@ -11956,11 +11984,8 @@ async fn fetch_feed_items(
           FROM user_repo_associations ura
           WHERE ura.user_id = ?
             AND ura.repo_id IS NOT NULL
-            AND ? != 'mine'
             AND (
-              (? = '' AND ura.is_following != 0)
-              OR (? = 'following' AND ura.is_following != 0)
-              OR (? = 'repo' AND lower(ura.repo_full_name) = lower(?))
+              (? = 'repo' AND lower(ura.repo_full_name) = lower(?))
               OR (
                 ? = 'repos'
                 AND EXISTS (
@@ -11970,7 +11995,35 @@ async fn fetch_feed_items(
                 )
               )
               OR (? = 'org' AND lower(ura.owner_login) = lower(?))
-              OR (? = 'mine' AND lower(ura.owner_login) = lower(?) AND ura.has_personal_owned_source != 0)
+            )
+          UNION
+          SELECT
+            sr.repo_id,
+            sr.full_name,
+            sr.owner_login,
+            sr.name,
+            sr.owner_avatar_url,
+            sr.open_graph_image_url,
+            sr.uses_custom_open_graph_image
+          FROM starred_repos sr
+          WHERE sr.user_id = ?
+            AND NOT EXISTS (
+              SELECT 1
+              FROM user_repo_associations ura
+              WHERE ura.user_id = sr.user_id
+                AND ura.repo_full_name_lower = lower(sr.full_name)
+            )
+            AND (
+              (? = 'repo' AND lower(sr.full_name) = lower(?))
+              OR (
+                ? = 'repos'
+                AND EXISTS (
+                  SELECT 1
+                  FROM json_each(?)
+                  WHERE lower(json_each.value) = lower(sr.full_name)
+                )
+              )
+              OR (? = 'org' AND lower(sr.owner_login) = lower(?))
             )
           UNION
           SELECT
@@ -12206,14 +12259,23 @@ async fn fetch_feed_items(
         .bind(scope_kind)
         .bind(scope_kind)
         .bind(scope_kind)
+        .bind(scope_org.as_deref())
+        .bind(user_id)
+        .bind(scope_kind)
+        .bind(user_id)
         .bind(scope_kind)
         .bind(scope_repo_item.as_deref())
         .bind(scope_kind)
         .bind(scope_repo_items_json.as_deref())
         .bind(scope_kind)
         .bind(scope_org.as_deref())
+        .bind(user_id)
         .bind(scope_kind)
-        .bind(scope_mine_owner.as_deref())
+        .bind(scope_repo_item.as_deref())
+        .bind(scope_kind)
+        .bind(scope_repo_items_json.as_deref())
+        .bind(scope_kind)
+        .bind(scope_org.as_deref())
         .bind(user_id)
         .bind(scope_kind)
         .bind(scope_mine_owner.as_deref())

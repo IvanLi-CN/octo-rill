@@ -95,6 +95,7 @@ SELECT
   COALESCE(ob.initialized_at, ob.updated_at) AS created_at,
   ob.updated_at AS updated_at
 FROM owned_repo_star_baselines ob
+WHERE 1
 ON CONFLICT(user_id, repo_full_name_lower) DO UPDATE SET
   repo_id = COALESCE(excluded.repo_id, user_repo_associations.repo_id),
   repo_full_name = excluded.repo_full_name,
@@ -184,6 +185,7 @@ SELECT
   COALESCE(sr.stargazed_at, sr.updated_at) AS created_at,
   sr.updated_at AS updated_at
 FROM starred_repos sr
+WHERE 1
 ON CONFLICT(user_id, repo_full_name_lower) DO UPDATE SET
   repo_id = COALESCE(excluded.repo_id, user_repo_associations.repo_id),
   repo_full_name = excluded.repo_full_name,
@@ -244,4 +246,166 @@ SELECT
   has_manual_feed_source
 FROM user_repo_associations
 WHERE is_following != 0
-  AND repo_id IS NOT NULL;
+  AND repo_id IS NOT NULL
+
+UNION ALL
+
+SELECT
+  sr.user_id AS user_id,
+  sr.repo_id AS repo_id,
+  sr.full_name AS full_name,
+  sr.owner_login AS owner_login,
+  sr.name AS name,
+  sr.html_url AS html_url,
+  sr.description AS description,
+  sr.is_private AS is_private,
+  sr.updated_at AS updated_at,
+  sr.owner_avatar_url AS owner_avatar_url,
+  sr.open_graph_image_url AS open_graph_image_url,
+  sr.uses_custom_open_graph_image AS uses_custom_open_graph_image,
+  'github_star' AS first_source,
+  sr.stargazed_at AS first_associated_at,
+  'system_default' AS follow_state_source,
+  0 AS has_personal_owned_source,
+  1 AS has_github_star_source,
+  0 AS has_manual_feed_source
+FROM starred_repos sr
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM user_repo_associations ura
+  WHERE ura.user_id = sr.user_id
+    AND ura.repo_full_name_lower = lower(sr.full_name)
+)
+
+UNION ALL
+
+SELECT
+  ob.user_id AS user_id,
+  ob.repo_id AS repo_id,
+  ob.repo_full_name AS full_name,
+  CASE
+    WHEN instr(ob.repo_full_name, '/') > 0
+      THEN substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1)
+    ELSE ob.repo_full_name
+  END AS owner_login,
+  CASE
+    WHEN instr(ob.repo_full_name, '/') > 0
+      THEN substr(ob.repo_full_name, instr(ob.repo_full_name, '/') + 1)
+    ELSE ob.repo_full_name
+  END AS name,
+  'https://github.com/' || ob.repo_full_name AS html_url,
+  NULL AS description,
+  ob.is_private AS is_private,
+  ob.updated_at AS updated_at,
+  ob.owner_avatar_url AS owner_avatar_url,
+  ob.open_graph_image_url AS open_graph_image_url,
+  ob.uses_custom_open_graph_image AS uses_custom_open_graph_image,
+  'personal_owned' AS first_source,
+  COALESCE(ob.initialized_at, ob.updated_at) AS first_associated_at,
+  'system_default' AS follow_state_source,
+  1 AS has_personal_owned_source,
+  0 AS has_github_star_source,
+  0 AS has_manual_feed_source
+FROM owned_repo_star_baselines ob
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM user_repo_associations ura
+  WHERE ura.user_id = ob.user_id
+    AND ura.repo_full_name_lower = lower(ob.repo_full_name)
+);
+
+DROP VIEW IF EXISTS user_release_visible_repos;
+
+CREATE VIEW user_release_visible_repos AS
+SELECT
+  ura.user_id AS user_id,
+  ura.repo_id AS repo_id,
+  ura.repo_full_name AS full_name,
+  ura.owner_login AS owner_login,
+  ura.repo_name AS name,
+  ura.description AS description,
+  COALESCE(ura.html_url, 'https://github.com/' || ura.repo_full_name) AS html_url,
+  sr.stargazed_at AS stargazed_at,
+  ura.is_private AS is_private,
+  ura.last_seen_at AS updated_at,
+  ura.owner_avatar_url AS owner_avatar_url,
+  ura.open_graph_image_url AS open_graph_image_url,
+  ura.uses_custom_open_graph_image AS uses_custom_open_graph_image
+FROM user_repo_associations ura
+JOIN users u
+  ON u.id = ura.user_id
+LEFT JOIN starred_repos sr
+  ON sr.user_id = ura.user_id
+ AND lower(sr.full_name) = ura.repo_full_name_lower
+WHERE ura.is_following != 0
+  AND ura.repo_id IS NOT NULL
+  AND (
+    ura.has_personal_owned_source = 0
+    OR ura.has_github_star_source != 0
+    OR u.include_own_releases != 0
+  )
+
+UNION ALL
+
+SELECT
+  sr.user_id AS user_id,
+  sr.repo_id AS repo_id,
+  sr.full_name AS full_name,
+  sr.owner_login AS owner_login,
+  sr.name AS name,
+  sr.description AS description,
+  sr.html_url AS html_url,
+  sr.stargazed_at AS stargazed_at,
+  sr.is_private AS is_private,
+  sr.updated_at AS updated_at,
+  sr.owner_avatar_url AS owner_avatar_url,
+  sr.open_graph_image_url AS open_graph_image_url,
+  sr.uses_custom_open_graph_image AS uses_custom_open_graph_image
+FROM starred_repos sr
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM user_repo_associations ura
+  WHERE ura.user_id = sr.user_id
+    AND ura.repo_full_name_lower = lower(sr.full_name)
+)
+
+UNION ALL
+
+SELECT
+  ob.user_id AS user_id,
+  ob.repo_id AS repo_id,
+  ob.repo_full_name AS full_name,
+  CASE
+    WHEN instr(ob.repo_full_name, '/') > 0
+      THEN substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1)
+    ELSE ob.repo_full_name
+  END AS owner_login,
+  CASE
+    WHEN instr(ob.repo_full_name, '/') > 0
+      THEN substr(ob.repo_full_name, instr(ob.repo_full_name, '/') + 1)
+    ELSE ob.repo_full_name
+  END AS name,
+  NULL AS description,
+  'https://github.com/' || ob.repo_full_name AS html_url,
+  NULL AS stargazed_at,
+  ob.is_private AS is_private,
+  ob.updated_at AS updated_at,
+  ob.owner_avatar_url AS owner_avatar_url,
+  ob.open_graph_image_url AS open_graph_image_url,
+  ob.uses_custom_open_graph_image AS uses_custom_open_graph_image
+FROM owned_repo_star_baselines ob
+JOIN users u
+  ON u.id = ob.user_id
+WHERE u.include_own_releases != 0
+  AND NOT EXISTS (
+    SELECT 1
+    FROM user_repo_associations ura
+    WHERE ura.user_id = ob.user_id
+      AND ura.repo_full_name_lower = lower(ob.repo_full_name)
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM starred_repos sr
+    WHERE sr.user_id = ob.user_id
+      AND sr.repo_id = ob.repo_id
+  );
