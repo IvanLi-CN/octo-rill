@@ -1295,6 +1295,10 @@ export function Dashboard(props: {
 	const initialNotificationBootstrapRef = useRef(
 		hasDesktopSidebarInbox || tab === "inbox",
 	);
+	const hasCachedNotifications =
+		queryClient.getQueryData<DashboardNotificationsQueryData>(
+			notificationsQueryKey,
+		) !== undefined;
 	const sidebarBootstrapCompletedRef = useRef(
 		sessionState?.sidebarBootstrapped ??
 			queryClient.getQueryData<DashboardBriefsQueryData>(briefsQueryKey) !==
@@ -1302,7 +1306,8 @@ export function Dashboard(props: {
 	);
 	const notificationsBootstrapCompletedRef = useRef(
 		sessionState?.notificationsBootstrapped ??
-			Boolean(warmStart && warmStart.notifications.length > 0),
+			(hasCachedNotifications ||
+				Boolean(warmStart && warmStart.notifications.length > 0)),
 	);
 	const reactionTokenBootstrapCompletedRef = useRef(
 		sessionState?.reactionTokenBootstrapped ??
