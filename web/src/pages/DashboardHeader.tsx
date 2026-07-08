@@ -45,6 +45,9 @@ export type DashboardHeaderProps = {
 	showMineEntry?: boolean;
 	mineHref?: string;
 	mineLabel?: string;
+	showFollowingEntry?: boolean;
+	followingHref?: string;
+	followingLabel?: string;
 };
 
 function clampUnit(value: number) {
@@ -152,6 +155,9 @@ function DashboardUserInfoCard(props: {
 	showMineEntry: boolean;
 	mineHref: string;
 	mineLabel: string;
+	showFollowingEntry: boolean;
+	followingHref: string;
+	followingLabel: string;
 }) {
 	const {
 		login,
@@ -165,6 +171,9 @@ function DashboardUserInfoCard(props: {
 		showMineEntry,
 		mineHref,
 		mineLabel,
+		showFollowingEntry,
+		followingHref,
+		followingLabel,
 	} = props;
 	const displayName = name?.trim() || login;
 	const secondaryName =
@@ -241,6 +250,22 @@ function DashboardUserInfoCard(props: {
 						</InternalLink>
 					</Button>
 				) : null}
+				{showFollowingEntry ? (
+					<Button
+						asChild
+						variant="ghost"
+						className="mb-2 w-full justify-start px-2"
+					>
+						<InternalLink
+							href={followingHref}
+							to={followingHref}
+							data-dashboard-focus-following-entry="true"
+						>
+							<Eye className="size-4" />
+							{followingLabel}
+						</InternalLink>
+					</Button>
+				) : null}
 				<Button asChild variant="ghost" className="w-full justify-start px-2">
 					<InternalLink
 						href="/settings"
@@ -303,6 +328,9 @@ function DashboardUserMenu(props: {
 	showMineEntry: boolean;
 	mineHref: string;
 	mineLabel: string;
+	showFollowingEntry: boolean;
+	followingHref: string;
+	followingLabel: string;
 }) {
 	const {
 		login,
@@ -317,6 +345,9 @@ function DashboardUserMenu(props: {
 		showMineEntry,
 		mineHref,
 		mineLabel,
+		showFollowingEntry,
+		followingHref,
+		followingLabel,
 	} = props;
 	const cardId = useId();
 	const wrapperRef = useRef<HTMLFieldSetElement | null>(null);
@@ -407,6 +438,9 @@ function DashboardUserMenu(props: {
 						showMineEntry={showMineEntry}
 						mineHref={mineHref}
 						mineLabel={mineLabel}
+						showFollowingEntry={showFollowingEntry}
+						followingHref={followingHref}
+						followingLabel={followingLabel}
 					/>
 				</div>
 			) : null}
@@ -430,6 +464,9 @@ export function DashboardHeader({
 	showMineEntry = true,
 	mineHref = "/focus/mine",
 	mineLabel = "我的仓库动态",
+	showFollowingEntry = true,
+	followingHref = "/focus/following",
+	followingLabel = "关注仓库",
 }: DashboardHeaderProps) {
 	const {
 		compactHeader,
@@ -717,6 +754,9 @@ export function DashboardHeader({
 						showMineEntry={showMineEntry}
 						mineHref={mineHref}
 						mineLabel={mineLabel}
+						showFollowingEntry={showFollowingEntry}
+						followingHref={followingHref}
+						followingLabel={followingLabel}
 					/>
 				</div>
 			</div>

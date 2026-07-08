@@ -1,16 +1,28 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDownToLine, RefreshCcw, WifiOff } from "lucide-react";
+import {
+	ArrowDownToLine,
+	Eye,
+	EyeOff,
+	RefreshCcw,
+	WifiOff,
+} from "lucide-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
 	type MeResponse,
+	type FollowingRepoItem,
+	type FollowingReposResponse,
 	type PersonalReposResponse,
 	type RepoPublicReleasePublicationStatusResponse,
 	ApiError,
 	apiGet,
+	apiGetFollowingRepos,
+	apiHead,
+	apiFollowRepo,
 	apiGetRepoPublicReleasePublication,
 	apiPost,
 	apiPostJson,
+	apiUnfollowRepo,
 	apiPublishRepoPublicRelease,
 	apiUnpublishRepoPublicRelease,
 } from "@/api";
@@ -75,6 +87,7 @@ import {
 	type DashboardRouteState,
 } from "@/dashboard/routeState";
 import {
+	DASHBOARD_FOLLOWING_ENTRY_LABEL,
 	buildDashboardScopeSummary,
 	DASHBOARD_MINE_ENTRY_LABEL,
 	resolveDashboardScopeRepoNames,
@@ -417,6 +430,99 @@ function resolveRepoPublicReleaseUrl(
 	return new URL(path, window.location.origin).toString();
 }
 
+function followingRepoSourceText(repo: FollowingRepoItem) {
+	const labels: string[] = [];
+	if (repo.sources.personal_owned) labels.push("个人仓库");
+	if (repo.sources.github_star) labels.push("GitHub Star");
+	if (repo.sources.manual_feed) labels.push("手动 Feed");
+	return labels.join(" · ");
+}
+
+type FollowingListView = "following" | "associated";
+type FollowingRepoFollowOverrides = Record<string, boolean>;
+
+function normalizeFollowingRepoKey(fullName: string) {
+	return fullName.trim().toLowerCase();
+}
+
+function applyFollowingRepoOverrides(
+	response: FollowingReposResponse | null,
+	overrides: FollowingRepoFollowOverrides,
+): FollowingReposResponse | null {
+	if (!response) {
+		return null;
+	}
+	if (Object.keys(overrides).length === 0) {
+		return response;
+	}
+	const associatedItems = response.associated_items.map((repo) => {
+		const override = overrides[normalizeFollowingRepoKey(repo.full_name)];
+		if (override === undefined) {
+			return repo;
+		}
+		return {
+			...repo,
+			is_following: override,
+			follow_state_source: "user_explicit",
+		};
+	});
+	const followingItems = associatedItems.filter((repo) => repo.is_following);
+	return {
+		...response,
+		items: followingItems,
+		associated_items: associatedItems,
+		following_count: followingItems.length,
+		associated_count: associatedItems.length,
+	};
+}
+
+function updateFollowingRepoSnapshot(
+	items: FollowingRepoItem[],
+	fullName: string,
+	isFollowing: boolean,
+) {
+	const normalizedFullName = normalizeFollowingRepoKey(fullName);
+	return items.map((repo) =>
+		normalizeFollowingRepoKey(repo.full_name) === normalizedFullName
+			? {
+					...repo,
+					is_following: isFollowing,
+					follow_state_source: "user_explicit",
+				}
+			: repo,
+	);
+}
+
+function mergeFollowingRepoSnapshot(
+	items: FollowingRepoItem[] | null,
+	response: FollowingReposResponse | null,
+	overrides: FollowingRepoFollowOverrides,
+): FollowingRepoItem[] | null {
+	if (!items) {
+		return null;
+	}
+	return items.map((repo) => {
+		const normalizedFullName = normalizeFollowingRepoKey(repo.full_name);
+		const canonicalRepo =
+			response?.associated_items.find(
+				(item) =>
+					normalizeFollowingRepoKey(item.full_name) === normalizedFullName,
+			) ?? null;
+		if (canonicalRepo) {
+			return canonicalRepo;
+		}
+		const override = overrides[normalizedFullName];
+		if (override === undefined) {
+			return repo;
+		}
+		return {
+			...repo,
+			is_following: override,
+			follow_state_source: "user_explicit",
+		};
+	});
+}
+
 function ScopedSummaryCard(props: {
 	scope: DashboardScope;
 	feedItems: FeedItem[];
@@ -424,6 +530,10 @@ function ScopedSummaryCard(props: {
 	personalRepos?: PersonalReposResponse | null;
 	personalReposLoading?: boolean;
 	personalReposError?: string | null;
+	followingRepos?: FollowingReposResponse | null;
+	followingReposLoading?: boolean;
+	followingReposError?: string | null;
+	reloadFollowingRepos?: () => Promise<unknown>;
 }) {
 	const {
 		scope,
@@ -432,6 +542,10 @@ function ScopedSummaryCard(props: {
 		personalRepos = null,
 		personalReposLoading = false,
 		personalReposError = null,
+		followingRepos = null,
+		followingReposLoading = false,
+		followingReposError = null,
+		reloadFollowingRepos,
 	} = props;
 	const { pushErrorToast, pushToast } = useAppToast();
 	const [publicationStatus, setPublicationStatus] =
@@ -441,6 +555,26 @@ function ScopedSummaryCard(props: {
 		"publish" | "unpublish" | null
 	>(null);
 	const [publicationError, setPublicationError] = useState<string | null>(null);
+	const [followBusy, setFollowBusy] = useState<"follow" | "unfollow" | null>(
+		null,
+	);
+	const [followingListView, setFollowingListView] =
+		useState<FollowingListView>("following");
+	const [followingRepoOverrides, setFollowingRepoOverrides] =
+		useState<FollowingRepoFollowOverrides>({});
+	const [followingListSnapshots, setFollowingListSnapshots] = useState<
+		Record<FollowingListView, FollowingRepoItem[] | null>
+	>({
+		following: null,
+		associated: null,
+	});
+	const [repoWarmState, setRepoWarmState] = useState<
+		"idle" | "pending" | "ready"
+	>("idle");
+	const effectiveFollowingRepos = useMemo(
+		() => applyFollowingRepoOverrides(followingRepos, followingRepoOverrides),
+		[followingRepoOverrides, followingRepos],
+	);
 	const feedRepoNames = Array.from(
 		new Set(
 			feedItems
@@ -451,11 +585,15 @@ function ScopedSummaryCard(props: {
 	const repoNames =
 		scope.kind === "mine" && personalRepos
 			? personalRepos.repos.map((repo) => repo.full_name)
-			: resolveDashboardScopeRepoNames(scope, feedRepoNames);
+			: scope.kind === "following" && effectiveFollowingRepos
+				? effectiveFollowingRepos.items.map((repo) => repo.full_name)
+				: resolveDashboardScopeRepoNames(scope, feedRepoNames);
 	const repoCount =
 		scope.kind === "mine" && personalRepos
 			? personalRepos.total_count
-			: repoNames.length;
+			: scope.kind === "following" && effectiveFollowingRepos
+				? effectiveFollowingRepos.following_count
+				: repoNames.length;
 	const releaseCount = feedItems.filter(
 		(item) => item.kind === "release",
 	).length;
@@ -464,6 +602,36 @@ function ScopedSummaryCard(props: {
 	const repoChipLimit = desktop ? 8 : 6;
 	const personalRepoItems =
 		scope.kind === "mine" && personalRepos ? personalRepos.repos : [];
+	const followingRepoItems =
+		scope.kind === "following" && effectiveFollowingRepos
+			? effectiveFollowingRepos.items
+			: [];
+	const associatedRepoItems =
+		scope.kind === "following" && effectiveFollowingRepos
+			? effectiveFollowingRepos.associated_items
+			: [];
+	const followingRepoCount =
+		scope.kind === "following" && effectiveFollowingRepos
+			? effectiveFollowingRepos.following_count
+			: followingRepoItems.length;
+	const associatedRepoCount =
+		scope.kind === "following" && effectiveFollowingRepos
+			? effectiveFollowingRepos.associated_count
+			: associatedRepoItems.length;
+	const stickyFollowingItems = mergeFollowingRepoSnapshot(
+		followingListSnapshots.following,
+		effectiveFollowingRepos,
+		followingRepoOverrides,
+	);
+	const stickyAssociatedItems = mergeFollowingRepoSnapshot(
+		followingListSnapshots.associated,
+		effectiveFollowingRepos,
+		followingRepoOverrides,
+	);
+	const followingListItems =
+		followingListView === "associated"
+			? (stickyAssociatedItems ?? associatedRepoItems)
+			: (stickyFollowingItems ?? followingRepoItems);
 	const visibleRepoNames = repoNames.slice(0, repoChipLimit);
 	const publicReleaseUrl = resolveRepoPublicReleaseUrl(
 		publicationStatus,
@@ -476,6 +644,62 @@ function ScopedSummaryCard(props: {
 					repo: scope.repo,
 				}
 			: null;
+	const currentFollowingRepo = repoScope
+		? (effectiveFollowingRepos?.associated_items.find(
+				(repo) =>
+					repo.full_name.toLowerCase() ===
+					`${repoScope.owner}/${repoScope.repo}`.toLowerCase(),
+			) ??
+			effectiveFollowingRepos?.items.find(
+				(repo) =>
+					repo.full_name.toLowerCase() ===
+					`${repoScope.owner}/${repoScope.repo}`.toLowerCase(),
+			) ??
+			null)
+		: null;
+	const repoIsFollowing = Boolean(currentFollowingRepo?.is_following);
+
+	useEffect(() => {
+		if (scope.kind !== "following") {
+			setFollowingListView("following");
+		}
+		setFollowingListSnapshots({
+			following: null,
+			associated: null,
+		});
+	}, [scope.kind]);
+
+	useEffect(() => {
+		setFollowingRepoOverrides({});
+	}, [followingRepos]);
+
+	const handleFollowingListViewChange = useCallback(
+		(nextView: FollowingListView) => {
+			setFollowingListView(nextView);
+			setFollowingListSnapshots({
+				following: null,
+				associated: null,
+			});
+		},
+		[],
+	);
+
+	const preserveCurrentFollowingList = useCallback(
+		(fullName: string, isFollowing: boolean) => {
+			if (scope.kind !== "following") {
+				return;
+			}
+			setFollowingListSnapshots((current) => ({
+				...current,
+				[followingListView]: updateFollowingRepoSnapshot(
+					followingListItems,
+					fullName,
+					isFollowing,
+				),
+			}));
+		},
+		[followingListItems, followingListView, scope.kind],
+	);
 
 	useEffect(() => {
 		if (!repoScope) {
@@ -500,6 +724,28 @@ function ScopedSummaryCard(props: {
 			})
 			.finally(() => {
 				if (!cancelled) setPublicationLoading(false);
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [repoScope?.owner, repoScope?.repo]);
+
+	useEffect(() => {
+		if (!repoScope) {
+			setRepoWarmState("idle");
+			return;
+		}
+		let cancelled = false;
+		apiHead(
+			`/api/feed?scope=repo&items=${encodeURIComponent(`${repoScope.owner}/${repoScope.repo}`)}`,
+		)
+			.then((status) => {
+				if (cancelled) return;
+				setRepoWarmState(status === 202 ? "pending" : "ready");
+			})
+			.catch(() => {
+				if (cancelled) return;
+				setRepoWarmState("idle");
 			});
 		return () => {
 			cancelled = true;
@@ -563,6 +809,103 @@ function ScopedSummaryCard(props: {
 			});
 	}, [publicReleaseUrl, pushErrorToast, pushToast]);
 
+	const followRepo = useCallback(
+		(target?: { owner: string; repo: string; fullName?: string }) => {
+			const effectiveTarget =
+				target ??
+				(repoScope ? { owner: repoScope.owner, repo: repoScope.repo } : null);
+			if (!effectiveTarget) return;
+			const fullName =
+				effectiveTarget.fullName ??
+				`${effectiveTarget.owner}/${effectiveTarget.repo}`;
+			const normalizedFullName = normalizeFollowingRepoKey(fullName);
+			setFollowingRepoOverrides((current) => ({
+				...current,
+				[normalizedFullName]: true,
+			}));
+			preserveCurrentFollowingList(fullName, true);
+			setFollowBusy("follow");
+			apiFollowRepo(effectiveTarget)
+				.then(async () => {
+					await reloadFollowingRepos?.();
+					pushToast({
+						title: "已关注仓库",
+						description: `${fullName} 已加入发布关注范围。`,
+					});
+				})
+				.catch((err: unknown) => {
+					setFollowingRepoOverrides((current) => {
+						const next = { ...current };
+						delete next[normalizedFullName];
+						return next;
+					});
+					setFollowingListSnapshots({
+						following: null,
+						associated: null,
+					});
+					pushErrorToast("关注失败", describeUnknownError(err, "请稍后重试"));
+				})
+				.finally(() => setFollowBusy(null));
+		},
+		[
+			preserveCurrentFollowingList,
+			pushErrorToast,
+			pushToast,
+			reloadFollowingRepos,
+			repoScope,
+		],
+	);
+
+	const unfollowRepo = useCallback(
+		(target?: { owner: string; repo: string; fullName?: string }) => {
+			const effectiveTarget =
+				target ??
+				(repoScope ? { owner: repoScope.owner, repo: repoScope.repo } : null);
+			if (!effectiveTarget) return;
+			const fullName =
+				effectiveTarget.fullName ??
+				`${effectiveTarget.owner}/${effectiveTarget.repo}`;
+			const normalizedFullName = normalizeFollowingRepoKey(fullName);
+			setFollowingRepoOverrides((current) => ({
+				...current,
+				[normalizedFullName]: false,
+			}));
+			preserveCurrentFollowingList(fullName, false);
+			setFollowBusy("unfollow");
+			apiUnfollowRepo(effectiveTarget)
+				.then(async () => {
+					await reloadFollowingRepos?.();
+					pushToast({
+						title: "已取消关注",
+						description: fullName,
+					});
+				})
+				.catch((err: unknown) => {
+					setFollowingRepoOverrides((current) => {
+						const next = { ...current };
+						delete next[normalizedFullName];
+						return next;
+					});
+					setFollowingListSnapshots({
+						following: null,
+						associated: null,
+					});
+					pushErrorToast(
+						"取消关注失败",
+						describeUnknownError(err, "请稍后重试"),
+					);
+				})
+				.finally(() => setFollowBusy(null));
+		},
+		[
+			preserveCurrentFollowingList,
+			pushErrorToast,
+			pushToast,
+			reloadFollowingRepos,
+			repoScope,
+		],
+	);
+
 	return (
 		<div
 			className={[
@@ -592,24 +935,70 @@ function ScopedSummaryCard(props: {
 				{summary.description}
 			</p>
 
-			<div className="mt-4 grid gap-3 sm:grid-cols-2">
-				<div className="rounded-2xl border border-border/65 bg-background/72 px-4 py-3">
-					<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-						发布
-					</p>
-					<p className="mt-1 text-lg font-semibold text-foreground">
-						{releaseCount}
-					</p>
+			{scope.kind === "following" ? (
+				<div
+					className="mt-4 grid gap-2 sm:grid-cols-2"
+					data-dashboard-following-stat-grid="true"
+				>
+					<button
+						type="button"
+						aria-pressed={followingListView === "following"}
+						data-dashboard-following-stat="following"
+						onClick={() => handleFollowingListViewChange("following")}
+						className={[
+							"rounded-xl px-4 py-3 text-left transition-colors",
+							followingListView === "following"
+								? "bg-muted/38 text-foreground"
+								: "bg-transparent text-muted-foreground hover:bg-muted/20 hover:text-foreground",
+						].join(" ")}
+					>
+						<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+							关注仓库
+						</p>
+						<p className="mt-1 text-lg font-semibold text-foreground">
+							{followingRepoCount}
+						</p>
+					</button>
+					<button
+						type="button"
+						aria-pressed={followingListView === "associated"}
+						data-dashboard-following-stat="associated"
+						onClick={() => handleFollowingListViewChange("associated")}
+						className={[
+							"rounded-xl px-4 py-3 text-left transition-colors",
+							followingListView === "associated"
+								? "bg-muted/38 text-foreground"
+								: "bg-transparent text-muted-foreground hover:bg-muted/20 hover:text-foreground",
+						].join(" ")}
+					>
+						<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+							关联仓库
+						</p>
+						<p className="mt-1 text-lg font-semibold text-foreground">
+							{associatedRepoCount}
+						</p>
+					</button>
 				</div>
-				<div className="rounded-2xl border border-border/65 bg-background/72 px-4 py-3">
-					<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-						动态
-					</p>
-					<p className="mt-1 text-lg font-semibold text-foreground">
-						{activityCount}
-					</p>
+			) : (
+				<div className="mt-4 grid gap-3 sm:grid-cols-2">
+					<div className="rounded-2xl border border-border/65 bg-background/72 px-4 py-3">
+						<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+							发布
+						</p>
+						<p className="mt-1 text-lg font-semibold text-foreground">
+							{releaseCount}
+						</p>
+					</div>
+					<div className="rounded-2xl border border-border/65 bg-background/72 px-4 py-3">
+						<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+							动态
+						</p>
+						<p className="mt-1 text-lg font-semibold text-foreground">
+							{activityCount}
+						</p>
+					</div>
 				</div>
-			</div>
+			)}
 
 			{scope.kind === "mine" && personalReposLoading && !personalRepos ? (
 				<p className="mt-4 rounded-2xl border border-dashed border-border/65 px-3 py-2 text-sm text-muted-foreground">
@@ -620,6 +1009,71 @@ function ScopedSummaryCard(props: {
 			{scope.kind === "mine" && personalReposError ? (
 				<p className="mt-4 rounded-2xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
 					个人仓库清单加载失败，当前动态仍可继续浏览。
+				</p>
+			) : null}
+
+			{scope.kind === "following" &&
+			followingReposLoading &&
+			!followingRepos ? (
+				<p className="mt-4 rounded-2xl border border-dashed border-border/65 px-3 py-2 text-sm text-muted-foreground">
+					正在加载关注仓库…
+				</p>
+			) : null}
+
+			{scope.kind === "following" && followingReposError ? (
+				<p className="mt-4 rounded-2xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+					关注仓库清单加载失败，当前动态仍可继续浏览。
+				</p>
+			) : null}
+
+			{scope.kind === "repo" ? (
+				<div className="mt-4 rounded-2xl border border-border/65 bg-background/72 px-4 py-3">
+					<div className="flex items-center justify-between gap-3">
+						<div className="min-w-0">
+							<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+								关注状态
+							</p>
+							<p className="mt-1 text-sm text-foreground">
+								{repoIsFollowing
+									? "已关注，进入全局发布范围"
+									: "未关注，仅按需读取"}
+							</p>
+						</div>
+						<Button
+							type="button"
+							variant="outline"
+							size="icon"
+							className="rounded-full border-border/70 bg-background/72 text-foreground hover:bg-background/72 hover:text-foreground"
+							disabled={followBusy !== null}
+							aria-label={
+								followBusy === "follow"
+									? "关注中"
+									: followBusy === "unfollow"
+										? "取消关注中"
+										: repoIsFollowing
+											? "取消关注"
+											: "关注仓库"
+							}
+							title={repoIsFollowing ? "取消关注" : "关注仓库"}
+							onClick={
+								repoIsFollowing ? () => unfollowRepo() : () => followRepo()
+							}
+						>
+							{repoIsFollowing ? (
+								<Eye className="size-4" />
+							) : (
+								<EyeOff className="size-4" />
+							)}
+						</Button>
+					</div>
+				</div>
+			) : null}
+
+			{scope.kind === "repo" &&
+			repoWarmState === "pending" &&
+			releaseCount === 0 ? (
+				<p className="mt-4 rounded-2xl border border-dashed border-border/65 px-3 py-2 text-sm text-muted-foreground">
+					这个公开仓库正在预热本地 Release 缓存，稍后刷新即可看到发布内容。
 				</p>
 			) : null}
 
@@ -667,6 +1121,81 @@ function ScopedSummaryCard(props: {
 											{releaseLabel}
 										</span>
 									</InternalLink>
+								</li>
+							);
+						})}
+					</ul>
+				</div>
+			) : scope.kind === "following" ? (
+				<div className="mt-4 border-t border-border/60 pt-4">
+					<div className="flex items-center justify-between gap-3">
+						<p className="text-sm font-medium text-foreground">
+							{followingListView === "following" ? "关注仓库" : "关联仓库"}
+						</p>
+						<p className="font-mono text-[11px] text-muted-foreground">
+							{followingListItems.length} 个
+						</p>
+					</div>
+					<ul
+						className="mt-3 max-h-80 divide-y divide-border/50 overflow-y-auto"
+						data-dashboard-following-repo-list={followingListView}
+					>
+						{followingListItems.map((repo) => {
+							const href = buildDashboardScopeHref({
+								kind: "repo",
+								owner: repo.owner_login,
+								repo: repo.name,
+							});
+							return (
+								<li key={repo.full_name} className="py-3 first:pt-0 last:pb-0">
+									<div className="flex items-start justify-between gap-3">
+										<div className="min-w-0">
+											<InternalLink
+												href={href}
+												to={href}
+												className="block truncate font-mono text-[12px] font-medium text-foreground"
+											>
+												{repo.full_name}
+											</InternalLink>
+											<p className="mt-0.5 text-xs text-muted-foreground">
+												{followingRepoSourceText(repo)}
+											</p>
+											<p className="mt-0.5 text-xs text-muted-foreground">
+												首次关联{" "}
+												{formatPersonalRepoUpdatedAt(repo.first_associated_at)}
+											</p>
+										</div>
+										<Button
+											type="button"
+											size="icon"
+											variant="outline"
+											className="rounded-full border-border/70 bg-background/72 text-foreground hover:bg-background/72 hover:text-foreground"
+											disabled={followBusy !== null}
+											aria-label={repo.is_following ? "取消关注" : "关注仓库"}
+											title={repo.is_following ? "取消关注" : "关注仓库"}
+											onClick={() => {
+												if (repo.is_following) {
+													unfollowRepo({
+														owner: repo.owner_login,
+														repo: repo.name,
+														fullName: repo.full_name,
+													});
+													return;
+												}
+												followRepo({
+													owner: repo.owner_login,
+													repo: repo.name,
+													fullName: repo.full_name,
+												});
+											}}
+										>
+											{repo.is_following ? (
+												<Eye className="size-4" />
+											) : (
+												<EyeOff className="size-4" />
+											)}
+										</Button>
+									</div>
 								</li>
 							);
 						})}
@@ -1080,7 +1609,17 @@ export function Dashboard(props: {
 		initialData: warmFeedData,
 		scope,
 	});
+	const followingReposQuery = useQuery<FollowingReposResponse>({
+		queryKey: ["dashboard", "following-repos", me.user.id],
+		queryFn: apiGetFollowingRepos,
+		enabled: scope?.kind === "following" || scope?.kind === "repo",
+	});
 	const refreshFeed = feed.refresh;
+	const followingRepos = followingReposQuery.data ?? null;
+	const followingReposLoading = followingReposQuery.isLoading;
+	const followingReposError = followingReposQuery.error
+		? describeUnknownError(followingReposQuery.error, "关注仓库清单加载失败。")
+		: null;
 	const [personalRepos, setPersonalRepos] =
 		useState<PersonalReposResponse | null>(null);
 	const [personalReposLoading, setPersonalReposLoading] = useState(false);
@@ -3287,6 +3826,8 @@ export function Dashboard(props: {
 					onSyncAll={onSyncAll}
 					mineHref={buildDashboardScopeHref({ kind: "mine" })}
 					mineLabel={DASHBOARD_MINE_ENTRY_LABEL}
+					followingHref={buildDashboardScopeHref({ kind: "following" })}
+					followingLabel={DASHBOARD_FOLLOWING_ENTRY_LABEL}
 					mobileControlBand={
 						<DashboardMobileControlBand
 							tab={tab}
@@ -3355,6 +3896,23 @@ export function Dashboard(props: {
 										personalReposError={
 											scope.kind === "mine" ? personalReposError : null
 										}
+										followingRepos={
+											scope.kind === "following" || scope.kind === "repo"
+												? followingRepos
+												: null
+										}
+										followingReposLoading={
+											(scope.kind === "following" || scope.kind === "repo") &&
+											followingReposLoading
+										}
+										followingReposError={
+											scope.kind === "following" || scope.kind === "repo"
+												? followingReposError
+												: null
+										}
+										reloadFollowingRepos={async () => {
+											await followingReposQuery.refetch();
+										}}
 									/>
 								</div>
 							) : null}
@@ -3456,6 +4014,23 @@ export function Dashboard(props: {
 									personalReposError={
 										scope.kind === "mine" ? personalReposError : null
 									}
+									followingRepos={
+										scope.kind === "following" || scope.kind === "repo"
+											? followingRepos
+											: null
+									}
+									followingReposLoading={
+										(scope.kind === "following" || scope.kind === "repo") &&
+										followingReposLoading
+									}
+									followingReposError={
+										scope.kind === "following" || scope.kind === "repo"
+											? followingReposError
+											: null
+									}
+									reloadFollowingRepos={async () => {
+										await followingReposQuery.refetch();
+									}}
 									desktop
 								/>
 							</aside>
