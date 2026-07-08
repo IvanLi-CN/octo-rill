@@ -15,6 +15,7 @@ import {
 	readStartupPresentationSeed,
 	type StartupPresentation,
 } from "@/auth/startupCache";
+import { useDemoSnapshot } from "@/demo/runtime";
 import {
 	describeNetworkAwareError,
 	type NetworkErrorKind,
@@ -57,6 +58,25 @@ let cachedSnapshotOrigin: "seed" | "network" | "none" = warmStartupSeed
 	? "seed"
 	: "none";
 let inflightSnapshotPromise: Promise<AuthSnapshot> | null = null;
+
+function buildSnapshotFromDemo(me: MeResponse | null): AuthSnapshot {
+	if (!me) {
+		return {
+			status: "anonymous",
+			me: null,
+			bootError: null,
+			bootErrorKind: null,
+			bootErrorDetail: null,
+		};
+	}
+	return {
+		status: "authenticated",
+		me,
+		bootError: null,
+		bootErrorKind: null,
+		bootErrorDetail: null,
+	};
+}
 
 async function requestAuthSnapshot(): Promise<AuthSnapshot> {
 	try {
@@ -143,6 +163,7 @@ async function loadAuthSnapshot(force = false) {
 
 export function AuthBootstrapProvider(props: { children: ReactNode }) {
 	const { children } = props;
+	const demoSnapshot = useDemoSnapshot();
 	const [snapshot, setSnapshot] = useState<AuthSnapshot>(() => {
 		if (warmStartupSeed) {
 			return {
@@ -167,6 +188,20 @@ export function AuthBootstrapProvider(props: { children: ReactNode }) {
 	const [isBootstrapping, setIsBootstrapping] = useState(true);
 
 	useEffect(() => {
+		if (demoSnapshot.active) {
+			const nextSnapshot = buildSnapshotFromDemo(
+				demoSnapshot.model?.me ?? null,
+			);
+			cachedSnapshot = nextSnapshot;
+			cachedSnapshotOrigin =
+				nextSnapshot.status === "authenticated" ? "network" : "none";
+			inflightSnapshotPromise = null;
+			setSnapshot(nextSnapshot);
+			setBootPresentation("live");
+			setIsBootstrapping(false);
+			return;
+		}
+
 		let cancelled = false;
 		setIsBootstrapping(true);
 		void loadAuthSnapshot().then((nextSnapshot) => {
@@ -179,16 +214,30 @@ export function AuthBootstrapProvider(props: { children: ReactNode }) {
 		return () => {
 			cancelled = true;
 		};
-	}, []);
+	}, [demoSnapshot.active, demoSnapshot.model?.me]);
 
 	const refreshAuth = useCallback(async () => {
+		if (demoSnapshot.active) {
+			const nextSnapshot = buildSnapshotFromDemo(
+				demoSnapshot.model?.me ?? null,
+			);
+			cachedSnapshot = nextSnapshot;
+			cachedSnapshotOrigin =
+				nextSnapshot.status === "authenticated" ? "network" : "none";
+			inflightSnapshotPromise = null;
+			setSnapshot(nextSnapshot);
+			setBootPresentation("live");
+			setIsBootstrapping(false);
+			return nextSnapshot.me;
+		}
+
 		setIsBootstrapping(true);
 		const nextSnapshot = await loadAuthSnapshot(true);
 		setSnapshot(nextSnapshot);
 		setBootPresentation("live");
 		setIsBootstrapping(false);
 		return nextSnapshot.me;
-	}, []);
+	}, [demoSnapshot.active, demoSnapshot.model?.me]);
 
 	const value = useMemo<AuthBootstrapValue>(
 		() => ({

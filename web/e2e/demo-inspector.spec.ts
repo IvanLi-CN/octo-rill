@@ -16,6 +16,26 @@ test("demo auth affordances stay inside mock runtime", async ({ page }) => {
 	).toBeVisible();
 });
 
+test("switching demo persona reseeds the auth surface", async ({ page }) => {
+	await page.goto(
+		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
+	);
+
+	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
+	await expect(
+		page.locator('[data-dashboard-brand-heading="true"]'),
+	).toBeVisible();
+
+	await inspector.getByRole("combobox").nth(1).click();
+	await page.getByRole("option", { name: "Guest", exact: true }).click();
+
+	await expect(page).toHaveURL(/d_persona=guest/);
+	await expect(page.locator("[data-landing-login-cta]")).toBeVisible();
+	await expect(
+		page.locator('[data-dashboard-brand-heading="true"]'),
+	).toHaveCount(0);
+});
+
 test("settings scene share url preserves existing route query", async ({
 	page,
 }) => {
@@ -124,4 +144,27 @@ test("demo inspector stays fully usable when toast feedback appears", async ({
 	await expect(
 		page.locator('[data-demo-inspector-scroll-cue="bottom"]'),
 	).toBeHidden();
+});
+
+test("reset scene restores the default publication share state", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1366, height: 768 });
+	await page.goto(
+		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
+	);
+
+	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
+	await inspector.getByRole("combobox").nth(3).click();
+	await page.getByRole("option", { name: "Published", exact: true }).click();
+
+	await expect(page).toHaveURL(/d_pub=published/);
+	await expect(page.getByRole("button", { name: "发布公开页" })).toHaveCount(0);
+	await expect(page.getByRole("button", { name: "取消发布" })).toBeVisible();
+
+	await page.getByRole("button", { name: "Reset Scene" }).click();
+
+	await expect(page).not.toHaveURL(/d_pub=published/);
+	await expect(page.getByRole("button", { name: "发布公开页" })).toBeVisible();
+	await expect(page.getByRole("button", { name: "取消发布" })).toHaveCount(0);
 });

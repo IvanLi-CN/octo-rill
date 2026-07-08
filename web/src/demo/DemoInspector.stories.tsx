@@ -8,6 +8,7 @@ const baseSnapshot = {
 	active: true,
 	demoBuild: true,
 	basepath: "/demo",
+	revision: 0,
 	shareState: {
 		sceneId: "dashboard-repo-publish" as const,
 		personaId: "member" as const,

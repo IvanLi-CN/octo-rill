@@ -1,6 +1,7 @@
 import { type ReactNode, useEffect, useSyncExternalStore } from "react";
 
 import {
+	buildDefaultDemoShareState,
 	buildDemoHref,
 	DEMO_PANEL_LAYOUT_STORAGE_KEY,
 	getDemoScene,
@@ -56,6 +57,7 @@ const runtimeState: DemoSnapshot = {
 	active: false,
 	demoBuild: false,
 	basepath: "/",
+	revision: 0,
 	shareState: {
 		sceneId: "landing-welcome",
 		personaId: "guest",
@@ -82,6 +84,18 @@ function patchRuntimeShareState(partial: DemoShareStatePatch) {
 		...runtimeState.shareState,
 		...partial,
 	};
+}
+
+function modelAffectingShareStateChanged(
+	current: DemoShareState,
+	next: DemoShareState,
+) {
+	return (
+		current.sceneId !== next.sceneId ||
+		current.personaId !== next.personaId ||
+		current.includeOwnReleases !== next.includeOwnReleases ||
+		current.publicationState !== next.publicationState
+	);
 }
 
 function canUseStorage() {
@@ -358,6 +372,7 @@ export function syncDemoRuntimeWithHref(href: string) {
 	if (runtimeState.lastSyncedHref === nextHref) return;
 	if (!demoDependencies) return;
 
+	const currentShareState = runtimeState.shareState;
 	const next = nextSnapshotFromUrl(parseHref(nextHref));
 	runtimeState.lastSyncedHref = nextHref;
 	if (!next.active && !runtimeState.demoBuild) {
@@ -366,6 +381,12 @@ export function syncDemoRuntimeWithHref(href: string) {
 	runtimeState.active = next.active;
 	runtimeState.shareState = next.shareState;
 	runtimeState.model = next.model;
+	if (
+		next.active &&
+		modelAffectingShareStateChanged(currentShareState, next.shareState)
+	) {
+		runtimeState.revision += 1;
+	}
 	emit();
 }
 
@@ -376,22 +397,33 @@ export function patchDemoShareState(
 	},
 ) {
 	if (!demoDependencies) return;
-	const nextShareState = {
+	const nextShareState: DemoShareState = {
 		...runtimeState.shareState,
 		...partial,
 	};
+	const shouldBumpRevision =
+		options?.reseed !== false &&
+		modelAffectingShareStateChanged(runtimeState.shareState, nextShareState);
 	runtimeState.shareState = nextShareState;
 	if (options?.reseed !== false) {
 		runtimeState.model = seedModel(nextShareState);
 		runtimeState.mutations = [];
+	}
+	if (shouldBumpRevision) {
+		runtimeState.revision += 1;
 	}
 	emit();
 }
 
 export function resetDemoScene() {
 	if (!demoDependencies) return;
-	runtimeState.model = seedModel(runtimeState.shareState);
+	const nextShareState = buildDefaultDemoShareState(
+		runtimeState.shareState.sceneId,
+	);
+	runtimeState.shareState = nextShareState;
+	runtimeState.model = seedModel(nextShareState);
 	runtimeState.mutations = [];
+	runtimeState.revision += 1;
 	emit();
 }
 

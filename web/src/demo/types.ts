@@ -112,6 +112,7 @@ export type DemoSnapshot = {
 	active: boolean;
 	demoBuild: boolean;
 	basepath: string;
+	revision: number;
 	shareState: DemoShareState;
 	model: DemoModel | null;
 	mutations: DemoMutationRecord[];

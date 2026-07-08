@@ -130,17 +130,30 @@ export function readDemoShareState(url: URL, basepath: string): DemoShareState {
 	const sceneId = DEMO_SCENE_BY_ID.has(sceneIdRaw ?? "")
 		? (sceneIdRaw as DemoSceneId)
 		: resolveDefaultSceneId(url.pathname, basepath);
-	const scene = getDemoScene(sceneId);
+	const defaults = buildDefaultDemoShareState(sceneId);
 
 	return {
 		sceneId,
 		personaId: normalizePersonaId(
 			url.searchParams.get("d_persona"),
-			scene.defaultPersona,
+			defaults.personaId,
 		),
 		networkMode: normalizeNetworkMode(url.searchParams.get("d_net")),
 		includeOwnReleases: url.searchParams.get("d_own") === "1",
 		publicationState: normalizePublicationState(url.searchParams.get("d_pub")),
+	};
+}
+
+export function buildDefaultDemoShareState(
+	sceneId: DemoSceneId,
+): DemoShareState {
+	const scene = getDemoScene(sceneId);
+	return {
+		sceneId,
+		personaId: scene.defaultPersona,
+		networkMode: "normal",
+		includeOwnReleases: false,
+		publicationState: "unpublished",
 	};
 }
 

@@ -31,11 +31,10 @@ import { useAppShellChrome } from "@/layout/AppShell";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import { cn } from "@/lib/utils";
 import { router } from "@/router";
-import { DEMO_SCENES } from "@/demo/registry";
+import { buildDefaultDemoShareState, DEMO_SCENES } from "@/demo/registry";
 import {
 	buildCurrentDemoHref,
 	patchDemoShareState,
-	resetDemoScene,
 	resolveCurrentDemoScene,
 	syncDemoRuntimeWithHref,
 	updateDemoPanelLayout,
@@ -185,6 +184,10 @@ export function DemoInspector() {
 		}
 	};
 
+	const replaceDemoLocation = (href: string) => {
+		window.location.replace(new URL(href, window.location.origin).toString());
+	};
+
 	const navigateWithShareState = (
 		next: Partial<typeof snapshot.shareState>,
 		options?: {
@@ -192,7 +195,11 @@ export function DemoInspector() {
 		},
 	) => {
 		const href = buildCurrentDemoHref(next);
-		patchDemoShareState(next, { reseed: options?.reseed });
+		if (options?.reseed !== false) {
+			replaceDemoLocation(href);
+			return;
+		}
+		patchDemoShareState(next, { reseed: false });
 		void router.navigate({
 			href,
 			replace: true,
@@ -201,6 +208,14 @@ export function DemoInspector() {
 
 	const setCollapsed = (collapsed: boolean) => {
 		updateDemoPanelLayout({ collapsed });
+	};
+
+	const resetToSceneDefaults = () => {
+		replaceDemoLocation(
+			buildCurrentDemoHref(
+				buildDefaultDemoShareState(snapshot.shareState.sceneId),
+			),
+		);
 	};
 
 	const panel = (
@@ -221,7 +236,7 @@ export function DemoInspector() {
 			onPublicationStateChange={(publicationState) =>
 				navigateWithShareState({ publicationState }, { reseed: true })
 			}
-			onReset={resetDemoScene}
+			onReset={resetToSceneDefaults}
 			onCopyShareLink={copyShareLink}
 		/>
 	);
