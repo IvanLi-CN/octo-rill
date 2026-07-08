@@ -146,6 +146,49 @@ test("demo inspector stays fully usable when toast feedback appears", async ({
 	).toBeHidden();
 });
 
+test("demo inspector grows to fit the full control stack on tall desktops", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1798, height: 1360 });
+	await page.goto(
+		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
+	);
+
+	await page.getByRole("button", { name: "发布公开页" }).click();
+
+	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
+	await expect(inspector).toBeVisible();
+	await expect(inspector.getByText("Actions & Share")).toBeVisible();
+	await expect(inspector.getByText("Advanced")).toBeVisible();
+	await expect(
+		page.locator('[data-demo-inspector-scroll-cue="bottom"]'),
+	).toBeHidden();
+
+	const geometry = await page.evaluate(() => {
+		const panel = document.querySelector<HTMLElement>(
+			'[data-demo-inspector-chrome="desktop"]',
+		);
+		const scroller = document.querySelector<HTMLElement>(
+			'[data-demo-inspector-scroller="true"]',
+		);
+		if (!panel || !scroller) {
+			throw new Error("demo inspector geometry nodes are missing");
+		}
+		const panelRect = panel.getBoundingClientRect();
+		return {
+			viewportHeight: window.innerHeight,
+			panelBottom: panelRect.bottom,
+			bottomGap: window.innerHeight - panelRect.bottom,
+			scrollHeight: scroller.scrollHeight,
+			clientHeight: scroller.clientHeight,
+		};
+	});
+
+	expect(geometry.scrollHeight).toBeLessThanOrEqual(geometry.clientHeight + 2);
+	expect(geometry.panelBottom).toBeLessThanOrEqual(geometry.viewportHeight - 1);
+	expect(geometry.bottomGap).toBeGreaterThan(0);
+});
+
 test("reset scene restores the default publication share state", async ({
 	page,
 }) => {

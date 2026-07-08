@@ -6,7 +6,7 @@
 - Implementation: 已交付
 - Created: 2026-07-08
 - Last: 2026-07-09
-- Summary: fast-track / `/demo/` runtime + floating inspector + Pages assembly 已落地，最后补齐了 deep-link query 保真、MSW 漏拦截、inspector live snapshot 同步，以及桌面态 toast 避让 + 视口内高度钳制
+- Summary: fast-track / `/demo/` runtime + floating inspector + Pages assembly 已落地，最后补齐了 deep-link query 保真、MSW 漏拦截、inspector live snapshot 同步，以及桌面态 toast 避让 + 视口内高度钳制 + tall viewport 自适应长高
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 

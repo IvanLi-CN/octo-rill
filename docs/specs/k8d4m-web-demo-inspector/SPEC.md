@@ -132,7 +132,7 @@
   captured_at: `2026-07-09`
   route: `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
   state: `dashboard-repo-publish`
-  evidence_note: 桌面态 deep-link 恢复后，模拟“发布公开页”写操作会同步更新 Published share state，并在 inspector 的 Advanced badge 中暴露 simulated write 计数。owner-facing 截图使用更高的桌面视口完整展示 inspector；`1440x1024` 的 toast 避让与视口内钳制由 Playwright 回归测试覆盖。
+  evidence_note: 桌面态 deep-link 恢复后，模拟“发布公开页”写操作会同步更新 Published share state，并在 inspector 的 Advanced badge 中暴露 simulated write 计数。owner-facing 截图使用更高的桌面视口完整展示 inspector 全栈内容；`1366x768` 的 toast 避让与短视口钳制、`1798x1360` 的 tall-desktop 完整展示均由 Playwright 回归测试覆盖。
 
 ![Desktop dashboard demo with simulated publish](./assets/dashboard-desktop-simulated-publish.png)
 

@@ -5,7 +5,14 @@ import {
 	Minimize2,
 	RefreshCcw,
 } from "lucide-react";
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import {
+	type ReactNode,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { useRouterState } from "@tanstack/react-router";
 
 import { Badge } from "@/components/ui/badge";
@@ -48,7 +55,7 @@ function clamp(value: number, min: number, max: number) {
 const DESKTOP_PANEL_WIDTH = 380;
 const DESKTOP_PANEL_GAP = 16;
 const DESKTOP_PANEL_MIN_HEIGHT = 360;
-const DESKTOP_PANEL_TARGET_HEIGHT = 640;
+const DESKTOP_PANEL_FALLBACK_HEIGHT = 640;
 const DESKTOP_PANEL_COLLAPSED_HEIGHT = 52;
 const DESKTOP_PANEL_TOAST_GAP = 12;
 const INSPECTOR_SCROLL_CUE_THRESHOLD = 12;
@@ -295,9 +302,11 @@ function DesktopInspectorChrome(props: {
 	const { headerHeight, viewportBottomInset, viewportTopInset } =
 		useAppShellChrome();
 	const panelRef = useRef<HTMLDivElement | null>(null);
+	const titleRef = useRef<HTMLDivElement | null>(null);
 	const scrollerRef = useRef<HTMLDivElement | null>(null);
 	const dragOffsetRef = useRef<{ x: number; y: number } | null>(null);
 	const [dragging, setDragging] = useState(false);
+	const [contentHeight, setContentHeight] = useState<number | null>(null);
 	const [viewportRevision, setViewportRevision] = useState(0);
 	const [scrollCues, setScrollCues] = useState({
 		showTop: false,
@@ -333,6 +342,60 @@ function DesktopInspectorChrome(props: {
 		});
 		return () => observer.disconnect();
 	}, []);
+
+	useLayoutEffect(() => {
+		if (collapsed || typeof window === "undefined") {
+			setContentHeight(null);
+			return;
+		}
+
+		const syncContentHeight = () => {
+			const titleHeight = titleRef.current?.offsetHeight ?? 0;
+			const scrollerHeight = scrollerRef.current?.scrollHeight ?? 0;
+			if (scrollerHeight === 0) return;
+			const nextHeight = titleHeight + scrollerHeight;
+			setContentHeight((current) =>
+				current !== null && Math.abs(current - nextHeight) < 1
+					? current
+					: nextHeight,
+			);
+		};
+
+		syncContentHeight();
+		const resizeObserver =
+			typeof ResizeObserver === "undefined"
+				? null
+				: new ResizeObserver(syncContentHeight);
+		if (titleRef.current) {
+			resizeObserver?.observe(titleRef.current);
+		}
+		if (scrollerRef.current) {
+			resizeObserver?.observe(scrollerRef.current);
+			if (scrollerRef.current.firstElementChild instanceof HTMLElement) {
+				resizeObserver?.observe(scrollerRef.current.firstElementChild);
+			}
+		}
+		const mutationObserver = new MutationObserver(syncContentHeight);
+		if (scrollerRef.current) {
+			mutationObserver.observe(scrollerRef.current, {
+				subtree: true,
+				childList: true,
+				characterData: true,
+				attributes: true,
+			});
+		}
+		window.addEventListener("resize", syncContentHeight);
+		const visualViewport = window.visualViewport;
+		visualViewport?.addEventListener("resize", syncContentHeight);
+		visualViewport?.addEventListener("scroll", syncContentHeight);
+		return () => {
+			resizeObserver?.disconnect();
+			mutationObserver.disconnect();
+			window.removeEventListener("resize", syncContentHeight);
+			visualViewport?.removeEventListener("resize", syncContentHeight);
+			visualViewport?.removeEventListener("scroll", syncContentHeight);
+		};
+	}, [collapsed, viewportRevision]);
 
 	useEffect(() => {
 		if (collapsed) {
@@ -404,11 +467,15 @@ function DesktopInspectorChrome(props: {
 		viewportBottomInset,
 		frameWidth,
 	});
+	const desiredPanelHeight = Math.max(
+		DESKTOP_PANEL_MIN_HEIGHT,
+		contentHeight ?? DESKTOP_PANEL_FALLBACK_HEIGHT,
+	);
 	const panelHeight = collapsed
 		? undefined
 		: Math.min(
-				panelMetrics.maxHeight ?? DESKTOP_PANEL_TARGET_HEIGHT,
-				DESKTOP_PANEL_TARGET_HEIGHT,
+				panelMetrics.maxHeight ?? desiredPanelHeight,
+				desiredPanelHeight,
 			);
 
 	useEffect(() => {
@@ -520,6 +587,7 @@ function DesktopInspectorChrome(props: {
 				data-demo-inspector-surface="true"
 			>
 				<div
+					ref={titleRef}
 					className="flex cursor-move items-center justify-between border-b px-4 py-3"
 					data-demo-inspector-title="true"
 					onPointerDown={(event) => {
