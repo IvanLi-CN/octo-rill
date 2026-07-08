@@ -128,6 +128,7 @@
   target_program: `mock-only`
   capture_scope: `browser-viewport`
   submission_gate: `captured`
+  PR: include
   captured_at: `2026-07-09`
   route: `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
   state: `dashboard-repo-publish`
@@ -139,6 +140,7 @@
   target_program: `mock-only`
   capture_scope: `drawer-surface`
   submission_gate: `captured`
+  PR: include
   captured_at: `2026-07-09`
   route: `/demo/settings?section=my-releases&demo=settings-my-releases`
   state: `settings-my-releases`
