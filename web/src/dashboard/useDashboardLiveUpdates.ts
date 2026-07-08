@@ -234,7 +234,19 @@ export function useDashboardLiveUpdates(options: {
 						`/api/dashboard/updates?${bootstrapParams.toString()}`,
 					);
 					if (currentBaselineKey() !== requestBaselineKey) return;
-					tokenRef.current = bootstrapResponse.token;
+					const bootstrapIncludeSet = new Set<DashboardLiveUpdateList>(
+						bootstrapInclude,
+					);
+					const hasOutOfScopeBootstrapChanges = (
+						["feed", "briefs", "notifications"] as const
+					).some((list) => {
+						if (bootstrapIncludeSet.has(list)) return false;
+						const update = bootstrapResponse.lists[list];
+						return Boolean(update?.changed && update.new_count > 0);
+					});
+					if (!hasOutOfScopeBootstrapChanges) {
+						tokenRef.current = bootstrapResponse.token;
+					}
 					pendingIncludeBootstrapRef.current = [];
 				}
 				const params = new URLSearchParams();
@@ -285,6 +297,7 @@ export function useDashboardLiveUpdates(options: {
 				const shouldEmit = options?.emit !== false && emittedNotices.length > 0;
 				if (shouldEmit) {
 					onUpdateRef.current(emittedNotices);
+					tokenRef.current = response.token;
 				} else if (
 					options?.emit === false ||
 					(!suppressedLists && notices.length === 0)

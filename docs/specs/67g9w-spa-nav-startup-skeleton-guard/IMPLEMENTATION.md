@@ -5,8 +5,8 @@
 - Lifecycle: active
 - Implementation: 已交付
 - Created: 2026-04-17
-- Last: 2026-04-24
-- Summary: 已交付；shell hydration gate + local feed skeleton + path-backed remount guard
+- Last: 2026-07-08
+- Summary: 已交付；shell hydration gate + React Query dashboard cache + path-backed history restore guard
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -31,3 +31,6 @@
 
 - `shellHydrated` 不再只依赖当前组件实例；同一用户在当前会话里已完成一次 Dashboard hydration 后，再沿着 `/` → `/stars` 这类 pathname-backed tab surface remount，也会继续保留壳层。
 - Dashboard 会话态现在会记住 sidebar / notifications / reaction-token bootstrap 与最近一次 briefs / inbox 快照，避免 path-backed route remount 把这类“只该启动一次”的副作用重新打回启动期。
+- Dashboard feed 已迁移到 `@tanstack/react-query` backed cache，query key 包含用户、feed type 与 scope signature；浏览器 Back/Forward 命中已访问 route 时直接恢复对应 feed 内容，不再进入 feed 初始 skeleton。
+- Dashboard briefs、notifications 与 reaction-token status 会同步进 `dashboard` query 白名单；根 provider 只持久化该白名单，`maxAge/gcTime` 对齐 1 小时 warm cache TTL。
+- 登出、`/api/me` 401 或用户 id 切换会清理 React Query persisted Dashboard cache 与旧 warm startup cache，避免跨账号残留。

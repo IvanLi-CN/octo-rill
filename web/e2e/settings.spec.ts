@@ -1,4 +1,4 @@
-import { type Route, expect, test } from "@playwright/test";
+import { type Locator, type Route, expect, test } from "@playwright/test";
 
 import { buildMockMeResponse } from "./mockApi";
 import { installPasskeyBrowserMock } from "./passkeyHelpers";
@@ -43,6 +43,39 @@ async function getPartialAccessibilityTreeSnapshot(
 		fetchRelatives: true,
 	});
 	return JSON.stringify(nodes);
+}
+
+async function dispatchHiddenPatShortcut(
+	input: Locator,
+	shortcut: "undo" | "deleteWordBackward",
+) {
+	const darwin = process.platform === "darwin";
+	const eventInit =
+		shortcut === "undo"
+			? {
+					key: "z",
+					code: "KeyZ",
+					ctrlKey: !darwin,
+					metaKey: darwin,
+				}
+			: {
+					key: "Backspace",
+					code: "Backspace",
+					altKey: darwin,
+					ctrlKey: !darwin,
+				};
+	await input.evaluate((node, init) => {
+		if (!(node instanceof HTMLInputElement)) {
+			throw new Error("expected HTMLInputElement");
+		}
+		node.dispatchEvent(
+			new KeyboardEvent("keydown", {
+				bubbles: true,
+				cancelable: true,
+				...init,
+			}),
+		);
+	}, eventInit);
 }
 
 const defaultGitHubConnections = [
@@ -531,9 +564,7 @@ test("settings github pat hidden mode preserves undo history after visible edits
 	await expect(toggleButton).toBeFocused();
 	await expect(toggleButton).toHaveAttribute("aria-label", "显示 GitHub PAT");
 	await input.focus();
-	await page.keyboard.press(
-		process.platform === "darwin" ? "Meta+Z" : "Control+Z",
-	);
+	await dispatchHiddenPatShortcut(input, "undo");
 	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
 	await expect(input).toHaveValue("");
 });
@@ -578,15 +609,34 @@ test("settings github pat hidden mode keeps word deletion shortcuts", async ({
 	await page.getByRole("button", { name: "隐藏 GitHub PAT" }).click();
 	await expect(toggleButton).toBeFocused();
 	await input.focus();
+	await expect(input).toBeFocused();
 	await input.evaluate((node) => {
 		if (!(node instanceof HTMLInputElement)) {
 			throw new Error("expected HTMLInputElement");
 		}
 		node.setSelectionRange(node.value.length, node.value.length);
 	});
-	await page.keyboard.press(
-		process.platform === "darwin" ? "Alt+Backspace" : "Control+Backspace",
-	);
+	await expect
+		.poll(
+			() =>
+				input.evaluate((node) => {
+					if (!(node instanceof HTMLInputElement)) {
+						throw new Error("expected HTMLInputElement");
+					}
+					return {
+						selectionStart: node.selectionStart,
+						selectionEnd: node.selectionEnd,
+						valueLength: node.value.length,
+					};
+				}),
+			{ message: "hidden PAT input caret should be at the end" },
+		)
+		.toEqual({
+			selectionStart: "ghp_visible_chunk".length,
+			selectionEnd: "ghp_visible_chunk".length,
+			valueLength: "ghp_visible_chunk".length,
+		});
+	await dispatchHiddenPatShortcut(input, "deleteWordBackward");
 	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
 	await expect(input).toHaveValue("ghp_visible_");
 });

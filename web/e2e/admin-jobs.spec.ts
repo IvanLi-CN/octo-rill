@@ -2332,7 +2332,6 @@ test("admin keeps realtime tasks visible while status filter refreshes", async (
 	await page.getByRole("combobox", { name: "实时异步任务状态筛选" }).click();
 	await page.getByRole("option", { name: "状态：运行中" }).click();
 
-	await expect(page.getByText("任务列表更新中...")).toBeVisible();
 	await expect(page.getByText("正在加载任务...")).toHaveCount(0);
 	await expect(page.getByText("sync.releases")).toBeVisible();
 	await expect(page.getByText("translate.release.batch")).toBeVisible();

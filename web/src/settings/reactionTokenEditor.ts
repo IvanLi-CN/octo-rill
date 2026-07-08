@@ -58,6 +58,7 @@ export function isReactionTokenUsable(status: ReactionTokenStatusResponse) {
 
 type UseReactionTokenEditorOptions = {
 	autoLoad?: boolean;
+	initialStatus?: ReactionTokenStatusResponse | null;
 	onStatusLoaded?: (status: ReactionTokenStatusResponse) => void;
 	onPatSaved?: (status: ReactionTokenStatusResponse) => void;
 };
@@ -65,18 +66,36 @@ type UseReactionTokenEditorOptions = {
 export function useReactionTokenEditor(
 	options: UseReactionTokenEditorOptions = {},
 ) {
-	const { autoLoad = true, onStatusLoaded, onPatSaved } = options;
+	const {
+		autoLoad = true,
+		initialStatus = null,
+		onStatusLoaded,
+		onPatSaved,
+	} = options;
+	const initialStatusNormalized = initialStatus
+		? normalizePatStatus(initialStatus.check.state, initialStatus.check.message)
+		: null;
 	const [reactionTokenLoading, setReactionTokenLoading] = useState(autoLoad);
-	const [reactionTokenConfigured, setReactionTokenConfigured] = useState(false);
+	const [reactionTokenConfigured, setReactionTokenConfigured] = useState(
+		() => initialStatus?.configured ?? false,
+	);
 	const [reactionTokenMasked, setReactionTokenMasked] = useState<string | null>(
-		null,
+		() => initialStatus?.masked_token ?? null,
 	);
 	const [reactionTokenOwner, setReactionTokenOwner] =
-		useState<ReactionTokenOwnerSummary | null>(null);
+		useState<ReactionTokenOwnerSummary | null>(
+			() => initialStatus?.owner ?? null,
+		);
 	const [patInput, setPatInput] = useState("");
-	const [patCheckState, setPatCheckState] = useState<PatCheckState>("idle");
-	const [patCheckMessage, setPatCheckMessage] = useState<string | null>(null);
-	const [patCheckedAt, setPatCheckedAt] = useState<string | null>(null);
+	const [patCheckState, setPatCheckState] = useState<PatCheckState>(
+		() => initialStatusNormalized?.status ?? "idle",
+	);
+	const [patCheckMessage, setPatCheckMessage] = useState<string | null>(
+		() => initialStatusNormalized?.message ?? null,
+	);
+	const [patCheckedAt, setPatCheckedAt] = useState<string | null>(
+		() => initialStatus?.check.checked_at ?? null,
+	);
 	const [patSaving, setPatSaving] = useState(false);
 	const patCheckSeqRef = useRef(0);
 	const patInputRef = useRef("");
@@ -99,6 +118,23 @@ export function useReactionTokenEditor(
 	useLayoutEffect(() => {
 		onPatSavedRef.current = onPatSaved;
 	}, [onPatSaved]);
+
+	useEffect(() => {
+		if (!initialStatus) return;
+		const normalized = normalizePatStatus(
+			initialStatus.check.state,
+			initialStatus.check.message,
+		);
+		const hasDraft = patInputRef.current.trim().length > 0;
+		setReactionTokenConfigured(initialStatus.configured);
+		setReactionTokenMasked(initialStatus.masked_token);
+		setReactionTokenOwner(initialStatus.owner);
+		if (!hasDraft) {
+			setPatCheckState(normalized.status);
+			setPatCheckMessage(normalized.message);
+			setPatCheckedAt(initialStatus.check.checked_at);
+		}
+	}, [initialStatus]);
 
 	const loadReactionToken = useCallback(async () => {
 		setReactionTokenLoading(true);

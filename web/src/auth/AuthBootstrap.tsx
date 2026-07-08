@@ -61,6 +61,11 @@ let inflightSnapshotPromise: Promise<AuthSnapshot> | null = null;
 async function requestAuthSnapshot(): Promise<AuthSnapshot> {
 	try {
 		const me = await apiGet<MeResponse>("/api/me");
+		const previousUserId =
+			cachedSnapshot?.me?.user.id ?? startupSeed?.me.user.id;
+		if (previousUserId && previousUserId !== me.user.id) {
+			clearAllWarmStartupCaches();
+		}
 		persistAuthenticatedStartup(me);
 		return {
 			status: "authenticated",

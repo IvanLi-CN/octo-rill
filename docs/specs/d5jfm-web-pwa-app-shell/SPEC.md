@@ -32,6 +32,7 @@ The PWA layer is an enhancement around the existing React + Vite app shell and A
 - A waiting Service Worker must be activated only after the user clicks the existing refresh action.
 - Offline anonymous boot must distinguish network unavailability from authentication failure and keep login-only actions visibly unavailable until connectivity is restored.
 - Offline authenticated boot should reuse recent auth and dashboard warm caches: if the active page has cached content, show a small offline cache notice while preserving that content; if the active page has no cache, show a large offline empty state with retry instead of a misleading empty list.
+- Dashboard server-state may use short-lived React Query persistence for PWA responsiveness, but only for whitelisted Dashboard query keys. This does not relax the Service Worker rule: `/api/**`, `/auth/**`, OAuth, passkey, SSE, mutation, and admin detail responses remain network-only and are not cached by the PWA layer.
 
 ## Acceptance
 
@@ -41,6 +42,7 @@ The PWA layer is an enhancement around the existing React + Vite app shell and A
 - The existing version update notice can represent both server version drift and Service Worker update availability.
 - The app shell can render a clear offline boundary when `/api/me` cannot be reached from a cached PWA shell.
 - Already-authenticated offline visits preserve active-page warm feed content when available and show a distinct no-cache offline empty state when unavailable.
+- Browser Back/Forward and short-lived PWA restores may reuse Dashboard React Query cache for up to 1 hour, then reconcile through normal network requests without caching private API responses in the Service Worker.
 
 ## Visual Evidence
 
