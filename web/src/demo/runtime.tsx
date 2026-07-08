@@ -1,6 +1,7 @@
 import { type ReactNode, useEffect, useSyncExternalStore } from "react";
 
 import {
+	applyDemoShareStateToSearchParams,
 	buildDefaultDemoShareState,
 	buildDemoHref,
 	DEMO_PANEL_LAYOUT_STORAGE_KEY,
@@ -52,6 +53,7 @@ let demoEventSourceFactory: DemoEventSourceFactory | null = null;
 let demoWorker: ReturnType<DemoRuntimeDependencies["setupWorker"]> | null =
 	null;
 let workerStartPromise: Promise<void> | null = null;
+const DEMO_WORKER_START_TIMEOUT_MS = 4_000;
 
 const runtimeState: DemoSnapshot = {
 	active: false,
@@ -140,6 +142,10 @@ function demoBuildEnabled() {
 	return Boolean(__OCTO_RILL_DEMO_APP__);
 }
 
+function regularBuildDemoEnabled() {
+	return Boolean(import.meta.env.DEV);
+}
+
 function demoBasepath() {
 	return __OCTO_RILL_ROUTER_BASEPATH__ || "/";
 }
@@ -147,8 +153,8 @@ function demoBasepath() {
 function isDemoUrl(url: URL) {
 	return (
 		demoBuildEnabled() ||
-		url.searchParams.has("demo") ||
-		url.searchParams.has("d_restore")
+		(regularBuildDemoEnabled() &&
+			(url.searchParams.has("demo") || url.searchParams.has("d_restore")))
 	);
 }
 
@@ -201,6 +207,7 @@ function stopDemoWorker() {
 		return;
 	}
 	demoWorker.stop();
+	demoWorker = null;
 	workerStartPromise = null;
 	demoEventSourceFactory = null;
 }
@@ -234,8 +241,8 @@ async function ensureWorkerStarted() {
 
 	const dependencies = requireDemoDependencies();
 	demoWorker ??= dependencies.setupWorker(...dependencies.demoHandlers);
-	workerStartPromise = demoWorker
-		.start({
+	workerStartPromise = Promise.race([
+		demoWorker.start({
 			quiet: true,
 			serviceWorker: {
 				url: `${import.meta.env.BASE_URL}mockServiceWorker.js`,
@@ -246,8 +253,22 @@ async function ensureWorkerStarted() {
 			onUnhandledRequest(request, print) {
 				dependencies.handleDemoUnhandledRequest(request, print);
 			},
-		})
-		.then(() => undefined);
+		}),
+		new Promise<never>((_, reject) => {
+			window.setTimeout(() => {
+				reject(
+					new Error(
+						`Demo worker did not start within ${DEMO_WORKER_START_TIMEOUT_MS}ms.`,
+					),
+				);
+			}, DEMO_WORKER_START_TIMEOUT_MS);
+		}),
+	])
+		.then(() => undefined)
+		.catch((error) => {
+			stopDemoWorker();
+			throw error;
+		});
 	return workerStartPromise;
 }
 
@@ -286,6 +307,24 @@ function appendMutation(label: string, detail: string) {
 	emit();
 }
 
+function persistDemoShareStateToWindowUrl() {
+	if (typeof window === "undefined" || !runtimeState.active) {
+		return;
+	}
+	const nextHref = buildCurrentDemoShareHref();
+	runtimeState.lastSyncedHref = nextHref;
+	const nextUrl = new URL(nextHref, window.location.origin);
+	const currentUrl = new URL(window.location.href);
+	if (
+		currentUrl.pathname === nextUrl.pathname &&
+		currentUrl.search === nextUrl.search &&
+		currentUrl.hash === nextUrl.hash
+	) {
+		return;
+	}
+	window.history.replaceState({}, "", nextUrl.toString());
+}
+
 export async function prepareDemoRuntime() {
 	if (typeof window === "undefined") return;
 
@@ -321,6 +360,7 @@ export async function prepareDemoRuntime() {
 		},
 		patchShareState: (partial) => {
 			patchRuntimeShareState(partial);
+			persistDemoShareStateToWindowUrl();
 			emit();
 		},
 		recordMutation: appendMutation,
@@ -378,13 +418,18 @@ export function syncDemoRuntimeWithHref(href: string) {
 	if (!next.active && !runtimeState.demoBuild) {
 		stopDemoWorker();
 	}
+	const shouldReseedModel =
+		next.active &&
+		(!runtimeState.active ||
+			modelAffectingShareStateChanged(currentShareState, next.shareState));
 	runtimeState.active = next.active;
 	runtimeState.shareState = next.shareState;
-	runtimeState.model = next.model;
-	if (
-		next.active &&
-		modelAffectingShareStateChanged(currentShareState, next.shareState)
-	) {
+	if (!next.active) {
+		runtimeState.model = null;
+	} else if (shouldReseedModel || !runtimeState.model) {
+		runtimeState.model = next.model;
+	}
+	if (shouldReseedModel) {
 		runtimeState.revision += 1;
 	}
 	emit();
@@ -451,6 +496,23 @@ export function buildCurrentDemoHref(nextShareState?: Partial<DemoShareState>) {
 		},
 		runtimeState.basepath,
 	);
+}
+
+export function buildCurrentDemoShareHref(
+	nextShareState?: Partial<DemoShareState>,
+) {
+	if (typeof window === "undefined") {
+		return buildCurrentDemoHref(nextShareState);
+	}
+
+	const url = new URL(window.location.href);
+	const params = new URLSearchParams(url.search);
+	applyDemoShareStateToSearchParams(params, {
+		...runtimeState.shareState,
+		...nextShareState,
+	});
+	const query = params.toString();
+	return `${url.pathname}${query ? `?${query}` : ""}${url.hash}`;
 }
 
 export function resolveCurrentDemoScene() {

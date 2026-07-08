@@ -157,21 +157,36 @@ export function buildDefaultDemoShareState(
 	};
 }
 
+export function applyDemoShareStateToSearchParams(
+	target: URLSearchParams,
+	state: DemoShareState,
+) {
+	target.delete("demo");
+	for (const key of Array.from(target.keys())) {
+		if (key.startsWith("d_")) {
+			target.delete(key);
+		}
+	}
+
+	target.set("demo", state.sceneId);
+	target.set("d_persona", state.personaId);
+	if (state.networkMode !== "normal") {
+		target.set("d_net", state.networkMode);
+	}
+	if (state.includeOwnReleases) {
+		target.set("d_own", "1");
+	}
+	if (state.publicationState === "published") {
+		target.set("d_pub", "published");
+	}
+	return target;
+}
+
 export function buildDemoHref(state: DemoShareState, basepath: string): string {
 	const scene = getDemoScene(state.sceneId);
 	const [scenePath, sceneSearch = ""] = scene.path.split("?", 2);
 	const params = new URLSearchParams(sceneSearch);
-	params.set("demo", state.sceneId);
-	params.set("d_persona", state.personaId);
-	if (state.networkMode !== "normal") {
-		params.set("d_net", state.networkMode);
-	}
-	if (state.includeOwnReleases) {
-		params.set("d_own", "1");
-	}
-	if (state.publicationState === "published") {
-		params.set("d_pub", "published");
-	}
+	applyDemoShareStateToSearchParams(params, state);
 	const path = `${normalizeBasepath(basepath)}${scenePath}` || "/";
 	const query = params.toString();
 	return query ? `${path}?${query}` : path;
@@ -211,6 +226,36 @@ export function buildCurrentDemoSearchObject(search?: string) {
 
 export function preserveCurrentDemoSearchInHref(href: string) {
 	const next = new URL(href, window.location.origin);
+	copyDemoSearchParams(readCurrentDemoSearchParams(), next.searchParams);
+	return `${next.pathname}${next.search}${next.hash}`;
+}
+
+function resolveCurrentDemoBasepath() {
+	return normalizeBasepath(__OCTO_RILL_ROUTER_BASEPATH__ || "/");
+}
+
+export function resolveDemoNativeHref(href: string) {
+	if (typeof window === "undefined") {
+		return href;
+	}
+
+	const next = new URL(href, window.location.origin);
+	if (next.origin !== window.location.origin) {
+		return href;
+	}
+
+	const basepath = resolveCurrentDemoBasepath();
+	if (basepath) {
+		if (next.pathname === "/") {
+			next.pathname = `${basepath}/`;
+		} else if (
+			next.pathname !== basepath &&
+			!next.pathname.startsWith(`${basepath}/`)
+		) {
+			next.pathname = `${basepath}${next.pathname}`;
+		}
+	}
+
 	copyDemoSearchParams(readCurrentDemoSearchParams(), next.searchParams);
 	return `${next.pathname}${next.search}${next.hash}`;
 }

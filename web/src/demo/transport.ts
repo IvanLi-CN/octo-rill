@@ -1,4 +1,10 @@
-import { delay, http, HttpResponse, isCommonAssetRequest } from "msw";
+import {
+	delay,
+	http,
+	HttpResponse,
+	isCommonAssetRequest,
+	passthrough,
+} from "msw";
 import type { AdminUserItem } from "@/admin/UserManagement";
 import type {
 	AdminDashboardResponse,
@@ -16,6 +22,11 @@ import type {
 	ReactionTokenStatusResponse,
 } from "@/api";
 import { buildDemoHref } from "@/demo/registry";
+import {
+	buildDemoOwnerReleaseFeedItem,
+	DEMO_OWNER_RELEASE_ID,
+} from "@/demo/fixtures";
+import { hasDemoRuntimeRequestMarker } from "@/demo/requestMarker";
 import type {
 	FeedReactionRefreshResponse,
 	ReleaseReactions,
@@ -96,8 +107,13 @@ function redirectToDemoAuth(
 	);
 }
 
-async function applyNetworkProfile(pathname: string) {
-	const { shareState } = currentSnapshot();
+async function applyNetworkProfile(request: Request) {
+	const snapshot = currentSnapshot();
+	if (!snapshot.demoBuild && !hasDemoRuntimeRequestMarker(request)) {
+		return passthrough();
+	}
+	const { shareState } = snapshot;
+	const pathname = new URL(request.url).pathname;
 	if (shareState.networkMode === "slow") {
 		await delay(850);
 		return null;
@@ -246,6 +262,29 @@ function buildTaskAcceptedResponse(taskId: string, taskType: string) {
 		task_id: taskId,
 		task_type: taskType,
 		status: "accepted",
+	};
+}
+
+function reconcileDemoFeedIncludeOwnReleases(
+	model: DemoModel,
+	includeOwnReleases: boolean,
+) {
+	if (!includeOwnReleases) {
+		return {
+			...model.feed,
+			items: model.feed.items.filter(
+				(item) => item.id !== DEMO_OWNER_RELEASE_ID,
+			),
+		};
+	}
+
+	if (model.feed.items.some((item) => item.id === DEMO_OWNER_RELEASE_ID)) {
+		return model.feed;
+	}
+
+	return {
+		...model.feed,
+		items: [buildDemoOwnerReleaseFeedItem(), ...model.feed.items],
 	};
 }
 
@@ -603,27 +642,27 @@ function updateAdminTask(
 
 export const demoHandlers = [
 	http.get("/auth/github/login", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return redirectToDemoAuth(request.url, "login");
 	}),
 	http.get("/auth/linuxdo/login", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return redirectToDemoAuth(request.url, "login");
 	}),
 	http.get("/auth/github/connect", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return redirectToDemoAuth(request.url, "connect");
 	}),
 	http.get("/auth/logout", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return redirectToDemoAuth(request.url, "logout");
 	}),
 	http.get("/api/version", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json({
 			ok: true,
@@ -632,12 +671,12 @@ export const demoHandlers = [
 		});
 	}),
 	http.get("/api/health", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json({ ok: true, version: currentDemoVersion() });
 	}),
 	http.get("/api/me", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const { model } = currentSnapshot();
 		if (!model?.me) {
@@ -655,7 +694,7 @@ export const demoHandlers = [
 	}),
 	http.get("/api/feed", async ({ request }) => {
 		const url = new URL(request.url);
-		const network = await applyNetworkProfile(url.pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const model = currentModel();
 		const type = url.searchParams.get("types");
@@ -676,13 +715,12 @@ export const demoHandlers = [
 		});
 	}),
 	http.head("/api/feed", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return new HttpResponse(null, { status: 204 });
 	}),
 	http.post("/api/feed/reactions/refresh", async ({ request }) => {
-		const url = new URL(request.url);
-		const network = await applyNetworkProfile(url.pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const payload = (await request.json().catch(() => null)) as {
 			release_ids?: unknown;
@@ -703,7 +741,7 @@ export const demoHandlers = [
 		return json(response);
 	}),
 	http.get("/api/dashboard/updates", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json({
 			token: "demo-updates-token",
@@ -728,7 +766,7 @@ export const demoHandlers = [
 		});
 	}),
 	http.get("/api/briefs", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json(
 			currentModel().briefs.map((brief) => ({
@@ -738,7 +776,7 @@ export const demoHandlers = [
 		);
 	}),
 	http.get("/api/briefs/:briefId", async ({ params, request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const brief = currentModel().briefs.find(
 			(item) => item.id === params.briefId,
@@ -752,17 +790,17 @@ export const demoHandlers = [
 		return json(brief);
 	}),
 	http.get("/api/notifications", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json(currentModel().notifications);
 	}),
 	http.get("/api/repos/following", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json(currentModel().followingRepos);
 	}),
 	http.put("/api/repos/:owner/:repo/following", async ({ params, request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const access = requireRuntimeAccess();
 		const fullName = `${params.owner}/${params.repo}`;
@@ -820,7 +858,7 @@ export const demoHandlers = [
 	http.delete(
 		"/api/repos/:owner/:repo/following",
 		async ({ params, request }) => {
-			const network = await applyNetworkProfile(new URL(request.url).pathname);
+			const network = await applyNetworkProfile(request);
 			if (network) return network;
 			const access = requireRuntimeAccess();
 			const fullName = `${params.owner}/${params.repo}`;
@@ -853,14 +891,14 @@ export const demoHandlers = [
 		},
 	),
 	http.get("/api/repos/:owner/:repo/public-release", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json(currentModel().publicationStatus);
 	}),
 	http.post(
 		"/api/repos/:owner/:repo/public-release",
 		async ({ params, request }) => {
-			const network = await applyNetworkProfile(new URL(request.url).pathname);
+			const network = await applyNetworkProfile(request);
 			if (network) return network;
 			const access = requireRuntimeAccess();
 			access.updateModel((model) => ({
@@ -884,7 +922,7 @@ export const demoHandlers = [
 	http.delete(
 		"/api/repos/:owner/:repo/public-release",
 		async ({ params, request }) => {
-			const network = await applyNetworkProfile(new URL(request.url).pathname);
+			const network = await applyNetworkProfile(request);
 			if (network) return network;
 			const access = requireRuntimeAccess();
 			access.updateModel((model) => ({
@@ -906,8 +944,7 @@ export const demoHandlers = [
 		},
 	),
 	http.post("/api/sync/all", async ({ request }) => {
-		const url = new URL(request.url);
-		const network = await applyNetworkProfile(url.pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const taskId = "task-demo-sync-all";
 		ensureTaskStream(taskId, buildSyncFrames(taskId));
@@ -918,8 +955,7 @@ export const demoHandlers = [
 		return json(buildTaskAcceptedResponse(taskId, "sync.all"));
 	}),
 	http.post("/api/sync/notifications", async ({ request }) => {
-		const url = new URL(request.url);
-		const network = await applyNetworkProfile(url.pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const taskId = "task-demo-sync-inbox";
 		ensureTaskStream(taskId, [
@@ -935,20 +971,20 @@ export const demoHandlers = [
 	http.get(
 		"/api/public/repos/:owner/:repo/releases/tag/:tag",
 		async ({ request }) => {
-			const network = await applyNetworkProfile(new URL(request.url).pathname);
+			const network = await applyNetworkProfile(request);
 			if (network) return network;
 			return json(currentModel().publicReleaseDetail);
 		},
 	),
 	http.get("/api/me/github-connections", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json({ items: currentModel().githubConnections });
 	}),
 	http.delete(
 		"/api/me/github-connections/:connectionId",
 		async ({ params, request }) => {
-			const network = await applyNetworkProfile(new URL(request.url).pathname);
+			const network = await applyNetworkProfile(request);
 			if (network) return network;
 			const access = requireRuntimeAccess();
 			access.updateModel((model) => ({
@@ -965,12 +1001,12 @@ export const demoHandlers = [
 		},
 	),
 	http.get("/api/me/linuxdo", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json(currentModel().linuxdo);
 	}),
 	http.delete("/api/me/linuxdo", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const access = requireRuntimeAccess();
 		access.updateModel((model) => ({
@@ -984,13 +1020,13 @@ export const demoHandlers = [
 		return json(currentModel().linuxdo);
 	}),
 	http.get("/api/me/passkeys", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json({ items: currentModel().passkeys });
 	}),
 	http.post("/api/auth/passkeys/register/options", async ({ request }) => {
 		const url = new URL(request.url);
-		const network = await applyNetworkProfile(url.pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json({
 			publicKey: {
@@ -1008,7 +1044,7 @@ export const demoHandlers = [
 	}),
 	http.post("/api/auth/passkeys/authenticate/options", async ({ request }) => {
 		const url = new URL(request.url);
-		const network = await applyNetworkProfile(url.pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const response: PasskeyRequestOptionsJSON = {
 			publicKey: {
@@ -1028,7 +1064,7 @@ export const demoHandlers = [
 		return json(response);
 	}),
 	http.post("/api/auth/passkeys/authenticate/verify", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const response: PasskeyAuthenticateVerifyResponse = {
 			status: "authenticated",
@@ -1037,7 +1073,7 @@ export const demoHandlers = [
 		return json(response);
 	}),
 	http.post("/api/auth/passkeys/register/verify", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const access = requireRuntimeAccess();
 		access.updateModel((model) => ({
@@ -1063,7 +1099,7 @@ export const demoHandlers = [
 		return json(response);
 	}),
 	http.delete("/api/me/passkeys/:passkeyId", async ({ params, request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const access = requireRuntimeAccess();
 		access.updateModel((model) => ({
@@ -1077,12 +1113,12 @@ export const demoHandlers = [
 		return json({ items: currentModel().passkeys });
 	}),
 	http.get("/api/me/api-keys", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json({ items: currentModel().apiKeys });
 	}),
 	http.post("/api/me/api-keys", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const payload = (await request.json()) as { name?: string };
 		const access = requireRuntimeAccess();
@@ -1109,7 +1145,7 @@ export const demoHandlers = [
 		return json(created);
 	}),
 	http.delete("/api/me/api-keys/:apiKeyId", async ({ params, request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const access = requireRuntimeAccess();
 		access.updateModel((model) => ({
@@ -1123,12 +1159,12 @@ export const demoHandlers = [
 		return json({ items: currentModel().apiKeys });
 	}),
 	http.get("/api/me/profile", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json(currentModel().profile);
 	}),
 	http.patch("/api/me/profile", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const payload = (await request.json()) as Partial<{
 			daily_brief_local_time: string;
@@ -1162,14 +1198,10 @@ export const demoHandlers = [
 				feed:
 					payload.include_own_releases === undefined
 						? model.feed
-						: {
-								...model.feed,
-								items: nextProfile.include_own_releases
-									? model.feed.items
-									: model.feed.items.filter(
-											(item) => item.id !== "release-owner-1",
-										),
-							},
+						: reconcileDemoFeedIncludeOwnReleases(
+								model,
+								nextProfile.include_own_releases,
+							),
 			};
 		});
 		access.recordMutation(
@@ -1184,12 +1216,12 @@ export const demoHandlers = [
 		return json(currentModel().profile);
 	}),
 	http.get("/api/reaction-token/status", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json(currentModel().reactionToken);
 	}),
 	http.post("/api/reaction-token/check", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const payload = (await request.json()) as { token?: string };
 		const response: ReactionTokenCheckResponse = {
@@ -1200,7 +1232,7 @@ export const demoHandlers = [
 		return json(response);
 	}),
 	http.put("/api/reaction-token", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const payload = (await request.json()) as { token?: string };
 		const access = requireRuntimeAccess();
@@ -1209,8 +1241,9 @@ export const demoHandlers = [
 			reactionToken: {
 				...model.reactionToken,
 				configured: true,
+				// Never reflect user-entered secret prefixes back into the mock UI.
 				masked_token: payload.token
-					? `${payload.token.slice(0, 8)}...demo`
+					? "demo_pat_token_xxxxxxxx"
 					: model.reactionToken.masked_token,
 				check: {
 					state: "valid",
@@ -1227,12 +1260,12 @@ export const demoHandlers = [
 	}),
 	http.get("/api/admin/users", async ({ request }) => {
 		const url = new URL(request.url);
-		const network = await applyNetworkProfile(url.pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json(filterUsers(currentModel().adminUsers, url.searchParams));
 	}),
 	http.patch("/api/admin/users/:userId", async ({ params, request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const payload = (await request.json()) as Partial<{
 			is_admin: boolean;
@@ -1259,7 +1292,7 @@ export const demoHandlers = [
 		return json(updated);
 	}),
 	http.get("/api/admin/users/:userId/profile", async ({ params, request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const profile = currentModel().adminUserProfiles[String(params.userId)];
 		if (!profile) {
@@ -1273,7 +1306,7 @@ export const demoHandlers = [
 	http.patch(
 		"/api/admin/users/:userId/profile",
 		async ({ params, request }) => {
-			const network = await applyNetworkProfile(new URL(request.url).pathname);
+			const network = await applyNetworkProfile(request);
 			if (network) return network;
 			const payload =
 				(await request.json()) as Partial<AdminUserProfileResponse>;
@@ -1302,24 +1335,24 @@ export const demoHandlers = [
 	),
 	http.get("/api/admin/dashboard", async ({ request }) => {
 		const url = new URL(request.url);
-		const network = await applyNetworkProfile(url.pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const window = url.searchParams.get("window") === "30d" ? "30d" : "7d";
 		return json(buildAdminDashboardResponse(currentModel(), window));
 	}),
 	http.get("/api/admin/jobs/overview", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json(currentModel().adminJobs.overview);
 	}),
 	http.get("/api/admin/jobs/realtime", async ({ request }) => {
 		const url = new URL(request.url);
-		const network = await applyNetworkProfile(url.pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json(filterTasks(allAdminTasks(currentModel()), url.searchParams));
 	}),
 	http.get("/api/admin/jobs/realtime/:taskId", async ({ params, request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const detail = currentModel().adminJobs.taskDetails[String(params.taskId)];
 		if (!detail) {
@@ -1333,7 +1366,7 @@ export const demoHandlers = [
 	http.post(
 		"/api/admin/jobs/realtime/:taskId/retry",
 		async ({ params, request }) => {
-			const network = await applyNetworkProfile(new URL(request.url).pathname);
+			const network = await applyNetworkProfile(request);
 			if (network) return network;
 			const access = requireRuntimeAccess();
 			access.updateModel((model) =>
@@ -1354,7 +1387,7 @@ export const demoHandlers = [
 	http.post(
 		"/api/admin/jobs/realtime/:taskId/cancel",
 		async ({ params, request }) => {
-			const network = await applyNetworkProfile(new URL(request.url).pathname);
+			const network = await applyNetworkProfile(request);
 			if (network) return network;
 			const access = requireRuntimeAccess();
 			access.updateModel((model) =>
@@ -1373,12 +1406,12 @@ export const demoHandlers = [
 		},
 	),
 	http.get("/api/admin/jobs/sync/runtime-config", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json(currentModel().adminJobs.syncRuntimeConfig);
 	}),
 	http.patch("/api/admin/jobs/sync/runtime-config", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const payload =
 			(await request.json()) as Partial<AdminSyncRuntimeConfigResponse>;
@@ -1413,12 +1446,12 @@ export const demoHandlers = [
 		return json(currentModel().adminJobs.syncRuntimeConfig);
 	}),
 	http.get("/api/admin/jobs/llm/status", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json(currentModel().adminJobs.llmStatus);
 	}),
 	http.patch("/api/admin/jobs/llm/runtime-config", async ({ request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const payload = (await request.json()) as Partial<{
 			max_concurrency: number;
@@ -1451,7 +1484,7 @@ export const demoHandlers = [
 	}),
 	http.get("/api/admin/jobs/llm/calls", async ({ request }) => {
 		const url = new URL(request.url);
-		const network = await applyNetworkProfile(url.pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		let items = currentModel().adminJobs.llmCalls;
 		const parentTaskId = url.searchParams.get("parent_task_id");
@@ -1466,7 +1499,7 @@ export const demoHandlers = [
 		});
 	}),
 	http.get("/api/admin/jobs/llm/calls/:callId", async ({ params, request }) => {
-		const network = await applyNetworkProfile(new URL(request.url).pathname);
+		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const detail =
 			currentModel().adminJobs.llmCallDetails[String(params.callId)];
@@ -1586,8 +1619,12 @@ export function handleDemoUnhandledRequest(
 	request: Request,
 	print: { warning: () => void },
 ) {
+	const snapshot = currentSnapshot();
 	const url = new URL(request.url);
 	if (isCommonAssetRequest(request)) {
+		return;
+	}
+	if (!snapshot.demoBuild && !hasDemoRuntimeRequestMarker(request)) {
 		return;
 	}
 	if (url.pathname.startsWith("/api/") || url.pathname.startsWith("/auth/")) {

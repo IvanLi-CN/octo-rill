@@ -52,6 +52,7 @@ const ADMIN_USER_ID = "demo-admin-01";
 const OWNER_SCOPE = { owner: "octo-demo", repo: "release-lab" } as const;
 const OWNER_REPO_FULL_NAME = `${OWNER_SCOPE.owner}/${OWNER_SCOPE.repo}`;
 const OWNER_REPO_VISUAL = buildRepoVisual("OR", "#0f4c81");
+export const DEMO_OWNER_RELEASE_ID = "release-owner-1";
 const DOCS_SCOPE = { owner: "octo-demo", repo: "docs-hub" } as const;
 const DOCS_REPO_FULL_NAME = `${DOCS_SCOPE.owner}/${DOCS_SCOPE.repo}`;
 const DOCS_REPO_VISUAL = buildRepoVisual("DS", "#0f766e");
@@ -202,7 +203,7 @@ function buildFeed(includeOwnReleases: boolean): FeedResponse {
 	const items: FeedItem[] = [
 		{
 			kind: "release",
-			id: "release-owner-1",
+			id: DEMO_OWNER_RELEASE_ID,
 			ts: "2026-07-08T09:20:00+08:00",
 			repo_full_name: OWNER_REPO_FULL_NAME,
 			repo_visual: OWNER_REPO_VISUAL,
@@ -324,9 +325,15 @@ function buildFeed(includeOwnReleases: boolean): FeedResponse {
 	return {
 		items: includeOwnReleases
 			? items
-			: items.filter((item) => item.id !== "release-owner-1"),
+			: items.filter((item) => item.id !== DEMO_OWNER_RELEASE_ID),
 		next_cursor: null,
 	};
+}
+
+export function buildDemoOwnerReleaseFeedItem() {
+	return buildFeed(true).items.find(
+		(item) => item.id === DEMO_OWNER_RELEASE_ID,
+	)!;
 }
 
 function buildBriefs(): BriefItem[] {

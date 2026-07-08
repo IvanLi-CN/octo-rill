@@ -1,3 +1,4 @@
+import { appendDemoRuntimeRequestMarker } from "@/demo/requestMarker";
 import { getDemoEventSourceFactory, isDemoMode } from "@/demo/runtime";
 
 export function openAppEventSource(
@@ -9,7 +10,7 @@ export function openAppEventSource(
 	if (typeof window !== "undefined" && isDemoMode()) {
 		const factory = getDemoEventSourceFactory();
 		if (factory) {
-			return factory(url, options);
+			return factory(appendDemoRuntimeRequestMarker(url), options);
 		}
 	}
 	return new EventSource(url, options);

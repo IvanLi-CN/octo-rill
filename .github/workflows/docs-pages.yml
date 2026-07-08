@@ -6,6 +6,7 @@ on:
     paths:
       - 'docs-site/**'
       - 'web/**'
+      - '.github/assets/**'
       - '.github/workflows/docs-pages.yml'
       - '.github/scripts/assemble-pages-site.sh'
   push:
@@ -13,6 +14,7 @@ on:
     paths:
       - 'docs-site/**'
       - 'web/**'
+      - '.github/assets/**'
       - '.github/workflows/docs-pages.yml'
       - '.github/scripts/assemble-pages-site.sh'
   workflow_dispatch:
@@ -191,11 +193,21 @@ jobs:
           test -f .tmp/pages-site/demo-404-recovery.js
           grep -q '/storybook.html' .tmp/pages-site/index.html
           grep -q '/demo/' .tmp/pages-site/index.html
+          grep -q 'href="./demo/"' .tmp/pages-site/index.html
+          grep -q 'href="./demo/?demo=landing-welcome"' .tmp/pages-site/web-demo.html
           grep -q "${DOCS_BASE}demo/assets/" .tmp/pages-site/demo/index.html
           grep -q '正在跳转到 Storybook' .tmp/pages-site/storybook.html
           grep -q './sb-manager/runtime.js' .tmp/pages-site/storybook/index.html
           grep -q './sb-common-assets/nunito-sans-regular.woff2' .tmp/pages-site/storybook/index.html
           grep -q "${DOCS_BASE}demo-404-recovery.js" .tmp/pages-site/404.html
+          if grep -q 'href="./demo.html?demo=' .tmp/pages-site/web-demo.html; then
+            echo "demo deep links were rewritten to demo.html" >&2
+            exit 1
+          fi
+          if grep -q 'href="/demo/' .tmp/pages-site/web-demo.html; then
+            echo "demo deep links lost the Pages base prefix" >&2
+            exit 1
+          fi
 
       - name: Upload assembled Pages site artifact
         uses: actions/upload-artifact@v4

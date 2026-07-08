@@ -37,10 +37,10 @@ import { Switch } from "@/components/ui/switch";
 import { useAppShellChrome } from "@/layout/AppShell";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import { cn } from "@/lib/utils";
-import { router } from "@/router";
 import { buildDefaultDemoShareState, DEMO_SCENES } from "@/demo/registry";
 import {
 	buildCurrentDemoHref,
+	buildCurrentDemoShareHref,
 	patchDemoShareState,
 	resolveCurrentDemoScene,
 	syncDemoRuntimeWithHref,
@@ -59,6 +59,26 @@ const DESKTOP_PANEL_FALLBACK_HEIGHT = 640;
 const DESKTOP_PANEL_COLLAPSED_HEIGHT = 52;
 const DESKTOP_PANEL_TOAST_GAP = 12;
 const INSPECTOR_SCROLL_CUE_THRESHOLD = 12;
+const DEMO_CONTENT_SAFE_LEFT_VAR = "--demo-inspector-safe-left";
+const DEMO_CONTENT_SAFE_RIGHT_VAR = "--demo-inspector-safe-right";
+
+function clearDemoContentSafeArea() {
+	if (typeof document === "undefined") return;
+	document.documentElement.style.removeProperty(DEMO_CONTENT_SAFE_LEFT_VAR);
+	document.documentElement.style.removeProperty(DEMO_CONTENT_SAFE_RIGHT_VAR);
+}
+
+function applyDemoContentSafeArea(input: { left: number; right: number }) {
+	if (typeof document === "undefined") return;
+	document.documentElement.style.setProperty(
+		DEMO_CONTENT_SAFE_LEFT_VAR,
+		`${Math.max(0, Math.round(input.left))}px`,
+	);
+	document.documentElement.style.setProperty(
+		DEMO_CONTENT_SAFE_RIGHT_VAR,
+		`${Math.max(0, Math.round(input.right))}px`,
+	);
+}
 
 function getOpenToastBottomInViewport(bounds: { left: number; right: number }) {
 	if (typeof document === "undefined") return 0;
@@ -174,8 +194,8 @@ export function DemoInspector() {
 	}, [routeLocationKey, snapshot.active]);
 
 	const shareHref = useMemo(
-		() => buildCurrentDemoHref(),
-		[snapshot.shareState],
+		() => buildCurrentDemoShareHref(),
+		[routeLocationKey, snapshot.shareState],
 	);
 
 	if (!snapshot.active) {
@@ -201,16 +221,17 @@ export function DemoInspector() {
 			reseed?: boolean;
 		},
 	) => {
-		const href = buildCurrentDemoHref(next);
 		if (options?.reseed !== false) {
-			replaceDemoLocation(href);
+			replaceDemoLocation(buildCurrentDemoHref(next));
 			return;
 		}
+		const href = buildCurrentDemoShareHref(next);
 		patchDemoShareState(next, { reseed: false });
-		void router.navigate({
-			href,
-			replace: true,
-		});
+		window.history.replaceState(
+			{},
+			"",
+			new URL(href, window.location.origin).toString(),
+		);
 	};
 
 	const setCollapsed = (collapsed: boolean) => {
@@ -236,7 +257,9 @@ export function DemoInspector() {
 			onPersonaChange={(personaId) =>
 				navigateWithShareState({ personaId }, { reseed: true })
 			}
-			onNetworkChange={(networkMode) => navigateWithShareState({ networkMode })}
+			onNetworkChange={(networkMode) =>
+				navigateWithShareState({ networkMode }, { reseed: false })
+			}
 			onIncludeOwnReleasesChange={(includeOwnReleases) =>
 				navigateWithShareState({ includeOwnReleases }, { reseed: true })
 			}
@@ -555,6 +578,72 @@ function DesktopInspectorChrome(props: {
 			? { left: panelMetrics.x, top: panelMetrics.y }
 			: { right: panelMetrics.x, top: panelMetrics.y };
 
+	useLayoutEffect(() => {
+		if (collapsed || !panelRef.current || typeof document === "undefined") {
+			clearDemoContentSafeArea();
+			return;
+		}
+
+		const panelRect = panelRef.current.getBoundingClientRect();
+		const contentFrames = Array.from(
+			document.querySelectorAll<HTMLElement>(
+				"[data-demo-content-frame='true']",
+			),
+		);
+
+		if (contentFrames.length === 0) {
+			clearDemoContentSafeArea();
+			return;
+		}
+
+		let nextSafeLeft = 0;
+		let nextSafeRight = 0;
+
+		for (const frame of contentFrames) {
+			const frameRect = frame.getBoundingClientRect();
+			const verticalOverlap =
+				Math.min(panelRect.bottom, frameRect.bottom) -
+				Math.max(panelRect.top, frameRect.top);
+			if (verticalOverlap <= 0) continue;
+
+			if (
+				panelRect.left <= frameRect.left &&
+				panelRect.right > frameRect.left
+			) {
+				nextSafeLeft = Math.max(
+					nextSafeLeft,
+					panelRect.right - frameRect.left + DESKTOP_PANEL_GAP,
+				);
+			}
+			if (
+				panelRect.right >= frameRect.right &&
+				panelRect.left < frameRect.right
+			) {
+				nextSafeRight = Math.max(
+					nextSafeRight,
+					frameRect.right - panelRect.left + DESKTOP_PANEL_GAP,
+				);
+			}
+		}
+
+		applyDemoContentSafeArea({
+			left: nextSafeLeft,
+			right: nextSafeRight,
+		});
+
+		return () => {
+			clearDemoContentSafeArea();
+		};
+	}, [
+		collapsed,
+		dragging,
+		edge,
+		panelMetrics.x,
+		panelMetrics.y,
+		panelHeight,
+		viewportRevision,
+	]);
+
 	if (collapsed) {
 		return (
 			<Button
@@ -669,16 +758,16 @@ export type DemoInspectorPanelProps = {
 export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 	const { snapshot } = props;
 	return (
-		<div className="space-y-2">
+		<div className="space-y-1.5">
 			<Card className="border-dashed">
-				<CardHeader className="p-4 pb-2">
+				<CardHeader className="p-3 pb-2">
 					<CardTitle className="flex items-center justify-between text-base">
 						<span>{props.sceneTitle}</span>
 						<Badge variant="outline">Simulated Writes</Badge>
 					</CardTitle>
 				</CardHeader>
-				<CardContent className="space-y-3 px-4 pb-4">
-					<section className="space-y-2">
+				<CardContent className="space-y-2.5 px-3 pb-3">
+					<section className="space-y-1.5">
 						<Label>Scene</Label>
 						<Select
 							value={snapshot.shareState.sceneId}
@@ -699,8 +788,8 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 						</Select>
 					</section>
 
-					<section className="grid gap-3 sm:grid-cols-2">
-						<div className="space-y-2">
+					<section className="grid gap-2.5 sm:grid-cols-2">
+						<div className="space-y-1.5">
 							<Label>Persona</Label>
 							<Select
 								value={snapshot.shareState.personaId}
@@ -718,7 +807,7 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 								</SelectContent>
 							</Select>
 						</div>
-						<div className="space-y-2">
+						<div className="space-y-1.5">
 							<Label>Network</Label>
 							<Select
 								value={snapshot.shareState.networkMode}
@@ -741,14 +830,14 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 			</Card>
 
 			<Card>
-				<CardHeader className="p-4 pb-2">
+				<CardHeader className="p-3 pb-2">
 					<CardTitle className="text-base">Data</CardTitle>
 				</CardHeader>
-				<CardContent className="space-y-3 px-4 pb-4">
+				<CardContent className="space-y-2.5 px-3 pb-3">
 					<div className="flex items-center justify-between gap-3">
 						<div className="space-y-0.5">
 							<p className="font-medium text-sm">Include My Releases</p>
-							<p className="text-muted-foreground text-xs">
+							<p className="text-muted-foreground text-xs leading-4">
 								影响 Settings 回显和 Dashboard owner-only release 露出。
 							</p>
 						</div>
@@ -757,7 +846,7 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 							onCheckedChange={props.onIncludeOwnReleasesChange}
 						/>
 					</div>
-					<div className="space-y-2">
+					<div className="space-y-1.5">
 						<Label>Repo Public Release State</Label>
 						<Select
 							value={snapshot.shareState.publicationState}
@@ -780,11 +869,11 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 			</Card>
 
 			<Card>
-				<CardHeader className="p-4 pb-2">
+				<CardHeader className="p-3 pb-2">
 					<CardTitle className="text-base">Actions & Share</CardTitle>
 				</CardHeader>
-				<CardContent className="space-y-3 px-4 pb-4">
-					<div className="flex flex-wrap gap-2">
+				<CardContent className="space-y-2.5 px-3 pb-3">
+					<div className="flex flex-wrap gap-1.5">
 						<Button type="button" variant="outline" onClick={props.onReset}>
 							<RefreshCcw className="size-4" />
 							Reset Scene
@@ -798,9 +887,9 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 							Copy Share URL
 						</Button>
 					</div>
-					<div className="space-y-2">
+					<div className="space-y-1.5">
 						<Label>Share</Label>
-						<p className="rounded-xl border bg-muted/30 px-3 py-2 font-mono text-[11px] break-all">
+						<p className="overflow-x-auto rounded-xl border bg-muted/30 px-2.5 py-1.5 font-mono text-[10px] leading-4 whitespace-nowrap">
 							{props.shareHref}
 						</p>
 					</div>
@@ -812,7 +901,7 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 				</CardContent>
 			</Card>
 
-			<details className="rounded-2xl border bg-muted/20 p-3">
+			<details className="rounded-2xl border bg-muted/20 p-2.5">
 				<summary className="cursor-pointer list-none">
 					<div className="flex items-center justify-between gap-3">
 						<p className="font-medium text-sm">Advanced</p>
@@ -826,8 +915,8 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 						</div>
 					</div>
 				</summary>
-				<div className="mt-4 space-y-4">
-					<section className="space-y-2">
+				<div className="mt-3 space-y-3">
+					<section className="space-y-1.5">
 						<p className="font-medium text-sm">Recent Mutations</p>
 						{snapshot.mutations.length === 0 ? (
 							<p className="text-muted-foreground text-sm">
@@ -835,7 +924,7 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 								write；直接在页面里保存、发布、取消或重试一次就会记录。
 							</p>
 						) : (
-							<div className="space-y-2">
+							<div className="space-y-1.5">
 								{snapshot.mutations.map((mutation) => (
 									<div
 										key={mutation.id}
@@ -850,7 +939,7 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 							</div>
 						)}
 					</section>
-					<section className="space-y-2">
+					<section className="space-y-1.5">
 						<p className="font-medium text-sm">Raw JSON</p>
 						<pre
 							className={cn(

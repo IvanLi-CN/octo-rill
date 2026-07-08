@@ -42,6 +42,11 @@ const baseSnapshot = {
 const meta = {
 	title: "Demo/Inspector Panel",
 	component: DemoInspectorPanel,
+	render: (args) => (
+		<div className="w-[400px]">
+			<DemoInspectorPanel {...args} />
+		</div>
+	),
 	args: {
 		snapshot: baseSnapshot,
 		sceneTitle: "Dashboard",
@@ -72,5 +77,18 @@ export const Default: Story = {
 			canvas.getByText("Publish public release page"),
 		).toBeInTheDocument();
 		await expect(canvas.getByText("Copy Share URL")).toBeInTheDocument();
+	},
+};
+
+export const ShortDesktopSurface: Story = {
+	render: (args) => (
+		<div className="h-[560px] w-[400px] overflow-y-auto rounded-[28px] border bg-background p-3">
+			<DemoInspectorPanel {...args} />
+		</div>
+	),
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("Actions & Share")).toBeInTheDocument();
+		await expect(canvas.getByText("Share")).toBeInTheDocument();
 	},
 };

@@ -16,6 +16,149 @@ test("demo auth affordances stay inside mock runtime", async ({ page }) => {
 	).toBeVisible();
 });
 
+test("demo mode skips live warm auth seed on first paint", async ({ page }) => {
+	await page.addInitScript(() => {
+		localStorage.setItem(
+			"octo-rill.auth-bootstrap.v3",
+			JSON.stringify({
+				savedAt: Date.now(),
+				me: {
+					user: {
+						id: "live-admin",
+						github_user_id: 1,
+						login: "live-admin",
+						name: "Live Admin",
+						avatar_url: null,
+						email: "live-admin@example.com",
+						is_admin: true,
+					},
+					access_sync: {
+						task_id: null,
+						task_type: null,
+						event_path: null,
+						reason: "none",
+					},
+					dashboard: {
+						daily_boundary_local: "08:00",
+						daily_boundary_time_zone: "Asia/Shanghai",
+						daily_boundary_utc_offset_minutes: 480,
+						include_own_releases: true,
+					},
+				},
+			}),
+		);
+
+		let leaked = false;
+		const markLeak = () => {
+			if (document.querySelector('[data-dashboard-brand-heading="true"]')) {
+				leaked = true;
+			}
+			(
+				window as typeof window & { __demoWarmSeedLeakSeen?: boolean }
+			).__demoWarmSeedLeakSeen = leaked;
+		};
+
+		markLeak();
+		new MutationObserver(markLeak).observe(document.documentElement, {
+			subtree: true,
+			childList: true,
+			attributes: true,
+		});
+	});
+
+	await page.goto("/?demo=landing-welcome");
+
+	await expect(page.locator("[data-landing-login-cta]")).toBeVisible();
+	await expect(
+		page.locator('[data-dashboard-brand-heading="true"]'),
+	).toHaveCount(0);
+	expect(
+		await page.evaluate(() =>
+			Boolean(
+				(window as typeof window & { __demoWarmSeedLeakSeen?: boolean })
+					.__demoWarmSeedLeakSeen,
+			),
+		),
+	).toBe(false);
+});
+
+test("demo worker ignores unmarked live requests in regular dev builds", async ({
+	page,
+}) => {
+	await page.goto("/?demo=landing-welcome");
+
+	const result = await page.evaluate(async () => {
+		try {
+			const response = await fetch("/api/version", {
+				credentials: "include",
+			});
+			const text = await response.text();
+			try {
+				return {
+					status: response.status,
+					payload: JSON.parse(text) as { source?: string } | null,
+				};
+			} catch {
+				return {
+					status: response.status,
+					payload: null,
+				};
+			}
+		} catch {
+			return {
+				status: null,
+				payload: null,
+			};
+		}
+	});
+
+	expect(result.payload?.source).not.toBe("DEMO_RUNTIME");
+});
+
+test("leaving demo mode does not keep the demo auth persona cached", async ({
+	page,
+}) => {
+	await page.goto(
+		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
+	);
+
+	await expect(
+		page.locator('[data-dashboard-brand-heading="true"]'),
+	).toBeVisible();
+
+	await page.goto("/");
+
+	await expect(page.locator("[data-landing-login-cta]")).toBeVisible();
+	await expect(
+		page.locator('[data-dashboard-brand-heading="true"]'),
+	).toHaveCount(0);
+});
+
+test("demo boot failure shows a safe error surface instead of a blank page", async ({
+	page,
+}) => {
+	await page.addInitScript(() => {
+		const container = window.ServiceWorkerContainer?.prototype;
+		if (!container) return;
+		container.register = async () => {
+			throw new Error("mock register blocked");
+		};
+	});
+
+	await page.goto("/?demo=landing-welcome");
+
+	await expect(
+		page.getByRole("heading", { name: "Web Demo 启动失败" }),
+	).toBeVisible();
+	await expect(
+		page.getByText("应用没有继续渲染，以避免误触真实接口或真实认证链路。"),
+	).toBeVisible();
+	await expect(page.getByRole("button", { name: "重新尝试" })).toBeVisible();
+	await expect(
+		page.locator('[data-dashboard-brand-heading="true"]'),
+	).toHaveCount(0);
+});
+
 test("switching demo persona reseeds the auth surface", async ({ page }) => {
 	await page.goto(
 		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
@@ -50,6 +193,132 @@ test("settings scene share url preserves existing route query", async ({
 	).not.toContainText("/settings?section=my-releases?demo=");
 });
 
+test("demo inspector share url follows in-scene route changes", async ({
+	page,
+}) => {
+	await page.goto("/settings?section=my-releases&demo=settings-my-releases");
+
+	await page.getByRole("link", { name: "GitHub PAT" }).first().click();
+
+	await expect(page).toHaveURL(
+		/settings\?(?=.*section=github-pat)(?=.*demo=settings-my-releases)/,
+	);
+	await expect(
+		page.locator('[data-demo-inspector-chrome="desktop"]'),
+	).toContainText(
+		/settings\?(?=.*section=github-pat)(?=.*demo=settings-my-releases)/,
+	);
+});
+
+test("network changes preserve the current in-scene route query", async ({
+	page,
+}) => {
+	await page.goto("/settings?section=my-releases&demo=settings-my-releases");
+
+	await page.getByRole("link", { name: "GitHub PAT" }).first().click();
+	await expect(page).toHaveURL(
+		/settings\?(?=.*section=github-pat)(?=.*demo=settings-my-releases)/,
+	);
+
+	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
+	await inspector.getByRole("combobox").nth(2).click();
+	await page.getByRole("option", { name: "Slow", exact: true }).click();
+
+	await expect(page).toHaveURL(
+		/settings\?(?=.*section=github-pat)(?=.*demo=settings-my-releases)(?=.*d_net=slow)/,
+	);
+	await expect(inspector).toContainText(
+		/settings\?(?=.*section=github-pat)(?=.*demo=settings-my-releases)(?=.*d_net=slow)/,
+	);
+});
+
+test("desktop inspector does not block settings simulated writes", async ({
+	page,
+}) => {
+	await page.goto("/settings?section=api-keys&demo=settings-my-releases");
+
+	const items = page.locator("[data-api-key-item]");
+	await expect(items.first()).toBeVisible();
+	const before = await items.count();
+
+	await page.getByRole("button", { name: "创建 API Key" }).click();
+
+	await expect(page.locator("[data-api-key-created]")).toBeVisible();
+	await expect(items).toHaveCount(before + 1);
+
+	await page.getByRole("link", { name: "GitHub PAT" }).first().click();
+	await expect(page).toHaveURL(/section=github-pat/);
+
+	await page.getByRole("link", { name: "API Key" }).first().click();
+	await expect(page).toHaveURL(/section=api-keys/);
+	await expect(items).toHaveCount(before + 1);
+});
+
+test("demo PAT saves never echo a user-entered secret prefix", async ({
+	page,
+}) => {
+	await page.goto("/settings?section=github-pat&demo=settings-my-releases");
+
+	const patInput = page.getByRole("textbox", { name: "GitHub PAT" });
+	await patInput.fill("ghp_sensitive_demo_secret_12345678");
+	await expect(
+		page.getByText("GitHub PAT 可用", { exact: true }),
+	).toBeVisible();
+
+	await page.getByRole("button", { name: "保存 GitHub PAT" }).click();
+
+	await expect(
+		page.getByText("demo_pat_token_xxxxxxxx", { exact: true }),
+	).toBeVisible();
+	await expect(
+		page.getByText("ghp_sensitive_demo_secret_12345678", { exact: true }),
+	).toHaveCount(0);
+	await expect(page.getByText("ghp_sens", { exact: true })).toHaveCount(0);
+});
+
+test("internal links preserve demo share state in native hrefs", async ({
+	page,
+}) => {
+	await page.goto("/settings?demo=settings-my-releases");
+
+	const githubPatLink = page.getByRole("link", { name: "GitHub PAT" }).first();
+	await expect(githubPatLink).toHaveAttribute(
+		"href",
+		/\/settings\?section=github-pat&demo=settings-my-releases/,
+	);
+
+	await page.goto(
+		"/public/octo-demo/release-lab/releases/tag/v2.31.0?demo=public-release-ready",
+	);
+
+	await expect(page.getByRole("link", { name: "OctoRill" })).toHaveAttribute(
+		"href",
+		/\/\?demo=public-release-ready/,
+	);
+});
+
+test("simulated publish writes published share state into the URL", async ({
+	page,
+}) => {
+	await page.goto(
+		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
+	);
+
+	await page.getByRole("button", { name: "发布公开页" }).evaluate((element) => {
+		if (!(element instanceof HTMLButtonElement)) {
+			throw new Error("publish button is missing");
+		}
+		element.click();
+	});
+
+	await expect(page).toHaveURL(/d_pub=published/);
+
+	await page.reload();
+
+	await expect(page.getByRole("button", { name: "取消发布" })).toBeVisible();
+	await expect(page.getByRole("button", { name: "发布公开页" })).toHaveCount(0);
+});
+
 test("demo inspector stays fully usable when toast feedback appears", async ({
 	page,
 }) => {
@@ -64,11 +333,13 @@ test("demo inspector stays fully usable when toast feedback appears", async ({
 	await expect(
 		page.locator('[data-demo-inspector-scroll-cue="bottom"]'),
 	).toBeVisible();
+	await expect(inspector.getByText("Actions & Share")).toBeVisible();
 
 	await page.getByRole("button", { name: "发布公开页" }).click();
 
 	const toast = page.locator('[data-slot="toast"][data-state="open"]').first();
 	await expect(toast).toBeVisible();
+	await expect(inspector.getByText("Actions & Share")).toBeVisible();
 
 	const geometry = await page.evaluate(() => {
 		const panel = document.querySelector<HTMLElement>(
@@ -98,6 +369,7 @@ test("demo inspector stays fully usable when toast feedback appears", async ({
 			viewportHeight: window.innerHeight,
 			panelTop: panelRect.top,
 			panelBottom: panelRect.bottom,
+			panelBottomGap: window.innerHeight - panelRect.bottom,
 			surfaceTop: surfaceRect.top,
 			surfaceBottom: surfaceRect.bottom,
 			scrollerBottom: scrollerRect.bottom,
@@ -112,6 +384,7 @@ test("demo inspector stays fully usable when toast feedback appears", async ({
 	});
 
 	expect(geometry.panelBottom).toBeLessThanOrEqual(geometry.viewportHeight - 1);
+	expect(geometry.panelBottomGap).toBeGreaterThanOrEqual(8);
 	expect(geometry.surfaceBottom).toBeLessThanOrEqual(
 		geometry.viewportHeight - 1,
 	);

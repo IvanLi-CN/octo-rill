@@ -29,7 +29,7 @@
 - `web/src/demo/**`：scene registry、mock data、MSW/SSE transport、inspector、share state、simulated writes。
 - `web` demo build target、`mockServiceWorker.js`、router basepath `/demo`、app bootstrap 顺序。
 - `.github/workflows/docs-pages.yml` 与 `.github/scripts/assemble-pages-site.sh` 的 demo 产物装配。
-- `docs-site/docs/web-demo.md`、`docs-site/docs/index.md`、`docs-site/docs/quick-start.md`、README / `web/README.md` / 产品文档中的 demo 入口与说明。
+- `docs-site/docs/web-demo.mdx`、`docs-site/docs/index.mdx`、`docs-site/docs/quick-start.md`、README / `web/README.md` / 产品文档中的 demo 入口与说明。
 
 ### Out of scope
 
@@ -59,6 +59,7 @@
   - `admin-jobs-running`
 - scene 需要绑定正式 route suffix，并允许通过 `d_persona`、`d_net`、`d_own`、`d_pub` 复现关键状态。
 - demo 中的写操作只更新内存态，并在 inspector 中记录为 simulated write。
+- demo fixtures 中的 owner / repo / 邮箱 / PAT mask / API key 必须使用明显的合成样例；secret-like 输入在 demo UI 中不得回显原始值或前缀。
 
 ### Inspector
 
@@ -135,6 +136,30 @@
   evidence_note: 桌面态 deep-link 恢复后，模拟“发布公开页”写操作会同步更新 Published share state，并在 inspector 的 Advanced badge 中暴露 simulated write 计数。owner-facing 截图使用更高的桌面视口完整展示 inspector 全栈内容；`1366x768` 的 toast 避让与短视口钳制、`1798x1360` 的 tall-desktop 完整展示均由 Playwright 回归测试覆盖。
 
 ![Desktop dashboard demo with simulated publish](./assets/dashboard-desktop-simulated-publish.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  submission_gate: `captured`
+  PR: include
+  captured_at: `2026-07-09`
+  route: `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
+  state: `dashboard-repo-publish`
+  evidence_note: 短视口桌面态（`1366x768`）下触发“发布公开页”toast 后，inspector 仍会避让顶部 toast、保持底边在视口内，并把剩余内容收进内部滚动区；owner-facing 截图现在保证 `Actions & Share` 标题仍在首屏内，不再呈现“底部像溢出视口”的观感。该场景与 `demo boot failure`、native anchor `/demo` share-state 保真一起由新增 Playwright 回归覆盖。
+
+![Desktop dashboard demo with toast-safe inspector](./assets/dashboard-desktop-toast-clamped-fixed.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  submission_gate: `captured`
+  PR: include
+  captured_at: `2026-07-09`
+  route: `/demo/settings?section=api-keys&demo=settings-my-releases`
+  state: `settings-my-releases`
+  evidence_note: 桌面态 Settings 在右侧 inspector 展开时，主内容会自动让出 safe area，因此 `创建 API Key` 等 simulated write 控件不会再被浮窗压住；同一路径下保存 GitHub PAT 时也只回显固定 demo mask，不泄漏用户输入的 secret 前缀。
+
+![Desktop settings demo with safe area and simulated API keys](./assets/settings-api-keys-safe-area.png)
 
 - source_type: `ui_demo`
   target_program: `mock-only`

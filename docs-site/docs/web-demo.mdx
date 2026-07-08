@@ -7,7 +7,7 @@ description: OctoRill 页面级 mock-only demo、视觉证据与验收入口。
 
 `/demo/` 是 OctoRill 的页面级 `mock-only` 子应用：它复用真实页面组件和真实 route suffix，但通过 `?demo=` 与 `d_*` 分享态进入 demo runtime，不依赖真实登录、真实 `/api/**` 或真实后端写路径。
 
-默认 demo scene 中出现的 owner / repo、邮箱、PAT mask 与 API key 只使用合成样例，例如 `octo-demo/release-lab` 与 `*.octo.demo`；它们不会映射到真实私有仓库或真实凭据。
+默认 demo scene 中出现的 owner / repo、邮箱、PAT mask 与 API key 只使用合成样例，例如 `octo-demo/release-lab` 与 `*.octo.demo`；它们不会映射到真实私有仓库或真实凭据。即使你在 demo 里手动输入 PAT，保存后的 UI 也只会回显固定假 mask，不会截取你的 secret 前缀。
 
 ## 它负责什么
 
@@ -23,13 +23,13 @@ description: OctoRill 页面级 mock-only demo、视觉证据与验收入口。
 
 ## 直接入口
 
-- [打开 `/demo/`](/demo/)
-- [Landing](/demo/?demo=landing-welcome)
-- [Dashboard](/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish)
-- [Settings](/demo/settings?section=my-releases&demo=settings-my-releases)
-- [Public Release](/demo/public/octo-demo/release-lab/releases/tag/v2.31.0?demo=public-release-ready)
-- [Admin Panel](/demo/admin/users?demo=admin-panel-users)
-- [Admin Jobs](/demo/admin/jobs?demo=admin-jobs-running)
+- <a href="./demo/">打开 <code>/demo/</code></a>
+- <a href="./demo/?demo=landing-welcome">Landing</a>
+- <a href="./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish">Dashboard</a>
+- <a href="./demo/settings?section=my-releases&amp;demo=settings-my-releases">Settings</a>
+- <a href="./demo/public/octo-demo/release-lab/releases/tag/v2.31.0?demo=public-release-ready">Public Release</a>
+- <a href="./demo/admin/users?demo=admin-panel-users">Admin Panel</a>
+- <a href="./demo/admin/jobs?demo=admin-jobs-running">Admin Jobs</a>
 
 ## 分享态合同
 
