@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { apiGet } from "@/api";
@@ -206,6 +206,13 @@ export function useFeed(
 			}
 		: null;
 	const currentError = appendError ?? currentInitialError;
+
+	useEffect(() => {
+		reqIdRef.current += 1;
+		setLoadingMore(false);
+		setAppendError(null);
+		setFreshKeys(new Set());
+	}, [queryKey]);
 
 	const loadInitial = useCallback(
 		async (options?: { freshKeys?: string[]; throwOnError?: boolean }) => {

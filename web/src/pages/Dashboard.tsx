@@ -1373,6 +1373,9 @@ export function Dashboard(props: {
 		);
 	}, [notifications, notificationsQueryKey, queryClient]);
 	useEffect(() => {
+		if (!sidebarBootstrapCompletedRef.current && briefs.length === 0) {
+			return;
+		}
 		queryClient.setQueryData<DashboardBriefsQueryData>(briefsQueryKey, {
 			items: briefs,
 			selectedBriefId,
