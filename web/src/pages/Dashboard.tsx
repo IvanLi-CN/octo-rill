@@ -1295,14 +1295,15 @@ export function Dashboard(props: {
 	const initialNotificationBootstrapRef = useRef(
 		hasDesktopSidebarInbox || tab === "inbox",
 	);
+	const hasCachedBriefs =
+		queryClient.getQueryData<DashboardBriefsQueryData>(briefsQueryKey) !==
+		undefined;
 	const hasCachedNotifications =
 		queryClient.getQueryData<DashboardNotificationsQueryData>(
 			notificationsQueryKey,
 		) !== undefined;
 	const sidebarBootstrapCompletedRef = useRef(
-		sessionState?.sidebarBootstrapped ??
-			queryClient.getQueryData<DashboardBriefsQueryData>(briefsQueryKey) !==
-				undefined,
+		sessionState?.sidebarBootstrapped ?? hasCachedBriefs,
 	);
 	const notificationsBootstrapCompletedRef = useRef(
 		sessionState?.notificationsBootstrapped ??
@@ -1314,20 +1315,20 @@ export function Dashboard(props: {
 			cachedReactionTokenStatus !== undefined,
 	);
 	const startupBootstrapRequestedRef = useRef(
-		sidebarBootstrapCompletedRef.current,
+		sessionState?.sidebarBootstrapped === true,
 	);
 	const startupSidebarRetriedRef = useRef(false);
 	const notificationsBootstrapRequestedRef = useRef(
-		notificationsBootstrapCompletedRef.current ||
+		sessionState?.notificationsBootstrapped === true ||
 			(initialNotificationBootstrapRef.current &&
 				!startupBootstrapRequestedRef.current),
 	);
 	const reactionTokenBootstrapRequestedRef = useRef(
-		reactionTokenBootstrapCompletedRef.current,
+		sessionState?.reactionTokenBootstrapped === true,
 	);
 	const notificationsRequestInFlightRef = useRef(false);
 	const [sidebarLoading, setSidebarLoading] = useState(
-		() => !bootedFromWarmStart,
+		() => !bootedFromWarmStart && !hasCachedBriefs,
 	);
 	const [notificationsLoading, setNotificationsLoading] = useState(false);
 	useEffect(() => {
@@ -1993,7 +1994,7 @@ export function Dashboard(props: {
 		const startSidebarBootstrap = (allowRetry: boolean) => {
 			startupBootstrapRequestedRef.current = true;
 			void refreshSidebar({
-				background: bootedFromWarmStart,
+				background: bootedFromWarmStart || hasCachedBriefs,
 				includeNotifications: initialNotificationBootstrapRef.current,
 			}).catch(() => {
 				startupBootstrapRequestedRef.current = false;
@@ -2005,7 +2006,7 @@ export function Dashboard(props: {
 			});
 		};
 		startSidebarBootstrap(true);
-	}, [bootedFromWarmStart, refreshSidebar, scopedMode]);
+	}, [bootedFromWarmStart, hasCachedBriefs, refreshSidebar, scopedMode]);
 
 	useEffect(() => {
 		if (reactionTokenBootstrapRequestedRef.current) {
