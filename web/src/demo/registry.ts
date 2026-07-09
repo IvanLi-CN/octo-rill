@@ -224,9 +224,19 @@ export function buildCurrentDemoSearchObject(search?: string) {
 	return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
+function hrefDeclaresDemoState(params: URLSearchParams) {
+	if (params.has("demo")) {
+		return true;
+	}
+
+	return Array.from(params.keys()).some((key) => key.startsWith("d_"));
+}
+
 export function preserveCurrentDemoSearchInHref(href: string) {
 	const next = new URL(href, window.location.origin);
-	copyDemoSearchParams(readCurrentDemoSearchParams(), next.searchParams);
+	if (!hrefDeclaresDemoState(next.searchParams)) {
+		copyDemoSearchParams(readCurrentDemoSearchParams(), next.searchParams);
+	}
 	return `${next.pathname}${next.search}${next.hash}`;
 }
 
@@ -256,7 +266,9 @@ export function resolveDemoNativeHref(href: string) {
 		}
 	}
 
-	copyDemoSearchParams(readCurrentDemoSearchParams(), next.searchParams);
+	if (!hrefDeclaresDemoState(next.searchParams)) {
+		copyDemoSearchParams(readCurrentDemoSearchParams(), next.searchParams);
+	}
 	return `${next.pathname}${next.search}${next.hash}`;
 }
 

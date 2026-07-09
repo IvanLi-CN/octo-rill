@@ -13,4 +13,11 @@
 - 2026-07-09: 将桌面态 inspector 从固定 640px 高改为按内容自然长高、仅在短视口内回退到内部滚动；补上 tall desktop 视口回归测试，并刷新 owner-facing `ui_demo` 视觉证据。
 - 2026-07-09: 为 demo bootstrap 增加 service worker 启动超时/失败的安全兜底错误页，统一修复 native anchor 在 `/demo` 下的 share-state `href` 保真，并把短视口 toast 场景截图写回本 spec 的 `## Visual Evidence`。
 - 2026-07-09: 针对 owner 反馈继续压紧桌面态 inspector 内容密度，确保 `1366x768` + toast 的短视口截图里 `Actions & Share`、share URL 与 `Advanced` 摘要都留在首屏内，同时补了 Storybook `CompactDesktopSurface` 入口与对应 Playwright 断言。
-- 2026-07-09: 继续收紧桌面态浮窗验收：主内容现在会为右侧 inspector 自动让出 safe area，Settings 中的 simulated API key / PAT 控件不再被遮挡；同时 demo 保存 PAT 时固定回显假 mask，避免把用户输入的 secret 前缀写回 mock UI。
+- 2026-07-09: 根据 owner 反馈撤回正文 safe area 让位逻辑，改回真正的桌面悬浮覆盖层；Dashboard 重新允许正文延伸到 inspector 下方，Settings / Public Release scene 默认停靠左侧以避免压住主操作，同时保留 demo 保存 PAT 的固定假 mask，避免把用户输入的 secret 前缀写回 mock UI。
+- 2026-07-09: 继续根据 owner 反馈细化桌面合同：当浏览器宽度足够容纳 Web App 最宽版心时，demo 根层会切成双栏 frame，左侧固定 inspector、右侧保留现有 app layout；普通桌面宽度仍保持真正的悬浮覆盖层，并新增超宽 left-docked 几何回归与 `ui_demo` 视觉证据。
+- 2026-07-09: review-loop 发现超宽双栏 frame 仍以 `content-box` 计算总宽度，导致 `maxWidth + padding-left` 在接近断点时可能顶出视口；已改为 `border-box` 约束根层宽度，并把 ultra-wide 回归用例改为校验 frame 右边界不超过 viewport，确保 docked inspector 与 app frame 对齐。
+- 2026-07-09: 第二轮 review-loop 继续收紧 scene 默认停靠位：inspector 布局存储已从单值格式升级为按 `sceneId` 分组的 `scenes` map，切 scene 或整页跳转到 `settings-my-releases` / `public-release-ready` 时会重新读取该 scene 的默认/持久布局，不再让旧的右侧布局覆盖左侧默认停靠位；同时补上 Dashboard -> Settings 与“多 scene 各自记忆布局”的回归测试。
+- 2026-07-09: 按 owner 最新验收口径把超宽桌面合同继续收紧为真正的 root-level pinned rail：当视口足够宽时，inspector 自身固定贴住视口最左边、占满全高、永久显示且不支持关闭；右侧保留现有 Web App layout。相应更新了 `DemoInspector`/`__root`、Storybook `WideDockedRail` 入口、wide/tall desktop Playwright 几何断言，以及 owner-facing `ui_demo` 宽屏证据图。
+- 2026-07-09: 根据 owner 最新反馈补齐 wide pinned rail 下的 footer 对齐：`AppMetaFooter` 现在会继承 demo wide shell 注入的 left/right offset，确保 footer 跟随右侧 Web App Layout 的 gutter，而不是继续固定铺满整个 viewport；同时补了 `AppMetaFooter` Storybook 宽屏 offset 预览、ultra-wide footer 几何断言，并刷新同一张 owner-facing `ui_demo` 宽屏证据图。
+- 2026-07-09: owner 更正宽屏验收口径后，超宽桌面合同从“永久显示、不可关闭”回退为“默认 pinned left rail，但支持收起成 bubble 恢复正常 Web App layout”；相应改动了 root frame 的 collapse gating、`DemoInspectorDockedRail` 头部收起交互、Storybook `WideDockedRail` 断言，以及 ultra-wide Playwright / `ui_demo` 证据，确保宽屏下既能看带 rail 的调试态，也能一键回到正常版心验收一般效果。
+- 2026-07-09: 根据 owner 最新反馈把 `Actions & Share` 中的 share deep link 从横向滚动文本块改成 readonly 单行 input，去掉额外横向滚动条，同时保留聚焦、移动光标与局部选择复制的交互；补上对应 Storybook 断言、Playwright 回归，以及落盘到 spec 的 owner-facing `ui_demo` 证据图。

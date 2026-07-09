@@ -1,3 +1,4 @@
+import type { CSSProperties } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, within } from "storybook/test";
@@ -13,6 +14,7 @@ type FooterPreviewProps = {
 	loadedVersion: string;
 	availableVersion: string | null;
 	hasUpdate: boolean;
+	wideDockedOffset?: boolean;
 };
 
 const FOOTER_RELEASE_HREF = "/public/IvanLi-CN/octo-rill/releases/tag/v2.29.0";
@@ -40,7 +42,17 @@ function FooterPreview(props: FooterPreviewProps) {
 	};
 
 	return (
-		<div className="bg-background min-h-screen">
+		<div
+			className="bg-background min-h-screen"
+			style={
+				props.wideDockedOffset
+					? ({
+							"--app-meta-footer-left": "404px",
+							"--app-meta-footer-right": "24px",
+						} as CSSProperties)
+					: undefined
+			}
+		>
 			<div className="mx-auto max-w-6xl px-6 py-10">
 				<p className="text-muted-foreground font-mono text-sm">
 					AppMetaFooter component preview
@@ -73,6 +85,7 @@ const meta = {
 		loadedVersion: "v2.29.0",
 		availableVersion: null,
 		hasUpdate: false,
+		wideDockedOffset: false,
 	},
 	argTypes: {
 		loadedVersion: {
@@ -82,6 +95,9 @@ const meta = {
 			control: "text",
 		},
 		hasUpdate: {
+			control: "boolean",
+		},
+		wideDockedOffset: {
 			control: "boolean",
 		},
 	},
@@ -178,6 +194,29 @@ export const RawSemverReleaseTag: Story = {
 			description: {
 				story:
 					"兼容 release 流程输出的无 v 前缀有效版本：展示文本保持当前版本值，跳转 tag 规范化为真实 GitHub Release tag。",
+			},
+		},
+	},
+};
+
+export const WideDockedOffset: Story = {
+	args: {
+		wideDockedOffset: true,
+	},
+	play: async ({ canvasElement }) => {
+		const storyRoot = canvasElement.ownerDocument.body;
+		const footer = storyRoot.querySelector<HTMLElement>("footer");
+		if (!footer) {
+			throw new Error("Expected footer to exist");
+		}
+		const rect = footer.getBoundingClientRect();
+		await expect(rect.left).toBeGreaterThanOrEqual(404);
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"宽屏 demo pinned rail 下，footer 外框会跟随右侧 Web App layout 的 left/right gutter，而不是继续铺满整个 viewport。",
 			},
 		},
 	},

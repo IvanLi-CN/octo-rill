@@ -1,4 +1,5 @@
 import {
+	ChevronDown,
 	Copy,
 	GripHorizontal,
 	Inspect,
@@ -7,7 +8,9 @@ import {
 } from "lucide-react";
 import {
 	type ReactNode,
+	type RefObject,
 	useEffect,
+	useId,
 	useLayoutEffect,
 	useMemo,
 	useRef,
@@ -15,17 +18,12 @@ import {
 } from "react";
 import { useRouterState } from "@tanstack/react-router";
 
+import { DEMO_INSPECTOR_PANEL_WIDTH_PX } from "@/demo/layout";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-	Select,
-	SelectContent,
-	SelectItem,
-	SelectTrigger,
-	SelectValue,
-} from "@/components/ui/select";
 import {
 	Sheet,
 	SheetContent,
@@ -35,14 +33,17 @@ import {
 } from "@/components/ui/sheet";
 import { Switch } from "@/components/ui/switch";
 import { useAppShellChrome } from "@/layout/AppShell";
+import { useOptionalRouter } from "@/lib/internalNavigation";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import { cn } from "@/lib/utils";
 import { buildDefaultDemoShareState, DEMO_SCENES } from "@/demo/registry";
 import {
+	applyDemoShareStateInPlace,
 	buildCurrentDemoHref,
 	buildCurrentDemoShareHref,
 	patchDemoShareState,
 	resolveCurrentDemoScene,
+	setPendingDemoRouteSyncHref,
 	syncDemoRuntimeWithHref,
 	updateDemoPanelLayout,
 	useDemoSnapshot,
@@ -52,31 +53,63 @@ function clamp(value: number, min: number, max: number) {
 	return Math.min(max, Math.max(min, value));
 }
 
-const DESKTOP_PANEL_WIDTH = 380;
+const DESKTOP_PANEL_WIDTH = DEMO_INSPECTOR_PANEL_WIDTH_PX;
 const DESKTOP_PANEL_GAP = 16;
 const DESKTOP_PANEL_MIN_HEIGHT = 360;
 const DESKTOP_PANEL_FALLBACK_HEIGHT = 640;
 const DESKTOP_PANEL_COLLAPSED_HEIGHT = 52;
 const DESKTOP_PANEL_TOAST_GAP = 12;
 const INSPECTOR_SCROLL_CUE_THRESHOLD = 12;
-const DEMO_CONTENT_SAFE_LEFT_VAR = "--demo-inspector-safe-left";
-const DEMO_CONTENT_SAFE_RIGHT_VAR = "--demo-inspector-safe-right";
+const WIDE_DOCKED_BUBBLE_X = 16;
+const WIDE_DOCKED_BUBBLE_Y = 88;
+const PERSONA_OPTIONS = [
+	{ value: "guest", label: "Guest" },
+	{ value: "member", label: "Member" },
+	{ value: "admin", label: "Admin" },
+] as const;
+const NETWORK_OPTIONS = [
+	{ value: "normal", label: "Normal" },
+	{ value: "slow", label: "Slow" },
+	{ value: "faulty", label: "Faulty" },
+] as const;
+const PUBLICATION_OPTIONS = [
+	{ value: "unpublished", label: "Unpublished" },
+	{ value: "published", label: "Published" },
+] as const;
 
-function clearDemoContentSafeArea() {
-	if (typeof document === "undefined") return;
-	document.documentElement.style.removeProperty(DEMO_CONTENT_SAFE_LEFT_VAR);
-	document.documentElement.style.removeProperty(DEMO_CONTENT_SAFE_RIGHT_VAR);
-}
+function InspectorSelect<Value extends string>(props: {
+	id: string;
+	value: Value;
+	options: ReadonlyArray<{
+		value: Value;
+		label: string;
+	}>;
+	compact?: boolean;
+	onValueChange: (value: Value) => void;
+}) {
+	const { compact = false } = props;
 
-function applyDemoContentSafeArea(input: { left: number; right: number }) {
-	if (typeof document === "undefined") return;
-	document.documentElement.style.setProperty(
-		DEMO_CONTENT_SAFE_LEFT_VAR,
-		`${Math.max(0, Math.round(input.left))}px`,
-	);
-	document.documentElement.style.setProperty(
-		DEMO_CONTENT_SAFE_RIGHT_VAR,
-		`${Math.max(0, Math.round(input.right))}px`,
+	return (
+		<div className="relative">
+			<select
+				id={props.id}
+				value={props.value}
+				className={cn(
+					"h-9 w-full appearance-none rounded-md border border-input bg-transparent px-3 pr-9 text-sm shadow-xs transition-[color,box-shadow] outline-none focus:border-ring focus:ring-[3px] focus:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-input/30 dark:hover:bg-input/50",
+					compact && "h-7.5 text-xs",
+				)}
+				onChange={(event) => props.onValueChange(event.target.value as Value)}
+				onPointerDown={(event) => event.stopPropagation()}
+				onClick={(event) => event.stopPropagation()}
+			>
+				{props.options.map((option) => (
+					<option key={option.value} value={option.value}>
+						{option.label}
+					</option>
+				))}
+			</select>
+			<ChevronDown className="pointer-events-none absolute top-1/2 right-3 size-4 -translate-y-1/2 text-muted-foreground" />
+		</div>
 	);
 }
 
@@ -171,167 +204,8 @@ function resolveDesktopPanelMetrics(input: {
 	};
 }
 
-export function DemoInspector() {
-	const snapshot = useDemoSnapshot();
-	const scene = resolveCurrentDemoScene();
-	const isMobile = useMediaQuery("(max-width: 767px)");
-	const [mobileOpen, setMobileOpen] = useState(false);
-
-	const routeLocationKey = useRouterState({
-		select: (state) =>
-			JSON.stringify({
-				pathname: state.location.pathname,
-				search: state.location.search,
-				hash: state.location.hash,
-			}),
-	});
-
-	useEffect(() => {
-		if (!snapshot.active) return;
-		syncDemoRuntimeWithHref(
-			`${window.location.pathname}${window.location.search}${window.location.hash}`,
-		);
-	}, [routeLocationKey, snapshot.active]);
-
-	const shareHref = useMemo(
-		() => buildCurrentDemoShareHref(),
-		[routeLocationKey, snapshot.shareState],
-	);
-
-	if (!snapshot.active) {
-		return null;
-	}
-
-	const copyShareLink = async () => {
-		const absoluteHref = new URL(shareHref, window.location.origin).toString();
-		try {
-			await navigator.clipboard.writeText(absoluteHref);
-		} catch {
-			// ignore clipboard failures in demo-only tooling
-		}
-	};
-
-	const replaceDemoLocation = (href: string) => {
-		window.location.replace(new URL(href, window.location.origin).toString());
-	};
-
-	const navigateWithShareState = (
-		next: Partial<typeof snapshot.shareState>,
-		options?: {
-			reseed?: boolean;
-		},
-	) => {
-		if (options?.reseed !== false) {
-			replaceDemoLocation(buildCurrentDemoHref(next));
-			return;
-		}
-		const href = buildCurrentDemoShareHref(next);
-		patchDemoShareState(next, { reseed: false });
-		window.history.replaceState(
-			{},
-			"",
-			new URL(href, window.location.origin).toString(),
-		);
-	};
-
-	const setCollapsed = (collapsed: boolean) => {
-		updateDemoPanelLayout({ collapsed });
-	};
-
-	const resetToSceneDefaults = () => {
-		replaceDemoLocation(
-			buildCurrentDemoHref(
-				buildDefaultDemoShareState(snapshot.shareState.sceneId),
-			),
-		);
-	};
-
-	const panelProps = {
-		snapshot,
-		sceneTitle: scene.title,
-		shareHref,
-		onSceneChange: (sceneId: (typeof DEMO_SCENES)[number]["id"]) =>
-			navigateWithShareState({ sceneId }, { reseed: true }),
-		onPersonaChange: (personaId: "guest" | "member" | "admin") =>
-			navigateWithShareState({ personaId }, { reseed: true }),
-		onNetworkChange: (networkMode: "normal" | "slow" | "faulty") =>
-			navigateWithShareState({ networkMode }, { reseed: false }),
-		onIncludeOwnReleasesChange: (includeOwnReleases: boolean) =>
-			navigateWithShareState({ includeOwnReleases }, { reseed: true }),
-		onPublicationStateChange: (publicationState: "published" | "unpublished") =>
-			navigateWithShareState({ publicationState }, { reseed: true }),
-		onReset: resetToSceneDefaults,
-		onCopyShareLink: copyShareLink,
-	} satisfies DemoInspectorPanelProps;
-
-	if (isMobile) {
-		return (
-			<>
-				<Button
-					type="button"
-					size="sm"
-					className="fixed bottom-4 right-4 z-50 rounded-full shadow-lg"
-					onClick={() => setMobileOpen(true)}
-				>
-					<Inspect className="size-4" />
-					Demo
-				</Button>
-				<Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
-					<SheetContent side="bottom" className="h-[82vh] rounded-t-3xl p-0">
-						<SheetHeader className="border-b pb-3">
-							<SheetTitle>Demo Inspector</SheetTitle>
-							<SheetDescription>
-								切换 scene / persona / network，并复制当前 share deep link。
-							</SheetDescription>
-						</SheetHeader>
-						<div className="h-full overflow-y-auto p-4">
-							<DemoInspectorPanel {...panelProps} />
-						</div>
-					</SheetContent>
-				</Sheet>
-			</>
-		);
-	}
-
-	return (
-		<DesktopInspectorChrome
-			collapsed={snapshot.panelLayout.collapsed}
-			edge={snapshot.panelLayout.edge}
-			x={snapshot.panelLayout.x}
-			y={snapshot.panelLayout.y}
-			onCollapse={() => setCollapsed(true)}
-			onExpand={() => setCollapsed(false)}
-		>
-			{({ density }) => (
-				<DemoInspectorPanel {...panelProps} density={density} />
-			)}
-		</DesktopInspectorChrome>
-	);
-}
-
-function DesktopInspectorChrome(props: {
-	children: (input: { density: "default" | "compact" }) => ReactNode;
-	collapsed: boolean;
-	edge: "left" | "right";
-	x: number;
-	y: number;
-	onCollapse: () => void;
-	onExpand: () => void;
-}) {
-	const { children, collapsed, edge, x, y, onCollapse, onExpand } = props;
-	const { headerHeight, viewportBottomInset, viewportTopInset } =
-		useAppShellChrome();
-	const panelRef = useRef<HTMLDivElement | null>(null);
-	const titleRef = useRef<HTMLDivElement | null>(null);
-	const scrollerRef = useRef<HTMLDivElement | null>(null);
-	const dragOffsetRef = useRef<{ x: number; y: number } | null>(null);
-	const [dragging, setDragging] = useState(false);
-	const [contentHeight, setContentHeight] = useState<number | null>(null);
+function useViewportRevision() {
 	const [viewportRevision, setViewportRevision] = useState(0);
-	const [scrollCues, setScrollCues] = useState({
-		showTop: false,
-		showBottom: false,
-	});
 
 	useEffect(() => {
 		if (typeof window === "undefined") return;
@@ -363,62 +237,24 @@ function DesktopInspectorChrome(props: {
 		return () => observer.disconnect();
 	}, []);
 
-	useLayoutEffect(() => {
-		if (collapsed || typeof window === "undefined") {
-			setContentHeight(null);
-			return;
-		}
+	return viewportRevision;
+}
 
-		const syncContentHeight = () => {
-			const titleHeight = titleRef.current?.offsetHeight ?? 0;
-			const scrollerHeight = scrollerRef.current?.scrollHeight ?? 0;
-			if (scrollerHeight === 0) return;
-			const nextHeight = titleHeight + scrollerHeight;
-			setContentHeight((current) =>
-				current !== null && Math.abs(current - nextHeight) < 1
-					? current
-					: nextHeight,
-			);
-		};
-
-		syncContentHeight();
-		const resizeObserver =
-			typeof ResizeObserver === "undefined"
-				? null
-				: new ResizeObserver(syncContentHeight);
-		if (titleRef.current) {
-			resizeObserver?.observe(titleRef.current);
-		}
-		if (scrollerRef.current) {
-			resizeObserver?.observe(scrollerRef.current);
-			if (scrollerRef.current.firstElementChild instanceof HTMLElement) {
-				resizeObserver?.observe(scrollerRef.current.firstElementChild);
-			}
-		}
-		const mutationObserver = new MutationObserver(syncContentHeight);
-		if (scrollerRef.current) {
-			mutationObserver.observe(scrollerRef.current, {
-				subtree: true,
-				childList: true,
-				characterData: true,
-				attributes: true,
-			});
-		}
-		window.addEventListener("resize", syncContentHeight);
-		const visualViewport = window.visualViewport;
-		visualViewport?.addEventListener("resize", syncContentHeight);
-		visualViewport?.addEventListener("scroll", syncContentHeight);
-		return () => {
-			resizeObserver?.disconnect();
-			mutationObserver.disconnect();
-			window.removeEventListener("resize", syncContentHeight);
-			visualViewport?.removeEventListener("resize", syncContentHeight);
-			visualViewport?.removeEventListener("scroll", syncContentHeight);
-		};
-	}, [collapsed, viewportRevision]);
+function useInspectorScrollCues(
+	scrollerRef: RefObject<HTMLDivElement | null>,
+	input: {
+		disabled: boolean;
+		viewportRevision: number;
+	},
+) {
+	const { disabled, viewportRevision } = input;
+	const [scrollCues, setScrollCues] = useState({
+		showTop: false,
+		showBottom: false,
+	});
 
 	useEffect(() => {
-		if (collapsed) {
+		if (disabled) {
 			setScrollCues({ showTop: false, showBottom: false });
 			return;
 		}
@@ -472,6 +308,374 @@ function DesktopInspectorChrome(props: {
 			window.removeEventListener("resize", syncScrollCues);
 			visualViewport?.removeEventListener("resize", syncScrollCues);
 			visualViewport?.removeEventListener("scroll", syncScrollCues);
+		};
+	}, [disabled, scrollerRef, viewportRevision]);
+
+	return scrollCues;
+}
+
+export function DemoInspector(props: {
+	desktopMode?: "floating" | "docked-sidebar";
+}) {
+	const snapshot = useDemoSnapshot();
+	const router = useOptionalRouter();
+	const scene = resolveCurrentDemoScene();
+	const isMobile = useMediaQuery("(max-width: 767px)");
+	const [mobileOpen, setMobileOpen] = useState(false);
+
+	const routeLocationKey = useRouterState({
+		select: (state) =>
+			JSON.stringify({
+				pathname: state.location.pathname,
+				search: state.location.search,
+				hash: state.location.hash,
+			}),
+	});
+
+	useEffect(() => {
+		if (!snapshot.active) return;
+		syncDemoRuntimeWithHref(
+			`${window.location.pathname}${window.location.search}${window.location.hash}`,
+		);
+	}, [routeLocationKey, snapshot.active]);
+
+	const shareHref = useMemo(
+		() => buildCurrentDemoShareHref(),
+		[routeLocationKey, snapshot.shareState],
+	);
+
+	if (!snapshot.active) {
+		return null;
+	}
+
+	const copyShareLink = async () => {
+		const absoluteHref = new URL(shareHref, window.location.origin).toString();
+		try {
+			await navigator.clipboard.writeText(absoluteHref);
+		} catch {
+			// ignore clipboard failures in demo-only tooling
+		}
+	};
+
+	const replaceDemoLocation = (href: string) => {
+		window.location.replace(new URL(href, window.location.origin).toString());
+	};
+
+	const navigateDemoHref = async (
+		href: string,
+		next: Partial<typeof snapshot.shareState>,
+		options?: {
+			reseed?: boolean;
+		},
+	) => {
+		if (!router) {
+			replaceDemoLocation(href);
+			return;
+		}
+
+		const previousShareState = snapshot.shareState;
+		setPendingDemoRouteSyncHref(href);
+		patchDemoShareState(next, { reseed: options?.reseed });
+
+		try {
+			await router.navigate({
+				href,
+				replace: true,
+			});
+		} catch (error) {
+			setPendingDemoRouteSyncHref(null);
+			patchDemoShareState(previousShareState, { reseed: options?.reseed });
+			throw error;
+		}
+	};
+
+	const navigateWithShareState = (
+		next: Partial<typeof snapshot.shareState>,
+		options?: {
+			reseed?: boolean;
+		},
+	) => {
+		const nextSceneId = next.sceneId ?? snapshot.shareState.sceneId;
+
+		if (
+			options?.reseed !== false &&
+			nextSceneId === snapshot.shareState.sceneId
+		) {
+			applyDemoShareStateInPlace(next, { reseed: true });
+			return;
+		}
+
+		if (options?.reseed !== false) {
+			void navigateDemoHref(buildCurrentDemoHref(next), next, {
+				reseed: true,
+			});
+		} else {
+			applyDemoShareStateInPlace(next, { reseed: false });
+		}
+	};
+
+	const setCollapsed = (collapsed: boolean) => {
+		updateDemoPanelLayout({ collapsed });
+	};
+
+	const collapseToBubble = () => {
+		updateDemoPanelLayout({
+			collapsed: true,
+			edge: "left",
+			x: WIDE_DOCKED_BUBBLE_X,
+			y: WIDE_DOCKED_BUBBLE_Y,
+		});
+	};
+
+	const resetToSceneDefaults = () => {
+		const nextShareState = buildDefaultDemoShareState(
+			snapshot.shareState.sceneId,
+		);
+		void navigateDemoHref(
+			buildCurrentDemoHref(nextShareState),
+			nextShareState,
+			{
+				reseed: true,
+			},
+		);
+	};
+
+	const panelProps = {
+		snapshot,
+		sceneTitle: scene.title,
+		shareHref,
+		onSceneChange: (sceneId: (typeof DEMO_SCENES)[number]["id"]) =>
+			navigateWithShareState({ sceneId }, { reseed: true }),
+		onPersonaChange: (personaId: "guest" | "member" | "admin") =>
+			navigateWithShareState({ personaId }, { reseed: true }),
+		onNetworkChange: (networkMode: "normal" | "slow" | "faulty") =>
+			navigateWithShareState({ networkMode }, { reseed: false }),
+		onIncludeOwnReleasesChange: (includeOwnReleases: boolean) =>
+			navigateWithShareState({ includeOwnReleases }, { reseed: true }),
+		onPublicationStateChange: (publicationState: "published" | "unpublished") =>
+			navigateWithShareState({ publicationState }, { reseed: true }),
+		onReset: resetToSceneDefaults,
+		onCopyShareLink: copyShareLink,
+	} satisfies DemoInspectorPanelProps;
+
+	if (isMobile) {
+		return (
+			<>
+				<Button
+					type="button"
+					size="sm"
+					className="fixed bottom-4 right-4 z-50 rounded-full shadow-lg"
+					onClick={() => setMobileOpen(true)}
+				>
+					<Inspect className="size-4" />
+					Demo
+				</Button>
+				<Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
+					<SheetContent side="bottom" className="h-[82vh] rounded-t-3xl p-0">
+						<SheetHeader className="border-b pb-3">
+							<SheetTitle>Demo Inspector</SheetTitle>
+							<SheetDescription>
+								切换 scene / persona / network，并复制当前 share deep link。
+							</SheetDescription>
+						</SheetHeader>
+						<div className="h-full overflow-y-auto p-4">
+							<DemoInspectorPanel {...panelProps} />
+						</div>
+					</SheetContent>
+				</Sheet>
+			</>
+		);
+	}
+
+	if (props.desktopMode === "docked-sidebar") {
+		return (
+			<DemoInspectorDockedRail onCollapse={collapseToBubble}>
+				{({ density }) => (
+					<DemoInspectorPanel {...panelProps} density={density} />
+				)}
+			</DemoInspectorDockedRail>
+		);
+	}
+
+	return (
+		<DesktopInspectorChrome
+			collapsed={snapshot.panelLayout.collapsed}
+			edge={snapshot.panelLayout.edge}
+			x={snapshot.panelLayout.x}
+			y={snapshot.panelLayout.y}
+			onCollapse={() => setCollapsed(true)}
+			onExpand={() => setCollapsed(false)}
+		>
+			{({ density }) => (
+				<DemoInspectorPanel {...panelProps} density={density} />
+			)}
+		</DesktopInspectorChrome>
+	);
+}
+
+export function DemoInspectorDockedRail(props: {
+	onCollapse: () => void;
+	children: (input: { density: "default" | "compact" }) => ReactNode;
+}) {
+	const scrollerRef = useRef<HTMLDivElement | null>(null);
+	const viewportRevision = useViewportRevision();
+	const scrollCues = useInspectorScrollCues(scrollerRef, {
+		disabled: false,
+		viewportRevision,
+	});
+	const density =
+		typeof window !== "undefined" && window.innerHeight <= 900
+			? "compact"
+			: "default";
+
+	return (
+		<div
+			className="fixed inset-y-0 left-0 z-40 flex h-dvh min-h-0 w-[380px] flex-col overflow-hidden border-r bg-background/95 shadow-[16px_0_44px_-32px_rgba(15,23,42,0.48)] backdrop-blur"
+			data-demo-inspector-chrome="desktop"
+			data-demo-inspector-layout="sidebar"
+			data-demo-inspector-mode="docked"
+			data-demo-inspector-pinned="true"
+		>
+			<div
+				className={cn(
+					"flex items-center justify-between gap-3 border-b px-4 py-4",
+					density === "compact" && "px-3 py-3",
+				)}
+				data-demo-inspector-title="true"
+			>
+				<div className="flex min-w-0 items-center gap-3">
+					<div className="flex size-9 shrink-0 items-center justify-center rounded-2xl border bg-muted/35">
+						<Inspect className="size-4 text-muted-foreground" />
+					</div>
+					<div className="min-w-0">
+						<p className="font-medium text-sm">Demo Inspector</p>
+						<p className="text-muted-foreground text-xs">
+							Pinned on wide desktop
+						</p>
+					</div>
+				</div>
+				<Button
+					type="button"
+					size="icon"
+					variant="ghost"
+					className={cn("shrink-0", density === "compact" && "size-8")}
+					aria-label="Collapse Demo Inspector"
+					data-demo-inspector-collapse="true"
+					onClick={props.onCollapse}
+				>
+					<Minimize2 className="size-4" />
+				</Button>
+			</div>
+			<div className="relative min-h-0 flex-1">
+				{scrollCues.showTop ? (
+					<div
+						className="pointer-events-none absolute inset-x-0 top-0 z-10 h-5 bg-linear-to-b from-background via-background/85 to-transparent"
+						data-demo-inspector-scroll-cue="top"
+					/>
+				) : null}
+				<div
+					ref={scrollerRef}
+					className={cn(
+						"h-full min-h-0 overflow-y-auto p-4 pb-6",
+						density === "compact" && "p-2.5 pb-3",
+					)}
+					data-demo-inspector-scroller="true"
+				>
+					{props.children({ density })}
+				</div>
+				{scrollCues.showBottom ? (
+					<>
+						<div
+							className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-12 bg-linear-to-t from-background via-background/86 to-transparent"
+							data-demo-inspector-scroll-cue="bottom"
+						/>
+						<div className="pointer-events-none absolute inset-x-0 bottom-3 z-10 flex justify-center">
+							<div className="rounded-full border bg-background/92 px-2.5 py-1 font-medium text-[10px] text-muted-foreground shadow-sm backdrop-blur">
+								向下滚动查看更多
+							</div>
+						</div>
+					</>
+				) : null}
+			</div>
+		</div>
+	);
+}
+
+function DesktopInspectorChrome(props: {
+	children: (input: { density: "default" | "compact" }) => ReactNode;
+	collapsed: boolean;
+	edge: "left" | "right";
+	x: number;
+	y: number;
+	onCollapse: () => void;
+	onExpand: () => void;
+}) {
+	const { children, collapsed, edge, x, y, onCollapse, onExpand } = props;
+	const { headerHeight, viewportBottomInset, viewportTopInset } =
+		useAppShellChrome();
+	const panelRef = useRef<HTMLDivElement | null>(null);
+	const titleRef = useRef<HTMLDivElement | null>(null);
+	const scrollerRef = useRef<HTMLDivElement | null>(null);
+	const dragOffsetRef = useRef<{ x: number; y: number } | null>(null);
+	const [dragging, setDragging] = useState(false);
+	const [contentHeight, setContentHeight] = useState<number | null>(null);
+	const viewportRevision = useViewportRevision();
+	const scrollCues = useInspectorScrollCues(scrollerRef, {
+		disabled: collapsed,
+		viewportRevision,
+	});
+
+	useLayoutEffect(() => {
+		if (collapsed || typeof window === "undefined") {
+			setContentHeight(null);
+			return;
+		}
+
+		const syncContentHeight = () => {
+			const titleHeight = titleRef.current?.offsetHeight ?? 0;
+			const scrollerHeight = scrollerRef.current?.scrollHeight ?? 0;
+			if (scrollerHeight === 0) return;
+			const nextHeight = titleHeight + scrollerHeight;
+			setContentHeight((current) =>
+				current !== null && Math.abs(current - nextHeight) < 1
+					? current
+					: nextHeight,
+			);
+		};
+
+		syncContentHeight();
+		const resizeObserver =
+			typeof ResizeObserver === "undefined"
+				? null
+				: new ResizeObserver(syncContentHeight);
+		if (titleRef.current) {
+			resizeObserver?.observe(titleRef.current);
+		}
+		if (scrollerRef.current) {
+			resizeObserver?.observe(scrollerRef.current);
+			if (scrollerRef.current.firstElementChild instanceof HTMLElement) {
+				resizeObserver?.observe(scrollerRef.current.firstElementChild);
+			}
+		}
+		const mutationObserver = new MutationObserver(syncContentHeight);
+		if (scrollerRef.current) {
+			mutationObserver.observe(scrollerRef.current, {
+				subtree: true,
+				childList: true,
+				characterData: true,
+				attributes: true,
+			});
+		}
+		window.addEventListener("resize", syncContentHeight);
+		const visualViewport = window.visualViewport;
+		visualViewport?.addEventListener("resize", syncContentHeight);
+		visualViewport?.addEventListener("scroll", syncContentHeight);
+		return () => {
+			resizeObserver?.disconnect();
+			mutationObserver.disconnect();
+			window.removeEventListener("resize", syncContentHeight);
+			visualViewport?.removeEventListener("resize", syncContentHeight);
+			visualViewport?.removeEventListener("scroll", syncContentHeight);
 		};
 	}, [collapsed, viewportRevision]);
 
@@ -579,72 +783,6 @@ function DesktopInspectorChrome(props: {
 			? { left: panelMetrics.x, top: panelMetrics.y }
 			: { right: panelMetrics.x, top: panelMetrics.y };
 
-	useLayoutEffect(() => {
-		if (collapsed || !panelRef.current || typeof document === "undefined") {
-			clearDemoContentSafeArea();
-			return;
-		}
-
-		const panelRect = panelRef.current.getBoundingClientRect();
-		const contentFrames = Array.from(
-			document.querySelectorAll<HTMLElement>(
-				"[data-demo-content-frame='true']",
-			),
-		);
-
-		if (contentFrames.length === 0) {
-			clearDemoContentSafeArea();
-			return;
-		}
-
-		let nextSafeLeft = 0;
-		let nextSafeRight = 0;
-
-		for (const frame of contentFrames) {
-			const frameRect = frame.getBoundingClientRect();
-			const verticalOverlap =
-				Math.min(panelRect.bottom, frameRect.bottom) -
-				Math.max(panelRect.top, frameRect.top);
-			if (verticalOverlap <= 0) continue;
-
-			if (
-				panelRect.left <= frameRect.left &&
-				panelRect.right > frameRect.left
-			) {
-				nextSafeLeft = Math.max(
-					nextSafeLeft,
-					panelRect.right - frameRect.left + DESKTOP_PANEL_GAP,
-				);
-			}
-			if (
-				panelRect.right >= frameRect.right &&
-				panelRect.left < frameRect.right
-			) {
-				nextSafeRight = Math.max(
-					nextSafeRight,
-					frameRect.right - panelRect.left + DESKTOP_PANEL_GAP,
-				);
-			}
-		}
-
-		applyDemoContentSafeArea({
-			left: nextSafeLeft,
-			right: nextSafeRight,
-		});
-
-		return () => {
-			clearDemoContentSafeArea();
-		};
-	}, [
-		collapsed,
-		dragging,
-		edge,
-		panelMetrics.x,
-		panelMetrics.y,
-		panelHeight,
-		viewportRevision,
-	]);
-
 	if (collapsed) {
 		return (
 			<Button
@@ -652,6 +790,7 @@ function DesktopInspectorChrome(props: {
 				size="sm"
 				className="fixed z-50 max-w-[calc(100vw-24px)] rounded-full px-4 py-5 shadow-lg"
 				data-demo-inspector-bubble="desktop"
+				data-demo-inspector-mode="floating"
 				style={positionStyle}
 				onClick={onExpand}
 			>
@@ -666,6 +805,7 @@ function DesktopInspectorChrome(props: {
 			ref={panelRef}
 			className="fixed z-50 flex w-[380px] max-w-[calc(100vw-24px)] overflow-hidden"
 			data-demo-inspector-chrome="desktop"
+			data-demo-inspector-mode="floating"
 			style={{
 				...positionStyle,
 				height: panelHeight,
@@ -679,7 +819,8 @@ function DesktopInspectorChrome(props: {
 				<div
 					ref={titleRef}
 					className={cn(
-						"flex cursor-move items-center justify-between border-b px-4 py-3",
+						"flex items-center justify-between border-b px-4 py-3",
+						"cursor-move",
 						density === "compact" && "px-3 py-2",
 					)}
 					data-demo-inspector-title="true"
@@ -708,6 +849,8 @@ function DesktopInspectorChrome(props: {
 						size="icon"
 						variant="ghost"
 						className={cn(density === "compact" && "size-8")}
+						aria-label="Collapse Demo Inspector"
+						data-demo-inspector-collapse="true"
 						onPointerDown={(event) => event.stopPropagation()}
 						onClick={onCollapse}
 					>
@@ -767,6 +910,13 @@ export type DemoInspectorPanelProps = {
 export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 	const { snapshot } = props;
 	const isCompact = props.density === "compact";
+	const sceneSelectId = useId();
+	const personaSelectId = useId();
+	const networkSelectId = useId();
+	const includeOwnReleasesSwitchId = useId();
+	const publicationStateSelectId = useId();
+	const shareInputId = useId();
+
 	return (
 		<div className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
 			<Card className="border-dashed">
@@ -788,70 +938,47 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 					)}
 				>
 					<section className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
-						<Label>Scene</Label>
-						<Select
+						<Label htmlFor={sceneSelectId}>Scene</Label>
+						<InspectorSelect
+							id={sceneSelectId}
 							value={snapshot.shareState.sceneId}
 							onValueChange={(value) =>
 								props.onSceneChange(value as (typeof DEMO_SCENES)[number]["id"])
 							}
-						>
-							<SelectTrigger
-								className={cn("w-full", isCompact && "h-7.5 text-xs")}
-							>
-								<SelectValue />
-							</SelectTrigger>
-							<SelectContent>
-								{DEMO_SCENES.map((scene) => (
-									<SelectItem key={scene.id} value={scene.id}>
-										{scene.title}
-									</SelectItem>
-								))}
-							</SelectContent>
-						</Select>
+							options={DEMO_SCENES.map((demoScene) => ({
+								value: demoScene.id,
+								label: demoScene.title,
+							}))}
+							compact={isCompact}
+						/>
 					</section>
 
 					<section
 						className={cn("grid gap-2.5 sm:grid-cols-2", isCompact && "gap-2")}
 					>
 						<div className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
-							<Label>Persona</Label>
-							<Select
+							<Label htmlFor={personaSelectId}>Persona</Label>
+							<InspectorSelect
+								id={personaSelectId}
 								value={snapshot.shareState.personaId}
 								onValueChange={(value) =>
 									props.onPersonaChange(value as "guest" | "member" | "admin")
 								}
-							>
-								<SelectTrigger
-									className={cn("w-full", isCompact && "h-7.5 text-xs")}
-								>
-									<SelectValue />
-								</SelectTrigger>
-								<SelectContent>
-									<SelectItem value="guest">Guest</SelectItem>
-									<SelectItem value="member">Member</SelectItem>
-									<SelectItem value="admin">Admin</SelectItem>
-								</SelectContent>
-							</Select>
+								options={PERSONA_OPTIONS}
+								compact={isCompact}
+							/>
 						</div>
 						<div className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
-							<Label>Network</Label>
-							<Select
+							<Label htmlFor={networkSelectId}>Network</Label>
+							<InspectorSelect
+								id={networkSelectId}
 								value={snapshot.shareState.networkMode}
 								onValueChange={(value) =>
 									props.onNetworkChange(value as "normal" | "slow" | "faulty")
 								}
-							>
-								<SelectTrigger
-									className={cn("w-full", isCompact && "h-7.5 text-xs")}
-								>
-									<SelectValue />
-								</SelectTrigger>
-								<SelectContent>
-									<SelectItem value="normal">Normal</SelectItem>
-									<SelectItem value="slow">Slow</SelectItem>
-									<SelectItem value="faulty">Faulty</SelectItem>
-								</SelectContent>
-							</Select>
+								options={NETWORK_OPTIONS}
+								compact={isCompact}
+							/>
 						</div>
 					</section>
 				</CardContent>
@@ -871,7 +998,12 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 				>
 					<div className="flex items-center justify-between gap-3">
 						<div className="space-y-0.5">
-							<p className="font-medium text-sm">Include My Releases</p>
+							<Label
+								htmlFor={includeOwnReleasesSwitchId}
+								className="justify-start gap-0 text-sm"
+							>
+								Include My Releases
+							</Label>
 							{isCompact ? null : (
 								<p className="text-muted-foreground text-xs leading-4">
 									影响 Settings 回显和 Dashboard owner-only release 露出。
@@ -879,30 +1011,26 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 							)}
 						</div>
 						<Switch
+							id={includeOwnReleasesSwitchId}
 							checked={snapshot.shareState.includeOwnReleases}
 							onCheckedChange={props.onIncludeOwnReleasesChange}
 						/>
 					</div>
 					<div className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
-						<Label>Repo Public Release State</Label>
-						<Select
+						<Label htmlFor={publicationStateSelectId}>
+							Repo Public Release State
+						</Label>
+						<InspectorSelect
+							id={publicationStateSelectId}
 							value={snapshot.shareState.publicationState}
 							onValueChange={(value) =>
 								props.onPublicationStateChange(
 									value as "published" | "unpublished",
 								)
 							}
-						>
-							<SelectTrigger
-								className={cn("w-full", isCompact && "h-7.5 text-xs")}
-							>
-								<SelectValue />
-							</SelectTrigger>
-							<SelectContent>
-								<SelectItem value="unpublished">Unpublished</SelectItem>
-								<SelectItem value="published">Published</SelectItem>
-							</SelectContent>
-						</Select>
+							options={PUBLICATION_OPTIONS}
+							compact={isCompact}
+						/>
 					</div>
 				</CardContent>
 			</Card>
@@ -942,15 +1070,17 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 						</Button>
 					</div>
 					<div className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
-						{isCompact ? null : <Label>Share</Label>}
-						<p
+						{isCompact ? null : <Label htmlFor={shareInputId}>Share</Label>}
+						<Input
+							id={shareInputId}
+							readOnly
+							value={props.shareHref}
+							spellCheck={false}
 							className={cn(
-								"overflow-x-auto rounded-xl border bg-muted/30 px-2.5 py-1.5 font-mono text-[10px] leading-4 whitespace-nowrap",
-								isCompact && "px-2 py-1 text-[9px] leading-3",
+								"h-10 rounded-xl bg-muted/30 font-mono text-[10px] leading-4 md:text-[10px]",
+								isCompact && "h-8 px-2 py-1 text-[9px] leading-3 md:text-[9px]",
 							)}
-						>
-							{props.shareHref}
-						</p>
+						/>
 					</div>
 					{isCompact ? null : (
 						<p className="text-muted-foreground text-xs">

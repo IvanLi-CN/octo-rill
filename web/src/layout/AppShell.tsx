@@ -1206,17 +1206,7 @@ export function AppShell({
 						mobileChrome && "px-4 py-4 pb-20 sm:px-6 sm:py-8 sm:pb-16",
 					)}
 				>
-					<div
-						data-demo-content-frame="true"
-						style={
-							{
-								paddingLeft: "var(--demo-inspector-safe-left, 0px)",
-								paddingRight: "var(--demo-inspector-safe-right, 0px)",
-							} as React.CSSProperties
-						}
-					>
-						{children}
-					</div>
+					{children}
 				</main>
 				<AppToastViewportHost />
 				{footer}

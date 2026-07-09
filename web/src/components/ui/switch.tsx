@@ -29,11 +29,11 @@ export function Switch(props: SwitchProps) {
 			data-state={checked ? "checked" : "unchecked"}
 			disabled={disabled}
 			className={cn(
-				"relative inline-flex h-7 w-12 shrink-0 rounded-full border p-0.5 shadow-sm outline-none transition-[background-color,border-color,box-shadow,opacity] duration-200 ease-out",
+				"relative inline-flex h-7 w-12 shrink-0 rounded-full border shadow-sm outline-none transition-[background-color,border-color,box-shadow,opacity] duration-200 ease-out",
 				"focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50",
 				checked
-					? "border-primary bg-primary text-primary-foreground hover:bg-primary/92"
-					: "border-border/80 bg-muted/70 text-muted-foreground hover:bg-muted",
+					? "border-emerald-500/60 bg-emerald-500/85 text-white hover:bg-emerald-500/78 dark:border-emerald-400/55 dark:bg-emerald-500/72 dark:hover:bg-emerald-500/68"
+					: "border-border/80 bg-muted/75 text-muted-foreground hover:border-foreground/15 hover:bg-muted/90 dark:bg-input/65",
 				disabled && "cursor-not-allowed opacity-55",
 				className,
 			)}
@@ -45,8 +45,8 @@ export function Switch(props: SwitchProps) {
 			<span
 				aria-hidden="true"
 				className={cn(
-					"pointer-events-none inline-flex size-5 items-center justify-center rounded-full bg-background shadow-sm ring-1 ring-black/5 transition-transform duration-200 ease-out",
-					checked ? "translate-x-6" : "translate-x-0",
+					"pointer-events-none absolute top-1/2 left-[3px] size-5 -translate-y-1/2 rounded-full bg-white shadow-[0_1px_3px_rgba(15,23,42,0.32)] ring-1 ring-black/8 transition-transform duration-200 ease-out",
+					checked ? "translate-x-5" : "translate-x-0",
 				)}
 			/>
 		</button>
