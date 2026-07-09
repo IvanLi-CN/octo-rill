@@ -33,6 +33,7 @@ export function dashboardFeedQueryKey(input: {
 	userId: string;
 	type: DashboardFeedQueryData["type"];
 	scope: DashboardScope | null;
+	viewerStateKey?: string | null;
 	cursor?: string | null;
 }) {
 	return [
@@ -42,6 +43,7 @@ export function dashboardFeedQueryKey(input: {
 			userId: input.userId,
 			type: input.type,
 			scope: buildDashboardScopeSignature(input.scope),
+			viewerStateKey: input.viewerStateKey ?? null,
 			cursor: input.cursor ?? null,
 		},
 	] as const;

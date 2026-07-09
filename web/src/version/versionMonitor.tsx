@@ -1,3 +1,4 @@
+import { appendDemoRuntimeRequestMarker } from "@/demo/requestMarker";
 import {
 	createContext,
 	useCallback,
@@ -9,6 +10,7 @@ import {
 	type ReactNode,
 } from "react";
 
+import { isDemoMode } from "@/demo/runtime";
 import { registerPwaServiceWorker } from "@/pwa/serviceWorkerRegistration";
 
 type HealthResponse = {
@@ -85,12 +87,15 @@ async function fetchVersionFromEndpoint(
 	endpoint: string,
 	signal: AbortSignal,
 ): Promise<string> {
-	const response = await fetch(endpoint, {
-		credentials: "include",
-		signal,
-		cache: "no-store",
-		headers: VERSION_REQUEST_HEADERS,
-	});
+	const response = await fetch(
+		isDemoMode() ? appendDemoRuntimeRequestMarker(endpoint) : endpoint,
+		{
+			credentials: "include",
+			signal,
+			cache: "no-store",
+			headers: VERSION_REQUEST_HEADERS,
+		},
+	);
 	if (!response.ok) {
 		throw new Error(`version request failed (${endpoint}): ${response.status}`);
 	}
@@ -177,6 +182,9 @@ function useVersionMonitorController(
 	}, []);
 
 	useEffect(() => {
+		if (isDemoMode()) {
+			return;
+		}
 		registerPwaServiceWorker({
 			onNeedRefresh(controller) {
 				serviceWorkerRefreshRef.current = controller.applyUpdate;

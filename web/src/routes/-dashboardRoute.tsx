@@ -3,6 +3,7 @@ import { useRouter } from "@tanstack/react-router";
 
 import { useAuthBootstrap } from "@/auth/AuthBootstrap";
 import {
+	buildDashboardWarmViewerStateKey,
 	readDashboardWarmSnapshot,
 	readStartupPresentationSeed,
 } from "@/auth/startupCache";
@@ -31,6 +32,7 @@ export function primeDashboardRouteSurfaceForStartup() {
 	);
 	const warmSnapshot = readDashboardWarmSnapshot({
 		userId: startupSeed.me.user.id,
+		viewerStateKey: buildDashboardWarmViewerStateKey(startupSeed.me),
 		routeState: buildDashboardWarmRouteState(startupRouteState),
 	});
 	if (warmSnapshot) {
@@ -62,6 +64,7 @@ export function DashboardRouteShell(props: {
 		if (!auth.me) return null;
 		return readDashboardWarmSnapshot({
 			userId: auth.me.user.id,
+			viewerStateKey: buildDashboardWarmViewerStateKey(auth.me),
 			routeState: buildDashboardWarmRouteState(routeState),
 		});
 	}, [auth.me, routeState]);

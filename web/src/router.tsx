@@ -1,5 +1,10 @@
 import { createRouter } from "@tanstack/react-router";
 
+import {
+	buildCurrentDemoSearchObject,
+	preserveCurrentDemoSearchInHref,
+} from "@/demo/registry";
+import { getDemoRouterBasepath } from "@/demo/runtime";
 import { routeTree } from "./routeTree.gen";
 
 function parseSearch(searchStr: string) {
@@ -34,13 +39,44 @@ function stringifySearch(search: Record<string, unknown>) {
 	return serialized ? `?${serialized}` : "";
 }
 
-export const router = createRouter({
+const routerInstance = createRouter({
 	routeTree,
+	basepath: getDemoRouterBasepath(),
 	parseSearch,
 	stringifySearch,
 	scrollRestoration: true,
 	defaultPreload: "intent",
 });
+
+const rawNavigate = routerInstance.navigate.bind(routerInstance);
+
+routerInstance.navigate = ((options: Record<string, unknown>) => {
+	if (typeof window === "undefined") {
+		return rawNavigate(options as never);
+	}
+
+	const nextOptions = { ...options };
+	const currentDemoSearch = buildCurrentDemoSearchObject();
+	if (typeof nextOptions.href === "string") {
+		nextOptions.href = preserveCurrentDemoSearchInHref(nextOptions.href);
+	} else if (
+		currentDemoSearch &&
+		(!nextOptions.search ||
+			(typeof nextOptions.search === "object" &&
+				!Array.isArray(nextOptions.search)))
+	) {
+		nextOptions.search = {
+			...currentDemoSearch,
+			...(typeof nextOptions.search === "object" && nextOptions.search
+				? (nextOptions.search as Record<string, unknown>)
+				: {}),
+		};
+	}
+
+	return rawNavigate(nextOptions as never);
+}) as typeof routerInstance.navigate;
+
+export const router = routerInstance;
 
 declare module "@tanstack/react-router" {
 	interface Register {

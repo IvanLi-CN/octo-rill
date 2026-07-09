@@ -1,4 +1,5 @@
 import { ApiError } from "@/api";
+import { isDemoMode } from "@/demo/runtime";
 import type {
 	PasskeyCreationOptionsJSON,
 	PasskeyCredentialDescriptorJSON,
@@ -115,9 +116,10 @@ function serializeAuthenticationCredential(credential: PublicKeyCredential) {
 export function browserSupportsPasskeys(): boolean {
 	return (
 		typeof window !== "undefined" &&
-		typeof window.PublicKeyCredential !== "undefined" &&
-		typeof navigator.credentials?.create === "function" &&
-		typeof navigator.credentials?.get === "function"
+		(isDemoMode() ||
+			(typeof window.PublicKeyCredential !== "undefined" &&
+				typeof navigator.credentials?.create === "function" &&
+				typeof navigator.credentials?.get === "function"))
 	);
 }
 
@@ -143,6 +145,19 @@ export async function browserSupportsConditionalMediation(): Promise<boolean> {
 export async function createPasskeyCredential(
 	options: PasskeyCreationOptionsJSON,
 ): Promise<unknown> {
+	if (isDemoMode()) {
+		return {
+			id: "demo-passkey",
+			rawId: "ZGVtby1wYXNza2V5",
+			type: "public-key",
+			response: {
+				attestationObject: "ZGVtby1hdHRlc3RhdGlvbg",
+				clientDataJSON: "ZGVtby1jbGllbnQtZGF0YQ",
+				transports: ["internal"],
+			},
+			clientExtensionResults: {},
+		};
+	}
 	const credential = await navigator.credentials.create(
 		creationOptionsFromJson(options),
 	);
@@ -156,6 +171,20 @@ export async function getPasskeyCredential(
 	options: PasskeyRequestOptionsJSON,
 	mediation: PasskeyMediation = "required",
 ): Promise<unknown> {
+	if (isDemoMode()) {
+		return {
+			id: "demo-passkey",
+			rawId: "ZGVtby1wYXNza2V5",
+			type: "public-key",
+			response: {
+				authenticatorData: "ZGVtby1hdXRoLWRhdGE",
+				clientDataJSON: "ZGVtby1jbGllbnQtZGF0YQ",
+				signature: "ZGVtby1zaWduYXR1cmU",
+				userHandle: "ZGVtby11c2Vy",
+			},
+			clientExtensionResults: {},
+		};
+	}
 	const credential = await navigator.credentials.get(
 		requestOptionsFromJson(options, mediation),
 	);

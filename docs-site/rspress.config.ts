@@ -37,6 +37,7 @@ export default defineConfig({
 			{ text: "文档", link: "/" },
 			{ text: "快速开始", link: "/quick-start" },
 			{ text: "配置", link: "/config" },
+			{ text: "Web Demo", link: "/web-demo" },
 			{ text: "公开 Release", link: "/public-releases" },
 			{ text: "API Key", link: "/api-key" },
 			{ text: "产品", link: "/product" },
@@ -51,6 +52,7 @@ export default defineConfig({
 						{ text: "文档首页", link: "/" },
 						{ text: "快速开始", link: "/quick-start" },
 						{ text: "配置参考", link: "/config" },
+						{ text: "Web Demo", link: "/web-demo" },
 						{ text: "公开 Release 接入", link: "/public-releases" },
 						{ text: "API Key 与外部 API", link: "/api-key" },
 					],
@@ -62,6 +64,7 @@ export default defineConfig({
 				{
 					text: "其他入口",
 					items: [
+						{ text: "Web Demo", link: "/web-demo" },
 						{ text: "Storybook", link: "/storybook.html" },
 						{ text: "GitHub 仓库", link: "https://github.com/IvanLi-CN/octo-rill" },
 					],

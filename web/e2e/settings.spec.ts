@@ -609,7 +609,11 @@ test("settings github pat hidden mode keeps word deletion shortcuts", async ({
 	await page.getByRole("button", { name: "隐藏 GitHub PAT" }).click();
 	await expect(toggleButton).toBeFocused();
 	await input.focus();
-	await expect(input).toBeFocused();
+	await expect
+		.poll(() => input.evaluate((node) => document.activeElement === node), {
+			message: "hidden PAT input should regain focus before shortcut dispatch",
+		})
+		.toBe(true);
 	await input.evaluate((node) => {
 		if (!(node instanceof HTMLInputElement)) {
 			throw new Error("expected HTMLInputElement");

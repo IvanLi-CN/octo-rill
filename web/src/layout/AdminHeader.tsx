@@ -2,6 +2,7 @@ import { clearAllWarmStartupCaches } from "@/auth/startupCache";
 import { BrandLogo } from "@/components/brand/BrandLogo";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { Button } from "@/components/ui/button";
+import { resolveDemoSafeAuthHref } from "@/demo/auth";
 import { useAppShellChrome } from "@/layout/AppShell";
 import { InternalLink } from "@/lib/internalNavigation";
 import { cn } from "@/lib/utils";
@@ -47,6 +48,7 @@ function clearStartupCacheBeforeLogout() {
 }
 
 export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
+	const safeLogoutHref = resolveDemoSafeAuthHref("/auth/logout", "logout");
 	const {
 		compactHeader,
 		headerInteracting,
@@ -334,7 +336,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 							}
 						>
 							<a
-								href="/auth/logout"
+								href={safeLogoutHref}
 								aria-label="退出登录"
 								title="退出登录"
 								onClick={clearStartupCacheBeforeLogout}

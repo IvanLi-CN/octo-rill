@@ -36,6 +36,7 @@ type AuthCacheRecord = {
 type DashboardWarmCacheRecord = {
 	savedAt: number;
 	userId: string;
+	viewerStateKey: string;
 	routeState: DashboardWarmRouteState;
 	feedRequestType: FeedRequestType;
 	feedItems: FeedItem[];
@@ -130,6 +131,15 @@ function stripBriefDetailContent(briefs: BriefItem[]): BriefItem[] {
 	);
 }
 
+export function buildDashboardWarmViewerStateKey(me: MeResponse) {
+	return [
+		me.dashboard.daily_boundary_local,
+		me.dashboard.daily_boundary_time_zone ?? "",
+		String(me.dashboard.daily_boundary_utc_offset_minutes),
+		me.dashboard.include_own_releases ? "1" : "0",
+	].join("|");
+}
+
 export function deriveStartupRouteFamily(pathname: string): StartupRouteFamily {
 	if (pathname.startsWith("/admin/jobs")) {
 		return "admin-jobs";
@@ -193,6 +203,7 @@ export function clearAllWarmStartupCaches() {
 
 export function readDashboardWarmSnapshot(input: {
 	userId: string;
+	viewerStateKey: string;
 	routeState: DashboardWarmRouteState;
 	now?: number;
 }) {
@@ -200,6 +211,12 @@ export function readDashboardWarmSnapshot(input: {
 		readStorageRecord<DashboardWarmCacheRecord>(DASHBOARD_CACHE_KEY);
 	if (!cached) return null;
 	if (cached.userId !== input.userId) return null;
+	if (
+		typeof cached.viewerStateKey === "string" &&
+		cached.viewerStateKey !== input.viewerStateKey
+	) {
+		return null;
+	}
 	if (!isFresh(cached.savedAt, STARTUP_WARM_TTL_MS, input.now)) return null;
 	const cachedActiveReleaseLocatorKey =
 		cached.routeState.activeReleaseLocatorKey ?? null;
@@ -232,6 +249,7 @@ export function persistDashboardWarmSnapshot(
 	writeStorageRecord<DashboardWarmCacheRecord>(DASHBOARD_CACHE_KEY, {
 		savedAt: snapshot.savedAt ?? Date.now(),
 		userId: snapshot.userId,
+		viewerStateKey: snapshot.viewerStateKey,
 		routeState: snapshot.routeState,
 		feedRequestType: snapshot.feedRequestType,
 		feedItems: snapshot.feedItems.slice(0, MAX_WARM_FEED_ITEMS),

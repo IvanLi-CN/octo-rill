@@ -22,6 +22,7 @@
 
 | ID | Title | Lifecycle | Spec | Companion docs | Implementation |
 | --- | --- | --- | --- | --- | --- |
+| k8d4m | Web Demo 与悬浮 Inspector Contract | active | [SPEC.md](./k8d4m-web-demo-inspector/SPEC.md) | [IMPLEMENTATION.md](./k8d4m-web-demo-inspector/IMPLEMENTATION.md) / [HISTORY.md](./k8d4m-web-demo-inspector/HISTORY.md) | 已交付；`/demo/` runtime + inspector + Pages assembly |
 | hz9vx | 列表状态一致性收敛 | active | [SPEC.md](./hz9vx-list-state-surface-consistency/SPEC.md) | [IMPLEMENTATION.md](./hz9vx-list-state-surface-consistency/IMPLEMENTATION.md) / [HISTORY.md](./hz9vx-list-state-surface-consistency/HISTORY.md) | 实现中；fast-track follow-up / shared five-state list contract + admin/dashboard list surfaces |
 | u1f6v | 认证态 Scoped Focus Feed | active | [SPEC.md](./u1f6v-authenticated-scoped-focus-feed/SPEC.md) | [IMPLEMENTATION.md](./u1f6v-authenticated-scoped-focus-feed/IMPLEMENTATION.md) / [HISTORY.md](./u1f6v-authenticated-scoped-focus-feed/HISTORY.md) | 实现中；fast-track / scoped reading surface + 单仓公开 Release 发布控件 |
 | p8r3l | 公开仓库 Release 外链与 API | active | [SPEC.md](./p8r3l-public-release-endpoints/SPEC.md) | [IMPLEMENTATION.md](./p8r3l-public-release-endpoints/IMPLEMENTATION.md) / [HISTORY.md](./p8r3l-public-release-endpoints/HISTORY.md) | 实现中；fast-track / public release pages + private owner publish usage + legacy list redirect |
