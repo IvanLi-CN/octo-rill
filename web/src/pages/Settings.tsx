@@ -73,6 +73,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { resolveDemoSafeAuthHref } from "@/demo/auth";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { InternalLink } from "@/lib/internalNavigation";
@@ -500,7 +501,9 @@ export function SettingsPage(props: {
 	]);
 
 	const onConnectGitHub = useCallback(() => {
-		window.location.assign("/auth/github/connect");
+		window.location.assign(
+			resolveDemoSafeAuthHref("/auth/github/connect", "connect"),
+		);
 	}, []);
 
 	const onDeleteGitHub = useCallback(
@@ -525,7 +528,9 @@ export function SettingsPage(props: {
 	);
 
 	const onConnectLinuxDo = useCallback(() => {
-		window.location.assign("/auth/linuxdo/login");
+		window.location.assign(
+			resolveDemoSafeAuthHref("/auth/linuxdo/login", "connect"),
+		);
 	}, []);
 
 	const onRegisterPasskey = useCallback(() => {

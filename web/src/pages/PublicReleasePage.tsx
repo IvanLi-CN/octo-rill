@@ -30,6 +30,7 @@ import {
 	CardTitle,
 } from "@/components/ui/card";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
+import { InternalLink } from "@/lib/internalNavigation";
 import type { FeedLane, ReleaseFeedItem } from "@/feed/types";
 import { cn } from "@/lib/utils";
 import { buildVersionReleaseHref } from "@/version/versionReleaseLink";
@@ -188,79 +189,94 @@ export function PublicReleasePage(props: {
 	return (
 		<main className="min-h-dvh bg-background text-foreground">
 			<div className="mx-auto flex min-h-dvh w-full max-w-5xl flex-col px-4 py-5 sm:px-6 lg:px-8">
-				<header className="flex flex-wrap items-center justify-between gap-3 border-b pb-4">
-					<a href="/" className="inline-flex items-center gap-3">
-						<BrandLogo variant="wordmark" className="h-6 sm:h-5" />
-					</a>
-					<Button asChild variant="outline" size="sm">
-						<a
-							href={`https://github.com/${owner}/${repo}/releases`}
-							target="_blank"
-							rel="noreferrer"
+				<div
+					className="flex min-h-full flex-col"
+					data-demo-content-frame="true"
+					style={
+						{
+							paddingLeft: "var(--demo-inspector-safe-left, 0px)",
+							paddingRight: "var(--demo-inspector-safe-right, 0px)",
+						} as React.CSSProperties
+					}
+				>
+					<header className="flex flex-wrap items-center justify-between gap-3 border-b pb-4">
+						<InternalLink
+							href="/"
+							to="/"
+							className="inline-flex items-center gap-3"
 						>
-							<ExternalLink className="size-4" />
-							GitHub
-						</a>
-					</Button>
-				</header>
+							<BrandLogo variant="wordmark" className="h-6 sm:h-5" />
+						</InternalLink>
+						<Button asChild variant="outline" size="sm">
+							<a
+								href={`https://github.com/${owner}/${repo}/releases`}
+								target="_blank"
+								rel="noreferrer"
+							>
+								<ExternalLink className="size-4" />
+								GitHub
+							</a>
+						</Button>
+					</header>
 
-				{tag ? null : (
-					<section className="py-6">
-						<h1 className="break-words text-3xl font-semibold tracking-normal">
-							{repoFullName}
-						</h1>
-					</section>
-				)}
+					{tag ? null : (
+						<section className="py-6">
+							<h1 className="break-words text-3xl font-semibold tracking-normal">
+								{repoFullName}
+							</h1>
+						</section>
+					)}
 
-				{state.status === "loading" ? (
-					<PublicReleaseLoadingSkeleton hasTag={Boolean(tag)} />
-				) : null}
+					{state.status === "loading" ? (
+						<PublicReleaseLoadingSkeleton hasTag={Boolean(tag)} />
+					) : null}
 
-				{state.status === "pending" ? (
-					<WaitingCard
-						title="Release 数据同步中"
-						description="这个仓库的 Release 数据还在同步中，稍后会自动重试。"
-						retryAfter={state.pending.retry_after_seconds}
-						statusLabel="同步中"
-						onRetry={load}
-					/>
-				) : null}
+					{state.status === "pending" ? (
+						<WaitingCard
+							title="Release 数据同步中"
+							description="这个仓库的 Release 数据还在同步中，稍后会自动重试。"
+							retryAfter={state.pending.retry_after_seconds}
+							statusLabel="同步中"
+							onRetry={load}
+						/>
+					) : null}
 
-				{state.status === "error" ? (
-					<Card>
-						<CardHeader>
-							<CardTitle>暂时无法展示</CardTitle>
-							<CardDescription>
-								{state.code ? `${state.code}: ` : ""}
-								{state.message || "请求失败，请稍后重试。"}
-							</CardDescription>
-						</CardHeader>
-						<CardContent>
-							<Button type="button" onClick={() => void load()}>
-								<RefreshCcw className="size-4" />
-								重试
-							</Button>
-						</CardContent>
-					</Card>
-				) : null}
+					{state.status === "error" ? (
+						<Card>
+							<CardHeader>
+								<CardTitle>暂时无法展示</CardTitle>
+								<CardDescription>
+									{state.code ? `${state.code}: ` : ""}
+									{state.message || "请求失败，请稍后重试。"}
+								</CardDescription>
+							</CardHeader>
+							<CardContent>
+								<Button type="button" onClick={() => void load()}>
+									<RefreshCcw className="size-4" />
+									重试
+								</Button>
+							</CardContent>
+						</Card>
+					) : null}
 
-				{state.status === "list" ? (
-					<ReleaseList
-						owner={owner}
-						repo={repo}
-						items={state.data.items}
-						hasMore={Boolean(state.data.next_cursor)}
-						loadingMore={loadingMore}
-						appendError={appendError}
-						onLoadMore={loadMore}
-					/>
-				) : null}
+					{state.status === "list" ? (
+						<ReleaseList
+							owner={owner}
+							repo={repo}
+							items={state.data.items}
+							hasMore={Boolean(state.data.next_cursor)}
+							loadingMore={loadingMore}
+							appendError={appendError}
+							onLoadMore={loadMore}
+						/>
+					) : null}
 
-				{state.status === "detail" ? (
-					<ReleaseDetail detail={state.data} />
-				) : null}
+					{state.status === "detail" ? (
+						<ReleaseDetail detail={state.data} />
+					) : null}
 
-				<PublicReleaseFooter owner={owner} repo={repo} />
+					<PublicReleaseFooter owner={owner} repo={repo} />
+				</div>
 			</div>
 		</main>
 	);

@@ -6,6 +6,7 @@ on:
     paths:
       - 'docs-site/**'
       - 'web/**'
+      - '.github/assets/**'
       - '.github/workflows/docs-pages.yml'
       - '.github/scripts/assemble-pages-site.sh'
   push:
@@ -13,6 +14,7 @@ on:
     paths:
       - 'docs-site/**'
       - 'web/**'
+      - '.github/assets/**'
       - '.github/workflows/docs-pages.yml'
       - '.github/scripts/assemble-pages-site.sh'
   workflow_dispatch:
@@ -95,12 +97,65 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  assemble-pages:
+  build-demo:
     runs-on: ubuntu-latest
-    needs: [build-docs, build-storybook]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.9
+
+      - name: Compute DOCS_BASE
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repo="${GITHUB_REPOSITORY##*/}"
+          if [[ "${repo}" == "${owner}.github.io" ]]; then
+            echo "DOCS_BASE=/" >> "$GITHUB_ENV"
+          else
+            echo "DOCS_BASE=/${repo}/" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install demo dependencies
+        run: bun install --cwd web --frozen-lockfile
+
+      - name: Build demo app
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd web
+          DOCS_BASE="${DOCS_BASE}" bun run build:demo
+
+      - name: Upload demo artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-static-build
+          path: web/dist-demo
+          retention-days: 1
+          if-no-files-found: error
+
+  assemble-pages:
+    runs-on: ubuntu-latest
+    needs: [build-docs, build-storybook, build-demo]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute DOCS_BASE
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repo="${GITHUB_REPOSITORY##*/}"
+          if [[ "${repo}" == "${owner}.github.io" ]]; then
+            echo "DOCS_BASE=/" >> "$GITHUB_ENV"
+          else
+            echo "DOCS_BASE=/${repo}/" >> "$GITHUB_ENV"
+          fi
 
       - name: Download docs artifact
         uses: actions/download-artifact@v4
@@ -114,11 +169,17 @@ jobs:
           name: storybook-static-build
           path: .tmp/storybook-static
 
+      - name: Download demo artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: demo-static-build
+          path: .tmp/demo-static
+
       - name: Assemble Pages site
         shell: bash
         run: |
           set -euo pipefail
-          bash ./.github/scripts/assemble-pages-site.sh .tmp/docs-site .tmp/storybook-static .tmp/pages-site
+          bash ./.github/scripts/assemble-pages-site.sh .tmp/docs-site .tmp/storybook-static .tmp/demo-static .tmp/pages-site
 
       - name: Smoke check assembled site
         shell: bash
@@ -126,11 +187,27 @@ jobs:
           set -euo pipefail
           test -f .tmp/pages-site/index.html
           test -f .tmp/pages-site/storybook/index.html
+          test -f .tmp/pages-site/demo/index.html
+          test -f .tmp/pages-site/demo/mockServiceWorker.js
           test -f .tmp/pages-site/storybook.html
+          test -f .tmp/pages-site/demo-404-recovery.js
           grep -q '/storybook.html' .tmp/pages-site/index.html
+          grep -q '/demo/' .tmp/pages-site/index.html
+          grep -q 'href="./demo/"' .tmp/pages-site/index.html
+          grep -q 'href="./demo/?demo=landing-welcome"' .tmp/pages-site/web-demo.html
+          grep -q "${DOCS_BASE}demo/assets/" .tmp/pages-site/demo/index.html
           grep -q '正在跳转到 Storybook' .tmp/pages-site/storybook.html
           grep -q './sb-manager/runtime.js' .tmp/pages-site/storybook/index.html
           grep -q './sb-common-assets/nunito-sans-regular.woff2' .tmp/pages-site/storybook/index.html
+          grep -q "${DOCS_BASE}demo-404-recovery.js" .tmp/pages-site/404.html
+          if grep -q 'href="./demo.html?demo=' .tmp/pages-site/web-demo.html; then
+            echo "demo deep links were rewritten to demo.html" >&2
+            exit 1
+          fi
+          if grep -q 'href="/demo/' .tmp/pages-site/web-demo.html; then
+            echo "demo deep links lost the Pages base prefix" >&2
+            exit 1
+          fi
 
       - name: Upload assembled Pages site artifact
         uses: actions/upload-artifact@v4

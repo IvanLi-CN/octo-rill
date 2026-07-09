@@ -15,6 +15,7 @@ import {
 	readStartupPresentationSeed,
 	type StartupPresentation,
 } from "@/auth/startupCache";
+import { useDemoSnapshot } from "@/demo/runtime";
 import {
 	describeNetworkAwareError,
 	type NetworkErrorKind,
@@ -57,6 +58,49 @@ let cachedSnapshotOrigin: "seed" | "network" | "none" = warmStartupSeed
 	? "seed"
 	: "none";
 let inflightSnapshotPromise: Promise<AuthSnapshot> | null = null;
+
+function buildSnapshotFromDemo(me: MeResponse | null): AuthSnapshot {
+	if (!me) {
+		return {
+			status: "anonymous",
+			me: null,
+			bootError: null,
+			bootErrorKind: null,
+			bootErrorDetail: null,
+		};
+	}
+	return {
+		status: "authenticated",
+		me,
+		bootError: null,
+		bootErrorKind: null,
+		bootErrorDetail: null,
+	};
+}
+
+function resolveInitialAuthSnapshot(
+	demoSnapshot: ReturnType<typeof useDemoSnapshot>,
+): AuthSnapshot {
+	if (demoSnapshot.active) {
+		return buildSnapshotFromDemo(demoSnapshot.model?.me ?? null);
+	}
+	if (warmStartupSeed) {
+		return {
+			status: "authenticated",
+			me: warmStartupSeed.me,
+			bootError: null,
+			bootErrorKind: null,
+			bootErrorDetail: null,
+		};
+	}
+	return {
+		status: "pending",
+		me: null,
+		bootError: null,
+		bootErrorKind: null,
+		bootErrorDetail: null,
+	};
+}
 
 async function requestAuthSnapshot(): Promise<AuthSnapshot> {
 	try {
@@ -143,30 +187,27 @@ async function loadAuthSnapshot(force = false) {
 
 export function AuthBootstrapProvider(props: { children: ReactNode }) {
 	const { children } = props;
-	const [snapshot, setSnapshot] = useState<AuthSnapshot>(() => {
-		if (warmStartupSeed) {
-			return {
-				status: "authenticated",
-				me: warmStartupSeed.me,
-				bootError: null,
-				bootErrorKind: null,
-				bootErrorDetail: null,
-			};
-		}
-		return {
-			status: "pending",
-			me: null,
-			bootError: null,
-			bootErrorKind: null,
-			bootErrorDetail: null,
-		};
-	});
-	const [bootPresentation, setBootPresentation] = useState<StartupPresentation>(
-		startupSeed?.presentation ?? "cold-init",
+	const demoSnapshot = useDemoSnapshot();
+	const [snapshot, setSnapshot] = useState<AuthSnapshot>(() =>
+		resolveInitialAuthSnapshot(demoSnapshot),
 	);
-	const [isBootstrapping, setIsBootstrapping] = useState(true);
+	const [bootPresentation, setBootPresentation] = useState<StartupPresentation>(
+		demoSnapshot.active ? "live" : (startupSeed?.presentation ?? "cold-init"),
+	);
+	const [isBootstrapping, setIsBootstrapping] = useState(!demoSnapshot.active);
 
 	useEffect(() => {
+		if (demoSnapshot.active) {
+			const nextSnapshot = buildSnapshotFromDemo(
+				demoSnapshot.model?.me ?? null,
+			);
+			inflightSnapshotPromise = null;
+			setSnapshot(nextSnapshot);
+			setBootPresentation("live");
+			setIsBootstrapping(false);
+			return;
+		}
+
 		let cancelled = false;
 		setIsBootstrapping(true);
 		void loadAuthSnapshot().then((nextSnapshot) => {
@@ -179,16 +220,27 @@ export function AuthBootstrapProvider(props: { children: ReactNode }) {
 		return () => {
 			cancelled = true;
 		};
-	}, []);
+	}, [demoSnapshot.active, demoSnapshot.model?.me]);
 
 	const refreshAuth = useCallback(async () => {
+		if (demoSnapshot.active) {
+			const nextSnapshot = buildSnapshotFromDemo(
+				demoSnapshot.model?.me ?? null,
+			);
+			inflightSnapshotPromise = null;
+			setSnapshot(nextSnapshot);
+			setBootPresentation("live");
+			setIsBootstrapping(false);
+			return nextSnapshot.me;
+		}
+
 		setIsBootstrapping(true);
 		const nextSnapshot = await loadAuthSnapshot(true);
 		setSnapshot(nextSnapshot);
 		setBootPresentation("live");
 		setIsBootstrapping(false);
 		return nextSnapshot.me;
-	}, []);
+	}, [demoSnapshot.active, demoSnapshot.model?.me]);
 
 	const value = useMemo<AuthBootstrapValue>(
 		() => ({

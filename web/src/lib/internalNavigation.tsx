@@ -2,6 +2,8 @@ import type { AnchorHTMLAttributes, MouseEvent } from "react";
 import { useCallback } from "react";
 import { useRouter } from "@tanstack/react-router";
 
+import { resolveDemoNativeHref } from "@/demo/registry";
+
 type NavigationTarget = {
 	href: string;
 	to: string;
@@ -33,11 +35,12 @@ export function useInternalNavigate() {
 
 	return useCallback(
 		async ({ href, to, search, params, replace }: NavigationTarget) => {
+			const resolvedHref = resolveDemoNativeHref(href);
 			if (!router) {
 				if (replace) {
-					window.location.replace(href);
+					window.location.replace(resolvedHref);
 				} else {
-					window.location.assign(href);
+					window.location.assign(resolvedHref);
 				}
 				return;
 			}
@@ -56,11 +59,12 @@ export function useInternalNavigate() {
 export function InternalLink(props: InternalLinkProps) {
 	const { href, to, search, params, replace, onClick, target, ...rest } = props;
 	const router = useOptionalRouter();
+	const resolvedHref = resolveDemoNativeHref(href);
 
 	return (
 		<a
 			{...rest}
-			href={href}
+			href={resolvedHref}
 			target={target}
 			onClick={(event) => {
 				onClick?.(event);

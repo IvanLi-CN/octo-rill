@@ -1,4 +1,8 @@
 import type { ReleaseDetailResponse } from "@/api";
+import {
+	copyDemoSearchParams,
+	readCurrentDemoSearchParams,
+} from "@/demo/registry";
 import { normalizeReleaseId } from "@/lib/releaseId";
 import type { DashboardTab } from "@/pages/DashboardControlBand";
 
@@ -296,11 +300,15 @@ export function buildDashboardReleaseHref(
 
 export function buildDashboardRouteUrl(routeState: DashboardRouteState) {
 	if (routeState.activeReleaseLocator) {
-		return buildDashboardReleaseHref(
+		const href = buildDashboardReleaseHref(
 			routeState.activeReleaseLocator,
 			routeState.releaseReturnTab,
 			{ scope: routeState.scope },
 		);
+		if (typeof window === "undefined") {
+			return href;
+		}
+		return preserveDashboardDemoHref(href);
 	}
 	const basePath = routeState.scope
 		? buildDashboardScopePath(
@@ -324,6 +332,9 @@ export function buildDashboardRouteUrl(routeState: DashboardRouteState) {
 		);
 		params.set("release", routeState.activeReleaseId);
 	}
+	if (typeof window !== "undefined") {
+		copyDemoSearchParams(readCurrentDemoSearchParams(), params);
+	}
 	const query = params.toString();
 	return query ? `${basePath}?${query}` : basePath;
 }
@@ -331,6 +342,12 @@ export function buildDashboardRouteUrl(routeState: DashboardRouteState) {
 function searchObjectFromParams(params: URLSearchParams) {
 	const entries = Array.from(params.entries());
 	return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+function preserveDashboardDemoHref(href: string) {
+	const next = new URL(href, window.location.origin);
+	copyDemoSearchParams(readCurrentDemoSearchParams(), next.searchParams);
+	return `${next.pathname}${next.search}${next.hash}`;
 }
 
 export function buildDashboardRouteNavigation(
@@ -345,6 +362,9 @@ export function buildDashboardRouteNavigation(
 				routeState.scope,
 			),
 		);
+		if (typeof window !== "undefined") {
+			copyDemoSearchParams(readCurrentDemoSearchParams(), params);
+		}
 		return {
 			to: "/$owner/$repo/releases/tag/$tag",
 			params: {
@@ -368,6 +388,9 @@ export function buildDashboardRouteNavigation(
 				),
 			);
 			searchParams.set("release", routeState.activeReleaseId);
+		}
+		if (typeof window !== "undefined") {
+			copyDemoSearchParams(readCurrentDemoSearchParams(), searchParams);
 		}
 		switch (routeState.scope.kind) {
 			case "repo":
@@ -417,6 +440,9 @@ export function buildDashboardRouteNavigation(
 			normalizeDashboardReturnTab(routeState.releaseReturnTab, null),
 		);
 		searchParams.set("release", routeState.activeReleaseId);
+	}
+	if (typeof window !== "undefined") {
+		copyDemoSearchParams(readCurrentDemoSearchParams(), searchParams);
 	}
 	return {
 		to: buildDashboardTabPath(routeState.tab),

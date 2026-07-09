@@ -1225,19 +1225,24 @@ test("detail retry failure stays visible after switching to the original text", 
 	});
 
 	await page.goto("/?tab=briefs&release=123");
-	await page.getByRole("tab", { name: "翻译" }).click();
-	await expect(page.getByText("翻译失败", { exact: true })).toBeVisible();
-
-	await page.getByRole("button", { name: "查看原文" }).click();
+	const detailDialog = page.getByRole("dialog", { name: "Release 详情" });
+	await detailDialog.getByRole("tab", { name: "翻译" }).click();
 	await expect(
-		page.getByRole("heading", { name: "Release 123" }),
+		detailDialog.getByText("翻译失败", { exact: true }),
 	).toBeVisible();
-	await expect(page.getByText("fix A", { exact: true })).toBeVisible();
 
-	await page.getByRole("tab", { name: "翻译" }).click();
-	await expect(page.getByText("翻译失败", { exact: true })).toBeVisible();
+	await detailDialog.getByRole("button", { name: "查看原文" }).click();
 	await expect(
-		page.getByText("Markdown 结构校验失败", { exact: true }),
+		detailDialog.getByRole("heading", { name: "Release 123" }),
+	).toBeVisible();
+	await expect(detailDialog.getByText("fix A", { exact: true })).toBeVisible();
+
+	await detailDialog.getByRole("tab", { name: "翻译" }).click();
+	await expect(
+		detailDialog.getByText("翻译失败", { exact: true }),
+	).toBeVisible();
+	await expect(
+		detailDialog.getByText("Markdown 结构校验失败", { exact: true }),
 	).toBeVisible();
 });
 

@@ -33,6 +33,10 @@ Dashboard 是登录后的主工作区，包含 6 个主标签：
 
 右侧侧栏长期保留 Inbox 快捷入口；在 `日报` 标签下还会显示日报列表。
 
+### Web Demo
+
+公开 `/demo/` 子应用复用同一套页面组件与 route suffix，但只接 mock-only runtime：它主要服务于页面级视觉证据、owner-facing 验收和 simulated write 演示，不取代真实产品入口。
+
 ### 管理页面
 
 管理员还会看到两类运营界面：

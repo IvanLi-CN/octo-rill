@@ -12,6 +12,7 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
+import { resolveDemoSafeAuthHref } from "@/demo/auth";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
@@ -118,6 +119,10 @@ export function BindGitHubPage(props: {
 	passkeyStatus?: string | null;
 }) {
 	const { linuxdoStatus = null, passkeyStatus = null } = props;
+	const githubLoginHref = resolveDemoSafeAuthHref(
+		"/auth/github/login",
+		"login",
+	);
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState<string | null>(null);
 	const [context, setContext] = useState<AuthBindContextResponse | null>(null);
@@ -278,7 +283,7 @@ export function BindGitHubPage(props: {
 
 								<div className="grid gap-3 sm:grid-cols-2">
 									<Button asChild size="lg" className="h-11 rounded-2xl">
-										<a href="/auth/github/login">
+										<a href={githubLoginHref}>
 											<AuthProviderIcon provider="github" />
 											绑定 GitHub 并继续
 										</a>
@@ -312,7 +317,7 @@ export function BindGitHubPage(props: {
 										</InternalLink>
 									</Button>
 									<Button asChild size="sm">
-										<a href="/auth/github/login">
+										<a href={githubLoginHref}>
 											<AuthProviderIcon provider="github" />
 											继续使用 GitHub 登录
 										</a>

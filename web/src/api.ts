@@ -1,4 +1,7 @@
+import { appendDemoRuntimeRequestMarker } from "@/demo/requestMarker";
+import { isDemoMode } from "@/demo/runtime";
 import type { RepoVisual } from "@/lib/repoVisual";
+import { openAppEventSource } from "@/demo/eventSource";
 
 export class ApiError extends Error {
 	public status: number;
@@ -41,8 +44,14 @@ function toApiError(res: Response, body: unknown) {
 	);
 }
 
+function resolveApiRequestPath(path: string) {
+	return isDemoMode() ? appendDemoRuntimeRequestMarker(path) : path;
+}
+
 export async function apiGet<T>(path: string): Promise<T> {
-	const res = await fetch(path, { credentials: "include" });
+	const res = await fetch(resolveApiRequestPath(path), {
+		credentials: "include",
+	});
 	if (!res.ok) {
 		const body = await parseJson(res);
 		throw toApiError(res, body);
@@ -50,7 +59,10 @@ export async function apiGet<T>(path: string): Promise<T> {
 	return (await res.json()) as T;
 }
 export async function apiHead(path: string): Promise<number> {
-	const res = await fetch(path, { method: "HEAD", credentials: "include" });
+	const res = await fetch(resolveApiRequestPath(path), {
+		method: "HEAD",
+		credentials: "include",
+	});
 	if (!res.ok && res.status !== 202 && res.status !== 204) {
 		throw toApiError(res, await parseJson(res));
 	}
@@ -66,7 +78,7 @@ export async function apiPostJson<T>(
 ): Promise<T> {
 	const headers = new Headers(init?.headers);
 	headers.set("content-type", "application/json");
-	const res = await fetch(path, {
+	const res = await fetch(resolveApiRequestPath(path), {
 		...init,
 		method: "POST",
 		credentials: "include",
@@ -111,7 +123,7 @@ export async function apiPostTaskSse(
 ): Promise<TaskSseTerminalEvent> {
 	const headers = new Headers(init?.headers);
 	headers.set("content-type", "application/json");
-	const res = await fetch(path, {
+	const res = await fetch(resolveApiRequestPath(path), {
 		...init,
 		method: "POST",
 		credentials: "include",
@@ -166,7 +178,7 @@ export async function apiPostTaskSse(
 	);
 }
 export async function apiPutJson<T>(path: string, body?: unknown): Promise<T> {
-	const res = await fetch(path, {
+	const res = await fetch(resolveApiRequestPath(path), {
 		method: "PUT",
 		credentials: "include",
 		headers: { "content-type": "application/json" },
@@ -181,7 +193,7 @@ export async function apiPatchJson<T>(
 	path: string,
 	body?: unknown,
 ): Promise<T> {
-	const res = await fetch(path, {
+	const res = await fetch(resolveApiRequestPath(path), {
 		method: "PATCH",
 		credentials: "include",
 		headers: { "content-type": "application/json" },
@@ -196,7 +208,7 @@ export async function apiDeleteJson<T>(
 	path: string,
 	body?: unknown,
 ): Promise<T> {
-	const res = await fetch(path, {
+	const res = await fetch(resolveApiRequestPath(path), {
 		method: "DELETE",
 		credentials: "include",
 		headers:
@@ -1187,7 +1199,9 @@ export async function apiCancelAdminRealtimeTask(
 	);
 }
 export function apiOpenAdminJobsEventsStream(): EventSource {
-	return new EventSource("/api/admin/jobs/events", { withCredentials: true });
+	return openAppEventSource("/api/admin/jobs/events", {
+		withCredentials: true,
+	});
 }
 export async function apiGetAdminScheduledSlots(): Promise<AdminScheduledSlotsResponse> {
 	return apiGet<AdminScheduledSlotsResponse>("/api/admin/jobs/scheduled");
@@ -1387,7 +1401,9 @@ export async function apiGetPublicRepoReleases(input: {
 	if (input.limit) params.set("limit", String(input.limit));
 	if (input.cursor) params.set("cursor", input.cursor);
 	const path = `/api/public/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases?${params.toString()}`;
-	const res = await fetch(path, { credentials: "include" });
+	const res = await fetch(resolveApiRequestPath(path), {
+		credentials: "include",
+	});
 	const body = await parseJson(res);
 	if (res.status === 202) return body as PublicReleasePendingResponse;
 	if (!res.ok) throw toApiError(res, body);
@@ -1405,7 +1421,9 @@ export async function apiGetPublicRepoReleaseDetail(input: {
 	params.set("lang", "zh-CN");
 	if (input.source) params.set("source", input.source);
 	const path = `/api/public/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases/tag/${encodeURIComponent(input.tag)}?${params.toString()}`;
-	const res = await fetch(path, { credentials: "include" });
+	const res = await fetch(resolveApiRequestPath(path), {
+		credentials: "include",
+	});
 	const body = (await res.json()) as unknown;
 	if (res.status === 202) return body as PublicReleasePendingResponse;
 	if (!res.ok) throw toApiError(res, body);
@@ -1710,7 +1728,7 @@ export async function apiSubmitTranslationRequest(
 export async function apiOpenTranslationRequestStream(
 	body: TranslationStreamSubmitRequest,
 ): Promise<Response> {
-	const res = await fetch("/api/translate/requests", {
+	const res = await fetch(resolveApiRequestPath("/api/translate/requests"), {
 		method: "POST",
 		credentials: "include",
 		headers: { "content-type": "application/json" },

@@ -1,8 +1,17 @@
+import { lazy, Suspense } from "react";
 import { createRootRoute, Outlet } from "@tanstack/react-router";
 
 import { useAuthBootstrap } from "@/auth/AuthBootstrap";
+import { isDemoMode } from "@/demo/runtime";
 import { AppBoot } from "@/pages/AppBoot";
 import { NotFoundPage } from "@/pages/NotFound";
+
+const LazyDemoInspector = lazy(async () => {
+	const module = await import("@/demo/DemoInspector");
+	return {
+		default: module.DemoInspector,
+	};
+});
 
 export const Route = createRootRoute({
 	component: RootRouteComponent,
@@ -16,7 +25,12 @@ function RootRouteComponent() {
 		return <AppBoot />;
 	}
 
-	return <Outlet />;
+	return (
+		<>
+			<Outlet />
+			<DemoInspectorMount />
+		</>
+	);
 }
 
 function RootRouteNotFoundComponent() {
@@ -31,5 +45,17 @@ function RootRouteNotFoundComponent() {
 			isAuthenticated={auth.isAuthenticated && Boolean(auth.me)}
 			pathname={typeof window === "undefined" ? null : window.location.pathname}
 		/>
+	);
+}
+
+function DemoInspectorMount() {
+	if (!isDemoMode()) {
+		return null;
+	}
+
+	return (
+		<Suspense fallback={null}>
+			<LazyDemoInspector />
+		</Suspense>
 	);
 }

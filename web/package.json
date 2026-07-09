@@ -6,6 +6,7 @@
 	"scripts": {
 		"dev": "vite",
 		"build": "tsc -b && vite build && bun run postbuild:pwa",
+		"build:demo": "tsc -b && vite build --mode demo",
 		"lint": "biome check .",
 		"format": "biome format . --write",
 		"e2e": "playwright test",
@@ -28,6 +29,7 @@
 		"class-variance-authority": "^0.7.1",
 		"clsx": "^2.1.1",
 		"lucide-react": "^0.507.0",
+		"msw": "^2.15.0",
 		"radix-ui": "^1.4.3",
 		"react": "^19.2.0",
 		"react-dom": "^19.2.0",
@@ -51,5 +53,10 @@
 		"storybook": "10.2.10",
 		"typescript": "~5.9.3",
 		"vite": "^7.3.1"
+	},
+	"msw": {
+		"workerDirectory": [
+			"public"
+		]
 	}
 }
