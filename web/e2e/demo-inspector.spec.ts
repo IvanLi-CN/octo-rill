@@ -285,6 +285,58 @@ test("desktop inspector does not block settings simulated writes", async ({
 	await expect(items).toHaveCount(before + 1);
 });
 
+test("scene switching reapplies settings left-docked inspector defaults", async ({
+	page,
+}) => {
+	await page.goto(
+		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
+	);
+
+	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
+	await expect(inspector).toBeVisible();
+
+	await openInspectorCombobox(inspector, 0);
+	await page.getByRole("option", { name: "Settings", exact: true }).click();
+
+	await expect(page).toHaveURL(
+		/settings\?(?=.*section=my-releases)(?=.*demo=settings-my-releases)/,
+	);
+	await expect(page.locator("[data-settings-layout]")).toBeVisible();
+	await page.getByRole("link", { name: "API Key" }).first().click();
+	await expect(page).toHaveURL(
+		/settings\?(?=.*section=api-keys)(?=.*demo=settings-my-releases)/,
+	);
+	const settingsInspector = page.locator(
+		'[data-demo-inspector-chrome="desktop"]',
+	);
+	await expect(settingsInspector).toBeVisible();
+	await expect(
+		page.getByRole("button", { name: "创建 API Key" }),
+	).toBeVisible();
+
+	const geometry = await page.evaluate(() => {
+		const inspectorNode = document.querySelector<HTMLElement>(
+			'[data-demo-inspector-chrome="desktop"]',
+		);
+		const createButton = Array.from(document.querySelectorAll("button")).find(
+			(button) => button.textContent?.includes("创建 API Key"),
+		);
+		if (!inspectorNode || !(createButton instanceof HTMLElement)) {
+			throw new Error("settings scene switch geometry is unavailable");
+		}
+		const inspectorRect = inspectorNode.getBoundingClientRect();
+		const buttonRect = createButton.getBoundingClientRect();
+		return {
+			inspectorLeft: inspectorRect.left,
+			inspectorRight: inspectorRect.right,
+			buttonLeft: buttonRect.left,
+		};
+	});
+
+	expect(geometry.inspectorLeft).toBeLessThanOrEqual(80);
+	expect(geometry.buttonLeft).toBeGreaterThan(geometry.inspectorRight + 16);
+});
+
 test("desktop inspector floats over dashboard content instead of reserving layout width", async ({
 	page,
 }) => {

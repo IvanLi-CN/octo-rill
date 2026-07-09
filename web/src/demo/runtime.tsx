@@ -46,6 +46,10 @@ const DEFAULT_PANEL_LAYOUT: DemoPanelLayout = {
 	collapsed: false,
 };
 
+type PersistedDemoPanelLayout = Partial<DemoPanelLayout> & {
+	sceneId?: DemoSceneId;
+};
+
 function buildDefaultPanelLayout(sceneId: DemoSceneId): DemoPanelLayout {
 	if (
 		sceneId === "settings-my-releases" ||
@@ -127,9 +131,22 @@ function readPanelLayout(sceneId: DemoSceneId): DemoPanelLayout {
 	try {
 		const raw = window.localStorage.getItem(DEMO_PANEL_LAYOUT_STORAGE_KEY);
 		if (!raw) return sceneDefaultLayout;
-		const parsed = JSON.parse(raw) as Partial<DemoPanelLayout>;
+		const parsed = JSON.parse(raw) as PersistedDemoPanelLayout;
+		const parsedSceneId =
+			typeof parsed.sceneId === "string" ? parsed.sceneId : null;
+		const nextEdge = parsed.edge === "left" ? "left" : "right";
+		if (parsedSceneId && parsedSceneId !== sceneId) {
+			return sceneDefaultLayout;
+		}
+		if (
+			!parsedSceneId &&
+			sceneDefaultLayout.edge === "left" &&
+			nextEdge !== "left"
+		) {
+			return sceneDefaultLayout;
+		}
 		return {
-			edge: parsed.edge === "left" ? "left" : "right",
+			edge: nextEdge,
 			x: typeof parsed.x === "number" ? parsed.x : sceneDefaultLayout.x,
 			y: typeof parsed.y === "number" ? parsed.y : sceneDefaultLayout.y,
 			collapsed:
@@ -142,12 +159,15 @@ function readPanelLayout(sceneId: DemoSceneId): DemoPanelLayout {
 	}
 }
 
-function persistPanelLayout(layout: DemoPanelLayout) {
+function persistPanelLayout(layout: DemoPanelLayout, sceneId: DemoSceneId) {
 	if (!canUseStorage()) return;
 	try {
 		window.localStorage.setItem(
 			DEMO_PANEL_LAYOUT_STORAGE_KEY,
-			JSON.stringify(layout),
+			JSON.stringify({
+				...layout,
+				sceneId,
+			} satisfies PersistedDemoPanelLayout),
 		);
 	} catch {
 		// ignore storage failures
@@ -437,12 +457,16 @@ export function syncDemoRuntimeWithHref(href: string) {
 	if (!next.active && !runtimeState.demoBuild) {
 		stopDemoWorker();
 	}
+	const sceneChanged = currentShareState.sceneId !== next.shareState.sceneId;
 	const shouldReseedModel =
 		next.active &&
 		(!runtimeState.active ||
 			modelAffectingShareStateChanged(currentShareState, next.shareState));
 	runtimeState.active = next.active;
 	runtimeState.shareState = next.shareState;
+	if (sceneChanged && next.active) {
+		runtimeState.panelLayout = readPanelLayout(next.shareState.sceneId);
+	}
 	if (!next.active) {
 		runtimeState.model = null;
 	} else if (shouldReseedModel || !runtimeState.model) {
@@ -465,10 +489,15 @@ export function patchDemoShareState(
 		...runtimeState.shareState,
 		...partial,
 	};
+	const sceneChanged =
+		runtimeState.shareState.sceneId !== nextShareState.sceneId;
 	const shouldBumpRevision =
 		options?.reseed !== false &&
 		modelAffectingShareStateChanged(runtimeState.shareState, nextShareState);
 	runtimeState.shareState = nextShareState;
+	if (sceneChanged) {
+		runtimeState.panelLayout = readPanelLayout(nextShareState.sceneId);
+	}
 	if (options?.reseed !== false) {
 		runtimeState.model = seedModel(nextShareState);
 		runtimeState.mutations = [];
@@ -501,7 +530,7 @@ export function updateDemoPanelLayout(
 		...runtimeState.panelLayout,
 		...partial,
 	};
-	persistPanelLayout(runtimeState.panelLayout);
+	persistPanelLayout(runtimeState.panelLayout, runtimeState.shareState.sceneId);
 	if (options?.emit !== false) {
 		emit();
 	}
