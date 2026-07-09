@@ -1,4 +1,4 @@
-import { lazy, type ReactNode, Suspense } from "react";
+import { lazy, type CSSProperties, type ReactNode, Suspense } from "react";
 import { createRootRoute, Outlet } from "@tanstack/react-router";
 
 import { useAuthBootstrap } from "@/auth/AuthBootstrap";
@@ -98,11 +98,15 @@ function DemoRootFrame(props: {
 			<div
 				className="min-h-dvh min-w-0"
 				data-demo-root-content="wide"
-				style={{
-					boxSizing: "border-box",
-					paddingLeft: `${DEMO_INSPECTOR_DOCKED_CONTENT_OFFSET_PX}px`,
-					paddingRight: `${DEMO_INSPECTOR_DOCKED_VIEWPORT_GUTTER_PX}px`,
-				}}
+				style={
+					{
+						"--app-meta-footer-left": `${DEMO_INSPECTOR_DOCKED_CONTENT_OFFSET_PX}px`,
+						"--app-meta-footer-right": `${DEMO_INSPECTOR_DOCKED_VIEWPORT_GUTTER_PX}px`,
+						boxSizing: "border-box",
+						paddingLeft: `${DEMO_INSPECTOR_DOCKED_CONTENT_OFFSET_PX}px`,
+						paddingRight: `${DEMO_INSPECTOR_DOCKED_VIEWPORT_GUTTER_PX}px`,
+					} as CSSProperties
+				}
 			>
 				<div
 					className="mx-auto w-full min-w-0"

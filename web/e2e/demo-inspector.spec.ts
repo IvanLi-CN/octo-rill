@@ -427,6 +427,9 @@ test("desktop inspector floats over dashboard content instead of reserving layou
 			'[data-dashboard-scope-summary="repo"][data-dashboard-scope-summary-layout="desktop"]',
 		),
 	).toBeVisible();
+	await expect(
+		page.locator('[data-app-meta-footer-hidden="false"]'),
+	).toBeVisible();
 
 	const geometry = await page.evaluate(() => {
 		const inspector = document.querySelector<HTMLElement>(
@@ -482,20 +485,27 @@ test("ultra-wide desktop pins inspector as a permanent full-height left rail", a
 		const rootContent = document.querySelector<HTMLElement>(
 			'[data-demo-root-content="wide"]',
 		);
+		const footer = document.querySelector<HTMLElement>("footer");
 		const scopeSummary = document.querySelector<HTMLElement>(
 			'[data-dashboard-scope-summary="repo"][data-dashboard-scope-summary-layout="desktop"]',
 		);
-		if (!inspector || !rootContent || !scopeSummary) {
+		if (!inspector || !rootContent || !footer || !scopeSummary) {
 			throw new Error("wide demo layout geometry is unavailable");
 		}
 		const inspectorRect = inspector.getBoundingClientRect();
 		const rootContentRect = rootContent.getBoundingClientRect();
 		const rootContentStyle = window.getComputedStyle(rootContent);
+		const footerRect = footer.getBoundingClientRect();
 		const summaryRect = scopeSummary.getBoundingClientRect();
 		return {
 			contentLeft:
 				rootContentRect.left +
 				Number.parseFloat(rootContentStyle.paddingLeft || "0"),
+			contentRight:
+				rootContentRect.right -
+				Number.parseFloat(rootContentStyle.paddingRight || "0"),
+			footerLeft: footerRect.left,
+			footerRight: footerRect.right,
 			inspectorLeft: inspectorRect.left,
 			inspectorRight: inspectorRect.right,
 			inspectorTop: inspectorRect.top,
@@ -525,6 +535,12 @@ test("ultra-wide desktop pins inspector as a permanent full-height left rail", a
 	).toBeLessThanOrEqual(2);
 	expect(geometry.hasCollapseButton).toBe(false);
 	expect(geometry.contentLeft).toBeGreaterThan(geometry.inspectorRight + 16);
+	expect(
+		Math.abs(geometry.footerLeft - geometry.contentLeft),
+	).toBeLessThanOrEqual(2);
+	expect(
+		Math.abs(geometry.footerRight - geometry.contentRight),
+	).toBeLessThanOrEqual(2);
 	expect(geometry.summaryLeft).toBeGreaterThan(geometry.inspectorRight + 16);
 	await captureDemoInspectorEvidence(
 		page.locator("body"),

@@ -170,7 +170,7 @@
   captured_at: `2026-07-09`
   route: `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
   state: `dashboard-repo-publish`
-  evidence_note: 超宽桌面宽度下，根层会切成 root-level 双栏：左侧 inspector 固定贴住视口最左边并占满全高，永久显示且不支持关闭；右侧继续承载现有 Web App 最宽版心。该场景由 Playwright 几何回归断言保护：`data-demo-root-frame="wide"` 必须出现，且 inspector 需要满足 `left=0`、`top=0`、`height=viewportHeight`、无 collapse button，以及 `summaryLeft > inspectorRight + 16`。
+  evidence_note: 超宽桌面宽度下，根层会切成 root-level 双栏：左侧 inspector 固定贴住视口最左边并占满全高，永久显示且不支持关闭；右侧继续承载现有 Web App 最宽版心。footer 也必须跟随右侧 Web App Layout 的 left/right gutter，而不是继续铺到 pinned rail 后方。该场景由 Playwright 几何回归断言保护：`data-demo-root-frame="wide"` 必须出现，且 inspector 需要满足 `left=0`、`top=0`、`height=viewportHeight`、无 collapse button，同时 `footerLeft === contentLeft`、`footerRight === contentRight` 且 `summaryLeft > inspectorRight + 16`。
 
 ![Ultra-wide desktop dashboard demo with pinned left rail](./assets/dashboard-desktop-wide-pinned-left-rail.png)
 
