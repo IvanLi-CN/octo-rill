@@ -339,7 +339,7 @@ test("ultra-wide desktop docks inspector into a dedicated left column", async ({
 		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
 	);
 	await expect(
-		page.locator('[data-dashboard-brand-heading="true"]'),
+		page.getByRole("heading", { name: "octo-demo/release-lab" }),
 	).toBeVisible();
 	await expect(page.locator('[data-demo-root-frame="wide"]')).toBeVisible();
 	await expect(
@@ -369,11 +369,13 @@ test("ultra-wide desktop docks inspector into a dedicated left column", async ({
 		const summaryRect = scopeSummary.getBoundingClientRect();
 		return {
 			frameLeft: frameRect.left,
+			frameRight: frameRect.right,
 			inspectorLeft: inspectorRect.left,
 			inspectorRight: inspectorRect.right,
 			inspectorMode: inspector.dataset.demoInspectorMode,
 			inspectorPosition: window.getComputedStyle(inspector).position,
 			summaryLeft: summaryRect.left,
+			viewportWidth: window.innerWidth,
 		};
 	});
 
@@ -382,6 +384,7 @@ test("ultra-wide desktop docks inspector into a dedicated left column", async ({
 	expect(
 		Math.abs(geometry.inspectorLeft - geometry.frameLeft),
 	).toBeLessThanOrEqual(2);
+	expect(geometry.frameRight).toBeLessThanOrEqual(geometry.viewportWidth + 2);
 	expect(geometry.summaryLeft).toBeGreaterThan(geometry.inspectorRight + 16);
 	await captureDemoInspectorEvidence(
 		page.locator("body"),

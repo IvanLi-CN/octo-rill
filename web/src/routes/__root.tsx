@@ -84,6 +84,7 @@ function DemoRootFrame(props: { children: ReactNode }) {
 			data-demo-root-frame="wide"
 			style={
 				{
+					boxSizing: "border-box",
 					maxWidth: `${DEMO_INSPECTOR_DOCKED_LAYOUT_WIDTH_PX}px`,
 					paddingLeft: `${DEMO_INSPECTOR_DOCKED_CONTENT_OFFSET_PX}px`,
 				} as CSSProperties
