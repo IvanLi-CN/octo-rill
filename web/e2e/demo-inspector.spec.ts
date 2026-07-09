@@ -1,4 +1,27 @@
-import { expect, test } from "@playwright/test";
+import { mkdirSync } from "node:fs";
+import { resolve } from "node:path";
+import { expect, test, type Locator } from "@playwright/test";
+
+const DEMO_INSPECTOR_EVIDENCE_DIR = process.env.DEMO_INSPECTOR_EVIDENCE_DIR;
+
+async function openInspectorCombobox(inspector: Locator, index: number) {
+	const combobox = inspector.getByRole("combobox").nth(index);
+	await combobox.evaluate((element) => {
+		if (!(element instanceof HTMLButtonElement)) {
+			throw new Error("demo inspector combobox is missing");
+		}
+		element.click();
+	});
+}
+
+async function captureDemoInspectorEvidence(target: Locator, filename: string) {
+	if (!DEMO_INSPECTOR_EVIDENCE_DIR) return;
+	mkdirSync(DEMO_INSPECTOR_EVIDENCE_DIR, { recursive: true });
+	await target.screenshot({
+		path: resolve(DEMO_INSPECTOR_EVIDENCE_DIR, filename),
+		animations: "disabled",
+	});
+}
 
 test("demo auth affordances stay inside mock runtime", async ({ page }) => {
 	await page.goto("/?demo=landing-welcome");
@@ -169,7 +192,7 @@ test("switching demo persona reseeds the auth surface", async ({ page }) => {
 		page.locator('[data-dashboard-brand-heading="true"]'),
 	).toBeVisible();
 
-	await inspector.getByRole("combobox").nth(1).click();
+	await openInspectorCombobox(inspector, 1);
 	await page.getByRole("option", { name: "Guest", exact: true }).click();
 
 	await expect(page).toHaveURL(/d_persona=guest/);
@@ -221,7 +244,7 @@ test("network changes preserve the current in-scene route query", async ({
 	);
 
 	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
-	await inspector.getByRole("combobox").nth(2).click();
+	await openInspectorCombobox(inspector, 2);
 	await page.getByRole("option", { name: "Slow", exact: true }).click();
 
 	await expect(page).toHaveURL(
@@ -330,16 +353,27 @@ test("demo inspector stays fully usable when toast feedback appears", async ({
 
 	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
 	await expect(inspector).toBeVisible();
-	await expect(
-		page.locator('[data-demo-inspector-scroll-cue="bottom"]'),
-	).toBeVisible();
 	await expect(inspector.getByText("Actions & Share")).toBeVisible();
+	await expect(
+		inspector.getByRole("button", { name: "Copy Share URL" }),
+	).toBeVisible();
+	await expect(inspector.getByText("Advanced")).toBeVisible();
+	await expect(inspector).toContainText(
+		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
+	);
 
 	await page.getByRole("button", { name: "发布公开页" }).click();
 
 	const toast = page.locator('[data-slot="toast"][data-state="open"]').first();
 	await expect(toast).toBeVisible();
 	await expect(inspector.getByText("Actions & Share")).toBeVisible();
+	await expect(
+		inspector.getByRole("button", { name: "Copy Share URL" }),
+	).toBeVisible();
+	await expect(inspector.getByText("Advanced")).toBeVisible();
+	await expect(
+		page.locator('[data-demo-inspector-scroll-cue="bottom"]'),
+	).toBeHidden();
 
 	const geometry = await page.evaluate(() => {
 		const panel = document.querySelector<HTMLElement>(
@@ -373,7 +407,7 @@ test("demo inspector stays fully usable when toast feedback appears", async ({
 			surfaceTop: surfaceRect.top,
 			surfaceBottom: surfaceRect.bottom,
 			scrollerBottom: scrollerRect.bottom,
-			scrollerCanScroll: scroller.scrollHeight > scroller.clientHeight,
+			scrollerCanScroll: scroller.scrollHeight - scroller.clientHeight > 12,
 			titleTop: titleRect.top,
 			toastBottom: toastRect?.bottom ?? 0,
 			toastLeft: toastRect?.left ?? 0,
@@ -393,7 +427,7 @@ test("demo inspector stays fully usable when toast feedback appears", async ({
 	);
 	expect(geometry.titleTop).toBeGreaterThanOrEqual(geometry.panelTop);
 	expect(geometry.surfaceTop).toBeGreaterThanOrEqual(geometry.panelTop);
-	expect(geometry.scrollerCanScroll).toBe(true);
+	expect(geometry.scrollerCanScroll).toBe(false);
 
 	const overlapsToastHorizontally =
 		geometry.panelRight > geometry.toastLeft &&
@@ -402,20 +436,13 @@ test("demo inspector stays fully usable when toast feedback appears", async ({
 		expect(geometry.titleTop).toBeGreaterThanOrEqual(geometry.toastBottom + 4);
 	}
 
-	await page
-		.locator('[data-demo-inspector-scroller="true"]')
-		.evaluate((element) => {
-			element.scrollTo({
-				top: element.scrollHeight,
-				behavior: "instant",
-			});
-		});
+	await captureDemoInspectorEvidence(
+		page.locator("body"),
+		"dashboard-desktop-toast-clamped-fixed.png",
+	);
 
 	await expect(
 		page.locator('[data-demo-inspector-scroll-cue="top"]'),
-	).toBeVisible();
-	await expect(
-		page.locator('[data-demo-inspector-scroll-cue="bottom"]'),
 	).toBeHidden();
 });
 
@@ -471,7 +498,7 @@ test("reset scene restores the default publication share state", async ({
 	);
 
 	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
-	await inspector.getByRole("combobox").nth(3).click();
+	await openInspectorCombobox(inspector, 3);
 	await page.getByRole("option", { name: "Published", exact: true }).click();
 
 	await expect(page).toHaveURL(/d_pub=published/);

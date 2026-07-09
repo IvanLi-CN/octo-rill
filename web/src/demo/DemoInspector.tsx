@@ -246,30 +246,23 @@ export function DemoInspector() {
 		);
 	};
 
-	const panel = (
-		<DemoInspectorPanel
-			snapshot={snapshot}
-			sceneTitle={scene.title}
-			shareHref={shareHref}
-			onSceneChange={(sceneId) =>
-				navigateWithShareState({ sceneId }, { reseed: true })
-			}
-			onPersonaChange={(personaId) =>
-				navigateWithShareState({ personaId }, { reseed: true })
-			}
-			onNetworkChange={(networkMode) =>
-				navigateWithShareState({ networkMode }, { reseed: false })
-			}
-			onIncludeOwnReleasesChange={(includeOwnReleases) =>
-				navigateWithShareState({ includeOwnReleases }, { reseed: true })
-			}
-			onPublicationStateChange={(publicationState) =>
-				navigateWithShareState({ publicationState }, { reseed: true })
-			}
-			onReset={resetToSceneDefaults}
-			onCopyShareLink={copyShareLink}
-		/>
-	);
+	const panelProps = {
+		snapshot,
+		sceneTitle: scene.title,
+		shareHref,
+		onSceneChange: (sceneId: (typeof DEMO_SCENES)[number]["id"]) =>
+			navigateWithShareState({ sceneId }, { reseed: true }),
+		onPersonaChange: (personaId: "guest" | "member" | "admin") =>
+			navigateWithShareState({ personaId }, { reseed: true }),
+		onNetworkChange: (networkMode: "normal" | "slow" | "faulty") =>
+			navigateWithShareState({ networkMode }, { reseed: false }),
+		onIncludeOwnReleasesChange: (includeOwnReleases: boolean) =>
+			navigateWithShareState({ includeOwnReleases }, { reseed: true }),
+		onPublicationStateChange: (publicationState: "published" | "unpublished") =>
+			navigateWithShareState({ publicationState }, { reseed: true }),
+		onReset: resetToSceneDefaults,
+		onCopyShareLink: copyShareLink,
+	} satisfies DemoInspectorPanelProps;
 
 	if (isMobile) {
 		return (
@@ -291,7 +284,9 @@ export function DemoInspector() {
 								切换 scene / persona / network，并复制当前 share deep link。
 							</SheetDescription>
 						</SheetHeader>
-						<div className="h-full overflow-y-auto p-4">{panel}</div>
+						<div className="h-full overflow-y-auto p-4">
+							<DemoInspectorPanel {...panelProps} />
+						</div>
 					</SheetContent>
 				</Sheet>
 			</>
@@ -307,13 +302,15 @@ export function DemoInspector() {
 			onCollapse={() => setCollapsed(true)}
 			onExpand={() => setCollapsed(false)}
 		>
-			{panel}
+			{({ density }) => (
+				<DemoInspectorPanel {...panelProps} density={density} />
+			)}
 		</DesktopInspectorChrome>
 	);
 }
 
 function DesktopInspectorChrome(props: {
-	children: ReactNode;
+	children: (input: { density: "default" | "compact" }) => ReactNode;
 	collapsed: boolean;
 	edge: "left" | "right";
 	x: number;
@@ -494,6 +491,10 @@ function DesktopInspectorChrome(props: {
 		DESKTOP_PANEL_MIN_HEIGHT,
 		contentHeight ?? DESKTOP_PANEL_FALLBACK_HEIGHT,
 	);
+	const density =
+		!collapsed && (panelMetrics.maxHeight ?? Number.POSITIVE_INFINITY) <= 590
+			? "compact"
+			: "default";
 	const panelHeight = collapsed
 		? undefined
 		: Math.min(
@@ -677,7 +678,10 @@ function DesktopInspectorChrome(props: {
 			>
 				<div
 					ref={titleRef}
-					className="flex cursor-move items-center justify-between border-b px-4 py-3"
+					className={cn(
+						"flex cursor-move items-center justify-between border-b px-4 py-3",
+						density === "compact" && "px-3.5 py-2.5",
+					)}
 					data-demo-inspector-title="true"
 					onPointerDown={(event) => {
 						if (
@@ -703,6 +707,7 @@ function DesktopInspectorChrome(props: {
 						type="button"
 						size="icon"
 						variant="ghost"
+						className={cn(density === "compact" && "size-8")}
 						onPointerDown={(event) => event.stopPropagation()}
 						onClick={onCollapse}
 					>
@@ -718,10 +723,13 @@ function DesktopInspectorChrome(props: {
 					) : null}
 					<div
 						ref={scrollerRef}
-						className="h-full min-h-0 overflow-y-auto p-4 pb-5"
+						className={cn(
+							"h-full min-h-0 overflow-y-auto p-4 pb-5",
+							density === "compact" && "p-3 pb-3.5",
+						)}
 						data-demo-inspector-scroller="true"
 					>
-						{children}
+						{children({ density })}
 					</div>
 					{scrollCues.showBottom ? (
 						<>
@@ -746,6 +754,7 @@ export type DemoInspectorPanelProps = {
 	snapshot: ReturnType<typeof useDemoSnapshot>;
 	sceneTitle: string;
 	shareHref: string;
+	density?: "default" | "compact";
 	onSceneChange: (sceneId: (typeof DEMO_SCENES)[number]["id"]) => void;
 	onPersonaChange: (personaId: "guest" | "member" | "admin") => void;
 	onNetworkChange: (networkMode: "normal" | "slow" | "faulty") => void;
@@ -757,17 +766,28 @@ export type DemoInspectorPanelProps = {
 
 export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 	const { snapshot } = props;
+	const isCompact = props.density === "compact";
 	return (
-		<div className="space-y-1.5">
+		<div className={cn("space-y-1.5", isCompact && "space-y-1")}>
 			<Card className="border-dashed">
-				<CardHeader className="p-3 pb-2">
-					<CardTitle className="flex items-center justify-between text-base">
+				<CardHeader className={cn("p-3 pb-2", isCompact && "p-2.5 pb-1.5")}>
+					<CardTitle
+						className={cn(
+							"flex items-center justify-between text-base",
+							isCompact && "text-[15px]",
+						)}
+					>
 						<span>{props.sceneTitle}</span>
 						<Badge variant="outline">Simulated Writes</Badge>
 					</CardTitle>
 				</CardHeader>
-				<CardContent className="space-y-2.5 px-3 pb-3">
-					<section className="space-y-1.5">
+				<CardContent
+					className={cn(
+						"space-y-2.5 px-3 pb-3",
+						isCompact && "space-y-2 px-2.5 pb-2.5",
+					)}
+				>
+					<section className={cn("space-y-1.5", isCompact && "space-y-1")}>
 						<Label>Scene</Label>
 						<Select
 							value={snapshot.shareState.sceneId}
@@ -775,7 +795,7 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 								props.onSceneChange(value as (typeof DEMO_SCENES)[number]["id"])
 							}
 						>
-							<SelectTrigger className="w-full">
+							<SelectTrigger className={cn("w-full", isCompact && "h-8")}>
 								<SelectValue />
 							</SelectTrigger>
 							<SelectContent>
@@ -788,8 +808,10 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 						</Select>
 					</section>
 
-					<section className="grid gap-2.5 sm:grid-cols-2">
-						<div className="space-y-1.5">
+					<section
+						className={cn("grid gap-2.5 sm:grid-cols-2", isCompact && "gap-2")}
+					>
+						<div className={cn("space-y-1.5", isCompact && "space-y-1")}>
 							<Label>Persona</Label>
 							<Select
 								value={snapshot.shareState.personaId}
@@ -797,7 +819,7 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 									props.onPersonaChange(value as "guest" | "member" | "admin")
 								}
 							>
-								<SelectTrigger className="w-full">
+								<SelectTrigger className={cn("w-full", isCompact && "h-8")}>
 									<SelectValue />
 								</SelectTrigger>
 								<SelectContent>
@@ -807,7 +829,7 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 								</SelectContent>
 							</Select>
 						</div>
-						<div className="space-y-1.5">
+						<div className={cn("space-y-1.5", isCompact && "space-y-1")}>
 							<Label>Network</Label>
 							<Select
 								value={snapshot.shareState.networkMode}
@@ -815,7 +837,7 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 									props.onNetworkChange(value as "normal" | "slow" | "faulty")
 								}
 							>
-								<SelectTrigger className="w-full">
+								<SelectTrigger className={cn("w-full", isCompact && "h-8")}>
 									<SelectValue />
 								</SelectTrigger>
 								<SelectContent>
@@ -830,15 +852,24 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 			</Card>
 
 			<Card>
-				<CardHeader className="p-3 pb-2">
-					<CardTitle className="text-base">Data</CardTitle>
+				<CardHeader className={cn("p-3 pb-2", isCompact && "p-2.5 pb-1.5")}>
+					<CardTitle className={cn("text-base", isCompact && "text-[15px]")}>
+						Data
+					</CardTitle>
 				</CardHeader>
-				<CardContent className="space-y-2.5 px-3 pb-3">
+				<CardContent
+					className={cn(
+						"space-y-2.5 px-3 pb-3",
+						isCompact && "space-y-2 px-2.5 pb-2.5",
+					)}
+				>
 					<div className="flex items-center justify-between gap-3">
 						<div className="space-y-0.5">
 							<p className="font-medium text-sm">Include My Releases</p>
 							<p className="text-muted-foreground text-xs leading-4">
-								影响 Settings 回显和 Dashboard owner-only release 露出。
+								{isCompact
+									? "影响 Settings 回显与 owner-only release 露出。"
+									: "影响 Settings 回显和 Dashboard owner-only release 露出。"}
 							</p>
 						</div>
 						<Switch
@@ -846,7 +877,7 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 							onCheckedChange={props.onIncludeOwnReleasesChange}
 						/>
 					</div>
-					<div className="space-y-1.5">
+					<div className={cn("space-y-1.5", isCompact && "space-y-1")}>
 						<Label>Repo Public Release State</Label>
 						<Select
 							value={snapshot.shareState.publicationState}
@@ -856,7 +887,7 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 								)
 							}
 						>
-							<SelectTrigger className="w-full">
+							<SelectTrigger className={cn("w-full", isCompact && "h-8")}>
 								<SelectValue />
 							</SelectTrigger>
 							<SelectContent>
@@ -869,39 +900,59 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 			</Card>
 
 			<Card>
-				<CardHeader className="p-3 pb-2">
-					<CardTitle className="text-base">Actions & Share</CardTitle>
+				<CardHeader className={cn("p-3 pb-2", isCompact && "p-2.5 pb-1.5")}>
+					<CardTitle className={cn("text-base", isCompact && "text-[15px]")}>
+						Actions & Share
+					</CardTitle>
 				</CardHeader>
-				<CardContent className="space-y-2.5 px-3 pb-3">
+				<CardContent
+					className={cn(
+						"space-y-2.5 px-3 pb-3",
+						isCompact && "space-y-2 px-2.5 pb-2.5",
+					)}
+				>
 					<div className="flex flex-wrap gap-1.5">
-						<Button type="button" variant="outline" onClick={props.onReset}>
+						<Button
+							type="button"
+							variant="outline"
+							size={isCompact ? "sm" : "default"}
+							onClick={props.onReset}
+						>
 							<RefreshCcw className="size-4" />
 							Reset Scene
 						</Button>
 						<Button
 							type="button"
 							variant="outline"
+							size={isCompact ? "sm" : "default"}
 							onClick={props.onCopyShareLink}
 						>
 							<Copy className="size-4" />
 							Copy Share URL
 						</Button>
 					</div>
-					<div className="space-y-1.5">
-						<Label>Share</Label>
+					<div className={cn("space-y-1.5", isCompact && "space-y-1")}>
+						{isCompact ? null : <Label>Share</Label>}
 						<p className="overflow-x-auto rounded-xl border bg-muted/30 px-2.5 py-1.5 font-mono text-[10px] leading-4 whitespace-nowrap">
 							{props.shareHref}
 						</p>
 					</div>
-					<p className="text-muted-foreground text-xs">
-						{snapshot.mutations.length === 0
-							? "No simulated writes recorded yet."
-							: `${snapshot.mutations.length} simulated write${snapshot.mutations.length > 1 ? "s" : ""} recorded.`}
-					</p>
+					{isCompact ? null : (
+						<p className="text-muted-foreground text-xs">
+							{snapshot.mutations.length === 0
+								? "No simulated writes recorded yet."
+								: `${snapshot.mutations.length} simulated write${snapshot.mutations.length > 1 ? "s" : ""} recorded.`}
+						</p>
+					)}
 				</CardContent>
 			</Card>
 
-			<details className="rounded-2xl border bg-muted/20 p-2.5">
+			<details
+				className={cn(
+					"rounded-2xl border bg-muted/20 p-2.5",
+					isCompact && "p-2",
+				)}
+			>
 				<summary className="cursor-pointer list-none">
 					<div className="flex items-center justify-between gap-3">
 						<p className="font-medium text-sm">Advanced</p>

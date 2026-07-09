@@ -145,7 +145,7 @@
   captured_at: `2026-07-09`
   route: `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
   state: `dashboard-repo-publish`
-  evidence_note: 短视口桌面态（`1366x768`）下触发“发布公开页”toast 后，inspector 仍会避让顶部 toast、保持底边在视口内，并把剩余内容收进内部滚动区；owner-facing 截图现在保证 `Actions & Share` 标题仍在首屏内，不再呈现“底部像溢出视口”的观感。该场景与 `demo boot failure`、native anchor `/demo` share-state 保真一起由新增 Playwright 回归覆盖。
+  evidence_note: 短视口桌面态（`1366x768`）下触发“发布公开页”toast 后，inspector 仍会避让顶部 toast、保持底边在视口内；同时通过 compact density 让 `Actions & Share`、share URL 与 `Advanced` 摘要都留在首屏，不再呈现“底部像溢出视口”的观感。该场景与 `demo boot failure`、native anchor `/demo` share-state 保真一起由新增 Playwright 回归覆盖。
 
 ![Desktop dashboard demo with toast-safe inspector](./assets/dashboard-desktop-toast-clamped-fixed.png)
 

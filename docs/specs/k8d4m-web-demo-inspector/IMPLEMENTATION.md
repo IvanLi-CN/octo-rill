@@ -23,4 +23,4 @@
 - [x] M1: 新 spec、scene registry、demo bootstrap 与 `/demo` build target 落地。
 - [x] M2: 六个页面级 surface 的 mock-only handlers / SSE / simulated writes 补齐。
 - [x] M3: Pages 组装、404 recovery shim 与公开文档入口同步。
-- [x] M4: Storybook inspector stories / docs（含 `ShortDesktopSurface`）、lint/build/e2e、visual evidence 与 review-loop 收口。
+- [x] M4: Storybook inspector stories / docs（含 `ShortDesktopSurface` / `CompactDesktopSurface`）、lint/build/e2e、visual evidence 与 review-loop 收口。

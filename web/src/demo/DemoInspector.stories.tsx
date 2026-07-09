@@ -92,3 +92,19 @@ export const ShortDesktopSurface: Story = {
 		await expect(canvas.getByText("Share")).toBeInTheDocument();
 	},
 };
+
+export const CompactDesktopSurface: Story = {
+	args: {
+		density: "compact",
+	},
+	render: (args) => (
+		<div className="h-[560px] w-[400px] overflow-y-auto rounded-[28px] border bg-background p-3">
+			<DemoInspectorPanel {...args} />
+		</div>
+	),
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("Actions & Share")).toBeInTheDocument();
+		await expect(canvas.getByText("Advanced")).toBeInTheDocument();
+	},
+};
