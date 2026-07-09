@@ -7,3 +7,4 @@
 - 2026-05-08: 公开 Release 首次登记改为优先复用近期本地公开仓库 metadata 与共享 Release 缓存，避免已有缓存的公开仓库卡在 metadata pending；同时 SQLite 主连接池改为默认 8 且可通过环境变量调整。
 - 2026-05-08: 主连接池放大后，高竞争后台写事务必须提前获取 SQLite writer slot；repo release / translation scheduler 的 claim / attach 路径按该约束收敛，避免 `SQLITE_BUSY_SNAPSHOT` 让计划任务连续失败。
 - 2026-07-07: 公开 Release 模型扩展为 `github_public` / `private_owner_published` 双 access kind；GitHub public repo 默认公开，viewer-owned private repo 需拥有者显式发布，并补齐 `/public/:owner/:repo/releases` 到 canonical `/:owner/:repo/releases` 的 replace 跳转。
+- 2026-07-09: 匿名 public proof 从“只认 recent public starred metadata”扩到“信任 fresh 的 `starred_repos ∪ owned_repo_star_baselines` privacy metadata”；public owned repo 若已有共享 `repo_releases` 缓存，首访可直接 `ready`，但 stale / unknown / fresh private metadata 仍保持 `metadata_pending`。

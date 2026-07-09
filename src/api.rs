@@ -8067,10 +8067,10 @@ struct PublicReleaseUsageRow {
 }
 
 #[derive(Debug, sqlx::FromRow)]
-struct PublicReleaseLocalRepoRow {
+struct PublicReleaseLocalMetadataRow {
     repo_id: i64,
     full_name: String,
-    is_private: i64,
+    is_private: Option<i64>,
     metadata_updated_at: Option<String>,
 }
 
@@ -8350,15 +8350,40 @@ async fn resolve_public_release_usage_from_local_metadata(
     state: &AppState,
     full_name_lower: &str,
 ) -> Result<Option<PublicReleaseUsageRow>, ApiError> {
-    let Some(repo) = sqlx::query_as::<_, PublicReleaseLocalRepoRow>(
+    let Some(repo) = sqlx::query_as::<_, PublicReleaseLocalMetadataRow>(
         r#"
-        SELECT repo_id, full_name, is_private, updated_at AS metadata_updated_at
-        FROM starred_repos
-        WHERE lower(full_name) = ?
-        ORDER BY updated_at DESC
+        SELECT repo_id, full_name, is_private, metadata_updated_at
+        FROM (
+          SELECT
+            repo_id,
+            full_name,
+            is_private,
+            updated_at AS metadata_updated_at,
+            0 AS source_rank
+          FROM starred_repos
+          WHERE lower(full_name) = ?
+          UNION ALL
+          SELECT
+            repo_id,
+            repo_full_name AS full_name,
+            is_private,
+            updated_at AS metadata_updated_at,
+            1 AS source_rank
+          FROM owned_repo_star_baselines
+          WHERE lower(repo_full_name) = ?
+        ) local_metadata
+        ORDER BY
+          COALESCE(metadata_updated_at, '') DESC,
+          CASE
+            WHEN is_private = 1 THEN 0
+            WHEN is_private IS NULL THEN 1
+            ELSE 2
+          END ASC,
+          source_rank ASC
         LIMIT 1
         "#,
     )
+    .bind(full_name_lower)
     .bind(full_name_lower)
     .fetch_optional(&state.pool)
     .await
@@ -8366,10 +8391,10 @@ async fn resolve_public_release_usage_from_local_metadata(
     else {
         return Ok(None);
     };
-    if repo.is_private != 0 {
+    if !public_local_metadata_is_fresh(repo.metadata_updated_at.as_deref()) {
         return Ok(None);
     }
-    if !public_local_metadata_is_fresh(repo.metadata_updated_at.as_deref()) {
+    if repo.is_private != Some(0) {
         return Ok(None);
     }
 
@@ -19287,15 +19312,16 @@ mod tests {
         AdminSyncSubscriptionEventItem, AdminTaskEventItem, AdminUserPatchRequest,
         AdminUserUpdateGuard, AdminUsersQuery, BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT,
         CreateApiKeyRequest, DashboardUpdatesQuery, DashboardUpdatesToken, FeedQuery,
-        FeedReactionRefreshRequest, FeedRow, GitHubCompareCommit, GitHubCompareCommitDetail,
-        GitHubCompareFile, GitHubCompareResponse, GraphQlError, LLM_CALL_ORDER_BY_CREATED_DESC,
-        LiveReleaseReactions, PublicReleaseQuery, RELEASE_FEED_BODY_MAX_CHARS,
-        ReleaseReactionCounts, ReleaseReactionRow, ReleaseReactionViewer, ReturnModeQuery,
-        SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslationCacheRow, TranslationUpsert,
-        admin_dashboard, admin_delete_public_release_repo, admin_download_realtime_task_log,
-        admin_get_llm_call_detail, admin_get_llm_scheduler_status, admin_get_realtime_task_detail,
-        admin_list_llm_calls, admin_list_realtime_tasks, admin_list_repo_governance,
-        admin_list_users, admin_patch_llm_runtime_config, admin_patch_user, admin_users_offset,
+        FeedReactionRefreshRequest, FeedRow, FeedScope, GitHubCompareCommit,
+        GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse, GraphQlError,
+        LLM_CALL_ORDER_BY_CREATED_DESC, LiveReleaseReactions, PublicReleaseQuery,
+        RELEASE_FEED_BODY_MAX_CHARS, ReleaseReactionCounts, ReleaseReactionRow,
+        ReleaseReactionViewer, ReturnModeQuery, SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem,
+        TranslationCacheRow, TranslationUpsert, admin_dashboard, admin_delete_public_release_repo,
+        admin_download_realtime_task_log, admin_get_llm_call_detail,
+        admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
+        admin_list_realtime_tasks, admin_list_repo_governance, admin_list_users,
+        admin_patch_llm_runtime_config, admin_patch_user, admin_users_offset,
         ai_error_is_non_retryable, brief_contains_release_link, build_compare_digest,
         build_feed_reaction_refresh_item, build_task_diagnostics, compact_dashboard_signatures,
         dashboard_updates, encode_dashboard_updates_token, ensure_account_enabled,
@@ -19315,11 +19341,11 @@ mod tests {
         parse_feed_types, parse_llm_models, parse_positive_admin_concurrency,
         parse_release_id_param, parse_release_smart_summary_payload,
         parse_repo_full_name_from_release_url, parse_translation_json, parse_unique_release_ids,
-        parse_unique_thread_ids, prepare_release_batch, preserve_chunk_edge_newlines,
-        public_get_repo_release_detail, public_list_repo_releases, publish_repo_public_release,
-        refresh_admin_dashboard_rollups, refresh_feed_reactions, release_cache_entry_reusable,
-        release_detail_source_hash, release_detail_translation_ready, release_excerpt,
-        release_feed_body, release_reactions_status, require_active_user_id,
+        parse_unique_thread_ids, prepare_release_batch, prepare_repo_scope_public_repo_access,
+        preserve_chunk_edge_newlines, public_get_repo_release_detail, public_list_repo_releases,
+        publish_repo_public_release, refresh_admin_dashboard_rollups, refresh_feed_reactions,
+        release_cache_entry_reusable, release_detail_source_hash, release_detail_translation_ready,
+        release_excerpt, release_feed_body, release_reactions_status, require_active_user_id,
         require_business_user_id, resolve_release_full_name,
         should_retry_public_compare_without_auth, smart_error_is_retryable, split_markdown_chunks,
         sync_all, sync_notifications, sync_releases, sync_starred,
@@ -20720,6 +20746,26 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed owned repo baseline");
+    }
+
+    async fn set_owned_repo_baseline_updated_at(pool: &SqlitePool, repo_id: i64, updated_at: &str) {
+        sqlx::query(
+            r#"
+            UPDATE owned_repo_star_baselines
+            SET updated_at = ?
+            WHERE repo_id = ?
+            "#,
+        )
+        .bind(updated_at)
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("update owned repo baseline timestamp");
+    }
+
+    async fn mark_owned_repo_baseline_fresh(pool: &SqlitePool, repo_id: i64) {
+        let now = chrono::Utc::now().to_rfc3339();
+        set_owned_repo_baseline_updated_at(pool, repo_id, now.as_str()).await;
     }
 
     async fn set_include_own_releases(pool: &SqlitePool, enabled: bool) {
@@ -27693,9 +27739,89 @@ line two",
     }
 
     #[tokio::test]
-    async fn public_release_list_first_access_does_not_reuse_owned_only_baseline() {
+    async fn public_release_list_first_access_reuses_public_owned_baseline_cache() {
         let pool = setup_pool().await;
-        set_include_own_releases(&pool, true).await;
+        seed_owned_repo_baseline(&pool, 42, "openai/codex").await;
+        mark_owned_repo_baseline_fresh(&pool, 42).await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool.clone());
+
+        let response = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("owned public baseline should reuse shared release cache");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["status"], json!("ready"));
+        assert_eq!(body["repo_full_name"], json!("openai/codex"));
+        assert_eq!(body["items"][0]["release_id"], json!("120"));
+        assert_eq!(
+            body["items"][0]["repo_visual"]["owner_avatar_url"],
+            json!("https://avatars.githubusercontent.com/u/30215105")
+        );
+        assert_eq!(
+            body["items"][0]["repo_visual"]["open_graph_image_url"],
+            json!("https://repository-images.githubusercontent.com/30215105/octo-rill")
+        );
+        let row: (Option<i64>, String) = sqlx::query_as(
+            r#"
+            SELECT repo_id, last_sync_status
+            FROM public_repo_release_usage
+            WHERE full_name_lower = 'openai/codex'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("public usage row");
+        assert_eq!(row.0, Some(42));
+        assert_eq!(row.1, "ready");
+    }
+
+    #[tokio::test]
+    async fn public_release_detail_first_access_reuses_public_owned_baseline_cache() {
+        let pool = setup_pool().await;
+        seed_owned_repo_baseline(&pool, 42, "openai/codex").await;
+        mark_owned_repo_baseline_fresh(&pool, 42).await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool);
+
+        let response = public_get_repo_release_detail(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned(), "v1.2.3".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: Some("page".to_owned()),
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("owned public baseline should reuse shared release detail cache");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["release_id"], json!("120"));
+        assert_eq!(body["repo_full_name"], json!("openai/codex"));
+        assert_eq!(
+            body["repo_visual"]["owner_avatar_url"],
+            json!("https://avatars.githubusercontent.com/u/30215105")
+        );
+    }
+
+    #[tokio::test]
+    async fn public_release_list_first_access_does_not_reuse_stale_owned_public_metadata() {
+        let pool = setup_pool().await;
         seed_owned_repo_baseline(&pool, 42, "openai/codex").await;
         seed_repo_release(&pool, 42, 120).await;
         let state = setup_state(pool.clone());
@@ -27712,7 +27838,7 @@ line two",
             }),
         )
         .await
-        .expect("owned-only baseline should not prove public visibility");
+        .expect("stale owned baseline should remain metadata pending");
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let body = response_json(response).await;
@@ -27732,6 +27858,56 @@ line two",
         .expect("public usage row");
         assert_eq!(row.0, None);
         assert_eq!(row.1, "pending");
+    }
+
+    #[tokio::test]
+    async fn repo_scope_public_repo_access_reuses_public_owned_cache_without_warmup() {
+        let pool = setup_pool().await;
+        seed_owned_repo_baseline(&pool, 42, "openai/codex").await;
+        mark_owned_repo_baseline_fresh(&pool, 42).await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool.clone());
+
+        let needs_warmup = prepare_repo_scope_public_repo_access(
+            state.as_ref(),
+            test_user_id(1).as_str(),
+            &FeedScope::Repo {
+                owner: "openai".to_owned(),
+                repo: "codex".to_owned(),
+            },
+        )
+        .await
+        .expect("prepare repo scope public access");
+
+        assert!(!needs_warmup);
+        let usage_row: (Option<i64>, String) = sqlx::query_as(
+            r#"
+            SELECT repo_id, last_sync_status
+            FROM public_repo_release_usage
+            WHERE full_name_lower = 'openai/codex'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("public usage row");
+        assert_eq!(usage_row.0, Some(42));
+        assert_eq!(usage_row.1, "ready");
+
+        let association_row: (Option<i64>, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT repo_id, has_manual_feed_source, is_following
+            FROM user_repo_associations
+            WHERE user_id = ?
+              AND repo_full_name_lower = 'openai/codex'
+            "#,
+        )
+        .bind(test_user_id(1))
+        .fetch_one(&pool)
+        .await
+        .expect("manual feed association row");
+        assert_eq!(association_row.0, Some(42));
+        assert_eq!(association_row.1, 1);
+        assert_eq!(association_row.2, 0);
     }
 
     #[tokio::test]
