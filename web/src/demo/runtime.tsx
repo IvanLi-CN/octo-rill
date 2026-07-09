@@ -77,6 +77,7 @@ let demoWorker: ReturnType<DemoRuntimeDependencies["setupWorker"]> | null =
 	null;
 let workerStartPromise: Promise<void> | null = null;
 const DEMO_WORKER_START_TIMEOUT_MS = 4_000;
+let pendingDemoRouteSyncHref: string | null = null;
 
 const runtimeState: DemoSnapshot = {
 	active: false,
@@ -404,6 +405,46 @@ function persistDemoShareStateToWindowUrl() {
 	window.history.replaceState({}, "", nextUrl.toString());
 }
 
+function applyPatchedDemoShareState(
+	nextShareState: DemoShareState,
+	options?: {
+		reseed?: boolean;
+		persistToUrl?: boolean;
+	},
+) {
+	if (!demoDependencies) return;
+
+	const sceneChanged =
+		runtimeState.shareState.sceneId !== nextShareState.sceneId;
+	const shouldBumpRevision =
+		options?.reseed !== false &&
+		modelAffectingShareStateChanged(runtimeState.shareState, nextShareState);
+	runtimeState.shareState = nextShareState;
+
+	if (sceneChanged) {
+		runtimeState.panelLayout = readPanelLayout(nextShareState.sceneId);
+	}
+
+	if (
+		options?.reseed !== false &&
+		(shouldBumpRevision || !runtimeState.model)
+	) {
+		requireDemoDependencies().clearAllWarmStartupCaches();
+		runtimeState.model = seedModel(nextShareState);
+		runtimeState.mutations = [];
+	}
+
+	if (options?.persistToUrl) {
+		persistDemoShareStateToWindowUrl();
+	}
+
+	if (shouldBumpRevision) {
+		runtimeState.revision += 1;
+	}
+
+	emit();
+}
+
 export async function prepareDemoRuntime() {
 	if (typeof window === "undefined") return;
 
@@ -491,6 +532,9 @@ export function syncDemoRuntimeWithHref(href: string) {
 	const nextHref = href.startsWith("http")
 		? new URL(href).pathname + new URL(href).search + new URL(href).hash
 		: href;
+	if (pendingDemoRouteSyncHref && nextHref !== pendingDemoRouteSyncHref) {
+		return;
+	}
 	if (runtimeState.lastSyncedHref === nextHref) return;
 	if (!demoDependencies) return;
 
@@ -518,6 +562,9 @@ export function syncDemoRuntimeWithHref(href: string) {
 	if (shouldReseedModel) {
 		runtimeState.revision += 1;
 	}
+	if (pendingDemoRouteSyncHref === nextHref) {
+		pendingDemoRouteSyncHref = null;
+	}
 	emit();
 }
 
@@ -527,28 +574,35 @@ export function patchDemoShareState(
 		reseed?: boolean;
 	},
 ) {
-	if (!demoDependencies) return;
-	const nextShareState: DemoShareState = {
-		...runtimeState.shareState,
-		...partial,
-	};
-	const sceneChanged =
-		runtimeState.shareState.sceneId !== nextShareState.sceneId;
-	const shouldBumpRevision =
-		options?.reseed !== false &&
-		modelAffectingShareStateChanged(runtimeState.shareState, nextShareState);
-	runtimeState.shareState = nextShareState;
-	if (sceneChanged) {
-		runtimeState.panelLayout = readPanelLayout(nextShareState.sceneId);
-	}
-	if (options?.reseed !== false) {
-		runtimeState.model = seedModel(nextShareState);
-		runtimeState.mutations = [];
-	}
-	if (shouldBumpRevision) {
-		runtimeState.revision += 1;
-	}
-	emit();
+	applyPatchedDemoShareState(
+		{
+			...runtimeState.shareState,
+			...partial,
+		},
+		options,
+	);
+}
+
+export function applyDemoShareStateInPlace(
+	partial: Partial<DemoShareState>,
+	options?: {
+		reseed?: boolean;
+	},
+) {
+	applyPatchedDemoShareState(
+		{
+			...runtimeState.shareState,
+			...partial,
+		},
+		{
+			...options,
+			persistToUrl: true,
+		},
+	);
+}
+
+export function setPendingDemoRouteSyncHref(href: string | null) {
+	pendingDemoRouteSyncHref = href;
 }
 
 export function resetDemoScene() {

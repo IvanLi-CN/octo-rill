@@ -4,14 +4,14 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
 
 const DEMO_INSPECTOR_EVIDENCE_DIR = process.env.DEMO_INSPECTOR_EVIDENCE_DIR;
 
-async function openInspectorCombobox(inspector: Locator, index: number) {
+async function setInspectorSelectValue(
+	inspector: Locator,
+	index: number,
+	value: string,
+) {
 	const combobox = inspector.getByRole("combobox").nth(index);
-	await combobox.evaluate((element) => {
-		if (!(element instanceof HTMLButtonElement)) {
-			throw new Error("demo inspector combobox is missing");
-		}
-		element.click();
-	});
+	await combobox.click();
+	await combobox.selectOption(value);
 }
 
 async function dragDesktopInspectorTitle(
@@ -217,8 +217,7 @@ test("switching demo persona reseeds the auth surface", async ({ page }) => {
 		page.locator('[data-dashboard-brand-heading="true"]'),
 	).toBeVisible();
 
-	await openInspectorCombobox(inspector, 1);
-	await page.getByRole("option", { name: "Guest", exact: true }).click();
+	await setInspectorSelectValue(inspector, 1, "guest");
 
 	await expect(page).toHaveURL(/d_persona=guest/);
 	await expect(page.locator("[data-landing-login-cta]")).toBeVisible();
@@ -233,12 +232,15 @@ test("settings scene share url preserves existing route query", async ({
 	await page.goto("/settings?section=my-releases&demo=settings-my-releases");
 
 	await expect(page).toHaveURL(/section=my-releases/);
-	await expect(
-		page.locator('[data-demo-inspector-chrome="desktop"]'),
-	).toContainText("/settings?section=my-releases&demo=settings-my-releases");
-	await expect(
-		page.locator('[data-demo-inspector-chrome="desktop"]'),
-	).not.toContainText("/settings?section=my-releases?demo=");
+	const shareInput = page
+		.locator('[data-demo-inspector-chrome="desktop"]')
+		.getByLabel("Share");
+	await expect(shareInput).toHaveValue(
+		/settings\?(?=.*section=my-releases)(?=.*demo=settings-my-releases)/,
+	);
+	await expect(shareInput).not.toHaveValue(
+		/settings\?section=my-releases\?demo=/,
+	);
 });
 
 test("demo inspector share url follows in-scene route changes", async ({
@@ -252,8 +254,8 @@ test("demo inspector share url follows in-scene route changes", async ({
 		/settings\?(?=.*section=github-pat)(?=.*demo=settings-my-releases)/,
 	);
 	await expect(
-		page.locator('[data-demo-inspector-chrome="desktop"]'),
-	).toContainText(
+		page.locator('[data-demo-inspector-chrome="desktop"]').getByLabel("Share"),
+	).toHaveValue(
 		/settings\?(?=.*section=github-pat)(?=.*demo=settings-my-releases)/,
 	);
 });
@@ -269,13 +271,12 @@ test("network changes preserve the current in-scene route query", async ({
 	);
 
 	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
-	await openInspectorCombobox(inspector, 2);
-	await page.getByRole("option", { name: "Slow", exact: true }).click();
+	await setInspectorSelectValue(inspector, 2, "slow");
 
 	await expect(page).toHaveURL(
 		/settings\?(?=.*section=github-pat)(?=.*demo=settings-my-releases)(?=.*d_net=slow)/,
 	);
-	await expect(inspector).toContainText(
+	await expect(inspector.getByLabel("Share")).toHaveValue(
 		/settings\?(?=.*section=github-pat)(?=.*demo=settings-my-releases)(?=.*d_net=slow)/,
 	);
 });
@@ -320,8 +321,7 @@ test("scene switching reapplies settings left-docked inspector defaults", async 
 	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
 	await expect(inspector).toBeVisible();
 
-	await openInspectorCombobox(inspector, 0);
-	await page.getByRole("option", { name: "Settings", exact: true }).click();
+	await setInspectorSelectValue(inspector, 0, "settings-my-releases");
 
 	await expect(page).toHaveURL(
 		/settings\?(?=.*section=my-releases)(?=.*demo=settings-my-releases)/,
@@ -379,8 +379,7 @@ test("scene-specific inspector layouts persist independently", async ({
 	expect(dashboardMoved).not.toBeNull();
 	expect(dashboardMoved!.y).toBeGreaterThan(dashboardStart!.y + 80);
 
-	await openInspectorCombobox(inspector, 0);
-	await page.getByRole("option", { name: "Settings", exact: true }).click();
+	await setInspectorSelectValue(inspector, 0, "settings-my-releases");
 
 	await expect(page).toHaveURL(
 		/settings\?(?=.*section=my-releases)(?=.*demo=settings-my-releases)/,
@@ -395,8 +394,7 @@ test("scene-specific inspector layouts persist independently", async ({
 	expect(settingsMoved).not.toBeNull();
 	expect(settingsMoved!.y).toBeGreaterThan(settingsStart!.y + 30);
 
-	await openInspectorCombobox(inspector, 0);
-	await page.getByRole("option", { name: "Dashboard", exact: true }).click();
+	await setInspectorSelectValue(inspector, 0, "dashboard-repo-publish");
 
 	await expect(page).toHaveURL(
 		/focus\/repo\/octo-demo\/release-lab\?demo=dashboard-repo-publish/,
@@ -597,6 +595,50 @@ test("ultra-wide desktop can collapse the left rail back into a bubble", async (
 	);
 });
 
+test("restored wide desktop rail stays interactive after collapsing into a bubble", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1800, height: 1200 });
+	await page.goto(
+		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish&d_persona=member&d_pub=published",
+	);
+	await expect(page.locator('[data-demo-root-frame="wide"]')).toBeVisible();
+
+	await page.locator('[data-demo-inspector-collapse="true"]').first().click();
+
+	const bubble = page.locator('[data-demo-inspector-bubble="desktop"]');
+	await expect(bubble).toBeVisible();
+
+	await bubble.click();
+	await expect(page.locator('[data-demo-root-frame="wide"]')).toBeVisible();
+
+	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
+	const publicationStateSelect = inspector.getByRole("combobox").nth(3);
+	const includeOwnReleasesSwitch = inspector.getByLabel("Include My Releases");
+
+	await publicationStateSelect.click();
+	await publicationStateSelect.selectOption("unpublished");
+	await expect(page).not.toHaveURL(/d_pub=published/);
+	await expect(page.getByRole("button", { name: "发布公开页" })).toBeVisible();
+
+	await publicationStateSelect.click();
+	await publicationStateSelect.selectOption("published");
+	await expect(page).toHaveURL(/d_pub=published/);
+	await expect(page.getByRole("button", { name: "取消发布" })).toBeVisible();
+
+	await includeOwnReleasesSwitch.click();
+	await expect(page).toHaveURL(/d_own=1/);
+	await expect(
+		page.getByRole("heading", { name: "Web Demo 作为页面验收主来源" }),
+	).toBeVisible();
+
+	await includeOwnReleasesSwitch.click();
+	await expect(page).not.toHaveURL(/d_own=1/);
+	await expect(
+		page.getByRole("heading", { name: "公开入口补齐" }).first(),
+	).toBeVisible();
+});
+
 test("demo PAT saves never echo a user-entered secret prefix", async ({
 	page,
 }) => {
@@ -662,6 +704,114 @@ test("simulated publish writes published share state into the URL", async ({
 	await expect(page.getByRole("button", { name: "发布公开页" })).toHaveCount(0);
 });
 
+test("include my releases toggle reseeds in place without a document reload", async ({
+	page,
+}) => {
+	await page.addInitScript(() => {
+		(
+			window as typeof window & { __demoDocumentToken?: string }
+		).__demoDocumentToken = Math.random().toString(36).slice(2);
+	});
+	await page.setViewportSize({ width: 1800, height: 1200 });
+	await page.goto(
+		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish&d_persona=member&d_pub=published",
+	);
+
+	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
+	const includeOwnReleasesSwitch = inspector.getByRole("switch").first();
+	const initialDocumentToken = await page.evaluate(
+		() =>
+			(window as typeof window & { __demoDocumentToken?: string })
+				.__demoDocumentToken,
+	);
+	expect(initialDocumentToken).toBeTruthy();
+
+	await includeOwnReleasesSwitch.click();
+	await expect(page).toHaveURL(/d_own=1/);
+	await expect(
+		page.getByRole("heading", { name: "Web Demo 作为页面验收主来源" }),
+	).toBeVisible();
+	await expect(includeOwnReleasesSwitch).toHaveAttribute(
+		"aria-checked",
+		"true",
+	);
+
+	await includeOwnReleasesSwitch.click();
+	await expect(page).not.toHaveURL(/d_own=1/);
+	await expect(
+		page.getByRole("heading", { name: "公开入口补齐" }).first(),
+	).toBeVisible();
+	await expect(includeOwnReleasesSwitch).toHaveAttribute(
+		"aria-checked",
+		"false",
+	);
+
+	const finalDocumentToken = await page.evaluate(
+		() =>
+			(window as typeof window & { __demoDocumentToken?: string })
+				.__demoDocumentToken,
+	);
+	expect(finalDocumentToken).toBe(initialDocumentToken);
+});
+
+test("demo inspector top controls stay clickable across persona, network, and scene changes", async ({
+	page,
+}) => {
+	await page.addInitScript(() => {
+		(
+			window as typeof window & { __demoDocumentToken?: string }
+		).__demoDocumentToken = Math.random().toString(36).slice(2);
+	});
+	await page.setViewportSize({ width: 1800, height: 1200 });
+	await page.goto(
+		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish&d_persona=member&d_pub=published",
+	);
+
+	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
+	const sceneSelect = inspector.getByRole("combobox").nth(0);
+	const personaSelect = inspector.getByRole("combobox").nth(1);
+	const networkSelect = inspector.getByRole("combobox").nth(2);
+	const initialDocumentToken = await page.evaluate(
+		() =>
+			(window as typeof window & { __demoDocumentToken?: string })
+				.__demoDocumentToken,
+	);
+
+	expect(initialDocumentToken).toBeTruthy();
+
+	await personaSelect.click();
+	await personaSelect.selectOption("guest");
+	await expect(page).toHaveURL(/d_persona=guest/);
+	await expect(page.locator("[data-landing-login-cta]")).toBeVisible();
+
+	await personaSelect.click();
+	await personaSelect.selectOption("member");
+	await expect(page).toHaveURL(/d_persona=member/);
+	await expect(
+		page.locator('[data-dashboard-brand-heading="true"]'),
+	).toBeVisible();
+
+	await networkSelect.click();
+	await networkSelect.selectOption("slow");
+	await expect(page).toHaveURL(
+		/focus\/repo\/octo-demo\/release-lab\?(?=.*demo=dashboard-repo-publish)(?=.*d_persona=member)(?=.*d_pub=published)(?=.*d_net=slow)/,
+	);
+
+	await sceneSelect.click();
+	await sceneSelect.selectOption("settings-my-releases");
+	await expect(page).toHaveURL(
+		/settings\?(?=.*section=my-releases)(?=.*demo=settings-my-releases)(?=.*d_persona=member)(?=.*d_pub=published)(?=.*d_net=slow)/,
+	);
+	await expect(page.locator("[data-settings-layout]")).toBeVisible();
+
+	const finalDocumentToken = await page.evaluate(
+		() =>
+			(window as typeof window & { __demoDocumentToken?: string })
+				.__demoDocumentToken,
+	);
+	expect(finalDocumentToken).toBe(initialDocumentToken);
+});
+
 test("demo inspector stays fully usable when toast feedback appears", async ({
 	page,
 }) => {
@@ -681,8 +831,8 @@ test("demo inspector stays fully usable when toast feedback appears", async ({
 		inspector.getByRole("button", { name: "Copy Share URL" }),
 	).toBeVisible();
 	await expect(inspector.getByText("Advanced")).toBeVisible();
-	await expect(inspector).toContainText(
-		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
+	await expect(inspector.getByLabel("Share")).toHaveValue(
+		/focus\/repo\/octo-demo\/release-lab\?(?=.*demo=dashboard-repo-publish)(?=.*d_persona=member)/,
 	);
 
 	await page.getByRole("button", { name: "发布公开页" }).click();
@@ -769,6 +919,53 @@ test("demo inspector stays fully usable when toast feedback appears", async ({
 	).toBeHidden();
 });
 
+test("share url stays in a readonly input without a horizontal scrollbar block", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1366, height: 768 });
+	await page.goto(
+		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish&d_persona=member&d_pub=published",
+	);
+	await expect(
+		page.locator('[data-dashboard-brand-heading="true"]'),
+	).toBeVisible();
+
+	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
+	await expect(inspector).toBeVisible();
+
+	const shareInput = inspector.getByLabel("Share");
+	await expect(shareInput).toBeVisible();
+	await expect(shareInput).toHaveValue(
+		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish&d_persona=member&d_pub=published",
+	);
+
+	const metrics = await shareInput.evaluate((node) => {
+		const input = node as HTMLInputElement;
+		return {
+			tagName: input.tagName,
+			readOnly: input.readOnly,
+			scrollHeight: input.scrollHeight,
+			clientHeight: input.clientHeight,
+		};
+	});
+
+	expect(metrics.tagName).toBe("INPUT");
+	expect(metrics.readOnly).toBe(true);
+	expect(metrics.scrollHeight).toBeLessThanOrEqual(metrics.clientHeight);
+
+	await shareInput.click();
+	await expect
+		.poll(async () =>
+			shareInput.evaluate((node) => node === document.activeElement),
+		)
+		.toBe(true);
+
+	await captureDemoInspectorEvidence(
+		page.locator("body"),
+		"dashboard-desktop-share-readonly-input.png",
+	);
+});
+
 test("wide tall desktops keep the full control stack visible in the pinned left rail", async ({
 	page,
 }) => {
@@ -828,22 +1025,38 @@ test("wide tall desktops keep the full control stack visible in the pinned left 
 test("reset scene restores the default publication share state", async ({
 	page,
 }) => {
+	await page.addInitScript(() => {
+		(
+			window as typeof window & { __demoDocumentToken?: string }
+		).__demoDocumentToken = Math.random().toString(36).slice(2);
+	});
 	await page.setViewportSize({ width: 1366, height: 768 });
 	await page.goto(
 		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
 	);
+	const initialDocumentToken = await page.evaluate(
+		() =>
+			(window as typeof window & { __demoDocumentToken?: string })
+				.__demoDocumentToken,
+	);
 
-	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
-	await openInspectorCombobox(inspector, 3);
-	await page.getByRole("option", { name: "Published", exact: true }).click();
+	expect(initialDocumentToken).toBeTruthy();
 
-	await expect(page).toHaveURL(/d_pub=published/);
+	await page.getByRole("button", { name: "发布公开页" }).click();
 	await expect(page.getByRole("button", { name: "发布公开页" })).toHaveCount(0);
 	await expect(page.getByRole("button", { name: "取消发布" })).toBeVisible();
+	await expect(page).toHaveURL(/d_pub=published/);
 
 	await page.getByRole("button", { name: "Reset Scene" }).click();
 
 	await expect(page).not.toHaveURL(/d_pub=published/);
 	await expect(page.getByRole("button", { name: "发布公开页" })).toBeVisible();
 	await expect(page.getByRole("button", { name: "取消发布" })).toHaveCount(0);
+
+	const finalDocumentToken = await page.evaluate(
+		() =>
+			(window as typeof window & { __demoDocumentToken?: string })
+				.__demoDocumentToken,
+	);
+	expect(finalDocumentToken).toBe(initialDocumentToken);
 });

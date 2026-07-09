@@ -210,6 +210,18 @@
 
 ![Mobile demo inspector drawer](./assets/settings-mobile-drawer.png)
 
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  submission_gate: `captured`
+  PR: include
+  captured_at: `2026-07-09`
+  route: `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish&d_persona=member`
+  state: `dashboard-repo-publish`
+  evidence_note: `Actions & Share` 的 share deep link 已从横向滚动文本块收口为只读单行 input。常规桌面宽度下不再出现额外的横向滚动条；owner 可以像普通 input 一样聚焦、移动光标、局部选择并复制当前 deep link，而不需要先拖动滚动条找尾部。
+
+![Desktop dashboard demo with readonly share input](./assets/dashboard-desktop-share-readonly-input.png)
+
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
 - 风险：Admin Jobs 页面请求面较宽，若后续新增 tab 初始加载逻辑，demo handler 需要同步补齐。

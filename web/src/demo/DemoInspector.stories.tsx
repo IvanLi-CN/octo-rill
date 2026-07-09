@@ -80,6 +80,11 @@ export const Default: Story = {
 			canvas.getByText("Publish public release page"),
 		).toBeInTheDocument();
 		await expect(canvas.getByText("Copy Share URL")).toBeInTheDocument();
+		await expect(
+			canvas.getByDisplayValue(
+				"/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish&d_persona=member&d_own=1&d_pub=published",
+			),
+		).toHaveAttribute("readonly");
 	},
 };
 
@@ -93,6 +98,11 @@ export const ShortDesktopSurface: Story = {
 		const canvas = within(canvasElement);
 		await expect(canvas.getByText("Actions & Share")).toBeInTheDocument();
 		await expect(canvas.getByText("Share")).toBeInTheDocument();
+		await expect(
+			canvas.getByDisplayValue(
+				"/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish&d_persona=member&d_own=1&d_pub=published",
+			),
+		).toBeInTheDocument();
 	},
 };
 
