@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
-import { expect, test, type Locator } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 
 const DEMO_INSPECTOR_EVIDENCE_DIR = process.env.DEMO_INSPECTOR_EVIDENCE_DIR;
 
@@ -12,6 +12,29 @@ async function openInspectorCombobox(inspector: Locator, index: number) {
 		}
 		element.click();
 	});
+}
+
+async function dragDesktopInspectorTitle(
+	page: Page,
+	inspector: Locator,
+	offset: {
+		x?: number;
+		y: number;
+	},
+) {
+	const title = inspector.locator('[data-demo-inspector-title="true"]');
+	const box = await title.boundingBox();
+	if (!box) {
+		throw new Error("demo inspector title is unavailable");
+	}
+	const startX = box.x + box.width / 2;
+	const startY = box.y + box.height / 2;
+	await page.mouse.move(startX, startY);
+	await page.mouse.down();
+	await page.mouse.move(startX + (offset.x ?? 0), startY + offset.y, {
+		steps: 10,
+	});
+	await page.mouse.up();
 }
 
 async function captureDemoInspectorEvidence(target: Locator, filename: string) {
@@ -335,6 +358,55 @@ test("scene switching reapplies settings left-docked inspector defaults", async 
 
 	expect(geometry.inspectorLeft).toBeLessThanOrEqual(80);
 	expect(geometry.buttonLeft).toBeGreaterThan(geometry.inspectorRight + 16);
+});
+
+test("scene-specific inspector layouts persist independently", async ({
+	page,
+}) => {
+	await page.goto(
+		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
+	);
+
+	let inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
+	await expect(inspector).toBeVisible();
+	const dashboardStart = await inspector.boundingBox();
+	expect(dashboardStart).not.toBeNull();
+
+	await dragDesktopInspectorTitle(page, inspector, { y: 140 });
+	const dashboardMoved = await inspector.boundingBox();
+	expect(dashboardMoved).not.toBeNull();
+	expect(dashboardMoved!.y).toBeGreaterThan(dashboardStart!.y + 80);
+
+	await openInspectorCombobox(inspector, 0);
+	await page.getByRole("option", { name: "Settings", exact: true }).click();
+
+	await expect(page).toHaveURL(
+		/settings\?(?=.*section=my-releases)(?=.*demo=settings-my-releases)/,
+	);
+	inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
+	await expect(inspector).toBeVisible();
+
+	const settingsStart = await inspector.boundingBox();
+	expect(settingsStart).not.toBeNull();
+	await dragDesktopInspectorTitle(page, inspector, { y: 60 });
+	const settingsMoved = await inspector.boundingBox();
+	expect(settingsMoved).not.toBeNull();
+	expect(settingsMoved!.y).toBeGreaterThan(settingsStart!.y + 30);
+
+	await openInspectorCombobox(inspector, 0);
+	await page.getByRole("option", { name: "Dashboard", exact: true }).click();
+
+	await expect(page).toHaveURL(
+		/focus\/repo\/octo-demo\/release-lab\?demo=dashboard-repo-publish/,
+	);
+	inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
+	await expect(inspector).toBeVisible();
+
+	const restoredDashboard = await inspector.boundingBox();
+	expect(restoredDashboard).not.toBeNull();
+	expect(
+		Math.abs(restoredDashboard!.y - dashboardMoved!.y),
+	).toBeLessThanOrEqual(8);
 });
 
 test("desktop inspector floats over dashboard content instead of reserving layout width", async ({

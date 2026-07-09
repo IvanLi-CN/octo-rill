@@ -50,6 +50,10 @@ type PersistedDemoPanelLayout = Partial<DemoPanelLayout> & {
 	sceneId?: DemoSceneId;
 };
 
+type PersistedDemoPanelLayoutStore = PersistedDemoPanelLayout & {
+	scenes?: Partial<Record<DemoSceneId, PersistedDemoPanelLayout>>;
+};
+
 function buildDefaultPanelLayout(sceneId: DemoSceneId): DemoPanelLayout {
 	if (
 		sceneId === "settings-my-releases" ||
@@ -125,35 +129,54 @@ function canUseStorage() {
 	);
 }
 
+function normalizeStoredPanelLayout(
+	storedLayout: Partial<DemoPanelLayout>,
+	sceneDefaultLayout: DemoPanelLayout,
+) {
+	return {
+		edge: storedLayout.edge === "left" ? "left" : "right",
+		x:
+			typeof storedLayout.x === "number"
+				? storedLayout.x
+				: sceneDefaultLayout.x,
+		y:
+			typeof storedLayout.y === "number"
+				? storedLayout.y
+				: sceneDefaultLayout.y,
+		collapsed:
+			typeof storedLayout.collapsed === "boolean"
+				? storedLayout.collapsed
+				: sceneDefaultLayout.collapsed,
+	} satisfies DemoPanelLayout;
+}
+
 function readPanelLayout(sceneId: DemoSceneId): DemoPanelLayout {
 	const sceneDefaultLayout = buildDefaultPanelLayout(sceneId);
 	if (!canUseStorage()) return sceneDefaultLayout;
 	try {
 		const raw = window.localStorage.getItem(DEMO_PANEL_LAYOUT_STORAGE_KEY);
 		if (!raw) return sceneDefaultLayout;
-		const parsed = JSON.parse(raw) as PersistedDemoPanelLayout;
+		const parsed = JSON.parse(raw) as PersistedDemoPanelLayoutStore;
+		if (parsed.scenes && typeof parsed.scenes === "object") {
+			const storedSceneLayout = parsed.scenes[sceneId];
+			if (!storedSceneLayout) {
+				return sceneDefaultLayout;
+			}
+			return normalizeStoredPanelLayout(storedSceneLayout, sceneDefaultLayout);
+		}
 		const parsedSceneId =
 			typeof parsed.sceneId === "string" ? parsed.sceneId : null;
-		const nextEdge = parsed.edge === "left" ? "left" : "right";
 		if (parsedSceneId && parsedSceneId !== sceneId) {
 			return sceneDefaultLayout;
 		}
 		if (
 			!parsedSceneId &&
 			sceneDefaultLayout.edge === "left" &&
-			nextEdge !== "left"
+			parsed.edge !== "left"
 		) {
 			return sceneDefaultLayout;
 		}
-		return {
-			edge: nextEdge,
-			x: typeof parsed.x === "number" ? parsed.x : sceneDefaultLayout.x,
-			y: typeof parsed.y === "number" ? parsed.y : sceneDefaultLayout.y,
-			collapsed:
-				typeof parsed.collapsed === "boolean"
-					? parsed.collapsed
-					: sceneDefaultLayout.collapsed,
-		};
+		return normalizeStoredPanelLayout(parsed, sceneDefaultLayout);
 	} catch {
 		return sceneDefaultLayout;
 	}
@@ -162,12 +185,32 @@ function readPanelLayout(sceneId: DemoSceneId): DemoPanelLayout {
 function persistPanelLayout(layout: DemoPanelLayout, sceneId: DemoSceneId) {
 	if (!canUseStorage()) return;
 	try {
+		const raw = window.localStorage.getItem(DEMO_PANEL_LAYOUT_STORAGE_KEY);
+		const parsed = raw
+			? (JSON.parse(raw) as PersistedDemoPanelLayoutStore)
+			: null;
+		const nextScenes: Partial<Record<DemoSceneId, PersistedDemoPanelLayout>> =
+			parsed?.scenes && typeof parsed.scenes === "object"
+				? { ...parsed.scenes }
+				: {};
+		if (
+			(!parsed?.scenes || typeof parsed.scenes !== "object") &&
+			parsed &&
+			typeof parsed.sceneId === "string"
+		) {
+			nextScenes[parsed.sceneId] = {
+				edge: parsed.edge,
+				x: parsed.x,
+				y: parsed.y,
+				collapsed: parsed.collapsed,
+			};
+		}
+		nextScenes[sceneId] = { ...layout };
 		window.localStorage.setItem(
 			DEMO_PANEL_LAYOUT_STORAGE_KEY,
 			JSON.stringify({
-				...layout,
-				sceneId,
-			} satisfies PersistedDemoPanelLayout),
+				scenes: nextScenes,
+			} satisfies PersistedDemoPanelLayoutStore),
 		);
 	} catch {
 		// ignore storage failures

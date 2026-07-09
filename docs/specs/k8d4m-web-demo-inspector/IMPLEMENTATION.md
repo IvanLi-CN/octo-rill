@@ -6,7 +6,7 @@
 - Implementation: 已交付
 - Created: 2026-07-08
 - Last: 2026-07-09
-- Summary: fast-track / `/demo/` runtime + floating inspector + Pages assembly 已落地，最后补齐了 deep-link query 保真、MSW 漏拦截、inspector live snapshot 同步、native anchor `/demo` share-state 保真、demo boot failure 安全兜底，以及桌面态 toast 避让 + 视口内高度钳制 + tall viewport 自适应长高，并进一步收口为双态桌面合同：常规宽度保持真正的悬浮覆盖层，超宽视口切到根层双栏 left-docked frame，同时保留按 scene 选择默认停靠边位与 PAT 固定假 mask，确保 simulated write 可点击且 mock surface 不回显 secret 前缀；review-loop 追加修正了超宽根层 frame 的盒模型，使 docked 模式的总宽度不会因 `padding-left` 叠加而顶出视口，并把 inspector 布局存储收口为 per-scene 语义，确保从 Dashboard 切到 Settings / Public Release 时会重新应用左侧默认停靠位而不被旧的右侧布局污染
+- Summary: fast-track / `/demo/` runtime + floating inspector + Pages assembly 已落地，最后补齐了 deep-link query 保真、MSW 漏拦截、inspector live snapshot 同步、native anchor `/demo` share-state 保真、demo boot failure 安全兜底，以及桌面态 toast 避让 + 视口内高度钳制 + tall viewport 自适应长高，并进一步收口为双态桌面合同：常规宽度保持真正的悬浮覆盖层，超宽视口切到根层双栏 left-docked frame，同时保留按 scene 选择默认停靠边位与 PAT 固定假 mask，确保 simulated write 可点击且 mock surface 不回显 secret 前缀；review-loop 追加修正了超宽根层 frame 的盒模型，使 docked 模式的总宽度不会因 `padding-left` 叠加而顶出视口，并把 inspector 布局存储升级为真正的 per-scene map，确保从 Dashboard 切到 Settings / Public Release 时会重新应用左侧默认停靠位，同时多个 scene 的自定义位置也能并存持久化
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
