@@ -213,9 +213,33 @@ type PublicReleaseStoryMode =
 	| "loading"
 	| "pending"
 	| "list"
+	| "owned-public-ready"
 	| "detail"
 	| "detail-long"
 	| "error";
+
+const ownedPublicReleaseItems = [
+	{
+		...releaseItems[0],
+		repo_full_name: "IvanLi-CN/tuckmark",
+		tag_name: "v0.2.0-preview.11",
+		previous_tag_name: "v0.1.2-preview.8",
+		name: "v0.2.0-preview.11",
+		html_url:
+			"https://github.com/IvanLi-CN/tuckmark/releases/tag/v0.2.0-preview.11",
+		body: "Tuckmark release v0.2.0-preview.11",
+	},
+	{
+		...releaseItems[1],
+		repo_full_name: "IvanLi-CN/tuckmark",
+		tag_name: "v0.1.2-preview.8",
+		previous_tag_name: null,
+		name: "v0.1.2-preview.8",
+		html_url:
+			"https://github.com/IvanLi-CN/tuckmark/releases/tag/v0.1.2-preview.8",
+		body: "Tuckmark release v0.1.2-preview.8",
+	},
+];
 
 function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 	const storyWindow = window as StoryWindow;
@@ -265,6 +289,20 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 					},
 				);
 			}
+			if (mode === "owned-public-ready") {
+				return new Response(
+					JSON.stringify({
+						status: "ready",
+						repo_full_name: "IvanLi-CN/tuckmark",
+						next_cursor: null,
+						items: ownedPublicReleaseItems,
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "application/json" },
+					},
+				);
+			}
 			const limit = Number(url.searchParams.get("limit") ?? "6");
 			const cursor = url.searchParams.get("cursor");
 			const start = cursor ? Number(cursor.split("|").at(-1) ?? "0") : 0;
@@ -306,11 +344,13 @@ function PublicReleaseStory(props: { mode: PublicReleaseStoryMode }) {
 	return (
 		<VersionMonitorStateProvider value={publicReleaseVersionState}>
 			<PublicReleasePage
-				owner="octo-rill"
+				owner={props.mode === "owned-public-ready" ? "IvanLi-CN" : "octo-rill"}
 				repo={
-					props.mode === "detail-long"
-						? "example-repository-name-that-is-intentionally-long-for-mobile-layout-proof"
-						: "example"
+					props.mode === "owned-public-ready"
+						? "tuckmark"
+						: props.mode === "detail-long"
+							? "example-repository-name-that-is-intentionally-long-for-mobile-layout-proof"
+							: "example"
 				}
 				tag={
 					props.mode === "detail" || props.mode === "detail-long"
@@ -384,6 +424,22 @@ export const LoadingKnownData: Story = {
 export const ReleaseList: Story = {
 	args: { mode: "list" },
 	play: async ({ canvasElement }) => {
+		await expectPublicReleaseFooterVersion(canvasElement);
+	},
+};
+
+export const OwnedPublicCacheReady: Story = {
+	args: { mode: "owned-public-ready" },
+	play: async ({ canvas, canvasElement }) => {
+		await expect(
+			canvas.getByRole("heading", { name: "IvanLi-CN/tuckmark" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("link", { name: "v0.2.0-preview.11" }),
+		).toBeVisible();
+		await expect(
+			canvas.queryByText("Release 数据同步中"),
+		).not.toBeInTheDocument();
 		await expectPublicReleaseFooterVersion(canvasElement);
 	},
 };

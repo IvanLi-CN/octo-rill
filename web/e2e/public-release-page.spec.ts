@@ -257,6 +257,40 @@ test("public release list requests six cached releases before loading more", asy
 	await expectPublicChrome(page, "octo-rill", "example");
 });
 
+test("public owned cached repo shows ready list instead of pending sync", async ({
+	page,
+}) => {
+	await installBaseApiMocks(page, (route) => {
+		return json(route, {
+			status: "ready",
+			repo_full_name: "IvanLi-CN/tuckmark",
+			next_cursor: null,
+			items: [
+				releaseItem(0, {
+					repo_full_name: "IvanLi-CN/tuckmark",
+					tag_name: "v0.2.0-preview.11",
+					previous_tag_name: "v0.1.2-preview.8",
+					name: "v0.2.0-preview.11",
+					html_url:
+						"https://github.com/IvanLi-CN/tuckmark/releases/tag/v0.2.0-preview.11",
+					body: "Tuckmark release v0.2.0-preview.11",
+				}),
+			],
+		});
+	});
+
+	await page.goto("/IvanLi-CN/tuckmark/releases");
+
+	await expect(
+		page.getByRole("heading", { name: "IvanLi-CN/tuckmark" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("link", { name: "v0.2.0-preview.11" }),
+	).toBeVisible();
+	await expect(page.getByText("Release 数据同步中")).not.toBeVisible();
+	await expectPublicChrome(page, "IvanLi-CN", "tuckmark");
+});
+
 test("public release detail keeps the shared chrome stable", async ({
 	page,
 }) => {
