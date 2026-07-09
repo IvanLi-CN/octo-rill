@@ -220,6 +220,8 @@ export function readDashboardWarmSnapshot(input: {
 	if (!isFresh(cached.savedAt, STARTUP_WARM_TTL_MS, input.now)) return null;
 	const cachedActiveReleaseLocatorKey =
 		cached.routeState.activeReleaseLocatorKey ?? null;
+	const cachedActiveAnnouncementLocatorKey =
+		cached.routeState.activeAnnouncementLocatorKey ?? null;
 	const cachedReleaseReturnTab = cached.routeState.releaseReturnTab ?? "briefs";
 	const cachedScopeSignature = cached.routeState.scopeSignature ?? null;
 	if (
@@ -228,6 +230,8 @@ export function readDashboardWarmSnapshot(input: {
 		cached.routeState.activeReleaseId !== input.routeState.activeReleaseId ||
 		cachedActiveReleaseLocatorKey !==
 			input.routeState.activeReleaseLocatorKey ||
+		cachedActiveAnnouncementLocatorKey !==
+			input.routeState.activeAnnouncementLocatorKey ||
 		cachedReleaseReturnTab !== input.routeState.releaseReturnTab
 	) {
 		return null;
@@ -238,6 +242,7 @@ export function readDashboardWarmSnapshot(input: {
 			...cached.routeState,
 			scopeSignature: cachedScopeSignature,
 			activeReleaseLocatorKey: cachedActiveReleaseLocatorKey,
+			activeAnnouncementLocatorKey: cachedActiveAnnouncementLocatorKey,
 			releaseReturnTab: cachedReleaseReturnTab,
 		},
 	};

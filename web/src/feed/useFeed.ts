@@ -13,7 +13,11 @@ import type {
 	SmartItem,
 	TranslatedItem,
 } from "@/feed/types";
-import { isReleaseFeedItem, isSocialFeedItem } from "@/feed/types";
+import {
+	isLaneCapableFeedItem,
+	isReleaseFeedItem,
+	isSocialFeedItem,
+} from "@/feed/types";
 import {
 	describeNetworkAwareError,
 	type NetworkErrorKind,
@@ -329,7 +333,7 @@ export function useFeed(
 							...current,
 							items: current.items.map((it) => {
 								if (itemKey(it) !== key) return it;
-								if (!isReleaseFeedItem(it)) return it;
+								if (!isLaneCapableFeedItem(it)) return it;
 								return {
 									...it,
 									translated: { ...translated },
@@ -351,7 +355,7 @@ export function useFeed(
 							...current,
 							items: current.items.map((it) => {
 								if (itemKey(it) !== key) return it;
-								if (!isReleaseFeedItem(it)) return it;
+								if (!isLaneCapableFeedItem(it)) return it;
 								return {
 									...it,
 									smart: { ...smart },

@@ -103,11 +103,20 @@ export type ReleaseFeedItem = FeedItemBase & {
 	reactions: ReleaseReactions | null;
 };
 
+export type AnnouncementFeedItem = FeedItemBase & {
+	kind: "announcement";
+	discussion_number: number | null;
+	discussion_key: string | null;
+	actor: FeedActor | null;
+	translated: TranslatedItem | null;
+	smart: SmartItem | null;
+	reactions: null;
+};
+
 export type SocialFeedItem = FeedItemBase & {
 	kind:
 		| "repo_star_received"
 		| "follower_received"
-		| "announcement"
 		| "release_update"
 		| "repo_forked";
 	actor: FeedActor;
@@ -116,17 +125,28 @@ export type SocialFeedItem = FeedItemBase & {
 	reactions: null;
 };
 
-export type FeedItem = ReleaseFeedItem | SocialFeedItem;
+export type FeedItem = ReleaseFeedItem | AnnouncementFeedItem | SocialFeedItem;
 
 export function isReleaseFeedItem(item: FeedItem): item is ReleaseFeedItem {
 	return item.kind === "release";
+}
+
+export function isAnnouncementFeedItem(
+	item: FeedItem,
+): item is AnnouncementFeedItem {
+	return item.kind === "announcement";
+}
+
+export function isLaneCapableFeedItem(
+	item: FeedItem,
+): item is ReleaseFeedItem | AnnouncementFeedItem {
+	return item.kind === "release" || item.kind === "announcement";
 }
 
 export function isSocialFeedItem(item: FeedItem): item is SocialFeedItem {
 	return (
 		item.kind === "repo_star_received" ||
 		item.kind === "follower_received" ||
-		item.kind === "announcement" ||
 		item.kind === "release_update" ||
 		item.kind === "repo_forked"
 	);
