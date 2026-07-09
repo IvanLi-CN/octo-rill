@@ -40,6 +40,7 @@ const SESSION_PENDING_ACCESS_SYNC_REASON: &str = "pending_access_sync_reason";
 const SESSION_ACTIVITY_TOUCHED_AT: &str = "activity_touched_at";
 const SESSION_ACTIVITY_TOUCH_INTERVAL_SECS: i64 = 15 * 60;
 const ACCESS_SYNC_REASON_INACTIVE_OVER_1H: &str = "inactive_over_1h";
+const GITHUB_DISCUSSION_PATH_SEGMENT: &str = "/discussions/";
 const ADMIN_DASHBOARD_TASK_TYPES: [(&str, &str); 3] = [
     (jobs::TASK_TRANSLATE_RELEASE_BATCH, "翻译"),
     (jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH, "润色"),
@@ -48,6 +49,62 @@ const ADMIN_DASHBOARD_TASK_TYPES: [(&str, &str); 3] = [
 
 fn resolve_release_full_name(html_url: &str, repo_id: i64) -> String {
     parse_repo_full_name_from_release_url(html_url).unwrap_or_else(|| format!("unknown/{repo_id}"))
+}
+
+pub(crate) fn parse_discussion_number_from_github_url(html_url: &str) -> Option<i64> {
+    let parsed = url::Url::parse(html_url).ok()?;
+    if !matches!(parsed.host_str(), Some("github.com" | "www.github.com")) {
+        return None;
+    }
+    let (_, number_raw) = parsed.path().split_once(GITHUB_DISCUSSION_PATH_SEGMENT)?;
+    number_raw
+        .split('/')
+        .next()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+}
+
+pub(crate) fn announcement_discussion_key(repo_full_name: &str, discussion_number: i64) -> String {
+    format!(
+        "{}#{discussion_number}",
+        repo_full_name.trim().to_ascii_lowercase()
+    )
+}
+
+pub(crate) fn parse_announcement_discussion_key(raw: &str) -> Option<(String, i64)> {
+    let (repo_full_name, discussion_number_raw) = raw.trim().rsplit_once('#')?;
+    let discussion_number = discussion_number_raw.trim().parse::<i64>().ok()?;
+    let repo_full_name = repo_full_name.trim().trim_matches('/').to_ascii_lowercase();
+    if repo_full_name.is_empty() || !repo_full_name.contains('/') {
+        return None;
+    }
+    Some((repo_full_name, discussion_number))
+}
+
+pub(crate) fn announcement_translation_metadata_text(
+    repo_full_name: &str,
+    discussion_number: Option<i64>,
+) -> String {
+    let mut metadata = repo_full_name.trim().to_owned();
+    if let Some(discussion_number) = discussion_number {
+        metadata.push('\n');
+        metadata.push_str("discussion_number=");
+        metadata.push_str(discussion_number.to_string().as_str());
+    }
+    metadata
+}
+
+pub(crate) fn parse_announcement_translation_metadata(raw: &str) -> (String, Option<i64>) {
+    let mut lines = raw.lines().map(str::trim).filter(|line| !line.is_empty());
+    let repo_full_name = lines.next().unwrap_or_default().to_owned();
+    let discussion_number = lines.find_map(|line| {
+        line.strip_prefix("discussion_number=")
+            .and_then(|value| value.trim().parse::<i64>().ok())
+    });
+    (repo_full_name, discussion_number)
+}
+
+fn graphql_string_literal(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
 }
 
 fn extract_brief_release_refs(markdown: &str) -> Vec<InternalReleaseRef> {
@@ -7369,6 +7426,594 @@ pub async fn get_release_detail_by_repo_tag(
     ))
 }
 
+#[derive(Debug, Serialize)]
+pub struct AnnouncementDetailResponse {
+    repo_full_name: String,
+    discussion_number: i64,
+    discussion_key: String,
+    repo_visual: Option<RepoVisual>,
+    title: String,
+    body: Option<String>,
+    html_url: String,
+    occurred_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actor: Option<FeedActor>,
+    translated: Option<TranslatedItem>,
+    smart: Option<SmartItem>,
+}
+
+#[derive(Debug, Clone)]
+struct AnnouncementDetailSource {
+    repo_full_name: String,
+    discussion_number: i64,
+    repo_visual: Option<RepoVisual>,
+    title: String,
+    body: Option<String>,
+    html_url: String,
+    occurred_at: Option<String>,
+    actor: Option<FeedActor>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AnnouncementDetailDbRow {
+    repo_full_name: Option<String>,
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: Option<i64>,
+    discussion_number: Option<i64>,
+    title: Option<String>,
+    body: Option<String>,
+    html_url: Option<String>,
+    occurred_at: Option<String>,
+    actor_login: Option<String>,
+    actor_avatar_url: Option<String>,
+    actor_html_url: Option<String>,
+}
+
+#[derive(Debug, Default, sqlx::FromRow)]
+struct AnnouncementTranslationStateRow {
+    trans_source_hash: Option<String>,
+    trans_status: Option<String>,
+    trans_title: Option<String>,
+    trans_summary: Option<String>,
+    trans_error_text: Option<String>,
+    trans_work_status: Option<String>,
+    smart_source_hash: Option<String>,
+    smart_status: Option<String>,
+    smart_title: Option<String>,
+    smart_summary: Option<String>,
+    smart_error_text: Option<String>,
+    smart_work_status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlAnnouncementDetailData {
+    repository: Option<GraphQlAnnouncementRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlAnnouncementRepository {
+    name_with_owner: Option<String>,
+    open_graph_image_url: Option<String>,
+    owner: Option<GraphQlAnnouncementRepositoryOwner>,
+    discussion: Option<GraphQlAnnouncementNode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlAnnouncementRepositoryOwner {
+    avatar_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlAnnouncementNode {
+    number: i64,
+    title: String,
+    body: Option<String>,
+    url: String,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    category: Option<GraphQlAnnouncementCategory>,
+    author: Option<GraphQlAnnouncementAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlAnnouncementCategory {
+    name: Option<String>,
+    slug: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlAnnouncementAuthor {
+    login: Option<String>,
+    avatar_url: Option<String>,
+    url: Option<String>,
+}
+
+fn is_announcement_category_match(slug: Option<&str>, name: Option<&str>) -> bool {
+    let slug = slug.unwrap_or_default().trim().to_ascii_lowercase();
+    let name = name.unwrap_or_default().trim().to_ascii_lowercase();
+    matches!(slug.as_str(), "announcement" | "announcements")
+        || matches!(name.as_str(), "announcement" | "announcements")
+}
+
+fn parse_discussion_number_param(raw: &str) -> Result<i64, ApiError> {
+    let discussion_number = raw
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| ApiError::bad_request("discussion number must be an integer"))?;
+    if discussion_number <= 0 {
+        return Err(ApiError::bad_request(
+            "discussion number must be a positive integer",
+        ));
+    }
+    Ok(discussion_number)
+}
+
+async fn fetch_announcement_detail_source_from_db(
+    state: &AppState,
+    user_id: &str,
+    owner: &str,
+    repo: &str,
+    discussion_number: i64,
+) -> Result<Option<AnnouncementDetailSource>, ApiError> {
+    let repo_full_name = format!("{owner}/{repo}");
+    let row = sqlx::query_as::<_, AnnouncementDetailDbRow>(
+        r#"
+        SELECT
+          e.repo_full_name,
+          e.repo_owner_avatar_url AS owner_avatar_url,
+          e.repo_open_graph_image_url AS open_graph_image_url,
+          e.repo_uses_custom_open_graph_image AS uses_custom_open_graph_image,
+          e.discussion_number,
+          e.title,
+          e.body,
+          e.html_url,
+          e.occurred_at,
+          e.actor_login,
+          e.actor_avatar_url,
+          e.actor_html_url
+        FROM social_activity_events e
+        WHERE e.user_id = ?
+          AND e.kind = 'announcement'
+          AND lower(e.repo_full_name) = lower(?)
+          AND e.discussion_number = ?
+        ORDER BY e.occurred_at DESC, e.id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(repo_full_name.as_str())
+    .bind(discussion_number)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(row.map(|row| AnnouncementDetailSource {
+        repo_full_name: row.repo_full_name.unwrap_or(repo_full_name),
+        discussion_number: row
+            .discussion_number
+            .or_else(|| {
+                row.html_url
+                    .as_deref()
+                    .and_then(parse_discussion_number_from_github_url)
+            })
+            .unwrap_or(discussion_number),
+        repo_visual: repo_visual_from_parts(
+            row.owner_avatar_url,
+            row.open_graph_image_url,
+            row.uses_custom_open_graph_image.unwrap_or(0) != 0,
+        ),
+        title: row
+            .title
+            .unwrap_or_else(|| format!("Discussion #{discussion_number}")),
+        body: row.body,
+        html_url: row.html_url.unwrap_or_else(|| {
+            format!("https://github.com/{owner}/{repo}/discussions/{discussion_number}")
+        }),
+        occurred_at: row.occurred_at,
+        actor: row.actor_login.map(|login| FeedActor {
+            login,
+            avatar_url: row.actor_avatar_url,
+            html_url: row.actor_html_url,
+        }),
+    }))
+}
+
+async fn fetch_live_announcement_detail_request(
+    state: &AppState,
+    access_token: &str,
+    owner: &str,
+    repo: &str,
+    discussion_number: i64,
+) -> Result<Option<AnnouncementDetailSource>, ApiError> {
+    let query = format!(
+        r#"
+        query {{
+          repository(owner: {owner}, name: {repo}) {{
+            nameWithOwner
+            openGraphImageUrl
+            owner {{
+              avatarUrl
+            }}
+            discussion(number: {discussion_number}) {{
+              number
+              title
+              body
+              url
+              createdAt
+              updatedAt
+              category {{
+                name
+                slug
+              }}
+              author {{
+                login
+                avatarUrl
+                url
+              }}
+            }}
+          }}
+        }}
+        "#,
+        owner = graphql_string_literal(owner),
+        repo = graphql_string_literal(repo),
+        discussion_number = discussion_number,
+    );
+
+    let response = state
+        .http
+        .post(state.github_graphql_url.clone())
+        .bearer_auth(access_token)
+        .header(reqwest::header::USER_AGENT, "OctoRill")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(&json!({ "query": query }))
+        .send()
+        .await
+        .map_err(ApiError::internal)?;
+
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        let headers = response.headers().clone();
+        let body = response.text().await.map_err(ApiError::internal)?;
+        if let Some(err) = github_graphql_http_error(status, &headers, &body) {
+            return Err(err);
+        }
+        return Err(ApiError::internal(format!(
+            "github graphql returned {status}: {body}"
+        )));
+    }
+
+    let response = response.error_for_status().map_err(ApiError::internal)?;
+    let body = response.text().await.map_err(ApiError::internal)?;
+    let parsed = serde_json::from_str::<GraphQlResponse<GraphQlAnnouncementDetailData>>(&body)
+        .map_err(ApiError::internal)?;
+    if let Some(errors) = parsed.errors
+        && !errors.is_empty()
+    {
+        if let Some(err) = github_graphql_errors_to_api_error(&errors) {
+            return Err(err);
+        }
+        let message = errors
+            .into_iter()
+            .map(|error| error.message)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::internal(format!(
+            "github graphql error: {message}"
+        )));
+    }
+
+    let Some(repository) = parsed.data.and_then(|data| data.repository) else {
+        return Ok(None);
+    };
+    let Some(discussion) = repository.discussion else {
+        return Ok(None);
+    };
+    if !is_announcement_category_match(
+        discussion
+            .category
+            .as_ref()
+            .and_then(|category| category.slug.as_deref()),
+        discussion
+            .category
+            .as_ref()
+            .and_then(|category| category.name.as_deref()),
+    ) {
+        return Ok(None);
+    }
+
+    Ok(Some(AnnouncementDetailSource {
+        repo_full_name: repository
+            .name_with_owner
+            .unwrap_or_else(|| format!("{owner}/{repo}")),
+        discussion_number: discussion.number,
+        repo_visual: repo_visual_from_parts(
+            repository.owner.and_then(|owner| owner.avatar_url),
+            repository.open_graph_image_url,
+            false,
+        ),
+        title: discussion.title,
+        body: discussion.body,
+        html_url: discussion.url,
+        occurred_at: discussion.updated_at.or(discussion.created_at),
+        actor: discussion.author.and_then(|author| {
+            let login = author.login?.trim().to_owned();
+            if login.is_empty() {
+                return None;
+            }
+            Some(FeedActor {
+                login,
+                avatar_url: author.avatar_url,
+                html_url: author.url,
+            })
+        }),
+    }))
+}
+
+async fn fetch_live_announcement_detail_for_user(
+    state: &AppState,
+    user_id: &str,
+    owner: &str,
+    repo: &str,
+    discussion_number: i64,
+) -> Result<Option<AnnouncementDetailSource>, ApiError> {
+    let connections = state
+        .load_github_connections(user_id)
+        .await
+        .map_err(|err| ApiError::internal(format!("load github connections failed: {err}")))?;
+    let mut last_auth_error: Option<ApiError> = None;
+
+    for connection in connections {
+        match fetch_live_announcement_detail_request(
+            state,
+            connection.access_token.as_str(),
+            owner,
+            repo,
+            discussion_number,
+        )
+        .await
+        {
+            Ok(detail) => return Ok(detail),
+            Err(err) if matches!(err.code(), "reauth_required" | "forbidden") => {
+                last_auth_error = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    if let Some(err) = last_auth_error {
+        return Err(err);
+    }
+
+    Ok(None)
+}
+
+async fn load_announcement_translation_state(
+    state: &AppState,
+    user_id: &str,
+    discussion_key: &str,
+) -> Result<AnnouncementTranslationStateRow, ApiError> {
+    let row = sqlx::query_as::<_, AnnouncementTranslationStateRow>(
+        r#"
+        SELECT
+          t.source_hash AS trans_source_hash,
+          t.status AS trans_status,
+          t.title AS trans_title,
+          t.summary AS trans_summary,
+          t.error_text AS trans_error_text,
+          tw.status AS trans_work_status,
+          s.source_hash AS smart_source_hash,
+          s.status AS smart_status,
+          s.title AS smart_title,
+          s.summary AS smart_summary,
+          s.error_text AS smart_error_text,
+          sw.status AS smart_work_status
+        FROM (SELECT 1) seed
+        LEFT JOIN ai_translations t
+          ON t.user_id = ?
+          AND t.entity_type = 'announcement_detail'
+          AND t.entity_id = ?
+          AND t.lang = 'zh-CN'
+          AND t.status IN ('ready', 'disabled', 'missing', 'error')
+        LEFT JOIN translation_work_items tw
+          ON tw.id = t.active_work_item_id
+        LEFT JOIN ai_translations s
+          ON s.user_id = ?
+          AND s.entity_type = 'announcement_smart'
+          AND s.entity_id = ?
+          AND s.lang = 'zh-CN'
+          AND s.status IN ('ready', 'disabled', 'missing', 'error')
+        LEFT JOIN translation_work_items sw
+          ON sw.id = s.active_work_item_id
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(discussion_key)
+    .bind(user_id)
+    .bind(discussion_key)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(row.unwrap_or_default())
+}
+
+async fn build_announcement_detail_response(
+    state: &AppState,
+    user_id: &str,
+    source: AnnouncementDetailSource,
+) -> Result<AnnouncementDetailResponse, ApiError> {
+    let discussion_key =
+        announcement_discussion_key(&source.repo_full_name, source.discussion_number);
+    let translation_state =
+        load_announcement_translation_state(state, user_id, discussion_key.as_str()).await?;
+    let original_body = source.body.clone().unwrap_or_default();
+    let source_hash = announcement_detail_source_hash(
+        &source.repo_full_name,
+        Some(source.discussion_number),
+        source.title.as_str(),
+        original_body.as_str(),
+    );
+    let smart_source_hash = crate::translations::announcement_smart_feed_source_hash(
+        discussion_key.as_str(),
+        source.repo_full_name.as_str(),
+        Some(source.discussion_number),
+        source.title.as_str(),
+        source.body.as_deref(),
+    );
+    let translation_fresh =
+        translation_state.trans_source_hash.as_deref() == Some(source_hash.as_str());
+    let smart_fresh =
+        translation_state.smart_source_hash.as_deref() == Some(smart_source_hash.as_str());
+    let translation_refresh_in_flight = !translation_fresh
+        && translation_state.trans_status.as_deref() == Some("ready")
+        && matches!(
+            translation_state.trans_work_status.as_deref(),
+            Some("queued" | "batched" | "running")
+        );
+    let smart_refresh_in_flight = !smart_fresh
+        && translation_state.smart_status.as_deref() == Some("ready")
+        && matches!(
+            translation_state.smart_work_status.as_deref(),
+            Some("queued" | "batched" | "running")
+        );
+
+    let translated = if state.config.ai.is_none() {
+        Some(translated_item("disabled", None, None, None, None))
+    } else if translation_fresh {
+        if let Some(status) = translation_state.trans_status.as_deref()
+            && status != "ready"
+        {
+            translated_terminal_item(status, translation_state.trans_error_text.as_deref())
+        } else {
+            let (title, summary) = normalize_translation_fields(
+                translation_state.trans_title.clone(),
+                translation_state.trans_summary.clone(),
+            );
+            if !release_detail_translation_ready(Some(original_body.as_str()), summary.as_deref()) {
+                Some(translated_item(
+                    "error",
+                    None,
+                    None,
+                    Some(false),
+                    Some(ANNOUNCEMENT_DETAIL_MARKDOWN_MISMATCH_ERROR),
+                ))
+            } else {
+                Some(translated_item("ready", title, summary, None, None))
+            }
+        }
+    } else if translation_refresh_in_flight {
+        translated_ready_item(
+            translation_state.trans_title.clone(),
+            translation_state.trans_summary.clone(),
+            Some(true),
+        )
+        .or_else(|| Some(translated_missing_item(false)))
+    } else {
+        Some(translated_missing_item(true))
+    };
+
+    let smart = if state.config.ai.is_none() {
+        Some(smart_item("disabled", None, None, None, None))
+    } else if smart_fresh {
+        if let Some(status) = translation_state.smart_status.as_deref()
+            && status != "ready"
+        {
+            smart_terminal_item(status, translation_state.smart_error_text.as_deref())
+        } else {
+            smart_ready_item(
+                translation_state.smart_title.clone(),
+                translation_state.smart_summary.clone(),
+                None,
+            )
+            .or_else(|| Some(smart_missing_item(None)))
+        }
+    } else if smart_refresh_in_flight {
+        smart_ready_item(
+            translation_state.smart_title.clone(),
+            translation_state.smart_summary.clone(),
+            Some(true),
+        )
+        .or_else(|| Some(smart_missing_item(Some(false))))
+    } else {
+        Some(smart_missing_item(None))
+    };
+
+    Ok(AnnouncementDetailResponse {
+        repo_full_name: source.repo_full_name,
+        discussion_number: source.discussion_number,
+        discussion_key,
+        repo_visual: source.repo_visual,
+        title: source.title,
+        body: source.body,
+        html_url: source.html_url,
+        occurred_at: source.occurred_at,
+        actor: source.actor,
+        translated,
+        smart,
+    })
+}
+
+pub async fn get_announcement_detail(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    headers: HeaderMap,
+    Path((owner_raw, repo_raw, discussion_number_raw)): Path<(String, String, String)>,
+) -> Result<Json<AnnouncementDetailResponse>, ApiError> {
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
+    let owner = owner_raw.trim();
+    let repo = repo_raw.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return Err(ApiError::bad_request("owner and repo are required"));
+    }
+    let discussion_number = parse_discussion_number_param(&discussion_number_raw)?;
+
+    let cached_source = fetch_announcement_detail_source_from_db(
+        state.as_ref(),
+        user_id.as_str(),
+        owner,
+        repo,
+        discussion_number,
+    )
+    .await?;
+    let live_source = match fetch_live_announcement_detail_for_user(
+        state.as_ref(),
+        user_id.as_str(),
+        owner,
+        repo,
+        discussion_number,
+    )
+    .await
+    {
+        Ok(source) => source,
+        Err(err) if cached_source.is_some() => {
+            tracing::warn!(
+                ?err,
+                repo = format!("{owner}/{repo}"),
+                discussion_number,
+                "announcement detail live fetch failed; falling back to cached row"
+            );
+            None
+        }
+        Err(err) => return Err(err),
+    };
+
+    let source = live_source.or(cached_source).ok_or_else(|| {
+        ApiError::new(StatusCode::NOT_FOUND, "not_found", "announcement not found")
+    })?;
+
+    Ok(Json(
+        build_announcement_detail_response(state.as_ref(), user_id.as_str(), source).await?,
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PublicReleaseQuery {
     content: Option<String>,
@@ -11227,7 +11872,7 @@ pub struct RepoVisual {
     uses_custom_open_graph_image: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct FeedActor {
     login: String,
     avatar_url: Option<String>,
@@ -11240,6 +11885,10 @@ pub struct FeedItem {
     ts: String,
     id: String,
     repo_full_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discussion_number: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discussion_key: Option<String>,
     repo_visual: Option<RepoVisual>,
     title: Option<String>,
     body: Option<String>,
@@ -11316,10 +11965,12 @@ struct FeedRow {
     ts: String,
     id_key: String,
     entity_id: String,
+    translation_entity_id: Option<String>,
     #[allow(dead_code)]
     release_id: Option<i64>,
     release_node_id: Option<String>,
     repo_full_name: Option<String>,
+    discussion_number: Option<i64>,
     owner_avatar_url: Option<String>,
     open_graph_image_url: Option<String>,
     uses_custom_open_graph_image: Option<i64>,
@@ -11759,6 +12410,42 @@ pub(crate) fn release_feed_translation_source_hash(
     ))
 }
 
+pub(crate) fn announcement_detail_source_hash(
+    repo_full_name: &str,
+    discussion_number: Option<i64>,
+    original_title: &str,
+    original_body: &str,
+) -> String {
+    let normalized_body = original_body.replace("\r\n", "\n");
+    let source = format!(
+        "v=1\nkind=announcement_detail\nrepo={}\ndiscussion_number={}\ntitle={}\nbody={}\n",
+        repo_full_name.trim().to_ascii_lowercase(),
+        discussion_number
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        original_title.trim(),
+        normalized_body.trim(),
+    );
+    ai::sha256_hex(&source)
+}
+
+pub(crate) fn announcement_feed_translation_source_hash(
+    repo_full_name: &str,
+    discussion_number: Option<i64>,
+    title: &str,
+    body: Option<&str>,
+) -> String {
+    ai::sha256_hex(&format!(
+        "v=1\nkind=announcement\nrepo={}\ndiscussion_number={}\ntitle={}\nbody={}\n",
+        repo_full_name.trim().to_ascii_lowercase(),
+        discussion_number
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        title.trim(),
+        body.unwrap_or("").trim(),
+    ))
+}
+
 pub(crate) fn release_feed_body_is_over_limit(body: Option<&str>) -> bool {
     let Some(body) = body else {
         return false;
@@ -12095,6 +12782,8 @@ async fn fetch_feed_items(
             ts,
             id_key,
             entity_id,
+            entity_id AS translation_entity_id,
+            NULL AS discussion_number,
             release_id,
             release_node_id,
             repo_full_name,
@@ -12171,6 +12860,14 @@ async fn fetch_feed_items(
             e.occurred_at AS ts,
             e.id AS id_key,
             e.id AS entity_id,
+            CASE
+              WHEN e.kind = 'announcement'
+                AND e.repo_full_name IS NOT NULL
+                AND e.discussion_number IS NOT NULL
+              THEN lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT)
+              ELSE NULL
+            END AS translation_entity_id,
+            e.discussion_number AS discussion_number,
             NULL AS release_id,
             NULL AS release_node_id,
             e.repo_full_name AS repo_full_name,
@@ -12217,8 +12914,9 @@ async fn fetch_feed_items(
             AND (? = 0 OR (e.repo_full_name IS NOT NULL AND vr.repo_id IS NOT NULL))
         )
         SELECT
-          i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id, i.release_id, i.release_node_id,
+          i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id, i.translation_entity_id, i.release_id, i.release_node_id,
           i.repo_full_name, i.owner_avatar_url, i.open_graph_image_url, i.uses_custom_open_graph_image,
+          i.discussion_number,
           i.release_tag_name, i.release_previous_tag_name,
           i.title, i.subtitle, i.reason, i.subject_type, i.html_url, i.unread,
           i.actor_login, i.actor_avatar_url, i.actor_html_url,
@@ -12243,15 +12941,39 @@ async fn fetch_feed_items(
           sw.status AS smart_work_status
         FROM items i
         LEFT JOIN ai_translations t
-          ON t.user_id = ? AND t.entity_type = 'release' AND t.entity_id = i.entity_id AND t.lang = 'zh-CN' AND t.status IN ('ready', 'disabled', 'missing', 'error')
+          ON t.user_id = ?
+          AND t.entity_type = CASE
+            WHEN i.kind = 'release' THEN 'release'
+            WHEN i.kind = 'announcement' THEN 'announcement_detail'
+            ELSE NULL
+          END
+          AND t.entity_id = i.translation_entity_id
+          AND t.lang = 'zh-CN'
+          AND t.status IN ('ready', 'disabled', 'missing', 'error')
         LEFT JOIN translation_work_items tw
           ON tw.id = t.active_work_item_id
         LEFT JOIN ai_translations dt
-          ON dt.user_id = ? AND dt.entity_type = 'release_detail' AND dt.entity_id = i.entity_id AND dt.lang = 'zh-CN' AND dt.status IN ('ready', 'disabled', 'missing', 'error')
+          ON dt.user_id = ?
+          AND dt.entity_type = CASE
+            WHEN i.kind = 'release' THEN 'release_detail'
+            WHEN i.kind = 'announcement' THEN 'announcement_detail'
+            ELSE NULL
+          END
+          AND dt.entity_id = i.translation_entity_id
+          AND dt.lang = 'zh-CN'
+          AND dt.status IN ('ready', 'disabled', 'missing', 'error')
         LEFT JOIN translation_work_items dtw
           ON dtw.id = dt.active_work_item_id
         LEFT JOIN ai_translations s
-          ON s.user_id = ? AND s.entity_type = 'release_smart' AND s.entity_id = i.entity_id AND s.lang = 'zh-CN' AND s.status IN ('ready', 'disabled', 'missing', 'error')
+          ON s.user_id = ?
+          AND s.entity_type = CASE
+            WHEN i.kind = 'release' THEN 'release_smart'
+            WHEN i.kind = 'announcement' THEN 'announcement_smart'
+            ELSE NULL
+          END
+          AND s.entity_id = i.translation_entity_id
+          AND s.lang = 'zh-CN'
+          AND s.status IN ('ready', 'disabled', 'missing', 'error')
         LEFT JOIN translation_work_items sw
           ON sw.id = s.active_work_item_id
         WHERE (
@@ -12750,6 +13472,8 @@ const RELEASE_FEED_MARKDOWN_MISMATCH_ERROR: &str =
     "release translation failed to preserve markdown structure";
 const RELEASE_DETAIL_MARKDOWN_MISMATCH_ERROR: &str =
     "release detail translation failed to preserve markdown structure";
+const ANNOUNCEMENT_DETAIL_MARKDOWN_MISMATCH_ERROR: &str =
+    "announcement detail translation failed to preserve markdown structure";
 
 fn translation_error_metadata(
     error_text: Option<&str>,
@@ -12927,20 +13651,31 @@ fn feed_item_from_row(
         r.open_graph_image_url.clone(),
         r.uses_custom_open_graph_image.unwrap_or(0) != 0,
     );
+    let kind = r.kind.clone();
+    let discussion_key = r.repo_full_name.as_deref().zip(r.discussion_number).map(
+        |(repo_full_name, discussion_number)| {
+            announcement_discussion_key(repo_full_name, discussion_number)
+        },
+    );
+    let is_release_like = matches!(kind.as_str(), "release" | "announcement");
 
-    if r.kind != "release" {
-        let (body, body_truncated) = match r.kind.as_str() {
-            "announcement" => (
-                release_feed_body(r.release_body.as_deref()),
-                release_feed_body_is_over_limit(r.release_body.as_deref()),
-            ),
-            _ => (None, false),
-        };
+    let (body, body_truncated) = if is_release_like {
+        (
+            release_feed_body(r.release_body.as_deref()),
+            release_feed_body_is_over_limit(r.release_body.as_deref()),
+        )
+    } else {
+        (None, false)
+    };
+
+    if !is_release_like {
         return FeedItem {
-            kind: r.kind,
+            kind,
             ts: r.ts,
             id: r.entity_id,
             repo_full_name: r.repo_full_name,
+            discussion_number: None,
+            discussion_key: None,
             repo_visual,
             title: r.title,
             body,
@@ -12957,40 +13692,40 @@ fn feed_item_from_row(
         };
     }
 
-    let (body, body_truncated) = match r.kind.as_str() {
-        "release" => {
-            let body = release_feed_body(r.release_body.as_deref());
-            let body_truncated = release_feed_body_is_over_limit(r.release_body.as_deref());
-            (body, body_truncated)
-        }
-        _ => (None, false),
-    };
-
-    let smart_current_hash = match r.kind.as_str() {
-        "release" => crate::translations::release_smart_feed_source_hash(
-            r.entity_id.as_str(),
-            r.repo_full_name.as_deref().unwrap_or(""),
-            r.title.as_deref().unwrap_or(""),
-            body.as_deref(),
-            r.release_tag_name.as_deref().unwrap_or(""),
-            r.release_previous_tag_name.as_deref(),
-        ),
-        _ => String::new(),
-    };
+    let translation_entity_id = r
+        .translation_entity_id
+        .clone()
+        .or_else(|| discussion_key.clone());
 
     let translated = if !ai_enabled {
         Some(translated_item("disabled", None, None, None, None))
     } else {
-        let current_hash = release_feed_translation_source_hash(
-            r.repo_full_name.as_deref().unwrap_or(""),
-            r.title.as_deref().unwrap_or(""),
-            body.as_deref(),
-        );
-        let detail_current_hash = release_detail_source_hash(
-            r.repo_full_name.as_deref().unwrap_or(""),
-            r.title.as_deref().unwrap_or(""),
-            r.release_body.as_deref().unwrap_or(""),
-        );
+        let current_hash = match kind.as_str() {
+            "announcement" => announcement_feed_translation_source_hash(
+                r.repo_full_name.as_deref().unwrap_or(""),
+                r.discussion_number,
+                r.title.as_deref().unwrap_or(""),
+                body.as_deref(),
+            ),
+            _ => release_feed_translation_source_hash(
+                r.repo_full_name.as_deref().unwrap_or(""),
+                r.title.as_deref().unwrap_or(""),
+                body.as_deref(),
+            ),
+        };
+        let detail_current_hash = match kind.as_str() {
+            "announcement" => announcement_detail_source_hash(
+                r.repo_full_name.as_deref().unwrap_or(""),
+                r.discussion_number,
+                r.title.as_deref().unwrap_or(""),
+                r.release_body.as_deref().unwrap_or(""),
+            ),
+            _ => release_detail_source_hash(
+                r.repo_full_name.as_deref().unwrap_or(""),
+                r.title.as_deref().unwrap_or(""),
+                r.release_body.as_deref().unwrap_or(""),
+            ),
+        };
         let refresh_in_flight = r.trans_source_hash.as_deref() != Some(current_hash.as_str())
             && r.trans_status.as_deref() == Some("ready")
             && matches!(
@@ -13004,11 +13739,18 @@ fn feed_item_from_row(
                 r.detail_trans_work_status.as_deref(),
                 Some("queued" | "batched" | "running")
             );
+        let detail_mismatch_error = if kind == "announcement" {
+            ANNOUNCEMENT_DETAIL_MARKDOWN_MISMATCH_ERROR
+        } else {
+            RELEASE_DETAIL_MARKDOWN_MISMATCH_ERROR
+        };
+
         if r.detail_trans_source_hash.as_deref() == Some(detail_current_hash.as_str()) {
             if let Some(status) = r.detail_trans_status.as_deref()
                 && status != "ready"
             {
-                if !body_truncated
+                if kind == "release"
+                    && !body_truncated
                     && matches!(status, "missing" | "error")
                     && r.trans_source_hash.as_deref() == Some(current_hash.as_str())
                     && r.trans_status.as_deref() == Some("ready")
@@ -13029,7 +13771,8 @@ fn feed_item_from_row(
                 );
                 if !release_detail_translation_ready(r.release_body.as_deref(), summary.as_deref())
                 {
-                    if !body_truncated
+                    if kind == "release"
+                        && !body_truncated
                         && r.trans_source_hash.as_deref() == Some(current_hash.as_str())
                         && r.trans_status.as_deref() == Some("ready")
                     {
@@ -13045,7 +13788,7 @@ fn feed_item_from_row(
                             None,
                             None,
                             Some(false),
-                            Some(RELEASE_DETAIL_MARKDOWN_MISMATCH_ERROR),
+                            Some(detail_mismatch_error),
                         ))
                     }
                 } else {
@@ -13068,13 +13811,16 @@ fn feed_item_from_row(
                 } else {
                     Some(translated_missing_item(true))
                 }
-            } else {
+            } else if kind == "release" {
                 translated_release_feed_ready_item(
                     r.trans_title.clone(),
                     r.trans_summary.clone(),
                     body.as_deref(),
                     None,
                 )
+            } else {
+                translated_ready_item(r.trans_title.clone(), r.trans_summary.clone(), None)
+                    .or_else(|| Some(translated_missing_item(true)))
             }
         } else if refresh_in_flight {
             translated_ready_item(r.trans_title.clone(), r.trans_summary.clone(), Some(true))
@@ -13082,6 +13828,26 @@ fn feed_item_from_row(
         } else {
             Some(translated_missing_item(true))
         }
+    };
+
+    let smart_current_hash = match kind.as_str() {
+        "announcement" => crate::translations::announcement_smart_feed_source_hash(
+            translation_entity_id
+                .as_deref()
+                .unwrap_or_else(|| discussion_key.as_deref().unwrap_or(r.entity_id.as_str())),
+            r.repo_full_name.as_deref().unwrap_or(""),
+            r.discussion_number,
+            r.title.as_deref().unwrap_or(""),
+            r.release_body.as_deref(),
+        ),
+        _ => crate::translations::release_smart_feed_source_hash(
+            r.entity_id.as_str(),
+            r.repo_full_name.as_deref().unwrap_or(""),
+            r.title.as_deref().unwrap_or(""),
+            body.as_deref(),
+            r.release_tag_name.as_deref().unwrap_or(""),
+            r.release_previous_tag_name.as_deref(),
+        ),
     };
 
     let smart = if !ai_enabled {
@@ -13114,19 +13880,30 @@ fn feed_item_from_row(
         }
     };
 
-    let status = release_reactions_status(&r);
-    let mut counts = release_counts_from_row(&r);
-    let mut viewer = ReleaseReactionViewer::default();
-    if let Some(live) = live_reactions {
-        counts = live.counts.clone();
-        viewer = live.viewer.clone();
-    }
+    let reactions = if kind == "release" {
+        let status = release_reactions_status(&r);
+        let mut counts = release_counts_from_row(&r);
+        let mut viewer = ReleaseReactionViewer::default();
+        if let Some(live) = live_reactions {
+            counts = live.counts.clone();
+            viewer = live.viewer.clone();
+        }
+        Some(ReleaseReactions {
+            counts,
+            viewer,
+            status: status.to_owned(),
+        })
+    } else {
+        None
+    };
 
     FeedItem {
-        kind: r.kind,
+        kind,
         ts: r.ts,
         id: r.entity_id,
         repo_full_name: r.repo_full_name,
+        discussion_number: r.discussion_number,
+        discussion_key,
         repo_visual,
         title: r.title,
         body,
@@ -13136,14 +13913,14 @@ fn feed_item_from_row(
         subject_type: r.subject_type,
         html_url: r.html_url,
         unread: r.unread,
-        actor: None,
+        actor: if r.kind == "announcement" {
+            actor
+        } else {
+            None
+        },
         translated,
         smart,
-        reactions: Some(ReleaseReactions {
-            counts,
-            viewer,
-            status: status.to_owned(),
-        }),
+        reactions,
     }
 }
 
@@ -17371,6 +18148,448 @@ pub async fn translate_release_detail_batch(
     }))
 }
 
+async fn resolve_announcement_detail_source_for_user(
+    state: &AppState,
+    user_id: &str,
+    discussion_key_raw: &str,
+) -> Result<AnnouncementDetailSource, ApiError> {
+    let Some((repo_full_name, discussion_number)) =
+        parse_announcement_discussion_key(discussion_key_raw)
+    else {
+        return Err(ApiError::bad_request("invalid announcement discussion key"));
+    };
+    let Some((owner, repo)) = repo_full_name.split_once('/') else {
+        return Err(ApiError::bad_request("invalid announcement repository"));
+    };
+
+    let cached_source =
+        fetch_announcement_detail_source_from_db(state, user_id, owner, repo, discussion_number)
+            .await?;
+    let live_source = match fetch_live_announcement_detail_for_user(
+        state,
+        user_id,
+        owner,
+        repo,
+        discussion_number,
+    )
+    .await
+    {
+        Ok(source) => source,
+        Err(err) if cached_source.is_some() => {
+            tracing::warn!(
+                ?err,
+                repo = repo_full_name.as_str(),
+                discussion_number,
+                "announcement translation live fetch failed; falling back to cached row"
+            );
+            None
+        }
+        Err(err) => return Err(err),
+    };
+
+    live_source
+        .or(cached_source)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "announcement not found"))
+}
+
+async fn translate_announcement_detail_internal(
+    state: &AppState,
+    user_id: &str,
+    discussion_key_raw: &str,
+) -> Result<TranslateResponse, ApiError> {
+    if state.config.ai.is_none() {
+        return Ok(TranslateResponse {
+            lang: "zh-CN".to_owned(),
+            status: "disabled".to_owned(),
+            title: None,
+            summary: None,
+        });
+    }
+
+    let source =
+        resolve_announcement_detail_source_for_user(state, user_id, discussion_key_raw).await?;
+    let discussion_key =
+        announcement_discussion_key(&source.repo_full_name, source.discussion_number);
+    let original_title = source.title.trim().to_owned();
+    let original_body = source.body.unwrap_or_default();
+    let source_hash = announcement_detail_source_hash(
+        source.repo_full_name.as_str(),
+        Some(source.discussion_number),
+        original_title.as_str(),
+        original_body.as_str(),
+    );
+    let requested_at = chrono::Utc::now().to_rfc3339();
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct TranslationRow {
+        source_hash: String,
+        status: String,
+        title: Option<String>,
+        summary: Option<String>,
+        error_text: Option<String>,
+    }
+
+    let cached = sqlx::query_as::<_, TranslationRow>(
+        r#"
+        SELECT source_hash, status, title, summary, error_text
+        FROM ai_translations
+        WHERE user_id = ?
+          AND entity_type = 'announcement_detail'
+          AND entity_id = ?
+          AND lang = 'zh-CN'
+          AND status IN ('ready', 'disabled', 'missing', 'error')
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(discussion_key.as_str())
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    if let Some(cached) = cached
+        && cached.source_hash == source_hash
+    {
+        match cached.status.as_str() {
+            "ready"
+                if release_detail_translation_ready(
+                    Some(original_body.as_str()),
+                    cached.summary.as_deref(),
+                ) =>
+            {
+                return Ok(TranslateResponse {
+                    lang: "zh-CN".to_owned(),
+                    status: "ready".to_owned(),
+                    title: cached.title,
+                    summary: cached.summary,
+                });
+            }
+            "disabled" => {
+                return Ok(TranslateResponse {
+                    lang: "zh-CN".to_owned(),
+                    status: "disabled".to_owned(),
+                    title: None,
+                    summary: None,
+                });
+            }
+            "missing" => {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    cached
+                        .error_text
+                        .unwrap_or_else(|| "announcement not found".to_owned()),
+                ));
+            }
+            "error" => {
+                return Err(ApiError::internal(cached.error_text.unwrap_or_else(|| {
+                    "announcement detail translation failed".to_owned()
+                })));
+            }
+            _ => {}
+        }
+    }
+
+    mark_translation_requested(
+        state,
+        user_id,
+        requested_at.as_str(),
+        TranslationUpsert {
+            entity_type: "announcement_detail",
+            entity_id: discussion_key.as_str(),
+            lang: "zh-CN",
+            source_hash: &source_hash,
+            title: None,
+            summary: None,
+        },
+    )
+    .await?;
+
+    let translated_title = ai::chat_completion(
+        state,
+        "你是一个翻译助手，只把 GitHub 仓库公告标题翻译成自然中文。输出纯文本，不要解释。",
+        &format!(
+            "Repo: {}\nDiscussion: #{}\nOriginal title: {}\n\n输出中文标题：",
+            source.repo_full_name, source.discussion_number, original_title
+        ),
+        120,
+    )
+    .await
+    .ok()
+    .and_then(|output| {
+        let title = output.trim();
+        if title.is_empty() {
+            None
+        } else {
+            Some(title.to_owned())
+        }
+    });
+
+    let body_markdown = if original_body.trim().is_empty() {
+        String::new()
+    } else {
+        let chunk_budget = release_detail_chunk_budget(state).await;
+        let chunks = split_markdown_chunks(&original_body, chunk_budget.max_chars);
+        translate_release_detail_chunks_batched(
+            state,
+            chunk_budget,
+            source.repo_full_name.as_str(),
+            original_title.as_str(),
+            &chunks,
+        )
+        .await
+        .map(|translated_chunks| translated_chunks.join(""))
+        .map_err(|err| {
+            if err
+                .to_string()
+                .contains(RELEASE_DETAIL_MARKDOWN_MISMATCH_ERROR)
+            {
+                ApiError::internal(ANNOUNCEMENT_DETAIL_MARKDOWN_MISMATCH_ERROR)
+            } else {
+                err
+            }
+        })?
+    };
+    let translated_summary = (!body_markdown.trim().is_empty()).then_some(body_markdown);
+    if !release_detail_translation_ready(
+        Some(original_body.as_str()),
+        translated_summary.as_deref(),
+    ) {
+        return Err(ApiError::internal(
+            "announcement detail translation produced empty summary",
+        ));
+    }
+
+    upsert_translation(
+        state,
+        user_id,
+        requested_at.as_str(),
+        TranslationUpsert {
+            entity_type: "announcement_detail",
+            entity_id: discussion_key.as_str(),
+            lang: "zh-CN",
+            source_hash: &source_hash,
+            title: translated_title.as_deref(),
+            summary: translated_summary.as_deref(),
+        },
+    )
+    .await?;
+
+    Ok(TranslateResponse {
+        lang: "zh-CN".to_owned(),
+        status: "ready".to_owned(),
+        title: translated_title,
+        summary: translated_summary,
+    })
+}
+
+pub async fn translate_announcement_detail_for_user(
+    state: &AppState,
+    user_id: &str,
+    discussion_key_raw: &str,
+) -> Result<TranslateResponse, ApiError> {
+    translate_announcement_detail_internal(state, user_id, discussion_key_raw).await
+}
+
+async fn summarize_announcement_smart_internal(
+    state: &AppState,
+    user_id: &str,
+    discussion_key_raw: &str,
+) -> Result<TranslateResponse, ApiError> {
+    if state.config.ai.is_none() {
+        return Ok(TranslateResponse {
+            lang: "zh-CN".to_owned(),
+            status: "disabled".to_owned(),
+            title: None,
+            summary: None,
+        });
+    }
+
+    let source =
+        resolve_announcement_detail_source_for_user(state, user_id, discussion_key_raw).await?;
+    let discussion_key =
+        announcement_discussion_key(&source.repo_full_name, source.discussion_number);
+    let original_title = source.title.trim().to_owned();
+    let original_body = source.body.unwrap_or_default();
+    if original_body.trim().is_empty() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            SMART_NO_VALUABLE_VERSION_INFO,
+        ));
+    }
+
+    let source_hash = crate::translations::announcement_smart_feed_source_hash(
+        discussion_key.as_str(),
+        source.repo_full_name.as_str(),
+        Some(source.discussion_number),
+        original_title.as_str(),
+        Some(original_body.as_str()),
+    );
+    let requested_at = chrono::Utc::now().to_rfc3339();
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct TranslationRow {
+        source_hash: String,
+        status: String,
+        title: Option<String>,
+        summary: Option<String>,
+        error_text: Option<String>,
+    }
+
+    let cached = sqlx::query_as::<_, TranslationRow>(
+        r#"
+        SELECT source_hash, status, title, summary, error_text
+        FROM ai_translations
+        WHERE user_id = ?
+          AND entity_type = 'announcement_smart'
+          AND entity_id = ?
+          AND lang = 'zh-CN'
+          AND status IN ('ready', 'disabled', 'missing', 'error')
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(discussion_key.as_str())
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    if let Some(cached) = cached
+        && cached.source_hash == source_hash
+    {
+        match cached.status.as_str() {
+            "ready"
+                if cached
+                    .summary
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty()) =>
+            {
+                return Ok(TranslateResponse {
+                    lang: "zh-CN".to_owned(),
+                    status: "ready".to_owned(),
+                    title: cached.title,
+                    summary: cached.summary,
+                });
+            }
+            "disabled" => {
+                return Ok(TranslateResponse {
+                    lang: "zh-CN".to_owned(),
+                    status: "disabled".to_owned(),
+                    title: None,
+                    summary: None,
+                });
+            }
+            "missing" => {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    cached
+                        .error_text
+                        .unwrap_or_else(|| "announcement not found".to_owned()),
+                ));
+            }
+            "error" => {
+                return Err(ApiError::internal(
+                    cached
+                        .error_text
+                        .unwrap_or_else(|| "announcement polish failed".to_owned()),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    mark_translation_requested(
+        state,
+        user_id,
+        requested_at.as_str(),
+        TranslationUpsert {
+            entity_type: "announcement_smart",
+            entity_id: discussion_key.as_str(),
+            lang: "zh-CN",
+            source_hash: &source_hash,
+            title: None,
+            summary: None,
+        },
+    )
+    .await?;
+
+    let translated_title = ai::chat_completion(
+        state,
+        "你是一个中文编辑，只把 GitHub 仓库公告标题润色成自然、简洁、准确的中文。输出纯文本，不要解释。",
+        &format!(
+            "Repo: {}\nDiscussion: #{}\nOriginal title: {}\n\n输出润色后的中文标题：",
+            source.repo_full_name, source.discussion_number, original_title
+        ),
+        120,
+    )
+    .await
+    .ok()
+    .and_then(|output| {
+        let title = output.trim();
+        if title.is_empty() {
+            None
+        } else {
+            Some(title.to_owned())
+        }
+    });
+
+    let polished_summary = ai::chat_completion(
+        state,
+        "你是一个技术公告编辑助手，负责把 GitHub 仓库公告整理成适合快速阅读的中文 Markdown。",
+        &format!(
+            "Repo: {}\nDiscussion: #{}\nTitle: {}\n\nAnnouncement body (Markdown):\n{}\n\n请整理成中文 Markdown，要求：\n1) 保留原始事实、限制、链接 URL、代码与命令；\n2) 优先输出 3-6 条要点，必要时保留小标题；\n3) 不新增事实，不掺入主观评价；\n4) 只输出 Markdown，不要解释。",
+            source.repo_full_name,
+            source.discussion_number,
+            original_title,
+            original_body,
+        ),
+        480,
+    )
+    .await
+    .map_err(ApiError::internal)?
+    .trim()
+    .to_owned();
+
+    if polished_summary.is_empty() {
+        return Err(ApiError::internal(
+            "announcement polish produced empty summary",
+        ));
+    }
+
+    upsert_translation(
+        state,
+        user_id,
+        requested_at.as_str(),
+        TranslationUpsert {
+            entity_type: "announcement_smart",
+            entity_id: discussion_key.as_str(),
+            lang: "zh-CN",
+            source_hash: &source_hash,
+            title: translated_title.as_deref(),
+            summary: Some(polished_summary.as_str()),
+        },
+    )
+    .await?;
+
+    Ok(TranslateResponse {
+        lang: "zh-CN".to_owned(),
+        status: "ready".to_owned(),
+        title: translated_title,
+        summary: Some(polished_summary),
+    })
+}
+
+pub async fn summarize_announcement_smart_for_user(
+    state: &AppState,
+    user_id: &str,
+    discussion_key_raw: &str,
+) -> Result<TranslateResponse, ApiError> {
+    summarize_announcement_smart_internal(state, user_id, discussion_key_raw).await
+}
+
 #[derive(Debug, Clone)]
 struct NotificationBatchCandidate {
     thread_id: String,
@@ -18154,9 +19373,11 @@ mod tests {
             ts: "2026-01-01T00:00:00Z".to_owned(),
             id_key: "1".to_owned(),
             entity_id: "1".to_owned(),
+            translation_entity_id: None,
             release_id: Some(1),
             release_node_id: node_id.map(str::to_owned),
             repo_full_name: None,
+            discussion_number: None,
             owner_avatar_url: None,
             open_graph_image_url: None,
             uses_custom_open_graph_image: None,

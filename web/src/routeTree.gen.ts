@@ -45,6 +45,7 @@ import { Route as PublicOwnerRepoReleasesRouteImport } from './routes/public/$ow
 import { Route as FocusRepoOwnerRepoRouteImport } from './routes/focus/repo/$owner/$repo'
 import { Route as FocusOrgOrgReleasesRouteImport } from './routes/focus/org/$org/releases'
 import { Route as AdminJobsSubscriptionsTaskIdRouteImport } from './routes/admin/jobs/subscriptions/$taskId'
+import { Route as OwnerRepoDiscussionsNumberRouteImport } from './routes/$owner/$repo/discussions/$number'
 import { Route as AdminJobsTasksTaskIdRouteRouteImport } from './routes/admin/jobs/tasks/$taskId/route'
 import { Route as FocusRepoOwnerRepoIndexRouteImport } from './routes/focus/repo/$owner/$repo/index'
 import { Route as AdminJobsTasksTaskIdIndexRouteImport } from './routes/admin/jobs/tasks/$taskId/index'
@@ -276,6 +277,16 @@ const AdminJobsSubscriptionsTaskIdRoute =
       (d) => d.Route,
     ),
   )
+const OwnerRepoDiscussionsNumberRoute =
+  OwnerRepoDiscussionsNumberRouteImport.update({
+    id: '/$owner/$repo/discussions/$number',
+    path: '/$owner/$repo/discussions/$number',
+    getParentRoute: () => rootRouteImport,
+  } as any).lazy(() =>
+    import('./routes/$owner/$repo/discussions/$number.lazy').then(
+      (d) => d.Route,
+    ),
+  )
 const AdminJobsTasksTaskIdRouteRoute =
   AdminJobsTasksTaskIdRouteRouteImport.update({
     id: '/tasks/$taskId',
@@ -367,6 +378,7 @@ export interface FileRoutesByFullPath {
   '/focus/mine/': typeof FocusMineIndexRoute
   '/focus/repos/': typeof FocusReposIndexRoute
   '/admin/jobs/tasks/$taskId': typeof AdminJobsTasksTaskIdRouteRouteWithChildren
+  '/$owner/$repo/discussions/$number': typeof OwnerRepoDiscussionsNumberRoute
   '/admin/jobs/subscriptions/$taskId': typeof AdminJobsSubscriptionsTaskIdRoute
   '/focus/org/$org/releases': typeof FocusOrgOrgReleasesRoute
   '/focus/repo/$owner/$repo': typeof FocusRepoOwnerRepoRouteWithChildren
@@ -404,6 +416,7 @@ export interface FileRoutesByTo {
   '/focus/following': typeof FocusFollowingIndexRoute
   '/focus/mine': typeof FocusMineIndexRoute
   '/focus/repos': typeof FocusReposIndexRoute
+  '/$owner/$repo/discussions/$number': typeof OwnerRepoDiscussionsNumberRoute
   '/admin/jobs/subscriptions/$taskId': typeof AdminJobsSubscriptionsTaskIdRoute
   '/focus/org/$org/releases': typeof FocusOrgOrgReleasesRoute
   '/public/$owner/$repo/releases': typeof PublicOwnerRepoReleasesRouteWithChildren
@@ -449,6 +462,7 @@ export interface FileRoutesById {
   '/focus/mine/': typeof FocusMineIndexRoute
   '/focus/repos/': typeof FocusReposIndexRoute
   '/admin/jobs/tasks/$taskId': typeof AdminJobsTasksTaskIdRouteRouteWithChildren
+  '/$owner/$repo/discussions/$number': typeof OwnerRepoDiscussionsNumberRoute
   '/admin/jobs/subscriptions/$taskId': typeof AdminJobsSubscriptionsTaskIdRoute
   '/focus/org/$org/releases': typeof FocusOrgOrgReleasesRoute
   '/focus/repo/$owner/$repo': typeof FocusRepoOwnerRepoRouteWithChildren
@@ -496,6 +510,7 @@ export interface FileRouteTypes {
     | '/focus/mine/'
     | '/focus/repos/'
     | '/admin/jobs/tasks/$taskId'
+    | '/$owner/$repo/discussions/$number'
     | '/admin/jobs/subscriptions/$taskId'
     | '/focus/org/$org/releases'
     | '/focus/repo/$owner/$repo'
@@ -533,6 +548,7 @@ export interface FileRouteTypes {
     | '/focus/following'
     | '/focus/mine'
     | '/focus/repos'
+    | '/$owner/$repo/discussions/$number'
     | '/admin/jobs/subscriptions/$taskId'
     | '/focus/org/$org/releases'
     | '/public/$owner/$repo/releases'
@@ -577,6 +593,7 @@ export interface FileRouteTypes {
     | '/focus/mine/'
     | '/focus/repos/'
     | '/admin/jobs/tasks/$taskId'
+    | '/$owner/$repo/discussions/$number'
     | '/admin/jobs/subscriptions/$taskId'
     | '/focus/org/$org/releases'
     | '/focus/repo/$owner/$repo'
@@ -606,6 +623,7 @@ export interface RootRouteChildren {
   FocusReposRoute: typeof FocusReposRouteWithChildren
   OwnerRepoReleasesRoute: typeof OwnerRepoReleasesRouteWithChildren
   FocusOrgOrgRoute: typeof FocusOrgOrgRouteWithChildren
+  OwnerRepoDiscussionsNumberRoute: typeof OwnerRepoDiscussionsNumberRoute
   FocusRepoOwnerRepoRoute: typeof FocusRepoOwnerRepoRouteWithChildren
   PublicOwnerRepoReleasesRoute: typeof PublicOwnerRepoReleasesRouteWithChildren
 }
@@ -864,6 +882,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AdminJobsSubscriptionsTaskIdRouteImport
       parentRoute: typeof AdminJobsSubscriptionsRoute
     }
+    '/$owner/$repo/discussions/$number': {
+      id: '/$owner/$repo/discussions/$number'
+      path: '/$owner/$repo/discussions/$number'
+      fullPath: '/$owner/$repo/discussions/$number'
+      preLoaderRoute: typeof OwnerRepoDiscussionsNumberRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/admin/jobs/tasks/$taskId': {
       id: '/admin/jobs/tasks/$taskId'
       path: '/tasks/$taskId'
@@ -1099,6 +1124,7 @@ const rootRouteChildren: RootRouteChildren = {
   FocusReposRoute: FocusReposRouteWithChildren,
   OwnerRepoReleasesRoute: OwnerRepoReleasesRouteWithChildren,
   FocusOrgOrgRoute: FocusOrgOrgRouteWithChildren,
+  OwnerRepoDiscussionsNumberRoute: OwnerRepoDiscussionsNumberRoute,
   FocusRepoOwnerRepoRoute: FocusRepoOwnerRepoRouteWithChildren,
   PublicOwnerRepoReleasesRoute: PublicOwnerRepoReleasesRouteWithChildren,
 }

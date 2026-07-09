@@ -646,6 +646,7 @@ struct FeedActivityEventSnapshot {
     event_id: String,
     repo_id: Option<i64>,
     repo_full_name: Option<String>,
+    discussion_number: Option<i64>,
     title: Option<String>,
     body: Option<String>,
     html_url: Option<String>,
@@ -785,6 +786,7 @@ struct DiscussionAnnouncement {
     event_id: String,
     repo_id: i64,
     repo_full_name: String,
+    discussion_number: i64,
     title: String,
     body: Option<String>,
     html_url: String,
@@ -2555,6 +2557,7 @@ async fn apply_social_activity_snapshot_with_options(
                         kind: "follower_received",
                         repo_id: None,
                         repo_full_name: None,
+                        discussion_number: None,
                         repo_visual: None,
                         title: None,
                         body: None,
@@ -2769,6 +2772,7 @@ async fn apply_social_activity_snapshot_with_options(
                             kind: "repo_star_received",
                             repo_id: Some(repo.repo_id),
                             repo_full_name: Some(repo.full_name.as_str()),
+                            discussion_number: None,
                             repo_visual: Some(repo),
                             title: None,
                             body: None,
@@ -2910,6 +2914,7 @@ struct SocialActivityEventInsert<'a> {
     kind: &'a str,
     repo_id: Option<i64>,
     repo_full_name: Option<&'a str>,
+    discussion_number: Option<i64>,
     repo_visual: Option<&'a OwnedRepoSnapshot>,
     title: Option<&'a str>,
     body: Option<&'a str>,
@@ -2945,6 +2950,7 @@ async fn insert_social_activity_event_tx(
           kind,
           repo_id,
           repo_full_name,
+          discussion_number,
           repo_owner_avatar_url,
           repo_open_graph_image_url,
           repo_uses_custom_open_graph_image,
@@ -2961,7 +2967,7 @@ async fn insert_social_activity_event_tx(
           created_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT DO NOTHING
         "#,
     )
@@ -2970,6 +2976,7 @@ async fn insert_social_activity_event_tx(
     .bind(event.kind)
     .bind(event.repo_id)
     .bind(event.repo_full_name)
+    .bind(event.discussion_number)
     .bind(repo_owner_avatar_url)
     .bind(repo_open_graph_image_url)
     .bind(repo_uses_custom_open_graph_image)
@@ -3126,6 +3133,7 @@ async fn materialize_follower_current_members_tx(
                 kind: "follower_received",
                 repo_id: None,
                 repo_full_name: None,
+                discussion_number: None,
                 repo_visual: None,
                 title: None,
                 body: None,
@@ -3205,6 +3213,7 @@ async fn materialize_repo_star_current_members_tx(
                 kind: "repo_star_received",
                 repo_id: Some(repo.repo_id),
                 repo_full_name: Some(repo.full_name.as_str()),
+                discussion_number: None,
                 repo_visual: Some(repo),
                 title: None,
                 body: None,
@@ -8667,6 +8676,7 @@ async fn fetch_discussion_announcement_events_snapshot(
                     event_id: announcement.event_id.clone(),
                     repo_id: Some(announcement.repo_id),
                     repo_full_name: Some(announcement.repo_full_name),
+                    discussion_number: Some(announcement.discussion_number),
                     title: Some(announcement.title),
                     body: announcement.body,
                     html_url: Some(announcement.html_url),
@@ -8802,8 +8812,9 @@ async fn fetch_discussion_announcement_category_discussions(
               discussions(first: {}, categoryId: {}, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
                 nodes {{
                   id
+                  number
                   title
-                  bodyText
+                  body
                   url
                   createdAt
                   updatedAt
@@ -8934,6 +8945,7 @@ fn discussion_announcement_from_node(
     repo_full_name: &str,
 ) -> Option<DiscussionAnnouncement> {
     let event_id = node.get("id")?.as_str()?.to_owned();
+    let discussion_number = node.get("number")?.as_i64()?;
     let title = node.get("title")?.as_str()?.to_owned();
     let html_url = node.get("url")?.as_str()?.to_owned();
     let occurred_at = node
@@ -8946,11 +8958,9 @@ fn discussion_announcement_from_node(
         event_id,
         repo_id,
         repo_full_name: repo_full_name.to_owned(),
+        discussion_number,
         title,
-        body: node
-            .get("bodyText")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        body: node.get("body").and_then(Value::as_str).map(str::to_owned),
         html_url,
         actor,
         occurred_at,
@@ -9014,6 +9024,7 @@ fn feed_activity_event_from_github(
                 event_id: github_event_id.clone(),
                 repo_id,
                 repo_full_name,
+                discussion_number: None,
                 title: forkee.as_ref().and_then(|repo| repo.full_name.clone()),
                 body: forkee.and_then(|repo| repo.description),
                 html_url,
@@ -9053,6 +9064,7 @@ fn feed_activity_event_from_github(
                 event_id: github_event_id.clone(),
                 repo_id,
                 repo_full_name,
+                discussion_number: None,
                 title,
                 body: release.and_then(|release| release.body),
                 html_url,
@@ -9121,6 +9133,7 @@ async fn insert_feed_activity_events(
                 kind: event.kind,
                 repo_id: event.repo_id,
                 repo_full_name: event.repo_full_name.as_deref(),
+                discussion_number: event.discussion_number,
                 repo_visual: repo_visual.as_ref(),
                 title: event.title.as_deref(),
                 body: event.body.as_deref(),
@@ -13545,6 +13558,7 @@ mod tests {
                 kind: "follower_received",
                 repo_id: None,
                 repo_full_name: None,
+                discussion_number: None,
                 repo_visual: None,
                 title: None,
                 body: None,
@@ -13761,6 +13775,7 @@ mod tests {
                 kind: "repo_star_received",
                 repo_id: Some(repo.repo_id),
                 repo_full_name: Some(repo.full_name.as_str()),
+                discussion_number: None,
                 repo_visual: Some(&repo),
                 title: None,
                 body: None,
@@ -14378,6 +14393,7 @@ mod tests {
                     kind: "follower_received",
                     repo_id: None,
                     repo_full_name: None,
+                    discussion_number: None,
                     repo_visual: None,
                     title: None,
                     body: None,
@@ -14404,6 +14420,7 @@ mod tests {
                     kind: "follower_received",
                     repo_id: None,
                     repo_full_name: None,
+                    discussion_number: None,
                     repo_visual: None,
                     title: None,
                     body: None,
@@ -14540,6 +14557,7 @@ mod tests {
                 github_event_id: Some("evt-1".to_owned()),
                 repo_id: Some(42),
                 repo_full_name: Some("octo/alpha".to_owned()),
+                discussion_number: Some(1),
                 title: Some("Alpha roadmap announcement".to_owned()),
                 body: Some("First announcement body".to_owned()),
                 html_url: Some("https://github.com/octo/alpha/discussions/1".to_owned()),
@@ -14552,6 +14570,7 @@ mod tests {
                 github_event_id: Some("evt-2".to_owned()),
                 repo_id: Some(42),
                 repo_full_name: Some("octo/alpha".to_owned()),
+                discussion_number: Some(2),
                 title: Some("Beta migration announcement".to_owned()),
                 body: Some("Second announcement body".to_owned()),
                 html_url: Some("https://github.com/octo/alpha/discussions/2".to_owned()),
@@ -14630,6 +14649,7 @@ mod tests {
             github_event_id: Some("evt-writer-pressure".to_owned()),
             repo_id: Some(42),
             repo_full_name: Some("octo/alpha".to_owned()),
+            discussion_number: Some(42),
             title: Some("SQLite writer pressure".to_owned()),
             body: Some("Should still persist after competing write".to_owned()),
             html_url: Some("https://github.com/octo/alpha/discussions/42".to_owned()),
@@ -14704,8 +14724,9 @@ mod tests {
     fn discussion_announcement_node_maps_to_activity_fields() {
         let node = json!({
             "id": "D_kwDOALPHA4",
+            "number": 44,
             "title": "Pinned maintainer announcement",
-            "bodyText": "The project roadmap has moved to Discussions.",
+            "body": "The project roadmap has moved to Discussions.",
             "url": "https://github.com/octo/alpha/discussions/44",
             "createdAt": "2026-03-05T10:00:00Z",
             "updatedAt": "2026-03-06T12:00:00Z",
@@ -14723,6 +14744,7 @@ mod tests {
         assert_eq!(announcement.event_id, "D_kwDOALPHA4");
         assert_eq!(announcement.repo_id, 1001);
         assert_eq!(announcement.repo_full_name, "octo/alpha");
+        assert_eq!(announcement.discussion_number, 44);
         assert_eq!(announcement.title, "Pinned maintainer announcement");
         assert_eq!(
             announcement.body.as_deref(),
