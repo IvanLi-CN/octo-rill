@@ -198,9 +198,15 @@
 
 ## Visual Evidence
 
+PR: include
+
 ![公告卡片润色等待态](./assets/announcement-card-smart-pending.png)
 
+PR: include
+
 ![混排 feed 页面级润色联动](./assets/announcement-mixed-page-lane.png)
+
+PR: include
 
 ![公告详情页默认润色态](./assets/announcement-detail-ready.png)
 
