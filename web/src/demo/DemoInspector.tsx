@@ -680,7 +680,7 @@ function DesktopInspectorChrome(props: {
 					ref={titleRef}
 					className={cn(
 						"flex cursor-move items-center justify-between border-b px-4 py-3",
-						density === "compact" && "px-3.5 py-2.5",
+						density === "compact" && "px-3 py-2",
 					)}
 					data-demo-inspector-title="true"
 					onPointerDown={(event) => {
@@ -725,7 +725,7 @@ function DesktopInspectorChrome(props: {
 						ref={scrollerRef}
 						className={cn(
 							"h-full min-h-0 overflow-y-auto p-4 pb-5",
-							density === "compact" && "p-3 pb-3.5",
+							density === "compact" && "p-2.5 pb-2.5",
 						)}
 						data-demo-inspector-scroller="true"
 					>
@@ -768,13 +768,13 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 	const { snapshot } = props;
 	const isCompact = props.density === "compact";
 	return (
-		<div className={cn("space-y-1.5", isCompact && "space-y-1")}>
+		<div className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
 			<Card className="border-dashed">
-				<CardHeader className={cn("p-3 pb-2", isCompact && "p-2.5 pb-1.5")}>
+				<CardHeader className={cn("p-3 pb-2", isCompact && "p-2 pb-1")}>
 					<CardTitle
 						className={cn(
 							"flex items-center justify-between text-base",
-							isCompact && "text-[15px]",
+							isCompact && "text-sm",
 						)}
 					>
 						<span>{props.sceneTitle}</span>
@@ -784,10 +784,10 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 				<CardContent
 					className={cn(
 						"space-y-2.5 px-3 pb-3",
-						isCompact && "space-y-2 px-2.5 pb-2.5",
+						isCompact && "space-y-1.5 px-2 pb-2",
 					)}
 				>
-					<section className={cn("space-y-1.5", isCompact && "space-y-1")}>
+					<section className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
 						<Label>Scene</Label>
 						<Select
 							value={snapshot.shareState.sceneId}
@@ -795,7 +795,9 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 								props.onSceneChange(value as (typeof DEMO_SCENES)[number]["id"])
 							}
 						>
-							<SelectTrigger className={cn("w-full", isCompact && "h-8")}>
+							<SelectTrigger
+								className={cn("w-full", isCompact && "h-7.5 text-xs")}
+							>
 								<SelectValue />
 							</SelectTrigger>
 							<SelectContent>
@@ -811,7 +813,7 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 					<section
 						className={cn("grid gap-2.5 sm:grid-cols-2", isCompact && "gap-2")}
 					>
-						<div className={cn("space-y-1.5", isCompact && "space-y-1")}>
+						<div className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
 							<Label>Persona</Label>
 							<Select
 								value={snapshot.shareState.personaId}
@@ -819,7 +821,9 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 									props.onPersonaChange(value as "guest" | "member" | "admin")
 								}
 							>
-								<SelectTrigger className={cn("w-full", isCompact && "h-8")}>
+								<SelectTrigger
+									className={cn("w-full", isCompact && "h-7.5 text-xs")}
+								>
 									<SelectValue />
 								</SelectTrigger>
 								<SelectContent>
@@ -829,7 +833,7 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 								</SelectContent>
 							</Select>
 						</div>
-						<div className={cn("space-y-1.5", isCompact && "space-y-1")}>
+						<div className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
 							<Label>Network</Label>
 							<Select
 								value={snapshot.shareState.networkMode}
@@ -837,7 +841,9 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 									props.onNetworkChange(value as "normal" | "slow" | "faulty")
 								}
 							>
-								<SelectTrigger className={cn("w-full", isCompact && "h-8")}>
+								<SelectTrigger
+									className={cn("w-full", isCompact && "h-7.5 text-xs")}
+								>
 									<SelectValue />
 								</SelectTrigger>
 								<SelectContent>
@@ -852,32 +858,32 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 			</Card>
 
 			<Card>
-				<CardHeader className={cn("p-3 pb-2", isCompact && "p-2.5 pb-1.5")}>
-					<CardTitle className={cn("text-base", isCompact && "text-[15px]")}>
+				<CardHeader className={cn("p-3 pb-2", isCompact && "p-2 pb-1")}>
+					<CardTitle className={cn("text-base", isCompact && "text-sm")}>
 						Data
 					</CardTitle>
 				</CardHeader>
 				<CardContent
 					className={cn(
 						"space-y-2.5 px-3 pb-3",
-						isCompact && "space-y-2 px-2.5 pb-2.5",
+						isCompact && "space-y-1.5 px-2 pb-2",
 					)}
 				>
 					<div className="flex items-center justify-between gap-3">
 						<div className="space-y-0.5">
 							<p className="font-medium text-sm">Include My Releases</p>
-							<p className="text-muted-foreground text-xs leading-4">
-								{isCompact
-									? "影响 Settings 回显与 owner-only release 露出。"
-									: "影响 Settings 回显和 Dashboard owner-only release 露出。"}
-							</p>
+							{isCompact ? null : (
+								<p className="text-muted-foreground text-xs leading-4">
+									影响 Settings 回显和 Dashboard owner-only release 露出。
+								</p>
+							)}
 						</div>
 						<Switch
 							checked={snapshot.shareState.includeOwnReleases}
 							onCheckedChange={props.onIncludeOwnReleasesChange}
 						/>
 					</div>
-					<div className={cn("space-y-1.5", isCompact && "space-y-1")}>
+					<div className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
 						<Label>Repo Public Release State</Label>
 						<Select
 							value={snapshot.shareState.publicationState}
@@ -887,7 +893,9 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 								)
 							}
 						>
-							<SelectTrigger className={cn("w-full", isCompact && "h-8")}>
+							<SelectTrigger
+								className={cn("w-full", isCompact && "h-7.5 text-xs")}
+							>
 								<SelectValue />
 							</SelectTrigger>
 							<SelectContent>
@@ -900,15 +908,15 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 			</Card>
 
 			<Card>
-				<CardHeader className={cn("p-3 pb-2", isCompact && "p-2.5 pb-1.5")}>
-					<CardTitle className={cn("text-base", isCompact && "text-[15px]")}>
+				<CardHeader className={cn("p-3 pb-2", isCompact && "p-2 pb-1")}>
+					<CardTitle className={cn("text-base", isCompact && "text-sm")}>
 						Actions & Share
 					</CardTitle>
 				</CardHeader>
 				<CardContent
 					className={cn(
 						"space-y-2.5 px-3 pb-3",
-						isCompact && "space-y-2 px-2.5 pb-2.5",
+						isCompact && "space-y-1.5 px-2 pb-2",
 					)}
 				>
 					<div className="flex flex-wrap gap-1.5">
@@ -916,6 +924,7 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 							type="button"
 							variant="outline"
 							size={isCompact ? "sm" : "default"}
+							className={cn(isCompact && "h-7 gap-1.5 px-2.5 text-xs")}
 							onClick={props.onReset}
 						>
 							<RefreshCcw className="size-4" />
@@ -925,15 +934,21 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 							type="button"
 							variant="outline"
 							size={isCompact ? "sm" : "default"}
+							className={cn(isCompact && "h-7 gap-1.5 px-2.5 text-xs")}
 							onClick={props.onCopyShareLink}
 						>
 							<Copy className="size-4" />
 							Copy Share URL
 						</Button>
 					</div>
-					<div className={cn("space-y-1.5", isCompact && "space-y-1")}>
+					<div className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
 						{isCompact ? null : <Label>Share</Label>}
-						<p className="overflow-x-auto rounded-xl border bg-muted/30 px-2.5 py-1.5 font-mono text-[10px] leading-4 whitespace-nowrap">
+						<p
+							className={cn(
+								"overflow-x-auto rounded-xl border bg-muted/30 px-2.5 py-1.5 font-mono text-[10px] leading-4 whitespace-nowrap",
+								isCompact && "px-2 py-1 text-[9px] leading-3",
+							)}
+						>
 							{props.shareHref}
 						</p>
 					</div>
@@ -950,7 +965,7 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 			<details
 				className={cn(
 					"rounded-2xl border bg-muted/20 p-2.5",
-					isCompact && "p-2",
+					isCompact && "p-1.5",
 				)}
 			>
 				<summary className="cursor-pointer list-none">
