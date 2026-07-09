@@ -12,6 +12,7 @@ import {
 import type {
 	DemoModel,
 	DemoPanelLayout,
+	DemoSceneId,
 	DemoShareStatePatch,
 	DemoShareState,
 	DemoSnapshot,
@@ -45,6 +46,28 @@ const DEFAULT_PANEL_LAYOUT: DemoPanelLayout = {
 	collapsed: false,
 };
 
+type PersistedDemoPanelLayout = Partial<DemoPanelLayout> & {
+	sceneId?: DemoSceneId;
+};
+
+type PersistedDemoPanelLayoutStore = PersistedDemoPanelLayout & {
+	scenes?: Partial<Record<DemoSceneId, PersistedDemoPanelLayout>>;
+};
+
+function buildDefaultPanelLayout(sceneId: DemoSceneId): DemoPanelLayout {
+	if (
+		sceneId === "settings-my-releases" ||
+		sceneId === "public-release-ready"
+	) {
+		return {
+			...DEFAULT_PANEL_LAYOUT,
+			edge: "left",
+		};
+	}
+
+	return { ...DEFAULT_PANEL_LAYOUT };
+}
+
 const listeners = new Set<() => void>();
 
 let demoDependencies: DemoRuntimeDependencies | null = null;
@@ -54,6 +77,7 @@ let demoWorker: ReturnType<DemoRuntimeDependencies["setupWorker"]> | null =
 	null;
 let workerStartPromise: Promise<void> | null = null;
 const DEMO_WORKER_START_TIMEOUT_MS = 4_000;
+let pendingDemoRouteSyncHref: string | null = null;
 
 const runtimeState: DemoSnapshot = {
 	active: false,
@@ -106,32 +130,88 @@ function canUseStorage() {
 	);
 }
 
-function readPanelLayout(): DemoPanelLayout {
-	if (!canUseStorage()) return DEFAULT_PANEL_LAYOUT;
+function normalizeStoredPanelLayout(
+	storedLayout: Partial<DemoPanelLayout>,
+	sceneDefaultLayout: DemoPanelLayout,
+) {
+	return {
+		edge: storedLayout.edge === "left" ? "left" : "right",
+		x:
+			typeof storedLayout.x === "number"
+				? storedLayout.x
+				: sceneDefaultLayout.x,
+		y:
+			typeof storedLayout.y === "number"
+				? storedLayout.y
+				: sceneDefaultLayout.y,
+		collapsed:
+			typeof storedLayout.collapsed === "boolean"
+				? storedLayout.collapsed
+				: sceneDefaultLayout.collapsed,
+	} satisfies DemoPanelLayout;
+}
+
+function readPanelLayout(sceneId: DemoSceneId): DemoPanelLayout {
+	const sceneDefaultLayout = buildDefaultPanelLayout(sceneId);
+	if (!canUseStorage()) return sceneDefaultLayout;
 	try {
 		const raw = window.localStorage.getItem(DEMO_PANEL_LAYOUT_STORAGE_KEY);
-		if (!raw) return DEFAULT_PANEL_LAYOUT;
-		const parsed = JSON.parse(raw) as Partial<DemoPanelLayout>;
-		return {
-			edge: parsed.edge === "left" ? "left" : "right",
-			x: typeof parsed.x === "number" ? parsed.x : DEFAULT_PANEL_LAYOUT.x,
-			y: typeof parsed.y === "number" ? parsed.y : DEFAULT_PANEL_LAYOUT.y,
-			collapsed:
-				typeof parsed.collapsed === "boolean"
-					? parsed.collapsed
-					: DEFAULT_PANEL_LAYOUT.collapsed,
-		};
+		if (!raw) return sceneDefaultLayout;
+		const parsed = JSON.parse(raw) as PersistedDemoPanelLayoutStore;
+		if (parsed.scenes && typeof parsed.scenes === "object") {
+			const storedSceneLayout = parsed.scenes[sceneId];
+			if (!storedSceneLayout) {
+				return sceneDefaultLayout;
+			}
+			return normalizeStoredPanelLayout(storedSceneLayout, sceneDefaultLayout);
+		}
+		const parsedSceneId =
+			typeof parsed.sceneId === "string" ? parsed.sceneId : null;
+		if (parsedSceneId && parsedSceneId !== sceneId) {
+			return sceneDefaultLayout;
+		}
+		if (
+			!parsedSceneId &&
+			sceneDefaultLayout.edge === "left" &&
+			parsed.edge !== "left"
+		) {
+			return sceneDefaultLayout;
+		}
+		return normalizeStoredPanelLayout(parsed, sceneDefaultLayout);
 	} catch {
-		return DEFAULT_PANEL_LAYOUT;
+		return sceneDefaultLayout;
 	}
 }
 
-function persistPanelLayout(layout: DemoPanelLayout) {
+function persistPanelLayout(layout: DemoPanelLayout, sceneId: DemoSceneId) {
 	if (!canUseStorage()) return;
 	try {
+		const raw = window.localStorage.getItem(DEMO_PANEL_LAYOUT_STORAGE_KEY);
+		const parsed = raw
+			? (JSON.parse(raw) as PersistedDemoPanelLayoutStore)
+			: null;
+		const nextScenes: Partial<Record<DemoSceneId, PersistedDemoPanelLayout>> =
+			parsed?.scenes && typeof parsed.scenes === "object"
+				? { ...parsed.scenes }
+				: {};
+		if (
+			(!parsed?.scenes || typeof parsed.scenes !== "object") &&
+			parsed &&
+			typeof parsed.sceneId === "string"
+		) {
+			nextScenes[parsed.sceneId] = {
+				edge: parsed.edge,
+				x: parsed.x,
+				y: parsed.y,
+				collapsed: parsed.collapsed,
+			};
+		}
+		nextScenes[sceneId] = { ...layout };
 		window.localStorage.setItem(
 			DEMO_PANEL_LAYOUT_STORAGE_KEY,
-			JSON.stringify(layout),
+			JSON.stringify({
+				scenes: nextScenes,
+			} satisfies PersistedDemoPanelLayoutStore),
 		);
 	} catch {
 		// ignore storage failures
@@ -325,16 +405,59 @@ function persistDemoShareStateToWindowUrl() {
 	window.history.replaceState({}, "", nextUrl.toString());
 }
 
+function applyPatchedDemoShareState(
+	nextShareState: DemoShareState,
+	options?: {
+		reseed?: boolean;
+		persistToUrl?: boolean;
+	},
+) {
+	if (!demoDependencies) return;
+
+	const sceneChanged =
+		runtimeState.shareState.sceneId !== nextShareState.sceneId;
+	const shouldBumpRevision =
+		options?.reseed !== false &&
+		modelAffectingShareStateChanged(runtimeState.shareState, nextShareState);
+	runtimeState.shareState = nextShareState;
+
+	if (sceneChanged) {
+		runtimeState.panelLayout = readPanelLayout(nextShareState.sceneId);
+	}
+
+	if (
+		options?.reseed !== false &&
+		(shouldBumpRevision || !runtimeState.model)
+	) {
+		requireDemoDependencies().clearAllWarmStartupCaches();
+		runtimeState.model = seedModel(nextShareState);
+		runtimeState.mutations = [];
+	}
+
+	if (options?.persistToUrl) {
+		persistDemoShareStateToWindowUrl();
+	}
+
+	if (shouldBumpRevision) {
+		runtimeState.revision += 1;
+	}
+
+	emit();
+}
+
 export async function prepareDemoRuntime() {
 	if (typeof window === "undefined") return;
 
 	apply404RestoreIfNeeded();
 	const url = new URL(window.location.href);
 	const active = isDemoUrl(url);
+	const initialShareState = active
+		? readDemoShareState(url, demoBasepath())
+		: runtimeState.shareState;
 
 	runtimeState.demoBuild = demoBuildEnabled();
 	runtimeState.basepath = demoBasepath();
-	runtimeState.panelLayout = readPanelLayout();
+	runtimeState.panelLayout = readPanelLayout(initialShareState.sceneId);
 	runtimeState.lastSyncedHref = `${url.pathname}${url.search}${url.hash}`;
 	runtimeState.active = active;
 
@@ -409,6 +532,9 @@ export function syncDemoRuntimeWithHref(href: string) {
 	const nextHref = href.startsWith("http")
 		? new URL(href).pathname + new URL(href).search + new URL(href).hash
 		: href;
+	if (pendingDemoRouteSyncHref && nextHref !== pendingDemoRouteSyncHref) {
+		return;
+	}
 	if (runtimeState.lastSyncedHref === nextHref) return;
 	if (!demoDependencies) return;
 
@@ -418,12 +544,16 @@ export function syncDemoRuntimeWithHref(href: string) {
 	if (!next.active && !runtimeState.demoBuild) {
 		stopDemoWorker();
 	}
+	const sceneChanged = currentShareState.sceneId !== next.shareState.sceneId;
 	const shouldReseedModel =
 		next.active &&
 		(!runtimeState.active ||
 			modelAffectingShareStateChanged(currentShareState, next.shareState));
 	runtimeState.active = next.active;
 	runtimeState.shareState = next.shareState;
+	if (sceneChanged && next.active) {
+		runtimeState.panelLayout = readPanelLayout(next.shareState.sceneId);
+	}
 	if (!next.active) {
 		runtimeState.model = null;
 	} else if (shouldReseedModel || !runtimeState.model) {
@@ -431,6 +561,9 @@ export function syncDemoRuntimeWithHref(href: string) {
 	}
 	if (shouldReseedModel) {
 		runtimeState.revision += 1;
+	}
+	if (pendingDemoRouteSyncHref === nextHref) {
+		pendingDemoRouteSyncHref = null;
 	}
 	emit();
 }
@@ -441,23 +574,35 @@ export function patchDemoShareState(
 		reseed?: boolean;
 	},
 ) {
-	if (!demoDependencies) return;
-	const nextShareState: DemoShareState = {
-		...runtimeState.shareState,
-		...partial,
-	};
-	const shouldBumpRevision =
-		options?.reseed !== false &&
-		modelAffectingShareStateChanged(runtimeState.shareState, nextShareState);
-	runtimeState.shareState = nextShareState;
-	if (options?.reseed !== false) {
-		runtimeState.model = seedModel(nextShareState);
-		runtimeState.mutations = [];
-	}
-	if (shouldBumpRevision) {
-		runtimeState.revision += 1;
-	}
-	emit();
+	applyPatchedDemoShareState(
+		{
+			...runtimeState.shareState,
+			...partial,
+		},
+		options,
+	);
+}
+
+export function applyDemoShareStateInPlace(
+	partial: Partial<DemoShareState>,
+	options?: {
+		reseed?: boolean;
+	},
+) {
+	applyPatchedDemoShareState(
+		{
+			...runtimeState.shareState,
+			...partial,
+		},
+		{
+			...options,
+			persistToUrl: true,
+		},
+	);
+}
+
+export function setPendingDemoRouteSyncHref(href: string | null) {
+	pendingDemoRouteSyncHref = href;
 }
 
 export function resetDemoScene() {
@@ -482,7 +627,7 @@ export function updateDemoPanelLayout(
 		...runtimeState.panelLayout,
 		...partial,
 	};
-	persistPanelLayout(runtimeState.panelLayout);
+	persistPanelLayout(runtimeState.panelLayout, runtimeState.shareState.sceneId);
 	if (options?.emit !== false) {
 		emit();
 	}

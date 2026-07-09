@@ -189,16 +189,7 @@ export function PublicReleasePage(props: {
 	return (
 		<main className="min-h-dvh bg-background text-foreground">
 			<div className="mx-auto flex min-h-dvh w-full max-w-5xl flex-col px-4 py-5 sm:px-6 lg:px-8">
-				<div
-					className="flex min-h-full flex-col"
-					data-demo-content-frame="true"
-					style={
-						{
-							paddingLeft: "var(--demo-inspector-safe-left, 0px)",
-							paddingRight: "var(--demo-inspector-safe-right, 0px)",
-						} as React.CSSProperties
-					}
-				>
+				<div className="flex min-h-full flex-col">
 					<header className="flex flex-wrap items-center justify-between gap-3 border-b pb-4">
 						<InternalLink
 							href="/"

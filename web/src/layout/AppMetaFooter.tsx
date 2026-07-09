@@ -23,13 +23,14 @@ export function AppMetaFooter() {
 				footerHidden ? "pointer-events-none translate-y-full" : "translate-y-0"
 			}`}
 			data-app-meta-footer-hidden={footerHidden ? "true" : "false"}
-			style={
-				mobileChromeEnabled && isMobileViewport
-					? {
-							bottom: `calc(env(safe-area-inset-bottom, 0px) + ${viewportBottomInset}px)`,
-						}
-					: undefined
-			}
+			style={{
+				left: "var(--app-meta-footer-left, 0px)",
+				right: "var(--app-meta-footer-right, 0px)",
+				bottom:
+					mobileChromeEnabled && isMobileViewport
+						? `calc(env(safe-area-inset-bottom, 0px) + ${viewportBottomInset}px)`
+						: undefined,
+			}}
 		>
 			<div
 				className={`mx-auto flex min-h-12 max-w-6xl flex-wrap items-center justify-between gap-x-4 gap-y-1 px-6 py-2 text-xs ${

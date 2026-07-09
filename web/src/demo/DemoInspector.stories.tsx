@@ -2,7 +2,10 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, fn, within } from "storybook/test";
 
 import { buildDemoModel } from "@/demo/fixtures";
-import { DemoInspectorPanel } from "@/demo/DemoInspector";
+import {
+	DemoInspectorDockedRail,
+	DemoInspectorPanel,
+} from "@/demo/DemoInspector";
 
 const baseSnapshot = {
 	active: true,
@@ -77,6 +80,11 @@ export const Default: Story = {
 			canvas.getByText("Publish public release page"),
 		).toBeInTheDocument();
 		await expect(canvas.getByText("Copy Share URL")).toBeInTheDocument();
+		await expect(
+			canvas.getByDisplayValue(
+				"/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish&d_persona=member&d_own=1&d_pub=published",
+			),
+		).toHaveAttribute("readonly");
 	},
 };
 
@@ -90,6 +98,11 @@ export const ShortDesktopSurface: Story = {
 		const canvas = within(canvasElement);
 		await expect(canvas.getByText("Actions & Share")).toBeInTheDocument();
 		await expect(canvas.getByText("Share")).toBeInTheDocument();
+		await expect(
+			canvas.getByDisplayValue(
+				"/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish&d_persona=member&d_own=1&d_pub=published",
+			),
+		).toBeInTheDocument();
 	},
 };
 
@@ -106,5 +119,31 @@ export const CompactDesktopSurface: Story = {
 		const canvas = within(canvasElement);
 		await expect(canvas.getByText("Actions & Share")).toBeInTheDocument();
 		await expect(canvas.getByText("Advanced")).toBeInTheDocument();
+	},
+};
+
+export const WideDockedRail: Story = {
+	parameters: {
+		layout: "fullscreen",
+	},
+	render: (args) => (
+		<div className="h-[820px] w-[380px] overflow-hidden">
+			<DemoInspectorDockedRail onCollapse={fn()}>
+				{({ density }) => <DemoInspectorPanel {...args} density={density} />}
+			</DemoInspectorDockedRail>
+		</div>
+	),
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByText("Pinned on wide desktop"),
+		).toBeInTheDocument();
+		await expect(canvas.getByText("Dashboard")).toBeInTheDocument();
+		await expect(canvas.getByText("Copy Share URL")).toBeInTheDocument();
+		await expect(
+			canvasElement.ownerDocument.body.querySelector(
+				'[data-demo-inspector-collapse="true"]',
+			),
+		).toBeTruthy();
 	},
 };
