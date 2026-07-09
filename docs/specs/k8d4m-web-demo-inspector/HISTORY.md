@@ -17,3 +17,4 @@
 - 2026-07-09: 继续根据 owner 反馈细化桌面合同：当浏览器宽度足够容纳 Web App 最宽版心时，demo 根层会切成双栏 frame，左侧固定 inspector、右侧保留现有 app layout；普通桌面宽度仍保持真正的悬浮覆盖层，并新增超宽 left-docked 几何回归与 `ui_demo` 视觉证据。
 - 2026-07-09: review-loop 发现超宽双栏 frame 仍以 `content-box` 计算总宽度，导致 `maxWidth + padding-left` 在接近断点时可能顶出视口；已改为 `border-box` 约束根层宽度，并把 ultra-wide 回归用例改为校验 frame 右边界不超过 viewport，确保 docked inspector 与 app frame 对齐。
 - 2026-07-09: 第二轮 review-loop 继续收紧 scene 默认停靠位：inspector 布局存储已从单值格式升级为按 `sceneId` 分组的 `scenes` map，切 scene 或整页跳转到 `settings-my-releases` / `public-release-ready` 时会重新读取该 scene 的默认/持久布局，不再让旧的右侧布局覆盖左侧默认停靠位；同时补上 Dashboard -> Settings 与“多 scene 各自记忆布局”的回归测试。
+- 2026-07-09: 按 owner 最新验收口径把超宽桌面合同继续收紧为真正的 root-level pinned rail：当视口足够宽时，inspector 自身固定贴住视口最左边、占满全高、永久显示且不支持关闭；右侧保留现有 Web App layout。相应更新了 `DemoInspector`/`__root`、Storybook `WideDockedRail` 入口、wide/tall desktop Playwright 几何断言，以及 owner-facing `ui_demo` 宽屏证据图。

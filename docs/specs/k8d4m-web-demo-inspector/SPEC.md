@@ -13,7 +13,7 @@
 - 冻结 `/demo/` 为公开 `web demo` 子应用前缀，使用 `demo=<scene-id>` 作为 scene 入口，`d_*` 作为分享态命名空间。
 - 让 demo runtime 在 `AuthBootstrap` 之前完成模式识别与 MSW worker 启动，确保 mock-only 模式不会命中真实 `/api/**`、真实登录或真实后端写路径。
 - 首版覆盖 `Landing / Dashboard / Settings / Public Release / Admin Panel / Admin Jobs` 六个页面级 surface。
-- 交付可悬浮、可吸边、可收起的结构化 inspector：支持 scene、persona、network、关键 data toggles、share link 与 recent simulated writes。
+- 交付结构化 inspector：常规桌面宽度保持可悬浮、可吸边、可收起；当浏览器宽度足够容纳 Web App 最宽版心时，切换为永久显示、不可关闭、固定贴住视口最左边且占满全高的 pinned left rail；同时支持 scene、persona、network、关键 data toggles、share link 与 recent simulated writes。
 - 把 GitHub Pages 装配扩展为 `docs-site + /storybook/ + /demo/`，并在根 `404.html` 上只对 `/demo/**` 开启 deep-link recovery。
 
 ### Non-goals
@@ -64,10 +64,11 @@
 ### Inspector
 
 - 桌面端：
-  - 可拖拽
-  - 拖拽结束后吸附到左右边缘
-  - 可收起为气泡
-  - 布局位置持久化到 localStorage
+  - 常规桌面宽度下可拖拽
+  - 常规桌面宽度下拖拽结束后吸附到左右边缘
+  - 常规桌面宽度下可收起为气泡
+  - 常规桌面宽度下布局位置持久化到 localStorage
+  - 当浏览器宽度足够容纳 Web App 最宽版心时，切换为 root-level 双栏：左侧 inspector 固定贴住视口最左边、占满全高、永久显示且不支持关闭；右侧继续承载现有 Web App layout
 - 移动端：
   - 默认只显示 bubble
   - 点击 bubble 后打开 drawer
@@ -108,7 +109,7 @@
 ## 验收标准（Acceptance Criteria）
 
 1. Given Pages 站点已构建，When 打开 `/demo/` 与六个目标 route 的 scene deep link，Then 页面都进入 mock-only runtime，且不依赖真实认证或真实 `/api/**`。
-2. Given demo 处于桌面端，When 拖拽 inspector 并释放，Then 面板会吸附左右边缘且位置被记住；When 收起后，Then 会变成可点击恢复的气泡。
+2. Given demo 处于常规桌面宽度，When 拖拽 inspector 并释放，Then 面板会吸附左右边缘且位置被记住；When 收起后，Then 会变成可点击恢复的气泡。Given demo 处于足够宽的桌面视口，When 页面进入 wide layout，Then inspector 会切成永久显示、不可关闭、固定贴住视口最左边且占满全高的 pinned left rail。
 3. Given demo 处于移动端，When 点击 bubble，Then inspector 以 drawer 打开。
 4. Given Settings / Dashboard / Admin 页面触发保存、发布、取消、重试等动作，When 操作完成，Then UI 立即回显 mock-only 结果，且 recent mutations 中留下 simulated 记录。
 5. Given GitHub Pages 直接访问 `/demo/**` 深链，When GitHub Pages 回落到根 `404.html`，Then 404 shim 会恢复到对应 demo route，而 docs-site 其它 404 路径保持普通文档站行为。
@@ -169,9 +170,9 @@
   captured_at: `2026-07-09`
   route: `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
   state: `dashboard-repo-publish`
-  evidence_note: 超宽桌面宽度下，根层会切成专用双栏 frame：左侧固定 demo inspector，右侧保留现有 Web App 最宽版心。该场景由新增 Playwright 断言保护：`data-demo-root-frame="wide"` 必须出现，且 `summaryLeft > inspectorRight + 16`。
+  evidence_note: 超宽桌面宽度下，根层会切成 root-level 双栏：左侧 inspector 固定贴住视口最左边并占满全高，永久显示且不支持关闭；右侧继续承载现有 Web App 最宽版心。该场景由 Playwright 几何回归断言保护：`data-demo-root-frame="wide"` 必须出现，且 inspector 需要满足 `left=0`、`top=0`、`height=viewportHeight`、无 collapse button，以及 `summaryLeft > inspectorRight + 16`。
 
-![Ultra-wide desktop dashboard demo with docked left inspector](./assets/dashboard-desktop-wide-docked-left.png)
+![Ultra-wide desktop dashboard demo with pinned left rail](./assets/dashboard-desktop-wide-pinned-left-rail.png)
 
 - source_type: `ui_demo`
   target_program: `mock-only`

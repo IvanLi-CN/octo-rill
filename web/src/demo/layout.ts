@@ -9,10 +9,3 @@ export const DEMO_INSPECTOR_DOCKED_VIEWPORT_GUTTER_PX = 24;
 export const DEMO_INSPECTOR_DOCKED_BREAKPOINT_PX =
 	DEMO_INSPECTOR_DOCKED_LAYOUT_WIDTH_PX +
 	DEMO_INSPECTOR_DOCKED_VIEWPORT_GUTTER_PX * 2;
-
-export function resolveDemoDockedFrameLeft(viewportWidth: number) {
-	return Math.max(
-		DEMO_INSPECTOR_DOCKED_VIEWPORT_GUTTER_PX,
-		Math.round((viewportWidth - DEMO_INSPECTOR_DOCKED_LAYOUT_WIDTH_PX) / 2),
-	);
-}

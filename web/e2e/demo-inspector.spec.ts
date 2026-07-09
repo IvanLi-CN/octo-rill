@@ -455,7 +455,7 @@ test("desktop inspector floats over dashboard content instead of reserving layou
 	);
 });
 
-test("ultra-wide desktop docks inspector into a dedicated left column", async ({
+test("ultra-wide desktop pins inspector as a permanent full-height left rail", async ({
 	page,
 }) => {
 	await page.setViewportSize({ width: 1800, height: 1200 });
@@ -476,43 +476,59 @@ test("ultra-wide desktop docks inspector into a dedicated left column", async ({
 	).toBeVisible();
 
 	const geometry = await page.evaluate(() => {
-		const frame = document.querySelector<HTMLElement>(
-			'[data-demo-root-frame="wide"]',
-		);
 		const inspector = document.querySelector<HTMLElement>(
 			'[data-demo-inspector-chrome="desktop"]',
+		);
+		const rootContent = document.querySelector<HTMLElement>(
+			'[data-demo-root-content="wide"]',
 		);
 		const scopeSummary = document.querySelector<HTMLElement>(
 			'[data-dashboard-scope-summary="repo"][data-dashboard-scope-summary-layout="desktop"]',
 		);
-		if (!frame || !inspector || !scopeSummary) {
+		if (!inspector || !rootContent || !scopeSummary) {
 			throw new Error("wide demo layout geometry is unavailable");
 		}
-		const frameRect = frame.getBoundingClientRect();
 		const inspectorRect = inspector.getBoundingClientRect();
+		const rootContentRect = rootContent.getBoundingClientRect();
+		const rootContentStyle = window.getComputedStyle(rootContent);
 		const summaryRect = scopeSummary.getBoundingClientRect();
 		return {
-			frameLeft: frameRect.left,
-			frameRight: frameRect.right,
+			contentLeft:
+				rootContentRect.left +
+				Number.parseFloat(rootContentStyle.paddingLeft || "0"),
 			inspectorLeft: inspectorRect.left,
 			inspectorRight: inspectorRect.right,
+			inspectorTop: inspectorRect.top,
+			inspectorBottom: inspectorRect.bottom,
+			inspectorHeight: inspectorRect.height,
 			inspectorMode: inspector.dataset.demoInspectorMode,
+			inspectorPinned: inspector.dataset.demoInspectorPinned,
 			inspectorPosition: window.getComputedStyle(inspector).position,
+			hasCollapseButton: Boolean(
+				inspector.querySelector('[data-demo-inspector-collapse="true"]'),
+			),
 			summaryLeft: summaryRect.left,
-			viewportWidth: window.innerWidth,
+			viewportHeight: window.innerHeight,
 		};
 	});
 
 	expect(geometry.inspectorMode).toBe("docked");
+	expect(geometry.inspectorPinned).toBe("true");
 	expect(geometry.inspectorPosition).toBe("fixed");
+	expect(Math.abs(geometry.inspectorLeft)).toBeLessThanOrEqual(2);
+	expect(Math.abs(geometry.inspectorTop)).toBeLessThanOrEqual(2);
 	expect(
-		Math.abs(geometry.inspectorLeft - geometry.frameLeft),
+		Math.abs(geometry.inspectorBottom - geometry.viewportHeight),
 	).toBeLessThanOrEqual(2);
-	expect(geometry.frameRight).toBeLessThanOrEqual(geometry.viewportWidth + 2);
+	expect(
+		Math.abs(geometry.inspectorHeight - geometry.viewportHeight),
+	).toBeLessThanOrEqual(2);
+	expect(geometry.hasCollapseButton).toBe(false);
+	expect(geometry.contentLeft).toBeGreaterThan(geometry.inspectorRight + 16);
 	expect(geometry.summaryLeft).toBeGreaterThan(geometry.inspectorRight + 16);
 	await captureDemoInspectorEvidence(
 		page.locator("body"),
-		"dashboard-desktop-wide-docked-left.png",
+		"dashboard-desktop-wide-pinned-left-rail.png",
 	);
 });
 
@@ -688,7 +704,7 @@ test("demo inspector stays fully usable when toast feedback appears", async ({
 	).toBeHidden();
 });
 
-test("demo inspector grows to fit the full control stack on tall desktops", async ({
+test("wide tall desktops keep the full control stack visible in the pinned left rail", async ({
 	page,
 }) => {
 	await page.setViewportSize({ width: 1798, height: 1360 });
@@ -721,17 +737,27 @@ test("demo inspector grows to fit the full control stack on tall desktops", asyn
 		}
 		const panelRect = panel.getBoundingClientRect();
 		return {
+			panelTop: panelRect.top,
 			viewportHeight: window.innerHeight,
 			panelBottom: panelRect.bottom,
 			bottomGap: window.innerHeight - panelRect.bottom,
+			mode: panel.dataset.demoInspectorMode,
+			pinned: panel.dataset.demoInspectorPinned,
+			hasCollapseButton: Boolean(
+				panel.querySelector('[data-demo-inspector-collapse="true"]'),
+			),
 			scrollHeight: scroller.scrollHeight,
 			clientHeight: scroller.clientHeight,
 		};
 	});
 
 	expect(geometry.scrollHeight).toBeLessThanOrEqual(geometry.clientHeight + 2);
-	expect(geometry.panelBottom).toBeLessThanOrEqual(geometry.viewportHeight - 1);
-	expect(geometry.bottomGap).toBeGreaterThan(0);
+	expect(geometry.mode).toBe("docked");
+	expect(geometry.pinned).toBe("true");
+	expect(geometry.hasCollapseButton).toBe(false);
+	expect(Math.abs(geometry.panelTop)).toBeLessThanOrEqual(1);
+	expect(geometry.panelBottom).toBeLessThanOrEqual(geometry.viewportHeight);
+	expect(Math.abs(geometry.bottomGap)).toBeLessThanOrEqual(1);
 });
 
 test("reset scene restores the default publication share state", async ({

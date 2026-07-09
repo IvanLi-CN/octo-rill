@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import {
 	type ReactNode,
+	type RefObject,
 	useEffect,
 	useLayoutEffect,
 	useMemo,
@@ -15,11 +16,7 @@ import {
 } from "react";
 import { useRouterState } from "@tanstack/react-router";
 
-import {
-	DEMO_INSPECTOR_DOCKED_BREAKPOINT_PX,
-	DEMO_INSPECTOR_PANEL_WIDTH_PX,
-	resolveDemoDockedFrameLeft,
-} from "@/demo/layout";
+import { DEMO_INSPECTOR_PANEL_WIDTH_PX } from "@/demo/layout";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -156,13 +153,122 @@ function resolveDesktopPanelMetrics(input: {
 	};
 }
 
-export function DemoInspector() {
+function useViewportRevision() {
+	const [viewportRevision, setViewportRevision] = useState(0);
+
+	useEffect(() => {
+		if (typeof window === "undefined") return;
+		const syncViewport = () => {
+			setViewportRevision((current) => current + 1);
+		};
+		const visualViewport = window.visualViewport;
+		window.addEventListener("resize", syncViewport);
+		visualViewport?.addEventListener("resize", syncViewport);
+		visualViewport?.addEventListener("scroll", syncViewport);
+		return () => {
+			window.removeEventListener("resize", syncViewport);
+			visualViewport?.removeEventListener("resize", syncViewport);
+			visualViewport?.removeEventListener("scroll", syncViewport);
+		};
+	}, []);
+
+	useEffect(() => {
+		if (typeof document === "undefined") return;
+		const observer = new MutationObserver(() => {
+			setViewportRevision((current) => current + 1);
+		});
+		observer.observe(document.body, {
+			subtree: true,
+			childList: true,
+			attributes: true,
+			attributeFilter: ["data-state"],
+		});
+		return () => observer.disconnect();
+	}, []);
+
+	return viewportRevision;
+}
+
+function useInspectorScrollCues(
+	scrollerRef: RefObject<HTMLDivElement | null>,
+	input: {
+		disabled: boolean;
+		viewportRevision: number;
+	},
+) {
+	const { disabled, viewportRevision } = input;
+	const [scrollCues, setScrollCues] = useState({
+		showTop: false,
+		showBottom: false,
+	});
+
+	useEffect(() => {
+		if (disabled) {
+			setScrollCues({ showTop: false, showBottom: false });
+			return;
+		}
+		const scroller = scrollerRef.current;
+		if (!scroller) return;
+
+		const syncScrollCues = () => {
+			const remainingScroll = scroller.scrollHeight - scroller.clientHeight;
+			const nextShowTop =
+				remainingScroll > INSPECTOR_SCROLL_CUE_THRESHOLD &&
+				scroller.scrollTop > INSPECTOR_SCROLL_CUE_THRESHOLD;
+			const nextShowBottom =
+				remainingScroll > INSPECTOR_SCROLL_CUE_THRESHOLD &&
+				scroller.scrollTop < remainingScroll - INSPECTOR_SCROLL_CUE_THRESHOLD;
+			setScrollCues((current) =>
+				current.showTop === nextShowTop && current.showBottom === nextShowBottom
+					? current
+					: {
+							showTop: nextShowTop,
+							showBottom: nextShowBottom,
+						},
+			);
+		};
+
+		syncScrollCues();
+		scroller.addEventListener("scroll", syncScrollCues, { passive: true });
+		const resizeObserver =
+			typeof ResizeObserver === "undefined"
+				? null
+				: new ResizeObserver(syncScrollCues);
+		resizeObserver?.observe(scroller);
+		const content = scroller.firstElementChild;
+		if (content) {
+			resizeObserver?.observe(content);
+		}
+		const mutationObserver = new MutationObserver(syncScrollCues);
+		mutationObserver.observe(scroller, {
+			subtree: true,
+			childList: true,
+			characterData: true,
+			attributes: true,
+		});
+		window.addEventListener("resize", syncScrollCues);
+		const visualViewport = window.visualViewport;
+		visualViewport?.addEventListener("resize", syncScrollCues);
+		visualViewport?.addEventListener("scroll", syncScrollCues);
+		return () => {
+			scroller.removeEventListener("scroll", syncScrollCues);
+			resizeObserver?.disconnect();
+			mutationObserver.disconnect();
+			window.removeEventListener("resize", syncScrollCues);
+			visualViewport?.removeEventListener("resize", syncScrollCues);
+			visualViewport?.removeEventListener("scroll", syncScrollCues);
+		};
+	}, [disabled, scrollerRef, viewportRevision]);
+
+	return scrollCues;
+}
+
+export function DemoInspector(props: {
+	desktopMode?: "floating" | "docked-sidebar";
+}) {
 	const snapshot = useDemoSnapshot();
 	const scene = resolveCurrentDemoScene();
 	const isMobile = useMediaQuery("(max-width: 767px)");
-	const isWideDockedDesktop = useMediaQuery(
-		`(min-width: ${DEMO_INSPECTOR_DOCKED_BREAKPOINT_PX}px)`,
-	);
 	const [mobileOpen, setMobileOpen] = useState(false);
 
 	const routeLocationKey = useRouterState({
@@ -281,13 +387,22 @@ export function DemoInspector() {
 		);
 	}
 
+	if (props.desktopMode === "docked-sidebar") {
+		return (
+			<DemoInspectorDockedRail>
+				{({ density }) => (
+					<DemoInspectorPanel {...panelProps} density={density} />
+				)}
+			</DemoInspectorDockedRail>
+		);
+	}
+
 	return (
 		<DesktopInspectorChrome
 			collapsed={snapshot.panelLayout.collapsed}
 			edge={snapshot.panelLayout.edge}
 			x={snapshot.panelLayout.x}
 			y={snapshot.panelLayout.y}
-			wideDocked={isWideDockedDesktop}
 			onCollapse={() => setCollapsed(true)}
 			onExpand={() => setCollapsed(false)}
 		>
@@ -298,18 +413,90 @@ export function DemoInspector() {
 	);
 }
 
+export function DemoInspectorDockedRail(props: {
+	children: (input: { density: "default" | "compact" }) => ReactNode;
+}) {
+	const scrollerRef = useRef<HTMLDivElement | null>(null);
+	const viewportRevision = useViewportRevision();
+	const scrollCues = useInspectorScrollCues(scrollerRef, {
+		disabled: false,
+		viewportRevision,
+	});
+	const density =
+		typeof window !== "undefined" && window.innerHeight <= 900
+			? "compact"
+			: "default";
+
+	return (
+		<div
+			className="fixed inset-y-0 left-0 z-40 flex h-dvh min-h-0 w-[380px] flex-col overflow-hidden border-r bg-background/95 shadow-[16px_0_44px_-32px_rgba(15,23,42,0.48)] backdrop-blur"
+			data-demo-inspector-chrome="desktop"
+			data-demo-inspector-layout="sidebar"
+			data-demo-inspector-mode="docked"
+			data-demo-inspector-pinned="true"
+		>
+			<div
+				className={cn(
+					"flex items-center gap-3 border-b px-4 py-4",
+					density === "compact" && "px-3 py-3",
+				)}
+				data-demo-inspector-title="true"
+			>
+				<div className="flex size-9 shrink-0 items-center justify-center rounded-2xl border bg-muted/35">
+					<Inspect className="size-4 text-muted-foreground" />
+				</div>
+				<div className="min-w-0">
+					<p className="font-medium text-sm">Demo Inspector</p>
+					<p className="text-muted-foreground text-xs">
+						Pinned on wide desktop
+					</p>
+				</div>
+			</div>
+			<div className="relative min-h-0 flex-1">
+				{scrollCues.showTop ? (
+					<div
+						className="pointer-events-none absolute inset-x-0 top-0 z-10 h-5 bg-linear-to-b from-background via-background/85 to-transparent"
+						data-demo-inspector-scroll-cue="top"
+					/>
+				) : null}
+				<div
+					ref={scrollerRef}
+					className={cn(
+						"h-full min-h-0 overflow-y-auto p-4 pb-6",
+						density === "compact" && "p-2.5 pb-3",
+					)}
+					data-demo-inspector-scroller="true"
+				>
+					{props.children({ density })}
+				</div>
+				{scrollCues.showBottom ? (
+					<>
+						<div
+							className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-12 bg-linear-to-t from-background via-background/86 to-transparent"
+							data-demo-inspector-scroll-cue="bottom"
+						/>
+						<div className="pointer-events-none absolute inset-x-0 bottom-3 z-10 flex justify-center">
+							<div className="rounded-full border bg-background/92 px-2.5 py-1 font-medium text-[10px] text-muted-foreground shadow-sm backdrop-blur">
+								向下滚动查看更多
+							</div>
+						</div>
+					</>
+				) : null}
+			</div>
+		</div>
+	);
+}
+
 function DesktopInspectorChrome(props: {
 	children: (input: { density: "default" | "compact" }) => ReactNode;
 	collapsed: boolean;
 	edge: "left" | "right";
 	x: number;
 	y: number;
-	wideDocked: boolean;
 	onCollapse: () => void;
 	onExpand: () => void;
 }) {
-	const { children, collapsed, edge, x, y, wideDocked, onCollapse, onExpand } =
-		props;
+	const { children, collapsed, edge, x, y, onCollapse, onExpand } = props;
 	const { headerHeight, viewportBottomInset, viewportTopInset } =
 		useAppShellChrome();
 	const panelRef = useRef<HTMLDivElement | null>(null);
@@ -318,41 +505,11 @@ function DesktopInspectorChrome(props: {
 	const dragOffsetRef = useRef<{ x: number; y: number } | null>(null);
 	const [dragging, setDragging] = useState(false);
 	const [contentHeight, setContentHeight] = useState<number | null>(null);
-	const [viewportRevision, setViewportRevision] = useState(0);
-	const [scrollCues, setScrollCues] = useState({
-		showTop: false,
-		showBottom: false,
+	const viewportRevision = useViewportRevision();
+	const scrollCues = useInspectorScrollCues(scrollerRef, {
+		disabled: collapsed,
+		viewportRevision,
 	});
-
-	useEffect(() => {
-		if (typeof window === "undefined") return;
-		const syncViewport = () => {
-			setViewportRevision((current) => current + 1);
-		};
-		const visualViewport = window.visualViewport;
-		window.addEventListener("resize", syncViewport);
-		visualViewport?.addEventListener("resize", syncViewport);
-		visualViewport?.addEventListener("scroll", syncViewport);
-		return () => {
-			window.removeEventListener("resize", syncViewport);
-			visualViewport?.removeEventListener("resize", syncViewport);
-			visualViewport?.removeEventListener("scroll", syncViewport);
-		};
-	}, []);
-
-	useEffect(() => {
-		if (typeof document === "undefined") return;
-		const observer = new MutationObserver(() => {
-			setViewportRevision((current) => current + 1);
-		});
-		observer.observe(document.body, {
-			subtree: true,
-			childList: true,
-			attributes: true,
-			attributeFilter: ["data-state"],
-		});
-		return () => observer.disconnect();
-	}, []);
 
 	useLayoutEffect(() => {
 		if (collapsed || typeof window === "undefined") {
@@ -408,74 +565,12 @@ function DesktopInspectorChrome(props: {
 		};
 	}, [collapsed, viewportRevision]);
 
-	useEffect(() => {
-		if (collapsed) {
-			setScrollCues({ showTop: false, showBottom: false });
-			return;
-		}
-		const scroller = scrollerRef.current;
-		if (!scroller) return;
-
-		const syncScrollCues = () => {
-			const remainingScroll = scroller.scrollHeight - scroller.clientHeight;
-			const nextShowTop =
-				remainingScroll > INSPECTOR_SCROLL_CUE_THRESHOLD &&
-				scroller.scrollTop > INSPECTOR_SCROLL_CUE_THRESHOLD;
-			const nextShowBottom =
-				remainingScroll > INSPECTOR_SCROLL_CUE_THRESHOLD &&
-				scroller.scrollTop < remainingScroll - INSPECTOR_SCROLL_CUE_THRESHOLD;
-			setScrollCues((current) =>
-				current.showTop === nextShowTop && current.showBottom === nextShowBottom
-					? current
-					: {
-							showTop: nextShowTop,
-							showBottom: nextShowBottom,
-						},
-			);
-		};
-
-		syncScrollCues();
-		scroller.addEventListener("scroll", syncScrollCues, { passive: true });
-		const resizeObserver =
-			typeof ResizeObserver === "undefined"
-				? null
-				: new ResizeObserver(syncScrollCues);
-		resizeObserver?.observe(scroller);
-		const content = scroller.firstElementChild;
-		if (content) {
-			resizeObserver?.observe(content);
-		}
-		const mutationObserver = new MutationObserver(syncScrollCues);
-		mutationObserver.observe(scroller, {
-			subtree: true,
-			childList: true,
-			characterData: true,
-			attributes: true,
-		});
-		window.addEventListener("resize", syncScrollCues);
-		const visualViewport = window.visualViewport;
-		visualViewport?.addEventListener("resize", syncScrollCues);
-		visualViewport?.addEventListener("scroll", syncScrollCues);
-		return () => {
-			scroller.removeEventListener("scroll", syncScrollCues);
-			resizeObserver?.disconnect();
-			mutationObserver.disconnect();
-			window.removeEventListener("resize", syncScrollCues);
-			visualViewport?.removeEventListener("resize", syncScrollCues);
-			visualViewport?.removeEventListener("scroll", syncScrollCues);
-		};
-	}, [collapsed, viewportRevision]);
-
 	const frameWidth =
 		panelRef.current?.offsetWidth ?? (collapsed ? 176 : DESKTOP_PANEL_WIDTH);
-	const dockedLeft =
-		typeof window === "undefined"
-			? DESKTOP_PANEL_GAP
-			: resolveDemoDockedFrameLeft(window.innerWidth);
 	const panelMetrics = resolveDesktopPanelMetrics({
 		collapsed,
-		edge: wideDocked ? "left" : edge,
-		x: wideDocked ? dockedLeft : x,
+		edge,
+		x,
 		y,
 		headerHeight,
 		viewportTopInset,
@@ -498,7 +593,7 @@ function DesktopInspectorChrome(props: {
 			);
 
 	useEffect(() => {
-		if (!dragging || wideDocked) return;
+		if (!dragging) return;
 		const initialOffset = dragOffsetRef.current;
 		if (!initialOffset) return;
 
@@ -567,11 +662,10 @@ function DesktopInspectorChrome(props: {
 		viewportBottomInset,
 		viewportRevision,
 		viewportTopInset,
-		wideDocked,
 	]);
 
 	const positionStyle =
-		(wideDocked ? "left" : edge) === "left"
+		edge === "left"
 			? { left: panelMetrics.x, top: panelMetrics.y }
 			: { right: panelMetrics.x, top: panelMetrics.y };
 
@@ -582,7 +676,7 @@ function DesktopInspectorChrome(props: {
 				size="sm"
 				className="fixed z-50 max-w-[calc(100vw-24px)] rounded-full px-4 py-5 shadow-lg"
 				data-demo-inspector-bubble="desktop"
-				data-demo-inspector-mode={wideDocked ? "docked" : "floating"}
+				data-demo-inspector-mode="floating"
 				style={positionStyle}
 				onClick={onExpand}
 			>
@@ -597,7 +691,7 @@ function DesktopInspectorChrome(props: {
 			ref={panelRef}
 			className="fixed z-50 flex w-[380px] max-w-[calc(100vw-24px)] overflow-hidden"
 			data-demo-inspector-chrome="desktop"
-			data-demo-inspector-mode={wideDocked ? "docked" : "floating"}
+			data-demo-inspector-mode="floating"
 			style={{
 				...positionStyle,
 				height: panelHeight,
@@ -612,14 +706,11 @@ function DesktopInspectorChrome(props: {
 					ref={titleRef}
 					className={cn(
 						"flex items-center justify-between border-b px-4 py-3",
-						!wideDocked && "cursor-move",
+						"cursor-move",
 						density === "compact" && "px-3 py-2",
 					)}
 					data-demo-inspector-title="true"
 					onPointerDown={(event) => {
-						if (wideDocked) {
-							return;
-						}
 						if (
 							event.target instanceof HTMLElement &&
 							event.target.closest("button")
@@ -636,11 +727,7 @@ function DesktopInspectorChrome(props: {
 					}}
 				>
 					<div className="flex items-center gap-2">
-						{wideDocked ? (
-							<Inspect className="size-4 text-muted-foreground" />
-						) : (
-							<GripHorizontal className="size-4 text-muted-foreground" />
-						)}
+						<GripHorizontal className="size-4 text-muted-foreground" />
 						<p className="font-medium text-sm">Demo Inspector</p>
 					</div>
 					<Button
@@ -648,6 +735,7 @@ function DesktopInspectorChrome(props: {
 						size="icon"
 						variant="ghost"
 						className={cn(density === "compact" && "size-8")}
+						data-demo-inspector-collapse="true"
 						onPointerDown={(event) => event.stopPropagation()}
 						onClick={onCollapse}
 					>
