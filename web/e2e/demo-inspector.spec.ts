@@ -259,10 +259,18 @@ test("desktop inspector does not block settings simulated writes", async ({
 	page,
 }) => {
 	await page.goto("/settings?section=api-keys&demo=settings-my-releases");
+	await expect(page.locator("[data-settings-layout]")).toBeVisible();
+	await expect(
+		page.locator('[data-settings-section="api-keys"]'),
+	).toBeVisible();
 
 	const items = page.locator("[data-api-key-item]");
 	await expect(items.first()).toBeVisible();
 	const before = await items.count();
+	await captureDemoInspectorEvidence(
+		page.locator("body"),
+		"settings-api-keys-floating-overlay.png",
+	);
 
 	await page.getByRole("button", { name: "创建 API Key" }).click();
 
@@ -275,6 +283,110 @@ test("desktop inspector does not block settings simulated writes", async ({
 	await page.getByRole("link", { name: "API Key" }).first().click();
 	await expect(page).toHaveURL(/section=api-keys/);
 	await expect(items).toHaveCount(before + 1);
+});
+
+test("desktop inspector floats over dashboard content instead of reserving layout width", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1366, height: 768 });
+	await page.goto(
+		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
+	);
+	await expect(
+		page.locator('[data-dashboard-brand-heading="true"]'),
+	).toBeVisible();
+	await expect(
+		page.locator('[data-demo-inspector-chrome="desktop"]'),
+	).toBeVisible();
+	await expect(
+		page.locator(
+			'[data-dashboard-scope-summary="repo"][data-dashboard-scope-summary-layout="desktop"]',
+		),
+	).toBeVisible();
+
+	const geometry = await page.evaluate(() => {
+		const inspector = document.querySelector<HTMLElement>(
+			'[data-demo-inspector-chrome="desktop"]',
+		);
+		const scopeSummary = document.querySelector<HTMLElement>(
+			'[data-dashboard-scope-summary="repo"][data-dashboard-scope-summary-layout="desktop"]',
+		);
+		if (!inspector || !scopeSummary) {
+			throw new Error("dashboard demo inspector geometry is unavailable");
+		}
+		const inspectorRect = inspector.getBoundingClientRect();
+		const summaryRect = scopeSummary.getBoundingClientRect();
+		return {
+			inspectorPosition: window.getComputedStyle(inspector).position,
+			panelLeft: inspectorRect.left,
+			summaryRight: summaryRect.right,
+		};
+	});
+
+	expect(geometry.inspectorPosition).toBe("fixed");
+	expect(geometry.summaryRight).toBeGreaterThan(geometry.panelLeft + 24);
+	await captureDemoInspectorEvidence(
+		page.locator("body"),
+		"dashboard-desktop-floating-overlay.png",
+	);
+});
+
+test("ultra-wide desktop docks inspector into a dedicated left column", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1800, height: 1200 });
+	await page.goto(
+		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
+	);
+	await expect(
+		page.locator('[data-dashboard-brand-heading="true"]'),
+	).toBeVisible();
+	await expect(page.locator('[data-demo-root-frame="wide"]')).toBeVisible();
+	await expect(
+		page.locator('[data-demo-inspector-chrome="desktop"]'),
+	).toBeVisible();
+	await expect(
+		page.locator(
+			'[data-dashboard-scope-summary="repo"][data-dashboard-scope-summary-layout="desktop"]',
+		),
+	).toBeVisible();
+
+	const geometry = await page.evaluate(() => {
+		const frame = document.querySelector<HTMLElement>(
+			'[data-demo-root-frame="wide"]',
+		);
+		const inspector = document.querySelector<HTMLElement>(
+			'[data-demo-inspector-chrome="desktop"]',
+		);
+		const scopeSummary = document.querySelector<HTMLElement>(
+			'[data-dashboard-scope-summary="repo"][data-dashboard-scope-summary-layout="desktop"]',
+		);
+		if (!frame || !inspector || !scopeSummary) {
+			throw new Error("wide demo layout geometry is unavailable");
+		}
+		const frameRect = frame.getBoundingClientRect();
+		const inspectorRect = inspector.getBoundingClientRect();
+		const summaryRect = scopeSummary.getBoundingClientRect();
+		return {
+			frameLeft: frameRect.left,
+			inspectorLeft: inspectorRect.left,
+			inspectorRight: inspectorRect.right,
+			inspectorMode: inspector.dataset.demoInspectorMode,
+			inspectorPosition: window.getComputedStyle(inspector).position,
+			summaryLeft: summaryRect.left,
+		};
+	});
+
+	expect(geometry.inspectorMode).toBe("docked");
+	expect(geometry.inspectorPosition).toBe("fixed");
+	expect(
+		Math.abs(geometry.inspectorLeft - geometry.frameLeft),
+	).toBeLessThanOrEqual(2);
+	expect(geometry.summaryLeft).toBeGreaterThan(geometry.inspectorRight + 16);
+	await captureDemoInspectorEvidence(
+		page.locator("body"),
+		"dashboard-desktop-wide-docked-left.png",
+	);
 });
 
 test("demo PAT saves never echo a user-entered secret prefix", async ({
@@ -350,6 +462,9 @@ test("demo inspector stays fully usable when toast feedback appears", async ({
 	await page.goto(
 		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
 	);
+	await expect(
+		page.locator('[data-dashboard-brand-heading="true"]'),
+	).toBeVisible();
 
 	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
 	await expect(inspector).toBeVisible();
@@ -453,6 +568,9 @@ test("demo inspector grows to fit the full control stack on tall desktops", asyn
 	await page.goto(
 		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
 	);
+	await expect(
+		page.locator('[data-dashboard-brand-heading="true"]'),
+	).toBeVisible();
 
 	await page.getByRole("button", { name: "发布公开页" }).click();
 

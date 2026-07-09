@@ -15,6 +15,11 @@ import {
 } from "react";
 import { useRouterState } from "@tanstack/react-router";
 
+import {
+	DEMO_INSPECTOR_DOCKED_BREAKPOINT_PX,
+	DEMO_INSPECTOR_PANEL_WIDTH_PX,
+	resolveDemoDockedFrameLeft,
+} from "@/demo/layout";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -52,33 +57,13 @@ function clamp(value: number, min: number, max: number) {
 	return Math.min(max, Math.max(min, value));
 }
 
-const DESKTOP_PANEL_WIDTH = 380;
+const DESKTOP_PANEL_WIDTH = DEMO_INSPECTOR_PANEL_WIDTH_PX;
 const DESKTOP_PANEL_GAP = 16;
 const DESKTOP_PANEL_MIN_HEIGHT = 360;
 const DESKTOP_PANEL_FALLBACK_HEIGHT = 640;
 const DESKTOP_PANEL_COLLAPSED_HEIGHT = 52;
 const DESKTOP_PANEL_TOAST_GAP = 12;
 const INSPECTOR_SCROLL_CUE_THRESHOLD = 12;
-const DEMO_CONTENT_SAFE_LEFT_VAR = "--demo-inspector-safe-left";
-const DEMO_CONTENT_SAFE_RIGHT_VAR = "--demo-inspector-safe-right";
-
-function clearDemoContentSafeArea() {
-	if (typeof document === "undefined") return;
-	document.documentElement.style.removeProperty(DEMO_CONTENT_SAFE_LEFT_VAR);
-	document.documentElement.style.removeProperty(DEMO_CONTENT_SAFE_RIGHT_VAR);
-}
-
-function applyDemoContentSafeArea(input: { left: number; right: number }) {
-	if (typeof document === "undefined") return;
-	document.documentElement.style.setProperty(
-		DEMO_CONTENT_SAFE_LEFT_VAR,
-		`${Math.max(0, Math.round(input.left))}px`,
-	);
-	document.documentElement.style.setProperty(
-		DEMO_CONTENT_SAFE_RIGHT_VAR,
-		`${Math.max(0, Math.round(input.right))}px`,
-	);
-}
 
 function getOpenToastBottomInViewport(bounds: { left: number; right: number }) {
 	if (typeof document === "undefined") return 0;
@@ -175,6 +160,9 @@ export function DemoInspector() {
 	const snapshot = useDemoSnapshot();
 	const scene = resolveCurrentDemoScene();
 	const isMobile = useMediaQuery("(max-width: 767px)");
+	const isWideDockedDesktop = useMediaQuery(
+		`(min-width: ${DEMO_INSPECTOR_DOCKED_BREAKPOINT_PX}px)`,
+	);
 	const [mobileOpen, setMobileOpen] = useState(false);
 
 	const routeLocationKey = useRouterState({
@@ -299,6 +287,7 @@ export function DemoInspector() {
 			edge={snapshot.panelLayout.edge}
 			x={snapshot.panelLayout.x}
 			y={snapshot.panelLayout.y}
+			wideDocked={isWideDockedDesktop}
 			onCollapse={() => setCollapsed(true)}
 			onExpand={() => setCollapsed(false)}
 		>
@@ -315,10 +304,12 @@ function DesktopInspectorChrome(props: {
 	edge: "left" | "right";
 	x: number;
 	y: number;
+	wideDocked: boolean;
 	onCollapse: () => void;
 	onExpand: () => void;
 }) {
-	const { children, collapsed, edge, x, y, onCollapse, onExpand } = props;
+	const { children, collapsed, edge, x, y, wideDocked, onCollapse, onExpand } =
+		props;
 	const { headerHeight, viewportBottomInset, viewportTopInset } =
 		useAppShellChrome();
 	const panelRef = useRef<HTMLDivElement | null>(null);
@@ -477,10 +468,14 @@ function DesktopInspectorChrome(props: {
 
 	const frameWidth =
 		panelRef.current?.offsetWidth ?? (collapsed ? 176 : DESKTOP_PANEL_WIDTH);
+	const dockedLeft =
+		typeof window === "undefined"
+			? DESKTOP_PANEL_GAP
+			: resolveDemoDockedFrameLeft(window.innerWidth);
 	const panelMetrics = resolveDesktopPanelMetrics({
 		collapsed,
-		edge,
-		x,
+		edge: wideDocked ? "left" : edge,
+		x: wideDocked ? dockedLeft : x,
 		y,
 		headerHeight,
 		viewportTopInset,
@@ -503,7 +498,7 @@ function DesktopInspectorChrome(props: {
 			);
 
 	useEffect(() => {
-		if (!dragging) return;
+		if (!dragging || wideDocked) return;
 		const initialOffset = dragOffsetRef.current;
 		if (!initialOffset) return;
 
@@ -572,78 +567,13 @@ function DesktopInspectorChrome(props: {
 		viewportBottomInset,
 		viewportRevision,
 		viewportTopInset,
+		wideDocked,
 	]);
 
 	const positionStyle =
-		edge === "left"
+		(wideDocked ? "left" : edge) === "left"
 			? { left: panelMetrics.x, top: panelMetrics.y }
 			: { right: panelMetrics.x, top: panelMetrics.y };
-
-	useLayoutEffect(() => {
-		if (collapsed || !panelRef.current || typeof document === "undefined") {
-			clearDemoContentSafeArea();
-			return;
-		}
-
-		const panelRect = panelRef.current.getBoundingClientRect();
-		const contentFrames = Array.from(
-			document.querySelectorAll<HTMLElement>(
-				"[data-demo-content-frame='true']",
-			),
-		);
-
-		if (contentFrames.length === 0) {
-			clearDemoContentSafeArea();
-			return;
-		}
-
-		let nextSafeLeft = 0;
-		let nextSafeRight = 0;
-
-		for (const frame of contentFrames) {
-			const frameRect = frame.getBoundingClientRect();
-			const verticalOverlap =
-				Math.min(panelRect.bottom, frameRect.bottom) -
-				Math.max(panelRect.top, frameRect.top);
-			if (verticalOverlap <= 0) continue;
-
-			if (
-				panelRect.left <= frameRect.left &&
-				panelRect.right > frameRect.left
-			) {
-				nextSafeLeft = Math.max(
-					nextSafeLeft,
-					panelRect.right - frameRect.left + DESKTOP_PANEL_GAP,
-				);
-			}
-			if (
-				panelRect.right >= frameRect.right &&
-				panelRect.left < frameRect.right
-			) {
-				nextSafeRight = Math.max(
-					nextSafeRight,
-					frameRect.right - panelRect.left + DESKTOP_PANEL_GAP,
-				);
-			}
-		}
-
-		applyDemoContentSafeArea({
-			left: nextSafeLeft,
-			right: nextSafeRight,
-		});
-
-		return () => {
-			clearDemoContentSafeArea();
-		};
-	}, [
-		collapsed,
-		dragging,
-		edge,
-		panelMetrics.x,
-		panelMetrics.y,
-		panelHeight,
-		viewportRevision,
-	]);
 
 	if (collapsed) {
 		return (
@@ -652,6 +582,7 @@ function DesktopInspectorChrome(props: {
 				size="sm"
 				className="fixed z-50 max-w-[calc(100vw-24px)] rounded-full px-4 py-5 shadow-lg"
 				data-demo-inspector-bubble="desktop"
+				data-demo-inspector-mode={wideDocked ? "docked" : "floating"}
 				style={positionStyle}
 				onClick={onExpand}
 			>
@@ -666,6 +597,7 @@ function DesktopInspectorChrome(props: {
 			ref={panelRef}
 			className="fixed z-50 flex w-[380px] max-w-[calc(100vw-24px)] overflow-hidden"
 			data-demo-inspector-chrome="desktop"
+			data-demo-inspector-mode={wideDocked ? "docked" : "floating"}
 			style={{
 				...positionStyle,
 				height: panelHeight,
@@ -679,11 +611,15 @@ function DesktopInspectorChrome(props: {
 				<div
 					ref={titleRef}
 					className={cn(
-						"flex cursor-move items-center justify-between border-b px-4 py-3",
+						"flex items-center justify-between border-b px-4 py-3",
+						!wideDocked && "cursor-move",
 						density === "compact" && "px-3 py-2",
 					)}
 					data-demo-inspector-title="true"
 					onPointerDown={(event) => {
+						if (wideDocked) {
+							return;
+						}
 						if (
 							event.target instanceof HTMLElement &&
 							event.target.closest("button")
@@ -700,7 +636,11 @@ function DesktopInspectorChrome(props: {
 					}}
 				>
 					<div className="flex items-center gap-2">
-						<GripHorizontal className="size-4 text-muted-foreground" />
+						{wideDocked ? (
+							<Inspect className="size-4 text-muted-foreground" />
+						) : (
+							<GripHorizontal className="size-4 text-muted-foreground" />
+						)}
 						<p className="font-medium text-sm">Demo Inspector</p>
 					</div>
 					<Button

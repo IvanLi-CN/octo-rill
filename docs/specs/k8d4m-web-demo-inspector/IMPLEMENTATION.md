@@ -6,7 +6,7 @@
 - Implementation: 已交付
 - Created: 2026-07-08
 - Last: 2026-07-09
-- Summary: fast-track / `/demo/` runtime + floating inspector + Pages assembly 已落地，最后补齐了 deep-link query 保真、MSW 漏拦截、inspector live snapshot 同步、native anchor `/demo` share-state 保真、demo boot failure 安全兜底，以及桌面态 toast 避让 + 视口内高度钳制 + tall viewport 自适应长高，并进一步补上桌面 safe area 与 PAT 固定假 mask，确保 simulated write 可点击且 mock surface 不回显 secret 前缀
+- Summary: fast-track / `/demo/` runtime + floating inspector + Pages assembly 已落地，最后补齐了 deep-link query 保真、MSW 漏拦截、inspector live snapshot 同步、native anchor `/demo` share-state 保真、demo boot failure 安全兜底，以及桌面态 toast 避让 + 视口内高度钳制 + tall viewport 自适应长高，并进一步收口为双态桌面合同：常规宽度保持真正的悬浮覆盖层，超宽视口切到根层双栏 left-docked frame，同时保留按 scene 选择默认停靠边位与 PAT 固定假 mask，确保 simulated write 可点击且 mock surface 不回显 secret 前缀
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 

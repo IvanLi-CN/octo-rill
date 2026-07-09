@@ -12,6 +12,7 @@ import {
 import type {
 	DemoModel,
 	DemoPanelLayout,
+	DemoSceneId,
 	DemoShareStatePatch,
 	DemoShareState,
 	DemoSnapshot,
@@ -44,6 +45,20 @@ const DEFAULT_PANEL_LAYOUT: DemoPanelLayout = {
 	y: 88,
 	collapsed: false,
 };
+
+function buildDefaultPanelLayout(sceneId: DemoSceneId): DemoPanelLayout {
+	if (
+		sceneId === "settings-my-releases" ||
+		sceneId === "public-release-ready"
+	) {
+		return {
+			...DEFAULT_PANEL_LAYOUT,
+			edge: "left",
+		};
+	}
+
+	return { ...DEFAULT_PANEL_LAYOUT };
+}
 
 const listeners = new Set<() => void>();
 
@@ -106,23 +121,24 @@ function canUseStorage() {
 	);
 }
 
-function readPanelLayout(): DemoPanelLayout {
-	if (!canUseStorage()) return DEFAULT_PANEL_LAYOUT;
+function readPanelLayout(sceneId: DemoSceneId): DemoPanelLayout {
+	const sceneDefaultLayout = buildDefaultPanelLayout(sceneId);
+	if (!canUseStorage()) return sceneDefaultLayout;
 	try {
 		const raw = window.localStorage.getItem(DEMO_PANEL_LAYOUT_STORAGE_KEY);
-		if (!raw) return DEFAULT_PANEL_LAYOUT;
+		if (!raw) return sceneDefaultLayout;
 		const parsed = JSON.parse(raw) as Partial<DemoPanelLayout>;
 		return {
 			edge: parsed.edge === "left" ? "left" : "right",
-			x: typeof parsed.x === "number" ? parsed.x : DEFAULT_PANEL_LAYOUT.x,
-			y: typeof parsed.y === "number" ? parsed.y : DEFAULT_PANEL_LAYOUT.y,
+			x: typeof parsed.x === "number" ? parsed.x : sceneDefaultLayout.x,
+			y: typeof parsed.y === "number" ? parsed.y : sceneDefaultLayout.y,
 			collapsed:
 				typeof parsed.collapsed === "boolean"
 					? parsed.collapsed
-					: DEFAULT_PANEL_LAYOUT.collapsed,
+					: sceneDefaultLayout.collapsed,
 		};
 	} catch {
-		return DEFAULT_PANEL_LAYOUT;
+		return sceneDefaultLayout;
 	}
 }
 
@@ -331,10 +347,13 @@ export async function prepareDemoRuntime() {
 	apply404RestoreIfNeeded();
 	const url = new URL(window.location.href);
 	const active = isDemoUrl(url);
+	const initialShareState = active
+		? readDemoShareState(url, demoBasepath())
+		: runtimeState.shareState;
 
 	runtimeState.demoBuild = demoBuildEnabled();
 	runtimeState.basepath = demoBasepath();
-	runtimeState.panelLayout = readPanelLayout();
+	runtimeState.panelLayout = readPanelLayout(initialShareState.sceneId);
 	runtimeState.lastSyncedHref = `${url.pathname}${url.search}${url.hash}`;
 	runtimeState.active = active;
 

@@ -1,8 +1,14 @@
-import { lazy, Suspense } from "react";
+import { type CSSProperties, lazy, type ReactNode, Suspense } from "react";
 import { createRootRoute, Outlet } from "@tanstack/react-router";
 
 import { useAuthBootstrap } from "@/auth/AuthBootstrap";
-import { isDemoMode } from "@/demo/runtime";
+import {
+	DEMO_INSPECTOR_DOCKED_BREAKPOINT_PX,
+	DEMO_INSPECTOR_DOCKED_CONTENT_OFFSET_PX,
+	DEMO_INSPECTOR_DOCKED_LAYOUT_WIDTH_PX,
+} from "@/demo/layout";
+import { isDemoMode, shouldPrepareDemoRuntime } from "@/demo/runtime";
+import { useMediaQuery } from "@/lib/useMediaQuery";
 import { AppBoot } from "@/pages/AppBoot";
 import { NotFoundPage } from "@/pages/NotFound";
 
@@ -27,7 +33,9 @@ function RootRouteComponent() {
 
 	return (
 		<>
-			<Outlet />
+			<DemoRootFrame>
+				<Outlet />
+			</DemoRootFrame>
 			<DemoInspectorMount />
 		</>
 	);
@@ -57,5 +65,31 @@ function DemoInspectorMount() {
 		<Suspense fallback={null}>
 			<LazyDemoInspector />
 		</Suspense>
+	);
+}
+
+function DemoRootFrame(props: { children: ReactNode }) {
+	const demoWideDocked = useMediaQuery(
+		`(min-width: ${DEMO_INSPECTOR_DOCKED_BREAKPOINT_PX}px)`,
+	);
+	const demoActive = isDemoMode() || shouldPrepareDemoRuntime();
+
+	if (!demoActive || !demoWideDocked) {
+		return <>{props.children}</>;
+	}
+
+	return (
+		<div
+			className="mx-auto w-full min-w-0"
+			data-demo-root-frame="wide"
+			style={
+				{
+					maxWidth: `${DEMO_INSPECTOR_DOCKED_LAYOUT_WIDTH_PX}px`,
+					paddingLeft: `${DEMO_INSPECTOR_DOCKED_CONTENT_OFFSET_PX}px`,
+				} as CSSProperties
+			}
+		>
+			{props.children}
+		</div>
 	);
 }

@@ -155,11 +155,35 @@
   submission_gate: `captured`
   PR: include
   captured_at: `2026-07-09`
+  route: `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
+  state: `dashboard-repo-publish`
+  evidence_note: 常规桌面宽度下，Dashboard demo inspector 保持真正的悬浮覆盖层：repo summary 与公开页卡片会继续铺到 inspector 下方，而不是为了 inspector 额外挤出版心。该场景由 Playwright 几何回归断言 `summaryRight > panelLeft` 保护。
+
+![Desktop dashboard demo with floating overlay inspector](./assets/dashboard-desktop-floating-overlay.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  submission_gate: `captured`
+  PR: include
+  captured_at: `2026-07-09`
+  route: `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
+  state: `dashboard-repo-publish`
+  evidence_note: 超宽桌面宽度下，根层会切成专用双栏 frame：左侧固定 demo inspector，右侧保留现有 Web App 最宽版心。该场景由新增 Playwright 断言保护：`data-demo-root-frame="wide"` 必须出现，且 `summaryLeft > inspectorRight + 16`。
+
+![Ultra-wide desktop dashboard demo with docked left inspector](./assets/dashboard-desktop-wide-docked-left.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  submission_gate: `captured`
+  PR: include
+  captured_at: `2026-07-09`
   route: `/demo/settings?section=api-keys&demo=settings-my-releases`
   state: `settings-my-releases`
-  evidence_note: 桌面态 Settings 在右侧 inspector 展开时，主内容会自动让出 safe area，因此 `创建 API Key` 等 simulated write 控件不会再被浮窗压住；同一路径下保存 GitHub PAT 时也只回显固定 demo mask，不泄漏用户输入的 secret 前缀。
+  evidence_note: 桌面态 Settings 不再为了 inspector 改写正文版心；inspector 保持真正的悬浮覆盖层，同时该 scene 默认停靠在左侧，确保 `创建 API Key` 等 simulated write 主操作在首屏内仍可直接点击；同一路径下保存 GitHub PAT 时也只回显固定 demo mask，不泄漏用户输入的 secret 前缀。
 
-![Desktop settings demo with safe area and simulated API keys](./assets/settings-api-keys-safe-area.png)
+![Desktop settings demo with floating overlay inspector](./assets/settings-api-keys-floating-overlay.png)
 
 - source_type: `ui_demo`
   target_program: `mock-only`
