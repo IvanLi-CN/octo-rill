@@ -8,7 +8,11 @@ import {
 	DEMO_INSPECTOR_DOCKED_CONTENT_OFFSET_PX,
 	DEMO_INSPECTOR_DOCKED_VIEWPORT_GUTTER_PX,
 } from "@/demo/layout";
-import { isDemoMode, shouldPrepareDemoRuntime } from "@/demo/runtime";
+import {
+	isDemoMode,
+	shouldPrepareDemoRuntime,
+	useDemoSnapshot,
+} from "@/demo/runtime";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import { AppBoot } from "@/pages/AppBoot";
 import { NotFoundPage } from "@/pages/NotFound";
@@ -27,11 +31,13 @@ export const Route = createRootRoute({
 
 function RootRouteComponent() {
 	const auth = useAuthBootstrap();
+	const demoSnapshot = useDemoSnapshot();
 	const demoWideDocked = useMediaQuery(
 		`(min-width: ${DEMO_INSPECTOR_DOCKED_BREAKPOINT_PX}px)`,
 	);
 	const demoActive = isDemoMode() || shouldPrepareDemoRuntime();
-	const showWideDockedLayout = demoActive && demoWideDocked;
+	const showWideDockedLayout =
+		demoActive && demoWideDocked && !demoSnapshot.panelLayout.collapsed;
 
 	if (auth.isBootstrapping && auth.bootPresentation === "cold-init") {
 		return <AppBoot />;

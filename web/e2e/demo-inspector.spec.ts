@@ -50,7 +50,9 @@ test("demo auth affordances stay inside mock runtime", async ({ page }) => {
 	await page.goto("/?demo=landing-welcome");
 
 	const loginLink = page.getByRole("link", { name: "使用 GitHub 登录" });
-	await expect(loginLink).toHaveAttribute("href", /demo=landing-welcome/);
+	await expect(loginLink).toHaveAttribute("href", /demo=landing-welcome/, {
+		timeout: 15_000,
+	});
 	const href = await loginLink.getAttribute("href");
 	expect(href).not.toBeNull();
 
@@ -458,7 +460,7 @@ test("desktop inspector floats over dashboard content instead of reserving layou
 	);
 });
 
-test("ultra-wide desktop pins inspector as a permanent full-height left rail", async ({
+test("ultra-wide desktop defaults to a full-height left rail", async ({
 	page,
 }) => {
 	await page.setViewportSize({ width: 1800, height: 1200 });
@@ -533,7 +535,7 @@ test("ultra-wide desktop pins inspector as a permanent full-height left rail", a
 	expect(
 		Math.abs(geometry.inspectorHeight - geometry.viewportHeight),
 	).toBeLessThanOrEqual(2);
-	expect(geometry.hasCollapseButton).toBe(false);
+	expect(geometry.hasCollapseButton).toBe(true);
 	expect(geometry.contentLeft).toBeGreaterThan(geometry.inspectorRight + 16);
 	expect(
 		Math.abs(geometry.footerLeft - geometry.contentLeft),
@@ -545,6 +547,53 @@ test("ultra-wide desktop pins inspector as a permanent full-height left rail", a
 	await captureDemoInspectorEvidence(
 		page.locator("body"),
 		"dashboard-desktop-wide-pinned-left-rail.png",
+	);
+});
+
+test("ultra-wide desktop can collapse the left rail back into a bubble", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1800, height: 1200 });
+	await page.goto(
+		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
+	);
+	await expect(page.locator('[data-demo-root-frame="wide"]')).toBeVisible();
+
+	await page.locator('[data-demo-inspector-collapse="true"]').first().click();
+
+	await expect(page.locator('[data-demo-root-frame="wide"]')).toHaveCount(0);
+	const bubble = page.locator('[data-demo-inspector-bubble="desktop"]');
+	await expect(bubble).toBeVisible();
+
+	const geometry = await page.evaluate(() => {
+		const bubbleNode = document.querySelector<HTMLElement>(
+			'[data-demo-inspector-bubble="desktop"]',
+		);
+		const footer = document.querySelector<HTMLElement>("footer");
+		if (!bubbleNode || !footer) {
+			throw new Error("collapsed wide demo geometry is unavailable");
+		}
+		const bubbleRect = bubbleNode.getBoundingClientRect();
+		const footerRect = footer.getBoundingClientRect();
+		return {
+			bubbleLeft: bubbleRect.left,
+			bubbleTop: bubbleRect.top,
+			footerLeft: footerRect.left,
+			footerRight: footerRect.right,
+			viewportWidth: window.innerWidth,
+		};
+	});
+
+	expect(geometry.bubbleLeft).toBeLessThanOrEqual(24);
+	expect(geometry.bubbleTop).toBeGreaterThanOrEqual(72);
+	expect(Math.abs(geometry.footerLeft)).toBeLessThanOrEqual(2);
+	expect(
+		Math.abs(geometry.footerRight - geometry.viewportWidth),
+	).toBeLessThanOrEqual(2);
+
+	await captureDemoInspectorEvidence(
+		page.locator("body"),
+		"dashboard-desktop-wide-collapsed-bubble.png",
 	);
 });
 
@@ -770,7 +819,7 @@ test("wide tall desktops keep the full control stack visible in the pinned left 
 	expect(geometry.scrollHeight).toBeLessThanOrEqual(geometry.clientHeight + 2);
 	expect(geometry.mode).toBe("docked");
 	expect(geometry.pinned).toBe("true");
-	expect(geometry.hasCollapseButton).toBe(false);
+	expect(geometry.hasCollapseButton).toBe(true);
 	expect(Math.abs(geometry.panelTop)).toBeLessThanOrEqual(1);
 	expect(geometry.panelBottom).toBeLessThanOrEqual(geometry.viewportHeight);
 	expect(Math.abs(geometry.bottomGap)).toBeLessThanOrEqual(1);

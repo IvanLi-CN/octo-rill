@@ -118,7 +118,7 @@ export const WideDockedRail: Story = {
 	},
 	render: (args) => (
 		<div className="h-[820px] w-[380px] overflow-hidden">
-			<DemoInspectorDockedRail>
+			<DemoInspectorDockedRail onCollapse={fn()}>
 				{({ density }) => <DemoInspectorPanel {...args} density={density} />}
 			</DemoInspectorDockedRail>
 		</div>
@@ -130,5 +130,10 @@ export const WideDockedRail: Story = {
 		).toBeInTheDocument();
 		await expect(canvas.getByText("Dashboard")).toBeInTheDocument();
 		await expect(canvas.getByText("Copy Share URL")).toBeInTheDocument();
+		await expect(
+			canvasElement.ownerDocument.body.querySelector(
+				'[data-demo-inspector-collapse="true"]',
+			),
+		).toBeTruthy();
 	},
 };

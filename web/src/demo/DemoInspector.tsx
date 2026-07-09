@@ -61,6 +61,8 @@ const DESKTOP_PANEL_FALLBACK_HEIGHT = 640;
 const DESKTOP_PANEL_COLLAPSED_HEIGHT = 52;
 const DESKTOP_PANEL_TOAST_GAP = 12;
 const INSPECTOR_SCROLL_CUE_THRESHOLD = 12;
+const WIDE_DOCKED_BUBBLE_X = 16;
+const WIDE_DOCKED_BUBBLE_Y = 88;
 
 function getOpenToastBottomInViewport(bounds: { left: number; right: number }) {
 	if (typeof document === "undefined") return 0;
@@ -332,6 +334,15 @@ export function DemoInspector(props: {
 		updateDemoPanelLayout({ collapsed });
 	};
 
+	const collapseToBubble = () => {
+		updateDemoPanelLayout({
+			collapsed: true,
+			edge: "left",
+			x: WIDE_DOCKED_BUBBLE_X,
+			y: WIDE_DOCKED_BUBBLE_Y,
+		});
+	};
+
 	const resetToSceneDefaults = () => {
 		replaceDemoLocation(
 			buildCurrentDemoHref(
@@ -389,7 +400,7 @@ export function DemoInspector(props: {
 
 	if (props.desktopMode === "docked-sidebar") {
 		return (
-			<DemoInspectorDockedRail>
+			<DemoInspectorDockedRail onCollapse={collapseToBubble}>
 				{({ density }) => (
 					<DemoInspectorPanel {...panelProps} density={density} />
 				)}
@@ -414,6 +425,7 @@ export function DemoInspector(props: {
 }
 
 export function DemoInspectorDockedRail(props: {
+	onCollapse: () => void;
 	children: (input: { density: "default" | "compact" }) => ReactNode;
 }) {
 	const scrollerRef = useRef<HTMLDivElement | null>(null);
@@ -437,20 +449,33 @@ export function DemoInspectorDockedRail(props: {
 		>
 			<div
 				className={cn(
-					"flex items-center gap-3 border-b px-4 py-4",
+					"flex items-center justify-between gap-3 border-b px-4 py-4",
 					density === "compact" && "px-3 py-3",
 				)}
 				data-demo-inspector-title="true"
 			>
-				<div className="flex size-9 shrink-0 items-center justify-center rounded-2xl border bg-muted/35">
-					<Inspect className="size-4 text-muted-foreground" />
+				<div className="flex min-w-0 items-center gap-3">
+					<div className="flex size-9 shrink-0 items-center justify-center rounded-2xl border bg-muted/35">
+						<Inspect className="size-4 text-muted-foreground" />
+					</div>
+					<div className="min-w-0">
+						<p className="font-medium text-sm">Demo Inspector</p>
+						<p className="text-muted-foreground text-xs">
+							Pinned on wide desktop
+						</p>
+					</div>
 				</div>
-				<div className="min-w-0">
-					<p className="font-medium text-sm">Demo Inspector</p>
-					<p className="text-muted-foreground text-xs">
-						Pinned on wide desktop
-					</p>
-				</div>
+				<Button
+					type="button"
+					size="icon"
+					variant="ghost"
+					className={cn("shrink-0", density === "compact" && "size-8")}
+					aria-label="Collapse Demo Inspector"
+					data-demo-inspector-collapse="true"
+					onClick={props.onCollapse}
+				>
+					<Minimize2 className="size-4" />
+				</Button>
 			</div>
 			<div className="relative min-h-0 flex-1">
 				{scrollCues.showTop ? (
@@ -735,6 +760,7 @@ function DesktopInspectorChrome(props: {
 						size="icon"
 						variant="ghost"
 						className={cn(density === "compact" && "size-8")}
+						aria-label="Collapse Demo Inspector"
 						data-demo-inspector-collapse="true"
 						onPointerDown={(event) => event.stopPropagation()}
 						onClick={onCollapse}

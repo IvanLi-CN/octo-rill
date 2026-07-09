@@ -13,7 +13,7 @@
 - 冻结 `/demo/` 为公开 `web demo` 子应用前缀，使用 `demo=<scene-id>` 作为 scene 入口，`d_*` 作为分享态命名空间。
 - 让 demo runtime 在 `AuthBootstrap` 之前完成模式识别与 MSW worker 启动，确保 mock-only 模式不会命中真实 `/api/**`、真实登录或真实后端写路径。
 - 首版覆盖 `Landing / Dashboard / Settings / Public Release / Admin Panel / Admin Jobs` 六个页面级 surface。
-- 交付结构化 inspector：常规桌面宽度保持可悬浮、可吸边、可收起；当浏览器宽度足够容纳 Web App 最宽版心时，切换为永久显示、不可关闭、固定贴住视口最左边且占满全高的 pinned left rail；同时支持 scene、persona、network、关键 data toggles、share link 与 recent simulated writes。
+- 交付结构化 inspector：常规桌面宽度保持可悬浮、可吸边、可收起；当浏览器宽度足够容纳 Web App 最宽版心时，默认切换为固定贴住视口最左边、占满全高的 pinned left rail，但仍支持收起成 bubble 以恢复正常 Web App layout；同时支持 scene、persona、network、关键 data toggles、share link 与 recent simulated writes。
 - 把 GitHub Pages 装配扩展为 `docs-site + /storybook/ + /demo/`，并在根 `404.html` 上只对 `/demo/**` 开启 deep-link recovery。
 
 ### Non-goals
@@ -68,7 +68,7 @@
   - 常规桌面宽度下拖拽结束后吸附到左右边缘
   - 常规桌面宽度下可收起为气泡
   - 常规桌面宽度下布局位置持久化到 localStorage
-  - 当浏览器宽度足够容纳 Web App 最宽版心时，切换为 root-level 双栏：左侧 inspector 固定贴住视口最左边、占满全高、永久显示且不支持关闭；右侧继续承载现有 Web App layout
+  - 当浏览器宽度足够容纳 Web App 最宽版心时，默认切换为 root-level 双栏：左侧 inspector 固定贴住视口最左边并占满全高；收起后退回 bubble，右侧 Web App layout 恢复正常版心以便确认一般效果
 - 移动端：
   - 默认只显示 bubble
   - 点击 bubble 后打开 drawer
@@ -109,7 +109,7 @@
 ## 验收标准（Acceptance Criteria）
 
 1. Given Pages 站点已构建，When 打开 `/demo/` 与六个目标 route 的 scene deep link，Then 页面都进入 mock-only runtime，且不依赖真实认证或真实 `/api/**`。
-2. Given demo 处于常规桌面宽度，When 拖拽 inspector 并释放，Then 面板会吸附左右边缘且位置被记住；When 收起后，Then 会变成可点击恢复的气泡。Given demo 处于足够宽的桌面视口，When 页面进入 wide layout，Then inspector 会切成永久显示、不可关闭、固定贴住视口最左边且占满全高的 pinned left rail。
+2. Given demo 处于常规桌面宽度，When 拖拽 inspector 并释放，Then 面板会吸附左右边缘且位置被记住；When 收起后，Then 会变成可点击恢复的气泡。Given demo 处于足够宽的桌面视口，When 页面进入 wide layout，Then inspector 会默认展开为固定贴住视口最左边且占满全高的 pinned left rail；When 在该状态下点击收起，Then inspector 会退回 bubble，且页面恢复正常 Web App layout。
 3. Given demo 处于移动端，When 点击 bubble，Then inspector 以 drawer 打开。
 4. Given Settings / Dashboard / Admin 页面触发保存、发布、取消、重试等动作，When 操作完成，Then UI 立即回显 mock-only 结果，且 recent mutations 中留下 simulated 记录。
 5. Given GitHub Pages 直接访问 `/demo/**` 深链，When GitHub Pages 回落到根 `404.html`，Then 404 shim 会恢复到对应 demo route，而 docs-site 其它 404 路径保持普通文档站行为。
@@ -170,9 +170,21 @@
   captured_at: `2026-07-09`
   route: `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
   state: `dashboard-repo-publish`
-  evidence_note: 超宽桌面宽度下，根层会切成 root-level 双栏：左侧 inspector 固定贴住视口最左边并占满全高，永久显示且不支持关闭；右侧继续承载现有 Web App 最宽版心。footer 也必须跟随右侧 Web App Layout 的 left/right gutter，而不是继续铺到 pinned rail 后方。该场景由 Playwright 几何回归断言保护：`data-demo-root-frame="wide"` 必须出现，且 inspector 需要满足 `left=0`、`top=0`、`height=viewportHeight`、无 collapse button，同时 `footerLeft === contentLeft`、`footerRight === contentRight` 且 `summaryLeft > inspectorRight + 16`。
+  evidence_note: 超宽桌面宽度下，根层会默认切成 root-level 双栏：左侧 inspector 固定贴住视口最左边并占满全高，右侧继续承载现有 Web App 最宽版心；此时 footer 必须跟随右侧 Web App Layout 的 left/right gutter，而不是继续铺到 pinned rail 后方。该场景由 Playwright 几何回归断言保护：`data-demo-root-frame="wide"` 必须出现，且 inspector 需要满足 `left=0`、`top=0`、`height=viewportHeight`、存在 collapse button，同时 `footerLeft === contentLeft`、`footerRight === contentRight` 且 `summaryLeft > inspectorRight + 16`。
 
 ![Ultra-wide desktop dashboard demo with pinned left rail](./assets/dashboard-desktop-wide-pinned-left-rail.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  submission_gate: `captured`
+  PR: include
+  captured_at: `2026-07-09`
+  route: `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
+  state: `dashboard-repo-publish`
+  evidence_note: 超宽桌面宽度下收起 pinned rail 后，inspector 会退回左上 bubble，根层双栏 frame 消失，页面恢复正常 Web App layout，方便确认无调试面板占位时的一般效果。该场景由 Playwright 回归断言保护：collapse 后 `data-demo-root-frame="wide"` 消失、bubble 出现，且 footer 会回到普通 viewport 宽度。
+
+![Ultra-wide desktop dashboard demo with collapsed bubble](./assets/dashboard-desktop-wide-collapsed-bubble.png)
 
 - source_type: `ui_demo`
   target_program: `mock-only`
