@@ -14,7 +14,7 @@
 - 当前 GitHub viewer-owned personal private repo 可由拥有者登录后显式发布，发布后复用同一个公开 Release 落地页 `/:owner/:repo/releases`；取消发布后匿名访问不得继续暴露该私有仓库内容。
 - `/public/:owner/:repo/releases` 作为旧列表路径兼容入口，必须 replace 跳转到 `/:owner/:repo/releases`。
 - 公开 Release 页面页脚展示当前 OctoRill 前端加载版本，并链接到 OctoRill 自身 public-only Release 详情页，登录态不得把该链接切到 Dashboard。
-- 首次访问先登记仓库 usage；若本地已有近期刷新且明确公开的仓库 metadata 与非草稿 Release 缓存，则直接复用共享缓存返回 ready；若只有近期公开 metadata 但尚无 Release 缓存，则回填 `repo_id` 并返回可重试 pending 响应；若本地无法确认近期公开 metadata，则返回 metadata pending。
+- 首次访问先登记仓库 usage；若本地已有近期刷新且带真实 privacy proof 的公开仓库 metadata 与非草稿 Release 缓存，则直接复用共享缓存返回 ready；若只有近期公开 metadata 但尚无 Release 缓存，则回填 `repo_id` 并返回可重试 pending 响应；若本地无法确认近期公开 metadata，则返回 metadata pending。
 - 公开端点与登录用户视图复用同一份仓库级 `repo_releases` 主数据。
 - 管理后台展示公开端点登记仓库、访问统计、同步状态、共享缓存数据量，并允许删除登记记录。
 
@@ -111,7 +111,7 @@
   When 请求到达服务端
   Then 响应为 `202 Accepted`，包含 `Retry-After` 与 pending JSON。
 
-- Given 第三方首次调用公开 API 且本地已有近期公开仓库 metadata 与共享 Release 缓存
+- Given 第三方首次调用公开 API 且本地已有近期可信公开仓库 metadata 与共享 Release 缓存
   When 请求到达服务端
   Then 响应为 `200 OK`，并将公开 usage 回填到已知 `repo_id`。
 
@@ -134,6 +134,13 @@
   PR: include
   image:
   ![公开 Release 等待同步状态](./assets/public-release-evidence-pending-mobile-v8.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `public-publicreleasepage--owned-public-cache-ready`
+  state: `public-owned-repo-cache-ready`
+  evidence_note: 验证 public owned repo 在本地已具备可信公开 metadata 且共享 `repo_releases` 已缓存时，canonical `/:owner/:repo/releases` 首访直接展示 ready 列表；页面标题、卡片 repo identity 与 GitHub 跳转都指向 `IvanLi-CN/tuckmark`，且不会误落入“Release 数据同步中”等待卡。
+  image:
+  ![public owned repo 首访直接复用共享 Release 缓存](./assets/public-release-evidence-owned-public-ready-v1.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `public-publicreleasepage--release-list`
