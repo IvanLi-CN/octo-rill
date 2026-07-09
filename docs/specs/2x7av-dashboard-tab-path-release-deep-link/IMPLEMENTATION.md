@@ -6,7 +6,7 @@
 - Implementation: 已交付
 - Created: 2026-04-22
 - Last: 2026-04-24
-- Summary: 已交付；path-backed tabs / repo-tag release locator / browser URL proof / post-review hardening landed
+- Summary: 已交付；path-backed tabs / repo-tag release locator / browser URL proof / post-review hardening landed；discussion canonical deep-link follow-up tracked in `#m8f2q`
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 

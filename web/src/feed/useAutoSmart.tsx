@@ -7,7 +7,12 @@ import {
 	isPendingTranslationResultStatus,
 } from "@/api";
 import { translationErrorIsRetryable } from "@/feed/retryableErrors";
-import { isReleaseFeedItem, type FeedItem, type SmartItem } from "@/feed/types";
+import {
+	isAnnouncementFeedItem,
+	isLaneCapableFeedItem,
+	type FeedItem,
+	type SmartItem,
+} from "@/feed/types";
 
 const RESOLVE_RESULTS_MAX_ITEMS = 60;
 const SECONDARY_PREFETCH_COUNT = 10;
@@ -58,6 +63,44 @@ function buildReleaseSmartRequestItem(
 		],
 		target_slots: ["title_zh", "body_md"],
 	};
+}
+
+function buildAnnouncementSmartRequestItem(
+	item: FeedItem,
+): TranslationRequestItemInput {
+	const title = item.title?.trim() || `announcement:${item.id}`;
+	const body = item.body?.trim();
+	const discussionNumber =
+		isAnnouncementFeedItem(item) && item.discussion_number
+			? `discussion_number=${item.discussion_number}`
+			: null;
+	const metadata = [item.repo_full_name, discussionNumber]
+		.filter((value): value is string => Boolean(value?.trim()))
+		.join("\n");
+	const entityId =
+		isAnnouncementFeedItem(item) && item.discussion_key
+			? item.discussion_key
+			: item.id;
+	return {
+		producer_ref: `feed.smart:announcement:${entityId}`,
+		kind: "announcement_smart",
+		variant: "feed_card",
+		entity_id: entityId,
+		target_lang: "zh-CN",
+		max_wait_ms: AUTO_SMART_MAX_WAIT_MS,
+		source_blocks: [
+			{ slot: "title", text: title },
+			...(body ? [{ slot: "body_markdown" as const, text: body }] : []),
+			...(metadata ? [{ slot: "metadata" as const, text: metadata }] : []),
+		],
+		target_slots: ["title_zh", "body_md"],
+	};
+}
+
+function buildSmartRequestItem(item: FeedItem): TranslationRequestItemInput {
+	return isAnnouncementFeedItem(item)
+		? buildAnnouncementSmartRequestItem(item)
+		: buildReleaseSmartRequestItem(item);
 }
 
 function mapTranslationItemToFeedSmart(item: {
@@ -311,7 +354,7 @@ export function useAutoSmart(params: {
 	const shouldAutoSmart = useCallback(
 		(item: FeedItem) =>
 			enabled &&
-			isReleaseFeedItem(item) &&
+			isLaneCapableFeedItem(item) &&
 			((item.smart?.status === "missing" &&
 				item.smart.auto_translate !== false) ||
 				(item.smart?.status === "ready" &&
@@ -323,7 +366,7 @@ export function useAutoSmart(params: {
 	const shouldAutoRetryLoadedError = useCallback(
 		(item: FeedItem) =>
 			enabled &&
-			isReleaseFeedItem(item) &&
+			isLaneCapableFeedItem(item) &&
 			item.smart?.status === "error" &&
 			feedSmartIsRetryable(item) &&
 			!autoRetriedKeysRef.current.has(keyOf(item)),
@@ -359,7 +402,7 @@ export function useAutoSmart(params: {
 			}
 			const key = keyOf(item);
 			itemByKeyRef.current.set(key, item);
-			const requestItem = buildReleaseSmartRequestItem(item);
+			const requestItem = buildSmartRequestItem(item);
 			const sourceKey = buildRequestSourceKey(requestItem);
 			const existing = requestTasksRef.current.get(key);
 			if (existing) {
@@ -680,7 +723,7 @@ export function useAutoSmart(params: {
 			for (const candidate of rawCandidates) {
 				const latestItem =
 					itemByKeyRef.current.get(candidate.key) ?? candidate.item;
-				const requestItem = buildReleaseSmartRequestItem(latestItem);
+				const requestItem = buildSmartRequestItem(latestItem);
 				const sourceKey = buildRequestSourceKey(requestItem);
 				const existing = requestTasksRef.current.get(candidate.key);
 				if (existing && existing.sourceKey === sourceKey) {
@@ -780,7 +823,7 @@ export function useAutoSmart(params: {
 				failedRef.current.delete(key);
 				retryCountRef.current.delete(key);
 				itemByKeyRef.current.set(key, item);
-				const requestItem = buildReleaseSmartRequestItem(item);
+				const requestItem = buildSmartRequestItem(item);
 				const sourceKey = buildRequestSourceKey(requestItem);
 				candidates.push({
 					key,
@@ -908,11 +951,11 @@ export function useAutoSmart(params: {
 
 	const smartNow = useCallback(
 		async (item: FeedItem) => {
-			if (!isReleaseFeedItem(item)) {
+			if (!isLaneCapableFeedItem(item)) {
 				return null;
 			}
 			const key = keyOf(item);
-			const requestItem = buildReleaseSmartRequestItem(item);
+			const requestItem = buildSmartRequestItem(item);
 			const sourceKey = buildRequestSourceKey(requestItem);
 			failedRef.current.delete(key);
 			retryCountRef.current.delete(key);

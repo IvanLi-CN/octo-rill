@@ -6,7 +6,7 @@
 - Implementation: 已交付
 - Created: 2026-04-07
 - Last: 2026-06-29
-- Summary: 已交付；PR #53; page-level lane selector, segmented selector polish, visual evidence refreshed, translation empty-content retries capped at 8 attempts in-call, native title removed from card lane tooltip triggers, Dashboard page-level lane selector styling refreshed with Storybook evidence, upstream chat 403 release translation/polish failures are recoverable through foreground generation plus `retry.recent_failures`, release-smart canonical feed lookup now anchors on the target release before repo-local previous-tag resolution to avoid global visible-release sorting under translation load, and Dashboard feed now auto-rescues retryable smart failures once per page session with a neutral waiting state
+- Summary: 已交付；PR #53; page-level lane selector, segmented selector polish, visual evidence refreshed, translation empty-content retries capped at 8 attempts in-call, native title removed from card lane tooltip triggers, Dashboard page-level lane selector styling refreshed with Storybook evidence, upstream chat 403 release translation/polish failures are recoverable through foreground generation plus `retry.recent_failures`, release-smart canonical feed lookup now anchors on the target release before repo-local previous-tag resolution to avoid global visible-release sorting under translation load, Dashboard feed now auto-rescues retryable smart failures once per page session with a neutral waiting state, and the shared lane contract is reused by announcement reading in `#m8f2q`
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 

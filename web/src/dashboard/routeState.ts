@@ -1,4 +1,4 @@
-import type { ReleaseDetailResponse } from "@/api";
+import type { AnnouncementDetailResponse, ReleaseDetailResponse } from "@/api";
 import {
 	copyDemoSearchParams,
 	readCurrentDemoSearchParams,
@@ -10,6 +10,12 @@ export type DashboardReleaseLocator = {
 	owner: string;
 	repo: string;
 	tag: string;
+};
+
+export type DashboardDiscussionLocator = {
+	owner: string;
+	repo: string;
+	number: string;
 };
 
 export type DashboardScope =
@@ -47,6 +53,7 @@ export type DashboardRouteState = {
 	scope: DashboardScope | null;
 	activeReleaseId: string | null;
 	activeReleaseLocator: DashboardReleaseLocator | null;
+	activeAnnouncementLocator: DashboardDiscussionLocator | null;
 	releaseReturnTab: DashboardTab;
 };
 
@@ -55,6 +62,7 @@ export type DashboardWarmRouteState = {
 	scopeSignature: string | null;
 	activeReleaseId: string | null;
 	activeReleaseLocatorKey: string | null;
+	activeAnnouncementLocatorKey: string | null;
 	releaseReturnTab: DashboardTab;
 };
 
@@ -217,6 +225,12 @@ export function buildDashboardReleasePath(locator: DashboardReleaseLocator) {
 	return `/${encodeSegment(locator.owner)}/${encodeSegment(locator.repo)}/releases/tag/${encodeSegment(locator.tag)}`;
 }
 
+export function buildDashboardDiscussionPath(
+	locator: DashboardDiscussionLocator,
+) {
+	return `/${encodeSegment(locator.owner)}/${encodeSegment(locator.repo)}/discussions/${encodeSegment(locator.number)}`;
+}
+
 function buildDashboardScopeQueryParams(scope: DashboardScope | null) {
 	const params = new URLSearchParams();
 	if (!scope) return params;
@@ -298,7 +312,34 @@ export function buildDashboardReleaseHref(
 	return `${buildDashboardReleasePath(locator)}${query ? `?${query}` : ""}`;
 }
 
+export function buildDashboardDiscussionHref(
+	locator: DashboardDiscussionLocator,
+	fromTab: DashboardTab = "briefs",
+	options?: {
+		scope?: DashboardScope | null;
+	},
+) {
+	const params = buildDashboardScopeQueryParams(options?.scope ?? null);
+	params.set(
+		"from",
+		normalizeDashboardReturnTab(fromTab, options?.scope ?? null),
+	);
+	const query = params.toString();
+	return `${buildDashboardDiscussionPath(locator)}${query ? `?${query}` : ""}`;
+}
+
 export function buildDashboardRouteUrl(routeState: DashboardRouteState) {
+	if (routeState.activeAnnouncementLocator) {
+		const href = buildDashboardDiscussionHref(
+			routeState.activeAnnouncementLocator,
+			routeState.releaseReturnTab,
+			{ scope: routeState.scope },
+		);
+		if (typeof window === "undefined") {
+			return href;
+		}
+		return preserveDashboardDemoHref(href);
+	}
 	if (routeState.activeReleaseLocator) {
 		const href = buildDashboardReleaseHref(
 			routeState.activeReleaseLocator,
@@ -353,6 +394,28 @@ function preserveDashboardDemoHref(href: string) {
 export function buildDashboardRouteNavigation(
 	routeState: DashboardRouteState,
 ): DashboardRouteNavigation {
+	if (routeState.activeAnnouncementLocator) {
+		const params = buildDashboardScopeQueryParams(routeState.scope);
+		params.set(
+			"from",
+			normalizeDashboardReturnTab(
+				routeState.releaseReturnTab,
+				routeState.scope,
+			),
+		);
+		if (typeof window !== "undefined") {
+			copyDemoSearchParams(readCurrentDemoSearchParams(), params);
+		}
+		return {
+			to: "/$owner/$repo/discussions/$number",
+			params: {
+				owner: routeState.activeAnnouncementLocator.owner,
+				repo: routeState.activeAnnouncementLocator.repo,
+				number: routeState.activeAnnouncementLocator.number,
+			},
+			search: searchObjectFromParams(params),
+		};
+	}
 	if (routeState.activeReleaseLocator) {
 		const params = buildDashboardScopeQueryParams(routeState.scope);
 		params.set(
@@ -460,6 +523,9 @@ export function buildDashboardWarmRouteState(
 		activeReleaseLocatorKey: routeState.activeReleaseLocator
 			? buildDashboardReleaseLocatorKey(routeState.activeReleaseLocator)
 			: null,
+		activeAnnouncementLocatorKey: routeState.activeAnnouncementLocator
+			? buildDashboardDiscussionLocatorKey(routeState.activeAnnouncementLocator)
+			: null,
 		releaseReturnTab: routeState.releaseReturnTab,
 	};
 }
@@ -468,6 +534,12 @@ export function buildDashboardReleaseLocatorKey(
 	locator: DashboardReleaseLocator,
 ) {
 	return `${locator.owner.toLowerCase()}/${locator.repo.toLowerCase()}#${locator.tag}`;
+}
+
+export function buildDashboardDiscussionLocatorKey(
+	locator: DashboardDiscussionLocator,
+) {
+	return `${locator.owner.toLowerCase()}/${locator.repo.toLowerCase()}#${locator.number}`;
 }
 
 function parseDashboardReleasePathname(
@@ -481,6 +553,19 @@ function parseDashboardReleasePathname(
 	const tag = decodeSegment(segments[4] ?? "");
 	if (!owner || !repo || !tag) return null;
 	return { owner, repo, tag };
+}
+
+function parseDashboardDiscussionPathname(
+	pathname: string,
+): DashboardDiscussionLocator | null {
+	const segments = normalizePathname(pathname).split("/").filter(Boolean);
+	if (segments.length !== 4) return null;
+	if (segments[2] !== "discussions") return null;
+	const owner = decodeSegment(segments[0] ?? "").trim();
+	const repo = decodeSegment(segments[1] ?? "").trim();
+	const number = decodeSegment(segments[3] ?? "").trim();
+	if (!owner || !repo || !number) return null;
+	return { owner, repo, number };
 }
 
 function parseDashboardScopePathname(
@@ -563,16 +648,16 @@ function searchParamsFromInput(
 
 function parseDashboardScopeFromSearch(
 	searchParams: URLSearchParams,
-	releaseLocator: DashboardReleaseLocator | null,
+	repoLocator: Pick<DashboardReleaseLocator, "owner" | "repo"> | null,
 ): DashboardScope | null {
 	const scopeKind = searchParams.get("scope")?.trim();
 	switch (scopeKind) {
 		case "repo":
-			return releaseLocator
+			return repoLocator
 				? {
 						kind: "repo",
-						owner: releaseLocator.owner,
-						repo: releaseLocator.repo,
+						owner: repoLocator.owner,
+						repo: repoLocator.repo,
 					}
 				: null;
 		case "repos":
@@ -605,6 +690,7 @@ export function parseLegacyDashboardRouteState(input: {
 			scope: null,
 			activeReleaseId: releaseId,
 			activeReleaseLocator: null,
+			activeAnnouncementLocator: null,
 			releaseReturnTab: normalizeDashboardReturnTab(input.tab),
 		};
 	}
@@ -614,6 +700,7 @@ export function parseLegacyDashboardRouteState(input: {
 		scope: null,
 		activeReleaseId: null,
 		activeReleaseLocator: null,
+		activeAnnouncementLocator: null,
 		releaseReturnTab: "briefs",
 	};
 }
@@ -639,6 +726,7 @@ export function parseDashboardRouteState(input: {
 	owner?: string | null;
 	repo?: string | null;
 	tag?: string | null;
+	number?: string | number | null;
 }): DashboardRouteState {
 	const pathname = normalizePathname(input.pathname ?? "/");
 	const searchParams = searchParamsFromInput(
@@ -650,6 +738,28 @@ export function parseDashboardRouteState(input: {
 	);
 	const parsedScopePath = parseDashboardScopePathname(pathname, searchParams);
 	const explicitScope = input.scope ?? parsedScopePath?.scope ?? null;
+
+	if (input.owner && input.repo && input.number != null) {
+		const locator = {
+			owner: input.owner,
+			repo: input.repo,
+			number: String(input.number),
+		};
+		const detailScope =
+			explicitScope ?? parseDashboardScopeFromSearch(searchParams, locator);
+		const fromTab = normalizeDashboardReturnTab(
+			input.from ?? searchParams.get("from"),
+			detailScope,
+		);
+		return {
+			tab: fromTab,
+			scope: detailScope,
+			activeReleaseId: null,
+			activeReleaseLocator: null,
+			activeAnnouncementLocator: locator,
+			releaseReturnTab: fromTab,
+		};
+	}
 
 	if (input.owner && input.repo && input.tag) {
 		const locator = {
@@ -668,6 +778,26 @@ export function parseDashboardRouteState(input: {
 			scope: detailScope,
 			activeReleaseId: null,
 			activeReleaseLocator: locator,
+			activeAnnouncementLocator: null,
+			releaseReturnTab: fromTab,
+		};
+	}
+
+	const discussionLocator = parseDashboardDiscussionPathname(pathname);
+	if (discussionLocator) {
+		const detailScope =
+			explicitScope ??
+			parseDashboardScopeFromSearch(searchParams, discussionLocator);
+		const fromTab = normalizeDashboardReturnTab(
+			searchParams.get("from"),
+			detailScope,
+		);
+		return {
+			tab: fromTab,
+			scope: detailScope,
+			activeReleaseId: null,
+			activeReleaseLocator: null,
+			activeAnnouncementLocator: discussionLocator,
 			releaseReturnTab: fromTab,
 		};
 	}
@@ -686,6 +816,7 @@ export function parseDashboardRouteState(input: {
 			scope: detailScope,
 			activeReleaseId: null,
 			activeReleaseLocator: releaseLocator,
+			activeAnnouncementLocator: null,
 			releaseReturnTab: fromTab,
 		};
 	}
@@ -704,6 +835,7 @@ export function parseDashboardRouteState(input: {
 				scope,
 				activeReleaseId: releaseId,
 				activeReleaseLocator: null,
+				activeAnnouncementLocator: null,
 				releaseReturnTab: fromTab,
 			};
 		}
@@ -712,6 +844,7 @@ export function parseDashboardRouteState(input: {
 			scope,
 			activeReleaseId: null,
 			activeReleaseLocator: null,
+			activeAnnouncementLocator: null,
 			releaseReturnTab: fromTab,
 		};
 	}
@@ -730,6 +863,7 @@ export function parseDashboardRouteState(input: {
 		scope: null,
 		activeReleaseId: null,
 		activeReleaseLocator: null,
+		activeAnnouncementLocator: null,
 		releaseReturnTab: "briefs",
 	};
 }
@@ -753,7 +887,11 @@ export function validateDashboardSearch(search: Record<string, unknown>) {
 }
 
 export function routeStateHasActiveRelease(routeState: DashboardRouteState) {
-	return Boolean(routeState.activeReleaseId || routeState.activeReleaseLocator);
+	return Boolean(
+		routeState.activeReleaseId ||
+			routeState.activeReleaseLocator ||
+			routeState.activeAnnouncementLocator,
+	);
 }
 
 export function isDashboardPathname(pathname: string) {
@@ -761,6 +899,7 @@ export function isDashboardPathname(pathname: string) {
 	return (
 		normalized === "/" ||
 		DASHBOARD_PATH_TO_TAB.has(normalized) ||
+		parseDashboardDiscussionPathname(normalized) !== null ||
 		parseDashboardReleasePathname(normalized) !== null ||
 		normalized === "/focus/repos" ||
 		normalized === "/focus/repos/releases" ||
@@ -801,6 +940,21 @@ export function releaseLocatorFromReleaseDetail(
 		owner,
 		repo,
 		tag: detail.tag_name,
+	};
+}
+
+export function discussionLocatorFromAnnouncementDetail(
+	detail: Pick<
+		AnnouncementDetailResponse,
+		"repo_full_name" | "discussion_number"
+	>,
+): DashboardDiscussionLocator | null {
+	const [owner, repo] = detail.repo_full_name.split("/", 2);
+	if (!owner || !repo) return null;
+	return {
+		owner,
+		repo,
+		number: String(detail.discussion_number),
 	};
 }
 

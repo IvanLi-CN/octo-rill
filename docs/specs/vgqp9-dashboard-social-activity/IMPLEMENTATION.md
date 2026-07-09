@@ -6,7 +6,7 @@
 - Implementation: 已交付
 - Created: 2026-04-10
 - Last: 2026-06-30
-- Summary: 已交付；全部 tab 已扩展公告与 Fork 混排，专属 tabs 保持发布 / 加星 / 关注 / 日报 / 收件箱口径；桌面内容卡片项目名后补充 Release / 公告类型图标
+- Summary: 已交付；全部 tab 已扩展公告与 Fork 混排，专属 tabs 保持发布 / 加星 / 关注 / 日报 / 收件箱口径；桌面内容卡片项目名后补充 Release / 公告类型图标；announcement 翻译 / 润色 / detail follow-up 转交 `#m8f2q`
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef } from "react";
 
 import { ErrorStatePanel } from "@/components/feedback/ErrorStatePanel";
+import type { DashboardScope } from "@/dashboard/routeState";
 import { FeedItemCard } from "@/feed/FeedItemCard";
 import type {
 	FeedItem,
@@ -19,6 +20,7 @@ export type FeedCardListProps = {
 	items: FeedItem[];
 	currentViewer?: FeedViewer | null;
 	sourceTab?: DashboardTab | null;
+	currentScope?: DashboardScope | null;
 	translationInFlightKeys: Set<string>;
 	translationAutoRetryingKeys: Set<string>;
 	smartInFlightKeys: Set<string>;
@@ -39,6 +41,7 @@ export function FeedItems(props: FeedCardListProps) {
 		items,
 		currentViewer,
 		sourceTab = null,
+		currentScope = null,
 		translationInFlightKeys,
 		translationAutoRetryingKeys,
 		smartInFlightKeys,
@@ -69,6 +72,7 @@ export function FeedItems(props: FeedCardListProps) {
 					item={item}
 					currentViewer={currentViewer}
 					sourceTab={sourceTab}
+					currentScope={currentScope}
 					activeLane={activeLane}
 					isTranslating={isTranslating}
 					isTranslationAutoRetrying={isTranslationAutoRetrying}

@@ -34,6 +34,8 @@ Release 是主阅读对象，承担最多的衍生能力：
 
 这两类卡片保持轻量，只展示必要身份信息、时间和 GitHub 跳转入口，不引入 AI lane。
 
+公告（GitHub Discussions Announcements）属于 `全部` tab 中的内容卡阅读项，而不是轻量社交流；它与 Release 一样支持 `原文 / 翻译 / 润色`，标题进入站内 discussion 详情页，右上角保留 GitHub 外链。
+
 ### Daily brief
 
 日报是按固定时间边界生成的回顾视图，不是长期归档报告。它把一个窗口内的变化重组为两部分：
@@ -79,7 +81,7 @@ Dashboard 采用主列 + 侧栏结构，核心标签为：
 - `日报`（canonical path：`/briefs`）
 - `收件箱`（canonical path：`/inbox`）
 
-右侧侧栏长期承担 Inbox 快捷入口；在 `日报` 标签下还同时承担日报列表。Release 详情的 canonical deep link 采用 `/<owner>/<repo>/releases/tag/<tag>?from=<tab>`，其中 `from` 只表达返回上下文，默认 `briefs`。
+右侧侧栏长期承担 Inbox 快捷入口；在 `日报` 标签下还同时承担日报列表。Release 详情的 canonical deep link 采用 `/<owner>/<repo>/releases/tag/<tag>?from=<tab>`，其中 `from` 只表达返回上下文，默认 `briefs`。登录态 announcement 详情的 canonical deep link 采用 `/<owner>/<repo>/discussions/<number>?from=<tab>`；命中后仍留在 Dashboard 壳层内阅读，不提供独立 public announcement page。
 
 ### Web Demo
 
@@ -114,6 +116,8 @@ Dashboard 采用主列 + 侧栏结构，核心标签为：
 - 在日报中，Release 主入口进入站内详情弹窗，而不是把正文重新塞回主列
 
 详情弹窗保留 Markdown 结构，并提供 GitHub 外链按钮查看原始 Release。
+
+公告条目复用同一套 `原文 / 翻译 / 润色` 阅读模型；feed 中正文可被截断，但进入站内 discussion 详情页后必须始终读取完整正文，并默认显示 `润色` lane。
 
 ## 翻译策略与需求窗口
 

@@ -804,7 +804,12 @@ fn release_translation_item_allows_upstream_chat_403_retry(
 ) -> bool {
     matches!(
         item.kind.as_str(),
-        "release_summary" | "release_detail" | "release_smart"
+        "release_summary"
+            | "release_detail"
+            | "release_smart"
+            | "announcement_summary"
+            | "announcement_detail"
+            | "announcement_smart"
     )
 }
 
@@ -2506,6 +2511,9 @@ async fn ensure_translation_result_for_item(
         ("release_summary", "feed_card" | "feed_body")
             | ("release_detail", "feed_body")
             | ("release_smart", "feed_card")
+            | ("announcement_summary", "feed_card" | "feed_body")
+            | ("announcement_detail", "feed_body")
+            | ("announcement_smart", "feed_card")
     ) && current_server_source_hash_for_item(tx, user_id, item)
         .await?
         .is_none()
@@ -4184,6 +4192,8 @@ async fn resolve_batch_results(
     let mut release_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
     let mut release_smart_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
     let mut detail_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
+    let mut announcement_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
+    let mut announcement_smart_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
     let mut notification_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
 
     for item in &batch.items {
@@ -4206,6 +4216,18 @@ async fn resolve_batch_results(
                     .or_default()
                     .push(item);
             }
+            "announcement_summary" | "announcement_detail" => {
+                announcement_groups
+                    .entry(item.scope_user_id.clone())
+                    .or_default()
+                    .push(item);
+            }
+            "announcement_smart" => {
+                announcement_smart_groups
+                    .entry(item.scope_user_id.clone())
+                    .or_default()
+                    .push(item);
+            }
             "notification" => {
                 notification_groups
                     .entry(item.scope_user_id.clone())
@@ -4222,6 +4244,37 @@ async fn resolve_batch_results(
                     error: Some(format!("unsupported translation kind: {}", item.kind)),
                 });
             }
+        }
+    }
+
+    for (_user_id, items) in announcement_groups {
+        for item in items {
+            let result = match api::translate_announcement_detail_for_user(
+                state,
+                item.scope_user_id.as_str(),
+                item.entity_id.as_str(),
+            )
+            .await
+            {
+                Ok(translated) => terminal_result_from_single_response(item, &translated),
+                Err(err) if err.code() == "not_found" => TerminalWorkResult {
+                    work_item_id: item.id.clone(),
+                    result_status: "missing".to_owned(),
+                    title_zh: None,
+                    summary_md: None,
+                    body_md: None,
+                    error: Some("announcement not found".to_owned()),
+                },
+                Err(err) => TerminalWorkResult {
+                    work_item_id: item.id.clone(),
+                    result_status: "error".to_owned(),
+                    title_zh: None,
+                    summary_md: None,
+                    body_md: None,
+                    error: Some(err.to_string()),
+                },
+            };
+            out.push(result);
         }
     }
 
@@ -4279,6 +4332,37 @@ async fn resolve_batch_results(
                     body_md: None,
                     error: Some("translation result missing".to_owned()),
                 }
+            };
+            out.push(result);
+        }
+    }
+
+    for (_user_id, items) in announcement_smart_groups {
+        for item in items {
+            let result = match api::summarize_announcement_smart_for_user(
+                state,
+                item.scope_user_id.as_str(),
+                item.entity_id.as_str(),
+            )
+            .await
+            {
+                Ok(translated) => terminal_result_from_single_response(item, &translated),
+                Err(err) if err.code() == "not_found" => TerminalWorkResult {
+                    work_item_id: item.id.clone(),
+                    result_status: "missing".to_owned(),
+                    title_zh: None,
+                    summary_md: None,
+                    body_md: None,
+                    error: Some(err.to_string()),
+                },
+                Err(err) => TerminalWorkResult {
+                    work_item_id: item.id.clone(),
+                    result_status: "error".to_owned(),
+                    title_zh: None,
+                    summary_md: None,
+                    body_md: None,
+                    error: Some(err.to_string()),
+                },
             };
             out.push(result);
         }
@@ -4361,7 +4445,10 @@ fn terminal_result_from_batch_item(
         body_md: None,
         error: translated.error.clone(),
     };
-    if matches!(item.kind.as_str(), "release_detail" | "release_smart") {
+    if matches!(
+        item.kind.as_str(),
+        "release_detail" | "release_smart" | "announcement_detail" | "announcement_smart"
+    ) {
         out.body_md = translated.summary.clone();
     } else {
         out.summary_md = translated.summary.clone();
@@ -4381,7 +4468,10 @@ fn terminal_result_from_single_response(
         body_md: None,
         error: None,
     };
-    if matches!(item.kind.as_str(), "release_detail" | "release_smart") {
+    if matches!(
+        item.kind.as_str(),
+        "release_detail" | "release_smart" | "announcement_detail" | "announcement_smart"
+    ) {
         out.body_md = translated.summary.clone();
     } else {
         out.summary_md = translated.summary.clone();
@@ -5367,7 +5457,13 @@ fn normalize_request_items(
         }
         if !matches!(
             kind,
-            "release_summary" | "release_smart" | "release_detail" | "notification"
+            "release_summary"
+                | "release_smart"
+                | "release_detail"
+                | "announcement_summary"
+                | "announcement_smart"
+                | "announcement_detail"
+                | "notification"
         ) {
             return Err(ApiError::bad_request(format!(
                 "unsupported translation kind: {kind}"
@@ -5462,6 +5558,35 @@ fn build_source_hash(item: &TranslationRequestItemInput) -> String {
         return crate::api::release_detail_source_hash(repo_full_name, title, body);
     }
 
+    if uses_announcement_detail_translation_state(item.kind.as_str(), item.variant.as_str()) {
+        let metadata = item
+            .source_blocks
+            .iter()
+            .find(|block| block.slot == "metadata")
+            .map(|block| block.text.as_str())
+            .unwrap_or_default();
+        let (repo_full_name, discussion_number) =
+            crate::api::parse_announcement_translation_metadata(metadata);
+        let title = item
+            .source_blocks
+            .iter()
+            .find(|block| block.slot == "title")
+            .map(|block| block.text.trim())
+            .unwrap_or_default();
+        let body = item
+            .source_blocks
+            .iter()
+            .find(|block| block.slot == "body_markdown")
+            .map(|block| block.text.as_str())
+            .unwrap_or_default();
+        return crate::api::announcement_detail_source_hash(
+            repo_full_name.as_str(),
+            discussion_number,
+            title,
+            body,
+        );
+    }
+
     let blocks_json =
         serde_json::to_string(&item.source_blocks).unwrap_or_else(|_| "[]".to_owned());
     let slots_json = serde_json::to_string(&item.target_slots).unwrap_or_else(|_| "[]".to_owned());
@@ -5479,6 +5604,11 @@ fn build_dedupe_key(
     let (kind, variant) =
         if uses_release_detail_translation_state(item.kind.as_str(), item.variant.as_str()) {
             ("release_detail", "shared")
+        } else if uses_announcement_detail_translation_state(
+            item.kind.as_str(),
+            item.variant.as_str(),
+        ) {
+            ("announcement_detail", "shared")
         } else {
             (item.kind.as_str(), item.variant.as_str())
         };
@@ -5539,6 +5669,12 @@ fn derive_item_source(item: &TranslationRequestItemInput) -> Option<String> {
         ("release_detail", "feed_body") => Some("feed.auto_translate".to_owned()),
         ("release_smart", "feed_card") => Some("feed.smart".to_owned()),
         ("release_detail", _) => Some("release_detail".to_owned()),
+        ("announcement_summary", "feed_card" | "feed_body") => {
+            Some("feed.auto_translate".to_owned())
+        }
+        ("announcement_detail", "feed_body") => Some("feed.auto_translate".to_owned()),
+        ("announcement_smart", "feed_card") => Some("feed.smart".to_owned()),
+        ("announcement_detail", _) => Some("announcement_detail".to_owned()),
         ("notification", _) => Some("notification".to_owned()),
         _ => Some(item.kind.clone()),
     }
@@ -5561,13 +5697,23 @@ fn uses_release_detail_translation_state(kind: &str, variant: &str) -> bool {
     kind == "release_detail" || matches!((kind, variant), ("release_summary", "feed_body"))
 }
 
+fn uses_announcement_detail_translation_state(kind: &str, variant: &str) -> bool {
+    kind == "announcement_detail"
+        || matches!((kind, variant), ("announcement_summary", "feed_body"))
+}
+
 fn map_entity_type(kind: &str, variant: &str) -> Option<&'static str> {
     if uses_release_detail_translation_state(kind, variant) {
         return Some("release_detail");
     }
+    if uses_announcement_detail_translation_state(kind, variant) {
+        return Some("announcement_detail");
+    }
     match kind {
         "release_summary" => Some("release"),
         "release_smart" => Some("release_smart"),
+        "announcement_summary" => Some("announcement"),
+        "announcement_smart" => Some("announcement_smart"),
         "notification" => Some("notification"),
         _ => None,
     }
@@ -5580,6 +5726,14 @@ struct CanonicalFeedReleaseRow {
     name: Option<String>,
     body: Option<String>,
     previous_tag_name: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct CanonicalFeedAnnouncementRow {
+    repo_full_name: String,
+    discussion_number: i64,
+    title: Option<String>,
+    body: Option<String>,
 }
 
 fn release_smart_metadata_text(
@@ -5634,6 +5788,40 @@ pub(crate) fn release_smart_feed_source_hash(
     })
 }
 
+pub(crate) fn announcement_smart_feed_source_hash(
+    entity_id: &str,
+    repo_full_name: &str,
+    discussion_number: Option<i64>,
+    title: &str,
+    body: Option<&str>,
+) -> String {
+    let mut source_blocks = vec![TranslationSourceBlock {
+        slot: "title".to_owned(),
+        text: title.trim().to_owned(),
+    }];
+    if let Some(body) = body.map(str::trim).filter(|value| !value.is_empty()) {
+        source_blocks.push(TranslationSourceBlock {
+            slot: "body_markdown".to_owned(),
+            text: body.to_owned(),
+        });
+    }
+    source_blocks.push(TranslationSourceBlock {
+        slot: "metadata".to_owned(),
+        text: crate::api::announcement_translation_metadata_text(repo_full_name, discussion_number),
+    });
+
+    build_source_hash(&TranslationRequestItemInput {
+        producer_ref: format!("feed.smart:announcement:{entity_id}"),
+        kind: "announcement_smart".to_owned(),
+        variant: "feed_card".to_owned(),
+        entity_id: entity_id.to_owned(),
+        target_lang: "zh-CN".to_owned(),
+        max_wait_ms: 0,
+        source_blocks,
+        target_slots: vec!["title_zh".to_owned(), "body_md".to_owned()],
+    })
+}
+
 async fn build_canonical_feed_request_item(
     tx: &mut Transaction<'_, Sqlite>,
     user_id: &str,
@@ -5644,8 +5832,86 @@ async fn build_canonical_feed_request_item(
         ("release_summary", "feed_card" | "feed_body")
             | ("release_smart", "feed_card")
             | ("release_detail", "feed_body" | "detail_card")
+            | ("announcement_summary", "feed_card" | "feed_body")
+            | ("announcement_smart", "feed_card")
+            | ("announcement_detail", "feed_body" | "detail_card")
     ) {
         return Ok(None);
+    }
+
+    if matches!(
+        item.kind.as_str(),
+        "announcement_summary" | "announcement_smart" | "announcement_detail"
+    ) {
+        let Some((repo_full_name, discussion_number)) =
+            crate::api::parse_announcement_discussion_key(item.entity_id.as_str())
+        else {
+            return Ok(None);
+        };
+        let row = sqlx::query_as::<_, CanonicalFeedAnnouncementRow>(
+            r#"
+            SELECT
+              e.repo_full_name,
+              e.discussion_number,
+              e.title,
+              e.body
+            FROM social_activity_events e
+            WHERE e.user_id = ?
+              AND e.kind = 'announcement'
+              AND lower(e.repo_full_name) = ?
+              AND e.discussion_number = ?
+            ORDER BY e.occurred_at DESC, e.id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id)
+        .bind(repo_full_name.as_str())
+        .bind(discussion_number)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(ApiError::internal)?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let title = row
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Announcement")
+            .to_owned();
+        let metadata = crate::api::announcement_translation_metadata_text(
+            row.repo_full_name.trim(),
+            Some(row.discussion_number),
+        );
+        let body = row
+            .body
+            .as_deref()
+            .map(|value| value.replace("\r\n", "\n"))
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+
+        let mut source_blocks = vec![TranslationSourceBlock {
+            slot: "title".to_owned(),
+            text: title,
+        }];
+        if let Some(body) = body {
+            source_blocks.push(TranslationSourceBlock {
+                slot: "body_markdown".to_owned(),
+                text: body,
+            });
+        }
+        source_blocks.push(TranslationSourceBlock {
+            slot: "metadata".to_owned(),
+            text: metadata,
+        });
+
+        return Ok(Some(TranslationRequestItemInput {
+            source_blocks,
+            ..item.clone()
+        }));
     }
 
     let Ok(release_id) = item.entity_id.parse::<i64>() else {

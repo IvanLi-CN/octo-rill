@@ -35,6 +35,7 @@ import {
 	resolvePreferredLaneForItem,
 } from "@/feed/laneOptions";
 import type {
+	AnnouncementFeedItem,
 	FeedItem,
 	FeedLane,
 	ReleaseFeedItem,
@@ -1784,8 +1785,8 @@ function buildFollowerItem(
 
 function buildAnnouncementItem(
 	id: string,
-	overrides?: Partial<SocialFeedItem>,
-): SocialFeedItem {
+	overrides?: Partial<AnnouncementFeedItem>,
+): AnnouncementFeedItem {
 	return {
 		kind: "announcement",
 		ts: "2026-04-04T15:20:00+08:00",
@@ -1798,6 +1799,8 @@ function buildAnnouncementItem(
 		subtitle: "仓库公告",
 		reason: null,
 		subject_type: "discussion",
+		discussion_number: 64,
+		discussion_key: `${PROJECT_REPO_FULL_NAME.toLowerCase()}#64`,
 		html_url: "https://github.com/acme/rocket/discussions/64",
 		unread: null,
 		actor: {
@@ -2067,6 +2070,52 @@ function makeAnnouncementAndForkFocusFeed(): FeedItem[] {
 		buildRepoStarItem("star-focus-control", {
 			ts: "2026-04-04T15:40:00+08:00",
 			repo_full_name: PROJECT_REPO_FULL_NAME,
+		}),
+	];
+}
+
+function makeAnnouncementAndReleaseLaneFeed(): FeedItem[] {
+	return [
+		buildFeedItem("release-lane-bridge", {
+			ts: "2026-04-04T17:10:00+08:00",
+			repo_full_name: "acme/rocket",
+			repo_visual: repoVisualFixtures.social,
+			title: "v3.4.0 阅读模式联动",
+			body: "- Release 与公告在混排 feed 中共用页面级阅读模式。",
+			html_url: "https://github.com/acme/rocket/releases/tag/v3.4.0",
+			translated: {
+				lang: "zh-CN",
+				status: "ready",
+				title: "v3.4.0 阅读模式联动（译文）",
+				summary: "- 页面级翻译模式会同时作用到 release 与公告",
+			},
+			smart: {
+				lang: "zh-CN",
+				status: "ready",
+				title: "v3.4.0 · 联动总览",
+				summary: "- 页面级润色模式对混排内容保持统一阅读节奏",
+			},
+		}),
+		buildAnnouncementItem("announcement-lane-bridge", {
+			ts: "2026-04-04T16:42:00+08:00",
+			title: "公告：混排 feed 共享阅读模式",
+			body: "- 公告会跟随页面级模式切换到翻译或润色 lane。",
+			translated: {
+				lang: "zh-CN",
+				status: "ready",
+				title: "公告：混排 feed 共享翻译模式",
+				summary: "- 公告译文与 release 译文同时切换",
+			},
+			smart: {
+				lang: "zh-CN",
+				status: "ready",
+				title: "公告：混排阅读流已对齐",
+				summary: "- 公告润色与 release 润色共用页面级默认模式",
+			},
+		}),
+		buildRepoStarItem("lane-bridge-star", {
+			ts: "2026-04-04T16:05:00+08:00",
+			repo_full_name: "acme/rocket",
 		}),
 	];
 }
@@ -6534,6 +6583,45 @@ export const MobileAnnouncementAndForkAllTab: Story = {
 		if (announcementTypeIcon) {
 			await expect(announcementTypeIcon).not.toBeVisible();
 		}
+	},
+};
+
+export const MixedReleaseAndAnnouncementPageLane: Story = {
+	name: "All tab / Page lane applies to release + announcement",
+	render: () => (
+		<DashboardPreview feedItems={makeAnnouncementAndReleaseLaneFeed()} />
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"页面级阅读模式切换器在 `全部` tab 的 mixed feed 中同时驱动 release 与公告，不影响旁边的轻量社交卡。",
+			},
+		},
+	},
+	play: async ({ canvasElement, userEvent }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "v3.4.0 阅读模式联动" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("heading", { name: "公告：混排 feed 共享阅读模式" }),
+		).toBeVisible();
+		await userEvent.click(canvas.getByRole("button", { name: "翻译" }));
+		await expect(
+			canvas.getByRole("heading", { name: "v3.4.0 阅读模式联动（译文）" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("heading", { name: "公告：混排 feed 共享翻译模式" }),
+		).toBeVisible();
+		await userEvent.click(canvas.getByRole("button", { name: "润色" }));
+		await expect(
+			canvas.getByRole("heading", { name: "v3.4.0 · 联动总览" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("heading", { name: "公告：混排阅读流已对齐" }),
+		).toBeVisible();
+		await expect(canvas.getByText("标星", { exact: true })).toBeVisible();
 	},
 };
 

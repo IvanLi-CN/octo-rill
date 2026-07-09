@@ -8,7 +8,8 @@ import {
 } from "@/api";
 import { translationErrorIsRetryable } from "@/feed/retryableErrors";
 import {
-	isReleaseFeedItem,
+	isAnnouncementFeedItem,
+	isLaneCapableFeedItem,
 	type FeedItem,
 	type TranslatedItem,
 	type TranslateResponse,
@@ -54,6 +55,44 @@ function buildReleaseSummaryRequestItem(
 		],
 		target_slots: ["title_zh", "body_md"],
 	};
+}
+
+function buildAnnouncementSummaryRequestItem(
+	item: FeedItem,
+): TranslationRequestItemInput {
+	const title = item.title?.trim() || `announcement:${item.id}`;
+	const body = item.body?.trim();
+	const discussionNumber =
+		isAnnouncementFeedItem(item) && item.discussion_number
+			? `discussion_number=${item.discussion_number}`
+			: null;
+	const metadata = [item.repo_full_name, discussionNumber]
+		.filter((value): value is string => Boolean(value?.trim()))
+		.join("\n");
+	const entityId =
+		isAnnouncementFeedItem(item) && item.discussion_key
+			? item.discussion_key
+			: item.id;
+	return {
+		producer_ref: `feed.auto_translate:announcement:${entityId}`,
+		kind: "announcement_summary",
+		variant: "feed_body",
+		entity_id: entityId,
+		target_lang: "zh-CN",
+		max_wait_ms: AUTO_TRANSLATE_MAX_WAIT_MS,
+		source_blocks: [
+			{ slot: "title", text: title },
+			...(body ? [{ slot: "body_markdown" as const, text: body }] : []),
+			...(metadata ? [{ slot: "metadata" as const, text: metadata }] : []),
+		],
+		target_slots: ["title_zh", "body_md"],
+	};
+}
+
+function buildSummaryRequestItem(item: FeedItem): TranslationRequestItemInput {
+	return isAnnouncementFeedItem(item)
+		? buildAnnouncementSummaryRequestItem(item)
+		: buildReleaseSummaryRequestItem(item);
 }
 
 function mapTranslationItemToFeedTranslated(item: {
@@ -304,7 +343,7 @@ export function useAutoTranslate(params: {
 	const shouldAutoTranslate = useCallback(
 		(item: FeedItem) =>
 			enabled &&
-			isReleaseFeedItem(item) &&
+			isLaneCapableFeedItem(item) &&
 			((item.translated?.status === "missing" &&
 				item.translated.auto_translate !== false) ||
 				(item.translated?.status === "ready" &&
@@ -316,7 +355,7 @@ export function useAutoTranslate(params: {
 	const shouldAutoRetryLoadedError = useCallback(
 		(item: FeedItem) =>
 			enabled &&
-			isReleaseFeedItem(item) &&
+			isLaneCapableFeedItem(item) &&
 			item.translated?.status === "error" &&
 			feedTranslationIsRetryable(item) &&
 			!autoRetriedKeysRef.current.has(keyOf(item)),
@@ -645,7 +684,7 @@ export function useAutoTranslate(params: {
 			for (const candidate of rawCandidates) {
 				const latestItem =
 					itemByKeyRef.current.get(candidate.key) ?? candidate.item;
-				const requestItem = buildReleaseSummaryRequestItem(latestItem);
+				const requestItem = buildSummaryRequestItem(latestItem);
 				const sourceKey = buildRequestSourceKey(requestItem);
 				const existing = requestTasksRef.current.get(candidate.key);
 				if (existing && existing.sourceKey === sourceKey) {
@@ -723,7 +762,7 @@ export function useAutoTranslate(params: {
 				failedRef.current.delete(key);
 				retryCountRef.current.delete(key);
 				itemByKeyRef.current.set(key, item);
-				const requestItem = buildReleaseSummaryRequestItem(item);
+				const requestItem = buildSummaryRequestItem(item);
 				const sourceKey = buildRequestSourceKey(requestItem);
 				candidates.push({
 					key,
@@ -752,7 +791,7 @@ export function useAutoTranslate(params: {
 			const existing = requestTasksRef.current.get(key);
 			let candidate: TranslationCandidate | null = null;
 			if (shouldAutoTranslate(item)) {
-				const requestItem = buildReleaseSummaryRequestItem(item);
+				const requestItem = buildSummaryRequestItem(item);
 				const sourceKey = buildRequestSourceKey(requestItem);
 				if (existing) {
 					if (existing.sourceKey !== sourceKey) {
@@ -861,11 +900,11 @@ export function useAutoTranslate(params: {
 
 	const translateNow = useCallback(
 		async (item: FeedItem) => {
-			if (!isReleaseFeedItem(item)) {
+			if (!isLaneCapableFeedItem(item)) {
 				return null;
 			}
 			const key = keyOf(item);
-			const requestItem = buildReleaseSummaryRequestItem(item);
+			const requestItem = buildSummaryRequestItem(item);
 			const sourceKey = buildRequestSourceKey(requestItem);
 			failedRef.current.delete(key);
 			retryCountRef.current.delete(key);
