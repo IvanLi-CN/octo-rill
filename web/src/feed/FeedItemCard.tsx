@@ -1268,13 +1268,6 @@ export function ReleaseFeedCard(props: {
 					<div className="flex items-start gap-2">
 						<div className="min-w-0 flex-1">
 							<div className="flex flex-wrap items-center gap-2">
-								{item.unread ? (
-									<span className="inline-flex items-center gap-1 text-[11px] font-medium">
-										<span className="size-1.5 rounded-full bg-primary" />
-										<span className="text-muted-foreground">未读</span>
-									</span>
-								) : null}
-
 								{repoFocusTarget ? (
 									<InternalLink
 										href={repoFocusTarget.href}

@@ -37,7 +37,7 @@ function buildAnnouncementItem(
 		discussion_number: 64,
 		discussion_key: "acme/rocket#64",
 		html_url: "https://github.com/acme/rocket/discussions/64",
-		unread: 1,
+		unread: null,
 		actor: {
 			login: "maintainer",
 			avatar_url: "https://github.com/maintainer.png?size=96",
