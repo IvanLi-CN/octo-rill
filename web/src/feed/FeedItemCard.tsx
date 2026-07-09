@@ -32,10 +32,16 @@ import {
 } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FEED_LANE_OPTIONS } from "@/feed/laneOptions";
-import { buildDashboardScopeHref } from "@/dashboard/routeState";
 import {
-	isReleaseFeedItem,
+	buildDashboardDiscussionHref,
+	buildDashboardScopeHref,
+	type DashboardScope,
+} from "@/dashboard/routeState";
+import {
+	isAnnouncementFeedItem,
+	isLaneCapableFeedItem,
 	isSocialFeedItem,
+	type AnnouncementFeedItem,
 	type FeedActor,
 	type FeedItem,
 	type FeedLane,
@@ -95,6 +101,7 @@ const REACTION_ITEMS: Array<{
 const RELEASE_TOOL_HEIGHT_CLASS = "h-9";
 const RELEASE_TOOL_BUTTON_CLASS = "h-9";
 const RELEASE_TOOL_ICON_BUTTON_CLASS = "size-8";
+type ReadableFeedItem = ReleaseFeedItem | AnnouncementFeedItem;
 
 type RepoFocusTarget = {
 	href: string;
@@ -188,7 +195,7 @@ function AutoRetryPendingPanel(props: {
 	);
 }
 
-function displayTitleForLane(item: ReleaseFeedItem, lane: FeedLane) {
+function displayTitleForLane(item: ReadableFeedItem, lane: FeedLane) {
 	const originalTitle = item.title ?? "(no title)";
 	if (lane === "translated") {
 		return item.translated?.title?.trim() || originalTitle;
@@ -222,14 +229,17 @@ function FeedItemTypeIcon(props: {
 	);
 }
 
-function OriginalLane(props: { item: ReleaseFeedItem }) {
+function OriginalLane(props: { item: ReadableFeedItem }) {
 	const { item } = props;
+	const isAnnouncement = item.kind === "announcement";
 	if (item.body?.trim()) {
 		return (
 			<>
 				{item.body_truncated ? (
 					<div className="mb-2 font-mono text-[11px] text-muted-foreground">
-						列表正文已截断显示；完整 release notes 请前往 GitHub 查看。
+						{isAnnouncement
+							? "列表正文已截断显示；完整公告内容请进入详情页或前往 GitHub 查看。"
+							: "列表正文已截断显示；完整 release notes 请前往 GitHub 查看。"}
 					</div>
 				) : null}
 				<Markdown content={item.body} />
@@ -238,14 +248,18 @@ function OriginalLane(props: { item: ReleaseFeedItem }) {
 	}
 	return (
 		<EmptyPanel
-			title="原文暂无可读正文"
-			description="这个 release 没有可直接展示的正文，主人可以切到翻译或润色看看。"
+			title={isAnnouncement ? "公告暂无可读正文" : "原文暂无可读正文"}
+			description={
+				isAnnouncement
+					? "这条公告没有可直接展示的正文，主人可以切到翻译或润色，或者进入详情页查看。"
+					: "这个 release 没有可直接展示的正文，主人可以切到翻译或润色看看。"
+			}
 		/>
 	);
 }
 
 function TranslatedLane(props: {
-	item: ReleaseFeedItem;
+	item: ReadableFeedItem;
 	onTranslateNow: () => void;
 	isAutoRetrying: boolean;
 }) {
@@ -293,7 +307,7 @@ function TranslatedLane(props: {
 }
 
 function SmartLane(props: {
-	item: ReleaseFeedItem;
+	item: ReadableFeedItem;
 	onSmartNow: () => void;
 	isSmartGenerating: boolean;
 	isAutoRetrying: boolean;
@@ -341,6 +355,29 @@ function SmartLane(props: {
 	}
 
 	return <OriginalLane item={item} />;
+}
+
+function buildAnnouncementTitleHref(
+	item: AnnouncementFeedItem,
+	sourceTab: DashboardTab | null,
+	currentScope: DashboardScope | null,
+) {
+	if (!item.repo_full_name || !item.discussion_number) {
+		return null;
+	}
+	const [owner = "", repo = ""] = item.repo_full_name.split("/", 2);
+	if (!owner || !repo) {
+		return null;
+	}
+	return buildDashboardDiscussionHref(
+		{
+			owner,
+			repo,
+			number: String(item.discussion_number),
+		},
+		sourceTab ?? "all",
+		{ scope: currentScope },
+	);
 }
 
 function FeedCardLaneTabs(props: {
@@ -700,25 +737,21 @@ function SocialActivityCard(props: {
 	const isRepoTarget = !isFollower;
 	const showTimestamp = !isFollower;
 	const ActionIcon =
-		item.kind === "announcement"
-			? Megaphone
-			: item.kind === "release_update"
-				? Tag
-				: item.kind === "repo_forked"
-					? GitFork
-					: isRepoStar
-						? Star
-						: UserPlus;
+		item.kind === "release_update"
+			? Tag
+			: item.kind === "repo_forked"
+				? GitFork
+				: isRepoStar
+					? Star
+					: UserPlus;
 	const actionTitle =
-		item.kind === "announcement"
-			? "公告"
-			: item.kind === "release_update"
-				? "发布"
-				: item.kind === "repo_forked"
-					? "Fork"
-					: isRepoStar
-						? "标星"
-						: "关注";
+		item.kind === "release_update"
+			? "发布"
+			: item.kind === "repo_forked"
+				? "Fork"
+				: isRepoStar
+					? "标星"
+					: "关注";
 	const actorHref = actor.html_url ?? `https://github.com/${actor.login}`;
 	const repoHref = item.repo_full_name
 		? `https://github.com/${item.repo_full_name}`
@@ -844,7 +877,7 @@ function SocialActivityCard(props: {
 						{formatIsoShortLocal(item.ts)}
 					</p>
 					{isFresh ? <FreshContentCue className="shrink-0" /> : null}
-					{item.kind === "announcement" || item.kind === "repo_forked" ? (
+					{item.kind === "repo_forked" ? (
 						<p className="min-w-0 truncate text-[11px] leading-none font-medium text-foreground/70 sm:text-xs">
 							{item.title ?? actionTitle}
 						</p>
@@ -1157,124 +1190,8 @@ function SocialActivityCard(props: {
 	);
 }
 
-function AnnouncementContentCard(props: {
-	item: SocialFeedItem;
-	isFresh?: boolean;
-	sourceTab?: DashboardTab | null;
-}) {
-	const { item, isFresh = false, sourceTab = null } = props;
-	const title = item.title?.trim() || item.repo_full_name || "仓库公告";
-	const subtitleBits = [
-		item.subtitle || "仓库公告",
-		item.actor?.login ? `by ${item.actor.login}` : null,
-	].filter(Boolean);
-	const subtitle = subtitleBits.join(" · ");
-	const repoFocusTarget = buildRepoFocusTarget(item.repo_full_name, sourceTab);
-
-	return (
-		<Card
-			className="group bg-card/80 shadow-sm transition-shadow hover:shadow-md"
-			data-announcement-card="true"
-			data-feed-item-id={item.id}
-		>
-			<CardHeader className="px-4 pb-3 pt-4 sm:px-6 sm:pb-4 sm:pt-6">
-				<div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
-					<div className="min-w-0 flex-1">
-						<div className="flex items-start gap-2">
-							<div className="min-w-0 flex-1">
-								<div className="flex flex-wrap items-center gap-2">
-									{repoFocusTarget ? (
-										<InternalLink
-											href={repoFocusTarget.href}
-											to={repoFocusTarget.to}
-											params={repoFocusTarget.params}
-											className="min-w-0"
-										>
-											<RepoIdentity
-												repoFullName={item.repo_full_name}
-												repoVisual={item.repo_visual}
-												className="min-w-0 min-h-8"
-												labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
-												visualClassName="size-8"
-												labelSuffix={<FeedItemTypeIcon type="announcement" />}
-											/>
-										</InternalLink>
-									) : (
-										<RepoIdentity
-											repoFullName={item.repo_full_name}
-											repoVisual={item.repo_visual}
-											className="min-w-0 min-h-8"
-											labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
-											visualClassName="size-8"
-											labelSuffix={<FeedItemTypeIcon type="announcement" />}
-										/>
-									)}
-								</div>
-
-								<CardTitle className="mt-2 text-balance text-[1.35rem] leading-tight sm:mt-2.5 sm:text-lg">
-									{title}
-								</CardTitle>
-								<p className="mt-0.5 font-mono text-[11px] text-muted-foreground sm:text-xs">
-									{formatIsoShortLocal(item.ts)}
-									{isFresh ? <FreshContentCue className="ml-2" /> : null}
-									{subtitle ? ` · ${subtitle}` : ""}
-								</p>
-							</div>
-
-							<a
-								href={item.html_url ?? "#"}
-								target="_blank"
-								rel="noreferrer"
-								aria-label="GitHub"
-								title="GitHub"
-								data-feed-mobile-github-link="true"
-								className="text-muted-foreground hover:text-foreground focus-visible:ring-ring inline-flex size-8 shrink-0 items-center justify-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 sm:hidden"
-							>
-								<ArrowUpRight className="size-4" />
-								<span className="sr-only">GitHub</span>
-							</a>
-						</div>
-					</div>
-
-					<div className="hidden flex-wrap items-center gap-2 sm:flex sm:justify-end">
-						<Button
-							asChild
-							variant="outline"
-							size="sm"
-							className="h-8 shrink-0 px-3 font-mono text-xs"
-						>
-							<a href={item.html_url ?? "#"} target="_blank" rel="noreferrer">
-								<ArrowUpRight className="size-4" />
-								GitHub
-							</a>
-						</Button>
-					</div>
-				</div>
-			</CardHeader>
-
-			<CardContent className="px-4 pb-4 pt-0 sm:px-6 sm:pb-6">
-				{item.body?.trim() ? (
-					<>
-						{item.body_truncated ? (
-							<div className="mb-2 font-mono text-[11px] text-muted-foreground">
-								列表正文已截断显示；完整公告内容请前往 GitHub 查看。
-							</div>
-						) : null}
-						<Markdown content={item.body} />
-					</>
-				) : (
-					<EmptyPanel
-						title="公告暂无可读正文"
-						description="这条公告没有可直接展示的正文，主人可以前往 GitHub 查看完整内容。"
-					/>
-				)}
-			</CardContent>
-		</Card>
-	);
-}
-
 export function ReleaseFeedCard(props: {
-	item: ReleaseFeedItem;
+	item: ReadableFeedItem;
 	activeLane: FeedLane;
 	isTranslating: boolean;
 	isTranslationAutoRetrying: boolean;
@@ -1311,14 +1228,22 @@ export function ReleaseFeedCard(props: {
 		onSmartNow,
 		onToggleReaction,
 	} = props;
-	const subtitleBits = [
-		item.reason || item.subtitle,
-		item.subject_type ? item.subject_type : null,
-	].filter(Boolean);
-	const subtitle = subtitleBits.join(" · ");
+	const isAnnouncement = item.kind === "announcement";
+	const subtitleBits = isAnnouncement
+		? [
+				item.subtitle || "仓库公告",
+				item.actor?.login ? `by ${item.actor.login}` : null,
+			]
+		: [
+				item.reason || item.subtitle,
+				item.subject_type ? item.subject_type : null,
+			];
+	const subtitle = subtitleBits.filter(Boolean).join(" · ");
 	const repoFocusTarget = buildRepoFocusTarget(item.repo_full_name, sourceTab);
-	const reactions = showReactions ? item.reactions : null;
-	const isVersionOnly = item.smart?.status === "insufficient";
+	const reactions =
+		showReactions && item.kind === "release" ? item.reactions : null;
+	const isVersionOnly =
+		item.kind === "release" && item.smart?.status === "insufficient";
 	const isArticleSurface = surface === "article";
 	const displayTitle = displayTitleForLane(item, activeLane);
 	const [reactionBubbleOpen, setReactionBubbleOpen] = useState(false);
@@ -1363,7 +1288,11 @@ export function ReleaseFeedCard(props: {
 											className="min-w-0 min-h-8"
 											labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
 											visualClassName="size-8"
-											labelSuffix={<FeedItemTypeIcon type="release" />}
+											labelSuffix={
+												<FeedItemTypeIcon
+													type={isAnnouncement ? "announcement" : "release"}
+												/>
+											}
 										/>
 									</InternalLink>
 								) : (
@@ -1373,7 +1302,11 @@ export function ReleaseFeedCard(props: {
 										className="min-w-0 min-h-8"
 										labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
 										visualClassName="size-8"
-										labelSuffix={<FeedItemTypeIcon type="release" />}
+										labelSuffix={
+											<FeedItemTypeIcon
+												type={isAnnouncement ? "announcement" : "release"}
+											/>
+										}
 									/>
 								)}
 							</div>
@@ -1698,23 +1631,22 @@ export function FeedItemCard(props: {
 	reactionError: string | null;
 	isFresh?: boolean;
 	sourceTab?: DashboardTab | null;
+	currentScope?: DashboardScope | null;
 	onSelectLane: (lane: FeedLane) => void;
 	onTranslateNow: () => void;
 	onSmartNow: () => void;
 	onToggleReaction: (content: ReactionContent) => void;
 }) {
-	const { item, currentViewer, isFresh = false, sourceTab = null } = props;
+	const {
+		item,
+		currentViewer,
+		isFresh = false,
+		sourceTab = null,
+		currentScope = null,
+	} = props;
 	let card: ReactNode = null;
 
-	if (item.kind === "announcement") {
-		card = (
-			<AnnouncementContentCard
-				item={item}
-				isFresh={isFresh}
-				sourceTab={sourceTab}
-			/>
-		);
-	} else if (isSocialFeedItem(item)) {
+	if (isSocialFeedItem(item)) {
 		card = (
 			<SocialActivityCard
 				item={item}
@@ -1723,8 +1655,19 @@ export function FeedItemCard(props: {
 				sourceTab={sourceTab}
 			/>
 		);
-	} else if (isReleaseFeedItem(item)) {
-		card = <ReleaseFeedCard {...props} item={item} sourceTab={sourceTab} />;
+	} else if (isLaneCapableFeedItem(item)) {
+		const titleHref = isAnnouncementFeedItem(item)
+			? buildAnnouncementTitleHref(item, sourceTab, currentScope)
+			: null;
+		card = (
+			<ReleaseFeedCard
+				{...props}
+				item={item}
+				sourceTab={sourceTab}
+				showReactions={item.kind === "release"}
+				titleHref={titleHref}
+			/>
+		);
 	} else {
 		return null;
 	}
@@ -1735,6 +1678,7 @@ export function FeedItemCard(props: {
 				"relative rounded-[24px] transition-[background-color,border-color,box-shadow] duration-200 ease-out",
 				isFresh && "dashboard-fresh-surface",
 			)}
+			data-announcement-card={item.kind === "announcement" ? "true" : undefined}
 			data-feed-item-fresh={isFresh ? "true" : "false"}
 		>
 			{card}

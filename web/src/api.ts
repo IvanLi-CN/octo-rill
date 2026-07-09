@@ -1314,6 +1314,25 @@ export type ReleaseDetailResponse = {
 	translated: ReleaseDetailTranslated | null;
 	smart: ReleaseDetailSmart | null;
 };
+export type AnnouncementDetailTranslated = ReleaseDetailTranslated;
+export type AnnouncementDetailSmart = ReleaseDetailSmart;
+export type AnnouncementDetailResponse = {
+	repo_full_name: string;
+	discussion_number: number;
+	discussion_key: string;
+	repo_visual: RepoVisual | null;
+	title: string;
+	body: string | null;
+	html_url: string;
+	occurred_at: string | null;
+	actor: {
+		login: string;
+		avatar_url?: string | null;
+		html_url?: string | null;
+	} | null;
+	translated: AnnouncementDetailTranslated | null;
+	smart: AnnouncementDetailSmart | null;
+};
 export async function apiGetReleaseDetail(
 	releaseId: string,
 ): Promise<ReleaseDetailResponse> {
@@ -1328,6 +1347,15 @@ export async function apiGetReleaseDetailByRepoTag(input: {
 }): Promise<ReleaseDetailResponse> {
 	return apiGet<ReleaseDetailResponse>(
 		`/api/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases/tag/${encodeURIComponent(input.tag)}/detail`,
+	);
+}
+export async function apiGetAnnouncementDetail(input: {
+	owner: string;
+	repo: string;
+	number: number | string;
+}): Promise<AnnouncementDetailResponse> {
+	return apiGet<AnnouncementDetailResponse>(
+		`/api/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/discussions/${encodeURIComponent(String(input.number))}/detail`,
 	);
 }
 export async function apiGetRepoPublicReleasePublication(input: {
@@ -1435,7 +1463,14 @@ export type TranslationSourceBlock = {
 };
 export type TranslationRequestItemInput = {
 	producer_ref: string;
-	kind: "release_summary" | "release_smart" | "release_detail" | "notification";
+	kind:
+		| "release_summary"
+		| "release_smart"
+		| "release_detail"
+		| "announcement_summary"
+		| "announcement_smart"
+		| "announcement_detail"
+		| "notification";
 	variant: string;
 	entity_id: string;
 	target_lang: string;
@@ -1559,6 +1594,16 @@ export function mapTranslationResultToReleaseDetailSmart(
 				? false
 				: retryable || undefined,
 	};
+}
+export function mapTranslationResultToAnnouncementDetailTranslated(
+	result: TranslationResultItem,
+): AnnouncementDetailTranslated | null {
+	return mapTranslationResultToReleaseDetailTranslated(result);
+}
+export function mapTranslationResultToAnnouncementDetailSmart(
+	result: TranslationResultItem,
+): AnnouncementDetailSmart | null {
+	return mapTranslationResultToReleaseDetailSmart(result);
 }
 export type TranslationBatchSubmitItemResponse = {
 	request_id: string;
@@ -1815,6 +1860,38 @@ export async function apiTranslateReleaseDetail(
 		kind: "release_detail",
 		variant: "detail_card",
 		entity_id: detail.release_id,
+		target_lang: "zh-CN",
+		max_wait_ms: 5_000,
+		source_blocks,
+		target_slots: ["title_zh", "body_md"],
+	};
+	return apiSubmitTranslationRequest({
+		mode: "wait",
+		item: requestItem,
+	});
+}
+export async function apiTranslateAnnouncementDetail(
+	detail: AnnouncementDetailResponse,
+): Promise<TranslationRequestResponse> {
+	const originalTitle =
+		detail.title.trim() || `discussion:${detail.discussion_number}`;
+	const body = detail.body?.trim();
+	const metadata = [
+		detail.repo_full_name,
+		`discussion_number=${detail.discussion_number}`,
+	]
+		.filter((value): value is string => Boolean(value?.trim()))
+		.join("\n");
+	const source_blocks: TranslationSourceBlock[] = [
+		{ slot: "title", text: originalTitle },
+		...(body ? [{ slot: "body_markdown" as const, text: body }] : []),
+		...(metadata ? [{ slot: "metadata" as const, text: metadata }] : []),
+	];
+	const requestItem: TranslationRequestItemInput = {
+		producer_ref: `announcement_detail:${detail.discussion_key}`,
+		kind: "announcement_detail",
+		variant: "detail_card",
+		entity_id: detail.discussion_key,
 		target_lang: "zh-CN",
 		max_wait_ms: 5_000,
 		source_blocks,

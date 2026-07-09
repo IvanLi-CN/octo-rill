@@ -61,7 +61,7 @@ import type {
 	ReleaseReactions,
 	ToggleReleaseReactionResponse,
 } from "@/feed/types";
-import { isReleaseFeedItem } from "@/feed/types";
+import { isLaneCapableFeedItem, isReleaseFeedItem } from "@/feed/types";
 import { useAutoSmart } from "@/feed/useAutoSmart";
 import { useAutoTranslate } from "@/feed/useAutoTranslate";
 import { type FeedRequestType, useFeed } from "@/feed/useFeed";
@@ -88,6 +88,7 @@ import {
 	type DashboardReleaseTarget,
 	type DashboardRouteState,
 } from "@/dashboard/routeState";
+import { AnnouncementDetailPage } from "@/dashboard/AnnouncementDetailPage";
 import {
 	DASHBOARD_FOLLOWING_ENTRY_LABEL,
 	buildDashboardScopeSummary,
@@ -1559,6 +1560,7 @@ export function Dashboard(props: {
 	);
 	const activeReleaseId = routeState.activeReleaseId;
 	const activeReleaseLocator = routeState.activeReleaseLocator;
+	const activeAnnouncementLocator = routeState.activeAnnouncementLocator;
 	const releaseReturnTab = routeState.releaseReturnTab;
 	const activeReleaseTarget = useMemo(
 		() =>
@@ -3024,7 +3026,7 @@ export function Dashboard(props: {
 	);
 	const requestLaneIfNeeded = useCallback(
 		(item: FeedItem, lane: FeedLane) => {
-			if (!isReleaseFeedItem(item)) {
+			if (!isLaneCapableFeedItem(item)) {
 				return;
 			}
 			if (
@@ -3072,7 +3074,7 @@ export function Dashboard(props: {
 	}, []);
 	const registerFeedItem = useCallback(
 		(item: FeedItem) => (element: HTMLElement | null) => {
-			if (!isReleaseFeedItem(item)) {
+			if (!isLaneCapableFeedItem(item)) {
 				return;
 			}
 			registerTranslate(item)(element);
@@ -3401,6 +3403,7 @@ export function Dashboard(props: {
 				scope,
 				activeReleaseId: null,
 				activeReleaseLocator: null,
+				activeAnnouncementLocator: null,
 				releaseReturnTab: scope ? "all" : "briefs",
 			});
 		},
@@ -3414,6 +3417,7 @@ export function Dashboard(props: {
 				scope: target.scope ?? scope,
 				activeReleaseId: target.releaseId,
 				activeReleaseLocator: target.locator,
+				activeAnnouncementLocator: null,
 				releaseReturnTab: target.fromTab,
 			});
 		},
@@ -3427,6 +3431,21 @@ export function Dashboard(props: {
 				scope,
 				activeReleaseId: null,
 				activeReleaseLocator: null,
+				activeAnnouncementLocator: null,
+				releaseReturnTab,
+			},
+			{ replace: true },
+		);
+	}, [releaseReturnTab, scope, setRouteState]);
+
+	const onCloseAnnouncementDetail = useCallback(() => {
+		setRouteState(
+			{
+				tab: releaseReturnTab,
+				scope,
+				activeReleaseId: null,
+				activeReleaseLocator: null,
+				activeAnnouncementLocator: null,
 				releaseReturnTab,
 			},
 			{ replace: true },
@@ -3453,6 +3472,7 @@ export function Dashboard(props: {
 					scope,
 					activeReleaseId: detail.release_id,
 					activeReleaseLocator: locator,
+					activeAnnouncementLocator: null,
 					releaseReturnTab,
 				},
 				{ replace: true },
@@ -3460,10 +3480,13 @@ export function Dashboard(props: {
 		},
 		[activeReleaseLocator, releaseReturnTab, scope, setRouteState, tab],
 	);
-	const showPageLaneSelector = tab === "all" || tab === "releases";
+	const hasActiveAnnouncementDetail = activeAnnouncementLocator !== null;
+	const showPageLaneSelector =
+		!hasActiveAnnouncementDetail && (tab === "all" || tab === "releases");
 	const renderSidebarInbox = !scopedMode && hasDesktopSidebarInbox;
 	const renderSidebar =
-		(tab === "briefs" && hasTabletSidebar) || renderSidebarInbox;
+		!hasActiveAnnouncementDetail &&
+		((tab === "briefs" && hasTabletSidebar) || renderSidebarInbox);
 	const dashboardContentLayoutClassName = scopedMode
 		? "grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px] lg:gap-6"
 		: renderSidebar
@@ -3635,6 +3658,7 @@ export function Dashboard(props: {
 				<FeedGroupedList
 					mode={mode}
 					sourceTab={mode}
+					currentScope={scope}
 					items={filteredItems}
 					currentViewer={{
 						login: me.user.login,
@@ -3921,90 +3945,101 @@ export function Dashboard(props: {
 									/>
 								</div>
 							) : null}
-							<TabsContent value="all" className="mt-0 min-w-0">
-								{renderFeedPanel("all")}
-							</TabsContent>
-							<TabsContent value="releases" className="mt-0 min-w-0">
-								{renderFeedPanel("releases")}
-							</TabsContent>
-							<TabsContent value="stars" className="mt-0 min-w-0">
-								{renderFeedPanel("stars")}
-							</TabsContent>
-							<TabsContent value="followers" className="mt-0 min-w-0">
-								{renderFeedPanel("followers")}
-							</TabsContent>
-							<TabsContent value="briefs" className="mt-0 min-w-0">
-								<NewContentNotice
-									count={liveNotices.briefs?.newCount ?? 0}
-									label="日报"
-									onReveal={() => {
-										void revealBriefUpdates().catch((error) => {
-											notifyGlobalError(
-												"新日报显示失败",
-												error,
-												"新日报显示失败，请稍后重试。",
-											);
-										});
-									}}
+							{hasActiveAnnouncementDetail && activeAnnouncementLocator ? (
+								<AnnouncementDetailPage
+									owner={activeAnnouncementLocator.owner}
+									repo={activeAnnouncementLocator.repo}
+									number={activeAnnouncementLocator.number}
+									onBack={onCloseAnnouncementDetail}
 								/>
-								<ReleaseDailyCard
-									briefs={briefs}
-									selectedId={selectedBriefId}
-									busy={busy === "Generate brief"}
-									freshKeys={freshBriefKeys}
-									error={
-										briefsError?.phase === "initial"
-											? briefsError.message
-											: null
-									}
-									detailLoading={selectedBriefDetailLoading}
-									detailError={selectedBriefDetailError}
-									onGenerate={onGenerateBrief}
-									onRetry={() =>
-										void refreshSidebar({
-											includeNotifications:
-												hasDesktopSidebarInbox || tab === "inbox",
-										})
-									}
-									onRetryDetail={
-										selectedBrief
-											? () => void loadBriefDetail(selectedBrief.id)
-											: undefined
-									}
-									onOpenRelease={onOpenReleaseDetail}
-								/>
-							</TabsContent>
-							<TabsContent value="inbox" className="mt-0 min-w-0">
-								<NewContentNotice
-									count={liveNotices.notifications?.newCount ?? 0}
-									label="Inbox 内容"
-									onReveal={() => {
-										void revealNotificationUpdates().catch((error) => {
-											notifyGlobalError(
-												"Inbox 新内容显示失败",
-												error,
-												"Inbox 新内容显示失败，请稍后重试。",
-											);
-										});
-									}}
-								/>
-								<InboxList
-									notifications={notifications}
-									loading={notificationsLoading}
-									busy={Boolean(busy)}
-									syncing={syncingInbox}
-									freshKeys={freshNotificationKeys}
-									error={
-										notificationsError?.phase === "initial"
-											? notificationsError.message
-											: null
-									}
-									onSync={tab === "inbox" ? onSyncInbox : undefined}
-									onRetry={() =>
-										void refreshNotifications({ background: false })
-									}
-								/>
-							</TabsContent>
+							) : (
+								<>
+									<TabsContent value="all" className="mt-0 min-w-0">
+										{renderFeedPanel("all")}
+									</TabsContent>
+									<TabsContent value="releases" className="mt-0 min-w-0">
+										{renderFeedPanel("releases")}
+									</TabsContent>
+									<TabsContent value="stars" className="mt-0 min-w-0">
+										{renderFeedPanel("stars")}
+									</TabsContent>
+									<TabsContent value="followers" className="mt-0 min-w-0">
+										{renderFeedPanel("followers")}
+									</TabsContent>
+									<TabsContent value="briefs" className="mt-0 min-w-0">
+										<NewContentNotice
+											count={liveNotices.briefs?.newCount ?? 0}
+											label="日报"
+											onReveal={() => {
+												void revealBriefUpdates().catch((error) => {
+													notifyGlobalError(
+														"新日报显示失败",
+														error,
+														"新日报显示失败，请稍后重试。",
+													);
+												});
+											}}
+										/>
+										<ReleaseDailyCard
+											briefs={briefs}
+											selectedId={selectedBriefId}
+											busy={busy === "Generate brief"}
+											freshKeys={freshBriefKeys}
+											error={
+												briefsError?.phase === "initial"
+													? briefsError.message
+													: null
+											}
+											detailLoading={selectedBriefDetailLoading}
+											detailError={selectedBriefDetailError}
+											onGenerate={onGenerateBrief}
+											onRetry={() =>
+												void refreshSidebar({
+													includeNotifications:
+														hasDesktopSidebarInbox || tab === "inbox",
+												})
+											}
+											onRetryDetail={
+												selectedBrief
+													? () => void loadBriefDetail(selectedBrief.id)
+													: undefined
+											}
+											onOpenRelease={onOpenReleaseDetail}
+										/>
+									</TabsContent>
+									<TabsContent value="inbox" className="mt-0 min-w-0">
+										<NewContentNotice
+											count={liveNotices.notifications?.newCount ?? 0}
+											label="Inbox 内容"
+											onReveal={() => {
+												void revealNotificationUpdates().catch((error) => {
+													notifyGlobalError(
+														"Inbox 新内容显示失败",
+														error,
+														"Inbox 新内容显示失败，请稍后重试。",
+													);
+												});
+											}}
+										/>
+										<InboxList
+											notifications={notifications}
+											loading={notificationsLoading}
+											busy={Boolean(busy)}
+											syncing={syncingInbox}
+											freshKeys={freshNotificationKeys}
+											error={
+												notificationsError?.phase === "initial"
+													? notificationsError.message
+													: null
+											}
+											onSync={tab === "inbox" ? onSyncInbox : undefined}
+											onRetry={() =>
+												void refreshNotifications({ background: false })
+											}
+										/>
+									</TabsContent>
+								</>
+							)}
 						</section>
 
 						{scopedMode && scope ? (

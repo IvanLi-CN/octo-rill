@@ -22,6 +22,7 @@
 
 | ID | Title | Lifecycle | Spec | Companion docs | Implementation |
 | --- | --- | --- | --- | --- | --- |
+| m8f2q | 公告翻译/润色与 Discussion 详情页对齐 | active | [SPEC.md](./m8f2q-announcement-discussion-reading/SPEC.md) | [IMPLEMENTATION.md](./m8f2q-announcement-discussion-reading/IMPLEMENTATION.md) / [HISTORY.md](./m8f2q-announcement-discussion-reading/HISTORY.md) | 已实现；announcement lane-capable card + canonical discussion detail route + local validation green |
 | k8d4m | Web Demo 与悬浮 Inspector Contract | active | [SPEC.md](./k8d4m-web-demo-inspector/SPEC.md) | [IMPLEMENTATION.md](./k8d4m-web-demo-inspector/IMPLEMENTATION.md) / [HISTORY.md](./k8d4m-web-demo-inspector/HISTORY.md) | 已交付；`/demo/` runtime + inspector + Pages assembly |
 | hz9vx | 列表状态一致性收敛 | active | [SPEC.md](./hz9vx-list-state-surface-consistency/SPEC.md) | [IMPLEMENTATION.md](./hz9vx-list-state-surface-consistency/IMPLEMENTATION.md) / [HISTORY.md](./hz9vx-list-state-surface-consistency/HISTORY.md) | 实现中；fast-track follow-up / shared five-state list contract + admin/dashboard list surfaces |
 | u1f6v | 认证态 Scoped Focus Feed | active | [SPEC.md](./u1f6v-authenticated-scoped-focus-feed/SPEC.md) | [IMPLEMENTATION.md](./u1f6v-authenticated-scoped-focus-feed/IMPLEMENTATION.md) / [HISTORY.md](./u1f6v-authenticated-scoped-focus-feed/HISTORY.md) | 实现中；fast-track / scoped reading surface + 单仓公开 Release 发布控件 |
