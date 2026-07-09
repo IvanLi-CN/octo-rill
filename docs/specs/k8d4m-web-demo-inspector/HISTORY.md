@@ -15,3 +15,4 @@
 - 2026-07-09: 针对 owner 反馈继续压紧桌面态 inspector 内容密度，确保 `1366x768` + toast 的短视口截图里 `Actions & Share`、share URL 与 `Advanced` 摘要都留在首屏内，同时补了 Storybook `CompactDesktopSurface` 入口与对应 Playwright 断言。
 - 2026-07-09: 根据 owner 反馈撤回正文 safe area 让位逻辑，改回真正的桌面悬浮覆盖层；Dashboard 重新允许正文延伸到 inspector 下方，Settings / Public Release scene 默认停靠左侧以避免压住主操作，同时保留 demo 保存 PAT 的固定假 mask，避免把用户输入的 secret 前缀写回 mock UI。
 - 2026-07-09: 继续根据 owner 反馈细化桌面合同：当浏览器宽度足够容纳 Web App 最宽版心时，demo 根层会切成双栏 frame，左侧固定 inspector、右侧保留现有 app layout；普通桌面宽度仍保持真正的悬浮覆盖层，并新增超宽 left-docked 几何回归与 `ui_demo` 视觉证据。
+- 2026-07-09: review-loop 发现超宽双栏 frame 仍以 `content-box` 计算总宽度，导致 `maxWidth + padding-left` 在接近断点时可能顶出视口；已改为 `border-box` 约束根层宽度，并把 ultra-wide 回归用例改为校验 frame 右边界不超过 viewport，确保 docked inspector 与 app frame 对齐。
