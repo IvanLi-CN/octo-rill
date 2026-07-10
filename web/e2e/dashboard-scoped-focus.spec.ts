@@ -198,7 +198,21 @@ async function installScopedFocusMocks(
 		}
 
 		if (req.method() === "GET" && pathname === "/api/briefs") {
-			return json(route, []);
+			return json(route, [
+				{
+					id: "cached-global-brief",
+					date: "2026-04-30",
+					window_start: "2026-04-29T00:00:00Z",
+					window_end: "2026-04-30T00:00:00Z",
+					effective_time_zone: "UTC",
+					effective_local_boundary: "00:00",
+					release_count: 1,
+					release_ids: ["focus-repo-1"],
+					content_markdown: "## 不应出现在聚焦页的全局日报",
+					created_at: "2026-04-30T00:00:03Z",
+					updated_at: "2026-04-30T00:00:03Z",
+				},
+			]);
 		}
 
 		if (req.method() === "POST" && pathname === "/api/briefs/generate") {
@@ -422,7 +436,7 @@ test("dashboard brand link opens the home feed from scoped routes", async ({
 	).toHaveCount(0);
 });
 
-test("scoped feeds ignore stale pending daily brief generation state from the global feed", async ({
+test("scoped feeds ignore cached briefs and pending generation state from the global feed", async ({
 	page,
 }) => {
 	await installScopedFocusMocks(page, { holdBriefGeneration: true });
@@ -445,6 +459,8 @@ test("scoped feeds ignore stale pending daily brief generation state from the gl
 	).toBeVisible();
 	await expect(page.getByRole("button", { name: "生成日报" })).toHaveCount(0);
 	await expect(page.locator('[data-feed-group-view="brief"]')).toHaveCount(0);
+	await expect(page.getByText("日报摘要")).toHaveCount(0);
+	await expect(page.getByText("不应出现在聚焦页的全局日报")).toHaveCount(0);
 	await expect(page.getByText("桌面版 Stable v2.1.47")).toBeVisible();
 	await expect(
 		page.locator('[data-social-card-primary-full-label="true"]', {
