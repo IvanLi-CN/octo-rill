@@ -224,11 +224,15 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route(
             "/public/repos/{owner}/{repo}/releases",
-            get(api::public_list_repo_releases),
+            get(api::public_list_repo_releases_http),
         )
         .route(
             "/public/repos/{owner}/{repo}/releases/tag/{tag}",
             get(api::public_get_repo_release_detail),
+        )
+        .route(
+            "/public/repos/{owner}/{repo}/releases/content",
+            get(api::public_get_repo_release_content),
         )
         .route("/notifications", get(api::list_notifications))
         .route("/dashboard/updates", get(api::dashboard_updates))

@@ -1,4 +1,11 @@
-import { ExternalLink, RefreshCcw } from "lucide-react";
+import {
+	ArrowLeft,
+	ChevronDown,
+	ChevronUp,
+	ExternalLink,
+	RefreshCcw,
+} from "lucide-react";
+import { useWindowVirtualizer } from "@tanstack/react-virtual";
 import {
 	lazy,
 	Suspense,
@@ -13,11 +20,13 @@ import {
 import {
 	ApiError,
 	type PublicReleaseHighlight,
+	type PublicReleaseGap,
 	type PublicReleaseListItem,
 	type PublicReleasePendingResponse,
 	type PublicReleaseResponse,
 	type ReleaseDetailResponse,
 	apiGetPublicRepoReleaseDetail,
+	apiGetPublicRepoReleaseContent,
 	apiGetPublicRepoReleases,
 } from "@/api";
 import { AuthProviderIcon } from "@/components/brand/AuthProviderIcon";
@@ -34,7 +43,11 @@ import {
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
 import { InternalLink } from "@/lib/internalNavigation";
 import type { FeedLane, ReleaseFeedItem } from "@/feed/types";
-import type { PublicReleaseHighlightSelection } from "@/publicRelease/routeState";
+import {
+	appendPublicReleaseHighlightParams,
+	publicReleaseHighlightSearch,
+	type PublicReleaseHighlightSelection,
+} from "@/publicRelease/routeState";
 import { cn } from "@/lib/utils";
 import { buildVersionReleaseHref } from "@/version/versionReleaseLink";
 import { useVersionMonitor } from "@/version/versionMonitor";
@@ -46,7 +59,7 @@ const ReleaseFeedCard = lazy(async () => {
 
 const PUBLIC_RELEASE_LIST_BODY_MAX_CHARS = 2800;
 const PUBLIC_RELEASE_PAGE_SIZE = 6;
-const PUBLIC_RELEASE_HIGHLIGHT_PAGE_SIZE = 12;
+const PUBLIC_RELEASE_HIGHLIGHT_PAGE_SIZE = 30;
 
 type LoadState =
 	| { status: "loading" }
@@ -93,32 +106,34 @@ export function PublicReleasePage(props: {
 	const [state, setState] = useState<LoadState>({ status: "loading" });
 	const [loadingMore, setLoadingMore] = useState(false);
 	const [loadingNewer, setLoadingNewer] = useState(false);
+	const [loadingGap, setLoadingGap] = useState<string | null>(null);
 	const [appendError, setAppendError] = useState<string | null>(null);
 	const initialLoadKeyRef = useRef<string | null>(null);
-	const prependAnchorRef = useRef<{ releaseId: string; top: number } | null>(
-		null,
-	);
-	const highlightIds =
-		highlight?.mode === "ids" || highlight?.mode === "invalid"
-			? highlight.ids?.join(",")
-			: undefined;
-	const highlightStart =
-		highlight?.mode === "range" || highlight?.mode === "invalid"
-			? highlight.start
-			: undefined;
-	const highlightEnd =
-		highlight?.mode === "range" || highlight?.mode === "invalid"
-			? highlight.end
-			: undefined;
 	const isHighlightMode = highlight !== null;
-	const initialLoadKey = [
-		owner,
-		repo,
-		tag ?? "",
-		highlightIds ?? "",
-		highlightStart ?? "",
-		highlightEnd ?? "",
-	].join("\u0000");
+	const initialLoadKey = JSON.stringify({ owner, repo, tag, highlight });
+
+	const highlightRequest = useMemo(() => {
+		if (!highlight) return {};
+		if (highlight.mode === "discrete") {
+			return {
+				highlight: highlight.selectors,
+				highlight_active: highlight.active,
+			};
+		}
+		if (highlight.mode === "range") {
+			return {
+				highlight_start: highlight.start,
+				highlight_end: highlight.end,
+				highlight_active: highlight.active,
+			};
+		}
+		return {
+			highlight: highlight.selectors,
+			highlight_start: highlight.start,
+			highlight_end: highlight.end,
+			highlight_active: highlight.active,
+		};
+	}, [highlight]);
 
 	const buildHighlightRequest = useCallback(
 		(direction?: "older" | "newer", cursor?: string | null) => ({
@@ -130,11 +145,11 @@ export function PublicReleasePage(props: {
 				: PUBLIC_RELEASE_PAGE_SIZE,
 			cursor,
 			direction,
-			highlight_ids: highlightIds,
-			highlight_start: highlightStart,
-			highlight_end: highlightEnd,
+			content: "polished" as const,
+			include_original: true,
+			...highlightRequest,
 		}),
-		[highlightEnd, highlightIds, highlightStart, isHighlightMode, owner, repo],
+		[highlightRequest, isHighlightMode, owner, repo],
 	);
 
 	const load = useCallback(async () => {
@@ -149,6 +164,8 @@ export function PublicReleasePage(props: {
 						repo,
 						tag,
 						source: "page",
+						content: "all",
+						include_original: true,
 					})
 				: await apiGetPublicRepoReleases({
 						...buildHighlightRequest(),
@@ -171,6 +188,25 @@ export function PublicReleasePage(props: {
 			setState({ status: "error", message: "公开 Release 加载失败" });
 		}
 	}, [buildHighlightRequest, owner, repo, tag]);
+
+	const mergeItems = useCallback(
+		(current: PublicReleaseListItem[], incoming: PublicReleaseListItem[]) => {
+			const byId = new Map(current.map((item) => [item.release_id, item]));
+			for (const item of incoming) {
+				byId.set(item.release_id, { ...byId.get(item.release_id), ...item });
+			}
+			return Array.from(byId.values()).sort((left, right) => {
+				const ts = (right.published_at ?? "").localeCompare(
+					left.published_at ?? "",
+				);
+				if (ts !== 0) return ts;
+				return right.release_id.localeCompare(left.release_id, undefined, {
+					numeric: true,
+				});
+			});
+		},
+		[],
+	);
 
 	const loadMore = useCallback(async () => {
 		if (
@@ -195,17 +231,13 @@ export function PublicReleasePage(props: {
 				if (current.status !== "list") {
 					return current;
 				}
-				const seen = new Set(current.data.items.map((item) => item.release_id));
-				const incoming = data.items.filter(
-					(item) => !seen.has(item.release_id),
-				);
 				return {
 					status: "list",
 					data: {
-						...data,
-						items: [...current.data.items, ...incoming],
-						previous_cursor:
-							data.previous_cursor ?? current.data.previous_cursor,
+						...current.data,
+						items: mergeItems(current.data.items, data.items),
+						next_cursor: data.next_cursor,
+						previous_cursor: current.data.previous_cursor,
 						highlight: data.highlight ?? current.data.highlight,
 					},
 				};
@@ -215,7 +247,7 @@ export function PublicReleasePage(props: {
 		} finally {
 			setLoadingMore(false);
 		}
-	}, [buildHighlightRequest, loadingMore, state, tag]);
+	}, [buildHighlightRequest, loadingMore, mergeItems, state, tag]);
 
 	const loadNewer = useCallback(async () => {
 		if (
@@ -225,15 +257,6 @@ export function PublicReleasePage(props: {
 			!state.data.previous_cursor
 		) {
 			return;
-		}
-		const firstItem = document.querySelector<HTMLElement>(
-			`[data-release-id="${CSS.escape(state.data.items[0]?.release_id ?? "")}"]`,
-		);
-		if (firstItem) {
-			prependAnchorRef.current = {
-				releaseId: state.data.items[0]?.release_id ?? "",
-				top: firstItem.getBoundingClientRect().top,
-			};
 		}
 		setLoadingNewer(true);
 		setAppendError(null);
@@ -247,15 +270,12 @@ export function PublicReleasePage(props: {
 			}
 			setState((current) => {
 				if (current.status !== "list") return current;
-				const seen = new Set(current.data.items.map((item) => item.release_id));
-				const incoming = data.items.filter(
-					(item) => !seen.has(item.release_id),
-				);
 				return {
 					status: "list",
 					data: {
-						...data,
-						items: [...incoming, ...current.data.items],
+						...current.data,
+						items: mergeItems(current.data.items, data.items),
+						previous_cursor: data.previous_cursor,
 						next_cursor: current.data.next_cursor ?? data.next_cursor,
 						highlight: data.highlight ?? current.data.highlight,
 					},
@@ -266,22 +286,110 @@ export function PublicReleasePage(props: {
 		} finally {
 			setLoadingNewer(false);
 		}
-	}, [buildHighlightRequest, loadingNewer, state, tag]);
+	}, [buildHighlightRequest, loadingNewer, mergeItems, state, tag]);
 
-	useLayoutEffect(() => {
-		const anchor = prependAnchorRef.current;
-		if (!anchor || state.status !== "list") return;
-		const element = document.querySelector<HTMLElement>(
-			`[data-release-id="${CSS.escape(anchor.releaseId)}"]`,
-		);
-		if (element) {
-			window.scrollBy({
-				top: element.getBoundingClientRect().top - anchor.top,
-				behavior: "auto",
+	const loadGap = useCallback(
+		async (gap: PublicReleaseGap) => {
+			if (loadingGap || state.status !== "list") return;
+			setLoadingGap(gap.newer_cursor);
+			setAppendError(null);
+			try {
+				const data = await apiGetPublicRepoReleases({
+					...buildHighlightRequest("older", gap.newer_cursor),
+					until_cursor: gap.older_cursor,
+				});
+				if (isPendingResponse(data)) return;
+				setState((current) => {
+					if (current.status !== "list") return current;
+					const existingIds = new Set(
+						current.data.items.map((item) => item.release_id),
+					);
+					const inserted = data.items.filter(
+						(item) => !existingIds.has(item.release_id),
+					).length;
+					const reachedOlderBoundary = data.items.some((item) =>
+						gap.older_cursor.endsWith(`|${item.release_id}`),
+					);
+					const nextGaps = (current.data.gaps ?? []).flatMap((candidate) => {
+						if (candidate.newer_cursor !== gap.newer_cursor) return [candidate];
+						if (reachedOlderBoundary || !data.next_cursor) return [];
+						return [
+							{
+								...candidate,
+								newer_cursor: data.next_cursor,
+								remaining_count: Math.max(
+									0,
+									candidate.remaining_count - inserted,
+								),
+							},
+						];
+					});
+					return {
+						status: "list",
+						data: {
+							...current.data,
+							items: mergeItems(current.data.items, data.items),
+							gaps: nextGaps,
+						},
+					};
+				});
+			} catch (err) {
+				setAppendError(err instanceof Error ? err.message : String(err));
+			} finally {
+				setLoadingGap(null);
+			}
+		},
+		[buildHighlightRequest, loadingGap, mergeItems, state.status],
+	);
+
+	const hydrateItems = useCallback(
+		(
+			items: Array<Pick<PublicReleaseListItem, "release_id" | "translated">>,
+		) => {
+			setState((current) => {
+				if (current.status !== "list") return current;
+				const translatedById = new Map(
+					items.map((item) => [item.release_id, item.translated]),
+				);
+				return {
+					status: "list",
+					data: {
+						...current.data,
+						items: current.data.items.map((item) =>
+							translatedById.has(item.release_id)
+								? {
+										...item,
+										translated: translatedById.get(item.release_id) ?? null,
+									}
+								: item,
+						),
+					},
+				};
 			});
-		}
-		prependAnchorRef.current = null;
-	}, [state]);
+		},
+		[],
+	);
+
+	const activateHighlight = useCallback((releaseId: string, index: number) => {
+		setState((current) => {
+			if (current.status !== "list" || !current.data.highlight) return current;
+			return {
+				status: "list",
+				data: {
+					...current.data,
+					highlight: {
+						...current.data.highlight,
+						active_release_id: releaseId,
+						active_index: index,
+					},
+					items: current.data.items.map((item) => ({
+						...item,
+						is_active_highlight: item.release_id === releaseId,
+					})),
+				},
+			};
+		});
+	}, []);
 
 	useEffect(() => {
 		if (initialLoadKeyRef.current === initialLoadKey) return;
@@ -297,6 +405,14 @@ export function PublicReleasePage(props: {
 	}, [load, state]);
 
 	const repoFullName = useMemo(() => `${owner}/${repo}`, [owner, repo]);
+	const highlightedListHref = useMemo(() => {
+		if (!tag || !highlight) return null;
+		const params = appendPublicReleaseHighlightParams(
+			new URLSearchParams(),
+			highlight,
+		);
+		return `/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases?${params.toString()}`;
+	}, [highlight, owner, repo, tag]);
 
 	return (
 		<main className="min-h-dvh bg-background text-foreground">
@@ -321,6 +437,21 @@ export function PublicReleasePage(props: {
 							</a>
 						</Button>
 					</header>
+
+					{highlightedListHref ? (
+						<div className="pt-4">
+							<InternalLink
+								href={highlightedListHref}
+								to="/$owner/$repo/releases"
+								params={{ owner, repo }}
+								search={publicReleaseHighlightSearch(highlight)}
+								className="inline-flex items-center gap-2 text-sm text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+							>
+								<ArrowLeft className="size-4" />
+								返回高亮列表
+							</InternalLink>
+						</div>
+					) : null}
 
 					{tag ? null : (
 						<section className="py-6">
@@ -368,6 +499,7 @@ export function PublicReleasePage(props: {
 							repo={repo}
 							items={state.data.items}
 							highlight={state.data.highlight}
+							gaps={state.data.gaps}
 							hasMore={Boolean(state.data.next_cursor)}
 							hasNewer={Boolean(state.data.previous_cursor)}
 							loadingMore={loadingMore}
@@ -375,6 +507,11 @@ export function PublicReleasePage(props: {
 							appendError={appendError}
 							onLoadMore={loadMore}
 							onLoadNewer={loadNewer}
+							onLoadGap={loadGap}
+							loadingGap={loadingGap}
+							highlightSelection={highlight}
+							onHydrateItems={hydrateItems}
+							onActivateHighlight={activateHighlight}
 						/>
 					) : null}
 
@@ -552,24 +689,70 @@ function ReleaseList(props: {
 	repo: string;
 	items: PublicReleaseListItem[];
 	highlight?: PublicReleaseHighlight;
+	gaps?: PublicReleaseGap[];
+	highlightSelection: PublicReleaseHighlightSelection;
 	hasMore: boolean;
 	hasNewer: boolean;
 	loadingMore: boolean;
 	loadingNewer: boolean;
+	loadingGap: string | null;
 	appendError: string | null;
-	onLoadMore: () => void;
-	onLoadNewer: () => void;
+	onLoadMore: () => Promise<void>;
+	onLoadNewer: () => Promise<void>;
+	onLoadGap: (gap: PublicReleaseGap) => Promise<void>;
+	onHydrateItems: (
+		items: Array<Pick<PublicReleaseListItem, "release_id" | "translated">>,
+	) => void;
+	onActivateHighlight: (releaseId: string, index: number) => void;
 }) {
-	const [selectedLane, setSelectedLane] = useState<FeedLane>("original");
+	const [selectedLane, setSelectedLane] = useState<FeedLane>("smart");
 	const [selectedLaneByRelease, setSelectedLaneByRelease] = useState<
 		Record<string, FeedLane>
 	>({});
-	const sentinelRef = useRef<HTMLDivElement | null>(null);
-	const sentinelVisibleRef = useRef(false);
-	const newerSentinelRef = useRef<HTMLDivElement | null>(null);
-	const newerSentinelVisibleRef = useRef(false);
-	const releaseElementRefs = useRef(new Map<string, HTMLDivElement>());
+	const listRef = useRef<HTMLDivElement | null>(null);
 	const focusedHighlightSignatureRef = useRef<string | null>(null);
+	const hydratedTranslatedRef = useRef(new Set<string>());
+
+	type VirtualRow =
+		| { kind: "release"; item: PublicReleaseListItem }
+		| { kind: "gap"; gap: PublicReleaseGap };
+
+	const rows = useMemo<VirtualRow[]>(() => {
+		const gapByNewerId = new Map<string, PublicReleaseGap>();
+		for (const gap of props.gaps ?? []) {
+			gapByNewerId.set(gap.newer_cursor.split("|").at(-1) ?? "", gap);
+		}
+		const result: VirtualRow[] = [];
+		for (const item of props.items) {
+			result.push({ kind: "release", item });
+			const gap = gapByNewerId.get(item.release_id);
+			if (gap) result.push({ kind: "gap", gap });
+		}
+		return result;
+	}, [props.gaps, props.items]);
+
+	const virtualizer = useWindowVirtualizer({
+		count: rows.length,
+		estimateSize: (index) => (rows[index]?.kind === "gap" ? 72 : 420),
+		overscan: 4,
+		scrollMargin: listRef.current?.offsetTop ?? 0,
+		getItemKey: (index) => {
+			const row = rows[index];
+			return row?.kind === "release"
+				? `release-${row.item.release_id}`
+				: `gap-${row?.gap.newer_cursor ?? index}`;
+		},
+	});
+
+	const virtualItems = virtualizer.getVirtualItems();
+	const visibleReleaseIds = virtualItems
+		.map((virtualItem) => rows[virtualItem.index])
+		.filter(
+			(row): row is Extract<VirtualRow, { kind: "release" }> =>
+				row?.kind === "release",
+		)
+		.map((row) => row.item.release_id);
+	const visibleReleaseSignature = visibleReleaseIds.join(",");
 
 	const selectAllLane = useCallback((lane: FeedLane) => {
 		setSelectedLane(lane);
@@ -584,107 +767,154 @@ function ReleaseList(props: {
 	}, []);
 
 	useEffect(() => {
-		if (
-			!props.hasMore ||
-			props.loadingMore ||
-			props.appendError ||
-			props.items.length === 0
-		) {
-			return;
-		}
-		const el = sentinelRef.current;
-		if (!el) return;
-		const obs = new IntersectionObserver(
-			(entries) => {
-				const isIntersecting = entries.some((entry) => entry.isIntersecting);
-				if (isIntersecting && !sentinelVisibleRef.current) {
-					sentinelVisibleRef.current = true;
-					props.onLoadMore();
-					return;
-				}
-				if (!isIntersecting) {
-					sentinelVisibleRef.current = false;
-				}
-			},
-			{ rootMargin: "900px 0px", threshold: 0.01 },
+		if (selectedLane !== "translated" || !visibleReleaseSignature) return;
+		const ids = visibleReleaseIds.filter(
+			(id) => !hydratedTranslatedRef.current.has(id),
 		);
-		obs.observe(el);
-		return () => obs.disconnect();
+		if (ids.length === 0) return;
+		for (const id of ids) hydratedTranslatedRef.current.add(id);
+		void apiGetPublicRepoReleaseContent({
+			owner: props.owner,
+			repo: props.repo,
+			release_ids: ids.slice(0, 30),
+			content: "translated",
+		})
+			.then((response) =>
+				props.onHydrateItems(
+					response.items.map((item) => ({
+						release_id: item.release_id,
+						translated: item.translated,
+					})),
+				),
+			)
+			.catch(() => {
+				for (const id of ids) hydratedTranslatedRef.current.delete(id);
+			});
 	}, [
-		props.appendError,
-		props.hasMore,
-		props.items.length,
-		props.loadingMore,
-		props.onLoadMore,
+		props.onHydrateItems,
+		props.owner,
+		props.repo,
+		selectedLane,
+		visibleReleaseIds,
+		visibleReleaseSignature,
 	]);
 
-	useEffect(() => {
-		if (
-			!props.hasNewer ||
-			props.loadingNewer ||
-			props.appendError ||
-			props.items.length === 0
-		) {
-			return;
-		}
-		const el = newerSentinelRef.current;
-		if (!el) return;
-		const obs = new IntersectionObserver(
-			(entries) => {
-				const isIntersecting = entries.some((entry) => entry.isIntersecting);
-				if (isIntersecting && !newerSentinelVisibleRef.current) {
-					newerSentinelVisibleRef.current = true;
-					props.onLoadNewer();
-					return;
-				}
-				if (!isIntersecting) newerSentinelVisibleRef.current = false;
-			},
-			{ rootMargin: "900px 0px", threshold: 0.01 },
-		);
-		obs.observe(el);
-		return () => obs.disconnect();
-	}, [
-		props.appendError,
-		props.hasNewer,
-		props.items.length,
-		props.loadingNewer,
-		props.onLoadNewer,
-	]);
-
-	useEffect(() => {
+	useLayoutEffect(() => {
 		if (!props.highlight || props.items.length === 0) return;
 		const signature = [
 			props.highlight.mode,
-			...props.highlight.requested_ids,
-			...props.highlight.resolved_ids,
+			...props.highlight.requested,
+			props.highlight.active_release_id ?? "",
 		].join(":");
 		if (focusedHighlightSignatureRef.current === signature) return;
-		const targets = props.items
-			.filter((item) => item.is_highlighted)
-			.map((item) => releaseElementRefs.current.get(item.release_id))
-			.filter((element): element is HTMLDivElement => Boolean(element));
-		if (targets.length === 0) return;
+		const activeId =
+			props.highlight.active_release_id ??
+			props.items.find((item) => item.is_highlighted)?.release_id;
+		const index = rows.findIndex(
+			(row) => row.kind === "release" && row.item.release_id === activeId,
+		);
+		if (index < 0) return;
+		virtualizer.scrollToIndex(index, { align: "start", behavior: "auto" });
+		focusedHighlightSignatureRef.current = signature;
+	}, [props.highlight, props.items, rows, virtualizer]);
 
-		const frame = window.requestAnimationFrame(() => {
-			const first = targets[0].getBoundingClientRect();
-			const last = targets.at(-1)?.getBoundingClientRect() ?? first;
-			const viewportHeight = window.innerHeight;
-			const currentTop = window.scrollY;
-			const firstAlignedTop = currentTop + first.top - 16;
-			const lastAlignedBottom = currentTop + last.bottom - viewportHeight + 16;
-			const spanHeight = last.bottom - first.top;
-			const targetTop =
-				spanHeight <= viewportHeight - 32
-					? currentTop + (first.top + last.bottom) / 2 - viewportHeight / 2
-					: Math.abs(firstAlignedTop - currentTop) <=
-							Math.abs(lastAlignedBottom - currentTop)
-						? firstAlignedTop
-						: lastAlignedBottom;
-			window.scrollTo({ top: Math.max(0, targetTop), behavior: "auto" });
-			focusedHighlightSignatureRef.current = signature;
-		});
-		return () => window.cancelAnimationFrame(frame);
+	const replaceActiveInUrl = useCallback((selector: string) => {
+		const url = new URL(window.location.href);
+		url.searchParams.set("highlight_active", selector);
+		window.history.replaceState(window.history.state, "", url);
+	}, []);
+
+	const activateTarget = useCallback(
+		(target: { selector: string; release_id: string }, focus: boolean) => {
+			replaceActiveInUrl(target.selector);
+			const targetIds =
+				props.highlight?.mode === "discrete"
+					? props.highlight.resolved.map((candidate) => candidate.release_id)
+					: props.items
+							.filter((item) => item.is_highlighted)
+							.map((item) => item.release_id);
+			const navigationIndex = targetIds.indexOf(target.release_id);
+			const currentNavigationIndex = targetIds.indexOf(
+				props.highlight?.active_release_id ?? "",
+			);
+			const absoluteIndex =
+				props.highlight?.mode === "range" &&
+				props.highlight.active_index !== null &&
+				currentNavigationIndex >= 0
+					? props.highlight.active_index +
+						(navigationIndex - currentNavigationIndex)
+					: navigationIndex + 1;
+			props.onActivateHighlight(
+				target.release_id,
+				Math.min(
+					props.highlight?.total ?? absoluteIndex,
+					Math.max(1, absoluteIndex),
+				),
+			);
+			const index = rows.findIndex(
+				(row) =>
+					row.kind === "release" && row.item.release_id === target.release_id,
+			);
+			if (index < 0) return;
+			virtualizer.scrollToIndex(index, { align: "start", behavior: "auto" });
+			if (focus) {
+				window.requestAnimationFrame(() => {
+					document
+						.querySelector<HTMLElement>(
+							`[data-release-id="${CSS.escape(target.release_id)}"]`,
+						)
+						?.focus({ preventScroll: true });
+				});
+			}
+		},
+		[
+			props.highlight,
+			props.items,
+			props.onActivateHighlight,
+			replaceActiveInUrl,
+			rows,
+			virtualizer,
+		],
+	);
+
+	const navigationTargets = useMemo(() => {
+		if (!props.highlight) return [];
+		if (props.highlight.mode === "discrete") return props.highlight.resolved;
+		return props.items
+			.filter((item) => item.is_highlighted)
+			.map((item, index) => ({
+				selector: `id:${item.release_id}`,
+				release_id: item.release_id,
+				tag_name: item.tag_name,
+				ordinal: index + 1,
+			}));
 	}, [props.highlight, props.items]);
+	const activeTargetIndex = Math.max(
+		0,
+		navigationTargets.findIndex(
+			(target) => target.release_id === props.highlight?.active_release_id,
+		),
+	);
+
+	const detailHref = useCallback(
+		(item: PublicReleaseListItem) => {
+			const params = appendPublicReleaseHighlightParams(
+				new URLSearchParams(),
+				props.highlightSelection,
+			);
+			if (props.highlight) {
+				const selector =
+					props.highlight.resolved.find(
+						(target) => target.release_id === item.release_id,
+					)?.selector ?? `id:${item.release_id}`;
+				params.set("highlight_active", selector);
+			}
+			const query = params.toString();
+			const path = `/public/${encodeURIComponent(props.owner)}/${encodeURIComponent(props.repo)}/releases/tag/${encodeURIComponent(item.tag_name)}`;
+			return query ? `${path}?${query}` : path;
+		},
+		[props.highlight, props.highlightSelection, props.owner, props.repo],
+	);
 
 	if (props.items.length === 0) {
 		return (
@@ -701,7 +931,10 @@ function ReleaseList(props: {
 
 	return (
 		<div className="space-y-3 sm:space-y-4">
-			<div ref={newerSentinelRef} />
+			<AutoLoadSentinel
+				enabled={props.hasNewer && !props.loadingNewer && !props.appendError}
+				onVisible={props.onLoadNewer}
+			/>
 			<div className="flex flex-wrap items-center justify-between gap-3">
 				<div className="flex w-full items-center justify-end">
 					<FeedPageLaneSelector
@@ -710,64 +943,62 @@ function ReleaseList(props: {
 					/>
 				</div>
 			</div>
-			{props.highlight?.unresolved_ids.length ? (
+			{props.highlight &&
+			(props.highlight.unresolved.length > 0 || props.highlight.message) ? (
 				<p
 					className="font-mono text-xs text-muted-foreground"
 					data-testid="public-release-highlight-unresolved"
 					role="status"
 				>
-					{props.highlight.unresolved_ids.length} 个高亮目标暂时未找到
+					{props.highlight.message ??
+						`${props.highlight.unresolved.length} 个高亮目标暂时未找到`}
 				</p>
 			) : null}
-			{props.items.map((item) => {
-				const feedItem = publicReleaseToFeedItem(item);
-				const detailHref = `/${encodeURIComponent(props.owner)}/${encodeURIComponent(props.repo)}/releases/tag/${encodeURIComponent(item.tag_name)}`;
-				const itemLane = selectedLaneByRelease[item.release_id] ?? selectedLane;
-				return (
-					<div
-						key={item.release_id}
-						ref={(element) => {
-							if (element) {
-								releaseElementRefs.current.set(item.release_id, element);
-							} else {
-								releaseElementRefs.current.delete(item.release_id);
-							}
-						}}
-						className={
-							item.is_highlighted
-								? "scroll-mt-5 rounded-[30px] bg-primary/[0.04] ring-2 ring-primary/35 ring-offset-2 ring-offset-background transition-[box-shadow,background-color] duration-200"
-								: undefined
-						}
-						data-highlighted={item.is_highlighted ? "true" : "false"}
-						data-release-id={item.release_id}
-						data-testid={`public-release-item-${item.release_id}`}
-					>
-						<Suspense
-							fallback={<ReleaseCardFallback title={releaseTitle(item)} />}
+			<div
+				ref={listRef}
+				className="relative w-full"
+				style={{ height: `${virtualizer.getTotalSize()}px` }}
+				data-testid="public-release-virtual-list"
+			>
+				{virtualItems.map((virtualItem) => {
+					const row = rows[virtualItem.index];
+					if (!row) return null;
+					return (
+						<div
+							key={virtualItem.key}
+							ref={virtualizer.measureElement}
+							data-index={virtualItem.index}
+							className="absolute top-0 left-0 w-full pb-3 sm:pb-4"
+							style={{
+								transform: `translateY(${virtualItem.start - virtualizer.options.scrollMargin}px)`,
+							}}
 						>
-							<ReleaseFeedCard
-								item={feedItem}
-								activeLane={itemLane}
-								isTranslating={false}
-								isTranslationAutoRetrying={false}
-								isSmartGenerating={false}
-								isSmartAutoRetrying={false}
-								isReactionBusy={false}
-								reactionError={null}
-								showReactions={false}
-								titleHref={detailHref}
-								onSelectLane={(lane) =>
-									selectReleaseLane(item.release_id, lane)
-								}
-								onTranslateNow={() => undefined}
-								onSmartNow={() => undefined}
-								onToggleReaction={() => undefined}
-							/>
-						</Suspense>
-					</div>
-				);
-			})}
-			<div ref={sentinelRef} />
+							{row.kind === "gap" ? (
+								<GapLoader
+									gap={row.gap}
+									loading={props.loadingGap === row.gap.newer_cursor}
+									onVisible={props.onLoadGap}
+								/>
+							) : (
+								<ReleaseVirtualRow
+									item={row.item}
+									lane={
+										selectedLaneByRelease[row.item.release_id] ?? selectedLane
+									}
+									detailHref={detailHref(row.item)}
+									onSelectLane={(lane) =>
+										selectReleaseLane(row.item.release_id, lane)
+									}
+								/>
+							)}
+						</div>
+					);
+				})}
+			</div>
+			<AutoLoadSentinel
+				enabled={props.hasMore && !props.loadingMore && !props.appendError}
+				onVisible={props.onLoadMore}
+			/>
 			{props.loadingMore ? (
 				<p className="font-mono text-xs text-muted-foreground">加载中...</p>
 			) : null}
@@ -797,6 +1028,155 @@ function ReleaseList(props: {
 					</Button>
 				</div>
 			) : null}
+			{props.highlight && props.highlight.total > 0 ? (
+				<nav
+					className="fixed right-4 z-30 flex items-center gap-1 rounded-xl border bg-background/95 p-1 shadow-sm supports-[backdrop-filter]:backdrop-blur-sm"
+					style={{ bottom: "calc(env(safe-area-inset-bottom) + 1rem)" }}
+					aria-label="高亮记录导航"
+					data-testid="public-release-highlight-navigation"
+				>
+					<Button
+						type="button"
+						variant="ghost"
+						size="icon"
+						title="上一条高亮记录"
+						disabled={activeTargetIndex <= 0}
+						onClick={() => {
+							const target = navigationTargets[activeTargetIndex - 1];
+							if (target) activateTarget(target, true);
+						}}
+					>
+						<ChevronUp className="size-4" />
+					</Button>
+					<span className="min-w-16 text-center font-mono text-xs tabular-nums">
+						{props.highlight.active_index ?? activeTargetIndex + 1} /{" "}
+						{props.highlight.total}
+					</span>
+					<Button
+						type="button"
+						variant="ghost"
+						size="icon"
+						title="下一条高亮记录"
+						disabled={
+							activeTargetIndex >= navigationTargets.length - 1 &&
+							!props.hasMore
+						}
+						onClick={() => {
+							const target = navigationTargets[activeTargetIndex + 1];
+							if (target) {
+								activateTarget(target, true);
+							} else {
+								void props.onLoadMore();
+							}
+						}}
+					>
+						<ChevronDown className="size-4" />
+					</Button>
+				</nav>
+			) : null}
+		</div>
+	);
+}
+
+function AutoLoadSentinel(props: {
+	enabled: boolean;
+	onVisible: () => Promise<void>;
+}) {
+	const ref = useRef<HTMLDivElement | null>(null);
+	const visibleRef = useRef(false);
+	useEffect(() => {
+		if (!props.enabled || !ref.current) return;
+		const observer = new IntersectionObserver(
+			(entries) => {
+				const visible = entries.some((entry) => entry.isIntersecting);
+				if (visible && !visibleRef.current) {
+					visibleRef.current = true;
+					void props.onVisible();
+				} else if (!visible) {
+					visibleRef.current = false;
+				}
+			},
+			{ rootMargin: "900px 0px", threshold: 0.01 },
+		);
+		observer.observe(ref.current);
+		return () => observer.disconnect();
+	}, [props.enabled, props.onVisible]);
+	return <div ref={ref} className="h-px" aria-hidden="true" />;
+}
+
+function GapLoader(props: {
+	gap: PublicReleaseGap;
+	loading: boolean;
+	onVisible: (gap: PublicReleaseGap) => Promise<void>;
+}) {
+	const ref = useRef<HTMLDivElement | null>(null);
+	useEffect(() => {
+		if (props.loading || !ref.current) return;
+		const observer = new IntersectionObserver(
+			(entries) => {
+				if (entries.some((entry) => entry.isIntersecting)) {
+					void props.onVisible(props.gap);
+				}
+			},
+			{ rootMargin: "700px 0px", threshold: 0.01 },
+		);
+		observer.observe(ref.current);
+		return () => observer.disconnect();
+	}, [props.gap, props.loading, props.onVisible]);
+	return (
+		<div
+			ref={ref}
+			className="flex min-h-14 items-center justify-center rounded-xl border border-dashed bg-muted/20 px-4 py-3 font-mono text-xs text-muted-foreground"
+			role="status"
+		>
+			{props.loading
+				? "正在补齐中间记录..."
+				: `省略 ${props.gap.remaining_count} 条，滚动后自动加载`}
+		</div>
+	);
+}
+
+function ReleaseVirtualRow(props: {
+	item: PublicReleaseListItem;
+	lane: FeedLane;
+	detailHref: string;
+	onSelectLane: (lane: FeedLane) => void;
+}) {
+	const feedItem = publicReleaseToFeedItem(props.item);
+	return (
+		<div
+			tabIndex={props.item.is_active_highlight ? -1 : undefined}
+			className={cn(
+				"scroll-mt-5 rounded-xl outline-none transition-[background-color,box-shadow] duration-200 motion-reduce:transition-none",
+				props.item.is_highlighted && "bg-primary/[0.04] ring-1 ring-primary/30",
+				props.item.is_active_highlight &&
+					"bg-primary/[0.07] ring-2 ring-primary/65 ring-offset-2 ring-offset-background",
+			)}
+			data-highlighted={props.item.is_highlighted ? "true" : "false"}
+			data-active-highlight={props.item.is_active_highlight ? "true" : "false"}
+			data-release-id={props.item.release_id}
+			data-testid={`public-release-item-${props.item.release_id}`}
+		>
+			<Suspense
+				fallback={<ReleaseCardFallback title={releaseTitle(props.item)} />}
+			>
+				<ReleaseFeedCard
+					item={feedItem}
+					activeLane={props.lane}
+					isTranslating={false}
+					isTranslationAutoRetrying={false}
+					isSmartGenerating={false}
+					isSmartAutoRetrying={false}
+					isReactionBusy={false}
+					reactionError={null}
+					showReactions={false}
+					titleHref={props.detailHref}
+					onSelectLane={props.onSelectLane}
+					onTranslateNow={() => undefined}
+					onSmartNow={() => undefined}
+					onToggleReaction={() => undefined}
+				/>
+			</Suspense>
 		</div>
 	);
 }

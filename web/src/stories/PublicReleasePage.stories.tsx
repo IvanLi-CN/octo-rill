@@ -1,7 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
-import { expect, within } from "storybook/test";
+import { expect, userEvent, within } from "storybook/test";
 
 import { PublicReleasePage } from "@/pages/PublicReleasePage";
 import {
@@ -223,6 +223,7 @@ type PublicReleaseStoryMode =
 	| "highlight-small-range"
 	| "highlight-large-range"
 	| "highlight-partial"
+	| "polished-fallback"
 	| "detail"
 	| "detail-long"
 	| "error";
@@ -262,6 +263,26 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 				: input;
 		const url = new URL(req.url, window.location.origin);
 		if (url.pathname.startsWith("/api/public/repos/")) {
+			if (url.pathname.endsWith("/releases/content")) {
+				const releaseIds = new Set(
+					(url.searchParams.get("release_ids") ?? "").split(","),
+				);
+				return new Response(
+					JSON.stringify({
+						items: publicReleaseItems
+							.filter((item) => releaseIds.has(item.release_id))
+							.map((item) => ({
+								release_id: item.release_id,
+								translated: item.translated,
+								smart: item.smart,
+							})),
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "application/json" },
+					},
+				);
+			}
 			if (mode === "loading") {
 				return new Promise<Response>(() => {});
 			}
@@ -312,31 +333,13 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 					},
 				);
 			}
-			const limit = Number(url.searchParams.get("limit") ?? "6");
-			const cursor = url.searchParams.get("cursor");
-			const direction = url.searchParams.get("direction") ?? "older";
-			const ids = url.searchParams.get("highlight_ids")?.split(",");
-			const startId = url.searchParams.get("highlight_start");
-			const endId = url.searchParams.get("highlight_end");
-			if (ids) {
-				const resolvedIds = ids.filter((id) =>
-					publicReleaseItems.some((item) => item.release_id === id),
-				);
-				const items = publicReleaseItems
-					.filter((item) => resolvedIds.includes(item.release_id))
-					.map((item) => ({ ...item, is_highlighted: true }));
+			if (mode === "polished-fallback") {
 				return new Response(
 					JSON.stringify({
 						status: "ready",
 						repo_full_name: "octo-rill/example",
 						next_cursor: null,
-						items,
-						highlight: {
-							mode: "ids",
-							requested_ids: ids,
-							resolved_ids: resolvedIds,
-							unresolved_ids: ids.filter((id) => !resolvedIds.includes(id)),
-						},
+						items: [{ ...releaseItems[1], is_highlighted: false }],
 					}),
 					{
 						status: 200,
@@ -344,26 +347,109 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 					},
 				);
 			}
-			if (startId !== null || endId !== null) {
-				const startIndex = startId
-					? publicReleaseItems.findIndex((item) => item.release_id === startId)
-					: -1;
-				const endIndex = endId
-					? publicReleaseItems.findIndex((item) => item.release_id === endId)
-					: -1;
-				const resolvedIds = [startId, endId].filter(
-					(id): id is string =>
-						Boolean(id) &&
-						publicReleaseItems.some((item) => item.release_id === id),
+			const limit = Number(url.searchParams.get("limit") ?? "6");
+			const cursor = url.searchParams.get("cursor");
+			const direction = url.searchParams.get("direction") ?? "older";
+			const selectors = url.searchParams.getAll("highlight");
+			const startSelector = url.searchParams.get("highlight_start");
+			const endSelector = url.searchParams.get("highlight_end");
+			const activeSelector = url.searchParams.get("highlight_active");
+			const resolveSelector = (selector: string | null) => {
+				if (!selector) return undefined;
+				if (selector.startsWith("id:")) {
+					return publicReleaseItems.find(
+						(item) => item.release_id === selector.slice(3),
+					);
+				}
+				if (selector.startsWith("tag:")) {
+					return publicReleaseItems.find(
+						(item) => item.tag_name === selector.slice(4),
+					);
+				}
+				return undefined;
+			};
+			const target = (
+				selector: string,
+				item: (typeof publicReleaseItems)[number],
+			) => ({
+				selector,
+				release_id: item.release_id,
+				tag_name: item.tag_name,
+				ordinal: publicReleaseItems.indexOf(item) + 1,
+			});
+			if (selectors.length > 0) {
+				const resolved = selectors.flatMap((selector) => {
+					const item = resolveSelector(selector);
+					return item ? [target(selector, item)] : [];
+				});
+				const resolvedIds = resolved.map((item) => item.release_id);
+				const active =
+					resolved.find((item) => item.selector === activeSelector) ??
+					resolved[0];
+				const items = publicReleaseItems
+					.filter((item) => resolvedIds.includes(item.release_id))
+					.map((item) => ({
+						...item,
+						is_highlighted: true,
+						is_active_highlight: item.release_id === active?.release_id,
+					}));
+				return new Response(
+					JSON.stringify({
+						status: "ready",
+						repo_full_name: "octo-rill/example",
+						next_cursor: null,
+						items,
+						highlight: {
+							mode: "discrete",
+							status:
+								resolved.length === selectors.length ? "complete" : "partial",
+							requested: selectors,
+							resolved,
+							unresolved: selectors.filter(
+								(selector) => !resolveSelector(selector),
+							),
+							total: resolved.length,
+							active_release_id: active?.release_id ?? null,
+							active_index: active ? resolved.indexOf(active) + 1 : null,
+						},
+						segments: items.map((item) => ({
+							first_release_id: item.release_id,
+							last_release_id: item.release_id,
+						})),
+						gaps:
+							items.length > 1
+								? [
+										{
+											newer_cursor: `storybook|${items[0].release_id}`,
+											older_cursor: `storybook|${items[1].release_id}`,
+											remaining_count: 1,
+										},
+									]
+								: [],
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "application/json" },
+					},
 				);
-				const unresolvedIds = [startId, endId].filter(
-					(id): id is string =>
-						Boolean(id) && !resolvedIds.includes(id as string),
+			}
+			if (startSelector !== null || endSelector !== null) {
+				const startItem = resolveSelector(startSelector);
+				const endItem = resolveSelector(endSelector);
+				const startIndex = startItem
+					? publicReleaseItems.indexOf(startItem)
+					: -1;
+				const endIndex = endItem ? publicReleaseItems.indexOf(endItem) : -1;
+				const unresolved = [startSelector, endSelector].filter(
+					(selector): selector is string =>
+						Boolean(selector) && !resolveSelector(selector),
 				);
 				if (startIndex < 0 || endIndex < 0) {
-					const items = publicReleaseItems
-						.filter((item) => resolvedIds.includes(item.release_id))
-						.map((item) => ({ ...item, is_highlighted: true }));
+					const items = publicReleaseItems.slice(0, limit);
+					const resolved = [startSelector, endSelector].flatMap((selector) => {
+						const item = resolveSelector(selector);
+						return selector && item ? [target(selector, item)] : [];
+					});
 					return new Response(
 						JSON.stringify({
 							status: "ready",
@@ -372,13 +458,16 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 							items,
 							highlight: {
 								mode: "range",
-								requested_ids: [startId, endId].filter((id): id is string =>
-									Boolean(id),
+								status: "partial",
+								requested: [startSelector, endSelector].filter(
+									(value): value is string => Boolean(value),
 								),
-								resolved_ids: resolvedIds,
-								unresolved_ids: unresolvedIds,
-								start_id: startId,
-								end_id: endId,
+								resolved,
+								unresolved,
+								total: 0,
+								active_release_id: null,
+								active_index: null,
+								message: "连续范围的端点未全部命中，已显示普通最新列表",
 							},
 						}),
 						{
@@ -407,6 +496,7 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 				const items = pageItems.map((item) => ({
 					...item,
 					is_highlighted: true,
+					is_active_highlight: item.release_id === startItem?.release_id,
 				}));
 				const nextOffset = offset - rangeStart + items.length;
 				return new Response(
@@ -422,11 +512,16 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 						items,
 						highlight: {
 							mode: "range",
-							requested_ids: [startId, endId],
-							resolved_ids: [startId, endId],
-							unresolved_ids: [],
-							start_id: startId,
-							end_id: endId,
+							status: "complete",
+							requested: [startSelector, endSelector],
+							resolved: [
+								target(startSelector ?? "", startItem!),
+								target(endSelector ?? "", endItem!),
+							],
+							unresolved: [],
+							total: rangeItems.length,
+							active_release_id: startItem?.release_id ?? null,
+							active_index: 1,
 						},
 					}),
 					{
@@ -462,24 +557,27 @@ function PublicReleaseStory(props: { mode: PublicReleaseStoryMode }) {
 	installPublicReleaseMock(props.mode);
 	const highlight =
 		props.mode === "highlight-ids"
-			? { mode: "ids" as const, ids: ["291058027", "291058025"] }
+			? {
+					mode: "discrete" as const,
+					selectors: ["tag:v2.7.0", "id:291058025"],
+				}
 			: props.mode === "highlight-small-range"
 				? {
 						mode: "range" as const,
-						start: "291058027",
-						end: "291058024",
+						start: "tag:v2.7.0",
+						end: "id:291058024",
 					}
 				: props.mode === "highlight-large-range"
 					? {
 							mode: "range" as const,
-							start: "291058027",
-							end: "291058020",
+							start: "tag:v2.7.0",
+							end: "id:291058020",
 						}
 					: props.mode === "highlight-partial"
 						? {
 								mode: "range" as const,
-								start: "291058027",
-								end: "missing-release",
+								start: "tag:v2.7.0",
+								end: "tag:missing-release",
 							}
 						: null;
 
@@ -603,6 +701,21 @@ export const DiscreteHighlight: Story = {
 		await expect(
 			canvas.getByTestId("public-release-item-291058027"),
 		).toHaveAttribute("data-highlighted", "true");
+		await userEvent.click(canvas.getByTitle("下一条高亮记录"));
+		await expect(
+			canvas.getByTestId("public-release-item-291058025"),
+		).toHaveAttribute("data-active-highlight", "true");
+		await expect(
+			canvas.getByTestId("public-release-item-291058025"),
+		).toHaveFocus();
+		await expectPublicReleaseFooterVersion(canvasElement);
+	},
+};
+
+export const PolishedFallbackToOriginal: Story = {
+	args: { mode: "polished-fallback" },
+	play: async ({ canvas, canvasElement }) => {
+		await expect(canvas.getByText("Shared cache")).toBeVisible();
 		await expectPublicReleaseFooterVersion(canvasElement);
 	},
 };
