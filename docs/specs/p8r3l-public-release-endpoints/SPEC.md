@@ -153,6 +153,19 @@
 - source_type: `storybook_canvas`
   target_program: `mock-only`
   capture_scope: `browser-viewport`
+  requested_viewport: `1750x1216`
+  viewport_strategy: `storybook-default`
+  sensitive_exclusion: `N/A`
+  submission_gate: `pending-owner-approval`
+  story_id_or_title: `public-publicreleasepage--release-list`
+  state: `release-list-desktop`
+  evidence_note: 验证无高亮参数时普通 Release 卡片保持原有页面样式，首屏按时间倒序展示多条记录，没有额外的高亮包装样式。
+  image:
+  ![公开 Release 列表桌面状态](./assets/public-release-list-desktop.png)
+
+- source_type: `storybook_canvas`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
   requested_viewport: `1765x1216`
   viewport_strategy: `storybook-viewport`
   sensitive_exclusion: `N/A`
@@ -161,7 +174,7 @@
   state: `discrete-highlight-desktop`
   evidence_note: 验证服务端返回的两个离散目标在公开 Release 列表中同时高亮，并在首次载入后处于同一视口范围内；页面仍保留仓库头部、内容 lane、Release 卡片和页脚。
   image:
-  ![公开 Release 离散高亮桌面状态](./assets/public-release-highlight-discrete-desktop-trimmed.png)
+  ![公开 Release 离散高亮桌面状态](./assets/public-release-highlight-discrete-desktop.png)
 
 - source_type: `storybook_canvas`
   target_program: `mock-only`
@@ -174,7 +187,7 @@
   state: `small-range-highlight-mobile`
   evidence_note: 验证 390px 移动端连续范围的多条 Release 保持倒序排列并持续高亮，页面级 lane 切换器与卡片内容共存且没有横向溢出。
   image:
-  ![公开 Release 连续范围移动状态](./assets/public-release-highlight-small-range-mobile-trimmed.png)
+  ![公开 Release 连续范围移动状态](./assets/public-release-highlight-small-range-mobile.png)
 
 - source_type: `storybook_canvas`
   target_program: `mock-only`
@@ -187,7 +200,7 @@
   state: `partial-range-highlight-mobile`
   evidence_note: 验证范围端点部分解析时页面显示已找到的 Release、保留高亮边框，并以状态文案明确提示未找到的目标；页脚与窄屏布局仍完整可见。
   image:
-  ![公开 Release 部分解析移动状态](./assets/public-release-highlight-partial-mobile-trimmed.png)
+  ![公开 Release 部分解析移动状态](./assets/public-release-highlight-partial-mobile.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `public-publicreleasepage--pending-sync`
