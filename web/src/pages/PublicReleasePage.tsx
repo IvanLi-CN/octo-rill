@@ -86,6 +86,39 @@ function releaseTitle(item: Pick<PublicReleaseListItem, "name" | "tag_name">) {
 	return item.name?.trim() || item.tag_name;
 }
 
+function activeHighlightSelector(highlight?: PublicReleaseHighlight) {
+	const activeReleaseId = highlight?.active_release_id;
+	if (!activeReleaseId) return undefined;
+	return (
+		highlight.resolved.find((target) => target.release_id === activeReleaseId)
+			?.selector ?? `id:${activeReleaseId}`
+	);
+}
+
+function mergePaginatedHighlight(
+	current: PublicReleaseHighlight | undefined,
+	incoming: PublicReleaseHighlight | undefined,
+) {
+	if (!current) return incoming;
+	if (!incoming) return current;
+	return {
+		...incoming,
+		active_release_id: current.active_release_id,
+		active_index: current.active_index,
+	};
+}
+
+function applyActiveHighlight(
+	items: PublicReleaseListItem[],
+	highlight: PublicReleaseHighlight | undefined,
+) {
+	if (!highlight?.active_release_id) return items;
+	return items.map((item) => ({
+		...item,
+		is_active_highlight: item.release_id === highlight.active_release_id,
+	}));
+}
+
 function PulseBlock(props: { className?: string; rounded?: string }) {
 	const { className, rounded = "rounded-2xl" } = props;
 	return (
@@ -136,7 +169,11 @@ export function PublicReleasePage(props: {
 	}, [highlight]);
 
 	const buildHighlightRequest = useCallback(
-		(direction?: "older" | "newer", cursor?: string | null) => ({
+		(
+			direction?: "older" | "newer",
+			cursor?: string | null,
+			activeSelector?: string,
+		) => ({
 			owner,
 			repo,
 			source: "page" as const,
@@ -148,6 +185,7 @@ export function PublicReleasePage(props: {
 			content: "polished" as const,
 			include_original: true,
 			...highlightRequest,
+			...(activeSelector ? { highlight_active: activeSelector } : {}),
 		}),
 		[highlightRequest, isHighlightMode, owner, repo],
 	);
@@ -221,7 +259,11 @@ export function PublicReleasePage(props: {
 		setAppendError(null);
 		try {
 			const data = await apiGetPublicRepoReleases({
-				...buildHighlightRequest("older", state.data.next_cursor),
+				...buildHighlightRequest(
+					"older",
+					state.data.next_cursor,
+					activeHighlightSelector(state.data.highlight),
+				),
 			});
 			if (isPendingResponse(data)) {
 				setState({ status: "pending", pending: data });
@@ -231,14 +273,21 @@ export function PublicReleasePage(props: {
 				if (current.status !== "list") {
 					return current;
 				}
+				const highlight = mergePaginatedHighlight(
+					current.data.highlight,
+					data.highlight,
+				);
 				return {
 					status: "list",
 					data: {
 						...current.data,
-						items: mergeItems(current.data.items, data.items),
+						items: applyActiveHighlight(
+							mergeItems(current.data.items, data.items),
+							highlight,
+						),
 						next_cursor: data.next_cursor,
 						previous_cursor: current.data.previous_cursor,
-						highlight: data.highlight ?? current.data.highlight,
+						highlight,
 					},
 				};
 			});
@@ -262,7 +311,11 @@ export function PublicReleasePage(props: {
 		setAppendError(null);
 		try {
 			const data = await apiGetPublicRepoReleases({
-				...buildHighlightRequest("newer", state.data.previous_cursor),
+				...buildHighlightRequest(
+					"newer",
+					state.data.previous_cursor,
+					activeHighlightSelector(state.data.highlight),
+				),
 			});
 			if (isPendingResponse(data)) {
 				setState({ status: "pending", pending: data });
@@ -270,14 +323,21 @@ export function PublicReleasePage(props: {
 			}
 			setState((current) => {
 				if (current.status !== "list") return current;
+				const highlight = mergePaginatedHighlight(
+					current.data.highlight,
+					data.highlight,
+				);
 				return {
 					status: "list",
 					data: {
 						...current.data,
-						items: mergeItems(current.data.items, data.items),
+						items: applyActiveHighlight(
+							mergeItems(current.data.items, data.items),
+							highlight,
+						),
 						previous_cursor: data.previous_cursor,
 						next_cursor: current.data.next_cursor ?? data.next_cursor,
-						highlight: data.highlight ?? current.data.highlight,
+						highlight,
 					},
 				};
 			});
@@ -295,12 +355,20 @@ export function PublicReleasePage(props: {
 			setAppendError(null);
 			try {
 				const data = await apiGetPublicRepoReleases({
-					...buildHighlightRequest("older", gap.newer_cursor),
+					...buildHighlightRequest(
+						"older",
+						gap.newer_cursor,
+						activeHighlightSelector(state.data.highlight),
+					),
 					until_cursor: gap.older_cursor,
 				});
 				if (isPendingResponse(data)) return;
 				setState((current) => {
 					if (current.status !== "list") return current;
+					const highlight = mergePaginatedHighlight(
+						current.data.highlight,
+						data.highlight,
+					);
 					const existingIds = new Set(
 						current.data.items.map((item) => item.release_id),
 					);
@@ -328,8 +396,12 @@ export function PublicReleasePage(props: {
 						status: "list",
 						data: {
 							...current.data,
-							items: mergeItems(current.data.items, data.items),
+							items: applyActiveHighlight(
+								mergeItems(current.data.items, data.items),
+								highlight,
+							),
 							gaps: nextGaps,
+							highlight,
 						},
 					};
 				});
