@@ -13,7 +13,7 @@ export const Route = createFileRoute("/public/$owner/$repo/releases")({
 				owner: params.owner,
 				repo: params.repo,
 			},
-			search: Object.fromEntries(new URLSearchParams(location.search)),
+			search: location.search,
 			replace: true,
 		});
 	},

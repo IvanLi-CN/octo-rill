@@ -52,6 +52,22 @@ export const DEMO_SCENES: DemoScene[] = [
 		personas: ["guest", "member", "admin"],
 	},
 	{
+		id: "public-release-highlight-discrete",
+		title: "Release Highlights",
+		description: "公开 Release 离散高亮、gap 与浮动导航。",
+		path: "/octo-demo/release-lab/releases?highlight=tag%3Av2.31.0&highlight=id%3A291058021&highlight=tag%3Av2.17.0&highlight_active=id%3A291058021",
+		defaultPersona: "guest",
+		personas: ["guest", "member", "admin"],
+	},
+	{
+		id: "public-release-highlight-range",
+		title: "Release Range",
+		description: "公开 Release 长范围、active 居中与双向浏览。",
+		path: "/octo-demo/release-lab/releases?highlight_start=tag%3Av2.31.0&highlight_end=id%3A291058010&highlight_active=id%3A291058019",
+		defaultPersona: "guest",
+		personas: ["guest", "member", "admin"],
+	},
+	{
 		id: "admin-panel-users",
 		title: "Admin Panel",
 		description: "用户治理页，支持 simulated role / disabled / profile save。",

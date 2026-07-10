@@ -13,6 +13,7 @@ import type {
 	MeProfileResponse,
 	MeResponse,
 	PasskeySummary,
+	PublicReleaseListResponse,
 	ReactionTokenStatusResponse,
 	ReleaseDetailResponse,
 	RepoPublicReleasePublicationStatusResponse,
@@ -476,6 +477,59 @@ function buildPublicReleaseDetail(): ReleaseDetailResponse {
 	};
 }
 
+function buildPublicReleaseList(): PublicReleaseListResponse {
+	const items: PublicReleaseListResponse["items"] = Array.from(
+		{ length: 18 },
+		(_, index) => {
+			const version = 31 - index;
+			const releaseId = String(291058027 - index);
+			const tagName = `v2.${version}.0`;
+			return {
+				release_id: releaseId,
+				repo_full_name: OWNER_REPO_FULL_NAME,
+				repo_visual: OWNER_REPO_VISUAL,
+				tag_name: tagName,
+				previous_tag_name: index === 17 ? null : `v2.${version - 1}.0`,
+				name: `${tagName} release window`,
+				body: `## ${tagName}\n\n- Stable public Release history\n- Original content remains available as an immediate fallback\n`,
+				html_url: `https://github.com/octo-demo/release-lab/releases/tag/${tagName}`,
+				published_at: `2026-06-${String(30 - index).padStart(2, "0")}T08:00:00Z`,
+				is_prerelease: index === 7 ? 1 : 0,
+				is_draft: 0,
+				is_highlighted: false,
+				is_active_highlight: false,
+				translated: {
+					lang: "zh-CN",
+					status: index % 4 === 2 ? "missing" : "ready",
+					title: index % 4 === 2 ? null : `${tagName} 中文更新`,
+					summary:
+						index % 4 === 2
+							? null
+							: "这一版继续完善公开 Release 浏览与稳定的数据窗口。",
+				},
+				smart: {
+					lang: "zh-CN",
+					status: index % 5 === 3 ? "missing" : "ready",
+					title: index % 5 === 3 ? null : `${tagName} 更新重点`,
+					summary:
+						index % 5 === 3
+							? null
+							: index % 3 === 0
+								? "本次更新聚焦公开页面性能、可分享定位与滚动稳定性。"
+								: "Release 内容已润色为更适合快速浏览的摘要。",
+				},
+			};
+		},
+	);
+	return {
+		status: "ready",
+		repo_full_name: OWNER_REPO_FULL_NAME,
+		next_cursor: null,
+		previous_cursor: null,
+		items,
+	};
+}
+
 function buildPublicationStatus(
 	publicationState: DemoPublicationState,
 ): RepoPublicReleasePublicationStatusResponse {
@@ -919,6 +973,7 @@ export function buildDemoModel(input: {
 		briefs: buildBriefs(),
 		notifications: buildNotifications(),
 		publicReleaseDetail: buildPublicReleaseDetail(),
+		publicReleaseList: buildPublicReleaseList(),
 		publicationStatus: buildPublicationStatus(input.publicationState),
 		adminUsers,
 		adminUserProfiles,

@@ -1,6 +1,6 @@
 # 实现状态
 
-- Summary: fast-track / public Release pages + REST API + admin registry 已加入 release_id 高亮深链、服务端聚焦窗口与双向 cursor；本地验证完成，等待 PR 收敛。
+- Summary: fast-track / typed tag/ID selector、后端推荐窗口、双向虚拟列表与润色默认阅读路径已完成本地实现和验证，等待 PR 收敛。
 
 ## Milestones
 
@@ -11,7 +11,7 @@
 - [x] M5: 完成 review-loop。
 - [ ] M6: 完成 PR 收敛。
 - [x] M7: 公开页面页脚版本号链接与移动端视觉证据完成。
-- [x] M8: 完成公开 Release 高亮 URL、服务端范围 seek、双向 cursor、自动滚动与前后端回归覆盖。
+- [x] M8: 完成 typed 高亮 URL、服务端分段/gap 窗口、双向虚拟列表、浮动导航与前后端回归覆盖。
 
 ## Current Notes
 
@@ -20,25 +20,20 @@
 - 公开 Release usage 已区分 `github_public` 与 `private_owner_published`：GitHub public repo 可由匿名访问自动登记；viewer-owned personal private repo 只能由拥有者登录态通过 `/api/repos/{owner}/{repo}/public-release` 发布，取消发布会删除 private usage 并复用共享缓存清理判断。
 - `/public/:owner/:repo/releases` 前端路由只对旧列表路径做 replace 跳转到 `/:owner/:repo/releases`，保留 `/public/:owner/:repo/releases/tag/:tag` public-only 详情语义。
 - SQLite 主连接池默认使用 `OCTORILL_SQLITE_POOL_MAX_CONNECTIONS=8`，允许在 `1..32` 内配置；启动日志记录实际连接池大小，并在 repo release / translation worker 并发明显超过 pool budget 时输出 warning。高竞争后台 claim / attach 写路径需要使用 `BEGIN IMMEDIATE` 这类提前声明写意图的事务，避免 WAL 多连接下 `BEGIN` 读快照升级写锁时触发 `SQLITE_BUSY_SNAPSHOT`。
-- 公开列表页默认展示原文正文，但列表态会截断超长正文，详情页仍展示完整正文。
+- 公开列表与公开详情默认展示润色；首屏携带原文作为缺失/失败回退，翻译按视口可见记录批量加载。
 - 公开 Release 页脚与全站 footer 保持一致：有效 `loadedVersion` 链接到 OctoRill 自身 public-only Release 详情页，`unknown` 保持纯文本。
 - 公开文档站已提供面向接入方的 `公开 Release 接入` 页面，覆盖公开页面 URL、REST API、pending retry、真实 pending reason 枚举、分页参数与部署前检查。
-- 高亮 URL 只接受两种互斥模式：`highlight_ids` 离散目标，或 `highlight_start` / `highlight_end` 倒序闭区间；后端去重并限制离散目标最多 32 个，范围首载最多 12 条。
-- 高亮列表直接复用 `repo_releases.release_id` 唯一查询和 `idx_repo_releases_repo_sort_ts` 排序索引；范围查询通过 seek 限定闭区间，后端返回 `highlight`、`is_highlighted`、`unresolved_ids` 与 `previous_cursor`。
-- 页面只渲染后端推荐窗口；首次高亮载入自动居中或选择最近的首条顶部/末条底部对齐，older 追加与 newer 前置保留高亮并通过锚点补偿滚动。
+- 高亮 URL 使用重复 typed `highlight` 或 typed `highlight_start` / `highlight_end`，并以 `highlight_active` 保存当前导航目标；离散目标上限 20，首屏完整数据预算 30。
+- 高亮列表复用 `repo_releases` 唯一 ID 与仓库排序索引，响应增加连续 segments、内部 gaps、精确命中进度和双向 bounded cursor。
+- 页面统一使用动态高度 window virtualization，内部 gap 接近视口后自动填充；右下浮动导航按页面时间顺序切换 active 目标并保持详情往返上下文。
 
 ## Verification
 
-- `codex -m gpt-5.5 -c model_reasoning_effort="medium" --sandbox read-only -a never review --base origin/main`
-- `cd web && bun run build`
-- `cargo test public_release --all-targets`
-- `cargo test --all-targets`
-- `cd web && bun run storybook:build`
-- `cd web && PLAYWRIGHT_WEB_PORT=36830 bun run e2e -- public-release-page.spec.ts`
-- `cd web && npm run storybook:build`
-- `cd web && npm run e2e -- public-release-page.spec.ts`
-- `CARGO_INCREMENTAL=0 cargo test public_release_highlight -- --nocapture`
+- `cargo test --all-targets -q` (`663 passed`)
 - `cd web && bun run lint`
 - `cd web && bun run build`
+- `cd web && bun run build:demo`
 - `cd web && bun run storybook:build`
-- `cd web && PLAYWRIGHT_WEB_PORT=15300 bun run e2e e2e/public-release-page.spec.ts --workers=1`
+- `cd web && PLAYWRIGHT_WEB_PORT=15300 bunx playwright test e2e/public-release-page.spec.ts --project=chromium` (`10 passed`)
+- `codex review --base origin/main`: 五轮审查已逐项修复 legacy redirect 重复参数、居中窗口顺序、详情翻译、范围绝对序号、hydration 字段覆盖与双向 cursor 边界问题。
+- Chrome mock-only `ui_demo`: `public-release-highlight-discrete` at `1440x1000`; `public-release-highlight-range` at requested `390x844`.

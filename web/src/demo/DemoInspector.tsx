@@ -464,7 +464,10 @@ export function DemoInspector(props: {
 				<Button
 					type="button"
 					size="sm"
-					className="fixed bottom-4 right-4 z-50 rounded-full shadow-lg"
+					className={cn(
+						"fixed bottom-4 z-50 rounded-full shadow-lg",
+						snapshot.panelLayout.edge === "left" ? "left-4" : "right-4",
+					)}
 					onClick={() => setMobileOpen(true)}
 				>
 					<Inspect className="size-4" />

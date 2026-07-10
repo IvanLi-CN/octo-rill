@@ -16,9 +16,11 @@
 - 公开 Release 页面页脚展示当前 OctoRill 前端加载版本，并链接到 OctoRill 自身 public-only Release 详情页，登录态不得把该链接切到 Dashboard。
 - 首次访问先登记仓库 usage；若本地已有近期刷新且带真实 privacy proof 的公开仓库 metadata 与非草稿 Release 缓存，则直接复用共享缓存返回 ready；若只有近期公开 metadata 但尚无 Release 缓存，则回填 `repo_id` 并返回可重试 pending 响应；若本地无法确认近期公开 metadata，则返回 metadata pending。
 - 公开端点与登录用户视图复用同一份仓库级 `repo_releases` 主数据。
-- 公开列表页支持以 GitHub Release 全局 `release_id` 构造深链高亮：`highlight_ids` 用于离散记录，`highlight_start` 与 `highlight_end` 用于当前时间倒序列表中的闭区间；两种模式互斥，解析、去重、长度上限和缺失目标由后端负责。
-- 高亮请求由后端直接返回目标数据窗口：离散目标最多 32 个，范围首载最多 12 条；范围窗口使用 `repo_releases` 排序索引 seek，并通过 opaque `next_cursor` / `previous_cursor` 支持 older/newer 方向，前端不得从第一页逐页探测目标。
-- 页面收到高亮窗口后自动定位：目标整体可放入视口时居中；否则在范围第一条顶部对齐和最后一条底部对齐之间选择滚动距离较近的一侧；后续追加或前置数据继续沿用同一高亮上下文，并维持锚点位置。
+- 公开列表页支持 URL 高亮深链：离散模式使用重复的 `highlight=tag:<tag_name>|id:<release_id>`，范围模式使用 `highlight_start` 与 `highlight_end` typed selector 表示当前时间倒序列表中的闭区间；两种模式互斥，端点允许反写，重复目标按同一 Release 去重。
+- 单个 URL 最多包含 20 个离散目标。后端一次解析 tag / ID 并返回最多 30 条推荐数据，包含全部已解析目标、连续 segment、内部 gap、双向 cursor、精确命中数与当前 active 序号；前端不得从第一页逐页探测目标。
+- `highlight_active` 表示当前导航目标。页面默认聚焦时间线上较新的目标，通过 replace 更新 active URL；显式导航后刷新或详情返回仍定位同一目标。
+- 公开列表统一使用动态高度 window virtualization。内部 gap 接近视口时按方向自动请求并逐步填满，prepend、gap 合并及内容 lane 高度变化必须保持当前阅读锚点。
+- 公开列表与公开详情默认展示润色；首屏同时携带原文回退，翻译内容在用户切换后按当前可见 Release 批量读取。
 - 管理后台展示公开端点登记仓库、访问统计、同步状态、共享缓存数据量，并允许删除登记记录。
 
 ### Non-goals
@@ -34,10 +36,11 @@
 ## 接口契约
 
 - `GET /api/public/repos/{owner}/{repo}/releases`
-  - Query: `content=original|translated|polished|all`, `lang=zh-CN`, optional `source=page`, `limit`, `cursor`, `direction=older|newer`
-  - 高亮 Query 二选一：`highlight_ids=<id1>,<id2>`，或 `highlight_start=<id>&highlight_end=<id>`；`release_id` 是 GitHub Release 全局 ID。
-  - `highlight_ids` 与范围参数互斥；离散 ID 去重后最多 32 个，范围窗口最多返回 12 条。非法组合、非正整数和超限请求由后端返回 `400`。
-  - `200`: 返回共享缓存列表；带高亮时响应包含 `highlight` 解析元数据，且每个列表项包含 `is_highlighted`。
+  - Query: `content=original|translated|polished|all`, `include_original=true|false`, `lang=zh-CN`, optional `source=page`, `limit`, `cursor`, `until_cursor`, `direction=older|newer`。
+  - 离散高亮使用重复的 `highlight=tag:<tag_name>|id:<release_id>`；范围使用 `highlight_start=<selector>&highlight_end=<selector>`；可选 `highlight_active=<selector>`。
+  - typed selector 的 `tag:` 值按仓库内精确 tag 匹配，`id:` 值必须为正整数。离散与范围冲突、格式错误、超过 20 个目标或范围端点缺失时不返回 400，而是返回普通最新列表与 `highlight.status=invalid`。
+  - `200`: 返回共享缓存列表；高亮响应额外包含 `highlight`、`segments`、`gaps`、`previous_cursor`，列表项包含 `is_highlighted` / `is_active_highlight`。首屏完整项目最多 30 条。
+  - 离散目标部分缺失时 `highlight.status=partial`，仍返回已解析目标；范围任一端点缺失时退回普通列表。`highlight.total` 与 `highlight.active_index` 使用页面时间顺序。
   - `202`: 返回 `status=pending_sync`、`reason`、`retry_after_seconds`，并设置 `Retry-After`。
   - `400 unsupported_language`: 非 `zh-CN` 语言。
 
@@ -46,6 +49,10 @@
   - `200`: 返回共享缓存详情。
   - `202`: 仓库登记或同步尚未完成。
   - `404 release_not_found_or_not_cached`: 仓库已有同步结果但指定 tag 未命中。
+
+- `GET /api/public/repos/{owner}/{repo}/releases/content`
+  - Query: `release_ids=<comma-separated ids>`，最多 30 个；`content=translated|polished`，`lang=zh-CN`。
+  - 只读取当前公开访问上下文中的本地共享缓存，用于虚拟视口 lane hydration；不得触发 GitHub 或 LLM 请求。
 
 - `GET /api/repos/{owner}/{repo}/public-release`
   - 登录会话 required。
@@ -76,8 +83,8 @@
 - `public_repo_release_usage` 只保存登记、统计、`repo_id` 映射、同步状态和错误，并通过 `access_kind` 区分 `github_public` 与 `private_owner_published`。
 - `private_owner_published` usage 必须记录发布者与发布时间；匿名公开 API 只有在该 usage 存在且未撤销时才可读取私有 repo 的共享 `repo_releases`。
 - Release 主数据只写入并读取 `repo_releases`。
-- `release_id` 直接复用 `repo_releases.release_id`，高亮响应包含 `requested_ids`、`resolved_ids`、`unresolved_ids`；范围响应额外包含 `start_id` 与 `end_id`。
-- 普通列表响应保持首载 6 条和既有 older cursor 语义；高亮范围响应可用 `next_cursor` 加载更旧窗口、用 `previous_cursor` 加载更新窗口，且每次响应继续返回同一高亮元数据与项目标记。
+- `release_id` 直接复用 `repo_releases.release_id`；selector 解析结果包含原 selector、解析后的 `release_id` / `tag_name` 与时间线 ordinal。
+- 普通列表保持既有首载与 cursor 兼容。高亮首载返回按时间顺序扁平化的 `items`，并用 `segments` 描述连续片段、用 `gaps` 描述片段间边界 cursor 与剩余记录数；`until_cursor` 限制内部 gap 请求不得越过相邻 segment。
 - 全局 `sync.subscriptions` 将已登记公开仓库纳入现有 repo release queue；没有用户 token 候选时可对公开仓库使用匿名 GitHub REST fallback。
 
 ## 验收标准
@@ -126,21 +133,21 @@
   When 未登录页面/API 与登录用户视图读取同一 Release
   Then 内容来自同一条 `repo_releases.release_id` 记录。
 
-- Given 用户打开带 `highlight_ids` 的公开 Release URL
-  When 目标记录部分存在或部分缺失
-  Then 后端一次返回已解析目标、`unresolved_ids` 与 `is_highlighted` 标记，前端不得继续遍历普通分页寻找目标。
+- Given 用户打开带重复 typed `highlight` 的公开 Release URL
+  When tag 与 ID 目标部分存在、重复或部分缺失
+  Then 后端一次解析并按时间排序去重，返回已解析目标、未解析 selector、推荐 segments 与高亮标记，前端不得遍历普通分页寻找目标。
 
-- Given 用户打开带 `highlight_start` 与 `highlight_end` 的公开 Release URL
-  When 两端存在且范围超过窗口上限
-  Then 返回按当前时间倒序排列的连续窗口，包含首端；后续 cursor 请求继续在同一闭区间内返回连续数据并保持高亮。
+- Given 用户打开带 typed `highlight_start` 与 `highlight_end` 的公开 Release URL
+  When 两端存在且书写顺序相反或范围超过窗口上限
+  Then 后端按当前时间倒序归一化为含首尾闭区间，返回精确总数与最多 30 条窗口；后续 cursor 请求继续返回连续数据并保持高亮。
 
 - Given 高亮窗口已经渲染
-  When 目标整体能放入视口
-  Then 页面尽量居中展示目标；否则比较范围第一条顶部对齐与最后一条底部对齐的滚动距离，选择较近的一侧。
+  When active 目标高度不超过可用视口
+  Then 页面完整展示 active 卡片，并在不牺牲 active 完整性的前提下尽量容纳更多相邻高亮卡；超高卡片按顶部对齐。
 
-- Given 高亮窗口发生 older 追加或 newer 前置
-  When DOM 增量更新完成
-  Then 高亮上下文不丢失，前置数据通过锚点补偿避免当前视口跳动，移动端没有横向溢出。
+- Given 虚拟列表发生 older/newer 追加、内部 gap 填充或 lane 高度变化
+  When 数据与测量结果合并
+  Then 高亮上下文不丢失，当前锚点无明显跳动，虚拟 DOM 只保留视口与 overscan 行，移动端没有横向溢出。
 
 - Given 管理员删除公开登记记录
   When 下一轮全局同步运行
@@ -163,31 +170,32 @@
   image:
   ![公开 Release 列表桌面状态](./assets/public-release-list-desktop.png)
 
-- source_type: `storybook_canvas`
+- source_type: `ui_demo`
   target_program: `mock-only`
   capture_scope: `browser-viewport`
-  requested_viewport: `1765x1216`
-  viewport_strategy: `storybook-viewport`
+  requested_viewport: `1440x1000`
+  viewport_strategy: `browser-viewport-override`
   sensitive_exclusion: `N/A`
   submission_gate: `pending-owner-approval`
-  story_id_or_title: `public-publicreleasepage--discrete-highlight`
+  story_id_or_title: `public-release-highlight-discrete`
   state: `discrete-highlight-desktop`
-  evidence_note: 验证服务端返回的两个离散目标在公开 Release 列表中同时高亮，并在首次载入后处于同一视口范围内；页面仍保留仓库头部、内容 lane、Release 卡片和页脚。
+  evidence_note: 验证 URL 中三个 tag/ID 混合离散目标由同一个列表请求返回并同时进入视口；active 目标使用更强焦点环，右下导航精确显示 `2 / 3`，默认内容 lane 为润色且无横向溢出。
   image:
   ![公开 Release 离散高亮桌面状态](./assets/public-release-highlight-discrete-desktop.png)
 
-- source_type: `storybook_canvas`
+- source_type: `ui_demo`
   target_program: `mock-only`
   capture_scope: `browser-viewport`
   requested_viewport: `390x844`
-  viewport_strategy: `devtools-emulate`
+  captured_viewport: `375x812`
+  viewport_strategy: `browser-viewport-override`
   sensitive_exclusion: `N/A`
   submission_gate: `pending-owner-approval`
-  story_id_or_title: `public-publicreleasepage--small-range-highlight`
-  state: `small-range-highlight-mobile`
-  evidence_note: 验证 390px 移动端连续范围的多条 Release 保持倒序排列并持续高亮，页面级 lane 切换器与卡片内容共存且没有横向溢出。
+  story_id_or_title: `public-release-highlight-range`
+  state: `long-range-highlight-mobile`
+  evidence_note: 验证 18 条连续范围以显式 active 为中心定位，右下导航显示 `9 / 18`；动态高度卡片在 390px 移动视口持续虚拟化渲染，active 焦点环、润色回退原文与原生滚动条共存且无横向溢出。
   image:
-  ![公开 Release 连续范围移动状态](./assets/public-release-highlight-small-range-mobile.png)
+  ![公开 Release 长范围移动状态](./assets/public-release-highlight-range-mobile.png)
 
 - source_type: `storybook_canvas`
   target_program: `mock-only`

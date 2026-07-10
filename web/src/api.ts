@@ -1395,16 +1395,35 @@ export type PublicReleaseListItem = {
 	is_prerelease: number;
 	is_draft: number;
 	is_highlighted?: boolean;
+	is_active_highlight?: boolean;
 	translated: ReleaseDetailTranslated | null;
 	smart: ReleaseDetailSmart | null;
 };
+export type PublicReleaseHighlightTarget = {
+	selector: string;
+	release_id: string;
+	tag_name: string;
+	ordinal: number;
+};
 export type PublicReleaseHighlight = {
-	mode: "ids" | "range";
-	requested_ids: string[];
-	resolved_ids: string[];
-	unresolved_ids: string[];
-	start_id?: string;
-	end_id?: string;
+	mode: "discrete" | "range" | "invalid";
+	status: "complete" | "partial" | "invalid";
+	requested: string[];
+	resolved: PublicReleaseHighlightTarget[];
+	unresolved: string[];
+	total: number;
+	active_release_id: string | null;
+	active_index: number | null;
+	message?: string | null;
+};
+export type PublicReleaseSegment = {
+	first_release_id: string;
+	last_release_id: string;
+};
+export type PublicReleaseGap = {
+	newer_cursor: string;
+	older_cursor: string;
+	remaining_count: number;
 };
 export type PublicReleaseListResponse = {
 	status: "ready";
@@ -1412,6 +1431,8 @@ export type PublicReleaseListResponse = {
 	next_cursor: string | null;
 	previous_cursor?: string | null;
 	highlight?: PublicReleaseHighlight;
+	segments?: PublicReleaseSegment[];
+	gaps?: PublicReleaseGap[];
 	items: PublicReleaseListItem[];
 };
 export type PublicReleasePendingResponse = {
@@ -1431,11 +1452,14 @@ export async function apiGetPublicRepoReleases(input: {
 	source?: "page";
 	limit?: number;
 	cursor?: string | null;
-	highlight_ids?: string[] | string;
+	until_cursor?: string | null;
+	highlight?: string[];
 	highlight_start?: string;
 	highlight_end?: string;
+	highlight_active?: string;
 	direction?: "older" | "newer";
 	content?: "original" | "translated" | "polished" | "all";
+	include_original?: boolean;
 }): Promise<PublicReleaseResponse> {
 	const params = new URLSearchParams();
 	params.set("content", input.content ?? "all");
@@ -1443,13 +1467,9 @@ export async function apiGetPublicRepoReleases(input: {
 	if (input.source) params.set("source", input.source);
 	if (input.limit) params.set("limit", String(input.limit));
 	if (input.cursor) params.set("cursor", input.cursor);
-	if (input.highlight_ids) {
-		params.set(
-			"highlight_ids",
-			Array.isArray(input.highlight_ids)
-				? input.highlight_ids.join(",")
-				: input.highlight_ids,
-		);
+	if (input.until_cursor) params.set("until_cursor", input.until_cursor);
+	for (const selector of input.highlight ?? []) {
+		params.append("highlight", selector);
 	}
 	if (input.highlight_start !== undefined) {
 		params.set("highlight_start", input.highlight_start);
@@ -1457,7 +1477,11 @@ export async function apiGetPublicRepoReleases(input: {
 	if (input.highlight_end !== undefined) {
 		params.set("highlight_end", input.highlight_end);
 	}
+	if (input.highlight_active !== undefined) {
+		params.set("highlight_active", input.highlight_active);
+	}
 	if (input.direction) params.set("direction", input.direction);
+	if (input.include_original) params.set("include_original", "true");
 	const path = `/api/public/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases?${params.toString()}`;
 	const res = await fetch(resolveApiRequestPath(path), {
 		credentials: "include",
@@ -1473,11 +1497,13 @@ export async function apiGetPublicRepoReleaseDetail(input: {
 	tag: string;
 	source?: "page";
 	content?: "original" | "translated" | "polished" | "all";
+	include_original?: boolean;
 }): Promise<ReleaseDetailResponse | PublicReleasePendingResponse> {
 	const params = new URLSearchParams();
 	params.set("content", input.content ?? "all");
 	params.set("lang", "zh-CN");
 	if (input.source) params.set("source", input.source);
+	if (input.include_original) params.set("include_original", "true");
 	const path = `/api/public/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases/tag/${encodeURIComponent(input.tag)}?${params.toString()}`;
 	const res = await fetch(resolveApiRequestPath(path), {
 		credentials: "include",
@@ -1486,6 +1512,24 @@ export async function apiGetPublicRepoReleaseDetail(input: {
 	if (res.status === 202) return body as PublicReleasePendingResponse;
 	if (!res.ok) throw toApiError(res, body);
 	return body as ReleaseDetailResponse;
+}
+
+export async function apiGetPublicRepoReleaseContent(input: {
+	owner: string;
+	repo: string;
+	release_ids: string[];
+	content: "translated" | "polished";
+}): Promise<{
+	items: Array<
+		Pick<PublicReleaseListItem, "release_id" | "translated" | "smart">
+	>;
+}> {
+	const params = new URLSearchParams();
+	params.set("release_ids", input.release_ids.join(","));
+	params.set("content", input.content);
+	params.set("lang", "zh-CN");
+	const path = `/api/public/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases/content?${params.toString()}`;
+	return apiGet(path);
 }
 export type TranslationSourceBlock = {
 	slot: "title" | "excerpt" | "body_markdown" | "metadata";

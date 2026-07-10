@@ -18,6 +18,7 @@ import type {
 	PasskeyAuthenticateVerifyResponse,
 	PasskeyRequestOptionsJSON,
 	PasskeyRegisterVerifyResponse,
+	PublicReleaseListItem,
 	ReactionTokenCheckResponse,
 	ReactionTokenStatusResponse,
 } from "@/api";
@@ -262,6 +263,235 @@ function buildTaskAcceptedResponse(taskId: string, taskType: string) {
 		task_id: taskId,
 		task_type: taskType,
 		status: "accepted",
+	};
+}
+
+function demoPublicReleaseCursor(item: PublicReleaseListItem) {
+	return `${item.published_at ?? ""}|${item.release_id}`;
+}
+
+function findDemoPublicRelease(
+	items: PublicReleaseListItem[],
+	selector: string | null,
+) {
+	if (!selector) return undefined;
+	if (selector.startsWith("id:")) {
+		return items.find((item) => item.release_id === selector.slice(3));
+	}
+	if (selector.startsWith("tag:")) {
+		return items.find((item) => item.tag_name === selector.slice(4));
+	}
+	return undefined;
+}
+
+function buildDemoPublicReleaseList(request: Request) {
+	const url = new URL(request.url);
+	const sourceItems = currentModel().publicReleaseList.items;
+	const selectors = url.searchParams.getAll("highlight");
+	const startSelector = url.searchParams.get("highlight_start");
+	const endSelector = url.searchParams.get("highlight_end");
+	const activeSelector = url.searchParams.get("highlight_active");
+	const cursor = url.searchParams.get("cursor");
+	const untilCursor = url.searchParams.get("until_cursor");
+	const direction = url.searchParams.get("direction") ?? "older";
+	const limit = Math.min(
+		30,
+		Math.max(1, Number(url.searchParams.get("limit") ?? 6)),
+	);
+	const cursorIndex = cursor
+		? sourceItems.findIndex((item) => demoPublicReleaseCursor(item) === cursor)
+		: -1;
+	const untilIndex = untilCursor
+		? sourceItems.findIndex(
+				(item) => demoPublicReleaseCursor(item) === untilCursor,
+			)
+		: -1;
+
+	if (selectors.length > 0) {
+		const seen = new Set<string>();
+		const resolved = selectors.flatMap((selector) => {
+			const item = findDemoPublicRelease(sourceItems, selector);
+			if (!item || seen.has(item.release_id)) return [];
+			seen.add(item.release_id);
+			return [
+				{
+					selector,
+					release_id: item.release_id,
+					tag_name: item.tag_name,
+					ordinal: sourceItems.indexOf(item) + 1,
+				},
+			];
+		});
+		resolved.sort((left, right) => left.ordinal - right.ordinal);
+		const active =
+			resolved.find((target) => target.selector === activeSelector) ??
+			resolved[0];
+		let pageItems = resolved.flatMap((target) => {
+			const item = sourceItems.find(
+				(candidate) => candidate.release_id === target.release_id,
+			);
+			return item ? [item] : [];
+		});
+		if (cursorIndex >= 0) {
+			const end = untilIndex >= 0 ? untilIndex + 1 : cursorIndex + 1 + limit;
+			pageItems = sourceItems.slice(cursorIndex + 1, end);
+		}
+		const highlightedIds = new Set(resolved.map((target) => target.release_id));
+		const items = pageItems.map((item) => ({
+			...item,
+			is_highlighted: highlightedIds.has(item.release_id),
+			is_active_highlight: item.release_id === active?.release_id,
+		}));
+		const gaps = cursor
+			? []
+			: items.slice(0, -1).flatMap((item, index) => {
+					const next = items[index + 1];
+					const currentIndex = sourceItems.indexOf(item);
+					const nextIndex = sourceItems.indexOf(next);
+					return nextIndex - currentIndex > 1
+						? [
+								{
+									newer_cursor: demoPublicReleaseCursor(item),
+									older_cursor: demoPublicReleaseCursor(next),
+									remaining_count: nextIndex - currentIndex - 1,
+								},
+							]
+						: [];
+				});
+		return {
+			status: "ready" as const,
+			repo_full_name: currentModel().publicReleaseList.repo_full_name,
+			next_cursor: null,
+			previous_cursor: null,
+			items,
+			highlight: {
+				mode: "discrete" as const,
+				status:
+					resolved.length === selectors.length
+						? ("complete" as const)
+						: ("partial" as const),
+				requested: selectors,
+				resolved,
+				unresolved: selectors.filter(
+					(selector) => !findDemoPublicRelease(sourceItems, selector),
+				),
+				total: resolved.length,
+				active_release_id: active?.release_id ?? null,
+				active_index: active ? resolved.indexOf(active) + 1 : null,
+			},
+			segments: items.map((item) => ({
+				first_release_id: item.release_id,
+				last_release_id: item.release_id,
+			})),
+			gaps,
+		};
+	}
+
+	if (startSelector || endSelector) {
+		const startItem = findDemoPublicRelease(sourceItems, startSelector);
+		const endItem = findDemoPublicRelease(sourceItems, endSelector);
+		if (!startItem || !endItem) {
+			return {
+				...currentModel().publicReleaseList,
+				items: sourceItems.slice(0, limit),
+				highlight: {
+					mode: "range" as const,
+					status: "partial" as const,
+					requested: [startSelector, endSelector].filter(
+						(value): value is string => Boolean(value),
+					),
+					resolved: [],
+					unresolved: [startSelector, endSelector].filter(
+						(value): value is string =>
+							Boolean(value) && !findDemoPublicRelease(sourceItems, value),
+					),
+					total: 0,
+					active_release_id: null,
+					active_index: null,
+					message: "连续范围的端点未全部命中，已显示普通最新列表",
+				},
+			};
+		}
+		const rangeStart = Math.min(
+			sourceItems.indexOf(startItem),
+			sourceItems.indexOf(endItem),
+		);
+		const rangeEnd = Math.max(
+			sourceItems.indexOf(startItem),
+			sourceItems.indexOf(endItem),
+		);
+		const activeItem =
+			findDemoPublicRelease(sourceItems, activeSelector) ??
+			sourceItems[rangeStart];
+		const activeIndex = Math.min(
+			rangeEnd,
+			Math.max(rangeStart, sourceItems.indexOf(activeItem)),
+		);
+		let pageStart = rangeStart;
+		let pageEnd = Math.min(rangeEnd + 1, pageStart + limit);
+		if (cursorIndex >= 0) {
+			if (direction === "newer") {
+				pageEnd = cursorIndex;
+				pageStart = Math.max(rangeStart, pageEnd - limit);
+			} else {
+				pageStart = cursorIndex + 1;
+				pageEnd = Math.min(rangeEnd + 1, pageStart + limit);
+			}
+		} else if (activeSelector) {
+			pageStart = Math.max(
+				rangeStart,
+				activeIndex - Math.floor((limit - 1) / 2),
+			);
+			pageEnd = Math.min(rangeEnd + 1, pageStart + limit);
+		}
+		const items = sourceItems.slice(pageStart, pageEnd).map((item) => ({
+			...item,
+			is_highlighted: true,
+			is_active_highlight: item.release_id === activeItem.release_id,
+		}));
+		return {
+			status: "ready" as const,
+			repo_full_name: currentModel().publicReleaseList.repo_full_name,
+			previous_cursor:
+				pageStart > rangeStart ? demoPublicReleaseCursor(items[0]) : null,
+			next_cursor:
+				pageEnd <= rangeEnd ? demoPublicReleaseCursor(items.at(-1)!) : null,
+			items,
+			highlight: {
+				mode: "range" as const,
+				status: "complete" as const,
+				requested: [startSelector!, endSelector!],
+				resolved: [
+					{
+						selector: startSelector!,
+						release_id: startItem.release_id,
+						tag_name: startItem.tag_name,
+						ordinal: sourceItems.indexOf(startItem) + 1,
+					},
+					{
+						selector: endSelector!,
+						release_id: endItem.release_id,
+						tag_name: endItem.tag_name,
+						ordinal: sourceItems.indexOf(endItem) + 1,
+					},
+				],
+				unresolved: [],
+				total: rangeEnd - rangeStart + 1,
+				active_release_id: activeItem.release_id,
+				active_index: activeIndex - rangeStart + 1,
+			},
+		};
+	}
+
+	const start = cursorIndex >= 0 ? cursorIndex + 1 : 0;
+	const items = sourceItems.slice(start, start + limit);
+	return {
+		...currentModel().publicReleaseList,
+		items,
+		next_cursor:
+			start + items.length < sourceItems.length
+				? demoPublicReleaseCursor(items.at(-1)!)
+				: null,
 	};
 }
 
@@ -969,6 +1199,33 @@ export const demoHandlers = [
 			"Queued a simulated inbox refresh task.",
 		);
 		return json(buildTaskAcceptedResponse(taskId, "sync.notifications"));
+	}),
+	http.get(
+		"/api/public/repos/:owner/:repo/releases/content",
+		async ({ request }) => {
+			const network = await applyNetworkProfile(request);
+			if (network) return network;
+			const url = new URL(request.url);
+			const releaseIds = new Set(
+				(url.searchParams.get("release_ids") ?? "").split(","),
+			);
+			return json({
+				items: currentModel()
+					.publicReleaseList.items.filter((item) =>
+						releaseIds.has(item.release_id),
+					)
+					.map((item) => ({
+						release_id: item.release_id,
+						translated: item.translated,
+						smart: item.smart,
+					})),
+			});
+		},
+	),
+	http.get("/api/public/repos/:owner/:repo/releases", async ({ request }) => {
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		return json(buildDemoPublicReleaseList(request));
 	}),
 	http.get(
 		"/api/public/repos/:owner/:repo/releases/tag/:tag",

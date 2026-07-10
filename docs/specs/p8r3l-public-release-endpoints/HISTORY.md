@@ -9,3 +9,4 @@
 - 2026-07-07: 公开 Release 模型扩展为 `github_public` / `private_owner_published` 双 access kind；GitHub public repo 默认公开，viewer-owned private repo 需拥有者显式发布，并补齐 `/public/:owner/:repo/releases` 到 canonical `/:owner/:repo/releases` 的 replace 跳转。
 - 2026-07-09: 匿名 public proof 从“只认 recent public starred metadata”扩到“信任 fresh 的 `starred_repos ∪ owned_repo_star_baselines` privacy metadata”；public owned repo 若已有共享 `repo_releases` 缓存，首访可直接 `ready`，但 stale / unknown / fresh private metadata 仍保持 `metadata_pending`。
 - 2026-07-10: 公开 Release 列表新增 `release_id` 高亮深链。后端直接解析离散 ID 或倒序闭区间，复用唯一 Release 查询与排序索引返回最多 12 条聚焦窗口、双向 opaque cursor、解析/未解析元数据和项目高亮标记；前端新增自动视口定位、older 追加、newer 前置与滚动锚点补偿，旧 `/public/.../releases` 跳转保留 query。
+- 2026-07-10: 高亮深链合同扩展为 typed tag/ID selector、20 个离散目标、30 条分段推荐窗口、内部 gap 自动填充、`highlight_active` 导航与动态高度虚拟列表；公开列表和详情默认切换到润色并携带原文回退。
