@@ -37,7 +37,7 @@ function releaseItem(index: number, overrides: Record<string, unknown> = {}) {
 				return `- Public release regression row ${index + 1}.${line + 1}`;
 			}).join("\n"),
 		html_url: `https://github.com/octo-rill/example/releases/tag/${tag}`,
-		published_at: "2026-05-04T08:00:00Z",
+		published_at: `2026-05-${String(20 - index).padStart(2, "0")}T08:00:00Z`,
 		is_prerelease: 0,
 		is_draft: 0,
 		translated: {
@@ -172,9 +172,15 @@ test("public release pending page hides backend retry details", async ({
 
 	await page.goto("/octo-rill/example/releases");
 
-	await expect(page.getByText("Release 数据同步中")).toBeVisible();
-	await expect(page.getByText("同步中", { exact: true })).toBeVisible();
-	await expect(page.getByText("约 60s 后重试")).toBeVisible();
+	await expect(page.getByText("Release 数据同步中")).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect(page.getByText("同步中", { exact: true })).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect(page.getByText("约 60s 后重试")).toBeVisible({
+		timeout: 15_000,
+	});
 	await expect(
 		page.getByText("Release data is being prepared"),
 	).not.toBeVisible();
@@ -192,9 +198,9 @@ test("public release loading page uses a skeleton instead of loading copy", asyn
 
 	await page.goto("/octo-rill/example/releases");
 
-	await expect(
-		page.getByTestId("public-release-loading-skeleton"),
-	).toBeVisible();
+	await expect(page.getByTestId("public-release-loading-skeleton")).toBeVisible(
+		{ timeout: 15_000 },
+	);
 	await expect(
 		page.getByTestId("public-release-skeleton-block").first(),
 	).toBeVisible();
@@ -245,12 +251,23 @@ test("public release list requests six cached releases before loading more", asy
 	await expect(
 		page.getByRole("heading", { name: "octo-rill/example" }),
 	).toBeVisible();
+	await expect(page.locator("[data-release-id]").first()).toHaveAttribute(
+		"data-highlighted",
+		"false",
+	);
 	expect(new URLSearchParams(seenQueries[0]).get("limit")).toBe("6");
 	await expect(
 		page.getByRole("button", { name: "原文" }).first(),
 	).toBeVisible();
-	await expect(page.getByText("v2.7.0 public release endpoints")).toBeVisible();
-	await expect(page.getByText("v2.0.0 public release endpoints")).toBeVisible();
+	await expect(page.getByText("公开更新记录入口").first()).toBeVisible();
+	await page.getByRole("button", { name: "原文" }).first().click();
+	await expect(
+		page
+			.getByRole("heading", {
+				name: /v2\.\d+\.0 public release endpoints/,
+			})
+			.first(),
+	).toBeVisible();
 	expect(seenQueries.some((query) => query.includes("cursor=next%7C6"))).toBe(
 		true,
 	);
@@ -285,17 +302,414 @@ test("public owned cached repo shows ready list instead of pending sync", async 
 		page.getByRole("heading", { name: "IvanLi-CN/tuckmark" }),
 	).toBeVisible();
 	await expect(
-		page.getByRole("link", { name: "v0.2.0-preview.11" }),
-	).toBeVisible();
+		page.getByRole("link", { name: "公开更新记录入口" }),
+	).toHaveAttribute(
+		"href",
+		"/public/IvanLi-CN/tuckmark/releases/tag/v0.2.0-preview.11",
+	);
 	await expect(page.getByText("Release 数据同步中")).not.toBeVisible();
 	await expectPublicChrome(page, "IvanLi-CN", "tuckmark");
+});
+
+test("public release typed discrete highlight keeps partial targets and replaces active URL", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1280, height: 720 });
+	const seenQueries: URL[] = [];
+	const items = Array.from({ length: 8 }, (_, index) => releaseItem(index));
+	await installBaseApiMocks(page, (route, url) => {
+		if (url.pathname.endsWith("/releases/content")) {
+			const requestedIds = (url.searchParams.get("release_ids") ?? "").split(
+				",",
+			);
+			return json(route, {
+				items: items
+					.filter((item) => requestedIds.includes(item.release_id))
+					.map((item) => ({
+						...item,
+						body: null,
+						smart: null,
+						is_highlighted: false,
+						is_active_highlight: false,
+					})),
+			});
+		}
+		seenQueries.push(url);
+		const selectors = url.searchParams.getAll("highlight");
+		const resolved = [
+			{
+				selector: "tag:v2.2.0",
+				release_id: "public-release-5",
+				tag_name: "v2.2.0",
+				ordinal: 6,
+			},
+			{
+				selector: "id:public-release-1",
+				release_id: "public-release-1",
+				tag_name: "v2.6.0",
+				ordinal: 2,
+			},
+		].sort((left, right) => left.ordinal - right.ordinal);
+		const resolvedIds = resolved.map((target) => target.release_id);
+		const active = resolved[0];
+		return json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items: items
+				.filter((item) => resolvedIds.includes(item.release_id))
+				.map((item) => ({
+					...item,
+					is_highlighted: true,
+					is_active_highlight: item.release_id === active.release_id,
+				})),
+			highlight: {
+				mode: "discrete",
+				status: "partial",
+				requested: selectors,
+				resolved,
+				unresolved: ["tag:missing-release"],
+				total: 2,
+				active_release_id: active.release_id,
+				active_index: 1,
+			},
+			segments: resolved.map((target) => ({
+				first_release_id: target.release_id,
+				last_release_id: target.release_id,
+			})),
+			gaps: [],
+		});
+	});
+
+	await page.goto(
+		"/public/octo-rill/example/releases?highlight=tag%3Av2.2.0&highlight=id%3Apublic-release-1&highlight=tag%3Amissing-release",
+	);
+
+	await expect(
+		page.getByTestId("public-release-item-public-release-5"),
+	).toHaveAttribute("data-highlighted", "true");
+	await expect(
+		page.getByTestId("public-release-item-public-release-1"),
+	).toHaveAttribute("data-highlighted", "true");
+	await expect(
+		page.getByTestId("public-release-highlight-unresolved"),
+	).toBeVisible();
+	expect(seenQueries[0].searchParams.getAll("highlight")).toEqual([
+		"tag:v2.2.0",
+		"id:public-release-1",
+		"tag:missing-release",
+	]);
+	expect(seenQueries[0].searchParams.get("cursor")).toBeNull();
+	await expect(
+		page.getByTestId("public-release-highlight-navigation"),
+	).toContainText("1 / 2");
+	await page.getByTitle("下一条高亮记录").click();
+	await expect(page).toHaveURL(/highlight_active=tag%3Av2.2.0/);
+	await page.getByRole("tab", { name: "翻译" }).first().click();
+	await expect(
+		page.getByTestId("public-release-item-public-release-5"),
+	).toHaveAttribute("data-highlighted", "true");
+	await page.getByRole("tab", { name: "润色" }).first().click();
+	await expect(
+		page.getByText("公开页面复用 Release 卡片并保留内容切换。").first(),
+	).toBeVisible();
+	await expectNoHorizontalOverflow(page);
+});
+
+test("public release pagination preserves the user-selected active highlight", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1280, height: 720 });
+	await page.addInitScript(() => {
+		class InertIntersectionObserver {
+			observe() {}
+			disconnect() {}
+		}
+		window.IntersectionObserver =
+			InertIntersectionObserver as unknown as typeof IntersectionObserver;
+	});
+	const seenQueries: URL[] = [];
+	const items = Array.from({ length: 8 }, (_, index) => releaseItem(index));
+	const resolved = [
+		{
+			selector: "id:public-release-1",
+			release_id: "public-release-1",
+			tag_name: items[1].tag_name,
+			ordinal: 2,
+		},
+		{
+			selector: "tag:v2.2.0",
+			release_id: "public-release-5",
+			tag_name: items[5].tag_name,
+			ordinal: 6,
+		},
+	];
+	await installBaseApiMocks(page, (route, url) => {
+		seenQueries.push(url);
+		const active =
+			resolved.find(
+				(target) =>
+					target.selector === url.searchParams.get("highlight_active"),
+			) ?? resolved[0];
+		const isPagination = url.searchParams.has("cursor");
+		const responseItems = isPagination
+			? [items[6]]
+			: resolved
+					.map((target) =>
+						items.find((item) => item.release_id === target.release_id),
+					)
+					.filter((item): item is (typeof items)[number] => item !== undefined);
+		return json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: isPagination ? null : "older|2",
+			items: responseItems.map((item) => ({
+				...item,
+				is_highlighted: resolved.some(
+					(target) => target.release_id === item.release_id,
+				),
+				is_active_highlight: item.release_id === active.release_id,
+			})),
+			highlight: {
+				mode: "discrete",
+				status: "complete",
+				requested: resolved.map((target) => target.selector),
+				resolved,
+				unresolved: [],
+				total: 2,
+				active_release_id: active.release_id,
+				active_index: resolved.indexOf(active) + 1,
+			},
+			segments: [
+				{
+					first_release_id: responseItems[0]?.release_id,
+					last_release_id: responseItems.at(-1)?.release_id,
+				},
+			],
+			gaps: [],
+		});
+	});
+
+	await page.goto(
+		"/octo-rill/example/releases?highlight=id%3Apublic-release-1&highlight=tag%3Av2.2.0",
+	);
+	await expect(
+		page.getByTestId("public-release-highlight-navigation"),
+	).toContainText("1 / 2");
+
+	await page.getByTitle("下一条高亮记录").click();
+	await expect(page).toHaveURL(/highlight_active=tag%3Av2.2.0/);
+	await expect(
+		page.getByTestId("public-release-item-public-release-5"),
+	).toHaveAttribute("data-active-highlight", "true");
+
+	await page.getByRole("button", { name: "更多" }).click();
+	await expect
+		.poll(() =>
+			seenQueries.find((url) => url.searchParams.get("cursor") === "older|2"),
+		)
+		.not.toBeUndefined();
+	const paginationQuery = seenQueries.find(
+		(url) => url.searchParams.get("cursor") === "older|2",
+	);
+	expect(paginationQuery?.searchParams.get("highlight_active")).toBe(
+		"tag:v2.2.0",
+	);
+	await expect(
+		page.getByTestId("public-release-highlight-navigation"),
+	).toContainText("2 / 2");
+	await expect(
+		page.getByTestId("public-release-item-public-release-5"),
+	).toHaveAttribute("data-active-highlight", "true");
+});
+
+test("public release typed range uses virtual rows and loads both directions", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1280, height: 720 });
+	const seenQueries: URL[] = [];
+	const items = Array.from({ length: 20 }, (_, index) => releaseItem(index));
+	await installBaseApiMocks(page, (route, url) => {
+		seenQueries.push(url);
+		const start = 0;
+		const end = 19;
+		const cursor = url.searchParams.get("cursor");
+		const direction = url.searchParams.get("direction") ?? "older";
+		const offset = cursor ? Number(cursor.split("|").at(-1)) : 4;
+		const limit = Math.min(Number(url.searchParams.get("limit") ?? "12"), 12);
+		const pageItems =
+			direction === "newer"
+				? items.slice(Math.max(start, offset - limit), offset)
+				: items.slice(offset, Math.min(end + 1, offset + limit));
+		const nextOffset = offset + pageItems.length;
+		return json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor:
+				direction === "older" && nextOffset <= end
+					? `range|${nextOffset}`
+					: null,
+			previous_cursor:
+				direction === "newer"
+					? Math.max(start, offset - pageItems.length) > start
+						? `range|${Math.max(start, offset - pageItems.length)}`
+						: null
+					: `range|${offset}`,
+			items: pageItems.map((item) => ({
+				...item,
+				is_highlighted: true,
+				is_active_highlight: item.release_id === "public-release-4",
+			})),
+			highlight: {
+				mode: "range",
+				status: "complete",
+				requested: ["tag:v2.7.0", "id:public-release-19"],
+				resolved: [
+					{
+						selector: "tag:v2.7.0",
+						release_id: "public-release-0",
+						tag_name: "v2.7.0",
+						ordinal: 1,
+					},
+					{
+						selector: "id:public-release-19",
+						release_id: "public-release-19",
+						tag_name: items[19].tag_name,
+						ordinal: 20,
+					},
+				],
+				unresolved: [],
+				total: 20,
+				active_release_id: "public-release-4",
+				active_index: 5,
+			},
+			segments: [
+				{
+					first_release_id: pageItems[0]?.release_id,
+					last_release_id: pageItems.at(-1)?.release_id,
+				},
+			],
+			gaps: [],
+		});
+	});
+
+	await page.goto(
+		"/octo-rill/example/releases?highlight_start=tag%3Av2.7.0&highlight_end=id%3Apublic-release-19&highlight_active=id%3Apublic-release-4",
+	);
+	await expect(
+		page.getByTestId("public-release-item-public-release-4"),
+	).toHaveAttribute("data-highlighted", "true");
+	await expect(page.getByTestId("public-release-virtual-list")).toBeVisible();
+	expect(await page.locator("[data-release-id]").count()).toBeLessThan(
+		items.length,
+	);
+
+	await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+	await expect.poll(() => seenQueries.length).toBeGreaterThan(1);
+	await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+	await expect(
+		page.getByTestId("public-release-item-public-release-19"),
+	).toHaveAttribute("data-highlighted", "true");
+	expect(
+		seenQueries.slice(1).every((url) => {
+			return (
+				url.searchParams.get("highlight_start") === "tag:v2.7.0" &&
+				url.searchParams.get("highlight_end") === "id:public-release-19"
+			);
+		}),
+	).toBe(true);
+
+	await page.evaluate(() => window.scrollTo(0, 0));
+	await expect
+		.poll(() =>
+			seenQueries.some((url) => url.searchParams.get("direction") === "newer"),
+		)
+		.toBe(true);
+	const newerQuery = seenQueries.find(
+		(url) => url.searchParams.get("direction") === "newer",
+	);
+	expect(newerQuery?.searchParams.get("cursor")).toBe("range|4");
+	expect(newerQuery?.searchParams.get("highlight_start")).toBe("tag:v2.7.0");
+	expect(newerQuery?.searchParams.get("highlight_end")).toBe(
+		"id:public-release-19",
+	);
+	await expectNoHorizontalOverflow(page);
+});
+
+test("centered range navigation preserves the absolute highlight index", async ({
+	page,
+}) => {
+	const items = Array.from({ length: 40 }, (_, index) => releaseItem(index));
+	await installBaseApiMocks(page, (route, url) => {
+		const pageItems = items.slice(5, 35);
+		const activeReleaseId =
+			url.searchParams.get("highlight_active")?.replace(/^id:/, "") ??
+			"public-release-19";
+		const activeIndex =
+			items.findIndex((item) => item.release_id === activeReleaseId) + 1;
+		return json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			previous_cursor: null,
+			items: pageItems.map((item) => ({
+				...item,
+				is_highlighted: true,
+				is_active_highlight: item.release_id === activeReleaseId,
+			})),
+			highlight: {
+				mode: "range",
+				status: "complete",
+				requested: ["id:public-release-0", "id:public-release-39"],
+				resolved: [
+					{
+						selector: "id:public-release-0",
+						release_id: "public-release-0",
+						tag_name: items[0].tag_name,
+						ordinal: 1,
+					},
+					{
+						selector: "id:public-release-39",
+						release_id: "public-release-39",
+						tag_name: items[39].tag_name,
+						ordinal: 40,
+					},
+				],
+				unresolved: [],
+				total: 40,
+				active_release_id: activeReleaseId,
+				active_index: activeIndex,
+			},
+			segments: [
+				{
+					first_release_id: pageItems[0].release_id,
+					last_release_id: pageItems.at(-1)?.release_id,
+				},
+			],
+			gaps: [],
+		});
+	});
+
+	await page.goto(
+		"/octo-rill/example/releases?highlight_start=id%3Apublic-release-0&highlight_end=id%3Apublic-release-39&highlight_active=id%3Apublic-release-19",
+	);
+	await expect(
+		page.getByTestId("public-release-highlight-navigation"),
+	).toContainText("20 / 40");
+	await page.getByTitle("下一条高亮记录").click();
+	await expect(
+		page.getByTestId("public-release-highlight-navigation"),
+	).toContainText("21 / 40");
+	await expect(page).toHaveURL(/highlight_active=id%3Apublic-release-20/);
 });
 
 test("public release detail keeps the shared chrome stable", async ({
 	page,
 }) => {
+	const detailRequests: URL[] = [];
 	await page.setViewportSize({ width: 390, height: 844 });
-	await installBaseApiMocks(page, (route) => {
+	await installBaseApiMocks(page, (route, url) => {
+		detailRequests.push(url);
 		return json(route, {
 			...releaseItem(0, {
 				name: "公开更新记录入口",
@@ -324,6 +738,13 @@ test("public release detail keeps the shared chrome stable", async ({
 		page.getByRole("heading", { name: "公开更新记录入口" }),
 	).toBeVisible();
 	await expect(page.getByRole("tab", { name: "润色" })).toBeVisible();
+	expect(detailRequests).toHaveLength(1);
+	expect(detailRequests[0]?.searchParams.get("content")).toBe("all");
+	await page.getByRole("tab", { name: "翻译" }).click();
+	await expect(page.getByRole("tab", { name: "翻译" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
 	await expectPublicChrome(page, "octo-rill", "example");
 	await expectNoHorizontalOverflow(page);
 });

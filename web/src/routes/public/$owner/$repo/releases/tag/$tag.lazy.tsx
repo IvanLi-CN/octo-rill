@@ -1,6 +1,7 @@
 import { createLazyFileRoute, getRouteApi } from "@tanstack/react-router";
 
 import { PublicReleasePage } from "@/pages/PublicReleasePage";
+import { parsePublicReleaseHighlight } from "@/publicRelease/routeState";
 
 const routeApi = getRouteApi("/public/$owner/$repo/releases/tag/$tag");
 
@@ -12,11 +13,13 @@ export const Route = createLazyFileRoute(
 
 function PublicReleaseDetailRouteComponent() {
 	const params = routeApi.useParams();
+	const search = routeApi.useSearch();
 	return (
 		<PublicReleasePage
 			owner={params.owner}
 			repo={params.repo}
 			tag={params.tag}
+			highlight={parsePublicReleaseHighlight(search)}
 		/>
 	);
 }

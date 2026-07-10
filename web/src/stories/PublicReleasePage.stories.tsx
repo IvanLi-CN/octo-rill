@@ -1,7 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
-import { expect, within } from "storybook/test";
+import { expect, userEvent, within } from "storybook/test";
 
 import { PublicReleasePage } from "@/pages/PublicReleasePage";
 import {
@@ -179,18 +179,23 @@ const releaseItems = [
 
 const publicReleaseItems = [
 	...releaseItems,
-	...Array.from({ length: 4 }, (_, index) => {
-		const minor = 3 - index;
-		const previousTag = minor > 0 ? `v2.${minor - 1}.0` : "v1.9.0";
+	...Array.from({ length: 8 }, (_, index) => {
+		const tag = index < 4 ? `v2.${3 - index}.0` : `v1.${9 - (index - 4)}.0`;
+		const previousTag =
+			index < 3
+				? `v2.${2 - index}.0`
+				: index === 3
+					? "v1.9.0"
+					: `v1.${8 - (index - 4)}.0`;
 		return {
 			release_id: String(291058023 - index),
 			repo_full_name: "octo-rill/example",
-			tag_name: `v2.${minor}.0`,
+			tag_name: tag,
 			previous_tag_name: previousTag,
-			name: `v2.${minor}.0 cached release page`,
+			name: `${tag} cached release page`,
 			body: "## Maintenance\n\n- Cached public release entry for pagination verification.\n",
-			html_url: `https://github.com/octo-rill/example/releases/tag/v2.${minor}.0`,
-			published_at: `2026-03-${String(24 - index * 7).padStart(2, "0")}T08:00:00Z`,
+			html_url: `https://github.com/octo-rill/example/releases/tag/${tag}`,
+			published_at: `2026-03-${String(24 - index).padStart(2, "0")}T08:00:00Z`,
 			is_prerelease: 0,
 			is_draft: 0,
 			translated: {
@@ -214,6 +219,11 @@ type PublicReleaseStoryMode =
 	| "pending"
 	| "list"
 	| "owned-public-ready"
+	| "highlight-ids"
+	| "highlight-small-range"
+	| "highlight-large-range"
+	| "highlight-partial"
+	| "polished-fallback"
 	| "detail"
 	| "detail-long"
 	| "error";
@@ -253,6 +263,26 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 				: input;
 		const url = new URL(req.url, window.location.origin);
 		if (url.pathname.startsWith("/api/public/repos/")) {
+			if (url.pathname.endsWith("/releases/content")) {
+				const releaseIds = new Set(
+					(url.searchParams.get("release_ids") ?? "").split(","),
+				);
+				return new Response(
+					JSON.stringify({
+						items: publicReleaseItems
+							.filter((item) => releaseIds.has(item.release_id))
+							.map((item) => ({
+								release_id: item.release_id,
+								translated: item.translated,
+								smart: item.smart,
+							})),
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "application/json" },
+					},
+				);
+			}
 			if (mode === "loading") {
 				return new Promise<Response>(() => {});
 			}
@@ -303,8 +333,203 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 					},
 				);
 			}
+			if (mode === "polished-fallback") {
+				return new Response(
+					JSON.stringify({
+						status: "ready",
+						repo_full_name: "octo-rill/example",
+						next_cursor: null,
+						items: [{ ...releaseItems[1], is_highlighted: false }],
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "application/json" },
+					},
+				);
+			}
 			const limit = Number(url.searchParams.get("limit") ?? "6");
 			const cursor = url.searchParams.get("cursor");
+			const direction = url.searchParams.get("direction") ?? "older";
+			const selectors = url.searchParams.getAll("highlight");
+			const startSelector = url.searchParams.get("highlight_start");
+			const endSelector = url.searchParams.get("highlight_end");
+			const activeSelector = url.searchParams.get("highlight_active");
+			const resolveSelector = (selector: string | null) => {
+				if (!selector) return undefined;
+				if (selector.startsWith("id:")) {
+					return publicReleaseItems.find(
+						(item) => item.release_id === selector.slice(3),
+					);
+				}
+				if (selector.startsWith("tag:")) {
+					return publicReleaseItems.find(
+						(item) => item.tag_name === selector.slice(4),
+					);
+				}
+				return undefined;
+			};
+			const target = (
+				selector: string,
+				item: (typeof publicReleaseItems)[number],
+			) => ({
+				selector,
+				release_id: item.release_id,
+				tag_name: item.tag_name,
+				ordinal: publicReleaseItems.indexOf(item) + 1,
+			});
+			if (selectors.length > 0) {
+				const resolved = selectors.flatMap((selector) => {
+					const item = resolveSelector(selector);
+					return item ? [target(selector, item)] : [];
+				});
+				const resolvedIds = resolved.map((item) => item.release_id);
+				const active =
+					resolved.find((item) => item.selector === activeSelector) ??
+					resolved[0];
+				const items = publicReleaseItems
+					.filter((item) => resolvedIds.includes(item.release_id))
+					.map((item) => ({
+						...item,
+						is_highlighted: true,
+						is_active_highlight: item.release_id === active?.release_id,
+					}));
+				return new Response(
+					JSON.stringify({
+						status: "ready",
+						repo_full_name: "octo-rill/example",
+						next_cursor: null,
+						items,
+						highlight: {
+							mode: "discrete",
+							status:
+								resolved.length === selectors.length ? "complete" : "partial",
+							requested: selectors,
+							resolved,
+							unresolved: selectors.filter(
+								(selector) => !resolveSelector(selector),
+							),
+							total: resolved.length,
+							active_release_id: active?.release_id ?? null,
+							active_index: active ? resolved.indexOf(active) + 1 : null,
+						},
+						segments: items.map((item) => ({
+							first_release_id: item.release_id,
+							last_release_id: item.release_id,
+						})),
+						gaps:
+							items.length > 1
+								? [
+										{
+											newer_cursor: `storybook|${items[0].release_id}`,
+											older_cursor: `storybook|${items[1].release_id}`,
+											remaining_count: 1,
+										},
+									]
+								: [],
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "application/json" },
+					},
+				);
+			}
+			if (startSelector !== null || endSelector !== null) {
+				const startItem = resolveSelector(startSelector);
+				const endItem = resolveSelector(endSelector);
+				const startIndex = startItem
+					? publicReleaseItems.indexOf(startItem)
+					: -1;
+				const endIndex = endItem ? publicReleaseItems.indexOf(endItem) : -1;
+				const unresolved = [startSelector, endSelector].filter(
+					(selector): selector is string =>
+						Boolean(selector) && !resolveSelector(selector),
+				);
+				if (startIndex < 0 || endIndex < 0) {
+					const items = publicReleaseItems.slice(0, limit);
+					const resolved = [startSelector, endSelector].flatMap((selector) => {
+						const item = resolveSelector(selector);
+						return selector && item ? [target(selector, item)] : [];
+					});
+					return new Response(
+						JSON.stringify({
+							status: "ready",
+							repo_full_name: "octo-rill/example",
+							next_cursor: null,
+							items,
+							highlight: {
+								mode: "range",
+								status: "partial",
+								requested: [startSelector, endSelector].filter(
+									(value): value is string => Boolean(value),
+								),
+								resolved,
+								unresolved,
+								total: 0,
+								active_release_id: null,
+								active_index: null,
+								message: "连续范围的端点未全部命中，已显示普通最新列表",
+							},
+						}),
+						{
+							status: 200,
+							headers: { "content-type": "application/json" },
+						},
+					);
+				}
+				const rangeStart = Math.min(startIndex, endIndex);
+				const rangeEnd = Math.max(startIndex, endIndex) + 1;
+				const rangeItems = publicReleaseItems.slice(rangeStart, rangeEnd);
+				const cursorOffset = cursor
+					? Number(cursor.split("|").at(-1) ?? rangeStart)
+					: rangeStart;
+				const offset = cursor ? cursorOffset : rangeStart;
+				const pageItems =
+					direction === "newer"
+						? publicReleaseItems.slice(
+								Math.max(rangeStart, offset - limit),
+								offset,
+							)
+						: rangeItems.slice(
+								offset - rangeStart,
+								offset - rangeStart + limit,
+							);
+				const items = pageItems.map((item) => ({
+					...item,
+					is_highlighted: true,
+					is_active_highlight: item.release_id === startItem?.release_id,
+				}));
+				const nextOffset = offset - rangeStart + items.length;
+				return new Response(
+					JSON.stringify({
+						status: "ready",
+						repo_full_name: "octo-rill/example",
+						next_cursor:
+							direction === "older" && nextOffset < rangeItems.length
+								? `storybook|${rangeStart + nextOffset}`
+								: null,
+						previous_cursor:
+							cursor && direction === "older" ? `storybook|${offset}` : null,
+						items,
+						highlight: {
+							mode: "range",
+							status: "complete",
+							requested: [startSelector, endSelector],
+							resolved: [
+								target(startSelector ?? "", startItem!),
+								target(endSelector ?? "", endItem!),
+							],
+							unresolved: [],
+							total: rangeItems.length,
+							active_release_id: startItem?.release_id ?? null,
+							active_index: 1,
+						},
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "application/json" },
+					},
+				);
+			}
 			const start = cursor ? Number(cursor.split("|").at(-1) ?? "0") : 0;
 			const items = publicReleaseItems.slice(start, start + limit);
 			const nextStart = start + items.length;
@@ -330,6 +555,31 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 
 function PublicReleaseStory(props: { mode: PublicReleaseStoryMode }) {
 	installPublicReleaseMock(props.mode);
+	const highlight =
+		props.mode === "highlight-ids"
+			? {
+					mode: "discrete" as const,
+					selectors: ["tag:v2.7.0", "id:291058025"],
+				}
+			: props.mode === "highlight-small-range"
+				? {
+						mode: "range" as const,
+						start: "tag:v2.7.0",
+						end: "id:291058024",
+					}
+				: props.mode === "highlight-large-range"
+					? {
+							mode: "range" as const,
+							start: "tag:v2.7.0",
+							end: "id:291058020",
+						}
+					: props.mode === "highlight-partial"
+						? {
+								mode: "range" as const,
+								start: "tag:v2.7.0",
+								end: "tag:missing-release",
+							}
+						: null;
 
 	useEffect(() => {
 		return () => {
@@ -357,6 +607,7 @@ function PublicReleaseStory(props: { mode: PublicReleaseStoryMode }) {
 						? "v2.7.0"
 						: null
 				}
+				highlight={highlight}
 			/>
 		</VersionMonitorStateProvider>
 	);
@@ -440,6 +691,63 @@ export const OwnedPublicCacheReady: Story = {
 		await expect(
 			canvas.queryByText("Release 数据同步中"),
 		).not.toBeInTheDocument();
+		await expectPublicReleaseFooterVersion(canvasElement);
+	},
+};
+
+export const DiscreteHighlight: Story = {
+	args: { mode: "highlight-ids" },
+	play: async ({ canvas, canvasElement }) => {
+		await expect(
+			canvas.getByTestId("public-release-item-291058027"),
+		).toHaveAttribute("data-highlighted", "true");
+		await userEvent.click(canvas.getByTitle("下一条高亮记录"));
+		await expect(
+			canvas.getByTestId("public-release-item-291058025"),
+		).toHaveAttribute("data-active-highlight", "true");
+		await expect(
+			canvas.getByTestId("public-release-item-291058025"),
+		).toHaveFocus();
+		await expectPublicReleaseFooterVersion(canvasElement);
+	},
+};
+
+export const PolishedFallbackToOriginal: Story = {
+	args: { mode: "polished-fallback" },
+	play: async ({ canvas, canvasElement }) => {
+		await expect(canvas.getByText("Shared cache")).toBeVisible();
+		await expectPublicReleaseFooterVersion(canvasElement);
+	},
+};
+
+export const SmallRangeHighlight: Story = {
+	args: { mode: "highlight-small-range" },
+	parameters: {
+		viewport: {
+			defaultViewport: "publicReleaseMobile390",
+		},
+	},
+	play: async ({ canvas, canvasElement }) => {
+		await expect(
+			canvas.getByTestId("public-release-item-291058024"),
+		).toHaveAttribute("data-highlighted", "true");
+		await expectPublicReleaseFooterVersion(canvasElement);
+	},
+};
+
+export const LargeRangeHighlight: Story = {
+	args: { mode: "highlight-large-range" },
+	play: async ({ canvasElement }) => {
+		await expectPublicReleaseFooterVersion(canvasElement);
+	},
+};
+
+export const PartialRangeHighlight: Story = {
+	args: { mode: "highlight-partial" },
+	play: async ({ canvas, canvasElement }) => {
+		await expect(
+			canvas.getByTestId("public-release-highlight-unresolved"),
+		).toBeVisible();
 		await expectPublicReleaseFooterVersion(canvasElement);
 	},
 };

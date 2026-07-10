@@ -13,6 +13,7 @@ import type {
 	MeLinuxDoResponse,
 	MeProfileResponse,
 	MeResponse,
+	PublicReleaseListResponse,
 	ReactionTokenStatusResponse,
 	ReleaseDetailResponse,
 	RepoPublicReleasePublicationStatusResponse,
@@ -27,6 +28,8 @@ export type DemoSceneId =
 	| "dashboard-repo-publish"
 	| "settings-my-releases"
 	| "public-release-ready"
+	| "public-release-highlight-discrete"
+	| "public-release-highlight-range"
 	| "admin-panel-users"
 	| "admin-jobs-running";
 
@@ -74,6 +77,7 @@ export type DemoModel = {
 	briefs: BriefItem[];
 	notifications: NotificationItem[];
 	publicReleaseDetail: ReleaseDetailResponse;
+	publicReleaseList: PublicReleaseListResponse;
 	publicationStatus: RepoPublicReleasePublicationStatusResponse;
 	adminUsers: AdminUserItem[];
 	adminUserProfiles: Record<string, AdminUserProfileResponse>;
