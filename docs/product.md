@@ -83,6 +83,10 @@ Dashboard 采用主列 + 侧栏结构，核心标签为：
 
 右侧侧栏长期承担 Inbox 快捷入口；在 `日报` 标签下还同时承担日报列表。Release 详情的 canonical deep link 采用 `/<owner>/<repo>/releases/tag/<tag>?from=<tab>`，其中 `from` 只表达返回上下文，默认 `briefs`。登录态 announcement 详情的 canonical deep link 采用 `/<owner>/<repo>/discussions/<number>?from=<tab>`；命中后仍留在 Dashboard 壳层内阅读，不提供独立 public announcement page。
 
+### Focus pages
+
+`/focus/*` 是按仓库、仓库集合、组织、个人仓库或关注仓库收窄的只读信息流。它保留与 Dashboard 一致的日期边界和原始卡片阅读能力，但不消费全局日报：已有日报、日报覆盖关系、日报/列表切换及日报生成状态都不会进入 focus 页面，也不会隐藏当前 scope 内的原始仓库动态。
+
 ### Web Demo
 
 `/demo/` 是公开页面级验收面，不承担真实业务写路径。它复用同一套路由与页面组件，但在 `demo=<scene-id>` 下强制进入 mock-only runtime，并通过 inspector 暴露 persona、network、关键 toggle 与 simulated write 行为。

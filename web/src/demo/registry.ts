@@ -30,7 +30,7 @@ export const DEMO_SCENES: DemoScene[] = [
 	{
 		id: "dashboard-repo-publish",
 		title: "Dashboard",
-		description: "repo scope 发布控制、Briefs / Inbox 与 simulated sync。",
+		description: "repo scope 原始信息流、发布控制与 simulated sync。",
 		path: buildDashboardScopeHref(repoScope),
 		defaultPersona: "member",
 		personas: ["member", "admin", "guest"],

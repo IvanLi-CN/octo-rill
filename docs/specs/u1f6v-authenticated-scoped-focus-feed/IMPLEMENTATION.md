@@ -4,7 +4,7 @@
 
 - Lifecycle: active
 - Delivery mode: fast-track
-- Current state: `/focus/mine` 个人仓库语义已实现，等待 merge-ready 收口
+- Current state: scoped feed 已隔离全局日报数据，等待 merge-ready 收口
 
 ## Scope coverage
 
@@ -18,7 +18,7 @@
 - [x] `/focus/mine` feed 使用同一 viewer owner repo baseline 作为聚焦范围，仍只展示真实动态
 - [x] scoped shell：双 tab + summary sidebar/mobile summary + empty state
 - [x] 单仓 focus 摘要卡公开 Release 页入口与 private owner repo 发布/取消发布控件
-- [x] scoped `全部` 页隐藏按日“生成日报”动作，并在 scoped 渲染时屏蔽全局页遗留的 pending/error 生成状态，保留历史原始列表阅读
+- [x] scoped `全部` 页完全忽略全局日报及其覆盖关系，屏蔽已有日报、生成动作、pending/error 状态并保留完整历史原始列表
 - [x] Storybook page/app-shell fallback 场景
 - [x] E2E 覆盖与最终视觉证据
 
