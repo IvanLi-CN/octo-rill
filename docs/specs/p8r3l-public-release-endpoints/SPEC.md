@@ -176,10 +176,11 @@
   requested_viewport: `1440x1000`
   viewport_strategy: `browser-viewport-override`
   sensitive_exclusion: `N/A`
-  submission_gate: `pending-owner-approval`
+  submission_gate: `approved`
   story_id_or_title: `public-release-highlight-discrete`
   state: `discrete-highlight-desktop`
   evidence_note: 验证 URL 中三个 tag/ID 混合离散目标由同一个列表请求返回并同时进入视口；active 目标使用更强焦点环，右下导航精确显示 `2 / 3`，默认内容 lane 为润色且无横向溢出。
+  PR: include
   image:
   ![公开 Release 离散高亮桌面状态](./assets/public-release-highlight-discrete-desktop.png)
 
@@ -190,10 +191,11 @@
   captured_viewport: `375x812`
   viewport_strategy: `browser-viewport-override`
   sensitive_exclusion: `N/A`
-  submission_gate: `pending-owner-approval`
+  submission_gate: `approved`
   story_id_or_title: `public-release-highlight-range`
   state: `long-range-highlight-mobile`
   evidence_note: 验证 18 条连续范围以显式 active 为中心定位，右下导航显示 `9 / 18`；动态高度卡片在 390px 移动视口持续虚拟化渲染，active 焦点环、润色回退原文与原生滚动条共存且无横向溢出。
+  PR: include
   image:
   ![公开 Release 长范围移动状态](./assets/public-release-highlight-range-mobile.png)
 
@@ -214,7 +216,6 @@
   story_id_or_title: `public-publicreleasepage--pending-sync`
   state: `public-page-pending-sync-mobile`
   evidence_note: 验证 390px 移动端首次访问公开 Release 页面且仓库尚未缓存时，页面使用面向用户的中文等待文案，不暴露 API message 或 reason code；状态胶囊展示“同步排队中 · 约 60s 后重试”，并提供手动重试入口；页头 GitHub 入口使用外链图标并指向当前仓库 Releases 页面，页脚 GitHub 入口使用 GitHub 图标并指向当前仓库根路径，页脚贴在短内容页面底部。
-  PR: include
   image:
   ![公开 Release 等待同步状态](./assets/public-release-evidence-pending-mobile-v8.png)
 
@@ -229,7 +230,6 @@
   story_id_or_title: `public-publicreleasepage--release-list`
   state: `public-release-list-desktop`
   evidence_note: 验证桌面端公开列表页展示仓库名、页面级原文/翻译/润色切换器和复用普通 Release 卡片的列表内容；卡片保留 repo identity、标题、发布时间/tag、卡片内部内容 lane 与 GitHub Release 链接，不显示不可靠 release 总数或解释性噪音。
-  PR: include
   image:
   ![公开 Release 列表页桌面端](./assets/public-release-evidence-list-desktop-v8.png)
 
@@ -258,7 +258,6 @@
   story_id_or_title: `admin-publicreleaserepomanagement--default`
   state: `admin-public-release-repos-delete-confirmation`
   evidence_note: 验证管理后台展示 ready/pending 登记仓库、API/页面访问统计、Release/翻译/润色数据量，并在删除前说明若无其他使用方会清理共享 Release 与 AI 缓存。
-  PR: include
   image:
   ![管理后台公开端点仓库删除确认](./assets/public-release-evidence-admin-v1.png)
 
@@ -272,6 +271,5 @@
   viewport: `1440x1000`
   state: `legacy-public-release-route-redirect`
   evidence_note: 验证旧 `/public/:owner/:repo/releases` 列表路径不再进入前端 404，而是 replace 到 canonical `/:owner/:repo/releases` 并展示公开 Release 落地页；public-only tag 详情路由语义不受此截图覆盖，由路由测试覆盖。
-  PR: include
   image:
   ![公开 Release 旧列表路径跳转到 canonical 落地页](./assets/public-release-legacy-redirect-browser-1440x1000.png)
