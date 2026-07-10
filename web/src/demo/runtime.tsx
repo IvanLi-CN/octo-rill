@@ -57,7 +57,9 @@ type PersistedDemoPanelLayoutStore = PersistedDemoPanelLayout & {
 function buildDefaultPanelLayout(sceneId: DemoSceneId): DemoPanelLayout {
 	if (
 		sceneId === "settings-my-releases" ||
-		sceneId === "public-release-ready"
+		sceneId === "public-release-ready" ||
+		sceneId === "public-release-highlight-discrete" ||
+		sceneId === "public-release-highlight-range"
 	) {
 		return {
 			...DEFAULT_PANEL_LAYOUT,

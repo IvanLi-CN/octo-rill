@@ -5,6 +5,7 @@ import {
 	preserveCurrentDemoSearchInHref,
 } from "@/demo/registry";
 import { getDemoRouterBasepath } from "@/demo/runtime";
+import { REPEATED_SEARCH_VALUE_SEPARATOR } from "@/publicRelease/routeState";
 import { routeTree } from "./routeTree.gen";
 
 function parseSearch(searchStr: string) {
@@ -14,7 +15,11 @@ function parseSearch(searchStr: string) {
 	const result: Record<string, string> = {};
 
 	for (const [key, value] of params.entries()) {
-		result[key] = value;
+		const current = result[key];
+		result[key] =
+			current === undefined
+				? value
+				: `${current}${REPEATED_SEARCH_VALUE_SEPARATOR}${value}`;
 	}
 
 	return result;
@@ -25,6 +30,15 @@ function stringifySearch(search: Record<string, unknown>) {
 
 	for (const [key, value] of Object.entries(search)) {
 		if (value === undefined || value === null || value === "") continue;
+		if (
+			typeof value === "string" &&
+			value.includes(REPEATED_SEARCH_VALUE_SEPARATOR)
+		) {
+			for (const item of value.split(REPEATED_SEARCH_VALUE_SEPARATOR)) {
+				params.append(key, item);
+			}
+			continue;
+		}
 		if (Array.isArray(value)) {
 			for (const item of value) {
 				if (item === undefined || item === null || item === "") continue;
