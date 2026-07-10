@@ -1,6 +1,6 @@
 # 实现状态
 
-- Summary: 本地验证完成；fast-track / public release pages + REST API + admin registry
+- Summary: fast-track / public Release pages + REST API + admin registry 已加入 release_id 高亮深链、服务端聚焦窗口与双向 cursor；本地验证完成，等待 PR 收敛。
 
 ## Milestones
 
@@ -11,6 +11,7 @@
 - [x] M5: 完成 review-loop。
 - [ ] M6: 完成 PR 收敛。
 - [x] M7: 公开页面页脚版本号链接与移动端视觉证据完成。
+- [x] M8: 完成公开 Release 高亮 URL、服务端范围 seek、双向 cursor、自动滚动与前后端回归覆盖。
 
 ## Current Notes
 
@@ -22,6 +23,9 @@
 - 公开列表页默认展示原文正文，但列表态会截断超长正文，详情页仍展示完整正文。
 - 公开 Release 页脚与全站 footer 保持一致：有效 `loadedVersion` 链接到 OctoRill 自身 public-only Release 详情页，`unknown` 保持纯文本。
 - 公开文档站已提供面向接入方的 `公开 Release 接入` 页面，覆盖公开页面 URL、REST API、pending retry、真实 pending reason 枚举、分页参数与部署前检查。
+- 高亮 URL 只接受两种互斥模式：`highlight_ids` 离散目标，或 `highlight_start` / `highlight_end` 倒序闭区间；后端去重并限制离散目标最多 32 个，范围首载最多 12 条。
+- 高亮列表直接复用 `repo_releases.release_id` 唯一查询和 `idx_repo_releases_repo_sort_ts` 排序索引；范围查询通过 seek 限定闭区间，后端返回 `highlight`、`is_highlighted`、`unresolved_ids` 与 `previous_cursor`。
+- 页面只渲染后端推荐窗口；首次高亮载入自动居中或选择最近的首条顶部/末条底部对齐，older 追加与 newer 前置保留高亮并通过锚点补偿滚动。
 
 ## Verification
 
@@ -33,3 +37,8 @@
 - `cd web && PLAYWRIGHT_WEB_PORT=36830 bun run e2e -- public-release-page.spec.ts`
 - `cd web && npm run storybook:build`
 - `cd web && npm run e2e -- public-release-page.spec.ts`
+- `CARGO_INCREMENTAL=0 cargo test public_release_highlight -- --nocapture`
+- `cd web && bun run lint`
+- `cd web && bun run build`
+- `cd web && bun run storybook:build`
+- `cd web && PLAYWRIGHT_WEB_PORT=15300 bun run e2e e2e/public-release-page.spec.ts --workers=1`
