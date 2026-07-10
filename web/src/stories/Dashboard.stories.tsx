@@ -3818,6 +3818,7 @@ function DashboardPreview(props: {
 				<FeedGroupedList
 					mode={mode}
 					sourceTab={mode}
+					currentScope={scope}
 					items={filteredItems}
 					currentViewer={STORYBOOK_VIEWER}
 					briefs={storyBriefs}
@@ -7287,7 +7288,19 @@ export const ScopedFocusRepoAll: Story = {
 			releaseTag: "v0.24.0",
 			releaseOnly: true,
 		}),
-		briefs: [],
+		briefs: [
+			makeBrief({
+				id: "brief-that-must-not-enter-scoped-focus",
+				date: "2026-04-04",
+				window_start: "2026-04-03T08:00:00+08:00",
+				window_end: "2026-04-04T08:00:00+08:00",
+				release_count: 1,
+				release_ids: ["focus-repo-release-history"],
+				content_markdown:
+					"## 不应出现在聚焦页的全局日报\n\n- 该内容仅用于验证 scope 隔离。",
+				created_at: "2026-04-04T08:00:03+08:00",
+			}),
+		],
 		now: new Date("2026-04-05T12:00:00+08:00"),
 		showFooter: false,
 		scope: {
@@ -7327,6 +7340,14 @@ export const ScopedFocusRepoAll: Story = {
 		await expect(
 			canvas.queryByRole("button", { name: "生成日报" }),
 		).not.toBeInTheDocument();
+		await expect(canvas.getByText("AFFiNE 0.23.0")).toBeVisible();
+		await expect(canvas.queryByText("日报摘要")).not.toBeInTheDocument();
+		await expect(
+			canvas.queryByText("不应出现在聚焦页的全局日报"),
+		).not.toBeInTheDocument();
+		expect(
+			canvasElement.querySelector('[data-feed-group-view="brief"]'),
+		).toBeNull();
 	},
 };
 

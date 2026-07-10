@@ -81,7 +81,7 @@
 - 移动端在 feed 顶部展示同等摘要信息。
 - 单仓 `repo` scope 摘要卡展示公开 Release 页入口：GitHub public repo 显示“公开仓库 · 可直接访问”与复制/跳转；viewer-owned private repo 显示发布状态，未发布时可发布，已发布时可复制、跳转、取消发布。
 - lane selector 继续复用 `全部 / 发布` 两个 feed-backed tab 的现有行为。
-- scoped 页面是只读范围聚焦面；即使 `全部` tab 中存在缺少日报的历史日组，也不得显示按天“生成日报”动作。
+- scoped 页面是只读范围聚焦面；`全部` tab 只按日报边界组织当前 scope 的原始仓库动态，任何全局日报都不得参与渲染、折叠、覆盖或隐藏条目，也不得显示按天“生成日报”动作。
 
 ### Scoped `全部`
 
@@ -186,9 +186,13 @@
   When `全部` tab 中存在缺少日报的历史日组
   Then 页面不显示“生成日报”按钮，历史原始列表仍可阅读。
 
-- Given 用户先在全局 `全部` tab 触发某个历史日组的“生成日报”
-  When 该生成仍处于 pending 或 error 状态，且用户站内导航到 `/focus/repo/owner/repo` 或 `/focus/org/org`
-  Then scoped 页面不得显示 pending 日报占位、错误日报面板或重试/生成动作，只展示该 scope 的原始列表。
+- Given 用户访问任意 `/focus/*` scoped 页面
+  When 全局 Dashboard 缓存中存在覆盖当前 scope Release 的已有日报
+  Then scoped 页面仍按日期展示完整原始仓库信息流，不显示日报卡片或日报/列表切换，也不按日报覆盖关系隐藏条目。
+
+- Given 用户先在全局 `全部` tab 查看已有日报或触发某个历史日组的“生成日报”
+  When 已有日报或生成状态仍留在缓存中，且用户站内导航到任意 `/focus/*` scoped 页面
+  Then scoped 页面不得显示日报正文、pending 占位、错误面板或重试/生成动作，只展示该 scope 的原始列表。
 
 - Given 多个 scope 页面先后访问
   When 页面 warm start 或 updates 轮询命中

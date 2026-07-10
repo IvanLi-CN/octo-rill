@@ -698,12 +698,14 @@ export const demoHandlers = [
 		if (network) return network;
 		const model = currentModel();
 		const type = url.searchParams.get("types");
-		if (!type || type === "all") {
-			return json(model.feed);
-		}
+		const scope = url.searchParams.get("scope");
+		const scopedRepo = scope === "repo" ? url.searchParams.get("items") : null;
+		const scopedItems = scopedRepo
+			? model.feed.items.filter((item) => item.repo_full_name === scopedRepo)
+			: model.feed.items;
 		return json({
 			...model.feed,
-			items: model.feed.items.filter((item) =>
+			items: scopedItems.filter((item) =>
 				type === "releases"
 					? item.kind === "release"
 					: type === "stars"
