@@ -733,11 +733,11 @@ function ReleaseList(props: {
 								releaseElementRefs.current.delete(item.release_id);
 							}
 						}}
-						className={cn(
-							"scroll-mt-5 rounded-[30px] transition-[box-shadow,background-color] duration-200",
-							item.is_highlighted &&
-								"bg-primary/[0.04] ring-2 ring-primary/35 ring-offset-2 ring-offset-background",
-						)}
+						className={
+							item.is_highlighted
+								? "scroll-mt-5 rounded-[30px] bg-primary/[0.04] ring-2 ring-primary/35 ring-offset-2 ring-offset-background transition-[box-shadow,background-color] duration-200"
+								: undefined
+						}
 						data-highlighted={item.is_highlighted ? "true" : "false"}
 						data-release-id={item.release_id}
 						data-testid={`public-release-item-${item.release_id}`}
