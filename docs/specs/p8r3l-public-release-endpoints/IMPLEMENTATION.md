@@ -1,6 +1,6 @@
 # 实现状态
 
-- Summary: fast-track / typed tag/ID selector、后端推荐窗口、双向虚拟列表与润色默认阅读路径已完成本地实现和验证，等待 PR 收敛。
+- Summary: fast-track / typed tag/ID selector、后端推荐窗口、双向虚拟列表与润色默认阅读路径已在 PR #213 收敛到 Step 5C Ready。
 
 ## Milestones
 
@@ -9,7 +9,7 @@
 - [x] M3: 新增公开列表/详情页面与管理后台登记列表。
 - [x] M4: 完成自动化验证与视觉证据。
 - [x] M5: 完成 review-loop。
-- [ ] M6: 完成 PR 收敛。
+- [x] M6: 完成 PR 收敛。
 - [x] M7: 公开页面页脚版本号链接与移动端视觉证据完成。
 - [x] M8: 完成 typed 高亮 URL、服务端分段/gap 窗口、双向虚拟列表、浮动导航与前后端回归覆盖。
 
