@@ -251,6 +251,11 @@ test("public release list requests six cached releases before loading more", asy
 	await expect(
 		page.getByRole("heading", { name: "octo-rill/example" }),
 	).toBeVisible();
+	expect(
+		await page
+			.getByTestId("public-release-item-public-release-0")
+			.evaluate((element) => element.className),
+	).toBe("");
 	expect(new URLSearchParams(seenQueries[0]).get("limit")).toBe("6");
 	await expect(
 		page.getByRole("button", { name: "原文" }).first(),
