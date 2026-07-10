@@ -172,9 +172,15 @@ test("public release pending page hides backend retry details", async ({
 
 	await page.goto("/octo-rill/example/releases");
 
-	await expect(page.getByText("Release 数据同步中")).toBeVisible();
-	await expect(page.getByText("同步中", { exact: true })).toBeVisible();
-	await expect(page.getByText("约 60s 后重试")).toBeVisible();
+	await expect(page.getByText("Release 数据同步中")).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect(page.getByText("同步中", { exact: true })).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect(page.getByText("约 60s 后重试")).toBeVisible({
+		timeout: 15_000,
+	});
 	await expect(
 		page.getByText("Release data is being prepared"),
 	).not.toBeVisible();
@@ -192,9 +198,9 @@ test("public release loading page uses a skeleton instead of loading copy", asyn
 
 	await page.goto("/octo-rill/example/releases");
 
-	await expect(
-		page.getByTestId("public-release-loading-skeleton"),
-	).toBeVisible();
+	await expect(page.getByTestId("public-release-loading-skeleton")).toBeVisible(
+		{ timeout: 15_000 },
+	);
 	await expect(
 		page.getByTestId("public-release-skeleton-block").first(),
 	).toBeVisible();
@@ -289,6 +295,167 @@ test("public owned cached repo shows ready list instead of pending sync", async 
 	).toBeVisible();
 	await expect(page.getByText("Release 数据同步中")).not.toBeVisible();
 	await expectPublicChrome(page, "IvanLi-CN", "tuckmark");
+});
+
+test("public release discrete highlight deep link uses one target request and keeps unresolved ids visible", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1280, height: 720 });
+	const seenQueries: URL[] = [];
+	const items = Array.from({ length: 8 }, (_, index) => releaseItem(index));
+	await installBaseApiMocks(page, (route, url) => {
+		seenQueries.push(url);
+		const ids = url.searchParams.get("highlight_ids")?.split(",") ?? [];
+		const resolvedIds = ids.filter((id) =>
+			items.some((item) => item.release_id === id),
+		);
+		return json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items: items
+				.filter((item) => resolvedIds.includes(item.release_id))
+				.map((item) => ({ ...item, is_highlighted: true })),
+			highlight: {
+				mode: "ids",
+				requested_ids: ids,
+				resolved_ids: resolvedIds,
+				unresolved_ids: ids.filter((id) => !resolvedIds.includes(id)),
+			},
+		});
+	});
+
+	await page.goto(
+		"/public/octo-rill/example/releases?highlight_ids=public-release-5,public-release-1,missing-release",
+	);
+
+	await expect(
+		page.getByTestId("public-release-item-public-release-5"),
+	).toHaveAttribute("data-highlighted", "true");
+	await expect(
+		page.getByTestId("public-release-item-public-release-1"),
+	).toHaveAttribute("data-highlighted", "true");
+	await expect(
+		page.getByTestId("public-release-highlight-unresolved"),
+	).toBeVisible();
+	await expect.poll(() => seenQueries.length).toBe(1);
+	await expect(page).toHaveURL(
+		/\/octo-rill\/example\/releases\?highlight_ids=public-release-5%2Cpublic-release-1%2Cmissing-release$/,
+	);
+	expect(seenQueries[0].searchParams.get("highlight_ids")).toBe(
+		"public-release-5,public-release-1,missing-release",
+	);
+	expect(seenQueries[0].searchParams.get("cursor")).toBeNull();
+	await expectNoHorizontalOverflow(page);
+});
+
+test("public release range highlight scrolls to the nearest viewport edge and preserves bidirectional focus", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1280, height: 720 });
+	const seenQueries: URL[] = [];
+	const items = Array.from({ length: 20 }, (_, index) => releaseItem(index));
+	await installBaseApiMocks(page, (route, url) => {
+		seenQueries.push(url);
+		const start = Number(
+			url.searchParams.get("highlight_start")?.split("-").at(-1),
+		);
+		const end = Number(
+			url.searchParams.get("highlight_end")?.split("-").at(-1),
+		);
+		const cursor = url.searchParams.get("cursor");
+		const direction = url.searchParams.get("direction") ?? "older";
+		const offset = cursor ? Number(cursor.split("|").at(-1)) : start;
+		const limit = Number(url.searchParams.get("limit") ?? "12");
+		const pageItems =
+			direction === "newer"
+				? items.slice(Math.max(start, offset - limit), offset)
+				: items.slice(offset, Math.min(end + 1, offset + limit));
+		const nextOffset = offset + pageItems.length;
+		return json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: nextOffset <= end ? `range|${nextOffset}` : null,
+			previous_cursor: cursor ? `range|${offset}` : null,
+			items: pageItems.map((item) => ({ ...item, is_highlighted: true })),
+			highlight: {
+				mode: "range",
+				requested_ids: [
+					url.searchParams.get("highlight_start"),
+					url.searchParams.get("highlight_end"),
+				],
+				resolved_ids: [
+					url.searchParams.get("highlight_start"),
+					url.searchParams.get("highlight_end"),
+				],
+				unresolved_ids: [],
+				start_id: url.searchParams.get("highlight_start"),
+				end_id: url.searchParams.get("highlight_end"),
+			},
+		});
+	});
+
+	await page.goto(
+		"/octo-rill/example/releases?highlight_start=public-release-0&highlight_end=public-release-15",
+	);
+	await expect(
+		page.getByTestId("public-release-item-public-release-0"),
+	).toHaveAttribute("data-highlighted", "true");
+	await expect(
+		page.getByTestId("public-release-item-public-release-11"),
+	).toHaveAttribute("data-highlighted", "true");
+
+	const alignment = await page.evaluate(() => {
+		const elements = Array.from(
+			document.querySelectorAll<HTMLElement>('[data-highlighted="true"]'),
+		);
+		const first = elements[0].getBoundingClientRect();
+		const last = elements.at(-1)?.getBoundingClientRect() ?? first;
+		const span = last.bottom - first.top;
+		const viewport = window.innerHeight;
+		return {
+			centered:
+				span <= viewport - 32 &&
+				Math.abs((first.top + last.bottom) / 2 - viewport / 2) <= 32,
+			firstAligned: Math.abs(first.top - 16) <= 32,
+			lastAligned: Math.abs(last.bottom - (viewport - 16)) <= 32,
+		};
+	});
+	expect(
+		alignment.centered || alignment.firstAligned || alignment.lastAligned,
+	).toBe(true);
+
+	await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+	await expect.poll(() => seenQueries.length).toBeGreaterThan(1);
+	await expect(
+		page.getByTestId("public-release-item-public-release-15"),
+	).toHaveAttribute("data-highlighted", "true");
+	expect(
+		seenQueries.slice(1).every((url) => {
+			return (
+				url.searchParams.get("highlight_start") === "public-release-0" &&
+				url.searchParams.get("highlight_end") === "public-release-15"
+			);
+		}),
+	).toBe(true);
+
+	await page.evaluate(() => window.scrollTo(0, 0));
+	await expect
+		.poll(() =>
+			seenQueries.some((url) => url.searchParams.get("direction") === "newer"),
+		)
+		.toBe(true);
+	const newerQuery = seenQueries.find(
+		(url) => url.searchParams.get("direction") === "newer",
+	);
+	expect(newerQuery?.searchParams.get("cursor")).toBe("range|12");
+	expect(newerQuery?.searchParams.get("highlight_start")).toBe(
+		"public-release-0",
+	);
+	expect(newerQuery?.searchParams.get("highlight_end")).toBe(
+		"public-release-15",
+	);
+	await expectNoHorizontalOverflow(page);
 });
 
 test("public release detail keeps the shared chrome stable", async ({

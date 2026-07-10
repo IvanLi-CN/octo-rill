@@ -31,6 +31,17 @@ https://example.com/IvanLi-CN/octo-rill/releases
 https://example.com/IvanLi-CN/octo-rill/releases/tag/v2.29.0
 ```
 
+### 高亮深链
+
+列表页支持直接分享一个或多个 Release，或分享当前时间倒序列表中的连续范围。`release_id` 使用 GitHub Release 全局 ID：
+
+```text
+{OCTORILL_ORIGIN}/{owner}/{repo}/releases?highlight_ids=<id1>,<id2>
+{OCTORILL_ORIGIN}/{owner}/{repo}/releases?highlight_start=<newer_id>&highlight_end=<older_id>
+```
+
+两种模式互斥。页面会先请求服务端推荐的聚焦窗口，再自动滚动到高亮记录；不会从第一页开始逐页寻找目标。范围过大时页面会继续使用响应中的 cursor 加载同一范围，离散目标缺失时会显示部分结果并保留未解析 ID。
+
 `owner`、`repo` 和 `tag` 都应该按 URL path segment 编码。尤其是 tag 里包含 `/`、空格或其它特殊字符时，必须先编码：
 
 ```js
@@ -61,6 +72,10 @@ GET {OCTORILL_ORIGIN}/api/public/repos/{owner}/{repo}/releases/tag/{tag}
 | `lang` | `zh-CN` | `zh-CN` | 当前只支持中文翻译。 |
 | `limit` | `1` 到 `30` | `6` | 仅列表接口支持。 |
 | `cursor` | 上次响应的 `next_cursor` | 空 | 仅列表接口支持，用于分页。 |
+| `direction` | `older`、`newer` | `older` | 高亮范围的 cursor 方向；`newer` 使用 `previous_cursor`。 |
+| `highlight_ids` | 逗号分隔的 Release 全局 ID | 空 | 离散高亮模式；后端去重，最多 32 个。 |
+| `highlight_start` | Release 全局 ID | 空 | 连续范围模式的端点；必须与 `highlight_end` 一起使用。 |
+| `highlight_end` | Release 全局 ID | 空 | 连续范围模式的端点；按时间倒序范围包含两端。 |
 | `source` | `page` | 空 | OctoRill 页面访问会使用；普通 API 调用可省略。 |
 
 列表响应在数据可用时返回 `200 OK`：
@@ -70,9 +85,23 @@ GET {OCTORILL_ORIGIN}/api/public/repos/{owner}/{repo}/releases/tag/{tag}
   "status": "ready",
   "repo_full_name": "IvanLi-CN/octo-rill",
   "next_cursor": null,
-  "items": []
+  "previous_cursor": null,
+  "highlight": {
+    "mode": "ids",
+    "requested_ids": ["291058027", "291058026"],
+    "resolved_ids": ["291058027"],
+    "unresolved_ids": ["291058026"]
+  },
+  "items": [
+    {
+      "release_id": "291058027",
+      "is_highlighted": true
+    }
+  ]
 }
 ```
+
+没有高亮参数时，`highlight` 与 `previous_cursor` 会省略，列表仍保持首载 6 条和 `next_cursor` 的既有行为。范围响应的 `highlight.mode` 为 `range`，并包含 `start_id`、`end_id`；当范围超过首载窗口时，使用 `next_cursor` 请求更旧记录，使用 `previous_cursor` 和 `direction=newer` 请求更新记录。
 
 如果仓库已登记但同步尚未完成，接口返回 `202 Accepted`，并带有 `Retry-After` header：
 
@@ -106,6 +135,7 @@ GET {OCTORILL_ORIGIN}/api/public/repos/{owner}/{repo}/releases/tag/{tag}
 - `published_at`
 - `is_prerelease`
 - `is_draft`
+- `is_highlighted`
 - `translated`
 - `smart`
 

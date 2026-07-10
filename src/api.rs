@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::future::Future;
@@ -41,6 +42,8 @@ const SESSION_ACTIVITY_TOUCHED_AT: &str = "activity_touched_at";
 const SESSION_ACTIVITY_TOUCH_INTERVAL_SECS: i64 = 15 * 60;
 const ACCESS_SYNC_REASON_INACTIVE_OVER_1H: &str = "inactive_over_1h";
 const GITHUB_DISCUSSION_PATH_SEGMENT: &str = "/discussions/";
+const PUBLIC_RELEASE_HIGHLIGHT_ID_LIMIT: usize = 32;
+const PUBLIC_RELEASE_HIGHLIGHT_WINDOW_LIMIT: i64 = 12;
 const ADMIN_DASHBOARD_TASK_TYPES: [(&str, &str); 3] = [
     (jobs::TASK_TRANSLATE_RELEASE_BATCH, "翻译"),
     (jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH, "润色"),
@@ -8021,6 +8024,10 @@ pub struct PublicReleaseQuery {
     source: Option<String>,
     cursor: Option<String>,
     limit: Option<i64>,
+    highlight_ids: Option<String>,
+    highlight_start: Option<String>,
+    highlight_end: Option<String>,
+    direction: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -8036,6 +8043,7 @@ pub struct PublicReleaseListItem {
     published_at: Option<String>,
     is_prerelease: i64,
     is_draft: i64,
+    is_highlighted: bool,
     translated: Option<TranslatedItem>,
     smart: Option<SmartItem>,
 }
@@ -8045,7 +8053,23 @@ pub struct PublicReleaseListResponse {
     status: String,
     repo_full_name: String,
     next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    highlight: Option<PublicReleaseHighlightResponse>,
     items: Vec<PublicReleaseListItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct PublicReleaseHighlightResponse {
+    mode: &'static str,
+    requested_ids: Vec<String>,
+    resolved_ids: Vec<String>,
+    unresolved_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -8170,10 +8194,44 @@ struct PublicReleaseTranslationRow {
     error_text: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PublicReleaseCursor {
     sort_ts: String,
     release_id: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicReleaseCursorDirection {
+    Older,
+    Newer,
+}
+
+#[derive(Debug, Clone)]
+enum PublicReleaseHighlightSpec {
+    Ids(Vec<i64>),
+    Range { start_id: i64, end_id: i64 },
+}
+
+impl PublicReleaseHighlightSpec {
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::Ids(_) => "ids",
+            Self::Range { .. } => "range",
+        }
+    }
+
+    fn requested_ids(&self) -> Vec<i64> {
+        match self {
+            Self::Ids(ids) => ids.clone(),
+            Self::Range { start_id, end_id } => vec![*start_id, *end_id],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PublicReleaseRangeBounds {
+    newer: PublicReleaseCursor,
+    older: PublicReleaseCursor,
 }
 
 fn validate_public_release_query(query: &PublicReleaseQuery) -> Result<(), ApiError> {
@@ -8192,6 +8250,9 @@ fn validate_public_release_query(query: &PublicReleaseQuery) -> Result<(), ApiEr
             "content must be original, translated, polished, or all",
         ));
     }
+
+    parse_public_release_highlight_spec(query)?;
+    parse_public_release_cursor_direction(query.direction.as_deref())?;
 
     Ok(())
 }
@@ -8221,6 +8282,100 @@ fn parse_public_release_cursor(raw: &str) -> Result<PublicReleaseCursor, ApiErro
 
 fn public_release_cursor(row: &PublicReleaseRow) -> String {
     format!("{}|{}", row.sort_ts, row.release_id)
+}
+
+fn parse_public_release_id(raw: &str) -> Result<i64, ApiError> {
+    let value = raw
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| ApiError::bad_request("highlight release ids must be positive integers"))?;
+    if value <= 0 {
+        return Err(ApiError::bad_request(
+            "highlight release ids must be positive integers",
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_public_release_highlight_spec(
+    query: &PublicReleaseQuery,
+) -> Result<Option<PublicReleaseHighlightSpec>, ApiError> {
+    let has_ids = query
+        .highlight_ids
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_start = query
+        .highlight_start
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_end = query
+        .highlight_end
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+
+    if has_ids && (has_start || has_end) {
+        return Err(ApiError::bad_request(
+            "highlight_ids cannot be combined with highlight_start or highlight_end",
+        ));
+    }
+    if has_start != has_end {
+        return Err(ApiError::bad_request(
+            "highlight_start and highlight_end must be provided together",
+        ));
+    }
+
+    if has_ids {
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
+        for raw_id in query
+            .highlight_ids
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+        {
+            let release_id = parse_public_release_id(raw_id)?;
+            if seen.insert(release_id) {
+                ids.push(release_id);
+            }
+        }
+        if ids.is_empty() || ids.len() > PUBLIC_RELEASE_HIGHLIGHT_ID_LIMIT {
+            return Err(ApiError::bad_request(format!(
+                "highlight_ids must contain 1 to {PUBLIC_RELEASE_HIGHLIGHT_ID_LIMIT} ids"
+            )));
+        }
+        return Ok(Some(PublicReleaseHighlightSpec::Ids(ids)));
+    }
+
+    if has_start {
+        return Ok(Some(PublicReleaseHighlightSpec::Range {
+            start_id: parse_public_release_id(
+                query.highlight_start.as_deref().unwrap_or_default(),
+            )?,
+            end_id: parse_public_release_id(query.highlight_end.as_deref().unwrap_or_default())?,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn parse_public_release_cursor_direction(
+    raw: Option<&str>,
+) -> Result<PublicReleaseCursorDirection, ApiError> {
+    match raw.unwrap_or("older") {
+        "older" => Ok(PublicReleaseCursorDirection::Older),
+        "newer" => Ok(PublicReleaseCursorDirection::Newer),
+        _ => Err(ApiError::bad_request("direction must be older or newer")),
+    }
+}
+
+fn compare_public_release_positions(
+    left: &PublicReleaseCursor,
+    right: &PublicReleaseCursor,
+) -> Ordering {
+    right
+        .sort_ts
+        .cmp(&left.sort_ts)
+        .then_with(|| right.release_id.cmp(&left.release_id))
 }
 
 fn normalize_public_repo_path(owner: String, repo: String) -> Result<(String, String), ApiError> {
@@ -9195,7 +9350,11 @@ fn public_smart_item(row: &PublicReleaseRow, content: &str) -> Option<SmartItem>
     }
 }
 
-fn public_list_item_from_row(row: PublicReleaseRow, content: &str) -> PublicReleaseListItem {
+fn public_list_item_from_row(
+    row: PublicReleaseRow,
+    content: &str,
+    is_highlighted: bool,
+) -> PublicReleaseListItem {
     let translated = public_translation_item(&row, content);
     let smart = public_smart_item(&row, content);
     let repo_visual = repo_visual_from_parts(
@@ -9219,18 +9378,24 @@ fn public_list_item_from_row(row: PublicReleaseRow, content: &str) -> PublicRele
         published_at: row.published_at,
         is_prerelease: row.is_prerelease,
         is_draft: row.is_draft,
+        is_highlighted,
         translated,
         smart,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn load_public_release_base_rows(
     state: &AppState,
     repo_id: i64,
     tag: Option<&str>,
+    release_ids: Option<&[i64]>,
+    bounds: Option<&PublicReleaseRangeBounds>,
     cursor: Option<&PublicReleaseCursor>,
+    direction: PublicReleaseCursorDirection,
     limit: i64,
 ) -> Result<Vec<PublicReleaseBaseRow>, ApiError> {
+    const SORT_EXPRESSION: &str = "COALESCE(r.published_at, r.created_at, r.updated_at)";
     let mut query = QueryBuilder::<sqlx::Sqlite>::new(
         r#"
         SELECT
@@ -9249,16 +9414,16 @@ async fn load_public_release_base_rows(
             WHERE prev.repo_id = r.repo_id
               AND prev.is_draft = 0
               AND (
-                COALESCE(prev.published_at, prev.created_at, prev.updated_at, '')
-                  < COALESCE(r.published_at, r.created_at, r.updated_at, '')
+                COALESCE(prev.published_at, prev.created_at, prev.updated_at)
+                  < COALESCE(r.published_at, r.created_at, r.updated_at)
                 OR (
-                  COALESCE(prev.published_at, prev.created_at, prev.updated_at, '')
-                    = COALESCE(r.published_at, r.created_at, r.updated_at, '')
+                  COALESCE(prev.published_at, prev.created_at, prev.updated_at)
+                    = COALESCE(r.published_at, r.created_at, r.updated_at)
                   AND prev.release_id < r.release_id
                 )
               )
             ORDER BY
-              COALESCE(prev.published_at, prev.created_at, prev.updated_at, '') DESC,
+              COALESCE(prev.published_at, prev.created_at, prev.updated_at) DESC,
               prev.release_id DESC
             LIMIT 1
           ) AS previous_tag_name
@@ -9272,24 +9437,83 @@ async fn load_public_release_base_rows(
         query.push(" AND r.tag_name = ");
         query.push_bind(tag);
     }
+    if let Some(release_ids) = release_ids {
+        query.push(" AND r.release_id IN (");
+        let mut separated = query.separated(", ");
+        for release_id in release_ids {
+            separated.push_bind(release_id);
+        }
+        query.push(")");
+    }
+    if let Some(bounds) = bounds {
+        query.push(" AND (");
+        query.push(SORT_EXPRESSION);
+        query.push(" < ");
+        query.push_bind(bounds.newer.sort_ts.as_str());
+        query.push(" OR (");
+        query.push(SORT_EXPRESSION);
+        query.push(" = ");
+        query.push_bind(bounds.newer.sort_ts.as_str());
+        query.push(" AND r.release_id <= ");
+        query.push_bind(bounds.newer.release_id);
+        query.push("))");
+        query.push(" AND (");
+        query.push(SORT_EXPRESSION);
+        query.push(" > ");
+        query.push_bind(bounds.older.sort_ts.as_str());
+        query.push(" OR (");
+        query.push(SORT_EXPRESSION);
+        query.push(" = ");
+        query.push_bind(bounds.older.sort_ts.as_str());
+        query.push(" AND r.release_id >= ");
+        query.push_bind(bounds.older.release_id);
+        query.push("))");
+    }
     if let Some(cursor) = cursor {
-        query.push(" AND (COALESCE(r.published_at, r.created_at, r.updated_at, '') < ");
+        let operator = match direction {
+            PublicReleaseCursorDirection::Older => "<",
+            PublicReleaseCursorDirection::Newer => ">",
+        };
+        let tie_operator = match direction {
+            PublicReleaseCursorDirection::Older => "<",
+            PublicReleaseCursorDirection::Newer => ">",
+        };
+        query.push(" AND (");
+        query.push(SORT_EXPRESSION);
+        query.push(" ");
+        query.push(operator);
         query.push_bind(cursor.sort_ts.as_str());
-        query.push(" OR (COALESCE(r.published_at, r.created_at, r.updated_at, '') = ");
+        query.push(" OR (");
+        query.push(SORT_EXPRESSION);
+        query.push(" = ");
         query.push_bind(cursor.sort_ts.as_str());
-        query.push(" AND r.release_id < ");
+        query.push(" AND r.release_id ");
+        query.push(tie_operator);
         query.push_bind(cursor.release_id);
         query.push("))");
     }
-    query.push(
-        " ORDER BY COALESCE(r.published_at, r.created_at, r.updated_at, '') DESC, r.release_id DESC LIMIT ",
-    );
+    query.push(" ORDER BY ");
+    query.push(SORT_EXPRESSION);
+    match direction {
+        PublicReleaseCursorDirection::Older => query.push(" DESC, r.release_id DESC LIMIT "),
+        PublicReleaseCursorDirection::Newer => query.push(" ASC, r.release_id ASC LIMIT "),
+    };
     query.push_bind(limit);
-    query
+    let mut rows = query
         .build_query_as()
         .fetch_all(&state.pool)
         .await
-        .map_err(ApiError::internal)
+        .map_err(ApiError::internal)?;
+    if direction == PublicReleaseCursorDirection::Newer {
+        if limit > 0 && rows.len() == limit as usize {
+            let extra = rows.pop();
+            rows.reverse();
+            rows.extend(extra);
+        } else {
+            rows.reverse();
+        }
+    }
+    Ok(rows)
 }
 
 async fn load_public_release_repo_visual(
@@ -9453,16 +9677,30 @@ fn public_release_row_from_parts(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn load_public_release_rows(
     state: &AppState,
     repo_full_name: &str,
     repo_id: i64,
     tag: Option<&str>,
+    release_ids: Option<&[i64]>,
+    bounds: Option<&PublicReleaseRangeBounds>,
     cursor: Option<&PublicReleaseCursor>,
+    direction: PublicReleaseCursorDirection,
     limit: i64,
     content: &str,
 ) -> Result<Vec<PublicReleaseRow>, ApiError> {
-    let base_rows = load_public_release_base_rows(state, repo_id, tag, cursor, limit).await?;
+    let base_rows = load_public_release_base_rows(
+        state,
+        repo_id,
+        tag,
+        release_ids,
+        bounds,
+        cursor,
+        direction,
+        limit,
+    )
+    .await?;
     if base_rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -9501,6 +9739,76 @@ async fn load_public_release_rows(
         .collect())
 }
 
+fn public_release_cursor_from_row(row: &PublicReleaseRow) -> PublicReleaseCursor {
+    PublicReleaseCursor {
+        sort_ts: row.sort_ts.clone(),
+        release_id: row.release_id,
+    }
+}
+
+fn public_release_position_is_in_range(
+    position: &PublicReleaseCursor,
+    bounds: &PublicReleaseRangeBounds,
+) -> bool {
+    let at_or_older_than_newer = position.sort_ts < bounds.newer.sort_ts
+        || (position.sort_ts == bounds.newer.sort_ts
+            && position.release_id <= bounds.newer.release_id);
+    let at_or_newer_than_older = position.sort_ts > bounds.older.sort_ts
+        || (position.sort_ts == bounds.older.sort_ts
+            && position.release_id >= bounds.older.release_id);
+    at_or_older_than_newer && at_or_newer_than_older
+}
+
+fn public_release_highlight_response(
+    spec: &PublicReleaseHighlightSpec,
+    resolved_ids: Vec<i64>,
+    unresolved_ids: Vec<i64>,
+) -> PublicReleaseHighlightResponse {
+    let (start_id, end_id) = match spec {
+        PublicReleaseHighlightSpec::Ids(_) => (None, None),
+        PublicReleaseHighlightSpec::Range { start_id, end_id } => {
+            (Some(start_id.to_string()), Some(end_id.to_string()))
+        }
+    };
+    PublicReleaseHighlightResponse {
+        mode: spec.mode(),
+        requested_ids: spec
+            .requested_ids()
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect(),
+        resolved_ids: resolved_ids.into_iter().map(|id| id.to_string()).collect(),
+        unresolved_ids: unresolved_ids
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect(),
+        start_id,
+        end_id,
+    }
+}
+
+fn public_release_highlighted_ids(
+    spec: &PublicReleaseHighlightSpec,
+    bounds: Option<&PublicReleaseRangeBounds>,
+    rows: &[PublicReleaseRow],
+) -> HashSet<i64> {
+    match spec {
+        PublicReleaseHighlightSpec::Ids(ids) => ids.iter().copied().collect(),
+        PublicReleaseHighlightSpec::Range { .. } => rows
+            .iter()
+            .filter(|row| {
+                bounds.is_none_or(|bounds| {
+                    public_release_position_is_in_range(
+                        &public_release_cursor_from_row(row),
+                        bounds,
+                    )
+                })
+            })
+            .map(|row| row.release_id)
+            .collect(),
+    }
+}
+
 pub async fn public_list_repo_releases(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
@@ -9519,7 +9827,8 @@ pub async fn public_list_repo_releases(
     let Some(repo_id) = usage.repo_id else {
         return Ok(public_pending_response(&usage));
     };
-    let limit = query.limit.unwrap_or(6).clamp(1, 30);
+    let highlight_spec = parse_public_release_highlight_spec(&query)?;
+    let direction = parse_public_release_cursor_direction(query.direction.as_deref())?;
     let cursor = query
         .cursor
         .as_deref()
@@ -9527,37 +9836,167 @@ pub async fn public_list_repo_releases(
         .filter(|value| !value.is_empty())
         .map(parse_public_release_cursor)
         .transpose()?;
-    let mut rows = load_public_release_rows(
-        state.as_ref(),
-        usage.full_name.as_str(),
-        repo_id,
-        None,
-        cursor.as_ref(),
-        limit.saturating_add(1),
-        query.content.as_deref().unwrap_or("all"),
-    )
-    .await?;
+    let content = query.content.as_deref().unwrap_or("all");
+    let mut range_bounds = None;
+    let mut unresolved_ids = Vec::new();
+    let mut resolved_ids = Vec::new();
+    let mut limit = query.limit.unwrap_or(6).clamp(1, 30);
+    let mut rows = match highlight_spec.as_ref() {
+        None => {
+            load_public_release_rows(
+                state.as_ref(),
+                usage.full_name.as_str(),
+                repo_id,
+                None,
+                None,
+                None,
+                cursor.as_ref(),
+                PublicReleaseCursorDirection::Older,
+                limit.saturating_add(1),
+                content,
+            )
+            .await?
+        }
+        Some(PublicReleaseHighlightSpec::Ids(ids)) => {
+            limit = ids.len() as i64;
+            let rows = load_public_release_rows(
+                state.as_ref(),
+                usage.full_name.as_str(),
+                repo_id,
+                None,
+                Some(ids.as_slice()),
+                None,
+                None,
+                PublicReleaseCursorDirection::Older,
+                limit,
+                content,
+            )
+            .await?;
+            let resolved = rows
+                .iter()
+                .map(|row| row.release_id)
+                .collect::<HashSet<_>>();
+            resolved_ids = rows.iter().map(|row| row.release_id).collect();
+            unresolved_ids = ids
+                .iter()
+                .copied()
+                .filter(|id| !resolved.contains(id))
+                .collect();
+            rows
+        }
+        Some(PublicReleaseHighlightSpec::Range { start_id, end_id }) => {
+            let boundary_ids = [*start_id, *end_id];
+            let boundary_rows = load_public_release_rows(
+                state.as_ref(),
+                usage.full_name.as_str(),
+                repo_id,
+                None,
+                Some(&boundary_ids),
+                None,
+                None,
+                PublicReleaseCursorDirection::Older,
+                2,
+                content,
+            )
+            .await?;
+            let boundary_by_id = boundary_rows
+                .iter()
+                .map(|row| (row.release_id, row))
+                .collect::<HashMap<_, _>>();
+            unresolved_ids = boundary_ids
+                .iter()
+                .copied()
+                .filter(|id| !boundary_by_id.contains_key(id))
+                .collect();
+            resolved_ids = boundary_ids
+                .iter()
+                .copied()
+                .filter(|id| boundary_by_id.contains_key(id))
+                .collect();
+
+            if unresolved_ids.is_empty() {
+                let start = public_release_cursor_from_row(boundary_by_id[start_id]);
+                let end = public_release_cursor_from_row(boundary_by_id[end_id]);
+                let (newer, older) =
+                    if compare_public_release_positions(&start, &end) == Ordering::Less {
+                        (start, end)
+                    } else {
+                        (end, start)
+                    };
+                range_bounds = Some(PublicReleaseRangeBounds { newer, older });
+                limit = query
+                    .limit
+                    .unwrap_or(PUBLIC_RELEASE_HIGHLIGHT_WINDOW_LIMIT)
+                    .clamp(1, PUBLIC_RELEASE_HIGHLIGHT_WINDOW_LIMIT);
+                load_public_release_rows(
+                    state.as_ref(),
+                    usage.full_name.as_str(),
+                    repo_id,
+                    None,
+                    None,
+                    range_bounds.as_ref(),
+                    cursor.as_ref(),
+                    direction,
+                    limit.saturating_add(1),
+                    content,
+                )
+                .await?
+            } else {
+                limit = boundary_rows.len() as i64;
+                boundary_rows
+            }
+        }
+    };
     if rows.is_empty() && public_release_usage_should_retry_without_rows(&usage) {
         return Ok(public_pending_response(&usage));
     }
-    let content = query.content.as_deref().unwrap_or("all");
-    let next_cursor = if rows.len() > limit as usize {
-        let next = rows
-            .get(limit.saturating_sub(1) as usize)
-            .map(public_release_cursor);
+
+    let has_more = rows.len() > limit as usize;
+    let mut next_cursor = None;
+    let mut previous_cursor = None;
+    if has_more {
+        match direction {
+            PublicReleaseCursorDirection::Older => {
+                next_cursor = rows
+                    .get(limit.saturating_sub(1) as usize)
+                    .map(public_release_cursor);
+            }
+            PublicReleaseCursorDirection::Newer => {
+                previous_cursor = rows.first().map(public_release_cursor);
+            }
+        }
         rows.truncate(limit as usize);
-        next
-    } else {
-        None
-    };
+    }
+    if highlight_spec.is_some() && cursor.is_some() && !rows.is_empty() {
+        match direction {
+            PublicReleaseCursorDirection::Older => {
+                previous_cursor = rows.first().map(public_release_cursor);
+            }
+            PublicReleaseCursorDirection::Newer => {
+                next_cursor = rows.last().map(public_release_cursor);
+            }
+        }
+    }
+    let highlighted_ids = highlight_spec
+        .as_ref()
+        .map(|spec| public_release_highlighted_ids(spec, range_bounds.as_ref(), &rows))
+        .unwrap_or_default();
+    let highlight = highlight_spec
+        .as_ref()
+        .map(|spec| public_release_highlight_response(spec, resolved_ids, unresolved_ids));
     Ok(Json(PublicReleaseListResponse {
         status: "ready".to_owned(),
         repo_full_name: usage.full_name,
         next_cursor,
+        previous_cursor,
         items: rows
             .into_iter()
-            .map(|row| public_list_item_from_row(row, content))
+            .map(|row| {
+                let is_highlighted = highlighted_ids.contains(&row.release_id);
+                public_list_item_from_row(row, content, is_highlighted)
+            })
             .collect(),
+        highlight,
     })
     .into_response())
 }
@@ -9586,6 +10025,9 @@ pub async fn public_get_repo_release_detail(
         repo_id,
         Some(tag.as_str()),
         None,
+        None,
+        None,
+        PublicReleaseCursorDirection::Older,
         1,
         query.content.as_deref().unwrap_or("all"),
     )
@@ -20623,6 +21065,25 @@ mod tests {
         .expect("seed shared repo release");
     }
 
+    async fn seed_repo_release_at(
+        pool: &SqlitePool,
+        repo_id: i64,
+        release_id: i64,
+        published_at: &str,
+    ) {
+        seed_repo_release(pool, repo_id, release_id).await;
+        sqlx::query(
+            "UPDATE repo_releases SET published_at = ?, created_at = ?, updated_at = ? WHERE release_id = ?",
+        )
+        .bind(published_at)
+        .bind(published_at)
+        .bind(published_at)
+        .bind(release_id)
+        .execute(pool)
+        .await
+        .expect("set shared repo release timestamp");
+    }
+
     async fn seed_public_release_usage(
         pool: &SqlitePool,
         repo_id: Option<i64>,
@@ -27174,6 +27635,10 @@ line two",
                 source: None,
                 cursor: None,
                 limit: None,
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -27209,6 +27674,10 @@ line two",
                 source: Some("page".to_owned()),
                 cursor: None,
                 limit: None,
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -27264,6 +27733,10 @@ line two",
                 source: Some("page".to_owned()),
                 cursor: None,
                 limit: None,
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -27291,6 +27764,10 @@ line two",
                 source: None,
                 cursor: None,
                 limit: None,
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -27366,6 +27843,10 @@ line two",
                 source: None,
                 cursor: None,
                 limit: None,
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -27405,6 +27886,10 @@ line two",
                 source: None,
                 cursor: None,
                 limit: None,
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -27469,6 +27954,10 @@ line two",
                 source: Some("page".to_owned()),
                 cursor: None,
                 limit: None,
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -27535,6 +28024,10 @@ line two",
                 source: Some("page".to_owned()),
                 cursor: None,
                 limit: None,
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -27648,6 +28141,10 @@ line two",
                 source: None,
                 cursor: None,
                 limit: None,
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -27713,6 +28210,10 @@ line two",
                 source: None,
                 cursor: None,
                 limit: None,
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -27835,6 +28336,10 @@ line two",
                 source: None,
                 cursor: None,
                 limit: None,
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -27924,6 +28429,10 @@ line two",
                 source: None,
                 cursor: None,
                 limit: None,
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -27950,6 +28459,10 @@ line two",
                 source: None,
                 cursor: None,
                 limit: None,
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -28013,6 +28526,10 @@ line two",
                 source: None,
                 cursor: None,
                 limit: Some(2),
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -28035,6 +28552,10 @@ line two",
                 source: None,
                 cursor: Some(cursor),
                 limit: Some(2),
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -28042,6 +28563,313 @@ line two",
         let second_body = response_json(second).await;
         assert_eq!(second_body["items"].as_array().unwrap().len(), 2);
         assert_eq!(second_body["next_cursor"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn public_release_list_highlight_ids_returns_requested_rows_and_unresolved_ids() {
+        let pool = setup_pool().await;
+        seed_public_release_usage(&pool, Some(42), "ready").await;
+        seed_repo_release_at(&pool, 42, 120, "2026-03-20T00:00:00Z").await;
+        seed_repo_release_at(&pool, 42, 122, "2026-03-18T00:00:00Z").await;
+        let state = setup_state(pool);
+
+        let response = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: None,
+                limit: None,
+                highlight_ids: Some("122,120,122,999".to_owned()),
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
+            }),
+        )
+        .await
+        .expect("highlight exact ids");
+
+        let body = response_json(response).await;
+        let item_ids = body["items"]
+            .as_array()
+            .expect("highlight items")
+            .iter()
+            .map(|item| item["release_id"].as_str().expect("release id"))
+            .collect::<Vec<_>>();
+        assert_eq!(item_ids, vec!["120", "122"]);
+        assert!(
+            body["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["is_highlighted"] == json!(true))
+        );
+        assert_eq!(body["highlight"]["mode"], json!("ids"));
+        assert_eq!(
+            body["highlight"]["requested_ids"],
+            json!(["122", "120", "999"])
+        );
+        assert_eq!(body["highlight"]["resolved_ids"], json!(["120", "122"]));
+        assert_eq!(body["highlight"]["unresolved_ids"], json!(["999"]));
+        assert_eq!(body["next_cursor"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn public_release_list_highlight_range_supports_inclusive_seek_and_both_cursor_directions()
+     {
+        let pool = setup_pool().await;
+        seed_public_release_usage(&pool, Some(42), "ready").await;
+        for index in 0..20_i64 {
+            let release_id = 120 + index;
+            let day = 20 - index;
+            let published_at = format!("2026-03-{day:02}T00:00:00Z");
+            seed_repo_release_at(&pool, 42, release_id, published_at.as_str()).await;
+        }
+        let state = setup_state(pool);
+
+        let first = public_list_repo_releases(
+            State(state.clone()),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: None,
+                limit: Some(3),
+                highlight_ids: None,
+                highlight_start: Some("120".to_owned()),
+                highlight_end: Some("139".to_owned()),
+                direction: None,
+            }),
+        )
+        .await
+        .expect("first range window");
+        let first_body = response_json(first).await;
+        let first_ids = first_body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["release_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(first_ids, vec!["120", "121", "122"]);
+        assert!(
+            first_body["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["is_highlighted"] == json!(true))
+        );
+        assert_eq!(first_body["highlight"]["mode"], json!("range"));
+        assert_eq!(
+            first_body["highlight"]["resolved_ids"],
+            json!(["120", "139"])
+        );
+        let next_cursor = first_body["next_cursor"]
+            .as_str()
+            .expect("older cursor")
+            .to_owned();
+
+        let second = public_list_repo_releases(
+            State(state.clone()),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: Some(next_cursor),
+                limit: Some(3),
+                highlight_ids: None,
+                highlight_start: Some("120".to_owned()),
+                highlight_end: Some("139".to_owned()),
+                direction: Some("older".to_owned()),
+            }),
+        )
+        .await
+        .expect("older range window");
+        let second_body = response_json(second).await;
+        let second_ids = second_body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["release_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(second_ids, vec!["123", "124", "125"]);
+        assert!(second_body["previous_cursor"].as_str().is_some());
+        assert!(
+            second_body["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["is_highlighted"] == json!(true))
+        );
+
+        let third = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: second_body["previous_cursor"].as_str().map(str::to_owned),
+                limit: Some(2),
+                highlight_ids: None,
+                highlight_start: Some("120".to_owned()),
+                highlight_end: Some("139".to_owned()),
+                direction: Some("newer".to_owned()),
+            }),
+        )
+        .await
+        .expect("newer range window");
+        let third_body = response_json(third).await;
+        let third_ids = third_body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["release_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(third_ids, vec!["121", "122"]);
+        assert!(
+            third_body["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["is_highlighted"] == json!(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn public_release_list_highlight_range_limits_large_windows_and_marks_found_boundary() {
+        let pool = setup_pool().await;
+        seed_public_release_usage(&pool, Some(42), "ready").await;
+        for index in 0..20_i64 {
+            let release_id = 120 + index;
+            let day = 20 - index;
+            let published_at = format!("2026-03-{day:02}T00:00:00Z");
+            seed_repo_release_at(&pool, 42, release_id, published_at.as_str()).await;
+        }
+        let state = setup_state(pool.clone());
+
+        let response = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: None,
+                limit: Some(30),
+                highlight_ids: None,
+                highlight_start: Some("120".to_owned()),
+                highlight_end: Some("139".to_owned()),
+                direction: None,
+            }),
+        )
+        .await
+        .expect("large range window");
+        let body = response_json(response).await;
+        assert_eq!(body["items"].as_array().unwrap().len(), 12);
+        assert!(body["next_cursor"].as_str().is_some());
+
+        let partial = public_list_repo_releases(
+            State(setup_state(pool)),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: None,
+                limit: None,
+                highlight_ids: None,
+                highlight_start: Some("120".to_owned()),
+                highlight_end: Some("999".to_owned()),
+                direction: None,
+            }),
+        )
+        .await
+        .expect("partial range window");
+        let partial_body = response_json(partial).await;
+        assert_eq!(partial_body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(partial_body["items"][0]["release_id"], json!("120"));
+        assert_eq!(partial_body["items"][0]["is_highlighted"], json!(true));
+        assert_eq!(partial_body["highlight"]["unresolved_ids"], json!(["999"]));
+    }
+
+    #[test]
+    fn public_release_highlight_query_modes_are_mutually_exclusive() {
+        let query = PublicReleaseQuery {
+            content: None,
+            lang: None,
+            source: None,
+            cursor: None,
+            limit: None,
+            highlight_ids: Some("120".to_owned()),
+            highlight_start: Some("120".to_owned()),
+            highlight_end: Some("139".to_owned()),
+            direction: None,
+        };
+
+        assert!(super::validate_public_release_query(&query).is_err());
+    }
+
+    #[tokio::test]
+    async fn public_release_highlight_seek_uses_repo_sort_index() {
+        let pool = setup_pool().await;
+        let plan_rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT r.release_id
+            FROM repo_releases r
+            WHERE r.repo_id = ?
+              AND r.is_draft = 0
+              AND (
+                COALESCE(r.published_at, r.created_at, r.updated_at) < ?
+                OR (
+                  COALESCE(r.published_at, r.created_at, r.updated_at) = ?
+                  AND r.release_id <= ?
+                )
+              )
+              AND (
+                COALESCE(r.published_at, r.created_at, r.updated_at) > ?
+                OR (
+                  COALESCE(r.published_at, r.created_at, r.updated_at) = ?
+                  AND r.release_id >= ?
+                )
+              )
+            ORDER BY COALESCE(r.published_at, r.created_at, r.updated_at) DESC,
+              r.release_id DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(42_i64)
+        .bind("2026-03-20T00:00:00Z")
+        .bind("2026-03-20T00:00:00Z")
+        .bind(120_i64)
+        .bind("2026-03-01T00:00:00Z")
+        .bind("2026-03-01T00:00:00Z")
+        .bind(139_i64)
+        .bind(13_i64)
+        .fetch_all(&pool)
+        .await
+        .expect("load public release range query plan");
+        let details = plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_repo_releases_repo_sort_ts")),
+            "expected public release range seek to use repo sort index, got: {details:#?}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+            "expected public release range seek to avoid temp sort, got: {details:#?}"
+        );
     }
 
     #[tokio::test]
@@ -28060,6 +28888,10 @@ line two",
                 source: None,
                 cursor: None,
                 limit: None,
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -28093,6 +28925,10 @@ line two",
                 source: None,
                 cursor: None,
                 limit: None,
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -28123,6 +28959,10 @@ line two",
                 source: None,
                 cursor: None,
                 limit: None,
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await
@@ -28151,6 +28991,10 @@ line two",
                 source: None,
                 cursor: None,
                 limit: None,
+                highlight_ids: None,
+                highlight_start: None,
+                highlight_end: None,
+                direction: None,
             }),
         )
         .await

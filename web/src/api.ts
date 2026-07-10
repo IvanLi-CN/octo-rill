@@ -1394,13 +1394,24 @@ export type PublicReleaseListItem = {
 	published_at: string | null;
 	is_prerelease: number;
 	is_draft: number;
+	is_highlighted?: boolean;
 	translated: ReleaseDetailTranslated | null;
 	smart: ReleaseDetailSmart | null;
+};
+export type PublicReleaseHighlight = {
+	mode: "ids" | "range";
+	requested_ids: string[];
+	resolved_ids: string[];
+	unresolved_ids: string[];
+	start_id?: string;
+	end_id?: string;
 };
 export type PublicReleaseListResponse = {
 	status: "ready";
 	repo_full_name: string;
 	next_cursor: string | null;
+	previous_cursor?: string | null;
+	highlight?: PublicReleaseHighlight;
 	items: PublicReleaseListItem[];
 };
 export type PublicReleasePendingResponse = {
@@ -1420,6 +1431,10 @@ export async function apiGetPublicRepoReleases(input: {
 	source?: "page";
 	limit?: number;
 	cursor?: string | null;
+	highlight_ids?: string[] | string;
+	highlight_start?: string;
+	highlight_end?: string;
+	direction?: "older" | "newer";
 	content?: "original" | "translated" | "polished" | "all";
 }): Promise<PublicReleaseResponse> {
 	const params = new URLSearchParams();
@@ -1428,6 +1443,21 @@ export async function apiGetPublicRepoReleases(input: {
 	if (input.source) params.set("source", input.source);
 	if (input.limit) params.set("limit", String(input.limit));
 	if (input.cursor) params.set("cursor", input.cursor);
+	if (input.highlight_ids) {
+		params.set(
+			"highlight_ids",
+			Array.isArray(input.highlight_ids)
+				? input.highlight_ids.join(",")
+				: input.highlight_ids,
+		);
+	}
+	if (input.highlight_start !== undefined) {
+		params.set("highlight_start", input.highlight_start);
+	}
+	if (input.highlight_end !== undefined) {
+		params.set("highlight_end", input.highlight_end);
+	}
+	if (input.direction) params.set("direction", input.direction);
 	const path = `/api/public/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases?${params.toString()}`;
 	const res = await fetch(resolveApiRequestPath(path), {
 		credentials: "include",
