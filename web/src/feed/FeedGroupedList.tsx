@@ -692,6 +692,11 @@ export function FeedGroupedList(
 		newContentBoundaries = [],
 		...feedCardProps
 	} = props;
+	const scopedFeed = Boolean(feedCardProps.currentScope);
+	const visibleBriefs = useMemo(
+		() => (scopedFeed ? [] : briefs),
+		[briefs, scopedFeed],
+	);
 
 	const sentinelRef = useRef<HTMLDivElement | null>(null);
 	const sentinelVisibleRef = useRef(false);
@@ -705,7 +710,7 @@ export function FeedGroupedList(
 		Map<string, HistoricalBriefErrorState>
 	>(() => toHistoricalBriefErrorMap(initialBriefErrorSummariesByDate));
 	const [loadMoreBubbleOpen, setLoadMoreBubbleOpen] = useState(false);
-	const briefGenerationEnabled = Boolean(onGenerateBriefForDate);
+	const briefGenerationEnabled = !scopedFeed && Boolean(onGenerateBriefForDate);
 	const blockingError =
 		error?.phase === "initial" && items.length === 0 ? error : null;
 	const appendError = error?.phase === "append" ? error : null;
@@ -747,7 +752,7 @@ export function FeedGroupedList(
 				dailyBoundaryLocal,
 				dailyBoundaryTimeZone,
 				dailyBoundaryUtcOffsetMinutes,
-				mode === "all" ? briefs : [],
+				mode === "all" ? visibleBriefs : [],
 				now,
 				mode === "all",
 			),
@@ -756,24 +761,24 @@ export function FeedGroupedList(
 			dailyBoundaryLocal,
 			dailyBoundaryTimeZone,
 			dailyBoundaryUtcOffsetMinutes,
-			briefs,
+			visibleBriefs,
 			now,
 			mode,
 		],
 	);
 	const briefById = useMemo(
-		() => new Map(briefs.map((brief) => [brief.id, brief])),
-		[briefs],
+		() => new Map(visibleBriefs.map((brief) => [brief.id, brief])),
+		[visibleBriefs],
 	);
 	const briefByDate = useMemo(() => {
 		const next = new Map<string, BriefLike>();
-		for (const brief of briefs) {
+		for (const brief of visibleBriefs) {
 			if (!next.has(brief.date)) {
 				next.set(brief.date, brief);
 			}
 		}
 		return next;
-	}, [briefs]);
+	}, [visibleBriefs]);
 
 	useEffect(() => {
 		setRawListGroupIds((current) => {
@@ -810,12 +815,12 @@ export function FeedGroupedList(
 		});
 		setBriefErrorsByDate((current) => {
 			const next = new Map(current);
-			for (const brief of briefs) {
+			for (const brief of visibleBriefs) {
 				next.delete(brief.date);
 			}
 			return next;
 		});
-	}, [groups]);
+	}, [groups, visibleBriefs]);
 
 	const skeletons = useMemo(() => Array.from({ length: 6 }, (_, i) => i), []);
 	const boundariesByAfterKey = useMemo(

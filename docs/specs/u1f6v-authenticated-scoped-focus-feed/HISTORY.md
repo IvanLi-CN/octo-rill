@@ -16,3 +16,8 @@
 - 将 `/focus/mine` 从“当前动态涉及的仓库摘要”修正为“当前 GitHub viewer 的个人仓库聚焦页”。
 - 冻结个人仓库清单接口语义：summary 仓库总数和右侧仓库列表来自当前 viewer owner repo baseline，不再受 feed 首屏分页影响；无 release 仓库也会出现在列表里。
 - 将账号菜单与页面标题统一为“个人仓库”，并保留 feed 只展示真实发布与 repo-bearing 动态的语义。
+
+## 2026-07-10
+
+- 将 scoped focus 的日报隔离从“禁止生成与生成状态”收紧为“全局日报数据完全不参与 scoped feed”；已有日报不得渲染、折叠或隐藏当前 scope 的原始动态。
+- 统一覆盖 `repo`、`repos`、`org`、`mine` 与 `following` scope，并保留日期分组与原始仓库信息流。

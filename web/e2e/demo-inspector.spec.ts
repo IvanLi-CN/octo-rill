@@ -414,7 +414,7 @@ test("desktop inspector floats over dashboard content instead of reserving layou
 }) => {
 	await page.setViewportSize({ width: 1366, height: 768 });
 	await page.goto(
-		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish",
+		"/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish&d_own=1",
 	);
 	await expect(
 		page.locator('[data-dashboard-brand-heading="true"]'),
@@ -430,6 +430,13 @@ test("desktop inspector floats over dashboard content instead of reserving layou
 	await expect(
 		page.locator('[data-app-meta-footer-hidden="false"]'),
 	).toBeVisible();
+	await expect(
+		page.getByRole("heading", { name: "Web Demo 作为页面验收主来源" }),
+	).toBeVisible();
+	await expect(
+		page.locator('[data-feed-item-key="release:release-public-2"]'),
+	).toHaveCount(0);
+	await expect(page.getByText("日报摘要")).toHaveCount(0);
 
 	const geometry = await page.evaluate(() => {
 		const inspector = document.querySelector<HTMLElement>(
@@ -635,8 +642,11 @@ test("restored wide desktop rail stays interactive after collapsing into a bubbl
 	await includeOwnReleasesSwitch.click();
 	await expect(page).not.toHaveURL(/d_own=1/);
 	await expect(
-		page.getByRole("heading", { name: "公开入口补齐" }).first(),
+		page.getByRole("link", { name: "Demo Scout 为 OctoRill 点了星" }),
 	).toBeVisible();
+	await expect(
+		page.getByRole("heading", { name: "Web Demo 作为页面验收主来源" }),
+	).toHaveCount(0);
 });
 
 test("demo PAT saves never echo a user-entered secret prefix", async ({
@@ -739,8 +749,11 @@ test("include my releases toggle reseeds in place without a document reload", as
 	await includeOwnReleasesSwitch.click();
 	await expect(page).not.toHaveURL(/d_own=1/);
 	await expect(
-		page.getByRole("heading", { name: "公开入口补齐" }).first(),
+		page.getByRole("link", { name: "Demo Scout 为 OctoRill 点了星" }),
 	).toBeVisible();
+	await expect(
+		page.getByRole("heading", { name: "Web Demo 作为页面验收主来源" }),
+	).toHaveCount(0);
 	await expect(includeOwnReleasesSwitch).toHaveAttribute(
 		"aria-checked",
 		"false",
