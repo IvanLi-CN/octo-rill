@@ -22,7 +22,7 @@
 - 公开列表统一使用动态高度 window virtualization。内部 gap 接近视口时按方向自动请求并逐步填满，prepend、gap 合并及内容 lane 高度变化必须保持当前阅读锚点。
 - 公开列表与公开详情默认展示润色；首屏同时携带原文回退，翻译内容在用户切换后按当前可见 Release 批量读取。
 - 公开列表页顶栏使用移动端 28px、桌面端 32px 的 OctoRill 品牌字标。页面级仓库身份使用 owner/avatar 加仓库名，并与 lane selector 置于同一弹性标题带内：宽度足够时同行，无法同时容纳时 selector 整块换至下一行。列表卡片不重复展示仓库身份、card-level lane 或 GitHub 操作，阅读模式仅由页面级 selector 控制。
-- 公开 Release 列表仅在页面具有已认证用户会话且该用户 PAT 已配置并校验有效时显示表情反应。匿名访问不得请求 PAT 状态或反应数据；缺失、失效或切换失败的 PAT 不得显示可操作的反应按钮。
+- 公开 Release 列表仅在页面具有已认证用户会话、该用户 PAT 已配置并校验有效、且反应刷新接口确认该 Release 对当前用户可操作时显示表情反应。匿名访问不得请求 PAT 状态或反应数据；缺失、失效或切换失败的 PAT，以及不在当前用户 release 可见范围内的公开记录，都不得显示可操作的反应按钮。
 - 管理后台展示公开端点登记仓库、访问统计、同步状态、共享缓存数据量，并允许删除登记记录。
 
 ### Non-goals
@@ -58,8 +58,8 @@
 
 - 已认证的公开 Release 列表可调用既有反应接口：
   - 先读取 `GET /api/reaction-token/status`，仅 `configured=true` 且 `check.state=valid` 时启用表情反应。
-  - 启用后调用 `POST /api/feed/reactions/refresh` 批量读取当前列表反应，并通过 `POST /api/release/reactions/toggle` 更新单条记录。
-  - 以上接口不属于匿名公开页面加载路径；`pat_required` 或 `pat_invalid` 必须立即隐藏反应控件。
+  - 启用后调用 `POST /api/feed/reactions/refresh` 批量读取当前列表反应，每批最多 100 个 `release_id`；只有响应中返回的 Release 才显示按钮，并通过 `POST /api/release/reactions/toggle` 更新单条记录。
+  - 以上接口不属于匿名公开页面加载路径；`pat_required`、`pat_invalid` 或 `not_found` 必须隐藏对应反应控件。
 
 - `GET /api/repos/{owner}/{repo}/public-release`
   - 登录会话 required。
@@ -178,7 +178,11 @@
 
 - Given 已登录用户且其 PAT 已配置并校验有效，访问公开 Release 列表
   When PAT 状态确认后
-  Then 当前卡片显示表情反应，批量刷新其状态，并可独立提交反应切换。
+  Then 仅对反应刷新接口确认可操作的卡片显示表情反应，批量刷新按至多 100 个 Release 分段，并可独立提交反应切换。
+
+- Given 已登录用户打开一个不在其 release 可见范围内的公开仓库链接
+  When PAT 有效但反应刷新接口不返回该 Release
+  Then 页面不得显示该记录的表情反应，避免提供会返回 `not_found` 的操作。
 
 - Given 管理员删除公开登记记录
   When 下一轮全局同步运行
