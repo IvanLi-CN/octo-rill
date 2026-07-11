@@ -480,6 +480,63 @@ test("public release reactions require an authenticated session with a usable PA
 	await expect(plusOne).toHaveAttribute("aria-pressed", "true");
 });
 
+test("public release retries a transient reaction refresh failure", async ({
+	page,
+}) => {
+	const items = [releaseItem(0)];
+	let refreshRequests = 0;
+	await installBaseApiMocks(
+		page,
+		(route) =>
+			json(route, {
+				status: "ready",
+				repo_full_name: "octo-rill/example",
+				next_cursor: null,
+				items,
+			}),
+		{ authenticated: true, reactionTokenUsable: true },
+	);
+	await page.route("**/api/feed/reactions/refresh", async (route) => {
+		refreshRequests += 1;
+		if (refreshRequests === 1) {
+			return json(route, { error: { code: "temporary" } }, 500);
+		}
+		const body = route.request().postDataJSON() as { release_ids: string[] };
+		return json(route, {
+			items: body.release_ids.map((releaseId) => ({
+				release_id: releaseId,
+				reactions: {
+					counts: {
+						plus1: 0,
+						laugh: 0,
+						heart: 0,
+						hooray: 0,
+						rocket: 0,
+						eyes: 0,
+					},
+					viewer: {
+						plus1: false,
+						laugh: false,
+						heart: false,
+						hooray: false,
+						rocket: false,
+						eyes: false,
+					},
+					status: "ready",
+				},
+			})),
+		});
+	});
+
+	await page.goto("/octo-rill/example/releases");
+	const firstRelease = page.getByTestId("public-release-item-public-release-0");
+	await expect(firstRelease).toBeVisible();
+	await expect(firstRelease.locator("[data-reaction-trigger]")).toHaveCount(6, {
+		timeout: 5_000,
+	});
+	expect(refreshRequests).toBe(2);
+});
+
 test("public release hides reactions without a usable PAT", async ({
 	page,
 }) => {
