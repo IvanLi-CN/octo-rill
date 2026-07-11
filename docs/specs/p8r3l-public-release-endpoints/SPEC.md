@@ -58,7 +58,7 @@
 
 - 已认证的公开 Release 列表可调用既有反应接口：
   - 先读取 `GET /api/reaction-token/status`，仅 `configured=true` 且 `check.state=valid` 时启用表情反应。
-  - 启用后调用 `POST /api/feed/reactions/refresh` 批量读取当前列表反应，每批最多 100 个 `release_id`；只有响应中返回的 Release 才显示按钮，并通过 `POST /api/release/reactions/toggle` 更新单条记录。
+  - 启用后调用 `POST /api/feed/reactions/refresh` 批量读取当前列表反应，每批最多 100 个 `release_id`；只有响应中返回的 Release 才显示按钮，并通过 `POST /api/release/reactions/toggle` 更新单条记录。列表分页、补 gap 或高亮窗口在请求途中改变时，已发出的有效响应仍按 `release_id` 合并，不能因列表更新而永久丢失控件。
   - 以上接口不属于匿名公开页面加载路径；`pat_required`、`pat_invalid` 或 `not_found` 必须隐藏对应反应控件。
 
 - `GET /api/repos/{owner}/{repo}/public-release`
