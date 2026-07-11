@@ -1202,6 +1202,8 @@ export function ReleaseFeedCard(props: {
 	isFresh?: boolean;
 	sourceTab?: DashboardTab | null;
 	showReactions?: boolean;
+	showRepoIdentity?: boolean;
+	showHeaderActions?: boolean;
 	surface?: "card" | "article";
 	titleHref?: string | null;
 	onSelectLane: (lane: FeedLane) => void;
@@ -1221,6 +1223,8 @@ export function ReleaseFeedCard(props: {
 		isFresh = false,
 		sourceTab = null,
 		showReactions = true,
+		showRepoIdentity = true,
+		showHeaderActions = true,
 		surface = "card",
 		titleHref = null,
 		onSelectLane,
@@ -1267,14 +1271,29 @@ export function ReleaseFeedCard(props: {
 				<div className="min-w-0 flex-1">
 					<div className="flex items-start gap-2">
 						<div className="min-w-0 flex-1">
-							<div className="flex flex-wrap items-center gap-2">
-								{repoFocusTarget ? (
-									<InternalLink
-										href={repoFocusTarget.href}
-										to={repoFocusTarget.to}
-										params={repoFocusTarget.params}
-										className="min-w-0"
-									>
+							{showRepoIdentity ? (
+								<div className="flex flex-wrap items-center gap-2">
+									{repoFocusTarget ? (
+										<InternalLink
+											href={repoFocusTarget.href}
+											to={repoFocusTarget.to}
+											params={repoFocusTarget.params}
+											className="min-w-0"
+										>
+											<RepoIdentity
+												repoFullName={item.repo_full_name}
+												repoVisual={item.repo_visual}
+												className="min-w-0 min-h-8"
+												labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
+												visualClassName="size-8"
+												labelSuffix={
+													<FeedItemTypeIcon
+														type={isAnnouncement ? "announcement" : "release"}
+													/>
+												}
+											/>
+										</InternalLink>
+									) : (
 										<RepoIdentity
 											repoFullName={item.repo_full_name}
 											repoVisual={item.repo_visual}
@@ -1287,24 +1306,16 @@ export function ReleaseFeedCard(props: {
 												/>
 											}
 										/>
-									</InternalLink>
-								) : (
-									<RepoIdentity
-										repoFullName={item.repo_full_name}
-										repoVisual={item.repo_visual}
-										className="min-w-0 min-h-8"
-										labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
-										visualClassName="size-8"
-										labelSuffix={
-											<FeedItemTypeIcon
-												type={isAnnouncement ? "announcement" : "release"}
-											/>
-										}
-									/>
-								)}
-							</div>
+									)}
+								</div>
+							) : null}
 
-							<CardTitle className="mt-2 text-balance text-[1.35rem] leading-tight sm:mt-2.5 sm:text-lg">
+							<CardTitle
+								className={cn(
+									"text-balance text-[1.35rem] leading-tight sm:text-lg",
+									showRepoIdentity && "mt-2 sm:mt-2.5",
+								)}
+							>
 								{titleHref ? (
 									<a href={titleHref} className="hover:underline">
 										{displayTitle}
@@ -1320,56 +1331,60 @@ export function ReleaseFeedCard(props: {
 							</p>
 						</div>
 
-						<div className="flex shrink-0 items-center gap-1 sm:hidden">
-							{isVersionOnly || !isArticleSurface ? null : (
-								<FeedCardLaneTabs
-									activeLane={activeLane}
-									isTranslating={isTranslating}
-									isSmartGenerating={isSmartGenerating}
-									size="compact"
-								/>
-							)}
-							<a
-								href={item.html_url ?? "#"}
-								target="_blank"
-								rel="noreferrer"
-								aria-label="GitHub"
-								title="GitHub"
-								data-feed-mobile-github-link="true"
-								className="text-muted-foreground hover:text-foreground focus-visible:ring-ring inline-flex size-8 shrink-0 items-center justify-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2"
-							>
-								<ArrowUpRight className="size-4" />
-								<span className="sr-only">GitHub</span>
-							</a>
-						</div>
+						{showHeaderActions ? (
+							<div className="flex shrink-0 items-center gap-1 sm:hidden">
+								{isVersionOnly || !isArticleSurface ? null : (
+									<FeedCardLaneTabs
+										activeLane={activeLane}
+										isTranslating={isTranslating}
+										isSmartGenerating={isSmartGenerating}
+										size="compact"
+									/>
+								)}
+								<a
+									href={item.html_url ?? "#"}
+									target="_blank"
+									rel="noreferrer"
+									aria-label="GitHub"
+									title="GitHub"
+									data-feed-mobile-github-link="true"
+									className="text-muted-foreground hover:text-foreground focus-visible:ring-ring inline-flex size-8 shrink-0 items-center justify-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2"
+								>
+									<ArrowUpRight className="size-4" />
+									<span className="sr-only">GitHub</span>
+								</a>
+							</div>
+						) : null}
 					</div>
 				</div>
 
-				<div className="hidden flex-wrap items-center gap-2 sm:flex sm:justify-end">
-					{isVersionOnly ? null : (
-						<FeedCardLaneTabs
-							activeLane={activeLane}
-							isTranslating={isTranslating}
-							isSmartGenerating={isSmartGenerating}
-							size={isArticleSurface ? "compact" : "default"}
-						/>
-					)}
-
-					<Button
-						asChild
-						variant="outline"
-						size="sm"
-						className={cn(
-							RELEASE_TOOL_BUTTON_CLASS,
-							"shrink-0 rounded-full px-3.5 font-mono text-xs",
+				{showHeaderActions ? (
+					<div className="hidden flex-wrap items-center gap-2 sm:flex sm:justify-end">
+						{isVersionOnly ? null : (
+							<FeedCardLaneTabs
+								activeLane={activeLane}
+								isTranslating={isTranslating}
+								isSmartGenerating={isSmartGenerating}
+								size={isArticleSurface ? "compact" : "default"}
+							/>
 						)}
-					>
-						<a href={item.html_url ?? "#"} target="_blank" rel="noreferrer">
-							<ArrowUpRight className="size-4" />
-							GitHub
-						</a>
-					</Button>
-				</div>
+
+						<Button
+							asChild
+							variant="outline"
+							size="sm"
+							className={cn(
+								RELEASE_TOOL_BUTTON_CLASS,
+								"shrink-0 rounded-full px-3.5 font-mono text-xs",
+							)}
+						>
+							<a href={item.html_url ?? "#"} target="_blank" rel="noreferrer">
+								<ArrowUpRight className="size-4" />
+								GitHub
+							</a>
+						</Button>
+					</div>
+				) : null}
 			</div>
 		</CardHeader>
 	);

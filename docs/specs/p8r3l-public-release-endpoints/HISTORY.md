@@ -10,3 +10,9 @@
 - 2026-07-09: 匿名 public proof 从“只认 recent public starred metadata”扩到“信任 fresh 的 `starred_repos ∪ owned_repo_star_baselines` privacy metadata”；public owned repo 若已有共享 `repo_releases` 缓存，首访可直接 `ready`，但 stale / unknown / fresh private metadata 仍保持 `metadata_pending`。
 - 2026-07-10: 公开 Release 列表新增 `release_id` 高亮深链。后端直接解析离散 ID 或倒序闭区间，复用唯一 Release 查询与排序索引返回最多 12 条聚焦窗口、双向 opaque cursor、解析/未解析元数据和项目高亮标记；前端新增自动视口定位、older 追加、newer 前置与滚动锚点补偿，旧 `/public/.../releases` 跳转保留 query。
 - 2026-07-10: 高亮深链合同扩展为 typed tag/ID selector、20 个离散目标、30 条分段推荐窗口、内部 gap 自动填充、`highlight_active` 导航与动态高度虚拟列表；公开列表和详情默认切换到润色并携带原文回退。
+- 2026-07-11: 公开列表页头将页面级 lane selector 提升到仓库标题带；桌面端保持标题与 selector 同行，窄屏整块换行，顶栏字标调整为桌面 32px、移动端 28px。
+- 2026-07-11: 公开列表仓库身份进一步收敛到页面标题带，使用 owner/avatar 加仓库名；列表卡片移除重复身份、card-level lane 与 GitHub 操作。
+- 2026-07-11: 公开列表表情反应改为依赖认证会话与有效 PAT；匿名不读取 PAT 或反应数据，无效/失效 PAT 不展示控件。刷新按最多 100 条分批，且只有当前用户可操作的 Release 显示控件，避免公开链接上的无效反应操作。
+- 2026-07-11: 修复反应刷新与列表窗口更新的竞态；已发出的有效刷新响应继续按 `release_id` 合并，防止分页、gap 或高亮加载期间的控件被永久隐藏。
+- 2026-07-11: 反应批次刷新改为独立收敛：成功批次立即合并，非 PAT 瞬态失败仅重试其所属 Release 至多三次，避免多批次请求互相吞掉结果。
+- 2026-07-11: 反应刷新和切换响应绑定认证会话 generation；用户切换后在途旧响应不能覆盖新会话的可见性或 viewer 状态。

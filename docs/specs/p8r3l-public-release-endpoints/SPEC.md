@@ -21,6 +21,8 @@
 - `highlight_active` 表示当前导航目标。页面默认聚焦时间线上较新的目标，通过 replace 更新 active URL；显式导航后刷新或详情返回仍定位同一目标。
 - 公开列表统一使用动态高度 window virtualization。内部 gap 接近视口时按方向自动请求并逐步填满，prepend、gap 合并及内容 lane 高度变化必须保持当前阅读锚点。
 - 公开列表与公开详情默认展示润色；首屏同时携带原文回退，翻译内容在用户切换后按当前可见 Release 批量读取。
+- 公开列表页顶栏使用移动端 28px、桌面端 32px 的 OctoRill 品牌字标。页面级仓库身份使用 owner/avatar 加仓库名，并与 lane selector 置于同一弹性标题带内：宽度足够时同行，无法同时容纳时 selector 整块换至下一行。列表卡片不重复展示仓库身份、card-level lane 或 GitHub 操作，阅读模式仅由页面级 selector 控制。
+- 公开 Release 列表仅在页面具有已认证用户会话、该用户 PAT 已配置并校验有效、且反应刷新接口确认该 Release 对当前用户可操作时显示表情反应。匿名访问不得请求 PAT 状态或反应数据；缺失、失效或切换失败的 PAT，以及不在当前用户 release 可见范围内的公开记录，都不得显示可操作的反应按钮。
 - 管理后台展示公开端点登记仓库、访问统计、同步状态、共享缓存数据量，并允许删除登记记录。
 
 ### Non-goals
@@ -53,6 +55,11 @@
 - `GET /api/public/repos/{owner}/{repo}/releases/content`
   - Query: `release_ids=<comma-separated ids>`，最多 30 个；`content=translated|polished`，`lang=zh-CN`。
   - 只读取当前公开访问上下文中的本地共享缓存，用于虚拟视口 lane hydration；不得触发 GitHub 或 LLM 请求。
+
+- 已认证的公开 Release 列表可调用既有反应接口：
+  - 先读取 `GET /api/reaction-token/status`，仅 `configured=true` 且 `check.state=valid` 时启用表情反应。
+  - 启用后调用 `POST /api/feed/reactions/refresh` 批量读取当前列表反应，每批最多 100 个 `release_id`；只有响应中返回的 Release 才显示按钮，并通过 `POST /api/release/reactions/toggle` 更新单条记录。列表分页、补 gap 或高亮窗口在请求途中改变时，已发出的有效响应仍按 `release_id` 合并，不能因列表更新而永久丢失控件；非 PAT 的瞬态批次失败独立重试至多三次，且不丢弃同轮已成功的批次。请求必须绑定当前认证会话，用户切换后不得合并旧会话的刷新或切换响应。
+  - 以上接口不属于匿名公开页面加载路径；`pat_required`、`pat_invalid` 或 `not_found` 必须隐藏对应反应控件。
 
 - `GET /api/repos/{owner}/{repo}/public-release`
   - 登录会话 required。
@@ -149,6 +156,34 @@
   When 数据与测量结果合并
   Then 高亮上下文不丢失，当前锚点无明显跳动，虚拟 DOM 只保留视口与 overscan 行，移动端没有横向溢出。
 
+- Given 公开 Release 列表已加载
+  When 宽度足以容纳仓库标题与页面级 lane selector
+  Then 标题带展示 owner/avatar 与仓库名，两者和 selector 位于同一行，桌面端顶栏 OctoRill 字标高度为 32px。
+
+- Given 公开 Release 列表在 390px 移动视口渲染
+  When 标题与 selector 无法同时容纳
+  Then selector 整块显示在标题下方，字标高度为 28px，页面没有横向溢出。
+
+- Given 公开 Release 列表已加载多条记录
+  When 用户阅读页面级标题带与任一 Release 卡片
+  Then 仓库身份、lane selector 与 GitHub 外链只在标题带或顶栏出现；卡片仅呈现 Release 标题、时间与对应内容。
+
+- Given 用户在公开 Release 列表切换页面级 lane
+  When 列表卡片在虚拟视口内重渲染
+  Then 所有卡片同步使用该 lane，卡片自身不提供局部 lane 覆盖。
+
+- Given 未登录用户，或已登录但未配置/未通过校验的 PAT，访问公开 Release 列表
+  When 列表渲染完成
+  Then 页面不显示表情反应；未登录路径不得请求 PAT 状态或反应刷新接口。
+
+- Given 已登录用户且其 PAT 已配置并校验有效，访问公开 Release 列表
+  When PAT 状态确认后
+  Then 仅对反应刷新接口确认可操作的卡片显示表情反应，批量刷新按至多 100 个 Release 分段，并可独立提交反应切换。
+
+- Given 已登录用户打开一个不在其 release 可见范围内的公开仓库链接
+  When PAT 有效但反应刷新接口不返回该 Release
+  Then 页面不得显示该记录的表情反应，避免提供会返回 `not_found` 的操作。
+
 - Given 管理员删除公开登记记录
   When 下一轮全局同步运行
   Then 该仓库不再因公开 usage 被纳入同步；若无其他公开登记或登录用户视图使用，则共享 Release 与 AI 缓存被清理，否则缓存保留。
@@ -156,6 +191,62 @@
 ## Visual Evidence
 
 本功能的视觉证据只覆盖用户和管理员能看见的界面状态：首次访问等待、公开列表桌面端、公开列表移动端、公开详情移动端极端文本、管理后台登记与删除确认。REST API 的状态码、`Retry-After`、缓存复用和清理策略由自动化测试覆盖，不纳入截图证据。
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `1440x1000`
+  captured_viewport: `1440x1000`
+  viewport_strategy: `browser-viewport-override`
+  sensitive_exclusion: `N/A`
+  submission_gate: `pending-owner-approval`
+  story_id_or_title: `public-release-highlight-discrete`
+  state: `public-release-header-layout-desktop`
+  evidence_note: 验证 32px 顶栏 OctoRill 字标与右侧 GitHub 按钮保持平衡，owner/avatar 加仓库名和页面级原文/翻译/润色 selector 在同一标题行；列表卡片不重复展示仓库身份、lane 或 GitHub 操作。
+  image:
+  ![公开 Release 标题带桌面布局](./assets/public-release-header-layout-desktop.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `390x844`
+  captured_viewport: `390x844`
+  viewport_strategy: `browser-viewport-override`
+  sensitive_exclusion: `N/A`
+  submission_gate: `pending-owner-approval`
+  story_id_or_title: `public-release-highlight-range`
+  state: `public-release-header-layout-mobile`
+  evidence_note: 验证 28px 顶栏字标、owner/avatar 加仓库名和标题下方整块换行的页面级 lane selector 与内容简化后的 Release 卡片能在移动端共存，且无横向溢出。
+  image:
+  ![公开 Release 标题带移动布局](./assets/public-release-header-layout-mobile.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `1440x1000`
+  captured_viewport: `1440x1000`
+  viewport_strategy: `browser-viewport-override`
+  sensitive_exclusion: `N/A`
+  submission_gate: `pending-owner-approval`
+  story_id_or_title: `public-release-highlight-discrete` with `d_persona=member`
+  state: `public-release-reactions-enabled-desktop`
+  evidence_note: 验证已认证且 PAT 有效的 member 场景会在每张 Release 卡片底部显示 6 个表情反应；标题带仍保持唯一仓库身份和页面级 lane，桌面端无横向溢出。
+  image:
+  ![公开 Release 有效 PAT 表情反应桌面状态](./assets/public-release-reactions-member-desktop.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `390x844`
+  captured_viewport: `390x844`
+  viewport_strategy: `browser-viewport-override`
+  sensitive_exclusion: `N/A`
+  submission_gate: `pending-owner-approval`
+  story_id_or_title: `public-release-highlight-discrete` with `d_persona=member`
+  state: `public-release-reactions-enabled-mobile`
+  evidence_note: 验证 member 有效 PAT 场景在移动端持续显示反应，28px 字标、标题下方页面级 lane 与卡片内容无横向溢出。
+  image:
+  ![公开 Release 有效 PAT 表情反应移动状态](./assets/public-release-reactions-member-mobile.png)
 
 - source_type: `storybook_canvas`
   target_program: `mock-only`
@@ -229,21 +320,21 @@
 - source_type: `storybook_canvas`
   story_id_or_title: `public-publicreleasepage--release-list`
   state: `public-release-list-desktop`
-  evidence_note: 验证桌面端公开列表页展示仓库名、页面级原文/翻译/润色切换器和复用普通 Release 卡片的列表内容；卡片保留 repo identity、标题、发布时间/tag、卡片内部内容 lane 与 GitHub Release 链接，不显示不可靠 release 总数或解释性噪音。
+  evidence_note: 验证桌面端公开列表页在标题带展示 owner/avatar、仓库名和页面级原文/翻译/润色切换器；卡片仅保留版本标题、发布时间/tag 与内容，不重复显示 repo identity、card-level lane 或 GitHub 操作。
   image:
   ![公开 Release 列表页桌面端](./assets/public-release-evidence-list-desktop-v8.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `public-publicreleasepage--release-list`
   state: `public-release-list-mobile`
-  evidence_note: 验证 390px 移动端公开列表页中页面级 lane 切换器、普通 Release 卡片、移动端 GitHub icon 链接、正文展示和长内容继续滚动能在窄屏共存，且无横向溢出。
+  evidence_note: 验证 390px 移动端公开列表页中页面级 lane 切换器、内容简化后的 Release 卡片、正文展示和长内容继续滚动能在窄屏共存，且无横向溢出。
   image:
   ![公开 Release 列表页移动端](./assets/public-release-evidence-list-mobile-v8.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `public-publicreleasepage--long-repo-and-tag-detail`
   state: `public-release-detail-mobile-edge`
-  evidence_note: 验证 390px 移动端公开详情页的最终布局：页头 LOGO 高度为 24px，右上角 GitHub 按钮使用外链图标打开仓库 Releases 页面；正文区把头像、项目名、时间/tag 作为仓库信息组，超长 repo full name 与超长 tag 单行省略，仓库名与日期行无额外垂直空隙；右侧小尺寸原文/翻译/润色选择器固定尺寸且右端对齐，短内容时页脚贴底并保留指向仓库根路径的 GitHub 入口，全页无横向溢出。
+  evidence_note: 验证 390px 移动端公开详情页的最终布局：页头 LOGO 高度为 28px，右上角 GitHub 按钮使用外链图标打开仓库 Releases 页面；正文区把头像、项目名、时间/tag 作为仓库信息组，超长 repo full name 与超长 tag 单行省略，仓库名与日期行无额外垂直空隙；右侧小尺寸原文/翻译/润色选择器固定尺寸且右端对齐，短内容时页脚贴底并保留指向仓库根路径的 GitHub 入口，全页无横向溢出。
   image:
   ![公开 Release 详情页移动端极端文本](./assets/public-release-evidence-detail-mobile-edge-v8.png)
 
