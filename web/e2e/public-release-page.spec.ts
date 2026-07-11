@@ -379,9 +379,10 @@ test("public release header keeps the title and global lane selector responsive"
 test("public release reactions require an authenticated session with a usable PAT", async ({
 	page,
 }) => {
-	const items = Array.from({ length: 2 }, (_, index) => releaseItem(index));
+	const items = Array.from({ length: 101 }, (_, index) => releaseItem(index));
 	let reactionTokenStatusRequests = 0;
 	let toggledReactionRequests = 0;
+	const reactionRefreshBatchSizes: number[] = [];
 	await installBaseApiMocks(
 		page,
 		(route) =>
@@ -404,6 +405,34 @@ test("public release reactions require an authenticated session with a usable PA
 				checked_at: "2026-07-11T00:00:00Z",
 			},
 			owner: null,
+		});
+	});
+	await page.route("**/api/feed/reactions/refresh", async (route) => {
+		const body = route.request().postDataJSON() as { release_ids: string[] };
+		reactionRefreshBatchSizes.push(body.release_ids.length);
+		return json(route, {
+			items: body.release_ids.map((releaseId) => ({
+				release_id: releaseId,
+				reactions: {
+					counts: {
+						plus1: 0,
+						laugh: 0,
+						heart: 0,
+						hooray: 0,
+						rocket: 0,
+						eyes: 0,
+					},
+					viewer: {
+						plus1: false,
+						laugh: false,
+						heart: false,
+						hooray: false,
+						rocket: false,
+						eyes: false,
+					},
+					status: "ready",
+				},
+			})),
 		});
 	});
 	await page.route("**/api/release/reactions/toggle", async (route) => {
@@ -440,6 +469,10 @@ test("public release reactions require an authenticated session with a usable PA
 	const firstRelease = page.getByTestId("public-release-item-public-release-0");
 	await expect(firstRelease).toBeVisible();
 	await expect.poll(() => reactionTokenStatusRequests).toBe(1);
+	await expect
+		.poll(() => reactionRefreshBatchSizes.reduce((sum, size) => sum + size, 0))
+		.toBe(101);
+	expect(reactionRefreshBatchSizes).toEqual([100, 1]);
 	await expect(firstRelease.locator("[data-reaction-trigger]")).toHaveCount(6);
 	const plusOne = firstRelease.locator("[data-reaction-trigger='plus1']");
 	await plusOne.click();
@@ -461,6 +494,28 @@ test("public release hides reactions without a usable PAT", async ({
 				items,
 			}),
 		{ authenticated: true, reactionTokenUsable: false },
+	);
+
+	await page.goto("/octo-rill/example/releases");
+	const firstRelease = page.getByTestId("public-release-item-public-release-0");
+	await expect(firstRelease).toBeVisible();
+	await expect(firstRelease.locator("[data-reaction-trigger]")).toHaveCount(0);
+});
+
+test("public release hides reactions outside the viewer's feed visibility", async ({
+	page,
+}) => {
+	const items = Array.from({ length: 2 }, (_, index) => releaseItem(index));
+	await installBaseApiMocks(
+		page,
+		(route) =>
+			json(route, {
+				status: "ready",
+				repo_full_name: "octo-rill/example",
+				next_cursor: null,
+				items,
+			}),
+		{ authenticated: true, reactionTokenUsable: true },
 	);
 
 	await page.goto("/octo-rill/example/releases");

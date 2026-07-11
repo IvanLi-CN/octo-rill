@@ -29,7 +29,7 @@
 - 高亮列表复用 `repo_releases` 唯一 ID 与仓库排序索引，响应增加连续 segments、内部 gaps、精确命中进度和双向 bounded cursor。
 - 页面统一使用动态高度 window virtualization，内部 gap 接近视口后自动填充；右下浮动导航按页面时间顺序切换 active 目标并保持详情往返上下文。
 - 公开列表页将页面级 lane 状态提升到 owner/avatar 加仓库名的标题带：宽度足够时同行，窄屏时 selector 整块换行；列表卡片不再重复仓库身份、lane 或 GitHub 操作，翻译 hydration 继续由页面级 lane 驱动。
-- 公开列表复用现有 `AuthBootstrap` 和 reaction token 查询键：匿名会话不发起 PAT 状态查询；只有认证会话的 PAT 为 `configured + valid` 才刷新并显示反应。`pat_required` / `pat_invalid` 反应请求会即时撤下控件，避免提供无法提交的操作。
+- 公开列表复用现有 `AuthBootstrap` 和 reaction token 查询键：匿名会话不发起 PAT 状态查询；认证会话的 PAT 为 `configured + valid` 后，按最多 100 条一批刷新反应，且只有接口确认可操作的 Release 显示控件。`pat_required` / `pat_invalid` / `not_found` 会即时撤下相关控件，避免提供无法提交的操作。
 
 ## Verification
 
@@ -43,7 +43,7 @@
 - `cd web && bun run build`
 - `cd web && bun run build:demo`
 - `cd web && bun x playwright test e2e/public-release-page.spec.ts --project=chromium` (`12 passed`)
-- `cd web && PLAYWRIGHT_WEB_PORT=55177 bun x playwright test e2e/public-release-page.spec.ts --project=chromium` (`14 passed`，覆盖匿名无 PAT 请求、有效 PAT 显示及提交表情反应、无效 PAT 隐藏)
+- `cd web && PLAYWRIGHT_WEB_PORT=55177 bun x playwright test e2e/public-release-page.spec.ts --project=chromium` (`15 passed`，覆盖匿名无 PAT 请求、有效 PAT 的 100 条分批刷新与提交表情反应、无效 PAT 或无 feed 可见性时隐藏)
 - Chrome mock-only `ui_demo`: `public-release-highlight-discrete` with `d_persona=member` at `1440x1000` and `390x844`; 有效 PAT 在每张可见 Release 卡片呈现 6 个表情反应，两个视口均无横向溢出。
 - Chrome mock-only `ui_demo`: `public-release-highlight-discrete` at `1440x1000` and `390x844`; title band has the sole owner/avatar repository identity and lane selector, while cards have no repo identity, lane, or GitHub controls.
 - `codex review --base origin/main`: 五轮审查已逐项修复 legacy redirect 重复参数、居中窗口顺序、详情翻译、范围绝对序号、hydration 字段覆盖与双向 cursor 边界问题。

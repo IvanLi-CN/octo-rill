@@ -77,30 +77,12 @@ const ReleaseFeedCard = lazy(async () => {
 const PUBLIC_RELEASE_LIST_BODY_MAX_CHARS = 2800;
 const PUBLIC_RELEASE_PAGE_SIZE = 6;
 const PUBLIC_RELEASE_HIGHLIGHT_PAGE_SIZE = 30;
-
-const EMPTY_RELEASE_REACTIONS: ReleaseReactions = {
-	counts: {
-		plus1: 0,
-		laugh: 0,
-		heart: 0,
-		hooray: 0,
-		rocket: 0,
-		eyes: 0,
-	},
-	viewer: {
-		plus1: false,
-		laugh: false,
-		heart: false,
-		hooray: false,
-		rocket: false,
-		eyes: false,
-	},
-	status: "ready",
-};
+const PUBLIC_RELEASE_REACTION_BATCH_SIZE = 100;
 
 type PublicReleaseReactionControls = {
 	enabled: boolean;
 	byReleaseId: Record<string, ReleaseReactions>;
+	availableReleaseIds: Set<string>;
 	busyReleaseIds: Set<string>;
 	errorByReleaseId: Record<string, string>;
 	onToggle: (releaseId: string, content: ReactionContent) => void;
@@ -143,6 +125,9 @@ function usePublicReleaseReactionControls(
 	const [byReleaseId, setByReleaseId] = useState<
 		Record<string, ReleaseReactions>
 	>({});
+	const [availableReleaseIds, setAvailableReleaseIds] = useState<Set<string>>(
+		() => new Set(),
+	);
 	const [busyReleaseIds, setBusyReleaseIds] = useState<Set<string>>(
 		() => new Set(),
 	);
@@ -156,6 +141,7 @@ function usePublicReleaseReactionControls(
 				.join("|"),
 		[items],
 	);
+	const requestedReleaseIdsRef = useRef(new Set<string>());
 	const enabled =
 		auth.isAuthenticated &&
 		!reactionAccessBlocked &&
@@ -171,29 +157,61 @@ function usePublicReleaseReactionControls(
 	useEffect(() => {
 		setReactionAccessBlocked(false);
 		setByReleaseId({});
+		setAvailableReleaseIds(new Set());
 		setBusyReleaseIds(new Set());
 		setErrorByReleaseId({});
+		requestedReleaseIdsRef.current = new Set();
 	}, [userId]);
 
 	useEffect(() => {
 		if (!enabled || !releaseIdSignature) return;
 		let cancelled = false;
-		const releaseIds = releaseIdSignature.split("|");
+		const releaseIds = releaseIdSignature
+			.split("|")
+			.filter((releaseId) => !requestedReleaseIdsRef.current.has(releaseId));
+		if (releaseIds.length === 0) return;
+		for (const releaseId of releaseIds) {
+			requestedReleaseIdsRef.current.add(releaseId);
+		}
+		const batches = Array.from(
+			{
+				length: Math.ceil(
+					releaseIds.length / PUBLIC_RELEASE_REACTION_BATCH_SIZE,
+				),
+			},
+			(_, index) =>
+				releaseIds.slice(
+					index * PUBLIC_RELEASE_REACTION_BATCH_SIZE,
+					(index + 1) * PUBLIC_RELEASE_REACTION_BATCH_SIZE,
+				),
+		);
 
-		void apiPostJson<FeedReactionRefreshResponse>(
-			"/api/feed/reactions/refresh",
-			{ release_ids: releaseIds },
+		void Promise.all(
+			batches.map((batch) =>
+				apiPostJson<FeedReactionRefreshResponse>(
+					"/api/feed/reactions/refresh",
+					{ release_ids: batch },
+				),
+			),
 		)
-			.then((response) => {
+			.then((responses) => {
 				if (cancelled) return;
+				const refreshed = responses.flatMap((response) => response.items);
 				setByReleaseId((current) => ({
 					...current,
 					...Object.fromEntries(
-						response.items.map((item) => [item.release_id, item.reactions]),
+						refreshed.map((item) => [item.release_id, item.reactions]),
 					),
 				}));
+				setAvailableReleaseIds(
+					(current) =>
+						new Set([...current, ...refreshed.map((item) => item.release_id)]),
+				);
 			})
 			.catch((error) => {
+				for (const releaseId of releaseIds) {
+					requestedReleaseIdsRef.current.delete(releaseId);
+				}
 				if (
 					error instanceof ApiError &&
 					(error.code === "pat_invalid" || error.code === "pat_required")
@@ -236,6 +254,14 @@ function usePublicReleaseReactionControls(
 						setReactionAccessBlocked(true);
 						return;
 					}
+					if (error instanceof ApiError && error.code === "not_found") {
+						setAvailableReleaseIds((current) => {
+							const next = new Set(current);
+							next.delete(releaseId);
+							return next;
+						});
+						return;
+					}
 					setErrorByReleaseId((current) => ({
 						...current,
 						[releaseId]:
@@ -256,6 +282,7 @@ function usePublicReleaseReactionControls(
 	return {
 		enabled,
 		byReleaseId,
+		availableReleaseIds,
 		busyReleaseIds,
 		errorByReleaseId,
 		onToggle,
@@ -1394,9 +1421,11 @@ function ReleaseVirtualRow(props: {
 	detailHref: string;
 	reactionControls: PublicReleaseReactionControls;
 }) {
-	const reactions = props.reactionControls.enabled
-		? (props.reactionControls.byReleaseId[props.item.release_id] ??
-			EMPTY_RELEASE_REACTIONS)
+	const showReactions =
+		props.reactionControls.enabled &&
+		props.reactionControls.availableReleaseIds.has(props.item.release_id);
+	const reactions = showReactions
+		? (props.reactionControls.byReleaseId[props.item.release_id] ?? null)
 		: null;
 	const feedItem = publicReleaseToFeedItem(props.item, reactions);
 	return (
@@ -1430,7 +1459,7 @@ function ReleaseVirtualRow(props: {
 						props.reactionControls.errorByReleaseId[props.item.release_id] ??
 						null
 					}
-					showReactions={props.reactionControls.enabled}
+					showReactions={showReactions}
 					showRepoIdentity={false}
 					showHeaderActions={false}
 					titleHref={props.detailHref}
