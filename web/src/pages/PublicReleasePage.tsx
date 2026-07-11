@@ -165,7 +165,6 @@ function usePublicReleaseReactionControls(
 
 	useEffect(() => {
 		if (!enabled || !releaseIdSignature) return;
-		let cancelled = false;
 		const releaseIds = releaseIdSignature
 			.split("|")
 			.filter((releaseId) => !requestedReleaseIdsRef.current.has(releaseId));
@@ -195,7 +194,6 @@ function usePublicReleaseReactionControls(
 			),
 		)
 			.then((responses) => {
-				if (cancelled) return;
 				const refreshed = responses.flatMap((response) => response.items);
 				setByReleaseId((current) => ({
 					...current,
@@ -219,10 +217,6 @@ function usePublicReleaseReactionControls(
 					setReactionAccessBlocked(true);
 				}
 			});
-
-		return () => {
-			cancelled = true;
-		};
 	}, [enabled, releaseIdSignature]);
 
 	const onToggle = useCallback(
