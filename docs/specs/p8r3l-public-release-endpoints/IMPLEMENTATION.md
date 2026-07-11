@@ -1,6 +1,6 @@
 # 实现状态
 
-- Summary: fast-track / typed tag/ID selector、后端推荐窗口、双向虚拟列表与润色默认阅读路径已在 PR #213 收敛到 Step 5C Ready。
+- Summary: fast-track / typed tag/ID selector、后端推荐窗口、双向虚拟列表、润色默认阅读路径、公开列表页头响应式布局与会话/PAT 条件化表情反应已交付。
 
 ## Milestones
 
@@ -12,6 +12,8 @@
 - [x] M6: 完成 PR 收敛。
 - [x] M7: 公开页面页脚版本号链接与移动端视觉证据完成。
 - [x] M8: 完成 typed 高亮 URL、服务端分段/gap 窗口、双向虚拟列表、浮动导航与前后端回归覆盖。
+- [x] M9: 公开列表页头字标、owner/avatar 仓库身份与页面级 lane 响应式布局完成；列表卡片去除重复身份和操作，并补齐桌面与移动端 mock-only 视觉证据。
+- [x] M10: 公开列表表情反应仅在已登录且 PAT 有效时启用；匿名不请求反应凭据或数据，并补齐反应切换回归与 member mock-only 视觉证据。
 
 ## Current Notes
 
@@ -26,6 +28,8 @@
 - 高亮 URL 使用重复 typed `highlight` 或 typed `highlight_start` / `highlight_end`，并以 `highlight_active` 保存当前导航目标；离散目标上限 20，首屏完整数据预算 30。
 - 高亮列表复用 `repo_releases` 唯一 ID 与仓库排序索引，响应增加连续 segments、内部 gaps、精确命中进度和双向 bounded cursor。
 - 页面统一使用动态高度 window virtualization，内部 gap 接近视口后自动填充；右下浮动导航按页面时间顺序切换 active 目标并保持详情往返上下文。
+- 公开列表页将页面级 lane 状态提升到 owner/avatar 加仓库名的标题带：宽度足够时同行，窄屏时 selector 整块换行；列表卡片不再重复仓库身份、lane 或 GitHub 操作，翻译 hydration 继续由页面级 lane 驱动。
+- 公开列表复用现有 `AuthBootstrap` 和 reaction token 查询键：匿名会话不发起 PAT 状态查询；只有认证会话的 PAT 为 `configured + valid` 才刷新并显示反应。`pat_required` / `pat_invalid` 反应请求会即时撤下控件，避免提供无法提交的操作。
 
 ## Verification
 
@@ -35,5 +39,12 @@
 - `cd web && bun run build:demo`
 - `cd web && bun run storybook:build`
 - `cd web && PLAYWRIGHT_WEB_PORT=15300 bunx playwright test e2e/public-release-page.spec.ts --project=chromium` (`10 passed`)
+- `cd web && bun run lint`
+- `cd web && bun run build`
+- `cd web && bun run build:demo`
+- `cd web && bun x playwright test e2e/public-release-page.spec.ts --project=chromium` (`12 passed`)
+- `cd web && PLAYWRIGHT_WEB_PORT=55177 bun x playwright test e2e/public-release-page.spec.ts --project=chromium` (`14 passed`，覆盖匿名无 PAT 请求、有效 PAT 显示及提交表情反应、无效 PAT 隐藏)
+- Chrome mock-only `ui_demo`: `public-release-highlight-discrete` with `d_persona=member` at `1440x1000` and `390x844`; 有效 PAT 在每张可见 Release 卡片呈现 6 个表情反应，两个视口均无横向溢出。
+- Chrome mock-only `ui_demo`: `public-release-highlight-discrete` at `1440x1000` and `390x844`; title band has the sole owner/avatar repository identity and lane selector, while cards have no repo identity, lane, or GitHub controls.
 - `codex review --base origin/main`: 五轮审查已逐项修复 legacy redirect 重复参数、居中窗口顺序、详情翻译、范围绝对序号、hydration 字段覆盖与双向 cursor 边界问题。
 - Chrome mock-only `ui_demo`: `public-release-highlight-discrete` at `1440x1000`; `public-release-highlight-range` at requested `390x844`.

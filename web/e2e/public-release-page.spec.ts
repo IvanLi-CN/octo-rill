@@ -59,7 +59,7 @@ function releaseItem(index: number, overrides: Record<string, unknown> = {}) {
 async function installBaseApiMocks(
 	page: Page,
 	publicHandler: (route: Route, url: URL) => Promise<void> | void,
-	options: { authenticated?: boolean } = {},
+	options: { authenticated?: boolean; reactionTokenUsable?: boolean } = {},
 ) {
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
@@ -90,6 +90,27 @@ async function installBaseApiMocks(
 				{ error: { code: "unauthorized", message: "unauthorized" } },
 				401,
 			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: options.reactionTokenUsable === true,
+				masked_token:
+					options.reactionTokenUsable === true ? "ghp_****_test" : null,
+				check: {
+					state: options.reactionTokenUsable === true ? "valid" : "idle",
+					message: null,
+					checked_at:
+						options.reactionTokenUsable === true
+							? "2026-07-11T00:00:00Z"
+							: null,
+				},
+				owner: null,
+			});
+		}
+
+		if (req.method() === "POST" && pathname === "/api/feed/reactions/refresh") {
+			return json(route, { items: [] });
 		}
 
 		if (req.method() === "GET" && pathname === "/api/health") {
@@ -274,6 +295,180 @@ test("public release list requests six cached releases before loading more", asy
 	await expectPublicChrome(page, "octo-rill", "example");
 });
 
+test("public release header keeps the title and global lane selector responsive", async ({
+	page,
+}) => {
+	const items = Array.from({ length: 2 }, (_, index) => releaseItem(index));
+	let reactionTokenStatusRequests = 0;
+	await installBaseApiMocks(page, (route) =>
+		json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items,
+		}),
+	);
+	await page.route("**/api/reaction-token/status", async (route) => {
+		reactionTokenStatusRequests += 1;
+		return json(route, { error: { code: "unexpected" } }, 500);
+	});
+
+	await page.setViewportSize({ width: 1440, height: 1000 });
+	await page.goto("/octo-rill/example/releases");
+
+	const wordmark = page.getByRole("img", { name: "OctoRill" });
+	const title = page.getByRole("heading", { name: "octo-rill/example" });
+	const pageLane = page.getByTestId("public-release-page-lane");
+	await expect(wordmark).toBeVisible();
+	await expect(title).toBeVisible();
+	await expect(pageLane).toBeVisible();
+	expect(
+		await page
+			.locator(
+				"[data-testid='public-release-title-band'] [data-repo-visual-kind='owner_avatar']",
+			)
+			.count(),
+	).toBe(1);
+	expect(
+		await page.locator("[data-release-id] [data-repo-visual-slot]").count(),
+	).toBe(0);
+	expect(await page.locator("[data-feed-lane-trigger]").count()).toBe(0);
+	expect(await page.locator("[data-feed-mobile-github-link]").count()).toBe(0);
+	expect(
+		await page.locator("header").getByRole("link", { name: "GitHub" }).count(),
+	).toBe(1);
+	expect(
+		await page
+			.locator("[data-release-id]")
+			.getByRole("link", { name: "GitHub" })
+			.count(),
+	).toBe(0);
+	expect(reactionTokenStatusRequests).toBe(0);
+
+	const [desktopWordmark, desktopTitle, desktopLane] = await Promise.all([
+		wordmark.boundingBox(),
+		title.boundingBox(),
+		pageLane.boundingBox(),
+	]);
+	expect(desktopWordmark).not.toBeNull();
+	expect(desktopTitle).not.toBeNull();
+	expect(desktopLane).not.toBeNull();
+	expect(desktopWordmark?.height).toBe(32);
+	expect(desktopLane?.y).toBeGreaterThanOrEqual(desktopTitle?.y ?? 0);
+	expect(desktopLane?.y).toBeLessThan(
+		(desktopTitle?.y ?? 0) + (desktopTitle?.height ?? 0),
+	);
+	await expectNoHorizontalOverflow(page);
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	await expect
+		.poll(async () => (await wordmark.boundingBox())?.height ?? 0)
+		.toBe(28);
+	const [mobileTitle, mobileLane] = await Promise.all([
+		title.boundingBox(),
+		pageLane.boundingBox(),
+	]);
+	expect(mobileTitle).not.toBeNull();
+	expect(mobileLane).not.toBeNull();
+	expect(mobileLane?.y).toBeGreaterThanOrEqual(
+		(mobileTitle?.y ?? 0) + (mobileTitle?.height ?? 0),
+	);
+	await expectNoHorizontalOverflow(page);
+});
+
+test("public release reactions require an authenticated session with a usable PAT", async ({
+	page,
+}) => {
+	const items = Array.from({ length: 2 }, (_, index) => releaseItem(index));
+	let reactionTokenStatusRequests = 0;
+	let toggledReactionRequests = 0;
+	await installBaseApiMocks(
+		page,
+		(route) =>
+			json(route, {
+				status: "ready",
+				repo_full_name: "octo-rill/example",
+				next_cursor: null,
+				items,
+			}),
+		{ authenticated: true, reactionTokenUsable: true },
+	);
+	await page.route("**/api/reaction-token/status", async (route) => {
+		reactionTokenStatusRequests += 1;
+		return json(route, {
+			configured: true,
+			masked_token: "ghp_****_test",
+			check: {
+				state: "valid",
+				message: null,
+				checked_at: "2026-07-11T00:00:00Z",
+			},
+			owner: null,
+		});
+	});
+	await page.route("**/api/release/reactions/toggle", async (route) => {
+		toggledReactionRequests += 1;
+		const body = route.request().postDataJSON() as {
+			release_id: string;
+			content: string;
+		};
+		return json(route, {
+			release_id: body.release_id,
+			reactions: {
+				counts: {
+					plus1: body.content === "plus1" ? 1 : 0,
+					laugh: 0,
+					heart: 0,
+					hooray: 0,
+					rocket: 0,
+					eyes: 0,
+				},
+				viewer: {
+					plus1: body.content === "plus1",
+					laugh: false,
+					heart: false,
+					hooray: false,
+					rocket: false,
+					eyes: false,
+				},
+				status: "ready",
+			},
+		});
+	});
+
+	await page.goto("/octo-rill/example/releases");
+	const firstRelease = page.getByTestId("public-release-item-public-release-0");
+	await expect(firstRelease).toBeVisible();
+	await expect.poll(() => reactionTokenStatusRequests).toBe(1);
+	await expect(firstRelease.locator("[data-reaction-trigger]")).toHaveCount(6);
+	const plusOne = firstRelease.locator("[data-reaction-trigger='plus1']");
+	await plusOne.click();
+	await expect.poll(() => toggledReactionRequests).toBe(1);
+	await expect(plusOne).toHaveAttribute("aria-pressed", "true");
+});
+
+test("public release hides reactions without a usable PAT", async ({
+	page,
+}) => {
+	const items = Array.from({ length: 2 }, (_, index) => releaseItem(index));
+	await installBaseApiMocks(
+		page,
+		(route) =>
+			json(route, {
+				status: "ready",
+				repo_full_name: "octo-rill/example",
+				next_cursor: null,
+				items,
+			}),
+		{ authenticated: true, reactionTokenUsable: false },
+	);
+
+	await page.goto("/octo-rill/example/releases");
+	const firstRelease = page.getByTestId("public-release-item-public-release-0");
+	await expect(firstRelease).toBeVisible();
+	await expect(firstRelease.locator("[data-reaction-trigger]")).toHaveCount(0);
+});
+
 test("public owned cached repo shows ready list instead of pending sync", async ({
 	page,
 }) => {
@@ -405,11 +600,17 @@ test("public release typed discrete highlight keeps partial targets and replaces
 	).toContainText("1 / 2");
 	await page.getByTitle("下一条高亮记录").click();
 	await expect(page).toHaveURL(/highlight_active=tag%3Av2.2.0/);
-	await page.getByRole("tab", { name: "翻译" }).first().click();
+	await page
+		.getByTestId("public-release-page-lane")
+		.getByRole("button", { name: "翻译" })
+		.click();
 	await expect(
 		page.getByTestId("public-release-item-public-release-5"),
 	).toHaveAttribute("data-highlighted", "true");
-	await page.getByRole("tab", { name: "润色" }).first().click();
+	await page
+		.getByTestId("public-release-page-lane")
+		.getByRole("button", { name: "润色" })
+		.click();
 	await expect(
 		page.getByText("公开页面复用 Release 卡片并保留内容切换。").first(),
 	).toBeVisible();
@@ -606,7 +807,14 @@ test("public release typed range uses virtual rows and loads both directions", a
 
 	await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
 	await expect.poll(() => seenQueries.length).toBeGreaterThan(1);
-	await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+	await expect
+		.poll(async () => {
+			await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+			return await page
+				.getByTestId("public-release-item-public-release-19")
+				.count();
+		})
+		.toBe(1);
 	await expect(
 		page.getByTestId("public-release-item-public-release-19"),
 	).toHaveAttribute("data-highlighted", "true");

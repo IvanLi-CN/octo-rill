@@ -5,6 +5,7 @@ import {
 	ExternalLink,
 	RefreshCcw,
 } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import { useWindowVirtualizer } from "@tanstack/react-virtual";
 import {
 	lazy,
@@ -19,6 +20,7 @@ import {
 
 import {
 	ApiError,
+	apiGetReactionTokenStatus,
 	type PublicReleaseHighlight,
 	type PublicReleaseGap,
 	type PublicReleaseListItem,
@@ -28,9 +30,12 @@ import {
 	apiGetPublicRepoReleaseDetail,
 	apiGetPublicRepoReleaseContent,
 	apiGetPublicRepoReleases,
+	apiPostJson,
 } from "@/api";
+import { useAuthBootstrap } from "@/auth/AuthBootstrap";
 import { AuthProviderIcon } from "@/components/brand/AuthProviderIcon";
 import { BrandLogo } from "@/components/brand/BrandLogo";
+import { RepoIdentity } from "@/components/repo/RepoIdentity";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -42,12 +47,24 @@ import {
 } from "@/components/ui/card";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
 import { InternalLink } from "@/lib/internalNavigation";
-import type { FeedLane, ReleaseFeedItem } from "@/feed/types";
+import type {
+	FeedLane,
+	FeedReactionRefreshResponse,
+	ReactionContent,
+	ReleaseFeedItem,
+	ReleaseReactions,
+	ToggleReleaseReactionResponse,
+} from "@/feed/types";
 import {
 	appendPublicReleaseHighlightParams,
 	publicReleaseHighlightSearch,
 	type PublicReleaseHighlightSelection,
 } from "@/publicRelease/routeState";
+import {
+	DASHBOARD_QUERY_STALE_MS,
+	dashboardReactionTokenQueryKey,
+} from "@/query/dashboardQueryKeys";
+import { isReactionTokenUsable } from "@/settings/reactionTokenEditor";
 import { cn } from "@/lib/utils";
 import { buildVersionReleaseHref } from "@/version/versionReleaseLink";
 import { useVersionMonitor } from "@/version/versionMonitor";
@@ -60,6 +77,34 @@ const ReleaseFeedCard = lazy(async () => {
 const PUBLIC_RELEASE_LIST_BODY_MAX_CHARS = 2800;
 const PUBLIC_RELEASE_PAGE_SIZE = 6;
 const PUBLIC_RELEASE_HIGHLIGHT_PAGE_SIZE = 30;
+
+const EMPTY_RELEASE_REACTIONS: ReleaseReactions = {
+	counts: {
+		plus1: 0,
+		laugh: 0,
+		heart: 0,
+		hooray: 0,
+		rocket: 0,
+		eyes: 0,
+	},
+	viewer: {
+		plus1: false,
+		laugh: false,
+		heart: false,
+		hooray: false,
+		rocket: false,
+		eyes: false,
+	},
+	status: "ready",
+};
+
+type PublicReleaseReactionControls = {
+	enabled: boolean;
+	byReleaseId: Record<string, ReleaseReactions>;
+	busyReleaseIds: Set<string>;
+	errorByReleaseId: Record<string, string>;
+	onToggle: (releaseId: string, content: ReactionContent) => void;
+};
 
 type LoadState =
 	| { status: "loading" }
@@ -80,6 +125,141 @@ function isPendingResponse(
 		"status" in value &&
 		(value as { status?: unknown }).status === "pending_sync"
 	);
+}
+
+function usePublicReleaseReactionControls(
+	items: PublicReleaseListItem[],
+): PublicReleaseReactionControls {
+	const auth = useAuthBootstrap();
+	const userId = auth.me?.user.id ?? null;
+	const reactionTokenQuery = useQuery({
+		queryKey: dashboardReactionTokenQueryKey(userId ?? "anonymous"),
+		queryFn: apiGetReactionTokenStatus,
+		enabled: auth.isAuthenticated && userId !== null,
+		staleTime: DASHBOARD_QUERY_STALE_MS,
+		retry: false,
+	});
+	const [reactionAccessBlocked, setReactionAccessBlocked] = useState(false);
+	const [byReleaseId, setByReleaseId] = useState<
+		Record<string, ReleaseReactions>
+	>({});
+	const [busyReleaseIds, setBusyReleaseIds] = useState<Set<string>>(
+		() => new Set(),
+	);
+	const [errorByReleaseId, setErrorByReleaseId] = useState<
+		Record<string, string>
+	>({});
+	const releaseIdSignature = useMemo(
+		() =>
+			Array.from(new Set(items.map((item) => item.release_id)))
+				.sort()
+				.join("|"),
+		[items],
+	);
+	const enabled =
+		auth.isAuthenticated &&
+		!reactionAccessBlocked &&
+		isReactionTokenUsable(
+			reactionTokenQuery.data ?? {
+				configured: false,
+				masked_token: null,
+				owner: null,
+				check: { state: "idle", message: null, checked_at: null },
+			},
+		);
+
+	useEffect(() => {
+		setReactionAccessBlocked(false);
+		setByReleaseId({});
+		setBusyReleaseIds(new Set());
+		setErrorByReleaseId({});
+	}, [userId]);
+
+	useEffect(() => {
+		if (!enabled || !releaseIdSignature) return;
+		let cancelled = false;
+		const releaseIds = releaseIdSignature.split("|");
+
+		void apiPostJson<FeedReactionRefreshResponse>(
+			"/api/feed/reactions/refresh",
+			{ release_ids: releaseIds },
+		)
+			.then((response) => {
+				if (cancelled) return;
+				setByReleaseId((current) => ({
+					...current,
+					...Object.fromEntries(
+						response.items.map((item) => [item.release_id, item.reactions]),
+					),
+				}));
+			})
+			.catch((error) => {
+				if (
+					error instanceof ApiError &&
+					(error.code === "pat_invalid" || error.code === "pat_required")
+				) {
+					setReactionAccessBlocked(true);
+				}
+			});
+
+		return () => {
+			cancelled = true;
+		};
+	}, [enabled, releaseIdSignature]);
+
+	const onToggle = useCallback(
+		(releaseId: string, content: ReactionContent) => {
+			if (!enabled || busyReleaseIds.has(releaseId)) return;
+			setBusyReleaseIds((current) => new Set(current).add(releaseId));
+			setErrorByReleaseId((current) => {
+				if (!(releaseId in current)) return current;
+				const next = { ...current };
+				delete next[releaseId];
+				return next;
+			});
+
+			void apiPostJson<ToggleReleaseReactionResponse>(
+				"/api/release/reactions/toggle",
+				{ release_id: releaseId, content },
+			)
+				.then((response) => {
+					setByReleaseId((current) => ({
+						...current,
+						[response.release_id]: response.reactions,
+					}));
+				})
+				.catch((error) => {
+					if (
+						error instanceof ApiError &&
+						(error.code === "pat_invalid" || error.code === "pat_required")
+					) {
+						setReactionAccessBlocked(true);
+						return;
+					}
+					setErrorByReleaseId((current) => ({
+						...current,
+						[releaseId]:
+							error instanceof Error ? error.message : "表情反应更新失败",
+					}));
+				})
+				.finally(() => {
+					setBusyReleaseIds((current) => {
+						const next = new Set(current);
+						next.delete(releaseId);
+						return next;
+					});
+				});
+		},
+		[busyReleaseIds, enabled],
+	);
+
+	return {
+		enabled,
+		byReleaseId,
+		busyReleaseIds,
+		errorByReleaseId,
+		onToggle,
+	};
 }
 
 function releaseTitle(item: Pick<PublicReleaseListItem, "name" | "tag_name">) {
@@ -141,9 +321,13 @@ export function PublicReleasePage(props: {
 	const [loadingNewer, setLoadingNewer] = useState(false);
 	const [loadingGap, setLoadingGap] = useState<string | null>(null);
 	const [appendError, setAppendError] = useState<string | null>(null);
+	const [selectedLane, setSelectedLane] = useState<FeedLane>("smart");
 	const initialLoadKeyRef = useRef<string | null>(null);
 	const isHighlightMode = highlight !== null;
 	const initialLoadKey = JSON.stringify({ owner, repo, tag, highlight });
+	const reactionControls = usePublicReleaseReactionControls(
+		state.status === "list" ? state.data.items : [],
+	);
 
 	const highlightRequest = useMemo(() => {
 		if (!highlight) return {};
@@ -477,6 +661,8 @@ export function PublicReleasePage(props: {
 	}, [load, state]);
 
 	const repoFullName = useMemo(() => `${owner}/${repo}`, [owner, repo]);
+	const repoVisual =
+		state.status === "list" ? state.data.items[0]?.repo_visual : null;
 	const highlightedListHref = useMemo(() => {
 		if (!tag || !highlight) return null;
 		const params = appendPublicReleaseHighlightParams(
@@ -496,7 +682,7 @@ export function PublicReleasePage(props: {
 							to="/"
 							className="inline-flex items-center gap-3"
 						>
-							<BrandLogo variant="wordmark" className="h-6 sm:h-5" />
+							<BrandLogo variant="wordmark" className="h-7 sm:h-8" />
 						</InternalLink>
 						<Button asChild variant="outline" size="sm">
 							<a
@@ -526,10 +712,28 @@ export function PublicReleasePage(props: {
 					) : null}
 
 					{tag ? null : (
-						<section className="py-6">
-							<h1 className="break-words text-3xl font-semibold tracking-normal">
-								{repoFullName}
-							</h1>
+						<section className="py-6" data-testid="public-release-title-band">
+							<div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+								<RepoIdentity
+									repoFullName={repoFullName}
+									repoVisual={repoVisual}
+									labelAs="h1"
+									className="max-w-full shrink-0"
+									labelClassName="break-words text-3xl font-semibold tracking-normal"
+									visualClassName="size-10"
+								/>
+								{state.status === "list" ? (
+									<div
+										className="ml-auto shrink-0"
+										data-testid="public-release-page-lane"
+									>
+										<FeedPageLaneSelector
+											value={selectedLane}
+											onValueChange={setSelectedLane}
+										/>
+									</div>
+								) : null}
+							</div>
 						</section>
 					)}
 
@@ -582,8 +786,10 @@ export function PublicReleasePage(props: {
 							onLoadGap={loadGap}
 							loadingGap={loadingGap}
 							highlightSelection={highlight}
+							selectedLane={selectedLane}
 							onHydrateItems={hydrateItems}
 							onActivateHighlight={activateHighlight}
+							reactionControls={reactionControls}
 						/>
 					) : null}
 
@@ -763,6 +969,8 @@ function ReleaseList(props: {
 	highlight?: PublicReleaseHighlight;
 	gaps?: PublicReleaseGap[];
 	highlightSelection: PublicReleaseHighlightSelection;
+	selectedLane: FeedLane;
+	reactionControls: PublicReleaseReactionControls;
 	hasMore: boolean;
 	hasNewer: boolean;
 	loadingMore: boolean;
@@ -777,10 +985,6 @@ function ReleaseList(props: {
 	) => void;
 	onActivateHighlight: (releaseId: string, index: number) => void;
 }) {
-	const [selectedLane, setSelectedLane] = useState<FeedLane>("smart");
-	const [selectedLaneByRelease, setSelectedLaneByRelease] = useState<
-		Record<string, FeedLane>
-	>({});
 	const listRef = useRef<HTMLDivElement | null>(null);
 	const focusedHighlightSignatureRef = useRef<string | null>(null);
 	const hydratedTranslatedRef = useRef(new Set<string>());
@@ -826,20 +1030,8 @@ function ReleaseList(props: {
 		.map((row) => row.item.release_id);
 	const visibleReleaseSignature = visibleReleaseIds.join(",");
 
-	const selectAllLane = useCallback((lane: FeedLane) => {
-		setSelectedLane(lane);
-		setSelectedLaneByRelease({});
-	}, []);
-
-	const selectReleaseLane = useCallback((releaseId: string, lane: FeedLane) => {
-		setSelectedLaneByRelease((current) => ({
-			...current,
-			[releaseId]: lane,
-		}));
-	}, []);
-
 	useEffect(() => {
-		if (selectedLane !== "translated" || !visibleReleaseSignature) return;
+		if (props.selectedLane !== "translated" || !visibleReleaseSignature) return;
 		const ids = visibleReleaseIds.filter(
 			(id) => !hydratedTranslatedRef.current.has(id),
 		);
@@ -866,7 +1058,7 @@ function ReleaseList(props: {
 		props.onHydrateItems,
 		props.owner,
 		props.repo,
-		selectedLane,
+		props.selectedLane,
 		visibleReleaseIds,
 		visibleReleaseSignature,
 	]);
@@ -1007,14 +1199,6 @@ function ReleaseList(props: {
 				enabled={props.hasNewer && !props.loadingNewer && !props.appendError}
 				onVisible={props.onLoadNewer}
 			/>
-			<div className="flex flex-wrap items-center justify-between gap-3">
-				<div className="flex w-full items-center justify-end">
-					<FeedPageLaneSelector
-						value={selectedLane}
-						onValueChange={selectAllLane}
-					/>
-				</div>
-			</div>
 			{props.highlight &&
 			(props.highlight.unresolved.length > 0 || props.highlight.message) ? (
 				<p
@@ -1054,13 +1238,9 @@ function ReleaseList(props: {
 							) : (
 								<ReleaseVirtualRow
 									item={row.item}
-									lane={
-										selectedLaneByRelease[row.item.release_id] ?? selectedLane
-									}
+									lane={props.selectedLane}
 									detailHref={detailHref(row.item)}
-									onSelectLane={(lane) =>
-										selectReleaseLane(row.item.release_id, lane)
-									}
+									reactionControls={props.reactionControls}
 								/>
 							)}
 						</div>
@@ -1212,9 +1392,13 @@ function ReleaseVirtualRow(props: {
 	item: PublicReleaseListItem;
 	lane: FeedLane;
 	detailHref: string;
-	onSelectLane: (lane: FeedLane) => void;
+	reactionControls: PublicReleaseReactionControls;
 }) {
-	const feedItem = publicReleaseToFeedItem(props.item);
+	const reactions = props.reactionControls.enabled
+		? (props.reactionControls.byReleaseId[props.item.release_id] ??
+			EMPTY_RELEASE_REACTIONS)
+		: null;
+	const feedItem = publicReleaseToFeedItem(props.item, reactions);
 	return (
 		<div
 			tabIndex={props.item.is_active_highlight ? -1 : undefined}
@@ -1239,21 +1423,33 @@ function ReleaseVirtualRow(props: {
 					isTranslationAutoRetrying={false}
 					isSmartGenerating={false}
 					isSmartAutoRetrying={false}
-					isReactionBusy={false}
-					reactionError={null}
-					showReactions={false}
+					isReactionBusy={props.reactionControls.busyReleaseIds.has(
+						props.item.release_id,
+					)}
+					reactionError={
+						props.reactionControls.errorByReleaseId[props.item.release_id] ??
+						null
+					}
+					showReactions={props.reactionControls.enabled}
+					showRepoIdentity={false}
+					showHeaderActions={false}
 					titleHref={props.detailHref}
-					onSelectLane={props.onSelectLane}
+					onSelectLane={() => undefined}
 					onTranslateNow={() => undefined}
 					onSmartNow={() => undefined}
-					onToggleReaction={() => undefined}
+					onToggleReaction={(content) =>
+						props.reactionControls.onToggle(props.item.release_id, content)
+					}
 				/>
 			</Suspense>
 		</div>
 	);
 }
 
-function publicReleaseToFeedItem(item: PublicReleaseListItem): ReleaseFeedItem {
+function publicReleaseToFeedItem(
+	item: PublicReleaseListItem,
+	reactions: ReleaseReactions | null = null,
+): ReleaseFeedItem {
 	const body = truncatePublicReleaseListBody(item.body);
 	return {
 		kind: "release",
@@ -1271,7 +1467,7 @@ function publicReleaseToFeedItem(item: PublicReleaseListItem): ReleaseFeedItem {
 		unread: null,
 		translated: item.translated,
 		smart: item.smart,
-		reactions: null,
+		reactions,
 	};
 }
 
