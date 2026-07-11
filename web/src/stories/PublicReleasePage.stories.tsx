@@ -3,7 +3,9 @@ import { useEffect } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, userEvent, within } from "storybook/test";
 
+import { AuthBootstrapProvider } from "@/auth/AuthBootstrap";
 import { PublicReleasePage } from "@/pages/PublicReleasePage";
+import { AppQueryProvider } from "@/query/queryClient";
 import {
 	type VersionMonitorValue,
 	VersionMonitorStateProvider,
@@ -224,6 +226,7 @@ type PublicReleaseStoryMode =
 	| "highlight-large-range"
 	| "highlight-partial"
 	| "polished-fallback"
+	| "reactions-enabled"
 	| "detail"
 	| "detail-long"
 	| "error";
@@ -262,6 +265,113 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 				? new Request(input, init)
 				: input;
 		const url = new URL(req.url, window.location.origin);
+		if (url.pathname === "/api/me") {
+			if (mode !== "reactions-enabled") {
+				return new Response(
+					JSON.stringify({
+						error: { code: "unauthorized", message: "unauthorized" },
+					}),
+					{ status: 401, headers: { "content-type": "application/json" } },
+				);
+			}
+			return new Response(
+				JSON.stringify({
+					user: {
+						id: "storybook-reaction-user",
+						github_user_id: 4242,
+						login: "octo",
+						name: "Octo",
+						avatar_url: null,
+						email: null,
+						is_admin: false,
+					},
+					dashboard: {
+						daily_boundary_local: "09:00",
+						daily_boundary_time_zone: "Asia/Shanghai",
+						daily_boundary_utc_offset_minutes: 480,
+						include_own_releases: false,
+					},
+				}),
+				{ headers: { "content-type": "application/json" } },
+			);
+		}
+		if (url.pathname === "/api/reaction-token/status") {
+			return new Response(
+				JSON.stringify({
+					configured: mode === "reactions-enabled",
+					masked_token:
+						mode === "reactions-enabled" ? "ghp_****_storybook" : null,
+					check: {
+						state: mode === "reactions-enabled" ? "valid" : "idle",
+						message: null,
+						checked_at:
+							mode === "reactions-enabled" ? "2026-07-11T00:00:00Z" : null,
+					},
+					owner: null,
+				}),
+				{ headers: { "content-type": "application/json" } },
+			);
+		}
+		if (url.pathname === "/api/feed/reactions/refresh") {
+			return new Response(
+				JSON.stringify({
+					items: publicReleaseItems.map((item) => ({
+						release_id: item.release_id,
+						reactions: {
+							counts: {
+								plus1: 0,
+								laugh: 0,
+								heart: 0,
+								hooray: 0,
+								rocket: 0,
+								eyes: 0,
+							},
+							viewer: {
+								plus1: false,
+								laugh: false,
+								heart: false,
+								hooray: false,
+								rocket: false,
+								eyes: false,
+							},
+							status: "ready",
+						},
+					})),
+				}),
+				{ headers: { "content-type": "application/json" } },
+			);
+		}
+		if (url.pathname === "/api/release/reactions/toggle") {
+			const payload = (await req.json()) as {
+				release_id: string;
+				content: string;
+			};
+			return new Response(
+				JSON.stringify({
+					release_id: payload.release_id,
+					reactions: {
+						counts: {
+							plus1: payload.content === "plus1" ? 1 : 0,
+							laugh: 0,
+							heart: 0,
+							hooray: 0,
+							rocket: 0,
+							eyes: 0,
+						},
+						viewer: {
+							plus1: payload.content === "plus1",
+							laugh: false,
+							heart: false,
+							hooray: false,
+							rocket: false,
+							eyes: false,
+						},
+						status: "ready",
+					},
+				}),
+				{ headers: { "content-type": "application/json" } },
+			);
+		}
 		if (url.pathname.startsWith("/api/public/repos/")) {
 			if (url.pathname.endsWith("/releases/content")) {
 				const releaseIds = new Set(
@@ -592,24 +702,30 @@ function PublicReleaseStory(props: { mode: PublicReleaseStoryMode }) {
 	}, []);
 
 	return (
-		<VersionMonitorStateProvider value={publicReleaseVersionState}>
-			<PublicReleasePage
-				owner={props.mode === "owned-public-ready" ? "IvanLi-CN" : "octo-rill"}
-				repo={
-					props.mode === "owned-public-ready"
-						? "tuckmark"
-						: props.mode === "detail-long"
-							? "example-repository-name-that-is-intentionally-long-for-mobile-layout-proof"
-							: "example"
-				}
-				tag={
-					props.mode === "detail" || props.mode === "detail-long"
-						? "v2.7.0"
-						: null
-				}
-				highlight={highlight}
-			/>
-		</VersionMonitorStateProvider>
+		<AppQueryProvider>
+			<AuthBootstrapProvider>
+				<VersionMonitorStateProvider value={publicReleaseVersionState}>
+					<PublicReleasePage
+						owner={
+							props.mode === "owned-public-ready" ? "IvanLi-CN" : "octo-rill"
+						}
+						repo={
+							props.mode === "owned-public-ready"
+								? "tuckmark"
+								: props.mode === "detail-long"
+									? "example-repository-name-that-is-intentionally-long-for-mobile-layout-proof"
+									: "example"
+						}
+						tag={
+							props.mode === "detail" || props.mode === "detail-long"
+								? "v2.7.0"
+								: null
+						}
+						highlight={highlight}
+					/>
+				</VersionMonitorStateProvider>
+			</AuthBootstrapProvider>
+		</AppQueryProvider>
 	);
 }
 
@@ -674,8 +790,39 @@ export const LoadingKnownData: Story = {
 
 export const ReleaseList: Story = {
 	args: { mode: "list" },
-	play: async ({ canvasElement }) => {
+	play: async ({ canvas, canvasElement }) => {
+		await expect(canvas.getByTestId("public-release-page-lane")).toBeVisible();
+		await expect(
+			canvas.getByRole("heading", { name: "octo-rill/example" }),
+		).toBeVisible();
+		expect(
+			canvasElement.querySelectorAll("[data-feed-lane-trigger]").length,
+		).toBe(0);
+		expect(
+			canvasElement.querySelectorAll("[data-feed-mobile-github-link]").length,
+		).toBe(0);
+		expect(
+			canvasElement.querySelectorAll(
+				"[data-release-id] [data-repo-visual-slot]",
+			).length,
+		).toBe(0);
 		await expectPublicReleaseFooterVersion(canvasElement);
+	},
+};
+
+export const ReactionsEnabled: Story = {
+	args: { mode: "reactions-enabled" },
+	play: async ({ canvasElement }) => {
+		const firstRelease = canvasElement.querySelector(
+			"[data-release-id='291058027']",
+		);
+		expect(firstRelease).toBeTruthy();
+		const plusOne = firstRelease?.querySelector<HTMLButtonElement>(
+			"[data-reaction-trigger='plus1']",
+		);
+		expect(plusOne).toBeTruthy();
+		await userEvent.click(plusOne!);
+		await expect(plusOne!).toHaveAttribute("aria-pressed", "true");
 	},
 };
 

@@ -5,6 +5,7 @@ import {
 	ExternalLink,
 	RefreshCcw,
 } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import { useWindowVirtualizer } from "@tanstack/react-virtual";
 import {
 	lazy,
@@ -19,6 +20,7 @@ import {
 
 import {
 	ApiError,
+	apiGetReactionTokenStatus,
 	type PublicReleaseHighlight,
 	type PublicReleaseGap,
 	type PublicReleaseListItem,
@@ -28,9 +30,12 @@ import {
 	apiGetPublicRepoReleaseDetail,
 	apiGetPublicRepoReleaseContent,
 	apiGetPublicRepoReleases,
+	apiPostJson,
 } from "@/api";
+import { useAuthBootstrap } from "@/auth/AuthBootstrap";
 import { AuthProviderIcon } from "@/components/brand/AuthProviderIcon";
 import { BrandLogo } from "@/components/brand/BrandLogo";
+import { RepoIdentity } from "@/components/repo/RepoIdentity";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -42,12 +47,24 @@ import {
 } from "@/components/ui/card";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
 import { InternalLink } from "@/lib/internalNavigation";
-import type { FeedLane, ReleaseFeedItem } from "@/feed/types";
+import type {
+	FeedLane,
+	FeedReactionRefreshResponse,
+	ReactionContent,
+	ReleaseFeedItem,
+	ReleaseReactions,
+	ToggleReleaseReactionResponse,
+} from "@/feed/types";
 import {
 	appendPublicReleaseHighlightParams,
 	publicReleaseHighlightSearch,
 	type PublicReleaseHighlightSelection,
 } from "@/publicRelease/routeState";
+import {
+	DASHBOARD_QUERY_STALE_MS,
+	dashboardReactionTokenQueryKey,
+} from "@/query/dashboardQueryKeys";
+import { isReactionTokenUsable } from "@/settings/reactionTokenEditor";
 import { cn } from "@/lib/utils";
 import { buildVersionReleaseHref } from "@/version/versionReleaseLink";
 import { useVersionMonitor } from "@/version/versionMonitor";
@@ -60,6 +77,18 @@ const ReleaseFeedCard = lazy(async () => {
 const PUBLIC_RELEASE_LIST_BODY_MAX_CHARS = 2800;
 const PUBLIC_RELEASE_PAGE_SIZE = 6;
 const PUBLIC_RELEASE_HIGHLIGHT_PAGE_SIZE = 30;
+const PUBLIC_RELEASE_REACTION_BATCH_SIZE = 100;
+const PUBLIC_RELEASE_REACTION_MAX_RETRIES = 3;
+const PUBLIC_RELEASE_REACTION_RETRY_DELAY_MS = 1_000;
+
+type PublicReleaseReactionControls = {
+	enabled: boolean;
+	byReleaseId: Record<string, ReleaseReactions>;
+	availableReleaseIds: Set<string>;
+	busyReleaseIds: Set<string>;
+	errorByReleaseId: Record<string, string>;
+	onToggle: (releaseId: string, content: ReactionContent) => void;
+};
 
 type LoadState =
 	| { status: "loading" }
@@ -80,6 +109,254 @@ function isPendingResponse(
 		"status" in value &&
 		(value as { status?: unknown }).status === "pending_sync"
 	);
+}
+
+function usePublicReleaseReactionControls(
+	items: PublicReleaseListItem[],
+): PublicReleaseReactionControls {
+	const auth = useAuthBootstrap();
+	const userId = auth.me?.user.id ?? null;
+	const reactionTokenQuery = useQuery({
+		queryKey: dashboardReactionTokenQueryKey(userId ?? "anonymous"),
+		queryFn: apiGetReactionTokenStatus,
+		enabled: auth.isAuthenticated && userId !== null,
+		staleTime: DASHBOARD_QUERY_STALE_MS,
+		retry: false,
+	});
+	const [reactionAccessBlocked, setReactionAccessBlocked] = useState(false);
+	const [byReleaseId, setByReleaseId] = useState<
+		Record<string, ReleaseReactions>
+	>({});
+	const [availableReleaseIds, setAvailableReleaseIds] = useState<Set<string>>(
+		() => new Set(),
+	);
+	const [busyReleaseIds, setBusyReleaseIds] = useState<Set<string>>(
+		() => new Set(),
+	);
+	const [errorByReleaseId, setErrorByReleaseId] = useState<
+		Record<string, string>
+	>({});
+	const [reactionRefreshGeneration, setReactionRefreshGeneration] = useState(0);
+	const releaseIdSignature = useMemo(
+		() =>
+			Array.from(new Set(items.map((item) => item.release_id)))
+				.sort()
+				.join("|"),
+		[items],
+	);
+	const requestedReleaseIdsRef = useRef(new Set<string>());
+	const reactionRefreshRetriesRef = useRef(new Map<string, number>());
+	const reactionRefreshRetryTimerRef = useRef<number | null>(null);
+	const reactionSessionRef = useRef({ userId, generation: 0 });
+	if (reactionSessionRef.current.userId !== userId) {
+		reactionSessionRef.current = {
+			userId,
+			generation: reactionSessionRef.current.generation + 1,
+		};
+	}
+	const enabled =
+		auth.isAuthenticated &&
+		!reactionAccessBlocked &&
+		isReactionTokenUsable(
+			reactionTokenQuery.data ?? {
+				configured: false,
+				masked_token: null,
+				owner: null,
+				check: { state: "idle", message: null, checked_at: null },
+			},
+		);
+
+	useEffect(() => {
+		if (reactionRefreshRetryTimerRef.current !== null) {
+			window.clearTimeout(reactionRefreshRetryTimerRef.current);
+			reactionRefreshRetryTimerRef.current = null;
+		}
+		setReactionAccessBlocked(false);
+		setByReleaseId({});
+		setAvailableReleaseIds(new Set());
+		setBusyReleaseIds(new Set());
+		setErrorByReleaseId({});
+		requestedReleaseIdsRef.current = new Set();
+		reactionRefreshRetriesRef.current = new Map();
+	}, [userId]);
+
+	useEffect(
+		() => () => {
+			if (reactionRefreshRetryTimerRef.current !== null) {
+				window.clearTimeout(reactionRefreshRetryTimerRef.current);
+			}
+		},
+		[],
+	);
+
+	const scheduleReactionRefreshRetry = useCallback(() => {
+		if (reactionRefreshRetryTimerRef.current !== null) return;
+		reactionRefreshRetryTimerRef.current = window.setTimeout(() => {
+			reactionRefreshRetryTimerRef.current = null;
+			setReactionRefreshGeneration((current) => current + 1);
+		}, PUBLIC_RELEASE_REACTION_RETRY_DELAY_MS);
+	}, []);
+
+	useEffect(() => {
+		if (!enabled || !releaseIdSignature) return;
+		const releaseIds = releaseIdSignature
+			.split("|")
+			.filter((releaseId) => !requestedReleaseIdsRef.current.has(releaseId));
+		if (releaseIds.length === 0) return;
+		for (const releaseId of releaseIds) {
+			requestedReleaseIdsRef.current.add(releaseId);
+		}
+		const batches = Array.from(
+			{
+				length: Math.ceil(
+					releaseIds.length / PUBLIC_RELEASE_REACTION_BATCH_SIZE,
+				),
+			},
+			(_, index) =>
+				releaseIds.slice(
+					index * PUBLIC_RELEASE_REACTION_BATCH_SIZE,
+					(index + 1) * PUBLIC_RELEASE_REACTION_BATCH_SIZE,
+				),
+		);
+		const requestSessionGeneration = reactionSessionRef.current.generation;
+
+		void Promise.allSettled(
+			batches.map((batch) =>
+				apiPostJson<FeedReactionRefreshResponse>(
+					"/api/feed/reactions/refresh",
+					{ release_ids: batch },
+				),
+			),
+		).then((results) => {
+			if (reactionSessionRef.current.generation !== requestSessionGeneration) {
+				return;
+			}
+			const refreshed = results.flatMap((result) =>
+				result.status === "fulfilled" ? result.value.items : [],
+			);
+			for (const item of refreshed) {
+				reactionRefreshRetriesRef.current.delete(item.release_id);
+			}
+			setByReleaseId((current) => ({
+				...current,
+				...Object.fromEntries(
+					refreshed.map((item) => [item.release_id, item.reactions]),
+				),
+			}));
+			setAvailableReleaseIds(
+				(current) =>
+					new Set([...current, ...refreshed.map((item) => item.release_id)]),
+			);
+
+			let shouldRetry = false;
+			for (const [index, result] of results.entries()) {
+				if (result.status === "fulfilled") continue;
+				const failedReleaseIds = batches[index] ?? [];
+				for (const releaseId of failedReleaseIds) {
+					requestedReleaseIdsRef.current.delete(releaseId);
+				}
+				if (
+					result.reason instanceof ApiError &&
+					(result.reason.code === "pat_invalid" ||
+						result.reason.code === "pat_required")
+				) {
+					setReactionAccessBlocked(true);
+					continue;
+				}
+				for (const releaseId of failedReleaseIds) {
+					const retries =
+						(reactionRefreshRetriesRef.current.get(releaseId) ?? 0) + 1;
+					reactionRefreshRetriesRef.current.set(releaseId, retries);
+					shouldRetry ||= retries <= PUBLIC_RELEASE_REACTION_MAX_RETRIES;
+				}
+			}
+			if (shouldRetry) scheduleReactionRefreshRetry();
+		});
+	}, [
+		enabled,
+		reactionRefreshGeneration,
+		releaseIdSignature,
+		scheduleReactionRefreshRetry,
+	]);
+
+	const onToggle = useCallback(
+		(releaseId: string, content: ReactionContent) => {
+			if (!enabled || busyReleaseIds.has(releaseId)) return;
+			const requestSessionGeneration = reactionSessionRef.current.generation;
+			setBusyReleaseIds((current) => new Set(current).add(releaseId));
+			setErrorByReleaseId((current) => {
+				if (!(releaseId in current)) return current;
+				const next = { ...current };
+				delete next[releaseId];
+				return next;
+			});
+
+			void apiPostJson<ToggleReleaseReactionResponse>(
+				"/api/release/reactions/toggle",
+				{ release_id: releaseId, content },
+			)
+				.then((response) => {
+					if (
+						reactionSessionRef.current.generation !== requestSessionGeneration
+					) {
+						return;
+					}
+					setByReleaseId((current) => ({
+						...current,
+						[response.release_id]: response.reactions,
+					}));
+				})
+				.catch((error) => {
+					if (
+						reactionSessionRef.current.generation !== requestSessionGeneration
+					) {
+						return;
+					}
+					if (
+						error instanceof ApiError &&
+						(error.code === "pat_invalid" || error.code === "pat_required")
+					) {
+						setReactionAccessBlocked(true);
+						return;
+					}
+					if (error instanceof ApiError && error.code === "not_found") {
+						setAvailableReleaseIds((current) => {
+							const next = new Set(current);
+							next.delete(releaseId);
+							return next;
+						});
+						return;
+					}
+					setErrorByReleaseId((current) => ({
+						...current,
+						[releaseId]:
+							error instanceof Error ? error.message : "表情反应更新失败",
+					}));
+				})
+				.finally(() => {
+					if (
+						reactionSessionRef.current.generation !== requestSessionGeneration
+					) {
+						return;
+					}
+					setBusyReleaseIds((current) => {
+						const next = new Set(current);
+						next.delete(releaseId);
+						return next;
+					});
+				});
+		},
+		[busyReleaseIds, enabled],
+	);
+
+	return {
+		enabled,
+		byReleaseId,
+		availableReleaseIds,
+		busyReleaseIds,
+		errorByReleaseId,
+		onToggle,
+	};
 }
 
 function releaseTitle(item: Pick<PublicReleaseListItem, "name" | "tag_name">) {
@@ -141,9 +418,13 @@ export function PublicReleasePage(props: {
 	const [loadingNewer, setLoadingNewer] = useState(false);
 	const [loadingGap, setLoadingGap] = useState<string | null>(null);
 	const [appendError, setAppendError] = useState<string | null>(null);
+	const [selectedLane, setSelectedLane] = useState<FeedLane>("smart");
 	const initialLoadKeyRef = useRef<string | null>(null);
 	const isHighlightMode = highlight !== null;
 	const initialLoadKey = JSON.stringify({ owner, repo, tag, highlight });
+	const reactionControls = usePublicReleaseReactionControls(
+		state.status === "list" ? state.data.items : [],
+	);
 
 	const highlightRequest = useMemo(() => {
 		if (!highlight) return {};
@@ -477,6 +758,8 @@ export function PublicReleasePage(props: {
 	}, [load, state]);
 
 	const repoFullName = useMemo(() => `${owner}/${repo}`, [owner, repo]);
+	const repoVisual =
+		state.status === "list" ? state.data.items[0]?.repo_visual : null;
 	const highlightedListHref = useMemo(() => {
 		if (!tag || !highlight) return null;
 		const params = appendPublicReleaseHighlightParams(
@@ -496,7 +779,7 @@ export function PublicReleasePage(props: {
 							to="/"
 							className="inline-flex items-center gap-3"
 						>
-							<BrandLogo variant="wordmark" className="h-6 sm:h-5" />
+							<BrandLogo variant="wordmark" className="h-7 sm:h-8" />
 						</InternalLink>
 						<Button asChild variant="outline" size="sm">
 							<a
@@ -526,10 +809,28 @@ export function PublicReleasePage(props: {
 					) : null}
 
 					{tag ? null : (
-						<section className="py-6">
-							<h1 className="break-words text-3xl font-semibold tracking-normal">
-								{repoFullName}
-							</h1>
+						<section className="py-6" data-testid="public-release-title-band">
+							<div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+								<RepoIdentity
+									repoFullName={repoFullName}
+									repoVisual={repoVisual}
+									labelAs="h1"
+									className="max-w-full shrink-0"
+									labelClassName="break-words text-3xl font-semibold tracking-normal"
+									visualClassName="size-10"
+								/>
+								{state.status === "list" ? (
+									<div
+										className="ml-auto shrink-0"
+										data-testid="public-release-page-lane"
+									>
+										<FeedPageLaneSelector
+											value={selectedLane}
+											onValueChange={setSelectedLane}
+										/>
+									</div>
+								) : null}
+							</div>
 						</section>
 					)}
 
@@ -582,8 +883,10 @@ export function PublicReleasePage(props: {
 							onLoadGap={loadGap}
 							loadingGap={loadingGap}
 							highlightSelection={highlight}
+							selectedLane={selectedLane}
 							onHydrateItems={hydrateItems}
 							onActivateHighlight={activateHighlight}
+							reactionControls={reactionControls}
 						/>
 					) : null}
 
@@ -763,6 +1066,8 @@ function ReleaseList(props: {
 	highlight?: PublicReleaseHighlight;
 	gaps?: PublicReleaseGap[];
 	highlightSelection: PublicReleaseHighlightSelection;
+	selectedLane: FeedLane;
+	reactionControls: PublicReleaseReactionControls;
 	hasMore: boolean;
 	hasNewer: boolean;
 	loadingMore: boolean;
@@ -777,10 +1082,6 @@ function ReleaseList(props: {
 	) => void;
 	onActivateHighlight: (releaseId: string, index: number) => void;
 }) {
-	const [selectedLane, setSelectedLane] = useState<FeedLane>("smart");
-	const [selectedLaneByRelease, setSelectedLaneByRelease] = useState<
-		Record<string, FeedLane>
-	>({});
 	const listRef = useRef<HTMLDivElement | null>(null);
 	const focusedHighlightSignatureRef = useRef<string | null>(null);
 	const hydratedTranslatedRef = useRef(new Set<string>());
@@ -826,20 +1127,8 @@ function ReleaseList(props: {
 		.map((row) => row.item.release_id);
 	const visibleReleaseSignature = visibleReleaseIds.join(",");
 
-	const selectAllLane = useCallback((lane: FeedLane) => {
-		setSelectedLane(lane);
-		setSelectedLaneByRelease({});
-	}, []);
-
-	const selectReleaseLane = useCallback((releaseId: string, lane: FeedLane) => {
-		setSelectedLaneByRelease((current) => ({
-			...current,
-			[releaseId]: lane,
-		}));
-	}, []);
-
 	useEffect(() => {
-		if (selectedLane !== "translated" || !visibleReleaseSignature) return;
+		if (props.selectedLane !== "translated" || !visibleReleaseSignature) return;
 		const ids = visibleReleaseIds.filter(
 			(id) => !hydratedTranslatedRef.current.has(id),
 		);
@@ -866,7 +1155,7 @@ function ReleaseList(props: {
 		props.onHydrateItems,
 		props.owner,
 		props.repo,
-		selectedLane,
+		props.selectedLane,
 		visibleReleaseIds,
 		visibleReleaseSignature,
 	]);
@@ -1007,14 +1296,6 @@ function ReleaseList(props: {
 				enabled={props.hasNewer && !props.loadingNewer && !props.appendError}
 				onVisible={props.onLoadNewer}
 			/>
-			<div className="flex flex-wrap items-center justify-between gap-3">
-				<div className="flex w-full items-center justify-end">
-					<FeedPageLaneSelector
-						value={selectedLane}
-						onValueChange={selectAllLane}
-					/>
-				</div>
-			</div>
 			{props.highlight &&
 			(props.highlight.unresolved.length > 0 || props.highlight.message) ? (
 				<p
@@ -1054,13 +1335,9 @@ function ReleaseList(props: {
 							) : (
 								<ReleaseVirtualRow
 									item={row.item}
-									lane={
-										selectedLaneByRelease[row.item.release_id] ?? selectedLane
-									}
+									lane={props.selectedLane}
 									detailHref={detailHref(row.item)}
-									onSelectLane={(lane) =>
-										selectReleaseLane(row.item.release_id, lane)
-									}
+									reactionControls={props.reactionControls}
 								/>
 							)}
 						</div>
@@ -1212,9 +1489,15 @@ function ReleaseVirtualRow(props: {
 	item: PublicReleaseListItem;
 	lane: FeedLane;
 	detailHref: string;
-	onSelectLane: (lane: FeedLane) => void;
+	reactionControls: PublicReleaseReactionControls;
 }) {
-	const feedItem = publicReleaseToFeedItem(props.item);
+	const showReactions =
+		props.reactionControls.enabled &&
+		props.reactionControls.availableReleaseIds.has(props.item.release_id);
+	const reactions = showReactions
+		? (props.reactionControls.byReleaseId[props.item.release_id] ?? null)
+		: null;
+	const feedItem = publicReleaseToFeedItem(props.item, reactions);
 	return (
 		<div
 			tabIndex={props.item.is_active_highlight ? -1 : undefined}
@@ -1239,21 +1522,33 @@ function ReleaseVirtualRow(props: {
 					isTranslationAutoRetrying={false}
 					isSmartGenerating={false}
 					isSmartAutoRetrying={false}
-					isReactionBusy={false}
-					reactionError={null}
-					showReactions={false}
+					isReactionBusy={props.reactionControls.busyReleaseIds.has(
+						props.item.release_id,
+					)}
+					reactionError={
+						props.reactionControls.errorByReleaseId[props.item.release_id] ??
+						null
+					}
+					showReactions={showReactions}
+					showRepoIdentity={false}
+					showHeaderActions={false}
 					titleHref={props.detailHref}
-					onSelectLane={props.onSelectLane}
+					onSelectLane={() => undefined}
 					onTranslateNow={() => undefined}
 					onSmartNow={() => undefined}
-					onToggleReaction={() => undefined}
+					onToggleReaction={(content) =>
+						props.reactionControls.onToggle(props.item.release_id, content)
+					}
 				/>
 			</Suspense>
 		</div>
 	);
 }
 
-function publicReleaseToFeedItem(item: PublicReleaseListItem): ReleaseFeedItem {
+function publicReleaseToFeedItem(
+	item: PublicReleaseListItem,
+	reactions: ReleaseReactions | null = null,
+): ReleaseFeedItem {
 	const body = truncatePublicReleaseListBody(item.body);
 	return {
 		kind: "release",
@@ -1271,7 +1566,7 @@ function publicReleaseToFeedItem(item: PublicReleaseListItem): ReleaseFeedItem {
 		unread: null,
 		translated: item.translated,
 		smart: item.smart,
-		reactions: null,
+		reactions,
 	};
 }
 

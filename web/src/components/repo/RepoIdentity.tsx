@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils";
 export function RepoIdentity(props: {
 	repoFullName: string | null;
 	repoVisual?: RepoVisual | null;
+	labelAs?: "span" | "h1";
 	className?: string;
 	labelClassName?: string;
 	visualClassName?: string;
@@ -18,6 +19,7 @@ export function RepoIdentity(props: {
 		repoFullName,
 		repoVisual = null,
 		className,
+		labelAs = "span",
 		labelClassName,
 		visualClassName,
 		labelSuffix,
@@ -39,6 +41,7 @@ export function RepoIdentity(props: {
 			repoFullName={repoFullName}
 			repoVisual={repoVisual}
 			className={className}
+			labelAs={labelAs}
 			labelClassName={labelClassName}
 			visualClassName={visualClassName}
 			labelSuffix={labelSuffix}
@@ -51,6 +54,7 @@ export function RepoIdentity(props: {
 function RepoIdentityContent(props: {
 	repoFullName: string;
 	repoVisual: RepoVisual | null;
+	labelAs: "span" | "h1";
 	className?: string;
 	labelClassName?: string;
 	visualClassName?: string;
@@ -61,6 +65,7 @@ function RepoIdentityContent(props: {
 		repoFullName,
 		repoVisual,
 		className,
+		labelAs,
 		labelClassName,
 		visualClassName,
 		labelSuffix,
@@ -120,6 +125,7 @@ function RepoIdentityContent(props: {
 			? repoNameParts[repoNameParts.length - 1].trim()
 			: repoFullName.trim();
 	const fallbackLabel = fallbackSource.slice(0, 1).toUpperCase() || "?";
+	const Label = labelAs;
 
 	return (
 		<div
@@ -156,21 +162,21 @@ function RepoIdentityContent(props: {
 					<span aria-hidden="true">{fallbackLabel}</span>
 				)}
 			</span>
-			<span className="flex min-w-0 flex-col justify-center">
-				<span
+			<div className="flex min-w-0 flex-col justify-center">
+				<div
 					className="flex min-w-0 items-center gap-1.5"
 					data-repo-identity-label-row="true"
 				>
-					<span
+					<Label
 						className={cn("block min-w-0 truncate", labelClassName)}
 						data-repo-identity-label="true"
 					>
 						{repoFullName}
-					</span>
+					</Label>
 					{labelSuffix}
-				</span>
+				</div>
 				{children}
-			</span>
+			</div>
 		</div>
 	);
 }
