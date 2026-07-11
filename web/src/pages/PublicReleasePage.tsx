@@ -147,6 +147,13 @@ function usePublicReleaseReactionControls(
 	const requestedReleaseIdsRef = useRef(new Set<string>());
 	const reactionRefreshRetriesRef = useRef(new Map<string, number>());
 	const reactionRefreshRetryTimerRef = useRef<number | null>(null);
+	const reactionSessionRef = useRef({ userId, generation: 0 });
+	if (reactionSessionRef.current.userId !== userId) {
+		reactionSessionRef.current = {
+			userId,
+			generation: reactionSessionRef.current.generation + 1,
+		};
+	}
 	const enabled =
 		auth.isAuthenticated &&
 		!reactionAccessBlocked &&
@@ -211,6 +218,7 @@ function usePublicReleaseReactionControls(
 					(index + 1) * PUBLIC_RELEASE_REACTION_BATCH_SIZE,
 				),
 		);
+		const requestSessionGeneration = reactionSessionRef.current.generation;
 
 		void Promise.allSettled(
 			batches.map((batch) =>
@@ -220,6 +228,9 @@ function usePublicReleaseReactionControls(
 				),
 			),
 		).then((results) => {
+			if (reactionSessionRef.current.generation !== requestSessionGeneration) {
+				return;
+			}
 			const refreshed = results.flatMap((result) =>
 				result.status === "fulfilled" ? result.value.items : [],
 			);
@@ -271,6 +282,7 @@ function usePublicReleaseReactionControls(
 	const onToggle = useCallback(
 		(releaseId: string, content: ReactionContent) => {
 			if (!enabled || busyReleaseIds.has(releaseId)) return;
+			const requestSessionGeneration = reactionSessionRef.current.generation;
 			setBusyReleaseIds((current) => new Set(current).add(releaseId));
 			setErrorByReleaseId((current) => {
 				if (!(releaseId in current)) return current;
@@ -284,12 +296,22 @@ function usePublicReleaseReactionControls(
 				{ release_id: releaseId, content },
 			)
 				.then((response) => {
+					if (
+						reactionSessionRef.current.generation !== requestSessionGeneration
+					) {
+						return;
+					}
 					setByReleaseId((current) => ({
 						...current,
 						[response.release_id]: response.reactions,
 					}));
 				})
 				.catch((error) => {
+					if (
+						reactionSessionRef.current.generation !== requestSessionGeneration
+					) {
+						return;
+					}
 					if (
 						error instanceof ApiError &&
 						(error.code === "pat_invalid" || error.code === "pat_required")
@@ -312,6 +334,11 @@ function usePublicReleaseReactionControls(
 					}));
 				})
 				.finally(() => {
+					if (
+						reactionSessionRef.current.generation !== requestSessionGeneration
+					) {
+						return;
+					}
 					setBusyReleaseIds((current) => {
 						const next = new Set(current);
 						next.delete(releaseId);
