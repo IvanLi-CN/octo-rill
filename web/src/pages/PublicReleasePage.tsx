@@ -78,6 +78,8 @@ const PUBLIC_RELEASE_LIST_BODY_MAX_CHARS = 2800;
 const PUBLIC_RELEASE_PAGE_SIZE = 6;
 const PUBLIC_RELEASE_HIGHLIGHT_PAGE_SIZE = 30;
 const PUBLIC_RELEASE_REACTION_BATCH_SIZE = 100;
+const PUBLIC_RELEASE_REACTION_MAX_RETRIES = 3;
+const PUBLIC_RELEASE_REACTION_RETRY_DELAY_MS = 1_000;
 
 type PublicReleaseReactionControls = {
 	enabled: boolean;
@@ -134,6 +136,7 @@ function usePublicReleaseReactionControls(
 	const [errorByReleaseId, setErrorByReleaseId] = useState<
 		Record<string, string>
 	>({});
+	const [reactionRefreshGeneration, setReactionRefreshGeneration] = useState(0);
 	const releaseIdSignature = useMemo(
 		() =>
 			Array.from(new Set(items.map((item) => item.release_id)))
@@ -142,6 +145,8 @@ function usePublicReleaseReactionControls(
 		[items],
 	);
 	const requestedReleaseIdsRef = useRef(new Set<string>());
+	const reactionRefreshRetriesRef = useRef(new Map<string, number>());
+	const reactionRefreshRetryTimerRef = useRef<number | null>(null);
 	const enabled =
 		auth.isAuthenticated &&
 		!reactionAccessBlocked &&
@@ -155,13 +160,35 @@ function usePublicReleaseReactionControls(
 		);
 
 	useEffect(() => {
+		if (reactionRefreshRetryTimerRef.current !== null) {
+			window.clearTimeout(reactionRefreshRetryTimerRef.current);
+			reactionRefreshRetryTimerRef.current = null;
+		}
 		setReactionAccessBlocked(false);
 		setByReleaseId({});
 		setAvailableReleaseIds(new Set());
 		setBusyReleaseIds(new Set());
 		setErrorByReleaseId({});
 		requestedReleaseIdsRef.current = new Set();
+		reactionRefreshRetriesRef.current = new Map();
 	}, [userId]);
+
+	useEffect(
+		() => () => {
+			if (reactionRefreshRetryTimerRef.current !== null) {
+				window.clearTimeout(reactionRefreshRetryTimerRef.current);
+			}
+		},
+		[],
+	);
+
+	const scheduleReactionRefreshRetry = useCallback(() => {
+		if (reactionRefreshRetryTimerRef.current !== null) return;
+		reactionRefreshRetryTimerRef.current = window.setTimeout(() => {
+			reactionRefreshRetryTimerRef.current = null;
+			setReactionRefreshGeneration((current) => current + 1);
+		}, PUBLIC_RELEASE_REACTION_RETRY_DELAY_MS);
+	}, []);
 
 	useEffect(() => {
 		if (!enabled || !releaseIdSignature) return;
@@ -185,39 +212,61 @@ function usePublicReleaseReactionControls(
 				),
 		);
 
-		void Promise.all(
+		void Promise.allSettled(
 			batches.map((batch) =>
 				apiPostJson<FeedReactionRefreshResponse>(
 					"/api/feed/reactions/refresh",
 					{ release_ids: batch },
 				),
 			),
-		)
-			.then((responses) => {
-				const refreshed = responses.flatMap((response) => response.items);
-				setByReleaseId((current) => ({
-					...current,
-					...Object.fromEntries(
-						refreshed.map((item) => [item.release_id, item.reactions]),
-					),
-				}));
-				setAvailableReleaseIds(
-					(current) =>
-						new Set([...current, ...refreshed.map((item) => item.release_id)]),
-				);
-			})
-			.catch((error) => {
-				for (const releaseId of releaseIds) {
+		).then((results) => {
+			const refreshed = results.flatMap((result) =>
+				result.status === "fulfilled" ? result.value.items : [],
+			);
+			for (const item of refreshed) {
+				reactionRefreshRetriesRef.current.delete(item.release_id);
+			}
+			setByReleaseId((current) => ({
+				...current,
+				...Object.fromEntries(
+					refreshed.map((item) => [item.release_id, item.reactions]),
+				),
+			}));
+			setAvailableReleaseIds(
+				(current) =>
+					new Set([...current, ...refreshed.map((item) => item.release_id)]),
+			);
+
+			let shouldRetry = false;
+			for (const [index, result] of results.entries()) {
+				if (result.status === "fulfilled") continue;
+				const failedReleaseIds = batches[index] ?? [];
+				for (const releaseId of failedReleaseIds) {
 					requestedReleaseIdsRef.current.delete(releaseId);
 				}
 				if (
-					error instanceof ApiError &&
-					(error.code === "pat_invalid" || error.code === "pat_required")
+					result.reason instanceof ApiError &&
+					(result.reason.code === "pat_invalid" ||
+						result.reason.code === "pat_required")
 				) {
 					setReactionAccessBlocked(true);
+					continue;
 				}
-			});
-	}, [enabled, releaseIdSignature]);
+				for (const releaseId of failedReleaseIds) {
+					const retries =
+						(reactionRefreshRetriesRef.current.get(releaseId) ?? 0) + 1;
+					reactionRefreshRetriesRef.current.set(releaseId, retries);
+					shouldRetry ||= retries <= PUBLIC_RELEASE_REACTION_MAX_RETRIES;
+				}
+			}
+			if (shouldRetry) scheduleReactionRefreshRetry();
+		});
+	}, [
+		enabled,
+		reactionRefreshGeneration,
+		releaseIdSignature,
+		scheduleReactionRefreshRetry,
+	]);
 
 	const onToggle = useCallback(
 		(releaseId: string, content: ReactionContent) => {
