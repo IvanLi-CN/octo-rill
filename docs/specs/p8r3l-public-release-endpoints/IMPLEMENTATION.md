@@ -29,7 +29,7 @@
 - 高亮列表复用 `repo_releases` 唯一 ID 与仓库排序索引，响应增加连续 segments、内部 gaps、精确命中进度和双向 bounded cursor。
 - 页面统一使用动态高度 window virtualization，内部 gap 接近视口后自动填充；右下浮动导航按页面时间顺序切换 active 目标并保持详情往返上下文。
 - 公开列表页将页面级 lane 状态提升到 owner/avatar 加仓库名的标题带：宽度足够时同行，窄屏时 selector 整块换行；列表卡片不再重复仓库身份、lane 或 GitHub 操作，翻译 hydration 继续由页面级 lane 驱动。
-- 公开列表复用现有 `AuthBootstrap` 和 reaction token 查询键：匿名会话不发起 PAT 状态查询；认证会话的 PAT 为 `configured + valid` 后，按最多 100 条一批刷新反应，且只有接口确认可操作的 Release 显示控件。列表窗口在刷新途中变化时仍合并已发出的有效响应，避免控件因 pagination、gap 或高亮加载竞态而永久隐藏；非 PAT 的失败批次独立重试最多三次，成功批次仍立即合并。`pat_required` / `pat_invalid` / `not_found` 会即时撤下相关控件，避免提供无法提交的操作。
+- 公开列表复用现有 `AuthBootstrap` 和 reaction token 查询键：匿名会话不发起 PAT 状态查询；认证会话的 PAT 为 `configured + valid` 后，按最多 100 条一批刷新反应，且只有接口确认可操作的 Release 显示控件。列表窗口在刷新途中变化时仍合并已发出的有效响应，避免控件因 pagination、gap 或高亮加载竞态而永久隐藏；非 PAT 的失败批次独立重试最多三次，成功批次仍立即合并。刷新和切换请求均绑定认证会话 generation，用户切换后的旧响应直接丢弃。`pat_required` / `pat_invalid` / `not_found` 会即时撤下相关控件，避免提供无法提交的操作。
 
 ## Verification
 
