@@ -15,7 +15,7 @@ use axum::response::{
     IntoResponse, Response,
     sse::{Event, KeepAlive, Sse},
 };
-use chrono::{DateTime, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Timelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -94,9 +94,7 @@ struct DispatchStateRow {
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct DailySlotUserRow {
     id: String,
-    daily_brief_local_time: Option<String>,
     daily_brief_time_zone: Option<String>,
-    daily_brief_utc_time: String,
     last_active_at: Option<String>,
 }
 
@@ -106,6 +104,8 @@ struct DailySlotUserSnapshot {
     last_active_at: Option<String>,
     key_date: String,
     local_boundary: String,
+    #[serde(default)]
+    scheduled_local_time: Option<String>,
     #[serde(default)]
     effective_local_boundary: Option<String>,
     time_zone: String,
@@ -425,7 +425,7 @@ pub async fn enqueue_recent_failures_retry_if_due(
 }
 
 pub async fn enqueue_brief_history_recompute_if_needed(state: &AppState) -> Result<Option<String>> {
-    if ai::legacy_brief_count(state).await? == 0 {
+    if ai::brief_history_recompute_candidate_count(state).await? == 0 {
         return Ok(None);
     }
 
@@ -1929,6 +1929,7 @@ async fn execute_task(
             } else {
                 ai::generate_daily_brief_snapshot_for_current(state, user_id.as_str()).await?
             };
+            let preferences = briefs::load_daily_brief_preferences(state, user_id.as_str()).await?;
             Ok(json!({
                 "brief_id": snapshot.id,
                 "content_length": snapshot.content_markdown.chars().count(),
@@ -1937,6 +1938,7 @@ async fn execute_task(
                 "window_end_utc": snapshot.window_end,
                 "effective_time_zone": snapshot.effective_time_zone,
                 "effective_local_boundary": snapshot.effective_local_boundary,
+                "scheduled_local_time": briefs::format_daily_brief_local_time(preferences.local_time),
                 "release_count": snapshot.release_ids.len(),
             }))
         }
@@ -2128,6 +2130,7 @@ async fn execute_daily_slot_task(
                 "last_active_at": user.last_active_at,
                 "key_date": user.window.key_date,
                 "local_boundary": user.window.effective_local_boundary,
+                "scheduled_local_time": briefs::format_daily_brief_local_time(user.preferences.local_time),
                 "time_zone": user.preferences.time_zone,
                 "window_start_utc": user.window.start_utc.to_rfc3339(),
                 "window_end_utc": user.window.end_utc.to_rfc3339(),
@@ -2157,6 +2160,7 @@ async fn execute_daily_slot_task(
                         "brief_id": snapshot.id,
                         "content_length": snapshot.content_markdown.chars().count(),
                         "local_boundary": snapshot.effective_local_boundary,
+                        "scheduled_local_time": briefs::format_daily_brief_local_time(user.preferences.local_time),
                         "time_zone": snapshot.effective_time_zone,
                         "window_start_utc": snapshot.window_start,
                         "window_end_utc": snapshot.window_end,
@@ -2177,6 +2181,7 @@ async fn execute_daily_slot_task(
                         "user_id": user.user_id,
                         "key_date": user.window.key_date,
                         "local_boundary": user.window.effective_local_boundary,
+                        "scheduled_local_time": briefs::format_daily_brief_local_time(user.preferences.local_time),
                         "time_zone": user.preferences.time_zone,
                         "error": err.to_string(),
                     }),
@@ -2231,13 +2236,12 @@ async fn collect_due_daily_slot_user_snapshots(
     slot_reference_utc: DateTime<Utc>,
     target_hour_key: &str,
 ) -> Result<Vec<DailySlotUserSnapshot>> {
+    let schedule_local_time = briefs::load_effective_daily_brief_local_time(state).await?;
     let users = sqlx::query_as::<_, DailySlotUserRow>(
         r#"
         SELECT
           id,
-          daily_brief_local_time,
           daily_brief_time_zone,
-          daily_brief_utc_time,
           last_active_at
         FROM users
         WHERE is_disabled = 0
@@ -2253,23 +2257,40 @@ async fn collect_due_daily_slot_user_snapshots(
 
     let mut due_users = Vec::new();
     for row in users {
-        let preferences = briefs::derive_daily_brief_preferences(
-            &state.config,
-            row.daily_brief_local_time.as_deref(),
-            row.daily_brief_time_zone.as_deref(),
-            Some(row.daily_brief_utc_time.as_str()),
-            slot_reference_utc,
-        );
-        let window = briefs::compute_current_daily_window(&preferences, slot_reference_utc)
-            .with_context(|| format!("failed to compute current window for user {}", row.id))?;
-        if window.end_utc.format("%Y-%m-%dT%H").to_string() != target_hour_key {
+        let preferences = briefs::DailyBriefPreferences {
+            local_time: schedule_local_time,
+            time_zone: briefs::resolve_daily_brief_time_zone(
+                briefs::default_daily_brief_time_zone(&state.config),
+                row.daily_brief_time_zone.as_deref(),
+            ),
+        };
+        let reference_local =
+            briefs::convert_daily_brief_utc_to_local(&preferences.time_zone, slot_reference_utc)
+                .with_context(|| format!("failed to convert slot reference for user {}", row.id))?;
+        let scheduled_local = briefs::resolve_daily_brief_local_datetime(
+            &preferences.time_zone,
+            NaiveDateTime::new(reference_local.date_naive(), preferences.local_time),
+        )
+        .with_context(|| format!("failed to compute scheduled local time for user {}", row.id))?;
+        if scheduled_local
+            .with_timezone(&Utc)
+            .format("%Y-%m-%dT%H")
+            .to_string()
+            != target_hour_key
+        {
             continue;
         }
+        let key_date = scheduled_local.date_naive() - chrono::Duration::days(1);
+        let window = briefs::compute_daily_window_for_key_date(&preferences, key_date)
+            .with_context(|| format!("failed to compute natural-day window for user {}", row.id))?;
         due_users.push(DailySlotUserSnapshot {
             user_id: row.id,
             last_active_at: row.last_active_at,
             key_date: window.key_date.to_string(),
             local_boundary: briefs::format_daily_brief_local_time(preferences.local_time),
+            scheduled_local_time: Some(briefs::format_daily_brief_local_time(
+                preferences.local_time,
+            )),
             effective_local_boundary: Some(window.effective_local_boundary.clone()),
             time_zone: preferences.time_zone,
             window_start_utc: window.start_utc.to_rfc3339(),
@@ -2319,13 +2340,16 @@ fn due_daily_slot_user_from_snapshot(snapshot: DailySlotUserSnapshot) -> Result<
                 snapshot.user_id
             )
         })?;
-    let local_time = briefs::parse_daily_brief_local_time(snapshot.local_boundary.as_str())
+    let _local_time = briefs::parse_daily_brief_local_time(snapshot.local_boundary.as_str())
         .with_context(|| {
             format!(
                 "invalid daily slot snapshot local_boundary for user {}",
                 snapshot.user_id
             )
         })?;
+    let scheduled_local_time = snapshot
+        .scheduled_local_time
+        .unwrap_or_else(|| snapshot.local_boundary.clone());
     let effective_local_boundary = snapshot
         .effective_local_boundary
         .unwrap_or_else(|| snapshot.local_boundary.clone());
@@ -2335,6 +2359,13 @@ fn due_daily_slot_user_from_snapshot(snapshot: DailySlotUserSnapshot) -> Result<
             snapshot.user_id
         )
     })?;
+    let scheduled_local_time = briefs::parse_daily_brief_local_time(scheduled_local_time.as_str())
+        .with_context(|| {
+            format!(
+                "invalid daily slot snapshot scheduled_local_time for user {}",
+                snapshot.user_id
+            )
+        })?;
     let time_zone =
         briefs::parse_daily_brief_time_zone(snapshot.time_zone.as_str()).with_context(|| {
             format!(
@@ -2369,7 +2400,7 @@ fn due_daily_slot_user_from_snapshot(snapshot: DailySlotUserSnapshot) -> Result<
         user_id: snapshot.user_id,
         last_active_at: snapshot.last_active_at,
         preferences: briefs::DailyBriefPreferences {
-            local_time,
+            local_time: scheduled_local_time,
             time_zone: time_zone.clone(),
         },
         window: briefs::DailyWindow {
@@ -2385,14 +2416,9 @@ fn due_daily_slot_user_from_snapshot(snapshot: DailySlotUserSnapshot) -> Result<
 }
 
 async fn execute_brief_history_recompute_task(state: &AppState, task_id: &str) -> Result<Value> {
-    #[derive(Debug, sqlx::FromRow)]
-    struct LegacyBriefRow {
-        id: String,
-        user_id: String,
-        date: String,
-    }
-
-    let total = ai::legacy_brief_count(state).await?;
+    let rows = ai::load_brief_history_recompute_candidates(state).await?;
+    let total = i64::try_from(rows.len())
+        .context("brief history recompute candidate count overflowed i64")?;
     append_task_event(
         state,
         task_id,
@@ -2429,18 +2455,6 @@ async fn execute_brief_history_recompute_task(state: &AppState, task_id: &str) -
             "canceled": false,
         }));
     }
-
-    let rows = sqlx::query_as::<_, LegacyBriefRow>(
-        r#"
-        SELECT id, user_id, date
-        FROM briefs
-        WHERE generation_source IN ('legacy', 'history_recompute_failed')
-        ORDER BY date DESC, created_at DESC, id DESC
-        "#,
-    )
-    .fetch_all(&state.pool)
-    .await
-    .context("failed to query legacy briefs for recompute")?;
 
     let mut processed = 0usize;
     let mut succeeded = 0usize;
@@ -3734,7 +3748,7 @@ mod tests {
         recover_runtime_state, recover_runtime_state_on_startup, retry_candidate_is_retryable,
         update_daily_brief_hour_slot_dispatch, upsert_dispatch_state,
     };
-    use chrono::{Duration, TimeZone, Utc};
+    use chrono::{Duration, NaiveTime, TimeZone, Utc};
     use serde_json::{Value, json};
     use sqlx::{
         Row, SqlitePool,
@@ -3881,6 +3895,14 @@ mod tests {
         let state = setup_state(pool.clone());
         let now = "2026-04-13T00:00:00Z";
 
+        crate::admin_runtime::update_daily_brief_schedule_local_time(
+            &pool,
+            &state.config,
+            NaiveTime::from_hms_opt(8, 0, 0).expect("valid schedule"),
+        )
+        .await
+        .expect("set global daily brief schedule");
+
         sqlx::query(
             r#"
             UPDATE daily_brief_hour_slots
@@ -3942,17 +3964,18 @@ mod tests {
         assert_eq!(users.len(), 1);
         assert_eq!(payload["hour_key"], json!("2026-04-13T00"));
         assert_eq!(users[0]["user_id"], json!("slot-user"));
-        assert_eq!(users[0]["key_date"], json!("2026-04-13"));
+        assert_eq!(users[0]["key_date"], json!("2026-04-12"));
         assert_eq!(users[0]["local_boundary"], json!("08:00"));
-        assert_eq!(users[0]["effective_local_boundary"], json!("08:00"));
+        assert_eq!(users[0]["scheduled_local_time"], json!("08:00"));
+        assert_eq!(users[0]["effective_local_boundary"], json!("00:00"));
         assert_eq!(users[0]["time_zone"], json!("Asia/Shanghai"));
         assert_eq!(
             users[0]["window_start_utc"],
-            json!("2026-04-12T00:00:00+00:00")
+            json!("2026-04-11T16:00:00+00:00")
         );
         assert_eq!(
             users[0]["window_end_utc"],
-            json!("2026-04-13T00:00:00+00:00")
+            json!("2026-04-12T16:00:00+00:00")
         );
     }
 
@@ -3961,6 +3984,14 @@ mod tests {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         let now = "2026-03-08T00:00:00Z";
+
+        crate::admin_runtime::update_daily_brief_schedule_local_time(
+            &pool,
+            &state.config,
+            NaiveTime::from_hms_opt(2, 0, 0).expect("valid schedule"),
+        )
+        .await
+        .expect("set dst-gap daily brief schedule");
 
         sqlx::query(
             r#"
@@ -4025,7 +4056,8 @@ mod tests {
         let users = payload["users"].as_array().expect("users array");
         assert_eq!(users.len(), 1);
         assert_eq!(users[0]["local_boundary"], json!("02:00"));
-        assert_eq!(users[0]["effective_local_boundary"], json!("03:00"));
+        assert_eq!(users[0]["scheduled_local_time"], json!("02:00"));
+        assert_eq!(users[0]["effective_local_boundary"], json!("00:00"));
 
         let due_users = load_due_daily_slot_users(
             state.as_ref(),
@@ -4039,7 +4071,7 @@ mod tests {
         .expect("load due users from payload");
         assert_eq!(due_users.len(), 1);
         assert_eq!(due_users[0].preferences.local_time.to_string(), "02:00:00");
-        assert_eq!(due_users[0].window.effective_local_boundary, "03:00");
+        assert_eq!(due_users[0].window.effective_local_boundary, "00:00");
     }
 
     #[tokio::test]

@@ -304,7 +304,7 @@ impl AppConfig {
                     .context("invalid AI_DAILY_AT_LOCAL (expected HH:MM)")
             })
             .transpose()?
-            .or_else(|| chrono::NaiveTime::from_hms_opt(8, 0, 0));
+            .or_else(|| chrono::NaiveTime::from_hms_opt(6, 0, 0));
 
         let legacy_runtime_time_zone = iana_time_zone::get_timezone().ok();
         let app_default_time_zone = resolve_app_default_time_zone(

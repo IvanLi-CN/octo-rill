@@ -1,21 +1,21 @@
-# Dashboard 按日报边界分组与历史日报折叠（#xaycu）
+# Dashboard 按自然日分组与历史日报折叠（#xaycu）
 
 ## 背景 / 问题陈述
 
 - Dashboard 首页当前把 `全部` 与 `发布` 两个 tab 都渲染为同一条平铺 Release feed，缺少“按天阅读”的结构感。
 - 用户在连续浏览多天 Release 时，很难快速分辨“今天”和“之前每天”的边界，也无法先看日报、再按需展开某一天的原始 Release 细节。
-- 现有前端只有 `/api/briefs` 返回的日报样本窗口，没有一个稳定的 Dashboard 启动期“日报边界”配置可用于对 feed 做统一分组。
+- 现有前端只有 `/api/briefs` 返回的日报样本窗口，没有一个稳定的 Dashboard 启动期“自然日边界”配置可用于对 feed 做统一分组。
 
 ## 目标 / 非目标
 
 ### Goals
 
-- 让 `发布` tab 按统一日报边界分组，并仅在日组切换处显示弱化的日期分隔线。
+- 让 `发布` tab 按统一本地自然日分组，并仅在日组切换处显示弱化的日期分隔线。
 - 让 `全部` tab 保持“今天”直接展示原始 Release 卡片，而更早的日组优先以真实日报内容呈现。
 - 历史日组在命中对应日报时，允许用户在“日报视图”和“日期分界 + 原始 Release 列表”之间来回切换。
 - 当历史日组没有对应日报时，退回为 `发布` tab 同款的日期分隔线 + 原始 Release 卡片。
 - 当历史日组没有对应日报时，允许用户按天手动触发日报生成，并在生成中看到占位日报卡片。
-- 补齐 Dashboard 启动期可消费的日报边界配置，并同步更新 Storybook 与视觉证据。
+- 补齐 Dashboard 启动期可消费的自然日分组配置，并同步更新 Storybook 与视觉证据。
 
 ### Non-goals
 
@@ -46,15 +46,15 @@
 
 ### MUST
 
-- Dashboard 必须拿到稳定的“日报边界本地时间”配置，不依赖从已有 brief 样本反推。
-- `发布` tab 的 feed 必须按日报边界切分成多个日组。
+- Dashboard 必须拿到稳定的“本地自然日边界”配置，不依赖从已有 brief 样本反推。
+- `发布` tab 的 feed 必须按本地自然日切分成多个日组。
 - 每个日组的分隔线必须显示日期与当日 Release 数，视觉上弱化为结构分隔，而不是主标题；首个可见日组不显示前置分隔。
 - `全部` tab 中，当前日组必须继续直接展示原始 Release 卡片。
 - `全部` tab 中，历史日组若有对应日报，默认只展示真实日报内容，并提供切换到原始 Release 列表的入口。
 - `全部` tab 中，历史日组若切换到原始 Release 列表，则不再同时显示日报卡片，且日期分界右侧必须提供返回日报视图的按钮。
 - `全部` tab 中，历史日组若无对应日报，必须直接展示原始 Release 列表，不显示伪摘要。
 - 非 scoped 的全局 `全部` tab 中，历史日组若无对应日报，日期分界右侧必须提供“生成日报”按钮；触发后按钮进入 spinning 状态，同时显示占位日报卡片，待生成成功后替换为真实日报。
-- scoped focus 页只复用按日报边界划分日期组的能力；无论全局日报是否存在，都只展示当前 scope 的原始仓库信息流，不继承日报折叠、覆盖隐藏、日报/列表切换或按天生成动作。
+- scoped focus 页只复用按本地自然日划分日期组的能力；无论全局日报是否存在，都只展示当前 scope 的原始仓库信息流，不继承日报折叠、覆盖隐藏、日报/列表切换或按天生成动作。
 - 历史日组手动生成日报若失败，失败信息必须留在原地的日报容器内，并提供“重试日报”按钮；不能只依赖短暂 toast。
 - 历史日组的展开状态必须彼此独立，且不写入 URL 或本地持久化。
 
@@ -72,7 +72,7 @@
 
 ### Core flows
 
-- 用户进入 `发布` tab 时，主列先按日报边界分组，再依序显示每个日组下的原始 Release 卡片。
+- 用户进入 `发布` tab 时，主列先按本地自然日分组，再依序显示每个日组下的原始 Release 卡片。
 - 用户进入 `全部` tab 时，当前日组保持原始 Release feed；更早的日组若命中日报，则优先显示一个卡头继承 divider 语言的日报卡片。
 - 用户点击历史日组的“列表”后，该组切换为“日期分界 + 原始 Release 列表”，不再同时显示日报卡片。
 - 用户点击历史日组分界右侧的“日报”后，该组重新切回日报卡片视图。
@@ -84,7 +84,7 @@
 
 - 当 feed 某日没有对应 brief 时，`全部` tab 不显示“日报不可用”错误文案，而是直接退回原始 Release 列表。
 - 分组后仍需保留无限滚动与可见窗口自动翻译：新加载的 Release 进入正确日组，不得丢失 card ref 注册。
-- 若 Dashboard 启动配置缺失或异常，前端必须回退到 `08:00` 作为日报边界，保持分组稳定。
+- 若 Dashboard 启动配置缺失或异常，前端必须回退到 `00:00` 作为自然日边界，保持分组稳定。
 
 ## 接口契约（Interfaces & Contracts）
 
@@ -93,13 +93,13 @@
   ```json
   {
     "dashboard": {
-      "daily_boundary_local": "08:00",
+      "daily_boundary_local": "00:00",
       "daily_boundary_time_zone": "Asia/Shanghai",
       "daily_boundary_utc_offset_minutes": 480
     }
   }
   ```
-  - `daily_boundary_local` 语义为 Dashboard feed 分组使用的本地日报边界时间，格式固定为 `HH:MM`。
+  - `daily_boundary_local` 语义为 Dashboard feed 分组使用的本地自然日边界时间，当前固定为 `00:00`。
   - `daily_boundary_time_zone` 语义为 Dashboard feed 分组时使用的服务端 IANA 时区；前端必须按该时区解释 feed timestamps 与 brief key date，避免浏览器本地时区漂移。
   - `daily_boundary_utc_offset_minutes` 语义为服务端当前本地 UTC 偏移分钟数；当前端拿不到可用 IANA 时区时，必须退回该固定偏移而不是浏览器本地时区。
 - `GET /api/feed` 与 `GET /api/briefs`
@@ -160,7 +160,7 @@
 ### Visual verification
 
 - 使用 Storybook 稳定场景覆盖：
-  - `发布` tab 按日报边界分组
+  - `发布` tab 按自然日分组
   - `全部` tab 历史日报折叠
   - `全部` tab 历史组缺日报 fallback
   - `全部` tab 历史组手动生成日报
@@ -171,8 +171,8 @@
 - 交互态细节（`列表` 后切回原始列表、`生成日报` 的 spinning 与占位日报、生成完成后的替换）由 Storybook `play` 覆盖校验。
 - 失败态（首次生成失败后的原位报错/重试）由 Storybook `play` 覆盖校验。
 
-- `发布` tab 按日报边界分组
-![发布 tab 按日报边界分组](./assets/dashboard-releases-grouped.png)
+- `发布` tab 按自然日分组
+![发布 tab 按自然日分组](./assets/dashboard-releases-grouped.png)
 
 - `全部` tab 历史日报默认折叠为日报摘要
 ![全部 tab 历史日报默认折叠](./assets/dashboard-all-history-collapsed.png)
@@ -186,12 +186,12 @@
 - `全部` tab 历史日组首次生成失败后，错误会原地留在日报容器里，并提供“重试日报”入口
 ![全部 tab 历史日组生成失败原地重试](./assets/dashboard-all-history-generate-error-retry.png)
 
-- `全部` tab 使用线上同时间段数据脱敏后的 mock：5月8日 10:39 后直接进入 5月7日日报周期，07:56 明细被日报覆盖隐藏
-![全部 tab 线上脱敏数据周期分割线](./assets/dashboard-sanitized-production-may8-boundary.png)
+- `全部` tab 使用线上同时间段数据脱敏后的 mock：5月7日 brief 保持在上一自然日组，5月8日 07:56 的 early-morning release 仍留在 5月8日自然日组
+![全部 tab 线上脱敏数据自然日分组](./assets/dashboard-sanitized-production-may8-boundary.png)
 
 ## 方案概述（Approach, high-level）
 
-- 在 Dashboard 启动数据中新增日报边界时间，让前端不再从 brief 样本推断分组规则。
+- 在 Dashboard 启动数据中固定返回 `00:00` 作为自然日边界，让前端不再把“自动出报时间”误当成 feed 分组规则。
 - 基于“窗口起点日”生成 feed 日组：当前日组保持原始 Release；历史日组按“brief 优先，否则回退 release 列表”渲染。
 - 把分组 helper 与新渲染容器沉到 `web/src/feed/`，由运行时 Dashboard 和 Storybook preview 共同消费。
 - 保持 `FeedItemCard`、自动翻译注册、反应按钮与详情弹窗逻辑不变，只重排日组容器层。

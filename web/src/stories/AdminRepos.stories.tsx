@@ -99,6 +99,7 @@ const governanceOverviewSeed: AdminRepoGovernanceOverviewResponse = {
 		retry_recent_failures_interval_minutes: 10,
 		repo_release_worker_concurrency: 8,
 		repo_refresh_system_budget_per_window: 1000,
+		daily_brief_schedule_local_time: "06:00",
 		recent_sync_tasks: [
 			{
 				id: "task-subscription-1010",
@@ -362,6 +363,7 @@ function AdminReposPreview(props: AdminReposPreviewProps) {
 				const body = (await req.json()) as {
 					sync_auto_fetch_interval_minutes?: number;
 					repo_refresh_system_budget_per_window?: number;
+					daily_brief_schedule_local_time?: string;
 				};
 				overview = {
 					...overview,
@@ -375,6 +377,9 @@ function AdminReposPreview(props: AdminReposPreviewProps) {
 							body.repo_refresh_system_budget_per_window ??
 								overview.settings.repo_refresh_system_budget_per_window,
 						),
+						daily_brief_schedule_local_time:
+							body.daily_brief_schedule_local_time ??
+							overview.settings.daily_brief_schedule_local_time,
 					},
 				};
 				return new Response(JSON.stringify(overview.settings), {

@@ -236,7 +236,6 @@ export function UserManagement({
 	const [profile, setProfile] = useState<AdminUserProfileResponse | null>(null);
 	const [profileSaving, setProfileSaving] = useState(false);
 	const [profileDraft, setProfileDraft] = useState({
-		daily_brief_local_time: "08:00",
 		daily_brief_time_zone: readHourAlignedBrowserTimeZone() ?? "Asia/Shanghai",
 	});
 
@@ -359,7 +358,6 @@ export function UserManagement({
 			const detail = await apiGetAdminUserProfile(user.id);
 			setProfile(detail);
 			setProfileDraft({
-				daily_brief_local_time: detail.daily_brief_local_time,
 				daily_brief_time_zone: detail.daily_brief_time_zone,
 			});
 		} catch (err) {
@@ -379,7 +377,6 @@ export function UserManagement({
 			);
 			setProfile(detail);
 			setProfileDraft({
-				daily_brief_local_time: detail.daily_brief_local_time,
 				daily_brief_time_zone: detail.daily_brief_time_zone,
 			});
 			await loadUsers({ clearError: false });
@@ -855,17 +852,10 @@ export function UserManagement({
 						</div>
 
 						<DailyBriefProfileForm
-							localTime={profileDraft.daily_brief_local_time}
 							timeZone={profileDraft.daily_brief_time_zone}
 							disabled={profileLoading || profileSaving}
 							error={profileError}
-							helperText="修改的是这个用户未来的日报边界；历史日报快照不会被覆写。管理员替别人修改时，必须显式写入目标用户时区。"
-							onLocalTimeChange={(value) =>
-								setProfileDraft((current) => ({
-									...current,
-									daily_brief_local_time: value,
-								}))
-							}
+							helperText="修改的是这个用户未来的日报时区归属；历史日报快照不会被覆写。"
 							onTimeZoneChange={(value) =>
 								setProfileDraft((current) => ({
 									...current,

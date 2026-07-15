@@ -1,11 +1,12 @@
 use std::env;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{NaiveTime, Utc};
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 
 use crate::{
+    briefs,
     config::AppConfig,
     state::AppState,
     translations::{
@@ -22,6 +23,7 @@ pub struct AdminRuntimeSettingsSnapshot {
     pub translation_general_worker_concurrency: usize,
     pub translation_dedicated_worker_concurrency: usize,
     pub repo_release_worker_concurrency: usize,
+    pub daily_brief_schedule_local_time: NaiveTime,
 }
 
 pub const DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES: i64 = 60;
@@ -30,6 +32,17 @@ pub const DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY: usize = 8;
 pub const MAX_REPO_RELEASE_WORKER_CONCURRENCY: usize = 32;
 pub const DEFAULT_REPO_REFRESH_SYSTEM_BUDGET_PER_WINDOW: i64 = 1000;
 pub const MAX_REPO_REFRESH_SYSTEM_BUDGET_PER_WINDOW: i64 = 20_000;
+
+fn default_daily_brief_schedule_local_time(config: &AppConfig) -> NaiveTime {
+    config
+        .ai_daily_at_local
+        .unwrap_or_else(|| NaiveTime::from_hms_opt(6, 0, 0).expect("06:00 is valid"))
+}
+
+fn parse_daily_brief_schedule_local_time(raw: &str, config: &AppConfig) -> NaiveTime {
+    briefs::parse_daily_brief_local_time(raw)
+        .unwrap_or_else(|_| default_daily_brief_schedule_local_time(config))
+}
 
 pub fn normalize_sync_auto_fetch_interval_minutes(value: i64) -> i64 {
     value.clamp(1, 120)
@@ -49,6 +62,67 @@ pub fn normalize_repo_release_worker_concurrency(value: i64) -> usize {
 
 pub fn normalize_repo_refresh_system_budget_per_window(value: i64) -> i64 {
     value.clamp(1, MAX_REPO_REFRESH_SYSTEM_BUDGET_PER_WINDOW)
+}
+
+pub async fn load_daily_brief_schedule_local_time(
+    pool: &SqlitePool,
+    config: &AppConfig,
+) -> Result<NaiveTime> {
+    let local_time = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT daily_brief_schedule_local_time
+        FROM admin_runtime_settings
+        WHERE id = 1
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or_else(|| {
+        briefs::format_daily_brief_local_time(default_daily_brief_schedule_local_time(config))
+    });
+
+    Ok(parse_daily_brief_schedule_local_time(
+        local_time.as_str(),
+        config,
+    ))
+}
+
+pub async fn update_daily_brief_schedule_local_time(
+    pool: &SqlitePool,
+    config: &AppConfig,
+    local_time: NaiveTime,
+) -> Result<NaiveTime> {
+    let now = Utc::now().to_rfc3339();
+    let local_time = briefs::format_daily_brief_local_time(local_time);
+    sqlx::query(
+        r#"
+        INSERT INTO admin_runtime_settings (
+          id,
+          llm_max_concurrency,
+          translation_general_worker_concurrency,
+          translation_dedicated_worker_concurrency,
+          sync_auto_fetch_interval_minutes,
+          daily_brief_schedule_local_time,
+          created_at,
+          updated_at
+        )
+        VALUES (1, 1, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          daily_brief_schedule_local_time = excluded.daily_brief_schedule_local_time,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
+    .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
+    .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
+    .bind(local_time.as_str())
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .execute(pool)
+    .await?;
+
+    load_daily_brief_schedule_local_time(pool, config).await
 }
 
 pub async fn load_repo_release_worker_concurrency(pool: &SqlitePool) -> Result<usize> {
@@ -429,6 +503,7 @@ pub async fn load_or_seed_runtime_settings(
         translation_general_worker_concurrency: DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY,
         translation_dedicated_worker_concurrency: DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
         repo_release_worker_concurrency: DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY,
+        daily_brief_schedule_local_time: default_daily_brief_schedule_local_time(config),
     };
     let now = Utc::now().to_rfc3339();
     sqlx::query(
@@ -442,10 +517,11 @@ pub async fn load_or_seed_runtime_settings(
           translation_general_worker_concurrency,
           translation_dedicated_worker_concurrency,
           repo_release_worker_concurrency,
+          daily_brief_schedule_local_time,
           created_at,
           updated_at
         )
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO NOTHING
         "#,
     )
@@ -456,6 +532,9 @@ pub async fn load_or_seed_runtime_settings(
     .bind(i64::try_from(snapshot.translation_general_worker_concurrency).unwrap_or(i64::MAX))
     .bind(i64::try_from(snapshot.translation_dedicated_worker_concurrency).unwrap_or(i64::MAX))
     .bind(i64::try_from(snapshot.repo_release_worker_concurrency).unwrap_or(i64::MAX))
+    .bind(briefs::format_daily_brief_local_time(
+        snapshot.daily_brief_schedule_local_time,
+    ))
     .bind(now.as_str())
     .bind(now.as_str())
     .execute(pool)
@@ -572,7 +651,8 @@ async fn fetch_runtime_settings(pool: &SqlitePool) -> Result<Option<AdminRuntime
           llm_models_json,
           translation_general_worker_concurrency,
           translation_dedicated_worker_concurrency,
-          repo_release_worker_concurrency
+          repo_release_worker_concurrency,
+          daily_brief_schedule_local_time
         FROM admin_runtime_settings
         WHERE id = 1
         LIMIT 1
@@ -598,6 +678,11 @@ async fn fetch_runtime_settings(pool: &SqlitePool) -> Result<Option<AdminRuntime
         repo_release_worker_concurrency: normalize_repo_release_worker_concurrency(
             row.get::<i64, _>("repo_release_worker_concurrency"),
         ),
+        daily_brief_schedule_local_time: briefs::parse_daily_brief_local_time(
+            row.get::<String, _>("daily_brief_schedule_local_time")
+                .as_str(),
+        )
+        .unwrap_or_else(|_| NaiveTime::from_hms_opt(6, 0, 0).expect("06:00 is valid")),
     }))
 }
 

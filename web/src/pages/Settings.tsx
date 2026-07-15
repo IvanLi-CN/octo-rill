@@ -365,15 +365,12 @@ export function SettingsPage(props: {
 	const [briefProfileLoading, setBriefProfileLoading] = useState(true);
 	const [briefProfileSaving, setBriefProfileSaving] = useState(false);
 	const [ownReleaseSaving, setOwnReleaseSaving] = useState(false);
-	const [_briefProfile, setBriefProfile] = useState<MeProfileResponse | null>(
-		null,
-	);
+	const [, setBriefProfile] = useState<MeProfileResponse | null>(null);
 	const [briefProfileError, setBriefProfileError] = useState<string | null>(
 		null,
 	);
 	const [briefProfileDraft, setBriefProfileDraft] =
 		useState<DailyBriefProfilePatchRequest>({
-			daily_brief_local_time: me.dashboard.daily_boundary_local,
 			daily_brief_time_zone:
 				me.dashboard.daily_boundary_time_zone ??
 				readHourAlignedBrowserTimeZone() ??
@@ -453,7 +450,6 @@ export function SettingsPage(props: {
 			const profile = await apiGetMeProfile();
 			setBriefProfile(profile);
 			setBriefProfileDraft({
-				daily_brief_local_time: profile.daily_brief_local_time,
 				daily_brief_time_zone: profile.daily_brief_time_zone,
 			});
 			setIncludeOwnReleases(profile.include_own_releases);
@@ -661,7 +657,6 @@ export function SettingsPage(props: {
 			.then(async (profile) => {
 				setBriefProfile(profile);
 				setBriefProfileDraft({
-					daily_brief_local_time: profile.daily_brief_local_time,
 					daily_brief_time_zone: profile.daily_brief_time_zone,
 				});
 				setIncludeOwnReleases(profile.include_own_releases);
@@ -685,7 +680,6 @@ export function SettingsPage(props: {
 			.then(async (profile) => {
 				setBriefProfile(profile);
 				setBriefProfileDraft({
-					daily_brief_local_time: profile.daily_brief_local_time,
 					daily_brief_time_zone: profile.daily_brief_time_zone,
 				});
 				setIncludeOwnReleases(profile.include_own_releases);
@@ -709,12 +703,8 @@ export function SettingsPage(props: {
 
 	const briefSummary = useMemo(() => {
 		if (briefProfileLoading) return "读取中";
-		return `${briefProfileDraft.daily_brief_local_time} · ${briefProfileDraft.daily_brief_time_zone}`;
-	}, [
-		briefProfileDraft.daily_brief_local_time,
-		briefProfileDraft.daily_brief_time_zone,
-		briefProfileLoading,
-	]);
+		return `按 ${briefProfileDraft.daily_brief_time_zone} 解释昨天`;
+	}, [briefProfileDraft.daily_brief_time_zone, briefProfileLoading]);
 	const ownReleaseSummary = includeOwnReleases ? "已开启" : "已关闭";
 	const profileBusy =
 		briefProfileLoading || briefProfileSaving || ownReleaseSaving;
@@ -1797,18 +1787,11 @@ export function SettingsPage(props: {
 								</CardHeader>
 								<CardContent className="space-y-4 p-5 max-md:px-0 max-md:pb-0">
 									<DailyBriefProfileForm
-										localTime={briefProfileDraft.daily_brief_local_time}
 										timeZone={briefProfileDraft.daily_brief_time_zone}
 										disabled={profileBusy}
 										error={briefProfileError}
 										compact
-										helperText={null}
-										onLocalTimeChange={(value) =>
-											setBriefProfileDraft((current) => ({
-												...current,
-												daily_brief_local_time: value,
-											}))
-										}
+										helperText="日报会按这里保存的时区解释“昨天”自然日。"
 										onTimeZoneChange={(value) =>
 											setBriefProfileDraft((current) => ({
 												...current,

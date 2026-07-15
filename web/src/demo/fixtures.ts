@@ -88,7 +88,7 @@ function buildMe(
 			reason: "none",
 		},
 		dashboard: {
-			daily_boundary_local: "08:00",
+			daily_boundary_local: "00:00",
 			daily_boundary_time_zone: "Asia/Shanghai",
 			daily_boundary_utc_offset_minutes: 480,
 			include_own_releases: includeOwnReleases,
@@ -102,7 +102,7 @@ function buildProfile(
 ): MeProfileResponse {
 	return {
 		user_id: me?.user.id ?? USER_ID,
-		daily_brief_local_time: "08:00",
+		daily_brief_schedule_local_time: "06:00",
 		daily_brief_time_zone: "Asia/Shanghai",
 		include_own_releases: includeOwnReleases,
 		last_active_at: "2026-07-08T09:58:00+08:00",
@@ -609,7 +609,7 @@ function buildAdminUserProfiles(
 			user.id,
 			{
 				user_id: user.id,
-				daily_brief_local_time: user.id === "disabled-user" ? "09:00" : "08:00",
+				daily_brief_schedule_local_time: "06:00",
 				daily_brief_time_zone: "Asia/Shanghai",
 				include_own_releases: user.include_own_releases,
 				last_active_at: user.last_active_at,
@@ -829,6 +829,7 @@ function buildAdminJobs(): DemoJobsModel {
 			retry_recent_failures_interval_minutes: 30,
 			repo_release_worker_concurrency: 6,
 			repo_refresh_system_budget_per_window: 800,
+			daily_brief_schedule_local_time: "06:00",
 			recent_sync_tasks: [
 				{
 					id: "task-sync-releases",

@@ -4,18 +4,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
-import {
-	Select,
-	SelectContent,
-	SelectItem,
-	SelectTrigger,
-	SelectValue,
-} from "@/components/ui/select";
-
-const HOUR_OPTIONS = Array.from({ length: 24 }, (_, hour) => {
-	const label = `${hour.toString().padStart(2, "0")}:00`;
-	return { value: label, label };
-});
 const TIME_ZONE_SAMPLE_YEAR = 2026;
 const TIME_ZONE_SAMPLE_DAYS = 400;
 const browserTimeZoneSupportCache = new Map<string, boolean>();
@@ -104,24 +92,20 @@ export function readHourAlignedBrowserTimeZone() {
 const SUPPORTED_TIME_ZONES = readSupportedTimeZones();
 
 export function DailyBriefProfileForm(props: {
-	localTime: string;
 	timeZone: string;
 	disabled?: boolean;
 	error?: string | null;
 	helperText?: ReactNode;
 	compact?: boolean;
-	onLocalTimeChange: (value: string) => void;
 	onTimeZoneChange: (value: string) => void;
 	onUseBrowserTimeZone?: (timeZone: string) => void;
 }) {
 	const {
-		localTime,
 		timeZone,
 		disabled = false,
 		error,
 		helperText,
 		compact = false,
-		onLocalTimeChange,
 		onTimeZoneChange,
 		onUseBrowserTimeZone,
 	} = props;
@@ -131,37 +115,7 @@ export function DailyBriefProfileForm(props: {
 
 	return (
 		<div className="space-y-4">
-			<div
-				className={cn(
-					"space-y-4",
-					compact &&
-						"grid gap-4 lg:grid-cols-[180px_minmax(0,1fr)] lg:items-start",
-				)}
-			>
-				<div className="space-y-2">
-					<Label htmlFor={`${timeZoneListId}-time`}>日报时间</Label>
-					<Select
-						value={localTime}
-						onValueChange={onLocalTimeChange}
-						disabled={disabled}
-					>
-						<SelectTrigger id={`${timeZoneListId}-time`}>
-							<SelectValue placeholder="选择整点时间" />
-						</SelectTrigger>
-						<SelectContent>
-							{HOUR_OPTIONS.map((option) => (
-								<SelectItem key={option.value} value={option.value}>
-									{option.label}
-								</SelectItem>
-							))}
-						</SelectContent>
-					</Select>
-					<p className="text-muted-foreground text-xs">
-						当前只支持整点；时区也只支持全年保持整点 UTC 偏移的 IANA
-						名称，未来生成都会按这个本地时间作为窗口边界。
-					</p>
-				</div>
-
+			<div className="space-y-2">
 				<div className="space-y-2">
 					<div className="flex items-center justify-between gap-2">
 						<Label htmlFor={`${timeZoneListId}-zone`}>IANA 时区</Label>
@@ -202,7 +156,7 @@ export function DailyBriefProfileForm(props: {
 					<p className="text-muted-foreground text-xs">
 						浏览器当前识别为 <code>{browserTimeZone}</code>
 						{supportedBrowserTimeZone
-							? "。"
+							? "；日报会按这个时区解释“昨天”自然日。"
 							: "；该时区当前不满足“全年整点 UTC 偏移”约束，请手动选择受支持的 IANA 时区。"}
 					</p>
 				</div>

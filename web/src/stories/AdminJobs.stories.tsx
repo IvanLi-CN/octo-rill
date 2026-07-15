@@ -1717,6 +1717,7 @@ function AdminJobsPreview({
 			retry_recent_failures_interval_minutes: 10,
 			repo_release_worker_concurrency: 12,
 			repo_refresh_system_budget_per_window: 1000,
+			daily_brief_schedule_local_time: "06:00",
 			recent_sync_tasks: scheduledRuns
 				.filter((item) => item.task_type === "sync.subscriptions")
 				.filter((item) => item.id !== "task-subscription-skipped")
@@ -2083,6 +2084,7 @@ function AdminJobsPreview({
 					retry_recent_failures_interval_minutes?: number;
 					repo_release_worker_concurrency?: number;
 					repo_refresh_system_budget_per_window?: number;
+					daily_brief_schedule_local_time?: string;
 				};
 				syncRuntimeConfig = {
 					...syncRuntimeConfig,
@@ -2101,6 +2103,9 @@ function AdminJobsPreview({
 						body.repo_refresh_system_budget_per_window ??
 							syncRuntimeConfig.repo_refresh_system_budget_per_window,
 					),
+					daily_brief_schedule_local_time:
+						body.daily_brief_schedule_local_time ??
+						syncRuntimeConfig.daily_brief_schedule_local_time,
 				};
 				return new Response(JSON.stringify(syncRuntimeConfig), {
 					status: 200,

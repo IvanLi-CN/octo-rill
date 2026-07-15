@@ -1,6 +1,6 @@
 import { isReleaseFeedItem, type FeedItem } from "@/feed/types";
 
-const DEFAULT_DAILY_BOUNDARY = "08:00";
+const DEFAULT_DAILY_BOUNDARY = "00:00";
 const timeZoneFormatterCache = new Map<string, Intl.DateTimeFormat>();
 
 export type DailyBoundaryLocal = {
@@ -118,7 +118,7 @@ export function parseDailyBoundaryLocal(
 ): DailyBoundaryLocal {
 	const match = rawValue?.match(/^(\d{2}):(\d{2})$/);
 	if (!match) {
-		return { hour: 8, minute: 0, label: DEFAULT_DAILY_BOUNDARY };
+		return { hour: 0, minute: 0, label: DEFAULT_DAILY_BOUNDARY };
 	}
 
 	const hour = Number(match[1]);
@@ -131,7 +131,7 @@ export function parseDailyBoundaryLocal(
 		minute < 0 ||
 		minute > 59
 	) {
-		return { hour: 8, minute: 0, label: DEFAULT_DAILY_BOUNDARY };
+		return { hour: 0, minute: 0, label: DEFAULT_DAILY_BOUNDARY };
 	}
 
 	return {
@@ -203,6 +203,7 @@ export function groupFeedItemsByDay(
 	_displayHistoricalRawGroupsByBriefDate = false,
 ) {
 	const boundary = parseDailyBoundaryLocal(dailyBoundaryLocal);
+	const useNaturalDayDate = boundary.hour === 0 && boundary.minute === 0;
 	const currentWindowStartKey = resolveWindowStartDateKey(
 		now,
 		boundary,
@@ -349,7 +350,9 @@ export function groupFeedItemsByDay(
 			dailyBoundaryTimeZone,
 			dailyBoundaryUtcOffsetMinutes,
 		);
-		const briefDate = shiftDateKey(windowStartKey, 1);
+		const briefDate = useNaturalDayDate
+			? windowStartKey
+			: shiftDateKey(windowStartKey, 1);
 		const rawGroupId = `${windowStartKey}@${boundary.label}`;
 		const historicalBrief = isReleaseFeedItem(item)
 			? (historicalBriefByReleaseId.get(item.id) ?? null)
