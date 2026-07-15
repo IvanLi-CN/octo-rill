@@ -41,7 +41,7 @@ try {
 	const earlyMorningRawRelease = release("318080539", "2026-05-05T21:55:09Z");
 	const groups = groupFeedItemsByDay(
 		[earlyMorningRawRelease],
-		"08:00",
+		"00:00",
 		"Asia/Shanghai",
 		480,
 		[],
@@ -52,29 +52,29 @@ try {
 	assert(groups.length === 1, "expected one raw group");
 	assert(groups[0].kind === "raw", "expected raw group without brief");
 	assert(
-		groups[0].id === "2026-05-05@08:00",
-		"raw group id should stay window-start based",
+		groups[0].id === "2026-05-06@00:00",
+		"raw group id should stay natural-day based",
 	);
 	assert(
-		groups[0].displayDate === "2026-05-05",
-		"raw group should display the daily window start date",
+		groups[0].displayDate === "2026-05-06",
+		"raw group should display the natural day",
 	);
 	assert(
 		groups[0].briefDate === "2026-05-06",
-		"generated brief API date should remain compatible with the stored window end date",
+		"generated brief API date should match the natural day being reviewed",
 	);
 
 	const historicalGroups = groupFeedItemsByDay(
 		[earlyMorningRawRelease],
-		"08:00",
+		"00:00",
 		"Asia/Shanghai",
 		480,
 		[
 			{
 				id: "brief-2026-05-06",
 				date: "2026-05-06",
-				window_start: "2026-05-05T00:00:00+00:00",
-				window_end: "2026-05-06T00:00:00+00:00",
+				window_start: "2026-05-05T16:00:00+00:00",
+				window_end: "2026-05-06T16:00:00+00:00",
 				release_ids: [earlyMorningRawRelease.id],
 			},
 		],
@@ -88,8 +88,8 @@ try {
 		"expected release to fold into its brief",
 	);
 	assert(
-		historicalGroups[0].displayDate === "2026-05-05",
-		"historical group should display the stored window start date",
+		historicalGroups[0].displayDate === "2026-05-06",
+		"historical group should display the reviewed natural day",
 	);
 	assert(
 		historicalGroups[0].briefId === "brief-2026-05-06",
@@ -102,7 +102,7 @@ try {
 	];
 	const mixedGroups = groupFeedItemsByDay(
 		mixedItems,
-		"08:00",
+		"00:00",
 		"Asia/Shanghai",
 		480,
 		[],
@@ -115,18 +115,18 @@ try {
 		"expected early morning releases to stay in the same window group",
 	);
 	assert(
-		mixedGroups[0].displayDate === "2026-05-05",
-		"mixed raw group should display May 5",
+		mixedGroups[0].displayDate === "2026-05-06",
+		"mixed raw group should display May 6",
 	);
 	assert(
 		mixedGroups[0].releaseCount === 2,
 		"expected two releases in the raw group",
 	);
 
-	const currentWindowRelease = release("319182286", "2026-05-07T20:48:56Z");
+	const currentWindowRelease = release("319182286", "2026-05-07T03:48:56Z");
 	const currentGroups = groupFeedItemsByDay(
 		[currentWindowRelease],
-		"08:00",
+		"00:00",
 		"Asia/Shanghai",
 		480,
 		[],
@@ -137,21 +137,21 @@ try {
 	assert(currentGroups.length === 1, "expected one current raw group");
 	assert(currentGroups[0].isCurrent === true, "expected current raw group");
 	assert(
-		currentGroups[0].id === "2026-05-07@08:00",
-		"current raw group id should stay window-start based",
+		currentGroups[0].id === "2026-05-07@00:00",
+		"current raw group id should stay natural-day based",
 	);
 	assert(
 		currentGroups[0].displayDate === "2026-05-07",
-		"current raw group should not display the future brief date",
+		"current raw group should display the current natural day",
 	);
 	assert(
-		currentGroups[0].briefDate === "2026-05-08",
-		"current raw group should keep the generated brief target date",
+		currentGroups[0].briefDate === "2026-05-07",
+		"current raw group should keep the generated brief target date aligned to the natural day",
 	);
 
 	const releasesTabGroups = groupFeedItemsByDay(
 		[earlyMorningRawRelease],
-		"08:00",
+		"00:00",
 		"Asia/Shanghai",
 		480,
 		[],
@@ -161,8 +161,8 @@ try {
 
 	assert(releasesTabGroups.length === 1, "expected one releases tab group");
 	assert(
-		releasesTabGroups[0].displayDate === "2026-05-05",
-		"release tab raw groups should keep the window start date",
+		releasesTabGroups[0].displayDate === "2026-05-06",
+		"release tab raw groups should keep the natural day date",
 	);
 
 	console.log("day group display date checks passed");

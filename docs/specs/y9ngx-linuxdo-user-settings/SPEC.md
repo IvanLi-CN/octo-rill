@@ -131,7 +131,7 @@
   When 前端处理 fallback
   Then 会出现可直接保存 GitHub PAT 的快捷弹层，并保留跳转 `/settings?section=github-pat` 的入口，且弹层输入框默认保持原生 `password` / secure-text 语义、默认关闭自动填充提示，仅在用户显式点亮后显示明文，并附带密码管理器忽略提示，同时继续支持隐藏态下的词级删除、拖放插入与撤销/重做。
 
-- Given 用户在设置页修改日报时间或时区
+- Given 用户在设置页修改日报时区
   When 提交保存
   Then 系统继续通过既有 `/api/me/profile` 保存并返回最新设置，不回退原有校验。
 

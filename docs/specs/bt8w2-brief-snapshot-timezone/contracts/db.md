@@ -4,15 +4,20 @@
 
 新增字段：
 
-- `daily_brief_local_time TEXT NULL`
-  - 语义：用户保存的本地日报整点，格式固定 `HH:00`
 - `daily_brief_time_zone TEXT NULL`
   - 语义：用户保存的 IANA 时区，例如 `Asia/Shanghai`
 
 兼容字段：
 
+- `daily_brief_local_time TEXT NULL`
+  - 仅作为旧数据迁移 / 兼容种子值保留；不再是 owner-facing 配置真相源
 - `daily_brief_utc_time TEXT NOT NULL`
   - 仅作为旧数据迁移种子值；新逻辑不再把它作为长期真相源。
+
+## admin_runtime_settings
+
+- `daily_brief_schedule_local_time TEXT NOT NULL DEFAULT '06:00'`
+  - 语义：管理员统一配置的自动出报本地整点，格式固定 `HH:00`
 
 ## briefs
 

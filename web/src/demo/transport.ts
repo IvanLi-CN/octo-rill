@@ -1426,7 +1426,6 @@ export const demoHandlers = [
 		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const payload = (await request.json()) as Partial<{
-			daily_brief_local_time: string;
 			daily_brief_time_zone: string;
 			include_own_releases: boolean;
 		}>;
@@ -1434,9 +1433,6 @@ export const demoHandlers = [
 		access.updateModel((model) => {
 			const nextProfile = {
 				...model.profile,
-				daily_brief_local_time:
-					payload.daily_brief_local_time ??
-					model.profile.daily_brief_local_time,
 				daily_brief_time_zone:
 					payload.daily_brief_time_zone ?? model.profile.daily_brief_time_zone,
 				include_own_releases:
@@ -1576,8 +1572,6 @@ export const demoHandlers = [
 				if (!current) return model;
 				nextProfile = {
 					...current,
-					daily_brief_local_time:
-						payload.daily_brief_local_time ?? current.daily_brief_local_time,
 					daily_brief_time_zone:
 						payload.daily_brief_time_zone ?? current.daily_brief_time_zone,
 					include_own_releases:
@@ -1695,6 +1689,9 @@ export const demoHandlers = [
 						payload.repo_refresh_system_budget_per_window ??
 						model.adminJobs.syncRuntimeConfig
 							.repo_refresh_system_budget_per_window,
+					daily_brief_schedule_local_time:
+						payload.daily_brief_schedule_local_time ??
+						model.adminJobs.syncRuntimeConfig.daily_brief_schedule_local_time,
 				},
 			},
 		}));

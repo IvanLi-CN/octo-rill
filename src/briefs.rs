@@ -8,9 +8,10 @@ use chrono::{
 use chrono_tz::Tz;
 use sqlx::FromRow;
 
-use crate::{config::AppConfig, state::AppState};
+use crate::{admin_runtime, config::AppConfig, state::AppState};
 
 pub const DEFAULT_DAILY_BRIEF_TIME_ZONE: &str = "Asia/Shanghai";
+pub const NATURAL_DAY_DAILY_BRIEF_BOUNDARY: &str = "00:00";
 const SUPPORTED_TIME_ZONE_SAMPLE_YEAR: i32 = 2026;
 const SUPPORTED_TIME_ZONE_SCAN_DAYS: i64 = 400;
 
@@ -24,7 +25,7 @@ pub struct DailyBriefPreferences {
 pub struct DailyWindow {
     pub key_date: NaiveDate,
     pub display_date: String,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub end_local: DateTime<FixedOffset>,
     pub start_utc: DateTime<Utc>,
     pub end_utc: DateTime<Utc>,
@@ -34,15 +35,13 @@ pub struct DailyWindow {
 
 #[derive(Debug, FromRow)]
 struct DailyBriefPreferenceRow {
-    daily_brief_local_time: Option<String>,
     daily_brief_time_zone: Option<String>,
-    daily_brief_utc_time: String,
 }
 
 pub fn default_daily_brief_local_time(config: &AppConfig) -> NaiveTime {
     config
         .ai_daily_at_local
-        .unwrap_or_else(|| NaiveTime::from_hms_opt(8, 0, 0).expect("08:00 is valid"))
+        .unwrap_or_else(|| NaiveTime::from_hms_opt(6, 0, 0).expect("06:00 is valid"))
 }
 
 pub fn default_daily_brief_time_zone(config: &AppConfig) -> &str {
@@ -51,6 +50,10 @@ pub fn default_daily_brief_time_zone(config: &AppConfig) -> &str {
 
 pub fn format_daily_brief_local_time(time: NaiveTime) -> String {
     time.format("%H:%M").to_string()
+}
+
+pub fn natural_day_daily_brief_boundary() -> NaiveTime {
+    NaiveTime::from_hms_opt(0, 0, 0).expect("00:00 is valid")
 }
 
 pub fn parse_daily_brief_local_time(raw: &str) -> Result<NaiveTime> {
@@ -113,6 +116,10 @@ fn stable_supported_time_zone_or_default(
         .and_then(canonical_supported_time_zone)
         .or_else(|| canonical_supported_time_zone(default_time_zone))
         .unwrap_or_else(|| DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned())
+}
+
+pub fn resolve_daily_brief_time_zone(default_time_zone: &str, candidate: Option<&str>) -> String {
+    stable_supported_time_zone_or_default(default_time_zone, candidate)
 }
 
 pub fn validate_hour_aligned_time_zone(
@@ -240,7 +247,7 @@ pub fn derive_daily_brief_preferences_with_defaults(
     legacy_daily_brief_utc_time: Option<&str>,
     reference_utc: DateTime<Utc>,
 ) -> DailyBriefPreferences {
-    let time_zone = stable_supported_time_zone_or_default(default_time_zone, daily_brief_time_zone);
+    let time_zone = resolve_daily_brief_time_zone(default_time_zone, daily_brief_time_zone);
 
     let local_time = daily_brief_local_time
         .and_then(|value| parse_daily_brief_local_time(value).ok())
@@ -257,13 +264,19 @@ pub fn derive_daily_brief_preferences_with_defaults(
     }
 }
 
+pub async fn load_effective_daily_brief_local_time(state: &AppState) -> Result<NaiveTime> {
+    admin_runtime::load_daily_brief_schedule_local_time(&state.pool, &state.config)
+        .await
+        .context("failed to load global daily brief schedule time")
+}
+
 pub async fn load_daily_brief_preferences(
     state: &AppState,
     user_id: &str,
 ) -> Result<DailyBriefPreferences> {
     let row = sqlx::query_as::<_, DailyBriefPreferenceRow>(
         r#"
-        SELECT daily_brief_local_time, daily_brief_time_zone, daily_brief_utc_time
+        SELECT daily_brief_time_zone
         FROM users
         WHERE id = ?
         LIMIT 1
@@ -278,13 +291,13 @@ pub async fn load_daily_brief_preferences(
         anyhow::bail!("user not found for daily brief preferences");
     };
 
-    Ok(derive_daily_brief_preferences(
-        &state.config,
-        row.daily_brief_local_time.as_deref(),
-        row.daily_brief_time_zone.as_deref(),
-        Some(row.daily_brief_utc_time.as_str()),
-        Utc::now(),
-    ))
+    Ok(DailyBriefPreferences {
+        local_time: load_effective_daily_brief_local_time(state).await?,
+        time_zone: resolve_daily_brief_time_zone(
+            default_daily_brief_time_zone(&state.config),
+            row.daily_brief_time_zone.as_deref(),
+        ),
+    })
 }
 
 pub fn compute_daily_window_for_key_date(
@@ -292,13 +305,18 @@ pub fn compute_daily_window_for_key_date(
     key_date: NaiveDate,
 ) -> Result<DailyWindow> {
     let time_zone = resolve_tz(&preferences.time_zone)?;
-    let end_local = resolve_local_datetime(
-        time_zone,
-        NaiveDateTime::new(key_date, preferences.local_time),
-    );
     let start_local = resolve_local_datetime(
         time_zone,
-        NaiveDateTime::new(key_date, preferences.local_time) - Duration::hours(24),
+        NaiveDateTime::new(key_date, natural_day_daily_brief_boundary()),
+    );
+    let end_local = resolve_local_datetime(
+        time_zone,
+        NaiveDateTime::new(
+            key_date
+                .checked_add_signed(Duration::days(1))
+                .expect("next day should be valid"),
+            natural_day_daily_brief_boundary(),
+        ),
     );
 
     Ok(DailyWindow {
@@ -308,7 +326,7 @@ pub fn compute_daily_window_for_key_date(
         end_utc: end_local.with_timezone(&Utc),
         end_local: end_local.fixed_offset(),
         effective_time_zone: preferences.time_zone.clone(),
-        effective_local_boundary: format_daily_brief_local_time(end_local.time()),
+        effective_local_boundary: NATURAL_DAY_DAILY_BRIEF_BOUNDARY.to_owned(),
     })
 }
 
@@ -318,12 +336,7 @@ pub fn key_date_for_now(
 ) -> Result<NaiveDate> {
     let time_zone = resolve_tz(&preferences.time_zone)?;
     let now_local = now_utc.with_timezone(&time_zone);
-    let today = now_local.date_naive();
-    Ok(if now_local.time() >= preferences.local_time {
-        today
-    } else {
-        today - Duration::days(1)
-    })
+    Ok(now_local.date_naive() - Duration::days(1))
 }
 
 pub fn compute_current_daily_window(
@@ -621,14 +634,14 @@ mod tests {
         )
         .expect("window");
 
-        assert_eq!(window.start_utc.to_rfc3339(), "2026-04-11T00:00:00+00:00");
-        assert_eq!(window.end_utc.to_rfc3339(), "2026-04-12T00:00:00+00:00");
+        assert_eq!(window.start_utc.to_rfc3339(), "2026-04-11T16:00:00+00:00");
+        assert_eq!(window.end_utc.to_rfc3339(), "2026-04-12T16:00:00+00:00");
         assert_eq!(window.effective_time_zone, "Asia/Shanghai");
-        assert_eq!(window.effective_local_boundary, "08:00");
+        assert_eq!(window.effective_local_boundary, "00:00");
     }
 
     #[test]
-    fn compute_window_uses_resolved_boundary_for_dst_gap() {
+    fn compute_window_spans_full_local_day_across_dst_transition() {
         let preferences = DailyBriefPreferences {
             local_time: NaiveTime::from_hms_opt(2, 0, 0).expect("02:00"),
             time_zone: "America/New_York".to_owned(),
@@ -640,11 +653,36 @@ mod tests {
         )
         .expect("window");
 
-        assert_eq!(
-            window.end_local.time(),
-            NaiveTime::from_hms_opt(3, 0, 0).unwrap()
-        );
-        assert_eq!(window.effective_local_boundary, "03:00");
+        assert_eq!(window.start_utc.to_rfc3339(), "2026-03-08T05:00:00+00:00");
+        assert_eq!(window.end_utc.to_rfc3339(), "2026-03-09T04:00:00+00:00");
+        assert_eq!(window.effective_local_boundary, "00:00");
+    }
+
+    #[test]
+    fn current_window_always_targets_latest_completed_local_day() {
+        let preferences = DailyBriefPreferences {
+            local_time: NaiveTime::from_hms_opt(9, 0, 0).expect("09:00"),
+            time_zone: "Asia/Shanghai".to_owned(),
+        };
+
+        let early_window = compute_current_daily_window(
+            &preferences,
+            Utc.with_ymd_and_hms(2026, 4, 12, 17, 0, 0)
+                .single()
+                .expect("valid utc datetime"),
+        )
+        .expect("early window");
+        let late_window = compute_current_daily_window(
+            &preferences,
+            Utc.with_ymd_and_hms(2026, 4, 12, 1, 0, 0)
+                .single()
+                .expect("valid utc datetime"),
+        )
+        .expect("late window");
+
+        assert_eq!(early_window.display_date, "2026-04-12");
+        assert_eq!(late_window.display_date, "2026-04-11");
+        assert_eq!(early_window.effective_local_boundary, "00:00");
     }
 
     #[test]
