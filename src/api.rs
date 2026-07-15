@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
@@ -437,7 +437,7 @@ pub async fn me(
     let preferences = briefs::load_daily_brief_preferences(state.as_ref(), &row.id)
         .await
         .map_err(ApiError::internal)?;
-    let daily_boundary_local = briefs::format_daily_brief_local_time(preferences.local_time);
+    let daily_boundary_local = briefs::NATURAL_DAY_DAILY_BRIEF_BOUNDARY.to_owned();
     let daily_boundary_time_zone = Some(preferences.time_zone.clone());
     let daily_boundary_utc_offset_minutes =
         briefs::current_utc_offset_minutes(&preferences, chrono::Utc::now())
@@ -964,7 +964,7 @@ pub async fn admin_patch_user(
 #[derive(Debug, Serialize)]
 pub struct DailyBriefProfileResponse {
     user_id: String,
-    daily_brief_local_time: String,
+    daily_brief_schedule_local_time: String,
     daily_brief_time_zone: String,
     include_own_releases: bool,
     last_active_at: Option<String>,
@@ -975,7 +975,6 @@ pub type MeProfileResponse = DailyBriefProfileResponse;
 
 #[derive(Debug, Deserialize)]
 pub struct DailyBriefProfilePatchRequest {
-    daily_brief_local_time: String,
     daily_brief_time_zone: String,
     #[serde(default)]
     include_own_releases: Option<bool>,
@@ -995,10 +994,8 @@ pub struct SyncAutoFetchTaskItem {
 
 #[derive(Debug, sqlx::FromRow)]
 struct DailyBriefProfileRow {
-    daily_brief_local_time: Option<String>,
     daily_brief_time_zone: Option<String>,
     include_own_releases: i64,
-    daily_brief_utc_time: String,
     last_active_at: Option<String>,
 }
 
@@ -1082,10 +1079,8 @@ async fn load_daily_brief_profile(
     let row = sqlx::query_as::<_, DailyBriefProfileRow>(
         r#"
         SELECT
-          daily_brief_local_time,
           daily_brief_time_zone,
           include_own_releases,
-          daily_brief_utc_time,
           last_active_at
         FROM users
         WHERE id = ?
@@ -1105,18 +1100,17 @@ async fn load_daily_brief_profile(
         ));
     };
 
-    let preferences = briefs::derive_daily_brief_preferences(
-        &state.config,
-        row.daily_brief_local_time.as_deref(),
-        row.daily_brief_time_zone.as_deref(),
-        Some(row.daily_brief_utc_time.as_str()),
-        chrono::Utc::now(),
-    );
+    let schedule_local_time = briefs::load_effective_daily_brief_local_time(state)
+        .await
+        .map_err(ApiError::internal)?;
 
     Ok(DailyBriefProfileResponse {
         user_id: user_id.to_owned(),
-        daily_brief_local_time: briefs::format_daily_brief_local_time(preferences.local_time),
-        daily_brief_time_zone: preferences.time_zone,
+        daily_brief_schedule_local_time: briefs::format_daily_brief_local_time(schedule_local_time),
+        daily_brief_time_zone: briefs::resolve_daily_brief_time_zone(
+            briefs::default_daily_brief_time_zone(&state.config),
+            row.daily_brief_time_zone.as_deref(),
+        ),
         include_own_releases: row.include_own_releases != 0,
         last_active_at: row.last_active_at,
     })
@@ -1127,18 +1121,22 @@ async fn persist_daily_brief_profile(
     user_id: &str,
     req: DailyBriefProfilePatchRequest,
 ) -> Result<DailyBriefProfileResponse, ApiError> {
-    let local_time = briefs::parse_daily_brief_local_time(&req.daily_brief_local_time)
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
     let time_zone = briefs::parse_daily_brief_time_zone(&req.daily_brief_time_zone)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     briefs::validate_hour_aligned_time_zone(&time_zone, chrono::Utc::now())
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let schedule_local_time = briefs::load_effective_daily_brief_local_time(state)
+        .await
+        .map_err(ApiError::internal)?;
     let enabled_hours = briefs::load_enabled_daily_brief_scheduler_hours(&state.pool)
         .await
         .map_err(ApiError::internal)?;
-    let missing_hours =
-        briefs::missing_daily_brief_scheduler_hours(local_time, &time_zone, &enabled_hours)
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let missing_hours = briefs::missing_daily_brief_scheduler_hours(
+        schedule_local_time,
+        &time_zone,
+        &enabled_hours,
+    )
+    .map_err(|err| ApiError::bad_request(err.to_string()))?;
     if !missing_hours.is_empty() {
         let missing_hours = missing_hours
             .into_iter()
@@ -1154,14 +1152,12 @@ async fn persist_daily_brief_profile(
     sqlx::query(
         r#"
         UPDATE users
-        SET daily_brief_local_time = ?,
-            daily_brief_time_zone = ?,
+        SET daily_brief_time_zone = ?,
             include_own_releases = COALESCE(?, include_own_releases),
             updated_at = ?
         WHERE id = ?
         "#,
     )
-    .bind(briefs::format_daily_brief_local_time(local_time))
     .bind(time_zone)
     .bind(
         req.include_own_releases
@@ -1402,6 +1398,7 @@ pub struct SyncRuntimeConfigResponse {
     retry_recent_failures_interval_minutes: i64,
     repo_release_worker_concurrency: usize,
     repo_refresh_system_budget_per_window: i64,
+    daily_brief_schedule_local_time: String,
     recent_sync_tasks: Vec<SyncAutoFetchTaskItem>,
 }
 
@@ -1411,6 +1408,7 @@ pub struct SyncRuntimeConfigPatchRequest {
     retry_recent_failures_interval_minutes: Option<i64>,
     repo_release_worker_concurrency: Option<i64>,
     repo_refresh_system_budget_per_window: Option<i64>,
+    daily_brief_schedule_local_time: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1559,14 +1557,78 @@ async fn load_sync_runtime_config(state: &AppState) -> Result<SyncRuntimeConfigR
         admin_runtime::load_repo_refresh_system_budget_per_window(&state.pool)
             .await
             .map_err(ApiError::internal)?;
+    let daily_brief_schedule_local_time =
+        admin_runtime::load_daily_brief_schedule_local_time(&state.pool, &state.config)
+            .await
+            .map_err(ApiError::internal)?;
 
     Ok(SyncRuntimeConfigResponse {
         sync_auto_fetch_interval_minutes: interval,
         retry_recent_failures_interval_minutes,
         repo_release_worker_concurrency,
         repo_refresh_system_budget_per_window,
+        daily_brief_schedule_local_time: briefs::format_daily_brief_local_time(
+            daily_brief_schedule_local_time,
+        ),
         recent_sync_tasks: load_recent_sync_auto_fetch_tasks(state).await?,
     })
+}
+
+async fn load_distinct_daily_brief_time_zones(state: &AppState) -> Result<Vec<String>, ApiError> {
+    let rows = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT DISTINCT daily_brief_time_zone
+        FROM users
+        ORDER BY daily_brief_time_zone ASC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let mut seen = HashSet::new();
+    let mut time_zones = Vec::new();
+    let default_time_zone = briefs::default_daily_brief_time_zone(&state.config).to_owned();
+    for raw in std::iter::once(Some(default_time_zone)).chain(rows.into_iter()) {
+        let time_zone = briefs::resolve_daily_brief_time_zone(
+            briefs::default_daily_brief_time_zone(&state.config),
+            raw.as_deref(),
+        );
+        if seen.insert(time_zone.clone()) {
+            time_zones.push(time_zone);
+        }
+    }
+    Ok(time_zones)
+}
+
+async fn validate_daily_brief_schedule_against_enabled_slots(
+    state: &AppState,
+    local_time: chrono::NaiveTime,
+) -> Result<(), ApiError> {
+    let enabled_hours = briefs::load_enabled_daily_brief_scheduler_hours(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut missing_hours = BTreeSet::new();
+    for time_zone in load_distinct_daily_brief_time_zones(state).await? {
+        for hour in
+            briefs::missing_daily_brief_scheduler_hours(local_time, &time_zone, &enabled_hours)
+                .map_err(|err| ApiError::bad_request(err.to_string()))?
+        {
+            missing_hours.insert(hour);
+        }
+    }
+    if missing_hours.is_empty() {
+        return Ok(());
+    }
+
+    let missing_hours = missing_hours
+        .into_iter()
+        .map(|hour| format!("{hour:02}:00Z"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(ApiError::bad_request(format!(
+        "invalid daily brief schedule for current scheduler configuration (missing enabled UTC slots for one or more user time zones: {missing_hours})"
+    )))
 }
 
 async fn persist_sync_runtime_config(
@@ -1599,6 +1661,15 @@ async fn persist_sync_runtime_config(
             "repo_refresh_system_budget_per_window must be between 1 and 20000",
         ));
     }
+    let daily_brief_schedule_local_time = req
+        .daily_brief_schedule_local_time
+        .as_deref()
+        .map(briefs::parse_daily_brief_local_time)
+        .transpose()
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if let Some(local_time) = daily_brief_schedule_local_time {
+        validate_daily_brief_schedule_against_enabled_slots(state, local_time).await?;
+    }
 
     admin_runtime::update_sync_auto_fetch_interval_minutes(
         &state.pool,
@@ -1620,6 +1691,15 @@ async fn persist_sync_runtime_config(
         admin_runtime::update_repo_refresh_system_budget_per_window(&state.pool, budget)
             .await
             .map_err(ApiError::internal)?;
+    }
+    if let Some(local_time) = daily_brief_schedule_local_time {
+        admin_runtime::update_daily_brief_schedule_local_time(
+            &state.pool,
+            &state.config,
+            local_time,
+        )
+        .await
+        .map_err(ApiError::internal)?;
     }
 
     load_sync_runtime_config(state).await
@@ -4029,6 +4109,7 @@ pub struct AdminBriefDailySlotUserDiagnostic {
     user_id: String,
     key_date: Option<String>,
     local_boundary: Option<String>,
+    scheduled_local_time: Option<String>,
     time_zone: Option<String>,
     window_start_utc: Option<String>,
     window_end_utc: Option<String>,
@@ -4044,6 +4125,7 @@ pub struct AdminBriefGenerateDiagnostics {
     content_length: Option<i64>,
     key_date: Option<String>,
     date: Option<String>,
+    scheduled_local_time: Option<String>,
     window_start_utc: Option<String>,
     window_end_utc: Option<String>,
     effective_time_zone: Option<String>,
@@ -4613,6 +4695,7 @@ fn upsert_daily_slot_user_diag(
         user_id: user_id.clone(),
         key_date: None,
         local_boundary: None,
+        scheduled_local_time: None,
         time_zone: None,
         window_start_utc: None,
         window_end_utc: None,
@@ -4681,6 +4764,8 @@ fn build_brief_daily_slot_diagnostics(
                     }
                     users[pos].local_boundary =
                         json_object_get_string(payload_object, "local_boundary");
+                    users[pos].scheduled_local_time =
+                        json_object_get_string(payload_object, "scheduled_local_time");
                     users[pos].time_zone = json_object_get_string(payload_object, "time_zone");
                     users[pos].window_start_utc =
                         json_object_get_string(payload_object, "window_start_utc");
@@ -4704,6 +4789,8 @@ fn build_brief_daily_slot_diagnostics(
                     }
                     users[pos].local_boundary =
                         json_object_get_string(payload_object, "local_boundary");
+                    users[pos].scheduled_local_time =
+                        json_object_get_string(payload_object, "scheduled_local_time");
                     users[pos].time_zone = json_object_get_string(payload_object, "time_zone");
                 }
             }
@@ -4723,6 +4810,8 @@ fn build_brief_daily_slot_diagnostics(
                     }
                     users[pos].local_boundary =
                         json_object_get_string(payload_object, "local_boundary");
+                    users[pos].scheduled_local_time =
+                        json_object_get_string(payload_object, "scheduled_local_time");
                     users[pos].time_zone = json_object_get_string(payload_object, "time_zone");
                     users[pos].window_start_utc =
                         json_object_get_string(payload_object, "window_start_utc");
@@ -4832,6 +4921,7 @@ fn build_brief_generate_diagnostics(
         content_length,
         key_date: json_object_get_string(payload_object, "key_date"),
         date: json_object_get_string(result_object, "date"),
+        scheduled_local_time: json_object_get_string(result_object, "scheduled_local_time"),
         window_start_utc: json_object_get_string(result_object, "window_start_utc"),
         window_end_utc: json_object_get_string(result_object, "window_end_utc"),
         effective_time_zone: json_object_get_string(result_object, "effective_time_zone"),
@@ -32007,7 +32097,7 @@ echo should_not_be_in_excerpt
             r#"
             UPDATE daily_brief_hour_slots
             SET enabled = 0, updated_at = '2026-04-14T00:00:00Z'
-            WHERE hour_utc = 12
+            WHERE hour_utc = 10
             "#,
         )
         .execute(&pool)
@@ -32019,7 +32109,6 @@ echo should_not_be_in_excerpt
             state.as_ref(),
             test_user_id(1).as_str(),
             super::DailyBriefProfilePatchRequest {
-                daily_brief_local_time: "08:00".to_owned(),
                 daily_brief_time_zone: "America/New_York".to_owned(),
                 include_own_releases: None,
             },
@@ -32028,7 +32117,7 @@ echo should_not_be_in_excerpt
         .expect_err("profile update should fail when required slot is disabled");
 
         assert_eq!(err.code(), "bad_request");
-        assert!(err.to_string().contains("12:00Z"));
+        assert!(err.to_string().contains("10:00Z"));
     }
 
     #[tokio::test]
@@ -32040,7 +32129,6 @@ echo should_not_be_in_excerpt
             state.as_ref(),
             test_user_id(1).as_str(),
             super::DailyBriefProfilePatchRequest {
-                daily_brief_local_time: "08:00".to_owned(),
                 daily_brief_time_zone: "America/New_York".to_owned(),
                 include_own_releases: None,
             },
@@ -32048,13 +32136,13 @@ echo should_not_be_in_excerpt
         .await
         .expect("profile update should succeed");
 
-        assert_eq!(profile.daily_brief_local_time, "08:00");
+        assert_eq!(profile.daily_brief_schedule_local_time, "06:00");
         assert_eq!(profile.daily_brief_time_zone, "America/New_York");
         assert!(!profile.include_own_releases);
 
-        let row = sqlx::query_as::<_, (Option<String>, Option<String>, i64)>(
+        let row = sqlx::query_as::<_, (Option<String>, i64)>(
             r#"
-            SELECT daily_brief_local_time, daily_brief_time_zone, include_own_releases
+            SELECT daily_brief_time_zone, include_own_releases
             FROM users
             WHERE id = ?
             "#,
@@ -32064,9 +32152,8 @@ echo should_not_be_in_excerpt
         .await
         .expect("load persisted profile");
 
-        assert_eq!(row.0.as_deref(), Some("08:00"));
-        assert_eq!(row.1.as_deref(), Some("America/New_York"));
-        assert_eq!(row.2, 0);
+        assert_eq!(row.0.as_deref(), Some("America/New_York"));
+        assert_eq!(row.1, 0);
     }
 
     #[tokio::test]
@@ -32081,6 +32168,7 @@ echo should_not_be_in_excerpt
                 retry_recent_failures_interval_minutes: Some(15),
                 repo_release_worker_concurrency: Some(12),
                 repo_refresh_system_budget_per_window: None,
+                daily_brief_schedule_local_time: Some("07:00".to_owned()),
             },
         )
         .await
@@ -32089,10 +32177,11 @@ echo should_not_be_in_excerpt
         assert_eq!(settings.sync_auto_fetch_interval_minutes, 10);
         assert_eq!(settings.retry_recent_failures_interval_minutes, 15);
         assert_eq!(settings.repo_release_worker_concurrency, 12);
+        assert_eq!(settings.daily_brief_schedule_local_time, "07:00");
 
-        let row = sqlx::query_as::<_, (i64, i64, i64)>(
+        let row = sqlx::query_as::<_, (i64, i64, i64, String)>(
             r#"
-            SELECT sync_auto_fetch_interval_minutes, retry_recent_failures_interval_minutes, repo_release_worker_concurrency
+            SELECT sync_auto_fetch_interval_minutes, retry_recent_failures_interval_minutes, repo_release_worker_concurrency, daily_brief_schedule_local_time
             FROM admin_runtime_settings
             WHERE id = 1
             "#,
@@ -32104,6 +32193,7 @@ echo should_not_be_in_excerpt
         assert_eq!(row.0, 10);
         assert_eq!(row.1, 15);
         assert_eq!(row.2, 12);
+        assert_eq!(row.3, "07:00");
     }
 
     #[tokio::test]
@@ -32119,6 +32209,7 @@ echo should_not_be_in_excerpt
                     retry_recent_failures_interval_minutes: None,
                     repo_release_worker_concurrency: None,
                     repo_refresh_system_budget_per_window: None,
+                    daily_brief_schedule_local_time: None,
                 },
             )
             .await
@@ -32144,6 +32235,7 @@ echo should_not_be_in_excerpt
                 retry_recent_failures_interval_minutes: Some(0),
                 repo_release_worker_concurrency: None,
                 repo_refresh_system_budget_per_window: None,
+                daily_brief_schedule_local_time: None,
             },
         )
         .await
@@ -32168,6 +32260,7 @@ echo should_not_be_in_excerpt
                 retry_recent_failures_interval_minutes: None,
                 repo_release_worker_concurrency: Some(33),
                 repo_refresh_system_budget_per_window: None,
+                daily_brief_schedule_local_time: None,
             },
         )
         .await
@@ -32205,6 +32298,7 @@ echo should_not_be_in_excerpt
             .await
             .expect("load profile");
 
+        assert_eq!(profile.daily_brief_schedule_local_time, "06:00");
         assert!(!profile.include_own_releases);
     }
 
@@ -32358,6 +32452,7 @@ echo should_not_be_in_excerpt
             .await
             .expect("load sync settings");
 
+        assert_eq!(settings.daily_brief_schedule_local_time, "06:00");
         assert_eq!(settings.recent_sync_tasks.len(), 3);
         assert!(
             settings
@@ -32388,7 +32483,6 @@ echo should_not_be_in_excerpt
             state.as_ref(),
             test_user_id(1).as_str(),
             super::DailyBriefProfilePatchRequest {
-                daily_brief_local_time: "09:00".to_owned(),
                 daily_brief_time_zone: "Asia/Shanghai".to_owned(),
                 include_own_releases: Some(true),
             },
@@ -32423,7 +32517,6 @@ echo should_not_be_in_excerpt
             state.as_ref(),
             test_user_id(1).as_str(),
             super::DailyBriefProfilePatchRequest {
-                daily_brief_local_time: "10:00".to_owned(),
                 daily_brief_time_zone: "Asia/Tokyo".to_owned(),
                 include_own_releases: None,
             },

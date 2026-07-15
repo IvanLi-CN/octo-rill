@@ -72,7 +72,7 @@ http://127.0.0.1:58090/auth/linuxdo/callback
 - `AI_BASE_URL`：AI provider base URL。默认 `https://api.openai.com/v1/`。
 - `AI_MODEL`：初始模型 ID。默认 `gpt-4o-mini`。首次启动会用它 seed 管理后台的模型路由列表；后续应在管理员页面维护多个模型与顺序。
 - `AI_MAX_CONCURRENCY`：单进程内同时在途的上游 LLM 请求数。默认 `1`。
-- `AI_DAILY_AT_LOCAL`：日报窗口边界，本地时间格式 `HH:MM`。默认 `08:00`。
+- `AI_DAILY_AT_LOCAL`：自动出报时刻种子值，本地时间格式 `HH:MM`。默认 `06:00`。它会在首次启动时 seed 管理后台的全局日报出报时间；后续以管理员保存到运行时配置的值为准。它只影响任务每天几点触发；日报内容窗口始终按配置时区解释为“昨天 `00:00 -> 24:00`”。
 
 对 OpenAI-compatible 网关，`AI_MODEL` 必须和 `/v1/models` 返回值一致；大小写通常也要一致。若后台模型列表为空，运行时也会回退到这个值。
 
@@ -83,6 +83,7 @@ http://127.0.0.1:58090/auth/linuxdo/callback
 - LLM 并发上限
 - 翻译 worker 数量
 - 可选的模型输入长度上限
+- 全局日报自动出报时间
 
 一旦管理员在任务中心保存这些设置，后续重启会优先使用数据库中的持久化值，而不是初次启动时的 env/default 种子。
 

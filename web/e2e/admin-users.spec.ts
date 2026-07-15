@@ -283,7 +283,7 @@ async function installBaseMocks(
 			}
 			return json(route, {
 				user_id: target.id,
-				daily_brief_local_time: "08:00",
+				daily_brief_schedule_local_time: "06:00",
 				daily_brief_time_zone: "Asia/Shanghai",
 				include_own_releases: target.include_own_releases,
 				last_active_at: target.last_active_at,
@@ -305,12 +305,11 @@ async function installBaseMocks(
 				);
 			}
 			const body = req.postDataJSON() as {
-				daily_brief_local_time?: string;
 				daily_brief_time_zone?: string;
 			};
 			return json(route, {
 				user_id: target.id,
-				daily_brief_local_time: body.daily_brief_local_time ?? "08:00",
+				daily_brief_schedule_local_time: "06:00",
 				daily_brief_time_zone: body.daily_brief_time_zone ?? "Asia/Shanghai",
 				include_own_releases: target.include_own_releases,
 				last_active_at: target.last_active_at,
@@ -421,7 +420,6 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 	await expect(profileSheet.getByText("UID")).toBeVisible();
 	await expect(profileSheet.getByText(STANDARD_USER_ID)).toBeVisible();
 	await expect(profileSheet).toContainText("有效关注仓库数 7");
-	await expect(profileSheet.getByLabel("日报时间")).toContainText("08:00");
 	await expect(profileSheet.getByLabel("IANA 时区")).toHaveValue(
 		"Asia/Shanghai",
 	);
@@ -733,11 +731,11 @@ test.describe("mobile admin shell", () => {
 	});
 });
 
-test.describe("daily brief time formatting", () => {
+test.describe("daily brief profile timezone helper", () => {
 	test.describe("DST browser timezone", () => {
 		test.use({ timezoneId: "America/New_York" });
 
-		test("daily brief time uses the current browser DST offset", async ({
+		test("daily brief form reflects the current browser IANA timezone", async ({
 			page,
 		}) => {
 			await installFrozenNow(page, "2026-07-15T12:00:00Z");
@@ -750,9 +748,11 @@ test.describe("daily brief time formatting", () => {
 			await standardUserRow.getByRole("button", { name: "详情" }).click();
 
 			const profileSheet = page.getByRole("dialog", { name: "用户详情" });
-			await expect(profileSheet.getByLabel("日报时间")).toContainText("08:00");
 			await expect(profileSheet.getByLabel("IANA 时区")).toHaveValue(
 				"Asia/Shanghai",
+			);
+			await expect(profileSheet).toContainText(
+				"浏览器当前识别为 America/New_York",
 			);
 		});
 	});
@@ -760,7 +760,7 @@ test.describe("daily brief time formatting", () => {
 	test.describe("fixed-offset browser timezone", () => {
 		test.use({ timezoneId: "Asia/Shanghai" });
 
-		test("daily brief time stays correct in a non-DST timezone", async ({
+		test("daily brief form reflects a fixed-offset browser timezone", async ({
 			page,
 		}) => {
 			await installFrozenNow(page, "2026-07-15T12:00:00Z");
@@ -773,9 +773,11 @@ test.describe("daily brief time formatting", () => {
 			await standardUserRow.getByRole("button", { name: "详情" }).click();
 
 			const profileSheet = page.getByRole("dialog", { name: "用户详情" });
-			await expect(profileSheet.getByLabel("日报时间")).toContainText("08:00");
 			await expect(profileSheet.getByLabel("IANA 时区")).toHaveValue(
 				"Asia/Shanghai",
+			);
+			await expect(profileSheet).toContainText(
+				"浏览器当前识别为 Asia/Shanghai",
 			);
 		});
 	});

@@ -135,6 +135,10 @@ const REPO_RELEASE_WORKER_MAX = 32;
 const REPO_RELEASE_WORKER_MARKS = [1, 5, 10, 16, 24, 32];
 const REPO_REFRESH_SYSTEM_BUDGET_MIN = 1;
 const REPO_REFRESH_SYSTEM_BUDGET_MAX = 20000;
+const DAILY_BRIEF_SCHEDULE_OPTIONS = Array.from(
+	{ length: 24 },
+	(_, hour) => `${String(hour).padStart(2, "0")}:00`,
+);
 let llmModelInputIdCounter = 0;
 
 type LlmModelInputRow = {
@@ -3677,6 +3681,10 @@ export function JobManagement({
 	] = useState(5);
 	const [repoRefreshSystemBudgetInput, setRepoRefreshSystemBudgetInput] =
 		useState(1000);
+	const [
+		dailyBriefScheduleLocalTimeInput,
+		setDailyBriefScheduleLocalTimeInput,
+	] = useState("06:00");
 
 	const [llmStatus, setLlmStatus] =
 		useState<AdminLlmSchedulerStatusResponse | null>(null);
@@ -4130,6 +4138,7 @@ export function JobManagement({
 			setRepoRefreshSystemBudgetInput(
 				res.repo_refresh_system_budget_per_window,
 			);
+			setDailyBriefScheduleLocalTimeInput(res.daily_brief_schedule_local_time);
 			syncRuntimeConfigLoadedOnceRef.current = true;
 		} catch (err) {
 			if (requestId !== syncRuntimeConfigRequestIdRef.current) {
@@ -4156,6 +4165,7 @@ export function JobManagement({
 			const res = await apiPatchAdminSyncRuntimeConfig({
 				sync_auto_fetch_interval_minutes: nextInterval,
 				retry_recent_failures_interval_minutes: nextRetryInterval,
+				daily_brief_schedule_local_time: dailyBriefScheduleLocalTimeInput,
 			});
 			setSyncRuntimeConfig(res);
 			setSyncAutoFetchIntervalInput(res.sync_auto_fetch_interval_minutes);
@@ -4167,6 +4177,7 @@ export function JobManagement({
 			setRepoRefreshSystemBudgetInput(
 				res.repo_refresh_system_budget_per_window,
 			);
+			setDailyBriefScheduleLocalTimeInput(res.daily_brief_schedule_local_time);
 			setTaskIntervalSettingsDialogOpen(false);
 			await Promise.all([
 				loadScheduledRuns({ background: true }),
@@ -4182,6 +4193,7 @@ export function JobManagement({
 		loadOverview,
 		loadScheduledRuns,
 		loadSubscriptionRuns,
+		dailyBriefScheduleLocalTimeInput,
 		retryRecentFailuresIntervalInput,
 		syncAutoFetchIntervalInput,
 	]);
@@ -4214,6 +4226,7 @@ export function JobManagement({
 			setRepoRefreshSystemBudgetInput(
 				res.repo_refresh_system_budget_per_window,
 			);
+			setDailyBriefScheduleLocalTimeInput(res.daily_brief_schedule_local_time);
 			setSubscriptionSyncSettingsDialogOpen(false);
 			await Promise.all([
 				loadSubscriptionRuns({ background: true }),
@@ -4241,6 +4254,9 @@ export function JobManagement({
 		setRetryRecentFailuresIntervalInput(
 			syncRuntimeConfig?.retry_recent_failures_interval_minutes ??
 				RETRY_RECENT_FAILURES_INTERVAL_DEFAULT,
+		);
+		setDailyBriefScheduleLocalTimeInput(
+			syncRuntimeConfig?.daily_brief_schedule_local_time ?? "06:00",
 		);
 		setTaskIntervalSettingsDialogOpen(true);
 	}, [syncRuntimeConfig]);
@@ -6278,6 +6294,41 @@ export function JobManagement({
 					</DialogHeader>
 
 					<div className="space-y-3">
+						<div className="space-y-3 rounded-lg border bg-card/70 px-3 py-4">
+							<div className="flex items-center justify-between gap-3">
+								<div className="flex items-center gap-2">
+									<Label htmlFor="daily-brief-schedule-local-time">
+										日报自动出报时间
+									</Label>
+									<Badge variant="outline">brief.daily_slot</Badge>
+								</div>
+								<span className="rounded-md border bg-background px-2.5 py-1 font-mono text-sm font-semibold">
+									{dailyBriefScheduleLocalTimeInput}
+								</span>
+							</div>
+							<Select
+								value={dailyBriefScheduleLocalTimeInput}
+								onValueChange={setDailyBriefScheduleLocalTimeInput}
+							>
+								<SelectTrigger
+									id="daily-brief-schedule-local-time"
+									aria-label="日报自动出报时间"
+								>
+									<SelectValue placeholder="选择自动出报时间" />
+								</SelectTrigger>
+								<SelectContent>
+									{DAILY_BRIEF_SCHEDULE_OPTIONS.map((value) => (
+										<SelectItem key={value} value={value}>
+											{value}
+										</SelectItem>
+									))}
+								</SelectContent>
+							</Select>
+							<p className="text-muted-foreground text-xs">
+								统一控制所有用户在各自本地时间几点自动生成“昨天”日报；内容窗口仍固定按本地自然日
+								`00:00 → 次日 00:00` 计算。
+							</p>
+						</div>
 						<div className="space-y-3 rounded-lg border bg-card/70 px-3 py-4">
 							<div className="flex items-center justify-between gap-3">
 								<div className="flex items-center gap-2">

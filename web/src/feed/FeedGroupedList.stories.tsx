@@ -101,42 +101,50 @@ const earlyMorningReleases: FeedItem[] = [
 ];
 
 const sanitizedProductionMay8Items: FeedItem[] = [
+	release("prod-history-release", {
+		ts: "2026-05-07T10:18:53Z",
+		repo_full_name: "example/history-cycle-release",
+		title: "History cycle release",
+		body: "- sanitized release from the previous natural day",
+		html_url:
+			"https://github.com/example/history-cycle-release/releases/tag/history",
+	}),
 	release("prod-current-release-a", {
 		ts: "2026-05-08T03:54:06Z",
 		repo_full_name: "example/current-cycle-a",
 		title: "Current cycle release A",
-		body: "- sanitized release after the daily boundary",
+		body: "- sanitized release from the current natural day",
 		html_url: "https://github.com/example/current-cycle-a/releases/tag/a",
 	}),
 	release("prod-current-release-b", {
 		ts: "2026-05-08T02:39:33Z",
 		repo_full_name: "example/current-cycle-b",
 		title: "Current cycle release B",
-		body: "- sanitized release after the daily boundary",
+		body: "- sanitized release from the current natural day",
 		html_url: "https://github.com/example/current-cycle-b/releases/tag/b",
 	}),
 	release("prod-covered-early-release", {
 		ts: "2026-05-07T23:56:53Z",
 		repo_full_name: "example/covered-early-release",
-		title: "Covered early-morning release",
-		body: "- sanitized release before the daily boundary",
+		title: "Current-day early-morning release",
+		body: "- sanitized release before the auto schedule time but still inside the same natural day",
 		html_url: "https://github.com/example/covered-early-release/releases/tag/c",
 	}),
 ];
 
 const sanitizedProductionMay8Briefs: FeedGroupedListProps["briefs"] = [
 	{
-		id: "sanitized-prod-brief-2026-05-08",
-		date: "2026-05-08",
-		window_start: "2026-05-07T00:00:00+00:00",
-		window_end: "2026-05-08T00:00:00+00:00",
+		id: "sanitized-prod-brief-2026-05-07",
+		date: "2026-05-07",
+		window_start: "2026-05-06T16:00:00+00:00",
+		window_end: "2026-05-07T16:00:00+00:00",
 		effective_time_zone: "Asia/Shanghai",
-		effective_local_boundary: "08:00",
-		release_count: 56,
-		release_ids: ["prod-covered-early-release"],
+		effective_local_boundary: "00:00",
+		release_count: 1,
+		release_ids: ["prod-history-release"],
 		content_markdown:
-			"## Sanitized Daily Brief\n\n- Window start: 2026-05-07 08:00\n- Source release count: 56\n- Includes the 2026-05-08 07:56 early-morning release from the production feed.\n",
-		created_at: "2026-05-08T00:01:54.372532734+00:00",
+			"## Sanitized Daily Brief\n\n- Window start: 2026-05-07 00:00\n- Source release count: 1\n- The 2026-05-08 07:56 release now stays in the 2026-05-08 natural-day group instead of being folded into yesterday.\n",
+		created_at: "2026-05-07T16:01:54.372532734+00:00",
 	},
 ];
 
@@ -170,10 +178,10 @@ function FeedGroupedListPreview(props: {
 						html_url: "https://github.com/IvanLi-CN",
 					}}
 					briefs={briefs}
-					dailyBoundaryLocal="08:00"
+					dailyBoundaryLocal="00:00"
 					dailyBoundaryTimeZone="Asia/Shanghai"
 					dailyBoundaryUtcOffsetMinutes={480}
-					now={now ?? new Date("2026-05-07T12:00:00+08:00")}
+					now={now ?? new Date("2026-05-08T12:00:00+08:00")}
 					error={null}
 					loadingInitial={false}
 					loadingMore={false}
@@ -208,7 +216,7 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"Feed 日组列表的稳定 canvas 场景，用于验证 08:00 日报边界前的 release 按日报周期开始日显示分组标题。",
+					"Feed 日组列表的稳定 canvas 场景，用于验证自然日分组、历史日报折叠，以及自动出报时间不再影响同一天的 raw release 归属。",
 			},
 		},
 	},
@@ -222,8 +230,8 @@ export const EarlyMorningRawFallbackDateLabel: Story = {
 	name: "Early Morning Raw Fallback Date Label",
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		await expect(canvas.getByText("2026-05-05")).toBeVisible();
-		await expect(canvas.queryByText("2026-05-06")).not.toBeInTheDocument();
+		await expect(canvas.getByText("2026-05-06")).toBeVisible();
+		await expect(canvas.queryByText("2026-05-05")).not.toBeInTheDocument();
 		const may6Group = canvasElement.querySelector<HTMLElement>(
 			'[data-feed-brief-date="2026-05-06"]',
 		);
@@ -231,7 +239,7 @@ export const EarlyMorningRawFallbackDateLabel: Story = {
 		if (!may6Group) {
 			throw new Error("Expected 2026-05-06 raw fallback group");
 		}
-		await expect(within(may6Group).getByText("2026-05-05")).toBeVisible();
+		await expect(within(may6Group).getByText("2026-05-06")).toBeVisible();
 		await expect(canvas.getByText("Dozzle v10.5.2")).toBeVisible();
 		await expect(canvas.getByText("0.44.4")).toBeVisible();
 	},
@@ -250,16 +258,19 @@ export const SanitizedProductionMay8Boundary: Story = {
 		const canvas = within(canvasElement);
 		await expect(canvas.getByText("Current cycle release A")).toBeVisible();
 		await expect(canvas.getByText("Current cycle release B")).toBeVisible();
+		await expect(
+			canvas.getByText("Current-day early-morning release"),
+		).toBeVisible();
 		await expect(canvas.getByText("Sanitized Daily Brief")).toBeVisible();
 		await expect(
-			canvas.queryByText("Covered early-morning release"),
+			canvas.queryByText("History cycle release"),
 		).not.toBeInTheDocument();
 
 		const labels = Array.from(
 			canvasElement.querySelectorAll<HTMLElement>("[data-feed-day-label]"),
 		).map((element) => element.textContent?.replace(/\s+/g, " ").trim());
 		expect(labels).toContain("2026-05-07 · 1 条 Release");
-		expect(labels.some((label) => label?.startsWith("2026-05-08"))).toBe(false);
+		expect(labels).toContain("2026-05-08 · 3 条 Release");
 	},
 };
 

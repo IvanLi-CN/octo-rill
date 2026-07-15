@@ -5,8 +5,8 @@
 - Lifecycle: active
 - Implementation: 已交付
 - Created: 2026-04-04
-- Last: 2026-07-10
-- Summary: 已交付；top-level tab copy aligned to 发布；scoped focus 页只保留日期分组与原始 scope 信息流，不消费任何全局日报状态
+- Last: 2026-07-15
+- Summary: 已交付；Dashboard `发布 / 全部 / 日报` 与历史折叠统一对齐本地自然日分组，`/api/me.dashboard.daily_boundary_local` 固定为 `00:00`，设置页不再把它误读成自动出报时间。
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 

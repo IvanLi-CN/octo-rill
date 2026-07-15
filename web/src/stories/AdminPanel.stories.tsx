@@ -87,7 +87,7 @@ function AdminPanelPreview({
 				user.id,
 				{
 					user_id: user.id,
-					daily_brief_local_time: "08:00",
+					daily_brief_schedule_local_time: "06:00",
 					daily_brief_time_zone: "Asia/Shanghai",
 					include_own_releases: user.include_own_releases,
 					last_active_at: user.last_active_at,
@@ -121,7 +121,7 @@ function AdminPanelPreview({
 							reason: "none",
 						},
 						dashboard: {
-							daily_boundary_local: "08:00",
+							daily_boundary_local: "00:00",
 							daily_boundary_time_zone: "Asia/Shanghai",
 							daily_boundary_utc_offset_minutes: 480,
 						},
@@ -215,7 +215,7 @@ function AdminPanelPreview({
 					JSON.stringify({
 						...(profiles.get(target.id) ?? {
 							user_id: target.id,
-							daily_brief_local_time: "08:00",
+							daily_brief_schedule_local_time: "06:00",
 							daily_brief_time_zone: "Asia/Shanghai",
 							include_own_releases: target.include_own_releases,
 							last_active_at: target.last_active_at,
@@ -248,12 +248,11 @@ function AdminPanelPreview({
 					);
 				}
 				const payload = (await req.json()) as {
-					daily_brief_local_time?: string;
 					daily_brief_time_zone?: string;
 				};
 				const nextProfile = {
 					user_id: target.id,
-					daily_brief_local_time: payload.daily_brief_local_time ?? "08:00",
+					daily_brief_schedule_local_time: "06:00",
 					daily_brief_time_zone:
 						payload.daily_brief_time_zone ?? "Asia/Shanghai",
 					include_own_releases: target.include_own_releases,

@@ -66,7 +66,7 @@ function buildMockMeResponse() {
 			is_admin: false,
 		},
 		dashboard: {
-			daily_boundary_local: "08:00",
+			daily_boundary_local: "00:00",
 			daily_boundary_time_zone: "Asia/Shanghai",
 			daily_boundary_utc_offset_minutes: 480,
 			include_own_releases: false,
@@ -77,7 +77,7 @@ function buildMockMeResponse() {
 function buildMockProfile(): MeProfileResponse {
 	return {
 		user_id: "storybook-user",
-		daily_brief_local_time: "08:00",
+		daily_brief_schedule_local_time: "06:00",
 		daily_brief_time_zone: "Asia/Shanghai",
 		last_active_at: "2026-04-18T08:00:00+08:00",
 		include_own_releases: false,
@@ -451,7 +451,7 @@ export const Default: Story = {
 		).toBeVisible();
 
 		await userEvent.click(canvas.getByRole("link", { name: "日报设置" }));
-		await expect(canvas.getByText("日报时间")).toBeVisible();
+		await expect(canvas.getByLabelText("IANA 时区")).toBeVisible();
 	},
 };
 

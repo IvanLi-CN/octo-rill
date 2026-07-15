@@ -345,7 +345,7 @@ async function installSettingsMocks(
 		if (req.method() === "GET" && pathname === "/api/me/profile") {
 			return json(route, {
 				user_id: "storybook-user",
-				daily_brief_local_time: "08:00",
+				daily_brief_schedule_local_time: "06:00",
 				daily_brief_time_zone: "Asia/Shanghai",
 				last_active_at: "2026-04-18T08:00:00+08:00",
 				include_own_releases: includeOwnReleases,
@@ -359,7 +359,7 @@ async function installSettingsMocks(
 			includeOwnReleases = payload?.include_own_releases ?? includeOwnReleases;
 			return json(route, {
 				user_id: "storybook-user",
-				daily_brief_local_time: "08:00",
+				daily_brief_schedule_local_time: "06:00",
 				daily_brief_time_zone: "Asia/Shanghai",
 				last_active_at: "2026-04-18T08:00:00+08:00",
 				include_own_releases: includeOwnReleases,
