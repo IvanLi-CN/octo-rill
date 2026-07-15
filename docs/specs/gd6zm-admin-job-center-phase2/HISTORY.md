@@ -16,3 +16,4 @@
 - 2026-04-24: 扩展翻译任务中心观测口径，补齐 `completed_with_issues`、批次 `result_summary` / `business_outcome` 与 Storybook 视觉证据。
 - 2026-04-27: 热修复 release-batch 诊断兼容 legacy `result_json.items[]`，避免后台任务详情把真实失败误判成“结果未知”。
 - 2026-05-06: 为定时任务页补齐失败数据重试间隔设置，并新增 `retry.recent_failures` 任务的运行记录与详情展示。
+- 2026-07-15: 管理员任务中心新增全局日报自动出报时间配置，用户详情抽屉只保留用户 IANA 时区编辑；全局调度时间仅在管理员任务中心维护。

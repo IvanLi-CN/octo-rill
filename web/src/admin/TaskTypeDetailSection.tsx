@@ -364,6 +364,9 @@ function buildTaskDetailPageModel(
 			const effectiveLocalBoundary =
 				diagnostics?.effective_local_boundary ??
 				readString(result, "effective_local_boundary");
+			const scheduledLocalTime =
+				diagnostics?.scheduled_local_time ??
+				readString(result, "scheduled_local_time");
 			const releaseCount =
 				diagnostics?.release_count ?? readNumber(result, "release_count");
 			const targetUser =
@@ -375,16 +378,18 @@ function buildTaskDetailPageModel(
 						: null;
 			return {
 				pageTitle: "日报生成详情页",
-				pageSummary: "展示单用户日报快照的窗口、时区与关联 Release 数量。",
+				pageSummary:
+					"展示单用户日报的回顾日期、自然日窗口，以及自动出报时间与关联 Release 数量。",
 				fields: buildFields(
 					field("目标用户", targetUser),
 					field("Brief ID", briefId),
-					field("display_date", date),
+					field("回顾日期", date),
 					field(
-						"窗口",
+						"自然日窗口",
 						windowStart && windowEnd ? `${windowStart} → ${windowEnd}` : null,
 					),
-					field("本地边界", effectiveLocalBoundary),
+					field("自动出报时间", scheduledLocalTime),
+					field("日报窗口边界", effectiveLocalBoundary),
 					field("时区", effectiveTimeZone),
 					field(
 						"关联 Release",
@@ -394,7 +399,7 @@ function buildTaskDetailPageModel(
 						"生成字符数",
 						contentLength !== null ? `${contentLength} chars` : null,
 					),
-					field("key_date", keyDate),
+					field("请求日期", keyDate),
 				),
 			};
 		}
@@ -413,7 +418,7 @@ function buildTaskDetailPageModel(
 			return {
 				pageTitle: "日报定时槽详情页",
 				pageSummary:
-					"展示日报定时任务在指定 UTC 小时槽的串行执行进度，以及每个用户的本地边界/时区/窗口。",
+					"展示日报定时任务在指定 UTC 小时槽的串行执行进度，以及每个用户的自动出报时间、时区与自然日窗口。",
 				fields: buildFields(
 					field(
 						"UTC 小时槽",
@@ -989,18 +994,25 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 								</div>
 								{item.key_date ? (
 									<p className="text-muted-foreground mt-1 text-xs">
-										key_date: {item.key_date}
+										回顾日期：{item.key_date}
 									</p>
 								) : null}
-								{item.local_boundary || item.time_zone ? (
+								{item.scheduled_local_time || item.time_zone ? (
 									<p className="text-muted-foreground mt-1 text-xs">
-										本地边界：{item.local_boundary ?? "-"} · 时区：
+										自动出报时间：
+										{item.scheduled_local_time ?? item.local_boundary ?? "-"} ·
+										时区：
 										{item.time_zone ?? "-"}
+									</p>
+								) : null}
+								{item.local_boundary ? (
+									<p className="text-muted-foreground mt-1 text-xs">
+										日报窗口边界：{item.local_boundary}
 									</p>
 								) : null}
 								{item.window_start_utc && item.window_end_utc ? (
 									<p className="text-muted-foreground mt-1 text-xs">
-										窗口：{item.window_start_utc} → {item.window_end_utc}
+										自然日窗口：{item.window_start_utc} → {item.window_end_utc}
 									</p>
 								) : null}
 								{item.error ? (

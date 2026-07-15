@@ -115,7 +115,7 @@
 
 - Given 用户详情抽屉
   When 打开用户详情
-  Then 按浏览器当前日期与浏览器当前时区显示 `daily_brief_utc_time` 对应的本地 `HH:mm`，并同时展示 UTC 原值（只读）。
+  Then 只展示用户保存的 IANA 时区与浏览器当前识别时区，不在该界面暴露全局自动出报时间；不再把浏览器当前时区当作日报时间真相源。
 
 - Given 管理员在任务中心点击任意任务“详情”
   When 任务详情抽屉打开
@@ -175,7 +175,7 @@ PR: include
 - submission_gate: `approved`
 - story_id_or_title: `admin-admin-jobs--task-interval-settings-clean-dialog`
 - state: `task-interval-settings-clean-dialog`
-- evidence_note: 验证“任务间隔设置”弹窗只包含订阅同步与失败数据重试间隔，默认 10 分钟，不包含 worker 配置或最近链路用时。
+- evidence_note: 验证“任务间隔设置”弹窗包含全局日报自动出报时间、订阅同步间隔与失败数据重试间隔，不混入 worker 配置或最近链路用时。
 
 PR: include
 ![任务间隔设置弹窗](./assets/admin-jobs-task-interval-settings.png)

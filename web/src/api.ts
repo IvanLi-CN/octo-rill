@@ -301,14 +301,14 @@ export type DashboardUpdatesResponse = {
 };
 export type AdminUserProfileResponse = {
 	user_id: LocalUserId;
-	daily_brief_local_time: string;
+	daily_brief_schedule_local_time: string;
 	daily_brief_time_zone: string;
 	include_own_releases: boolean;
 	last_active_at: string | null;
 };
 export type MeProfileResponse = {
 	user_id: LocalUserId;
-	daily_brief_local_time: string;
+	daily_brief_schedule_local_time: string;
 	daily_brief_time_zone: string;
 	include_own_releases: boolean;
 	last_active_at: string | null;
@@ -328,6 +328,7 @@ export type AdminSyncRuntimeConfigResponse = {
 	retry_recent_failures_interval_minutes: number;
 	repo_release_worker_concurrency: number;
 	repo_refresh_system_budget_per_window: number;
+	daily_brief_schedule_local_time: string;
 	recent_sync_tasks: SyncAutoFetchTaskItem[];
 };
 export type AdminRepoGovernanceGridCell = {
@@ -454,9 +455,9 @@ export type AdminSyncRuntimeConfigUpdateRequest = {
 	retry_recent_failures_interval_minutes?: number;
 	repo_release_worker_concurrency?: number;
 	repo_refresh_system_budget_per_window?: number;
+	daily_brief_schedule_local_time?: string;
 };
 export type DailyBriefProfilePatchRequest = {
-	daily_brief_local_time: string;
 	daily_brief_time_zone: string;
 	include_own_releases?: boolean;
 };
@@ -780,6 +781,7 @@ export type AdminBriefDailySlotDiagnostics = {
 		state: "succeeded" | "failed" | "running";
 		error: string | null;
 		local_boundary: string | null;
+		scheduled_local_time?: string | null;
 		time_zone: string | null;
 		window_start_utc: string | null;
 		window_end_utc: string | null;
@@ -792,6 +794,7 @@ export type AdminBriefGenerateDiagnostics = {
 	key_date: string | null;
 	brief_id: string | null;
 	date: string | null;
+	scheduled_local_time?: string | null;
 	window_start_utc: string | null;
 	window_end_utc: string | null;
 	effective_time_zone: string | null;

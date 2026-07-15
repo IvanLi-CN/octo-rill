@@ -4,23 +4,19 @@ import { useState } from "react";
 import { DailyBriefProfileForm } from "@/briefs/DailyBriefProfileForm";
 
 function Preview(args: {
-	localTime: string;
 	timeZone: string;
 	error?: string | null;
 	helperText?: string;
 	disabled?: boolean;
 }) {
-	const [localTime, setLocalTime] = useState(args.localTime);
 	const [timeZone, setTimeZone] = useState(args.timeZone);
 	return (
 		<div className="max-w-xl rounded-xl border bg-background p-6">
 			<DailyBriefProfileForm
-				localTime={localTime}
 				timeZone={timeZone}
 				error={args.error}
 				helperText={args.helperText}
 				disabled={args.disabled}
-				onLocalTimeChange={setLocalTime}
 				onTimeZoneChange={setTimeZone}
 				onUseBrowserTimeZone={setTimeZone}
 			/>
@@ -36,15 +32,14 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"日报设置表单，统一承载普通用户自助设置与管理员代他人编辑。时间只允许整点，时区必须是 IANA 名称。",
+					"日报设置表单，统一承载普通用户自助设置与管理员代他人编辑。用户这里只维护“昨天”自然日对应的 IANA 时区。",
 			},
 		},
 	},
 	args: {
-		localTime: "08:00",
 		timeZone: "Asia/Shanghai",
 		helperText:
-			"保存后只影响未来生成的日报；已经生成的历史快照仍按原窗口解释。",
+			"保存后只影响“昨天”按哪个时区解释；已经生成的历史快照不会被改写。",
 		error: null,
 		disabled: false,
 	},
@@ -66,9 +61,7 @@ export const InvalidTimeZone: Story = {
 
 export const DstAwareWindow: Story = {
 	args: {
-		localTime: "09:00",
 		timeZone: "America/New_York",
-		helperText:
-			"DST 切换日也按 IANA 规则求窗口：歧义时取第一次出现，不存在时顺延到下一个有效时刻。",
+		helperText: "DST 切换日也按 IANA 规则解释“昨天”自然日。",
 	},
 };

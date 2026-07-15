@@ -497,13 +497,11 @@ export const SheetOpen: Story = {
 			<SheetContent className="max-w-md">
 				<SheetHeader>
 					<SheetTitle>用户详情</SheetTitle>
-					<SheetDescription>查看账号状态与日报时间。</SheetDescription>
+					<SheetDescription>查看账号状态与日报时区。</SheetDescription>
 				</SheetHeader>
 				<div className="space-y-3 px-4 pb-4 text-sm">
 					<div className="rounded-lg border p-3">最后活动：08:05</div>
-					<div className="rounded-lg border p-3">
-						日报时间（浏览器当前时区）：16:00
-					</div>
+					<div className="rounded-lg border p-3">日报时区：Asia/Shanghai</div>
 					<div className="rounded-lg border p-3">账户角色：管理员</div>
 				</div>
 			</SheetContent>
