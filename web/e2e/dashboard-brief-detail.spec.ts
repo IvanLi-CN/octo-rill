@@ -1,4 +1,4 @@
-import { type Route, expect, test } from "@playwright/test";
+import { type Page, type Route, expect, test } from "@playwright/test";
 
 import { buildMockMeResponse } from "./mockApi";
 
@@ -9,6 +9,12 @@ function json(route: Route, payload: unknown, status = 200) {
 		body: JSON.stringify(payload),
 	});
 }
+
+const repoVisual = {
+	owner_avatar_url: "https://github.com/octo.png?size=96",
+	open_graph_image_url: "https://example.com/preview.png",
+	uses_custom_open_graph_image: false,
+};
 
 const briefSummaries = [
 	{
@@ -55,20 +61,58 @@ const briefDetails = new Map([
 		"brief-2026-04-29",
 		{
 			...briefSummaries[1],
-			content_markdown: "## 完整日报\n\nFULL DETAIL B SHOULD LOAD",
+			content_markdown:
+				"## 完整日报\n\nFULL DETAIL B SHOULD LOAD\n\n- [owner/repo v40](/owner/repo/releases/tag/v40?from=briefs)",
 		},
 	],
 ]);
 
-test("dashboard loads brief summaries first and fetches selected detail lazily", async ({
-	page,
-}) => {
+function makeReleaseFeedItem(input: {
+	id: string;
+	ts: string;
+	tag: string;
+	title: string;
+}) {
+	return {
+		kind: "release",
+		ts: input.ts,
+		id: input.id,
+		repo_full_name: "owner/repo",
+		repo_visual: repoVisual,
+		title: input.title,
+		body: `- body for ${input.id}`,
+		body_truncated: false,
+		subtitle: null,
+		reason: null,
+		subject_type: null,
+		html_url: `https://github.com/owner/repo/releases/tag/${input.tag}`,
+		unread: null,
+		translated: {
+			lang: "zh-CN",
+			status: "missing",
+			title: null,
+			summary: null,
+		},
+		smart: {
+			lang: "zh-CN",
+			status: "missing",
+			title: null,
+			summary: null,
+		},
+		reactions: null,
+	};
+}
+
+async function installDashboardBriefMocks(
+	page: Page,
+	options?: {
+		feedItems?: unknown[];
+		briefDetailFailureIds?: Set<string>;
+	},
+) {
 	let summaryRequests = 0;
 	const detailRequests: string[] = [];
-
-	await page.addInitScript(() => {
-		window.localStorage.clear();
-	});
+	const briefDetailFailures = new Set(options?.briefDetailFailureIds ?? []);
 
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
@@ -92,7 +136,7 @@ test("dashboard loads brief summaries first and fetches selected detail lazily",
 
 		if (req.method() === "GET" && pathname === "/api/feed") {
 			return json(route, {
-				items: [],
+				items: options?.feedItems ?? [],
 				next_cursor: null,
 			});
 		}
@@ -117,6 +161,14 @@ test("dashboard loads brief summaries first and fetches selected detail lazily",
 		if (req.method() === "GET" && pathname.startsWith("/api/briefs/")) {
 			const briefId = decodeURIComponent(pathname.replace("/api/briefs/", ""));
 			detailRequests.push(briefId);
+			if (briefDetailFailures.has(briefId)) {
+				briefDetailFailures.delete(briefId);
+				return json(
+					route,
+					{ error: { code: "brief_detail_failed", message: "detail failed" } },
+					500,
+				);
+			}
 			const detail = briefDetails.get(briefId);
 			return detail
 				? json(route, detail)
@@ -155,16 +207,232 @@ test("dashboard loads brief summaries first and fetches selected detail lazily",
 		);
 	});
 
-	await page.goto("/briefs");
+	return {
+		getSummaryRequests: () => summaryRequests,
+		getDetailRequests: () => detailRequests.slice(),
+	};
+}
 
-	await expect(page.getByText("FULL DETAIL A SHOULD LOAD")).toBeVisible({
+test("brief deep link canonicalizes to /briefs and list selection uses replace", async ({
+	page,
+}) => {
+	const tracker = await installDashboardBriefMocks(page);
+
+	await page.addInitScript(() => {
+		window.localStorage.clear();
+	});
+
+	await page.goto("/?tab=briefs&brief=brief-2026-04-29");
+
+	await expect(page).toHaveURL(/\/briefs\?brief=brief-2026-04-29$/);
+	await expect(page.getByText("FULL DETAIL B SHOULD LOAD")).toBeVisible({
 		timeout: 15_000,
 	});
-	await expect.poll(() => summaryRequests).toBe(1);
-	expect(detailRequests).toEqual(["brief-2026-04-30"]);
-	await expect(page.getByText("FULL DETAIL B SHOULD LOAD")).toHaveCount(0);
+	await expect.poll(tracker.getSummaryRequests).toBe(1);
+	expect(tracker.getDetailRequests()).toEqual(["brief-2026-04-29"]);
 
-	await page.getByRole("button", { name: /#2026-04-29/ }).click();
-	await expect(page.getByText("FULL DETAIL B SHOULD LOAD")).toBeVisible();
-	expect(detailRequests).toEqual(["brief-2026-04-30", "brief-2026-04-29"]);
+	const historyLengthBefore = await page.evaluate(() => window.history.length);
+	await page.getByRole("button", { name: /#2026-04-30/ }).click();
+	await expect(page).toHaveURL(/\/briefs\?brief=brief-2026-04-30$/);
+	await expect(page.getByText("FULL DETAIL A SHOULD LOAD")).toBeVisible();
+	const historyLengthAfter = await page.evaluate(() => window.history.length);
+	expect(historyLengthAfter).toBe(historyLengthBefore);
+	expect(tracker.getDetailRequests()).toEqual([
+		"brief-2026-04-29",
+		"brief-2026-04-30",
+	]);
+});
+
+test("historical brief cards lazy-load full content, push to /briefs, and copy rich content", async ({
+	page,
+}) => {
+	await page.addInitScript(() => {
+		window.localStorage.clear();
+
+		class TestClipboardItem {
+			items: Record<string, Blob>;
+
+			constructor(items: Record<string, Blob>) {
+				this.items = items;
+			}
+		}
+
+		const clipboardWrites: Array<Record<string, Blob>> = [];
+		const clipboardAttempts: string[][] = [];
+		const clipboardWriteTexts: string[] = [];
+
+		Object.defineProperty(window, "ClipboardItem", {
+			value: TestClipboardItem,
+			configurable: true,
+		});
+
+		Object.defineProperty(window, "__clipboardWrites", {
+			value: clipboardWrites,
+			configurable: true,
+			writable: true,
+		});
+		Object.defineProperty(window, "__clipboardAttempts", {
+			value: clipboardAttempts,
+			configurable: true,
+			writable: true,
+		});
+		Object.defineProperty(window, "__clipboardWriteTexts", {
+			value: clipboardWriteTexts,
+			configurable: true,
+			writable: true,
+		});
+
+		Object.defineProperty(navigator, "clipboard", {
+			value: {
+				write: async (items: Array<{ items: Record<string, Blob> }>) => {
+					const payload = items[0]?.items;
+					if (!payload) {
+						throw new Error("missing clipboard payload");
+					}
+					clipboardAttempts.push(Object.keys(payload));
+					if ("text/markdown" in payload && clipboardWrites.length === 0) {
+						throw new Error("text/markdown unsupported");
+					}
+					clipboardWrites.push(payload);
+				},
+				writeText: async (text: string) => {
+					clipboardWriteTexts.push(text);
+				},
+			},
+			configurable: true,
+		});
+	});
+
+	await installDashboardBriefMocks(page, {
+		feedItems: [
+			makeReleaseFeedItem({
+				id: "40",
+				ts: "2026-04-29T10:27:01Z",
+				tag: "v40",
+				title: "Release 40",
+			}),
+			makeReleaseFeedItem({
+				id: "41",
+				ts: "2026-04-29T09:12:00Z",
+				tag: "v41",
+				title: "Release 41",
+			}),
+		],
+	});
+
+	await page.goto("/");
+
+	const historicalGroup = page.locator(
+		'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-29"]',
+	);
+	await expect(
+		historicalGroup.getByRole("button", { name: "去日报" }),
+	).toBeVisible();
+	await expect(
+		historicalGroup.getByText("FULL DETAIL B SHOULD LOAD"),
+	).toBeVisible({
+		timeout: 15_000,
+	});
+
+	await historicalGroup.getByRole("button", { name: "复制" }).click();
+	await expect(
+		page.locator('[data-slot="toast-title"]').filter({ hasText: "日报已复制" }),
+	).toBeVisible();
+
+	const clipboardState = await page.evaluate(async () => {
+		const writes = (
+			window as typeof window & {
+				__clipboardWrites: Array<Record<string, Blob>>;
+				__clipboardAttempts: string[][];
+				__clipboardWriteTexts: string[];
+			}
+		).__clipboardWrites;
+		const attempts = (
+			window as typeof window & {
+				__clipboardAttempts: string[][];
+			}
+		).__clipboardAttempts;
+		const texts = (
+			window as typeof window & {
+				__clipboardWriteTexts: string[];
+			}
+		).__clipboardWriteTexts;
+		const finalPayload = writes.at(-1) ?? {};
+		const resolved = await Promise.all(
+			Object.entries(finalPayload).map(async ([type, blob]) => [
+				type,
+				await blob.text(),
+			]),
+		);
+		return {
+			attempts,
+			writeCallCount: writes.length,
+			writeTextCallCount: texts.length,
+			finalPayload: Object.fromEntries(resolved),
+		};
+	});
+
+	expect(clipboardState.writeCallCount).toBe(1);
+	expect(clipboardState.writeTextCallCount).toBe(0);
+	expect(clipboardState.attempts).toEqual([
+		["text/html", "text/plain", "text/markdown"],
+		["text/html", "text/plain"],
+	]);
+	expect(clipboardState.finalPayload["text/html"]).toContain(
+		"FULL DETAIL B SHOULD LOAD",
+	);
+	expect(clipboardState.finalPayload["text/plain"]).toContain(
+		"FULL DETAIL B SHOULD LOAD",
+	);
+
+	await historicalGroup.getByRole("button", { name: "去日报" }).click();
+	await expect(page).toHaveURL(/\/briefs\?brief=brief-2026-04-29$/);
+	await page.goBack();
+	await expect(page).toHaveURL(/\/$/);
+	await expect(
+		historicalGroup.getByText("FULL DETAIL B SHOULD LOAD"),
+	).toBeVisible();
+});
+
+test("historical brief detail failure stays inline and can retry", async ({
+	page,
+}) => {
+	await page.addInitScript(() => {
+		window.localStorage.clear();
+	});
+
+	const tracker = await installDashboardBriefMocks(page, {
+		feedItems: [
+			makeReleaseFeedItem({
+				id: "40",
+				ts: "2026-04-29T10:27:01Z",
+				tag: "v40",
+				title: "Release 40",
+			}),
+		],
+		briefDetailFailureIds: new Set(["brief-2026-04-29"]),
+	});
+
+	await page.goto("/");
+
+	const historicalGroup = page.locator(
+		'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-29"]',
+	);
+	await expect(historicalGroup.getByText("日报正文加载失败")).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect(historicalGroup.getByText("第二条摘要预览")).toHaveCount(0);
+
+	await historicalGroup.getByRole("button", { name: "重试" }).click();
+	await expect(
+		historicalGroup.getByText("FULL DETAIL B SHOULD LOAD"),
+	).toBeVisible({
+		timeout: 15_000,
+	});
+	expect(
+		tracker
+			.getDetailRequests()
+			.filter((briefId) => briefId === "brief-2026-04-29"),
+	).toHaveLength(2);
+	expect(tracker.getDetailRequests()).toContain("brief-2026-04-30");
 });

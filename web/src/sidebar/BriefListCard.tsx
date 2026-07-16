@@ -56,6 +56,7 @@ export function BriefListCard(props: {
 									variant={active ? "outline" : "ghost"}
 									size="sm"
 									onClick={() => onSelectId(b.id)}
+									aria-pressed={active}
 									data-brief-item-fresh={isFresh ? "true" : "false"}
 									className={cn(
 										"h-auto w-full justify-between gap-2 rounded-md border px-2 py-1 text-left font-mono text-xs shadow-none transition-[background-color,border-color,box-shadow] duration-200",

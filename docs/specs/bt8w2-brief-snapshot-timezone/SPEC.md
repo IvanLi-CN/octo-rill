@@ -59,7 +59,7 @@
 
 - Given Dashboard `全部` tab 存在一批被 snapshot memberships 命中的历史 release
   When 页面渲染完成
-  Then 这些 release 会优先折叠成对应 brief；未被 membership 命中的 release 不会误折进 brief。
+  Then 这些 release 会优先折叠成对应 brief；未被 membership 命中的 release 不会误折进 brief，且历史卡与 `/briefs` 主卡都继续通过 `GET /api/briefs/{brief_id}` 懒加载完整正文，而不是把完整 markdown 塞回 `GET /api/briefs` 列表响应。
 
 - Given 用户在自助设置中提交非法时区，或管理员在任务中心提交非法整点时间
   When 服务端接收 PATCH
@@ -75,6 +75,7 @@
 - 通过 migration 扩展 `users`、重建 `briefs`、新增 `brief_release_memberships`，并引入 `(user_id, window_start_utc, window_end_utc)` 唯一性。
 - `src/ai.rs` 中的 brief 生成链路统一写入 snapshot 与 memberships；`src/jobs.rs` 的定时槽调度按用户偏好决定每天几点触发，而内容窗口固定回顾该用户上一个已完整结束的本地自然日。
 - Dashboard `FeedGroupedList` 结合 memberships 构建历史 brief 组，raw day grouping 仅对未命中 snapshot 的项目兜底。
+- `GET /api/briefs` 继续保持 snapshot-friendly 的瘦列表合同（窗口、时区、memberships、preview），前端完整正文统一走 detail lazy-load；历史卡与 `/briefs` 主卡共享同一份 detail 缓存与 in-flight 去重。
 - Web 端新增普通用户“日报时区设置”与管理员全局出报时间配置，所有历史/详情展示都读取落库 snapshot 字段。
 
 ## 测试与验证
