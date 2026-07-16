@@ -46,11 +46,13 @@ export type DashboardReleaseTarget = {
 	locator: DashboardReleaseLocator | null;
 	fromTab: DashboardTab;
 	scope?: DashboardScope | null;
+	selectedBriefId?: string | null;
 };
 
 export type DashboardRouteState = {
 	tab: DashboardTab;
 	scope: DashboardScope | null;
+	selectedBriefId: string | null;
 	activeReleaseId: string | null;
 	activeReleaseLocator: DashboardReleaseLocator | null;
 	activeAnnouncementLocator: DashboardDiscussionLocator | null;
@@ -60,6 +62,7 @@ export type DashboardRouteState = {
 export type DashboardWarmRouteState = {
 	tab: DashboardTab;
 	scopeSignature: string | null;
+	selectedBriefId: string | null;
 	activeReleaseId: string | null;
 	activeReleaseLocatorKey: string | null;
 	activeAnnouncementLocatorKey: string | null;
@@ -118,6 +121,11 @@ function normalizeRepoNamePart(value: string | null | undefined) {
 	return value?.trim().replace(/^\/+|\/+$/g, "") ?? "";
 }
 
+function normalizeBriefId(value: string | null | undefined) {
+	const normalized = value?.trim() ?? "";
+	return normalized ? normalized : null;
+}
+
 function normalizeRepoFullName(value: string | null | undefined) {
 	const [ownerRaw = "", repoRaw = ""] = (value ?? "").split("/", 2);
 	const owner = normalizeRepoNamePart(ownerRaw);
@@ -171,6 +179,18 @@ function decodeSegment(value: string) {
 
 function scopeDefaultTab(scope: DashboardScope | null) {
 	return scope ? "all" : "briefs";
+}
+
+function normalizeSelectedBriefId(
+	value: string | null | undefined,
+	input: {
+		tab?: DashboardTab | null;
+		scope?: DashboardScope | null;
+	},
+) {
+	if (input.scope) return null;
+	if (input.tab !== "briefs") return null;
+	return normalizeBriefId(value);
 }
 
 export function normalizeDashboardTab(
@@ -301,13 +321,22 @@ export function buildDashboardReleaseHref(
 	fromTab: DashboardTab = "briefs",
 	options?: {
 		scope?: DashboardScope | null;
+		selectedBriefId?: string | null;
 	},
 ) {
 	const params = buildDashboardScopeQueryParams(options?.scope ?? null);
-	params.set(
-		"from",
-		normalizeDashboardReturnTab(fromTab, options?.scope ?? null),
+	const normalizedFromTab = normalizeDashboardReturnTab(
+		fromTab,
+		options?.scope ?? null,
 	);
+	params.set("from", normalizedFromTab);
+	const selectedBriefId = normalizeSelectedBriefId(options?.selectedBriefId, {
+		tab: normalizedFromTab,
+		scope: options?.scope ?? null,
+	});
+	if (selectedBriefId) {
+		params.set("brief", selectedBriefId);
+	}
 	const query = params.toString();
 	return `${buildDashboardReleasePath(locator)}${query ? `?${query}` : ""}`;
 }
@@ -317,13 +346,22 @@ export function buildDashboardDiscussionHref(
 	fromTab: DashboardTab = "briefs",
 	options?: {
 		scope?: DashboardScope | null;
+		selectedBriefId?: string | null;
 	},
 ) {
 	const params = buildDashboardScopeQueryParams(options?.scope ?? null);
-	params.set(
-		"from",
-		normalizeDashboardReturnTab(fromTab, options?.scope ?? null),
+	const normalizedFromTab = normalizeDashboardReturnTab(
+		fromTab,
+		options?.scope ?? null,
 	);
+	params.set("from", normalizedFromTab);
+	const selectedBriefId = normalizeSelectedBriefId(options?.selectedBriefId, {
+		tab: normalizedFromTab,
+		scope: options?.scope ?? null,
+	});
+	if (selectedBriefId) {
+		params.set("brief", selectedBriefId);
+	}
 	const query = params.toString();
 	return `${buildDashboardDiscussionPath(locator)}${query ? `?${query}` : ""}`;
 }
@@ -333,7 +371,10 @@ export function buildDashboardRouteUrl(routeState: DashboardRouteState) {
 		const href = buildDashboardDiscussionHref(
 			routeState.activeAnnouncementLocator,
 			routeState.releaseReturnTab,
-			{ scope: routeState.scope },
+			{
+				scope: routeState.scope,
+				selectedBriefId: routeState.selectedBriefId,
+			},
 		);
 		if (typeof window === "undefined") {
 			return href;
@@ -344,7 +385,10 @@ export function buildDashboardRouteUrl(routeState: DashboardRouteState) {
 		const href = buildDashboardReleaseHref(
 			routeState.activeReleaseLocator,
 			routeState.releaseReturnTab,
-			{ scope: routeState.scope },
+			{
+				scope: routeState.scope,
+				selectedBriefId: routeState.selectedBriefId,
+			},
 		);
 		if (typeof window === "undefined") {
 			return href;
@@ -363,6 +407,13 @@ export function buildDashboardRouteUrl(routeState: DashboardRouteState) {
 	const params = routeState.scope
 		? buildDashboardScopePageQueryParams(routeState.scope)
 		: new URLSearchParams();
+	const selectedBriefId = normalizeSelectedBriefId(routeState.selectedBriefId, {
+		tab: routeState.tab,
+		scope: routeState.scope,
+	});
+	if (selectedBriefId) {
+		params.set("brief", selectedBriefId);
+	}
 	if (routeState.activeReleaseId) {
 		params.set(
 			routeState.scope ? "from" : "tab",
@@ -396,13 +447,21 @@ export function buildDashboardRouteNavigation(
 ): DashboardRouteNavigation {
 	if (routeState.activeAnnouncementLocator) {
 		const params = buildDashboardScopeQueryParams(routeState.scope);
-		params.set(
-			"from",
-			normalizeDashboardReturnTab(
-				routeState.releaseReturnTab,
-				routeState.scope,
-			),
+		const normalizedFromTab = normalizeDashboardReturnTab(
+			routeState.releaseReturnTab,
+			routeState.scope,
 		);
+		params.set("from", normalizedFromTab);
+		const selectedBriefId = normalizeSelectedBriefId(
+			routeState.selectedBriefId,
+			{
+				tab: normalizedFromTab,
+				scope: routeState.scope,
+			},
+		);
+		if (selectedBriefId) {
+			params.set("brief", selectedBriefId);
+		}
 		if (typeof window !== "undefined") {
 			copyDemoSearchParams(readCurrentDemoSearchParams(), params);
 		}
@@ -418,13 +477,21 @@ export function buildDashboardRouteNavigation(
 	}
 	if (routeState.activeReleaseLocator) {
 		const params = buildDashboardScopeQueryParams(routeState.scope);
-		params.set(
-			"from",
-			normalizeDashboardReturnTab(
-				routeState.releaseReturnTab,
-				routeState.scope,
-			),
+		const normalizedFromTab = normalizeDashboardReturnTab(
+			routeState.releaseReturnTab,
+			routeState.scope,
 		);
+		params.set("from", normalizedFromTab);
+		const selectedBriefId = normalizeSelectedBriefId(
+			routeState.selectedBriefId,
+			{
+				tab: normalizedFromTab,
+				scope: routeState.scope,
+			},
+		);
+		if (selectedBriefId) {
+			params.set("brief", selectedBriefId);
+		}
 		if (typeof window !== "undefined") {
 			copyDemoSearchParams(readCurrentDemoSearchParams(), params);
 		}
@@ -497,6 +564,13 @@ export function buildDashboardRouteNavigation(
 	}
 
 	const searchParams = new URLSearchParams();
+	const selectedBriefId = normalizeSelectedBriefId(routeState.selectedBriefId, {
+		tab: routeState.tab,
+		scope: routeState.scope,
+	});
+	if (selectedBriefId) {
+		searchParams.set("brief", selectedBriefId);
+	}
 	if (routeState.activeReleaseId) {
 		searchParams.set(
 			"tab",
@@ -519,6 +593,7 @@ export function buildDashboardWarmRouteState(
 	return {
 		tab: routeState.tab,
 		scopeSignature: buildDashboardScopeSignature(routeState.scope),
+		selectedBriefId: routeState.selectedBriefId,
 		activeReleaseId: routeState.activeReleaseId,
 		activeReleaseLocatorKey: routeState.activeReleaseLocator
 			? buildDashboardReleaseLocatorKey(routeState.activeReleaseLocator)
@@ -623,6 +698,7 @@ function searchParamsFromInput(
 				tab?: string | null;
 				release?: string | null;
 				from?: string | null;
+				brief?: string | null;
 				scope?: string | null;
 				items?: string | null;
 				org?: string | null;
@@ -640,6 +716,7 @@ function searchParamsFromInput(
 	if (input?.tab) params.set("tab", input.tab);
 	if (input?.release) params.set("release", input.release);
 	if (input?.from) params.set("from", input.from);
+	if (input?.brief) params.set("brief", input.brief);
 	if (input?.scope) params.set("scope", input.scope);
 	if (input?.items) params.set("items", input.items);
 	if (input?.org) params.set("org", input.org);
@@ -682,22 +759,33 @@ export function parseLegacyDashboardRouteState(input: {
 	tab?: string | null;
 	release?: string | null;
 	from?: string | null;
+	brief?: string | null;
 }): DashboardRouteState {
 	const releaseId = normalizeReleaseId(input.release);
+	const releaseReturnTab = normalizeDashboardReturnTab(input.tab);
 	if (releaseId) {
 		return {
 			tab: "briefs",
 			scope: null,
+			selectedBriefId: normalizeSelectedBriefId(input.brief, {
+				tab: releaseReturnTab,
+				scope: null,
+			}),
 			activeReleaseId: releaseId,
 			activeReleaseLocator: null,
 			activeAnnouncementLocator: null,
-			releaseReturnTab: normalizeDashboardReturnTab(input.tab),
+			releaseReturnTab,
 		};
 	}
 
+	const tab = normalizeDashboardTab(input.tab);
 	return {
-		tab: normalizeDashboardTab(input.tab),
+		tab,
 		scope: null,
+		selectedBriefId: normalizeSelectedBriefId(input.brief, {
+			tab,
+			scope: null,
+		}),
 		activeReleaseId: null,
 		activeReleaseLocator: null,
 		activeAnnouncementLocator: null,
@@ -714,6 +802,7 @@ export function parseDashboardRouteState(input: {
 				tab?: string | null;
 				release?: string | null;
 				from?: string | null;
+				brief?: string | null;
 				scope?: string | null;
 				items?: string | null;
 				org?: string | null;
@@ -722,6 +811,7 @@ export function parseDashboardRouteState(input: {
 	tab?: string | null;
 	release?: string | null;
 	from?: string | null;
+	brief?: string | null;
 	scope?: DashboardScope | null;
 	owner?: string | null;
 	repo?: string | null;
@@ -734,6 +824,7 @@ export function parseDashboardRouteState(input: {
 			tab: input.tab,
 			release: input.release,
 			from: input.from,
+			brief: input.brief,
 		},
 	);
 	const parsedScopePath = parseDashboardScopePathname(pathname, searchParams);
@@ -754,6 +845,10 @@ export function parseDashboardRouteState(input: {
 		return {
 			tab: fromTab,
 			scope: detailScope,
+			selectedBriefId: normalizeSelectedBriefId(searchParams.get("brief"), {
+				tab: fromTab,
+				scope: detailScope,
+			}),
 			activeReleaseId: null,
 			activeReleaseLocator: null,
 			activeAnnouncementLocator: locator,
@@ -776,6 +871,10 @@ export function parseDashboardRouteState(input: {
 		return {
 			tab: fromTab,
 			scope: detailScope,
+			selectedBriefId: normalizeSelectedBriefId(searchParams.get("brief"), {
+				tab: fromTab,
+				scope: detailScope,
+			}),
 			activeReleaseId: null,
 			activeReleaseLocator: locator,
 			activeAnnouncementLocator: null,
@@ -795,6 +894,10 @@ export function parseDashboardRouteState(input: {
 		return {
 			tab: fromTab,
 			scope: detailScope,
+			selectedBriefId: normalizeSelectedBriefId(searchParams.get("brief"), {
+				tab: fromTab,
+				scope: detailScope,
+			}),
 			activeReleaseId: null,
 			activeReleaseLocator: null,
 			activeAnnouncementLocator: discussionLocator,
@@ -814,6 +917,10 @@ export function parseDashboardRouteState(input: {
 		return {
 			tab: fromTab,
 			scope: detailScope,
+			selectedBriefId: normalizeSelectedBriefId(searchParams.get("brief"), {
+				tab: fromTab,
+				scope: detailScope,
+			}),
 			activeReleaseId: null,
 			activeReleaseLocator: releaseLocator,
 			activeAnnouncementLocator: null,
@@ -833,6 +940,7 @@ export function parseDashboardRouteState(input: {
 			return {
 				tab: fromTab,
 				scope,
+				selectedBriefId: null,
 				activeReleaseId: releaseId,
 				activeReleaseLocator: null,
 				activeAnnouncementLocator: null,
@@ -842,6 +950,7 @@ export function parseDashboardRouteState(input: {
 		return {
 			tab,
 			scope,
+			selectedBriefId: null,
 			activeReleaseId: null,
 			activeReleaseLocator: null,
 			activeAnnouncementLocator: null,
@@ -854,6 +963,7 @@ export function parseDashboardRouteState(input: {
 			tab: searchParams.get("tab"),
 			release: searchParams.get("release"),
 			from: searchParams.get("from"),
+			brief: searchParams.get("brief"),
 		});
 	}
 
@@ -861,6 +971,10 @@ export function parseDashboardRouteState(input: {
 	return {
 		tab,
 		scope: null,
+		selectedBriefId: normalizeSelectedBriefId(searchParams.get("brief"), {
+			tab,
+			scope: null,
+		}),
 		activeReleaseId: null,
 		activeReleaseLocator: null,
 		activeAnnouncementLocator: null,
@@ -880,6 +994,7 @@ export function validateDashboardSearch(search: Record<string, unknown>) {
 		tab: typeof search.tab === "string" ? search.tab : undefined,
 		release: typeof search.release === "string" ? search.release : undefined,
 		from: typeof search.from === "string" ? search.from : undefined,
+		brief: typeof search.brief === "string" ? search.brief : undefined,
 		scope: typeof search.scope === "string" ? search.scope : undefined,
 		items: typeof search.items === "string" ? search.items : undefined,
 		org: typeof search.org === "string" ? search.org : undefined,
@@ -963,12 +1078,21 @@ export function buildDashboardReleaseTarget(input: {
 	locator?: DashboardReleaseLocator | null;
 	fromTab?: DashboardTab | null;
 	scope?: DashboardScope | null;
+	selectedBriefId?: string | null;
 }): DashboardReleaseTarget {
+	const fromTab = normalizeDashboardReturnTab(
+		input.fromTab,
+		input.scope ?? null,
+	);
 	return {
 		releaseId: normalizeReleaseId(input.releaseId) ?? null,
 		locator: input.locator ?? null,
-		fromTab: normalizeDashboardReturnTab(input.fromTab, input.scope ?? null),
+		fromTab,
 		scope: input.scope ?? null,
+		selectedBriefId: normalizeSelectedBriefId(input.selectedBriefId, {
+			tab: fromTab,
+			scope: input.scope ?? null,
+		}),
 	};
 }
 
@@ -990,6 +1114,16 @@ export function parseInternalDashboardReleaseTarget(
 					scope,
 				),
 				scope,
+				selectedBriefId: normalizeSelectedBriefId(
+					url.searchParams.get("brief"),
+					{
+						tab: normalizeDashboardReturnTab(
+							url.searchParams.get("from"),
+							scope,
+						),
+						scope,
+					},
+				),
 			};
 		}
 		const scoped = parseDashboardScopePathname(url.pathname, url.searchParams);
@@ -1004,16 +1138,22 @@ export function parseInternalDashboardReleaseTarget(
 					scoped.scope,
 				),
 				scope: scoped.scope,
+				selectedBriefId: null,
 			};
 		}
 		if (normalizePathname(url.pathname) !== "/") return null;
 		const releaseId = normalizeReleaseId(url.searchParams.get("release"));
 		if (!releaseId) return null;
+		const fromTab = normalizeDashboardReturnTab(url.searchParams.get("tab"));
 		return {
 			releaseId,
 			locator: null,
-			fromTab: normalizeDashboardReturnTab(url.searchParams.get("tab")),
+			fromTab,
 			scope: null,
+			selectedBriefId: normalizeSelectedBriefId(url.searchParams.get("brief"), {
+				tab: fromTab,
+				scope: null,
+			}),
 		};
 	} catch {
 		return null;

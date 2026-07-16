@@ -74,6 +74,10 @@ import {
 	describeUnknownError,
 	type NetworkErrorKind,
 } from "@/lib/errorPresentation";
+import {
+	buildRichClipboardPayload,
+	writeRichClipboard,
+} from "@/lib/richClipboard";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import {
 	buildDashboardReleaseTarget,
@@ -421,6 +425,16 @@ function resolveSelectedBrief(briefs: BriefItem[], selectedId: string | null) {
 		if (found) return found;
 	}
 	return briefs[0] ?? null;
+}
+
+function waitForNextPaint() {
+	return new Promise<void>((resolve) => {
+		if (typeof window === "undefined") {
+			resolve();
+			return;
+		}
+		window.requestAnimationFrame(() => resolve());
+	});
 }
 
 function resolveRepoPublicReleaseUrl(
@@ -1562,6 +1576,7 @@ export function Dashboard(props: {
 	const activeReleaseLocator = routeState.activeReleaseLocator;
 	const activeAnnouncementLocator = routeState.activeAnnouncementLocator;
 	const releaseReturnTab = routeState.releaseReturnTab;
+	const routeSelectedBriefId = routeState.selectedBriefId;
 	const activeReleaseTarget = useMemo(
 		() =>
 			activeReleaseId || activeReleaseLocator
@@ -1570,9 +1585,16 @@ export function Dashboard(props: {
 						locator: activeReleaseLocator,
 						fromTab: releaseReturnTab,
 						scope,
+						selectedBriefId: routeSelectedBriefId,
 					})
 				: null,
-		[activeReleaseId, activeReleaseLocator, releaseReturnTab, scope],
+		[
+			activeReleaseId,
+			activeReleaseLocator,
+			releaseReturnTab,
+			routeSelectedBriefId,
+			scope,
+		],
 	);
 	const setRouteState = useCallback(
 		(
@@ -1691,12 +1713,14 @@ export function Dashboard(props: {
 		() => resolveDisplayLaneForFeed(feed.items, pageDefaultLane),
 		[feed.items, pageDefaultLane],
 	);
-	const [selectedBriefId, setSelectedBriefId] = useState<string | null>(
+	const [fallbackSelectedBriefId, setFallbackSelectedBriefId] = useState<
+		string | null
+	>(
 		() =>
 			queryClient.getQueryData<DashboardBriefsQueryData>(briefsQueryKey)
 				?.selectedBriefId ??
-			sessionState?.selectedBriefId ??
 			warmStart?.selectedBriefId ??
+			sessionState?.selectedBriefId ??
 			null,
 	);
 	const [reactionBusyKeys, setReactionBusyKeys] = useState<Set<string>>(
@@ -1822,13 +1846,16 @@ export function Dashboard(props: {
 			warmStart?.briefs ??
 			[],
 	);
-	const briefDetailRequestInFlightRef = useRef<Set<string>>(new Set());
+	const briefDetailRequestInFlightRef = useRef<
+		Map<string, Promise<BriefItem | null>>
+	>(new Map());
 	const [briefDetailLoadingIds, setBriefDetailLoadingIds] = useState<
 		Set<string>
 	>(() => new Set());
 	const [briefDetailErrors, setBriefDetailErrors] = useState<
 		Record<string, string | undefined>
 	>({});
+	const [copyingBriefId, setCopyingBriefId] = useState<string | null>(null);
 	const allowReleaseItemLaneOverride = useMediaQuery("(min-width: 640px)");
 	const [briefsError, setBriefsError] = useState<DashboardSectionError | null>(
 		null,
@@ -1884,7 +1911,15 @@ export function Dashboard(props: {
 	useEffect(() => {
 		if (!briefsCacheQuery.data) return;
 		setBriefs(briefsCacheQuery.data.items);
-		setSelectedBriefId((current) => {
+		setFallbackSelectedBriefId((current) => {
+			if (
+				routeSelectedBriefId &&
+				briefsCacheQuery.data.items.some(
+					(brief) => brief.id === routeSelectedBriefId,
+				)
+			) {
+				return routeSelectedBriefId;
+			}
 			const cachedSelectedId = briefsCacheQuery.data.selectedBriefId;
 			if (
 				cachedSelectedId &&
@@ -1903,7 +1938,11 @@ export function Dashboard(props: {
 			return briefsCacheQuery.data.items[0]?.id ?? null;
 		});
 		sidebarBootstrapCompletedRef.current = true;
-	}, [briefsCacheQuery.data]);
+	}, [briefsCacheQuery.data, routeSelectedBriefId]);
+	useEffect(() => {
+		if (!routeSelectedBriefId) return;
+		setFallbackSelectedBriefId(routeSelectedBriefId);
+	}, [routeSelectedBriefId]);
 	useEffect(() => {
 		if (!reactionTokenCacheQuery.data) return;
 		setReactionTokenConfigured(
@@ -1929,9 +1968,15 @@ export function Dashboard(props: {
 		}
 		queryClient.setQueryData<DashboardBriefsQueryData>(briefsQueryKey, {
 			items: briefs,
-			selectedBriefId,
+			selectedBriefId: routeSelectedBriefId ?? fallbackSelectedBriefId,
 		});
-	}, [briefs, briefsQueryKey, queryClient, selectedBriefId]);
+	}, [
+		briefs,
+		briefsQueryKey,
+		fallbackSelectedBriefId,
+		queryClient,
+		routeSelectedBriefId,
+	]);
 	const notifyGlobalError = useCallback(
 		(
 			title: string,
@@ -2018,7 +2063,13 @@ export function Dashboard(props: {
 				setBriefs((current) =>
 					mergeBriefSummariesWithCachedDetails(b, current),
 				);
-				setSelectedBriefId((prev) => {
+				setFallbackSelectedBriefId((prev) => {
+					if (
+						routeSelectedBriefId &&
+						b.some((brief) => brief.id === routeSelectedBriefId)
+					) {
+						return routeSelectedBriefId;
+					}
 					if (
 						options?.preferredBriefId &&
 						b.some((x) => x.id === options.preferredBriefId)
@@ -2052,7 +2103,7 @@ export function Dashboard(props: {
 				setSidebarLoading(false);
 			}
 		},
-		[briefs.length, loadNotifications, notifyGlobalError],
+		[briefs.length, loadNotifications, notifyGlobalError, routeSelectedBriefId],
 	);
 	const refreshNotifications = useCallback(
 		async (options?: { background?: boolean }) => {
@@ -2068,10 +2119,12 @@ export function Dashboard(props: {
 		},
 		[loadNotifications],
 	);
+	const selectedBriefId = routeSelectedBriefId ?? fallbackSelectedBriefId;
 	const selectedBrief = useMemo(
 		() => resolveSelectedBrief(briefs, selectedBriefId),
 		[briefs, selectedBriefId],
 	);
+	const effectiveSelectedBriefId = selectedBrief?.id ?? null;
 	const selectedBriefDetailLoading = selectedBrief
 		? briefDetailLoadingIds.has(selectedBrief.id)
 		: false;
@@ -2079,47 +2132,54 @@ export function Dashboard(props: {
 		? (briefDetailErrors[selectedBrief.id] ?? null)
 		: null;
 	const loadBriefDetail = useCallback(
-		async (briefId: string) => {
-			if (briefDetailRequestInFlightRef.current.has(briefId)) {
-				return;
+		async (briefId: string): Promise<BriefItem | null> => {
+			const existingRequest =
+				briefDetailRequestInFlightRef.current.get(briefId);
+			if (existingRequest) {
+				return existingRequest;
 			}
-			briefDetailRequestInFlightRef.current.add(briefId);
-			setBriefDetailLoadingIds((current) => {
-				const next = new Set(current);
-				next.add(briefId);
-				return next;
-			});
-			setBriefDetailErrors((current) => ({
-				...current,
-				[briefId]: undefined,
-			}));
-			try {
-				const detail = await apiGet<BriefItem>(
-					`/api/briefs/${encodeURIComponent(briefId)}`,
-				);
-				setBriefs((current) =>
-					current.map((brief) =>
-						brief.id === detail.id ? { ...brief, ...detail } : brief,
-					),
-				);
-			} catch (error) {
-				const message = describeUnknownError(
-					error,
-					"日报正文加载失败，请稍后重试。",
-				);
-				setBriefDetailErrors((current) => ({
-					...current,
-					[briefId]: message,
-				}));
-				notifyGlobalError("日报正文加载失败", error, message);
-			} finally {
-				briefDetailRequestInFlightRef.current.delete(briefId);
+			const request = (async () => {
 				setBriefDetailLoadingIds((current) => {
 					const next = new Set(current);
-					next.delete(briefId);
+					next.add(briefId);
 					return next;
 				});
-			}
+				setBriefDetailErrors((current) => ({
+					...current,
+					[briefId]: undefined,
+				}));
+				try {
+					const detail = await apiGet<BriefItem>(
+						`/api/briefs/${encodeURIComponent(briefId)}`,
+					);
+					setBriefs((current) =>
+						current.map((brief) =>
+							brief.id === detail.id ? { ...brief, ...detail } : brief,
+						),
+					);
+					return detail;
+				} catch (error) {
+					const message = describeUnknownError(
+						error,
+						"日报正文加载失败，请稍后重试。",
+					);
+					setBriefDetailErrors((current) => ({
+						...current,
+						[briefId]: message,
+					}));
+					notifyGlobalError("日报正文加载失败", error, message);
+					return null;
+				} finally {
+					briefDetailRequestInFlightRef.current.delete(briefId);
+					setBriefDetailLoadingIds((current) => {
+						const next = new Set(current);
+						next.delete(briefId);
+						return next;
+					});
+				}
+			})();
+			briefDetailRequestInFlightRef.current.set(briefId, request);
+			return request;
 		},
 		[notifyGlobalError],
 	);
@@ -2131,6 +2191,104 @@ export function Dashboard(props: {
 		}
 		void loadBriefDetail(selectedBrief.id);
 	}, [loadBriefDetail, selectedBrief?.id, selectedBrief, selectedBriefContent]);
+	const ensureBriefDetail = useCallback(
+		async (briefId: string) => {
+			const existing = briefs.find((brief) => brief.id === briefId) ?? null;
+			if (existing?.content_markdown) {
+				return existing;
+			}
+			return loadBriefDetail(briefId);
+		},
+		[briefs, loadBriefDetail],
+	);
+	const openBrief = useCallback(
+		(briefId: string, options?: { replace?: boolean }) => {
+			setFallbackSelectedBriefId(briefId);
+			setRouteState(
+				{
+					tab: "briefs",
+					scope: null,
+					selectedBriefId: briefId,
+					activeReleaseId: null,
+					activeReleaseLocator: null,
+					activeAnnouncementLocator: null,
+					releaseReturnTab: "briefs",
+				},
+				{ replace: options?.replace },
+			);
+		},
+		[setRouteState],
+	);
+	const copyBrief = useCallback(
+		async (briefId: string) => {
+			setCopyingBriefId(briefId);
+			try {
+				const detail = await ensureBriefDetail(briefId);
+				const brief =
+					detail ?? briefs.find((item) => item.id === briefId) ?? null;
+				const markdown = brief?.content_markdown?.trim() ?? "";
+				if (!markdown) {
+					throw new Error("日报正文还没有准备好。");
+				}
+				await waitForNextPaint();
+				await waitForNextPaint();
+				const briefRoot = document.querySelector<HTMLElement>(
+					`[data-brief-content-id="${briefId}"] [data-markdown-root="true"]`,
+				);
+				if (!briefRoot) {
+					throw new Error("日报正文还没有完成渲染。");
+				}
+				await writeRichClipboard(
+					buildRichClipboardPayload(briefRoot, { markdown }),
+				);
+				pushToast({
+					title: "日报已复制",
+					description: "已写入富文本与纯文本；支持时会附带 Markdown。",
+				});
+			} catch (error) {
+				pushErrorToast(
+					"复制日报失败",
+					describeUnknownError(error, "请稍后重试。"),
+				);
+			} finally {
+				setCopyingBriefId((current) => (current === briefId ? null : current));
+			}
+		},
+		[briefs, ensureBriefDetail, pushErrorToast, pushToast],
+	);
+
+	useEffect(() => {
+		if (
+			scope ||
+			tab !== "briefs" ||
+			!effectiveSelectedBriefId ||
+			activeReleaseId ||
+			activeReleaseLocator ||
+			activeAnnouncementLocator
+		) {
+			return;
+		}
+		if (routeSelectedBriefId === effectiveSelectedBriefId) {
+			return;
+		}
+		setRouteState(
+			{
+				...routeState,
+				selectedBriefId: effectiveSelectedBriefId,
+			},
+			{ replace: true },
+		);
+	}, [
+		activeAnnouncementLocator,
+		activeReleaseId,
+		activeReleaseLocator,
+		effectiveSelectedBriefId,
+		routeSelectedBriefId,
+		routeState,
+		scope,
+		setRouteState,
+		tab,
+	]);
 
 	const refreshAll = useCallback(async () => {
 		const tasks: Array<Promise<unknown>> = [refreshFeed()];
@@ -3401,27 +3559,37 @@ export function Dashboard(props: {
 			setRouteState({
 				tab: nextTab,
 				scope,
+				selectedBriefId:
+					!scope && nextTab === "briefs" ? effectiveSelectedBriefId : null,
 				activeReleaseId: null,
 				activeReleaseLocator: null,
 				activeAnnouncementLocator: null,
 				releaseReturnTab: scope ? "all" : "briefs",
 			});
 		},
-		[scope, setRouteState],
+		[effectiveSelectedBriefId, scope, setRouteState],
 	);
 
 	const onOpenReleaseDetail = useCallback(
 		(target: DashboardReleaseTarget) => {
+			const nextScope = target.scope ?? scope;
+			const nextSelectedBriefId =
+				!nextScope && target.fromTab === "briefs"
+					? (target.selectedBriefId ??
+						routeSelectedBriefId ??
+						effectiveSelectedBriefId)
+					: null;
 			setRouteState({
 				tab: target.fromTab,
-				scope: target.scope ?? scope,
+				scope: nextScope,
+				selectedBriefId: nextSelectedBriefId,
 				activeReleaseId: target.releaseId,
 				activeReleaseLocator: target.locator,
 				activeAnnouncementLocator: null,
 				releaseReturnTab: target.fromTab,
 			});
 		},
-		[scope, setRouteState],
+		[effectiveSelectedBriefId, routeSelectedBriefId, scope, setRouteState],
 	);
 
 	const onCloseReleaseDetail = useCallback(() => {
@@ -3429,6 +3597,8 @@ export function Dashboard(props: {
 			{
 				tab: releaseReturnTab,
 				scope,
+				selectedBriefId:
+					!scope && releaseReturnTab === "briefs" ? routeSelectedBriefId : null,
 				activeReleaseId: null,
 				activeReleaseLocator: null,
 				activeAnnouncementLocator: null,
@@ -3436,13 +3606,15 @@ export function Dashboard(props: {
 			},
 			{ replace: true },
 		);
-	}, [releaseReturnTab, scope, setRouteState]);
+	}, [releaseReturnTab, routeSelectedBriefId, scope, setRouteState]);
 
 	const onCloseAnnouncementDetail = useCallback(() => {
 		setRouteState(
 			{
 				tab: releaseReturnTab,
 				scope,
+				selectedBriefId:
+					!scope && releaseReturnTab === "briefs" ? routeSelectedBriefId : null,
 				activeReleaseId: null,
 				activeReleaseLocator: null,
 				activeAnnouncementLocator: null,
@@ -3450,7 +3622,7 @@ export function Dashboard(props: {
 			},
 			{ replace: true },
 		);
-	}, [releaseReturnTab, scope, setRouteState]);
+	}, [releaseReturnTab, routeSelectedBriefId, scope, setRouteState]);
 
 	const onReleaseDetailResolved = useCallback(
 		(detail: {
@@ -3470,6 +3642,8 @@ export function Dashboard(props: {
 				{
 					tab,
 					scope,
+					selectedBriefId:
+						!scope && tab === "briefs" ? routeSelectedBriefId : null,
 					activeReleaseId: detail.release_id,
 					activeReleaseLocator: locator,
 					activeAnnouncementLocator: null,
@@ -3478,7 +3652,14 @@ export function Dashboard(props: {
 				{ replace: true },
 			);
 		},
-		[activeReleaseLocator, releaseReturnTab, scope, setRouteState, tab],
+		[
+			activeReleaseLocator,
+			releaseReturnTab,
+			routeSelectedBriefId,
+			scope,
+			setRouteState,
+			tab,
+		],
 	);
 	const hasActiveAnnouncementDetail = activeAnnouncementLocator !== null;
 	const showPageLaneSelector =
@@ -3701,9 +3882,24 @@ export function Dashboard(props: {
 					onOpenReleaseFromBrief={
 						mode === "all" ? onOpenReleaseDetail : undefined
 					}
+					onOpenBrief={mode === "all" && !scope ? openBrief : undefined}
+					onCopyBrief={mode === "all" && !scope ? copyBrief : undefined}
+					onEnsureBriefDetail={
+						mode === "all" && !scope ? ensureBriefDetail : undefined
+					}
+					onRetryBriefDetail={
+						mode === "all" && !scope
+							? (briefId) => {
+									void loadBriefDetail(briefId);
+								}
+							: undefined
+					}
 					onGenerateBriefForDate={
 						mode === "all" && !scope ? onGenerateBriefForDate : undefined
 					}
+					briefDetailLoadingIds={briefDetailLoadingIds}
+					briefDetailErrors={briefDetailErrors}
+					copyingBriefId={copyingBriefId}
 					newContentBoundaries={activeFeedNotices.map((notice, index) => ({
 						id: notice.boundaryId,
 						count: notice.boundaryKeys.length,
@@ -3787,7 +3983,7 @@ export function Dashboard(props: {
 			scopeSignature: currentScopeSignature,
 			notifications,
 			briefs,
-			selectedBriefId,
+			selectedBriefId: effectiveSelectedBriefId,
 			shellHydrated,
 			sidebarBootstrapped: sidebarBootstrapCompletedRef.current,
 			notificationsBootstrapped: notificationsBootstrapCompletedRef.current,
@@ -3797,10 +3993,10 @@ export function Dashboard(props: {
 	}, [
 		briefs,
 		currentScopeSignature,
+		effectiveSelectedBriefId,
 		me.user.id,
 		notifications,
 		reactionTokenConfigured,
-		selectedBriefId,
 		shellHydrated,
 	]);
 
@@ -3817,17 +4013,17 @@ export function Dashboard(props: {
 			nextCursor: feed.nextCursor,
 			notifications,
 			briefs,
-			selectedBriefId,
+			selectedBriefId: effectiveSelectedBriefId,
 		});
 	}, [
 		briefs,
+		effectiveSelectedBriefId,
 		feed.items,
 		feed.loadingInitial,
 		feed.nextCursor,
 		me.user.id,
 		notifications,
 		routeState,
-		selectedBriefId,
 		sidebarLoading,
 		feedRequestType,
 	]);
@@ -3982,7 +4178,7 @@ export function Dashboard(props: {
 										/>
 										<ReleaseDailyCard
 											briefs={briefs}
-											selectedId={selectedBriefId}
+											selectedId={effectiveSelectedBriefId}
 											busy={busy === "Generate brief"}
 											freshKeys={freshBriefKeys}
 											error={
@@ -4079,9 +4275,9 @@ export function Dashboard(props: {
 								{tab === "briefs" ? (
 									<BriefListCard
 										briefs={briefs}
-										selectedId={selectedBriefId}
+										selectedId={effectiveSelectedBriefId}
 										freshKeys={freshBriefKeys}
-										onSelectId={(id) => setSelectedBriefId(id)}
+										onSelectId={(id) => openBrief(id, { replace: true })}
 									/>
 								) : null}
 								{renderSidebarInbox ? (

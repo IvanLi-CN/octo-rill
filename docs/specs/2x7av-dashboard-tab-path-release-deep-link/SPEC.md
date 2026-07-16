@@ -19,6 +19,7 @@
 
 - 将 Dashboard 顶部主 tab 的 canonical URL 收口为 path-backed surface：`/`、`/releases`、`/stars`、`/followers`、`/briefs`、`/inbox`。
 - 新增 GitHub 风格 release detail deep link：`/<owner>/<repo>/releases/tag/<tag>?from=<tab>`，并让 `from` 只表达返回上下文，默认 `briefs`。
+- 新增 briefs 选中态 deep link：`/briefs?brief=<brief_id>`，并要求 release detail 在 `from=briefs` 上下文下保留该 `brief` 返回态。
 - 新增 `GET /api/repos/:owner/:repo/releases/tag/:tag/detail`，保留 `GET /api/releases/:release_id/detail` 兼容旧入口与内部调用。
 - 让 brief internal link 生成器、Markdown parser / reconciler 与详情权限判定同时兼容新旧链接，并默认生成 canonical path。
 - 补齐 Storybook、Playwright、router helper、后端解析测试与 targeted browser URL 证明，最终按 fast-track 推进到 merge+cleanup。
@@ -66,6 +67,13 @@
 - `日报` → `/briefs`
 - `收件箱` → `/inbox`
 
+### Brief selection deep link
+
+- canonical briefs selection：`/briefs?brief=<brief_id>`
+- `brief` 只在全局 briefs 上下文和 `from=briefs` 的 release detail 返回链路中保留
+- `/?tab=briefs&brief=<brief_id>` 必须在首轮前端导航中 `replace` 到 `/briefs?brief=<brief_id>`
+- `/briefs` 右侧日报列表切换只允许 `replace` 当前 URL；从 `全部` tab 历史日报卡点击 `去日报` 必须 `push` 到 `/briefs?brief=<brief_id>`
+
 ### Release detail canonical path
 
 - canonical path：`/<owner>/<repo>/releases/tag/<tag>?from=<tab>`
@@ -110,7 +118,7 @@
 
 - Given 用户直接访问 `/<owner>/<repo>/releases/tag/<tag>?from=briefs`
   When 页面完成首载并打开 release detail
-  Then Dashboard 进入 `日报` 上下文，关闭 detail 后回到 `/briefs`。
+  Then Dashboard 进入 `日报` 上下文，关闭 detail 后回到 `/briefs`；若链接同时携带 `brief=<brief_id>`，则必须恢复到 `/briefs?brief=<brief_id>`。
 
 - Given 用户直接访问 `/<owner>/<repo>/releases/tag/<tag>?from=stars`
   When 用户关闭 release detail

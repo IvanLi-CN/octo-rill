@@ -27,6 +27,7 @@ type ApiOptions = {
 	translatedSummary: string;
 	feedTimestamp: string;
 	detailPublishedAt: string;
+	briefId: string;
 	briefDate: string;
 	briefWindowStart: string;
 	briefWindowEnd: string;
@@ -439,6 +440,7 @@ async function installApiMocks(
 		translatedSummary: "这是 release 123 的中文详情摘要。",
 		feedTimestamp: "2026-02-22T11:22:33Z",
 		detailPublishedAt: "2026-02-22T11:22:33Z",
+		briefId: "brief-2026-02-23",
 		briefDate: "2026-02-23",
 		briefWindowStart: "2026-02-22T00:00:00Z",
 		briefWindowEnd: "2026-02-23T00:00:00Z",
@@ -581,9 +583,14 @@ async function installApiMocks(
 		if (req.method() === "GET" && pathname === "/api/briefs") {
 			return json(route, [
 				{
+					id: cfg.briefId,
 					date: cfg.briefDate,
 					window_start: cfg.briefWindowStart,
 					window_end: cfg.briefWindowEnd,
+					effective_time_zone: "Asia/Shanghai",
+					effective_local_boundary: "08:00",
+					release_count: 1,
+					release_ids: [cfg.releaseId],
 					content_markdown: cfg.briefMarkdown,
 					created_at: cfg.briefCreatedAt,
 				},
@@ -994,6 +1001,7 @@ test("deep link with release id opens briefs tab and loads release detail", asyn
 }) => {
 	await installApiMocks(page, {
 		releaseId: "289513858",
+		briefId: "brief-2026-02-23",
 		detailTitle: "Release 289513858",
 	});
 
@@ -1017,12 +1025,37 @@ test("deep link with release id opens briefs tab and loads release detail", asyn
 	).toBeVisible();
 
 	await detailDialog.getByRole("button", { name: "关闭" }).click();
-	await expect(page).toHaveURL(/\/briefs$/);
+	await expect(page).toHaveURL(/\/briefs\?brief=brief-2026-02-23$/);
 	await expect(detailDialog).toHaveCount(0);
 	await expect(page.getByRole("tab", { name: "日报" })).toHaveAttribute(
 		"aria-selected",
 		"true",
 	);
+});
+
+test("release detail opened from a brief deep link restores the same brief on close", async ({
+	page,
+}) => {
+	await installApiMocks(page, {
+		releaseId: "289513858",
+		briefId: "brief-2026-02-23",
+	});
+
+	await page.goto("/?tab=briefs&brief=brief-2026-02-23&release=289513858");
+	await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
+
+	await expect(page).toHaveURL(
+		/\/owner\/repo\/releases\/tag\/v1\.2\.3\?from=briefs&brief=brief-2026-02-23$/,
+	);
+	const detailDialog = page.getByRole("dialog", { name: "Release 详情" });
+	await expect(detailDialog).toBeVisible();
+
+	await detailDialog.getByRole("button", { name: "关闭" }).click();
+	await expect(page).toHaveURL(/\/briefs\?brief=brief-2026-02-23$/);
+	await expect(page.getByText("repo/v1.2.3")).toBeVisible();
+	await expect(
+		page.getByRole("button", { name: /#2026-02-23/ }),
+	).toHaveAttribute("aria-pressed", "true");
 });
 
 test("detail translate button updates card content", async ({ page }) => {
@@ -2226,7 +2259,7 @@ test.describe("localized timestamps", () => {
 			const briefPanel = page.getByRole("tabpanel", { name: "日报" });
 			await expect(
 				page.getByText(
-					"#2026-07-23 · 2026-07-22 08:00:00 → 2026-07-23 08:00:00",
+					"#2026-07-23 · 2026-07-22 08:00:00 → 2026-07-23 08:00:00 · 08:00 · Asia/Shanghai",
 					{
 						exact: true,
 					},
@@ -2258,7 +2291,7 @@ test.describe("localized timestamps", () => {
 			const briefPanel = page.getByRole("tabpanel", { name: "日报" });
 			await expect(
 				page.getByText(
-					"#2026-07-23 · 2026-07-21 20:00:00 → 2026-07-22 20:00:00",
+					"#2026-07-23 · 2026-07-22 08:00:00 → 2026-07-23 08:00:00 · 08:00 · Asia/Shanghai",
 					{
 						exact: true,
 					},
