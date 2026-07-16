@@ -3044,7 +3044,7 @@ const generatedBriefTemplates: Record<string, BriefItem> = {
 ### [acme/fleet](https://github.com/acme/fleet)
 
 - [fallback lane release](${storyBriefReleaseHref("acme", "fleet", "fallback-lane-release")}) · 2026-04-03T06:20:00+08:00 · [GitHub Release](https://github.com/acme/fleet/releases/tag/fallback-lane-release)
-  - 回补这一天的日报摘要，用来验证按天生成后的展示切换。
+  - 回补这一天的完整日报，用来验证按天生成后的展示切换。
 
 ## 获星与关注
 
@@ -4624,7 +4624,7 @@ export const AllHistoryFallbackToReleaseCards: Story = {
 		await expect(canvas.getByText(FALLBACK_RAW_MARKER)).toBeVisible();
 		await step("start generating fallback brief", async () => {
 			await canvas.getByRole("button", { name: "生成日报" }).click();
-			await expect(canvas.getByText("正在生成这一天的日报摘要…")).toBeVisible();
+			await expect(canvas.getByText("正在生成这一天的日报…")).toBeVisible();
 			await expect(
 				canvas.getByRole("button", { name: "生成日报" }),
 			).toBeDisabled();
@@ -4632,7 +4632,7 @@ export const AllHistoryFallbackToReleaseCards: Story = {
 				canvas.queryByText(FALLBACK_RAW_MARKER),
 			).not.toBeInTheDocument();
 			await expect(
-				await canvas.findByText(/回补这一天的日报摘要/),
+				await canvas.findByText(/回补这一天的完整日报/),
 			).toBeVisible();
 			await expect(canvas.getByText("### 关注")).toBeVisible();
 			await expect(canvas.queryByText("### 获星")).not.toBeInTheDocument();
@@ -4699,7 +4699,7 @@ export const AllHistoryFallbackGenerateErrorAndRetry: Story = {
 		await step("retry still succeeds in place", async () => {
 			await canvas.getByRole("button", { name: "重试日报" }).click();
 			await expect(
-				await canvas.findByText(/回补这一天的日报摘要/),
+				await canvas.findByText(/回补这一天的完整日报/),
 			).toBeVisible();
 			await expect(
 				canvas.queryByText("后台没有返回日报内容，请稍后重试。"),
@@ -7342,6 +7342,7 @@ export const ScopedFocusRepoAll: Story = {
 		).not.toBeInTheDocument();
 		await expect(canvas.getByText("AFFiNE 0.23.0")).toBeVisible();
 		await expect(canvas.queryByText("日报摘要")).not.toBeInTheDocument();
+		await expect(canvas.queryByText("日报")).not.toBeInTheDocument();
 		await expect(
 			canvas.queryByText("不应出现在聚焦页的全局日报"),
 		).not.toBeInTheDocument();

@@ -174,7 +174,7 @@
 - `发布` tab 按自然日分组
 ![发布 tab 按自然日分组](./assets/dashboard-releases-grouped.png)
 
-- `全部` tab 历史日报默认折叠为日报摘要
+- `全部` tab 历史日组默认折叠为完整日报卡：卡头提供 `去日报` 与 `复制`，正文通过 brief detail 懒加载后展示完整内容
 ![全部 tab 历史日报默认折叠](./assets/dashboard-all-history-collapsed.png)
 
 - `全部` tab 历史日报切换到 release-only 视图后，右侧 action slot 位置保持不变
