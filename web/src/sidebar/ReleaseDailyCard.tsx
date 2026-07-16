@@ -158,21 +158,24 @@ export function ReleaseDailyCard(props: {
 							/>
 						) : (
 							<>
-								{selected.content_markdown || selected.preview_markdown ? (
+								{selected.content_markdown ? (
 									<Markdown
-										content={
-											selected.content_markdown ??
-											selected.preview_markdown ??
-											""
-										}
+										content={selected.content_markdown}
 										onInternalReleaseClick={onOpenRelease}
 									/>
 								) : null}
-								{detailLoading && !selected.content_markdown ? (
-									<div className="mt-3 space-y-2">
-										<div className="bg-muted h-3 w-full animate-pulse rounded" />
-										<div className="bg-muted h-3 w-11/12 animate-pulse rounded" />
-										<div className="bg-muted h-3 w-8/12 animate-pulse rounded" />
+								{!selected.content_markdown ? (
+									<div className="mt-3 space-y-3">
+										<p className="text-muted-foreground text-sm">
+											{detailLoading
+												? "正在加载完整日报…"
+												: "正在准备完整日报…"}
+										</p>
+										<div className="space-y-2">
+											<div className="bg-muted h-3 w-full animate-pulse rounded" />
+											<div className="bg-muted h-3 w-11/12 animate-pulse rounded" />
+											<div className="bg-muted h-3 w-8/12 animate-pulse rounded" />
+										</div>
 									</div>
 								) : null}
 							</>

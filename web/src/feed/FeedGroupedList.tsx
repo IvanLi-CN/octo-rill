@@ -1,5 +1,7 @@
 import {
+	ArrowUpRight,
 	ArrowUpToLine,
+	Copy,
 	RefreshCcw,
 	List,
 	LoaderCircle,
@@ -333,10 +335,6 @@ function briefFullMarkdown(brief: BriefLike | null) {
 	return brief?.content_markdown ?? "";
 }
 
-function briefDisplayMarkdown(brief: BriefLike | null) {
-	return brief?.content_markdown ?? brief?.preview_markdown ?? "";
-}
-
 function briefCoversSection(
 	brief: BriefLike | null,
 	sectionFlag: boolean | undefined,
@@ -459,22 +457,19 @@ function FeedDayDivider(props: {
 
 function FeedBriefBody(props: {
 	brief: BriefLike | null;
+	content: string | null;
+	loadingLabel: string;
 	onOpenRelease?: (target: DashboardReleaseTarget) => void;
 }) {
-	const { brief, onOpenRelease } = props;
+	const { brief, content, loadingLabel, onOpenRelease } = props;
 
 	return (
 		<div className="px-4 pb-4 pt-4 sm:px-6 sm:pb-5">
-			{brief ? (
-				<Markdown
-					content={briefDisplayMarkdown(brief)}
-					onInternalReleaseClick={onOpenRelease}
-				/>
+			{brief && content ? (
+				<Markdown content={content} onInternalReleaseClick={onOpenRelease} />
 			) : (
 				<div className="space-y-3">
-					<p className="text-muted-foreground text-sm">
-						正在生成这一天的日报摘要…
-					</p>
+					<p className="text-muted-foreground text-sm">{loadingLabel}</p>
 					<div className="space-y-2">
 						<div className="bg-muted h-4 w-40 animate-pulse rounded" />
 						<div className="bg-muted h-3 w-full animate-pulse rounded" />
@@ -489,47 +484,101 @@ function FeedBriefBody(props: {
 
 function HistoricalBriefPanel(props: {
 	brief: BriefLike | null;
-	errorState?: HistoricalBriefErrorState | null;
+	generationErrorState?: HistoricalBriefErrorState | null;
+	detailError?: string | null;
+	detailLoading?: boolean;
 	onRetryGenerate?: (() => void) | undefined;
+	onRetryDetail?: (() => void) | undefined;
 	retryBusy?: boolean;
 	onOpenReleaseFromBrief?: (target: DashboardReleaseTarget) => void;
+	onOpenBrief?: (() => void) | undefined;
+	onCopyBrief?: (() => void) | undefined;
+	copyBusy?: boolean;
 }) {
 	const {
 		brief,
-		errorState = null,
+		generationErrorState = null,
+		detailError = null,
+		detailLoading = false,
 		onRetryGenerate,
+		onRetryDetail,
 		retryBusy = false,
 		onOpenReleaseFromBrief,
+		onOpenBrief,
+		onCopyBrief,
+		copyBusy = false,
 	} = props;
-	const showBriefBody =
-		!errorState && (!brief || Boolean(briefDisplayMarkdown(brief)));
-	const hasSummaryWithoutBody =
-		!errorState && Boolean(brief?.preview_markdown) && !brief?.content_markdown;
+	const loadingLabel = brief
+		? "正在加载这一天的日报…"
+		: "正在生成这一天的日报…";
 	return (
 		<div className={FEED_BRIEF_PANEL_CLASS}>
-			<div className="flex items-center gap-2 border-b border-dashed border-border/55 px-4 py-[10px] text-foreground/82 sm:px-6">
-				<Newspaper className="size-4" />
-				<span className="font-mono text-[13px] tracking-wide">日报摘要</span>
+			<div className="flex items-center justify-between gap-3 border-b border-dashed border-border/55 px-4 py-[10px] text-foreground/82 sm:px-6">
+				<div className="flex min-w-0 items-center gap-2">
+					<Newspaper className="size-4" />
+					<span className="font-mono text-[13px] tracking-wide">日报</span>
+					{brief && onOpenBrief ? (
+						<Button
+							type="button"
+							variant="ghost"
+							size="icon"
+							aria-label="去日报"
+							title="去日报"
+							className="size-7 rounded-full text-foreground/72 hover:text-foreground"
+							onClick={onOpenBrief}
+						>
+							<ArrowUpRight className="size-3.5" />
+						</Button>
+					) : null}
+				</div>
+				{brief && onCopyBrief ? (
+					<Button
+						type="button"
+						variant="ghost"
+						size="sm"
+						className="h-7 gap-1 rounded-full px-2 font-mono text-[11px] text-foreground/72 hover:text-foreground"
+						onClick={onCopyBrief}
+						disabled={copyBusy}
+					>
+						{copyBusy ? (
+							<LoaderCircle className="size-3.5 animate-spin" />
+						) : (
+							<Copy className="size-3.5" />
+						)}
+						{copyBusy ? "复制中…" : "复制"}
+					</Button>
+				) : null}
 			</div>
-			<div className="space-y-3 px-4 pb-4 pt-4 sm:px-6 sm:pb-5">
-				{errorState ? (
+			<div
+				className="space-y-3 px-4 pb-4 pt-4 sm:px-6 sm:pb-5"
+				data-brief-content-id={brief?.id ?? undefined}
+			>
+				{generationErrorState ? (
 					<ErrorStatePanel
 						title="日报生成失败"
-						summary={errorState.summary}
+						summary={generationErrorState.summary}
 						size="compact"
 						actionLabel={onRetryGenerate ? "重试日报" : undefined}
 						onAction={onRetryGenerate}
 						loading={retryBusy}
 					/>
-				) : null}
-				{showBriefBody ? (
-					<FeedBriefBody brief={brief} onOpenRelease={onOpenReleaseFromBrief} />
-				) : null}
-				{hasSummaryWithoutBody ? (
-					<p className="text-muted-foreground mt-3 text-sm">
-						显示的是日报摘要，完整正文会在日报列表选中后加载。
-					</p>
-				) : null}
+				) : detailError ? (
+					<ErrorStatePanel
+						title="日报正文加载失败"
+						summary={detailError}
+						size="compact"
+						actionLabel={onRetryDetail ? "重试" : undefined}
+						onAction={onRetryDetail}
+						loading={detailLoading}
+					/>
+				) : (
+					<FeedBriefBody
+						brief={brief}
+						content={brief?.content_markdown ?? null}
+						loadingLabel={loadingLabel}
+						onOpenRelease={onOpenReleaseFromBrief}
+					/>
+				)}
 			</div>
 		</div>
 	);
@@ -543,10 +592,16 @@ function FeedHistoricalDayGroup(props: {
 	showDivider: boolean;
 	showBriefPanel: boolean;
 	brief: BriefLike | null;
-	errorState?: HistoricalBriefErrorState | null;
+	generationErrorState?: HistoricalBriefErrorState | null;
+	detailError?: string | null;
+	detailLoading?: boolean;
 	onRetryGenerate?: (() => void) | undefined;
+	onRetryDetail?: (() => void) | undefined;
 	retryBusy?: boolean;
 	onOpenReleaseFromBrief?: (target: DashboardReleaseTarget) => void;
+	onOpenBrief?: (() => void) | undefined;
+	onCopyBrief?: (() => void) | undefined;
+	copyBusy?: boolean;
 	items: FeedItem[];
 	feedCardProps: Omit<FeedCardListProps, "items">;
 }) {
@@ -558,10 +613,16 @@ function FeedHistoricalDayGroup(props: {
 		showDivider,
 		showBriefPanel,
 		brief,
-		errorState = null,
+		generationErrorState = null,
+		detailError = null,
+		detailLoading = false,
 		onRetryGenerate,
+		onRetryDetail,
 		retryBusy = false,
 		onOpenReleaseFromBrief,
+		onOpenBrief,
+		onCopyBrief,
+		copyBusy = false,
 		items,
 		feedCardProps,
 	} = props;
@@ -637,10 +698,16 @@ function FeedHistoricalDayGroup(props: {
 			) : null}
 			<HistoricalBriefPanel
 				brief={brief}
-				errorState={errorState}
+				generationErrorState={generationErrorState}
+				detailError={detailError}
+				detailLoading={detailLoading}
 				onRetryGenerate={onRetryGenerate}
+				onRetryDetail={onRetryDetail}
 				retryBusy={retryBusy}
 				onOpenReleaseFromBrief={onOpenReleaseFromBrief}
+				onOpenBrief={onOpenBrief}
+				onCopyBrief={onCopyBrief}
+				copyBusy={copyBusy}
 			/>
 			{trailingItems.length > 0 ? (
 				<FeedItems items={trailingItems} {...feedCardProps} />
@@ -666,8 +733,15 @@ export function FeedGroupedList(
 		dailyBoundaryUtcOffsetMinutes: number | null | undefined;
 		now?: Date;
 		onOpenReleaseFromBrief?: (target: DashboardReleaseTarget) => void;
+		onOpenBrief?: (briefId: string) => void;
+		onCopyBrief?: (briefId: string) => void;
+		onEnsureBriefDetail?: (briefId: string) => void;
+		onRetryBriefDetail?: (briefId: string) => void;
 		onGenerateBriefForDate?: (date: string) => Promise<void>;
 		initialBriefErrorSummariesByDate?: Record<string, string>;
+		briefDetailLoadingIds?: Set<string>;
+		briefDetailErrors?: Record<string, string | undefined>;
+		copyingBriefId?: string | null;
 		newContentBoundaries?: NewContentBoundary[];
 	},
 ) {
@@ -687,8 +761,15 @@ export function FeedGroupedList(
 		dailyBoundaryUtcOffsetMinutes,
 		now,
 		onOpenReleaseFromBrief,
+		onOpenBrief,
+		onCopyBrief,
+		onEnsureBriefDetail,
+		onRetryBriefDetail,
 		onGenerateBriefForDate,
 		initialBriefErrorSummariesByDate = {},
+		briefDetailLoadingIds = new Set<string>(),
+		briefDetailErrors = {},
+		copyingBriefId = null,
 		newContentBoundaries = [],
 		...feedCardProps
 	} = props;
@@ -779,6 +860,38 @@ export function FeedGroupedList(
 		}
 		return next;
 	}, [visibleBriefs]);
+	const historicalBriefIdsNeedingDetail = useMemo(() => {
+		if (mode !== "all" || scopedFeed) {
+			return [];
+		}
+		const next = new Set<string>();
+		for (const group of groups) {
+			if (group.kind !== "historical") continue;
+			const brief =
+				(group.briefId ? briefById.get(group.briefId) : null) ??
+				(group.briefDate ? briefByDate.get(group.briefDate) : null);
+			if (!brief?.id || brief.content_markdown) continue;
+			if (briefDetailLoadingIds.has(brief.id)) continue;
+			if (briefDetailErrors[brief.id]) continue;
+			next.add(brief.id);
+		}
+		return Array.from(next);
+	}, [
+		briefByDate,
+		briefById,
+		briefDetailErrors,
+		briefDetailLoadingIds,
+		groups,
+		mode,
+		scopedFeed,
+	]);
+
+	useEffect(() => {
+		if (!onEnsureBriefDetail) return;
+		for (const briefId of historicalBriefIdsNeedingDetail) {
+			onEnsureBriefDetail(briefId);
+		}
+	}, [historicalBriefIdsNeedingDetail, onEnsureBriefDetail]);
 
 	useEffect(() => {
 		setRawListGroupIds((current) => {
@@ -866,9 +979,15 @@ export function FeedGroupedList(
 						? briefByDate.get(group.briefDate)
 						: null) ??
 					null;
-				const briefError = briefGenerationEnabled
+				const briefGenerationError = briefGenerationEnabled
 					? (briefErrorsByDate.get(group.briefDate) ?? null)
 					: null;
+				const briefDetailError = brief
+					? (briefDetailErrors[brief.id] ?? null)
+					: null;
+				const briefDetailLoading = brief
+					? briefDetailLoadingIds.has(brief.id)
+					: false;
 				const hasReleases = group.releaseCount > 0;
 				const isHistoricalRawGroup =
 					mode === "all" &&
@@ -883,7 +1002,7 @@ export function FeedGroupedList(
 					hasReleases &&
 					(group.kind === "historical" ||
 						pendingBrief ||
-						Boolean(briefError)) &&
+						Boolean(briefGenerationError)) &&
 					!rawListGroupIds.has(group.id);
 				const showDivider = index > 0;
 				let groupAction: ReactNode = null;
@@ -942,7 +1061,7 @@ export function FeedGroupedList(
 								生成日报
 							</Button>
 						);
-					} else if (briefError && onGenerateBriefForDate) {
+					} else if (briefGenerationError && onGenerateBriefForDate) {
 						groupAction = (
 							<Button
 								type="button"
@@ -1059,7 +1178,9 @@ export function FeedGroupedList(
 								showDivider={showDivider}
 								showBriefPanel={showBriefPanel}
 								brief={pendingBrief ? null : brief}
-								errorState={briefError}
+								generationErrorState={briefGenerationError}
+								detailError={briefDetailError}
+								detailLoading={briefDetailLoading}
 								onRetryGenerate={
 									onGenerateBriefForDate
 										? () => {
@@ -1095,8 +1216,20 @@ export function FeedGroupedList(
 											}
 										: undefined
 								}
+								onRetryDetail={
+									brief && onRetryBriefDetail
+										? () => onRetryBriefDetail(brief.id)
+										: undefined
+								}
 								retryBusy={pendingBrief}
 								onOpenReleaseFromBrief={onOpenReleaseFromBrief}
+								onOpenBrief={
+									brief && onOpenBrief ? () => onOpenBrief(brief.id) : undefined
+								}
+								onCopyBrief={
+									brief && onCopyBrief ? () => onCopyBrief(brief.id) : undefined
+								}
+								copyBusy={copyingBriefId === brief?.id}
 								items={group.items}
 								feedCardProps={{ ...feedCardProps, sourceTab }}
 							/>
