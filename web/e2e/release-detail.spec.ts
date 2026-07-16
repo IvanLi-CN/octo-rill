@@ -1001,6 +1001,7 @@ test("deep link with release id opens briefs tab and loads release detail", asyn
 }) => {
 	await installApiMocks(page, {
 		releaseId: "289513858",
+		briefId: "brief-2026-02-23",
 		detailTitle: "Release 289513858",
 	});
 
@@ -1024,7 +1025,7 @@ test("deep link with release id opens briefs tab and loads release detail", asyn
 	).toBeVisible();
 
 	await detailDialog.getByRole("button", { name: "关闭" }).click();
-	await expect(page).toHaveURL(/\/briefs$/);
+	await expect(page).toHaveURL(/\/briefs\?brief=brief-2026-02-23$/);
 	await expect(detailDialog).toHaveCount(0);
 	await expect(page.getByRole("tab", { name: "日报" })).toHaveAttribute(
 		"aria-selected",
