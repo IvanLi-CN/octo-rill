@@ -3863,6 +3863,8 @@ function DashboardPreview(props: {
 					onOpenReleaseFromBrief={
 						mode === "all" ? openReleaseDetail : undefined
 					}
+					onOpenBrief={mode === "all" && !scope ? () => {} : undefined}
+					onCopyBrief={mode === "all" && !scope ? () => {} : undefined}
 					onGenerateBriefForDate={
 						mode === "all" && !scope ? generateBriefForDate : undefined
 					}
@@ -4519,6 +4521,8 @@ export const AllHistoryCollapsedToBriefs: Story = {
 		).toBeVisible();
 		await expect(canvas.getByText("## 获星与关注")).toBeVisible();
 		await expect(canvas.getByRole("link", { name: "#13840" })).toBeVisible();
+		await expect(canvas.getByRole("button", { name: "去日报" })).toBeVisible();
+		await expect(canvas.getByRole("button", { name: "复制" })).toBeVisible();
 		await expect(
 			canvas.queryByText(HISTORY_RAW_MARKER),
 		).not.toBeInTheDocument();
