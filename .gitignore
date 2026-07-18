@@ -23,6 +23,7 @@ logs/
 
 # Scratch
 /tmp/
+/output/
 
 # Bun/Node
 node_modules/
@@ -44,5 +45,6 @@ web/*.tsbuildinfo
 !.codex/skills/**
 .codex/skills/**/__pycache__/
 .codex/skills/**/*.pyc
+.impeccable/
 .serena/
 .serena
