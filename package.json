@@ -1,6 +1,7 @@
 {
   "name": "octo-rill",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "hooks:install": "sh ./scripts/install-hooks.sh",
