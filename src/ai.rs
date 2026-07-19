@@ -3394,6 +3394,20 @@ fn preserves_release_link_sequence(source: &str, candidate: &str) -> bool {
         == extract_internal_release_ref_sequence(candidate)
 }
 
+fn release_block_has_summary_details(block: &BriefReleaseBlock) -> bool {
+    block
+        .detail_lines
+        .iter()
+        .any(|line| !line.starts_with("相关链接："))
+}
+
+fn release_block_has_related_links(block: &BriefReleaseBlock) -> bool {
+    block
+        .detail_lines
+        .iter()
+        .any(|line| line.starts_with("相关链接："))
+}
+
 fn preserves_release_detail_presence(source: &str, candidate: &str) -> bool {
     let Some(source_blocks) = extract_brief_release_blocks(source) else {
         return false;
@@ -3411,7 +3425,10 @@ fn preserves_release_detail_presence(source: &str, candidate: &str) -> bool {
         .all(|(source_block, candidate_block)| {
             source_block.repo_full_name == candidate_block.repo_full_name
                 && source_block.release_title == candidate_block.release_title
-                && source_block.detail_lines.is_empty() == candidate_block.detail_lines.is_empty()
+                && release_block_has_summary_details(source_block)
+                    == release_block_has_summary_details(candidate_block)
+                && release_block_has_related_links(source_block)
+                    == release_block_has_related_links(candidate_block)
         })
 }
 
@@ -8587,6 +8604,68 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert!(blocks[0].detail_lines.is_empty());
         assert!(!built.content_markdown.contains("发布 Tuckmark v0.5.2"));
+    }
+
+    #[tokio::test]
+    async fn build_brief_content_from_digests_rejects_polish_adding_pseudo_summary_to_link_only_release()
+     {
+        let release = ReleaseDigest {
+            release_id: 42,
+            full_name: "IvanLi-CN/tuckmark".to_owned(),
+            title: "v0.5.2".to_owned(),
+            body: "Tuckmark release v0.5.2\nhttps://github.com/IvanLi-CN/tuckmark/compare/v0.5.1...v0.5.2".to_owned(),
+            html_url: "https://github.com/IvanLi-CN/tuckmark/releases/tag/v0.5.2".to_owned(),
+            published_at: "2026-07-18T23:49:57Z".to_owned(),
+            is_prerelease: false,
+        };
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(|Json(payload): Json<Value>| async move {
+                let prompt = payload["messages"][1]["content"]
+                    .as_str()
+                    .expect("user prompt should be present");
+                let content = if prompt.contains("对下面日报做一次统一润色") {
+                    "## 项目更新\n\n### [IvanLi-CN/tuckmark](https://github.com/IvanLi-CN/tuckmark)\n\n- [v0.5.2](/IvanLi-CN/tuckmark/releases/tag/v0.5.2?from=briefs) · 2026-07-18T23:49:57Z · [GitHub Release](https://github.com/IvanLi-CN/tuckmark/releases/tag/v0.5.2)\n  - 发布 Tuckmark v0.5.2\n  - 相关链接：[compare](https://github.com/IvanLi-CN/tuckmark/compare/v0.5.1...v0.5.2)\n"
+                        .to_owned()
+                } else {
+                    "{\"valuable\":false,\"title_zh\":null,\"summary_bullets\":[]}".to_owned()
+                };
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "choices": [{
+                            "message": { "content": content }
+                        }]
+                    })),
+                )
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let user_id = brief_test_user_id();
+        let now = "2026-07-19T00:00:00Z";
+        seed_brief_release_scope(
+            state.as_ref(),
+            user_id,
+            1,
+            "IvanLi-CN/tuckmark",
+            std::slice::from_ref(&release),
+            now,
+        )
+        .await;
+
+        let built =
+            build_brief_content_from_digests(state.as_ref(), user_id, vec![release], Vec::new())
+                .await
+                .expect("build brief content");
+
+        let blocks =
+            extract_brief_release_blocks(&built.content_markdown).expect("parse brief blocks");
+        assert_eq!(blocks.len(), 1);
+        assert!(!release_block_has_summary_details(&blocks[0]));
+        assert!(release_block_has_related_links(&blocks[0]));
+        assert!(!built.content_markdown.contains("发布 Tuckmark v0.5.2"));
+        assert!(built.content_markdown.contains("相关链接："));
     }
 
     #[tokio::test]
