@@ -17736,14 +17736,22 @@ fn parse_release_smart_summary_payload(raw: &str) -> Option<ReleaseSmartSummaryP
     })
 }
 
+fn release_smart_body_system_prompt() -> &'static str {
+    "你是一个严谨的版本变化整理助手，专门把 GitHub Release 证据整理成便于人类快速理解的中文要点卡片。只能根据给定证据输出，不得脑补。标题必须具体且证据绑定；如果保留版本号，版本号后面必须直接说明具体变更。禁止输出“版本更新”“更新要点”“发布说明”“版本发布”这类空泛标题。遇到短 `PR / Channel / Bump / Commit` 结构时，优先从 `feat(...)` / `fix(...)` 等 subject 提炼标题，不能让 stable/minor/patch/commit SHA 主导标题。"
+}
+
 fn release_smart_body_prompt(item: &ReleaseSmartBatchCandidate) -> String {
     format!(
-        "Repo: {repo}\nRelease title: {title}\nRelease tag: {tag}\nSource: release body\n\nRelease body:\n{body}\n\n请判断这段 GitHub Release 正文是否足以生成“方便了解项目版本变化”的中文要点卡片。\n输出严格 JSON（不要 markdown code block）：\n{{\"valuable\":true,\"title_zh\":\"...\",\"summary_bullets\":[\"...\",\"...\"]}}\n\n硬性要求：\n1) 只能根据输入证据，不得脑补；\n2) valuable=true 时，summary_bullets 必须是 1-4 条简洁中文要点，聚焦真实版本变化；\n3) valuable=false 时，summary_bullets 必须是空数组，title_zh 可为 null；\n4) 若正文只有模板、链接、空话、营销句、版本占位或“查看 commits”等无实质变更说明，必须返回 valuable=false；\n5) 不输出 URL，不写长段落，不逐句直译原文。",
+        "Repo: {repo}\nRelease title: {title}\nRelease tag: {tag}\nSource: release body\n\nRelease body:\n{body}\n\n请判断这段 GitHub Release 正文是否足以生成“方便了解项目版本变化”的中文要点卡片。\n输出严格 JSON（不要 markdown code block）：\n{{\"valuable\":true,\"title_zh\":\"...\",\"summary_bullets\":[\"...\",\"...\"]}}\n\n硬性要求：\n1) 只能根据输入证据，不得脑补；\n2) valuable=true 时，title_zh 必须是 1 条具体、简短、证据绑定的中文标题；若保留版本号（如 `{tag}`），版本号后面必须立刻点明具体动作 + 对象/模块/领域；\n3) valuable=true 时，summary_bullets 必须是 1-4 条简洁中文要点，聚焦真实版本变化；title_zh 要比 bullets 更短，但不能比 bullets 更空；\n4) 若正文是短 `PR / Channel / Bump / Commit` 结构，且 PR 行含 `feat(...)` / `fix(...)` / `perf(...)` / `refactor(...)` 等具体 subject，title_zh 必须优先从这行提炼；`Channel` / `Bump` / `Commit SHA` 只能辅助 summary_bullets，不能主导标题；\n5) 禁止输出空泛标题，例如：`版本更新`、`更新要点`、`发布说明`、`版本发布`、`稳定版更新`、`补丁更新`；也不要只复述 `stable` / `minor` / `patch`；\n6) valuable=false 时，summary_bullets 必须是空数组，title_zh 可为 null；\n7) 若正文只有模板、链接、空话、营销句、版本占位或“查看 commits”等无实质变更说明，必须返回 valuable=false；\n8) 不输出 URL，不写长段落，不逐句直译原文。\n\n短 body 标题示例（只示范标题风格，不要照抄无关信息）：\n- 输入：`PR: #653 feat(prompt-cache): add conversation operations tab` + `Channel: stable` + `Bump: minor`\n  - 坏标题：\"v2.42.0 版本更新\"\n  - 好标题：\"v2.42.0 新增对话操作标签页\"\n- 输入：`PR: #650 feat(dashboard): track upstream host bandwidth truth` + `Channel: stable` + `Bump: minor`\n  - 坏标题：\"v2.41.0 更新要点\"\n  - 好标题：\"v2.41.0 新增上游主机带宽追踪\"\n- 输入：`PR: #654 fix(web): refresh persisted dashboard invocation detail` + `Channel: stable` + `Bump: patch`\n  - 坏标题：\"v2.42.1 补丁更新\"\n  - 好标题：\"v2.42.1 修复 Dashboard 持久化调用详情刷新\"",
         repo = item.full_name,
         title = item.title,
         tag = item.tag_name,
         body = item.body,
     )
+}
+
+fn release_smart_diff_system_prompt() -> &'static str {
+    "你是一个严谨的版本变化整理助手，专门把 GitHub compare 摘要整理成便于人类快速理解的中文版本变化要点。只能根据给定证据输出，不得脑补。标题必须具体且证据绑定；如果保留版本号，版本号后面必须直接说明具体变更。禁止输出“版本更新”“更新要点”“发布说明”“版本发布”这类空泛标题，也不要让 stable/minor/patch 之类版本属性主导标题。"
 }
 
 fn release_smart_diff_prompt(
@@ -17752,7 +17760,7 @@ fn release_smart_diff_prompt(
     digest: &str,
 ) -> String {
     format!(
-        "Repo: {repo}\nRelease title: {title}\nRelease tag: {tag}\nCompare range: {compare_range}\nSource: compare digest\n\n说明：release body 已经被判定为不足以支撑版本变化摘要，请只根据下列 compare 摘要判断是否能提炼出对人类有用的版本变化。\n\nCompare digest:\n{digest}\n\n输出严格 JSON（不要 markdown code block）：\n{{\"valuable\":true,\"title_zh\":\"...\",\"summary_bullets\":[\"...\",\"...\"]}}\n\n硬性要求：\n1) 只能依据给定 compare digest，总结 1-4 条中文要点；\n2) 优先总结功能、修复、性能、兼容性、运维/构建变更等可读变化；\n3) 若 digest 只体现 lockfile、minified、generated、版本号或噪声文件，且无法说明实际版本变化，必须返回 valuable=false；\n4) valuable=false 时 summary_bullets 必须为空数组；\n5) 不输出 URL，不得臆测未提供的行为影响。",
+        "Repo: {repo}\nRelease title: {title}\nRelease tag: {tag}\nCompare range: {compare_range}\nSource: compare digest\n\n说明：release body 已经被判定为不足以支撑版本变化摘要，请只根据下列 compare 摘要判断是否能提炼出对人类有用的版本变化。\n\nCompare digest:\n{digest}\n\n输出严格 JSON（不要 markdown code block）：\n{{\"valuable\":true,\"title_zh\":\"...\",\"summary_bullets\":[\"...\",\"...\"]}}\n\n硬性要求：\n1) 只能依据给定 compare digest；\n2) valuable=true 时，title_zh 必须是 1 条具体、简短、证据绑定的中文标题；若保留版本号（如 `{tag}`），版本号后面必须立刻点明具体动作 + 对象/模块/领域；\n3) valuable=true 时，总结 1-4 条中文要点，优先提炼功能、修复、性能、兼容性、运维/构建变更等可读变化；标题要比 bullets 更短，但不能写成 `版本更新`、`更新要点`、`发布说明` 这类空泛词；\n4) 不要让 `stable` / `minor` / `patch`、compare range、commit SHA、文件计数本身主导标题；\n5) 若 digest 只体现 lockfile、minified、generated、版本号或噪声文件，且无法说明实际版本变化，必须返回 valuable=false；\n6) valuable=false 时 summary_bullets 必须为空数组；\n7) 不输出 URL，不得臆测未提供的行为影响。",
         repo = item.full_name,
         title = item.title,
         tag = item.tag_name,
@@ -18020,14 +18028,9 @@ async fn summarize_release_smart_candidate_with_ai(
     item: &ReleaseSmartBatchCandidate,
 ) -> Result<Option<(Option<String>, Option<String>)>, ApiError> {
     let body_prompt = release_smart_body_prompt(item);
-    let raw = ai::chat_completion(
-        state,
-        "你是一个严谨的版本变化整理助手，专门把 GitHub Release 证据整理成便于人类快速理解的中文要点卡片。只能根据给定证据输出，不得脑补。",
-        &body_prompt,
-        700,
-    )
-    .await
-    .map_err(ApiError::internal)?;
+    let raw = ai::chat_completion(state, release_smart_body_system_prompt(), &body_prompt, 700)
+        .await
+        .map_err(ApiError::internal)?;
     let parsed = parse_release_smart_summary_payload(&raw)
         .ok_or_else(|| ApiError::internal("release smart body summary json decode failed"))?;
     if parsed.valuable {
@@ -18058,14 +18061,9 @@ async fn summarize_release_smart_candidate_with_ai(
     };
 
     let diff_prompt = release_smart_diff_prompt(item, &compare_range, &digest);
-    let raw = ai::chat_completion(
-        state,
-        "你是一个严谨的版本变化整理助手，专门把 GitHub compare 摘要整理成便于人类快速理解的中文版本变化要点。只能根据给定证据输出，不得脑补。",
-        &diff_prompt,
-        700,
-    )
-    .await
-    .map_err(ApiError::internal)?;
+    let raw = ai::chat_completion(state, release_smart_diff_system_prompt(), &diff_prompt, 700)
+        .await
+        .map_err(ApiError::internal)?;
     let parsed = parse_release_smart_summary_payload(&raw)
         .ok_or_else(|| ApiError::internal("release smart diff summary json decode failed"))?;
     if !parsed.valuable {
@@ -20644,12 +20642,12 @@ mod tests {
         GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse, GraphQlError,
         LLM_CALL_ORDER_BY_CREATED_DESC, LiveReleaseReactions, PublicReleaseQuery,
         RELEASE_FEED_BODY_MAX_CHARS, ReleaseReactionCounts, ReleaseReactionRow,
-        ReleaseReactionViewer, ReturnModeQuery, SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem,
-        TranslationCacheRow, TranslationUpsert, admin_dashboard, admin_delete_public_release_repo,
-        admin_download_realtime_task_log, admin_get_llm_call_detail,
-        admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
-        admin_list_realtime_tasks, admin_list_repo_governance, admin_list_users,
-        admin_patch_llm_runtime_config, admin_patch_user, admin_users_offset,
+        ReleaseReactionViewer, ReleaseSmartBatchCandidate, ReturnModeQuery,
+        SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslationCacheRow, TranslationUpsert,
+        admin_dashboard, admin_delete_public_release_repo, admin_download_realtime_task_log,
+        admin_get_llm_call_detail, admin_get_llm_scheduler_status, admin_get_realtime_task_detail,
+        admin_list_llm_calls, admin_list_realtime_tasks, admin_list_repo_governance,
+        admin_list_users, admin_patch_llm_runtime_config, admin_patch_user, admin_users_offset,
         ai_error_is_non_retryable, brief_contains_release_link, build_compare_digest,
         build_feed_reaction_refresh_item, build_task_diagnostics, compact_dashboard_signatures,
         dashboard_updates, encode_dashboard_updates_token, ensure_account_enabled,
@@ -20674,9 +20672,10 @@ mod tests {
         public_list_repo_releases_http, publish_repo_public_release,
         refresh_admin_dashboard_rollups, refresh_feed_reactions, release_cache_entry_reusable,
         release_detail_source_hash, release_detail_translation_ready, release_excerpt,
-        release_feed_body, release_reactions_status, require_active_user_id,
-        require_business_user_id, resolve_release_full_name,
-        should_retry_public_compare_without_auth, smart_error_is_retryable, split_markdown_chunks,
+        release_feed_body, release_reactions_status, release_smart_body_prompt,
+        release_smart_diff_prompt, require_active_user_id, require_business_user_id,
+        resolve_release_full_name, should_retry_public_compare_without_auth,
+        smart_error_is_retryable, split_markdown_chunks, summarize_release_smart_candidate_with_ai,
         sync_all, sync_notifications, sync_releases, sync_starred,
         translate_release_detail_for_user, translate_releases_batch_for_user,
         translate_response_from_batch_item, unpublish_repo_public_release, upsert_translation,
@@ -27247,6 +27246,138 @@ body={}
                 "详情见".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn release_smart_body_prompt_prefers_specific_titles_for_short_release_bodies() {
+        let prompt = release_smart_body_prompt(&ReleaseSmartBatchCandidate {
+            release_id: 356108921,
+            entity_id: "356108921".to_owned(),
+            full_name: "IvanLi-CN/codex-vibe-monitor".to_owned(),
+            tag_name: "v2.42.0".to_owned(),
+            previous_tag_name: Some("v2.41.2".to_owned()),
+            title: "v2.42.0".to_owned(),
+            body: "PR: #653 feat(prompt-cache): add conversation operations tab\nChannel: stable\nBump: minor\nCommit: 60f036ff163d14a44d179101b8ebf4539a1473ee".to_owned(),
+            source_hash: "hash".to_owned(),
+        });
+
+        assert!(prompt.contains("title_zh 必须是 1 条具体、简短、证据绑定的中文标题"));
+        assert!(prompt.contains("PR / Channel / Bump / Commit"));
+        assert!(prompt.contains("坏标题：\"v2.42.0 版本更新\""));
+        assert!(prompt.contains("好标题：\"v2.42.0 新增对话操作标签页\""));
+        assert!(prompt.contains("坏标题：\"v2.41.0 更新要点\""));
+        assert!(prompt.contains("好标题：\"v2.41.0 新增上游主机带宽追踪\""));
+        assert!(prompt.contains("`Channel` / `Bump` / `Commit SHA` 只能辅助 summary_bullets"));
+    }
+
+    #[test]
+    fn release_smart_diff_prompt_bans_generic_titles_and_version_led_titles() {
+        let prompt = release_smart_diff_prompt(
+            &ReleaseSmartBatchCandidate {
+                release_id: 356108921,
+                entity_id: "356108921".to_owned(),
+                full_name: "IvanLi-CN/codex-vibe-monitor".to_owned(),
+                tag_name: "v2.42.0".to_owned(),
+                previous_tag_name: Some("v2.41.2".to_owned()),
+                title: "v2.42.0".to_owned(),
+                body: "stub".to_owned(),
+                source_hash: "hash".to_owned(),
+            },
+            "v2.41.2...v2.42.0",
+            "commit_subjects:\n- 60f036f: feat(prompt-cache): add conversation operations tab",
+        );
+
+        assert!(prompt.contains("title_zh 必须是 1 条具体、简短、证据绑定的中文标题"));
+        assert!(prompt.contains("版本号后面必须立刻点明具体动作 + 对象/模块/领域"));
+        assert!(prompt.contains("不能写成 `版本更新`、`更新要点`、`发布说明` 这类空泛词"));
+        assert!(prompt.contains(
+            "不要让 `stable` / `minor` / `patch`、compare range、commit SHA、文件计数本身主导标题"
+        ));
+    }
+
+    #[tokio::test]
+    async fn summarize_release_smart_candidate_with_ai_sends_specific_title_contract() {
+        let pool = setup_pool().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_route = Arc::clone(&calls);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                let calls_for_route = Arc::clone(&calls_for_route);
+                async move {
+                    calls_for_route.fetch_add(1, Ordering::SeqCst);
+                    let system_prompt = payload["messages"][0]["content"]
+                        .as_str()
+                        .unwrap_or_default();
+                    let user_prompt = payload["messages"][1]["content"]
+                        .as_str()
+                        .unwrap_or_default();
+
+                    assert!(system_prompt.contains("标题必须具体且证据绑定"));
+                    assert!(
+                        system_prompt.contains(
+                            "禁止输出“版本更新”“更新要点”“发布说明”“版本发布”这类空泛标题"
+                        )
+                    );
+                    assert!(user_prompt.contains("坏标题：\"v2.42.0 版本更新\""));
+                    assert!(user_prompt.contains("好标题：\"v2.42.0 新增对话操作标签页\""));
+                    assert!(
+                        user_prompt
+                            .contains("好标题：\"v2.42.1 修复 Dashboard 持久化调用详情刷新\"")
+                    );
+                    assert!(
+                        user_prompt
+                            .contains("`Channel` / `Bump` / `Commit SHA` 只能辅助 summary_bullets")
+                    );
+
+                    let content = json!({
+                        "valuable": true,
+                        "title_zh": "v2.42.0 新增对话操作标签页",
+                        "summary_bullets": [
+                            "新增对话操作标签页，用于管理提示词缓存中的对话数据"
+                        ]
+                    })
+                    .to_string();
+                    let response = json!({
+                        "choices": [{"message": {"content": content}}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
+                    });
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        Json(response),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_state_with_ai_base_url(pool, base_url);
+
+        let summarized = summarize_release_smart_candidate_with_ai(
+            state.as_ref(),
+            "user-1",
+            &ReleaseSmartBatchCandidate {
+                release_id: 356108921,
+                entity_id: "356108921".to_owned(),
+                full_name: "IvanLi-CN/codex-vibe-monitor".to_owned(),
+                tag_name: "v2.42.0".to_owned(),
+                previous_tag_name: Some("v2.41.2".to_owned()),
+                title: "v2.42.0".to_owned(),
+                body: "PR: #653 feat(prompt-cache): add conversation operations tab\nChannel: stable\nBump: minor\nCommit: 60f036ff163d14a44d179101b8ebf4539a1473ee".to_owned(),
+                source_hash: "hash".to_owned(),
+            },
+        )
+        .await
+        .expect("summarize release smart");
+
+        assert_eq!(
+            summarized,
+            Some((
+                Some("v2.42.0 新增对话操作标签页".to_owned()),
+                Some("- 新增对话操作标签页，用于管理提示词缓存中的对话数据".to_owned()),
+            ))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
