@@ -43,7 +43,7 @@ Release 是主阅读对象，承担最多的衍生能力：
 - 时间窗口：以 `daily_brief_time_zone` 解释本地自然日，窗口固定为「昨日 00:00（本地）→ 今日 00:00（本地）」。
 - 自动出报：管理员运行时设置 `daily_brief_schedule_local_time` 决定系统每天几点自动生成日报；首次启动时默认值由 `AI_DAILY_AT_LOCAL` 种子提供，不再由用户单独设置，也不参与内容取数窗口。
 - 内容结构固定为：
-  - `## 项目更新`：始终存在，按项目分组逐条列出 release 与变更要点；若当天没有 Release，则显示 `- 本时间窗口内没有新的 Release。`
+  - `## 项目更新`：始终存在，按项目分组逐条列出 release；release 要点由 `release_smart` 决定，低信息 release 不输出伪摘要，body 无价值时会尝试 compare fallback，两者都无价值时只保留 release 主行不补子 bullet；若 AI 不可用或失败，则显示中性提示式兜底；若当天没有 Release，则显示 `- 本时间窗口内没有新的 Release。`
   - `## 获星与关注`：仅当同一自然日内实际存在 `repo_star_received` 或 `follower_received` 动态时出现；只渲染有数据的 `### 获星` / `### 关注` 小节，不再输出空社交占位
 - 链接策略：
   - release 主链接：站内链接 `/<owner>/<repo>/releases/tag/<tag>?from=briefs`，点击后在 `日报` 上下文展示详情卡
