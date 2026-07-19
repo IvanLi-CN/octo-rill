@@ -53,13 +53,16 @@
 - 新生成 brief 正文不得再包含 `## 概览`、`时间窗口（本地）` 或等价概览文案。
 - brief 正文必须稳定包含 `## 项目更新` 与 `## 获星与关注` 两个章节；任一类数据为空时也要输出对应空态。
 - `## 项目更新` 继续按仓库分组，保留 release 主链接 `/?tab=briefs&release=<release_id>` 与 GitHub Release 外链。
-- `## 项目更新` 中的仓库标题必须保持 `### [owner/repo](...)`；每条 release 必须保持顶层 `- [title](/?tab=briefs&release=...)`；release 详情只能由连续的 `  - ...` 子 bullet 组成。
+- `## 项目更新` 中的仓库标题必须保持 `### [owner/repo](...)`；每条 release 必须保持顶层 `- [title](/?tab=briefs&release=...)`；release 详情只允许在确有可提炼变更时以连续的 `  - ...` 子 bullet 组成，低信息 release 只保留主行。
+- release 要点提取必须复用 `release_smart` 的事实链路：`body valuable -> 直接总结`，否则走 compare fallback；两者都无价值时，不得编造任何伪摘要或固定占位文案。
 - `## 获星与关注` 必须覆盖同一窗口内的 `repo_star_received` 与 `follower_received` 事件，并按最新事件倒序展示紧凑摘要。
 - related links 不得再直出完整 GitHub URL；PR / Issue 显示 `#编号`，commit 显示短 SHA。
 - 润色后的日报若被单层 markdown fence 包裹，落库前必须剥离该外层 fence。
 - 润色结果若把 release 子 bullet 改写成段落、硬换行文本、双空行或其它非 canonical 结构，必须拒绝并回退到 deterministic markdown。
+- 润色结果若把 release 子 bullet 改写成段落、硬换行文本、双空行或其它非 canonical 结构，必须拒绝并回退到 deterministic markdown；润色阶段也不得为零子 bullet 的 release 补写“发布 xxx”“版本发布”“更新要点”等空泛内容。
 - Release 要点生成与润色 prompt 必须声明默认使用简体中文整理日报内容，同时允许保留代码标识符、commit type、包名、API 名、项目名、版本号和原始标题等必要英文。
 - 当 AI 不可用或返回不可解析摘要时，deterministic fallback 不得直接复用原始 release notes 的英文 bullet；应输出中文提示式兜底，并保留 release 主链接与 GitHub Release 外链。
+- `brief.refresh_content` 与同窗口再生成必须把 `发布 <repo> <version>`、`版本发布`、`更新要点` 这类伪摘要纳入可刷新范围。
 - 已存在的标准化 brief 命中同一窗口时，重新生成必须更新原有行，而不是直接 no-op 复用旧内容。
 - 历史修复任务必须能够扫描并刷新命中旧格式签名的可重建 brief。
 
@@ -116,6 +119,14 @@ None
 - Given 某个 release body 中提取到了 PR、Issue 或 commit 链接
   When 日报正文渲染相关链接
   Then 显示文本分别为 `#编号`、`#编号`、短 SHA，而不是完整 GitHub URL。
+
+- Given 某个 release body 无价值但 compare digest 提取到了明确变更
+  When 日报正文渲染该 release
+  Then 该 release 仍只保留主行，但会输出 compare-derived 的中文子 bullet，而不会生成伪摘要。
+
+- Given 某个 release 的 body 与 compare digest 都无价值
+  When 日报正文渲染该 release
+  Then 该 release 仅保留主行与外链，不渲染任何子 bullet；润色后也保持零子 bullet。
 
 - Given LLM 返回的润色结果是整篇 ` ```markdown ` fenced 文本
   When brief 内容落库
@@ -207,6 +218,7 @@ None
 - 2026-04-16: 创建规格，冻结“移除概览/窗口、补社交摘要、支持历史内容刷新”的实现口径。
 - 2026-04-19: 收紧 brief canonical Markdown 契约，新增结构校验 / deterministic fallback，并把 V2 正文层级漂移纳入历史刷新。
 - 2026-04-22: 同步 brief release 主链接 current truth；新生成内容默认输出 `/<owner>/<repo>/releases/tag/<tag>?from=briefs`，legacy query 链接继续兼容。
+- 2026-07-19: 日报 release 要点改为复用 `release_smart` 的 valuable / compare fallback 事实链路；低信息 release 不再生成伪摘要，历史 brief refresh 继续原位修复。
 
 ## 参考（References）
 

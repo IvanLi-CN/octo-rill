@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{
-    admin_runtime,
+    admin_runtime, api,
     briefs::{self, DailyWindow as UserDailyWindow},
     config::AiConfig,
     jobs, local_id, observability,
@@ -1119,6 +1119,16 @@ struct BuiltBriefContent {
     releases: Vec<ReleaseDigest>,
 }
 
+const BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET: &str =
+    "暂未生成变更摘要，请打开 Release 详情查看原文与润色。";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BriefReleaseSummaryState {
+    Ready(Vec<String>),
+    NoValue,
+    Unavailable,
+}
+
 #[derive(Debug, Clone)]
 pub struct StoredBrief {
     pub id: String,
@@ -1207,11 +1217,13 @@ struct ChatCompletionOutput {
     usage: LlmTokenUsage,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct ProjectSummaryPayload {
     items: Vec<ProjectSummaryItem>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct ProjectSummaryItem {
     release_id: i64,
@@ -1246,6 +1258,12 @@ fn llm_token_usage_from_chat_usage(usage: Option<ChatCompletionsUsage>) -> LlmTo
             cached_input_tokens: None,
             total_tokens: None,
         })
+}
+
+fn first_markdown_link_text(markdown: &str) -> Option<&str> {
+    let rest = markdown.strip_prefix('[')?;
+    let text_end = rest.find("](")?;
+    Some(&rest[..text_end])
 }
 
 fn build_llm_messages_json(messages: &[ChatMessage<'_>]) -> Option<String> {
@@ -2828,10 +2846,6 @@ async fn recover_runtime_state_with_mode(
     Ok(())
 }
 
-fn non_empty_lines(md: &str) -> impl Iterator<Item = &str> {
-    md.lines().map(str::trim).filter(|line| !line.is_empty())
-}
-
 fn extract_json_object_span(raw: &str) -> Option<&str> {
     let start = raw.find('{')?;
     let end = raw.rfind('}')?;
@@ -3259,16 +3273,172 @@ fn brief_content_is_canonical(markdown: &str) -> bool {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BriefReleaseBlock {
+    repo_full_name: String,
+    release_title: String,
+    detail_lines: Vec<String>,
+}
+
+fn extract_brief_release_blocks(markdown: &str) -> Option<Vec<BriefReleaseBlock>> {
+    let stripped = strip_outer_markdown_fence(markdown);
+    let normalized = stripped.replace("\r\n", "\n");
+    let lines = normalized.lines().collect::<Vec<_>>();
+    let project_idx = lines.iter().position(|line| line.trim() == "## 项目更新")?;
+    let social_idx = lines
+        .iter()
+        .position(|line| line.trim() == "## 获星与关注")
+        .unwrap_or(lines.len());
+    let project_lines = trim_trailing_blank_lines(&lines[project_idx + 1..social_idx]);
+    if project_lines.len() < 2 || !project_lines[0].trim().is_empty() {
+        return None;
+    }
+    if project_lines[1] == "- 本时间窗口内没有新的 Release。" {
+        return Some(Vec::new());
+    }
+
+    let mut blocks = Vec::new();
+    let mut i = 1usize;
+    while i < project_lines.len() {
+        let repo_line = project_lines[i];
+        if !is_canonical_repo_heading_line(repo_line) {
+            return None;
+        }
+        let repo_full_name = first_markdown_link_text(repo_line.trim_start_matches("### "))?
+            .trim()
+            .to_owned();
+        i += 1;
+        if i >= project_lines.len() || !project_lines[i].trim().is_empty() {
+            return None;
+        }
+        i += 1;
+
+        loop {
+            if i >= project_lines.len() || !is_canonical_release_line(project_lines[i]) {
+                return None;
+            }
+            let release_title =
+                first_markdown_link_text(project_lines[i].trim_start_matches("- "))?
+                    .trim()
+                    .to_owned();
+            i += 1;
+
+            let mut detail_lines = Vec::new();
+            while i < project_lines.len() && is_canonical_release_detail_line(project_lines[i]) {
+                detail_lines.push(
+                    project_lines[i]
+                        .trim_start_matches("  - ")
+                        .trim()
+                        .to_owned(),
+                );
+                i += 1;
+            }
+            blocks.push(BriefReleaseBlock {
+                repo_full_name: repo_full_name.clone(),
+                release_title,
+                detail_lines,
+            });
+
+            if i >= project_lines.len() {
+                break;
+            }
+            if !project_lines[i].trim().is_empty() {
+                return None;
+            }
+            i += 1;
+            if i >= project_lines.len() {
+                return None;
+            }
+            if is_canonical_release_line(project_lines[i]) {
+                continue;
+            }
+            if is_canonical_repo_heading_line(project_lines[i]) {
+                break;
+            }
+            return None;
+        }
+    }
+
+    Some(blocks)
+}
+
+fn brief_has_trivial_release_publish_summaries(markdown: &str) -> bool {
+    extract_brief_release_blocks(markdown).is_some_and(|blocks| {
+        blocks.into_iter().any(|block| {
+            let repo_short_name = block
+                .repo_full_name
+                .rsplit('/')
+                .next()
+                .unwrap_or(block.repo_full_name.as_str())
+                .trim()
+                .to_ascii_lowercase();
+            let release_title = block.release_title.trim().to_ascii_lowercase();
+            block
+                .detail_lines
+                .into_iter()
+                .filter(|line| !line.starts_with("相关链接："))
+                .any(|line| {
+                    let normalized = line.trim().to_ascii_lowercase();
+                    matches!(
+                        normalized.as_str(),
+                        "版本发布" | "更新要点" | "发布说明" | "版本更新"
+                    ) || normalized == format!("发布 {release_title}")
+                        || normalized == format!("发布 {repo_short_name} {release_title}")
+                })
+        })
+    })
+}
+
 fn preserves_release_link_sequence(source: &str, candidate: &str) -> bool {
     extract_internal_release_ref_sequence(source)
         == extract_internal_release_ref_sequence(candidate)
+}
+
+fn release_block_has_summary_details(block: &BriefReleaseBlock) -> bool {
+    block
+        .detail_lines
+        .iter()
+        .any(|line| !line.starts_with("相关链接："))
+}
+
+fn release_block_has_related_links(block: &BriefReleaseBlock) -> bool {
+    block
+        .detail_lines
+        .iter()
+        .any(|line| line.starts_with("相关链接："))
+}
+
+fn preserves_release_detail_presence(source: &str, candidate: &str) -> bool {
+    let Some(source_blocks) = extract_brief_release_blocks(source) else {
+        return false;
+    };
+    let Some(candidate_blocks) = extract_brief_release_blocks(candidate) else {
+        return false;
+    };
+    if source_blocks.len() != candidate_blocks.len() {
+        return false;
+    }
+
+    source_blocks
+        .iter()
+        .zip(candidate_blocks.iter())
+        .all(|(source_block, candidate_block)| {
+            source_block.repo_full_name == candidate_block.repo_full_name
+                && source_block.release_title == candidate_block.release_title
+                && release_block_has_summary_details(source_block)
+                    == release_block_has_summary_details(candidate_block)
+                && release_block_has_related_links(source_block)
+                    == release_block_has_related_links(candidate_block)
+        })
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn brief_content_needs_refresh(markdown: &str) -> bool {
     let trimmed = markdown.trim();
     let stripped = strip_outer_markdown_fence(markdown);
-    stripped != trimmed || !brief_content_is_canonical(stripped)
+    stripped != trimmed
+        || !brief_content_is_canonical(stripped)
+        || brief_has_trivial_release_publish_summaries(stripped)
 }
 
 fn strip_markdown_links_to_text(input: &str) -> String {
@@ -3404,11 +3574,8 @@ fn extract_github_links(body: &str, max_links: usize) -> Vec<String> {
 }
 
 fn extract_fallback_bullets(body: &str, _max_bullets: usize) -> Vec<String> {
-    if non_empty_lines(body).any(|line| !line.starts_with('#')) {
-        return vec!["本次发布提供了变更说明，请打开 Release 详情查看原文与翻译。".to_owned()];
-    }
-
-    vec!["本次发布未提供可提取的变更说明。".to_owned()]
+    let _ = body;
+    vec![BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET.to_owned()]
 }
 
 fn to_release_digest(rows: Vec<ReleaseRow>) -> Vec<ReleaseDigest> {
@@ -3614,6 +3781,7 @@ async fn load_social_activity_digests_for_window(
     Ok(to_social_activity_digests(rows))
 }
 
+#[allow(dead_code)]
 fn build_project_prompt(full_name: &str, releases: &[ReleaseDigest]) -> String {
     let mut body = String::new();
     body.push_str("你会收到同一仓库在一个时间窗口内的多个 GitHub Release。请为每个 release 提取 1-4 条变更要点。\n");
@@ -3643,6 +3811,7 @@ fn build_project_prompt(full_name: &str, releases: &[ReleaseDigest]) -> String {
     body
 }
 
+#[allow(dead_code)]
 fn build_projects_batch_prompt(projects: &[(String, Vec<ReleaseDigest>)]) -> String {
     let mut body = String::new();
     body.push_str("你会收到多个仓库在一个时间窗口内的 GitHub Release。请为每个 release 提取 1-4 条变更要点。\n");
@@ -3675,6 +3844,7 @@ fn build_projects_batch_prompt(projects: &[(String, Vec<ReleaseDigest>)]) -> Str
     body
 }
 
+#[allow(dead_code)]
 async fn summarize_project_with_ai(
     state: &AppState,
     full_name: &str,
@@ -3714,6 +3884,7 @@ async fn summarize_project_with_ai(
     Ok(out)
 }
 
+#[allow(dead_code)]
 async fn summarize_projects_with_ai(
     state: &AppState,
     projects: &[(String, Vec<ReleaseDigest>)],
@@ -3837,16 +4008,87 @@ async fn summarize_projects_with_ai(
     merged
 }
 
+fn parse_brief_smart_summary_bullets(summary: &str) -> Vec<String> {
+    summary
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("- ")
+                .or_else(|| line.trim().strip_prefix("* "))
+        })
+        .map(|line| sanitize_bullet_text(line.trim()))
+        .filter(|line| !line.is_empty())
+        .take(4)
+        .collect()
+}
+
+async fn load_brief_release_summary_states(
+    state: &AppState,
+    user_id: &str,
+    releases: &[ReleaseDigest],
+) -> Result<HashMap<i64, BriefReleaseSummaryState>> {
+    if releases.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    if state.config.ai.is_none() {
+        return Ok(releases
+            .iter()
+            .map(|release| (release.release_id, BriefReleaseSummaryState::Unavailable))
+            .collect());
+    }
+
+    let release_ids = releases
+        .iter()
+        .map(|release| release.release_id)
+        .collect::<Vec<_>>();
+    let items = api::summarize_releases_smart_batch_internal(state, user_id, &release_ids)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let mut summary_states = HashMap::new();
+
+    for item in items {
+        let Ok(release_id) = item.id.parse::<i64>() else {
+            continue;
+        };
+        let state = match item.status.as_str() {
+            "ready" => {
+                let bullets = item
+                    .summary
+                    .as_deref()
+                    .map(parse_brief_smart_summary_bullets)
+                    .unwrap_or_default();
+                if bullets.is_empty() {
+                    BriefReleaseSummaryState::Unavailable
+                } else {
+                    BriefReleaseSummaryState::Ready(bullets)
+                }
+            }
+            "missing" => BriefReleaseSummaryState::NoValue,
+            "disabled" | "error" => BriefReleaseSummaryState::Unavailable,
+            _ => BriefReleaseSummaryState::Unavailable,
+        };
+        summary_states.insert(release_id, state);
+    }
+
+    Ok(summary_states)
+}
+
 fn build_repo_rendered(
     full_name: &str,
     releases: &[ReleaseDigest],
-    ai_bullets: Option<&HashMap<i64, Vec<String>>>,
+    summary_states: &HashMap<i64, BriefReleaseSummaryState>,
 ) -> RepoRendered {
     let rendered = releases
         .iter()
         .map(|release| {
-            let ai = ai_bullets.and_then(|m| m.get(&release.release_id)).cloned();
-            let bullets = ai.unwrap_or_else(|| extract_fallback_bullets(&release.body, 3));
+            let bullets = match summary_states.get(&release.release_id) {
+                Some(BriefReleaseSummaryState::Ready(bullets)) => bullets.clone(),
+                Some(BriefReleaseSummaryState::NoValue) => Vec::new(),
+                Some(BriefReleaseSummaryState::Unavailable) | None => {
+                    extract_fallback_bullets(&release.body, 1)
+                }
+            };
             let related_links = extract_github_links(&release.body, 3);
             ReleaseRendered {
                 release_id: release.release_id,
@@ -4286,7 +4528,7 @@ async fn polish_brief_markdown(
         }
     };
     let prompt = format!(
-        "请在不删减任何 release 条目与社交摘要的前提下，对下面日报做一次统一润色。\n\n硬性要求：\n1) 保留所有链接原样（尤其 /owner/repo/releases/tag/<tag>?from=briefs）；\n{social_structure_rule}\n3) 默认使用简体中文优化可读性；技术术语、代码标识符、commit type、包名、API 名、项目名、版本号和原始标题可以保留英文；\n4) 不要输出 markdown code block，也不要把整篇内容包进 ```markdown ```；\n5) 不新增编造事实；\n6) release 与 repo 的顺序必须保持不变；\n7) 必须严格保持 Markdown 层级：仓库标题保持 `### [repo](...)`；每条 release 保持顶层 `- [title](/owner/repo/releases/tag/<tag>?from=briefs)`；release 下的摘要与“相关链接”必须保持缩进两个空格的子 bullet `  - ...`；\n8) 不得把 release 下的子 bullet 改写成普通段落、硬换行文本或空行分隔；\n9) 除章节、仓库标题、release block 之间已有的单个空行外，不得新增额外空行；\n10) 你只能改写既有 bullet 的措辞、去重或压缩重复表达，不能改结构。\n\n日报原文：\n{markdown}",
+        "请在不删减任何 release 条目与社交摘要的前提下，对下面日报做一次统一润色。\n\n硬性要求：\n1) 保留所有链接原样（尤其 /owner/repo/releases/tag/<tag>?from=briefs）；\n{social_structure_rule}\n3) 默认使用简体中文优化可读性；技术术语、代码标识符、commit type、包名、API 名、项目名、版本号和原始标题可以保留英文；\n4) 不要输出 markdown code block，也不要把整篇内容包进 ```markdown ```；\n5) 不新增编造事实；\n6) release 与 repo 的顺序必须保持不变；\n7) 必须严格保持 Markdown 层级：仓库标题保持 `### [repo](...)`；每条 release 保持顶层 `- [title](/owner/repo/releases/tag/<tag>?from=briefs)`；release 下若原本有摘要与“相关链接”，必须继续保持缩进两个空格的子 bullet `  - ...`；\n8) 若某条 release 原文没有任何子 bullet，润色后也必须保持没有子 bullet；禁止补写“发布 xxx”“版本发布”“更新要点”之类空泛内容；\n9) 不得把 release 下的子 bullet 改写成普通段落、硬换行文本或空行分隔；\n10) 除章节、仓库标题、release block 之间已有的单个空行外，不得新增额外空行；\n11) 你只能改写既有 bullet 的措辞、去重或压缩重复表达，不能改结构。\n\n日报原文：\n{markdown}",
     );
 
     let polished = chat_completion(
@@ -4310,6 +4552,9 @@ async fn polish_brief_markdown(
     if !preserves_release_link_sequence(markdown, &sanitized) {
         return None;
     }
+    if !preserves_release_detail_presence(markdown, &sanitized) {
+        return None;
+    }
     if !preserves_social_summary_items(markdown, &sanitized) {
         return None;
     }
@@ -4319,21 +4564,21 @@ async fn polish_brief_markdown(
 
 async fn build_brief_content_from_digests(
     state: &AppState,
+    user_id: &str,
     releases: Vec<ReleaseDigest>,
     social: Vec<SocialActivityDigest>,
 ) -> Result<BuiltBriefContent> {
     let grouped = group_by_repo(&releases)
         .into_iter()
         .collect::<Vec<(String, Vec<ReleaseDigest>)>>();
-
-    let ai_bullets = summarize_projects_with_ai(state, &grouped).await;
+    let summary_states = load_brief_release_summary_states(state, user_id, &releases).await?;
 
     let mut repos = Vec::with_capacity(grouped.len());
     for (full_name, project_releases) in grouped {
         repos.push(build_repo_rendered(
             &full_name,
             &project_releases,
-            Some(&ai_bullets),
+            &summary_states,
         ));
     }
     repos.sort_by(|left, right| {
@@ -4415,7 +4660,7 @@ async fn build_brief_content(
 
     let social =
         load_social_activity_digests_for_window(state, user_id, &start_utc, &end_utc).await?;
-    build_brief_content_from_digests(state, to_release_digest(rows), social).await
+    build_brief_content_from_digests(state, user_id, to_release_digest(rows), social).await
 }
 
 #[allow(dead_code)]
@@ -5269,7 +5514,7 @@ async fn refresh_existing_brief_snapshot(
     .await?;
     let social =
         load_social_activity_digests_for_window(state, &row.user_id, &start_utc, &end_utc).await?;
-    let built = build_brief_content_from_digests(state, releases, social).await?;
+    let built = build_brief_content_from_digests(state, &row.user_id, releases, social).await?;
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = state
         .pool
@@ -5760,7 +6005,7 @@ pub async fn recompute_legacy_brief_snapshot(
     let social =
         load_social_activity_digests_for_window(state, &legacy.user_id, &window_start, &window_end)
             .await?;
-    let built = build_brief_content_from_digests(state, releases, social).await?;
+    let built = build_brief_content_from_digests(state, &legacy.user_id, releases, social).await?;
 
     let mut tx = state
         .pool
@@ -5993,6 +6238,176 @@ mod tests {
             .await
             .expect("run migrations");
         setup_llm_state_with_pool(pool, None).await
+    }
+
+    fn brief_test_user_id() -> &'static str {
+        "user-brief-tests"
+    }
+
+    async fn seed_brief_test_user(state: &AppState, user_id: &str, now: &str) {
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_utc_time, daily_brief_local_time, daily_brief_time_zone,
+              created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(user_id)
+        .bind(9001_i64)
+        .bind("brief-tests")
+        .bind("08:00")
+        .bind("08:00")
+        .bind("Asia/Shanghai")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert brief test user");
+    }
+
+    async fn seed_brief_visible_repo(
+        state: &AppState,
+        user_id: &str,
+        repo_id: i64,
+        full_name: &str,
+        now: &str,
+    ) {
+        let (owner_login, repo_name) = full_name
+            .split_once('/')
+            .expect("repo full name should contain owner/name");
+        sqlx::query(
+            r#"
+            INSERT INTO starred_repos (
+              id, user_id, repo_id, full_name, owner_login, name,
+              description, html_url, stargazed_at, is_private, updated_at,
+              owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(format!("starred-{repo_id}"))
+        .bind(user_id)
+        .bind(repo_id)
+        .bind(full_name)
+        .bind(owner_login)
+        .bind(repo_name)
+        .bind(Option::<String>::None)
+        .bind(format!("https://github.com/{full_name}"))
+        .bind(now)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .execute(&state.pool)
+        .await
+        .expect("insert brief visible repo");
+    }
+
+    async fn seed_repo_release_row(
+        state: &AppState,
+        repo_id: i64,
+        release: &ReleaseDigest,
+        now: &str,
+    ) {
+        let tag_name = release
+            .html_url
+            .rsplit('/')
+            .next()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(release.title.as_str())
+            .to_owned();
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(format!("repo-release-{}", release.release_id))
+        .bind(repo_id)
+        .bind(release.release_id)
+        .bind(format!("node-{}", release.release_id))
+        .bind(tag_name)
+        .bind(&release.title)
+        .bind(&release.body)
+        .bind(&release.html_url)
+        .bind(&release.published_at)
+        .bind(&release.published_at)
+        .bind(i64::from(release.is_prerelease))
+        .bind(0_i64)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert repo release");
+    }
+
+    async fn seed_brief_release_scope(
+        state: &AppState,
+        user_id: &str,
+        repo_id: i64,
+        full_name: &str,
+        releases: &[ReleaseDigest],
+        now: &str,
+    ) {
+        seed_brief_test_user(state, user_id, now).await;
+        seed_brief_visible_repo(state, user_id, repo_id, full_name, now).await;
+        for release in releases {
+            seed_repo_release_row(state, repo_id, release, now).await;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_release_smart_cache(
+        state: &AppState,
+        user_id: &str,
+        release: &ReleaseDigest,
+        previous_tag_name: Option<&str>,
+        status: &str,
+        title: Option<&str>,
+        summary: Option<&str>,
+        error_text: Option<&str>,
+        now: &str,
+    ) {
+        let entity_id = release.release_id.to_string();
+        let source_hash = crate::translations::release_smart_feed_source_hash(
+            entity_id.as_str(),
+            release.full_name.as_str(),
+            release.title.as_str(),
+            crate::api::release_feed_body(Some(release.body.as_str())).as_deref(),
+            release
+                .html_url
+                .rsplit('/')
+                .next()
+                .unwrap_or(release.title.as_str()),
+            previous_tag_name,
+        );
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary,
+              error_text, active_work_item_id, created_at, updated_at
+            )
+            VALUES (?, ?, 'release_smart', ?, 'zh-CN', ?, ?, ?, ?, ?, NULL, ?, ?)
+            "#,
+        )
+        .bind(format!("smart-cache-{}", release.release_id))
+        .bind(user_id)
+        .bind(entity_id)
+        .bind(source_hash)
+        .bind(status)
+        .bind(title)
+        .bind(summary)
+        .bind(error_text)
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert release smart cache");
     }
 
     fn test_release_digest(
@@ -7423,9 +7838,57 @@ mod tests {
         assert!(brief_content_needs_refresh(
             "## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.0.0](/?tab=briefs&release=42) · 2026-03-06T12:00:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.0.0)  \n  fix: keep formatting stable  \n  related: paragraph drift\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- 本时间窗口内没有新的关注动态。\n"
         ));
+        assert!(brief_content_needs_refresh(
+            "## 项目更新\n\n### [IvanLi-CN/tuckmark](https://github.com/IvanLi-CN/tuckmark)\n\n- [v0.5.2](/IvanLi-CN/tuckmark/releases/tag/v0.5.2?from=briefs) · 2026-07-18T23:49:57Z · [GitHub Release](https://github.com/IvanLi-CN/tuckmark/releases/tag/v0.5.2)\n  - 发布 Tuckmark v0.5.2\n"
+        ));
         assert!(!brief_content_needs_refresh(
             "## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.0.0](/?tab=briefs&release=42) · 2026-03-06T12:00:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.0.0)\n  - fix: keep formatting stable\n  - 相关链接：[4d8f459](https://github.com/acme/rocket/commit/4d8f459)\n"
         ));
+    }
+
+    #[tokio::test]
+    async fn load_brief_content_refresh_candidates_includes_fake_release_publish_summary() {
+        let state = setup_llm_state().await;
+        let user_id = brief_test_user_id();
+        let now = "2026-07-19T00:10:00Z";
+        seed_brief_test_user(state.as_ref(), user_id, now).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-fake-release-summary")
+        .bind(user_id)
+        .bind("2026-07-18")
+        .bind("2026-07-17T16:00:00Z")
+        .bind("2026-07-18T16:00:00Z")
+        .bind("Asia/Shanghai")
+        .bind("00:00")
+        .bind("manual")
+        .bind(
+            "## 项目更新\n\n### [IvanLi-CN/tuckmark](https://github.com/IvanLi-CN/tuckmark)\n\n- [v0.5.2](/IvanLi-CN/tuckmark/releases/tag/v0.5.2?from=briefs) · 2026-07-18T23:49:57Z · [GitHub Release](https://github.com/IvanLi-CN/tuckmark/releases/tag/v0.5.2)\n  - 发布 Tuckmark v0.5.2\n",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert fake release summary brief");
+
+        let candidates = load_brief_content_refresh_candidates(state.as_ref())
+            .await
+            .expect("load refresh candidates");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, "brief-fake-release-summary");
+        assert_eq!(candidates[0].user_id, user_id);
+        assert_eq!(candidates[0].date, "2026-07-18");
     }
 
     #[test]
@@ -7713,7 +8176,7 @@ mod tests {
 
         assert_eq!(
             bullets,
-            vec!["本次发布提供了变更说明，请打开 Release 详情查看原文与翻译。".to_owned()]
+            vec![BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET.to_owned()]
         );
         assert!(
             !bullets
@@ -7725,9 +8188,11 @@ mod tests {
     #[tokio::test]
     async fn build_brief_content_from_digests_falls_back_to_chinese_guidance_without_ai() {
         let state = setup_llm_state().await;
+        let user_id = brief_test_user_id();
 
         let built = build_brief_content_from_digests(
             state.as_ref(),
+            user_id,
             vec![ReleaseDigest {
                 release_id: 42,
                 full_name: "acme/rocket".to_owned(),
@@ -7746,7 +8211,7 @@ mod tests {
         assert!(
             built
                 .content_markdown
-                .contains("  - 本次发布提供了变更说明，请打开 Release 详情查看原文与翻译。")
+                .contains(BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET)
         );
         assert!(
             !built
@@ -7761,25 +8226,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_brief_content_from_digests_falls_back_to_chinese_guidance_on_ai_parse_failure() {
+    async fn build_brief_content_from_digests_omits_pseudo_summary_for_title_only_release_body() {
+        let release = ReleaseDigest {
+            release_id: 42,
+            full_name: "IvanLi-CN/tuckmark".to_owned(),
+            title: "v0.5.2".to_owned(),
+            body: "Tuckmark release v0.5.2".to_owned(),
+            html_url: "https://github.com/IvanLi-CN/tuckmark/releases/tag/v0.5.2".to_owned(),
+            published_at: "2026-07-18T23:49:57Z".to_owned(),
+            is_prerelease: false,
+        };
         let base_url = spawn_test_ai_server(Router::new().route(
             "/chat/completions",
             post(|Json(payload): Json<Value>| async move {
-                let messages = payload["messages"]
-                    .as_array()
-                    .expect("messages should be present");
-                let prompt = messages[1]["content"]
+                let prompt = payload["messages"][1]["content"]
                     .as_str()
                     .expect("user prompt should be present");
                 if prompt.contains("对下面日报做一次统一润色") {
-                    assert!(prompt.contains("默认使用简体中文优化可读性"));
-                    assert!(
-                        prompt.contains(
-                            "技术术语、代码标识符、commit type、包名、API 名、项目名、版本号和原始标题可以保留英文"
-                        )
-                    );
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": { "content": "## 项目更新\n\n### [IvanLi-CN/tuckmark](https://github.com/IvanLi-CN/tuckmark)\n\n- [v0.5.2](/IvanLi-CN/tuckmark/releases/tag/v0.5.2?from=briefs) · 2026-07-18T23:49:57Z · [GitHub Release](https://github.com/IvanLi-CN/tuckmark/releases/tag/v0.5.2)\n" }
+                            }]
+                        })),
+                    )
+                } else if prompt.contains("Source: release body")
+                    || prompt.contains("Source: compare digest")
+                {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": { "content": "{\"valuable\":false,\"title_zh\":null,\"summary_bullets\":[]}" }
+                            }]
+                        })),
+                    )
                 } else {
-                    assert!(prompt.contains("默认使用简体中文整理要点"));
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": { "content": "{\"items\":[{\"release_id\":42,\"summary_bullets\":[\"发布 Tuckmark v0.5.2\"]}]}" }
+                            }]
+                        })),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let user_id = brief_test_user_id();
+        let now = "2026-07-19T00:00:00Z";
+        seed_brief_release_scope(
+            state.as_ref(),
+            user_id,
+            1,
+            "IvanLi-CN/tuckmark",
+            std::slice::from_ref(&release),
+            now,
+        )
+        .await;
+
+        let built =
+            build_brief_content_from_digests(state.as_ref(), user_id, vec![release], Vec::new())
+                .await
+                .expect("build brief content");
+
+        let blocks =
+            extract_brief_release_blocks(&built.content_markdown).expect("parse brief blocks");
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].detail_lines.is_empty());
+        assert!(!built.content_markdown.contains("发布 Tuckmark v0.5.2"));
+        assert!(
+            !built
+                .content_markdown
+                .contains(BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET)
+        );
+    }
+
+    #[tokio::test]
+    async fn build_brief_content_from_digests_falls_back_to_chinese_guidance_on_ai_parse_failure() {
+        let release = ReleaseDigest {
+            release_id: 42,
+            full_name: "acme/rocket".to_owned(),
+            title: "v1.0.0".to_owned(),
+            body: "- feat(api): add batch endpoint".to_owned(),
+            html_url: "https://github.com/acme/rocket/releases/tag/v1.0.0".to_owned(),
+            published_at: "2026-03-06T12:00:00Z".to_owned(),
+            is_prerelease: false,
+        };
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(|Json(payload): Json<Value>| async move {
+                let prompt = payload["messages"][1]["content"]
+                    .as_str()
+                    .expect("user prompt should be present");
+                if prompt.contains("Source: release body") {
+                    assert!(prompt.contains("valuable=true"));
+                } else {
+                    assert!(prompt.contains("对下面日报做一次统一润色"));
                 }
 
                 (
@@ -7794,28 +8340,28 @@ mod tests {
         ))
         .await;
         let state = setup_llm_state_with_ai(Some(base_url)).await;
-
-        let built = build_brief_content_from_digests(
+        let user_id = brief_test_user_id();
+        let now = "2026-03-07T00:00:00Z";
+        seed_brief_release_scope(
             state.as_ref(),
-            vec![ReleaseDigest {
-                release_id: 42,
-                full_name: "acme/rocket".to_owned(),
-                title: "v1.0.0".to_owned(),
-                body: "- feat(api): add batch endpoint".to_owned(),
-                html_url: "https://github.com/acme/rocket/releases/tag/v1.0.0".to_owned(),
-                published_at: "2026-03-06T12:00:00Z".to_owned(),
-                is_prerelease: false,
-            }],
-            Vec::new(),
+            user_id,
+            1,
+            "acme/rocket",
+            std::slice::from_ref(&release),
+            now,
         )
-        .await
-        .expect("build brief content");
+        .await;
+
+        let built =
+            build_brief_content_from_digests(state.as_ref(), user_id, vec![release], Vec::new())
+                .await
+                .expect("build brief content");
 
         assert!(brief_content_is_canonical(&built.content_markdown));
         assert!(
             built
                 .content_markdown
-                .contains("  - 本次发布提供了变更说明，请打开 Release 详情查看原文与翻译。")
+                .contains(BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET)
         );
         assert!(
             !built
@@ -7825,7 +8371,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_brief_content_from_digests_uses_cached_release_smart_summary() {
+        let current = ReleaseDigest {
+            release_id: 42,
+            full_name: "acme/rocket".to_owned(),
+            title: "v1.0.1".to_owned(),
+            body: "Tuckmark release v1.0.1".to_owned(),
+            html_url: "https://github.com/acme/rocket/releases/tag/v1.0.1".to_owned(),
+            published_at: "2026-03-06T12:00:00Z".to_owned(),
+            is_prerelease: false,
+        };
+        let previous = ReleaseDigest {
+            release_id: 41,
+            full_name: "acme/rocket".to_owned(),
+            title: "v1.0.0".to_owned(),
+            body: "previous".to_owned(),
+            html_url: "https://github.com/acme/rocket/releases/tag/v1.0.0".to_owned(),
+            published_at: "2026-03-05T12:00:00Z".to_owned(),
+            is_prerelease: false,
+        };
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(|_: Json<Value>| async move {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "choices": [{
+                            "message": { "content": "should not be called" }
+                        }]
+                    })),
+                )
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let user_id = brief_test_user_id();
+        let now = "2026-03-07T00:00:00Z";
+        seed_brief_release_scope(
+            state.as_ref(),
+            user_id,
+            1,
+            "acme/rocket",
+            &[previous.clone(), current.clone()],
+            now,
+        )
+        .await;
+        seed_release_smart_cache(
+            state.as_ref(),
+            user_id,
+            &current,
+            Some("v1.0.0"),
+            "ready",
+            Some("v1.0.1 修复批量接口"),
+            Some("- 修复批量接口返回值与错误提示不一致的问题"),
+            None,
+            now,
+        )
+        .await;
+
+        let built =
+            build_brief_content_from_digests(state.as_ref(), user_id, vec![current], Vec::new())
+                .await
+                .expect("build brief content");
+
+        assert!(
+            built
+                .content_markdown
+                .contains("  - 修复批量接口返回值与错误提示不一致的问题")
+        );
+        assert!(
+            !built
+                .content_markdown
+                .contains(BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET)
+        );
+    }
+
+    #[tokio::test]
     async fn build_brief_content_from_digests_falls_back_when_polish_breaks_canonical_structure() {
+        let release = ReleaseDigest {
+            release_id: 42,
+            full_name: "acme/rocket".to_owned(),
+            title: "v1.0.0".to_owned(),
+            body: "fix: keep formatting stable".to_owned(),
+            html_url: "https://github.com/acme/rocket/releases/tag/v1.0.0".to_owned(),
+            published_at: "2026-03-06T12:00:00Z".to_owned(),
+            is_prerelease: false,
+        };
         let base_url = spawn_test_ai_server(Router::new().route(
             "/chat/completions",
             post(|Json(payload): Json<Value>| async move {
@@ -7837,13 +8468,7 @@ mod tests {
                     "## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.0.0](/?tab=briefs&release=42) · 2026-03-06T12:00:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.0.0)  \n  fix: keep formatting stable  \n  paragraph drift\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- [@alice](https://github.com/alice)"
                         .to_owned()
                 } else {
-                    serde_json::json!({
-                        "items": [{
-                            "release_id": 42,
-                            "summary_bullets": ["fix: keep formatting stable"]
-                        }]
-                    })
-                    .to_string()
+                    "{\"valuable\":false,\"title_zh\":null,\"summary_bullets\":[]}".to_owned()
                 };
 
                 (
@@ -7858,18 +8483,34 @@ mod tests {
         ))
         .await;
         let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let user_id = brief_test_user_id();
+        let now = "2026-03-07T00:00:00Z";
+        seed_brief_release_scope(
+            state.as_ref(),
+            user_id,
+            1,
+            "acme/rocket",
+            std::slice::from_ref(&release),
+            now,
+        )
+        .await;
+        seed_release_smart_cache(
+            state.as_ref(),
+            user_id,
+            &release,
+            None,
+            "ready",
+            Some("v1.0.0 修复格式问题"),
+            Some("- fix: keep formatting stable"),
+            None,
+            now,
+        )
+        .await;
 
         let built = build_brief_content_from_digests(
             state.as_ref(),
-            vec![ReleaseDigest {
-                release_id: 42,
-                full_name: "acme/rocket".to_owned(),
-                title: "v1.0.0".to_owned(),
-                body: "fix: keep formatting stable".to_owned(),
-                html_url: "https://github.com/acme/rocket/releases/tag/v1.0.0".to_owned(),
-                published_at: "2026-03-06T12:00:00Z".to_owned(),
-                is_prerelease: false,
-            }],
+            user_id,
+            vec![release],
             vec![SocialActivityDigest {
                 kind: "follower_received".to_owned(),
                 repo_full_name: None,
@@ -7903,6 +8544,128 @@ mod tests {
                     .expect("canonical internal release ref")
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn build_brief_content_from_digests_rejects_polish_adding_pseudo_summary_to_empty_release()
+     {
+        let release = ReleaseDigest {
+            release_id: 42,
+            full_name: "IvanLi-CN/tuckmark".to_owned(),
+            title: "v0.5.2".to_owned(),
+            body: "Tuckmark release v0.5.2".to_owned(),
+            html_url: "https://github.com/IvanLi-CN/tuckmark/releases/tag/v0.5.2".to_owned(),
+            published_at: "2026-07-18T23:49:57Z".to_owned(),
+            is_prerelease: false,
+        };
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(|Json(payload): Json<Value>| async move {
+                let prompt = payload["messages"][1]["content"]
+                    .as_str()
+                    .expect("user prompt should be present");
+                let content = if prompt.contains("对下面日报做一次统一润色") {
+                    "## 项目更新\n\n### [IvanLi-CN/tuckmark](https://github.com/IvanLi-CN/tuckmark)\n\n- [v0.5.2](/IvanLi-CN/tuckmark/releases/tag/v0.5.2?from=briefs) · 2026-07-18T23:49:57Z · [GitHub Release](https://github.com/IvanLi-CN/tuckmark/releases/tag/v0.5.2)\n  - 发布 Tuckmark v0.5.2\n"
+                        .to_owned()
+                } else {
+                    "{\"valuable\":false,\"title_zh\":null,\"summary_bullets\":[]}".to_owned()
+                };
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "choices": [{
+                            "message": { "content": content }
+                        }]
+                    })),
+                )
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let user_id = brief_test_user_id();
+        let now = "2026-07-19T00:00:00Z";
+        seed_brief_release_scope(
+            state.as_ref(),
+            user_id,
+            1,
+            "IvanLi-CN/tuckmark",
+            std::slice::from_ref(&release),
+            now,
+        )
+        .await;
+
+        let built =
+            build_brief_content_from_digests(state.as_ref(), user_id, vec![release], Vec::new())
+                .await
+                .expect("build brief content");
+
+        let blocks =
+            extract_brief_release_blocks(&built.content_markdown).expect("parse brief blocks");
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].detail_lines.is_empty());
+        assert!(!built.content_markdown.contains("发布 Tuckmark v0.5.2"));
+    }
+
+    #[tokio::test]
+    async fn build_brief_content_from_digests_rejects_polish_adding_pseudo_summary_to_link_only_release()
+     {
+        let release = ReleaseDigest {
+            release_id: 42,
+            full_name: "IvanLi-CN/tuckmark".to_owned(),
+            title: "v0.5.2".to_owned(),
+            body: "Tuckmark release v0.5.2\nhttps://github.com/IvanLi-CN/tuckmark/compare/v0.5.1...v0.5.2".to_owned(),
+            html_url: "https://github.com/IvanLi-CN/tuckmark/releases/tag/v0.5.2".to_owned(),
+            published_at: "2026-07-18T23:49:57Z".to_owned(),
+            is_prerelease: false,
+        };
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(|Json(payload): Json<Value>| async move {
+                let prompt = payload["messages"][1]["content"]
+                    .as_str()
+                    .expect("user prompt should be present");
+                let content = if prompt.contains("对下面日报做一次统一润色") {
+                    "## 项目更新\n\n### [IvanLi-CN/tuckmark](https://github.com/IvanLi-CN/tuckmark)\n\n- [v0.5.2](/IvanLi-CN/tuckmark/releases/tag/v0.5.2?from=briefs) · 2026-07-18T23:49:57Z · [GitHub Release](https://github.com/IvanLi-CN/tuckmark/releases/tag/v0.5.2)\n  - 发布 Tuckmark v0.5.2\n  - 相关链接：[compare](https://github.com/IvanLi-CN/tuckmark/compare/v0.5.1...v0.5.2)\n"
+                        .to_owned()
+                } else {
+                    "{\"valuable\":false,\"title_zh\":null,\"summary_bullets\":[]}".to_owned()
+                };
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "choices": [{
+                            "message": { "content": content }
+                        }]
+                    })),
+                )
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let user_id = brief_test_user_id();
+        let now = "2026-07-19T00:00:00Z";
+        seed_brief_release_scope(
+            state.as_ref(),
+            user_id,
+            1,
+            "IvanLi-CN/tuckmark",
+            std::slice::from_ref(&release),
+            now,
+        )
+        .await;
+
+        let built =
+            build_brief_content_from_digests(state.as_ref(), user_id, vec![release], Vec::new())
+                .await
+                .expect("build brief content");
+
+        let blocks =
+            extract_brief_release_blocks(&built.content_markdown).expect("parse brief blocks");
+        assert_eq!(blocks.len(), 1);
+        assert!(!release_block_has_summary_details(&blocks[0]));
+        assert!(release_block_has_related_links(&blocks[0]));
+        assert!(!built.content_markdown.contains("发布 Tuckmark v0.5.2"));
+        assert!(built.content_markdown.contains("相关链接："));
     }
 
     #[tokio::test]

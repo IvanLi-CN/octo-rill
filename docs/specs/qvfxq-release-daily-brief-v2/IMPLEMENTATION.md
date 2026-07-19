@@ -5,17 +5,17 @@
 - Lifecycle: active
 - Implementation: 已交付
 - Created: 2026-04-16
-- Last: 2026-05-10
-- Summary: 已交付；fast-track / canonical brief markdown validator + refresh drift repair landed；日报生成 prompt 与 deterministic fallback 已补齐默认中文倾向
+- Last: 2026-07-19
+- Summary: 已交付；fast-track / canonical brief markdown validator + refresh drift repair landed；日报生成已复用 release_smart 的 valuable/compare 事实链路，低信息 release 不再补伪摘要
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
 ## 文档更新（Docs to Update）
 
 - `docs/product.md`: 日报内容结构改为 `项目更新 + 获星与关注`
-- `docs/product.md`: 日报 release 要点默认中文倾向与 AI 失败兜底口径
+- `docs/product.md`: 日报 release 要点默认中文倾向、release_smart 复用与 AI 失败兜底口径
 - `docs/specs/README.md`: 登记本 spec，收口后写入 PR 号与状态
-- `docs/specs/qvfxq-release-daily-brief-v2/SPEC.md`: 同步实现状态、视觉证据与验证结果
+- `docs/specs/qvfxq-release-daily-brief-v2/SPEC.md`: 同步实现状态、视觉证据、release_smart 复用语义与验证结果
 
 ## 计划资产（Plan assets）
 
@@ -34,6 +34,7 @@ None
 - [x] M3: 内容刷新任务、admin diagnostics 与相关回归测试落地。
 - [x] M4: Storybook、文档、视觉证据与快车道收口完成。
 - [x] M5: 日报 summary / polish prompt 补齐默认简体中文契约；AI 不可用或 parse failed 时使用中文提示式 fallback，避免直接复用原始 release notes bullet。
+- [x] M6: 日报 release 要点复用 `release_smart` 的 valuable / compare fallback 语义，低信息 release 不再补伪摘要。
 
 ## 验证结果
 
@@ -46,3 +47,7 @@ None
 - `cd web && bun run build`
 - `cd web && bun run storybook:build`
 - `cd web && bun run e2e -- e2e/release-detail.spec.ts` → `21 passed`
+
+## 变更记录
+
+- 2026-07-19: 日报 release 要点改为复用 `release_smart`，低信息 release 不再生成伪摘要，历史 brief refresh 继续原位修复。
