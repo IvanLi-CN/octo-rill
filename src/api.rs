@@ -18409,7 +18409,7 @@ fn build_release_smart_batch_item(
     }
 }
 
-async fn summarize_releases_smart_batch_internal(
+pub(crate) async fn summarize_releases_smart_batch_internal(
     state: &AppState,
     user_id: &str,
     release_ids: &[i64],
