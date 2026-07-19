@@ -6496,7 +6496,7 @@ mod tests {
         assert_eq!(row.1, "content_refresh");
         assert!(
             row.2
-                .contains("  - 本次发布提供了变更说明，请打开 Release 详情查看原文与翻译。")
+                .contains("  - 暂未生成变更摘要，请打开 Release 详情查看原文与润色。")
         );
         assert!(!row.2.contains("  - fix: keep nested bullets stable"));
         assert!(!row.2.contains("stable  \n"));
