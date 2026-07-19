@@ -3,74 +3,109 @@
   <img src="./brand/exports/wordmark-dark.svg#gh-dark-mode-only" alt="OctoRill" width="420" />
 </p>
 
+<p align="center">
+  <a href="./README.md">English</a> · <a href="./README.zh-CN.md">简体中文</a>
+</p>
+
 # OctoRill
 
-OctoRill 把与“我”相关的 GitHub 动态整理成一个更适合持续阅读的工作区：集中查看发布更新、获星与关注动态、日报，以及 Inbox 入口；发布内容支持中文翻译与要点整理。
+<p align="center">
+  <a href="https://github.com/IvanLi-CN/octo-rill/releases"><img src="https://img.shields.io/github/v/release/IvanLi-CN/octo-rill?display_name=tag&label=release&style=flat-square" alt="Latest release" /></a>
+  <a href="https://github.com/IvanLi-CN/octo-rill/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/IvanLi-CN/octo-rill/ci.yml?branch=main&label=ci&style=flat-square" alt="CI status" /></a>
+  <a href="https://ivanli-cn.github.io/octo-rill/"><img src="https://img.shields.io/badge/docs-pages-0f172a?style=flat-square" alt="Public docs" /></a>
+  <a href="https://ivanli-cn.github.io/octo-rill/demo/"><img src="https://img.shields.io/badge/web%20demo-mock--only-0f766e?style=flat-square" alt="Mock-only web demo" /></a>
+  <a href="https://ivanli-cn.github.io/octo-rill/storybook.html"><img src="https://img.shields.io/badge/storybook-static-b45309?style=flat-square" alt="Static Storybook" /></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square" alt="MIT license" /></a>
+</p>
 
-## 先去哪里看
+OctoRill is a personal workspace for GitHub activity. It brings release updates, direct social signals, daily briefs, and an inbox entry point into one interface. It is not a full GitHub client.
 
-- 公共文档站：[`ivanli-cn.github.io/octo-rill`](https://ivanli-cn.github.io/octo-rill/)
-- 本地启动步骤：[`docs-site/docs/quick-start.md`](./docs-site/docs/quick-start.md)
-- 配置参考：[`docs-site/docs/config.md`](./docs-site/docs/config.md)
-- 页面级 Web Demo：[`docs-site/docs/web-demo.md`](./docs-site/docs/web-demo.md)
-- 公开产品说明：[`docs-site/docs/product.md`](./docs-site/docs/product.md)
-- 内部文档入口：[`docs/README.md`](./docs/README.md)
-- 系统概览：[`docs/architecture.md`](./docs/architecture.md)
-- 仓库治理与 GitHub 保护规则：[`docs/repository-governance.md`](./docs/repository-governance.md)
-- 内部产品参考：[`docs/product.md`](./docs/product.md)
-- 前端与 Storybook 贡献说明：[`web/README.md`](./web/README.md)
+<p align="center">
+  <img src="./brand/exports/octo-rill-github-social-preview.png#gh-light-mode-only" alt="OctoRill dashboard preview" width="100%" />
+  <img src="./brand/exports/octo-rill-github-social-preview-dark.png#gh-dark-mode-only" alt="OctoRill dashboard preview" width="100%" />
+</p>
 
-## 仓库结构
+## What it does
 
-- `src/`：Rust 后端，负责 OAuth、同步、翻译、日报、通知与管理员任务接口。
-- `web/`：React + Vite 前端、`/demo/` 页面级 demo，以及 Storybook。
-- `docs-site/`：Rspress 文档站；发布时与 Storybook、Web Demo 组装到同一个 GitHub Pages 站点。
-- `docs/`：内部项目文档入口，包含产品语义、系统概览与 topic-level specs。
-- `docs/specs/`：topic-level 规格、实现状态与历史追踪；用于长期工程记忆，不替代项目入口文档。
-- `migrations/`：SQLite schema 迁移。
-- `brand/`：品牌资源与导出文件。
+- Read releases in `original`, `translated`, or `polished` mode.
+- Show direct social signals: stars on personal repositories and new followers.
+- Build daily briefs using the user's local day boundary.
+- Provide a dashboard, scoped focus pages, admin pages, and a mock-only web demo.
 
-## 本地最短启动路径
+## Repository layout
 
-1. 在仓库根目录安装仓库级工具与 hooks：
+- `src/`: Rust backend for auth, sync, translation, briefs, admin APIs, and static asset serving.
+- `web/`: React + Vite frontend, Storybook, Playwright tests, and the `/demo/` surface.
+- `docs-site/`: Public docs site built with Rspress.
+- `docs/`: Internal project docs, architecture notes, and specs.
+- `migrations/`: SQLite schema migrations.
+- `brand/`: Source brand files and exported assets.
 
-   ```bash
-   bun install
-   ```
+## Quick start
 
-2. 复制环境变量模板并填写最少必需项：
+Requirements:
 
-   ```bash
-   cp .env.example .env.local
-   ```
+- Rust `1.91.0`
+- Bun `1.x`
+- SQLite development libraries
+- A GitHub OAuth app
 
-   至少补齐：`OCTORILL_ENCRYPTION_KEY_BASE64`、`GITHUB_CLIENT_ID`、`GITHUB_CLIENT_SECRET`、`GITHUB_OAUTH_REDIRECT_URL`。如果这次不测试 LinuxDO，记得把 `LINUXDO_CLIENT_ID`、`LINUXDO_CLIENT_SECRET`、`LINUXDO_OAUTH_REDIRECT_URL` 三项都清空；如果要测试 LinuxDO 绑定，则三项必须同时出现。根路径公网部署默认固定使用 `octo_rill_sid`；本地多实例或非根路径部署会自动派生隔离 cookie 名，避免互踢登录。
+Install repository tools:
 
-3. 启动后端：
+```bash
+bun install
+```
 
-   ```bash
-   cargo run
-   ```
+Create local env:
 
-   默认监听 `http://127.0.0.1:58090`。
+```bash
+cp .env.example .env.local
+```
 
-4. 启动前端：
+Required variables:
 
-   ```bash
-   cd web
-   bun install
-   bun run dev
-   ```
+- `OCTORILL_ENCRYPTION_KEY_BASE64`
+- `GITHUB_CLIENT_ID`
+- `GITHUB_CLIENT_SECRET`
+- `GITHUB_OAUTH_REDIRECT_URL`
 
-   打开 `http://127.0.0.1:55174`。首次成功时，你会先看到 GitHub 登录页；已有会话时会直接进入 Dashboard。
+If you are not testing LinuxDO, leave these three variables empty together:
 
-可选本地入口：
+- `LINUXDO_CLIENT_ID`
+- `LINUXDO_CLIENT_SECRET`
+- `LINUXDO_OAUTH_REDIRECT_URL`
 
-- Web Demo build：`cd web && bun run build:demo`
-- Storybook：`cd web && bun run storybook` → `http://127.0.0.1:55176`
-- 文档站：`cd docs-site && bun install && bun run dev` → `http://127.0.0.1:50885`
+If you want to test translation and daily briefs, also set:
 
-## 常用命令
+- `AI_API_KEY`
+- `AI_BASE_URL`
+- `AI_MODEL`
+
+Start the backend:
+
+```bash
+cargo run
+```
+
+The backend listens on `http://127.0.0.1:58090` by default.
+
+Start the frontend:
+
+```bash
+cd web
+bun install
+bun run dev
+```
+
+Open `http://127.0.0.1:55174`.
+
+Optional local entry points:
+
+- Storybook: `cd web && bun run storybook`
+- Web demo build: `cd web && bun run build:demo`
+- Docs site: `cd docs-site && bun install && bun run dev`
+
+## Common commands
 
 ```bash
 cargo fmt --all -- --check
@@ -81,10 +116,16 @@ cargo check --locked --all-targets --all-features
 (cd docs-site && bun run build)
 ```
 
-## 开发流程提醒
+## More docs
 
-- 变更代码时同步更新文档；不要让 README、docs-site 与行为实现分叉。
-- 合到 `main` 的 PR 需要且只能有一个 `type:*` 标签和一个 `channel:*` 标签；文档改动通常使用 `type:docs`。
-- `main` 的 GitHub 保护规则、required checks 与 PR 合并门禁维护在 [`docs/repository-governance.md`](./docs/repository-governance.md) 与 `.github/quality-gates.json`。
-- LinuxDO 绑定、自托管 callback 与 AI 配置的细项统一写在 [`docs-site/docs/config.md`](./docs-site/docs/config.md)，不要再把 README 扩写成部署手册。
-- 如果改动影响页面或 Storybook 文档入口，先验证 docs-site build、Storybook build 与 assembled Pages smoke check。
+- Public docs site: [ivanli-cn.github.io/octo-rill](https://ivanli-cn.github.io/octo-rill/)
+- Quick start: [docs-site/docs/quick-start.md](./docs-site/docs/quick-start.md) `Chinese`
+- Config reference: [docs-site/docs/config.md](./docs-site/docs/config.md) `Chinese`
+- Product notes: [docs-site/docs/product.md](./docs-site/docs/product.md) `Chinese`
+- Internal docs: [docs/README.md](./docs/README.md)
+- Architecture: [docs/architecture.md](./docs/architecture.md)
+- Frontend notes: [web/README.md](./web/README.md)
+
+## License
+
+[MIT](./LICENSE)
