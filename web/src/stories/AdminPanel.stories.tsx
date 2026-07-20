@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useState } from "react";
+import { expect, screen, within } from "storybook/test";
 
 import type { UserManagementStoryState } from "@/admin/UserManagement";
 import type { AdminUserItem } from "@/admin/UserManagement";
@@ -452,6 +453,35 @@ export const EvidenceCompactList: Story = {
 			description: {
 				story:
 					"紧凑双层列表布局证据，覆盖超长 login/name/email、仓库总数、我的发布纳入状态，以及单行截断策略。",
+			},
+		},
+	},
+};
+
+export const EvidenceTimeTooltips: Story = {
+	name: "Evidence / Time Tooltips",
+	play: async ({ canvasElement, userEvent }) => {
+		const canvas = within(canvasElement);
+		const lastActiveTrigger = canvasElement.querySelector(
+			"[data-user-last-active-trigger]",
+		);
+		if (!(lastActiveTrigger instanceof HTMLElement)) {
+			throw new Error("Expected admin users last-active tooltip trigger");
+		}
+		await expect(
+			canvas.getByRole("heading", { name: "用户管理" }),
+		).toBeVisible();
+		await userEvent.hover(lastActiveTrigger);
+		await expect(
+			screen.getByText("最近一次受保护会话活跃时间，按浏览器当前时区显示。"),
+		).toBeVisible();
+		await expect(screen.getByText("2026-02-26 08:00")).toBeVisible();
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"时间列 tooltip 证据：悬浮在“最后活动”字段上时，使用 UI 库 tooltip 解释字段语义与时区口径。",
 			},
 		},
 	},

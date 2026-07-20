@@ -17,3 +17,9 @@
   state: user-management
   evidence_note: verifies admin header navigation consistency on user management page
   image: ![Admin users header and list](./admin-users-header-storybook.png)
+
+- source_type: storybook_canvas
+  story_id_or_title: admin-admin-panel--evidence-compact-list
+  state: admin-users-last-active-tooltip
+  evidence_note: verifies the admin users last-active field shows MM/DD HH:mm in-row and reveals the full local datetime plus field meaning in the shadcn tooltip
+  image: ![Admin users last-active tooltip](./admin-users-last-active-tooltip.png)
