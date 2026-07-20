@@ -54,6 +54,29 @@ async function installFrozenNow(page: Page, isoString: string) {
 	}, fixedTime);
 }
 
+function formatAdminShortDateTime(value: string | null) {
+	if (!value) return "-";
+	const parsed = new Date(value);
+	if (Number.isNaN(parsed.getTime())) return "-";
+	const month = `${parsed.getMonth() + 1}`.padStart(2, "0");
+	const day = `${parsed.getDate()}`.padStart(2, "0");
+	const hour = `${parsed.getHours()}`.padStart(2, "0");
+	const minute = `${parsed.getMinutes()}`.padStart(2, "0");
+	return `${month}/${day} ${hour}:${minute}`;
+}
+
+function formatAdminFullDateTime(value: string | null) {
+	if (!value) return "-";
+	const parsed = new Date(value);
+	if (Number.isNaN(parsed.getTime())) return "-";
+	const year = parsed.getFullYear();
+	const month = `${parsed.getMonth() + 1}`.padStart(2, "0");
+	const day = `${parsed.getDate()}`.padStart(2, "0");
+	const hour = `${parsed.getHours()}`.padStart(2, "0");
+	const minute = `${parsed.getMinutes()}`.padStart(2, "0");
+	return `${year}-${month}-${day} ${hour}:${minute}`;
+}
+
 async function openAdminPanelFromDashboard(page: Page) {
 	await page.getByRole("button", { name: "查看账号信息" }).click();
 	const userCard = page.locator("[data-dashboard-user-card]");
@@ -410,7 +433,33 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 	await expect(page.getByText("唯一管理员，不能撤销")).toBeVisible();
 
 	const standardUserRow = userRow(page, STANDARD_USER_ID);
-	await expect(standardUserRow).toContainText("最后活动：");
+	await expect(standardUserRow).toContainText(
+		formatAdminShortDateTime("2026-02-26T07:00:00Z"),
+	);
+	const lastActiveTooltipTrigger = standardUserRow.locator(
+		"[data-user-last-active-trigger]",
+	);
+	await lastActiveTooltipTrigger.hover();
+	await expect(
+		page.getByRole("tooltip").filter({ hasText: "最近一次受保护会话活跃时间" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("tooltip").filter({
+			hasText: formatAdminFullDateTime("2026-02-26T07:00:00Z"),
+		}),
+	).toBeVisible();
+	const createdAtTooltipTrigger = standardUserRow.locator(
+		"[data-user-created-at-trigger]",
+	);
+	await createdAtTooltipTrigger.focus();
+	await expect(
+		page.getByRole("tooltip").filter({ hasText: "账号创建时间" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("tooltip").filter({
+			hasText: formatAdminFullDateTime("2026-02-25T08:00:00Z"),
+		}),
+	).toBeVisible();
 	await expect(standardUserRow).toContainText("普通用户");
 	await expect(standardUserRow).toContainText("有效关注：7");
 	await expect(standardUserRow).toContainText("我的发布：未纳入");
@@ -420,6 +469,18 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 	await expect(profileSheet.getByText("UID")).toBeVisible();
 	await expect(profileSheet.getByText(STANDARD_USER_ID)).toBeVisible();
 	await expect(profileSheet).toContainText("有效关注仓库数 7");
+	await expect(profileSheet).toContainText(
+		formatAdminShortDateTime("2026-02-26T07:00:00Z"),
+	);
+	await profileSheet.locator("[data-user-profile-last-active-trigger]").focus();
+	await expect(
+		page.getByRole("tooltip").filter({ hasText: "最近一次受保护会话活跃时间" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("tooltip").filter({
+			hasText: formatAdminFullDateTime("2026-02-26T07:00:00Z"),
+		}),
+	).toBeVisible();
 	await expect(profileSheet.getByLabel("IANA 时区")).toHaveValue(
 		"Asia/Shanghai",
 	);

@@ -15,7 +15,7 @@
 - 引入通用异步任务引擎（任务主表 + 事件表 + 运行时 worker）。
 - 落地 24 个 UTC 小时槽定时日报任务（命中槽位后按用户串行生成，失败不中断）。
 - 扩展触发类接口支持 `return_mode=sync|task_id|sse`。
-- 在用户管理中补齐新增字段可视化：`last_active_at` 列表展示、`daily_brief_utc_time` 详情抽屉展示（只读）。
+- 在用户管理中补齐新增字段可视化：`last_active_at` 列表展示与完整值 tooltip、`daily_brief_utc_time` 详情抽屉展示（只读）。
 - 任务详情按 `task_type` 提供专属详情页，并在 Storybook 为各类任务提供独立示例。
 - 翻译任务中心必须额外展示 `clean completed / completed with issues / failed`，并在批次历史与详情中同时展示 raw 状态、`business_outcome` 与 `result_summary`。
 - 定时任务页的共享设置入口需要同时覆盖 `sync.subscriptions` 与 `retry.recent_failures`，并提供失败数据重试任务的独立运行记录与详情。
@@ -111,11 +111,15 @@
 
 - Given 用户管理列表
   When 查看用户行
-  Then 显示 `last_active_at`（浏览器时区 `HH:mm`）。
+  Then 显示 `last_active_at`（浏览器时区 `MM/DD HH:mm`），且悬浮或聚焦字段时通过产品内 tooltip 展示字段语义与完整本地时间 `YYYY-MM-DD HH:mm`。
 
 - Given 用户详情抽屉
   When 打开用户详情
   Then 只展示用户保存的 IANA 时区与浏览器当前识别时区，不在该界面暴露全局自动出报时间；不再把浏览器当前时区当作日报时间真相源。
+
+- Given 用户详情抽屉中的“最后活动（浏览器当前时区）”
+  When 管理员悬浮或聚焦该字段
+  Then 字段本体显示浏览器时区 `MM/DD HH:mm`，tooltip 展示完整本地时间 `YYYY-MM-DD HH:mm` 与字段语义说明。
 
 - Given 管理员在任务中心点击任意任务“详情”
   When 任务详情抽屉打开
@@ -149,6 +153,22 @@
 ## Visual Evidence
 
 ![管理员翻译批次业务结果详情](./assets/admin-jobs-translation-business-outcome.png)
+
+### 用户管理最后活动 tooltip
+
+- source_type: `storybook_canvas`
+- target_program: `mock-only`
+- capture_scope: `element`
+- requested_viewport: `1600x980`
+- viewport_strategy: `storybook-viewport + clipped-element`
+- sensitive_exclusion: `N/A`
+- submission_gate: `approved`
+- story_id_or_title: `admin-admin-panel--evidence-compact-list`
+- state: `admin-users-last-active-tooltip`
+- evidence_note: 验证用户管理列表里的“最后活动”字段默认显示 `MM/DD HH:mm`，且悬浮后使用 UI 库 tooltip 展示完整本地时间与字段语义。
+
+PR: include
+![用户管理最后活动 tooltip](./assets/admin-users-last-active-tooltip.png)
 
 ### 最近失败数据重试定时任务
 
