@@ -4,6 +4,7 @@ import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, userEvent, within } from "storybook/test";
 
 import { AuthBootstrapProvider } from "@/auth/AuthBootstrap";
+import { ReleaseFeedCard } from "@/feed/FeedItemCard";
 import { PublicReleasePage } from "@/pages/PublicReleasePage";
 import { AppQueryProvider } from "@/query/queryClient";
 import {
@@ -254,6 +255,126 @@ const ownedPublicReleaseItems = [
 	},
 ];
 
+type ReleaseCardStoryProps = Parameters<typeof ReleaseFeedCard>[0];
+type ReleaseCardGalleryEmphasis = Exclude<
+	ReleaseCardStoryProps["emphasis"],
+	undefined
+>;
+
+const highlightGalleryItem: ReleaseCardStoryProps["item"] = {
+	kind: "release",
+	ts: releaseDetail.published_at,
+	id: releaseDetail.release_id,
+	repo_full_name: releaseDetail.repo_full_name,
+	repo_visual: releaseDetail.repo_visual,
+	title: "公开更新记录入口",
+	body: "这次版本把公开仓库的 Release 列表与详情开放为可直接分享的页面，并提供可重试的 REST API。",
+	body_truncated: false,
+	subtitle: releaseDetail.tag_name,
+	reason: null,
+	subject_type: null,
+	html_url: releaseDetail.html_url,
+	unread: null,
+	translated: releaseDetail.translated,
+	smart: releaseDetail.smart,
+	reactions: null,
+};
+
+const highlightGalleryStates: Array<{
+	id: string;
+	label: string;
+	note: string;
+	emphasis: ReleaseCardGalleryEmphasis;
+}> = [
+	{
+		id: "default",
+		label: "普通态",
+		note: "普通列表，没有任何高亮上下文。",
+		emphasis: "default",
+	},
+	{
+		id: "subdued",
+		label: "非高亮弱化态",
+		note: "处在高亮上下文里，但自己不是目标卡片；标题、时间、正文整体退后。",
+		emphasis: "subdued",
+	},
+	{
+		id: "highlighted",
+		label: "高亮态",
+		note: "命中的高亮卡片，使用轮廓和阴影抬起，但弱于当前导航目标。",
+		emphasis: "highlighted",
+	},
+	{
+		id: "active-highlight",
+		label: "当前高亮态",
+		note: "当前导航目标，使用最强轮廓和阴影，和其他卡片一眼拉开。",
+		emphasis: "active-highlight",
+	},
+];
+
+function HighlightCardStateGallery() {
+	return (
+		<div className="min-h-screen bg-[linear-gradient(180deg,#f7f1e5_0%,#f4ebdc_100%)] px-4 py-6 sm:px-6 sm:py-8">
+			<div className="mx-auto max-w-6xl space-y-5">
+				<section className="max-w-3xl rounded-[28px] border border-black/5 bg-white/80 p-5 shadow-[0_16px_30px_-34px_rgba(15,23,42,0.16)] backdrop-blur-sm sm:p-6">
+					<p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-foreground/38">
+						State gallery
+					</p>
+					<h2 className="mt-2 text-2xl font-semibold tracking-tight text-foreground sm:text-[2rem]">
+						公开 Release 卡片高亮层级
+					</h2>
+					<p className="mt-2 max-w-2xl text-sm leading-6 text-foreground/64">
+						同一张卡片，同一个内容，只切换状态层级。
+						这里专门用来审阅普通态、弱化态、高亮态和当前高亮态是否真的一眼可分。
+					</p>
+				</section>
+
+				<div className="grid gap-4 xl:grid-cols-2">
+					{highlightGalleryStates.map((state) => (
+						<section
+							key={state.id}
+							data-testid={`public-release-gallery-state-${state.id}`}
+							className="rounded-[28px] border border-black/5 bg-white/68 p-4 backdrop-blur-sm sm:p-5"
+						>
+							<div className="mb-4 space-y-2">
+								<div className="inline-flex rounded-full border border-black/6 bg-black/[0.025] px-3 py-1">
+									<p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-foreground/40">
+										{state.label}
+									</p>
+								</div>
+								<p className="text-sm leading-6 text-foreground/62">
+									{state.note}
+								</p>
+							</div>
+
+							<div className="rounded-[24px] border border-black/4 bg-[#f8f1e4] p-4 sm:p-5">
+								<ReleaseFeedCard
+									item={highlightGalleryItem}
+									activeLane="smart"
+									emphasis={state.emphasis}
+									isTranslating={false}
+									isTranslationAutoRetrying={false}
+									isSmartGenerating={false}
+									isSmartAutoRetrying={false}
+									isReactionBusy={false}
+									reactionError={null}
+									showReactions={false}
+									showRepoIdentity={false}
+									showHeaderActions={false}
+									onSelectLane={() => undefined}
+									onTranslateNow={() => undefined}
+									onSmartNow={() => undefined}
+									onToggleReaction={() => undefined}
+								/>
+							</div>
+						</section>
+					))}
+				</div>
+			</div>
+		</div>
+	);
+}
+
 function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 	const storyWindow = window as StoryWindow;
 	if (!storyWindow.__publicReleaseOriginalFetch) {
@@ -496,13 +617,11 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 				const active =
 					resolved.find((item) => item.selector === activeSelector) ??
 					resolved[0];
-				const items = publicReleaseItems
-					.filter((item) => resolvedIds.includes(item.release_id))
-					.map((item) => ({
-						...item,
-						is_highlighted: true,
-						is_active_highlight: item.release_id === active?.release_id,
-					}));
+				const items = publicReleaseItems.map((item) => ({
+					...item,
+					is_highlighted: resolvedIds.includes(item.release_id),
+					is_active_highlight: item.release_id === active?.release_id,
+				}));
 				return new Response(
 					JSON.stringify({
 						status: "ready",
@@ -522,20 +641,16 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 							active_release_id: active?.release_id ?? null,
 							active_index: active ? resolved.indexOf(active) + 1 : null,
 						},
-						segments: items.map((item) => ({
-							first_release_id: item.release_id,
-							last_release_id: item.release_id,
-						})),
-						gaps:
-							items.length > 1
+						segments:
+							items.length > 0
 								? [
 										{
-											newer_cursor: `storybook|${items[0].release_id}`,
-											older_cursor: `storybook|${items[1].release_id}`,
-											remaining_count: 1,
+											first_release_id: items[0].release_id,
+											last_release_id: items[items.length - 1].release_id,
 										},
 									]
 								: [],
+						gaps: [],
 					}),
 					{
 						status: 200,
@@ -589,6 +704,14 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 				const rangeStart = Math.min(startIndex, endIndex);
 				const rangeEnd = Math.max(startIndex, endIndex) + 1;
 				const rangeItems = publicReleaseItems.slice(rangeStart, rangeEnd);
+				const activeItem = (() => {
+					const candidate = resolveSelector(activeSelector);
+					if (!candidate) return startItem;
+					const candidateIndex = publicReleaseItems.indexOf(candidate);
+					return candidateIndex >= rangeStart && candidateIndex < rangeEnd
+						? candidate
+						: startItem;
+				})();
 				const cursorOffset = cursor
 					? Number(cursor.split("|").at(-1) ?? rangeStart)
 					: rangeStart;
@@ -606,7 +729,7 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 				const items = pageItems.map((item) => ({
 					...item,
 					is_highlighted: true,
-					is_active_highlight: item.release_id === startItem?.release_id,
+					is_active_highlight: item.release_id === activeItem?.release_id,
 				}));
 				const nextOffset = offset - rangeStart + items.length;
 				return new Response(
@@ -630,8 +753,12 @@ function installPublicReleaseMock(mode: PublicReleaseStoryMode) {
 							],
 							unresolved: [],
 							total: rangeItems.length,
-							active_release_id: startItem?.release_id ?? null,
-							active_index: 1,
+							active_release_id: activeItem?.release_id ?? null,
+							active_index: activeItem
+								? rangeItems.findIndex(
+										(item) => item.release_id === activeItem.release_id,
+									) + 1
+								: null,
 						},
 					}),
 					{
@@ -669,19 +796,22 @@ function PublicReleaseStory(props: { mode: PublicReleaseStoryMode }) {
 		props.mode === "highlight-ids"
 			? {
 					mode: "discrete" as const,
-					selectors: ["tag:v2.7.0", "id:291058025"],
+					selectors: ["tag:v2.7.0", "id:291058025", "tag:v1.9.0"],
+					active: "id:291058025",
 				}
 			: props.mode === "highlight-small-range"
 				? {
 						mode: "range" as const,
 						start: "tag:v2.7.0",
 						end: "id:291058024",
+						active: "id:291058025",
 					}
 				: props.mode === "highlight-large-range"
 					? {
 							mode: "range" as const,
 							start: "tag:v2.7.0",
-							end: "id:291058020",
+							end: "id:291058016",
+							active: "id:291058020",
 						}
 					: props.mode === "highlight-partial"
 						? {
@@ -848,14 +978,49 @@ export const DiscreteHighlight: Story = {
 		await expect(
 			canvas.getByTestId("public-release-item-291058027"),
 		).toHaveAttribute("data-highlighted", "true");
-		await userEvent.click(canvas.getByTitle("下一条高亮记录"));
+		await expect(
+			canvas.getByTestId("public-release-item-291058019"),
+		).toHaveAttribute("data-highlighted", "true");
 		await expect(
 			canvas.getByTestId("public-release-item-291058025"),
 		).toHaveAttribute("data-active-highlight", "true");
 		await expect(
-			canvas.getByTestId("public-release-item-291058025"),
-		).toHaveFocus();
+			canvas.getByTestId("public-release-highlight-navigation"),
+		).toContainText("2 / 3");
 		await expectPublicReleaseFooterVersion(canvasElement);
+	},
+};
+
+export const HighlightStateGallery: Story = {
+	name: "Highlight state gallery",
+	render: () => <HighlightCardStateGallery />,
+	parameters: {
+		layout: "fullscreen",
+		docs: {
+			description: {
+				story:
+					"把公开 Release 卡片的普通态、非高亮弱化态、高亮态和当前高亮态放进同一审阅面，专门用于确认高亮层级是否足够清晰。",
+			},
+		},
+	},
+	play: async ({ canvas, canvasElement }) => {
+		await expect(canvas.getByText("公开 Release 卡片高亮层级")).toBeVisible();
+		await expect(
+			canvas.getByTestId("public-release-gallery-state-default"),
+		).toBeVisible();
+		await expect(
+			canvas.getByTestId("public-release-gallery-state-subdued"),
+		).toBeVisible();
+		await expect(
+			canvas.getByTestId("public-release-gallery-state-highlighted"),
+		).toBeVisible();
+		await expect(
+			canvas.getByTestId("public-release-gallery-state-active-highlight"),
+		).toBeVisible();
+		expect(
+			canvasElement.ownerDocument.documentElement.scrollWidth -
+				canvasElement.ownerDocument.documentElement.clientWidth,
+		).toBeLessThanOrEqual(1);
 	},
 };
 
@@ -884,6 +1049,11 @@ export const SmallRangeHighlight: Story = {
 
 export const LargeRangeHighlight: Story = {
 	args: { mode: "highlight-large-range" },
+	parameters: {
+		viewport: {
+			defaultViewport: "publicReleaseMobile390",
+		},
+	},
 	play: async ({ canvasElement }) => {
 		await expectPublicReleaseFooterVersion(canvasElement);
 	},
@@ -891,6 +1061,11 @@ export const LargeRangeHighlight: Story = {
 
 export const PartialRangeHighlight: Story = {
 	args: { mode: "highlight-partial" },
+	parameters: {
+		viewport: {
+			defaultViewport: "publicReleaseMobile390",
+		},
+	},
 	play: async ({ canvas, canvasElement }) => {
 		await expect(
 			canvas.getByTestId("public-release-highlight-unresolved"),
