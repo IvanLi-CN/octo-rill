@@ -5,8 +5,8 @@
 - Lifecycle: active
 - Implementation: 已交付
 - Created: 2026-02-25
-- Last: 2026-04-27
-- Summary: 已交付；admin jobs translate/smart diagnostics now also interpret legacy item-only task results
+- Last: 2026-07-20
+- Summary: 已交付；用户管理 `last_active_at` 现以 `MM/DD HH:mm` 呈现，并在列表/详情中通过 shadcn tooltip 补齐完整本地时间说明；admin jobs translate/smart diagnostics continue to interpret legacy item-only task results
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 

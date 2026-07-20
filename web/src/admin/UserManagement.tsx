@@ -60,6 +60,11 @@ import {
 	TableHeader,
 	TableRow,
 } from "@/components/ui/table";
+import {
+	Tooltip,
+	TooltipContent,
+	TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { useInternalNavigate } from "@/lib/internalNavigation";
 import { useListSurfaceState } from "@/hooks/useListSurfaceState";
 import {
@@ -120,19 +125,6 @@ type PendingAdminConfirm = {
 	nextIsAdmin: boolean;
 };
 
-const HM_FORMATTER = new Intl.DateTimeFormat(undefined, {
-	hour: "2-digit",
-	minute: "2-digit",
-	hour12: false,
-});
-const DATE_TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
-	month: "2-digit",
-	day: "2-digit",
-	hour: "2-digit",
-	minute: "2-digit",
-	hour12: false,
-});
-
 const PAGE_SIZE = 20;
 const DEFAULT_GUARD = { admin_total: 0, active_admin_total: 0 };
 const ROLE_OPTIONS: Array<{ value: AdminRole; label: string }> = [
@@ -146,18 +138,41 @@ const STATUS_OPTIONS: Array<{ value: AdminStatus; label: string }> = [
 	{ value: "disabled", label: "状态：禁用" },
 ];
 
-function formatLocalHm(value: string | null | undefined) {
-	if (!value) return "-";
-	const parsed = new Date(value);
-	if (Number.isNaN(parsed.getTime())) return "-";
-	return HM_FORMATTER.format(parsed);
-}
-
 function formatLocalDateTime(value: string | null | undefined) {
 	if (!value) return "-";
 	const parsed = new Date(value);
 	if (Number.isNaN(parsed.getTime())) return "-";
-	return DATE_TIME_FORMATTER.format(parsed);
+	const month = `${parsed.getMonth() + 1}`.padStart(2, "0");
+	const day = `${parsed.getDate()}`.padStart(2, "0");
+	const hour = `${parsed.getHours()}`.padStart(2, "0");
+	const minute = `${parsed.getMinutes()}`.padStart(2, "0");
+	return `${month}/${day} ${hour}:${minute}`;
+}
+
+function formatLocalFullDateTime(value: string | null | undefined) {
+	if (!value) return "-";
+	const parsed = new Date(value);
+	if (Number.isNaN(parsed.getTime())) return "-";
+	const year = parsed.getFullYear();
+	const month = `${parsed.getMonth() + 1}`.padStart(2, "0");
+	const day = `${parsed.getDate()}`.padStart(2, "0");
+	const hour = `${parsed.getHours()}`.padStart(2, "0");
+	const minute = `${parsed.getMinutes()}`.padStart(2, "0");
+	return `${year}-${month}-${day} ${hour}:${minute}`;
+}
+
+function renderFieldTooltip(
+	title: string,
+	fullValue: string,
+	description: string,
+) {
+	return (
+		<div className="max-w-64 space-y-1">
+			<p className="font-medium">{title}</p>
+			<p className="font-mono text-background text-xs">{fullValue}</p>
+			<p className="text-background/80">{description}</p>
+		</div>
+	);
 }
 
 function toAdminUserErrorMessage(err: unknown) {
@@ -720,18 +735,56 @@ export function UserManagement({
 												</TableCell>
 												<TableCell className="px-3 py-3">
 													<div className="min-w-0 space-y-1">
-														<p
-															className="truncate font-medium text-sm whitespace-nowrap"
-															title={`最后活动：${formatLocalHm(user.last_active_at)}`}
-														>
-															最后活动：{formatLocalHm(user.last_active_at)}
-														</p>
-														<p
-															className="text-muted-foreground truncate text-xs whitespace-nowrap"
-															title={`创建时间：${formatLocalDateTime(user.created_at)}`}
-														>
-															创建时间：{formatLocalDateTime(user.created_at)}
-														</p>
+														<Tooltip>
+															<TooltipTrigger asChild>
+																<button
+																	type="button"
+																	data-user-last-active-trigger
+																	aria-label="最后活动说明"
+																	className="max-w-full cursor-help rounded-sm text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+																>
+																	<span className="block truncate font-medium text-sm whitespace-nowrap">
+																		{formatLocalDateTime(user.last_active_at)}
+																	</span>
+																</button>
+															</TooltipTrigger>
+															<TooltipContent
+																side="top"
+																align="start"
+																sideOffset={6}
+															>
+																{renderFieldTooltip(
+																	"最后活动",
+																	formatLocalFullDateTime(user.last_active_at),
+																	"最近一次受保护会话活跃时间，按浏览器当前时区显示。",
+																)}
+															</TooltipContent>
+														</Tooltip>
+														<Tooltip>
+															<TooltipTrigger asChild>
+																<button
+																	type="button"
+																	data-user-created-at-trigger
+																	aria-label="创建时间说明"
+																	className="text-muted-foreground max-w-full cursor-help rounded-sm text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+																>
+																	<span className="block truncate text-xs whitespace-nowrap">
+																		创建 {formatLocalDateTime(user.created_at)}
+																	</span>
+																</button>
+															</TooltipTrigger>
+															<TooltipContent
+																side="top"
+																align="start"
+																sideOffset={6}
+															>
+																{renderFieldTooltip(
+																	"创建时间",
+																	formatLocalFullDateTime(user.created_at),
+																	"账号创建时间，按浏览器当前时区显示。",
+																)}
+															</TooltipContent>
+														</Tooltip>
 													</div>
 												</TableCell>
 												<TableCell className="px-3 py-3">
@@ -827,16 +880,39 @@ export function UserManagement({
 									{profileUser?.id ?? "-"}
 								</p>
 							</div>
-							<div className="rounded-lg border p-3">
-								<p className="text-muted-foreground text-xs">
-									最后活动（浏览器当前时区）
-								</p>
-								<p className="mt-1 font-medium">
-									{formatLocalHm(
-										profile?.last_active_at ?? profileUser?.last_active_at,
+							<Tooltip>
+								<TooltipTrigger asChild>
+									<button
+										type="button"
+										data-user-profile-last-active-trigger
+										aria-label="最后活动说明"
+										className="w-full cursor-help rounded-lg border p-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+									>
+										<p className="text-muted-foreground text-xs">
+											最后活动（浏览器当前时区）
+										</p>
+										<p className="mt-1 font-medium">
+											{formatLocalDateTime(
+												profile?.last_active_at ?? profileUser?.last_active_at,
+											)}
+										</p>
+									</button>
+								</TooltipTrigger>
+								<TooltipContent
+									side="left"
+									align="start"
+									sideOffset={8}
+									avoidCollisions={false}
+								>
+									{renderFieldTooltip(
+										"最后活动",
+										formatLocalFullDateTime(
+											profile?.last_active_at ?? profileUser?.last_active_at,
+										),
+										"最近一次受保护会话活跃时间，按浏览器当前时区显示。",
 									)}
-								</p>
-							</div>
+								</TooltipContent>
+							</Tooltip>
 							<div className="rounded-lg border p-3">
 								<p className="text-muted-foreground text-xs">账号状态</p>
 								<p className="mt-1 font-medium">
