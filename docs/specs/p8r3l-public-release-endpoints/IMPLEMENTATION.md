@@ -26,8 +26,10 @@
 - 公开 Release 页脚与全站 footer 保持一致：有效 `loadedVersion` 链接到 OctoRill 自身 public-only Release 详情页，`unknown` 保持纯文本。
 - 公开文档站已提供面向接入方的 `公开 Release 接入` 页面，覆盖公开页面 URL、REST API、pending retry、真实 pending reason 枚举、分页参数与部署前检查。
 - 高亮 URL 使用重复 typed `highlight` 或 typed `highlight_start` / `highlight_end`，并以 `highlight_active` 保存当前导航目标；离散目标上限 20，首屏完整数据预算 30。
+- 离散高亮首屏会保留 active 周围的列表上下文，同时仍保证所有命中目标留在窗口内；单目标不会退化成只剩一张卡片。
 - 高亮列表复用 `repo_releases` 唯一 ID 与仓库排序索引，响应增加连续 segments、内部 gaps、精确命中进度和双向 bounded cursor。
 - 页面统一使用动态高度 window virtualization，内部 gap 接近视口后自动填充；右下浮动导航按页面时间顺序切换 active 目标并保持详情往返上下文。
+- 高亮卡片层级现在由 `ReleaseFeedCard` 统一接管：普通态保持原列表权重，`subdued` 通过文字与边界降权退后，`highlighted` 与 `active-highlight` 通过更干净的轮廓和柔和阴影抬起；用于审阅这三档差异的 Storybook `Highlight state gallery` 作为本轮唯一新增视觉证据。
 - 公开列表页将页面级 lane 状态提升到 owner/avatar 加仓库名的标题带：宽度足够时同行，窄屏时 selector 整块换行；列表卡片不再重复仓库身份、lane 或 GitHub 操作，翻译 hydration 继续由页面级 lane 驱动。
 - 公开列表复用现有 `AuthBootstrap` 和 reaction token 查询键：匿名会话不发起 PAT 状态查询；认证会话的 PAT 为 `configured + valid` 后，按最多 100 条一批刷新反应，且只有接口确认可操作的 Release 显示控件。列表窗口在刷新途中变化时仍合并已发出的有效响应，避免控件因 pagination、gap 或高亮加载竞态而永久隐藏；非 PAT 的失败批次独立重试最多三次，成功批次仍立即合并。刷新和切换请求均绑定认证会话 generation，用户切换后的旧响应直接丢弃。`pat_required` / `pat_invalid` / `not_found` 会即时撤下相关控件，避免提供无法提交的操作。
 

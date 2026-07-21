@@ -1190,6 +1190,12 @@ function SocialActivityCard(props: {
 	);
 }
 
+type ReleaseCardEmphasis =
+	| "default"
+	| "subdued"
+	| "highlighted"
+	| "active-highlight";
+
 export function ReleaseFeedCard(props: {
 	item: ReadableFeedItem;
 	activeLane: FeedLane;
@@ -1206,6 +1212,7 @@ export function ReleaseFeedCard(props: {
 	showHeaderActions?: boolean;
 	surface?: "card" | "article";
 	titleHref?: string | null;
+	emphasis?: ReleaseCardEmphasis;
 	onSelectLane: (lane: FeedLane) => void;
 	onTranslateNow: () => void;
 	onSmartNow: () => void;
@@ -1227,6 +1234,7 @@ export function ReleaseFeedCard(props: {
 		showHeaderActions = true,
 		surface = "card",
 		titleHref = null,
+		emphasis = "default",
 		onSelectLane,
 		onTranslateNow,
 		onSmartNow,
@@ -1250,7 +1258,68 @@ export function ReleaseFeedCard(props: {
 		item.kind === "release" && item.smart?.status === "insufficient";
 	const isArticleSurface = surface === "article";
 	const displayTitle = displayTitleForLane(item, activeLane);
+	const isSubdued = emphasis === "subdued";
+	const isHighlighted = emphasis === "highlighted";
+	const isActiveHighlight = emphasis === "active-highlight";
 	const [reactionBubbleOpen, setReactionBubbleOpen] = useState(false);
+
+	const cardToneClassName = cn(
+		isArticleSurface
+			? "group border-0 bg-transparent shadow-none"
+			: "group transition-[background-color,border-color,box-shadow,color] duration-200 ease-out",
+		!isArticleSurface &&
+			emphasis === "default" &&
+			"bg-card/80 shadow-sm hover:shadow-md",
+		!isArticleSurface &&
+			isSubdued &&
+			"border-border/34 bg-card/60 shadow-[0_10px_22px_-26px_rgba(15,23,42,0.08)]",
+		!isArticleSurface &&
+			isHighlighted &&
+			"border-primary/18 bg-card/98 shadow-[0_18px_34px_-26px_rgba(79,106,152,0.24),0_0_0_1px_rgba(79,106,152,0.14)]",
+		!isArticleSurface &&
+			isActiveHighlight &&
+			"border-primary/28 bg-card shadow-[0_24px_42px_-24px_rgba(79,106,152,0.28),0_0_0_1px_rgba(79,106,152,0.2),0_0_0_8px_rgba(79,106,152,0.06)]",
+		isVersionOnly && "border-dashed",
+	);
+	const repoIdentityLabelClassName = cn(
+		"font-mono text-base font-medium tracking-tight",
+		isSubdued
+			? "text-foreground/46"
+			: isActiveHighlight
+				? "text-foreground/92"
+				: isHighlighted
+					? "text-foreground/84"
+					: "text-foreground/80",
+	);
+	const cardTitleClassName = cn(
+		"text-balance text-[1.35rem] leading-tight transition-colors duration-200 sm:text-lg",
+		showRepoIdentity && "mt-2 sm:mt-2.5",
+		isSubdued
+			? "text-foreground/52"
+			: isActiveHighlight
+				? "text-foreground"
+				: isHighlighted
+					? "text-foreground/97"
+					: "text-foreground",
+	);
+	const cardMetaClassName = cn(
+		"mt-1 font-mono text-[11px] transition-colors duration-200 sm:text-xs",
+		isSubdued
+			? "text-foreground/28"
+			: isActiveHighlight
+				? "text-foreground/62"
+				: isHighlighted
+					? "text-foreground/54"
+					: "text-muted-foreground",
+	);
+	const cardContentToneClassName = cn(
+		isSubdued &&
+			"text-foreground/48 [&_.text-muted-foreground]:text-foreground/34 [&_[data-markdown-root='true']]:text-foreground/48 [&_[data-markdown-root='true']_strong]:text-foreground/64",
+		isHighlighted &&
+			"text-foreground/84 [&_.text-muted-foreground]:text-foreground/58 [&_[data-markdown-root='true']]:text-foreground/84 [&_[data-markdown-root='true']_strong]:text-foreground/95",
+		isActiveHighlight &&
+			"text-foreground/92 [&_.text-muted-foreground]:text-foreground/64 [&_[data-markdown-root='true']]:text-foreground/92 [&_[data-markdown-root='true']_strong]:text-foreground",
+	);
 
 	useEffect(() => {
 		if (reactionError) {
@@ -1284,7 +1353,7 @@ export function ReleaseFeedCard(props: {
 												repoFullName={item.repo_full_name}
 												repoVisual={item.repo_visual}
 												className="min-w-0 min-h-8"
-												labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
+												labelClassName={repoIdentityLabelClassName}
 												visualClassName="size-8"
 												labelSuffix={
 													<FeedItemTypeIcon
@@ -1298,7 +1367,7 @@ export function ReleaseFeedCard(props: {
 											repoFullName={item.repo_full_name}
 											repoVisual={item.repo_visual}
 											className="min-w-0 min-h-8"
-											labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
+											labelClassName={repoIdentityLabelClassName}
 											visualClassName="size-8"
 											labelSuffix={
 												<FeedItemTypeIcon
@@ -1310,12 +1379,7 @@ export function ReleaseFeedCard(props: {
 								</div>
 							) : null}
 
-							<CardTitle
-								className={cn(
-									"text-balance text-[1.35rem] leading-tight sm:text-lg",
-									showRepoIdentity && "mt-2 sm:mt-2.5",
-								)}
-							>
+							<CardTitle className={cardTitleClassName}>
 								{titleHref ? (
 									<a href={titleHref} className="hover:underline">
 										{displayTitle}
@@ -1324,7 +1388,7 @@ export function ReleaseFeedCard(props: {
 									displayTitle
 								)}
 							</CardTitle>
-							<p className="mt-1 font-mono text-[11px] text-muted-foreground sm:text-xs">
+							<p className={cardMetaClassName} data-public-release-meta="true">
 								{formatIsoShortLocal(item.ts)}
 								{isFresh ? <FreshContentCue className="ml-2" /> : null}
 								{subtitle ? ` · ${subtitle}` : ""}
@@ -1575,14 +1639,7 @@ export function ReleaseFeedCard(props: {
 	}
 
 	return (
-		<Card
-			className={cn(
-				isArticleSurface
-					? "group border-0 bg-transparent shadow-none"
-					: "group bg-card/80 shadow-sm transition-shadow hover:shadow-md",
-				isVersionOnly && "border-dashed",
-			)}
-		>
+		<Card className={cardToneClassName}>
 			{isVersionOnly ? (
 				header
 			) : (
@@ -1598,6 +1655,7 @@ export function ReleaseFeedCard(props: {
 							isArticleSurface
 								? "px-0 pb-0 pt-0 sm:px-0 sm:pb-0"
 								: "px-4 pb-4 pt-0 sm:px-6 sm:pb-6",
+							cardContentToneClassName,
 						)}
 					>
 						<TabsContent value="original" className="mt-0">

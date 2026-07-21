@@ -111,12 +111,20 @@ GET {OCTORILL_ORIGIN}/api/public/repos/{owner}/{repo}/releases/content
     "active_release_id": "291058027",
     "active_index": 1
   },
-  "segments": [{ "first_release_id": "291058027", "last_release_id": "291058027" }],
+  "segments": [{ "first_release_id": "291058028", "last_release_id": "291058026" }],
   "gaps": [],
   "items": [
     {
+      "release_id": "291058028",
+      "is_highlighted": false
+    },
+    {
       "release_id": "291058027",
       "is_highlighted": true
+    },
+    {
+      "release_id": "291058026",
+      "is_highlighted": false
     }
   ]
 }

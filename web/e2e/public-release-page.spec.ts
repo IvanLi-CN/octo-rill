@@ -319,6 +319,11 @@ test("public release header keeps the title and global lane selector responsive"
 	const wordmark = page.getByRole("img", { name: "OctoRill" });
 	const title = page.getByRole("heading", { name: "octo-rill/example" });
 	const pageLane = page.getByTestId("public-release-page-lane");
+	await page.waitForFunction(() =>
+		Array.from(document.images)
+			.filter((img) => img.alt === "OctoRill")
+			.every((img) => img.complete && img.naturalWidth > 0),
+	);
 	await expect(wordmark).toBeVisible();
 	await expect(title).toBeVisible();
 	await expect(pageLane).toBeVisible();
@@ -663,13 +668,11 @@ test("public release typed discrete highlight keeps partial targets and replaces
 			status: "ready",
 			repo_full_name: "octo-rill/example",
 			next_cursor: null,
-			items: items
-				.filter((item) => resolvedIds.includes(item.release_id))
-				.map((item) => ({
-					...item,
-					is_highlighted: true,
-					is_active_highlight: item.release_id === active.release_id,
-				})),
+			items: items.map((item) => ({
+				...item,
+				is_highlighted: resolvedIds.includes(item.release_id),
+				is_active_highlight: item.release_id === active.release_id,
+			})),
 			highlight: {
 				mode: "discrete",
 				status: "partial",
@@ -680,10 +683,12 @@ test("public release typed discrete highlight keeps partial targets and replaces
 				active_release_id: active.release_id,
 				active_index: 1,
 			},
-			segments: resolved.map((target) => ({
-				first_release_id: target.release_id,
-				last_release_id: target.release_id,
-			})),
+			segments: [
+				{
+					first_release_id: items[0].release_id,
+					last_release_id: items[items.length - 1].release_id,
+				},
+			],
 			gaps: [],
 		});
 	});
