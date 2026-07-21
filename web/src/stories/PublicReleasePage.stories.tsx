@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, userEvent, within } from "storybook/test";
 
+import type { ReleaseDetailResponse } from "@/api";
 import { AuthBootstrapProvider } from "@/auth/AuthBootstrap";
 import { ReleaseFeedCard } from "@/feed/FeedItemCard";
 import { PublicReleasePage } from "@/pages/PublicReleasePage";
@@ -65,7 +66,7 @@ const releaseDetail = {
 		summary:
 			"这次版本把公开仓库的 Release 列表与详情开放为可直接分享的页面，并提供可重试的 REST API。",
 	},
-};
+} satisfies ReleaseDetailResponse;
 
 const longRepoAndTagReleaseDetail = {
 	...releaseDetail,
@@ -986,13 +987,14 @@ export const DiscreteHighlight: Story = {
 		).toHaveAttribute("data-active-highlight", "true");
 		await expect(
 			canvas.getByTestId("public-release-highlight-navigation"),
-		).toContainText("2 / 3");
+		).toHaveTextContent("2 / 3");
 		await expectPublicReleaseFooterVersion(canvasElement);
 	},
 };
 
 export const HighlightStateGallery: Story = {
 	name: "Highlight state gallery",
+	args: { mode: "list" },
 	render: () => <HighlightCardStateGallery />,
 	parameters: {
 		layout: "fullscreen",
