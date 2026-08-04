@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-- Lifecycle: superseded(release-translation-input-budget-runtime)
+- Lifecycle: superseded
 - Implementation: 重新设计（release-translation-input-budget-runtime）
 - Created: 2026-03-27
 - Last: 2026-04-13
