@@ -9,7 +9,7 @@
 ### Goals
 
 - 从仓库中删除 `.codex/skills/ui-ux-pro-max/**` 全部资产。
-- 删除仅服务于该安装动作的旧规格 `docs/specs/ejdn8-uipro-skill-install/SPEC.md`。
+- 删除仅服务于该安装动作的旧安装规格。
 - 更新 `docs/specs/README.md`，移除失效索引并登记本次 removal spec。
 - 保持除本 removal spec 与 specs index 外，仓库内不再出现 `ui-ux-pro-max` 的残留引用。
 
@@ -24,7 +24,7 @@
 ### In scope
 
 - `.codex/skills/ui-ux-pro-max/**`
-- `docs/specs/ejdn8-uipro-skill-install/SPEC.md`
+- 已废弃的仓库内 skill 安装规格
 - `docs/specs/README.md`
 - 本规格文档
 
@@ -39,7 +39,7 @@
 ### MUST
 
 - 仓库中不得再保留 `.codex/skills/ui-ux-pro-max/**` 文件。
-- `docs/specs/README.md` 不得继续引用已删除的 `#ejdn8` 安装规格。
+- `docs/specs/README.md` 不得继续引用已删除的安装规格。
 - 除本 removal spec 与 specs index 外，仓库级文本搜索不再命中 `ui-ux-pro-max` 相关引用。
 
 ### SHOULD
