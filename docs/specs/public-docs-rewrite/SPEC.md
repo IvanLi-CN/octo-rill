@@ -94,7 +94,7 @@ None
 
 - Given 维护者运行 docs 验证链路
   When 执行 docs-site build、Storybook build 和 assembled Pages smoke check
-  Then 三项都通过，且本地浏览器可以打开重写后的公开首页、快速开始、配置、产品和 Storybook 导览页面。
+  Then 三项都通过，且本地浏览器可以打开重写后的公开首页、快速开始、配置、产品和 Storybook 直接入口；旧导览 URL 兼容重定向到 Storybook。
 
 ## 实现前置条件（Definition of Ready / Preconditions）
 
@@ -108,7 +108,7 @@ None
 
 - Docs build: `cd docs-site && bun run build`
 - Storybook build: `cd web && bun run storybook:build`
-- Assembled site smoke: `bash ./.github/scripts/assemble-pages-site.sh docs-site/doc_build web/storybook-static .tmp/pages-site`
+- Assembled site smoke: `bash ./.github/scripts/assemble-pages-site.sh docs-site/doc_build web/storybook-static web/dist-demo .tmp/pages-site`
 
 ### UI / Storybook (if applicable)
 

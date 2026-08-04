@@ -66,7 +66,7 @@
 
 - Docs build: `cd docs-site && bun run build`
 - Storybook build: `cd web && bun run storybook:build`
-- Assembled site smoke: `bash ./.github/scripts/assemble-pages-site.sh docs-site/doc_build web/storybook-static .tmp/pages-site`
+- Assembled site smoke: `bash ./.github/scripts/assemble-pages-site.sh docs-site/doc_build web/storybook-static web/dist-demo .tmp/pages-site`
 
 ### UI / Storybook (if applicable)
 

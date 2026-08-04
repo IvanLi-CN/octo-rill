@@ -3,10 +3,10 @@
 ## 当前状态
 
 - Lifecycle: active
-- Implementation: 待实现
+- Implementation: 已实现，待交付收口
 - Created: 2026-04-20
 - Last: 2026-04-20
-- Summary: 待实现；fast-track / lazy routes + branch-level split
+- Summary: 已实现，待交付收口；lazy routes + branch-level split 已落地，剩余构建、证据与 PR cleanup
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
