@@ -70,7 +70,7 @@
 
 1. Given 在 `docs-site` 内执行 `bun run build`，When 设置 `DOCS_BASE=/octo-rill/`，Then 文档站能成功构建，且生成的站内链接与静态资源路径都指向 `/octo-rill/` 子路径。
 2. Given 在 `web` 内执行 `bun run storybook:build`，When 打开生成产物，Then 核心故事组均可在 docs 视图看到说明文字。
-3. Given 执行装配脚本，When 传入 docs 与 storybook 两个构建目录，Then 输出目录同时包含 `index.html`、`storybook/index.html` 与 `storybook.html`，且 `storybook.html` 提供 Storybook 总入口与核心故事深链。
+3. Given 执行装配脚本，When 传入 docs、storybook 与 demo 三个构建目录，Then 输出目录同时包含 docs 首页、`storybook/`、`storybook.html` 与 `demo/`，且 `storybook.html` 提供 Storybook 总入口与核心故事深链。
 4. Given GitHub Actions 触发 `Docs Pages` 工作流，When 构建成功，Then 能上传 assembled pages artifact，并在非 PR 场景部署 GitHub Pages。
 5. Given 开发者阅读根 README 与 `web/README.md`，When 按说明启动文档站与 Storybook，Then 端口、命令与实际脚本一致。
 
@@ -79,7 +79,7 @@
 - `cd docs-site && DOCS_BASE=/octo-rill/ bun run build`
 - `cd web && bun run lint`
 - `cd web && bun run storybook:build`
-- `bash ./.github/scripts/assemble-pages-site.sh <docs_build> <storybook_build> <output_dir>` smoke check
+- `bash ./.github/scripts/assemble-pages-site.sh <docs_build> <storybook_build> <demo_build> <output_dir>` smoke check
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 

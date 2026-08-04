@@ -30,7 +30,7 @@
 - `src/version.rs`：统一版本来源解析。
 - `src/server.rs`：新增 `/api/version`，更新 `/api/health` 版本来源。
 - `web/src/layout/AppMetaFooter.tsx`：双端点读取与回退逻辑，并把有效 `loadedVersion` 渲染为内部 Release 详情链接。
-- `web/vite.config.ts` / `web/build/embeddedVersion.ts`：前端构建期版本解析改为 env 优先、Cargo 可选兜底、缺省不崩。
+- `web/vite.config.ts` / `web/config/embeddedVersion.ts`：前端构建期版本解析改为 env 优先、Cargo 可选兜底、缺省不崩。
 - `Dockerfile`：web / Rust 构建阶段都消费 `APP_EFFECTIVE_VERSION`，且 web-builder 在完整仓库上下文里保留 `Cargo.toml` 兜底来源。
 - `.github/workflows/ci.yml`：在既有 `Build (Release)` gate 内加入 Docker smoke 覆盖 release `web-builder` 路径。
 - `.github/workflows/release.yml`：增加 `APP_EFFECTIVE_VERSION` 非空保护，并在历史 backfill 时叠加当前 workflow revision 的 Docker/web 构建基础设施修复。
