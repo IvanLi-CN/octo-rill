@@ -261,45 +261,68 @@
   image:
   ![公开 Release 列表桌面状态](./assets/public-release-list-desktop.png)
 
-- source_type: `ui_demo`
+- source_type: `storybook_canvas`
   target_program: `mock-only`
   capture_scope: `browser-viewport`
   requested_viewport: `1440x1000`
-  viewport_strategy: `browser-viewport-override`
+  viewport_strategy: `browser-resize-fallback`
   sensitive_exclusion: `N/A`
   submission_gate: `approved`
-  story_id_or_title: `public-release-highlight-discrete`
+  story_id_or_title: `public-publicreleasepage--discrete-highlight`
   state: `discrete-highlight-desktop`
-  evidence_note: 验证 URL 中三个 tag/ID 混合离散目标由同一个列表请求返回并同时进入视口；active 目标使用更强焦点环，右下导航精确显示 `2 / 3`，默认内容 lane 为润色且无横向溢出。
-  PR: include
+  evidence_note: 验证 URL 中三个 tag/ID 混合离散目标由同一个列表请求返回并同时进入视口；active 目标使用最强的轮廓与阴影，高亮组保持次一级描边，其余卡片通过更弱文字层级退后，右下导航精确显示 `2 / 3`。
   image:
   ![公开 Release 离散高亮桌面状态](./assets/public-release-highlight-discrete-desktop.png)
-
-- source_type: `ui_demo`
-  target_program: `mock-only`
-  capture_scope: `browser-viewport`
-  requested_viewport: `390x844`
-  captured_viewport: `375x812`
-  viewport_strategy: `browser-viewport-override`
-  sensitive_exclusion: `N/A`
-  submission_gate: `approved`
-  story_id_or_title: `public-release-highlight-range`
-  state: `long-range-highlight-mobile`
-  evidence_note: 验证 18 条连续范围以显式 active 为中心定位，右下导航显示 `9 / 18`；动态高度卡片在 390px 移动视口持续虚拟化渲染，active 焦点环、润色回退原文与原生滚动条共存且无横向溢出。
-  PR: include
-  image:
-  ![公开 Release 长范围移动状态](./assets/public-release-highlight-range-mobile.png)
 
 - source_type: `storybook_canvas`
   target_program: `mock-only`
   capture_scope: `browser-viewport`
   requested_viewport: `390x844`
-  viewport_strategy: `devtools-emulate`
+  viewport_strategy: `browser-resize-fallback`
   sensitive_exclusion: `N/A`
-  submission_gate: `pending-owner-approval`
+  submission_gate: `approved`
+  story_id_or_title: `public-publicreleasepage--small-range-highlight`
+  state: `small-range-highlight-mobile`
+  evidence_note: 验证短连续范围会在同一移动视口内保留多张高亮卡片；active 目标使用最强轮廓与阴影，相邻高亮卡保持次级描边，非高亮卡片文字与边界明显弱化，右下导航精确显示 `3 / 4`。
+  image:
+  ![公开 Release 短范围移动状态](./assets/public-release-highlight-small-range-mobile.png)
+
+- source_type: `storybook_canvas`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `390x844`
+  viewport_strategy: `browser-resize-fallback`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  story_id_or_title: `public-publicreleasepage--large-range-highlight`
+  state: `large-range-highlight-mobile`
+  evidence_note: 验证较长连续范围保留时间线滚动上下文，active 目标按显式 selector 锁定为 `8 / 12`；当前卡片使用最强轮廓与阴影，其余非高亮记录在同一视口内仍明显降权，移动端继续保持导航和无横向溢出。
+  image:
+  ![公开 Release 长范围移动状态](./assets/public-release-highlight-large-range-mobile.png)
+
+- source_type: `storybook_canvas`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `1600x1400`
+  viewport_strategy: `browser-resize-fallback`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  story_id_or_title: `public-publicreleasepage--highlight-state-gallery`
+  state: `highlight-state-gallery-desktop`
+  evidence_note: 作为这轮唯一新增视觉证据，直接并排展示普通态、非高亮弱化态、高亮态与当前高亮态，用同一张卡片内容校对层级是否一眼可分。
+  image:
+  ![公开 Release 卡片高亮层级 Gallery](./assets/public-release-highlight-state-gallery-desktop.png)
+
+- source_type: `storybook_canvas`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `390x844`
+  viewport_strategy: `browser-resize-fallback`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
   story_id_or_title: `public-publicreleasepage--partial-range-highlight`
   state: `partial-range-highlight-mobile`
-  evidence_note: 验证范围端点部分解析时页面显示已找到的 Release、保留高亮边框，并以状态文案明确提示未找到的目标；页脚与窄屏布局仍完整可见。
+  evidence_note: 验证范围端点部分解析时页面退回普通最新列表，并以状态文案明确提示未找到的目标；移动端页头、lane 与首屏列表布局保持完整。
   image:
   ![公开 Release 部分解析移动状态](./assets/public-release-highlight-partial-mobile.png)
 
