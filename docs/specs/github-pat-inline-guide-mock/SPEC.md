@@ -114,14 +114,6 @@ GitHub 实际界面 vs OctoRill 参考界面对比（desktop/mobile × light/dar
 设置页内嵌版的移动端最终形态（可切换 section story）
 ![Settings switchable mobile](./assets/settings-switchable-mobile.png)
 
-## 实现概述
-
-- `GitHubPatGuideCard` 使用 DOM 复刻 GitHub classic PAT 页面骨架，并按主题与断点切换 desktop/mobile × light/dark 四个变体。
-- 设置页保留真实 PAT 编辑能力，只把参考界面作为嵌入式抄写区域；移动端嵌入版允许横向滚动并降低说明噪声。
-- `Settings.stories.tsx` 新增可切换 section 的 story，并在 story 内拦截导航跳转、改为本地状态切换。
-- 移动端设置页导航拆成独立 2×2 网格渲染，避免桌面按钮变体导致选中态与布局失真。
-- 移动端 `GitHub PAT`、`日报设置`、`我的发布`、`LinuxDO 绑定` 的外层 section 卡片壳统一抹平，保留导航和内容之间的明确分隔。
-
 ## 参考（References）
 
 - https://github.com/settings/tokens/new

@@ -39,13 +39,6 @@
 - brief markdown fallback 的 batched resolve 现已按 locator 数分批执行，避免超过 SQLite bind limit；同时按 brief 回填时再次去重，保持 `release_ids` / `release_count` 的既有唯一性语义。
 - canonical path-backed tab 切换继续遵守 [Dashboard SPA 导航避免回退启动骨架](../spa-nav-startup-skeleton-guard/SPEC.md)的壳层保留约束：Dashboard 在同一会话内已完成首屏 hydration 后，再切 `/stars` 等 path-backed tab 只显示局部 feed skeleton，不再回退全局 startup skeleton。
 
-## 实现里程碑（Milestones / Delivery checklist）
-
-- M1: 冻结 dashboard path-backed tabs、release deep link、legacy ingress 兼容 contract。
-- M2: 完成前端 routeState / route files / Dashboard detail restore 的 path-backed 重构。
-- M3: 完成 repo/tag detail API、brief link parser / reconciler 与回归测试。
-- M4: 补齐浏览器 URL 证据、review-loop、PR merge 与 cleanup 收口。
-
 ## 验证结果
 - `cargo fmt`
 - `cargo test` → `441 passed`
