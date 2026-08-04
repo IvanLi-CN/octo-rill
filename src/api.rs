@@ -1149,25 +1149,31 @@ async fn persist_daily_brief_profile(
     }
 
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE users
-        SET daily_brief_time_zone = ?,
-            include_own_releases = COALESCE(?, include_own_releases),
-            updated_at = ?
-        WHERE id = ?
-        "#,
-    )
-    .bind(time_zone)
-    .bind(
-        req.include_own_releases
-            .map(|value| if value { 1_i64 } else { 0_i64 }),
-    )
-    .bind(now.as_str())
-    .bind(user_id)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    state
+        .sqlite_writer
+        .write_foreground("daily_brief_profile_update", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE users
+                SET daily_brief_time_zone = ?,
+                    include_own_releases = COALESCE(?, include_own_releases),
+                    updated_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(time_zone.as_str())
+            .bind(
+                req.include_own_releases
+                    .map(|value| if value { 1_i64 } else { 0_i64 }),
+            )
+            .bind(now.as_str())
+            .bind(user_id)
+            .execute(&state.pool)
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(ApiError::internal)?;
 
     load_daily_brief_profile(state, user_id).await
 }
@@ -1258,34 +1264,33 @@ pub async fn me_create_api_key(
     let id = local_id::generate_local_id();
     let now = chrono::Utc::now().to_rfc3339();
 
-    sqlx::query(
-        r#"
-        INSERT INTO user_api_keys (
-          id,
-          user_id,
-          name,
-          key_hash,
-          key_ciphertext,
-          key_nonce,
-          key_prefix,
-          masked_key,
-          created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(id.as_str())
-    .bind(user_id.as_str())
-    .bind(name.as_str())
-    .bind(key_hash.as_str())
-    .bind(encrypted.ciphertext)
-    .bind(encrypted.nonce)
-    .bind(key_prefix.as_str())
-    .bind(masked_key.as_str())
-    .bind(now.as_str())
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    state
+        .sqlite_writer
+        .write_foreground("api_key_create", |_| async {
+            sqlx::query(
+                r#"
+                INSERT INTO user_api_keys (
+                  id, user_id, name, key_hash, key_ciphertext, key_nonce,
+                  key_prefix, masked_key, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(id.as_str())
+            .bind(user_id.as_str())
+            .bind(name.as_str())
+            .bind(key_hash.as_str())
+            .bind(encrypted.ciphertext.as_slice())
+            .bind(encrypted.nonce.as_slice())
+            .bind(key_prefix.as_str())
+            .bind(masked_key.as_str())
+            .bind(now.as_str())
+            .execute(&state.pool)
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(ApiError::internal)?;
 
     let item = load_api_key_summary(state.as_ref(), &user_id, &id).await?;
     Ok(Json(CreateApiKeyResponse { item, api_key }))
@@ -1299,21 +1304,28 @@ pub async fn me_delete_api_key(
     let user_id = require_active_user_id(state.as_ref(), &session).await?;
     let api_key_id = parse_local_id_param(api_key_id, "api_key_id")?;
     let now = chrono::Utc::now().to_rfc3339();
-    let result = sqlx::query(
-        r#"
+    let result = state
+        .sqlite_writer
+        .write_foreground("api_key_revoke", |_| async {
+            Ok::<_, anyhow::Error>(
+                sqlx::query(
+                    r#"
         UPDATE user_api_keys
         SET revoked_at = ?
         WHERE id = ?
           AND user_id = ?
           AND revoked_at IS NULL
         "#,
-    )
-    .bind(now.as_str())
-    .bind(api_key_id.as_str())
-    .bind(user_id.as_str())
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+                )
+                .bind(now.as_str())
+                .bind(api_key_id.as_str())
+                .bind(user_id.as_str())
+                .execute(&state.pool)
+                .await?,
+            )
+        })
+        .await
+        .map_err(ApiError::internal)?;
 
     if result.rows_affected() == 0 {
         return Err(ApiError::new(
@@ -2105,16 +2117,22 @@ pub async fn me_delete_linuxdo(
     session: Session,
 ) -> Result<Json<MeLinuxDoResponse>, ApiError> {
     let user_id = require_active_user_id(state.as_ref(), &session).await?;
-    sqlx::query(
-        r#"
+    state
+        .sqlite_writer
+        .write_foreground("linuxdo_connection_unlink", |_| async {
+            sqlx::query(
+                r#"
         DELETE FROM linuxdo_connections
         WHERE user_id = ?
         "#,
-    )
-    .bind(user_id)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+            )
+            .bind(user_id.as_str())
+            .execute(&state.pool)
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(ApiError::internal)?;
 
     Ok(Json(MeLinuxDoResponse {
         available: state.config.linuxdo.is_some(),
@@ -2264,7 +2282,15 @@ pub async fn me_delete_github_connection(
         ));
     }
 
-    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let (writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "github_connection_unlink",
+            crate::sqlite_write::SqliteWritePriority::Foreground,
+        )
+        .await
+        .map_err(ApiError::internal)?;
     sqlx::query(
         r#"
         DELETE FROM github_connections
@@ -2292,6 +2318,7 @@ pub async fn me_delete_github_connection(
     .map_err(ApiError::internal)?;
 
     tx.commit().await.map_err(ApiError::internal)?;
+    drop(writer);
 
     me_get_github_connections(State(state), session).await
 }
@@ -2325,7 +2352,15 @@ pub async fn me_delete_passkey(
         ));
     }
 
-    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let (writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "passkey_delete",
+            crate::sqlite_write::SqliteWritePriority::Foreground,
+        )
+        .await
+        .map_err(ApiError::internal)?;
     sqlx::query(
         r#"
         DELETE FROM user_passkeys
@@ -2367,6 +2402,7 @@ pub async fn me_delete_passkey(
     }
 
     tx.commit().await.map_err(ApiError::internal)?;
+    drop(writer);
 
     me_get_passkeys(State(state), session).await
 }
@@ -21471,6 +21507,80 @@ mod tests {
         .await
         .expect("query last used at");
         assert!(last_used_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn api_key_create_waits_for_foreground_writer_backpressure() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        let held_writer = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "test_api_key_background_pressure",
+                crate::sqlite_write::SqliteWritePriority::Background,
+            )
+            .await
+            .expect("hold sqlite writer");
+        let create_state = state.clone();
+        let session = setup_session(1).await;
+        let create = tokio::spawn(async move {
+            me_create_api_key(
+                State(create_state),
+                session,
+                Json(CreateApiKeyRequest { name: None }),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!create.is_finished(), "API key create bypassed coordinator");
+        drop(held_writer);
+        let created = tokio::time::timeout(std::time::Duration::from_secs(1), create)
+            .await
+            .expect("API key create should finish after writer release")
+            .expect("join API key create")
+            .expect("create API key");
+        assert!(
+            created
+                .0
+                .api_key
+                .starts_with(crate::api_keys::API_KEY_PREFIX)
+        );
+    }
+
+    #[tokio::test]
+    async fn api_key_auth_skips_last_used_touch_while_writer_is_busy() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let Json(created) = me_create_api_key(
+            State(state.clone()),
+            setup_session(1).await,
+            Json(CreateApiKeyRequest { name: None }),
+        )
+        .await
+        .expect("create API key");
+        let held_writer = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "test_api_key_last_used_pressure",
+                crate::sqlite_write::SqliteWritePriority::Background,
+            )
+            .await
+            .expect("hold sqlite writer");
+
+        let user_id = crate::api_keys::authenticate_api_key(state.as_ref(), &created.api_key)
+            .await
+            .expect("authentication should not fail when best-effort touch is skipped");
+        assert_eq!(user_id, test_user_id(1));
+        let last_used_at = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT last_used_at FROM user_api_keys WHERE id = ?",
+        )
+        .bind(created.item.id)
+        .fetch_one(&pool)
+        .await
+        .expect("query last used at");
+        assert!(last_used_at.is_none());
+        drop(held_writer);
     }
 
     #[tokio::test]

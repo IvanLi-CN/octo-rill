@@ -112,16 +112,22 @@ pub async fn register_runtime_owner(state: &AppState) -> Result<()> {
 }
 
 pub async fn unregister_runtime_owner(state: &AppState) -> Result<()> {
-    sqlx::query(
-        r#"
-        DELETE FROM runtime_owners
-        WHERE runtime_owner_id = ?
-        "#,
-    )
-    .bind(state.runtime_owner_id.as_str())
-    .execute(&state.pool)
-    .await
-    .context("failed to unregister runtime owner")?;
+    state
+        .sqlite_writer
+        .write("runtime_owner_unregister", |_| async {
+            sqlx::query(
+                r#"
+                DELETE FROM runtime_owners
+                WHERE runtime_owner_id = ?
+                "#,
+            )
+            .bind(state.runtime_owner_id.as_str())
+            .execute(&state.pool)
+            .await
+            .context("failed to unregister runtime owner")?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?;
     Ok(())
 }
 
@@ -173,18 +179,27 @@ async fn touch_runtime_owner_lease(state: &AppState) -> Result<()> {
 
 async fn prune_stale_runtime_owners(state: &AppState) -> Result<()> {
     let cutoff = stale_cutoff_timestamp(Utc::now());
-    sqlx::query(
-        r#"
-        DELETE FROM runtime_owners
-        WHERE runtime_owner_id != ?
-          AND julianday(lease_heartbeat_at) <= julianday(?)
-        "#,
-    )
-    .bind(state.runtime_owner_id.as_str())
-    .bind(cutoff.as_str())
-    .execute(&state.pool)
-    .await
-    .context("failed to prune stale runtime owners")?;
+    let result = state
+        .sqlite_writer
+        .try_write("runtime_owner_prune", || async {
+            sqlx::query(
+                r#"
+                DELETE FROM runtime_owners
+                WHERE runtime_owner_id != ?
+                  AND julianday(lease_heartbeat_at) <= julianday(?)
+                "#,
+            )
+            .bind(state.runtime_owner_id.as_str())
+            .bind(cutoff.as_str())
+            .execute(&state.pool)
+            .await
+            .context("failed to prune stale runtime owners")?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+    if let Err(err) = result {
+        tracing::warn!(?err, "skipped best-effort stale runtime owner prune");
+    }
     Ok(())
 }
 
