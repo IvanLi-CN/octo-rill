@@ -2,7 +2,7 @@
 
 ## 生命周期
 
-- Lifecycle: superseded(#y2yf8)
+- Lifecycle: superseded
 - Created: 2026-03-27
 - Last: 2026-04-13
 - Superseded by: [../release-translation-input-budget-runtime/SPEC.md](../release-translation-input-budget-runtime/SPEC.md)
