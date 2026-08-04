@@ -88,18 +88,30 @@ pub async fn authenticate_api_key(state: &AppState, api_key: &str) -> Result<Str
     }
 
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE user_api_keys
-        SET last_used_at = ?
-        WHERE id = ?
-        "#,
-    )
-    .bind(now.as_str())
-    .bind(row.id.as_str())
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    let touch_result = state
+        .sqlite_writer
+        .try_write("api_key_last_used", || async {
+            sqlx::query(
+                r#"
+                UPDATE user_api_keys
+                SET last_used_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(now.as_str())
+            .bind(row.id.as_str())
+            .execute(&state.pool)
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+    if let Err(err) = touch_result {
+        tracing::warn!(
+            event = "api_key.last_used",
+            error = %err,
+            "skipped best-effort API key last-used touch"
+        );
+    }
 
     Ok(row.user_id)
 }
