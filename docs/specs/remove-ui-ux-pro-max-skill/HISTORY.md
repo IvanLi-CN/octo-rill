@@ -10,3 +10,4 @@
 
 - 2026-04-18: 建立该主题规格并冻结基础范围。
 - 2026-04-18: 已交付；local implementation completed; removed project-local skill assets and obsolete install spec
+- Legacy trace: 已删除的安装规格曾位于 `docs/specs/ejdn8-uipro-skill-install/SPEC.md`（`#ejdn8`）。
