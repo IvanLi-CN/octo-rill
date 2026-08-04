@@ -8,8 +8,6 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import { useWindowVirtualizer } from "@tanstack/react-virtual";
 import {
-	lazy,
-	Suspense,
 	useCallback,
 	useEffect,
 	useLayoutEffect,
@@ -45,6 +43,7 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
+import { ReleaseFeedCard } from "@/feed/FeedItemCard";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
 import { InternalLink } from "@/lib/internalNavigation";
 import type {
@@ -68,11 +67,6 @@ import { isReactionTokenUsable } from "@/settings/reactionTokenEditor";
 import { cn } from "@/lib/utils";
 import { buildVersionReleaseHref } from "@/version/versionReleaseLink";
 import { useVersionMonitor } from "@/version/versionMonitor";
-
-const ReleaseFeedCard = lazy(async () => {
-	const module = await import("@/feed/FeedItemCard");
-	return { default: module.ReleaseFeedCard };
-});
 
 const PUBLIC_RELEASE_LIST_BODY_MAX_CHARS = 2800;
 const PUBLIC_RELEASE_PAGE_SIZE = 6;
@@ -1338,6 +1332,7 @@ function ReleaseList(props: {
 									lane={props.selectedLane}
 									detailHref={detailHref(row.item)}
 									reactionControls={props.reactionControls}
+									hasHighlightContext={Boolean(props.highlight)}
 								/>
 							)}
 						</div>
@@ -1490,6 +1485,7 @@ function ReleaseVirtualRow(props: {
 	lane: FeedLane;
 	detailHref: string;
 	reactionControls: PublicReleaseReactionControls;
+	hasHighlightContext: boolean;
 }) {
 	const showReactions =
 		props.reactionControls.enabled &&
@@ -1498,49 +1494,47 @@ function ReleaseVirtualRow(props: {
 		? (props.reactionControls.byReleaseId[props.item.release_id] ?? null)
 		: null;
 	const feedItem = publicReleaseToFeedItem(props.item, reactions);
+	const emphasis = !props.hasHighlightContext
+		? "default"
+		: props.item.is_active_highlight
+			? "active-highlight"
+			: props.item.is_highlighted
+				? "highlighted"
+				: "subdued";
 	return (
 		<div
 			tabIndex={props.item.is_active_highlight ? -1 : undefined}
-			className={cn(
-				"scroll-mt-5 rounded-xl outline-none transition-[background-color,box-shadow] duration-200 motion-reduce:transition-none",
-				props.item.is_highlighted && "bg-primary/[0.04] ring-1 ring-primary/30",
-				props.item.is_active_highlight &&
-					"bg-primary/[0.07] ring-2 ring-primary/65 ring-offset-2 ring-offset-background",
-			)}
+			className="scroll-mt-5 rounded-xl outline-none"
 			data-highlighted={props.item.is_highlighted ? "true" : "false"}
 			data-active-highlight={props.item.is_active_highlight ? "true" : "false"}
 			data-release-id={props.item.release_id}
 			data-testid={`public-release-item-${props.item.release_id}`}
 		>
-			<Suspense
-				fallback={<ReleaseCardFallback title={releaseTitle(props.item)} />}
-			>
-				<ReleaseFeedCard
-					item={feedItem}
-					activeLane={props.lane}
-					isTranslating={false}
-					isTranslationAutoRetrying={false}
-					isSmartGenerating={false}
-					isSmartAutoRetrying={false}
-					isReactionBusy={props.reactionControls.busyReleaseIds.has(
-						props.item.release_id,
-					)}
-					reactionError={
-						props.reactionControls.errorByReleaseId[props.item.release_id] ??
-						null
-					}
-					showReactions={showReactions}
-					showRepoIdentity={false}
-					showHeaderActions={false}
-					titleHref={props.detailHref}
-					onSelectLane={() => undefined}
-					onTranslateNow={() => undefined}
-					onSmartNow={() => undefined}
-					onToggleReaction={(content) =>
-						props.reactionControls.onToggle(props.item.release_id, content)
-					}
-				/>
-			</Suspense>
+			<ReleaseFeedCard
+				item={feedItem}
+				activeLane={props.lane}
+				emphasis={emphasis}
+				isTranslating={false}
+				isTranslationAutoRetrying={false}
+				isSmartGenerating={false}
+				isSmartAutoRetrying={false}
+				isReactionBusy={props.reactionControls.busyReleaseIds.has(
+					props.item.release_id,
+				)}
+				reactionError={
+					props.reactionControls.errorByReleaseId[props.item.release_id] ?? null
+				}
+				showReactions={showReactions}
+				showRepoIdentity={false}
+				showHeaderActions={false}
+				titleHref={props.detailHref}
+				onSelectLane={() => undefined}
+				onTranslateNow={() => undefined}
+				onSmartNow={() => undefined}
+				onToggleReaction={(content) =>
+					props.reactionControls.onToggle(props.item.release_id, content)
+				}
+			/>
 		</div>
 	);
 }
@@ -1589,36 +1583,23 @@ function ReleaseDetail({ detail }: { detail: ReleaseDetailResponse }) {
 
 	return (
 		<div className="py-6">
-			<Suspense fallback={<ReleaseCardFallback title={releaseTitle(detail)} />}>
-				<ReleaseFeedCard
-					item={feedItem}
-					activeLane={selectedLane}
-					isTranslating={false}
-					isTranslationAutoRetrying={false}
-					isSmartGenerating={false}
-					isSmartAutoRetrying={false}
-					isReactionBusy={false}
-					reactionError={null}
-					showReactions={false}
-					surface="article"
-					onSelectLane={setSelectedLane}
-					onTranslateNow={() => undefined}
-					onSmartNow={() => undefined}
-					onToggleReaction={() => undefined}
-				/>
-			</Suspense>
+			<ReleaseFeedCard
+				item={feedItem}
+				activeLane={selectedLane}
+				isTranslating={false}
+				isTranslationAutoRetrying={false}
+				isSmartGenerating={false}
+				isSmartAutoRetrying={false}
+				isReactionBusy={false}
+				reactionError={null}
+				showReactions={false}
+				surface="article"
+				onSelectLane={setSelectedLane}
+				onTranslateNow={() => undefined}
+				onSmartNow={() => undefined}
+				onToggleReaction={() => undefined}
+			/>
 		</div>
-	);
-}
-
-function ReleaseCardFallback(props: { title: string }) {
-	return (
-		<Card>
-			<CardHeader>
-				<CardTitle>{props.title}</CardTitle>
-				<CardDescription>正在加载 Release 卡片</CardDescription>
-			</CardHeader>
-		</Card>
 	);
 }
 

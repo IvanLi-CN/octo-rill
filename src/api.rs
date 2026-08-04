@@ -8253,7 +8253,7 @@ pub struct RepoPublicReleasePublicationStatusResponse {
     cache_cleanup: Option<AdminPublicRepoCacheCleanup>,
 }
 
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 struct PublicReleaseRow {
     release_id: i64,
     sort_ts: String,
@@ -10355,6 +10355,73 @@ fn public_release_highlighted_ids(
     }
 }
 
+fn sort_public_release_rows(rows: &mut [PublicReleaseRow]) {
+    rows.sort_by(|left, right| {
+        right
+            .sort_ts
+            .cmp(&left.sort_ts)
+            .then_with(|| right.release_id.cmp(&left.release_id))
+    });
+}
+
+fn dedupe_public_release_rows(rows: Vec<PublicReleaseRow>) -> Vec<PublicReleaseRow> {
+    let mut by_id = HashMap::new();
+    for row in rows {
+        by_id.entry(row.release_id).or_insert(row);
+    }
+    let mut rows = by_id.into_values().collect::<Vec<_>>();
+    sort_public_release_rows(&mut rows);
+    rows
+}
+
+fn select_public_release_focus_rows(
+    rows: Vec<PublicReleaseRow>,
+    highlighted_ids: &HashSet<i64>,
+    ordinal_by_id: &HashMap<i64, i64>,
+    active_ordinal: i64,
+    limit: usize,
+) -> Vec<PublicReleaseRow> {
+    if rows.len() <= limit {
+        return rows;
+    }
+
+    let mut highlighted = rows
+        .iter()
+        .filter(|row| highlighted_ids.contains(&row.release_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_public_release_rows(&mut highlighted);
+    if highlighted.len() >= limit {
+        highlighted.truncate(limit);
+        return highlighted;
+    }
+
+    let mut context = rows
+        .into_iter()
+        .filter(|row| !highlighted_ids.contains(&row.release_id))
+        .collect::<Vec<_>>();
+    context.sort_by(|left, right| {
+        let left_ordinal = ordinal_by_id
+            .get(&left.release_id)
+            .copied()
+            .unwrap_or(i64::MAX);
+        let right_ordinal = ordinal_by_id
+            .get(&right.release_id)
+            .copied()
+            .unwrap_or(i64::MAX);
+        left_ordinal
+            .abs_diff(active_ordinal)
+            .cmp(&right_ordinal.abs_diff(active_ordinal))
+            .then_with(|| left_ordinal.cmp(&right_ordinal))
+            .then_with(|| right.sort_ts.cmp(&left.sort_ts))
+            .then_with(|| right.release_id.cmp(&left.release_id))
+    });
+
+    highlighted.extend(context.into_iter().take(limit - highlighted.len()));
+    sort_public_release_rows(&mut highlighted);
+    highlighted
+}
+
 async fn count_public_release_positions(
     state: &AppState,
     repo_id: i64,
@@ -10562,11 +10629,12 @@ async fn public_list_repo_releases_impl(
             .await?
         }
         Some(PublicReleaseHighlightSpec::Ids(ids)) => {
+            limit = query
+                .limit
+                .unwrap_or(PUBLIC_RELEASE_HIGHLIGHT_WINDOW_LIMIT)
+                .clamp(1, PUBLIC_RELEASE_HIGHLIGHT_WINDOW_LIMIT)
+                .max(ids.len() as i64);
             if cursor.is_some() {
-                limit = query
-                    .limit
-                    .unwrap_or(PUBLIC_RELEASE_HIGHLIGHT_WINDOW_LIMIT)
-                    .clamp(1, PUBLIC_RELEASE_HIGHLIGHT_WINDOW_LIMIT);
                 load_public_release_rows(
                     state.as_ref(),
                     usage.full_name.as_str(),
@@ -10581,8 +10649,8 @@ async fn public_list_repo_releases_impl(
                 )
                 .await?
             } else {
-                limit = ids.len() as i64;
-                load_public_release_rows(
+                let highlighted_ids = ids.iter().copied().collect::<HashSet<_>>();
+                let mut focus_rows = load_public_release_rows(
                     state.as_ref(),
                     usage.full_name.as_str(),
                     repo_id,
@@ -10591,10 +10659,89 @@ async fn public_list_repo_releases_impl(
                     None,
                     None,
                     PublicReleaseCursorDirection::Older,
-                    limit,
+                    ids.len() as i64,
                     content,
                 )
-                .await?
+                .await?;
+                let mut has_more_newer = false;
+                let mut has_more_older = false;
+                if let Some(active_position) = highlight_resolution.active_position.as_ref() {
+                    let newer_rows = load_public_release_rows(
+                        state.as_ref(),
+                        usage.full_name.as_str(),
+                        repo_id,
+                        None,
+                        None,
+                        None,
+                        Some(active_position),
+                        PublicReleaseCursorDirection::Newer,
+                        PUBLIC_RELEASE_HIGHLIGHT_WINDOW_LIMIT.saturating_add(1),
+                        content,
+                    )
+                    .await?;
+                    has_more_newer =
+                        newer_rows.len() > PUBLIC_RELEASE_HIGHLIGHT_WINDOW_LIMIT as usize;
+                    focus_rows.extend(newer_rows);
+
+                    let older_rows = load_public_release_rows(
+                        state.as_ref(),
+                        usage.full_name.as_str(),
+                        repo_id,
+                        None,
+                        None,
+                        None,
+                        Some(active_position),
+                        PublicReleaseCursorDirection::Older,
+                        PUBLIC_RELEASE_HIGHLIGHT_WINDOW_LIMIT.saturating_add(1),
+                        content,
+                    )
+                    .await?;
+                    has_more_older =
+                        older_rows.len() > PUBLIC_RELEASE_HIGHLIGHT_WINDOW_LIMIT as usize;
+                    focus_rows.extend(older_rows);
+                }
+
+                let candidate_rows = dedupe_public_release_rows(focus_rows);
+                let candidate_first_id = candidate_rows.first().map(|row| row.release_id);
+                let candidate_last_id = candidate_rows.last().map(|row| row.release_id);
+                let selected_rows = if candidate_rows.len() > limit as usize {
+                    let selectors = candidate_rows
+                        .iter()
+                        .map(|row| PublicReleaseTypedSelector::Id(row.release_id))
+                        .collect::<Vec<_>>();
+                    let ordinal_by_id =
+                        load_public_release_selector_rows(state.as_ref(), repo_id, &selectors)
+                            .await?
+                            .into_iter()
+                            .map(|row| (row.release_id, row.ordinal))
+                            .collect::<HashMap<_, _>>();
+                    let active_ordinal = highlight_resolution
+                        .active_position
+                        .as_ref()
+                        .and_then(|position| ordinal_by_id.get(&position.release_id))
+                        .copied()
+                        .unwrap_or(0);
+                    select_public_release_focus_rows(
+                        candidate_rows,
+                        &highlighted_ids,
+                        &ordinal_by_id,
+                        active_ordinal,
+                        limit as usize,
+                    )
+                } else {
+                    candidate_rows
+                };
+                if let Some(first) = selected_rows.first()
+                    && (has_more_newer || candidate_first_id != Some(first.release_id))
+                {
+                    recommended_previous_cursor = Some(public_release_cursor(first));
+                }
+                if let Some(last) = selected_rows.last()
+                    && (has_more_older || candidate_last_id != Some(last.release_id))
+                {
+                    recommended_next_cursor = Some(public_release_cursor(last));
+                }
+                selected_rows
             }
         }
         Some(PublicReleaseHighlightSpec::Range { start_id, end_id }) => {
@@ -29618,13 +29765,55 @@ line two",
         assert_eq!(body["highlight"]["active_release_id"], json!("122"));
         assert_eq!(body["highlight"]["active_index"], json!(2));
         assert_eq!(body["highlight"]["unresolved"], json!(["tag:missing"]));
-        assert_eq!(body["items"].as_array().unwrap().len(), 2);
+        assert_eq!(body["items"].as_array().unwrap().len(), 3);
         assert_eq!(body["items"][0]["release_id"], json!("120"));
-        assert_eq!(body["items"][1]["release_id"], json!("122"));
-        assert_eq!(body["items"][1]["is_active_highlight"], json!(true));
+        assert_eq!(body["items"][1]["release_id"], json!("121"));
+        assert_eq!(body["items"][2]["release_id"], json!("122"));
+        assert_eq!(body["items"][2]["is_active_highlight"], json!(true));
         assert!(body["items"][0]["body"].is_string());
-        assert_eq!(body["segments"].as_array().unwrap().len(), 2);
-        assert_eq!(body["gaps"][0]["remaining_count"], json!(1));
+        assert_eq!(body["segments"].as_array().unwrap().len(), 1);
+        assert_eq!(body["gaps"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn public_release_single_discrete_highlight_keeps_list_context() {
+        let pool = setup_pool().await;
+        seed_public_release_usage(&pool, Some(42), "ready").await;
+        for (release_id, published_at) in [
+            (120, "2026-03-20T00:00:00Z"),
+            (121, "2026-03-19T00:00:00Z"),
+            (122, "2026-03-18T00:00:00Z"),
+            (123, "2026-03-17T00:00:00Z"),
+            (124, "2026-03-16T00:00:00Z"),
+        ] {
+            seed_repo_release_at(&pool, 42, release_id, published_at).await;
+        }
+        let state = setup_state(pool);
+
+        let response = public_list_repo_releases_http(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            RawQuery(Some(
+                "content=polished&highlight=id%3A122&highlight_active=id%3A122".to_owned(),
+            )),
+        )
+        .await
+        .expect("single discrete highlight response");
+
+        let body = response_json(response).await;
+        let item_ids = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["release_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(item_ids, vec!["120", "121", "122", "123", "124"]);
+        assert_eq!(body["highlight"]["total"], json!(1));
+        assert_eq!(body["highlight"]["active_release_id"], json!("122"));
+        assert_eq!(body["items"][2]["is_highlighted"], json!(true));
+        assert_eq!(body["items"][2]["is_active_highlight"], json!(true));
+        assert_eq!(body["segments"].as_array().unwrap().len(), 1);
+        assert_eq!(body["gaps"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -29644,7 +29833,9 @@ line two",
         let first = public_list_repo_releases_http(
             State(state.clone()),
             Path(("openai".to_owned(), "codex".to_owned())),
-            RawQuery(Some("highlight=id%3A120&highlight=id%3A122".to_owned())),
+            RawQuery(Some(
+                "highlight=id%3A120&highlight=id%3A122&limit=2".to_owned(),
+            )),
         )
         .await
         .expect("initial discrete window");
