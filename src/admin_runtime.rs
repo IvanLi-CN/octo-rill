@@ -924,6 +924,7 @@ mod tests {
             runtime_owner_id: generate_local_id(),
             pool,
             sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
+            api_key_last_used_touches: crate::api_keys::ApiKeyLastUsedTouchQueue::new(),
             config,
         })
     }

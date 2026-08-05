@@ -21169,6 +21169,7 @@ mod tests {
             config,
             pool,
             sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
+            api_key_last_used_touches: crate::api_keys::ApiKeyLastUsedTouchQueue::new(),
             http: reqwest::Client::new(),
             github_rest_http: reqwest::Client::new(),
             github_rest_api_base: Url::parse("https://api.github.com/")
@@ -21227,6 +21228,7 @@ mod tests {
             config,
             pool,
             sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
+            api_key_last_used_touches: crate::api_keys::ApiKeyLastUsedTouchQueue::new(),
             http: reqwest::Client::new(),
             github_rest_http: reqwest::Client::new(),
             github_rest_api_base: Url::parse("https://api.github.com/")
@@ -21634,7 +21636,7 @@ mod tests {
             .expect("authenticate API key");
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while crate::api_keys::api_key_last_used_touch_is_pending(
-                state.runtime_owner_id.as_str(),
+                state.as_ref(),
                 created.item.id.as_str(),
             ) {
                 tokio::task::yield_now().await;
@@ -21703,16 +21705,34 @@ mod tests {
         crate::api_keys::authenticate_api_key(state_two.as_ref(), &created_two.api_key)
             .await
             .expect("authenticate second API key");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while crate::api_keys::api_key_last_used_touch_is_pending(state_two.as_ref(), shared_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second state's touch should not wait for the first state's writer");
+        let second_last_used_at = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT last_used_at FROM user_api_keys WHERE id = ?",
+        )
+        .bind(shared_id)
+        .fetch_one(&pool_two)
+        .await
+        .expect("query second state's last-used timestamp");
+        assert!(second_last_used_at.is_some());
+
         drop(held_writer);
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 let one_pending = crate::api_keys::api_key_last_used_touch_is_pending(
-                    state_one.runtime_owner_id.as_str(),
+                    state_one.as_ref(),
                     shared_id,
                 );
                 let two_pending = crate::api_keys::api_key_last_used_touch_is_pending(
-                    state_two.runtime_owner_id.as_str(),
+                    state_two.as_ref(),
                     shared_id,
                 );
                 if !one_pending && !two_pending {
