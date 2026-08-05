@@ -26,8 +26,8 @@ use webauthn_rs_core::{
 };
 
 use crate::{
-    ai::LlmScheduler, config::AppConfig, crypto::EncryptionKey, local_id,
-    sqlite_write::SqliteWriteCoordinator, translations::TranslationSchedulerController,
+    ai::LlmScheduler, api_keys::ApiKeyLastUsedTouchQueue, config::AppConfig, crypto::EncryptionKey,
+    local_id, sqlite_write::SqliteWriteCoordinator, translations::TranslationSchedulerController,
 };
 
 pub type GitHubOAuthClient =
@@ -40,6 +40,7 @@ pub struct AppState {
     pub config: AppConfig,
     pub pool: SqlitePool,
     pub sqlite_writer: SqliteWriteCoordinator,
+    pub api_key_last_used_touches: Arc<ApiKeyLastUsedTouchQueue>,
     pub http: reqwest::Client,
     pub github_rest_http: reqwest::Client,
     pub github_rest_api_base: Url,
