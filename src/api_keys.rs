@@ -31,11 +31,17 @@ struct DeferredApiKeyTouch {
     used_at: String,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DeferredApiKeyTouchKey {
+    runtime_owner_id: String,
+    api_key_id: String,
+}
+
 #[derive(Default)]
 struct DeferredApiKeyTouchQueue {
     running: bool,
-    active: Option<String>,
-    pending: HashMap<String, DeferredApiKeyTouch>,
+    active: Option<DeferredApiKeyTouchKey>,
+    pending: HashMap<DeferredApiKeyTouchKey, DeferredApiKeyTouch>,
 }
 
 static DEFERRED_API_KEY_TOUCHES: OnceLock<Mutex<DeferredApiKeyTouchQueue>> = OnceLock::new();
@@ -110,6 +116,7 @@ pub async fn authenticate_api_key(state: &AppState, api_key: &str) -> Result<Str
     }
 
     enqueue_api_key_last_used_touch(
+        state.runtime_owner_id.clone(),
         row.id.clone(),
         chrono::Utc::now().to_rfc3339(),
         state.pool.clone(),
@@ -120,6 +127,7 @@ pub async fn authenticate_api_key(state: &AppState, api_key: &str) -> Result<Str
 }
 
 fn enqueue_api_key_last_used_touch(
+    runtime_owner_id: String,
     api_key_id: String,
     used_at: String,
     pool: SqlitePool,
@@ -134,9 +142,13 @@ fn enqueue_api_key_last_used_touch(
             );
             return;
         };
+        let key = DeferredApiKeyTouchKey {
+            runtime_owner_id,
+            api_key_id,
+        };
         queue
             .pending
-            .entry(api_key_id)
+            .entry(key)
             .and_modify(|pending| {
                 if pending.used_at < used_at {
                     pending.used_at.clone_from(&used_at);
@@ -171,19 +183,16 @@ async fn drain_api_key_last_used_touches() {
                 );
                 return;
             };
-            let Some(api_key_id) = queue.pending.keys().next().cloned() else {
+            let Some(key) = queue.pending.keys().next().cloned() else {
                 queue.running = false;
                 return;
             };
-            let touch = queue
-                .pending
-                .remove(&api_key_id)
-                .expect("pending touch exists");
-            queue.active = Some(api_key_id.clone());
-            (api_key_id, touch)
+            let touch = queue.pending.remove(&key).expect("pending touch exists");
+            queue.active = Some(key.clone());
+            (key, touch)
         };
 
-        let (api_key_id, touch) = next;
+        let (key, touch) = next;
         let touch_result = touch
             .sqlite_writer
             .write("api_key_last_used", |_| async {
@@ -196,7 +205,7 @@ async fn drain_api_key_last_used_touches() {
                     "#,
                 )
                 .bind(touch.used_at.as_str())
-                .bind(api_key_id.as_str())
+                .bind(key.api_key_id.as_str())
                 .bind(touch.used_at.as_str())
                 .execute(&touch.pool)
                 .await?;
@@ -219,12 +228,16 @@ async fn drain_api_key_last_used_touches() {
 }
 
 #[cfg(test)]
-pub fn api_key_last_used_touch_is_pending(api_key_id: &str) -> bool {
+pub fn api_key_last_used_touch_is_pending(runtime_owner_id: &str, api_key_id: &str) -> bool {
+    let key = DeferredApiKeyTouchKey {
+        runtime_owner_id: runtime_owner_id.to_owned(),
+        api_key_id: api_key_id.to_owned(),
+    };
     DEFERRED_API_KEY_TOUCHES
         .get()
         .and_then(|queue| queue.lock().ok())
         .is_some_and(|queue| {
-            queue.active.as_deref() == Some(api_key_id) || queue.pending.contains_key(api_key_id)
+            queue.active.as_ref() == Some(&key) || queue.pending.contains_key(&key)
         })
 }
 

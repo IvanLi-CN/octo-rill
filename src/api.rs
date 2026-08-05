@@ -21633,7 +21633,10 @@ mod tests {
             .await
             .expect("authenticate API key");
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while crate::api_keys::api_key_last_used_touch_is_pending(created.item.id.as_str()) {
+            while crate::api_keys::api_key_last_used_touch_is_pending(
+                state.runtime_owner_id.as_str(),
+                created.item.id.as_str(),
+            ) {
                 tokio::task::yield_now().await;
             }
         })
@@ -21648,6 +21651,89 @@ mod tests {
         .await
         .expect("query monotonic last used at");
         assert_eq!(last_used_at.as_deref(), Some(future_last_used_at));
+    }
+
+    #[tokio::test]
+    async fn api_key_auth_scopes_deferred_touches_to_the_runtime_owner() {
+        let pool_one = setup_pool().await;
+        let pool_two = setup_pool().await;
+        let state_one = setup_state(pool_one.clone());
+        let mut state_two = setup_state(pool_two.clone());
+        Arc::get_mut(&mut state_two)
+            .expect("state is uniquely owned")
+            .runtime_owner_id = "api-test-runtime-owner-two".to_owned();
+        let Json(created_one) = me_create_api_key(
+            State(state_one.clone()),
+            setup_session(1).await,
+            Json(CreateApiKeyRequest { name: None }),
+        )
+        .await
+        .expect("create first API key");
+        let Json(created_two) = me_create_api_key(
+            State(state_two.clone()),
+            setup_session(1).await,
+            Json(CreateApiKeyRequest { name: None }),
+        )
+        .await
+        .expect("create second API key");
+        let shared_id = "shared-api-key-id";
+        for (pool, id) in [
+            (&pool_one, created_one.item.id.as_str()),
+            (&pool_two, created_two.item.id.as_str()),
+        ] {
+            sqlx::query("UPDATE user_api_keys SET id = ? WHERE id = ?")
+                .bind(shared_id)
+                .bind(id)
+                .execute(pool)
+                .await
+                .expect("set shared database-local API key id");
+        }
+        let held_writer = state_one
+            .sqlite_writer
+            .acquire_with_priority(
+                "test_cross_state_api_key_touch",
+                crate::sqlite_write::SqliteWritePriority::Background,
+            )
+            .await
+            .expect("hold first state's writer");
+
+        crate::api_keys::authenticate_api_key(state_one.as_ref(), &created_one.api_key)
+            .await
+            .expect("authenticate first API key");
+        crate::api_keys::authenticate_api_key(state_two.as_ref(), &created_two.api_key)
+            .await
+            .expect("authenticate second API key");
+        drop(held_writer);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let one_pending = crate::api_keys::api_key_last_used_touch_is_pending(
+                    state_one.runtime_owner_id.as_str(),
+                    shared_id,
+                );
+                let two_pending = crate::api_keys::api_key_last_used_touch_is_pending(
+                    state_two.runtime_owner_id.as_str(),
+                    shared_id,
+                );
+                if !one_pending && !two_pending {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both deferred touches should finish");
+
+        for pool in [&pool_one, &pool_two] {
+            let last_used_at = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT last_used_at FROM user_api_keys WHERE id = ?",
+            )
+            .bind(shared_id)
+            .fetch_one(pool)
+            .await
+            .expect("query scoped last-used timestamp");
+            assert!(last_used_at.is_some());
+        }
     }
 
     #[tokio::test]
