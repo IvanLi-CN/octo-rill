@@ -9,7 +9,7 @@ tags:
   - external-dependency
 status: active
 related_specs:
-  - docs/specs/z8vjj-feed-hot-path-reaction-refresh/SPEC.md
+  - docs/specs/feed-hot-path-reaction-refresh/SPEC.md
 ---
 
 # Feed hot path external refresh split
@@ -47,6 +47,6 @@ related_specs:
 
 ## References
 
-- `docs/specs/z8vjj-feed-hot-path-reaction-refresh/SPEC.md`
+- `docs/specs/feed-hot-path-reaction-refresh/SPEC.md`
 - `src/api.rs`
 - `web/src/pages/Dashboard.tsx`

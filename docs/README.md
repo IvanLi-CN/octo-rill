@@ -34,9 +34,9 @@
 
 ### Agent memory / 长期工程记忆
 
-- `docs/specs/<id>-<topic>/SPEC.md`：topic-level 规格与验收语义
-- `docs/specs/<id>-<topic>/IMPLEMENTATION.md`：当前实现状态、验证与落地范围
-- `docs/specs/<id>-<topic>/HISTORY.md`：关键演进原因与后继关系
+- `docs/specs/<topic>/SPEC.md`：topic-level 规格与验收语义
+- `docs/specs/<topic>/IMPLEMENTATION.md`：当前实现状态、验证与落地范围
+- `docs/specs/<topic>/HISTORY.md`：关键演进原因与后继关系
 - `docs/solutions/**`：可复用的工程经验与排障结论（存在时）
 
 ## 按问题找真相
