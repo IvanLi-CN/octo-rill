@@ -21,7 +21,7 @@
 - LLM call insert/event/running/requeue/finalize/heartbeat/recovery 已接入 writer coordinator。
 - LLM call retention cleanup 改为 best-effort writer lane；writer permit 不可得或 SQLite busy 时跳过本轮清理，并留下结构化 `sqlite.write` downgrade 日志，而不是把后台保留任务放大成周期性 warning spam 或主流程失败；完成态额外记录 cutoff、删除行数与 elapsed_ms，便于区分“无事可做”“writer pressure 跳过”“真实慢删除”。
 - runtime owner register/heartbeat 已接入 writer coordinator；`touch_user_last_active_at` 使用非阻塞 best-effort writer 尝试，拿不到 permit 时跳过，SQLite busy/locked 时记录 warning 并继续用户请求。
-- API key 创建/撤销、daily brief profile 更新、LinuxDO/GitHub connection unlink 与 passkey 删除使用 foreground lane；API key `last_used_at` touch 与 stale runtime owner prune 使用 best-effort lane，runtime owner unregister 使用 background lane，避免这些应用内写路径绕过共享 coordinator。
+- API key 创建/撤销、daily brief profile 更新、LinuxDO/GitHub connection unlink 与 passkey 删除使用 foreground lane；API key `last_used_at` touch 在不阻塞认证响应的后台任务中排队到 background lane，stale runtime owner prune 使用 best-effort lane，runtime owner unregister 使用 background lane，避免这些应用内写路径绕过共享 coordinator。
 - feed reaction refresh 的 counts 持久化改为 best-effort writer lane；writer permit 不可得或 SQLite busy 时跳过持久化，但保留 live payload 返回与结构化 warning。
 - repo refresh governance rebuild 已拆成 cleanup、snapshot upsert chunks、terminal member reconciliation chunks、legacy member backfill chunks、snapshot completion 与 cycle reconciliation 阶段；snapshot/member chunk size 固定为 500，并输出 chunk count 与最大 writer chunk elapsed telemetry。
 - subscription sync 的 `sync_subscription_events` 插入已接入 writer coordinator；`repo_release_watchers` / `sync_subscription_events` 历史裁剪改为 best-effort writer lane，在 writer permit 不可得或 SQLite busy 时跳过本轮清理并留下结构化 downgrade 日志。

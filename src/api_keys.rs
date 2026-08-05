@@ -88,30 +88,34 @@ pub async fn authenticate_api_key(state: &AppState, api_key: &str) -> Result<Str
     }
 
     let now = chrono::Utc::now().to_rfc3339();
-    let touch_result = state
-        .sqlite_writer
-        .try_write("api_key_last_used", || async {
-            sqlx::query(
-                r#"
-                UPDATE user_api_keys
-                SET last_used_at = ?
-                WHERE id = ?
-                "#,
-            )
-            .bind(now.as_str())
-            .bind(row.id.as_str())
-            .execute(&state.pool)
-            .await?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .await;
-    if let Err(err) = touch_result {
-        tracing::warn!(
-            event = "api_key.last_used",
-            error = %err,
-            "skipped best-effort API key last-used touch"
-        );
-    }
+    let sqlite_writer = state.sqlite_writer.clone();
+    let pool = state.pool.clone();
+    let api_key_id = row.id.clone();
+    tokio::spawn(async move {
+        let touch_result = sqlite_writer
+            .write("api_key_last_used", |_| async {
+                sqlx::query(
+                    r#"
+                    UPDATE user_api_keys
+                    SET last_used_at = ?
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(now.as_str())
+                .bind(api_key_id.as_str())
+                .execute(&pool)
+                .await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await;
+        if let Err(err) = touch_result {
+            tracing::warn!(
+                event = "api_key.last_used",
+                error = %err,
+                "deferred API key last-used touch failed"
+            );
+        }
+    });
 
     Ok(row.user_id)
 }
