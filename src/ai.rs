@@ -6188,6 +6188,7 @@ mod tests {
             config,
             pool,
             sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
+            api_key_last_used_touches: crate::api_keys::ApiKeyLastUsedTouchQueue::new(),
             http: reqwest::Client::new(),
             github_rest_http: reqwest::Client::new(),
             github_rest_api_base: Url::parse("https://api.github.com/")

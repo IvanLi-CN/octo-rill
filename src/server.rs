@@ -146,6 +146,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         config: config.clone(),
         pool: pool.clone(),
         sqlite_writer,
+        api_key_last_used_touches: crate::api_keys::ApiKeyLastUsedTouchQueue::new(),
         http,
         github_rest_http,
         github_rest_api_base: Url::parse("https://api.github.com/")
@@ -530,6 +531,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     .await;
 
     runtime_owner_heartbeat.stop().await;
+    crate::api_keys::flush_api_key_last_used_touches(app_state.as_ref()).await;
     let unregister_result = runtime::unregister_runtime_owner(app_state.as_ref()).await;
     if let Err(err) = unregister_result {
         if serve_result.is_ok() {
