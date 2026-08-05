@@ -21499,14 +21499,23 @@ mod tests {
         .expect("authenticate api key");
         assert_eq!(resolved, test_user_id(1));
 
-        let last_used_at = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT last_used_at FROM user_api_keys WHERE id = ?",
-        )
-        .bind(created.item.id.as_str())
-        .fetch_one(&pool)
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let last_used_at = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT last_used_at FROM user_api_keys WHERE id = ?",
+                )
+                .bind(created.item.id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("query last used at");
+                if last_used_at.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .expect("query last used at");
-        assert!(last_used_at.is_some());
+        .expect("last-used touch should eventually persist");
     }
 
     #[tokio::test]
@@ -21549,7 +21558,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_key_auth_skips_last_used_touch_while_writer_is_busy() {
+    async fn api_key_auth_defers_last_used_touch_while_writer_is_busy() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         let Json(created) = me_create_api_key(
@@ -21575,12 +21584,30 @@ mod tests {
         let last_used_at = sqlx::query_scalar::<_, Option<String>>(
             "SELECT last_used_at FROM user_api_keys WHERE id = ?",
         )
-        .bind(created.item.id)
+        .bind(created.item.id.as_str())
         .fetch_one(&pool)
         .await
         .expect("query last used at");
         assert!(last_used_at.is_none());
         drop(held_writer);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let last_used_at = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT last_used_at FROM user_api_keys WHERE id = ?",
+                )
+                .bind(created.item.id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("query deferred last used at");
+                if last_used_at.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred last-used touch should eventually persist");
     }
 
     #[tokio::test]
