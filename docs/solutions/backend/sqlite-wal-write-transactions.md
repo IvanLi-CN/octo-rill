@@ -6,9 +6,9 @@ component: jobs, repo-release-queue, translations
 tags: [sqlite, wal, concurrency, jobs]
 status: active
 related_specs:
-  - docs/specs/5prh7-sqlite-writer-coordinator/SPEC.md
-  - docs/specs/s8qkn-subscription-sync/SPEC.md
-  - docs/specs/p8r3l-public-release-endpoints/SPEC.md
+  - docs/specs/sqlite-writer-coordinator/SPEC.md
+  - docs/specs/subscription-sync/SPEC.md
+  - docs/specs/public-release-endpoints/SPEC.md
 ---
 
 # SQLite WAL Write Transactions Under Worker Concurrency
