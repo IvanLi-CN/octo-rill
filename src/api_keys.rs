@@ -1,9 +1,15 @@
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
+
 use axum::http::StatusCode;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::Rng;
 use sha2::{Digest, Sha256};
+use sqlx::SqlitePool;
 
-use crate::{error::ApiError, state::AppState};
+use crate::{error::ApiError, sqlite_write::SqliteWriteCoordinator, state::AppState};
 
 pub const API_KEY_PREFIX: &str = "orill_ak_";
 const API_KEY_RANDOM_BYTES: usize = 32;
@@ -17,6 +23,22 @@ struct ApiKeyAuthRow {
     user_id: String,
     is_disabled: i64,
 }
+
+#[derive(Clone)]
+struct DeferredApiKeyTouch {
+    pool: SqlitePool,
+    sqlite_writer: SqliteWriteCoordinator,
+    used_at: String,
+}
+
+#[derive(Default)]
+struct DeferredApiKeyTouchQueue {
+    running: bool,
+    active: Option<String>,
+    pending: HashMap<String, DeferredApiKeyTouch>,
+}
+
+static DEFERRED_API_KEY_TOUCHES: OnceLock<Mutex<DeferredApiKeyTouchQueue>> = OnceLock::new();
 
 pub fn generate_api_key_plaintext() -> String {
     let mut bytes = [0_u8; API_KEY_RANDOM_BYTES];
@@ -87,23 +109,96 @@ pub async fn authenticate_api_key(state: &AppState, api_key: &str) -> Result<Str
         ));
     }
 
-    let now = chrono::Utc::now().to_rfc3339();
-    let sqlite_writer = state.sqlite_writer.clone();
-    let pool = state.pool.clone();
-    let api_key_id = row.id.clone();
-    tokio::spawn(async move {
-        let touch_result = sqlite_writer
+    enqueue_api_key_last_used_touch(
+        row.id.clone(),
+        chrono::Utc::now().to_rfc3339(),
+        state.pool.clone(),
+        state.sqlite_writer.clone(),
+    );
+
+    Ok(row.user_id)
+}
+
+fn enqueue_api_key_last_used_touch(
+    api_key_id: String,
+    used_at: String,
+    pool: SqlitePool,
+    sqlite_writer: SqliteWriteCoordinator,
+) {
+    let queue = DEFERRED_API_KEY_TOUCHES.get_or_init(|| Mutex::new(Default::default()));
+    let should_spawn = {
+        let Ok(mut queue) = queue.lock() else {
+            tracing::warn!(
+                event = "api_key.last_used",
+                "deferred API key touch queue poisoned"
+            );
+            return;
+        };
+        queue
+            .pending
+            .entry(api_key_id)
+            .and_modify(|pending| {
+                if pending.used_at < used_at {
+                    pending.used_at.clone_from(&used_at);
+                }
+            })
+            .or_insert(DeferredApiKeyTouch {
+                pool,
+                sqlite_writer,
+                used_at,
+            });
+        if queue.running {
+            false
+        } else {
+            queue.running = true;
+            true
+        }
+    };
+
+    if should_spawn {
+        tokio::spawn(drain_api_key_last_used_touches());
+    }
+}
+
+async fn drain_api_key_last_used_touches() {
+    loop {
+        let next = {
+            let queue = DEFERRED_API_KEY_TOUCHES.get_or_init(|| Mutex::new(Default::default()));
+            let Ok(mut queue) = queue.lock() else {
+                tracing::warn!(
+                    event = "api_key.last_used",
+                    "deferred API key touch queue poisoned"
+                );
+                return;
+            };
+            let Some(api_key_id) = queue.pending.keys().next().cloned() else {
+                queue.running = false;
+                return;
+            };
+            let touch = queue
+                .pending
+                .remove(&api_key_id)
+                .expect("pending touch exists");
+            queue.active = Some(api_key_id.clone());
+            (api_key_id, touch)
+        };
+
+        let (api_key_id, touch) = next;
+        let touch_result = touch
+            .sqlite_writer
             .write("api_key_last_used", |_| async {
                 sqlx::query(
                     r#"
                     UPDATE user_api_keys
                     SET last_used_at = ?
                     WHERE id = ?
+                      AND (last_used_at IS NULL OR julianday(last_used_at) < julianday(?))
                     "#,
                 )
-                .bind(now.as_str())
+                .bind(touch.used_at.as_str())
                 .bind(api_key_id.as_str())
-                .execute(&pool)
+                .bind(touch.used_at.as_str())
+                .execute(&touch.pool)
                 .await?;
                 Ok::<(), anyhow::Error>(())
             })
@@ -115,9 +210,22 @@ pub async fn authenticate_api_key(state: &AppState, api_key: &str) -> Result<Str
                 "deferred API key last-used touch failed"
             );
         }
-    });
+        if let Some(queue) = DEFERRED_API_KEY_TOUCHES.get()
+            && let Ok(mut queue) = queue.lock()
+        {
+            queue.active = None;
+        }
+    }
+}
 
-    Ok(row.user_id)
+#[cfg(test)]
+pub fn api_key_last_used_touch_is_pending(api_key_id: &str) -> bool {
+    DEFERRED_API_KEY_TOUCHES
+        .get()
+        .and_then(|queue| queue.lock().ok())
+        .is_some_and(|queue| {
+            queue.active.as_deref() == Some(api_key_id) || queue.pending.contains_key(api_key_id)
+        })
 }
 
 fn invalid_api_key() -> ApiError {
