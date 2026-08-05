@@ -21611,6 +21611,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_key_auth_never_regresses_last_used_at() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let Json(created) = me_create_api_key(
+            State(state.clone()),
+            setup_session(1).await,
+            Json(CreateApiKeyRequest { name: None }),
+        )
+        .await
+        .expect("create API key");
+        let future_last_used_at = "2999-01-01T00:00:00Z";
+        sqlx::query("UPDATE user_api_keys SET last_used_at = ? WHERE id = ?")
+            .bind(future_last_used_at)
+            .bind(created.item.id.as_str())
+            .execute(&pool)
+            .await
+            .expect("seed future last-used timestamp");
+
+        crate::api_keys::authenticate_api_key(state.as_ref(), &created.api_key)
+            .await
+            .expect("authenticate API key");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while crate::api_keys::api_key_last_used_touch_is_pending(created.item.id.as_str()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred last-used touch should finish");
+
+        let last_used_at = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT last_used_at FROM user_api_keys WHERE id = ?",
+        )
+        .bind(created.item.id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("query monotonic last used at");
+        assert_eq!(last_used_at.as_deref(), Some(future_last_used_at));
+    }
+
+    #[tokio::test]
     async fn business_auth_preserves_session_for_non_api_key_authorization_headers() {
         let pool = setup_pool().await;
         let state = setup_state(pool);
