@@ -64,7 +64,7 @@ function RootRouteComponent() {
 		demoWideDocked &&
 		!demoSnapshot.panelLayout.collapsed;
 
-	if (auth.isBootstrapping && auth.bootPresentation === "cold-init") {
+	if (auth.isBootstrapping) {
 		return <AppBoot />;
 	}
 	if (auth.status === "paused" && location.pathname !== "/account/paused") {
@@ -93,7 +93,7 @@ function RootRouteComponent() {
 function RootRouteNotFoundComponent() {
 	const auth = useAuthBootstrap();
 
-	if (auth.isBootstrapping && auth.bootPresentation === "cold-init") {
+	if (auth.isBootstrapping) {
 		return <AppBoot />;
 	}
 

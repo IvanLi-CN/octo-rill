@@ -1,4 +1,4 @@
-import { expect, test, type Route } from "@playwright/test";
+import { expect, test, type Page, type Route } from "@playwright/test";
 
 import { buildMockMeResponse } from "./mockApi";
 
@@ -7,6 +7,59 @@ function json(route: Route, payload: unknown, status = 200) {
 		status,
 		contentType: "application/json",
 		body: JSON.stringify(payload),
+	});
+}
+
+async function installMalformedCompletionEventSource(page: Page) {
+	await page.addInitScript(() => {
+		class MockEventSource {
+			readyState = 1;
+			onerror: ((this: EventSource, event: Event) => unknown) | null = null;
+			private listeners = new Map<
+				string,
+				Set<(event: Event | MessageEvent<string>) => unknown>
+			>();
+			private timers: number[] = [];
+
+			constructor(url: string | URL) {
+				if (!String(url).endsWith("/api/tasks/resume-task/events")) return;
+				this.timers.push(
+					window.setTimeout(() => {
+						if (this.readyState === 2) return;
+						const event = new MessageEvent("task.completed", {
+							data: "not-json",
+						});
+						for (const listener of this.listeners.get("task.completed") ?? []) {
+							listener.call(this as unknown as EventSource, event);
+						}
+					}, 30),
+				);
+			}
+
+			addEventListener(
+				type: string,
+				listener: (event: Event | MessageEvent<string>) => unknown,
+			) {
+				const current = this.listeners.get(type) ?? new Set();
+				current.add(listener);
+				this.listeners.set(type, current);
+			}
+
+			removeEventListener(
+				type: string,
+				listener: (event: Event | MessageEvent<string>) => unknown,
+			) {
+				this.listeners.get(type)?.delete(listener);
+			}
+
+			close() {
+				this.readyState = 2;
+				for (const timer of this.timers) window.clearTimeout(timer);
+				this.timers = [];
+			}
+		}
+
+		window.EventSource = MockEventSource as unknown as typeof EventSource;
 	});
 }
 
@@ -58,4 +111,50 @@ test("paused session enters account recovery from GET /api/me", async ({
 	expect(apiPaths).toContain("/api/me");
 	expect(apiPaths).not.toContain("/api/account/status");
 	expect(apiPaths).not.toContain("/api/feed");
+});
+
+test("malformed resume completion event becomes a retryable failure", async ({
+	page,
+}) => {
+	await installMalformedCompletionEventSource(page);
+
+	await page.route("**/api/**", async (route) => {
+		const request = route.request();
+		const pathname = new URL(request.url()).pathname;
+		if (request.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse({
+					id: "2f4k7m9p3x6c8v2a",
+					github_user_id: 10,
+					login: "octo-member",
+					name: "Octo Member",
+					avatar_url: null,
+					email: "member@example.com",
+					is_admin: false,
+					account_status: "paused",
+					paused_at: "2026-08-06T03:15:00+08:00",
+				}),
+			);
+		}
+		if (request.method() === "POST" && pathname === "/api/me/resume") {
+			return json(route, {
+				status: "enabled",
+				access_sync: {
+					task_id: "resume-task",
+					task_type: "sync.access_refresh",
+					event_path: "/api/tasks/resume-task/events",
+					reason: "account_resumed",
+				},
+				sync_enqueue_error: null,
+			});
+		}
+		return json(route, { error: { code: "unexpected_api" } }, 404);
+	});
+
+	await page.goto("/");
+	await page.getByRole("button", { name: "恢复账号" }).click();
+
+	await expect(page.getByText("访问同步事件无效，请重试。")).toBeVisible();
+	await expect(page.getByRole("button", { name: "重试同步" })).toBeVisible();
 });
