@@ -27,6 +27,7 @@ import type {
 	DemoModel,
 	DemoPersonaId,
 	DemoPublicationState,
+	DemoSceneId,
 } from "@/demo/types";
 
 function svgAvatarDataUrl(
@@ -61,6 +62,7 @@ const DOCS_REPO_VISUAL = buildRepoVisual("DS", "#0f766e");
 function buildMe(
 	personaId: DemoPersonaId,
 	includeOwnReleases: boolean,
+	accountStatus: "enabled" | "paused" = "enabled",
 ): MeResponse | null {
 	if (personaId === "guest") {
 		return null;
@@ -80,6 +82,9 @@ function buildMe(
 			),
 			email: isAdmin ? "admin@octo.demo" : "member@octo.demo",
 			is_admin: isAdmin,
+			account_status: accountStatus,
+			paused_at:
+				accountStatus === "paused" ? "2026-06-08T03:15:00+08:00" : null,
 		},
 		access_sync: {
 			task_id: null,
@@ -562,6 +567,8 @@ function buildAdminUsers(): AdminUserItem[] {
 			email: "admin@octo.demo",
 			is_admin: true,
 			is_disabled: false,
+			paused_at: null,
+			account_status: "enabled",
 			repo_total: 48,
 			include_own_releases: true,
 			last_active_at: "2026-07-08T09:58:00+08:00",
@@ -577,6 +584,8 @@ function buildAdminUsers(): AdminUserItem[] {
 			email: "member@octo.demo",
 			is_admin: false,
 			is_disabled: false,
+			paused_at: null,
+			account_status: "enabled",
 			repo_total: 21,
 			include_own_releases: false,
 			last_active_at: "2026-07-08T09:26:00+08:00",
@@ -592,11 +601,30 @@ function buildAdminUsers(): AdminUserItem[] {
 			email: "paused@octo.demo",
 			is_admin: false,
 			is_disabled: true,
+			paused_at: null,
+			account_status: "disabled",
 			repo_total: 3,
 			include_own_releases: false,
 			last_active_at: null,
 			created_at: "2026-05-20T12:00:00+08:00",
 			updated_at: "2026-07-06T11:20:00+08:00",
+		},
+		{
+			id: "paused-user",
+			github_user_id: 10,
+			login: "octo-paused",
+			name: "Paused Member",
+			avatar_url: null,
+			email: "paused@octo.demo",
+			is_admin: false,
+			is_disabled: false,
+			paused_at: "2026-06-08T03:15:00+08:00",
+			account_status: "paused",
+			repo_total: 0,
+			include_own_releases: false,
+			last_active_at: "2026-05-08T10:00:00+08:00",
+			created_at: "2026-04-20T12:00:00+08:00",
+			updated_at: "2026-06-08T03:15:00+08:00",
 		},
 	];
 }
@@ -952,11 +980,16 @@ function buildAdminJobsStream(): {
 }
 
 export function buildDemoModel(input: {
+	sceneId: DemoSceneId;
 	personaId: DemoPersonaId;
 	includeOwnReleases: boolean;
 	publicationState: DemoPublicationState;
 }): DemoModel {
-	const me = buildMe(input.personaId, input.includeOwnReleases);
+	const me = buildMe(
+		input.personaId,
+		input.includeOwnReleases,
+		input.sceneId === "paused-account-resume" ? "paused" : "enabled",
+	);
 	const profile = buildProfile(me, input.includeOwnReleases);
 	const adminUsers = buildAdminUsers();
 	const adminUserProfiles = buildAdminUserProfiles(adminUsers);

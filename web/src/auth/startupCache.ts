@@ -70,7 +70,7 @@ export type AdminUsersWarmSnapshot = {
 	queryInput: string;
 	query: string;
 	role: "all" | "admin" | "user";
-	status: "all" | "enabled" | "disabled";
+	status: "all" | "enabled" | "paused" | "disabled";
 	page: number;
 	items: AdminUsersWarmItem[];
 	total: number;

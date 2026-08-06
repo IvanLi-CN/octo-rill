@@ -420,6 +420,8 @@ pub async fn backfill_legacy_daily_brief_preferences(state: &AppState) -> Result
         r#"
         SELECT id, daily_brief_local_time, daily_brief_time_zone, daily_brief_utc_time
         FROM users
+        WHERE is_disabled = 0
+          AND paused_at IS NULL
         ORDER BY id ASC
         "#,
     )

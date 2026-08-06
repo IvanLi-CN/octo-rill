@@ -1,5 +1,16 @@
-import { lazy, type CSSProperties, type ReactNode, Suspense } from "react";
-import { createRootRoute, Outlet } from "@tanstack/react-router";
+import {
+	lazy,
+	type CSSProperties,
+	type ReactNode,
+	Suspense,
+	useEffect,
+} from "react";
+import {
+	createRootRoute,
+	Outlet,
+	useLocation,
+	useRouter,
+} from "@tanstack/react-router";
 
 import { useAuthBootstrap } from "@/auth/AuthBootstrap";
 import {
@@ -16,6 +27,7 @@ import {
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import { AppBoot } from "@/pages/AppBoot";
 import { NotFoundPage } from "@/pages/NotFound";
+import { PausedAccountPage } from "@/pages/PausedAccount";
 
 const LazyDemoInspector = lazy(async () => {
 	const module = await import("@/demo/DemoInspector");
@@ -31,16 +43,32 @@ export const Route = createRootRoute({
 
 function RootRouteComponent() {
 	const auth = useAuthBootstrap();
+	const location = useLocation();
+	const router = useRouter();
 	const demoSnapshot = useDemoSnapshot();
+
+	useEffect(() => {
+		if (auth.status !== "paused" || location.pathname === "/account/paused") {
+			return;
+		}
+		void router.navigate({ to: "/account/paused", replace: true });
+	}, [auth.status, location.pathname, router]);
 	const demoWideDocked = useMediaQuery(
 		`(min-width: ${DEMO_INSPECTOR_DOCKED_BREAKPOINT_PX}px)`,
 	);
 	const demoActive = isDemoMode() || shouldPrepareDemoRuntime();
+	const demoControlsHidden = demoSnapshot.shareState.controlsHidden;
 	const showWideDockedLayout =
-		demoActive && demoWideDocked && !demoSnapshot.panelLayout.collapsed;
+		demoActive &&
+		!demoControlsHidden &&
+		demoWideDocked &&
+		!demoSnapshot.panelLayout.collapsed;
 
 	if (auth.isBootstrapping && auth.bootPresentation === "cold-init") {
 		return <AppBoot />;
+	}
+	if (auth.status === "paused" && location.pathname !== "/account/paused") {
+		return <PausedAccountPage />;
 	}
 
 	return (
@@ -55,7 +83,9 @@ function RootRouteComponent() {
 			>
 				<Outlet />
 			</DemoRootFrame>
-			{showWideDockedLayout ? null : <DemoInspectorMount />}
+			{showWideDockedLayout || demoControlsHidden ? null : (
+				<DemoInspectorMount />
+			)}
 		</>
 	);
 }

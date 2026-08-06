@@ -76,7 +76,7 @@ import {
 } from "@/components/ui/sheet";
 
 type AdminRole = "all" | "admin" | "user";
-type AdminStatus = "all" | "enabled" | "disabled";
+type AdminStatus = "all" | "enabled" | "paused" | "disabled";
 
 export type AdminUserItem = {
 	id: LocalUserId;
@@ -87,6 +87,8 @@ export type AdminUserItem = {
 	email: string | null;
 	is_admin: boolean;
 	is_disabled: boolean;
+	paused_at?: string | null;
+	account_status?: "enabled" | "paused" | "disabled";
 	repo_total: number;
 	include_own_releases: boolean;
 	last_active_at: string | null;
@@ -135,8 +137,17 @@ const ROLE_OPTIONS: Array<{ value: AdminRole; label: string }> = [
 const STATUS_OPTIONS: Array<{ value: AdminStatus; label: string }> = [
 	{ value: "all", label: "状态：全部" },
 	{ value: "enabled", label: "状态：启用" },
+	{ value: "paused", label: "状态：暂停" },
 	{ value: "disabled", label: "状态：禁用" },
 ];
+
+function accountStatusLabel(
+	status: AdminUserItem["account_status"],
+	isDisabled = false,
+) {
+	if (isDisabled || status === "disabled") return "已禁用";
+	return status === "paused" ? "已暂停" : "已启用";
+}
 
 function formatLocalDateTime(value: string | null | undefined) {
 	if (!value) return "-";
@@ -286,7 +297,10 @@ export function UserManagement({
 					res.guard ?? {
 						admin_total: res.items.filter((item) => item.is_admin).length,
 						active_admin_total: res.items.filter(
-							(item) => item.is_admin && !item.is_disabled,
+							(item) =>
+								item.is_admin &&
+								!item.is_disabled &&
+								item.account_status !== "paused",
 						).length,
 					},
 				);
@@ -644,6 +658,7 @@ export function UserManagement({
 										const isLastActiveAdmin =
 											user.is_admin &&
 											!user.is_disabled &&
+											user.account_status !== "paused" &&
 											guardSummary.active_admin_total <= 1;
 										const adminActionBlocked = user.is_admin
 											? isLastAdmin || isLastActiveAdmin
@@ -722,13 +737,17 @@ export function UserManagement({
 															className="text-muted-foreground truncate text-xs whitespace-nowrap"
 															title={
 																guardHint
-																	? `${user.is_disabled ? "已禁用" : "已启用"} · ${guardHint}`
-																	: user.is_disabled
-																		? "已禁用"
-																		: "已启用"
+																	? `${accountStatusLabel(user.account_status, user.is_disabled)} · ${guardHint}`
+																	: accountStatusLabel(
+																			user.account_status,
+																			user.is_disabled,
+																		)
 															}
 														>
-															{user.is_disabled ? "已禁用" : "已启用"}
+															{accountStatusLabel(
+																user.account_status,
+																user.is_disabled,
+															)}
 															{guardHint ? ` · ${guardHint}` : ""}
 														</p>
 													</div>
@@ -916,8 +935,11 @@ export function UserManagement({
 							<div className="rounded-lg border p-3">
 								<p className="text-muted-foreground text-xs">账号状态</p>
 								<p className="mt-1 font-medium">
-									{profileUser?.is_disabled ? "已禁用" : "已启用"} ·{" "}
-									{profileUser?.is_admin ? "管理员" : "普通用户"} ·
+									{accountStatusLabel(
+										profileUser?.account_status,
+										profileUser?.is_disabled,
+									)}{" "}
+									· {profileUser?.is_admin ? "管理员" : "普通用户"} ·
 									有效关注仓库数 {profileUser?.repo_total ?? 0}
 								</p>
 								<p className="text-muted-foreground mt-1 text-xs">
