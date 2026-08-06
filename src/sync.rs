@@ -5297,6 +5297,137 @@ where
     Ok((deleted, batches, false))
 }
 
+async fn reconcile_repo_refresh_governance_terminal_member_rowids(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    rowids: &[i64],
+    now_rfc3339: &str,
+) -> Result<u64> {
+    let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        r#"
+        UPDATE repo_refresh_governance_cycle_members
+        SET completed_at = COALESCE(
+              completed_at,
+              (
+                SELECT COALESCE(work_items.finished_at, work_items.updated_at)
+                FROM repo_release_work_items work_items
+                JOIN repo_refresh_governance_snapshots snapshots
+                  ON snapshots.repo_id = repo_refresh_governance_cycle_members.repo_id
+                 AND snapshots.active_cycle_id = repo_refresh_governance_cycle_members.cycle_id
+                WHERE work_items.repo_id = repo_refresh_governance_cycle_members.repo_id
+                  AND work_items.status IN ('succeeded', 'failed')
+                  AND snapshots.system_last_selected_at IS NOT NULL
+                  AND julianday(COALESCE(work_items.finished_at, work_items.updated_at))
+                      >= julianday(snapshots.system_last_selected_at)
+                ORDER BY julianday(COALESCE(work_items.finished_at, work_items.updated_at)) ASC
+                LIMIT 1
+              )
+            ),
+            attempt_status = COALESCE(
+              attempt_status,
+              (
+                SELECT work_items.status
+                FROM repo_release_work_items work_items
+                JOIN repo_refresh_governance_snapshots snapshots
+                  ON snapshots.repo_id = repo_refresh_governance_cycle_members.repo_id
+                 AND snapshots.active_cycle_id = repo_refresh_governance_cycle_members.cycle_id
+                WHERE work_items.repo_id = repo_refresh_governance_cycle_members.repo_id
+                  AND work_items.status IN ('succeeded', 'failed')
+                  AND snapshots.system_last_selected_at IS NOT NULL
+                  AND julianday(COALESCE(work_items.finished_at, work_items.updated_at))
+                      >= julianday(snapshots.system_last_selected_at)
+                ORDER BY julianday(COALESCE(work_items.finished_at, work_items.updated_at)) ASC
+                LIMIT 1
+              )
+            ),
+            attempt_error = COALESCE(
+              attempt_error,
+              (
+                SELECT work_items.error_text
+                FROM repo_release_work_items work_items
+                JOIN repo_refresh_governance_snapshots snapshots
+                  ON snapshots.repo_id = repo_refresh_governance_cycle_members.repo_id
+                 AND snapshots.active_cycle_id = repo_refresh_governance_cycle_members.cycle_id
+                WHERE work_items.repo_id = repo_refresh_governance_cycle_members.repo_id
+                  AND work_items.status IN ('succeeded', 'failed')
+                  AND snapshots.system_last_selected_at IS NOT NULL
+                  AND julianday(COALESCE(work_items.finished_at, work_items.updated_at))
+                      >= julianday(snapshots.system_last_selected_at)
+                ORDER BY julianday(COALESCE(work_items.finished_at, work_items.updated_at)) ASC
+                LIMIT 1
+              )
+            ),
+            updated_at =
+        "#,
+    );
+    builder.push_bind(now_rfc3339);
+    builder.push(
+        r#"
+        WHERE completed_at IS NULL
+          AND EXISTS (
+            SELECT 1
+            FROM repo_refresh_governance_cycles cycles
+            WHERE cycles.id = repo_refresh_governance_cycle_members.cycle_id
+              AND cycles.status = 'active'
+          )
+          AND rowid IN (
+        "#,
+    );
+    {
+        let mut separated = builder.separated(", ");
+        for rowid in rowids {
+            separated.push_bind(rowid);
+        }
+    }
+    builder.push(")");
+    builder
+        .build()
+        .execute(&mut **tx)
+        .await
+        .context("reconcile completed repo refresh governance attempts")
+        .map(|result| result.rows_affected())
+}
+
+async fn backfill_repo_refresh_governance_legacy_member_rowids(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    rowids: &[i64],
+    now_rfc3339: &str,
+) -> Result<u64> {
+    let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        r#"
+        UPDATE repo_refresh_governance_cycle_members
+        SET attempt_status = 'succeeded',
+            updated_at =
+        "#,
+    );
+    builder.push_bind(now_rfc3339);
+    builder.push(
+        r#"
+        WHERE completed_at IS NOT NULL
+          AND attempt_status IS NULL
+          AND EXISTS (
+            SELECT 1
+            FROM repo_refresh_governance_cycles cycles
+            WHERE cycles.id = repo_refresh_governance_cycle_members.cycle_id
+              AND cycles.status = 'active'
+          )
+          AND rowid IN (
+        "#,
+    );
+    {
+        let mut separated = builder.separated(", ");
+        for rowid in rowids {
+            separated.push_bind(rowid);
+        }
+    }
+    builder.push(")");
+    builder
+        .build()
+        .execute(&mut **tx)
+        .await
+        .context("backfill completed repo refresh governance attempt statuses")
+        .map(|result| result.rows_affected())
+}
+
 async fn count_completed_repo_refresh_governance_cycle_members(state: &AppState) -> Result<i64> {
     sqlx::query_scalar(
         r#"
@@ -5469,95 +5600,28 @@ async fn rebuild_repo_refresh_governance_snapshots(
         let chunk_started = Instant::now();
         state
             .sqlite_writer
-            .write("repo_refresh_governance_reconcile_members_chunk", |_| async {
-                let mut tx = state
-                    .pool
-                    .begin_with("BEGIN IMMEDIATE")
-                    .await
-                    .context("begin repo refresh governance member reconcile tx")?;
+            .write(
+                "repo_refresh_governance_reconcile_members_chunk",
+                |_| async {
+                    let mut tx = state
+                        .pool
+                        .begin_with("BEGIN IMMEDIATE")
+                        .await
+                        .context("begin repo refresh governance member reconcile tx")?;
 
-                let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-                    r#"
-                UPDATE repo_refresh_governance_cycle_members
-                SET completed_at = COALESCE(
-                      completed_at,
-                      (
-                        SELECT COALESCE(work_items.finished_at, work_items.updated_at)
-                        FROM repo_release_work_items work_items
-                        JOIN repo_refresh_governance_snapshots snapshots
-                          ON snapshots.repo_id = repo_refresh_governance_cycle_members.repo_id
-                         AND snapshots.active_cycle_id = repo_refresh_governance_cycle_members.cycle_id
-                        WHERE work_items.repo_id = repo_refresh_governance_cycle_members.repo_id
-                          AND work_items.status IN ('succeeded', 'failed')
-                          AND snapshots.system_last_selected_at IS NOT NULL
-                          AND julianday(COALESCE(work_items.finished_at, work_items.updated_at))
-                              >= julianday(snapshots.system_last_selected_at)
-                        ORDER BY julianday(COALESCE(work_items.finished_at, work_items.updated_at)) ASC
-                        LIMIT 1
-                      )
-                    ),
-                    attempt_status = COALESCE(
-                      attempt_status,
-                      (
-                        SELECT work_items.status
-                        FROM repo_release_work_items work_items
-                        JOIN repo_refresh_governance_snapshots snapshots
-                          ON snapshots.repo_id = repo_refresh_governance_cycle_members.repo_id
-                         AND snapshots.active_cycle_id = repo_refresh_governance_cycle_members.cycle_id
-                        WHERE work_items.repo_id = repo_refresh_governance_cycle_members.repo_id
-                          AND work_items.status IN ('succeeded', 'failed')
-                          AND snapshots.system_last_selected_at IS NOT NULL
-                          AND julianday(COALESCE(work_items.finished_at, work_items.updated_at))
-                              >= julianday(snapshots.system_last_selected_at)
-                        ORDER BY julianday(COALESCE(work_items.finished_at, work_items.updated_at)) ASC
-                        LIMIT 1
-                      )
-                    ),
-                    attempt_error = COALESCE(
-                      attempt_error,
-                      (
-                        SELECT work_items.error_text
-                        FROM repo_release_work_items work_items
-                        JOIN repo_refresh_governance_snapshots snapshots
-                          ON snapshots.repo_id = repo_refresh_governance_cycle_members.repo_id
-                         AND snapshots.active_cycle_id = repo_refresh_governance_cycle_members.cycle_id
-                        WHERE work_items.repo_id = repo_refresh_governance_cycle_members.repo_id
-                          AND work_items.status IN ('succeeded', 'failed')
-                          AND snapshots.system_last_selected_at IS NOT NULL
-                          AND julianday(COALESCE(work_items.finished_at, work_items.updated_at))
-                              >= julianday(snapshots.system_last_selected_at)
-                        ORDER BY julianday(COALESCE(work_items.finished_at, work_items.updated_at)) ASC
-                        LIMIT 1
-                      )
-                    ),
-                    updated_at =
-                "#,
-                );
-                builder.push_bind(now_rfc3339.as_str());
-                builder.push(
-                    r#"
-                WHERE completed_at IS NULL
-                  AND rowid IN (
-                "#,
-                );
-                {
-                    let mut separated = builder.separated(", ");
-                    for rowid in rowid_chunk {
-                        separated.push_bind(rowid);
-                    }
-                }
-                builder.push(")");
-                builder
-                    .build()
-                    .execute(&mut *tx)
-                    .await
-                    .context("reconcile completed repo refresh governance attempts")?;
+                    reconcile_repo_refresh_governance_terminal_member_rowids(
+                        &mut tx,
+                        rowid_chunk,
+                        now_rfc3339.as_str(),
+                    )
+                    .await?;
 
-                tx.commit()
-                    .await
-                    .context("commit repo refresh governance member reconcile tx")?;
-                Ok::<_, anyhow::Error>(())
-            })
+                    tx.commit()
+                        .await
+                        .context("commit repo refresh governance member reconcile tx")?;
+                    Ok::<_, anyhow::Error>(())
+                },
+            )
             .await?;
         stats.terminal_member_reconcile_chunks += 1;
         record_repo_refresh_governance_writer_chunk(&mut stats, chunk_started.elapsed());
@@ -5577,33 +5641,12 @@ async fn rebuild_repo_refresh_governance_snapshots(
                         .await
                         .context("begin legacy repo refresh governance member backfill tx")?;
 
-                    let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-                        r#"
-                UPDATE repo_refresh_governance_cycle_members
-                SET attempt_status = 'succeeded',
-                    updated_at =
-                "#,
-                    );
-                    builder.push_bind(now_rfc3339.as_str());
-                    builder.push(
-                        r#"
-                WHERE completed_at IS NOT NULL
-                  AND attempt_status IS NULL
-                  AND rowid IN (
-                "#,
-                    );
-                    {
-                        let mut separated = builder.separated(", ");
-                        for rowid in rowid_chunk {
-                            separated.push_bind(rowid);
-                        }
-                    }
-                    builder.push(")");
-                    builder
-                        .build()
-                        .execute(&mut *tx)
-                        .await
-                        .context("backfill completed repo refresh governance attempt statuses")?;
+                    backfill_repo_refresh_governance_legacy_member_rowids(
+                        &mut tx,
+                        rowid_chunk,
+                        now_rfc3339.as_str(),
+                    )
+                    .await?;
 
                     tx.commit()
                         .await
@@ -12042,28 +12085,221 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn governance_retention_caps_each_maintenance_run_at_50k_rows() {
-        let calls = Arc::new(tokio::sync::Mutex::new(0_usize));
+    async fn governance_retention_caps_existing_backlog_at_50k_rows_per_run() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        const TOTAL_MEMBERS: i64 = 50_001;
+        sqlx::query(
+            r#"
+            INSERT INTO repo_refresh_governance_cycles (
+              id, status, window_budget, frozen_repo_count, completed_repo_count,
+              window_index_started_at, window_index_completed_at, started_at, completed_at, updated_at
+            ) VALUES (?, 'completed', 1000, ?, ?, 2954976, 2954977, ?, ?, ?)
+            "#,
+        )
+        .bind("completed-cycle-production-scale")
+        .bind(TOTAL_MEMBERS)
+        .bind(TOTAL_MEMBERS)
+        .bind("2026-03-06T11:00:00Z")
+        .bind("2026-03-06T11:10:00Z")
+        .bind("2026-03-06T11:10:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed production-scale retention cycle");
+
+        for first_repo_id in (1..=TOTAL_MEMBERS).step_by(500) {
+            let last_repo_id = (first_repo_id + 499).min(TOTAL_MEMBERS);
+            let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                r#"
+                INSERT INTO repo_refresh_governance_cycle_members (
+                  cycle_id, repo_id, repo_full_name, completed_at, updated_at
+                )
+                "#,
+            );
+            builder.push_values(first_repo_id..=last_repo_id, |mut row, repo_id| {
+                row.push_bind("completed-cycle-production-scale")
+                    .push_bind(repo_id)
+                    .push_bind(format!("octo/production-scale-{repo_id}"))
+                    .push_bind("2026-03-06T11:10:00Z")
+                    .push_bind("2026-03-06T11:10:00Z");
+            });
+            builder
+                .build()
+                .execute(&pool)
+                .await
+                .expect("seed production-scale retention members");
+        }
+
         let (deleted, batches, yielded) =
             super::execute_repo_refresh_governance_retention_batches({
-                let calls = calls.clone();
+                let state = state.clone();
                 move || {
-                    let calls = calls.clone();
+                    let state = state.clone();
                     async move {
-                        *calls.lock().await += 1;
-                        Ok::<_, anyhow::Error>(
-                            super::RepoRefreshGovernanceRetentionOutcome::Deleted(500),
-                        )
+                        super::prune_completed_repo_refresh_governance_cycle_members(state.as_ref())
+                            .await
                     }
                 }
             })
             .await
-            .expect("execute bounded retention batches");
+            .expect("prune production-scale retention backlog");
 
         assert_eq!(deleted, 50_000);
         assert_eq!(batches, 100);
         assert!(!yielded);
-        assert_eq!(*calls.lock().await, 100);
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM repo_refresh_governance_cycle_members WHERE cycle_id = ?",
+        )
+        .bind("completed-cycle-production-scale")
+        .fetch_one(&pool)
+        .await
+        .expect("count production-scale retention remainder");
+        let summary_members: i64 = sqlx::query_scalar(
+            "SELECT completed_repo_count FROM repo_refresh_governance_cycles WHERE id = ?",
+        )
+        .bind("completed-cycle-production-scale")
+        .fetch_one(&pool)
+        .await
+        .expect("load retained production-scale cycle summary");
+        assert_eq!(remaining, 1);
+        assert_eq!(summary_members, TOTAL_MEMBERS);
+    }
+
+    #[tokio::test]
+    async fn governance_reconciliation_skips_cycle_completed_after_rowid_load() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_repo_refresh_governance_active_member(&pool, 420, "octo/transition-race").await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "transition-race-terminal-work",
+                repo_id: 420,
+                repo_full_name: "octo/transition-race",
+                status: jobs::STATUS_SUCCEEDED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 1,
+                last_candidate_failures: 0,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        sqlx::query(
+            "UPDATE repo_release_work_items SET finished_at = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind("2026-03-06T12:06:00Z")
+        .bind("2026-03-06T12:06:00Z")
+        .bind("transition-race-terminal-work")
+        .execute(&pool)
+        .await
+        .expect("mark transition-race work terminal");
+
+        let rowids = super::load_repo_refresh_governance_terminal_member_rowids(state.as_ref())
+            .await
+            .expect("load active-cycle reconciliation rowids");
+        assert_eq!(rowids.len(), 1);
+        sqlx::query(
+            "UPDATE repo_refresh_governance_cycles SET status = 'completed', completed_at = ? WHERE id = ?",
+        )
+        .bind("2026-03-06T12:07:00Z")
+        .bind("cycle-governance-test")
+        .execute(&pool)
+        .await
+        .expect("complete cycle after rowid load");
+
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin transition-race reconciliation tx");
+        let updated = super::reconcile_repo_refresh_governance_terminal_member_rowids(
+            &mut tx,
+            &rowids,
+            "2026-03-06T12:08:00Z",
+        )
+        .await
+        .expect("reconcile transition-race member");
+        tx.commit()
+            .await
+            .expect("commit transition-race reconciliation tx");
+
+        let member: (Option<String>, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT completed_at, attempt_status
+            FROM repo_refresh_governance_cycle_members
+            WHERE cycle_id = ? AND repo_id = ?
+            "#,
+        )
+        .bind("cycle-governance-test")
+        .bind(420_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("load preserved completed-cycle member");
+        assert_eq!(updated, 0);
+        assert_eq!(member, (None, None));
+    }
+
+    #[tokio::test]
+    async fn governance_legacy_backfill_skips_cycle_completed_after_rowid_load() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_repo_refresh_governance_active_member(&pool, 421, "octo/legacy-transition-race").await;
+        sqlx::query(
+            r#"
+            UPDATE repo_refresh_governance_cycle_members
+            SET completed_at = ?
+            WHERE cycle_id = ? AND repo_id = ?
+            "#,
+        )
+        .bind("2026-03-06T12:06:00Z")
+        .bind("cycle-governance-test")
+        .bind(421_i64)
+        .execute(&pool)
+        .await
+        .expect("seed legacy completed member");
+
+        let rowids = super::load_repo_refresh_governance_legacy_member_rowids(state.as_ref())
+            .await
+            .expect("load active-cycle legacy rowids");
+        assert_eq!(rowids.len(), 1);
+        sqlx::query(
+            "UPDATE repo_refresh_governance_cycles SET status = 'completed', completed_at = ? WHERE id = ?",
+        )
+        .bind("2026-03-06T12:07:00Z")
+        .bind("cycle-governance-test")
+        .execute(&pool)
+        .await
+        .expect("complete legacy cycle after rowid load");
+
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin legacy transition-race backfill tx");
+        let updated = super::backfill_repo_refresh_governance_legacy_member_rowids(
+            &mut tx,
+            &rowids,
+            "2026-03-06T12:08:00Z",
+        )
+        .await
+        .expect("backfill transition-race member");
+        tx.commit()
+            .await
+            .expect("commit legacy transition-race backfill tx");
+
+        let attempt_status: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT attempt_status
+            FROM repo_refresh_governance_cycle_members
+            WHERE cycle_id = ? AND repo_id = ?
+            "#,
+        )
+        .bind("cycle-governance-test")
+        .bind(421_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("load preserved legacy completed-cycle member");
+        assert_eq!(updated, 0);
+        assert!(attempt_status.is_none());
     }
 
     #[tokio::test]
