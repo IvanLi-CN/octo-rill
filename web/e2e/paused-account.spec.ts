@@ -10,8 +10,11 @@ function json(route: Route, payload: unknown, status = 200) {
 	});
 }
 
-async function installMalformedCompletionEventSource(page: Page) {
-	await page.addInitScript(() => {
+async function installMalformedCompletionEventSource(
+	page: Page,
+	payload: string,
+) {
+	await page.addInitScript((completionPayload) => {
 		class MockEventSource {
 			readyState = 1;
 			onerror: ((this: EventSource, event: Event) => unknown) | null = null;
@@ -27,7 +30,7 @@ async function installMalformedCompletionEventSource(page: Page) {
 					window.setTimeout(() => {
 						if (this.readyState === 2) return;
 						const event = new MessageEvent("task.completed", {
-							data: "not-json",
+							data: completionPayload,
 						});
 						for (const listener of this.listeners.get("task.completed") ?? []) {
 							listener.call(this as unknown as EventSource, event);
@@ -60,7 +63,7 @@ async function installMalformedCompletionEventSource(page: Page) {
 		}
 
 		window.EventSource = MockEventSource as unknown as typeof EventSource;
-	});
+	}, payload);
 }
 
 test("paused session enters account recovery from GET /api/me", async ({
@@ -113,48 +116,53 @@ test("paused session enters account recovery from GET /api/me", async ({
 	expect(apiPaths).not.toContain("/api/feed");
 });
 
-test("malformed resume completion event becomes a retryable failure", async ({
-	page,
-}) => {
-	await installMalformedCompletionEventSource(page);
+for (const [label, payload] of [
+	["invalid JSON", "not-json"],
+	["null JSON", "null"],
+] as const) {
+	test(`malformed resume completion event (${label}) becomes a retryable failure`, async ({
+		page,
+	}) => {
+		await installMalformedCompletionEventSource(page, payload);
 
-	await page.route("**/api/**", async (route) => {
-		const request = route.request();
-		const pathname = new URL(request.url()).pathname;
-		if (request.method() === "GET" && pathname === "/api/me") {
-			return json(
-				route,
-				buildMockMeResponse({
-					id: "2f4k7m9p3x6c8v2a",
-					github_user_id: 10,
-					login: "octo-member",
-					name: "Octo Member",
-					avatar_url: null,
-					email: "member@example.com",
-					is_admin: false,
-					account_status: "paused",
-					paused_at: "2026-08-06T03:15:00+08:00",
-				}),
-			);
-		}
-		if (request.method() === "POST" && pathname === "/api/me/resume") {
-			return json(route, {
-				status: "enabled",
-				access_sync: {
-					task_id: "resume-task",
-					task_type: "sync.access_refresh",
-					event_path: "/api/tasks/resume-task/events",
-					reason: "account_resumed",
-				},
-				sync_enqueue_error: null,
-			});
-		}
-		return json(route, { error: { code: "unexpected_api" } }, 404);
+		await page.route("**/api/**", async (route) => {
+			const request = route.request();
+			const pathname = new URL(request.url()).pathname;
+			if (request.method() === "GET" && pathname === "/api/me") {
+				return json(
+					route,
+					buildMockMeResponse({
+						id: "2f4k7m9p3x6c8v2a",
+						github_user_id: 10,
+						login: "octo-member",
+						name: "Octo Member",
+						avatar_url: null,
+						email: "member@example.com",
+						is_admin: false,
+						account_status: "paused",
+						paused_at: "2026-08-06T03:15:00+08:00",
+					}),
+				);
+			}
+			if (request.method() === "POST" && pathname === "/api/me/resume") {
+				return json(route, {
+					status: "enabled",
+					access_sync: {
+						task_id: "resume-task",
+						task_type: "sync.access_refresh",
+						event_path: "/api/tasks/resume-task/events",
+						reason: "account_resumed",
+					},
+					sync_enqueue_error: null,
+				});
+			}
+			return json(route, { error: { code: "unexpected_api" } }, 404);
+		});
+
+		await page.goto("/");
+		await page.getByRole("button", { name: "恢复账号" }).click();
+
+		await expect(page.getByText("访问同步事件无效，请重试。")).toBeVisible();
+		await expect(page.getByRole("button", { name: "重试同步" })).toBeVisible();
 	});
-
-	await page.goto("/");
-	await page.getByRole("button", { name: "恢复账号" }).click();
-
-	await expect(page.getByText("访问同步事件无效，请重试。")).toBeVisible();
-	await expect(page.getByRole("button", { name: "重试同步" })).toBeVisible();
-});
+}

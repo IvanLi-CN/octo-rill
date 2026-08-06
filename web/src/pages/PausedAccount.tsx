@@ -62,18 +62,22 @@ export function PausedAccountPage() {
 			source.addEventListener("task.running", () => setState("syncing"));
 			source.addEventListener("task.progress", () => setState("syncing"));
 			source.addEventListener("task.completed", (event) => {
-				let payload: { status?: string; error?: string };
+				let parsed: unknown;
 				try {
-					payload = JSON.parse((event as MessageEvent).data) as {
-						status?: string;
-						error?: string;
-					};
+					parsed = JSON.parse((event as MessageEvent).data) as unknown;
 				} catch {
 					setState("failed");
 					setError("访问同步事件无效，请重试。");
 					source.close();
 					return;
 				}
+				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+					setState("failed");
+					setError("访问同步事件无效，请重试。");
+					source.close();
+					return;
+				}
+				const payload = parsed as { status?: string; error?: string };
 				if (payload.status === "succeeded") {
 					setState("succeeded");
 					setError(null);
