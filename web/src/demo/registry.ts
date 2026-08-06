@@ -83,6 +83,14 @@ export const DEMO_SCENES: DemoScene[] = [
 		defaultPersona: "admin",
 		personas: ["admin", "member", "guest"],
 	},
+	{
+		id: "paused-account-resume",
+		title: "Paused Account",
+		description: "账号暂停后的自助恢复与访问同步状态。",
+		path: "/account/paused",
+		defaultPersona: "member",
+		personas: ["member"],
+	},
 ];
 
 const DEMO_SCENE_BY_ID = new Map<string, DemoScene>(
@@ -112,6 +120,8 @@ export function resolveDefaultSceneId(
 
 	if (normalizedPath.startsWith("/admin/jobs")) return "admin-jobs-running";
 	if (normalizedPath.startsWith("/admin")) return "admin-panel-users";
+	if (normalizedPath.startsWith("/account/paused"))
+		return "paused-account-resume";
 	if (normalizedPath.startsWith("/settings")) return "settings-my-releases";
 	if (normalizedPath.startsWith("/public/")) return "public-release-ready";
 	if (normalizedPath.startsWith("/focus/")) return "dashboard-repo-publish";
@@ -157,6 +167,7 @@ export function readDemoShareState(url: URL, basepath: string): DemoShareState {
 		networkMode: normalizeNetworkMode(url.searchParams.get("d_net")),
 		includeOwnReleases: url.searchParams.get("d_own") === "1",
 		publicationState: normalizePublicationState(url.searchParams.get("d_pub")),
+		controlsHidden: url.searchParams.get("d_controls") === "hidden",
 	};
 }
 
@@ -170,6 +181,7 @@ export function buildDefaultDemoShareState(
 		networkMode: "normal",
 		includeOwnReleases: false,
 		publicationState: "unpublished",
+		controlsHidden: false,
 	};
 }
 
@@ -194,6 +206,9 @@ export function applyDemoShareStateToSearchParams(
 	}
 	if (state.publicationState === "published") {
 		target.set("d_pub", "published");
+	}
+	if (state.controlsHidden) {
+		target.set("d_controls", "hidden");
 	}
 	return target;
 }

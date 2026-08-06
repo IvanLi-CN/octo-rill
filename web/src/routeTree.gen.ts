@@ -25,6 +25,7 @@ import { Route as BindGithubRouteImport } from './routes/bind/github'
 import { Route as AdminUsersRouteImport } from './routes/admin/users'
 import { Route as AdminReposRouteImport } from './routes/admin/repos'
 import { Route as AdminPublicReleasesRouteImport } from './routes/admin/public-releases'
+import { Route as AccountPausedRouteImport } from './routes/account/paused'
 import { Route as AdminJobsRouteRouteImport } from './routes/admin/jobs/route'
 import { Route as FocusReposIndexRouteImport } from './routes/focus/repos/index'
 import { Route as FocusMineIndexRouteImport } from './routes/focus/mine/index'
@@ -137,6 +138,13 @@ const AdminPublicReleasesRoute = AdminPublicReleasesRouteImport.update({
   getParentRoute: () => AdminRouteRoute,
 } as any).lazy(() =>
   import('./routes/admin/public-releases.lazy').then((d) => d.Route),
+)
+const AccountPausedRoute = AccountPausedRouteImport.update({
+  id: '/account/paused',
+  path: '/account/paused',
+  getParentRoute: () => rootRouteImport,
+} as any).lazy(() =>
+  import('./routes/account/paused.lazy').then((d) => d.Route),
 )
 const AdminJobsRouteRoute = AdminJobsRouteRouteImport.update({
   id: '/jobs',
@@ -356,6 +364,7 @@ export interface FileRoutesByFullPath {
   '/settings': typeof SettingsRoute
   '/stars': typeof StarsRoute
   '/admin/jobs': typeof AdminJobsRouteRouteWithChildren
+  '/account/paused': typeof AccountPausedRoute
   '/admin/public-releases': typeof AdminPublicReleasesRoute
   '/admin/repos': typeof AdminReposRoute
   '/admin/users': typeof AdminUsersRoute
@@ -400,6 +409,7 @@ export interface FileRoutesByTo {
   '/releases': typeof ReleasesRoute
   '/settings': typeof SettingsRoute
   '/stars': typeof StarsRoute
+  '/account/paused': typeof AccountPausedRoute
   '/admin/public-releases': typeof AdminPublicReleasesRoute
   '/admin/repos': typeof AdminReposRoute
   '/admin/users': typeof AdminUsersRoute
@@ -440,6 +450,7 @@ export interface FileRoutesById {
   '/settings': typeof SettingsRoute
   '/stars': typeof StarsRoute
   '/admin/jobs': typeof AdminJobsRouteRouteWithChildren
+  '/account/paused': typeof AccountPausedRoute
   '/admin/public-releases': typeof AdminPublicReleasesRoute
   '/admin/repos': typeof AdminReposRoute
   '/admin/users': typeof AdminUsersRoute
@@ -488,6 +499,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/stars'
     | '/admin/jobs'
+    | '/account/paused'
     | '/admin/public-releases'
     | '/admin/repos'
     | '/admin/users'
@@ -532,6 +544,7 @@ export interface FileRouteTypes {
     | '/releases'
     | '/settings'
     | '/stars'
+    | '/account/paused'
     | '/admin/public-releases'
     | '/admin/repos'
     | '/admin/users'
@@ -571,6 +584,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/stars'
     | '/admin/jobs'
+    | '/account/paused'
     | '/admin/public-releases'
     | '/admin/repos'
     | '/admin/users'
@@ -617,6 +631,7 @@ export interface RootRouteChildren {
   ReleasesRoute: typeof ReleasesRoute
   SettingsRoute: typeof SettingsRoute
   StarsRoute: typeof StarsRoute
+  AccountPausedRoute: typeof AccountPausedRoute
   BindGithubRoute: typeof BindGithubRoute
   FocusFollowingRoute: typeof FocusFollowingRouteWithChildren
   FocusMineRoute: typeof FocusMineRouteWithChildren
@@ -741,6 +756,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/admin/public-releases'
       preLoaderRoute: typeof AdminPublicReleasesRouteImport
       parentRoute: typeof AdminRouteRoute
+    }
+    '/account/paused': {
+      id: '/account/paused'
+      path: '/account/paused'
+      fullPath: '/account/paused'
+      preLoaderRoute: typeof AccountPausedRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/admin/jobs': {
       id: '/admin/jobs'
@@ -1118,6 +1140,7 @@ const rootRouteChildren: RootRouteChildren = {
   ReleasesRoute: ReleasesRoute,
   SettingsRoute: SettingsRoute,
   StarsRoute: StarsRoute,
+  AccountPausedRoute: AccountPausedRoute,
   BindGithubRoute: BindGithubRoute,
   FocusFollowingRoute: FocusFollowingRouteWithChildren,
   FocusMineRoute: FocusMineRouteWithChildren,

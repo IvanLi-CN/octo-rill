@@ -2340,6 +2340,7 @@ async fn load_user_release_visible_repo_aggregation_rows(
             ON u.id = fr.user_id
           WHERE fr.user_id = ?
             AND u.is_disabled = 0
+            AND u.paused_at IS NULL
         )
         SELECT
           repo_id,
@@ -4210,6 +4211,7 @@ pub async fn sync_subscriptions(
         SELECT id, last_active_at
         FROM users
         WHERE is_disabled = 0
+          AND paused_at IS NULL
         ORDER BY
           CASE WHEN last_active_at IS NULL THEN 1 ELSE 0 END ASC,
           last_active_at DESC,
@@ -4903,6 +4905,7 @@ async fn load_effective_repo_totals_by_user(state: &AppState) -> Result<HashMap<
         FROM users
         LEFT JOIN repo_totals ON repo_totals.user_id = users.id
         WHERE users.is_disabled = 0
+          AND users.paused_at IS NULL
         "#,
     )
     .fetch_all(&state.pool)
@@ -7261,6 +7264,7 @@ async fn load_repo_release_candidate_users(
         SELECT DISTINCT u.id AS user_id, u.last_active_at
         FROM users u
         WHERE u.is_disabled = 0
+          AND u.paused_at IS NULL
           AND (
             EXISTS (
               SELECT 1

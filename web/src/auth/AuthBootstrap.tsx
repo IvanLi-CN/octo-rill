@@ -21,7 +21,11 @@ import {
 	type NetworkErrorKind,
 } from "@/lib/errorPresentation";
 
-export type AuthBootstrapStatus = "pending" | "anonymous" | "authenticated";
+export type AuthBootstrapStatus =
+	| "pending"
+	| "anonymous"
+	| "paused"
+	| "authenticated";
 
 type AuthSnapshot = {
 	status: AuthBootstrapStatus;
@@ -60,6 +64,15 @@ let cachedSnapshotOrigin: "seed" | "network" | "none" = warmStartupSeed
 let inflightSnapshotPromise: Promise<AuthSnapshot> | null = null;
 
 function buildSnapshotFromDemo(me: MeResponse | null): AuthSnapshot {
+	if (me?.user.account_status === "paused") {
+		return {
+			status: "paused",
+			me,
+			bootError: null,
+			bootErrorKind: null,
+			bootErrorDetail: null,
+		};
+	}
 	if (!me) {
 		return {
 			status: "anonymous",
@@ -110,6 +123,16 @@ async function requestAuthSnapshot(): Promise<AuthSnapshot> {
 		if (previousUserId && previousUserId !== me.user.id) {
 			clearAllWarmStartupCaches();
 		}
+		if (me.user.account_status === "paused") {
+			clearAllWarmStartupCaches();
+			return {
+				status: "paused",
+				me,
+				bootError: null,
+				bootErrorKind: null,
+				bootErrorDetail: null,
+			};
+		}
 		persistAuthenticatedStartup(me);
 		return {
 			status: "authenticated",
@@ -129,7 +152,6 @@ async function requestAuthSnapshot(): Promise<AuthSnapshot> {
 				bootErrorDetail: null,
 			};
 		}
-
 		const bootError = describeNetworkAwareError(
 			err,
 			"登录状态检查失败，请稍后重试。",

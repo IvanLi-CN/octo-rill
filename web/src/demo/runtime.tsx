@@ -27,6 +27,7 @@ type DemoEventSourceFactory = (
 
 type DemoRuntimeDependencies = {
 	buildDemoModel: (options: {
+		sceneId: DemoSceneId;
 		personaId: DemoShareState["personaId"];
 		includeOwnReleases: boolean;
 		publicationState: DemoShareState["publicationState"];
@@ -92,6 +93,7 @@ const runtimeState: DemoSnapshot = {
 		networkMode: "normal",
 		includeOwnReleases: false,
 		publicationState: "unpublished",
+		controlsHidden: false,
 	},
 	model: null,
 	mutations: [],
@@ -278,6 +280,7 @@ function requireDemoDependencies() {
 
 function seedModel(shareState: DemoShareState): DemoModel {
 	return requireDemoDependencies().buildDemoModel({
+		sceneId: shareState.sceneId,
 		personaId: shareState.personaId,
 		includeOwnReleases: shareState.includeOwnReleases,
 		publicationState: shareState.publicationState,

@@ -5252,6 +5252,8 @@ pub async fn load_brief_history_recompute_candidates(
           briefs.generation_source
         FROM briefs
         JOIN users ON users.id = briefs.user_id
+        WHERE users.is_disabled = 0
+          AND users.paused_at IS NULL
         ORDER BY COALESCE(briefs.window_end_utc, briefs.created_at) DESC, briefs.created_at DESC, briefs.id DESC
         "#,
     )
@@ -5293,14 +5295,17 @@ pub async fn load_brief_content_refresh_candidates(
 
     let rows = sqlx::query_as::<_, BriefContentRefreshCandidateRow>(
         r#"
-        SELECT id, user_id, date, effective_time_zone, content_markdown
+        SELECT briefs.id, briefs.user_id, briefs.date, briefs.effective_time_zone, briefs.content_markdown
         FROM briefs
-        WHERE generation_source NOT IN ('legacy', 'history_recompute_failed')
-          AND window_start_utc IS NOT NULL
-          AND window_end_utc IS NOT NULL
-          AND effective_time_zone IS NOT NULL
-          AND effective_local_boundary IS NOT NULL
-        ORDER BY COALESCE(window_end_utc, created_at) DESC, created_at DESC, id DESC
+        JOIN users ON users.id = briefs.user_id
+        WHERE users.is_disabled = 0
+          AND users.paused_at IS NULL
+          AND briefs.generation_source NOT IN ('legacy', 'history_recompute_failed')
+          AND briefs.window_start_utc IS NOT NULL
+          AND briefs.window_end_utc IS NOT NULL
+          AND briefs.effective_time_zone IS NOT NULL
+          AND briefs.effective_local_boundary IS NOT NULL
+        ORDER BY COALESCE(briefs.window_end_utc, briefs.created_at) DESC, briefs.created_at DESC, briefs.id DESC
         "#,
     )
     .fetch_all(&state.pool)
@@ -7890,6 +7895,59 @@ mod tests {
         assert_eq!(candidates[0].id, "brief-fake-release-summary");
         assert_eq!(candidates[0].user_id, user_id);
         assert_eq!(candidates[0].date, "2026-07-18");
+    }
+
+    #[tokio::test]
+    async fn brief_maintenance_candidates_exclude_paused_accounts() {
+        let state = setup_llm_state().await;
+        let user_id = brief_test_user_id();
+        let now = "2026-07-19T00:10:00Z";
+        seed_brief_test_user(state.as_ref(), user_id, now).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-paused-maintenance")
+        .bind(user_id)
+        .bind("2026-07-18")
+        .bind("2026-07-17T16:00:00Z")
+        .bind("2026-07-18T16:00:00Z")
+        .bind("Asia/Shanghai")
+        .bind("00:00")
+        .bind("manual")
+        .bind("## 概览\n\n- refresh candidate\n")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert paused maintenance brief");
+        sqlx::query("UPDATE users SET paused_at = ? WHERE id = ?")
+            .bind("2026-07-19T00:00:00Z")
+            .bind(user_id)
+            .execute(&state.pool)
+            .await
+            .expect("pause maintenance user");
+
+        assert!(
+            load_brief_history_recompute_candidates(state.as_ref())
+                .await
+                .expect("load history candidates")
+                .is_empty()
+        );
+        assert!(
+            load_brief_content_refresh_candidates(state.as_ref())
+                .await
+                .expect("load refresh candidates")
+                .is_empty()
+        );
     }
 
     #[test]
