@@ -10,6 +10,13 @@
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
+## Active initiative
+
+- Integration branch: `prd/repo-refresh-governance`
+- Account suspension: tracked by the inactive-account-suspension ticket.
+- Governance retention: tracked by the governance-retention ticket.
+- Existing production databases require a separately approved maintenance window before converting to incremental auto-vacuum with a full `VACUUM`.
+
 ## 实现里程碑
 
 - [x] M1: schema / runtime config / governance snapshot tables

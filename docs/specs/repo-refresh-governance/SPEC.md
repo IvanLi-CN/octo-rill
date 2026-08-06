@@ -12,7 +12,7 @@
 - 固定“有效关注池”语义：
   - `starred_repos` 恒纳入；
   - owned repo 仅当 `users.include_own_releases=1` 时纳入；
-  - `users.is_disabled=1` 的用户整池排除。
+  - `users.is_disabled=1` 或 `users.paused_at IS NOT NULL` 的用户整池排除。
 - system release 调度改为“每 10 分钟预算窗口内最多挑选一批仓库”，默认预算字段为 `repo_refresh_system_budget_per_window`，并与 Admin Jobs 共用同一 runtime config。10 分钟是调度预算窗口，不是全池刷新完成 SLA。
 - 排序合同固定为：
   - `watcher_user_count DESC`
@@ -23,6 +23,8 @@
   - `watcher_repo_total_sum` 按关系来源不去重，同一用户对同一 repo 的 `starred + owned` 需要累计两次；
   - `cached_stargazer_count` 使用 best-effort 本地缓存，允许过时，未知值落后于已知值。
 - 新增 repo 治理物化快照与 system full-cycle 跟踪，页面读取和 scheduler 选仓都只读快照，不在请求链路里临时跨多表重聚合。
+- 连续 30 天未访问的账号由每日维护任务标记暂停；暂停账号主动恢复后才重新进入有效关注池并触发访问同步。
+- 已完成 cycle 的 member 明细在周期闭环后分批删除，只保留 cycle 汇总；存量明细通过可让步的在线维护任务渐进收敛。
 - `/api/admin/users` 与用户详情中的 `repo_total` 改为有效关注池口径，并把 owner-facing 文案同步改成“有效关注仓库数”。
 
 ### Non-goals
@@ -101,6 +103,17 @@
   - 离池 repo 不得永久阻塞当前轮完成；
   - 当前轮完成后写入“上次完成全量更新时间”。
 - 已选中但卡在旧语义下的 active cycle 必须在治理快照重建时自动 reconciliation：若系统选中时间之后已经存在终态 release work item，则补写 member `completed_at/attempt_status/attempt_error` 与 snapshot `system_last_attempt_*`，并按新语义推进 cycle 计数。
+- reconciliation、终态补账与候选选择只能读取 `status='active'` 的 cycle；已完成历史不得进入在线治理查询。
+- cycle 完成后以 500 行短事务删除其 member 明细，cycle 汇总行继续保留。
+- 存量历史每分钟最多删除 50000 行；SQLite busy 或前台写入积压时立即让步，并在后续维护轮次继续。
+
+### 闲置账号暂停
+
+- 每日 03:15 按 `APP_DEFAULT_TIME_ZONE` 执行一次幂等维护，重启时补跑当天错过的轮次。
+- `COALESCE(last_active_at, created_at) <= now - 30 days` 且未禁用、未暂停的账号写入 `paused_at`；所有角色均适用。
+- 登录不会解除暂停或更新暂停账号的 `last_active_at`。暂停账号只能读取自身状态、主动恢复和退出。
+- 主动恢复清除 `paused_at`、更新 `last_active_at`，随后创建或复用 `sync.access_refresh`；入队失败不回滚恢复状态。
+- 状态优先级为 `disabled > paused > enabled`。暂停账号的业务 API 与 API key 请求返回稳定错误码 `account_paused`。
 
 ### 治理页
 
@@ -162,8 +175,20 @@
   Then 新入池 repo 归下一轮，离池 repo 不阻塞本轮闭环完成时间。
 
 - Given `/admin/users` 与用户详情展示 `repo_total`
-  When 用户关闭 `include_own_releases` 或账号被 disabled
-  Then owned baseline 不再虚增其有效关注仓库数，disabled 用户的有效关注仓库数归零。
+  When 用户关闭 `include_own_releases`、账号被 disabled 或 paused
+  Then owned baseline 不再虚增其有效关注仓库数，disabled/paused 用户的有效关注仓库数归零。
+
+- Given 用户连续 30 天未访问
+  When 每日账号维护任务执行
+  Then 用户被标记暂停，且不再进入仓库池、发布候选、订阅同步和用户后台任务。
+
+- Given 暂停用户重新登录并点击“立即恢复”
+  When 恢复状态已持久化但访问同步入队失败
+  Then 用户仍保持启用状态，可返回首页并重试同步。
+
+- Given 治理库存在已完成 cycle 的大量 member 历史
+  When 治理重建与在线清理运行
+  Then 在线查询只扫描 active cycle，历史以受限短事务渐进删除，cycle 汇总仍可查询。
 
 - Given 管理员在仓库明细中选择目标窗口 `W1` 与 `W3`，并把迫切值范围设为 `2.0-4.0`
   When 前端防抖后请求 `GET /api/admin/repos`
