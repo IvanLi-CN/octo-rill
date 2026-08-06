@@ -77,13 +77,17 @@ export function PausedAccountPage() {
 					source.close();
 					return;
 				}
-				const payload = parsed as { status?: string; error?: string };
+				const payload = parsed as { status?: unknown; error?: unknown };
 				if (payload.status === "succeeded") {
 					setState("succeeded");
 					setError(null);
 				} else {
 					setState("failed");
-					setError(payload.error ?? "访问同步未完成，请重试。");
+					setError(
+						typeof payload.error === "string"
+							? payload.error
+							: "访问同步未完成，请重试。",
+					);
 				}
 				source.close();
 			});
