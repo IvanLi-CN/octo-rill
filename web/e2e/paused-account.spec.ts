@@ -116,6 +116,58 @@ test("paused session enters account recovery from GET /api/me", async ({
 	expect(apiPaths).not.toContain("/api/feed");
 });
 
+test("paused recovery inherits the app canvas and keeps theme controls available", async ({
+	page,
+}) => {
+	await page.emulateMedia({ colorScheme: "dark" });
+	await page.route("**/api/**", async (route) => {
+		const request = route.request();
+		const pathname = new URL(request.url()).pathname;
+		if (request.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse({
+					id: "2f4k7m9p3x6c8v2a",
+					github_user_id: 10,
+					login: "octo-member",
+					name: "Octo Member",
+					avatar_url: null,
+					email: "member@example.com",
+					is_admin: false,
+					account_status: "paused",
+					paused_at: "2026-08-06T03:15:00+08:00",
+				}),
+			);
+		}
+		return json(route, { error: { code: "unexpected_api" } }, 404);
+	});
+
+	await page.goto("/");
+
+	await expect(
+		page
+			.locator("[data-paused-account-panel]")
+			.locator("xpath=ancestor::main[1]"),
+	).not.toHaveClass(/bg-background/);
+	const themeToggle = page.locator("[data-theme-toggle]");
+	await expect(themeToggle).toBeVisible();
+	await expect(themeToggle.getByRole("button", { name: "浅色" })).toBeVisible();
+	await expect(themeToggle.getByRole("button", { name: "深色" })).toBeVisible();
+	await expect(
+		themeToggle.getByRole("button", { name: "跟随系统" }),
+	).toBeVisible();
+
+	await themeToggle.getByRole("button", { name: "浅色" }).click();
+	await expect
+		.poll(() =>
+			page.evaluate(() => ({
+				resolvedTheme: document.documentElement.dataset.theme,
+				isDark: document.documentElement.classList.contains("dark"),
+			})),
+		)
+		.toEqual({ resolvedTheme: "light", isDark: false });
+});
+
 for (const [label, payload, expectedError] of [
 	["invalid JSON", "not-json", "访问同步事件无效，请重试。"],
 	["null JSON", "null", "访问同步事件无效，请重试。"],

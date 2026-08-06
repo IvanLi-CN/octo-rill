@@ -66,7 +66,7 @@
   - summary cards / activity grid / filtered repo list
   - budget 只读展示与入口提示，实际编辑收口到 Admin Jobs 的“订阅同步设置”弹窗
 - web account recovery:
-  - `/account/paused` 暂停账号恢复页与访问同步 SSE 状态
+  - `/account/paused` 暂停账号恢复页与访问同步 SSE 状态，复用应用全局画布并保留主题模式切换
   - 管理员用户列表的 `all / enabled / paused / disabled` 状态筛选
 - Storybook fallback / visual evidence for the new admin page
 
@@ -204,6 +204,10 @@
   When 请求不属于 `GET /api/me`、`POST /api/me/resume` 或退出登录
   Then 返回 `403 account_paused`。
 
+- Given 暂停会话打开 `/account/paused`
+  When 用户查看或切换浅色、深色、跟随系统主题
+  Then 页面不引入独立背景层，恢复操作、主题控件与页脚在各主题下均可访问。
+
 - Given 治理库存在已完成 cycle 的大量 member 历史
   When 治理重建与在线清理运行
   Then 在线查询只扫描 active cycle，历史以最多 500 行短事务渐进删除，所有 owner 与重启共享每分钟 50000 行预算，cycle 汇总仍可查询。
@@ -219,21 +223,21 @@
 ## Visual Evidence
 
 - source_type: `ui_demo`
-  scenario: `paused account recovery idle state`
+  scenario: `paused account recovery idle state, light theme`
   target_program: `mock-only`
   capture_scope: `browser-viewport`
-  requested_viewport: `1831x1037`
-  viewport_strategy: `default-browser-viewport`
+  requested_viewport: `1440x900`
+  viewport_strategy: `chrome-viewport`
   margin_policy: `trim_only`
   evidence_surface: `page`
   sensitive_exclusion: `N/A`
   submission_gate: `approved`
-  evidence_note: 证明暂停账号页在无演示控件或覆盖层的桌面稳定 mock 场景中，恢复、返回首页和退出登录操作与页脚可同时清晰呈现。
+  evidence_note: 证明暂停账号页在无演示控件或覆盖层的浅色桌面稳定 mock 场景中，复用应用画布，恢复、返回首页、退出登录、主题控件与页脚可同时清晰呈现。
   PR: include
-  ![暂停账号恢复桌面证据](./assets/paused-account-desktop.png)
+  ![暂停账号恢复浅色桌面证据](./assets/paused-account-light-desktop.png)
 
 - source_type: `ui_demo`
-  scenario: `paused account recovery idle state`
+  scenario: `paused account recovery idle state, light theme`
   target_program: `mock-only`
   capture_scope: `browser-viewport`
   requested_viewport: `393x852`
@@ -242,9 +246,37 @@
   evidence_surface: `page`
   sensitive_exclusion: `N/A`
   submission_gate: `approved`
-  evidence_note: 证明暂停账号页在精确 `393x852` CSS px 移动视口中没有 Demo 控件覆盖页脚，按钮、状态与版本信息均清晰可读。
+  evidence_note: 证明暂停账号页在精确 `393x852` CSS px 浅色移动视口中没有 Demo 控件覆盖页脚，按钮、状态、主题控件与版本信息均清晰可读。
   PR: include
-  ![暂停账号恢复移动证据](./assets/paused-account-mobile.png)
+  ![暂停账号恢复浅色移动证据](./assets/paused-account-light-mobile.png)
+
+- source_type: `ui_demo`
+  scenario: `paused account recovery idle state, dark theme`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `1440x900`
+  viewport_strategy: `chrome-viewport`
+  margin_policy: `trim_only`
+  evidence_surface: `page`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  evidence_note: 证明暂停账号页在无演示控件或覆盖层的深色桌面稳定 mock 场景中，深色画布来自应用主题而非页面独立背景，恢复操作、主题控件与页脚均清晰可用。
+  PR: include
+  ![暂停账号恢复深色桌面证据](./assets/paused-account-dark-desktop.png)
+
+- source_type: `ui_demo`
+  scenario: `paused account recovery idle state, dark theme`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `393x852`
+  viewport_strategy: `chrome-viewport`
+  margin_policy: `trim_only`
+  evidence_surface: `page`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  evidence_note: 证明暂停账号页在精确 `393x852` CSS px 深色移动视口中没有 Demo 控件覆盖页脚，恢复操作、主题控件与版本信息均清晰可读。
+  PR: include
+  ![暂停账号恢复深色移动证据](./assets/paused-account-dark-mobile.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `admin-admin-repos--evidence-desktop`
