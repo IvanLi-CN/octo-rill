@@ -18,8 +18,10 @@ const baseSnapshot = {
 		networkMode: "normal" as const,
 		includeOwnReleases: true,
 		publicationState: "published" as const,
+		controlsHidden: false,
 	},
 	model: buildDemoModel({
+		sceneId: "dashboard-repo-publish",
 		personaId: "member",
 		includeOwnReleases: true,
 		publicationState: "published",
