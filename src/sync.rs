@@ -865,6 +865,7 @@ struct RepoRefreshGovernanceRebuildStats {
 enum RepoRefreshGovernanceRetentionOutcome {
     Deleted(u64),
     Skipped,
+    Throttled,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -5223,11 +5224,73 @@ async fn load_repo_refresh_governance_legacy_member_rowids(state: &AppState) -> 
 async fn prune_completed_repo_refresh_governance_cycle_members(
     state: &AppState,
 ) -> Result<RepoRefreshGovernanceRetentionOutcome> {
+    let now_rfc3339 = Utc::now().to_rfc3339();
     match state
         .sqlite_writer
-        .try_write("repo_refresh_governance_retention", || async {
-            Ok::<_, anyhow::Error>(
+        .try_write("repo_refresh_governance_retention", || {
+            let now_rfc3339 = now_rfc3339.clone();
+            async move {
+                let mut tx = state
+                    .pool
+                    .begin_with("BEGIN IMMEDIATE")
+                    .await
+                    .context("begin repo refresh governance retention tx")?;
                 sqlx::query(
+                    r#"
+                    INSERT INTO repo_refresh_governance_retention_state (
+                      id, window_started_at, deleted_rows, updated_at
+                    ) VALUES (1, ?, 0, ?)
+                    ON CONFLICT(id) DO NOTHING
+                    "#,
+                )
+                .bind(now_rfc3339.as_str())
+                .bind(now_rfc3339.as_str())
+                .execute(&mut *tx)
+                .await
+                .context("initialize repo refresh governance retention state")?;
+                sqlx::query(
+                    r#"
+                    UPDATE repo_refresh_governance_retention_state
+                    SET window_started_at = ?,
+                        deleted_rows = 0,
+                        updated_at = ?
+                    WHERE id = 1
+                      AND julianday(?) >= julianday(window_started_at) + (1.0 / 1440.0)
+                    "#,
+                )
+                .bind(now_rfc3339.as_str())
+                .bind(now_rfc3339.as_str())
+                .bind(now_rfc3339.as_str())
+                .execute(&mut *tx)
+                .await
+                .context("reset repo refresh governance retention rate window")?;
+
+                let deleted_in_window: i64 = sqlx::query_scalar(
+                    r#"
+                    SELECT deleted_rows
+                    FROM repo_refresh_governance_retention_state
+                    WHERE id = 1
+                    "#,
+                )
+                .fetch_one(&mut *tx)
+                .await
+                .context("load repo refresh governance retention rate window")?;
+                let remaining_limit = i64::try_from(
+                    REPO_REFRESH_GOVERNANCE_RETENTION_MAX_ROWS_PER_MINUTE.saturating_sub(
+                        u64::try_from(deleted_in_window.max(0)).unwrap_or(u64::MAX),
+                    ),
+                )
+                .unwrap_or(0);
+                if remaining_limit == 0 {
+                    tx.commit()
+                        .await
+                        .context("commit repo refresh governance retention throttle tx")?;
+                    return Ok::<_, anyhow::Error>(
+                        RepoRefreshGovernanceRetentionOutcome::Throttled,
+                    );
+                }
+
+                let deleted = sqlx::query(
                     r#"
                     DELETE FROM repo_refresh_governance_cycle_members
                     WHERE rowid IN (
@@ -5241,16 +5304,35 @@ async fn prune_completed_repo_refresh_governance_cycle_members(
                     )
                     "#,
                 )
-                .bind(REPO_REFRESH_GOVERNANCE_RETENTION_BATCH_SIZE)
-                .execute(&state.pool)
+                .bind(REPO_REFRESH_GOVERNANCE_RETENTION_BATCH_SIZE.min(remaining_limit))
+                .execute(&mut *tx)
                 .await
                 .context("prune completed repo refresh governance cycle members")?
-                .rows_affected(),
-            )
+                .rows_affected();
+                if deleted > 0 {
+                    sqlx::query(
+                        r#"
+                        UPDATE repo_refresh_governance_retention_state
+                        SET deleted_rows = deleted_rows + ?,
+                            updated_at = ?
+                        WHERE id = 1
+                        "#,
+                    )
+                    .bind(i64::try_from(deleted).unwrap_or(i64::MAX))
+                    .bind(now_rfc3339.as_str())
+                    .execute(&mut *tx)
+                    .await
+                    .context("record repo refresh governance retention progress")?;
+                }
+                tx.commit()
+                    .await
+                    .context("commit repo refresh governance retention tx")?;
+                Ok::<_, anyhow::Error>(RepoRefreshGovernanceRetentionOutcome::Deleted(deleted))
+            }
         })
         .await
     {
-        Ok(Some(deleted)) => Ok(RepoRefreshGovernanceRetentionOutcome::Deleted(deleted)),
+        Ok(Some(outcome)) => Ok(outcome),
         Ok(None) => {
             tracing::warn!(
                 event = "sqlite.write",
@@ -5276,7 +5358,7 @@ async fn prune_completed_repo_refresh_governance_cycle_members(
 
 async fn execute_repo_refresh_governance_retention_batches<F, Fut>(
     mut prune_batch: F,
-) -> Result<(u64, usize, bool)>
+) -> Result<(u64, usize, bool, bool)>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<RepoRefreshGovernanceRetentionOutcome>>,
@@ -5290,11 +5372,16 @@ where
                 deleted = deleted.saturating_add(rows);
                 batches += 1;
             }
-            RepoRefreshGovernanceRetentionOutcome::Skipped => return Ok((deleted, batches, true)),
+            RepoRefreshGovernanceRetentionOutcome::Skipped => {
+                return Ok((deleted, batches, true, false));
+            }
+            RepoRefreshGovernanceRetentionOutcome::Throttled => {
+                return Ok((deleted, batches, false, true));
+            }
         }
     }
 
-    Ok((deleted, batches, false))
+    Ok((deleted, batches, false, false))
 }
 
 async fn reconcile_repo_refresh_governance_terminal_member_rowids(
@@ -5445,10 +5532,11 @@ async fn count_completed_repo_refresh_governance_cycle_members(state: &AppState)
 
 async fn prune_repo_refresh_governance_retention(state: &AppState) -> Result<()> {
     let started_at = Instant::now();
-    let (deleted, batches, yielded) = execute_repo_refresh_governance_retention_batches(|| {
-        prune_completed_repo_refresh_governance_cycle_members(state)
-    })
-    .await?;
+    let (deleted, batches, yielded, rate_limited) =
+        execute_repo_refresh_governance_retention_batches(|| {
+            prune_completed_repo_refresh_governance_cycle_members(state)
+        })
+        .await?;
     let remaining = count_completed_repo_refresh_governance_cycle_members(state).await?;
 
     tracing::info!(
@@ -5460,6 +5548,7 @@ async fn prune_repo_refresh_governance_retention(state: &AppState) -> Result<()>
         max_rows_per_minute = REPO_REFRESH_GOVERNANCE_RETENTION_MAX_ROWS_PER_MINUTE,
         batches,
         yielded,
+        rate_limited,
         elapsed_ms = started_at.elapsed().as_millis(),
         "repo refresh governance retention pass completed"
     );
@@ -12259,7 +12348,7 @@ mod tests {
                 .expect("seed production-scale retention members");
         }
 
-        let (deleted, batches, yielded) =
+        let (deleted, batches, yielded, rate_limited) =
             super::execute_repo_refresh_governance_retention_batches({
                 let state = state.clone();
                 move || {
@@ -12276,6 +12365,7 @@ mod tests {
         assert_eq!(deleted, 50_000);
         assert_eq!(batches, 100);
         assert!(!yielded);
+        assert!(!rate_limited);
         let remaining: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM repo_refresh_governance_cycle_members WHERE cycle_id = ?",
         )
@@ -12292,6 +12382,36 @@ mod tests {
         .expect("load retained production-scale cycle summary");
         assert_eq!(remaining, 1);
         assert_eq!(summary_members, TOTAL_MEMBERS);
+
+        let restarted_state = setup_state(pool.clone());
+        let throttled =
+            super::prune_completed_repo_refresh_governance_cycle_members(restarted_state.as_ref())
+                .await
+                .expect("enforce retention rate limit after restart");
+        assert_eq!(
+            throttled,
+            super::RepoRefreshGovernanceRetentionOutcome::Throttled
+        );
+
+        sqlx::query(
+            r#"
+            UPDATE repo_refresh_governance_retention_state
+            SET window_started_at = ?
+            WHERE id = 1
+            "#,
+        )
+        .bind("2000-01-01T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("expire persisted retention rate window");
+        let resumed =
+            super::prune_completed_repo_refresh_governance_cycle_members(restarted_state.as_ref())
+                .await
+                .expect("resume retention after persisted rate window");
+        assert_eq!(
+            resumed,
+            super::RepoRefreshGovernanceRetentionOutcome::Deleted(1)
+        );
     }
 
     #[tokio::test]
