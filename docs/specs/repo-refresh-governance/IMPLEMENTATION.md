@@ -5,7 +5,7 @@
 - Lifecycle: active
 - Implementation: 已交付
 - Created: 2026-06-29
-- Last: 2026-07-05
+- Last: 2026-08-06
 - Summary: 已交付；effective repo pool、10 分钟 budgeted governance snapshots、attempt-based system cycle ledger、chunked governance rebuild、`/admin/repos` 独立治理页、预算编辑收口到订阅同步设置弹窗、仓库明细目标窗口/迫切值筛选、Storybook 视觉证据与 build validation 已完成
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
