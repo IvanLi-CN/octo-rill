@@ -190,6 +190,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(api_version).layer(middleware::from_fn(version_no_store_cache)),
         )
         .route("/me", get(api::me))
+        .route("/me/resume", post(api::me_resume))
         .route("/me/personal-repos", get(api::list_personal_repos))
         .route(
             "/me/profile",
@@ -494,6 +495,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         jobs::spawn_hourly_scheduler(app_state.clone());
         jobs::spawn_subscription_scheduler(app_state.clone());
         jobs::spawn_recent_failures_retry_scheduler(app_state.clone());
+        jobs::spawn_account_pause_scheduler(app_state.clone());
         jobs::spawn_admin_dashboard_rollup_scheduler(app_state.clone());
         if let Err(err) = jobs::enqueue_brief_history_recompute_if_needed(app_state.as_ref()).await
         {

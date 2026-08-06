@@ -595,7 +595,7 @@ test("dashboard to admin to dashboard stays in SPA mode and does not re-bootstra
 		.toBe(navigationEntryCount);
 });
 
-test("warm cache resumes the dashboard shell immediately before the network refresh completes", async ({
+test("warm cache holds the dashboard until the network refresh completes", async ({
 	page,
 }) => {
 	await seedWarmDashboardCache(page);
@@ -710,16 +710,61 @@ test("warm cache resumes the dashboard shell immediately before the network refr
 
 	await page.goto("/", { waitUntil: "domcontentloaded" });
 
-	await expect(page.locator("[data-app-boot]")).toHaveCount(0);
+	await expect(page.locator("[data-app-boot]")).toBeVisible();
 	await expect(
 		page.getByRole("link", { name: "使用 GitHub 登录" }),
 	).toHaveCount(0);
 	await expect(
 		page.locator('[data-dashboard-hydration-source="warm-cache"]'),
-	).toHaveCount(1);
+	).toHaveCount(0);
+	expect(feedCalls).toBe(0);
+
+	await expect(page.locator("[data-app-boot]")).toHaveCount(0);
 	await expect(
 		page.locator("[data-dashboard-secondary-controls]"),
 	).toBeVisible();
 	await expect(page.getByText("Fresh Release 20002")).toBeVisible();
 	expect(feedCalls).toBeGreaterThan(0);
+});
+
+test("warm cache cannot issue business requests before a paused /api/me response", async ({
+	page,
+}) => {
+	await seedWarmDashboardCache(page);
+	const businessPaths: string[] = [];
+
+	await page.route("**/api/**", async (route) => {
+		const request = route.request();
+		const pathname = new URL(request.url()).pathname;
+		if (request.method() === "GET" && pathname === "/api/me") {
+			await sleep(900);
+			return json(
+				route,
+				buildMockMeResponse({
+					id: "2f4k7m9p3x6c8v2a",
+					github_user_id: 10,
+					login: "octo-admin",
+					name: "Octo Admin",
+					avatar_url: null,
+					email: "admin@example.com",
+					is_admin: true,
+					account_status: "paused",
+					paused_at: "2026-08-06T03:15:00+08:00",
+				}),
+			);
+		}
+
+		if (!["/api/version", "/api/health"].includes(pathname)) {
+			businessPaths.push(pathname);
+		}
+		return json(route, { error: { code: "account_paused" } }, 403);
+	});
+
+	await page.goto("/", { waitUntil: "domcontentloaded" });
+
+	await expect(page.locator("[data-app-boot]")).toBeVisible();
+	expect(businessPaths).toEqual([]);
+	await expect(page).toHaveURL(/\/account\/paused$/);
+	await expect(page.getByRole("heading", { name: "账号已暂停" })).toBeVisible();
+	expect(businessPaths).toEqual([]);
 });

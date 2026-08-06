@@ -39,6 +39,7 @@
 ### In scope
 
 - DB migration:
+  - `users.paused_at`
   - `admin_runtime_settings.repo_refresh_system_budget_per_window`
   - `starred_repos.repo_stargazer_count(_updated_at)`
   - `owned_repo_star_baselines.repo_stargazer_count(_updated_at)`
@@ -58,11 +59,15 @@
   - `GET /api/admin/repos`
   - `GET/PATCH /api/admin/jobs/sync/runtime-config` 扩展 budget 字段
   - `GET /api/admin/users` `repo_total` 新口径
+  - `GET /api/me` 暂停会话状态读取与 `POST /api/me/resume` 自助恢复
 - web admin:
   - `/admin/repos` route
   - `AdminHeader` 导航项“仓库治理”
   - summary cards / activity grid / filtered repo list
   - budget 只读展示与入口提示，实际编辑收口到 Admin Jobs 的“订阅同步设置”弹窗
+- web account recovery:
+  - `/account/paused` 暂停账号恢复页与访问同步 SSE 状态
+  - 管理员用户列表的 `all / enabled / paused / disabled` 状态筛选
 - Storybook fallback / visual evidence for the new admin page
 
 ### Out of scope
@@ -114,8 +119,10 @@
 
 - 每日 03:15 按 `APP_DEFAULT_TIME_ZONE` 执行一次幂等维护，重启时补跑当天错过的轮次。
 - `COALESCE(last_active_at, created_at) <= now - 30 days` 且未禁用、未暂停的账号写入 `paused_at`；所有角色均适用。
-- 登录不会解除暂停或更新暂停账号的 `last_active_at`。暂停账号只能读取自身状态、主动恢复和退出。
-- 主动恢复清除 `paused_at`、更新 `last_active_at`，随后创建或复用 `sync.access_refresh`；入队失败不回滚恢复状态。
+- 登录不会解除暂停或更新暂停账号的 `last_active_at`。
+- 暂停会话允许的接口面仅为 `GET /api/me`、`POST /api/me/resume` 与退出登录；不新增第二个自状态接口。
+- `GET /api/me` 对暂停会话保持可用，返回用户有效 `account_status=paused` 与 `paused_at`，`access_sync` 为 `none`，且不触发业务数据或访问同步副作用，也不更新 `last_active_at`。
+- 主动恢复通过 `POST /api/me/resume` 清除 `paused_at`、更新 `last_active_at`，随后创建或复用 `sync.access_refresh`；入队失败不回滚恢复状态。
 - 状态优先级为 `disabled > paused > enabled`。暂停账号的业务 API 与 API key 请求返回稳定错误码 `account_paused`。
 
 ### 治理页
@@ -189,6 +196,14 @@
   When 恢复状态已持久化但访问同步入队失败
   Then 用户仍保持启用状态，可返回首页并重试同步。
 
+- Given 暂停用户持有有效会话
+  When 调用 `GET /api/me`
+  Then 返回 `account_status=paused` 与 `paused_at`，不创建访问同步、不产生业务副作用且不更新活动时间。
+
+- Given 暂停账号通过会话或 API key 调用业务接口
+  When 请求不属于 `GET /api/me`、`POST /api/me/resume` 或退出登录
+  Then 返回 `403 account_paused`。
+
 - Given 治理库存在已完成 cycle 的大量 member 历史
   When 治理重建与在线清理运行
   Then 在线查询只扫描 active cycle，历史以最多 500 行短事务渐进删除，所有 owner 与重启共享每分钟 50000 行预算，cycle 汇总仍可查询。
@@ -203,6 +218,34 @@
 
 ## Visual Evidence
 
+- source_type: `ui_demo`
+  scenario: `paused account recovery idle state`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `1831x1037`
+  viewport_strategy: `default-browser-viewport`
+  margin_policy: `trim_only`
+  evidence_surface: `page`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  evidence_note: 证明暂停账号页在无演示控件或覆盖层的桌面稳定 mock 场景中，恢复、返回首页和退出登录操作与页脚可同时清晰呈现。
+  PR: include
+  ![暂停账号恢复桌面证据](./assets/paused-account-desktop.png)
+
+- source_type: `ui_demo`
+  scenario: `paused account recovery idle state`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `393x852`
+  viewport_strategy: `chrome-viewport`
+  margin_policy: `trim_only`
+  evidence_surface: `page`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  evidence_note: 证明暂停账号页在精确 `393x852` CSS px 移动视口中没有 Demo 控件覆盖页脚，按钮、状态与版本信息均清晰可读。
+  PR: include
+  ![暂停账号恢复移动证据](./assets/paused-account-mobile.png)
+
 - source_type: `storybook_canvas`
   story_id_or_title: `admin-admin-repos--evidence-desktop`
   state: `desktop governance`
@@ -213,7 +256,6 @@
   sensitive_exclusion: `N/A`
   submission_gate: `pending-owner-approval`
   evidence_note: 证明 `/admin/repos` 在桌面视口下同时展示有效关注池 summary、可访问活动图图例、单跳预算 CTA，以及使用状态下拉、目标窗口与迫切值范围筛选的仓库明细。
-  PR: include
   ![仓库治理桌面证据](./assets/admin-repos-desktop.png)
 
 - source_type: `storybook_canvas`
@@ -232,7 +274,6 @@
   story_id_or_title: `admin-admin-repos--evidence-desktop`
   state: `desktop governance with system attempts`
   evidence_note: 证明 `/admin/repos` 在桌面视口下明确区分实际刷新新鲜度、system 尝试成功/失败、system 成功时间与软目标窗口。
-  PR: include
   ![仓库治理桌面 system 尝试证据](./assets/admin-repos-desktop-attempts.png)
 
 - source_type: `storybook_canvas`

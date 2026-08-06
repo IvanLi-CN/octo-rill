@@ -272,6 +272,13 @@ pub struct MeResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct AccountResumeResponse {
+    status: String,
+    access_sync: AccessSyncBootstrap,
+    sync_enqueue_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct UserSummary {
     id: String,
     github_user_id: i64,
@@ -280,6 +287,8 @@ pub struct UserSummary {
     avatar_url: Option<String>,
     email: Option<String>,
     is_admin: bool,
+    account_status: String,
+    paused_at: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -287,6 +296,7 @@ struct MeUserRow {
     id: String,
     is_admin: i64,
     is_disabled: i64,
+    paused_at: Option<String>,
     last_active_at: Option<String>,
     include_own_releases: i64,
 }
@@ -372,7 +382,7 @@ pub async fn me(
     let user_id = require_user_id(&session).await?;
     let row = sqlx::query_as::<_, MeUserRow>(
         r#"
-        SELECT id, is_admin, is_disabled, last_active_at, include_own_releases
+        SELECT id, is_admin, is_disabled, paused_at, last_active_at, include_own_releases
         FROM users
         WHERE id = ?
         "#,
@@ -391,9 +401,13 @@ pub async fn me(
         ));
     };
 
-    if let Err(err) = ensure_account_enabled(row.is_disabled != 0) {
+    if row.is_disabled != 0 {
         session.clear().await;
-        return Err(err);
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "account_disabled",
+            "account is disabled",
+        ));
     }
 
     let first_github = sqlx::query_as::<_, MeFirstGitHubRow>(
@@ -432,8 +446,15 @@ pub async fn me(
     .map_err(ApiError::internal)?
     .and_then(|record| record.avatar_url);
 
-    let access_sync = maybe_bootstrap_access_sync(state.as_ref(), &session, &row).await?;
-    touch_user_last_active_at(state.as_ref(), &row.id).await?;
+    let is_paused = row.paused_at.is_some();
+    let access_sync = if is_paused {
+        AccessSyncBootstrap::none()
+    } else {
+        maybe_bootstrap_access_sync(state.as_ref(), &session, &row).await?
+    };
+    if !is_paused {
+        touch_user_last_active_at(state.as_ref(), &row.id).await?;
+    }
     let preferences = briefs::load_daily_brief_preferences(state.as_ref(), &row.id)
         .await
         .map_err(ApiError::internal)?;
@@ -452,6 +473,12 @@ pub async fn me(
             avatar_url: linuxdo_avatar.or(first_github.avatar_url),
             email: first_github.email,
             is_admin: row.is_admin != 0,
+            account_status: if is_paused {
+                "paused".to_owned()
+            } else {
+                "enabled".to_owned()
+            },
+            paused_at: row.paused_at,
         },
         access_sync,
         dashboard: DashboardBootstrap {
@@ -461,6 +488,101 @@ pub async fn me(
             include_own_releases: row.include_own_releases != 0,
         },
     }))
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AccountResumeRow {
+    is_disabled: i64,
+}
+
+pub async fn me_resume(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<AccountResumeResponse>, ApiError> {
+    let user_id = require_user_id(&session).await?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let (writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "account_resume",
+            crate::sqlite_write::SqliteWritePriority::Foreground,
+        )
+        .await
+        .map_err(ApiError::internal)?;
+    let row = sqlx::query_as::<_, AccountResumeRow>(
+        r#"
+        SELECT is_disabled
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(&user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some(row) = row else {
+        session.clear().await;
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "session user not found",
+        ));
+    };
+    if row.is_disabled != 0 {
+        let _ = tx.rollback().await;
+        drop(writer);
+        session.clear().await;
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "account_disabled",
+            "account is disabled",
+        ));
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE users
+        SET paused_at = NULL, last_active_at = ?, updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(&user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    drop(writer);
+
+    let access_sync = jobs::enqueue_singleton_task_for_requester(
+        state.as_ref(),
+        jobs::NewTask {
+            task_type: jobs::TASK_SYNC_ACCESS_REFRESH.to_owned(),
+            payload: json!({ "user_id": user_id.clone() }),
+            source: "api.me_resume".to_owned(),
+            requested_by: Some(user_id.clone()),
+            parent_task_id: None,
+        },
+    )
+    .await;
+    match access_sync {
+        Ok(task) => Ok(Json(AccountResumeResponse {
+            status: "enabled".to_owned(),
+            access_sync: AccessSyncBootstrap::from_task(task, "account_resumed"),
+            sync_enqueue_error: None,
+        })),
+        Err(err) => {
+            tracing::warn!(user_id, err = %err, "account resumed but access sync enqueue failed");
+            Ok(Json(AccountResumeResponse {
+                status: "enabled".to_owned(),
+                access_sync: AccessSyncBootstrap::none(),
+                sync_enqueue_error: Some("access_sync_enqueue_failed".to_owned()),
+            }))
+        }
+    }
 }
 
 fn last_active_is_stale(last_active_at: Option<&str>) -> bool {
@@ -595,6 +717,8 @@ pub struct AdminUserItem {
     email: Option<String>,
     is_admin: bool,
     is_disabled: bool,
+    paused_at: Option<String>,
+    account_status: String,
     repo_total: i64,
     include_own_releases: bool,
     last_active_at: Option<String>,
@@ -638,6 +762,7 @@ struct AdminUserUpdateGuard {
     target_user_id: String,
     target_is_admin: bool,
     target_is_disabled: bool,
+    target_is_paused: bool,
     next_is_admin: bool,
     next_is_disabled: bool,
     admin_count: i64,
@@ -661,8 +786,10 @@ fn guard_admin_user_update(guard: AdminUserUpdateGuard) -> Result<(), ApiError> 
         ));
     }
 
-    let target_is_active_admin = guard.target_is_admin && !guard.target_is_disabled;
-    let next_is_active_admin = guard.next_is_admin && !guard.next_is_disabled;
+    let target_is_active_admin =
+        guard.target_is_admin && !guard.target_is_disabled && !guard.target_is_paused;
+    let next_is_active_admin =
+        guard.next_is_admin && !guard.next_is_disabled && !guard.target_is_paused;
     if target_is_active_admin && !next_is_active_admin && guard.active_admin_count <= 1 {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -692,7 +819,7 @@ pub async fn admin_list_users(
         return Err(ApiError::bad_request("invalid role filter"));
     }
     let status = query.status.unwrap_or_else(|| "all".to_owned());
-    if status != "all" && status != "enabled" && status != "disabled" {
+    if status != "all" && status != "enabled" && status != "paused" && status != "disabled" {
         return Err(ApiError::bad_request("invalid status filter"));
     }
 
@@ -713,7 +840,12 @@ pub async fn admin_list_users(
         WHERE
           (? = '' OR lower(login) LIKE ? OR lower(COALESCE(name, '')) LIKE ? OR lower(COALESCE(email, '')) LIKE ?)
           AND (? = 'all' OR (? = 'admin' AND is_admin = 1) OR (? = 'user' AND is_admin = 0))
-          AND (? = 'all' OR (? = 'enabled' AND is_disabled = 0) OR (? = 'disabled' AND is_disabled = 1))
+          AND (
+            ? = 'all'
+            OR (? = 'enabled' AND is_disabled = 0 AND paused_at IS NULL)
+            OR (? = 'paused' AND is_disabled = 0 AND paused_at IS NOT NULL)
+            OR (? = 'disabled' AND is_disabled = 1)
+          )
         "#,
     )
     .bind(query_text.as_str())
@@ -723,6 +855,7 @@ pub async fn admin_list_users(
     .bind(role.as_str())
     .bind(role.as_str())
     .bind(role.as_str())
+    .bind(status.as_str())
     .bind(status.as_str())
     .bind(status.as_str())
     .bind(status.as_str())
@@ -741,11 +874,13 @@ pub async fn admin_list_users(
             FROM starred_repos sr
             JOIN users starred_users ON starred_users.id = sr.user_id
             WHERE starred_users.is_disabled = 0
+              AND starred_users.paused_at IS NULL
             UNION ALL
             SELECT ob.user_id, ob.repo_id
             FROM owned_repo_star_baselines ob
             JOIN users owned_users ON owned_users.id = ob.user_id
             WHERE owned_users.is_disabled = 0
+              AND owned_users.paused_at IS NULL
               AND owned_users.include_own_releases != 0
           ) repo_sources
           GROUP BY repo_sources.user_id
@@ -759,6 +894,12 @@ pub async fn admin_list_users(
           users.email,
           users.is_admin,
           users.is_disabled,
+          users.paused_at,
+          CASE
+            WHEN users.is_disabled != 0 THEN 'disabled'
+            WHEN users.paused_at IS NOT NULL THEN 'paused'
+            ELSE 'enabled'
+          END AS account_status,
           COALESCE(repo_totals.repo_total, 0) AS repo_total,
           users.include_own_releases,
           users.last_active_at,
@@ -769,7 +910,12 @@ pub async fn admin_list_users(
         WHERE
           (? = '' OR lower(users.login) LIKE ? OR lower(COALESCE(users.name, '')) LIKE ? OR lower(COALESCE(users.email, '')) LIKE ?)
           AND (? = 'all' OR (? = 'admin' AND users.is_admin = 1) OR (? = 'user' AND users.is_admin = 0))
-          AND (? = 'all' OR (? = 'enabled' AND users.is_disabled = 0) OR (? = 'disabled' AND users.is_disabled = 1))
+          AND (
+            ? = 'all'
+            OR (? = 'enabled' AND users.is_disabled = 0 AND users.paused_at IS NULL)
+            OR (? = 'paused' AND users.is_disabled = 0 AND users.paused_at IS NOT NULL)
+            OR (? = 'disabled' AND users.is_disabled = 1)
+          )
         ORDER BY users.created_at ASC, users.id ASC
         LIMIT ? OFFSET ?
         "#,
@@ -781,6 +927,7 @@ pub async fn admin_list_users(
     .bind(role.as_str())
     .bind(role.as_str())
     .bind(role.as_str())
+    .bind(status.as_str())
     .bind(status.as_str())
     .bind(status.as_str())
     .bind(status.as_str())
@@ -797,7 +944,7 @@ pub async fn admin_list_users(
             .map_err(ApiError::internal)?;
 
     let active_admin_total = sqlx::query_scalar::<_, i64>(
-        r#"SELECT COUNT(*) FROM users WHERE is_admin = 1 AND is_disabled = 0"#,
+        r#"SELECT COUNT(*) FROM users WHERE is_admin = 1 AND is_disabled = 0 AND paused_at IS NULL"#,
     )
     .fetch_one(&state.pool)
     .await
@@ -835,12 +982,13 @@ pub async fn admin_patch_user(
         id: String,
         is_admin: i64,
         is_disabled: i64,
+        paused_at: Option<String>,
     }
 
     let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     let target = sqlx::query_as::<_, AdminPatchTargetRow>(
         r#"
-        SELECT id, is_admin, is_disabled
+        SELECT id, is_admin, is_disabled, paused_at
         FROM users
         WHERE id = ?
         "#,
@@ -863,8 +1011,9 @@ pub async fn admin_patch_user(
 
     let target_is_admin = target.is_admin != 0;
     let target_is_disabled = target.is_disabled != 0;
-    let target_is_active_admin = target_is_admin && !target_is_disabled;
-    let next_is_active_admin = next_is_admin && !next_is_disabled;
+    let target_is_paused = target.paused_at.is_some();
+    let target_is_active_admin = target_is_admin && !target_is_disabled && !target_is_paused;
+    let next_is_active_admin = next_is_admin && !next_is_disabled && !target_is_paused;
 
     let admin_count = if target_is_admin && !next_is_admin {
         sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM users WHERE is_admin = 1"#)
@@ -877,7 +1026,7 @@ pub async fn admin_patch_user(
 
     let active_admin_count = if target_is_active_admin && !next_is_active_admin {
         sqlx::query_scalar::<_, i64>(
-            r#"SELECT COUNT(*) FROM users WHERE is_admin = 1 AND is_disabled = 0"#,
+            r#"SELECT COUNT(*) FROM users WHERE is_admin = 1 AND is_disabled = 0 AND paused_at IS NULL"#,
         )
         .fetch_one(&mut *tx)
         .await
@@ -891,6 +1040,7 @@ pub async fn admin_patch_user(
         target_user_id: target.id,
         target_is_admin,
         target_is_disabled,
+        target_is_paused,
         next_is_admin,
         next_is_disabled,
         admin_count,
@@ -924,11 +1074,13 @@ pub async fn admin_patch_user(
             FROM starred_repos sr
             JOIN users starred_users ON starred_users.id = sr.user_id
             WHERE starred_users.is_disabled = 0
+              AND starred_users.paused_at IS NULL
             UNION ALL
             SELECT ob.user_id, ob.repo_id
             FROM owned_repo_star_baselines ob
             JOIN users owned_users ON owned_users.id = ob.user_id
             WHERE owned_users.is_disabled = 0
+              AND owned_users.paused_at IS NULL
               AND owned_users.include_own_releases != 0
           ) repo_sources
           GROUP BY repo_sources.user_id
@@ -942,6 +1094,12 @@ pub async fn admin_patch_user(
           users.email,
           users.is_admin,
           users.is_disabled,
+          users.paused_at,
+          CASE
+            WHEN users.is_disabled != 0 THEN 'disabled'
+            WHEN users.paused_at IS NOT NULL THEN 'paused'
+            ELSE 'enabled'
+          END AS account_status,
           COALESCE(repo_totals.repo_total, 0) AS repo_total,
           users.include_own_releases,
           users.last_active_at,
@@ -20678,9 +20836,22 @@ fn ensure_account_enabled(is_disabled: bool) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn ensure_account_active(is_disabled: bool, is_paused: bool) -> Result<(), ApiError> {
+    ensure_account_enabled(is_disabled)?;
+    if is_paused {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "account_paused",
+            "account is paused",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct SessionAccessRow {
     is_disabled: i64,
+    paused_at: Option<String>,
     last_active_at: Option<String>,
 }
 
@@ -20691,7 +20862,7 @@ pub(crate) async fn require_active_user_id(
     let user_id = require_user_id(session).await?;
     let row = sqlx::query_as::<_, SessionAccessRow>(
         r#"
-        SELECT is_disabled, last_active_at
+        SELECT is_disabled, paused_at, last_active_at
         FROM users
         WHERE id = ?
         "#,
@@ -20710,8 +20881,10 @@ pub(crate) async fn require_active_user_id(
         ));
     };
 
-    if let Err(err) = ensure_account_enabled(row.is_disabled != 0) {
-        session.clear().await;
+    if let Err(err) = ensure_account_active(row.is_disabled != 0, row.paused_at.is_some()) {
+        if err.code() == "account_disabled" {
+            session.clear().await;
+        }
         return Err(err);
     }
 
@@ -20844,8 +21017,8 @@ mod tests {
         load_pending_access_sync_reason, load_viewer_user, looks_like_json_blob,
         map_job_action_error, map_public_compare_fallback_error, mark_translation_requested,
         markdown_structure_preserved, me, me_create_api_key, me_delete_api_key, me_delete_passkey,
-        me_get_api_keys, normalize_markdown_translation_output, normalize_translation_fields,
-        parse_batch_notification_translation_payload,
+        me_get_api_keys, me_resume, normalize_markdown_translation_output,
+        normalize_translation_fields, parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_feed_types, parse_llm_models, parse_positive_admin_concurrency,
         parse_release_id_param, parse_release_smart_summary_payload,
@@ -21843,6 +22016,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paused_user_api_key_is_rejected_as_account_paused() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let Json(created) = me_create_api_key(
+            State(state.clone()),
+            setup_session(1).await,
+            Json(CreateApiKeyRequest { name: None }),
+        )
+        .await
+        .expect("create API key");
+        sqlx::query("UPDATE users SET paused_at = ? WHERE id = ?")
+            .bind("2026-02-23T03:15:00Z")
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("pause API key owner");
+
+        let err = require_business_user_id(
+            state.as_ref(),
+            &empty_session(),
+            &bearer_headers(created.api_key.as_str()),
+        )
+        .await
+        .expect_err("paused user API key should fail");
+        assert_eq!(err.code(), "account_paused");
+    }
+
+    #[tokio::test]
     async fn api_key_management_remains_session_only() {
         let pool = setup_pool().await;
         let state = setup_state(pool);
@@ -22261,6 +22462,171 @@ mod tests {
         .await
         .expect("count inflight access refresh tasks");
         assert_eq!(inflight, 1);
+    }
+
+    #[tokio::test]
+    async fn paused_me_returns_effective_status_without_activity_or_access_sync_side_effects() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+        let last_active_at = "2026-01-11T08:00:00Z";
+        let paused_at = "2026-02-23T03:15:00Z";
+        set_last_active_at(&pool, user_id.as_str(), Some(last_active_at)).await;
+        sqlx::query("UPDATE users SET paused_at = ? WHERE id = ?")
+            .bind(paused_at)
+            .bind(user_id.as_str())
+            .execute(&pool)
+            .await
+            .expect("pause test user");
+        let session = setup_session(1).await;
+        let probe = session.clone();
+
+        let Json(response) = me(State(state), session)
+            .await
+            .expect("paused session can read me");
+
+        assert_eq!(response.user.account_status, "paused");
+        assert_eq!(response.user.paused_at.as_deref(), Some(paused_at));
+        assert_eq!(response.access_sync.reason, "none");
+        let persisted_last_active_at = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT last_active_at FROM users WHERE id = ?",
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load persisted activity");
+        assert_eq!(persisted_last_active_at.as_deref(), Some(last_active_at));
+        let access_sync_total = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM job_tasks WHERE requested_by = ? AND task_type = ?",
+        )
+        .bind(user_id.as_str())
+        .bind(jobs::TASK_SYNC_ACCESS_REFRESH)
+        .fetch_one(&pool)
+        .await
+        .expect("count access sync tasks");
+        assert_eq!(access_sync_total, 0);
+        assert_eq!(
+            probe
+                .get::<String>("user_id")
+                .await
+                .expect("read paused session"),
+            Some(user_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_session_business_guard_preserves_session_and_activity() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+        let last_active_at = "2026-01-11T08:00:00Z";
+        set_last_active_at(&pool, user_id.as_str(), Some(last_active_at)).await;
+        sqlx::query("UPDATE users SET paused_at = ? WHERE id = ?")
+            .bind("2026-02-23T03:15:00Z")
+            .bind(user_id.as_str())
+            .execute(&pool)
+            .await
+            .expect("pause test user");
+        let session = setup_session(1).await;
+        let probe = session.clone();
+
+        let err = require_active_user_id(state.as_ref(), &session)
+            .await
+            .expect_err("paused session must not access business APIs");
+        assert_eq!(err.code(), "account_paused");
+        assert_eq!(
+            probe
+                .get::<String>("user_id")
+                .await
+                .expect("read paused session"),
+            Some(user_id.clone())
+        );
+        let persisted_last_active_at = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT last_active_at FROM users WHERE id = ?",
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load persisted activity");
+        assert_eq!(persisted_last_active_at.as_deref(), Some(last_active_at));
+    }
+
+    #[tokio::test]
+    async fn me_resume_keeps_account_resumed_when_access_sync_enqueue_fails() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+        sqlx::query("UPDATE users SET paused_at = ? WHERE id = ?")
+            .bind("2026-02-23T03:15:00Z")
+            .bind(user_id.as_str())
+            .execute(&pool)
+            .await
+            .expect("pause test user");
+        sqlx::query(
+            r#"
+            CREATE TRIGGER reject_account_resume_task
+            BEFORE INSERT ON job_tasks
+            WHEN NEW.source = 'api.me_resume'
+            BEGIN
+              SELECT RAISE(ABORT, 'injected access sync enqueue failure');
+            END
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("install enqueue failure trigger");
+
+        let Json(response) = me_resume(State(state), setup_session(1).await)
+            .await
+            .expect("resume response preserves committed account state");
+
+        assert_eq!(response.status, "enabled");
+        assert_eq!(
+            response.sync_enqueue_error.as_deref(),
+            Some("access_sync_enqueue_failed")
+        );
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT paused_at, last_active_at FROM users WHERE id = ?",
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load resumed user");
+        assert!(row.0.is_none());
+        assert!(row.1.is_some());
+    }
+
+    #[tokio::test]
+    async fn me_resume_reactivates_account_and_enqueues_access_sync() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+        sqlx::query("UPDATE users SET paused_at = ? WHERE id = ?")
+            .bind("2026-02-23T03:15:00Z")
+            .bind(user_id.as_str())
+            .execute(&pool)
+            .await
+            .expect("pause test user");
+
+        let Json(response) = me_resume(State(state), setup_session(1).await)
+            .await
+            .expect("resume paused account");
+
+        assert_eq!(response.status, "enabled");
+        assert!(response.sync_enqueue_error.is_none());
+        assert_eq!(
+            response.access_sync.task_type.as_deref(),
+            Some(jobs::TASK_SYNC_ACCESS_REFRESH)
+        );
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT paused_at, last_active_at FROM users WHERE id = ?",
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load resumed user");
+        assert!(row.0.is_none());
+        assert!(row.1.is_some());
     }
 
     #[tokio::test]
@@ -22952,6 +23318,7 @@ mod tests {
             target_user_id: test_user_id(7),
             target_is_admin: true,
             target_is_disabled: false,
+            target_is_paused: false,
             next_is_admin: true,
             next_is_disabled: true,
             admin_count: 2,
@@ -22968,6 +23335,7 @@ mod tests {
             target_user_id: test_user_id(2),
             target_is_admin: true,
             target_is_disabled: false,
+            target_is_paused: false,
             next_is_admin: false,
             next_is_disabled: false,
             admin_count: 1,
@@ -22984,6 +23352,7 @@ mod tests {
             target_user_id: test_user_id(2),
             target_is_admin: true,
             target_is_disabled: false,
+            target_is_paused: false,
             next_is_admin: true,
             next_is_disabled: true,
             admin_count: 2,
@@ -23174,6 +23543,47 @@ mod tests {
             .expect("disabled viewer item");
         assert_eq!(disabled_user.repo_total, 0);
         assert!(disabled_user.is_disabled);
+    }
+
+    #[tokio::test]
+    async fn admin_list_users_filters_paused_accounts_and_excludes_their_repos() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        seed_user(&pool, 2, "paused-viewer", 0, 0).await;
+        seed_star_for_user_with_privacy(&pool, 2, 77, false).await;
+        sqlx::query("UPDATE users SET paused_at = ? WHERE id = ?")
+            .bind("2026-02-24T00:00:00Z")
+            .bind(test_user_id(2))
+            .execute(&pool)
+            .await
+            .expect("pause viewer");
+
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+        let Json(response) = admin_list_users(
+            State(state),
+            session,
+            Query(AdminUsersQuery {
+                query: None,
+                role: None,
+                status: Some("paused".to_owned()),
+                page: None,
+                page_size: None,
+            }),
+        )
+        .await
+        .expect("paused user filter should succeed");
+
+        assert_eq!(response.total, 1);
+        let paused_user = response.items.first().expect("paused viewer item");
+        assert_eq!(paused_user.id, test_user_id(2));
+        assert_eq!(paused_user.account_status, "paused");
+        assert_eq!(paused_user.repo_total, 0);
+        assert!(paused_user.paused_at.is_some());
     }
 
     struct RepoGovernanceSnapshotSeed<'a> {
