@@ -7663,6 +7663,12 @@ async fn record_repo_refresh_governance_attempt(
                        AND active_cycle_completed = 0
                        AND EXISTS (
                          SELECT 1
+                         FROM repo_refresh_governance_cycles cycles
+                         WHERE cycles.id = repo_refresh_governance_snapshots.active_cycle_id
+                           AND cycles.status = 'active'
+                       )
+                       AND EXISTS (
+                         SELECT 1
                          FROM repo_refresh_governance_cycle_members members
                          WHERE members.cycle_id = repo_refresh_governance_snapshots.active_cycle_id
                            AND members.repo_id = repo_refresh_governance_snapshots.repo_id
@@ -7674,6 +7680,12 @@ async fn record_repo_refresh_governance_attempt(
                       WHEN active_cycle_id IS NOT NULL
                        AND system_last_selected_at IS NOT NULL
                        AND active_cycle_completed = 0
+                       AND EXISTS (
+                         SELECT 1
+                         FROM repo_refresh_governance_cycles cycles
+                         WHERE cycles.id = repo_refresh_governance_snapshots.active_cycle_id
+                           AND cycles.status = 'active'
+                       )
                        AND EXISTS (
                          SELECT 1
                          FROM repo_refresh_governance_cycle_members members
@@ -7689,6 +7701,12 @@ async fn record_repo_refresh_governance_attempt(
                        AND active_cycle_completed = 0
                        AND EXISTS (
                          SELECT 1
+                         FROM repo_refresh_governance_cycles cycles
+                         WHERE cycles.id = repo_refresh_governance_snapshots.active_cycle_id
+                           AND cycles.status = 'active'
+                       )
+                       AND EXISTS (
+                         SELECT 1
                          FROM repo_refresh_governance_cycle_members members
                          WHERE members.cycle_id = repo_refresh_governance_snapshots.active_cycle_id
                            AND members.repo_id = repo_refresh_governance_snapshots.repo_id
@@ -7700,6 +7718,12 @@ async fn record_repo_refresh_governance_attempt(
                       WHEN active_cycle_id IS NOT NULL
                        AND system_last_selected_at IS NOT NULL
                        AND active_cycle_completed = 0
+                       AND EXISTS (
+                         SELECT 1
+                         FROM repo_refresh_governance_cycles cycles
+                         WHERE cycles.id = repo_refresh_governance_snapshots.active_cycle_id
+                           AND cycles.status = 'active'
+                       )
                        AND EXISTS (
                          SELECT 1
                          FROM repo_refresh_governance_cycle_members members
@@ -7738,6 +7762,12 @@ async fn record_repo_refresh_governance_attempt(
                   AND active_cycle_completed = 0
                   AND EXISTS (
                     SELECT 1
+                    FROM repo_refresh_governance_cycles cycles
+                    WHERE cycles.id = repo_refresh_governance_snapshots.active_cycle_id
+                      AND cycles.status = 'active'
+                  )
+                  AND EXISTS (
+                    SELECT 1
                     FROM repo_refresh_governance_cycle_members members
                     WHERE members.cycle_id = repo_refresh_governance_snapshots.active_cycle_id
                       AND members.repo_id = repo_refresh_governance_snapshots.repo_id
@@ -7761,6 +7791,12 @@ async fn record_repo_refresh_governance_attempt(
                             attempt_error = COALESCE(attempt_error, ?),
                             updated_at = ?
                         WHERE cycle_id = ? AND repo_id = ?
+                          AND EXISTS (
+                            SELECT 1
+                            FROM repo_refresh_governance_cycles cycles
+                            WHERE cycles.id = repo_refresh_governance_cycle_members.cycle_id
+                              AND cycles.status = 'active'
+                          )
                         "#,
                 )
                 .bind(now_rfc3339)
@@ -7782,6 +7818,13 @@ async fn record_repo_refresh_governance_attempt(
                             system_last_attempt_error = COALESCE(system_last_attempt_error, ?),
                             updated_at = ?
                         WHERE repo_id = ?
+                          AND active_cycle_id = ?
+                          AND EXISTS (
+                            SELECT 1
+                            FROM repo_refresh_governance_cycles cycles
+                            WHERE cycles.id = repo_refresh_governance_snapshots.active_cycle_id
+                              AND cycles.status = 'active'
+                          )
                         "#,
                 )
                 .bind(now_rfc3339)
@@ -7789,6 +7832,7 @@ async fn record_repo_refresh_governance_attempt(
                 .bind(attempt_error)
                 .bind(now_rfc3339)
                 .bind(repo_id)
+                .bind(active_cycle_id.as_str())
                 .execute(&mut *tx)
                 .await
                 .context("mark repo refresh snapshot cycle completion")?;
@@ -7828,6 +7872,7 @@ async fn record_repo_refresh_governance_attempt(
                                 completed_at = ?,
                                 updated_at = ?
                             WHERE id = ?
+                              AND status = 'active'
                             "#,
                     )
                     .bind(completed_repo_count)
@@ -7845,6 +7890,7 @@ async fn record_repo_refresh_governance_attempt(
                             SET completed_repo_count = ?,
                                 updated_at = ?
                             WHERE id = ?
+                              AND status = 'active'
                             "#,
                     )
                     .bind(completed_repo_count)
@@ -11515,6 +11561,89 @@ mod tests {
         assert!(row.1.is_none());
         assert_eq!(row.2.as_deref(), Some(jobs::STATUS_FAILED));
         assert_eq!(row.3.as_deref(), Some("github returned 404 Not Found"));
+    }
+
+    #[tokio::test]
+    async fn repo_refresh_governance_attempt_ignores_completed_cycle_stale_snapshot() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_repo_refresh_governance_active_member(&pool, 49, "octo/stale-cycle").await;
+        sqlx::query(
+            r#"
+            UPDATE repo_refresh_governance_cycles
+            SET status = 'completed', completed_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("2026-03-06T12:10:00Z")
+        .bind("cycle-governance-test")
+        .execute(&pool)
+        .await
+        .expect("complete stale governance cycle");
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-stale-cycle-failed",
+                repo_id: 49,
+                repo_full_name: "octo/stale-cycle",
+                status: jobs::STATUS_FAILED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 0,
+                last_candidate_failures: 1,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+
+        record_repo_refresh_governance_attempt(
+            state.as_ref(),
+            "repo-work-stale-cycle-failed",
+            jobs::STATUS_FAILED,
+            Some("github returned 404 Not Found"),
+            None,
+            "2026-03-06T12:12:00Z",
+        )
+        .await
+        .expect("ignore stale completed governance cycle attempt");
+
+        let row = sqlx::query_as::<
+            _,
+            (
+                i64,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                i64,
+            ),
+        >(
+            r#"
+            SELECT snapshots.active_cycle_completed,
+                   snapshots.system_last_attempt_at,
+                   snapshots.system_last_attempt_status,
+                   members.completed_at,
+                   members.attempt_status,
+                   cycles.completed_repo_count
+            FROM repo_refresh_governance_snapshots snapshots
+            JOIN repo_refresh_governance_cycle_members members
+              ON members.cycle_id = snapshots.active_cycle_id
+             AND members.repo_id = snapshots.repo_id
+            JOIN repo_refresh_governance_cycles cycles
+              ON cycles.id = members.cycle_id
+            WHERE snapshots.repo_id = ?
+            "#,
+        )
+        .bind(49_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("load stale governance cycle state");
+        assert_eq!(row.0, 0);
+        assert!(row.1.is_none());
+        assert!(row.2.is_none());
+        assert!(row.3.is_none());
+        assert!(row.4.is_none());
+        assert_eq!(row.5, 0);
     }
 
     #[tokio::test]
