@@ -45,6 +45,8 @@
   - `repo_refresh_governance_snapshots`
   - `repo_refresh_governance_cycles`
   - `repo_refresh_governance_cycle_members`
+  - `repo_refresh_governance_retention_state`
+  - completed-cycle retention index on `repo_refresh_governance_cycles`
 - scheduler:
   - 有效关注池聚合
   - repo governance snapshot rebuild
@@ -104,8 +106,9 @@
   - 当前轮完成后写入“上次完成全量更新时间”。
 - 已选中但卡在旧语义下的 active cycle 必须在治理快照重建时自动 reconciliation：若系统选中时间之后已经存在终态 release work item，则补写 member `completed_at/attempt_status/attempt_error` 与 snapshot `system_last_attempt_*`，并按新语义推进 cycle 计数。
 - reconciliation、终态补账与候选选择只能读取 `status='active'` 的 cycle；已完成历史不得进入在线治理查询。
-- cycle 完成后以 500 行短事务删除其 member 明细，cycle 汇总行继续保留。
-- 存量历史每分钟最多删除 50000 行；SQLite busy 或前台写入积压时立即让步，并在后续维护轮次继续。
+- cycle 完成后以最多 500 行的短事务删除其 member 明细，cycle 汇总行继续保留。
+- 存量历史以 SQLite 持久化的共享时间窗限流，每分钟最多删除 50000 行；预算跨进程 owner 与重启连续生效。SQLite busy 或前台写入积压时立即让步，并在后续维护轮次继续。
+- 新建 SQLite 数据库在启用 WAL 前配置 incremental auto-vacuum；既有生产库不得由在线任务自动执行 full `VACUUM` 转换，转换仍需单独批准的维护窗口。
 
 ### 闲置账号暂停
 
@@ -188,7 +191,11 @@
 
 - Given 治理库存在已完成 cycle 的大量 member 历史
   When 治理重建与在线清理运行
-  Then 在线查询只扫描 active cycle，历史以受限短事务渐进删除，cycle 汇总仍可查询。
+  Then 在线查询只扫描 active cycle，历史以最多 500 行短事务渐进删除，所有 owner 与重启共享每分钟 50000 行预算，cycle 汇总仍可查询。
+
+- Given 新建 SQLite 数据库初始化治理功能
+  When 应用配置运行时数据库
+  Then 在 WAL 启用前配置 incremental auto-vacuum，且不会自动对既有生产库执行 full `VACUUM`。
 
 - Given 管理员在仓库明细中选择目标窗口 `W1` 与 `W3`，并把迫切值范围设为 `2.0-4.0`
   When 前端防抖后请求 `GET /api/admin/repos`

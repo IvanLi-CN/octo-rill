@@ -5,7 +5,7 @@
 - Lifecycle: active
 - Implementation: 已交付
 - Created: 2026-06-29
-- Last: 2026-07-05
+- Last: 2026-08-06
 - Summary: 已交付；effective repo pool、10 分钟 budgeted governance snapshots、attempt-based system cycle ledger、chunked governance rebuild、`/admin/repos` 独立治理页、预算编辑收口到订阅同步设置弹窗、仓库明细目标窗口/迫切值筛选、Storybook 视觉证据与 build validation 已完成
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
@@ -14,7 +14,7 @@
 
 - Integration branch: `prd/repo-refresh-governance`
 - Account suspension: tracked by the inactive-account-suspension ticket.
-- Governance retention: tracked by the governance-retention ticket.
+- Governance retention: active-cycle reconciliation excludes completed history; completed member rows are pruned in best-effort 500-row transactions under a SQLite-persisted, shared 50000-row-per-minute budget while cycle summaries remain queryable.
 - Existing production databases require a separately approved maintenance window before converting to incremental auto-vacuum with a full `VACUUM`.
 
 ## 实现里程碑
@@ -28,6 +28,7 @@
 - [x] M7: final frontend build / storybook / e2e validation sweep
 - [x] M8: system attempt ledger, failure recording, and active cycle reconciliation
 - [x] M9: governance rebuild 分阶段 chunked writer，避免大候选池与 cycle member reconciliation 长时间占用 SQLite writer。
+- [x] M10: completed-cycle member retention uses active-only queries, short best-effort deletes, and a restart-safe shared budget; new databases configure incremental auto-vacuum without scheduling a production full `VACUUM`.
 
 ## 本轮收口
 
