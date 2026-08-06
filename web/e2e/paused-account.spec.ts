@@ -116,9 +116,14 @@ test("paused session enters account recovery from GET /api/me", async ({
 	expect(apiPaths).not.toContain("/api/feed");
 });
 
-for (const [label, payload] of [
-	["invalid JSON", "not-json"],
-	["null JSON", "null"],
+for (const [label, payload, expectedError] of [
+	["invalid JSON", "not-json", "访问同步事件无效，请重试。"],
+	["null JSON", "null", "访问同步事件无效，请重试。"],
+	[
+		"object error",
+		'{"status":"failed","error":{}}',
+		"访问同步未完成，请重试。",
+	],
 ] as const) {
 	test(`malformed resume completion event (${label}) becomes a retryable failure`, async ({
 		page,
@@ -162,7 +167,7 @@ for (const [label, payload] of [
 		await page.goto("/");
 		await page.getByRole("button", { name: "恢复账号" }).click();
 
-		await expect(page.getByText("访问同步事件无效，请重试。")).toBeVisible();
+		await expect(page.getByText(expectedError)).toBeVisible();
 		await expect(page.getByRole("button", { name: "重试同步" })).toBeVisible();
 	});
 }
