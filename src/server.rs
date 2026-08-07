@@ -16,7 +16,10 @@ use axum::{
 use serde_json::json;
 use sqlx::{
     SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+    sqlite::{
+        SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions,
+        SqliteSynchronous,
+    },
 };
 use time::Duration;
 use tokio::task::AbortHandle;
@@ -187,6 +190,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(api_version).layer(middleware::from_fn(version_no_store_cache)),
         )
         .route("/me", get(api::me))
+        .route("/me/resume", post(api::me_resume))
         .route("/me/personal-repos", get(api::list_personal_repos))
         .route(
             "/me/profile",
@@ -491,6 +495,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         jobs::spawn_hourly_scheduler(app_state.clone());
         jobs::spawn_subscription_scheduler(app_state.clone());
         jobs::spawn_recent_failures_retry_scheduler(app_state.clone());
+        jobs::spawn_account_pause_scheduler(app_state.clone());
         jobs::spawn_admin_dashboard_rollup_scheduler(app_state.clone());
         if let Err(err) = jobs::enqueue_brief_history_recompute_if_needed(app_state.as_ref()).await
         {
@@ -504,6 +509,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             .as_ref()
             .map(|_| ai::spawn_model_catalog_sync_task(app_state.clone()));
         let llm_call_retention_abort_handle = ai::spawn_llm_call_retention_task(app_state.clone());
+        let repo_governance_retention_abort_handle =
+            sync::spawn_repo_refresh_governance_retention_task(app_state.clone());
         let llm_call_recovery_abort_handle = ai::spawn_llm_call_recovery_task(app_state.clone());
         translations::spawn_translation_scheduler(app_state.clone()).await;
         let translation_recovery_abort_handle =
@@ -514,6 +521,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         let mut abort_handles = vec![
             deletion_abort_handle,
             llm_call_retention_abort_handle,
+            repo_governance_retention_abort_handle,
             llm_call_recovery_abort_handle,
             task_recovery_abort_handle,
             repo_release_recovery_abort_handle,
@@ -586,6 +594,7 @@ fn build_sqlite_connect_options(database_url: &str) -> Result<SqliteConnectOptio
         .create_if_missing(true)
         .foreign_keys(true)
         .busy_timeout(SQLITE_BUSY_TIMEOUT)
+        .auto_vacuum(SqliteAutoVacuum::Incremental)
         .synchronous(SqliteSynchronous::Normal);
 
     if database_url != "sqlite::memory:" {
@@ -1504,6 +1513,16 @@ mod tests {
             .await
             .expect("read sqlite pragmas");
 
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations after configuring a new database");
+
+        let auto_vacuum = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
+            .fetch_one(&pool)
+            .await
+            .expect("read auto vacuum after migrations");
+        assert_eq!(auto_vacuum, 2);
         assert_eq!(pragmas.journal_mode, "wal");
         assert_eq!(pragmas.busy_timeout_ms, 5000);
         assert_eq!(pragmas.synchronous, 1);

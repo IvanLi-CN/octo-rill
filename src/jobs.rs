@@ -15,7 +15,7 @@ use axum::response::{
     IntoResponse, Response,
     sse::{Event, KeepAlive, Sse},
 };
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Timelike, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -123,6 +123,10 @@ struct DueDailySlotUser {
 
 const SUBSCRIPTION_SCHEDULE_NAME: &str = "sync.subscriptions";
 const RETRY_RECENT_FAILURES_SCHEDULE_NAME: &str = "retry.recent_failures";
+const ACCOUNT_PAUSE_SCHEDULE_NAME: &str = "account.pause_inactive";
+const ACCOUNT_PAUSE_LOCAL_TIME: NaiveTime =
+    NaiveTime::from_hms_opt(3, 15, 0).expect("valid fixed local time");
+const ACCOUNT_PAUSE_INACTIVITY_DAYS: i64 = 30;
 const ADMIN_DASHBOARD_ROLLUP_SCHEDULER_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const RETRY_RECENT_FAILURES_MAX_ITEMS_PER_KIND: i64 = 100;
 const RETRY_RECENT_FAILURES_KIND_BUDGET: Duration = Duration::from_secs(10 * 60);
@@ -223,6 +227,99 @@ pub fn spawn_recent_failures_retry_scheduler(state: Arc<AppState>) {
             tokio::time::sleep(Duration::from_secs(20)).await;
         }
     });
+}
+
+pub fn spawn_account_pause_scheduler(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = run_account_pause_maintenance_if_due(state.as_ref(), Utc::now()).await
+            {
+                tracing::warn!(?err, "account pause scheduler: maintenance failed");
+            }
+            tokio::time::sleep(Duration::from_secs(45)).await;
+        }
+    });
+}
+
+pub async fn run_account_pause_maintenance_if_due(
+    state: &AppState,
+    now: DateTime<Utc>,
+) -> Result<Option<i64>> {
+    let time_zone: Tz = state
+        .config
+        .app_default_time_zone
+        .parse()
+        .with_context(|| {
+            format!(
+                "invalid app default time zone {}",
+                state.config.app_default_time_zone
+            )
+        })?;
+    let local_now = now.with_timezone(&time_zone);
+    if local_now.time() < ACCOUNT_PAUSE_LOCAL_TIME {
+        return Ok(None);
+    }
+    let schedule_key = local_now.date_naive().format("%Y-%m-%d").to_string();
+    let pause_before = now - chrono::Duration::days(ACCOUNT_PAUSE_INACTIVITY_DAYS);
+    let paused_at = now.to_rfc3339();
+    let schedule_updated_at = paused_at.clone();
+
+    let (_writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "account_pause_maintenance")
+        .await
+        .context("begin account pause maintenance")?;
+    let previous_key = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT last_dispatch_key FROM scheduled_task_dispatch_state WHERE schedule_name = ?",
+    )
+    .bind(ACCOUNT_PAUSE_SCHEDULE_NAME)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("load account pause dispatch state")?
+    .flatten();
+    if previous_key.as_deref() == Some(schedule_key.as_str()) {
+        tx.commit()
+            .await
+            .context("commit unchanged account pause maintenance")?;
+        return Ok(None);
+    }
+
+    let result = sqlx::query(
+        r#"
+        UPDATE users
+        SET paused_at = ?, updated_at = ?
+        WHERE is_disabled = 0
+          AND paused_at IS NULL
+          AND COALESCE(last_active_at, created_at) <= ?
+        "#,
+    )
+    .bind(paused_at.as_str())
+    .bind(paused_at.as_str())
+    .bind(pause_before.to_rfc3339())
+    .execute(&mut *tx)
+    .await
+    .context("pause inactive accounts")?;
+    sqlx::query(
+        r#"
+        INSERT INTO scheduled_task_dispatch_state (
+          schedule_name, last_dispatch_key, last_task_id, updated_at
+        ) VALUES (?, ?, NULL, ?)
+        ON CONFLICT(schedule_name) DO UPDATE SET
+          last_dispatch_key = excluded.last_dispatch_key,
+          last_task_id = NULL,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(ACCOUNT_PAUSE_SCHEDULE_NAME)
+    .bind(schedule_key.as_str())
+    .bind(schedule_updated_at.as_str())
+    .execute(&mut *tx)
+    .await
+    .context("record account pause dispatch state")?;
+    tx.commit()
+        .await
+        .context("commit account pause maintenance")?;
+    Ok(Some(result.rows_affected() as i64))
 }
 
 pub fn spawn_admin_dashboard_rollup_scheduler(state: Arc<AppState>) {
@@ -1882,6 +1979,15 @@ async fn execute_task(
     task_type: &str,
     payload: &Value,
 ) -> Result<Value> {
+    if let Some(user_id) = payload.get("user_id").and_then(Value::as_str)
+        && !user_is_background_eligible(state, user_id).await?
+    {
+        return Ok(json!({
+            "skipped": true,
+            "skip_reason": "account_inactive",
+            "user_id": user_id,
+        }));
+    }
     match task_type {
         TASK_SYNC_STARRED => {
             let user_id = payload_local_id(payload, "user_id")?;
@@ -1993,6 +2099,17 @@ async fn execute_task(
         }
         _ => Err(anyhow!("unsupported task_type: {task_type}")),
     }
+}
+
+async fn user_is_background_eligible(state: &AppState, user_id: &str) -> Result<bool> {
+    let eligible = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM users WHERE id = ? AND is_disabled = 0 AND paused_at IS NULL",
+    )
+    .bind(user_id)
+    .fetch_one(&state.pool)
+    .await
+    .context("check user background eligibility")?;
+    Ok(eligible != 0)
 }
 
 type TaskStepFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -2115,6 +2232,24 @@ async fn execute_daily_slot_task(
         {
             canceled = true;
             break;
+        }
+
+        if !user_is_background_eligible(state, user.user_id.as_str()).await? {
+            append_task_event(
+                state,
+                task_id,
+                "task.progress",
+                json!({
+                    "task_id": task_id,
+                    "stage": "skip",
+                    "index": index + 1,
+                    "total": due_users.len(),
+                    "user_id": user.user_id,
+                    "skip_reason": "account_inactive",
+                }),
+            )
+            .await?;
+            continue;
         }
 
         append_task_event(
@@ -2245,6 +2380,7 @@ async fn collect_due_daily_slot_user_snapshots(
           last_active_at
         FROM users
         WHERE is_disabled = 0
+          AND paused_at IS NULL
         ORDER BY
           CASE WHEN last_active_at IS NULL THEN 1 ELSE 0 END ASC,
           last_active_at DESC,
@@ -2470,6 +2606,25 @@ async fn execute_brief_history_recompute_task(state: &AppState, task_id: &str) -
             break;
         }
 
+        if !user_is_background_eligible(state, row.user_id.as_str()).await? {
+            append_task_event(
+                state,
+                task_id,
+                "task.progress",
+                json!({
+                    "task_id": task_id,
+                    "stage": "skip",
+                    "total": total,
+                    "brief_id": row.id,
+                    "user_id": row.user_id,
+                    "date": row.date,
+                    "skip_reason": "account_inactive",
+                }),
+            )
+            .await?;
+            continue;
+        }
+
         processed += 1;
         append_task_event(
             state,
@@ -2642,6 +2797,25 @@ async fn execute_brief_refresh_content_task(state: &AppState, task_id: &str) -> 
         {
             canceled = true;
             break;
+        }
+
+        if !user_is_background_eligible(state, row.user_id.as_str()).await? {
+            append_task_event(
+                state,
+                task_id,
+                "task.progress",
+                json!({
+                    "task_id": task_id,
+                    "stage": "skip",
+                    "total": total,
+                    "brief_id": row.id,
+                    "user_id": row.user_id,
+                    "date": row.date,
+                    "skip_reason": "account_inactive",
+                }),
+            )
+            .await?;
+            continue;
         }
 
         processed += 1;
@@ -2859,15 +3033,18 @@ async fn load_recent_failed_brief_retry_candidates(
 ) -> Result<Vec<RetryBriefCandidateRow>> {
     sqlx::query_as::<_, RetryBriefCandidateRow>(
         r#"
-        SELECT id, user_id, date
+        SELECT briefs.id, briefs.user_id, briefs.date
         FROM briefs
-        WHERE generation_source = 'content_refresh_failed'
-          AND window_start_utc IS NOT NULL
-          AND window_end_utc IS NOT NULL
-          AND effective_time_zone IS NOT NULL
-          AND effective_local_boundary IS NOT NULL
-          AND datetime(updated_at) >= datetime('now', '-1 day')
-        ORDER BY updated_at DESC, created_at DESC, id DESC
+        JOIN users ON users.id = briefs.user_id
+        WHERE users.is_disabled = 0
+          AND users.paused_at IS NULL
+          AND briefs.generation_source = 'content_refresh_failed'
+          AND briefs.window_start_utc IS NOT NULL
+          AND briefs.window_end_utc IS NOT NULL
+          AND briefs.effective_time_zone IS NOT NULL
+          AND briefs.effective_local_boundary IS NOT NULL
+          AND datetime(briefs.updated_at) >= datetime('now', '-1 day')
+        ORDER BY briefs.updated_at DESC, briefs.created_at DESC, briefs.id DESC
         LIMIT ?
         "#,
     )
@@ -2884,19 +3061,22 @@ async fn load_recent_failed_translation_retry_candidates(
     let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         r#"
         SELECT
-          id,
-          scope_user_id,
-          kind,
-          variant,
-          entity_id,
-          target_lang,
-          source_hash,
-          source_blocks_json,
-          target_slots_json,
-          result_status,
-          error_text
+          translation_work_items.id,
+          translation_work_items.scope_user_id,
+          translation_work_items.kind,
+          translation_work_items.variant,
+          translation_work_items.entity_id,
+          translation_work_items.target_lang,
+          translation_work_items.source_hash,
+          translation_work_items.source_blocks_json,
+          translation_work_items.target_slots_json,
+          translation_work_items.result_status,
+          translation_work_items.error_text
         FROM translation_work_items
-        WHERE kind IN (
+        JOIN users ON users.id = translation_work_items.scope_user_id
+        WHERE users.is_disabled = 0
+          AND users.paused_at IS NULL
+          AND translation_work_items.kind IN (
         "#,
     );
     {
@@ -2907,33 +3087,33 @@ async fn load_recent_failed_translation_retry_candidates(
     }
     query.push(
         r#")
-          AND status IN ('completed', 'failed')
-          AND result_status IN ('error', 'missing')
-          AND datetime(updated_at) >= datetime('now', '-1 day')
+          AND translation_work_items.status IN ('completed', 'failed')
+          AND translation_work_items.result_status IN ('error', 'missing')
+          AND datetime(translation_work_items.updated_at) >= datetime('now', '-1 day')
           AND (
-            (result_status = 'missing' AND error_text IS NULL)
+            (translation_work_items.result_status = 'missing' AND translation_work_items.error_text IS NULL)
             OR (
-              result_status = 'error'
-              AND error_text IS NOT NULL
+              translation_work_items.result_status = 'error'
+              AND translation_work_items.error_text IS NOT NULL
               AND (
-                lower(error_text) LIKE '%runtime_lease_expired%'
-                OR lower(error_text) LIKE '%repo scope required; re-login via github oauth%'
-                OR lower(error_text) LIKE '%database is locked%'
-                OR lower(error_text) LIKE '%busy%'
-                OR lower(error_text) LIKE '%timed out%'
-                OR lower(error_text) LIKE '%timeout%'
-                OR lower(error_text) LIKE '%temporarily unavailable%'
-                OR lower(error_text) LIKE '%connection reset%'
-                OR lower(error_text) LIKE '%connection refused%'
+                lower(translation_work_items.error_text) LIKE '%runtime_lease_expired%'
+                OR lower(translation_work_items.error_text) LIKE '%repo scope required; re-login via github oauth%'
+                OR lower(translation_work_items.error_text) LIKE '%database is locked%'
+                OR lower(translation_work_items.error_text) LIKE '%busy%'
+                OR lower(translation_work_items.error_text) LIKE '%timed out%'
+                OR lower(translation_work_items.error_text) LIKE '%timeout%'
+                OR lower(translation_work_items.error_text) LIKE '%temporarily unavailable%'
+                OR lower(translation_work_items.error_text) LIKE '%connection reset%'
+                OR lower(translation_work_items.error_text) LIKE '%connection refused%'
                 OR (
-                  kind IN ('release_smart', 'release_summary', 'release_detail')
+                  translation_work_items.kind IN ('release_smart', 'release_summary', 'release_detail')
                   AND (
-                    lower(error_text) LIKE '%chat upstream returned 403%'
+                    lower(translation_work_items.error_text) LIKE '%chat upstream returned 403%'
                     OR (
-                      lower(error_text) LIKE '%403 forbidden%'
+                      lower(translation_work_items.error_text) LIKE '%403 forbidden%'
                       AND (
-                        lower(error_text) LIKE '%chat%'
-                        OR lower(error_text) LIKE '%upstream%'
+                        lower(translation_work_items.error_text) LIKE '%chat%'
+                        OR lower(translation_work_items.error_text) LIKE '%upstream%'
                       )
                     )
                   )
@@ -2941,7 +3121,7 @@ async fn load_recent_failed_translation_retry_candidates(
               )
             )
           )
-        ORDER BY updated_at DESC, created_at DESC, id DESC
+        ORDER BY translation_work_items.updated_at DESC, translation_work_items.created_at DESC, translation_work_items.id DESC
         LIMIT "#,
     );
     query.push_bind(RETRY_RECENT_FAILURES_MAX_ITEMS_PER_KIND);
@@ -3123,6 +3303,24 @@ async fn retry_recent_failed_briefs(state: &AppState, task_id: &str) -> Result<R
             summary.timed_out = true;
             break;
         }
+        if !user_is_background_eligible(state, row.user_id.as_str()).await? {
+            summary.skipped += 1;
+            append_task_event(
+                state,
+                task_id,
+                "task.progress",
+                json!({
+                    "task_id": task_id,
+                    "stage": "item_skipped",
+                    "kind": summary.kind,
+                    "brief_id": row.id,
+                    "user_id": row.user_id,
+                    "skip_reason": "account_inactive",
+                }),
+            )
+            .await?;
+            continue;
+        }
         summary.processed += 1;
         summary.current_id = Some(row.id.clone());
         append_task_event(
@@ -3218,6 +3416,24 @@ async fn retry_recent_failed_translation_kind(
             break;
         }
         summary.current_id = Some(row.id.clone());
+        if !user_is_background_eligible(state, row.scope_user_id.as_str()).await? {
+            summary.skipped += 1;
+            append_task_event(
+                state,
+                task_id,
+                "task.progress",
+                json!({
+                    "task_id": task_id,
+                    "stage": "item_skipped",
+                    "kind": summary.kind,
+                    "work_item_id": row.id,
+                    "user_id": row.scope_user_id,
+                    "skip_reason": "account_inactive",
+                }),
+            )
+            .await?;
+            continue;
+        }
         if !retry_candidate_is_retryable(row) {
             summary.skipped += 1;
             append_task_event(
@@ -3746,7 +3962,8 @@ mod tests {
         load_translation_stream_cursor, load_translation_stream_rows, mark_brief_generation_source,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
         recover_runtime_state, recover_runtime_state_on_startup, retry_candidate_is_retryable,
-        update_daily_brief_hour_slot_dispatch, upsert_dispatch_state,
+        run_account_pause_maintenance_if_due, update_daily_brief_hour_slot_dispatch,
+        upsert_dispatch_state,
     };
     use chrono::{Duration, NaiveTime, TimeZone, Utc};
     use serde_json::{Value, json};
@@ -5421,6 +5638,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recent_failure_retry_candidates_exclude_paused_users() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 90_010, "paused-retry-user").await;
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date, window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary, generation_source,
+              content_markdown, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-paused-retry")
+        .bind("90010")
+        .bind("2026-03-07")
+        .bind("2026-03-06T16:00:00Z")
+        .bind("2026-03-07T16:00:00Z")
+        .bind("Asia/Shanghai")
+        .bind("08:00")
+        .bind("content_refresh_failed")
+        .bind("failed fallback")
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("seed failed brief");
+        sqlx::query(
+            r#"
+            INSERT INTO translation_work_items (
+              id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang,
+              protocol_version, model_profile, source_hash, source_blocks_json,
+              target_slots_json, token_estimate, deadline_at, status, result_status,
+              error_text, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("work-paused-retry")
+        .bind("dedupe-paused-retry")
+        .bind("90010")
+        .bind("release_smart")
+        .bind("default")
+        .bind("release-paused")
+        .bind("zh-CN")
+        .bind("v1")
+        .bind("default")
+        .bind("hash-paused")
+        .bind("[]")
+        .bind("[]")
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind("failed")
+        .bind("error")
+        .bind("timed out")
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("seed failed translation work item");
+        sqlx::query("UPDATE users SET paused_at = ? WHERE id = ?")
+            .bind(now.as_str())
+            .bind("90010")
+            .execute(&pool)
+            .await
+            .expect("pause retry user");
+
+        assert!(
+            load_recent_failed_brief_retry_candidates(state.as_ref())
+                .await
+                .expect("load brief retry candidates")
+                .is_empty()
+        );
+        assert!(
+            load_recent_failed_translation_retry_candidates(state.as_ref(), &["release_smart"],)
+                .await
+                .expect("load translation retry candidates")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn recent_failed_translation_retry_candidates_include_upstream_403() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -6572,5 +6872,64 @@ mod tests {
             .expect("re-enqueue refresh")
             .expect("retry task id");
         assert!(!retry_task_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn account_pause_maintenance_recovers_missed_run_and_is_idempotent() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 901, "inactive-account").await;
+        seed_user(&pool, 902, "recent-account").await;
+        seed_user(&pool, 903, "disabled-account").await;
+
+        sqlx::query("UPDATE users SET last_active_at = ?, is_disabled = ? WHERE id = ?")
+            .bind("2026-02-01T00:00:00Z")
+            .bind(0_i64)
+            .bind("901")
+            .execute(&pool)
+            .await
+            .expect("mark inactive account");
+        sqlx::query("UPDATE users SET last_active_at = ?, is_disabled = ? WHERE id = ?")
+            .bind("2026-03-06T23:00:00Z")
+            .bind(0_i64)
+            .bind("902")
+            .execute(&pool)
+            .await
+            .expect("mark recent account");
+        sqlx::query("UPDATE users SET last_active_at = ?, is_disabled = ? WHERE id = ?")
+            .bind("2026-01-01T00:00:00Z")
+            .bind(1_i64)
+            .bind("903")
+            .execute(&pool)
+            .await
+            .expect("mark disabled account");
+
+        // 10:00 Asia/Shanghai: the 03:15 local run was missed and must recover.
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 7, 2, 0, 0)
+            .single()
+            .expect("valid datetime");
+        assert_eq!(
+            run_account_pause_maintenance_if_due(state.as_ref(), now)
+                .await
+                .expect("run account pause maintenance"),
+            Some(1)
+        );
+        assert_eq!(
+            run_account_pause_maintenance_if_due(state.as_ref(), now)
+                .await
+                .expect("repeat account pause maintenance"),
+            None
+        );
+
+        let rows = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT id, paused_at FROM users WHERE id IN ('901', '902', '903') ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("load pause state");
+        assert!(rows[0].1.is_some());
+        assert_eq!(rows[1].1, None);
+        assert_eq!(rows[2].1, None);
     }
 }

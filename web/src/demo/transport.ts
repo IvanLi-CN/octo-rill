@@ -8,6 +8,7 @@ import {
 import type { AdminUserItem } from "@/admin/UserManagement";
 import type {
 	AdminDashboardResponse,
+	AccountResumeResponse,
 	AdminLlmCallDetailResponse,
 	AdminRealtimeTaskDetailResponse,
 	AdminRealtimeTaskItem,
@@ -921,6 +922,40 @@ export const demoHandlers = [
 			);
 		}
 		return json(model.me);
+	}),
+	http.post("/api/me/resume", async ({ request }) => {
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		const taskId = "task-demo-account-resume";
+		ensureTaskStream(taskId, buildSyncFrames(taskId));
+		requireRuntimeAccess().updateModel((model) => ({
+			...model,
+			me: model.me
+				? {
+						...model.me,
+						user: {
+							...model.me.user,
+							account_status: "enabled",
+							paused_at: null,
+						},
+					}
+				: null,
+		}));
+		requireRuntimeAccess().recordMutation(
+			"Resume paused account",
+			"Cleared the simulated pause and queued in-memory access sync.",
+		);
+		const response: AccountResumeResponse = {
+			status: "enabled",
+			access_sync: {
+				task_id: taskId,
+				task_type: "sync.access_refresh",
+				event_path: `/api/tasks/${taskId}/events`,
+				reason: "account_resumed",
+			},
+			sync_enqueue_error: null,
+		};
+		return json(response);
 	}),
 	http.get("/api/feed", async ({ request }) => {
 		const url = new URL(request.url);

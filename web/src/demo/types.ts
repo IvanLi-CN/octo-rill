@@ -31,7 +31,8 @@ export type DemoSceneId =
 	| "public-release-highlight-discrete"
 	| "public-release-highlight-range"
 	| "admin-panel-users"
-	| "admin-jobs-running";
+	| "admin-jobs-running"
+	| "paused-account-resume";
 
 export type DemoPersonaId = "guest" | "member" | "admin";
 
@@ -101,6 +102,7 @@ export type DemoShareState = {
 	networkMode: DemoNetworkMode;
 	includeOwnReleases: boolean;
 	publicationState: DemoPublicationState;
+	controlsHidden: boolean;
 };
 
 export type DemoShareStatePatch = Partial<DemoShareState>;

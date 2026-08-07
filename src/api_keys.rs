@@ -23,6 +23,7 @@ struct ApiKeyAuthRow {
     id: String,
     user_id: String,
     is_disabled: i64,
+    paused_at: Option<String>,
 }
 
 pub struct ApiKeyLastUsedTouchQueue {
@@ -220,7 +221,7 @@ pub async fn authenticate_api_key(state: &AppState, api_key: &str) -> Result<Str
     let key_hash = hash_api_key(api_key);
     let row = sqlx::query_as::<_, ApiKeyAuthRow>(
         r#"
-        SELECT k.id, k.user_id, u.is_disabled
+        SELECT k.id, k.user_id, u.is_disabled, u.paused_at
         FROM user_api_keys k
         JOIN users u ON u.id = k.user_id
         WHERE k.key_hash = ?
@@ -241,6 +242,13 @@ pub async fn authenticate_api_key(state: &AppState, api_key: &str) -> Result<Str
             StatusCode::FORBIDDEN,
             "account_disabled",
             "account is disabled",
+        ));
+    }
+    if row.paused_at.is_some() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "account_paused",
+            "account is paused",
         ));
     }
 

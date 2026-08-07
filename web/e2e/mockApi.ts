@@ -12,6 +12,8 @@ type MockUser = {
 	avatar_url: string | null;
 	email: string | null;
 	is_admin: boolean;
+	account_status?: "enabled" | "paused" | "disabled";
+	paused_at?: string | null;
 };
 
 type MockAccessSync = {

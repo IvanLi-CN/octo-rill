@@ -3718,6 +3718,7 @@ async fn claim_next_batch(
     {
         return Ok(None);
     }
+    requeue_ineligible_queued_batch_items(state).await?;
     if let Some(batch) = claim_existing_queued_batch(state, &worker).await? {
         return Ok(Some(batch));
     }
@@ -3732,7 +3733,10 @@ async fn claim_next_batch(
                    w.created_at, w.started_at, w.finished_at, w.updated_at,
                    {claim_origin_case} AS request_origin
             FROM translation_work_items w
+            JOIN users u ON u.id = w.scope_user_id
             WHERE w.status = 'queued'
+              AND u.is_disabled = 0
+              AND u.paused_at IS NULL
               AND {claim_origin_case} = 'user'
             ORDER BY w.deadline_at ASC, w.created_at ASC
             LIMIT 1
@@ -3748,7 +3752,10 @@ async fn claim_next_batch(
                    w.created_at, w.started_at, w.finished_at, w.updated_at,
                    {claim_origin_case} AS request_origin
             FROM translation_work_items w
+            JOIN users u ON u.id = w.scope_user_id
             WHERE w.status = 'queued'
+              AND u.is_disabled = 0
+              AND u.paused_at IS NULL
             ORDER BY w.deadline_at ASC, w.created_at ASC
             LIMIT 1
             "#,
@@ -3771,7 +3778,10 @@ async fn claim_next_batch(
                w.created_at, w.started_at, w.finished_at, w.updated_at,
                {claim_origin_case} AS request_origin
         FROM translation_work_items w
+        JOIN users u ON u.id = w.scope_user_id
         WHERE w.status = 'queued'
+          AND u.is_disabled = 0
+          AND u.paused_at IS NULL
           AND w.target_lang = ?
           AND w.protocol_version = ?
           AND w.model_profile = ?
@@ -3875,6 +3885,13 @@ async fn claim_next_batch(
             UPDATE translation_work_items
             SET status = 'batched', batch_id = ?, updated_at = ?
             WHERE id = ? AND status = 'queued'
+              AND EXISTS (
+                SELECT 1
+                FROM users u
+                WHERE u.id = translation_work_items.scope_user_id
+                  AND u.is_disabled = 0
+                  AND u.paused_at IS NULL
+              )
             "#,
         )
         .bind(batch_id.as_str())
@@ -3936,6 +3953,118 @@ async fn claim_next_batch(
     }))
 }
 
+async fn requeue_ineligible_queued_batch_items(state: &AppState) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "translation_batch_ineligible_requeue")
+        .await?;
+    let items = sqlx::query_as::<_, (String, String)>(
+        r#"
+        SELECT b.id, w.id
+        FROM translation_batches b
+        JOIN translation_batch_items bi ON bi.batch_id = b.id
+        JOIN translation_work_items w ON w.id = bi.work_item_id
+        JOIN users u ON u.id = w.scope_user_id
+        WHERE b.status = 'queued'
+          AND (u.is_disabled = 1 OR u.paused_at IS NOT NULL)
+        ORDER BY b.id ASC, bi.item_index ASC
+        "#,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    if items.is_empty() {
+        tx.commit().await?;
+        return Ok(());
+    }
+
+    let mut batch_ids = HashSet::new();
+    for (batch_id, work_item_id) in items {
+        let request_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM translation_requests WHERE work_item_id = ?",
+        )
+        .bind(work_item_id.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        for request_id in request_ids {
+            reset_request_for_retry(&mut tx, request_id.as_str(), now.as_str()).await?;
+        }
+        reset_retryable_terminal_work_item(&mut tx, work_item_id.as_str(), now.as_str()).await?;
+        sqlx::query(
+            r#"
+            UPDATE ai_translations
+            SET status = 'queued', updated_at = ?
+            WHERE active_work_item_id = ? AND status = 'running'
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(work_item_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM translation_batch_items WHERE batch_id = ? AND work_item_id = ?")
+            .bind(batch_id.as_str())
+            .bind(work_item_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        batch_ids.insert(batch_id);
+    }
+
+    for batch_id in batch_ids {
+        sqlx::query(
+            r#"
+            UPDATE translation_batches
+            SET item_count = (
+                  SELECT COUNT(*) FROM translation_batch_items WHERE batch_id = ?
+                ),
+                request_count = (
+                  SELECT COUNT(*)
+                  FROM translation_requests
+                  WHERE work_item_id IN (
+                    SELECT work_item_id FROM translation_batch_items WHERE batch_id = ?
+                  )
+                ),
+                estimated_input_tokens = (
+                  SELECT COALESCE(SUM(token_estimate), 0)
+                  FROM translation_batch_items
+                  WHERE batch_id = ?
+                ),
+                status = CASE
+                  WHEN EXISTS (
+                    SELECT 1 FROM translation_batch_items WHERE batch_id = ?
+                  ) THEN 'queued'
+                  ELSE 'completed'
+                END,
+                finished_at = CASE
+                  WHEN EXISTS (
+                    SELECT 1 FROM translation_batch_items WHERE batch_id = ?
+                  ) THEN NULL
+                  ELSE ?
+                END,
+                updated_at = CASE
+                  WHEN EXISTS (
+                    SELECT 1 FROM translation_batch_items WHERE batch_id = ?
+                  ) THEN updated_at
+                  ELSE ?
+                END
+            WHERE id = ? AND status = 'queued'
+            "#,
+        )
+        .bind(batch_id.as_str())
+        .bind(batch_id.as_str())
+        .bind(batch_id.as_str())
+        .bind(batch_id.as_str())
+        .bind(batch_id.as_str())
+        .bind(now.as_str())
+        .bind(batch_id.as_str())
+        .bind(now.as_str())
+        .bind(batch_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn claim_existing_queued_batch(
     state: &AppState,
     worker: &TranslationWorkerProfile,
@@ -3956,6 +4085,14 @@ async fn claim_existing_queued_batch(
         WHERE status = 'queued'
           AND worker_kind = ?
           AND julianday(COALESCE(updated_at, created_at)) <= julianday(?)
+          AND NOT EXISTS (
+            SELECT 1
+            FROM translation_batch_items bi
+            JOIN translation_work_items w ON w.id = bi.work_item_id
+            JOIN users u ON u.id = w.scope_user_id
+            WHERE bi.batch_id = translation_batches.id
+              AND (u.is_disabled = 1 OR u.paused_at IS NOT NULL)
+          )
         ORDER BY created_at ASC, id ASC
         LIMIT 1
         "#,
@@ -4020,6 +4157,14 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
             updated_at = ?
         WHERE id = ?
           AND status = 'queued'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM translation_batch_items bi
+            JOIN translation_work_items w ON w.id = bi.work_item_id
+            JOIN users u ON u.id = w.scope_user_id
+            WHERE bi.batch_id = translation_batches.id
+              AND (u.is_disabled = 1 OR u.paused_at IS NOT NULL)
+          )
         "#,
     )
     .bind(now.as_str())
@@ -9248,6 +9393,170 @@ mod tests {
                 .as_deref(),
             Some("disabled")
         );
+    }
+
+    #[tokio::test]
+    async fn scheduler_does_not_claim_paused_account_translation_work() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let mut item = sample_release_item("paused-work-item");
+        item.max_wait_ms = 0;
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let work_item_id = created.result.work_item_id.clone().expect("work item id");
+        sqlx::query("UPDATE users SET paused_at = ? WHERE id = ?")
+            .bind("2026-08-06T03:15:00+08:00")
+            .bind("1")
+            .execute(&pool)
+            .await
+            .expect("pause user");
+
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim paused work");
+        assert!(batch.is_none());
+
+        let work_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ?")
+                .bind(work_item_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load paused work item");
+        assert_eq!(work_status, "queued");
+    }
+
+    #[tokio::test]
+    async fn scheduler_requeues_queued_batch_work_for_paused_account() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let mut item = sample_release_item("paused-queued-batch");
+        item.max_wait_ms = 0;
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let work_item_id = created.result.work_item_id.clone().expect("work item id");
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim batch")
+            .expect("batch exists");
+        let claimed_batch = batch.clone();
+        sqlx::query("UPDATE users SET paused_at = ? WHERE id = ?")
+            .bind("2026-08-06T03:15:00+08:00")
+            .bind("1")
+            .execute(&pool)
+            .await
+            .expect("pause user");
+        sqlx::query("UPDATE translation_batches SET created_at = ?, updated_at = ? WHERE id = ?")
+            .bind("2026-03-06T00:00:00Z")
+            .bind("2026-03-06T00:00:00Z")
+            .bind(batch.id.as_str())
+            .execute(&pool)
+            .await
+            .expect("age queued batch");
+
+        let reclaimed = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim result");
+        assert!(reclaimed.is_none());
+        execute_claimed_batch(state.as_ref(), claimed_batch)
+            .await
+            .expect("skip paused queued batch execution");
+
+        let work_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ?")
+                .bind(work_item_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load requeued work item");
+        assert_eq!(work_status, "queued");
+        let batch_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_batches WHERE id = ?")
+                .bind(batch.id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load emptied batch");
+        assert_eq!(batch_status, "completed");
+    }
+
+    #[tokio::test]
+    async fn scheduler_reclaims_active_work_after_requeuing_paused_batch_item() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "active").await;
+        seed_user(&pool, 2, "paused").await;
+        let mut active_item = sample_release_item("mixed-active-batch");
+        active_item.max_wait_ms = 0;
+        let mut paused_item = sample_release_item("mixed-paused-batch");
+        paused_item.max_wait_ms = 0;
+
+        let active_created = create_translation_request(state.as_ref(), "1", "async", &active_item)
+            .await
+            .expect("create active request");
+        let paused_created = create_translation_request(state.as_ref(), "2", "async", &paused_item)
+            .await
+            .expect("create paused request");
+        let initial_batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim initial batch")
+            .expect("initial batch exists");
+        assert_eq!(initial_batch.items.len(), 2);
+        sqlx::query("UPDATE users SET paused_at = ? WHERE id = ?")
+            .bind("2026-08-06T03:15:00+08:00")
+            .bind("2")
+            .execute(&pool)
+            .await
+            .expect("pause second user");
+        sqlx::query("UPDATE translation_batches SET created_at = ?, updated_at = ? WHERE id = ?")
+            .bind("2026-03-06T00:00:00Z")
+            .bind("2026-03-06T00:00:00Z")
+            .bind(initial_batch.id.as_str())
+            .execute(&pool)
+            .await
+            .expect("age mixed batch");
+
+        let reclaimed = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("reclaim mixed batch")
+            .expect("active work remains eligible");
+        assert_eq!(reclaimed.id, initial_batch.id);
+        assert_eq!(reclaimed.items.len(), 1);
+        assert_eq!(reclaimed.items[0].scope_user_id, "1");
+
+        let active_work_item_id = active_created
+            .result
+            .work_item_id
+            .expect("active work item id");
+        let paused_request_id = paused_created.request_id.clone();
+        let paused_work_item_id = paused_created
+            .result
+            .work_item_id
+            .expect("paused work item id");
+        let active_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ?")
+                .bind(active_work_item_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load active work item");
+        let paused_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ?")
+                .bind(paused_work_item_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load paused work item");
+        let paused_request_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_requests WHERE id = ?")
+                .bind(paused_request_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load paused request");
+        assert_eq!(active_status, "batched");
+        assert_eq!(paused_status, "queued");
+        assert_eq!(paused_request_status, "queued");
     }
 
     #[tokio::test]
