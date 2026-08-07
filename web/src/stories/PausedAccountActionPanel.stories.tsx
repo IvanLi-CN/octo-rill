@@ -29,6 +29,7 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const Idle: Story = {
+	globals: { theme: "light" },
 	args: { state: "idle" },
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
@@ -39,6 +40,20 @@ export const Idle: Story = {
 			canvas.getByRole("button", { name: "恢复账号" }),
 		).toBeEnabled();
 		await expect(canvas.getByText("等待恢复")).toBeVisible();
+	},
+};
+
+export const IdleDark: Story = {
+	globals: { theme: "dark" },
+	args: { state: "idle" },
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "账号已暂停" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("button", { name: "恢复账号" }),
+		).toBeEnabled();
 	},
 };
 

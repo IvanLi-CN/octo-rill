@@ -5,8 +5,8 @@
 - Lifecycle: active
 - Implementation: 已交付
 - Created: 2026-06-29
-- Last: 2026-08-06
-- Summary: 已交付；effective repo pool、10 分钟 budgeted governance snapshots、attempt-based system cycle ledger、chunked governance rebuild、`/admin/repos` 独立治理页、闲置账号暂停与自助恢复、预算编辑收口到订阅同步设置弹窗、仓库明细目标窗口/迫切值筛选、Storybook 和稳定 `ui_demo` 视觉证据与 build validation 已完成
+- Last: 2026-08-07
+- Summary: 已交付；effective repo pool、10 分钟 budgeted governance snapshots、attempt-based system cycle ledger、chunked governance rebuild、`/admin/repos` 独立治理页、闲置账号暂停与自助恢复、预算编辑收口到订阅同步设置弹窗、仓库明细目标窗口/迫切值筛选、带主题模式切换的暂停恢复页、Storybook 和稳定 `ui_demo` 视觉证据与 build validation 已完成
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -29,7 +29,7 @@
 - [x] M8: system attempt ledger, failure recording, and active cycle reconciliation
 - [x] M9: governance rebuild 分阶段 chunked writer，避免大候选池与 cycle member reconciliation 长时间占用 SQLite writer。
 - [x] M10: completed-cycle member retention uses active-only queries, short best-effort deletes, and a restart-safe shared budget; new databases configure incremental auto-vacuum without scheduling a production full `VACUUM`.
-- [x] M11: inactive account suspension: schema、daily maintenance、paused access guards、self-service resume、eligible-pool exclusions、admin filters、stable UI demo、Storybook states and approved visual evidence.
+- [x] M11: inactive account suspension: schema、daily maintenance、paused access guards、self-service resume、eligible-pool exclusions、admin filters、stable UI demo、浅色/深色 Storybook states and approved visual evidence.
 
 ## 本轮收口
 
@@ -52,7 +52,7 @@
 
 - `users.paused_at` 记录暂停时刻；每日 03:15 使用应用默认时区幂等标记连续 30 天未活动账号，并在重启后补跑当天遗漏轮次。
 - 认证层保留暂停会话；`GET /api/me` 直接返回有效账号状态和 `paused_at`，不触发访问同步、业务副作用或活动时间写入。业务 API 与 API key 一律返回 `account_paused`。
-- `/account/paused` 通过 `POST /api/me/resume` 自助恢复，展示恢复、排队、SSE 同步、完成和入队失败重试状态。恢复写入先于同步入队，入队失败不会回滚账号恢复。
+- `/account/paused` 通过 `POST /api/me/resume` 自助恢复，展示恢复、排队、SSE 同步、完成和入队失败重试状态；页面复用应用画布并保留浅色、深色、跟随系统主题控件。恢复写入先于同步入队，入队失败不会回滚账号恢复。
 - 有效关注池、订阅同步、发布候选、brief backfill、AI 历史与翻译重试候选，以及用户任务执行入口均排除暂停账号；翻译批次的新认领、旧批次回收和执行前检查同样排除暂停账号，暂停前已排队的暂停项会重新等待恢复而不阻塞同批活跃项。管理员可按 enabled、paused、disabled 查看有效状态。
 
 ## 明细筛选收口

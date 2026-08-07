@@ -7,6 +7,7 @@ import {
 	type PausedAccountActionState,
 } from "@/account/PausedAccountActionPanel";
 import { BrandLogo } from "@/components/brand/BrandLogo";
+import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { openAppEventSource } from "@/demo/eventSource";
@@ -106,10 +107,11 @@ export function PausedAccountPage() {
 
 	return (
 		<AppShell footer={<AppMetaFooter />} mobileChrome={false}>
-			<main className="min-h-[calc(100dvh-5rem)] bg-background px-4 py-10 sm:px-6 sm:py-16">
+			<main className="min-h-[calc(100dvh-5rem)] px-4 py-10 sm:px-6 sm:py-16">
 				<div className="mx-auto flex w-full max-w-5xl flex-col gap-10">
-					<div className="flex h-8 items-center">
+					<div className="flex h-8 items-center justify-between gap-4">
 						<BrandLogo variant="wordmark" className="h-7" />
+						<ThemeToggle />
 					</div>
 					<div className="flex min-h-[55dvh] items-center justify-center">
 						<PausedAccountActionPanel
