@@ -30,6 +30,7 @@ OctoRill is a personal workspace for GitHub activity. It brings release updates,
 - Read releases in `original`, `translated`, or `polished` mode.
 - Show direct social signals: stars on personal repositories and new followers.
 - Build daily briefs using the user's local day boundary.
+- Pause accounts inactive for 30 days while preserving a self-service status and recovery flow.
 - Provide a dashboard, scoped focus pages, admin pages, and a mock-only web demo.
 
 ## Repository layout

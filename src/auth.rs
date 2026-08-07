@@ -263,7 +263,10 @@ async fn upsert_github_user_for_account(
               avatar_url = excluded.avatar_url,
               email = excluded.email,
               updated_at = excluded.updated_at,
-              last_active_at = excluded.last_active_at,
+              last_active_at = CASE
+                WHEN users.paused_at IS NULL THEN excluded.last_active_at
+                ELSE users.last_active_at
+              END,
               daily_brief_utc_time = excluded.daily_brief_utc_time,
               daily_brief_local_time = excluded.daily_brief_local_time,
               daily_brief_time_zone = excluded.daily_brief_time_zone
@@ -301,7 +304,10 @@ async fn upsert_github_user_for_account(
           avatar_url = excluded.avatar_url,
           email = excluded.email,
           updated_at = excluded.updated_at,
-          last_active_at = excluded.last_active_at,
+          last_active_at = CASE
+            WHEN users.paused_at IS NULL THEN excluded.last_active_at
+            ELSE users.last_active_at
+          END,
           daily_brief_utc_time = excluded.daily_brief_utc_time,
           daily_brief_local_time = excluded.daily_brief_local_time,
           daily_brief_time_zone = excluded.daily_brief_time_zone

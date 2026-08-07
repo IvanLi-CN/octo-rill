@@ -4,7 +4,7 @@
 
 - Lifecycle: active
 - Created: 2026-06-29
-- Last: 2026-07-05
+- Last: 2026-08-07
 
 ## 变更记录
 
@@ -21,3 +21,6 @@
 - 2026-07-02: 仓库明细新增服务端全量目标窗口多选与迫切值范围筛选；前端搜索、老化、窗口和迫切值筛选统一为 300ms 防抖自动应用，并将老化状态三按钮收口为单个下拉选择后刷新 Storybook 视觉证据。
 - 2026-07-02: 仓库明细筛选控件视觉继续收敛：目标窗口与迫切值仍打开各自面板，但触发器右侧补齐下拉箭头并保持浅色 outline。
 - 2026-07-05: 将 `repo_refresh_governance_rebuild` 拆成 cleanup、500 行 snapshot upsert chunks、500 行 member reconciliation chunks、snapshot completion 与 cycle reconciliation 阶段，并在 telemetry 中记录 chunk count 与最大 chunk elapsed，避免全池重建长时间占用 SQLite writer。
+- 2026-08-06: 治理重建与终态补账统一限制在 active cycle；完成 member 通过最多 500 行的 best-effort 短事务渐进清理，使用 SQLite 持久化状态跨 owner 与重启共享每分钟 50000 行预算；新建数据库在 WAL 前启用 incremental auto-vacuum，既有生产库仍需单独维护窗口转换。
+- 2026-08-06: 交付闲置账号暂停：每日 03:15 按应用时区扫描并补跑遗漏维护轮次，暂停账号从有效关注池、后台候选和业务访问中排除。暂停会话保留 `GET /api/me` 自状态读取，不触发访问同步或活动时间写入；用户在 `/account/paused` 通过 `POST /api/me/resume` 恢复，访问同步入队失败不会回滚恢复结果。
+- 2026-08-07: 暂停恢复页移除重复的页面背景层，复用应用画布并保留浅色、深色、跟随系统主题控件；稳定 `ui_demo` 以隐藏 Demo 控件的亮色与深色桌面、移动端状态完成证据覆盖。

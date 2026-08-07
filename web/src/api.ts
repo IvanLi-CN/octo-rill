@@ -230,6 +230,8 @@ export type MeResponse = {
 		avatar_url: string | null;
 		email: string | null;
 		is_admin: boolean;
+		account_status?: "enabled" | "paused" | "disabled";
+		paused_at?: string | null;
 	};
 	access_sync?: {
 		task_id: string | null;
@@ -244,6 +246,19 @@ export type MeResponse = {
 		include_own_releases: boolean;
 	};
 };
+export type AccountResumeResponse = {
+	status: "enabled";
+	access_sync: {
+		task_id: string | null;
+		task_type: string | null;
+		event_path: string | null;
+		reason: "account_resumed" | "reused_inflight" | "none";
+	};
+	sync_enqueue_error: "access_sync_enqueue_failed" | null;
+};
+export function apiResumeAccount() {
+	return apiPost<AccountResumeResponse>("/api/me/resume");
+}
 export type PersonalRepoItem = {
 	repo_id: number;
 	full_name: string;
