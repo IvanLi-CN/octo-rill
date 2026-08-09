@@ -21,7 +21,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use sqlx::Row;
+use sqlx::{QueryBuilder, Row, Sqlite};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex, task::JoinSet};
 
 use crate::{
@@ -162,6 +162,8 @@ pub struct SyncReleasesResult {
 pub struct SyncAccessRefreshResult {
     pub starred: SyncStarredResult,
     pub release: SharedReleaseDemandResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_freshness_assessment: Option<DashboardReleaseFreshnessAssessment>,
     pub social: SyncSocialActivityResult,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub social_error: Option<String>,
@@ -365,6 +367,198 @@ struct ReleaseDemandRepo {
     is_new_repo: bool,
 }
 
+const DASHBOARD_RELEASE_FRESHNESS_POLICY_VERSION: i64 = 1;
+
+#[derive(Debug, Clone, Serialize)]
+struct DashboardReleaseFreshnessPressure {
+    queued_work_items: usize,
+    running_work_items: usize,
+    repo_release_worker_concurrency: usize,
+    queue_ratio: f64,
+    active_dashboard_tasks: usize,
+    queue_pressure_level: String,
+    active_task_pressure_level: String,
+    pressure_level: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DashboardReleaseFreshnessAssessment {
+    policy_version: i64,
+    profile: String,
+    evaluated_at: String,
+    effective_repo_count: usize,
+    pressure: DashboardReleaseFreshnessPressure,
+    min_window_minutes: i64,
+    max_window_minutes: i64,
+    fetched_count: usize,
+    reused_fresh_count: usize,
+    reused_running_count: usize,
+    queued_count: usize,
+    decision_counts: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DashboardReleaseFreshnessRepoAssessment {
+    policy_version: i64,
+    profile: String,
+    evaluated_at: String,
+    repo_id: i64,
+    repo_full_name: String,
+    effective_repo_count: usize,
+    watcher_user_count: usize,
+    snapshot_missing: bool,
+    portfolio_adjustment: i64,
+    sharing_adjustment: i64,
+    pressure_adjustment: i64,
+    freshness_window_minutes: i64,
+    last_success_at: Option<String>,
+    decision: String,
+    reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardFreshnessPressureLevel {
+    Light,
+    Moderate,
+    High,
+    Saturated,
+}
+
+impl DashboardFreshnessPressureLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Moderate => "moderate",
+            Self::High => "high",
+            Self::Saturated => "saturated",
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Light => 0,
+            Self::Moderate => 1,
+            Self::High => 2,
+            Self::Saturated => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DashboardReleaseFreshnessPolicy {
+    profile: String,
+    evaluated_at: String,
+    effective_repo_count: usize,
+    pressure_adjustment: i64,
+    assessment: DashboardReleaseFreshnessAssessment,
+}
+
+impl DashboardReleaseFreshnessPolicy {
+    fn portfolio_adjustment(&self) -> i64 {
+        let values = match self.profile.as_str() {
+            "latest" => [0, 1, 3, 6],
+            "capacity" => [2, 5, 10, 16],
+            _ => [0, 2, 5, 9],
+        };
+        match self.effective_repo_count {
+            0..=25 => values[0],
+            26..=100 => values[1],
+            101..=300 => values[2],
+            _ => values[3],
+        }
+    }
+
+    fn sharing_adjustment(watcher_user_count: usize) -> i64 {
+        match watcher_user_count {
+            0 | 1 => 0,
+            2..=4 => -1,
+            5..=19 => -3,
+            _ => -5,
+        }
+    }
+
+    fn assess_repo(
+        &self,
+        repo: &ReleaseDemandRepo,
+        watcher_user_count: usize,
+        snapshot_missing: bool,
+        last_success_at: Option<&str>,
+        in_progress: bool,
+    ) -> DashboardReleaseFreshnessRepoAssessment {
+        let portfolio_adjustment = self.portfolio_adjustment();
+        let sharing_adjustment = Self::sharing_adjustment(watcher_user_count);
+        let freshness_window_minutes =
+            (1 + portfolio_adjustment + sharing_adjustment + self.pressure_adjustment).clamp(1, 30);
+        let freshness_cutoff = DateTime::parse_from_rfc3339(&self.evaluated_at)
+            .ok()
+            .map(|value| {
+                value.with_timezone(&Utc) - chrono::Duration::minutes(freshness_window_minutes)
+            });
+        let fresh = last_success_at
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .zip(freshness_cutoff)
+            .is_some_and(|(last, cutoff)| last.with_timezone(&Utc) >= cutoff);
+        let (decision, reason_codes) = if in_progress {
+            ("reused_running", vec!["existing_work_item".to_owned()])
+        } else if fresh {
+            ("reused_fresh", vec!["within_window".to_owned()])
+        } else if last_success_at.is_some() {
+            ("fetch", vec!["outside_window".to_owned()])
+        } else {
+            ("fetch", vec!["no_prior_success".to_owned()])
+        };
+        let mut reason_codes = reason_codes;
+        if snapshot_missing {
+            reason_codes.push("snapshot_missing".to_owned());
+        }
+        DashboardReleaseFreshnessRepoAssessment {
+            policy_version: DASHBOARD_RELEASE_FRESHNESS_POLICY_VERSION,
+            profile: self.profile.clone(),
+            evaluated_at: self.evaluated_at.clone(),
+            repo_id: repo.repo_id,
+            repo_full_name: repo.full_name.clone(),
+            effective_repo_count: self.effective_repo_count,
+            watcher_user_count,
+            snapshot_missing,
+            portfolio_adjustment,
+            sharing_adjustment,
+            pressure_adjustment: self.pressure_adjustment,
+            freshness_window_minutes,
+            last_success_at: last_success_at.map(str::to_owned),
+            decision: decision.to_owned(),
+            reason_codes,
+        }
+    }
+
+    fn record_decision(&mut self, decision: &str, window_minutes: i64) {
+        *self
+            .assessment
+            .decision_counts
+            .entry(decision.to_owned())
+            .or_default() += 1;
+        match decision {
+            "fetch" => {
+                self.assessment.fetched_count += 1;
+                self.assessment.queued_count += 1;
+            }
+            "reused_fresh" => self.assessment.reused_fresh_count += 1,
+            "reused_running" => self.assessment.reused_running_count += 1,
+            _ => {}
+        }
+        if self.assessment.decision_counts.values().sum::<usize>() == 1 {
+            self.assessment.min_window_minutes = window_minutes;
+        } else {
+            self.assessment.min_window_minutes =
+                self.assessment.min_window_minutes.min(window_minutes);
+        }
+        self.assessment.max_window_minutes = self.assessment.max_window_minutes.max(window_minutes);
+    }
+
+    fn snapshot(&self) -> DashboardReleaseFreshnessAssessment {
+        self.assessment.clone()
+    }
+}
+
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct SharedReleaseDemandResult {
     pub repos: usize,
@@ -373,6 +567,14 @@ pub struct SharedReleaseDemandResult {
     pub reused_fresh: usize,
     pub queued: usize,
     pub failed: usize,
+    pub current_run_releases: usize,
+    pub fetched_count: usize,
+    pub inserted_count: usize,
+    pub updated_count: usize,
+    pub unchanged_count: usize,
+    pub pages_fetched: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness_assessment: Option<DashboardReleaseFreshnessAssessment>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1997,6 +2199,23 @@ pub async fn sync_access_refresh(
     .await
 }
 
+pub async fn sync_access_refresh_with_dashboard_freshness(
+    state: &AppState,
+    task_id: &str,
+    user_id: &str,
+) -> Result<SyncAccessRefreshResult> {
+    let profile = admin_runtime::load_dashboard_release_freshness_profile(&state.pool).await?;
+    sync_access_refresh_with_freshness(
+        state,
+        task_id,
+        user_id,
+        profile.as_str(),
+        |state, user_id| Box::pin(sync_starred_for_access_refresh(state, user_id)),
+        |state, user_id| Box::pin(refresh_owned_repo_release_visibility(state, user_id)),
+    )
+    .await
+}
+
 type AccessRefreshStarFuture<'a> = Pin<
     Box<
         dyn Future<Output = std::result::Result<SyncStarredResult, SyncStarredExecutionError>>
@@ -2011,6 +2230,29 @@ async fn sync_access_refresh_with<SyncStarred, RefreshVisibility>(
     state: &AppState,
     task_id: &str,
     user_id: &str,
+    sync_starred: SyncStarred,
+    refresh_visibility: RefreshVisibility,
+) -> Result<SyncAccessRefreshResult>
+where
+    SyncStarred: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshStarFuture<'a>,
+    RefreshVisibility: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshVisibilityFuture<'a>,
+{
+    sync_access_refresh_with_freshness(
+        state,
+        task_id,
+        user_id,
+        "",
+        sync_starred,
+        refresh_visibility,
+    )
+    .await
+}
+
+async fn sync_access_refresh_with_freshness<SyncStarred, RefreshVisibility>(
+    state: &AppState,
+    task_id: &str,
+    user_id: &str,
+    freshness_profile: &str,
     sync_starred: SyncStarred,
     refresh_visibility: RefreshVisibility,
 ) -> Result<SyncAccessRefreshResult>
@@ -2099,12 +2341,13 @@ where
     )
     .await;
 
-    let release = attach_and_wait_for_user_release_demand(
+    let release = attach_and_wait_for_user_release_demand_with_freshness(
         state,
         Some((task_id, before_repo_ids)),
         user_id,
         RepoReleaseOrigin::Interactive,
         "access_refresh",
+        (!freshness_profile.is_empty()).then_some(freshness_profile),
     )
     .await?;
 
@@ -2200,9 +2443,11 @@ where
     )
     .await;
 
+    let release_freshness_assessment = release.freshness_assessment.clone();
     Ok(SyncAccessRefreshResult {
         starred,
         release,
+        release_freshness_assessment,
         social,
         social_error,
         notifications,
@@ -2222,6 +2467,7 @@ struct AttachReleaseDemandResult {
 #[derive(Debug, Default)]
 struct WaitReleaseDemandResult {
     releases: usize,
+    current_run_releases: usize,
     failed: usize,
     candidate_failures: usize,
     fetched_count: usize,
@@ -2298,6 +2544,9 @@ struct RepoReleaseWatcherUpsert<'a> {
     reason: &'a str,
     is_new_repo: bool,
     reused_fresh: bool,
+    freshness_window_minutes: Option<i64>,
+    freshness_decision: Option<&'a str>,
+    freshness_assessment_json: Option<&'a str>,
     status: &'a str,
     error_text: Option<&'a str>,
     now_rfc3339: &'a str,
@@ -3456,6 +3705,195 @@ async fn attach_and_wait_for_user_release_demand(
     origin: RepoReleaseOrigin,
     reason: &str,
 ) -> Result<SharedReleaseDemandResult> {
+    attach_and_wait_for_user_release_demand_with_freshness(
+        state,
+        task_context,
+        user_id,
+        origin,
+        reason,
+        None,
+    )
+    .await
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DashboardFreshnessSnapshotRow {
+    repo_id: i64,
+    watcher_user_count: i64,
+}
+
+fn dashboard_freshness_pressure_level_from_queue(
+    queue_ratio: f64,
+) -> DashboardFreshnessPressureLevel {
+    if queue_ratio < 1.0 {
+        DashboardFreshnessPressureLevel::Light
+    } else if queue_ratio < 2.0 {
+        DashboardFreshnessPressureLevel::Moderate
+    } else if queue_ratio < 4.0 {
+        DashboardFreshnessPressureLevel::High
+    } else {
+        DashboardFreshnessPressureLevel::Saturated
+    }
+}
+
+fn dashboard_freshness_pressure_level_from_active_tasks(
+    active_tasks: usize,
+) -> DashboardFreshnessPressureLevel {
+    match active_tasks {
+        0..=1 => DashboardFreshnessPressureLevel::Light,
+        2..=3 => DashboardFreshnessPressureLevel::Moderate,
+        4..=7 => DashboardFreshnessPressureLevel::High,
+        _ => DashboardFreshnessPressureLevel::Saturated,
+    }
+}
+
+fn dashboard_freshness_pressure_adjustment(
+    profile: &str,
+    level: DashboardFreshnessPressureLevel,
+) -> i64 {
+    let values = match profile {
+        "latest" => [0, 2, 5, 9],
+        "capacity" => [0, 6, 12, 20],
+        _ => [0, 3, 7, 12],
+    };
+    values[usize::from(level.rank())]
+}
+
+async fn load_dashboard_release_freshness_policy(
+    state: &AppState,
+    profile: &str,
+    repos: &[ReleaseDemandRepo],
+) -> Result<DashboardReleaseFreshnessPolicy> {
+    let queued_work_items = usize::try_from(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM repo_release_work_items WHERE status = ?",
+        )
+        .bind(jobs::STATUS_QUEUED)
+        .fetch_one(&state.pool)
+        .await?,
+    )
+    .unwrap_or_default();
+    let running_work_items = usize::try_from(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM repo_release_work_items WHERE status = ?",
+        )
+        .bind(jobs::STATUS_RUNNING)
+        .fetch_one(&state.pool)
+        .await?,
+    )
+    .unwrap_or_default();
+    let repo_release_worker_concurrency =
+        admin_runtime::load_repo_release_worker_concurrency(&state.pool).await?;
+    let queue_ratio = (queued_work_items + running_work_items) as f64
+        / repo_release_worker_concurrency.max(1) as f64;
+
+    let active_payloads = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT payload_json
+        FROM job_tasks
+        WHERE task_type = ? AND status IN (?, ?)
+        "#,
+    )
+    .bind(jobs::TASK_SYNC_ACCESS_REFRESH)
+    .bind(jobs::STATUS_QUEUED)
+    .bind(jobs::STATUS_RUNNING)
+    .fetch_all(&state.pool)
+    .await?;
+    let active_dashboard_tasks = active_payloads
+        .into_iter()
+        .filter(|payload| {
+            serde_json::from_str::<Value>(payload)
+                .ok()
+                .and_then(|value| value.get("dashboard_adaptive_release_freshness").cloned())
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+        })
+        .count();
+
+    let queue_pressure_level = dashboard_freshness_pressure_level_from_queue(queue_ratio);
+    let active_task_pressure_level =
+        dashboard_freshness_pressure_level_from_active_tasks(active_dashboard_tasks);
+    let pressure_level = if queue_pressure_level.rank() >= active_task_pressure_level.rank() {
+        queue_pressure_level
+    } else {
+        active_task_pressure_level
+    };
+    let evaluated_at = Utc::now().to_rfc3339();
+    let pressure = DashboardReleaseFreshnessPressure {
+        queued_work_items,
+        running_work_items,
+        repo_release_worker_concurrency,
+        queue_ratio,
+        active_dashboard_tasks,
+        queue_pressure_level: queue_pressure_level.as_str().to_owned(),
+        active_task_pressure_level: active_task_pressure_level.as_str().to_owned(),
+        pressure_level: pressure_level.as_str().to_owned(),
+    };
+    let pressure_adjustment = dashboard_freshness_pressure_adjustment(profile, pressure_level);
+    let mut decision_counts = HashMap::new();
+    decision_counts.insert("fetch".to_owned(), 0);
+    decision_counts.insert("reused_fresh".to_owned(), 0);
+    decision_counts.insert("reused_running".to_owned(), 0);
+    Ok(DashboardReleaseFreshnessPolicy {
+        profile: admin_runtime::normalize_dashboard_release_freshness_profile(profile).to_owned(),
+        evaluated_at: evaluated_at.clone(),
+        effective_repo_count: repos.len(),
+        pressure_adjustment,
+        assessment: DashboardReleaseFreshnessAssessment {
+            policy_version: DASHBOARD_RELEASE_FRESHNESS_POLICY_VERSION,
+            profile: admin_runtime::normalize_dashboard_release_freshness_profile(profile)
+                .to_owned(),
+            evaluated_at,
+            effective_repo_count: repos.len(),
+            pressure,
+            min_window_minutes: 0,
+            max_window_minutes: 0,
+            fetched_count: 0,
+            reused_fresh_count: 0,
+            reused_running_count: 0,
+            queued_count: 0,
+            decision_counts,
+        },
+    })
+}
+
+async fn load_dashboard_release_freshness_snapshots(
+    state: &AppState,
+    repos: &[ReleaseDemandRepo],
+) -> Result<HashMap<i64, usize>> {
+    if repos.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "SELECT repo_id, watcher_user_count FROM repo_refresh_governance_snapshots WHERE repo_id IN (",
+    );
+    let mut separated = query.separated(", ");
+    for repo in repos {
+        separated.push_bind(repo.repo_id);
+    }
+    separated.push_unseparated(")");
+    let rows = query
+        .build_query_as::<DashboardFreshnessSnapshotRow>()
+        .fetch_all(&state.pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            usize::try_from(row.watcher_user_count)
+                .ok()
+                .map(|count| (row.repo_id, count))
+        })
+        .collect())
+}
+
+async fn attach_and_wait_for_user_release_demand_with_freshness(
+    state: &AppState,
+    task_context: Option<(&str, HashSet<i64>)>,
+    user_id: &str,
+    origin: RepoReleaseOrigin,
+    reason: &str,
+    freshness_profile: Option<&str>,
+) -> Result<SharedReleaseDemandResult> {
     let repos = load_user_release_visible_repo_rows(state, user_id).await?;
     let previous_repo_ids = task_context
         .as_ref()
@@ -3470,8 +3908,45 @@ async fn attach_and_wait_for_user_release_demand(
         })
         .collect::<Vec<_>>();
     let task_id = task_context.as_ref().map(|(task_id, _)| *task_id);
-    let attached =
-        attach_release_demand(state, task_id, Some(user_id), &demand_repos, origin, reason).await?;
+    expire_repo_release_deadlines(state).await?;
+    let mut freshness = if origin == RepoReleaseOrigin::Interactive {
+        if let Some(profile) = freshness_profile {
+            Some(load_dashboard_release_freshness_policy(state, profile, &demand_repos).await?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let snapshots = if freshness.is_some() {
+        load_dashboard_release_freshness_snapshots(state, &demand_repos).await?
+    } else {
+        HashMap::new()
+    };
+    if let (Some(task_id), Some(policy)) = (task_id, freshness.as_ref()) {
+        jobs::append_task_event(
+            state,
+            task_id,
+            "task.progress",
+            json!({
+                "task_id": task_id,
+                "stage": "release_freshness_assessed",
+                "assessment": policy.snapshot(),
+            }),
+        )
+        .await?;
+    }
+    let attached = attach_release_demand_with_freshness(
+        state,
+        task_id,
+        Some(user_id),
+        &demand_repos,
+        origin,
+        reason,
+        freshness.as_mut(),
+        &snapshots,
+    )
+    .await?;
 
     if let Some(task_id) = task_id {
         jobs::append_task_event(
@@ -3497,6 +3972,7 @@ async fn attach_and_wait_for_user_release_demand(
         Some(attached.repos),
     )
     .await?;
+    let freshness_assessment = freshness.map(|policy| policy.snapshot());
     Ok(SharedReleaseDemandResult {
         repos: attached.repos,
         releases: waited.releases,
@@ -3504,6 +3980,13 @@ async fn attach_and_wait_for_user_release_demand(
         reused_fresh: attached.reused_fresh,
         queued: attached.queued,
         failed: waited.failed,
+        current_run_releases: waited.current_run_releases,
+        fetched_count: waited.fetched_count,
+        inserted_count: waited.inserted_count,
+        updated_count: waited.updated_count,
+        unchanged_count: waited.unchanged_count,
+        pages_fetched: waited.pages_fetched,
+        freshness_assessment,
     })
 }
 
@@ -3536,6 +4019,30 @@ async fn attach_release_demand(
     repos: &[ReleaseDemandRepo],
     origin: RepoReleaseOrigin,
     reason: &str,
+) -> Result<AttachReleaseDemandResult> {
+    attach_release_demand_with_freshness(
+        state,
+        task_id,
+        user_id,
+        repos,
+        origin,
+        reason,
+        None,
+        &HashMap::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn attach_release_demand_with_freshness(
+    state: &AppState,
+    task_id: Option<&str>,
+    user_id: Option<&str>,
+    repos: &[ReleaseDemandRepo],
+    origin: RepoReleaseOrigin,
+    reason: &str,
+    mut freshness: Option<&mut DashboardReleaseFreshnessPolicy>,
+    snapshots: &HashMap<i64, usize>,
 ) -> Result<AttachReleaseDemandResult> {
     let mut result = AttachReleaseDemandResult {
         repos: repos.len(),
@@ -3587,11 +4094,38 @@ async fn attach_release_demand(
             )
         })?;
 
+        let adaptive_assessment = freshness.as_deref_mut().map(|policy| {
+            let watcher_user_count = snapshots.get(&repo.repo_id).copied().unwrap_or(1);
+            let assessment = policy.assess_repo(
+                repo,
+                watcher_user_count,
+                !snapshots.contains_key(&repo.repo_id),
+                existing
+                    .as_ref()
+                    .and_then(|item| item.last_success_at.as_deref()),
+                existing.as_ref().is_some_and(|item| {
+                    item.status == jobs::STATUS_QUEUED || item.status == jobs::STATUS_RUNNING
+                }),
+            );
+            policy.record_decision(
+                assessment.decision.as_str(),
+                assessment.freshness_window_minutes,
+            );
+            assessment
+        });
+        let adaptive_assessment_json = adaptive_assessment
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let is_fresh = adaptive_assessment
+            .as_ref()
+            .is_some_and(|assessment| assessment.decision == "reused_fresh")
+            || (adaptive_assessment.is_none()
+                && existing
+                    .as_ref()
+                    .and_then(|item| item.last_success_at.as_deref())
+                    .is_some_and(|value| value >= freshness_cutoff.as_str()));
         let work_item_id = if let Some(existing) = existing {
-            let is_fresh = existing
-                .last_success_at
-                .as_deref()
-                .is_some_and(|value| value >= freshness_cutoff.as_str());
             let next_priority = existing.priority.max(origin.priority());
             let next_origin = if next_priority == REPO_RELEASE_PRIORITY_INTERACTIVE {
                 RepoReleaseOrigin::Interactive.as_str()
@@ -3624,6 +4158,13 @@ async fn attach_release_demand(
                             reason,
                             is_new_repo: repo.is_new_repo,
                             reused_fresh: true,
+                            freshness_window_minutes: adaptive_assessment
+                                .as_ref()
+                                .map(|assessment| assessment.freshness_window_minutes),
+                            freshness_decision: adaptive_assessment
+                                .as_ref()
+                                .map(|assessment| assessment.decision.as_str()),
+                            freshness_assessment_json: adaptive_assessment_json.as_deref(),
                             status: "succeeded",
                             error_text: None,
                             now_rfc3339: &now_rfc3339,
@@ -3705,6 +4246,13 @@ async fn attach_release_demand(
                             reason,
                             is_new_repo: repo.is_new_repo,
                             reused_fresh: false,
+                            freshness_window_minutes: adaptive_assessment
+                                .as_ref()
+                                .map(|assessment| assessment.freshness_window_minutes),
+                            freshness_decision: adaptive_assessment
+                                .as_ref()
+                                .map(|assessment| assessment.decision.as_str()),
+                            freshness_assessment_json: adaptive_assessment_json.as_deref(),
                             status: "pending",
                             error_text: None,
                             now_rfc3339: &now_rfc3339,
@@ -3712,7 +4260,11 @@ async fn attach_release_demand(
                     )
                     .await?;
                 }
-                if existing.status == jobs::STATUS_RUNNING {
+                if adaptive_assessment
+                    .as_ref()
+                    .is_some_and(|assessment| assessment.decision == "reused_running")
+                    || existing.status == jobs::STATUS_RUNNING
+                {
                     result.reused_running += 1;
                 } else {
                     result.queued += 1;
@@ -3771,6 +4323,13 @@ async fn attach_release_demand(
                         reason,
                         is_new_repo: repo.is_new_repo,
                         reused_fresh: false,
+                        freshness_window_minutes: adaptive_assessment
+                            .as_ref()
+                            .map(|assessment| assessment.freshness_window_minutes),
+                        freshness_decision: adaptive_assessment
+                            .as_ref()
+                            .map(|assessment| assessment.decision.as_str()),
+                        freshness_assessment_json: adaptive_assessment_json.as_deref(),
                         status: "pending",
                         error_text: None,
                         now_rfc3339: &now_rfc3339,
@@ -3817,11 +4376,14 @@ async fn upsert_repo_release_watcher(
           reason,
           is_new_repo,
           reused_fresh,
+          freshness_window_minutes,
+          freshness_decision,
+          freshness_assessment_json,
           status,
           error_text,
           created_at,
           updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(task_id, work_item_id) DO UPDATE SET
           user_id = excluded.user_id,
           origin = excluded.origin,
@@ -3829,6 +4391,9 @@ async fn upsert_repo_release_watcher(
           reason = excluded.reason,
           is_new_repo = excluded.is_new_repo,
           reused_fresh = excluded.reused_fresh,
+          freshness_window_minutes = excluded.freshness_window_minutes,
+          freshness_decision = excluded.freshness_decision,
+          freshness_assessment_json = excluded.freshness_assessment_json,
           status = CASE
             WHEN repo_release_watchers.status = 'succeeded' THEN repo_release_watchers.status
             ELSE excluded.status
@@ -3846,6 +4411,9 @@ async fn upsert_repo_release_watcher(
     .bind(watcher.reason)
     .bind(if watcher.is_new_repo { 1_i64 } else { 0_i64 })
     .bind(if watcher.reused_fresh { 1_i64 } else { 0_i64 })
+    .bind(watcher.freshness_window_minutes)
+    .bind(watcher.freshness_decision)
+    .bind(watcher.freshness_assessment_json)
     .bind(watcher.status)
     .bind(watcher.error_text)
     .bind(watcher.now_rfc3339)
@@ -3865,6 +4433,22 @@ async fn wait_for_release_demand(
     if work_item_ids.is_empty() {
         return Ok(WaitReleaseDemandResult::default());
     }
+
+    let adaptive_freshness = if let Some(task_id) = task_id {
+        sqlx::query_scalar::<_, String>("SELECT payload_json FROM job_tasks WHERE id = ? LIMIT 1")
+            .bind(task_id)
+            .fetch_optional(&state.pool)
+            .await?
+            .and_then(|payload| {
+                serde_json::from_str::<Value>(&payload)
+                    .ok()
+                    .and_then(|value| value.get("dashboard_adaptive_release_freshness").cloned())
+                    .and_then(|value| value.as_bool())
+            })
+            .unwrap_or(false)
+    } else {
+        false
+    };
 
     let mut progress = SubscriptionProgressEmitter::new("release_progress");
     loop {
@@ -3898,6 +4482,7 @@ async fn wait_for_release_demand(
                 state,
                 task_id,
                 total_repos.unwrap_or(work_item_ids.len()),
+                adaptive_freshness,
             )
             .await?;
             progress
@@ -3962,6 +4547,7 @@ async fn wait_for_release_demand(
             state,
             task_id,
             total_repos.unwrap_or(work_item_ids.len()),
+            adaptive_freshness,
         )
         .await?;
         progress
@@ -3989,13 +4575,13 @@ async fn wait_for_release_demand(
             SELECT
               COALESCE(SUM(CASE WHEN rw.status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
               COALESCE(SUM(CASE WHEN rw.status = 'succeeded' THEN wi.last_release_count ELSE 0 END), 0) AS release_count,
-              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_release_count ELSE 0 END), 0) AS stats_release_count,
-              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_fetched_count ELSE 0 END), 0) AS fetched_count,
-              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_inserted_count ELSE 0 END), 0) AS inserted_count,
-              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_updated_count ELSE 0 END), 0) AS updated_count,
-              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_unchanged_count ELSE 0 END), 0) AS unchanged_count,
-              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_pages_fetched ELSE 0 END), 0) AS pages_fetched,
-              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_candidate_failures ELSE 0 END), 0) AS candidate_failures
+              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 AND COALESCE(rw.freshness_decision, '') != 'reused_running' THEN wi.last_release_count ELSE 0 END), 0) AS stats_release_count,
+              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 AND COALESCE(rw.freshness_decision, '') != 'reused_running' THEN wi.last_fetched_count ELSE 0 END), 0) AS fetched_count,
+              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 AND COALESCE(rw.freshness_decision, '') != 'reused_running' THEN wi.last_inserted_count ELSE 0 END), 0) AS inserted_count,
+              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 AND COALESCE(rw.freshness_decision, '') != 'reused_running' THEN wi.last_updated_count ELSE 0 END), 0) AS updated_count,
+              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 AND COALESCE(rw.freshness_decision, '') != 'reused_running' THEN wi.last_unchanged_count ELSE 0 END), 0) AS unchanged_count,
+              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 AND COALESCE(rw.freshness_decision, '') != 'reused_running' THEN wi.last_pages_fetched ELSE 0 END), 0) AS pages_fetched,
+              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 AND COALESCE(rw.freshness_decision, '') != 'reused_running' THEN wi.last_candidate_failures ELSE 0 END), 0) AS candidate_failures
             FROM repo_release_watchers rw
             JOIN repo_release_work_items wi ON wi.id = rw.work_item_id
             WHERE rw.task_id = "#,
@@ -4010,6 +4596,7 @@ async fn wait_for_release_demand(
             usize::try_from(row.get::<i64, _>("stats_release_count")).unwrap_or_default();
         let mut result = WaitReleaseDemandResult {
             releases: usize::try_from(row.get::<i64, _>("release_count")).unwrap_or_default(),
+            current_run_releases: legacy_stats_count,
             failed: usize::try_from(row.get::<i64, _>("failed_count")).unwrap_or_default(),
             candidate_failures: usize::try_from(row.get::<i64, _>("candidate_failures"))
                 .unwrap_or_default(),
@@ -4021,11 +4608,12 @@ async fn wait_for_release_demand(
                 .unwrap_or_default(),
             pages_fetched: usize::try_from(row.get::<i64, _>("pages_fetched")).unwrap_or_default(),
         };
-        if result.fetched_count
-            + result.inserted_count
-            + result.updated_count
-            + result.unchanged_count
-            == 0
+        if !adaptive_freshness
+            && result.fetched_count
+                + result.inserted_count
+                + result.updated_count
+                + result.unchanged_count
+                == 0
         {
             result.fetched_count = legacy_stats_count;
             result.inserted_count = legacy_stats_count;
@@ -4064,6 +4652,7 @@ async fn wait_for_release_demand(
         usize::try_from(row.get::<i64, _>("release_count")).unwrap_or_default();
     let mut result = WaitReleaseDemandResult {
         releases: legacy_release_count,
+        current_run_releases: legacy_release_count,
         failed: usize::try_from(row.get::<i64, _>("failed_count")).unwrap_or_default(),
         candidate_failures: usize::try_from(row.get::<i64, _>("candidate_failures"))
             .unwrap_or_default(),
@@ -4086,6 +4675,7 @@ async fn load_release_demand_progress(
     state: &AppState,
     task_id: &str,
     total_repos: usize,
+    adaptive_freshness: bool,
 ) -> Result<ReleaseDemandProgress> {
     let row = sqlx::query(
         r#"
@@ -4093,13 +4683,13 @@ async fn load_release_demand_progress(
           COALESCE(SUM(CASE WHEN rw.status = 'succeeded' THEN 1 ELSE 0 END), 0) AS succeeded_count,
           COALESCE(SUM(CASE WHEN rw.status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
           COALESCE(SUM(CASE WHEN rw.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_count,
-          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_release_count ELSE 0 END), 0) AS release_count,
-          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_fetched_count ELSE 0 END), 0) AS fetched_count,
-          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_inserted_count ELSE 0 END), 0) AS inserted_count,
-          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_updated_count ELSE 0 END), 0) AS updated_count,
-          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_unchanged_count ELSE 0 END), 0) AS unchanged_count,
-          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_pages_fetched ELSE 0 END), 0) AS pages_fetched,
-          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_candidate_failures ELSE 0 END), 0) AS candidate_failures
+          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 AND COALESCE(rw.freshness_decision, '') != 'reused_running' THEN wi.last_release_count ELSE 0 END), 0) AS release_count,
+          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 AND COALESCE(rw.freshness_decision, '') != 'reused_running' THEN wi.last_fetched_count ELSE 0 END), 0) AS fetched_count,
+          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 AND COALESCE(rw.freshness_decision, '') != 'reused_running' THEN wi.last_inserted_count ELSE 0 END), 0) AS inserted_count,
+          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 AND COALESCE(rw.freshness_decision, '') != 'reused_running' THEN wi.last_updated_count ELSE 0 END), 0) AS updated_count,
+          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 AND COALESCE(rw.freshness_decision, '') != 'reused_running' THEN wi.last_unchanged_count ELSE 0 END), 0) AS unchanged_count,
+          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 AND COALESCE(rw.freshness_decision, '') != 'reused_running' THEN wi.last_pages_fetched ELSE 0 END), 0) AS pages_fetched,
+          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 AND COALESCE(rw.freshness_decision, '') != 'reused_running' THEN wi.last_candidate_failures ELSE 0 END), 0) AS candidate_failures
         FROM repo_release_watchers rw
         JOIN repo_release_work_items wi ON wi.id = rw.work_item_id
         WHERE rw.task_id = ?
@@ -4124,8 +4714,12 @@ async fn load_release_demand_progress(
         unchanged_count: usize::try_from(row.get::<i64, _>("unchanged_count")).unwrap_or_default(),
         pages_fetched: usize::try_from(row.get::<i64, _>("pages_fetched")).unwrap_or_default(),
     };
-    if result.fetched_count + result.inserted_count + result.updated_count + result.unchanged_count
-        == 0
+    if !adaptive_freshness
+        && result.fetched_count
+            + result.inserted_count
+            + result.updated_count
+            + result.unchanged_count
+            == 0
     {
         result.fetched_count = legacy_release_count;
         result.inserted_count = legacy_release_count;
@@ -10916,7 +11510,7 @@ mod tests {
     use anyhow::{Context, anyhow};
     use sqlx::Row;
     use std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         fs,
         net::SocketAddr,
         sync::{
@@ -10934,36 +11528,38 @@ mod tests {
     use url::Url;
 
     use super::{
-        EligibleUserRow, FeedActivityEventSnapshot, FollowerSnapshot, GitHubActivityEvent,
-        GitHubActivityPayload, GitHubActor, GitHubEventRepo, GitHubNotification, GitHubRelease,
-        GitHubReleaseEventPayload, NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE,
-        NOTIFICATION_OPEN_URL_REPAIR_KEY, NOTIFICATION_OPEN_URL_REPAIR_PENDING,
-        NOTIFICATIONS_SINCE_KEY, NotificationRepo, NotificationSubject, OwnedRepoNode,
-        OwnedRepoSnapshot, REPO_REFRESH_GOVERNANCE_REBUILD_CHUNK_SIZE,
-        REPO_RELEASE_DEADLINE_EXPIRED_ERROR, ReleaseDemandRepo, RepoOwner, RepoRefreshCandidate,
-        RepoReleaseFetchOutcome, RepoReleaseHttpState, RepoReleaseOrigin, RepoReleaseWorkItemRow,
-        RepoReleaseWriteStats, RepoStargazerFetchResult, RepoStargazerSnapshot,
-        SocialActivityEventInsert, StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot,
-        SubscriptionEventRecord, SubscriptionPrunePhaseOutcome, SubscriptionRunContext,
-        SyncRequestError, aggregate_release_visible_repos, aggregate_repos,
-        announcement_category_id_from_repo_value, append_subscription_event,
-        apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
-        apply_social_activity_snapshot_with_options, attach_and_wait_for_user_release_demand,
-        attach_release_demand, claim_next_repo_release_work_item, classify_github_http_error,
-        cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
-        discussion_announcement_from_node, execute_repo_release_work_item,
-        execute_subscription_prune_phases, expire_repo_release_deadlines,
-        fail_repo_release_work_item, feed_activity_event_from_github,
-        fetch_repo_releases_with_optional_token, hydrate_repo_refresh_candidates,
-        insert_feed_activity_events, insert_social_activity_event_tx,
-        install_social_activity_snapshot_after_reads_hook, is_terminal_notification_thread_error,
-        load_public_release_usage_sync_access, load_repo_release_candidate_users,
-        owned_repo_snapshot_from_node, process_repo_release_work_item,
-        prune_subscription_sync_history, rebuild_repo_refresh_governance_snapshots,
-        record_repo_refresh_governance_attempt, record_repo_release_sync_success,
-        recover_repo_release_runtime_state_on_startup, replace_starred_repos,
-        repo_release_deadline_at, resolve_notification_open_url, store_sync_state_value,
-        subscription_event_counts_as_critical, subscription_timeout_error,
+        DASHBOARD_RELEASE_FRESHNESS_POLICY_VERSION, DashboardFreshnessPressureLevel,
+        DashboardReleaseFreshnessAssessment, DashboardReleaseFreshnessPolicy,
+        DashboardReleaseFreshnessPressure, EligibleUserRow, FeedActivityEventSnapshot,
+        FollowerSnapshot, GitHubActivityEvent, GitHubActivityPayload, GitHubActor, GitHubEventRepo,
+        GitHubNotification, GitHubRelease, GitHubReleaseEventPayload,
+        NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE, NOTIFICATION_OPEN_URL_REPAIR_KEY,
+        NOTIFICATION_OPEN_URL_REPAIR_PENDING, NOTIFICATIONS_SINCE_KEY, NotificationRepo,
+        NotificationSubject, OwnedRepoNode, OwnedRepoSnapshot,
+        REPO_REFRESH_GOVERNANCE_REBUILD_CHUNK_SIZE, REPO_RELEASE_DEADLINE_EXPIRED_ERROR,
+        ReleaseDemandRepo, RepoOwner, RepoRefreshCandidate, RepoReleaseFetchOutcome,
+        RepoReleaseHttpState, RepoReleaseOrigin, RepoReleaseWorkItemRow, RepoReleaseWriteStats,
+        RepoStargazerFetchResult, RepoStargazerSnapshot, SocialActivityEventInsert,
+        StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot, SubscriptionEventRecord,
+        SubscriptionPrunePhaseOutcome, SubscriptionRunContext, SyncRequestError,
+        aggregate_release_visible_repos, aggregate_repos, announcement_category_id_from_repo_value,
+        append_subscription_event, apply_social_activity_snapshot,
+        apply_social_activity_snapshot_partial, apply_social_activity_snapshot_with_options,
+        attach_and_wait_for_user_release_demand_with_freshness, attach_release_demand,
+        claim_next_repo_release_work_item, classify_github_http_error, cmp_last_active_desc,
+        collect_repo_stargazer_snapshots_with, discussion_announcement_from_node,
+        execute_repo_release_work_item, execute_subscription_prune_phases,
+        expire_repo_release_deadlines, fail_repo_release_work_item,
+        feed_activity_event_from_github, fetch_repo_releases_with_optional_token,
+        hydrate_repo_refresh_candidates, insert_feed_activity_events,
+        insert_social_activity_event_tx, install_social_activity_snapshot_after_reads_hook,
+        is_terminal_notification_thread_error, load_public_release_usage_sync_access,
+        load_repo_release_candidate_users, owned_repo_snapshot_from_node,
+        process_repo_release_work_item, prune_subscription_sync_history,
+        rebuild_repo_refresh_governance_snapshots, record_repo_refresh_governance_attempt,
+        record_repo_release_sync_success, recover_repo_release_runtime_state_on_startup,
+        replace_starred_repos, repo_release_deadline_at, resolve_notification_open_url,
+        store_sync_state_value, subscription_event_counts_as_critical, subscription_timeout_error,
         sync_notifications_with_fetch, sync_starred_for_user_with_fetch, upsert_notifications,
         upsert_repo_releases, upsert_starred_repos, wait_for_release_demand,
     };
@@ -10994,6 +11590,165 @@ mod tests {
         assert!(cmp_last_active_desc(stale, recent).is_gt());
         assert!(cmp_last_active_desc(recent, None).is_lt());
         assert!(cmp_last_active_desc(None, recent).is_gt());
+    }
+
+    fn test_dashboard_freshness_policy(
+        profile: &str,
+        effective_repo_count: usize,
+        pressure_level: DashboardFreshnessPressureLevel,
+    ) -> DashboardReleaseFreshnessPolicy {
+        let pressure = DashboardReleaseFreshnessPressure {
+            queued_work_items: 0,
+            running_work_items: 0,
+            repo_release_worker_concurrency: 8,
+            queue_ratio: 0.0,
+            active_dashboard_tasks: 0,
+            queue_pressure_level: pressure_level.as_str().to_owned(),
+            active_task_pressure_level: pressure_level.as_str().to_owned(),
+            pressure_level: pressure_level.as_str().to_owned(),
+        };
+        DashboardReleaseFreshnessPolicy {
+            profile: profile.to_owned(),
+            evaluated_at: "2026-08-09T00:00:00Z".to_owned(),
+            effective_repo_count,
+            pressure_adjustment: super::dashboard_freshness_pressure_adjustment(
+                profile,
+                pressure_level,
+            ),
+            assessment: DashboardReleaseFreshnessAssessment {
+                policy_version: DASHBOARD_RELEASE_FRESHNESS_POLICY_VERSION,
+                profile: profile.to_owned(),
+                evaluated_at: "2026-08-09T00:00:00Z".to_owned(),
+                effective_repo_count,
+                pressure,
+                min_window_minutes: 0,
+                max_window_minutes: 0,
+                fetched_count: 0,
+                reused_fresh_count: 0,
+                reused_running_count: 0,
+                queued_count: 0,
+                decision_counts: HashMap::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn dashboard_freshness_policy_uses_profile_matrix_and_clamps_window() {
+        let repo = ReleaseDemandRepo {
+            repo_id: 1,
+            full_name: "octo/example".to_owned(),
+            is_new_repo: false,
+        };
+        let balanced = test_dashboard_freshness_policy(
+            "balanced",
+            150,
+            DashboardFreshnessPressureLevel::Light,
+        );
+        assert_eq!(
+            balanced
+                .assess_repo(&repo, 1, false, None, false)
+                .freshness_window_minutes,
+            6
+        );
+        assert_eq!(
+            balanced
+                .assess_repo(&repo, 20, false, None, false)
+                .freshness_window_minutes,
+            1
+        );
+
+        let latest = test_dashboard_freshness_policy(
+            "latest",
+            26,
+            DashboardFreshnessPressureLevel::Moderate,
+        );
+        assert_eq!(
+            latest
+                .assess_repo(&repo, 1, false, None, false)
+                .freshness_window_minutes,
+            4
+        );
+        assert_eq!(
+            latest
+                .assess_repo(&repo, 1, false, Some("2026-08-09T00:00:00Z"), true)
+                .decision,
+            "reused_running"
+        );
+        assert_eq!(
+            latest
+                .assess_repo(&repo, 1, false, Some("2026-08-08T23:59:00Z"), false)
+                .decision,
+            "reused_fresh"
+        );
+        assert_eq!(
+            latest
+                .assess_repo(&repo, 1, false, Some("2026-08-08T23:50:00Z"), false)
+                .decision,
+            "fetch"
+        );
+
+        let capacity = test_dashboard_freshness_policy(
+            "capacity",
+            301,
+            DashboardFreshnessPressureLevel::Saturated,
+        );
+        assert_eq!(
+            capacity
+                .assess_repo(&repo, 1, false, None, false)
+                .freshness_window_minutes,
+            30
+        );
+    }
+
+    #[test]
+    fn dashboard_freshness_pressure_uses_maximum_and_records_missing_snapshot() {
+        assert_eq!(
+            super::dashboard_freshness_pressure_level_from_queue(0.99),
+            DashboardFreshnessPressureLevel::Light
+        );
+        assert_eq!(
+            super::dashboard_freshness_pressure_level_from_queue(1.0),
+            DashboardFreshnessPressureLevel::Moderate
+        );
+        assert_eq!(
+            super::dashboard_freshness_pressure_level_from_queue(2.0),
+            DashboardFreshnessPressureLevel::High
+        );
+        assert_eq!(
+            super::dashboard_freshness_pressure_level_from_queue(4.0),
+            DashboardFreshnessPressureLevel::Saturated
+        );
+        assert_eq!(
+            super::dashboard_freshness_pressure_level_from_active_tasks(1),
+            DashboardFreshnessPressureLevel::Light
+        );
+        assert_eq!(
+            super::dashboard_freshness_pressure_level_from_active_tasks(2),
+            DashboardFreshnessPressureLevel::Moderate
+        );
+        assert_eq!(
+            super::dashboard_freshness_pressure_level_from_active_tasks(4),
+            DashboardFreshnessPressureLevel::High
+        );
+        assert_eq!(
+            super::dashboard_freshness_pressure_level_from_active_tasks(8),
+            DashboardFreshnessPressureLevel::Saturated
+        );
+        let repo = ReleaseDemandRepo {
+            repo_id: 2,
+            full_name: "octo/missing".to_owned(),
+            is_new_repo: false,
+        };
+        let policy =
+            test_dashboard_freshness_policy("balanced", 1, DashboardFreshnessPressureLevel::Light);
+        let assessment = policy.assess_repo(&repo, 1, true, None, false);
+        assert!(assessment.snapshot_missing);
+        assert!(
+            assessment
+                .reason_codes
+                .iter()
+                .any(|code| code == "snapshot_missing")
+        );
     }
 
     #[test]
@@ -17674,12 +18429,13 @@ mod tests {
         .await
         .expect("seed fresh repo release work item");
 
-        let result = attach_and_wait_for_user_release_demand(
+        let result = attach_and_wait_for_user_release_demand_with_freshness(
             state.as_ref(),
             Some(("task-access-fresh", HashSet::new())),
             user_id.as_str(),
             RepoReleaseOrigin::Interactive,
             "access_refresh",
+            Some("latest"),
         )
         .await
         .expect("attach and wait for release demand");
@@ -17690,10 +18446,20 @@ mod tests {
         assert_eq!(result.reused_running, 0);
         assert_eq!(result.queued, 0);
         assert_eq!(result.failed, 0);
+        let freshness = result
+            .freshness_assessment
+            .as_ref()
+            .expect("adaptive freshness assessment");
+        assert_eq!(freshness.profile, "latest");
+        assert_eq!(freshness.effective_repo_count, 1);
+        assert_eq!(freshness.reused_fresh_count, 1);
+        assert_eq!(freshness.min_window_minutes, 1);
+        assert_eq!(freshness.max_window_minutes, 1);
 
-        let watcher = sqlx::query_as::<_, (String, i64, String, String)>(
+        let watcher = sqlx::query_as::<_, (String, i64, String, String, i64, String, String)>(
             r#"
-            SELECT status, is_new_repo, origin, reason
+            SELECT status, is_new_repo, origin, reason, freshness_window_minutes,
+                   freshness_decision, freshness_assessment_json
             FROM repo_release_watchers
             WHERE task_id = ? AND work_item_id = ?
             LIMIT 1
@@ -17708,6 +18474,9 @@ mod tests {
         assert_eq!(watcher.1, 1);
         assert_eq!(watcher.2, RepoReleaseOrigin::Interactive.as_str());
         assert_eq!(watcher.3, "access_refresh");
+        assert_eq!(watcher.4, 1);
+        assert_eq!(watcher.5, "reused_fresh");
+        assert!(watcher.6.contains("snapshot_missing"));
 
         let progress_payload = sqlx::query_scalar::<_, String>(
             r#"
@@ -17739,6 +18508,92 @@ mod tests {
             progress.get("queued").and_then(serde_json::Value::as_u64),
             Some(0)
         );
+    }
+
+    #[tokio::test]
+    async fn adaptive_release_progress_excludes_reused_running_work_item_stats() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_access_refresh_task(&state, "task-access-running-stats").await;
+        sqlx::query("UPDATE job_tasks SET payload_json = ? WHERE id = ?")
+            .bind(r#"{"dashboard_adaptive_release_freshness":true}"#)
+            .bind("task-access-running-stats")
+            .execute(&pool)
+            .await
+            .expect("mark task as adaptive dashboard refresh");
+
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-running-stats",
+                repo_id: 8080,
+                repo_full_name: "octo/running-stats",
+                status: jobs::STATUS_SUCCEEDED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 9,
+                last_candidate_failures: 0,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE repo_release_work_items
+            SET last_fetched_count = 9,
+                last_inserted_count = 4,
+                last_updated_count = 3,
+                last_unchanged_count = 2,
+                last_pages_fetched = 2
+            WHERE id = ?
+            "#,
+        )
+        .bind("repo-work-running-stats")
+        .execute(&pool)
+        .await
+        .expect("seed running work item stats");
+        sqlx::query(
+            r#"
+            INSERT INTO repo_release_watchers (
+              id, work_item_id, task_id, user_id, origin, priority, reason,
+              is_new_repo, reused_fresh, freshness_decision, status,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("watch-running-stats")
+        .bind("repo-work-running-stats")
+        .bind("task-access-running-stats")
+        .bind(Option::<String>::None)
+        .bind(RepoReleaseOrigin::Interactive.as_str())
+        .bind(RepoReleaseOrigin::Interactive.priority())
+        .bind("access_refresh")
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind("reused_running")
+        .bind(jobs::STATUS_SUCCEEDED)
+        .bind("2026-03-06T00:00:00Z")
+        .bind("2026-03-06T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed reused running watcher");
+
+        let result = wait_for_release_demand(
+            state.as_ref(),
+            Some("task-access-running-stats"),
+            &["repo-work-running-stats".to_owned()],
+            Some(1),
+        )
+        .await
+        .expect("summarize reused running work item");
+
+        assert_eq!(result.releases, 9);
+        assert_eq!(result.current_run_releases, 0);
+        assert_eq!(result.fetched_count, 0);
+        assert_eq!(result.inserted_count, 0);
+        assert_eq!(result.updated_count, 0);
+        assert_eq!(result.unchanged_count, 0);
+        assert_eq!(result.pages_fetched, 0);
     }
 
     #[tokio::test]
@@ -17962,6 +18817,7 @@ mod tests {
                 releases: 5,
                 ..super::SharedReleaseDemandResult::default()
             },
+            release_freshness_assessment: None,
             social: super::SyncSocialActivityResult::default(),
             social_error: None,
             notifications: super::SyncNotificationsResult {
