@@ -548,8 +548,18 @@ export function DashboardHeader({
 		onSyncAll?.();
 	}, [onSyncAll]);
 	const revealSyncTooltip = useCallback(() => {
-		setSyncTooltipDismissed(false);
-	}, []);
+		if (syncingAll) {
+			setSyncTooltipDismissed(false);
+		}
+	}, [syncingAll]);
+	const handleSyncTooltipOpenChange = useCallback(
+		(nextOpen: boolean) => {
+			if (nextOpen) {
+				revealSyncTooltip();
+			}
+		},
+		[revealSyncTooltip],
+	);
 
 	return (
 		<div
@@ -717,13 +727,17 @@ export function DashboardHeader({
 							)}
 						/>
 					</div>
-					<Tooltip open={showSyncTooltip}>
+					<Tooltip
+						open={showSyncTooltip}
+						onOpenChange={handleSyncTooltipOpenChange}
+					>
 						<TooltipTrigger asChild>
 							<Button
 								ref={syncTriggerRef}
 								disabled={busy && !syncingAll}
 								onClick={handleSyncClick}
 								onPointerEnter={revealSyncTooltip}
+								onPointerMove={revealSyncTooltip}
 								onFocus={revealSyncTooltip}
 								size={hideSubtitle ? "sm" : "default"}
 								data-app-shell-gesture-guard

@@ -6,7 +6,7 @@
 - Implementation: 已交付
 - Created: 2026-03-27
 - Last: 2026-08-09
-- Summary: 已交付；同步进度气泡支持 outside-click / Escape 临时关闭，并可通过 hover、聚焦或点击同步按钮恢复当前详情；重复点击不再发出替代详情的 toast
+- Summary: 已交付；同步进度气泡支持 outside-click / Escape 临时关闭，并通过 Tooltip 原语的 hover、pointer move、聚焦或点击同步按钮恢复当前详情；重复点击不再发出替代详情的 toast
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
