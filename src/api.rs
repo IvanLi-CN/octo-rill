@@ -6395,16 +6395,25 @@ pub async fn admin_get_release_freshness_audit(
         .map_err(ApiError::internal)?;
     let items = rows
         .into_iter()
-        .map(|row| AdminReleaseFreshnessAuditItemResponse {
-            repo_id: row.repo_id,
-            repo_full_name: row.repo_full_name,
-            status: row.status,
-            reused_fresh: row.reused_fresh != 0,
-            freshness_window_minutes: row.freshness_window_minutes,
-            freshness_decision: row.freshness_decision,
-            assessment: parse_json_value(row.freshness_assessment_json.as_deref()),
-            last_success_at: row.last_success_at,
-            error_text: row.error_text,
+        .map(|row| {
+            let assessment = parse_json_value(row.freshness_assessment_json.as_deref());
+            let last_success_at = assessment
+                .as_ref()
+                .and_then(|value| value.get("last_success_at"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or(row.last_success_at);
+            AdminReleaseFreshnessAuditItemResponse {
+                repo_id: row.repo_id,
+                repo_full_name: row.repo_full_name,
+                status: row.status,
+                reused_fresh: row.reused_fresh != 0,
+                freshness_window_minutes: row.freshness_window_minutes,
+                freshness_decision: row.freshness_decision,
+                assessment,
+                last_success_at,
+                error_text: row.error_text,
+            }
         })
         .collect();
 
@@ -13039,15 +13048,20 @@ pub async fn sync_all(
         return Ok(Json(body?).into_response());
     }
 
+    let payload = if matches!(&mode, ReturnMode::TaskId) {
+        json!({
+            "user_id": user_id.clone(),
+            "dashboard_adaptive_release_freshness": true,
+        })
+    } else {
+        json!({ "user_id": user_id.clone() })
+    };
     enqueue_singleton_or_stream_task(
         state,
         mode,
         jobs::NewTask {
             task_type: jobs::TASK_SYNC_ACCESS_REFRESH.to_owned(),
-            payload: json!({
-                "user_id": user_id.clone(),
-                "dashboard_adaptive_release_freshness": true,
-            }),
+            payload,
             source: "api.sync_all".to_owned(),
             requested_by: Some(user_id.clone()),
             parent_task_id: None,
@@ -22429,6 +22443,57 @@ mod tests {
         .await
         .expect("count access refresh tasks");
         assert_eq!(queued, 1);
+
+        let payload = sqlx::query_scalar::<_, String>(
+            "SELECT payload_json FROM job_tasks WHERE id = ? LIMIT 1",
+        )
+        .bind(first_task_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load sync_all task payload");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&payload)
+                .expect("parse sync_all task payload")["dashboard_adaptive_release_freshness"],
+            json!(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_all_sse_keeps_legacy_access_refresh_freshness_payload() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        let _response = sync_all(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(ReturnModeQuery {
+                return_mode: Some("sse".to_owned()),
+            }),
+        )
+        .await
+        .expect("enqueue sync_all sse");
+
+        let payload = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT payload_json
+            FROM job_tasks
+            WHERE requested_by = ? AND task_type = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(test_user_id(1))
+        .bind(jobs::TASK_SYNC_ACCESS_REFRESH)
+        .fetch_one(&pool)
+        .await
+        .expect("load sync_all sse task payload");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&payload)
+                .expect("parse sync_all sse payload")
+                .get("dashboard_adaptive_release_freshness")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -27096,7 +27161,9 @@ mod tests {
         .bind(0_i64)
         .bind(1_i64)
         .bind("fetch")
-        .bind(r#"{"reason_codes":["snapshot_missing","outside_window"]}"#)
+        .bind(
+            r#"{"last_success_at":"2026-03-06T14:20:00Z","reason_codes":["snapshot_missing","outside_window"]}"#,
+        )
         .bind(jobs::STATUS_SUCCEEDED)
         .bind(Option::<String>::None)
         .bind(now)
@@ -27129,6 +27196,10 @@ mod tests {
         );
         assert_eq!(response.items[0].freshness_window_minutes, Some(1));
         assert!(!response.items[0].reused_fresh);
+        assert_eq!(
+            response.items[0].last_success_at.as_deref(),
+            Some("2026-03-06T14:20:00Z")
+        );
         assert_eq!(
             response.items[0]
                 .assessment

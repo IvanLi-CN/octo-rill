@@ -484,6 +484,7 @@ impl DashboardReleaseFreshnessPolicy {
         snapshot_missing: bool,
         last_success_at: Option<&str>,
         in_progress: bool,
+        existing_status: Option<&str>,
     ) -> DashboardReleaseFreshnessRepoAssessment {
         let portfolio_adjustment = self.portfolio_adjustment();
         let sharing_adjustment = Self::sharing_adjustment(watcher_user_count);
@@ -500,7 +501,9 @@ impl DashboardReleaseFreshnessPolicy {
             .is_some_and(|(last, cutoff)| last.with_timezone(&Utc) >= cutoff);
         let (decision, reason_codes) = if in_progress {
             ("reused_running", vec!["existing_work_item".to_owned()])
-        } else if fresh {
+        } else if existing_status == Some(jobs::STATUS_FAILED) {
+            ("fetch", vec!["failed_work_item".to_owned()])
+        } else if fresh && existing_status == Some(jobs::STATUS_SUCCEEDED) {
             ("reused_fresh", vec!["within_window".to_owned()])
         } else if last_success_at.is_some() {
             ("fetch", vec!["outside_window".to_owned()])
@@ -4106,6 +4109,7 @@ async fn attach_release_demand_with_freshness(
                 existing.as_ref().is_some_and(|item| {
                     item.status == jobs::STATUS_QUEUED || item.status == jobs::STATUS_RUNNING
                 }),
+                existing.as_ref().map(|item| item.status.as_str()),
             );
             policy.record_decision(
                 assessment.decision.as_str(),
@@ -11546,20 +11550,22 @@ mod tests {
         append_subscription_event, apply_social_activity_snapshot,
         apply_social_activity_snapshot_partial, apply_social_activity_snapshot_with_options,
         attach_and_wait_for_user_release_demand_with_freshness, attach_release_demand,
-        claim_next_repo_release_work_item, classify_github_http_error, cmp_last_active_desc,
-        collect_repo_stargazer_snapshots_with, discussion_announcement_from_node,
-        execute_repo_release_work_item, execute_subscription_prune_phases,
-        expire_repo_release_deadlines, fail_repo_release_work_item,
-        feed_activity_event_from_github, fetch_repo_releases_with_optional_token,
-        hydrate_repo_refresh_candidates, insert_feed_activity_events,
-        insert_social_activity_event_tx, install_social_activity_snapshot_after_reads_hook,
-        is_terminal_notification_thread_error, load_public_release_usage_sync_access,
-        load_repo_release_candidate_users, owned_repo_snapshot_from_node,
-        process_repo_release_work_item, prune_subscription_sync_history,
-        rebuild_repo_refresh_governance_snapshots, record_repo_refresh_governance_attempt,
-        record_repo_release_sync_success, recover_repo_release_runtime_state_on_startup,
-        replace_starred_repos, repo_release_deadline_at, resolve_notification_open_url,
-        store_sync_state_value, subscription_event_counts_as_critical, subscription_timeout_error,
+        attach_release_demand_with_freshness, claim_next_repo_release_work_item,
+        classify_github_http_error, cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
+        discussion_announcement_from_node, execute_repo_release_work_item,
+        execute_subscription_prune_phases, expire_repo_release_deadlines,
+        fail_repo_release_work_item, feed_activity_event_from_github,
+        fetch_repo_releases_with_optional_token, hydrate_repo_refresh_candidates,
+        insert_feed_activity_events, insert_social_activity_event_tx,
+        install_social_activity_snapshot_after_reads_hook, is_terminal_notification_thread_error,
+        load_dashboard_release_freshness_policy, load_dashboard_release_freshness_snapshots,
+        load_public_release_usage_sync_access, load_repo_release_candidate_users,
+        owned_repo_snapshot_from_node, process_repo_release_work_item,
+        prune_subscription_sync_history, rebuild_repo_refresh_governance_snapshots,
+        record_repo_refresh_governance_attempt, record_repo_release_sync_success,
+        recover_repo_release_runtime_state_on_startup, replace_starred_repos,
+        repo_release_deadline_at, resolve_notification_open_url, store_sync_state_value,
+        subscription_event_counts_as_critical, subscription_timeout_error,
         sync_notifications_with_fetch, sync_starred_for_user_with_fetch, upsert_notifications,
         upsert_repo_releases, upsert_starred_repos, wait_for_release_demand,
     };
@@ -11646,13 +11652,13 @@ mod tests {
         );
         assert_eq!(
             balanced
-                .assess_repo(&repo, 1, false, None, false)
+                .assess_repo(&repo, 1, false, None, false, None)
                 .freshness_window_minutes,
             6
         );
         assert_eq!(
             balanced
-                .assess_repo(&repo, 20, false, None, false)
+                .assess_repo(&repo, 20, false, None, false, None)
                 .freshness_window_minutes,
             1
         );
@@ -11664,25 +11670,46 @@ mod tests {
         );
         assert_eq!(
             latest
-                .assess_repo(&repo, 1, false, None, false)
+                .assess_repo(&repo, 1, false, None, false, None)
                 .freshness_window_minutes,
             4
         );
         assert_eq!(
             latest
-                .assess_repo(&repo, 1, false, Some("2026-08-09T00:00:00Z"), true)
+                .assess_repo(
+                    &repo,
+                    1,
+                    false,
+                    Some("2026-08-09T00:00:00Z"),
+                    true,
+                    Some(jobs::STATUS_RUNNING),
+                )
                 .decision,
             "reused_running"
         );
         assert_eq!(
             latest
-                .assess_repo(&repo, 1, false, Some("2026-08-08T23:59:00Z"), false)
+                .assess_repo(
+                    &repo,
+                    1,
+                    false,
+                    Some("2026-08-08T23:59:00Z"),
+                    false,
+                    Some(jobs::STATUS_SUCCEEDED),
+                )
                 .decision,
             "reused_fresh"
         );
         assert_eq!(
             latest
-                .assess_repo(&repo, 1, false, Some("2026-08-08T23:50:00Z"), false)
+                .assess_repo(
+                    &repo,
+                    1,
+                    false,
+                    Some("2026-08-08T23:50:00Z"),
+                    false,
+                    Some(jobs::STATUS_SUCCEEDED),
+                )
                 .decision,
             "fetch"
         );
@@ -11694,7 +11721,7 @@ mod tests {
         );
         assert_eq!(
             capacity
-                .assess_repo(&repo, 1, false, None, false)
+                .assess_repo(&repo, 1, false, None, false, None)
                 .freshness_window_minutes,
             30
         );
@@ -11741,7 +11768,7 @@ mod tests {
         };
         let policy =
             test_dashboard_freshness_policy("balanced", 1, DashboardFreshnessPressureLevel::Light);
-        let assessment = policy.assess_repo(&repo, 1, true, None, false);
+        let assessment = policy.assess_repo(&repo, 1, true, None, false, None);
         assert!(assessment.snapshot_missing);
         assert!(
             assessment
@@ -18508,6 +18535,80 @@ mod tests {
             progress.get("queued").and_then(serde_json::Value::as_u64),
             Some(0)
         );
+    }
+
+    #[tokio::test]
+    async fn adaptive_release_requeues_failed_work_item_even_with_recent_success() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("failed-recent");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        seed_sync_task(&state, "task-access-failed-recent").await;
+        seed_starred_repo_row(&pool, user_id.as_str(), 4242, "octo/failed-recent").await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-failed-recent",
+                repo_id: 4242,
+                repo_full_name: "octo/failed-recent",
+                status: jobs::STATUS_FAILED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 3,
+                last_candidate_failures: 1,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        sqlx::query("UPDATE repo_release_work_items SET last_success_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind("repo-work-failed-recent")
+            .execute(&pool)
+            .await
+            .expect("seed recent success timestamp");
+
+        let demand_repos = vec![ReleaseDemandRepo {
+            repo_id: 4242,
+            full_name: "octo/failed-recent".to_owned(),
+            is_new_repo: false,
+        }];
+        let mut policy =
+            load_dashboard_release_freshness_policy(state.as_ref(), "latest", &demand_repos)
+                .await
+                .expect("load freshness policy");
+        let snapshots = load_dashboard_release_freshness_snapshots(state.as_ref(), &demand_repos)
+            .await
+            .expect("load freshness snapshots");
+        let result = attach_release_demand_with_freshness(
+            state.as_ref(),
+            Some("task-access-failed-recent"),
+            Some(user_id.as_str()),
+            &demand_repos,
+            RepoReleaseOrigin::Interactive,
+            "access_refresh",
+            Some(&mut policy),
+            &snapshots,
+        )
+        .await
+        .expect("attach failed work item demand");
+
+        assert_eq!(result.reused_fresh, 0);
+        assert_eq!(result.queued, 1);
+        let decision = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT freshness_decision, freshness_assessment_json
+            FROM repo_release_watchers
+            WHERE task_id = ? AND work_item_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind("task-access-failed-recent")
+        .bind("repo-work-failed-recent")
+        .fetch_one(&pool)
+        .await
+        .expect("load failed work item audit");
+        assert_eq!(decision.0, "fetch");
+        assert!(decision.1.contains("failed_work_item"));
     }
 
     #[tokio::test]
