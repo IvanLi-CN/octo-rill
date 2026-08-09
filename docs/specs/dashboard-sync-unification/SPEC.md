@@ -151,11 +151,11 @@ PR: none
 
 - source_type: `storybook_canvas`
   target_program: `mock-only`
-  capture_scope: `element`
+  capture_scope: `browser-viewport`
   requested_viewport: `1280x720`
   viewport_strategy: `storybook-viewport`
-  margin_policy: `require_margin`
-  evidence_surface: `component`
+  margin_policy: `trim_only`
+  evidence_surface: `page`
   sensitive_exclusion: `N/A`
   submission_gate: `pending-owner-approval`
   story_id_or_title: `Pages/Dashboard Header / Syncing`
@@ -166,11 +166,11 @@ PR: none
 
 - source_type: `storybook_canvas`
   target_program: `mock-only`
-  capture_scope: `element`
+  capture_scope: `browser-viewport`
   requested_viewport: `390x844`
   viewport_strategy: `storybook-viewport`
-  margin_policy: `require_margin`
-  evidence_surface: `component`
+  margin_policy: `trim_only`
+  evidence_surface: `page`
   sensitive_exclusion: `N/A`
   submission_gate: `pending-owner-approval`
   story_id_or_title: `Pages/Dashboard Header / Regression / Mobile sync recovery`
