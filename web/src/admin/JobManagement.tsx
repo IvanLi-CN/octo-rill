@@ -3682,6 +3682,15 @@ export function JobManagement({
 	const [repoRefreshSystemBudgetInput, setRepoRefreshSystemBudgetInput] =
 		useState(1000);
 	const [
+		dashboardReleaseFreshnessProfileInput,
+		setDashboardReleaseFreshnessProfileInput,
+	] =
+		useState<
+			NonNullable<
+				AdminSyncRuntimeConfigResponse["dashboard_release_freshness_profile"]
+			>
+		>("balanced");
+	const [
 		dailyBriefScheduleLocalTimeInput,
 		setDailyBriefScheduleLocalTimeInput,
 	] = useState("06:00");
@@ -4138,6 +4147,9 @@ export function JobManagement({
 			setRepoRefreshSystemBudgetInput(
 				res.repo_refresh_system_budget_per_window,
 			);
+			setDashboardReleaseFreshnessProfileInput(
+				res.dashboard_release_freshness_profile ?? "balanced",
+			);
 			setDailyBriefScheduleLocalTimeInput(res.daily_brief_schedule_local_time);
 			syncRuntimeConfigLoadedOnceRef.current = true;
 		} catch (err) {
@@ -4215,6 +4227,8 @@ export function JobManagement({
 				repo_refresh_system_budget_per_window: clampRepoRefreshSystemBudget(
 					repoRefreshSystemBudgetInput,
 				),
+				dashboard_release_freshness_profile:
+					dashboardReleaseFreshnessProfileInput,
 			});
 			setSyncRuntimeConfig(res);
 			setSyncAutoFetchIntervalInput(res.sync_auto_fetch_interval_minutes);
@@ -4225,6 +4239,9 @@ export function JobManagement({
 			setRepoReleaseWorkerConcurrencyInput(res.repo_release_worker_concurrency);
 			setRepoRefreshSystemBudgetInput(
 				res.repo_refresh_system_budget_per_window,
+			);
+			setDashboardReleaseFreshnessProfileInput(
+				res.dashboard_release_freshness_profile ?? "balanced",
 			);
 			setDailyBriefScheduleLocalTimeInput(res.daily_brief_schedule_local_time);
 			setSubscriptionSyncSettingsDialogOpen(false);
@@ -4242,6 +4259,7 @@ export function JobManagement({
 		loadSubscriptionRuns,
 		repoReleaseWorkerConcurrencyInput,
 		repoRefreshSystemBudgetInput,
+		dashboardReleaseFreshnessProfileInput,
 		syncAutoFetchIntervalInput,
 		syncRuntimeConfig,
 	]);
@@ -4268,6 +4286,9 @@ export function JobManagement({
 		);
 		setRepoRefreshSystemBudgetInput(
 			syncRuntimeConfig?.repo_refresh_system_budget_per_window ?? 1000,
+		);
+		setDashboardReleaseFreshnessProfileInput(
+			syncRuntimeConfig?.dashboard_release_freshness_profile ?? "balanced",
 		);
 		setSubscriptionSyncSettingsDialogOpen(true);
 	}, [syncRuntimeConfig]);
@@ -6512,6 +6533,43 @@ export function JobManagement({
 
 					<div className="grid gap-6 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
 						<div className="space-y-5 lg:border-r lg:border-border/70 lg:pr-6">
+							<div className="space-y-2">
+								<Label>Dashboard 手动刷新新鲜度</Label>
+								<div
+									role="radiogroup"
+									aria-label="Dashboard 手动刷新新鲜度策略"
+									className="grid grid-cols-3 gap-1 rounded-lg border bg-muted/30 p-1"
+								>
+									{(
+										[
+											["latest", "最新"],
+											["balanced", "平衡"],
+											["capacity", "容量"],
+										] as const
+									).map(([value, label]) => (
+										<button
+											key={value}
+											type="button"
+											aria-pressed={
+												dashboardReleaseFreshnessProfileInput === value
+											}
+											className={`min-h-9 rounded-md px-2 text-xs font-medium transition-colors ${
+												dashboardReleaseFreshnessProfileInput === value
+													? "bg-background text-foreground shadow-sm"
+													: "text-muted-foreground hover:text-foreground"
+											}`}
+											onClick={() =>
+												setDashboardReleaseFreshnessProfileInput(value)
+											}
+										>
+											{label}
+										</button>
+									))}
+								</div>
+								<p className="text-muted-foreground text-xs">
+									仅作用于 Dashboard 全量同步，单仓窗口始终限制在 1–30 分钟。
+								</p>
+							</div>
 							<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
 								<Label htmlFor="repo-release-worker-concurrency">
 									Release 抓取并发

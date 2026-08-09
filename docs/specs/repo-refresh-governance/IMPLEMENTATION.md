@@ -6,7 +6,7 @@
 - Implementation: 已交付
 - Created: 2026-06-29
 - Last: 2026-08-07
-- Summary: 已交付；effective repo pool、10 分钟 budgeted governance snapshots、attempt-based system cycle ledger、chunked governance rebuild、`/admin/repos` 独立治理页、闲置账号暂停与自助恢复、预算编辑收口到订阅同步设置弹窗、仓库明细目标窗口/迫切值筛选、带主题模式切换的暂停恢复页、Storybook 和稳定 `ui_demo` 视觉证据与 build validation 已完成
+- Summary: 已交付；effective repo pool、10 分钟 budgeted governance snapshots、attempt-based system cycle ledger、chunked governance rebuild、`/admin/repos` 独立治理页、闲置账号暂停与自助恢复、Dashboard Release 自适应新鲜度与任务审计、预算编辑收口到订阅同步设置弹窗、仓库明细目标窗口/迫切值筛选、带主题模式切换的暂停恢复页、Storybook 和 build validation 已完成
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -30,6 +30,7 @@
 - [x] M9: governance rebuild 分阶段 chunked writer，避免大候选池与 cycle member reconciliation 长时间占用 SQLite writer。
 - [x] M10: completed-cycle member retention uses active-only queries, short best-effort deletes, and a restart-safe shared budget; new databases configure incremental auto-vacuum without scheduling a production full `VACUUM`.
 - [x] M11: inactive account suspension: schema、daily maintenance、paused access guards、self-service resume、eligible-pool exclusions、admin filters、stable UI demo、浅色/深色 Storybook states and approved visual evidence.
+- [x] M12: Dashboard 手动全量同步在 Release 阶段冻结 `latest / balanced / capacity` 新鲜度策略，按有效仓库规模、共享快照与实时压力逐仓决定抓取或复用；审计结果写入 watcher、任务结果与 progress event，并由管理员详情摘要与分页接口展示。
 
 ## 本轮收口
 
@@ -59,3 +60,11 @@
 
 - 仓库明细列表新增服务端全量筛选：`target_windows` 多选、`urgency_min` / `urgency_max` 范围、真实目标窗口 options；前端搜索、老化、窗口与迫切值筛选统一 300ms 防抖自动应用，并将 `全部 / 仅超 24 小时 / 仅未成功` 三个互斥状态收口为单个下拉选择。
 - 目标窗口与迫切值保留各自的筛选面板，并在触发按钮右侧展示下拉箭头，和状态下拉形成一致的筛选控件 affordance。
+
+## Dashboard Release 新鲜度收口
+
+- `POST /api/sync/all` 异步任务通过 `dashboard_adaptive_release_freshness` payload 标记启用动态策略；单项同步、系统订阅同步与旧 `sync.access_refresh` 任务保持既有 30 分钟语义。
+- Release 阶段开始时冻结评估时刻、策略档位、有效仓库集合、队列压力和活跃 Dashboard 任务数。窗口严格钳制在 1–30 分钟，压力只放宽窗口，不跳过有效仓库或拒绝同步。
+- `admin_runtime_settings.dashboard_release_freshness_profile` 只接受 `latest / balanced / capacity`，缺省为 `balanced`；共享快照缺失时按 1 人计算并保留 `snapshot_missing`。
+- `repo_release_watchers` 保存逐仓窗口、决策和评估 JSON；`result_json.release_freshness_assessment` 与 `release_freshness_assessed` 事件保存任务级汇总。管理员查询仅限 `sync.access_refresh`，沿用 watcher 生命周期清理。
+- `release.releases` 继续表示兼容总量；`current_run_releases`、抓取/写入/分页字段只统计本轮 work item，`reused_fresh_count` 与 `reused_running_count` 单独记录缓存和进行中任务复用。

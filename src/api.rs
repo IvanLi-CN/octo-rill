@@ -1568,6 +1568,7 @@ pub struct SyncRuntimeConfigResponse {
     retry_recent_failures_interval_minutes: i64,
     repo_release_worker_concurrency: usize,
     repo_refresh_system_budget_per_window: i64,
+    dashboard_release_freshness_profile: String,
     daily_brief_schedule_local_time: String,
     recent_sync_tasks: Vec<SyncAutoFetchTaskItem>,
 }
@@ -1578,6 +1579,7 @@ pub struct SyncRuntimeConfigPatchRequest {
     retry_recent_failures_interval_minutes: Option<i64>,
     repo_release_worker_concurrency: Option<i64>,
     repo_refresh_system_budget_per_window: Option<i64>,
+    dashboard_release_freshness_profile: Option<String>,
     daily_brief_schedule_local_time: Option<String>,
 }
 
@@ -1727,6 +1729,10 @@ async fn load_sync_runtime_config(state: &AppState) -> Result<SyncRuntimeConfigR
         admin_runtime::load_repo_refresh_system_budget_per_window(&state.pool)
             .await
             .map_err(ApiError::internal)?;
+    let dashboard_release_freshness_profile =
+        admin_runtime::load_dashboard_release_freshness_profile(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
     let daily_brief_schedule_local_time =
         admin_runtime::load_daily_brief_schedule_local_time(&state.pool, &state.config)
             .await
@@ -1737,6 +1743,7 @@ async fn load_sync_runtime_config(state: &AppState) -> Result<SyncRuntimeConfigR
         retry_recent_failures_interval_minutes,
         repo_release_worker_concurrency,
         repo_refresh_system_budget_per_window,
+        dashboard_release_freshness_profile,
         daily_brief_schedule_local_time: briefs::format_daily_brief_local_time(
             daily_brief_schedule_local_time,
         ),
@@ -1831,6 +1838,13 @@ async fn persist_sync_runtime_config(
             "repo_refresh_system_budget_per_window must be between 1 and 20000",
         ));
     }
+    if let Some(profile) = req.dashboard_release_freshness_profile.as_deref()
+        && !admin_runtime::is_dashboard_release_freshness_profile(profile)
+    {
+        return Err(ApiError::bad_request(
+            "dashboard_release_freshness_profile must be one of latest, balanced, capacity",
+        ));
+    }
     let daily_brief_schedule_local_time = req
         .daily_brief_schedule_local_time
         .as_deref()
@@ -1859,6 +1873,11 @@ async fn persist_sync_runtime_config(
     }
     if let Some(budget) = req.repo_refresh_system_budget_per_window {
         admin_runtime::update_repo_refresh_system_budget_per_window(&state.pool, budget)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    if let Some(profile) = req.dashboard_release_freshness_profile.as_deref() {
+        admin_runtime::update_dashboard_release_freshness_profile(&state.pool, profile)
             .await
             .map_err(ApiError::internal)?;
     }
@@ -4449,6 +4468,15 @@ pub struct AdminSyncAccessRefreshDiagnostics {
     star_repos: i64,
     release_repos: i64,
     releases: i64,
+    current_run_releases: i64,
+    fetched_count: i64,
+    inserted_count: i64,
+    updated_count: i64,
+    unchanged_count: i64,
+    pages_fetched: i64,
+    reused_fresh_count: i64,
+    reused_running_count: i64,
+    release_freshness_assessment: Option<Value>,
     social_repo_stars: i64,
     social_followers: i64,
     social_events: i64,
@@ -4456,6 +4484,48 @@ pub struct AdminSyncAccessRefreshDiagnostics {
     social_error: Option<String>,
     notifications_error: Option<String>,
     failure: Option<AdminSyncAccessRefreshFailureDiagnostic>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminReleaseFreshnessQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    decision: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct AdminReleaseFreshnessAuditItem {
+    repo_id: i64,
+    repo_full_name: String,
+    status: String,
+    reused_fresh: i64,
+    freshness_window_minutes: Option<i64>,
+    freshness_decision: Option<String>,
+    freshness_assessment_json: Option<String>,
+    last_success_at: Option<String>,
+    error_text: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminReleaseFreshnessAuditResponse {
+    items: Vec<AdminReleaseFreshnessAuditItemResponse>,
+    page: i64,
+    page_size: i64,
+    total: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminReleaseFreshnessAuditItemResponse {
+    repo_id: i64,
+    repo_full_name: String,
+    status: String,
+    reused_fresh: bool,
+    freshness_window_minutes: Option<i64>,
+    freshness_decision: Option<String>,
+    assessment: Option<Value>,
+    last_success_at: Option<String>,
+    error_text: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5518,6 +5588,22 @@ fn latest_access_refresh_failure(
     latest
 }
 
+fn latest_release_freshness_assessment(events: &[AdminTaskEventItem]) -> Option<Value> {
+    events.iter().rev().find_map(|event| {
+        if event.event_type != "task.progress" {
+            return None;
+        }
+        let payload = parse_json_value(Some(event.payload_json.as_str()))?;
+        let object = payload.as_object()?;
+        if json_object_get_string(Some(object), "stage").as_deref()
+            != Some("release_freshness_assessed")
+        {
+            return None;
+        }
+        object.get("assessment").cloned()
+    })
+}
+
 fn build_sync_access_refresh_diagnostics(
     task: &AdminRealtimeTaskDetailItem,
     events: &[AdminTaskEventItem],
@@ -5533,12 +5619,28 @@ fn build_sync_access_refresh_diagnostics(
     let notifications_error = json_object_get_string(result_object, "notifications_error");
     let log_available = realtime_task_log_available(task);
     let log_download_path = log_available.then(|| realtime_task_log_download_path(&task.id));
+    let release_freshness_assessment = result_object
+        .and_then(|object| object.get("release_freshness_assessment").cloned())
+        .or_else(|| release_object.and_then(|object| object.get("freshness_assessment").cloned()))
+        .or_else(|| latest_release_freshness_assessment(events));
     let diagnostics = AdminSyncAccessRefreshDiagnostics {
         log_available,
         log_download_path,
         star_repos: json_object_get_i64(starred_object, "repos").unwrap_or(0),
         release_repos: json_object_get_i64(release_object, "repos").unwrap_or(0),
         releases: json_object_get_i64(release_object, "releases").unwrap_or(0),
+        current_run_releases: json_object_get_i64(release_object, "current_run_releases")
+            .unwrap_or(0),
+        fetched_count: json_object_get_i64(release_object, "fetched_count").unwrap_or(0),
+        inserted_count: json_object_get_i64(release_object, "inserted_count").unwrap_or(0),
+        updated_count: json_object_get_i64(release_object, "updated_count").unwrap_or(0),
+        unchanged_count: json_object_get_i64(release_object, "unchanged_count").unwrap_or(0),
+        pages_fetched: json_object_get_i64(release_object, "pages_fetched").unwrap_or(0),
+        reused_fresh_count: json_object_get_i64(release_object, "reused_fresh_count")
+            .unwrap_or_else(|| json_object_get_i64(release_object, "reused_fresh").unwrap_or(0)),
+        reused_running_count: json_object_get_i64(release_object, "reused_running_count")
+            .unwrap_or_else(|| json_object_get_i64(release_object, "reused_running").unwrap_or(0)),
+        release_freshness_assessment,
         social_repo_stars: json_object_get_i64(social_object, "repo_stars").unwrap_or(0),
         social_followers: json_object_get_i64(social_object, "followers").unwrap_or(0),
         social_events: json_object_get_i64(social_object, "events").unwrap_or(0),
@@ -6182,6 +6284,136 @@ pub async fn admin_get_realtime_task_detail(
     Ok(Json(
         load_realtime_task_detail_response(state.as_ref(), task_id.as_str()).await?,
     ))
+}
+
+pub async fn admin_get_release_freshness_audit(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(task_id): Path<String>,
+    Query(query): Query<AdminReleaseFreshnessQuery>,
+) -> Result<Json<AdminReleaseFreshnessAuditResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let task_id = parse_local_id_param(task_id, "task_id")?;
+    let task_type =
+        sqlx::query_scalar::<_, String>("SELECT task_type FROM job_tasks WHERE id = ? LIMIT 1")
+            .bind(task_id.as_str())
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "task not found"))?;
+    if task_type != jobs::TASK_SYNC_ACCESS_REFRESH {
+        return Err(ApiError::bad_request(
+            "release freshness audit is only available for sync.access_refresh tasks",
+        ));
+    }
+
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(50).clamp(1, 100);
+    let decision = query
+        .decision
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(decision) = decision
+        && !matches!(decision, "fetch" | "reused_fresh" | "reused_running")
+    {
+        return Err(ApiError::bad_request(
+            "decision must be one of fetch, reused_fresh, reused_running",
+        ));
+    }
+    let reason = query
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if reason.is_some_and(|value| {
+        value.len() > 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    }) {
+        return Err(ApiError::bad_request("reason must be an ASCII reason code"));
+    }
+
+    let mut count_query = QueryBuilder::<Sqlite>::new(
+        "SELECT COUNT(*) FROM repo_release_watchers rw WHERE rw.task_id = ",
+    );
+    count_query.push_bind(task_id.as_str());
+    if let Some(decision) = decision {
+        count_query.push(" AND rw.freshness_decision = ");
+        count_query.push_bind(decision);
+    }
+    if let Some(reason) = reason {
+        count_query.push(
+            " AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(rw.freshness_assessment_json) THEN rw.freshness_assessment_json ELSE '{\"reason_codes\":[]}' END, '$.reason_codes') AS reason_code WHERE reason_code.value = ",
+        );
+        count_query.push_bind(reason);
+        count_query.push(")");
+    }
+    let total = count_query
+        .build_query_scalar::<i64>()
+        .fetch_one(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+
+    let offset = (page - 1).saturating_mul(page_size);
+    let mut rows_query = QueryBuilder::<Sqlite>::new(
+        r#"SELECT
+             wi.repo_id,
+             wi.repo_full_name,
+             rw.status,
+             rw.reused_fresh,
+             rw.freshness_window_minutes,
+             rw.freshness_decision,
+             rw.freshness_assessment_json,
+             wi.last_success_at,
+             rw.error_text
+           FROM repo_release_watchers rw
+           JOIN repo_release_work_items wi ON wi.id = rw.work_item_id
+           WHERE rw.task_id = "#,
+    );
+    rows_query.push_bind(task_id.as_str());
+    if let Some(decision) = decision {
+        rows_query.push(" AND rw.freshness_decision = ");
+        rows_query.push_bind(decision);
+    }
+    if let Some(reason) = reason {
+        rows_query.push(
+            " AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(rw.freshness_assessment_json) THEN rw.freshness_assessment_json ELSE '{\"reason_codes\":[]}' END, '$.reason_codes') AS reason_code WHERE reason_code.value = ",
+        );
+        rows_query.push_bind(reason);
+        rows_query.push(")");
+    }
+    rows_query.push(" ORDER BY wi.repo_id ASC, rw.id ASC LIMIT ");
+    rows_query.push_bind(page_size);
+    rows_query.push(" OFFSET ");
+    rows_query.push_bind(offset);
+    let rows = rows_query
+        .build_query_as::<AdminReleaseFreshnessAuditItem>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let items = rows
+        .into_iter()
+        .map(|row| AdminReleaseFreshnessAuditItemResponse {
+            repo_id: row.repo_id,
+            repo_full_name: row.repo_full_name,
+            status: row.status,
+            reused_fresh: row.reused_fresh != 0,
+            freshness_window_minutes: row.freshness_window_minutes,
+            freshness_decision: row.freshness_decision,
+            assessment: parse_json_value(row.freshness_assessment_json.as_deref()),
+            last_success_at: row.last_success_at,
+            error_text: row.error_text,
+        })
+        .collect();
+
+    Ok(Json(AdminReleaseFreshnessAuditResponse {
+        items,
+        page,
+        page_size,
+        total,
+    }))
 }
 
 async fn load_realtime_task_detail_response(
@@ -12812,7 +13044,10 @@ pub async fn sync_all(
         mode,
         jobs::NewTask {
             task_type: jobs::TASK_SYNC_ACCESS_REFRESH.to_owned(),
-            payload: json!({ "user_id": user_id.clone() }),
+            payload: json!({
+                "user_id": user_id.clone(),
+                "dashboard_adaptive_release_freshness": true,
+            }),
             source: "api.sync_all".to_owned(),
             requested_by: Some(user_id.clone()),
             parent_task_id: None,
@@ -20990,32 +21225,33 @@ mod tests {
         ACCESS_SYNC_REASON_INACTIVE_OVER_1H, ADMIN_DASHBOARD_PREAGGREGATE_DAYS,
         ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT, ADMIN_TASK_DETAIL_EVENT_LIMIT, AdminDashboardQuery,
         AdminLlmCallListScope, AdminLlmCallsQuery, AdminLlmRuntimeConfigUpdateRequest,
-        AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery, AdminRepoGovernanceListQuery,
-        AdminSyncSubscriptionEventItem, AdminTaskEventItem, AdminUserPatchRequest,
-        AdminUserUpdateGuard, AdminUsersQuery, BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT,
-        CreateApiKeyRequest, DashboardUpdatesQuery, DashboardUpdatesToken, FeedQuery,
-        FeedReactionRefreshRequest, FeedRow, FeedScope, GitHubCompareCommit,
-        GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse, GraphQlError,
-        LLM_CALL_ORDER_BY_CREATED_DESC, LiveReleaseReactions, PublicReleaseQuery,
+        AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery, AdminReleaseFreshnessQuery,
+        AdminRepoGovernanceListQuery, AdminSyncSubscriptionEventItem, AdminTaskEventItem,
+        AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery,
+        BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, CreateApiKeyRequest, DashboardUpdatesQuery,
+        DashboardUpdatesToken, FeedQuery, FeedReactionRefreshRequest, FeedRow, FeedScope,
+        GitHubCompareCommit, GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse,
+        GraphQlError, LLM_CALL_ORDER_BY_CREATED_DESC, LiveReleaseReactions, PublicReleaseQuery,
         RELEASE_FEED_BODY_MAX_CHARS, ReleaseReactionCounts, ReleaseReactionRow,
         ReleaseReactionViewer, ReleaseSmartBatchCandidate, ReturnModeQuery,
         SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslationCacheRow, TranslationUpsert,
         admin_dashboard, admin_delete_public_release_repo, admin_download_realtime_task_log,
         admin_get_llm_call_detail, admin_get_llm_scheduler_status, admin_get_realtime_task_detail,
-        admin_list_llm_calls, admin_list_realtime_tasks, admin_list_repo_governance,
-        admin_list_users, admin_patch_llm_runtime_config, admin_patch_user, admin_users_offset,
-        ai_error_is_non_retryable, brief_contains_release_link, build_compare_digest,
-        build_feed_reaction_refresh_item, build_task_diagnostics, compact_dashboard_signatures,
-        dashboard_updates, encode_dashboard_updates_token, ensure_account_enabled,
-        execute_sync_all_sync_with, extract_brief_release_ids, extract_translation_fields,
-        feed_item_from_row, get_brief, get_release_detail, get_release_detail_by_repo_tag,
-        get_repo_public_release_status, github_access_restricted_error,
-        github_graphql_errors_to_api_error, github_graphql_http_error, github_rate_limited_error,
-        github_reauth_required_error, guard_admin_user_update, has_repo_scope,
-        last_active_is_stale, list_briefs, list_feed, list_personal_repos, list_releases,
-        llm_call_order_by_clause, load_admin_dashboard_today_live_snapshot,
-        load_pending_access_sync_reason, load_viewer_user, looks_like_json_blob,
-        map_job_action_error, map_public_compare_fallback_error, mark_translation_requested,
+        admin_get_release_freshness_audit, admin_list_llm_calls, admin_list_realtime_tasks,
+        admin_list_repo_governance, admin_list_users, admin_patch_llm_runtime_config,
+        admin_patch_user, admin_users_offset, ai_error_is_non_retryable,
+        brief_contains_release_link, build_compare_digest, build_feed_reaction_refresh_item,
+        build_task_diagnostics, compact_dashboard_signatures, dashboard_updates,
+        encode_dashboard_updates_token, ensure_account_enabled, execute_sync_all_sync_with,
+        extract_brief_release_ids, extract_translation_fields, feed_item_from_row, get_brief,
+        get_release_detail, get_release_detail_by_repo_tag, get_repo_public_release_status,
+        github_access_restricted_error, github_graphql_errors_to_api_error,
+        github_graphql_http_error, github_rate_limited_error, github_reauth_required_error,
+        guard_admin_user_update, has_repo_scope, last_active_is_stale, list_briefs, list_feed,
+        list_personal_repos, list_releases, llm_call_order_by_clause,
+        load_admin_dashboard_today_live_snapshot, load_pending_access_sync_reason,
+        load_viewer_user, looks_like_json_blob, map_job_action_error,
+        map_public_compare_fallback_error, mark_translation_requested,
         markdown_structure_preserved, me, me_create_api_key, me_delete_api_key, me_delete_passkey,
         me_get_api_keys, me_resume, normalize_markdown_translation_output,
         normalize_translation_fields, parse_batch_notification_translation_payload,
@@ -26790,6 +27026,118 @@ mod tests {
         let minutes = (idx / 60) % 60;
         let seconds = idx % 60;
         format!("2026-03-06T{hours:02}:{minutes:02}:{seconds:02}Z")
+    }
+
+    #[tokio::test]
+    async fn admin_get_release_freshness_audit_filters_and_paginates() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "admin", 1, 0).await;
+        let state = setup_state(pool.clone());
+        let session = setup_session(2).await;
+        let task_id = crate::local_id::test_local_id("task-release-freshness-audit");
+        let work_item_id = crate::local_id::test_local_id("work-release-freshness-audit");
+        let now = "2026-03-06T14:30:00Z";
+        seed_access_refresh_task(
+            &pool,
+            task_id.as_str(),
+            test_user_id(2).as_str(),
+            jobs::STATUS_SUCCEEDED,
+        )
+        .await;
+        sqlx::query(
+            r#"
+            INSERT INTO repo_release_work_items (
+              id, repo_id, repo_full_name, status, request_origin, priority,
+              has_new_repo_watchers, deadline_at, last_release_count,
+              last_candidate_failures, last_success_at, error_text,
+              created_at, started_at, finished_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(work_item_id.as_str())
+        .bind(4242_i64)
+        .bind("octo/audit")
+        .bind(jobs::STATUS_SUCCEEDED)
+        .bind("interactive")
+        .bind(10_i64)
+        .bind(0_i64)
+        .bind("2999-01-01T00:00:00Z")
+        .bind(3_i64)
+        .bind(0_i64)
+        .bind("2026-03-06T14:29:00Z")
+        .bind(Option::<String>::None)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed release freshness work item");
+        sqlx::query(
+            r#"
+            INSERT INTO repo_release_watchers (
+              id, work_item_id, task_id, user_id, origin, priority, reason,
+              is_new_repo, reused_fresh, freshness_window_minutes,
+              freshness_decision, freshness_assessment_json, status, error_text,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::test_local_id(
+            "watch-release-freshness-audit",
+        ))
+        .bind(work_item_id.as_str())
+        .bind(task_id.as_str())
+        .bind(test_user_id(2))
+        .bind("interactive")
+        .bind(10_i64)
+        .bind("access_refresh")
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(1_i64)
+        .bind("fetch")
+        .bind(r#"{"reason_codes":["snapshot_missing","outside_window"]}"#)
+        .bind(jobs::STATUS_SUCCEEDED)
+        .bind(Option::<String>::None)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed release freshness watcher");
+
+        let response = admin_get_release_freshness_audit(
+            State(state),
+            session,
+            Path(task_id),
+            Query(AdminReleaseFreshnessQuery {
+                page: Some(1),
+                page_size: Some(1000),
+                decision: Some("fetch".to_owned()),
+                reason: Some("snapshot_missing".to_owned()),
+            }),
+        )
+        .await
+        .expect("release freshness audit response")
+        .0;
+
+        assert_eq!(response.page_size, 100);
+        assert_eq!(response.total, 1);
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(
+            response.items[0].freshness_decision.as_deref(),
+            Some("fetch")
+        );
+        assert_eq!(response.items[0].freshness_window_minutes, Some(1));
+        assert!(!response.items[0].reused_fresh);
+        assert_eq!(
+            response.items[0]
+                .assessment
+                .as_ref()
+                .and_then(|value| value.get("reason_codes"))
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
     }
 
     #[tokio::test]
@@ -33183,6 +33531,7 @@ echo should_not_be_in_excerpt
                 retry_recent_failures_interval_minutes: Some(15),
                 repo_release_worker_concurrency: Some(12),
                 repo_refresh_system_budget_per_window: None,
+                dashboard_release_freshness_profile: Some("capacity".to_owned()),
                 daily_brief_schedule_local_time: Some("07:00".to_owned()),
             },
         )
@@ -33192,11 +33541,12 @@ echo should_not_be_in_excerpt
         assert_eq!(settings.sync_auto_fetch_interval_minutes, 10);
         assert_eq!(settings.retry_recent_failures_interval_minutes, 15);
         assert_eq!(settings.repo_release_worker_concurrency, 12);
+        assert_eq!(settings.dashboard_release_freshness_profile, "capacity");
         assert_eq!(settings.daily_brief_schedule_local_time, "07:00");
 
-        let row = sqlx::query_as::<_, (i64, i64, i64, String)>(
+        let row = sqlx::query_as::<_, (i64, i64, i64, String, String)>(
             r#"
-            SELECT sync_auto_fetch_interval_minutes, retry_recent_failures_interval_minutes, repo_release_worker_concurrency, daily_brief_schedule_local_time
+            SELECT sync_auto_fetch_interval_minutes, retry_recent_failures_interval_minutes, repo_release_worker_concurrency, dashboard_release_freshness_profile, daily_brief_schedule_local_time
             FROM admin_runtime_settings
             WHERE id = 1
             "#,
@@ -33208,7 +33558,34 @@ echo should_not_be_in_excerpt
         assert_eq!(row.0, 10);
         assert_eq!(row.1, 15);
         assert_eq!(row.2, 12);
-        assert_eq!(row.3, "07:00");
+        assert_eq!(row.3, "capacity");
+        assert_eq!(row.4, "07:00");
+    }
+
+    #[tokio::test]
+    async fn persist_sync_runtime_config_rejects_unknown_freshness_profile() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+
+        let err = super::persist_sync_runtime_config(
+            state.as_ref(),
+            super::SyncRuntimeConfigPatchRequest {
+                sync_auto_fetch_interval_minutes: 10,
+                retry_recent_failures_interval_minutes: None,
+                repo_release_worker_concurrency: None,
+                repo_refresh_system_budget_per_window: None,
+                dashboard_release_freshness_profile: Some("aggressive".to_owned()),
+                daily_brief_schedule_local_time: None,
+            },
+        )
+        .await
+        .expect_err("unknown freshness profile should be rejected");
+
+        assert_eq!(err.code(), "bad_request");
+        assert!(
+            err.to_string()
+                .contains("dashboard_release_freshness_profile")
+        );
     }
 
     #[tokio::test]
@@ -33224,6 +33601,7 @@ echo should_not_be_in_excerpt
                     retry_recent_failures_interval_minutes: None,
                     repo_release_worker_concurrency: None,
                     repo_refresh_system_budget_per_window: None,
+                    dashboard_release_freshness_profile: None,
                     daily_brief_schedule_local_time: None,
                 },
             )
@@ -33250,6 +33628,7 @@ echo should_not_be_in_excerpt
                 retry_recent_failures_interval_minutes: Some(0),
                 repo_release_worker_concurrency: None,
                 repo_refresh_system_budget_per_window: None,
+                dashboard_release_freshness_profile: None,
                 daily_brief_schedule_local_time: None,
             },
         )
@@ -33275,6 +33654,7 @@ echo should_not_be_in_excerpt
                 retry_recent_failures_interval_minutes: None,
                 repo_release_worker_concurrency: Some(33),
                 repo_refresh_system_budget_per_window: None,
+                dashboard_release_freshness_profile: None,
                 daily_brief_schedule_local_time: None,
             },
         )

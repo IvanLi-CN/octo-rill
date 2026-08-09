@@ -1,6 +1,13 @@
-import type { AdminLlmCallItem, AdminRealtimeTaskDetailResponse } from "@/api";
+import { useEffect, useState } from "react";
+import type {
+	AdminLlmCallItem,
+	AdminReleaseFreshnessAuditItem,
+	AdminRealtimeTaskDetailResponse,
+} from "@/api";
+import { apiGetAdminReleaseFreshnessAudit } from "@/api";
 import { Button } from "@/components/ui/button";
 import { formatIsoShortLocal } from "@/lib/datetime";
+import { ChevronDown, RefreshCw } from "lucide-react";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -97,6 +104,24 @@ function field(
 ): TaskField | null {
 	if (!value) return null;
 	return { label, value };
+}
+
+function freshnessDecisionLabel(decision: string | null | undefined): string {
+	if (decision === "fetch") return "本轮抓取";
+	if (decision === "reused_fresh") return "复用新鲜缓存";
+	if (decision === "reused_running") return "复用进行中任务";
+	return "未评估";
+}
+
+function freshnessPressureLabel(level: string | undefined): string {
+	if (level === "saturated") return "饱和";
+	if (level === "high") return "高";
+	if (level === "moderate") return "中";
+	return "低";
+}
+
+function formatAuditTime(value: string | null | undefined): string {
+	return value ? formatIsoShortLocal(value) : "无";
 }
 
 function summarizeDailySlotEvents(detail: AdminRealtimeTaskDetailResponse) {
@@ -281,6 +306,26 @@ function buildTaskDetailPageModel(
 							: readNumber(release, "releases") !== null
 								? `${readNumber(release, "releases")}`
 								: null,
+					),
+					field(
+						"本轮 Release 数",
+						diagnostics ? `${diagnostics.current_run_releases}` : null,
+					),
+					field(
+						"本轮抓取 / 新增 / 更新 / 未变",
+						diagnostics
+							? `${diagnostics.fetched_count} / ${diagnostics.inserted_count} / ${diagnostics.updated_count} / ${diagnostics.unchanged_count}`
+							: null,
+					),
+					field(
+						"复用新鲜缓存 / 进行中任务",
+						diagnostics
+							? `${diagnostics.reused_fresh_count} / ${diagnostics.reused_running_count}`
+							: null,
+					),
+					field(
+						"本轮抓取页数",
+						diagnostics ? `${diagnostics.pages_fetched}` : null,
 					),
 					field(
 						"Social 事件",
@@ -911,6 +956,66 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 	const showRelatedLlmCalls = shouldShowRelatedLlmCalls(
 		props.detail.task.task_type,
 	);
+	const freshnessAssessment =
+		accessRefreshDiagnostics?.release_freshness_assessment ?? null;
+	const [freshnessAuditOpen, setFreshnessAuditOpen] = useState(false);
+	const [freshnessAuditLoading, setFreshnessAuditLoading] = useState(false);
+	const [freshnessAuditError, setFreshnessAuditError] = useState<string | null>(
+		null,
+	);
+	const [freshnessAuditItems, setFreshnessAuditItems] = useState<
+		AdminReleaseFreshnessAuditItem[]
+	>([]);
+	const [freshnessAuditTotal, setFreshnessAuditTotal] = useState(0);
+	const [freshnessAuditPage, setFreshnessAuditPage] = useState(1);
+	const [freshnessAuditDecision, setFreshnessAuditDecision] = useState("");
+	const [freshnessAuditReason, setFreshnessAuditReason] = useState("");
+
+	useEffect(() => {
+		if (
+			!freshnessAuditOpen ||
+			props.detail.task.task_type !== "sync.access_refresh"
+		) {
+			return;
+		}
+		let cancelled = false;
+		setFreshnessAuditLoading(true);
+		setFreshnessAuditError(null);
+		const params = new URLSearchParams({
+			page: String(freshnessAuditPage),
+			page_size: "50",
+		});
+		if (freshnessAuditDecision) params.set("decision", freshnessAuditDecision);
+		if (freshnessAuditReason) params.set("reason", freshnessAuditReason);
+		void apiGetAdminReleaseFreshnessAudit(props.detail.task.id, params)
+			.then((response) => {
+				if (cancelled) return;
+				setFreshnessAuditItems(response.items);
+				setFreshnessAuditTotal(response.total);
+			})
+			.catch((error: unknown) => {
+				if (!cancelled) {
+					setFreshnessAuditError(
+						error instanceof Error
+							? error.message
+							: "加载 Release 审计明细失败",
+					);
+				}
+			})
+			.finally(() => {
+				if (!cancelled) setFreshnessAuditLoading(false);
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [
+		freshnessAuditDecision,
+		freshnessAuditOpen,
+		freshnessAuditPage,
+		freshnessAuditReason,
+		props.detail.task.id,
+		props.detail.task.task_type,
+	]);
 
 	return (
 		<section className="space-y-3">
@@ -955,6 +1060,185 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 					</div>
 				))}
 			</div>
+			{accessRefreshDiagnostics ? (
+				<div className={detailCardClass}>
+					<div className="flex flex-wrap items-start justify-between gap-3">
+						<div>
+							<p className="text-muted-foreground text-[11px]">
+								Release 新鲜度评估
+							</p>
+							{freshnessAssessment ? (
+								<p className="mt-1 text-sm font-semibold">
+									{freshnessAssessment.profile} ·{" "}
+									{freshnessAssessment.effective_repo_count === 0
+										? "无有效仓库"
+										: freshnessAssessment.max_window_minutes > 0
+											? `${freshnessAssessment.min_window_minutes}–${freshnessAssessment.max_window_minutes} 分钟窗口`
+											: "评估中"}
+								</p>
+							) : (
+								<p className="mt-1 text-sm font-semibold">未应用动态策略</p>
+							)}
+						</div>
+						{freshnessAssessment ? (
+							<span className="rounded-full border px-2.5 py-1 text-xs font-medium">
+								压力{" "}
+								{freshnessPressureLabel(
+									freshnessAssessment.pressure.pressure_level,
+								)}
+							</span>
+						) : null}
+					</div>
+					{freshnessAssessment ? (
+						<div className="mt-3 grid gap-2 sm:grid-cols-4">
+							<div className="rounded-md border bg-muted/20 p-2">
+								<p className="text-muted-foreground text-[11px]">有效仓库</p>
+								<p className="mt-1 text-sm font-semibold">
+									{freshnessAssessment.effective_repo_count}
+								</p>
+							</div>
+							<div className="rounded-md border bg-muted/20 p-2">
+								<p className="text-muted-foreground text-[11px]">要求抓取</p>
+								<p className="mt-1 text-sm font-semibold">
+									{freshnessAssessment.fetched_count}
+								</p>
+							</div>
+							<div className="rounded-md border bg-muted/20 p-2">
+								<p className="text-muted-foreground text-[11px]">
+									复用新鲜缓存
+								</p>
+								<p className="mt-1 text-sm font-semibold">
+									{freshnessAssessment.reused_fresh_count}
+								</p>
+							</div>
+							<div className="rounded-md border bg-muted/20 p-2">
+								<p className="text-muted-foreground text-[11px]">评估时间</p>
+								<p className="mt-1 text-xs font-medium">
+									{formatAuditTime(freshnessAssessment.evaluated_at)}
+								</p>
+							</div>
+						</div>
+					) : null}
+					<Button
+						type="button"
+						variant="ghost"
+						className="mt-3 h-9 w-full justify-between px-2"
+						onClick={() => {
+							setFreshnessAuditOpen((open) => !open);
+							setFreshnessAuditPage(1);
+						}}
+						aria-expanded={freshnessAuditOpen}
+					>
+						<span>查看仓库决策明细</span>
+						<ChevronDown
+							className={`size-4 transition-transform ${freshnessAuditOpen ? "rotate-180" : ""}`}
+						/>
+					</Button>
+					{freshnessAuditOpen ? (
+						<div className="mt-3 space-y-3 border-t pt-3">
+							<div className="grid gap-2 sm:grid-cols-2">
+								<select
+									value={freshnessAuditDecision}
+									onChange={(event) => {
+										setFreshnessAuditDecision(event.target.value);
+										setFreshnessAuditPage(1);
+									}}
+									aria-label="按新鲜度决策筛选"
+									className="h-9 rounded-md border bg-background px-2 text-sm"
+								>
+									<option value="">全部决策</option>
+									<option value="fetch">本轮抓取</option>
+									<option value="reused_fresh">复用新鲜缓存</option>
+									<option value="reused_running">复用进行中任务</option>
+								</select>
+								<input
+									value={freshnessAuditReason}
+									onChange={(event) => {
+										setFreshnessAuditReason(event.target.value);
+										setFreshnessAuditPage(1);
+									}}
+									placeholder="原因码，例如 snapshot_missing"
+									aria-label="按新鲜度原因码筛选"
+									className="h-9 rounded-md border bg-background px-2 text-sm"
+								/>
+							</div>
+							{freshnessAuditLoading ? (
+								<p className="text-muted-foreground flex items-center gap-2 text-xs">
+									<RefreshCw className="size-3.5 animate-spin" />{" "}
+									正在加载审计明细…
+								</p>
+							) : freshnessAuditError ? (
+								<p className="text-destructive text-xs">
+									{freshnessAuditError}
+								</p>
+							) : freshnessAuditItems.length === 0 ? (
+								<p className="text-muted-foreground text-xs">
+									暂无匹配的仓库决策。
+								</p>
+							) : (
+								<div className="space-y-2">
+									{freshnessAuditItems.map((item) => (
+										<div
+											key={`${item.repo_id}:${item.freshness_decision}`}
+											className="rounded-md border p-2"
+										>
+											<div className="flex flex-wrap items-center justify-between gap-2">
+												<p className="text-xs font-medium">
+													{item.repo_full_name}
+												</p>
+												<span className="text-xs font-medium">
+													{freshnessDecisionLabel(item.freshness_decision)}
+												</span>
+											</div>
+											<p className="text-muted-foreground mt-1 text-[11px]">
+												窗口 {item.freshness_window_minutes ?? "-"} 分钟 ·
+												上次成功 {formatAuditTime(item.last_success_at)}
+											</p>
+											{item.assessment?.reason_codes?.length ? (
+												<p className="text-muted-foreground mt-1 text-[11px]">
+													原因：{item.assessment.reason_codes.join("、")}
+												</p>
+											) : null}
+										</div>
+									))}
+								</div>
+							)}
+							{freshnessAuditTotal > 50 ? (
+								<div className="flex items-center justify-between gap-2">
+									<p className="text-muted-foreground text-[11px]">
+										第 {freshnessAuditPage} 页 · 共 {freshnessAuditTotal} 条
+									</p>
+									<div className="flex gap-1">
+										<Button
+											type="button"
+											variant="outline"
+											size="sm"
+											disabled={
+												freshnessAuditPage <= 1 || freshnessAuditLoading
+											}
+											onClick={() => setFreshnessAuditPage((page) => page - 1)}
+										>
+											上一页
+										</Button>
+										<Button
+											type="button"
+											variant="outline"
+											size="sm"
+											disabled={
+												freshnessAuditPage * 50 >= freshnessAuditTotal ||
+												freshnessAuditLoading
+											}
+											onClick={() => setFreshnessAuditPage((page) => page + 1)}
+										>
+											下一页
+										</Button>
+									</div>
+								</div>
+							) : null}
+						</div>
+					) : null}
+				</div>
+			) : null}
 			{diagnostics?.translate_release_batch?.items?.length ? (
 				<div className={detailCardClass}>
 					<p className="text-muted-foreground text-[11px]">Release 翻译明细</p>
