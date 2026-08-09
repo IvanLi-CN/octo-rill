@@ -344,7 +344,8 @@
   evidence_surface: `component`
   sensitive_exclusion: `N/A`
   submission_gate: `pending-owner-approval`
-  evidence_note: 证明管理员任务详情常驻展示 balanced 策略、压力档位、窗口范围、本轮抓取与缓存复用统计，并可展开仓库决策明细。
+  evidence_binding_sha: `fe03a92f02371ab6dab2f5f2559ca27b6a1ce716`
+  evidence_note: 证明管理员任务详情常驻展示 balanced 策略、压力档位、窗口范围、本轮抓取与缓存复用统计，桌面统计卡片按三列排列，并可展开仓库决策明细。
   PR: include
   ![Dashboard Release 新鲜度桌面证据](./assets/dashboard-release-freshness-desktop.png)
 
@@ -359,7 +360,8 @@
   evidence_surface: `component`
   sensitive_exclusion: `N/A`
   submission_gate: `pending-owner-approval`
-  evidence_note: 证明 393x852 CSS px 移动布局下策略摘要、筛选控件与复用新鲜缓存仓库明细保持可读，并支持长列表滚动。
+  evidence_binding_sha: `fe03a92f02371ab6dab2f5f2559ca27b6a1ce716`
+  evidence_note: 证明 393x852 CSS px 移动布局下策略摘要、筛选控件与全量仓库决策明细保持单列可读，并支持长列表滚动。
   PR: include
   ![Dashboard Release 新鲜度移动证据](./assets/dashboard-release-freshness-mobile.png)
 
