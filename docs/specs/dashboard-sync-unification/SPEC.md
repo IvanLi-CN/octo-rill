@@ -132,9 +132,9 @@
 
 ## Visual Evidence
 
-![Dashboard default sync entry](./assets/dashboard-default.png)
-
 - PR: none
+
+![Dashboard default sync entry](./assets/dashboard-default.png)
 
 - source_type: `storybook_canvas`
   target_program: `mock-only`
