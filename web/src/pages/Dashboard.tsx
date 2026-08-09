@@ -3517,12 +3517,6 @@ export function Dashboard(props: {
 			busy === SYNC_ALL_LABEL ||
 			accessSyncRunning
 		) {
-			pushToast({
-				title: "后台同步正在进行",
-				description:
-					"系统正在同步你的 GitHub 数据，可以悬浮在同步按钮上查看进度。",
-				duration: 3200,
-			});
 			return;
 		}
 		syncAllInFlightRef.current = true;
@@ -3542,7 +3536,7 @@ export function Dashboard(props: {
 		).finally(() => {
 			syncAllInFlightRef.current = false;
 		});
-	}, [accessSyncRunning, busy, pushToast, run, trackTaskStream]);
+	}, [accessSyncRunning, busy, run, trackTaskStream]);
 	const syncingAll = busy === SYNC_ALL_LABEL || accessSyncRunning;
 	const syncingInbox = busy === "Sync inbox";
 

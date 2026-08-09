@@ -46,9 +46,9 @@
 - 顶部同步操作只保留一个名为 `同步` 的按钮。
 - 顶部不得再显示单独的 `Refresh` 按钮。
 - `同步` 按钮左侧必须有刷新系 icon，并在全量同步执行中旋转。
-- 全量同步进行中，顶部 `同步` 按钮必须保持可点击；重复点击不得新建第二个同步任务，只提示后台同步正在进行。
+- 全量同步进行中，顶部 `同步` 按钮必须保持可点击；重复点击不得新建第二个同步任务；若进度气泡已被收起，重复点击应恢复当前进度详情，不再以 toast 替代详情。
 - 全量同步进行中，悬浮在顶部 `同步` 按钮上必须显示阶段进度，进度来源只能使用现有 `task.progress` SSE 事件。
-- 全量同步进行中，进度气泡打开后点击页面空白处或按 `Escape` 必须关闭气泡；关闭只影响当前同步中的本地显示状态，不取消后台任务，下一次全量同步开始时应重新自动展示。
+- 全量同步进行中，进度气泡打开后点击页面空白处或按 `Escape` 必须关闭气泡；关闭只影响当前同步中的本地显示状态，不取消后台任务；用户再次 hover、聚焦或点击同步按钮时必须恢复当前进度详情，下一次全量同步开始时仍应重新自动展示。
 - `Sync starred`、`Sync releases`、`Sync inbox` 的顶部按钮必须移除。
 - Feed 空态仅保留一个页面内 `同步` CTA，不再展示拆分同步按钮。
 - Inbox 空态与 release reaction `sync_required` 场景不得再渲染局部同步按钮。
@@ -70,7 +70,7 @@
 - 用户在 Dashboard 顶部点击 `同步`，页面进入 busy 状态；按钮保持可点击并展示旋转 icon。
 - 同步中 tooltip 展示“正在后台同步你的 GitHub 数据”、当前阶段、`0/4` 到 `4/4` 阶段进度，以及 SSE payload 中已有的仓库、Release、社交事件或 Inbox 通知计数。
 - 同步中 tooltip 支持 outside-click dismissal：点击同步按钮与气泡自身不关闭，点击页面其它空白区域或按 `Escape` 关闭当前气泡；当 `syncingAll` 回到 false 后清除本地 dismissal 状态，保证后续同步仍能重新展示进度提示。
-- 同步中再次点击 `同步` 时，前端只发出轻量 toast，不再次调用 `/api/sync/all?return_mode=task_id`。
+- 同步中再次点击 `同步` 时，前端恢复当前进度气泡，不再次调用 `/api/sync/all?return_mode=task_id`，也不发出替代详情的 toast。
 - 同步流程依次请求 starred、releases、notifications 三个端点；任一步失败时沿用既有 `run/busy` 错误处理，不继续后续请求。
 - Feed 空态仍可提供一个页面内 `同步` CTA，但其行为与顶部主按钮完全一致。
 
@@ -93,11 +93,15 @@
 
 - Given 用户触发全量同步
   When `同步` 流程进行中
-  Then 顶部 `同步` 按钮可点击，左侧 icon 旋转，悬浮 tooltip 展示阶段进度与已完成工作量，且重复点击不会新建第二个同步任务。
+  Then 顶部 `同步` 按钮可点击，左侧 icon 旋转，悬浮 tooltip 展示阶段进度与已完成工作量；重复点击会恢复已收起的详情，但不会新建第二个同步任务或显示替代详情的 toast。
 
 - Given 全量同步进度气泡已经显示
   When 用户点击页面空白处或按 `Escape`
-  Then 气泡关闭，后台同步继续运行，且下一次全量同步开始时气泡可再次自动显示。
+  Then 气泡关闭，后台同步继续运行；下一次 hover、聚焦或点击同步按钮时可恢复详情，下一次全量同步开始时气泡也会自动显示。
+
+- Given 全量同步进度气泡已被当前用户收起
+  When 用户再次 hover、聚焦或点击顶部 `同步`
+  Then 当前阶段进度与已完成工作量重新显示，且 `/api/sync/all?return_mode=task_id` 请求次数不增加。
 
 - Given Feed 为空
   When 空态卡片显示
@@ -123,11 +127,14 @@
 ### Visual verification
 
 - 使用 Storybook 产出一张 Dashboard 默认态视觉证据。
+- 使用 Storybook 产出桌面端与 390px 移动端的同步进度恢复视觉证据。
 - 视觉证据需写入本 spec 的 `## Visual Evidence`。
 
 ## Visual Evidence
 
 ![Dashboard default sync entry](./assets/dashboard-default.png)
+
+- PR: none
 
 - source_type: `storybook_canvas`
   target_program: `mock-only`
@@ -139,9 +146,38 @@
   story_id_or_title: `Pages/Dashboard Header / Syncing`
   state: `sync-progress-tooltip`
   evidence_note: 验证 Dashboard 页头 `同步` 按钮在全量同步中保持可点击、刷新 icon 旋转，并在悬浮气泡中展示阶段进度与已完成工作量。
-  PR: include
   image:
   ![Dashboard sync progress tooltip](./assets/dashboard-sync-progress-tooltip.png)
+
+- source_type: `storybook_canvas`
+  target_program: `mock-only`
+  capture_scope: `element`
+  requested_viewport: `1280x720`
+  viewport_strategy: `storybook-viewport`
+  margin_policy: `require_margin`
+  evidence_surface: `component`
+  sensitive_exclusion: `N/A`
+  submission_gate: `pending-owner-approval`
+  story_id_or_title: `Pages/Dashboard Header / Syncing`
+  state: `sync-progress-recovery-desktop`
+  evidence_note: 验证桌面端进度详情被空白点击或 Escape 收起后，重新 hover、聚焦或点击同步按钮均恢复同一份阶段与工作量详情。
+  image:
+  ![Desktop sync progress recovery](./assets/dashboard-sync-progress-recovery-desktop.png)
+
+- source_type: `storybook_canvas`
+  target_program: `mock-only`
+  capture_scope: `element`
+  requested_viewport: `390x844`
+  viewport_strategy: `storybook-viewport`
+  margin_policy: `require_margin`
+  evidence_surface: `component`
+  sensitive_exclusion: `N/A`
+  submission_gate: `pending-owner-approval`
+  story_id_or_title: `Pages/Dashboard Header / Regression / Mobile sync recovery`
+  state: `sync-progress-recovery-mobile`
+  evidence_note: 验证 390px 移动端进度详情被收起后，触控点击同步按钮恢复当前详情。
+  image:
+  ![Mobile sync progress recovery](./assets/dashboard-sync-progress-recovery-mobile.png)
 
 ## 方案概述（Approach, high-level）
 

@@ -2004,6 +2004,7 @@ test("dashboard opens access sync warmup bubble immediately after clicking sync"
 	let notificationCalls = 0;
 	let briefCalls = 0;
 	let taskAccepted = false;
+	let syncAllCalls = 0;
 
 	await page.addInitScript(
 		({ taskId, runningDelayMs, starDelayMs, completeDelayMs }) => {
@@ -2127,6 +2128,7 @@ test("dashboard opens access sync warmup bubble immediately after clicking sync"
 		}
 
 		if (req.method() === "POST" && pathname === "/api/sync/all") {
+			syncAllCalls += 1;
 			taskAccepted = true;
 			expect(searchParams.get("return_mode")).toBe("task_id");
 			return json(route, {
@@ -2192,7 +2194,24 @@ test("dashboard opens access sync warmup bubble immediately after clicking sync"
 	await expect(tooltip).toContainText("0/4");
 	await expect(tooltip).toContainText("正在准备 Star 阶段");
 
+	await page.locator("body").click({ position: { x: 20, y: 320 } });
+	await expect(page.locator('[data-slot="tooltip-content"]')).toHaveCount(0);
+	await syncButton.hover();
+	await expect(tooltip).toBeVisible();
+
+	await page.keyboard.press("Escape");
+	await expect(page.locator('[data-slot="tooltip-content"]')).toHaveCount(0);
+	await syncButton.focus();
+	await expect(tooltip).toBeVisible();
+
+	await page.locator("body").click({ position: { x: 20, y: 320 } });
+	await expect(page.locator('[data-slot="tooltip-content"]')).toHaveCount(0);
+	await syncButton.click();
+	await expect(tooltip).toBeVisible();
+	await expect(page.getByText("后台同步正在进行")).toHaveCount(0);
+
 	expect(taskAccepted).toBe(true);
+	expect(syncAllCalls).toBe(1);
 	expect(feedCalls).toBeGreaterThanOrEqual(1);
 	expect(notificationCalls).toBeGreaterThanOrEqual(1);
 	expect(briefCalls).toBeGreaterThanOrEqual(1);
