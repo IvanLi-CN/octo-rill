@@ -132,7 +132,7 @@
 
 ## Visual Evidence
 
-- PR: none
+PR: none
 
 ![Dashboard default sync entry](./assets/dashboard-default.png)
 
