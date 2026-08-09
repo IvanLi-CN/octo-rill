@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, type ReactNode } from "react";
+import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
@@ -111,6 +112,19 @@ const RELATED_USER_B = "5j7r9v3x6b8d2f4h";
 const SLOT_USER_A = "6k8m2p4r7t9w3y5b";
 const SLOT_USER_B = "7n9q3s5v8x2c4f6h";
 const SLOT_USER_C = "8p2r4t6w9y3d5g7k";
+const TASK_DETAIL_VIEWPORTS = {
+	...INITIAL_VIEWPORTS,
+	taskDetailDesktop1440: {
+		name: "Task detail desktop 1440x900",
+		styles: { width: "1440px", height: "900px" },
+		type: "desktop",
+	},
+	taskDetailMobile393: {
+		name: "Task detail mobile 393x852",
+		styles: { width: "393px", height: "852px" },
+		type: "mobile",
+	},
+} as const;
 
 function buildDetail(
 	taskType: string,
@@ -155,6 +169,9 @@ const meta = {
 	component: TaskTypeDetailSection,
 	parameters: {
 		layout: "padded",
+		viewport: {
+			options: TASK_DETAIL_VIEWPORTS,
+		},
 		docs: {
 			description: {
 				component:
@@ -302,6 +319,9 @@ export const SyncAccessRefreshFailed: Story = {
 };
 
 export const SyncAccessRefreshFreshnessAudit: Story = {
+	parameters: {
+		viewport: { defaultViewport: "taskDetailDesktop1440" },
+	},
 	render: (args) => (
 		<ReleaseFreshnessAuditMock>
 			<div className="mx-auto max-w-4xl">
@@ -398,6 +418,13 @@ export const SyncAccessRefreshFreshnessAudit: Story = {
 		await waitFor(() => {
 			expect(canvas.getByText("octo/release-51")).toBeVisible();
 		});
+	},
+};
+
+export const SyncAccessRefreshFreshnessAuditMobile: Story = {
+	...SyncAccessRefreshFreshnessAudit,
+	parameters: {
+		viewport: { defaultViewport: "taskDetailMobile393" },
 	},
 };
 
