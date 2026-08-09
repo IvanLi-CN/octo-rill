@@ -379,12 +379,92 @@ export const Syncing: Story = {
 				screen.queryByText("正在后台同步你的 GitHub 数据"),
 			).not.toBeInTheDocument();
 		});
+		await userEvent.hover(syncButton);
+		await expect(
+			screen.getByText("正在后台同步你的 GitHub 数据"),
+		).toBeVisible();
+
+		await userEvent.keyboard("{Escape}");
+		await waitFor(() => {
+			expect(
+				screen.queryByText("正在后台同步你的 GitHub 数据"),
+			).not.toBeInTheDocument();
+		});
+		syncButton.focus();
+		await expect(
+			screen.getByText("正在后台同步你的 GitHub 数据"),
+		).toBeVisible();
+
+		await userEvent.click(canvasElement);
+		await waitFor(() => {
+			expect(
+				screen.queryByText("正在后台同步你的 GitHub 数据"),
+			).not.toBeInTheDocument();
+		});
+		await userEvent.click(syncButton);
+		await expect(
+			screen.getByText("正在后台同步你的 GitHub 数据"),
+		).toBeVisible();
 	},
 	parameters: {
 		docs: {
 			description: {
 				story:
 					"同步中状态：右侧主按钮保持可点并旋转 icon，悬浮提示展示阶段进度与已完成工作量。",
+			},
+		},
+	},
+};
+
+export const SyncingMobile: Story = {
+	name: "Regression / Mobile sync recovery",
+	render: (args) => <DashboardHeaderMobileShellPreview {...args} />,
+	args: {
+		busy: true,
+		syncingAll: true,
+		syncProgress: {
+			currentStep: 2,
+			totalSteps: 4,
+			stageLabel: "Release 已同步",
+			detail: "写入 42 条 Release · 覆盖 18 个仓库",
+		},
+	},
+	globals: {
+		viewport: {
+			value: "dashboardHeaderMobile390",
+			isRotated: false,
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const syncButton = canvas.getByRole("button", { name: "同步" });
+		await expect(syncButton).toBeEnabled();
+		await expect(
+			within(canvasElement.ownerDocument.body).getByText(
+				"正在后台同步你的 GitHub 数据",
+			),
+		).toBeVisible();
+
+		await userEvent.click(canvasElement);
+		await waitFor(() => {
+			expect(
+				canvasElement.ownerDocument.body.querySelector(
+					"[data-dashboard-sync-tooltip-content]",
+				),
+			).toBeNull();
+		});
+		await userEvent.click(syncButton);
+		await expect(
+			within(canvasElement.ownerDocument.body).getByText(
+				"正在后台同步你的 GitHub 数据",
+			),
+		).toBeVisible();
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"390px 移动端回归：同步详情被收起后，触控点击顶部同步按钮会恢复当前进度，不会新建第二个任务。",
 			},
 		},
 	},

@@ -7,7 +7,14 @@ import {
 	ShieldCheck,
 	Sparkles,
 } from "lucide-react";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+	useCallback,
+	useEffect,
+	useId,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 
 import { BrandLogo } from "@/components/brand/BrandLogo";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
@@ -536,6 +543,14 @@ export function DashboardHeader({
 		};
 	}, [showSyncTooltip]);
 
+	const handleSyncClick = useCallback(() => {
+		setSyncTooltipDismissed(false);
+		onSyncAll?.();
+	}, [onSyncAll]);
+	const revealSyncTooltip = useCallback(() => {
+		setSyncTooltipDismissed(false);
+	}, []);
+
 	return (
 		<div
 			className={cn(
@@ -707,7 +722,9 @@ export function DashboardHeader({
 							<Button
 								ref={syncTriggerRef}
 								disabled={busy && !syncingAll}
-								onClick={onSyncAll}
+								onClick={handleSyncClick}
+								onPointerEnter={revealSyncTooltip}
+								onFocus={revealSyncTooltip}
 								size={hideSubtitle ? "sm" : "default"}
 								data-app-shell-gesture-guard
 								className={cn(
