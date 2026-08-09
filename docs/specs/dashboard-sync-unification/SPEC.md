@@ -132,8 +132,7 @@
 
 ## Visual Evidence
 
-PR: none
-
+PR: include
 ![Dashboard default sync entry](./assets/dashboard-default.png)
 
 - source_type: `storybook_canvas`
@@ -147,6 +146,7 @@ PR: none
   state: `sync-progress-tooltip`
   evidence_note: 验证 Dashboard 页头 `同步` 按钮在全量同步中保持可点击、刷新 icon 旋转，并在悬浮气泡中展示阶段进度与已完成工作量。
   image:
+  PR: include
   ![Dashboard sync progress tooltip](./assets/dashboard-sync-progress-tooltip.png)
 
 - source_type: `storybook_canvas`
@@ -157,11 +157,12 @@ PR: none
   margin_policy: `trim_only`
   evidence_surface: `page`
   sensitive_exclusion: `N/A`
-  submission_gate: `pending-owner-approval`
+  submission_gate: `approved`
   story_id_or_title: `Pages/Dashboard Header / Syncing`
   state: `sync-progress-recovery-desktop`
   evidence_note: 验证桌面端进度详情被空白点击或 Escape 收起后，重新 hover、聚焦或点击同步按钮均恢复同一份阶段与工作量详情。
   image:
+  PR: include
   ![Desktop sync progress recovery](./assets/dashboard-sync-progress-recovery-desktop.png)
 
 - source_type: `storybook_canvas`
@@ -172,11 +173,12 @@ PR: none
   margin_policy: `trim_only`
   evidence_surface: `page`
   sensitive_exclusion: `N/A`
-  submission_gate: `pending-owner-approval`
+  submission_gate: `approved`
   story_id_or_title: `Pages/Dashboard Header / Regression / Mobile sync recovery`
   state: `sync-progress-recovery-mobile`
   evidence_note: 验证 390px 移动端进度详情被收起后，触控点击同步按钮恢复当前详情。
   image:
+  PR: include
   ![Mobile sync progress recovery](./assets/dashboard-sync-progress-recovery-mobile.png)
 
 ## 方案概述（Approach, high-level）
