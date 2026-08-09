@@ -1052,7 +1052,7 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 					</p>
 				</div>
 			) : null}
-			<div className="grid gap-2 md:grid-cols-2">
+			<div className="grid gap-2 md:grid-cols-3">
 				{model.fields.map((item) => (
 					<div key={`${item.label}:${item.value}`} className={detailCardClass}>
 						<p className="text-muted-foreground text-[11px]">{item.label}</p>
