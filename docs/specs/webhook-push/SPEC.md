@@ -65,7 +65,7 @@
 
 ### Webhook 接收
 
-- 接收端必须验证 `X-Hub-Signature-256`，拒绝无签名或签名错误请求。
+- 接收端必须先要求提供格式有效的 `X-Hub-Signature-256`；对于能匹配 hook 记录的请求，必须使用该用户的 secret 验证签名并拒绝签名错误请求。hook 记录不存在时没有可用 secret，按下述忽略语义返回接受但不入队。
 - `X-GitHub-Delivery` 全局去重；`ping` 安全返回成功。
 - 只处理 `X-GitHub-Event: release` 且 `action=published`、`release.draft=false` 的 payload。
 - 有效事件通过 repo ID 挂入现有共享 Release 队列；HTTP 请求不得等待 GitHub Release 拉取完成。
