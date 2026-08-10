@@ -1828,15 +1828,15 @@ export function SettingsPage(props: {
 										<AlertDialogTitle>开启 Webhook 推送？</AlertDialogTitle>
 										<AlertDialogDescription className="space-y-3 text-left leading-6">
 											<span className="block">
-												OctoRill 会使用当前 classic PAT 的 <strong>repo</strong>{" "}
-												或 <strong>public_repo</strong> 权限，在 PAT
-												所属账号的个人 owner 仓库中创建、检查和修复仅监听
+												本次启用立即使用当前 classic PAT 的{" "}
+												<strong>repo</strong> 或 <strong>public_repo</strong>{" "}
+												权限，在 PAT 所属账号的个人 owner 仓库中注册仅监听
 												Release 的 webhook。
 											</span>
 											<span className="block">
 												每个 webhook 使用独立的加密 secret 验证 GitHub
-												签名，只在新 Release 发布时排队同步。关闭后现有 hooks
-												会保留，但事件将被忽略；需要时可在关闭后批量删除
+												签名；当前接收范围仅为新 Release，事件进入同步队列。
+												关闭状态保留已有 hooks 并忽略事件，批量删除仅针对
 												OctoRill 创建的 hooks。
 											</span>
 										</AlertDialogDescription>
