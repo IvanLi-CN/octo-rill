@@ -693,6 +693,7 @@ export function SettingsPage(props: {
 					daily_brief_time_zone: profile.daily_brief_time_zone,
 				});
 				setIncludeOwnReleases(profile.include_own_releases);
+				await loadWebhookPush();
 				await onProfileSaved?.();
 			})
 			.catch((err) => {
@@ -701,7 +702,7 @@ export function SettingsPage(props: {
 			.finally(() => {
 				setBriefProfileSaving(false);
 			});
-	}, [briefProfileDraft, includeOwnReleases, onProfileSaved]);
+	}, [briefProfileDraft, includeOwnReleases, loadWebhookPush, onProfileSaved]);
 
 	const onSaveOwnReleases = useCallback(() => {
 		setOwnReleaseSaving(true);

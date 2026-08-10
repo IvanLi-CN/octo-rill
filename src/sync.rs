@@ -7904,6 +7904,12 @@ async fn load_repo_release_candidate_users(
                 AND pu.published_by_user_id = u.id
                 AND pu.last_sync_status != 'inaccessible'
             )
+            OR EXISTS (
+              SELECT 1
+              FROM owned_repo_star_baselines ob
+              WHERE ob.user_id = u.id
+                AND ob.repo_id = ?
+            )
           )
         ORDER BY
           CASE WHEN u.last_active_at IS NULL THEN 1 ELSE 0 END ASC,
@@ -7911,6 +7917,7 @@ async fn load_repo_release_candidate_users(
           u.id ASC
         "#,
     )
+    .bind(repo_id)
     .bind(repo_id)
     .bind(repo_id)
     .fetch_all(&state.pool)

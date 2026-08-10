@@ -4145,10 +4145,20 @@ export function JobManagement({
 		setSyncRuntimeConfigLoading(true);
 		setSyncRuntimeConfigError(null);
 		try {
-			const [res, webhookConfig] = await Promise.all([
+			const [res, webhookResult] = await Promise.all([
 				apiGetAdminSyncRuntimeConfig(),
-				apiGetAdminWebhookPushRuntimeConfig(),
+				apiGetAdminWebhookPushRuntimeConfig().then(
+					(config) => ({ ok: true as const, config }),
+					() => ({ ok: false as const }),
+				),
 			]);
+			const webhookConfig = webhookResult.ok
+				? webhookResult.config
+				: {
+						audit_interval_days: 7,
+						last_started_at: null,
+						next_started_at: null,
+					};
 			if (requestId !== syncRuntimeConfigRequestIdRef.current) {
 				return;
 			}
