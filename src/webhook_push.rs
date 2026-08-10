@@ -1412,17 +1412,49 @@ async fn execute_for_user_locked(
     };
     let mut counts = HashMap::<&str, usize>::new();
     for (index, repo) in targets.iter().enumerate() {
+        if jobs::is_task_cancel_requested(state, task_id).await? {
+            return Ok(json!({
+                "operation": operation,
+                "total": targets.len(),
+                "counts": counts,
+                "canceled": true,
+            }));
+        }
         renew_user_operation_lease(state, user_id, task_id).await?;
         let resolved_repo;
-        let repo = if operation == OP_DELETE {
-            resolved_repo =
-                resolve_delete_target(state, &token, owner_github_user_id, repo).await?;
-            &resolved_repo
+        let result = if operation == OP_DELETE {
+            match resolve_delete_target(state, &token, owner_github_user_id, repo).await {
+                Ok(resolved) => {
+                    resolved_repo = resolved;
+                    run_repo_operation(
+                        state,
+                        user_id,
+                        &resolved_repo,
+                        operation,
+                        &token,
+                        &callback,
+                        &secret,
+                    )
+                    .await?
+                }
+                Err(error) => {
+                    sqlx::query(
+                        "UPDATE webhook_push_repos SET status = ?, error_kind = ?, error_message = ?, updated_at = ? WHERE user_id = ? AND repo_id = ?",
+                    )
+                    .bind(STATUS_ERROR)
+                    .bind("owner_resolution")
+                    .bind(error.to_string())
+                    .bind(Utc::now().to_rfc3339())
+                    .bind(user_id)
+                    .bind(repo.repo_id)
+                    .execute(&state.pool)
+                    .await?;
+                    "failed"
+                }
+            }
         } else {
-            repo
+            run_repo_operation(state, user_id, repo, operation, &token, &callback, &secret).await?
         };
-        let result =
-            run_repo_operation(state, user_id, repo, operation, &token, &callback, &secret).await?;
         *counts.entry(result).or_default() += 1;
         jobs::append_task_event(
             state,
