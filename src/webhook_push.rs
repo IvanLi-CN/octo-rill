@@ -496,6 +496,7 @@ async fn list_repo_statuses(
     let owner_login = owner_login.unwrap_or("");
     sqlx::query_as::<_, WebhookRepoStatus>(
         r#"
+        SELECT * FROM (
         SELECT ob.repo_id,
                substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1) AS owner_login,
                substr(ob.repo_full_name, instr(ob.repo_full_name, '/') + 1) AS repo_name,
@@ -511,11 +512,24 @@ async fn list_repo_statuses(
           ON wr.user_id = ob.user_id AND wr.repo_id = ob.repo_id
         WHERE ob.user_id = ?
           AND lower(substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1)) = lower(?)
-        ORDER BY lower(ob.repo_full_name)
+        UNION ALL
+        SELECT wr.repo_id, wr.owner_login, wr.repo_name, wr.repo_full_name,
+               NULL AS is_private, wr.hook_id, wr.status,
+               wr.error_kind, wr.error_message,
+               wr.permission_paused != 0 AS permission_paused,
+               wr.last_checked_at, wr.last_registered_at
+        FROM webhook_push_repos wr
+        WHERE wr.user_id = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM owned_repo_star_baselines ob
+            WHERE ob.user_id = wr.user_id AND ob.repo_id = wr.repo_id
+          )
+        ) ORDER BY lower(repo_full_name)
         "#,
     )
     .bind(user_id)
     .bind(owner_login)
+    .bind(user_id)
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::internal)
@@ -834,11 +848,15 @@ async fn resolve_delete_target(
     token: &str,
     expected_owner_github_user_id: i64,
     repo: &TargetRepo,
-) -> Result<TargetRepo> {
+) -> std::result::Result<TargetRepo, GitHubCallError> {
     let url = state
         .github_rest_api_base
         .join(&format!("repositories/{}", repo.repo_id))
-        .context("build GitHub repository identity URL")?;
+        .map_err(|error| GitHubCallError {
+            status: None,
+            rate_limited: false,
+            message: error.to_string(),
+        })?;
     let response = state
         .github_rest_http
         .get(url)
@@ -848,23 +866,38 @@ async fn resolve_delete_target(
         .timeout(Duration::from_secs(60))
         .send()
         .await
-        .context("load GitHub repository identity")?;
+        .map_err(|error| GitHubCallError {
+            status: error.status(),
+            rate_limited: false,
+            message: error.to_string(),
+        })?;
     if !response.status().is_success() {
-        return Err(anyhow!(response_error(response).await.to_string()));
+        return Err(response_error(response).await);
     }
     let identity = response
         .json::<GitHubRepoIdentity>()
         .await
-        .context("decode GitHub repository identity")?;
+        .map_err(|error| GitHubCallError {
+            status: None,
+            rate_limited: false,
+            message: error.to_string(),
+        })?;
     if identity.id != repo.repo_id || identity.owner.id != expected_owner_github_user_id {
-        return Err(anyhow!(
-            "GitHub PAT owner does not match the repository hook owner"
-        ));
+        return Err(GitHubCallError {
+            status: Some(StatusCode::FORBIDDEN),
+            rate_limited: false,
+            message: "GitHub PAT owner does not match the repository hook owner".to_owned(),
+        });
     }
-    let (owner_login, repo_name) = identity
-        .full_name
-        .split_once('/')
-        .context("GitHub repository full_name is invalid")?;
+    let (owner_login, repo_name) =
+        identity
+            .full_name
+            .split_once('/')
+            .ok_or_else(|| GitHubCallError {
+                status: None,
+                rate_limited: false,
+                message: "GitHub repository full_name is invalid".to_owned(),
+            })?;
     Ok(TargetRepo {
         repo_id: repo.repo_id,
         owner_github_user_id: Some(expected_owner_github_user_id),
@@ -1558,12 +1591,14 @@ async fn execute_for_user_locked(
                 .await?
             }
             Err(error) => {
+                let permission_paused = is_permission_error(&error);
                 sqlx::query(
-                    "UPDATE webhook_push_repos SET status = ?, error_kind = ?, error_message = ?, updated_at = ? WHERE user_id = ? AND repo_id = ?",
+                    "UPDATE webhook_push_repos SET status = ?, error_kind = ?, error_message = ?, permission_paused = ?, updated_at = ? WHERE user_id = ? AND repo_id = ?",
                 )
-                .bind(STATUS_ERROR)
-                .bind("owner_resolution")
-                .bind(error.to_string())
+                .bind(if permission_paused { STATUS_PERMISSION_PAUSED } else { STATUS_ERROR })
+                .bind(if permission_paused { "permission" } else { "owner_resolution" })
+                .bind(error.message)
+                .bind(if permission_paused { 1_i64 } else { 0_i64 })
                 .bind(Utc::now().to_rfc3339())
                 .bind(user_id)
                 .bind(repo.repo_id)
