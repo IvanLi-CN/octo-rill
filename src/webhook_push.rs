@@ -50,6 +50,17 @@ fn user_operation_lock(user_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+fn delivery_lock(delivery_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("webhook delivery lock poisoned")
+        .entry(delivery_id.to_owned())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct UserConfigRow {
     include_own_releases: i64,
@@ -771,29 +782,46 @@ async fn list_hooks(
     token: &str,
     repo: &TargetRepo,
 ) -> std::result::Result<Vec<GitHubHook>, GitHubCallError> {
-    let url = github_url(state, repo, "").map_err(|err| GitHubCallError {
+    let mut url = github_url(state, repo, "").map_err(|err| GitHubCallError {
         status: None,
         message: err.to_string(),
     })?;
-    let response = state
-        .github_rest_http
-        .get(url)
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .send()
-        .await
-        .map_err(|err| GitHubCallError {
-            status: err.status(),
-            message: err.to_string(),
-        })?;
-    if !response.status().is_success() {
-        return Err(response_error(response).await);
+    let mut hooks = Vec::new();
+    for page in 1_u32.. {
+        url.query_pairs_mut()
+            .clear()
+            .append_pair("per_page", "100")
+            .append_pair("page", &page.to_string());
+        let response = state
+            .github_rest_http
+            .get(url.clone())
+            .bearer_auth(token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .map_err(|err| GitHubCallError {
+                status: err.status(),
+                message: err.to_string(),
+            })?;
+        if !response.status().is_success() {
+            return Err(response_error(response).await);
+        }
+        let page_hooks =
+            response
+                .json::<Vec<GitHubHook>>()
+                .await
+                .map_err(|err| GitHubCallError {
+                    status: None,
+                    message: err.to_string(),
+                })?;
+        let is_last_page = page_hooks.len() < 100;
+        hooks.extend(page_hooks);
+        if is_last_page {
+            return Ok(hooks);
+        }
     }
-    response.json().await.map_err(|err| GitHubCallError {
-        status: None,
-        message: err.to_string(),
-    })
+    unreachable!("GitHub hook pagination exhausted the page number range")
 }
 
 async fn create_hook(
@@ -991,12 +1019,14 @@ async fn run_repo_operation(
                 return Ok("deleted");
             }
             Err(error) => {
+                let permission_paused = is_permission_error(&error);
                 sqlx::query(
-                    "UPDATE webhook_push_repos SET status = ?, error_kind = ?, error_message = ?, updated_at = ? WHERE user_id = ? AND repo_id = ?",
+                    "UPDATE webhook_push_repos SET status = ?, error_kind = ?, error_message = ?, permission_paused = ?, updated_at = ? WHERE user_id = ? AND repo_id = ?",
                 )
-                .bind(STATUS_ERROR)
-                .bind(if is_permission_error(&error) { "permission" } else { "github_error" })
+                .bind(if permission_paused { STATUS_PERMISSION_PAUSED } else { STATUS_ERROR })
+                .bind(if permission_paused { "permission" } else { "github_error" })
                 .bind(&error.message)
+                .bind(if permission_paused { 1_i64 } else { 0_i64 })
                 .bind(Utc::now().to_rfc3339())
                 .bind(user_id)
                 .bind(repo.repo_id)
@@ -1422,15 +1452,27 @@ pub async fn receive(
     let repo = payload.repository.as_ref();
     let should_queue =
         should_enqueue_release(row.1 != 0, row.2 != 0, event, &payload, row.5, &row.6);
+    let delivery_lock = delivery_lock(delivery);
+    let _delivery_guard = delivery_lock.lock().await;
     let now = Utc::now().to_rfc3339();
     let inserted = sqlx::query(
         "INSERT OR IGNORE INTO webhook_push_deliveries (delivery_id, hook_id, repo_id, event, action, received_at) VALUES (?, ?, ?, ?, ?, ?)",
     ).bind(delivery).bind(hook_id).bind(repo.map(|item| item.id)).bind(event).bind(action).bind(&now)
         .execute(&state.pool).await.map_err(ApiError::internal)?;
     if inserted.rows_affected() == 0 {
-        return Ok(Json(
-            json!({"accepted": true, "queued": false, "reason": "duplicate"}),
-        ));
+        let queued_task_id = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT queued_task_id FROM webhook_push_deliveries WHERE delivery_id = ?",
+        )
+        .bind(delivery)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        .flatten();
+        if queued_task_id.is_some() {
+            return Ok(Json(
+                json!({"accepted": true, "queued": false, "reason": "duplicate"}),
+            ));
+        }
     }
     if !should_queue {
         return Ok(Json(
@@ -1447,16 +1489,7 @@ pub async fn receive(
     .await
     {
         Ok(reused_fresh) => reused_fresh,
-        Err(error) => {
-            sqlx::query(
-                "DELETE FROM webhook_push_deliveries WHERE delivery_id = ? AND queued_task_id IS NULL",
-            )
-            .bind(delivery)
-            .execute(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-            return Err(ApiError::internal(error));
-        }
+        Err(error) => return Err(ApiError::internal(error)),
     };
     sqlx::query("UPDATE webhook_push_deliveries SET queued_task_id = ? WHERE delivery_id = ?")
         .bind(format!("repo-release:{}", repo.id))
