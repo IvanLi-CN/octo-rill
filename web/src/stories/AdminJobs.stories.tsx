@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useRef, useState } from "react";
+import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import type {
@@ -18,6 +19,26 @@ const RUNNING_WORKER_UPDATED_AT = new Date(
 	STORYBOOK_NOW - 75_000,
 ).toISOString();
 const ERROR_WORKER_UPDATED_AT = new Date(STORYBOOK_NOW - 30_000).toISOString();
+
+const ADMIN_JOBS_VIEWPORTS = {
+	...INITIAL_VIEWPORTS,
+	adminJobsSettingsDesktop: {
+		name: "Admin jobs settings desktop 1440x900",
+		styles: {
+			height: "900px",
+			width: "1440px",
+		},
+		type: "desktop",
+	},
+	adminJobsSettingsMobile: {
+		name: "Admin jobs settings mobile 393x852",
+		styles: {
+			height: "852px",
+			width: "393px",
+		},
+		type: "mobile",
+	},
+} as const;
 
 const runningSubscriptionInitialRelease = {
 	succeeded_repos: 58,
@@ -1624,7 +1645,7 @@ type AdminJobsPreviewProps = {
 	translationState?: "default" | "busy" | "recovered" | "failed";
 	taskIntervalSettingsDialogDefaultOpen?: boolean;
 	subscriptionSyncSettingsDialogDefaultOpen?: boolean;
-	syncSettingsHelpTooltipsOpen?: boolean;
+	syncSettingsHelpTooltip?: "dialog" | "freshness" | "duration";
 };
 
 function setInputValue(element: HTMLInputElement, value: string) {
@@ -1662,7 +1683,7 @@ function AdminJobsPreview({
 	translationState = "default",
 	taskIntervalSettingsDialogDefaultOpen = false,
 	subscriptionSyncSettingsDialogDefaultOpen = false,
-	syncSettingsHelpTooltipsOpen = false,
+	syncSettingsHelpTooltip,
 }: AdminJobsPreviewProps) {
 	const [ready, setReady] = useState(false);
 	const autoOpenedRef = useRef(false);
@@ -2575,7 +2596,7 @@ function AdminJobsPreview({
 			subscriptionSyncSettingsDialogDefaultOpen={
 				subscriptionSyncSettingsDialogDefaultOpen
 			}
-			syncSettingsHelpTooltipsOpen={syncSettingsHelpTooltipsOpen}
+			syncSettingsHelpTooltip={syncSettingsHelpTooltip}
 		/>
 	);
 }
@@ -2586,6 +2607,9 @@ const meta = {
 	tags: ["autodocs"],
 	parameters: {
 		layout: "fullscreen",
+		viewport: {
+			options: ADMIN_JOBS_VIEWPORTS,
+		},
 		docs: {
 			description: {
 				component:
@@ -3066,7 +3090,6 @@ export const SubscriptionSyncSettingsAutoOpen: Story = {
 		<AdminJobsPreview
 			routeUrl="/admin/jobs/subscriptions"
 			subscriptionSyncSettingsDialogDefaultOpen
-			syncSettingsHelpTooltipsOpen
 		/>
 	),
 	parameters: {
@@ -3084,6 +3107,88 @@ export const SubscriptionSyncSettingsAutoOpen: Story = {
 		).toBeVisible();
 		await expect(canvas.getByText("10 分钟系统预算")).toBeVisible();
 		await expect(canvas.getByText("最近三次链路用时")).toBeVisible();
+		const latestProfile = canvas.getByRole("button", { name: "最新" });
+		await userEvent.click(latestProfile);
+		await expect(latestProfile).toHaveAttribute("aria-pressed", "true");
+		await expect(canvas.getByRole("button", { name: "平衡" })).toHaveAttribute(
+			"aria-pressed",
+			"false",
+		);
+	},
+};
+
+export const SubscriptionSyncSettingsFreshnessHelp: Story = {
+	name: "Evidence / Subscription Sync Freshness Help",
+	render: () => (
+		<AdminJobsPreview
+			routeUrl="/admin/jobs/subscriptions"
+			subscriptionSyncSettingsDialogDefaultOpen
+			syncSettingsHelpTooltip="freshness"
+		/>
+	),
+	globals: {
+		viewport: {
+			value: "adminJobsSettingsDesktop",
+			isRotated: false,
+		},
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"桌面证据：订阅同步设置的紧凑帮助触发器与 Dashboard 新鲜度策略说明。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const body = within(canvasElement.ownerDocument.body);
+		await expect(
+			await canvas.findByRole("dialog", { name: "订阅同步设置" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("button", {
+				name: "Dashboard 手动刷新新鲜度策略说明",
+			}),
+		).toBeVisible();
+		await expect(canvas.getByRole("button", { name: "最新" })).toBeVisible();
+		await expect(canvas.getByRole("button", { name: "平衡" })).toBeVisible();
+		await expect(canvas.getByRole("button", { name: "容量" })).toBeVisible();
+		await expect(await body.findByRole("tooltip")).toHaveTextContent(
+			"压力只会延长复用窗口，不会跳过有效关注仓库。",
+		);
+	},
+};
+
+export const SubscriptionSyncSettingsFreshnessHelpMobile: Story = {
+	name: "Evidence / Subscription Sync Freshness Help Mobile",
+	render: () => (
+		<AdminJobsPreview
+			routeUrl="/admin/jobs/subscriptions"
+			subscriptionSyncSettingsDialogDefaultOpen
+			syncSettingsHelpTooltip="freshness"
+		/>
+	),
+	globals: {
+		viewport: {
+			value: "adminJobsSettingsMobile",
+			isRotated: false,
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const body = within(canvasElement.ownerDocument.body);
+		await expect(
+			await canvas.findByRole("dialog", { name: "订阅同步设置" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("button", {
+				name: "Dashboard 手动刷新新鲜度策略说明",
+			}),
+		).toBeVisible();
+		await expect(await body.findByRole("tooltip")).toHaveTextContent(
+			"单仓窗口始终限制在",
+		);
 	},
 };
 
