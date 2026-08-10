@@ -13,6 +13,7 @@ SET owner_github_user_id = (
   SELECT pat.owner_github_user_id
   FROM reaction_pat_tokens pat
   WHERE pat.user_id = webhook_push_repos.user_id
+    AND lower(pat.owner_login) = lower(webhook_push_repos.owner_login)
 );
 
 UPDATE webhook_push_deliveries

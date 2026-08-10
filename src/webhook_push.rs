@@ -71,7 +71,7 @@ struct PatRow {
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct TargetRepo {
     repo_id: i64,
-    owner_github_user_id: i64,
+    owner_github_user_id: Option<i64>,
     owner_login: String,
     repo_name: String,
     repo_full_name: String,
@@ -179,6 +179,13 @@ struct ReleasePayloadRepo {
 #[derive(Debug, Deserialize)]
 struct GitHubUser {
     id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRepoIdentity {
+    id: i64,
+    full_name: String,
+    owner: GitHubUser,
 }
 
 #[derive(Debug, Deserialize)]
@@ -692,10 +699,10 @@ async fn ensure_delete_pat_owner(
     owner_github_user_id: i64,
 ) -> Result<(), ApiError> {
     let mismatched = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM webhook_push_repos WHERE user_id = ? AND hook_id IS NOT NULL AND (owner_github_user_id IS NULL OR owner_github_user_id != ?)",
+        "SELECT COUNT(*) FROM webhook_push_repos WHERE user_id = ? AND hook_id IS NOT NULL AND owner_github_user_id IS NOT NULL AND owner_github_user_id != ?",
     )
-    .bind(owner_github_user_id)
     .bind(user_id)
+    .bind(owner_github_user_id)
     .fetch_one(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -769,7 +776,7 @@ async fn load_targets(
         "#,
     )
     .bind(user_id)
-    .bind(owner_github_user_id)
+    .bind(Some(owner_github_user_id))
     .bind(owner_login)
     .bind(repo_id)
     .bind(repo_id)
@@ -788,6 +795,50 @@ fn github_url(state: &AppState, repo: &TargetRepo, suffix: &str) -> Result<url::
             repo.owner_login, repo.repo_name
         ))
         .context("build github webhook URL")
+}
+
+async fn resolve_delete_target(
+    state: &AppState,
+    token: &str,
+    expected_owner_github_user_id: i64,
+    repo: &TargetRepo,
+) -> Result<TargetRepo> {
+    let url = state
+        .github_rest_api_base
+        .join(&format!("repositories/{}", repo.repo_id))
+        .context("build GitHub repository identity URL")?;
+    let response = state
+        .github_rest_http
+        .get(url)
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .context("load GitHub repository identity")?;
+    if !response.status().is_success() {
+        return Err(anyhow!(response_error(response).await.to_string()));
+    }
+    let identity = response
+        .json::<GitHubRepoIdentity>()
+        .await
+        .context("decode GitHub repository identity")?;
+    if identity.id != repo.repo_id || identity.owner.id != expected_owner_github_user_id {
+        return Err(anyhow!(
+            "GitHub PAT owner does not match the repository hook owner"
+        ));
+    }
+    let (owner_login, repo_name) = identity
+        .full_name
+        .split_once('/')
+        .context("GitHub repository full_name is invalid")?;
+    Ok(TargetRepo {
+        repo_id: repo.repo_id,
+        owner_github_user_id: Some(expected_owner_github_user_id),
+        owner_login: owner_login.to_owned(),
+        repo_name: repo_name.to_owned(),
+        repo_full_name: identity.full_name,
+    })
 }
 
 async fn response_error(response: reqwest::Response) -> GitHubCallError {
@@ -1255,6 +1306,9 @@ async fn execute_for_user(
     scheduled: bool,
 ) -> Result<Value> {
     while !try_acquire_user_operation_lease(state, user_id, task_id).await? {
+        if jobs::is_task_cancel_requested(state, task_id).await? {
+            return Ok(json!({"canceled": true}));
+        }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
     let operation_lock = user_operation_lock(user_id);
@@ -1336,14 +1390,11 @@ async fn execute_for_user_locked(
     let targets = if operation == OP_DELETE {
         sqlx::query_as::<_, TargetRepo>(
             r#"
-            SELECT repo_id, owner_github_user_id, ? AS owner_login, repo_name,
-                   ? || '/' || repo_name AS repo_full_name
+            SELECT repo_id, owner_github_user_id, owner_login, repo_name, repo_full_name
             FROM webhook_push_repos WHERE user_id = ? AND hook_id IS NOT NULL
             ORDER BY lower(repo_full_name)
             "#,
         )
-        .bind(&owner_login)
-        .bind(&owner_login)
         .bind(user_id)
         .fetch_all(&state.pool)
         .await?
@@ -1362,6 +1413,14 @@ async fn execute_for_user_locked(
     let mut counts = HashMap::<&str, usize>::new();
     for (index, repo) in targets.iter().enumerate() {
         renew_user_operation_lease(state, user_id, task_id).await?;
+        let resolved_repo;
+        let repo = if operation == OP_DELETE {
+            resolved_repo =
+                resolve_delete_target(state, &token, owner_github_user_id, repo).await?;
+            &resolved_repo
+        } else {
+            repo
+        };
         let result =
             run_repo_operation(state, user_id, repo, operation, &token, &callback, &secret).await?;
         *counts.entry(result).or_default() += 1;

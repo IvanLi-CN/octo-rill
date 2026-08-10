@@ -3926,7 +3926,7 @@ async fn recover_runtime_state_with_mode(
     Ok(())
 }
 
-async fn is_task_cancel_requested(state: &AppState, task_id: &str) -> Result<bool> {
+pub(crate) async fn is_task_cancel_requested(state: &AppState, task_id: &str) -> Result<bool> {
     let flag = sqlx::query_scalar::<_, i64>(
         r#"
         SELECT cancel_requested
