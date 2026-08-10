@@ -5580,18 +5580,20 @@ export function JobManagement({
 														>
 															详情
 														</Button>
-														<Button
-															variant="outline"
-															disabled={
-																scheduledRunActionsDisabled ||
-																busy ||
-																task.status === "queued" ||
-																task.status === "running"
-															}
-															onClick={() => void onRetryTask(task.id)}
-														>
-															重试
-														</Button>
+														{task.task_type !== "webhook.push.audit" ? (
+															<Button
+																variant="outline"
+																disabled={
+																	scheduledRunActionsDisabled ||
+																	busy ||
+																	task.status === "queued" ||
+																	task.status === "running"
+																}
+																onClick={() => void onRetryTask(task.id)}
+															>
+																重试
+															</Button>
+														) : null}
 														<Button
 															variant="destructive"
 															disabled={

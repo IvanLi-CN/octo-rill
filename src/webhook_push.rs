@@ -50,17 +50,6 @@ fn user_operation_lock(user_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-fn delivery_lock(delivery_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
-    LOCKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("webhook delivery lock poisoned")
-        .entry(delivery_id.to_owned())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
-}
-
 #[derive(Debug, sqlx::FromRow)]
 struct UserConfigRow {
     include_own_releases: i64,
@@ -588,11 +577,10 @@ pub async fn patch_settings(
 }
 
 fn task_response(task: EnqueuedTask) -> TaskEnqueueResponse {
-    let reused = task.status != jobs::STATUS_QUEUED;
     TaskEnqueueResponse {
         task_id: task.task_id,
         status: task.status,
-        reused,
+        reused: task.reused,
     }
 }
 
@@ -666,6 +654,8 @@ pub async fn delete_all(
             "请先关闭“Webhook 推送”，再全部删除 Webhook。",
         ));
     }
+    let (_, owner_login, _) = validate_pat(state.as_ref(), &user_id).await?;
+    ensure_delete_pat_owner(state.as_ref(), &user_id, &owner_login).await?;
     state
         .sqlite_writer
         .write_foreground("webhook_push_delete_pending", |_| async {
@@ -684,6 +674,29 @@ pub async fn delete_all(
     Ok(Json(task_response(
         enqueue_manage(state.as_ref(), &user_id, OP_DELETE, None, "manual").await?,
     )))
+}
+
+async fn ensure_delete_pat_owner(
+    state: &AppState,
+    user_id: &str,
+    owner_login: &str,
+) -> Result<(), ApiError> {
+    let mismatched = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM webhook_push_repos WHERE user_id = ? AND hook_id IS NOT NULL AND lower(owner_login) != lower(?)",
+    )
+    .bind(user_id)
+    .bind(owner_login)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if mismatched != 0 {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "pat_owner_mismatch_cleanup",
+            "待删除的 Webhook 属于另一个 GitHub 账号，请恢复该账号的 classic PAT 后重试。",
+        ));
+    }
+    Ok(())
 }
 
 pub async fn register_repo(
@@ -940,6 +953,10 @@ async fn delete_hook(
 }
 
 fn is_permission_error(error: &GitHubCallError) -> bool {
+    let message = error.message.to_ascii_lowercase();
+    if message.contains("rate limit") || message.contains("rate_limit") {
+        return false;
+    }
     matches!(
         error.status,
         Some(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND)
@@ -1144,6 +1161,42 @@ async fn run_repo_operation(
     }
 }
 
+async fn try_acquire_user_operation_lease(
+    state: &AppState,
+    user_id: &str,
+    task_id: &str,
+) -> Result<bool> {
+    let now = Utc::now();
+    let expires_at = (now + chrono::Duration::hours(2)).to_rfc3339();
+    let result = sqlx::query(
+        r#"
+        INSERT INTO webhook_push_user_operation_leases (user_id, task_id, expires_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          task_id = excluded.task_id,
+          expires_at = excluded.expires_at
+        WHERE webhook_push_user_operation_leases.expires_at < ?
+        "#,
+    )
+    .bind(user_id)
+    .bind(task_id)
+    .bind(&expires_at)
+    .bind(now.to_rfc3339())
+    .execute(&state.pool)
+    .await?;
+    Ok(result.rows_affected() != 0)
+}
+
+async fn release_user_operation_lease(state: &AppState, user_id: &str, task_id: &str) {
+    let _ = sqlx::query(
+        "DELETE FROM webhook_push_user_operation_leases WHERE user_id = ? AND task_id = ?",
+    )
+    .bind(user_id)
+    .bind(task_id)
+    .execute(&state.pool)
+    .await;
+}
+
 async fn execute_for_user(
     state: &AppState,
     task_id: &str,
@@ -1152,8 +1205,27 @@ async fn execute_for_user(
     repo_id: Option<i64>,
     scheduled: bool,
 ) -> Result<Value> {
+    if !try_acquire_user_operation_lease(state, user_id, task_id).await? {
+        return Err(anyhow!(
+            "another webhook operation is already running for this user"
+        ));
+    }
     let operation_lock = user_operation_lock(user_id);
     let _operation_guard = operation_lock.lock().await;
+    let result =
+        execute_for_user_locked(state, task_id, user_id, operation, repo_id, scheduled).await;
+    release_user_operation_lease(state, user_id, task_id).await;
+    result
+}
+
+async fn execute_for_user_locked(
+    state: &AppState,
+    task_id: &str,
+    user_id: &str,
+    operation: &str,
+    repo_id: Option<i64>,
+    scheduled: bool,
+) -> Result<Value> {
     let config = load_user_config(state, user_id)
         .await
         .map_err(|err| anyhow!(err.to_string()))?;
@@ -1165,11 +1237,17 @@ async fn execute_for_user(
         return Ok(json!({"skipped": true, "reason": "re_enabled"}));
     }
     let (token, owner_login, allows_private, secret, callback) = if operation == OP_DELETE {
-        let (_, token) = load_pat(state, user_id)
+        let (pat, token) = load_pat(state, user_id)
             .await
             .map_err(|err| anyhow!(err.to_string()))?
             .ok_or_else(|| anyhow!("GitHub PAT is not configured"))?;
-        (token, String::new(), false, String::new(), String::new())
+        let owner_login = pat
+            .owner_login
+            .ok_or_else(|| anyhow!("GitHub PAT owner is not available"))?;
+        ensure_delete_pat_owner(state, user_id, &owner_login)
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+        (token, owner_login, false, String::new(), String::new())
     } else {
         let (token, owner_login, allows_private) = validate_pat(state, user_id)
             .await
@@ -1248,6 +1326,12 @@ pub async fn execute_manage_task(
 }
 
 pub async fn execute_audit_task(state: &AppState, task_id: &str) -> Result<Value> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query("UPDATE admin_runtime_settings SET webhook_push_audit_last_started_at = ?, updated_at = ? WHERE id = 1")
+        .bind(&now)
+        .bind(&now)
+        .execute(&state.pool)
+        .await?;
     let users = sqlx::query_scalar::<_, String>(
         "SELECT id FROM users WHERE include_own_releases != 0 AND webhook_push_enabled != 0 ORDER BY id",
     ).fetch_all(&state.pool).await?;
@@ -1281,14 +1365,10 @@ pub async fn enqueue_audit_if_due(state: &AppState, now: DateTime<Utc>) -> Resul
         .is_none_or(|last| {
             now >= last.with_timezone(&Utc) + chrono::Duration::days(config.audit_interval_days)
         });
-    if !due
-        || jobs::find_inflight_task_by_type(state, jobs::TASK_WEBHOOK_PUSH_AUDIT)
-            .await?
-            .is_some()
-    {
+    if !due {
         return Ok(None);
     }
-    let task = jobs::enqueue_task(
+    let task = jobs::enqueue_singleton_task_by_type(
         state,
         NewTask {
             task_type: jobs::TASK_WEBHOOK_PUSH_AUDIT.to_owned(),
@@ -1299,8 +1379,6 @@ pub async fn enqueue_audit_if_due(state: &AppState, now: DateTime<Utc>) -> Resul
         },
     )
     .await?;
-    sqlx::query("UPDATE admin_runtime_settings SET webhook_push_audit_last_started_at = ?, updated_at = ? WHERE id = 1")
-        .bind(now.to_rfc3339()).bind(now.to_rfc3339()).execute(&state.pool).await?;
     Ok(Some(task.task_id))
 }
 
@@ -1414,6 +1492,11 @@ pub async fn receive(
         WHERE u.webhook_push_callback_key = ?
           AND u.webhook_push_secret_ciphertext IS NOT NULL
           AND u.webhook_push_secret_nonce IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM reaction_pat_tokens pat
+            WHERE pat.user_id = u.id
+              AND lower(pat.owner_login) = lower(wr.owner_login)
+          )
         "#,
     )
     .bind(hook_id)
@@ -1455,29 +1538,33 @@ pub async fn receive(
     let repo = payload.repository.as_ref();
     let should_queue =
         should_enqueue_release(row.1 != 0, row.2 != 0, event, &payload, row.5, &row.6);
-    let delivery_lock = delivery_lock(delivery);
-    let _delivery_guard = delivery_lock.lock().await;
     let now = Utc::now().to_rfc3339();
-    let inserted = sqlx::query(
+    sqlx::query(
         "INSERT OR IGNORE INTO webhook_push_deliveries (delivery_id, hook_id, repo_id, event, action, received_at) VALUES (?, ?, ?, ?, ?, ?)",
     ).bind(delivery).bind(hook_id).bind(repo.map(|item| item.id)).bind(event).bind(action).bind(&now)
         .execute(&state.pool).await.map_err(ApiError::internal)?;
-    if inserted.rows_affected() == 0 {
-        let queued_task_id = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT queued_task_id FROM webhook_push_deliveries WHERE delivery_id = ?",
-        )
-        .bind(delivery)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(ApiError::internal)?
-        .flatten();
-        if queued_task_id.is_some() {
-            return Ok(Json(
-                json!({"accepted": true, "queued": false, "reason": "duplicate"}),
-            ));
-        }
+    let claimed = sqlx::query(
+        "UPDATE webhook_push_deliveries SET processing_state = 'processing', processing_started_at = ? WHERE delivery_id = ? AND (processing_state = 'pending' OR (processing_state = 'processing' AND processing_started_at < ?))",
+    )
+    .bind(&now)
+    .bind(delivery)
+    .bind((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339())
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if claimed.rows_affected() == 0 {
+        return Ok(Json(
+            json!({"accepted": true, "queued": false, "reason": "duplicate"}),
+        ));
     }
     if !should_queue {
+        sqlx::query(
+            "UPDATE webhook_push_deliveries SET processing_state = 'ignored', processing_started_at = NULL WHERE delivery_id = ?",
+        )
+        .bind(delivery)
+        .execute(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
         return Ok(Json(
             json!({"accepted": true, "queued": false, "reason": "ignored"}),
         ));
@@ -1492,9 +1579,17 @@ pub async fn receive(
     .await
     {
         Ok(reused_fresh) => reused_fresh,
-        Err(error) => return Err(ApiError::internal(error)),
+        Err(error) => {
+            let _ = sqlx::query(
+                "UPDATE webhook_push_deliveries SET processing_state = 'pending', processing_started_at = NULL WHERE delivery_id = ? AND processing_state = 'processing'",
+            )
+            .bind(delivery)
+            .execute(&state.pool)
+            .await;
+            return Err(ApiError::internal(error));
+        }
     };
-    sqlx::query("UPDATE webhook_push_deliveries SET queued_task_id = ? WHERE delivery_id = ?")
+    sqlx::query("UPDATE webhook_push_deliveries SET queued_task_id = ?, processing_state = 'queued', processing_started_at = NULL WHERE delivery_id = ?")
         .bind(format!("repo-release:{}", repo.id))
         .bind(delivery)
         .execute(&state.pool)

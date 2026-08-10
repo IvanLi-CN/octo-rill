@@ -10,7 +10,7 @@
 - `POST /api/me/webhook-push/repos/{repo_id}/register`：人工逐仓注册并在成功后解除暂停。
 - `POST /api/me/webhook-push/repos/{repo_id}/check`：人工逐仓只读检查。
 
-所有写操作返回 `{ "task_id": string, "reused": boolean }`，前端通过现有 task API/SSE 跟踪。
+会排队后台任务的写操作返回 `{ "task_id": string, "reused": boolean }`，前端通过现有 task API/SSE 跟踪。关闭 Webhook 推送时不排队任务，返回 `task_id: null`。
 
 ## Admin APIs
 
@@ -22,4 +22,3 @@
 - `POST /api/webhooks/github/releases`
 - 必需 headers：`X-GitHub-Delivery`、`X-GitHub-Event`、`X-Hub-Signature-256`；`ping` 不要求已存在 release payload。
 - 成功响应 `{ "accepted": true, "queued": boolean, "reason": string }`。
-

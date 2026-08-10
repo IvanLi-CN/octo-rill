@@ -717,6 +717,7 @@ export function SettingsPage(props: {
 					daily_brief_time_zone: profile.daily_brief_time_zone,
 				});
 				setIncludeOwnReleases(profile.include_own_releases);
+				await loadWebhookPush();
 				await onProfileSaved?.();
 			})
 			.catch((err) => {
@@ -725,7 +726,7 @@ export function SettingsPage(props: {
 			.finally(() => {
 				setOwnReleaseSaving(false);
 			});
-	}, [briefProfileDraft, includeOwnReleases, onProfileSaved]);
+	}, [briefProfileDraft, includeOwnReleases, loadWebhookPush, onProfileSaved]);
 
 	const runWebhookPushAction = useCallback(
 		async (action: "register" | "check" | "delete", repoId?: number) => {
@@ -1838,10 +1839,8 @@ export function SettingsPage(props: {
 												Release 的 webhook。
 											</span>
 											<span className="block">
-												每个 webhook 使用独立的加密 secret 验证 GitHub
-												签名；当前接收范围仅为新 Release，事件进入同步队列。
-												关闭状态保留已有 hooks 并忽略事件，全部删除仅针对
-												OctoRill 创建的 hooks。
+												本次启用会为当前用户生成并加密保存签名
+												secret；当前接收范围仅为新 Release，事件进入同步队列。
 											</span>
 										</AlertDialogDescription>
 									</AlertDialogHeader>

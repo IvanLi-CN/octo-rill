@@ -72,6 +72,8 @@ pub struct EnqueuedTask {
     pub task_id: String,
     pub task_type: String,
     pub status: String,
+    #[serde(skip_serializing)]
+    pub reused: bool,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1022,6 +1024,7 @@ pub async fn enqueue_task(state: &AppState, new_task: NewTask) -> Result<Enqueue
         task_id,
         task_type: new_task.task_type,
         status: STATUS_QUEUED.to_owned(),
+        reused: false,
     })
 }
 
@@ -1060,6 +1063,7 @@ pub async fn find_inflight_task_for_requester(
         task_id: row.id,
         task_type: row.task_type,
         status: row.status,
+        reused: true,
     }))
 }
 
@@ -1095,6 +1099,7 @@ pub async fn find_inflight_task_by_type(
         task_id: row.id,
         task_type: row.task_type,
         status: row.status,
+        reused: true,
     }))
 }
 
@@ -1112,6 +1117,24 @@ pub async fn enqueue_singleton_task_for_requester(
     enqueue_task(state, new_task).await
 }
 
+pub async fn enqueue_singleton_task_by_type(
+    state: &AppState,
+    new_task: NewTask,
+) -> Result<EnqueuedTask> {
+    let _guard = task_singleton_enqueue_lock().lock().await;
+    if let Some(existing) = find_inflight_task_by_type(state, &new_task.task_type).await? {
+        return Ok(existing);
+    }
+    let task_type = new_task.task_type.clone();
+    match enqueue_task(state, new_task).await {
+        Ok(task) => Ok(task),
+        Err(error) if is_unique_violation(&error) => find_inflight_task_by_type(state, &task_type)
+            .await?
+            .context("inflight task disappeared after unique conflict"),
+        Err(error) => Err(error),
+    }
+}
+
 pub async fn enqueue_singleton_task_for_requester_and_payload(
     state: &AppState,
     new_task: NewTask,
@@ -1120,9 +1143,52 @@ pub async fn enqueue_singleton_task_for_requester_and_payload(
     let requested_by = new_task
         .requested_by
         .as_deref()
-        .context("payload singleton task requires requested_by")?;
+        .context("payload singleton task requires requested_by")?
+        .to_owned();
+    let task_type = new_task.task_type.clone();
     let payload_json = serde_json::to_string(&new_task.payload).context("serialize payload")?;
-    let existing = sqlx::query_as::<_, (String, String, String)>(
+    if let Some(existing) = find_inflight_task_for_requester_and_payload(
+        state,
+        &task_type,
+        &requested_by,
+        &payload_json,
+    )
+    .await?
+    {
+        return Ok(existing);
+    }
+    match enqueue_task(state, new_task).await {
+        Ok(task) => Ok(task),
+        Err(error) if is_unique_violation(&error) => find_inflight_task_for_requester_and_payload(
+            state,
+            &task_type,
+            &requested_by,
+            &payload_json,
+        )
+        .await?
+        .context("inflight payload task disappeared after unique conflict"),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_unique_violation(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<sqlx::Error>()
+            .is_some_and(|error| match error {
+                sqlx::Error::Database(database) => database.is_unique_violation(),
+                _ => false,
+            })
+    })
+}
+
+async fn find_inflight_task_for_requester_and_payload(
+    state: &AppState,
+    task_type: &str,
+    requested_by: &str,
+    payload_json: &str,
+) -> Result<Option<EnqueuedTask>> {
+    let row = sqlx::query_as::<_, (String, String, String)>(
         r#"
         SELECT id, task_type, status
         FROM job_tasks
@@ -1132,7 +1198,7 @@ pub async fn enqueue_singleton_task_for_requester_and_payload(
         LIMIT 1
         "#,
     )
-    .bind(&new_task.task_type)
+    .bind(task_type)
     .bind(requested_by)
     .bind(payload_json)
     .bind(STATUS_QUEUED)
@@ -1140,14 +1206,12 @@ pub async fn enqueue_singleton_task_for_requester_and_payload(
     .fetch_optional(&state.pool)
     .await
     .context("failed to find inflight task by requester and payload")?;
-    if let Some((task_id, task_type, status)) = existing {
-        return Ok(EnqueuedTask {
-            task_id,
-            task_type,
-            status,
-        });
-    }
-    enqueue_task(state, new_task).await
+    Ok(row.map(|(task_id, task_type, status)| EnqueuedTask {
+        task_id,
+        task_type,
+        status,
+        reused: true,
+    }))
 }
 
 pub async fn start_inline_task(state: &AppState, new_task: NewTask) -> Result<EnqueuedTask> {
@@ -1189,6 +1253,7 @@ pub async fn start_inline_task(state: &AppState, new_task: NewTask) -> Result<En
         task_id,
         task_type: new_task.task_type,
         status: STATUS_RUNNING.to_owned(),
+        reused: false,
     })
 }
 
