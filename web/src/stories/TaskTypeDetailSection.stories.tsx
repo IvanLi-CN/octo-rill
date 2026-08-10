@@ -1,7 +1,110 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { useEffect, type ReactNode } from "react";
+import { INITIAL_VIEWPORTS } from "storybook/viewport";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
 import type { AdminRealtimeTaskDetailResponse } from "@/api";
+
+const freshnessAuditItems = Array.from({ length: 75 }, (_, index) => {
+	const decision =
+		index % 3 === 0
+			? "reused_running"
+			: index % 3 === 1
+				? "reused_fresh"
+				: "fetch";
+	return {
+		repo_id: 1000 + index,
+		repo_full_name: `octo/release-${String(index + 1).padStart(2, "0")}`,
+		status: decision === "fetch" ? "queued" : "succeeded",
+		reused_fresh: decision === "reused_fresh",
+		freshness_window_minutes: decision === "fetch" ? 1 : 8,
+		freshness_decision: decision,
+		assessment: {
+			reason_codes:
+				decision === "fetch"
+					? index % 2 === 0
+						? ["outside_window"]
+						: ["snapshot_missing"]
+					: [
+							decision === "reused_running"
+								? "running_work_item"
+								: "within_window",
+						],
+		},
+		last_success_at:
+			decision === "reused_running" ? null : "2026-02-26T11:58:00Z",
+		error_text: null,
+	};
+});
+
+const adaptiveFreshnessAssessment = {
+	policy_version: 1,
+	profile: "balanced" as const,
+	evaluated_at: "2026-02-26T12:00:12Z",
+	effective_repo_count: 42,
+	pressure: {
+		queued_work_items: 5,
+		running_work_items: 4,
+		repo_release_worker_concurrency: 8,
+		queue_ratio: 1.125,
+		active_dashboard_tasks: 2,
+		queue_pressure_level: "moderate",
+		active_task_pressure_level: "moderate",
+		pressure_level: "moderate",
+	},
+	min_window_minutes: 1,
+	max_window_minutes: 8,
+	fetched_count: 12,
+	reused_fresh_count: 21,
+	reused_running_count: 9,
+	queued_count: 12,
+	decision_counts: {
+		fetch: 12,
+		reused_fresh: 21,
+		reused_running: 9,
+	},
+};
+
+function ReleaseFreshnessAuditMock({ children }: { children: ReactNode }) {
+	useEffect(() => {
+		const originalFetch = window.fetch.bind(window);
+		window.fetch = async (input, init) => {
+			const request =
+				typeof input === "string" || input instanceof URL
+					? new Request(input, init)
+					: input;
+			const url = new URL(request.url, window.location.origin);
+			if (!url.pathname.endsWith("/release-freshness")) {
+				return originalFetch(input, init);
+			}
+			const page = Math.max(1, Number(url.searchParams.get("page") ?? "1"));
+			const decision = url.searchParams.get("decision");
+			const reason = url.searchParams.get("reason");
+			const filtered = freshnessAuditItems.filter((item) => {
+				if (decision && item.freshness_decision !== decision) return false;
+				if (reason && !item.assessment.reason_codes.includes(reason))
+					return false;
+				return true;
+			});
+			const pageSize = 50;
+			return new Response(
+				JSON.stringify({
+					items: filtered.slice((page - 1) * pageSize, page * pageSize),
+					page,
+					page_size: pageSize,
+					total: filtered.length,
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		};
+		return () => {
+			window.fetch = originalFetch;
+		};
+	}, []);
+
+	return <>{children}</>;
+}
 
 const TARGET_USER_ID = "2f4k7m9p3x6c8v2a";
 const RELATED_USER_A = "4h6p9s3t5z8e2x4c";
@@ -9,6 +112,19 @@ const RELATED_USER_B = "5j7r9v3x6b8d2f4h";
 const SLOT_USER_A = "6k8m2p4r7t9w3y5b";
 const SLOT_USER_B = "7n9q3s5v8x2c4f6h";
 const SLOT_USER_C = "8p2r4t6w9y3d5g7k";
+const TASK_DETAIL_VIEWPORTS = {
+	...INITIAL_VIEWPORTS,
+	taskDetailDesktop1440: {
+		name: "Task detail desktop 1440x900",
+		styles: { width: "1440px", height: "900px" },
+		type: "desktop",
+	},
+	taskDetailMobile393: {
+		name: "Task detail mobile 393x852",
+		styles: { width: "393px", height: "852px" },
+		type: "mobile",
+	},
+} as const;
 
 function buildDetail(
 	taskType: string,
@@ -53,6 +169,9 @@ const meta = {
 	component: TaskTypeDetailSection,
 	parameters: {
 		layout: "padded",
+		viewport: {
+			options: TASK_DETAIL_VIEWPORTS,
+		},
 		docs: {
 			description: {
 				component:
@@ -196,6 +315,116 @@ export const SyncAccessRefreshFailed: Story = {
 				},
 			},
 		),
+	},
+};
+
+export const SyncAccessRefreshFreshnessAudit: Story = {
+	parameters: {
+		viewport: { defaultViewport: "taskDetailDesktop1440" },
+	},
+	render: (args) => (
+		<ReleaseFreshnessAuditMock>
+			<div className="mx-auto max-w-4xl">
+				<TaskTypeDetailSection {...args} />
+			</div>
+		</ReleaseFreshnessAuditMock>
+	),
+	args: {
+		detail: buildDetail(
+			"sync.access_refresh",
+			{
+				user_id: TARGET_USER_ID,
+				dashboard_adaptive_release_freshness: true,
+			},
+			{
+				starred: { repos: 42 },
+				release: {
+					repos: 42,
+					releases: 120,
+					current_run_releases: 18,
+					fetched_count: 12,
+					inserted_count: 8,
+					updated_count: 4,
+					unchanged_count: 0,
+					pages_fetched: 12,
+					reused_fresh_count: 21,
+					reused_running_count: 9,
+					freshness_assessment: adaptiveFreshnessAssessment,
+				},
+				social: { repo_stars: 4, followers: 2, events: 3 },
+				notifications: { notifications: 6 },
+			},
+			[],
+			{
+				diagnostics: {
+					business_outcome: {
+						code: "ok",
+						label: "同步完成",
+						message: "Dashboard 全量同步已完成，Release 新鲜度审计可供核查。",
+					},
+					sync_access_refresh: {
+						log_available: true,
+						log_download_path:
+							"/api/admin/jobs/realtime/task-sync.access_refresh/log",
+						star_repos: 42,
+						release_repos: 42,
+						releases: 120,
+						current_run_releases: 18,
+						fetched_count: 12,
+						inserted_count: 8,
+						updated_count: 4,
+						unchanged_count: 0,
+						pages_fetched: 12,
+						reused_fresh_count: 21,
+						reused_running_count: 9,
+						release_freshness_assessment: adaptiveFreshnessAssessment,
+						social_repo_stars: 4,
+						social_followers: 2,
+						social_events: 3,
+						notifications: 6,
+						social_error: null,
+						notifications_error: null,
+					},
+				},
+			},
+		),
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await userEvent.click(
+			canvas.getByRole("button", { name: "查看仓库决策明细" }),
+		);
+		await waitFor(() => {
+			expect(canvas.getByText("octo/release-01")).toBeVisible();
+		});
+		await userEvent.selectOptions(
+			canvas.getByRole("combobox", { name: "按新鲜度决策筛选" }),
+			"fetch",
+		);
+		await waitFor(() => {
+			expect(canvas.getByText("octo/release-03")).toBeVisible();
+		});
+		await userEvent.clear(
+			canvas.getByRole("textbox", { name: "按新鲜度原因码筛选" }),
+		);
+		await userEvent.selectOptions(
+			canvas.getByRole("combobox", { name: "按新鲜度决策筛选" }),
+			"",
+		);
+		await waitFor(() => {
+			expect(canvas.getByRole("button", { name: "下一页" })).toBeEnabled();
+		});
+		await userEvent.click(canvas.getByRole("button", { name: "下一页" }));
+		await waitFor(() => {
+			expect(canvas.getByText("octo/release-51")).toBeVisible();
+		});
+	},
+};
+
+export const SyncAccessRefreshFreshnessAuditMobile: Story = {
+	...SyncAccessRefreshFreshnessAudit,
+	parameters: {
+		viewport: { defaultViewport: "taskDetailMobile393" },
 	},
 };
 

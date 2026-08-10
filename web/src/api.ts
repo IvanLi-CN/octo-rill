@@ -343,6 +343,7 @@ export type AdminSyncRuntimeConfigResponse = {
 	retry_recent_failures_interval_minutes: number;
 	repo_release_worker_concurrency: number;
 	repo_refresh_system_budget_per_window: number;
+	dashboard_release_freshness_profile?: "latest" | "balanced" | "capacity";
 	daily_brief_schedule_local_time: string;
 	recent_sync_tasks: SyncAutoFetchTaskItem[];
 };
@@ -470,6 +471,7 @@ export type AdminSyncRuntimeConfigUpdateRequest = {
 	retry_recent_failures_interval_minutes?: number;
 	repo_release_worker_concurrency?: number;
 	repo_refresh_system_budget_per_window?: number;
+	dashboard_release_freshness_profile?: "latest" | "balanced" | "capacity";
 	daily_brief_schedule_local_time?: string;
 };
 export type DailyBriefProfilePatchRequest = {
@@ -914,6 +916,15 @@ export type AdminSyncAccessRefreshDiagnostics = {
 	star_repos: number;
 	release_repos: number;
 	releases: number;
+	current_run_releases?: number;
+	fetched_count?: number;
+	inserted_count?: number;
+	updated_count?: number;
+	unchanged_count?: number;
+	pages_fetched?: number;
+	reused_fresh_count?: number;
+	reused_running_count?: number;
+	release_freshness_assessment?: AdminReleaseFreshnessAssessment | null;
 	social_repo_stars: number;
 	social_followers: number;
 	social_events: number;
@@ -932,6 +943,52 @@ export type AdminSyncAccessRefreshDiagnostics = {
 		retry_limit: number | null;
 		error_chain: string | null;
 	} | null;
+};
+export type AdminReleaseFreshnessPressure = {
+	queued_work_items: number;
+	running_work_items: number;
+	repo_release_worker_concurrency: number;
+	queue_ratio: number;
+	active_dashboard_tasks: number;
+	queue_pressure_level: string;
+	active_task_pressure_level: string;
+	pressure_level: string;
+};
+export type AdminReleaseFreshnessAssessment = {
+	policy_version: number;
+	profile: "latest" | "balanced" | "capacity";
+	evaluated_at: string;
+	effective_repo_count: number;
+	pressure: AdminReleaseFreshnessPressure;
+	min_window_minutes: number;
+	max_window_minutes: number;
+	fetched_count: number;
+	reused_fresh_count: number;
+	reused_running_count: number;
+	queued_count: number;
+	decision_counts: Record<string, number>;
+};
+export type AdminReleaseFreshnessAuditItem = {
+	repo_id: number;
+	repo_full_name: string;
+	status: string;
+	reused_fresh: boolean;
+	freshness_window_minutes: number | null;
+	freshness_decision: "fetch" | "reused_fresh" | "reused_running" | null;
+	assessment: {
+		reason_codes?: string[];
+		watcher_user_count?: number;
+		last_success_at?: string | null;
+		[key: string]: unknown;
+	} | null;
+	last_success_at: string | null;
+	error_text: string | null;
+};
+export type AdminReleaseFreshnessAuditResponse = {
+	items: AdminReleaseFreshnessAuditItem[];
+	page: number;
+	page_size: number;
+	total: number;
 };
 export type AdminTaskDiagnostics = {
 	business_outcome: AdminBusinessOutcome;
@@ -1207,6 +1264,14 @@ export async function apiRetryAdminRealtimeTask(
 ): Promise<AdminTaskActionResponse> {
 	return apiPostJson<AdminTaskActionResponse>(
 		`/api/admin/jobs/realtime/${encodeURIComponent(taskId)}/retry`,
+	);
+}
+export async function apiGetAdminReleaseFreshnessAudit(
+	taskId: string,
+	params: URLSearchParams,
+): Promise<AdminReleaseFreshnessAuditResponse> {
+	return apiGet<AdminReleaseFreshnessAuditResponse>(
+		`/api/admin/jobs/realtime/${encodeURIComponent(taskId)}/release-freshness?${params.toString()}`,
 	);
 }
 export async function apiCancelAdminRealtimeTask(

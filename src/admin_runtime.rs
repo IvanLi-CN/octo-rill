@@ -23,6 +23,7 @@ pub struct AdminRuntimeSettingsSnapshot {
     pub translation_general_worker_concurrency: usize,
     pub translation_dedicated_worker_concurrency: usize,
     pub repo_release_worker_concurrency: usize,
+    pub dashboard_release_freshness_profile: String,
     pub daily_brief_schedule_local_time: NaiveTime,
 }
 
@@ -32,6 +33,23 @@ pub const DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY: usize = 8;
 pub const MAX_REPO_RELEASE_WORKER_CONCURRENCY: usize = 32;
 pub const DEFAULT_REPO_REFRESH_SYSTEM_BUDGET_PER_WINDOW: i64 = 1000;
 pub const MAX_REPO_REFRESH_SYSTEM_BUDGET_PER_WINDOW: i64 = 20_000;
+pub const DEFAULT_DASHBOARD_RELEASE_FRESHNESS_PROFILE: &str = "balanced";
+
+pub fn is_dashboard_release_freshness_profile(value: &str) -> bool {
+    matches!(value, "latest" | "balanced" | "capacity")
+}
+
+pub fn normalize_dashboard_release_freshness_profile(value: &str) -> &'static str {
+    if is_dashboard_release_freshness_profile(value) {
+        match value {
+            "latest" => "latest",
+            "capacity" => "capacity",
+            _ => "balanced",
+        }
+    } else {
+        DEFAULT_DASHBOARD_RELEASE_FRESHNESS_PROFILE
+    }
+}
 
 fn default_daily_brief_schedule_local_time(config: &AppConfig) -> NaiveTime {
     config
@@ -155,6 +173,42 @@ pub async fn load_repo_refresh_system_budget_per_window(pool: &SqlitePool) -> Re
     .unwrap_or(DEFAULT_REPO_REFRESH_SYSTEM_BUDGET_PER_WINDOW);
 
     Ok(normalize_repo_refresh_system_budget_per_window(budget))
+}
+
+pub async fn load_dashboard_release_freshness_profile(pool: &SqlitePool) -> Result<String> {
+    let profile = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT dashboard_release_freshness_profile
+        FROM admin_runtime_settings
+        WHERE id = 1
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or_else(|| DEFAULT_DASHBOARD_RELEASE_FRESHNESS_PROFILE.to_owned());
+
+    Ok(normalize_dashboard_release_freshness_profile(profile.as_str()).to_owned())
+}
+
+pub async fn update_dashboard_release_freshness_profile(
+    pool: &SqlitePool,
+    profile: &str,
+) -> Result<String> {
+    let profile = normalize_dashboard_release_freshness_profile(profile);
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE admin_runtime_settings
+        SET dashboard_release_freshness_profile = ?, updated_at = ?
+        WHERE id = 1
+        "#,
+    )
+    .bind(profile)
+    .bind(now.as_str())
+    .execute(pool)
+    .await?;
+    load_dashboard_release_freshness_profile(pool).await
 }
 
 pub async fn update_repo_release_worker_concurrency(
@@ -503,6 +557,7 @@ pub async fn load_or_seed_runtime_settings(
         translation_general_worker_concurrency: DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY,
         translation_dedicated_worker_concurrency: DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
         repo_release_worker_concurrency: DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY,
+        dashboard_release_freshness_profile: DEFAULT_DASHBOARD_RELEASE_FRESHNESS_PROFILE.to_owned(),
         daily_brief_schedule_local_time: default_daily_brief_schedule_local_time(config),
     };
     let now = Utc::now().to_rfc3339();
@@ -652,6 +707,7 @@ async fn fetch_runtime_settings(pool: &SqlitePool) -> Result<Option<AdminRuntime
           translation_general_worker_concurrency,
           translation_dedicated_worker_concurrency,
           repo_release_worker_concurrency,
+          dashboard_release_freshness_profile,
           daily_brief_schedule_local_time
         FROM admin_runtime_settings
         WHERE id = 1
@@ -678,6 +734,11 @@ async fn fetch_runtime_settings(pool: &SqlitePool) -> Result<Option<AdminRuntime
         repo_release_worker_concurrency: normalize_repo_release_worker_concurrency(
             row.get::<i64, _>("repo_release_worker_concurrency"),
         ),
+        dashboard_release_freshness_profile: normalize_dashboard_release_freshness_profile(
+            row.get::<String, _>("dashboard_release_freshness_profile")
+                .as_str(),
+        )
+        .to_owned(),
         daily_brief_schedule_local_time: briefs::parse_daily_brief_local_time(
             row.get::<String, _>("daily_brief_schedule_local_time")
                 .as_str(),

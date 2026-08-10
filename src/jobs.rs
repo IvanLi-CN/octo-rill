@@ -2001,7 +2001,16 @@ async fn execute_task(
         }
         TASK_SYNC_ACCESS_REFRESH => {
             let user_id = payload_local_id(payload, "user_id")?;
-            let res = sync::sync_access_refresh(state, task_id, user_id.as_str()).await?;
+            let res = if payload
+                .get("dashboard_adaptive_release_freshness")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                sync::sync_access_refresh_with_dashboard_freshness(state, task_id, user_id.as_str())
+                    .await?
+            } else {
+                sync::sync_access_refresh(state, task_id, user_id.as_str()).await?
+            };
             Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
         }
         TASK_SYNC_NOTIFICATIONS => {

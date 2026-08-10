@@ -31,6 +31,7 @@
 
 - 不为长尾 repo 追加 24h/72h 的硬保底 SLA；只通过软目标频段和 aging 提升调度优先级。
 - 不把交互式 `sync.access_refresh`、手动 sync、公开 release 访问 demand 并入这 10 分钟 system budget。
+- Dashboard 全量同步的动态 Release 新鲜度只调整交互 demand 的复用窗口，不消费 system budget，也不改变系统调度闭环。
 - 不把仓库老化信息塞回 `/admin` 主仪表盘；治理信息只在新的 `/admin/repos` 独立页展示。
 - 不在治理页面读取链路里直接请求 GitHub；页面只读本地快照与共享队列状态。
 
@@ -48,6 +49,8 @@
   - `repo_refresh_governance_cycle_members`
   - `repo_refresh_governance_retention_state`
   - completed-cycle retention index on `repo_refresh_governance_cycles`
+  - `admin_runtime_settings.dashboard_release_freshness_profile`
+  - `repo_release_watchers` freshness assessment fields and audit index
 - scheduler:
   - 有效关注池聚合
   - repo governance snapshot rebuild
@@ -74,6 +77,7 @@
 
 - 改造公开 release 仓库登记页的职责边界。
 - 引入新的 GitHub 在线探测或页面级实时数据拉取。
+- 在普通用户界面展示或配置 Release 新鲜度策略。
 
 ## 功能与行为规格（Functional / Behavior Spec）
 
@@ -100,6 +104,15 @@
 - 每轮最多挑选 `repo_refresh_system_budget_per_window` 个 repo 挂入 shared repo release queue。
 - 交互式/手动 demand 不消费该 budget；如果某 repo 已被本轮 system 选中，而对应 release work item 后续被交互式需求复用或提升，work item 到达 `succeeded` 或 `failed` 终态时仍必须结算本轮 system attempt。
 - 失败的 system attempt 记录 `system_last_attempt_at/status/error`，但不更新 `system_last_success_at`；成功的 attempt 同时更新 `system_last_success_at` 和实际刷新成功时间。
+
+### Dashboard 手动刷新新鲜度
+
+- 只有 `POST /api/sync/all?return_mode=task_id` 创建的 `sync.access_refresh` 任务携带 Dashboard 自适应标记；其他访问同步继续使用共享缓存的 30 分钟默认窗口。
+- Release 阶段开始时冻结评估时刻、有效仓库数量、Release 队列数量、Release worker 并发、活跃 Dashboard 自适应任务数和管理员策略档位。每个仓库随后独立计算 1–30 分钟窗口。
+- 压力分档分别按 `(queued + running) / repo_release_worker_concurrency` 与活跃 Dashboard 任务数计算，最终压力取两者最大档位；压力只增加窗口，不减少有效关注仓库覆盖。
+- `latest / balanced / capacity` 使用固定的规模、共享人数和压力加权矩阵，结果钳制在 1–30 分钟。共享人数读取治理快照，缺失时按 1 计算并记录 `snapshot_missing`。
+- 任务 `result_json.release_freshness_assessment`、`release_freshness_assessed` 事件和 `repo_release_watchers` 逐仓字段共同构成审计合同。管理员任务详情展示摘要，并通过分页接口查询仓库决策明细。
+- `release.releases` 保留复用缓存后的兼容总量；`current_run_releases` 与抓取/写入字段只统计本轮实际处理的 work item。
 
 ### 全量 cycle
 
@@ -319,6 +332,38 @@
   state: `subscription sync settings dialog auto-open from governance cta`
   evidence_note: 证明仓库刷新 budget 的唯一编辑入口已经收口到任务中心“订阅同步设置”弹窗，并支持从治理页 CTA 单跳自动展开。
   ![订阅同步设置预算弹窗证据](./assets/subscription-sync-settings-budget-dialog.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `admin-task-type-detail--sync-access-refresh-freshness-audit`
+  state: `adaptive dashboard release freshness audit, desktop browser viewport`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `1440x900`
+  viewport_strategy: `storybook-viewport`
+  margin_policy: `trim_only`
+  evidence_surface: `page`
+  sensitive_exclusion: `N/A`
+  submission_gate: `pending-owner-approval`
+  evidence_binding_sha: `68026dd100b38992e5e3480c77e6e4d41377a387`
+  evidence_note: 证明正常 1440x900 浏览器视口首屏中，管理员任务详情的统计卡片按三列排列，并展示 balanced 策略、压力档位、窗口范围、本轮抓取与缓存复用统计。
+  PR: include
+  ![Dashboard Release 新鲜度桌面证据](./assets/dashboard-release-freshness-desktop.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `admin-task-type-detail--sync-access-refresh-freshness-audit-mobile`
+  state: `adaptive dashboard release freshness audit, mobile browser viewport`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `393x852`
+  viewport_strategy: `storybook-viewport`
+  margin_policy: `trim_only`
+  evidence_surface: `page`
+  sensitive_exclusion: `N/A`
+  submission_gate: `pending-owner-approval`
+  evidence_binding_sha: `68026dd100b38992e5e3480c77e6e4d41377a387`
+  evidence_note: 证明正常 393x852 CSS px 移动浏览器视口首屏中，统计卡片保持单列可读，并可继续滚动查看 Release 新鲜度审计区。
+  PR: include
+  ![Dashboard Release 新鲜度移动证据](./assets/dashboard-release-freshness-mobile.png)
 
 ## 关系 / Supersede
 
