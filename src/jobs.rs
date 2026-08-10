@@ -1311,6 +1311,9 @@ pub async fn retry_task(
     if source.status == STATUS_RUNNING || source.status == STATUS_QUEUED {
         return Err(anyhow!("only finished tasks can be retried"));
     }
+    if source.task_type == TASK_WEBHOOK_PUSH_AUDIT {
+        return Err(anyhow!("scheduled webhook audit tasks cannot be retried"));
+    }
 
     let payload: Value =
         serde_json::from_str(&source.payload_json).context("invalid source payload")?;

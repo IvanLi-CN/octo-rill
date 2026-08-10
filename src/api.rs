@@ -6583,6 +6583,11 @@ fn map_job_action_error(err: anyhow::Error) -> ApiError {
             "invalid_task_state",
             "only finished tasks can be retried",
         ),
+        "scheduled webhook audit tasks cannot be retried" => ApiError::new(
+            StatusCode::CONFLICT,
+            "invalid_task_state",
+            "scheduled webhook audit tasks cannot be retried",
+        ),
         _ => ApiError::internal(err),
     }
 }

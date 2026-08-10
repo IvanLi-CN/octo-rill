@@ -71,6 +71,7 @@ struct PatRow {
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct TargetRepo {
     repo_id: i64,
+    owner_github_user_id: i64,
     owner_login: String,
     repo_name: String,
     repo_full_name: String,
@@ -213,6 +214,7 @@ struct HookRequestConfig<'a> {
 #[derive(Debug)]
 struct GitHubCallError {
     status: Option<StatusCode>,
+    rate_limited: bool,
     message: String,
 }
 
@@ -286,7 +288,10 @@ fn parse_scopes(headers: &HeaderMap) -> Vec<String> {
         .collect()
 }
 
-async fn validate_pat(state: &AppState, user_id: &str) -> Result<(String, String, bool), ApiError> {
+async fn validate_pat(
+    state: &AppState,
+    user_id: &str,
+) -> Result<(String, i64, String, bool), ApiError> {
     let Some((pat, token)) = load_pat(state, user_id).await? else {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -352,7 +357,12 @@ async fn validate_pat(state: &AppState, user_id: &str) -> Result<(String, String
         ));
     }
     let allows_private = scopes.iter().any(|scope| scope == "repo");
-    Ok((token, pat.owner_login.unwrap_or_default(), allows_private))
+    Ok((
+        token,
+        github_user.id,
+        pat.owner_login.unwrap_or_default(),
+        allows_private,
+    ))
 }
 
 fn generate_secret() -> String {
@@ -654,8 +664,8 @@ pub async fn delete_all(
             "请先关闭“Webhook 推送”，再全部删除 Webhook。",
         ));
     }
-    let (_, owner_login, _) = validate_pat(state.as_ref(), &user_id).await?;
-    ensure_delete_pat_owner(state.as_ref(), &user_id, &owner_login).await?;
+    let (_, owner_github_user_id, _, _) = validate_pat(state.as_ref(), &user_id).await?;
+    ensure_delete_pat_owner(state.as_ref(), &user_id, owner_github_user_id).await?;
     state
         .sqlite_writer
         .write_foreground("webhook_push_delete_pending", |_| async {
@@ -679,13 +689,13 @@ pub async fn delete_all(
 async fn ensure_delete_pat_owner(
     state: &AppState,
     user_id: &str,
-    owner_login: &str,
+    owner_github_user_id: i64,
 ) -> Result<(), ApiError> {
     let mismatched = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM webhook_push_repos WHERE user_id = ? AND hook_id IS NOT NULL AND lower(owner_login) != lower(?)",
+        "SELECT COUNT(*) FROM webhook_push_repos WHERE user_id = ? AND hook_id IS NOT NULL AND (owner_github_user_id IS NULL OR owner_github_user_id != ?)",
     )
+    .bind(owner_github_user_id)
     .bind(user_id)
-    .bind(owner_login)
     .fetch_one(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -735,6 +745,7 @@ pub async fn check_repo(
 async fn load_targets(
     state: &AppState,
     user_id: &str,
+    owner_github_user_id: i64,
     owner_login: &str,
     repo_id: Option<i64>,
     skip_paused: bool,
@@ -742,7 +753,7 @@ async fn load_targets(
 ) -> Result<Vec<TargetRepo>> {
     sqlx::query_as::<_, TargetRepo>(
         r#"
-        SELECT ob.repo_id,
+        SELECT ob.repo_id, ? AS owner_github_user_id,
                substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1) AS owner_login,
                substr(ob.repo_full_name, instr(ob.repo_full_name, '/') + 1) AS repo_name,
                ob.repo_full_name
@@ -758,6 +769,7 @@ async fn load_targets(
         "#,
     )
     .bind(user_id)
+    .bind(owner_github_user_id)
     .bind(owner_login)
     .bind(repo_id)
     .bind(repo_id)
@@ -780,9 +792,16 @@ fn github_url(state: &AppState, repo: &TargetRepo, suffix: &str) -> Result<url::
 
 async fn response_error(response: reqwest::Response) -> GitHubCallError {
     let status = response.status();
+    let rate_limited = response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == "0")
+        || response.headers().contains_key("retry-after");
     let body = response.text().await.unwrap_or_default();
     GitHubCallError {
         status: Some(status),
+        rate_limited,
         message: format!(
             "GitHub webhook API returned {status}: {}",
             body.chars().take(240).collect::<String>()
@@ -797,6 +816,7 @@ async fn list_hooks(
 ) -> std::result::Result<Vec<GitHubHook>, GitHubCallError> {
     let mut url = github_url(state, repo, "").map_err(|err| GitHubCallError {
         status: None,
+        rate_limited: false,
         message: err.to_string(),
     })?;
     let mut hooks = Vec::new();
@@ -815,6 +835,7 @@ async fn list_hooks(
             .await
             .map_err(|err| GitHubCallError {
                 status: err.status(),
+                rate_limited: false,
                 message: err.to_string(),
             })?;
         if !response.status().is_success() {
@@ -826,6 +847,7 @@ async fn list_hooks(
                 .await
                 .map_err(|err| GitHubCallError {
                     status: None,
+                    rate_limited: false,
                     message: err.to_string(),
                 })?;
         let is_last_page = page_hooks.len() < 100;
@@ -846,6 +868,7 @@ async fn create_hook(
 ) -> std::result::Result<GitHubHook, GitHubCallError> {
     let url = github_url(state, repo, "").map_err(|err| GitHubCallError {
         status: None,
+        rate_limited: false,
         message: err.to_string(),
     })?;
     let response = state
@@ -869,6 +892,7 @@ async fn create_hook(
         .await
         .map_err(|err| GitHubCallError {
             status: err.status(),
+            rate_limited: false,
             message: err.to_string(),
         })?;
     if !response.status().is_success() {
@@ -876,6 +900,7 @@ async fn create_hook(
     }
     response.json().await.map_err(|err| GitHubCallError {
         status: None,
+        rate_limited: false,
         message: err.to_string(),
     })
 }
@@ -890,6 +915,7 @@ async fn update_hook(
 ) -> std::result::Result<GitHubHook, GitHubCallError> {
     let url = github_url(state, repo, &format!("/{hook_id}")).map_err(|err| GitHubCallError {
         status: None,
+        rate_limited: false,
         message: err.to_string(),
     })?;
     let response = state
@@ -913,6 +939,7 @@ async fn update_hook(
         .await
         .map_err(|err| GitHubCallError {
             status: err.status(),
+            rate_limited: false,
             message: err.to_string(),
         })?;
     if !response.status().is_success() {
@@ -920,6 +947,7 @@ async fn update_hook(
     }
     response.json().await.map_err(|err| GitHubCallError {
         status: None,
+        rate_limited: false,
         message: err.to_string(),
     })
 }
@@ -932,6 +960,7 @@ async fn delete_hook(
 ) -> std::result::Result<(), GitHubCallError> {
     let url = github_url(state, repo, &format!("/{hook_id}")).map_err(|err| GitHubCallError {
         status: None,
+        rate_limited: false,
         message: err.to_string(),
     })?;
     let response = state
@@ -944,6 +973,7 @@ async fn delete_hook(
         .await
         .map_err(|err| GitHubCallError {
             status: err.status(),
+            rate_limited: false,
             message: err.to_string(),
         })?;
     if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
@@ -953,6 +983,9 @@ async fn delete_hook(
 }
 
 fn is_permission_error(error: &GitHubCallError) -> bool {
+    if error.rate_limited {
+        return false;
+    }
     let message = error.message.to_ascii_lowercase();
     if message.contains("rate limit") || message.contains("rate_limit") {
         return false;
@@ -976,11 +1009,12 @@ async fn persist_repo_state(
     sqlx::query(
         r#"
         INSERT INTO webhook_push_repos (
-          user_id, repo_id, owner_login, repo_name, repo_full_name,
+          user_id, repo_id, owner_github_user_id, owner_login, repo_name, repo_full_name,
           hook_id, callback_url, status, error_kind, error_message,
           permission_paused, last_checked_at, last_registered_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, repo_id) DO UPDATE SET
+          owner_github_user_id = excluded.owner_github_user_id,
           owner_login = excluded.owner_login, repo_name = excluded.repo_name,
           repo_full_name = excluded.repo_full_name,
           hook_id = COALESCE(excluded.hook_id, webhook_push_repos.hook_id),
@@ -992,7 +1026,7 @@ async fn persist_repo_state(
           updated_at = excluded.updated_at
         "#,
     )
-    .bind(user_id).bind(repo.repo_id).bind(&repo.owner_login).bind(&repo.repo_name).bind(&repo.repo_full_name)
+    .bind(user_id).bind(repo.repo_id).bind(repo.owner_github_user_id).bind(&repo.owner_login).bind(&repo.repo_name).bind(&repo.repo_full_name)
     .bind(hook_id).bind(callback).bind(status)
     .bind(error.map(|err| if is_permission_error(err) { "permission" } else { "github_error" }))
     .bind(error.map(|err| err.message.as_str()))
@@ -1167,7 +1201,7 @@ async fn try_acquire_user_operation_lease(
     task_id: &str,
 ) -> Result<bool> {
     let now = Utc::now();
-    let expires_at = (now + chrono::Duration::hours(2)).to_rfc3339();
+    let expires_at = (now + chrono::Duration::minutes(10)).to_rfc3339();
     let result = sqlx::query(
         r#"
         INSERT INTO webhook_push_user_operation_leases (user_id, task_id, expires_at)
@@ -1185,6 +1219,21 @@ async fn try_acquire_user_operation_lease(
     .execute(&state.pool)
     .await?;
     Ok(result.rows_affected() != 0)
+}
+
+async fn renew_user_operation_lease(state: &AppState, user_id: &str, task_id: &str) -> Result<()> {
+    let result = sqlx::query(
+        "UPDATE webhook_push_user_operation_leases SET expires_at = ? WHERE user_id = ? AND task_id = ?",
+    )
+    .bind((Utc::now() + chrono::Duration::minutes(10)).to_rfc3339())
+    .bind(user_id)
+    .bind(task_id)
+    .execute(&state.pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(anyhow!("webhook operation lease was lost"));
+    }
+    Ok(())
 }
 
 async fn release_user_operation_lease(state: &AppState, user_id: &str, task_id: &str) {
@@ -1205,10 +1254,8 @@ async fn execute_for_user(
     repo_id: Option<i64>,
     scheduled: bool,
 ) -> Result<Value> {
-    if !try_acquire_user_operation_lease(state, user_id, task_id).await? {
-        return Err(anyhow!(
-            "another webhook operation is already running for this user"
-        ));
+    while !try_acquire_user_operation_lease(state, user_id, task_id).await? {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
     let operation_lock = user_operation_lock(user_id);
     let _operation_guard = operation_lock.lock().await;
@@ -1236,28 +1283,47 @@ async fn execute_for_user_locked(
     } else if operation == OP_DELETE {
         return Ok(json!({"skipped": true, "reason": "re_enabled"}));
     }
-    let (token, owner_login, allows_private, secret, callback) = if operation == OP_DELETE {
-        let (pat, token) = load_pat(state, user_id)
-            .await
-            .map_err(|err| anyhow!(err.to_string()))?
-            .ok_or_else(|| anyhow!("GitHub PAT is not configured"))?;
-        let owner_login = pat
-            .owner_login
-            .ok_or_else(|| anyhow!("GitHub PAT owner is not available"))?;
-        ensure_delete_pat_owner(state, user_id, &owner_login)
-            .await
-            .map_err(|err| anyhow!(err.to_string()))?;
-        (token, owner_login, false, String::new(), String::new())
-    } else {
-        let (token, owner_login, allows_private) = validate_pat(state, user_id)
-            .await
-            .map_err(|err| anyhow!(err.to_string()))?;
-        let (secret, key) = ensure_secret_and_key(state, user_id)
-            .await
-            .map_err(|err| anyhow!(err.to_string()))?;
-        let callback = callback_url(state, &key).map_err(|err| anyhow!(err.to_string()))?;
-        (token, owner_login, allows_private, secret, callback)
-    };
+    let (token, owner_github_user_id, owner_login, allows_private, secret, callback) =
+        if operation == OP_DELETE {
+            let (pat, token) = load_pat(state, user_id)
+                .await
+                .map_err(|err| anyhow!(err.to_string()))?
+                .ok_or_else(|| anyhow!("GitHub PAT is not configured"))?;
+            let owner_github_user_id = pat
+                .owner_github_user_id
+                .ok_or_else(|| anyhow!("GitHub PAT owner id is not available"))?;
+            let owner_login = pat
+                .owner_login
+                .ok_or_else(|| anyhow!("GitHub PAT owner is not available"))?;
+            ensure_delete_pat_owner(state, user_id, owner_github_user_id)
+                .await
+                .map_err(|err| anyhow!(err.to_string()))?;
+            (
+                token,
+                owner_github_user_id,
+                owner_login,
+                false,
+                String::new(),
+                String::new(),
+            )
+        } else {
+            let (token, owner_github_user_id, owner_login, allows_private) =
+                validate_pat(state, user_id)
+                    .await
+                    .map_err(|err| anyhow!(err.to_string()))?;
+            let (secret, key) = ensure_secret_and_key(state, user_id)
+                .await
+                .map_err(|err| anyhow!(err.to_string()))?;
+            let callback = callback_url(state, &key).map_err(|err| anyhow!(err.to_string()))?;
+            (
+                token,
+                owner_github_user_id,
+                owner_login,
+                allows_private,
+                secret,
+                callback,
+            )
+        };
     if operation == OP_REGISTER
         && let Err(error) = sync::refresh_owned_repo_release_visibility(state, user_id).await
     {
@@ -1270,11 +1336,14 @@ async fn execute_for_user_locked(
     let targets = if operation == OP_DELETE {
         sqlx::query_as::<_, TargetRepo>(
             r#"
-            SELECT repo_id, owner_login, repo_name, repo_full_name
+            SELECT repo_id, owner_github_user_id, ? AS owner_login, repo_name,
+                   ? || '/' || repo_name AS repo_full_name
             FROM webhook_push_repos WHERE user_id = ? AND hook_id IS NOT NULL
             ORDER BY lower(repo_full_name)
             "#,
         )
+        .bind(&owner_login)
+        .bind(&owner_login)
         .bind(user_id)
         .fetch_all(&state.pool)
         .await?
@@ -1282,6 +1351,7 @@ async fn execute_for_user_locked(
         load_targets(
             state,
             user_id,
+            owner_github_user_id,
             &owner_login,
             repo_id,
             scheduled,
@@ -1291,6 +1361,7 @@ async fn execute_for_user_locked(
     };
     let mut counts = HashMap::<&str, usize>::new();
     for (index, repo) in targets.iter().enumerate() {
+        renew_user_operation_lease(state, user_id, task_id).await?;
         let result =
             run_repo_operation(state, user_id, repo, operation, &token, &callback, &secret).await?;
         *counts.entry(result).or_default() += 1;
@@ -1495,7 +1566,7 @@ pub async fn receive(
           AND EXISTS (
             SELECT 1 FROM reaction_pat_tokens pat
             WHERE pat.user_id = u.id
-              AND lower(pat.owner_login) = lower(wr.owner_login)
+              AND pat.owner_github_user_id = wr.owner_github_user_id
           )
         "#,
     )
