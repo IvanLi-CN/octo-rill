@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -176,6 +177,7 @@ struct ReleasePayloadRepo {
 #[derive(Debug, Deserialize)]
 struct GitHubUser {
     id: i64,
+    login: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -326,10 +328,32 @@ async fn validate_pat(
         .bearer_auth(&token)
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
+        .timeout(Duration::from_secs(60))
         .send()
         .await
         .map_err(ApiError::internal)?;
-    if response.status() != StatusCode::OK {
+    let status = response.status();
+    let rate_limited = response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == "0")
+        || response.headers().contains_key("retry-after");
+    if status != StatusCode::OK {
+        if rate_limited {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "github_rate_limited",
+                "GitHub API 当前限流，请稍后重试。",
+            ));
+        }
+        if status.is_server_error() {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "github_unavailable",
+                "GitHub user API 暂时不可用，请稍后重试。",
+            ));
+        }
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "pat_invalid",
@@ -351,20 +375,26 @@ async fn validate_pat(
         .json::<GitHubUser>()
         .await
         .map_err(ApiError::internal)?;
-    if pat.owner_github_user_id != Some(github_user.id) || pat.owner_login.is_none() {
+    if pat.owner_github_user_id != Some(github_user.id) {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "pat_owner_mismatch",
             "PAT 所属 GitHub 账号未绑定到当前 OctoRill 账号。",
         ));
     }
+    if pat.owner_login.as_deref() != Some(github_user.login.as_str()) {
+        sqlx::query(
+            "UPDATE reaction_pat_tokens SET owner_login = ?, updated_at = ? WHERE user_id = ?",
+        )
+        .bind(&github_user.login)
+        .bind(Utc::now().to_rfc3339())
+        .bind(user_id)
+        .execute(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    }
     let allows_private = scopes.iter().any(|scope| scope == "repo");
-    Ok((
-        token,
-        github_user.id,
-        pat.owner_login.unwrap_or_default(),
-        allows_private,
-    ))
+    Ok((token, github_user.id, github_user.login, allows_private))
 }
 
 fn generate_secret() -> String {
@@ -815,6 +845,7 @@ async fn resolve_delete_target(
         .bearer_auth(token)
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
+        .timeout(Duration::from_secs(60))
         .send()
         .await
         .context("load GitHub repository identity")?;
@@ -884,6 +915,7 @@ async fn list_hooks(
             .bearer_auth(token)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
+            .timeout(Duration::from_secs(60))
             .send()
             .await
             .map_err(|err| GitHubCallError {
@@ -941,6 +973,7 @@ async fn create_hook(
                 insecure_ssl: "0",
             },
         })
+        .timeout(Duration::from_secs(60))
         .send()
         .await
         .map_err(|err| GitHubCallError {
@@ -988,6 +1021,7 @@ async fn update_hook(
                 insecure_ssl: "0",
             },
         })
+        .timeout(Duration::from_secs(60))
         .send()
         .await
         .map_err(|err| GitHubCallError {
@@ -1022,6 +1056,7 @@ async fn delete_hook(
         .bearer_auth(token)
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
+        .timeout(Duration::from_secs(60))
         .send()
         .await
         .map_err(|err| GitHubCallError {

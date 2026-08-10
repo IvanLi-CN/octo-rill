@@ -37,7 +37,7 @@
   - PAT owner 是当前用户已绑定的 GitHub 账号；
   - classic PAT scope 包含 `public_repo` 或 `repo`；
   - `OCTORILL_PUBLIC_BASE_URL` 是 GitHub 可访问的 HTTPS 地址。
-- 开启必须经过二次确认。确认内容只说明当前授权动作：权限用途、仅监听新发布 Release和 secret 加密保存。关闭后 hooks 仍保留的行为在常规设置说明中展示，不放入开启确认弹窗。
+- 开启必须经过二次确认。确认内容只说明当前授权动作：权限用途、仅监听新发布 Release 和 secret 加密保存。关闭后 hooks 仍保留的行为由关闭状态下可用的“全部删除 Webhook”操作体现，不放入开启确认弹窗。
 - 开启成功后立即排队一次全量注册。单仓失败不回滚开关。
 
 ### 仓库范围
