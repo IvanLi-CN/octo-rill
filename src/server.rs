@@ -271,6 +271,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(api::admin_get_realtime_task_detail),
         )
         .route(
+            "/admin/jobs/realtime/{task_id}/release-freshness",
+            get(api::admin_get_release_freshness_audit),
+        )
+        .route(
             "/admin/jobs/realtime/{task_id}/log",
             get(api::admin_download_realtime_task_log),
         )
