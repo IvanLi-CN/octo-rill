@@ -904,7 +904,7 @@ async fn list_hooks(
         message: err.to_string(),
     })?;
     let mut hooks = Vec::new();
-    for page in 1_u32.. {
+    for page in 1_u32..=5 {
         url.query_pairs_mut()
             .clear()
             .append_pair("per_page", "100")
@@ -941,7 +941,11 @@ async fn list_hooks(
             return Ok(hooks);
         }
     }
-    unreachable!("GitHub hook pagination exhausted the page number range")
+    Err(GitHubCallError {
+        status: None,
+        rate_limited: false,
+        message: "GitHub hook list exceeds the supported 500-hook limit".to_owned(),
+    })
 }
 
 async fn create_hook(
@@ -1160,17 +1164,50 @@ async fn run_repo_operation(
     secret: &str,
 ) -> Result<&'static str> {
     if operation == OP_DELETE {
-        let hook_id = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT hook_id FROM webhook_push_repos WHERE user_id = ? AND repo_id = ?",
+        let stored = sqlx::query_as::<_, (Option<i64>, String)>(
+            "SELECT hook_id, callback_url FROM webhook_push_repos WHERE user_id = ? AND repo_id = ?",
         )
         .bind(user_id)
         .bind(repo.repo_id)
         .fetch_optional(&state.pool)
-        .await?
-        .flatten();
-        let Some(hook_id) = hook_id else {
+        .await?;
+        let Some((Some(hook_id), stored_callback)) = stored else {
             return Ok("skipped");
         };
+        let hooks = match list_hooks(state, token, repo).await {
+            Ok(hooks) => hooks,
+            Err(error) => {
+                sqlx::query(
+                    "UPDATE webhook_push_repos SET status = ?, error_kind = ?, error_message = ?, updated_at = ? WHERE user_id = ? AND repo_id = ?",
+                )
+                .bind(STATUS_ERROR)
+                .bind("github_error")
+                .bind(error.message)
+                .bind(Utc::now().to_rfc3339())
+                .bind(user_id)
+                .bind(repo.repo_id)
+                .execute(&state.pool)
+                .await?;
+                return Ok("failed");
+            }
+        };
+        let still_owned = hooks.iter().any(|hook| {
+            hook.id == hook_id
+                && hook.config.url.as_deref() == Some(stored_callback.as_str())
+                && hook.events.iter().any(|event| event == "release")
+        });
+        if !still_owned {
+            sqlx::query(
+                "UPDATE webhook_push_repos SET hook_id = NULL, status = ?, error_kind = NULL, error_message = NULL, updated_at = ? WHERE user_id = ? AND repo_id = ?",
+            )
+            .bind(STATUS_MISSING)
+            .bind(Utc::now().to_rfc3339())
+            .bind(user_id)
+            .bind(repo.repo_id)
+            .execute(&state.pool)
+            .await?;
+            return Ok("skipped");
+        }
         match delete_hook(state, token, repo, hook_id).await {
             Ok(()) => {
                 sqlx::query("DELETE FROM webhook_push_repos WHERE user_id = ? AND repo_id = ?")
@@ -1267,6 +1304,13 @@ async fn run_repo_operation(
             callback,
             (STATUS_MISSING, None, None, false),
         )
+        .await?;
+        sqlx::query(
+            "UPDATE webhook_push_repos SET hook_id = NULL WHERE user_id = ? AND repo_id = ?",
+        )
+        .bind(user_id)
+        .bind(repo.repo_id)
+        .execute(&state.pool)
         .await?;
         return Ok("missing");
     }
@@ -1500,39 +1544,33 @@ async fn execute_for_user_locked(
             }));
         }
         renew_user_operation_lease(state, user_id, task_id).await?;
-        let resolved_repo;
-        let result = if operation == OP_DELETE {
-            match resolve_delete_target(state, &token, owner_github_user_id, repo).await {
-                Ok(resolved) => {
-                    resolved_repo = resolved;
-                    run_repo_operation(
-                        state,
-                        user_id,
-                        &resolved_repo,
-                        operation,
-                        &token,
-                        &callback,
-                        &secret,
-                    )
-                    .await?
-                }
-                Err(error) => {
-                    sqlx::query(
-                        "UPDATE webhook_push_repos SET status = ?, error_kind = ?, error_message = ?, updated_at = ? WHERE user_id = ? AND repo_id = ?",
-                    )
-                    .bind(STATUS_ERROR)
-                    .bind("owner_resolution")
-                    .bind(error.to_string())
-                    .bind(Utc::now().to_rfc3339())
-                    .bind(user_id)
-                    .bind(repo.repo_id)
-                    .execute(&state.pool)
-                    .await?;
-                    "failed"
-                }
+        let result = match resolve_delete_target(state, &token, owner_github_user_id, repo).await {
+            Ok(resolved_repo) => {
+                run_repo_operation(
+                    state,
+                    user_id,
+                    &resolved_repo,
+                    operation,
+                    &token,
+                    &callback,
+                    &secret,
+                )
+                .await?
             }
-        } else {
-            run_repo_operation(state, user_id, repo, operation, &token, &callback, &secret).await?
+            Err(error) => {
+                sqlx::query(
+                    "UPDATE webhook_push_repos SET status = ?, error_kind = ?, error_message = ?, updated_at = ? WHERE user_id = ? AND repo_id = ?",
+                )
+                .bind(STATUS_ERROR)
+                .bind("owner_resolution")
+                .bind(error.to_string())
+                .bind(Utc::now().to_rfc3339())
+                .bind(user_id)
+                .bind(repo.repo_id)
+                .execute(&state.pool)
+                .await?;
+                "failed"
+            }
         };
         *counts.entry(result).or_default() += 1;
         jobs::append_task_event(

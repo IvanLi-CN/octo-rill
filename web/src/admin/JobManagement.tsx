@@ -1018,6 +1018,8 @@ function taskTypeLabel(taskType: string) {
 			return "订阅同步";
 		case "retry.recent_failures":
 			return "失败数据重试";
+		case "webhook.push.audit":
+			return "Webhook 定时巡查";
 		case "brief.generate":
 			return "日报生成";
 		case "brief.refresh_content":
