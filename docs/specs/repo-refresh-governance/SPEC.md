@@ -335,33 +335,33 @@
 
 - source_type: `storybook_canvas`
   story_id_or_title: `admin-task-type-detail--sync-access-refresh-freshness-audit`
-  state: `adaptive dashboard release freshness audit, desktop`
+  state: `adaptive dashboard release freshness audit, desktop browser viewport`
   target_program: `mock-only`
-  capture_scope: `element`
+  capture_scope: `browser-viewport`
   requested_viewport: `1440x900`
-  viewport_strategy: `browser-resize-fallback`
-  margin_policy: `require_margin`
-  evidence_surface: `component`
+  viewport_strategy: `storybook-viewport`
+  margin_policy: `trim_only`
+  evidence_surface: `page`
   sensitive_exclusion: `N/A`
   submission_gate: `pending-owner-approval`
-  evidence_binding_sha: `fe03a92f02371ab6dab2f5f2559ca27b6a1ce716`
-  evidence_note: 证明管理员任务详情常驻展示 balanced 策略、压力档位、窗口范围、本轮抓取与缓存复用统计，桌面统计卡片按三列排列，并可展开仓库决策明细。
+  evidence_binding_sha: `68026dd100b38992e5e3480c77e6e4d41377a387`
+  evidence_note: 证明正常 1440x900 浏览器视口首屏中，管理员任务详情的统计卡片按三列排列，并展示 balanced 策略、压力档位、窗口范围、本轮抓取与缓存复用统计。
   PR: include
   ![Dashboard Release 新鲜度桌面证据](./assets/dashboard-release-freshness-desktop.png)
 
 - source_type: `storybook_canvas`
-  story_id_or_title: `admin-task-type-detail--sync-access-refresh-freshness-audit`
-  state: `adaptive dashboard release freshness audit, mobile with reused-fresh filter`
+  story_id_or_title: `admin-task-type-detail--sync-access-refresh-freshness-audit-mobile`
+  state: `adaptive dashboard release freshness audit, mobile browser viewport`
   target_program: `mock-only`
-  capture_scope: `element`
+  capture_scope: `browser-viewport`
   requested_viewport: `393x852`
-  viewport_strategy: `browser-resize-fallback`
-  margin_policy: `require_margin`
-  evidence_surface: `component`
+  viewport_strategy: `storybook-viewport`
+  margin_policy: `trim_only`
+  evidence_surface: `page`
   sensitive_exclusion: `N/A`
   submission_gate: `pending-owner-approval`
-  evidence_binding_sha: `fe03a92f02371ab6dab2f5f2559ca27b6a1ce716`
-  evidence_note: 证明 393x852 CSS px 移动布局下策略摘要、筛选控件与全量仓库决策明细保持单列可读，并支持长列表滚动。
+  evidence_binding_sha: `68026dd100b38992e5e3480c77e6e4d41377a387`
+  evidence_note: 证明正常 393x852 CSS px 移动浏览器视口首屏中，统计卡片保持单列可读，并可继续滚动查看 Release 新鲜度审计区。
   PR: include
   ![Dashboard Release 新鲜度移动证据](./assets/dashboard-release-freshness-mobile.png)
 
