@@ -44,7 +44,7 @@
 
 - 目标仓库来自 PAT owner 对应 GitHub connection 刷新的 `owned_repo_star_baselines`。
 - 仅处理 `owner_login` 与 PAT owner login 一致的个人 owner 仓库。
-- `public_repo` PAT 对私有仓库的权限失败按仓库暂停；`repo` PAT 可覆盖公开与私有仓库。
+- `public_repo` PAT 仅选择公开仓库；`repo` PAT 可覆盖公开与私有仓库。
 
 ### 注册、检查和删除
 
@@ -94,5 +94,13 @@
 
 ## Visual Evidence
 
-实施完成后补充 Storybook 或 mock-only UI 的桌面与移动端证据。
+证据来源为 mock-only Storybook 完整页面 fallback，绑定 Settings story 的桌面与移动视口。
 
+PR: include
+![Webhook 启用确认弹窗](./assets/webhook-confirmation-desktop.png)
+
+PR: include
+![Webhook 权限暂停与部分成功状态](./assets/webhook-permission-paused-desktop.png)
+
+PR: include
+![Webhook 关闭后移动端批量删除状态](./assets/webhook-delete-ready-mobile.png)

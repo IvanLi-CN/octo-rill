@@ -2627,7 +2627,10 @@ async fn user_includes_own_releases(state: &AppState, user_id: &str) -> Result<b
     Ok(include_own_releases != 0)
 }
 
-async fn refresh_owned_repo_release_visibility(state: &AppState, user_id: &str) -> Result<bool> {
+pub(crate) async fn refresh_owned_repo_release_visibility(
+    state: &AppState,
+    user_id: &str,
+) -> Result<bool> {
     if !user_includes_own_releases(state, user_id).await? {
         return Ok(false);
     }

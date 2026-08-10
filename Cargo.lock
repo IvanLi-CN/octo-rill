@@ -1711,6 +1711,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "dotenvy",
+ "hmac 0.12.1",
  "iana-time-zone",
  "oauth2",
  "rand 0.10.0",

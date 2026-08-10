@@ -23,6 +23,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::{
     admin_runtime, ai, api, briefs, local_id, runtime, state::AppState, sync, translations,
+    webhook_push,
 };
 
 pub const STATUS_QUEUED: &str = "queued";
@@ -47,11 +48,14 @@ pub const TASK_TRANSLATE_RELEASE_BATCH: &str = "translate.release.batch";
 pub const TASK_SUMMARIZE_RELEASE_SMART_BATCH: &str = "summarize.release.smart.batch";
 pub const TASK_TRANSLATE_RELEASE_DETAIL: &str = "translate.release_detail";
 pub const TASK_TRANSLATE_NOTIFICATION: &str = "translate.notification";
+pub const TASK_WEBHOOK_PUSH_MANAGE: &str = "webhook.push.manage";
+pub const TASK_WEBHOOK_PUSH_AUDIT: &str = "webhook.push.audit";
 
 pub const SCHEDULED_TASK_TYPES: &[&str] = &[
     TASK_BRIEF_DAILY_SLOT,
     TASK_SYNC_SUBSCRIPTIONS,
     TASK_RETRY_RECENT_FAILURES,
+    TASK_WEBHOOK_PUSH_AUDIT,
 ];
 
 #[derive(Debug, Clone)]
@@ -225,6 +229,17 @@ pub fn spawn_recent_failures_retry_scheduler(state: Arc<AppState>) {
                 );
             }
             tokio::time::sleep(Duration::from_secs(20)).await;
+        }
+    });
+}
+
+pub fn spawn_webhook_push_scheduler(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = webhook_push::enqueue_audit_if_due(state.as_ref(), Utc::now()).await {
+                tracing::warn!(?err, "webhook push scheduler: enqueue due audit failed");
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
         }
     });
 }
@@ -2063,6 +2078,10 @@ async fn execute_task(
         TASK_RETRY_RECENT_FAILURES => {
             execute_recent_failures_retry_task(state, task_id, payload).await
         }
+        TASK_WEBHOOK_PUSH_MANAGE => {
+            webhook_push::execute_manage_task(state, task_id, payload).await
+        }
+        TASK_WEBHOOK_PUSH_AUDIT => webhook_push::execute_audit_task(state, task_id).await,
         TASK_TRANSLATE_RELEASE => {
             let user_id = payload_local_id(payload, "user_id")?;
             let release_id = payload_string(payload, "release_id")?;

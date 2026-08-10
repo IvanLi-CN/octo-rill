@@ -38,12 +38,14 @@ import {
 	type AdminTranslationRequestListItem,
 	type AdminTranslationStatusResponse,
 	type AdminSyncRuntimeConfigResponse,
+	type AdminWebhookPushRuntimeConfigResponse,
 	type AdminSyncSubscriptionsDiagnostics,
 	type SyncAutoFetchTaskItem,
 	type LocalUserId,
 	ApiError,
 	apiCancelAdminRealtimeTask,
 	apiGetAdminSyncRuntimeConfig,
+	apiGetAdminWebhookPushRuntimeConfig,
 	apiGetAdminLlmCallDetail,
 	apiGetAdminLlmCalls,
 	apiGetAdminLlmSchedulerStatus,
@@ -58,6 +60,7 @@ import {
 	apiOpenAdminJobsEventsStream,
 	apiPatchAdminLlmRuntimeConfig,
 	apiPatchAdminSyncRuntimeConfig,
+	apiPatchAdminWebhookPushRuntimeConfig,
 	apiPatchAdminTranslationRuntimeConfig,
 	apiRetryAdminRealtimeTask,
 } from "@/api";
@@ -3667,6 +3670,10 @@ export function JobManagement({
 	const [syncRuntimeConfigError, setSyncRuntimeConfigError] = useState<
 		string | null
 	>(null);
+	const [webhookPushRuntimeConfig, setWebhookPushRuntimeConfig] =
+		useState<AdminWebhookPushRuntimeConfigResponse | null>(null);
+	const [webhookPushAuditIntervalInput, setWebhookPushAuditIntervalInput] =
+		useState(7);
 	const [taskIntervalSettingsDialogOpen, setTaskIntervalSettingsDialogOpen] =
 		useState(taskIntervalSettingsDialogDefaultOpen);
 	const [
@@ -4137,11 +4144,16 @@ export function JobManagement({
 		setSyncRuntimeConfigLoading(true);
 		setSyncRuntimeConfigError(null);
 		try {
-			const res = await apiGetAdminSyncRuntimeConfig();
+			const [res, webhookConfig] = await Promise.all([
+				apiGetAdminSyncRuntimeConfig(),
+				apiGetAdminWebhookPushRuntimeConfig(),
+			]);
 			if (requestId !== syncRuntimeConfigRequestIdRef.current) {
 				return;
 			}
 			setSyncRuntimeConfig(res);
+			setWebhookPushRuntimeConfig(webhookConfig);
+			setWebhookPushAuditIntervalInput(webhookConfig.audit_interval_days);
 			setSyncAutoFetchIntervalInput(res.sync_auto_fetch_interval_minutes);
 			setRetryRecentFailuresIntervalInput(
 				res.retry_recent_failures_interval_minutes ??
@@ -4183,7 +4195,12 @@ export function JobManagement({
 				retry_recent_failures_interval_minutes: nextRetryInterval,
 				daily_brief_schedule_local_time: dailyBriefScheduleLocalTimeInput,
 			});
+			const webhookConfig = await apiPatchAdminWebhookPushRuntimeConfig(
+				Math.min(30, Math.max(1, webhookPushAuditIntervalInput)),
+			);
 			setSyncRuntimeConfig(res);
+			setWebhookPushRuntimeConfig(webhookConfig);
+			setWebhookPushAuditIntervalInput(webhookConfig.audit_interval_days);
 			setSyncAutoFetchIntervalInput(res.sync_auto_fetch_interval_minutes);
 			setRetryRecentFailuresIntervalInput(
 				res.retry_recent_failures_interval_minutes ??
@@ -4212,6 +4229,7 @@ export function JobManagement({
 		dailyBriefScheduleLocalTimeInput,
 		retryRecentFailuresIntervalInput,
 		syncAutoFetchIntervalInput,
+		webhookPushAuditIntervalInput,
 	]);
 
 	const saveSubscriptionSyncSettings = useCallback(async () => {
@@ -4280,8 +4298,11 @@ export function JobManagement({
 		setDailyBriefScheduleLocalTimeInput(
 			syncRuntimeConfig?.daily_brief_schedule_local_time ?? "06:00",
 		);
+		setWebhookPushAuditIntervalInput(
+			webhookPushRuntimeConfig?.audit_interval_days ?? 7,
+		);
 		setTaskIntervalSettingsDialogOpen(true);
-	}, [syncRuntimeConfig]);
+	}, [syncRuntimeConfig, webhookPushRuntimeConfig]);
 
 	const openSubscriptionSyncSettingsDialog = useCallback(() => {
 		setSyncRuntimeConfigError(null);
@@ -6352,6 +6373,33 @@ export function JobManagement({
 							<p className="text-muted-foreground text-xs">
 								统一控制所有用户在各自本地时间几点自动生成“昨天”日报；内容窗口仍固定按本地自然日
 								`00:00 → 次日 00:00` 计算。
+							</p>
+						</div>
+						<div className="space-y-3 rounded-lg border bg-card/70 px-3 py-4">
+							<div className="flex items-center justify-between gap-3">
+								<div className="flex items-center gap-2">
+									<Label htmlFor="webhook-push-audit-interval">
+										Webhook 定时巡查周期
+									</Label>
+									<Badge variant="outline">webhook_push_audit</Badge>
+								</div>
+								<span className="rounded-md border bg-background px-2.5 py-1 font-mono text-sm font-semibold">
+									{webhookPushAuditIntervalInput} 天
+								</span>
+							</div>
+							<Input
+								id="webhook-push-audit-interval"
+								type="number"
+								min={1}
+								max={30}
+								value={webhookPushAuditIntervalInput}
+								onChange={(event) =>
+									setWebhookPushAuditIntervalInput(Number(event.target.value))
+								}
+							/>
+							<p className="text-muted-foreground text-xs">
+								每 1–30 天自动发现新增个人仓库并补齐缺失
+								hook；权限暂停仓库会跳过。
 							</p>
 						</div>
 						<div className="space-y-3 rounded-lg border bg-card/70 px-3 py-4">

@@ -10,6 +10,7 @@ import type {
 	MeProfileResponse,
 	PasskeySummary,
 	ReactionTokenStatusResponse,
+	WebhookPushSettingsResponse,
 } from "@/api";
 import { SettingsPage } from "@/pages/Settings";
 import type { SettingsSection } from "@/settings/routeState";
@@ -124,6 +125,7 @@ type SettingsStoryArgs = {
 	reactionTokenStatus: ReactionTokenStatusResponse;
 	profile: MeProfileResponse;
 	themePreference: ThemePreference;
+	webhookPush?: WebhookPushSettingsResponse;
 };
 
 function SettingsStoryScene(args: SettingsStoryArgs) {
@@ -259,6 +261,94 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 		}
 		if (request.pathname === "/api/me/profile" && method === "GET") {
 			return jsonResponse(profile);
+		}
+		if (request.pathname === "/api/me/webhook-push" && method === "GET") {
+			if (args.webhookPush) return jsonResponse(args.webhookPush);
+			return jsonResponse({
+				enabled: false,
+				include_own_releases: profile.include_own_releases,
+				callback_ready: true,
+				pat: {
+					configured: reactionTokenStatus.configured,
+					valid: true,
+					owner_login: "storybook-user",
+				},
+				summary: {
+					total: 2,
+					registered: 1,
+					missing: 1,
+					permission_paused: 0,
+					errors: 0,
+					removable: 1,
+				},
+				schedule: {
+					audit_interval_days: 7,
+					last_started_at: null,
+					next_started_at: null,
+				},
+				repos: [
+					{
+						repo_id: 1,
+						owner_login: "storybook-user",
+						repo_name: "octo-rill",
+						repo_full_name: "storybook-user/octo-rill",
+						is_private: false,
+						hook_id: 10,
+						status: "registered",
+						error_kind: null,
+						error_message: null,
+						permission_paused: false,
+						last_checked_at: null,
+						last_registered_at: null,
+					},
+					{
+						repo_id: 2,
+						owner_login: "storybook-user",
+						repo_name: "notes",
+						repo_full_name: "storybook-user/notes",
+						is_private: false,
+						hook_id: null,
+						status: "missing",
+						error_kind: null,
+						error_message: null,
+						permission_paused: false,
+						last_checked_at: null,
+						last_registered_at: null,
+					},
+				],
+			});
+		}
+		if (request.pathname === "/api/me/webhook-push" && method === "PATCH") {
+			return jsonResponse({
+				enabled: JSON.parse(String(init?.body ?? "{}")).enabled,
+				include_own_releases: profile.include_own_releases,
+				callback_ready: true,
+				pat: { configured: true, valid: true, owner_login: "storybook-user" },
+				summary: {
+					total: 0,
+					registered: 0,
+					missing: 0,
+					permission_paused: 0,
+					errors: 0,
+					removable: 0,
+				},
+				schedule: {
+					audit_interval_days: 7,
+					last_started_at: null,
+					next_started_at: null,
+				},
+				repos: [],
+			});
+		}
+		if (
+			request.pathname.startsWith("/api/me/webhook-push/") &&
+			(method === "POST" || method === "DELETE")
+		) {
+			return jsonResponse({
+				task_id: "storybook-webhook-task",
+				status: "queued",
+				reused: false,
+			});
 		}
 		if (request.pathname === "/api/me/profile" && method === "PATCH") {
 			const patch = init?.body ? JSON.parse(String(init.body)) : {};
@@ -853,11 +943,28 @@ export const GitHubPatMobileDark: Story = {
 };
 
 export const DeepLinkedMyReleases: Story = {
+	globals: {
+		viewport: { value: "settingsGithubPatDesktop1280", isRotated: false },
+	},
 	args: {
 		section: "my-releases",
 		profile: {
 			...buildMockProfile(),
 			include_own_releases: false,
+		},
+		reactionTokenStatus: {
+			configured: true,
+			masked_token: "ghp_****_storybook",
+			check: {
+				state: "valid",
+				message: "token is valid for @storybook-user",
+				checked_at: "2026-04-18T08:00:00+08:00",
+			},
+			owner: {
+				github_connection_id: "ghconn_primary",
+				github_user_id: 42,
+				login: "storybook-user",
+			},
 		},
 	},
 	parameters: {
@@ -881,5 +988,117 @@ export const DeepLinkedMyReleases: Story = {
 
 		await expect(switchControl).toHaveAttribute("aria-checked", "true");
 		await expect(canvas.getByText("已纳入我的发布")).toBeVisible();
+
+		const webhookSwitch = await canvas.findByRole("switch", {
+			name: "Webhook 推送",
+		});
+		await userEvent.click(webhookSwitch);
+		await expect(
+			await screen.findByRole("alertdialog", { name: "开启 Webhook 推送？" }),
+		).toBeVisible();
+		await expect(
+			screen.getByRole("button", { name: "确认开启并注册" }),
+		).toBeVisible();
+	},
+};
+
+export const WebhookPermissionPaused: Story = {
+	globals: {
+		viewport: { value: "settingsGithubPatDesktop1280", isRotated: false },
+	},
+	args: {
+		...DeepLinkedMyReleases.args,
+		profile: { ...buildMockProfile(), include_own_releases: true },
+		webhookPush: {
+			enabled: true,
+			include_own_releases: true,
+			callback_ready: true,
+			pat: { configured: true, valid: true, owner_login: "storybook-user" },
+			summary: {
+				total: 3,
+				registered: 1,
+				missing: 1,
+				permission_paused: 1,
+				errors: 0,
+				removable: 2,
+			},
+			schedule: {
+				audit_interval_days: 7,
+				last_started_at: "2026-08-08T02:00:00Z",
+				next_started_at: "2026-08-15T02:00:00Z",
+			},
+			repos: [
+				{
+					repo_id: 1,
+					owner_login: "storybook-user",
+					repo_name: "octo-rill",
+					repo_full_name: "storybook-user/octo-rill",
+					is_private: false,
+					hook_id: 10,
+					status: "registered",
+					error_kind: null,
+					error_message: null,
+					permission_paused: false,
+					last_checked_at: "2026-08-08T02:00:00Z",
+					last_registered_at: "2026-08-08T02:00:00Z",
+				},
+				{
+					repo_id: 2,
+					owner_login: "storybook-user",
+					repo_name: "private-service",
+					repo_full_name: "storybook-user/private-service",
+					is_private: true,
+					hook_id: null,
+					status: "permission_paused",
+					error_kind: "permission",
+					error_message:
+						"GitHub 拒绝管理该仓库的 webhook。请更新 PAT 权限后手动注册。",
+					permission_paused: true,
+					last_checked_at: "2026-08-08T02:00:00Z",
+					last_registered_at: null,
+				},
+				{
+					repo_id: 3,
+					owner_login: "storybook-user",
+					repo_name: "notes",
+					repo_full_name: "storybook-user/notes",
+					is_private: false,
+					hook_id: null,
+					status: "missing",
+					error_kind: null,
+					error_message: null,
+					permission_paused: false,
+					last_checked_at: "2026-08-08T02:00:00Z",
+					last_registered_at: null,
+				},
+			],
+		},
+	},
+};
+
+export const WebhookDeleteReady: Story = {
+	globals: {
+		viewport: { value: "settingsGithubPatMobile390", isRotated: false },
+	},
+	args: {
+		...WebhookPermissionPaused.args,
+		webhookPush: {
+			...(WebhookPermissionPaused.args
+				?.webhookPush as WebhookPushSettingsResponse),
+			enabled: false,
+			summary: {
+				total: 3,
+				registered: 1,
+				missing: 1,
+				permission_paused: 1,
+				errors: 0,
+				removable: 2,
+			},
+			repos: (
+				WebhookPermissionPaused.args?.webhookPush as WebhookPushSettingsResponse
+			).repos.map((repo, index) =>
+				index === 0 ? { ...repo, status: "delete_pending" } : repo,
+			),
+		},
 	},
 };

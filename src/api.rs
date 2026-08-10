@@ -1315,11 +1315,19 @@ async fn persist_daily_brief_profile(
                 UPDATE users
                 SET daily_brief_time_zone = ?,
                     include_own_releases = COALESCE(?, include_own_releases),
+                    webhook_push_enabled = CASE
+                      WHEN ? = 0 THEN 0
+                      ELSE webhook_push_enabled
+                    END,
                     updated_at = ?
                 WHERE id = ?
                 "#,
             )
             .bind(time_zone.as_str())
+            .bind(
+                req.include_own_releases
+                    .map(|value| if value { 1_i64 } else { 0_i64 }),
+            )
             .bind(
                 req.include_own_releases
                     .map(|value| if value { 1_i64 } else { 0_i64 }),
