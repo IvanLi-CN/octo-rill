@@ -1385,7 +1385,8 @@ pub async fn receive(
     let event = headers
         .get("x-github-event")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| ApiError::bad_request("X-GitHub-Event is required"))?;
     let hook_id = headers
         .get("x-github-hook-id")
         .and_then(|value| value.to_str().ok())

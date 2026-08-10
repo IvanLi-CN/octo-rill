@@ -1386,6 +1386,7 @@ const SCHEDULED_TASK_TYPES = new Set([
 	"brief.daily_slot",
 	"sync.subscriptions",
 	"retry.recent_failures",
+	"webhook.push.audit",
 ]);
 const STREAM_REFRESH_DELAY_MS = 600;
 const STREAM_RECONNECT_DELAY_MS = 1500;
