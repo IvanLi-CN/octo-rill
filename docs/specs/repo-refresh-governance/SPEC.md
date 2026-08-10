@@ -299,7 +299,7 @@
   requested_viewport: `1440x1200`
   viewport_strategy: `playwright-viewport`
   sensitive_exclusion: `N/A`
-  submission_gate: `pending-owner-approval`
+  submission_gate: `owner-approved`
   evidence_note: 证明 `/admin/repos` 在桌面视口下同时展示有效关注池 summary、可访问活动图图例、单跳预算 CTA，以及使用状态下拉、目标窗口与迫切值范围筛选的仓库明细。
   ![仓库治理桌面证据](./assets/admin-repos-desktop.png)
 
@@ -311,7 +311,7 @@
   requested_viewport: `768x1180`
   viewport_strategy: `playwright-viewport`
   sensitive_exclusion: `N/A`
-  submission_gate: `pending-owner-approval`
+  submission_gate: `owner-approved`
   evidence_note: 证明 `/admin/repos` 在窄平板视口下仍能稳定展示 summary、预算 CTA、活动图图例与明细筛选，不退化为不可滚动的密集表格。
   ![仓库治理窄屏证据](./assets/admin-repos-narrow-tablet.png)
 
@@ -332,6 +332,38 @@
   state: `subscription sync settings dialog auto-open from governance cta`
   evidence_note: 证明仓库刷新 budget 的唯一编辑入口已经收口到任务中心“订阅同步设置”弹窗，并支持从治理页 CTA 单跳自动展开。
   ![订阅同步设置预算弹窗证据](./assets/subscription-sync-settings-budget-dialog.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `admin-admin-jobs--subscription-sync-settings-freshness-help`
+  state: `subscription sync freshness policy help, desktop browser viewport`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `1440x900`
+  viewport_strategy: `browser-viewport`
+  margin_policy: `trim_only`
+  evidence_surface: `page`
+  sensitive_exclusion: `N/A`
+  submission_gate: `pending-owner-approval`
+  evidence_binding_sha: `958e4eb68ccc6d7c0ee9f0bc5f0e193416f3c6fd`
+  evidence_note: 证明正常 1440x900 浏览器视口中的订阅同步设置弹窗将标题、Dashboard 新鲜度与链路用时帮助触发器收紧为同一节奏，并展示三档策略、1–30 分钟边界及压力不跳过仓库的约束。
+  PR: include
+  ![订阅同步新鲜度策略桌面证据](./assets/subscription-sync-freshness-help-desktop.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `admin-admin-jobs--subscription-sync-settings-freshness-help-mobile`
+  state: `subscription sync freshness policy help, mobile browser viewport`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `393x852`
+  viewport_strategy: `browser-viewport`
+  margin_policy: `trim_only`
+  evidence_surface: `page`
+  sensitive_exclusion: `N/A`
+  submission_gate: `pending-owner-approval`
+  evidence_binding_sha: `958e4eb68ccc6d7c0ee9f0bc5f0e193416f3c6fd`
+  evidence_note: 证明正常 393x852 浏览器视口中，弹窗以内部滚动保留标题、关闭按钮、紧凑帮助触发器与完整策略 Tooltip，且浮层未发生裁切或横向溢出。
+  PR: include
+  ![订阅同步新鲜度策略移动证据](./assets/subscription-sync-freshness-help-mobile.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `admin-task-type-detail--sync-access-refresh-freshness-audit`
