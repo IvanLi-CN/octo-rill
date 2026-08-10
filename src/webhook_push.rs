@@ -523,6 +523,7 @@ async fn list_repo_statuses(
           AND NOT EXISTS (
             SELECT 1 FROM owned_repo_star_baselines ob
             WHERE ob.user_id = wr.user_id AND ob.repo_id = wr.repo_id
+              AND lower(substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1)) = lower(?)
           )
         ) ORDER BY lower(repo_full_name)
         "#,
@@ -530,6 +531,7 @@ async fn list_repo_statuses(
     .bind(user_id)
     .bind(owner_login)
     .bind(user_id)
+    .bind(owner_login)
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::internal)
@@ -1210,12 +1212,14 @@ async fn run_repo_operation(
         let hooks = match list_hooks(state, token, repo).await {
             Ok(hooks) => hooks,
             Err(error) => {
+                let permission_paused = is_permission_error(&error);
                 sqlx::query(
-                    "UPDATE webhook_push_repos SET status = ?, error_kind = ?, error_message = ?, updated_at = ? WHERE user_id = ? AND repo_id = ?",
+                    "UPDATE webhook_push_repos SET status = ?, error_kind = ?, error_message = ?, permission_paused = ?, updated_at = ? WHERE user_id = ? AND repo_id = ?",
                 )
-                .bind(STATUS_ERROR)
-                .bind("github_error")
+                .bind(if permission_paused { STATUS_PERMISSION_PAUSED } else { STATUS_ERROR })
+                .bind(if permission_paused { "permission" } else { "github_error" })
                 .bind(error.message)
+                .bind(if permission_paused { 1_i64 } else { 0_i64 })
                 .bind(Utc::now().to_rfc3339())
                 .bind(user_id)
                 .bind(repo.repo_id)
@@ -1592,17 +1596,22 @@ async fn execute_for_user_locked(
             }
             Err(error) => {
                 let permission_paused = is_permission_error(&error);
-                sqlx::query(
-                    "UPDATE webhook_push_repos SET status = ?, error_kind = ?, error_message = ?, permission_paused = ?, updated_at = ? WHERE user_id = ? AND repo_id = ?",
+                persist_repo_state(
+                    state,
+                    user_id,
+                    repo,
+                    &callback,
+                    (
+                        if permission_paused {
+                            STATUS_PERMISSION_PAUSED
+                        } else {
+                            STATUS_ERROR
+                        },
+                        None,
+                        Some(&error),
+                        false,
+                    ),
                 )
-                .bind(if permission_paused { STATUS_PERMISSION_PAUSED } else { STATUS_ERROR })
-                .bind(if permission_paused { "permission" } else { "owner_resolution" })
-                .bind(error.message)
-                .bind(if permission_paused { 1_i64 } else { 0_i64 })
-                .bind(Utc::now().to_rfc3339())
-                .bind(user_id)
-                .bind(repo.repo_id)
-                .execute(&state.pool)
                 .await?;
                 "failed"
             }
