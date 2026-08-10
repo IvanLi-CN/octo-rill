@@ -1388,6 +1388,10 @@ const STREAM_REFRESH_DELAY_MS = 600;
 const STREAM_RECONNECT_DELAY_MS = 1500;
 
 type StreamStatus = "connecting" | "connected" | "reconnecting";
+type SyncSettingsHelpTooltip = "dialog" | "freshness" | "duration";
+
+const SYNC_SETTINGS_HELP_BUTTON_CLASS =
+	"size-8 rounded-full text-muted-foreground";
 
 function normalizePathname(pathname: string) {
 	return pathname.replace(/\/+$/, "") || "/";
@@ -1404,7 +1408,7 @@ type JobManagementProps = {
 	) => void;
 	taskIntervalSettingsDialogDefaultOpen?: boolean;
 	subscriptionSyncSettingsDialogDefaultOpen?: boolean;
-	syncSettingsHelpTooltipsOpen?: boolean;
+	syncSettingsHelpTooltip?: SyncSettingsHelpTooltip;
 };
 
 type LoadOptions = {
@@ -3619,7 +3623,7 @@ export function JobManagement({
 	onNavigateRoute,
 	taskIntervalSettingsDialogDefaultOpen = false,
 	subscriptionSyncSettingsDialogDefaultOpen = false,
-	syncSettingsHelpTooltipsOpen = false,
+	syncSettingsHelpTooltip,
 }: JobManagementProps) {
 	const isRouteControlled = controlledRouteState !== undefined;
 	const [uncontrolledRouteState, setUncontrolledRouteState] =
@@ -6486,7 +6490,7 @@ export function JobManagement({
 				}}
 			>
 				<DialogContent
-					className="sm:max-w-3xl"
+					className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-3xl"
 					onOpenAutoFocus={(event) => {
 						event.preventDefault();
 						window.requestAnimationFrame(() => {
@@ -6497,29 +6501,27 @@ export function JobManagement({
 					}}
 				>
 					<DialogHeader>
-						<div className="flex items-center gap-2">
+						<div className="flex items-center gap-1">
 							<DialogTitle>订阅同步设置</DialogTitle>
-							<Tooltip open={syncSettingsHelpTooltipsOpen ? true : undefined}>
+							<Tooltip
+								open={syncSettingsHelpTooltip === "dialog" ? true : undefined}
+							>
 								<TooltipTrigger asChild>
 									<Button
 										type="button"
 										variant="ghost"
 										size="icon"
-										className="text-muted-foreground size-11 rounded-full"
+										className={SYNC_SETTINGS_HELP_BUTTON_CLASS}
 									>
 										<CircleHelp className="size-4" />
 										<span className="sr-only">订阅同步配置说明</span>
 									</Button>
 								</TooltipTrigger>
 								<TooltipContent
-									align={syncSettingsHelpTooltipsOpen ? "center" : "start"}
-									className={
-										syncSettingsHelpTooltipsOpen
-											? "w-56 max-w-56 whitespace-normal break-words text-left leading-relaxed"
-											: "max-w-72"
-									}
-									side={syncSettingsHelpTooltipsOpen ? "top" : "bottom"}
-									sideOffset={6}
+									align="start"
+									className="max-w-72"
+									side="bottom"
+									sideOffset={4}
 								>
 									这里统一调整订阅同步的 Release 抓取并发、仓库刷新系统预算，
 									并保留最近三次链路记录。
@@ -6534,7 +6536,56 @@ export function JobManagement({
 					<div className="grid gap-6 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
 						<div className="space-y-5 lg:border-r lg:border-border/70 lg:pr-6">
 							<div className="space-y-2">
-								<Label>Dashboard 手动刷新新鲜度</Label>
+								<div className="flex items-center gap-1">
+									<Label>Dashboard 手动刷新新鲜度</Label>
+									<Tooltip
+										open={
+											syncSettingsHelpTooltip === "freshness" ? true : undefined
+										}
+									>
+										<TooltipTrigger asChild>
+											<Button
+												type="button"
+												variant="ghost"
+												size="icon"
+												className={SYNC_SETTINGS_HELP_BUTTON_CLASS}
+											>
+												<CircleHelp className="size-3.5" />
+												<span className="sr-only">
+													Dashboard 手动刷新新鲜度策略说明
+												</span>
+											</Button>
+										</TooltipTrigger>
+										<TooltipContent
+											align="start"
+											className="w-72 max-w-[calc(100vw-2rem)] whitespace-normal break-words text-left leading-relaxed"
+											side="bottom"
+											sideOffset={4}
+										>
+											<div className="space-y-2">
+												<p>
+													仅作用于 Dashboard 全量同步，单仓窗口始终限制在 1–30
+													分钟。
+												</p>
+												<ul className="space-y-1">
+													<li>
+														<span className="font-medium">最新：</span>
+														优先获取更新鲜的数据。
+													</li>
+													<li>
+														<span className="font-medium">平衡：</span>
+														默认策略，在新鲜度与同步压力之间折中。
+													</li>
+													<li>
+														<span className="font-medium">容量：</span>
+														优先降低抓取压力，复用窗口相对更长。
+													</li>
+												</ul>
+												<p>压力只会延长复用窗口，不会跳过有效关注仓库。</p>
+											</div>
+										</TooltipContent>
+									</Tooltip>
+								</div>
 								<div
 									role="radiogroup"
 									aria-label="Dashboard 手动刷新新鲜度策略"
@@ -6677,31 +6728,29 @@ export function JobManagement({
 
 						<div className="space-y-3">
 							<div className="flex items-center justify-between gap-3">
-								<div className="flex items-center gap-2">
+								<div className="flex items-center gap-1">
 									<p className="text-sm font-medium">最近三次链路用时</p>
 									<Tooltip
-										open={syncSettingsHelpTooltipsOpen ? true : undefined}
+										open={
+											syncSettingsHelpTooltip === "duration" ? true : undefined
+										}
 									>
 										<TooltipTrigger asChild>
 											<Button
 												type="button"
 												variant="ghost"
 												size="icon"
-												className="text-muted-foreground size-11 rounded-full"
+												className={SYNC_SETTINGS_HELP_BUTTON_CLASS}
 											>
 												<CircleHelp className="size-3.5" />
 												<span className="sr-only">链路用时说明</span>
 											</Button>
 										</TooltipTrigger>
 										<TooltipContent
-											align={syncSettingsHelpTooltipsOpen ? "end" : "center"}
-											className={
-												syncSettingsHelpTooltipsOpen
-													? "w-72 max-w-72 whitespace-normal break-words text-left leading-relaxed"
-													: "max-w-80"
-											}
+											align="center"
+											className="max-w-80"
 											side="top"
-											sideOffset={6}
+											sideOffset={4}
 										>
 											用时从定时触发开始，直到同步、润色和翻译子任务全部完成；点击记录可打开任务详情。
 										</TooltipContent>

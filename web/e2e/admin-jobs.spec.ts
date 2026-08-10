@@ -1947,6 +1947,16 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(
 		syncSettingsDialog.getByRole("slider", { name: "Release 抓取并发" }),
 	).toBeVisible();
+	const freshnessHelp = syncSettingsDialog.getByRole("button", {
+		name: "Dashboard 手动刷新新鲜度策略说明",
+	});
+	await freshnessHelp.hover();
+	await expect(page.getByRole("tooltip")).toContainText(
+		"仅作用于 Dashboard 全量同步，单仓窗口始终限制在 1–30 分钟。",
+	);
+	await expect(page.getByRole("tooltip")).toContainText(
+		"压力只会延长复用窗口，不会跳过有效关注仓库。",
+	);
 	await expect(
 		syncSettingsDialog.getByText("task-subscriptions-skipped"),
 	).toHaveCount(0);
