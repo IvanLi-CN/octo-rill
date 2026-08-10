@@ -9,7 +9,7 @@
 ## Goals
 
 - 在“我的发布”中提供默认关闭的“Webhook 推送”子开关。
-- 提供“全量注册 Webhook”“全量检查 Webhook”“批量删除 Webhook”以及逐仓注册/检查入口。
+- 提供“全部注册 Webhook”“全部检查 Webhook”“全部删除 Webhook”以及逐仓注册/检查入口。
 - 开启后立即注册，并由管理员配置的后台定时巡查查漏补缺；默认周期 7 天。
 - 权限错误按仓库暂停自动巡查，直到人工注册成功。
 - 验证 GitHub HMAC 签名并幂等接收新发布 Release 事件，再复用共享 Release 同步队列。
@@ -76,9 +76,9 @@
 - “Webhook 推送”位于 `/settings?section=my-releases` 现有卡片内，使用独立 Switch。
 - 卡片必须展示启用状态、PAT owner、已注册/缺失/权限暂停/可删除数量、最近与下次定时巡查。
 - 固定全量按钮名称：
-  - `全量注册 Webhook`
-  - `全量检查 Webhook`
-  - `批量删除 Webhook`
+  - `全部注册 Webhook`
+  - `全部检查 Webhook`
+  - `全部删除 Webhook`
 - 仓库行提供 `注册 Webhook` / `重新注册 Webhook` 和 `检查 Webhook`。
 - 页面不得出现可点击的“巡查”或“立即巡查”。
 - 权限错误必须给出 repo、失败原因与 classic PAT 修复指引；无 PAT 时链接到同一设置页的 GitHub PAT section。

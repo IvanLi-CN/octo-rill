@@ -799,7 +799,7 @@ export function SettingsPage(props: {
 			.then(async () => {
 				await loadWebhookPush();
 				setWebhookPushConfirmOpen(false);
-				setWebhookPushNotice("Webhook 推送已开启，全量注册任务已排队。");
+				setWebhookPushNotice("Webhook 推送已开启，全部注册任务已排队。");
 			})
 			.catch((err) =>
 				setWebhookPushError(err instanceof Error ? err.message : String(err)),
@@ -1688,7 +1688,7 @@ export function SettingsPage(props: {
 												) : (
 													<Webhook className="size-4" />
 												)}
-												全量注册 Webhook
+												全部注册 Webhook
 											</Button>
 											<Button
 												className="max-sm:min-h-11"
@@ -1704,7 +1704,7 @@ export function SettingsPage(props: {
 												) : (
 													<SearchCheck className="size-4" />
 												)}
-												全量检查 Webhook
+												全部检查 Webhook
 											</Button>
 											<Button
 												className="max-sm:min-h-11"
@@ -1722,7 +1722,7 @@ export function SettingsPage(props: {
 												) : (
 													<Trash2 className="size-4" />
 												)}
-												批量删除 Webhook
+												全部删除 Webhook
 											</Button>
 										</div>
 
@@ -1836,7 +1836,7 @@ export function SettingsPage(props: {
 											<span className="block">
 												每个 webhook 使用独立的加密 secret 验证 GitHub
 												签名；当前接收范围仅为新 Release，事件进入同步队列。
-												关闭状态保留已有 hooks 并忽略事件，批量删除仅针对
+												关闭状态保留已有 hooks 并忽略事件，全部删除仅针对
 												OctoRill 创建的 hooks。
 											</span>
 										</AlertDialogDescription>

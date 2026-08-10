@@ -663,7 +663,7 @@ pub async fn delete_all(
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "disable_webhook_push_first",
-            "请先关闭“Webhook 推送”，再批量删除 Webhook。",
+            "请先关闭“Webhook 推送”，再全部删除 Webhook。",
         ));
     }
     state

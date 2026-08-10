@@ -1038,18 +1038,18 @@ test("webhook push requires confirmation and exposes no patrol action", async ({
 	await expect(confirmation).toContainText("仅监听 Release");
 	await confirmation.getByRole("button", { name: "确认开启并注册" }).click();
 	await expect(
-		section.getByText("Webhook 推送已开启，全量注册任务已排队。", {
+		section.getByText("Webhook 推送已开启，全部注册任务已排队。", {
 			exact: true,
 		}),
 	).toBeVisible();
 	await expect(
-		section.getByRole("button", { name: "全量注册 Webhook" }),
+		section.getByRole("button", { name: "全部注册 Webhook" }),
 	).toBeVisible();
 	await expect(
-		section.getByRole("button", { name: "全量检查 Webhook" }),
+		section.getByRole("button", { name: "全部检查 Webhook" }),
 	).toBeVisible();
 	await expect(
-		section.getByRole("button", { name: "批量删除 Webhook" }),
+		section.getByRole("button", { name: "全部删除 Webhook" }),
 	).toBeVisible();
 	await expect(section.getByRole("button", { name: /巡查/ })).toHaveCount(0);
 });
