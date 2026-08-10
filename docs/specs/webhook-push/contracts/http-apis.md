@@ -20,5 +20,5 @@
 ## Receiver
 
 - `POST /api/webhooks/github/releases`
-- 必需 headers：`X-GitHub-Delivery`、`X-GitHub-Event`、`X-Hub-Signature-256`；`ping` 不要求已存在 release payload。
+- 必需 headers：`X-GitHub-Delivery`、`X-GitHub-Event`、`X-GitHub-Hook-ID`、`X-Hub-Signature-256`；`ping` 不要求已存在 release payload。
 - 成功响应 `{ "accepted": true, "queued": boolean, "reason": string }`。

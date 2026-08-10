@@ -54,9 +54,6 @@ fn user_operation_lock(user_id: &str) -> Arc<tokio::sync::Mutex<()>> {
 struct UserConfigRow {
     include_own_releases: i64,
     webhook_push_enabled: i64,
-    webhook_push_secret_ciphertext: Option<Vec<u8>>,
-    webhook_push_secret_nonce: Option<Vec<u8>>,
-    webhook_push_callback_key: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -243,9 +240,7 @@ fn callback_ready(state: &AppState) -> bool {
 async fn load_user_config(state: &AppState, user_id: &str) -> Result<UserConfigRow, ApiError> {
     sqlx::query_as::<_, UserConfigRow>(
         r#"
-        SELECT include_own_releases, webhook_push_enabled,
-               webhook_push_secret_ciphertext, webhook_push_secret_nonce,
-               webhook_push_callback_key
+        SELECT include_own_releases, webhook_push_enabled
         FROM users WHERE id = ?
         "#,
     )
@@ -380,46 +375,53 @@ async fn ensure_secret_and_key(
     state: &AppState,
     user_id: &str,
 ) -> Result<(String, String), ApiError> {
-    let config = load_user_config(state, user_id).await?;
-    if let (Some(ciphertext), Some(nonce), Some(key)) = (
-        config.webhook_push_secret_ciphertext,
-        config.webhook_push_secret_nonce,
-        config.webhook_push_callback_key,
-    ) {
-        let secret = state
-            .encryption_key
-            .decrypt_str(&ciphertext, &nonce)
-            .map_err(ApiError::internal)?;
-        return Ok((secret, key));
-    }
-    let secret = generate_secret();
-    let key = crate::local_id::generate_local_id();
-    let encrypted = state
-        .encryption_key
-        .encrypt_str(&secret)
-        .map_err(ApiError::internal)?;
-    let now = Utc::now().to_rfc3339();
-    state
+    let (_sqlite_write, mut tx) = state
         .sqlite_writer
-        .write_foreground("webhook_push_secret_seed", |_| async {
-            sqlx::query(
-                r#"
-                UPDATE users
-                SET webhook_push_secret_ciphertext = ?, webhook_push_secret_nonce = ?,
-                    webhook_push_callback_key = ?, updated_at = ?
-                WHERE id = ?
-                "#,
-            )
-            .bind(&encrypted.ciphertext)
-            .bind(&encrypted.nonce)
-            .bind(&key)
-            .bind(&now)
-            .bind(user_id)
-            .execute(&state.pool)
-            .await?;
-            Ok::<_, anyhow::Error>(())
-        })
+        .begin_immediate(&state.pool, "webhook_push_secret_seed")
         .await
+        .map_err(ApiError::internal)?;
+    let current = sqlx::query_as::<_, (Option<Vec<u8>>, Option<Vec<u8>>, Option<String>)>(
+        r#"
+        SELECT webhook_push_secret_ciphertext, webhook_push_secret_nonce,
+               webhook_push_callback_key
+        FROM users WHERE id = ?
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    let (ciphertext, nonce, key) = if let (Some(ciphertext), Some(nonce), Some(key)) = current {
+        (ciphertext, nonce, key)
+    } else {
+        let secret = generate_secret();
+        let key = crate::local_id::generate_local_id();
+        let encrypted = state
+            .encryption_key
+            .encrypt_str(&secret)
+            .map_err(ApiError::internal)?;
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET webhook_push_secret_ciphertext = ?, webhook_push_secret_nonce = ?,
+                webhook_push_callback_key = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&encrypted.ciphertext)
+        .bind(&encrypted.nonce)
+        .bind(&key)
+        .bind(Utc::now().to_rfc3339())
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+        (encrypted.ciphertext, encrypted.nonce, key)
+    };
+    tx.commit().await.map_err(ApiError::internal)?;
+    let secret = state
+        .encryption_key
+        .decrypt_str(&ciphertext, &nonce)
         .map_err(ApiError::internal)?;
     Ok((secret, key))
 }
@@ -775,8 +777,8 @@ async fn load_targets(
         ORDER BY lower(ob.repo_full_name)
         "#,
     )
+    .bind(owner_github_user_id)
     .bind(user_id)
-    .bind(Some(owner_github_user_id))
     .bind(owner_login)
     .bind(repo_id)
     .bind(repo_id)
@@ -1045,6 +1047,29 @@ fn is_permission_error(error: &GitHubCallError) -> bool {
         error.status,
         Some(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND)
     )
+}
+
+async fn pause_user_repos_for_permission_error(
+    state: &AppState,
+    user_id: &str,
+    error_code: &str,
+    error: &ApiError,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE webhook_push_repos
+        SET status = 'permission_paused', permission_paused = 1,
+            error_kind = ?, error_message = ?, updated_at = ?
+        WHERE user_id = ?
+        "#,
+    )
+    .bind(error_code)
+    .bind(error.to_string())
+    .bind(Utc::now().to_rfc3339())
+    .bind(user_id)
+    .execute(&state.pool)
+    .await?;
+    Ok(())
 }
 
 async fn persist_repo_state(
@@ -1362,9 +1387,28 @@ async fn execute_for_user_locked(
             )
         } else {
             let (token, owner_github_user_id, owner_login, allows_private) =
-                validate_pat(state, user_id)
-                    .await
-                    .map_err(|err| anyhow!(err.to_string()))?;
+                match validate_pat(state, user_id).await {
+                    Ok(value) => value,
+                    Err(error)
+                        if scheduled
+                            && matches!(
+                                error.code(),
+                                "pat_invalid"
+                                    | "pat_scope_missing"
+                                    | "pat_owner_mismatch"
+                                    | "classic_pat_required"
+                            ) =>
+                    {
+                        pause_user_repos_for_permission_error(state, user_id, error.code(), &error)
+                            .await?;
+                        return Ok(json!({
+                            "skipped": true,
+                            "reason": "permission_paused",
+                            "error_code": error.code()
+                        }));
+                    }
+                    Err(error) => return Err(anyhow!(error.to_string())),
+                };
             let (secret, key) = ensure_secret_and_key(state, user_id)
                 .await
                 .map_err(|err| anyhow!(err.to_string()))?;
@@ -1583,6 +1627,12 @@ fn verify_signature(secret: &str, signature: &str, body: &[u8]) -> bool {
     mac.verify_slice(&expected).is_ok()
 }
 
+fn has_valid_signature_format(signature: &str) -> bool {
+    signature.strip_prefix("sha256=").is_some_and(|value| {
+        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
 fn decode_hex(value: &str) -> std::result::Result<Vec<u8>, ()> {
     if !value.len().is_multiple_of(2) {
         return Err(());
@@ -1644,6 +1694,13 @@ pub async fn receive(
                 "X-Hub-Signature-256 is required",
             )
         })?;
+    if !has_valid_signature_format(signature) {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_signature",
+            "X-Hub-Signature-256 is malformed",
+        ));
+    }
     let row = sqlx::query_as::<_, (String, i64, i64, Vec<u8>, Vec<u8>, i64, String)>(
         r#"
         SELECT u.id, u.include_own_releases, u.webhook_push_enabled,
@@ -1779,6 +1836,16 @@ mod tests {
     #[test]
     fn signature_verification_rejects_wrong_digest() {
         assert!(!verify_signature("secret", "sha256=00", b"payload"));
+    }
+
+    #[test]
+    fn signature_format_requires_sha256_hex_digest() {
+        assert!(has_valid_signature_format(
+            "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17"
+        ));
+        for signature in ["garbage", "sha256=xyz", "sha256=00", "sha1=757107ea"] {
+            assert!(!has_valid_signature_format(signature));
+        }
     }
 
     fn release_payload(action: &str, repo_id: i64, draft: bool) -> ReleasePayload {

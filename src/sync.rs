@@ -3951,6 +3951,7 @@ async fn attach_and_wait_for_user_release_demand_with_freshness(
         reason,
         freshness.as_mut(),
         &snapshots,
+        false,
     )
     .await?;
 
@@ -4029,13 +4030,16 @@ pub async fn enqueue_user_repo_release_sync(
         full_name: full_name.to_owned(),
         is_new_repo: false,
     }];
-    let attached = attach_release_demand(
+    let attached = attach_release_demand_with_freshness(
         state,
         None,
         Some(user_id),
         &repos,
         RepoReleaseOrigin::Interactive,
         "webhook_release",
+        None,
+        &HashMap::new(),
+        true,
     )
     .await?;
     Ok(attached.reused_fresh > 0)
@@ -4058,6 +4062,7 @@ async fn attach_release_demand(
         reason,
         None,
         &HashMap::new(),
+        false,
     )
     .await
 }
@@ -4072,6 +4077,7 @@ async fn attach_release_demand_with_freshness(
     reason: &str,
     mut freshness: Option<&mut DashboardReleaseFreshnessPolicy>,
     snapshots: &HashMap<i64, usize>,
+    force_refresh: bool,
 ) -> Result<AttachReleaseDemandResult> {
     let mut result = AttachReleaseDemandResult {
         repos: repos.len(),
@@ -4147,14 +4153,15 @@ async fn attach_release_demand_with_freshness(
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        let is_fresh = adaptive_assessment
-            .as_ref()
-            .is_some_and(|assessment| assessment.decision == "reused_fresh")
-            || (adaptive_assessment.is_none()
-                && existing
-                    .as_ref()
-                    .and_then(|item| item.last_success_at.as_deref())
-                    .is_some_and(|value| value >= freshness_cutoff.as_str()));
+        let is_fresh = !force_refresh
+            && (adaptive_assessment
+                .as_ref()
+                .is_some_and(|assessment| assessment.decision == "reused_fresh")
+                || (adaptive_assessment.is_none()
+                    && existing
+                        .as_ref()
+                        .and_then(|item| item.last_success_at.as_deref())
+                        .is_some_and(|value| value >= freshness_cutoff.as_str())));
         let work_item_id = if let Some(existing) = existing {
             let next_priority = existing.priority.max(origin.priority());
             let next_origin = if next_priority == REPO_RELEASE_PRIORITY_INTERACTIVE {
@@ -18621,6 +18628,7 @@ mod tests {
             "access_refresh",
             Some(&mut policy),
             &snapshots,
+            false,
         )
         .await
         .expect("attach failed work item demand");
