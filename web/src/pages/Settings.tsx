@@ -1389,6 +1389,7 @@ export function SettingsPage(props: {
 											</Button>
 										) : (
 											<Button
+												className="max-sm:min-h-11"
 												size="sm"
 												disabled={!linuxdoAvailable}
 												onClick={onConnectLinuxDo}
@@ -1668,6 +1669,7 @@ export function SettingsPage(props: {
 
 										<div className="mt-4 flex flex-wrap gap-2">
 											<Button
+												className="max-sm:min-h-11"
 												size="sm"
 												variant="outline"
 												disabled={
@@ -1683,6 +1685,7 @@ export function SettingsPage(props: {
 												全量注册 Webhook
 											</Button>
 											<Button
+												className="max-sm:min-h-11"
 												size="sm"
 												variant="outline"
 												disabled={
@@ -1698,6 +1701,7 @@ export function SettingsPage(props: {
 												全量检查 Webhook
 											</Button>
 											<Button
+												className="max-sm:min-h-11"
 												size="sm"
 												variant="destructive"
 												disabled={
@@ -1756,6 +1760,7 @@ export function SettingsPage(props: {
 														</div>
 														<div className="flex shrink-0 gap-2">
 															<Button
+																className="max-sm:min-h-11"
 																size="sm"
 																variant="outline"
 																disabled={
