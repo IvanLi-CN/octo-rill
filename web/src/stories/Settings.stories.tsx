@@ -321,23 +321,9 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 		if (request.pathname === "/api/me/webhook-push" && method === "PATCH") {
 			return jsonResponse({
 				enabled: JSON.parse(String(init?.body ?? "{}")).enabled,
-				include_own_releases: profile.include_own_releases,
-				callback_ready: true,
-				pat: { configured: true, valid: true, owner_login: "storybook-user" },
-				summary: {
-					total: 0,
-					registered: 0,
-					missing: 0,
-					permission_paused: 0,
-					errors: 0,
-					removable: 0,
-				},
-				schedule: {
-					audit_interval_days: 7,
-					last_started_at: null,
-					next_started_at: null,
-				},
-				repos: [],
+				task_id: "storybook-webhook-task",
+				status: "queued",
+				reused: false,
 			});
 		}
 		if (

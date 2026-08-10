@@ -400,9 +400,9 @@ async function installSettingsMocks(
 			);
 			return json(route, {
 				enabled: webhookPushEnabled,
-				task: webhookPushEnabled
-					? { task_id: "webhook-task", status: "queued", reused: false }
-					: null,
+				task_id: webhookPushEnabled ? "webhook-task" : null,
+				status: webhookPushEnabled ? "queued" : null,
+				reused: false,
 			});
 		}
 
@@ -1028,6 +1028,7 @@ test("webhook push requires confirmation and exposes no patrol action", async ({
 
 	await page.goto("/settings?section=my-releases");
 	const section = page.locator('[data-settings-section="my-releases"]');
+	await expect(section).toContainText("PAT 所属账号：@storybook-user");
 	await section.getByRole("switch", { name: "Webhook 推送" }).click();
 
 	const confirmation = page.getByRole("alertdialog", {

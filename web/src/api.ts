@@ -373,7 +373,9 @@ export type WebhookPushTaskResponse = {
 };
 export type WebhookPushPatchResponse = {
 	enabled: boolean;
-	task: WebhookPushTaskResponse | null;
+	task_id: string | null;
+	status: string | null;
+	reused: boolean;
 };
 export type AdminWebhookPushRuntimeConfigResponse = {
 	audit_interval_days: number;

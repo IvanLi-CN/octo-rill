@@ -4018,6 +4018,29 @@ pub async fn enqueue_public_repo_release_sync(
     Ok(attached.reused_fresh > 0)
 }
 
+pub async fn enqueue_user_repo_release_sync(
+    state: &AppState,
+    user_id: &str,
+    repo_id: i64,
+    full_name: &str,
+) -> Result<bool> {
+    let repos = [ReleaseDemandRepo {
+        repo_id,
+        full_name: full_name.to_owned(),
+        is_new_repo: false,
+    }];
+    let attached = attach_release_demand(
+        state,
+        None,
+        Some(user_id),
+        &repos,
+        RepoReleaseOrigin::Interactive,
+        "webhook_release",
+    )
+    .await?;
+    Ok(attached.reused_fresh > 0)
+}
+
 async fn attach_release_demand(
     state: &AppState,
     task_id: Option<&str>,

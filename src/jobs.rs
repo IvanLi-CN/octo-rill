@@ -1112,6 +1112,44 @@ pub async fn enqueue_singleton_task_for_requester(
     enqueue_task(state, new_task).await
 }
 
+pub async fn enqueue_singleton_task_for_requester_and_payload(
+    state: &AppState,
+    new_task: NewTask,
+) -> Result<EnqueuedTask> {
+    let _guard = task_singleton_enqueue_lock().lock().await;
+    let requested_by = new_task
+        .requested_by
+        .as_deref()
+        .context("payload singleton task requires requested_by")?;
+    let payload_json = serde_json::to_string(&new_task.payload).context("serialize payload")?;
+    let existing = sqlx::query_as::<_, (String, String, String)>(
+        r#"
+        SELECT id, task_type, status
+        FROM job_tasks
+        WHERE task_type = ? AND requested_by = ? AND payload_json = ?
+          AND status IN (?, ?)
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(&new_task.task_type)
+    .bind(requested_by)
+    .bind(payload_json)
+    .bind(STATUS_QUEUED)
+    .bind(STATUS_RUNNING)
+    .fetch_optional(&state.pool)
+    .await
+    .context("failed to find inflight task by requester and payload")?;
+    if let Some((task_id, task_type, status)) = existing {
+        return Ok(EnqueuedTask {
+            task_id,
+            task_type,
+            status,
+        });
+    }
+    enqueue_task(state, new_task).await
+}
+
 pub async fn start_inline_task(state: &AppState, new_task: NewTask) -> Result<EnqueuedTask> {
     let now = Utc::now().to_rfc3339();
     let task_id = insert_task_record(
@@ -3979,15 +4017,17 @@ mod tests {
         NewTask, RetryTranslationCandidateRow, SMART_NO_VALUABLE_VERSION_INFO, STATUS_FAILED,
         STATUS_QUEUED, STATUS_RUNNING, TASK_BRIEF_DAILY_SLOT, TASK_BRIEF_HISTORY_RECOMPUTE,
         TASK_BRIEF_REFRESH_CONTENT, TASK_RETRY_RECENT_FAILURES, TASK_SUMMARIZE_RELEASE_SMART_BATCH,
-        TASK_SYNC_ALL, TASK_SYNC_RELEASES, TASK_SYNC_SUBSCRIPTIONS, TranslationStreamCursor,
-        claim_next_queued_task, current_recent_failures_retry_schedule_key,
-        current_subscription_schedule_key, enqueue_brief_history_recompute_if_needed,
-        enqueue_brief_refresh_content_if_needed, enqueue_hour_slot_if_due,
-        enqueue_recent_failures_retry_if_due, enqueue_task, execute_brief_history_recompute_task,
-        execute_brief_refresh_content_task, execute_daily_slot_task, execute_sync_all_task_with,
-        is_scheduled_task_type, load_due_daily_slot_users,
-        load_recent_failed_brief_retry_candidates, load_recent_failed_translation_retry_candidates,
-        load_translation_stream_cursor, load_translation_stream_rows, mark_brief_generation_source,
+        TASK_SYNC_ALL, TASK_SYNC_RELEASES, TASK_SYNC_SUBSCRIPTIONS, TASK_WEBHOOK_PUSH_AUDIT,
+        TranslationStreamCursor, claim_next_queued_task,
+        current_recent_failures_retry_schedule_key, current_subscription_schedule_key,
+        enqueue_brief_history_recompute_if_needed, enqueue_brief_refresh_content_if_needed,
+        enqueue_hour_slot_if_due, enqueue_recent_failures_retry_if_due,
+        enqueue_singleton_task_for_requester_and_payload, enqueue_task,
+        execute_brief_history_recompute_task, execute_brief_refresh_content_task,
+        execute_daily_slot_task, execute_sync_all_task_with, is_scheduled_task_type,
+        load_due_daily_slot_users, load_recent_failed_brief_retry_candidates,
+        load_recent_failed_translation_retry_candidates, load_translation_stream_cursor,
+        load_translation_stream_rows, mark_brief_generation_source,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
         recover_runtime_state, recover_runtime_state_on_startup, retry_candidate_is_retryable,
         run_account_pause_maintenance_if_due, update_daily_brief_hour_slot_dispatch,
@@ -4007,6 +4047,72 @@ mod tests {
         state::{AppState, build_oauth_client},
         sync,
     };
+
+    #[tokio::test]
+    async fn requester_payload_singleton_keeps_distinct_webhook_operations() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            "INSERT INTO users (id, github_user_id, login, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind("webhook-user")
+        .bind(9001_i64)
+        .bind("webhook-user")
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("insert webhook user");
+        let build_task = |operation: &str, repo_id: Option<i64>| NewTask {
+            task_type: "webhook.push.manage".to_owned(),
+            payload: json!({
+                "user_id": "webhook-user",
+                "operation": operation,
+                "repo_id": repo_id,
+            }),
+            source: "test".to_owned(),
+            requested_by: Some("webhook-user".to_owned()),
+            parent_task_id: None,
+        };
+
+        let first = enqueue_singleton_task_for_requester_and_payload(
+            state.as_ref(),
+            build_task("register", Some(1)),
+        )
+        .await
+        .expect("enqueue first task");
+        let reused = enqueue_singleton_task_for_requester_and_payload(
+            state.as_ref(),
+            build_task("register", Some(1)),
+        )
+        .await
+        .expect("reuse identical task");
+        let other_repo = enqueue_singleton_task_for_requester_and_payload(
+            state.as_ref(),
+            build_task("register", Some(2)),
+        )
+        .await
+        .expect("enqueue other repo task");
+        let delete = enqueue_singleton_task_for_requester_and_payload(
+            state.as_ref(),
+            build_task("delete", None),
+        )
+        .await
+        .expect("enqueue delete task");
+
+        assert_eq!(first.task_id, reused.task_id);
+        assert_ne!(first.task_id, other_repo.task_id);
+        assert_ne!(first.task_id, delete.task_id);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM job_tasks WHERE requested_by = 'webhook-user'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count webhook tasks"),
+            3
+        );
+    }
 
     #[test]
     fn current_subscription_schedule_key_uses_configured_minute_buckets() {
@@ -4379,6 +4485,7 @@ mod tests {
         assert!(is_scheduled_task_type(TASK_BRIEF_DAILY_SLOT));
         assert!(is_scheduled_task_type(TASK_SYNC_SUBSCRIPTIONS));
         assert!(is_scheduled_task_type(TASK_RETRY_RECENT_FAILURES));
+        assert!(is_scheduled_task_type(TASK_WEBHOOK_PUSH_AUDIT));
         assert!(!is_scheduled_task_type("translate.release"));
         assert!(!is_scheduled_task_type(TASK_SUMMARIZE_RELEASE_SMART_BATCH));
     }

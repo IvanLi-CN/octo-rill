@@ -1578,6 +1578,11 @@ export function SettingsPage(props: {
 													接收个人 owner 仓库的新 Release 通知，并进入现有
 													Release 同步任务。
 												</p>
+												{webhookPush?.pat.owner_login ? (
+													<p className="text-muted-foreground text-sm">
+														PAT 所属账号：@{webhookPush.pat.owner_login}
+													</p>
+												) : null}
 											</div>
 											<Switch
 												checked={webhookPush?.enabled ?? false}
@@ -1757,6 +1762,15 @@ export function SettingsPage(props: {
 																	{repo.error_message}
 																</p>
 															) : null}
+															{repo.permission_paused ? (
+																<InternalLink
+																	className="inline-flex text-sm underline underline-offset-4"
+																	href={buildSettingsHref("github-pat")}
+																	to={buildSettingsHref("github-pat")}
+																>
+																	更新 classic PAT 的 repo 或 public_repo 权限
+																</InternalLink>
+															) : null}
 														</div>
 														<div className="flex shrink-0 gap-2">
 															<Button
@@ -1774,9 +1788,12 @@ export function SettingsPage(props: {
 																	)
 																}
 															>
-																注册
+																{repo.status === "registered"
+																	? "重新注册 Webhook"
+																	: "注册 Webhook"}
 															</Button>
 															<Button
+																className="max-sm:min-h-11"
 																size="sm"
 																variant="ghost"
 																disabled={
@@ -1790,7 +1807,7 @@ export function SettingsPage(props: {
 																	)
 																}
 															>
-																检查
+																检查 Webhook
 															</Button>
 														</div>
 													</div>

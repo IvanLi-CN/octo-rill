@@ -3886,9 +3886,10 @@ pub async fn admin_list_realtime_tasks(
     let task_type = query.task_type.unwrap_or_default();
     let exclude_task_type = query.exclude_task_type.unwrap_or_default();
     let task_group = query.task_group.unwrap_or_else(|| "all".to_owned());
-    let scheduled_daily_task = jobs::SCHEDULED_TASK_TYPES[0];
-    let scheduled_subscription_task = jobs::SCHEDULED_TASK_TYPES[1];
-    let scheduled_retry_task = jobs::SCHEDULED_TASK_TYPES[2];
+    let scheduled_tasks = jobs::SCHEDULED_TASK_TYPES
+        .iter()
+        .map(|task| (*task).to_owned())
+        .collect::<Vec<_>>();
     let mut total_query =
         QueryBuilder::<sqlx::Sqlite>::new("SELECT COUNT(*) FROM job_tasks WHERE 1 = 1");
     append_admin_realtime_task_filters(
@@ -3897,11 +3898,7 @@ pub async fn admin_list_realtime_tasks(
         task_type.clone(),
         exclude_task_type.clone(),
         task_group.clone(),
-        [
-            scheduled_daily_task.to_owned(),
-            scheduled_subscription_task.to_owned(),
-            scheduled_retry_task.to_owned(),
-        ],
+        &scheduled_tasks,
     );
     let total = total_query
         .build_query_scalar::<i64>()
@@ -3935,11 +3932,7 @@ pub async fn admin_list_realtime_tasks(
         task_type,
         exclude_task_type,
         task_group.clone(),
-        [
-            jobs::TASK_BRIEF_DAILY_SLOT.to_owned(),
-            jobs::TASK_SYNC_SUBSCRIPTIONS.to_owned(),
-            jobs::TASK_RETRY_RECENT_FAILURES.to_owned(),
-        ],
+        &scheduled_tasks,
     );
     items_query.push(" ORDER BY created_at DESC, id DESC LIMIT ");
     items_query.push_bind(page_size);
@@ -3972,13 +3965,13 @@ pub async fn admin_list_realtime_tasks(
     }))
 }
 
-fn append_admin_realtime_task_filters(
-    query: &mut QueryBuilder<'_, sqlx::Sqlite>,
+fn append_admin_realtime_task_filters<'a>(
+    query: &mut QueryBuilder<'a, sqlx::Sqlite>,
     status: String,
     task_type: String,
     exclude_task_type: String,
     task_group: String,
-    scheduled_tasks: [String; 3],
+    scheduled_tasks: &'a [String],
 ) {
     if status != "all" {
         query.push(" AND status = ");

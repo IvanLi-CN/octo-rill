@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use anyhow::{Context, Result, anyhow};
 use axum::{
@@ -35,6 +38,17 @@ const STATUS_DELETE_PENDING: &str = "delete_pending";
 const DELIVERY_RETENTION_DAYS: i64 = 30;
 
 type HmacSha256 = Hmac<Sha256>;
+
+fn user_operation_lock(user_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("webhook operation lock poisoned")
+        .entry(user_id.to_owned())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 #[derive(Debug, sqlx::FromRow)]
 struct UserConfigRow {
@@ -553,9 +567,12 @@ pub async fn patch_settings(
     } else {
         None
     };
+    let task = task.map(task_response);
     Ok(Json(json!({
         "enabled": request.enabled,
-        "task": task.map(task_response),
+        "task_id": task.as_ref().map(|task| task.task_id.as_str()),
+        "status": task.as_ref().map(|task| task.status.as_str()),
+        "reused": task.as_ref().is_some_and(|task| task.reused),
     })))
 }
 
@@ -575,7 +592,7 @@ async fn enqueue_manage(
     repo_id: Option<i64>,
     source: &str,
 ) -> Result<EnqueuedTask, ApiError> {
-    jobs::enqueue_singleton_task_for_requester(
+    jobs::enqueue_singleton_task_for_requester_and_payload(
         state,
         NewTask {
             task_type: jobs::TASK_WEBHOOK_PUSH_MANAGE.to_owned(),
@@ -974,13 +991,16 @@ async fn run_repo_operation(
                 return Ok("deleted");
             }
             Err(error) => {
-                persist_repo_state(
-                    state,
-                    user_id,
-                    repo,
-                    callback,
-                    (STATUS_ERROR, Some(hook_id), Some(&error), false),
+                sqlx::query(
+                    "UPDATE webhook_push_repos SET status = ?, error_kind = ?, error_message = ?, updated_at = ? WHERE user_id = ? AND repo_id = ?",
                 )
+                .bind(STATUS_ERROR)
+                .bind(if is_permission_error(&error) { "permission" } else { "github_error" })
+                .bind(&error.message)
+                .bind(Utc::now().to_rfc3339())
+                .bind(user_id)
+                .bind(repo.repo_id)
+                .execute(&state.pool)
                 .await?;
                 return Ok("failed");
             }
@@ -1102,6 +1122,8 @@ async fn execute_for_user(
     repo_id: Option<i64>,
     scheduled: bool,
 ) -> Result<Value> {
+    let operation_lock = user_operation_lock(user_id);
+    let _operation_guard = operation_lock.lock().await;
     let config = load_user_config(state, user_id)
         .await
         .map_err(|err| anyhow!(err.to_string()))?;
@@ -1110,13 +1132,22 @@ async fn execute_for_user(
     {
         return Ok(json!({"skipped": true, "reason": "disabled"}));
     }
-    let (token, owner_login, allows_private) = validate_pat(state, user_id)
-        .await
-        .map_err(|err| anyhow!(err.to_string()))?;
-    let (secret, key) = ensure_secret_and_key(state, user_id)
-        .await
-        .map_err(|err| anyhow!(err.to_string()))?;
-    let callback = callback_url(state, &key).map_err(|err| anyhow!(err.to_string()))?;
+    let (token, owner_login, allows_private, secret, callback) = if operation == OP_DELETE {
+        let (_, token) = load_pat(state, user_id)
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?
+            .ok_or_else(|| anyhow!("GitHub PAT is not configured"))?;
+        (token, String::new(), false, String::new(), String::new())
+    } else {
+        let (token, owner_login, allows_private) = validate_pat(state, user_id)
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let (secret, key) = ensure_secret_and_key(state, user_id)
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let callback = callback_url(state, &key).map_err(|err| anyhow!(err.to_string()))?;
+        (token, owner_login, allows_private, secret, callback)
+    };
     if operation == OP_REGISTER
         && let Err(error) = sync::refresh_owned_repo_release_visibility(state, user_id).await
     {
@@ -1356,14 +1387,12 @@ pub async fn receive(
     .bind(&query.key)
     .fetch_optional(&state.pool)
     .await
-    .map_err(ApiError::internal)?
-    .ok_or_else(|| {
-        ApiError::new(
-            StatusCode::NOT_FOUND,
-            "webhook_not_found",
-            "Webhook endpoint not found",
-        )
-    })?;
+    .map_err(ApiError::internal)?;
+    let Some(row) = row else {
+        return Ok(Json(
+            json!({"accepted": true, "queued": false, "reason": "unknown_hook"}),
+        ));
+    };
     let secret = state
         .encryption_key
         .decrypt_str(&row.3, &row.4)
@@ -1409,10 +1438,26 @@ pub async fn receive(
         ));
     }
     let repo = repo.expect("repo checked above");
-    let reused_fresh =
-        sync::enqueue_public_repo_release_sync(state.as_ref(), repo.id, &repo.full_name)
+    let reused_fresh = match sync::enqueue_user_repo_release_sync(
+        state.as_ref(),
+        &row.0,
+        repo.id,
+        &repo.full_name,
+    )
+    .await
+    {
+        Ok(reused_fresh) => reused_fresh,
+        Err(error) => {
+            sqlx::query(
+                "DELETE FROM webhook_push_deliveries WHERE delivery_id = ? AND queued_task_id IS NULL",
+            )
+            .bind(delivery)
+            .execute(&state.pool)
             .await
             .map_err(ApiError::internal)?;
+            return Err(ApiError::internal(error));
+        }
+    };
     sqlx::query("UPDATE webhook_push_deliveries SET queued_task_id = ? WHERE delivery_id = ?")
         .bind(format!("repo-release:{}", repo.id))
         .bind(delivery)
