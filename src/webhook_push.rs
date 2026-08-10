@@ -1157,10 +1157,12 @@ async fn execute_for_user(
     let config = load_user_config(state, user_id)
         .await
         .map_err(|err| anyhow!(err.to_string()))?;
-    if operation != OP_DELETE
-        && (config.include_own_releases == 0 || config.webhook_push_enabled == 0)
-    {
-        return Ok(json!({"skipped": true, "reason": "disabled"}));
+    if config.include_own_releases == 0 || config.webhook_push_enabled == 0 {
+        if operation != OP_DELETE {
+            return Ok(json!({"skipped": true, "reason": "disabled"}));
+        }
+    } else if operation == OP_DELETE {
+        return Ok(json!({"skipped": true, "reason": "re_enabled"}));
     }
     let (token, owner_login, allows_private, secret, callback) = if operation == OP_DELETE {
         let (_, token) = load_pat(state, user_id)
