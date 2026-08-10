@@ -1087,4 +1087,16 @@ export const WebhookDeleteReady: Story = {
 			),
 		},
 	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("button", { name: "全部删除 Webhook" }),
+		).toBeVisible();
+		await expect(
+			canvas.queryByRole("button", { name: /注册 Webhook/ }),
+		).not.toBeInTheDocument();
+		await expect(
+			canvas.queryByRole("button", { name: "检查" }),
+		).not.toBeInTheDocument();
+	},
 };

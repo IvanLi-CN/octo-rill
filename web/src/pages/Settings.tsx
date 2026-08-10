@@ -1674,56 +1674,58 @@ export function SettingsPage(props: {
 										</div>
 
 										<div className="mt-4 flex flex-wrap gap-2">
-											<Button
-												className="max-sm:min-h-11"
-												size="sm"
-												variant="outline"
-												disabled={
-													!webhookPush?.enabled || webhookPushBusy !== null
-												}
-												onClick={() => void runWebhookPushAction("register")}
-											>
-												{webhookPushBusy === "register" ? (
-													<LoaderCircle className="size-4 animate-spin" />
-												) : (
-													<Webhook className="size-4" />
-												)}
-												全部注册 Webhook
-											</Button>
-											<Button
-												className="max-sm:min-h-11"
-												size="sm"
-												variant="outline"
-												disabled={
-													!webhookPush?.enabled || webhookPushBusy !== null
-												}
-												onClick={() => void runWebhookPushAction("check")}
-											>
-												{webhookPushBusy === "check" ? (
-													<LoaderCircle className="size-4 animate-spin" />
-												) : (
-													<SearchCheck className="size-4" />
-												)}
-												全部检查 Webhook
-											</Button>
-											<Button
-												className="max-sm:min-h-11"
-												size="sm"
-												variant="destructive"
-												disabled={
-													webhookPush?.enabled !== false ||
-													(webhookPush?.summary.removable ?? 0) === 0 ||
-													webhookPushBusy !== null
-												}
-												onClick={() => void runWebhookPushAction("delete")}
-											>
-												{webhookPushBusy === "delete" ? (
-													<LoaderCircle className="size-4 animate-spin" />
-												) : (
-													<Trash2 className="size-4" />
-												)}
-												全部删除 Webhook
-											</Button>
+											{webhookPush?.enabled ? (
+												<>
+													<Button
+														className="max-sm:min-h-11"
+														size="sm"
+														variant="outline"
+														disabled={webhookPushBusy !== null}
+														onClick={() =>
+															void runWebhookPushAction("register")
+														}
+													>
+														{webhookPushBusy === "register" ? (
+															<LoaderCircle className="size-4 animate-spin" />
+														) : (
+															<Webhook className="size-4" />
+														)}
+														全部注册 Webhook
+													</Button>
+													<Button
+														className="max-sm:min-h-11"
+														size="sm"
+														variant="outline"
+														disabled={webhookPushBusy !== null}
+														onClick={() => void runWebhookPushAction("check")}
+													>
+														{webhookPushBusy === "check" ? (
+															<LoaderCircle className="size-4 animate-spin" />
+														) : (
+															<SearchCheck className="size-4" />
+														)}
+														全部检查 Webhook
+													</Button>
+												</>
+											) : (
+												<Button
+													className="max-sm:min-h-11"
+													size="sm"
+													variant="destructive"
+													disabled={
+														(webhookPush?.summary.removable ?? 0) === 0 ||
+														webhookPushBusy !== null
+													}
+													onClick={() => void runWebhookPushAction("delete")}
+												>
+													{webhookPushBusy === "delete" ? (
+														<LoaderCircle className="size-4 animate-spin" />
+													) : (
+														<Trash2 className="size-4" />
+													)}
+													全部删除 Webhook
+												</Button>
+											)}
 										</div>
 
 										{webhookPush?.repos.length ? (
@@ -1773,44 +1775,46 @@ export function SettingsPage(props: {
 																</InternalLink>
 															) : null}
 														</div>
-														<div className="flex shrink-0 gap-2">
-															<Button
-																className="max-sm:min-h-11"
-																size="sm"
-																variant="outline"
-																disabled={
-																	!webhookPush.enabled ||
-																	webhookPushBusy !== null
-																}
-																onClick={() =>
-																	void runWebhookPushAction(
-																		"register",
-																		repo.repo_id,
-																	)
-																}
-															>
-																{repo.status === "registered"
-																	? "重新注册 Webhook"
-																	: "注册 Webhook"}
-															</Button>
-															<Button
-																className="max-sm:min-h-11"
-																size="sm"
-																variant="ghost"
-																disabled={
-																	!webhookPush.enabled ||
-																	webhookPushBusy !== null
-																}
-																onClick={() =>
-																	void runWebhookPushAction(
-																		"check",
-																		repo.repo_id,
-																	)
-																}
-															>
-																检查 Webhook
-															</Button>
-														</div>
+														{webhookPush.enabled ? (
+															<div className="flex shrink-0 gap-2">
+																<Button
+																	className="max-sm:min-h-11"
+																	size="sm"
+																	variant="outline"
+																	disabled={
+																		!webhookPush.enabled ||
+																		webhookPushBusy !== null
+																	}
+																	onClick={() =>
+																		void runWebhookPushAction(
+																			"register",
+																			repo.repo_id,
+																		)
+																	}
+																>
+																	{repo.status === "registered"
+																		? "重新注册 Webhook"
+																		: "注册 Webhook"}
+																</Button>
+																<Button
+																	className="max-sm:min-h-11"
+																	size="sm"
+																	variant="ghost"
+																	disabled={
+																		!webhookPush.enabled ||
+																		webhookPushBusy !== null
+																	}
+																	onClick={() =>
+																		void runWebhookPushAction(
+																			"check",
+																			repo.repo_id,
+																		)
+																	}
+																>
+																	检查
+																</Button>
+															</div>
+														) : null}
 													</div>
 												))}
 											</div>

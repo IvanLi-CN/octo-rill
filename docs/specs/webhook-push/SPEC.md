@@ -79,7 +79,7 @@
   - `全部注册 Webhook`
   - `全部检查 Webhook`
   - `全部删除 Webhook`
-- 仓库行提供 `注册 Webhook` / `重新注册 Webhook` 和 `检查 Webhook`。
+- 仓库行提供 `注册 Webhook` / `重新注册 Webhook` 和 `检查`。
 - 页面不得出现可点击的“巡查”或“立即巡查”。
 - 权限错误必须给出 repo、失败原因与 classic PAT 修复指引；无 PAT 时链接到同一设置页的 GitHub PAT section。
 
@@ -103,4 +103,4 @@ PR: include
 ![Webhook 权限暂停与部分成功状态](./assets/webhook-permission-paused-desktop.png)
 
 PR: include
-![Webhook 关闭后移动端批量删除状态](./assets/webhook-delete-ready-mobile.png)
+![Webhook 关闭状态下移动端全部删除](./assets/webhook-delete-ready-mobile.png)

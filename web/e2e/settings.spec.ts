@@ -1050,7 +1050,7 @@ test("webhook push requires confirmation and exposes no patrol action", async ({
 	).toBeVisible();
 	await expect(
 		section.getByRole("button", { name: "全部删除 Webhook" }),
-	).toBeVisible();
+	).toHaveCount(0);
 	await expect(section.getByRole("button", { name: /巡查/ })).toHaveCount(0);
 });
 
