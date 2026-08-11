@@ -15,6 +15,11 @@ import type {
 	PersonalReposResponse,
 	ReleaseDetailResponse,
 } from "@/api";
+import {
+	AppToastProvider,
+	AppToastViewportHost,
+	useAppToast,
+} from "@/components/feedback/AppToast";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -2873,6 +2878,59 @@ function makeSmartRetryErrorFeed(): FeedItem[] {
 			},
 		}),
 	];
+}
+
+function SmartFailureToastPreview() {
+	const { pushErrorToast } = useAppToast();
+	const cardRef = useRef<HTMLDivElement>(null);
+	const attemptRef = useRef(0);
+	const item = makeSmartRetryErrorFeed()[0] as ReleaseFeedItem;
+
+	const triggerFailure = () => {
+		attemptRef.current += 1;
+		pushErrorToast(
+			"润色触发失败",
+			`第 ${attemptRef.current} 次失败：上游模型拒绝请求。`,
+			{
+				dedupeKey: "dashboard-feed:smart:release:50005",
+				actionLabel: "定位到卡片",
+				onAction: () => {
+					const element = cardRef.current;
+					if (!element) return;
+					element.scrollIntoView({ block: "center", behavior: "smooth" });
+					element.focus({ preventScroll: true });
+				},
+			},
+		);
+	};
+
+	return (
+		<div className="min-h-[900px] bg-background px-4 py-6">
+			<div className="mx-auto flex w-full max-w-2xl flex-col gap-4">
+				<Button type="button" variant="outline" onClick={triggerFailure}>
+					模拟失败
+				</Button>
+				<div ref={cardRef} data-feed-item-key="release:50005" tabIndex={-1}>
+					<FeedItemCard
+						item={item}
+						currentViewer={STORYBOOK_VIEWER}
+						activeLane="smart"
+						isTranslating={false}
+						isTranslationAutoRetrying={false}
+						isSmartGenerating={false}
+						isSmartAutoRetrying={false}
+						isReactionBusy={false}
+						reactionError={null}
+						onSelectLane={() => {}}
+						onTranslateNow={() => {}}
+						onSmartNow={triggerFailure}
+						onToggleReaction={() => {}}
+					/>
+				</div>
+			</div>
+			<AppToastViewportHost />
+		</div>
+	);
 }
 
 function makeSmartInsufficientFeed(): FeedItem[] {
@@ -6280,6 +6338,44 @@ export const SmartRetryActionLoading: Story = {
 		expect(icon).not.toBeNull();
 		expect(icon?.classList.contains("animate-spin")).toBe(true);
 		await expect(canvas.getByText("润色失败", { exact: true })).toBeVisible();
+	},
+};
+
+export const SmartFailureToastLocateCard: Story = {
+	args: {
+		initialTab: "releases",
+		feedMode: "smart-retry-error",
+	},
+	render: () => (
+		<AppToastProvider>
+			<SmartFailureToastPreview />
+		</AppToastProvider>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"同一卡片连续两次润色失败会刷新同一条 toast，并保留定位到卡片的操作；点击后卡片滚动到视口并获得程序化焦点。",
+			},
+		},
+	},
+	play: async ({ canvasElement, userEvent }) => {
+		const canvas = within(canvasElement);
+		const retryButton = canvas.getByRole("button", { name: "重试润色" });
+		await userEvent.click(retryButton);
+		await userEvent.click(retryButton);
+		expect(canvas.getAllByText("润色触发失败", { exact: true })).toHaveLength(
+			1,
+		);
+		expect(canvas.getAllByRole("button", { name: "定位到卡片" })).toHaveLength(
+			1,
+		);
+		await userEvent.click(canvas.getByRole("button", { name: "定位到卡片" }));
+		await waitFor(() => {
+			expect(document.activeElement?.getAttribute("data-feed-item-key")).toBe(
+				"release:50005",
+			);
+		});
 	},
 };
 

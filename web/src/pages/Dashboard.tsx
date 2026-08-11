@@ -1977,6 +1977,16 @@ export function Dashboard(props: {
 		queryClient,
 		routeSelectedBriefId,
 	]);
+	const focusFeedItem = useCallback((key: string) => {
+		window.requestAnimationFrame(() => {
+			const element = Array.from(
+				document.querySelectorAll<HTMLElement>("[data-feed-item-key]"),
+			).find((item) => item.dataset.feedItemKey === key);
+			if (!element) return;
+			element.scrollIntoView({ block: "center", behavior: "smooth" });
+			element.focus({ preventScroll: true });
+		});
+	}, []);
 	const notifyGlobalError = useCallback(
 		(
 			title: string,
@@ -1986,9 +1996,11 @@ export function Dashboard(props: {
 				actionLabel?: string;
 				onAction?: () => void;
 				detail?: string | null;
+				dedupeKey?: string;
 			},
 		) => {
 			pushErrorToast(title, describeUnknownError(error, fallback), {
+				dedupeKey: options?.dedupeKey,
 				actionLabel: options?.actionLabel,
 				onAction: options?.onAction,
 				detail:
@@ -1996,6 +2008,27 @@ export function Dashboard(props: {
 			});
 		},
 		[pushErrorToast],
+	);
+	const notifyFeedLaneError = useCallback(
+		(
+			item: FeedItem,
+			lane: Extract<FeedLane, "translated" | "smart">,
+			error: unknown,
+		) => {
+			const isSmart = lane === "smart";
+			const key = feedItemKey(item);
+			notifyGlobalError(
+				isSmart ? "润色触发失败" : "翻译触发失败",
+				error,
+				isSmart ? "润色触发失败，请稍后重试。" : "翻译触发失败，请稍后重试。",
+				{
+					dedupeKey: `dashboard-feed:${lane}:${key}`,
+					actionLabel: "定位到卡片",
+					onAction: () => focusFeedItem(key),
+				},
+			);
+		},
+		[focusFeedItem, notifyGlobalError],
 	);
 
 	const loadNotifications = useCallback(
@@ -3169,18 +3202,18 @@ export function Dashboard(props: {
 	const onTranslateNow = useCallback(
 		(item: FeedItem) => {
 			void translateNow(item).catch((error) => {
-				notifyGlobalError("翻译触发失败", error, "翻译触发失败，请稍后重试。");
+				notifyFeedLaneError(item, "translated", error);
 			});
 		},
-		[notifyGlobalError, translateNow],
+		[notifyFeedLaneError, translateNow],
 	);
 	const onSmartNow = useCallback(
 		(item: FeedItem) => {
 			void smartNow(item).catch((error) => {
-				notifyGlobalError("润色触发失败", error, "润色触发失败，请稍后重试。");
+				notifyFeedLaneError(item, "smart", error);
 			});
 		},
-		[notifyGlobalError, smartNow],
+		[notifyFeedLaneError, smartNow],
 	);
 	const requestLaneIfNeeded = useCallback(
 		(item: FeedItem, lane: FeedLane) => {
@@ -3194,11 +3227,7 @@ export function Dashboard(props: {
 						item.translated?.auto_translate !== false))
 			) {
 				void translateNow(item).catch((error) => {
-					notifyGlobalError(
-						"翻译触发失败",
-						error,
-						"翻译触发失败，请稍后重试。",
-					);
+					notifyFeedLaneError(item, "translated", error);
 				});
 			}
 			if (
@@ -3208,15 +3237,11 @@ export function Dashboard(props: {
 						item.smart?.auto_translate !== false))
 			) {
 				void smartNow(item).catch((error) => {
-					notifyGlobalError(
-						"润色触发失败",
-						error,
-						"润色触发失败，请稍后重试。",
-					);
+					notifyFeedLaneError(item, "smart", error);
 				});
 			}
 		},
-		[notifyGlobalError, smartNow, translateNow],
+		[notifyFeedLaneError, smartNow, translateNow],
 	);
 	const onSelectLane = useCallback(
 		(item: FeedItem, lane: FeedLane) => {

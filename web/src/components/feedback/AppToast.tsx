@@ -23,6 +23,7 @@ type ToastVariant = "default" | "destructive";
 
 type AppToastRecord = {
 	id: string;
+	dedupeKey?: string;
 	title: string;
 	description: string;
 	detail?: string | null;
@@ -34,6 +35,7 @@ type AppToastRecord = {
 };
 
 export type AppToastInput = {
+	dedupeKey?: string;
 	title: string;
 	description: string;
 	detail?: string | null;
@@ -88,20 +90,32 @@ export function AppToastProvider(props: { children: React.ReactNode }) {
 
 	const pushToast = useCallback((input: AppToastInput) => {
 		const id = makeToastId();
-		setToasts((current) => [
-			{
-				id,
-				title: input.title,
-				description: input.description,
-				detail: input.detail ?? null,
-				variant: input.variant ?? "default",
-				duration: input.duration ?? 6000,
-				actionLabel: input.actionLabel,
-				onAction: input.onAction,
-				open: true,
-			},
-			...current,
-		]);
+		const nextToast: AppToastRecord = {
+			id,
+			dedupeKey: input.dedupeKey,
+			title: input.title,
+			description: input.description,
+			detail: input.detail ?? null,
+			variant: input.variant ?? "default",
+			duration: input.duration ?? 6000,
+			actionLabel: input.actionLabel,
+			onAction: input.onAction,
+			open: true,
+		};
+		setToasts((current) => {
+			if (!input.dedupeKey) {
+				return [nextToast, ...current];
+			}
+			const existingIndex = current.findIndex(
+				(toast) => toast.dedupeKey === input.dedupeKey && toast.open,
+			);
+			if (existingIndex < 0) {
+				return [nextToast, ...current];
+			}
+			const next = current.slice();
+			next.splice(existingIndex, 1, nextToast);
+			return next;
+		});
 		return id;
 	}, []);
 
@@ -112,6 +126,7 @@ export function AppToastProvider(props: { children: React.ReactNode }) {
 			options?: Omit<AppToastInput, "title" | "description" | "variant">,
 		) => {
 			return pushToast({
+				dedupeKey: options?.dedupeKey,
 				title,
 				description,
 				detail: options?.detail,
