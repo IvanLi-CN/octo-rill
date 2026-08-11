@@ -22,6 +22,7 @@ mod state;
 mod sync;
 mod translations;
 mod version;
+mod webhook_push;
 
 use anyhow::Result;
 use dotenvy::{dotenv, from_filename};

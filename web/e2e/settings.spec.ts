@@ -177,6 +177,7 @@ async function installSettingsMocks(
 		options?.githubConnections ?? defaultGitHubConnections;
 	let passkeys = options?.passkeys ?? [];
 	let apiKeys = options?.apiKeys ?? [];
+	let webhookPushEnabled = false;
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
 		const url = new URL(req.url());
@@ -363,6 +364,56 @@ async function installSettingsMocks(
 				daily_brief_time_zone: "Asia/Shanghai",
 				last_active_at: "2026-04-18T08:00:00+08:00",
 				include_own_releases: includeOwnReleases,
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/me/webhook-push") {
+			return json(route, {
+				enabled: webhookPushEnabled,
+				include_own_releases: includeOwnReleases,
+				callback_ready: true,
+				pat: {
+					configured: options?.reactionTokenConfigured ?? false,
+					valid: options?.reactionTokenState === "valid",
+					owner_login: options?.reactionTokenOwnerLogin ?? "storybook-user",
+				},
+				summary: {
+					total: 1,
+					registered: 0,
+					missing: 1,
+					permission_paused: 0,
+					errors: 0,
+					removable: 0,
+				},
+				schedule: {
+					audit_interval_days: 7,
+					last_started_at: null,
+					next_started_at: null,
+				},
+				repos: [],
+			});
+		}
+
+		if (req.method() === "PATCH" && pathname === "/api/me/webhook-push") {
+			webhookPushEnabled = Boolean(
+				(req.postDataJSON() as { enabled?: boolean } | null)?.enabled,
+			);
+			return json(route, {
+				enabled: webhookPushEnabled,
+				task_id: webhookPushEnabled ? "webhook-task" : null,
+				status: webhookPushEnabled ? "queued" : null,
+				reused: false,
+			});
+		}
+
+		if (
+			pathname.startsWith("/api/me/webhook-push/") &&
+			(req.method() === "POST" || req.method() === "DELETE")
+		) {
+			return json(route, {
+				task_id: "webhook-task",
+				status: "queued",
+				reused: false,
 			});
 		}
 
@@ -962,6 +1013,45 @@ test("settings deep link saves my releases opt-in", async ({ page }) => {
 
 	await expect(switchControl).toHaveAttribute("aria-checked", "true");
 	await expect(myReleasesSection).toContainText("已纳入我的发布");
+});
+
+test("webhook push requires confirmation and exposes no patrol action", async ({
+	page,
+}) => {
+	await installPasskeyBrowserMock(page);
+	await installSettingsMocks(page, {
+		includeOwnReleases: true,
+		reactionTokenConfigured: true,
+		reactionTokenState: "valid",
+		reactionTokenOwnerLogin: "storybook-user",
+	});
+
+	await page.goto("/settings?section=my-releases");
+	const section = page.locator('[data-settings-section="my-releases"]');
+	await expect(section).toContainText("PAT 所属账号：@storybook-user");
+	await section.getByRole("switch", { name: "Webhook 推送" }).click();
+
+	const confirmation = page.getByRole("alertdialog", {
+		name: "开启 Webhook 推送？",
+	});
+	await expect(confirmation).toContainText("repo 或 public_repo");
+	await expect(confirmation).toContainText("仅监听 Release");
+	await confirmation.getByRole("button", { name: "确认开启并注册" }).click();
+	await expect(
+		section.getByText("Webhook 推送已开启，全部注册任务已排队。", {
+			exact: true,
+		}),
+	).toBeVisible();
+	await expect(
+		section.getByRole("button", { name: "全部注册 Webhook" }),
+	).toBeVisible();
+	await expect(
+		section.getByRole("button", { name: "全部检查 Webhook" }),
+	).toBeVisible();
+	await expect(
+		section.getByRole("button", { name: "全部删除 Webhook" }),
+	).toHaveCount(0);
+	await expect(section.getByRole("button", { name: /巡查/ })).toHaveCount(0);
 });
 
 test("unknown app route shows not-found page after app shell boot", async ({
