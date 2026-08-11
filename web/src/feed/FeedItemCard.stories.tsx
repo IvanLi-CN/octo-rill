@@ -224,7 +224,59 @@ export const AnnouncementSmartPending: Story = {
 		const smartTrigger = canvasElement.querySelector(
 			'[data-feed-lane-trigger="smart"][data-feed-lane-loading="true"]',
 		);
-		expect(smartTrigger).not.toBeNull();
+		if (!(smartTrigger instanceof HTMLElement)) {
+			throw new Error("Expected a loading smart lane trigger");
+		}
+		expect(smartTrigger).toHaveClass("ring-2");
+		expect(smartTrigger).not.toHaveClass("animate-pulse");
+		const smartIcon = smartTrigger.querySelector("svg");
+		expect(smartIcon).not.toBeNull();
+		expect(smartIcon?.parentElement).toHaveClass("motion-safe:animate-pulse");
+	},
+};
+
+export const AnnouncementTranslatedPendingInactive: Story = {
+	render: () => (
+		<FeedItemCardPreview
+			activeLane="original"
+			isTranslating
+			item={buildAnnouncementItem({
+				translated: {
+					lang: "zh-CN",
+					status: "missing",
+					title: null,
+					summary: null,
+				},
+			})}
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"当前仍在查看原文时，后台翻译等待只让翻译图标呼吸，不为未选中 lane 增加外框。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "路线图公告：信息流语义订正" }),
+		).toBeVisible();
+		const translatedTrigger = canvasElement.querySelector(
+			'[data-feed-lane-trigger="translated"][data-feed-lane-loading="true"]',
+		);
+		if (!(translatedTrigger instanceof HTMLElement)) {
+			throw new Error("Expected a loading translated lane trigger");
+		}
+		expect(translatedTrigger).not.toHaveClass("animate-pulse");
+		expect(translatedTrigger).not.toHaveClass("ring-1");
+		expect(translatedTrigger).not.toHaveClass("ring-2");
+		const translatedIcon = translatedTrigger.querySelector("svg");
+		expect(translatedIcon).not.toBeNull();
+		expect(translatedIcon?.parentElement).toHaveClass(
+			"motion-safe:animate-pulse",
+		);
 	},
 };
 
