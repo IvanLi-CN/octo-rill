@@ -6097,7 +6097,25 @@ export const SmartLoading: Story = {
 		const smartTrigger = canvasElement.querySelector(
 			'[data-feed-lane-trigger="smart"][data-feed-lane-loading="true"]',
 		);
-		expect(smartTrigger).not.toBeNull();
+		if (!(smartTrigger instanceof HTMLElement)) {
+			throw new Error("Expected a loading smart lane trigger");
+		}
+		expect(smartTrigger).toHaveClass("ring-2");
+		expect(smartTrigger).not.toHaveClass("animate-pulse");
+		const smartIcon = smartTrigger.querySelector("svg");
+		expect(smartIcon).not.toBeNull();
+		expect(smartIcon?.parentElement).toHaveClass("motion-safe:animate-pulse");
+	},
+};
+
+export const MobileSmartLoading: Story = {
+	...SmartLoading,
+	name: "Mobile / Smart loading",
+	parameters: {
+		...SmartLoading.parameters,
+		viewport: {
+			defaultViewport: "dashboardMobile390",
+		},
 	},
 };
 
