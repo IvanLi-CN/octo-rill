@@ -6111,6 +6111,7 @@ export const SmartLoading: Story = {
 export const MobileSmartLoading: Story = {
 	...SmartLoading,
 	name: "Mobile / Smart loading",
+	play: SmartLoading.play,
 	parameters: {
 		...SmartLoading.parameters,
 		viewport: {
