@@ -28,7 +28,7 @@ import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
 import { FeedGroupedList } from "@/feed/FeedGroupedList";
-import { FeedItemCard } from "@/feed/FeedItemCard";
+import { FeedItemCard, ReleaseFeedCard } from "@/feed/FeedItemCard";
 import {
 	DEFAULT_PAGE_LANE,
 	resolveDisplayLaneForFeed,
@@ -6097,7 +6097,50 @@ export const SmartLoading: Story = {
 		const smartTrigger = canvasElement.querySelector(
 			'[data-feed-lane-trigger="smart"][data-feed-lane-loading="true"]',
 		);
-		expect(smartTrigger).not.toBeNull();
+		if (!(smartTrigger instanceof HTMLElement)) {
+			throw new Error("Expected a loading smart lane trigger");
+		}
+		await expect(smartTrigger).toBeVisible();
+		expect(smartTrigger).toHaveClass("ring-2");
+		expect(smartTrigger).not.toHaveClass("animate-pulse");
+		const smartIcon = smartTrigger.querySelector("svg");
+		expect(smartIcon).not.toBeNull();
+		expect(smartIcon?.parentElement).toHaveClass("motion-safe:animate-pulse");
+	},
+};
+
+export const MobileSmartLoading: Story = {
+	name: "Mobile / Smart loading",
+	render: () => {
+		const item = makeSmartLoadingFeed()[0] as ReleaseFeedItem;
+		return (
+			<div className="bg-background min-h-screen px-4 py-6">
+				<div className="mx-auto w-full max-w-2xl">
+					<ReleaseFeedCard
+						item={item}
+						activeLane="smart"
+						isTranslating={false}
+						isTranslationAutoRetrying={false}
+						isSmartGenerating
+						isSmartAutoRetrying={false}
+						isReactionBusy={false}
+						reactionError={null}
+						surface="article"
+						onSelectLane={() => {}}
+						onTranslateNow={() => {}}
+						onSmartNow={() => {}}
+						onToggleReaction={() => {}}
+					/>
+				</div>
+			</div>
+		);
+	},
+	play: SmartLoading.play,
+	parameters: {
+		...SmartLoading.parameters,
+		viewport: {
+			defaultViewport: "dashboardMobile390",
+		},
 	},
 };
 

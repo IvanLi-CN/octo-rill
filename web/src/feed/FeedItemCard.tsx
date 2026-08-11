@@ -412,8 +412,8 @@ function FeedCardLaneTabs(props: {
 					(option.lane === "smart" && isSmartGenerating);
 				const loadingClass = isLoading
 					? active
-						? "animate-pulse ring-2 ring-foreground/15 ring-offset-1 ring-offset-background"
-						: "animate-pulse text-foreground/60 ring-1 ring-primary/20"
+						? "ring-2 ring-foreground/15 ring-offset-1 ring-offset-background"
+						: "text-foreground/60"
 					: null;
 				return (
 					<TabsTrigger
@@ -432,7 +432,14 @@ function FeedCardLaneTabs(props: {
 							loadingClass,
 						)}
 					>
-						<Icon className={compact ? "size-3" : "size-3.25"} />
+						<span
+							className={cn(
+								"inline-flex",
+								isLoading && "motion-safe:animate-pulse",
+							)}
+						>
+							<Icon className={compact ? "size-3" : "size-3.25"} />
+						</span>
 						<span className="sr-only">{option.label}</span>
 						<span
 							aria-hidden="true"
