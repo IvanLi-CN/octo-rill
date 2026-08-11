@@ -6100,6 +6100,7 @@ export const SmartLoading: Story = {
 		if (!(smartTrigger instanceof HTMLElement)) {
 			throw new Error("Expected a loading smart lane trigger");
 		}
+		await expect(smartTrigger).toBeVisible();
 		expect(smartTrigger).toHaveClass("ring-2");
 		expect(smartTrigger).not.toHaveClass("animate-pulse");
 		const smartIcon = smartTrigger.querySelector("svg");
@@ -6117,7 +6118,6 @@ export const MobileSmartLoading: Story = {
 				<div className="mx-auto w-full max-w-2xl">
 					<ReleaseFeedCard
 						item={item}
-						currentViewer={STORYBOOK_VIEWER}
 						activeLane="smart"
 						isTranslating={false}
 						isTranslationAutoRetrying={false}
