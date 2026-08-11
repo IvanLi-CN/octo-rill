@@ -4154,19 +4154,18 @@ export function JobManagement({
 					() => ({ ok: false as const }),
 				),
 			]);
-			const webhookConfig = webhookResult.ok
-				? webhookResult.config
-				: {
-						audit_interval_days: 7,
-						last_started_at: null,
-						next_started_at: null,
-					};
 			if (requestId !== syncRuntimeConfigRequestIdRef.current) {
 				return;
 			}
 			setSyncRuntimeConfig(res);
-			setWebhookPushRuntimeConfig(webhookConfig);
-			setWebhookPushAuditIntervalInput(webhookConfig.audit_interval_days);
+			setWebhookPushRuntimeConfig(
+				webhookResult.ok ? webhookResult.config : null,
+			);
+			if (webhookResult.ok) {
+				setWebhookPushAuditIntervalInput(
+					webhookResult.config.audit_interval_days,
+				);
+			}
 			setSyncAutoFetchIntervalInput(res.sync_auto_fetch_interval_minutes);
 			setRetryRecentFailuresIntervalInput(
 				res.retry_recent_failures_interval_minutes ??
@@ -5469,7 +5468,11 @@ export function JobManagement({
 								size="icon"
 								aria-label="配置定时任务间隔"
 								onClick={openTaskIntervalSettingsDialog}
-								disabled={!syncRuntimeConfig || syncRuntimeConfigSaving}
+								disabled={
+									!syncRuntimeConfig ||
+									!webhookPushRuntimeConfig ||
+									syncRuntimeConfigSaving
+								}
 							>
 								<Settings2 />
 							</Button>

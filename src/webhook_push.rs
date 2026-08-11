@@ -333,11 +333,12 @@ async fn validate_pat(
         .await
         .map_err(ApiError::internal)?;
     let status = response.status();
-    let rate_limited = response
-        .headers()
-        .get("x-ratelimit-remaining")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == "0")
+    let rate_limited = status == StatusCode::TOO_MANY_REQUESTS
+        || response
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == "0")
         || response.headers().contains_key("retry-after");
     if status != StatusCode::OK {
         if rate_limited {
@@ -719,8 +720,7 @@ pub async fn delete_all(
             "请先关闭“Webhook 推送”，再全部删除 Webhook。",
         ));
     }
-    let (_, owner_github_user_id, _, _) = validate_pat(state.as_ref(), &user_id).await?;
-    ensure_delete_pat_owner(state.as_ref(), &user_id, owner_github_user_id).await?;
+    validate_pat(state.as_ref(), &user_id).await?;
     state
         .sqlite_writer
         .write_foreground("webhook_push_delete_pending", |_| async {
@@ -739,29 +739,6 @@ pub async fn delete_all(
     Ok(Json(task_response(
         enqueue_manage(state.as_ref(), &user_id, OP_DELETE, None, "manual").await?,
     )))
-}
-
-async fn ensure_delete_pat_owner(
-    state: &AppState,
-    user_id: &str,
-    owner_github_user_id: i64,
-) -> Result<(), ApiError> {
-    let mismatched = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM webhook_push_repos WHERE user_id = ? AND hook_id IS NOT NULL AND owner_github_user_id IS NOT NULL AND owner_github_user_id != ?",
-    )
-    .bind(user_id)
-    .bind(owner_github_user_id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
-    if mismatched != 0 {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "pat_owner_mismatch_cleanup",
-            "待删除的 Webhook 属于另一个 GitHub 账号，请恢复该账号的 classic PAT 后重试。",
-        ));
-    }
-    Ok(())
 }
 
 pub async fn register_repo(
@@ -1490,9 +1467,6 @@ async fn execute_for_user_locked(
             let owner_login = pat
                 .owner_login
                 .ok_or_else(|| anyhow!("GitHub PAT owner is not available"))?;
-            ensure_delete_pat_owner(state, user_id, owner_github_user_id)
-                .await
-                .map_err(|err| anyhow!(err.to_string()))?;
             (
                 token,
                 owner_github_user_id,
@@ -1596,23 +1570,38 @@ async fn execute_for_user_locked(
             }
             Err(error) => {
                 let permission_paused = is_permission_error(&error);
-                persist_repo_state(
-                    state,
-                    user_id,
-                    repo,
-                    &callback,
-                    (
-                        if permission_paused {
-                            STATUS_PERMISSION_PAUSED
-                        } else {
-                            STATUS_ERROR
-                        },
-                        None,
-                        Some(&error),
-                        false,
-                    ),
-                )
-                .await?;
+                if operation == OP_DELETE {
+                    sqlx::query(
+                        "UPDATE webhook_push_repos SET status = ?, error_kind = ?, error_message = ?, permission_paused = ?, updated_at = ? WHERE user_id = ? AND repo_id = ?",
+                    )
+                    .bind(if permission_paused { STATUS_PERMISSION_PAUSED } else { STATUS_ERROR })
+                    .bind(if permission_paused { "permission" } else { "github_error" })
+                    .bind(&error.message)
+                    .bind(if permission_paused { 1_i64 } else { 0_i64 })
+                    .bind(Utc::now().to_rfc3339())
+                    .bind(user_id)
+                    .bind(repo.repo_id)
+                    .execute(&state.pool)
+                    .await?;
+                } else {
+                    persist_repo_state(
+                        state,
+                        user_id,
+                        repo,
+                        &callback,
+                        (
+                            if permission_paused {
+                                STATUS_PERMISSION_PAUSED
+                            } else {
+                                STATUS_ERROR
+                            },
+                            None,
+                            Some(&error),
+                            false,
+                        ),
+                    )
+                    .await?;
+                }
                 "failed"
             }
         };
