@@ -41,7 +41,7 @@ use crate::session_store::CoordinatedSqliteSessionStore;
 use crate::state::AppState;
 use crate::{
     admin_runtime, ai, api, auth, config::AppConfig, jobs, observability, runtime, state, sync,
-    translations, version,
+    translations, version, webhook_push,
 };
 
 const SESSION_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
@@ -197,6 +197,24 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(api::me_get_profile).patch(api::me_patch_profile),
         )
         .route(
+            "/me/webhook-push",
+            get(webhook_push::get_settings).patch(webhook_push::patch_settings),
+        )
+        .route(
+            "/me/webhook-push/register",
+            post(webhook_push::register_all),
+        )
+        .route("/me/webhook-push/check", post(webhook_push::check_all))
+        .route("/me/webhook-push/hooks", delete(webhook_push::delete_all))
+        .route(
+            "/me/webhook-push/repos/{repo_id}/register",
+            post(webhook_push::register_repo),
+        )
+        .route(
+            "/me/webhook-push/repos/{repo_id}/check",
+            post(webhook_push::check_repo),
+        )
+        .route(
             "/me/api-keys",
             get(api::me_get_api_keys).post(api::me_create_api_key),
         )
@@ -240,6 +258,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(api::public_get_repo_release_content),
         )
         .route("/notifications", get(api::list_notifications))
+        .route("/webhooks/github/releases", post(webhook_push::receive))
         .route("/dashboard/updates", get(api::dashboard_updates))
         .route("/feed", get(api::list_feed).head(api::head_feed))
         .route("/feed/reactions/refresh", post(api::refresh_feed_reactions))
@@ -264,6 +283,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             axum::routing::delete(api::admin_delete_public_release_repo),
         )
         .route("/admin/jobs/overview", get(api::admin_jobs_overview))
+        .route(
+            "/admin/jobs/webhook-push/runtime-config",
+            get(webhook_push::admin_get_runtime_config)
+                .patch(webhook_push::admin_patch_runtime_config),
+        )
         .route("/admin/jobs/events", get(api::admin_jobs_events_sse))
         .route("/admin/jobs/realtime", get(api::admin_list_realtime_tasks))
         .route(
@@ -499,6 +523,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         jobs::spawn_hourly_scheduler(app_state.clone());
         jobs::spawn_subscription_scheduler(app_state.clone());
         jobs::spawn_recent_failures_retry_scheduler(app_state.clone());
+        jobs::spawn_webhook_push_scheduler(app_state.clone());
         jobs::spawn_account_pause_scheduler(app_state.clone());
         jobs::spawn_admin_dashboard_rollup_scheduler(app_state.clone());
         if let Err(err) = jobs::enqueue_brief_history_recompute_if_needed(app_state.as_ref()).await

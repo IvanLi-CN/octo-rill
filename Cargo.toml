@@ -13,6 +13,7 @@ base64 = "0.22.1"
 chrono = { version = "0.4.43", features = ["serde"] }
 chrono-tz = "0.10.4"
 dotenvy = "0.15.7"
+hmac = "0.12.1"
 iana-time-zone = "0.1.64"
 oauth2 = "5.0.0"
 rand = "0.10.0"

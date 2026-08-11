@@ -328,6 +328,60 @@ export type MeProfileResponse = {
 	include_own_releases: boolean;
 	last_active_at: string | null;
 };
+export type WebhookPushRepoStatus = {
+	repo_id: number;
+	owner_login: string;
+	repo_name: string;
+	repo_full_name: string;
+	is_private: boolean | null;
+	hook_id: number | null;
+	status: string;
+	error_kind: string | null;
+	error_message: string | null;
+	permission_paused: boolean;
+	last_checked_at: string | null;
+	last_registered_at: string | null;
+};
+export type WebhookPushSettingsResponse = {
+	enabled: boolean;
+	include_own_releases: boolean;
+	callback_ready: boolean;
+	pat: {
+		configured: boolean;
+		valid: boolean;
+		owner_login: string | null;
+	};
+	summary: {
+		total: number;
+		registered: number;
+		missing: number;
+		permission_paused: number;
+		errors: number;
+		removable: number;
+	};
+	schedule: {
+		audit_interval_days: number;
+		last_started_at: string | null;
+		next_started_at: string | null;
+	};
+	repos: WebhookPushRepoStatus[];
+};
+export type WebhookPushTaskResponse = {
+	task_id: string;
+	status: string;
+	reused: boolean;
+};
+export type WebhookPushPatchResponse = {
+	enabled: boolean;
+	task_id: string | null;
+	status: string | null;
+	reused: boolean;
+};
+export type AdminWebhookPushRuntimeConfigResponse = {
+	audit_interval_days: number;
+	last_started_at: string | null;
+	next_started_at: string | null;
+};
 export type SyncAutoFetchTaskItem = {
 	id: string;
 	status: string;
@@ -1161,6 +1215,52 @@ export async function apiGetAuthBindContext(): Promise<AuthBindContextResponse> 
 }
 export async function apiGetMePasskeys(): Promise<MePasskeysResponse> {
 	return apiGet<MePasskeysResponse>("/api/me/passkeys");
+}
+export async function apiGetMeWebhookPush(): Promise<WebhookPushSettingsResponse> {
+	return apiGet<WebhookPushSettingsResponse>("/api/me/webhook-push");
+}
+export async function apiPatchMeWebhookPush(
+	enabled: boolean,
+): Promise<WebhookPushPatchResponse> {
+	return apiPatchJson<WebhookPushPatchResponse>("/api/me/webhook-push", {
+		enabled,
+	});
+}
+export async function apiRegisterMeWebhookPush(
+	repoId?: number,
+): Promise<WebhookPushTaskResponse> {
+	return apiPostJson<WebhookPushTaskResponse>(
+		repoId === undefined
+			? "/api/me/webhook-push/register"
+			: `/api/me/webhook-push/repos/${repoId}/register`,
+		{},
+	);
+}
+export async function apiCheckMeWebhookPush(
+	repoId?: number,
+): Promise<WebhookPushTaskResponse> {
+	return apiPostJson<WebhookPushTaskResponse>(
+		repoId === undefined
+			? "/api/me/webhook-push/check"
+			: `/api/me/webhook-push/repos/${repoId}/check`,
+		{},
+	);
+}
+export async function apiDeleteMeWebhookPushHooks(): Promise<WebhookPushTaskResponse> {
+	return apiDeleteJson<WebhookPushTaskResponse>("/api/me/webhook-push/hooks");
+}
+export async function apiGetAdminWebhookPushRuntimeConfig(): Promise<AdminWebhookPushRuntimeConfigResponse> {
+	return apiGet<AdminWebhookPushRuntimeConfigResponse>(
+		"/api/admin/jobs/webhook-push/runtime-config",
+	);
+}
+export async function apiPatchAdminWebhookPushRuntimeConfig(
+	auditIntervalDays: number,
+): Promise<AdminWebhookPushRuntimeConfigResponse> {
+	return apiPatchJson<AdminWebhookPushRuntimeConfigResponse>(
+		"/api/admin/jobs/webhook-push/runtime-config",
+		{ audit_interval_days: auditIntervalDays },
+	);
 }
 export async function apiGetMeApiKeys(): Promise<MeApiKeysResponse> {
 	return apiGet<MeApiKeysResponse>("/api/me/api-keys");

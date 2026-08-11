@@ -2627,7 +2627,10 @@ async fn user_includes_own_releases(state: &AppState, user_id: &str) -> Result<b
     Ok(include_own_releases != 0)
 }
 
-async fn refresh_owned_repo_release_visibility(state: &AppState, user_id: &str) -> Result<bool> {
+pub(crate) async fn refresh_owned_repo_release_visibility(
+    state: &AppState,
+    user_id: &str,
+) -> Result<bool> {
     if !user_includes_own_releases(state, user_id).await? {
         return Ok(false);
     }
@@ -3948,6 +3951,7 @@ async fn attach_and_wait_for_user_release_demand_with_freshness(
         reason,
         freshness.as_mut(),
         &snapshots,
+        false,
     )
     .await?;
 
@@ -4015,6 +4019,32 @@ pub async fn enqueue_public_repo_release_sync(
     Ok(attached.reused_fresh > 0)
 }
 
+pub async fn enqueue_user_repo_release_sync(
+    state: &AppState,
+    user_id: &str,
+    repo_id: i64,
+    full_name: &str,
+) -> Result<bool> {
+    let repos = [ReleaseDemandRepo {
+        repo_id,
+        full_name: full_name.to_owned(),
+        is_new_repo: false,
+    }];
+    let attached = attach_release_demand_with_freshness(
+        state,
+        None,
+        Some(user_id),
+        &repos,
+        RepoReleaseOrigin::Interactive,
+        "webhook_release",
+        None,
+        &HashMap::new(),
+        true,
+    )
+    .await?;
+    Ok(attached.reused_fresh > 0)
+}
+
 async fn attach_release_demand(
     state: &AppState,
     task_id: Option<&str>,
@@ -4032,6 +4062,7 @@ async fn attach_release_demand(
         reason,
         None,
         &HashMap::new(),
+        false,
     )
     .await
 }
@@ -4046,6 +4077,7 @@ async fn attach_release_demand_with_freshness(
     reason: &str,
     mut freshness: Option<&mut DashboardReleaseFreshnessPolicy>,
     snapshots: &HashMap<i64, usize>,
+    force_refresh: bool,
 ) -> Result<AttachReleaseDemandResult> {
     let mut result = AttachReleaseDemandResult {
         repos: repos.len(),
@@ -4121,14 +4153,15 @@ async fn attach_release_demand_with_freshness(
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        let is_fresh = adaptive_assessment
-            .as_ref()
-            .is_some_and(|assessment| assessment.decision == "reused_fresh")
-            || (adaptive_assessment.is_none()
-                && existing
-                    .as_ref()
-                    .and_then(|item| item.last_success_at.as_deref())
-                    .is_some_and(|value| value >= freshness_cutoff.as_str()));
+        let is_fresh = !force_refresh
+            && (adaptive_assessment
+                .as_ref()
+                .is_some_and(|assessment| assessment.decision == "reused_fresh")
+                || (adaptive_assessment.is_none()
+                    && existing
+                        .as_ref()
+                        .and_then(|item| item.last_success_at.as_deref())
+                        .is_some_and(|value| value >= freshness_cutoff.as_str())));
         let work_item_id = if let Some(existing) = existing {
             let next_priority = existing.priority.max(origin.priority());
             let next_origin = if next_priority == REPO_RELEASE_PRIORITY_INTERACTIVE {
@@ -7878,6 +7911,12 @@ async fn load_repo_release_candidate_users(
                 AND pu.published_by_user_id = u.id
                 AND pu.last_sync_status != 'inaccessible'
             )
+            OR EXISTS (
+              SELECT 1
+              FROM owned_repo_star_baselines ob
+              WHERE ob.user_id = u.id
+                AND ob.repo_id = ?
+            )
           )
         ORDER BY
           CASE WHEN u.last_active_at IS NULL THEN 1 ELSE 0 END ASC,
@@ -7885,6 +7924,7 @@ async fn load_repo_release_candidate_users(
           u.id ASC
         "#,
     )
+    .bind(repo_id)
     .bind(repo_id)
     .bind(repo_id)
     .fetch_all(&state.pool)
@@ -18588,6 +18628,7 @@ mod tests {
             "access_refresh",
             Some(&mut policy),
             &snapshots,
+            false,
         )
         .await
         .expect("attach failed work item demand");
