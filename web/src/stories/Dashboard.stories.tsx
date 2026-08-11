@@ -28,7 +28,7 @@ import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
 import { FeedGroupedList } from "@/feed/FeedGroupedList";
-import { FeedItemCard } from "@/feed/FeedItemCard";
+import { FeedItemCard, ReleaseFeedCard } from "@/feed/FeedItemCard";
 import {
 	DEFAULT_PAGE_LANE,
 	resolveDisplayLaneForFeed,
@@ -6109,8 +6109,32 @@ export const SmartLoading: Story = {
 };
 
 export const MobileSmartLoading: Story = {
-	...SmartLoading,
 	name: "Mobile / Smart loading",
+	render: () => {
+		const item = makeSmartLoadingFeed()[0] as ReleaseFeedItem;
+		return (
+			<div className="bg-background min-h-screen px-4 py-6">
+				<div className="mx-auto w-full max-w-2xl">
+					<ReleaseFeedCard
+						item={item}
+						currentViewer={STORYBOOK_VIEWER}
+						activeLane="smart"
+						isTranslating={false}
+						isTranslationAutoRetrying={false}
+						isSmartGenerating
+						isSmartAutoRetrying={false}
+						isReactionBusy={false}
+						reactionError={null}
+						surface="article"
+						onSelectLane={() => {}}
+						onTranslateNow={() => {}}
+						onSmartNow={() => {}}
+						onToggleReaction={() => {}}
+					/>
+				</div>
+			</div>
+		);
+	},
 	play: SmartLoading.play,
 	parameters: {
 		...SmartLoading.parameters,
