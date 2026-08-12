@@ -31,6 +31,8 @@ type AppToastRecord = {
 	duration: number;
 	actionLabel?: string;
 	onAction?: () => void;
+	secondaryActionLabel?: string;
+	onSecondaryAction?: () => void;
 	open: boolean;
 };
 
@@ -43,6 +45,8 @@ export type AppToastInput = {
 	duration?: number;
 	actionLabel?: string;
 	onAction?: () => void;
+	secondaryActionLabel?: string;
+	onSecondaryAction?: () => void;
 };
 
 type AppToastContextValue = {
@@ -100,6 +104,8 @@ export function AppToastProvider(props: { children: React.ReactNode }) {
 			duration: input.duration ?? 6000,
 			actionLabel: input.actionLabel,
 			onAction: input.onAction,
+			secondaryActionLabel: input.secondaryActionLabel,
+			onSecondaryAction: input.onSecondaryAction,
 			open: true,
 		};
 		setToasts((current) => {
@@ -133,6 +139,8 @@ export function AppToastProvider(props: { children: React.ReactNode }) {
 				duration: options?.duration,
 				actionLabel: options?.actionLabel,
 				onAction: options?.onAction,
+				secondaryActionLabel: options?.secondaryActionLabel,
+				onSecondaryAction: options?.onSecondaryAction,
 				variant: "destructive",
 			});
 		},
@@ -194,18 +202,33 @@ export function AppToastViewportHost() {
 							detail={toast.detail}
 							summary={toast.description}
 						/>
-						{toast.actionLabel && toast.onAction ? (
-							<div className="pt-1">
-								<ToastAction altText={toast.actionLabel} asChild>
-									<Button
-										variant="outline"
-										size="sm"
-										className="h-8 rounded-full font-mono text-xs"
-										onClick={toast.onAction}
-									>
-										{toast.actionLabel}
-									</Button>
-								</ToastAction>
+						{(toast.actionLabel && toast.onAction) ||
+						(toast.secondaryActionLabel && toast.onSecondaryAction) ? (
+							<div className="flex flex-wrap gap-2 pt-1">
+								{toast.actionLabel && toast.onAction ? (
+									<ToastAction altText={toast.actionLabel} asChild>
+										<Button
+											variant="outline"
+											size="sm"
+											className="h-8 rounded-full font-mono text-xs"
+											onClick={toast.onAction}
+										>
+											{toast.actionLabel}
+										</Button>
+									</ToastAction>
+								) : null}
+								{toast.secondaryActionLabel && toast.onSecondaryAction ? (
+									<ToastAction altText={toast.secondaryActionLabel} asChild>
+										<Button
+											variant="outline"
+											size="sm"
+											className="h-8 rounded-full font-mono text-xs"
+											onClick={toast.onSecondaryAction}
+										>
+											{toast.secondaryActionLabel}
+										</Button>
+									</ToastAction>
+								) : null}
 							</div>
 						) : null}
 					</div>

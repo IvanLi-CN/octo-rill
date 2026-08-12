@@ -2888,8 +2888,10 @@ function SmartFailureToastPreview() {
 	const triggerFailure = () => {
 		pushErrorToast("润色触发失败", "上游模型拒绝请求。", {
 			dedupeKey: "dashboard-feed:smart:release:50005",
-			actionLabel: "定位到卡片",
-			onAction: () => {
+			actionLabel: "重试润色",
+			onAction: triggerFailure,
+			secondaryActionLabel: "定位到卡片",
+			onSecondaryAction: () => {
 				const element = cardRef.current;
 				if (!element) return;
 				element.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -6323,7 +6325,8 @@ export const SmartRetryActionLoading: Story = {
 	},
 	play: async ({ canvasElement, userEvent }) => {
 		const canvas = within(canvasElement);
-		const retryButton = canvas.getByRole("button", { name: "重试润色" });
+		const card = canvas.locator('[data-feed-item-key="release:50005"]');
+		const retryButton = card.getByRole("button", { name: "重试润色" });
 		await expect(retryButton).toBeEnabled();
 		await userEvent.click(retryButton);
 		await expect(retryButton).toBeDisabled();
@@ -6349,19 +6352,32 @@ export const SmartFailureToastLocateCard: Story = {
 		docs: {
 			description: {
 				story:
-					"同一卡片连续两次润色失败会刷新同一条 toast，并保留定位到卡片的操作；点击后卡片滚动到视口并获得程序化焦点。",
+					"同一卡片连续两次润色失败会刷新同一条 toast，并提供重试润色与定位到卡片两个操作。点击定位后卡片滚动到视口并获得程序化焦点。",
 			},
 		},
 	},
 	play: async ({ canvasElement, userEvent }) => {
 		const canvas = within(canvasElement);
-		const retryButton = canvas.getByRole("button", { name: "重试润色" });
+		const card = canvas.locator('[data-feed-item-key="release:50005"]');
+		const retryButton = card.getByRole("button", { name: "重试润色" });
 		await userEvent.click(retryButton);
 		await userEvent.click(retryButton);
 		expect(canvas.getAllByText("润色触发失败", { exact: true })).toHaveLength(
 			1,
 		);
+		expect(canvas.getAllByRole("button", { name: "重试润色" })).toHaveLength(2);
 		expect(canvas.getAllByRole("button", { name: "定位到卡片" })).toHaveLength(
+			1,
+		);
+		expect(
+			canvas.getByText("上游模型拒绝请求。", { exact: true }),
+		).toBeVisible();
+		await userEvent.click(
+			canvas
+				.locator('[data-slot="toast"]')
+				.getByRole("button", { name: "重试润色" }),
+		);
+		expect(canvas.getAllByText("润色触发失败", { exact: true })).toHaveLength(
 			1,
 		);
 		await userEvent.click(canvas.getByRole("button", { name: "定位到卡片" }));

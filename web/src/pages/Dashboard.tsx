@@ -1995,6 +1995,8 @@ export function Dashboard(props: {
 			options?: {
 				actionLabel?: string;
 				onAction?: () => void;
+				secondaryActionLabel?: string;
+				onSecondaryAction?: () => void;
 				detail?: string | null;
 				dedupeKey?: string;
 			},
@@ -2003,6 +2005,8 @@ export function Dashboard(props: {
 				dedupeKey: options?.dedupeKey,
 				actionLabel: options?.actionLabel,
 				onAction: options?.onAction,
+				secondaryActionLabel: options?.secondaryActionLabel,
+				onSecondaryAction: options?.onSecondaryAction,
 				detail:
 					options?.detail ?? (error instanceof Error ? error.message : null),
 			});
@@ -2014,6 +2018,7 @@ export function Dashboard(props: {
 			item: FeedItem,
 			lane: Extract<FeedLane, "translated" | "smart">,
 			error: unknown,
+			retry: (item: FeedItem) => Promise<unknown>,
 		) => {
 			const isSmart = lane === "smart";
 			const key = feedItemKey(item);
@@ -2023,8 +2028,14 @@ export function Dashboard(props: {
 				isSmart ? "润色触发失败，请稍后重试。" : "翻译触发失败，请稍后重试。",
 				{
 					dedupeKey: `dashboard-feed:${lane}:${key}`,
-					actionLabel: "定位到卡片",
-					onAction: () => focusFeedItem(key),
+					actionLabel: isSmart ? "重试润色" : "重试翻译",
+					onAction: () => {
+						void retry(item).catch((nextError) =>
+							notifyFeedLaneError(item, lane, nextError, retry),
+						);
+					},
+					secondaryActionLabel: "定位到卡片",
+					onSecondaryAction: () => focusFeedItem(key),
 				},
 			);
 		},
@@ -3202,7 +3213,7 @@ export function Dashboard(props: {
 	const onTranslateNow = useCallback(
 		(item: FeedItem) => {
 			void translateNow(item).catch((error) => {
-				notifyFeedLaneError(item, "translated", error);
+				notifyFeedLaneError(item, "translated", error, translateNow);
 			});
 		},
 		[notifyFeedLaneError, translateNow],
@@ -3210,7 +3221,7 @@ export function Dashboard(props: {
 	const onSmartNow = useCallback(
 		(item: FeedItem) => {
 			void smartNow(item).catch((error) => {
-				notifyFeedLaneError(item, "smart", error);
+				notifyFeedLaneError(item, "smart", error, smartNow);
 			});
 		},
 		[notifyFeedLaneError, smartNow],
@@ -3227,7 +3238,7 @@ export function Dashboard(props: {
 						item.translated?.auto_translate !== false))
 			) {
 				void translateNow(item).catch((error) => {
-					notifyFeedLaneError(item, "translated", error);
+					notifyFeedLaneError(item, "translated", error, translateNow);
 				});
 			}
 			if (
@@ -3237,7 +3248,7 @@ export function Dashboard(props: {
 						item.smart?.auto_translate !== false))
 			) {
 				void smartNow(item).catch((error) => {
-					notifyFeedLaneError(item, "smart", error);
+					notifyFeedLaneError(item, "smart", error, smartNow);
 				});
 			}
 		},

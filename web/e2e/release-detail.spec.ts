@@ -1855,7 +1855,11 @@ test("feed smart localized retryable error shows neutral auto-retry waiting stat
 		}),
 	).toBeVisible();
 	await expect(page.getByText("润色失败", { exact: true })).toHaveCount(0);
-	await expect(page.getByRole("button", { name: "重试润色" })).toHaveCount(0);
+	await expect(
+		page
+			.locator(`[data-feed-item-key="release:${releaseId}"]`)
+			.getByRole("button", { name: "重试润色" }),
+	).toHaveCount(0);
 });
 
 test("feed smart upstream rejected error auto retries on page load", async ({
@@ -2137,7 +2141,7 @@ test("feed smart trigger failures coalesce and locate the card", async ({
 				).length,
 		)
 		.toBeGreaterThanOrEqual(1);
-	await page.getByRole("button", { name: "重试润色" }).click();
+	await releaseCard.getByRole("button", { name: "重试润色" }).click();
 	await expect
 		.poll(
 			() =>
@@ -2149,6 +2153,19 @@ test("feed smart trigger failures coalesce and locate the card", async ({
 
 	await expect(page.getByText("润色触发失败", { exact: true })).toHaveCount(1);
 	await expect(page.getByRole("button", { name: "定位到卡片" })).toHaveCount(1);
+	await expect(page.getByRole("button", { name: "重试润色" })).toHaveCount(2);
+	await page
+		.locator('[data-slot="toast"]')
+		.getByRole("button", { name: "重试润色" })
+		.click();
+	await expect
+		.poll(
+			() =>
+				tracker.translationResolveRequests.filter((request) =>
+					request.kinds.every((kind) => kind === "release_smart"),
+				).length,
+		)
+		.toBeGreaterThanOrEqual(3);
 
 	await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
 	await page.getByRole("button", { name: "定位到卡片" }).click();
