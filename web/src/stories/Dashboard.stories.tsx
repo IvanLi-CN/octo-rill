@@ -2883,25 +2883,19 @@ function makeSmartRetryErrorFeed(): FeedItem[] {
 function SmartFailureToastPreview() {
 	const { pushErrorToast } = useAppToast();
 	const cardRef = useRef<HTMLDivElement>(null);
-	const attemptRef = useRef(0);
 	const item = makeSmartRetryErrorFeed()[0] as ReleaseFeedItem;
 
 	const triggerFailure = () => {
-		attemptRef.current += 1;
-		pushErrorToast(
-			"润色触发失败",
-			`第 ${attemptRef.current} 次失败：上游模型拒绝请求。`,
-			{
-				dedupeKey: "dashboard-feed:smart:release:50005",
-				actionLabel: "定位到卡片",
-				onAction: () => {
-					const element = cardRef.current;
-					if (!element) return;
-					element.scrollIntoView({ block: "center", behavior: "smooth" });
-					element.focus({ preventScroll: true });
-				},
+		pushErrorToast("润色触发失败", "上游模型拒绝请求。", {
+			dedupeKey: "dashboard-feed:smart:release:50005",
+			actionLabel: "定位到卡片",
+			onAction: () => {
+				const element = cardRef.current;
+				if (!element) return;
+				element.scrollIntoView({ block: "center", behavior: "smooth" });
+				element.focus({ preventScroll: true });
 			},
-		);
+		});
 	};
 
 	return (
