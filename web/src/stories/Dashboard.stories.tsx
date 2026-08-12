@@ -6325,7 +6325,11 @@ export const SmartRetryActionLoading: Story = {
 	},
 	play: async ({ canvasElement, userEvent }) => {
 		const canvas = within(canvasElement);
-		const card = canvas.locator('[data-feed-item-key="release:50005"]');
+		const cardElement = canvasElement.querySelector<HTMLElement>(
+			'[data-feed-item-key="release:50005"]',
+		);
+		if (!cardElement) throw new Error("Expected the mock feed card to render");
+		const card = within(cardElement);
 		const retryButton = card.getByRole("button", { name: "重试润色" });
 		await expect(retryButton).toBeEnabled();
 		await userEvent.click(retryButton);
@@ -6358,7 +6362,11 @@ export const SmartFailureToastLocateCard: Story = {
 	},
 	play: async ({ canvasElement, userEvent }) => {
 		const canvas = within(canvasElement);
-		const card = canvas.locator('[data-feed-item-key="release:50005"]');
+		const cardElement = canvasElement.querySelector<HTMLElement>(
+			'[data-feed-item-key="release:50005"]',
+		);
+		if (!cardElement) throw new Error("Expected the mock feed card to render");
+		const card = within(cardElement);
 		const retryButton = card.getByRole("button", { name: "重试润色" });
 		await userEvent.click(retryButton);
 		await userEvent.click(retryButton);
@@ -6373,9 +6381,12 @@ export const SmartFailureToastLocateCard: Story = {
 			canvas.getByText("上游模型拒绝请求。", { exact: true }),
 		).toBeVisible();
 		await userEvent.click(
-			canvas
-				.locator('[data-slot="toast"]')
-				.getByRole("button", { name: "重试润色" }),
+			within(
+				canvasElement.querySelector<HTMLElement>('[data-slot="toast"]') ??
+					(() => {
+						throw new Error("Expected the failure toast to render");
+					})(),
+			).getByRole("button", { name: "重试润色" }),
 		);
 		expect(canvas.getAllByText("润色触发失败", { exact: true })).toHaveLength(
 			1,
