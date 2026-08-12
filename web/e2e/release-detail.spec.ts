@@ -50,6 +50,7 @@ type ApiOptions = {
 	smartFeedCount?: number;
 	smartInitialReadyIds?: string[];
 	smartInitialErrorIds?: string[];
+	smartInitialAutoRetryableIds?: string[];
 	smartInitialErrorPayloads?: Record<string, TranslationErrorPayload>;
 	smartResolveStatuses?: Record<string, "ready" | "missing" | "error">;
 	smartResolveErrors?: Record<string, TranslationErrorPayload>;
@@ -132,6 +133,7 @@ function makeAutoTranslateFeedItems(
 		initialErrorPayloads?: Record<string, TranslationErrorPayload>;
 		smartInitialReadyIds?: string[];
 		smartInitialErrorIds?: string[];
+		smartInitialAutoRetryableIds?: string[];
 		smartInitialErrorPayloads?: Record<string, TranslationErrorPayload>;
 		autoTranslateDisabledIds?: string[];
 		aiDisabled?: boolean;
@@ -142,6 +144,9 @@ function makeAutoTranslateFeedItems(
 	const initialErrorIds = new Set(options?.initialErrorIds ?? []);
 	const smartInitialReadyIds = new Set(options?.smartInitialReadyIds ?? []);
 	const smartInitialErrorIds = new Set(options?.smartInitialErrorIds ?? []);
+	const smartInitialAutoRetryableIds = new Set(
+		options?.smartInitialAutoRetryableIds ?? [],
+	);
 	const autoTranslateDisabledIds = new Set(
 		options?.autoTranslateDisabledIds ?? [],
 	);
@@ -251,7 +256,7 @@ function makeAutoTranslateFeedItems(
 								error_detail:
 									options?.smartInitialErrorPayloads?.[releaseId]
 										?.error_detail ?? null,
-								auto_translate: false,
+								auto_translate: smartInitialAutoRetryableIds.has(releaseId),
 							}
 						: {
 								lang: "zh-CN",
@@ -551,6 +556,7 @@ async function installApiMocks(
 								initialErrorIds: cfg.autoTranslateAppendPageErrorIds,
 								initialErrorPayloads: cfg.autoTranslateInitialErrorPayloads,
 								smartInitialErrorIds: cfg.smartInitialErrorIds,
+								smartInitialAutoRetryableIds: cfg.smartInitialAutoRetryableIds,
 								smartInitialErrorPayloads: cfg.smartInitialErrorPayloads,
 								withReactions: cfg.withAutoTranslateReactions,
 							})
@@ -560,6 +566,7 @@ async function installApiMocks(
 								initialErrorPayloads: cfg.autoTranslateInitialErrorPayloads,
 								smartInitialReadyIds: cfg.smartInitialReadyIds,
 								smartInitialErrorIds: cfg.smartInitialErrorIds,
+								smartInitialAutoRetryableIds: cfg.smartInitialAutoRetryableIds,
 								smartInitialErrorPayloads: cfg.smartInitialErrorPayloads,
 								autoTranslateDisabledIds: cfg.autoTranslateDisabledIds,
 								aiDisabled: cfg.aiDisabledFeed,
@@ -1828,6 +1835,7 @@ test("feed smart localized retryable error shows neutral auto-retry waiting stat
 	await expect(page.getByRole("tab", { name: "发布" })).toHaveAttribute(
 		"aria-selected",
 		"true",
+		{ timeout: 15_000 },
 	);
 	await expect
 		.poll(() =>
@@ -1848,7 +1856,11 @@ test("feed smart localized retryable error shows neutral auto-retry waiting stat
 		}),
 	).toBeVisible();
 	await expect(page.getByText("润色失败", { exact: true })).toHaveCount(0);
-	await expect(page.getByRole("button", { name: "重试润色" })).toHaveCount(0);
+	await expect(
+		page
+			.locator(`[data-feed-item-key="release:${releaseId}"]`)
+			.getByRole("button", { name: "重试润色" }),
+	).toHaveCount(0);
 });
 
 test("feed smart upstream rejected error auto retries on page load", async ({
@@ -2084,6 +2096,92 @@ test("feed auto retry falls back to the existing error panel after one failed au
 	await expect(page.getByText("润色结果准备中", { exact: true })).toBeVisible();
 	await expect(page.getByText("润色失败", { exact: true })).toBeVisible();
 	await expect(page.getByRole("button", { name: "重试润色" })).toBeVisible();
+});
+
+test("feed smart trigger failures coalesce and locate the card", async ({
+	page,
+}) => {
+	const releaseId = makeAutoTranslateReleaseId(0);
+	const tracker = await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 1,
+		smartInitialErrorIds: [releaseId],
+		smartInitialAutoRetryableIds: [releaseId],
+		smartInitialErrorPayloads: {
+			[releaseId]: {
+				error_code: "upstream_rejected",
+				error_summary: "上游模型拒绝请求",
+				error_detail: "AI returned 403 Forbidden: Chat upstream returned 403",
+			},
+		},
+		smartResolveStatuses: {
+			[releaseId]: "error",
+		},
+		smartResolveErrors: {
+			[releaseId]: {
+				error_code: "upstream_rejected",
+				error_summary: "上游模型拒绝请求",
+				error_detail: "AI returned 403 Forbidden: Chat upstream returned 403",
+			},
+		},
+		smartResolveDelayMs: 1000,
+	});
+
+	await page.goto("/?tab=releases");
+	await expect(page.getByRole("tab", { name: "发布" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+		{ timeout: 15_000 },
+	);
+	const releaseCard = page.locator(
+		`[data-feed-item-key="release:${releaseId}"]`,
+	);
+	await expect(releaseCard).toBeVisible();
+	await releaseCard.locator('[data-feed-lane-trigger="smart"]').click();
+	await expect(page.getByText("润色失败", { exact: true })).toBeVisible();
+	await expect
+		.poll(
+			() =>
+				tracker.translationResolveRequests.filter((request) =>
+					request.kinds.every((kind) => kind === "release_smart"),
+				).length,
+		)
+		.toBeGreaterThanOrEqual(1);
+	await releaseCard.getByRole("button", { name: "重试润色" }).click();
+	await expect
+		.poll(
+			() =>
+				tracker.translationResolveRequests.filter((request) =>
+					request.kinds.every((kind) => kind === "release_smart"),
+				).length,
+		)
+		.toBeGreaterThanOrEqual(2);
+
+	await expect(page.getByText("润色触发失败", { exact: true })).toHaveCount(1);
+	await expect(page.getByRole("button", { name: "定位到卡片" })).toHaveCount(1);
+	await expect(page.getByRole("button", { name: "重试润色" })).toHaveCount(2);
+	await page
+		.locator('[data-slot="toast"]')
+		.getByRole("button", { name: "重试润色" })
+		.click();
+	await expect
+		.poll(
+			() =>
+				tracker.translationResolveRequests.filter((request) =>
+					request.kinds.every((kind) => kind === "release_smart"),
+				).length,
+		)
+		.toBeGreaterThanOrEqual(3);
+
+	await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+	await page.getByRole("button", { name: "定位到卡片" }).click();
+	await expect
+		.poll(() =>
+			page.evaluate(() =>
+				document.activeElement?.getAttribute("data-feed-item-key"),
+			),
+		)
+		.toBe(`release:${releaseId}`);
 });
 
 test("feed load more auto retries newly appended translated failures once", async ({

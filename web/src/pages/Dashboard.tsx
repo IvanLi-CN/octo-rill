@@ -1483,7 +1483,7 @@ export function Dashboard(props: {
 		bootErrorDetail = null,
 		onRetryBoot,
 	} = props;
-	const { pushErrorToast, pushToast } = useAppToast();
+	const { dismissToast, pushErrorToast, pushToast } = useAppToast();
 	const queryClient = useQueryClient();
 	const isRouteControlled = controlledRouteState !== undefined;
 	const isAdmin = me.user.is_admin;
@@ -1637,6 +1637,8 @@ export function Dashboard(props: {
 		initialData: warmFeedData,
 		scope,
 	});
+	const feedItemsRef = useRef(feed.items);
+	feedItemsRef.current = feed.items;
 	const followingReposQuery = useQuery<FollowingReposResponse>({
 		queryKey: ["dashboard", "following-repos", me.user.id],
 		queryFn: apiGetFollowingRepos,
@@ -1977,6 +1979,16 @@ export function Dashboard(props: {
 		queryClient,
 		routeSelectedBriefId,
 	]);
+	const focusFeedItem = useCallback((key: string) => {
+		window.requestAnimationFrame(() => {
+			const element = Array.from(
+				document.querySelectorAll<HTMLElement>("[data-feed-item-key]"),
+			).find((item) => item.dataset.feedItemKey === key);
+			if (!element) return;
+			element.scrollIntoView({ block: "center", behavior: "smooth" });
+			element.focus({ preventScroll: true });
+		});
+	}, []);
 	const notifyGlobalError = useCallback(
 		(
 			title: string,
@@ -1985,17 +1997,62 @@ export function Dashboard(props: {
 			options?: {
 				actionLabel?: string;
 				onAction?: () => void;
+				secondaryActionLabel?: string;
+				onSecondaryAction?: () => void;
 				detail?: string | null;
+				dedupeKey?: string;
 			},
 		) => {
-			pushErrorToast(title, describeUnknownError(error, fallback), {
+			return pushErrorToast(title, describeUnknownError(error, fallback), {
+				dedupeKey: options?.dedupeKey,
 				actionLabel: options?.actionLabel,
 				onAction: options?.onAction,
+				secondaryActionLabel: options?.secondaryActionLabel,
+				onSecondaryAction: options?.onSecondaryAction,
 				detail:
 					options?.detail ?? (error instanceof Error ? error.message : null),
 			});
 		},
 		[pushErrorToast],
+	);
+	const notifyFeedLaneError = useCallback(
+		(
+			item: FeedItem,
+			lane: Extract<FeedLane, "translated" | "smart">,
+			error: unknown,
+			retry: (item: FeedItem) => Promise<unknown>,
+		) => {
+			const isSmart = lane === "smart";
+			const key = feedItemKey(item);
+			let toastId = "";
+			toastId = notifyGlobalError(
+				isSmart ? "润色触发失败" : "翻译触发失败",
+				error,
+				isSmart ? "润色触发失败，请稍后重试。" : "翻译触发失败，请稍后重试。",
+				{
+					dedupeKey: `dashboard-feed:${lane}:${key}`,
+					actionLabel: isSmart ? "重试润色" : "重试翻译",
+					onAction: async () => {
+						const currentItem = feedItemsRef.current.find(
+							(feedItem) => feedItemKey(feedItem) === key,
+						);
+						if (!currentItem) {
+							dismissToast(toastId);
+							return;
+						}
+						try {
+							await retry(currentItem);
+							dismissToast(toastId);
+						} catch (nextError) {
+							notifyFeedLaneError(currentItem, lane, nextError, retry);
+						}
+					},
+					secondaryActionLabel: "定位到卡片",
+					onSecondaryAction: () => focusFeedItem(key),
+				},
+			);
+		},
+		[dismissToast, feedItemsRef, focusFeedItem, notifyGlobalError],
 	);
 
 	const loadNotifications = useCallback(
@@ -3169,18 +3226,18 @@ export function Dashboard(props: {
 	const onTranslateNow = useCallback(
 		(item: FeedItem) => {
 			void translateNow(item).catch((error) => {
-				notifyGlobalError("翻译触发失败", error, "翻译触发失败，请稍后重试。");
+				notifyFeedLaneError(item, "translated", error, translateNow);
 			});
 		},
-		[notifyGlobalError, translateNow],
+		[notifyFeedLaneError, translateNow],
 	);
 	const onSmartNow = useCallback(
 		(item: FeedItem) => {
 			void smartNow(item).catch((error) => {
-				notifyGlobalError("润色触发失败", error, "润色触发失败，请稍后重试。");
+				notifyFeedLaneError(item, "smart", error, smartNow);
 			});
 		},
-		[notifyGlobalError, smartNow],
+		[notifyFeedLaneError, smartNow],
 	);
 	const requestLaneIfNeeded = useCallback(
 		(item: FeedItem, lane: FeedLane) => {
@@ -3194,11 +3251,7 @@ export function Dashboard(props: {
 						item.translated?.auto_translate !== false))
 			) {
 				void translateNow(item).catch((error) => {
-					notifyGlobalError(
-						"翻译触发失败",
-						error,
-						"翻译触发失败，请稍后重试。",
-					);
+					notifyFeedLaneError(item, "translated", error, translateNow);
 				});
 			}
 			if (
@@ -3208,15 +3261,11 @@ export function Dashboard(props: {
 						item.smart?.auto_translate !== false))
 			) {
 				void smartNow(item).catch((error) => {
-					notifyGlobalError(
-						"润色触发失败",
-						error,
-						"润色触发失败，请稍后重试。",
-					);
+					notifyFeedLaneError(item, "smart", error, smartNow);
 				});
 			}
 		},
-		[notifyGlobalError, smartNow, translateNow],
+		[notifyFeedLaneError, smartNow, translateNow],
 	);
 	const onSelectLane = useCallback(
 		(item: FeedItem, lane: FeedLane) => {

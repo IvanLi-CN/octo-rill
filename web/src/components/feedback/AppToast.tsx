@@ -23,6 +23,7 @@ type ToastVariant = "default" | "destructive";
 
 type AppToastRecord = {
 	id: string;
+	dedupeKey?: string;
 	title: string;
 	description: string;
 	detail?: string | null;
@@ -30,10 +31,13 @@ type AppToastRecord = {
 	duration: number;
 	actionLabel?: string;
 	onAction?: () => void;
+	secondaryActionLabel?: string;
+	onSecondaryAction?: () => void;
 	open: boolean;
 };
 
 export type AppToastInput = {
+	dedupeKey?: string;
 	title: string;
 	description: string;
 	detail?: string | null;
@@ -41,6 +45,8 @@ export type AppToastInput = {
 	duration?: number;
 	actionLabel?: string;
 	onAction?: () => void;
+	secondaryActionLabel?: string;
+	onSecondaryAction?: () => void;
 };
 
 type AppToastContextValue = {
@@ -88,20 +94,34 @@ export function AppToastProvider(props: { children: React.ReactNode }) {
 
 	const pushToast = useCallback((input: AppToastInput) => {
 		const id = makeToastId();
-		setToasts((current) => [
-			{
-				id,
-				title: input.title,
-				description: input.description,
-				detail: input.detail ?? null,
-				variant: input.variant ?? "default",
-				duration: input.duration ?? 6000,
-				actionLabel: input.actionLabel,
-				onAction: input.onAction,
-				open: true,
-			},
-			...current,
-		]);
+		const nextToast: AppToastRecord = {
+			id,
+			dedupeKey: input.dedupeKey,
+			title: input.title,
+			description: input.description,
+			detail: input.detail ?? null,
+			variant: input.variant ?? "default",
+			duration: input.duration ?? 6000,
+			actionLabel: input.actionLabel,
+			onAction: input.onAction,
+			secondaryActionLabel: input.secondaryActionLabel,
+			onSecondaryAction: input.onSecondaryAction,
+			open: true,
+		};
+		setToasts((current) => {
+			if (!input.dedupeKey) {
+				return [nextToast, ...current];
+			}
+			const existingIndex = current.findIndex(
+				(toast) => toast.dedupeKey === input.dedupeKey && toast.open,
+			);
+			if (existingIndex < 0) {
+				return [nextToast, ...current];
+			}
+			const next = current.slice();
+			next.splice(existingIndex, 1, nextToast);
+			return next;
+		});
 		return id;
 	}, []);
 
@@ -112,12 +132,15 @@ export function AppToastProvider(props: { children: React.ReactNode }) {
 			options?: Omit<AppToastInput, "title" | "description" | "variant">,
 		) => {
 			return pushToast({
+				dedupeKey: options?.dedupeKey,
 				title,
 				description,
 				detail: options?.detail,
 				duration: options?.duration,
 				actionLabel: options?.actionLabel,
 				onAction: options?.onAction,
+				secondaryActionLabel: options?.secondaryActionLabel,
+				onSecondaryAction: options?.onSecondaryAction,
 				variant: "destructive",
 			});
 		},
@@ -179,18 +202,33 @@ export function AppToastViewportHost() {
 							detail={toast.detail}
 							summary={toast.description}
 						/>
-						{toast.actionLabel && toast.onAction ? (
-							<div className="pt-1">
-								<ToastAction altText={toast.actionLabel} asChild>
-									<Button
-										variant="outline"
-										size="sm"
-										className="h-8 rounded-full font-mono text-xs"
-										onClick={toast.onAction}
-									>
-										{toast.actionLabel}
-									</Button>
-								</ToastAction>
+						{(toast.actionLabel && toast.onAction) ||
+						(toast.secondaryActionLabel && toast.onSecondaryAction) ? (
+							<div className="flex flex-wrap gap-2 pt-1">
+								{toast.actionLabel && toast.onAction ? (
+									<ToastAction altText={toast.actionLabel} asChild>
+										<Button
+											variant="outline"
+											size="sm"
+											className="h-8 rounded-full font-mono text-xs"
+											onClick={toast.onAction}
+										>
+											{toast.actionLabel}
+										</Button>
+									</ToastAction>
+								) : null}
+								{toast.secondaryActionLabel && toast.onSecondaryAction ? (
+									<ToastAction altText={toast.secondaryActionLabel} asChild>
+										<Button
+											variant="outline"
+											size="sm"
+											className="h-8 rounded-full font-mono text-xs"
+											onClick={toast.onSecondaryAction}
+										>
+											{toast.secondaryActionLabel}
+										</Button>
+									</ToastAction>
+								) : null}
 							</div>
 						) : null}
 					</div>
