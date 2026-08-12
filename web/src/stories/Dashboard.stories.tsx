@@ -2885,18 +2885,25 @@ function SmartFailureToastPreview() {
 	const cardRef = useRef<HTMLDivElement>(null);
 	const item = makeSmartRetryErrorFeed()[0] as ReleaseFeedItem;
 
+	const smartNow = async () => {
+		throw new Error("上游模型拒绝请求。");
+	};
+
 	const triggerFailure = () => {
-		pushErrorToast("润色触发失败", "上游模型拒绝请求。", {
-			dedupeKey: "dashboard-feed:smart:release:50005",
-			actionLabel: "重试润色",
-			onAction: triggerFailure,
-			secondaryActionLabel: "定位到卡片",
-			onSecondaryAction: () => {
-				const element = cardRef.current;
-				if (!element) return;
-				element.scrollIntoView({ block: "center", behavior: "smooth" });
-				element.focus({ preventScroll: true });
-			},
+		void smartNow().catch((error) => {
+			pushErrorToast("润色触发失败", "上游模型拒绝请求。", {
+				dedupeKey: "dashboard-feed:smart:release:50005",
+				actionLabel: "重试润色",
+				onAction: triggerFailure,
+				secondaryActionLabel: "定位到卡片",
+				onSecondaryAction: () => {
+					const element = cardRef.current;
+					if (!element) return;
+					element.scrollIntoView({ block: "center", behavior: "smooth" });
+					element.focus({ preventScroll: true });
+				},
+				detail: error instanceof Error ? error.message : null,
+			});
 		});
 	};
 

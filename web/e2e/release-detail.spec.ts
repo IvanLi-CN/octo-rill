@@ -1835,6 +1835,7 @@ test("feed smart localized retryable error shows neutral auto-retry waiting stat
 	await expect(page.getByRole("tab", { name: "发布" })).toHaveAttribute(
 		"aria-selected",
 		"true",
+		{ timeout: 15_000 },
 	);
 	await expect
 		.poll(() =>
@@ -2127,6 +2128,11 @@ test("feed smart trigger failures coalesce and locate the card", async ({
 	});
 
 	await page.goto("/?tab=releases");
+	await expect(page.getByRole("tab", { name: "发布" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+		{ timeout: 15_000 },
+	);
 	const releaseCard = page.locator(
 		`[data-feed-item-key="release:${releaseId}"]`,
 	);

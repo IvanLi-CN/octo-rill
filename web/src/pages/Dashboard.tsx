@@ -1483,7 +1483,7 @@ export function Dashboard(props: {
 		bootErrorDetail = null,
 		onRetryBoot,
 	} = props;
-	const { pushErrorToast, pushToast } = useAppToast();
+	const { dismissToast, pushErrorToast, pushToast } = useAppToast();
 	const queryClient = useQueryClient();
 	const isRouteControlled = controlledRouteState !== undefined;
 	const isAdmin = me.user.is_admin;
@@ -1637,6 +1637,8 @@ export function Dashboard(props: {
 		initialData: warmFeedData,
 		scope,
 	});
+	const feedItemsRef = useRef(feed.items);
+	feedItemsRef.current = feed.items;
 	const followingReposQuery = useQuery<FollowingReposResponse>({
 		queryKey: ["dashboard", "following-repos", me.user.id],
 		queryFn: apiGetFollowingRepos,
@@ -2001,7 +2003,7 @@ export function Dashboard(props: {
 				dedupeKey?: string;
 			},
 		) => {
-			pushErrorToast(title, describeUnknownError(error, fallback), {
+			return pushErrorToast(title, describeUnknownError(error, fallback), {
 				dedupeKey: options?.dedupeKey,
 				actionLabel: options?.actionLabel,
 				onAction: options?.onAction,
@@ -2022,24 +2024,35 @@ export function Dashboard(props: {
 		) => {
 			const isSmart = lane === "smart";
 			const key = feedItemKey(item);
-			notifyGlobalError(
+			let toastId = "";
+			toastId = notifyGlobalError(
 				isSmart ? "润色触发失败" : "翻译触发失败",
 				error,
 				isSmart ? "润色触发失败，请稍后重试。" : "翻译触发失败，请稍后重试。",
 				{
 					dedupeKey: `dashboard-feed:${lane}:${key}`,
 					actionLabel: isSmart ? "重试润色" : "重试翻译",
-					onAction: () => {
-						void retry(item).catch((nextError) =>
-							notifyFeedLaneError(item, lane, nextError, retry),
+					onAction: async () => {
+						const currentItem = feedItemsRef.current.find(
+							(feedItem) => feedItemKey(feedItem) === key,
 						);
+						if (!currentItem) {
+							dismissToast(toastId);
+							return;
+						}
+						try {
+							await retry(currentItem);
+							dismissToast(toastId);
+						} catch (nextError) {
+							notifyFeedLaneError(currentItem, lane, nextError, retry);
+						}
 					},
 					secondaryActionLabel: "定位到卡片",
 					onSecondaryAction: () => focusFeedItem(key),
 				},
 			);
 		},
-		[focusFeedItem, notifyGlobalError],
+		[dismissToast, feedItemsRef, focusFeedItem, notifyGlobalError],
 	);
 
 	const loadNotifications = useCallback(
