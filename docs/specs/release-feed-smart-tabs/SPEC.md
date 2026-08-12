@@ -352,7 +352,7 @@
   viewport_strategy: `storybook-viewport`
   margin_policy: `require_margin`
   evidence_surface: `component`
-  evidence_binding_sha: `d89c13d60cb608af79880ddb3b206ad7acc05dfb`
+  evidence_binding_sha: `118fdfe`
   evidence_note: 验证同一卡片润色失败 toast 同时提供“重试润色”和“定位到卡片”，重复失败仍只保留一条提示。
   PR: include
 
@@ -366,7 +366,7 @@
   viewport_strategy: `storybook-viewport`
   margin_policy: `require_margin`
   evidence_surface: `component`
-  evidence_binding_sha: `d89c13d60cb608af79880ddb3b206ad7acc05dfb`
+  evidence_binding_sha: `118fdfe`
   evidence_note: 验证失败卡片自身仍保留“重试润色”，toast 的重试入口与卡片 lane 复用同一请求语义。
   PR: include
 
