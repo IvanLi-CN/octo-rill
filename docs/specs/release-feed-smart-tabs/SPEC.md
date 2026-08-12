@@ -343,3 +343,31 @@
   evidence_note: 验证 Release 详情弹窗在 smart 缺失时显示 `润色中…`，正文继续保留原始 release notes。
 
   ![Release 详情润色生成中保留原文](./assets/release-detail-smart-loading-original-fallback.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `Pages/Dashboard/SmartFailureToastLocateCard`
+  state: `smart-failure-toast-with-retry-and-locate`
+  target_program: `mock-only`
+  capture_scope: `element`
+  viewport_strategy: `storybook-viewport`
+  margin_policy: `require_margin`
+  evidence_surface: `component`
+  evidence_binding_sha: `118fdfe`
+  evidence_note: 验证同一卡片润色失败 toast 同时提供“重试润色”和“定位到卡片”，重复失败仍只保留一条提示。
+  PR: include
+
+  ![润色失败 toast 操作](./assets/release-smart-failure-toast.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `Pages/Dashboard/SmartFailureToastLocateCard`
+  state: `smart-failure-card-with-local-retry`
+  target_program: `mock-only`
+  capture_scope: `element`
+  viewport_strategy: `storybook-viewport`
+  margin_policy: `require_margin`
+  evidence_surface: `component`
+  evidence_binding_sha: `118fdfe`
+  evidence_note: 验证失败卡片自身仍保留“重试润色”，toast 的重试入口与卡片 lane 复用同一请求语义。
+  PR: include
+
+  ![润色失败卡片重试](./assets/release-smart-failure-card.png)
