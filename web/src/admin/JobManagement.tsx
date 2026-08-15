@@ -6099,16 +6099,14 @@ export function JobManagement({
 							</div>
 							<div className="flex items-center gap-2">
 								<fieldset
-									className="bg-muted flex h-9 items-center rounded-md border p-0.5"
+									className="bg-muted/80 flex h-9 items-center rounded-md border p-0.5 shadow-sm"
 									aria-label="LLM 概览视图"
 								>
 									<Button
 										type="button"
-										variant={
-											llmOverviewView === "activity" ? "secondary" : "ghost"
-										}
+										variant="ghost"
 										size="icon"
-										className="size-7"
+										className={`size-7 border transition-colors ${llmOverviewView === "activity" ? "border-primary bg-primary text-primary-foreground shadow-sm hover:bg-primary/90 hover:text-primary-foreground" : "border-transparent text-muted-foreground hover:bg-background hover:text-foreground"}`}
 										aria-label="显示模型活动图"
 										aria-pressed={llmOverviewView === "activity"}
 										title="活动图"
@@ -6118,11 +6116,9 @@ export function JobManagement({
 									</Button>
 									<Button
 										type="button"
-										variant={
-											llmOverviewView === "cards" ? "secondary" : "ghost"
-										}
+										variant="ghost"
 										size="icon"
-										className="size-7"
+										className={`size-7 border transition-colors ${llmOverviewView === "cards" ? "border-primary bg-primary text-primary-foreground shadow-sm hover:bg-primary/90 hover:text-primary-foreground" : "border-transparent text-muted-foreground hover:bg-background hover:text-foreground"}`}
 										aria-label="显示模型状态卡片"
 										aria-pressed={llmOverviewView === "cards"}
 										title="模型卡片"
