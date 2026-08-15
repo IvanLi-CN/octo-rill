@@ -4486,7 +4486,7 @@ export function JobManagement({
 				llm_models: llmModels,
 			});
 			setLlmStatus(nextStatus);
-			void loadLlmActivity({ background: true });
+			void loadLlmActivity();
 			setLlmSettingsDialogOpen(false);
 		} catch (err) {
 			setLlmSettingsSaveError(normalizeErrorMessage(err));
