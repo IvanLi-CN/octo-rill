@@ -2264,8 +2264,15 @@ test("admin llm activity prioritizes the grid on mobile", async ({ page }) => {
 
 	const grid = page.getByTestId("llm-activity-grid");
 	await expect(grid).toBeVisible({ timeout: 10_000 });
+	await expect(grid.getByText("最近 25 小时", { exact: false })).toBeVisible();
+	await expect(grid.getByTestId("llm-activity-mobile-range")).toContainText(
+		"至",
+	);
 	const modelLabel = grid.locator('span[title="gpt-4o-mini"]');
 	await expect(modelLabel).toBeHidden();
+	await expect(grid.getByRole("button", { name: /gpt-4o-mini/ })).toHaveCount(
+		25,
+	);
 
 	const modelNamesToggle = grid.getByRole("button", { name: "显示模型名" });
 	await expect(modelNamesToggle).toHaveAttribute("aria-pressed", "false");
