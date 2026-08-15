@@ -4486,13 +4486,19 @@ export function JobManagement({
 				llm_models: llmModels,
 			});
 			setLlmStatus(nextStatus);
+			void loadLlmActivity({ background: true });
 			setLlmSettingsDialogOpen(false);
 		} catch (err) {
 			setLlmSettingsSaveError(normalizeErrorMessage(err));
 		} finally {
 			setLlmSettingsSaving(false);
 		}
-	}, [llmMaxConcurrencyInput, llmModelContextLimitInput, llmModelsInput]);
+	}, [
+		llmMaxConcurrencyInput,
+		llmModelContextLimitInput,
+		llmModelsInput,
+		loadLlmActivity,
+	]);
 
 	const loadLlmCalls = useCallback(
 		async (options?: LoadOptions) => {
