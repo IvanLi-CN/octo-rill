@@ -38,6 +38,7 @@ const localTime = (value: string) =>
 	}).format(new Date(value));
 
 const ACTIVITY_SUMMARY_ID = "llm-activity-summary";
+const MOBILE_BUCKET_COUNT = 25;
 
 const activityClass = (count: number, maximum: number) => {
 	if (count === 0 || maximum === 0) return "bg-muted/80 ring-border/50";
@@ -114,9 +115,12 @@ export function LlmActivityGrid({
 		if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
 		event.preventDefault();
 		const direction = event.key === "ArrowLeft" ? -1 : 1;
+		const firstVisibleColumn = window.matchMedia("(min-width: 768px)").matches
+			? 0
+			: Math.max(0, (data?.buckets.length ?? 0) - MOBILE_BUCKET_COUNT);
 		const next = Math.min(
 			(data?.buckets.length ?? 1) - 1,
-			Math.max(0, column + direction),
+			Math.max(firstVisibleColumn, column + direction),
 		);
 		setHoveredColumn(next);
 		setPinnedColumn((current) => (current === null ? null : next));
@@ -157,15 +161,25 @@ export function LlmActivityGrid({
 	const bucketSucceeded =
 		selectedBucket?.counts.reduce((sum, count) => sum + count.succeeded, 0) ??
 		0;
+	const mobileBucketStart = Math.max(
+		0,
+		data.buckets.length - MOBILE_BUCKET_COUNT,
+	);
+	const mobileBuckets = data.buckets.slice(mobileBucketStart);
 	const gridStyle = {
 		"--llm-activity-bucket-count": data.bucket_count,
+		"--llm-activity-mobile-bucket-count": mobileBuckets.length,
 	} as CSSProperties;
 
 	return (
 		<div ref={rootRef} className="relative" data-testid="llm-activity-grid">
 			<div className="mb-2 flex min-h-8 items-center justify-between gap-3">
 				<p className="text-muted-foreground text-xs">
-					最近 {data.bucket_count} 小时 · 本地时间
+					<span className="md:hidden">最近 {mobileBuckets.length} 小时</span>
+					<span className="hidden md:inline">
+						最近 {data.bucket_count} 小时
+					</span>
+					{" · 本地时间"}
 				</p>
 				<div className="flex items-center gap-2">
 					{refreshing ? (
@@ -191,20 +205,32 @@ export function LlmActivityGrid({
 					</Button>
 				</div>
 			</div>
+			{mobileBuckets.length > 0 ? (
+				<div
+					className="text-muted-foreground mb-2 flex items-center justify-between font-mono text-[10px] tabular-nums md:hidden"
+					data-testid="llm-activity-mobile-range"
+				>
+					<span>{localTime(mobileBuckets[0].started_at)}</span>
+					<span aria-hidden="true">至</span>
+					<span>
+						{localTime(mobileBuckets[mobileBuckets.length - 1].ended_at)}
+					</span>
+				</div>
+			) : null}
 			<div className="overflow-x-auto pb-2">
 				<div
-					className={`grid w-max gap-x-[3px] gap-y-1 md:grid-cols-[152px_repeat(var(--llm-activity-bucket-count),16px)] ${showMobileModelNames ? "grid-cols-[152px_repeat(var(--llm-activity-bucket-count),16px)]" : "grid-cols-[28px_repeat(var(--llm-activity-bucket-count),16px)]"}`}
+					className={`grid w-max gap-x-px gap-y-1 md:grid-cols-[152px_repeat(var(--llm-activity-bucket-count),16px)] md:gap-x-[3px] ${showMobileModelNames ? "grid-cols-[152px_repeat(var(--llm-activity-mobile-bucket-count),10px)]" : "grid-cols-[28px_repeat(var(--llm-activity-mobile-bucket-count),10px)]"}`}
 					style={gridStyle}
 				>
-					<div className="bg-card sticky left-0 z-20" />
+					<div className="bg-card sticky left-0 z-20 h-0 md:h-auto" />
 					{data.buckets.map((bucket, column) => (
 						<div
 							key={bucket.started_at}
-							className="text-muted-foreground h-8 text-xs"
+							className={`${column < mobileBucketStart ? "hidden md:block" : "h-0"} text-muted-foreground text-xs md:h-8`}
 							title={localTime(bucket.started_at)}
 						>
 							{column % 6 === 0 || column === data.buckets.length - 1 ? (
-								<span className="inline-block origin-bottom-left rotate-[-45deg] whitespace-nowrap">
+								<span className="hidden origin-bottom-left rotate-[-45deg] whitespace-nowrap md:inline-block">
 									{localTime(bucket.started_at).slice(0, 5)}
 								</span>
 							) : null}
@@ -218,7 +244,7 @@ export function LlmActivityGrid({
 					{data.models.map((model) => [
 						<div
 							key={`${model.model}:label`}
-							className="bg-card sticky left-0 z-10 flex h-4 items-center pr-1 md:pr-3"
+							className="bg-card sticky left-0 z-10 flex h-2.5 items-center pr-1 md:h-4 md:pr-3"
 						>
 							<span
 								className={`${showMobileModelNames ? "inline" : "hidden"} truncate font-mono text-xs md:inline`}
@@ -252,7 +278,7 @@ export function LlmActivityGrid({
 										else cellRefs.current.delete(key);
 									}}
 									type="button"
-									className={`size-4 rounded-[3px] ring-1 transition-[filter,transform] hover:brightness-95 focus-visible:z-20 focus-visible:scale-125 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${activityClass(total, visibleMax)} ${activeColumn === column ? "brightness-90 ring-2 ring-foreground/45" : ""}`}
+									className={`${column < mobileBucketStart ? "hidden md:block" : ""} size-2.5 rounded-[2px] ring-1 transition-[filter,transform] hover:brightness-95 focus-visible:z-20 focus-visible:scale-125 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:size-4 md:rounded-[3px] ${activityClass(total, visibleMax)} ${activeColumn === column ? "brightness-90 ring-2 ring-foreground/45" : ""}`}
 									aria-label={`${localTime(bucket.started_at)}，${model.model}，成功 ${count.succeeded}，失败 ${count.failed}`}
 									aria-controls={ACTIVITY_SUMMARY_ID}
 									aria-expanded={activeColumn === column}

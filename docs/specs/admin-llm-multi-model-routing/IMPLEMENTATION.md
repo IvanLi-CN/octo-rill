@@ -6,7 +6,7 @@
 - Implementation: 已实现
 - Created: 2026-06-28
 - Last: 2026-08-15
-- Summary: 多模型路由与固定 50 小时活动接口、默认活动图/卡片切换、列聚合交互及独立刷新状态均已实现。
+- Summary: 多模型路由与固定 50 小时活动接口、移动端 25 小时紧凑视图、活动图/卡片切换、列聚合交互及独立刷新状态均已实现。
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
