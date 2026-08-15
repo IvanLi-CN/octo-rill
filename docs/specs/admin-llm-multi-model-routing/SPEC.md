@@ -16,6 +16,7 @@
 - 保留现有单模型内部重试语义；某模型在一次调用内跑完现有重试预算后仍失败，才记为一次模型级最终失败。
 - 同一模型连续 3 次最终失败后进入 10 分钟冷却，后续新请求优先改用后续模型；冷却到期后自动恢复优先尝试。
 - 输入预算、管理员状态接口、调用日志与翻译批次画像一起收敛到多模型语义。
+- 在管理员 LLM 调度卡片中按最近 50 个 UTC 小时展示逐模型终态调用活动，并保留模型状态卡片视图。
 
 ### Non-goals
 
@@ -38,7 +39,8 @@
 
 - 多 provider failover。
 - 历史 `llm_calls` / `translation_batches` 数据回填为新路由画像。
-- 新增按模型分桶的 24h 统计图或独立健康面板。
+- 可配置桶宽、桶数、历史回填、跨实例聚合或独立健康面板。
+- 用活动颜色表达成功率；活动颜色只表达成功与失败终态调用总量。
 
 ## 需求（Requirements）
 
@@ -106,6 +108,18 @@
   - `effective_input_limit`
   - `effective_input_limit_source`
 
+### 5. 模型活动窗口
+
+- `GET /api/admin/jobs/llm/activity` 是独立的管理员只读接口，不接受查询参数。
+- 响应固定为 `bucket_minutes = 60`、`bucket_count = 50`；窗口包含当前 UTC 小时及前 49 小时，`window_started_at` 与 `window_ended_at` 分别为完整窗口的左闭、右开边界。
+- 只有 `succeeded | failed` 终态进入统计，以 `finished_at` 为首选终态时间；运行时 override 覆盖尚未持久化的状态和时间后再聚合。
+- 当前配置模型先按优先级排列；窗口内有终态活动但已移除的模型随后按最近活动时间倒序、模型名升序排列。
+- 所有模型均补齐 50 个桶以及零计数单元，响应中的每个桶按相同模型顺序返回计数。
+- 活动图默认展示，使用设置按钮旁的图表/卡片图标分段控件切换；选择仅存在于当前组件生命周期，不影响调用列表筛选。
+- 单元格活动量为 `succeeded + failed`。零调用显示中性灰，非零单元按 `ceil(4 * cell_count / visible_max)` 映射四级活动颜色。
+- 悬浮、键盘聚焦或点击任一时间列时，聚合窗逐模型显示成功数、失败数、`成功 / (成功 + 失败)` 与 `模型成功 / 桶内全部模型成功`；零分母显示 `--`。
+- 图表拥有独立的首次加载、错误、重试和后台刷新状态；SSE 或手动刷新期间保留旧网格，直到新响应到达。
+
 ## 接口契约（Interfaces & Contracts）
 
 ### 接口清单（Inventory）
@@ -113,6 +127,7 @@
 | 接口（Name） | 类型（Kind） | 范围（Scope） | 变更（Change） | 契约文档（Contract Doc） | 负责人（Owner） | 使用方（Consumers） |
 | --- | --- | --- | --- | --- | --- | --- |
 | `GET /api/admin/jobs/llm/status` | HTTP API | external | Modify | `./contracts/http-apis.md` | backend | web-admin |
+| `GET /api/admin/jobs/llm/activity` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web-admin |
 | `PATCH /api/admin/jobs/llm/runtime-config` | HTTP API | external | Modify | `./contracts/http-apis.md` | backend | web-admin |
 | `admin_runtime_settings.llm_models_json` | DB schema | internal | New | `./contracts/db.md` | backend | backend |
 | LLM runtime model health state | Runtime contract | internal | New | `./contracts/db.md` | backend | backend |
@@ -149,6 +164,14 @@
   When 读取 `GET /api/admin/jobs/llm/status`
   Then `effective_model_input_limit` 与 `selected_model_for_new_calls` 对应模型一致。
 
+- Given 管理员首次打开 LLM 调度页
+  When 活动数据加载完成
+  Then 默认显示最近 50 小时逐模型活动图，并可切回原有模型卡片。
+
+- Given 某小时同时存在多个模型的成功与失败调用
+  When 悬浮、聚焦或固定该时间列
+  Then 聚合窗按模型显示精确计数、成功率和按成功计的使用率。
+
 ## 非功能性验收 / 质量门槛（Quality Gates）
 
 - Rust tests: `cargo test`
@@ -173,9 +196,17 @@ PR: include
 
 - 管理端 `LLM 调度` 多模型设置弹窗（含排序按钮）Storybook canvas。
 - 管理端 `LLM 调度` 状态卡展示首选模型冷却、次选模型接管的 Storybook canvas。
+- 管理端活动图桌面深色聚合窗与 `393x852` 移动端浅色横向滚动页面证据。
+
+PR: include
+![LLM activity desktop dark](./assets/llm-activity-desktop-dark.png)
+
+PR: include
+![LLM activity mobile light](./assets/llm-activity-mobile-light.png)
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
 - 假设：多模型 v1 只运行在同一 provider/base URL/api key 下；这轮不做多密钥与 provider 抽象。
 - 假设：模型冷却状态进程内持有即可接受；服务重启后允许恢复为 clean state。
 - 风险：若模型目录缺失某模型的上下文窗口，系统会回落到 builtin / unknown fallback，可能让小上下文模型在估算上偏乐观或偏保守。
+- 假设：现有 `llm_calls` 七日保留期足以覆盖 50 小时窗口；无需 migration 或 ADR，因为没有新增持久化真相源、跨模块架构边界或不可逆技术决策。

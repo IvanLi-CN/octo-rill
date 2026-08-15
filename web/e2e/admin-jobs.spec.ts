@@ -258,6 +258,40 @@ async function installAdminJobsMocks(
 		last_success_at: "2026-02-26T03:00:01Z",
 		last_failure_at: "2026-02-26T02:00:03Z",
 	};
+	const llmActivityStart = new Date("2026-02-24T01:00:00Z");
+	const llmActivity = {
+		bucket_minutes: 60,
+		bucket_count: 50,
+		window_started_at: llmActivityStart.toISOString(),
+		window_ended_at: new Date(
+			llmActivityStart.getTime() + 50 * 3_600_000,
+		).toISOString(),
+		models: [
+			{ model: "gpt-4o-mini", priority: 1, configured: true },
+			{ model: "gpt-4.1-mini", priority: 2, configured: true },
+		],
+		buckets: Array.from({ length: 50 }, (_, index) => {
+			const startedAt = new Date(
+				llmActivityStart.getTime() + index * 3_600_000,
+			);
+			return {
+				started_at: startedAt.toISOString(),
+				ended_at: new Date(startedAt.getTime() + 3_600_000).toISOString(),
+				counts: [
+					{
+						model: "gpt-4o-mini",
+						succeeded: index === 49 ? 8 : index % 4 === 0 ? 3 : 0,
+						failed: index === 49 ? 2 : 0,
+					},
+					{
+						model: "gpt-4.1-mini",
+						succeeded: index === 49 ? 2 : index % 3 === 0 ? 1 : 0,
+						failed: index === 49 ? 1 : 0,
+					},
+				],
+			};
+		}),
+	};
 	const syncSubscriptionChainFinishedAt: Record<string, string> = {
 		"task-subscriptions-1": "2026-02-26T14:50:30Z",
 	};
@@ -1494,6 +1528,10 @@ async function installAdminJobsMocks(
 			return json(route, llmSchedulerStatus);
 		}
 
+		if (req.method() === "GET" && pathname === "/api/admin/jobs/llm/activity") {
+			return json(route, llmActivity);
+		}
+
 		if (
 			req.method() === "GET" &&
 			pathname === "/api/admin/jobs/sync/runtime-config"
@@ -2176,11 +2214,54 @@ test("admin llm calls are sorted by status group and created time", async ({
 	]);
 });
 
+test("admin llm activity defaults to chart and keeps list filters independent", async ({
+	page,
+}) => {
+	const activityRequests: URL[] = [];
+	page.on("request", (request) => {
+		const url = new URL(request.url());
+		if (url.pathname === "/api/admin/jobs/llm/activity") {
+			activityRequests.push(url);
+		}
+	});
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+	const grid = page.getByTestId("llm-activity-grid");
+	await expect(grid).toBeVisible({ timeout: 10_000 });
+	await expect(
+		page.getByRole("button", { name: "显示模型活动图" }),
+	).toHaveAttribute("aria-pressed", "true");
+	const latestCell = grid.getByRole("button", {
+		name: /gpt-4o-mini，成功 8，失败 2/,
+	});
+	await latestCell.click();
+	const summary = grid.getByTestId("llm-activity-summary");
+	await expect(summary).toContainText("80%");
+	await expect(summary).toContainText("67%");
+	await latestCell.press("ArrowLeft");
+	await expect(summary).toBeVisible();
+	await page.keyboard.press("Escape");
+	await expect(summary).toHaveCount(0);
+
+	await page.getByRole("combobox", { name: "LLM 调用状态筛选" }).click();
+	await page.getByRole("option", { name: "状态：失败" }).click();
+	await expect(page.getByText("job.api.translate_release")).toBeVisible();
+	expect(activityRequests.length).toBeGreaterThan(0);
+	expect(activityRequests.every((request) => request.search === "")).toBe(true);
+
+	await page.getByRole("button", { name: "显示模型状态卡片" }).click();
+	await expect(grid).toHaveCount(0);
+	await expect(page.getByText("冷却中")).toBeVisible();
+	await page.reload({ waitUntil: "domcontentloaded" });
+	await expect(page.getByTestId("llm-activity-grid")).toBeVisible();
+});
+
 test("admin keeps llm calls visible during sse refresh", async ({ page }) => {
 	test.slow();
 	await installAdminJobsMocks(page, {
 		responseDelayMs: 1200,
-		delayedPaths: ["/api/admin/jobs/llm/calls"],
+		delayedPaths: ["/api/admin/jobs/llm/calls", "/api/admin/jobs/llm/activity"],
 		emitStreamEvents: true,
 	});
 	await page.goto("/admin/jobs");
@@ -2190,6 +2271,8 @@ test("admin keeps llm calls visible during sse refresh", async ({ page }) => {
 	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
 	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
 	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
+	await expect(page.getByTestId("llm-activity-grid")).toBeVisible();
+	await expect(page.getByText("更新中", { exact: true })).toBeVisible();
 });
 
 test("admin keeps newest llm filter results after overlapping refreshes", async ({
@@ -2485,6 +2568,7 @@ test("admin can update llm runtime settings from settings dialog", async ({
 		page.getByText("并发上限 5 · 可用 4 · 输入 65,536 tokens"),
 	).toBeVisible();
 	await expect(page.getByText("当前优先模型：")).toBeVisible();
+	await page.getByRole("button", { name: "显示模型状态卡片" }).click();
 	await expect(page.getByText("1. gpt-4.1-mini")).toBeVisible();
 });
 

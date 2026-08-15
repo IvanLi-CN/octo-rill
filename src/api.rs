@@ -13,7 +13,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, extract::State};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{Datelike, TimeZone};
+use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
@@ -6795,6 +6795,49 @@ pub struct AdminLlmSchedulerStatusResponse {
     last_failure_at: Option<String>,
 }
 
+const ADMIN_LLM_ACTIVITY_BUCKET_MINUTES: i64 = 60;
+const ADMIN_LLM_ACTIVITY_BUCKET_COUNT: usize = 50;
+
+#[derive(Debug, Serialize)]
+pub struct AdminLlmActivityModel {
+    model: String,
+    priority: Option<i64>,
+    configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminLlmActivityCount {
+    model: String,
+    succeeded: i64,
+    failed: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminLlmActivityBucket {
+    started_at: String,
+    ended_at: String,
+    counts: Vec<AdminLlmActivityCount>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminLlmActivityResponse {
+    bucket_minutes: i64,
+    bucket_count: usize,
+    window_started_at: String,
+    window_ended_at: String,
+    models: Vec<AdminLlmActivityModel>,
+    buckets: Vec<AdminLlmActivityBucket>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AdminLlmActivityCallRow {
+    id: String,
+    status: String,
+    model: String,
+    finished_at: Option<String>,
+    updated_at: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AdminLlmRuntimeConfigUpdateRequest {
     max_concurrency: i64,
@@ -6966,6 +7009,189 @@ pub async fn admin_get_llm_scheduler_status(
     Ok(Json(
         load_admin_llm_scheduler_status_response(state.as_ref()).await?,
     ))
+}
+
+pub async fn admin_get_llm_activity(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<AdminLlmActivityResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    admin_runtime::sync_persisted_runtime_settings(state.clone())
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(
+        load_admin_llm_activity_response(state.as_ref(), Utc::now()).await?,
+    ))
+}
+
+async fn load_admin_llm_activity_response(
+    state: &AppState,
+    now: DateTime<Utc>,
+) -> Result<AdminLlmActivityResponse, ApiError> {
+    let current_hour = now
+        .with_minute(0)
+        .and_then(|value| value.with_second(0))
+        .and_then(|value| value.with_nanosecond(0))
+        .ok_or_else(|| ApiError::internal(anyhow::anyhow!("truncate UTC hour failed")))?;
+    let window_started_at = current_hour
+        - Duration::hours(i64::try_from(ADMIN_LLM_ACTIVITY_BUCKET_COUNT - 1).unwrap_or(49));
+    let window_ended_at = current_hour + Duration::hours(1);
+    let window_start_text = window_started_at.to_rfc3339();
+    let window_end_text = window_ended_at.to_rfc3339();
+
+    let mut rows = sqlx::query_as::<_, AdminLlmActivityCallRow>(
+        r#"
+        SELECT id, status, model, finished_at, updated_at
+        FROM llm_calls
+        WHERE COALESCE(finished_at, updated_at, created_at) >= ?
+          AND COALESCE(finished_at, updated_at, created_at) < ?
+        "#,
+    )
+    .bind(window_start_text.as_str())
+    .bind(window_end_text.as_str())
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let overrides = state.llm_scheduler.admin_overrides().await;
+    let loaded_ids = rows
+        .iter()
+        .map(|row| row.id.as_str())
+        .collect::<HashSet<_>>();
+    let missing_override_ids = overrides
+        .keys()
+        .filter(|id| !loaded_ids.contains(id.as_str()))
+        .collect::<Vec<_>>();
+    if !missing_override_ids.is_empty() {
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT id, status, model, finished_at, updated_at FROM llm_calls WHERE id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for id in missing_override_ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(")");
+        rows.extend(
+            query
+                .build_query_as::<AdminLlmActivityCallRow>()
+                .fetch_all(&state.pool)
+                .await
+                .map_err(ApiError::internal)?,
+        );
+    }
+    for row in &mut rows {
+        if let Some(snapshot) = overrides.get(&row.id) {
+            row.status = snapshot.status.clone();
+            row.finished_at = snapshot.finished_at.clone();
+            row.updated_at = snapshot.updated_at.clone();
+        }
+    }
+
+    let configured_models = admin_runtime::load_llm_models(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let configured_set = configured_models.iter().cloned().collect::<HashSet<_>>();
+    let mut aggregated = HashMap::<(usize, String), (i64, i64)>::new();
+    let mut historical_latest = HashMap::<String, DateTime<Utc>>::new();
+
+    for row in rows {
+        if row.status != "succeeded" && row.status != "failed" {
+            continue;
+        }
+        let terminal_at = row
+            .finished_at
+            .as_deref()
+            .unwrap_or(row.updated_at.as_str());
+        let Ok(terminal_at) = DateTime::parse_from_rfc3339(terminal_at) else {
+            continue;
+        };
+        let terminal_at = terminal_at.with_timezone(&Utc);
+        if terminal_at < window_started_at || terminal_at >= window_ended_at {
+            continue;
+        }
+        let bucket_index = usize::try_from(
+            (terminal_at - window_started_at).num_minutes() / ADMIN_LLM_ACTIVITY_BUCKET_MINUTES,
+        )
+        .unwrap_or(ADMIN_LLM_ACTIVITY_BUCKET_COUNT);
+        if bucket_index >= ADMIN_LLM_ACTIVITY_BUCKET_COUNT {
+            continue;
+        }
+        let counts = aggregated
+            .entry((bucket_index, row.model.clone()))
+            .or_insert((0, 0));
+        if row.status == "succeeded" {
+            counts.0 += 1;
+        } else {
+            counts.1 += 1;
+        }
+        if !configured_set.contains(&row.model) {
+            historical_latest
+                .entry(row.model)
+                .and_modify(|latest| *latest = (*latest).max(terminal_at))
+                .or_insert(terminal_at);
+        }
+    }
+
+    let mut historical_models = historical_latest.into_iter().collect::<Vec<_>>();
+    historical_models.sort_by(|(left_model, left_at), (right_model, right_at)| {
+        right_at
+            .cmp(left_at)
+            .then_with(|| left_model.cmp(right_model))
+    });
+
+    let mut models = configured_models
+        .into_iter()
+        .enumerate()
+        .map(|(index, model)| AdminLlmActivityModel {
+            model,
+            priority: Some(i64::try_from(index + 1).unwrap_or(i64::MAX)),
+            configured: true,
+        })
+        .collect::<Vec<_>>();
+    models.extend(
+        historical_models
+            .into_iter()
+            .map(|(model, _)| AdminLlmActivityModel {
+                model,
+                priority: None,
+                configured: false,
+            }),
+    );
+
+    let buckets = (0..ADMIN_LLM_ACTIVITY_BUCKET_COUNT)
+        .map(|index| {
+            let started_at =
+                window_started_at + Duration::hours(i64::try_from(index).unwrap_or(i64::MAX));
+            let counts = models
+                .iter()
+                .map(|model| {
+                    let (succeeded, failed) = aggregated
+                        .get(&(index, model.model.clone()))
+                        .copied()
+                        .unwrap_or((0, 0));
+                    AdminLlmActivityCount {
+                        model: model.model.clone(),
+                        succeeded,
+                        failed,
+                    }
+                })
+                .collect();
+            AdminLlmActivityBucket {
+                started_at: started_at.to_rfc3339(),
+                ended_at: (started_at + Duration::hours(1)).to_rfc3339(),
+                counts,
+            }
+        })
+        .collect();
+
+    Ok(AdminLlmActivityResponse {
+        bucket_minutes: ADMIN_LLM_ACTIVITY_BUCKET_MINUTES,
+        bucket_count: ADMIN_LLM_ACTIVITY_BUCKET_COUNT,
+        window_started_at: window_start_text,
+        window_ended_at: window_end_text,
+        models,
+        buckets,
+    })
 }
 
 pub async fn admin_patch_llm_runtime_config(
@@ -21256,25 +21482,26 @@ mod tests {
         ReleaseReactionViewer, ReleaseSmartBatchCandidate, ReturnModeQuery,
         SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslationCacheRow, TranslationUpsert,
         admin_dashboard, admin_delete_public_release_repo, admin_download_realtime_task_log,
-        admin_get_llm_call_detail, admin_get_llm_scheduler_status, admin_get_realtime_task_detail,
-        admin_get_release_freshness_audit, admin_list_llm_calls, admin_list_realtime_tasks,
-        admin_list_repo_governance, admin_list_users, admin_patch_llm_runtime_config,
-        admin_patch_user, admin_users_offset, ai_error_is_non_retryable,
-        brief_contains_release_link, build_compare_digest, build_feed_reaction_refresh_item,
-        build_task_diagnostics, compact_dashboard_signatures, dashboard_updates,
-        encode_dashboard_updates_token, ensure_account_enabled, execute_sync_all_sync_with,
-        extract_brief_release_ids, extract_translation_fields, feed_item_from_row, get_brief,
-        get_release_detail, get_release_detail_by_repo_tag, get_repo_public_release_status,
-        github_access_restricted_error, github_graphql_errors_to_api_error,
-        github_graphql_http_error, github_rate_limited_error, github_reauth_required_error,
-        guard_admin_user_update, has_repo_scope, last_active_is_stale, list_briefs, list_feed,
-        list_personal_repos, list_releases, llm_call_order_by_clause,
-        load_admin_dashboard_today_live_snapshot, load_pending_access_sync_reason,
-        load_viewer_user, looks_like_json_blob, map_job_action_error,
-        map_public_compare_fallback_error, mark_translation_requested,
-        markdown_structure_preserved, me, me_create_api_key, me_delete_api_key, me_delete_passkey,
-        me_get_api_keys, me_resume, normalize_markdown_translation_output,
-        normalize_translation_fields, parse_batch_notification_translation_payload,
+        admin_get_llm_activity, admin_get_llm_call_detail, admin_get_llm_scheduler_status,
+        admin_get_realtime_task_detail, admin_get_release_freshness_audit, admin_list_llm_calls,
+        admin_list_realtime_tasks, admin_list_repo_governance, admin_list_users,
+        admin_patch_llm_runtime_config, admin_patch_user, admin_users_offset,
+        ai_error_is_non_retryable, brief_contains_release_link, build_compare_digest,
+        build_feed_reaction_refresh_item, build_task_diagnostics, compact_dashboard_signatures,
+        dashboard_updates, encode_dashboard_updates_token, ensure_account_enabled,
+        execute_sync_all_sync_with, extract_brief_release_ids, extract_translation_fields,
+        feed_item_from_row, get_brief, get_release_detail, get_release_detail_by_repo_tag,
+        get_repo_public_release_status, github_access_restricted_error,
+        github_graphql_errors_to_api_error, github_graphql_http_error, github_rate_limited_error,
+        github_reauth_required_error, guard_admin_user_update, has_repo_scope,
+        last_active_is_stale, list_briefs, list_feed, list_personal_repos, list_releases,
+        llm_call_order_by_clause, load_admin_dashboard_today_live_snapshot,
+        load_admin_llm_activity_response, load_pending_access_sync_reason, load_viewer_user,
+        looks_like_json_blob, map_job_action_error, map_public_compare_fallback_error,
+        mark_translation_requested, markdown_structure_preserved, me, me_create_api_key,
+        me_delete_api_key, me_delete_passkey, me_get_api_keys, me_resume,
+        normalize_markdown_translation_output, normalize_translation_fields,
+        parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_feed_types, parse_llm_models, parse_positive_admin_concurrency,
         parse_release_id_param, parse_release_smart_summary_payload,
@@ -24163,6 +24390,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_get_llm_activity_rejects_non_admin() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "viewer", 0, 0).await;
+        let state = setup_state(pool);
+
+        let err = admin_get_llm_activity(State(Arc::clone(&state)), setup_session(2).await)
+            .await
+            .expect_err("non-admin user should be rejected");
+
+        assert_eq!(err.code(), "forbidden_admin_only");
+
+        sqlx::query("UPDATE users SET is_admin = 1 WHERE id = ?")
+            .bind(test_user_id(2))
+            .execute(&state.pool)
+            .await
+            .expect("promote viewer to admin");
+        let response = admin_get_llm_activity(State(state), setup_session(2).await)
+            .await
+            .expect("admin should read activity")
+            .0;
+        assert_eq!(response.bucket_count, 50);
+    }
+
+    #[tokio::test]
     async fn admin_list_llm_calls_filters_status_and_source() {
         let pool = setup_pool().await;
         sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
@@ -26321,6 +26572,150 @@ mod tests {
         assert_eq!(resp.calls_24h, 2);
         assert_eq!(resp.failed_24h, 1);
         assert!(resp.avg_wait_ms_24h.is_some());
+    }
+
+    #[tokio::test]
+    async fn admin_get_llm_activity_builds_fixed_window_and_reconciles_overrides() {
+        let pool = setup_pool().await;
+        let window_start = "2026-08-13T09:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO admin_runtime_settings (
+              id,
+              llm_max_concurrency,
+              ai_model_context_limit,
+              llm_models_json,
+              translation_general_worker_concurrency,
+              translation_dedicated_worker_concurrency,
+              created_at,
+              updated_at
+            ) VALUES (1, 1, NULL, '["configured-b","configured-a"]', 3, 1, ?, ?)
+            "#,
+        )
+        .bind(window_start)
+        .bind(window_start)
+        .execute(&pool)
+        .await
+        .expect("seed runtime settings");
+
+        for (id, status, model, terminal_at) in [
+            (
+                "activity-left",
+                "succeeded",
+                "configured-a",
+                "2026-08-13T09:00:00Z",
+            ),
+            (
+                "activity-failed",
+                "failed",
+                "historical-z",
+                "2026-08-15T09:15:00Z",
+            ),
+            (
+                "activity-latest",
+                "succeeded",
+                "historical-a",
+                "2026-08-15T10:30:00Z",
+            ),
+            (
+                "activity-right",
+                "succeeded",
+                "outside-model",
+                "2026-08-15T11:00:00Z",
+            ),
+        ] {
+            seed_llm_call_with_created_at(
+                &pool,
+                id,
+                status,
+                "tests.activity",
+                Some(test_user_id(1)),
+                terminal_at,
+            )
+            .await;
+            sqlx::query("UPDATE llm_calls SET model = ? WHERE id = ?")
+                .bind(model)
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("set activity model");
+        }
+
+        seed_llm_call_with_created_at(
+            &pool,
+            "activity-override",
+            "running",
+            "tests.activity",
+            Some(test_user_id(1)),
+            "2026-08-01T10:40:00Z",
+        )
+        .await;
+        sqlx::query("UPDATE llm_calls SET model = 'configured-b' WHERE id = 'activity-override'")
+            .execute(&pool)
+            .await
+            .expect("set override model");
+
+        let state = setup_state(pool);
+        state
+            .llm_scheduler
+            .set_admin_override(crate::ai::LlmCallAdminOverride {
+                id: "activity-override".to_owned(),
+                status: "succeeded".to_owned(),
+                attempt_count: 2,
+                scheduler_wait_ms: 12,
+                first_token_wait_ms: None,
+                duration_ms: Some(50),
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                total_tokens: None,
+                output_messages_json: None,
+                response_text: None,
+                error_text: None,
+                started_at: Some("2026-08-15T10:40:00Z".to_owned()),
+                finished_at: Some("2026-08-15T10:45:00Z".to_owned()),
+                updated_at: "2026-08-15T10:45:00Z".to_owned(),
+            })
+            .await;
+
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 8, 15, 10, 59, 30)
+            .single()
+            .expect("valid test time");
+        let response = load_admin_llm_activity_response(state.as_ref(), now)
+            .await
+            .expect("activity response");
+
+        assert_eq!(response.bucket_minutes, 60);
+        assert_eq!(response.bucket_count, 50);
+        assert_eq!(response.window_started_at, "2026-08-13T09:00:00+00:00");
+        assert_eq!(response.window_ended_at, "2026-08-15T11:00:00+00:00");
+        assert_eq!(response.buckets.len(), 50);
+        assert_eq!(
+            response
+                .models
+                .iter()
+                .map(|item| (item.model.as_str(), item.priority, item.configured))
+                .collect::<Vec<_>>(),
+            vec![
+                ("configured-b", Some(1), true),
+                ("configured-a", Some(2), true),
+                ("historical-a", None, false),
+                ("historical-z", None, false),
+            ]
+        );
+        let first_bucket = &response.buckets[0];
+        assert_eq!(first_bucket.counts[1].succeeded, 1);
+        let last_bucket = &response.buckets[49];
+        assert_eq!(last_bucket.counts[0].succeeded, 1);
+        assert_eq!(last_bucket.counts[2].succeeded, 1);
+        assert_eq!(last_bucket.counts.len(), 4);
+        assert!(
+            response
+                .models
+                .iter()
+                .all(|model| model.model != "outside-model")
+        );
     }
 
     #[tokio::test]

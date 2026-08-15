@@ -2,7 +2,9 @@ import {
 	ArrowDown,
 	ArrowLeft,
 	ArrowUp,
+	ChartNoAxesColumnIncreasing,
 	CircleHelp,
+	LayoutGrid,
 	Plus,
 	Settings2,
 	Trash2,
@@ -10,6 +12,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
+import { LlmActivityGrid } from "@/admin/LlmActivityGrid";
 import { TranslationWorkerBoard } from "@/admin/TranslationWorkerBoard";
 import {
 	ADMIN_JOBS_BASE_PATH,
@@ -24,6 +27,7 @@ import {
 	type AdminLlmCallDetailResponse,
 	type AdminLlmCallItem,
 	type AdminLlmCallStreamEvent,
+	type AdminLlmActivityResponse,
 	type AdminLlmSchedulerStatusResponse,
 	type AdminJobsOverviewResponse,
 	type AdminJobsStreamEvent,
@@ -47,6 +51,7 @@ import {
 	apiGetAdminSyncRuntimeConfig,
 	apiGetAdminWebhookPushRuntimeConfig,
 	apiGetAdminLlmCallDetail,
+	apiGetAdminLlmActivity,
 	apiGetAdminLlmCalls,
 	apiGetAdminLlmSchedulerStatus,
 	apiGetAdminJobsOverview,
@@ -3711,6 +3716,13 @@ export function JobManagement({
 
 	const [llmStatus, setLlmStatus] =
 		useState<AdminLlmSchedulerStatusResponse | null>(null);
+	const [llmActivity, setLlmActivity] =
+		useState<AdminLlmActivityResponse | null>(null);
+	const [llmActivityLoading, setLlmActivityLoading] = useState(false);
+	const [llmActivityError, setLlmActivityError] = useState<string | null>(null);
+	const [llmOverviewView, setLlmOverviewView] = useState<"activity" | "cards">(
+		"activity",
+	);
 	const [llmStatusLoading, setLlmStatusLoading] = useState(false);
 	const [llmSettingsDialogOpen, setLlmSettingsDialogOpen] = useState(false);
 	const [llmMaxConcurrencyInput, setLlmMaxConcurrencyInput] = useState("");
@@ -3773,6 +3785,9 @@ export function JobManagement({
 	const llmStatusLoadedOnceRef = useRef(false);
 	const llmStatusInitialRequestInFlightRef = useRef(false);
 	const llmStatusRequestIdRef = useRef(0);
+	const llmActivityLoadedOnceRef = useRef(false);
+	const llmActivityInitialRequestInFlightRef = useRef(false);
+	const llmActivityRequestIdRef = useRef(0);
 	const llmCallsLoadedOnceRef = useRef(false);
 	const llmCallsInitialRequestInFlightRef = useRef(false);
 	const llmCallsRequestIdRef = useRef(0);
@@ -3847,7 +3862,9 @@ export function JobManagement({
 		detailLoading || scheduledRunsLoadPhase !== "idle";
 	const llmCallsRefreshing = llmCallsLoadPhase === "refreshing";
 	const llmStatusRefreshing = llmStatusLoading && llmStatus !== null;
-	const llmRefreshing = llmStatusRefreshing || llmCallsRefreshing;
+	const llmActivityRefreshing = llmActivityLoading && llmActivity !== null;
+	const llmRefreshing =
+		llmStatusRefreshing || llmActivityRefreshing || llmCallsRefreshing;
 	const llmCallActionsDisabled = llmDetailLoading || llmRefreshing;
 	const realtimeListSurface = useListSurfaceState({
 		loading: tasksLoadPhase !== "idle",
@@ -3876,6 +3893,7 @@ export function JobManagement({
 		subscriptionRunsLoadPhase !== "idle" ||
 		syncRuntimeConfigLoading ||
 		llmStatusLoading ||
+		llmActivityLoading ||
 		llmCallsLoadPhase !== "idle";
 
 	useEffect(() => {
@@ -4387,6 +4405,37 @@ export function JobManagement({
 		}
 	}, []);
 
+	const loadLlmActivity = useCallback(async (options?: LoadOptions) => {
+		if (
+			options?.background &&
+			!llmActivityLoadedOnceRef.current &&
+			llmActivityInitialRequestInFlightRef.current
+		) {
+			return;
+		}
+		const requestId = llmActivityRequestIdRef.current + 1;
+		llmActivityRequestIdRef.current = requestId;
+		llmActivityInitialRequestInFlightRef.current =
+			!llmActivityLoadedOnceRef.current;
+		setLlmActivityLoading(true);
+		setLlmActivityError(null);
+		try {
+			const response = await apiGetAdminLlmActivity();
+			if (requestId !== llmActivityRequestIdRef.current) return;
+			setLlmActivity(response);
+			llmActivityLoadedOnceRef.current = true;
+		} catch (err) {
+			if (requestId === llmActivityRequestIdRef.current) {
+				setLlmActivityError(normalizeErrorMessage(err));
+			}
+		} finally {
+			if (requestId === llmActivityRequestIdRef.current) {
+				setLlmActivityLoading(false);
+				llmActivityInitialRequestInFlightRef.current = false;
+			}
+		}
+	}, []);
+
 	const openLlmSettingsDialog = useCallback(() => {
 		setLlmSettingsSaveError(null);
 		setLlmMaxConcurrencyInput(String(llmStatus?.max_concurrency ?? ""));
@@ -4522,6 +4571,7 @@ export function JobManagement({
 					loadSubscriptionRuns(options),
 					loadSyncRuntimeConfig(options),
 					loadLlmSchedulerStatus(options),
+					loadLlmActivity(options),
 					loadLlmCalls(options),
 				]);
 			} catch (err) {
@@ -4535,6 +4585,7 @@ export function JobManagement({
 			loadSubscriptionRuns,
 			loadSyncRuntimeConfig,
 			loadLlmSchedulerStatus,
+			loadLlmActivity,
 			loadLlmCalls,
 		],
 	);
@@ -4594,6 +4645,7 @@ export function JobManagement({
 					loadSubscriptionRuns({ background: true }),
 					loadSyncRuntimeConfig({ background: true }),
 					loadLlmSchedulerStatus({ background: true }),
+					loadLlmActivity({ background: true }),
 					loadLlmCalls({ background: true }),
 				]);
 				const activeDetailTaskId = detailTaskIdRef.current;
@@ -4613,6 +4665,7 @@ export function JobManagement({
 			if (needLlmRefresh) {
 				await Promise.all([
 					loadLlmSchedulerStatus({ background: true }),
+					loadLlmActivity({ background: true }),
 					loadLlmCalls({ background: true }),
 				]);
 			}
@@ -4649,6 +4702,7 @@ export function JobManagement({
 		loadSubscriptionRuns,
 		loadSyncRuntimeConfig,
 		loadLlmSchedulerStatus,
+		loadLlmActivity,
 		loadLlmCalls,
 		refreshTaskDetail,
 		refreshLlmDetail,
@@ -4741,13 +4795,17 @@ export function JobManagement({
 		const llmCallOptions = llmCallsLoadedOnceRef.current
 			? { background: true }
 			: undefined;
+		const llmActivityOptions = llmActivityLoadedOnceRef.current
+			? { background: true }
+			: undefined;
 		void Promise.all([
 			loadLlmSchedulerStatus(llmStatusOptions),
+			loadLlmActivity(llmActivityOptions),
 			loadLlmCalls(llmCallOptions),
 		]).catch((err) => {
 			setListError(normalizeErrorMessage(err));
 		});
-	}, [loadLlmSchedulerStatus, loadLlmCalls]);
+	}, [loadLlmSchedulerStatus, loadLlmActivity, loadLlmCalls]);
 
 	useEffect(() => {
 		if (!activeRouteTaskId) {
@@ -6033,19 +6091,62 @@ export function JobManagement({
 							<div className="space-y-1.5">
 								<CardTitle>LLM 调度</CardTitle>
 							</div>
-							<Button
-								type="button"
-								variant="outline"
-								size="icon"
-								aria-label="配置 LLM 运行参数"
-								onClick={openLlmSettingsDialog}
-								disabled={!llmStatus || llmSettingsSaving}
-							>
-								<Settings2 />
-							</Button>
+							<div className="flex items-center gap-2">
+								<fieldset
+									className="bg-muted flex h-9 items-center rounded-md border p-0.5"
+									aria-label="LLM 概览视图"
+								>
+									<Button
+										type="button"
+										variant={
+											llmOverviewView === "activity" ? "secondary" : "ghost"
+										}
+										size="icon"
+										className="size-7"
+										aria-label="显示模型活动图"
+										aria-pressed={llmOverviewView === "activity"}
+										title="活动图"
+										onClick={() => setLlmOverviewView("activity")}
+									>
+										<ChartNoAxesColumnIncreasing />
+									</Button>
+									<Button
+										type="button"
+										variant={
+											llmOverviewView === "cards" ? "secondary" : "ghost"
+										}
+										size="icon"
+										className="size-7"
+										aria-label="显示模型状态卡片"
+										aria-pressed={llmOverviewView === "cards"}
+										title="模型卡片"
+										onClick={() => setLlmOverviewView("cards")}
+									>
+										<LayoutGrid />
+									</Button>
+								</fieldset>
+								<Button
+									type="button"
+									variant="outline"
+									size="icon"
+									aria-label="配置 LLM 运行参数"
+									onClick={openLlmSettingsDialog}
+									disabled={!llmStatus || llmSettingsSaving}
+								>
+									<Settings2 />
+								</Button>
+							</div>
 						</CardHeader>
 						<CardContent className="space-y-4">
-							{llmStatus?.model_statuses?.length ? (
+							{llmOverviewView === "activity" ? (
+								<LlmActivityGrid
+									data={llmActivity}
+									loading={llmActivityLoading}
+									refreshing={llmActivityRefreshing}
+									error={llmActivityError}
+									onRetry={() => void loadLlmActivity()}
+								/>
+							) : llmStatus?.model_statuses?.length ? (
 								<div className="grid gap-2 lg:grid-cols-2">
 									{llmStatus.model_statuses.map((modelStatus) => (
 										<div

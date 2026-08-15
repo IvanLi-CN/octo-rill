@@ -326,6 +326,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/admin/jobs/llm/status",
             get(api::admin_get_llm_scheduler_status),
         )
+        .route("/admin/jobs/llm/activity", get(api::admin_get_llm_activity))
         .route(
             "/admin/jobs/llm/runtime-config",
             patch(api::admin_patch_llm_runtime_config),
