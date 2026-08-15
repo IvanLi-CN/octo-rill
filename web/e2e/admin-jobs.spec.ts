@@ -2270,8 +2270,16 @@ test("admin llm activity prioritizes the grid on mobile", async ({ page }) => {
 	);
 	const modelLabel = grid.locator('span[title="gpt-4o-mini"]');
 	await expect(modelLabel).toBeHidden();
-	await expect(grid.getByRole("button", { name: /gpt-4o-mini/ })).toHaveCount(
-		25,
+	const mobileModelCells = grid.getByRole("button", { name: /gpt-4o-mini/ });
+	await expect(mobileModelCells).toHaveCount(25);
+	const [firstCellBox, secondCellBox] = await Promise.all([
+		mobileModelCells.nth(0).boundingBox(),
+		mobileModelCells.nth(1).boundingBox(),
+	]);
+	expect(firstCellBox).not.toBeNull();
+	expect(secondCellBox).not.toBeNull();
+	expect((firstCellBox?.x ?? 0) + (firstCellBox?.width ?? 0)).toBeLessThan(
+		secondCellBox?.x ?? 0,
 	);
 
 	const modelNamesToggle = grid.getByRole("button", { name: "显示模型名" });

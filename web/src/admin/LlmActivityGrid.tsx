@@ -219,7 +219,7 @@ export function LlmActivityGrid({
 			) : null}
 			<div className="overflow-x-auto pb-2">
 				<div
-					className={`grid w-max gap-x-px gap-y-1 md:grid-cols-[152px_repeat(var(--llm-activity-bucket-count),16px)] md:gap-x-[3px] ${showMobileModelNames ? "grid-cols-[152px_repeat(var(--llm-activity-mobile-bucket-count),10px)]" : "grid-cols-[28px_repeat(var(--llm-activity-mobile-bucket-count),10px)]"}`}
+					className={`grid w-max gap-x-0.5 gap-y-1 md:grid-cols-[152px_repeat(var(--llm-activity-bucket-count),16px)] md:gap-x-[3px] ${showMobileModelNames ? "grid-cols-[152px_repeat(var(--llm-activity-mobile-bucket-count),9px)]" : "grid-cols-[28px_repeat(var(--llm-activity-mobile-bucket-count),9px)]"}`}
 					style={gridStyle}
 				>
 					<div className="bg-card sticky left-0 z-20 h-0 md:h-auto" />
@@ -278,7 +278,7 @@ export function LlmActivityGrid({
 										else cellRefs.current.delete(key);
 									}}
 									type="button"
-									className={`${column < mobileBucketStart ? "hidden md:block" : ""} size-2.5 rounded-[2px] ring-1 transition-[filter,transform] hover:brightness-95 focus-visible:z-20 focus-visible:scale-125 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:size-4 md:rounded-[3px] ${activityClass(total, visibleMax)} ${activeColumn === column ? "brightness-90 ring-2 ring-foreground/45" : ""}`}
+									className={`${column < mobileBucketStart ? "hidden md:block" : ""} size-[9px] rounded-[2px] ring-1 transition-[filter] hover:brightness-95 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring md:size-4 md:rounded-[3px] ${activityClass(total, visibleMax)} ${activeColumn === column ? "brightness-90 ring-1 ring-foreground/60" : ""}`}
 									aria-label={`${localTime(bucket.started_at)}，${model.model}，成功 ${count.succeeded}，失败 ${count.failed}`}
 									aria-controls={ACTIVITY_SUMMARY_ID}
 									aria-expanded={activeColumn === column}
