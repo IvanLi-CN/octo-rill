@@ -3,10 +3,10 @@
 ## 当前状态
 
 - Lifecycle: active
-- Implementation: 已交付
+- Implementation: 已实现
 - Created: 2026-06-28
-- Last: 2026-06-28
-- Summary: 已交付；local implementation completed；管理员后台现已支持多模型顺序配置、模型级冷却切换、按实际选模计算输入预算，并补齐 Storybook / E2E / 视觉证据。
+- Last: 2026-08-15
+- Summary: 多模型路由与固定 50 小时活动接口、移动端 25 小时紧凑视图、活动图/卡片切换、列聚合交互及独立刷新状态均已实现。
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -28,3 +28,6 @@
 - [x] M2: `ai.rs` 多模型选模、连续最终失败计数、10 分钟冷却、预算按实际候选模型计算、状态接口扩展。
 - [x] M3: 管理台多模型编辑、排序/增删、逐模型状态展示、Storybook 夹具与 E2E 更新。
 - [x] M4: 完成 `cargo test`、`cargo clippy --all-targets -- -D warnings`、`web` lint/build/storybook/e2e 与视觉证据落盘。
+- [x] M5: 固定 50 小时管理员活动接口、override 对账、历史模型排序与 Rust API 覆盖。
+- [x] M6: 活动网格、视图切换、列聚合交互、独立刷新状态及 mock / Storybook / Playwright 覆盖。
+- [x] M7: 完成最终质量门禁与桌面/移动视觉证据。

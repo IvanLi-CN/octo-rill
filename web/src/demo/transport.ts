@@ -1741,6 +1741,11 @@ export const demoHandlers = [
 		if (network) return network;
 		return json(currentModel().adminJobs.llmStatus);
 	}),
+	http.get("/api/admin/jobs/llm/activity", async ({ request }) => {
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		return json(currentModel().adminJobs.llmActivity);
+	}),
 	http.patch("/api/admin/jobs/llm/runtime-config", async ({ request }) => {
 		const network = await applyNetworkProfile(request);
 		if (network) return network;

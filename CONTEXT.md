@@ -19,3 +19,7 @@ _Avoid_: 私有仓库, star baseline, watched repo
 **我的发布纳入状态**:
 The user preference that controls whether owned-repository baselines participate in release visibility. It describes release inclusion, not repository ownership or sync freshness.
 _Avoid_: 私有仓库开关, owner repo enabled
+
+**LLM 逻辑调用**:
+一次由 OctoRill 调度并最终归属于单个模型的 LLM 请求。内部重试仍属于同一次逻辑调用，最终只产生一个成功或失败结果。
+_Avoid_: 执行, attempt, 单次重试
