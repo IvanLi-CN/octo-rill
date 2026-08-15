@@ -2229,9 +2229,16 @@ test("admin llm activity defaults to chart and keeps list filters independent", 
 
 	const grid = page.getByTestId("llm-activity-grid");
 	await expect(grid).toBeVisible({ timeout: 10_000 });
-	await expect(
-		page.getByRole("button", { name: "显示模型活动图" }),
-	).toHaveAttribute("aria-pressed", "true");
+	const activityViewButton = page.getByRole("button", {
+		name: "显示模型活动图",
+	});
+	const cardsViewButton = page.getByRole("button", {
+		name: "显示模型状态卡片",
+	});
+	await expect(activityViewButton).toHaveAttribute("aria-pressed", "true");
+	await expect(activityViewButton).toHaveClass(/bg-primary/);
+	await expect(cardsViewButton).toHaveAttribute("aria-pressed", "false");
+	await expect(cardsViewButton).not.toHaveClass(/bg-primary/);
 	const latestCell = grid.getByRole("button", {
 		name: /gpt-4o-mini，成功 8，失败 2/,
 	});
@@ -2250,8 +2257,11 @@ test("admin llm activity defaults to chart and keeps list filters independent", 
 	expect(activityRequests.length).toBeGreaterThan(0);
 	expect(activityRequests.every((request) => request.search === "")).toBe(true);
 
-	await page.getByRole("button", { name: "显示模型状态卡片" }).click();
+	await cardsViewButton.click();
 	await expect(grid).toHaveCount(0);
+	await expect(cardsViewButton).toHaveAttribute("aria-pressed", "true");
+	await expect(cardsViewButton).toHaveClass(/bg-primary/);
+	await expect(activityViewButton).not.toHaveClass(/bg-primary/);
 	await expect(page.getByText("冷却中")).toBeVisible();
 	await page.reload({ waitUntil: "domcontentloaded" });
 	await expect(page.getByTestId("llm-activity-grid")).toBeVisible();
