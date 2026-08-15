@@ -1131,6 +1131,26 @@ export type AdminLlmSchedulerStatusResponse = {
 	last_success_at: string | null;
 	last_failure_at: string | null;
 };
+export type AdminLlmActivityResponse = {
+	bucket_minutes: 60;
+	bucket_count: 50;
+	window_started_at: string;
+	window_ended_at: string;
+	models: {
+		model: string;
+		priority: number | null;
+		configured: boolean;
+	}[];
+	buckets: {
+		started_at: string;
+		ended_at: string;
+		counts: {
+			model: string;
+			succeeded: number;
+			failed: number;
+		}[];
+	}[];
+};
 export type AdminLlmRuntimeConfigUpdateRequest = {
 	max_concurrency: number;
 	ai_model_context_limit?: number | null;
@@ -1439,6 +1459,9 @@ export async function apiPatchAdminSyncRuntimeConfig(
 }
 export async function apiGetAdminLlmSchedulerStatus(): Promise<AdminLlmSchedulerStatusResponse> {
 	return apiGet<AdminLlmSchedulerStatusResponse>("/api/admin/jobs/llm/status");
+}
+export async function apiGetAdminLlmActivity(): Promise<AdminLlmActivityResponse> {
+	return apiGet<AdminLlmActivityResponse>("/api/admin/jobs/llm/activity");
 }
 export async function apiPatchAdminLlmRuntimeConfig(
 	body: AdminLlmRuntimeConfigUpdateRequest,

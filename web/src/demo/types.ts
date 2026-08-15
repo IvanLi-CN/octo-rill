@@ -3,6 +3,7 @@ import type {
 	AdminJobsOverviewResponse,
 	AdminLlmCallDetailResponse,
 	AdminLlmCallItem,
+	AdminLlmActivityResponse,
 	AdminLlmSchedulerStatusResponse,
 	AdminRealtimeTaskDetailResponse,
 	AdminRealtimeTaskItem,
@@ -60,6 +61,7 @@ export type DemoJobsModel = {
 	subscriptionRuns: AdminRealtimeTaskItem[];
 	syncRuntimeConfig: AdminSyncRuntimeConfigResponse;
 	llmStatus: AdminLlmSchedulerStatusResponse;
+	llmActivity: AdminLlmActivityResponse;
 	llmCalls: AdminLlmCallItem[];
 	taskDetails: Record<string, AdminRealtimeTaskDetailResponse>;
 	llmCallDetails: Record<string, AdminLlmCallDetailResponse>;

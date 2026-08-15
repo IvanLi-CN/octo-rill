@@ -1,5 +1,38 @@
 # HTTP APIs
 
+## `GET /api/admin/jobs/llm/activity`
+
+管理员只读接口，无查询参数。固定返回当前 UTC 小时与前 49 个完整小时位置；每个桶采用 `[started_at, ended_at)`。
+
+```json
+{
+  "bucket_minutes": 60,
+  "bucket_count": 50,
+  "window_started_at": "2026-08-13T09:00:00Z",
+  "window_ended_at": "2026-08-15T11:00:00Z",
+  "models": [
+    { "model": "gpt-4o-mini", "priority": 1, "configured": true },
+    { "model": "retired-model", "priority": null, "configured": false }
+  ],
+  "buckets": [
+    {
+      "started_at": "2026-08-13T09:00:00Z",
+      "ended_at": "2026-08-13T10:00:00Z",
+      "counts": [
+        { "model": "gpt-4o-mini", "succeeded": 2, "failed": 1 },
+        { "model": "retired-model", "succeeded": 0, "failed": 0 }
+      ]
+    }
+  ]
+}
+```
+
+- `bucket_minutes` 固定为 `60`，`bucket_count` 固定为 `50`。
+- 当前配置模型按 `priority` 升序；历史模型按窗口内最近活动倒序、模型名升序追加，历史模型的 `priority` 为 `null`。
+- 仅 `succeeded | failed` 计数，以终态时间落桶；运行时管理员 override 在聚合前与持久化记录对账。
+- `buckets` 始终为 50 项，且每项 `counts` 按 `models` 顺序补齐零计数。
+- 非管理员保持现有 `403 forbidden_admin_only` 错误语义。
+
 ## `GET /api/admin/jobs/llm/status`
 
 ### Response delta
