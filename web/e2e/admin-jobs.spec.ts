@@ -2257,6 +2257,25 @@ test("admin llm activity defaults to chart and keeps list filters independent", 
 	await expect(page.getByTestId("llm-activity-grid")).toBeVisible();
 });
 
+test("admin llm activity prioritizes the grid on mobile", async ({ page }) => {
+	await page.setViewportSize({ width: 393, height: 852 });
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+	const grid = page.getByTestId("llm-activity-grid");
+	await expect(grid).toBeVisible({ timeout: 10_000 });
+	const modelLabel = grid.locator('span[title="gpt-4o-mini"]');
+	await expect(modelLabel).toBeHidden();
+
+	const modelNamesToggle = grid.getByRole("button", { name: "显示模型名" });
+	await expect(modelNamesToggle).toHaveAttribute("aria-pressed", "false");
+	await modelNamesToggle.click();
+	await expect(modelLabel).toBeVisible();
+	await expect(
+		grid.getByRole("button", { name: "隐藏模型名" }),
+	).toHaveAttribute("aria-pressed", "true");
+});
+
 test("admin keeps llm calls visible during sse refresh", async ({ page }) => {
 	test.slow();
 	await installAdminJobsMocks(page, {
