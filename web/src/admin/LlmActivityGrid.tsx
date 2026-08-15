@@ -30,6 +30,8 @@ const localTime = (value: string) =>
 		hour12: false,
 	}).format(new Date(value));
 
+const ACTIVITY_SUMMARY_ID = "llm-activity-summary";
+
 const activityClass = (count: number, maximum: number) => {
 	if (count === 0 || maximum === 0) return "bg-muted/80 ring-border/50";
 	const level = Math.ceil((4 * count) / maximum);
@@ -71,8 +73,17 @@ export function LlmActivityGrid({
 			if (!rootRef.current?.contains(event.target as Node))
 				setPinnedColumn(null);
 		};
+		const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+			if (event.key !== "Escape") return;
+			setPinnedColumn(null);
+			setHoveredColumn(null);
+		};
 		document.addEventListener("mousedown", closeOutside);
-		return () => document.removeEventListener("mousedown", closeOutside);
+		document.addEventListener("keydown", closeOnEscape);
+		return () => {
+			document.removeEventListener("mousedown", closeOutside);
+			document.removeEventListener("keydown", closeOnEscape);
+		};
 	}, [pinnedColumn]);
 
 	useEffect(() => {
@@ -100,6 +111,7 @@ export function LlmActivityGrid({
 			Math.max(0, column + direction),
 		);
 		setHoveredColumn(next);
+		setPinnedColumn((current) => (current === null ? null : next));
 		cellRefs.current.get(`${model}:${next}`)?.focus();
 	};
 
@@ -208,6 +220,8 @@ export function LlmActivityGrid({
 									type="button"
 									className={`size-4 rounded-[3px] ring-1 transition-[filter,transform] hover:brightness-95 focus-visible:z-20 focus-visible:scale-125 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${activityClass(total, visibleMax)} ${activeColumn === column ? "brightness-90 ring-2 ring-foreground/45" : ""}`}
 									aria-label={`${localTime(bucket.started_at)}，${model.model}，成功 ${count.succeeded}，失败 ${count.failed}`}
+									aria-controls={ACTIVITY_SUMMARY_ID}
+									aria-expanded={activeColumn === column}
 									onMouseEnter={() => setHoveredColumn(column)}
 									onMouseLeave={() => setHoveredColumn(null)}
 									onFocus={() => setHoveredColumn(column)}
@@ -225,8 +239,11 @@ export function LlmActivityGrid({
 			</div>
 			{selectedBucket ? (
 				<div
+					id={ACTIVITY_SUMMARY_ID}
 					className="bg-popover text-popover-foreground absolute right-0 top-7 z-30 w-[min(28rem,calc(100vw-3rem))] rounded-md border p-3 shadow-lg"
 					role="dialog"
+					aria-live="polite"
+					aria-atomic="true"
 					aria-label={`${localTime(selectedBucket.started_at)} 模型活动`}
 					data-testid="llm-activity-summary"
 				>
