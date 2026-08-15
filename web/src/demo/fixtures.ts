@@ -2,6 +2,7 @@ import type { AdminUserItem } from "@/admin/UserManagement";
 import type {
 	AdminLlmCallDetailResponse,
 	AdminLlmCallItem,
+	AdminLlmActivityResponse,
 	AdminRealtimeTaskDetailResponse,
 	AdminRealtimeTaskItem,
 	AdminTaskDiagnostics,
@@ -713,6 +714,47 @@ function buildTaskDiagnostics(): AdminTaskDiagnostics {
 }
 
 function buildAdminJobs(): DemoJobsModel {
+	const activityWindowEnd = new Date("2026-07-08T10:00:00Z");
+	const activityWindowStart = new Date(
+		activityWindowEnd.getTime() - 50 * 60 * 60 * 1000,
+	);
+	const llmActivity: AdminLlmActivityResponse = {
+		bucket_minutes: 60,
+		bucket_count: 50,
+		window_started_at: activityWindowStart.toISOString(),
+		window_ended_at: activityWindowEnd.toISOString(),
+		models: [
+			{ model: "gpt-5-mini", priority: 1, configured: true },
+			{ model: "gpt-4.1-mini", priority: 2, configured: true },
+			{ model: "retired-summary-model", priority: null, configured: false },
+		],
+		buckets: Array.from({ length: 50 }, (_, index) => {
+			const startedAt = new Date(
+				activityWindowStart.getTime() + index * 60 * 60 * 1000,
+			);
+			return {
+				started_at: startedAt.toISOString(),
+				ended_at: new Date(startedAt.getTime() + 60 * 60 * 1000).toISOString(),
+				counts: [
+					{
+						model: "gpt-5-mini",
+						succeeded: index % 7 === 0 ? 8 : index % 3 === 0 ? 4 : 1,
+						failed: index % 13 === 0 ? 1 : 0,
+					},
+					{
+						model: "gpt-4.1-mini",
+						succeeded: index % 5 === 0 ? 5 : index % 2 === 0 ? 2 : 0,
+						failed: index % 17 === 0 ? 1 : 0,
+					},
+					{
+						model: "retired-summary-model",
+						succeeded: index === 6 || index === 7 ? 2 : 0,
+						failed: index === 7 ? 1 : 0,
+					},
+				],
+			};
+		}),
+	};
 	const realtimeTasks: AdminRealtimeTaskItem[] = [
 		{
 			id: "task-sync-subscriptions",
@@ -900,6 +942,7 @@ function buildAdminJobs(): DemoJobsModel {
 			last_success_at: "2026-07-08T09:08:00+08:00",
 			last_failure_at: "2026-07-08T06:15:00+08:00",
 		},
+		llmActivity,
 		llmCalls,
 		taskDetails,
 		llmCallDetails,

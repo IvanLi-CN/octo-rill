@@ -2,3 +2,4 @@
 
 - 2026-06-28: 创建 follow-up spec，冻结“同 provider 多模型 + 顺序优先 + 连续 3 次最终失败后冷却 10 分钟 + 冷却到期自动恢复”的合同。
 - 2026-06-28: 完成后端 runtime model routing、管理员多模型设置 UI、预算口径收敛、状态接口扩展，以及 Storybook / Playwright / Rust 校验与视觉证据落盘。
+- 2026-08-15: 冻结最近 50 个 UTC 小时的逐模型终态活动合同，采用独立只读接口、默认活动图与组件内卡片切换；沿用 `llm_calls` 与七日保留期，不新增 migration 或 ADR。

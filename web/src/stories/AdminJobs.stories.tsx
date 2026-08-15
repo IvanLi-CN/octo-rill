@@ -1733,6 +1733,36 @@ function AdminJobsPreview({
 			last_success_at: llmCalls.at(-1)?.finished_at ?? null,
 			last_failure_at: llmCalls[0]?.finished_at ?? null,
 		};
+		const llmActivityStart = new Date("2026-02-24T01:00:00Z");
+		const llmActivity = {
+			bucket_minutes: 60,
+			bucket_count: 50,
+			window_started_at: llmActivityStart.toISOString(),
+			window_ended_at: new Date(
+				llmActivityStart.getTime() + 50 * 3_600_000,
+			).toISOString(),
+			models: llmSchedulerStatus.model_statuses.map((model) => ({
+				model: model.model,
+				priority: model.priority,
+				configured: true,
+			})),
+			buckets: Array.from({ length: 50 }, (_, index) => {
+				const startedAt = new Date(
+					llmActivityStart.getTime() + index * 3_600_000,
+				);
+				return {
+					started_at: startedAt.toISOString(),
+					ended_at: new Date(startedAt.getTime() + 3_600_000).toISOString(),
+					counts: llmSchedulerStatus.model_statuses.map(
+						(model, modelIndex) => ({
+							model: model.model,
+							succeeded: index % (modelIndex + 3) === 0 ? 4 - modelIndex : 0,
+							failed: index === 49 ? modelIndex : 0,
+						}),
+					),
+				};
+			}),
+		};
 		let syncRuntimeConfig = {
 			sync_auto_fetch_interval_minutes: 10,
 			retry_recent_failures_interval_minutes: 10,
@@ -2139,6 +2169,16 @@ function AdminJobsPreview({
 				req.method === "GET"
 			) {
 				return new Response(JSON.stringify(llmSchedulerStatus), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+
+			if (
+				url.pathname === "/api/admin/jobs/llm/activity" &&
+				req.method === "GET"
+			) {
+				return new Response(JSON.stringify(llmActivity), {
 					status: 200,
 					headers: { "content-type": "application/json" },
 				});
