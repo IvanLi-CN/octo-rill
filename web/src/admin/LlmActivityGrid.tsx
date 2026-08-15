@@ -1,5 +1,12 @@
-import { AlertCircle, LoaderCircle, RefreshCw } from "lucide-react";
 import {
+	AlertCircle,
+	LoaderCircle,
+	PanelLeftClose,
+	PanelLeftOpen,
+	RefreshCw,
+} from "lucide-react";
+import {
+	type CSSProperties,
 	type KeyboardEvent,
 	useEffect,
 	useMemo,
@@ -54,6 +61,7 @@ export function LlmActivityGrid({
 	const cellRefs = useRef(new Map<string, HTMLButtonElement>());
 	const [hoveredColumn, setHoveredColumn] = useState<number | null>(null);
 	const [pinnedColumn, setPinnedColumn] = useState<number | null>(null);
+	const [showMobileModelNames, setShowMobileModelNames] = useState(false);
 	const activeColumn = pinnedColumn ?? hoveredColumn;
 
 	const visibleMax = useMemo(
@@ -149,28 +157,44 @@ export function LlmActivityGrid({
 	const bucketSucceeded =
 		selectedBucket?.counts.reduce((sum, count) => sum + count.succeeded, 0) ??
 		0;
-	const gridTemplateColumns = `152px repeat(${data.bucket_count}, 16px)`;
+	const gridStyle = {
+		"--llm-activity-bucket-count": data.bucket_count,
+	} as CSSProperties;
 
 	return (
 		<div ref={rootRef} className="relative" data-testid="llm-activity-grid">
-			<div className="mb-2 flex min-h-5 items-center justify-between gap-3">
+			<div className="mb-2 flex min-h-8 items-center justify-between gap-3">
 				<p className="text-muted-foreground text-xs">
 					最近 {data.bucket_count} 小时 · 本地时间
 				</p>
-				{refreshing ? (
-					<span
-						className="text-muted-foreground inline-flex items-center gap-1 text-xs"
-						role="status"
+				<div className="flex items-center gap-2">
+					{refreshing ? (
+						<span
+							className="text-muted-foreground inline-flex items-center gap-1 text-xs"
+							role="status"
+						>
+							<LoaderCircle className="size-3 animate-spin" />
+							更新中
+						</span>
+					) : null}
+					<Button
+						type="button"
+						variant="ghost"
+						size="icon"
+						className="size-8 md:hidden"
+						aria-label={showMobileModelNames ? "隐藏模型名" : "显示模型名"}
+						aria-pressed={showMobileModelNames}
+						title={showMobileModelNames ? "隐藏模型名" : "显示模型名"}
+						onClick={() => setShowMobileModelNames((current) => !current)}
 					>
-						<LoaderCircle className="size-3 animate-spin" />
-						更新中
-					</span>
-				) : null}
+						{showMobileModelNames ? <PanelLeftClose /> : <PanelLeftOpen />}
+					</Button>
+				</div>
 			</div>
 			<div className="overflow-x-auto pb-2">
 				<div
-					className="grid w-max gap-x-[3px] gap-y-1"
-					style={{ gridTemplateColumns }}
+					className={`grid w-max gap-x-[3px] gap-y-1 md:grid-cols-[152px_repeat(var(--llm-activity-bucket-count),16px)] ${showMobileModelNames ? "grid-cols-[152px_repeat(var(--llm-activity-bucket-count),16px)]" : "grid-cols-[28px_repeat(var(--llm-activity-bucket-count),16px)]"}`}
+					style={gridStyle}
 				>
 					<div className="bg-card sticky left-0 z-20" />
 					{data.buckets.map((bucket, column) => (
@@ -194,12 +218,22 @@ export function LlmActivityGrid({
 					{data.models.map((model) => [
 						<div
 							key={`${model.model}:label`}
-							className="bg-card sticky left-0 z-10 flex h-4 items-center pr-3"
+							className="bg-card sticky left-0 z-10 flex h-4 items-center pr-1 md:pr-3"
 						>
-							<span className="truncate font-mono text-xs" title={model.model}>
+							<span
+								className={`${showMobileModelNames ? "inline" : "hidden"} truncate font-mono text-xs md:inline`}
+								title={model.model}
+							>
 								{model.configured ? `${model.priority}. ` : ""}
 								{model.model}
 							</span>
+							<span
+								className={`${showMobileModelNames ? "hidden" : "inline"} text-muted-foreground w-full text-center font-mono text-[10px] tabular-nums md:hidden`}
+								aria-hidden="true"
+							>
+								{model.priority || "·"}
+							</span>
+							<span className="sr-only">{model.model}</span>
 						</div>,
 						...data.buckets.map((bucket, column) => {
 							const count = bucket.counts.find(
