@@ -1,4 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { expect, userEvent, within } from "storybook/test";
 import { LlmActivityGrid } from "@/admin/LlmActivityGrid";
 import type { AdminLlmActivityResponse } from "@/api";
 
@@ -69,7 +70,21 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-export const Default: Story = {};
+export const Default: Story = {
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const body = within(canvasElement.ownerDocument.body);
+		const firstCell = canvas.getAllByRole("button", {
+			name: /gpt-5-mini/,
+		})[0];
+		await userEvent.click(firstCell);
+		await expect(body.getByTestId("llm-activity-summary")).toBeVisible();
+		await userEvent.keyboard("{ArrowLeft}");
+		await expect(body.getByTestId("llm-activity-summary")).toBeVisible();
+		await userEvent.keyboard("{Escape}");
+		await expect(body.queryByTestId("llm-activity-summary")).toBeNull();
+	},
+};
 
 export const Loading: Story = {
 	args: { data: null, loading: true },

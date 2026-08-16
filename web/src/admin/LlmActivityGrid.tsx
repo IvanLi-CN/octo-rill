@@ -161,6 +161,9 @@ export function LlmActivityGrid({
 	const cellRefs = useRef(new Map<string, HTMLButtonElement>());
 	const [hoveredColumn, setHoveredColumn] = useState<number | null>(null);
 	const [pinnedColumn, setPinnedColumn] = useState<number | null>(null);
+	const [pinnedBucketStartedAt, setPinnedBucketStartedAt] = useState<
+		string | null
+	>(null);
 	const [tooltipAnchor, setTooltipAnchor] = useState<TooltipAnchor | null>(
 		null,
 	);
@@ -170,7 +173,18 @@ export function LlmActivityGrid({
 	const isDesktop = useMediaQuery("(min-width: 1024px)");
 	const isTablet = useMediaQuery("(min-width: 640px)");
 	const isMobile = !isTablet;
-	const activeColumn = pinnedColumn ?? hoveredColumn;
+	const resolvedPinnedColumn =
+		pinnedBucketStartedAt && data
+			? data.buckets.findIndex(
+					(bucket) => bucket.started_at === pinnedBucketStartedAt,
+				)
+			: pinnedColumn;
+	const activeColumn =
+		pinnedBucketStartedAt !== null
+			? resolvedPinnedColumn !== null && resolvedPinnedColumn >= 0
+				? resolvedPinnedColumn
+				: null
+			: (pinnedColumn ?? hoveredColumn);
 	const gridLabelWidth = isDesktop ? 152 : isTablet ? 112 : 28;
 	const minimumCellSize = isDesktop ? 12 : isTablet ? 11 : 9;
 	const gridGap = isMobile ? 2 : 3;
@@ -233,6 +247,7 @@ export function LlmActivityGrid({
 		tooltipAnchorRef.current = null;
 		setHoveredColumn(null);
 		setPinnedColumn(null);
+		setPinnedBucketStartedAt(null);
 		setTooltipAnchor(null);
 		setTooltipPosition(null);
 	}, []);
@@ -306,13 +321,29 @@ export function LlmActivityGrid({
 
 	useEffect(() => {
 		if (
+			pinnedBucketStartedAt !== null &&
+			data &&
+			!data.buckets.some(
+				(bucket) => bucket.started_at === pinnedBucketStartedAt,
+			)
+		) {
+			closeActivityTooltip();
+			return;
+		}
+		if (
 			activeColumn !== null &&
 			(activeColumn < visibleBucketStart ||
 				activeColumn >= (data?.buckets.length ?? 0))
 		) {
 			closeActivityTooltip();
 		}
-	}, [activeColumn, closeActivityTooltip, data, visibleBucketStart]);
+	}, [
+		activeColumn,
+		closeActivityTooltip,
+		data,
+		pinnedBucketStartedAt,
+		visibleBucketStart,
+	]);
 
 	const selectedBucket =
 		activeColumn === null ? null : (data?.buckets[activeColumn] ?? null);
@@ -405,24 +436,9 @@ export function LlmActivityGrid({
 						),
 					),
 			) ??
-			placementCandidates
-				.filter(
-					(candidate) =>
-						!overlaps(
-							candidate.left,
-							candidate.top,
-							tooltipRect.width,
-							tooltipRect.height,
-							gridRect,
-						),
-				)
-				.sort(
-					(left, right) => candidateOverlap(left) - candidateOverlap(right),
-				)[0];
-		if (!position) {
-			setTooltipPosition(null);
-			return;
-		}
+			[...placementCandidates].sort(
+				(left, right) => candidateOverlap(left) - candidateOverlap(right),
+			)[0];
 		setTooltipPosition((current) =>
 			current?.left === position.left && current.top === position.top
 				? current
@@ -447,23 +463,23 @@ export function LlmActivityGrid({
 			if (pinnedColumn !== null || anchorElement) {
 				if (!anchorElement) return;
 				const rect = anchorElement.getBoundingClientRect();
-				if (
-					rect.bottom <= 0 ||
-					rect.top >= window.innerHeight ||
-					rect.right <= 0 ||
-					rect.left >= window.innerWidth
-				) {
-					closeActivityTooltip();
-					return;
+				const isVisible =
+					rect.bottom > 0 &&
+					rect.top < window.innerHeight &&
+					rect.right > 0 &&
+					rect.left < window.innerWidth;
+				if (isVisible) {
+					const anchor = {
+						x: rect.left + rect.width / 2,
+						y: rect.top + rect.height / 2,
+					};
+					tooltipAnchorRef.current = anchor;
+					setTooltipAnchor((current) =>
+						current?.x === anchor.x && current.y === anchor.y
+							? current
+							: anchor,
+					);
 				}
-				const anchor = {
-					x: rect.left + rect.width / 2,
-					y: rect.top + rect.height / 2,
-				};
-				tooltipAnchorRef.current = anchor;
-				setTooltipAnchor((current) =>
-					current?.x === anchor.x && current.y === anchor.y ? current : anchor,
-				);
 			}
 			scheduleUpdate();
 		};
@@ -511,6 +527,9 @@ export function LlmActivityGrid({
 		);
 		setHoveredColumn(next);
 		setPinnedColumn((current) => (current === null ? null : next));
+		setPinnedBucketStartedAt((current) =>
+			current === null ? null : (data?.buckets[next]?.started_at ?? current),
+		);
 		const nextCell = cellRefs.current.get(`${model}:${next}`);
 		if (nextCell) {
 			nextCell.focus();
@@ -754,6 +773,7 @@ export function LlmActivityGrid({
 									onPointerDown={(event) => {
 										setHoveredColumn(column);
 										setPinnedColumn(column);
+										setPinnedBucketStartedAt(bucket.started_at);
 										tooltipAnchorElementRef.current = event.currentTarget;
 										const anchor = { x: event.clientX, y: event.clientY };
 										tooltipAnchorRef.current = anchor;
@@ -761,6 +781,7 @@ export function LlmActivityGrid({
 									}}
 									onClick={(event) => {
 										setPinnedColumn(column);
+										setPinnedBucketStartedAt(bucket.started_at);
 										setAnchorFromElement(event.currentTarget);
 									}}
 									onKeyDown={(event) =>
