@@ -32,6 +32,7 @@ type AdminJobsMockOptions = {
 	emitTranslationEvents?: boolean;
 	emitSubscriptionProgressEvents?: boolean;
 	currentUserLogin?: string;
+	activityRefreshOnSecondRequest?: boolean;
 };
 
 function sleep(ms: number) {
@@ -291,6 +292,31 @@ async function installAdminJobsMocks(
 				],
 			};
 		}),
+	};
+	const shiftedLlmActivity = (hours: number) => {
+		const buckets = Array.from(
+			{ length: llmActivity.buckets.length },
+			(_, index) => {
+				const source =
+					llmActivity.buckets[
+						Math.min(index + hours, llmActivity.buckets.length - 1)
+					];
+				const startedAt = new Date(
+					llmActivityStart.getTime() + (index + hours) * 3_600_000,
+				);
+				return {
+					...source,
+					started_at: startedAt.toISOString(),
+					ended_at: new Date(startedAt.getTime() + 3_600_000).toISOString(),
+				};
+			},
+		);
+		return {
+			...llmActivity,
+			window_started_at: buckets[0].started_at,
+			window_ended_at: buckets.at(-1)?.ended_at ?? llmActivity.window_ended_at,
+			buckets,
+		};
 	};
 	const syncSubscriptionChainFinishedAt: Record<string, string> = {
 		"task-subscriptions-1": "2026-02-26T14:50:30Z",
@@ -816,6 +842,7 @@ async function installAdminJobsMocks(
 		return null;
 	}
 
+	let llmActivityRequestCount = 0;
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
 		const url = new URL(req.url());
@@ -1529,7 +1556,13 @@ async function installAdminJobsMocks(
 		}
 
 		if (req.method() === "GET" && pathname === "/api/admin/jobs/llm/activity") {
-			return json(route, llmActivity);
+			llmActivityRequestCount += 1;
+			return json(
+				route,
+				options.activityRefreshOnSecondRequest && llmActivityRequestCount > 1
+					? shiftedLlmActivity(llmActivityRequestCount - 1)
+					: llmActivity,
+			);
 		}
 
 		if (
@@ -2243,7 +2276,7 @@ test("admin llm activity defaults to chart and keeps list filters independent", 
 		name: /gpt-4o-mini，成功 8，失败 2/,
 	});
 	await latestCell.click();
-	const summary = grid.getByTestId("llm-activity-summary");
+	const summary = page.getByTestId("llm-activity-summary");
 	await expect(summary).toContainText("80%");
 	await expect(summary).toContainText("67%");
 	await latestCell.press("ArrowLeft");
@@ -2267,6 +2300,315 @@ test("admin llm activity defaults to chart and keeps list filters independent", 
 	await expect(page.getByTestId("llm-activity-grid")).toBeVisible();
 });
 
+test("admin llm activity keeps the pointer tooltip clear of the grid", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1200, height: 900 });
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+	const grid = page.getByTestId("llm-activity-grid");
+	const cells = grid.getByRole("button", { name: /gpt-4o-mini/ });
+	await expect(cells.first()).toBeVisible({ timeout: 10_000 });
+	await cells.nth(20).hover();
+
+	const summary = page.getByTestId("llm-activity-summary");
+	await expect(summary).toBeVisible();
+	const [summaryBox, cellBoxes] = await Promise.all([
+		summary.boundingBox(),
+		cells.evaluateAll((nodes) =>
+			nodes
+				.filter((node) => {
+					const style = window.getComputedStyle(node);
+					return style.display !== "none" && style.visibility !== "hidden";
+				})
+				.map((node) => {
+					const box = node.getBoundingClientRect();
+					return {
+						left: box.left,
+						right: box.right,
+						top: box.top,
+						bottom: box.bottom,
+					};
+				}),
+		),
+	]);
+	expect(summaryBox).not.toBeNull();
+	expect(
+		cellBoxes.some(
+			(cell) =>
+				(summaryBox?.x ?? 0) < cell.right &&
+				(summaryBox?.x ?? 0) + (summaryBox?.width ?? 0) > cell.left &&
+				(summaryBox?.y ?? 0) < cell.bottom &&
+				(summaryBox?.y ?? 0) + (summaryBox?.height ?? 0) > cell.top,
+		),
+	).toBe(false);
+
+	await page.mouse.move((summaryBox?.x ?? 0) + 12, (summaryBox?.y ?? 0) + 12);
+	await expect(summary).toBeVisible();
+});
+
+test("admin llm activity reanchors a pinned tooltip after activity refresh", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1200, height: 900 });
+	await installAdminJobsMocks(page, {
+		emitStreamEvents: false,
+		activityRefreshOnSecondRequest: true,
+		delayRules: [
+			{
+				pathname: "/api/admin/jobs/llm/activity",
+				afterCount: 1,
+				times: 1,
+				delayMs: 500,
+			},
+		],
+	});
+	await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+	const grid = page.getByTestId("llm-activity-grid");
+	const cells = grid.locator('button[aria-label*="gpt-4o-mini"]');
+	await expect(cells.first()).toBeVisible({ timeout: 10_000 });
+	await expect(cells).toHaveCount(50, { timeout: 10_000 });
+	const pinnedCell = cells.nth(20);
+	const pinnedLabel = await pinnedCell.getAttribute("aria-label");
+	expect(pinnedLabel).not.toBeNull();
+	await pinnedCell.click();
+
+	const summary = page.getByTestId("llm-activity-summary");
+	await expect(summary).toBeVisible();
+	const activeCellSelector =
+		'button[aria-expanded="true"][aria-label*="gpt-4o-mini"]';
+	const beforeActiveCell = await grid.locator(activeCellSelector).boundingBox();
+	const beforeTooltip = await summary.boundingBox();
+	await page
+		.getByRole("button", { name: "刷新" })
+		.first()
+		.dispatchEvent("click");
+	await expect(summary).toBeVisible();
+	await expect(
+		grid.getByRole("button", { name: pinnedLabel ?? "" }),
+	).toBeVisible();
+	await page.waitForTimeout(700);
+	const afterActiveCell = await grid.locator(activeCellSelector).boundingBox();
+	const afterTooltip = await summary.boundingBox();
+	expect(beforeActiveCell).not.toBeNull();
+	expect(afterActiveCell).not.toBeNull();
+	expect(beforeTooltip).not.toBeNull();
+	expect(afterTooltip).not.toBeNull();
+	expect(
+		Math.abs((afterActiveCell?.x ?? 0) - (beforeActiveCell?.x ?? 0)),
+	).toBeGreaterThan(0);
+	expect(
+		Math.abs((afterTooltip?.x ?? 0) - (beforeTooltip?.x ?? 0)),
+	).toBeGreaterThan(0);
+	const activeCellShift =
+		(afterActiveCell?.x ?? 0) +
+		(afterActiveCell?.width ?? 0) / 2 -
+		((beforeActiveCell?.x ?? 0) + (beforeActiveCell?.width ?? 0) / 2);
+	const tooltipShift =
+		(afterTooltip?.x ?? 0) +
+		(afterTooltip?.width ?? 0) / 2 -
+		((beforeTooltip?.x ?? 0) + (beforeTooltip?.width ?? 0) / 2);
+	expect(Math.abs(tooltipShift - activeCellShift)).toBeLessThan(1);
+	const refreshedCellBoxes = await cells.evaluateAll((nodes) =>
+		nodes
+			.filter((node) => {
+				const style = window.getComputedStyle(node);
+				return style.display !== "none" && style.visibility !== "hidden";
+			})
+			.map((node) => {
+				const box = node.getBoundingClientRect();
+				return {
+					left: box.left,
+					right: box.right,
+					top: box.top,
+					bottom: box.bottom,
+				};
+			}),
+	);
+	expect(
+		refreshedCellBoxes.some(
+			(cell) =>
+				(afterTooltip?.x ?? 0) < cell.right &&
+				(afterTooltip?.x ?? 0) + (afterTooltip?.width ?? 0) > cell.left &&
+				(afterTooltip?.y ?? 0) < cell.bottom &&
+				(afterTooltip?.y ?? 0) + (afterTooltip?.height ?? 0) > cell.top,
+		),
+	).toBe(false);
+});
+
+test("admin llm activity handles tooltip edges across rows and viewports", async ({
+	page,
+}) => {
+	for (const viewport of [
+		{ width: 1200, height: 500 },
+		{ width: 393, height: 852 },
+	]) {
+		await page.setViewportSize(viewport);
+		await installAdminJobsMocks(page, { emitStreamEvents: false });
+		await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+		const grid = page.getByTestId("llm-activity-grid");
+		await expect(grid).toBeVisible({ timeout: 10_000 });
+		await grid.scrollIntoViewIfNeeded();
+		const visibleCells = grid.locator(
+			'button[aria-controls="llm-activity-summary"]:visible',
+		);
+		await expect(visibleCells.first()).toBeVisible();
+		await visibleCells.first().hover();
+
+		const summary = page.getByTestId("llm-activity-summary");
+		await expect(summary).toBeVisible();
+		const [summaryBox, viewportOverflow] = await Promise.all([
+			summary.boundingBox(),
+			page.evaluate(() => ({
+				documentOverflow:
+					document.documentElement.scrollWidth -
+					document.documentElement.clientWidth,
+				viewportWidth: window.innerWidth,
+				viewportHeight: window.innerHeight,
+			})),
+		]);
+		expect(summaryBox).not.toBeNull();
+		expect(summaryBox?.x ?? -1).toBeGreaterThanOrEqual(0);
+		expect(summaryBox?.y ?? -1).toBeGreaterThanOrEqual(0);
+		expect((summaryBox?.x ?? 0) + (summaryBox?.width ?? 0)).toBeLessThanOrEqual(
+			viewportOverflow.viewportWidth,
+		);
+		expect(
+			(summaryBox?.y ?? 0) + (summaryBox?.height ?? 0),
+		).toBeLessThanOrEqual(viewportOverflow.viewportHeight);
+		expect(viewportOverflow.documentOverflow).toBeLessThanOrEqual(1);
+
+		const cellBoxes = await visibleCells.evaluateAll((nodes) =>
+			nodes.map((node) => {
+				const rect = node.getBoundingClientRect();
+				return {
+					left: rect.left,
+					right: rect.right,
+					top: rect.top,
+					bottom: rect.bottom,
+				};
+			}),
+		);
+		expect(
+			cellBoxes.some(
+				(cell) =>
+					(summaryBox?.x ?? 0) < cell.right &&
+					(summaryBox?.x ?? 0) + (summaryBox?.width ?? 0) > cell.left &&
+					(summaryBox?.y ?? 0) < cell.bottom &&
+					(summaryBox?.y ?? 0) + (summaryBox?.height ?? 0) > cell.top,
+			),
+		).toBe(false);
+
+		await visibleCells.last().click();
+		await page.mouse.wheel(0, 120);
+		await expect(summary).toBeVisible();
+		await page.keyboard.press("Escape");
+		await expect(summary).toHaveCount(0);
+	}
+});
+
+test("admin llm activity fits a dynamic recent window without horizontal overflow", async ({
+	page,
+}) => {
+	const visibleBucketCounts: number[] = [];
+	for (const width of [1200, 960, 640, 393, 320]) {
+		await page.setViewportSize({ width, height: 852 });
+		await installAdminJobsMocks(page, { emitStreamEvents: false });
+		await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+		const grid = page.getByTestId("llm-activity-grid");
+		const cells = grid.getByRole("button", { name: /gpt-4o-mini/ });
+		await expect(cells.first()).toBeVisible({ timeout: 10_000 });
+		const [visibleCells, layout] = await Promise.all([
+			cells.evaluateAll(
+				(nodes) =>
+					nodes.filter((node) => {
+						const style = window.getComputedStyle(node);
+						return (
+							style.display !== "none" &&
+							style.visibility !== "hidden" &&
+							node.getBoundingClientRect().width > 0
+						);
+					}).length,
+			),
+			page.evaluate(() => ({
+				documentOverflow:
+					document.documentElement.scrollWidth -
+					document.documentElement.clientWidth,
+			})),
+		]);
+		visibleBucketCounts.push(visibleCells);
+		expect(visibleCells).toBeGreaterThan(0);
+		expect(visibleCells).toBeLessThanOrEqual(50);
+		expect(layout.documentOverflow).toBeLessThanOrEqual(1);
+		expect(
+			await grid.evaluate((node) => node.scrollWidth - node.clientWidth),
+		).toBeLessThanOrEqual(1);
+		expect(
+			await grid.evaluate((node) => {
+				const surface = node.querySelector<HTMLElement>(
+					'[data-testid="llm-activity-surface"]',
+				);
+				const rowCells = Array.from(
+					node.querySelectorAll<HTMLButtonElement>(
+						'button[aria-label*="gpt-4o-mini"]',
+					),
+				);
+				const lastCell = rowCells.at(-1);
+				if (!surface || !lastCell) return Number.POSITIVE_INFINITY;
+				return Math.abs(
+					surface.getBoundingClientRect().right -
+						lastCell.getBoundingClientRect().right,
+				);
+			}),
+		).toBeLessThanOrEqual(1);
+		if (width >= 640) {
+			const timeLabels = grid.getByTestId("llm-activity-time-label");
+			const surfaceBox = await grid
+				.getByTestId("llm-activity-surface")
+				.boundingBox();
+			const [firstTimeLabel, lastTimeLabel] = await Promise.all([
+				timeLabels.first().boundingBox(),
+				timeLabels.last().boundingBox(),
+			]);
+			const timeLabelBoxes = await timeLabels.evaluateAll((nodes) =>
+				nodes
+					.map((node) => node.getBoundingClientRect())
+					.filter((rect) => rect.width > 0)
+					.map((rect) => ({ left: rect.left, right: rect.right }))
+					.sort((left, right) => left.left - right.left),
+			);
+			expect(await timeLabels.count()).toBeGreaterThan(1);
+			expect(surfaceBox).not.toBeNull();
+			for (const labelBox of [firstTimeLabel, lastTimeLabel]) {
+				expect(labelBox).not.toBeNull();
+				expect(labelBox?.x ?? 0).toBeGreaterThanOrEqual(
+					(surfaceBox?.x ?? 0) - 1,
+				);
+				expect((labelBox?.x ?? 0) + (labelBox?.width ?? 0)).toBeLessThanOrEqual(
+					(surfaceBox?.x ?? 0) + (surfaceBox?.width ?? 0) + 1,
+				);
+			}
+			for (let index = 1; index < timeLabelBoxes.length; index += 1) {
+				expect(timeLabelBoxes[index - 1].right).toBeLessThanOrEqual(
+					timeLabelBoxes[index].left + 1,
+				);
+			}
+		}
+
+		if (width < 640) {
+			await expect(grid.getByRole("list", { name: "模型图例" })).toBeVisible();
+		}
+	}
+
+	expect(visibleBucketCounts[0]).toBeGreaterThan(visibleBucketCounts[2]);
+	expect(visibleBucketCounts[1]).toBeGreaterThan(visibleBucketCounts[2]);
+	expect(visibleBucketCounts[3]).toBeGreaterThan(visibleBucketCounts[4]);
+});
+
 test("admin llm activity prioritizes the grid on mobile", async ({ page }) => {
 	await page.setViewportSize({ width: 393, height: 852 });
 	await installAdminJobsMocks(page, { emitStreamEvents: false });
@@ -2274,14 +2616,15 @@ test("admin llm activity prioritizes the grid on mobile", async ({ page }) => {
 
 	const grid = page.getByTestId("llm-activity-grid");
 	await expect(grid).toBeVisible({ timeout: 10_000 });
-	await expect(grid.getByText("最近 25 小时", { exact: false })).toBeVisible();
+	await expect(grid.getByText(/最近 \d+ 小时/, { exact: false })).toBeVisible();
 	await expect(grid.getByTestId("llm-activity-mobile-range")).toContainText(
 		"至",
 	);
 	const modelLabel = grid.locator('span[title="gpt-4o-mini"]');
 	await expect(modelLabel).toBeHidden();
 	const mobileModelCells = grid.getByRole("button", { name: /gpt-4o-mini/ });
-	await expect(mobileModelCells).toHaveCount(25);
+	expect(await mobileModelCells.count()).toBeGreaterThan(0);
+	expect(await mobileModelCells.count()).toBeLessThan(50);
 	const [firstCellBox, secondCellBox] = await Promise.all([
 		mobileModelCells.nth(0).boundingBox(),
 		mobileModelCells.nth(1).boundingBox(),
@@ -2292,13 +2635,9 @@ test("admin llm activity prioritizes the grid on mobile", async ({ page }) => {
 		secondCellBox?.x ?? 0,
 	);
 
-	const modelNamesToggle = grid.getByRole("button", { name: "显示模型名" });
-	await expect(modelNamesToggle).toHaveAttribute("aria-pressed", "false");
-	await modelNamesToggle.click();
-	await expect(modelLabel).toBeVisible();
-	await expect(
-		grid.getByRole("button", { name: "隐藏模型名" }),
-	).toHaveAttribute("aria-pressed", "true");
+	await expect(grid.getByRole("list", { name: "模型图例" })).toContainText(
+		"gpt-4o-mini",
+	);
 });
 
 test("admin keeps llm calls visible during sse refresh", async ({ page }) => {
