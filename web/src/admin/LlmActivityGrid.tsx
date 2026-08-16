@@ -135,6 +135,10 @@ export function LlmActivityGrid({
 		data?.buckets.length ?? MAX_BUCKET_COUNT,
 		Math.max(1, bucketCapacity),
 	);
+	const visibleBucketStart = Math.max(
+		0,
+		(data?.buckets.length ?? 0) - visibleBucketCount,
+	);
 
 	useLayoutEffect(() => {
 		const surface = gridSurfaceRef.current;
@@ -202,19 +206,30 @@ export function LlmActivityGrid({
 			const gridSurface = gridSurfaceRef.current;
 			const tooltip = tooltipRef.current;
 			if (!gridSurface) return;
-			const inGrid = containsPoint(
-				toActivityRect(gridSurface.getBoundingClientRect()),
-				event.clientX,
-				event.clientY,
-			);
-			const inTooltip = tooltip
+			const gridRect = toActivityRect(gridSurface.getBoundingClientRect());
+			const inGrid = containsPoint(gridRect, event.clientX, event.clientY);
+			const tooltipRect = tooltip
+				? toActivityRect(tooltip.getBoundingClientRect())
+				: null;
+			const inTooltip = tooltipRect
+				? containsPoint(tooltipRect, event.clientX, event.clientY)
+				: false;
+			const inTransitionGap = tooltipRect
 				? containsPoint(
-						toActivityRect(tooltip.getBoundingClientRect()),
+						{
+							left: Math.min(gridRect.left, tooltipRect.left) - TOOLTIP_GAP,
+							right: Math.max(gridRect.right, tooltipRect.right) + TOOLTIP_GAP,
+							top: Math.min(gridRect.top, tooltipRect.top) - TOOLTIP_GAP,
+							bottom:
+								Math.max(gridRect.bottom, tooltipRect.bottom) + TOOLTIP_GAP,
+							height: 0,
+							width: 0,
+						},
 						event.clientX,
 						event.clientY,
 					)
 				: false;
-			if (!inGrid && !inTooltip) {
+			if (!inGrid && !inTooltip && !inTransitionGap) {
 				setHoveredColumn(null);
 				setTooltipAnchor(null);
 				setTooltipPosition(null);
@@ -226,10 +241,14 @@ export function LlmActivityGrid({
 	}, [activeColumn, pinnedColumn]);
 
 	useEffect(() => {
-		if (activeColumn !== null && activeColumn >= (data?.buckets.length ?? 0)) {
+		if (
+			activeColumn !== null &&
+			(activeColumn < visibleBucketStart ||
+				activeColumn >= (data?.buckets.length ?? 0))
+		) {
 			closeActivityTooltip();
 		}
-	}, [activeColumn, closeActivityTooltip, data]);
+	}, [activeColumn, closeActivityTooltip, data, visibleBucketStart]);
 
 	const selectedBucket =
 		activeColumn === null ? null : (data?.buckets[activeColumn] ?? null);
@@ -241,6 +260,16 @@ export function LlmActivityGrid({
 
 		const tooltipRect = toActivityRect(tooltip.getBoundingClientRect());
 		const gridRect = toActivityRect(gridSurface.getBoundingClientRect());
+		const rootRect = rootRef.current
+			? toActivityRect(rootRef.current.getBoundingClientRect())
+			: gridRect;
+		const siblingRects = rootRef.current?.parentElement
+			? Array.from(rootRef.current.parentElement.children)
+					.filter((element) => element !== rootRef.current)
+					.map((element) => toActivityRect(element.getBoundingClientRect()))
+					.filter((rect) => rect.width > 0 && rect.height > 0)
+			: [];
+		const avoidRects = [gridRect, rootRect, ...siblingRects];
 		const minimumLeft = TOOLTIP_VIEWPORT_MARGIN;
 		const maximumLeft = Math.max(
 			minimumLeft,
@@ -275,12 +304,14 @@ export function LlmActivityGrid({
 		const position =
 			candidates.find(
 				(candidate) =>
-					!overlaps(
-						candidate.left,
-						candidate.top,
-						tooltipRect.width,
-						tooltipRect.height,
-						gridRect,
+					!avoidRects.some((rect) =>
+						overlaps(
+							candidate.left,
+							candidate.top,
+							tooltipRect.width,
+							tooltipRect.height,
+							rect,
+						),
 					),
 			) ?? candidates[0];
 		setTooltipPosition((current) =>
@@ -367,10 +398,6 @@ export function LlmActivityGrid({
 	const bucketSucceeded =
 		selectedBucket?.counts.reduce((sum, count) => sum + count.succeeded, 0) ??
 		0;
-	const visibleBucketStart = Math.max(
-		0,
-		data.buckets.length - visibleBucketCount,
-	);
 	const visibleBuckets = data.buckets.slice(visibleBucketStart);
 	const gridStyle = {
 		gridTemplateColumns: `${gridLabelWidth}px repeat(${visibleBuckets.length}, minmax(0, 1fr))`,
@@ -390,7 +417,6 @@ export function LlmActivityGrid({
 					role="tooltip"
 					aria-live="polite"
 					aria-atomic="true"
-					aria-label={`${localTime(selectedBucket.started_at)} 模型活动`}
 					data-testid="llm-activity-summary"
 				>
 					<p className="text-sm font-medium">
@@ -550,8 +576,10 @@ export function LlmActivityGrid({
 										setTooltipAnchor({ x: event.clientX, y: event.clientY });
 									}}
 									onFocus={(event) => {
-										if (pinnedColumn === null) setHoveredColumn(column);
-										setAnchorFromElement(event.currentTarget);
+										if (pinnedColumn === null) {
+											setHoveredColumn(column);
+											setAnchorFromElement(event.currentTarget);
+										}
 									}}
 									onBlur={() => {
 										if (pinnedColumn === null) setHoveredColumn(null);
