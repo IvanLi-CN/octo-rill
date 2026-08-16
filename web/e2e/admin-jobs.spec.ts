@@ -2243,7 +2243,7 @@ test("admin llm activity defaults to chart and keeps list filters independent", 
 		name: /gpt-4o-mini，成功 8，失败 2/,
 	});
 	await latestCell.click();
-	const summary = grid.getByTestId("llm-activity-summary");
+	const summary = page.getByTestId("llm-activity-summary");
 	await expect(summary).toContainText("80%");
 	await expect(summary).toContainText("67%");
 	await latestCell.press("ArrowLeft");
@@ -2265,6 +2265,100 @@ test("admin llm activity defaults to chart and keeps list filters independent", 
 	await expect(page.getByText("冷却中")).toBeVisible();
 	await page.reload({ waitUntil: "domcontentloaded" });
 	await expect(page.getByTestId("llm-activity-grid")).toBeVisible();
+});
+
+test("admin llm activity keeps the pointer tooltip clear of the grid", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1200, height: 900 });
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+	const grid = page.getByTestId("llm-activity-grid");
+	const cells = grid.getByRole("button", { name: /gpt-4o-mini/ });
+	await expect(cells.first()).toBeVisible({ timeout: 10_000 });
+	await cells.nth(20).hover();
+
+	const summary = page.getByTestId("llm-activity-summary");
+	await expect(summary).toBeVisible();
+	const [summaryBox, cellBoxes] = await Promise.all([
+		summary.boundingBox(),
+		cells.evaluateAll((nodes) =>
+			nodes
+				.filter((node) => {
+					const style = window.getComputedStyle(node);
+					return style.display !== "none" && style.visibility !== "hidden";
+				})
+				.map((node) => {
+					const box = node.getBoundingClientRect();
+					return {
+						left: box.left,
+						right: box.right,
+						top: box.top,
+						bottom: box.bottom,
+					};
+				}),
+		),
+	]);
+	expect(summaryBox).not.toBeNull();
+	expect(
+		cellBoxes.some(
+			(cell) =>
+				(summaryBox?.x ?? 0) < cell.right &&
+				(summaryBox?.x ?? 0) + (summaryBox?.width ?? 0) > cell.left &&
+				(summaryBox?.y ?? 0) < cell.bottom &&
+				(summaryBox?.y ?? 0) + (summaryBox?.height ?? 0) > cell.top,
+		),
+	).toBe(false);
+
+	await page.mouse.move((summaryBox?.x ?? 0) + 12, (summaryBox?.y ?? 0) + 12);
+	await expect(summary).toBeVisible();
+});
+
+test("admin llm activity uses responsive buckets without horizontal overflow", async ({
+	page,
+}) => {
+	for (const { width, expectedBuckets } of [
+		{ width: 1024, expectedBuckets: 50 },
+		{ width: 768, expectedBuckets: 36 },
+		{ width: 393, expectedBuckets: 25 },
+		{ width: 320, expectedBuckets: 25 },
+	]) {
+		await page.setViewportSize({ width, height: 852 });
+		await installAdminJobsMocks(page, { emitStreamEvents: false });
+		await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+		const grid = page.getByTestId("llm-activity-grid");
+		const cells = grid.getByRole("button", { name: /gpt-4o-mini/ });
+		await expect(cells.first()).toBeVisible({ timeout: 10_000 });
+		const [visibleCells, layout] = await Promise.all([
+			cells.evaluateAll(
+				(nodes) =>
+					nodes.filter((node) => {
+						const style = window.getComputedStyle(node);
+						return (
+							style.display !== "none" &&
+							style.visibility !== "hidden" &&
+							node.getBoundingClientRect().width > 0
+						);
+					}).length,
+			),
+			page.evaluate(() => ({
+				documentOverflow:
+					document.documentElement.scrollWidth -
+					document.documentElement.clientWidth,
+			})),
+		]);
+		expect(visibleCells).toBe(expectedBuckets);
+		expect(layout.documentOverflow).toBeLessThanOrEqual(1);
+		expect(
+			await grid.evaluate((node) => node.scrollWidth - node.clientWidth),
+		).toBeLessThanOrEqual(1);
+
+		if (width < 640) {
+			await expect(grid.getByRole("list", { name: "模型图例" })).toBeVisible();
+		}
+	}
 });
 
 test("admin llm activity prioritizes the grid on mobile", async ({ page }) => {
@@ -2292,13 +2386,9 @@ test("admin llm activity prioritizes the grid on mobile", async ({ page }) => {
 		secondCellBox?.x ?? 0,
 	);
 
-	const modelNamesToggle = grid.getByRole("button", { name: "显示模型名" });
-	await expect(modelNamesToggle).toHaveAttribute("aria-pressed", "false");
-	await modelNamesToggle.click();
-	await expect(modelLabel).toBeVisible();
-	await expect(
-		grid.getByRole("button", { name: "隐藏模型名" }),
-	).toHaveAttribute("aria-pressed", "true");
+	await expect(grid.getByRole("list", { name: "模型图例" })).toContainText(
+		"gpt-4o-mini",
+	);
 });
 
 test("admin keeps llm calls visible during sse refresh", async ({ page }) => {

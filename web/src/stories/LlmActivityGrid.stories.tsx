@@ -74,18 +74,29 @@ type Story = StoryObj<typeof meta>;
 export const Default: Story = {
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
+		const page = within(canvasElement.ownerDocument.body);
 		const latestCell = canvas.getByRole("button", {
 			name: /gpt-5-mini，成功 8，失败 2/,
 		});
-		await userEvent.click(latestCell);
-		const summary = canvas.getByTestId("llm-activity-summary");
+		await userEvent.hover(latestCell);
+		const summary = page.getByTestId("llm-activity-summary");
 		await expect(summary).toHaveTextContent("80%");
 		await expect(summary).toHaveTextContent("2");
+		const summaryRect = summary.getBoundingClientRect();
+		canvasElement.ownerDocument.dispatchEvent(
+			new PointerEvent("pointermove", {
+				bubbles: true,
+				clientX: summaryRect.left + 12,
+				clientY: summaryRect.top + 12,
+			}),
+		);
+		await expect(summary).toBeVisible();
+		await userEvent.click(latestCell);
 		await userEvent.keyboard("{ArrowLeft}");
-		await expect(canvas.getByTestId("llm-activity-summary")).toBeVisible();
+		await expect(page.getByTestId("llm-activity-summary")).toBeVisible();
 		await userEvent.keyboard("{Escape}");
 		await expect(
-			canvas.queryByTestId("llm-activity-summary"),
+			page.queryByTestId("llm-activity-summary"),
 		).not.toBeInTheDocument();
 	},
 };
