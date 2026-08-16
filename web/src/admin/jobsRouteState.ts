@@ -7,9 +7,35 @@ export type AdminJobsPrimaryTab =
 
 export type TranslationViewTab = "queue" | "history";
 
+export type LlmCallRouteStatus =
+	| "all"
+	| "queued"
+	| "running"
+	| "succeeded"
+	| "failed";
+
+export type LlmCallTimeField = "started" | "finished";
+
+export type LlmCallRouteFilters = {
+	status: LlmCallRouteStatus;
+	model: string;
+	source: string;
+	requestedBy: string;
+	timeField: LlmCallTimeField;
+	timeFrom: string;
+	timeTo: string;
+};
+
 export type AdminJobsSearchInput = {
 	from?: string;
 	view?: string;
+	llm_status?: string;
+	llm_model?: string;
+	llm_source?: string;
+	llm_requested_by?: string;
+	llm_time_field?: string;
+	llm_time_from?: string;
+	llm_time_to?: string;
 };
 
 export type TaskDrawerRoute = {
@@ -23,6 +49,7 @@ export type AdminJobsRouteState = {
 	taskDrawerRoute: TaskDrawerRoute | null;
 	drawerFromTab: AdminJobsPrimaryTab | null;
 	subscriptionDetailTaskId?: string | null;
+	llmCallFilters?: LlmCallRouteFilters;
 };
 
 export const ADMIN_JOBS_BASE_PATH = "/admin/jobs";
@@ -33,7 +60,17 @@ export const ADMIN_JOBS_TRANSLATIONS_PATH = `${ADMIN_JOBS_BASE_PATH}/translation
 export const ADMIN_SUBSCRIPTION_SETTINGS_AUTO_OPEN_SESSION_KEY =
 	"admin.jobs.subscription-settings.auto-open";
 
-const ADMIN_JOBS_ROUTE_QUERY_KEYS = ["from", "view"] as const;
+const ADMIN_JOBS_ROUTE_QUERY_KEYS = [
+	"from",
+	"view",
+	"llm_status",
+	"llm_model",
+	"llm_source",
+	"llm_requested_by",
+	"llm_time_field",
+	"llm_time_from",
+	"llm_time_to",
+] as const;
 const TASK_DRAWER_ROUTE_PATTERN =
 	/^\/admin\/jobs\/tasks\/([^/]+?)(?:\/llm\/([^/]+))?$/;
 const SUBSCRIPTION_DETAIL_ROUTE_PATTERN =
@@ -53,6 +90,64 @@ function isPrimaryTab(
 		value === "llm" ||
 		value === "translations"
 	);
+}
+
+function normalizeLlmRouteText(value: string | null | undefined) {
+	return value?.trim() ?? "";
+}
+
+function normalizeLlmRouteTimestamp(value: string | null | undefined) {
+	const normalized = normalizeLlmRouteText(value);
+	if (!normalized || !/\dT\d.*(?:Z|[+-]\d{2}:\d{2})$/i.test(normalized)) {
+		return "";
+	}
+	const timestamp = Date.parse(normalized);
+	return Number.isNaN(timestamp) ? "" : new Date(timestamp).toISOString();
+}
+
+export function parseLlmCallRouteFilters(
+	search: Pick<
+		AdminJobsSearchInput,
+		| "llm_status"
+		| "llm_model"
+		| "llm_source"
+		| "llm_requested_by"
+		| "llm_time_field"
+		| "llm_time_from"
+		| "llm_time_to"
+	>,
+): LlmCallRouteFilters {
+	const status = search.llm_status;
+	return {
+		status:
+			status === "queued" ||
+			status === "running" ||
+			status === "succeeded" ||
+			status === "failed"
+				? status
+				: "all",
+		model: normalizeLlmRouteText(search.llm_model),
+		source: normalizeLlmRouteText(search.llm_source),
+		requestedBy: normalizeLlmRouteText(search.llm_requested_by),
+		timeField: search.llm_time_field === "finished" ? "finished" : "started",
+		timeFrom: normalizeLlmRouteTimestamp(search.llm_time_from),
+		timeTo: normalizeLlmRouteTimestamp(search.llm_time_to),
+	};
+}
+
+export function llmCallRouteFiltersToSearch(
+	filters: LlmCallRouteFilters,
+): AdminJobsSearchInput {
+	return {
+		llm_status: filters.status === "all" ? undefined : filters.status,
+		llm_model: filters.model || undefined,
+		llm_source: filters.source || undefined,
+		llm_requested_by: filters.requestedBy || undefined,
+		llm_time_field:
+			filters.timeField === "finished" ? filters.timeField : undefined,
+		llm_time_from: filters.timeFrom || undefined,
+		llm_time_to: filters.timeTo || undefined,
+	};
 }
 
 export function parseTranslationView(
@@ -105,6 +200,15 @@ export function parseAdminJobsRoute(
 	search: string,
 ): AdminJobsRouteState {
 	const searchParams = new URLSearchParams(search);
+	const llmCallFilters = parseLlmCallRouteFilters({
+		llm_status: searchParams.get("llm_status") ?? undefined,
+		llm_model: searchParams.get("llm_model") ?? undefined,
+		llm_source: searchParams.get("llm_source") ?? undefined,
+		llm_requested_by: searchParams.get("llm_requested_by") ?? undefined,
+		llm_time_field: searchParams.get("llm_time_field") ?? undefined,
+		llm_time_from: searchParams.get("llm_time_from") ?? undefined,
+		llm_time_to: searchParams.get("llm_time_to") ?? undefined,
+	});
 	const translationView = parseTranslationView(searchParams);
 	const rawDrawerFromTab = searchParams.get("from");
 	const drawerFromTab = isPrimaryTab(rawDrawerFromTab)
@@ -119,6 +223,7 @@ export function parseAdminJobsRoute(
 			taskDrawerRoute,
 			drawerFromTab,
 			subscriptionDetailTaskId: null,
+			llmCallFilters,
 		};
 	}
 
@@ -135,6 +240,7 @@ export function parseAdminJobsRoute(
 			subscriptionDetailTaskId: decodeURIComponent(
 				subscriptionDetailMatch[1] ?? "",
 			),
+			llmCallFilters,
 		};
 	}
 
@@ -155,6 +261,7 @@ export function parseAdminJobsRoute(
 		taskDrawerRoute: null,
 		drawerFromTab: null,
 		subscriptionDetailTaskId: null,
+		llmCallFilters,
 	};
 }
 
@@ -187,6 +294,13 @@ export function buildAdminJobsRouteUrl(
 		}
 	} else if (route.primaryTab === "translations") {
 		searchParams.set("view", route.translationView);
+	} else if (route.primaryTab === "llm") {
+		const filters = llmCallRouteFiltersToSearch(
+			route.llmCallFilters ?? parseLlmCallRouteFilters({}),
+		);
+		for (const [key, value] of Object.entries(filters)) {
+			if (value) searchParams.set(key, value);
+		}
 	}
 
 	const query = searchParams.toString();
@@ -204,6 +318,7 @@ export function buildAdminJobsRouteState(input: {
 	const drawerFromTab = isPrimaryTab(input.search.from)
 		? input.search.from
 		: null;
+	const llmCallFilters = parseLlmCallRouteFilters(input.search);
 
 	if (input.taskId) {
 		return {
@@ -215,6 +330,7 @@ export function buildAdminJobsRouteState(input: {
 			},
 			drawerFromTab,
 			subscriptionDetailTaskId: null,
+			llmCallFilters,
 		};
 	}
 
@@ -226,6 +342,7 @@ export function buildAdminJobsRouteState(input: {
 		taskDrawerRoute: null,
 		drawerFromTab: null,
 		subscriptionDetailTaskId: input.subscriptionDetailTaskId ?? null,
+		llmCallFilters,
 	};
 }
 
@@ -233,5 +350,25 @@ export function validateAdminJobsSearch(search: Record<string, unknown>) {
 	return {
 		from: typeof search.from === "string" ? search.from : undefined,
 		view: typeof search.view === "string" ? search.view : undefined,
+		llm_status:
+			typeof search.llm_status === "string" ? search.llm_status : undefined,
+		llm_model:
+			typeof search.llm_model === "string" ? search.llm_model : undefined,
+		llm_source:
+			typeof search.llm_source === "string" ? search.llm_source : undefined,
+		llm_requested_by:
+			typeof search.llm_requested_by === "string"
+				? search.llm_requested_by
+				: undefined,
+		llm_time_field:
+			typeof search.llm_time_field === "string"
+				? search.llm_time_field
+				: undefined,
+		llm_time_from:
+			typeof search.llm_time_from === "string"
+				? search.llm_time_from
+				: undefined,
+		llm_time_to:
+			typeof search.llm_time_to === "string" ? search.llm_time_to : undefined,
 	};
 }

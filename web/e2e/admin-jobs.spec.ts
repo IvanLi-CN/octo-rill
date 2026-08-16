@@ -153,10 +153,10 @@ async function installAdminJobsMocks(
 			prompt_text: "prompt 1",
 			response_text: null,
 			error_text: "mock llm failed",
-			created_at: "2026-02-26T05:00:00Z",
-			started_at: "2026-02-26T05:00:01Z",
-			finished_at: "2026-02-26T05:00:03Z",
-			updated_at: "2026-02-26T05:00:03Z",
+			created_at: "2026-02-26T02:00:00Z",
+			started_at: "2026-02-26T02:00:01Z",
+			finished_at: "2026-02-26T02:00:03Z",
+			updated_at: "2026-02-26T02:00:03Z",
 		},
 		{
 			id: "llm-call-2",
@@ -1647,11 +1647,19 @@ async function installAdminJobsMocks(
 
 		if (req.method() === "GET" && pathname === "/api/admin/jobs/llm/calls") {
 			const status = url.searchParams.get("status") ?? "all";
+			const model = url.searchParams.get("model") ?? "";
 			const source = url.searchParams.get("source") ?? "";
 			const requestedBy = url.searchParams.get("requested_by");
 			const parentTaskId = url.searchParams.get("parent_task_id") ?? "";
+			const startedFrom = url.searchParams.get("started_from");
+			const startedTo = url.searchParams.get("started_to");
+			const finishedFrom = url.searchParams.get("finished_from");
+			const finishedBefore = url.searchParams.get("finished_before");
+			const timestamp = (value: string | null | undefined) =>
+				value ? new Date(value).getTime() : Number.NaN;
 			const filtered = llmCalls.filter((item) => {
 				if (status !== "all" && item.status !== status) return false;
+				if (model && item.model !== model) return false;
 				if (source && item.source !== source) return false;
 				if (
 					requestedBy &&
@@ -1662,7 +1670,20 @@ async function installAdminJobsMocks(
 				if (parentTaskId && item.parent_task_id !== parentTaskId) {
 					return false;
 				}
-				return true;
+				const startedAt = timestamp(item.started_at ?? item.created_at);
+				const finishedAt = timestamp(
+					item.finished_at ?? item.updated_at ?? item.created_at,
+				);
+				const startedFromAt = timestamp(startedFrom);
+				const startedToAt = timestamp(startedTo);
+				const finishedFromAt = timestamp(finishedFrom);
+				const finishedBeforeAt = timestamp(finishedBefore);
+				return (
+					(Number.isNaN(startedFromAt) || startedAt >= startedFromAt) &&
+					(Number.isNaN(startedToAt) || startedAt <= startedToAt) &&
+					(Number.isNaN(finishedFromAt) || finishedAt >= finishedFromAt) &&
+					(Number.isNaN(finishedBeforeAt) || finishedAt < finishedBeforeAt)
+				);
 			});
 			return json(route, {
 				items: filtered.map(
@@ -2298,6 +2319,96 @@ test("admin llm activity defaults to chart and keeps list filters independent", 
 	await expect(page.getByText("冷却中")).toBeVisible();
 	await page.reload({ waitUntil: "domcontentloaded" });
 	await expect(page.getByTestId("llm-activity-grid")).toBeVisible();
+});
+
+test("admin drills from LLM activity and model cards into shareable call filters", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	await page.goto(
+		"/admin/jobs/llm?llm_status=succeeded&llm_source=obsolete-source&llm_requested_by=obsolete-user&llm_time_field=started&llm_time_from=2026-02-26T00%3A00%3A00Z",
+		{ waitUntil: "domcontentloaded" },
+	);
+
+	const grid = page.getByTestId("llm-activity-grid");
+	const latestCell = grid.getByRole("button", {
+		name: /gpt-4o-mini，成功 8，失败 2/,
+	});
+	await expect(latestCell).toBeVisible({ timeout: 10_000 });
+	await latestCell.focus();
+	await page.keyboard.press("ContextMenu");
+	await expect(
+		page.getByRole("menuitem", { name: "查看失败调用" }),
+	).toBeVisible();
+	await page.keyboard.press("Escape");
+
+	await latestCell.click({ button: "right" });
+	await page.getByRole("menuitem", { name: "查看失败调用" }).click();
+	await expect
+		.poll(() => {
+			const search = new URL(page.url()).searchParams;
+			return {
+				status: search.get("llm_status"),
+				model: search.get("llm_model"),
+				source: search.get("llm_source"),
+				requestedBy: search.get("llm_requested_by"),
+				timeField: search.get("llm_time_field"),
+				timeFrom: search.get("llm_time_from"),
+				timeTo: search.get("llm_time_to"),
+			};
+		})
+		.toEqual({
+			status: "failed",
+			model: "gpt-4o-mini",
+			source: null,
+			requestedBy: null,
+			timeField: "finished",
+			timeFrom: "2026-02-26T02:00:00.000Z",
+			timeTo: "2026-02-26T03:00:00.000Z",
+		});
+	const results = page.getByRole("region", { name: "LLM 调用记录结果" });
+	await expect(results).toBeFocused();
+	await expect(page.getByText("job.api.translate_release")).toBeVisible();
+
+	await page.goBack();
+	await expect(page).toHaveURL(/llm_source=obsolete-source/);
+	const restoredCell = page
+		.getByTestId("llm-activity-grid")
+		.getByRole("button", { name: /gpt-4o-mini，成功 8，失败 2/ });
+	await restoredCell.click();
+	await page.getByRole("button", { name: /gpt-4o-mini 的调用操作/ }).click();
+	await page.getByRole("menuitem", { name: "查看全部调用" }).click();
+	await expect
+		.poll(() => {
+			const search = new URL(page.url()).searchParams;
+			return [
+				search.get("llm_status"),
+				search.get("llm_model"),
+				search.get("llm_time_field"),
+				search.get("llm_time_to"),
+			];
+		})
+		.toEqual([null, "gpt-4o-mini", "finished", "2026-02-26T03:00:00.000Z"]);
+
+	await page.getByRole("button", { name: "显示模型状态卡片" }).click();
+	await page.getByRole("button", { name: /gpt-4o-mini 的调用操作/ }).click();
+	await page.getByRole("menuitem", { name: "查看全部调用" }).click();
+	await expect
+		.poll(() => {
+			const search = new URL(page.url()).searchParams;
+			return {
+				model: search.get("llm_model"),
+				timeField: search.get("llm_time_field"),
+				timeFrom: search.get("llm_time_from"),
+				timeTo: search.get("llm_time_to"),
+			};
+		})
+		.toEqual({
+			model: "gpt-4o-mini",
+			timeField: null,
+			timeFrom: null,
+			timeTo: null,
+		});
 });
 
 test("admin llm activity keeps the pointer tooltip clear of the grid", async ({

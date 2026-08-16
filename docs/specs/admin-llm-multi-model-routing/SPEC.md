@@ -125,6 +125,10 @@
 - 聚合窗不接收指针事件。文档级命中检测将网格与上一帧浮窗矩形视为同一安全区，指针进入浮窗区域时保留最后的有效位置，只有离开两者后才关闭；点击固定，外部点击或 Escape 关闭。
 - 浮窗和活动网格在矮视口中均受限于 `min(30vh, 12rem)` 的最大高度并仅允许纵向滚动，避免模型数量增长时浮窗越出视口或覆盖活动区域。
 - 图表拥有独立的首次加载、错误、重试和后台刷新状态；SSE 或手动刷新期间保留旧网格，直到新响应到达。
+- 网格单元格和模型状态卡片均提供“查看失败调用”与“查看全部调用”操作。网格操作带入精确模型及该桶终态时间的 `[started_at, ended_at)` 范围；状态卡片仅带入精确模型，并使用调用记录既有七日保留期。
+- 排障跳转必须清空来源、请求用户、旧状态、旧时间和分页等冲突筛选，再设置目标状态、模型和时间范围；跳转将完整筛选写入 URL 并新增一条浏览器历史记录，加载后将焦点移动到调用记录结果区域。
+- 调用列表筛选状态由 URL 恢复：`llm_status`、`llm_model`、`llm_source`、`llm_requested_by`、`llm_time_field`、`llm_time_from`、`llm_time_to`。时间值使用 UTC RFC3339；时间口径可选开始时间或结束时间。开始时间上限保持包含语义，结束时间上限为“结束时间前”的排他语义。
+- 调用列表支持精确模型筛选和终态时间范围。终态时间统一按 `COALESCE(finished_at, updated_at, created_at)` 计算，`finished_from` 为包含下限，`finished_before` 为排他上限；持久化记录和 runtime override 合并后必须遵循同一筛选与分页语义。
 
 ## 接口契约（Interfaces & Contracts）
 
@@ -134,6 +138,7 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | `GET /api/admin/jobs/llm/status` | HTTP API | external | Modify | `./contracts/http-apis.md` | backend | web-admin |
 | `GET /api/admin/jobs/llm/activity` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web-admin |
+| `GET /api/admin/jobs/llm/calls` | HTTP API | external | Modify | `./contracts/http-apis.md` | backend | web-admin |
 | `PATCH /api/admin/jobs/llm/runtime-config` | HTTP API | external | Modify | `./contracts/http-apis.md` | backend | web-admin |
 | `admin_runtime_settings.llm_models_json` | DB schema | internal | New | `./contracts/db.md` | backend | backend |
 | LLM runtime model health state | Runtime contract | internal | New | `./contracts/db.md` | backend | backend |
@@ -157,6 +162,14 @@
 - Given 模型列表为 `[A, B, C]` 且 `A` 未冷却
   When 发起新的 LLM 请求
   Then 该请求使用 `A`，并在整次内部重试周期中保持使用 `A`。
+
+- Given 管理员从活动图单元格打开失败调用
+  When 该单元格对应模型 `A` 和时间桶 `[from, before)`
+  Then 调用列表精确筛选模型 `A`、失败状态及相同终态时间范围，并可由复制后的 URL 恢复。
+
+- Given 管理员从模型状态卡片打开全部调用
+  When 目标模型为 `A`
+  Then 调用列表仅保留模型 `A` 的七日保留期记录，且来源、请求用户、旧状态、旧时间和分页筛选已清除。
 
 - Given `A` 连续 3 次“最终失败”
   When 发起新的 LLM 请求
@@ -214,6 +227,28 @@ PR: include
 
 PR: include
 ![LLM activity tooltip Storybook](./assets/llm-activity-tooltip-storybook.png)
+
+### 调用排障跳转
+
+- `ui_demo`：桌面活动桶菜单，覆盖“查看失败调用 / 查看全部调用”。
+
+PR: include
+![LLM call drilldown desktop menu](./assets/llm-call-drilldown-desktop.png)
+
+- `ui_demo`：`393x852` 移动端终态筛选和失败调用结果。
+
+PR: include
+![LLM call drilldown mobile result](./assets/llm-call-drilldown-mobile-result.png)
+
+- `ui_demo`：`393x852` 移动端显式操作菜单。
+
+PR: include
+![LLM call drilldown mobile menu](./assets/llm-call-drilldown-mobile-menu.png)
+
+- `storybook_canvas`：活动网格右键上下文菜单。
+
+PR: include
+![LLM call drilldown Storybook menu](./assets/llm-call-drilldown-storybook.png)
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
