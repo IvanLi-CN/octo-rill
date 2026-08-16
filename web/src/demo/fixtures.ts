@@ -831,6 +831,28 @@ function buildAdminJobs(): DemoJobsModel {
 			finished_at: null,
 			updated_at: NOW,
 		},
+		{
+			id: "llm-call-demo-failed-1",
+			status: "failed",
+			source: "scheduler.translation.deadline",
+			model: "gpt-5-mini",
+			requested_by: ADMIN_USER_ID,
+			parent_task_id: "task-sync-subscriptions",
+			parent_task_type: "sync.subscriptions",
+			max_tokens: 900,
+			attempt_count: 2,
+			scheduler_wait_ms: 180,
+			first_token_wait_ms: null,
+			duration_ms: 1640,
+			input_tokens: 1088,
+			output_tokens: null,
+			cached_input_tokens: 0,
+			total_tokens: 1088,
+			created_at: "2026-07-07T18:20:00+08:00",
+			started_at: "2026-07-07T18:20:02+08:00",
+			finished_at: "2026-07-07T18:23:12+08:00",
+			updated_at: "2026-07-07T18:23:12+08:00",
+		},
 	];
 
 	const llmCallDetails: Record<string, AdminLlmCallDetailResponse> = {
@@ -847,6 +869,19 @@ function buildAdminJobs(): DemoJobsModel {
 			prompt_text: "Translate release notes for /demo/ Web Demo contract",
 			response_text: null,
 			error_text: null,
+		},
+		"llm-call-demo-failed-1": {
+			...llmCalls[1],
+			input_messages_json: JSON.stringify([
+				{
+					role: "user",
+					content: "Translate the release announcement before the deadline.",
+				},
+			]),
+			output_messages_json: null,
+			prompt_text: "Translate the release announcement before the deadline.",
+			response_text: null,
+			error_text: "Upstream provider deadline exceeded after 1.64 seconds.",
 		},
 	};
 

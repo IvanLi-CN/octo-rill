@@ -12,6 +12,11 @@ import {
 import { createPortal } from "react-dom";
 
 import type { AdminLlmActivityResponse } from "@/api";
+import {
+	LlmCallActionsMenu,
+	LlmCallContextMenu,
+	type LlmCallDrilldown,
+} from "@/admin/LlmCallContextMenu";
 import { Button } from "@/components/ui/button";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 
@@ -21,6 +26,9 @@ type LlmActivityGridProps = {
 	refreshing?: boolean;
 	error?: string | null;
 	onRetry?: () => void;
+	onOpenCalls?: (
+		target: LlmCallDrilldown & { status: "all" | "failed" },
+	) => void;
 };
 
 type ActivityRect = {
@@ -149,6 +157,7 @@ export function LlmActivityGrid({
 	refreshing = false,
 	error = null,
 	onRetry,
+	onOpenCalls,
 }: LlmActivityGridProps) {
 	const rootRef = useRef<HTMLDivElement>(null);
 	const gridSurfaceRef = useRef<HTMLDivElement>(null);
@@ -603,15 +612,28 @@ export function LlmActivityGrid({
 							? { left: tooltipPosition.left, top: tooltipPosition.top }
 							: { left: 0, top: 0, visibility: "hidden" }
 					}
-					role="tooltip"
+					role={pinnedColumn !== null && pinnedModel ? "dialog" : "tooltip"}
 					tabIndex={pinnedColumn !== null ? 0 : -1}
 					aria-live="polite"
 					aria-atomic="true"
 					data-testid="llm-activity-summary"
 				>
-					<p className="text-sm font-medium">
-						{localTime(selectedBucket.started_at)}
-					</p>
+					<div className="flex items-center justify-between gap-2">
+						<p className="text-sm font-medium">
+							{localTime(selectedBucket.started_at)}
+						</p>
+						{pinnedModel && onOpenCalls ? (
+							<LlmCallActionsMenu
+								target={{
+									model: pinnedModel,
+									finishedFrom: selectedBucket.started_at,
+									finishedBefore: selectedBucket.ended_at,
+								}}
+								onOpen={onOpenCalls}
+								label={`${pinnedModel} 的调用操作`}
+							/>
+						) : null}
+					</div>
 					<div className="mt-2 grid grid-cols-[minmax(0,1fr)_auto_auto_auto_auto] gap-x-3 gap-y-1 text-xs">
 						<span className="text-muted-foreground">模型</span>
 						<span className="text-muted-foreground text-right">成功</span>
@@ -745,7 +767,7 @@ export function LlmActivityGrid({
 							};
 							const total = count.succeeded + count.failed;
 							const key = `${model.model}:${column}`;
-							return (
+							const cell = (
 								<button
 									key={key}
 									ref={(node) => {
@@ -806,6 +828,21 @@ export function LlmActivityGrid({
 										handleKeyDown(event, model.model, column)
 									}
 								/>
+							);
+							return onOpenCalls ? (
+								<LlmCallContextMenu
+									key={key}
+									target={{
+										model: model.model,
+										finishedFrom: bucket.started_at,
+										finishedBefore: bucket.ended_at,
+									}}
+									onOpen={onOpenCalls}
+								>
+									{cell}
+								</LlmCallContextMenu>
+							) : (
+								cell
 							);
 						}),
 					])}

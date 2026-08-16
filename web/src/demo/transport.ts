@@ -1783,15 +1783,52 @@ export const demoHandlers = [
 		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		let items = currentModel().adminJobs.llmCalls;
+		const status = url.searchParams.get("status") ?? "all";
+		const model = url.searchParams.get("model")?.trim() ?? "";
+		const source = url.searchParams.get("source")?.trim() ?? "";
+		const requestedBy = url.searchParams.get("requested_by")?.trim() ?? "";
 		const parentTaskId = url.searchParams.get("parent_task_id");
+		const startedFrom = url.searchParams.get("started_from");
+		const startedTo = url.searchParams.get("started_to");
+		const finishedFrom = url.searchParams.get("finished_from");
+		const finishedBefore = url.searchParams.get("finished_before");
+		const timestamp = (value: string | null | undefined) =>
+			value ? new Date(value).getTime() : Number.NaN;
 		if (parentTaskId) {
 			items = items.filter((item) => item.parent_task_id === parentTaskId);
 		}
+		items = items.filter((item) => {
+			if (status !== "all" && item.status !== status) return false;
+			if (model && item.model !== model) return false;
+			if (source && item.source !== source) return false;
+			if (requestedBy && item.requested_by !== requestedBy) return false;
+			const startedAt = timestamp(item.started_at ?? item.created_at);
+			const finishedAt = timestamp(
+				item.finished_at ?? item.updated_at ?? item.created_at,
+			);
+			const startedFromAt = timestamp(startedFrom);
+			const startedToAt = timestamp(startedTo);
+			const finishedFromAt = timestamp(finishedFrom);
+			const finishedBeforeAt = timestamp(finishedBefore);
+			return (
+				(Number.isNaN(startedFromAt) || startedAt >= startedFromAt) &&
+				(Number.isNaN(startedToAt) || startedAt <= startedToAt) &&
+				(Number.isNaN(finishedFromAt) || finishedAt >= finishedFromAt) &&
+				(Number.isNaN(finishedBeforeAt) || finishedAt < finishedBeforeAt)
+			);
+		});
+		const page = Math.max(1, Number(url.searchParams.get("page") ?? "1"));
+		const pageSize = Math.max(
+			1,
+			Number(url.searchParams.get("page_size") ?? "20"),
+		);
+		const total = items.length;
+		items = items.slice((page - 1) * pageSize, page * pageSize);
 		return json({
 			items,
-			total: items.length,
-			page: Number(url.searchParams.get("page") ?? "1"),
-			page_size: Number(url.searchParams.get("page_size") ?? "20"),
+			total,
+			page,
+			page_size: pageSize,
 		});
 	}),
 	http.get("/api/admin/jobs/llm/calls/:callId", async ({ params, request }) => {

@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, within } from "storybook/test";
+import { expect, fn, userEvent, within } from "storybook/test";
 import { LlmActivityGrid } from "@/admin/LlmActivityGrid";
 import type { AdminLlmActivityResponse } from "@/api";
 
@@ -59,6 +59,13 @@ const meta = {
 			},
 		},
 	},
+	decorators: [
+		(Story) => (
+			<div className="mx-auto min-h-80 w-full max-w-3xl rounded-md bg-zinc-200 p-6">
+				<Story />
+			</div>
+		),
+	],
 	args: {
 		data: fixture,
 		loading: false,
@@ -83,6 +90,33 @@ export const Default: Story = {
 		await expect(body.getByTestId("llm-activity-summary")).toBeVisible();
 		await userEvent.keyboard("{Escape}");
 		await expect(body.queryByTestId("llm-activity-summary")).toBeNull();
+	},
+};
+
+export const DrilldownMenu: Story = {
+	args: {
+		onOpenCalls: fn(),
+	},
+	play: async ({ canvasElement, args }) => {
+		const canvas = within(canvasElement);
+		const body = within(canvasElement.ownerDocument.body);
+		const firstCell = canvas.getAllByRole("button", {
+			name: /gpt-5-mini/,
+		})[0];
+		await userEvent.pointer({ target: firstCell, keys: "[MouseRight]" });
+		await userEvent.click(body.getByRole("menuitem", { name: "查看失败调用" }));
+		await expect(args.onOpenCalls).toHaveBeenCalledWith(
+			expect.objectContaining({
+				model: "gpt-5-mini",
+				status: "failed",
+			}),
+		);
+		firstCell.focus();
+		await userEvent.keyboard("{ContextMenu}");
+		await expect(
+			body.getByRole("menuitem", { name: "查看全部调用" }),
+		).toBeVisible();
+		await userEvent.keyboard("{Escape}");
 	},
 };
 

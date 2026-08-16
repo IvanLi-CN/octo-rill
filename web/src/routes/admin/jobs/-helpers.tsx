@@ -7,6 +7,8 @@ import {
 	type AdminJobsSearchInput,
 	buildAdminJobsRouteState,
 	buildAdminJobsRouteUrl,
+	llmCallRouteFiltersToSearch,
+	parseLlmCallRouteFilters,
 	type AdminJobsRouteState,
 	ADMIN_JOBS_BASE_PATH,
 	ADMIN_JOBS_LLM_PATH,
@@ -19,7 +21,9 @@ import { AdminJobsStartupSkeleton, AppBoot } from "@/pages/AppBoot";
 
 import { useRequiredAdmin } from "../../-adminGuard";
 
-function buildAdminJobsCanonicalSearch(routeState: AdminJobsRouteState) {
+function buildAdminJobsCanonicalSearch(
+	routeState: AdminJobsRouteState,
+): AdminJobsSearchInput {
 	if (routeState.taskDrawerRoute) {
 		if (routeState.drawerFromTab === "translations") {
 			return {
@@ -46,22 +50,35 @@ function buildAdminJobsCanonicalSearch(routeState: AdminJobsRouteState) {
 		};
 	}
 
+	if (routeState.primaryTab === "llm") {
+		return {
+			from: undefined,
+			view: undefined,
+			...llmCallRouteFiltersToSearch(
+				routeState.llmCallFilters ?? parseLlmCallRouteFilters({}),
+			),
+		};
+	}
+
 	return {
 		from: undefined,
 		view: undefined,
 	};
 }
 
-function sameSearch(
-	left: AdminJobsSearchInput,
-	right: {
-		from?: string;
-		view?: string;
-	},
-) {
+function sameSearch(left: AdminJobsSearchInput, right: AdminJobsSearchInput) {
 	return (
 		(left.from ?? undefined) === (right.from ?? undefined) &&
-		(left.view ?? undefined) === (right.view ?? undefined)
+		(left.view ?? undefined) === (right.view ?? undefined) &&
+		(left.llm_status ?? undefined) === (right.llm_status ?? undefined) &&
+		(left.llm_model ?? undefined) === (right.llm_model ?? undefined) &&
+		(left.llm_source ?? undefined) === (right.llm_source ?? undefined) &&
+		(left.llm_requested_by ?? undefined) ===
+			(right.llm_requested_by ?? undefined) &&
+		(left.llm_time_field ?? undefined) ===
+			(right.llm_time_field ?? undefined) &&
+		(left.llm_time_from ?? undefined) === (right.llm_time_from ?? undefined) &&
+		(left.llm_time_to ?? undefined) === (right.llm_time_to ?? undefined)
 	);
 }
 
