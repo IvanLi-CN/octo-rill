@@ -563,7 +563,7 @@ export function LlmActivityGrid({
 				<div
 					ref={tooltipRef}
 					id={ACTIVITY_SUMMARY_ID}
-					className="bg-popover text-popover-foreground pointer-events-none fixed z-50 max-h-[min(70vh,24rem)] w-[min(28rem,calc(100vw-1.5rem))] overflow-y-auto rounded-md border p-3 shadow-lg"
+					className="bg-popover text-popover-foreground pointer-events-none fixed z-50 max-h-[min(30vh,12rem)] w-[min(28rem,calc(100vw-1.5rem))] overflow-y-auto rounded-md border p-3 shadow-lg"
 					style={
 						tooltipPosition
 							? { left: tooltipPosition.left, top: tooltipPosition.top }
