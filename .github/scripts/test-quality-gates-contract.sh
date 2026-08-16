@@ -24,7 +24,8 @@ fi
 grep -q "implementation_profile='final' does not match workflow profile 'bootstrap'" "$tmp_dir/profile-mismatch.log"
 
 coverage_repo="$tmp_dir/coverage-repo"
-cp -R "$repo_root/." "$coverage_repo"
+mkdir -p "$coverage_repo"
+cp -R "$repo_root/.github" "$coverage_repo/.github"
 python3 - <<'PY' "$coverage_repo"
 from pathlib import Path
 import json
@@ -49,7 +50,8 @@ fi
 grep -q "unexpected=\['Build (Release)'\]" "$tmp_dir/coverage.log"
 
 label_repo="$tmp_dir/label-repo"
-cp -R "$repo_root/." "$label_repo"
+mkdir -p "$label_repo"
+cp -R "$repo_root/.github" "$label_repo/.github"
 python3 - <<'PY' "$label_repo"
 from pathlib import Path
 import sys
@@ -71,49 +73,9 @@ fi
 
 grep -q "label-gate.yml.on.pull_request_target.types drifted" "$tmp_dir/label.log"
 
-label_metadata_repo="$tmp_dir/label-metadata-repo"
-cp -R "$repo_root/." "$label_metadata_repo"
-python3 - <<'PY' "$label_metadata_repo"
-from pathlib import Path
-import sys
-
-repo = Path(sys.argv[1])
-path = repo / ".github/workflows/label-gate.yml"
-text = path.read_text()
-old_group = "group: label-gate-${{ github.event.pull_request.number || github.run_id }}"
-metadata_group = "group: label-gate-${{ github.event.action == 'edited' && format('metadata-{0}', github.run_id) || github.event.pull_request.number || github.run_id }}"
-if old_group not in text:
-    raise SystemExit("failed to locate label-gate legacy concurrency group")
-path.write_text(text.replace(old_group, metadata_group, 1))
-PY
-
-python3 "$repo_root/.github/scripts/check_quality_gates_contract.py" --repo-root "$label_metadata_repo" --profile final
-
-label_invalid_group_repo="$tmp_dir/label-invalid-group-repo"
-cp -R "$repo_root/." "$label_invalid_group_repo"
-python3 - <<'PY' "$label_invalid_group_repo"
-from pathlib import Path
-import sys
-
-repo = Path(sys.argv[1])
-path = repo / ".github/workflows/label-gate.yml"
-text = path.read_text()
-old_group = "group: label-gate-${{ github.event.pull_request.number || github.run_id }}"
-invalid_group = "group: label-gate-${{ github.event.action == 'edited' && github.run_id || github.event.pull_request.number }}"
-if old_group not in text:
-    raise SystemExit("failed to locate label-gate legacy concurrency group")
-path.write_text(text.replace(old_group, invalid_group, 1))
-PY
-
-if python3 "$repo_root/.github/scripts/check_quality_gates_contract.py" --repo-root "$label_invalid_group_repo" --profile final >/dev/null 2>"$tmp_dir/label-invalid-group.log"; then
-  echo "expected unsupported label-gate concurrency group to fail" >&2
-  exit 1
-fi
-
-grep -q "label-gate.yml.concurrency.group is not an approved value" "$tmp_dir/label-invalid-group.log"
-
 review_repo="$tmp_dir/review-repo"
-cp -R "$repo_root/." "$review_repo"
+mkdir -p "$review_repo"
+cp -R "$repo_root/.github" "$review_repo/.github"
 python3 - <<'PY' "$review_repo"
 from pathlib import Path
 import sys
@@ -133,5 +95,60 @@ if python3 "$repo_root/.github/scripts/check_quality_gates_contract.py" --repo-r
 fi
 
 grep -q "review-policy.yml: trusted-source fetch drifted" "$tmp_dir/review.log"
+
+python3 - <<'PY' "$repo_root" "$tmp_dir"
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+repo_root = Path(sys.argv[1])
+tmp_dir = Path(sys.argv[2])
+cases = (
+    (
+        "ci.yml",
+        "group: ci-${{ github.event_name == 'pull_request' && github.event.action == 'edited' && format('metadata-{0}', github.run_id) || github.ref }}",
+        "group: ci-${{ github.ref }}",
+        "ci.yml.concurrency.group drifted",
+    ),
+    (
+        "label-gate.yml",
+        "group: label-gate-${{ github.event.action == 'edited' && format('metadata-{0}', github.run_id) || github.event.pull_request.number || github.run_id }}",
+        "group: label-gate-${{ github.event.pull_request.number || github.run_id }}",
+        "label-gate.yml.concurrency.group drifted",
+    ),
+    (
+        "review-policy.yml",
+        "group: review-policy-${{ github.event_name == 'pull_request' && github.event.action == 'edited' && format('metadata-{0}', github.run_id) || github.event.pull_request.number || github.run_id }}",
+        "group: review-policy-${{ github.event.pull_request.number || github.run_id }}",
+        "review-policy.yml.concurrency.group drifted",
+    ),
+)
+
+for workflow, expected, replacement, failure in cases:
+    candidate = tmp_dir / f"{workflow}-concurrency-repo"
+    shutil.copytree(repo_root / ".github", candidate / ".github")
+    path = candidate / ".github" / "workflows" / workflow
+    text = path.read_text()
+    if expected not in text:
+        raise SystemExit(f"failed to locate metadata concurrency group in {workflow}")
+    path.write_text(text.replace(expected, replacement, 1))
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / ".github" / "scripts" / "check_quality_gates_contract.py"),
+            "--repo-root",
+            str(candidate),
+            "--profile",
+            "final",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        raise SystemExit(f"expected {workflow} concurrency drift to fail")
+    if failure not in result.stderr:
+        raise SystemExit(f"missing {workflow} concurrency drift assertion: {result.stderr}")
+PY
 
 echo "test-quality-gates-contract: all checks passed"
