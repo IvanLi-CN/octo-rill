@@ -2071,7 +2071,13 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(
 		page.getByRole("textbox", { name: "LLM 调用来源筛选" }),
 	).toBeVisible();
+	const timeRangeTrigger = page.getByRole("button", {
+		name: "LLM 调用时间范围：开始时间",
+	});
+	await expect(timeRangeTrigger).toBeVisible();
+	await timeRangeTrigger.click();
 	await expect(page.getByLabel("LLM 开始时间下限")).toBeVisible();
+	await page.keyboard.press("Escape");
 	await expect(page.getByText("调度器状态")).toHaveCount(0);
 	await expect(page.getByText("等待 / 进行中")).toHaveCount(0);
 	await expect(page.getByText("近24h 调用 / 失败")).toBeVisible();
@@ -2369,6 +2375,24 @@ test("admin drills from LLM activity and model cards into shareable call filters
 	const results = page.getByRole("region", { name: "LLM 调用记录结果" });
 	await expect(results).toBeFocused();
 	await expect(page.getByText("job.api.translate_release")).toBeVisible();
+	await page
+		.getByRole("button", { name: "LLM 调用时间范围：结束时间" })
+		.click();
+	await expect
+		.poll(() =>
+			page.getByLabel("LLM 结束时间下限").evaluate((input) => {
+				return new Date((input as HTMLInputElement).value).toISOString();
+			}),
+		)
+		.toBe("2026-02-26T02:00:00.000Z");
+	await expect
+		.poll(() =>
+			page.getByLabel("LLM 结束时间上限（不含）").evaluate((input) => {
+				return new Date((input as HTMLInputElement).value).toISOString();
+			}),
+		)
+		.toBe("2026-02-26T03:00:00.000Z");
+	await page.keyboard.press("Escape");
 
 	await page.goBack();
 	await expect(page).toHaveURL(/llm_source=obsolete-source/);

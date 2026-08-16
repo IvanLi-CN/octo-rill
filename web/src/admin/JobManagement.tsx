@@ -19,6 +19,7 @@ import {
 	LlmCallContextMenu,
 	type LlmCallDrilldown,
 } from "@/admin/LlmCallContextMenu";
+import { LlmCallTimeRangeFilter } from "@/admin/LlmCallTimeRangeFilter";
 import { TranslationWorkerBoard } from "@/admin/TranslationWorkerBoard";
 import {
 	ADMIN_JOBS_BASE_PATH,
@@ -6404,80 +6405,27 @@ export function JobManagement({
 									placeholder="用户 NanoID（requested_by）"
 									aria-label="LLM 调用用户筛选"
 								/>
-								<div className="grid gap-2 xl:col-span-4 xl:grid-cols-[minmax(0,180px)_minmax(0,1fr)_minmax(0,1fr)_auto]">
-									<Select
-										value={llmTimeField}
-										onValueChange={(nextValue) => {
-											const nextTimeField = nextValue as LlmCallTimeField;
-											setLlmTimeField(nextTimeField);
-											updateLlmCallRouteFilters(
-												{ timeField: nextTimeField },
-												{ replace: true },
-											);
-										}}
-									>
-										<SelectTrigger aria-label="LLM 时间口径">
-											<SelectValue />
-										</SelectTrigger>
-										<SelectContent>
-											<SelectItem value="started">开始时间</SelectItem>
-											<SelectItem value="finished">结束时间</SelectItem>
-										</SelectContent>
-									</Select>
-									<div className="min-w-0 space-y-1">
-										<Label
-											htmlFor="llm-call-time-from"
-											className="text-muted-foreground text-xs"
-										>
-											{llmTimeField === "finished"
-												? "结束时间后"
-												: "开始时间后"}
-										</Label>
-										<Input
-											id="llm-call-time-from"
-											type="datetime-local"
-											value={llmStartedFromFilter}
-											onChange={(event) => {
-												setLlmStartedFromFilter(event.target.value);
+								<div className="flex min-w-0 gap-2 sm:col-span-2 xl:col-span-4">
+									<div className="min-w-0 flex-1">
+										<LlmCallTimeRangeFilter
+											value={{
+												timeField: llmTimeField,
+												timeFrom: llmStartedFromFilter,
+												timeTo: llmStartedToFilter,
+											}}
+											onValueChange={(nextValue) => {
+												setLlmTimeField(nextValue.timeField);
+												setLlmStartedFromFilter(nextValue.timeFrom);
+												setLlmStartedToFilter(nextValue.timeTo);
 												updateLlmCallRouteFilters(
-													{ timeFrom: localInputToUtc(event.target.value) },
+													{
+														timeField: nextValue.timeField,
+														timeFrom: localInputToUtc(nextValue.timeFrom),
+														timeTo: localInputToUtc(nextValue.timeTo),
+													},
 													{ replace: true },
 												);
 											}}
-											aria-label={
-												llmTimeField === "finished"
-													? "LLM 结束时间下限"
-													: "LLM 开始时间下限"
-											}
-											className="text-xs"
-										/>
-									</div>
-									<div className="min-w-0 space-y-1">
-										<Label
-											htmlFor="llm-call-time-to"
-											className="text-muted-foreground text-xs"
-										>
-											{llmTimeField === "finished"
-												? "结束时间前（不含）"
-												: "开始时间前"}
-										</Label>
-										<Input
-											id="llm-call-time-to"
-											type="datetime-local"
-											value={llmStartedToFilter}
-											onChange={(event) => {
-												setLlmStartedToFilter(event.target.value);
-												updateLlmCallRouteFilters(
-													{ timeTo: localInputToUtc(event.target.value) },
-													{ replace: true },
-												);
-											}}
-											aria-label={
-												llmTimeField === "finished"
-													? "LLM 结束时间上限（不含）"
-													: "LLM 开始时间上限"
-											}
-											className="text-xs"
 										/>
 									</div>
 									<Button
