@@ -1,6 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, within } from "storybook/test";
-
 import { LlmActivityGrid } from "@/admin/LlmActivityGrid";
 import type { AdminLlmActivityResponse } from "@/api";
 
@@ -56,7 +55,7 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"管理员 LLM 调度的固定 50 小时逐模型活动网格，覆盖列聚合、键盘漫游和独立刷新状态。",
+					"管理员 LLM 调度按容器宽度动态展示最近窗口（最多 50 小时）的逐模型活动网格，覆盖列聚合、键盘漫游和独立刷新状态。",
 			},
 		},
 	},
@@ -74,19 +73,16 @@ type Story = StoryObj<typeof meta>;
 export const Default: Story = {
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		const latestCell = canvas.getByRole("button", {
-			name: /gpt-5-mini，成功 8，失败 2/,
-		});
-		await userEvent.click(latestCell);
-		const summary = canvas.getByTestId("llm-activity-summary");
-		await expect(summary).toHaveTextContent("80%");
-		await expect(summary).toHaveTextContent("2");
+		const body = within(canvasElement.ownerDocument.body);
+		const firstCell = canvas.getAllByRole("button", {
+			name: /gpt-5-mini/,
+		})[0];
+		await userEvent.click(firstCell);
+		await expect(body.getByTestId("llm-activity-summary")).toBeVisible();
 		await userEvent.keyboard("{ArrowLeft}");
-		await expect(canvas.getByTestId("llm-activity-summary")).toBeVisible();
+		await expect(body.getByTestId("llm-activity-summary")).toBeVisible();
 		await userEvent.keyboard("{Escape}");
-		await expect(
-			canvas.queryByTestId("llm-activity-summary"),
-		).not.toBeInTheDocument();
+		await expect(body.queryByTestId("llm-activity-summary")).toBeNull();
 	},
 };
 
