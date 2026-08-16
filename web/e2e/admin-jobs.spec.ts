@@ -2380,6 +2380,7 @@ test("admin llm activity reanchors a pinned tooltip after activity refresh", asy
 	const activeCellSelector =
 		'button[aria-expanded="true"][aria-label*="gpt-4o-mini"]';
 	const beforeActiveCell = await grid.locator(activeCellSelector).boundingBox();
+	const beforeTooltip = await summary.boundingBox();
 	await page
 		.getByRole("button", { name: "刷新" })
 		.first()
@@ -2390,10 +2391,16 @@ test("admin llm activity reanchors a pinned tooltip after activity refresh", asy
 	).toBeVisible();
 	await page.waitForTimeout(700);
 	const afterActiveCell = await grid.locator(activeCellSelector).boundingBox();
+	const afterTooltip = await summary.boundingBox();
 	expect(beforeActiveCell).not.toBeNull();
 	expect(afterActiveCell).not.toBeNull();
+	expect(beforeTooltip).not.toBeNull();
+	expect(afterTooltip).not.toBeNull();
 	expect(
 		Math.abs((afterActiveCell?.x ?? 0) - (beforeActiveCell?.x ?? 0)),
+	).toBeGreaterThan(0);
+	expect(
+		Math.abs((afterTooltip?.x ?? 0) - (beforeTooltip?.x ?? 0)),
 	).toBeGreaterThan(0);
 });
 
