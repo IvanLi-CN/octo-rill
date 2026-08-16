@@ -43,9 +43,7 @@ type TooltipPosition = {
 };
 
 const ACTIVITY_SUMMARY_ID = "llm-activity-summary";
-const DESKTOP_BUCKET_COUNT = 50;
-const TABLET_BUCKET_COUNT = 36;
-const MOBILE_BUCKET_COUNT = 25;
+const MAX_BUCKET_COUNT = 50;
 const TOOLTIP_GAP = 12;
 const TOOLTIP_VIEWPORT_MARGIN = 12;
 
@@ -117,15 +115,39 @@ export function LlmActivityGrid({
 	);
 	const [tooltipPosition, setTooltipPosition] =
 		useState<TooltipPosition | null>(null);
+	const [gridSurfaceWidth, setGridSurfaceWidth] = useState(0);
 	const isDesktop = useMediaQuery("(min-width: 1024px)");
 	const isTablet = useMediaQuery("(min-width: 640px)");
 	const isMobile = !isTablet;
 	const activeColumn = pinnedColumn ?? hoveredColumn;
-	const visibleBucketCount = isDesktop
-		? DESKTOP_BUCKET_COUNT
-		: isTablet
-			? TABLET_BUCKET_COUNT
-			: MOBILE_BUCKET_COUNT;
+	const gridLabelWidth = isDesktop ? 152 : isTablet ? 112 : 28;
+	const minimumCellSize = isDesktop ? 12 : isTablet ? 11 : 9;
+	const gridGap = isMobile ? 2 : 3;
+	const fallbackBucketCount = isDesktop ? MAX_BUCKET_COUNT : isTablet ? 36 : 25;
+	const bucketCapacity =
+		gridSurfaceWidth > 0
+			? Math.floor(
+					Math.max(0, gridSurfaceWidth - gridLabelWidth) /
+						(minimumCellSize + gridGap),
+				)
+			: fallbackBucketCount;
+	const visibleBucketCount = Math.min(
+		data?.buckets.length ?? MAX_BUCKET_COUNT,
+		Math.max(1, bucketCapacity),
+	);
+
+	useLayoutEffect(() => {
+		const surface = gridSurfaceRef.current;
+		if (!surface) return;
+		const updateWidth = () => {
+			const width = Math.round(surface.getBoundingClientRect().width);
+			setGridSurfaceWidth((current) => (current === width ? current : width));
+		};
+		updateWidth();
+		const observer = new ResizeObserver(updateWidth);
+		observer.observe(surface);
+		return () => observer.disconnect();
+	}, [data]);
 
 	const visibleMax = useMemo(
 		() =>
@@ -350,16 +372,8 @@ export function LlmActivityGrid({
 		data.buckets.length - visibleBucketCount,
 	);
 	const visibleBuckets = data.buckets.slice(visibleBucketStart);
-	const gridLabelWidth = isDesktop ? 152 : isTablet ? 112 : 28;
-	const maximumCellSize = isDesktop ? 12 : isTablet ? 11 : 9;
-	const gridGap = isMobile ? 2 : 3;
-	const gridMaximumWidth =
-		gridLabelWidth +
-		visibleBuckets.length * maximumCellSize +
-		Math.max(0, visibleBuckets.length - 1) * gridGap;
 	const gridStyle = {
 		gridTemplateColumns: `${gridLabelWidth}px repeat(${visibleBuckets.length}, minmax(0, 1fr))`,
-		maxWidth: `${gridMaximumWidth}px`,
 	} as CSSProperties;
 
 	const tooltip = selectedBucket
@@ -439,7 +453,11 @@ export function LlmActivityGrid({
 					</span>
 				</div>
 			) : null}
-			<div ref={gridSurfaceRef} className="min-w-0">
+			<div
+				ref={gridSurfaceRef}
+				className="min-w-0"
+				data-testid="llm-activity-surface"
+			>
 				<div
 					className={`grid w-full gap-y-1 ${isMobile ? "gap-x-0.5" : "gap-x-[3px]"}`}
 					style={gridStyle}
@@ -448,11 +466,17 @@ export function LlmActivityGrid({
 					{visibleBuckets.map((bucket, index) => (
 						<div
 							key={bucket.started_at}
-							className="text-muted-foreground h-0 text-xs sm:h-8"
+							className="text-muted-foreground relative h-0 text-xs sm:h-8"
 							title={localTime(bucket.started_at)}
 						>
 							{index % 6 === 0 || index === visibleBuckets.length - 1 ? (
-								<span className="hidden origin-bottom-left rotate-[-45deg] whitespace-nowrap sm:inline-block">
+								<span
+									className={`absolute bottom-0 hidden rotate-[-45deg] whitespace-nowrap sm:inline-block ${
+										index === visibleBuckets.length - 1
+											? "right-0 origin-bottom-right"
+											: "left-0 origin-bottom-left"
+									}`}
+								>
 									{localTime(bucket.started_at).slice(0, 5)}
 								</span>
 							) : null}

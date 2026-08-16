@@ -2315,15 +2315,11 @@ test("admin llm activity keeps the pointer tooltip clear of the grid", async ({
 	await expect(summary).toBeVisible();
 });
 
-test("admin llm activity uses responsive buckets without horizontal overflow", async ({
+test("admin llm activity fits a dynamic recent window without horizontal overflow", async ({
 	page,
 }) => {
-	for (const { width, expectedBuckets } of [
-		{ width: 1024, expectedBuckets: 50 },
-		{ width: 768, expectedBuckets: 36 },
-		{ width: 393, expectedBuckets: 25 },
-		{ width: 320, expectedBuckets: 25 },
-	]) {
+	const visibleBucketCounts: number[] = [];
+	for (const width of [1200, 960, 640, 393, 320]) {
 		await page.setViewportSize({ width, height: 852 });
 		await installAdminJobsMocks(page, { emitStreamEvents: false });
 		await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
@@ -2349,16 +2345,40 @@ test("admin llm activity uses responsive buckets without horizontal overflow", a
 					document.documentElement.clientWidth,
 			})),
 		]);
-		expect(visibleCells).toBe(expectedBuckets);
+		visibleBucketCounts.push(visibleCells);
+		expect(visibleCells).toBeGreaterThan(0);
+		expect(visibleCells).toBeLessThanOrEqual(50);
 		expect(layout.documentOverflow).toBeLessThanOrEqual(1);
 		expect(
 			await grid.evaluate((node) => node.scrollWidth - node.clientWidth),
+		).toBeLessThanOrEqual(1);
+		expect(
+			await grid.evaluate((node) => {
+				const surface = node.querySelector<HTMLElement>(
+					'[data-testid="llm-activity-surface"]',
+				);
+				const rowCells = Array.from(
+					node.querySelectorAll<HTMLButtonElement>(
+						'button[aria-label*="gpt-4o-mini"]',
+					),
+				);
+				const lastCell = rowCells.at(-1);
+				if (!surface || !lastCell) return Number.POSITIVE_INFINITY;
+				return Math.abs(
+					surface.getBoundingClientRect().right -
+						lastCell.getBoundingClientRect().right,
+				);
+			}),
 		).toBeLessThanOrEqual(1);
 
 		if (width < 640) {
 			await expect(grid.getByRole("list", { name: "模型图例" })).toBeVisible();
 		}
 	}
+
+	expect(visibleBucketCounts[0]).toBeGreaterThan(visibleBucketCounts[2]);
+	expect(visibleBucketCounts[1]).toBeGreaterThan(visibleBucketCounts[2]);
+	expect(visibleBucketCounts[3]).toBeGreaterThan(visibleBucketCounts[4]);
 });
 
 test("admin llm activity prioritizes the grid on mobile", async ({ page }) => {
@@ -2368,14 +2388,15 @@ test("admin llm activity prioritizes the grid on mobile", async ({ page }) => {
 
 	const grid = page.getByTestId("llm-activity-grid");
 	await expect(grid).toBeVisible({ timeout: 10_000 });
-	await expect(grid.getByText("最近 25 小时", { exact: false })).toBeVisible();
+	await expect(grid.getByText(/最近 \d+ 小时/, { exact: false })).toBeVisible();
 	await expect(grid.getByTestId("llm-activity-mobile-range")).toContainText(
 		"至",
 	);
 	const modelLabel = grid.locator('span[title="gpt-4o-mini"]');
 	await expect(modelLabel).toBeHidden();
 	const mobileModelCells = grid.getByRole("button", { name: /gpt-4o-mini/ });
-	await expect(mobileModelCells).toHaveCount(25);
+	expect(await mobileModelCells.count()).toBeGreaterThan(0);
+	expect(await mobileModelCells.count()).toBeLessThan(50);
 	const [firstCellBox, secondCellBox] = await Promise.all([
 		mobileModelCells.nth(0).boundingBox(),
 		mobileModelCells.nth(1).boundingBox(),
