@@ -1,0 +1,65 @@
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import { useState } from "react";
+import { expect, userEvent, within } from "storybook/test";
+
+import {
+	LlmCallTimeRangeFilter,
+	type LlmCallTimeRangeValue,
+} from "@/admin/LlmCallTimeRangeFilter";
+
+function TimeRangeFilterStory(props: { value: LlmCallTimeRangeValue }) {
+	const [value, setValue] = useState(props.value);
+	return <LlmCallTimeRangeFilter value={value} onValueChange={setValue} />;
+}
+
+const meta = {
+	title: "Admin/LlmCallTimeRangeFilter",
+	component: TimeRangeFilterStory,
+	tags: ["autodocs"],
+	parameters: {
+		layout: "padded",
+	},
+	decorators: [
+		(Story) => (
+			<div className="bg-muted mx-auto min-h-56 w-full max-w-2xl rounded-md border p-6">
+				<Story />
+			</div>
+		),
+	],
+} satisfies Meta<typeof TimeRangeFilterStory>;
+
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+export const StartedRange: Story = {
+	args: {
+		value: {
+			timeField: "started",
+			timeFrom: "2026-08-16T09:00",
+			timeTo: "2026-08-16T12:00",
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const body = within(canvasElement.ownerDocument.body);
+		await userEvent.click(
+			canvas.getByRole("button", { name: "LLM 调用时间范围：开始时间" }),
+		);
+		await expect(body.getByLabelText("LLM 开始时间下限")).toHaveValue(
+			"2026-08-16T09:00",
+		);
+		await userEvent.click(body.getByRole("combobox", { name: "LLM 时间口径" }));
+		await userEvent.click(body.getByRole("option", { name: "结束时间" }));
+		await expect(body.getByLabelText("LLM 结束时间上限（不含）")).toBeVisible();
+	},
+};
+
+export const EmptyRange: Story = {
+	args: {
+		value: {
+			timeField: "finished",
+			timeFrom: "",
+			timeTo: "",
+		},
+	},
+};
