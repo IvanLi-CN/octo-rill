@@ -636,7 +636,7 @@ export function LlmActivityGrid({
 			) : null}
 			<div
 				ref={gridSurfaceRef}
-				className="min-w-0"
+				className="min-w-0 max-h-[min(30vh,12rem)] overflow-y-auto"
 				data-testid="llm-activity-surface"
 			>
 				<div
