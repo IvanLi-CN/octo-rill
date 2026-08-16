@@ -82,6 +82,34 @@ const toActivityRect = (rect: DOMRect): ActivityRect => ({
 const containsPoint = (rect: ActivityRect, x: number, y: number) =>
 	x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
 
+const isInTransitionCorridor = (
+	from: ActivityRect,
+	to: ActivityRect,
+	gap: number,
+	x: number,
+	y: number,
+) => {
+	const horizontalOverlap =
+		x >= Math.max(from.left, to.left) - gap &&
+		x <= Math.min(from.right, to.right) + gap;
+	const verticalOverlap =
+		y >= Math.max(from.top, to.top) - gap &&
+		y <= Math.min(from.bottom, to.bottom) + gap;
+	if (to.top >= from.bottom) {
+		return horizontalOverlap && y >= from.bottom - gap && y <= to.top + gap;
+	}
+	if (to.bottom <= from.top) {
+		return horizontalOverlap && y >= to.bottom - gap && y <= from.top + gap;
+	}
+	if (to.left >= from.right) {
+		return verticalOverlap && x >= from.right - gap && x <= to.left + gap;
+	}
+	if (to.right <= from.left) {
+		return verticalOverlap && x >= to.right - gap && x <= from.left + gap;
+	}
+	return false;
+};
+
 const overlaps = (
 	left: number,
 	top: number,
@@ -107,6 +135,7 @@ export function LlmActivityGrid({
 	const rootRef = useRef<HTMLDivElement>(null);
 	const gridSurfaceRef = useRef<HTMLDivElement>(null);
 	const tooltipRef = useRef<HTMLDivElement>(null);
+	const tooltipAnchorElementRef = useRef<HTMLButtonElement | null>(null);
 	const cellRefs = useRef(new Map<string, HTMLButtonElement>());
 	const [hoveredColumn, setHoveredColumn] = useState<number | null>(null);
 	const [pinnedColumn, setPinnedColumn] = useState<number | null>(null);
@@ -165,6 +194,7 @@ export function LlmActivityGrid({
 	);
 
 	const setAnchorFromElement = useCallback((element: HTMLButtonElement) => {
+		tooltipAnchorElementRef.current = element;
 		const rect = toActivityRect(element.getBoundingClientRect());
 		setTooltipAnchor({
 			x: rect.left + rect.width / 2,
@@ -173,6 +203,7 @@ export function LlmActivityGrid({
 	}, []);
 
 	const closeActivityTooltip = useCallback(() => {
+		tooltipAnchorElementRef.current = null;
 		setHoveredColumn(null);
 		setPinnedColumn(null);
 		setTooltipAnchor(null);
@@ -215,16 +246,10 @@ export function LlmActivityGrid({
 				? containsPoint(tooltipRect, event.clientX, event.clientY)
 				: false;
 			const inTransitionGap = tooltipRect
-				? containsPoint(
-						{
-							left: Math.min(gridRect.left, tooltipRect.left) - TOOLTIP_GAP,
-							right: Math.max(gridRect.right, tooltipRect.right) + TOOLTIP_GAP,
-							top: Math.min(gridRect.top, tooltipRect.top) - TOOLTIP_GAP,
-							bottom:
-								Math.max(gridRect.bottom, tooltipRect.bottom) + TOOLTIP_GAP,
-							height: 0,
-							width: 0,
-						},
+				? isInTransitionCorridor(
+						gridRect,
+						tooltipRect,
+						TOOLTIP_GAP,
 						event.clientX,
 						event.clientY,
 					)
@@ -324,7 +349,27 @@ export function LlmActivityGrid({
 	useLayoutEffect(() => {
 		if (!selectedBucket || !tooltipAnchor) return;
 		updateTooltipPosition();
-		const update = () => window.requestAnimationFrame(updateTooltipPosition);
+		const update = () => {
+			if (pinnedColumn !== null) {
+				const anchorElement = tooltipAnchorElementRef.current;
+				if (!anchorElement) return;
+				const rect = anchorElement.getBoundingClientRect();
+				if (
+					rect.bottom <= 0 ||
+					rect.top >= window.innerHeight ||
+					rect.right <= 0 ||
+					rect.left >= window.innerWidth
+				) {
+					closeActivityTooltip();
+					return;
+				}
+				setTooltipAnchor({
+					x: rect.left + rect.width / 2,
+					y: rect.top + rect.height / 2,
+				});
+			}
+			window.requestAnimationFrame(updateTooltipPosition);
+		};
 		window.addEventListener("resize", update);
 		window.addEventListener("scroll", update, true);
 		const observer = new ResizeObserver(update);
@@ -335,7 +380,13 @@ export function LlmActivityGrid({
 			window.removeEventListener("scroll", update, true);
 			observer.disconnect();
 		};
-	}, [selectedBucket, tooltipAnchor, updateTooltipPosition]);
+	}, [
+		closeActivityTooltip,
+		pinnedColumn,
+		selectedBucket,
+		tooltipAnchor,
+		updateTooltipPosition,
+	]);
 
 	const handleKeyDown = (
 		event: KeyboardEvent<HTMLButtonElement>,
@@ -380,7 +431,11 @@ export function LlmActivityGrid({
 
 	if (!data && error) {
 		return (
-			<div className="flex min-h-44 flex-col items-center justify-center gap-3 rounded-md border border-dashed p-6 text-center">
+			<div
+				className="flex min-h-44 flex-col items-center justify-center gap-3 rounded-md border border-dashed p-6 text-center"
+				role="alert"
+				aria-live="assertive"
+			>
 				<AlertCircle className="text-destructive size-5" />
 				<p className="text-muted-foreground max-w-md text-sm">{error}</p>
 				{onRetry ? (
@@ -587,6 +642,7 @@ export function LlmActivityGrid({
 									onPointerDown={(event) => {
 										setHoveredColumn(column);
 										setPinnedColumn(column);
+										tooltipAnchorElementRef.current = event.currentTarget;
 										setTooltipAnchor({ x: event.clientX, y: event.clientY });
 									}}
 									onClick={(event) => {
@@ -618,7 +674,25 @@ export function LlmActivityGrid({
 				</ul>
 			) : null}
 			{error ? (
-				<p className="text-destructive mt-2 text-xs">更新失败：{error}</p>
+				<div
+					className="text-destructive mt-2 flex flex-wrap items-center gap-2 text-xs"
+					role="alert"
+					aria-live="polite"
+				>
+					<span>更新失败：{error}</span>
+					{onRetry ? (
+						<Button
+							type="button"
+							variant="ghost"
+							size="sm"
+							onClick={onRetry}
+							className="h-6 px-2 text-xs"
+						>
+							<RefreshCw />
+							重试
+						</Button>
+					) : null}
+				</div>
 			) : null}
 			{tooltip}
 		</div>
