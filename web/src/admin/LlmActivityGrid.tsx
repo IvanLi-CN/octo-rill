@@ -257,9 +257,11 @@ export function LlmActivityGrid({
 	useEffect(() => {
 		if (activeColumn === null) return;
 		const closeOutside = (event: MouseEvent) => {
+			const target = event.target as Node;
 			if (
 				pinnedColumn !== null &&
-				!rootRef.current?.contains(event.target as Node)
+				!rootRef.current?.contains(target) &&
+				!tooltipRef.current?.contains(target)
 			) {
 				closeActivityTooltip();
 			}
@@ -595,13 +597,14 @@ export function LlmActivityGrid({
 				<div
 					ref={tooltipRef}
 					id={ACTIVITY_SUMMARY_ID}
-					className="bg-popover text-popover-foreground pointer-events-none fixed z-50 max-h-[min(30vh,12rem)] w-[min(28rem,calc(100vw-1.5rem))] overflow-y-auto rounded-md border p-3 shadow-lg"
+					className={`bg-popover text-popover-foreground fixed z-50 max-h-[min(30vh,12rem)] w-[min(28rem,calc(100vw-1.5rem))] overflow-y-auto rounded-md border p-3 shadow-lg ${pinnedColumn !== null ? "pointer-events-auto" : "pointer-events-none"}`}
 					style={
 						tooltipPosition
 							? { left: tooltipPosition.left, top: tooltipPosition.top }
 							: { left: 0, top: 0, visibility: "hidden" }
 					}
 					role="tooltip"
+					tabIndex={pinnedColumn !== null ? 0 : -1}
 					aria-live="polite"
 					aria-atomic="true"
 					data-testid="llm-activity-summary"

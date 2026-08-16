@@ -32,6 +32,7 @@ type AdminJobsMockOptions = {
 	emitTranslationEvents?: boolean;
 	emitSubscriptionProgressEvents?: boolean;
 	currentUserLogin?: string;
+	activityRefreshOnSecondRequest?: boolean;
 };
 
 function sleep(ms: number) {
@@ -291,6 +292,31 @@ async function installAdminJobsMocks(
 				],
 			};
 		}),
+	};
+	const shiftedLlmActivity = (hours: number) => {
+		const buckets = Array.from(
+			{ length: llmActivity.buckets.length },
+			(_, index) => {
+				const source =
+					llmActivity.buckets[
+						Math.min(index + hours, llmActivity.buckets.length - 1)
+					];
+				const startedAt = new Date(
+					llmActivityStart.getTime() + (index + hours) * 3_600_000,
+				);
+				return {
+					...source,
+					started_at: startedAt.toISOString(),
+					ended_at: new Date(startedAt.getTime() + 3_600_000).toISOString(),
+				};
+			},
+		);
+		return {
+			...llmActivity,
+			window_started_at: buckets[0].started_at,
+			window_ended_at: buckets.at(-1)?.ended_at ?? llmActivity.window_ended_at,
+			buckets,
+		};
 	};
 	const syncSubscriptionChainFinishedAt: Record<string, string> = {
 		"task-subscriptions-1": "2026-02-26T14:50:30Z",
@@ -816,6 +842,7 @@ async function installAdminJobsMocks(
 		return null;
 	}
 
+	let llmActivityRequestCount = 0;
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
 		const url = new URL(req.url());
@@ -1529,7 +1556,13 @@ async function installAdminJobsMocks(
 		}
 
 		if (req.method() === "GET" && pathname === "/api/admin/jobs/llm/activity") {
-			return json(route, llmActivity);
+			llmActivityRequestCount += 1;
+			return json(
+				route,
+				options.activityRefreshOnSecondRequest && llmActivityRequestCount > 1
+					? shiftedLlmActivity(llmActivityRequestCount - 1)
+					: llmActivity,
+			);
 		}
 
 		if (
@@ -2313,6 +2346,55 @@ test("admin llm activity keeps the pointer tooltip clear of the grid", async ({
 
 	await page.mouse.move((summaryBox?.x ?? 0) + 12, (summaryBox?.y ?? 0) + 12);
 	await expect(summary).toBeVisible();
+});
+
+test("admin llm activity reanchors a pinned tooltip after activity refresh", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1200, height: 900 });
+	await installAdminJobsMocks(page, {
+		emitStreamEvents: false,
+		activityRefreshOnSecondRequest: true,
+		delayRules: [
+			{
+				pathname: "/api/admin/jobs/llm/activity",
+				afterCount: 1,
+				times: 1,
+				delayMs: 500,
+			},
+		],
+	});
+	await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+	const grid = page.getByTestId("llm-activity-grid");
+	const cells = grid.locator('button[aria-label*="gpt-4o-mini"]');
+	await expect(cells.first()).toBeVisible({ timeout: 10_000 });
+	await expect(cells).toHaveCount(50, { timeout: 10_000 });
+	const pinnedCell = cells.nth(20);
+	const pinnedLabel = await pinnedCell.getAttribute("aria-label");
+	expect(pinnedLabel).not.toBeNull();
+	await pinnedCell.click();
+
+	const summary = page.getByTestId("llm-activity-summary");
+	await expect(summary).toBeVisible();
+	const activeCellSelector =
+		'button[aria-expanded="true"][aria-label*="gpt-4o-mini"]';
+	const beforeActiveCell = await grid.locator(activeCellSelector).boundingBox();
+	await page
+		.getByRole("button", { name: "刷新" })
+		.first()
+		.dispatchEvent("click");
+	await expect(summary).toBeVisible();
+	await expect(
+		grid.getByRole("button", { name: pinnedLabel ?? "" }),
+	).toBeVisible();
+	await page.waitForTimeout(700);
+	const afterActiveCell = await grid.locator(activeCellSelector).boundingBox();
+	expect(beforeActiveCell).not.toBeNull();
+	expect(afterActiveCell).not.toBeNull();
+	expect(
+		Math.abs((afterActiveCell?.x ?? 0) - (beforeActiveCell?.x ?? 0)),
+	).toBeGreaterThan(0);
 });
 
 test("admin llm activity handles tooltip edges across rows and viewports", async ({
