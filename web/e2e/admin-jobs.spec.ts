@@ -2402,6 +2402,40 @@ test("admin llm activity reanchors a pinned tooltip after activity refresh", asy
 	expect(
 		Math.abs((afterTooltip?.x ?? 0) - (beforeTooltip?.x ?? 0)),
 	).toBeGreaterThan(0);
+	const activeCellShift =
+		(afterActiveCell?.x ?? 0) +
+		(afterActiveCell?.width ?? 0) / 2 -
+		((beforeActiveCell?.x ?? 0) + (beforeActiveCell?.width ?? 0) / 2);
+	const tooltipShift =
+		(afterTooltip?.x ?? 0) +
+		(afterTooltip?.width ?? 0) / 2 -
+		((beforeTooltip?.x ?? 0) + (beforeTooltip?.width ?? 0) / 2);
+	expect(Math.abs(tooltipShift - activeCellShift)).toBeLessThan(1);
+	const refreshedCellBoxes = await cells.evaluateAll((nodes) =>
+		nodes
+			.filter((node) => {
+				const style = window.getComputedStyle(node);
+				return style.display !== "none" && style.visibility !== "hidden";
+			})
+			.map((node) => {
+				const box = node.getBoundingClientRect();
+				return {
+					left: box.left,
+					right: box.right,
+					top: box.top,
+					bottom: box.bottom,
+				};
+			}),
+	);
+	expect(
+		refreshedCellBoxes.some(
+			(cell) =>
+				(afterTooltip?.x ?? 0) < cell.right &&
+				(afterTooltip?.x ?? 0) + (afterTooltip?.width ?? 0) > cell.left &&
+				(afterTooltip?.y ?? 0) < cell.bottom &&
+				(afterTooltip?.y ?? 0) + (afterTooltip?.height ?? 0) > cell.top,
+		),
+	).toBe(false);
 });
 
 test("admin llm activity handles tooltip edges across rows and viewports", async ({
