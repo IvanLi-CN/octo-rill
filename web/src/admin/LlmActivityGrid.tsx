@@ -122,6 +122,24 @@ const overlaps = (
 	top < rect.bottom &&
 	top + height > rect.top;
 
+const overlapArea = (
+	left: number,
+	top: number,
+	width: number,
+	height: number,
+	rect: ActivityRect,
+) => {
+	const overlapWidth = Math.max(
+		0,
+		Math.min(left + width, rect.right) - Math.max(left, rect.left),
+	);
+	const overlapHeight = Math.max(
+		0,
+		Math.min(top + height, rect.bottom) - Math.max(top, rect.top),
+	);
+	return overlapWidth * overlapHeight;
+};
+
 const clamp = (value: number, minimum: number, maximum: number) =>
 	Math.min(Math.max(value, minimum), maximum);
 
@@ -285,16 +303,22 @@ export function LlmActivityGrid({
 
 		const tooltipRect = toActivityRect(tooltip.getBoundingClientRect());
 		const gridRect = toActivityRect(gridSurface.getBoundingClientRect());
-		const rootRect = rootRef.current
-			? toActivityRect(rootRef.current.getBoundingClientRect())
-			: gridRect;
 		const siblingRects = rootRef.current?.parentElement
 			? Array.from(rootRef.current.parentElement.children)
 					.filter((element) => element !== rootRef.current)
 					.map((element) => toActivityRect(element.getBoundingClientRect()))
 					.filter((rect) => rect.width > 0 && rect.height > 0)
 			: [];
-		const avoidRects = [gridRect, rootRect, ...siblingRects];
+		const contentRects = rootRef.current
+			? Array.from(
+					rootRef.current.querySelectorAll<HTMLElement>(
+						'[data-testid="llm-activity-mobile-range"], ul[aria-label="模型图例"], [role="alert"]',
+					),
+				)
+					.map((element) => toActivityRect(element.getBoundingClientRect()))
+					.filter((rect) => rect.width > 0 && rect.height > 0)
+			: [];
+		const avoidRects = [gridRect, ...siblingRects, ...contentRects];
 		const minimumLeft = TOOLTIP_VIEWPORT_MARGIN;
 		const maximumLeft = Math.max(
 			minimumLeft,
@@ -326,6 +350,19 @@ export function LlmActivityGrid({
 			left: clamp(candidate.left, minimumLeft, maximumLeft),
 			top: clamp(candidate.top, minimumTop, maximumTop),
 		}));
+		const candidateOverlap = (candidate: TooltipPosition) =>
+			avoidRects.reduce(
+				(total, rect) =>
+					total +
+					overlapArea(
+						candidate.left,
+						candidate.top,
+						tooltipRect.width,
+						tooltipRect.height,
+						rect,
+					),
+				0,
+			);
 		const position =
 			candidates.find(
 				(candidate) =>
@@ -338,7 +375,22 @@ export function LlmActivityGrid({
 							rect,
 						),
 					),
-			) ?? candidates[0];
+			) ??
+			candidates
+				.filter(
+					(candidate) =>
+						!overlaps(
+							candidate.left,
+							candidate.top,
+							tooltipRect.width,
+							tooltipRect.height,
+							gridRect,
+						),
+				)
+				.sort(
+					(left, right) => candidateOverlap(left) - candidateOverlap(right),
+				)[0] ??
+			candidates[0];
 		setTooltipPosition((current) =>
 			current?.left === position.left && current.top === position.top
 				? current
@@ -350,8 +402,8 @@ export function LlmActivityGrid({
 		if (!selectedBucket || !tooltipAnchor) return;
 		updateTooltipPosition();
 		const update = () => {
-			if (pinnedColumn !== null) {
-				const anchorElement = tooltipAnchorElementRef.current;
+			const anchorElement = tooltipAnchorElementRef.current;
+			if (pinnedColumn !== null || anchorElement) {
 				if (!anchorElement) return;
 				const rect = anchorElement.getBoundingClientRect();
 				if (
@@ -627,6 +679,7 @@ export function LlmActivityGrid({
 									aria-expanded={activeColumn === column}
 									onPointerMove={(event) => {
 										if (pinnedColumn !== null) return;
+										tooltipAnchorElementRef.current = null;
 										setHoveredColumn(column);
 										setTooltipAnchor({ x: event.clientX, y: event.clientY });
 									}}
