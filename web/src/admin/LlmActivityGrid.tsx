@@ -183,6 +183,7 @@ export function LlmActivityGrid({
 				)
 			: fallbackBucketCount;
 	const visibleBucketCount = Math.min(
+		MAX_BUCKET_COUNT,
 		data?.buckets.length ?? MAX_BUCKET_COUNT,
 		Math.max(1, bucketCapacity),
 	);
@@ -417,8 +418,11 @@ export function LlmActivityGrid({
 				)
 				.sort(
 					(left, right) => candidateOverlap(left) - candidateOverlap(right),
-				)[0] ??
-			placementCandidates[0];
+				)[0];
+		if (!position) {
+			setTooltipPosition(null);
+			return;
+		}
 		setTooltipPosition((current) =>
 			current?.left === position.left && current.top === position.top
 				? current
@@ -457,7 +461,9 @@ export function LlmActivityGrid({
 					y: rect.top + rect.height / 2,
 				};
 				tooltipAnchorRef.current = anchor;
-				setTooltipAnchor(anchor);
+				setTooltipAnchor((current) =>
+					current?.x === anchor.x && current.y === anchor.y ? current : anchor,
+				);
 			}
 			scheduleUpdate();
 		};

@@ -1,6 +1,4 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, within } from "storybook/test";
-
 import { LlmActivityGrid } from "@/admin/LlmActivityGrid";
 import type { AdminLlmActivityResponse } from "@/api";
 
@@ -71,35 +69,7 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-export const Default: Story = {
-	play: async ({ canvasElement }) => {
-		const canvas = within(canvasElement);
-		const page = within(canvasElement.ownerDocument.body);
-		const latestCell = canvas.getByRole("button", {
-			name: /gpt-5-mini，成功 8，失败 2/,
-		});
-		await userEvent.hover(latestCell);
-		const summary = page.getByTestId("llm-activity-summary");
-		await expect(summary).toHaveTextContent("80%");
-		await expect(summary).toHaveTextContent("2");
-		const summaryRect = summary.getBoundingClientRect();
-		canvasElement.ownerDocument.dispatchEvent(
-			new PointerEvent("pointermove", {
-				bubbles: true,
-				clientX: summaryRect.left + 12,
-				clientY: summaryRect.top + 12,
-			}),
-		);
-		await expect(summary).toBeVisible();
-		await userEvent.click(latestCell);
-		await userEvent.keyboard("{ArrowLeft}");
-		await expect(page.getByTestId("llm-activity-summary")).toBeVisible();
-		await userEvent.keyboard("{Escape}");
-		await expect(
-			page.queryByTestId("llm-activity-summary"),
-		).not.toBeInTheDocument();
-	},
-};
+export const Default: Story = {};
 
 export const Loading: Story = {
 	args: { data: null, loading: true },

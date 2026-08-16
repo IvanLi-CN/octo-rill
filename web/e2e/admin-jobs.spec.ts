@@ -2315,6 +2315,78 @@ test("admin llm activity keeps the pointer tooltip clear of the grid", async ({
 	await expect(summary).toBeVisible();
 });
 
+test("admin llm activity handles tooltip edges across rows and viewports", async ({
+	page,
+}) => {
+	for (const viewport of [
+		{ width: 1200, height: 500 },
+		{ width: 393, height: 852 },
+	]) {
+		await page.setViewportSize(viewport);
+		await installAdminJobsMocks(page, { emitStreamEvents: false });
+		await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+		const grid = page.getByTestId("llm-activity-grid");
+		await expect(grid).toBeVisible({ timeout: 10_000 });
+		await grid.scrollIntoViewIfNeeded();
+		const visibleCells = grid.locator(
+			'button[aria-controls="llm-activity-summary"]:visible',
+		);
+		await expect(visibleCells.first()).toBeVisible();
+		await visibleCells.first().hover();
+
+		const summary = page.getByTestId("llm-activity-summary");
+		await expect(summary).toBeVisible();
+		const [summaryBox, viewportOverflow] = await Promise.all([
+			summary.boundingBox(),
+			page.evaluate(() => ({
+				documentOverflow:
+					document.documentElement.scrollWidth -
+					document.documentElement.clientWidth,
+				viewportWidth: window.innerWidth,
+				viewportHeight: window.innerHeight,
+			})),
+		]);
+		expect(summaryBox).not.toBeNull();
+		expect(summaryBox?.x ?? -1).toBeGreaterThanOrEqual(0);
+		expect(summaryBox?.y ?? -1).toBeGreaterThanOrEqual(0);
+		expect((summaryBox?.x ?? 0) + (summaryBox?.width ?? 0)).toBeLessThanOrEqual(
+			viewportOverflow.viewportWidth,
+		);
+		expect(
+			(summaryBox?.y ?? 0) + (summaryBox?.height ?? 0),
+		).toBeLessThanOrEqual(viewportOverflow.viewportHeight);
+		expect(viewportOverflow.documentOverflow).toBeLessThanOrEqual(1);
+
+		const cellBoxes = await visibleCells.evaluateAll((nodes) =>
+			nodes.map((node) => {
+				const rect = node.getBoundingClientRect();
+				return {
+					left: rect.left,
+					right: rect.right,
+					top: rect.top,
+					bottom: rect.bottom,
+				};
+			}),
+		);
+		expect(
+			cellBoxes.some(
+				(cell) =>
+					(summaryBox?.x ?? 0) < cell.right &&
+					(summaryBox?.x ?? 0) + (summaryBox?.width ?? 0) > cell.left &&
+					(summaryBox?.y ?? 0) < cell.bottom &&
+					(summaryBox?.y ?? 0) + (summaryBox?.height ?? 0) > cell.top,
+			),
+		).toBe(false);
+
+		await visibleCells.last().click();
+		await page.mouse.wheel(0, 120);
+		await expect(summary).toBeVisible();
+		await page.keyboard.press("Escape");
+		await expect(summary).toHaveCount(0);
+	}
+});
+
 test("admin llm activity fits a dynamic recent window without horizontal overflow", async ({
 	page,
 }) => {
