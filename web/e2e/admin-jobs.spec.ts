@@ -2370,6 +2370,39 @@ test("admin llm activity fits a dynamic recent window without horizontal overflo
 				);
 			}),
 		).toBeLessThanOrEqual(1);
+		if (width >= 640) {
+			const timeLabels = grid.getByTestId("llm-activity-time-label");
+			const surfaceBox = await grid
+				.getByTestId("llm-activity-surface")
+				.boundingBox();
+			const [firstTimeLabel, lastTimeLabel] = await Promise.all([
+				timeLabels.first().boundingBox(),
+				timeLabels.last().boundingBox(),
+			]);
+			const timeLabelBoxes = await timeLabels.evaluateAll((nodes) =>
+				nodes
+					.map((node) => node.getBoundingClientRect())
+					.filter((rect) => rect.width > 0)
+					.map((rect) => ({ left: rect.left, right: rect.right }))
+					.sort((left, right) => left.left - right.left),
+			);
+			expect(await timeLabels.count()).toBeGreaterThan(1);
+			expect(surfaceBox).not.toBeNull();
+			for (const labelBox of [firstTimeLabel, lastTimeLabel]) {
+				expect(labelBox).not.toBeNull();
+				expect(labelBox?.x ?? 0).toBeGreaterThanOrEqual(
+					(surfaceBox?.x ?? 0) - 1,
+				);
+				expect((labelBox?.x ?? 0) + (labelBox?.width ?? 0)).toBeLessThanOrEqual(
+					(surfaceBox?.x ?? 0) + (surfaceBox?.width ?? 0) + 1,
+				);
+			}
+			for (let index = 1; index < timeLabelBoxes.length; index += 1) {
+				expect(timeLabelBoxes[index - 1].right).toBeLessThanOrEqual(
+					timeLabelBoxes[index].left + 1,
+				);
+			}
+		}
 
 		if (width < 640) {
 			await expect(grid.getByRole("list", { name: "模型图例" })).toBeVisible();

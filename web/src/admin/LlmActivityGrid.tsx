@@ -463,25 +463,34 @@ export function LlmActivityGrid({
 					style={gridStyle}
 				>
 					<div className="bg-card sticky left-0 z-20 h-0 sm:h-auto" />
-					{visibleBuckets.map((bucket, index) => (
-						<div
-							key={bucket.started_at}
-							className="text-muted-foreground relative h-0 text-xs sm:h-8"
-							title={localTime(bucket.started_at)}
-						>
-							{index % 6 === 0 || index === visibleBuckets.length - 1 ? (
-								<span
-									className={`absolute bottom-0 hidden rotate-[-45deg] whitespace-nowrap sm:inline-block ${
-										index === visibleBuckets.length - 1
-											? "right-0 origin-bottom-right"
-											: "left-0 origin-bottom-left"
-									}`}
-								>
-									{localTime(bucket.started_at).slice(0, 5)}
-								</span>
-							) : null}
-						</div>
-					))}
+					{visibleBuckets.map((bucket, index) => {
+						const isFirstBucket = index === 0;
+						const isLastBucket = index === visibleBuckets.length - 1;
+						const isTooCloseToLastBucket =
+							!isLastBucket && visibleBuckets.length - 1 - index < 3;
+						const timeLabelPosition = isFirstBucket
+							? "left-0"
+							: isLastBucket
+								? "right-0"
+								: "left-1/2 -translate-x-1/2";
+						return (
+							<div
+								key={bucket.started_at}
+								className="text-muted-foreground relative h-0 text-xs sm:h-6"
+								title={localTime(bucket.started_at)}
+							>
+								{(index % 6 === 0 && !isTooCloseToLastBucket) ||
+								isLastBucket ? (
+									<span
+										className={`absolute bottom-0 hidden whitespace-nowrap sm:inline-block ${timeLabelPosition}`}
+										data-testid="llm-activity-time-label"
+									>
+										{localTime(bucket.started_at).slice(0, 5)}
+									</span>
+								) : null}
+							</div>
+						);
+					})}
 					{data.models.length === 0 ? (
 						<div className="text-muted-foreground col-span-full py-10 text-center text-sm">
 							窗口内暂无模型活动
