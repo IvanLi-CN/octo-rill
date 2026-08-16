@@ -71,6 +71,47 @@ fi
 
 grep -q "label-gate.yml.on.pull_request_target.types drifted" "$tmp_dir/label.log"
 
+label_metadata_repo="$tmp_dir/label-metadata-repo"
+cp -R "$repo_root/." "$label_metadata_repo"
+python3 - <<'PY' "$label_metadata_repo"
+from pathlib import Path
+import sys
+
+repo = Path(sys.argv[1])
+path = repo / ".github/workflows/label-gate.yml"
+text = path.read_text()
+old_group = "group: label-gate-${{ github.event.pull_request.number || github.run_id }}"
+metadata_group = "group: label-gate-${{ github.event.action == 'edited' && format('metadata-{0}', github.run_id) || github.event.pull_request.number || github.run_id }}"
+if old_group not in text:
+    raise SystemExit("failed to locate label-gate legacy concurrency group")
+path.write_text(text.replace(old_group, metadata_group, 1))
+PY
+
+python3 "$repo_root/.github/scripts/check_quality_gates_contract.py" --repo-root "$label_metadata_repo" --profile final
+
+label_invalid_group_repo="$tmp_dir/label-invalid-group-repo"
+cp -R "$repo_root/." "$label_invalid_group_repo"
+python3 - <<'PY' "$label_invalid_group_repo"
+from pathlib import Path
+import sys
+
+repo = Path(sys.argv[1])
+path = repo / ".github/workflows/label-gate.yml"
+text = path.read_text()
+old_group = "group: label-gate-${{ github.event.pull_request.number || github.run_id }}"
+invalid_group = "group: label-gate-${{ github.event.action == 'edited' && github.run_id || github.event.pull_request.number }}"
+if old_group not in text:
+    raise SystemExit("failed to locate label-gate legacy concurrency group")
+path.write_text(text.replace(old_group, invalid_group, 1))
+PY
+
+if python3 "$repo_root/.github/scripts/check_quality_gates_contract.py" --repo-root "$label_invalid_group_repo" --profile final >/dev/null 2>"$tmp_dir/label-invalid-group.log"; then
+  echo "expected unsupported label-gate concurrency group to fail" >&2
+  exit 1
+fi
+
+grep -q "label-gate.yml.concurrency.group is not an approved value" "$tmp_dir/label-invalid-group.log"
+
 review_repo="$tmp_dir/review-repo"
 cp -R "$repo_root/." "$review_repo"
 python3 - <<'PY' "$review_repo"

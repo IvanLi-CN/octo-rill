@@ -55,6 +55,10 @@ BOOTSTRAP_REVIEW_POLICY_PULL_REQUEST_TYPES = {
     "edited",
 }
 REVIEW_POLICY_REVIEW_TYPES = {"submitted", "dismissed", "edited"}
+LABEL_GATE_CONCURRENCY_GROUPS = {
+    "label-gate-${{ github.event.pull_request.number || github.run_id }}",
+    "label-gate-${{ github.event.action == 'edited' && format('metadata-{0}', github.run_id) || github.event.pull_request.number || github.run_id }}",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -675,8 +679,8 @@ def validate_label_gate(path: Path, contract: ContractModel) -> None:
     require("checks" not in permissions, "label-gate.yml.permissions.checks must stay unset")
     concurrency = require_mapping(workflow.get("concurrency"), "label-gate.yml.concurrency")
     require(
-        concurrency.get("group") == "label-gate-${{ github.event.pull_request.number || github.run_id }}",
-        "label-gate.yml.concurrency.group drifted",
+        concurrency.get("group") in LABEL_GATE_CONCURRENCY_GROUPS,
+        "label-gate.yml.concurrency.group is not an approved value",
     )
     require(concurrency.get("cancel-in-progress") is True, "label-gate.yml.concurrency.cancel-in-progress must stay true")
 
