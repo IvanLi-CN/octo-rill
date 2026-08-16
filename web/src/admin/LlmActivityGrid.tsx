@@ -164,6 +164,7 @@ export function LlmActivityGrid({
 	const [pinnedBucketStartedAt, setPinnedBucketStartedAt] = useState<
 		string | null
 	>(null);
+	const [pinnedModel, setPinnedModel] = useState<string | null>(null);
 	const [tooltipAnchor, setTooltipAnchor] = useState<TooltipAnchor | null>(
 		null,
 	);
@@ -248,6 +249,7 @@ export function LlmActivityGrid({
 		setHoveredColumn(null);
 		setPinnedColumn(null);
 		setPinnedBucketStartedAt(null);
+		setPinnedModel(null);
 		setTooltipAnchor(null);
 		setTooltipPosition(null);
 	}, []);
@@ -459,7 +461,15 @@ export function LlmActivityGrid({
 			});
 		};
 		const update = () => {
-			const anchorElement = tooltipAnchorElementRef.current;
+			const pinnedCell =
+				pinnedColumn !== null &&
+				pinnedModel !== null &&
+				resolvedPinnedColumn !== null &&
+				resolvedPinnedColumn >= 0
+					? cellRefs.current.get(`${pinnedModel}:${resolvedPinnedColumn}`)
+					: null;
+			if (pinnedCell) tooltipAnchorElementRef.current = pinnedCell;
+			const anchorElement = pinnedCell ?? tooltipAnchorElementRef.current;
 			if (pinnedColumn !== null || anchorElement) {
 				if (!anchorElement) return;
 				const rect = anchorElement.getBoundingClientRect();
@@ -500,6 +510,8 @@ export function LlmActivityGrid({
 	}, [
 		closeActivityTooltip,
 		pinnedColumn,
+		pinnedModel,
+		resolvedPinnedColumn,
 		selectedBucket,
 		tooltipAnchor,
 		updateTooltipPosition,
@@ -774,6 +786,7 @@ export function LlmActivityGrid({
 										setHoveredColumn(column);
 										setPinnedColumn(column);
 										setPinnedBucketStartedAt(bucket.started_at);
+										setPinnedModel(model.model);
 										tooltipAnchorElementRef.current = event.currentTarget;
 										const anchor = { x: event.clientX, y: event.clientY };
 										tooltipAnchorRef.current = anchor;
@@ -782,6 +795,7 @@ export function LlmActivityGrid({
 									onClick={(event) => {
 										setPinnedColumn(column);
 										setPinnedBucketStartedAt(bucket.started_at);
+										setPinnedModel(model.model);
 										setAnchorFromElement(event.currentTarget);
 									}}
 									onKeyDown={(event) =>
