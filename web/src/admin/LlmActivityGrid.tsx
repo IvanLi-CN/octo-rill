@@ -450,7 +450,6 @@ export function LlmActivityGrid({
 
 	useLayoutEffect(() => {
 		if (!selectedBucket || !tooltipAnchor) return;
-		updateTooltipPosition();
 		const scheduleUpdate = () => {
 			if (tooltipRafRef.current !== null) {
 				window.cancelAnimationFrame(tooltipRafRef.current);
@@ -493,6 +492,8 @@ export function LlmActivityGrid({
 			}
 			scheduleUpdate();
 		};
+		// Resolve the pinned cell before positioning so refreshes re-anchor immediately.
+		update();
 		window.addEventListener("resize", update);
 		window.addEventListener("scroll", update, true);
 		const observer = new ResizeObserver(update);
