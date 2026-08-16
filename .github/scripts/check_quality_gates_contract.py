@@ -55,10 +55,9 @@ BOOTSTRAP_REVIEW_POLICY_PULL_REQUEST_TYPES = {
     "edited",
 }
 REVIEW_POLICY_REVIEW_TYPES = {"submitted", "dismissed", "edited"}
-LABEL_GATE_CONCURRENCY_GROUPS = {
-    "label-gate-${{ github.event.pull_request.number || github.run_id }}",
-    "label-gate-${{ github.event.action == 'edited' && format('metadata-{0}', github.run_id) || github.event.pull_request.number || github.run_id }}",
-}
+CI_METADATA_EDITED_GROUP = "ci-${{ github.event_name == 'pull_request' && github.event.action == 'edited' && format('metadata-{0}', github.run_id) || github.ref }}"
+LABEL_GATE_METADATA_EDITED_GROUP = "label-gate-${{ github.event.action == 'edited' && format('metadata-{0}', github.run_id) || github.event.pull_request.number || github.run_id }}"
+REVIEW_POLICY_METADATA_EDITED_GROUP = "review-policy-${{ github.event_name == 'pull_request' && github.event.action == 'edited' && format('metadata-{0}', github.run_id) || github.event.pull_request.number || github.run_id }}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -172,6 +171,17 @@ def event_config(workflow: dict[str, Any], event_name: str, where: str) -> dict[
     if isinstance(config, dict):
         return config
     raise ContractError(f"{where}.on.{event_name} must be an object")
+
+
+def assert_concurrency_contract(
+    workflow: dict[str, Any], expected_group: str, expected_cancel: Any, where: str
+) -> None:
+    concurrency = require_mapping(workflow.get("concurrency"), f"{where}.concurrency")
+    require(concurrency.get("group") == expected_group, f"{where}.concurrency.group drifted")
+    require(
+        concurrency.get("cancel-in-progress") == expected_cancel,
+        f"{where}.concurrency.cancel-in-progress drifted",
+    )
 
 
 def assert_event_branches(config: dict[str, Any], expected: set[str], where: str) -> None:
@@ -582,6 +592,12 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
     assert_event_types(pull_request_config, CI_PULL_REQUEST_TYPES, "ci.yml.on.pull_request")
     merge_group_config = event_config(workflow, "merge_group", "ci.yml")
     assert_event_types(merge_group_config, {"checks_requested"}, "ci.yml.on.merge_group")
+    assert_concurrency_contract(
+        workflow,
+        CI_METADATA_EDITED_GROUP,
+        "${{ github.event_name == 'pull_request' }}",
+        "ci.yml",
+    )
 
     permissions = require_mapping(workflow.get("permissions"), "ci.yml.permissions")
     require(permissions.get("contents") == "read", "ci.yml.permissions.contents must stay read")
@@ -677,12 +693,7 @@ def validate_label_gate(path: Path, contract: ContractModel) -> None:
     require(permissions.get("pull-requests") == "read", "label-gate.yml.permissions.pull-requests must stay read")
     require(permissions.get("issues") == "read", "label-gate.yml.permissions.issues must stay read")
     require("checks" not in permissions, "label-gate.yml.permissions.checks must stay unset")
-    concurrency = require_mapping(workflow.get("concurrency"), "label-gate.yml.concurrency")
-    require(
-        concurrency.get("group") in LABEL_GATE_CONCURRENCY_GROUPS,
-        "label-gate.yml.concurrency.group is not an approved value",
-    )
-    require(concurrency.get("cancel-in-progress") is True, "label-gate.yml.concurrency.cancel-in-progress must stay true")
+    assert_concurrency_contract(workflow, LABEL_GATE_METADATA_EDITED_GROUP, True, "label-gate.yml")
 
     job = named_job_config(workflow, "validate-pr-labels", expected_jobs, "label-gate.yml")
     require(job.get("name") == contract.label_check_name, "label-gate.yml: required label check name drifted")
@@ -792,6 +803,7 @@ def validate_review_policy(path: Path, contract: ContractModel) -> None:
     require(permissions.get("contents") == "read", "review-policy.yml.permissions.contents must stay read")
     require(permissions.get("pull-requests") == "read", "review-policy.yml.permissions.pull-requests must stay read")
     require("statuses" not in permissions, "review-policy.yml.permissions.statuses must stay unset")
+    assert_concurrency_contract(workflow, REVIEW_POLICY_METADATA_EDITED_GROUP, True, "review-policy.yml")
 
     job = named_job_config(workflow, "review-policy", expected_jobs, "review-policy.yml")
     require_exact_if(
