@@ -3649,6 +3649,7 @@ export function JobManagement({
 	const routeState = controlledRouteState ?? uncontrolledRouteState;
 	const routeLlmCallFilters =
 		routeState.llmCallFilters ?? DEFAULT_LLM_CALL_ROUTE_FILTERS;
+	const latestLlmCallRouteFiltersRef = useRef(routeLlmCallFilters);
 	const hasLlmCallFilters =
 		routeLlmCallFilters.status !== "all" ||
 		routeLlmCallFilters.model !== "" ||
@@ -3962,6 +3963,7 @@ export function JobManagement({
 	);
 
 	useEffect(() => {
+		latestLlmCallRouteFiltersRef.current = routeLlmCallFilters;
 		setLlmStatusFilter(routeLlmCallFilters.status);
 		setLlmModelFilter(routeLlmCallFilters.model);
 		setLlmSourceFilter(routeLlmCallFilters.source);
@@ -3990,6 +3992,11 @@ export function JobManagement({
 			options?: { replace?: boolean },
 		) => {
 			setLlmCallPage(1);
+			const mergedFilters = {
+				...latestLlmCallRouteFiltersRef.current,
+				...nextFilters,
+			};
+			latestLlmCallRouteFiltersRef.current = mergedFilters;
 			navigateAdminJobsRoute(
 				{
 					primaryTab: "llm",
@@ -3997,15 +4004,12 @@ export function JobManagement({
 					taskDrawerRoute: null,
 					drawerFromTab: null,
 					subscriptionDetailTaskId: null,
-					llmCallFilters: {
-						...routeLlmCallFilters,
-						...nextFilters,
-					},
+					llmCallFilters: mergedFilters,
 				},
 				options,
 			);
 		},
-		[navigateAdminJobsRoute, routeLlmCallFilters, translationView],
+		[navigateAdminJobsRoute, translationView],
 	);
 
 	const openLlmCallInvestigation = useCallback(

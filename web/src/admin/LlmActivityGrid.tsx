@@ -51,6 +51,7 @@ type TooltipPosition = {
 };
 
 const ACTIVITY_SUMMARY_ID = "llm-activity-summary";
+const ACTIVITY_SUMMARY_LABEL_ID = "llm-activity-summary-label";
 const MAX_BUCKET_COUNT = 50;
 const TOOLTIP_GAP = 12;
 const TOOLTIP_VIEWPORT_MARGIN = 12;
@@ -684,11 +685,19 @@ export function LlmActivityGrid({
 							: { left: 0, top: 0, visibility: "hidden" }
 					}
 					role={pinnedColumn !== null && pinnedModel ? "dialog" : "tooltip"}
+					{...(pinnedColumn !== null && pinnedModel
+						? { "aria-labelledby": ACTIVITY_SUMMARY_LABEL_ID }
+						: {})}
 					tabIndex={pinnedColumn !== null ? 0 : -1}
 					aria-live="polite"
 					aria-atomic="true"
 					data-testid="llm-activity-summary"
 				>
+					{pinnedColumn !== null && pinnedModel ? (
+						<span id={ACTIVITY_SUMMARY_LABEL_ID} className="sr-only">
+							{pinnedModel} 在 {localTime(selectedBucket.started_at)} 的调用摘要
+						</span>
+					) : null}
 					<div className="flex items-center justify-between gap-2">
 						<p className="text-sm font-medium">
 							{localTime(selectedBucket.started_at)}

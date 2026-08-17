@@ -1,5 +1,5 @@
 import { CalendarRange, ChevronDown, SlidersHorizontal, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type Ref } from "react";
 
 import {
 	formatLlmCallTimeRangeSummary,
@@ -97,11 +97,13 @@ function MobileTimeRangeButton({
 	value,
 	exclusiveUpperBound,
 	onClick,
+	buttonRef,
 }: {
 	label: string;
 	value: LlmCallTimeRangeValue;
 	exclusiveUpperBound?: boolean;
 	onClick: () => void;
+	buttonRef?: Ref<HTMLButtonElement>;
 }) {
 	const summary = formatLlmCallTimeRangeSummary(value.from, value.to, {
 		exclusiveUpperBound,
@@ -113,6 +115,7 @@ function MobileTimeRangeButton({
 			className="h-11 w-full justify-start px-3 text-left font-normal"
 			aria-label={`LLM ${label}范围`}
 			onClick={onClick}
+			ref={buttonRef}
 		>
 			<CalendarRange className="text-muted-foreground size-4" />
 			<span className="shrink-0 text-sm">{label}</span>
@@ -144,6 +147,9 @@ export function LlmCallFilters({
 		"started" | "finished" | null
 	>(null);
 	const mobileTimePanelRef = useRef<HTMLElement>(null);
+	const startedTimeButtonRef = useRef<HTMLButtonElement>(null);
+	const finishedTimeButtonRef = useRef<HTMLButtonElement>(null);
+	const lastTimeButtonRef = useRef<HTMLButtonElement | null>(null);
 
 	useEffect(() => {
 		if (mobileTimePanel === null) return;
@@ -160,7 +166,15 @@ export function LlmCallFilters({
 	].filter(Boolean).length;
 
 	const openTimePanel = (panel: "started" | "finished") => {
+		lastTimeButtonRef.current =
+			panel === "started"
+				? startedTimeButtonRef.current
+				: finishedTimeButtonRef.current;
 		setMobileTimePanel(panel);
+	};
+	const closeTimePanel = () => {
+		setMobileTimePanel(null);
+		window.requestAnimationFrame(() => lastTimeButtonRef.current?.focus());
 	};
 	const mobileTimePanelLabel =
 		mobileTimePanel === "started" ? "开始时间" : "结束时间";
@@ -203,12 +217,14 @@ export function LlmCallFilters({
 				label="开始时间"
 				value={started}
 				onClick={() => openTimePanel("started")}
+				buttonRef={startedTimeButtonRef}
 			/>
 			<MobileTimeRangeButton
 				label="结束时间"
 				exclusiveUpperBound
 				value={finished}
 				onClick={() => openTimePanel("finished")}
+				buttonRef={finishedTimeButtonRef}
 			/>
 		</>
 	);
@@ -258,7 +274,7 @@ export function LlmCallFilters({
 						onEscapeKeyDown={(event) => {
 							if (mobileTimePanel === null) return;
 							event.preventDefault();
-							setMobileTimePanel(null);
+							closeTimePanel();
 						}}
 					>
 						<SheetHeader className="border-b px-5 py-4 text-left">
@@ -287,7 +303,7 @@ export function LlmCallFilters({
 									type="button"
 									aria-label="关闭时间范围设置"
 									className="absolute inset-0 z-10 cursor-default bg-black/45"
-									onClick={() => setMobileTimePanel(null)}
+									onClick={closeTimePanel}
 								/>
 								<section
 									ref={mobileTimePanelRef}
@@ -306,7 +322,7 @@ export function LlmCallFilters({
 											size="icon"
 											aria-label="返回筛选条件"
 											className="size-10"
-											onClick={() => setMobileTimePanel(null)}
+											onClick={closeTimePanel}
 										>
 											<ChevronDown className="size-4" />
 										</Button>
