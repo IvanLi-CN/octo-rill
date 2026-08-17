@@ -1,7 +1,6 @@
 import { CalendarRange, ChevronDown } from "lucide-react";
 import { useId } from "react";
 
-import type { LlmCallTimeField } from "@/admin/jobsRouteState";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -10,18 +9,12 @@ import {
 	PopoverContent,
 	PopoverTrigger,
 } from "@/components/ui/popover";
-import {
-	Select,
-	SelectContent,
-	SelectItem,
-	SelectTrigger,
-	SelectValue,
-} from "@/components/ui/select";
 
 export type LlmCallTimeRangeValue = {
-	timeField: LlmCallTimeField;
-	timeFrom: string;
-	timeTo: string;
+	startedFrom: string;
+	startedTo: string;
+	finishedFrom: string;
+	finishedBefore: string;
 };
 
 function formatDateTimeInput(value: string) {
@@ -30,17 +23,97 @@ function formatDateTimeInput(value: string) {
 	return `${date.replaceAll("-", "/")} ${time}`.trim();
 }
 
-function formatRangeSummary(value: LlmCallTimeRangeValue) {
-	const from = formatDateTimeInput(value.timeFrom);
-	const to = formatDateTimeInput(value.timeTo);
-	if (!from && !to) return "不限时间";
-	if (!from) {
-		return value.timeField === "finished" ? `${to} 前（不含）` : `截至 ${to}`;
-	}
+function formatRangeSummary(
+	fromValue: string,
+	toValue: string,
+	options?: { exclusiveUpperBound?: boolean },
+) {
+	const from = formatDateTimeInput(fromValue);
+	const to = formatDateTimeInput(toValue);
+	if (!from && !to) return "";
+	if (!from) return options?.exclusiveUpperBound ? `${to} 前` : `截至 ${to}`;
 	if (!to) return `${from} 起`;
-	return value.timeField === "finished"
-		? `${from} 至 ${to}（上限不含）`
-		: `${from} 至 ${to}`;
+	return `${from} 至 ${to}`;
+}
+
+function formatFilterSummary(value: LlmCallTimeRangeValue) {
+	const started = formatRangeSummary(value.startedFrom, value.startedTo);
+	const finished = formatRangeSummary(
+		value.finishedFrom,
+		value.finishedBefore,
+		{
+			exclusiveUpperBound: true,
+		},
+	);
+	return (
+		[started ? `开始：${started}` : "", finished ? `结束：${finished}` : ""]
+			.filter(Boolean)
+			.join(" · ") || "不限时间"
+	);
+}
+
+function TimeRangeFields({
+	legend,
+	fromLabel,
+	toLabel,
+	fromValue,
+	toValue,
+	onFromChange,
+	onToChange,
+	bordered = false,
+}: {
+	legend: string;
+	fromLabel: string;
+	toLabel: string;
+	fromValue: string;
+	toValue: string;
+	onFromChange: (value: string) => void;
+	onToChange: (value: string) => void;
+	bordered?: boolean;
+}) {
+	const fromInputId = useId();
+	const toInputId = useId();
+
+	return (
+		<fieldset
+			className={
+				bordered ? "border-border space-y-2 border-t pt-3" : "space-y-2"
+			}
+		>
+			<legend className="text-sm font-medium">{legend}</legend>
+			<div className="grid gap-3 sm:grid-cols-2">
+				<div className="min-w-0 space-y-1.5">
+					<Label
+						htmlFor={fromInputId}
+						className="text-muted-foreground text-xs"
+					>
+						{fromLabel}
+					</Label>
+					<Input
+						id={fromInputId}
+						type="datetime-local"
+						value={fromValue}
+						onChange={(event) => onFromChange(event.target.value)}
+						aria-label={`LLM ${fromLabel}`}
+						className="text-xs"
+					/>
+				</div>
+				<div className="min-w-0 space-y-1.5">
+					<Label htmlFor={toInputId} className="text-muted-foreground text-xs">
+						{toLabel}
+					</Label>
+					<Input
+						id={toInputId}
+						type="datetime-local"
+						value={toValue}
+						onChange={(event) => onToChange(event.target.value)}
+						aria-label={`LLM ${toLabel}`}
+						className="text-xs"
+					/>
+				</div>
+			</div>
+		</fieldset>
+	);
 }
 
 export function LlmCallTimeRangeFilter({
@@ -50,9 +123,7 @@ export function LlmCallTimeRangeFilter({
 	value: LlmCallTimeRangeValue;
 	onValueChange: (value: LlmCallTimeRangeValue) => void;
 }) {
-	const fieldLabel = value.timeField === "finished" ? "结束时间" : "开始时间";
-	const fromInputId = useId();
-	const toInputId = useId();
+	const summary = formatFilterSummary(value);
 
 	return (
 		<Popover>
@@ -60,13 +131,13 @@ export function LlmCallTimeRangeFilter({
 				<Button
 					type="button"
 					variant="outline"
-					aria-label={`LLM 调用时间范围：${fieldLabel}`}
+					aria-label="LLM 调用时间范围"
 					className="h-auto min-h-9 w-full justify-start px-3 py-2 text-left font-normal"
 				>
 					<CalendarRange className="text-muted-foreground size-4" />
-					<span className="shrink-0 text-sm">{fieldLabel}</span>
+					<span className="shrink-0 text-sm">调用时间</span>
 					<span className="text-muted-foreground min-w-0 truncate text-sm">
-						{formatRangeSummary(value)}
+						{summary}
 					</span>
 					<ChevronDown className="text-muted-foreground ml-auto size-4" />
 				</Button>
@@ -75,77 +146,34 @@ export function LlmCallTimeRangeFilter({
 				align="start"
 				className="w-[min(calc(100vw-2rem),34rem)] rounded-md p-3"
 			>
-				<fieldset className="space-y-3">
-					<legend className="sr-only">LLM 调用时间范围</legend>
-					<div className="flex items-center justify-between gap-3">
-						<p className="text-sm font-medium">调用时间范围</p>
-						<Select
-							value={value.timeField}
-							onValueChange={(timeField) =>
-								onValueChange({
-									...value,
-									timeField: timeField as LlmCallTimeField,
-								})
-							}
-						>
-							<SelectTrigger
-								size="sm"
-								className="w-[7.5rem]"
-								aria-label="LLM 时间口径"
-							>
-								<SelectValue />
-							</SelectTrigger>
-							<SelectContent>
-								<SelectItem value="started">开始时间</SelectItem>
-								<SelectItem value="finished">结束时间</SelectItem>
-							</SelectContent>
-						</Select>
-					</div>
-					<div className="grid gap-3 sm:grid-cols-2">
-						<div className="min-w-0 space-y-1.5">
-							<Label
-								htmlFor={fromInputId}
-								className="text-muted-foreground text-xs"
-							>
-								{fieldLabel}后
-							</Label>
-							<Input
-								id={fromInputId}
-								type="datetime-local"
-								value={value.timeFrom}
-								onChange={(event) =>
-									onValueChange({ ...value, timeFrom: event.target.value })
-								}
-								aria-label={`LLM ${fieldLabel}下限`}
-								className="text-xs"
-							/>
-						</div>
-						<div className="min-w-0 space-y-1.5">
-							<Label
-								htmlFor={toInputId}
-								className="text-muted-foreground text-xs"
-							>
-								{value.timeField === "finished"
-									? "结束时间前（不含）"
-									: "开始时间前"}
-							</Label>
-							<Input
-								id={toInputId}
-								type="datetime-local"
-								value={value.timeTo}
-								onChange={(event) =>
-									onValueChange({ ...value, timeTo: event.target.value })
-								}
-								aria-label={
-									value.timeField === "finished"
-										? "LLM 结束时间上限（不含）"
-										: "LLM 开始时间上限"
-								}
-								className="text-xs"
-							/>
-						</div>
-					</div>
-				</fieldset>
+				<div className="space-y-3">
+					<p className="text-sm font-medium">调用时间范围</p>
+					<TimeRangeFields
+						legend="开始时间"
+						fromLabel="开始时间后"
+						toLabel="开始时间前"
+						fromValue={value.startedFrom}
+						toValue={value.startedTo}
+						onFromChange={(startedFrom) =>
+							onValueChange({ ...value, startedFrom })
+						}
+						onToChange={(startedTo) => onValueChange({ ...value, startedTo })}
+					/>
+					<TimeRangeFields
+						legend="结束时间"
+						fromLabel="结束时间后"
+						toLabel="结束时间前（不含）"
+						fromValue={value.finishedFrom}
+						toValue={value.finishedBefore}
+						onFromChange={(finishedFrom) =>
+							onValueChange({ ...value, finishedFrom })
+						}
+						onToChange={(finishedBefore) =>
+							onValueChange({ ...value, finishedBefore })
+						}
+						bordered
+					/>
+				</div>
 			</PopoverContent>
 		</Popover>
 	);

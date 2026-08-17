@@ -14,16 +14,15 @@ export type LlmCallRouteStatus =
 	| "succeeded"
 	| "failed";
 
-export type LlmCallTimeField = "started" | "finished";
-
 export type LlmCallRouteFilters = {
 	status: LlmCallRouteStatus;
 	model: string;
 	source: string;
 	requestedBy: string;
-	timeField: LlmCallTimeField;
-	timeFrom: string;
-	timeTo: string;
+	startedFrom: string;
+	startedTo: string;
+	finishedFrom: string;
+	finishedBefore: string;
 };
 
 export type AdminJobsSearchInput = {
@@ -33,6 +32,11 @@ export type AdminJobsSearchInput = {
 	llm_model?: string;
 	llm_source?: string;
 	llm_requested_by?: string;
+	llm_started_from?: string;
+	llm_started_to?: string;
+	llm_finished_from?: string;
+	llm_finished_before?: string;
+	// Legacy single-axis time range parameters. Parsed for shared-link compatibility.
 	llm_time_field?: string;
 	llm_time_from?: string;
 	llm_time_to?: string;
@@ -67,6 +71,10 @@ const ADMIN_JOBS_ROUTE_QUERY_KEYS = [
 	"llm_model",
 	"llm_source",
 	"llm_requested_by",
+	"llm_started_from",
+	"llm_started_to",
+	"llm_finished_from",
+	"llm_finished_before",
 	"llm_time_field",
 	"llm_time_from",
 	"llm_time_to",
@@ -112,12 +120,19 @@ export function parseLlmCallRouteFilters(
 		| "llm_model"
 		| "llm_source"
 		| "llm_requested_by"
+		| "llm_started_from"
+		| "llm_started_to"
+		| "llm_finished_from"
+		| "llm_finished_before"
 		| "llm_time_field"
 		| "llm_time_from"
 		| "llm_time_to"
 	>,
 ): LlmCallRouteFilters {
 	const status = search.llm_status;
+	const legacyTimeFrom = normalizeLlmRouteTimestamp(search.llm_time_from);
+	const legacyTimeTo = normalizeLlmRouteTimestamp(search.llm_time_to);
+	const useLegacyFinishedRange = search.llm_time_field === "finished";
 	return {
 		status:
 			status === "queued" ||
@@ -129,9 +144,18 @@ export function parseLlmCallRouteFilters(
 		model: normalizeLlmRouteText(search.llm_model),
 		source: normalizeLlmRouteText(search.llm_source),
 		requestedBy: normalizeLlmRouteText(search.llm_requested_by),
-		timeField: search.llm_time_field === "finished" ? "finished" : "started",
-		timeFrom: normalizeLlmRouteTimestamp(search.llm_time_from),
-		timeTo: normalizeLlmRouteTimestamp(search.llm_time_to),
+		startedFrom:
+			normalizeLlmRouteTimestamp(search.llm_started_from) ||
+			(useLegacyFinishedRange ? "" : legacyTimeFrom),
+		startedTo:
+			normalizeLlmRouteTimestamp(search.llm_started_to) ||
+			(useLegacyFinishedRange ? "" : legacyTimeTo),
+		finishedFrom:
+			normalizeLlmRouteTimestamp(search.llm_finished_from) ||
+			(useLegacyFinishedRange ? legacyTimeFrom : ""),
+		finishedBefore:
+			normalizeLlmRouteTimestamp(search.llm_finished_before) ||
+			(useLegacyFinishedRange ? legacyTimeTo : ""),
 	};
 }
 
@@ -143,10 +167,13 @@ export function llmCallRouteFiltersToSearch(
 		llm_model: filters.model || undefined,
 		llm_source: filters.source || undefined,
 		llm_requested_by: filters.requestedBy || undefined,
-		llm_time_field:
-			filters.timeField === "finished" ? filters.timeField : undefined,
-		llm_time_from: filters.timeFrom || undefined,
-		llm_time_to: filters.timeTo || undefined,
+		llm_started_from: filters.startedFrom || undefined,
+		llm_started_to: filters.startedTo || undefined,
+		llm_finished_from: filters.finishedFrom || undefined,
+		llm_finished_before: filters.finishedBefore || undefined,
+		llm_time_field: undefined,
+		llm_time_from: undefined,
+		llm_time_to: undefined,
 	};
 }
 
@@ -205,6 +232,10 @@ export function parseAdminJobsRoute(
 		llm_model: searchParams.get("llm_model") ?? undefined,
 		llm_source: searchParams.get("llm_source") ?? undefined,
 		llm_requested_by: searchParams.get("llm_requested_by") ?? undefined,
+		llm_started_from: searchParams.get("llm_started_from") ?? undefined,
+		llm_started_to: searchParams.get("llm_started_to") ?? undefined,
+		llm_finished_from: searchParams.get("llm_finished_from") ?? undefined,
+		llm_finished_before: searchParams.get("llm_finished_before") ?? undefined,
 		llm_time_field: searchParams.get("llm_time_field") ?? undefined,
 		llm_time_from: searchParams.get("llm_time_from") ?? undefined,
 		llm_time_to: searchParams.get("llm_time_to") ?? undefined,
@@ -359,6 +390,22 @@ export function validateAdminJobsSearch(search: Record<string, unknown>) {
 		llm_requested_by:
 			typeof search.llm_requested_by === "string"
 				? search.llm_requested_by
+				: undefined,
+		llm_started_from:
+			typeof search.llm_started_from === "string"
+				? search.llm_started_from
+				: undefined,
+		llm_started_to:
+			typeof search.llm_started_to === "string"
+				? search.llm_started_to
+				: undefined,
+		llm_finished_from:
+			typeof search.llm_finished_from === "string"
+				? search.llm_finished_from
+				: undefined,
+		llm_finished_before:
+			typeof search.llm_finished_before === "string"
+				? search.llm_finished_before
 				: undefined,
 		llm_time_field:
 			typeof search.llm_time_field === "string"

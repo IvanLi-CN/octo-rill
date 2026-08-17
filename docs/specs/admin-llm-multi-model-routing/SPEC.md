@@ -127,7 +127,7 @@
 - 图表拥有独立的首次加载、错误、重试和后台刷新状态；SSE 或手动刷新期间保留旧网格，直到新响应到达。
 - 网格单元格和模型状态卡片均提供“查看失败调用”与“查看全部调用”操作。网格操作带入精确模型及该桶终态时间的 `[started_at, ended_at)` 范围；状态卡片仅带入精确模型，并使用调用记录既有七日保留期。
 - 排障跳转必须清空来源、请求用户、旧状态、旧时间和分页等冲突筛选，再设置目标状态、模型和时间范围；跳转将完整筛选写入 URL 并新增一条浏览器历史记录，加载后将焦点移动到调用记录结果区域。
-- 调用列表筛选状态由 URL 恢复：`llm_status`、`llm_model`、`llm_source`、`llm_requested_by`、`llm_time_field`、`llm_time_from`、`llm_time_to`。时间值使用 UTC RFC3339；时间口径可选开始时间或结束时间。时间口径与起止边界必须由单一范围控件呈现。开始时间上限保持包含语义，结束时间上限为“结束时间前”的排他语义。
+- 调用列表筛选状态由 URL 恢复：`llm_status`、`llm_model`、`llm_source`、`llm_requested_by`、`llm_started_from`、`llm_started_to`、`llm_finished_from`、`llm_finished_before`。时间值使用 UTC RFC3339；开始时间与结束时间范围可同时生效，并由单一范围控件呈现。开始时间上限保持包含语义，结束时间上限为“结束时间前”的排他语义。历史单口径参数 `llm_time_field`、`llm_time_from`、`llm_time_to` 必须可解析，并在 URL 规范化时迁移到对应的新参数。
 - 调用列表支持精确模型筛选和终态时间范围。终态时间统一按 `COALESCE(finished_at, updated_at, created_at)` 计算，`finished_from` 为包含下限，`finished_before` 为排他上限；持久化记录和 runtime override 合并后必须遵循同一筛选与分页语义。
 
 ## 接口契约（Interfaces & Contracts）
@@ -252,17 +252,17 @@ PR: include
 
 ### 调用时间范围控件
 
-- `ui_demo`：桌面结束时间范围筛选，范围摘要和展开后的边界输入处于同一控件中。
+- `ui_demo`：桌面调用时间控件，开始时间与结束时间两套范围在同一弹层中展示。
 
 PR: include
 ![LLM call time range desktop](./assets/llm-call-time-range-desktop.png)
 
-- `ui_demo`：`393x852` 移动端范围控件保持单行摘要，展开后纵向展示边界输入。
+- `ui_demo`：`393x852` 移动端范围控件保持单行摘要，展开后纵向展示开始与结束时间的四个边界输入。
 
 PR: include
 ![LLM call time range mobile](./assets/llm-call-time-range-mobile.png)
 
-- `storybook_canvas`：受控范围组件完成开始/结束时间切换，并显示结束时间的排他上限。
+- `storybook_canvas`：受控范围组件同时展示开始/结束时间范围；摘要反映四个边界，结束时间上限保持排他语义。
 
 PR: include
 ![LLM call time range Storybook](./assets/llm-call-time-range-storybook.png)
