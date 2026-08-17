@@ -185,9 +185,30 @@ test("demo LLM activity buckets drill into matching call records", async ({
 					counts: { model: string; succeeded: number; failed: number }[];
 				}[];
 			}>,
-			fetch(`/api/admin/jobs/llm/calls?${marker}&page_size=1000`).then(
-				(response) => response.json(),
-			) as Promise<{ items: Call[]; total: number }>,
+			(async () => {
+				const firstPage = (await fetch(
+					`/api/admin/jobs/llm/calls?${marker}&page_size=100`,
+				).then((response) => response.json())) as {
+					items: Call[];
+					total: number;
+					page_size: number;
+				};
+				const pageCount = Math.ceil(firstPage.total / firstPage.page_size);
+				const remainingPages = await Promise.all(
+					Array.from({ length: Math.max(0, pageCount - 1) }, (_, index) =>
+						fetch(
+							`/api/admin/jobs/llm/calls?${marker}&page_size=100&page=${index + 2}`,
+						).then((response) => response.json() as Promise<{ items: Call[] }>),
+					),
+				);
+				return {
+					...firstPage,
+					items: [
+						...firstPage.items,
+						...remainingPages.flatMap((page) => page.items),
+					],
+				};
+			})(),
 			fetch(`/api/admin/jobs/llm/status?${marker}`).then((response) =>
 				response.json(),
 			) as Promise<{
@@ -201,7 +222,7 @@ test("demo LLM activity buckets drill into matching call records", async ({
 				avg_duration_ms_24h: number | null;
 				last_success_at: string | null;
 				last_failure_at: string | null;
-				model_statuses: { model: string; priority: number }[];
+				model_statuses: { model: string; priority: number; status: string }[];
 			}>,
 		]);
 		const calls = callsResponse.items;
@@ -300,6 +321,10 @@ test("demo LLM activity buckets drill into matching call records", async ({
 			activityMismatches,
 			routingMismatches,
 			listedTotalMatches: callsResponse.total === calls.length,
+			pageSize: callsResponse.page_size,
+			invalidModelStatuses: status.model_statuses
+				.filter((model) => !["ready", "cooldown"].includes(model.status))
+				.map((model) => `${model.model}:${model.status}`),
 			statusSummary: {
 				available_slots: status.available_slots,
 				waiting_calls: status.waiting_calls,
@@ -335,7 +360,78 @@ test("demo LLM activity buckets drill into matching call records", async ({
 	expect(consistency.activityMismatches).toEqual([]);
 	expect(consistency.routingMismatches).toEqual([]);
 	expect(consistency.listedTotalMatches).toBe(true);
+	expect(consistency.pageSize).toBe(100);
+	expect(consistency.invalidModelStatuses).toEqual([]);
 	expect(consistency.statusSummary).toEqual(consistency.expectedStatusSummary);
+
+	const runtimeUpdate = await page.evaluate(async () => {
+		const marker = "__demo_runtime=1";
+		const status = await fetch(`/api/admin/jobs/llm/runtime-config?${marker}`, {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				max_concurrency: 3,
+				ai_model_context_limit: null,
+				llm_models: ["gpt-4.1-mini", "gpt-5-mini"],
+			}),
+		}).then((response) => response.json());
+		const activity = await fetch(`/api/admin/jobs/llm/activity?${marker}`).then(
+			(response) => response.json(),
+		);
+		return { status, activity } as {
+			status: {
+				max_concurrency: number;
+				ai_model_context_limit: number | null;
+				llm_models: string[];
+				selected_model_for_new_calls: string | null;
+				effective_model_input_limit: number;
+				effective_model_input_limit_source: string;
+				model_statuses: {
+					model: string;
+					priority: number;
+					status: string;
+					effective_input_limit: number;
+					effective_input_limit_source: string;
+				}[];
+			};
+			activity: {
+				models: {
+					model: string;
+					priority: number | null;
+					configured: boolean;
+				}[];
+			};
+		};
+	});
+
+	expect(runtimeUpdate.status).toMatchObject({
+		max_concurrency: 3,
+		ai_model_context_limit: null,
+		llm_models: ["gpt-4.1-mini", "gpt-5-mini"],
+		selected_model_for_new_calls: "gpt-4.1-mini",
+		effective_model_input_limit: 1047576,
+		effective_model_input_limit_source: "builtin_catalog",
+	});
+	expect(runtimeUpdate.status.model_statuses).toEqual([
+		expect.objectContaining({
+			model: "gpt-4.1-mini",
+			priority: 1,
+			status: "ready",
+			effective_input_limit: 1047576,
+			effective_input_limit_source: "builtin_catalog",
+		}),
+		expect.objectContaining({
+			model: "gpt-5-mini",
+			priority: 2,
+			status: "ready",
+			effective_input_limit: 128000,
+			effective_input_limit_source: "builtin_catalog",
+		}),
+	]);
+	expect(runtimeUpdate.activity.models.slice(0, 2)).toEqual([
+		{ model: "gpt-4.1-mini", priority: 1, configured: true },
+		{ model: "gpt-5-mini", priority: 2, configured: true },
+	]);
 });
 
 test("demo worker ignores unmarked live requests in regular dev builds", async ({

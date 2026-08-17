@@ -7460,12 +7460,12 @@ fn push_llm_call_filters(
         query.push_bind(scope.parent_task_id.to_owned());
     }
     if let Some(started_from) = scope.started_from {
-        query.push(" AND unixepoch(COALESCE(started_at, created_at)) >= unixepoch(");
+        query.push(" AND julianday(COALESCE(started_at, created_at)) >= julianday(");
         query.push_bind(started_from.to_owned());
         query.push(")");
     }
     if let Some(started_to) = scope.started_to {
-        query.push(" AND unixepoch(COALESCE(started_at, created_at)) <= unixepoch(");
+        query.push(" AND julianday(COALESCE(started_at, created_at)) <= julianday(");
         query.push_bind(started_to.to_owned());
         query.push(")");
     }
@@ -26296,6 +26296,55 @@ mod tests {
         assert_eq!(resp.total, 1);
         assert_eq!(resp.items.len(), 1);
         assert_eq!(resp.items[0].id, "call-zulu");
+    }
+
+    #[tokio::test]
+    async fn admin_list_llm_calls_started_filters_preserve_subsecond_boundaries() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        for (call_id, created_at) in [
+            ("call-boundary", "2026-02-26T02:00:00.000Z"),
+            ("call-after-boundary", "2026-02-26T02:00:00.500Z"),
+        ] {
+            seed_llm_call_with_created_at(
+                &pool,
+                call_id,
+                "succeeded",
+                "api.translate_releases_batch",
+                Some(test_user_id(1)),
+                created_at,
+            )
+            .await;
+        }
+
+        let resp = admin_list_llm_calls(
+            State(setup_state(pool)),
+            setup_session(1).await,
+            Query(AdminLlmCallsQuery {
+                status: Some("all".to_owned()),
+                model: None,
+                source: Some("api.translate_releases_batch".to_owned()),
+                requested_by: Some(test_user_id(1)),
+                parent_task_id: None,
+                started_from: None,
+                started_to: Some("2026-02-26T02:00:00.000Z".to_owned()),
+                finished_from: None,
+                finished_before: None,
+                sort: None,
+                page: Some(1),
+                page_size: Some(20),
+            }),
+        )
+        .await
+        .expect("started upper bound should preserve milliseconds")
+        .0;
+
+        assert_eq!(resp.total, 1);
+        assert_eq!(resp.items[0].id, "call-boundary");
     }
 
     #[tokio::test]

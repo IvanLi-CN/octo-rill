@@ -1655,6 +1655,7 @@ async function installAdminJobsMocks(
 			const startedTo = url.searchParams.get("started_to");
 			const finishedFrom = url.searchParams.get("finished_from");
 			const finishedBefore = url.searchParams.get("finished_before");
+			const sort = url.searchParams.get("sort") ?? "created_desc";
 			const timestamp = (value: string | null | undefined) =>
 				value ? new Date(value).getTime() : Number.NaN;
 			const filtered = llmCalls.filter((item) => {
@@ -1685,8 +1686,35 @@ async function installAdminJobsMocks(
 					(Number.isNaN(finishedBeforeAt) || finishedAt < finishedBeforeAt)
 				);
 			});
+			const statusRank = (value: string) =>
+				value === "running" ? 0 : value === "queued" ? 1 : 2;
+			const sorted = [...filtered].sort((left, right) => {
+				if (sort === "status_grouped" && status === "all") {
+					const rankDifference =
+						statusRank(left.status) - statusRank(right.status);
+					if (rankDifference !== 0) return rankDifference;
+				}
+				return (
+					new Date(right.created_at).getTime() -
+						new Date(left.created_at).getTime() ||
+					right.created_at.localeCompare(left.created_at) ||
+					right.id.localeCompare(left.id)
+				);
+			});
+			const pageNumber = Math.max(
+				1,
+				Number(url.searchParams.get("page") ?? "1"),
+			);
+			const pageSize = Math.min(
+				100,
+				Math.max(1, Number(url.searchParams.get("page_size") ?? "20")),
+			);
+			const pageItems = sorted.slice(
+				(pageNumber - 1) * pageSize,
+				pageNumber * pageSize,
+			);
 			return json(route, {
-				items: filtered.map(
+				items: pageItems.map(
 					({
 						prompt_text: _p,
 						response_text: _r,
@@ -1696,8 +1724,8 @@ async function installAdminJobsMocks(
 						...rest
 					}) => rest,
 				),
-				page: 1,
-				page_size: 20,
+				page: pageNumber,
+				page_size: pageSize,
 				total: filtered.length,
 			});
 		}
@@ -2283,9 +2311,14 @@ test("admin jobs tabs are URL-driven and support deep links plus history", async
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
 });
 
-test("admin llm calls are sorted by status group and created time", async ({
+test("admin requests grouped LLM call ordering and renders the response", async ({
 	page,
 }) => {
+	const callRequests: URL[] = [];
+	page.on("request", (request) => {
+		const url = new URL(request.url());
+		if (url.pathname === "/api/admin/jobs/llm/calls") callRequests.push(url);
+	});
 	await installAdminJobsMocks(page, { emitStreamEvents: false });
 	await page.goto("/admin/jobs", { waitUntil: "domcontentloaded" });
 
@@ -2303,6 +2336,41 @@ test("admin llm calls are sorted by status group and created time", async ({
 		"ID: llm-call-3",
 		"ID: llm-call-1",
 	]);
+	expect(
+		callRequests.some(
+			(request) =>
+				request.searchParams.get("sort") === "status_grouped" &&
+				request.searchParams.get("page") === "1" &&
+				request.searchParams.get("page_size") === "20",
+		),
+	).toBe(true);
+});
+
+test("admin keeps rapid LLM filter edits in the shareable URL", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+	await page
+		.getByRole("textbox", { name: "LLM 调用来源筛选" })
+		.fill("job.api.translate_release");
+	await page
+		.getByRole("textbox", { name: "LLM 调用模型筛选" })
+		.pressSequentially("gpt-4o-mini");
+
+	await expect
+		.poll(() => {
+			const search = new URL(page.url()).searchParams;
+			return {
+				model: search.get("llm_model"),
+				source: search.get("llm_source"),
+			};
+		})
+		.toEqual({
+			model: "gpt-4o-mini",
+			source: "job.api.translate_release",
+		});
 });
 
 test("admin llm activity defaults to chart and keeps list filters independent", async ({
@@ -2348,6 +2416,9 @@ test("admin llm activity defaults to chart and keeps list filters independent", 
 	});
 	await latestCell.click();
 	const summary = page.getByTestId("llm-activity-summary");
+	await expect(
+		page.getByRole("dialog", { name: /gpt-4o-mini.*调用摘要/ }),
+	).toBeVisible();
 	await expect(summary).toContainText("80%");
 	await expect(summary).toContainText("67%");
 	await latestCell.press("ArrowLeft");
@@ -2432,10 +2503,22 @@ test("admin drills from LLM activity and model cards into shareable call filters
 	).toBeVisible();
 	await expect(
 		page.getByRole("textbox", { name: "LLM 结束时间后" }),
-	).toHaveValue("2026/02/26 10:00");
+	).toHaveValue(
+		await page.evaluate(() => {
+			const value = new Date("2026-02-26T02:00:00.000Z");
+			const pad = (part: number) => String(part).padStart(2, "0");
+			return `${value.getFullYear()}/${pad(value.getMonth() + 1)}/${pad(value.getDate())} ${pad(value.getHours())}:${pad(value.getMinutes())}`;
+		}),
+	);
 	await expect(
 		page.getByRole("textbox", { name: "LLM 结束时间前（不含）" }),
-	).toHaveValue("2026/02/26 11:00");
+	).toHaveValue(
+		await page.evaluate(() => {
+			const value = new Date("2026-02-26T03:00:00.000Z");
+			const pad = (part: number) => String(part).padStart(2, "0");
+			return `${value.getFullYear()}/${pad(value.getMonth() + 1)}/${pad(value.getDate())} ${pad(value.getHours())}:${pad(value.getMinutes())}`;
+		}),
+	);
 	await page.keyboard.press("Escape");
 	await page.getByRole("button", { name: "LLM 开始时间范围" }).click();
 	await page
@@ -2946,6 +3029,9 @@ test("admin llm mobile filters keep context around the time range panel", async 
 	await page.keyboard.press("Escape");
 	await expect(drawer).toHaveCount(0);
 	await expect(filters).toBeVisible();
+	await expect(
+		filters.getByRole("button", { name: "LLM 开始时间范围" }),
+	).toBeFocused();
 	await expect(
 		filters.getByRole("textbox", { name: "LLM 调用模型筛选" }),
 	).toBeVisible();

@@ -1753,23 +1753,82 @@ export const demoHandlers = [
 			llm_models: string[];
 		}>;
 		const access = requireRuntimeAccess();
-		access.updateModel((model) => ({
-			...model,
-			adminJobs: {
-				...model.adminJobs,
-				llmStatus: {
-					...model.adminJobs.llmStatus,
-					max_concurrency:
-						payload.max_concurrency ??
-						model.adminJobs.llmStatus.max_concurrency,
-					ai_model_context_limit:
-						payload.ai_model_context_limit ??
-						model.adminJobs.llmStatus.ai_model_context_limit,
-					llm_models:
-						payload.llm_models ?? model.adminJobs.llmStatus.llm_models,
+		access.updateModel((model) => {
+			const currentStatus = model.adminJobs.llmStatus;
+			const hasContextLimit = Object.hasOwn(payload, "ai_model_context_limit");
+			const contextLimit = hasContextLimit
+				? typeof payload.ai_model_context_limit === "number"
+					? payload.ai_model_context_limit
+					: null
+				: currentStatus.ai_model_context_limit;
+			const nextModels =
+				payload.llm_models && payload.llm_models.length > 0
+					? payload.llm_models
+					: currentStatus.llm_models;
+			const nextMaxConcurrency =
+				payload.max_concurrency ?? currentStatus.max_concurrency;
+			const previousStatuses = new Map(
+				currentStatus.model_statuses.map((status) => [status.model, status]),
+			);
+			const nextModelStatuses = nextModels.map((modelName, index) => {
+				const previous = previousStatuses.get(modelName);
+				const builtinLimit = modelName === "gpt-4.1-mini" ? 1047576 : 128000;
+				return {
+					model: modelName,
+					priority: index + 1,
+					status: previous?.status === "cooldown" ? "cooldown" : "ready",
+					consecutive_final_failures: previous?.consecutive_final_failures ?? 0,
+					cooldown_until: previous?.cooldown_until ?? null,
+					effective_input_limit: contextLimit ?? builtinLimit,
+					effective_input_limit_source:
+						contextLimit === null ? "builtin_catalog" : "admin_override",
+				};
+			});
+			const selectedModel =
+				nextModelStatuses.find((status) => status.status !== "cooldown")
+					?.model ?? null;
+			const selectedStatus = nextModelStatuses.find(
+				(status) => status.model === selectedModel,
+			);
+			const configuredModelNames = new Set(nextModels);
+			const retiredActivityModels = model.adminJobs.llmActivity.models
+				.filter((item) => !configuredModelNames.has(item.model))
+				.map((item) => ({ ...item, priority: null, configured: false }));
+			return {
+				...model,
+				adminJobs: {
+					...model.adminJobs,
+					llmStatus: {
+						...currentStatus,
+						max_concurrency: nextMaxConcurrency,
+						available_slots: Math.max(
+							0,
+							nextMaxConcurrency - currentStatus.in_flight_calls,
+						),
+						ai_model_context_limit: contextLimit,
+						llm_models: nextModels,
+						selected_model_for_new_calls: selectedModel,
+						effective_model_input_limit:
+							selectedStatus?.effective_input_limit ?? contextLimit ?? 128000,
+						effective_model_input_limit_source:
+							selectedStatus?.effective_input_limit_source ??
+							(contextLimit === null ? "builtin_catalog" : "admin_override"),
+						model_statuses: nextModelStatuses,
+					},
+					llmActivity: {
+						...model.adminJobs.llmActivity,
+						models: [
+							...nextModels.map((modelName, index) => ({
+								model: modelName,
+								priority: index + 1,
+								configured: true,
+							})),
+							...retiredActivityModels,
+						],
+					},
 				},
-			},
-		}));
+			};
+		});
 		access.recordMutation(
 			"Save LLM settings",
 			"Updated admin LLM scheduler settings in demo memory only.",
@@ -1815,10 +1874,33 @@ export const demoHandlers = [
 				(Number.isNaN(finishedBeforeAt) || finishedAt < finishedBeforeAt)
 			);
 		});
-		const page = Math.max(1, Number(url.searchParams.get("page") ?? "1"));
-		const pageSize = Math.max(
-			1,
-			Number(url.searchParams.get("page_size") ?? "20"),
+		const sort = url.searchParams.get("sort") ?? "created_desc";
+		const statusRank = (value: string) =>
+			value === "running" ? 0 : value === "queued" ? 1 : 2;
+		items = [...items].sort((left, right) => {
+			if (sort === "status_grouped" && status === "all") {
+				const rankDifference =
+					statusRank(left.status) - statusRank(right.status);
+				if (rankDifference !== 0) return rankDifference;
+			}
+			const timeDifference =
+				timestamp(right.created_at) - timestamp(left.created_at);
+			if (timeDifference !== 0) return timeDifference;
+			const createdDifference = right.created_at.localeCompare(left.created_at);
+			return createdDifference !== 0
+				? createdDifference
+				: right.id.localeCompare(left.id);
+		});
+		const positiveInteger = (value: string | null, fallback: number) => {
+			const parsed = Number(value);
+			return Number.isFinite(parsed) && parsed >= 1
+				? Math.floor(parsed)
+				: fallback;
+		};
+		const page = positiveInteger(url.searchParams.get("page"), 1);
+		const pageSize = Math.min(
+			100,
+			positiveInteger(url.searchParams.get("page_size"), 20),
 		);
 		const total = items.length;
 		items = items.slice((page - 1) * pageSize, page * pageSize);
