@@ -8,7 +8,6 @@ import {
 	Plus,
 	Settings2,
 	Trash2,
-	X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -19,7 +18,7 @@ import {
 	LlmCallContextMenu,
 	type LlmCallDrilldown,
 } from "@/admin/LlmCallContextMenu";
-import { LlmCallTimeRangeFilter } from "@/admin/LlmCallTimeRangeFilter";
+import { LlmCallFilters, type LlmStatusFilter } from "@/admin/LlmCallFilters";
 import { TranslationWorkerBoard } from "@/admin/TranslationWorkerBoard";
 import {
 	ADMIN_JOBS_BASE_PATH,
@@ -882,17 +881,6 @@ const REALTIME_STATUS_FILTER_OPTIONS: Array<{
 	{ value: "canceled", label: "状态：取消" },
 ];
 
-const LLM_STATUS_FILTER_OPTIONS: Array<{
-	value: LlmStatusFilter;
-	label: string;
-}> = [
-	{ value: "all", label: "状态：全部" },
-	{ value: "queued", label: "状态：排队" },
-	{ value: "running", label: "状态：运行中" },
-	{ value: "failed", label: "状态：失败" },
-	{ value: "succeeded", label: "状态：成功" },
-];
-
 function streamStatusTone(
 	status: "connecting" | "connected" | "reconnecting",
 ): BadgeTone {
@@ -1402,8 +1390,6 @@ type RealtimeStatusFilter =
 	| "failed"
 	| "succeeded"
 	| "canceled";
-
-type LlmStatusFilter = "all" | "queued" | "running" | "failed" | "succeeded";
 
 const DEFAULT_LLM_CALL_ROUTE_FILTERS = parseLlmCallRouteFilters({});
 
@@ -6355,131 +6341,94 @@ export function JobManagement({
 								</div>
 							</div>
 
-							<div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-								<FilterSelect
-									value={llmStatusFilter}
-									onValueChange={(nextValue) => {
-										setLlmStatusFilter(nextValue as LlmStatusFilter);
-										updateLlmCallRouteFilters(
-											{ status: nextValue as LlmStatusFilter },
-											{ replace: true },
-										);
-									}}
-									options={LLM_STATUS_FILTER_OPTIONS}
-									placeholder="状态筛选"
-									ariaLabel="LLM 调用状态筛选"
-								/>
-								<Input
-									value={llmModelFilter}
-									onChange={(event) => {
-										setLlmModelFilter(event.target.value);
-										updateLlmCallRouteFilters(
-											{ model: event.target.value.trim() },
-											{ replace: true },
-										);
-									}}
-									placeholder="模型（精确匹配）"
-									aria-label="LLM 调用模型筛选"
-								/>
-								<Input
-									value={llmSourceFilter}
-									onChange={(event) => {
-										setLlmSourceFilter(event.target.value);
-										updateLlmCallRouteFilters(
-											{ source: event.target.value.trim() },
-											{ replace: true },
-										);
-									}}
-									placeholder="来源（source）"
-									aria-label="LLM 调用来源筛选"
-								/>
-								<Input
-									value={llmRequestedByFilter}
-									onChange={(event) => {
-										setLlmRequestedByFilter(event.target.value);
-										updateLlmCallRouteFilters(
-											{ requestedBy: event.target.value.trim() },
-											{ replace: true },
-										);
-									}}
-									placeholder="用户 NanoID（requested_by）"
-									aria-label="LLM 调用用户筛选"
-								/>
-								<div className="flex min-w-0 gap-2 sm:col-span-2 xl:col-span-4">
-									<div className="grid min-w-0 flex-1 gap-2 sm:grid-cols-2">
-										<LlmCallTimeRangeFilter
-											label="开始时间"
-											value={{
-												from: llmStartedFromFilter,
-												to: llmStartedToFilter,
-											}}
-											onValueChange={(nextValue) => {
-												setLlmStartedFromFilter(nextValue.from);
-												setLlmStartedToFilter(nextValue.to);
-												updateLlmCallRouteFilters(
-													{
-														startedFrom: localInputToUtc(nextValue.from),
-														startedTo: localInputToUtc(nextValue.to),
-													},
-													{ replace: true },
-												);
-											}}
-										/>
-										<LlmCallTimeRangeFilter
-											label="结束时间"
-											exclusiveUpperBound
-											value={{
-												from: llmFinishedFromFilter,
-												to: llmFinishedBeforeFilter,
-											}}
-											onValueChange={(nextValue) => {
-												setLlmFinishedFromFilter(nextValue.from);
-												setLlmFinishedBeforeFilter(nextValue.to);
-												updateLlmCallRouteFilters(
-													{
-														finishedFrom: localInputToUtc(nextValue.from),
-														finishedBefore: localInputToUtc(nextValue.to),
-													},
-													{ replace: true },
-												);
-											}}
-										/>
-									</div>
-									<Button
-										type="button"
-										variant="outline"
-										size="icon"
-										aria-label="清除 LLM 调用筛选"
-										title="清除筛选"
-										disabled={!hasLlmCallFilters}
-										onClick={() => {
-											setLlmStatusFilter("all");
-											setLlmModelFilter("");
-											setLlmSourceFilter("");
-											setLlmRequestedByFilter("");
-											setLlmStartedFromFilter("");
-											setLlmStartedToFilter("");
-											setLlmFinishedFromFilter("");
-											setLlmFinishedBeforeFilter("");
-											updateLlmCallRouteFilters(
-												{
-													status: "all",
-													model: "",
-													source: "",
-													requestedBy: "",
-													startedFrom: "",
-													startedTo: "",
-													finishedFrom: "",
-													finishedBefore: "",
-												},
-												{ replace: true },
-											);
-										}}
-									>
-										<X className="size-4" />
-									</Button>
-								</div>
-							</div>
+							<LlmCallFilters
+								status={llmStatusFilter}
+								onStatusChange={(nextValue) => {
+									setLlmStatusFilter(nextValue);
+									updateLlmCallRouteFilters(
+										{ status: nextValue },
+										{ replace: true },
+									);
+								}}
+								model={llmModelFilter}
+								onModelChange={(nextValue) => {
+									setLlmModelFilter(nextValue);
+									updateLlmCallRouteFilters(
+										{ model: nextValue.trim() },
+										{ replace: true },
+									);
+								}}
+								source={llmSourceFilter}
+								onSourceChange={(nextValue) => {
+									setLlmSourceFilter(nextValue);
+									updateLlmCallRouteFilters(
+										{ source: nextValue.trim() },
+										{ replace: true },
+									);
+								}}
+								requestedBy={llmRequestedByFilter}
+								onRequestedByChange={(nextValue) => {
+									setLlmRequestedByFilter(nextValue);
+									updateLlmCallRouteFilters(
+										{ requestedBy: nextValue.trim() },
+										{ replace: true },
+									);
+								}}
+								started={{
+									from: llmStartedFromFilter,
+									to: llmStartedToFilter,
+								}}
+								onStartedChange={(nextValue) => {
+									setLlmStartedFromFilter(nextValue.from);
+									setLlmStartedToFilter(nextValue.to);
+									updateLlmCallRouteFilters(
+										{
+											startedFrom: localInputToUtc(nextValue.from),
+											startedTo: localInputToUtc(nextValue.to),
+										},
+										{ replace: true },
+									);
+								}}
+								finished={{
+									from: llmFinishedFromFilter,
+									to: llmFinishedBeforeFilter,
+								}}
+								onFinishedChange={(nextValue) => {
+									setLlmFinishedFromFilter(nextValue.from);
+									setLlmFinishedBeforeFilter(nextValue.to);
+									updateLlmCallRouteFilters(
+										{
+											finishedFrom: localInputToUtc(nextValue.from),
+											finishedBefore: localInputToUtc(nextValue.to),
+										},
+										{ replace: true },
+									);
+								}}
+								hasFilters={hasLlmCallFilters}
+								onClear={() => {
+									setLlmStatusFilter("all");
+									setLlmModelFilter("");
+									setLlmSourceFilter("");
+									setLlmRequestedByFilter("");
+									setLlmStartedFromFilter("");
+									setLlmStartedToFilter("");
+									setLlmFinishedFromFilter("");
+									setLlmFinishedBeforeFilter("");
+									updateLlmCallRouteFilters(
+										{
+											status: "all",
+											model: "",
+											source: "",
+											requestedBy: "",
+											startedFrom: "",
+											startedTo: "",
+											finishedFrom: "",
+											finishedBefore: "",
+										},
+										{ replace: true },
+									);
+								}}
+							/>
 
 							<section
 								ref={llmCallResultsRef}

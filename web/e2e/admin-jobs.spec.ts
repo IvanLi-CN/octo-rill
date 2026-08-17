@@ -1899,7 +1899,9 @@ test("admin can manage jobs center", async ({ page }) => {
 	const llmTab = page.getByRole("tab", { name: "LLM调度" });
 
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
-	await expect(page.getByRole("img", { name: "OctoRill" })).toBeVisible();
+	await expect(
+		page.getByRole("link", { name: "OctoRill 管理后台" }),
+	).toBeVisible();
 	await expect(
 		page.getByRole("navigation", { name: "管理员导航" }),
 	).toBeVisible();
@@ -2080,12 +2082,32 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(startedRangeTrigger).toBeVisible();
 	await expect(finishedRangeTrigger).toBeVisible();
 	await startedRangeTrigger.click();
-	await expect(page.getByLabel("LLM 开始时间后")).toBeVisible();
-	await expect(page.getByLabel("LLM 开始时间前")).toBeVisible();
+	await expect(
+		page.getByRole("group", { name: "LLM 开始时间后日历" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("group", { name: "LLM 开始时间前日历" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("textbox", { name: "LLM 开始时间后" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("textbox", { name: "LLM 开始时间前" }),
+	).toBeVisible();
 	await page.keyboard.press("Escape");
 	await finishedRangeTrigger.click();
-	await expect(page.getByLabel("LLM 结束时间后")).toBeVisible();
-	await expect(page.getByLabel("LLM 结束时间前（不含）")).toBeVisible();
+	await expect(
+		page.getByRole("group", { name: "LLM 结束时间后日历" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("group", { name: "LLM 结束时间前（不含）日历" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("textbox", { name: "LLM 结束时间后" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("textbox", { name: "LLM 结束时间前（不含）" }),
+	).toBeVisible();
 	await page.keyboard.press("Escape");
 	await expect(page.getByText("调度器状态")).toHaveCount(0);
 	await expect(page.getByText("等待 / 进行中")).toHaveCount(0);
@@ -2298,6 +2320,19 @@ test("admin llm activity defaults to chart and keeps list filters independent", 
 
 	const grid = page.getByTestId("llm-activity-grid");
 	await expect(grid).toBeVisible({ timeout: 10_000 });
+	const filterHeights = await Promise.all(
+		[
+			page.getByRole("combobox", { name: "LLM 调用状态筛选" }),
+			page.getByRole("textbox", { name: "LLM 调用模型筛选" }),
+			page.getByRole("button", { name: "LLM 开始时间范围" }),
+			page.getByRole("button", { name: "LLM 结束时间范围" }),
+		].map((filter) =>
+			filter.evaluate((element) =>
+				Math.round(element.getBoundingClientRect().height),
+			),
+		),
+	);
+	expect(filterHeights).toEqual([36, 36, 36, 36]);
 	const activityViewButton = page.getByRole("button", {
 		name: "显示模型活动图",
 	});
@@ -2389,23 +2424,23 @@ test("admin drills from LLM activity and model cards into shareable call filters
 	await expect(results).toBeFocused();
 	await expect(page.getByText("job.api.translate_release")).toBeVisible();
 	await page.getByRole("button", { name: "LLM 结束时间范围" }).click();
-	await expect
-		.poll(() =>
-			page.getByLabel("LLM 结束时间后").evaluate((input) => {
-				return new Date((input as HTMLInputElement).value).toISOString();
-			}),
-		)
-		.toBe("2026-02-26T02:00:00.000Z");
-	await expect
-		.poll(() =>
-			page.getByLabel("LLM 结束时间前（不含）").evaluate((input) => {
-				return new Date((input as HTMLInputElement).value).toISOString();
-			}),
-		)
-		.toBe("2026-02-26T03:00:00.000Z");
+	await expect(
+		page.getByRole("group", { name: "LLM 结束时间后日历" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("group", { name: "LLM 结束时间前（不含）日历" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("textbox", { name: "LLM 结束时间后" }),
+	).toHaveValue("2026/02/26 10:00");
+	await expect(
+		page.getByRole("textbox", { name: "LLM 结束时间前（不含）" }),
+	).toHaveValue("2026/02/26 11:00");
 	await page.keyboard.press("Escape");
 	await page.getByRole("button", { name: "LLM 开始时间范围" }).click();
-	await page.getByLabel("LLM 开始时间后").fill("2026-02-26T01:00");
+	await page
+		.getByRole("textbox", { name: "LLM 开始时间后" })
+		.fill("2026/02/26 01:00");
 	await expect
 		.poll(() => {
 			const search = new URL(page.url()).searchParams;
@@ -2468,6 +2503,50 @@ test("admin drills from LLM activity and model cards into shareable call filters
 			finishedFrom: null,
 			finishedBefore: null,
 		});
+});
+
+test("admin llm activity keeps context-menu hit targets contiguous", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1200, height: 900 });
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+	const grid = page.getByTestId("llm-activity-grid");
+	const firstModelCells = grid.getByRole("button", { name: /gpt-4o-mini/ });
+	const secondModelCells = grid.getByRole("button", { name: /gpt-4\.1-mini/ });
+	await expect(firstModelCells.first()).toBeVisible({ timeout: 10_000 });
+	const [firstCellBox, secondCellBox, nextRowCellBox] = await Promise.all([
+		firstModelCells.nth(0).boundingBox(),
+		firstModelCells.nth(1).boundingBox(),
+		secondModelCells.nth(0).boundingBox(),
+	]);
+	expect(firstCellBox).not.toBeNull();
+	expect(secondCellBox).not.toBeNull();
+	expect(nextRowCellBox).not.toBeNull();
+	expect(
+		Math.abs(
+			(firstCellBox?.x ?? 0) +
+				(firstCellBox?.width ?? 0) -
+				(secondCellBox?.x ?? 0),
+		),
+	).toBeLessThan(0.5);
+	expect(
+		Math.abs(
+			(firstCellBox?.y ?? 0) +
+				(firstCellBox?.height ?? 0) -
+				(nextRowCellBox?.y ?? 0),
+		),
+	).toBeLessThan(0.5);
+
+	await page.mouse.click(
+		secondCellBox?.x ?? 0,
+		(firstCellBox?.y ?? 0) + (firstCellBox?.height ?? 0) / 2,
+		{ button: "right" },
+	);
+	await expect(
+		page.getByRole("menuitem", { name: "查看失败调用" }),
+	).toBeVisible();
 });
 
 test("admin llm activity keeps the pointer tooltip clear of the grid", async ({
@@ -2801,13 +2880,75 @@ test("admin llm activity prioritizes the grid on mobile", async ({ page }) => {
 	]);
 	expect(firstCellBox).not.toBeNull();
 	expect(secondCellBox).not.toBeNull();
-	expect((firstCellBox?.x ?? 0) + (firstCellBox?.width ?? 0)).toBeLessThan(
-		secondCellBox?.x ?? 0,
-	);
+	expect(
+		Math.abs(
+			(firstCellBox?.x ?? 0) +
+				(firstCellBox?.width ?? 0) -
+				(secondCellBox?.x ?? 0),
+		),
+	).toBeLessThan(0.5);
 
 	await expect(grid.getByRole("list", { name: "模型图例" })).toContainText(
 		"gpt-4o-mini",
 	);
+});
+
+test("admin llm mobile filters keep context around the time range panel", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 393, height: 852 });
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+	await expect(
+		page.getByRole("button", { name: "打开 LLM 调用筛选" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("textbox", { name: "LLM 调用模型筛选" }),
+	).toHaveCount(0);
+	await page.getByRole("button", { name: "打开 LLM 调用筛选" }).click();
+	const filters = page.getByRole("dialog", { name: "筛选调用记录" });
+	await expect(filters).toBeVisible();
+	await expect(filters).toHaveClass(/right-0/);
+	await expect(
+		filters.getByRole("textbox", { name: "LLM 调用模型筛选" }),
+	).toBeVisible();
+	await filters.getByRole("button", { name: "LLM 开始时间范围" }).click();
+	const drawer = filters.getByRole("region", {
+		name: "LLM 开始时间范围设置",
+	});
+	await expect(drawer).toBeVisible();
+	await expect(filters).toBeVisible();
+	await expect(page.getByRole("dialog")).toHaveCount(1);
+	await expect(drawer).toHaveClass(/bottom-0/);
+	await expect(
+		drawer.getByRole("group", { name: "LLM 开始时间后日历" }),
+	).toBeVisible();
+	await expect(
+		drawer.getByRole("group", { name: "LLM 开始时间前日历" }),
+	).toHaveCount(0);
+	await drawer.getByRole("textbox", { name: "LLM 开始时间前" }).click();
+	await expect(
+		drawer.getByRole("group", { name: "LLM 开始时间后日历" }),
+	).toHaveCount(0);
+	await expect(
+		drawer.getByRole("group", { name: "LLM 开始时间前日历" }),
+	).toBeVisible();
+	const scrollMetrics = await drawer
+		.getByTestId("llm-time-range-drawer-scroll")
+		.evaluate((element) => ({
+			clientHeight: element.clientHeight,
+			scrollHeight: element.scrollHeight,
+		}));
+	expect(scrollMetrics.scrollHeight).toBeLessThanOrEqual(
+		scrollMetrics.clientHeight + 1,
+	);
+	await page.keyboard.press("Escape");
+	await expect(drawer).toHaveCount(0);
+	await expect(filters).toBeVisible();
+	await expect(
+		filters.getByRole("textbox", { name: "LLM 调用模型筛选" }),
+	).toBeVisible();
 });
 
 test("admin keeps llm calls visible during sse refresh", async ({ page }) => {

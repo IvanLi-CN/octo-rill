@@ -713,48 +713,236 @@ function buildTaskDiagnostics(): AdminTaskDiagnostics {
 	};
 }
 
-function buildAdminJobs(): DemoJobsModel {
-	const activityWindowEnd = new Date("2026-07-08T10:00:00Z");
-	const activityWindowStart = new Date(
-		activityWindowEnd.getTime() - 50 * 60 * 60 * 1000,
-	);
-	const llmActivity: AdminLlmActivityResponse = {
+const LLM_ACTIVITY_BUCKET_COUNT = 50;
+const LLM_ACTIVITY_BUCKET_MS = 60 * 60 * 1000;
+const LLM_FAILOVER_BUCKETS = new Set([13, 39]);
+const LLM_ACTIVITY_MODELS = [
+	{ model: "gpt-5-mini", priority: 1, configured: true },
+	{ model: "gpt-4.1-mini", priority: 2, configured: true },
+	{
+		model: "retired-summary-model",
+		priority: null,
+		configured: false,
+	},
+] as const;
+
+function intendedLlmCallCounts(model: string, bucketIndex: number) {
+	if (model === "gpt-5-mini") {
+		if (LLM_FAILOVER_BUCKETS.has(bucketIndex)) {
+			return { succeeded: 0, failed: 3 };
+		}
+		return {
+			succeeded: bucketIndex % 7 === 0 ? 8 : bucketIndex % 3 === 0 ? 4 : 1,
+			failed: 0,
+		};
+	}
+	if (model === "gpt-4.1-mini") {
+		return LLM_FAILOVER_BUCKETS.has(bucketIndex)
+			? { succeeded: 3, failed: 0 }
+			: { succeeded: 0, failed: 0 };
+	}
+	return {
+		succeeded: bucketIndex === 6 || bucketIndex === 7 ? 2 : 0,
+		failed: bucketIndex === 7 ? 1 : 0,
+	};
+}
+
+function llmCallFinishedMinute(
+	model: string,
+	bucketIndex: number,
+	status: "succeeded" | "failed",
+	statusIndex: number,
+	sequence: number,
+) {
+	if (LLM_FAILOVER_BUCKETS.has(bucketIndex)) {
+		if (model === "gpt-5-mini" && status === "failed") {
+			return 5 + statusIndex * 3;
+		}
+		if (model === "gpt-4.1-mini" && status === "succeeded") {
+			return 14 + statusIndex * 3;
+		}
+	}
+	return 5 + sequence * 3;
+}
+
+function buildHistoricalLlmCalls(
+	activityWindowStart: Date,
+): AdminLlmCallItem[] {
+	return Array.from({ length: LLM_ACTIVITY_BUCKET_COUNT }, (_, bucketIndex) => {
+		const bucketStartedAt =
+			activityWindowStart.getTime() + bucketIndex * LLM_ACTIVITY_BUCKET_MS;
+		return LLM_ACTIVITY_MODELS.flatMap(({ model }) => {
+			const counts = intendedLlmCallCounts(model, bucketIndex);
+			return (["succeeded", "failed"] as const).flatMap((status) =>
+				Array.from({ length: counts[status] }, (_, statusIndex) => {
+					const sequence =
+						status === "succeeded"
+							? statusIndex
+							: counts.succeeded + statusIndex;
+					const durationMs = 900 + ((bucketIndex + sequence) % 7) * 170;
+					const schedulerWaitMs = 120 + ((bucketIndex + sequence) % 6) * 45;
+					const finishedMinute = llmCallFinishedMinute(
+						model,
+						bucketIndex,
+						status,
+						statusIndex,
+						sequence,
+					);
+					const finishedAt = new Date(
+						bucketStartedAt + finishedMinute * 60 * 1000,
+					);
+					const startedAt = new Date(finishedAt.getTime() - durationMs);
+					const createdAt = new Date(startedAt.getTime() - schedulerWaitMs);
+					const isShowcaseFailure =
+						model === "gpt-5-mini" &&
+						bucketIndex === 39 &&
+						status === "failed" &&
+						statusIndex === 0;
+					const modelId = model.replace(/[^a-z0-9]+/gi, "-");
+					const inputTokens = 780 + ((bucketIndex + sequence) % 8) * 77;
+					const outputTokens =
+						status === "succeeded" ? 180 + sequence * 13 : null;
+					return {
+						id: isShowcaseFailure
+							? "llm-call-demo-failed-1"
+							: `llm-call-history-${bucketIndex}-${modelId}-${status}-${statusIndex}`,
+						status,
+						source:
+							model === "gpt-5-mini"
+								? "job.api.translate_release"
+								: model === "gpt-4.1-mini"
+									? "scheduler.translation.deadline"
+									: "brief.summary.backfill",
+						model,
+						requested_by:
+							model === "retired-summary-model" ? null : ADMIN_USER_ID,
+						parent_task_id:
+							model === "retired-summary-model"
+								? null
+								: "task-sync-subscriptions",
+						parent_task_type:
+							model === "retired-summary-model" ? null : "sync.subscriptions",
+						max_tokens: 900,
+						attempt_count: status === "failed" ? 2 : 1,
+						scheduler_wait_ms: schedulerWaitMs,
+						first_token_wait_ms:
+							status === "succeeded" ? 320 + sequence * 40 : null,
+						duration_ms: durationMs,
+						input_tokens: inputTokens,
+						output_tokens: outputTokens,
+						cached_input_tokens: sequence % 3 === 0 ? 64 : 0,
+						total_tokens:
+							outputTokens === null ? inputTokens : inputTokens + outputTokens,
+						created_at: createdAt.toISOString(),
+						started_at: startedAt.toISOString(),
+						finished_at: finishedAt.toISOString(),
+						updated_at: finishedAt.toISOString(),
+					};
+				}),
+			);
+		});
+	}).flat();
+}
+
+function buildLlmActivityFromCalls(
+	llmCalls: AdminLlmCallItem[],
+	activityWindowStart: Date,
+	activityWindowEnd: Date,
+): AdminLlmActivityResponse {
+	return {
 		bucket_minutes: 60,
-		bucket_count: 50,
+		bucket_count: LLM_ACTIVITY_BUCKET_COUNT,
 		window_started_at: activityWindowStart.toISOString(),
 		window_ended_at: activityWindowEnd.toISOString(),
-		models: [
-			{ model: "gpt-5-mini", priority: 1, configured: true },
-			{ model: "gpt-4.1-mini", priority: 2, configured: true },
-			{ model: "retired-summary-model", priority: null, configured: false },
-		],
-		buckets: Array.from({ length: 50 }, (_, index) => {
-			const startedAt = new Date(
-				activityWindowStart.getTime() + index * 60 * 60 * 1000,
+		models: [...LLM_ACTIVITY_MODELS],
+		buckets: Array.from({ length: LLM_ACTIVITY_BUCKET_COUNT }, (_, index) => {
+			const bucketStartedAt = new Date(
+				activityWindowStart.getTime() + index * LLM_ACTIVITY_BUCKET_MS,
 			);
+			const bucketEndedAt = new Date(
+				bucketStartedAt.getTime() + LLM_ACTIVITY_BUCKET_MS,
+			);
+			const bucketCalls = llmCalls.filter((call) => {
+				if (call.status !== "succeeded" && call.status !== "failed")
+					return false;
+				const finishedAt = new Date(
+					call.finished_at ?? call.updated_at ?? call.created_at,
+				).getTime();
+				return (
+					finishedAt >= bucketStartedAt.getTime() &&
+					finishedAt < bucketEndedAt.getTime()
+				);
+			});
 			return {
-				started_at: startedAt.toISOString(),
-				ended_at: new Date(startedAt.getTime() + 60 * 60 * 1000).toISOString(),
-				counts: [
-					{
-						model: "gpt-5-mini",
-						succeeded: index % 7 === 0 ? 8 : index % 3 === 0 ? 4 : 1,
-						failed: index % 13 === 0 ? 1 : 0,
-					},
-					{
-						model: "gpt-4.1-mini",
-						succeeded: index % 5 === 0 ? 5 : index % 2 === 0 ? 2 : 0,
-						failed: index % 17 === 0 ? 1 : 0,
-					},
-					{
-						model: "retired-summary-model",
-						succeeded: index === 6 || index === 7 ? 2 : 0,
-						failed: index === 7 ? 1 : 0,
-					},
-				],
+				started_at: bucketStartedAt.toISOString(),
+				ended_at: bucketEndedAt.toISOString(),
+				counts: LLM_ACTIVITY_MODELS.map(({ model }) => ({
+					model,
+					succeeded: bucketCalls.filter(
+						(call) => call.model === model && call.status === "succeeded",
+					).length,
+					failed: bucketCalls.filter(
+						(call) => call.model === model && call.status === "failed",
+					).length,
+				})),
 			};
 		}),
 	};
+}
+
+function buildLlmCallDetails(llmCalls: AdminLlmCallItem[]) {
+	return Object.fromEntries(
+		llmCalls.map((call) => [
+			call.id,
+			{
+				...call,
+				input_messages_json: JSON.stringify([
+					{
+						role: "user",
+						content: `Run ${call.source} with ${call.model}.`,
+					},
+				]),
+				output_messages_json:
+					call.status === "succeeded"
+						? JSON.stringify([{ role: "assistant", content: "Demo result." }])
+						: null,
+				prompt_text: `Run ${call.source} with ${call.model}.`,
+				response_text:
+					call.status === "succeeded"
+						? "Completed by the deterministic Web Demo fixture."
+						: null,
+				error_text:
+					call.status === "failed"
+						? "Upstream provider deadline exceeded in the deterministic Web Demo fixture."
+						: null,
+			} satisfies AdminLlmCallDetailResponse,
+		]),
+	);
+}
+
+function roundedAverage(values: number[]) {
+	return values.length === 0
+		? null
+		: Math.round(values.reduce((sum, value) => sum + value, 0) / values.length);
+}
+
+function latestFinishedAt(llmCalls: AdminLlmCallItem[], status: string) {
+	return (
+		llmCalls
+			.filter((call) => call.status === status && call.finished_at)
+			.map((call) => call.finished_at as string)
+			.sort((left, right) => right.localeCompare(left))[0] ?? null
+	);
+}
+
+function buildAdminJobs(): DemoJobsModel {
+	const demoNow = new Date(NOW);
+	const activityWindowEnd = new Date(demoNow);
+	activityWindowEnd.setUTCMinutes(0, 0, 0);
+	const activityWindowStart = new Date(
+		activityWindowEnd.getTime() -
+			LLM_ACTIVITY_BUCKET_COUNT * LLM_ACTIVITY_BUCKET_MS,
+	);
 	const realtimeTasks: AdminRealtimeTaskItem[] = [
 		{
 			id: "task-sync-subscriptions",
@@ -808,7 +996,29 @@ function buildAdminJobs(): DemoJobsModel {
 		(item) => item.task_type === "sync.subscriptions",
 	);
 
-	const llmCalls: AdminLlmCallItem[] = [
+	const currentLlmCalls: AdminLlmCallItem[] = [
+		{
+			id: "llm-call-queued-1",
+			status: "queued",
+			source: "scheduler.translation.deadline",
+			model: "gpt-4.1-mini",
+			requested_by: ADMIN_USER_ID,
+			parent_task_id: "task-sync-subscriptions",
+			parent_task_type: "sync.subscriptions",
+			max_tokens: 900,
+			attempt_count: 0,
+			scheduler_wait_ms: 0,
+			first_token_wait_ms: null,
+			duration_ms: null,
+			input_tokens: null,
+			output_tokens: null,
+			cached_input_tokens: null,
+			total_tokens: null,
+			created_at: "2026-07-08T10:20:00+08:00",
+			started_at: null,
+			finished_at: null,
+			updated_at: NOW,
+		},
 		{
 			id: "llm-call-1",
 			status: "running",
@@ -831,59 +1041,33 @@ function buildAdminJobs(): DemoJobsModel {
 			finished_at: null,
 			updated_at: NOW,
 		},
-		{
-			id: "llm-call-demo-failed-1",
-			status: "failed",
-			source: "scheduler.translation.deadline",
-			model: "gpt-5-mini",
-			requested_by: ADMIN_USER_ID,
-			parent_task_id: "task-sync-subscriptions",
-			parent_task_type: "sync.subscriptions",
-			max_tokens: 900,
-			attempt_count: 2,
-			scheduler_wait_ms: 180,
-			first_token_wait_ms: null,
-			duration_ms: 1640,
-			input_tokens: 1088,
-			output_tokens: null,
-			cached_input_tokens: 0,
-			total_tokens: 1088,
-			created_at: "2026-07-07T18:20:00+08:00",
-			started_at: "2026-07-07T18:20:02+08:00",
-			finished_at: "2026-07-07T18:23:12+08:00",
-			updated_at: "2026-07-07T18:23:12+08:00",
-		},
 	];
-
-	const llmCallDetails: Record<string, AdminLlmCallDetailResponse> = {
-		"llm-call-1": {
-			...llmCalls[0],
-			input_messages_json: JSON.stringify([
-				{
-					role: "system",
-					content:
-						"You translate GitHub release notes into concise Chinese summaries.",
-				},
-			]),
-			output_messages_json: null,
-			prompt_text: "Translate release notes for /demo/ Web Demo contract",
-			response_text: null,
-			error_text: null,
-		},
-		"llm-call-demo-failed-1": {
-			...llmCalls[1],
-			input_messages_json: JSON.stringify([
-				{
-					role: "user",
-					content: "Translate the release announcement before the deadline.",
-				},
-			]),
-			output_messages_json: null,
-			prompt_text: "Translate the release announcement before the deadline.",
-			response_text: null,
-			error_text: "Upstream provider deadline exceeded after 1.64 seconds.",
-		},
-	};
+	const historicalLlmCalls = buildHistoricalLlmCalls(activityWindowStart).sort(
+		(left, right) => right.created_at.localeCompare(left.created_at),
+	);
+	const llmCalls = [...currentLlmCalls, ...historicalLlmCalls];
+	const llmActivity = buildLlmActivityFromCalls(
+		llmCalls,
+		activityWindowStart,
+		activityWindowEnd,
+	);
+	const llmCallDetails = buildLlmCallDetails(llmCalls);
+	const recentCutoff = demoNow.getTime() - 24 * 60 * 60 * 1000;
+	const recentLlmCalls = llmCalls.filter((call) => {
+		const createdAt = new Date(call.created_at).getTime();
+		return createdAt >= recentCutoff && createdAt <= demoNow.getTime();
+	});
+	const recentWaits = recentLlmCalls.map((call) => call.scheduler_wait_ms);
+	const recentDurations = recentLlmCalls.flatMap((call) =>
+		call.duration_ms === null ? [] : [call.duration_ms],
+	);
+	const maxConcurrency = 4;
+	const waitingCalls = llmCalls.filter(
+		(call) => call.status === "queued",
+	).length;
+	const inFlightCalls = llmCalls.filter(
+		(call) => call.status === "running",
+	).length;
 
 	const taskDetails: Record<string, AdminRealtimeTaskDetailResponse> = {
 		"task-sync-subscriptions": {
@@ -952,7 +1136,7 @@ function buildAdminJobs(): DemoJobsModel {
 			scheduler_enabled: true,
 			llm_models: ["gpt-5-mini", "gpt-4.1-mini"],
 			selected_model_for_new_calls: "gpt-5-mini",
-			max_concurrency: 4,
+			max_concurrency: maxConcurrency,
 			ai_model_context_limit: 120000,
 			effective_model_input_limit: 120000,
 			effective_model_input_limit_source: "runtime-config",
@@ -966,16 +1150,26 @@ function buildAdminJobs(): DemoJobsModel {
 					effective_input_limit: 120000,
 					effective_input_limit_source: "runtime-config",
 				},
+				{
+					model: "gpt-4.1-mini",
+					priority: 2,
+					status: "healthy",
+					consecutive_final_failures: 0,
+					cooldown_until: null,
+					effective_input_limit: 120000,
+					effective_input_limit_source: "runtime-config",
+				},
 			],
-			available_slots: 3,
-			waiting_calls: 1,
-			in_flight_calls: 1,
-			calls_24h: 182,
-			failed_24h: 3,
-			avg_wait_ms_24h: 540,
-			avg_duration_ms_24h: 2800,
-			last_success_at: "2026-07-08T09:08:00+08:00",
-			last_failure_at: "2026-07-08T06:15:00+08:00",
+			available_slots: Math.max(0, maxConcurrency - inFlightCalls),
+			waiting_calls: waitingCalls,
+			in_flight_calls: inFlightCalls,
+			calls_24h: recentLlmCalls.length,
+			failed_24h: recentLlmCalls.filter((call) => call.status === "failed")
+				.length,
+			avg_wait_ms_24h: roundedAverage(recentWaits),
+			avg_duration_ms_24h: roundedAverage(recentDurations),
+			last_success_at: latestFinishedAt(llmCalls, "succeeded"),
+			last_failure_at: latestFinishedAt(llmCalls, "failed"),
 		},
 		llmActivity,
 		llmCalls,
