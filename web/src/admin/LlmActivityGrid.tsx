@@ -55,6 +55,19 @@ const MAX_BUCKET_COUNT = 50;
 const TOOLTIP_GAP = 12;
 const TOOLTIP_VIEWPORT_MARGIN = 12;
 
+const ACTIVITY_VOLUME_CLASSES = [
+	"bg-sky-200 ring-sky-300/50 dark:bg-sky-950 dark:ring-sky-800/60",
+	"bg-cyan-300 ring-cyan-400/50 dark:bg-cyan-800 dark:ring-cyan-700/70",
+	"bg-emerald-400 ring-emerald-500/50 dark:bg-emerald-700 dark:ring-emerald-600/70",
+	"bg-green-500 ring-green-600/50 dark:bg-green-500 dark:ring-green-400/70",
+] as const;
+const ACTIVITY_IDLE_CLASS = "bg-muted/80 ring-border/50";
+const ACTIVITY_DEGRADED_CLASS =
+	"bg-amber-400 ring-amber-500/70 dark:bg-amber-500 dark:ring-amber-300/70";
+const ACTIVITY_FAILED_CLASS = "bg-destructive ring-destructive/70";
+
+type ActivityOutcome = "idle" | "healthy" | "degraded" | "failed";
+
 const percent = (numerator: number, denominator: number) =>
 	denominator === 0 ? "--" : `${Math.round((100 * numerator) / denominator)}%`;
 
@@ -67,16 +80,74 @@ const localTime = (value: string) =>
 		hour12: false,
 	}).format(new Date(value));
 
-const activityClass = (count: number, maximum: number) => {
-	if (count === 0 || maximum === 0) return "bg-muted/80 ring-border/50";
-	const level = Math.ceil((4 * count) / maximum);
-	return [
-		"bg-sky-200 ring-sky-300/50 dark:bg-sky-950 dark:ring-sky-800/60",
-		"bg-cyan-300 ring-cyan-400/50 dark:bg-cyan-800 dark:ring-cyan-700/70",
-		"bg-emerald-400 ring-emerald-500/50 dark:bg-emerald-700 dark:ring-emerald-600/70",
-		"bg-green-500 ring-green-600/50 dark:bg-green-500 dark:ring-green-400/70",
-	][Math.max(0, level - 1)];
+const activityOutcome = (
+	succeeded: number,
+	failed: number,
+): ActivityOutcome => {
+	const total = succeeded + failed;
+	if (total === 0) return "idle";
+	if (failed === total) return "failed";
+	if (failed > 0) return "degraded";
+	return "healthy";
 };
+
+const activityClass = (succeeded: number, failed: number, maximum: number) => {
+	const total = succeeded + failed;
+	switch (activityOutcome(succeeded, failed)) {
+		case "idle":
+			return ACTIVITY_IDLE_CLASS;
+		case "failed":
+			return ACTIVITY_FAILED_CLASS;
+		case "degraded":
+			return ACTIVITY_DEGRADED_CLASS;
+		case "healthy": {
+			const level = Math.ceil((4 * total) / maximum);
+			return ACTIVITY_VOLUME_CLASSES[Math.max(0, level - 1)];
+		}
+	}
+};
+
+function ActivityColorLegend() {
+	return (
+		<ul
+			className="text-muted-foreground flex flex-wrap items-center gap-x-3 gap-y-1 text-xs"
+			aria-label="活动图颜色图例"
+		>
+			<li className="inline-flex items-center gap-1.5">
+				<span
+					className={`size-2.5 rounded-[2px] ring-1 ${ACTIVITY_IDLE_CLASS}`}
+					aria-hidden="true"
+				/>
+				<span>无调用</span>
+			</li>
+			<li className="inline-flex items-center gap-1.5">
+				<span className="inline-flex gap-0.5" aria-hidden="true">
+					{ACTIVITY_VOLUME_CLASSES.map((className) => (
+						<span
+							key={className}
+							className={`size-2.5 rounded-[2px] ring-1 ${className}`}
+						/>
+					))}
+				</span>
+				<span>调用量低至高</span>
+			</li>
+			<li className="inline-flex items-center gap-1.5">
+				<span
+					className={`size-2.5 rounded-[2px] ring-1 ${ACTIVITY_DEGRADED_CLASS}`}
+					aria-hidden="true"
+				/>
+				<span>含失败</span>
+			</li>
+			<li className="inline-flex items-center gap-1.5">
+				<span
+					className={`size-2.5 rounded-[2px] ring-1 ${ACTIVITY_FAILED_CLASS}`}
+					aria-hidden="true"
+				/>
+				<span>全部失败</span>
+			</li>
+		</ul>
+	);
+}
 
 const toActivityRect = (rect: DOMRect): ActivityRect => ({
 	bottom: rect.bottom,
@@ -197,13 +268,13 @@ export function LlmActivityGrid({
 			: (pinnedColumn ?? hoveredColumn);
 	const gridLabelWidth = isDesktop ? 152 : isTablet ? 112 : 28;
 	const minimumCellSize = isDesktop ? 12 : isTablet ? 11 : 9;
-	const gridGap = isMobile ? 2 : 3;
+	const visualCellGap = isMobile ? 2 : 3;
 	const fallbackBucketCount = isDesktop ? MAX_BUCKET_COUNT : isTablet ? 36 : 25;
 	const bucketCapacity =
 		gridSurfaceWidth > 0
 			? Math.floor(
 					Math.max(0, gridSurfaceWidth - gridLabelWidth) /
-						(minimumCellSize + gridGap),
+						(minimumCellSize + visualCellGap),
 				)
 			: fallbackBucketCount;
 	const visibleBucketCount = Math.min(
@@ -665,19 +736,22 @@ export function LlmActivityGrid({
 
 	return (
 		<div ref={rootRef} className="min-w-0" data-testid="llm-activity-grid">
-			<div className="mb-2 flex min-h-8 items-center justify-between gap-3">
-				<p className="text-muted-foreground text-xs">
-					最近 {visibleBuckets.length} 小时 · 本地时间
-				</p>
-				{refreshing ? (
-					<span
-						className="text-muted-foreground inline-flex items-center gap-1 text-xs"
-						role="status"
-					>
-						<LoaderCircle className="size-3 animate-spin" />
-						更新中
-					</span>
-				) : null}
+			<div className="mb-2 flex min-h-8 flex-col items-start justify-between gap-2 sm:flex-row sm:items-center sm:gap-3">
+				<div className="flex shrink-0 items-center gap-2">
+					<p className="text-muted-foreground text-xs">
+						最近 {visibleBuckets.length} 小时 · 本地时间
+					</p>
+					{refreshing ? (
+						<span
+							className="text-muted-foreground inline-flex items-center gap-1 text-xs"
+							role="status"
+						>
+							<LoaderCircle className="size-3 animate-spin" />
+							更新中
+						</span>
+					) : null}
+				</div>
+				<ActivityColorLegend />
 			</div>
 			{isMobile && visibleBuckets.length > 0 ? (
 				<div
@@ -696,10 +770,7 @@ export function LlmActivityGrid({
 				className="min-w-0 max-h-[min(30vh,12rem)] overflow-y-auto"
 				data-testid="llm-activity-surface"
 			>
-				<div
-					className={`grid w-full gap-y-1 ${isMobile ? "gap-x-0.5" : "gap-x-[3px]"}`}
-					style={gridStyle}
-				>
+				<div className="grid w-full gap-0" style={gridStyle}>
 					<div className="bg-card sticky left-0 z-20 h-0 sm:h-auto" />
 					{visibleBuckets.map((bucket, index) => {
 						const isFirstBucket = index === 0;
@@ -765,7 +836,7 @@ export function LlmActivityGrid({
 								succeeded: 0,
 								failed: 0,
 							};
-							const total = count.succeeded + count.failed;
+							const outcome = activityOutcome(count.succeeded, count.failed);
 							const key = `${model.model}:${column}`;
 							const cell = (
 								<button
@@ -775,13 +846,14 @@ export function LlmActivityGrid({
 										else cellRefs.current.delete(key);
 									}}
 									type="button"
-									className={`aspect-square w-full min-w-0 rounded-[2px] ring-1 transition-[filter] hover:brightness-95 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:rounded-[3px] ${activityClass(total, visibleMax)} ${activeColumn === column ? "brightness-90 ring-1 ring-foreground/60" : ""}`}
+									className="group relative aspect-square w-full min-w-0 focus-visible:outline-none"
 									aria-label={`${localTime(bucket.started_at)}，${model.model}，成功 ${count.succeeded}，失败 ${count.failed}`}
 									aria-controls={ACTIVITY_SUMMARY_ID}
 									aria-describedby={
 										activeColumn === column ? ACTIVITY_SUMMARY_ID : undefined
 									}
 									aria-expanded={activeColumn === column}
+									data-activity-outcome={outcome}
 									onPointerMove={(event) => {
 										if (pinnedColumn !== null) return;
 										tooltipAnchorElementRef.current = null;
@@ -827,7 +899,12 @@ export function LlmActivityGrid({
 									onKeyDown={(event) =>
 										handleKeyDown(event, model.model, column)
 									}
-								/>
+								>
+									<span
+										aria-hidden="true"
+										className={`pointer-events-none absolute rounded-[2px] ring-1 transition-[filter] group-hover:brightness-95 group-focus-visible:ring-ring sm:rounded-[3px] ${isMobile ? "inset-x-px inset-y-0.5" : "inset-x-[1.5px] inset-y-0.5"} ${activityClass(count.succeeded, count.failed, visibleMax)} ${activeColumn === column ? "brightness-90 ring-foreground/60" : ""}`}
+									/>
+								</button>
 							);
 							return onOpenCalls ? (
 								<LlmCallContextMenu

@@ -30,8 +30,9 @@ function activityFixture(): AdminLlmActivityResponse {
 					},
 					{
 						model: "gpt-4.1-mini",
-						succeeded: index === 49 ? 2 : index % 3 === 0 ? 2 : 0,
-						failed: index === 49 ? 1 : 0,
+						succeeded:
+							index === 47 ? 0 : index === 49 ? 2 : index % 3 === 0 ? 2 : 0,
+						failed: index === 47 ? 2 : index === 49 ? 1 : 0,
 					},
 					{
 						model: "retired-model",
@@ -81,6 +82,18 @@ export const Default: Story = {
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		const body = within(canvasElement.ownerDocument.body);
+		const colorLegend = canvas.getByRole("list", {
+			name: "活动图颜色图例",
+		});
+		await expect(colorLegend).toHaveTextContent("无调用");
+		await expect(colorLegend).toHaveTextContent("调用量低至高");
+		await expect(colorLegend).toHaveTextContent("含失败");
+		await expect(colorLegend).toHaveTextContent("全部失败");
+		await expect(
+			canvas.getByRole("button", {
+				name: /gpt-4\.1-mini，成功 0，失败 2/,
+			}),
+		).toHaveAttribute("data-activity-outcome", "failed");
 		const firstCell = canvas.getAllByRole("button", {
 			name: /gpt-5-mini/,
 		})[0];
@@ -103,6 +116,14 @@ export const DrilldownMenu: Story = {
 		const firstCell = canvas.getAllByRole("button", {
 			name: /gpt-5-mini/,
 		})[0];
+		const secondCell = canvas.getAllByRole("button", {
+			name: /gpt-5-mini/,
+		})[1];
+		const firstCellBox = firstCell.getBoundingClientRect();
+		const secondCellBox = secondCell.getBoundingClientRect();
+		await expect(
+			Math.abs(firstCellBox.right - secondCellBox.left),
+		).toBeLessThan(0.5);
 		await userEvent.pointer({ target: firstCell, keys: "[MouseRight]" });
 		await userEvent.click(body.getByRole("menuitem", { name: "查看失败调用" }));
 		await expect(args.onOpenCalls).toHaveBeenCalledWith(

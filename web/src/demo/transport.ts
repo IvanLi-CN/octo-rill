@@ -806,11 +806,9 @@ function buildAdminDashboardResponse(
 			},
 		],
 		llm_health: {
-			calls_24h: model.adminJobs.llmCalls.length,
-			failed_24h: model.adminJobs.llmCalls.filter(
-				(call) => call.status === "failed",
-			).length,
-			last_failure_at: null,
+			calls_24h: model.adminJobs.llmStatus.calls_24h,
+			failed_24h: model.adminJobs.llmStatus.failed_24h,
+			last_failure_at: model.adminJobs.llmStatus.last_failure_at,
 			top_failure_reasons: [],
 			top_failure_sources: [],
 		},

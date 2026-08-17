@@ -130,6 +130,214 @@ test("demo mode skips live warm auth seed on first paint", async ({ page }) => {
 	).toBe(false);
 });
 
+test("demo LLM activity buckets drill into matching call records", async ({
+	page,
+}) => {
+	await page.goto(
+		"/admin/jobs/llm?demo=admin-jobs-running&d_persona=admin&d_controls=hidden",
+	);
+
+	const grid = page.getByTestId("llm-activity-grid");
+	const colorLegend = grid.getByRole("list", {
+		name: "活动图颜色图例",
+	});
+	await expect(colorLegend).toContainText("调用量低至高");
+	await expect(colorLegend).toContainText("含失败");
+	await expect(colorLegend).toContainText("全部失败");
+	await expect(
+		grid
+			.getByRole("button", {
+				name: /gpt-5-mini，成功 0，失败 3/,
+			})
+			.first(),
+	).toHaveAttribute("data-activity-outcome", "failed");
+	const retiredModelBucket = grid.getByRole("button", {
+		name: /retired-summary-model，成功 2，失败 1/,
+	});
+	await expect(retiredModelBucket).toBeVisible({ timeout: 15_000 });
+	await retiredModelBucket.click({ button: "right" });
+	await page.getByRole("menuitem", { name: "查看全部调用" }).click();
+
+	const results = page.getByRole("region", { name: "LLM 调用记录结果" });
+	await expect(results).toContainText("共 3 条调用");
+	await expect(results.getByText("模型：retired-summary-model")).toHaveCount(3);
+	await expect(results.getByText("成功", { exact: true })).toHaveCount(2);
+	await expect(results.getByText("失败", { exact: true })).toHaveCount(1);
+
+	const consistency = await page.evaluate(async () => {
+		type Call = {
+			status: string;
+			model: string;
+			scheduler_wait_ms: number;
+			duration_ms: number | null;
+			created_at: string;
+			finished_at: string | null;
+			updated_at: string;
+		};
+		const marker = "__demo_runtime=1";
+		const [activity, callsResponse, status] = await Promise.all([
+			fetch(`/api/admin/jobs/llm/activity?${marker}`).then((response) =>
+				response.json(),
+			) as Promise<{
+				buckets: {
+					started_at: string;
+					ended_at: string;
+					counts: { model: string; succeeded: number; failed: number }[];
+				}[];
+			}>,
+			fetch(`/api/admin/jobs/llm/calls?${marker}&page_size=1000`).then(
+				(response) => response.json(),
+			) as Promise<{ items: Call[]; total: number }>,
+			fetch(`/api/admin/jobs/llm/status?${marker}`).then((response) =>
+				response.json(),
+			) as Promise<{
+				max_concurrency: number;
+				available_slots: number;
+				waiting_calls: number;
+				in_flight_calls: number;
+				calls_24h: number;
+				failed_24h: number;
+				avg_wait_ms_24h: number | null;
+				avg_duration_ms_24h: number | null;
+				last_success_at: string | null;
+				last_failure_at: string | null;
+				model_statuses: { model: string; priority: number }[];
+			}>,
+		]);
+		const calls = callsResponse.items;
+		const activityMismatches = activity.buckets.flatMap((bucket) => {
+			const from = new Date(bucket.started_at).getTime();
+			const before = new Date(bucket.ended_at).getTime();
+			return bucket.counts.flatMap((count) => {
+				const matching = calls.filter((call) => {
+					const finishedAt = new Date(
+						call.finished_at ?? call.updated_at ?? call.created_at,
+					).getTime();
+					return (
+						call.model === count.model &&
+						finishedAt >= from &&
+						finishedAt < before
+					);
+				});
+				const succeeded = matching.filter(
+					(call) => call.status === "succeeded",
+				).length;
+				const failed = matching.filter(
+					(call) => call.status === "failed",
+				).length;
+				return succeeded === count.succeeded && failed === count.failed
+					? []
+					: [
+							`${bucket.started_at}:${count.model}:${succeeded}/${failed}!=${count.succeeded}/${count.failed}`,
+						];
+			});
+		});
+		const demoNow = new Date("2026-07-08T10:30:00+08:00").getTime();
+		const recentCutoff = demoNow - 24 * 60 * 60 * 1000;
+		const recentCalls = calls.filter((call) => {
+			const createdAt = new Date(call.created_at).getTime();
+			return createdAt >= recentCutoff && createdAt <= demoNow;
+		});
+		const average = (values: number[]) =>
+			values.length === 0
+				? null
+				: Math.round(
+						values.reduce((sum, value) => sum + value, 0) / values.length,
+					);
+		const latest = (targetStatus: string) =>
+			calls
+				.filter((call) => call.status === targetStatus && call.finished_at)
+				.map((call) => call.finished_at as string)
+				.sort((left, right) => right.localeCompare(left))[0] ?? null;
+		const waitingCalls = calls.filter(
+			(call) => call.status === "queued",
+		).length;
+		const inFlightCalls = calls.filter(
+			(call) => call.status === "running",
+		).length;
+		const configuredModels = [...status.model_statuses].sort(
+			(left, right) => left.priority - right.priority,
+		);
+		const routingMismatches = calls.flatMap((call) => {
+			const modelIndex = configuredModels.findIndex(
+				(model) => model.model === call.model,
+			);
+			if (modelIndex <= 0 || !call.finished_at) return [];
+			const finishedAt = new Date(call.finished_at).getTime();
+			return configuredModels.slice(0, modelIndex).flatMap((higherModel) => {
+				const precedingHigherCalls = calls
+					.filter(
+						(candidate) =>
+							candidate.model === higherModel.model &&
+							candidate.finished_at !== null &&
+							new Date(candidate.finished_at).getTime() < finishedAt,
+					)
+					.sort(
+						(left, right) =>
+							new Date(right.finished_at as string).getTime() -
+							new Date(left.finished_at as string).getTime(),
+					);
+				const consecutiveFailures = precedingHigherCalls.findIndex(
+					(candidate) => candidate.status !== "failed",
+				);
+				const failureCount =
+					consecutiveFailures === -1
+						? precedingHigherCalls.length
+						: consecutiveFailures;
+				const latestFailureAt = precedingHigherCalls[0]?.finished_at
+					? new Date(precedingHigherCalls[0].finished_at).getTime()
+					: null;
+				return failureCount >= 3 &&
+					latestFailureAt !== null &&
+					finishedAt - latestFailureAt <= 10 * 60 * 1000
+					? []
+					: [
+							`${call.id}:${higherModel.model}:${failureCount}:${latestFailureAt ?? "none"}`,
+						];
+			});
+		});
+		return {
+			activityMismatches,
+			routingMismatches,
+			listedTotalMatches: callsResponse.total === calls.length,
+			statusSummary: {
+				available_slots: status.available_slots,
+				waiting_calls: status.waiting_calls,
+				in_flight_calls: status.in_flight_calls,
+				calls_24h: status.calls_24h,
+				failed_24h: status.failed_24h,
+				avg_wait_ms_24h: status.avg_wait_ms_24h,
+				avg_duration_ms_24h: status.avg_duration_ms_24h,
+				last_success_at: status.last_success_at,
+				last_failure_at: status.last_failure_at,
+			},
+			expectedStatusSummary: {
+				available_slots: Math.max(0, status.max_concurrency - inFlightCalls),
+				waiting_calls: waitingCalls,
+				in_flight_calls: inFlightCalls,
+				calls_24h: recentCalls.length,
+				failed_24h: recentCalls.filter((call) => call.status === "failed")
+					.length,
+				avg_wait_ms_24h: average(
+					recentCalls.map((call) => call.scheduler_wait_ms),
+				),
+				avg_duration_ms_24h: average(
+					recentCalls.flatMap((call) =>
+						call.duration_ms === null ? [] : [call.duration_ms],
+					),
+				),
+				last_success_at: latest("succeeded"),
+				last_failure_at: latest("failed"),
+			},
+		};
+	});
+
+	expect(consistency.activityMismatches).toEqual([]);
+	expect(consistency.routingMismatches).toEqual([]);
+	expect(consistency.listedTotalMatches).toBe(true);
+	expect(consistency.statusSummary).toEqual(consistency.expectedStatusSummary);
+});
+
 test("demo worker ignores unmarked live requests in regular dev builds", async ({
 	page,
 }) => {
