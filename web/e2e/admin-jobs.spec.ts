@@ -3170,6 +3170,7 @@ test("admin ignores stale llm refresh errors after filter change", async ({
 	await expect(
 		page.getByRole("combobox", { name: "LLM 调用状态筛选" }),
 	).toBeVisible();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
 	const refreshButton = page.getByRole("button", { name: "刷新" });
 	await refreshButton.click();
 	await page.getByRole("combobox", { name: "LLM 调用状态筛选" }).click();
