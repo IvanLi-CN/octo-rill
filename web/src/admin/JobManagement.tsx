@@ -30,7 +30,6 @@ import {
 	type AdminJobsPrimaryTab,
 	type AdminJobsRouteState,
 	type LlmCallRouteFilters,
-	type LlmCallTimeField,
 	type TranslationViewTab,
 } from "@/admin/jobsRouteState";
 import {
@@ -3669,9 +3668,10 @@ export function JobManagement({
 		routeLlmCallFilters.model !== "" ||
 		routeLlmCallFilters.source !== "" ||
 		routeLlmCallFilters.requestedBy !== "" ||
-		routeLlmCallFilters.timeField !== "started" ||
-		routeLlmCallFilters.timeFrom !== "" ||
-		routeLlmCallFilters.timeTo !== "";
+		routeLlmCallFilters.startedFrom !== "" ||
+		routeLlmCallFilters.startedTo !== "" ||
+		routeLlmCallFilters.finishedFrom !== "" ||
+		routeLlmCallFilters.finishedBefore !== "";
 	const [overview, setOverview] = useState<AdminJobsOverviewResponse | null>(
 		null,
 	);
@@ -3772,7 +3772,8 @@ export function JobManagement({
 	const [llmRequestedByFilter, setLlmRequestedByFilter] = useState("");
 	const [llmStartedFromFilter, setLlmStartedFromFilter] = useState("");
 	const [llmStartedToFilter, setLlmStartedToFilter] = useState("");
-	const [llmTimeField, setLlmTimeField] = useState<LlmCallTimeField>("started");
+	const [llmFinishedFromFilter, setLlmFinishedFromFilter] = useState("");
+	const [llmFinishedBeforeFilter, setLlmFinishedBeforeFilter] = useState("");
 	const [llmCalls, setLlmCalls] = useState<AdminLlmCallItem[]>([]);
 	const [llmCallTotal, setLlmCallTotal] = useState(0);
 	const [llmCallPage, setLlmCallPage] = useState(1);
@@ -3979,18 +3980,22 @@ export function JobManagement({
 		setLlmModelFilter(routeLlmCallFilters.model);
 		setLlmSourceFilter(routeLlmCallFilters.source);
 		setLlmRequestedByFilter(routeLlmCallFilters.requestedBy);
-		setLlmStartedFromFilter(utcToLocalInput(routeLlmCallFilters.timeFrom));
-		setLlmStartedToFilter(utcToLocalInput(routeLlmCallFilters.timeTo));
-		setLlmTimeField(routeLlmCallFilters.timeField);
+		setLlmStartedFromFilter(utcToLocalInput(routeLlmCallFilters.startedFrom));
+		setLlmStartedToFilter(utcToLocalInput(routeLlmCallFilters.startedTo));
+		setLlmFinishedFromFilter(utcToLocalInput(routeLlmCallFilters.finishedFrom));
+		setLlmFinishedBeforeFilter(
+			utcToLocalInput(routeLlmCallFilters.finishedBefore),
+		);
 		setLlmCallPage(1);
 	}, [
 		routeLlmCallFilters.model,
 		routeLlmCallFilters.requestedBy,
 		routeLlmCallFilters.source,
 		routeLlmCallFilters.status,
-		routeLlmCallFilters.timeField,
-		routeLlmCallFilters.timeFrom,
-		routeLlmCallFilters.timeTo,
+		routeLlmCallFilters.startedFrom,
+		routeLlmCallFilters.startedTo,
+		routeLlmCallFilters.finishedBefore,
+		routeLlmCallFilters.finishedFrom,
 	]);
 
 	const updateLlmCallRouteFilters = useCallback(
@@ -4026,12 +4031,10 @@ export function JobManagement({
 					model: target.model,
 					source: "",
 					requestedBy: "",
-					timeField:
-						target.finishedFrom || target.finishedBefore
-							? "finished"
-							: "started",
-					timeFrom: target.finishedFrom ?? "",
-					timeTo: target.finishedBefore ?? "",
+					startedFrom: "",
+					startedTo: "",
+					finishedFrom: target.finishedFrom ?? "",
+					finishedBefore: target.finishedBefore ?? "",
 				},
 				{ replace: false },
 			);
@@ -4631,19 +4634,15 @@ export function JobManagement({
 				if (requestedBy) {
 					params.set("requested_by", requestedBy);
 				}
-				const timeFromUtc = localInputToUtc(llmStartedFromFilter);
-				if (timeFromUtc) {
-					params.set(
-						llmTimeField === "finished" ? "finished_from" : "started_from",
-						timeFromUtc,
-					);
-				}
-				const timeToUtc = localInputToUtc(llmStartedToFilter);
-				if (timeToUtc) {
-					params.set(
-						llmTimeField === "finished" ? "finished_before" : "started_to",
-						timeToUtc,
-					);
+				const startedFromUtc = localInputToUtc(llmStartedFromFilter);
+				if (startedFromUtc) params.set("started_from", startedFromUtc);
+				const startedToUtc = localInputToUtc(llmStartedToFilter);
+				if (startedToUtc) params.set("started_to", startedToUtc);
+				const finishedFromUtc = localInputToUtc(llmFinishedFromFilter);
+				if (finishedFromUtc) params.set("finished_from", finishedFromUtc);
+				const finishedBeforeUtc = localInputToUtc(llmFinishedBeforeFilter);
+				if (finishedBeforeUtc) {
+					params.set("finished_before", finishedBeforeUtc);
 				}
 				const res = await apiGetAdminLlmCalls(params);
 				if (requestId !== llmCallsRequestIdRef.current) {
@@ -4682,7 +4681,8 @@ export function JobManagement({
 			llmRequestedByFilter,
 			llmStartedFromFilter,
 			llmStartedToFilter,
-			llmTimeField,
+			llmFinishedFromFilter,
+			llmFinishedBeforeFilter,
 		],
 	);
 
@@ -6409,19 +6409,26 @@ export function JobManagement({
 									<div className="min-w-0 flex-1">
 										<LlmCallTimeRangeFilter
 											value={{
-												timeField: llmTimeField,
-												timeFrom: llmStartedFromFilter,
-												timeTo: llmStartedToFilter,
+												startedFrom: llmStartedFromFilter,
+												startedTo: llmStartedToFilter,
+												finishedFrom: llmFinishedFromFilter,
+												finishedBefore: llmFinishedBeforeFilter,
 											}}
 											onValueChange={(nextValue) => {
-												setLlmTimeField(nextValue.timeField);
-												setLlmStartedFromFilter(nextValue.timeFrom);
-												setLlmStartedToFilter(nextValue.timeTo);
+												setLlmStartedFromFilter(nextValue.startedFrom);
+												setLlmStartedToFilter(nextValue.startedTo);
+												setLlmFinishedFromFilter(nextValue.finishedFrom);
+												setLlmFinishedBeforeFilter(nextValue.finishedBefore);
 												updateLlmCallRouteFilters(
 													{
-														timeField: nextValue.timeField,
-														timeFrom: localInputToUtc(nextValue.timeFrom),
-														timeTo: localInputToUtc(nextValue.timeTo),
+														startedFrom: localInputToUtc(nextValue.startedFrom),
+														startedTo: localInputToUtc(nextValue.startedTo),
+														finishedFrom: localInputToUtc(
+															nextValue.finishedFrom,
+														),
+														finishedBefore: localInputToUtc(
+															nextValue.finishedBefore,
+														),
 													},
 													{ replace: true },
 												);
@@ -6442,16 +6449,18 @@ export function JobManagement({
 											setLlmRequestedByFilter("");
 											setLlmStartedFromFilter("");
 											setLlmStartedToFilter("");
-											setLlmTimeField("started");
+											setLlmFinishedFromFilter("");
+											setLlmFinishedBeforeFilter("");
 											updateLlmCallRouteFilters(
 												{
 													status: "all",
 													model: "",
 													source: "",
 													requestedBy: "",
-													timeField: "started",
-													timeFrom: "",
-													timeTo: "",
+													startedFrom: "",
+													startedTo: "",
+													finishedFrom: "",
+													finishedBefore: "",
 												},
 												{ replace: true },
 											);

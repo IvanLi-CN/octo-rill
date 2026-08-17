@@ -31,35 +31,37 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-export const StartedRange: Story = {
+export const CombinedRanges: Story = {
 	args: {
 		value: {
-			timeField: "started",
-			timeFrom: "2026-08-16T09:00",
-			timeTo: "2026-08-16T12:00",
+			startedFrom: "2026-08-16T09:00",
+			startedTo: "2026-08-16T12:00",
+			finishedFrom: "2026-08-16T09:05",
+			finishedBefore: "2026-08-16T12:10",
 		},
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		const body = within(canvasElement.ownerDocument.body);
 		await userEvent.click(
-			canvas.getByRole("button", { name: "LLM 调用时间范围：开始时间" }),
+			canvas.getByRole("button", { name: "LLM 调用时间范围" }),
 		);
-		await expect(body.getByLabelText("LLM 开始时间下限")).toHaveValue(
+		await expect(body.getByLabelText("LLM 开始时间后")).toHaveValue(
 			"2026-08-16T09:00",
 		);
-		await userEvent.click(body.getByRole("combobox", { name: "LLM 时间口径" }));
-		await userEvent.click(body.getByRole("option", { name: "结束时间" }));
-		await expect(body.getByLabelText("LLM 结束时间上限（不含）")).toBeVisible();
+		await expect(body.getByLabelText("LLM 结束时间前（不含）")).toHaveValue(
+			"2026-08-16T12:10",
+		);
 	},
 };
 
 export const EmptyRange: Story = {
 	args: {
 		value: {
-			timeField: "finished",
-			timeFrom: "",
-			timeTo: "",
+			startedFrom: "",
+			startedTo: "",
+			finishedFrom: "",
+			finishedBefore: "",
 		},
 	},
 };

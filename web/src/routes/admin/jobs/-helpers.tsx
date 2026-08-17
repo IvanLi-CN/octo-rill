@@ -75,6 +75,14 @@ function sameSearch(left: AdminJobsSearchInput, right: AdminJobsSearchInput) {
 		(left.llm_source ?? undefined) === (right.llm_source ?? undefined) &&
 		(left.llm_requested_by ?? undefined) ===
 			(right.llm_requested_by ?? undefined) &&
+		(left.llm_started_from ?? undefined) ===
+			(right.llm_started_from ?? undefined) &&
+		(left.llm_started_to ?? undefined) ===
+			(right.llm_started_to ?? undefined) &&
+		(left.llm_finished_from ?? undefined) ===
+			(right.llm_finished_from ?? undefined) &&
+		(left.llm_finished_before ?? undefined) ===
+			(right.llm_finished_before ?? undefined) &&
 		(left.llm_time_field ?? undefined) ===
 			(right.llm_time_field ?? undefined) &&
 		(left.llm_time_from ?? undefined) === (right.llm_time_from ?? undefined) &&

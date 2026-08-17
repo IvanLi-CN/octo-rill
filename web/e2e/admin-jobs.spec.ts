@@ -2072,11 +2072,12 @@ test("admin can manage jobs center", async ({ page }) => {
 		page.getByRole("textbox", { name: "LLM 调用来源筛选" }),
 	).toBeVisible();
 	const timeRangeTrigger = page.getByRole("button", {
-		name: "LLM 调用时间范围：开始时间",
+		name: "LLM 调用时间范围",
 	});
 	await expect(timeRangeTrigger).toBeVisible();
 	await timeRangeTrigger.click();
-	await expect(page.getByLabel("LLM 开始时间下限")).toBeVisible();
+	await expect(page.getByLabel("LLM 开始时间后")).toBeVisible();
+	await expect(page.getByLabel("LLM 结束时间后")).toBeVisible();
 	await page.keyboard.press("Escape");
 	await expect(page.getByText("调度器状态")).toHaveCount(0);
 	await expect(page.getByText("等待 / 进行中")).toHaveCount(0);
@@ -2358,9 +2359,11 @@ test("admin drills from LLM activity and model cards into shareable call filters
 				model: search.get("llm_model"),
 				source: search.get("llm_source"),
 				requestedBy: search.get("llm_requested_by"),
-				timeField: search.get("llm_time_field"),
-				timeFrom: search.get("llm_time_from"),
-				timeTo: search.get("llm_time_to"),
+				startedFrom: search.get("llm_started_from"),
+				startedTo: search.get("llm_started_to"),
+				finishedFrom: search.get("llm_finished_from"),
+				finishedBefore: search.get("llm_finished_before"),
+				legacyField: search.get("llm_time_field"),
 			};
 		})
 		.toEqual({
@@ -2368,30 +2371,45 @@ test("admin drills from LLM activity and model cards into shareable call filters
 			model: "gpt-4o-mini",
 			source: null,
 			requestedBy: null,
-			timeField: "finished",
-			timeFrom: "2026-02-26T02:00:00.000Z",
-			timeTo: "2026-02-26T03:00:00.000Z",
+			startedFrom: null,
+			startedTo: null,
+			finishedFrom: "2026-02-26T02:00:00.000Z",
+			finishedBefore: "2026-02-26T03:00:00.000Z",
+			legacyField: null,
 		});
 	const results = page.getByRole("region", { name: "LLM 调用记录结果" });
 	await expect(results).toBeFocused();
 	await expect(page.getByText("job.api.translate_release")).toBeVisible();
-	await page
-		.getByRole("button", { name: "LLM 调用时间范围：结束时间" })
-		.click();
+	await page.getByRole("button", { name: "LLM 调用时间范围" }).click();
 	await expect
 		.poll(() =>
-			page.getByLabel("LLM 结束时间下限").evaluate((input) => {
+			page.getByLabel("LLM 结束时间后").evaluate((input) => {
 				return new Date((input as HTMLInputElement).value).toISOString();
 			}),
 		)
 		.toBe("2026-02-26T02:00:00.000Z");
 	await expect
 		.poll(() =>
-			page.getByLabel("LLM 结束时间上限（不含）").evaluate((input) => {
+			page.getByLabel("LLM 结束时间前（不含）").evaluate((input) => {
 				return new Date((input as HTMLInputElement).value).toISOString();
 			}),
 		)
 		.toBe("2026-02-26T03:00:00.000Z");
+	await page.getByLabel("LLM 开始时间后").fill("2026-02-26T01:00");
+	await expect
+		.poll(() => {
+			const search = new URL(page.url()).searchParams;
+			return {
+				startedFrom: search.get("llm_started_from"),
+				finishedFrom: search.get("llm_finished_from"),
+				finishedBefore: search.get("llm_finished_before"),
+			};
+		})
+		.toEqual({
+			startedFrom: new Date("2026-02-26T01:00").toISOString(),
+			finishedFrom: "2026-02-26T02:00:00.000Z",
+			finishedBefore: "2026-02-26T03:00:00.000Z",
+		});
 	await page.keyboard.press("Escape");
 
 	await page.goBack();
@@ -2408,11 +2426,16 @@ test("admin drills from LLM activity and model cards into shareable call filters
 			return [
 				search.get("llm_status"),
 				search.get("llm_model"),
-				search.get("llm_time_field"),
-				search.get("llm_time_to"),
+				search.get("llm_finished_from"),
+				search.get("llm_finished_before"),
 			];
 		})
-		.toEqual([null, "gpt-4o-mini", "finished", "2026-02-26T03:00:00.000Z"]);
+		.toEqual([
+			null,
+			"gpt-4o-mini",
+			"2026-02-26T02:00:00.000Z",
+			"2026-02-26T03:00:00.000Z",
+		]);
 
 	await page.getByRole("button", { name: "显示模型状态卡片" }).click();
 	await page.getByRole("button", { name: /gpt-4o-mini 的调用操作/ }).click();
@@ -2422,16 +2445,18 @@ test("admin drills from LLM activity and model cards into shareable call filters
 			const search = new URL(page.url()).searchParams;
 			return {
 				model: search.get("llm_model"),
-				timeField: search.get("llm_time_field"),
-				timeFrom: search.get("llm_time_from"),
-				timeTo: search.get("llm_time_to"),
+				startedFrom: search.get("llm_started_from"),
+				startedTo: search.get("llm_started_to"),
+				finishedFrom: search.get("llm_finished_from"),
+				finishedBefore: search.get("llm_finished_before"),
 			};
 		})
 		.toEqual({
 			model: "gpt-4o-mini",
-			timeField: null,
-			timeFrom: null,
-			timeTo: null,
+			startedFrom: null,
+			startedTo: null,
+			finishedFrom: null,
+			finishedBefore: null,
 		});
 });
 
