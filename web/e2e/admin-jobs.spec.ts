@@ -3178,7 +3178,7 @@ test("admin ignores stale llm refresh errors after filter change", async ({
 
 	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
 	await expect(refreshButton).toBeDisabled();
-	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	await expect(page.getByText("job.api.translate_release")).toBeVisible();
 	await expect(page.getByText("stale llm refresh failed")).toHaveCount(0);
 
 	await page.waitForTimeout(700);
