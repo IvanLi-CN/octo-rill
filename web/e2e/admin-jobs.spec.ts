@@ -2071,13 +2071,21 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(
 		page.getByRole("textbox", { name: "LLM 调用来源筛选" }),
 	).toBeVisible();
-	const timeRangeTrigger = page.getByRole("button", {
-		name: "LLM 调用时间范围",
+	const startedRangeTrigger = page.getByRole("button", {
+		name: "LLM 开始时间范围",
 	});
-	await expect(timeRangeTrigger).toBeVisible();
-	await timeRangeTrigger.click();
+	const finishedRangeTrigger = page.getByRole("button", {
+		name: "LLM 结束时间范围",
+	});
+	await expect(startedRangeTrigger).toBeVisible();
+	await expect(finishedRangeTrigger).toBeVisible();
+	await startedRangeTrigger.click();
 	await expect(page.getByLabel("LLM 开始时间后")).toBeVisible();
+	await expect(page.getByLabel("LLM 开始时间前")).toBeVisible();
+	await page.keyboard.press("Escape");
+	await finishedRangeTrigger.click();
 	await expect(page.getByLabel("LLM 结束时间后")).toBeVisible();
+	await expect(page.getByLabel("LLM 结束时间前（不含）")).toBeVisible();
 	await page.keyboard.press("Escape");
 	await expect(page.getByText("调度器状态")).toHaveCount(0);
 	await expect(page.getByText("等待 / 进行中")).toHaveCount(0);
@@ -2380,7 +2388,7 @@ test("admin drills from LLM activity and model cards into shareable call filters
 	const results = page.getByRole("region", { name: "LLM 调用记录结果" });
 	await expect(results).toBeFocused();
 	await expect(page.getByText("job.api.translate_release")).toBeVisible();
-	await page.getByRole("button", { name: "LLM 调用时间范围" }).click();
+	await page.getByRole("button", { name: "LLM 结束时间范围" }).click();
 	await expect
 		.poll(() =>
 			page.getByLabel("LLM 结束时间后").evaluate((input) => {
@@ -2395,6 +2403,8 @@ test("admin drills from LLM activity and model cards into shareable call filters
 			}),
 		)
 		.toBe("2026-02-26T03:00:00.000Z");
+	await page.keyboard.press("Escape");
+	await page.getByRole("button", { name: "LLM 开始时间范围" }).click();
 	await page.getByLabel("LLM 开始时间后").fill("2026-02-26T01:00");
 	await expect
 		.poll(() => {

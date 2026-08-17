@@ -6406,29 +6406,39 @@ export function JobManagement({
 									aria-label="LLM 调用用户筛选"
 								/>
 								<div className="flex min-w-0 gap-2 sm:col-span-2 xl:col-span-4">
-									<div className="min-w-0 flex-1">
+									<div className="grid min-w-0 flex-1 gap-2 sm:grid-cols-2">
 										<LlmCallTimeRangeFilter
+											label="开始时间"
 											value={{
-												startedFrom: llmStartedFromFilter,
-												startedTo: llmStartedToFilter,
-												finishedFrom: llmFinishedFromFilter,
-												finishedBefore: llmFinishedBeforeFilter,
+												from: llmStartedFromFilter,
+												to: llmStartedToFilter,
 											}}
 											onValueChange={(nextValue) => {
-												setLlmStartedFromFilter(nextValue.startedFrom);
-												setLlmStartedToFilter(nextValue.startedTo);
-												setLlmFinishedFromFilter(nextValue.finishedFrom);
-												setLlmFinishedBeforeFilter(nextValue.finishedBefore);
+												setLlmStartedFromFilter(nextValue.from);
+												setLlmStartedToFilter(nextValue.to);
 												updateLlmCallRouteFilters(
 													{
-														startedFrom: localInputToUtc(nextValue.startedFrom),
-														startedTo: localInputToUtc(nextValue.startedTo),
-														finishedFrom: localInputToUtc(
-															nextValue.finishedFrom,
-														),
-														finishedBefore: localInputToUtc(
-															nextValue.finishedBefore,
-														),
+														startedFrom: localInputToUtc(nextValue.from),
+														startedTo: localInputToUtc(nextValue.to),
+													},
+													{ replace: true },
+												);
+											}}
+										/>
+										<LlmCallTimeRangeFilter
+											label="结束时间"
+											exclusiveUpperBound
+											value={{
+												from: llmFinishedFromFilter,
+												to: llmFinishedBeforeFilter,
+											}}
+											onValueChange={(nextValue) => {
+												setLlmFinishedFromFilter(nextValue.from);
+												setLlmFinishedBeforeFilter(nextValue.to);
+												updateLlmCallRouteFilters(
+													{
+														finishedFrom: localInputToUtc(nextValue.from),
+														finishedBefore: localInputToUtc(nextValue.to),
 													},
 													{ replace: true },
 												);
