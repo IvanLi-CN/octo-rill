@@ -7075,8 +7075,8 @@ async fn load_admin_llm_activity_response(
         r#"
         SELECT id, status, model, finished_at, updated_at
         FROM llm_calls
-        WHERE COALESCE(finished_at, updated_at, created_at) >= ?
-          AND COALESCE(finished_at, updated_at, created_at) < ?
+        WHERE julianday(COALESCE(finished_at, updated_at, created_at)) >= julianday(?)
+          AND julianday(COALESCE(finished_at, updated_at, created_at)) < julianday(?)
         "#,
     )
     .bind(window_start_text.as_str())
@@ -26848,6 +26848,12 @@ mod tests {
                 "2026-08-13T09:00:00Z",
             ),
             (
+                "activity-offset",
+                "succeeded",
+                "configured-a",
+                "2026-08-13T08:30:00-01:00",
+            ),
+            (
                 "activity-failed",
                 "failed",
                 "historical-z",
@@ -26947,7 +26953,7 @@ mod tests {
             ]
         );
         let first_bucket = &response.buckets[0];
-        assert_eq!(first_bucket.counts[1].succeeded, 1);
+        assert_eq!(first_bucket.counts[1].succeeded, 2);
         let last_bucket = &response.buckets[49];
         assert_eq!(last_bucket.counts[0].succeeded, 1);
         assert_eq!(last_bucket.counts[2].succeeded, 1);

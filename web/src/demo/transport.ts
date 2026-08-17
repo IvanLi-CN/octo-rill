@@ -26,6 +26,7 @@ import type {
 import { buildDemoHref } from "@/demo/registry";
 import {
 	buildDemoOwnerReleaseFeedItem,
+	buildLlmActivityFromCalls,
 	DEMO_OWNER_RELEASE_ID,
 } from "@/demo/fixtures";
 import { hasDemoRuntimeRequestMarker } from "@/demo/requestMarker";
@@ -1752,6 +1753,23 @@ export const demoHandlers = [
 			ai_model_context_limit: number | null;
 			llm_models: string[];
 		}>;
+		const normalizedModels = payload.llm_models?.map((model) => model.trim());
+		if (
+			normalizedModels &&
+			(normalizedModels.length === 0 ||
+				normalizedModels.some((model) => model.length === 0) ||
+				new Set(normalizedModels).size !== normalizedModels.length)
+		) {
+			return HttpResponse.json(
+				{
+					error: {
+						code: "bad_request",
+						message: "llm_models must contain non-empty, unique model names",
+					},
+				},
+				{ status: 400 },
+			);
+		}
 		const access = requireRuntimeAccess();
 		access.updateModel((model) => {
 			const currentStatus = model.adminJobs.llmStatus;
@@ -1761,10 +1779,7 @@ export const demoHandlers = [
 					? payload.ai_model_context_limit
 					: null
 				: currentStatus.ai_model_context_limit;
-			const nextModels =
-				payload.llm_models && payload.llm_models.length > 0
-					? payload.llm_models
-					: currentStatus.llm_models;
+			const nextModels = normalizedModels ?? currentStatus.llm_models;
 			const nextMaxConcurrency =
 				payload.max_concurrency ?? currentStatus.max_concurrency;
 			const previousStatuses = new Map(
@@ -1784,16 +1799,36 @@ export const demoHandlers = [
 						contextLimit === null ? "builtin_catalog" : "admin_override",
 				};
 			});
-			const selectedModel =
-				nextModelStatuses.find((status) => status.status !== "cooldown")
-					?.model ?? null;
-			const selectedStatus = nextModelStatuses.find(
-				(status) => status.model === selectedModel,
-			);
+			const selectedStatus =
+				nextModelStatuses.find((status) => status.status !== "cooldown") ??
+				[...nextModelStatuses].sort((left, right) => {
+					const leftUntil = left.cooldown_until
+						? new Date(left.cooldown_until).getTime()
+						: Number.POSITIVE_INFINITY;
+					const rightUntil = right.cooldown_until
+						? new Date(right.cooldown_until).getTime()
+						: Number.POSITIVE_INFINITY;
+					return leftUntil - rightUntil || left.priority - right.priority;
+				})[0];
+			const selectedModel = selectedStatus?.model ?? null;
 			const configuredModelNames = new Set(nextModels);
 			const retiredActivityModels = model.adminJobs.llmActivity.models
 				.filter((item) => !configuredModelNames.has(item.model))
 				.map((item) => ({ ...item, priority: null, configured: false }));
+			const nextActivityModels = [
+				...nextModels.map((modelName, index) => ({
+					model: modelName,
+					priority: index + 1,
+					configured: true,
+				})),
+				...retiredActivityModels,
+			];
+			const nextActivity = buildLlmActivityFromCalls(
+				model.adminJobs.llmCalls,
+				new Date(model.adminJobs.llmActivity.window_started_at),
+				new Date(model.adminJobs.llmActivity.window_ended_at),
+				nextActivityModels,
+			);
 			return {
 				...model,
 				adminJobs: {
@@ -1816,15 +1851,7 @@ export const demoHandlers = [
 						model_statuses: nextModelStatuses,
 					},
 					llmActivity: {
-						...model.adminJobs.llmActivity,
-						models: [
-							...nextModels.map((modelName, index) => ({
-								model: modelName,
-								priority: index + 1,
-								configured: true,
-							})),
-							...retiredActivityModels,
-						],
+						...nextActivity,
 					},
 				},
 			};

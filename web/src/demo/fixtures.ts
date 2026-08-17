@@ -844,17 +844,18 @@ function buildHistoricalLlmCalls(
 	}).flat();
 }
 
-function buildLlmActivityFromCalls(
+export function buildLlmActivityFromCalls(
 	llmCalls: AdminLlmCallItem[],
 	activityWindowStart: Date,
 	activityWindowEnd: Date,
+	models: Readonly<AdminLlmActivityResponse["models"]> = LLM_ACTIVITY_MODELS,
 ): AdminLlmActivityResponse {
 	return {
 		bucket_minutes: 60,
 		bucket_count: LLM_ACTIVITY_BUCKET_COUNT,
 		window_started_at: activityWindowStart.toISOString(),
 		window_ended_at: activityWindowEnd.toISOString(),
-		models: [...LLM_ACTIVITY_MODELS],
+		models: [...models],
 		buckets: Array.from({ length: LLM_ACTIVITY_BUCKET_COUNT }, (_, index) => {
 			const bucketStartedAt = new Date(
 				activityWindowStart.getTime() + index * LLM_ACTIVITY_BUCKET_MS,
@@ -876,7 +877,7 @@ function buildLlmActivityFromCalls(
 			return {
 				started_at: bucketStartedAt.toISOString(),
 				ended_at: bucketEndedAt.toISOString(),
-				counts: LLM_ACTIVITY_MODELS.map(({ model }) => ({
+				counts: models.map(({ model }) => ({
 					model,
 					succeeded: bucketCalls.filter(
 						(call) => call.model === model && call.status === "succeeded",
@@ -938,7 +939,7 @@ function latestFinishedAt(llmCalls: AdminLlmCallItem[], status: string) {
 function buildAdminJobs(): DemoJobsModel {
 	const demoNow = new Date(NOW);
 	const activityWindowEnd = new Date(demoNow);
-	activityWindowEnd.setUTCMinutes(0, 0, 0);
+	activityWindowEnd.setUTCHours(activityWindowEnd.getUTCHours() + 1, 0, 0, 0);
 	const activityWindowStart = new Date(
 		activityWindowEnd.getTime() -
 			LLM_ACTIVITY_BUCKET_COUNT * LLM_ACTIVITY_BUCKET_MS,

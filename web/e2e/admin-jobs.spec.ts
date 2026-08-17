@@ -2494,6 +2494,10 @@ test("admin drills from LLM activity and model cards into shareable call filters
 	const results = page.getByRole("region", { name: "LLM 调用记录结果" });
 	await expect(results).toBeFocused();
 	await expect(page.getByText("job.api.translate_release")).toBeVisible();
+	await latestCell.focus();
+	await latestCell.click({ button: "right" });
+	await page.getByRole("menuitem", { name: "查看失败调用" }).click();
+	await expect(results).toBeFocused();
 	await page.getByRole("button", { name: "LLM 结束时间范围" }).click();
 	await expect(
 		page.getByRole("group", { name: "LLM 结束时间后日历" }),
