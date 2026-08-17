@@ -3812,7 +3812,17 @@ export function JobManagement({
 	const llmCallsInitialRequestInFlightRef = useRef(false);
 	const llmCallsRequestIdRef = useRef(0);
 	const llmCallResultsRef = useRef<HTMLElement>(null);
-	const llmCallResultsFocusRequestedRef = useRef(false);
+	const focusLlmCallResults = useCallback(() => {
+		window.setTimeout(() => {
+			window.requestAnimationFrame(() => {
+				llmCallResultsRef.current?.scrollIntoView({
+					behavior: "smooth",
+					block: "start",
+				});
+				llmCallResultsRef.current?.focus({ preventScroll: true });
+			});
+		}, 0);
+	}, []);
 	const detailTaskIdRef = useRef<string | null>(null);
 	const llmDetailIdRef = useRef<string | null>(null);
 	const activeTaskDrawerLlmCallIdRef = useRef<string | null>(null);
@@ -4014,7 +4024,6 @@ export function JobManagement({
 
 	const openLlmCallInvestigation = useCallback(
 		(target: LlmCallDrilldown & { status: "all" | "failed" }) => {
-			llmCallResultsFocusRequestedRef.current = true;
 			updateLlmCallRouteFilters(
 				{
 					status: target.status,
@@ -4028,8 +4037,9 @@ export function JobManagement({
 				},
 				{ replace: false },
 			);
+			focusLlmCallResults();
 		},
-		[updateLlmCallRouteFilters],
+		[focusLlmCallResults, updateLlmCallRouteFilters],
 	);
 
 	useEffect(() => {
@@ -4641,16 +4651,6 @@ export function JobManagement({
 				setLlmCalls(sortLlmCallsForDisplay(res.items));
 				setLlmCallTotal(res.total);
 				llmCallsLoadedOnceRef.current = true;
-				if (llmCallResultsFocusRequestedRef.current) {
-					llmCallResultsFocusRequestedRef.current = false;
-					window.requestAnimationFrame(() => {
-						llmCallResultsRef.current?.scrollIntoView({
-							behavior: "smooth",
-							block: "start",
-						});
-						llmCallResultsRef.current?.focus({ preventScroll: true });
-					});
-				}
 			} catch (err) {
 				if (requestId !== llmCallsRequestIdRef.current) {
 					return;

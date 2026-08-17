@@ -179,6 +179,7 @@ test("demo LLM activity buckets drill into matching call records", async ({
 			fetch(`/api/admin/jobs/llm/activity?${marker}`).then((response) =>
 				response.json(),
 			) as Promise<{
+				window_ended_at: string;
 				buckets: {
 					started_at: string;
 					ended_at: string;
@@ -319,6 +320,7 @@ test("demo LLM activity buckets drill into matching call records", async ({
 		});
 		return {
 			activityMismatches,
+			windowEnd: activity.window_ended_at,
 			routingMismatches,
 			listedTotalMatches: callsResponse.total === calls.length,
 			pageSize: callsResponse.page_size,
@@ -358,6 +360,7 @@ test("demo LLM activity buckets drill into matching call records", async ({
 	});
 
 	expect(consistency.activityMismatches).toEqual([]);
+	expect(consistency.windowEnd).toBe("2026-07-08T03:00:00.000Z");
 	expect(consistency.routingMismatches).toEqual([]);
 	expect(consistency.listedTotalMatches).toBe(true);
 	expect(consistency.pageSize).toBe(100);
@@ -366,6 +369,15 @@ test("demo LLM activity buckets drill into matching call records", async ({
 
 	const runtimeUpdate = await page.evaluate(async () => {
 		const marker = "__demo_runtime=1";
+		const invalidModelStatuses = await Promise.all(
+			[[], [""], ["gpt-5-mini", "gpt-5-mini"]].map((llm_models) =>
+				fetch(`/api/admin/jobs/llm/runtime-config?${marker}`, {
+					method: "PATCH",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ llm_models }),
+				}).then((response) => response.status),
+			),
+		);
 		const status = await fetch(`/api/admin/jobs/llm/runtime-config?${marker}`, {
 			method: "PATCH",
 			headers: { "content-type": "application/json" },
@@ -378,7 +390,8 @@ test("demo LLM activity buckets drill into matching call records", async ({
 		const activity = await fetch(`/api/admin/jobs/llm/activity?${marker}`).then(
 			(response) => response.json(),
 		);
-		return { status, activity } as {
+		return { invalidModelStatuses, status, activity } as {
+			invalidModelStatuses: number[];
 			status: {
 				max_concurrency: number;
 				ai_model_context_limit: number | null;
@@ -400,10 +413,14 @@ test("demo LLM activity buckets drill into matching call records", async ({
 					priority: number | null;
 					configured: boolean;
 				}[];
+				buckets: {
+					counts: { model: string; succeeded: number; failed: number }[];
+				}[];
 			};
 		};
 	});
 
+	expect(runtimeUpdate.invalidModelStatuses).toEqual([400, 400, 400]);
 	expect(runtimeUpdate.status).toMatchObject({
 		max_concurrency: 3,
 		ai_model_context_limit: null,
@@ -432,6 +449,16 @@ test("demo LLM activity buckets drill into matching call records", async ({
 		{ model: "gpt-4.1-mini", priority: 1, configured: true },
 		{ model: "gpt-5-mini", priority: 2, configured: true },
 	]);
+	const runtimeActivityModels = runtimeUpdate.activity.models.map(
+		(model) => model.model,
+	);
+	expect(
+		runtimeUpdate.activity.buckets.every(
+			(bucket) =>
+				JSON.stringify(bucket.counts.map((count) => count.model)) ===
+				JSON.stringify(runtimeActivityModels),
+		),
+	).toBe(true);
 });
 
 test("demo worker ignores unmarked live requests in regular dev builds", async ({
