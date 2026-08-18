@@ -1851,12 +1851,20 @@ export const demoHandlers = [
 			const nextModelStatuses = nextModels.map((modelName, index) => {
 				const previous = previousStatuses.get(modelName);
 				const builtinLimit = modelName === "gpt-4.1-mini" ? 1047576 : 128000;
+				const cooldownUntil = previous?.cooldown_until ?? null;
+				const cooldownUntilAt = cooldownUntil
+					? Date.parse(cooldownUntil)
+					: Number.NaN;
+				const isCoolingDown =
+					previous?.status === "cooldown" &&
+					Number.isFinite(cooldownUntilAt) &&
+					cooldownUntilAt > Date.now();
 				return {
 					model: modelName,
 					priority: index + 1,
-					status: previous?.status === "cooldown" ? "cooldown" : "ready",
+					status: isCoolingDown ? "cooldown" : "ready",
 					consecutive_final_failures: previous?.consecutive_final_failures ?? 0,
-					cooldown_until: previous?.cooldown_until ?? null,
+					cooldown_until: isCoolingDown ? cooldownUntil : null,
 					effective_input_limit: contextLimit ?? builtinLimit,
 					effective_input_limit_source:
 						contextLimit === null ? "builtin_catalog" : "admin_override",
