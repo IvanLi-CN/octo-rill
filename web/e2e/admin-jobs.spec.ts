@@ -2579,6 +2579,24 @@ test("admin drills from LLM activity and model cards into shareable call filters
 		page.getByRole("menuitem", { name: "查看失败调用" }),
 	).toBeVisible();
 	await page.keyboard.press("Escape");
+	await modelStatusActions.dispatchEvent("pointerdown", {
+		button: 0,
+		isPrimary: true,
+		pointerId: 1,
+		pointerType: "touch",
+	});
+	await expect(page.getByRole("menu")).toHaveCount(1);
+	await page.waitForTimeout(800);
+	await expect(page.getByRole("menu")).toHaveCount(1);
+	await page
+		.locator('button[aria-label="gpt-4o-mini 的调用操作"]')
+		.dispatchEvent("pointerup", {
+			button: 0,
+			isPrimary: true,
+			pointerId: 1,
+			pointerType: "touch",
+		});
+	await page.keyboard.press("Escape");
 	await modelStatusActions.click();
 	await page.getByRole("menuitem", { name: "查看全部调用" }).click();
 	await expect

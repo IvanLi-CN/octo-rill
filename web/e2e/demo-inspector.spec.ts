@@ -386,6 +386,15 @@ test("demo LLM activity buckets drill into matching call records", async ({
 				}).then((response) => response.status),
 			),
 		);
+		const malformedModelStatuses = await Promise.all(
+			["gpt-5-mini", [null], [1]].map((llm_models) =>
+				fetch(`/api/admin/jobs/llm/runtime-config?${marker}`, {
+					method: "PATCH",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ max_concurrency: 2, llm_models }),
+				}).then((response) => response.status),
+			),
+		);
 		const invalidRuntimeStatuses = await Promise.all(
 			[
 				{ max_concurrency: 0 },
@@ -412,16 +421,43 @@ test("demo LLM activity buckets drill into matching call records", async ({
 		const activity = await fetch(`/api/admin/jobs/llm/activity?${marker}`).then(
 			(response) => response.json(),
 		);
+		await fetch(`/api/admin/jobs/llm/runtime-config?${marker}`, {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				max_concurrency: 3,
+				llm_models: ["gpt-4.1-mini", "gpt-5-mini", "never-used"],
+			}),
+		});
+		await fetch(`/api/admin/jobs/llm/runtime-config?${marker}`, {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				max_concurrency: 3,
+				llm_models: ["gpt-4.1-mini", "gpt-5-mini"],
+			}),
+		});
+		const activityAfterUnusedModelRemoval = (await fetch(
+			`/api/admin/jobs/llm/activity?${marker}`,
+		).then((response) => response.json())) as {
+			models: { model: string; configured: boolean }[];
+		};
 		return {
 			invalidCallQueryStatuses,
 			invalidModelStatuses,
 			invalidRuntimeStatuses,
+			malformedModelStatuses,
+			retiredModelsAfterUnusedRemoval: activityAfterUnusedModelRemoval.models
+				.filter((model) => !model.configured)
+				.map((model) => model.model),
 			status,
 			activity,
 		} as {
 			invalidCallQueryStatuses: number[];
 			invalidModelStatuses: number[];
 			invalidRuntimeStatuses: number[];
+			malformedModelStatuses: number[];
+			retiredModelsAfterUnusedRemoval: string[];
 			status: {
 				max_concurrency: number;
 				ai_model_context_limit: number | null;
@@ -453,6 +489,13 @@ test("demo LLM activity buckets drill into matching call records", async ({
 	expect(runtimeUpdate.invalidCallQueryStatuses).toEqual([400, 400, 400]);
 	expect(runtimeUpdate.invalidModelStatuses).toEqual([400, 400, 400]);
 	expect(runtimeUpdate.invalidRuntimeStatuses).toEqual([400, 400, 400, 400]);
+	expect(runtimeUpdate.malformedModelStatuses).toEqual([400, 400, 400]);
+	expect(runtimeUpdate.retiredModelsAfterUnusedRemoval).toContain(
+		"retired-summary-model",
+	);
+	expect(runtimeUpdate.retiredModelsAfterUnusedRemoval).not.toContain(
+		"never-used",
+	);
 	expect(runtimeUpdate.status).toMatchObject({
 		max_concurrency: 3,
 		ai_model_context_limit: null,
