@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, within } from "storybook/test";
+import { expect, fn, userEvent, within } from "storybook/test";
 import { LlmActivityGrid } from "@/admin/LlmActivityGrid";
 import type { AdminLlmActivityResponse } from "@/api";
 
@@ -30,8 +30,9 @@ function activityFixture(): AdminLlmActivityResponse {
 					},
 					{
 						model: "gpt-4.1-mini",
-						succeeded: index === 49 ? 2 : index % 3 === 0 ? 2 : 0,
-						failed: index === 49 ? 1 : 0,
+						succeeded:
+							index === 47 ? 0 : index === 49 ? 2 : index % 3 === 0 ? 2 : 0,
+						failed: index === 47 ? 2 : index === 49 ? 1 : 0,
 					},
 					{
 						model: "retired-model",
@@ -59,6 +60,13 @@ const meta = {
 			},
 		},
 	},
+	decorators: [
+		(Story) => (
+			<div className="mx-auto min-h-80 w-full max-w-3xl rounded-md bg-zinc-200 p-6">
+				<Story />
+			</div>
+		),
+	],
 	args: {
 		data: fixture,
 		loading: false,
@@ -74,6 +82,18 @@ export const Default: Story = {
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		const body = within(canvasElement.ownerDocument.body);
+		const colorLegend = canvas.getByRole("list", {
+			name: "活动图颜色图例",
+		});
+		await expect(colorLegend).toHaveTextContent("无调用");
+		await expect(colorLegend).toHaveTextContent("调用量低至高");
+		await expect(colorLegend).toHaveTextContent("含失败");
+		await expect(colorLegend).toHaveTextContent("全部失败");
+		await expect(
+			canvas.getByRole("button", {
+				name: /gpt-4\.1-mini，成功 0，失败 2/,
+			}),
+		).toHaveAttribute("data-activity-outcome", "failed");
 		const firstCell = canvas.getAllByRole("button", {
 			name: /gpt-5-mini/,
 		})[0];
@@ -83,6 +103,41 @@ export const Default: Story = {
 		await expect(body.getByTestId("llm-activity-summary")).toBeVisible();
 		await userEvent.keyboard("{Escape}");
 		await expect(body.queryByTestId("llm-activity-summary")).toBeNull();
+	},
+};
+
+export const DrilldownMenu: Story = {
+	args: {
+		onOpenCalls: fn(),
+	},
+	play: async ({ canvasElement, args }) => {
+		const canvas = within(canvasElement);
+		const body = within(canvasElement.ownerDocument.body);
+		const firstCell = canvas.getAllByRole("button", {
+			name: /gpt-5-mini/,
+		})[0];
+		const secondCell = canvas.getAllByRole("button", {
+			name: /gpt-5-mini/,
+		})[1];
+		const firstCellBox = firstCell.getBoundingClientRect();
+		const secondCellBox = secondCell.getBoundingClientRect();
+		await expect(
+			Math.abs(firstCellBox.right - secondCellBox.left),
+		).toBeLessThan(0.5);
+		await userEvent.pointer({ target: firstCell, keys: "[MouseRight]" });
+		await userEvent.click(body.getByRole("menuitem", { name: "查看失败调用" }));
+		await expect(args.onOpenCalls).toHaveBeenCalledWith(
+			expect.objectContaining({
+				model: "gpt-5-mini",
+				status: "failed",
+			}),
+		);
+		firstCell.focus();
+		await userEvent.keyboard("{ContextMenu}");
+		await expect(
+			body.getByRole("menuitem", { name: "查看全部调用" }),
+		).toBeVisible();
+		await userEvent.keyboard("{Escape}");
 	},
 };
 

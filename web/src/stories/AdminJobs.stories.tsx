@@ -2246,15 +2246,25 @@ function AdminJobsPreview({
 				req.method === "GET"
 			) {
 				const status = url.searchParams.get("status");
+				const model = url.searchParams.get("model");
 				const source = url.searchParams.get("source");
 				const requestedBy = url.searchParams.get("requested_by");
 				const parentTaskId = url.searchParams.get("parent_task_id");
+				const startedFrom = url.searchParams.get("started_from");
+				const startedTo = url.searchParams.get("started_to");
+				const finishedFrom = url.searchParams.get("finished_from");
+				const finishedBefore = url.searchParams.get("finished_before");
+				const timestamp = (value: string | null | undefined) =>
+					value ? new Date(value).getTime() : Number.NaN;
 				let rows = [...llmCalls];
 				if (status && status !== "all") {
 					rows = rows.filter((item) => item.status === status);
 				}
 				if (source) {
 					rows = rows.filter((item) => item.source === source);
+				}
+				if (model) {
+					rows = rows.filter((item) => item.model === model);
 				}
 				if (requestedBy) {
 					rows = rows.filter(
@@ -2264,6 +2274,22 @@ function AdminJobsPreview({
 				if (parentTaskId) {
 					rows = rows.filter((item) => item.parent_task_id === parentTaskId);
 				}
+				rows = rows.filter((item) => {
+					const startedAt = timestamp(item.started_at ?? item.created_at);
+					const finishedAt = timestamp(
+						item.finished_at ?? item.updated_at ?? item.created_at,
+					);
+					const startedFromAt = timestamp(startedFrom);
+					const startedToAt = timestamp(startedTo);
+					const finishedFromAt = timestamp(finishedFrom);
+					const finishedBeforeAt = timestamp(finishedBefore);
+					return (
+						(Number.isNaN(startedFromAt) || startedAt >= startedFromAt) &&
+						(Number.isNaN(startedToAt) || startedAt <= startedToAt) &&
+						(Number.isNaN(finishedFromAt) || finishedAt >= finishedFromAt) &&
+						(Number.isNaN(finishedBeforeAt) || finishedAt < finishedBeforeAt)
+					);
+				});
 				const page = url.searchParams.get("page");
 				const pageSize = url.searchParams.get("page_size");
 				const { pageItems, total } = paginate(rows, page, pageSize);

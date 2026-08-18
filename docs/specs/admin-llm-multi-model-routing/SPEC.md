@@ -125,6 +125,10 @@
 - 聚合窗不接收指针事件。文档级命中检测将网格与上一帧浮窗矩形视为同一安全区，指针进入浮窗区域时保留最后的有效位置，只有离开两者后才关闭；点击固定，外部点击或 Escape 关闭。
 - 浮窗和活动网格在矮视口中均受限于 `min(30vh, 12rem)` 的最大高度并仅允许纵向滚动，避免模型数量增长时浮窗越出视口或覆盖活动区域。
 - 图表拥有独立的首次加载、错误、重试和后台刷新状态；SSE 或手动刷新期间保留旧网格，直到新响应到达。
+- 网格单元格和模型状态卡片均提供“查看失败调用”与“查看全部调用”操作。网格操作带入精确模型及该桶终态时间的 `[started_at, ended_at)` 范围；状态卡片仅带入精确模型，并使用调用记录既有七日保留期。
+- 排障跳转必须清空来源、请求用户、旧状态、旧时间和分页等冲突筛选，再设置目标状态、模型和时间范围；跳转将完整筛选写入 URL 并新增一条浏览器历史记录，加载后将焦点移动到调用记录结果区域。
+- 调用列表筛选状态由 URL 恢复：`llm_status`、`llm_model`、`llm_source`、`llm_requested_by`、`llm_started_from`、`llm_started_to`、`llm_finished_from`、`llm_finished_before`。时间值使用 UTC RFC3339；开始时间与结束时间范围可同时生效，并由两个彼此独立的一体化范围控件呈现，每个控件只负责一个时间口径。桌面端直接呈现筛选工具栏；窄屏主界面仅呈现一个筛选入口，状态、模型、来源、用户与两个时间范围入口集中在右侧抽屉中。范围控件由单一触发器打开统一面板；桌面端在面板内并列呈现两个独立端点子面板，每个子面板拥有自己的日期网格、月份导航、小时和分钟选择；窄屏保留边界输入行但一次只展示当前端点子面板，不使用浏览器原生 `datetime-local`。窄屏进入时间范围时，右侧筛选抽屉必须保持打开，时间面板在同一个筛选对话框内从底部覆盖展开；关闭时间面板后直接返回筛选字段，不得创建第二个 Sheet、第二个对话框或额外的焦点陷阱。开始时间上限保持包含语义，结束时间上限为“结束时间前”的排他语义。历史单口径参数 `llm_time_field`、`llm_time_from`、`llm_time_to` 必须可解析，并在 URL 规范化时迁移到对应的新参数。
+- 调用列表支持精确模型筛选和终态时间范围。终态时间统一按 `COALESCE(finished_at, updated_at, created_at)` 计算，`finished_from` 为包含下限，`finished_before` 为排他上限；持久化记录和 runtime override 合并后必须遵循同一筛选与分页语义。
 
 ## 接口契约（Interfaces & Contracts）
 
@@ -134,6 +138,7 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | `GET /api/admin/jobs/llm/status` | HTTP API | external | Modify | `./contracts/http-apis.md` | backend | web-admin |
 | `GET /api/admin/jobs/llm/activity` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web-admin |
+| `GET /api/admin/jobs/llm/calls` | HTTP API | external | Modify | `./contracts/http-apis.md` | backend | web-admin |
 | `PATCH /api/admin/jobs/llm/runtime-config` | HTTP API | external | Modify | `./contracts/http-apis.md` | backend | web-admin |
 | `admin_runtime_settings.llm_models_json` | DB schema | internal | New | `./contracts/db.md` | backend | backend |
 | LLM runtime model health state | Runtime contract | internal | New | `./contracts/db.md` | backend | backend |
@@ -158,6 +163,14 @@
   When 发起新的 LLM 请求
   Then 该请求使用 `A`，并在整次内部重试周期中保持使用 `A`。
 
+- Given 管理员从活动图单元格打开失败调用
+  When 该单元格对应模型 `A` 和时间桶 `[from, before)`
+  Then 调用列表精确筛选模型 `A`、失败状态及相同终态时间范围，并可由复制后的 URL 恢复。
+
+- Given 管理员从模型状态卡片打开全部调用
+  When 目标模型为 `A`
+  Then 调用列表仅保留模型 `A` 的七日保留期记录，且来源、请求用户、旧状态、旧时间和分页筛选已清除。
+
 - Given `A` 连续 3 次“最终失败”
   When 发起新的 LLM 请求
   Then 新请求优先改用 `B`，且 `GET /api/admin/jobs/llm/status` 中 `A.status = cooldown`、`cooldown_until` 非空。
@@ -181,6 +194,10 @@
 - Given 某小时同时存在多个模型的成功与失败调用
   When 悬浮、聚焦或固定该时间列
   Then 聚合窗按模型显示精确计数、成功率和按成功计的使用率，并始终避开活动网格与视口边界；指针进入聚合窗区域不会关闭它。
+
+- Given 活动桶存在成功或失败调用
+  When 渲染活动图
+  Then 界面显示颜色图例；无调用使用中性色、无失败调用按调用量显示蓝绿色阶、部分失败使用警告色、全部失败使用错误色，且文字与聚合窗提供非颜色语义。
 
 ## 非功能性验收 / 质量门槛（Quality Gates）
 
@@ -214,6 +231,73 @@ PR: include
 
 PR: include
 ![LLM activity tooltip Storybook](./assets/llm-activity-tooltip-storybook.png)
+
+### 调用排障跳转
+
+- `ui_demo`：桌面活动桶菜单，覆盖“查看失败调用 / 查看全部调用”。
+
+PR: include
+![LLM call drilldown desktop menu](./assets/llm-call-drilldown-desktop.png)
+
+- `ui_demo`：`393x852` 移动端终态筛选和失败调用结果。
+
+PR: include
+![LLM call drilldown mobile result](./assets/llm-call-drilldown-mobile-result.png)
+
+- `ui_demo`：`393x852` 移动端显式操作菜单。
+
+PR: include
+![LLM call drilldown mobile menu](./assets/llm-call-drilldown-mobile-menu.png)
+
+- `storybook_canvas`：活动网格右键上下文菜单。
+
+PR: include
+![LLM call drilldown Storybook menu](./assets/llm-call-drilldown-storybook.png)
+
+- `ui_demo`：在两个活动格子的公共边界坐标触发右键后，仍显示调用排障菜单；格子保留视觉间距，但横向与纵向命中矩形连续且无空白热区。
+
+PR: include
+![LLM activity contiguous context menu targets](./assets/llm-activity-contiguous-context-menu.png)
+
+- `ui_demo`：活动图、调用列表和 24 小时状态汇总由同一组确定性调用记录派生。`retired-summary-model` 的 `07/06 15:00` 活动桶显示成功 `2`、失败 `1`，跳转后的同模型终态时间范围严格返回 `3` 条调用。
+
+PR: include
+![LLM demo consistent chart filter](./assets/llm-demo-consistent-chart-filter.png)
+
+PR: include
+![LLM demo consistent call drilldown](./assets/llm-demo-consistent-call-drilldown.png)
+
+### 调用时间范围控件
+
+- `ui_demo`：桌面调用时间筛选，开始时间与结束时间各自拥有独立的一体化范围控件；每个控件由单一触发器打开统一面板，首行以无可见端点标签的 `输入 ~ 输入` 形式设置边界，下面并列呈现两个日历与时间子面板。
+
+PR: include
+![LLM call time range desktop](./assets/llm-call-time-range-desktop.png)
+
+- `ui_demo`：`393x852` 移动端主界面只保留一个筛选入口；右侧筛选抽屉集中呈现状态、模型、来源、用户及开始/结束时间入口，筛选控件采用适合触屏的 `44px` 高度。
+
+PR: include
+![LLM call filters mobile drawer](./assets/llm-call-filters-mobile-drawer.png)
+
+- `ui_demo`：移动端时间面板在同一个右侧筛选对话框内从底部覆盖展开，筛选上下文保持可见；面板保留无标签 `输入 ~ 输入` 边界设置，并且一次只展示当前输入端点的日历与时间子面板。点击另一端点输入后切换面板，标准视口内无需滚动，不使用浏览器原生 `datetime-local`，也不创建第二个 Sheet 或焦点陷阱。
+
+PR: include
+![LLM call time range mobile](./assets/llm-call-time-range-mobile.png)
+
+- `storybook_canvas`：两个受控一体化范围组件分别展示开始/结束时间；结束时间控件保持排他上限语义，故事覆盖无标签边界输入行及同一面板内两个日历、月份和时分交互，并绑定 `393x852` 的底部抽屉场景。
+
+PR: include
+![LLM call time range Storybook](./assets/llm-call-time-range-storybook.png)
+
+- `ui_demo`：桌面筛选行中，状态、模型与两个时间范围触发器全部采用标准 `36px` 控件高度；范围触发器不得因摘要文本或内边距增高。
+
+PR: include
+![LLM call time range trigger height desktop](./assets/llm-call-time-range-trigger-height-desktop.png)
+
+- `storybook_canvas`：范围触发器与统一的双日历面板保持可见，组件画布的外边距已规范化。
+
+PR: include
+![LLM call time range trigger height Storybook](./assets/llm-call-time-range-trigger-height-storybook.png)
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
