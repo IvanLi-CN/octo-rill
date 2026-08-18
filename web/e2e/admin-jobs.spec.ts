@@ -2570,7 +2570,16 @@ test("admin drills from LLM activity and model cards into shareable call filters
 		]);
 
 	await page.getByRole("button", { name: "显示模型状态卡片" }).click();
-	await page.getByRole("button", { name: /gpt-4o-mini 的调用操作/ }).click();
+	const modelStatusActions = page.getByRole("button", {
+		name: /gpt-4o-mini 的调用操作/,
+	});
+	await modelStatusActions.focus();
+	await page.keyboard.press("Shift+F10");
+	await expect(
+		page.getByRole("menuitem", { name: "查看失败调用" }),
+	).toBeVisible();
+	await page.keyboard.press("Escape");
+	await modelStatusActions.click();
 	await page.getByRole("menuitem", { name: "查看全部调用" }).click();
 	await expect
 		.poll(() => {
