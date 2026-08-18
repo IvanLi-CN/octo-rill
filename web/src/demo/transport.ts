@@ -148,6 +148,52 @@ function json(data: unknown, init?: ResponseInit) {
 	});
 }
 
+function badRequest(message: string) {
+	return HttpResponse.json(
+		{ error: { code: "bad_request", message } },
+		{ status: 400 },
+	);
+}
+
+function isPositiveInteger(value: unknown, maximum = Number.MAX_SAFE_INTEGER) {
+	return (
+		typeof value === "number" &&
+		Number.isSafeInteger(value) &&
+		value > 0 &&
+		value <= maximum
+	);
+}
+
+function isRfc3339Timestamp(value: string) {
+	const match = value.match(
+		/^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|([+-])(\d{2}):(\d{2}))$/,
+	);
+	if (!match) return false;
+	const [, yearText, monthText, dayText, hourText, minuteText, secondText] =
+		match;
+	const year = Number(yearText);
+	const month = Number(monthText);
+	const day = Number(dayText);
+	const hour = Number(hourText);
+	const minute = Number(minuteText);
+	const second = Number(secondText);
+	const offsetHour = Number(match[8] ?? 0);
+	const offsetMinute = Number(match[9] ?? 0);
+	const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+	return (
+		month >= 1 &&
+		month <= 12 &&
+		day >= 1 &&
+		day <= daysInMonth &&
+		hour <= 23 &&
+		minute <= 59 &&
+		second <= 59 &&
+		offsetHour <= 23 &&
+		offsetMinute <= 59 &&
+		Number.isFinite(Date.parse(value))
+	);
+}
+
 function currentDemoVersion() {
 	return __APP_LOADED_VERSION__;
 }
@@ -1760,15 +1806,19 @@ export const demoHandlers = [
 				normalizedModels.some((model) => model.length === 0) ||
 				new Set(normalizedModels).size !== normalizedModels.length)
 		) {
-			return HttpResponse.json(
-				{
-					error: {
-						code: "bad_request",
-						message: "llm_models must contain non-empty, unique model names",
-					},
-				},
-				{ status: 400 },
+			return badRequest(
+				"llm_models must contain non-empty, unique model names",
 			);
+		}
+		if (!isPositiveInteger(payload.max_concurrency)) {
+			return badRequest("max_concurrency must be a positive integer");
+		}
+		if (
+			Object.hasOwn(payload, "ai_model_context_limit") &&
+			payload.ai_model_context_limit !== null &&
+			!isPositiveInteger(payload.ai_model_context_limit, 0xffff_ffff)
+		) {
+			return badRequest("ai_model_context_limit must be a positive integer");
 		}
 		const access = requireRuntimeAccess();
 		access.updateModel((model) => {
@@ -1868,6 +1918,9 @@ export const demoHandlers = [
 		if (network) return network;
 		let items = currentModel().adminJobs.llmCalls;
 		const status = url.searchParams.get("status") ?? "all";
+		if (!["all", "queued", "running", "succeeded", "failed"].includes(status)) {
+			return badRequest("invalid status filter");
+		}
 		const model = url.searchParams.get("model")?.trim() ?? "";
 		const source = url.searchParams.get("source")?.trim() ?? "";
 		const requestedBy = url.searchParams.get("requested_by")?.trim() ?? "";
@@ -1876,6 +1929,16 @@ export const demoHandlers = [
 		const startedTo = url.searchParams.get("started_to");
 		const finishedFrom = url.searchParams.get("finished_from");
 		const finishedBefore = url.searchParams.get("finished_before");
+		for (const [field, value] of [
+			["started_from", startedFrom],
+			["started_to", startedTo],
+			["finished_from", finishedFrom],
+			["finished_before", finishedBefore],
+		] as const) {
+			if (value?.trim() && !isRfc3339Timestamp(value.trim())) {
+				return badRequest(`${field} must be RFC3339`);
+			}
+		}
 		const timestamp = (value: string | null | undefined) =>
 			value ? new Date(value).getTime() : Number.NaN;
 		if (parentTaskId) {
@@ -1902,6 +1965,9 @@ export const demoHandlers = [
 			);
 		});
 		const sort = url.searchParams.get("sort") ?? "created_desc";
+		if (!["created_desc", "status_grouped"].includes(sort)) {
+			return badRequest("invalid sort filter");
+		}
 		const statusRank = (value: string) =>
 			value === "running" ? 0 : value === "queued" ? 1 : 2;
 		items = [...items].sort((left, right) => {

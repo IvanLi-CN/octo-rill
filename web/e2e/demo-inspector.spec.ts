@@ -369,12 +369,34 @@ test("demo LLM activity buckets drill into matching call records", async ({
 
 	const runtimeUpdate = await page.evaluate(async () => {
 		const marker = "__demo_runtime=1";
+		const invalidCallQueryStatuses = await Promise.all(
+			["status=unknown", "sort=unknown", "finished_before=not-a-timestamp"].map(
+				(query) =>
+					fetch(`/api/admin/jobs/llm/calls?${marker}&${query}`).then(
+						(response) => response.status,
+					),
+			),
+		);
 		const invalidModelStatuses = await Promise.all(
 			[[], [""], ["gpt-5-mini", "gpt-5-mini"]].map((llm_models) =>
 				fetch(`/api/admin/jobs/llm/runtime-config?${marker}`, {
 					method: "PATCH",
 					headers: { "content-type": "application/json" },
 					body: JSON.stringify({ llm_models }),
+				}).then((response) => response.status),
+			),
+		);
+		const invalidRuntimeStatuses = await Promise.all(
+			[
+				{ max_concurrency: 0 },
+				{ max_concurrency: -1 },
+				{ max_concurrency: 2, ai_model_context_limit: 0 },
+				{ max_concurrency: 2, ai_model_context_limit: 0x1_0000_0000 },
+			].map((body) =>
+				fetch(`/api/admin/jobs/llm/runtime-config?${marker}`, {
+					method: "PATCH",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify(body),
 				}).then((response) => response.status),
 			),
 		);
@@ -390,8 +412,16 @@ test("demo LLM activity buckets drill into matching call records", async ({
 		const activity = await fetch(`/api/admin/jobs/llm/activity?${marker}`).then(
 			(response) => response.json(),
 		);
-		return { invalidModelStatuses, status, activity } as {
+		return {
+			invalidCallQueryStatuses,
+			invalidModelStatuses,
+			invalidRuntimeStatuses,
+			status,
+			activity,
+		} as {
+			invalidCallQueryStatuses: number[];
 			invalidModelStatuses: number[];
+			invalidRuntimeStatuses: number[];
 			status: {
 				max_concurrency: number;
 				ai_model_context_limit: number | null;
@@ -420,7 +450,9 @@ test("demo LLM activity buckets drill into matching call records", async ({
 		};
 	});
 
+	expect(runtimeUpdate.invalidCallQueryStatuses).toEqual([400, 400, 400]);
 	expect(runtimeUpdate.invalidModelStatuses).toEqual([400, 400, 400]);
+	expect(runtimeUpdate.invalidRuntimeStatuses).toEqual([400, 400, 400, 400]);
 	expect(runtimeUpdate.status).toMatchObject({
 		max_concurrency: 3,
 		ai_model_context_limit: null,
