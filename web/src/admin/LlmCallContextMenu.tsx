@@ -1,5 +1,10 @@
 import { List, ListX, MoreHorizontal } from "lucide-react";
-import { cloneElement, type KeyboardEvent, type ReactElement } from "react";
+import {
+	cloneElement,
+	type KeyboardEvent,
+	type ReactElement,
+	useState,
+} from "react";
 import { ContextMenu, DropdownMenu } from "radix-ui";
 
 import { Button } from "@/components/ui/button";
@@ -107,8 +112,9 @@ export function LlmCallActionsMenu(props: {
 	label: string;
 }) {
 	const { target, onOpen, label } = props;
+	const [open, setOpen] = useState(false);
 	return (
-		<DropdownMenu.Root>
+		<DropdownMenu.Root open={open} onOpenChange={setOpen}>
 			<DropdownMenu.Trigger asChild>
 				<Button
 					type="button"
@@ -117,6 +123,22 @@ export function LlmCallActionsMenu(props: {
 					className="size-8"
 					aria-label={label}
 					title={label}
+					onPointerDown={(event) => event.stopPropagation()}
+					onKeyDown={(event) => {
+						if (
+							event.key !== "ContextMenu" &&
+							!(event.key === "F10" && event.shiftKey)
+						) {
+							return;
+						}
+						event.preventDefault();
+						event.stopPropagation();
+						setOpen(true);
+					}}
+					onContextMenu={(event) => {
+						event.preventDefault();
+						event.stopPropagation();
+					}}
 				>
 					<MoreHorizontal className="size-4" />
 				</Button>

@@ -1794,12 +1794,26 @@ export const demoHandlers = [
 	http.patch("/api/admin/jobs/llm/runtime-config", async ({ request }) => {
 		const network = await applyNetworkProfile(request);
 		if (network) return network;
-		const payload = (await request.json()) as Partial<{
-			max_concurrency: number;
-			ai_model_context_limit: number | null;
-			llm_models: string[];
-		}>;
-		const normalizedModels = payload.llm_models?.map((model) => model.trim());
+		const rawPayload = await request.json();
+		if (
+			!rawPayload ||
+			typeof rawPayload !== "object" ||
+			Array.isArray(rawPayload)
+		) {
+			return badRequest("request body must be an object");
+		}
+		const payload = rawPayload as Record<string, unknown>;
+		const rawModels = payload.llm_models;
+		if (
+			rawModels !== undefined &&
+			(!Array.isArray(rawModels) ||
+				rawModels.some((model) => typeof model !== "string"))
+		) {
+			return badRequest("llm_models must be an array of model names");
+		}
+		const normalizedModels = (rawModels as string[] | undefined)?.map((model) =>
+			model.trim(),
+		);
 		if (
 			normalizedModels &&
 			(normalizedModels.length === 0 ||
@@ -1830,8 +1844,7 @@ export const demoHandlers = [
 					: null
 				: currentStatus.ai_model_context_limit;
 			const nextModels = normalizedModels ?? currentStatus.llm_models;
-			const nextMaxConcurrency =
-				payload.max_concurrency ?? currentStatus.max_concurrency;
+			const nextMaxConcurrency = payload.max_concurrency as number;
 			const previousStatuses = new Map(
 				currentStatus.model_statuses.map((status) => [status.model, status]),
 			);
@@ -1862,8 +1875,19 @@ export const demoHandlers = [
 				})[0];
 			const selectedModel = selectedStatus?.model ?? null;
 			const configuredModelNames = new Set(nextModels);
+			const modelsWithWindowActivity = new Set(
+				model.adminJobs.llmActivity.buckets.flatMap((bucket) =>
+					bucket.counts
+						.filter((count) => count.succeeded + count.failed > 0)
+						.map((count) => count.model),
+				),
+			);
 			const retiredActivityModels = model.adminJobs.llmActivity.models
-				.filter((item) => !configuredModelNames.has(item.model))
+				.filter(
+					(item) =>
+						!configuredModelNames.has(item.model) &&
+						modelsWithWindowActivity.has(item.model),
+				)
 				.map((item) => ({ ...item, priority: null, configured: false }));
 			const nextActivityModels = [
 				...nextModels.map((modelName, index) => ({
