@@ -13,14 +13,22 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
 import { LlmActivityGrid } from "@/admin/LlmActivityGrid";
+import {
+	LlmCallActionsMenu,
+	LlmCallContextMenu,
+	type LlmCallDrilldown,
+} from "@/admin/LlmCallContextMenu";
+import { LlmCallFilters, type LlmStatusFilter } from "@/admin/LlmCallFilters";
 import { TranslationWorkerBoard } from "@/admin/TranslationWorkerBoard";
 import {
 	ADMIN_JOBS_BASE_PATH,
 	ADMIN_SUBSCRIPTION_SETTINGS_AUTO_OPEN_SESSION_KEY,
 	buildAdminJobsRouteUrl,
+	parseLlmCallRouteFilters,
 	parseAdminJobsRoute,
 	type AdminJobsPrimaryTab,
 	type AdminJobsRouteState,
+	type LlmCallRouteFilters,
 	type TranslationViewTab,
 } from "@/admin/jobsRouteState";
 import {
@@ -351,6 +359,14 @@ function localInputToUtc(value: string) {
 	const parsed = new Date(value);
 	if (Number.isNaN(parsed.getTime())) return "";
 	return parsed.toISOString();
+}
+
+function utcToLocalInput(value: string) {
+	if (!value) return "";
+	const parsed = new Date(value);
+	if (Number.isNaN(parsed.getTime())) return "";
+	const offset = parsed.getTimezoneOffset() * 60_000;
+	return new Date(parsed.getTime() - offset).toISOString().slice(0, 16);
 }
 
 type LlmConversationMessage = {
@@ -865,17 +881,6 @@ const REALTIME_STATUS_FILTER_OPTIONS: Array<{
 	{ value: "canceled", label: "状态：取消" },
 ];
 
-const LLM_STATUS_FILTER_OPTIONS: Array<{
-	value: LlmStatusFilter;
-	label: string;
-}> = [
-	{ value: "all", label: "状态：全部" },
-	{ value: "queued", label: "状态：排队" },
-	{ value: "running", label: "状态：运行中" },
-	{ value: "failed", label: "状态：失败" },
-	{ value: "succeeded", label: "状态：成功" },
-];
-
 function streamStatusTone(
 	status: "connecting" | "connected" | "reconnecting",
 ): BadgeTone {
@@ -1386,7 +1391,7 @@ type RealtimeStatusFilter =
 	| "succeeded"
 	| "canceled";
 
-type LlmStatusFilter = "all" | "queued" | "running" | "failed" | "succeeded";
+const DEFAULT_LLM_CALL_ROUTE_FILTERS = parseLlmCallRouteFilters({});
 
 const TASK_PAGE_SIZE = 20;
 const SCHEDULED_TASK_TYPES = new Set([
@@ -3642,6 +3647,18 @@ export function JobManagement({
 			parseAdminJobsRoute(window.location.pathname, window.location.search),
 		);
 	const routeState = controlledRouteState ?? uncontrolledRouteState;
+	const routeLlmCallFilters =
+		routeState.llmCallFilters ?? DEFAULT_LLM_CALL_ROUTE_FILTERS;
+	const latestLlmCallRouteFiltersRef = useRef(routeLlmCallFilters);
+	const hasLlmCallFilters =
+		routeLlmCallFilters.status !== "all" ||
+		routeLlmCallFilters.model !== "" ||
+		routeLlmCallFilters.source !== "" ||
+		routeLlmCallFilters.requestedBy !== "" ||
+		routeLlmCallFilters.startedFrom !== "" ||
+		routeLlmCallFilters.startedTo !== "" ||
+		routeLlmCallFilters.finishedFrom !== "" ||
+		routeLlmCallFilters.finishedBefore !== "";
 	const [overview, setOverview] = useState<AdminJobsOverviewResponse | null>(
 		null,
 	);
@@ -3737,10 +3754,13 @@ export function JobManagement({
 	const [llmSettingsSaving, setLlmSettingsSaving] = useState(false);
 	const [llmStatusFilter, setLlmStatusFilter] =
 		useState<LlmStatusFilter>("all");
+	const [llmModelFilter, setLlmModelFilter] = useState("");
 	const [llmSourceFilter, setLlmSourceFilter] = useState("");
 	const [llmRequestedByFilter, setLlmRequestedByFilter] = useState("");
 	const [llmStartedFromFilter, setLlmStartedFromFilter] = useState("");
 	const [llmStartedToFilter, setLlmStartedToFilter] = useState("");
+	const [llmFinishedFromFilter, setLlmFinishedFromFilter] = useState("");
+	const [llmFinishedBeforeFilter, setLlmFinishedBeforeFilter] = useState("");
 	const [llmCalls, setLlmCalls] = useState<AdminLlmCallItem[]>([]);
 	const [llmCallTotal, setLlmCallTotal] = useState(0);
 	const [llmCallPage, setLlmCallPage] = useState(1);
@@ -3791,6 +3811,18 @@ export function JobManagement({
 	const llmCallsLoadedOnceRef = useRef(false);
 	const llmCallsInitialRequestInFlightRef = useRef(false);
 	const llmCallsRequestIdRef = useRef(0);
+	const llmCallResultsRef = useRef<HTMLElement>(null);
+	const focusLlmCallResults = useCallback(() => {
+		window.setTimeout(() => {
+			window.requestAnimationFrame(() => {
+				llmCallResultsRef.current?.scrollIntoView({
+					behavior: "smooth",
+					block: "start",
+				});
+				llmCallResultsRef.current?.focus({ preventScroll: true });
+			});
+		}, 0);
+	}, []);
 	const detailTaskIdRef = useRef<string | null>(null);
 	const llmDetailIdRef = useRef<string | null>(null);
 	const activeTaskDrawerLlmCallIdRef = useRef<string | null>(null);
@@ -3938,6 +3970,76 @@ export function JobManagement({
 			setUncontrolledRouteState(nextRoute);
 		},
 		[onNavigateRoute],
+	);
+
+	useEffect(() => {
+		latestLlmCallRouteFiltersRef.current = routeLlmCallFilters;
+		setLlmStatusFilter(routeLlmCallFilters.status);
+		setLlmModelFilter(routeLlmCallFilters.model);
+		setLlmSourceFilter(routeLlmCallFilters.source);
+		setLlmRequestedByFilter(routeLlmCallFilters.requestedBy);
+		setLlmStartedFromFilter(utcToLocalInput(routeLlmCallFilters.startedFrom));
+		setLlmStartedToFilter(utcToLocalInput(routeLlmCallFilters.startedTo));
+		setLlmFinishedFromFilter(utcToLocalInput(routeLlmCallFilters.finishedFrom));
+		setLlmFinishedBeforeFilter(
+			utcToLocalInput(routeLlmCallFilters.finishedBefore),
+		);
+		setLlmCallPage(1);
+	}, [
+		routeLlmCallFilters.model,
+		routeLlmCallFilters.requestedBy,
+		routeLlmCallFilters.source,
+		routeLlmCallFilters.status,
+		routeLlmCallFilters.startedFrom,
+		routeLlmCallFilters.startedTo,
+		routeLlmCallFilters.finishedBefore,
+		routeLlmCallFilters.finishedFrom,
+	]);
+
+	const updateLlmCallRouteFilters = useCallback(
+		(
+			nextFilters: Partial<LlmCallRouteFilters>,
+			options?: { replace?: boolean },
+		) => {
+			setLlmCallPage(1);
+			const mergedFilters = {
+				...latestLlmCallRouteFiltersRef.current,
+				...nextFilters,
+			};
+			latestLlmCallRouteFiltersRef.current = mergedFilters;
+			navigateAdminJobsRoute(
+				{
+					primaryTab: "llm",
+					translationView,
+					taskDrawerRoute: null,
+					drawerFromTab: null,
+					subscriptionDetailTaskId: null,
+					llmCallFilters: mergedFilters,
+				},
+				options,
+			);
+		},
+		[navigateAdminJobsRoute, translationView],
+	);
+
+	const openLlmCallInvestigation = useCallback(
+		(target: LlmCallDrilldown & { status: "all" | "failed" }) => {
+			updateLlmCallRouteFilters(
+				{
+					status: target.status,
+					model: target.model,
+					source: "",
+					requestedBy: "",
+					startedFrom: "",
+					startedTo: "",
+					finishedFrom: target.finishedFrom ?? "",
+					finishedBefore: target.finishedBefore ?? "",
+				},
+				{ replace: false },
+			);
+			focusLlmCallResults();
+		},
+		[focusLlmCallResults, updateLlmCallRouteFilters],
 	);
 
 	useEffect(() => {
@@ -4522,6 +4624,9 @@ export function JobManagement({
 				params.set("sort", "status_grouped");
 				params.set("page", String(llmCallPage));
 				params.set("page_size", String(TASK_PAGE_SIZE));
+				if (llmModelFilter.trim()) {
+					params.set("model", llmModelFilter.trim());
+				}
 				if (llmSourceFilter.trim()) {
 					params.set("source", llmSourceFilter.trim());
 				}
@@ -4530,12 +4635,14 @@ export function JobManagement({
 					params.set("requested_by", requestedBy);
 				}
 				const startedFromUtc = localInputToUtc(llmStartedFromFilter);
-				if (startedFromUtc) {
-					params.set("started_from", startedFromUtc);
-				}
+				if (startedFromUtc) params.set("started_from", startedFromUtc);
 				const startedToUtc = localInputToUtc(llmStartedToFilter);
-				if (startedToUtc) {
-					params.set("started_to", startedToUtc);
+				if (startedToUtc) params.set("started_to", startedToUtc);
+				const finishedFromUtc = localInputToUtc(llmFinishedFromFilter);
+				if (finishedFromUtc) params.set("finished_from", finishedFromUtc);
+				const finishedBeforeUtc = localInputToUtc(llmFinishedBeforeFilter);
+				if (finishedBeforeUtc) {
+					params.set("finished_before", finishedBeforeUtc);
 				}
 				const res = await apiGetAdminLlmCalls(params);
 				if (requestId !== llmCallsRequestIdRef.current) {
@@ -4559,10 +4666,13 @@ export function JobManagement({
 		[
 			llmStatusFilter,
 			llmCallPage,
+			llmModelFilter,
 			llmSourceFilter,
 			llmRequestedByFilter,
 			llmStartedFromFilter,
 			llmStartedToFilter,
+			llmFinishedFromFilter,
+			llmFinishedBeforeFilter,
 		],
 	);
 
@@ -6147,51 +6257,63 @@ export function JobManagement({
 									refreshing={llmActivityRefreshing}
 									error={llmActivityError}
 									onRetry={() => void loadLlmActivity()}
+									onOpenCalls={openLlmCallInvestigation}
 								/>
 							) : llmStatus?.model_statuses?.length ? (
 								<div className="grid gap-2 lg:grid-cols-2">
 									{llmStatus.model_statuses.map((modelStatus) => (
-										<div
+										<LlmCallContextMenu
 											key={modelStatus.model}
-											className="rounded-lg border bg-card/70 p-3"
+											target={{ model: modelStatus.model }}
+											onOpen={openLlmCallInvestigation}
 										>
-											<div className="flex items-center justify-between gap-3">
-												<div className="min-w-0">
-													<p className="truncate font-mono text-sm">
-														{modelStatus.priority}. {modelStatus.model}
-													</p>
-													<p className="text-muted-foreground mt-1 text-xs">
-														{modelStatus.status === "cooldown"
-															? `冷却至 ${formatLocalDateTime(modelStatus.cooldown_until)}`
-															: "可用"}
-													</p>
+											<div className="rounded-lg border bg-card/70 p-3">
+												<div className="flex items-center justify-between gap-3">
+													<div className="min-w-0">
+														<p className="truncate font-mono text-sm">
+															{modelStatus.priority}. {modelStatus.model}
+														</p>
+														<p className="text-muted-foreground mt-1 text-xs">
+															{modelStatus.status === "cooldown"
+																? `冷却至 ${formatLocalDateTime(modelStatus.cooldown_until)}`
+																: "可用"}
+														</p>
+													</div>
+													<div className="flex shrink-0 items-center gap-1">
+														<Badge
+															variant={
+																modelStatus.status === "cooldown"
+																	? "secondary"
+																	: "outline"
+															}
+														>
+															{modelStatus.status === "cooldown"
+																? "冷却中"
+																: "就绪"}
+														</Badge>
+														<LlmCallActionsMenu
+															target={{ model: modelStatus.model }}
+															onOpen={openLlmCallInvestigation}
+															label={`${modelStatus.model} 的调用操作`}
+														/>
+													</div>
 												</div>
-												<Badge
-													variant={
-														modelStatus.status === "cooldown"
-															? "secondary"
-															: "outline"
-													}
-												>
-													{modelStatus.status === "cooldown"
-														? "冷却中"
-														: "就绪"}
-												</Badge>
+												<p className="text-muted-foreground mt-2 text-xs">
+													连续最终失败{" "}
+													{formatCount(modelStatus.consecutive_final_failures)}{" "}
+													次
+												</p>
+												<p className="text-muted-foreground mt-1 text-xs">
+													输入上限{" "}
+													{formatCount(modelStatus.effective_input_limit)}{" "}
+													tokens（
+													{formatModelInputLimitSource(
+														modelStatus.effective_input_limit_source,
+													)}
+													）
+												</p>
 											</div>
-											<p className="text-muted-foreground mt-2 text-xs">
-												连续最终失败{" "}
-												{formatCount(modelStatus.consecutive_final_failures)} 次
-											</p>
-											<p className="text-muted-foreground mt-1 text-xs">
-												输入上限{" "}
-												{formatCount(modelStatus.effective_input_limit)}{" "}
-												tokens（
-												{formatModelInputLimitSource(
-													modelStatus.effective_input_limit_source,
-												)}
-												）
-											</p>
-										</div>
+										</LlmCallContextMenu>
 									))}
 								</div>
 							) : null}
@@ -6223,193 +6345,244 @@ export function JobManagement({
 								</div>
 							</div>
 
-							<div className="grid gap-2 lg:grid-cols-[minmax(0,220px)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.35fr)]">
-								<FilterSelect
-									value={llmStatusFilter}
-									onValueChange={(nextValue) => {
-										setLlmCallPage(1);
-										setLlmStatusFilter(nextValue);
-									}}
-									options={LLM_STATUS_FILTER_OPTIONS}
-									placeholder="状态筛选"
-									ariaLabel="LLM 调用状态筛选"
-								/>
-								<Input
-									value={llmSourceFilter}
-									onChange={(event) => {
-										setLlmCallPage(1);
-										setLlmSourceFilter(event.target.value);
-									}}
-									placeholder="来源（source）"
-									aria-label="LLM 调用来源筛选"
-								/>
-								<Input
-									value={llmRequestedByFilter}
-									onChange={(event) => {
-										setLlmCallPage(1);
-										setLlmRequestedByFilter(event.target.value);
-									}}
-									placeholder="用户 NanoID（requested_by）"
-									aria-label="LLM 调用用户筛选"
-								/>
-								<div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-									<Input
-										type="datetime-local"
-										value={llmStartedFromFilter}
-										onChange={(event) => {
-											setLlmCallPage(1);
-											setLlmStartedFromFilter(event.target.value);
-										}}
-										aria-label="LLM 开始时间下限"
-										className="text-xs"
-									/>
-									<Input
-										type="datetime-local"
-										value={llmStartedToFilter}
-										onChange={(event) => {
-											setLlmCallPage(1);
-											setLlmStartedToFilter(event.target.value);
-										}}
-										aria-label="LLM 开始时间上限"
-										className="text-xs"
-									/>
-								</div>
-							</div>
+							<LlmCallFilters
+								status={llmStatusFilter}
+								onStatusChange={(nextValue) => {
+									setLlmStatusFilter(nextValue);
+									updateLlmCallRouteFilters(
+										{ status: nextValue },
+										{ replace: true },
+									);
+								}}
+								model={llmModelFilter}
+								onModelChange={(nextValue) => {
+									setLlmModelFilter(nextValue);
+									updateLlmCallRouteFilters(
+										{ model: nextValue.trim() },
+										{ replace: true },
+									);
+								}}
+								source={llmSourceFilter}
+								onSourceChange={(nextValue) => {
+									setLlmSourceFilter(nextValue);
+									updateLlmCallRouteFilters(
+										{ source: nextValue.trim() },
+										{ replace: true },
+									);
+								}}
+								requestedBy={llmRequestedByFilter}
+								onRequestedByChange={(nextValue) => {
+									setLlmRequestedByFilter(nextValue);
+									updateLlmCallRouteFilters(
+										{ requestedBy: nextValue.trim() },
+										{ replace: true },
+									);
+								}}
+								started={{
+									from: llmStartedFromFilter,
+									to: llmStartedToFilter,
+								}}
+								onStartedChange={(nextValue) => {
+									setLlmStartedFromFilter(nextValue.from);
+									setLlmStartedToFilter(nextValue.to);
+									updateLlmCallRouteFilters(
+										{
+											startedFrom: localInputToUtc(nextValue.from),
+											startedTo: localInputToUtc(nextValue.to),
+										},
+										{ replace: true },
+									);
+								}}
+								finished={{
+									from: llmFinishedFromFilter,
+									to: llmFinishedBeforeFilter,
+								}}
+								onFinishedChange={(nextValue) => {
+									setLlmFinishedFromFilter(nextValue.from);
+									setLlmFinishedBeforeFilter(nextValue.to);
+									updateLlmCallRouteFilters(
+										{
+											finishedFrom: localInputToUtc(nextValue.from),
+											finishedBefore: localInputToUtc(nextValue.to),
+										},
+										{ replace: true },
+									);
+								}}
+								hasFilters={hasLlmCallFilters}
+								onClear={() => {
+									setLlmStatusFilter("all");
+									setLlmModelFilter("");
+									setLlmSourceFilter("");
+									setLlmRequestedByFilter("");
+									setLlmStartedFromFilter("");
+									setLlmStartedToFilter("");
+									setLlmFinishedFromFilter("");
+									setLlmFinishedBeforeFilter("");
+									updateLlmCallRouteFilters(
+										{
+											status: "all",
+											model: "",
+											source: "",
+											requestedBy: "",
+											startedFrom: "",
+											startedTo: "",
+											finishedFrom: "",
+											finishedBefore: "",
+										},
+										{ replace: true },
+									);
+								}}
+							/>
 
-							<p className="text-muted-foreground text-xs">
-								共 {formatCount(llmCallTotal)} 条调用
-							</p>
-
-							<ListSurfaceShell
-								state={llmListSurface.state}
-								refreshing={llmListSurface.showRefreshing}
-								className="space-y-3"
+							<section
+								ref={llmCallResultsRef}
+								tabIndex={-1}
+								aria-label="LLM 调用记录结果"
+								className="space-y-3 scroll-mt-4 outline-none"
 							>
-								{llmListSurface.showRefreshing ? (
-									<ListRefreshingNotice label="LLM 调度更新中..." />
-								) : null}
-								{listError && llmCalls.length > 0 ? (
-									<ListInlineError
-										title="LLM 调用刷新失败"
-										summary={listError}
-										actionLabel="重试"
-										onAction={() =>
-											void Promise.all([
-												loadLlmSchedulerStatus({ background: true }),
-												loadLlmCalls({ background: true }),
-											])
-										}
-									/>
-								) : null}
-								{llmListSurface.state === "blocking-error" ? (
-									<ListBlockingErrorState
-										title="LLM 调用加载失败"
-										summary={listError ?? "当前无法读取 LLM 调用记录。"}
-										actionLabel="重试"
-										onAction={() =>
-											void Promise.all([
-												loadLlmSchedulerStatus(),
-												loadLlmCalls(),
-											])
-										}
-									/>
-								) : llmListSurface.state === "initial-loading" ? (
-									<CardListSkeleton count={4} />
-								) : llmListSurface.state === "empty" ? (
-									<ListEmptyState
-										title="暂无调用记录"
-										description="当前筛选条件下没有匹配的 LLM 调用。"
-									/>
-								) : (
-									<div className="space-y-2">
-										{llmCalls.map((call) => {
-											const tone = taskStatusTone(call.status);
-											return (
-												<div
-													key={call.id}
-													className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between"
-												>
-													<div className="min-w-0">
-														<div className="flex flex-wrap items-center gap-2">
-															<p className="font-medium text-sm">
-																{call.source}
-															</p>
-															<StatusBadge
-																label={taskStatusLabel(call.status)}
-																tone={tone}
-															/>
-														</div>
-														<p className="text-muted-foreground mt-1 text-xs">
-															模型：
-															<span className="font-mono">{call.model}</span>
-														</p>
-														<p className="text-muted-foreground mt-1 text-xs">
-															用户：{call.requested_by ?? "-"} · 重试次数：
-															{formatCount(call.attempt_count)}
-														</p>
-														<p className="text-muted-foreground mt-1 text-xs">
-															等待 {formatDurationMs(call.scheduler_wait_ms)} ·
-															首字 {formatDurationMs(call.first_token_wait_ms)}{" "}
-															· 耗时 {formatDurationMs(call.duration_ms)}
-														</p>
-														<p className="text-muted-foreground mt-1 text-xs">
-															Token 输入/输出/缓存：
-															{formatCount(call.input_tokens)} /{" "}
-															{formatCount(call.output_tokens)} /{" "}
-															{formatCount(call.cached_input_tokens)}
-														</p>
-														<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
-															ID: {call.id}
-														</p>
-													</div>
-													<div className="flex flex-wrap gap-2">
-														<Button
-															variant="outline"
-															disabled={llmCallActionsDisabled}
-															onClick={() => void onOpenLlmCallDetail(call.id)}
-														>
-															详情
-														</Button>
-													</div>
-												</div>
-											);
-										})}
-									</div>
-								)}
-							</ListSurfaceShell>
-
-							<div className="flex items-center justify-between">
 								<p className="text-muted-foreground text-xs">
-									第 {llmCallPage}/{llmCallTotalPages} 页
+									共 {formatCount(llmCallTotal)} 条调用
 								</p>
-								<div className="flex gap-2">
-									<Button
-										variant="outline"
-										size="sm"
-										disabled={llmCallPage <= 1 || llmCallsLoadPhase !== "idle"}
-										onClick={() =>
-											setLlmCallPage((prev) => Math.max(1, prev - 1))
-										}
-									>
-										上一页
-									</Button>
-									<Button
-										variant="outline"
-										size="sm"
-										disabled={
-											llmCallPage >= llmCallTotalPages ||
-											llmCallsLoadPhase !== "idle"
-										}
-										onClick={() =>
-											setLlmCallPage((prev) =>
-												Math.min(llmCallTotalPages, prev + 1),
-											)
-										}
-									>
-										下一页
-									</Button>
+
+								<ListSurfaceShell
+									state={llmListSurface.state}
+									refreshing={llmListSurface.showRefreshing}
+									className="space-y-3"
+								>
+									{llmListSurface.showRefreshing ? (
+										<ListRefreshingNotice label="LLM 调度更新中..." />
+									) : null}
+									{listError && llmCalls.length > 0 ? (
+										<ListInlineError
+											title="LLM 调用刷新失败"
+											summary={listError}
+											actionLabel="重试"
+											onAction={() =>
+												void Promise.all([
+													loadLlmSchedulerStatus({ background: true }),
+													loadLlmCalls({ background: true }),
+												])
+											}
+										/>
+									) : null}
+									{llmListSurface.state === "blocking-error" ? (
+										<ListBlockingErrorState
+											title="LLM 调用加载失败"
+											summary={listError ?? "当前无法读取 LLM 调用记录。"}
+											actionLabel="重试"
+											onAction={() =>
+												void Promise.all([
+													loadLlmSchedulerStatus(),
+													loadLlmCalls(),
+												])
+											}
+										/>
+									) : llmListSurface.state === "initial-loading" ? (
+										<CardListSkeleton count={4} />
+									) : llmListSurface.state === "empty" ? (
+										<ListEmptyState
+											title="暂无调用记录"
+											description="当前筛选条件下没有匹配的 LLM 调用。"
+										/>
+									) : (
+										<div className="space-y-2">
+											{llmCalls.map((call) => {
+												const tone = taskStatusTone(call.status);
+												return (
+													<div
+														key={call.id}
+														className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between"
+													>
+														<div className="min-w-0">
+															<div className="flex flex-wrap items-center gap-2">
+																<p className="font-medium text-sm">
+																	{call.source}
+																</p>
+																<StatusBadge
+																	label={taskStatusLabel(call.status)}
+																	tone={tone}
+																/>
+															</div>
+															<p className="text-muted-foreground mt-1 text-xs">
+																模型：
+																<span className="font-mono">{call.model}</span>
+															</p>
+															<p className="text-muted-foreground mt-1 text-xs">
+																用户：{call.requested_by ?? "-"} · 重试次数：
+																{formatCount(call.attempt_count)}
+															</p>
+															<p className="text-muted-foreground mt-1 text-xs">
+																等待 {formatDurationMs(call.scheduler_wait_ms)}{" "}
+																· 首字{" "}
+																{formatDurationMs(call.first_token_wait_ms)} ·
+																耗时 {formatDurationMs(call.duration_ms)}
+															</p>
+															<p className="text-muted-foreground mt-1 text-xs">
+																Token 输入/输出/缓存：
+																{formatCount(call.input_tokens)} /{" "}
+																{formatCount(call.output_tokens)} /{" "}
+																{formatCount(call.cached_input_tokens)}
+															</p>
+															<p className="text-muted-foreground mt-1 text-xs">
+																完成：{formatLocalDateTime(call.finished_at)}
+															</p>
+															<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
+																ID: {call.id}
+															</p>
+														</div>
+														<div className="flex flex-wrap gap-2">
+															<Button
+																variant="outline"
+																disabled={llmCallActionsDisabled}
+																onClick={() =>
+																	void onOpenLlmCallDetail(call.id)
+																}
+															>
+																详情
+															</Button>
+														</div>
+													</div>
+												);
+											})}
+										</div>
+									)}
+								</ListSurfaceShell>
+
+								<div className="flex items-center justify-between">
+									<p className="text-muted-foreground text-xs">
+										第 {llmCallPage}/{llmCallTotalPages} 页
+									</p>
+									<div className="flex gap-2">
+										<Button
+											variant="outline"
+											size="sm"
+											disabled={
+												llmCallPage <= 1 || llmCallsLoadPhase !== "idle"
+											}
+											onClick={() =>
+												setLlmCallPage((prev) => Math.max(1, prev - 1))
+											}
+										>
+											上一页
+										</Button>
+										<Button
+											variant="outline"
+											size="sm"
+											disabled={
+												llmCallPage >= llmCallTotalPages ||
+												llmCallsLoadPhase !== "idle"
+											}
+											onClick={() =>
+												setLlmCallPage((prev) =>
+													Math.min(llmCallTotalPages, prev + 1),
+												)
+											}
+										>
+											下一页
+										</Button>
+									</div>
 								</div>
-							</div>
+							</section>
 						</CardContent>
 					</Card>
 				</TabsContent>

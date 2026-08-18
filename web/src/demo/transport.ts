@@ -26,6 +26,7 @@ import type {
 import { buildDemoHref } from "@/demo/registry";
 import {
 	buildDemoOwnerReleaseFeedItem,
+	buildLlmActivityFromCalls,
 	DEMO_OWNER_RELEASE_ID,
 } from "@/demo/fixtures";
 import { hasDemoRuntimeRequestMarker } from "@/demo/requestMarker";
@@ -145,6 +146,52 @@ function json(data: unknown, init?: ResponseInit) {
 			...(init?.headers ?? {}),
 		},
 	});
+}
+
+function badRequest(message: string) {
+	return HttpResponse.json(
+		{ error: { code: "bad_request", message } },
+		{ status: 400 },
+	);
+}
+
+function isPositiveInteger(value: unknown, maximum = Number.MAX_SAFE_INTEGER) {
+	return (
+		typeof value === "number" &&
+		Number.isSafeInteger(value) &&
+		value > 0 &&
+		value <= maximum
+	);
+}
+
+function isRfc3339Timestamp(value: string) {
+	const match = value.match(
+		/^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|([+-])(\d{2}):(\d{2}))$/,
+	);
+	if (!match) return false;
+	const [, yearText, monthText, dayText, hourText, minuteText, secondText] =
+		match;
+	const year = Number(yearText);
+	const month = Number(monthText);
+	const day = Number(dayText);
+	const hour = Number(hourText);
+	const minute = Number(minuteText);
+	const second = Number(secondText);
+	const offsetHour = Number(match[8] ?? 0);
+	const offsetMinute = Number(match[9] ?? 0);
+	const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+	return (
+		month >= 1 &&
+		month <= 12 &&
+		day >= 1 &&
+		day <= daysInMonth &&
+		hour <= 23 &&
+		minute <= 59 &&
+		second <= 59 &&
+		offsetHour <= 23 &&
+		offsetMinute <= 59 &&
+		Number.isFinite(Date.parse(value))
+	);
 }
 
 function currentDemoVersion() {
@@ -806,11 +853,9 @@ function buildAdminDashboardResponse(
 			},
 		],
 		llm_health: {
-			calls_24h: model.adminJobs.llmCalls.length,
-			failed_24h: model.adminJobs.llmCalls.filter(
-				(call) => call.status === "failed",
-			).length,
-			last_failure_at: null,
+			calls_24h: model.adminJobs.llmStatus.calls_24h,
+			failed_24h: model.adminJobs.llmStatus.failed_24h,
+			last_failure_at: model.adminJobs.llmStatus.last_failure_at,
 			top_failure_reasons: [],
 			top_failure_sources: [],
 		},
@@ -1749,29 +1794,150 @@ export const demoHandlers = [
 	http.patch("/api/admin/jobs/llm/runtime-config", async ({ request }) => {
 		const network = await applyNetworkProfile(request);
 		if (network) return network;
-		const payload = (await request.json()) as Partial<{
-			max_concurrency: number;
-			ai_model_context_limit: number | null;
-			llm_models: string[];
-		}>;
+		const rawPayload = await request.json();
+		if (
+			!rawPayload ||
+			typeof rawPayload !== "object" ||
+			Array.isArray(rawPayload)
+		) {
+			return badRequest("request body must be an object");
+		}
+		const payload = rawPayload as Record<string, unknown>;
+		const rawModels = payload.llm_models;
+		if (
+			rawModels !== undefined &&
+			(!Array.isArray(rawModels) ||
+				rawModels.some((model) => typeof model !== "string"))
+		) {
+			return badRequest("llm_models must be an array of model names");
+		}
+		const normalizedModels = (rawModels as string[] | undefined)?.map((model) =>
+			model.trim(),
+		);
+		if (
+			normalizedModels &&
+			(normalizedModels.length === 0 ||
+				normalizedModels.some((model) => model.length === 0) ||
+				new Set(normalizedModels).size !== normalizedModels.length)
+		) {
+			return badRequest(
+				"llm_models must contain non-empty, unique model names",
+			);
+		}
+		if (!isPositiveInteger(payload.max_concurrency)) {
+			return badRequest("max_concurrency must be a positive integer");
+		}
+		if (
+			Object.hasOwn(payload, "ai_model_context_limit") &&
+			payload.ai_model_context_limit !== null &&
+			!isPositiveInteger(payload.ai_model_context_limit, 0xffff_ffff)
+		) {
+			return badRequest("ai_model_context_limit must be a positive integer");
+		}
 		const access = requireRuntimeAccess();
-		access.updateModel((model) => ({
-			...model,
-			adminJobs: {
-				...model.adminJobs,
-				llmStatus: {
-					...model.adminJobs.llmStatus,
-					max_concurrency:
-						payload.max_concurrency ??
-						model.adminJobs.llmStatus.max_concurrency,
-					ai_model_context_limit:
-						payload.ai_model_context_limit ??
-						model.adminJobs.llmStatus.ai_model_context_limit,
-					llm_models:
-						payload.llm_models ?? model.adminJobs.llmStatus.llm_models,
+		access.updateModel((model) => {
+			const currentStatus = model.adminJobs.llmStatus;
+			const hasContextLimit = Object.hasOwn(payload, "ai_model_context_limit");
+			const contextLimit = hasContextLimit
+				? typeof payload.ai_model_context_limit === "number"
+					? payload.ai_model_context_limit
+					: null
+				: currentStatus.ai_model_context_limit;
+			const nextModels = normalizedModels ?? currentStatus.llm_models;
+			const nextMaxConcurrency = payload.max_concurrency as number;
+			const previousStatuses = new Map(
+				currentStatus.model_statuses.map((status) => [status.model, status]),
+			);
+			const nextModelStatuses = nextModels.map((modelName, index) => {
+				const previous = previousStatuses.get(modelName);
+				const builtinLimit = modelName === "gpt-4.1-mini" ? 1047576 : 128000;
+				const cooldownUntil = previous?.cooldown_until ?? null;
+				const cooldownUntilAt = cooldownUntil
+					? Date.parse(cooldownUntil)
+					: Number.NaN;
+				const isCoolingDown =
+					previous?.status === "cooldown" &&
+					Number.isFinite(cooldownUntilAt) &&
+					cooldownUntilAt > Date.now();
+				return {
+					model: modelName,
+					priority: index + 1,
+					status: isCoolingDown ? "cooldown" : "ready",
+					consecutive_final_failures: previous?.consecutive_final_failures ?? 0,
+					cooldown_until: isCoolingDown ? cooldownUntil : null,
+					effective_input_limit: contextLimit ?? builtinLimit,
+					effective_input_limit_source:
+						contextLimit === null ? "builtin_catalog" : "admin_override",
+				};
+			});
+			const selectedStatus =
+				nextModelStatuses.find((status) => status.status !== "cooldown") ??
+				[...nextModelStatuses].sort((left, right) => {
+					const leftUntil = left.cooldown_until
+						? new Date(left.cooldown_until).getTime()
+						: Number.POSITIVE_INFINITY;
+					const rightUntil = right.cooldown_until
+						? new Date(right.cooldown_until).getTime()
+						: Number.POSITIVE_INFINITY;
+					return leftUntil - rightUntil || left.priority - right.priority;
+				})[0];
+			const selectedModel = selectedStatus?.model ?? null;
+			const configuredModelNames = new Set(nextModels);
+			const modelsWithWindowActivity = new Set(
+				model.adminJobs.llmActivity.buckets.flatMap((bucket) =>
+					bucket.counts
+						.filter((count) => count.succeeded + count.failed > 0)
+						.map((count) => count.model),
+				),
+			);
+			const retiredActivityModels = model.adminJobs.llmActivity.models
+				.filter(
+					(item) =>
+						!configuredModelNames.has(item.model) &&
+						modelsWithWindowActivity.has(item.model),
+				)
+				.map((item) => ({ ...item, priority: null, configured: false }));
+			const nextActivityModels = [
+				...nextModels.map((modelName, index) => ({
+					model: modelName,
+					priority: index + 1,
+					configured: true,
+				})),
+				...retiredActivityModels,
+			];
+			const nextActivity = buildLlmActivityFromCalls(
+				model.adminJobs.llmCalls,
+				new Date(model.adminJobs.llmActivity.window_started_at),
+				new Date(model.adminJobs.llmActivity.window_ended_at),
+				nextActivityModels,
+			);
+			return {
+				...model,
+				adminJobs: {
+					...model.adminJobs,
+					llmStatus: {
+						...currentStatus,
+						max_concurrency: nextMaxConcurrency,
+						available_slots: Math.max(
+							0,
+							nextMaxConcurrency - currentStatus.in_flight_calls,
+						),
+						ai_model_context_limit: contextLimit,
+						llm_models: nextModels,
+						selected_model_for_new_calls: selectedModel,
+						effective_model_input_limit:
+							selectedStatus?.effective_input_limit ?? contextLimit ?? 128000,
+						effective_model_input_limit_source:
+							selectedStatus?.effective_input_limit_source ??
+							(contextLimit === null ? "builtin_catalog" : "admin_override"),
+						model_statuses: nextModelStatuses,
+					},
+					llmActivity: {
+						...nextActivity,
+					},
 				},
-			},
-		}));
+			};
+		});
 		access.recordMutation(
 			"Save LLM settings",
 			"Updated admin LLM scheduler settings in demo memory only.",
@@ -1783,15 +1949,91 @@ export const demoHandlers = [
 		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		let items = currentModel().adminJobs.llmCalls;
+		const status = url.searchParams.get("status") ?? "all";
+		if (!["all", "queued", "running", "succeeded", "failed"].includes(status)) {
+			return badRequest("invalid status filter");
+		}
+		const model = url.searchParams.get("model")?.trim() ?? "";
+		const source = url.searchParams.get("source")?.trim() ?? "";
+		const requestedBy = url.searchParams.get("requested_by")?.trim() ?? "";
 		const parentTaskId = url.searchParams.get("parent_task_id");
+		const startedFrom = url.searchParams.get("started_from");
+		const startedTo = url.searchParams.get("started_to");
+		const finishedFrom = url.searchParams.get("finished_from");
+		const finishedBefore = url.searchParams.get("finished_before");
+		for (const [field, value] of [
+			["started_from", startedFrom],
+			["started_to", startedTo],
+			["finished_from", finishedFrom],
+			["finished_before", finishedBefore],
+		] as const) {
+			if (value?.trim() && !isRfc3339Timestamp(value.trim())) {
+				return badRequest(`${field} must be RFC3339`);
+			}
+		}
+		const timestamp = (value: string | null | undefined) =>
+			value ? new Date(value).getTime() : Number.NaN;
 		if (parentTaskId) {
 			items = items.filter((item) => item.parent_task_id === parentTaskId);
 		}
+		items = items.filter((item) => {
+			if (status !== "all" && item.status !== status) return false;
+			if (model && item.model !== model) return false;
+			if (source && item.source !== source) return false;
+			if (requestedBy && item.requested_by !== requestedBy) return false;
+			const startedAt = timestamp(item.started_at ?? item.created_at);
+			const finishedAt = timestamp(
+				item.finished_at ?? item.updated_at ?? item.created_at,
+			);
+			const startedFromAt = timestamp(startedFrom);
+			const startedToAt = timestamp(startedTo);
+			const finishedFromAt = timestamp(finishedFrom);
+			const finishedBeforeAt = timestamp(finishedBefore);
+			return (
+				(Number.isNaN(startedFromAt) || startedAt >= startedFromAt) &&
+				(Number.isNaN(startedToAt) || startedAt <= startedToAt) &&
+				(Number.isNaN(finishedFromAt) || finishedAt >= finishedFromAt) &&
+				(Number.isNaN(finishedBeforeAt) || finishedAt < finishedBeforeAt)
+			);
+		});
+		const sort = url.searchParams.get("sort") ?? "created_desc";
+		if (!["created_desc", "status_grouped"].includes(sort)) {
+			return badRequest("invalid sort filter");
+		}
+		const statusRank = (value: string) =>
+			value === "running" ? 0 : value === "queued" ? 1 : 2;
+		items = [...items].sort((left, right) => {
+			if (sort === "status_grouped" && status === "all") {
+				const rankDifference =
+					statusRank(left.status) - statusRank(right.status);
+				if (rankDifference !== 0) return rankDifference;
+			}
+			const timeDifference =
+				timestamp(right.created_at) - timestamp(left.created_at);
+			if (timeDifference !== 0) return timeDifference;
+			const createdDifference = right.created_at.localeCompare(left.created_at);
+			return createdDifference !== 0
+				? createdDifference
+				: right.id.localeCompare(left.id);
+		});
+		const positiveInteger = (value: string | null, fallback: number) => {
+			const parsed = Number(value);
+			return Number.isFinite(parsed) && parsed >= 1
+				? Math.floor(parsed)
+				: fallback;
+		};
+		const page = positiveInteger(url.searchParams.get("page"), 1);
+		const pageSize = Math.min(
+			100,
+			positiveInteger(url.searchParams.get("page_size"), 20),
+		);
+		const total = items.length;
+		items = items.slice((page - 1) * pageSize, page * pageSize);
 		return json({
 			items,
-			total: items.length,
-			page: Number(url.searchParams.get("page") ?? "1"),
-			page_size: Number(url.searchParams.get("page_size") ?? "20"),
+			total,
+			page,
+			page_size: pageSize,
 		});
 	}),
 	http.get("/api/admin/jobs/llm/calls/:callId", async ({ params, request }) => {

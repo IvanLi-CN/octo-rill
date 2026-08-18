@@ -6850,11 +6850,14 @@ pub struct AdminLlmRuntimeConfigUpdateRequest {
 #[derive(Debug, Deserialize)]
 pub struct AdminLlmCallsQuery {
     status: Option<String>,
+    model: Option<String>,
     source: Option<String>,
     requested_by: Option<String>,
     parent_task_id: Option<String>,
     started_from: Option<String>,
     started_to: Option<String>,
+    finished_from: Option<String>,
+    finished_before: Option<String>,
     sort: Option<String>,
     page: Option<i64>,
     page_size: Option<i64>,
@@ -6881,9 +6884,7 @@ fn apply_llm_call_admin_override(item: &mut AdminLlmCallItem, snapshot: &ai::Llm
     if let Some(started_at) = snapshot.started_at.clone() {
         item.started_at = Some(started_at);
     }
-    if let Some(finished_at) = snapshot.finished_at.clone() {
-        item.finished_at = Some(finished_at);
-    }
+    item.finished_at = snapshot.finished_at.clone();
     item.updated_at = snapshot.updated_at.clone();
 }
 
@@ -6933,6 +6934,10 @@ fn llm_call_matches_status_filter(item: &AdminLlmCallItem, status: &str) -> bool
     status == "all" || item.status == status
 }
 
+fn llm_call_matches_model_filter(item: &AdminLlmCallItem, model: &str) -> bool {
+    model.is_empty() || item.model == model
+}
+
 fn llm_call_started_at_sort_key(item: &AdminLlmCallItem) -> i64 {
     item.started_at
         .as_deref()
@@ -6953,6 +6958,33 @@ fn llm_call_matches_started_filter(
     }
     if let Some(upper_bound) = started_to.map(llm_call_created_at_sort_key)
         && started_at > upper_bound
+    {
+        return false;
+    }
+    true
+}
+
+fn llm_call_terminal_at_sort_key(item: &AdminLlmCallItem) -> i64 {
+    let terminal_at = item
+        .finished_at
+        .as_deref()
+        .unwrap_or(item.updated_at.as_str());
+    llm_call_created_at_sort_key(terminal_at)
+}
+
+fn llm_call_matches_finished_filter(
+    item: &AdminLlmCallItem,
+    finished_from: Option<&str>,
+    finished_before: Option<&str>,
+) -> bool {
+    let finished_at = llm_call_terminal_at_sort_key(item);
+    if let Some(lower_bound) = finished_from.map(llm_call_created_at_sort_key)
+        && finished_at < lower_bound
+    {
+        return false;
+    }
+    if let Some(upper_bound) = finished_before.map(llm_call_created_at_sort_key)
+        && finished_at >= upper_bound
     {
         return false;
     }
@@ -7043,8 +7075,8 @@ async fn load_admin_llm_activity_response(
         r#"
         SELECT id, status, model, finished_at, updated_at
         FROM llm_calls
-        WHERE COALESCE(finished_at, updated_at, created_at) >= ?
-          AND COALESCE(finished_at, updated_at, created_at) < ?
+        WHERE julianday(COALESCE(finished_at, updated_at, created_at)) >= julianday(?)
+          AND julianday(COALESCE(finished_at, updated_at, created_at)) < julianday(?)
         "#,
     )
     .bind(window_start_text.as_str())
@@ -7380,11 +7412,14 @@ where
 
 struct AdminLlmCallListScope<'a> {
     status: Option<&'a str>,
+    model: &'a str,
     source: &'a str,
     requested_by: Option<&'a str>,
     parent_task_id: &'a str,
     started_from: Option<&'a str>,
     started_to: Option<&'a str>,
+    finished_from: Option<&'a str>,
+    finished_before: Option<&'a str>,
 }
 
 struct AdminLlmCallIdScope<'a> {
@@ -7408,6 +7443,10 @@ fn push_llm_call_filters(
         query.push(" AND status = ");
         query.push_bind(status.to_owned());
     }
+    if !scope.model.is_empty() {
+        query.push(" AND model = ");
+        query.push_bind(scope.model.to_owned());
+    }
     if !scope.source.is_empty() {
         query.push(" AND source = ");
         query.push_bind(scope.source.to_owned());
@@ -7421,13 +7460,23 @@ fn push_llm_call_filters(
         query.push_bind(scope.parent_task_id.to_owned());
     }
     if let Some(started_from) = scope.started_from {
-        query.push(" AND unixepoch(COALESCE(started_at, created_at)) >= unixepoch(");
+        query.push(" AND julianday(COALESCE(started_at, created_at)) >= julianday(");
         query.push_bind(started_from.to_owned());
         query.push(")");
     }
     if let Some(started_to) = scope.started_to {
-        query.push(" AND unixepoch(COALESCE(started_at, created_at)) <= unixepoch(");
+        query.push(" AND julianday(COALESCE(started_at, created_at)) <= julianday(");
         query.push_bind(started_to.to_owned());
+        query.push(")");
+    }
+    if let Some(finished_from) = scope.finished_from {
+        query.push(" AND julianday(COALESCE(finished_at, updated_at, created_at)) >= julianday(");
+        query.push_bind(finished_from.to_owned());
+        query.push(")");
+    }
+    if let Some(finished_before) = scope.finished_before {
+        query.push(" AND julianday(COALESCE(finished_at, updated_at, created_at)) < julianday(");
+        query.push_bind(finished_before.to_owned());
         query.push(")");
     }
     if let Some(include_ids) = ids.include_ids {
@@ -7573,11 +7622,15 @@ pub async fn admin_list_llm_calls(
         return Err(ApiError::bad_request("invalid status filter"));
     }
 
+    let model = query.model.unwrap_or_default().trim().to_owned();
     let source = query.source.unwrap_or_default().trim().to_owned();
     let requested_by = query.requested_by.clone();
     let parent_task_id = query.parent_task_id.unwrap_or_default().trim().to_owned();
     let started_from = parse_llm_calls_filter_timestamp(query.started_from, "started_from")?;
     let started_to = parse_llm_calls_filter_timestamp(query.started_to, "started_to")?;
+    let finished_from = parse_llm_calls_filter_timestamp(query.finished_from, "finished_from")?;
+    let finished_before =
+        parse_llm_calls_filter_timestamp(query.finished_before, "finished_before")?;
     let sort = query.sort.unwrap_or_else(|| "created_desc".to_owned());
     if !matches!(sort.as_str(), "created_desc" | "status_grouped") {
         return Err(ApiError::bad_request("invalid sort filter"));
@@ -7585,19 +7638,25 @@ pub async fn admin_list_llm_calls(
 
     let base_scope = AdminLlmCallListScope {
         status: Some(status.as_str()),
+        model: model.as_str(),
         source: source.as_str(),
         requested_by: requested_by.as_deref(),
         parent_task_id: parent_task_id.as_str(),
         started_from: started_from.as_deref(),
         started_to: started_to.as_deref(),
+        finished_from: finished_from.as_deref(),
+        finished_before: finished_before.as_deref(),
     };
     let override_scope = AdminLlmCallListScope {
         status: None,
+        model: model.as_str(),
         source: source.as_str(),
         requested_by: requested_by.as_deref(),
         parent_task_id: parent_task_id.as_str(),
         started_from: None,
         started_to: None,
+        finished_from: None,
+        finished_before: None,
     };
     let no_ids = AdminLlmCallIdScope {
         include_ids: None,
@@ -7650,7 +7709,13 @@ pub async fn admin_list_llm_calls(
     apply_llm_call_admin_overrides(&mut override_items, &overrides);
     override_items.retain(|item| {
         llm_call_matches_status_filter(item, status.as_str())
+            && llm_call_matches_model_filter(item, model.as_str())
             && llm_call_matches_started_filter(item, started_from.as_deref(), started_to.as_deref())
+            && llm_call_matches_finished_filter(
+                item,
+                finished_from.as_deref(),
+                finished_before.as_deref(),
+            )
     });
     sort_admin_llm_calls(&mut override_items, sort.as_str());
 
@@ -24373,11 +24438,14 @@ mod tests {
             session,
             Query(AdminLlmCallsQuery {
                 status: None,
+                model: None,
                 source: None,
                 requested_by: None,
                 parent_task_id: None,
                 started_from: None,
                 started_to: None,
+                finished_from: None,
+                finished_before: None,
                 sort: None,
                 page: None,
                 page_size: None,
@@ -24446,11 +24514,14 @@ mod tests {
             session,
             Query(AdminLlmCallsQuery {
                 status: Some("failed".to_owned()),
+                model: None,
                 source: Some("api.translate_releases_batch".to_owned()),
                 requested_by: Some(test_user_id(1)),
                 parent_task_id: None,
                 started_from: None,
                 started_to: None,
+                finished_from: None,
+                finished_before: None,
                 sort: Some("status_grouped".to_owned()),
                 page: Some(1),
                 page_size: Some(20),
@@ -25715,11 +25786,14 @@ mod tests {
     fn llm_call_order_by_clause_uses_created_desc_when_status_is_fixed() {
         let scope = AdminLlmCallListScope {
             status: Some("running"),
+            model: "",
             source: "",
             requested_by: None,
             parent_task_id: "",
             started_from: None,
             started_to: None,
+            finished_from: None,
+            finished_before: None,
         };
 
         assert_eq!(
@@ -25781,11 +25855,14 @@ mod tests {
             session,
             Query(AdminLlmCallsQuery {
                 status: Some("all".to_owned()),
+                model: None,
                 source: Some("api.translate_releases_batch".to_owned()),
                 requested_by: Some(test_user_id(1)),
                 parent_task_id: None,
                 started_from: None,
                 started_to: None,
+                finished_from: None,
+                finished_before: None,
                 sort: Some("status_grouped".to_owned()),
                 page: Some(1),
                 page_size: Some(20),
@@ -25855,11 +25932,14 @@ mod tests {
             session,
             Query(AdminLlmCallsQuery {
                 status: Some("all".to_owned()),
+                model: None,
                 source: Some("api.translate_releases_batch".to_owned()),
                 requested_by: Some(test_user_id(1)),
                 parent_task_id: None,
                 started_from: None,
                 started_to: None,
+                finished_from: None,
+                finished_before: None,
                 sort: None,
                 page: Some(1),
                 page_size: Some(20),
@@ -25933,11 +26013,14 @@ mod tests {
             session,
             Query(AdminLlmCallsQuery {
                 status: Some("all".to_owned()),
+                model: None,
                 source: Some("api.translate_releases_batch".to_owned()),
                 requested_by: Some(test_user_id(1)),
                 parent_task_id: None,
                 started_from: None,
                 started_to: None,
+                finished_from: None,
+                finished_before: None,
                 sort: None,
                 page: Some(1),
                 page_size: Some(20),
@@ -26030,11 +26113,14 @@ mod tests {
             setup_session(1).await,
             Query(AdminLlmCallsQuery {
                 status: Some("queued".to_owned()),
+                model: None,
                 source: Some("api.translate_releases_batch".to_owned()),
                 requested_by: Some(test_user_id(1)),
                 parent_task_id: None,
                 started_from: None,
                 started_to: None,
+                finished_from: None,
+                finished_before: None,
                 sort: Some("status_grouped".to_owned()),
                 page: Some(1),
                 page_size: Some(1),
@@ -26053,11 +26139,14 @@ mod tests {
             setup_session(1).await,
             Query(AdminLlmCallsQuery {
                 status: Some("queued".to_owned()),
+                model: None,
                 source: Some("api.translate_releases_batch".to_owned()),
                 requested_by: Some(test_user_id(1)),
                 parent_task_id: None,
                 started_from: None,
                 started_to: None,
+                finished_from: None,
+                finished_before: None,
                 sort: Some("status_grouped".to_owned()),
                 page: Some(2),
                 page_size: Some(1),
@@ -26101,11 +26190,14 @@ mod tests {
             setup_session(1).await,
             Query(AdminLlmCallsQuery {
                 status: Some("all".to_owned()),
+                model: None,
                 source: Some("api.translate_releases_batch".to_owned()),
                 requested_by: Some(test_user_id(1)),
                 parent_task_id: None,
                 started_from: None,
                 started_to: None,
+                finished_from: None,
+                finished_before: None,
                 sort: None,
                 page: Some(1),
                 page_size: Some(20),
@@ -26119,11 +26211,14 @@ mod tests {
             setup_session(1).await,
             Query(AdminLlmCallsQuery {
                 status: Some("all".to_owned()),
+                model: None,
                 source: Some("api.translate_releases_batch".to_owned()),
                 requested_by: Some(test_user_id(1)),
                 parent_task_id: None,
                 started_from: None,
                 started_to: None,
+                finished_from: None,
+                finished_before: None,
                 sort: Some("status_grouped".to_owned()),
                 page: Some(1),
                 page_size: Some(20),
@@ -26181,11 +26276,14 @@ mod tests {
             session,
             Query(AdminLlmCallsQuery {
                 status: Some("all".to_owned()),
+                model: None,
                 source: Some("api.translate_releases_batch".to_owned()),
                 requested_by: Some(test_user_id(1)),
                 parent_task_id: None,
                 started_from: Some(started_from),
                 started_to: Some(started_to),
+                finished_from: None,
+                finished_before: None,
                 sort: None,
                 page: Some(1),
                 page_size: Some(20),
@@ -26198,6 +26296,55 @@ mod tests {
         assert_eq!(resp.total, 1);
         assert_eq!(resp.items.len(), 1);
         assert_eq!(resp.items[0].id, "call-zulu");
+    }
+
+    #[tokio::test]
+    async fn admin_list_llm_calls_started_filters_preserve_subsecond_boundaries() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        for (call_id, created_at) in [
+            ("call-boundary", "2026-02-26T02:00:00.000Z"),
+            ("call-after-boundary", "2026-02-26T02:00:00.500Z"),
+        ] {
+            seed_llm_call_with_created_at(
+                &pool,
+                call_id,
+                "succeeded",
+                "api.translate_releases_batch",
+                Some(test_user_id(1)),
+                created_at,
+            )
+            .await;
+        }
+
+        let resp = admin_list_llm_calls(
+            State(setup_state(pool)),
+            setup_session(1).await,
+            Query(AdminLlmCallsQuery {
+                status: Some("all".to_owned()),
+                model: None,
+                source: Some("api.translate_releases_batch".to_owned()),
+                requested_by: Some(test_user_id(1)),
+                parent_task_id: None,
+                started_from: None,
+                started_to: Some("2026-02-26T02:00:00.000Z".to_owned()),
+                finished_from: None,
+                finished_before: None,
+                sort: None,
+                page: Some(1),
+                page_size: Some(20),
+            }),
+        )
+        .await
+        .expect("started upper bound should preserve milliseconds")
+        .0;
+
+        assert_eq!(resp.total, 1);
+        assert_eq!(resp.items[0].id, "call-boundary");
     }
 
     #[tokio::test]
@@ -26257,11 +26404,14 @@ mod tests {
             setup_session(1).await,
             Query(AdminLlmCallsQuery {
                 status: Some("all".to_owned()),
+                model: None,
                 source: Some("api.translate_releases_batch".to_owned()),
                 requested_by: Some(test_user_id(1)),
                 parent_task_id: None,
                 started_from: Some(started_from),
                 started_to: Some(started_to),
+                finished_from: None,
+                finished_before: None,
                 sort: Some("status_grouped".to_owned()),
                 page: Some(1),
                 page_size: Some(20),
@@ -26278,6 +26428,95 @@ mod tests {
             resp.items[0].started_at.as_deref(),
             Some(override_started_at.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn admin_list_llm_calls_filters_model_and_terminal_range_after_overrides() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        for (call_id, created_at) in [
+            ("call-terminal-persistent", "2026-02-26T02:15:00Z"),
+            ("call-terminal-other-model", "2026-02-26T02:20:00Z"),
+            ("call-terminal-boundary", "2026-02-26T03:00:00Z"),
+            ("call-terminal-override", "2026-02-26T04:00:00Z"),
+        ] {
+            seed_llm_call_with_created_at(
+                &pool,
+                call_id,
+                "failed",
+                "api.translate_releases_batch",
+                Some(test_user_id(1)),
+                created_at,
+            )
+            .await;
+        }
+        sqlx::query("UPDATE llm_calls SET model = ? WHERE id = ?")
+            .bind("gpt-4.1-mini")
+            .bind("call-terminal-other-model")
+            .execute(&pool)
+            .await
+            .expect("set a non-matching model");
+
+        let state = setup_state(pool);
+        state
+            .llm_scheduler
+            .set_admin_override(crate::ai::LlmCallAdminOverride {
+                id: "call-terminal-override".to_owned(),
+                status: "failed".to_owned(),
+                attempt_count: 2,
+                scheduler_wait_ms: 120,
+                first_token_wait_ms: None,
+                duration_ms: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                total_tokens: None,
+                output_messages_json: None,
+                response_text: None,
+                error_text: Some("overridden failure".to_owned()),
+                started_at: Some("2026-02-26T02:25:00Z".to_owned()),
+                finished_at: Some("2026-02-26T02:30:00Z".to_owned()),
+                updated_at: "2026-02-26T02:30:00Z".to_owned(),
+            })
+            .await;
+
+        let request = |page| AdminLlmCallsQuery {
+            status: Some("failed".to_owned()),
+            model: Some("gpt-4o-mini".to_owned()),
+            source: Some("api.translate_releases_batch".to_owned()),
+            requested_by: Some(test_user_id(1)),
+            parent_task_id: None,
+            started_from: None,
+            started_to: None,
+            finished_from: Some("2026-02-26T02:00:00Z".to_owned()),
+            finished_before: Some("2026-02-26T03:00:00Z".to_owned()),
+            sort: None,
+            page: Some(page),
+            page_size: Some(1),
+        };
+
+        let first_page = admin_list_llm_calls(
+            State(Arc::clone(&state)),
+            setup_session(1).await,
+            Query(request(1)),
+        )
+        .await
+        .expect("terminal filter should include the override-backed call")
+        .0;
+        let second_page =
+            admin_list_llm_calls(State(state), setup_session(1).await, Query(request(2)))
+                .await
+                .expect("terminal filter should retain persistent pagination")
+                .0;
+
+        assert_eq!(first_page.total, 2);
+        assert_eq!(first_page.items[0].id, "call-terminal-override");
+        assert_eq!(second_page.total, 2);
+        assert_eq!(second_page.items[0].id, "call-terminal-persistent");
     }
 
     #[tokio::test]
@@ -26374,11 +26613,14 @@ mod tests {
             session,
             Query(AdminLlmCallsQuery {
                 status: Some("all".to_owned()),
+                model: None,
                 source: None,
                 requested_by: Some(test_user_id(1)),
                 parent_task_id: Some(parent_task_a.clone()),
                 started_from: None,
                 started_to: None,
+                finished_from: None,
+                finished_before: None,
                 sort: None,
                 page: Some(1),
                 page_size: Some(20),
@@ -26606,6 +26848,12 @@ mod tests {
                 "2026-08-13T09:00:00Z",
             ),
             (
+                "activity-offset",
+                "succeeded",
+                "configured-a",
+                "2026-08-13T08:30:00-01:00",
+            ),
+            (
                 "activity-failed",
                 "failed",
                 "historical-z",
@@ -26705,7 +26953,7 @@ mod tests {
             ]
         );
         let first_bucket = &response.buckets[0];
-        assert_eq!(first_bucket.counts[1].succeeded, 1);
+        assert_eq!(first_bucket.counts[1].succeeded, 2);
         let last_bucket = &response.buckets[49];
         assert_eq!(last_bucket.counts[0].succeeded, 1);
         assert_eq!(last_bucket.counts[2].succeeded, 1);

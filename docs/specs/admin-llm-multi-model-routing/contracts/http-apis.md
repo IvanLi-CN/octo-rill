@@ -1,5 +1,17 @@
 # HTTP APIs
 
+## `GET /api/admin/jobs/llm/calls`
+
+管理员调用记录接口保留既有 `status`、`source`、`requested_by`、`parent_task_id`、`started_from`、`started_to`、`sort`、`page` 与 `page_size` 参数，并新增：
+
+- `model`：精确匹配模型名；空白值不构成筛选。
+- `finished_from`：终态时间的包含下限，必须为 RFC3339。
+- `finished_before`：终态时间的排他上限，必须为 RFC3339。
+
+终态时间统一为 `COALESCE(finished_at, updated_at, created_at)`。因此 `finished_from` 与 `finished_before` 的范围为 `[finished_from, finished_before)`，与活动图桶的落桶口径完全一致。`started_to` 继续保持既有包含上限语义。
+
+当运行时管理员 override 覆盖持久化记录的状态或时间时，服务端必须先使用覆盖后的有效记录应用模型、状态、开始时间和终态时间筛选，再统一排序与分页。
+
 ## `GET /api/admin/jobs/llm/activity`
 
 管理员只读接口，无查询参数。固定返回当前 UTC 小时与前 49 个完整小时位置；每个桶采用 `[started_at, ended_at)`。

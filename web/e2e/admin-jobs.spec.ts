@@ -153,10 +153,10 @@ async function installAdminJobsMocks(
 			prompt_text: "prompt 1",
 			response_text: null,
 			error_text: "mock llm failed",
-			created_at: "2026-02-26T05:00:00Z",
-			started_at: "2026-02-26T05:00:01Z",
-			finished_at: "2026-02-26T05:00:03Z",
-			updated_at: "2026-02-26T05:00:03Z",
+			created_at: "2026-02-26T02:00:00Z",
+			started_at: "2026-02-26T02:00:01Z",
+			finished_at: "2026-02-26T02:00:03Z",
+			updated_at: "2026-02-26T02:00:03Z",
 		},
 		{
 			id: "llm-call-2",
@@ -1647,11 +1647,20 @@ async function installAdminJobsMocks(
 
 		if (req.method() === "GET" && pathname === "/api/admin/jobs/llm/calls") {
 			const status = url.searchParams.get("status") ?? "all";
+			const model = url.searchParams.get("model") ?? "";
 			const source = url.searchParams.get("source") ?? "";
 			const requestedBy = url.searchParams.get("requested_by");
 			const parentTaskId = url.searchParams.get("parent_task_id") ?? "";
+			const startedFrom = url.searchParams.get("started_from");
+			const startedTo = url.searchParams.get("started_to");
+			const finishedFrom = url.searchParams.get("finished_from");
+			const finishedBefore = url.searchParams.get("finished_before");
+			const sort = url.searchParams.get("sort") ?? "created_desc";
+			const timestamp = (value: string | null | undefined) =>
+				value ? new Date(value).getTime() : Number.NaN;
 			const filtered = llmCalls.filter((item) => {
 				if (status !== "all" && item.status !== status) return false;
+				if (model && item.model !== model) return false;
 				if (source && item.source !== source) return false;
 				if (
 					requestedBy &&
@@ -1662,10 +1671,50 @@ async function installAdminJobsMocks(
 				if (parentTaskId && item.parent_task_id !== parentTaskId) {
 					return false;
 				}
-				return true;
+				const startedAt = timestamp(item.started_at ?? item.created_at);
+				const finishedAt = timestamp(
+					item.finished_at ?? item.updated_at ?? item.created_at,
+				);
+				const startedFromAt = timestamp(startedFrom);
+				const startedToAt = timestamp(startedTo);
+				const finishedFromAt = timestamp(finishedFrom);
+				const finishedBeforeAt = timestamp(finishedBefore);
+				return (
+					(Number.isNaN(startedFromAt) || startedAt >= startedFromAt) &&
+					(Number.isNaN(startedToAt) || startedAt <= startedToAt) &&
+					(Number.isNaN(finishedFromAt) || finishedAt >= finishedFromAt) &&
+					(Number.isNaN(finishedBeforeAt) || finishedAt < finishedBeforeAt)
+				);
 			});
+			const statusRank = (value: string) =>
+				value === "running" ? 0 : value === "queued" ? 1 : 2;
+			const sorted = [...filtered].sort((left, right) => {
+				if (sort === "status_grouped" && status === "all") {
+					const rankDifference =
+						statusRank(left.status) - statusRank(right.status);
+					if (rankDifference !== 0) return rankDifference;
+				}
+				return (
+					new Date(right.created_at).getTime() -
+						new Date(left.created_at).getTime() ||
+					right.created_at.localeCompare(left.created_at) ||
+					right.id.localeCompare(left.id)
+				);
+			});
+			const pageNumber = Math.max(
+				1,
+				Number(url.searchParams.get("page") ?? "1"),
+			);
+			const pageSize = Math.min(
+				100,
+				Math.max(1, Number(url.searchParams.get("page_size") ?? "20")),
+			);
+			const pageItems = sorted.slice(
+				(pageNumber - 1) * pageSize,
+				pageNumber * pageSize,
+			);
 			return json(route, {
-				items: filtered.map(
+				items: pageItems.map(
 					({
 						prompt_text: _p,
 						response_text: _r,
@@ -1675,8 +1724,8 @@ async function installAdminJobsMocks(
 						...rest
 					}) => rest,
 				),
-				page: 1,
-				page_size: 20,
+				page: pageNumber,
+				page_size: pageSize,
 				total: filtered.length,
 			});
 		}
@@ -1878,7 +1927,9 @@ test("admin can manage jobs center", async ({ page }) => {
 	const llmTab = page.getByRole("tab", { name: "LLM调度" });
 
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
-	await expect(page.getByRole("img", { name: "OctoRill" })).toBeVisible();
+	await expect(
+		page.getByRole("link", { name: "OctoRill 管理后台" }),
+	).toBeVisible();
 	await expect(
 		page.getByRole("navigation", { name: "管理员导航" }),
 	).toBeVisible();
@@ -2050,7 +2101,42 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(
 		page.getByRole("textbox", { name: "LLM 调用来源筛选" }),
 	).toBeVisible();
-	await expect(page.getByLabel("LLM 开始时间下限")).toBeVisible();
+	const startedRangeTrigger = page.getByRole("button", {
+		name: "LLM 开始时间范围",
+	});
+	const finishedRangeTrigger = page.getByRole("button", {
+		name: "LLM 结束时间范围",
+	});
+	await expect(startedRangeTrigger).toBeVisible();
+	await expect(finishedRangeTrigger).toBeVisible();
+	await startedRangeTrigger.click();
+	await expect(
+		page.getByRole("group", { name: "LLM 开始时间后日历" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("group", { name: "LLM 开始时间前日历" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("textbox", { name: "LLM 开始时间后" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("textbox", { name: "LLM 开始时间前" }),
+	).toBeVisible();
+	await page.keyboard.press("Escape");
+	await finishedRangeTrigger.click();
+	await expect(
+		page.getByRole("group", { name: "LLM 结束时间后日历" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("group", { name: "LLM 结束时间前（不含）日历" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("textbox", { name: "LLM 结束时间后" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("textbox", { name: "LLM 结束时间前（不含）" }),
+	).toBeVisible();
+	await page.keyboard.press("Escape");
 	await expect(page.getByText("调度器状态")).toHaveCount(0);
 	await expect(page.getByText("等待 / 进行中")).toHaveCount(0);
 	await expect(page.getByText("近24h 调用 / 失败")).toBeVisible();
@@ -2225,9 +2311,14 @@ test("admin jobs tabs are URL-driven and support deep links plus history", async
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
 });
 
-test("admin llm calls are sorted by status group and created time", async ({
+test("admin requests grouped LLM call ordering and renders the response", async ({
 	page,
 }) => {
+	const callRequests: URL[] = [];
+	page.on("request", (request) => {
+		const url = new URL(request.url());
+		if (url.pathname === "/api/admin/jobs/llm/calls") callRequests.push(url);
+	});
 	await installAdminJobsMocks(page, { emitStreamEvents: false });
 	await page.goto("/admin/jobs", { waitUntil: "domcontentloaded" });
 
@@ -2245,6 +2336,41 @@ test("admin llm calls are sorted by status group and created time", async ({
 		"ID: llm-call-3",
 		"ID: llm-call-1",
 	]);
+	expect(
+		callRequests.some(
+			(request) =>
+				request.searchParams.get("sort") === "status_grouped" &&
+				request.searchParams.get("page") === "1" &&
+				request.searchParams.get("page_size") === "20",
+		),
+	).toBe(true);
+});
+
+test("admin keeps rapid LLM filter edits in the shareable URL", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+	await page
+		.getByRole("textbox", { name: "LLM 调用来源筛选" })
+		.fill("job.api.translate_release");
+	await page
+		.getByRole("textbox", { name: "LLM 调用模型筛选" })
+		.pressSequentially("gpt-4o-mini");
+
+	await expect
+		.poll(() => {
+			const search = new URL(page.url()).searchParams;
+			return {
+				model: search.get("llm_model"),
+				source: search.get("llm_source"),
+			};
+		})
+		.toEqual({
+			model: "gpt-4o-mini",
+			source: "job.api.translate_release",
+		});
 });
 
 test("admin llm activity defaults to chart and keeps list filters independent", async ({
@@ -2262,6 +2388,19 @@ test("admin llm activity defaults to chart and keeps list filters independent", 
 
 	const grid = page.getByTestId("llm-activity-grid");
 	await expect(grid).toBeVisible({ timeout: 10_000 });
+	const filterHeights = await Promise.all(
+		[
+			page.getByRole("combobox", { name: "LLM 调用状态筛选" }),
+			page.getByRole("textbox", { name: "LLM 调用模型筛选" }),
+			page.getByRole("button", { name: "LLM 开始时间范围" }),
+			page.getByRole("button", { name: "LLM 结束时间范围" }),
+		].map((filter) =>
+			filter.evaluate((element) =>
+				Math.round(element.getBoundingClientRect().height),
+			),
+		),
+	);
+	expect(filterHeights).toEqual([36, 36, 36, 36]);
 	const activityViewButton = page.getByRole("button", {
 		name: "显示模型活动图",
 	});
@@ -2277,6 +2416,9 @@ test("admin llm activity defaults to chart and keeps list filters independent", 
 	});
 	await latestCell.click();
 	const summary = page.getByTestId("llm-activity-summary");
+	await expect(
+		page.getByRole("dialog", { name: /gpt-4o-mini.*调用摘要/ }),
+	).toBeVisible();
 	await expect(summary).toContainText("80%");
 	await expect(summary).toContainText("67%");
 	await latestCell.press("ArrowLeft");
@@ -2298,6 +2440,227 @@ test("admin llm activity defaults to chart and keeps list filters independent", 
 	await expect(page.getByText("冷却中")).toBeVisible();
 	await page.reload({ waitUntil: "domcontentloaded" });
 	await expect(page.getByTestId("llm-activity-grid")).toBeVisible();
+});
+
+test("admin drills from LLM activity and model cards into shareable call filters", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	await page.goto(
+		"/admin/jobs/llm?llm_status=succeeded&llm_source=obsolete-source&llm_requested_by=obsolete-user&llm_time_field=started&llm_time_from=2026-02-26T00%3A00%3A00Z",
+		{ waitUntil: "domcontentloaded" },
+	);
+
+	const grid = page.getByTestId("llm-activity-grid");
+	const latestCell = grid.getByRole("button", {
+		name: /gpt-4o-mini，成功 8，失败 2/,
+	});
+	await expect(latestCell).toBeVisible({ timeout: 10_000 });
+	await latestCell.focus();
+	await page.keyboard.press("ContextMenu");
+	await expect(
+		page.getByRole("menuitem", { name: "查看失败调用" }),
+	).toBeVisible();
+	await page.keyboard.press("Escape");
+
+	await latestCell.click({ button: "right" });
+	await page.getByRole("menuitem", { name: "查看失败调用" }).click();
+	await expect
+		.poll(() => {
+			const search = new URL(page.url()).searchParams;
+			return {
+				status: search.get("llm_status"),
+				model: search.get("llm_model"),
+				source: search.get("llm_source"),
+				requestedBy: search.get("llm_requested_by"),
+				startedFrom: search.get("llm_started_from"),
+				startedTo: search.get("llm_started_to"),
+				finishedFrom: search.get("llm_finished_from"),
+				finishedBefore: search.get("llm_finished_before"),
+				legacyField: search.get("llm_time_field"),
+			};
+		})
+		.toEqual({
+			status: "failed",
+			model: "gpt-4o-mini",
+			source: null,
+			requestedBy: null,
+			startedFrom: null,
+			startedTo: null,
+			finishedFrom: "2026-02-26T02:00:00.000Z",
+			finishedBefore: "2026-02-26T03:00:00.000Z",
+			legacyField: null,
+		});
+	const results = page.getByRole("region", { name: "LLM 调用记录结果" });
+	await expect(results).toBeFocused();
+	await expect(page.getByText("job.api.translate_release")).toBeVisible();
+	await latestCell.focus();
+	await latestCell.click({ button: "right" });
+	await page.getByRole("menuitem", { name: "查看失败调用" }).click();
+	await expect(results).toBeFocused();
+	await page.getByRole("button", { name: "LLM 结束时间范围" }).click();
+	await expect(
+		page.getByRole("group", { name: "LLM 结束时间后日历" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("group", { name: "LLM 结束时间前（不含）日历" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("textbox", { name: "LLM 结束时间后" }),
+	).toHaveValue(
+		await page.evaluate(() => {
+			const value = new Date("2026-02-26T02:00:00.000Z");
+			const pad = (part: number) => String(part).padStart(2, "0");
+			return `${value.getFullYear()}/${pad(value.getMonth() + 1)}/${pad(value.getDate())} ${pad(value.getHours())}:${pad(value.getMinutes())}`;
+		}),
+	);
+	await expect(
+		page.getByRole("textbox", { name: "LLM 结束时间前（不含）" }),
+	).toHaveValue(
+		await page.evaluate(() => {
+			const value = new Date("2026-02-26T03:00:00.000Z");
+			const pad = (part: number) => String(part).padStart(2, "0");
+			return `${value.getFullYear()}/${pad(value.getMonth() + 1)}/${pad(value.getDate())} ${pad(value.getHours())}:${pad(value.getMinutes())}`;
+		}),
+	);
+	await page.keyboard.press("Escape");
+	await page.getByRole("button", { name: "LLM 开始时间范围" }).click();
+	await page
+		.getByRole("textbox", { name: "LLM 开始时间后" })
+		.fill("2026/02/26 01:00");
+	await expect
+		.poll(() => {
+			const search = new URL(page.url()).searchParams;
+			return {
+				startedFrom: search.get("llm_started_from"),
+				finishedFrom: search.get("llm_finished_from"),
+				finishedBefore: search.get("llm_finished_before"),
+			};
+		})
+		.toEqual({
+			startedFrom: new Date("2026-02-26T01:00").toISOString(),
+			finishedFrom: "2026-02-26T02:00:00.000Z",
+			finishedBefore: "2026-02-26T03:00:00.000Z",
+		});
+	await page.keyboard.press("Escape");
+
+	await page.goBack();
+	await expect(page).toHaveURL(/llm_source=obsolete-source/);
+	const restoredCell = page
+		.getByTestId("llm-activity-grid")
+		.getByRole("button", { name: /gpt-4o-mini，成功 8，失败 2/ });
+	await restoredCell.click();
+	await page.getByRole("button", { name: /gpt-4o-mini 的调用操作/ }).click();
+	await page.getByRole("menuitem", { name: "查看全部调用" }).click();
+	await expect
+		.poll(() => {
+			const search = new URL(page.url()).searchParams;
+			return [
+				search.get("llm_status"),
+				search.get("llm_model"),
+				search.get("llm_finished_from"),
+				search.get("llm_finished_before"),
+			];
+		})
+		.toEqual([
+			null,
+			"gpt-4o-mini",
+			"2026-02-26T02:00:00.000Z",
+			"2026-02-26T03:00:00.000Z",
+		]);
+
+	await page.getByRole("button", { name: "显示模型状态卡片" }).click();
+	const modelStatusActions = page.getByRole("button", {
+		name: /gpt-4o-mini 的调用操作/,
+	});
+	await modelStatusActions.focus();
+	await page.keyboard.press("Shift+F10");
+	await expect(
+		page.getByRole("menuitem", { name: "查看失败调用" }),
+	).toBeVisible();
+	await page.keyboard.press("Escape");
+	await modelStatusActions.dispatchEvent("pointerdown", {
+		button: 0,
+		isPrimary: true,
+		pointerId: 1,
+		pointerType: "touch",
+	});
+	await expect(page.getByRole("menu")).toHaveCount(1);
+	await page.waitForTimeout(800);
+	await expect(page.getByRole("menu")).toHaveCount(1);
+	await page
+		.locator('button[aria-label="gpt-4o-mini 的调用操作"]')
+		.dispatchEvent("pointerup", {
+			button: 0,
+			isPrimary: true,
+			pointerId: 1,
+			pointerType: "touch",
+		});
+	await page.keyboard.press("Escape");
+	await modelStatusActions.click();
+	await page.getByRole("menuitem", { name: "查看全部调用" }).click();
+	await expect
+		.poll(() => {
+			const search = new URL(page.url()).searchParams;
+			return {
+				model: search.get("llm_model"),
+				startedFrom: search.get("llm_started_from"),
+				startedTo: search.get("llm_started_to"),
+				finishedFrom: search.get("llm_finished_from"),
+				finishedBefore: search.get("llm_finished_before"),
+			};
+		})
+		.toEqual({
+			model: "gpt-4o-mini",
+			startedFrom: null,
+			startedTo: null,
+			finishedFrom: null,
+			finishedBefore: null,
+		});
+});
+
+test("admin llm activity keeps context-menu hit targets contiguous", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1200, height: 900 });
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+	const grid = page.getByTestId("llm-activity-grid");
+	const firstModelCells = grid.getByRole("button", { name: /gpt-4o-mini/ });
+	const secondModelCells = grid.getByRole("button", { name: /gpt-4\.1-mini/ });
+	await expect(firstModelCells.first()).toBeVisible({ timeout: 10_000 });
+	const [firstCellBox, secondCellBox, nextRowCellBox] = await Promise.all([
+		firstModelCells.nth(0).boundingBox(),
+		firstModelCells.nth(1).boundingBox(),
+		secondModelCells.nth(0).boundingBox(),
+	]);
+	expect(firstCellBox).not.toBeNull();
+	expect(secondCellBox).not.toBeNull();
+	expect(nextRowCellBox).not.toBeNull();
+	expect(
+		Math.abs(
+			(firstCellBox?.x ?? 0) +
+				(firstCellBox?.width ?? 0) -
+				(secondCellBox?.x ?? 0),
+		),
+	).toBeLessThan(0.5);
+	expect(
+		Math.abs(
+			(firstCellBox?.y ?? 0) +
+				(firstCellBox?.height ?? 0) -
+				(nextRowCellBox?.y ?? 0),
+		),
+	).toBeLessThan(0.5);
+
+	await page.mouse.click(
+		secondCellBox?.x ?? 0,
+		(firstCellBox?.y ?? 0) + (firstCellBox?.height ?? 0) / 2,
+		{ button: "right" },
+	);
+	await expect(
+		page.getByRole("menuitem", { name: "查看失败调用" }),
+	).toBeVisible();
 });
 
 test("admin llm activity keeps the pointer tooltip clear of the grid", async ({
@@ -2631,13 +2994,78 @@ test("admin llm activity prioritizes the grid on mobile", async ({ page }) => {
 	]);
 	expect(firstCellBox).not.toBeNull();
 	expect(secondCellBox).not.toBeNull();
-	expect((firstCellBox?.x ?? 0) + (firstCellBox?.width ?? 0)).toBeLessThan(
-		secondCellBox?.x ?? 0,
-	);
+	expect(
+		Math.abs(
+			(firstCellBox?.x ?? 0) +
+				(firstCellBox?.width ?? 0) -
+				(secondCellBox?.x ?? 0),
+		),
+	).toBeLessThan(0.5);
 
 	await expect(grid.getByRole("list", { name: "模型图例" })).toContainText(
 		"gpt-4o-mini",
 	);
+});
+
+test("admin llm mobile filters keep context around the time range panel", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 393, height: 852 });
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+
+	await expect(
+		page.getByRole("button", { name: "打开 LLM 调用筛选" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("textbox", { name: "LLM 调用模型筛选" }),
+	).toHaveCount(0);
+	await page.getByRole("button", { name: "打开 LLM 调用筛选" }).click();
+	const filters = page.getByRole("dialog", { name: "筛选调用记录" });
+	await expect(filters).toBeVisible();
+	await expect(filters).toHaveClass(/right-0/);
+	await expect(
+		filters.getByRole("textbox", { name: "LLM 调用模型筛选" }),
+	).toBeVisible();
+	await filters.getByRole("button", { name: "LLM 开始时间范围" }).click();
+	const drawer = filters.getByRole("region", {
+		name: "LLM 开始时间范围设置",
+	});
+	await expect(drawer).toBeVisible();
+	await expect(filters).toBeVisible();
+	await expect(page.getByRole("dialog")).toHaveCount(1);
+	await expect(drawer).toHaveClass(/bottom-0/);
+	await expect(
+		drawer.getByRole("group", { name: "LLM 开始时间后日历" }),
+	).toBeVisible();
+	await expect(
+		drawer.getByRole("group", { name: "LLM 开始时间前日历" }),
+	).toHaveCount(0);
+	await drawer.getByRole("textbox", { name: "LLM 开始时间前" }).click();
+	await expect(
+		drawer.getByRole("group", { name: "LLM 开始时间后日历" }),
+	).toHaveCount(0);
+	await expect(
+		drawer.getByRole("group", { name: "LLM 开始时间前日历" }),
+	).toBeVisible();
+	const scrollMetrics = await drawer
+		.getByTestId("llm-time-range-drawer-scroll")
+		.evaluate((element) => ({
+			clientHeight: element.clientHeight,
+			scrollHeight: element.scrollHeight,
+		}));
+	expect(scrollMetrics.scrollHeight).toBeLessThanOrEqual(
+		scrollMetrics.clientHeight + 1,
+	);
+	await page.keyboard.press("Escape");
+	await expect(drawer).toHaveCount(0);
+	await expect(filters).toBeVisible();
+	await expect(
+		filters.getByRole("button", { name: "LLM 开始时间范围" }),
+	).toBeFocused();
+	await expect(
+		filters.getByRole("textbox", { name: "LLM 调用模型筛选" }),
+	).toBeVisible();
 });
 
 test("admin keeps llm calls visible during sse refresh", async ({ page }) => {
@@ -2769,6 +3197,7 @@ test("admin ignores stale llm refresh errors after filter change", async ({
 	await expect(
 		page.getByRole("combobox", { name: "LLM 调用状态筛选" }),
 	).toBeVisible();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
 	const refreshButton = page.getByRole("button", { name: "刷新" });
 	await refreshButton.click();
 	await page.getByRole("combobox", { name: "LLM 调用状态筛选" }).click();
@@ -2776,7 +3205,7 @@ test("admin ignores stale llm refresh errors after filter change", async ({
 
 	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
 	await expect(refreshButton).toBeDisabled();
-	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	await expect(page.getByText("job.api.translate_release")).toBeVisible();
 	await expect(page.getByText("stale llm refresh failed")).toHaveCount(0);
 
 	await page.waitForTimeout(700);
