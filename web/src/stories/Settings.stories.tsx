@@ -1080,11 +1080,14 @@ export const WebhookDeleteReady: Story = {
 				errors: 0,
 				removable: 2,
 			},
-			repos: (
-				WebhookPermissionPaused.args?.webhookPush as WebhookPushSettingsResponse
-			).repos.map((repo, index) =>
-				index === 0 ? { ...repo, status: "delete_pending" } : repo,
-			),
+			repos:
+				(
+					WebhookPermissionPaused.args?.webhookPush as
+						| WebhookPushSettingsResponse
+						| undefined
+				)?.repos.map((repo, index) =>
+					index === 0 ? { ...repo, status: "delete_pending" } : repo,
+				) ?? [],
 		},
 	},
 	play: async ({ canvasElement }) => {
