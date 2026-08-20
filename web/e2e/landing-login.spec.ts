@@ -53,6 +53,32 @@ async function installLandingApiMocks(
 	});
 }
 
+async function installPendingAuthRedirect(
+	page: Page,
+	provider: "github" | "linuxdo",
+) {
+	let requestCount = 0;
+	let releaseNavigation: (() => void) | undefined;
+	const navigationReleased = new Promise<void>((resolve) => {
+		releaseNavigation = resolve;
+	});
+	const routePattern = `**/auth/${provider}/login`;
+
+	await page.route(routePattern, async (route) => {
+		requestCount += 1;
+		await navigationReleased;
+		await route.abort();
+	});
+
+	return {
+		count: () => requestCount,
+		release: async () => {
+			releaseNavigation?.();
+			await page.unroute(routePattern).catch(() => undefined);
+		},
+	};
+}
+
 test("landing page shows concise login copy for unauthenticated users", async ({
 	page,
 }) => {
@@ -201,4 +227,183 @@ test("landing page disables passkey actions when browser support is unavailable"
 			"当前浏览器不支持 Passkey；你仍然可以继续使用 GitHub / LinuxDO 登录。",
 		),
 	).toBeVisible();
+});
+
+test("landing page preserves native modified and middle-click OAuth semantics", async ({
+	page,
+}) => {
+	await installPasskeyBrowserMock(page);
+	await installLandingApiMocks(page, 401, "unauthorized");
+	await page
+		.context()
+		.route("**/auth/github/login", (route) => route.fulfill({ status: 204 }));
+
+	await page.goto("/");
+	await expect(page.locator("[data-landing-login-cta]")).toBeVisible({
+		timeout: 15_000,
+	});
+
+	const interaction = await page.evaluate(() => {
+		const link = document.querySelector<HTMLAnchorElement>(
+			"[data-landing-login-cta]",
+		);
+		if (!link) throw new Error("GitHub login link not found");
+
+		const modifiedClick = new MouseEvent("click", {
+			bubbles: true,
+			cancelable: true,
+			button: 0,
+			ctrlKey: true,
+		});
+		link.dispatchEvent(modifiedClick);
+
+		const middleClick = new MouseEvent("click", {
+			bubbles: true,
+			cancelable: true,
+			button: 1,
+		});
+		link.dispatchEvent(middleClick);
+
+		return {
+			href: link.getAttribute("href"),
+			modifiedDefaultPrevented: modifiedClick.defaultPrevented,
+			middleDefaultPrevented: middleClick.defaultPrevented,
+			ariaDisabled: link.getAttribute("aria-disabled"),
+		};
+	});
+
+	expect(interaction).toEqual({
+		href: "/auth/github/login",
+		modifiedDefaultPrevented: false,
+		middleDefaultPrevented: false,
+		ariaDisabled: null,
+	});
+});
+
+test("landing page locks every login action while GitHub OAuth is starting", async ({
+	page,
+}) => {
+	await installPasskeyBrowserMock(page);
+	await installLandingApiMocks(page, 401, "unauthorized");
+	const pendingAuth = await installPendingAuthRedirect(page, "github");
+
+	try {
+		await page.goto("/");
+		await expect(page.locator("[data-landing-login-cta]")).toBeVisible({
+			timeout: 15_000,
+		});
+
+		const pendingState = await page.evaluate(
+			() =>
+				new Promise((resolve) => {
+					const link = document.querySelector<HTMLAnchorElement>(
+						"[data-landing-login-cta]",
+					);
+					if (!link) throw new Error("GitHub login link not found");
+					for (let index = 0; index < 2; index += 1) {
+						link.dispatchEvent(
+							new MouseEvent("click", {
+								bubbles: true,
+								cancelable: true,
+								button: 0,
+							}),
+						);
+					}
+					requestAnimationFrame(() => {
+						resolve({
+							githubName: link.textContent?.trim(),
+							githubDisabled: link.getAttribute("aria-disabled"),
+							linuxdoDisabled: document
+								.querySelector("[data-landing-linuxdo-cta]")
+								?.getAttribute("aria-disabled"),
+							passkeyLoginDisabled: document.querySelector<HTMLButtonElement>(
+								"[data-landing-passkey-login-cta]",
+							)?.disabled,
+							passkeyRegisterDisabled:
+								document.querySelector<HTMLButtonElement>(
+									"[data-landing-passkey-register-cta]",
+								)?.disabled,
+							cardBusy: document
+								.querySelector("[data-landing-login-card]")
+								?.getAttribute("aria-busy"),
+						});
+					});
+				}),
+		);
+		expect(pendingState).toEqual({
+			githubName: "正在跳转到 GitHub…",
+			githubDisabled: "true",
+			linuxdoDisabled: "true",
+			passkeyLoginDisabled: true,
+			passkeyRegisterDisabled: true,
+			cardBusy: "true",
+		});
+		await expect.poll(() => pendingAuth.count()).toBe(1);
+	} finally {
+		await pendingAuth.release();
+	}
+});
+
+test("landing page shows the LinuxDO redirect state without a second OAuth request", async ({
+	page,
+}) => {
+	await installPasskeyBrowserMock(page);
+	await installLandingApiMocks(page, 401, "unauthorized");
+	const pendingAuth = await installPendingAuthRedirect(page, "linuxdo");
+
+	try {
+		await page.goto("/");
+		await expect(page.locator("[data-landing-linuxdo-cta]")).toBeVisible({
+			timeout: 15_000,
+		});
+
+		const pendingState = await page.evaluate(
+			() =>
+				new Promise((resolve) => {
+					const link = document.querySelector<HTMLAnchorElement>(
+						"[data-landing-linuxdo-cta]",
+					);
+					if (!link) throw new Error("LinuxDO login link not found");
+					for (let index = 0; index < 2; index += 1) {
+						link.dispatchEvent(
+							new MouseEvent("click", {
+								bubbles: true,
+								cancelable: true,
+								button: 0,
+							}),
+						);
+					}
+					requestAnimationFrame(() => {
+						resolve({
+							linuxdoName: link.textContent?.trim(),
+							githubDisabled: document
+								.querySelector("[data-landing-login-cta]")
+								?.getAttribute("aria-disabled"),
+							linuxdoDisabled: link.getAttribute("aria-disabled"),
+							passkeyLoginDisabled: document.querySelector<HTMLButtonElement>(
+								"[data-landing-passkey-login-cta]",
+							)?.disabled,
+							passkeyRegisterDisabled:
+								document.querySelector<HTMLButtonElement>(
+									"[data-landing-passkey-register-cta]",
+								)?.disabled,
+							cardBusy: document
+								.querySelector("[data-landing-login-card]")
+								?.getAttribute("aria-busy"),
+						});
+					});
+				}),
+		);
+		expect(pendingState).toEqual({
+			linuxdoName: "正在跳转到 LinuxDO…",
+			githubDisabled: "true",
+			linuxdoDisabled: "true",
+			passkeyLoginDisabled: true,
+			passkeyRegisterDisabled: true,
+			cardBusy: "true",
+		});
+		await expect.poll(() => pendingAuth.count()).toBe(1);
+	} finally {
+		await pendingAuth.release();
+	}
 });
