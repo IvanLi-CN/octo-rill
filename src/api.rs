@@ -8852,6 +8852,11 @@ pub struct PublicReleaseQuery {
     direction: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicReleaseRefreshRequest {
+    IfStale,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PublicReleaseListItem {
     release_id: String,
@@ -8884,6 +8889,8 @@ pub struct PublicReleaseListResponse {
     segments: Option<Vec<PublicReleaseSegmentResponse>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     gaps: Option<Vec<PublicReleaseGapResponse>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh: Option<sync::PublicRepoReleaseRefresh>,
     items: Vec<PublicReleaseListItem>,
 }
 
@@ -9136,6 +9143,7 @@ fn parse_public_release_http_query(
         PublicReleaseQuery,
         PublicReleaseHighlightRequest,
         Option<String>,
+        Option<PublicReleaseRefreshRequest>,
     ),
     ApiError,
 > {
@@ -9152,6 +9160,7 @@ fn parse_public_release_http_query(
     };
     let mut highlight = PublicReleaseHighlightRequest::default();
     let mut until_cursor = None;
+    let mut refresh = None;
     for (key, value) in url::form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes()) {
         match key.as_ref() {
             "content" => query.content = Some(value.into_owned()),
@@ -9171,10 +9180,55 @@ fn parse_public_release_http_query(
             "highlight_start" => highlight.start = Some(value.into_owned()),
             "highlight_end" => highlight.end = Some(value.into_owned()),
             "highlight_active" => highlight.active = Some(value.into_owned()),
+            "refresh" => {
+                if refresh.is_some() {
+                    return Err(ApiError::bad_request("refresh must only be provided once"));
+                }
+                refresh = Some(match value.as_ref() {
+                    "if_stale" => PublicReleaseRefreshRequest::IfStale,
+                    _ => return Err(ApiError::bad_request("refresh must be if_stale")),
+                });
+            }
             _ => {}
         }
     }
-    Ok((query, highlight, until_cursor))
+    Ok((query, highlight, until_cursor, refresh))
+}
+
+async fn require_public_release_refresh_api_key(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let value = headers
+        .get(header::AUTHORIZATION)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid_api_key",
+                "invalid API key",
+            )
+        })?
+        .to_str()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid_api_key",
+                "invalid API key",
+            )
+        })?
+        .trim_start();
+    let mut auth_parts = value.splitn(2, char::is_whitespace);
+    let scheme = auth_parts.next().unwrap_or("");
+    let api_key = auth_parts.next().unwrap_or("").trim();
+    if !scheme.eq_ignore_ascii_case("Bearer") || !api_key.starts_with(api_keys::API_KEY_PREFIX) {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "invalid API key",
+        ));
+    }
+    api_keys::authenticate_api_key(state, api_key).await?;
+    Ok(())
 }
 
 fn validate_public_release_query(query: &PublicReleaseQuery) -> Result<(), ApiError> {
@@ -11255,16 +11309,33 @@ pub async fn public_list_repo_releases(
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<PublicReleaseQuery>,
 ) -> Result<Response, ApiError> {
-    public_list_repo_releases_impl(state, owner, repo, query, None, None).await
+    public_list_repo_releases_impl(state, owner, repo, query, None, None, None).await
 }
 
 pub async fn public_list_repo_releases_http(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
     RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let (query, highlight_request, until_cursor) =
+    let (query, highlight_request, until_cursor, refresh) =
         parse_public_release_http_query(raw_query.as_deref())?;
+    if refresh.is_some()
+        && (query
+            .cursor
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || until_cursor
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty()))
+    {
+        return Err(ApiError::bad_request(
+            "refresh=if_stale is only supported on the first release window",
+        ));
+    }
+    if refresh.is_some() {
+        require_public_release_refresh_api_key(state.as_ref(), &headers).await?;
+    }
     public_list_repo_releases_impl(
         state,
         owner,
@@ -11272,6 +11343,7 @@ pub async fn public_list_repo_releases_http(
         query,
         Some(highlight_request),
         until_cursor,
+        refresh,
     )
     .await
 }
@@ -11283,6 +11355,7 @@ async fn public_list_repo_releases_impl(
     query: PublicReleaseQuery,
     highlight_request: Option<PublicReleaseHighlightRequest>,
     until_cursor: Option<String>,
+    refresh_request: Option<PublicReleaseRefreshRequest>,
 ) -> Result<Response, ApiError> {
     validate_public_release_query(&query)?;
     let usage = upsert_public_release_usage(
@@ -11296,6 +11369,19 @@ async fn public_list_repo_releases_impl(
     ensure_public_release_usage_accessible(&usage)?;
     let Some(repo_id) = usage.repo_id else {
         return Ok(public_pending_response(&usage));
+    };
+    let refresh = if refresh_request.is_some() {
+        Some(
+            sync::refresh_public_repo_release_if_stale(
+                state.as_ref(),
+                repo_id,
+                usage.full_name.as_str(),
+            )
+            .await
+            .map_err(ApiError::internal)?,
+        )
+    } else {
+        None
     };
     let explicit_active_requested = highlight_request
         .as_ref()
@@ -11690,6 +11776,7 @@ async fn public_list_repo_releases_impl(
         highlight: highlight_resolution.response,
         segments,
         gaps,
+        refresh,
     })
     .into_response())
 }
@@ -31500,6 +31587,98 @@ line two",
     }
 
     #[tokio::test]
+    async fn public_release_refresh_opt_in_requires_a_key_and_keeps_cached_items() {
+        let pool = setup_pool().await;
+        seed_public_release_usage(&pool, Some(42), "ready").await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool.clone());
+
+        let err = public_list_repo_releases_http(
+            State(state.clone()),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            RawQuery(Some("refresh=if_stale".to_owned())),
+            HeaderMap::new(),
+        )
+        .await
+        .expect_err("refresh opt-in without a key must fail");
+        assert_eq!(err.code(), "invalid_api_key");
+        assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
+
+        let anonymous = public_list_repo_releases_http(
+            State(state.clone()),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            RawQuery(None),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("anonymous public read remains available");
+        let anonymous_body = response_json(anonymous).await;
+        assert!(anonymous_body.get("refresh").is_none());
+        let anonymous_work_items = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM repo_release_work_items WHERE repo_id = ?",
+        )
+        .bind(42_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("count anonymous work items");
+        assert_eq!(anonymous_work_items, 0);
+
+        let Json(created) = me_create_api_key(
+            State(state.clone()),
+            setup_session(1).await,
+            Json(CreateApiKeyRequest { name: None }),
+        )
+        .await
+        .expect("create API key");
+        let response = public_list_repo_releases_http(
+            State(state.clone()),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            RawQuery(Some("refresh=if_stale".to_owned())),
+            bearer_headers(created.api_key.as_str()),
+        )
+        .await
+        .expect("authenticated refresh opt-in");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(body["refresh"]["state"], json!("queued"));
+        assert_eq!(body["refresh"]["retry_after_seconds"], json!(2));
+        assert!(!body.to_string().contains(created.api_key.as_str()));
+
+        sqlx::query(
+            "UPDATE repo_release_work_items SET status = 'succeeded', last_success_at = ? WHERE repo_id = ?",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(42_i64)
+        .execute(&pool)
+        .await
+        .expect("mark release cache fresh");
+        let fresh = public_list_repo_releases_http(
+            State(state.clone()),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            RawQuery(Some("refresh=if_stale".to_owned())),
+            bearer_headers(created.api_key.as_str()),
+        )
+        .await
+        .expect("fresh refresh opt-in");
+        let fresh_body = response_json(fresh).await;
+        assert_eq!(fresh_body["refresh"]["state"], json!("fresh"));
+        assert!(fresh_body["refresh"].get("retry_after_seconds").is_none());
+
+        let err = public_list_repo_releases_http(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            RawQuery(Some(
+                "refresh=if_stale&cursor=2026-03-20T00%3A00%3A00Z%7C120".to_owned(),
+            )),
+            bearer_headers(created.api_key.as_str()),
+        )
+        .await
+        .expect_err("refresh opt-in on a page must fail");
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn public_release_typed_highlight_resolves_tag_and_id_with_partial_metadata() {
         let pool = setup_pool().await;
         seed_public_release_usage(&pool, Some(42), "ready").await;
@@ -31515,6 +31694,7 @@ line two",
                 "content=polished&highlight=tag%3Av1.2.3&highlight=id%3A122&highlight=tag%3Amissing&highlight_active=id%3A122"
                     .to_owned(),
             )),
+            HeaderMap::new(),
         )
         .await
         .expect("typed highlight response");
@@ -31557,6 +31737,7 @@ line two",
             RawQuery(Some(
                 "content=polished&highlight=id%3A122&highlight_active=id%3A122".to_owned(),
             )),
+            HeaderMap::new(),
         )
         .await
         .expect("single discrete highlight response");
@@ -31597,6 +31778,7 @@ line two",
             RawQuery(Some(
                 "highlight=id%3A120&highlight=id%3A122&limit=2".to_owned(),
             )),
+            HeaderMap::new(),
         )
         .await
         .expect("initial discrete window");
@@ -31615,6 +31797,7 @@ line two",
             State(state),
             Path(("openai".to_owned(), "codex".to_owned())),
             RawQuery(Some(query.finish())),
+            HeaderMap::new(),
         )
         .await
         .expect("bounded gap fill");
@@ -31645,6 +31828,7 @@ line two",
             State(state),
             Path(("openai".to_owned(), "codex".to_owned())),
             RawQuery(Some(query)),
+            HeaderMap::new(),
         )
         .await
         .expect("over-limit highlight remains readable");
@@ -31670,6 +31854,7 @@ line two",
                 "highlight_start=id%3A122&highlight_end=tag%3Av1.2.3&highlight_active=id%3A121"
                     .to_owned(),
             )),
+            HeaderMap::new(),
         )
         .await
         .expect("reversed typed range");
@@ -31711,6 +31896,7 @@ line two",
                 "highlight_start=id%3A120&highlight_end=id%3A159&highlight_active=id%3A139"
                     .to_owned(),
             )),
+            HeaderMap::new(),
         )
         .await
         .expect("centered typed range");
