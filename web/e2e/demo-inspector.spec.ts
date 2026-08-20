@@ -143,6 +143,24 @@ test("demo landing clears a local OAuth action after a cross-case reset", async 
 	);
 });
 
+test("demo landing cancels queued OAuth when the inspector selects another action", async ({
+	page,
+}) => {
+	await page.goto("/?demo=landing-welcome");
+
+	await page.locator("[data-landing-login-cta]").dispatchEvent("click", {
+		button: 0,
+	});
+	await page.getByLabel("Login action").selectOption("linuxdo");
+
+	await expect(
+		page.getByRole("link", { name: "正在跳转到 LinuxDO…" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("link", { name: "正在跳转到 GitHub…" }),
+	).toHaveCount(0);
+});
+
 test("demo landing case selector renders every authentication state", async ({
 	page,
 }) => {
