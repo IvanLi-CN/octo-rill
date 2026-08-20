@@ -36,7 +36,21 @@ import { useAppShellChrome } from "@/layout/AppShell";
 import { useOptionalRouter } from "@/lib/internalNavigation";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import { cn } from "@/lib/utils";
-import { buildDefaultDemoShareState, DEMO_SCENES } from "@/demo/registry";
+import {
+	buildDefaultDemoShareState,
+	DEMO_SCENES,
+	getLandingCaseControls,
+	LANDING_AUTH_ACTION_OPTIONS,
+	LANDING_BOOT_STATE_OPTIONS,
+	LANDING_CASE_OPTIONS,
+	LANDING_PASSKEY_SUPPORT_OPTIONS,
+} from "@/demo/registry";
+import type {
+	DemoLandingAuthAction,
+	DemoLandingBootState,
+	DemoLandingCase,
+	DemoLandingPasskeySupport,
+} from "@/demo/types";
 import {
 	applyDemoShareStateInPlace,
 	buildCurrentDemoHref,
@@ -445,7 +459,73 @@ export function DemoInspector(props: {
 		sceneTitle: scene.title,
 		shareHref,
 		onSceneChange: (sceneId: (typeof DEMO_SCENES)[number]["id"]) =>
-			navigateWithShareState({ sceneId }, { reseed: true }),
+			navigateWithShareState(
+				{
+					...buildDefaultDemoShareState(sceneId),
+					networkMode: snapshot.shareState.networkMode,
+					includeOwnReleases: snapshot.shareState.includeOwnReleases,
+					publicationState: snapshot.shareState.publicationState,
+					controlsHidden: snapshot.shareState.controlsHidden,
+				},
+				{ reseed: true },
+			),
+		onLandingCaseChange: (landingCase: DemoLandingCase) =>
+			navigateWithShareState(
+				{
+					landingCase,
+					...getLandingCaseControls(landingCase),
+					personaId: "guest",
+				},
+				{ reseed: false },
+			),
+		onLandingAuthActionChange: (landingAuthAction: DemoLandingAuthAction) =>
+			navigateWithShareState(
+				{
+					landingCase: "custom",
+					landingAuthAction,
+					landingPasskeySupport:
+						landingAuthAction === "passkey-authenticate" ||
+						landingAuthAction === "passkey-register"
+							? "supported"
+							: snapshot.shareState.landingPasskeySupport,
+					landingBootState:
+						landingAuthAction === "idle"
+							? snapshot.shareState.landingBootState
+							: "ready",
+					personaId: "guest",
+				},
+				{ reseed: false },
+			),
+		onLandingPasskeySupportChange: (
+			landingPasskeySupport: DemoLandingPasskeySupport,
+		) =>
+			navigateWithShareState(
+				{
+					landingCase: "custom",
+					landingPasskeySupport,
+					landingAuthAction:
+						landingPasskeySupport === "unsupported" &&
+						(snapshot.shareState.landingAuthAction === "passkey-authenticate" ||
+							snapshot.shareState.landingAuthAction === "passkey-register")
+							? "idle"
+							: snapshot.shareState.landingAuthAction,
+					personaId: "guest",
+				},
+				{ reseed: false },
+			),
+		onLandingBootStateChange: (landingBootState: DemoLandingBootState) =>
+			navigateWithShareState(
+				{
+					landingCase: "custom",
+					landingBootState,
+					landingAuthAction:
+						landingBootState === "network-unavailable"
+							? "idle"
+							: snapshot.shareState.landingAuthAction,
+					personaId: "guest",
+				},
+				{ reseed: false },
+			),
 		onPersonaChange: (personaId: "guest" | "member" | "admin") =>
 			navigateWithShareState({ personaId }, { reseed: true }),
 		onNetworkChange: (networkMode: "normal" | "slow" | "faulty") =>
@@ -902,6 +982,10 @@ export type DemoInspectorPanelProps = {
 	shareHref: string;
 	density?: "default" | "compact";
 	onSceneChange: (sceneId: (typeof DEMO_SCENES)[number]["id"]) => void;
+	onLandingCaseChange: (landingCase: DemoLandingCase) => void;
+	onLandingAuthActionChange: (action: DemoLandingAuthAction) => void;
+	onLandingPasskeySupportChange: (support: DemoLandingPasskeySupport) => void;
+	onLandingBootStateChange: (bootState: DemoLandingBootState) => void;
 	onPersonaChange: (personaId: "guest" | "member" | "admin") => void;
 	onNetworkChange: (networkMode: "normal" | "slow" | "faulty") => void;
 	onIncludeOwnReleasesChange: (checked: boolean) => void;
@@ -914,6 +998,10 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 	const { snapshot } = props;
 	const isCompact = props.density === "compact";
 	const sceneSelectId = useId();
+	const landingCaseSelectId = useId();
+	const landingAuthActionSelectId = useId();
+	const landingPasskeySupportSelectId = useId();
+	const landingBootStateSelectId = useId();
 	const personaSelectId = useId();
 	const networkSelectId = useId();
 	const includeOwnReleasesSwitchId = useId();
@@ -987,56 +1075,148 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 				</CardContent>
 			</Card>
 
-			<Card>
-				<CardHeader className={cn("p-3 pb-2", isCompact && "p-2 pb-1")}>
-					<CardTitle className={cn("text-base", isCompact && "text-sm")}>
-						Data
-					</CardTitle>
-				</CardHeader>
-				<CardContent
-					className={cn(
-						"space-y-2.5 px-3 pb-3",
-						isCompact && "space-y-1.5 px-2 pb-2",
-					)}
-				>
-					<div className="flex items-center justify-between gap-3">
-						<div className="space-y-0.5">
-							<Label
-								htmlFor={includeOwnReleasesSwitchId}
-								className="justify-start gap-0 text-sm"
-							>
-								Include My Releases
-							</Label>
-							{isCompact ? null : (
-								<p className="text-muted-foreground text-xs leading-4">
-									影响 Settings 回显和 Dashboard owner-only release 露出。
-								</p>
+			{snapshot.shareState.sceneId === "landing-welcome" ? (
+				<Card data-demo-scene-controls="landing">
+					<CardHeader className={cn("p-3 pb-2", isCompact && "p-2 pb-1")}>
+						<CardTitle className={cn("text-base", isCompact && "text-sm")}>
+							Landing Controls
+						</CardTitle>
+					</CardHeader>
+					<CardContent
+						className={cn(
+							"space-y-2.5 px-3 pb-3",
+							isCompact && "space-y-1.5 px-2 pb-2",
+						)}
+					>
+						<section className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
+							<Label htmlFor={landingCaseSelectId}>Case preset</Label>
+							<InspectorSelect
+								id={landingCaseSelectId}
+								value={snapshot.shareState.landingCase}
+								onValueChange={(value) =>
+									props.onLandingCaseChange(value as DemoLandingCase)
+								}
+								options={LANDING_CASE_OPTIONS}
+								compact={isCompact}
+							/>
+						</section>
+						<section className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
+							<Label htmlFor={landingAuthActionSelectId}>Login action</Label>
+							<InspectorSelect
+								id={landingAuthActionSelectId}
+								value={snapshot.shareState.landingAuthAction}
+								onValueChange={(value) =>
+									props.onLandingAuthActionChange(
+										value as DemoLandingAuthAction,
+									)
+								}
+								options={LANDING_AUTH_ACTION_OPTIONS}
+								compact={isCompact}
+							/>
+						</section>
+						<section
+							className={cn(
+								"grid gap-2.5 sm:grid-cols-2",
+								isCompact && "gap-2",
 							)}
-						</div>
-						<Switch
-							id={includeOwnReleasesSwitchId}
-							checked={snapshot.shareState.includeOwnReleases}
-							onCheckedChange={props.onIncludeOwnReleasesChange}
-						/>
-					</div>
-					<div className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
-						<Label htmlFor={publicationStateSelectId}>
-							Repo Public Release State
-						</Label>
-						<InspectorSelect
-							id={publicationStateSelectId}
-							value={snapshot.shareState.publicationState}
-							onValueChange={(value) =>
-								props.onPublicationStateChange(
-									value as "published" | "unpublished",
-								)
-							}
-							options={PUBLICATION_OPTIONS}
-							compact={isCompact}
-						/>
-					</div>
-				</CardContent>
-			</Card>
+						>
+							<div className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
+								<Label htmlFor={landingPasskeySupportSelectId}>
+									Passkey support
+								</Label>
+								<InspectorSelect
+									id={landingPasskeySupportSelectId}
+									value={snapshot.shareState.landingPasskeySupport}
+									onValueChange={(value) =>
+										props.onLandingPasskeySupportChange(
+											value as DemoLandingPasskeySupport,
+										)
+									}
+									options={LANDING_PASSKEY_SUPPORT_OPTIONS}
+									compact={isCompact}
+								/>
+							</div>
+							<div className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
+								<Label htmlFor={landingBootStateSelectId}>Auth boot</Label>
+								<InspectorSelect
+									id={landingBootStateSelectId}
+									value={snapshot.shareState.landingBootState}
+									onValueChange={(value) =>
+										props.onLandingBootStateChange(
+											value as DemoLandingBootState,
+										)
+									}
+									options={LANDING_BOOT_STATE_OPTIONS}
+									compact={isCompact}
+								/>
+							</div>
+						</section>
+					</CardContent>
+				</Card>
+			) : null}
+
+			{snapshot.shareState.sceneId === "dashboard-repo-publish" ||
+			snapshot.shareState.sceneId === "settings-my-releases" ||
+			snapshot.shareState.sceneId === "public-release-ready" ? (
+				<Card data-demo-scene-controls={snapshot.shareState.sceneId}>
+					<CardHeader className={cn("p-3 pb-2", isCompact && "p-2 pb-1")}>
+						<CardTitle className={cn("text-base", isCompact && "text-sm")}>
+							{snapshot.shareState.sceneId === "dashboard-repo-publish"
+								? "Dashboard Controls"
+								: snapshot.shareState.sceneId === "settings-my-releases"
+									? "Settings Controls"
+									: "Public Release Controls"}
+						</CardTitle>
+					</CardHeader>
+					<CardContent
+						className={cn(
+							"space-y-2.5 px-3 pb-3",
+							isCompact && "space-y-1.5 px-2 pb-2",
+						)}
+					>
+						{snapshot.shareState.sceneId !== "public-release-ready" ? (
+							<div className="flex items-center justify-between gap-3">
+								<div className="space-y-0.5">
+									<Label
+										htmlFor={includeOwnReleasesSwitchId}
+										className="justify-start gap-0 text-sm"
+									>
+										Include My Releases
+									</Label>
+									{isCompact ? null : (
+										<p className="text-muted-foreground text-xs leading-4">
+											影响 Settings 回显和 Dashboard owner-only release 露出。
+										</p>
+									)}
+								</div>
+								<Switch
+									id={includeOwnReleasesSwitchId}
+									checked={snapshot.shareState.includeOwnReleases}
+									onCheckedChange={props.onIncludeOwnReleasesChange}
+								/>
+							</div>
+						) : null}
+						{snapshot.shareState.sceneId !== "settings-my-releases" ? (
+							<div className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
+								<Label htmlFor={publicationStateSelectId}>
+									Repo Public Release State
+								</Label>
+								<InspectorSelect
+									id={publicationStateSelectId}
+									value={snapshot.shareState.publicationState}
+									onValueChange={(value) =>
+										props.onPublicationStateChange(
+											value as "published" | "unpublished",
+										)
+									}
+									options={PUBLICATION_OPTIONS}
+									compact={isCompact}
+								/>
+							</div>
+						) : null}
+					</CardContent>
+				</Card>
+			) : null}
 
 			<Card>
 				<CardHeader className={cn("p-3 pb-2", isCompact && "p-2 pb-1")}>
