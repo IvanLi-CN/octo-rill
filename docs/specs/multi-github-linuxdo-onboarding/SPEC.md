@@ -224,9 +224,11 @@ Landing 双登录入口（storybook_canvas: `Pages/Landing / Default`）
 ![Landing dual login entry](./assets/landing-dual-login.png)
 
 Landing 认证动作互斥与场景专属控制（controlled demo: `Landing / Custom`）
+PR: include
 ![Landing auth feedback controls](./assets/landing-auth-feedback-controls.png)
 
 Landing GitHub OAuth 跳转中移动态（controlled demo: `Landing / GitHub OAuth pending`）
+PR: include
 ![Landing auth feedback mobile](./assets/landing-auth-feedback-mobile.png)
 
 LinuxDO 首登补绑页（storybook_canvas: `Pages/BindGitHub / Pending Linux Do`）
