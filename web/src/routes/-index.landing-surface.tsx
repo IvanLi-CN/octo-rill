@@ -6,7 +6,10 @@ import { Landing, type LandingAuthAction } from "@/pages/Landing";
 function resolveLandingDemoState(
 	shareState: Pick<
 		DemoShareState,
-		"landingAuthAction" | "landingPasskeySupport" | "landingBootState"
+		| "landingCase"
+		| "landingAuthAction"
+		| "landingPasskeySupport"
+		| "landingBootState"
 	>,
 ) {
 	const authNetworkUnavailable =
