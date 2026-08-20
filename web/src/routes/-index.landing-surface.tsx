@@ -21,10 +21,17 @@ function resolveLandingDemoState(
 			: shareState.landingAuthAction === "idle"
 				? null
 				: (shareState.landingAuthAction as LandingAuthAction);
+	const previewAuthStateKey = [
+		shareState.landingCase,
+		shareState.landingAuthAction,
+		shareState.landingPasskeySupport,
+		shareState.landingBootState,
+	].join(":");
 
 	return {
 		passkeySupportOverride: !passkeyUnsupported,
 		previewAuthAction,
+		previewAuthStateKey,
 		...(authNetworkUnavailable
 			? {
 					bootError: "演示：网络连接不可用。请恢复网络后重试登录。",

@@ -106,6 +106,7 @@ test("demo landing returns to idle when the inspector clears a held OAuth action
 		page.getByRole("link", { name: "正在跳转到 GitHub…" }),
 	).toBeVisible();
 
+	await page.getByLabel("Case preset").selectOption("linuxdo-redirect");
 	await page.getByLabel("Case preset").selectOption("default");
 	await expect(
 		page.getByRole("link", { name: "使用 GitHub 登录" }),
@@ -159,6 +160,25 @@ test("demo landing cancels queued OAuth when the inspector selects another actio
 	await expect(
 		page.getByRole("link", { name: "正在跳转到 GitHub…" }),
 	).toHaveCount(0);
+});
+
+test("demo landing cancels queued OAuth when controls collapse to a null preview", async ({
+	page,
+}) => {
+	await page.goto("/?demo=landing-welcome");
+
+	await page.locator("[data-landing-login-cta]").dispatchEvent("click", {
+		button: 0,
+	});
+	await page.getByLabel("Case preset").selectOption("passkey-unsupported");
+
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toBeVisible();
+	await expect(page.locator("[data-landing-login-card]")).toHaveAttribute(
+		"aria-busy",
+		"false",
+	);
 });
 
 test("demo landing case selector renders every authentication state", async ({

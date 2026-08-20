@@ -56,6 +56,7 @@ type LandingProps = {
 	onRetryBoot?: () => void;
 	passkeySupportOverride?: boolean | null;
 	previewAuthAction?: LandingAuthAction | null;
+	previewAuthStateKey?: string;
 	onAuthNavigate?: (
 		href: string,
 		action: Extract<LandingAuthAction, "github" | "linuxdo">,
@@ -93,6 +94,7 @@ export function Landing({
 	onRetryBoot,
 	passkeySupportOverride = null,
 	previewAuthAction = null,
+	previewAuthStateKey,
 	onAuthNavigate,
 }: LandingProps) {
 	const githubLoginHref = resolveDemoSafeAuthHref(
@@ -133,6 +135,19 @@ export function Landing({
 			setActiveLoginAction(null);
 		}
 	}, [previewAuthAction]);
+
+	useEffect(() => {
+		if (previewAuthStateKey === undefined) return;
+		oauthNavigationTokenRef.current += 1;
+		if (
+			activeLoginActionRef.current === null ||
+			activeLoginActionRef.current === "github" ||
+			activeLoginActionRef.current === "linuxdo"
+		) {
+			activeLoginActionRef.current = null;
+			setActiveLoginAction(null);
+		}
+	}, [previewAuthStateKey]);
 
 	useEffect(() => {
 		return () => {
