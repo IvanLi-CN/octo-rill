@@ -105,6 +105,18 @@ jobs:
             echo "No web/ package; skipping"
           fi
 
+      - name: Front-end Storybook interaction tests (optional)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f web/package.json ]]; then
+            cd web
+            bunx playwright install chromium
+            bun run test:storybook
+          else
+            echo "No web/ package; skipping"
+          fi
+
       - name: Front-end demo build (optional)
         shell: bash
         run: |

@@ -94,6 +94,28 @@ test("demo landing holds OAuth navigation to expose mutual exclusion feedback", 
 	await expect(page).toHaveURL(/demo=landing-welcome/);
 });
 
+test("demo landing returns to idle when the inspector clears a held OAuth action", async ({
+	page,
+}) => {
+	await page.goto("/?demo=landing-welcome");
+
+	await page.locator("[data-landing-login-cta]").dispatchEvent("click", {
+		button: 0,
+	});
+	await expect(
+		page.getByRole("link", { name: "正在跳转到 GitHub…" }),
+	).toBeVisible();
+
+	await page.getByLabel("Case preset").selectOption("default");
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).not.toHaveAttribute("aria-disabled", "true");
+	await expect(page.locator("[data-landing-login-card]")).toHaveAttribute(
+		"aria-busy",
+		"false",
+	);
+});
+
 test("demo landing case selector renders every authentication state", async ({
 	page,
 }) => {

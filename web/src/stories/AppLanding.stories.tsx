@@ -18,7 +18,7 @@ const LANDING_VIEWPORTS = {
 const meta = {
 	title: "Pages/Landing",
 	component: Landing,
-	tags: ["autodocs"],
+	tags: ["autodocs", "landing-auth-feedback"],
 	parameters: {
 		layout: "fullscreen",
 		viewport: {
