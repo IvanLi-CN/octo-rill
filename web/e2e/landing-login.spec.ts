@@ -460,7 +460,19 @@ for (const pendingPasskey of [
 			await page.goto("/");
 			const activePasskeyButton = page.locator(pendingPasskey.ctaSelector);
 			await expect(activePasskeyButton).toBeVisible({ timeout: 15_000 });
-			await activePasskeyButton.click();
+			await page.evaluate((selector) => {
+				const button = document.querySelector<HTMLButtonElement>(selector);
+				if (!button) throw new Error("Passkey login button not found");
+				for (let index = 0; index < 2; index += 1) {
+					button.dispatchEvent(
+						new MouseEvent("click", {
+							bubbles: true,
+							cancelable: true,
+							button: 0,
+						}),
+					);
+				}
+			}, pendingPasskey.ctaSelector);
 			await expect.poll(() => pendingOptions.count()).toBe(1);
 
 			await expect(activePasskeyButton).toHaveText(pendingPasskey.pendingCopy);

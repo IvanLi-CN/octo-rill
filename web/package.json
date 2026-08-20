@@ -15,6 +15,7 @@
 		"preview": "vite preview --host 127.0.0.1 --port 55175 --strictPort",
 		"storybook": "storybook dev -p 55176 --host 127.0.0.1 --no-open",
 		"storybook:build": "storybook build",
+		"test:storybook": "vitest --project=storybook --run",
 		"test:day-groups": "bun run scripts/test-day-groups.ts",
 		"test:embedded-version": "bun run scripts/test-embedded-version.ts",
 		"test:pwa-build-contract": "bun ./scripts/test-pwa-build-contract.mjs"
@@ -45,15 +46,19 @@
 		"@biomejs/biome": "2.5.1",
 		"@playwright/test": "^1.57.0",
 		"@storybook/addon-docs": "10.2.10",
+		"@storybook/addon-vitest": "10.2.10",
 		"@storybook/react-vite": "10.2.10",
 		"@tanstack/router-plugin": "^1.167.22",
 		"@types/node": "^24.10.1",
 		"@types/react": "^19.2.7",
 		"@types/react-dom": "^19.2.3",
 		"@vitejs/plugin-react-swc": "^4.1.0",
+		"@vitest/browser": "4.1.11",
+		"@vitest/browser-playwright": "4.1.11",
 		"storybook": "10.2.10",
 		"typescript": "~5.9.3",
-		"vite": "^7.3.1"
+		"vite": "^7.3.1",
+		"vitest": "4.1.11"
 	},
 	"msw": {
 		"workerDirectory": [

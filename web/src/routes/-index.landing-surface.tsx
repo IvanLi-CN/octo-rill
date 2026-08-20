@@ -1,4 +1,4 @@
-import { useDemoSnapshot } from "@/demo/runtime";
+import { applyDemoShareStateInPlace, useDemoSnapshot } from "@/demo/runtime";
 import type { DemoShareState } from "@/demo/types";
 import type { NetworkErrorKind } from "@/lib/errorPresentation";
 import { Landing, type LandingAuthAction } from "@/pages/Landing";
@@ -52,7 +52,18 @@ export default function LandingRouteSurface(props: {
 		<Landing
 			{...props}
 			{...demoLandingState}
-			onAuthNavigate={demoLandingState ? () => undefined : undefined}
+			onAuthNavigate={
+				demoLandingState
+					? (_href, action) =>
+							applyDemoShareStateInPlace(
+								{
+									landingCase: "custom",
+									landingAuthAction: action,
+								},
+								{ reseed: false },
+							)
+					: undefined
+			}
 		/>
 	);
 }

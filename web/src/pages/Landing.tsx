@@ -56,7 +56,10 @@ type LandingProps = {
 	onRetryBoot?: () => void;
 	passkeySupportOverride?: boolean | null;
 	previewAuthAction?: LandingAuthAction | null;
-	onAuthNavigate?: (href: string) => void;
+	onAuthNavigate?: (
+		href: string,
+		action: Extract<LandingAuthAction, "github" | "linuxdo">,
+	) => void;
 };
 
 const heroTitle = "集中查看与你相关的 GitHub 动态";
@@ -106,11 +109,21 @@ export function Landing({
 	const [activeLoginAction, setActiveLoginAction] =
 		useState<LandingAuthAction | null>(null);
 	const activeLoginActionRef = useRef<LandingAuthAction | null>(null);
+	const previousPreviewAuthActionRef = useRef(previewAuthAction);
 	const [passkeyError, setPasskeyError] = useState<string | null>(null);
 
 	useEffect(() => {
 		setPasskeySupported(passkeySupportOverride ?? browserSupportsPasskeys());
 	}, [passkeySupportOverride]);
+
+	useEffect(() => {
+		const previousPreviewAuthAction = previousPreviewAuthActionRef.current;
+		previousPreviewAuthActionRef.current = previewAuthAction;
+		if (previousPreviewAuthAction === null || previewAuthAction !== null)
+			return;
+		activeLoginActionRef.current = null;
+		setActiveLoginAction(null);
+	}, [previewAuthAction]);
 
 	const authNetworkUnavailable =
 		bootErrorKind === "offline" || bootErrorKind === "network";
@@ -125,9 +138,12 @@ export function Landing({
 				: null;
 
 	const navigateToAuth = useCallback(
-		(href: string) => {
+		(
+			href: string,
+			action: Extract<LandingAuthAction, "github" | "linuxdo">,
+		) => {
 			if (onAuthNavigate) {
-				onAuthNavigate(href);
+				onAuthNavigate(href, action);
 				return;
 			}
 			window.location.assign(href);
@@ -162,7 +178,7 @@ export function Landing({
 			setPasskeyError(null);
 			requestAnimationFrame(() => {
 				requestAnimationFrame(() => {
-					navigateToAuth(href);
+					navigateToAuth(href, provider);
 				});
 			});
 		},
