@@ -79,6 +79,32 @@ async function installPendingAuthRedirect(
 	};
 }
 
+async function installPendingPasskeyOptions(
+	page: Page,
+	action: "authenticate" | "register",
+) {
+	let requestCount = 0;
+	let releaseOptions: (() => void) | undefined;
+	const optionsReleased = new Promise<void>((resolve) => {
+		releaseOptions = resolve;
+	});
+	const routePattern = `**/api/auth/passkeys/${action}/options`;
+
+	await page.route(routePattern, async (route) => {
+		requestCount += 1;
+		await optionsReleased;
+		await route.abort();
+	});
+
+	return {
+		count: () => requestCount,
+		release: async () => {
+			releaseOptions?.();
+			await page.unroute(routePattern).catch(() => undefined);
+		},
+	};
+}
+
 test("landing page shows concise login copy for unauthenticated users", async ({
 	page,
 }) => {
@@ -407,3 +433,74 @@ test("landing page shows the LinuxDO redirect state without a second OAuth reque
 		await pendingAuth.release();
 	}
 });
+
+for (const pendingPasskey of [
+	{
+		action: "authenticate" as const,
+		ctaSelector: "[data-landing-passkey-login-cta]",
+		pendingCopy: "正在验证 Passkey…",
+	},
+	{
+		action: "register" as const,
+		ctaSelector: "[data-landing-passkey-register-cta]",
+		pendingCopy: "正在创建 Passkey…",
+	},
+]) {
+	test(`landing page locks every login action while Passkey ${pendingPasskey.action} is starting`, async ({
+		page,
+	}) => {
+		await installPasskeyBrowserMock(page);
+		await installLandingApiMocks(page, 401, "unauthorized");
+		const pendingOptions = await installPendingPasskeyOptions(
+			page,
+			pendingPasskey.action,
+		);
+
+		try {
+			await page.goto("/");
+			const activePasskeyButton = page.locator(pendingPasskey.ctaSelector);
+			await expect(activePasskeyButton).toBeVisible({ timeout: 15_000 });
+			await activePasskeyButton.click();
+			await expect.poll(() => pendingOptions.count()).toBe(1);
+
+			await expect(activePasskeyButton).toHaveText(pendingPasskey.pendingCopy);
+			await expect(activePasskeyButton).toBeDisabled();
+			await expect(page.locator("[data-landing-login-cta]")).toHaveAttribute(
+				"aria-disabled",
+				"true",
+			);
+			await expect(page.locator("[data-landing-linuxdo-cta]")).toHaveAttribute(
+				"aria-disabled",
+				"true",
+			);
+			await expect(
+				page.locator("[data-landing-passkey-login-cta]"),
+			).toBeDisabled();
+			await expect(
+				page.locator("[data-landing-passkey-register-cta]"),
+			).toBeDisabled();
+			await expect(page.locator("[data-landing-login-card]")).toHaveAttribute(
+				"aria-busy",
+				"true",
+			);
+
+			const disabledOAuthClick = await page.evaluate(() => {
+				const link = document.querySelector<HTMLAnchorElement>(
+					"[data-landing-login-cta]",
+				);
+				if (!link) throw new Error("GitHub login link not found");
+				const click = new MouseEvent("click", {
+					bubbles: true,
+					cancelable: true,
+					button: 0,
+				});
+				link.dispatchEvent(click);
+				return click.defaultPrevented;
+			});
+			expect(disabledOAuthClick).toBe(true);
+			expect(pendingOptions.count()).toBe(1);
+		} finally {
+			await pendingOptions.release();
+		}
+	});
+}
