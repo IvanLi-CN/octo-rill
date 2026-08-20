@@ -120,6 +120,8 @@ export function Landing({
 	useEffect(() => {
 		const previousPreviewAuthAction = previousPreviewAuthActionRef.current;
 		previousPreviewAuthActionRef.current = previewAuthAction;
+		if (previousPreviewAuthAction === previewAuthAction) return;
+		oauthNavigationTokenRef.current += 1;
 		if (previousPreviewAuthAction === null || previewAuthAction !== null)
 			return;
 		if (
@@ -127,7 +129,6 @@ export function Landing({
 			activeLoginActionRef.current === "github" ||
 			activeLoginActionRef.current === "linuxdo"
 		) {
-			oauthNavigationTokenRef.current += 1;
 			activeLoginActionRef.current = null;
 			setActiveLoginAction(null);
 		}
