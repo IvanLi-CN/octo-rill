@@ -501,7 +501,7 @@ export async function prepareDemoRuntime() {
 
 	dependencies.clearAllWarmStartupCaches();
 	await ensureWorkerStarted();
-	runtimeSnapshot = { ...runtimeState };
+	emit();
 }
 
 export function getDemoSnapshot() {
