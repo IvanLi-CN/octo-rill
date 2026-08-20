@@ -111,7 +111,7 @@ jobs:
           set -euo pipefail
           if [[ -f web/package.json ]]; then
             cd web
-            bunx playwright install chromium
+            bunx playwright install --with-deps chromium
             bun run test:storybook
           else
             echo "No web/ package; skipping"
