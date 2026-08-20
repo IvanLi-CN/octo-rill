@@ -175,6 +175,8 @@
 
 ## Visual Evidence
 
+PR: none
+
 Landing Passkey 入口（storybook: `Pages/AppLanding / Default`）
 ![Landing passkey entry](./assets/landing-passkey-entry.png)
 
