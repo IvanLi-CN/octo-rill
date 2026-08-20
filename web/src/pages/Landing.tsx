@@ -127,7 +127,11 @@ export function Landing({
 				previousPreviewAuthAction !== "linuxdo")
 		)
 			return;
-		if (activeLoginActionRef.current === previousPreviewAuthAction) {
+		if (
+			activeLoginActionRef.current === null ||
+			activeLoginActionRef.current === "github" ||
+			activeLoginActionRef.current === "linuxdo"
+		) {
 			oauthNavigationTokenRef.current += 1;
 			activeLoginActionRef.current = null;
 			setActiveLoginAction(null);

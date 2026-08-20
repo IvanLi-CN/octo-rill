@@ -110,7 +110,12 @@ export const OAuthRedirectPending: Story = {
 		await userEvent.click(githubLink);
 		await expect(githubLink).toHaveAccessibleName("正在跳转到 GitHub…");
 		await expect(githubLink).toHaveAttribute("aria-disabled", "true");
+		await expect(githubLink).toHaveAttribute("data-disabled", "true");
+		await expect(
+			canvasElement.querySelector("[data-landing-login-cta] svg.animate-spin"),
+		).not.toBeNull();
 		await expect(linuxDoLink).toHaveAttribute("aria-disabled", "true");
+		await expect(linuxDoLink).toHaveAttribute("data-disabled", "true");
 		await expect(
 			canvas.getByRole("button", { name: "使用 Passkey 登录" }),
 		).toBeDisabled();
