@@ -339,9 +339,14 @@ test("landing page locks every login action while GitHub OAuth is starting", asy
 						resolve({
 							githubName: link.textContent?.trim(),
 							githubDisabled: link.getAttribute("aria-disabled"),
+							githubDataDisabled: link.getAttribute("data-disabled"),
+							githubSpinner: Boolean(link.querySelector("svg.animate-spin")),
 							linuxdoDisabled: document
 								.querySelector("[data-landing-linuxdo-cta]")
 								?.getAttribute("aria-disabled"),
+							linuxdoDataDisabled: document
+								.querySelector("[data-landing-linuxdo-cta]")
+								?.getAttribute("data-disabled"),
 							passkeyLoginDisabled: document.querySelector<HTMLButtonElement>(
 								"[data-landing-passkey-login-cta]",
 							)?.disabled,
@@ -359,7 +364,10 @@ test("landing page locks every login action while GitHub OAuth is starting", asy
 		expect(pendingState).toEqual({
 			githubName: "正在跳转到 GitHub…",
 			githubDisabled: "true",
+			githubDataDisabled: "true",
+			githubSpinner: true,
 			linuxdoDisabled: "true",
+			linuxdoDataDisabled: "true",
 			passkeyLoginDisabled: true,
 			passkeyRegisterDisabled: true,
 			cardBusy: "true",
@@ -405,7 +413,12 @@ test("landing page shows the LinuxDO redirect state without a second OAuth reque
 							githubDisabled: document
 								.querySelector("[data-landing-login-cta]")
 								?.getAttribute("aria-disabled"),
+							githubDataDisabled: document
+								.querySelector("[data-landing-login-cta]")
+								?.getAttribute("data-disabled"),
 							linuxdoDisabled: link.getAttribute("aria-disabled"),
+							linuxdoDataDisabled: link.getAttribute("data-disabled"),
+							linuxdoSpinner: Boolean(link.querySelector("svg.animate-spin")),
 							passkeyLoginDisabled: document.querySelector<HTMLButtonElement>(
 								"[data-landing-passkey-login-cta]",
 							)?.disabled,
@@ -423,7 +436,10 @@ test("landing page shows the LinuxDO redirect state without a second OAuth reque
 		expect(pendingState).toEqual({
 			linuxdoName: "正在跳转到 LinuxDO…",
 			githubDisabled: "true",
+			githubDataDisabled: "true",
 			linuxdoDisabled: "true",
+			linuxdoDataDisabled: "true",
+			linuxdoSpinner: true,
 			passkeyLoginDisabled: true,
 			passkeyRegisterDisabled: true,
 			cardBusy: "true",
