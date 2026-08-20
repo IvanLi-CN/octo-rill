@@ -4,6 +4,10 @@ import {
 } from "@/dashboard/routeState";
 import { buildSettingsHref } from "@/settings/routeState";
 import type {
+	DemoLandingAuthAction,
+	DemoLandingBootState,
+	DemoLandingCase,
+	DemoLandingPasskeySupport,
 	DemoNetworkMode,
 	DemoPersonaId,
 	DemoPublicationState,
@@ -17,6 +21,92 @@ const repoScope: DashboardScope = {
 	owner: "octo-demo",
 	repo: "release-lab",
 };
+
+export const LANDING_CASE_OPTIONS = [
+	{ value: "default", label: "Default" },
+	{ value: "custom", label: "Custom" },
+	{ value: "github-redirect", label: "GitHub OAuth pending" },
+	{ value: "linuxdo-redirect", label: "LinuxDO OAuth pending" },
+	{ value: "passkey-authenticate", label: "Passkey sign-in pending" },
+	{ value: "passkey-register", label: "Passkey creation pending" },
+	{ value: "passkey-unsupported", label: "Passkey unsupported" },
+	{ value: "auth-network-unavailable", label: "Auth network unavailable" },
+] as const satisfies ReadonlyArray<{
+	value: DemoLandingCase;
+	label: string;
+}>;
+
+export const LANDING_AUTH_ACTION_OPTIONS = [
+	{ value: "idle", label: "Idle" },
+	{ value: "github", label: "GitHub OAuth pending" },
+	{ value: "linuxdo", label: "LinuxDO OAuth pending" },
+	{ value: "passkey-authenticate", label: "Passkey sign-in pending" },
+	{ value: "passkey-register", label: "Passkey creation pending" },
+] as const satisfies ReadonlyArray<{
+	value: DemoLandingAuthAction;
+	label: string;
+}>;
+
+export const LANDING_PASSKEY_SUPPORT_OPTIONS = [
+	{ value: "supported", label: "Supported" },
+	{ value: "unsupported", label: "Unsupported" },
+] as const satisfies ReadonlyArray<{
+	value: DemoLandingPasskeySupport;
+	label: string;
+}>;
+
+export const LANDING_BOOT_STATE_OPTIONS = [
+	{ value: "ready", label: "Ready" },
+	{ value: "network-unavailable", label: "Network unavailable" },
+] as const satisfies ReadonlyArray<{
+	value: DemoLandingBootState;
+	label: string;
+}>;
+
+type DemoLandingControls = Pick<
+	DemoShareState,
+	"landingAuthAction" | "landingPasskeySupport" | "landingBootState"
+>;
+
+const DEFAULT_LANDING_CONTROLS: DemoLandingControls = {
+	landingAuthAction: "idle",
+	landingPasskeySupport: "supported",
+	landingBootState: "ready",
+};
+
+export function getLandingCaseControls(
+	landingCase: DemoLandingCase,
+): DemoLandingControls {
+	switch (landingCase) {
+		case "github-redirect":
+			return { ...DEFAULT_LANDING_CONTROLS, landingAuthAction: "github" };
+		case "linuxdo-redirect":
+			return { ...DEFAULT_LANDING_CONTROLS, landingAuthAction: "linuxdo" };
+		case "passkey-authenticate":
+			return {
+				...DEFAULT_LANDING_CONTROLS,
+				landingAuthAction: "passkey-authenticate",
+			};
+		case "passkey-register":
+			return {
+				...DEFAULT_LANDING_CONTROLS,
+				landingAuthAction: "passkey-register",
+			};
+		case "passkey-unsupported":
+			return {
+				...DEFAULT_LANDING_CONTROLS,
+				landingPasskeySupport: "unsupported",
+			};
+		case "auth-network-unavailable":
+			return {
+				...DEFAULT_LANDING_CONTROLS,
+				landingBootState: "network-unavailable",
+			};
+		case "custom":
+		case "default":
+			return { ...DEFAULT_LANDING_CONTROLS };
+	}
+}
 
 export const DEMO_SCENES: DemoScene[] = [
 	{
@@ -145,6 +235,43 @@ export function normalizeNetworkMode(
 	return "normal";
 }
 
+export function normalizeLandingCase(
+	value: string | null | undefined,
+): DemoLandingCase {
+	return LANDING_CASE_OPTIONS.some((option) => option.value === value)
+		? (value as DemoLandingCase)
+		: "default";
+}
+
+function normalizeLandingAuthAction(
+	value: string | null | undefined,
+	fallback: DemoLandingAuthAction,
+): DemoLandingAuthAction {
+	return LANDING_AUTH_ACTION_OPTIONS.some((option) => option.value === value)
+		? (value as DemoLandingAuthAction)
+		: fallback;
+}
+
+function normalizeLandingPasskeySupport(
+	value: string | null | undefined,
+	fallback: DemoLandingPasskeySupport,
+): DemoLandingPasskeySupport {
+	return LANDING_PASSKEY_SUPPORT_OPTIONS.some(
+		(option) => option.value === value,
+	)
+		? (value as DemoLandingPasskeySupport)
+		: fallback;
+}
+
+function normalizeLandingBootState(
+	value: string | null | undefined,
+	fallback: DemoLandingBootState,
+): DemoLandingBootState {
+	return LANDING_BOOT_STATE_OPTIONS.some((option) => option.value === value)
+		? (value as DemoLandingBootState)
+		: fallback;
+}
+
 export function normalizePublicationState(
 	value: string | null | undefined,
 ): DemoPublicationState {
@@ -157,6 +284,8 @@ export function readDemoShareState(url: URL, basepath: string): DemoShareState {
 		? (sceneIdRaw as DemoSceneId)
 		: resolveDefaultSceneId(url.pathname, basepath);
 	const defaults = buildDefaultDemoShareState(sceneId);
+	const landingCase = normalizeLandingCase(url.searchParams.get("d_case"));
+	const landingCaseControls = getLandingCaseControls(landingCase);
 
 	return {
 		sceneId,
@@ -167,6 +296,19 @@ export function readDemoShareState(url: URL, basepath: string): DemoShareState {
 		networkMode: normalizeNetworkMode(url.searchParams.get("d_net")),
 		includeOwnReleases: url.searchParams.get("d_own") === "1",
 		publicationState: normalizePublicationState(url.searchParams.get("d_pub")),
+		landingCase,
+		landingAuthAction: normalizeLandingAuthAction(
+			url.searchParams.get("d_auth"),
+			landingCaseControls.landingAuthAction,
+		),
+		landingPasskeySupport: normalizeLandingPasskeySupport(
+			url.searchParams.get("d_passkey"),
+			landingCaseControls.landingPasskeySupport,
+		),
+		landingBootState: normalizeLandingBootState(
+			url.searchParams.get("d_auth_boot"),
+			landingCaseControls.landingBootState,
+		),
 		controlsHidden: url.searchParams.get("d_controls") === "hidden",
 	};
 }
@@ -181,6 +323,8 @@ export function buildDefaultDemoShareState(
 		networkMode: "normal",
 		includeOwnReleases: false,
 		publicationState: "unpublished",
+		landingCase: "default",
+		...DEFAULT_LANDING_CONTROLS,
 		controlsHidden: false,
 	};
 }
@@ -206,6 +350,21 @@ export function applyDemoShareStateToSearchParams(
 	}
 	if (state.publicationState === "published") {
 		target.set("d_pub", "published");
+	}
+	const landingCaseControls = getLandingCaseControls(state.landingCase);
+	if (state.landingCase !== "default") {
+		target.set("d_case", state.landingCase);
+	}
+	if (state.landingAuthAction !== landingCaseControls.landingAuthAction) {
+		target.set("d_auth", state.landingAuthAction);
+	}
+	if (
+		state.landingPasskeySupport !== landingCaseControls.landingPasskeySupport
+	) {
+		target.set("d_passkey", state.landingPasskeySupport);
+	}
+	if (state.landingBootState !== landingCaseControls.landingBootState) {
+		target.set("d_auth_boot", state.landingBootState);
 	}
 	if (state.controlsHidden) {
 		target.set("d_controls", "hidden");

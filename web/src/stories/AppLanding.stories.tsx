@@ -18,7 +18,7 @@ const LANDING_VIEWPORTS = {
 const meta = {
 	title: "Pages/Landing",
 	component: Landing,
-	tags: ["autodocs"],
+	tags: ["autodocs", "landing-auth-feedback"],
 	parameters: {
 		layout: "fullscreen",
 		viewport: {
@@ -87,6 +87,50 @@ export const Default: Story = {
 			description: {
 				story:
 					"默认未登录首屏：桌面保留品牌说明区 + 独立登录卡，同时暴露 GitHub / LinuxDO / Passkey 入口，其中 Passkey 支持返回用户直登与首登先建后绑。",
+			},
+		},
+	},
+};
+
+export const OAuthRedirectPending: Story = {
+	args: {
+		bootError: null,
+		passkeySupportOverride: true,
+		onAuthNavigate: () => undefined,
+	},
+	play: async ({ canvasElement, userEvent }) => {
+		const canvas = within(canvasElement);
+		const githubLink = canvas.getByRole("link", {
+			name: "使用 GitHub 登录",
+		});
+		const linuxDoLink = canvas.getByRole("link", {
+			name: "使用 LinuxDO 登录",
+		});
+
+		await userEvent.click(githubLink);
+		await expect(githubLink).toHaveAccessibleName("正在跳转到 GitHub…");
+		await expect(githubLink).toHaveAttribute("aria-disabled", "true");
+		await expect(githubLink).toHaveAttribute("data-disabled", "true");
+		await expect(
+			canvasElement.querySelector("[data-landing-login-cta] svg.animate-spin"),
+		).not.toBeNull();
+		await expect(linuxDoLink).toHaveAttribute("aria-disabled", "true");
+		await expect(linuxDoLink).toHaveAttribute("data-disabled", "true");
+		await expect(
+			canvas.getByRole("button", { name: "使用 Passkey 登录" }),
+		).toBeDisabled();
+		await expect(
+			canvasElement.querySelector("[aria-busy=true]"),
+		).not.toBeNull();
+		await expect(canvas.getByRole("status")).toHaveTextContent(
+			"正在跳转到 GitHub 登录。",
+		);
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"受控 OAuth 导航 mock 下的跳转中状态：活动入口显示反馈，所有登录方式同时进入互斥禁用态。",
 			},
 		},
 	},
