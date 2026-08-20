@@ -90,6 +90,7 @@
 - Landing 增加两类 Passkey CTA：
   - `使用 Passkey 登录`（左侧带 Passkey 图标，和其他登录入口保持一致）
   - `首次使用？创建 Passkey 并继续绑定 GitHub`
+- Landing 的 GitHub、LinuxDO 与两项 Passkey 操作归入同一认证动作组：任一动作开始后，四个入口立即互斥禁用；OAuth 入口仍保留原始链接与修饰键语义，并显示跳转中反馈。
 - `/settings` 支持 `section=passkeys` 与 `passkey=<status>`
   - 仅 `section=passkeys` 保留 `passkey=<status>` flash；切到其他设置分区时必须清掉该 query，避免成功/错误 banner 泄漏到无关页面
   - 若 GitHub callback 同时带回 LinuxDO `connected` 与 Passkey 恢复类状态（如 `passkey_retry_required` / `passkey_already_bound` / `expired`），落点仍必须优先打开 `section=passkeys`，避免把 Passkey remediation 引导到其他分区
@@ -100,6 +101,7 @@
 ### 返回用户：直接使用 Passkey 登录
 
 - 用户在 Landing 点击 `使用 Passkey 登录`。
+- 点击后登录卡进入 `aria-busy` 忙碌态，GitHub / LinuxDO / 两项 Passkey 入口均不可重复交互；Passkey 现有加载、错误与最终清理行为保持不变。
 - 前端向后端请求 discoverable challenge，浏览器完成 WebAuthn `get()`。
 - 后端通过 discoverable user handle 找到既有账号，并验证该账号仍有至少一条 GitHub connection。
 - 验证成功后写入 session，更新对应 Passkey 的 `last_used_at`，返回 `/`。
@@ -158,6 +160,10 @@
   When callback 尝试消费 pending Passkey
   Then 系统返回 `passkey_retry_required`，不自动合并账号。
 
+- Given 用户处于 Landing 且四个认证入口均可用
+  When 用户以未修饰主键点击任一认证入口
+  Then 活动入口立即显示忙碌反馈，其他入口同步禁用，且重复点击不会产生第二次认证动作。
+
 ## 质量门槛
 
 - `cargo fmt --all -- --check`
@@ -168,6 +174,8 @@
 - `cd web && bun run e2e -- landing-login.spec.ts bind-github.spec.ts settings.spec.ts passkey-login.spec.ts`
 
 ## Visual Evidence
+
+PR: none
 
 Landing Passkey 入口（storybook: `Pages/AppLanding / Default`）
 ![Landing passkey entry](./assets/landing-passkey-entry.png)

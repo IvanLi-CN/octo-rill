@@ -64,6 +64,244 @@ test("demo auth affordances stay inside mock runtime", async ({ page }) => {
 	).toBeVisible();
 });
 
+test("demo landing holds OAuth navigation to expose mutual exclusion feedback", async ({
+	page,
+}) => {
+	await page.goto("/?demo=landing-welcome&d_controls=hidden");
+
+	const githubLogin = page.getByRole("link", { name: "使用 GitHub 登录" });
+	await githubLogin.click();
+
+	const pendingGithubLogin = page.getByRole("link", {
+		name: "正在跳转到 GitHub…",
+	});
+	await expect(pendingGithubLogin).toHaveAttribute("aria-disabled", "true");
+	await expect(
+		page.getByRole("link", { name: "使用 LinuxDO 登录" }),
+	).toHaveAttribute("aria-disabled", "true");
+	await expect(
+		page.getByRole("button", { name: "使用 Passkey 登录" }),
+	).toBeDisabled();
+	await expect(
+		page.getByRole("button", {
+			name: "首次使用？创建 Passkey 并继续绑定 GitHub",
+		}),
+	).toBeDisabled();
+	await expect(page.locator("[data-landing-login-card]")).toHaveAttribute(
+		"aria-busy",
+		"true",
+	);
+	await expect(page).toHaveURL(/demo=landing-welcome/);
+});
+
+test("demo landing returns to idle when the inspector clears a held OAuth action", async ({
+	page,
+}) => {
+	await page.goto("/?demo=landing-welcome");
+
+	await page.locator("[data-landing-login-cta]").dispatchEvent("click", {
+		button: 0,
+	});
+	await expect(
+		page.getByRole("link", { name: "正在跳转到 GitHub…" }),
+	).toBeVisible();
+
+	await page.getByLabel("Case preset").selectOption("linuxdo-redirect");
+	await page.getByLabel("Case preset").selectOption("default");
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).not.toHaveAttribute("aria-disabled", "true");
+	await expect(page.locator("[data-landing-login-card]")).toHaveAttribute(
+		"aria-busy",
+		"false",
+	);
+});
+
+test("demo landing clears a local OAuth action after a cross-case reset", async ({
+	page,
+}) => {
+	await page.goto("/?demo=landing-welcome");
+
+	await page.locator("[data-landing-login-cta]").dispatchEvent("click", {
+		button: 0,
+	});
+	await expect(
+		page.getByRole("link", { name: "正在跳转到 GitHub…" }),
+	).toBeVisible();
+
+	await page.getByLabel("Login action").selectOption("passkey-authenticate");
+	await expect(
+		page.getByRole("button", { name: "正在验证 Passkey…" }),
+	).toBeDisabled();
+	await page.getByLabel("Login action").selectOption("idle");
+
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toBeVisible();
+	await expect(page.locator("[data-landing-login-card]")).toHaveAttribute(
+		"aria-busy",
+		"false",
+	);
+});
+
+test("demo landing cancels queued OAuth when the inspector selects another action", async ({
+	page,
+}) => {
+	await page.goto("/?demo=landing-welcome");
+
+	await page.locator("[data-landing-login-cta]").dispatchEvent("click", {
+		button: 0,
+	});
+	await page.getByLabel("Login action").selectOption("linuxdo");
+
+	await expect(
+		page.getByRole("link", { name: "正在跳转到 LinuxDO…" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("link", { name: "正在跳转到 GitHub…" }),
+	).toHaveCount(0);
+});
+
+test("demo landing cancels queued OAuth when controls collapse to a null preview", async ({
+	page,
+}) => {
+	await page.goto("/?demo=landing-welcome");
+
+	await page.locator("[data-landing-login-cta]").dispatchEvent("click", {
+		button: 0,
+	});
+	await page.getByLabel("Case preset").selectOption("passkey-unsupported");
+
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toBeVisible();
+	await expect(page.locator("[data-landing-login-card]")).toHaveAttribute(
+		"aria-busy",
+		"false",
+	);
+});
+
+test("demo landing case selector renders every authentication state", async ({
+	page,
+}) => {
+	await page.goto("/?demo=landing-welcome");
+
+	const caseSelect = page.getByLabel("Case preset");
+	await expect(caseSelect).toHaveValue("default", { timeout: 15_000 });
+
+	await caseSelect.selectOption("github-redirect");
+	await expect(page.locator("[data-landing-login-cta]")).toHaveText(
+		"正在跳转到 GitHub…",
+	);
+	await expect(page.locator("[data-landing-linuxdo-cta]")).toHaveAttribute(
+		"aria-disabled",
+		"true",
+	);
+	await expect(page).toHaveURL(/d_case=github-redirect/);
+
+	await caseSelect.selectOption("linuxdo-redirect");
+	await expect(page.locator("[data-landing-linuxdo-cta]")).toHaveText(
+		"正在跳转到 LinuxDO…",
+	);
+	await expect(page.locator("[data-landing-login-cta]")).toHaveAttribute(
+		"aria-disabled",
+		"true",
+	);
+
+	await caseSelect.selectOption("passkey-authenticate");
+	await expect(page.locator("[data-landing-passkey-login-cta]")).toHaveText(
+		"正在验证 Passkey…",
+	);
+	await expect(page.locator("[data-landing-passkey-login-cta]")).toBeDisabled();
+
+	await caseSelect.selectOption("passkey-register");
+	await expect(page.locator("[data-landing-passkey-register-cta]")).toHaveText(
+		"正在创建 Passkey…",
+	);
+	await expect(
+		page.locator("[data-landing-passkey-register-cta]"),
+	).toBeDisabled();
+
+	await caseSelect.selectOption("passkey-unsupported");
+	await expect(
+		page.getByText(
+			"当前浏览器不支持 Passkey；你仍然可以继续使用 GitHub / LinuxDO 登录。",
+		),
+	).toBeVisible();
+
+	await caseSelect.selectOption("auth-network-unavailable");
+	await expect(
+		page.locator('[data-landing-boot-network-state="network"]'),
+	).toBeVisible();
+	await expect(page.locator("[data-landing-login-cta]")).toHaveAttribute(
+		"aria-disabled",
+		"true",
+	);
+	await expect(page.locator("[data-landing-linuxdo-cta]")).toHaveAttribute(
+		"aria-disabled",
+		"true",
+	);
+});
+
+test("landing scene controls compose custom authentication states", async ({
+	page,
+}) => {
+	await page.goto("/?demo=landing-welcome");
+
+	const controls = page.locator('[data-demo-scene-controls="landing"]');
+	await expect(controls.getByText("Landing Controls")).toBeVisible();
+	const casePreset = controls.getByLabel("Case preset");
+	const loginAction = controls.getByLabel("Login action");
+	const passkeySupport = controls.getByLabel("Passkey support");
+	const authBoot = controls.getByLabel("Auth boot");
+
+	await loginAction.selectOption("github");
+	await expect(casePreset).toHaveValue("custom");
+	await expect(page.locator("[data-landing-login-cta]")).toHaveText(
+		"正在跳转到 GitHub…",
+	);
+	await expect(page).toHaveURL(/d_case=custom/);
+	await expect(page).toHaveURL(/d_auth=github/);
+
+	await loginAction.selectOption("passkey-register");
+	await expect(page.locator("[data-landing-passkey-register-cta]")).toHaveText(
+		"正在创建 Passkey…",
+	);
+	await expect(passkeySupport).toHaveValue("supported");
+
+	await passkeySupport.selectOption("unsupported");
+	await expect(loginAction).toHaveValue("idle");
+	await expect(
+		page.getByText(
+			"当前浏览器不支持 Passkey；你仍然可以继续使用 GitHub / LinuxDO 登录。",
+		),
+	).toBeVisible();
+
+	await authBoot.selectOption("network-unavailable");
+	await expect(
+		page.locator('[data-landing-boot-network-state="network"]'),
+	).toBeVisible();
+	await expect(loginAction).toHaveValue("idle");
+});
+
+test("scene changes reset to the target specialized control context", async ({
+	page,
+}) => {
+	await page.goto(
+		"/?demo=landing-welcome&d_persona=guest&d_case=custom&d_auth=github",
+	);
+
+	await page.getByLabel("Scene").selectOption("dashboard-repo-publish");
+	await expect(page.getByText("Dashboard Controls")).toBeVisible();
+	await expect(
+		page.locator('[data-dashboard-brand-heading="true"]'),
+	).toBeVisible();
+	await expect(page).toHaveURL(/demo=dashboard-repo-publish/);
+	await expect(page).toHaveURL(/d_persona=member/);
+	expect(new URL(page.url()).searchParams.has("d_case")).toBe(false);
+	expect(new URL(page.url()).searchParams.has("d_auth")).toBe(false);
+});
+
 test("demo mode skips live warm auth seed on first paint", async ({ page }) => {
 	await page.addInitScript(() => {
 		localStorage.setItem(

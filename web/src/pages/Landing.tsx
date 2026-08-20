@@ -27,8 +27,27 @@ import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
 import type { NetworkErrorKind } from "@/lib/errorPresentation";
-import { Inbox, Package2, RefreshCcw, Users, WifiOff } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import {
+	Inbox,
+	LoaderCircle,
+	Package2,
+	RefreshCcw,
+	Users,
+	WifiOff,
+} from "lucide-react";
+import {
+	useCallback,
+	useEffect,
+	useRef,
+	useState,
+	type MouseEvent,
+} from "react";
+
+export type LandingAuthAction =
+	| "github"
+	| "linuxdo"
+	| "passkey-authenticate"
+	| "passkey-register";
 
 type LandingProps = {
 	bootError?: string | null;
@@ -36,6 +55,12 @@ type LandingProps = {
 	bootErrorDetail?: string | null;
 	onRetryBoot?: () => void;
 	passkeySupportOverride?: boolean | null;
+	previewAuthAction?: LandingAuthAction | null;
+	previewAuthStateKey?: string;
+	onAuthNavigate?: (
+		href: string,
+		action: Extract<LandingAuthAction, "github" | "linuxdo">,
+	) => void;
 };
 
 const heroTitle = "集中查看与你相关的 GitHub 动态";
@@ -68,6 +93,9 @@ export function Landing({
 	bootErrorDetail = null,
 	onRetryBoot,
 	passkeySupportOverride = null,
+	previewAuthAction = null,
+	previewAuthStateKey,
+	onAuthNavigate,
 }: LandingProps) {
 	const githubLoginHref = resolveDemoSafeAuthHref(
 		"/auth/github/login",
@@ -80,18 +108,118 @@ export function Landing({
 	const [passkeySupported, setPasskeySupported] = useState(
 		() => passkeySupportOverride ?? browserSupportsPasskeys(),
 	);
-	const [passkeyBusyMode, setPasskeyBusyMode] = useState<
-		"authenticate" | "register" | null
-	>(null);
+	const [activeLoginAction, setActiveLoginAction] =
+		useState<LandingAuthAction | null>(null);
+	const activeLoginActionRef = useRef<LandingAuthAction | null>(null);
+	const oauthNavigationTokenRef = useRef(0);
+	const previousPreviewAuthActionRef = useRef(previewAuthAction);
 	const [passkeyError, setPasskeyError] = useState<string | null>(null);
 
 	useEffect(() => {
 		setPasskeySupported(passkeySupportOverride ?? browserSupportsPasskeys());
 	}, [passkeySupportOverride]);
 
+	useEffect(() => {
+		const previousPreviewAuthAction = previousPreviewAuthActionRef.current;
+		previousPreviewAuthActionRef.current = previewAuthAction;
+		if (previousPreviewAuthAction === previewAuthAction) return;
+		oauthNavigationTokenRef.current += 1;
+		if (previousPreviewAuthAction === null || previewAuthAction !== null)
+			return;
+		if (
+			activeLoginActionRef.current === null ||
+			activeLoginActionRef.current === "github" ||
+			activeLoginActionRef.current === "linuxdo"
+		) {
+			activeLoginActionRef.current = null;
+			setActiveLoginAction(null);
+		}
+	}, [previewAuthAction]);
+
+	useEffect(() => {
+		if (previewAuthStateKey === undefined) return;
+		oauthNavigationTokenRef.current += 1;
+		if (
+			activeLoginActionRef.current === null ||
+			activeLoginActionRef.current === "github" ||
+			activeLoginActionRef.current === "linuxdo"
+		) {
+			activeLoginActionRef.current = null;
+			setActiveLoginAction(null);
+		}
+	}, [previewAuthStateKey]);
+
+	useEffect(() => {
+		return () => {
+			oauthNavigationTokenRef.current += 1;
+		};
+	}, []);
+
 	const authNetworkUnavailable =
 		bootErrorKind === "offline" || bootErrorKind === "network";
-	const loginLinkDisabled = authNetworkUnavailable;
+	const displayedLoginAction = previewAuthAction ?? activeLoginAction;
+	const loginBusy = displayedLoginAction !== null;
+	const loginLinkDisabled = authNetworkUnavailable || loginBusy;
+	const passkeyBusyMode =
+		displayedLoginAction === "passkey-authenticate"
+			? "authenticate"
+			: displayedLoginAction === "passkey-register"
+				? "register"
+				: null;
+
+	const navigateToAuth = useCallback(
+		(
+			href: string,
+			action: Extract<LandingAuthAction, "github" | "linuxdo">,
+		) => {
+			if (onAuthNavigate) {
+				onAuthNavigate(href, action);
+				return;
+			}
+			window.location.assign(href);
+		},
+		[onAuthNavigate],
+	);
+
+	const onOAuthLogin = useCallback(
+		(
+			event: MouseEvent<HTMLAnchorElement>,
+			provider: Extract<LandingAuthAction, "github" | "linuxdo">,
+			href: string,
+		) => {
+			if (loginLinkDisabled || activeLoginActionRef.current !== null) {
+				event.preventDefault();
+				return;
+			}
+
+			if (
+				event.button !== 0 ||
+				event.metaKey ||
+				event.altKey ||
+				event.ctrlKey ||
+				event.shiftKey
+			) {
+				return;
+			}
+
+			event.preventDefault();
+			const navigationToken = ++oauthNavigationTokenRef.current;
+			activeLoginActionRef.current = provider;
+			setActiveLoginAction(provider);
+			setPasskeyError(null);
+			requestAnimationFrame(() => {
+				requestAnimationFrame(() => {
+					if (
+						oauthNavigationTokenRef.current !== navigationToken ||
+						activeLoginActionRef.current !== provider
+					)
+						return;
+					navigateToAuth(href, provider);
+				});
+			});
+		},
+		[loginLinkDisabled, navigateToAuth],
+	);
 
 	const onAuthenticatePasskey = useCallback(() => {
 		if (!passkeySupported) {
@@ -100,7 +228,15 @@ export function Landing({
 			);
 			return;
 		}
-		setPasskeyBusyMode("authenticate");
+		if (
+			loginBusy ||
+			activeLoginActionRef.current !== null ||
+			authNetworkUnavailable
+		) {
+			return;
+		}
+		activeLoginActionRef.current = "passkey-authenticate";
+		setActiveLoginAction("passkey-authenticate");
 		setPasskeyError(null);
 		void apiPostPasskeyAuthenticateOptions()
 			.then((options) => getPasskeyCredential(options, "required"))
@@ -112,9 +248,12 @@ export function Landing({
 				setPasskeyError(normalizePasskeyErrorMessage(err));
 			})
 			.finally(() => {
-				setPasskeyBusyMode(null);
+				activeLoginActionRef.current = null;
+				setActiveLoginAction((activeAction) =>
+					activeAction === "passkey-authenticate" ? null : activeAction,
+				);
 			});
-	}, [passkeySupported]);
+	}, [authNetworkUnavailable, loginBusy, passkeySupported]);
 
 	const onRegisterPasskey = useCallback(() => {
 		if (!passkeySupported) {
@@ -123,7 +262,15 @@ export function Landing({
 			);
 			return;
 		}
-		setPasskeyBusyMode("register");
+		if (
+			loginBusy ||
+			activeLoginActionRef.current !== null ||
+			authNetworkUnavailable
+		) {
+			return;
+		}
+		activeLoginActionRef.current = "passkey-register";
+		setActiveLoginAction("passkey-register");
 		setPasskeyError(null);
 		void apiPostPasskeyRegisterOptions()
 			.then((options) => createPasskeyCredential(options))
@@ -137,9 +284,12 @@ export function Landing({
 				setPasskeyError(normalizePasskeyErrorMessage(err));
 			})
 			.finally(() => {
-				setPasskeyBusyMode(null);
+				activeLoginActionRef.current = null;
+				setActiveLoginAction((activeAction) =>
+					activeAction === "passkey-register" ? null : activeAction,
+				);
 			});
-	}, [passkeySupported]);
+	}, [authNetworkUnavailable, loginBusy, passkeySupported]);
 
 	return (
 		<AppShell notice={<VersionUpdateNotice />} footer={<AppMetaFooter />}>
@@ -194,6 +344,8 @@ export function Landing({
 					<aside className="order-1 lg:order-2">
 						<Card
 							className="rounded-[28px] border-border/70 bg-card/96 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:shadow-[0_24px_55px_rgba(2,6,23,0.4)]"
+							aria-busy={loginBusy}
+							data-landing-auth-state={displayedLoginAction ?? "idle"}
 							data-landing-login-card
 						>
 							<CardHeader className="gap-3 px-5 pt-5 pb-0 sm:px-6 sm:pt-6">
@@ -217,14 +369,21 @@ export function Landing({
 										href={githubLoginHref}
 										aria-disabled={loginLinkDisabled ? "true" : undefined}
 										tabIndex={loginLinkDisabled ? -1 : undefined}
-										onClick={(event) => {
-											if (loginLinkDisabled) {
-												event.preventDefault();
-											}
-										}}
+										onClick={(event) =>
+											onOAuthLogin(event, "github", githubLoginHref)
+										}
 									>
-										<AuthProviderIcon provider="github" />
-										使用 GitHub 登录
+										{displayedLoginAction === "github" ? (
+											<LoaderCircle
+												className="size-4 animate-spin"
+												aria-hidden="true"
+											/>
+										) : (
+											<AuthProviderIcon provider="github" />
+										)}
+										{displayedLoginAction === "github"
+											? "正在跳转到 GitHub…"
+											: "使用 GitHub 登录"}
 									</a>
 								</Button>
 								<Button
@@ -238,14 +397,21 @@ export function Landing({
 										href={linuxdoLoginHref}
 										aria-disabled={loginLinkDisabled ? "true" : undefined}
 										tabIndex={loginLinkDisabled ? -1 : undefined}
-										onClick={(event) => {
-											if (loginLinkDisabled) {
-												event.preventDefault();
-											}
-										}}
+										onClick={(event) =>
+											onOAuthLogin(event, "linuxdo", linuxdoLoginHref)
+										}
 									>
-										<AuthProviderIcon provider="linuxdo" />
-										使用 LinuxDO 登录
+										{displayedLoginAction === "linuxdo" ? (
+											<LoaderCircle
+												className="size-4 animate-spin"
+												aria-hidden="true"
+											/>
+										) : (
+											<AuthProviderIcon provider="linuxdo" />
+										)}
+										{displayedLoginAction === "linuxdo"
+											? "正在跳转到 LinuxDO…"
+											: "使用 LinuxDO 登录"}
 									</a>
 								</Button>
 								<Button
@@ -254,9 +420,7 @@ export function Landing({
 									className="h-12 w-full rounded-2xl text-base font-semibold sm:h-14"
 									onClick={onAuthenticatePasskey}
 									disabled={
-										!passkeySupported ||
-										passkeyBusyMode !== null ||
-										authNetworkUnavailable
+										!passkeySupported || loginBusy || authNetworkUnavailable
 									}
 									data-landing-passkey-login-cta
 								>
@@ -271,9 +435,7 @@ export function Landing({
 									className="h-11 w-full rounded-2xl text-sm font-medium"
 									onClick={onRegisterPasskey}
 									disabled={
-										!passkeySupported ||
-										passkeyBusyMode !== null ||
-										authNetworkUnavailable
+										!passkeySupported || loginBusy || authNetworkUnavailable
 									}
 									data-landing-passkey-register-cta
 								>
@@ -286,6 +448,18 @@ export function Landing({
 									<div className="rounded-2xl border border-border/70 bg-muted/20 px-4 py-3 text-sm leading-6 text-muted-foreground">
 										当前浏览器不支持 Passkey；你仍然可以继续使用 GitHub /
 										LinuxDO 登录。
+									</div>
+								) : null}
+
+								{loginBusy ? (
+									<div className="sr-only" role="status" aria-live="polite">
+										{displayedLoginAction === "github"
+											? "正在跳转到 GitHub 登录。"
+											: displayedLoginAction === "linuxdo"
+												? "正在跳转到 LinuxDO 登录。"
+												: displayedLoginAction === "passkey-authenticate"
+													? "正在验证 Passkey。"
+													: "正在创建 Passkey。"}
 									</div>
 								) : null}
 

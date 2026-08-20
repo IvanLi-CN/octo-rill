@@ -41,6 +41,27 @@ export type DemoNetworkMode = "normal" | "slow" | "faulty";
 
 export type DemoPublicationState = "published" | "unpublished";
 
+export type DemoLandingCase =
+	| "default"
+	| "custom"
+	| "github-redirect"
+	| "linuxdo-redirect"
+	| "passkey-authenticate"
+	| "passkey-register"
+	| "passkey-unsupported"
+	| "auth-network-unavailable";
+
+export type DemoLandingAuthAction =
+	| "idle"
+	| "github"
+	| "linuxdo"
+	| "passkey-authenticate"
+	| "passkey-register";
+
+export type DemoLandingPasskeySupport = "supported" | "unsupported";
+
+export type DemoLandingBootState = "ready" | "network-unavailable";
+
 export type DemoMutationRecord = {
 	id: string;
 	label: string;
@@ -104,6 +125,10 @@ export type DemoShareState = {
 	networkMode: DemoNetworkMode;
 	includeOwnReleases: boolean;
 	publicationState: DemoPublicationState;
+	landingCase: DemoLandingCase;
+	landingAuthAction: DemoLandingAuthAction;
+	landingPasskeySupport: DemoLandingPasskeySupport;
+	landingBootState: DemoLandingBootState;
 	controlsHidden: boolean;
 };
 

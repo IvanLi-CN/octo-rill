@@ -93,6 +93,10 @@ const runtimeState: DemoSnapshot = {
 		networkMode: "normal",
 		includeOwnReleases: false,
 		publicationState: "unpublished",
+		landingCase: "default",
+		landingAuthAction: "idle",
+		landingPasskeySupport: "supported",
+		landingBootState: "ready",
 		controlsHidden: false,
 	},
 	model: null,
@@ -497,7 +501,7 @@ export async function prepareDemoRuntime() {
 
 	dependencies.clearAllWarmStartupCaches();
 	await ensureWorkerStarted();
-	runtimeSnapshot = { ...runtimeState };
+	emit();
 }
 
 export function getDemoSnapshot() {

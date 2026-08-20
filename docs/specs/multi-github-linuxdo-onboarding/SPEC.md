@@ -69,6 +69,8 @@
 - PAT 保存前必须校验 `/user` 返回的 GitHub user id 属于当前账号任一 connection；状态接口必须返回 PAT owner 元数据。
 - Settings 必须支持 GitHub 连接列表、追加绑定、解绑（非最后一条），并展示 LinuxDO 绑定态与 PAT owner。
 - Landing 必须同时提供 GitHub 登录与 LinuxDO 登录入口。
+- Landing 的 GitHub、LinuxDO 与两项 Passkey 操作必须共享单一认证动作状态：任一动作开始后，四个入口立即进入互斥禁用态。
+- GitHub / LinuxDO OAuth 的未修饰主键点击必须先显示对应的跳转中反馈，再保持原始 OAuth `href` 发起导航；修饰键与非主键点击保留浏览器原生链接语义。
 - `/api/me` 的头像必须遵循“LinuxDO 优先，否则第一条 GitHub”规则。
 
 ### SHOULD
@@ -87,6 +89,7 @@
 ### Core flows
 
 - 用户匿名点击 Landing 的“使用 GitHub 登录”时，走 GitHub OAuth；若 GitHub 已绑定某个 OctoRill 账号，则直接登录该账号；若尚未绑定，则创建/确认内部账号并写入首条 GitHub connection。
+- OAuth 发起期间，活动入口显示旋转反馈与“正在跳转到 GitHub/LinuxDO …”文案，登录卡提供 `aria-busy` 和可宣读状态；重复点击不得产生第二次认证导航。
 - 已登录用户在 `/settings?section=github-accounts` 点击“绑定 GitHub”时，系统发起 `/auth/github/connect`；回调成功后新增 connection，不改变任何产品层“主从”状态，因为产品上不存在该概念。
 - 用户匿名点击“使用 LinuxDO 登录”时：
   - 若该 LinuxDO 已绑定某个 OctoRill 账号，直接登录该账号；
@@ -178,6 +181,10 @@
   When `/api/me` 返回用户摘要
   Then `avatar_url` 必须优先使用 LinuxDO 头像；若未绑定 LinuxDO，则回退到第一条 GitHub 头像。
 
+- Given 用户处于 Landing 且四个认证入口均可用
+  When 用户以未修饰主键点击任一 GitHub / LinuxDO / Passkey 入口
+  Then 活动入口立即显示忙碌反馈，四个入口互斥禁用，且在认证动作完成前重复点击不会产生第二次请求或导航。
+
 ## 实现前置条件（Definition of Ready / Preconditions）
 
 - `users` 继续作为内部账号主表、`github_connections` 作为 GitHub 外部身份层的语义已冻结。
@@ -198,7 +205,7 @@
 
 - Stories to add/update: `AppLanding`、`Settings`、`BindGitHub`。
 - Docs pages / state galleries to add/update: Settings GitHub 账号 / PAT owner / LinuxDO onboarding 状态画廊。
-- `play` / interaction coverage to add/update: Landing CTA 可见性、Settings 深链 section、补绑页状态展示。
+- `play` / interaction coverage to add/update: Landing CTA 可见性、OAuth 跳转中互斥反馈、可分享 `d_case` Landing Case 预设与 `d_auth` / `d_passkey` / `d_auth_boot` 场景控制、Settings 深链 section、补绑页状态展示。
 - 最终 owner-facing 视觉证据写入本 spec 的 `## Visual Evidence`。
 
 ### Quality checks
@@ -215,6 +222,14 @@
 
 Landing 双登录入口（storybook_canvas: `Pages/Landing / Default`）
 ![Landing dual login entry](./assets/landing-dual-login.png)
+
+Landing 认证动作互斥与场景专属控制（controlled demo: `Landing / Custom`）
+PR: include
+![Landing auth feedback controls](./assets/landing-auth-feedback-controls.png)
+
+Landing GitHub OAuth 跳转中移动态（controlled demo: `Landing / GitHub OAuth pending`）
+PR: include
+![Landing auth feedback mobile](./assets/landing-auth-feedback-mobile.png)
 
 LinuxDO 首登补绑页（storybook_canvas: `Pages/BindGitHub / Pending Linux Do`）
 ![Bind GitHub pending LinuxDO](./assets/bind-github-pending-linuxdo.png)

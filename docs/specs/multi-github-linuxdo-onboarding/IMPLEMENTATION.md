@@ -6,7 +6,7 @@
 - Implementation: 已交付
 - Created: 2026-04-21
 - Last: 2026-04-21
-- Summary: 已交付；PR #117; fast-track / multi-github + linuxdo onboarding / 去主账号语义并收口运行时迁移；legacy schema cleanup deferred
+- Summary: 已交付；PR #117; fast-track / multi-github + linuxdo onboarding / 去主账号语义并收口运行时迁移；Landing 认证动作统一互斥并补充 OAuth 跳转反馈；legacy schema cleanup deferred
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -32,3 +32,4 @@ None
 - [x] M2: GitHub / LinuxDO OAuth 流程改造成“多 GitHub 连接 + LinuxDO 首登补绑”，并开放连接管理 API。
 - [x] M3: Landing、`/bind/github`、Settings、Storybook、Playwright 与 owner-facing 视觉证据完成首轮落地。
 - [x] M4: 去除“主账号”语义、完成运行时迁移收口并推进到交付路径。
+- [x] M5: Landing 统一 GitHub / LinuxDO / Passkey 认证动作状态，补充 OAuth 跳转反馈、重复点击拦截、ARIA 状态，以及可分享的 Landing Case 预设与场景专属控制 Demo、Storybook / E2E 覆盖。

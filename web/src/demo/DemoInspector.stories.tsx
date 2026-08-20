@@ -18,6 +18,10 @@ const baseSnapshot = {
 		networkMode: "normal" as const,
 		includeOwnReleases: true,
 		publicationState: "published" as const,
+		landingCase: "default" as const,
+		landingAuthAction: "idle" as const,
+		landingPasskeySupport: "supported" as const,
+		landingBootState: "ready" as const,
 		controlsHidden: false,
 	},
 	model: buildDemoModel({
@@ -58,6 +62,10 @@ const meta = {
 		shareHref:
 			"/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish&d_persona=member&d_own=1&d_pub=published",
 		onSceneChange: fn(),
+		onLandingCaseChange: fn(),
+		onLandingAuthActionChange: fn(),
+		onLandingPasskeySupportChange: fn(),
+		onLandingBootStateChange: fn(),
 		onPersonaChange: fn(),
 		onNetworkChange: fn(),
 		onIncludeOwnReleasesChange: fn(),
@@ -87,6 +95,36 @@ export const Default: Story = {
 				"/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish&d_persona=member&d_own=1&d_pub=published",
 			),
 		).toHaveAttribute("readonly");
+	},
+};
+
+export const LandingCases: Story = {
+	args: {
+		snapshot: {
+			...baseSnapshot,
+			shareState: {
+				...baseSnapshot.shareState,
+				sceneId: "landing-welcome",
+				personaId: "guest",
+				landingCase: "github-redirect",
+				landingAuthAction: "github",
+			},
+			model: buildDemoModel({
+				sceneId: "landing-welcome",
+				personaId: "guest",
+				includeOwnReleases: true,
+				publicationState: "published",
+			}),
+		},
+		sceneTitle: "Landing",
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByLabelText("Case preset")).toHaveValue(
+			"github-redirect",
+		);
+		await expect(canvas.getByText("GitHub OAuth pending")).toBeInTheDocument();
+		await expect(canvas.getByText("Landing Controls")).toBeInTheDocument();
 	},
 };
 
