@@ -11371,15 +11371,24 @@ async fn public_list_repo_releases_impl(
         return Ok(public_pending_response(&usage));
     };
     let refresh = if refresh_request.is_some() {
-        Some(
-            sync::refresh_public_repo_release_if_stale(
-                state.as_ref(),
-                repo_id,
-                usage.full_name.as_str(),
-            )
-            .await
-            .map_err(ApiError::internal)?,
+        match sync::refresh_public_repo_release_if_stale(
+            state.as_ref(),
+            repo_id,
+            usage.full_name.as_str(),
         )
+        .await
+        {
+            Ok(refresh) => Some(refresh),
+            Err(err) => {
+                tracing::warn!(
+                    repo_id,
+                    repo_full_name = usage.full_name.as_str(),
+                    error = ?err,
+                    "public release refresh attach failed; serving cached releases"
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -31676,6 +31685,40 @@ line two",
         .await
         .expect_err("refresh opt-in on a page must fail");
         assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn public_release_refresh_opt_in_keeps_cached_items_when_attach_fails() {
+        let pool = setup_pool().await;
+        seed_public_release_usage(&pool, Some(42), "ready").await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool.clone());
+        let Json(created) = me_create_api_key(
+            State(state.clone()),
+            setup_session(1).await,
+            Json(CreateApiKeyRequest { name: None }),
+        )
+        .await
+        .expect("create API key");
+
+        sqlx::query("DROP TABLE repo_release_work_items")
+            .execute(&pool)
+            .await
+            .expect("break refresh attach without removing cached releases");
+
+        let response = public_list_repo_releases_http(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            RawQuery(Some("refresh=if_stale".to_owned())),
+            bearer_headers(created.api_key.as_str()),
+        )
+        .await
+        .expect("cached releases remain readable when refresh attach fails");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+        assert!(body.get("refresh").is_none());
     }
 
     #[tokio::test]
