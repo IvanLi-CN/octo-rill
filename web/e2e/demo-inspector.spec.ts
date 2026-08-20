@@ -116,6 +116,33 @@ test("demo landing returns to idle when the inspector clears a held OAuth action
 	);
 });
 
+test("demo landing clears a local OAuth action after a cross-case reset", async ({
+	page,
+}) => {
+	await page.goto("/?demo=landing-welcome");
+
+	await page.locator("[data-landing-login-cta]").dispatchEvent("click", {
+		button: 0,
+	});
+	await expect(
+		page.getByRole("link", { name: "正在跳转到 GitHub…" }),
+	).toBeVisible();
+
+	await page.getByLabel("Login action").selectOption("passkey-authenticate");
+	await expect(
+		page.getByRole("button", { name: "正在验证 Passkey…" }),
+	).toBeDisabled();
+	await page.getByLabel("Login action").selectOption("idle");
+
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toBeVisible();
+	await expect(page.locator("[data-landing-login-card]")).toHaveAttribute(
+		"aria-busy",
+		"false",
+	);
+});
+
 test("demo landing case selector renders every authentication state", async ({
 	page,
 }) => {

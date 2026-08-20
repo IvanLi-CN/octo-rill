@@ -120,12 +120,7 @@ export function Landing({
 	useEffect(() => {
 		const previousPreviewAuthAction = previousPreviewAuthActionRef.current;
 		previousPreviewAuthActionRef.current = previewAuthAction;
-		if (
-			previousPreviewAuthAction === null ||
-			previewAuthAction !== null ||
-			(previousPreviewAuthAction !== "github" &&
-				previousPreviewAuthAction !== "linuxdo")
-		)
+		if (previousPreviewAuthAction === null || previewAuthAction !== null)
 			return;
 		if (
 			activeLoginActionRef.current === null ||
@@ -137,6 +132,12 @@ export function Landing({
 			setActiveLoginAction(null);
 		}
 	}, [previewAuthAction]);
+
+	useEffect(() => {
+		return () => {
+			oauthNavigationTokenRef.current += 1;
+		};
+	}, []);
 
 	const authNetworkUnavailable =
 		bootErrorKind === "offline" || bootErrorKind === "network";
