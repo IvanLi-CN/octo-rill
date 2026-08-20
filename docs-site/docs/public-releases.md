@@ -78,6 +78,7 @@ GET {OCTORILL_ORIGIN}/api/public/repos/{owner}/{repo}/releases/content
 | `lang` | `zh-CN` | `zh-CN` | 当前只支持中文翻译。 |
 | `limit` | `1` 到 `30` | `6` | 仅列表接口支持。 |
 | `cursor` | 上次响应的 `next_cursor` | 空 | 仅列表接口支持，用于分页。 |
+| `refresh` | `if_stale` | 空 | 仅限受信任的后端集成。首窗口携带有效 Bearer API key 时，若该仓库上次成功同步已超过 30 秒，会在返回缓存的同时附加单仓异步刷新；分页不可使用。 |
 | `until_cursor` | gap 响应的另一侧 cursor | 空 | 与 `cursor` 一起使用，把内部 gap 加载限制在指定边界。 |
 | `direction` | `older`、`newer` | `older` | 高亮范围的 cursor 方向；`newer` 使用 `previous_cursor`。 |
 | `highlight` | 重复的 `tag:<tag>` 或 `id:<release_id>` | 空 | 离散高亮模式；解析到同一 Release 时去重，最多 20 个。 |
@@ -113,6 +114,11 @@ GET {OCTORILL_ORIGIN}/api/public/repos/{owner}/{repo}/releases/content
   },
   "segments": [{ "first_release_id": "291058028", "last_release_id": "291058026" }],
   "gaps": [],
+  "refresh": {
+    "state": "queued",
+    "last_success_at": "2026-08-20T01:02:03Z",
+    "retry_after_seconds": 2
+  },
   "items": [
     {
       "release_id": "291058028",
@@ -131,6 +137,19 @@ GET {OCTORILL_ORIGIN}/api/public/repos/{owner}/{repo}/releases/content
 ```
 
 没有高亮参数时，`highlight`、`segments`、`gaps` 与 `previous_cursor` 会省略，列表仍保持首载 6 条和 `next_cursor` 的既有行为。范围响应的 `highlight.mode` 为 `range`，`total` 是精确范围数量；当范围超过首载窗口时，使用 `next_cursor` 请求更旧记录，使用 `previous_cursor` 和 `direction=newer` 请求更新记录。
+
+### 受信任集成按需刷新
+
+服务端集成可在首窗口使用 `refresh=if_stale`，并通过 `Authorization: Bearer orill_ak_...` 认证。它始终返回已有缓存；不会等待 GitHub，也不会把有内容的响应改为 `202`。缺失或无效的 key 返回 `401`，携带 `cursor` 或 `until_cursor` 的 opt-in 请求返回 `400`。
+
+成功响应可选 `refresh` 字段使用 snake_case：
+
+- `fresh`：最近成功同步不超过 30 秒；不提供 `retry_after_seconds`。
+- `queued`：本次读取已附加等待中的单仓共享 work item；建议 2 秒后重读。
+- `running`：已有 worker 正在同步这个仓库；建议 2 秒后重读。
+- `backoff`：上游失败后的既有退避仍有效；`retry_after_seconds` 是剩余时间，最大 60 秒。
+
+调用方只应在页面或会话仍打开时按该建议进行有限重读。匿名公开页面、普通列表读取以及后续分页不会触发这项 demand。
 
 如果仓库已登记但同步尚未完成，接口返回 `202 Accepted`，并带有 `Retry-After` header：
 

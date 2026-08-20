@@ -40,6 +40,7 @@ const REPO_RELEASE_WORKERS_MAX: usize = admin_runtime::MAX_REPO_RELEASE_WORKER_C
 const REPO_RELEASE_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(450);
 const REPO_RELEASE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const REPO_RELEASE_FRESHNESS_WINDOW: Duration = Duration::from_secs(30 * 60);
+const PUBLIC_RELEASE_READ_FRESHNESS_WINDOW: Duration = Duration::from_secs(30);
 const REPO_RELEASE_DEFAULT_PER_PAGE: usize = 20;
 const REPO_RELEASE_LARGE_REPO_PER_PAGE: usize = 10;
 const REPO_RELEASE_DEFAULT_MAX_PAGES: usize = 1;
@@ -592,6 +593,31 @@ struct RepoReleaseWorkItemRow {
     deadline_at: String,
     last_success_at: Option<String>,
     started_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicRepoReleaseRefreshState {
+    Fresh,
+    Queued,
+    Running,
+    Backoff,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PublicRepoReleaseRefresh {
+    pub state: PublicRepoReleaseRefreshState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<i64>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct PublicRepoReleaseRefreshSnapshotRow {
+    status: String,
+    last_success_at: Option<String>,
+    backoff_until: Option<String>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -3952,6 +3978,7 @@ async fn attach_and_wait_for_user_release_demand_with_freshness(
         freshness.as_mut(),
         &snapshots,
         false,
+        None,
     )
     .await?;
 
@@ -4019,6 +4046,102 @@ pub async fn enqueue_public_repo_release_sync(
     Ok(attached.reused_fresh > 0)
 }
 
+pub async fn refresh_public_repo_release_if_stale(
+    state: &AppState,
+    repo_id: i64,
+    full_name: &str,
+) -> Result<PublicRepoReleaseRefresh> {
+    let now = Utc::now();
+    if let Some(snapshot) = load_public_repo_release_refresh_snapshot(state, repo_id).await?
+        && snapshot.last_success_at.as_deref().is_some_and(|value| {
+            repo_release_timestamp_is_fresh(
+                value,
+                now - chrono::Duration::from_std(PUBLIC_RELEASE_READ_FRESHNESS_WINDOW)
+                    .unwrap_or_default(),
+            )
+        })
+    {
+        return Ok(PublicRepoReleaseRefresh {
+            state: PublicRepoReleaseRefreshState::Fresh,
+            last_success_at: snapshot.last_success_at,
+            retry_after_seconds: None,
+        });
+    }
+    let repos = [ReleaseDemandRepo {
+        repo_id,
+        full_name: full_name.to_owned(),
+        is_new_repo: false,
+    }];
+    let attached = attach_release_demand_with_freshness(
+        state,
+        None,
+        None,
+        &repos,
+        RepoReleaseOrigin::Interactive,
+        "public_release_access",
+        None,
+        &HashMap::new(),
+        false,
+        Some(PUBLIC_RELEASE_READ_FRESHNESS_WINDOW),
+    )
+    .await?;
+    let snapshot = load_public_repo_release_refresh_snapshot(state, repo_id)
+        .await?
+        .context("load public release refresh snapshot after attach")?;
+    let retry_after_seconds = snapshot
+        .backoff_until
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc) - now)
+        .filter(|remaining| *remaining > chrono::Duration::zero())
+        .map(|remaining| remaining.num_seconds().clamp(1, 60));
+
+    let state = if retry_after_seconds.is_some() {
+        PublicRepoReleaseRefreshState::Backoff
+    } else if attached.reused_fresh > 0 {
+        PublicRepoReleaseRefreshState::Fresh
+    } else if snapshot.status == jobs::STATUS_RUNNING || attached.reused_running > 0 {
+        PublicRepoReleaseRefreshState::Running
+    } else {
+        PublicRepoReleaseRefreshState::Queued
+    };
+
+    Ok(PublicRepoReleaseRefresh {
+        state,
+        last_success_at: snapshot.last_success_at,
+        retry_after_seconds: match state {
+            PublicRepoReleaseRefreshState::Fresh => None,
+            PublicRepoReleaseRefreshState::Queued | PublicRepoReleaseRefreshState::Running => {
+                Some(2)
+            }
+            PublicRepoReleaseRefreshState::Backoff => retry_after_seconds,
+        },
+    })
+}
+
+async fn load_public_repo_release_refresh_snapshot(
+    state: &AppState,
+    repo_id: i64,
+) -> Result<Option<PublicRepoReleaseRefreshSnapshotRow>> {
+    let snapshot = sqlx::query_as::<_, PublicRepoReleaseRefreshSnapshotRow>(
+        r#"
+        SELECT
+          item.status,
+          item.last_success_at,
+          state.backoff_until
+        FROM repo_release_work_items item
+        LEFT JOIN repo_release_sync_state state ON state.repo_id = item.repo_id
+        WHERE item.repo_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_optional(&state.pool)
+    .await
+    .context("load public release refresh snapshot")?;
+    Ok(snapshot)
+}
+
 pub async fn enqueue_user_repo_release_sync(
     state: &AppState,
     user_id: &str,
@@ -4040,6 +4163,7 @@ pub async fn enqueue_user_repo_release_sync(
         None,
         &HashMap::new(),
         true,
+        None,
     )
     .await?;
     Ok(attached.reused_fresh > 0)
@@ -4063,6 +4187,7 @@ async fn attach_release_demand(
         None,
         &HashMap::new(),
         false,
+        None,
     )
     .await
 }
@@ -4078,6 +4203,7 @@ async fn attach_release_demand_with_freshness(
     mut freshness: Option<&mut DashboardReleaseFreshnessPolicy>,
     snapshots: &HashMap<i64, usize>,
     force_refresh: bool,
+    freshness_window: Option<Duration>,
 ) -> Result<AttachReleaseDemandResult> {
     let mut result = AttachReleaseDemandResult {
         repos: repos.len(),
@@ -4092,7 +4218,9 @@ async fn attach_release_demand_with_freshness(
     let now = Utc::now();
     let now_rfc3339 = now.to_rfc3339();
     let deadline_at = repo_release_deadline_at(now, origin);
-    let freshness_cutoff = repo_release_fresh_cutoff(now);
+    let freshness_cutoff = now
+        - chrono::Duration::from_std(freshness_window.unwrap_or(REPO_RELEASE_FRESHNESS_WINDOW))
+            .unwrap_or_default();
     let mut reused_fresh_system_work_items = Vec::new();
 
     for repo in repos {
@@ -4161,7 +4289,9 @@ async fn attach_release_demand_with_freshness(
                     && existing
                         .as_ref()
                         .and_then(|item| item.last_success_at.as_deref())
-                        .is_some_and(|value| value >= freshness_cutoff.as_str())));
+                        .is_some_and(|value| {
+                            repo_release_timestamp_is_fresh(value, freshness_cutoff)
+                        })));
         let work_item_id = if let Some(existing) = existing {
             let next_priority = existing.priority.max(origin.priority());
             let next_origin = if next_priority == REPO_RELEASE_PRIORITY_INTERACTIVE {
@@ -4772,9 +4902,10 @@ fn repo_release_deadline_at(now: DateTime<Utc>, origin: RepoReleaseOrigin) -> St
     (now + offset).to_rfc3339()
 }
 
-fn repo_release_fresh_cutoff(now: DateTime<Utc>) -> String {
-    (now - chrono::Duration::from_std(REPO_RELEASE_FRESHNESS_WINDOW).unwrap_or_default())
-        .to_rfc3339()
+fn repo_release_timestamp_is_fresh(value: &str, freshness_cutoff: DateTime<Utc>) -> bool {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc) >= freshness_cutoff)
+        .unwrap_or(false)
 }
 
 fn earlier_timestamp(left: &str, right: &str) -> String {
@@ -11552,6 +11683,7 @@ fn fallback_notification_open_url(thread_id: Option<&str>, repo_full_name: Optio
 #[cfg(test)]
 mod tests {
     use anyhow::{Context, anyhow};
+    use chrono::{DateTime, Utc};
     use sqlx::Row;
     use std::{
         collections::{HashMap, HashSet},
@@ -11579,7 +11711,7 @@ mod tests {
         GitHubNotification, GitHubRelease, GitHubReleaseEventPayload,
         NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE, NOTIFICATION_OPEN_URL_REPAIR_KEY,
         NOTIFICATION_OPEN_URL_REPAIR_PENDING, NOTIFICATIONS_SINCE_KEY, NotificationRepo,
-        NotificationSubject, OwnedRepoNode, OwnedRepoSnapshot,
+        NotificationSubject, OwnedRepoNode, OwnedRepoSnapshot, PublicRepoReleaseRefreshState,
         REPO_REFRESH_GOVERNANCE_REBUILD_CHUNK_SIZE, REPO_RELEASE_DEADLINE_EXPIRED_ERROR,
         ReleaseDemandRepo, RepoOwner, RepoRefreshCandidate, RepoReleaseFetchOutcome,
         RepoReleaseHttpState, RepoReleaseOrigin, RepoReleaseWorkItemRow, RepoReleaseWriteStats,
@@ -11603,8 +11735,9 @@ mod tests {
         owned_repo_snapshot_from_node, process_repo_release_work_item,
         prune_subscription_sync_history, rebuild_repo_refresh_governance_snapshots,
         record_repo_refresh_governance_attempt, record_repo_release_sync_success,
-        recover_repo_release_runtime_state_on_startup, replace_starred_repos,
-        repo_release_deadline_at, resolve_notification_open_url, store_sync_state_value,
+        recover_repo_release_runtime_state_on_startup, refresh_public_repo_release_if_stale,
+        replace_starred_repos, repo_release_deadline_at, repo_release_timestamp_is_fresh,
+        resolve_notification_open_url, store_sync_state_value,
         subscription_event_counts_as_critical, subscription_timeout_error,
         sync_notifications_with_fetch, sync_starred_for_user_with_fetch, upsert_notifications,
         upsert_repo_releases, upsert_starred_repos, wait_for_release_demand,
@@ -11636,6 +11769,23 @@ mod tests {
         assert!(cmp_last_active_desc(stale, recent).is_gt());
         assert!(cmp_last_active_desc(recent, None).is_lt());
         assert!(cmp_last_active_desc(None, recent).is_gt());
+    }
+
+    #[test]
+    fn public_release_freshness_keeps_the_exact_thirty_second_boundary() {
+        let now = DateTime::parse_from_rfc3339("2026-08-20T00:00:30Z")
+            .expect("parse fixed timestamp")
+            .with_timezone(&Utc);
+        let cutoff = now - chrono::Duration::seconds(30);
+
+        assert!(repo_release_timestamp_is_fresh(
+            "2026-08-20T00:00:00Z",
+            cutoff,
+        ));
+        assert!(!repo_release_timestamp_is_fresh(
+            "2026-08-19T23:59:59.999Z",
+            cutoff,
+        ));
     }
 
     fn test_dashboard_freshness_policy(
@@ -18149,6 +18299,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_release_refresh_reuses_one_work_item_and_reports_runtime_state() {
+        let pool = setup_pool_with_max_connections(4).await;
+        let state = setup_state(pool.clone());
+        let repo_id = 52_i64;
+        let future_deadline = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-public-refresh",
+                repo_id,
+                repo_full_name: "octo/public-refresh",
+                status: jobs::STATUS_SUCCEEDED,
+                deadline_at: future_deadline.as_str(),
+                last_release_count: 1,
+                last_candidate_failures: 0,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        sqlx::query("UPDATE repo_release_work_items SET last_success_at = ? WHERE repo_id = ?")
+            .bind((chrono::Utc::now() - chrono::Duration::seconds(31)).to_rfc3339())
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("seed stale release success");
+
+        let (first, second) = tokio::join!(
+            refresh_public_repo_release_if_stale(state.as_ref(), repo_id, "octo/public-refresh"),
+            refresh_public_repo_release_if_stale(state.as_ref(), repo_id, "octo/public-refresh"),
+        );
+        assert_eq!(
+            first.expect("first public refresh").state,
+            PublicRepoReleaseRefreshState::Queued
+        );
+        assert_eq!(
+            second.expect("second public refresh").state,
+            PublicRepoReleaseRefreshState::Queued
+        );
+        let work_item_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM repo_release_work_items WHERE repo_id = ?",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count public refresh work items");
+        assert_eq!(work_item_count, 1);
+
+        sqlx::query("UPDATE repo_release_work_items SET status = 'running' WHERE repo_id = ?")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("mark public refresh running");
+        let running =
+            refresh_public_repo_release_if_stale(state.as_ref(), repo_id, "octo/public-refresh")
+                .await
+                .expect("refresh running work item");
+        assert_eq!(running.state, PublicRepoReleaseRefreshState::Running);
+        assert_eq!(running.retry_after_seconds, Some(2));
+
+        let backoff_until = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO repo_release_sync_state (
+              repo_id, last_attempt_at, last_error_text, backoff_until, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(repo_id)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind("timeout: GitHub request timed out")
+        .bind(backoff_until)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed public refresh backoff");
+        let backoff =
+            refresh_public_repo_release_if_stale(state.as_ref(), repo_id, "octo/public-refresh")
+                .await
+                .expect("refresh backing-off work item");
+        assert_eq!(backoff.state, PublicRepoReleaseRefreshState::Backoff);
+        assert!(
+            backoff
+                .retry_after_seconds
+                .is_some_and(|seconds| (1..=60).contains(&seconds))
+        );
+    }
+
+    #[tokio::test]
     async fn repo_release_deadline_recovery_skips_refreshed_deadlines() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -18629,6 +18868,7 @@ mod tests {
             Some(&mut policy),
             &snapshots,
             false,
+            None,
         )
         .await
         .expect("attach failed work item demand");
