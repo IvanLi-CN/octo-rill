@@ -109,6 +109,7 @@ export function Landing({
 	const [activeLoginAction, setActiveLoginAction] =
 		useState<LandingAuthAction | null>(null);
 	const activeLoginActionRef = useRef<LandingAuthAction | null>(null);
+	const oauthNavigationTokenRef = useRef(0);
 	const previousPreviewAuthActionRef = useRef(previewAuthAction);
 	const [passkeyError, setPasskeyError] = useState<string | null>(null);
 
@@ -119,10 +120,18 @@ export function Landing({
 	useEffect(() => {
 		const previousPreviewAuthAction = previousPreviewAuthActionRef.current;
 		previousPreviewAuthActionRef.current = previewAuthAction;
-		if (previousPreviewAuthAction === null || previewAuthAction !== null)
+		if (
+			previousPreviewAuthAction === null ||
+			previewAuthAction !== null ||
+			(previousPreviewAuthAction !== "github" &&
+				previousPreviewAuthAction !== "linuxdo")
+		)
 			return;
-		activeLoginActionRef.current = null;
-		setActiveLoginAction(null);
+		if (activeLoginActionRef.current === previousPreviewAuthAction) {
+			oauthNavigationTokenRef.current += 1;
+			activeLoginActionRef.current = null;
+			setActiveLoginAction(null);
+		}
 	}, [previewAuthAction]);
 
 	const authNetworkUnavailable =
@@ -173,11 +182,17 @@ export function Landing({
 			}
 
 			event.preventDefault();
+			const navigationToken = ++oauthNavigationTokenRef.current;
 			activeLoginActionRef.current = provider;
 			setActiveLoginAction(provider);
 			setPasskeyError(null);
 			requestAnimationFrame(() => {
 				requestAnimationFrame(() => {
+					if (
+						oauthNavigationTokenRef.current !== navigationToken ||
+						activeLoginActionRef.current !== provider
+					)
+						return;
 					navigateToAuth(href, provider);
 				});
 			});
