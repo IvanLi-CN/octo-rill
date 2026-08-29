@@ -1,0 +1,192 @@
+{
+  "canvas": {
+    "height": 3840,
+    "width": 3072
+  },
+  "files": [
+    {
+      "path": "shared/wordmark-lettering.svg",
+      "sha256": "8ce48c19069d80a7a182bc66cfabd08fef2f86733e4fed2737c300eb407fbf53"
+    },
+    {
+      "path": "light/background.png",
+      "sha256": "664823185ba4a99bf1918a5c43d048d290a282d43b8b32c93ad5d2618946c050"
+    },
+    {
+      "path": "light/decorative.png",
+      "sha256": "1536c5a79b6dbb9b53cca5ce609f88e4b98f46b637a757a8f9ff8f618e2d32d1"
+    },
+    {
+      "path": "light/dashboard.png",
+      "sha256": "3bdbe17cc5cd4de39ab77c3427dae4bca5ab2fc9d3606d8550b524da19db1b62"
+    },
+    {
+      "path": "light/platform.png",
+      "sha256": "bd0114ff585f1266fadaf57fd1e2f1071c3533cf62f6be1a3606079c61e68d51"
+    },
+    {
+      "path": "light/mascot.png",
+      "sha256": "a45f5f55d30c9807ccfaa5ca207924a5c77ee2392fe87455786b1354fe1ae957"
+    },
+    {
+      "path": "light/inbox.png",
+      "sha256": "007736f061d946176052df42825deb88c8924cb806ccce57ff9f0982a2671432"
+    },
+    {
+      "path": "light/wordmark.png",
+      "sha256": "d6339e683c070d9f9a6b059e8448d781734e75bdc325390c0bc76495681e7b7b"
+    },
+    {
+      "path": "light/wordmark.svg",
+      "sha256": "e5b98c8e609af38b5574fef47593253361f016c29f0e9fa176b870845bcc4c0e"
+    },
+    {
+      "path": "light/decorative.svg",
+      "sha256": "40fcf4ba08390dd246687010322db61ec82c102d4c2a57bc70f8e6d9bac3673c"
+    },
+    {
+      "path": "octo-rill-product-poster-light.ora",
+      "sha256": "e99df2c2de5f373adbf4d3f153163e820cc3f4e38a18eacb5d22eb0ee16fa3d9"
+    },
+    {
+      "path": "dark/background.png",
+      "sha256": "676fccebc29e39a9a07d0dab1ec37b25f00b92bd4e2c359bd4ee85239d6d2a81"
+    },
+    {
+      "path": "dark/decorative.png",
+      "sha256": "14ef3182c069756d0dbf4480424d1a4c8d784e0436f21d5dc5ef000721dd271f"
+    },
+    {
+      "path": "dark/dashboard.png",
+      "sha256": "f07d9a4e93bcacf47628d8ef458635ff0bf8f0eda9509f8f290c498185ec2cbf"
+    },
+    {
+      "path": "dark/platform.png",
+      "sha256": "b11723ff42c1b32514fccb80e094a78909c028da6696a69f6cc46b6f0ab4879d"
+    },
+    {
+      "path": "dark/mascot.png",
+      "sha256": "85e4291f28abddccaf51faea4b7ee563778eba29f5c38ef61ebcb1b1da6d1de5"
+    },
+    {
+      "path": "dark/inbox.png",
+      "sha256": "384b4722e8fd36a6baf93756eb59765ef40f0b8a5408c009a2a7b9422a7c6987"
+    },
+    {
+      "path": "dark/wordmark.png",
+      "sha256": "b90fb87a0203fff7e0b6e6ca75331bd2e800da4f324e9d05dbec5219ab9cb3cc"
+    },
+    {
+      "path": "dark/wordmark.svg",
+      "sha256": "f39c1e64ecdfaaa72ea363a272f3a6f3dc19302a0c30cac442c07bdbad7d1683"
+    },
+    {
+      "path": "dark/decorative.svg",
+      "sha256": "9aa17398fb48297cde0c1acbb3e4277def0c8debdd66b5ce5089ab0de6e2e537"
+    },
+    {
+      "path": "octo-rill-product-poster-dark.ora",
+      "sha256": "0388c63476f346b19809611221c0613ef279b7666123a035b8c4f2a16b564cdd"
+    }
+  ],
+  "layer_order": [
+    "background",
+    "decorative",
+    "dashboard",
+    "platform",
+    "mascot",
+    "inbox",
+    "wordmark"
+  ],
+  "source_kind": "recovered-semantic-layers",
+  "themes": {
+    "dark": {
+      "decorative_vector": "dark/decorative.svg",
+      "export": "brand/exports/octo-rill-product-poster.png",
+      "export_rgb_sha256": "9466fe8cd5bdb09b917d772ca261892f98e558badedbbb46d825e9cf474d3e98",
+      "layers": [
+        {
+          "name": "background",
+          "path": "dark/background.png",
+          "rgba_sha256": "b99ac76d1439c64aa6662696682c90894fe17a054570ae72f9f837b3e45397f7"
+        },
+        {
+          "name": "decorative",
+          "path": "dark/decorative.png",
+          "rgba_sha256": "eb62930a2e4c0689d69f3438ea4525598470482f8f93333af41ae5f44deef507"
+        },
+        {
+          "name": "dashboard",
+          "path": "dark/dashboard.png",
+          "rgba_sha256": "202d592e167ddf8f4d025a112ef2e95bebe855a98b9798782a1fd0cdbe13ba1d"
+        },
+        {
+          "name": "platform",
+          "path": "dark/platform.png",
+          "rgba_sha256": "f331362fa6cc7983031e69944ba45e16da0add00fe3908e319e22b65ae0fcb25"
+        },
+        {
+          "name": "mascot",
+          "path": "dark/mascot.png",
+          "rgba_sha256": "35c4c29bf7deb9f671602e447b00b6aca2dbfa5169ea969ab069dfe220600c78"
+        },
+        {
+          "name": "inbox",
+          "path": "dark/inbox.png",
+          "rgba_sha256": "e35b0c3060da840638df137547f917b9ad88ae246dd685f1805b44d02631f24e"
+        },
+        {
+          "name": "wordmark",
+          "path": "dark/wordmark.png",
+          "rgba_sha256": "f49291fed6a80b9f9f1fd5f47529388b63c69809110f467c72d166a7b7a09db1"
+        }
+      ],
+      "openraster": "octo-rill-product-poster-dark.ora",
+      "wordmark_vector": "dark/wordmark.svg"
+    },
+    "light": {
+      "decorative_vector": "light/decorative.svg",
+      "export": "brand/exports/octo-rill-product-poster-light.png",
+      "export_rgb_sha256": "83620ce3bde5678fc49f36a51c72b4693943a5f335e3fb697365ca2e8e1e564c",
+      "layers": [
+        {
+          "name": "background",
+          "path": "light/background.png",
+          "rgba_sha256": "129af92ef46f74ee89a1727f30f541d40d348acd9994d7b9b8dab4a778ad48ac"
+        },
+        {
+          "name": "decorative",
+          "path": "light/decorative.png",
+          "rgba_sha256": "df53237d873e698d0f9122abd02156473d2500d1f5b1a608f655cd483cc9a062"
+        },
+        {
+          "name": "dashboard",
+          "path": "light/dashboard.png",
+          "rgba_sha256": "a7f2a35f10547b4118826e409db47c5de900a8b0c8d7b5f40bd85fbf4087bd27"
+        },
+        {
+          "name": "platform",
+          "path": "light/platform.png",
+          "rgba_sha256": "5e14e6dc16ccc839280ba4e27dbe3654d3d8b652350ce8ace0d5a1e7da353132"
+        },
+        {
+          "name": "mascot",
+          "path": "light/mascot.png",
+          "rgba_sha256": "c663432058284acd2935ad29f549c64cdbfca352705cfdd02bf2c14252581260"
+        },
+        {
+          "name": "inbox",
+          "path": "light/inbox.png",
+          "rgba_sha256": "1464d0a526e330fcef61b3dd0b2c6ededee1df282d440369a262a7543cfccb53"
+        },
+        {
+          "name": "wordmark",
+          "path": "light/wordmark.png",
+          "rgba_sha256": "13d16849a05887942a6b775f1956dcc307c4100cc1db85ae3ac8eef11b03486a"
+        }
+      ],
+      "openraster": "octo-rill-product-poster-light.ora",
+      "wordmark_vector": "light/wordmark.svg"
+    }
+  }
+}
