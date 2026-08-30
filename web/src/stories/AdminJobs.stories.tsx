@@ -3294,6 +3294,12 @@ export const LlmFilters: Story = {
 			llmSourceFilter="job.api.translate_release"
 		/>
 	),
+	globals: {
+		viewport: {
+			value: "adminJobsSettingsDesktop",
+			isRotated: false,
+		},
+	},
 	parameters: {
 		docs: {
 			description: {
