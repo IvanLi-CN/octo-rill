@@ -930,13 +930,6 @@ fn translation_batch_business_outcome(
             label: "AI 已禁用".to_owned(),
             message: "批次条目全部命中禁用路径，未执行翻译。".to_owned(),
         },
-        _ if summary.error + summary.missing > 0 && summary.ready == 0 && summary.disabled == 0 => {
-            api::AdminBusinessOutcome {
-                code: "failed".to_owned(),
-                label: "业务失败".to_owned(),
-                message: "批次已完成，但全部条目失败或缺失。".to_owned(),
-            }
-        }
         _ if summary.error > 0 || summary.missing > 0 => api::AdminBusinessOutcome {
             code: "partial".to_owned(),
             label: "部分成功".to_owned(),
@@ -11769,6 +11762,25 @@ mod tests {
                 running: 0,
             },
             4,
+            None,
+        );
+        assert_eq!(outcome.code, "partial");
+        assert_eq!(outcome.label, "部分成功");
+    }
+
+    #[test]
+    fn translation_batch_business_outcome_marks_all_failed_items_as_partial() {
+        let outcome = translation_batch_business_outcome(
+            "completed",
+            &AdminTranslationBatchResultSummary {
+                ready: 0,
+                error: 2,
+                missing: 1,
+                disabled: 0,
+                queued: 0,
+                running: 0,
+            },
+            3,
             None,
         );
         assert_eq!(outcome.code, "partial");
