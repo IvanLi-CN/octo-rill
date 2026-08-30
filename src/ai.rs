@@ -1922,7 +1922,7 @@ impl Drop for SchedulerWaitingGuard<'_> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct LlmCallAdminOverride {
     pub id: String,
     pub status: String,
@@ -1937,6 +1937,11 @@ pub(crate) struct LlmCallAdminOverride {
     pub output_messages_json: Option<String>,
     pub response_text: Option<String>,
     pub error_text: Option<String>,
+    pub failure_class: Option<String>,
+    pub final_model: Option<String>,
+    pub fallback_count: i64,
+    pub retry_scheduled_at: Option<String>,
+    pub recovery_attempt_count: i64,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub updated_at: String,
@@ -2703,6 +2708,11 @@ pub async fn chat_completion(
                     output_messages_json: None,
                     response_text: None,
                     error_text: None,
+                    failure_class: None,
+                    final_model: None,
+                    fallback_count: 0,
+                    retry_scheduled_at: None,
+                    recovery_attempt_count: 0,
                     started_at: started_at_timestamp.clone(),
                     finished_at: None,
                     updated_at: running_updated_at,
@@ -2758,6 +2768,11 @@ pub async fn chat_completion(
                             output_messages_json: Some(output.output_messages_json.clone()),
                             response_text: Some(output.content.clone()),
                             error_text: None,
+                            failure_class: None,
+                            final_model: Some(model_for_call.clone()),
+                            fallback_count,
+                            retry_scheduled_at: None,
+                            recovery_attempt_count: 0,
                             started_at: started_at_timestamp.clone(),
                             finished_at: Some(finished_at.clone()),
                             updated_at: finished_at.clone(),
@@ -2848,6 +2863,16 @@ pub async fn chat_completion(
                                 output_messages_json: None,
                                 response_text: None,
                                 error_text: None,
+                                failure_class: Some(failure_class.as_str().to_owned()),
+                                final_model: None,
+                                fallback_count,
+                                retry_scheduled_at: Some(
+                                    (chrono::Utc::now()
+                                        + chrono::Duration::from_std(retry_delay)
+                                            .unwrap_or_else(|_| chrono::Duration::zero()))
+                                    .to_rfc3339(),
+                                ),
+                                recovery_attempt_count: 0,
                                 started_at: started_at_timestamp.clone(),
                                 finished_at: None,
                                 updated_at: requeued_at,
@@ -2923,6 +2948,11 @@ pub async fn chat_completion(
                                 output_messages_json: None,
                                 response_text: None,
                                 error_text: None,
+                                failure_class: Some(failure_class.as_str().to_owned()),
+                                final_model: None,
+                                fallback_count,
+                                retry_scheduled_at: None,
+                                recovery_attempt_count: 0,
                                 started_at: started_at_timestamp.clone(),
                                 finished_at: None,
                                 updated_at: requeued_at,
@@ -3001,6 +3031,11 @@ pub async fn chat_completion(
                             output_messages_json: None,
                             response_text: None,
                             error_text: Some(safe_message.to_owned()),
+                            failure_class: Some(failure_class.as_str().to_owned()),
+                            final_model: Some(model_for_call.clone()),
+                            fallback_count,
+                            retry_scheduled_at: None,
+                            recovery_attempt_count: 0,
                             started_at: started_at_timestamp.clone(),
                             finished_at: Some(finished_at.clone()),
                             updated_at: finished_at.clone(),
@@ -7029,6 +7064,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 updated_at: "2026-03-10T00:00:00Z".to_owned(),
+                ..Default::default()
             })
             .await;
 
@@ -7135,6 +7171,7 @@ mod tests {
             started_at: Some("2026-03-10T00:00:00Z".to_owned()),
             finished_at: None,
             updated_at: "2026-03-10T00:00:00Z".to_owned(),
+            ..Default::default()
         };
 
         state
