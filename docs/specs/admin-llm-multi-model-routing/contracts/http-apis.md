@@ -23,16 +23,14 @@
   "window_started_at": "2026-08-13T09:00:00Z",
   "window_ended_at": "2026-08-15T11:00:00Z",
   "models": [
-    { "model": "gpt-4o-mini", "priority": 1, "configured": true },
-    { "model": "retired-model", "priority": null, "configured": false }
+    { "model": "configured-candidate", "priority": null, "configured": true }
   ],
   "buckets": [
     {
       "started_at": "2026-08-13T09:00:00Z",
       "ended_at": "2026-08-13T10:00:00Z",
       "counts": [
-        { "model": "gpt-4o-mini", "succeeded": 2, "failed": 1 },
-        { "model": "retired-model", "succeeded": 0, "failed": 0 }
+        { "model": "configured-candidate", "succeeded": 2, "failed": 1 }
       ]
     }
   ]
@@ -51,28 +49,28 @@
 
 ```json
 {
-  "llm_models": ["gpt-4o-mini", "gpt-4.1-mini"],
-  "selected_model_for_new_calls": "gpt-4.1-mini",
+  "llm_models": ["configured-candidate"],
+  "selected_model_for_new_calls": "configured-candidate",
   "effective_model_input_limit": 1047576,
   "effective_model_input_limit_source": "builtin_catalog",
   "model_statuses": [
     {
-      "model": "gpt-4o-mini",
+      "model": "configured-candidate",
       "priority": 1,
       "status": "cooldown",
-      "consecutive_final_failures": 3,
+      "consecutive_final_failures": 2,
       "cooldown_until": "2026-06-28T12:15:00Z",
       "effective_input_limit": 128000,
       "effective_input_limit_source": "builtin_catalog"
     },
     {
-      "model": "gpt-4.1-mini",
-      "priority": 2,
+      "model": "configured-candidate",
+      "priority": null,
       "status": "ready",
       "consecutive_final_failures": 0,
       "cooldown_until": null,
-      "effective_input_limit": 1047576,
-      "effective_input_limit_source": "builtin_catalog"
+      "effective_input_limit": 128000,
+      "effective_input_limit_source": "configured_catalog"
     }
   ]
 }
@@ -91,7 +89,7 @@
 {
   "max_concurrency": 5,
   "ai_model_context_limit": null,
-  "llm_models": ["gpt-4o-mini", "gpt-4.1-mini"]
+  "llm_models": ["configured-candidate"]
 }
 ```
 

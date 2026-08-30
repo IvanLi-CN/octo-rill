@@ -166,6 +166,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .llm_scheduler
         .set_model_routing(runtime_settings.llm_models.clone())
         .await;
+    app_state
+        .llm_scheduler
+        .set_model_health(admin_runtime::load_llm_model_health(&pool).await?)
+        .await;
 
     let addr: SocketAddr = config.bind_addr;
     let listener = tokio::net::TcpListener::bind(addr)

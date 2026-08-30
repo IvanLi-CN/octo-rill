@@ -13,3 +13,4 @@
 - 2026-02-27: 增补多轮消息 JSON 展示与 token 指标（含 cached tokens），扩展 llm_calls schema 与 admin API/UI。
 - 2026-02-27: 增补首字等待时间（first token wait）落库与详情/列表展示，用于排查模型首包延迟。
 - 2026-02-27: 新增 `llm_call_events` 与 `llm.call` SSE 事件，支持后台页面对 LLM 调用列表/状态/详情的实时刷新。
+- LLM 详情补充安全失败分类、最终路由、回退次数、恢复时间与逐次尝试历史。

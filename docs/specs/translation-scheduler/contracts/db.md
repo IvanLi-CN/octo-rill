@@ -10,6 +10,13 @@
   - actual scheduled batches with trigger reason and token estimate
 - `translation_batch_items`
   - batch membership and terminal per-item status/error
+- `translation_work_items` recovery columns
+  - `failure_class TEXT NULL`
+  - `retry_count INTEGER NOT NULL DEFAULT 0`
+  - `next_retry_at TEXT NULL`
+  - `retry_expires_at TEXT NULL` (automatic recovery ends after 24 hours)
+- `llm_recovery_flags`
+  - persistent default-off canary switch and stable partition percentage
 
 ## Modified tables
 
@@ -36,3 +43,4 @@
 - Boot-time recovery runs before workers/schedulers start and immediately reclaims rows whose runtime owner lease is missing or stale.
 - Periodic runtime sweep reclaims orphaned `running` work after 90s without heartbeat.
 - Translation request/work-item rows do not own leases directly; they are failed by batch-level recovery.
+- Recovery scans run once per minute and only requeue structured, recoverable failures when the canary switch allows the stable partition. Historical unclassified failures remain manual-only.

@@ -35,6 +35,10 @@
 - 非管理员用户可见性扩展。
 - 现有实时任务/定时任务页面重构。
 
+## Related ADRs
+
+- [ADR 0001: LLM Recovery Boundary](../../adr/0001-llm-recovery-boundary.md)
+
 ## 接口契约（Interfaces & Contracts）
 
 ### 接口清单（Inventory）
@@ -64,6 +68,10 @@
 - Given 点击某条调用详情
   When 抽屉打开
   Then 可见完整 prompt/response/error 与等待/首字/耗时/重试次数。
+
+- Given 调用已安排结构化恢复
+  When 管理员查看详情
+  Then 显示真实失败分类和“错误且已安排恢复”，同时保留最终路由、回退次数、下次恢复时间与可展开尝试历史。
 
 - Given 调用记录存在 `parent_task_id`
   When 点击 “查看父任务”

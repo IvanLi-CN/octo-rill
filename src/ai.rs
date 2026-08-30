@@ -19,7 +19,7 @@ use crate::{
     admin_runtime, api,
     briefs::{self, DailyWindow as UserDailyWindow},
     config::AiConfig,
-    jobs, local_id, observability,
+    local_id, observability,
     release_links::{
         InternalReleaseRef, build_internal_brief_release_href_from_html_url,
         parse_internal_release_ref, parse_release_locator_from_github_release_url,
@@ -42,17 +42,83 @@ const MODEL_LIMIT_RESOLUTION_ADMIN_OVERRIDE: &str = "admin_override";
 const MODEL_LIMIT_RESOLUTION_SYNCED_CATALOG: &str = "synced_catalog";
 const MODEL_LIMIT_RESOLUTION_BUILTIN_CATALOG: &str = "builtin_catalog";
 const MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK: &str = "unknown_fallback";
-const LLM_REQUEST_MAX_RETRIES: usize = 3;
-const LLM_REQUEST_MAX_ATTEMPTS: usize = LLM_REQUEST_MAX_RETRIES + 1;
-const LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS: usize = 8;
+const LLM_REQUEST_MAX_ATTEMPTS: usize = 8;
+const LLM_ROUTE_TRANSIENT_MAX_ATTEMPTS: usize = 2;
 const LLM_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(500);
 const LLM_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(5);
 const LLM_RETRY_BACKOFF_JITTER_MAX_MS: u64 = 250;
 const LLM_CALL_LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const LLM_CALL_LOG_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
-const LLM_MODEL_FINAL_FAILURE_THRESHOLD: u32 = 3;
+const LLM_MODEL_FINAL_FAILURE_THRESHOLD: u32 = 2;
+const LLM_MODEL_FAILURE_WINDOW: Duration = Duration::from_secs(10 * 60);
 const LLM_MODEL_FAILURE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 const AI_RESPONSE_MISSING_CONTENT_ERROR: &str = "AI response missing content";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LlmFailureClass {
+    EmptyContent,
+    Transient,
+    RateLimited,
+    Configuration,
+}
+
+impl LlmFailureClass {
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "empty_content" => Some(Self::EmptyContent),
+            "transient" => Some(Self::Transient),
+            "rate_limited" => Some(Self::RateLimited),
+            "configuration" => Some(Self::Configuration),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::EmptyContent => "empty_content",
+            Self::Transient => "transient",
+            Self::RateLimited => "rate_limited",
+            Self::Configuration => "configuration",
+        }
+    }
+
+    pub(crate) const fn is_recoverable(self) -> bool {
+        !matches!(self, Self::Configuration)
+    }
+
+    pub(crate) const fn safe_message(self) -> &'static str {
+        match self {
+            Self::EmptyContent => AI_RESPONSE_MISSING_CONTENT_ERROR,
+            Self::Transient => "LLM upstream temporarily unavailable",
+            Self::RateLimited => "LLM upstream rate limited",
+            Self::Configuration => "LLM configuration or request rejected",
+        }
+    }
+}
+
+impl std::fmt::Display for LlmFailureClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct LlmCallFailure {
+    pub(crate) class: LlmFailureClass,
+}
+
+impl std::fmt::Display for LlmCallFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.class.safe_message())
+    }
+}
+
+impl std::error::Error for LlmCallFailure {}
+
+pub(crate) fn llm_failure_class(err: &anyhow::Error) -> Option<LlmFailureClass> {
+    err.downcast_ref::<LlmCallFailure>()
+        .map(|failure| failure.class)
+}
 
 #[derive(Debug, Default)]
 struct ModelLimitCatalog {
@@ -102,6 +168,7 @@ pub struct LlmSchedulerModelRuntimeStatus {
     pub priority: i64,
     pub status: &'static str,
     pub consecutive_final_failures: i64,
+    pub relevant_failure_count: i64,
     pub cooldown_until: Option<String>,
 }
 
@@ -141,8 +208,11 @@ struct ModelRoutingState {
 
 #[derive(Debug, Clone, Default)]
 struct ModelRouteHealthState {
-    consecutive_final_failures: u32,
+    relevant_failure_count: u32,
+    window_started_at: Option<DateTime<Utc>>,
     cooldown_until: Option<DateTime<Utc>>,
+    last_failure_class: Option<String>,
+    last_failure_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -228,6 +298,39 @@ impl LlmScheduler {
         routing.health = next_health;
     }
 
+    pub async fn set_model_health(&self, health: Vec<admin_runtime::LlmModelHealth>) {
+        let mut routing = self.routing.write().await;
+        for item in health {
+            let model = normalize_model_name(item.model.as_str());
+            if model.is_empty() {
+                continue;
+            }
+            routing.health.insert(
+                model,
+                ModelRouteHealthState {
+                    relevant_failure_count: u32::try_from(item.relevant_failure_count.max(0))
+                        .unwrap_or(u32::MAX),
+                    window_started_at: item
+                        .window_started_at
+                        .as_deref()
+                        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                        .map(|value| value.with_timezone(&Utc)),
+                    cooldown_until: item
+                        .cooldown_until
+                        .as_deref()
+                        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                        .map(|value| value.with_timezone(&Utc)),
+                    last_failure_class: item.last_failure_class,
+                    last_failure_at: item
+                        .last_failure_at
+                        .as_deref()
+                        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                        .map(|value| value.with_timezone(&Utc)),
+                },
+            );
+        }
+    }
+
     pub async fn routing_status(
         &self,
         fallback_model: Option<&str>,
@@ -242,7 +345,9 @@ impl LlmScheduler {
             .iter()
             .enumerate()
             .map(|(idx, model)| {
-                let health = routing.health.get(model).cloned().unwrap_or_default();
+                let health = health_for_model(&routing.health, model)
+                    .cloned()
+                    .unwrap_or_default();
                 let cooldown_until = health
                     .cooldown_until
                     .filter(|cooldown_until| *cooldown_until > now)
@@ -255,7 +360,8 @@ impl LlmScheduler {
                     } else {
                         "ready"
                     },
-                    consecutive_final_failures: i64::from(health.consecutive_final_failures),
+                    consecutive_final_failures: i64::from(health.relevant_failure_count),
+                    relevant_failure_count: i64::from(health.relevant_failure_count),
                     cooldown_until,
                 }
             })
@@ -273,35 +379,84 @@ impl LlmScheduler {
             .selected_model_for_new_calls
     }
 
-    pub async fn record_model_success(&self, model: &str) {
-        let normalized = model.trim();
-        if normalized.is_empty() {
-            return;
+    pub async fn route_candidates(&self, fallback_model: Option<&str>) -> Vec<String> {
+        let routing = self.routing.read().await;
+        let now = Utc::now();
+        let ordered_models = effective_routing_models(&routing.ordered_models, fallback_model);
+        let mut ready = Vec::new();
+        let mut cooled = Vec::new();
+        for model in ordered_models {
+            let cooldown_until =
+                health_for_model(&routing.health, &model).and_then(|entry| entry.cooldown_until);
+            if cooldown_until.is_none_or(|until| until <= now) {
+                ready.push(model);
+            } else {
+                cooled.push((model, cooldown_until.expect("cooldown is present")));
+            }
         }
-        let mut routing = self.routing.write().await;
-        let entry = routing
-            .health
-            .entry(normalized.to_owned())
-            .or_insert_with(ModelRouteHealthState::default);
-        entry.consecutive_final_failures = 0;
-        entry.cooldown_until = None;
+        if !ready.is_empty() {
+            return ready;
+        }
+        cooled.sort_by_key(|(_, until)| *until);
+        cooled.into_iter().take(1).map(|(model, _)| model).collect()
     }
 
-    pub async fn record_model_final_failure(&self, model: &str) {
-        let normalized = model.trim();
+    pub async fn record_model_success(&self, model: &str) {
+        let normalized = normalize_model_name(model);
         if normalized.is_empty() {
             return;
         }
         let mut routing = self.routing.write().await;
         let entry = routing
             .health
-            .entry(normalized.to_owned())
+            .entry(normalized)
             .or_insert_with(ModelRouteHealthState::default);
-        entry.consecutive_final_failures = entry.consecutive_final_failures.saturating_add(1);
-        if entry.consecutive_final_failures >= LLM_MODEL_FINAL_FAILURE_THRESHOLD {
-            let seconds = i64::try_from(LLM_MODEL_FAILURE_COOLDOWN.as_secs()).unwrap_or(i64::MAX);
-            entry.cooldown_until = Some(Utc::now() + chrono::Duration::seconds(seconds));
+        if entry
+            .cooldown_until
+            .is_some_and(|cooldown_until| cooldown_until <= Utc::now())
+        {
+            entry.cooldown_until = None;
         }
+    }
+
+    pub async fn record_model_final_failure(
+        &self,
+        model: &str,
+        failure_class: &str,
+    ) -> Option<admin_runtime::LlmModelHealth> {
+        let normalized = normalize_model_name(model);
+        let failure_class = LlmFailureClass::from_str(failure_class)?;
+        if normalized.is_empty() || !failure_class.is_recoverable() {
+            return None;
+        }
+        let now = Utc::now();
+        let mut routing = self.routing.write().await;
+        let entry = routing
+            .health
+            .entry(normalized.clone())
+            .or_insert_with(ModelRouteHealthState::default);
+        if entry.window_started_at.is_none_or(|started| {
+            now.signed_duration_since(started).num_seconds()
+                >= i64::try_from(LLM_MODEL_FAILURE_WINDOW.as_secs()).unwrap_or(i64::MAX)
+        }) {
+            entry.relevant_failure_count = 0;
+            entry.window_started_at = Some(now);
+        }
+        entry.relevant_failure_count = entry.relevant_failure_count.saturating_add(1);
+        entry.last_failure_class = Some(failure_class.as_str().to_owned());
+        entry.last_failure_at = Some(now);
+        if entry.relevant_failure_count >= LLM_MODEL_FINAL_FAILURE_THRESHOLD {
+            let seconds = i64::try_from(LLM_MODEL_FAILURE_COOLDOWN.as_secs()).unwrap_or(i64::MAX);
+            entry.cooldown_until = Some(now + chrono::Duration::seconds(seconds));
+        }
+        Some(admin_runtime::LlmModelHealth {
+            model: normalized,
+            relevant_failure_count: i64::from(entry.relevant_failure_count),
+            window_started_at: entry.window_started_at.map(|value| value.to_rfc3339()),
+            cooldown_until: entry.cooldown_until.map(|value| value.to_rfc3339()),
+            last_failure_class: entry.last_failure_class.clone(),
+            last_failure_at: entry.last_failure_at.map(|value| value.to_rfc3339()),
+        })
     }
 
     pub fn runtime_status(&self) -> LlmSchedulerRuntimeStatus {
@@ -411,7 +566,9 @@ fn select_model_from_routing<'a>(
 ) -> Option<&'a str> {
     let mut earliest_cooled: Option<(&'a str, DateTime<Utc>)> = None;
     for model in ordered_models {
-        let Some(cooldown_until) = health.get(model).and_then(|entry| entry.cooldown_until) else {
+        let Some(cooldown_until) =
+            health_for_model(health, model).and_then(|entry| entry.cooldown_until)
+        else {
             return Some(model.as_str());
         };
         if cooldown_until <= now {
@@ -425,6 +582,15 @@ fn select_model_from_routing<'a>(
     earliest_cooled.map(|(model, _)| model)
 }
 
+fn health_for_model<'a>(
+    health: &'a HashMap<String, ModelRouteHealthState>,
+    model: &str,
+) -> Option<&'a ModelRouteHealthState> {
+    health
+        .get(model)
+        .or_else(|| health.get(&normalize_model_name(model)))
+}
+
 pub async fn with_llm_call_context<F, T>(context: LlmCallContext, fut: F) -> T
 where
     F: Future<Output = T>,
@@ -434,43 +600,6 @@ where
 
 fn current_llm_call_context() -> Option<LlmCallContext> {
     LLM_CALL_CONTEXT.try_with(Clone::clone).ok()
-}
-
-fn llm_parent_task_type_uses_translation_empty_content_retry_budget(
-    parent_task_type: Option<&str>,
-) -> bool {
-    matches!(
-        parent_task_type,
-        Some(
-            jobs::TASK_TRANSLATE_RELEASE
-                | jobs::TASK_TRANSLATE_RELEASE_BATCH
-                | jobs::TASK_TRANSLATE_RELEASE_DETAIL
-                | jobs::TASK_TRANSLATE_NOTIFICATION
-                | jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH
-        )
-    )
-}
-
-fn llm_call_uses_translation_empty_content_retry_budget(
-    source: &str,
-    parent_task_type: Option<&str>,
-) -> bool {
-    let normalized_source = source.strip_prefix("job.").unwrap_or(source);
-    normalized_source.starts_with("translation.scheduler.")
-        || normalized_source.starts_with("api.translate_")
-        || llm_parent_task_type_uses_translation_empty_content_retry_budget(parent_task_type)
-}
-
-fn ai_error_is_missing_content(err: &anyhow::Error) -> bool {
-    err.to_string().trim() == AI_RESPONSE_MISSING_CONTENT_ERROR
-}
-
-fn max_llm_attempts_for_call(translation_empty_content_budget_active: bool) -> usize {
-    if translation_empty_content_budget_active {
-        LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS
-    } else {
-        LLM_REQUEST_MAX_ATTEMPTS
-    }
 }
 
 fn normalize_model_name(raw: &str) -> String {
@@ -1398,13 +1527,15 @@ fn parse_chat_completion_sse_output(
         Ok(())
     }
 
-    let raw = std::str::from_utf8(body).map_err(|err| ChatCompletionAttemptError {
-        err: anyhow!(
-            "AI returned invalid SSE success response (content-type {content_type}): {err}"
-        ),
-        retryable: false,
-        retry_after: None,
-        first_token_wait_ms,
+    let raw = std::str::from_utf8(body).map_err(|err| {
+        ChatCompletionAttemptError::new(
+            anyhow!(
+                "AI returned invalid SSE success response (content-type {content_type}): {err}"
+            ),
+            LlmFailureClass::Configuration,
+            None,
+            first_token_wait_ms,
+        )
     })?;
 
     let mut event_name: Option<String> = None;
@@ -1440,14 +1571,18 @@ fn parse_chat_completion_sse_output(
         if trimmed.is_empty() {
             flush_event(&mut event_name, &mut event_data).map_err(|err| {
                 let message = err.to_string();
-                ChatCompletionAttemptError {
-                    err: anyhow!(
+                ChatCompletionAttemptError::new(
+                    anyhow!(
                         "AI returned event-stream success response error (content-type {content_type}): {message}"
                     ),
-                    retryable: !ai_response_message_is_non_retryable(&message),
-                    retry_after: None,
+                    if ai_response_message_is_non_retryable(&message) {
+                        LlmFailureClass::Configuration
+                    } else {
+                        LlmFailureClass::Transient
+                    },
+                    None,
                     first_token_wait_ms,
-                }
+                )
             })?;
             continue;
         }
@@ -1464,14 +1599,18 @@ fn parse_chat_completion_sse_output(
 
     flush_event(&mut event_name, &mut event_data).map_err(|err| {
         let message = err.to_string();
-        ChatCompletionAttemptError {
-            err: anyhow!(
+        ChatCompletionAttemptError::new(
+            anyhow!(
                 "AI returned event-stream success response error (content-type {content_type}): {message}"
             ),
-            retryable: !ai_response_message_is_non_retryable(&message),
-            retry_after: None,
+            if ai_response_message_is_non_retryable(&message) {
+                LlmFailureClass::Configuration
+            } else {
+                LlmFailureClass::Transient
+            },
+            None,
             first_token_wait_ms,
-        }
+        )
     })?;
 
     let content = content.trim().to_owned();
@@ -1485,14 +1624,14 @@ fn parse_chat_completion_sse_output(
         extract_error_message(body)
             .unwrap_or_else(|| "AI event-stream response ended before [DONE]".to_owned())
     };
-    Err(ChatCompletionAttemptError {
-        err: anyhow!(
+    Err(ChatCompletionAttemptError::new(
+        anyhow!(
             "AI returned invalid event-stream success response (content-type {content_type}): {message}"
         ),
-        retryable: !ai_response_message_is_non_retryable(&message),
-        retry_after: None,
+        LlmFailureClass::EmptyContent,
+        None,
         first_token_wait_ms,
-    })
+    ))
 }
 
 pub fn sha256_hex(input: &str) -> String {
@@ -1614,9 +1753,28 @@ pub fn recent_key_dates(
 #[derive(Debug)]
 struct ChatCompletionAttemptError {
     err: anyhow::Error,
+    failure_class: LlmFailureClass,
+    #[allow(dead_code)]
     retryable: bool,
     retry_after: Option<Duration>,
     first_token_wait_ms: Option<i64>,
+}
+
+impl ChatCompletionAttemptError {
+    fn new(
+        err: anyhow::Error,
+        failure_class: LlmFailureClass,
+        retry_after: Option<Duration>,
+        first_token_wait_ms: Option<i64>,
+    ) -> Self {
+        Self {
+            err,
+            failure_class,
+            retryable: failure_class.is_recoverable(),
+            retry_after,
+            first_token_wait_ms,
+        }
+    }
 }
 
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
@@ -1627,6 +1785,17 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
 
 fn is_retryable_transport_error(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect() || err.is_request()
+}
+
+fn failure_class_for_status(status: reqwest::StatusCode, message: &str) -> LlmFailureClass {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return LlmFailureClass::RateLimited;
+    }
+    if !is_retryable_status(status) || ai_response_message_is_non_retryable(message) {
+        LlmFailureClass::Configuration
+    } else {
+        LlmFailureClass::Transient
+    }
 }
 
 fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
@@ -1874,6 +2043,13 @@ async fn append_llm_call_event(
     payload: Value,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
+    let failure_class = payload.get("failure_class").and_then(Value::as_str);
+    let model = payload.get("model").and_then(Value::as_str);
+    let attempt = payload.get("attempt").and_then(Value::as_i64);
+    let retry_after_ms = payload.get("retry_after_ms").and_then(Value::as_i64);
+    let from_model = payload.get("from_model").and_then(Value::as_str);
+    let to_model = payload.get("to_model").and_then(Value::as_str);
+    let fallback_count = payload.get("fallback_count").and_then(Value::as_i64);
     let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned());
     let inserted = state
         .sqlite_writer
@@ -1888,6 +2064,13 @@ async fn append_llm_call_event(
                       source,
                       requested_by,
                       parent_task_id,
+                      failure_class,
+                      model,
+                      attempt,
+                      retry_after_ms,
+                      from_model,
+                      to_model,
+                      fallback_count,
                       payload_json,
                       created_at
                     )
@@ -1900,6 +2083,13 @@ async fn append_llm_call_event(
                       requested_by,
                       parent_task_id,
                       ?,
+                      ?,
+                      ?,
+                      ?,
+                      ?,
+                      ?,
+                      ?,
+                      ?,
                       ?
                     FROM llm_calls
                     WHERE id = ?
@@ -1909,6 +2099,13 @@ async fn append_llm_call_event(
             .bind(local_id::generate_local_id())
             .bind(event_type)
             .bind(status)
+            .bind(failure_class)
+            .bind(model)
+            .bind(attempt)
+            .bind(retry_after_ms)
+            .bind(from_model)
+            .bind(to_model)
+            .bind(fallback_count)
             .bind(payload_json.as_str())
             .bind(now.as_str())
             .bind(call_id)
@@ -1928,6 +2125,7 @@ async fn update_llm_call_running(
     call_id: &str,
     attempt_count: i64,
     scheduler_wait_ms: i64,
+    model: &str,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     state
@@ -1937,6 +2135,10 @@ async fn update_llm_call_running(
                 r#"
                 UPDATE llm_calls
                 SET status = 'running',
+                    model = ?,
+                    failure_class = NULL,
+                    final_model = NULL,
+                    retry_scheduled_at = NULL,
                     started_at = COALESCE(started_at, ?),
                     attempt_count = ?,
                     scheduler_wait_ms = ?,
@@ -1946,6 +2148,7 @@ async fn update_llm_call_running(
                 WHERE id = ?
                 "#,
             )
+            .bind(model)
             .bind(now.as_str())
             .bind(attempt_count)
             .bind(scheduler_wait_ms)
@@ -1965,6 +2168,8 @@ async fn update_llm_call_running(
         "llm.running",
         "running",
         serde_json::json!({
+            "model": model,
+            "attempt": attempt_count,
             "attempt_count": attempt_count,
             "scheduler_wait_ms": scheduler_wait_ms,
         }),
@@ -1974,14 +2179,21 @@ async fn update_llm_call_running(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn requeue_llm_call_for_retry(
     state: &AppState,
     call_id: &str,
     attempt_count: i64,
     scheduler_wait_ms: i64,
     retry_delay: Duration,
+    next_model: &str,
+    failure_class: Option<&str>,
+    fallback_count: i64,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
+    let retry_scheduled_at = (chrono::Utc::now()
+        + chrono::Duration::from_std(retry_delay).unwrap_or_else(|_| chrono::Duration::zero()))
+    .to_rfc3339();
     state
         .sqlite_writer
         .write("llm_call_requeue", |_| async {
@@ -1989,16 +2201,25 @@ async fn requeue_llm_call_for_retry(
                 r#"
                 UPDATE llm_calls
                 SET status = 'queued',
+                    model = ?,
+                    failure_class = ?,
+                    final_model = NULL,
+                    fallback_count = ?,
                     attempt_count = ?,
                     scheduler_wait_ms = ?,
                     runtime_owner_id = NULL,
                     lease_heartbeat_at = NULL,
+                    retry_scheduled_at = ?,
                     updated_at = ?
                 WHERE id = ?
                 "#,
             )
+            .bind(next_model)
+            .bind(failure_class)
+            .bind(fallback_count)
             .bind(attempt_count)
             .bind(scheduler_wait_ms)
+            .bind(retry_scheduled_at.as_str())
             .bind(now.as_str())
             .bind(call_id)
             .execute(&state.pool)
@@ -2013,14 +2234,79 @@ async fn requeue_llm_call_for_retry(
         "llm.retry_queued",
         "queued",
         serde_json::json!({
+            "model": next_model,
+            "failure_class": failure_class,
+            "attempt": attempt_count,
             "attempt_count": attempt_count,
             "scheduler_wait_ms": scheduler_wait_ms,
             "retry_delay_ms": i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
+            "retry_after_ms": i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
+            "fallback_count": fallback_count,
         }),
     )
     .await
     .context("append llm_call retry queued event failed")?;
     Ok(())
+}
+
+async fn persist_model_failure_health(
+    state: &AppState,
+    model: &str,
+    failure_class: LlmFailureClass,
+) {
+    let Some(health) = state
+        .llm_scheduler
+        .record_model_final_failure(model, failure_class.as_str())
+        .await
+    else {
+        return;
+    };
+    if let Err(err) = admin_runtime::upsert_llm_model_health(&state.pool, &health).await {
+        tracing::warn!(
+            event = "sqlite.write",
+            operation = "ai.llm_model_health_upsert",
+            model = model,
+            failure_class = failure_class.as_str(),
+            error_kind = "persist_failed",
+            error_chain = %observability::error_chain_summary(err.as_ref()),
+            "llm model health persistence failed"
+        );
+    }
+}
+
+async fn append_llm_attempt_failure_event(
+    state: &AppState,
+    call_id: &str,
+    model: &str,
+    attempt: usize,
+    failure_class: LlmFailureClass,
+    retry_after: Option<Duration>,
+    fallback_count: i64,
+) {
+    if let Err(err) = append_llm_call_event(
+        state,
+        call_id,
+        "llm.attempt_failed",
+        "failed",
+        serde_json::json!({
+            "model": model,
+            "attempt": i64::try_from(attempt).unwrap_or(i64::MAX),
+            "failure_class": failure_class.as_str(),
+            "retry_after_ms": retry_after.map(|delay| i64::try_from(delay.as_millis()).unwrap_or(i64::MAX)),
+            "fallback_count": fallback_count,
+        }),
+    )
+    .await
+    {
+        tracing::warn!(
+            event = "sqlite.write",
+            operation = "ai.llm_call_attempt_event",
+            call_id,
+            error_kind = "persist_failed",
+            error_chain = %observability::error_chain_summary(err.as_ref()),
+            "llm attempt audit event persistence failed"
+        );
+    }
 }
 
 async fn finalize_llm_call(
@@ -2047,6 +2333,11 @@ async fn finalize_llm_call(
                     output_tokens = ?,
                     cached_input_tokens = ?,
                     total_tokens = ?,
+                    failure_class = ?,
+                    final_model = ?,
+                    fallback_count = ?,
+                    retry_scheduled_at = ?,
+                    recovery_attempt_count = ?,
                     finished_at = ?,
                     runtime_owner_id = NULL,
                     lease_heartbeat_at = NULL,
@@ -2066,6 +2357,11 @@ async fn finalize_llm_call(
             .bind(update.output_tokens)
             .bind(update.cached_input_tokens)
             .bind(update.total_tokens)
+            .bind(update.failure_class)
+            .bind(update.final_model)
+            .bind(update.fallback_count)
+            .bind(update.retry_scheduled_at)
+            .bind(update.recovery_attempt_count)
             .bind(now.as_str())
             .bind(now.as_str())
             .bind(call_id)
@@ -2094,7 +2390,11 @@ async fn finalize_llm_call(
             "cached_input_tokens": update.cached_input_tokens,
             "total_tokens": update.total_tokens,
             "has_output": update.response_text.is_some(),
-            "error_text_preview": update.error_text.map(|value| truncate_chars(value, 200)),
+            "failure_class": update.failure_class,
+            "final_model": update.final_model,
+            "fallback_count": update.fallback_count,
+            "retry_scheduled_at": update.retry_scheduled_at,
+            "recovery_attempt_count": update.recovery_attempt_count,
         }),
     )
     .await
@@ -2138,6 +2438,11 @@ struct FinalizeLlmCallUpdate<'a> {
     output_tokens: Option<i64>,
     cached_input_tokens: Option<i64>,
     total_tokens: Option<i64>,
+    failure_class: Option<&'a str>,
+    final_model: Option<&'a str>,
+    fallback_count: i64,
+    retry_scheduled_at: Option<&'a str>,
+    recovery_attempt_count: i64,
 }
 
 async fn chat_completion_once(
@@ -2151,11 +2456,8 @@ async fn chat_completion_once(
         .base_url
         .join("chat/completions")
         .context("invalid AI_BASE_URL")
-        .map_err(|err| ChatCompletionAttemptError {
-            err,
-            retryable: false,
-            retry_after: None,
-            first_token_wait_ms: None,
+        .map_err(|err| {
+            ChatCompletionAttemptError::new(err, LlmFailureClass::Configuration, None, None)
         })?;
 
     let req = ChatCompletionsRequest {
@@ -2184,13 +2486,16 @@ async fn chat_completion_once(
         .send()
         .await
         .map_err(|err| {
-            let retryable = is_retryable_transport_error(&err);
-            ChatCompletionAttemptError {
-                err: anyhow!("AI request failed: {err}"),
-                retryable,
-                retry_after: None,
-                first_token_wait_ms: None,
-            }
+            ChatCompletionAttemptError::new(
+                anyhow!("AI request failed: {err}"),
+                if is_retryable_transport_error(&err) {
+                    LlmFailureClass::Transient
+                } else {
+                    LlmFailureClass::Configuration
+                },
+                None,
+                None,
+            )
         })?;
     let first_token_wait_ms =
         i64::try_from(response_wait_started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
@@ -2213,24 +2518,23 @@ async fn chat_completion_once(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
         .unwrap_or_default();
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|err| ChatCompletionAttemptError {
-            err: anyhow!("AI read response failed: {err}"),
-            retryable: true,
-            retry_after: None,
+    let body = resp.bytes().await.map_err(|err| {
+        ChatCompletionAttemptError::new(
+            anyhow!("AI read response failed: {err}"),
+            LlmFailureClass::Transient,
+            None,
             first_token_wait_ms,
-        })?;
+        )
+    })?;
 
     if !status.is_success() {
         let msg = extract_error_message(&body).unwrap_or_else(|| "upstream_error".to_owned());
-        return Err(ChatCompletionAttemptError {
-            err: anyhow!("AI returned {status}: {msg}"),
-            retryable: is_retryable_status(status) && !ai_response_message_is_non_retryable(&msg),
+        return Err(ChatCompletionAttemptError::new(
+            anyhow!("AI returned {status}: {msg}"),
+            failure_class_for_status(status, &msg),
             retry_after,
             first_token_wait_ms,
-        });
+        ));
     }
 
     let content_type_lower = content_type.to_ascii_lowercase();
@@ -2242,29 +2546,28 @@ async fn chat_completion_once(
         && !content_type_lower.contains("+json")
     {
         let msg = extract_error_message(&body).unwrap_or_else(|| "non_json_success".to_owned());
-        return Err(ChatCompletionAttemptError {
-            err: anyhow!(
-                "AI returned non-json success response (content-type {content_type}): {msg}"
-            ),
-            retryable: false,
-            retry_after: None,
+        return Err(ChatCompletionAttemptError::new(
+            anyhow!("AI returned non-json success response (content-type {content_type}): {msg}"),
+            LlmFailureClass::Configuration,
+            None,
             first_token_wait_ms,
-        });
+        ));
     }
 
-    let resp: ChatCompletionsResponse =
-        serde_json::from_slice(&body).map_err(|err| ChatCompletionAttemptError {
-            err: anyhow!(
-                "AI response json decode failed: {}",
-                extract_error_message(&body)
-                    .unwrap_or_else(|| format!("{err}; upstream_json_decode_failed"))
-            ),
-            retryable: extract_error_message(&body)
-                .map(|msg| !ai_response_message_is_non_retryable(&msg))
-                .unwrap_or(true),
-            retry_after: None,
+    let resp: ChatCompletionsResponse = serde_json::from_slice(&body).map_err(|err| {
+        let message = extract_error_message(&body)
+            .unwrap_or_else(|| format!("{err}; upstream_json_decode_failed"));
+        ChatCompletionAttemptError::new(
+            anyhow!("AI response json decode failed: {message}"),
+            if ai_response_message_is_non_retryable(&message) {
+                LlmFailureClass::Configuration
+            } else {
+                LlmFailureClass::Transient
+            },
+            None,
             first_token_wait_ms,
-        })?;
+        )
+    })?;
 
     let ChatCompletionsResponse { choices, usage } = resp;
 
@@ -2274,11 +2577,13 @@ async fn chat_completion_once(
         .and_then(|c| c.message.content)
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| ChatCompletionAttemptError {
-            err: anyhow!(AI_RESPONSE_MISSING_CONTENT_ERROR),
-            retryable: true,
-            retry_after: None,
-            first_token_wait_ms,
+        .ok_or_else(|| {
+            ChatCompletionAttemptError::new(
+                anyhow!(AI_RESPONSE_MISSING_CONTENT_ERROR),
+                LlmFailureClass::EmptyContent,
+                None,
+                first_token_wait_ms,
+            )
         })?;
 
     let output_messages_json = serde_json::to_string(&[ChatMessage {
@@ -2303,12 +2608,22 @@ pub async fn chat_completion(
     max_tokens: u32,
 ) -> Result<String> {
     let Some(base_ai) = state.config.ai.clone() else {
-        return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
+        return Err(anyhow::Error::new(LlmCallFailure {
+            class: LlmFailureClass::Configuration,
+        }));
     };
     let selected_model = select_model_for_new_calls(state).await;
-    let mut ai = base_ai;
-    if !selected_model.model.trim().is_empty() {
-        ai.model = selected_model.model.clone();
+    let mut candidates = state
+        .llm_scheduler
+        .route_candidates(Some(base_ai.model.as_str()))
+        .await;
+    if candidates.is_empty() && !selected_model.model.trim().is_empty() {
+        candidates.push(selected_model.model.clone());
+    }
+    if candidates.is_empty() {
+        return Err(anyhow::Error::new(LlmCallFailure {
+            class: LlmFailureClass::Configuration,
+        }));
     }
 
     let log_record = build_llm_call_log_record();
@@ -2327,7 +2642,7 @@ pub async fn chat_completion(
     let llm_call_persisted = match insert_llm_call(
         state,
         &log_record,
-        ai.model.as_str(),
+        candidates[0].as_str(),
         max_tokens,
         &prompt_text,
         input_messages_json.as_deref(),
@@ -2347,19 +2662,19 @@ pub async fn chat_completion(
         }
     };
 
-    let model_for_call = ai.model.clone();
     let mut total_wait_ms = 0_i64;
     let mut started_at: Option<Instant> = None;
     let mut started_at_timestamp: Option<String> = None;
-    let translation_source_uses_empty_content_budget =
-        llm_call_uses_translation_empty_content_retry_budget(
-            log_record.source.as_str(),
-            log_record.parent_task_type.as_deref(),
-        );
-    let mut translation_empty_content_budget_active = false;
+    let mut candidate_index = 0_usize;
+    let mut candidate_attempts = 0_usize;
+    let mut fallback_count = 0_i64;
     let mut attempt = 0_usize;
     loop {
         attempt = attempt.saturating_add(1);
+        candidate_attempts = candidate_attempts.saturating_add(1);
+        let model_for_call = candidates[candidate_index].clone();
+        let mut ai = base_ai.clone();
+        ai.model = model_for_call.clone();
         let (wait_ms, mut in_flight_guard) = state.llm_scheduler.acquire_slot().await;
         total_wait_ms = total_wait_ms.saturating_add(wait_ms.max(0));
         let attempt_count = i64::try_from(attempt).unwrap_or(i64::MAX);
@@ -2398,6 +2713,7 @@ pub async fn chat_completion(
                 log_record.id.as_str(),
                 attempt_count,
                 total_wait_ms,
+                model_for_call.as_str(),
             )
             .await;
             let heartbeat_enabled = persist_result.is_ok();
@@ -2470,6 +2786,11 @@ pub async fn chat_completion(
                                 output_tokens: output.usage.output_tokens,
                                 cached_input_tokens: output.usage.cached_input_tokens,
                                 total_tokens: output.usage.total_tokens,
+                                failure_class: None,
+                                final_model: Some(model_for_call.as_str()),
+                                fallback_count,
+                                retry_scheduled_at: None,
+                                recovery_attempt_count: 0,
                             },
                         )
                         .await,
@@ -2482,47 +2803,54 @@ pub async fn chat_completion(
             }
             Err(attempt_err) => {
                 let ChatCompletionAttemptError {
-                    retryable,
+                    failure_class,
+                    retryable: _,
                     retry_after,
                     err,
                     first_token_wait_ms,
                 } = attempt_err;
-                if translation_source_uses_empty_content_budget && ai_error_is_missing_content(&err)
-                {
-                    translation_empty_content_budget_active = true;
-                }
-                let max_attempts =
-                    max_llm_attempts_for_call(translation_empty_content_budget_active);
-                if !retryable || attempt >= max_attempts {
-                    state
-                        .llm_scheduler
-                        .record_model_final_failure(model_for_call.as_str())
-                        .await;
-                    let duration_ms = started_at.map(|started| {
-                        i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
-                    });
-                    let error_message = err.to_string();
-                    let finished_at = chrono::Utc::now().to_rfc3339();
+                append_llm_attempt_failure_event(
+                    state,
+                    log_record.id.as_str(),
+                    model_for_call.as_str(),
+                    attempt,
+                    failure_class,
+                    retry_after,
+                    fallback_count,
+                )
+                .await;
+
+                let can_retry_same_candidate = matches!(
+                    failure_class,
+                    LlmFailureClass::Transient | LlmFailureClass::RateLimited
+                ) && candidate_attempts
+                    < LLM_ROUTE_TRANSIENT_MAX_ATTEMPTS
+                    && attempt < LLM_REQUEST_MAX_ATTEMPTS;
+                let has_next_candidate = candidate_index + 1 < candidates.len();
+
+                if can_retry_same_candidate {
+                    let retry_delay = next_retry_delay(candidate_attempts, retry_after);
+                    let requeued_at = chrono::Utc::now().to_rfc3339();
                     if llm_call_persisted {
                         state
                             .llm_scheduler
                             .set_admin_override(LlmCallAdminOverride {
                                 id: log_record.id.clone(),
-                                status: "failed".to_owned(),
+                                status: "queued".to_owned(),
                                 attempt_count,
                                 scheduler_wait_ms: total_wait_ms,
-                                first_token_wait_ms,
-                                duration_ms,
+                                first_token_wait_ms: None,
+                                duration_ms: None,
                                 input_tokens: None,
                                 output_tokens: None,
                                 cached_input_tokens: None,
                                 total_tokens: None,
                                 output_messages_json: None,
                                 response_text: None,
-                                error_text: Some(error_message.clone()),
+                                error_text: None,
                                 started_at: started_at_timestamp.clone(),
-                                finished_at: Some(finished_at.clone()),
-                                updated_at: finished_at.clone(),
+                                finished_at: None,
+                                updated_at: requeued_at,
                             })
                             .await;
                     }
@@ -2532,54 +2860,150 @@ pub async fn chat_completion(
                         reconcile_admin_override_after_persist(
                             state,
                             log_record.id.as_str(),
-                            finalize_llm_call(
+                            requeue_llm_call_for_retry(
                                 state,
                                 log_record.id.as_str(),
-                                FinalizeLlmCallUpdate {
-                                    status: "failed",
-                                    attempt_count,
-                                    scheduler_wait_ms: total_wait_ms,
-                                    first_token_wait_ms,
-                                    duration_ms,
-                                    output_messages_json: None,
-                                    response_text: None,
-                                    error_text: Some(error_message.as_str()),
-                                    input_tokens: None,
-                                    output_tokens: None,
-                                    cached_input_tokens: None,
-                                    total_tokens: None,
-                                },
+                                attempt_count,
+                                total_wait_ms,
+                                retry_delay,
+                                model_for_call.as_str(),
+                                Some(failure_class.as_str()),
+                                fallback_count,
                             )
                             .await,
-                            "llm call log finalize failure failed",
+                            "llm call requeue update failed",
                         )
                         .await;
                     }
                     heartbeat.stop().await;
-                    return Err(err);
+                    tracing::warn!(
+                        event = "upstream.call",
+                        operation = "ai.chat_completions",
+                        attempt,
+                        max_attempts = LLM_REQUEST_MAX_ATTEMPTS,
+                        model = model_for_call.as_str(),
+                        failure_class = failure_class.as_str(),
+                        retry_delay_ms = i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
+                        error_chain = %observability::error_chain_summary(err.as_ref()),
+                        "ai request failed; retrying current model"
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    continue;
                 }
-                let retry_delay = next_retry_delay(attempt, retry_after);
-                let requeued_at = chrono::Utc::now().to_rfc3339();
+
+                if failure_class.is_recoverable() {
+                    persist_model_failure_health(state, model_for_call.as_str(), failure_class)
+                        .await;
+                }
+
+                if failure_class != LlmFailureClass::Configuration
+                    && has_next_candidate
+                    && attempt < LLM_REQUEST_MAX_ATTEMPTS
+                {
+                    let next_model = candidates[candidate_index + 1].clone();
+                    let previous_model = model_for_call.clone();
+                    candidate_index += 1;
+                    candidate_attempts = 0;
+                    fallback_count = fallback_count.saturating_add(1);
+                    let requeued_at = chrono::Utc::now().to_rfc3339();
+                    if llm_call_persisted {
+                        state
+                            .llm_scheduler
+                            .set_admin_override(LlmCallAdminOverride {
+                                id: log_record.id.clone(),
+                                status: "queued".to_owned(),
+                                attempt_count,
+                                scheduler_wait_ms: total_wait_ms,
+                                first_token_wait_ms: None,
+                                duration_ms: None,
+                                input_tokens: None,
+                                output_tokens: None,
+                                cached_input_tokens: None,
+                                total_tokens: None,
+                                output_messages_json: None,
+                                response_text: None,
+                                error_text: None,
+                                started_at: started_at_timestamp.clone(),
+                                finished_at: None,
+                                updated_at: requeued_at,
+                            })
+                            .await;
+                    }
+                    if let Err(err) = append_llm_call_event(
+                        state,
+                        log_record.id.as_str(),
+                        "llm.route_switched",
+                        "queued",
+                        serde_json::json!({
+                            "failure_class": failure_class.as_str(),
+                            "from_model": previous_model,
+                            "to_model": next_model,
+                            "model": next_model,
+                            "attempt": attempt_count,
+                            "fallback_count": fallback_count,
+                        }),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            event = "sqlite.write",
+                            operation = "ai.llm_route_switch_event",
+                            call_id = log_record.id.as_str(),
+                            error_kind = "persist_failed",
+                            error_chain = %observability::error_chain_summary(err.as_ref()),
+                            "llm route switch audit event persistence failed"
+                        );
+                    }
+                    in_flight_guard.release_permit();
+                    drop(in_flight_guard);
+                    if llm_call_persisted {
+                        reconcile_admin_override_after_persist(
+                            state,
+                            log_record.id.as_str(),
+                            requeue_llm_call_for_retry(
+                                state,
+                                log_record.id.as_str(),
+                                attempt_count,
+                                total_wait_ms,
+                                Duration::ZERO,
+                                next_model.as_str(),
+                                Some(failure_class.as_str()),
+                                fallback_count,
+                            )
+                            .await,
+                            "llm route switch persistence failed",
+                        )
+                        .await;
+                    }
+                    heartbeat.stop().await;
+                    continue;
+                }
+
+                let duration_ms = started_at.map(|started| {
+                    i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
+                });
+                let safe_message = failure_class.safe_message();
+                let finished_at = chrono::Utc::now().to_rfc3339();
                 if llm_call_persisted {
                     state
                         .llm_scheduler
                         .set_admin_override(LlmCallAdminOverride {
                             id: log_record.id.clone(),
-                            status: "queued".to_owned(),
+                            status: "failed".to_owned(),
                             attempt_count,
                             scheduler_wait_ms: total_wait_ms,
-                            first_token_wait_ms: None,
-                            duration_ms: None,
+                            first_token_wait_ms,
+                            duration_ms,
                             input_tokens: None,
                             output_tokens: None,
                             cached_input_tokens: None,
                             total_tokens: None,
                             output_messages_json: None,
                             response_text: None,
-                            error_text: None,
+                            error_text: Some(safe_message.to_owned()),
                             started_at: started_at_timestamp.clone(),
-                            finished_at: None,
-                            updated_at: requeued_at.clone(),
+                            finished_at: Some(finished_at.clone()),
+                            updated_at: finished_at.clone(),
                         })
                         .await;
                 }
@@ -2589,15 +3013,31 @@ pub async fn chat_completion(
                     reconcile_admin_override_after_persist(
                         state,
                         log_record.id.as_str(),
-                        requeue_llm_call_for_retry(
+                        finalize_llm_call(
                             state,
                             log_record.id.as_str(),
-                            attempt_count,
-                            total_wait_ms,
-                            retry_delay,
+                            FinalizeLlmCallUpdate {
+                                status: "failed",
+                                attempt_count,
+                                scheduler_wait_ms: total_wait_ms,
+                                first_token_wait_ms,
+                                duration_ms,
+                                output_messages_json: None,
+                                response_text: None,
+                                error_text: Some(safe_message),
+                                input_tokens: None,
+                                output_tokens: None,
+                                cached_input_tokens: None,
+                                total_tokens: None,
+                                failure_class: Some(failure_class.as_str()),
+                                final_model: Some(model_for_call.as_str()),
+                                fallback_count,
+                                retry_scheduled_at: None,
+                                recovery_attempt_count: 0,
+                            },
                         )
                         .await,
-                        "llm call requeue update failed",
+                        "llm call log finalize failure failed",
                     )
                     .await;
                 }
@@ -2606,23 +3046,26 @@ pub async fn chat_completion(
                     event = "upstream.call",
                     operation = "ai.chat_completions",
                     attempt,
-                    max_attempts,
-                    retries_left = max_attempts.saturating_sub(attempt),
+                    max_attempts = LLM_REQUEST_MAX_ATTEMPTS,
+                    model = model_for_call.as_str(),
+                    failure_class = failure_class.as_str(),
                     elapsed_ms = first_token_wait_ms.unwrap_or_default(),
-                    retry_after_ms = retry_after
-                        .map(|delay| i64::try_from(delay.as_millis()).unwrap_or(i64::MAX)),
-                    retry_delay_ms = i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
-                    error_kind = "request_failed",
+                    error_kind = "request_failed_final",
                     error_chain = %observability::error_chain_summary(err.as_ref()),
-                    "ai request failed; sleeping before retry"
+                    "ai request failed after route candidates were exhausted"
                 );
-                tokio::time::sleep(retry_delay).await;
+                return Err(anyhow::Error::new(LlmCallFailure {
+                    class: failure_class,
+                }));
             }
         }
     }
 }
 
 fn ai_error_is_non_retryable(err: &anyhow::Error) -> bool {
+    if llm_failure_class(err) == Some(LlmFailureClass::Configuration) {
+        return true;
+    }
     let msg = err.to_string();
     let msg_lower = msg.to_ascii_lowercase();
     let status_422_non_context = msg_lower.contains("ai returned 422")
@@ -2717,7 +3160,7 @@ async fn recover_llm_call_with_message(
         event_type,
         "failed",
         serde_json::json!({
-            "error_text_preview": truncate_chars(message, 200),
+            "error_kind": "runtime_lease_expired",
             "previous_runtime_owner_id": previous_runtime_owner_id,
             "previous_lease_heartbeat_at": previous_lease_heartbeat_at,
         }),
@@ -6139,6 +6582,7 @@ mod tests {
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
         crypto::EncryptionKey,
+        jobs,
         state::build_oauth_client,
     };
 
@@ -6601,6 +7045,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn llm_scheduler_cools_model_after_two_relevant_failures() {
+        let scheduler = LlmScheduler::new(1);
+        scheduler
+            .set_model_routing(vec!["model-a".to_owned(), "model-b".to_owned()])
+            .await;
+
+        assert_eq!(
+            scheduler.route_candidates(None).await,
+            vec!["model-a".to_owned(), "model-b".to_owned()]
+        );
+        assert!(
+            scheduler
+                .record_model_final_failure("model-a", "configuration")
+                .await
+                .is_none(),
+            "configuration failures must not affect routing health"
+        );
+
+        let first = scheduler
+            .record_model_final_failure("model-a", "transient")
+            .await
+            .expect("first relevant failure should be recorded");
+        assert_eq!(first.relevant_failure_count, 1);
+        assert!(first.cooldown_until.is_none());
+
+        let second = scheduler
+            .record_model_final_failure("model-a", "rate_limited")
+            .await
+            .expect("second relevant failure should be recorded");
+        assert_eq!(second.relevant_failure_count, 2);
+        assert!(second.cooldown_until.is_some());
+        assert_eq!(
+            scheduler.route_candidates(None).await,
+            vec!["model-b".to_owned()]
+        );
+
+        let status = scheduler.routing_status(None).await;
+        let model_a = status
+            .model_statuses
+            .iter()
+            .find(|item| item.model == "model-a")
+            .expect("model-a status");
+        assert_eq!(model_a.status, "cooldown");
+        assert_eq!(model_a.relevant_failure_count, 2);
+    }
+
+    #[tokio::test]
+    async fn llm_scheduler_restores_persisted_cooldown_health() {
+        let scheduler = LlmScheduler::new(1);
+        scheduler
+            .set_model_routing(vec!["model-a".to_owned(), "model-b".to_owned()])
+            .await;
+        let cooldown_until = (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+        scheduler
+            .set_model_health(vec![admin_runtime::LlmModelHealth {
+                model: "model-a".to_owned(),
+                relevant_failure_count: 2,
+                window_started_at: Some(Utc::now().to_rfc3339()),
+                cooldown_until: Some(cooldown_until),
+                last_failure_class: Some("transient".to_owned()),
+                last_failure_at: Some(Utc::now().to_rfc3339()),
+            }])
+            .await;
+
+        assert_eq!(
+            scheduler.route_candidates(None).await,
+            vec!["model-b".to_owned()]
+        );
+    }
+
+    #[tokio::test]
     async fn reconcile_admin_override_after_persist_clears_only_on_success() {
         let state = setup_llm_state().await;
         let snapshot = LlmCallAdminOverride {
@@ -6676,7 +7191,7 @@ mod tests {
         )
         .await
         .expect("seed llm call");
-        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 120)
+        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 120, "gpt-4o-mini")
             .await
             .expect("mark llm call running");
         requeue_llm_call_for_retry(
@@ -6685,13 +7200,17 @@ mod tests {
             1,
             120,
             Duration::from_secs(3),
+            "gpt-4o-mini",
+            Some("transient"),
+            0,
         )
         .await
         .expect("requeue llm call");
 
         let row = sqlx::query(
             r#"
-            SELECT status, attempt_count, scheduler_wait_ms, started_at
+            SELECT status, attempt_count, scheduler_wait_ms, started_at,
+                   failure_class, fallback_count, retry_scheduled_at
             FROM llm_calls
             WHERE id = ?
             "#,
@@ -6705,6 +7224,12 @@ mod tests {
         assert_eq!(row.get::<i64, _>("attempt_count"), 1);
         assert_eq!(row.get::<i64, _>("scheduler_wait_ms"), 120);
         assert!(row.get::<Option<String>, _>("started_at").is_some());
+        assert_eq!(
+            row.get::<Option<String>, _>("failure_class").as_deref(),
+            Some("transient")
+        );
+        assert_eq!(row.get::<i64, _>("fallback_count"), 0);
+        assert!(row.get::<Option<String>, _>("retry_scheduled_at").is_some());
 
         let event = sqlx::query(
             r#"
@@ -6844,6 +7369,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_completion_switches_model_after_empty_content() {
+        let model_attempts = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let observed_models = Arc::clone(&model_attempts);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                let observed_models = Arc::clone(&observed_models);
+                async move {
+                    let model = payload["model"].as_str().unwrap_or_default().to_owned();
+                    observed_models.lock().await.push(model.clone());
+                    let content = if model == "model-a" { "" } else { "ok" };
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "choices": [{"message": {"content": content}}]
+                        })),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        state
+            .llm_scheduler
+            .set_model_routing(vec!["model-a".to_owned(), "model-b".to_owned()])
+            .await;
+
+        let result = chat_completion(state.as_ref(), "system", "user", 128)
+            .await
+            .expect("second model should satisfy the call");
+        assert_eq!(result, "ok");
+
+        let models = model_attempts.lock().await.clone();
+        assert_eq!(models, vec!["model-a".to_owned(), "model-b".to_owned()]);
+
+        let row = sqlx::query(
+            r#"
+            SELECT model, final_model, fallback_count, failure_class, attempt_count
+            FROM llm_calls
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&state.pool)
+        .await
+        .expect("load routed llm call");
+        assert_eq!(row.get::<String, _>("model"), "model-b");
+        assert_eq!(
+            row.get::<Option<String>, _>("final_model").as_deref(),
+            Some("model-b")
+        );
+        assert_eq!(row.get::<i64, _>("fallback_count"), 1);
+        assert_eq!(row.get::<Option<String>, _>("failure_class"), None);
+        assert_eq!(row.get::<i64, _>("attempt_count"), 2);
+
+        let switched = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM llm_call_events WHERE event_type = 'llm.route_switched'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .expect("count route switch events");
+        assert_eq!(switched, 1);
+    }
+
+    #[tokio::test]
     async fn chat_completion_once_marks_upstream_401_inside_502_as_non_retryable() {
         let base_url = spawn_test_ai_server(Router::new().route(
             "/chat/completions",
@@ -6908,14 +7498,16 @@ mod tests {
                 parent_translation_batch_id: Some("batch-test".to_owned()),
             };
 
-            let result = with_llm_call_context(context, async {
+            let err = with_llm_call_context(context, async {
                 chat_completion(state.as_ref(), "system", "user", 128).await
             })
             .await
-            .expect("translation-scoped empty content retries should eventually succeed");
+            .expect_err(
+                "empty content should switch candidates instead of retrying the same model",
+            );
 
-            assert_eq!(result, "ok");
-            assert_eq!(seen_attempts.load(Ordering::SeqCst), success_attempt);
+            assert_eq!(err.to_string(), AI_RESPONSE_MISSING_CONTENT_ERROR);
+            assert_eq!(seen_attempts.load(Ordering::SeqCst), 1);
 
             let row = sqlx::query(
                 r#"
@@ -6933,16 +7525,13 @@ mod tests {
                 row.get::<String, _>("source"),
                 "translation.scheduler.deadline"
             );
-            assert_eq!(row.get::<String, _>("status"), "succeeded");
+            assert_eq!(row.get::<String, _>("status"), "failed");
+            assert_eq!(row.get::<i64, _>("attempt_count"), 1);
+            assert_eq!(row.get::<Option<String>, _>("response_text"), None);
             assert_eq!(
-                row.get::<i64, _>("attempt_count"),
-                i64::try_from(success_attempt).unwrap_or(i64::MAX)
+                row.get::<Option<String>, _>("error_text"),
+                Some(AI_RESPONSE_MISSING_CONTENT_ERROR.to_owned())
             );
-            assert_eq!(
-                row.get::<Option<String>, _>("response_text"),
-                Some("ok".to_owned())
-            );
-            assert_eq!(row.get::<Option<String>, _>("error_text"), None);
         }
     }
 
@@ -6997,16 +7586,14 @@ mod tests {
             parent_translation_batch_id: Some("batch-test".to_owned()),
         };
 
-        let result = with_llm_call_context(context, async {
+        let err = with_llm_call_context(context, async {
             chat_completion(state.as_ref(), "system", "user", 128).await
         })
         .await
-        .expect(
-            "translation-scoped calls should keep the 8-attempt budget once empty content appears",
-        );
+        .expect_err("empty content should fail the current candidate immediately");
 
-        assert_eq!(result, "ok");
-        assert_eq!(seen_attempts.load(Ordering::SeqCst), 6);
+        assert_eq!(err.to_string(), AI_RESPONSE_MISSING_CONTENT_ERROR);
+        assert_eq!(seen_attempts.load(Ordering::SeqCst), 1);
 
         let row = sqlx::query(
             r#"
@@ -7024,13 +7611,13 @@ mod tests {
             row.get::<String, _>("source"),
             "translation.scheduler.deadline"
         );
-        assert_eq!(row.get::<String, _>("status"), "succeeded");
-        assert_eq!(row.get::<i64, _>("attempt_count"), 6);
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert_eq!(row.get::<i64, _>("attempt_count"), 1);
+        assert_eq!(row.get::<Option<String>, _>("response_text"), None);
         assert_eq!(
-            row.get::<Option<String>, _>("response_text"),
-            Some("ok".to_owned())
+            row.get::<Option<String>, _>("error_text"),
+            Some(AI_RESPONSE_MISSING_CONTENT_ERROR.to_owned())
         );
-        assert_eq!(row.get::<Option<String>, _>("error_text"), None);
     }
 
     #[tokio::test]
@@ -7071,10 +7658,7 @@ mod tests {
         .expect_err("api translate source should fail after eight empty attempts");
 
         assert_eq!(err.to_string(), AI_RESPONSE_MISSING_CONTENT_ERROR);
-        assert_eq!(
-            seen_attempts.load(Ordering::SeqCst),
-            LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS
-        );
+        assert_eq!(seen_attempts.load(Ordering::SeqCst), 1);
 
         let row = sqlx::query(
             r#"
@@ -7090,10 +7674,7 @@ mod tests {
 
         assert_eq!(row.get::<String, _>("source"), "api.translate_release");
         assert_eq!(row.get::<String, _>("status"), "failed");
-        assert_eq!(
-            row.get::<i64, _>("attempt_count"),
-            i64::try_from(LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS).unwrap_or(i64::MAX)
-        );
+        assert_eq!(row.get::<i64, _>("attempt_count"), 1);
         assert_eq!(row.get::<Option<String>, _>("response_text"), None);
         assert_eq!(
             row.get::<Option<String>, _>("error_text"),
@@ -7139,10 +7720,7 @@ mod tests {
         .expect_err("queued api translate source should inherit the 8-attempt budget");
 
         assert_eq!(err.to_string(), AI_RESPONSE_MISSING_CONTENT_ERROR);
-        assert_eq!(
-            seen_attempts.load(Ordering::SeqCst),
-            LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS
-        );
+        assert_eq!(seen_attempts.load(Ordering::SeqCst), 1);
 
         let row = sqlx::query(
             r#"
@@ -7158,10 +7736,7 @@ mod tests {
 
         assert_eq!(row.get::<String, _>("source"), "job.api.translate_release");
         assert_eq!(row.get::<String, _>("status"), "failed");
-        assert_eq!(
-            row.get::<i64, _>("attempt_count"),
-            i64::try_from(LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS).unwrap_or(i64::MAX)
-        );
+        assert_eq!(row.get::<i64, _>("attempt_count"), 1);
         assert_eq!(
             row.get::<Option<String>, _>("error_text"),
             Some(AI_RESPONSE_MISSING_CONTENT_ERROR.to_owned())
@@ -7206,10 +7781,7 @@ mod tests {
         .expect_err("release smart job source should inherit the 8-attempt budget");
 
         assert_eq!(err.to_string(), AI_RESPONSE_MISSING_CONTENT_ERROR);
-        assert_eq!(
-            seen_attempts.load(Ordering::SeqCst),
-            LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS
-        );
+        assert_eq!(seen_attempts.load(Ordering::SeqCst), 1);
 
         let row = sqlx::query(
             r#"
@@ -7228,10 +7800,7 @@ mod tests {
             "job.sync.releases.auto_smart"
         );
         assert_eq!(row.get::<String, _>("status"), "failed");
-        assert_eq!(
-            row.get::<i64, _>("attempt_count"),
-            i64::try_from(LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS).unwrap_or(i64::MAX)
-        );
+        assert_eq!(row.get::<i64, _>("attempt_count"), 1);
         assert_eq!(
             row.get::<Option<String>, _>("error_text"),
             Some(AI_RESPONSE_MISSING_CONTENT_ERROR.to_owned())
@@ -7267,10 +7836,7 @@ mod tests {
             .expect_err("non-translation sources should keep the default budget");
 
         assert_eq!(err.to_string(), AI_RESPONSE_MISSING_CONTENT_ERROR);
-        assert_eq!(
-            seen_attempts.load(Ordering::SeqCst),
-            LLM_REQUEST_MAX_ATTEMPTS
-        );
+        assert_eq!(seen_attempts.load(Ordering::SeqCst), 1);
 
         let row = sqlx::query(
             r#"
@@ -7286,10 +7852,7 @@ mod tests {
 
         assert_eq!(row.get::<String, _>("source"), "ai.chat_completion");
         assert_eq!(row.get::<String, _>("status"), "failed");
-        assert_eq!(
-            row.get::<i64, _>("attempt_count"),
-            i64::try_from(LLM_REQUEST_MAX_ATTEMPTS).unwrap_or(i64::MAX)
-        );
+        assert_eq!(row.get::<i64, _>("attempt_count"), 1);
         assert_eq!(
             row.get::<Option<String>, _>("error_text"),
             Some(AI_RESPONSE_MISSING_CONTENT_ERROR.to_owned())
@@ -7335,11 +7898,10 @@ mod tests {
         .expect_err("retryable non-empty errors should keep the default budget");
 
         let error_text = err.to_string();
-        assert!(error_text.contains("AI returned 502"));
-        assert!(error_text.contains("temporary upstream failure"));
+        assert_eq!(error_text, "LLM upstream temporarily unavailable");
         assert_eq!(
             seen_attempts.load(Ordering::SeqCst),
-            LLM_REQUEST_MAX_ATTEMPTS
+            LLM_ROUTE_TRANSIENT_MAX_ATTEMPTS
         );
 
         let row = sqlx::query(
@@ -7361,13 +7923,12 @@ mod tests {
         assert_eq!(row.get::<String, _>("status"), "failed");
         assert_eq!(
             row.get::<i64, _>("attempt_count"),
-            i64::try_from(LLM_REQUEST_MAX_ATTEMPTS).unwrap_or(i64::MAX)
+            i64::try_from(LLM_ROUTE_TRANSIENT_MAX_ATTEMPTS).unwrap_or(i64::MAX)
         );
         let stored_error = row
             .get::<Option<String>, _>("error_text")
             .expect("failed llm call should persist error text");
-        assert!(stored_error.contains("AI returned 502"));
-        assert!(stored_error.contains("temporary upstream failure"));
+        assert_eq!(stored_error, "LLM upstream temporarily unavailable");
     }
 
     #[tokio::test]
@@ -7385,7 +7946,7 @@ mod tests {
         insert_llm_call(state.as_ref(), &log, "gpt-test", 512, "prompt", Some("[]"))
             .await
             .expect("seed llm call");
-        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 10)
+        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 10, "gpt-test")
             .await
             .expect("mark llm call running");
         sqlx::query(
@@ -7443,7 +8004,7 @@ mod tests {
         insert_llm_call(state.as_ref(), &log, "gpt-test", 512, "prompt", Some("[]"))
             .await
             .expect("seed llm call");
-        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 10)
+        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 10, "gpt-test")
             .await
             .expect("mark llm call running");
         let now = Utc::now().to_rfc3339();
@@ -7506,7 +8067,7 @@ mod tests {
         insert_llm_call(state.as_ref(), &log, "gpt-test", 512, "prompt", Some("[]"))
             .await
             .expect("seed llm call");
-        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 10)
+        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 10, "gpt-test")
             .await
             .expect("mark llm call running");
         let now = Utc::now().to_rfc3339();
@@ -7565,7 +8126,7 @@ mod tests {
         insert_llm_call(state.as_ref(), &log, "gpt-test", 512, "prompt", Some("[]"))
             .await
             .expect("seed llm call");
-        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 10)
+        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 10, "gpt-test")
             .await
             .expect("mark llm call running");
         let now = Utc::now().to_rfc3339();

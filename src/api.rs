@@ -6720,6 +6720,11 @@ pub struct AdminLlmCallItem {
     output_tokens: Option<i64>,
     cached_input_tokens: Option<i64>,
     total_tokens: Option<i64>,
+    failure_class: Option<String>,
+    final_model: Option<String>,
+    fallback_count: i64,
+    retry_scheduled_at: Option<String>,
+    recovery_attempt_count: i64,
     created_at: String,
     started_at: Option<String>,
     finished_at: Option<String>,
@@ -6749,10 +6754,31 @@ pub struct AdminLlmCallDetailItem {
     prompt_text: String,
     response_text: Option<String>,
     error_text: Option<String>,
+    failure_class: Option<String>,
+    final_model: Option<String>,
+    fallback_count: i64,
+    retry_scheduled_at: Option<String>,
+    recovery_attempt_count: i64,
     created_at: String,
     started_at: Option<String>,
     finished_at: Option<String>,
     updated_at: String,
+    #[sqlx(skip)]
+    attempt_history: Vec<AdminLlmCallAttemptItem>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct AdminLlmCallAttemptItem {
+    event_type: String,
+    status: String,
+    model: Option<String>,
+    attempt: Option<i64>,
+    failure_class: Option<String>,
+    retry_after_ms: Option<i64>,
+    from_model: Option<String>,
+    to_model: Option<String>,
+    fallback_count: Option<i64>,
+    created_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -6769,6 +6795,7 @@ pub struct AdminLlmModelStatusItem {
     priority: i64,
     status: String,
     consecutive_final_failures: i64,
+    relevant_failure_count: i64,
     cooldown_until: Option<String>,
     effective_input_limit: i64,
     effective_input_limit_source: String,
@@ -6793,6 +6820,8 @@ pub struct AdminLlmSchedulerStatusResponse {
     avg_duration_ms_24h: Option<i64>,
     last_success_at: Option<String>,
     last_failure_at: Option<String>,
+    llm_recovery_enabled: bool,
+    llm_recovery_rollout_percent: i64,
 }
 
 const ADMIN_LLM_ACTIVITY_BUCKET_MINUTES: i64 = 60;
@@ -6845,6 +6874,10 @@ pub struct AdminLlmRuntimeConfigUpdateRequest {
     ai_model_context_limit: Option<Option<i64>>,
     #[serde(default)]
     llm_models: Option<Vec<String>>,
+    #[serde(default)]
+    llm_recovery_enabled: Option<bool>,
+    #[serde(default)]
+    llm_recovery_rollout_percent: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7249,11 +7282,31 @@ pub async fn admin_patch_llm_runtime_config(
             .await
             .map_err(ApiError::internal)?,
     };
+    let current_recovery = admin_runtime::load_llm_recovery_runtime_config(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let recovery_enabled = req.llm_recovery_enabled.unwrap_or(current_recovery.enabled);
+    let recovery_rollout_percent = match req.llm_recovery_rollout_percent {
+        Some(value) if !(0..=100).contains(&value) => {
+            return Err(ApiError::bad_request(
+                "llm_recovery_rollout_percent must be between 0 and 100",
+            ));
+        }
+        Some(value) => value,
+        None => i64::from(current_recovery.rollout_percent),
+    };
     admin_runtime::update_llm_runtime_settings(
         &state.pool,
         max_concurrency,
         ai_model_context_limit,
         &llm_models,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    admin_runtime::update_llm_recovery_runtime_config(
+        &state.pool,
+        recovery_enabled,
+        recovery_rollout_percent,
     )
     .await
     .map_err(ApiError::internal)?;
@@ -7314,6 +7367,9 @@ async fn load_admin_llm_scheduler_status_response(
     .await
     .map_err(ApiError::internal)?;
     let selected_model = ai::select_model_for_new_calls(state).await;
+    let recovery = admin_runtime::load_llm_recovery_runtime_config(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
     let ai_model_context_limit = admin_runtime::load_ai_model_context_limit(&state.pool)
         .await
         .map_err(ApiError::internal)?
@@ -7327,6 +7383,7 @@ async fn load_admin_llm_scheduler_status_response(
             priority: status.priority,
             status: status.status.to_owned(),
             consecutive_final_failures: status.consecutive_final_failures,
+            relevant_failure_count: status.relevant_failure_count,
             cooldown_until: status.cooldown_until,
             effective_input_limit: i64::from(effective_input_limit),
             effective_input_limit_source: effective_input_limit_source.to_owned(),
@@ -7351,6 +7408,8 @@ async fn load_admin_llm_scheduler_status_response(
         avg_duration_ms_24h: avg_duration_raw.map(|value| value.round() as i64),
         last_success_at,
         last_failure_at,
+        llm_recovery_enabled: recovery.enabled,
+        llm_recovery_rollout_percent: i64::from(recovery.rollout_percent),
     })
 }
 
@@ -7581,6 +7640,11 @@ async fn load_admin_llm_call_items(
           output_tokens,
           cached_input_tokens,
           total_tokens,
+          failure_class,
+          final_model,
+          fallback_count,
+          retry_scheduled_at,
+          recovery_attempt_count,
           created_at,
           started_at,
           finished_at,
@@ -7781,6 +7845,11 @@ pub async fn admin_get_llm_call_detail(
           prompt_text,
           response_text,
           error_text,
+          failure_class,
+          final_model,
+          fallback_count,
+          retry_scheduled_at,
+          recovery_attempt_count,
           created_at,
           started_at,
           finished_at,
@@ -7799,6 +7868,21 @@ pub async fn admin_get_llm_call_detail(
     if let Some(snapshot) = state.llm_scheduler.admin_overrides().await.get(&item.id) {
         apply_llm_call_detail_admin_override(&mut item, snapshot);
     }
+
+    item.attempt_history = sqlx::query_as::<_, AdminLlmCallAttemptItem>(
+        r#"
+        SELECT event_type, status, model, attempt, failure_class, retry_after_ms,
+               from_model, to_model, fallback_count, created_at
+        FROM llm_call_events
+        WHERE call_id = ?
+        ORDER BY julianday(created_at) ASC, created_at ASC, id ASC
+        LIMIT 100
+        "#,
+    )
+    .bind(item.id.as_str())
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
 
     Ok(Json(item))
 }
@@ -15865,9 +15949,6 @@ fn smart_item(
 fn translated_terminal_item(status: &str, error_text: Option<&str>) -> Option<TranslatedItem> {
     match status {
         "disabled" => Some(translated_item("disabled", None, None, None, None)),
-        "error" if crate::translations::release_translation_error_is_retryable(error_text) => {
-            Some(translated_missing_item(true))
-        }
         "missing" | "error" => Some(translated_item(
             status,
             None,
@@ -15948,7 +16029,6 @@ fn smart_terminal_item(status: &str, error_text: Option<&str>) -> Option<SmartIt
         "missing" if error_text == Some(SMART_NO_VALUABLE_VERSION_INFO) => {
             Some(smart_item("insufficient", None, None, Some(false), None))
         }
-        "error" if smart_error_is_retryable(error_text) => Some(smart_missing_item(Some(true))),
         "missing" | "error" => Some(smart_item(status, None, None, Some(false), error_text)),
         _ => None,
     }
@@ -15968,6 +16048,7 @@ fn smart_missing_item(auto_translate: Option<bool>) -> SmartItem {
     smart_item("missing", None, None, auto_translate, None)
 }
 
+#[cfg(test)]
 fn smart_error_is_retryable(error_text: Option<&str>) -> bool {
     crate::translations::release_translation_error_is_retryable(error_text)
 }
@@ -17717,6 +17798,9 @@ const NOTIFICATION_BATCH_MAX_TOKENS: u32 = 1_100;
 const NOTIFICATION_BATCH_OVERHEAD_TOKENS: u32 = 220;
 
 fn ai_error_is_non_retryable(err: &anyhow::Error) -> bool {
+    if ai::llm_failure_class(err) == Some(ai::LlmFailureClass::Configuration) {
+        return true;
+    }
     let msg = err.to_string().to_ascii_lowercase();
     let status_422_non_context =
         msg.contains("ai returned 422") && !msg.contains("context") && !msg.contains("length");
@@ -18068,11 +18152,11 @@ async fn translate_pending_release_batch_candidates(
             Err(err) => {
                 if ai_error_is_non_retryable(&err) {
                     abort_remaining_batches = true;
-                    non_retryable_error_text = Some(err.to_string());
                     tracing::warn!(
                         ?err,
                         "release detail batch translation upstream error is non-retryable; skipping remaining batch calls"
                     );
+                    non_retryable_error_text = Some(ApiError::from_llm_error(err).to_string());
                 } else if batch_indices.len() > 1 {
                     let mid = batch_indices.len() / 2;
                     pending_groups.push(batch_indices[mid..].to_vec());
@@ -19013,7 +19097,7 @@ async fn summarize_release_smart_candidate_with_ai(
     let body_prompt = release_smart_body_prompt(item);
     let raw = ai::chat_completion(state, release_smart_body_system_prompt(), &body_prompt, 700)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(ApiError::from_llm_error)?;
     let parsed = parse_release_smart_summary_payload(&raw)
         .ok_or_else(|| ApiError::internal("release smart body summary json decode failed"))?;
     if parsed.valuable {
@@ -19046,7 +19130,7 @@ async fn summarize_release_smart_candidate_with_ai(
     let diff_prompt = release_smart_diff_prompt(item, &compare_range, &digest);
     let raw = ai::chat_completion(state, release_smart_diff_system_prompt(), &diff_prompt, 700)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(ApiError::from_llm_error)?;
     let parsed = parse_release_smart_summary_payload(&raw)
         .ok_or_else(|| ApiError::internal("release smart diff summary json decode failed"))?;
     if !parsed.valuable {
@@ -19223,10 +19307,6 @@ async fn prepare_release_smart_batch(
                 continue;
             }
             if cache.status == "error" {
-                if smart_error_is_retryable(cache.error_text.as_deref()) {
-                    pending.push(item.clone());
-                    continue;
-                }
                 terminal.insert(
                     item.release_id,
                     ReleaseBatchTerminalState {
@@ -19946,7 +20026,7 @@ async fn translate_release_detail_chunk(
         budget.max_output_tokens,
     )
     .await
-    .map_err(ApiError::internal)?;
+    .map_err(ApiError::from_llm_error)?;
     let translated = normalize_markdown_translation_output(chunk, translated);
     if markdown_structure_preserved(chunk, &translated) {
         return Ok(translated);
@@ -19968,7 +20048,7 @@ async fn translate_release_detail_chunk(
         budget.max_output_tokens,
     )
     .await
-    .map_err(ApiError::internal)?;
+    .map_err(ApiError::from_llm_error)?;
     let retry = normalize_markdown_translation_output(chunk, retry);
     if !markdown_structure_preserved(chunk, &retry) {
         return Err(ApiError::internal(
@@ -20086,9 +20166,7 @@ async fn translate_release_detail_chunks_batched(
                         ?err,
                         "release detail chunk batch error is non-retryable; skipping single fallback"
                     );
-                    return Err(ApiError::internal(
-                        "release detail translation unavailable: upstream model/channel rejected request",
-                    ));
+                    return Err(ApiError::from_llm_error(err));
                 }
                 tracing::warn!(
                     ?err,
@@ -20296,15 +20374,9 @@ async fn translate_release_detail_internal(
         120,
     )
     .await
-    .ok()
-    .and_then(|s| {
-        let title = s.trim();
-        if title.is_empty() {
-            None
-        } else {
-            Some(title.to_owned())
-        }
-    });
+    .map_err(ApiError::from_llm_error)?;
+    let translated_title = translated_title.trim();
+    let translated_title = (!translated_title.is_empty()).then(|| translated_title.to_owned());
 
     let body_markdown = if original_body.trim().is_empty() {
         String::new()
@@ -20649,15 +20721,9 @@ async fn translate_announcement_detail_internal(
         120,
     )
     .await
-    .ok()
-    .and_then(|output| {
-        let title = output.trim();
-        if title.is_empty() {
-            None
-        } else {
-            Some(title.to_owned())
-        }
-    });
+    .map_err(ApiError::from_llm_error)?;
+    let translated_title = translated_title.trim();
+    let translated_title = (!translated_title.is_empty()).then(|| translated_title.to_owned());
 
     let body_markdown = if original_body.trim().is_empty() {
         String::new()
@@ -20860,15 +20926,9 @@ async fn summarize_announcement_smart_internal(
         120,
     )
     .await
-    .ok()
-    .and_then(|output| {
-        let title = output.trim();
-        if title.is_empty() {
-            None
-        } else {
-            Some(title.to_owned())
-        }
-    });
+    .map_err(ApiError::from_llm_error)?;
+    let translated_title = translated_title.trim();
+    let translated_title = (!translated_title.is_empty()).then(|| translated_title.to_owned());
 
     let polished_summary = ai::chat_completion(
         state,
@@ -20883,7 +20943,7 @@ async fn summarize_announcement_smart_internal(
         480,
     )
     .await
-    .map_err(ApiError::internal)?
+    .map_err(ApiError::from_llm_error)?
     .trim()
     .to_owned();
 
@@ -27146,6 +27206,8 @@ mod tests {
                 max_concurrency: 2,
                 ai_model_context_limit: None,
                 llm_models: None,
+                llm_recovery_enabled: None,
+                llm_recovery_rollout_percent: None,
             }),
         )
         .await
@@ -28870,7 +28932,7 @@ mod tests {
     }
 
     #[test]
-    fn feed_item_from_row_retries_upstream_rejected_translation_errors() {
+    fn feed_item_from_row_keeps_upstream_rejected_translation_errors_visible() {
         let mut row = test_feed_row(Some("R_node"));
         row.repo_full_name = Some("openai/codex".to_owned());
         row.title = Some("Release v1.2.3".to_owned());
@@ -28889,8 +28951,8 @@ mod tests {
 
         let item = feed_item_from_row(row, true, None);
         let translated = item.translated.expect("translated item");
-        assert_eq!(translated.status, "missing");
-        assert_eq!(translated.auto_translate, None);
+        assert_eq!(translated.status, "error");
+        assert_eq!(translated.auto_translate, Some(false));
         assert!(translated.title.is_none());
         assert!(translated.summary.is_none());
     }
@@ -29120,7 +29182,7 @@ body={}
     }
 
     #[test]
-    fn feed_item_from_row_retries_retryable_smart_errors() {
+    fn feed_item_from_row_keeps_retryable_smart_errors_visible() {
         let mut row = test_feed_row(Some("R_node"));
         row.repo_full_name = Some("openai/codex".to_owned());
         row.release_tag_name = Some("v1.2.4".to_owned());
@@ -29141,8 +29203,8 @@ body={}
 
         let item = feed_item_from_row(row, true, None);
         let smart = item.smart.expect("smart item");
-        assert_eq!(smart.status, "missing");
-        assert_eq!(smart.auto_translate, Some(true));
+        assert_eq!(smart.status, "error");
+        assert_eq!(smart.auto_translate, Some(false));
         assert!(smart.title.is_none());
         assert!(smart.summary.is_none());
     }
@@ -33854,10 +33916,9 @@ line two",
         .await
         .expect("load persisted terminal detail translation");
         assert_eq!(row.get::<String, _>("status"), "error");
-        assert!(
-            row.get::<Option<String>, _>("error_text")
-                .as_deref()
-                .is_some_and(|value| value.contains("401") || value.contains("bad key"))
+        assert_eq!(
+            row.get::<Option<String>, _>("error_text").as_deref(),
+            Some("LLM configuration or request rejected")
         );
     }
 

@@ -31,6 +31,11 @@ Key columns:
 - `started_at TEXT NULL`
 - `finished_at TEXT NULL`
 - `updated_at TEXT NOT NULL`
+- `failure_class TEXT NULL` (`empty_content|transient|rate_limited|configuration`)
+- `final_model TEXT NULL`
+- `fallback_count INTEGER NOT NULL DEFAULT 0`
+- `retry_scheduled_at TEXT NULL`
+- `recovery_attempt_count INTEGER NOT NULL DEFAULT 0`
 
 Indexes:
 
@@ -52,14 +57,17 @@ Key columns:
 
 - `id INTEGER PRIMARY KEY AUTOINCREMENT`
 - `call_id TEXT NOT NULL` (FK to `llm_calls.id`, `ON DELETE CASCADE`)
-- `event_type TEXT NOT NULL` (e.g. `llm.queued|llm.running|llm.succeeded|llm.failed`)
+- `event_type TEXT NOT NULL` (e.g. `llm.queued|llm.running|llm.attempt_failed|llm.route_switched|llm.succeeded|llm.failed`)
 - `status TEXT NOT NULL` (`queued|running|succeeded|failed`)
 - `source TEXT NOT NULL`
 - `requested_by INTEGER NULL`
 - `parent_task_id TEXT NULL`
 - `payload_json TEXT NULL` (small event metadata snapshot)
+- Structured recovery columns (`failure_class`, `model`, `attempt`, `retry_after_ms`, `from_model`, `to_model`, `fallback_count`) are nullable for compatibility; payload remains the audit envelope.
 - `created_at TEXT NOT NULL`
 
 Indexes:
 
 - `idx_llm_call_events_call_id_id` on `(call_id, id)`
+
+Event payloads contain only safe failure classes, route metadata, retry timing, and attempt counters. Upstream response bodies and user content are excluded.
