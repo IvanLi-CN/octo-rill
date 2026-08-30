@@ -492,6 +492,7 @@ function LlmCallDetailSection(props: {
 	onOpenParentTask: (taskId: string | null) => void;
 }) {
 	const { detail, onOpenParentTask } = props;
+	const attemptHistory = detail.attempt_history ?? [];
 	const llmInputMessages = useMemo(() => {
 		const parsed = parseLlmConversationMessages(detail.input_messages_json);
 		if (parsed.length > 0) return parsed;
@@ -633,14 +634,14 @@ function LlmCallDetailSection(props: {
 				<div className="flex items-center justify-between gap-2">
 					<p className="text-muted-foreground text-xs">尝试历史</p>
 					<span className="text-muted-foreground text-[11px]">
-						{formatCount(detail.attempt_history.length)} 条安全审计记录
+						{formatCount(attemptHistory.length)} 条安全审计记录
 					</span>
 				</div>
-				{detail.attempt_history.length === 0 ? (
+				{attemptHistory.length === 0 ? (
 					<p className="text-muted-foreground mt-2 text-xs">暂无尝试记录。</p>
 				) : (
 					<div className="mt-2 space-y-1.5">
-						{detail.attempt_history.map((event, index) => (
+						{attemptHistory.map((event, index) => (
 							<div
 								key={`${event.created_at}-${event.event_type}-${index}`}
 								className="bg-muted/30 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border px-2 py-1.5 text-[11px]"
