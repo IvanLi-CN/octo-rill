@@ -17,7 +17,7 @@
 - `failure_class`：`empty_content | transient | rate_limited | configuration` 或 `null`；只返回安全分类，不返回上游响应体。
 - `final_model`：逻辑调用最终命中的模型，未结束时为 `null`。
 - `fallback_count`：候选切换次数。
-- `retry_scheduled_at`：同一候选的定时重试或翻译恢复时间；即时切换候选时为 `null`。
+- `retry_scheduled_at`：同一候选的定时重试时间；即时切换候选时为 `null`。翻译 work item 的恢复时间由 `translation_work_items.next_retry_at` 表示。
 - `recovery_attempt_count`：该调用已执行的恢复次数。
 
 `GET /api/admin/jobs/llm/calls/{call_id}` 详情在上述字段之外返回 `attempt_history` 数组。数组只包含事件类型、模型、尝试序号、失败分类、限流等待、路由切换和时间戳等安全审计字段。
