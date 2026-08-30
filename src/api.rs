@@ -16997,6 +16997,7 @@ pub struct TranslateBatchItem {
     pub title: Option<String>,
     pub summary: Option<String>,
     pub error: Option<String>,
+    pub failure_class: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -17797,6 +17798,7 @@ struct ReleaseBatchCandidate {
 struct ReleaseBatchTerminalState {
     status: String,
     error: Option<String>,
+    failure_class: Option<String>,
 }
 
 type ReleaseBatchTranslationMap = HashMap<i64, (Option<String>, Option<String>)>;
@@ -18117,6 +18119,7 @@ async fn translate_pending_release_batch_candidates(
 
     let mut translated = HashMap::<i64, (Option<String>, Option<String>)>::new();
     let mut non_retryable_error_text: Option<String> = None;
+    let mut non_retryable_error_class: Option<String> = None;
     let mut abort_remaining_batches = false;
     let mut pending_groups = groups;
     while let Some(batch_indices) = pending_groups.pop() {
@@ -18166,7 +18169,9 @@ async fn translate_pending_release_batch_candidates(
                         ?err,
                         "release detail batch translation upstream error is non-retryable; skipping remaining batch calls"
                     );
-                    non_retryable_error_text = Some(ApiError::from_llm_error(err).to_string());
+                    let safe_error = ApiError::from_llm_error(err);
+                    non_retryable_error_class = safe_error.failure_class().map(str::to_owned);
+                    non_retryable_error_text = Some(safe_error.to_string());
                 } else if batch_indices.len() > 1 {
                     let mid = batch_indices.len() / 2;
                     pending_groups.push(batch_indices[mid..].to_vec());
@@ -18218,6 +18223,7 @@ async fn translate_pending_release_batch_candidates(
                 title,
                 summary,
                 error: None,
+                failure_class: None,
             });
             continue;
         }
@@ -18246,6 +18252,7 @@ async fn translate_pending_release_batch_candidates(
                 title: None,
                 summary: None,
                 error: Some(error_text.clone()),
+                failure_class: non_retryable_error_class.clone(),
             });
             continue;
         }
@@ -18258,6 +18265,7 @@ async fn translate_pending_release_batch_candidates(
                 title: translated.title,
                 summary: translated.summary,
                 error: None,
+                failure_class: None,
             }),
             Err(err) if err.code() == "not_found" => items.push(TranslateBatchItem {
                 id: candidate.release_id.to_string(),
@@ -18266,6 +18274,7 @@ async fn translate_pending_release_batch_candidates(
                 title: None,
                 summary: None,
                 error: Some("release not found".to_owned()),
+                failure_class: None,
             }),
             Err(err) => {
                 let error_text = err.to_string();
@@ -18281,6 +18290,7 @@ async fn translate_pending_release_batch_candidates(
                     title: None,
                     summary: None,
                     error: Some(error_text),
+                    failure_class: err.failure_class().map(str::to_owned),
                 });
             }
         }
@@ -18456,6 +18466,7 @@ async fn prepare_release_batch(
                     ReleaseBatchTerminalState {
                         status: cache.status.clone(),
                         error: cache.error_text.clone(),
+                        failure_class: None,
                     },
                 );
                 continue;
@@ -18477,6 +18488,7 @@ async fn prepare_release_batch(
                     ReleaseBatchTerminalState {
                         status: cache.status.clone(),
                         error: cache.error_text.clone(),
+                        failure_class: None,
                     },
                 );
                 continue;
@@ -18518,6 +18530,7 @@ fn build_release_batch_item(
             title: None,
             summary: None,
             error: Some("release not found".to_owned()),
+            failure_class: None,
         };
     }
 
@@ -18532,6 +18545,7 @@ fn build_release_batch_item(
                 (terminal_state.status == "missing")
                     .then_some("translation result missing".to_owned())
             }),
+            failure_class: terminal_state.failure_class.clone(),
         };
     }
 
@@ -18543,6 +18557,7 @@ fn build_release_batch_item(
             title: title.clone(),
             summary: summary.clone(),
             error: None,
+            failure_class: None,
         };
     }
 
@@ -18553,6 +18568,7 @@ fn build_release_batch_item(
         title: None,
         summary: None,
         error: Some("translation failed".to_owned()),
+        failure_class: None,
     }
 }
 
@@ -18616,6 +18632,7 @@ async fn translate_releases_batch_internal(
                 title: None,
                 summary: None,
                 error: None,
+                failure_class: None,
             })
             .collect());
     }
@@ -18644,6 +18661,7 @@ async fn translate_releases_batch_internal(
                         ReleaseBatchTerminalState {
                             status: item.status,
                             error: item.error,
+                            failure_class: item.failure_class,
                         },
                     );
                 }
@@ -19312,6 +19330,7 @@ async fn prepare_release_smart_batch(
                     ReleaseBatchTerminalState {
                         status: cache.status.clone(),
                         error: cache.error_text.clone(),
+                        failure_class: None,
                     },
                 );
                 continue;
@@ -19322,6 +19341,7 @@ async fn prepare_release_smart_batch(
                     ReleaseBatchTerminalState {
                         status: cache.status.clone(),
                         error: cache.error_text.clone(),
+                        failure_class: None,
                     },
                 );
                 continue;
@@ -19444,6 +19464,7 @@ fn build_release_smart_batch_item(
             title: None,
             summary: None,
             error: Some("release not found".to_owned()),
+            failure_class: None,
         };
     }
 
@@ -19458,6 +19479,7 @@ fn build_release_smart_batch_item(
                 (terminal_state.status == "missing")
                     .then_some("translation result missing".to_owned())
             }),
+            failure_class: terminal_state.failure_class.clone(),
         };
     }
 
@@ -19469,6 +19491,7 @@ fn build_release_smart_batch_item(
             title: title.clone(),
             summary: summary.clone(),
             error: None,
+            failure_class: None,
         };
     }
 
@@ -19479,6 +19502,7 @@ fn build_release_smart_batch_item(
         title: None,
         summary: None,
         error: Some("release smart summary failed".to_owned()),
+        failure_class: None,
     }
 }
 
@@ -19497,6 +19521,7 @@ pub(crate) async fn summarize_releases_smart_batch_internal(
                 title: None,
                 summary: None,
                 error: None,
+                failure_class: None,
             })
             .collect());
     }
@@ -19516,6 +19541,7 @@ pub(crate) async fn summarize_releases_smart_batch_internal(
                     ReleaseBatchTerminalState {
                         status: "missing".to_owned(),
                         error: Some(SMART_NO_VALUABLE_VERSION_INFO.to_owned()),
+                        failure_class: None,
                     },
                 );
             }
@@ -19525,6 +19551,7 @@ pub(crate) async fn summarize_releases_smart_batch_internal(
                     ReleaseBatchTerminalState {
                         status: "error".to_owned(),
                         error: Some(err.to_string()),
+                        failure_class: err.failure_class().map(str::to_owned),
                     },
                 );
             }
@@ -19615,6 +19642,7 @@ async fn translate_releases_batch_stream_worker(
                     title: None,
                     summary: None,
                     error: None,
+                    failure_class: None,
                 };
                 if !send_batch_stream_event(
                     &tx,
@@ -19732,6 +19760,7 @@ async fn translate_releases_batch_stream_worker(
                             title: None,
                             summary: None,
                             error: None,
+                            failure_class: None,
                         }),
                         error: None,
                     },
@@ -19762,6 +19791,7 @@ async fn translate_releases_batch_stream_worker(
                                 ReleaseBatchTerminalState {
                                     status: item.status.clone(),
                                     error: item.error.clone(),
+                                    failure_class: item.failure_class.clone(),
                                 },
                             );
                         }
@@ -20514,6 +20544,7 @@ async fn translate_release_detail_batch_internal(
                 title: translated.title,
                 summary: translated.summary,
                 error: None,
+                failure_class: None,
             }),
             Err(err) if err.code() == "not_found" => items.push(TranslateBatchItem {
                 id: release_id.to_string(),
@@ -20522,6 +20553,7 @@ async fn translate_release_detail_batch_internal(
                 title: None,
                 summary: None,
                 error: Some("release not found".to_owned()),
+                failure_class: None,
             }),
             Err(err) => {
                 let error_text = err.to_string();
@@ -20537,6 +20569,7 @@ async fn translate_release_detail_batch_internal(
                     title: None,
                     summary: None,
                     error: Some(error_text),
+                    failure_class: err.failure_class().map(str::to_owned),
                 });
             }
         }
@@ -21076,7 +21109,13 @@ async fn translate_notification_single_candidate_with_ai(
 #[derive(Debug, Default)]
 struct NotificationTranslationBatchResult {
     translated: HashMap<String, (Option<String>, Option<String>)>,
-    errors: HashMap<String, String>,
+    errors: HashMap<String, NotificationTranslationError>,
+}
+
+#[derive(Debug, Clone)]
+struct NotificationTranslationError {
+    message: String,
+    failure_class: Option<String>,
 }
 
 async fn translate_notification_candidates_with_ai(
@@ -21158,11 +21197,10 @@ async fn translate_notification_candidates_with_ai(
                 }
             }
             Err(err) => {
-                let safe_error = if let Some(class) = ai::llm_failure_class(&err) {
-                    class.safe_message().to_owned()
-                } else {
-                    err.to_string()
-                };
+                let failure_class = ai::llm_failure_class(&err);
+                let safe_error = failure_class
+                    .map(|class| class.safe_message().to_owned())
+                    .unwrap_or_else(|| "translation failed".to_owned());
                 if ai_error_is_non_retryable(&err) {
                     abort_remaining_batches = true;
                     tracing::warn!(
@@ -21170,9 +21208,12 @@ async fn translate_notification_candidates_with_ai(
                         "notification batch translation upstream error is non-retryable; skipping single fallback"
                     );
                     for item in &batch {
-                        errors
-                            .entry(item.thread_id.clone())
-                            .or_insert_with(|| safe_error.clone());
+                        errors.entry(item.thread_id.clone()).or_insert_with(|| {
+                            NotificationTranslationError {
+                                message: safe_error.clone(),
+                                failure_class: failure_class.map(|class| class.as_str().to_owned()),
+                            }
+                        });
                     }
                 } else {
                     tracing::warn!(
@@ -21195,11 +21236,22 @@ async fn translate_notification_candidates_with_ai(
                     Ok(None) => {
                         errors.insert(
                             item.thread_id.clone(),
-                            "AI response missing content".to_owned(),
+                            NotificationTranslationError {
+                                message: "AI response missing content".to_owned(),
+                                failure_class: Some(
+                                    ai::LlmFailureClass::EmptyContent.as_str().to_owned(),
+                                ),
+                            },
                         );
                     }
                     Err(err) => {
-                        errors.insert(item.thread_id.clone(), err.to_string());
+                        errors.insert(
+                            item.thread_id.clone(),
+                            NotificationTranslationError {
+                                message: err.to_string(),
+                                failure_class: err.failure_class().map(str::to_owned),
+                            },
+                        );
                     }
                 }
             }
@@ -21207,11 +21259,15 @@ async fn translate_notification_candidates_with_ai(
     }
 
     if abort_remaining_batches {
-        let fallback_error = errors
-            .values()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "LLM configuration or request rejected".to_owned());
+        let fallback_error =
+            errors
+                .values()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| NotificationTranslationError {
+                    message: "LLM configuration or request rejected".to_owned(),
+                    failure_class: Some(ai::LlmFailureClass::Configuration.as_str().to_owned()),
+                });
         for item in pending {
             errors
                 .entry(item.thread_id.clone())
@@ -21246,6 +21302,7 @@ async fn translate_notifications_batch_internal(
                 title: None,
                 summary: None,
                 error: None,
+                failure_class: None,
             })
             .collect());
     }
@@ -21421,6 +21478,7 @@ async fn translate_notifications_batch_internal(
                 title: None,
                 summary: None,
                 error: Some("notification not found".to_owned()),
+                failure_class: None,
             });
             continue;
         }
@@ -21436,6 +21494,7 @@ async fn translate_notifications_batch_internal(
                 } else {
                     None
                 },
+                failure_class: None,
             });
             continue;
         }
@@ -21447,6 +21506,7 @@ async fn translate_notifications_batch_internal(
                 title: title.clone(),
                 summary: summary.clone(),
                 error: None,
+                failure_class: None,
             });
         } else if let Some(error) = pending_result.errors.get(thread_id) {
             out.push(TranslateBatchItem {
@@ -21455,7 +21515,8 @@ async fn translate_notifications_batch_internal(
                 status: "error".to_owned(),
                 title: None,
                 summary: None,
-                error: Some(error.clone()),
+                error: Some(error.message.clone()),
+                failure_class: error.failure_class.clone(),
             });
         } else {
             out.push(TranslateBatchItem {
@@ -21465,6 +21526,7 @@ async fn translate_notifications_batch_internal(
                 title: None,
                 summary: None,
                 error: Some("translation failed".to_owned()),
+                failure_class: None,
             });
         }
     }
@@ -27421,6 +27483,7 @@ mod tests {
             title: Some("标题".to_owned()),
             summary: Some("摘要".to_owned()),
             error: None,
+            failure_class: None,
         };
         let response =
             translate_response_from_batch_item(item).expect("ready batch item should succeed");
@@ -27440,6 +27503,7 @@ mod tests {
             error: Some(
                 "release detail translation failed to preserve markdown structure".to_owned(),
             ),
+            failure_class: None,
         };
         let err = translate_response_from_batch_item(item).expect_err("error item should fail");
         assert_eq!(err.code(), "internal_error");
@@ -27455,6 +27519,7 @@ mod tests {
             title: None,
             summary: None,
             error: Some("ai returned 401: bad key".to_owned()),
+            failure_class: None,
         };
         let err = translate_response_from_batch_item(item).expect_err("error item should fail");
         assert_eq!(err.code(), "internal_error");
@@ -27470,6 +27535,7 @@ mod tests {
             title: None,
             summary: None,
             error: Some("release not found".to_owned()),
+            failure_class: None,
         };
         let err = translate_response_from_batch_item(item).expect_err("missing item should fail");
         assert_eq!(err.code(), "not_found");
