@@ -13,17 +13,17 @@
 
 - 在 `/admin/jobs/llm` 的设置弹窗中支持维护**同一 provider / key** 下的多个模型 ID。
 - 模型列表支持排序，调度对新请求始终优先选择排在前面且未处于冷却中的模型。
-- 保留现有单模型内部重试语义；某模型在一次调用内跑完现有重试预算后仍失败，才记为一次模型级最终失败。
-- 同一模型连续 3 次最终失败后进入 10 分钟冷却，后续新请求优先改用后续模型；冷却到期后自动恢复优先尝试。
+- 每个逻辑调用按失败分类执行有限恢复：空内容立即切换候选；瞬态或限流在当前候选上最多尝试两次；每个候选只参加一次路由轮次，总上游尝试不超过 8 次。
+- 同一模型在滚动 10 分钟窗口内累计 2 次相关最终失败后进入 10 分钟冷却；冷却到期后自动恢复探测。配置错误直接终止，不切换候选。
 - 输入预算、管理员状态接口、调用日志与翻译批次画像一起收敛到多模型语义。
 - 在管理员 LLM 调度卡片中按最近 50 个 UTC 小时展示逐模型终态调用活动，并保留模型状态卡片视图。
 
 ### Non-goals
 
 - 不支持每个模型独立的 `base_url`、`api_key`、provider 或加密密钥存储。
-- 不在同一次 `chat_completion` 请求内做跨模型接力重试。
+- 单次 `chat_completion` 逻辑调用按失败分类执行有限路由恢复，不暴露候选路由排列。
 - 不引入权重路由、随机打散、按任务类型定向模型、按模型独立上下文上限覆盖。
-- 不把模型冷却状态持久化到数据库；冷却与连续失败计数仅是进程内 runtime state。
+- 模型健康窗口持久化到数据库，服务重启后从持久化健康表恢复。
 
 ## 范围（Scope）
 
@@ -49,8 +49,8 @@
 - `PATCH /api/admin/jobs/llm/runtime-config` 必须支持提交有序 `llm_models` 数组，数组元素为 trim 后的非空模型 ID。
 - 管理端模型列表必须至少保留 1 个模型，且 trim / normalize 后不得重复。
 - 新请求选模顺序固定为管理员排序后的第一个可用模型；若全部处于冷却，则选择 `cooldown_until` 最早到期的模型继续探测，不得直接返回“无模型可用”。
-- 模型级最终失败的定义必须是：一次 `chat_completion` 已用完该模型的现有内部重试预算后仍失败。
-- 某模型连续 3 次最终失败后进入 10 分钟冷却；成功一次则该模型的连续失败计数清零。
+- 模型级最终失败的定义必须是：该候选已完成当前逻辑调用允许的瞬态 / 限流重试后仍失败，或在该候选上得到空内容；单次逻辑调用所有候选的上游尝试总数不得超过 8 次。
+- 某模型在滚动窗口内累计两次相关最终失败后进入 10 分钟冷却；成功不会抹除窗口历史。
 - `effective_model_input_limit` 必须与“下一次新请求将会选中的模型”一致；所有批处理预算也必须按该实际候选模型计算。
 
 ### SHOULD
@@ -76,14 +76,14 @@
 
 ### 2. 运行时选模与冷却
 
-- 每次新 LLM 请求在进入 upstream 调用前，先依据当前持久化模型列表与 runtime 健康态解析“本次选中的模型”。
-- 该次请求在整个内部重试周期中都固定使用同一个模型，不在 attempt 之间切换模型。
+- 每次新 LLM 请求在进入 upstream 调用前，先依据当前持久化模型列表与 runtime 健康态得到候选顺序；若全部候选冷却，选择最早到期者继续探测。
+- 空内容立即结束当前候选并切换下一个候选；瞬态或限流在当前候选上最多重试一次，仍失败后切换；配置错误直接结束逻辑调用，不切换候选。候选路由轮次与尝试总数均受硬上限约束。
 - 若该次请求最终成功：
-  - 记录实际模型到 `llm_calls.model`
-  - 清零该模型的 `consecutive_final_failures`
+  - 记录实际最终模型到 `llm_calls.model` / `final_model`
+  - 记录回退次数与逐次安全尝试事件
 - 若该次请求最终失败：
-  - 对该模型的 `consecutive_final_failures += 1`
-  - 若累计达到 3，则写入 `cooldown_until = now + 10m`
+  - 持久化安全失败分类、最终路由、回退次数、尝试历史与恢复安排
+  - 仅对 `empty_content`、`transient`、`rate_limited` 计入模型健康窗口；累计达到 2 次则写入 `cooldown_until = now + 10m`
 
 ### 3. 预算与模型画像
 
@@ -130,6 +130,10 @@
 - 调用列表筛选状态由 URL 恢复：`llm_status`、`llm_model`、`llm_source`、`llm_requested_by`、`llm_started_from`、`llm_started_to`、`llm_finished_from`、`llm_finished_before`。时间值使用 UTC RFC3339；开始时间与结束时间范围可同时生效，并由两个彼此独立的一体化范围控件呈现，每个控件只负责一个时间口径。桌面端直接呈现筛选工具栏；窄屏主界面仅呈现一个筛选入口，状态、模型、来源、用户与两个时间范围入口集中在右侧抽屉中。范围控件由单一触发器打开统一面板；桌面端在面板内并列呈现两个独立端点子面板，每个子面板拥有自己的日期网格、月份导航、小时和分钟选择；窄屏保留边界输入行但一次只展示当前端点子面板，不使用浏览器原生 `datetime-local`。窄屏进入时间范围时，右侧筛选抽屉必须保持打开，时间面板在同一个筛选对话框内从底部覆盖展开；关闭时间面板后直接返回筛选字段，不得创建第二个 Sheet、第二个对话框或额外的焦点陷阱。开始时间上限保持包含语义，结束时间上限为“结束时间前”的排他语义。历史单口径参数 `llm_time_field`、`llm_time_from`、`llm_time_to` 必须可解析，并在 URL 规范化时迁移到对应的新参数。
 - 调用列表支持精确模型筛选和终态时间范围。终态时间统一按 `COALESCE(finished_at, updated_at, created_at)` 计算，`finished_from` 为包含下限，`finished_before` 为排他上限；持久化记录和 runtime override 合并后必须遵循同一筛选与分页语义。
 
+## Related ADRs
+
+- [ADR 0001: LLM Recovery Boundary](../../adr/0001-llm-recovery-boundary.md)
+
 ## 接口契约（Interfaces & Contracts）
 
 ### 接口清单（Inventory）
@@ -159,9 +163,13 @@
   When 保存设置
   Then 前端阻止提交，后端也返回 `400 bad_request`。
 
-- Given 模型列表为 `[A, B, C]` 且 `A` 未冷却
+- Given 存在可用的已配置候选路由
+  When 发起新的 LLM 请求并出现空内容、瞬态或限流错误
+  Then 系统按候选顺序恢复；空内容立即切候选，瞬态或限流在当前候选最多尝试两次，单次逻辑调用总上游尝试不超过 8 次。
+
+- Given 上游返回配置 / 鉴权 / 请求校验错误
   When 发起新的 LLM 请求
-  Then 该请求使用 `A`，并在整次内部重试周期中保持使用 `A`。
+  Then 逻辑调用立即以真实 `error` 终止，不切换候选、不安排自动恢复。
 
 - Given 管理员从活动图单元格打开失败调用
   When 该单元格对应模型 `A` 和时间桶 `[from, before)`
@@ -171,15 +179,15 @@
   When 目标模型为 `A`
   Then 调用列表仅保留模型 `A` 的七日保留期记录，且来源、请求用户、旧状态、旧时间和分页筛选已清除。
 
-- Given `A` 连续 3 次“最终失败”
+- Given 某路由在滚动窗口内累计两次相关“最终失败”
   When 发起新的 LLM 请求
-  Then 新请求优先改用 `B`，且 `GET /api/admin/jobs/llm/status` 中 `A.status = cooldown`、`cooldown_until` 非空。
+  Then 该路由进入 10 分钟冷却，且状态接口返回 `status = cooldown` 与非空 `cooldown_until`。
 
-- Given `A` 的冷却时间已过
+- Given 某路由的冷却时间已过
   When 再发起新的 LLM 请求
   Then 系统重新优先尝试 `A`。
 
-- Given `ai_model_context_limit = null` 且模型列表第一项为小上下文模型
+- Given `ai_model_context_limit = null` 且选中候选路由无手动上限
   When 读取 `GET /api/admin/jobs/llm/status`
   Then `effective_model_input_limit` 与 `selected_model_for_new_calls` 对应模型一致。
 
@@ -219,89 +227,87 @@
 
 ![LLM failover status](./assets/llm-status-failover.png)
 
+### 管理端恢复状态
+
+- `1440x900` 桌面端显示 LLM 调度活动、失败汇总、自动恢复开关状态与调用筛选入口。
+
+![LLM recovery admin desktop](./assets/llm-recovery-admin-desktop.jpg)
+
+- `393x852` 移动端顶部显示任务概览、LLM 调度切换与恢复汇总。
+
+![LLM recovery admin mobile top](./assets/llm-recovery-admin-mobile-top.jpg)
+
+- `393x852` 移动端调用详情显示安全失败分类、回退模型、重试次数与下次恢复时间。
+
+![LLM recovery admin mobile detail](./assets/llm-recovery-admin-mobile-detail.jpg)
+
 - 管理端 `LLM 调度` 多模型设置弹窗（含排序按钮）Storybook canvas。
 - 管理端 `LLM 调度` 状态卡展示首选模型冷却、次选模型接管的 Storybook canvas。
 - 管理端活动图桌面深色完整 50 桶页面（含完整、不重叠的首尾时间刻度）、`393x852` 移动端浅色按容器容量紧凑页面，以及 Storybook 37 桶聚合窗组件证据。
 
-PR: include
 ![LLM activity desktop dark](./assets/llm-activity-desktop-dark.png)
 
-PR: include
 ![LLM activity mobile light](./assets/llm-activity-mobile-light.png)
 
-PR: include
 ![LLM activity tooltip Storybook](./assets/llm-activity-tooltip-storybook.png)
 
 ### 调用排障跳转
 
 - `ui_demo`：桌面活动桶菜单，覆盖“查看失败调用 / 查看全部调用”。
 
-PR: include
 ![LLM call drilldown desktop menu](./assets/llm-call-drilldown-desktop.png)
 
 - `ui_demo`：`393x852` 移动端终态筛选和失败调用结果。
 
-PR: include
 ![LLM call drilldown mobile result](./assets/llm-call-drilldown-mobile-result.png)
 
 - `ui_demo`：`393x852` 移动端显式操作菜单。
 
-PR: include
 ![LLM call drilldown mobile menu](./assets/llm-call-drilldown-mobile-menu.png)
 
 - `storybook_canvas`：活动网格右键上下文菜单。
 
-PR: include
 ![LLM call drilldown Storybook menu](./assets/llm-call-drilldown-storybook.png)
 
 - `ui_demo`：在两个活动格子的公共边界坐标触发右键后，仍显示调用排障菜单；格子保留视觉间距，但横向与纵向命中矩形连续且无空白热区。
 
-PR: include
 ![LLM activity contiguous context menu targets](./assets/llm-activity-contiguous-context-menu.png)
 
-- `ui_demo`：活动图、调用列表和 24 小时状态汇总由同一组确定性调用记录派生。`retired-summary-model` 的 `07/06 15:00` 活动桶显示成功 `2`、失败 `1`，跳转后的同模型终态时间范围严格返回 `3` 条调用。
+- `ui_demo`：活动图、调用列表和 24 小时状态汇总由同一组确定性合成调用记录派生，覆盖成功、失败、冷却和恢复安排状态。
 
-PR: include
 ![LLM demo consistent chart filter](./assets/llm-demo-consistent-chart-filter.png)
 
-PR: include
 ![LLM demo consistent call drilldown](./assets/llm-demo-consistent-call-drilldown.png)
 
 ### 调用时间范围控件
 
 - `ui_demo`：桌面调用时间筛选，开始时间与结束时间各自拥有独立的一体化范围控件；每个控件由单一触发器打开统一面板，首行以无可见端点标签的 `输入 ~ 输入` 形式设置边界，下面并列呈现两个日历与时间子面板。
 
-PR: include
 ![LLM call time range desktop](./assets/llm-call-time-range-desktop.png)
 
 - `ui_demo`：`393x852` 移动端主界面只保留一个筛选入口；右侧筛选抽屉集中呈现状态、模型、来源、用户及开始/结束时间入口，筛选控件采用适合触屏的 `44px` 高度。
 
-PR: include
 ![LLM call filters mobile drawer](./assets/llm-call-filters-mobile-drawer.png)
 
 - `ui_demo`：移动端时间面板在同一个右侧筛选对话框内从底部覆盖展开，筛选上下文保持可见；面板保留无标签 `输入 ~ 输入` 边界设置，并且一次只展示当前输入端点的日历与时间子面板。点击另一端点输入后切换面板，标准视口内无需滚动，不使用浏览器原生 `datetime-local`，也不创建第二个 Sheet 或焦点陷阱。
 
-PR: include
 ![LLM call time range mobile](./assets/llm-call-time-range-mobile.png)
 
 - `storybook_canvas`：两个受控一体化范围组件分别展示开始/结束时间；结束时间控件保持排他上限语义，故事覆盖无标签边界输入行及同一面板内两个日历、月份和时分交互，并绑定 `393x852` 的底部抽屉场景。
 
-PR: include
 ![LLM call time range Storybook](./assets/llm-call-time-range-storybook.png)
 
 - `ui_demo`：桌面筛选行中，状态、模型与两个时间范围触发器全部采用标准 `36px` 控件高度；范围触发器不得因摘要文本或内边距增高。
 
-PR: include
 ![LLM call time range trigger height desktop](./assets/llm-call-time-range-trigger-height-desktop.png)
 
 - `storybook_canvas`：范围触发器与统一的双日历面板保持可见，组件画布的外边距已规范化。
 
-PR: include
 ![LLM call time range trigger height Storybook](./assets/llm-call-time-range-trigger-height-storybook.png)
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
 - 假设：多模型 v1 只运行在同一 provider/base URL/api key 下；这轮不做多密钥与 provider 抽象。
-- 假设：模型冷却状态进程内持有即可接受；服务重启后允许恢复为 clean state。
+- 约束：模型健康窗口与冷却截止时间持久化在 `llm_model_health`，服务重启时必须恢复未过期的冷却状态；历史未分类失败不得被自动恢复器猜测处理。
 - 风险：若模型目录缺失某模型的上下文窗口，系统会回落到 builtin / unknown fallback，可能让小上下文模型在估算上偏乐观或偏保守。
-- 假设：现有 `llm_calls` 七日保留期足以覆盖 50 小时窗口；无需 migration 或 ADR，因为没有新增持久化真相源、跨模块架构边界或不可逆技术决策。
+- 约束：恢复开关默认关闭，稳定分区必须按 work item ID 哈希并通过 24 小时业务成功率门槛后逐级放量；每次启用或扩大分区均需单独主人授权。
