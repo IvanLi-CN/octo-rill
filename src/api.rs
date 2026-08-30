@@ -6720,6 +6720,11 @@ pub struct AdminLlmCallItem {
     output_tokens: Option<i64>,
     cached_input_tokens: Option<i64>,
     total_tokens: Option<i64>,
+    failure_class: Option<String>,
+    final_model: Option<String>,
+    fallback_count: i64,
+    retry_scheduled_at: Option<String>,
+    recovery_attempt_count: i64,
     created_at: String,
     started_at: Option<String>,
     finished_at: Option<String>,
@@ -6749,10 +6754,31 @@ pub struct AdminLlmCallDetailItem {
     prompt_text: String,
     response_text: Option<String>,
     error_text: Option<String>,
+    failure_class: Option<String>,
+    final_model: Option<String>,
+    fallback_count: i64,
+    retry_scheduled_at: Option<String>,
+    recovery_attempt_count: i64,
     created_at: String,
     started_at: Option<String>,
     finished_at: Option<String>,
     updated_at: String,
+    #[sqlx(skip)]
+    attempt_history: Vec<AdminLlmCallAttemptItem>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct AdminLlmCallAttemptItem {
+    event_type: String,
+    status: String,
+    model: Option<String>,
+    attempt: Option<i64>,
+    failure_class: Option<String>,
+    retry_after_ms: Option<i64>,
+    from_model: Option<String>,
+    to_model: Option<String>,
+    fallback_count: Option<i64>,
+    created_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -6769,6 +6795,7 @@ pub struct AdminLlmModelStatusItem {
     priority: i64,
     status: String,
     consecutive_final_failures: i64,
+    relevant_failure_count: i64,
     cooldown_until: Option<String>,
     effective_input_limit: i64,
     effective_input_limit_source: String,
@@ -6793,6 +6820,8 @@ pub struct AdminLlmSchedulerStatusResponse {
     avg_duration_ms_24h: Option<i64>,
     last_success_at: Option<String>,
     last_failure_at: Option<String>,
+    llm_recovery_enabled: bool,
+    llm_recovery_rollout_percent: i64,
 }
 
 const ADMIN_LLM_ACTIVITY_BUCKET_MINUTES: i64 = 60;
@@ -6845,6 +6874,10 @@ pub struct AdminLlmRuntimeConfigUpdateRequest {
     ai_model_context_limit: Option<Option<i64>>,
     #[serde(default)]
     llm_models: Option<Vec<String>>,
+    #[serde(default)]
+    llm_recovery_enabled: Option<bool>,
+    #[serde(default)]
+    llm_recovery_rollout_percent: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6881,6 +6914,11 @@ fn apply_llm_call_admin_override(item: &mut AdminLlmCallItem, snapshot: &ai::Llm
     item.output_tokens = snapshot.output_tokens;
     item.cached_input_tokens = snapshot.cached_input_tokens;
     item.total_tokens = snapshot.total_tokens;
+    item.failure_class = snapshot.failure_class.clone();
+    item.final_model = snapshot.final_model.clone();
+    item.fallback_count = snapshot.fallback_count;
+    item.retry_scheduled_at = snapshot.retry_scheduled_at.clone();
+    item.recovery_attempt_count = snapshot.recovery_attempt_count;
     if let Some(started_at) = snapshot.started_at.clone() {
         item.started_at = Some(started_at);
     }
@@ -6901,6 +6939,11 @@ fn apply_llm_call_detail_admin_override(
     item.output_tokens = snapshot.output_tokens;
     item.cached_input_tokens = snapshot.cached_input_tokens;
     item.total_tokens = snapshot.total_tokens;
+    item.failure_class = snapshot.failure_class.clone();
+    item.final_model = snapshot.final_model.clone();
+    item.fallback_count = snapshot.fallback_count;
+    item.retry_scheduled_at = snapshot.retry_scheduled_at.clone();
+    item.recovery_attempt_count = snapshot.recovery_attempt_count;
     if let Some(output_messages_json) = snapshot.output_messages_json.clone() {
         item.output_messages_json = Some(output_messages_json);
     }
@@ -7249,11 +7292,31 @@ pub async fn admin_patch_llm_runtime_config(
             .await
             .map_err(ApiError::internal)?,
     };
+    let current_recovery = admin_runtime::load_llm_recovery_runtime_config(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let recovery_enabled = req.llm_recovery_enabled.unwrap_or(current_recovery.enabled);
+    let recovery_rollout_percent = match req.llm_recovery_rollout_percent {
+        Some(value) if !(0..=100).contains(&value) => {
+            return Err(ApiError::bad_request(
+                "llm_recovery_rollout_percent must be between 0 and 100",
+            ));
+        }
+        Some(value) => value,
+        None => i64::from(current_recovery.rollout_percent),
+    };
     admin_runtime::update_llm_runtime_settings(
         &state.pool,
         max_concurrency,
         ai_model_context_limit,
         &llm_models,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    admin_runtime::update_llm_recovery_runtime_config(
+        &state.pool,
+        recovery_enabled,
+        recovery_rollout_percent,
     )
     .await
     .map_err(ApiError::internal)?;
@@ -7314,6 +7377,9 @@ async fn load_admin_llm_scheduler_status_response(
     .await
     .map_err(ApiError::internal)?;
     let selected_model = ai::select_model_for_new_calls(state).await;
+    let recovery = admin_runtime::load_llm_recovery_runtime_config(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
     let ai_model_context_limit = admin_runtime::load_ai_model_context_limit(&state.pool)
         .await
         .map_err(ApiError::internal)?
@@ -7327,6 +7393,7 @@ async fn load_admin_llm_scheduler_status_response(
             priority: status.priority,
             status: status.status.to_owned(),
             consecutive_final_failures: status.consecutive_final_failures,
+            relevant_failure_count: status.relevant_failure_count,
             cooldown_until: status.cooldown_until,
             effective_input_limit: i64::from(effective_input_limit),
             effective_input_limit_source: effective_input_limit_source.to_owned(),
@@ -7351,6 +7418,8 @@ async fn load_admin_llm_scheduler_status_response(
         avg_duration_ms_24h: avg_duration_raw.map(|value| value.round() as i64),
         last_success_at,
         last_failure_at,
+        llm_recovery_enabled: recovery.enabled,
+        llm_recovery_rollout_percent: i64::from(recovery.rollout_percent),
     })
 }
 
@@ -7581,6 +7650,11 @@ async fn load_admin_llm_call_items(
           output_tokens,
           cached_input_tokens,
           total_tokens,
+          failure_class,
+          final_model,
+          fallback_count,
+          retry_scheduled_at,
+          recovery_attempt_count,
           created_at,
           started_at,
           finished_at,
@@ -7781,6 +7855,11 @@ pub async fn admin_get_llm_call_detail(
           prompt_text,
           response_text,
           error_text,
+          failure_class,
+          final_model,
+          fallback_count,
+          retry_scheduled_at,
+          recovery_attempt_count,
           created_at,
           started_at,
           finished_at,
@@ -7799,6 +7878,21 @@ pub async fn admin_get_llm_call_detail(
     if let Some(snapshot) = state.llm_scheduler.admin_overrides().await.get(&item.id) {
         apply_llm_call_detail_admin_override(&mut item, snapshot);
     }
+
+    item.attempt_history = sqlx::query_as::<_, AdminLlmCallAttemptItem>(
+        r#"
+        SELECT event_type, status, model, attempt, failure_class, retry_after_ms,
+               from_model, to_model, fallback_count, created_at
+        FROM llm_call_events
+        WHERE call_id = ?
+        ORDER BY julianday(created_at) ASC, created_at ASC, id ASC
+        LIMIT 100
+        "#,
+    )
+    .bind(item.id.as_str())
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
 
     Ok(Json(item))
 }
@@ -15865,9 +15959,6 @@ fn smart_item(
 fn translated_terminal_item(status: &str, error_text: Option<&str>) -> Option<TranslatedItem> {
     match status {
         "disabled" => Some(translated_item("disabled", None, None, None, None)),
-        "error" if crate::translations::release_translation_error_is_retryable(error_text) => {
-            Some(translated_missing_item(true))
-        }
         "missing" | "error" => Some(translated_item(
             status,
             None,
@@ -15948,7 +16039,6 @@ fn smart_terminal_item(status: &str, error_text: Option<&str>) -> Option<SmartIt
         "missing" if error_text == Some(SMART_NO_VALUABLE_VERSION_INFO) => {
             Some(smart_item("insufficient", None, None, Some(false), None))
         }
-        "error" if smart_error_is_retryable(error_text) => Some(smart_missing_item(Some(true))),
         "missing" | "error" => Some(smart_item(status, None, None, Some(false), error_text)),
         _ => None,
     }
@@ -15968,6 +16058,7 @@ fn smart_missing_item(auto_translate: Option<bool>) -> SmartItem {
     smart_item("missing", None, None, auto_translate, None)
 }
 
+#[cfg(test)]
 fn smart_error_is_retryable(error_text: Option<&str>) -> bool {
     crate::translations::release_translation_error_is_retryable(error_text)
 }
@@ -16906,6 +16997,7 @@ pub struct TranslateBatchItem {
     pub title: Option<String>,
     pub summary: Option<String>,
     pub error: Option<String>,
+    pub failure_class: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -17706,6 +17798,7 @@ struct ReleaseBatchCandidate {
 struct ReleaseBatchTerminalState {
     status: String,
     error: Option<String>,
+    failure_class: Option<String>,
 }
 
 type ReleaseBatchTranslationMap = HashMap<i64, (Option<String>, Option<String>)>;
@@ -17717,6 +17810,9 @@ const NOTIFICATION_BATCH_MAX_TOKENS: u32 = 1_100;
 const NOTIFICATION_BATCH_OVERHEAD_TOKENS: u32 = 220;
 
 fn ai_error_is_non_retryable(err: &anyhow::Error) -> bool {
+    if ai::llm_failure_class(err) == Some(ai::LlmFailureClass::Configuration) {
+        return true;
+    }
     let msg = err.to_string().to_ascii_lowercase();
     let status_422_non_context =
         msg.contains("ai returned 422") && !msg.contains("context") && !msg.contains("length");
@@ -18023,6 +18119,7 @@ async fn translate_pending_release_batch_candidates(
 
     let mut translated = HashMap::<i64, (Option<String>, Option<String>)>::new();
     let mut non_retryable_error_text: Option<String> = None;
+    let mut non_retryable_error_class: Option<String> = None;
     let mut abort_remaining_batches = false;
     let mut pending_groups = groups;
     while let Some(batch_indices) = pending_groups.pop() {
@@ -18068,11 +18165,13 @@ async fn translate_pending_release_batch_candidates(
             Err(err) => {
                 if ai_error_is_non_retryable(&err) {
                     abort_remaining_batches = true;
-                    non_retryable_error_text = Some(err.to_string());
                     tracing::warn!(
                         ?err,
                         "release detail batch translation upstream error is non-retryable; skipping remaining batch calls"
                     );
+                    let safe_error = ApiError::from_llm_error(err);
+                    non_retryable_error_class = safe_error.failure_class().map(str::to_owned);
+                    non_retryable_error_text = Some(safe_error.to_string());
                 } else if batch_indices.len() > 1 {
                     let mid = batch_indices.len() / 2;
                     pending_groups.push(batch_indices[mid..].to_vec());
@@ -18124,6 +18223,7 @@ async fn translate_pending_release_batch_candidates(
                 title,
                 summary,
                 error: None,
+                failure_class: None,
             });
             continue;
         }
@@ -18152,6 +18252,7 @@ async fn translate_pending_release_batch_candidates(
                 title: None,
                 summary: None,
                 error: Some(error_text.clone()),
+                failure_class: non_retryable_error_class.clone(),
             });
             continue;
         }
@@ -18164,6 +18265,7 @@ async fn translate_pending_release_batch_candidates(
                 title: translated.title,
                 summary: translated.summary,
                 error: None,
+                failure_class: None,
             }),
             Err(err) if err.code() == "not_found" => items.push(TranslateBatchItem {
                 id: candidate.release_id.to_string(),
@@ -18172,6 +18274,7 @@ async fn translate_pending_release_batch_candidates(
                 title: None,
                 summary: None,
                 error: Some("release not found".to_owned()),
+                failure_class: None,
             }),
             Err(err) => {
                 let error_text = err.to_string();
@@ -18187,6 +18290,7 @@ async fn translate_pending_release_batch_candidates(
                     title: None,
                     summary: None,
                     error: Some(error_text),
+                    failure_class: err.failure_class().map(str::to_owned),
                 });
             }
         }
@@ -18362,6 +18466,7 @@ async fn prepare_release_batch(
                     ReleaseBatchTerminalState {
                         status: cache.status.clone(),
                         error: cache.error_text.clone(),
+                        failure_class: None,
                     },
                 );
                 continue;
@@ -18383,6 +18488,7 @@ async fn prepare_release_batch(
                     ReleaseBatchTerminalState {
                         status: cache.status.clone(),
                         error: cache.error_text.clone(),
+                        failure_class: None,
                     },
                 );
                 continue;
@@ -18424,6 +18530,7 @@ fn build_release_batch_item(
             title: None,
             summary: None,
             error: Some("release not found".to_owned()),
+            failure_class: None,
         };
     }
 
@@ -18438,6 +18545,7 @@ fn build_release_batch_item(
                 (terminal_state.status == "missing")
                     .then_some("translation result missing".to_owned())
             }),
+            failure_class: terminal_state.failure_class.clone(),
         };
     }
 
@@ -18449,6 +18557,7 @@ fn build_release_batch_item(
             title: title.clone(),
             summary: summary.clone(),
             error: None,
+            failure_class: None,
         };
     }
 
@@ -18459,6 +18568,7 @@ fn build_release_batch_item(
         title: None,
         summary: None,
         error: Some("translation failed".to_owned()),
+        failure_class: None,
     }
 }
 
@@ -18522,6 +18632,7 @@ async fn translate_releases_batch_internal(
                 title: None,
                 summary: None,
                 error: None,
+                failure_class: None,
             })
             .collect());
     }
@@ -18550,6 +18661,7 @@ async fn translate_releases_batch_internal(
                         ReleaseBatchTerminalState {
                             status: item.status,
                             error: item.error,
+                            failure_class: item.failure_class,
                         },
                     );
                 }
@@ -19013,7 +19125,7 @@ async fn summarize_release_smart_candidate_with_ai(
     let body_prompt = release_smart_body_prompt(item);
     let raw = ai::chat_completion(state, release_smart_body_system_prompt(), &body_prompt, 700)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(ApiError::from_llm_error)?;
     let parsed = parse_release_smart_summary_payload(&raw)
         .ok_or_else(|| ApiError::internal("release smart body summary json decode failed"))?;
     if parsed.valuable {
@@ -19046,7 +19158,7 @@ async fn summarize_release_smart_candidate_with_ai(
     let diff_prompt = release_smart_diff_prompt(item, &compare_range, &digest);
     let raw = ai::chat_completion(state, release_smart_diff_system_prompt(), &diff_prompt, 700)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(ApiError::from_llm_error)?;
     let parsed = parse_release_smart_summary_payload(&raw)
         .ok_or_else(|| ApiError::internal("release smart diff summary json decode failed"))?;
     if !parsed.valuable {
@@ -19218,20 +19330,18 @@ async fn prepare_release_smart_batch(
                     ReleaseBatchTerminalState {
                         status: cache.status.clone(),
                         error: cache.error_text.clone(),
+                        failure_class: None,
                     },
                 );
                 continue;
             }
             if cache.status == "error" {
-                if smart_error_is_retryable(cache.error_text.as_deref()) {
-                    pending.push(item.clone());
-                    continue;
-                }
                 terminal.insert(
                     item.release_id,
                     ReleaseBatchTerminalState {
                         status: cache.status.clone(),
                         error: cache.error_text.clone(),
+                        failure_class: None,
                     },
                 );
                 continue;
@@ -19354,6 +19464,7 @@ fn build_release_smart_batch_item(
             title: None,
             summary: None,
             error: Some("release not found".to_owned()),
+            failure_class: None,
         };
     }
 
@@ -19368,6 +19479,7 @@ fn build_release_smart_batch_item(
                 (terminal_state.status == "missing")
                     .then_some("translation result missing".to_owned())
             }),
+            failure_class: terminal_state.failure_class.clone(),
         };
     }
 
@@ -19379,6 +19491,7 @@ fn build_release_smart_batch_item(
             title: title.clone(),
             summary: summary.clone(),
             error: None,
+            failure_class: None,
         };
     }
 
@@ -19389,6 +19502,7 @@ fn build_release_smart_batch_item(
         title: None,
         summary: None,
         error: Some("release smart summary failed".to_owned()),
+        failure_class: None,
     }
 }
 
@@ -19407,6 +19521,7 @@ pub(crate) async fn summarize_releases_smart_batch_internal(
                 title: None,
                 summary: None,
                 error: None,
+                failure_class: None,
             })
             .collect());
     }
@@ -19426,6 +19541,7 @@ pub(crate) async fn summarize_releases_smart_batch_internal(
                     ReleaseBatchTerminalState {
                         status: "missing".to_owned(),
                         error: Some(SMART_NO_VALUABLE_VERSION_INFO.to_owned()),
+                        failure_class: None,
                     },
                 );
             }
@@ -19435,6 +19551,7 @@ pub(crate) async fn summarize_releases_smart_batch_internal(
                     ReleaseBatchTerminalState {
                         status: "error".to_owned(),
                         error: Some(err.to_string()),
+                        failure_class: err.failure_class().map(str::to_owned),
                     },
                 );
             }
@@ -19525,6 +19642,7 @@ async fn translate_releases_batch_stream_worker(
                     title: None,
                     summary: None,
                     error: None,
+                    failure_class: None,
                 };
                 if !send_batch_stream_event(
                     &tx,
@@ -19642,6 +19760,7 @@ async fn translate_releases_batch_stream_worker(
                             title: None,
                             summary: None,
                             error: None,
+                            failure_class: None,
                         }),
                         error: None,
                     },
@@ -19672,6 +19791,7 @@ async fn translate_releases_batch_stream_worker(
                                 ReleaseBatchTerminalState {
                                     status: item.status.clone(),
                                     error: item.error.clone(),
+                                    failure_class: item.failure_class.clone(),
                                 },
                             );
                         }
@@ -19946,7 +20066,7 @@ async fn translate_release_detail_chunk(
         budget.max_output_tokens,
     )
     .await
-    .map_err(ApiError::internal)?;
+    .map_err(ApiError::from_llm_error)?;
     let translated = normalize_markdown_translation_output(chunk, translated);
     if markdown_structure_preserved(chunk, &translated) {
         return Ok(translated);
@@ -19968,7 +20088,7 @@ async fn translate_release_detail_chunk(
         budget.max_output_tokens,
     )
     .await
-    .map_err(ApiError::internal)?;
+    .map_err(ApiError::from_llm_error)?;
     let retry = normalize_markdown_translation_output(chunk, retry);
     if !markdown_structure_preserved(chunk, &retry) {
         return Err(ApiError::internal(
@@ -20086,9 +20206,7 @@ async fn translate_release_detail_chunks_batched(
                         ?err,
                         "release detail chunk batch error is non-retryable; skipping single fallback"
                     );
-                    return Err(ApiError::internal(
-                        "release detail translation unavailable: upstream model/channel rejected request",
-                    ));
+                    return Err(ApiError::from_llm_error(err));
                 }
                 tracing::warn!(
                     ?err,
@@ -20296,15 +20414,9 @@ async fn translate_release_detail_internal(
         120,
     )
     .await
-    .ok()
-    .and_then(|s| {
-        let title = s.trim();
-        if title.is_empty() {
-            None
-        } else {
-            Some(title.to_owned())
-        }
-    });
+    .map_err(ApiError::from_llm_error)?;
+    let translated_title = translated_title.trim();
+    let translated_title = (!translated_title.is_empty()).then(|| translated_title.to_owned());
 
     let body_markdown = if original_body.trim().is_empty() {
         String::new()
@@ -20432,6 +20544,7 @@ async fn translate_release_detail_batch_internal(
                 title: translated.title,
                 summary: translated.summary,
                 error: None,
+                failure_class: None,
             }),
             Err(err) if err.code() == "not_found" => items.push(TranslateBatchItem {
                 id: release_id.to_string(),
@@ -20440,6 +20553,7 @@ async fn translate_release_detail_batch_internal(
                 title: None,
                 summary: None,
                 error: Some("release not found".to_owned()),
+                failure_class: None,
             }),
             Err(err) => {
                 let error_text = err.to_string();
@@ -20455,6 +20569,7 @@ async fn translate_release_detail_batch_internal(
                     title: None,
                     summary: None,
                     error: Some(error_text),
+                    failure_class: err.failure_class().map(str::to_owned),
                 });
             }
         }
@@ -20649,15 +20764,9 @@ async fn translate_announcement_detail_internal(
         120,
     )
     .await
-    .ok()
-    .and_then(|output| {
-        let title = output.trim();
-        if title.is_empty() {
-            None
-        } else {
-            Some(title.to_owned())
-        }
-    });
+    .map_err(ApiError::from_llm_error)?;
+    let translated_title = translated_title.trim();
+    let translated_title = (!translated_title.is_empty()).then(|| translated_title.to_owned());
 
     let body_markdown = if original_body.trim().is_empty() {
         String::new()
@@ -20860,15 +20969,9 @@ async fn summarize_announcement_smart_internal(
         120,
     )
     .await
-    .ok()
-    .and_then(|output| {
-        let title = output.trim();
-        if title.is_empty() {
-            None
-        } else {
-            Some(title.to_owned())
-        }
-    });
+    .map_err(ApiError::from_llm_error)?;
+    let translated_title = translated_title.trim();
+    let translated_title = (!translated_title.is_empty()).then(|| translated_title.to_owned());
 
     let polished_summary = ai::chat_completion(
         state,
@@ -20883,7 +20986,7 @@ async fn summarize_announcement_smart_internal(
         480,
     )
     .await
-    .map_err(ApiError::internal)?
+    .map_err(ApiError::from_llm_error)?
     .trim()
     .to_owned();
 
@@ -20958,7 +21061,7 @@ fn build_notification_batch_prompt(items: &[NotificationBatchCandidate]) -> Stri
 async fn translate_notification_single_candidate_with_ai(
     state: &AppState,
     item: &NotificationBatchCandidate,
-) -> Option<(Option<String>, Option<String>)> {
+) -> Result<Option<(Option<String>, Option<String>)>, ApiError> {
     let prompt = format!(
         "Repo: {repo}\nOriginal title: {title}\nReason: {reason}\nType: {subject_type}\n\n请把这条 Inbox 通知翻译/解释为中文，输出严格 JSON（不要 markdown code block）：\n{{\"title_zh\": \"...\", \"summary_md\": \"- ...\"}}\n\n要求：summary_md 1-3 条；给出建议动作；不包含任何 URL。",
         repo = item.repo_full_name,
@@ -20974,7 +21077,7 @@ async fn translate_notification_single_candidate_with_ai(
         500,
     )
     .await
-    .ok()?;
+    .map_err(ApiError::from_llm_error)?;
     let parsed = parse_translation_json(&raw);
     let title = parsed
         .as_ref()
@@ -20997,18 +21100,30 @@ async fn translate_notification_single_candidate_with_ai(
             }
         });
     if title.is_none() && summary.is_none() {
-        None
+        Ok(None)
     } else {
-        Some((title, summary))
+        Ok(Some((title, summary)))
     }
+}
+
+#[derive(Debug, Default)]
+struct NotificationTranslationBatchResult {
+    translated: HashMap<String, (Option<String>, Option<String>)>,
+    errors: HashMap<String, NotificationTranslationError>,
+}
+
+#[derive(Debug, Clone)]
+struct NotificationTranslationError {
+    message: String,
+    failure_class: Option<String>,
 }
 
 async fn translate_notification_candidates_with_ai(
     state: &AppState,
     pending: &[NotificationBatchCandidate],
-) -> HashMap<String, (Option<String>, Option<String>)> {
+) -> NotificationTranslationBatchResult {
     if pending.is_empty() {
-        return HashMap::new();
+        return NotificationTranslationBatchResult::default();
     }
 
     let budget_info =
@@ -21040,6 +21155,7 @@ async fn translate_notification_candidates_with_ai(
     );
 
     let mut translated = HashMap::new();
+    let mut errors = HashMap::new();
     let mut abort_remaining_batches = false;
     for batch_indices in groups {
         if abort_remaining_batches {
@@ -21081,12 +21197,24 @@ async fn translate_notification_candidates_with_ai(
                 }
             }
             Err(err) => {
+                let failure_class = ai::llm_failure_class(&err);
+                let safe_error = failure_class
+                    .map(|class| class.safe_message().to_owned())
+                    .unwrap_or_else(|| "translation failed".to_owned());
                 if ai_error_is_non_retryable(&err) {
                     abort_remaining_batches = true;
                     tracing::warn!(
                         ?err,
                         "notification batch translation upstream error is non-retryable; skipping single fallback"
                     );
+                    for item in &batch {
+                        errors.entry(item.thread_id.clone()).or_insert_with(|| {
+                            NotificationTranslationError {
+                                message: safe_error.clone(),
+                                failure_class: failure_class.map(|class| class.as_str().to_owned()),
+                            }
+                        });
+                    }
                 } else {
                     tracing::warn!(
                         ?err,
@@ -21101,16 +21229,53 @@ async fn translate_notification_candidates_with_ai(
                 if translated.contains_key(&item.thread_id) {
                     continue;
                 }
-                if let Some(res) =
-                    translate_notification_single_candidate_with_ai(state, item).await
-                {
-                    translated.insert(item.thread_id.clone(), res);
+                match translate_notification_single_candidate_with_ai(state, item).await {
+                    Ok(Some(res)) => {
+                        translated.insert(item.thread_id.clone(), res);
+                    }
+                    Ok(None) => {
+                        errors.insert(
+                            item.thread_id.clone(),
+                            NotificationTranslationError {
+                                message: "AI response missing content".to_owned(),
+                                failure_class: Some(
+                                    ai::LlmFailureClass::EmptyContent.as_str().to_owned(),
+                                ),
+                            },
+                        );
+                    }
+                    Err(err) => {
+                        errors.insert(
+                            item.thread_id.clone(),
+                            NotificationTranslationError {
+                                message: err.to_string(),
+                                failure_class: err.failure_class().map(str::to_owned),
+                            },
+                        );
+                    }
                 }
             }
         }
     }
 
-    translated
+    if abort_remaining_batches {
+        let fallback_error =
+            errors
+                .values()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| NotificationTranslationError {
+                    message: "LLM configuration or request rejected".to_owned(),
+                    failure_class: Some(ai::LlmFailureClass::Configuration.as_str().to_owned()),
+                });
+        for item in pending {
+            errors
+                .entry(item.thread_id.clone())
+                .or_insert_with(|| fallback_error.clone());
+        }
+    }
+
+    NotificationTranslationBatchResult { translated, errors }
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -21137,6 +21302,7 @@ async fn translate_notifications_batch_internal(
                 title: None,
                 summary: None,
                 error: None,
+                failure_class: None,
             })
             .collect());
     }
@@ -21278,8 +21444,8 @@ async fn translate_notifications_batch_internal(
         .await?;
     }
 
-    let pending_translated = translate_notification_candidates_with_ai(state, &pending).await;
-    for (thread_id, value) in pending_translated {
+    let pending_result = translate_notification_candidates_with_ai(state, &pending).await;
+    for (thread_id, value) in pending_result.translated {
         translated.insert(thread_id, value);
     }
 
@@ -21312,6 +21478,7 @@ async fn translate_notifications_batch_internal(
                 title: None,
                 summary: None,
                 error: Some("notification not found".to_owned()),
+                failure_class: None,
             });
             continue;
         }
@@ -21327,6 +21494,7 @@ async fn translate_notifications_batch_internal(
                 } else {
                     None
                 },
+                failure_class: None,
             });
             continue;
         }
@@ -21338,6 +21506,17 @@ async fn translate_notifications_batch_internal(
                 title: title.clone(),
                 summary: summary.clone(),
                 error: None,
+                failure_class: None,
+            });
+        } else if let Some(error) = pending_result.errors.get(thread_id) {
+            out.push(TranslateBatchItem {
+                id: thread_id.clone(),
+                lang: "zh-CN".to_owned(),
+                status: "error".to_owned(),
+                title: None,
+                summary: None,
+                error: Some(error.message.clone()),
+                failure_class: error.failure_class.clone(),
             });
         } else {
             out.push(TranslateBatchItem {
@@ -21347,6 +21526,7 @@ async fn translate_notifications_batch_internal(
                 title: None,
                 summary: None,
                 error: Some("translation failed".to_owned()),
+                failure_class: None,
             });
         }
     }
@@ -26100,6 +26280,7 @@ mod tests {
                 started_at: Some("2026-02-26T02:00:01Z".to_owned()),
                 finished_at: Some("2026-02-26T02:00:09Z".to_owned()),
                 updated_at: "2026-02-26T02:00:09Z".to_owned(),
+                ..Default::default()
             })
             .await;
         let session = setup_session(1).await;
@@ -26201,6 +26382,7 @@ mod tests {
                 started_at: Some("2026-02-26T06:00:01Z".to_owned()),
                 finished_at: None,
                 updated_at: "2026-02-26T06:00:05Z".to_owned(),
+                ..Default::default()
             })
             .await;
 
@@ -26483,6 +26665,7 @@ mod tests {
                 started_at: Some(override_started_at.clone()),
                 finished_at: None,
                 updated_at: override_started_at.clone(),
+                ..Default::default()
             })
             .await;
 
@@ -26577,6 +26760,7 @@ mod tests {
                 started_at: Some("2026-02-26T02:25:00Z".to_owned()),
                 finished_at: Some("2026-02-26T02:30:00Z".to_owned()),
                 updated_at: "2026-02-26T02:30:00Z".to_owned(),
+                ..Default::default()
             })
             .await;
 
@@ -26839,6 +27023,11 @@ mod tests {
                 ),
                 response_text: Some("override detail response".to_owned()),
                 error_text: None,
+                failure_class: Some("transient".to_owned()),
+                final_model: Some("gpt-4.1-mini".to_owned()),
+                fallback_count: 2,
+                retry_scheduled_at: Some("2026-02-26T03:05:00Z".to_owned()),
+                recovery_attempt_count: 1,
                 started_at: Some("2026-02-26T03:00:01Z".to_owned()),
                 finished_at: Some("2026-02-26T03:00:08Z".to_owned()),
                 updated_at: "2026-02-26T03:00:08Z".to_owned(),
@@ -26868,6 +27057,14 @@ mod tests {
             resp.response_text.as_deref(),
             Some("override detail response")
         );
+        assert_eq!(resp.failure_class.as_deref(), Some("transient"));
+        assert_eq!(resp.final_model.as_deref(), Some("gpt-4.1-mini"));
+        assert_eq!(resp.fallback_count, 2);
+        assert_eq!(
+            resp.retry_scheduled_at.as_deref(),
+            Some("2026-02-26T03:05:00Z")
+        );
+        assert_eq!(resp.recovery_attempt_count, 1);
         assert_eq!(resp.started_at.as_deref(), Some("2026-02-26T03:00:01Z"));
         assert_eq!(resp.finished_at.as_deref(), Some("2026-02-26T03:00:08Z"));
         assert_eq!(resp.updated_at, "2026-02-26T03:00:08Z");
@@ -27019,6 +27216,7 @@ mod tests {
                 started_at: Some("2026-08-15T10:40:00Z".to_owned()),
                 finished_at: Some("2026-08-15T10:45:00Z".to_owned()),
                 updated_at: "2026-08-15T10:45:00Z".to_owned(),
+                ..Default::default()
             })
             .await;
 
@@ -27146,6 +27344,8 @@ mod tests {
                 max_concurrency: 2,
                 ai_model_context_limit: None,
                 llm_models: None,
+                llm_recovery_enabled: None,
+                llm_recovery_rollout_percent: None,
             }),
         )
         .await
@@ -27283,6 +27483,7 @@ mod tests {
             title: Some("标题".to_owned()),
             summary: Some("摘要".to_owned()),
             error: None,
+            failure_class: None,
         };
         let response =
             translate_response_from_batch_item(item).expect("ready batch item should succeed");
@@ -27302,6 +27503,7 @@ mod tests {
             error: Some(
                 "release detail translation failed to preserve markdown structure".to_owned(),
             ),
+            failure_class: None,
         };
         let err = translate_response_from_batch_item(item).expect_err("error item should fail");
         assert_eq!(err.code(), "internal_error");
@@ -27317,6 +27519,7 @@ mod tests {
             title: None,
             summary: None,
             error: Some("ai returned 401: bad key".to_owned()),
+            failure_class: None,
         };
         let err = translate_response_from_batch_item(item).expect_err("error item should fail");
         assert_eq!(err.code(), "internal_error");
@@ -27332,6 +27535,7 @@ mod tests {
             title: None,
             summary: None,
             error: Some("release not found".to_owned()),
+            failure_class: None,
         };
         let err = translate_response_from_batch_item(item).expect_err("missing item should fail");
         assert_eq!(err.code(), "not_found");
@@ -28870,7 +29074,7 @@ mod tests {
     }
 
     #[test]
-    fn feed_item_from_row_retries_upstream_rejected_translation_errors() {
+    fn feed_item_from_row_keeps_upstream_rejected_translation_errors_visible() {
         let mut row = test_feed_row(Some("R_node"));
         row.repo_full_name = Some("openai/codex".to_owned());
         row.title = Some("Release v1.2.3".to_owned());
@@ -28889,8 +29093,8 @@ mod tests {
 
         let item = feed_item_from_row(row, true, None);
         let translated = item.translated.expect("translated item");
-        assert_eq!(translated.status, "missing");
-        assert_eq!(translated.auto_translate, None);
+        assert_eq!(translated.status, "error");
+        assert_eq!(translated.auto_translate, Some(false));
         assert!(translated.title.is_none());
         assert!(translated.summary.is_none());
     }
@@ -29120,7 +29324,7 @@ body={}
     }
 
     #[test]
-    fn feed_item_from_row_retries_retryable_smart_errors() {
+    fn feed_item_from_row_keeps_retryable_smart_errors_visible() {
         let mut row = test_feed_row(Some("R_node"));
         row.repo_full_name = Some("openai/codex".to_owned());
         row.release_tag_name = Some("v1.2.4".to_owned());
@@ -29141,8 +29345,8 @@ body={}
 
         let item = feed_item_from_row(row, true, None);
         let smart = item.smart.expect("smart item");
-        assert_eq!(smart.status, "missing");
-        assert_eq!(smart.auto_translate, Some(true));
+        assert_eq!(smart.status, "error");
+        assert_eq!(smart.auto_translate, Some(false));
         assert!(smart.title.is_none());
         assert!(smart.summary.is_none());
     }
@@ -33854,10 +34058,9 @@ line two",
         .await
         .expect("load persisted terminal detail translation");
         assert_eq!(row.get::<String, _>("status"), "error");
-        assert!(
-            row.get::<Option<String>, _>("error_text")
-                .as_deref()
-                .is_some_and(|value| value.contains("401") || value.contains("bad key"))
+        assert_eq!(
+            row.get::<Option<String>, _>("error_text").as_deref(),
+            Some("LLM configuration or request rejected")
         );
     }
 

@@ -20,11 +20,28 @@ pub struct AdminRuntimeSettingsSnapshot {
     pub llm_max_concurrency: usize,
     pub ai_model_context_limit: Option<u32>,
     pub llm_models: Vec<String>,
+    pub llm_recovery: LlmRecoveryRuntimeConfig,
     pub translation_general_worker_concurrency: usize,
     pub translation_dedicated_worker_concurrency: usize,
     pub repo_release_worker_concurrency: usize,
     pub dashboard_release_freshness_profile: String,
     pub daily_brief_schedule_local_time: NaiveTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LlmRecoveryRuntimeConfig {
+    pub enabled: bool,
+    pub rollout_percent: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmModelHealth {
+    pub model: String,
+    pub relevant_failure_count: i64,
+    pub window_started_at: Option<String>,
+    pub cooldown_until: Option<String>,
+    pub last_failure_class: Option<String>,
+    pub last_failure_at: Option<String>,
 }
 
 pub const DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES: i64 = 60;
@@ -34,6 +51,19 @@ pub const MAX_REPO_RELEASE_WORKER_CONCURRENCY: usize = 32;
 pub const DEFAULT_REPO_REFRESH_SYSTEM_BUDGET_PER_WINDOW: i64 = 1000;
 pub const MAX_REPO_REFRESH_SYSTEM_BUDGET_PER_WINDOW: i64 = 20_000;
 pub const DEFAULT_DASHBOARD_RELEASE_FRESHNESS_PROFILE: &str = "balanced";
+pub const DEFAULT_LLM_RECOVERY_ENABLED: bool = false;
+pub const DEFAULT_LLM_RECOVERY_ROLLOUT_PERCENT: u8 = 0;
+
+pub fn is_llm_recovery_failure_class(value: &str) -> bool {
+    matches!(
+        value,
+        "empty_content" | "transient" | "rate_limited" | "configuration"
+    )
+}
+
+pub fn normalize_llm_recovery_rollout_percent(value: i64) -> u8 {
+    u8::try_from(value.clamp(0, 100)).unwrap_or(DEFAULT_LLM_RECOVERY_ROLLOUT_PERCENT)
+}
 
 pub fn is_dashboard_release_freshness_profile(value: &str) -> bool {
     matches!(value, "latest" | "balanced" | "capacity")
@@ -80,6 +110,162 @@ pub fn normalize_repo_release_worker_concurrency(value: i64) -> usize {
 
 pub fn normalize_repo_refresh_system_budget_per_window(value: i64) -> i64 {
     value.clamp(1, MAX_REPO_REFRESH_SYSTEM_BUDGET_PER_WINDOW)
+}
+
+pub async fn load_llm_recovery_runtime_config(
+    pool: &SqlitePool,
+) -> Result<LlmRecoveryRuntimeConfig> {
+    let row = sqlx::query(
+        r#"
+        SELECT llm_recovery_enabled, llm_recovery_rollout_percent
+        FROM llm_recovery_flags
+        WHERE id = 1
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row
+        .map(|row| LlmRecoveryRuntimeConfig {
+            enabled: row.get::<i64, _>("llm_recovery_enabled") != 0,
+            rollout_percent: normalize_llm_recovery_rollout_percent(
+                row.get::<i64, _>("llm_recovery_rollout_percent"),
+            ),
+        })
+        .unwrap_or(LlmRecoveryRuntimeConfig {
+            enabled: DEFAULT_LLM_RECOVERY_ENABLED,
+            rollout_percent: DEFAULT_LLM_RECOVERY_ROLLOUT_PERCENT,
+        }))
+}
+
+pub async fn update_llm_recovery_runtime_config(
+    pool: &SqlitePool,
+    enabled: bool,
+    rollout_percent: i64,
+) -> Result<LlmRecoveryRuntimeConfig> {
+    let rollout_percent = normalize_llm_recovery_rollout_percent(rollout_percent);
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO llm_recovery_flags (
+          id,
+          llm_recovery_enabled,
+          llm_recovery_rollout_percent,
+          created_at,
+          updated_at
+        )
+        VALUES (1, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          llm_recovery_enabled = excluded.llm_recovery_enabled,
+          llm_recovery_rollout_percent = excluded.llm_recovery_rollout_percent,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(if enabled { 1_i64 } else { 0_i64 })
+    .bind(i64::from(rollout_percent))
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .execute(pool)
+    .await?;
+
+    load_llm_recovery_runtime_config(pool).await
+}
+
+pub async fn load_llm_model_health(pool: &SqlitePool) -> Result<Vec<LlmModelHealth>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+          model,
+          relevant_failure_count,
+          window_started_at,
+          cooldown_until,
+          last_failure_class,
+          last_failure_at
+        FROM llm_model_health
+        ORDER BY model ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let model = row.get::<String, _>("model").trim().to_owned();
+            (!model.is_empty()).then(|| LlmModelHealth {
+                model,
+                relevant_failure_count: row.get::<i64, _>("relevant_failure_count").max(0),
+                window_started_at: row.get::<Option<String>, _>("window_started_at"),
+                cooldown_until: row.get::<Option<String>, _>("cooldown_until"),
+                last_failure_class: row.get::<Option<String>, _>("last_failure_class"),
+                last_failure_at: row.get::<Option<String>, _>("last_failure_at"),
+            })
+        })
+        .collect())
+}
+
+pub async fn upsert_llm_model_health(pool: &SqlitePool, health: &LlmModelHealth) -> Result<()> {
+    let model = health.model.trim();
+    if model.is_empty() {
+        anyhow::bail!("llm model health requires a non-empty model");
+    }
+    if health
+        .last_failure_class
+        .as_deref()
+        .is_some_and(|failure_class| !is_llm_recovery_failure_class(failure_class))
+    {
+        anyhow::bail!("invalid llm recovery failure class");
+    }
+
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO llm_model_health (
+          model,
+          relevant_failure_count,
+          window_started_at,
+          cooldown_until,
+          last_failure_class,
+          last_failure_at,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(model) DO UPDATE SET
+          relevant_failure_count = excluded.relevant_failure_count,
+          window_started_at = excluded.window_started_at,
+          cooldown_until = excluded.cooldown_until,
+          last_failure_class = excluded.last_failure_class,
+          last_failure_at = excluded.last_failure_at,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(model)
+    .bind(health.relevant_failure_count.max(0))
+    .bind(health.window_started_at.as_deref())
+    .bind(health.cooldown_until.as_deref())
+    .bind(health.last_failure_class.as_deref())
+    .bind(health.last_failure_at.as_deref())
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+pub async fn delete_llm_model_health(pool: &SqlitePool, model: &str) -> Result<()> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("DELETE FROM llm_model_health WHERE model = ?")
+        .bind(model)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn load_daily_brief_schedule_local_time(
@@ -554,6 +740,10 @@ pub async fn load_or_seed_runtime_settings(
         llm_max_concurrency: config.ai_max_concurrency,
         ai_model_context_limit: None,
         llm_models: default_llm_models(config),
+        llm_recovery: LlmRecoveryRuntimeConfig {
+            enabled: DEFAULT_LLM_RECOVERY_ENABLED,
+            rollout_percent: DEFAULT_LLM_RECOVERY_ROLLOUT_PERCENT,
+        },
         translation_general_worker_concurrency: DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY,
         translation_dedicated_worker_concurrency: DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
         repo_release_worker_concurrency: DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY,
@@ -684,6 +874,10 @@ pub async fn sync_persisted_runtime_settings(
         .set_model_routing(snapshot.llm_models.clone())
         .await;
     state
+        .llm_scheduler
+        .set_model_health(load_llm_model_health(&state.pool).await?)
+        .await;
+    state
         .translation_scheduler
         .apply_runtime_config(
             state.clone(),
@@ -708,9 +902,12 @@ async fn fetch_runtime_settings(pool: &SqlitePool) -> Result<Option<AdminRuntime
           translation_dedicated_worker_concurrency,
           repo_release_worker_concurrency,
           dashboard_release_freshness_profile,
-          daily_brief_schedule_local_time
-        FROM admin_runtime_settings
-        WHERE id = 1
+          daily_brief_schedule_local_time,
+          COALESCE(flags.llm_recovery_enabled, 0) AS llm_recovery_enabled,
+          COALESCE(flags.llm_recovery_rollout_percent, 0) AS llm_recovery_rollout_percent
+        FROM admin_runtime_settings settings
+        LEFT JOIN llm_recovery_flags flags ON flags.id = 1
+        WHERE settings.id = 1
         LIMIT 1
         "#,
     )
@@ -731,6 +928,12 @@ async fn fetch_runtime_settings(pool: &SqlitePool) -> Result<Option<AdminRuntime
             row.get::<i64, _>("translation_dedicated_worker_concurrency"),
         )
         .unwrap_or(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+        llm_recovery: LlmRecoveryRuntimeConfig {
+            enabled: row.get::<i64, _>("llm_recovery_enabled") != 0,
+            rollout_percent: normalize_llm_recovery_rollout_percent(
+                row.get::<i64, _>("llm_recovery_rollout_percent"),
+            ),
+        },
         repo_release_worker_concurrency: normalize_repo_release_worker_concurrency(
             row.get::<i64, _>("repo_release_worker_concurrency"),
         ),
@@ -823,6 +1026,134 @@ mod tests {
                 .await
                 .expect("load retry interval"),
             DEFAULT_RETRY_RECENT_FAILURES_INTERVAL_MINUTES,
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_recovery_runtime_config_defaults_to_disabled_zero_percent() {
+        let pool = setup_pool().await;
+
+        assert_eq!(
+            load_llm_recovery_runtime_config(&pool)
+                .await
+                .expect("load recovery runtime config"),
+            LlmRecoveryRuntimeConfig {
+                enabled: false,
+                rollout_percent: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_recovery_migration_adds_all_audit_and_recovery_columns() {
+        let pool = setup_pool().await;
+
+        for (table, expected_columns) in [
+            (
+                "llm_calls",
+                [
+                    "failure_class",
+                    "final_model",
+                    "fallback_count",
+                    "retry_scheduled_at",
+                    "recovery_attempt_count",
+                ]
+                .as_slice(),
+            ),
+            (
+                "llm_call_events",
+                [
+                    "failure_class",
+                    "model",
+                    "attempt",
+                    "retry_after_ms",
+                    "from_model",
+                    "to_model",
+                    "fallback_count",
+                ]
+                .as_slice(),
+            ),
+            (
+                "translation_work_items",
+                [
+                    "failure_class",
+                    "retry_count",
+                    "next_retry_at",
+                    "retry_expires_at",
+                ]
+                .as_slice(),
+            ),
+        ] {
+            let columns = sqlx::query_scalar::<_, String>(&format!(
+                "SELECT name FROM pragma_table_info('{table}')"
+            ))
+            .fetch_all(&pool)
+            .await
+            .expect("read migrated table columns");
+            for expected_column in expected_columns {
+                assert!(
+                    columns.iter().any(|column| column == expected_column),
+                    "{table} missing {expected_column}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn update_llm_recovery_runtime_config_persists_normalized_values() {
+        let pool = setup_pool().await;
+
+        let updated = update_llm_recovery_runtime_config(&pool, true, 140)
+            .await
+            .expect("update recovery runtime config");
+        assert_eq!(
+            updated,
+            LlmRecoveryRuntimeConfig {
+                enabled: true,
+                rollout_percent: 100,
+            }
+        );
+
+        let snapshot = load_or_seed_runtime_settings(&pool, &test_config(1))
+            .await
+            .expect("load seeded runtime settings");
+        assert_eq!(snapshot.llm_recovery, updated);
+    }
+
+    #[tokio::test]
+    async fn llm_model_health_round_trips_and_rejects_unknown_failure_classes() {
+        let pool = setup_pool().await;
+        let health = LlmModelHealth {
+            model: "configured-model".to_owned(),
+            relevant_failure_count: 2,
+            window_started_at: Some("2026-08-30T00:00:00+00:00".to_owned()),
+            cooldown_until: Some("2026-08-30T00:10:00+00:00".to_owned()),
+            last_failure_class: Some("rate_limited".to_owned()),
+            last_failure_at: Some("2026-08-30T00:01:00+00:00".to_owned()),
+        };
+
+        upsert_llm_model_health(&pool, &health)
+            .await
+            .expect("upsert health");
+        assert_eq!(
+            load_llm_model_health(&pool).await.expect("load health"),
+            vec![health.clone()]
+        );
+
+        let invalid = LlmModelHealth {
+            last_failure_class: Some("upstream_response".to_owned()),
+            ..health.clone()
+        };
+        assert!(upsert_llm_model_health(&pool, &invalid).await.is_err());
+
+        delete_llm_model_health(&pool, health.model.as_str())
+            .await
+            .expect("delete health");
+        assert!(
+            load_llm_model_health(&pool)
+                .await
+                .expect("load deleted health")
+                .is_empty()
         );
     }
 

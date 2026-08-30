@@ -833,6 +833,14 @@ function buildHistoricalLlmCalls(
 						cached_input_tokens: sequence % 3 === 0 ? 64 : 0,
 						total_tokens:
 							outputTokens === null ? inputTokens : inputTokens + outputTokens,
+						failure_class: status === "failed" ? "transient" : null,
+						final_model: status === "succeeded" ? model : null,
+						fallback_count: status === "failed" && isShowcaseFailure ? 1 : 0,
+						retry_scheduled_at:
+							status === "failed"
+								? new Date(finishedAt.getTime() + 5 * 60 * 1000).toISOString()
+								: null,
+						recovery_attempt_count: status === "failed" ? 1 : 0,
 						created_at: createdAt.toISOString(),
 						started_at: startedAt.toISOString(),
 						finished_at: finishedAt.toISOString(),
@@ -914,8 +922,25 @@ function buildLlmCallDetails(llmCalls: AdminLlmCallItem[]) {
 						: null,
 				error_text:
 					call.status === "failed"
-						? "Upstream provider deadline exceeded in the deterministic Web Demo fixture."
+						? "LLM upstream temporarily unavailable"
 						: null,
+				attempt_history:
+					call.status === "failed"
+						? [
+								{
+									event_type: "attempt.failed",
+									status: "failed",
+									model: call.model,
+									attempt: call.attempt_count,
+									failure_class: call.failure_class,
+									retry_after_ms: call.retry_scheduled_at ? 300_000 : null,
+									from_model: call.model,
+									to_model: call.final_model,
+									fallback_count: call.fallback_count,
+									created_at: call.finished_at ?? call.updated_at,
+								},
+							]
+						: [],
 			} satisfies AdminLlmCallDetailResponse,
 		]),
 	);
@@ -1015,6 +1040,11 @@ function buildAdminJobs(): DemoJobsModel {
 			output_tokens: null,
 			cached_input_tokens: null,
 			total_tokens: null,
+			failure_class: null,
+			final_model: null,
+			fallback_count: 0,
+			retry_scheduled_at: null,
+			recovery_attempt_count: 0,
 			created_at: "2026-07-08T10:20:00+08:00",
 			started_at: null,
 			finished_at: null,
@@ -1037,6 +1067,11 @@ function buildAdminJobs(): DemoJobsModel {
 			output_tokens: null,
 			cached_input_tokens: 0,
 			total_tokens: null,
+			failure_class: null,
+			final_model: null,
+			fallback_count: 0,
+			retry_scheduled_at: null,
+			recovery_attempt_count: 0,
 			created_at: "2026-07-08T09:10:05+08:00",
 			started_at: "2026-07-08T09:10:06+08:00",
 			finished_at: null,
@@ -1147,6 +1182,7 @@ function buildAdminJobs(): DemoJobsModel {
 					priority: 1,
 					status: "ready",
 					consecutive_final_failures: 0,
+					relevant_failure_count: 0,
 					cooldown_until: null,
 					effective_input_limit: 120000,
 					effective_input_limit_source: "admin_override",
@@ -1156,6 +1192,7 @@ function buildAdminJobs(): DemoJobsModel {
 					priority: 2,
 					status: "ready",
 					consecutive_final_failures: 0,
+					relevant_failure_count: 0,
 					cooldown_until: null,
 					effective_input_limit: 120000,
 					effective_input_limit_source: "admin_override",
@@ -1171,6 +1208,8 @@ function buildAdminJobs(): DemoJobsModel {
 			avg_duration_ms_24h: roundedAverage(recentDurations),
 			last_success_at: latestFinishedAt(llmCalls, "succeeded"),
 			last_failure_at: latestFinishedAt(llmCalls, "failed"),
+			llm_recovery_enabled: false,
+			llm_recovery_rollout_percent: 0,
 		},
 		llmActivity,
 		llmCalls,

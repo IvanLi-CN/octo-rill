@@ -287,6 +287,11 @@ const llmCallsSeed: AdminLlmCallDetailResponse[] = [
 		output_tokens: 0,
 		cached_input_tokens: 640,
 		total_tokens: 1320,
+		failure_class: "transient",
+		final_model: "gpt-4.1-mini",
+		fallback_count: 1,
+		retry_scheduled_at: "2026-02-27T06:15:04Z",
+		recovery_attempt_count: 1,
 		input_messages_json: JSON.stringify([
 			{
 				role: "system",
@@ -326,8 +331,21 @@ Notes:
 - fix(api): normalize RFC3339 timestamps
 - docs: update admin guide`,
 		response_text: null,
-		error_text:
-			"OpenAI API timeout after 30000ms; retry budget exhausted (attempt=3).",
+		error_text: "LLM upstream temporarily unavailable",
+		attempt_history: [
+			{
+				event_type: "attempt.failed",
+				status: "failed",
+				model: "gpt-4o-mini",
+				attempt: 2,
+				failure_class: "transient",
+				retry_after_ms: 300000,
+				from_model: "gpt-4o-mini",
+				to_model: "gpt-4.1-mini",
+				fallback_count: 1,
+				created_at: "2026-02-27T06:10:03Z",
+			},
+		],
 		created_at: "2026-02-27T06:10:00Z",
 		started_at: "2026-02-27T06:10:01Z",
 		finished_at: "2026-02-27T06:10:04Z",
@@ -350,6 +368,11 @@ Notes:
 		output_tokens: null,
 		cached_input_tokens: 420,
 		total_tokens: null,
+		failure_class: null,
+		final_model: null,
+		fallback_count: 0,
+		retry_scheduled_at: null,
+		recovery_attempt_count: 0,
 		input_messages_json: JSON.stringify([
 			{
 				role: "system",
@@ -386,6 +409,7 @@ Summarize the following bullet points:
 3) added filters: status/source/requested_by/started_from/started_to`,
 		response_text: null,
 		error_text: null,
+		attempt_history: [],
 		created_at: "2026-02-27T06:12:00Z",
 		started_at: "2026-02-27T06:12:00Z",
 		finished_at: null,
@@ -1709,6 +1733,7 @@ function AdminJobsPreview({
 					priority: 1,
 					status: "cooldown",
 					consecutive_final_failures: 3,
+					relevant_failure_count: 3,
 					cooldown_until: "2026-02-26T04:10:00Z",
 					effective_input_limit: 128000,
 					effective_input_limit_source: "builtin_catalog",
@@ -1718,6 +1743,7 @@ function AdminJobsPreview({
 					priority: 2,
 					status: "ready",
 					consecutive_final_failures: 0,
+					relevant_failure_count: 0,
 					cooldown_until: null,
 					effective_input_limit: 1047576,
 					effective_input_limit_source: "builtin_catalog",
@@ -1732,6 +1758,8 @@ function AdminJobsPreview({
 			avg_duration_ms_24h: 1570,
 			last_success_at: llmCalls.at(-1)?.finished_at ?? null,
 			last_failure_at: llmCalls[0]?.finished_at ?? null,
+			llm_recovery_enabled: false,
+			llm_recovery_rollout_percent: 0,
 		};
 		const llmActivityStart = new Date("2026-02-24T01:00:00Z");
 		const llmActivity = {
@@ -2220,6 +2248,7 @@ function AdminJobsPreview({
 						priority: index + 1,
 						status: "ready",
 						consecutive_final_failures: 0,
+						relevant_failure_count: 0,
 						cooldown_until: null,
 						effective_input_limit:
 							aiModelContextLimit ??
@@ -3265,12 +3294,50 @@ export const LlmFilters: Story = {
 			llmSourceFilter="job.api.translate_release"
 		/>
 	),
+	globals: {
+		viewport: {
+			value: "adminJobsSettingsDesktop",
+			isRotated: false,
+		},
+	},
 	parameters: {
 		docs: {
 			description: {
 				story: "聚焦 LLM 调用筛选器生效后的列表视图。",
 			},
 		},
+	},
+};
+
+export const LlmRecoveryMobile: Story = {
+	name: "Evidence / LLM Recovery Mobile",
+	render: () => (
+		<AdminJobsPreview
+			routeUrl="/admin/jobs/llm"
+			llmSourceFilter="job.api.translate_release"
+		/>
+	),
+	globals: {
+		viewport: {
+			value: "adminJobsSettingsMobile",
+			isRotated: false,
+		},
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"移动端证据：LLM 失败分类、最终路由、恢复安排与调用列表在 393x852 视口内保持可读。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("失败分类：瞬态故障")).toBeVisible();
+		await expect(canvas.getByText("下次恢复 02/27 14:15:04")).toBeVisible();
+		await expect(
+			canvas.getByRole("button", { name: "配置 LLM 运行参数" }),
+		).toBeVisible();
 	},
 };
 

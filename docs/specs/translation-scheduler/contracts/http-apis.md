@@ -90,6 +90,7 @@
 - `wait` 最多阻塞到 `item.max_wait_ms`；若预算内未进入终态，则返回该 request 当前的单结果快照，`result.status` 可保持 `queued | running`。
 - release detail 等 request-based 交互不得在前端继续追加超出 `max_wait_ms` 合同的同步阻塞；拿到 pending 快照后应转为后台轮询或等待下次显式读取。
 - release detail 批次若遇到 retryable upstream `429` / rate-limit / 临时 slow，后端会把 request/work item 复位到 `queued` 后再返回后续快照，不把本次失败沉成默认终态错误。
+- legacy batch responses include `failure_class` when the backend has a structured `empty_content | transient | rate_limited | configuration` classification. Historical records without a classification remain `null`; recovery logic never infers a class from `error` text.
 
 ### Stream events
 
@@ -127,3 +128,5 @@ Admin views expose scheduler runtime status, request aggregates, batch aggregate
 - `POST /api/translate/notifications/batch`
 
 All legacy translation endpoints remain compatibility shims. They still accept the historical request shapes and delegate to the same translation handlers during frontend/backend rollouts; new producers should migrate to `/api/translate/requests*`.
+
+Legacy batch item responses (`/api/translate/*/batch`) include the optional `failure_class` field. It is a structured, safe value and is kept separate from the human-readable `error` message.

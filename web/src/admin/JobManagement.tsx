@@ -90,6 +90,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import {
 	Select,
 	SelectContent,
@@ -491,6 +492,7 @@ function LlmCallDetailSection(props: {
 	onOpenParentTask: (taskId: string | null) => void;
 }) {
 	const { detail, onOpenParentTask } = props;
+	const attemptHistory = detail.attempt_history ?? [];
 	const llmInputMessages = useMemo(() => {
 		const parsed = parseLlmConversationMessages(detail.input_messages_json);
 		if (parsed.length > 0) return parsed;
@@ -610,6 +612,61 @@ function LlmCallDetailSection(props: {
 						完成 {formatLocalDateTime(detail.finished_at)}
 					</p>
 				</div>
+				<div className="rounded-lg border p-3">
+					<p className="text-muted-foreground text-xs">失败与最终路由</p>
+					<p className="mt-1 font-medium">
+						{llmFailureClassLabel(detail.failure_class)}
+						<span className="text-muted-foreground ml-2 text-xs font-normal">
+							最终模型 {detail.final_model ?? detail.model}
+						</span>
+					</p>
+					<p className="text-muted-foreground mt-1 text-xs">
+						回退 {formatCount(detail.fallback_count)} 次 · 恢复{" "}
+						{formatCount(detail.recovery_attempt_count)} 次
+					</p>
+					<p className="text-muted-foreground mt-1 text-xs">
+						下次恢复 {formatLocalDateTime(detail.retry_scheduled_at)}
+					</p>
+				</div>
+			</div>
+
+			<div className="mt-3 rounded-lg border p-3">
+				<div className="flex items-center justify-between gap-2">
+					<p className="text-muted-foreground text-xs">尝试历史</p>
+					<span className="text-muted-foreground text-[11px]">
+						{formatCount(attemptHistory.length)} 条安全审计记录
+					</span>
+				</div>
+				{attemptHistory.length === 0 ? (
+					<p className="text-muted-foreground mt-2 text-xs">暂无尝试记录。</p>
+				) : (
+					<div className="mt-2 space-y-1.5">
+						{attemptHistory.map((event, index) => (
+							<div
+								key={`${event.created_at}-${event.event_type}-${index}`}
+								className="bg-muted/30 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border px-2 py-1.5 text-[11px]"
+							>
+								<span className="font-medium">{event.event_type}</span>
+								<span className="text-muted-foreground">
+									{event.model ?? "-"} · 第 {formatCount(event.attempt)} 次
+								</span>
+								{event.failure_class ? (
+									<span className="text-destructive">
+										{llmFailureClassLabel(event.failure_class)}
+									</span>
+								) : null}
+								{event.to_model ? (
+									<span className="text-muted-foreground">
+										→ {event.to_model}
+									</span>
+								) : null}
+								<span className="text-muted-foreground ml-auto">
+									{formatLocalDateTime(event.created_at)}
+								</span>
+							</div>
+						))}
+					</div>
+				)}
 			</div>
 
 			<div className="mt-3 flex flex-wrap gap-2">
@@ -755,6 +812,21 @@ function taskStatusLabel(status: string) {
 			return "已跳过";
 		default:
 			return status;
+	}
+}
+
+function llmFailureClassLabel(failureClass: string | null | undefined) {
+	switch (failureClass) {
+		case "empty_content":
+			return "空内容";
+		case "transient":
+			return "瞬态故障";
+		case "rate_limited":
+			return "限流";
+		case "configuration":
+			return "配置或请求错误";
+		default:
+			return failureClass ?? "-";
 	}
 }
 
@@ -3745,6 +3817,8 @@ export function JobManagement({
 	const [llmMaxConcurrencyInput, setLlmMaxConcurrencyInput] = useState("");
 	const [llmModelContextLimitInput, setLlmModelContextLimitInput] =
 		useState("");
+	const [llmRecoveryEnabledInput, setLlmRecoveryEnabledInput] = useState(false);
+	const [llmRecoveryRolloutInput, setLlmRecoveryRolloutInput] = useState("0");
 	const [llmModelsInput, setLlmModelsInput] = useState<LlmModelInputRow[]>([
 		createLlmModelInputRow(""),
 	]);
@@ -4546,6 +4620,10 @@ export function JobManagement({
 				? String(llmStatus.ai_model_context_limit)
 				: "",
 		);
+		setLlmRecoveryEnabledInput(llmStatus?.llm_recovery_enabled ?? false);
+		setLlmRecoveryRolloutInput(
+			String(llmStatus?.llm_recovery_rollout_percent ?? 0),
+		);
 		setLlmModelsInput(
 			llmStatus?.llm_models?.length
 				? llmStatus.llm_models.map((model) => createLlmModelInputRow(model))
@@ -4578,6 +4656,15 @@ export function JobManagement({
 			return;
 		}
 		const llmModels = normalizeLlmModelsForInput(modelValues);
+		const rolloutPercent = Number.parseInt(llmRecoveryRolloutInput.trim(), 10);
+		if (
+			!Number.isInteger(rolloutPercent) ||
+			rolloutPercent < 0 ||
+			rolloutPercent > 100
+		) {
+			setLlmSettingsSaveError("自动恢复灰度必须是 0 到 100 的整数。");
+			return;
+		}
 
 		setLlmSettingsSaving(true);
 		setLlmSettingsSaveError(null);
@@ -4586,6 +4673,8 @@ export function JobManagement({
 				max_concurrency: maxConcurrency,
 				ai_model_context_limit: aiModelContextLimit,
 				llm_models: llmModels,
+				llm_recovery_enabled: llmRecoveryEnabledInput,
+				llm_recovery_rollout_percent: rolloutPercent,
 			});
 			setLlmStatus(nextStatus);
 			void loadLlmActivity();
@@ -4599,6 +4688,8 @@ export function JobManagement({
 		llmMaxConcurrencyInput,
 		llmModelContextLimitInput,
 		llmModelsInput,
+		llmRecoveryEnabledInput,
+		llmRecoveryRolloutInput,
 		loadLlmActivity,
 	]);
 
@@ -6304,6 +6395,10 @@ export function JobManagement({
 													次
 												</p>
 												<p className="text-muted-foreground mt-1 text-xs">
+													10 分钟相关失败{" "}
+													{formatCount(modelStatus.relevant_failure_count)} 次
+												</p>
+												<p className="text-muted-foreground mt-1 text-xs">
 													输入上限{" "}
 													{formatCount(modelStatus.effective_input_limit)}{" "}
 													tokens（
@@ -6341,6 +6436,14 @@ export function JobManagement({
 										<span className="ml-1 font-mono">
 											{llmStatus?.selected_model_for_new_calls ?? "-"}
 										</span>
+									</p>
+									<p className="text-muted-foreground mt-1 text-xs">
+										自动恢复：
+										<span className="ml-1 font-medium">
+											{llmStatus?.llm_recovery_enabled ? "已启用" : "已关闭"}
+										</span>{" "}
+										· 灰度{" "}
+										{formatCount(llmStatus?.llm_recovery_rollout_percent)}%
 									</p>
 								</div>
 							</div>
@@ -6506,6 +6609,12 @@ export function JobManagement({
 															<p className="text-muted-foreground mt-1 text-xs">
 																模型：
 																<span className="font-mono">{call.model}</span>
+																{call.final_model &&
+																call.final_model !== call.model ? (
+																	<span className="ml-2">
+																		→ 最终 {call.final_model}
+																	</span>
+																) : null}
 															</p>
 															<p className="text-muted-foreground mt-1 text-xs">
 																用户：{call.requested_by ?? "-"} · 重试次数：
@@ -6526,6 +6635,23 @@ export function JobManagement({
 															<p className="text-muted-foreground mt-1 text-xs">
 																完成：{formatLocalDateTime(call.finished_at)}
 															</p>
+															{call.status === "failed" ? (
+																<>
+																	<p className="text-destructive mt-1 text-xs">
+																		失败分类：
+																		{llmFailureClassLabel(call.failure_class)}
+																	</p>
+																	<p className="text-muted-foreground mt-1 text-xs">
+																		回退 {formatCount(call.fallback_count)} 次 ·
+																		恢复{" "}
+																		{formatCount(call.recovery_attempt_count)}{" "}
+																		次 · 下次恢复{" "}
+																		{formatLocalDateTime(
+																			call.retry_scheduled_at,
+																		)}
+																	</p>
+																</>
+															) : null}
 															<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
 																ID: {call.id}
 															</p>
@@ -7200,6 +7326,45 @@ export function JobManagement({
 								）。
 							</p>
 						</div>
+						<div className="space-y-2 rounded-lg border p-3">
+							<div className="flex items-center justify-between gap-3">
+								<div>
+									<Label htmlFor="llm-recovery-enabled">翻译失败自动恢复</Label>
+									<p className="text-muted-foreground mt-1 text-xs">
+										默认关闭；只恢复已分类的空内容、瞬态和限流失败。
+									</p>
+								</div>
+								<Switch
+									id="llm-recovery-enabled"
+									aria-label="启用翻译失败自动恢复"
+									checked={llmRecoveryEnabledInput}
+									onCheckedChange={setLlmRecoveryEnabledInput}
+									disabled={llmSettingsSaving}
+								/>
+							</div>
+							<div className="space-y-2">
+								<Label htmlFor="llm-recovery-rollout">
+									稳定分区灰度（百分比）
+								</Label>
+								<Input
+									id="llm-recovery-rollout"
+									type="number"
+									min={0}
+									max={100}
+									step={1}
+									inputMode="numeric"
+									value={llmRecoveryRolloutInput}
+									onChange={(event) =>
+										setLlmRecoveryRolloutInput(event.target.value)
+									}
+									disabled={llmSettingsSaving}
+								/>
+								<p className="text-muted-foreground text-xs">
+									当前为 {llmStatus?.llm_recovery_rollout_percent ?? 0}
+									%；未授权放量时请保持 0。
+								</p>
+							</div>
+						</div>
 						<div className="space-y-2">
 							<div className="flex items-center justify-between gap-2">
 								<Label>模型路由顺序</Label>
@@ -7305,8 +7470,8 @@ export function JobManagement({
 								))}
 							</div>
 							<p className="text-muted-foreground text-xs">
-								调度会优先使用排在前面的可用模型；单模型连续最终失败 3 次后冷却
-								10 分钟，再自动恢复尝试。
+								调度会优先使用排在前面的可用模型；单模型 10
+								分钟内两次相关失败后冷却 10 分钟，再自动恢复尝试。
 							</p>
 						</div>
 						{llmSettingsSaveError ? (

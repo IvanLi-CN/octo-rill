@@ -10,6 +10,7 @@ pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    failure_class: Option<&'static str>,
 }
 
 impl ApiError {
@@ -18,11 +19,28 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            failure_class: None,
         }
+    }
+
+    pub fn from_llm_error(err: anyhow::Error) -> Self {
+        if let Some(class) = crate::ai::llm_failure_class(&err) {
+            return Self {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "llm_error",
+                message: class.safe_message().to_owned(),
+                failure_class: Some(class.as_str()),
+            };
+        }
+        Self::internal(err)
     }
 
     pub fn code(&self) -> &'static str {
         self.code
+    }
+
+    pub fn failure_class(&self) -> Option<&'static str> {
+        self.failure_class
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
@@ -55,6 +73,7 @@ impl IntoResponse for ApiError {
                 "error": {
                     "code": self.code,
                     "message": self.message,
+                    "failure_class": self.failure_class,
                 }
             })),
         )

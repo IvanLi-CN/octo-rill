@@ -1117,6 +1117,7 @@ export type AdminLlmSchedulerStatusResponse = {
 		priority: number;
 		status: string;
 		consecutive_final_failures: number;
+		relevant_failure_count: number;
 		cooldown_until: string | null;
 		effective_input_limit: number;
 		effective_input_limit_source: string;
@@ -1130,6 +1131,8 @@ export type AdminLlmSchedulerStatusResponse = {
 	avg_duration_ms_24h: number | null;
 	last_success_at: string | null;
 	last_failure_at: string | null;
+	llm_recovery_enabled: boolean;
+	llm_recovery_rollout_percent: number;
 };
 export type AdminLlmActivityResponse = {
 	bucket_minutes: 60;
@@ -1155,6 +1158,8 @@ export type AdminLlmRuntimeConfigUpdateRequest = {
 	max_concurrency: number;
 	ai_model_context_limit?: number | null;
 	llm_models?: string[];
+	llm_recovery_enabled?: boolean;
+	llm_recovery_rollout_percent?: number;
 };
 export type AdminLlmCallItem = {
 	id: string;
@@ -1173,6 +1178,11 @@ export type AdminLlmCallItem = {
 	output_tokens: number | null;
 	cached_input_tokens: number | null;
 	total_tokens: number | null;
+	failure_class: string | null;
+	final_model: string | null;
+	fallback_count: number;
+	retry_scheduled_at: string | null;
+	recovery_attempt_count: number;
 	created_at: string;
 	started_at: string | null;
 	finished_at: string | null;
@@ -1184,6 +1194,18 @@ export type AdminLlmCallDetailResponse = AdminLlmCallItem & {
 	prompt_text: string;
 	response_text: string | null;
 	error_text: string | null;
+	attempt_history: {
+		event_type: string;
+		status: string;
+		model: string | null;
+		attempt: number | null;
+		failure_class: string | null;
+		retry_after_ms: number | null;
+		from_model: string | null;
+		to_model: string | null;
+		fallback_count: number | null;
+		created_at: string;
+	}[];
 };
 export type AdminLlmCallsResponse = {
 	items: AdminLlmCallItem[];
