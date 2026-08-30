@@ -306,6 +306,6 @@ PR: include
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
 - 假设：多模型 v1 只运行在同一 provider/base URL/api key 下；这轮不做多密钥与 provider 抽象。
-- 假设：模型冷却状态进程内持有即可接受；服务重启后允许恢复为 clean state。
+- 约束：模型健康窗口与冷却截止时间持久化在 `llm_model_health`，服务重启时必须恢复未过期的冷却状态；历史未分类失败不得被自动恢复器猜测处理。
 - 风险：若模型目录缺失某模型的上下文窗口，系统会回落到 builtin / unknown fallback，可能让小上下文模型在估算上偏乐观或偏保守。
-- 假设：现有 `llm_calls` 七日保留期足以覆盖 50 小时窗口；无需 migration 或 ADR，因为没有新增持久化真相源、跨模块架构边界或不可逆技术决策。
+- 约束：恢复开关默认关闭，稳定分区必须按 work item ID 哈希并通过 24 小时业务成功率门槛后逐级放量；每次启用或扩大分区均需单独主人授权。
