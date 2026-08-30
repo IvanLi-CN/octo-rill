@@ -227,84 +227,82 @@
 
 ![LLM failover status](./assets/llm-status-failover.png)
 
+### 管理端恢复状态
+
+- `1440x900` 桌面端显示 LLM 调度活动、失败汇总、自动恢复开关状态与调用筛选入口。
+
+![LLM recovery admin desktop](./assets/llm-recovery-admin-desktop.jpg)
+
+- `393x852` 移动端顶部显示任务概览、LLM 调度切换与恢复汇总。
+
+![LLM recovery admin mobile top](./assets/llm-recovery-admin-mobile-top.jpg)
+
+- `393x852` 移动端调用详情显示安全失败分类、回退模型、重试次数与下次恢复时间。
+
+![LLM recovery admin mobile detail](./assets/llm-recovery-admin-mobile-detail.jpg)
+
 - 管理端 `LLM 调度` 多模型设置弹窗（含排序按钮）Storybook canvas。
 - 管理端 `LLM 调度` 状态卡展示首选模型冷却、次选模型接管的 Storybook canvas。
 - 管理端活动图桌面深色完整 50 桶页面（含完整、不重叠的首尾时间刻度）、`393x852` 移动端浅色按容器容量紧凑页面，以及 Storybook 37 桶聚合窗组件证据。
 
-PR: include
 ![LLM activity desktop dark](./assets/llm-activity-desktop-dark.png)
 
-PR: include
 ![LLM activity mobile light](./assets/llm-activity-mobile-light.png)
 
-PR: include
 ![LLM activity tooltip Storybook](./assets/llm-activity-tooltip-storybook.png)
 
 ### 调用排障跳转
 
 - `ui_demo`：桌面活动桶菜单，覆盖“查看失败调用 / 查看全部调用”。
 
-PR: include
 ![LLM call drilldown desktop menu](./assets/llm-call-drilldown-desktop.png)
 
 - `ui_demo`：`393x852` 移动端终态筛选和失败调用结果。
 
-PR: include
 ![LLM call drilldown mobile result](./assets/llm-call-drilldown-mobile-result.png)
 
 - `ui_demo`：`393x852` 移动端显式操作菜单。
 
-PR: include
 ![LLM call drilldown mobile menu](./assets/llm-call-drilldown-mobile-menu.png)
 
 - `storybook_canvas`：活动网格右键上下文菜单。
 
-PR: include
 ![LLM call drilldown Storybook menu](./assets/llm-call-drilldown-storybook.png)
 
 - `ui_demo`：在两个活动格子的公共边界坐标触发右键后，仍显示调用排障菜单；格子保留视觉间距，但横向与纵向命中矩形连续且无空白热区。
 
-PR: include
 ![LLM activity contiguous context menu targets](./assets/llm-activity-contiguous-context-menu.png)
 
 - `ui_demo`：活动图、调用列表和 24 小时状态汇总由同一组确定性合成调用记录派生，覆盖成功、失败、冷却和恢复安排状态。
 
-PR: include
 ![LLM demo consistent chart filter](./assets/llm-demo-consistent-chart-filter.png)
 
-PR: include
 ![LLM demo consistent call drilldown](./assets/llm-demo-consistent-call-drilldown.png)
 
 ### 调用时间范围控件
 
 - `ui_demo`：桌面调用时间筛选，开始时间与结束时间各自拥有独立的一体化范围控件；每个控件由单一触发器打开统一面板，首行以无可见端点标签的 `输入 ~ 输入` 形式设置边界，下面并列呈现两个日历与时间子面板。
 
-PR: include
 ![LLM call time range desktop](./assets/llm-call-time-range-desktop.png)
 
 - `ui_demo`：`393x852` 移动端主界面只保留一个筛选入口；右侧筛选抽屉集中呈现状态、模型、来源、用户及开始/结束时间入口，筛选控件采用适合触屏的 `44px` 高度。
 
-PR: include
 ![LLM call filters mobile drawer](./assets/llm-call-filters-mobile-drawer.png)
 
 - `ui_demo`：移动端时间面板在同一个右侧筛选对话框内从底部覆盖展开，筛选上下文保持可见；面板保留无标签 `输入 ~ 输入` 边界设置，并且一次只展示当前输入端点的日历与时间子面板。点击另一端点输入后切换面板，标准视口内无需滚动，不使用浏览器原生 `datetime-local`，也不创建第二个 Sheet 或焦点陷阱。
 
-PR: include
 ![LLM call time range mobile](./assets/llm-call-time-range-mobile.png)
 
 - `storybook_canvas`：两个受控一体化范围组件分别展示开始/结束时间；结束时间控件保持排他上限语义，故事覆盖无标签边界输入行及同一面板内两个日历、月份和时分交互，并绑定 `393x852` 的底部抽屉场景。
 
-PR: include
 ![LLM call time range Storybook](./assets/llm-call-time-range-storybook.png)
 
 - `ui_demo`：桌面筛选行中，状态、模型与两个时间范围触发器全部采用标准 `36px` 控件高度；范围触发器不得因摘要文本或内边距增高。
 
-PR: include
 ![LLM call time range trigger height desktop](./assets/llm-call-time-range-trigger-height-desktop.png)
 
 - `storybook_canvas`：范围触发器与统一的双日历面板保持可见，组件画布的外边距已规范化。
 
-PR: include
 ![LLM call time range trigger height Storybook](./assets/llm-call-time-range-trigger-height-storybook.png)
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
