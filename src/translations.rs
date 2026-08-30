@@ -5047,6 +5047,34 @@ async fn recover_due_translation_work_items(state: &AppState) -> Result<()> {
             continue;
         }
 
+        if let Some(entity_type) = map_entity_type(item.kind.as_str(), item.variant.as_str()) {
+            sqlx::query(
+                r#"
+                UPDATE ai_translations
+                SET status = 'queued',
+                    title = NULL,
+                    summary = NULL,
+                    error_text = NULL,
+                    active_work_item_id = ?,
+                    updated_at = ?
+                WHERE user_id = ?
+                  AND entity_type = ?
+                  AND entity_id = ?
+                  AND lang = ?
+                  AND source_hash = ?
+                "#,
+            )
+            .bind(item.id.as_str())
+            .bind(now.as_str())
+            .bind(item.scope_user_id.as_str())
+            .bind(entity_type)
+            .bind(item.entity_id.as_str())
+            .bind(item.target_lang.as_str())
+            .bind(item.source_hash.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
+
         let requests = sqlx::query_scalar::<_, String>(
             "SELECT id FROM translation_requests WHERE work_item_id = ?",
         )
@@ -8280,6 +8308,150 @@ mod tests {
             state_row.1.as_deref(),
             Some("AI returned 429 Too Many Requests: rpm exhausted")
         );
+    }
+
+    #[tokio::test]
+    async fn recover_due_translation_work_items_requeues_cached_translation_state() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("recovery-due");
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("create recovery request");
+        let work_item_id = created
+            .result
+            .work_item_id
+            .clone()
+            .expect("work item attached");
+        let source_hash: String = sqlx::query_scalar(
+            "SELECT source_hash FROM translation_work_items WHERE id = ? LIMIT 1",
+        )
+        .bind(work_item_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load work item source hash");
+
+        sqlx::query(
+            r#"
+            UPDATE ai_translations
+            SET status = 'error',
+                title = NULL,
+                summary = NULL,
+                error_text = 'temporary translation failure',
+                active_work_item_id = NULL,
+                updated_at = ?
+            WHERE user_id = ?
+              AND entity_type = 'release_detail'
+              AND entity_id = ?
+              AND lang = 'zh-CN'
+            "#,
+        )
+        .bind("2026-03-30T00:00:01Z")
+        .bind("1")
+        .bind(item.entity_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark cached translation failed");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_requests
+            SET status = 'failed',
+                result_status = 'error',
+                error_text = 'temporary translation failure',
+                finished_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("2026-03-30T00:00:01Z")
+        .bind("2026-03-30T00:00:01Z")
+        .bind(created.request_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark translation request failed");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'completed',
+                result_status = 'error',
+                error_text = 'temporary translation failure',
+                failure_class = 'transient',
+                retry_count = 0,
+                next_retry_at = '2020-01-01T00:00:00Z',
+                retry_expires_at = '2099-01-01T00:00:00Z',
+                finished_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("2026-03-30T00:00:01Z")
+        .bind("2026-03-30T00:00:01Z")
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item due for recovery");
+
+        crate::admin_runtime::update_llm_recovery_runtime_config(&pool, true, 100)
+            .await
+            .expect("enable full recovery rollout");
+        recover_due_translation_work_items(state.as_ref())
+            .await
+            .expect("recover due work item");
+
+        let work_item_row: (String, Option<String>, Option<String>, i64, Option<String>) =
+            sqlx::query_as(
+                r#"
+                SELECT status, result_status, next_retry_at, retry_count, failure_class
+                FROM translation_work_items
+                WHERE id = ?
+                LIMIT 1
+                "#,
+            )
+            .bind(work_item_id.as_str())
+            .fetch_one(&pool)
+            .await
+            .expect("load recovered work item");
+        let request_row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, result_status, error_text FROM translation_requests WHERE id = ? LIMIT 1",
+        )
+        .bind(created.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered request");
+        let translation_row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT status, error_text, active_work_item_id
+            FROM ai_translations
+            WHERE user_id = ?
+              AND entity_type = 'release_detail'
+              AND entity_id = ?
+              AND lang = 'zh-CN'
+              AND source_hash = ?
+            LIMIT 1
+            "#,
+        )
+        .bind("1")
+        .bind(item.entity_id.as_str())
+        .bind(source_hash.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered translation state");
+
+        assert_eq!(work_item_row.0, "queued");
+        assert_eq!(work_item_row.1, None);
+        assert_eq!(work_item_row.2, None);
+        assert_eq!(work_item_row.3, 1);
+        assert_eq!(work_item_row.4.as_deref(), Some("transient"));
+        assert_eq!(request_row.0, "queued");
+        assert_eq!(request_row.1, None);
+        assert_eq!(request_row.2, None);
+        assert_eq!(translation_row.0, "queued");
+        assert_eq!(translation_row.1, None);
+        assert_eq!(translation_row.2.as_deref(), Some(work_item_id.as_str()));
     }
 
     #[tokio::test]
