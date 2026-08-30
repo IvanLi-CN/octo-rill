@@ -121,7 +121,15 @@ pub fn classify_translation_error(error_text: Option<&str>) -> Option<Classified
         .to_owned();
     let normalized = detail.to_ascii_lowercase();
 
-    let (code, summary) = if normalized.contains("runtime_lease_expired") {
+    let (code, summary) = if normalized == "ai response missing content" {
+        ("empty_content", "模型输出为空")
+    } else if normalized == "llm upstream temporarily unavailable" {
+        ("transient", "上游暂时不可用")
+    } else if normalized == "llm upstream rate limited" {
+        ("rate_limited", "上游请求被限流")
+    } else if normalized == "llm configuration or request rejected" {
+        ("configuration", "模型配置或请求被拒绝")
+    } else if normalized.contains("runtime_lease_expired") {
         ("runtime_lease_expired", "运行时租约失效")
     } else if normalized.contains("preserve markdown structure")
         || normalized.contains("markdown structure")
@@ -6593,6 +6601,39 @@ mod tests {
         assert_eq!(classified.code, "body_too_long");
         assert_eq!(classified.summary, "正文超过 3000 字符");
         assert_eq!(classified.detail, "body exceeds 3000 chars");
+    }
+
+    #[test]
+    fn classify_translation_error_maps_safe_llm_failure_classes() {
+        let cases = [
+            (
+                "AI response missing content",
+                "empty_content",
+                "模型输出为空",
+            ),
+            (
+                "LLM upstream temporarily unavailable",
+                "transient",
+                "上游暂时不可用",
+            ),
+            (
+                "LLM upstream rate limited",
+                "rate_limited",
+                "上游请求被限流",
+            ),
+            (
+                "LLM configuration or request rejected",
+                "configuration",
+                "模型配置或请求被拒绝",
+            ),
+        ];
+
+        for (error, code, summary) in cases {
+            let classified = classify_translation_error(Some(error)).expect("classified error");
+            assert_eq!(classified.code, code);
+            assert_eq!(classified.summary, summary);
+            assert_eq!(classified.detail, error);
+        }
     }
 
     #[test]

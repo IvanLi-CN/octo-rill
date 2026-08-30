@@ -21018,7 +21018,7 @@ fn build_notification_batch_prompt(items: &[NotificationBatchCandidate]) -> Stri
 async fn translate_notification_single_candidate_with_ai(
     state: &AppState,
     item: &NotificationBatchCandidate,
-) -> Option<(Option<String>, Option<String>)> {
+) -> Result<Option<(Option<String>, Option<String>)>, ApiError> {
     let prompt = format!(
         "Repo: {repo}\nOriginal title: {title}\nReason: {reason}\nType: {subject_type}\n\n请把这条 Inbox 通知翻译/解释为中文，输出严格 JSON（不要 markdown code block）：\n{{\"title_zh\": \"...\", \"summary_md\": \"- ...\"}}\n\n要求：summary_md 1-3 条；给出建议动作；不包含任何 URL。",
         repo = item.repo_full_name,
@@ -21034,7 +21034,7 @@ async fn translate_notification_single_candidate_with_ai(
         500,
     )
     .await
-    .ok()?;
+    .map_err(ApiError::from_llm_error)?;
     let parsed = parse_translation_json(&raw);
     let title = parsed
         .as_ref()
@@ -21057,18 +21057,24 @@ async fn translate_notification_single_candidate_with_ai(
             }
         });
     if title.is_none() && summary.is_none() {
-        None
+        Ok(None)
     } else {
-        Some((title, summary))
+        Ok(Some((title, summary)))
     }
+}
+
+#[derive(Debug, Default)]
+struct NotificationTranslationBatchResult {
+    translated: HashMap<String, (Option<String>, Option<String>)>,
+    errors: HashMap<String, String>,
 }
 
 async fn translate_notification_candidates_with_ai(
     state: &AppState,
     pending: &[NotificationBatchCandidate],
-) -> HashMap<String, (Option<String>, Option<String>)> {
+) -> NotificationTranslationBatchResult {
     if pending.is_empty() {
-        return HashMap::new();
+        return NotificationTranslationBatchResult::default();
     }
 
     let budget_info =
@@ -21100,6 +21106,7 @@ async fn translate_notification_candidates_with_ai(
     );
 
     let mut translated = HashMap::new();
+    let mut errors = HashMap::new();
     let mut abort_remaining_batches = false;
     for batch_indices in groups {
         if abort_remaining_batches {
@@ -21141,12 +21148,22 @@ async fn translate_notification_candidates_with_ai(
                 }
             }
             Err(err) => {
+                let safe_error = if let Some(class) = ai::llm_failure_class(&err) {
+                    class.safe_message().to_owned()
+                } else {
+                    err.to_string()
+                };
                 if ai_error_is_non_retryable(&err) {
                     abort_remaining_batches = true;
                     tracing::warn!(
                         ?err,
                         "notification batch translation upstream error is non-retryable; skipping single fallback"
                     );
+                    for item in &batch {
+                        errors
+                            .entry(item.thread_id.clone())
+                            .or_insert_with(|| safe_error.clone());
+                    }
                 } else {
                     tracing::warn!(
                         ?err,
@@ -21161,16 +21178,38 @@ async fn translate_notification_candidates_with_ai(
                 if translated.contains_key(&item.thread_id) {
                     continue;
                 }
-                if let Some(res) =
-                    translate_notification_single_candidate_with_ai(state, item).await
-                {
-                    translated.insert(item.thread_id.clone(), res);
+                match translate_notification_single_candidate_with_ai(state, item).await {
+                    Ok(Some(res)) => {
+                        translated.insert(item.thread_id.clone(), res);
+                    }
+                    Ok(None) => {
+                        errors.insert(
+                            item.thread_id.clone(),
+                            "AI response missing content".to_owned(),
+                        );
+                    }
+                    Err(err) => {
+                        errors.insert(item.thread_id.clone(), err.to_string());
+                    }
                 }
             }
         }
     }
 
-    translated
+    if abort_remaining_batches {
+        let fallback_error = errors
+            .values()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "LLM configuration or request rejected".to_owned());
+        for item in pending {
+            errors
+                .entry(item.thread_id.clone())
+                .or_insert_with(|| fallback_error.clone());
+        }
+    }
+
+    NotificationTranslationBatchResult { translated, errors }
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -21338,8 +21377,8 @@ async fn translate_notifications_batch_internal(
         .await?;
     }
 
-    let pending_translated = translate_notification_candidates_with_ai(state, &pending).await;
-    for (thread_id, value) in pending_translated {
+    let pending_result = translate_notification_candidates_with_ai(state, &pending).await;
+    for (thread_id, value) in pending_result.translated {
         translated.insert(thread_id, value);
     }
 
@@ -21398,6 +21437,15 @@ async fn translate_notifications_batch_internal(
                 title: title.clone(),
                 summary: summary.clone(),
                 error: None,
+            });
+        } else if let Some(error) = pending_result.errors.get(thread_id) {
+            out.push(TranslateBatchItem {
+                id: thread_id.clone(),
+                lang: "zh-CN".to_owned(),
+                status: "error".to_owned(),
+                title: None,
+                summary: None,
+                error: Some(error.clone()),
             });
         } else {
             out.push(TranslateBatchItem {
