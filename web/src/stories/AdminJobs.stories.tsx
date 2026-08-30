@@ -3303,6 +3303,38 @@ export const LlmFilters: Story = {
 	},
 };
 
+export const LlmRecoveryMobile: Story = {
+	name: "Evidence / LLM Recovery Mobile",
+	render: () => (
+		<AdminJobsPreview
+			routeUrl="/admin/jobs/llm"
+			llmSourceFilter="job.api.translate_release"
+		/>
+	),
+	globals: {
+		viewport: {
+			value: "adminJobsSettingsMobile",
+			isRotated: false,
+		},
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"移动端证据：LLM 失败分类、最终路由、恢复安排与调用列表在 393x852 视口内保持可读。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("失败分类：瞬态故障")).toBeVisible();
+		await expect(canvas.getByText("下次恢复 02/27 14:15:04")).toBeVisible();
+		await expect(
+			canvas.getByRole("button", { name: "配置 LLM 运行参数" }),
+		).toBeVisible();
+	},
+};
+
 export const LlmConversationDetail: Story = {
 	render: () => (
 		<AdminJobsPreview routeUrl="/admin/jobs/llm" autoOpenConversation />
