@@ -6914,6 +6914,11 @@ fn apply_llm_call_admin_override(item: &mut AdminLlmCallItem, snapshot: &ai::Llm
     item.output_tokens = snapshot.output_tokens;
     item.cached_input_tokens = snapshot.cached_input_tokens;
     item.total_tokens = snapshot.total_tokens;
+    item.failure_class = snapshot.failure_class.clone();
+    item.final_model = snapshot.final_model.clone();
+    item.fallback_count = snapshot.fallback_count;
+    item.retry_scheduled_at = snapshot.retry_scheduled_at.clone();
+    item.recovery_attempt_count = snapshot.recovery_attempt_count;
     if let Some(started_at) = snapshot.started_at.clone() {
         item.started_at = Some(started_at);
     }
@@ -6934,6 +6939,11 @@ fn apply_llm_call_detail_admin_override(
     item.output_tokens = snapshot.output_tokens;
     item.cached_input_tokens = snapshot.cached_input_tokens;
     item.total_tokens = snapshot.total_tokens;
+    item.failure_class = snapshot.failure_class.clone();
+    item.final_model = snapshot.final_model.clone();
+    item.fallback_count = snapshot.fallback_count;
+    item.retry_scheduled_at = snapshot.retry_scheduled_at.clone();
+    item.recovery_attempt_count = snapshot.recovery_attempt_count;
     if let Some(output_messages_json) = snapshot.output_messages_json.clone() {
         item.output_messages_json = Some(output_messages_json);
     }
@@ -26208,6 +26218,7 @@ mod tests {
                 started_at: Some("2026-02-26T02:00:01Z".to_owned()),
                 finished_at: Some("2026-02-26T02:00:09Z".to_owned()),
                 updated_at: "2026-02-26T02:00:09Z".to_owned(),
+                ..Default::default()
             })
             .await;
         let session = setup_session(1).await;
@@ -26309,6 +26320,7 @@ mod tests {
                 started_at: Some("2026-02-26T06:00:01Z".to_owned()),
                 finished_at: None,
                 updated_at: "2026-02-26T06:00:05Z".to_owned(),
+                ..Default::default()
             })
             .await;
 
@@ -26591,6 +26603,7 @@ mod tests {
                 started_at: Some(override_started_at.clone()),
                 finished_at: None,
                 updated_at: override_started_at.clone(),
+                ..Default::default()
             })
             .await;
 
@@ -26685,6 +26698,7 @@ mod tests {
                 started_at: Some("2026-02-26T02:25:00Z".to_owned()),
                 finished_at: Some("2026-02-26T02:30:00Z".to_owned()),
                 updated_at: "2026-02-26T02:30:00Z".to_owned(),
+                ..Default::default()
             })
             .await;
 
@@ -26947,6 +26961,11 @@ mod tests {
                 ),
                 response_text: Some("override detail response".to_owned()),
                 error_text: None,
+                failure_class: Some("transient".to_owned()),
+                final_model: Some("gpt-4.1-mini".to_owned()),
+                fallback_count: 2,
+                retry_scheduled_at: Some("2026-02-26T03:05:00Z".to_owned()),
+                recovery_attempt_count: 1,
                 started_at: Some("2026-02-26T03:00:01Z".to_owned()),
                 finished_at: Some("2026-02-26T03:00:08Z".to_owned()),
                 updated_at: "2026-02-26T03:00:08Z".to_owned(),
@@ -26976,6 +26995,14 @@ mod tests {
             resp.response_text.as_deref(),
             Some("override detail response")
         );
+        assert_eq!(resp.failure_class.as_deref(), Some("transient"));
+        assert_eq!(resp.final_model.as_deref(), Some("gpt-4.1-mini"));
+        assert_eq!(resp.fallback_count, 2);
+        assert_eq!(
+            resp.retry_scheduled_at.as_deref(),
+            Some("2026-02-26T03:05:00Z")
+        );
+        assert_eq!(resp.recovery_attempt_count, 1);
         assert_eq!(resp.started_at.as_deref(), Some("2026-02-26T03:00:01Z"));
         assert_eq!(resp.finished_at.as_deref(), Some("2026-02-26T03:00:08Z"));
         assert_eq!(resp.updated_at, "2026-02-26T03:00:08Z");
@@ -27127,6 +27154,7 @@ mod tests {
                 started_at: Some("2026-08-15T10:40:00Z".to_owned()),
                 finished_at: Some("2026-08-15T10:45:00Z".to_owned()),
                 updated_at: "2026-08-15T10:45:00Z".to_owned(),
+                ..Default::default()
             })
             .await;
 
