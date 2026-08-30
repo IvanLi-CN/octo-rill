@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     convert::Infallible,
     sync::{Arc, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -745,6 +745,7 @@ fn pending_result_status_from_work_status(work_item_status: Option<&str>) -> &'s
     }
 }
 
+#[cfg(test)]
 pub(crate) fn translation_error_is_retryable(error_text: Option<&str>) -> bool {
     let Some(raw) = error_text else {
         return false;
@@ -781,6 +782,7 @@ pub(crate) fn translation_error_is_retryable(error_text: Option<&str>) -> bool {
         .any(|fragment| normalized.contains(fragment))
 }
 
+#[cfg(test)]
 pub(crate) fn translation_error_is_upstream_chat_403(error_text: Option<&str>) -> bool {
     let Some(raw) = error_text else {
         return false;
@@ -789,39 +791,26 @@ pub(crate) fn translation_error_is_upstream_chat_403(error_text: Option<&str>) -
     translation_error_is_upstream_chat_403_normalized(normalized.as_str())
 }
 
+#[cfg(test)]
 fn translation_error_is_upstream_chat_403_normalized(normalized: &str) -> bool {
     normalized.contains("chat upstream returned 403")
         || (normalized.contains("403 forbidden")
             && (normalized.contains("chat") || normalized.contains("upstream")))
 }
 
+#[cfg(test)]
 pub(crate) fn release_translation_error_is_retryable(error_text: Option<&str>) -> bool {
     translation_error_is_retryable(error_text) || translation_error_is_upstream_chat_403(error_text)
 }
 
-fn release_translation_item_allows_upstream_chat_403_retry(
-    item: &TranslationRequestItemInput,
-) -> bool {
-    matches!(
-        item.kind.as_str(),
-        "release_summary"
-            | "release_detail"
-            | "release_smart"
-            | "announcement_summary"
-            | "announcement_detail"
-            | "announcement_smart"
-    )
-}
-
 fn should_retry_translation_terminal_error(
     retry_on_error: bool,
-    item: &TranslationRequestItemInput,
-    error_text: Option<&str>,
+    _item: &TranslationRequestItemInput,
+    _error_text: Option<&str>,
 ) -> bool {
+    // Automatic recovery is owned by the structured work-item worker. A
+    // caller may still request an explicit manual retry.
     retry_on_error
-        || translation_error_is_retryable(error_text)
-        || (release_translation_item_allows_upstream_chat_403_retry(item)
-            && translation_error_is_upstream_chat_403(error_text))
 }
 
 fn queued_request_result(
@@ -1036,6 +1025,24 @@ struct TerminalWorkResult {
     summary_md: Option<String>,
     body_md: Option<String>,
     error: Option<String>,
+    failure_class: Option<ai::LlmFailureClass>,
+}
+
+fn terminal_failure_class_from_error_text(error: Option<&str>) -> Option<ai::LlmFailureClass> {
+    let error = error?.trim();
+    match error {
+        "AI response missing content" => Some(ai::LlmFailureClass::EmptyContent),
+        "LLM upstream temporarily unavailable" => Some(ai::LlmFailureClass::Transient),
+        "LLM upstream rate limited" => Some(ai::LlmFailureClass::RateLimited),
+        "LLM configuration or request rejected" => Some(ai::LlmFailureClass::Configuration),
+        _ => None,
+    }
+}
+
+fn terminal_failure_class_from_api_error(error: &ApiError) -> Option<ai::LlmFailureClass> {
+    error
+        .failure_class()
+        .and_then(ai::LlmFailureClass::from_str)
 }
 
 impl ClaimCandidateRow {
@@ -1690,9 +1697,16 @@ pub async fn spawn_translation_scheduler(state: Arc<AppState>) {
 
 pub fn spawn_translation_recovery_task(state: Arc<AppState>) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
+        let mut last_translation_recovery = Instant::now() - Duration::from_secs(60);
         loop {
             if let Err(err) = recover_runtime_state(state.as_ref()).await {
                 warn!(?err, "translation recovery sweep failed");
+            }
+            if last_translation_recovery.elapsed() >= Duration::from_secs(60) {
+                if let Err(err) = recover_due_translation_work_items(state.as_ref()).await {
+                    warn!(?err, "translation retry recovery sweep failed");
+                }
+                last_translation_recovery = Instant::now();
             }
             sleep(runtime::RUNTIME_LEASE_HEARTBEAT_INTERVAL).await;
         }
@@ -3653,6 +3667,9 @@ async fn reset_retryable_terminal_work_item(
             summary_md = NULL,
             body_md = NULL,
             error_text = NULL,
+            failure_class = NULL,
+            next_retry_at = NULL,
+            retry_expires_at = NULL,
             started_at = NULL,
             finished_at = NULL,
             updated_at = ?
@@ -4328,6 +4345,7 @@ async fn resolve_batch_results(
                 summary_md: None,
                 body_md: None,
                 error: None,
+                failure_class: None,
             })
             .collect());
     }
@@ -4387,6 +4405,7 @@ async fn resolve_batch_results(
                     summary_md: None,
                     body_md: None,
                     error: Some(format!("unsupported translation kind: {}", item.kind)),
+                    failure_class: None,
                 });
             }
         }
@@ -4409,6 +4428,7 @@ async fn resolve_batch_results(
                     summary_md: None,
                     body_md: None,
                     error: Some("announcement not found".to_owned()),
+                    failure_class: None,
                 },
                 Err(err) => TerminalWorkResult {
                     work_item_id: item.id.clone(),
@@ -4417,6 +4437,7 @@ async fn resolve_batch_results(
                     summary_md: None,
                     body_md: None,
                     error: Some(err.to_string()),
+                    failure_class: terminal_failure_class_from_api_error(&err),
                 },
             };
             out.push(result);
@@ -4446,6 +4467,7 @@ async fn resolve_batch_results(
                     summary_md: None,
                     body_md: None,
                     error: Some("translation result missing".to_owned()),
+                    failure_class: None,
                 }
             };
             out.push(result);
@@ -4476,6 +4498,7 @@ async fn resolve_batch_results(
                     summary_md: None,
                     body_md: None,
                     error: Some("translation result missing".to_owned()),
+                    failure_class: None,
                 }
             };
             out.push(result);
@@ -4499,6 +4522,7 @@ async fn resolve_batch_results(
                     summary_md: None,
                     body_md: None,
                     error: Some(err.to_string()),
+                    failure_class: terminal_failure_class_from_api_error(&err),
                 },
                 Err(err) => TerminalWorkResult {
                     work_item_id: item.id.clone(),
@@ -4507,6 +4531,7 @@ async fn resolve_batch_results(
                     summary_md: None,
                     body_md: None,
                     error: Some(err.to_string()),
+                    failure_class: terminal_failure_class_from_api_error(&err),
                 },
             };
             out.push(result);
@@ -4530,6 +4555,7 @@ async fn resolve_batch_results(
                     summary_md: None,
                     body_md: None,
                     error: Some("release not found".to_owned()),
+                    failure_class: None,
                 },
                 Err(err) => TerminalWorkResult {
                     work_item_id: item.id.clone(),
@@ -4538,6 +4564,7 @@ async fn resolve_batch_results(
                     summary_md: None,
                     body_md: None,
                     error: Some(err.to_string()),
+                    failure_class: terminal_failure_class_from_api_error(&err),
                 },
             };
             out.push(result);
@@ -4561,6 +4588,7 @@ async fn resolve_batch_results(
                     summary_md: None,
                     body_md: None,
                     error: Some("notification not found".to_owned()),
+                    failure_class: None,
                 },
                 Err(err) => TerminalWorkResult {
                     work_item_id: item.id.clone(),
@@ -4569,6 +4597,7 @@ async fn resolve_batch_results(
                     summary_md: None,
                     body_md: None,
                     error: Some(err.to_string()),
+                    failure_class: terminal_failure_class_from_api_error(&err),
                 },
             };
             out.push(result);
@@ -4589,6 +4618,7 @@ fn terminal_result_from_batch_item(
         summary_md: None,
         body_md: None,
         error: translated.error.clone(),
+        failure_class: terminal_failure_class_from_error_text(translated.error.as_deref()),
     };
     if matches!(
         item.kind.as_str(),
@@ -4612,6 +4642,7 @@ fn terminal_result_from_single_response(
         summary_md: None,
         body_md: None,
         error: None,
+        failure_class: None,
     };
     if matches!(
         item.kind.as_str(),
@@ -4624,12 +4655,37 @@ fn terminal_result_from_single_response(
     out
 }
 
+const TRANSLATION_RECOVERY_DELAYS_MINUTES: [i64; 5] = [1, 5, 15, 60, 240];
+const TRANSLATION_RECOVERY_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn translation_recovery_delay(retry_count: i64) -> Duration {
+    let index = usize::try_from(retry_count.max(0))
+        .unwrap_or(TRANSLATION_RECOVERY_DELAYS_MINUTES.len())
+        .min(TRANSLATION_RECOVERY_DELAYS_MINUTES.len() - 1);
+    Duration::from_secs(
+        u64::try_from(TRANSLATION_RECOVERY_DELAYS_MINUTES[index].max(0)).unwrap_or(0) * 60,
+    )
+}
+
+fn translation_recovery_in_rollout(work_item_id: &str, rollout_percent: u8) -> bool {
+    if rollout_percent == 0 {
+        return false;
+    }
+    if rollout_percent >= 100 {
+        return true;
+    }
+    let digest = ai::sha256_hex(work_item_id);
+    let bucket = u8::from_str_radix(&digest[..2], 16).unwrap_or(0) % 100;
+    bucket < rollout_percent
+}
+
 async fn finalize_batch_success(
     state: &AppState,
     batch: &ClaimedBatch,
     results: Vec<TerminalWorkResult>,
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
+    let recovery_config = admin_runtime::load_llm_recovery_runtime_config(&state.pool).await?;
     let (_sqlite_write, mut tx) = state
         .sqlite_writer
         .begin_immediate(&state.pool, "translation_batch_finalize")
@@ -4642,82 +4698,53 @@ async fn finalize_batch_success(
         else {
             continue;
         };
-        let retryable_terminal_error = result.result_status == "error"
-            && should_retry_translation_terminal_error(
-                false,
-                &TranslationRequestItemInput {
-                    producer_ref: String::new(),
-                    kind: work_item.kind.clone(),
-                    variant: work_item.variant.clone(),
-                    entity_id: work_item.entity_id.clone(),
-                    target_lang: work_item.target_lang.clone(),
-                    max_wait_ms: 0,
-                    source_blocks: Vec::new(),
-                    target_slots: Vec::new(),
-                },
-                result.error.as_deref(),
-            );
-
-        if retryable_terminal_error {
-            reset_retryable_terminal_work_item(&mut tx, work_item.id.as_str(), now.as_str())
-                .await?;
-            sqlx::query(
-                r#"
-                UPDATE translation_batch_items
-                SET result_status = NULL, error_text = NULL, updated_at = ?
-                WHERE batch_id = ? AND work_item_id = ?
-                "#,
-            )
-            .bind(now.as_str())
-            .bind(batch.id.as_str())
-            .bind(work_item.id.as_str())
-            .execute(&mut *tx)
-            .await?;
-
-            let requests = sqlx::query(
-                r#"
-                SELECT id
-                FROM translation_requests
-                WHERE work_item_id = ?
-                "#,
-            )
-            .bind(work_item.id.as_str())
-            .fetch_all(&mut *tx)
-            .await?;
-            for request in requests {
-                let request_id: String = request.try_get("id")?;
-                reset_request_for_retry(&mut tx, request_id.as_str(), now.as_str()).await?;
-                attach_request_to_work_item(
-                    &mut tx,
-                    request_id.as_str(),
-                    work_item.id.as_str(),
-                    "queued",
-                    now.as_str(),
-                )
-                .await?;
-            }
-
-            upsert_translation_demand_state(
-                &mut tx,
-                &work_item.scope_user_id,
-                &TranslationRequestItemInput {
-                    producer_ref: work_item.dedupe_key.clone(),
-                    kind: work_item.kind.clone(),
-                    variant: work_item.variant.clone(),
-                    entity_id: work_item.entity_id.clone(),
-                    target_lang: work_item.target_lang.clone(),
-                    max_wait_ms: 0,
-                    source_blocks: Vec::new(),
-                    target_slots: Vec::new(),
-                },
-                work_item.source_hash.as_str(),
-                "queued",
+        let failure_class = result.failure_class;
+        let retry_state = sqlx::query(
+            "SELECT retry_count, retry_expires_at FROM translation_work_items WHERE id = ? LIMIT 1",
+        )
+        .bind(work_item.id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let retry_count = retry_state
+            .as_ref()
+            .map(|row| row.get::<i64, _>("retry_count"))
+            .unwrap_or(0)
+            .max(0);
+        let current_expires_at = retry_state
+            .as_ref()
+            .and_then(|row| row.get::<Option<String>, _>("retry_expires_at"));
+        let recovery_enabled = result.result_status == "error"
+            && failure_class.is_some_and(ai::LlmFailureClass::is_recoverable)
+            && recovery_config.enabled
+            && translation_recovery_in_rollout(
                 work_item.id.as_str(),
-                now.as_str(),
-            )
-            .await?;
-            continue;
-        }
+                recovery_config.rollout_percent,
+            );
+        let retry_expires_at = if recovery_enabled {
+            current_expires_at.or_else(|| {
+                (Utc::now()
+                    + chrono::Duration::from_std(TRANSLATION_RECOVERY_MAX_AGE)
+                        .unwrap_or_else(|_| chrono::Duration::hours(24)))
+                .to_rfc3339()
+                .into()
+            })
+        } else {
+            None
+        };
+        let retry_scheduled_at = if recovery_enabled {
+            let expires = retry_expires_at
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc));
+            let candidate = Utc::now()
+                + chrono::Duration::from_std(translation_recovery_delay(retry_count))
+                    .unwrap_or_else(|_| chrono::Duration::minutes(1));
+            expires
+                .filter(|expires| candidate <= *expires)
+                .map_or_else(|| None, |_| Some(candidate.to_rfc3339()))
+        } else {
+            None
+        };
 
         sqlx::query(
             r#"
@@ -4728,6 +4755,10 @@ async fn finalize_batch_success(
                 summary_md = ?,
                 body_md = ?,
                 error_text = ?,
+                failure_class = ?,
+                retry_count = ?,
+                next_retry_at = ?,
+                retry_expires_at = ?,
                 finished_at = ?,
                 updated_at = ?
             WHERE id = ?
@@ -4738,6 +4769,10 @@ async fn finalize_batch_success(
         .bind(result.summary_md.as_deref())
         .bind(result.body_md.as_deref())
         .bind(result.error.as_deref())
+        .bind(failure_class.map(ai::LlmFailureClass::as_str))
+        .bind(retry_count)
+        .bind(retry_scheduled_at.as_deref())
+        .bind(retry_expires_at.as_deref())
         .bind(now.as_str())
         .bind(now.as_str())
         .bind(result.work_item_id.as_str())
@@ -4851,7 +4886,10 @@ async fn finalize_batch_failure(
     err: anyhow::Error,
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    let message = err.to_string();
+    let failure_class = ai::llm_failure_class(&err);
+    let message = failure_class
+        .map(|class| class.safe_message().to_owned())
+        .unwrap_or_else(|| err.to_string());
     let (_sqlite_write, mut tx) = state
         .sqlite_writer
         .begin_immediate(&state.pool, "translation_batch_finalize")
@@ -4861,10 +4899,172 @@ async fn finalize_batch_failure(
         batch.id.as_str(),
         &batch.items,
         message.as_str(),
+        failure_class,
         now.as_str(),
     )
     .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DueTranslationRecoveryRow {
+    id: String,
+    scope_user_id: String,
+    kind: String,
+    variant: String,
+    entity_id: String,
+    target_lang: String,
+    source_hash: String,
+}
+
+async fn recover_due_translation_work_items(state: &AppState) -> Result<()> {
+    let config = admin_runtime::load_llm_recovery_runtime_config(&state.pool).await?;
+    if !config.enabled || config.rollout_percent == 0 {
+        return Ok(());
+    }
+
+    // A newer source supersedes an old failed plan. This is deliberately a
+    // metadata-only update and never exposes source content.
+    sqlx::query(
+        r#"
+        UPDATE translation_work_items AS old
+        SET next_retry_at = NULL,
+            retry_expires_at = NULL,
+            failure_class = NULL,
+            updated_at = ?
+        WHERE old.status = 'completed'
+          AND old.next_retry_at IS NOT NULL
+          AND EXISTS (
+            SELECT 1
+            FROM translation_work_items AS newer
+            WHERE newer.scope_user_id = old.scope_user_id
+              AND newer.kind = old.kind
+              AND newer.variant = old.variant
+              AND newer.entity_id = old.entity_id
+              AND newer.target_lang = old.target_lang
+              AND newer.source_hash != old.source_hash
+              AND (newer.created_at > old.created_at
+                   OR (newer.created_at = old.created_at AND newer.id > old.id))
+          )
+        "#,
+    )
+    .bind(Utc::now().to_rfc3339())
+    .execute(&state.pool)
+    .await?;
+
+    let now = Utc::now().to_rfc3339();
+    let due_items = sqlx::query_as::<_, DueTranslationRecoveryRow>(
+        r#"
+        SELECT id, scope_user_id, kind, variant, entity_id, target_lang, source_hash
+        FROM translation_work_items
+        WHERE status = 'completed'
+          AND result_status = 'error'
+          AND failure_class IN ('empty_content', 'transient', 'rate_limited')
+          AND next_retry_at IS NOT NULL
+          AND julianday(next_retry_at) <= julianday(?)
+          AND retry_expires_at IS NOT NULL
+          AND julianday(retry_expires_at) > julianday(?)
+        ORDER BY next_retry_at ASC, id ASC
+        LIMIT 100
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .fetch_all(&state.pool)
+    .await?;
+
+    for item in due_items {
+        if !translation_recovery_in_rollout(item.id.as_str(), config.rollout_percent) {
+            continue;
+        }
+        let (_sqlite_write, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "translation_work_item_recovery")
+            .await?;
+
+        let latest_hash = sqlx::query_scalar::<_, Option<String>>(
+            r#"
+            SELECT source_hash
+            FROM translation_work_items
+            WHERE scope_user_id = ? AND kind = ? AND variant = ?
+              AND entity_id = ? AND target_lang = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(item.scope_user_id.as_str())
+        .bind(item.kind.as_str())
+        .bind(item.variant.as_str())
+        .bind(item.entity_id.as_str())
+        .bind(item.target_lang.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+
+        if latest_hash.as_deref() != Some(item.source_hash.as_str()) {
+            sqlx::query(
+                "UPDATE translation_work_items SET next_retry_at = NULL, retry_expires_at = NULL, failure_class = NULL, updated_at = ? WHERE id = ?",
+            )
+            .bind(now.as_str())
+            .bind(item.id.as_str())
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            continue;
+        }
+
+        let updated = sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'queued',
+                batch_id = NULL,
+                result_status = NULL,
+                title_zh = NULL,
+                summary_md = NULL,
+                body_md = NULL,
+                error_text = NULL,
+                next_retry_at = NULL,
+                retry_count = retry_count + 1,
+                started_at = NULL,
+                finished_at = NULL,
+                updated_at = ?
+            WHERE id = ?
+              AND status = 'completed'
+              AND result_status = 'error'
+              AND next_retry_at IS NOT NULL
+              AND julianday(next_retry_at) <= julianday(?)
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(item.id.as_str())
+        .bind(now.as_str())
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            tx.commit().await?;
+            continue;
+        }
+
+        let requests = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM translation_requests WHERE work_item_id = ?",
+        )
+        .bind(item.id.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        for request_id in requests {
+            reset_request_for_retry(&mut tx, request_id.as_str(), now.as_str()).await?;
+            attach_request_to_work_item(
+                &mut tx,
+                request_id.as_str(),
+                item.id.as_str(),
+                "queued",
+                now.as_str(),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+    }
     Ok(())
 }
 
@@ -4923,6 +5123,7 @@ async fn fail_batch_with_message(
     batch_id: &str,
     items: &[WorkItemRow],
     message: &str,
+    failure_class: Option<ai::LlmFailureClass>,
     now: &str,
 ) -> Result<(), ApiError> {
     for item in items {
@@ -4932,12 +5133,16 @@ async fn fail_batch_with_message(
             SET status = 'failed',
                 result_status = 'error',
                 error_text = ?,
+                failure_class = ?,
+                next_retry_at = NULL,
+                retry_expires_at = NULL,
                 finished_at = ?,
                 updated_at = ?
             WHERE id = ?
             "#,
         )
         .bind(message)
+        .bind(failure_class.map(ai::LlmFailureClass::as_str))
         .bind(now)
         .bind(now)
         .bind(item.id.as_str())
@@ -5127,6 +5332,7 @@ async fn recover_runtime_state_with_mode(
             batch.id.as_str(),
             &items,
             runtime::RUNTIME_LEASE_EXPIRED_ERROR,
+            None,
             now.as_str(),
         )
         .await?;
@@ -7663,7 +7869,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_translation_results_retries_retryable_terminal_error_automatically() {
+    async fn resolve_translation_results_keeps_retryable_terminal_error_until_worker_recovery() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         seed_user(&pool, 1, "octo").await;
@@ -7766,10 +7972,10 @@ mod tests {
                 .expect("load work item status");
 
         assert_eq!(requests, 1);
-        assert_eq!(resolved[0].status, "queued");
-        assert_eq!(request_status, "queued");
-        assert_eq!(request_result_status, None);
-        assert_eq!(work_item_status, "queued");
+        assert_eq!(resolved[0].status, "error");
+        assert_eq!(request_status, "failed");
+        assert_eq!(request_result_status.as_deref(), Some("error"));
+        assert_eq!(work_item_status, "failed");
         assert_eq!(
             resolved[0].work_item_id.as_deref(),
             Some(work_item_id.as_str())
@@ -7777,7 +7983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_translation_results_retries_release_upstream_403_without_explicit_retry() {
+    async fn resolve_translation_results_keeps_release_upstream_403_until_worker_recovery() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         seed_user(&pool, 1, "octo").await;
@@ -7879,10 +8085,10 @@ mod tests {
                 .await
                 .expect("load work item status");
 
-        assert_eq!(resolved[0].status, "queued");
-        assert_eq!(request_status, "queued");
-        assert_eq!(request_result_status, None);
-        assert_eq!(work_item_status, "queued");
+        assert_eq!(resolved[0].status, "error");
+        assert_eq!(request_status, "failed");
+        assert_eq!(request_result_status.as_deref(), Some("error"));
+        assert_eq!(work_item_status, "failed");
         assert_eq!(
             resolved[0].work_item_id.as_deref(),
             Some(work_item_id.as_str())
@@ -7996,6 +8202,7 @@ mod tests {
                 summary_md: None,
                 body_md: None,
                 error: Some("AI returned 429 Too Many Requests: rpm exhausted".to_owned()),
+                failure_class: Some(ai::LlmFailureClass::RateLimited),
             }],
         )
         .await
@@ -8029,13 +8236,16 @@ mod tests {
         .await
         .expect("load translation state");
 
-        assert_eq!(request_row.0, "queued");
-        assert_eq!(request_row.1, None);
-        assert_eq!(work_item_row.0, "queued");
-        assert_eq!(work_item_row.1, None);
-        assert_eq!(work_item_row.2, None);
-        assert_eq!(state_row.0, "queued");
-        assert_eq!(state_row.1, None);
+        assert_eq!(request_row.0, "failed");
+        assert_eq!(request_row.1.as_deref(), Some("error"));
+        assert_eq!(work_item_row.0, "completed");
+        assert_eq!(work_item_row.1.as_deref(), Some("error"));
+        assert_eq!(work_item_row.2.as_deref(), Some(batch.id.as_str()));
+        assert_eq!(state_row.0, "error");
+        assert_eq!(
+            state_row.1.as_deref(),
+            Some("AI returned 429 Too Many Requests: rpm exhausted")
+        );
     }
 
     #[tokio::test]

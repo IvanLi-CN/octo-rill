@@ -41,7 +41,7 @@
       "id": "3a0f5147-4cb1-4f0e-a2c4-67cb4d70d2f5",
       "status": "succeeded",
       "source": "api.translate_releases_batch",
-      "model": "gpt-4o-mini",
+      "model": "configured-candidate",
       "requested_by": 1,
       "parent_task_id": null,
       "parent_task_type": null,
@@ -57,7 +57,12 @@
       "created_at": "2026-02-27T12:00:00Z",
       "started_at": "2026-02-27T12:00:00Z",
       "finished_at": "2026-02-27T12:00:01Z",
-      "updated_at": "2026-02-27T12:00:01Z"
+      "updated_at": "2026-02-27T12:00:01Z",
+      "failure_class": null,
+      "final_model": "configured-candidate",
+      "fallback_count": 0,
+      "retry_scheduled_at": null,
+      "recovery_attempt_count": 0
     }
   ],
   "page": 1,
@@ -75,7 +80,7 @@
   "id": "3a0f5147-4cb1-4f0e-a2c4-67cb4d70d2f5",
   "status": "failed",
   "source": "job.translate.release",
-  "model": "gpt-4o-mini",
+  "model": "configured-candidate",
   "requested_by": 1,
   "parent_task_id": "d5bf4a8b-8fc3-4d6d-af68-8b34db732457",
   "parent_task_type": "translate.release",
@@ -92,13 +97,30 @@
   "output_messages_json": null,
   "prompt_text": "full prompt ...",
   "response_text": null,
-  "error_text": "AI returned 429: rate limited",
+  "error_text": "上游请求被限流",
+  "failure_class": "rate_limited",
+  "final_model": "configured-candidate",
+  "fallback_count": 1,
+  "retry_scheduled_at": "2026-02-27T12:05:00Z",
+  "recovery_attempt_count": 0,
+  "attempt_history": [
+    {
+      "event_type": "llm.attempt_failed",
+      "model": "configured-candidate",
+      "failure_class": "rate_limited",
+      "attempt": 1,
+      "retry_after_ms": 1000,
+      "created_at": "2026-02-27T12:00:02Z"
+    }
+  ],
   "created_at": "2026-02-27T12:00:00Z",
   "started_at": "2026-02-27T12:00:01Z",
   "finished_at": "2026-02-27T12:00:06Z",
   "updated_at": "2026-02-27T12:00:06Z"
 }
 ```
+
+详情响应还包含安全 `failure_class`、最终路由、回退次数、逐次尝试历史与恢复时间。示例中的路由标识和内容均为合成占位值，不代表运行时配置或线上记录。
 
 ## Extended: `GET /api/admin/jobs/events` (SSE)
 

@@ -29,6 +29,10 @@
 - 不做历史翻译任务数据回填。
 - 不实现人工重跑 / 重放动作。
 
+## Related ADRs
+
+- [ADR 0001: LLM Recovery Boundary](../../adr/0001-llm-recovery-boundary.md)
+
 ## 接口契约（Interfaces & Contracts）
 
 ### 接口清单（Inventory）
@@ -65,9 +69,17 @@
   When `item.max_wait_ms` 预算耗尽且所属 work item 仍未终态
   Then 请求方收到当前 request 的单结果快照，`result.status` 允许保持 `queued` 或 `running`，而不是继续同步阻塞到批次终态。
 
-- Given release detail work item 在批次内遇到上游 `429` / rate-limit / 暂时性 upstream slow
-  When 错误被判定为 retryable terminal error
-  Then 调度器必须把该 request、work item 与结果表状态重置回 `queued`，而不是把本次失败沉成 owner-facing `error` 终态。
+- Given 翻译或润色 work item 遇到可恢复的空内容、限流或瞬态上游错误
+  When 错误被判定为结构化可恢复失败
+  Then 调度器必须先持久化真实 `error` 状态、失败分类、尝试历史与下一次恢复时间；到期恢复器再将 request 与 work item 重新置为 `queued`。
+
+- Given 历史记录没有结构化失败分类
+  When 恢复器扫描到该记录
+  Then 不得自动补跑，只允许受控人工重试。
+
+- Given 批次执行器完成但存在失败或缺失 item
+  When 管理端计算业务结果
+  Then 结果必须为 `partial`，不能因为执行器返回成功而覆盖业务失败。
 
 - Given 一个批次同时包含 `release_summary`、`release_detail`、`notification`
   When 管理员查看批次详情

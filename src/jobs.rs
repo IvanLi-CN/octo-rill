@@ -3148,6 +3148,7 @@ struct RetryBriefCandidateRow {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
+#[cfg(test)]
 struct RetryTranslationCandidateRow {
     id: String,
     scope_user_id: String,
@@ -3188,6 +3189,7 @@ async fn load_recent_failed_brief_retry_candidates(
     .context("failed to load recent failed brief retry candidates")
 }
 
+#[cfg(test)]
 async fn load_recent_failed_translation_retry_candidates(
     state: &AppState,
     kinds: &[&str],
@@ -3267,6 +3269,7 @@ async fn load_recent_failed_translation_retry_candidates(
         .context("failed to load recent failed translation retry candidates")
 }
 
+#[cfg(test)]
 fn retry_candidate_is_retryable(row: &RetryTranslationCandidateRow) -> bool {
     match row.result_status.as_deref() {
         Some("error") => {
@@ -3284,6 +3287,7 @@ fn retry_candidate_is_retryable(row: &RetryTranslationCandidateRow) -> bool {
     }
 }
 
+#[cfg(test)]
 fn retry_candidate_request_item(
     row: &RetryTranslationCandidateRow,
 ) -> Result<translations::TranslationRequestItemInput> {
@@ -3305,6 +3309,7 @@ fn retry_candidate_request_item(
     })
 }
 
+#[cfg(test)]
 async fn retry_candidate_source_is_stale(
     state: &AppState,
     row: &RetryTranslationCandidateRow,
@@ -3328,6 +3333,7 @@ async fn retry_candidate_source_is_stale(
     Ok(current_hash.is_some_and(|hash| hash != row.source_hash))
 }
 
+#[cfg(test)]
 fn translation_state_entity_type(kind: &str, variant: &str) -> Option<&'static str> {
     if kind == "release_detail" || matches!((kind, variant), ("release_summary", "feed_body")) {
         return Some("release_detail");
@@ -3340,6 +3346,7 @@ fn translation_state_entity_type(kind: &str, variant: &str) -> Option<&'static s
     }
 }
 
+#[cfg(test)]
 async fn reset_translation_work_item_for_retry(
     state: &AppState,
     row: &RetryTranslationCandidateRow,
@@ -3516,6 +3523,7 @@ async fn retry_recent_failed_briefs(state: &AppState, task_id: &str) -> Result<R
     Ok(summary)
 }
 
+#[cfg(test)]
 async fn retry_recent_failed_translation_kind(
     state: &AppState,
     task_id: &str,
@@ -3687,7 +3695,7 @@ async fn execute_recent_failures_retry_task(
             "stage": "start",
             "schedule_key": schedule_key,
             "interval_minutes": interval_minutes,
-            "order": "daily_brief -> polish -> translation",
+            "order": "daily_brief",
         }),
     )
     .await?;
@@ -3697,32 +3705,11 @@ async fn execute_recent_failures_retry_task(
         || is_task_cancel_requested(state, task_id)
             .await
             .unwrap_or(false);
-    let polish = if canceled {
-        RetryKindSummary::new("polish", 0)
-    } else {
-        retry_recent_failed_translation_kind(state, task_id, "polish", &["release_smart"]).await?
-    };
-    let canceled = canceled
-        || polish.canceled
-        || is_task_cancel_requested(state, task_id)
-            .await
-            .unwrap_or(false);
-    let translation = if canceled {
-        RetryKindSummary::new("translation", 0)
-    } else {
-        retry_recent_failed_translation_kind(
-            state,
-            task_id,
-            "translation",
-            &["release_summary", "release_detail", "notification"],
-        )
-        .await?
-    };
-    let canceled = canceled
-        || translation.canceled
-        || is_task_cancel_requested(state, task_id)
-            .await
-            .unwrap_or(false);
+    // Translation and release_smart recovery is owned by the structured
+    // translation recovery worker. Keep this legacy scheduled task scoped to
+    // daily briefs so it cannot infer retryability from error text.
+    let polish = RetryKindSummary::new("polish", 0);
+    let translation = RetryKindSummary::new("translation", 0);
 
     append_task_event(
         state,
@@ -3747,7 +3734,8 @@ async fn execute_recent_failures_retry_task(
         "lookback_hours": 24,
         "max_items_per_kind": RETRY_RECENT_FAILURES_MAX_ITEMS_PER_KIND,
         "kind_timeout_seconds": RETRY_RECENT_FAILURES_KIND_BUDGET.as_secs(),
-        "order": "daily_brief -> polish -> translation",
+        "order": "daily_brief",
+        "translation_recovery": "structured_worker",
         "canceled": canceled,
         "daily_brief": daily_brief,
         "polish": polish,

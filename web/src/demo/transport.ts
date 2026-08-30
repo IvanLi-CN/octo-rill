@@ -1834,6 +1834,30 @@ export const demoHandlers = [
 		) {
 			return badRequest("ai_model_context_limit must be a positive integer");
 		}
+		if (
+			Object.hasOwn(payload, "llm_recovery_enabled") &&
+			typeof payload.llm_recovery_enabled !== "boolean"
+		) {
+			return badRequest("llm_recovery_enabled must be a boolean");
+		}
+		if (
+			Object.hasOwn(payload, "llm_recovery_rollout_percent") &&
+			(!Number.isInteger(payload.llm_recovery_rollout_percent) ||
+				(payload.llm_recovery_rollout_percent as number) < 0 ||
+				(payload.llm_recovery_rollout_percent as number) > 100)
+		) {
+			return badRequest(
+				"llm_recovery_rollout_percent must be between 0 and 100",
+			);
+		}
+		const requestedRecoveryEnabled =
+			typeof payload.llm_recovery_enabled === "boolean"
+				? payload.llm_recovery_enabled
+				: undefined;
+		const requestedRecoveryRollout =
+			typeof payload.llm_recovery_rollout_percent === "number"
+				? payload.llm_recovery_rollout_percent
+				: undefined;
 		const access = requireRuntimeAccess();
 		access.updateModel((model) => {
 			const currentStatus = model.adminJobs.llmStatus;
@@ -1864,6 +1888,7 @@ export const demoHandlers = [
 					priority: index + 1,
 					status: isCoolingDown ? "cooldown" : "ready",
 					consecutive_final_failures: previous?.consecutive_final_failures ?? 0,
+					relevant_failure_count: previous?.relevant_failure_count ?? 0,
 					cooldown_until: isCoolingDown ? cooldownUntil : null,
 					effective_input_limit: contextLimit ?? builtinLimit,
 					effective_input_limit_source:
@@ -1931,6 +1956,11 @@ export const demoHandlers = [
 							selectedStatus?.effective_input_limit_source ??
 							(contextLimit === null ? "builtin_catalog" : "admin_override"),
 						model_statuses: nextModelStatuses,
+						llm_recovery_enabled:
+							requestedRecoveryEnabled ?? currentStatus.llm_recovery_enabled,
+						llm_recovery_rollout_percent:
+							requestedRecoveryRollout ??
+							currentStatus.llm_recovery_rollout_percent,
 					},
 					llmActivity: {
 						...nextActivity,
