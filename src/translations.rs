@@ -1029,17 +1029,6 @@ struct TerminalWorkResult {
     failure_class: Option<ai::LlmFailureClass>,
 }
 
-fn terminal_failure_class_from_error_text(error: Option<&str>) -> Option<ai::LlmFailureClass> {
-    let error = error?.trim();
-    match error {
-        "AI response missing content" => Some(ai::LlmFailureClass::EmptyContent),
-        "LLM upstream temporarily unavailable" => Some(ai::LlmFailureClass::Transient),
-        "LLM upstream rate limited" => Some(ai::LlmFailureClass::RateLimited),
-        "LLM configuration or request rejected" => Some(ai::LlmFailureClass::Configuration),
-        _ => None,
-    }
-}
-
 fn terminal_failure_class_from_api_error(error: &ApiError) -> Option<ai::LlmFailureClass> {
     error
         .failure_class()
@@ -4619,7 +4608,10 @@ fn terminal_result_from_batch_item(
         summary_md: None,
         body_md: None,
         error: translated.error.clone(),
-        failure_class: terminal_failure_class_from_error_text(translated.error.as_deref()),
+        failure_class: translated
+            .failure_class
+            .as_deref()
+            .and_then(ai::LlmFailureClass::from_str),
     };
     if matches!(
         item.kind.as_str(),
@@ -6655,6 +6647,51 @@ mod tests {
             assert_eq!(classified.summary, summary);
             assert_eq!(classified.detail, error);
         }
+    }
+
+    #[test]
+    fn terminal_batch_result_uses_structured_failure_class() {
+        let work_item = WorkItemRow {
+            id: "work-1".to_owned(),
+            dedupe_key: "dedupe-1".to_owned(),
+            scope_user_id: "user-1".to_owned(),
+            kind: "release_detail".to_owned(),
+            variant: "detail_card".to_owned(),
+            entity_id: "120".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            protocol_version: TRANSLATION_PROTOCOL_VERSION.to_owned(),
+            model_profile: "default".to_owned(),
+            source_hash: "hash-1".to_owned(),
+            source_blocks_json: "[]".to_owned(),
+            target_slots_json: "[]".to_owned(),
+            token_estimate: 1,
+            deadline_at: "2026-04-15T00:00:00Z".to_owned(),
+            status: "running".to_owned(),
+            batch_id: Some("batch-1".to_owned()),
+            result_status: None,
+            title_zh: None,
+            summary_md: None,
+            body_md: None,
+            error_text: None,
+            cache_hit: 0,
+            created_at: "2026-04-15T00:00:00Z".to_owned(),
+            started_at: None,
+            finished_at: None,
+            updated_at: "2026-04-15T00:00:00Z".to_owned(),
+        };
+        let translated = api::TranslateBatchItem {
+            id: "120".to_owned(),
+            lang: "zh-CN".to_owned(),
+            status: "error".to_owned(),
+            title: None,
+            summary: None,
+            error: Some("AI response missing content".to_owned()),
+            failure_class: Some("transient".to_owned()),
+        };
+
+        let result = terminal_result_from_batch_item(&work_item, &translated);
+        assert_eq!(result.error.as_deref(), Some("AI response missing content"));
+        assert_eq!(result.failure_class, Some(ai::LlmFailureClass::Transient));
     }
 
     #[test]

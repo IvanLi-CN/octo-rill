@@ -4636,6 +4636,7 @@ mod tests {
                 title: Some("Ready".to_owned()),
                 summary: Some("ok".to_owned()),
                 error: None,
+                failure_class: None,
             },
             crate::api::TranslateBatchItem {
                 id: "102".to_owned(),
@@ -4644,6 +4645,7 @@ mod tests {
                 title: None,
                 summary: None,
                 error: Some("missing".to_owned()),
+                failure_class: None,
             },
             crate::api::TranslateBatchItem {
                 id: "103".to_owned(),
@@ -4652,6 +4654,7 @@ mod tests {
                 title: None,
                 summary: None,
                 error: Some("disabled".to_owned()),
+                failure_class: None,
             },
             crate::api::TranslateBatchItem {
                 id: "104".to_owned(),
@@ -4660,6 +4663,7 @@ mod tests {
                 title: None,
                 summary: None,
                 error: Some("boom".to_owned()),
+                failure_class: None,
             },
         ]);
 

@@ -171,6 +171,7 @@ export type TranslateBatchItem = {
 	title: string | null;
 	summary: string | null;
 	error: string | null;
+	failure_class?: string | null;
 };
 
 export type TranslateBatchResponse = {
