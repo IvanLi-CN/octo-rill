@@ -2196,9 +2196,11 @@ async fn requeue_llm_call_for_retry(
     fallback_count: i64,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    let retry_scheduled_at = (chrono::Utc::now()
-        + chrono::Duration::from_std(retry_delay).unwrap_or_else(|_| chrono::Duration::zero()))
-    .to_rfc3339();
+    let retry_scheduled_at = (!retry_delay.is_zero()).then(|| {
+        (chrono::Utc::now()
+            + chrono::Duration::from_std(retry_delay).unwrap_or_else(|_| chrono::Duration::zero()))
+        .to_rfc3339()
+    });
     state
         .sqlite_writer
         .write("llm_call_requeue", |_| async {
@@ -2224,7 +2226,7 @@ async fn requeue_llm_call_for_retry(
             .bind(fallback_count)
             .bind(attempt_count)
             .bind(scheduler_wait_ms)
-            .bind(retry_scheduled_at.as_str())
+            .bind(retry_scheduled_at.as_deref())
             .bind(now.as_str())
             .bind(call_id)
             .execute(&state.pool)
@@ -7443,7 +7445,8 @@ mod tests {
 
         let row = sqlx::query(
             r#"
-            SELECT model, final_model, fallback_count, failure_class, attempt_count
+            SELECT model, final_model, fallback_count, failure_class, attempt_count,
+                   retry_scheduled_at
             FROM llm_calls
             ORDER BY created_at DESC, id DESC
             LIMIT 1
@@ -7460,6 +7463,7 @@ mod tests {
         assert_eq!(row.get::<i64, _>("fallback_count"), 1);
         assert_eq!(row.get::<Option<String>, _>("failure_class"), None);
         assert_eq!(row.get::<i64, _>("attempt_count"), 2);
+        assert_eq!(row.get::<Option<String>, _>("retry_scheduled_at"), None);
 
         let switched = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM llm_call_events WHERE event_type = 'llm.route_switched'",
