@@ -167,7 +167,7 @@ function FeedGroupedListPreview(props: {
 	) as Record<string, FeedLane>;
 
 	return (
-		<div className="bg-background min-h-screen px-4 py-8 text-foreground sm:px-8">
+		<div className="bg-background px-4 py-8 text-foreground sm:px-8">
 			<div className="mx-auto max-w-4xl">
 				<FeedGroupedList
 					mode="all"
