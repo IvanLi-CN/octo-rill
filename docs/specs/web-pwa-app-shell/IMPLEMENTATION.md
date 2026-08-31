@@ -5,6 +5,7 @@
 - Implementation covers the main Vite web app only.
 - PWA shell uses generated static assets and a conservative same-origin Service Worker.
 - Manifest carries stable install identity, shortcuts, and screenshots sourced from stable app-shell evidence. Production postbuild rewrites only install icon URLs to content-hashed filenames derived from the approved PNG bytes.
+- The postbuild step hashes the clean Vite output before renaming each install icon, then rewrites the manifest and legacy fallback; it fails if the source and metadata sets diverge.
 - Chromium install metadata remains manifest-authoritative; the hashed `apple-touch-icon` link is retained only for newly created Apple Web Clips and other legacy consumers.
 - Version notice now surfaces both Service Worker refresh and native install prompt actions in one shared shell surface.
 - Anonymous boot now presents network-aware offline copy when the cached app shell loads but `/api/me` cannot be reached, and keeps login-only actions visibly unavailable until retry.
