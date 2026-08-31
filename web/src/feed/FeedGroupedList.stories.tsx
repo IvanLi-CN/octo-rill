@@ -381,6 +381,11 @@ export const FoldedHistoryPaginationContinuation: Story = {
 	},
 };
 
+export const FoldedHistoryPaginationPaused: Story = {
+	name: "Folded History Pagination Paused",
+	render: () => <FeedGroupedListContinuationPreview />,
+};
+
 export const HistoricalBriefInlineErrorVisible: Story = {
 	name: "Historical Brief Inline Error Visible",
 	render: () => (
