@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import type { ComponentProps } from "react";
+import { useState, type ComponentProps } from "react";
 import { expect, within } from "storybook/test";
 
 import { FeedGroupedList } from "@/feed/FeedGroupedList";
@@ -208,6 +208,96 @@ function FeedGroupedListPreview(props: {
 	);
 }
 
+const foldedHistoryBriefs: FeedGroupedListProps["briefs"] = [
+	{
+		id: "brief-folded-history-2026-05-07",
+		date: "2026-05-07",
+		window_start: "2026-05-06T16:00:00Z",
+		window_end: "2026-05-07T16:00:00Z",
+		effective_time_zone: "Asia/Shanghai",
+		effective_local_boundary: "00:00",
+		release_count: 2,
+		release_ids: ["folded-history-40", "folded-history-41"],
+		content_markdown: "## 历史日报\n\n日报已覆盖这一天的 Release。",
+		created_at: "2026-05-07T16:05:00Z",
+	},
+];
+
+function FeedGroupedListContinuationPreview() {
+	const initialItem = release("folded-history-40", {
+		ts: "2026-05-07T10:27:01Z",
+		title: "Folded history release 40",
+	});
+	const foldedItem = release("folded-history-41", {
+		ts: "2026-05-07T09:12:00Z",
+		title: "Folded history release 41",
+	});
+	const visibleItem = release("visible-history-43", {
+		ts: "2026-05-06T09:12:00Z",
+		title: "Visible history release 43",
+	});
+	const [items, setItems] = useState<FeedItem[]>([initialItem]);
+	const [nextCursor, setNextCursor] = useState<string | null>("page-2");
+	const [loadingMore, setLoadingMore] = useState(false);
+	const selectedLaneByKey = Object.fromEntries(
+		items.map((item) => [`${item.kind}:${item.id}`, "original"]),
+	) as Record<string, FeedLane>;
+
+	const loadMore = () => {
+		if (loadingMore || !nextCursor) return;
+		setLoadingMore(true);
+		window.setTimeout(() => {
+			if (nextCursor === "page-2") {
+				setItems((current) => [...current, foldedItem]);
+				setNextCursor("page-3");
+			} else {
+				setItems((current) => [...current, visibleItem]);
+				setNextCursor(null);
+			}
+			setLoadingMore(false);
+		}, 100);
+	};
+
+	return (
+		<div className="bg-background min-h-screen px-4 py-8 text-foreground sm:px-8">
+			<div className="mx-auto max-w-4xl">
+				<FeedGroupedList
+					mode="all"
+					items={items}
+					currentViewer={{
+						login: "IvanLi-CN",
+						avatar_url: "https://github.com/IvanLi-CN.png?size=96",
+						html_url: "https://github.com/IvanLi-CN",
+					}}
+					briefs={foldedHistoryBriefs}
+					dailyBoundaryLocal="00:00"
+					dailyBoundaryTimeZone="Asia/Shanghai"
+					dailyBoundaryUtcOffsetMinutes={480}
+					now={new Date("2026-05-08T12:00:00+08:00")}
+					error={null}
+					loadingInitial={false}
+					loadingMore={loadingMore}
+					hasMore={Boolean(nextCursor)}
+					translationInFlightKeys={new Set()}
+					translationAutoRetryingKeys={new Set()}
+					smartInFlightKeys={new Set()}
+					smartAutoRetryingKeys={new Set()}
+					registerItemRef={() => () => {}}
+					selectedLaneByKey={selectedLaneByKey}
+					onLoadMore={loadMore}
+					onRetryInitial={() => {}}
+					onSelectLane={() => {}}
+					onTranslateNow={() => {}}
+					onSmartNow={() => {}}
+					reactionBusyKeys={new Set()}
+					reactionErrorByKey={{}}
+					onToggleReaction={() => {}}
+				/>
+			</div>
+		</div>
+	);
+}
+
 const meta = {
 	title: "Feed/FeedGroupedList",
 	component: FeedGroupedListPreview,
@@ -271,6 +361,23 @@ export const SanitizedProductionMay8Boundary: Story = {
 		).map((element) => element.textContent?.replace(/\s+/g, " ").trim());
 		expect(labels).toContain("2026-05-07 · 1 条 Release");
 		expect(labels).toContain("2026-05-08 · 3 条 Release");
+	},
+};
+
+export const FoldedHistoryPaginationContinuation: Story = {
+	name: "Folded History Pagination Continuation",
+	render: () => <FeedGroupedListContinuationPreview />,
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const continueButton = canvas.getByRole("button", {
+			name: "继续加载历史动态",
+		});
+		await expect(continueButton).toBeVisible();
+		await continueButton.click();
+		await expect(canvas.getByText("Visible history release 43")).toBeVisible();
+		await expect(
+			canvas.queryByRole("button", { name: "继续加载历史动态" }),
+		).not.toBeInTheDocument();
 	},
 };
 

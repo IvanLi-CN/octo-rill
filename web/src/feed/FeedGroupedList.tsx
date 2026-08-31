@@ -1,4 +1,5 @@
 import {
+	ArrowDown,
 	ArrowUpRight,
 	ArrowUpToLine,
 	Copy,
@@ -13,6 +14,7 @@ import {
 	type ReactNode,
 	useCallback,
 	useEffect,
+	useLayoutEffect,
 	useMemo,
 	useRef,
 	useState,
@@ -86,6 +88,22 @@ type NewContentBoundary = {
 
 function keyOfFeedItem(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
+}
+
+function readVisibleFeedProjection(root: HTMLElement | null) {
+	if (!root) return "";
+
+	return JSON.stringify(
+		Array.from(root.querySelectorAll<HTMLElement>("[data-feed-group-id]")).map(
+			(group) => ({
+				id: group.dataset.feedGroupId ?? "",
+				view: group.dataset.feedGroupView ?? "",
+				itemKeys: Array.from(
+					group.querySelectorAll<HTMLElement>("[data-feed-item-key]"),
+				).map((item) => item.dataset.feedItemKey ?? ""),
+			}),
+		),
+	);
 }
 
 function isBoundaryOutsideViewport(element: HTMLElement) {
@@ -774,13 +792,26 @@ export function FeedGroupedList(
 		...feedCardProps
 	} = props;
 	const scopedFeed = Boolean(feedCardProps.currentScope);
+	const feedScopeSignature = useMemo(
+		() => JSON.stringify(feedCardProps.currentScope ?? null),
+		[feedCardProps.currentScope],
+	);
 	const visibleBriefs = useMemo(
 		() => (scopedFeed ? [] : briefs),
 		[briefs, scopedFeed],
 	);
 
 	const sentinelRef = useRef<HTMLDivElement | null>(null);
+	const feedRootRef = useRef<HTMLDivElement | null>(null);
 	const sentinelVisibleRef = useRef(false);
+	const visibleProjectionRef = useRef("");
+	const paginationAttemptRef = useRef<{ beforeProjection: string } | null>(
+		null,
+	);
+	const previousItemsRef = useRef<FeedItem[] | null>(null);
+	const wasLoadingMoreRef = useRef(false);
+	const [requiresExplicitContinuation, setRequiresExplicitContinuation] =
+		useState(false);
 	const [rawListGroupIds, setRawListGroupIds] = useState<Set<string>>(
 		() => new Set<string>(),
 	);
@@ -796,8 +827,82 @@ export function FeedGroupedList(
 		error?.phase === "initial" && items.length === 0 ? error : null;
 	const appendError = error?.phase === "append" ? error : null;
 
+	const requestLoadMore = useCallback(
+		(source: "auto" | "manual") => {
+			if (source === "auto" && requiresExplicitContinuation) return;
+			paginationAttemptRef.current = {
+				beforeProjection: visibleProjectionRef.current,
+			};
+			sentinelVisibleRef.current = true;
+			onLoadMore();
+		},
+		[onLoadMore, requiresExplicitContinuation],
+	);
+
 	useEffect(() => {
-		if (!hasMore || loadingInitial || loadingMore || appendError) return;
+		sentinelVisibleRef.current = false;
+		paginationAttemptRef.current = null;
+		setRequiresExplicitContinuation(false);
+	}, [feedScopeSignature, mode]);
+
+	useEffect(() => {
+		if (!loadingInitial) return;
+		sentinelVisibleRef.current = false;
+		paginationAttemptRef.current = null;
+		setRequiresExplicitContinuation(false);
+	}, [loadingInitial]);
+
+	useLayoutEffect(() => {
+		const nextProjection = readVisibleFeedProjection(feedRootRef.current);
+		const previousProjection = visibleProjectionRef.current;
+		const paginationAttempt = paginationAttemptRef.current;
+		const itemsReplaced =
+			previousItemsRef.current !== null && previousItemsRef.current !== items;
+
+		if (itemsReplaced && !paginationAttempt && !loadingMore) {
+			sentinelVisibleRef.current = false;
+			setRequiresExplicitContinuation(false);
+		}
+		if (
+			requiresExplicitContinuation &&
+			!loadingMore &&
+			!paginationAttempt &&
+			previousProjection !== "" &&
+			previousProjection !== nextProjection
+		) {
+			sentinelVisibleRef.current = false;
+			setRequiresExplicitContinuation(false);
+		}
+
+		if (wasLoadingMoreRef.current && !loadingMore && paginationAttempt) {
+			sentinelVisibleRef.current = false;
+			if (
+				!appendError &&
+				mode === "all" &&
+				hasMore &&
+				paginationAttempt.beforeProjection === nextProjection
+			) {
+				setRequiresExplicitContinuation(true);
+			} else {
+				setRequiresExplicitContinuation(false);
+			}
+			paginationAttemptRef.current = null;
+		}
+
+		visibleProjectionRef.current = nextProjection;
+		previousItemsRef.current = items;
+		wasLoadingMoreRef.current = loadingMore;
+	});
+
+	useEffect(() => {
+		if (
+			!hasMore ||
+			loadingInitial ||
+			loadingMore ||
+			appendError ||
+			requiresExplicitContinuation
+		)
+			return;
 		const el = sentinelRef.current;
 		if (!el) return;
 
@@ -805,8 +910,7 @@ export function FeedGroupedList(
 			(entries) => {
 				const isIntersecting = entries.some((entry) => entry.isIntersecting);
 				if (isIntersecting && !sentinelVisibleRef.current) {
-					sentinelVisibleRef.current = true;
-					onLoadMore();
+					requestLoadMore("auto");
 					return;
 				}
 				if (!isIntersecting) {
@@ -818,7 +922,14 @@ export function FeedGroupedList(
 
 		obs.observe(el);
 		return () => obs.disconnect();
-	}, [appendError, hasMore, loadingInitial, loadingMore, onLoadMore]);
+	}, [
+		appendError,
+		hasMore,
+		loadingInitial,
+		loadingMore,
+		requiresExplicitContinuation,
+		requestLoadMore,
+	]);
 
 	useEffect(() => {
 		if (appendError) {
@@ -941,7 +1052,7 @@ export function FeedGroupedList(
 		[items, newContentBoundaries],
 	);
 	return (
-		<div className="space-y-3 sm:space-y-4">
+		<div ref={feedRootRef} className="space-y-3 sm:space-y-4">
 			{blockingError ? (
 				<ErrorStatePanel
 					title="动态加载失败"
@@ -1274,12 +1385,35 @@ export function FeedGroupedList(
 							className="font-mono text-xs"
 							onClick={() => {
 								setLoadMoreBubbleOpen(false);
-								onLoadMore();
+								requestLoadMore("manual");
 							}}
 						>
 							继续加载
 						</Button>
 					</ErrorBubble>
+				</div>
+			) : null}
+
+			{!appendError && requiresExplicitContinuation && hasMore ? (
+				<div
+					className="flex justify-center pt-1"
+					data-feed-pagination-continuation="true"
+				>
+					<Button
+						type="button"
+						variant="outline"
+						size="sm"
+						className="font-mono text-xs"
+						disabled={loadingMore}
+						onClick={() => requestLoadMore("manual")}
+					>
+						{loadingMore ? (
+							<LoaderCircle className="size-3.5 animate-spin" />
+						) : (
+							<ArrowDown className="size-3.5" />
+						)}
+						继续加载历史动态
+					</Button>
 				</div>
 			) : null}
 
