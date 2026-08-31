@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useState, type ComponentProps } from "react";
+import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, within } from "storybook/test";
 
 import { FeedGroupedList } from "@/feed/FeedGroupedList";
@@ -223,6 +224,18 @@ const foldedHistoryBriefs: FeedGroupedListProps["briefs"] = [
 	},
 ];
 
+const FEED_VIEWPORTS = {
+	...INITIAL_VIEWPORTS,
+	feedMobile393: {
+		name: "Feed mobile 393x852",
+		styles: {
+			height: "852px",
+			width: "393px",
+		},
+		type: "mobile",
+	},
+} as const;
+
 function FeedGroupedListContinuationPreview() {
 	const initialItem = release("folded-history-40", {
 		ts: "2026-05-07T10:27:01Z",
@@ -259,8 +272,8 @@ function FeedGroupedListContinuationPreview() {
 	};
 
 	return (
-		<div className="bg-background min-h-screen px-4 py-8 text-foreground sm:px-8">
-			<div className="mx-auto max-w-4xl">
+		<div className="bg-slate-800 px-4 py-8 text-foreground sm:px-8">
+			<div className="mx-auto max-w-4xl rounded-2xl bg-background p-4">
 				<FeedGroupedList
 					mode="all"
 					items={items}
@@ -303,6 +316,9 @@ const meta = {
 	component: FeedGroupedListPreview,
 	parameters: {
 		layout: "fullscreen",
+		viewport: {
+			options: FEED_VIEWPORTS,
+		},
 		docs: {
 			description: {
 				component:
@@ -384,6 +400,26 @@ export const FoldedHistoryPaginationContinuation: Story = {
 export const FoldedHistoryPaginationPaused: Story = {
 	name: "Folded History Pagination Paused",
 	render: () => <FeedGroupedListContinuationPreview />,
+};
+
+export const FoldedHistoryPaginationPausedMobile: Story = {
+	name: "Folded History Pagination Paused Mobile",
+	globals: {
+		viewport: { value: "feedMobile393", isRotated: false },
+	},
+	render: () => <FeedGroupedListContinuationPreview />,
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const continueButton = canvas.getByRole("button", {
+			name: "继续加载历史动态",
+		});
+		await expect(continueButton).toBeVisible();
+		const buttonBounds = continueButton.getBoundingClientRect();
+		expect(buttonBounds.left).toBeGreaterThanOrEqual(0);
+		expect(buttonBounds.right).toBeLessThanOrEqual(
+			canvasElement.ownerDocument.documentElement.clientWidth,
+		);
+	},
 };
 
 export const HistoricalBriefInlineErrorVisible: Story = {
