@@ -17,54 +17,13 @@ test.beforeAll(() => {
 	});
 });
 
-async function installAnonymousApiMocks(page: Page) {
-	await page.route("**/api/**", async (route) => {
-		const req = route.request();
-		const url = new URL(req.url());
-
-		if (req.method() === "GET" && url.pathname === "/api/me") {
-			return route.fulfill({
-				status: 401,
-				contentType: "application/json",
-				body: JSON.stringify({
-					error: {
-						code: "unauthorized",
-						message: "unauthorized",
-					},
-				}),
-			});
-		}
-
-		if (req.method() === "GET" && url.pathname === "/api/version") {
-			return route.fulfill({
-				status: 200,
-				contentType: "application/json",
-				body: JSON.stringify({
-					ok: true,
-					version: "0.1.0",
-					source: "APP_EFFECTIVE_VERSION",
-				}),
-			});
-		}
-
-		return route.fulfill({
-			status: 404,
-			contentType: "application/json",
-			body: JSON.stringify({
-				error: {
-					code: "not_found",
-					message: `unhandled ${req.method()} ${url.pathname}`,
-				},
-			}),
-		});
-	});
-}
-
 type StaticPwaServer = {
 	origin: string;
 	setApiVersion: (version: string) => void;
 	setServiceWorkerRevision: (revision: number) => void;
 	getApiMeRequests: () => number;
+	getManifestRequests: () => number;
+	getInstallIconRequests: () => number;
 	getServiceWorkerRequests: () => number;
 	getSkipWaitingMessages: () => number;
 	close: () => Promise<void>;
@@ -85,10 +44,16 @@ const contentTypes = new Map([
 	[".woff2", "font/woff2"],
 ]);
 
+function isContentHashedPwaAssetPath(pathname: string) {
+	return /^\/pwa\/[^/]+\.[0-9a-f]{16}\.png$/.test(pathname);
+}
+
 async function startStaticPwaServer(): Promise<StaticPwaServer> {
 	let apiVersion = "0.1.0";
 	let serviceWorkerRevision = 1;
 	let apiMeRequests = 0;
+	let manifestRequests = 0;
+	let installIconRequests = 0;
 	let serviceWorkerRequests = 0;
 	let skipWaitingMessages = 0;
 
@@ -133,6 +98,12 @@ async function startStaticPwaServer(): Promise<StaticPwaServer> {
 
 			const filePath = resolveDistPath(requestUrl.pathname);
 			try {
+				if (requestUrl.pathname === "/manifest.webmanifest") {
+					manifestRequests += 1;
+				}
+				if (isContentHashedPwaAssetPath(requestUrl.pathname)) {
+					installIconRequests += 1;
+				}
 				let body = await readFile(filePath);
 				if (requestUrl.pathname === "/sw.js") {
 					serviceWorkerRequests += 1;
@@ -151,9 +122,11 @@ self.addEventListener("message", (event) => {
 					]);
 				}
 				response.writeHead(200, {
-					"cache-control": requestUrl.pathname.startsWith("/assets/")
-						? "public, max-age=31536000, immutable"
-						: "no-cache",
+					"cache-control":
+						requestUrl.pathname.startsWith("/assets/") ||
+						isContentHashedPwaAssetPath(requestUrl.pathname)
+							? "public, max-age=31536000, immutable"
+							: "no-cache",
 					"content-type":
 						contentTypes.get(path.extname(filePath)) ??
 						"application/octet-stream",
@@ -186,6 +159,12 @@ self.addEventListener("message", (event) => {
 		},
 		getApiMeRequests() {
 			return apiMeRequests;
+		},
+		getManifestRequests() {
+			return manifestRequests;
+		},
+		getInstallIconRequests() {
+			return installIconRequests;
 		},
 		getServiceWorkerRequests() {
 			return serviceWorkerRequests;
@@ -366,65 +345,127 @@ function cachedReleaseFeedItem() {
 test("app exposes installable PWA metadata without blocking anonymous login", async ({
 	page,
 }) => {
-	await installAnonymousApiMocks(page);
-	await page.goto("/");
+	const server = await startStaticPwaServer();
+	try {
+		await page.goto(server.origin);
 
-	await expect(page.locator('link[rel="manifest"]')).toHaveAttribute(
-		"href",
-		"/manifest.webmanifest",
-	);
-	await expect(page.locator('link[rel="apple-touch-icon"]')).toHaveAttribute(
-		"href",
-		"/pwa/apple-touch-icon.png",
-	);
-	await expect(page.locator('meta[name="theme-color"]')).toHaveAttribute(
-		"content",
-		"#0f172a",
-	);
-	await expect(
-		page.locator('meta[name="mobile-web-app-capable"]'),
-	).toHaveAttribute("content", "yes");
-	await expect(
-		page.locator('meta[name="apple-mobile-web-app-capable"]'),
-	).toHaveAttribute("content", "yes");
-	await expect(
-		page.locator('meta[name="apple-mobile-web-app-title"]'),
-	).toHaveAttribute("content", "OctoRill");
-	await expect(
-		page.locator('meta[name="apple-mobile-web-app-status-bar-style"]'),
-	).toHaveAttribute("content", "black-translucent");
-	await expect(
-		page.getByRole("link", { name: "使用 GitHub 登录" }),
-	).toBeVisible();
+		await expect(page.locator('link[rel="manifest"]')).toHaveAttribute(
+			"href",
+			"/manifest.webmanifest",
+		);
+		await expect(page.locator('link[rel="apple-touch-icon"]')).toHaveAttribute(
+			"href",
+			/^\/pwa\/apple-touch-icon\.[0-9a-f]{16}\.png$/,
+		);
+		await expect(page.locator('meta[name="theme-color"]')).toHaveAttribute(
+			"content",
+			"#0f172a",
+		);
+		await expect(
+			page.locator('meta[name="mobile-web-app-capable"]'),
+		).toHaveAttribute("content", "yes");
+		await expect(
+			page.locator('meta[name="apple-mobile-web-app-capable"]'),
+		).toHaveAttribute("content", "yes");
+		await expect(
+			page.locator('meta[name="apple-mobile-web-app-title"]'),
+		).toHaveAttribute("content", "OctoRill");
+		await expect(
+			page.locator('meta[name="apple-mobile-web-app-status-bar-style"]'),
+		).toHaveAttribute("content", "black-translucent");
+		await expect(
+			page.getByRole("link", { name: "使用 GitHub 登录" }),
+		).toBeVisible();
 
-	const manifestResponse = await page.request.get("/manifest.webmanifest");
-	expect(manifestResponse.ok()).toBe(true);
-	const manifest = (await manifestResponse.json()) as {
-		id?: string;
-		name?: string;
-		display?: string;
-		icons?: Array<{ src?: string; purpose?: string }>;
-		screenshots?: Array<{ src?: string; form_factor?: string }>;
-		shortcuts?: Array<{ name?: string; url?: string }>;
-	};
-	expect(manifest.id).toBe("/");
-	expect(manifest.name).toBe("OctoRill");
-	expect(manifest.display).toBe("standalone");
-	expect(
-		manifest.icons?.some((icon) => icon.purpose?.includes("maskable")),
-	).toBe(true);
-	expect(manifest.screenshots?.map((screenshot) => screenshot.src)).toEqual([
-		"/pwa/screenshots/dashboard-warm-skeleton-mobile-shell.png",
-		"/pwa/screenshots/app-shell-update-notice.png",
-	]);
-	expect(
-		manifest.screenshots?.map((screenshot) => screenshot.form_factor),
-	).toEqual(["narrow", "wide"]);
-	expect(manifest.shortcuts?.map((shortcut) => shortcut.url)).toEqual([
-		"/",
-		"/admin",
-		"/settings",
-	]);
+		const manifestResponse = await page.request.get(
+			`${server.origin}/manifest.webmanifest`,
+		);
+		expect(manifestResponse.ok()).toBe(true);
+		const manifest = (await manifestResponse.json()) as {
+			id?: string;
+			start_url?: string;
+			scope?: string;
+			name?: string;
+			display?: string;
+			icons?: Array<{ src?: string; purpose?: string }>;
+			screenshots?: Array<{ src?: string; form_factor?: string }>;
+			shortcuts?: Array<{ name?: string; url?: string }>;
+		};
+		expect(manifest.id).toBe("/");
+		expect(manifest.start_url).toBe("/");
+		expect(manifest.scope).toBe("/");
+		expect(manifest.name).toBe("OctoRill");
+		expect(manifest.display).toBe("standalone");
+		expect(manifest.icons?.map((icon) => icon.src)).toEqual(
+			expect.arrayContaining([
+				expect.stringMatching(/^\/pwa\/icon-192\.[0-9a-f]{16}\.png$/),
+				expect.stringMatching(/^\/pwa\/icon-512\.[0-9a-f]{16}\.png$/),
+				expect.stringMatching(/^\/pwa\/maskable-icon-512\.[0-9a-f]{16}\.png$/),
+			]),
+		);
+		expect(
+			manifest.icons?.some((icon) => icon.purpose?.includes("maskable")),
+		).toBe(true);
+		expect(manifest.screenshots?.map((screenshot) => screenshot.src)).toEqual([
+			"/pwa/screenshots/dashboard-warm-skeleton-mobile-shell.png",
+			"/pwa/screenshots/app-shell-update-notice.png",
+		]);
+		expect(
+			manifest.screenshots?.map((screenshot) => screenshot.form_factor),
+		).toEqual(["narrow", "wide"]);
+		expect(manifest.shortcuts?.map((shortcut) => shortcut.url)).toEqual([
+			"/",
+			"/admin",
+			"/settings",
+		]);
+	} finally {
+		await server.close();
+	}
+});
+
+test("install metadata stays network-revalidated outside the service worker precache", async ({
+	page,
+}) => {
+	const server = await startStaticPwaServer();
+	try {
+		await page.goto(server.origin);
+		await waitForServiceWorkerControl(page);
+
+		const manifestRequestsBefore = server.getManifestRequests();
+		const installIconRequestsBefore = server.getInstallIconRequests();
+		const iconUrl = await page.evaluate(async () => {
+			const manifestResponse = await fetch("/manifest.webmanifest", {
+				cache: "no-store",
+			});
+			const manifest = (await manifestResponse.json()) as {
+				icons?: Array<{ src?: string }>;
+			};
+			const icon = manifest.icons?.find((candidate) =>
+				candidate.src?.startsWith("/pwa/icon-192."),
+			);
+			if (!icon?.src) throw new Error("manifest did not declare icon-192");
+			await fetch(icon.src, { cache: "no-store" });
+			return icon.src;
+		});
+
+		expect(server.getManifestRequests()).toBeGreaterThan(
+			manifestRequestsBefore,
+		);
+		expect(server.getInstallIconRequests()).toBeGreaterThan(
+			installIconRequestsBefore,
+		);
+
+		const manifestHeaders = await page.request.get(
+			`${server.origin}/manifest.webmanifest`,
+		);
+		expect(manifestHeaders.headers()["cache-control"]).toBe("no-cache");
+		const iconHeaders = await page.request.get(`${server.origin}${iconUrl}`);
+		expect(iconHeaders.headers()["cache-control"]).toBe(
+			"public, max-age=31536000, immutable",
+		);
+	} finally {
+		await server.close();
+	}
 });
 
 test("production service worker falls back to cached app shell while bypassing private network paths", async ({

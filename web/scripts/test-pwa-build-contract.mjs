@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -98,31 +99,70 @@ for (const [url, expectedName] of expectedShortcuts) {
 }
 
 const expectedIcons = new Map([
-	["/pwa/icon-192.png", { width: 192, height: 192, maskable: false }],
-	["/pwa/icon-512.png", { width: 512, height: 512, maskable: false }],
-	["/pwa/maskable-icon-512.png", { width: 512, height: 512, maskable: true }],
+	["icon-192", { width: 192, height: 192, maskable: false }],
+	["icon-512", { width: 512, height: 512, maskable: false }],
+	["maskable-icon-512", { width: 512, height: 512, maskable: true }],
 ]);
 
-for (const [src, expected] of expectedIcons) {
-	const icon = manifest.icons.find((candidate) => candidate?.src === src);
-	assert(icon, `manifest includes ${src}`);
+for (const [basename, expected] of expectedIcons) {
+	const icon = manifest.icons.find((candidate) =>
+		candidate?.src?.startsWith(`/pwa/${basename}.`),
+	);
+	assert(icon, `manifest includes ${basename} install icon`);
+	assert.match(
+		icon.src,
+		new RegExp(`^/pwa/${basename}\\.[0-9a-f]{16}\\.png$`),
+		`${basename} icon URL is content hashed`,
+	);
 	assert.equal(icon.sizes, `${expected.width}x${expected.height}`);
 	assert.equal(icon.type, "image/png");
 	if (expected.maskable) {
 		assert(
 			typeof icon.purpose === "string" && icon.purpose.includes("maskable"),
-			`${src} must be maskable`,
+			`${basename} must be maskable`,
 		);
 	}
-	const actual = await readPngSize(path.join(distDir, src));
+	const iconBytes = await readFile(path.join(distDir, icon.src.slice(1)));
+	const digest = createHash("sha256")
+		.update(iconBytes)
+		.digest("hex")
+		.slice(0, 16);
+	assert.equal(
+		icon.src.match(/\.([0-9a-f]{16})\.png$/)?.[1],
+		digest,
+		`${basename} icon URL matches its file content`,
+	);
+	const actual = await readPngSize(path.join(distDir, icon.src.slice(1)));
 	assert.deepEqual(actual, {
 		width: expected.width,
 		height: expected.height,
 	});
 }
+assert.equal(
+	manifest.icons.length,
+	expectedIcons.size,
+	"manifest does not add a legacy icon as a Chromium install icon",
+);
 
+const appleTouchIconHref = indexHtml.match(
+	/rel="apple-touch-icon"[\s\S]*?href="([^"]+)"/,
+);
+assert(appleTouchIconHref, "index links a legacy Apple touch icon fallback");
+assert.match(
+	appleTouchIconHref[1],
+	/^\/pwa\/apple-touch-icon\.[0-9a-f]{16}\.png$/,
+	"legacy Apple touch icon URL is content hashed",
+);
+const appleTouchIconBytes = await readFile(
+	path.join(distDir, appleTouchIconHref[1].slice(1)),
+);
+assert.equal(
+	appleTouchIconHref[1].match(/\.([0-9a-f]{16})\.png$/)?.[1],
+	createHash("sha256").update(appleTouchIconBytes).digest("hex").slice(0, 16),
+	"legacy Apple touch icon URL matches its file content",
+);
 const appleTouchIcon = await readPngSize(
-	path.join(distDir, "pwa/apple-touch-icon.png"),
+	path.join(distDir, appleTouchIconHref[1].slice(1)),
 );
 assert.deepEqual(appleTouchIcon, { width: 180, height: 180 });
 
@@ -169,12 +209,17 @@ assert(Array.isArray(precache.urls), "precache urls must be an array");
 assert(precache.urls.includes("/"), "precache includes root app shell alias");
 assert(precache.urls.includes("/index.html"), "precache includes index.html");
 assert(
-	precache.urls.includes("/manifest.webmanifest"),
-	"precache includes manifest",
+	!precache.urls.includes("/manifest.webmanifest"),
+	"precache excludes manifest so installers can revalidate it",
 );
 assert(
-	precache.urls.includes("/pwa/icon-192.png"),
-	"precache includes install icon",
+	!precache.urls.some(
+		(url) =>
+			url.startsWith("/pwa/icon-") ||
+			url.startsWith("/pwa/maskable-icon-") ||
+			url.startsWith("/pwa/apple-touch-icon"),
+	),
+	"precache excludes install icons so browsers can fetch current metadata",
 );
 assert(
 	precache.urls.includes(
@@ -209,6 +254,16 @@ assert(serviceWorker.includes('pathname.startsWith("/auth/")'));
 assert(serviceWorker.includes('request.method === "GET"'));
 assert(serviceWorker.includes("url.origin === self.location.origin"));
 assert(serviceWorker.includes('event.request.mode === "navigate"'));
+assert(
+	!serviceWorker.includes("/manifest.webmanifest"),
+	"service worker does not pin the manifest",
+);
+assert(
+	!serviceWorker.includes("/pwa/icon-") &&
+		!serviceWorker.includes("/pwa/maskable-icon-") &&
+		!serviceWorker.includes("/pwa/apple-touch-icon"),
+	"service worker does not pin install icons",
+);
 assert(
 	serviceWorker.includes('worker.postMessage({ type: "SKIP_WAITING" })') ===
 		false,

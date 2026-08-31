@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
-import { readFile, readdir, writeFile } from "node:fs/promises";
+import { readFile, readdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const distDir = path.resolve(import.meta.dirname, "../dist");
+const manifestPath = path.join(distDir, "manifest.webmanifest");
+const indexPath = path.join(distDir, "index.html");
 const viteAssetExtensions = new Set([
 	".css",
 	".js",
@@ -14,13 +16,24 @@ const viteAssetExtensions = new Set([
 ]);
 const appShellAssetUrls = new Set([
 	"/index.html",
-	"/manifest.webmanifest",
 	"/favicon.ico",
 	"/favicon.svg",
 ]);
-const pwaAssetExtensions = new Set([".png"]);
+const pwaScreenshotExtensions = new Set([".png"]);
 const brandAssetExtensions = new Set([".svg"]);
 const reactionAssetExtensions = new Set([".svg"]);
+const installIconAssets = [
+	{ relativePath: "pwa/icon-192.png", manifestSrc: "/pwa/icon-192.png" },
+	{ relativePath: "pwa/icon-512.png", manifestSrc: "/pwa/icon-512.png" },
+	{
+		relativePath: "pwa/maskable-icon-512.png",
+		manifestSrc: "/pwa/maskable-icon-512.png",
+	},
+	{
+		relativePath: "pwa/apple-touch-icon.png",
+		legacyHtmlSrc: "/pwa/apple-touch-icon.png",
+	},
+];
 
 async function listFiles(dir) {
 	const entries = await readdir(dir, { withFileTypes: true });
@@ -43,6 +56,73 @@ function toUrl(filePath) {
 	return `/${path.relative(distDir, filePath).split(path.sep).join("/")}`;
 }
 
+async function contentHash(filePath) {
+	return createHash("sha256")
+		.update(await readFile(filePath))
+		.digest("hex")
+		.slice(0, 16);
+}
+
+async function contentAddressInstallIcons() {
+	return Promise.all(
+		installIconAssets.map(async (asset) => {
+			const sourcePath = path.join(distDir, asset.relativePath);
+			const extension = path.extname(sourcePath);
+			const basename = path.basename(sourcePath, extension);
+			const digest = await contentHash(sourcePath);
+			const hashedPath = path.join(
+				path.dirname(sourcePath),
+				`${basename}.${digest}${extension}`,
+			);
+			await rename(sourcePath, hashedPath);
+			return {
+				...asset,
+				hashedPath,
+				hashedUrl: toUrl(hashedPath),
+			};
+		}),
+	);
+}
+
+const contentAddressedInstallIcons = await contentAddressInstallIcons();
+const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+if (!Array.isArray(manifest.icons)) {
+	throw new Error("PWA manifest must declare install icons");
+}
+
+const manifestIconAssets = new Map(
+	contentAddressedInstallIcons
+		.filter((asset) => asset.manifestSrc)
+		.map((asset) => [asset.manifestSrc, asset]),
+);
+const rewrittenManifestIcons = new Set();
+for (const icon of manifest.icons) {
+	const asset = manifestIconAssets.get(icon?.src);
+	if (!asset) continue;
+	icon.src = asset.hashedUrl;
+	rewrittenManifestIcons.add(asset.manifestSrc);
+}
+if (rewrittenManifestIcons.size !== manifestIconAssets.size) {
+	throw new Error("PWA manifest icons do not match the install icon assets");
+}
+await writeFile(manifestPath, `${JSON.stringify(manifest, null, "\t")}\n`);
+
+const legacyAppleTouchIcon = contentAddressedInstallIcons.find(
+	(asset) => asset.legacyHtmlSrc,
+);
+if (!legacyAppleTouchIcon) {
+	throw new Error("PWA build must include a legacy Apple touch icon fallback");
+}
+const indexHtml = await readFile(indexPath, "utf8");
+const updatedIndexHtml = indexHtml.replace(
+	/\/pwa\/apple-touch-icon(?:\.[0-9a-f]{16})?\.png/g,
+	legacyAppleTouchIcon.hashedUrl,
+);
+if (updatedIndexHtml === indexHtml) {
+	throw new Error("PWA index must link the legacy Apple touch icon fallback");
+}
+await writeFile(indexPath, updatedIndexHtml);
+
 function isAllowedPrecacheUrl(url) {
 	const extension = path.extname(url);
 	if (appShellAssetUrls.has(url)) {
@@ -52,7 +132,10 @@ function isAllowedPrecacheUrl(url) {
 		return viteAssetExtensions.has(extension);
 	}
 	if (url.startsWith("/pwa/")) {
-		return pwaAssetExtensions.has(extension);
+		return (
+			url.startsWith("/pwa/screenshots/") &&
+			pwaScreenshotExtensions.has(extension)
+		);
 	}
 	if (url.startsWith("/brand/")) {
 		return brandAssetExtensions.has(extension);
@@ -80,7 +163,7 @@ if (!files.some((file) => file.url === "/index.html")) {
 
 const hash = createHash("sha256");
 hash.update("/\n");
-hash.update(await readFile(path.join(distDir, "index.html")));
+hash.update(await readFile(indexPath));
 hash.update("\n");
 for (const file of files) {
 	hash.update(file.url);
