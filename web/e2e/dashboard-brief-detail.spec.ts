@@ -107,11 +107,21 @@ async function installDashboardBriefMocks(
 	page: Page,
 	options?: {
 		feedItems?: unknown[];
+		feedPage?: (cursor: string | null) => {
+			items: unknown[];
+			nextCursor: string | null;
+		};
+		feedPageFailureCursors?: Array<string | null>;
 		briefDetailFailureIds?: Set<string>;
 	},
 ) {
 	let summaryRequests = 0;
 	const detailRequests: string[] = [];
+	const feedRequests: Array<string | null> = [];
+	const feedPageFailures = new Map<string | null, number>();
+	for (const cursor of options?.feedPageFailureCursors ?? []) {
+		feedPageFailures.set(cursor, (feedPageFailures.get(cursor) ?? 0) + 1);
+	}
 	const briefDetailFailures = new Set(options?.briefDetailFailureIds ?? []);
 
 	await page.route("**/api/**", async (route) => {
@@ -135,6 +145,24 @@ async function installDashboardBriefMocks(
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {
+			const cursor = url.searchParams.get("cursor");
+			feedRequests.push(cursor);
+			const remainingFailures = feedPageFailures.get(cursor) ?? 0;
+			if (remainingFailures > 0) {
+				feedPageFailures.set(cursor, remainingFailures - 1);
+				return json(
+					route,
+					{ error: { code: "feed_page_failed", message: "page failed" } },
+					500,
+				);
+			}
+			if (options?.feedPage) {
+				const page = options.feedPage(cursor);
+				return json(route, {
+					items: page.items,
+					next_cursor: page.nextCursor,
+				});
+			}
 			return json(route, {
 				items: options?.feedItems ?? [],
 				next_cursor: null,
@@ -208,10 +236,202 @@ async function installDashboardBriefMocks(
 	});
 
 	return {
+		getFeedRequests: () => feedRequests.slice(),
 		getSummaryRequests: () => summaryRequests,
 		getDetailRequests: () => detailRequests.slice(),
 	};
 }
+
+test("dashboard pauses pagination when an appended page is fully folded into a brief", async ({
+	page,
+}) => {
+	await page.addInitScript(() => {
+		window.localStorage.clear();
+	});
+
+	const release40 = makeReleaseFeedItem({
+		id: "40",
+		ts: "2026-04-29T10:27:01Z",
+		tag: "v40",
+		title: "Release 40",
+	});
+	const release41 = makeReleaseFeedItem({
+		id: "41",
+		ts: "2026-04-29T09:12:00Z",
+		tag: "v41",
+		title: "Release 41",
+	});
+	const release43 = makeReleaseFeedItem({
+		id: "43",
+		ts: "2026-04-28T09:12:00Z",
+		tag: "v43",
+		title: "Release 43",
+	});
+
+	const tracker = await installDashboardBriefMocks(page, {
+		feedPage: (cursor) => {
+			if (cursor === null) {
+				return { items: [release40], nextCursor: "cursor-page-2" };
+			}
+			if (cursor === "cursor-page-2") {
+				return { items: [release41], nextCursor: "cursor-page-3" };
+			}
+			return { items: [release43], nextCursor: null };
+		},
+	});
+
+	await page.goto("/");
+
+	await expect(
+		page.locator(
+			'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-29"]',
+		),
+	).toBeVisible({ timeout: 15_000 });
+	await expect.poll(() => tracker.getFeedRequests()).toContain("cursor-page-2");
+	await expect(
+		page.getByRole("button", { name: "继续加载历史动态" }),
+	).toBeVisible({ timeout: 15_000 });
+	await expect.poll(tracker.getFeedRequests).toEqual([null, "cursor-page-2"]);
+
+	await page.getByRole("button", { name: "继续加载历史动态" }).click();
+	await expect(page.locator('[data-feed-item-key="release:43"]')).toBeVisible();
+	await expect
+		.poll(tracker.getFeedRequests)
+		.toEqual([null, "cursor-page-2", "cursor-page-3"]);
+	await expect(
+		page.getByRole("button", { name: "继续加载历史动态" }),
+	).toHaveCount(0);
+});
+
+test("dashboard resumes pagination when folded history switches to list view", async ({
+	page,
+}) => {
+	await page.addInitScript(() => {
+		window.localStorage.clear();
+	});
+
+	const release40 = makeReleaseFeedItem({
+		id: "40",
+		ts: "2026-04-29T10:27:01Z",
+		tag: "v40",
+		title: "Release 40",
+	});
+	const release41 = makeReleaseFeedItem({
+		id: "41",
+		ts: "2026-04-29T09:12:00Z",
+		tag: "v41",
+		title: "Release 41",
+	});
+	const release43 = makeReleaseFeedItem({
+		id: "43",
+		ts: "2026-04-28T09:12:00Z",
+		tag: "v43",
+		title: "Release 43",
+	});
+
+	const tracker = await installDashboardBriefMocks(page, {
+		feedPage: (cursor) => {
+			if (cursor === null) {
+				return { items: [release40], nextCursor: "cursor-page-2" };
+			}
+			if (cursor === "cursor-page-2") {
+				return { items: [release41], nextCursor: "cursor-page-3" };
+			}
+			return { items: [release43], nextCursor: null };
+		},
+	});
+
+	await page.goto("/");
+
+	const historicalGroup = page.locator(
+		'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-29"]',
+	);
+	await expect(historicalGroup).toBeVisible({ timeout: 15_000 });
+	await expect.poll(() => tracker.getFeedRequests()).toContain("cursor-page-2");
+	await expect(
+		page.getByRole("button", { name: "继续加载历史动态" }),
+	).toBeVisible({ timeout: 15_000 });
+
+	await historicalGroup.getByRole("button", { name: "列表" }).click();
+	await expect(
+		historicalGroup.locator('[data-feed-item-key="release:40"]'),
+	).toBeVisible();
+	await expect(
+		historicalGroup.locator('[data-feed-item-key="release:41"]'),
+	).toBeVisible();
+	await expect(page.locator('[data-feed-item-key="release:43"]')).toBeVisible();
+	await expect
+		.poll(tracker.getFeedRequests)
+		.toEqual([null, "cursor-page-2", "cursor-page-3"]);
+});
+
+test("dashboard retries an appended page before entering explicit continuation", async ({
+	page,
+}) => {
+	await page.addInitScript(() => {
+		window.localStorage.clear();
+	});
+
+	const release40 = makeReleaseFeedItem({
+		id: "40",
+		ts: "2026-04-29T10:27:01Z",
+		tag: "v40",
+		title: "Release 40",
+	});
+	const release41 = makeReleaseFeedItem({
+		id: "41",
+		ts: "2026-04-29T09:12:00Z",
+		tag: "v41",
+		title: "Release 41",
+	});
+	const release43 = makeReleaseFeedItem({
+		id: "43",
+		ts: "2026-04-28T09:12:00Z",
+		tag: "v43",
+		title: "Release 43",
+	});
+
+	const tracker = await installDashboardBriefMocks(page, {
+		feedPageFailureCursors: ["cursor-page-2", "cursor-page-2"],
+		feedPage: (cursor) => {
+			if (cursor === null) {
+				return { items: [release40], nextCursor: "cursor-page-2" };
+			}
+			if (cursor === "cursor-page-2") {
+				return { items: [release41], nextCursor: "cursor-page-3" };
+			}
+			return { items: [release43], nextCursor: null };
+		},
+	});
+
+	await page.goto("/");
+	await expect(page.getByRole("button", { name: "继续加载" })).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect
+		.poll(tracker.getFeedRequests)
+		.toEqual([null, "cursor-page-2", "cursor-page-2"]);
+
+	await page.getByRole("button", { name: "继续加载" }).click();
+	await expect(
+		page.getByRole("button", { name: "继续加载历史动态" }),
+	).toBeVisible({ timeout: 15_000 });
+	await expect
+		.poll(tracker.getFeedRequests)
+		.toEqual([null, "cursor-page-2", "cursor-page-2", "cursor-page-2"]);
+
+	await page.getByRole("button", { name: "继续加载历史动态" }).click();
+	await expect(page.locator('[data-feed-item-key="release:43"]')).toBeVisible();
+	await expect
+		.poll(tracker.getFeedRequests)
+		.toEqual([
+			null,
+			"cursor-page-2",
+			"cursor-page-2",
+			"cursor-page-2",
+			"cursor-page-3",
+		]);
+});
 
 test("brief deep link canonicalizes to /briefs and list selection uses replace", async ({
 	page,
