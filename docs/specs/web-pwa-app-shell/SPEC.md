@@ -24,6 +24,7 @@ The PWA layer is an enhancement around the existing React + Vite app shell and A
 
 - `manifest.webmanifest` must use a stable root `id`, `display: standalone`, root `scope`, root `start_url`, OctoRill name metadata, categories, install icons including a maskable 512px PNG, screenshots, and shortcuts for primary app destinations.
 - Production install icon URLs must include a content hash derived from the served PNG bytes. When icon content changes, the manifest must publish a new URL while `id`, `scope`, and `start_url` remain unchanged.
+- The content hash must be computed from the production PNG bytes that the server will serve; a changed icon must never reuse an old hashed URL or its immutable cache identity.
 - Where a browser supports manifest-driven installation, the manifest is the authoritative install metadata source. The `apple-touch-icon` link is retained only as an explicitly legacy Apple Web Clip fallback and must not be treated as a second Chromium install icon source.
 - The Service Worker must ignore non-GET requests, cross-origin requests, `/api/**`, and `/auth/**`.
 - Document navigations should prefer the network and fall back to the cached app shell only when the network is unavailable.
