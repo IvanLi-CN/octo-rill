@@ -881,7 +881,9 @@ fn apply_static_site_cache_headers(
         "no-store, no-cache, must-revalidate"
     } else if path == "/manifest.webmanifest" {
         "no-cache"
-    } else if status.is_success() && path.starts_with("/assets/") {
+    } else if status.is_success()
+        && (path.starts_with("/assets/") || is_hashed_pwa_asset_path(path))
+    {
         "public, max-age=31536000, immutable"
     } else {
         "no-cache"
@@ -891,6 +893,27 @@ fn apply_static_site_cache_headers(
         header::CACHE_CONTROL,
         HeaderValue::from_static(cache_control),
     );
+}
+
+fn is_hashed_pwa_asset_path(path: &str) -> bool {
+    let Some(file_name) = path.strip_prefix("/pwa/") else {
+        return false;
+    };
+    let Some(file_name) = file_name.rsplit('/').next() else {
+        return false;
+    };
+    let Some(stem) = file_name.strip_suffix(".png") else {
+        return false;
+    };
+    let Some((basename, digest)) = stem.rsplit_once('.') else {
+        return false;
+    };
+
+    !basename.is_empty()
+        && digest.len() == 16
+        && digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
 }
 
 fn looks_like_static_asset_path(path: &str) -> bool {
@@ -973,8 +996,9 @@ mod tests {
     use super::{
         AppConfig, SESSION_COOKIE_MAX_AGE_SECS, SameSite, accepts_html_document, api_health,
         api_version, apply_no_store_headers, attach_static_site_routes, build_session_cookie_name,
-        build_sqlite_connect_options, build_sqlite_pool_options, looks_like_static_asset_path,
-        read_sqlite_runtime_pragmas, session_inactivity_expiry, should_serve_spa_shell,
+        build_sqlite_connect_options, build_sqlite_pool_options, is_hashed_pwa_asset_path,
+        looks_like_static_asset_path, read_sqlite_runtime_pragmas, session_inactivity_expiry,
+        should_serve_spa_shell,
     };
     use axum::{
         Router,
@@ -1599,6 +1623,23 @@ mod tests {
     }
 
     #[test]
+    fn only_content_hashed_pwa_assets_are_immutable_candidates() {
+        assert!(is_hashed_pwa_asset_path(
+            "/pwa/icon-192.0123456789abcdef.png"
+        ));
+        assert!(is_hashed_pwa_asset_path(
+            "/pwa/apple-touch-icon.abcdef0123456789.png"
+        ));
+        assert!(!is_hashed_pwa_asset_path("/pwa/icon-192.png"));
+        assert!(!is_hashed_pwa_asset_path(
+            "/pwa/icon-192.0123456789abcde.png"
+        ));
+        assert!(!is_hashed_pwa_asset_path(
+            "/pwa/icon-192.0123456789abcdeg.png"
+        ));
+    }
+
+    #[test]
     fn spa_shell_fallback_only_applies_to_html_navigation_paths() {
         let html_headers = HeaderMap::from_iter([(
             header::ACCEPT,
@@ -1644,6 +1685,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(fixture_root.join("assets")).expect("create assets dir");
+        fs::create_dir_all(fixture_root.join("pwa")).expect("create pwa dir");
         fs::write(
             fixture_root.join("index.html"),
             "<!doctype html><html><body>spa-shell</body></html>",
@@ -1661,6 +1703,13 @@ mod tests {
             r#"{"name":"OctoRill"}"#,
         )
         .expect("write manifest");
+        fs::write(
+            fixture_root.join("pwa/icon-192.0123456789abcdef.png"),
+            "hashed-icon-ok",
+        )
+        .expect("write hashed icon");
+        fs::write(fixture_root.join("pwa/icon-192.png"), "stable-icon-ok")
+            .expect("write stable icon");
 
         let app = attach_static_site_routes(
             Router::new()
@@ -1688,6 +1737,13 @@ mod tests {
             .await
             .expect("request root");
         assert_eq!(root_response.status(), StatusCode::OK);
+        assert_eq!(
+            root_response
+                .headers()
+                .get(reqwest::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, no-cache, must-revalidate")
+        );
         assert!(
             root_response
                 .text()
@@ -1805,6 +1861,34 @@ mod tests {
         assert_eq!(manifest_response.status(), StatusCode::OK);
         assert_eq!(
             manifest_response
+                .headers()
+                .get(reqwest::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-cache")
+        );
+
+        let hashed_icon_response = client
+            .get(format!("http://{addr}/pwa/icon-192.0123456789abcdef.png"))
+            .send()
+            .await
+            .expect("request hashed icon");
+        assert_eq!(hashed_icon_response.status(), StatusCode::OK);
+        assert_eq!(
+            hashed_icon_response
+                .headers()
+                .get(reqwest::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=31536000, immutable")
+        );
+
+        let stable_icon_response = client
+            .get(format!("http://{addr}/pwa/icon-192.png"))
+            .send()
+            .await
+            .expect("request stable icon");
+        assert_eq!(stable_icon_response.status(), StatusCode::OK);
+        assert_eq!(
+            stable_icon_response
                 .headers()
                 .get(reqwest::header::CACHE_CONTROL)
                 .and_then(|value| value.to_str().ok()),

@@ -11,3 +11,4 @@
 - 2026-05-12: Hardened offline anonymous boot and install metadata so a cached app shell surfaces network unavailability explicitly while preserving private API/auth bypass rules.
 - 2026-05-13: Split authenticated offline Dashboard into cached-content and no-cache states, and kept warm feed content available across lazy route loading and auth reconciliation.
 - 2026-07-08: Added Dashboard React Query persistence as a whitelisted 1 hour server-state cache for PWA responsiveness while keeping Service Worker private API/auth bypass rules unchanged.
+- 2026-09-01: Fixed installed-app icon delivery by content-addressing production icon URLs, keeping manifest identity stable, excluding install metadata from Service Worker precache, and documenting Chromium versus Apple Web Clip update limits.

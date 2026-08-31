@@ -5,7 +5,12 @@
     <link rel="icon" type="image/svg+xml" href="%BASE_URL%favicon.svg" />
     <link rel="alternate icon" href="%BASE_URL%favicon.ico" sizes="32x32" />
     <link rel="manifest" href="%BASE_URL%manifest.webmanifest" />
-    <link rel="apple-touch-icon" href="%BASE_URL%pwa/apple-touch-icon.png" />
+    <!-- Supported PWA installers use the manifest; this link is only the legacy Apple Web Clip fallback. -->
+    <link
+      rel="apple-touch-icon"
+      sizes="180x180"
+      href="%BASE_URL%pwa/apple-touch-icon.png"
+    />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0f172a" />
     <meta name="mobile-web-app-capable" content="yes" />
