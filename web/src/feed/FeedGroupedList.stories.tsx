@@ -237,6 +237,10 @@ const FEED_VIEWPORTS = {
 } as const;
 
 function FeedGroupedListContinuationPreview() {
+	const currentItem = release("current-history-39", {
+		ts: "2026-05-08T10:00:00Z",
+		title: "Current history release 39",
+	});
 	const initialItem = release("folded-history-40", {
 		ts: "2026-05-07T10:27:01Z",
 		title: "Folded history release 40",
@@ -249,7 +253,7 @@ function FeedGroupedListContinuationPreview() {
 		ts: "2026-05-06T09:12:00Z",
 		title: "Visible history release 43",
 	});
-	const [items, setItems] = useState<FeedItem[]>([initialItem]);
+	const [items, setItems] = useState<FeedItem[]>([currentItem, initialItem]);
 	const [nextCursor, setNextCursor] = useState<string | null>("page-2");
 	const [loadingMore, setLoadingMore] = useState(false);
 	const selectedLaneByKey = Object.fromEntries(
