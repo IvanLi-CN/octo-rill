@@ -107,6 +107,20 @@ export function FeedReadableSectionList(props: {
 	const [listSections, setListSections] = useState<Set<string>>(
 		() => new Set(),
 	);
+	const [generatingDate, setGeneratingDate] = useState<string | null>(null);
+	const handleGenerateBrief = useCallback(
+		async (date: string) => {
+			if (!onGenerateBriefForDate || generatingDate !== null) return;
+			setGeneratingDate(date);
+			try {
+				await onGenerateBriefForDate(date);
+				await onRetry();
+			} finally {
+				setGeneratingDate(null);
+			}
+		},
+		[generatingDate, onGenerateBriefForDate, onRetry],
+	);
 
 	useEffect(() => {
 		requestVisibleRef.current = false;
@@ -376,7 +390,8 @@ export function FeedReadableSectionList(props: {
 									variant="ghost"
 									size="sm"
 									className={actionClass}
-									onClick={() => void onGenerateBriefForDate(sectionDate)}
+									disabled={generatingDate === sectionDate}
+									onClick={() => void handleGenerateBrief(sectionDate)}
 								>
 									<Newspaper className="size-4" />
 									生成日报
