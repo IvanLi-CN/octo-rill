@@ -40,6 +40,7 @@ ALLOWED_CHANGED_PATHS = {
     "docs/specs/ci-wall-clock-acceptance/IMPLEMENTATION.md",
     "docs/specs/ci-wall-clock-acceptance/HISTORY.md",
     "docs/repository-governance.md",
+    "web/e2e/admin-jobs.spec.ts",
 }
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
