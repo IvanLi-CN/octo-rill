@@ -36,6 +36,35 @@ The expected workflow owners are:
 - `CI Pipeline` owns lint, backend, frontend, worktree bootstrap, and release build checks;
 - `Review Policy` owns `Review Policy Gate`.
 
+## Controlled CI performance acceptance
+
+`CI Pipeline` exposes a manual `workflow_dispatch` boolean input named
+`ci_performance_acceptance`. It defaults to `false`; only an explicitly enabled
+dispatch runs the acceptance path. Normal pull request, merge-group, and
+`main` push triggers remain unchanged, including the `Build (Release)` required
+check name.
+
+The acceptance driver uses two owner-prepared refs whose commit SHAs are
+resolved immediately before dispatch. The control ref contains only the
+dispatch-input change; the candidate ref is derived from control and contains
+the approved CI workflow, contract-checker, offline-fixture, driver, test, and
+documentation paths. The driver rejects mutable or unexpected refs, retries,
+concurrent runs, unexpected SHAs, failed required jobs, and candidate runs
+without a successful Docker runtime smoke step.
+
+Each pair is dispatched serially in alternating control/candidate order for ten
+pairs. It records the workflow run, jobs, and terminal timestamps as JSON. The
+candidate passes only when all ten runs succeed, candidate median wall-clock is
+at most 720 seconds, nearest-rank P90 is at most 840 seconds, and candidate
+median is at most 75% of control median. The measurement interval is
+`run_started_at` through `updated_at`; median uses the average of sorted values
+five and six, and P90 uses sorted value nine.
+
+Preparing/pushing the temporary control ref, dispatching the acceptance runs,
+and deleting temporary refs are separately authorized operational actions. They
+must use synthetic credentials and temporary SQLite only; no production data,
+secrets, or external services are permitted.
+
 ## Pull request workflow
 
 Feature work starts on a topic branch and lands through a pull request targeting `main`.

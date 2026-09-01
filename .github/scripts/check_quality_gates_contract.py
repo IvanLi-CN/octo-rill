@@ -603,6 +603,80 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
     require(permissions.get("contents") == "read", "ci.yml.permissions.contents must stay read")
     require("statuses" not in permissions, "ci.yml.permissions.statuses must stay unset")
 
+    dispatch = event_config(workflow, "workflow_dispatch", "ci.yml")
+    dispatch_inputs = require_mapping(dispatch.get("inputs"), "ci.yml.on.workflow_dispatch.inputs")
+    performance_input = require_mapping(
+        dispatch_inputs.get("ci_performance_acceptance"),
+        "ci.yml.on.workflow_dispatch.inputs.ci_performance_acceptance",
+    )
+    require(performance_input.get("type") == "boolean", "ci.yml: ci_performance_acceptance must be a boolean input")
+    require(performance_input.get("required") is False, "ci.yml: ci_performance_acceptance must be optional")
+    require(performance_input.get("default") is False, "ci.yml: ci_performance_acceptance must default to false")
+
+    build_job = job_config(workflow, "build", "ci.yml")
+    require("needs" not in build_job, "ci.yml.jobs.build must not wait on unrelated jobs")
+    build_if = build_job.get("if")
+    require(isinstance(build_if, str), "ci.yml.jobs.build.if must be declared")
+    require(
+        "github.event_name == 'workflow_dispatch'" in build_if
+        and "inputs.ci_performance_acceptance == true" in build_if,
+        "ci.yml.jobs.build.if must gate manual acceptance on ci_performance_acceptance",
+    )
+    build_env = require_mapping(build_job.get("env"), "ci.yml.jobs.build.env")
+    require(
+        build_env.get("CI_SMOKE_VERSION") == "ci-${{ github.run_id }}-${{ github.run_attempt }}",
+        "ci.yml.jobs.build.env.CI_SMOKE_VERSION must be run-unique",
+    )
+    require(
+        build_env.get("CI_SMOKE_IMAGE") == "octo-rill-ci-smoke:${{ github.run_id }}-${{ github.run_attempt }}",
+        "ci.yml.jobs.build.env.CI_SMOKE_IMAGE must be run-unique",
+    )
+    build_steps = build_job.get("steps")
+    require(isinstance(build_steps, list), "ci.yml.jobs.build.steps must be a list")
+    for index, raw_step in enumerate(build_steps):
+        if not isinstance(raw_step, dict):
+            continue
+        step_text = str(raw_step.get("run", ""))
+        require(
+            not ("cargo build" in step_text and "--release" in step_text),
+            f"ci.yml.jobs.build.steps[{index}] must not repeat a host release compilation",
+        )
+    docker_step = uses_step_config(
+        build_job,
+        "Build Docker smoke image (linux/amd64)",
+        "docker/build-push-action@v6",
+        "ci.yml.jobs.build",
+    )
+    docker_with = require_mapping(
+        docker_step.get("with"),
+        "ci.yml.jobs.build.steps['Build Docker smoke image (linux/amd64)'].with",
+    )
+    require(docker_with.get("load") is True, "ci.yml: Docker smoke build must load the image")
+    require(docker_with.get("push") is False, "ci.yml: Docker smoke build must not push")
+    require(docker_with.get("platforms") == "linux/amd64", "ci.yml: Docker smoke platform drifted")
+    require(docker_with.get("tags") == "${{ env.CI_SMOKE_IMAGE }}", "ci.yml: Docker smoke image tag must use CI_SMOKE_IMAGE")
+    require(
+        "APP_EFFECTIVE_VERSION=${{ env.CI_SMOKE_VERSION }}" in str(docker_with.get("build-args", "")),
+        "ci.yml: Docker smoke build must embed CI_SMOKE_VERSION",
+    )
+    smoke_step = step_config(build_job, "Run Docker release smoke", "ci.yml.jobs.build")
+    require_no_if(smoke_step, "ci.yml.jobs.build.steps['Run Docker release smoke']")
+    require_fail_closed(smoke_step, "ci.yml.jobs.build.steps['Run Docker release smoke']")
+    smoke_run = step_run(smoke_step, "ci.yml.jobs.build.steps['Run Docker release smoke']")
+    for required_fragment in (
+        "mktemp -d",
+        "trap cleanup EXIT",
+        "docker run -d --rm",
+        "DATABASE_URL=sqlite::memory:",
+        "OCTORILL_ENCRYPTION_KEY_BASE64",
+        "/api/health",
+        "jq -e",
+        ".ok == true and .version == $version",
+        "docker rm -f",
+        "rm -rf",
+    ):
+        require(required_fragment in smoke_run, f"ci.yml: Docker runtime smoke must contain {required_fragment!r}")
+
     lint_job = named_job_config(workflow, "lint", expected_jobs, "ci.yml")
     require_no_if(lint_job, "ci.yml.jobs.lint")
     require_fail_closed(lint_job, "ci.yml.jobs.lint")
@@ -620,7 +694,7 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
     trusted_run = str(trusted_step.get("run", ""))
     require("base_branch=" in trusted_run, "ci.yml.jobs.lint: trusted-source base_branch resolution drifted")
     require("git fetch --no-tags --depth=1 origin" in trusted_run, "ci.yml.jobs.lint: trusted-source fetch drifted")
-    require("git show \"${source_ref}:${path}\"" in trusted_run, "ci.yml.jobs.lint: trusted-source materialization drifted")
+    require("git show \"${source_ref}:$path\"" in trusted_run, "ci.yml.jobs.lint: trusted-source materialization drifted")
     require(
         "bootstrap-current-branch" not in trusted_run and "using current branch for bootstrap rollout only" not in trusted_run,
         "ci.yml.jobs.lint: bootstrap fallback must stay disabled",
@@ -668,7 +742,9 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
     require_fail_closed(self_tests, "ci.yml.jobs.lint.steps['Quality gates self-tests']")
     run = str(self_tests.get("run", ""))
     require(
-        "test-quality-gates-contract.sh" in run and "test-live-quality-gates.sh" in run,
+        "test-quality-gates-contract.sh" in run
+        and "test-ci-performance-acceptance.sh" in run
+        and "test-live-quality-gates.sh" in run,
         "ci.yml.jobs.lint: self-tests step drifted",
     )
 

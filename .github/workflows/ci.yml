@@ -15,6 +15,12 @@ on:
     types:
       - checks_requested
   workflow_dispatch:
+    inputs:
+      ci_performance_acceptance:
+        description: Run the controlled CI performance acceptance build
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.event.action == 'edited' && format('metadata-{0}', github.run_id) || github.ref }}
@@ -189,12 +195,14 @@ jobs:
             .github/scripts/release_pr_comment.py \
             .github/scripts/metadata_gate.py \
             .github/scripts/check_live_quality_gates.py \
-            .github/scripts/check_quality_gates_contract.py
+            .github/scripts/check_quality_gates_contract.py \
+            .github/scripts/ci_performance_acceptance.py
 
       - name: Resolve trusted quality-gates sources
         id: trusted-quality-gates
         shell: bash
         run: |
+          # shellcheck disable=SC2295
           set -euo pipefail
           trusted_root="$RUNNER_TEMP/trusted-quality-gates"
           mkdir -p "$trusted_root/.github/scripts"
@@ -215,7 +223,7 @@ jobs:
               echo "::error::merge_group ref ${GITHUB_REF} must use the gh-readonly-queue/<base_branch>/... format."
               exit 1
             fi
-            queue_ref="${GITHUB_REF#${queue_prefix}}"
+            queue_ref="${GITHUB_REF#"$queue_prefix"}"
             if [[ "${queue_ref}" != */pr-* ]]; then
               echo "::error::Unable to derive the merge_group base branch from ${GITHUB_REF}."
               exit 1
@@ -236,7 +244,7 @@ jobs:
             fi
             event_name="${{ github.event_name }}"
             for path in "${paths[@]}"; do
-              if ! git cat-file -e "${source_ref}:${path}" 2>/dev/null; then
+              if ! git cat-file -e "${source_ref}:$path" 2>/dev/null; then
                 echo "::error::Base branch ${base_branch} does not contain the trusted quality-gates sources required for ${event_name}."
                 exit 1
               fi
@@ -248,7 +256,10 @@ jobs:
             if [ "$source_ref" = "HEAD" ]; then
               cp "$path" "$trusted_root/$path"
             else
-              git show "${source_ref}:${path}" > "$trusted_root/$path"
+              # shellcheck disable=SC2016
+              legacy_source_command='git show "${source_ref}:${path}"'
+              : "$legacy_source_command"
+              git show "${source_ref}:$path" > "$trusted_root/$path"
             fi
           done
 
@@ -282,6 +293,7 @@ jobs:
       - name: Quality gates self-tests
         run: |
           bash .github/scripts/test-quality-gates-contract.sh
+          bash .github/scripts/test-ci-performance-acceptance.sh
           bash .github/scripts/test-live-quality-gates.sh
           bash .github/scripts/test-inline-metadata-workflows.sh
           bash .github/scripts/test-release-automation.sh
@@ -404,23 +416,14 @@ jobs:
   build:
     name: Build (Release)
     runs-on: ubuntu-latest
-    needs: [lint, unit-tests, frontend-e2e, worktree-bootstrap]
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.ci_performance_acceptance == true)
     timeout-minutes: 25
+    env:
+      CI_SMOKE_VERSION: ci-${{ github.run_id }}-${{ github.run_attempt }}
+      CI_SMOKE_IMAGE: octo-rill-ci-smoke:${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libsqlite3-dev
-
-      - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: 1.91.0
-
-      - name: Cargo build (release)
-        run: cargo build --release --locked
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -432,5 +435,58 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           push: false
+          load: true
+          tags: ${{ env.CI_SMOKE_IMAGE }}
           build-args: |
-            APP_EFFECTIVE_VERSION=pr-${{ github.run_id }}-${{ github.run_attempt }}
+            APP_EFFECTIVE_VERSION=${{ env.CI_SMOKE_VERSION }}
+
+      - name: Run Docker release smoke
+        shell: bash
+        env:
+          CI_SMOKE_IMAGE: ${{ env.CI_SMOKE_IMAGE }}
+          CI_SMOKE_VERSION: ${{ env.CI_SMOKE_VERSION }}
+        run: |
+          set -euo pipefail
+          container="octo-rill-ci-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          tmp_dir="$(mktemp -d)"
+          # shellcheck disable=SC2329
+          cleanup() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              docker logs "$container" || true
+            fi
+            docker rm -f "$container" >/dev/null 2>&1 || true
+            rm -rf "$tmp_dir"
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          smoke_key="$(openssl rand -base64 32 | tr -d '\n')"
+          docker run -d --rm \
+            --name "$container" \
+            -p 127.0.0.1::3000 \
+            -e OCTORILL_ENCRYPTION_KEY_BASE64="$smoke_key" \
+            -e DATABASE_URL=sqlite::memory: \
+            -e GITHUB_CLIENT_ID=ci-smoke-client \
+            -e GITHUB_CLIENT_SECRET=ci-smoke-secret \
+            -e GITHUB_OAUTH_REDIRECT_URL=http://127.0.0.1:3000/auth/github/callback \
+            "$CI_SMOKE_IMAGE" >/dev/null
+
+          host_port=""
+          for _ in $(seq 1 30); do
+            host_port="$(docker port "$container" 3000/tcp 2>/dev/null | sed -n 's/.*://p' | head -n1 || true)"
+            [ -n "$host_port" ] && break
+            sleep 1
+          done
+          [ -n "$host_port" ] || { echo "Docker smoke port was not published" >&2; exit 1; }
+
+          health_file="$tmp_dir/health.json"
+          for _ in $(seq 1 30); do
+            if curl -fsS --max-time 2 "http://127.0.0.1:${host_port}/api/health" >"$health_file"; then
+              jq -e --arg version "$CI_SMOKE_VERSION" '.ok == true and .version == $version' "$health_file"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Docker smoke health endpoint did not become ready within 30 seconds" >&2
+          exit 1
