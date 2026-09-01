@@ -45,12 +45,13 @@ dispatch runs the acceptance path. Normal pull request, merge-group, and
 check name.
 
 The acceptance driver uses two owner-prepared refs whose commit SHAs are
-resolved immediately before dispatch. The control ref contains only the
-dispatch-input change; the candidate ref is derived from control and contains
-the approved CI workflow, contract-checker, offline-fixture, driver, test, and
-documentation paths. The driver rejects mutable or unexpected refs, retries,
-concurrent runs, unexpected SHAs, failed required jobs, and candidate runs
-without a successful Docker runtime smoke step.
+resolved immediately before dispatch. The control ref contains the dispatch
+input change and the verified E2E stabilization file shared by both arms; the
+candidate ref is derived from control and contains the approved CI workflow,
+contract-checker, offline-fixture, driver, test, and documentation paths. The
+driver verifies the shared file blob is identical, then rejects mutable or
+unexpected refs, retries, concurrent runs, unexpected SHAs, failed required
+jobs, and candidate runs without a successful Docker runtime smoke step.
 
 Each pair is dispatched serially in alternating control/candidate order for ten
 pairs. It records the workflow run, jobs, and terminal timestamps as JSON. The

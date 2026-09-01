@@ -40,8 +40,12 @@ ALLOWED_CHANGED_PATHS = {
     "docs/specs/ci-wall-clock-acceptance/IMPLEMENTATION.md",
     "docs/specs/ci-wall-clock-acceptance/HISTORY.md",
     "docs/repository-governance.md",
+}
+CONTROL_BASELINE_PATHS = {
+    ".github/workflows/ci.yml",
     "web/e2e/admin-jobs.spec.ts",
 }
+CONTROL_SHARED_PATHS = {"web/e2e/admin-jobs.spec.ts"}
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 TRANSIENT_GET_ERROR_MARKERS = (
     "tls handshake timeout",
@@ -147,6 +151,16 @@ def resolve_ref(client: ApiClient, repo: str, ref: str) -> str:
     return sha
 
 
+def resolve_file_blob(client: ApiClient, repo: str, sha: str, path: str) -> str:
+    response = client.api(f"repos/{repo}/contents/{path}?ref={sha}")
+    if not isinstance(response, dict) or response.get("type") != "file":
+        raise AcceptanceError(f"{path} is not a file at {sha}")
+    blob_sha = response.get("sha")
+    if not isinstance(blob_sha, str) or not SHA_RE.fullmatch(blob_sha):
+        raise AcceptanceError(f"{path} at {sha} did not resolve to a file blob SHA")
+    return blob_sha
+
+
 def validate_ref_pair(client: ApiClient, repo: str, control_ref: str, candidate_ref: str) -> dict[str, Any]:
     if not control_ref or not candidate_ref or ref_name(control_ref) == ref_name(candidate_ref):
         raise AcceptanceError("control and candidate refs must be different")
@@ -160,10 +174,15 @@ def validate_ref_pair(client: ApiClient, repo: str, control_ref: str, candidate_
         for item in (baseline_compare.get("files", []) if isinstance(baseline_compare, dict) else [])
         if isinstance(item, dict) and isinstance(item.get("filename"), str)
     )
-    if baseline_files != [".github/workflows/ci.yml"]:
+    if baseline_files != sorted(CONTROL_BASELINE_PATHS):
         raise AcceptanceError(
-            "control ref must be derived from the verified baseline with only the dispatch workflow change"
+            "control ref must be derived from the verified baseline with only the dispatch workflow and shared E2E stabilization"
         )
+    for path in CONTROL_SHARED_PATHS:
+        control_blob = resolve_file_blob(client, repo, control_sha, path)
+        candidate_blob = resolve_file_blob(client, repo, candidate_sha, path)
+        if control_blob != candidate_blob:
+            raise AcceptanceError(f"control and candidate must share the exact {path} blob")
     return {
         "control_ref": ref_name(control_ref),
         "control_sha": control_sha,
@@ -183,6 +202,9 @@ def validate_allowed_delta(client: ApiClient, repo: str, control_sha: str, candi
     unexpected = sorted(set(changed) - ALLOWED_CHANGED_PATHS)
     if unexpected:
         raise AcceptanceError(f"candidate ref contains unexpected files: {unexpected}")
+    shared_changed = sorted(set(changed) & CONTROL_SHARED_PATHS)
+    if shared_changed:
+        raise AcceptanceError(f"candidate ref must reuse shared control files unchanged: {shared_changed}")
     return changed
 
 

@@ -15,7 +15,7 @@
 ## Coverage / rollout summary
 
 - The release job builds once through Docker Buildx with `load: true`, then verifies the loaded image through a temporary runtime container.
-- The Python driver resolves and freezes both ref SHAs before serial dispatch and writes auditable run/job records and statistics.
+- The Python driver resolves and freezes both ref SHAs before serial dispatch, verifies the shared E2E stabilization blob, and writes auditable run/job records and statistics.
 
 ## Remaining Gaps
 

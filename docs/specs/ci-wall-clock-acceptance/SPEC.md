@@ -10,8 +10,8 @@
 
 - `Build (Release)`: CI 中保持原 required-check 名称的 Docker 发布物构建与运行时 smoke job。
 - `CI_SMOKE_VERSION`: 每次 CI run 唯一的发布物版本值，必须由 health response 回显。
-- `control ref`: 仅包含受控 dispatch 输入合同的不可变提交引用。
-- `candidate ref`: 从 control ref 派生并包含本主题批准实现的不可变提交引用。
+- `control ref`: 从已验证基线派生、仅包含受控 dispatch 输入合同和已验证 E2E 稳定性文件的不可变提交引用。
+- `candidate ref`: 从 control ref 派生并包含本主题批准实现的不可变提交引用；共享 E2E 稳定性文件必须与 control 使用完全相同的 blob。
 - `Acceptance driver`: 通过 `gh api` 串行 dispatch、轮询和记录 control/candidate runs 的 Python CLI。
 
 ## Requirements
@@ -29,7 +29,7 @@
 
 ### REQ-CI-WALLCLOCK-003
 
-- The acceptance driver MUST make performance claims only from two owner-prepared refs whose immutable SHAs, allowed file delta, run attempts, ordering, jobs, and terminal timestamps are validated.
+- The acceptance driver MUST make performance claims only from two owner-prepared refs whose immutable SHAs, shared E2E stabilization blob, allowed file delta, run attempts, ordering, jobs, and terminal timestamps are validated.
 - Outputs: ten serial alternating control/candidate pairs are recorded as JSON; candidate passes only with ten successful Docker-smoke runs, median at most 720 seconds, nearest-rank P90 at most 840 seconds, and median at most 75% of control median.
 
 ### REQ-CI-WALLCLOCK-004
