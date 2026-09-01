@@ -163,7 +163,6 @@ function makeReadableRawSection(input: {
 		items_next_cursor: input.nextCursor ?? null,
 	};
 }
-
 function makeScrollableFirstPage(
 	release40: ReturnType<typeof makeReleaseFeedItem>,
 ) {
