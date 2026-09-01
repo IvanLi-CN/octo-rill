@@ -1,7 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useState, type ComponentProps } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
-import { expect, within } from "storybook/test";
+import { expect, userEvent, within } from "storybook/test";
 
 import { FeedGroupedList } from "@/feed/FeedGroupedList";
 import type { FeedItem, FeedLane, ReleaseFeedItem } from "@/feed/types";
@@ -236,7 +236,11 @@ const FEED_VIEWPORTS = {
 	},
 } as const;
 
-function FeedGroupedListContinuationPreview() {
+function FeedGroupedListContinuationPreview(props: {
+	forceLoadingMore?: boolean;
+	includeCurrentItem?: boolean;
+}) {
+	const { forceLoadingMore = false, includeCurrentItem = true } = props;
 	const currentItem = release("current-history-39", {
 		ts: "2026-05-08T10:00:00Z",
 		title: "Current history release 39",
@@ -253,15 +257,18 @@ function FeedGroupedListContinuationPreview() {
 		ts: "2026-05-06T09:12:00Z",
 		title: "Visible history release 43",
 	});
-	const [items, setItems] = useState<FeedItem[]>([currentItem, initialItem]);
+	const [items, setItems] = useState<FeedItem[]>(() =>
+		includeCurrentItem ? [currentItem, initialItem] : [initialItem],
+	);
 	const [nextCursor, setNextCursor] = useState<string | null>("page-2");
 	const [loadingMore, setLoadingMore] = useState(false);
+	const paginationLoading = forceLoadingMore || loadingMore;
 	const selectedLaneByKey = Object.fromEntries(
 		items.map((item) => [`${item.kind}:${item.id}`, "original"]),
 	) as Record<string, FeedLane>;
 
 	const loadMore = () => {
-		if (loadingMore || !nextCursor) return;
+		if (forceLoadingMore || loadingMore || !nextCursor) return;
 		setLoadingMore(true);
 		window.setTimeout(() => {
 			if (nextCursor === "page-2") {
@@ -277,7 +284,10 @@ function FeedGroupedListContinuationPreview() {
 
 	return (
 		<div className="bg-slate-800 px-4 py-8 text-foreground sm:px-8">
-			<div className="mx-auto max-w-4xl rounded-2xl bg-background p-4">
+			<div
+				data-feed-grouped-list-preview="true"
+				className="mx-auto max-w-4xl bg-background px-[17px] pt-[17px] pb-[18px]"
+			>
 				<FeedGroupedList
 					mode="all"
 					items={items}
@@ -293,7 +303,7 @@ function FeedGroupedListContinuationPreview() {
 					now={new Date("2026-05-08T12:00:00+08:00")}
 					error={null}
 					loadingInitial={false}
-					loadingMore={loadingMore}
+					loadingMore={paginationLoading}
 					hasMore={Boolean(nextCursor)}
 					translationInFlightKeys={new Set()}
 					translationAutoRetryingKeys={new Set()}
@@ -406,11 +416,42 @@ export const FoldedHistoryPaginationPaused: Story = {
 	render: () => <FeedGroupedListContinuationPreview />,
 };
 
-export const FoldedHistoryPaginationListView: Story = {
-	name: "Folded History Pagination List View",
-	render: () => <FeedGroupedListContinuationPreview />,
+export const FoldedHistoryPaginationLoading: Story = {
+	name: "Folded History Pagination Loading",
+	render: () => <FeedGroupedListContinuationPreview forceLoadingMore />,
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
+		const body = within(canvasElement.ownerDocument.body);
+		await expect(canvas.getByRole("status")).toHaveAttribute(
+			"aria-label",
+			"加载中",
+		);
+		expect(canvas.getByRole("status")).not.toHaveTextContent("加载中");
+		const loadingIndicator = canvasElement.querySelector<HTMLElement>(
+			"[data-feed-pagination-loading='true']",
+		);
+		expect(loadingIndicator).toBeTruthy();
+		await expect(
+			loadingIndicator?.querySelectorAll(
+				"[data-feed-pagination-wave-dot='true']",
+			),
+		).toHaveLength(3);
+		await userEvent.hover(loadingIndicator as HTMLElement);
+		expect(body.queryByRole("tooltip")).not.toBeInTheDocument();
+		await expect(await body.findByRole("tooltip")).toHaveTextContent("加载中");
+	},
+};
+
+export const FoldedHistoryPaginationListView: Story = {
+	name: "Folded History Pagination List View",
+	render: () => (
+		<FeedGroupedListContinuationPreview includeCurrentItem={false} />
+	),
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("button", { name: "继续加载历史动态" }),
+		).toBeVisible();
 		const historicalGroup = canvasElement.querySelector<HTMLElement>(
 			'[data-feed-brief-date="2026-05-07"]',
 		);

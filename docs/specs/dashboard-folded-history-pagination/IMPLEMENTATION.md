@@ -4,7 +4,7 @@
 
 ## Current Status
 
-- Implementation: 已实现，待视觉证据与 PR 收口
+- Implementation: 已实现，视觉证据已确认，PR 收口中
 - Lifecycle: active
 - Catalog note: 已确认采用显式续载，运行时、回归与 Storybook 覆盖已完成。
 
@@ -15,10 +15,10 @@
 - 续载按钮复用既有追加请求、去重、错误与加载状态；投影产生进展、tab/scope/首屏刷新或历史组切换到“列表”时清除暂停。
 - Dashboard mock cursor 序列已覆盖折叠暂停、显式续载、列表切换、分页失败重试和末页。
 - Storybook 已增加 `Feed/FeedGroupedList/Folded History Pagination Continuation` 场景。
+- Storybook 加载态使用无文字三点波浪胶囊，悬停 500ms 后显示 Tooltip；Dashboard mock E2E 已覆盖延迟行为。
 
 ## Remaining Gaps
 
-- 产出并确认 Storybook 受控视觉证据。
 - 创建 direct PR，绑定当前 head、CI 与最终交付事实。
 
 ## Related Changes

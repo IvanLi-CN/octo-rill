@@ -24,6 +24,12 @@ import { Markdown } from "@/components/Markdown";
 import { ErrorBubble } from "@/components/feedback/ErrorBubble";
 import { ErrorStatePanel } from "@/components/feedback/ErrorStatePanel";
 import { Button } from "@/components/ui/button";
+import {
+	Tooltip,
+	TooltipContent,
+	TooltipProvider,
+	TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { FeedItems, type FeedCardListProps } from "@/feed/FeedList";
 import {
 	type BriefSnapshotCandidate,
@@ -1041,10 +1047,13 @@ export function FeedGroupedList(
 		});
 		setBriefErrorsByDate((current) => {
 			const next = new Map(current);
+			let changed = false;
 			for (const brief of visibleBriefs) {
-				next.delete(brief.date);
+				if (next.delete(brief.date)) {
+					changed = true;
+				}
 			}
-			return next;
+			return changed ? next : current;
 		});
 	}, [groups, visibleBriefs]);
 
@@ -1262,6 +1271,8 @@ export function FeedGroupedList(
 						);
 					}
 				}
+				const renderDayDivider =
+					showDivider || (!showBriefPanel && groupAction !== null);
 
 				return (
 					<section
@@ -1288,7 +1299,7 @@ export function FeedGroupedList(
 								releaseCount={group.releaseCount}
 								activityCount={group.activityCount}
 								action={groupAction}
-								showDivider={showDivider}
+								showDivider={renderDayDivider}
 								showBriefPanel={showBriefPanel}
 								brief={pendingBrief ? null : brief}
 								generationErrorState={briefGenerationError}
@@ -1353,7 +1364,7 @@ export function FeedGroupedList(
 									releaseCount={group.releaseCount}
 									activityCount={group.activityCount}
 									action={groupAction}
-									showDivider={showDivider}
+									showDivider={renderDayDivider}
 								/>
 								{renderFeedItemsWithBoundaries(
 									group.items,
@@ -1366,10 +1377,44 @@ export function FeedGroupedList(
 				);
 			})}
 
-			<div ref={sentinelRef} />
+			<div ref={sentinelRef} data-feed-pagination-sentinel="true" />
 
 			{loadingMore ? (
-				<p className="text-muted-foreground font-mono text-xs">加载中…</p>
+				<div
+					className="flex justify-center pt-1"
+					aria-label="加载中"
+					data-feed-pagination-loading="true"
+					role="status"
+				>
+					<TooltipProvider delayDuration={500} skipDelayDuration={0}>
+						<Tooltip>
+							<TooltipTrigger asChild>
+								<span className="feed-pagination-loading-pill text-muted-foreground inline-flex items-center rounded-full px-5 py-2 shadow-sm">
+									<span
+										aria-hidden="true"
+										className="feed-pagination-wave inline-flex items-center gap-1"
+									>
+										<span
+											className="feed-pagination-wave-dot size-1.5 rounded-full"
+											data-feed-pagination-wave-dot="true"
+										/>
+										<span
+											className="feed-pagination-wave-dot size-1.5 rounded-full"
+											data-feed-pagination-wave-dot="true"
+										/>
+										<span
+											className="feed-pagination-wave-dot size-1.5 rounded-full"
+											data-feed-pagination-wave-dot="true"
+										/>
+									</span>
+								</span>
+							</TooltipTrigger>
+							<TooltipContent side="top" sideOffset={8}>
+								加载中
+							</TooltipContent>
+						</Tooltip>
+					</TooltipProvider>
+				</div>
 			) : null}
 
 			{appendError ? (
@@ -1396,7 +1441,10 @@ export function FeedGroupedList(
 				</div>
 			) : null}
 
-			{!appendError && requiresExplicitContinuation && hasMore ? (
+			{!appendError &&
+			!loadingMore &&
+			requiresExplicitContinuation &&
+			hasMore ? (
 				<div
 					className="flex justify-center pt-1"
 					data-feed-pagination-continuation="true"
@@ -1406,14 +1454,9 @@ export function FeedGroupedList(
 						variant="outline"
 						size="sm"
 						className="font-mono text-xs"
-						disabled={loadingMore}
 						onClick={() => requestLoadMore("manual")}
 					>
-						{loadingMore ? (
-							<LoaderCircle className="size-3.5 animate-spin" />
-						) : (
-							<ArrowDown className="size-3.5" />
-						)}
+						<ArrowDown className="size-3.5" />
 						继续加载历史动态
 					</Button>
 				</div>
