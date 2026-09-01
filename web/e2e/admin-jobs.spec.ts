@@ -3244,10 +3244,19 @@ test("admin ignores stale llm refresh errors after filter change", async ({
 	const refreshButton = page.getByRole("button", { name: "刷新" });
 	await refreshButton.click();
 	await page.getByRole("combobox", { name: "LLM 调用状态筛选" }).click();
+	const filteredLlmRequest = page.waitForRequest((request) => {
+		const url = new URL(request.url());
+		return (
+			request.method() === "GET" &&
+			url.pathname === "/api/admin/jobs/llm/calls" &&
+			url.searchParams.get("status") === "failed"
+		);
+	});
 	await page.getByRole("option", { name: "状态：失败" }).click();
+	await filteredLlmRequest;
+	await expect(refreshButton).toBeDisabled();
 
 	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
-	await expect(refreshButton).toBeDisabled();
 	await expect(page.getByText("job.api.translate_release")).toBeVisible();
 	await expect(page.getByText("stale llm refresh failed")).toHaveCount(0);
 
