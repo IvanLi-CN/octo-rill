@@ -1,4 +1,11 @@
-import { type Page, type Route, expect, test } from "@playwright/test";
+import { writeFile } from "node:fs/promises";
+import {
+	type Page,
+	type Route,
+	type TestInfo,
+	expect,
+	test,
+} from "@playwright/test";
 
 import { buildMockMeResponse } from "./mockApi";
 
@@ -95,7 +102,7 @@ function makeReleaseFeedItem(input: {
 		},
 		smart: {
 			lang: "zh-CN",
-			status: "missing",
+			status: "disabled",
 			title: null,
 			summary: null,
 		},
@@ -103,15 +110,44 @@ function makeReleaseFeedItem(input: {
 	};
 }
 
+function makeScrollableFirstPage(
+	release40: ReturnType<typeof makeReleaseFeedItem>,
+) {
+	return [
+		release40,
+		...Array.from({ length: 29 }, (_, index) =>
+			makeReleaseFeedItem({
+				id: `seed-${index + 1}`,
+				ts: `2026-04-${String(28 - Math.floor(index / 2)).padStart(2, "0")}T${String(10 - (index % 10)).padStart(2, "0")}:00:00Z`,
+				tag: `seed-${index + 1}`,
+				title: `Seed release ${index + 1}`,
+			}),
+		),
+	];
+}
+
 async function installDashboardBriefMocks(
 	page: Page,
 	options?: {
 		feedItems?: unknown[];
+		feedPage?: (cursor: string | null) => {
+			items: unknown[];
+			nextCursor: string | null;
+		};
+		deferFeedPageCursors?: Array<string | null>;
+		feedPageFailureCursors?: Array<string | null>;
 		briefDetailFailureIds?: Set<string>;
 	},
 ) {
 	let summaryRequests = 0;
 	const detailRequests: string[] = [];
+	const feedRequests: Array<string | null> = [];
+	const feedPageFailures = new Map<string | null, number>();
+	const deferredFeedPageCursors = new Set(options?.deferFeedPageCursors ?? []);
+	const deferredFeedPageResolvers = new Map<string | null, () => void>();
+	for (const cursor of options?.feedPageFailureCursors ?? []) {
+		feedPageFailures.set(cursor, (feedPageFailures.get(cursor) ?? 0) + 1);
+	}
 	const briefDetailFailures = new Set(options?.briefDetailFailureIds ?? []);
 
 	await page.route("**/api/**", async (route) => {
@@ -135,6 +171,30 @@ async function installDashboardBriefMocks(
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {
+			const cursor = url.searchParams.get("cursor");
+			feedRequests.push(cursor);
+			if (deferredFeedPageCursors.has(cursor)) {
+				await new Promise<void>((resolve) => {
+					deferredFeedPageResolvers.set(cursor, resolve);
+				});
+				deferredFeedPageCursors.delete(cursor);
+			}
+			const remainingFailures = feedPageFailures.get(cursor) ?? 0;
+			if (remainingFailures > 0) {
+				feedPageFailures.set(cursor, remainingFailures - 1);
+				return json(
+					route,
+					{ error: { code: "feed_page_failed", message: "page failed" } },
+					500,
+				);
+			}
+			if (options?.feedPage) {
+				const page = options.feedPage(cursor);
+				return json(route, {
+					items: page.items,
+					next_cursor: page.nextCursor,
+				});
+			}
 			return json(route, {
 				items: options?.feedItems ?? [],
 				next_cursor: null,
@@ -191,6 +251,38 @@ async function installDashboardBriefMocks(
 			});
 		}
 
+		if (req.method() === "POST" && pathname === "/api/translate/results") {
+			const body = req.postDataJSON() as {
+				items?: Array<{
+					producer_ref?: string;
+					entity_id?: string;
+					kind?: string;
+					variant?: string;
+				}>;
+			};
+			return json(route, {
+				items: (body.items ?? []).map((item) => {
+					const entityId = item.entity_id ?? "";
+					return {
+						producer_ref: item.producer_ref ?? "feed-card",
+						entity_id: entityId,
+						kind: item.kind ?? "release_summary",
+						variant: item.variant ?? "feed_card",
+						status: "ready",
+						title_zh: `Release ${entityId}`,
+						summary_md: "Mock translation summary",
+						body_md: `Mock translation body for ${entityId}`,
+						error: null,
+						error_code: null,
+						error_summary: null,
+						error_detail: null,
+						work_item_id: null,
+						batch_id: null,
+					};
+				}),
+			});
+		}
+
 		if (req.method() === "GET" && pathname === "/api/health") {
 			return json(route, { ok: true, version: "1.2.3" });
 		}
@@ -208,10 +300,412 @@ async function installDashboardBriefMocks(
 	});
 
 	return {
+		getFeedRequests: () => feedRequests.slice(),
 		getSummaryRequests: () => summaryRequests,
 		getDetailRequests: () => detailRequests.slice(),
+		releaseFeedPage: (cursor: string | null) => {
+			const resolve = deferredFeedPageResolvers.get(cursor);
+			if (!resolve) {
+				throw new Error(`No deferred feed request for cursor ${cursor}`);
+			}
+			deferredFeedPageResolvers.delete(cursor);
+			resolve();
+		},
 	};
 }
+
+async function capturePaginationEvidence(
+	page: Page,
+	testInfo: TestInfo,
+	name: string,
+	requests: Array<string | null>,
+) {
+	const imagePath = testInfo.outputPath(`${name}.png`);
+	await page.screenshot({ path: imagePath });
+	await testInfo.attach(name, {
+		path: imagePath,
+		contentType: "image/png",
+	});
+	const requestsPath = testInfo.outputPath(`${name}-requests.json`);
+	await writeFile(requestsPath, JSON.stringify({ requests }, null, 2));
+	await testInfo.attach(`${name}-requests`, {
+		path: requestsPath,
+		contentType: "application/json",
+	});
+}
+
+async function scrollPaginationSentinelIntoView(page: Page) {
+	await page
+		.locator("[data-feed-pagination-sentinel]")
+		.scrollIntoViewIfNeeded();
+}
+
+test("dashboard pauses pagination when an appended page is fully folded into a brief", async ({
+	page,
+}, testInfo) => {
+	await page.addInitScript(() => {
+		window.localStorage.clear();
+	});
+
+	const release40 = makeReleaseFeedItem({
+		id: "40",
+		ts: "2026-04-29T10:27:01Z",
+		tag: "v40",
+		title: "Release 40",
+	});
+	const release41 = makeReleaseFeedItem({
+		id: "41",
+		ts: "2026-04-29T09:12:00Z",
+		tag: "v41",
+		title: "Release 41",
+	});
+	const release43 = makeReleaseFeedItem({
+		id: "43",
+		ts: "2026-04-13T09:12:00Z",
+		tag: "v43",
+		title: "Release 43",
+	});
+	const firstPage = makeScrollableFirstPage(release40);
+
+	const tracker = await installDashboardBriefMocks(page, {
+		feedPage: (cursor) => {
+			if (cursor === null) {
+				return { items: firstPage, nextCursor: "cursor-page-2" };
+			}
+			if (cursor === "cursor-page-2") {
+				return { items: [release41], nextCursor: "cursor-page-3" };
+			}
+			return { items: [release43], nextCursor: null };
+		},
+	});
+
+	await page.goto("/");
+
+	await expect(
+		page.locator(
+			'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-29"]',
+		),
+	).toBeVisible({ timeout: 15_000 });
+	await expect.poll(tracker.getFeedRequests).toEqual([null]);
+	await scrollPaginationSentinelIntoView(page);
+	await expect.poll(() => tracker.getFeedRequests()).toContain("cursor-page-2");
+	await expect(
+		page.getByRole("button", { name: "继续加载历史动态" }),
+	).toBeVisible({ timeout: 15_000 });
+	await expect.poll(tracker.getFeedRequests).toEqual([null, "cursor-page-2"]);
+	await page
+		.getByRole("button", { name: "继续加载历史动态" })
+		.evaluate((element) => element.scrollIntoView({ block: "center" }));
+	await capturePaginationEvidence(
+		page,
+		testInfo,
+		"folded-history-paused",
+		tracker.getFeedRequests(),
+	);
+
+	await page.getByRole("button", { name: "继续加载历史动态" }).click();
+	await expect(page.locator('[data-feed-item-key="release:43"]')).toBeVisible();
+	await expect
+		.poll(tracker.getFeedRequests)
+		.toEqual([null, "cursor-page-2", "cursor-page-3"]);
+	await expect(
+		page.getByRole("button", { name: "继续加载历史动态" }),
+	).toHaveCount(0);
+	await page
+		.locator('[data-feed-item-key="release:43"]')
+		.scrollIntoViewIfNeeded();
+	await capturePaginationEvidence(
+		page,
+		testInfo,
+		"folded-history-resumed",
+		tracker.getFeedRequests(),
+	);
+});
+
+test("dashboard keeps paginating when an appended page remains visible at the sentinel", async ({
+	page,
+}, testInfo) => {
+	await page.addInitScript(() => {
+		window.localStorage.clear();
+	});
+
+	const firstPage = Array.from({ length: 30 }, (_, index) =>
+		makeReleaseFeedItem({
+			id: String(index + 1),
+			ts: `2026-04-${String(30 - Math.floor(index / 5)).padStart(2, "0")}T${String(10 - (index % 10)).padStart(2, "0")}:00:00Z`,
+			tag: `v${index + 1}`,
+			title: `Release ${index + 1}`,
+		}),
+	);
+	const release31 = makeReleaseFeedItem({
+		id: "31",
+		ts: "2026-04-24T09:12:00Z",
+		tag: "v31",
+		title: "Release 31",
+	});
+	const release32 = makeReleaseFeedItem({
+		id: "32",
+		ts: "2026-04-24T08:12:00Z",
+		tag: "v32",
+		title: "Release 32",
+	});
+
+	const tracker = await installDashboardBriefMocks(page, {
+		feedPage: (cursor) => {
+			if (cursor === null) {
+				return { items: firstPage, nextCursor: "cursor-page-2" };
+			}
+			if (cursor === "cursor-page-2") {
+				return { items: [release31], nextCursor: "cursor-page-3" };
+			}
+			return { items: [release32], nextCursor: null };
+		},
+	});
+
+	await page.goto("/");
+	await expect(page.locator('[data-feed-item-key="release:30"]')).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect.poll(tracker.getFeedRequests).toEqual([null]);
+
+	await scrollPaginationSentinelIntoView(page);
+	await expect(page.locator('[data-feed-item-key="release:32"]')).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect
+		.poll(tracker.getFeedRequests)
+		.toEqual([null, "cursor-page-2", "cursor-page-3"]);
+	await expect(page.getByText("已到尽头（共 32 条）")).toBeVisible();
+	await page
+		.locator('[data-feed-item-key="release:32"]')
+		.scrollIntoViewIfNeeded();
+	await capturePaginationEvidence(
+		page,
+		testInfo,
+		"visible-sentinel-auto-pagination",
+		tracker.getFeedRequests(),
+	);
+});
+
+test("dashboard shows pagination loading while the next page is in flight", async ({
+	page,
+}, testInfo) => {
+	await page.addInitScript(() => {
+		window.localStorage.clear();
+	});
+
+	const firstPage = Array.from({ length: 30 }, (_, index) =>
+		makeReleaseFeedItem({
+			id: String(index + 1),
+			ts: `2026-04-${String(30 - Math.floor(index / 5)).padStart(2, "0")}T${String(10 - (index % 10)).padStart(2, "0")}:00:00Z`,
+			tag: `v${index + 1}`,
+			title: `Release ${index + 1}`,
+		}),
+	);
+	const release31 = makeReleaseFeedItem({
+		id: "31",
+		ts: "2026-04-24T09:12:00Z",
+		tag: "v31",
+		title: "Release 31",
+	});
+
+	const tracker = await installDashboardBriefMocks(page, {
+		deferFeedPageCursors: ["cursor-page-2"],
+		feedPage: (cursor) =>
+			cursor === null
+				? { items: firstPage, nextCursor: "cursor-page-2" }
+				: { items: [release31], nextCursor: null },
+	});
+
+	await page.goto("/");
+	await expect(page.locator('[data-feed-item-key="release:30"]')).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect.poll(tracker.getFeedRequests).toEqual([null]);
+
+	await scrollPaginationSentinelIntoView(page);
+	await expect.poll(tracker.getFeedRequests).toEqual([null, "cursor-page-2"]);
+	const loadingStatus = page.locator("[data-feed-pagination-loading='true']");
+	await expect(loadingStatus).toHaveAttribute("role", "status");
+	await expect(loadingStatus).toHaveAttribute("aria-label", "加载中");
+	await expect(loadingStatus).not.toContainText("加载中");
+	const loadingDots = loadingStatus.locator(
+		"[data-feed-pagination-wave-dot='true']",
+	);
+	await expect(loadingDots).toHaveCount(3);
+	await expect(loadingDots.first()).toHaveCSS(
+		"animation-name",
+		"feed-pagination-wave",
+	);
+	const loadingTooltip = page.getByRole("tooltip");
+	await expect(loadingTooltip).toHaveCount(0);
+	await loadingStatus.hover();
+	await page.waitForTimeout(300);
+	await expect(loadingTooltip).toHaveCount(0);
+	await expect(loadingTooltip).toHaveText("加载中");
+	await loadingStatus.scrollIntoViewIfNeeded();
+	await capturePaginationEvidence(
+		page,
+		testInfo,
+		"pagination-loading",
+		tracker.getFeedRequests(),
+	);
+
+	tracker.releaseFeedPage("cursor-page-2");
+	await expect(page.locator('[data-feed-item-key="release:31"]')).toBeVisible();
+	await expect(loadingStatus).toHaveCount(0);
+	await expect.poll(tracker.getFeedRequests).toEqual([null, "cursor-page-2"]);
+});
+
+test("dashboard resumes pagination when folded history switches to list view", async ({
+	page,
+}, testInfo) => {
+	await page.addInitScript(() => {
+		window.localStorage.clear();
+	});
+
+	const release40 = makeReleaseFeedItem({
+		id: "40",
+		ts: "2026-04-29T10:27:01Z",
+		tag: "v40",
+		title: "Release 40",
+	});
+	const release41 = makeReleaseFeedItem({
+		id: "41",
+		ts: "2026-04-29T09:12:00Z",
+		tag: "v41",
+		title: "Release 41",
+	});
+	const release43 = makeReleaseFeedItem({
+		id: "43",
+		ts: "2026-04-13T09:12:00Z",
+		tag: "v43",
+		title: "Release 43",
+	});
+	const firstPage = makeScrollableFirstPage(release40);
+
+	const tracker = await installDashboardBriefMocks(page, {
+		feedPage: (cursor) => {
+			if (cursor === null) {
+				return { items: firstPage, nextCursor: "cursor-page-2" };
+			}
+			if (cursor === "cursor-page-2") {
+				return { items: [release41], nextCursor: "cursor-page-3" };
+			}
+			return { items: [release43], nextCursor: null };
+		},
+	});
+
+	await page.goto("/");
+
+	const historicalGroup = page.locator(
+		'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-29"]',
+	);
+	await expect(historicalGroup).toBeVisible({ timeout: 15_000 });
+	await expect.poll(tracker.getFeedRequests).toEqual([null]);
+	await scrollPaginationSentinelIntoView(page);
+	await expect.poll(() => tracker.getFeedRequests()).toContain("cursor-page-2");
+	await expect(
+		page.getByRole("button", { name: "继续加载历史动态" }),
+	).toBeVisible({ timeout: 15_000 });
+
+	await historicalGroup.getByRole("button", { name: "列表" }).click();
+	await expect(
+		historicalGroup.locator('[data-feed-item-key="release:40"]'),
+	).toBeVisible();
+	await expect(
+		historicalGroup.locator('[data-feed-item-key="release:41"]'),
+	).toBeVisible();
+	await expect(
+		historicalGroup.getByRole("button", { name: "日报" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("button", { name: "继续加载历史动态" }),
+	).toHaveCount(0);
+	await scrollPaginationSentinelIntoView(page);
+	await expect(page.locator('[data-feed-item-key="release:43"]')).toBeVisible();
+	await expect
+		.poll(tracker.getFeedRequests)
+		.toEqual([null, "cursor-page-2", "cursor-page-3"]);
+	await historicalGroup.scrollIntoViewIfNeeded();
+	await capturePaginationEvidence(
+		page,
+		testInfo,
+		"folded-history-list-view",
+		tracker.getFeedRequests(),
+	);
+});
+
+test("dashboard retries an appended page before entering explicit continuation", async ({
+	page,
+}) => {
+	await page.addInitScript(() => {
+		window.localStorage.clear();
+	});
+
+	const release40 = makeReleaseFeedItem({
+		id: "40",
+		ts: "2026-04-29T10:27:01Z",
+		tag: "v40",
+		title: "Release 40",
+	});
+	const release41 = makeReleaseFeedItem({
+		id: "41",
+		ts: "2026-04-29T09:12:00Z",
+		tag: "v41",
+		title: "Release 41",
+	});
+	const release43 = makeReleaseFeedItem({
+		id: "43",
+		ts: "2026-04-13T09:12:00Z",
+		tag: "v43",
+		title: "Release 43",
+	});
+	const firstPage = makeScrollableFirstPage(release40);
+
+	const tracker = await installDashboardBriefMocks(page, {
+		feedPageFailureCursors: ["cursor-page-2", "cursor-page-2"],
+		feedPage: (cursor) => {
+			if (cursor === null) {
+				return { items: firstPage, nextCursor: "cursor-page-2" };
+			}
+			if (cursor === "cursor-page-2") {
+				return { items: [release41], nextCursor: "cursor-page-3" };
+			}
+			return { items: [release43], nextCursor: null };
+		},
+	});
+
+	await page.goto("/");
+	await expect.poll(tracker.getFeedRequests).toEqual([null]);
+	await scrollPaginationSentinelIntoView(page);
+	await expect(page.getByRole("button", { name: "继续加载" })).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect
+		.poll(tracker.getFeedRequests)
+		.toEqual([null, "cursor-page-2", "cursor-page-2"]);
+
+	await page.getByRole("button", { name: "继续加载" }).click();
+	await expect(
+		page.getByRole("button", { name: "继续加载历史动态" }),
+	).toBeVisible({ timeout: 15_000 });
+	await expect
+		.poll(tracker.getFeedRequests)
+		.toEqual([null, "cursor-page-2", "cursor-page-2", "cursor-page-2"]);
+
+	await page.getByRole("button", { name: "继续加载历史动态" }).click();
+	await expect(page.locator('[data-feed-item-key="release:43"]')).toBeVisible();
+	await expect
+		.poll(tracker.getFeedRequests)
+		.toEqual([
+			null,
+			"cursor-page-2",
+			"cursor-page-2",
+			"cursor-page-2",
+			"cursor-page-3",
+		]);
+});
 
 test("brief deep link canonicalizes to /briefs and list selection uses replace", async ({
 	page,
