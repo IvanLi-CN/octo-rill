@@ -24,6 +24,8 @@ class FakeGh:
     def __init__(self):
         self.control_sha = "1" * 40
         self.candidate_sha = "2" * 40
+        self.shared_blob_sha = "3" * 40
+        self.candidate_shared_blob_sha = self.shared_blob_sha
         self.next_id = 1000
         self.runs = {}
         self.dispatches = []
@@ -33,9 +35,12 @@ class FakeGh:
             return {"object": {"type": "commit", "sha": self.control_sha}}
         if endpoint.endswith("git/ref/heads/candidate"):
             return {"object": {"type": "commit", "sha": self.candidate_sha}}
+        if "/contents/web/e2e/admin-jobs.spec.ts?ref=" in endpoint:
+            blob_sha = self.shared_blob_sha if "ref=" + self.control_sha in endpoint else self.candidate_shared_blob_sha
+            return {"type": "file", "sha": blob_sha}
         if "/compare/" in endpoint:
             if f"{module.BASELINE_SHA}...{self.control_sha}" in endpoint:
-                return {"files": [{"filename": ".github/workflows/ci.yml"}]}
+                return {"files": [{"filename": path} for path in sorted(module.CONTROL_BASELINE_PATHS)]}
             return {"files": [{"filename": path} for path in sorted(module.ALLOWED_CHANGED_PATHS)]}
         if endpoint.endswith("/dispatches") and method == "POST":
             assert payload["inputs"] == {module.ACCEPTANCE_INPUT: "true"}
@@ -87,6 +92,7 @@ result = module.AcceptanceRunner(fake, "IvanLi-CN/octo-rill", poll_interval=0, t
 expected_order = ["control", "candidate", "candidate", "control"] * 5
 assert fake.dispatches == expected_order, fake.dispatches
 assert len(result["runs"]) == 20
+assert "web/e2e/admin-jobs.spec.ts" not in changed
 assert result["statistics"]["candidate_median_seconds"] <= 720
 assert result["statistics"]["candidate_p90_seconds"] <= 840
 assert result["statistics"]["candidate_median_ratio"] <= 0.75
@@ -108,6 +114,14 @@ except module.AcceptanceError as error:
     assert "different" in str(error)
 else:
     raise AssertionError("identical refs must be rejected")
+
+fake.candidate_shared_blob_sha = "4" * 40
+try:
+    module.validate_ref_pair(fake, "IvanLi-CN/octo-rill", "control", "candidate")
+except module.AcceptanceError as error:
+    assert "share the exact" in str(error)
+else:
+    raise AssertionError("shared control files must match exactly")
 
 get_results = iter(
     [
