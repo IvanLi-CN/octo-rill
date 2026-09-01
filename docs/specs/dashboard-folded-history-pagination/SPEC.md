@@ -130,6 +130,24 @@ None。此主题不改变 HTTP、数据库、事件或公开组件接口；内�
 
 ## Visual Evidence
 
+- `storybook_canvas` / 暂停：第二页被既有日报折叠后显示 `继续加载历史动态`，不自动消费第三页。
+  ![历史折叠后暂停自动分页](./assets/folded-history-paused.png)
+
+- `storybook_canvas` / 续载完成：显式续载取得可见历史活动后，暂停控件消失并显示新内容。
+  ![显式续载后的可见历史活动](./assets/folded-history-resumed.png)
+
+- `storybook_canvas` / 列表视图：切换到 `列表` 后可查看此前被日报折叠的原始活动。
+  ![历史活动列表视图](./assets/folded-history-list-view.png)
+
+- `storybook_canvas` / 窄屏：393x852 视口下续载控件保持可见且不溢出。
+  ![窄屏历史分页暂停](./assets/folded-history-paused-mobile.png)
+
+- `storybook_canvas` / 加载中：滚动触发下一页请求时只显示三点波浪胶囊，不占用文字布局。
+  ![三点波浪加载胶囊](./assets/folded-history-loading.png)
+
+- `storybook_canvas` / 延迟 Tooltip：悬停加载胶囊后延迟显示 `加载中` 提示。
+  ![加载胶囊 Tooltip](./assets/folded-history-loading-tooltip.png)
+
 ## Related PRs
 
 - None
