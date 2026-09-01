@@ -110,6 +110,60 @@ function makeReleaseFeedItem(input: {
 	};
 }
 
+function makeReadableBriefSection(input: {
+	id: string;
+	date: string;
+	content: string;
+	supplementalItems?: unknown[];
+}) {
+	return {
+		id: `section-${input.id}`,
+		kind: "brief",
+		display_date: input.date,
+		window_start: `${input.date}T00:00:00Z`,
+		window_end: `${input.date}T23:59:59Z`,
+		activity_count: 1 + (input.supplementalItems?.length ?? 0),
+		brief: {
+			id: input.id,
+			date: input.date,
+			window_start: `${input.date}T00:00:00Z`,
+			window_end: `${input.date}T23:59:59Z`,
+			effective_time_zone: "UTC",
+			effective_local_boundary: "00:00",
+			release_count: 1,
+			covers_repo_stars: false,
+			covers_followers: false,
+			content_markdown: input.content,
+			created_at: `${input.date}T23:59:00Z`,
+			updated_at: `${input.date}T23:59:00Z`,
+		},
+		supplemental_items: input.supplementalItems ?? [],
+		supplemental_next_cursor: null,
+		items_next_cursor: "section-items-page-2",
+	};
+}
+
+function makeReadableRawSection(input: {
+	id: string;
+	date: string;
+	items: unknown[];
+	nextCursor?: string | null;
+}) {
+	return {
+		id: `section-${input.id}`,
+		kind: "raw",
+		display_date: input.date,
+		window_start: null,
+		window_end: null,
+		activity_count: input.items.length,
+		brief: null,
+		items: input.items,
+		supplemental_items: [],
+		supplemental_next_cursor: null,
+		items_next_cursor: input.nextCursor ?? null,
+	};
+}
+
 function makeScrollableFirstPage(
 	release40: ReturnType<typeof makeReleaseFeedItem>,
 ) {
@@ -134,6 +188,15 @@ async function installDashboardBriefMocks(
 			items: unknown[];
 			nextCursor: string | null;
 		};
+		readableSectionPage?: (cursor: string | null) => unknown;
+		readableSectionPageFailures?: Array<string | null>;
+		deferReadableSectionPageCursors?: Array<string | null>;
+		readableSectionItemsPage?: (
+			sectionId: string,
+			cursor: string | null,
+		) => unknown;
+		deferReadableSectionItems?: string[];
+		readableSectionItemsFailures?: string[];
 		deferFeedPageCursors?: Array<string | null>;
 		feedPageFailureCursors?: Array<string | null>;
 		briefDetailFailureIds?: Set<string>;
@@ -142,9 +205,32 @@ async function installDashboardBriefMocks(
 	let summaryRequests = 0;
 	const detailRequests: string[] = [];
 	const feedRequests: Array<string | null> = [];
+	const readableSectionRequests: Array<string | null> = [];
+	const readableSectionItemRequests: Array<{
+		sectionId: string;
+		cursor: string | null;
+	}> = [];
 	const feedPageFailures = new Map<string | null, number>();
 	const deferredFeedPageCursors = new Set(options?.deferFeedPageCursors ?? []);
 	const deferredFeedPageResolvers = new Map<string | null, () => void>();
+	const deferredReadableItemResolvers = new Map<string, () => void>();
+	const deferredReadablePageResolvers = new Map<string | null, () => void>();
+	const deferredReadableItems = new Set(
+		options?.deferReadableSectionItems ?? [],
+	);
+	const deferredReadablePages = new Set(
+		options?.deferReadableSectionPageCursors ?? [],
+	);
+	const readableItemFailures = new Set(
+		options?.readableSectionItemsFailures ?? [],
+	);
+	const readablePageFailures = new Map<string | null, number>();
+	for (const cursor of options?.readableSectionPageFailures ?? []) {
+		readablePageFailures.set(
+			cursor,
+			(readablePageFailures.get(cursor) ?? 0) + 1,
+		);
+	}
 	for (const cursor of options?.feedPageFailureCursors ?? []) {
 		feedPageFailures.set(cursor, (feedPageFailures.get(cursor) ?? 0) + 1);
 	}
@@ -199,6 +285,81 @@ async function installDashboardBriefMocks(
 				items: options?.feedItems ?? [],
 				next_cursor: null,
 			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			const cursor = url.searchParams.get("cursor");
+			readableSectionRequests.push(cursor);
+			if (deferredReadablePages.has(cursor)) {
+				await new Promise<void>((resolve) => {
+					deferredReadablePageResolvers.set(cursor, resolve);
+				});
+				deferredReadablePages.delete(cursor);
+			}
+			const remainingReadableFailures = readablePageFailures.get(cursor) ?? 0;
+			if (remainingReadableFailures > 0) {
+				readablePageFailures.set(cursor, remainingReadableFailures - 1);
+				return json(
+					route,
+					{
+						error: {
+							code: "readable_page_failed",
+							message: "readable page failed",
+						},
+					},
+					500,
+				);
+			}
+			if (!options?.readableSectionPage) {
+				const fallbackSections = briefSummaries.map((summary) => ({
+					id: `section-${summary.id}`,
+					date: summary.date,
+					kind: "brief",
+					brief: briefDetails.get(summary.id),
+					items: [],
+					supplemental_items: [],
+					item_count: summary.release_count,
+					items_next_cursor: null,
+				}));
+				return json(route, {
+					sections: cursor ? [] : fallbackSections,
+					next_cursor: null,
+				});
+			}
+			return json(route, options.readableSectionPage(cursor));
+		}
+
+		if (
+			req.method() === "GET" &&
+			pathname.startsWith("/api/dashboard/feed/sections/") &&
+			pathname.endsWith("/items")
+		) {
+			const sectionId = decodeURIComponent(pathname.split("/").at(-2) ?? "");
+			const cursor = url.searchParams.get("cursor");
+			readableSectionItemRequests.push({ sectionId, cursor });
+			if (deferredReadableItems.has(sectionId)) {
+				await new Promise<void>((resolve) => {
+					deferredReadableItemResolvers.set(sectionId, resolve);
+				});
+			}
+			if (readableItemFailures.has(sectionId)) {
+				readableItemFailures.delete(sectionId);
+				return json(
+					route,
+					{
+						error: {
+							code: "section_items_failed",
+							message: "section items failed",
+						},
+					},
+					500,
+				);
+			}
+			const payload = options?.readableSectionItemsPage?.(
+				sectionId,
+				cursor,
+			) ?? { items: [], next_cursor: null };
+			return json(route, payload);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/dashboard/updates") {
@@ -301,6 +462,8 @@ async function installDashboardBriefMocks(
 
 	return {
 		getFeedRequests: () => feedRequests.slice(),
+		getReadableSectionRequests: () => readableSectionRequests.slice(),
+		getReadableSectionItemRequests: () => readableSectionItemRequests.slice(),
 		getSummaryRequests: () => summaryRequests,
 		getDetailRequests: () => detailRequests.slice(),
 		releaseFeedPage: (cursor: string | null) => {
@@ -309,6 +472,24 @@ async function installDashboardBriefMocks(
 				throw new Error(`No deferred feed request for cursor ${cursor}`);
 			}
 			deferredFeedPageResolvers.delete(cursor);
+			resolve();
+		},
+		releaseReadableSectionItems: (sectionId: string) => {
+			const resolve = deferredReadableItemResolvers.get(sectionId);
+			if (!resolve)
+				throw new Error(`No deferred readable item request for ${sectionId}`);
+			deferredReadableItemResolvers.delete(sectionId);
+			deferredReadableItems.delete(sectionId);
+			resolve();
+		},
+		releaseReadableSectionPage: (cursor: string | null) => {
+			const resolve = deferredReadablePageResolvers.get(cursor);
+			if (!resolve)
+				throw new Error(
+					`No deferred readable page request for cursor ${cursor}`,
+				);
+			deferredReadablePageResolvers.delete(cursor);
+			deferredReadablePages.delete(cursor);
 			resolve();
 		},
 	};
@@ -340,7 +521,367 @@ async function scrollPaginationSentinelIntoView(page: Page) {
 		.scrollIntoViewIfNeeded();
 }
 
-test("dashboard pauses pagination when an appended page is fully folded into a brief", async ({
+test("dashboard advances to the next readable section without a continuation stop", async ({
+	page,
+}) => {
+	await page.addInitScript(() => {
+		window.localStorage.clear();
+	});
+
+	const supplemental = makeReleaseFeedItem({
+		id: "supplemental-1",
+		ts: "2026-04-29T10:27:01Z",
+		tag: "supplemental-1",
+		title: "Uncovered supplemental release",
+	});
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPage: (cursor) =>
+			cursor === null
+				? {
+						sections: [
+							makeReadableBriefSection({
+								id: "brief-readable-1",
+								date: "2026-04-30",
+								content: "## 完整日报\n\nREADABLE BRIEF ONE",
+								supplementalItems: [supplemental],
+							}),
+						],
+						next_cursor: "readable-section-page-2",
+					}
+				: {
+						sections: [
+							makeReadableBriefSection({
+								id: "brief-readable-2",
+								date: "2026-04-29",
+								content: "## 完整日报\n\nREADABLE BRIEF TWO",
+							}),
+						],
+						next_cursor: null,
+					},
+	});
+
+	await page.goto("/");
+	await expect(page.getByText("READABLE BRIEF ONE")).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect(page.getByText("Uncovered supplemental release")).toBeVisible();
+	await expect.poll(tracker.getReadableSectionRequests).toContain(null);
+	await expect(tracker.getFeedRequests()).toHaveLength(0);
+
+	await scrollPaginationSentinelIntoView(page);
+	await expect(page.getByText("READABLE BRIEF TWO")).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect
+		.poll(tracker.getReadableSectionRequests)
+		.toContain("readable-section-page-2");
+	await expect(
+		page.getByRole("button", { name: "继续加载历史动态" }),
+	).toHaveCount(0);
+});
+
+test("dashboard fetches covered raw releases only after switching a brief to list", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const covered = makeReleaseFeedItem({
+		id: "covered-release",
+		ts: "2026-04-30T12:00:00Z",
+		tag: "covered",
+		title: "Covered release appears in list",
+	});
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPage: () => ({
+			sections: [
+				{
+					id: "section-brief-list",
+					date: "2026-04-30",
+					kind: "brief",
+					brief: {
+						id: "brief-list",
+						date: "2026-04-30",
+						window_start: "2026-04-30T00:00:00Z",
+						window_end: "2026-04-30T23:59:59Z",
+						release_count: 1,
+						release_ids: ["covered-release"],
+						content_markdown: "## 完整日报\n\n日报正文没有被截断。",
+						covers_repo_stars: false,
+						covers_followers: false,
+						preview_markdown: "日报摘要不应显示",
+						effective_time_zone: "UTC",
+						effective_local_boundary: "00:00",
+						created_at: "2026-04-30T23:00:00Z",
+						updated_at: "2026-04-30T23:00:00Z",
+					},
+					items: [],
+					supplemental_items: [],
+					item_count: 1,
+					items_next_cursor: null,
+				},
+			],
+			next_cursor: null,
+		}),
+		readableSectionItemsPage: () => ({ items: [covered], next_cursor: null }),
+	});
+
+	await page.goto("/");
+	await expect(page.getByText("日报正文没有被截断。")).toBeVisible();
+	await expect(page.getByText("Covered release appears in list")).toHaveCount(
+		0,
+	);
+	await page.getByRole("button", { name: "列表" }).click();
+	await expect(page.getByText("Covered release appears in list")).toBeVisible();
+	await expect
+		.poll(tracker.getReadableSectionItemRequests)
+		.toEqual([{ sectionId: "section-brief-list", cursor: null }]);
+	await expect(tracker.getFeedRequests()).toHaveLength(0);
+});
+
+test("dashboard keeps a history date without a brief readable and manual", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const raw = makeReleaseFeedItem({
+		id: "raw-history",
+		ts: "2026-04-28T10:00:00Z",
+		tag: "raw-history",
+		title: "没有日报的原始发布",
+	});
+	const rawContinuation = makeReleaseFeedItem({
+		id: "raw-history-continuation",
+		ts: "2026-04-28T09:00:00Z",
+		tag: "raw-history-continuation",
+		title: "没有日报区块的明细续页",
+	});
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPage: () => ({
+			sections: [
+				makeReadableRawSection({
+					id: "raw-history",
+					date: "2026-04-28",
+					items: [raw],
+					nextCursor: "raw-history-page-2",
+				}),
+			],
+			next_cursor: null,
+		}),
+		readableSectionItemsPage: (_sectionId, cursor) =>
+			cursor === "raw-history-page-2"
+				? { items: [rawContinuation], next_cursor: null }
+				: { items: [], next_cursor: null },
+	});
+
+	await page.goto("/");
+	await expect(page.getByText("没有日报的原始发布")).toBeVisible();
+	await expect(page.getByText("没有日报区块的明细续页")).toBeVisible();
+	await expect(page.getByRole("button", { name: "生成日报" })).toBeVisible();
+	await expect.poll(tracker.getReadableSectionItemRequests).toContainEqual({
+		sectionId: "section-raw-history",
+		cursor: "raw-history-page-2",
+	});
+	await expect(tracker.getFeedRequests()).toHaveLength(0);
+});
+
+test("dashboard paginates list details independently from the readable stream", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const first = makeReleaseFeedItem({
+		id: "detail-first",
+		tag: "detail-first",
+		title: "首批列表发布",
+	});
+	const second = makeReleaseFeedItem({
+		id: "detail-second",
+		tag: "detail-second",
+		title: "区块明细续页发布",
+	});
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPage: () => ({
+			sections: [
+				makeReadableBriefSection({
+					id: "brief-detail-pagination",
+					date: "2026-04-30",
+					content: "## 日报优先区块",
+				}),
+			],
+			next_cursor: null,
+		}),
+		readableSectionItemsPage: (_sectionId, cursor) =>
+			cursor === null
+				? { items: [first], next_cursor: "detail-page-2" }
+				: { items: [first, second], next_cursor: null },
+	});
+
+	await page.goto("/");
+	await page.getByRole("button", { name: "列表" }).click();
+	await expect(page.getByText("首批列表发布")).toBeVisible();
+	await expect(page.getByText("区块明细续页发布")).toBeVisible();
+	await expect(page.getByText("首批列表发布")).toHaveCount(1);
+	await expect.poll(tracker.getReadableSectionItemRequests).toContainEqual({
+		sectionId: "section-brief-detail-pagination",
+		cursor: "detail-page-2",
+	});
+	await expect
+		.poll(() =>
+			tracker.getReadableSectionRequests().filter((cursor) => cursor !== null),
+		)
+		.toHaveLength(0);
+});
+
+test("dashboard shows the centered wave capsule while section details load", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPage: () => ({
+			sections: [
+				makeReadableBriefSection({
+					id: "brief-loading",
+					date: "2026-04-30",
+					content: "## 完整日报\n\n等待列表明细",
+				}),
+			],
+			next_cursor: null,
+		}),
+		deferReadableSectionItems: ["section-brief-loading"],
+		readableSectionItemsPage: () => ({ items: [], next_cursor: null }),
+	});
+
+	await page.goto("/");
+	await page.getByRole("button", { name: "列表" }).click();
+	const loading = page.locator("[data-readable-pagination-loading='true']");
+	await expect(loading).toBeVisible();
+	await expect(
+		loading.locator("[data-feed-pagination-wave-dot='true']"),
+	).toHaveCount(3);
+	await tracker.releaseReadableSectionItems("section-brief-loading");
+	await expect(loading).toHaveCount(0);
+});
+
+test("dashboard shows the centered wave capsule while a readable page loads", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const tracker = await installDashboardBriefMocks(page, {
+		deferReadableSectionPageCursors: ["readable-page-2"],
+		readableSectionPage: (cursor) =>
+			cursor === null
+				? {
+						sections: [
+							makeReadableBriefSection({
+								id: "brief-page-1",
+								date: "2026-04-30",
+								content: "## 第一页日报",
+							}),
+						],
+						next_cursor: "readable-page-2",
+					}
+				: { sections: [], next_cursor: null },
+	});
+
+	await page.goto("/");
+	await expect(page.getByText("第一页日报")).toBeVisible();
+	await scrollPaginationSentinelIntoView(page);
+	const loading = page.locator("[data-readable-pagination-loading='true']");
+	await expect(loading).toBeVisible();
+	await expect(
+		loading.locator("[data-feed-pagination-wave-dot='true']"),
+	).toHaveCount(3);
+	tracker.releaseReadableSectionPage("readable-page-2");
+	await expect(loading).toHaveCount(0);
+});
+
+test("dashboard retries a failed readable page in place", async ({ page }) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPageFailures: ["readable-page-2"],
+		readableSectionPage: (cursor) =>
+			cursor === null
+				? {
+						sections: [
+							makeReadableBriefSection({
+								id: "brief-error-1",
+								date: "2026-04-30",
+								content: "## 第一页日报",
+							}),
+						],
+						next_cursor: "readable-page-2",
+					}
+				: {
+						sections: [
+							makeReadableBriefSection({
+								id: "brief-error-2",
+								date: "2026-04-29",
+								content: "## 重试后日报",
+							}),
+						],
+						next_cursor: null,
+					},
+	});
+
+	await page.goto("/");
+	await expect(page.getByRole("button", { name: "重试加载" })).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect
+		.poll(tracker.getReadableSectionRequests)
+		.toContain("readable-page-2");
+	await page.getByRole("button", { name: "重试加载" }).click();
+	await expect(page.getByText("重试后日报")).toBeVisible();
+	await expect
+		.poll(() =>
+			tracker
+				.getReadableSectionRequests()
+				.filter((cursor) => cursor === "readable-page-2"),
+		)
+		.toHaveLength(2);
+});
+
+test("dashboard stops after a readable cursor repeats", async ({ page }) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const tracker = await installDashboardBriefMocks(page, {
+		readableSectionPage: (cursor) =>
+			cursor === null
+				? {
+						sections: [
+							makeReadableBriefSection({
+								id: "repeat-cursor-first",
+								date: "2026-04-30",
+								content: "## 首个可读区块",
+							}),
+						],
+						next_cursor: "repeat-cursor",
+					}
+				: {
+						sections: [
+							makeReadableBriefSection({
+								id: "repeat-cursor-second",
+								date: "2026-04-29",
+								content: "## 重复 cursor 后仍只交付一次",
+							}),
+						],
+						next_cursor: "repeat-cursor",
+					},
+	});
+
+	await page.goto("/");
+	await expect(page.getByText("首个可读区块")).toBeVisible();
+	await scrollPaginationSentinelIntoView(page);
+	await expect(page.getByText("重复 cursor 后仍只交付一次")).toBeVisible();
+	await expect
+		.poll(() =>
+			tracker
+				.getReadableSectionRequests()
+				.filter((cursor) => cursor === "repeat-cursor"),
+		)
+		.toHaveLength(1);
+	await expect(
+		page.locator("[data-readable-pagination-end='true']"),
+	).toBeVisible();
+});
+
+test.skip("legacy: dashboard pauses pagination when an appended page is fully folded into a brief", async ({
 	page,
 }, testInfo) => {
 	await page.addInitScript(() => {
@@ -422,7 +963,7 @@ test("dashboard pauses pagination when an appended page is fully folded into a b
 	);
 });
 
-test("dashboard keeps paginating when an appended page remains visible at the sentinel", async ({
+test.skip("legacy: dashboard keeps paginating when an appended page remains visible at the sentinel", async ({
 	page,
 }, testInfo) => {
 	await page.addInitScript(() => {
@@ -487,7 +1028,7 @@ test("dashboard keeps paginating when an appended page remains visible at the se
 	);
 });
 
-test("dashboard shows pagination loading while the next page is in flight", async ({
+test.skip("legacy: dashboard shows pagination loading while the next page is in flight", async ({
 	page,
 }, testInfo) => {
 	await page.addInitScript(() => {
@@ -557,7 +1098,7 @@ test("dashboard shows pagination loading while the next page is in flight", asyn
 	await expect.poll(tracker.getFeedRequests).toEqual([null, "cursor-page-2"]);
 });
 
-test("dashboard resumes pagination when folded history switches to list view", async ({
+test.skip("legacy: dashboard resumes pagination when folded history switches to list view", async ({
 	page,
 }, testInfo) => {
 	await page.addInitScript(() => {
@@ -636,7 +1177,7 @@ test("dashboard resumes pagination when folded history switches to list view", a
 	);
 });
 
-test("dashboard retries an appended page before entering explicit continuation", async ({
+test.skip("legacy: dashboard retries an appended page before entering explicit continuation", async ({
 	page,
 }) => {
 	await page.addInitScript(() => {
@@ -888,7 +1429,7 @@ test("historical brief cards lazy-load full content, push to /briefs, and copy r
 	).toBeVisible();
 });
 
-test("historical brief detail failure stays inline and can retry", async ({
+test.skip("legacy: historical brief detail failure stays inline and can retry", async ({
 	page,
 }) => {
 	await page.addInitScript(() => {

@@ -4,7 +4,7 @@
 
 ## Lifecycle / Compatibility
 
-- 新主题；与既有 Dashboard 日分组和历史日报折叠规范兼容，不替代其阅读语义。
+- 本主题已被 [Dashboard 可读区块分页](../dashboard-readable-section-pagination/SPEC.md) 替代；后继主题保留日报优先阅读，但把分页边界从客户端渲染投影移到服务端可读区块。
 
 ## Replacements / Background
 

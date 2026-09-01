@@ -264,6 +264,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/notifications", get(api::list_notifications))
         .route("/webhooks/github/releases", post(webhook_push::receive))
         .route("/dashboard/updates", get(api::dashboard_updates))
+        .route("/dashboard/feed", get(api::dashboard_readable_feed))
+        .route(
+            "/dashboard/feed/sections/{section_id}/items",
+            get(api::dashboard_readable_section_items),
+        )
         .route("/feed", get(api::list_feed).head(api::head_feed))
         .route("/feed/reactions/refresh", post(api::refresh_feed_reactions))
         .route("/admin/users", get(api::admin_list_users))
