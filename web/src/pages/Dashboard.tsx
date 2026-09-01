@@ -2573,6 +2573,12 @@ export function Dashboard(props: {
 	const revealFeedUpdates = useCallback(
 		async (notice = activeFeedNotice) => {
 			if (!notice) return;
+			if (readableSectionsActive) {
+				await refreshFeed();
+				dismissFeedBoundary(notice.boundaryId);
+				await checkDashboardUpdates({ emit: false, include: ["feed"] });
+				return;
+			}
 			const freshKeys = notice.latestKeys.slice(0, notice.newCount);
 			const hasHydratedFreshItems = feed.items.some((item) =>
 				freshKeys.includes(feedItemKey(item)),
@@ -2597,13 +2603,20 @@ export function Dashboard(props: {
 			feed.freshKeys,
 			feed.items,
 			refreshFeed,
+			readableSectionsActive,
 			scrollToFreshFeedTop,
 		],
 	);
 
 	useEffect(() => {
 		const notice = activeFeedNotice;
-		if (!notice || feed.loadingInitial) return;
+		if (
+			!notice ||
+			(readableSectionsActive
+				? readableSections.loadingInitial
+				: feed.loadingInitial)
+		)
+			return;
 		const freshKeys = notice.latestKeys.slice(0, notice.newCount);
 		if (freshKeys.length === 0) return;
 		const hydratedKey = freshKeys.join("|");
@@ -2615,6 +2628,27 @@ export function Dashboard(props: {
 		const nextFreshKeys = Array.from(
 			new Set([...feed.freshKeys, ...freshKeys]),
 		);
+		if (readableSectionsActive) {
+			void refreshFeed()
+				.then(() => {
+					restoreFeedScrollAnchor(anchor);
+					dismissFeedBoundary(notice.boundaryId);
+					void checkDashboardUpdates({ emit: false, include: ["feed"] });
+				})
+				.catch((error) => {
+					if (
+						hydratedFeedNoticeRef.current.get(notice.boundaryId) === hydratedKey
+					) {
+						hydratedFeedNoticeRef.current.delete(notice.boundaryId);
+					}
+					notifyGlobalError(
+						"新动态显示失败",
+						error,
+						"新动态显示失败，请稍后重试。",
+					);
+				});
+			return;
+		}
 		void refreshFeed({
 			freshKeys: nextFreshKeys,
 			throwOnError: true,
@@ -2662,6 +2696,8 @@ export function Dashboard(props: {
 		feed.loadingInitial,
 		feedRequestType,
 		notifyGlobalError,
+		readableSections.loadingInitial,
+		readableSectionsActive,
 		refreshFeed,
 	]);
 
