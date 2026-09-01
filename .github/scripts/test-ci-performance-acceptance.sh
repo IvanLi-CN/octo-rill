@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 module_path = sys.argv[1]
@@ -107,6 +108,50 @@ except module.AcceptanceError as error:
     assert "different" in str(error)
 else:
     raise AssertionError("identical refs must be rejected")
+
+get_results = iter(
+    [
+        SimpleNamespace(returncode=1, stderr="TLS handshake timeout", stdout=""),
+        SimpleNamespace(returncode=1, stderr="unexpected EOF", stdout=""),
+        SimpleNamespace(returncode=0, stderr="", stdout='{"ok": true}'),
+    ]
+)
+get_calls = []
+sleep_calls = []
+original_run = module.subprocess.run
+original_sleep = module.time.sleep
+try:
+    def fake_get_run(command, **kwargs):
+        get_calls.append((command, kwargs))
+        return next(get_results)
+
+    module.subprocess.run = fake_get_run
+    module.time.sleep = lambda seconds: sleep_calls.append(seconds)
+    assert module.GhApi().api("repos/IvanLi-CN/octo-rill/actions/runs") == {"ok": True}
+    assert len(get_calls) == 3
+    assert sleep_calls == [1, 2]
+
+    post_calls = []
+
+    def fake_post_run(command, **kwargs):
+        post_calls.append((command, kwargs))
+        return SimpleNamespace(returncode=1, stderr="temporarily unavailable", stdout="")
+
+    module.subprocess.run = fake_post_run
+    try:
+        module.GhApi().api(
+            "repos/IvanLi-CN/octo-rill/actions/workflows/ci.yml/dispatches",
+            method="POST",
+            payload={"ref": "candidate"},
+        )
+    except module.AcceptanceError as error:
+        assert "POST" in str(error)
+    else:
+        raise AssertionError("POST failures must not be retried")
+    assert len(post_calls) == 1
+finally:
+    module.subprocess.run = original_run
+    module.time.sleep = original_sleep
 
 print("test-ci-performance-acceptance: all checks passed")
 PY

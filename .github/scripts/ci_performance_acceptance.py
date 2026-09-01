@@ -43,6 +43,18 @@ ALLOWED_CHANGED_PATHS = {
     "web/e2e/admin-jobs.spec.ts",
 }
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+TRANSIENT_GET_ERROR_MARKERS = (
+    "tls handshake timeout",
+    "eof",
+    "unexpected eof",
+    "connection reset by peer",
+    "connection refused",
+    "i/o timeout",
+    "context deadline exceeded",
+    "temporarily unavailable",
+    "network is unreachable",
+)
+GET_MAX_ATTEMPTS = 3
 
 
 class AcceptanceError(RuntimeError):
@@ -62,16 +74,23 @@ class GhApi:
         command = [self.gh_bin, "api", endpoint]
         if method != "GET":
             command.extend(["--method", method, "--input", "-"])
-        result = subprocess.run(
-            command,
-            input=json.dumps(payload) if payload is not None else None,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
+        for attempt in range(1, GET_MAX_ATTEMPTS + 1):
+            result = subprocess.run(
+                command,
+                input=json.dumps(payload) if payload is not None else None,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                break
             detail = result.stderr.strip() or result.stdout.strip()
-            raise AcceptanceError(f"gh api failed ({method} {endpoint}): {detail}")
+            can_retry = method == "GET" and any(
+                marker in detail.lower() for marker in TRANSIENT_GET_ERROR_MARKERS
+            )
+            if not can_retry or attempt == GET_MAX_ATTEMPTS:
+                raise AcceptanceError(f"gh api failed ({method} {endpoint}): {detail}")
+            time.sleep(2 ** (attempt - 1))
         try:
             return json.loads(result.stdout) if result.stdout.strip() else None
         except json.JSONDecodeError as exc:
