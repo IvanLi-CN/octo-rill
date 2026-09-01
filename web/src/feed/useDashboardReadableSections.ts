@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { apiGet } from "@/api";
+import { ApiError, apiGet } from "@/api";
 import type {
 	DashboardReadableFeedResponse,
 	DashboardReadableSection,
@@ -116,9 +116,37 @@ export function useDashboardReadableSections(options?: {
 		setNextCursor(null);
 		setDetails({});
 		try {
-			const response = await apiGet<DashboardReadableFeedResponse>(
-				"/api/dashboard/feed",
-			);
+			let response: DashboardReadableFeedResponse;
+			try {
+				response = await apiGet<DashboardReadableFeedResponse>(
+					"/api/dashboard/feed",
+				);
+			} catch (cause) {
+				// Keep rolling deployments and older test fixtures usable while the
+				// readable endpoint is introduced. A successful readable response
+				// always remains the only normal root-feed path.
+				if (!(cause instanceof ApiError) || cause.status !== 404) throw cause;
+				const legacy = await apiGet<FeedResponse>("/api/feed");
+				const legacyItems = legacy.items ?? [];
+				const firstTimestamp = legacyItems[0]?.ts ?? new Date(0).toISOString();
+				response = {
+					sections:
+						legacyItems.length > 0
+							? [
+									{
+										id: "legacy-feed",
+										date: firstTimestamp.slice(0, 10),
+										item_count: legacyItems.length,
+										brief: null,
+										items: legacyItems,
+										items_next_cursor: null,
+										supplemental_items: [],
+									},
+								]
+							: [],
+					next_cursor: null,
+				};
+			}
 			if (requestId !== requestIdRef.current) return;
 			setSections(response.sections ?? []);
 			setNextCursor(response.next_cursor ?? null);
