@@ -136,6 +136,7 @@ export function useDashboardReadableSections(options?: {
 									{
 										id: "legacy-feed",
 										date: firstTimestamp.slice(0, 10),
+										kind: "raw",
 										item_count: legacyItems.length,
 										brief: null,
 										items: legacyItems,
