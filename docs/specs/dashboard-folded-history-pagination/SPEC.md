@@ -1,6 +1,6 @@
 # Dashboard 折叠历史的可见进展分页
 
-> 当前有效规范以本文为准；实现覆盖与当前状态见 `./IMPLEMENTATION.md`，主题局部演进见 `./HISTORY.md`，持久决策的完整取舍见关联 ADR。
+> 本主题已被 [Dashboard 可读区块分页](../dashboard-readable-section-pagination/SPEC.md) 替代。下文保留为历史合同；当前实现不得再以显式续载作为根页的正常分页路径。
 
 ## 背景 / 问题陈述
 
