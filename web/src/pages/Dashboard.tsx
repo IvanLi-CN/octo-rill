@@ -1636,44 +1636,55 @@ export function Dashboard(props: {
 			: null;
 	const viewerStateKey = buildDashboardWarmViewerStateKey(me);
 	const readableMode = !scopedMode && tab === "all";
-	const feed = useFeed(feedRequestType, {
-		userId: me.user.id,
-		viewerStateKey,
-		initialData: readableMode ? null : warmFeedData,
-		scope,
-		enabled: !readableMode,
-	});
 	const readableSections = useDashboardReadableSections({
 		userId: me.user.id,
 		viewerStateKey,
 		enabled: readableMode,
 	});
+	const readableSectionsActive =
+		readableMode && !readableSections.legacyFallback;
+	const feed = useFeed(feedRequestType, {
+		userId: me.user.id,
+		viewerStateKey,
+		initialData: readableSectionsActive ? null : warmFeedData,
+		scope,
+		enabled: !readableSectionsActive,
+	});
 	const applyTranslationToActive = useCallback(
 		(item: Pick<FeedItem, "kind" | "id">, translated: TranslatedItem) => {
-			if (readableMode) {
+			if (readableSectionsActive) {
 				readableSections.applyTranslation(item, translated);
 			} else {
 				feed.applyTranslation(item, translated);
 			}
 		},
-		[feed.applyTranslation, readableMode, readableSections.applyTranslation],
+		[
+			feed.applyTranslation,
+			readableSectionsActive,
+			readableSections.applyTranslation,
+		],
 	);
 	const applySmartToActive = useCallback(
 		(item: Pick<FeedItem, "kind" | "id">, smart: SmartItem) => {
-			if (readableMode) readableSections.applySmart(item, smart);
+			if (readableSectionsActive) readableSections.applySmart(item, smart);
 			else feed.applySmart(item, smart);
 		},
-		[feed.applySmart, readableMode, readableSections.applySmart],
+		[feed.applySmart, readableSectionsActive, readableSections.applySmart],
 	);
 	const applyReactionsToActive = useCallback(
 		(item: Pick<FeedItem, "kind" | "id">, reactions: ReleaseReactions) => {
-			if (readableMode) readableSections.applyReactions(item, reactions);
+			if (readableSectionsActive)
+				readableSections.applyReactions(item, reactions);
 			else feed.applyReactions(item, reactions);
 		},
-		[feed.applyReactions, readableMode, readableSections.applyReactions],
+		[
+			feed.applyReactions,
+			readableSectionsActive,
+			readableSections.applyReactions,
+		],
 	);
 	const activeFeedItems = useMemo(() => {
-		if (!readableMode) return feed.items;
+		if (!readableSectionsActive) return feed.items;
 		return readableSections.sections.flatMap((section) => [
 			...(section.items ?? []),
 			...(section.supplemental_items ?? []),
@@ -1681,7 +1692,7 @@ export function Dashboard(props: {
 		]);
 	}, [
 		feed.items,
-		readableMode,
+		readableSectionsActive,
 		readableSections.details,
 		readableSections.sections,
 	]);
@@ -1692,7 +1703,7 @@ export function Dashboard(props: {
 		queryFn: apiGetFollowingRepos,
 		enabled: scope?.kind === "following" || scope?.kind === "repo",
 	});
-	const refreshFeed = readableMode
+	const refreshFeed = readableSectionsActive
 		? readableSections.loadInitial
 		: feed.refresh;
 	const followingRepos = followingReposQuery.data ?? null;
@@ -2444,7 +2455,11 @@ export function Dashboard(props: {
 		[feedRequestType],
 	);
 	const { checkNow: checkDashboardUpdates } = useDashboardLiveUpdates({
-		enabled: shellHydrated && !feed.loadingInitial,
+		enabled:
+			shellHydrated &&
+			(readableSectionsActive
+				? !readableSections.loadingInitial
+				: !feed.loadingInitial),
 		feedType: feedRequestType,
 		includeBriefs: !scopedMode,
 		includeNotifications:
@@ -3771,19 +3786,22 @@ export function Dashboard(props: {
 	const retryDashboardNetwork = useCallback(async () => {
 		await Promise.allSettled([
 			onRetryBoot?.(),
-			readableMode ? readableSections.loadInitial() : feed.loadInitial(),
+			readableSectionsActive
+				? readableSections.loadInitial()
+				: feed.loadInitial(),
 		]);
 	}, [
 		feed.loadInitial,
 		onRetryBoot,
-		readableMode,
+		readableSectionsActive,
 		readableSections.loadInitial,
 	]);
 
 	const renderFeedPanel = (
 		mode: "all" | "releases" | "stars" | "followers",
 	) => {
-		const rootReadable = mode === "all" && !scopedMode;
+		const rootReadable =
+			mode === "all" && !scopedMode && readableSectionsActive;
 		const filteredItems = filterFeedItemsForTab(feed.items, mode, {
 			scoped: scopedMode,
 		});
@@ -4162,7 +4180,7 @@ export function Dashboard(props: {
 	]);
 
 	useEffect(() => {
-		if (readableMode || feed.loadingInitial || sidebarLoading) {
+		if (readableSectionsActive || feed.loadingInitial || sidebarLoading) {
 			return;
 		}
 		persistDashboardWarmSnapshot({
@@ -4187,7 +4205,7 @@ export function Dashboard(props: {
 		routeState,
 		sidebarLoading,
 		feedRequestType,
-		readableMode,
+		readableSectionsActive,
 	]);
 
 	const showStartupSkeleton =

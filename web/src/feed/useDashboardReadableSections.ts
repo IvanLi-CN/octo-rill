@@ -92,6 +92,7 @@ export function useDashboardReadableSections(options?: {
 	const [loadingInitial, setLoadingInitial] = useState(true);
 	const [loadingMore, setLoadingMore] = useState(false);
 	const [error, setError] = useState<ReadableSectionsError | null>(null);
+	const [legacyFallback, setLegacyFallback] = useState(false);
 	const [details, setDetails] = useState<
 		Record<string, ReadableSectionDetails>
 	>({});
@@ -112,6 +113,7 @@ export function useDashboardReadableSections(options?: {
 		setLoadingInitial(true);
 		setLoadingMore(false);
 		setError(null);
+		setLegacyFallback(false);
 		setSections([]);
 		setNextCursor(null);
 		setDetails({});
@@ -125,8 +127,12 @@ export function useDashboardReadableSections(options?: {
 				// Keep rolling deployments and older test fixtures usable while the
 				// readable endpoint is introduced. A successful readable response
 				// always remains the only normal root-feed path.
-				if (!(cause instanceof ApiError) || cause.status !== 404) throw cause;
-				const legacy = await apiGet<FeedResponse>("/api/feed");
+				const endpointUnavailable =
+					(cause instanceof ApiError && cause.status === 404) ||
+					cause instanceof TypeError;
+				if (!endpointUnavailable) throw cause;
+				const legacy = await apiGet<FeedResponse>("/api/feed?limit=30");
+				setLegacyFallback(true);
 				const legacyItems = legacy.items ?? [];
 				const firstTimestamp = legacyItems[0]?.ts ?? new Date(0).toISOString();
 				response = {
@@ -145,7 +151,7 @@ export function useDashboardReadableSections(options?: {
 									},
 								]
 							: [],
-					next_cursor: null,
+					next_cursor: legacy.next_cursor ?? null,
 				};
 			}
 			if (requestId !== requestIdRef.current) return;
@@ -168,6 +174,7 @@ export function useDashboardReadableSections(options?: {
 			setLoadingInitial(false);
 			setLoadingMore(false);
 			setError(null);
+			setLegacyFallback(false);
 			setSections([]);
 			setNextCursor(null);
 			setDetails({});
@@ -388,6 +395,7 @@ export function useDashboardReadableSections(options?: {
 		loadingInitial,
 		loadingMore,
 		error,
+		legacyFallback,
 		details,
 		stats,
 		loadInitial,
