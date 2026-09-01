@@ -303,6 +303,62 @@ test("dashboard pauses pagination when an appended page is fully folded into a b
 	).toHaveCount(0);
 });
 
+test("dashboard keeps paginating when an appended page remains visible at the sentinel", async ({
+	page,
+}) => {
+	await page.addInitScript(() => {
+		window.localStorage.clear();
+	});
+
+	const firstPage = Array.from({ length: 30 }, (_, index) =>
+		makeReleaseFeedItem({
+			id: String(index + 1),
+			ts: `2026-04-${String(30 - Math.floor(index / 5)).padStart(2, "0")}T${String(10 - (index % 10)).padStart(2, "0")}:00:00Z`,
+			tag: `v${index + 1}`,
+			title: `Release ${index + 1}`,
+		}),
+	);
+	const release31 = makeReleaseFeedItem({
+		id: "31",
+		ts: "2026-04-24T09:12:00Z",
+		tag: "v31",
+		title: "Release 31",
+	});
+	const release32 = makeReleaseFeedItem({
+		id: "32",
+		ts: "2026-04-24T08:12:00Z",
+		tag: "v32",
+		title: "Release 32",
+	});
+
+	const tracker = await installDashboardBriefMocks(page, {
+		feedPage: (cursor) => {
+			if (cursor === null) {
+				return { items: firstPage, nextCursor: "cursor-page-2" };
+			}
+			if (cursor === "cursor-page-2") {
+				return { items: [release31], nextCursor: "cursor-page-3" };
+			}
+			return { items: [release32], nextCursor: null };
+		},
+	});
+
+	await page.goto("/");
+	await expect(page.locator('[data-feed-item-key="release:30"]')).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect.poll(tracker.getFeedRequests).toEqual([null]);
+
+	await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+	await expect(page.locator('[data-feed-item-key="release:32"]')).toBeVisible({
+		timeout: 15_000,
+	});
+	await expect
+		.poll(tracker.getFeedRequests)
+		.toEqual([null, "cursor-page-2", "cursor-page-3"]);
+	await expect(page.getByText("已到尽头（共 32 条）")).toBeVisible();
+});
+
 test("dashboard resumes pagination when folded history switches to list view", async ({
 	page,
 }) => {
