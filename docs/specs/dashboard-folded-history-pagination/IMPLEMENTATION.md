@@ -4,7 +4,7 @@
 
 ## Current Status
 
-- Implementation: 已实现，视觉证据已确认，PR 收口中
+- Implementation: 已实现，视觉证据已确认，PR #250 收口中
 - Lifecycle: active
 - Catalog note: 已确认采用显式续载，运行时、回归与 Storybook 覆盖已完成。
 
@@ -19,11 +19,12 @@
 
 ## Remaining Gaps
 
-- 创建 direct PR，绑定当前 head、CI 与最终交付事实。
+- 等待 PR #250 的必需 CI 与最终交付事实收敛。
 
 ## Related Changes
 
 - `web/src/feed/FeedGroupedList.tsx`
+- `web/src/index.css`
 - `web/e2e/dashboard-brief-detail.spec.ts`
 - `web/src/feed/FeedGroupedList.stories.tsx`
 

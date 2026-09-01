@@ -150,7 +150,7 @@ None。此主题不改变 HTTP、数据库、事件或公开组件接口；内�
 
 ## Related PRs
 
-- None
+- #250
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
