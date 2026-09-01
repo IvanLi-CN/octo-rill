@@ -158,7 +158,7 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const CompleteBriefAndSupplemental: Story = {
-	render: () => <Preview withDetails />,
+	render: () => <Preview />,
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		await expect(
@@ -236,5 +236,5 @@ export const NarrowViewport: Story = {
 	globals: {
 		viewport: { value: "mobile1", isRotated: false },
 	},
-	render: () => <Preview withDetails />,
+	render: () => <Preview />,
 };

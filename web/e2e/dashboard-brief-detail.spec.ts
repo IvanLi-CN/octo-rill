@@ -634,6 +634,11 @@ test("dashboard fetches covered raw releases only after switching a brief to lis
 		.poll(tracker.getReadableSectionItemRequests)
 		.toEqual([{ sectionId: "section-brief-list", cursor: null }]);
 	await expect(tracker.getFeedRequests()).toHaveLength(0);
+	await page.getByRole("button", { name: "日报" }).click();
+	await expect(page.getByText("Covered release appears in list")).toHaveCount(
+		0,
+	);
+	await expect(page.getByText("日报正文没有被截断。")).toBeVisible();
 });
 
 test("dashboard keeps a history date without a brief readable and manual", async ({

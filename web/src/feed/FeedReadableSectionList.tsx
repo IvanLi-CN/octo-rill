@@ -231,8 +231,10 @@ export function FeedReadableSectionList(props: {
 				const brief = section.brief;
 				const detail = details[section.id];
 				const inList = listSections.has(section.id);
-				const rawItems = inList
-					? (detail?.items ?? [])
+				const rawItems = brief
+					? inList
+						? (detail?.items ?? [])
+						: []
 					: mergeUnique([...(section.items ?? []), ...(detail?.items ?? [])]);
 				const detailCursor = detail
 					? detail.nextCursor
