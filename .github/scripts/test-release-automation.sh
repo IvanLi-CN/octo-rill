@@ -472,6 +472,25 @@ assert [candidate.pr_number for candidate in built_candidates] == [152, 151, 153
 
 release_workflow = contract.load_yaml(release_workflow_path)
 release_workflow_text = release_workflow_path.read_text(encoding="utf-8")
+notify_release_workflow_text = notify_release_workflow_path.read_text(encoding="utf-8")
+oidrune_notify_ref = "IvanLi-CN/oidrune/.github/workflows/notify.yml@e48822f99c6402a753ed86557ea029754cbab20b"
+
+
+def assert_oidrune_notify_contract(job, where, outcome, summary_fragments):
+    assert job.get("uses") == oidrune_notify_ref
+    assert job.get("permissions") == {"id-token": "write"}
+    assert "secrets" not in job
+    with_config = contract.require_mapping(job.get("with"), f"{where}.with")
+    assert set(with_config) == {"outcome", "summary"}
+    assert with_config.get("outcome") == outcome
+    summary = with_config.get("summary")
+    assert isinstance(summary, str)
+    for fragment in summary_fragments:
+        assert fragment in summary, f"{where}: summary missing {fragment!r}"
+    assert "gateway_url" not in with_config
+    assert "oidc_audience" not in with_config
+
+
 on_section = contract.require_mapping(contract.mapping_get(release_workflow, "on"), "release.yml.on")
 assert "workflow_run" not in on_section
 push_config = contract.event_config(release_workflow, "push", "release.yml")
@@ -626,26 +645,19 @@ for needed_job in [
     "audit-backfill",
 ]:
     assert f"needs.{needed_job}.result == 'failure'" in notify_if
-assert notify_job.get("permissions") == {}
-assert (
-    notify_job.get("uses")
-    == "IvanLi-CN/github-workflows/.github/workflows/release-failure-telegram.yml@main"
+assert_oidrune_notify_contract(
+    notify_job,
+    "release.yml.jobs.notify-on-failure",
+    "failure",
+    [
+        "title: Manual Release failure",
+        "project: ${{ github.repository }}",
+        "status: failure",
+        "target_sha: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || github.sha }}",
+        "run_url: ${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}",
+        "workflow: ${{ github.workflow }}",
+    ],
 )
-notify_with = contract.require_mapping(notify_job.get("with"), "release.yml.jobs.notify-on-failure.with")
-assert notify_with.get("repository") == "${{ github.repository }}"
-assert notify_with.get("workflow_name") == "${{ github.workflow }}"
-assert notify_with.get("conclusion") == "failure"
-assert notify_with.get("run_url") == "${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}"
-assert notify_with.get("ref_label") == "${{ github.ref_name && format('branch: {0}', github.ref_name) || 'ref: unavailable' }}"
-assert notify_with.get("head_sha") == "${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || github.sha }}"
-assert notify_with.get("run_attempt") == "${{ github.run_attempt }}"
-assert notify_with.get("actor") == "${{ github.actor }}"
-assert notify_with.get("event_name") == "${{ github.event_name }}"
-notify_secrets = contract.require_mapping(
-    notify_job.get("secrets"),
-    "release.yml.jobs.notify-on-failure.secrets",
-)
-assert notify_secrets.get("SHOUTRRR_URL") == "${{ secrets.SHOUTRRR_URL }}"
 
 notify_release_workflow = contract.load_yaml(notify_release_workflow_path)
 notify_failure_job = contract.job_config(
@@ -656,12 +668,43 @@ notify_failure_job = contract.job_config(
 notify_failure_if = notify_failure_job.get("if", "")
 assert "github.event.workflow_run.conclusion == 'failure'" in notify_failure_if
 assert "github.event.workflow_run.event != 'workflow_dispatch'" in notify_failure_if
+assert_oidrune_notify_contract(
+    notify_failure_job,
+    "notify-release-failure.yml.jobs.notify_failure",
+    "${{ github.event.workflow_run.conclusion }}",
+    [
+        "title: Release failure",
+        "project: ${{ github.repository }}",
+        "status: ${{ github.event.workflow_run.conclusion }}",
+        "target_sha: ${{ github.event.workflow_run.head_sha }}",
+        "run_url: ${{ github.event.workflow_run.html_url }}",
+        "workflow: ${{ github.event.workflow_run.name }}",
+    ],
+)
 smoke_job = contract.job_config(
     notify_release_workflow,
     "smoke_test",
     "notify-release-failure.yml",
 )
 assert smoke_job.get("if") == "${{ github.event_name == 'workflow_dispatch' }}"
+assert_oidrune_notify_contract(
+    smoke_job,
+    "notify-release-failure.yml.jobs.smoke_test",
+    "failure",
+    [
+        "title: Notify failed release smoke test",
+        "project: ${{ github.repository }}",
+        "status: failure",
+        "target_sha: ${{ github.sha }}",
+        "run_url: ${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}",
+        "workflow: Notify failed release",
+    ],
+)
+for workflow_text in (release_workflow_text, notify_release_workflow_text):
+    assert "IvanLi-CN/github-workflows/.github/workflows/release-failure-telegram.yml@main" not in workflow_text
+    assert "SHOUTRRR_URL" not in workflow_text
+    assert "gateway_url" not in workflow_text
+    assert "oidc_audience" not in workflow_text
 
 ci_workflow = contract.load_yaml(ci_workflow_path)
 lint_job = contract.job_config(ci_workflow, "lint", "ci.yml")

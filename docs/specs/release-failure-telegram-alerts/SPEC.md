@@ -1,45 +1,48 @@
 # Release 失败 Telegram 告警接入
 
-## 目标
+## Context and Scope
 
-为 `octo-rill` 接入共享的 Telegram 失败告警工作流，使真实 `Release` 失败能够通过 `workflow_run` 自动告警，同时保留一个安全的 repo-local `workflow_dispatch` smoke test 入口。
+### Context
 
-## 范围
+`octo-rill` needs a repository-local notification path for failed Release runs. The notification path covers both automatic `workflow_run` failures and the existing manual smoke entry point, while the Release workflow retains its manual backfill failure behavior.
 
-### In scope
+### Goals
 
-- 新增 `.github/workflows/notify-release-failure.yml`
-- 监听 `Release` workflow 的失败结果并转发到 `IvanLi-CN/github-workflows`
-- 复用单个 repo secret：`SHOUTRRR_URL`
-- 提供 repo-local `workflow_dispatch` smoke test
+- Route the three existing release-failure calls through the pinned Oidrune OIDC reusable workflow.
+- Keep the existing trigger filters, failure predicates, Release context, and project-specific behavior.
+- Make every caller provide the complete notification metadata required by Oidrune.
 
-### Out of scope
+### In Scope
 
-- 不修改现有 `Release` 发布逻辑
-- 不新增第二通知渠道
-- 不调整 release 版本计算、tag、GitHub Release 或镜像发布规则
+- `.github/workflows/notify-release-failure.yml` and its `notify_failure` and `smoke_test` jobs.
+- `.github/workflows/release.yml` and its inline `notify-on-failure` job.
+- The release-failure workflow contract tests and the associated implementation documentation.
 
-## 需求
+### Out of Scope
 
-### Must
+- Release version calculation, tags, GitHub Releases, Docker images, or other Release jobs.
+- Adding another notification channel or changing the existing workflow event filters.
+- Oidrune gateway control-plane configuration or a real Telegram smoke notification.
 
-- 当 `main` 上的 `Release` workflow 以 `failure` 结束时，必须触发 notifier workflow
-- notifier 必须显式调用 `IvanLi-CN/github-workflows/.github/workflows/release-failure-telegram.yml@main`
-- notifier 必须显式传入 `secrets.SHOUTRRR_URL`
-- notifier 必须保留 `workflow_dispatch` 入口，用于安全 smoke test
-- notifier 不能对非 `main` 分支的失败 run 发送 production-style 告警
+## Requirements
 
-## 验收标准
+- REQ-RELEASE-FAILURE-ROUTE: When a `Release` workflow fails on `main`, the notifier MUST preserve the existing `workflow_run` route and failure-only behavior.
+- REQ-TRUSTED-OIDRUNE-REF: All three caller jobs MUST use `IvanLi-CN/oidrune/.github/workflows/notify.yml@e48822f99c6402a753ed86557ea029754cbab20b`; a moving ref such as `@main` MUST NOT be used.
+- REQ-OIDC-PERMISSION: Each caller job MUST grant `id-token: write` to the reusable workflow.
+- REQ-CALLER-SUMMARY: Each caller MUST pass `outcome` and a complete `summary` containing the project name, status/result, target SHA, run URL, and the applicable failure, smoke, or Release title.
+- REQ-DEFAULT-GATEWAY: Callers MUST NOT pass `gateway_url` or `oidc_audience`, so Oidrune resolves its default gateway and audience.
+- REQ-NO-LEGACY-SECRET: Callers MUST NOT pass the legacy `SHOUTRRR_URL` secret or any other old Telegram secret wiring.
+- REQ-SMOKE-PATH: The existing `workflow_dispatch` smoke path MUST remain available and MUST call Oidrune with explicit smoke title/context.
+- REQ-NON-MAIN-FILTER: The notifier MUST continue excluding non-`main` Release failures from production-style notification behavior.
+- REQ-MANUAL-RELEASE-PREDICATE: The inline Release notifier MUST preserve its existing `needs` list and notify only when a relevant manual Release dependency fails.
 
-- Given `SHOUTRRR_URL` 已配置
-  When 手动运行 `notify-release-failure.yml`
-  Then Telegram 收到 smoke-test 消息
-- Given `Release` 在 `main` 上失败
-  When `notify-release-failure.yml` 接收 `workflow_run`
-  Then Telegram 收到失败告警
-- Given 某个非 `main` 分支手动触发 `Release`
-  When 该 run 失败
-  Then 不发送 production-style 失败告警
-- Given `Release` 成功
-  When notifier workflow 评估事件
-  Then 不发送失败告警
+## Verification
+
+- VER-WORKFLOW-ROUTE: The workflow contract test covers: REQ-RELEASE-FAILURE-ROUTE, REQ-TRUSTED-OIDRUNE-REF, REQ-OIDC-PERMISSION, REQ-DEFAULT-GATEWAY, and REQ-NO-LEGACY-SECRET.
+- VER-SUMMARY-METADATA: The workflow contract test covers: REQ-CALLER-SUMMARY by asserting project, status/result, target SHA, run URL, and title fragments for all three calls.
+- VER-SMOKE-FILTER: The workflow contract test covers: REQ-SMOKE-PATH and REQ-NON-MAIN-FILTER by asserting the manual trigger and existing workflow-run predicates.
+- VER-MANUAL-FAILURE: The workflow contract test covers: REQ-MANUAL-RELEASE-PREDICATE by asserting the unchanged `needs` list and failure conditions.
+
+## Related ADRs
+
+- None
