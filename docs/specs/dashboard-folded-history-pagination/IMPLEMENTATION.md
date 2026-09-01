@@ -4,7 +4,7 @@
 
 ## Current Status
 
-- Implementation: 已实现，视觉证据已确认，PR #250 收口中
+- Implementation: 已实现，视觉证据已确认，PR #250 merge-ready / Step 5C Ready
 - Lifecycle: active
 - Catalog note: 已确认采用显式续载，运行时、回归与 Storybook 覆盖已完成。
 
@@ -19,7 +19,7 @@
 
 ## Remaining Gaps
 
-- 等待 PR #250 的必需 CI 与最终交付事实收敛。
+- None
 
 ## Related Changes
 
