@@ -808,7 +808,7 @@ export function FeedGroupedList(
 	const paginationAttemptRef = useRef<{ beforeProjection: string } | null>(
 		null,
 	);
-	const previousItemsRef = useRef<FeedItem[] | null>(null);
+	const previousItemKeysRef = useRef<string | null>(null);
 	const wasLoadingMoreRef = useRef(false);
 	const [requiresExplicitContinuation, setRequiresExplicitContinuation] =
 		useState(false);
@@ -856,8 +856,10 @@ export function FeedGroupedList(
 		const nextProjection = readVisibleFeedProjection(feedRootRef.current);
 		const previousProjection = visibleProjectionRef.current;
 		const paginationAttempt = paginationAttemptRef.current;
+		const itemKeysSignature = items.map(keyOfFeedItem).join("\u001f");
 		const itemsReplaced =
-			previousItemsRef.current !== null && previousItemsRef.current !== items;
+			previousItemKeysRef.current !== null &&
+			previousItemKeysRef.current !== itemKeysSignature;
 
 		if (itemsReplaced && !paginationAttempt && !loadingMore) {
 			sentinelVisibleRef.current = false;
@@ -890,7 +892,7 @@ export function FeedGroupedList(
 		}
 
 		visibleProjectionRef.current = nextProjection;
-		previousItemsRef.current = items;
+		previousItemKeysRef.current = itemKeysSignature;
 		wasLoadingMoreRef.current = loadingMore;
 	});
 
