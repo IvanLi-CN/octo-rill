@@ -132,6 +132,7 @@ export function useDashboardReadableSections(options?: {
 					cause instanceof TypeError;
 				if (!endpointUnavailable) throw cause;
 				const legacy = await apiGet<FeedResponse>("/api/feed?limit=30");
+				if (requestId !== requestIdRef.current) return;
 				setLegacyFallback(true);
 				const legacyItems = legacy.items ?? [];
 				const firstTimestamp = legacyItems[0]?.ts ?? new Date(0).toISOString();
