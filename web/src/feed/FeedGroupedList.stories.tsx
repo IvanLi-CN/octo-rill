@@ -155,6 +155,8 @@ function FeedGroupedListPreview(props: {
 	now?: Date;
 	onGenerateBriefForDate?: FeedGroupedListProps["onGenerateBriefForDate"];
 	initialBriefErrorSummariesByDate?: Record<string, string>;
+	outerClassName?: string;
+	surfaceClassName?: string;
 }) {
 	const {
 		items = earlyMorningReleases,
@@ -162,14 +164,16 @@ function FeedGroupedListPreview(props: {
 		now,
 		onGenerateBriefForDate,
 		initialBriefErrorSummariesByDate,
+		outerClassName = "bg-background",
+		surfaceClassName = "",
 	} = props;
 	const selectedLaneByKey = Object.fromEntries(
 		items.map((item) => [`${item.kind}:${item.id}`, "original"]),
 	) as Record<string, FeedLane>;
 
 	return (
-		<div className="bg-background px-4 py-8 text-foreground sm:px-8">
-			<div className="mx-auto max-w-4xl">
+		<div className={`${outerClassName} px-4 py-8 text-foreground sm:px-8`}>
+			<div className={`mx-auto max-w-4xl ${surfaceClassName}`}>
 				<FeedGroupedList
 					mode="all"
 					items={items}
@@ -362,6 +366,27 @@ export const EarlyMorningRawFallbackDateLabel: Story = {
 		await expect(within(may6Group).getByText("2026-05-06")).toBeVisible();
 		await expect(canvas.getByText("Dozzle v10.5.2")).toBeVisible();
 		await expect(canvas.getByText("0.44.4")).toBeVisible();
+	},
+};
+
+export const FeedPaginationEndCentered: Story = {
+	name: "Feed Pagination End Centered",
+	render: () => (
+		<FeedGroupedListPreview
+			items={earlyMorningReleases.slice(0, 3)}
+			now={new Date("2026-05-08T12:00:00+08:00")}
+			outerClassName="bg-slate-800"
+			surfaceClassName="bg-background px-4 py-5 sm:px-6"
+		/>
+	),
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const endMarker = canvas.getByText("已到尽头（共 3 条）");
+		await expect(endMarker).toBeVisible();
+		expect(getComputedStyle(endMarker).textAlign).toBe("center");
+		await expect(
+			canvasElement.querySelectorAll("[data-feed-item-key]"),
+		).toHaveLength(3);
 	},
 };
 

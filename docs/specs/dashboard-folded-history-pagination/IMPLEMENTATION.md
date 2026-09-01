@@ -14,7 +14,7 @@
 - `FeedGroupedList` 以日组、视图和已渲染原始活动键组成可见投影；成功追加无投影变化时只在 `全部` tab 进入显式续载。
 - 续载按钮复用既有追加请求、去重、错误与加载状态；投影产生进展、tab/scope/首屏刷新或历史组切换到“列表”时清除暂停。
 - Dashboard mock cursor 序列已覆盖折叠暂停、显式续载、列表切换、分页失败重试和末页。
-- Storybook 已增加 `Feed/FeedGroupedList/Folded History Pagination Continuation` 场景。
+- Storybook 已增加 `Feed/FeedGroupedList/Folded History Pagination Continuation` 与末页居中场景，且末页状态有列表卡片数量和 computed `text-align` 断言。
 - Storybook 加载态使用无文字三点波浪胶囊，悬停 500ms 后显示 Tooltip；Dashboard mock E2E 已覆盖延迟行为。
 
 ## Remaining Gaps
@@ -24,6 +24,7 @@
 ## Related Changes
 
 - `web/src/feed/FeedGroupedList.tsx`
+- `web/src/feed/FeedList.tsx`
 - `web/src/index.css`
 - `web/e2e/dashboard-brief-detail.spec.ts`
 - `web/src/feed/FeedGroupedList.stories.tsx`

@@ -148,6 +148,9 @@ None。此主题不改变 HTTP、数据库、事件或公开组件接口；内�
 - `storybook_canvas` / 延迟 Tooltip：悬停加载胶囊后延迟显示 `加载中` 提示。
   ![加载胶囊 Tooltip](./assets/folded-history-loading-tooltip.png)
 
+- `storybook_canvas` / 末页居中：完整列表到达末页时，`已到尽头（共 3 条）` 与列表容器水平居中对齐。
+  ![末页提示水平居中](./assets/folded-history-end-centered.png)
+
 ## Related PRs
 
 - #250
