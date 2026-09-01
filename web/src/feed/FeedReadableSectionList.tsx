@@ -162,8 +162,11 @@ export function FeedReadableSectionList(props: {
 			const observer = new IntersectionObserver(
 				(entries) => {
 					if (!entries.some((entry) => entry.isIntersecting)) return;
-					detailRequestVisibleRef.current.add(`${sectionId}:${detailCursor}`);
+					const requestKey = `${sectionId}:${detailCursor}`;
+					detailRequestVisibleRef.current.add(requestKey);
 					onLoadSectionItems(sectionId, detailCursor);
+					// Let a changed cursor or an explicit retry schedule a new request.
+					detailRequestVisibleRef.current.delete(requestKey);
 				},
 				{ rootMargin: "0px", threshold: 0.01 },
 			);
