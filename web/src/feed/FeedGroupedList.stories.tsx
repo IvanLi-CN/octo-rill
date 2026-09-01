@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import type { ComponentProps } from "react";
-import { expect, within } from "storybook/test";
+import { useState, type ComponentProps } from "react";
+import { INITIAL_VIEWPORTS } from "storybook/viewport";
+import { expect, userEvent, within } from "storybook/test";
 
 import { FeedGroupedList } from "@/feed/FeedGroupedList";
 import type { FeedItem, FeedLane, ReleaseFeedItem } from "@/feed/types";
@@ -154,6 +155,8 @@ function FeedGroupedListPreview(props: {
 	now?: Date;
 	onGenerateBriefForDate?: FeedGroupedListProps["onGenerateBriefForDate"];
 	initialBriefErrorSummariesByDate?: Record<string, string>;
+	outerClassName?: string;
+	surfaceClassName?: string;
 }) {
 	const {
 		items = earlyMorningReleases,
@@ -161,14 +164,16 @@ function FeedGroupedListPreview(props: {
 		now,
 		onGenerateBriefForDate,
 		initialBriefErrorSummariesByDate,
+		outerClassName = "bg-background",
+		surfaceClassName = "",
 	} = props;
 	const selectedLaneByKey = Object.fromEntries(
 		items.map((item) => [`${item.kind}:${item.id}`, "original"]),
 	) as Record<string, FeedLane>;
 
 	return (
-		<div className="bg-background min-h-screen px-4 py-8 text-foreground sm:px-8">
-			<div className="mx-auto max-w-4xl">
+		<div className={`${outerClassName} px-4 py-8 text-foreground sm:px-8`}>
+			<div className={`mx-auto max-w-4xl ${surfaceClassName}`}>
 				<FeedGroupedList
 					mode="all"
 					items={items}
@@ -208,11 +213,130 @@ function FeedGroupedListPreview(props: {
 	);
 }
 
+const foldedHistoryBriefs: FeedGroupedListProps["briefs"] = [
+	{
+		id: "brief-folded-history-2026-05-07",
+		date: "2026-05-07",
+		window_start: "2026-05-06T16:00:00Z",
+		window_end: "2026-05-07T16:00:00Z",
+		effective_time_zone: "Asia/Shanghai",
+		effective_local_boundary: "00:00",
+		release_count: 2,
+		release_ids: ["folded-history-40", "folded-history-41"],
+		content_markdown: "## 历史日报\n\n日报已覆盖这一天的 Release。",
+		created_at: "2026-05-07T16:05:00Z",
+	},
+];
+
+const FEED_VIEWPORTS = {
+	...INITIAL_VIEWPORTS,
+	feedMobile393: {
+		name: "Feed mobile 393x852",
+		styles: {
+			height: "852px",
+			width: "393px",
+		},
+		type: "mobile",
+	},
+} as const;
+
+function FeedGroupedListContinuationPreview(props: {
+	forceLoadingMore?: boolean;
+	includeCurrentItem?: boolean;
+}) {
+	const { forceLoadingMore = false, includeCurrentItem = true } = props;
+	const currentItem = release("current-history-39", {
+		ts: "2026-05-08T10:00:00Z",
+		title: "Current history release 39",
+	});
+	const initialItem = release("folded-history-40", {
+		ts: "2026-05-07T10:27:01Z",
+		title: "Folded history release 40",
+	});
+	const foldedItem = release("folded-history-41", {
+		ts: "2026-05-07T09:12:00Z",
+		title: "Folded history release 41",
+	});
+	const visibleItem = release("visible-history-43", {
+		ts: "2026-05-06T09:12:00Z",
+		title: "Visible history release 43",
+	});
+	const [items, setItems] = useState<FeedItem[]>(() =>
+		includeCurrentItem ? [currentItem, initialItem] : [initialItem],
+	);
+	const [nextCursor, setNextCursor] = useState<string | null>("page-2");
+	const [loadingMore, setLoadingMore] = useState(false);
+	const paginationLoading = forceLoadingMore || loadingMore;
+	const selectedLaneByKey = Object.fromEntries(
+		items.map((item) => [`${item.kind}:${item.id}`, "original"]),
+	) as Record<string, FeedLane>;
+
+	const loadMore = () => {
+		if (forceLoadingMore || loadingMore || !nextCursor) return;
+		setLoadingMore(true);
+		window.setTimeout(() => {
+			if (nextCursor === "page-2") {
+				setItems((current) => [...current, foldedItem]);
+				setNextCursor("page-3");
+			} else {
+				setItems((current) => [...current, visibleItem]);
+				setNextCursor(null);
+			}
+			setLoadingMore(false);
+		}, 100);
+	};
+
+	return (
+		<div className="bg-slate-800 px-4 py-8 text-foreground sm:px-8">
+			<div
+				data-feed-grouped-list-preview="true"
+				className="mx-auto max-w-4xl bg-background px-[17px] pt-[17px] pb-[18px]"
+			>
+				<FeedGroupedList
+					mode="all"
+					items={items}
+					currentViewer={{
+						login: "IvanLi-CN",
+						avatar_url: "https://github.com/IvanLi-CN.png?size=96",
+						html_url: "https://github.com/IvanLi-CN",
+					}}
+					briefs={foldedHistoryBriefs}
+					dailyBoundaryLocal="00:00"
+					dailyBoundaryTimeZone="Asia/Shanghai"
+					dailyBoundaryUtcOffsetMinutes={480}
+					now={new Date("2026-05-08T12:00:00+08:00")}
+					error={null}
+					loadingInitial={false}
+					loadingMore={paginationLoading}
+					hasMore={Boolean(nextCursor)}
+					translationInFlightKeys={new Set()}
+					translationAutoRetryingKeys={new Set()}
+					smartInFlightKeys={new Set()}
+					smartAutoRetryingKeys={new Set()}
+					registerItemRef={() => () => {}}
+					selectedLaneByKey={selectedLaneByKey}
+					onLoadMore={loadMore}
+					onRetryInitial={() => {}}
+					onSelectLane={() => {}}
+					onTranslateNow={() => {}}
+					onSmartNow={() => {}}
+					reactionBusyKeys={new Set()}
+					reactionErrorByKey={{}}
+					onToggleReaction={() => {}}
+				/>
+			</div>
+		</div>
+	);
+}
+
 const meta = {
 	title: "Feed/FeedGroupedList",
 	component: FeedGroupedListPreview,
 	parameters: {
 		layout: "fullscreen",
+		viewport: {
+			options: FEED_VIEWPORTS,
+		},
 		docs: {
 			description: {
 				component:
@@ -245,6 +369,27 @@ export const EarlyMorningRawFallbackDateLabel: Story = {
 	},
 };
 
+export const FeedPaginationEndCentered: Story = {
+	name: "Feed Pagination End Centered",
+	render: () => (
+		<FeedGroupedListPreview
+			items={earlyMorningReleases.slice(0, 3)}
+			now={new Date("2026-05-08T12:00:00+08:00")}
+			outerClassName="bg-slate-800"
+			surfaceClassName="bg-background px-4 py-5 sm:px-6"
+		/>
+	),
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const endMarker = canvas.getByText("已到尽头（共 3 条）");
+		await expect(endMarker).toBeVisible();
+		expect(getComputedStyle(endMarker).textAlign).toBe("center");
+		await expect(
+			canvasElement.querySelectorAll("[data-feed-item-key]"),
+		).toHaveLength(3);
+	},
+};
+
 export const SanitizedProductionMay8Boundary: Story = {
 	name: "Sanitized Production May 8 Boundary",
 	render: () => (
@@ -271,6 +416,103 @@ export const SanitizedProductionMay8Boundary: Story = {
 		).map((element) => element.textContent?.replace(/\s+/g, " ").trim());
 		expect(labels).toContain("2026-05-07 · 1 条 Release");
 		expect(labels).toContain("2026-05-08 · 3 条 Release");
+	},
+};
+
+export const FoldedHistoryPaginationContinuation: Story = {
+	name: "Folded History Pagination Continuation",
+	render: () => <FeedGroupedListContinuationPreview />,
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const continueButton = canvas.getByRole("button", {
+			name: "继续加载历史动态",
+		});
+		await expect(continueButton).toBeVisible();
+		await continueButton.click();
+		await expect(canvas.getByText("Visible history release 43")).toBeVisible();
+		await expect(
+			canvas.queryByRole("button", { name: "继续加载历史动态" }),
+		).not.toBeInTheDocument();
+	},
+};
+
+export const FoldedHistoryPaginationPaused: Story = {
+	name: "Folded History Pagination Paused",
+	render: () => <FeedGroupedListContinuationPreview />,
+};
+
+export const FoldedHistoryPaginationLoading: Story = {
+	name: "Folded History Pagination Loading",
+	render: () => <FeedGroupedListContinuationPreview forceLoadingMore />,
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const body = within(canvasElement.ownerDocument.body);
+		await expect(canvas.getByRole("status")).toHaveAttribute(
+			"aria-label",
+			"加载中",
+		);
+		expect(canvas.getByRole("status")).not.toHaveTextContent("加载中");
+		const loadingIndicator = canvasElement.querySelector<HTMLElement>(
+			"[data-feed-pagination-loading='true']",
+		);
+		expect(loadingIndicator).toBeTruthy();
+		await expect(
+			loadingIndicator?.querySelectorAll(
+				"[data-feed-pagination-wave-dot='true']",
+			),
+		).toHaveLength(3);
+		await userEvent.hover(loadingIndicator as HTMLElement);
+		expect(body.queryByRole("tooltip")).not.toBeInTheDocument();
+		await expect(await body.findByRole("tooltip")).toHaveTextContent("加载中");
+	},
+};
+
+export const FoldedHistoryPaginationListView: Story = {
+	name: "Folded History Pagination List View",
+	render: () => (
+		<FeedGroupedListContinuationPreview includeCurrentItem={false} />
+	),
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("button", { name: "继续加载历史动态" }),
+		).toBeVisible();
+		const historicalGroup = canvasElement.querySelector<HTMLElement>(
+			'[data-feed-brief-date="2026-05-07"]',
+		);
+		expect(historicalGroup).toBeTruthy();
+		if (!historicalGroup) {
+			throw new Error("Expected folded history group");
+		}
+		await expect(
+			within(historicalGroup).getByRole("button", { name: "列表" }),
+		).toBeVisible();
+		await within(historicalGroup).getByRole("button", { name: "列表" }).click();
+		await expect(canvas.getByText("Folded history release 40")).toBeVisible();
+		await expect(canvas.getByText("Folded history release 41")).toBeVisible();
+		await expect(
+			within(historicalGroup).getByRole("button", { name: "日报" }),
+		).toBeVisible();
+	},
+};
+
+export const FoldedHistoryPaginationPausedMobile: Story = {
+	name: "Folded History Pagination Paused Mobile",
+	globals: {
+		viewport: { value: "feedMobile393", isRotated: false },
+	},
+	render: () => <FeedGroupedListContinuationPreview />,
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const continueButton = canvas.getByRole("button", {
+			name: "继续加载历史动态",
+		});
+		await expect(continueButton).toBeVisible();
+		const buttonBounds = continueButton.getBoundingClientRect();
+		expect(buttonBounds.left).toBeGreaterThanOrEqual(0);
+		expect(buttonBounds.right).toBeLessThanOrEqual(
+			canvasElement.ownerDocument.documentElement.clientWidth,
+		);
 	},
 };
 

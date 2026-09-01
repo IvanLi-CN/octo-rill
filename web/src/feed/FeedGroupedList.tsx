@@ -1,4 +1,5 @@
 import {
+	ArrowDown,
 	ArrowUpRight,
 	ArrowUpToLine,
 	Copy,
@@ -13,6 +14,7 @@ import {
 	type ReactNode,
 	useCallback,
 	useEffect,
+	useLayoutEffect,
 	useMemo,
 	useRef,
 	useState,
@@ -22,6 +24,12 @@ import { Markdown } from "@/components/Markdown";
 import { ErrorBubble } from "@/components/feedback/ErrorBubble";
 import { ErrorStatePanel } from "@/components/feedback/ErrorStatePanel";
 import { Button } from "@/components/ui/button";
+import {
+	Tooltip,
+	TooltipContent,
+	TooltipProvider,
+	TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { FeedItems, type FeedCardListProps } from "@/feed/FeedList";
 import {
 	type BriefSnapshotCandidate,
@@ -86,6 +94,22 @@ type NewContentBoundary = {
 
 function keyOfFeedItem(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
+}
+
+function readVisibleFeedProjection(root: HTMLElement | null) {
+	if (!root) return "";
+
+	return JSON.stringify(
+		Array.from(root.querySelectorAll<HTMLElement>("[data-feed-group-id]")).map(
+			(group) => ({
+				id: group.dataset.feedGroupId ?? "",
+				view: group.dataset.feedGroupView ?? "",
+				itemKeys: Array.from(
+					group.querySelectorAll<HTMLElement>("[data-feed-item-key]"),
+				).map((item) => item.dataset.feedItemKey ?? ""),
+			}),
+		),
+	);
 }
 
 function isBoundaryOutsideViewport(element: HTMLElement) {
@@ -774,13 +798,26 @@ export function FeedGroupedList(
 		...feedCardProps
 	} = props;
 	const scopedFeed = Boolean(feedCardProps.currentScope);
+	const feedScopeSignature = useMemo(
+		() => JSON.stringify(feedCardProps.currentScope ?? null),
+		[feedCardProps.currentScope],
+	);
 	const visibleBriefs = useMemo(
 		() => (scopedFeed ? [] : briefs),
 		[briefs, scopedFeed],
 	);
 
 	const sentinelRef = useRef<HTMLDivElement | null>(null);
+	const feedRootRef = useRef<HTMLDivElement | null>(null);
 	const sentinelVisibleRef = useRef(false);
+	const visibleProjectionRef = useRef("");
+	const paginationAttemptRef = useRef<{ beforeProjection: string } | null>(
+		null,
+	);
+	const previousItemKeysRef = useRef<string | null>(null);
+	const wasLoadingMoreRef = useRef(false);
+	const [requiresExplicitContinuation, setRequiresExplicitContinuation] =
+		useState(false);
 	const [rawListGroupIds, setRawListGroupIds] = useState<Set<string>>(
 		() => new Set<string>(),
 	);
@@ -796,8 +833,84 @@ export function FeedGroupedList(
 		error?.phase === "initial" && items.length === 0 ? error : null;
 	const appendError = error?.phase === "append" ? error : null;
 
+	const requestLoadMore = useCallback(
+		(source: "auto" | "manual") => {
+			if (source === "auto" && requiresExplicitContinuation) return;
+			paginationAttemptRef.current = {
+				beforeProjection: visibleProjectionRef.current,
+			};
+			sentinelVisibleRef.current = true;
+			onLoadMore();
+		},
+		[onLoadMore, requiresExplicitContinuation],
+	);
+
 	useEffect(() => {
-		if (!hasMore || loadingInitial || loadingMore || appendError) return;
+		sentinelVisibleRef.current = false;
+		paginationAttemptRef.current = null;
+		setRequiresExplicitContinuation(false);
+	}, [feedScopeSignature, mode]);
+
+	useEffect(() => {
+		if (!loadingInitial) return;
+		sentinelVisibleRef.current = false;
+		paginationAttemptRef.current = null;
+		setRequiresExplicitContinuation(false);
+	}, [loadingInitial]);
+
+	useLayoutEffect(() => {
+		const nextProjection = readVisibleFeedProjection(feedRootRef.current);
+		const previousProjection = visibleProjectionRef.current;
+		const paginationAttempt = paginationAttemptRef.current;
+		const itemKeysSignature = items.map(keyOfFeedItem).join("\u001f");
+		const itemsReplaced =
+			previousItemKeysRef.current !== null &&
+			previousItemKeysRef.current !== itemKeysSignature;
+
+		if (itemsReplaced && !paginationAttempt && !loadingMore) {
+			sentinelVisibleRef.current = false;
+			setRequiresExplicitContinuation(false);
+		}
+		if (
+			requiresExplicitContinuation &&
+			!loadingMore &&
+			!paginationAttempt &&
+			previousProjection !== "" &&
+			previousProjection !== nextProjection
+		) {
+			sentinelVisibleRef.current = false;
+			setRequiresExplicitContinuation(false);
+		}
+
+		if (wasLoadingMoreRef.current && !loadingMore && paginationAttempt) {
+			sentinelVisibleRef.current = false;
+			if (
+				!appendError &&
+				mode === "all" &&
+				hasMore &&
+				paginationAttempt.beforeProjection === nextProjection
+			) {
+				setRequiresExplicitContinuation(true);
+			} else {
+				setRequiresExplicitContinuation(false);
+			}
+			paginationAttemptRef.current = null;
+		}
+
+		visibleProjectionRef.current = nextProjection;
+		previousItemKeysRef.current = itemKeysSignature;
+		wasLoadingMoreRef.current = loadingMore;
+	});
+
+	useEffect(() => {
+		if (
+			!hasMore ||
+			loadingInitial ||
+			loadingMore ||
+			appendError ||
+			requiresExplicitContinuation
+		)
+			return;
 		const el = sentinelRef.current;
 		if (!el) return;
 
@@ -805,8 +918,7 @@ export function FeedGroupedList(
 			(entries) => {
 				const isIntersecting = entries.some((entry) => entry.isIntersecting);
 				if (isIntersecting && !sentinelVisibleRef.current) {
-					sentinelVisibleRef.current = true;
-					onLoadMore();
+					requestLoadMore("auto");
 					return;
 				}
 				if (!isIntersecting) {
@@ -818,7 +930,14 @@ export function FeedGroupedList(
 
 		obs.observe(el);
 		return () => obs.disconnect();
-	}, [appendError, hasMore, loadingInitial, loadingMore, onLoadMore]);
+	}, [
+		appendError,
+		hasMore,
+		loadingInitial,
+		loadingMore,
+		requiresExplicitContinuation,
+		requestLoadMore,
+	]);
 
 	useEffect(() => {
 		if (appendError) {
@@ -928,10 +1047,13 @@ export function FeedGroupedList(
 		});
 		setBriefErrorsByDate((current) => {
 			const next = new Map(current);
+			let changed = false;
 			for (const brief of visibleBriefs) {
-				next.delete(brief.date);
+				if (next.delete(brief.date)) {
+					changed = true;
+				}
 			}
-			return next;
+			return changed ? next : current;
 		});
 	}, [groups, visibleBriefs]);
 
@@ -941,7 +1063,7 @@ export function FeedGroupedList(
 		[items, newContentBoundaries],
 	);
 	return (
-		<div className="space-y-3 sm:space-y-4">
+		<div ref={feedRootRef} className="space-y-3 sm:space-y-4">
 			{blockingError ? (
 				<ErrorStatePanel
 					title="动态加载失败"
@@ -1149,6 +1271,8 @@ export function FeedGroupedList(
 						);
 					}
 				}
+				const renderDayDivider =
+					showDivider || (!showBriefPanel && groupAction !== null);
 
 				return (
 					<section
@@ -1175,7 +1299,7 @@ export function FeedGroupedList(
 								releaseCount={group.releaseCount}
 								activityCount={group.activityCount}
 								action={groupAction}
-								showDivider={showDivider}
+								showDivider={renderDayDivider}
 								showBriefPanel={showBriefPanel}
 								brief={pendingBrief ? null : brief}
 								generationErrorState={briefGenerationError}
@@ -1240,7 +1364,7 @@ export function FeedGroupedList(
 									releaseCount={group.releaseCount}
 									activityCount={group.activityCount}
 									action={groupAction}
-									showDivider={showDivider}
+									showDivider={renderDayDivider}
 								/>
 								{renderFeedItemsWithBoundaries(
 									group.items,
@@ -1253,10 +1377,44 @@ export function FeedGroupedList(
 				);
 			})}
 
-			<div ref={sentinelRef} />
+			<div ref={sentinelRef} data-feed-pagination-sentinel="true" />
 
 			{loadingMore ? (
-				<p className="text-muted-foreground font-mono text-xs">加载中…</p>
+				<div
+					className="flex justify-center pt-1"
+					aria-label="加载中"
+					data-feed-pagination-loading="true"
+					role="status"
+				>
+					<TooltipProvider delayDuration={500} skipDelayDuration={0}>
+						<Tooltip>
+							<TooltipTrigger asChild>
+								<span className="feed-pagination-loading-pill text-muted-foreground inline-flex items-center rounded-full px-5 py-2 shadow-sm">
+									<span
+										aria-hidden="true"
+										className="feed-pagination-wave inline-flex items-center gap-1"
+									>
+										<span
+											className="feed-pagination-wave-dot size-1.5 rounded-full"
+											data-feed-pagination-wave-dot="true"
+										/>
+										<span
+											className="feed-pagination-wave-dot size-1.5 rounded-full"
+											data-feed-pagination-wave-dot="true"
+										/>
+										<span
+											className="feed-pagination-wave-dot size-1.5 rounded-full"
+											data-feed-pagination-wave-dot="true"
+										/>
+									</span>
+								</span>
+							</TooltipTrigger>
+							<TooltipContent side="top" sideOffset={8}>
+								加载中
+							</TooltipContent>
+						</Tooltip>
+					</TooltipProvider>
+				</div>
 			) : null}
 
 			{appendError ? (
@@ -1274,7 +1432,7 @@ export function FeedGroupedList(
 							className="font-mono text-xs"
 							onClick={() => {
 								setLoadMoreBubbleOpen(false);
-								onLoadMore();
+								requestLoadMore("manual");
 							}}
 						>
 							继续加载
@@ -1283,8 +1441,32 @@ export function FeedGroupedList(
 				</div>
 			) : null}
 
+			{!appendError &&
+			!loadingMore &&
+			requiresExplicitContinuation &&
+			hasMore ? (
+				<div
+					className="flex justify-center pt-1"
+					data-feed-pagination-continuation="true"
+				>
+					<Button
+						type="button"
+						variant="outline"
+						size="sm"
+						className="font-mono text-xs"
+						onClick={() => requestLoadMore("manual")}
+					>
+						<ArrowDown className="size-3.5" />
+						继续加载历史动态
+					</Button>
+				</div>
+			) : null}
+
 			{!appendError && !hasMore && items.length > 0 ? (
-				<p className="text-muted-foreground font-mono text-xs">
+				<p
+					className="text-muted-foreground w-full text-center font-mono text-xs"
+					data-feed-pagination-end="true"
+				>
 					已到尽头（共 {items.length} 条）
 				</p>
 			) : null}

@@ -198,7 +198,10 @@ export function FeedList(
 			) : null}
 
 			{!hasMore && items.length > 0 ? (
-				<p className="text-muted-foreground font-mono text-xs">
+				<p
+					className="text-muted-foreground w-full text-center font-mono text-xs"
+					data-feed-pagination-end="true"
+				>
 					已到尽头（共 {items.length} 条）
 				</p>
 			) : null}
