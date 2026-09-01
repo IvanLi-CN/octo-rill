@@ -402,6 +402,30 @@ export const FoldedHistoryPaginationPaused: Story = {
 	render: () => <FeedGroupedListContinuationPreview />,
 };
 
+export const FoldedHistoryPaginationListView: Story = {
+	name: "Folded History Pagination List View",
+	render: () => <FeedGroupedListContinuationPreview />,
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const historicalGroup = canvasElement.querySelector<HTMLElement>(
+			'[data-feed-brief-date="2026-05-07"]',
+		);
+		expect(historicalGroup).toBeTruthy();
+		if (!historicalGroup) {
+			throw new Error("Expected folded history group");
+		}
+		await expect(
+			within(historicalGroup).getByRole("button", { name: "列表" }),
+		).toBeVisible();
+		await within(historicalGroup).getByRole("button", { name: "列表" }).click();
+		await expect(canvas.getByText("Folded history release 40")).toBeVisible();
+		await expect(canvas.getByText("Folded history release 41")).toBeVisible();
+		await expect(
+			within(historicalGroup).getByRole("button", { name: "日报" }),
+		).toBeVisible();
+	},
+};
+
 export const FoldedHistoryPaginationPausedMobile: Story = {
 	name: "Folded History Pagination Paused Mobile",
 	globals: {
