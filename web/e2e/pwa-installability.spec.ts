@@ -7,7 +7,7 @@ import {
 	type ServerResponse,
 } from "node:http";
 import path from "node:path";
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type CDPSession, type Page } from "@playwright/test";
 
 test.describe.configure({ mode: "serial" });
 
@@ -25,6 +25,7 @@ type StaticPwaServer = {
 	setPwaRelease: (release: "v1" | "v2") => void;
 	getApiMeRequests: () => number;
 	getManifestRequests: () => number;
+	getBrowserManifestRequests: () => number;
 	getInstallIconRequests: () => number;
 	getServiceWorkerRequests: () => number;
 	getSkipWaitingMessages: () => number;
@@ -152,6 +153,7 @@ async function startStaticPwaServer(): Promise<StaticPwaServer> {
 	let activeRelease: PwaRelease = releases.v1;
 	let apiMeRequests = 0;
 	let manifestRequests = 0;
+	let browserManifestRequests = 0;
 	let installIconRequests = 0;
 	let serviceWorkerRequests = 0;
 	let skipWaitingMessages = 0;
@@ -198,6 +200,9 @@ async function startStaticPwaServer(): Promise<StaticPwaServer> {
 			try {
 				if (requestUrl.pathname === "/manifest.webmanifest") {
 					manifestRequests += 1;
+					if (request.headers["sec-fetch-dest"] === "manifest") {
+						browserManifestRequests += 1;
+					}
 				}
 				if (isContentHashedInstallIconPath(requestUrl.pathname)) {
 					installIconRequests += 1;
@@ -275,6 +280,9 @@ self.addEventListener("message", (event) => {
 		getManifestRequests() {
 			return manifestRequests;
 		},
+		getBrowserManifestRequests() {
+			return browserManifestRequests;
+		},
 		getInstallIconRequests() {
 			return installIconRequests;
 		},
@@ -343,47 +351,58 @@ async function emulateInstalledChromiumLaunch(page: Page) {
 	});
 }
 
-async function readInstallMetadata(page: Page) {
-	return page.evaluate(async () => {
-		const manifestLink = document.querySelector(
-			'link[rel~="manifest"]',
-		) as HTMLLinkElement | null;
-		if (!manifestLink)
-			throw new Error("product index is missing its manifest link");
+function manifestPath(value: string | undefined, origin: string) {
+	return value ? new URL(value, origin).pathname : value;
+}
 
-		const manifestResponse = await fetch(manifestLink.href);
-		if (!manifestResponse.ok) {
-			throw new Error(`manifest request failed: ${manifestResponse.status}`);
-		}
-		const manifest = (await manifestResponse.json()) as {
+async function readInstallMetadata(page: Page, cdpSession: CDPSession) {
+	const appManifest = (await cdpSession.send("Page.getAppManifest")) as {
+		url?: string;
+		errors?: Array<{ message?: string }>;
+		manifest?: {
 			id?: string;
-			start_url?: string;
+			startUrl?: string;
 			scope?: string;
-			icons?: Array<{ src?: string }>;
+			icons?: Array<{ url?: string }>;
 		};
-		const icons = await Promise.all(
-			(manifest.icons ?? []).map(async (icon) => {
-				if (!icon.src) throw new Error("manifest icon is missing src");
-				const iconResponse = await fetch(
-					new URL(icon.src, manifestResponse.url),
-				);
+	};
+	if (appManifest.errors?.length) {
+		throw new Error(
+			`browser manifest parser failed: ${appManifest.errors
+				.map((error) => error.message)
+				.join("; ")}`,
+		);
+	}
+	if (!appManifest.manifest) {
+		throw new Error("browser manifest parser returned no manifest");
+	}
+
+	const origin = new URL(page.url()).origin;
+	const iconUrls = (appManifest.manifest.icons ?? []).map((icon) => {
+		if (!icon.url) throw new Error("browser manifest icon is missing url");
+		return icon.url;
+	});
+	const icons = await page.evaluate(async (urls) => {
+		return Promise.all(
+			urls.map(async (url) => {
+				const iconResponse = await fetch(url);
 				if (!iconResponse.ok) {
 					throw new Error(`icon request failed: ${iconResponse.status}`);
 				}
 				return {
-					src: new URL(icon.src, manifestResponse.url).pathname,
+					src: new URL(url).pathname,
 					byteLength: (await iconResponse.arrayBuffer()).byteLength,
 				};
 			}),
 		);
+	}, iconUrls);
 
-		return {
-			id: manifest.id,
-			startUrl: manifest.start_url,
-			scope: manifest.scope,
-			icons,
-		};
-	});
+	return {
+		id: manifestPath(appManifest.manifest.id, origin),
+		startUrl: manifestPath(appManifest.manifest.startUrl, origin),
+		scope: manifestPath(appManifest.manifest.scope, origin),
+		icons,
+	};
 }
 
 async function dispatchBeforeInstallPrompt(
@@ -599,9 +618,10 @@ test("install metadata stays network-revalidated outside the service worker prec
 		await page.goto(server.origin);
 		await waitForServiceWorkerControl(page);
 
+		const cdpSession = await page.context().newCDPSession(page);
 		const manifestRequestsBefore = server.getManifestRequests();
 		const installIconRequestsBefore = server.getInstallIconRequests();
-		const metadata = await readInstallMetadata(page);
+		const metadata = await readInstallMetadata(page, cdpSession);
 		expect(metadata.icons).toHaveLength(3);
 		expect(metadata.icons.every((icon) => icon.byteLength > 0)).toBe(true);
 
@@ -633,7 +653,7 @@ test("same Chromium standalone app context retrieves V2 install metadata after a
 	const server = await startStaticPwaServer();
 	try {
 		// Playwright cannot drive the OS install UI; this models an installed Chromium
-		// desktop/WebAPK launch while keeping browser metadata requests real.
+		// desktop/WebAPK launch. Page.getAppManifest keeps Manifest parsing browser-owned.
 		await emulateInstalledChromiumLaunch(page);
 		await page.goto(server.origin);
 		expect(
@@ -642,9 +662,11 @@ test("same Chromium standalone app context retrieves V2 install metadata after a
 			),
 		).toBe(true);
 		await waitForServiceWorkerControl(page);
+		const cdpSession = await page.context().newCDPSession(page);
 
-		const v1 = await readInstallMetadata(page);
+		const v1 = await readInstallMetadata(page, cdpSession);
 		const v1ManifestRequests = server.getManifestRequests();
+		const v1BrowserManifestRequests = server.getBrowserManifestRequests();
 		const v1InstallIconRequests = server.getInstallIconRequests();
 		const v1ServiceWorkerRequests = server.getServiceWorkerRequests();
 		expect(v1).toMatchObject({ id: "/", startUrl: "/", scope: "/" });
@@ -661,7 +683,7 @@ test("same Chromium standalone app context retrieves V2 install metadata after a
 			.poll(() => server.getServiceWorkerRequests())
 			.toBeGreaterThan(v1ServiceWorkerRequests);
 
-		const v2 = await readInstallMetadata(page);
+		const v2 = await readInstallMetadata(page, cdpSession);
 		expect(v2).toMatchObject({ id: "/", startUrl: "/", scope: "/" });
 		expect(v2.icons).toHaveLength(3);
 		expect(v2.icons.every((icon) => icon.byteLength > 0)).toBe(true);
@@ -686,6 +708,9 @@ test("same Chromium standalone app context retrieves V2 install metadata after a
 				?.byteLength,
 		);
 		expect(server.getManifestRequests()).toBeGreaterThan(v1ManifestRequests);
+		expect(server.getBrowserManifestRequests()).toBeGreaterThan(
+			v1BrowserManifestRequests,
+		);
 		expect(server.getInstallIconRequests()).toBeGreaterThan(
 			v1InstallIconRequests,
 		);
