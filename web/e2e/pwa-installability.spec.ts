@@ -327,6 +327,22 @@ async function waitForServiceWorkerControl(page: Page) {
 	});
 }
 
+async function emulateInstalledChromiumLaunch(page: Page) {
+	await page.addInitScript(() => {
+		const nativeMatchMedia = window.matchMedia.bind(window);
+		window.matchMedia = (query: string) => {
+			const mediaQueryList = nativeMatchMedia(query);
+			if (query !== "(display-mode: standalone)") return mediaQueryList;
+			return new Proxy(mediaQueryList, {
+				get(target, property, receiver) {
+					if (property === "matches") return true;
+					return Reflect.get(target, property, receiver);
+				},
+			});
+		};
+	});
+}
+
 async function readInstallMetadata(page: Page) {
 	return page.evaluate(async () => {
 		const manifestLink = document.querySelector(
@@ -335,9 +351,7 @@ async function readInstallMetadata(page: Page) {
 		if (!manifestLink)
 			throw new Error("product index is missing its manifest link");
 
-		const manifestResponse = await fetch(manifestLink.href, {
-			cache: "no-store",
-		});
+		const manifestResponse = await fetch(manifestLink.href);
 		if (!manifestResponse.ok) {
 			throw new Error(`manifest request failed: ${manifestResponse.status}`);
 		}
@@ -352,9 +366,6 @@ async function readInstallMetadata(page: Page) {
 				if (!icon.src) throw new Error("manifest icon is missing src");
 				const iconResponse = await fetch(
 					new URL(icon.src, manifestResponse.url),
-					{
-						cache: "no-store",
-					},
 				);
 				if (!iconResponse.ok) {
 					throw new Error(`icon request failed: ${iconResponse.status}`);
@@ -616,12 +627,20 @@ test("install metadata stays network-revalidated outside the service worker prec
 	}
 });
 
-test("same Chromium context retrieves V2 install metadata after a V1 app update", async ({
+test("same Chromium standalone app context retrieves V2 install metadata after a V1 app update", async ({
 	page,
 }) => {
 	const server = await startStaticPwaServer();
 	try {
+		// Playwright cannot drive the OS install UI; this models an installed Chromium
+		// desktop/WebAPK launch while keeping browser metadata requests real.
+		await emulateInstalledChromiumLaunch(page);
 		await page.goto(server.origin);
+		expect(
+			await page.evaluate(
+				() => window.matchMedia("(display-mode: standalone)").matches,
+			),
+		).toBe(true);
 		await waitForServiceWorkerControl(page);
 
 		const v1 = await readInstallMetadata(page);

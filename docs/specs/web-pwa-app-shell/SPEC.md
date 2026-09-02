@@ -46,7 +46,7 @@ The PWA layer is an enhancement around the existing React + Vite app shell and A
 - Production build emits `manifest.webmanifest`, `sw.js`, `pwa-precache-manifest.json`, and PNG app icons.
 - Browser installability checks identify the app as installable and expose the declared screenshots and shortcuts.
 - The build and static-server contracts prove manifest identity stability, content-hashed icon URL/content consistency, revalidation of install metadata, immutable caching for hashed icons, and Service Worker exclusion of install metadata.
-- A Chromium desktop / Android Chrome-WebAPK update regression models an already-installed V1, then proves normal V2 startup and update checking obtain the V2 Manifest and hashed install icons in the same browser context without an uninstall or reinstall step. This does not claim automatic migration of existing iOS/iPadOS Web Clips.
+- A Chromium standalone app-context / Android Chrome-WebAPK update regression models an already-installed V1, then proves normal V2 startup and update checking obtain the V2 Manifest and hashed install icons in the same browser context without an uninstall or reinstall step. This does not claim automatic migration of existing iOS/iPadOS Web Clips.
 - Auth, passkey, OAuth, API, and SSE paths continue to use network behavior.
 - The existing version update notice can represent both server version drift and Service Worker update availability.
 - The app shell can render a clear offline boundary when `/api/me` cannot be reached from a cached PWA shell.
@@ -56,7 +56,7 @@ The PWA layer is an enhancement around the existing React + Vite app shell and A
 ## Platform Update Contract
 
 - Chromium desktop and Android Chrome/WebAPK installations use the manifest identity and `icons` members to recognize and update the same installed application. The implementation keeps `id`, `scope`, and `start_url` stable and changes an icon URL when its bytes change, which is the supported manifest signal for an icon update. The Service Worker update notice remains an app-shell refresh control; it is not the install metadata update mechanism.
-- The automated release regression uses the same Chromium browser context for V1 and V2 to represent an existing Chromium desktop or Android Chrome/WebAPK installation; it verifies stable identity plus fresh V2 manifest/icon retrieval without exercising an install prompt a second time.
+- The automated release regression uses the same Chromium standalone app context for V1 and V2 to represent an existing Chromium desktop or Android Chrome/WebAPK installation; it verifies the standalone launch mode, stable identity, and fresh V2 manifest/icon retrieval without exercising an install prompt a second time.
 - Existing iOS/iPadOS Web Clips and browsers that do not apply manifest-driven installation are platform-owned shortcuts. This topic makes no claim that a web response can force-migrate an existing Web Clip or another browser's stored icon, and does not include them in the automatic update acceptance path.
 - Contract references: [Web Application Manifest](https://www.w3.org/TR/appmanifest/), [Chrome web app update behavior](https://developer.chrome.com/blog/improvements-to-web-app-updates), and [Apple Web Clip icon configuration](https://developer.apple.com/library/archive/documentation/AppleApplications/Reference/SafariWebContent/ConfiguringWebApplications/ConfiguringWebApplications.html).
 

@@ -5,6 +5,7 @@ import path from "node:path";
 import { parse } from "parse5";
 
 const distDir = path.resolve(import.meta.dirname, "../dist");
+const approvedIconDir = path.resolve(import.meta.dirname, "../public/pwa");
 const manifestPath = path.join(distDir, "manifest.webmanifest");
 const indexPath = path.join(distDir, "index.html");
 const precachePath = path.join(distDir, "pwa-precache-manifest.json");
@@ -150,9 +151,23 @@ for (const [url, expectedName] of expectedShortcuts) {
 }
 
 const expectedIcons = new Map([
-	["icon-192", { width: 192, height: 192, maskable: false }],
-	["icon-512", { width: 512, height: 512, maskable: false }],
-	["maskable-icon-512", { width: 512, height: 512, maskable: true }],
+	[
+		"icon-192",
+		{ source: "icon-192.png", width: 192, height: 192, maskable: false },
+	],
+	[
+		"icon-512",
+		{ source: "icon-512.png", width: 512, height: 512, maskable: false },
+	],
+	[
+		"maskable-icon-512",
+		{
+			source: "maskable-icon-512.png",
+			width: 512,
+			height: 512,
+			maskable: true,
+		},
+	],
 ]);
 
 for (const [basename, expected] of expectedIcons) {
@@ -174,6 +189,14 @@ for (const [basename, expected] of expectedIcons) {
 		);
 	}
 	const iconBytes = await readFile(path.join(distDir, icon.src.slice(1)));
+	const approvedIconBytes = await readFile(
+		path.join(approvedIconDir, expected.source),
+	);
+	assert.equal(
+		Buffer.compare(iconBytes, approvedIconBytes),
+		0,
+		`${basename} production bytes match the approved source artwork`,
+	);
 	const digest = createHash("sha256")
 		.update(iconBytes)
 		.digest("hex")

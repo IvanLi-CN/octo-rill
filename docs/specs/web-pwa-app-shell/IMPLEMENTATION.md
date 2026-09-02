@@ -19,9 +19,9 @@
 ## Validation
 
 - Frontend production build completes with generated `sw.js` and `pwa-precache-manifest.json`.
-- Build contract coverage parses generated HTML to check the sole product Manifest link and absence of an Apple touch icon link, then checks manifest identity, content-hashed icon URLs and bytes, shortcuts, screenshots, PNG icon dimensions, precache URL safety, and Service Worker metadata cache-bypass guards.
+- Build contract coverage parses generated HTML to check the sole product Manifest link and absence of an Apple touch icon link, then checks manifest identity, content-hashed icon URLs, byte-for-byte parity with approved `web/public/pwa` artwork, shortcuts, screenshots, PNG icon dimensions, precache URL safety, and Service Worker metadata cache-bypass guards. CI runs this post-build contract.
 - Static server tests cover SPA fallback, app-shell cache headers, Service Worker cache headers, manifest revalidation headers, stable icon revalidation, and immutable hashed PWA assets.
-- Browser runtime checks confirm manifest metadata, absence of the product Apple touch icon link, standalone/iOS install meta, screenshots, shortcuts, maskable icon declaration, same-origin Service Worker registration, offline app-shell fallback, offline anonymous boot copy, authenticated offline cached-content and no-cache states, private path network bypass, network-revalidated install metadata, same-context Chromium V1-to-V2 Manifest/icon retrieval, update-triggered Service Worker checks, waiting Service Worker refresh activation, and install prompt behavior.
+- Browser runtime checks confirm manifest metadata, absence of the product Apple touch icon link, standalone/iOS install meta, screenshots, shortcuts, maskable icon declaration, same-origin Service Worker registration, offline app-shell fallback, offline anonymous boot copy, authenticated offline cached-content and no-cache states, private path network bypass, network-revalidated install metadata, same-context Chromium standalone V1-to-V2 Manifest/icon retrieval, update-triggered Service Worker checks, waiting Service Worker refresh activation, and install prompt behavior.
 - Storybook covers the Landing offline boot fallback and Dashboard authenticated offline cache/no-cache states as stable visual evidence sources.
 
 ## Evidence
