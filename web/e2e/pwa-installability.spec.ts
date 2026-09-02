@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
 	createServer,
@@ -21,6 +22,7 @@ type StaticPwaServer = {
 	origin: string;
 	setApiVersion: (version: string) => void;
 	setServiceWorkerRevision: (revision: number) => void;
+	setPwaRelease: (release: "v1" | "v2") => void;
 	getApiMeRequests: () => number;
 	getManifestRequests: () => number;
 	getInstallIconRequests: () => number;
@@ -44,13 +46,110 @@ const contentTypes = new Map([
 	[".woff2", "font/woff2"],
 ]);
 
-function isContentHashedPwaAssetPath(pathname: string) {
-	return /^\/pwa\/[^/]+\.[0-9a-f]{16}\.png$/.test(pathname);
+function isContentHashedInstallIconPath(pathname: string) {
+	return /^\/pwa\/(?:icon-192|icon-512|maskable-icon-512)\.[0-9a-f]{16}\.png$/.test(
+		pathname,
+	);
+}
+
+type PwaRelease = {
+	manifest: Buffer;
+	installIcons: Map<string, Buffer>;
+};
+
+const pngCrcTable = Uint32Array.from({ length: 256 }, (_, index) => {
+	let crc = index;
+	for (let bit = 0; bit < 8; bit += 1) {
+		crc = (crc & 1) === 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+	}
+	return crc >>> 0;
+});
+
+function pngCrc32(bytes: Buffer): number {
+	let crc = 0xffffffff;
+	for (const byte of bytes) {
+		crc = pngCrcTable[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+	}
+	return ~crc >>> 0;
+}
+
+function addPngTextChunk(png: Buffer, text: string): Buffer {
+	const chunkType = Buffer.from("tEXt", "ascii");
+	const chunkData = Buffer.from(`octo-rill-release\0${text}`, "latin1");
+	const chunk = Buffer.alloc(12 + chunkData.length);
+	chunk.writeUInt32BE(chunkData.length, 0);
+	chunkType.copy(chunk, 4);
+	chunkData.copy(chunk, 8);
+	const crc = Buffer.alloc(4);
+	crc.writeUInt32BE(pngCrc32(Buffer.concat([chunkType, chunkData])), 0);
+	crc.copy(chunk, 8 + chunkData.length);
+
+	const iendTypeOffset = png.lastIndexOf(Buffer.from("IEND", "ascii"));
+	if (iendTypeOffset < 4) throw new Error("V1 icon is missing its IEND chunk");
+	return Buffer.concat([
+		png.subarray(0, iendTypeOffset - 4),
+		chunk,
+		png.subarray(iendTypeOffset - 4),
+	]);
+}
+
+async function createPwaReleases(): Promise<Record<"v1" | "v2", PwaRelease>> {
+	const manifestPath = path.join(distDir, "manifest.webmanifest");
+	const v1Manifest = await readFile(manifestPath);
+	const manifest = JSON.parse(v1Manifest.toString("utf8")) as {
+		icons?: Array<{
+			src?: string;
+			sizes?: string;
+			type?: string;
+			purpose?: string;
+		}>;
+	};
+	const v1InstallIcons = new Map<string, Buffer>();
+	for (const icon of manifest.icons ?? []) {
+		if (!icon.src) throw new Error("V1 manifest icon is missing src");
+		v1InstallIcons.set(
+			icon.src,
+			await readFile(path.join(distDir, icon.src.slice(1))),
+		);
+	}
+
+	const v2Manifest = JSON.parse(v1Manifest.toString("utf8")) as typeof manifest;
+	const v2InstallIcons = new Map(v1InstallIcons);
+	const v1RegularIcon = manifest.icons?.find((icon) =>
+		icon.src?.startsWith("/pwa/icon-192."),
+	);
+	if (!v1RegularIcon?.src)
+		throw new Error("V1 manifest did not declare icon-192");
+	const v1RegularIconBytes = v1InstallIcons.get(v1RegularIcon.src);
+	if (!v1RegularIconBytes) throw new Error("V1 icon-192 bytes are missing");
+
+	// Keep the V2 fixture pixel-identical while changing its content identity.
+	const v2RegularIconBytes = addPngTextChunk(v1RegularIconBytes, "v2");
+	const v2RegularIconDigest = createHash("sha256")
+		.update(v2RegularIconBytes)
+		.digest("hex")
+		.slice(0, 16);
+	const v2RegularIconSrc = `/pwa/icon-192.${v2RegularIconDigest}.png`;
+	v2InstallIcons.delete(v1RegularIcon.src);
+	v2InstallIcons.set(v2RegularIconSrc, v2RegularIconBytes);
+	v2Manifest.icons = (v2Manifest.icons ?? []).map((icon) =>
+		icon.src === v1RegularIcon.src ? { ...icon, src: v2RegularIconSrc } : icon,
+	);
+
+	return {
+		v1: { manifest: v1Manifest, installIcons: v1InstallIcons },
+		v2: {
+			manifest: Buffer.from(`${JSON.stringify(v2Manifest, null, "\t")}\n`),
+			installIcons: v2InstallIcons,
+		},
+	};
 }
 
 async function startStaticPwaServer(): Promise<StaticPwaServer> {
+	const releases = await createPwaReleases();
 	let apiVersion = "0.1.0";
 	let serviceWorkerRevision = 1;
+	let activeRelease: PwaRelease = releases.v1;
 	let apiMeRequests = 0;
 	let manifestRequests = 0;
 	let installIconRequests = 0;
@@ -96,15 +195,20 @@ async function startStaticPwaServer(): Promise<StaticPwaServer> {
 				return;
 			}
 
-			const filePath = resolveDistPath(requestUrl.pathname);
 			try {
 				if (requestUrl.pathname === "/manifest.webmanifest") {
 					manifestRequests += 1;
 				}
-				if (isContentHashedPwaAssetPath(requestUrl.pathname)) {
+				if (isContentHashedInstallIconPath(requestUrl.pathname)) {
 					installIconRequests += 1;
 				}
-				let body = await readFile(filePath);
+				let body = activeRelease.installIcons.get(requestUrl.pathname);
+				if (requestUrl.pathname === "/manifest.webmanifest") {
+					body = activeRelease.manifest;
+				}
+				if (!body) {
+					body = await readFile(resolveDistPath(requestUrl.pathname));
+				}
 				if (requestUrl.pathname === "/sw.js") {
 					serviceWorkerRequests += 1;
 					body = Buffer.concat([
@@ -124,12 +228,17 @@ self.addEventListener("message", (event) => {
 				response.writeHead(200, {
 					"cache-control":
 						requestUrl.pathname.startsWith("/assets/") ||
-						isContentHashedPwaAssetPath(requestUrl.pathname)
+						isContentHashedInstallIconPath(requestUrl.pathname)
 							? "public, max-age=31536000, immutable"
 							: "no-cache",
 					"content-type":
-						contentTypes.get(path.extname(filePath)) ??
-						"application/octet-stream",
+						contentTypes.get(
+							path.extname(
+								requestUrl.pathname === "/"
+									? "/index.html"
+									: requestUrl.pathname,
+							),
+						) ?? "application/octet-stream",
 				});
 				response.end(body);
 			} catch {
@@ -156,6 +265,9 @@ self.addEventListener("message", (event) => {
 		},
 		setServiceWorkerRevision(revision: number) {
 			serviceWorkerRevision = revision;
+		},
+		setPwaRelease(release: "v1" | "v2") {
+			activeRelease = releases[release];
 		},
 		getApiMeRequests() {
 			return apiMeRequests;
@@ -212,6 +324,54 @@ async function waitForServiceWorkerControl(page: Page) {
 				{ once: true },
 			);
 		});
+	});
+}
+
+async function readInstallMetadata(page: Page) {
+	return page.evaluate(async () => {
+		const manifestLink = document.querySelector(
+			'link[rel~="manifest"]',
+		) as HTMLLinkElement | null;
+		if (!manifestLink)
+			throw new Error("product index is missing its manifest link");
+
+		const manifestResponse = await fetch(manifestLink.href, {
+			cache: "no-store",
+		});
+		if (!manifestResponse.ok) {
+			throw new Error(`manifest request failed: ${manifestResponse.status}`);
+		}
+		const manifest = (await manifestResponse.json()) as {
+			id?: string;
+			start_url?: string;
+			scope?: string;
+			icons?: Array<{ src?: string }>;
+		};
+		const icons = await Promise.all(
+			(manifest.icons ?? []).map(async (icon) => {
+				if (!icon.src) throw new Error("manifest icon is missing src");
+				const iconResponse = await fetch(
+					new URL(icon.src, manifestResponse.url),
+					{
+						cache: "no-store",
+					},
+				);
+				if (!iconResponse.ok) {
+					throw new Error(`icon request failed: ${iconResponse.status}`);
+				}
+				return {
+					src: new URL(icon.src, manifestResponse.url).pathname,
+					byteLength: (await iconResponse.arrayBuffer()).byteLength,
+				};
+			}),
+		);
+
+		return {
+			id: manifest.id,
+			startUrl: manifest.start_url,
+			scope: manifest.scope,
+			icons,
+		};
 	});
 }
 
@@ -349,14 +509,11 @@ test("app exposes installable PWA metadata without blocking anonymous login", as
 	try {
 		await page.goto(server.origin);
 
-		await expect(page.locator('link[rel="manifest"]')).toHaveAttribute(
+		await expect(page.locator('link[rel~="manifest"]')).toHaveAttribute(
 			"href",
 			"/manifest.webmanifest",
 		);
-		await expect(page.locator('link[rel="apple-touch-icon"]')).toHaveAttribute(
-			"href",
-			/^\/pwa\/apple-touch-icon\.[0-9a-f]{16}\.png$/,
-		);
+		await expect(page.locator('link[rel~="apple-touch-icon"]')).toHaveCount(0);
 		await expect(page.locator('meta[name="theme-color"]')).toHaveAttribute(
 			"content",
 			"#0f172a",
@@ -433,20 +590,9 @@ test("install metadata stays network-revalidated outside the service worker prec
 
 		const manifestRequestsBefore = server.getManifestRequests();
 		const installIconRequestsBefore = server.getInstallIconRequests();
-		const iconUrl = await page.evaluate(async () => {
-			const manifestResponse = await fetch("/manifest.webmanifest", {
-				cache: "no-store",
-			});
-			const manifest = (await manifestResponse.json()) as {
-				icons?: Array<{ src?: string }>;
-			};
-			const icon = manifest.icons?.find((candidate) =>
-				candidate.src?.startsWith("/pwa/icon-192."),
-			);
-			if (!icon?.src) throw new Error("manifest did not declare icon-192");
-			await fetch(icon.src, { cache: "no-store" });
-			return icon.src;
-		});
+		const metadata = await readInstallMetadata(page);
+		expect(metadata.icons).toHaveLength(3);
+		expect(metadata.icons.every((icon) => icon.byteLength > 0)).toBe(true);
 
 		expect(server.getManifestRequests()).toBeGreaterThan(
 			manifestRequestsBefore,
@@ -459,9 +605,73 @@ test("install metadata stays network-revalidated outside the service worker prec
 			`${server.origin}/manifest.webmanifest`,
 		);
 		expect(manifestHeaders.headers()["cache-control"]).toBe("no-cache");
-		const iconHeaders = await page.request.get(`${server.origin}${iconUrl}`);
-		expect(iconHeaders.headers()["cache-control"]).toBe(
-			"public, max-age=31536000, immutable",
+		for (const icon of metadata.icons) {
+			const iconHeaders = await page.request.get(`${server.origin}${icon.src}`);
+			expect(iconHeaders.headers()["cache-control"]).toBe(
+				"public, max-age=31536000, immutable",
+			);
+		}
+	} finally {
+		await server.close();
+	}
+});
+
+test("same Chromium context retrieves V2 install metadata after a V1 app update", async ({
+	page,
+}) => {
+	const server = await startStaticPwaServer();
+	try {
+		await page.goto(server.origin);
+		await waitForServiceWorkerControl(page);
+
+		const v1 = await readInstallMetadata(page);
+		const v1ManifestRequests = server.getManifestRequests();
+		const v1InstallIconRequests = server.getInstallIconRequests();
+		const v1ServiceWorkerRequests = server.getServiceWorkerRequests();
+		expect(v1).toMatchObject({ id: "/", startUrl: "/", scope: "/" });
+		expect(v1.icons).toHaveLength(3);
+		expect(v1.icons.every((icon) => icon.byteLength > 0)).toBe(true);
+		const v1IconSrcs = v1.icons.map((icon) => icon.src);
+
+		server.setPwaRelease("v2");
+		server.setApiVersion("0.2.0");
+		server.setServiceWorkerRevision(2);
+		await page.reload({ waitUntil: "domcontentloaded" });
+		await expect(page.locator("body")).toBeVisible();
+		await expect
+			.poll(() => server.getServiceWorkerRequests())
+			.toBeGreaterThan(v1ServiceWorkerRequests);
+
+		const v2 = await readInstallMetadata(page);
+		expect(v2).toMatchObject({ id: "/", startUrl: "/", scope: "/" });
+		expect(v2.icons).toHaveLength(3);
+		expect(v2.icons.every((icon) => icon.byteLength > 0)).toBe(true);
+		expect(v2.icons.map((icon) => icon.src)).not.toEqual(v1IconSrcs);
+		expect(v2.icons.map((icon) => icon.src)).toEqual(
+			expect.arrayContaining([
+				expect.stringMatching(/^\/pwa\/icon-192\.[0-9a-f]{16}\.png$/),
+				expect.stringMatching(/^\/pwa\/icon-512\.[0-9a-f]{16}\.png$/),
+				expect.stringMatching(/^\/pwa\/maskable-icon-512\.[0-9a-f]{16}\.png$/),
+			]),
+		);
+		expect(
+			v2.icons.find((icon) => icon.src.startsWith("/pwa/icon-192."))?.src,
+		).not.toBe(
+			v1.icons.find((icon) => icon.src.startsWith("/pwa/icon-192."))?.src,
+		);
+		expect(
+			v2.icons.find((icon) => icon.src.startsWith("/pwa/icon-192."))
+				?.byteLength,
+		).not.toBe(
+			v1.icons.find((icon) => icon.src.startsWith("/pwa/icon-192."))
+				?.byteLength,
+		);
+		expect(server.getManifestRequests()).toBeGreaterThan(v1ManifestRequests);
+		expect(server.getInstallIconRequests()).toBeGreaterThan(
+			v1InstallIconRequests,
+		);
+		await expect(page.locator("[data-version-update-notice]")).toContainText(
+			"检测到新版本",
 		);
 	} finally {
 		await server.close();
