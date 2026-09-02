@@ -149,6 +149,72 @@ for workflow, expected, replacement, failure in cases:
         raise SystemExit(f"expected {workflow} concurrency drift to fail")
     if failure not in result.stderr:
         raise SystemExit(f"missing {workflow} concurrency drift assertion: {result.stderr}")
+
+workflow_cases = (
+    (
+        "build-needs",
+        lambda text: text.replace(
+            "    runs-on: ubuntu-latest\n    if: github.event_name ==",
+            "    runs-on: ubuntu-latest\n    needs: []\n    if: github.event_name ==",
+            1,
+        ),
+        "ci.yml.jobs.build must not wait on unrelated jobs",
+    ),
+    (
+        "host-release-build",
+        lambda text: text.replace(
+            "      - name: Set up Docker Buildx\n",
+            "      - name: Host release compilation\n        run: cargo build --release --locked\n\n      - name: Set up Docker Buildx\n",
+            1,
+        ),
+        "must not repeat a host release compilation",
+    ),
+    (
+        "dispatch-default",
+        lambda text: text.replace("        default: false\n", "        default: true\n", 1),
+        "ci.yml: ci_performance_acceptance must default to false",
+    ),
+    (
+        "docker-load",
+        lambda text: text.replace("          load: true\n", "", 1),
+        "ci.yml: Docker smoke build must load the image",
+    ),
+    (
+        "runtime-version-assertion",
+        lambda text: text.replace(".ok == true and .version == $version", ".ok == true", 1),
+        "ci.yml: Docker runtime smoke must contain '.ok == true and .version == $version'",
+    ),
+    (
+        "runtime-cleanup",
+        lambda text: text.replace('            docker rm -f "$container"', '            docker rm "$container"', 1),
+        "ci.yml: Docker runtime smoke must contain 'docker rm -f'",
+    ),
+)
+
+for name, rewrite, failure in workflow_cases:
+    candidate = tmp_dir / f"ci-{name}-repo"
+    shutil.copytree(repo_root / ".github", candidate / ".github")
+    path = candidate / ".github/workflows/ci.yml"
+    rewritten = rewrite(path.read_text())
+    if rewritten == path.read_text():
+        raise SystemExit(f"failed to rewrite workflow case {name}")
+    path.write_text(rewritten)
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / ".github/scripts/check_quality_gates_contract.py"),
+            "--repo-root",
+            str(candidate),
+            "--profile",
+            "final",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        raise SystemExit(f"expected workflow case {name} to fail")
+    if failure not in result.stderr:
+        raise SystemExit(f"missing workflow case {name} assertion: {result.stderr}")
 PY
 
 echo "test-quality-gates-contract: all checks passed"
