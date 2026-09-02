@@ -335,22 +335,6 @@ async function waitForServiceWorkerControl(page: Page) {
 	});
 }
 
-async function emulateInstalledChromiumLaunch(page: Page) {
-	await page.addInitScript(() => {
-		const nativeMatchMedia = window.matchMedia.bind(window);
-		window.matchMedia = (query: string) => {
-			const mediaQueryList = nativeMatchMedia(query);
-			if (query !== "(display-mode: standalone)") return mediaQueryList;
-			return new Proxy(mediaQueryList, {
-				get(target, property, receiver) {
-					if (property === "matches") return true;
-					return Reflect.get(target, property, receiver);
-				},
-			});
-		};
-	});
-}
-
 function manifestPath(value: string | undefined, origin: string) {
 	return value ? new URL(value, origin).pathname : value;
 }
@@ -647,21 +631,13 @@ test("install metadata stays network-revalidated outside the service worker prec
 	}
 });
 
-test("same Chromium standalone app context retrieves V2 install metadata after a V1 app update", async ({
+test("same Chromium browser context retrieves V2 install metadata after a V1 release update", async ({
 	page,
 }) => {
 	test.setTimeout(120_000);
 	const server = await startStaticPwaServer();
 	try {
-		// Playwright cannot drive the OS install UI; this models an installed Chromium
-		// desktop/WebAPK launch. Page.getAppManifest keeps Manifest parsing browser-owned.
-		await emulateInstalledChromiumLaunch(page);
 		await page.goto(server.origin);
-		expect(
-			await page.evaluate(
-				() => window.matchMedia("(display-mode: standalone)").matches,
-			),
-		).toBe(true);
 		await waitForServiceWorkerControl(page);
 		const cdpSession = await page.context().newCDPSession(page);
 
@@ -719,6 +695,89 @@ test("same Chromium standalone app context retrieves V2 install metadata after a
 			"检测到新版本",
 		);
 	} finally {
+		await server.close();
+	}
+});
+
+test("real installed Chromium PWA retrieves V2 install metadata without reinstall", async ({
+	context,
+	page,
+}) => {
+	test.skip(
+		process.env.OCTORILL_REAL_PWA_TEST !== "1",
+		"requires a ChromeOS runner with the DevTools PWA handler",
+	);
+	test.setTimeout(120_000);
+	const server = await startStaticPwaServer();
+	let managementSession: CDPSession | undefined;
+	let appPage: Page | undefined;
+	let manifestId: string | undefined;
+	try {
+		await page.goto(server.origin);
+		managementSession = await context.newCDPSession(page);
+		const appManifest = (await managementSession.send(
+			"Page.getAppManifest",
+		)) as {
+			manifest?: { id?: string };
+		};
+		manifestId = appManifest.manifest?.id;
+		if (!manifestId) throw new Error("browser manifest is missing its id");
+
+		await managementSession.send("PWA.install", { manifestId });
+		const launchedPage = context.waitForEvent("page", { timeout: 30_000 });
+		await managementSession.send("PWA.launch", { manifestId });
+		appPage = await launchedPage;
+		await appPage.waitForURL(`${server.origin}/**`);
+		await appPage.bringToFront();
+		await expect
+			.poll(() =>
+				appPage?.evaluate(
+					() => window.matchMedia("(display-mode: standalone)").matches,
+				),
+			)
+			.toBe(true);
+		await waitForServiceWorkerControl(appPage);
+		const appSession = await context.newCDPSession(appPage);
+
+		const v1 = await readInstallMetadata(appPage, appSession);
+		const v1BrowserManifestRequests = server.getBrowserManifestRequests();
+		const v1IconSrcs = v1.icons.map((icon) => icon.src);
+		const v1ServiceWorkerRequests = server.getServiceWorkerRequests();
+		expect(v1).toMatchObject({ id: "/", startUrl: "/", scope: "/" });
+		expect(v1.icons).toHaveLength(3);
+
+		server.setPwaRelease("v2");
+		server.setApiVersion("0.2.0");
+		server.setServiceWorkerRevision(2);
+		await appPage.reload({ waitUntil: "domcontentloaded" });
+		await expect
+			.poll(() => server.getServiceWorkerRequests())
+			.toBeGreaterThan(v1ServiceWorkerRequests);
+
+		const v2 = await readInstallMetadata(appPage, appSession);
+		expect(v2).toMatchObject({ id: "/", startUrl: "/", scope: "/" });
+		expect(v2.icons).toHaveLength(3);
+		expect(v2.icons.map((icon) => icon.src)).not.toEqual(v1IconSrcs);
+		expect(server.getBrowserManifestRequests()).toBeGreaterThan(
+			v1BrowserManifestRequests,
+		);
+		expect(
+			v2.icons.find((icon) => icon.src.startsWith("/pwa/icon-192."))?.src,
+		).not.toBe(
+			v1.icons.find((icon) => icon.src.startsWith("/pwa/icon-192."))?.src,
+		);
+		await expect(appPage.locator("[data-version-update-notice]")).toContainText(
+			"检测到新版本",
+		);
+	} finally {
+		if (appPage && !appPage.isClosed()) await appPage.close();
+		if (managementSession && manifestId) {
+			try {
+				await managementSession.send("PWA.uninstall", { manifestId });
+			} catch {
+				// Dedicated PWA runners may clean the temporary profile themselves.
+			}
+		}
 		await server.close();
 	}
 });
