@@ -792,6 +792,7 @@ test("dashboard shows the centered wave capsule while a readable page loads", as
 	await expect(
 		loading.locator("[data-feed-pagination-wave-dot='true']"),
 	).toHaveCount(3);
+	await expect(loading).toHaveCSS("height", "24px");
 	tracker.releaseReadableSectionPage("readable-page-2");
 	await expect(loading).toHaveCount(0);
 });
@@ -825,13 +826,22 @@ test("dashboard retries a failed readable page in place", async ({ page }) => {
 	});
 
 	await page.goto("/");
-	await expect(page.getByRole("button", { name: "重试加载" })).toBeVisible({
+	const retry = page.getByRole("button", { name: /^重试加载：/ });
+	await expect(retry).toBeVisible({
 		timeout: 15_000,
 	});
+	await expect(retry).toHaveAttribute(
+		"data-feed-pagination-error-chip",
+		"true",
+	);
+	await expect(retry).toHaveCSS("height", "24px");
+	await expect(
+		page.locator("[data-readable-pagination-end='true']"),
+	).toHaveCount(0);
 	await expect
 		.poll(tracker.getReadableSectionRequests)
 		.toContain("readable-page-2");
-	await page.getByRole("button", { name: "重试加载" }).click();
+	await retry.click();
 	await expect(page.getByText("重试后日报")).toBeVisible();
 	await expect
 		.poll(() =>

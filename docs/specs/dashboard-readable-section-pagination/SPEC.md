@@ -102,7 +102,8 @@
 
 ## Visual Evidence
 
-- None until the implementation satisfies the verification contract.
+- `storybook_canvas` / 主区块分页 Chip：`加载更多`、无文字三点波浪加载和错误重试在同一 24px 槽位内连续切换；加载与错误状态等高，错误文案完整可读，循环回到可再次触发的 `加载更多`。
+  ![主区块分页 Chip 三态过渡](./assets/pagination-three-state-loop.gif)
 
 ## References
 

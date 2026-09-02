@@ -1,8 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Copy, List, Newspaper, RefreshCcw } from "lucide-react";
+import {
+	type RefObject,
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useRef,
+	useState,
+} from "react";
+import { ArrowDown, Copy, List, Newspaper, RefreshCcw } from "lucide-react";
 
 import { Markdown } from "@/components/Markdown";
 import { Button } from "@/components/ui/button";
+import { Chip } from "@/components/ui/chip";
 import {
 	Tooltip,
 	TooltipContent,
@@ -34,36 +42,232 @@ function mergeUnique(items: FeedItem[]) {
 	});
 }
 
-function PaginationWave({ loading }: { loading: boolean }) {
-	if (!loading) return null;
+type PaginationFeedbackState =
+	| { kind: "load-more" }
+	| { kind: "loading" }
+	| { kind: "error"; message: string };
+
+const noop = () => {};
+const loadingChipWidth = 56;
+const loadMoreChipFallbackWidth = 94;
+const feedbackExitDurationMs = 180;
+
+function useMeasuredChipWidth(
+	measureRef: RefObject<HTMLElement | null>,
+	deps: readonly unknown[],
+) {
+	const [width, setWidth] = useState<number | null>(null);
+
+	useLayoutEffect(() => {
+		const measure = measureRef.current;
+		if (!measure) return;
+		const update = () => {
+			const nextWidth = Math.ceil(
+				Math.max(measure.getBoundingClientRect().width, measure.scrollWidth),
+			);
+			setWidth((current) => (current === nextWidth ? current : nextWidth));
+		};
+		update();
+		const observer =
+			typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
+		observer?.observe(measure);
+		void document.fonts?.ready.then(update);
+		return () => observer?.disconnect();
+	}, deps);
+
+	return width;
+}
+
+function getPaginationFeedback(
+	hasMore: boolean,
+	loading: boolean,
+	error: ReadableSectionsError | null,
+): PaginationFeedbackState | null {
+	if (error?.phase === "append") {
+		return { kind: "error", message: error.message };
+	}
+	if (loading) return { kind: "loading" };
+	return hasMore ? { kind: "load-more" } : null;
+}
+
+function PaginationFeedbackChip(props: {
+	feedback: PaginationFeedbackState;
+	errorMessage: string;
+	onLoadMore: () => void;
+	onRetry: () => void;
+	leaving: boolean;
+}) {
+	const { feedback, errorMessage, onLoadMore, onRetry, leaving } = props;
+	const loadMoreMeasureRef = useRef<HTMLSpanElement | null>(null);
+	const errorMeasureRef = useRef<HTMLSpanElement | null>(null);
+	const loadMoreWidth = useMeasuredChipWidth(loadMoreMeasureRef, []);
+	const errorWidth = useMeasuredChipWidth(errorMeasureRef, [errorMessage]);
+	const isLoadMore = feedback.kind === "load-more";
+	const isLoading = feedback.kind === "loading";
+	const isError = feedback.kind === "error";
+
+	const chipWidth = isLoading
+		? loadingChipWidth
+		: isLoadMore
+			? (loadMoreWidth ?? loadMoreChipFallbackWidth)
+			: (errorWidth ?? 248);
+	const chip = (
+		<Chip
+			variant={isError ? "destructive" : "neutral"}
+			role={isLoading && !leaving ? "status" : undefined}
+			aria-label={isLoading && !leaving ? "加载中" : undefined}
+			aria-hidden={leaving || undefined}
+			data-readable-pagination-loading={
+				isLoading && !leaving ? "true" : undefined
+			}
+			data-feed-pagination-loading={isLoading && !leaving ? "true" : undefined}
+			data-feed-pagination-chip="true"
+			data-feed-pagination-state={feedback.kind}
+			data-feed-pagination-leaving={leaving || undefined}
+			className="feed-pagination-feedback-chip relative isolate max-w-full shrink-0 px-0"
+			style={{ width: `min(100%, ${chipWidth}px)` }}
+		>
+			<span
+				ref={loadMoreMeasureRef}
+				aria-hidden="true"
+				className="pointer-events-none invisible absolute left-0 top-0 inline-flex h-6 items-center gap-1.5 whitespace-nowrap px-2.5 text-xs font-medium leading-4"
+			>
+				<ArrowDown className="size-3.5 shrink-0" />
+				<span>加载更多</span>
+			</span>
+			<span
+				ref={errorMeasureRef}
+				aria-hidden="true"
+				className="pointer-events-none invisible absolute left-0 top-0 inline-flex h-6 items-center gap-1.5 whitespace-nowrap px-2.5 text-xs font-medium leading-4"
+			>
+				<span>{errorMessage}</span>
+				<RefreshCcw className="size-3.5 shrink-0" />
+			</span>
+			<span
+				aria-hidden={!isLoading || leaving}
+				className="feed-pagination-feedback-loader absolute inset-0 flex items-center justify-center gap-1.5"
+			>
+				{[0, 1, 2].map((index) => (
+					<span
+						key={index}
+						className="feed-pagination-wave-dot size-1.5 rounded-full bg-foreground/70"
+						data-feed-pagination-wave-dot="true"
+					/>
+				))}
+			</span>
+			<button
+				type="button"
+				aria-hidden={!isLoadMore || leaving}
+				tabIndex={isLoadMore && !leaving ? 0 : -1}
+				aria-label="加载更多"
+				data-feed-pagination-load-more-chip={isLoadMore ? "true" : undefined}
+				onClick={onLoadMore}
+				className="feed-pagination-feedback-load-more absolute -inset-px flex min-w-0 items-center gap-1.5 rounded-full px-2.5 text-left outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
+			>
+				<ArrowDown className="size-3.5 shrink-0" />
+				<span>加载更多</span>
+			</button>
+			<button
+				type="button"
+				aria-hidden={!isError || leaving}
+				tabIndex={isError && !leaving ? 0 : -1}
+				aria-label={`重试加载：${errorMessage}`}
+				data-feed-pagination-error-chip={isError ? "true" : undefined}
+				onClick={onRetry}
+				className="feed-pagination-feedback-error absolute -inset-px flex min-w-0 items-center gap-1.5 rounded-full px-2.5 text-left outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
+			>
+				<span className="min-w-0 truncate">{errorMessage}</span>
+				<RefreshCcw className="size-3.5 shrink-0" />
+			</button>
+		</Chip>
+	);
+
 	return (
 		<div
-			className="flex justify-center pt-1"
-			data-readable-pagination-loading="true"
-			data-feed-pagination-loading="true"
+			role={isError && !leaving ? "alert" : undefined}
+			aria-live={isError && !leaving ? "assertive" : undefined}
+			className="contents"
 		>
 			<TooltipProvider delayDuration={500}>
 				<Tooltip>
-					<TooltipTrigger asChild>
-						<span
-							role="status"
-							aria-label="加载中"
-							className="inline-flex min-h-9 items-center justify-center gap-1 rounded-full border border-border/70 bg-card/80 px-5 shadow-sm"
-						>
-							{[0, 1, 2].map((index) => (
-								<span
-									key={index}
-									className="feed-pagination-wave-dot size-1.5 rounded-full bg-foreground/70"
-									data-feed-pagination-wave-dot="true"
-								/>
-							))}
-						</span>
-					</TooltipTrigger>
+					<TooltipTrigger asChild>{chip}</TooltipTrigger>
 					<TooltipContent side="top" sideOffset={8}>
-						加载中
+						{isLoadMore ? "加载更多" : isError ? "重试加载" : "加载中"}
 					</TooltipContent>
 				</Tooltip>
 			</TooltipProvider>
+		</div>
+	);
+}
+
+function PaginationFeedback(props: {
+	hasMore?: boolean;
+	loading: boolean;
+	error: ReadableSectionsError | null;
+	onLoadMore?: () => void;
+	onRetry?: () => void;
+}) {
+	const {
+		hasMore = false,
+		loading,
+		error,
+		onLoadMore = noop,
+		onRetry = noop,
+	} = props;
+	const desiredFeedback = getPaginationFeedback(hasMore, loading, error);
+	const desiredKey = desiredFeedback
+		? desiredFeedback.kind === "error"
+			? `error:${desiredFeedback.message}`
+			: desiredFeedback.kind
+		: "idle";
+	const [currentFeedback, setCurrentFeedback] = useState(desiredFeedback);
+	const [errorMessage, setErrorMessage] = useState(
+		desiredFeedback?.kind === "error" ? desiredFeedback.message : "",
+	);
+	const [leaving, setLeaving] = useState(false);
+	const currentFeedbackRef = useRef(currentFeedback);
+
+	useEffect(() => {
+		if (desiredFeedback) {
+			if (desiredFeedback.kind === "error") {
+				setErrorMessage(desiredFeedback.message);
+			}
+			currentFeedbackRef.current = desiredFeedback;
+			setCurrentFeedback(desiredFeedback);
+			setLeaving(false);
+			return;
+		}
+		if (!currentFeedbackRef.current) return;
+		setLeaving(true);
+		const reduceMotion = window.matchMedia?.(
+			"(prefers-reduced-motion: reduce)",
+		).matches;
+		const timeout = window.setTimeout(
+			() => {
+				currentFeedbackRef.current = null;
+				setCurrentFeedback(null);
+				setLeaving(false);
+			},
+			reduceMotion ? 0 : feedbackExitDurationMs,
+		);
+		return () => window.clearTimeout(timeout);
+	}, [desiredKey]);
+
+	if (!currentFeedback) return null;
+
+	return (
+		<div
+			className="feed-pagination-feedback-slot"
+			data-feed-pagination-feedback="true"
+			data-feed-pagination-feedback-state={currentFeedback?.kind ?? "idle"}
+		>
+			<PaginationFeedbackChip
+				feedback={currentFeedback}
+				errorMessage={errorMessage}
+				onLoadMore={onLoadMore}
+				onRetry={onRetry}
+				leaving={leaving}
+			/>
 		</div>
 	);
 }
@@ -75,6 +279,7 @@ export function FeedReadableSectionList(props: {
 	loadingInitial: boolean;
 	loadingMore: boolean;
 	hasMore: boolean;
+	autoLoadMore?: boolean;
 	onLoadMore: () => void;
 	onRetry: () => void;
 	onLoadSectionItems: (sectionId: string, cursor?: string | null) => void;
@@ -91,6 +296,7 @@ export function FeedReadableSectionList(props: {
 		loadingInitial,
 		loadingMore,
 		hasMore,
+		autoLoadMore = true,
 		onLoadMore,
 		onRetry,
 		onLoadSectionItems,
@@ -127,7 +333,13 @@ export function FeedReadableSectionList(props: {
 	}, [hasMore, sections.length]);
 
 	useEffect(() => {
-		if (!hasMore || loadingInitial || loadingMore || error?.phase === "append")
+		if (
+			!autoLoadMore ||
+			!hasMore ||
+			loadingInitial ||
+			loadingMore ||
+			error?.phase === "append"
+		)
 			return;
 		const element = sentinelRef.current;
 		if (!element || typeof IntersectionObserver === "undefined") return;
@@ -147,7 +359,14 @@ export function FeedReadableSectionList(props: {
 		);
 		observer.observe(element);
 		return () => observer.disconnect();
-	}, [error?.phase, hasMore, loadingInitial, loadingMore, onLoadMore]);
+	}, [
+		autoLoadMore,
+		error?.phase,
+		hasMore,
+		loadingInitial,
+		loadingMore,
+		onLoadMore,
+	]);
 
 	useEffect(() => {
 		if (typeof IntersectionObserver === "undefined") return;
@@ -343,7 +562,7 @@ export function FeedReadableSectionList(props: {
 							</div>
 						) : null}
 						{(inList || !brief) && detailLoading ? (
-							<PaginationWave loading />
+							<PaginationFeedback loading error={null} />
 						) : null}
 						{(inList || !brief) && detail?.error ? (
 							<div className="flex items-center justify-end gap-2 px-1 text-xs text-destructive">
@@ -407,30 +626,14 @@ export function FeedReadableSectionList(props: {
 				data-feed-pagination-sentinel="true"
 				className="h-1"
 			/>
-			<PaginationWave loading={loadingMore} />
-			{error?.phase === "append" ? (
-				<div className="flex items-center justify-center gap-2 text-xs text-destructive">
-					<span>{error.message}</span>
-					<TooltipProvider delayDuration={500}>
-						<Tooltip>
-							<TooltipTrigger asChild>
-								<Button
-									type="button"
-									variant="ghost"
-									size="icon"
-									className="rounded-full"
-									aria-label="重试加载"
-									onClick={onRetry}
-								>
-									<RefreshCcw className="size-4" />
-								</Button>
-							</TooltipTrigger>
-							<TooltipContent>重试加载</TooltipContent>
-						</Tooltip>
-					</TooltipProvider>
-				</div>
-			) : null}
-			{!hasMore && sections.length > 0 ? (
+			<PaginationFeedback
+				hasMore={hasMore}
+				loading={loadingMore}
+				error={error}
+				onLoadMore={onLoadMore}
+				onRetry={onRetry}
+			/>
+			{!hasMore && !error?.phase && sections.length > 0 ? (
 				<p
 					className="w-full text-center font-mono text-xs text-muted-foreground"
 					data-readable-pagination-end="true"

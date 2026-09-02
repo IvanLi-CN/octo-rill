@@ -1,6 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, within } from "storybook/test";
-import { useState } from "react";
+import { expect, userEvent, waitFor, within } from "storybook/test";
+import { useEffect, useState } from "react";
 
 import { FeedReadableSectionList } from "@/feed/FeedReadableSectionList";
 import type {
@@ -73,17 +73,42 @@ const briefSection: DashboardReadableSection = {
 	item_count: 2,
 };
 
+const appendFailure: ReadableSectionsError = {
+	phase: "append",
+	message: "更多可读动态加载失败，请稍后重试。",
+	kind: "network",
+	detail: null,
+	at: 0,
+};
+
+const feedbackLoopDelayMs = 2_400;
+const loadingChipWidth = 56;
+
+type FeedbackLoopPhase = "load-more" | "loading" | "error";
+
+const feedbackLoopPhases: FeedbackLoopPhase[] = [
+	"load-more",
+	"loading",
+	"error",
+];
+
 function Preview(props: {
 	loading?: boolean;
 	mainLoading?: boolean;
+	mainHasMore?: boolean;
+	autoLoadMore?: boolean;
 	withDetails?: boolean;
 	error?: ReadableSectionsError | null;
+	onLoadMore?: () => void;
 }) {
 	const {
 		loading = false,
 		mainLoading = false,
+		mainHasMore = mainLoading,
+		autoLoadMore = true,
 		withDetails = false,
 		error = null,
+		onLoadMore = () => {},
 	} = props;
 	const [details, setDetails] = useState<
 		Record<string, ReadableSectionDetails>
@@ -117,10 +142,14 @@ function Preview(props: {
 		onToggleReaction: () => {},
 	};
 	return (
-		<div className="min-h-0 overflow-hidden bg-slate-900 p-8 text-foreground sm:p-10">
+		<div
+			className="mx-auto w-full max-w-3xl bg-card p-4 text-foreground sm:p-6"
+			data-visual-evidence-surface="true"
+		>
 			<div
-				className="mx-auto max-w-3xl bg-slate-100 p-6 text-slate-900 sm:p-8"
+				className="w-full"
 				data-readable-evidence-surface="true"
+				data-visual-evidence-target="true"
 			>
 				<FeedReadableSectionList
 					sections={[briefSection]}
@@ -128,8 +157,9 @@ function Preview(props: {
 					error={error}
 					loadingInitial={false}
 					loadingMore={mainLoading}
-					hasMore={mainLoading}
-					onLoadMore={() => {}}
+					hasMore={mainHasMore}
+					autoLoadMore={autoLoadMore}
+					onLoadMore={onLoadMore}
 					onRetry={() => {}}
 					onLoadSectionItems={(sectionId) => {
 						setDetails({
@@ -144,6 +174,60 @@ function Preview(props: {
 					feedCardProps={feedCardProps}
 				/>
 			</div>
+		</div>
+	);
+}
+
+function LoadingErrorLoadingLoopPreview() {
+	const [phase, setPhase] = useState<"loading" | "error">("loading");
+
+	useEffect(() => {
+		const timeout = window.setTimeout(() => {
+			setPhase((current) => (current === "loading" ? "error" : "loading"));
+		}, feedbackLoopDelayMs);
+		return () => window.clearTimeout(timeout);
+	}, [phase]);
+
+	return (
+		<div
+			data-feed-pagination-cycle="true"
+			data-feed-pagination-cycle-phase={phase}
+		>
+			<Preview
+				mainLoading={phase === "loading"}
+				error={phase === "error" ? appendFailure : null}
+			/>
+		</div>
+	);
+}
+
+function LoadMoreLoadingErrorLoopPreview() {
+	const [phase, setPhase] = useState<FeedbackLoopPhase>("load-more");
+
+	useEffect(() => {
+		const timeout = window.setTimeout(() => {
+			setPhase((current) => {
+				const currentIndex = feedbackLoopPhases.indexOf(current);
+				return feedbackLoopPhases[
+					(currentIndex + 1) % feedbackLoopPhases.length
+				];
+			});
+		}, feedbackLoopDelayMs);
+		return () => window.clearTimeout(timeout);
+	}, [phase]);
+
+	return (
+		<div
+			data-feed-pagination-cycle="true"
+			data-feed-pagination-cycle-phase={phase}
+		>
+			<Preview
+				mainHasMore
+				mainLoading={phase === "loading"}
+				autoLoadMore={false}
+				error={phase === "error" ? appendFailure : null}
+				onLoadMore={() => setPhase("loading")}
+			/>
 		</div>
 	);
 }
@@ -192,6 +276,9 @@ export const ListLoadingWaveCapsule: Story = {
 				.getByRole("status")
 				.querySelectorAll("[data-feed-pagination-wave-dot='true']").length,
 		).toBe(3);
+		await expect(
+			canvas.getByRole("status").getAttribute("data-feed-pagination-chip"),
+		).toBe("true");
 	},
 };
 
@@ -208,33 +295,183 @@ export const MainLoadingWaveCapsule: Story = {
 				.getByRole("status")
 				.querySelectorAll("[data-feed-pagination-wave-dot='true']").length,
 		).toBe(3);
+		await expect(
+			canvas.getByRole("status").getAttribute("data-feed-pagination-chip"),
+		).toBe("true");
 	},
 };
 
 export const AppendFailureRetry: Story = {
-	render: () => (
-		<Preview
-			error={{
-				phase: "append",
-				message: "更多可读动态加载失败，请稍后重试。",
-				kind: "network",
-				detail: null,
-				at: 0,
-			}}
-		/>
-	),
+	render: () => <Preview error={appendFailure} />,
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		await expect(
-			canvas.getByRole("button", { name: "重试加载" }),
-		).toBeVisible();
+		const retry = canvas.getByRole("button", { name: /重试加载/ });
+		await expect(retry).toBeVisible();
+		await expect(retry.getAttribute("data-feed-pagination-error-chip")).toBe(
+			"true",
+		);
+		await expect(canvas.queryByText(/已到尽头/)).not.toBeInTheDocument();
+	},
+};
+
+export const LoadingErrorLoadingLoop: Story = {
+	tags: ["feed-pagination-feedback"],
+	render: () => <LoadingErrorLoadingLoopPreview />,
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const feedbackChip = () => {
+			const chip = canvasElement.querySelector<HTMLElement>(
+				"[data-feed-pagination-chip='true']",
+			);
+			if (!chip) throw new Error("Expected pagination feedback chip");
+			return chip;
+		};
+		const feedbackSlot = canvasElement.querySelector<HTMLElement>(
+			"[data-feed-pagination-feedback='true']",
+		);
+		if (!feedbackSlot) throw new Error("Expected pagination feedback slot");
+
+		await waitFor(
+			() => expect(feedbackChip().dataset.feedPaginationState).toBe("loading"),
+			{
+				timeout: feedbackLoopDelayMs + 1_000,
+			},
+		);
+		await waitFor(() => expect(canvas.getByRole("status")).toBeVisible(), {
+			timeout: feedbackLoopDelayMs + 1_000,
+		});
+		const loading = canvas.getByRole("status");
+		const loadingHeight = loading.offsetHeight;
+		const loadingWidth = loading.offsetWidth;
+		const slotHeight = feedbackSlot.offsetHeight;
+		await expect(loadingHeight).toBe(24);
+		await expect(loadingWidth).toBe(56);
+		await expect(slotHeight).toBe(24);
+
+		await waitFor(
+			() => expect(feedbackChip().dataset.feedPaginationState).toBe("error"),
+			{ timeout: feedbackLoopDelayMs + 1_000 },
+		);
+		await waitFor(
+			() =>
+				expect(canvas.getByRole("button", { name: /重试加载/ })).toBeVisible(),
+			{ timeout: 1_000 },
+		);
+		const retry = canvas.getByRole("button", { name: /重试加载/ });
+		await expect(retry.offsetHeight).toBe(loadingHeight);
+		await waitFor(
+			() => expect(retry.offsetWidth).toBeGreaterThan(loadingWidth),
+			{ timeout: 1_000 },
+		);
+		await expect(feedbackSlot.offsetHeight).toBe(slotHeight);
+
+		await waitFor(
+			() => expect(feedbackChip().dataset.feedPaginationState).toBe("loading"),
+			{
+				timeout: feedbackLoopDelayMs + 1_000,
+			},
+		);
+		await waitFor(() => expect(canvas.getByRole("status")).toBeVisible(), {
+			timeout: feedbackLoopDelayMs + 1_000,
+		});
+		const reloading = canvas.getByRole("status");
+		await expect(reloading.offsetHeight).toBe(loadingHeight);
+		await waitFor(() => expect(reloading.offsetWidth).toBe(loadingWidth), {
+			timeout: 1_000,
+		});
+		await expect(feedbackSlot.offsetHeight).toBe(slotHeight);
+	},
+};
+
+export const LoadMoreLoadingErrorLoop: Story = {
+	tags: ["feed-pagination-feedback"],
+	render: () => <LoadMoreLoadingErrorLoopPreview />,
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const feedbackChip = () => {
+			const chip = canvasElement.querySelector<HTMLElement>(
+				"[data-feed-pagination-chip='true']",
+			);
+			if (!chip) throw new Error("Expected pagination feedback chip");
+			return chip;
+		};
+		const feedbackSlot = canvasElement.querySelector<HTMLElement>(
+			"[data-feed-pagination-feedback='true']",
+		);
+		if (!feedbackSlot) throw new Error("Expected pagination feedback slot");
+
+		await waitFor(
+			() =>
+				expect(feedbackChip().dataset.feedPaginationState).toBe("load-more"),
+			{ timeout: feedbackLoopDelayMs + 1_000 },
+		);
+		const loadMore = canvas.getByRole("button", { name: "加载更多" });
+		const loadMoreHeight = loadMore.offsetHeight;
+		const slotHeight = feedbackSlot.offsetHeight;
+		await expect(loadMoreHeight).toBe(24);
+		await expect(loadMore.offsetWidth).toBeGreaterThan(loadingChipWidth);
+		await expect(slotHeight).toBe(24);
+
+		await userEvent.click(loadMore);
+		await waitFor(
+			() => expect(feedbackChip().dataset.feedPaginationState).toBe("loading"),
+			{ timeout: 1_000 },
+		);
+		const loading = canvas.getByRole("status");
+		await expect(loading.offsetHeight).toBe(loadMoreHeight);
+		await waitFor(() => expect(loading.offsetWidth).toBe(loadingChipWidth), {
+			timeout: 1_000,
+		});
+		await expect(feedbackSlot.offsetHeight).toBe(slotHeight);
+
+		await waitFor(
+			() => expect(feedbackChip().dataset.feedPaginationState).toBe("error"),
+			{ timeout: feedbackLoopDelayMs + 1_000 },
+		);
+		const retry = canvas.getByRole("button", { name: /重试加载/ });
+		await expect(retry.offsetHeight).toBe(loadMoreHeight);
+		await waitFor(
+			() => expect(retry.offsetWidth).toBeGreaterThan(loadingChipWidth),
+			{ timeout: 1_000 },
+		);
+		await expect(retry.scrollWidth).toBe(retry.clientWidth);
+		await expect(feedbackSlot.offsetHeight).toBe(slotHeight);
+
+		await waitFor(
+			() =>
+				expect(feedbackChip().dataset.feedPaginationState).toBe("load-more"),
+			{ timeout: feedbackLoopDelayMs + 1_000 },
+		);
+		const nextLoadMore = canvas.getByRole("button", { name: "加载更多" });
+		await expect(nextLoadMore.offsetHeight).toBe(loadMoreHeight);
+		await waitFor(
+			() => expect(nextLoadMore.offsetWidth).toBeGreaterThan(loadingChipWidth),
+			{
+				timeout: 1_000,
+			},
+		);
+		await expect(feedbackSlot.offsetHeight).toBe(slotHeight);
 	},
 };
 
 export const NarrowViewport: Story = {
-	name: "Narrow viewport",
+	name: "Narrow viewport error chip",
 	globals: {
 		viewport: { value: "mobile1", isRotated: false },
 	},
-	render: () => <Preview />,
+	render: () => <Preview error={appendFailure} />,
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const retry = canvas.getByRole("button", { name: /重试加载/ });
+		await expect(retry).toBeVisible();
+		const retryBounds = retry.getBoundingClientRect();
+		expect(retryBounds.left).toBeGreaterThanOrEqual(0);
+		expect(retryBounds.right).toBeLessThanOrEqual(
+			canvasElement.ownerDocument.documentElement.clientWidth,
+		);
+		expect(
+			canvasElement.ownerDocument.documentElement.scrollWidth -
+				canvasElement.ownerDocument.documentElement.clientWidth,
+		).toBeLessThanOrEqual(1);
+	},
 };
