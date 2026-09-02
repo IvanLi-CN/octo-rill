@@ -46,6 +46,7 @@ import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
 import { FeedGroupedList } from "@/feed/FeedGroupedList";
+import { FeedReadableSectionList } from "@/feed/FeedReadableSectionList";
 import {
 	DEFAULT_PAGE_LANE,
 	isFeedLane,
@@ -57,14 +58,17 @@ import type {
 	FeedReactionRefreshResponse,
 	FeedItem,
 	FeedLane,
+	SmartItem,
 	ReactionContent,
 	ReleaseReactions,
+	TranslatedItem,
 	ToggleReleaseReactionResponse,
 } from "@/feed/types";
 import { isLaneCapableFeedItem, isReleaseFeedItem } from "@/feed/types";
 import { useAutoSmart } from "@/feed/useAutoSmart";
 import { useAutoTranslate } from "@/feed/useAutoTranslate";
 import { type FeedRequestType, useFeed } from "@/feed/useFeed";
+import { useDashboardReadableSections } from "@/feed/useDashboardReadableSections";
 import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
@@ -1631,20 +1635,77 @@ export function Dashboard(props: {
 				}
 			: null;
 	const viewerStateKey = buildDashboardWarmViewerStateKey(me);
+	const readableMode = !scopedMode && tab === "all";
+	const readableSections = useDashboardReadableSections({
+		userId: me.user.id,
+		viewerStateKey,
+		enabled: readableMode,
+	});
+	const readableSectionsActive =
+		readableMode && !readableSections.legacyFallback;
 	const feed = useFeed(feedRequestType, {
 		userId: me.user.id,
 		viewerStateKey,
-		initialData: warmFeedData,
+		initialData: readableSectionsActive ? null : warmFeedData,
 		scope,
+		enabled: !readableSectionsActive,
 	});
-	const feedItemsRef = useRef(feed.items);
-	feedItemsRef.current = feed.items;
+	const applyTranslationToActive = useCallback(
+		(item: Pick<FeedItem, "kind" | "id">, translated: TranslatedItem) => {
+			if (readableSectionsActive) {
+				readableSections.applyTranslation(item, translated);
+			} else {
+				feed.applyTranslation(item, translated);
+			}
+		},
+		[
+			feed.applyTranslation,
+			readableSectionsActive,
+			readableSections.applyTranslation,
+		],
+	);
+	const applySmartToActive = useCallback(
+		(item: Pick<FeedItem, "kind" | "id">, smart: SmartItem) => {
+			if (readableSectionsActive) readableSections.applySmart(item, smart);
+			else feed.applySmart(item, smart);
+		},
+		[feed.applySmart, readableSectionsActive, readableSections.applySmart],
+	);
+	const applyReactionsToActive = useCallback(
+		(item: Pick<FeedItem, "kind" | "id">, reactions: ReleaseReactions) => {
+			if (readableSectionsActive)
+				readableSections.applyReactions(item, reactions);
+			else feed.applyReactions(item, reactions);
+		},
+		[
+			feed.applyReactions,
+			readableSectionsActive,
+			readableSections.applyReactions,
+		],
+	);
+	const activeFeedItems = useMemo(() => {
+		if (!readableSectionsActive) return feed.items;
+		return readableSections.sections.flatMap((section) => [
+			...(section.items ?? []),
+			...(section.supplemental_items ?? []),
+			...(readableSections.details[section.id]?.items ?? []),
+		]);
+	}, [
+		feed.items,
+		readableSectionsActive,
+		readableSections.details,
+		readableSections.sections,
+	]);
+	const feedItemsRef = useRef(activeFeedItems);
+	feedItemsRef.current = activeFeedItems;
 	const followingReposQuery = useQuery<FollowingReposResponse>({
 		queryKey: ["dashboard", "following-repos", me.user.id],
 		queryFn: apiGetFollowingRepos,
 		enabled: scope?.kind === "following" || scope?.kind === "repo",
 	});
-	const refreshFeed = feed.refresh;
+	const refreshFeed = readableSectionsActive
+		? readableSections.loadInitial
+		: feed.refresh;
 	const followingRepos = followingReposQuery.data ?? null;
 	const followingReposLoading = followingReposQuery.isLoading;
 	const followingReposError = followingReposQuery.error
@@ -2394,7 +2455,11 @@ export function Dashboard(props: {
 		[feedRequestType],
 	);
 	const { checkNow: checkDashboardUpdates } = useDashboardLiveUpdates({
-		enabled: shellHydrated && !feed.loadingInitial,
+		enabled:
+			shellHydrated &&
+			(readableSectionsActive
+				? !readableSections.loadingInitial
+				: !feed.loadingInitial),
 		feedType: feedRequestType,
 		includeBriefs: !scopedMode,
 		includeNotifications:
@@ -2508,6 +2573,12 @@ export function Dashboard(props: {
 	const revealFeedUpdates = useCallback(
 		async (notice = activeFeedNotice) => {
 			if (!notice) return;
+			if (readableSectionsActive) {
+				await refreshFeed();
+				dismissFeedBoundary(notice.boundaryId);
+				await checkDashboardUpdates({ emit: false, include: ["feed"] });
+				return;
+			}
 			const freshKeys = notice.latestKeys.slice(0, notice.newCount);
 			const hasHydratedFreshItems = feed.items.some((item) =>
 				freshKeys.includes(feedItemKey(item)),
@@ -2532,13 +2603,20 @@ export function Dashboard(props: {
 			feed.freshKeys,
 			feed.items,
 			refreshFeed,
+			readableSectionsActive,
 			scrollToFreshFeedTop,
 		],
 	);
 
 	useEffect(() => {
 		const notice = activeFeedNotice;
-		if (!notice || feed.loadingInitial) return;
+		if (
+			!notice ||
+			(readableSectionsActive
+				? readableSections.loadingInitial
+				: feed.loadingInitial)
+		)
+			return;
 		const freshKeys = notice.latestKeys.slice(0, notice.newCount);
 		if (freshKeys.length === 0) return;
 		const hydratedKey = freshKeys.join("|");
@@ -2550,6 +2628,27 @@ export function Dashboard(props: {
 		const nextFreshKeys = Array.from(
 			new Set([...feed.freshKeys, ...freshKeys]),
 		);
+		if (readableSectionsActive) {
+			void refreshFeed()
+				.then(() => {
+					restoreFeedScrollAnchor(anchor);
+					dismissFeedBoundary(notice.boundaryId);
+					void checkDashboardUpdates({ emit: false, include: ["feed"] });
+				})
+				.catch((error) => {
+					if (
+						hydratedFeedNoticeRef.current.get(notice.boundaryId) === hydratedKey
+					) {
+						hydratedFeedNoticeRef.current.delete(notice.boundaryId);
+					}
+					notifyGlobalError(
+						"新动态显示失败",
+						error,
+						"新动态显示失败，请稍后重试。",
+					);
+				});
+			return;
+		}
 		void refreshFeed({
 			freshKeys: nextFreshKeys,
 			throwOnError: true,
@@ -2597,6 +2696,8 @@ export function Dashboard(props: {
 		feed.loadingInitial,
 		feedRequestType,
 		notifyGlobalError,
+		readableSections.loadingInitial,
+		readableSectionsActive,
 		refreshFeed,
 	]);
 
@@ -2728,7 +2829,7 @@ export function Dashboard(props: {
 		autoRetryingKeys: translationAutoRetryingKeys,
 	} = useAutoTranslate({
 		enabled: true,
-		onTranslated: feed.applyTranslation,
+		onTranslated: applyTranslationToActive,
 	});
 	const {
 		prime: primeSmart,
@@ -2739,7 +2840,7 @@ export function Dashboard(props: {
 		autoRetryingKeys: smartAutoRetryingKeys,
 	} = useAutoSmart({
 		enabled: true,
-		onSmart: feed.applySmart,
+		onSmart: applySmartToActive,
 	});
 
 	useEffect(() => {
@@ -2784,7 +2885,7 @@ export function Dashboard(props: {
 		if (reactionTokenConfigured !== true) {
 			return;
 		}
-		const releaseIds = feed.items
+		const releaseIds = activeFeedItems
 			.filter(isReleaseFeedItem)
 			.filter((item) => item.reactions?.status === "ready")
 			.map((item) => item.id);
@@ -2859,7 +2960,7 @@ export function Dashboard(props: {
 							continue;
 						}
 						reactionServerByKeyRef.current.set(key, item.reactions);
-						feed.applyReactions(
+						applyReactionsToActive(
 							{ kind: "release", id: item.release_id },
 							item.reactions,
 						);
@@ -2872,8 +2973,8 @@ export function Dashboard(props: {
 				}
 			});
 	}, [
-		feed.applyReactions,
-		feed.items,
+		applyReactionsToActive,
+		activeFeedItems,
 		loadReactionToken,
 		reactionTokenConfigured,
 	]);
@@ -3358,7 +3459,7 @@ export function Dashboard(props: {
 						!latestDesired ||
 						!firstPendingReactionContent(res.reactions, latestDesired)
 					) {
-						feed.applyReactions(item, res.reactions);
+						applyReactionsToActive(item, res.reactions);
 						reactionDesiredByKeyRef.current.delete(key);
 					}
 				})
@@ -3366,7 +3467,7 @@ export function Dashboard(props: {
 					const stable = reactionServerByKeyRef.current.get(key);
 					if (stable) {
 						reactionDesiredByKeyRef.current.set(key, stable);
-						feed.applyReactions(item, stable);
+						applyReactionsToActive(item, stable);
 					} else {
 						reactionDesiredByKeyRef.current.delete(key);
 					}
@@ -3423,7 +3524,7 @@ export function Dashboard(props: {
 					}
 				});
 		},
-		[feed, openPatDialog],
+		[applyReactionsToActive, openPatDialog],
 	);
 
 	const scheduleReactionFlush = useCallback(
@@ -3458,7 +3559,7 @@ export function Dashboard(props: {
 			}
 			const optimistic = buildOptimisticReactions(current, content);
 			reactionDesiredByKeyRef.current.set(key, optimistic);
-			feed.applyReactions(item, optimistic);
+			applyReactionsToActive(item, optimistic);
 
 			setReactionErrorByKey((prev) => {
 				if (!(key in prev)) return prev;
@@ -3468,7 +3569,7 @@ export function Dashboard(props: {
 			});
 			scheduleReactionFlush(key);
 		},
-		[feed, scheduleReactionFlush],
+		[applyReactionsToActive, scheduleReactionFlush],
 	);
 
 	const onToggleReaction = useCallback(
@@ -3590,12 +3691,12 @@ export function Dashboard(props: {
 	const syncingInbox = busy === "Sync inbox";
 
 	const aiDisabledHint = useMemo(() => {
-		const any = feed.items.find(
+		const any = activeFeedItems.find(
 			(it) =>
 				it.translated?.status === "disabled" || it.smart?.status === "disabled",
 		);
 		return Boolean(any);
-	}, [feed.items]);
+	}, [activeFeedItems]);
 
 	const onSelectTab = useCallback(
 		(nextTab: Tab) => {
@@ -3719,12 +3820,24 @@ export function Dashboard(props: {
 	const bootNetworkUnavailable =
 		bootErrorKind === "offline" || bootErrorKind === "network";
 	const retryDashboardNetwork = useCallback(async () => {
-		await Promise.allSettled([onRetryBoot?.(), feed.loadInitial()]);
-	}, [feed.loadInitial, onRetryBoot]);
+		await Promise.allSettled([
+			onRetryBoot?.(),
+			readableSectionsActive
+				? readableSections.loadInitial()
+				: feed.loadInitial(),
+		]);
+	}, [
+		feed.loadInitial,
+		onRetryBoot,
+		readableSectionsActive,
+		readableSections.loadInitial,
+	]);
 
 	const renderFeedPanel = (
 		mode: "all" | "releases" | "stars" | "followers",
 	) => {
+		const rootReadable =
+			mode === "all" && !scopedMode && readableSectionsActive;
 		const filteredItems = filterFeedItemsForTab(feed.items, mode, {
 			scoped: scopedMode,
 		});
@@ -3749,9 +3862,14 @@ export function Dashboard(props: {
 			networkUnavailable && filteredItems.length > 0;
 		const scopedEmpty =
 			scopedMode && !feed.loadingInitial && filteredItems.length === 0;
+		const readableEmpty =
+			rootReadable &&
+			!readableSections.loadingInitial &&
+			!readableSections.error &&
+			readableSections.sections.length === 0;
 		return (
 			<>
-				{offlineWithCachedContent ? (
+				{!rootReadable && offlineWithCachedContent ? (
 					<div
 						className="mb-4 rounded-xl border border-amber-300/45 bg-amber-50/80 px-4 py-3 text-sm text-amber-950 shadow-sm dark:border-amber-300/20 dark:bg-amber-950/20 dark:text-amber-100"
 						data-dashboard-offline-cache-banner="true"
@@ -3782,7 +3900,7 @@ export function Dashboard(props: {
 					</div>
 				) : null}
 
-				{offlineEmpty ? (
+				{!rootReadable && offlineEmpty ? (
 					<div
 						className="bg-card/75 mb-4 rounded-2xl border border-amber-300/45 p-6 shadow-sm dark:border-amber-300/20"
 						data-dashboard-offline-empty-state="true"
@@ -3821,10 +3939,12 @@ export function Dashboard(props: {
 					</div>
 				) : null}
 
-				{!blockingFeedError &&
-				!offlineEmpty &&
-				!feed.loadingInitial &&
-				filteredItems.length === 0 ? (
+				{readableEmpty ||
+				(!rootReadable &&
+					!blockingFeedError &&
+					!offlineEmpty &&
+					!feed.loadingInitial &&
+					filteredItems.length === 0) ? (
 					<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
 						{scopedEmpty && scope ? (
 							<>
@@ -3879,92 +3999,144 @@ export function Dashboard(props: {
 					</div>
 				) : null}
 
-				<FeedGroupedList
-					mode={mode}
-					sourceTab={mode}
-					currentScope={scope}
-					items={filteredItems}
-					currentViewer={{
-						login: me.user.login,
-						avatar_url: me.user.avatar_url,
-						html_url: `https://github.com/${me.user.login}`,
-					}}
-					briefs={briefs}
-					dailyBoundaryLocal={dailyBoundaryLocal}
-					dailyBoundaryTimeZone={dailyBoundaryTimeZone}
-					dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
-					error={offlineEmpty ? null : feed.error}
-					loadingInitial={feed.loadingInitial}
-					loadingMore={feed.loadingMore}
-					hasMore={feed.hasMore}
-					translationInFlightKeys={translationInFlightKeys}
-					translationAutoRetryingKeys={translationAutoRetryingKeys}
-					smartInFlightKeys={smartInFlightKeys}
-					smartAutoRetryingKeys={smartAutoRetryingKeys}
-					registerItemRef={registerFeedItem}
-					onLoadMore={feed.loadMore}
-					onRetryInitial={feed.loadInitial}
-					selectedLaneByKey={Object.fromEntries(
-						filteredItems.map((item) => [
-							feedItemKey(item),
-							resolveLaneForItem(
-								item,
-								selectedLaneByKey,
-								pageDefaultLane,
-								allowReleaseItemLaneOverride,
+				{rootReadable ? (
+					<FeedReadableSectionList
+						sections={readableSections.sections}
+						details={readableSections.details}
+						error={readableSections.error}
+						loadingInitial={readableSections.loadingInitial}
+						loadingMore={readableSections.loadingMore}
+						hasMore={readableSections.hasMore}
+						onLoadMore={() => void readableSections.loadMore()}
+						onRetry={() => void readableSections.retry()}
+						onLoadSectionItems={(sectionId, cursor) => {
+							void readableSections.loadSectionItems(sectionId, cursor);
+						}}
+						feedCardProps={{
+							currentViewer: {
+								login: me.user.login,
+								avatar_url: me.user.avatar_url,
+								html_url: `https://github.com/${me.user.login}`,
+							},
+							sourceTab: mode,
+							currentScope: null,
+							translationInFlightKeys,
+							translationAutoRetryingKeys,
+							smartInFlightKeys,
+							smartAutoRetryingKeys,
+							registerItemRef: registerFeedItem,
+							selectedLaneByKey: Object.fromEntries(
+								activeFeedItems.map((item) => [
+									feedItemKey(item),
+									resolveLaneForItem(
+										item,
+										selectedLaneByKey,
+										pageDefaultLane,
+										allowReleaseItemLaneOverride,
+									),
+								]),
 							),
-						]),
-					)}
-					onSelectLane={onSelectLane}
-					onTranslateNow={onTranslateNow}
-					onSmartNow={onSmartNow}
-					reactionBusyKeys={reactionBusyKeys}
-					reactionErrorByKey={reactionErrorByKey}
-					freshKeys={feed.freshKeys}
-					onToggleReaction={onToggleReaction}
-					onOpenReleaseFromBrief={
-						mode === "all" ? onOpenReleaseDetail : undefined
-					}
-					onOpenBrief={mode === "all" && !scope ? openBrief : undefined}
-					onCopyBrief={mode === "all" && !scope ? copyBrief : undefined}
-					onEnsureBriefDetail={
-						mode === "all" && !scope ? ensureBriefDetail : undefined
-					}
-					onRetryBriefDetail={
-						mode === "all" && !scope
-							? (briefId) => {
-									void loadBriefDetail(briefId);
-								}
-							: undefined
-					}
-					onGenerateBriefForDate={
-						mode === "all" && !scope ? onGenerateBriefForDate : undefined
-					}
-					briefDetailLoadingIds={briefDetailLoadingIds}
-					briefDetailErrors={briefDetailErrors}
-					copyingBriefId={copyingBriefId}
-					newContentBoundaries={activeFeedNotices.map((notice, index) => ({
-						id: notice.boundaryId,
-						count: notice.boundaryKeys.length,
-						label: "动态",
-						latestKeys: notice.boundaryKeys,
-						afterKey: notice.boundaryAfterKey,
-						isLatest: index === 0,
-						isSealed: notice.sealed,
-						onExitedViewport: dismissFeedBoundary,
-						onFreshAreaEntered: sealFeedBoundary,
-						onResolveAfterKey: resolveFeedBoundary,
-						onReveal: () => {
-							void revealFeedUpdates(notice).catch((error) => {
-								notifyGlobalError(
-									"新动态显示失败",
-									error,
-									"新动态显示失败，请稍后重试。",
-								);
-							});
-						},
-					}))}
-				/>
+							onSelectLane,
+							onTranslateNow,
+							onSmartNow,
+							reactionBusyKeys,
+							reactionErrorByKey,
+							onToggleReaction,
+							freshKeys: new Set(),
+						}}
+						onOpenReleaseFromBrief={onOpenReleaseDetail}
+						onOpenBrief={openBrief}
+						onCopyBrief={copyBrief}
+						onGenerateBriefForDate={onGenerateBriefForDate}
+					/>
+				) : (
+					<FeedGroupedList
+						mode={mode}
+						sourceTab={mode}
+						currentScope={scope}
+						items={filteredItems}
+						currentViewer={{
+							login: me.user.login,
+							avatar_url: me.user.avatar_url,
+							html_url: `https://github.com/${me.user.login}`,
+						}}
+						briefs={briefs}
+						dailyBoundaryLocal={dailyBoundaryLocal}
+						dailyBoundaryTimeZone={dailyBoundaryTimeZone}
+						dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
+						error={offlineEmpty ? null : feed.error}
+						loadingInitial={feed.loadingInitial}
+						loadingMore={feed.loadingMore}
+						hasMore={feed.hasMore}
+						translationInFlightKeys={translationInFlightKeys}
+						translationAutoRetryingKeys={translationAutoRetryingKeys}
+						smartInFlightKeys={smartInFlightKeys}
+						smartAutoRetryingKeys={smartAutoRetryingKeys}
+						registerItemRef={registerFeedItem}
+						onLoadMore={feed.loadMore}
+						onRetryInitial={feed.loadInitial}
+						selectedLaneByKey={Object.fromEntries(
+							filteredItems.map((item) => [
+								feedItemKey(item),
+								resolveLaneForItem(
+									item,
+									selectedLaneByKey,
+									pageDefaultLane,
+									allowReleaseItemLaneOverride,
+								),
+							]),
+						)}
+						onSelectLane={onSelectLane}
+						onTranslateNow={onTranslateNow}
+						onSmartNow={onSmartNow}
+						reactionBusyKeys={reactionBusyKeys}
+						reactionErrorByKey={reactionErrorByKey}
+						freshKeys={feed.freshKeys}
+						onToggleReaction={onToggleReaction}
+						onOpenReleaseFromBrief={
+							mode === "all" ? onOpenReleaseDetail : undefined
+						}
+						onOpenBrief={mode === "all" && !scope ? openBrief : undefined}
+						onCopyBrief={mode === "all" && !scope ? copyBrief : undefined}
+						onEnsureBriefDetail={
+							mode === "all" && !scope ? ensureBriefDetail : undefined
+						}
+						onRetryBriefDetail={
+							mode === "all" && !scope
+								? (briefId) => {
+										void loadBriefDetail(briefId);
+									}
+								: undefined
+						}
+						onGenerateBriefForDate={
+							mode === "all" && !scope ? onGenerateBriefForDate : undefined
+						}
+						briefDetailLoadingIds={briefDetailLoadingIds}
+						briefDetailErrors={briefDetailErrors}
+						copyingBriefId={copyingBriefId}
+						newContentBoundaries={activeFeedNotices.map((notice, index) => ({
+							id: notice.boundaryId,
+							count: notice.boundaryKeys.length,
+							label: "动态",
+							latestKeys: notice.boundaryKeys,
+							afterKey: notice.boundaryAfterKey,
+							isLatest: index === 0,
+							isSealed: notice.sealed,
+							onExitedViewport: dismissFeedBoundary,
+							onFreshAreaEntered: sealFeedBoundary,
+							onResolveAfterKey: resolveFeedBoundary,
+							onReveal: () => {
+								void revealFeedUpdates(notice).catch((error) => {
+									notifyGlobalError(
+										"新动态显示失败",
+										error,
+										"新动态显示失败，请稍后重试。",
+									);
+								});
+							},
+						}))}
+					/>
+				)}
 			</>
 		);
 	};
@@ -4044,7 +4216,7 @@ export function Dashboard(props: {
 	]);
 
 	useEffect(() => {
-		if (feed.loadingInitial || sidebarLoading) {
+		if (readableSectionsActive || feed.loadingInitial || sidebarLoading) {
 			return;
 		}
 		persistDashboardWarmSnapshot({
@@ -4069,6 +4241,7 @@ export function Dashboard(props: {
 		routeState,
 		sidebarLoading,
 		feedRequestType,
+		readableSectionsActive,
 	]);
 
 	const showStartupSkeleton =
