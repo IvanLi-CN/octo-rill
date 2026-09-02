@@ -157,6 +157,44 @@ export type FeedResponse = {
 	next_cursor: string | null;
 };
 
+export type DashboardReadableBrief = {
+	id: string;
+	date: string;
+	window_start: string | null;
+	window_end: string | null;
+	effective_time_zone: string | null;
+	effective_local_boundary: string | null;
+	release_count: number;
+	release_ids?: string[];
+	preview_markdown?: string;
+	covers_repo_stars: boolean;
+	covers_followers: boolean;
+	content_markdown: string;
+	created_at: string;
+	updated_at: string;
+};
+
+export type DashboardReadableSection = {
+	id: string;
+	date?: string;
+	display_date?: string;
+	kind: "brief" | "raw";
+	window_start?: string | null;
+	window_end?: string | null;
+	brief: DashboardReadableBrief | null;
+	items?: FeedItem[];
+	supplemental_items?: FeedItem[];
+	supplemental_next_cursor?: string | null;
+	items_next_cursor?: string | null;
+	item_count?: number;
+	activity_count?: number;
+};
+
+export type DashboardReadableFeedResponse = {
+	sections: DashboardReadableSection[];
+	next_cursor: string | null;
+};
+
 export type TranslateResponse = {
 	lang: string;
 	status: "ready" | "disabled";

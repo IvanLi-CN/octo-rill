@@ -143,6 +143,7 @@ export function useFeed(
 		userId?: string;
 		viewerStateKey?: string | null;
 		scope?: DashboardScope | null;
+		enabled?: boolean;
 		initialData?: {
 			type: FeedRequestType;
 			items: FeedItem[];
@@ -156,6 +157,7 @@ export function useFeed(
 	const userId = options?.userId ?? "anonymous";
 	const viewerStateKey = options?.viewerStateKey ?? null;
 	const scope = options?.scope ?? null;
+	const enabled = options?.enabled ?? true;
 	const scopeSignature = useMemo(
 		() => buildDashboardScopeSignature(scope),
 		[scope],
@@ -179,6 +181,7 @@ export function useFeed(
 	const reqIdRef = useRef(0);
 	const query = useQuery<DashboardFeedQueryData>({
 		queryKey,
+		enabled,
 		queryFn: async () => {
 			const current =
 				queryClient.getQueryData<DashboardFeedQueryData>(queryKey);
@@ -209,7 +212,7 @@ export function useFeed(
 	const currentData = query.data ?? null;
 	const currentItems = currentData?.items ?? [];
 	const currentNextCursor = currentData?.nextCursor ?? null;
-	const currentLoadingInitial = !currentData && query.isPending;
+	const currentLoadingInitial = enabled && !currentData && query.isPending;
 	const hasMore = Boolean(currentNextCursor);
 	const currentInitialError = query.error
 		? {
@@ -229,6 +232,7 @@ export function useFeed(
 
 	const loadInitial = useCallback(
 		async (options?: { freshKeys?: string[]; throwOnError?: boolean }) => {
+			if (!enabled) return;
 			reqIdRef.current += 1;
 			const reqId = reqIdRef.current;
 
@@ -247,7 +251,7 @@ export function useFeed(
 				setFreshKeys(new Set(options?.freshKeys ?? []));
 			}
 		},
-		[query.refetch],
+		[enabled, query.refetch],
 	);
 
 	const loadMore = useCallback(async () => {

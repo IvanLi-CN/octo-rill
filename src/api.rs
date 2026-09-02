@@ -13,7 +13,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, extract::State};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
@@ -12593,7 +12593,7 @@ pub async fn list_briefs(
     Ok(Json(items))
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, Clone, sqlx::FromRow)]
 pub struct BriefDetailItem {
     id: String,
     date: String,
@@ -13231,7 +13231,7 @@ async fn load_dashboard_feed_signatures(
     scope: Option<&FeedScope>,
     viewer_login: Option<&str>,
 ) -> Result<Vec<String>, ApiError> {
-    fetch_feed_items(state, user_id, None, types, scope, viewer_login, 30)
+    fetch_feed_items(state, user_id, None, types, scope, viewer_login, 30, None)
         .await
         .map(|rows| {
             rows.into_iter()
@@ -14191,6 +14191,60 @@ pub struct FeedResponse {
     next_cursor: Option<String>,
 }
 
+const DASHBOARD_READABLE_SECTION_LIMIT: usize = 3;
+const DASHBOARD_READABLE_SECTION_ITEM_LIMIT: usize = 30;
+
+#[derive(Debug, Deserialize)]
+pub struct DashboardReadableFeedQuery {
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DashboardReadableSectionItemsQuery {
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardReadableFeedResponse {
+    sections: Vec<DashboardReadableSection>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardReadableSection {
+    id: String,
+    #[serde(rename = "display_date")]
+    date: String,
+    kind: String,
+    #[serde(rename = "window_start")]
+    window_start: Option<String>,
+    #[serde(rename = "window_end")]
+    window_end: Option<String>,
+    brief: Option<DashboardReadableBrief>,
+    items: Vec<FeedItem>,
+    supplemental_items: Vec<FeedItem>,
+    supplemental_next_cursor: Option<String>,
+    items_next_cursor: Option<String>,
+    #[serde(rename = "activity_count")]
+    item_count: usize,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct DashboardReadableBrief {
+    id: String,
+    date: String,
+    window_start: Option<String>,
+    window_end: Option<String>,
+    effective_time_zone: Option<String>,
+    effective_local_boundary: Option<String>,
+    release_count: usize,
+    covers_repo_stars: bool,
+    covers_followers: bool,
+    content_markdown: String,
+    created_at: String,
+    updated_at: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PersonalRepoListResponse {
     owner_login: String,
@@ -14309,7 +14363,7 @@ pub struct FeedActor {
     html_url: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct FeedItem {
     kind: String,
     ts: String,
@@ -14335,7 +14389,7 @@ pub struct FeedItem {
     reactions: Option<ReleaseReactions>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct TranslatedItem {
     lang: String,
     status: String, // ready | missing | disabled | error
@@ -15098,6 +15152,7 @@ fn parse_feed_cursor(cursor: &str) -> Result<StreamCursor, ApiError> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_feed_items(
     state: &AppState,
     user_id: &str,
@@ -15106,6 +15161,7 @@ async fn fetch_feed_items(
     scope: Option<&FeedScope>,
     viewer_login: Option<&str>,
     limit: i64,
+    time_window: Option<(&str, &str)>,
 ) -> Result<Vec<FeedRow>, ApiError> {
     let sql = r#"
         WITH scoped_visible_repos AS (
@@ -15414,6 +15470,10 @@ async fn fetch_feed_items(
         )
           AND (
             ? = 0
+            OR (i.sort_ts >= ? AND i.sort_ts < ?)
+          )
+          AND (
+            ? = 0
             OR i.sort_ts < ?
             OR (i.sort_ts = ? AND i.kind_rank < ?)
             OR (i.sort_ts = ? AND i.kind_rank = ? AND i.id_key < ?)
@@ -15501,6 +15561,9 @@ async fn fetch_feed_items(
     } else {
         0_i64
     })
+    .bind(if time_window.is_some() { 1_i64 } else { 0_i64 })
+    .bind(time_window.map(|(start, _)| start))
+    .bind(time_window.map(|(_, end)| end))
     .bind(if has_cursor { 1_i64 } else { 0_i64 })
     .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
     .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
@@ -16351,6 +16414,586 @@ fn feed_item_from_row(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct DashboardReadableSectionCursor {
+    date: String,
+    user: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DashboardReadableItemsCursor {
+    offset: usize,
+    section: Option<String>,
+    user: Option<String>,
+}
+
+#[cfg(test)]
+fn encode_dashboard_readable_section_cursor(date: &str) -> String {
+    encode_dashboard_readable_section_cursor_for_user("", date)
+}
+
+fn dashboard_readable_cursor_subject(user_id: &str) -> String {
+    ai::sha256_hex(&format!("dashboard-readable:{user_id}"))
+        .chars()
+        .take(24)
+        .collect()
+}
+
+fn encode_dashboard_readable_section_cursor_for_user(user_id: &str, date: &str) -> String {
+    let payload = serde_json::json!({
+        "date": date,
+        "user": if user_id.is_empty() {
+            Value::Null
+        } else {
+            Value::String(dashboard_readable_cursor_subject(user_id))
+        },
+    });
+    URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes())
+}
+
+fn decode_dashboard_readable_section_cursor_for_user(
+    raw: &str,
+    user_id: Option<&str>,
+) -> Result<String, ApiError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(raw.trim())
+        .map_err(|_| ApiError::bad_request("invalid readable section cursor"))?;
+    let cursor = serde_json::from_slice::<DashboardReadableSectionCursor>(&bytes)
+        .map_err(|_| ApiError::bad_request("invalid readable section cursor"))?;
+    NaiveDate::parse_from_str(&cursor.date, "%Y-%m-%d")
+        .map_err(|_| ApiError::bad_request("invalid readable section cursor"))?;
+    if let Some(user_id) = user_id {
+        let expected = dashboard_readable_cursor_subject(user_id);
+        if cursor.user.as_deref() != Some(expected.as_str()) {
+            return Err(ApiError::bad_request("invalid readable section cursor"));
+        }
+    }
+    Ok(cursor.date)
+}
+
+#[cfg(test)]
+fn decode_dashboard_readable_section_cursor(raw: &str) -> Result<String, ApiError> {
+    decode_dashboard_readable_section_cursor_for_user(raw, None)
+}
+
+fn encode_dashboard_readable_items_cursor_for_context(
+    offset: usize,
+    user_id: &str,
+    section_id: &str,
+) -> String {
+    let payload = serde_json::json!({
+        "offset": offset,
+        "section": if section_id.is_empty() {
+            Value::Null
+        } else {
+            Value::String(section_id.to_owned())
+        },
+        "user": if user_id.is_empty() {
+            Value::Null
+        } else {
+            Value::String(dashboard_readable_cursor_subject(user_id))
+        },
+    });
+    URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes())
+}
+
+fn decode_dashboard_readable_items_cursor_for_context(
+    raw: &str,
+    user_id: Option<&str>,
+    section_id: Option<&str>,
+) -> Result<usize, ApiError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(raw.trim())
+        .map_err(|_| ApiError::bad_request("invalid section items cursor"))?;
+    let cursor = serde_json::from_slice::<DashboardReadableItemsCursor>(&bytes)
+        .map_err(|_| ApiError::bad_request("invalid section items cursor"))?;
+    if let Some(user_id) = user_id {
+        let expected = dashboard_readable_cursor_subject(user_id);
+        if cursor.user.as_deref() != Some(expected.as_str()) {
+            return Err(ApiError::bad_request("invalid section items cursor"));
+        }
+    }
+    if let Some(section_id) = section_id
+        && cursor.section.as_deref() != Some(section_id)
+    {
+        return Err(ApiError::bad_request("invalid section items cursor"));
+    }
+    Ok(cursor.offset)
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DashboardReadableTimestampRow {
+    ts: String,
+}
+
+async fn load_dashboard_readable_timestamps(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    let rows = sqlx::query_as::<_, DashboardReadableTimestampRow>(
+        r#"
+        WITH visible_repos AS (
+          SELECT DISTINCT repo_id
+          FROM user_release_visible_repos
+          WHERE user_id = ?
+        )
+        SELECT COALESCE(r.published_at, r.created_at, r.updated_at) AS ts
+        FROM repo_releases r
+        JOIN visible_repos vr ON vr.repo_id = r.repo_id
+        WHERE COALESCE(r.published_at, r.created_at, r.updated_at) IS NOT NULL
+        UNION ALL
+        SELECT e.occurred_at AS ts
+        FROM social_activity_events e
+        WHERE e.user_id = ?
+        ORDER BY ts DESC
+        "#,
+    )
+    .bind(user_id)
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(rows.into_iter().map(|row| row.ts).collect())
+}
+
+fn dashboard_readable_date_window_utc(date: &str, time_zone: &str) -> Option<(String, String)> {
+    let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    let time_zone = time_zone.parse::<Tz>().ok()?;
+    let start = time_zone
+        .from_local_datetime(&date.and_hms_opt(0, 0, 0)?)
+        .earliest()?
+        .with_timezone(&Utc);
+    let end = time_zone
+        .from_local_datetime(&date.succ_opt()?.and_hms_opt(0, 0, 0)?)
+        .earliest()?
+        .with_timezone(&Utc);
+    Some((
+        start.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        end.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    ))
+}
+
+async fn fetch_dashboard_readable_rows_for_date(
+    state: &AppState,
+    user_id: &str,
+    date: &str,
+    time_zone: &str,
+    limit: i64,
+) -> Result<Vec<FeedRow>, ApiError> {
+    let Some((start, end)) = dashboard_readable_date_window_utc(date, time_zone) else {
+        return Ok(Vec::new());
+    };
+    fetch_feed_items(
+        state,
+        user_id,
+        None,
+        FeedTypeSelection::all(),
+        None,
+        None,
+        limit,
+        Some((start.as_str(), end.as_str())),
+    )
+    .await
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DashboardReadableBriefDateRow {
+    date: String,
+}
+
+async fn load_dashboard_readable_brief_dates(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    sqlx::query_as::<_, DashboardReadableBriefDateRow>(
+        "SELECT DISTINCT date FROM briefs WHERE user_id = ? ORDER BY date DESC",
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await
+    .map(|rows| rows.into_iter().map(|row| row.date).collect())
+    .map_err(ApiError::internal)
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DashboardReadableBriefRow {
+    id: String,
+    date: String,
+    window_start_utc: Option<String>,
+    window_end_utc: Option<String>,
+    effective_time_zone: Option<String>,
+    effective_local_boundary: Option<String>,
+    generation_source: String,
+    content_markdown: String,
+    created_at: String,
+    updated_at: String,
+}
+
+async fn load_dashboard_readable_briefs_for_dates(
+    state: &AppState,
+    user_id: &str,
+    dates: &[String],
+) -> Result<Vec<BriefDetailItem>, ApiError> {
+    if dates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let date_placeholders = std::iter::repeat_n("?", dates.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rows_sql = format!(
+        r#"
+        SELECT id, date, window_start_utc, window_end_utc,
+               effective_time_zone, effective_local_boundary,
+               generation_source, content_markdown, created_at, updated_at
+        FROM briefs
+        WHERE user_id = ?
+          AND date IN ({date_placeholders})
+        ORDER BY COALESCE(window_end_utc, created_at) DESC, created_at DESC, id DESC
+        "#,
+    );
+    let mut rows = sqlx::query_as::<_, DashboardReadableBriefRow>(&rows_sql).bind(user_id);
+    for date in dates {
+        rows = rows.bind(date);
+    }
+    let rows = rows
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+
+    let memberships_sql = format!(
+        r#"
+        SELECT m.brief_id, m.release_id
+        FROM brief_release_memberships m
+        JOIN briefs b ON b.id = m.brief_id
+        WHERE b.user_id = ?
+          AND b.date IN ({date_placeholders})
+        ORDER BY m.brief_id ASC, m.ordinal ASC
+        "#,
+    );
+    let mut memberships = sqlx::query_as::<_, (String, i64)>(&memberships_sql).bind(user_id);
+    for date in dates {
+        memberships = memberships.bind(date);
+    }
+    let memberships = memberships
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut release_ids_by_brief = HashMap::<String, Vec<String>>::new();
+    for (brief_id, release_id) in memberships {
+        release_ids_by_brief
+            .entry(brief_id)
+            .or_default()
+            .push(release_id.to_string());
+    }
+
+    let mut fallback_refs_by_brief = HashMap::<String, Vec<InternalReleaseRef>>::new();
+    let mut fallback_refs = Vec::new();
+    for row in &rows {
+        if release_ids_by_brief.contains_key(&row.id)
+            || !brief_uses_markdown_release_fallback(&row.generation_source)
+        {
+            continue;
+        }
+        let refs = extract_brief_release_refs(&row.content_markdown);
+        if refs.is_empty() {
+            continue;
+        }
+        fallback_refs.extend(refs.iter().cloned());
+        fallback_refs_by_brief.insert(row.id.clone(), refs);
+    }
+    let resolved_fallback_ids = if fallback_refs.is_empty() {
+        HashMap::new()
+    } else {
+        resolve_brief_release_refs_batched(&state.pool, &fallback_refs)
+            .await
+            .map_err(ApiError::internal)?
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let release_ids = release_ids_by_brief
+                .remove(&row.id)
+                .or_else(|| {
+                    fallback_refs_by_brief.remove(&row.id).map(|refs| {
+                        let mut seen = HashSet::new();
+                        refs.into_iter()
+                            .filter_map(|reference| resolved_fallback_ids.get(&reference).copied())
+                            .filter(|release_id| seen.insert(*release_id))
+                            .map(|release_id| release_id.to_string())
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
+            BriefDetailItem {
+                id: row.id,
+                date: row.date,
+                window_start: row.window_start_utc,
+                window_end: row.window_end_utc,
+                effective_time_zone: row.effective_time_zone,
+                effective_local_boundary: row.effective_local_boundary,
+                release_count: release_ids.len(),
+                release_ids,
+                preview_markdown: brief_preview_markdown(&row.content_markdown),
+                covers_repo_stars: brief_markdown_has_section(&row.content_markdown, "### 获星"),
+                covers_followers: brief_markdown_has_section(&row.content_markdown, "### 关注"),
+                content_markdown: row.content_markdown,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+            }
+        })
+        .collect())
+}
+
+fn dashboard_readable_local_date(ts: &str, time_zone: &str) -> String {
+    let fallback = ts.chars().take(10).collect::<String>();
+    let Ok(parsed) = DateTime::parse_from_rfc3339(ts) else {
+        return fallback;
+    };
+    let Ok(tz) = time_zone.parse::<Tz>() else {
+        return parsed.date_naive().to_string();
+    };
+    parsed.with_timezone(&tz).date_naive().to_string()
+}
+
+fn dashboard_readable_item_is_covered(item: &FeedItem, brief: &BriefDetailItem) -> bool {
+    if item.kind == "release" {
+        return brief.release_ids.iter().any(|id| id == &item.id);
+    }
+    if item.kind == "repo_star_received" {
+        return brief.covers_repo_stars;
+    }
+    if item.kind == "follower_received" {
+        return brief.covers_followers;
+    }
+    false
+}
+
+fn dashboard_readable_item_in_brief_window(
+    item: &FeedItem,
+    brief: &BriefDetailItem,
+    fallback_date: &str,
+    time_zone: &str,
+) -> bool {
+    let parsed_item = DateTime::parse_from_rfc3339(&item.ts).ok();
+    if let (Some(start), Some(end), Some(item_ts)) = (
+        brief
+            .window_start
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok()),
+        brief
+            .window_end
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok()),
+        parsed_item,
+    ) {
+        return item_ts >= start && item_ts < end;
+    }
+    dashboard_readable_local_date(&item.ts, time_zone) == fallback_date
+}
+
+fn dashboard_readable_brief_public(brief: &BriefDetailItem) -> DashboardReadableBrief {
+    DashboardReadableBrief {
+        id: brief.id.clone(),
+        date: brief.date.clone(),
+        window_start: brief.window_start.clone(),
+        window_end: brief.window_end.clone(),
+        effective_time_zone: brief.effective_time_zone.clone(),
+        effective_local_boundary: brief.effective_local_boundary.clone(),
+        release_count: brief.release_count,
+        covers_repo_stars: brief.covers_repo_stars,
+        covers_followers: brief.covers_followers,
+        content_markdown: brief.content_markdown.clone(),
+        created_at: brief.created_at.clone(),
+        updated_at: brief.updated_at.clone(),
+    }
+}
+
+pub async fn dashboard_readable_feed(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    headers: HeaderMap,
+    Query(query): Query<DashboardReadableFeedQuery>,
+) -> Result<Json<DashboardReadableFeedResponse>, ApiError> {
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
+    let preferences = briefs::load_daily_brief_preferences(state.as_ref(), &user_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let time_zone = preferences.time_zone.as_str();
+    let brief_dates = load_dashboard_readable_brief_dates(state.as_ref(), &user_id).await?;
+    let mut dates = load_dashboard_readable_timestamps(state.as_ref(), &user_id)
+        .await?
+        .into_iter()
+        .map(|ts| dashboard_readable_local_date(&ts, time_zone))
+        .collect::<Vec<_>>();
+    dates.extend(brief_dates);
+    dates.sort();
+    dates.dedup();
+    dates.sort_by(|a, b| b.cmp(a));
+    if let Some(raw_cursor) = query
+        .cursor
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let cursor_date =
+            decode_dashboard_readable_section_cursor_for_user(raw_cursor, Some(user_id.as_str()))?;
+        dates.retain(|date| date < &cursor_date);
+    }
+
+    let selected_dates = dates
+        .iter()
+        .take(DASHBOARD_READABLE_SECTION_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>();
+    let briefs =
+        load_dashboard_readable_briefs_for_dates(state.as_ref(), &user_id, &selected_dates).await?;
+    let mut sections = Vec::with_capacity(selected_dates.len());
+    for date in &selected_dates {
+        let brief = briefs
+            .iter()
+            .find(|candidate| candidate.date == *date)
+            .cloned();
+        let fetch_limit = if brief.is_some() {
+            10_000
+        } else {
+            (DASHBOARD_READABLE_SECTION_ITEM_LIMIT + 1) as i64
+        };
+        let raw_items = fetch_dashboard_readable_rows_for_date(
+            state.as_ref(),
+            &user_id,
+            date,
+            time_zone,
+            fetch_limit,
+        )
+        .await?
+        .into_iter()
+        .map(|row| feed_item_from_row(row, state.config.ai.is_some(), None))
+        .collect::<Vec<_>>();
+        let (kind, items, supplemental_items, item_count) = if let Some(brief) = brief.as_ref() {
+            let supplemental = raw_items
+                .iter()
+                .filter(|item| {
+                    dashboard_readable_item_in_brief_window(item, brief, date, time_zone)
+                        && !dashboard_readable_item_is_covered(item, brief)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (
+                "brief".to_owned(),
+                Vec::new(),
+                supplemental,
+                raw_items.len(),
+            )
+        } else {
+            let item_count = raw_items.len();
+            let items = raw_items
+                .into_iter()
+                .take(DASHBOARD_READABLE_SECTION_ITEM_LIMIT)
+                .collect::<Vec<_>>();
+            ("raw".to_owned(), items, Vec::new(), item_count)
+        };
+        let items_next_cursor =
+            if kind == "raw" && item_count > DASHBOARD_READABLE_SECTION_ITEM_LIMIT {
+                Some(encode_dashboard_readable_items_cursor_for_context(
+                    DASHBOARD_READABLE_SECTION_ITEM_LIMIT,
+                    user_id.as_str(),
+                    &encode_dashboard_readable_section_cursor_for_user(user_id.as_str(), date),
+                ))
+            } else {
+                None
+            };
+        let public_brief = brief.as_ref().map(dashboard_readable_brief_public);
+        let window_start = brief.as_ref().and_then(|value| value.window_start.clone());
+        let window_end = brief.as_ref().and_then(|value| value.window_end.clone());
+        let section_id = encode_dashboard_readable_section_cursor_for_user(user_id.as_str(), date);
+        sections.push(DashboardReadableSection {
+            id: section_id,
+            date: date.clone(),
+            kind,
+            window_start,
+            window_end,
+            brief: public_brief,
+            items,
+            supplemental_items,
+            supplemental_next_cursor: None,
+            items_next_cursor,
+            item_count,
+        });
+    }
+    let next_cursor = if dates.len() > selected_dates.len() {
+        selected_dates
+            .last()
+            .map(|date| encode_dashboard_readable_section_cursor_for_user(user_id.as_str(), date))
+    } else {
+        None
+    };
+    Ok(Json(DashboardReadableFeedResponse {
+        sections,
+        next_cursor,
+    }))
+}
+
+pub async fn dashboard_readable_section_items(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    headers: HeaderMap,
+    Path(section_id): Path<String>,
+    Query(query): Query<DashboardReadableSectionItemsQuery>,
+) -> Result<Json<FeedResponse>, ApiError> {
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
+    let section_date =
+        decode_dashboard_readable_section_cursor_for_user(&section_id, Some(user_id.as_str()))?;
+    let offset = query
+        .cursor
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|cursor| {
+            decode_dashboard_readable_items_cursor_for_context(
+                cursor,
+                Some(user_id.as_str()),
+                Some(section_id.as_str()),
+            )
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let preferences = briefs::load_daily_brief_preferences(state.as_ref(), &user_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let fetch_limit = offset
+        .saturating_add(DASHBOARD_READABLE_SECTION_ITEM_LIMIT + 1)
+        .min(i64::MAX as usize) as i64;
+    let rows = fetch_dashboard_readable_rows_for_date(
+        state.as_ref(),
+        &user_id,
+        &section_date,
+        preferences.time_zone.as_str(),
+        fetch_limit,
+    )
+    .await?;
+    let ai_enabled = state.config.ai.is_some();
+    let rows = rows
+        .into_iter()
+        .map(|row| feed_item_from_row(row, ai_enabled, None))
+        .collect::<Vec<_>>();
+    let page_end = offset.saturating_add(DASHBOARD_READABLE_SECTION_ITEM_LIMIT);
+    let has_more = rows.len() > page_end;
+    let items: Vec<FeedItem> = rows
+        .into_iter()
+        .skip(offset)
+        .take(DASHBOARD_READABLE_SECTION_ITEM_LIMIT)
+        .collect();
+    let next_cursor = if has_more {
+        Some(encode_dashboard_readable_items_cursor_for_context(
+            offset + items.len(),
+            user_id.as_str(),
+            section_id.as_str(),
+        ))
+    } else {
+        None
+    };
+    Ok(Json(FeedResponse { items, next_cursor }))
+}
+
 pub async fn head_feed(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -16408,6 +17051,7 @@ pub async fn list_feed(
         scope.as_ref(),
         Some(viewer.login.as_str()),
         limit,
+        None,
     )
     .await?;
     let db_elapsed = db_started_at.elapsed();
@@ -21806,6 +22450,172 @@ pub(crate) async fn ensure_owned_repo_visual_columns(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dashboard_readable_section_cursor_is_opaque_and_stable() {
+        let encoded = encode_dashboard_readable_section_cursor("2026-04-30");
+        assert_ne!(encoded, "2026-04-30");
+        assert_eq!(
+            decode_dashboard_readable_section_cursor(&encoded).expect("cursor"),
+            "2026-04-30"
+        );
+        assert!(decode_dashboard_readable_section_cursor("not-a-cursor").is_err());
+    }
+
+    #[test]
+    fn dashboard_readable_cursors_bind_to_user_and_section() {
+        let section = encode_dashboard_readable_section_cursor_for_user("user-a", "2026-04-30");
+        assert_eq!(
+            decode_dashboard_readable_section_cursor_for_user(&section, Some("user-a"))
+                .expect("section cursor"),
+            "2026-04-30"
+        );
+        assert!(
+            decode_dashboard_readable_section_cursor_for_user(&section, Some("user-b")).is_err()
+        );
+
+        let items = encode_dashboard_readable_items_cursor_for_context(30, "user-a", &section);
+        assert_eq!(
+            decode_dashboard_readable_items_cursor_for_context(
+                &items,
+                Some("user-a"),
+                Some(&section),
+            )
+            .expect("items cursor"),
+            30
+        );
+        assert!(
+            decode_dashboard_readable_items_cursor_for_context(
+                &items,
+                Some("user-a"),
+                Some("other-section"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn dashboard_readable_public_projection_keeps_full_content_only() {
+        let brief = BriefDetailItem {
+            id: "brief-1".to_owned(),
+            date: "2026-04-30".to_owned(),
+            window_start: None,
+            window_end: None,
+            effective_time_zone: Some("UTC".to_owned()),
+            effective_local_boundary: Some("00:00".to_owned()),
+            release_count: 1,
+            release_ids: vec!["42".to_owned()],
+            preview_markdown: "摘要不应进入根页区块".to_owned(),
+            covers_repo_stars: false,
+            covers_followers: false,
+            content_markdown: "完整日报正文".to_owned(),
+            created_at: "2026-04-30T23:00:00Z".to_owned(),
+            updated_at: "2026-04-30T23:00:00Z".to_owned(),
+        };
+        let value = serde_json::to_value(dashboard_readable_brief_public(&brief)).expect("json");
+        assert_eq!(value["content_markdown"], "完整日报正文");
+        assert!(value.get("preview_markdown").is_none());
+        assert!(value.get("release_ids").is_none());
+    }
+
+    #[test]
+    fn dashboard_readable_local_date_uses_user_time_zone() {
+        assert_eq!(
+            dashboard_readable_local_date("2026-04-30T23:30:00Z", "Asia/Shanghai"),
+            "2026-05-01"
+        );
+        assert_eq!(
+            dashboard_readable_local_date("2026-04-30T23:30:00Z", "UTC"),
+            "2026-04-30"
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_readable_feed_reads_three_date_sections_and_uses_section_cursor() {
+        let pool = setup_pool().await;
+        seed_star(&pool, 42).await;
+        for (release_id, date) in [
+            (4201, "2026-04-30"),
+            (4202, "2026-04-29"),
+            (4203, "2026-04-28"),
+            (4204, "2026-04-27"),
+        ] {
+            seed_repo_release_at(&pool, 42, release_id, &format!("{date}T08:00:00Z")).await;
+        }
+        seed_brief(
+            &pool,
+            test_user_id(1).as_str(),
+            "2026-04-30",
+            "## 完整日报\n\n日报覆盖了第一条发布。",
+        )
+        .await;
+        sqlx::query(
+            r#"
+            INSERT INTO brief_release_memberships (
+              brief_id, release_id, release_ts_utc, ordinal, created_at
+            )
+            VALUES ('brief-2026-04-30', 4201, '2026-04-30T08:00:00Z', 0, '2026-04-30T08:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed readable brief membership");
+        let state = setup_state(pool);
+        let Json(first) = dashboard_readable_feed(
+            State(state.clone()),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(DashboardReadableFeedQuery { cursor: None }),
+        )
+        .await
+        .expect("load first readable sections");
+
+        assert_eq!(first.sections.len(), 3);
+        assert_eq!(
+            first
+                .sections
+                .iter()
+                .map(|section| section.date.as_str())
+                .collect::<Vec<_>>(),
+            vec!["2026-04-30", "2026-04-29", "2026-04-28"]
+        );
+        assert_eq!(first.sections[0].kind, "brief");
+        assert_eq!(
+            first.sections[0]
+                .brief
+                .as_ref()
+                .map(|brief| brief.content_markdown.as_str()),
+            Some("## 完整日报\n\n日报覆盖了第一条发布。")
+        );
+        assert!(first.sections[0].supplemental_items.is_empty());
+        assert!(first.next_cursor.is_some());
+
+        let section_id = first.sections[0].id.clone();
+        let Json(detail) = dashboard_readable_section_items(
+            State(state.clone()),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Path(section_id),
+            Query(DashboardReadableSectionItemsQuery { cursor: None }),
+        )
+        .await
+        .expect("load readable section items");
+        assert_eq!(detail.items.len(), 1);
+        assert_eq!(detail.items[0].id, "4201");
+
+        let Json(second) = dashboard_readable_feed(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(DashboardReadableFeedQuery {
+                cursor: first.next_cursor,
+            }),
+        )
+        .await
+        .expect("load next readable sections");
+        assert_eq!(second.sections.len(), 1);
+        assert_eq!(second.sections[0].date, "2026-04-27");
+        assert!(second.next_cursor.is_none());
+    }
     use chrono::{Datelike, TimeZone};
 
     use super::{
@@ -21815,7 +22625,8 @@ mod tests {
         AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery, AdminReleaseFreshnessQuery,
         AdminRepoGovernanceListQuery, AdminSyncSubscriptionEventItem, AdminTaskEventItem,
         AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery,
-        BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, CreateApiKeyRequest, DashboardUpdatesQuery,
+        BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, BriefDetailItem, CreateApiKeyRequest,
+        DashboardReadableFeedQuery, DashboardReadableSectionItemsQuery, DashboardUpdatesQuery,
         DashboardUpdatesToken, FeedQuery, FeedReactionRefreshRequest, FeedRow, FeedScope,
         GitHubCompareCommit, GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse,
         GraphQlError, LLM_CALL_ORDER_BY_CREATED_DESC, LiveReleaseReactions, PublicReleaseQuery,
@@ -21829,20 +22640,27 @@ mod tests {
         admin_patch_llm_runtime_config, admin_patch_user, admin_users_offset,
         ai_error_is_non_retryable, brief_contains_release_link, build_compare_digest,
         build_feed_reaction_refresh_item, build_task_diagnostics, compact_dashboard_signatures,
-        dashboard_updates, encode_dashboard_updates_token, ensure_account_enabled,
-        execute_sync_all_sync_with, extract_brief_release_ids, extract_translation_fields,
-        feed_item_from_row, get_brief, get_release_detail, get_release_detail_by_repo_tag,
-        get_repo_public_release_status, github_access_restricted_error,
-        github_graphql_errors_to_api_error, github_graphql_http_error, github_rate_limited_error,
-        github_reauth_required_error, guard_admin_user_update, has_repo_scope,
-        last_active_is_stale, list_briefs, list_feed, list_personal_repos, list_releases,
-        llm_call_order_by_clause, load_admin_dashboard_today_live_snapshot,
-        load_admin_llm_activity_response, load_pending_access_sync_reason, load_viewer_user,
-        looks_like_json_blob, map_job_action_error, map_public_compare_fallback_error,
-        mark_translation_requested, markdown_structure_preserved, me, me_create_api_key,
-        me_delete_api_key, me_delete_passkey, me_get_api_keys, me_resume,
-        normalize_markdown_translation_output, normalize_translation_fields,
-        parse_batch_notification_translation_payload,
+        dashboard_readable_brief_public, dashboard_readable_feed, dashboard_readable_local_date,
+        dashboard_readable_section_items, dashboard_updates,
+        decode_dashboard_readable_items_cursor_for_context,
+        decode_dashboard_readable_section_cursor,
+        decode_dashboard_readable_section_cursor_for_user,
+        encode_dashboard_readable_items_cursor_for_context,
+        encode_dashboard_readable_section_cursor,
+        encode_dashboard_readable_section_cursor_for_user, encode_dashboard_updates_token,
+        ensure_account_enabled, execute_sync_all_sync_with, extract_brief_release_ids,
+        extract_translation_fields, feed_item_from_row, get_brief, get_release_detail,
+        get_release_detail_by_repo_tag, get_repo_public_release_status,
+        github_access_restricted_error, github_graphql_errors_to_api_error,
+        github_graphql_http_error, github_rate_limited_error, github_reauth_required_error,
+        guard_admin_user_update, has_repo_scope, last_active_is_stale, list_briefs, list_feed,
+        list_personal_repos, list_releases, llm_call_order_by_clause,
+        load_admin_dashboard_today_live_snapshot, load_admin_llm_activity_response,
+        load_pending_access_sync_reason, load_viewer_user, looks_like_json_blob,
+        map_job_action_error, map_public_compare_fallback_error, mark_translation_requested,
+        markdown_structure_preserved, me, me_create_api_key, me_delete_api_key, me_delete_passkey,
+        me_get_api_keys, me_resume, normalize_markdown_translation_output,
+        normalize_translation_fields, parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_feed_types, parse_llm_models, parse_positive_admin_concurrency,
         parse_release_id_param, parse_release_smart_summary_payload,

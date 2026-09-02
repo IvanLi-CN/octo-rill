@@ -4,9 +4,9 @@
 
 ## Current Status
 
-- Implementation: 已实现，视觉证据已确认，PR #250 merge-ready / Step 5C Ready
-- Lifecycle: active
-- Catalog note: 已确认采用显式续载，运行时、回归与 Storybook 覆盖已完成。
+- Implementation: 已被后继主题替代。
+- Lifecycle: superseded
+- Catalog note: PR #250 的显式续载实现仍是已发布历史事实，但不再是目标行为。
 
 ## Coverage / rollout summary
 
