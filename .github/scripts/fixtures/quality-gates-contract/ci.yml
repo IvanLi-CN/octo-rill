@@ -17,6 +17,12 @@ on:
     types:
       - checks_requested
   workflow_dispatch:
+    inputs:
+      ci_performance_acceptance:
+        description: Run the controlled CI performance acceptance build
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.event.action == 'edited' && format('metadata-{0}', github.run_id) || github.ref }}
@@ -115,7 +121,7 @@ jobs:
               echo "::error::merge_group ref ${GITHUB_REF} must use the gh-readonly-queue/<base_branch>/... format."
               exit 1
             fi
-            queue_ref="${GITHUB_REF#${queue_prefix}}"
+            queue_ref="${GITHUB_REF#"$queue_prefix"}"
             if [[ "${queue_ref}" != */pr-* ]]; then
               echo "::error::Unable to derive the merge_group base branch from ${GITHUB_REF}."
               exit 1
@@ -136,7 +142,7 @@ jobs:
             fi
             event_name="${{ github.event_name }}"
             for path in "${paths[@]}"; do
-              if ! git cat-file -e "${source_ref}:${path}" 2>/dev/null; then
+              if ! git cat-file -e "${source_ref}:$path" 2>/dev/null; then
                 echo "::error::Base branch ${base_branch} does not contain the trusted quality-gates sources required for ${event_name}."
                 exit 1
               fi
@@ -148,7 +154,7 @@ jobs:
             if [ "$source_ref" = "HEAD" ]; then
               cp "$path" "$trusted_root/$path"
             else
-              git show "${source_ref}:${path}" > "$trusted_root/$path"
+              git show "${source_ref}:$path" > "$trusted_root/$path"
             fi
           done
 
@@ -301,74 +307,46 @@ jobs:
   build:
     name: Build Artifacts
     runs-on: ubuntu-latest
-    if: github.event_name != 'push'
-    needs: [lint, frontend-tests, records-overlay-e2e, unit-tests]
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.ci_performance_acceptance == true)
     timeout-minutes: 45
+    env:
+      CI_SMOKE_VERSION: ci-${{ github.run_id }}-${{ github.run_attempt }}
+      CI_SMOKE_IMAGE: octo-rill-ci-smoke:${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libsqlite3-dev
-
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version-file: .bun-version
-
-      - name: Install repo tooling
-        run: bun install --frozen-lockfile
-
-      - name: Install front-end dependencies
-        working-directory: web
-        run: bun install --frozen-lockfile
-
-      - name: Front-end build
-        working-directory: web
-        run: bun run build
-
-      - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: 1.91.0
-
-      - name: Cache cargo directories
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Cargo build (release)
-        run: cargo build --release --locked
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build smoke image (linux/amd64, load)
+      - name: Build Docker smoke image (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ${{ env.CI_SMOKE_IMAGE }}
+          build-args: |
+            APP_EFFECTIVE_VERSION=${{ env.CI_SMOKE_VERSION }}
+
+      - name: Run Docker release smoke
         shell: bash
-        env:
-          SMOKE_TAG: codex-vibe-monitor:pr-smoke-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          docker buildx build \
-            --load \
-            --platform "${PLATFORM_AMD64}" \
-            --tag "${SMOKE_TAG}" \
-            --build-arg APP_EFFECTIVE_VERSION=pr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT} \
-            .
-
-      - name: Smoke test image (linux/amd64)
-        shell: bash
-        env:
-          SMOKE_TAG: codex-vibe-monitor:pr-smoke-${{ github.run_id }}-${{ github.run_attempt }}
-          SMOKE_CONTAINER_NAME: smoke-codex-vibe-monitor-pr-${{ github.run_id }}-${{ github.run_attempt }}
-          SMOKE_PLATFORM: ${{ env.PLATFORM_AMD64 }}
-        run: ./.github/scripts/smoke-test-image.sh "$SMOKE_TAG"
+          tmp_dir="$(mktemp -d)"
+          cleanup() { status=$?; docker rm -f ci-smoke >/dev/null 2>&1 || true; rm -rf "$tmp_dir"; exit "$status"; }
+          trap cleanup EXIT
+          docker run -d --rm --name ci-smoke -p 127.0.0.1::3000 \
+            -e OCTORILL_ENCRYPTION_KEY_BASE64=synthetic \
+            -e DATABASE_URL=sqlite::memory: \
+            -e GITHUB_CLIENT_ID=ci-client \
+            -e GITHUB_CLIENT_SECRET=ci-secret \
+            -e GITHUB_OAUTH_REDIRECT_URL=http://127.0.0.1:3000/callback \
+            "${CI_SMOKE_IMAGE}"
+          curl -fsS http://127.0.0.1:3000/api/health > "$tmp_dir/health.json"
+          jq -e --arg version "${CI_SMOKE_VERSION}" '.ok == true and .version == $version' "$tmp_dir/health.json"
 
   release-meta:
     name: Release Meta (intent + version + tags)
