@@ -1633,7 +1633,7 @@ mod tests {
             "/pwa/icon-192.0123456789abcdef.png"
         ));
         assert!(is_hashed_pwa_asset_path(
-            "/pwa/apple-touch-icon.abcdef0123456789.png"
+            "/pwa/screenshots/app-shell-update-notice.abcdef0123456789.png"
         ));
         assert!(!is_hashed_pwa_asset_path("/pwa/icon-192.png"));
         assert!(!is_hashed_pwa_asset_path(

@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { parse } from "parse5";
 
 const distDir = path.resolve(import.meta.dirname, "../dist");
+const approvedIconDir = path.resolve(import.meta.dirname, "../public/pwa");
 const manifestPath = path.join(distDir, "manifest.webmanifest");
 const indexPath = path.join(distDir, "index.html");
 const precachePath = path.join(distDir, "pwa-precache-manifest.json");
@@ -27,6 +29,39 @@ async function readPngSize(filePath) {
 	};
 }
 
+function findElements(document, tagName) {
+	const elements = [];
+	const visit = (node) => {
+		if (node?.nodeName === tagName) {
+			elements.push(node);
+		}
+		for (const child of node?.childNodes ?? []) {
+			visit(child);
+		}
+	};
+	visit(document);
+	return elements;
+}
+
+function getAttribute(element, name) {
+	return element.attrs.find((attribute) => attribute.name === name)?.value;
+}
+
+function hasRel(element, value) {
+	return (getAttribute(element, "rel") ?? "")
+		.split(/\s+/)
+		.filter(Boolean)
+		.includes(value);
+}
+
+function requireMetaContent(elements, name) {
+	const meta = elements.find(
+		(element) => getAttribute(element, "name") === name,
+	);
+	assert(meta, `index includes ${name} meta`);
+	return getAttribute(meta, "content");
+}
+
 function assertNoPrivatePath(urls) {
 	for (const url of urls) {
 		assert.equal(typeof url, "string", "precache URL must be a string");
@@ -41,6 +76,23 @@ function assertNoPrivatePath(urls) {
 
 const manifest = await readJson(manifestPath);
 const indexHtml = await readFile(indexPath, "utf8");
+const document = parse(indexHtml);
+const linkElements = findElements(document, "link");
+const metaElements = findElements(document, "meta");
+const manifestLinks = linkElements.filter((element) =>
+	hasRel(element, "manifest"),
+);
+assert.equal(manifestLinks.length, 1, "index has one manifest link");
+assert.equal(
+	getAttribute(manifestLinks[0], "href"),
+	"/manifest.webmanifest",
+	"index manifest link points to the root manifest",
+);
+assert.equal(
+	linkElements.filter((element) => hasRel(element, "apple-touch-icon")).length,
+	0,
+	"product index does not declare an Apple touch icon",
+);
 assert.equal(manifest.name, "OctoRill");
 assert.equal(manifest.short_name, "OctoRill");
 assert.equal(manifest.id, "/");
@@ -51,24 +103,24 @@ assert.deepEqual(manifest.display_override, ["standalone", "browser"]);
 assert.equal(manifest.theme_color, "#0f172a");
 assert.equal(manifest.background_color, "#0f172a");
 assert.deepEqual(manifest.categories, ["productivity", "utilities"]);
-assert(
-	indexHtml.includes('<meta name="mobile-web-app-capable" content="yes"'),
+assert.equal(
+	requireMetaContent(metaElements, "mobile-web-app-capable"),
+	"yes",
 	"index includes Android standalone meta",
 );
-assert(
-	indexHtml.includes('<meta name="apple-mobile-web-app-capable" content="yes"'),
+assert.equal(
+	requireMetaContent(metaElements, "apple-mobile-web-app-capable"),
+	"yes",
 	"index includes iOS standalone meta",
 );
-assert(
-	indexHtml.includes(
-		'<meta name="apple-mobile-web-app-title" content="OctoRill"',
-	),
+assert.equal(
+	requireMetaContent(metaElements, "apple-mobile-web-app-title"),
+	"OctoRill",
 	"index includes iOS app title",
 );
-assert(
-	indexHtml.includes(
-		'<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"',
-	),
+assert.equal(
+	requireMetaContent(metaElements, "apple-mobile-web-app-status-bar-style"),
+	"black-translucent",
 	"index includes iOS status bar style",
 );
 assert(Array.isArray(manifest.icons), "manifest icons must be an array");
@@ -99,9 +151,23 @@ for (const [url, expectedName] of expectedShortcuts) {
 }
 
 const expectedIcons = new Map([
-	["icon-192", { width: 192, height: 192, maskable: false }],
-	["icon-512", { width: 512, height: 512, maskable: false }],
-	["maskable-icon-512", { width: 512, height: 512, maskable: true }],
+	[
+		"icon-192",
+		{ source: "icon-192.png", width: 192, height: 192, maskable: false },
+	],
+	[
+		"icon-512",
+		{ source: "icon-512.png", width: 512, height: 512, maskable: false },
+	],
+	[
+		"maskable-icon-512",
+		{
+			source: "maskable-icon-512.png",
+			width: 512,
+			height: 512,
+			maskable: true,
+		},
+	],
 ]);
 
 for (const [basename, expected] of expectedIcons) {
@@ -123,6 +189,14 @@ for (const [basename, expected] of expectedIcons) {
 		);
 	}
 	const iconBytes = await readFile(path.join(distDir, icon.src.slice(1)));
+	const approvedIconBytes = await readFile(
+		path.join(approvedIconDir, expected.source),
+	);
+	assert.equal(
+		Buffer.compare(iconBytes, approvedIconBytes),
+		0,
+		`${basename} production bytes match the approved source artwork`,
+	);
 	const digest = createHash("sha256")
 		.update(iconBytes)
 		.digest("hex")
@@ -141,30 +215,8 @@ for (const [basename, expected] of expectedIcons) {
 assert.equal(
 	manifest.icons.length,
 	expectedIcons.size,
-	"manifest does not add a legacy icon as a Chromium install icon",
+	"manifest contains only the supported regular and maskable install icons",
 );
-
-const appleTouchIconHref = indexHtml.match(
-	/rel="apple-touch-icon"[\s\S]*?href="([^"]+)"/,
-);
-assert(appleTouchIconHref, "index links a legacy Apple touch icon fallback");
-assert.match(
-	appleTouchIconHref[1],
-	/^\/pwa\/apple-touch-icon\.[0-9a-f]{16}\.png$/,
-	"legacy Apple touch icon URL is content hashed",
-);
-const appleTouchIconBytes = await readFile(
-	path.join(distDir, appleTouchIconHref[1].slice(1)),
-);
-assert.equal(
-	appleTouchIconHref[1].match(/\.([0-9a-f]{16})\.png$/)?.[1],
-	createHash("sha256").update(appleTouchIconBytes).digest("hex").slice(0, 16),
-	"legacy Apple touch icon URL matches its file content",
-);
-const appleTouchIcon = await readPngSize(
-	path.join(distDir, appleTouchIconHref[1].slice(1)),
-);
-assert.deepEqual(appleTouchIcon, { width: 180, height: 180 });
 
 const expectedScreenshots = new Map([
 	[
@@ -214,10 +266,7 @@ assert(
 );
 assert(
 	!precache.urls.some(
-		(url) =>
-			url.startsWith("/pwa/icon-") ||
-			url.startsWith("/pwa/maskable-icon-") ||
-			url.startsWith("/pwa/apple-touch-icon"),
+		(url) => url.startsWith("/pwa/") && !url.startsWith("/pwa/screenshots/"),
 	),
 	"precache excludes install icons so browsers can fetch current metadata",
 );
@@ -260,8 +309,7 @@ assert(
 );
 assert(
 	!serviceWorker.includes("/pwa/icon-") &&
-		!serviceWorker.includes("/pwa/maskable-icon-") &&
-		!serviceWorker.includes("/pwa/apple-touch-icon"),
+		!serviceWorker.includes("/pwa/maskable-icon-"),
 	"service worker does not pin install icons",
 );
 assert(
