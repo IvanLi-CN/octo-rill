@@ -17,7 +17,7 @@ export default defineConfig((env) =>
 						storybookTest({
 							configDir: resolve(__dirname, ".storybook"),
 							tags: {
-								include: ["landing-auth-feedback"],
+								include: ["landing-auth-feedback", "feed-pagination-feedback"],
 								exclude: [],
 								skip: [],
 							},
