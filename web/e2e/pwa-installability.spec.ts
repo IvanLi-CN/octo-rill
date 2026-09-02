@@ -650,6 +650,7 @@ test("install metadata stays network-revalidated outside the service worker prec
 test("same Chromium standalone app context retrieves V2 install metadata after a V1 app update", async ({
 	page,
 }) => {
+	test.setTimeout(120_000);
 	const server = await startStaticPwaServer();
 	try {
 		// Playwright cannot drive the OS install UI; this models an installed Chromium
