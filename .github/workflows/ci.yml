@@ -89,6 +89,18 @@ jobs:
             echo "No web/ package; skipping"
           fi
 
+      - name: Front-end PWA build contract (optional)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f web/package.json ]]; then
+            cd web
+            bun run build
+            bun run test:pwa-build-contract
+          else
+            echo "No web/ package; skipping"
+          fi
+
       - name: Front-end embedded version contract test (optional)
         shell: bash
         run: |

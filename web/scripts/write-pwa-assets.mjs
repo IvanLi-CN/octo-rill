@@ -29,10 +29,6 @@ const installIconAssets = [
 		relativePath: "pwa/maskable-icon-512.png",
 		manifestSrc: "/pwa/maskable-icon-512.png",
 	},
-	{
-		relativePath: "pwa/apple-touch-icon.png",
-		legacyHtmlSrc: "/pwa/apple-touch-icon.png",
-	},
 ];
 
 async function listFiles(dir) {
@@ -106,22 +102,6 @@ if (rewrittenManifestIcons.size !== manifestIconAssets.size) {
 	throw new Error("PWA manifest icons do not match the install icon assets");
 }
 await writeFile(manifestPath, `${JSON.stringify(manifest, null, "\t")}\n`);
-
-const legacyAppleTouchIcon = contentAddressedInstallIcons.find(
-	(asset) => asset.legacyHtmlSrc,
-);
-if (!legacyAppleTouchIcon) {
-	throw new Error("PWA build must include a legacy Apple touch icon fallback");
-}
-const indexHtml = await readFile(indexPath, "utf8");
-const updatedIndexHtml = indexHtml.replace(
-	/\/pwa\/apple-touch-icon(?:\.[0-9a-f]{16})?\.png/g,
-	legacyAppleTouchIcon.hashedUrl,
-);
-if (updatedIndexHtml === indexHtml) {
-	throw new Error("PWA index must link the legacy Apple touch icon fallback");
-}
-await writeFile(indexPath, updatedIndexHtml);
 
 function isAllowedPrecacheUrl(url) {
 	const extension = path.extname(url);
