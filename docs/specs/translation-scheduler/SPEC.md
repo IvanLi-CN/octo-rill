@@ -18,7 +18,7 @@
 ## Requirements
 
 - REQ-SCHEDULER: 调度器必须把翻译请求、work item、批次和结果扇出保持为独立领域模型，生产者只提交需求而不拥有组批策略。
-- REQ-ATTEMPT-AUDIT: 每次初始执行、自动恢复、手动重试及其状态转换必须在同一事务追加元数据专用的尝试事件；事件不得保存源文本、prompt、原始模型响应或原始上游错误。
+- REQ-ATTEMPT-AUDIT: 每次初始执行、自动恢复、手动重试及其状态转换必须在同一事务追加元数据专用的尝试事件；已到期并重新入队时，当前尝试状态必须呈现为 `queued` 而非保留过期的重试安排；事件不得保存源文本、prompt、原始模型响应或原始上游错误。
 - REQ-COLLECTION-RECORDS: 管理端必须按 Release、公告、日报分组、分页并以最近 24 小时为默认时间范围展示采集记录；行数据必须包含该类型的基础区分信息、发现时间和翻译或润色任务摘要。
 - REQ-RECORD-DETAIL: 桌面端必须在抽屉展示记录详情与尝试历史，移动端必须导航至详情路由；详情必须暴露模型、错误分类、重试信息和可用下钻链接。
 
@@ -26,7 +26,7 @@
 
 - VER-RUST-SCHEDULER: 覆盖: REQ-SCHEDULER, REQ-ATTEMPT-AUDIT。通过 Rust 单元与集成测试验证队列、批次、自动恢复、手动重试和追加式事件写入。
 - VER-ADMIN-API: 覆盖: REQ-ATTEMPT-AUDIT, REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过管理员 API 测试验证时间筛选、分页、任务摘要、尝试历史和安全错误字段。
-- VER-WEB-ADMIN: 覆盖: REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过 Web 构建、Playwright 回归与 `ui_demo` 视觉证据验证分组列表、桌面抽屉和移动详情路由。
+- VER-WEB-ADMIN: 覆盖: REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过 Web 构建、Playwright 回归与 `ui_demo` 视觉证据验证分组列表、桌面抽屉、移动详情路由，以及尝试列表直接可见的模型、错误和重入队状态。
 
 ## 目标 / 非目标
 
@@ -93,6 +93,10 @@
   When 错误被判定为结构化可恢复失败
   Then 调度器必须先持久化真实 `error` 状态、失败分类、尝试历史与下一次恢复时间；到期恢复器再将 request 与 work item 重新置为 `queued`。
 
+- Given 先前失败的 work item 已到达自动恢复时间
+  When 恢复器将它重新入队
+  Then 该失败尝试的重试安排仍保留为历史事件，而管理员读取的当前尝试状态显示 `queued` 与自动恢复触发方式。
+
 - Given 一个发布记录对应的 work item 被首次执行、手动重试或自动恢复
   When 管理员按 `entity_id` 查询尝试审计
   Then 返回按时间追加的入队、开始、完成与重试安排事件；每条事件包含尝试序号、触发方式、结果或失败分类、是否可重试、下次重试时间和可用的 request、batch、LLM 调用关联。
@@ -135,7 +139,7 @@
 
 - Rust tests：请求去重、缓存命中、deadline flush、token flush、批次扇出、批次终态返回、自动/手动重试审计、管理员 API 聚合。
 - Web tests：Feed 自动翻译、Release Detail 翻译、管理员“翻译调度”标签页与发布记录重试审计。
-- Playwright：producer `wait`/`stream` 行为与管理员视图回归。
+- Playwright：producer `wait`/`stream` 行为与管理员视图回归，包括内容处理记录的重入队状态、模型、错误和下钻。
 
 ### Quality checks
 
