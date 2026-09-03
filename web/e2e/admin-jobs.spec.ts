@@ -3356,6 +3356,7 @@ test("admin llm mobile filters keep context around the time range panel", async 
 
 test("admin keeps llm calls visible during sse refresh", async ({ page }) => {
 	test.slow();
+	const delayedRefreshTimeoutMs = 12_000;
 	await installAdminJobsMocks(page, {
 		responseDelayMs: 4000,
 		delayedPaths: ["/api/admin/jobs/llm/calls", "/api/admin/jobs/llm/activity"],
@@ -3364,9 +3365,15 @@ test("admin keeps llm calls visible during sse refresh", async ({ page }) => {
 	await page.goto("/admin/jobs");
 
 	await page.getByRole("tab", { name: "LLM调度" }).click();
-	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
-	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
-	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible({
+		timeout: delayedRefreshTimeoutMs,
+	});
+	await expect(page.getByText("LLM 调度更新中...")).toBeVisible({
+		timeout: delayedRefreshTimeoutMs,
+	});
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible({
+		timeout: delayedRefreshTimeoutMs,
+	});
 	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
 	await expect(page.getByTestId("llm-activity-grid")).toBeVisible();
 	await expect(page.getByText("更新中", { exact: true })).toBeVisible();
