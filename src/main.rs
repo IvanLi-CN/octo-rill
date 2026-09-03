@@ -1,3 +1,4 @@
+mod admin_ai_records;
 mod admin_runtime;
 mod ai;
 mod api;

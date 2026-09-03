@@ -1816,6 +1816,11 @@ function AdminJobsPreview({
 					finished_at: syncSubscriptionChainFinishedAt[item.id] ?? null,
 				})),
 		};
+		let webhookPushRuntimeConfig = {
+			audit_interval_days: 7,
+			last_started_at: "2026-02-26T04:00:00Z",
+			next_started_at: "2026-03-05T04:00:00Z",
+		};
 		let translationWorkers =
 			translationState === "busy"
 				? translationBusyWorkersSeed.map((item) => ({ ...item }))
@@ -2187,6 +2192,34 @@ function AdminJobsPreview({
 						syncRuntimeConfig.daily_brief_schedule_local_time,
 				};
 				return new Response(JSON.stringify(syncRuntimeConfig), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+
+			if (
+				url.pathname === "/api/admin/jobs/webhook-push/runtime-config" &&
+				req.method === "GET"
+			) {
+				return new Response(JSON.stringify(webhookPushRuntimeConfig), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+
+			if (
+				url.pathname === "/api/admin/jobs/webhook-push/runtime-config" &&
+				req.method === "PATCH"
+			) {
+				const body = (await req.json()) as { audit_interval_days?: number };
+				webhookPushRuntimeConfig = {
+					...webhookPushRuntimeConfig,
+					audit_interval_days: Number(
+						body.audit_interval_days ??
+							webhookPushRuntimeConfig.audit_interval_days,
+					),
+				};
+				return new Response(JSON.stringify(webhookPushRuntimeConfig), {
 					status: 200,
 					headers: { "content-type": "application/json" },
 				});

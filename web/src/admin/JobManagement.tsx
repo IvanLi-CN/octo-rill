@@ -6,12 +6,21 @@ import {
 	CircleHelp,
 	LayoutGrid,
 	Plus,
+	Search,
 	Settings2,
 	Trash2,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+	type FormEvent,
+	useCallback,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 
 import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
+import { AiOperationsRecordsSection } from "@/admin/AiOperationsRecordsSection";
 import { LlmActivityGrid } from "@/admin/LlmActivityGrid";
 import {
 	LlmCallActionsMenu,
@@ -45,6 +54,7 @@ import {
 	type AdminTaskEventItem,
 	type AdminTranslationBatchDetailResponse,
 	type AdminTranslationStreamEvent,
+	type AdminTranslationAttemptEvent,
 	type AdminTranslationBatchListItem,
 	type AdminTranslationRequestDetailResponse,
 	type AdminTranslationRequestListItem,
@@ -67,6 +77,7 @@ import {
 	apiGetAdminRealtimeTasks,
 	apiGetAdminTranslationBatchDetail,
 	apiGetAdminTranslationBatches,
+	apiGetAdminTranslationAttemptEvents,
 	apiGetAdminTranslationRequestDetail,
 	apiGetAdminTranslationRequests,
 	apiGetAdminTranslationStatus,
@@ -1684,6 +1695,75 @@ function translationRequestOriginLabel(origin: string) {
 	}
 }
 
+function translationAttemptTriggerLabel(trigger: string) {
+	switch (trigger) {
+		case "initial":
+			return "首次";
+		case "manual_retry":
+			return "手动重试";
+		case "automatic_recovery":
+			return "自动重试";
+		case "system_requeue":
+			return "系统重排";
+		default:
+			return trigger || "-";
+	}
+}
+
+function translationAttemptEventLabel(eventType: string) {
+	switch (eventType) {
+		case "attempt_queued":
+			return "已入队";
+		case "attempt_started":
+			return "已开始";
+		case "attempt_completed":
+			return "已完成";
+		case "retry_scheduled":
+			return "已安排重试";
+		default:
+			return eventType || "-";
+	}
+}
+
+function translationAttemptEventTone(eventType: string): BadgeTone {
+	switch (eventType) {
+		case "attempt_queued":
+		case "retry_scheduled":
+			return taskStatusTone("queued");
+		case "attempt_started":
+			return taskStatusTone("running");
+		default:
+			return {
+				badgeClass:
+					"border-border bg-muted/60 text-foreground dark:border-border dark:bg-muted/50 dark:text-foreground",
+				dotClass: "bg-muted-foreground",
+			};
+	}
+}
+
+function translationAttemptResultLabel(event: AdminTranslationAttemptEvent) {
+	if (event.result_status) {
+		return translationItemStatusLabel(event.result_status);
+	}
+	return event.retry_eligible ? "可重试" : "-";
+}
+
+function translationAttemptResultTone(
+	event: AdminTranslationAttemptEvent,
+): BadgeTone {
+	if (event.result_status) {
+		return translationItemTone(event.result_status);
+	}
+	if (event.retry_eligible) {
+		return taskStatusTone("queued");
+	}
+	return {
+		badgeClass:
+			"border-border bg-muted/60 text-foreground dark:border-border dark:bg-muted/50 dark:text-foreground",
+		dotClass: "bg-muted-foreground",
+	};
+}
+
 function translationWorkerKindLabel(kind: string) {
 	switch (kind) {
 		case "general":
@@ -1746,6 +1826,15 @@ function TranslationSchedulerSection(props: {
 	const [batchTotal, setBatchTotal] = useState(0);
 	const [batchPage, setBatchPage] = useState(1);
 	const [batchLoadPhase, setBatchLoadPhase] = useState<ListLoadPhase>("idle");
+	const [auditEntityIdInput, setAuditEntityIdInput] = useState("");
+	const [auditEntityId, setAuditEntityId] = useState("");
+	const [auditEvents, setAuditEvents] = useState<
+		AdminTranslationAttemptEvent[]
+	>([]);
+	const [auditTotal, setAuditTotal] = useState(0);
+	const [auditPage, setAuditPage] = useState(1);
+	const [auditLoadPhase, setAuditLoadPhase] = useState<ListLoadPhase>("idle");
+	const [auditError, setAuditError] = useState<string | null>(null);
 	const [drawer, setDrawer] = useState<TranslationDrawerState>(null);
 	const [requestDetail, setRequestDetail] =
 		useState<AdminTranslationRequestDetailResponse | null>(null);
@@ -1763,6 +1852,7 @@ function TranslationSchedulerSection(props: {
 	const [settingsSaving, setSettingsSaving] = useState(false);
 	const requestLoadedRef = useRef(false);
 	const batchLoadedRef = useRef(false);
+	const auditRequestIdRef = useRef(0);
 	const requestTotalPages = useMemo(
 		() => Math.max(1, Math.ceil(requestTotal / TASK_PAGE_SIZE)),
 		[requestTotal],
@@ -1770,6 +1860,10 @@ function TranslationSchedulerSection(props: {
 	const batchTotalPages = useMemo(
 		() => Math.max(1, Math.ceil(batchTotal / TASK_PAGE_SIZE)),
 		[batchTotal],
+	);
+	const auditTotalPages = useMemo(
+		() => Math.max(1, Math.ceil(auditTotal / TASK_PAGE_SIZE)),
+		[auditTotal],
 	);
 	const requestListSurface = useListSurfaceState({
 		loading: requestLoadPhase !== "idle",
@@ -1780,6 +1874,11 @@ function TranslationSchedulerSection(props: {
 		loading: batchLoadPhase !== "idle",
 		hasData: batches.length > 0,
 		hasError: listError !== null,
+	});
+	const auditListSurface = useListSurfaceState({
+		loading: auditLoadPhase !== "idle",
+		hasData: auditEvents.length > 0,
+		hasError: auditError !== null,
 	});
 	const selectedWorker = useMemo(() => {
 		if (drawer?.kind !== "worker") {
@@ -1863,6 +1962,38 @@ function TranslationSchedulerSection(props: {
 		[batchPage, batchStatusFilter],
 	);
 
+	const loadAuditEvents = useCallback(
+		async (entityId: string, page: number) => {
+			const requestId = auditRequestIdRef.current + 1;
+			auditRequestIdRef.current = requestId;
+			setAuditLoadPhase("initial");
+			setAuditError(null);
+			try {
+				const params = new URLSearchParams({
+					entity_id: entityId,
+					kind: "release_detail",
+					variant: "feed_body",
+					page: String(page),
+					page_size: String(TASK_PAGE_SIZE),
+				});
+				const res = await apiGetAdminTranslationAttemptEvents(params);
+				if (requestId !== auditRequestIdRef.current) return;
+				setAuditEvents(res.items);
+				setAuditTotal(res.total);
+			} catch (err) {
+				if (requestId !== auditRequestIdRef.current) return;
+				setAuditEvents([]);
+				setAuditTotal(0);
+				setAuditError(normalizeErrorMessage(err));
+			} finally {
+				if (requestId === auditRequestIdRef.current) {
+					setAuditLoadPhase("idle");
+				}
+			}
+		},
+		[],
+	);
+
 	const openRequestDetail = useCallback(async (requestId: string) => {
 		setDrawer({ kind: "request", id: requestId });
 		setDrawerLoading(true);
@@ -1940,6 +2071,36 @@ function TranslationSchedulerSection(props: {
 		}
 	}, [dedicatedWorkerInput, generalWorkerInput]);
 
+	const submitAuditSearch = useCallback(
+		(event: FormEvent<HTMLFormElement>) => {
+			event.preventDefault();
+			const nextEntityId = auditEntityIdInput.trim();
+			if (!nextEntityId) {
+				auditRequestIdRef.current += 1;
+				setAuditEntityId("");
+				setAuditEvents([]);
+				setAuditTotal(0);
+				setAuditPage(1);
+				setAuditLoadPhase("idle");
+				setAuditError(null);
+				return;
+			}
+			if (nextEntityId === auditEntityId && auditPage === 1) {
+				void loadAuditEvents(nextEntityId, 1);
+			}
+			setAuditPage(1);
+			setAuditEntityId(nextEntityId);
+		},
+		[auditEntityId, auditEntityIdInput, auditPage, loadAuditEvents],
+	);
+
+	useEffect(
+		() => () => {
+			auditRequestIdRef.current += 1;
+		},
+		[],
+	);
+
 	useEffect(() => {
 		if (refreshNonce < 0) return;
 		setListError(null);
@@ -1961,6 +2122,11 @@ function TranslationSchedulerSection(props: {
 			setListError(normalizeErrorMessage(err));
 		});
 	}, [loadBatches, refreshNonce]);
+
+	useEffect(() => {
+		if (!auditEntityId) return;
+		void loadAuditEvents(auditEntityId, auditPage);
+	}, [auditEntityId, auditPage, loadAuditEvents, refreshNonce]);
 
 	useEffect(() => {
 		if (refreshNonce < 0) return;
@@ -2084,6 +2250,361 @@ function TranslationSchedulerSection(props: {
 				}
 				onWorkerClick={(worker) => openWorkerDetail(worker.worker_id)}
 			/>
+
+			<Card>
+				<CardHeader>
+					<CardTitle>发布记录重试审计</CardTitle>
+					<p className="text-muted-foreground text-sm">
+						按发布记录 ID 查看首次执行、自动恢复和手动重试的完整事件链。
+					</p>
+				</CardHeader>
+				<CardContent className="space-y-4">
+					<form
+						onSubmit={submitAuditSearch}
+						className="flex flex-col gap-2 sm:flex-row sm:items-end"
+					>
+						<div className="grid flex-1 gap-2">
+							<Label htmlFor="translation-audit-entity-id">发布记录 ID</Label>
+							<Input
+								id="translation-audit-entity-id"
+								value={auditEntityIdInput}
+								onChange={(event) => setAuditEntityIdInput(event.target.value)}
+								placeholder="例如 377359238"
+								autoComplete="off"
+							/>
+						</div>
+						<Button
+							type="submit"
+							variant="outline"
+							size="icon"
+							className="max-lg:size-11"
+							aria-label="查询发布记录重试审计"
+							disabled={auditLoadPhase !== "idle"}
+						>
+							<Search />
+						</Button>
+					</form>
+
+					{!auditEntityId ? (
+						<p className="text-muted-foreground text-sm">
+							输入发布记录 ID 后显示对应翻译工作项的尝试历史。
+						</p>
+					) : (
+						<section
+							aria-busy={auditLoadPhase !== "idle"}
+							aria-label="发布记录重试审计结果"
+							className="space-y-3"
+						>
+							<p
+								aria-atomic="true"
+								aria-live="polite"
+								className="sr-only"
+								role="status"
+							>
+								{auditLoadPhase !== "idle"
+									? `正在加载发布记录 ${auditEntityId} 的重试审计。`
+									: auditError
+										? ""
+										: auditEvents.length === 0
+											? `发布记录 ${auditEntityId} 暂无尝试记录。`
+											: `已加载发布记录 ${auditEntityId} 的 ${formatCount(auditTotal)} 条重试审计事件。`}
+							</p>
+							<div className="flex flex-wrap items-center justify-between gap-2">
+								<p className="text-sm">
+									发布记录{" "}
+									<span className="font-mono font-medium">{auditEntityId}</span>
+								</p>
+								<span className="text-muted-foreground text-xs">
+									共 {formatCount(auditTotal)} 条事件
+								</span>
+							</div>
+
+							<ListSurfaceShell
+								state={auditListSurface.state}
+								refreshing={auditListSurface.showRefreshing}
+								className="space-y-3"
+							>
+								{auditListSurface.showRefreshing ? (
+									<ListRefreshingNotice label="重试审计更新中..." />
+								) : null}
+								{auditListSurface.state === "blocking-error" ? (
+									<ListBlockingErrorState
+										title="重试审计加载失败"
+										summary={
+											auditError ?? "当前无法读取这条发布记录的尝试历史。"
+										}
+										actionLabel="重试"
+										onAction={() =>
+											void loadAuditEvents(auditEntityId, auditPage)
+										}
+									/>
+								) : auditListSurface.state === "initial-loading" ? (
+									<CardListSkeleton count={3} itemClassName="h-32" />
+								) : auditListSurface.state === "empty" ? (
+									<ListEmptyState
+										title="暂无尝试记录"
+										description="这条发布记录尚未进入结构化翻译调度，或记录产生于审计功能启用之前。"
+									/>
+								) : (
+									<>
+										<div className="hidden lg:block">
+											<Table
+												containerClassName="rounded-lg border"
+												className="w-full table-fixed text-sm"
+											>
+												<TableHeader>
+													<TableRow>
+														<TableHead className="w-[8%]">尝试</TableHead>
+														<TableHead className="w-[16%]">事件</TableHead>
+														<TableHead className="w-[12%]">结果</TableHead>
+														<TableHead className="w-[27%]">
+															错误与恢复
+														</TableHead>
+														<TableHead className="w-[25%]">关联</TableHead>
+														<TableHead className="w-[12%]">时间</TableHead>
+													</TableRow>
+												</TableHeader>
+												<TableBody>
+													{auditEvents.map((event) => (
+														<TableRow key={event.id}>
+															<TableCell className="px-3 py-3 font-mono font-semibold">
+																#{event.attempt_no}
+															</TableCell>
+															<TableCell className="px-3 py-3">
+																<p>
+																	{translationAttemptEventLabel(
+																		event.event_type,
+																	)}
+																</p>
+																<p className="text-muted-foreground mt-1 text-xs">
+																	{translationAttemptTriggerLabel(
+																		event.trigger,
+																	)}
+																</p>
+															</TableCell>
+															<TableCell className="px-3 py-3">
+																<StatusBadge
+																	label={translationAttemptResultLabel(event)}
+																	tone={translationAttemptResultTone(event)}
+																/>
+															</TableCell>
+															<TableCell className="px-3 py-3">
+																{event.error_summary ? (
+																	<p
+																		className="line-clamp-2 break-words text-xs leading-5"
+																		title={event.error_summary}
+																	>
+																		{event.error_summary}
+																	</p>
+																) : (
+																	<p className="text-muted-foreground text-xs">
+																		-
+																	</p>
+																)}
+																{event.error_code || event.failure_class ? (
+																	<p className="text-muted-foreground mt-1 font-mono text-[11px]">
+																		{[event.error_code, event.failure_class]
+																			.filter(Boolean)
+																			.join(" · ")}
+																	</p>
+																) : null}
+																{event.next_retry_at ? (
+																	<p className="mt-1 text-xs text-amber-700 dark:text-amber-200">
+																		下次重试{" "}
+																		{formatLocalDateTime(event.next_retry_at)}
+																	</p>
+																) : null}
+															</TableCell>
+															<TableCell className="px-3 py-3">
+																<div className="flex flex-wrap gap-1.5">
+																	<span
+																		className="max-w-full break-all font-mono text-[11px] text-muted-foreground"
+																		title={event.work_item_id}
+																	>
+																		工作项 {event.work_item_id}
+																	</span>
+																	{event.request_id ? (
+																		<Button
+																			variant="outline"
+																			size="sm"
+																			onClick={() =>
+																				void openRequestDetail(
+																					event.request_id!,
+																				)
+																			}
+																		>
+																			请求
+																		</Button>
+																	) : null}
+																	{event.batch_id ? (
+																		<Button
+																			variant="outline"
+																			size="sm"
+																			onClick={() =>
+																				void openBatchDetail(event.batch_id!)
+																			}
+																		>
+																			批次
+																		</Button>
+																	) : null}
+																	{event.llm_call_ids.map((callId) => (
+																		<Button
+																			key={callId}
+																			variant="outline"
+																			size="sm"
+																			className="max-w-full font-mono text-[11px]"
+																			onClick={() =>
+																				onOpenLlmCallDetail(callId)
+																			}
+																		>
+																			{callId}
+																		</Button>
+																	))}
+																	{!event.request_id &&
+																	!event.batch_id &&
+																	event.llm_call_ids.length === 0 ? (
+																		<span className="text-muted-foreground text-xs">
+																			-
+																		</span>
+																	) : null}
+																</div>
+															</TableCell>
+															<TableCell className="px-3 py-3 text-xs">
+																{formatLocalDateTime(event.created_at)}
+															</TableCell>
+														</TableRow>
+													))}
+												</TableBody>
+											</Table>
+										</div>
+										<div className="space-y-2 lg:hidden">
+											{auditEvents.map((event) => (
+												<div key={event.id} className="border p-3">
+													<div className="flex flex-wrap items-center gap-2">
+														<p className="font-mono font-semibold text-sm">
+															#{event.attempt_no}
+														</p>
+														<StatusBadge
+															label={translationAttemptEventLabel(
+																event.event_type,
+															)}
+															tone={translationAttemptEventTone(
+																event.event_type,
+															)}
+														/>
+														<StatusBadge
+															label={translationAttemptResultLabel(event)}
+															tone={translationAttemptResultTone(event)}
+														/>
+													</div>
+													<p className="text-muted-foreground mt-1 text-xs">
+														{translationAttemptTriggerLabel(event.trigger)} ·{" "}
+														{formatLocalDateTime(event.created_at)}
+													</p>
+													{event.error_summary ? (
+														<p className="mt-2 break-words text-sm">
+															{event.error_summary}
+														</p>
+													) : null}
+													{event.error_code ||
+													event.failure_class ||
+													event.next_retry_at ? (
+														<p className="text-muted-foreground mt-1 text-xs">
+															{[event.error_code, event.failure_class]
+																.filter(Boolean)
+																.join(" · ") || "-"}
+															{event.next_retry_at
+																? ` · 下次重试 ${formatLocalDateTime(event.next_retry_at)}`
+																: ""}
+														</p>
+													) : null}
+													<div className="mt-3 flex flex-wrap gap-2">
+														<span
+															className="max-w-full break-all font-mono text-[11px] text-muted-foreground"
+															title={event.work_item_id}
+														>
+															工作项 {event.work_item_id}
+														</span>
+														{event.request_id ? (
+															<Button
+																variant="outline"
+																size="sm"
+																className="min-h-11"
+																onClick={() =>
+																	void openRequestDetail(event.request_id!)
+																}
+															>
+																请求详情
+															</Button>
+														) : null}
+														{event.batch_id ? (
+															<Button
+																variant="outline"
+																size="sm"
+																className="min-h-11"
+																onClick={() =>
+																	void openBatchDetail(event.batch_id!)
+																}
+															>
+																批次详情
+															</Button>
+														) : null}
+														{event.llm_call_ids.map((callId) => (
+															<Button
+																key={callId}
+																variant="outline"
+																size="sm"
+																className="min-h-11"
+																onClick={() => onOpenLlmCallDetail(callId)}
+															>
+																LLM 详情
+															</Button>
+														))}
+													</div>
+												</div>
+											))}
+										</div>
+									</>
+								)}
+							</ListSurfaceShell>
+
+							<div className="flex items-center justify-between">
+								<p className="text-muted-foreground text-xs">
+									第 {auditPage}/{auditTotalPages} 页
+								</p>
+								<div className="flex gap-2">
+									<Button
+										variant="outline"
+										size="sm"
+										className="max-lg:min-h-11"
+										disabled={auditPage <= 1 || auditLoadPhase !== "idle"}
+										onClick={() =>
+											setAuditPage((previous) => Math.max(1, previous - 1))
+										}
+									>
+										上一页
+									</Button>
+									<Button
+										variant="outline"
+										size="sm"
+										className="max-lg:min-h-11"
+										disabled={
+											auditPage >= auditTotalPages || auditLoadPhase !== "idle"
+										}
+										onClick={() =>
+											setAuditPage((previous) =>
+												Math.min(auditTotalPages, previous + 1),
+											)
+										}
+									>
+										下一页
+									</Button>
+								</div>
+							</div>
+						</section>
+					)}
+				</CardContent>
+			</Card>
 
 			<Tabs
 				value={viewTab}
@@ -3942,6 +4463,7 @@ export function JobManagement({
 	);
 	const tab = routeState.primaryTab;
 	const translationView = routeState.translationView;
+	const aiRecordDetailRoute = routeState.aiRecordDetailRoute ?? null;
 	const taskDrawerRoute = routeState.taskDrawerRoute;
 	const taskDrawerFromTab = routeState.drawerFromTab;
 	const activeSubscriptionDetailTaskId =
@@ -5504,6 +6026,12 @@ export function JobManagement({
 						>
 							翻译调度
 						</TabsTrigger>
+						<TabsTrigger
+							value="ai_records"
+							className="!h-8 font-mono text-[11px] sm:text-xs"
+						>
+							内容处理
+						</TabsTrigger>
 					</TabsList>
 					<div className="flex flex-wrap items-center gap-2">
 						<Button
@@ -6713,7 +7241,7 @@ export function JobManagement({
 					</Card>
 				</TabsContent>
 
-				<TabsContent value="translations">
+				<TabsContent value="translations" className="space-y-4">
 					<TranslationSchedulerSection
 						viewTab={translationView}
 						onViewTabChange={(nextValue) =>
@@ -6726,6 +7254,66 @@ export function JobManagement({
 						}
 						refreshNonce={refreshNonce}
 						onOpenLlmCallDetail={(callId) => void onOpenLlmCallDetail(callId)}
+					/>
+				</TabsContent>
+
+				<TabsContent value="ai_records" className="space-y-4">
+					<AiOperationsRecordsSection
+						detailRoute={aiRecordDetailRoute}
+						onOpenRecord={(kind, id) =>
+							navigateAdminJobsRoute({
+								primaryTab: "ai_records",
+								translationView,
+								taskDrawerRoute: null,
+								drawerFromTab: null,
+								subscriptionDetailTaskId: null,
+								aiRecordDetailRoute: {
+									kind,
+									id,
+									attemptId: null,
+									llmCallId: null,
+								},
+							})
+						}
+						onOpenAttempt={(attemptId) => {
+							if (!aiRecordDetailRoute) return;
+							navigateAdminJobsRoute({
+								primaryTab: "ai_records",
+								translationView,
+								taskDrawerRoute: null,
+								drawerFromTab: null,
+								subscriptionDetailTaskId: null,
+								aiRecordDetailRoute: {
+									...aiRecordDetailRoute,
+									attemptId: attemptId || null,
+									llmCallId: null,
+								},
+							});
+						}}
+						onOpenLlm={(llmCallId) => {
+							if (!aiRecordDetailRoute) return;
+							navigateAdminJobsRoute({
+								primaryTab: "ai_records",
+								translationView,
+								taskDrawerRoute: null,
+								drawerFromTab: null,
+								subscriptionDetailTaskId: null,
+								aiRecordDetailRoute: {
+									...aiRecordDetailRoute,
+									llmCallId,
+								},
+							});
+						}}
+						onCloseRecord={() =>
+							navigateAdminJobsRoute({
+								primaryTab: "ai_records",
+								translationView,
+								taskDrawerRoute: null,
+								drawerFromTab: null,
+								subscriptionDetailTaskId: null,
+								aiRecordDetailRoute: null,
+							})
+						}
 					/>
 				</TabsContent>
 			</Tabs>

@@ -255,6 +255,20 @@ pub struct PublicTranslationResultItem {
 #[derive(Debug, Deserialize)]
 pub struct AdminTranslationListQuery {
     pub status: Option<String>,
+    pub task_group: Option<String>,
+    pub discovered_from: Option<String>,
+    pub discovered_before: Option<String>,
+    pub page: Option<i64>,
+    pub page_size: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminTranslationAttemptListQuery {
+    pub entity_id: Option<String>,
+    pub request_id: Option<String>,
+    pub work_item_id: Option<String>,
+    pub kind: Option<String>,
+    pub variant: Option<String>,
     pub page: Option<i64>,
     pub page_size: Option<i64>,
 }
@@ -310,8 +324,10 @@ pub struct AdminTranslationRequestListItem {
     pub variant: String,
     pub entity_id: String,
     pub batch_id: Option<String>,
+    pub retry_count: i64,
     pub created_at: String,
     pub started_at: Option<String>,
+    pub last_attempt_at: Option<String>,
     pub finished_at: Option<String>,
     pub updated_at: String,
 }
@@ -324,10 +340,44 @@ pub struct AdminTranslationRequestsResponse {
     pub total: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminTranslationAttemptEvent {
+    pub id: i64,
+    pub work_item_id: String,
+    pub request_id: Option<String>,
+    pub batch_id: Option<String>,
+    pub scope_user_id: String,
+    pub kind: String,
+    pub variant: String,
+    pub entity_id: String,
+    pub target_lang: String,
+    pub attempt_no: i64,
+    pub trigger: String,
+    pub event_type: String,
+    pub result_status: Option<String>,
+    pub error_code: Option<String>,
+    pub error_summary: Option<String>,
+    pub failure_class: Option<String>,
+    pub retry_eligible: bool,
+    pub next_retry_at: Option<String>,
+    pub llm_call_ids: Vec<String>,
+    pub llm_calls: Vec<AdminTranslationLinkedLlmCall>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminTranslationAttemptEventsResponse {
+    pub items: Vec<AdminTranslationAttemptEvent>,
+    pub page: i64,
+    pub page_size: i64,
+    pub total: i64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AdminTranslationRequestDetailResponse {
     pub request: AdminTranslationRequestListItem,
     pub result: AdminTranslationRequestResultItem,
+    pub attempts: Vec<AdminTranslationAttemptEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -365,7 +415,7 @@ pub struct AdminTranslationBatchesResponse {
     pub total: i64,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct AdminTranslationLinkedLlmCall {
     pub id: String,
     pub status: String,
@@ -397,6 +447,63 @@ struct AdminTranslationBatchRow {
     started_at: Option<String>,
     finished_at: Option<String>,
     updated_at: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct AdminTranslationAttemptEventRow {
+    id: i64,
+    work_item_id: String,
+    request_id: Option<String>,
+    batch_id: Option<String>,
+    scope_user_id: String,
+    kind: String,
+    variant: String,
+    entity_id: String,
+    target_lang: String,
+    attempt_no: i64,
+    trigger: String,
+    event_type: String,
+    result_status: Option<String>,
+    error_code: Option<String>,
+    error_summary: Option<String>,
+    failure_class: Option<String>,
+    retry_eligible: i64,
+    next_retry_at: Option<String>,
+    llm_call_ids_json: String,
+    created_at: String,
+}
+
+impl AdminTranslationAttemptEventRow {
+    fn into_response(
+        self,
+        llm_calls: Vec<AdminTranslationLinkedLlmCall>,
+    ) -> AdminTranslationAttemptEvent {
+        let llm_call_ids = serde_json::from_str::<Vec<String>>(self.llm_call_ids_json.as_str())
+            .unwrap_or_default();
+        AdminTranslationAttemptEvent {
+            id: self.id,
+            work_item_id: self.work_item_id,
+            request_id: self.request_id,
+            batch_id: self.batch_id,
+            scope_user_id: self.scope_user_id,
+            kind: self.kind,
+            variant: self.variant,
+            entity_id: self.entity_id,
+            target_lang: self.target_lang,
+            attempt_no: self.attempt_no,
+            trigger: self.trigger,
+            event_type: self.event_type,
+            result_status: self.result_status,
+            error_code: self.error_code,
+            error_summary: self.error_summary,
+            failure_class: self.failure_class,
+            retry_eligible: self.retry_eligible != 0,
+            next_retry_at: self.next_retry_at,
+            llm_call_ids,
+            llm_calls,
+            created_at: self.created_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -582,6 +689,103 @@ struct WorkItemRow {
     updated_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranslationAttemptTrigger {
+    Initial,
+    ManualRetry,
+    AutomaticRecovery,
+    SystemRequeue,
+}
+
+impl TranslationAttemptTrigger {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::ManualRetry => "manual_retry",
+            Self::AutomaticRecovery => "automatic_recovery",
+            Self::SystemRequeue => "system_requeue",
+        }
+    }
+
+    fn from_db(value: &str) -> Self {
+        match value {
+            "manual_retry" => Self::ManualRetry,
+            "automatic_recovery" => Self::AutomaticRecovery,
+            "system_requeue" => Self::SystemRequeue,
+            _ => Self::Initial,
+        }
+    }
+}
+
+fn translation_attempt_trigger_for_request_origin(origin: &str) -> TranslationAttemptTrigger {
+    if origin == "user" {
+        TranslationAttemptTrigger::ManualRetry
+    } else {
+        TranslationAttemptTrigger::SystemRequeue
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TranslationAttemptIdentity {
+    work_item_id: String,
+    scope_user_id: String,
+    kind: String,
+    variant: String,
+    entity_id: String,
+    target_lang: String,
+}
+
+impl From<&WorkItemRow> for TranslationAttemptIdentity {
+    fn from(item: &WorkItemRow) -> Self {
+        Self {
+            work_item_id: item.id.clone(),
+            scope_user_id: item.scope_user_id.clone(),
+            kind: item.kind.clone(),
+            variant: item.variant.clone(),
+            entity_id: item.entity_id.clone(),
+            target_lang: item.target_lang.clone(),
+        }
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct TranslationAttemptStateRow {
+    attempt_count: i64,
+    next_attempt_trigger: String,
+}
+
+struct TranslationAttemptEventDetails<'a> {
+    request_id: Option<&'a str>,
+    batch_id: Option<&'a str>,
+    attempt_no: i64,
+    trigger: TranslationAttemptTrigger,
+    event_type: &'static str,
+    result_status: Option<&'a str>,
+    error_text: Option<&'a str>,
+    failure_class: Option<ai::LlmFailureClass>,
+    retry_eligible: bool,
+    next_retry_at: Option<&'a str>,
+    llm_call_ids: &'a [String],
+}
+
+struct TranslationAttemptCompletion<'a> {
+    batch_id: &'a str,
+    result_status: &'a str,
+    error_text: Option<&'a str>,
+    failure_class: Option<ai::LlmFailureClass>,
+    retry_eligible: bool,
+    next_retry_at: Option<&'a str>,
+    llm_call_ids: &'a [String],
+}
+
+struct TranslationRetrySchedule<'a> {
+    batch_id: &'a str,
+    next_retry_at: &'a str,
+    failure_class: Option<ai::LlmFailureClass>,
+    error_text: Option<&'a str>,
+    llm_call_ids: &'a [String],
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct ClaimCandidateRow {
@@ -642,6 +846,8 @@ struct RequestRow {
     updated_at: String,
     work_item_status: Option<String>,
     batch_id: Option<String>,
+    retry_count: i64,
+    last_attempt_at: Option<String>,
 }
 
 impl RequestRow {
@@ -668,8 +874,10 @@ impl RequestRow {
             variant: self.variant.clone(),
             entity_id: self.entity_id.clone(),
             batch_id: self.batch_id.clone(),
+            retry_count: self.retry_count,
             created_at: self.created_at.clone(),
             started_at: self.started_at.clone(),
+            last_attempt_at: self.last_attempt_at.clone(),
             finished_at: self.finished_at.clone(),
             updated_at: self.updated_at.clone(),
         }
@@ -1667,7 +1875,9 @@ fn request_row_select_sql() -> &'static str {
            r.error_text,
            r.created_at, r.started_at, r.finished_at, r.updated_at,
            (SELECT status FROM translation_work_items w WHERE w.id = r.work_item_id) AS work_item_status,
-           (SELECT batch_id FROM translation_work_items w WHERE w.id = r.work_item_id) AS batch_id
+           (SELECT batch_id FROM translation_work_items w WHERE w.id = r.work_item_id) AS batch_id,
+           COALESCE((SELECT retry_count FROM translation_work_items w WHERE w.id = r.work_item_id), 0) AS retry_count,
+           (SELECT MAX(created_at) FROM translation_attempt_events e WHERE e.work_item_id = r.work_item_id) AS last_attempt_at
     FROM translation_requests r
     "#
 }
@@ -2115,6 +2325,14 @@ pub async fn admin_list_translation_requests(
     let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
     let offset = (page - 1) * page_size;
     let status = query.status.unwrap_or_else(|| "all".to_owned());
+    let task_group = query.task_group.unwrap_or_else(|| "all".to_owned());
+    if !matches!(task_group.as_str(), "all" | "translation" | "polish") {
+        return Err(ApiError::bad_request("invalid task_group filter"));
+    }
+    let discovered_from =
+        parse_translation_filter_timestamp(query.discovered_from, "discovered_from")?;
+    let discovered_before =
+        parse_translation_filter_timestamp(query.discovered_before, "discovered_before")?;
 
     let effective_status_sql = request_effective_status_sql("status", "work_item_status");
     let total_sql = format!(
@@ -2122,6 +2340,13 @@ pub async fn admin_list_translation_requests(
         SELECT COUNT(*)
         FROM ({request_rows_base}) request_rows
         WHERE (? = 'all' OR {effective_status_sql} = ?)
+          AND (
+            ? = 'all'
+            OR (? = 'translation' AND kind != 'release_smart')
+            OR (? = 'polish' AND kind = 'release_smart')
+          )
+          AND (? IS NULL OR julianday(created_at) >= julianday(?))
+          AND (? IS NULL OR julianday(created_at) < julianday(?))
         "#,
         request_rows_base = request_row_select_sql(),
         effective_status_sql = effective_status_sql,
@@ -2129,6 +2354,13 @@ pub async fn admin_list_translation_requests(
     let total = sqlx::query_scalar::<_, i64>(&total_sql)
         .bind(status.as_str())
         .bind(status.as_str())
+        .bind(task_group.as_str())
+        .bind(task_group.as_str())
+        .bind(task_group.as_str())
+        .bind(discovered_from.as_deref())
+        .bind(discovered_from.as_deref())
+        .bind(discovered_before.as_deref())
+        .bind(discovered_before.as_deref())
         .fetch_one(&state.pool)
         .await
         .map_err(ApiError::internal)?;
@@ -2138,8 +2370,15 @@ pub async fn admin_list_translation_requests(
         SELECT *
         FROM ({request_rows_base}) request_rows
         WHERE (? = 'all' OR {effective_status_sql} = ?)
+          AND (
+            ? = 'all'
+            OR (? = 'translation' AND kind != 'release_smart')
+            OR (? = 'polish' AND kind = 'release_smart')
+          )
+          AND (? IS NULL OR julianday(created_at) >= julianday(?))
+          AND (? IS NULL OR julianday(created_at) < julianday(?))
         ORDER BY CASE WHEN {effective_status_sql} IN ('queued', 'running') THEN 0 ELSE 1 END ASC,
-                 updated_at DESC,
+                 created_at DESC,
                  id DESC
         LIMIT ? OFFSET ?
         "#,
@@ -2149,6 +2388,13 @@ pub async fn admin_list_translation_requests(
     let items = sqlx::query_as::<_, RequestRow>(&request_rows_sql)
         .bind(status.as_str())
         .bind(status.as_str())
+        .bind(task_group.as_str())
+        .bind(task_group.as_str())
+        .bind(task_group.as_str())
+        .bind(discovered_from.as_deref())
+        .bind(discovered_from.as_deref())
+        .bind(discovered_before.as_deref())
+        .bind(discovered_before.as_deref())
         .bind(page_size)
         .bind(offset)
         .fetch_all(&state.pool)
@@ -2164,6 +2410,157 @@ pub async fn admin_list_translation_requests(
         page_size,
         total,
     }))
+}
+
+fn parse_translation_filter_timestamp(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<String>, ApiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let parsed = DateTime::parse_from_rfc3339(trimmed)
+        .map_err(|_| ApiError::bad_request(format!("invalid {field} timestamp")))?;
+    Ok(Some(parsed.with_timezone(&Utc).to_rfc3339()))
+}
+
+pub async fn admin_list_translation_attempt_events(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Query(query): Query<AdminTranslationAttemptListQuery>,
+) -> Result<Json<AdminTranslationAttemptEventsResponse>, ApiError> {
+    let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
+    let entity_id = query.entity_id.unwrap_or_default().trim().to_owned();
+    let request_id = query.request_id.unwrap_or_default().trim().to_owned();
+    let work_item_id = query.work_item_id.unwrap_or_default().trim().to_owned();
+    if entity_id.is_empty() && request_id.is_empty() && work_item_id.is_empty() {
+        return Err(ApiError::bad_request(
+            "entity_id, request_id, or work_item_id is required",
+        ));
+    }
+    let kind = query.kind.unwrap_or_default().trim().to_owned();
+    let variant = query.variant.unwrap_or_default().trim().to_owned();
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(50).clamp(1, 200);
+    let offset = page.saturating_sub(1).saturating_mul(page_size);
+
+    let total = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM translation_attempt_events
+        WHERE (? = '' OR entity_id = ?)
+          AND (? = '' OR request_id = ?)
+          AND (? = '' OR work_item_id = ?)
+          AND (? = '' OR kind = ?)
+          AND (? = '' OR variant = ?)
+        "#,
+    )
+    .bind(entity_id.as_str())
+    .bind(entity_id.as_str())
+    .bind(request_id.as_str())
+    .bind(request_id.as_str())
+    .bind(work_item_id.as_str())
+    .bind(work_item_id.as_str())
+    .bind(kind.as_str())
+    .bind(kind.as_str())
+    .bind(variant.as_str())
+    .bind(variant.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let items = sqlx::query_as::<_, AdminTranslationAttemptEventRow>(
+        r#"
+        SELECT id, work_item_id, request_id, batch_id, scope_user_id, kind, variant, entity_id,
+               target_lang, attempt_no, trigger, event_type, result_status, error_code,
+               error_summary, failure_class, retry_eligible, next_retry_at,
+               llm_call_ids_json, created_at
+        FROM translation_attempt_events
+        WHERE (? = '' OR entity_id = ?)
+          AND (? = '' OR request_id = ?)
+          AND (? = '' OR work_item_id = ?)
+          AND (? = '' OR kind = ?)
+          AND (? = '' OR variant = ?)
+        ORDER BY created_at ASC, id ASC
+        LIMIT ? OFFSET ?
+        "#,
+    )
+    .bind(entity_id.as_str())
+    .bind(entity_id.as_str())
+    .bind(request_id.as_str())
+    .bind(request_id.as_str())
+    .bind(work_item_id.as_str())
+    .bind(work_item_id.as_str())
+    .bind(kind.as_str())
+    .bind(kind.as_str())
+    .bind(variant.as_str())
+    .bind(variant.as_str())
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let items = hydrate_translation_attempt_events(state.as_ref(), items).await?;
+
+    Ok(Json(AdminTranslationAttemptEventsResponse {
+        items,
+        page,
+        page_size,
+        total,
+    }))
+}
+
+async fn hydrate_translation_attempt_events(
+    state: &AppState,
+    rows: Vec<AdminTranslationAttemptEventRow>,
+) -> Result<Vec<AdminTranslationAttemptEvent>, ApiError> {
+    let call_ids = rows
+        .iter()
+        .flat_map(|row| {
+            serde_json::from_str::<Vec<String>>(row.llm_call_ids_json.as_str()).unwrap_or_default()
+        })
+        .collect::<HashSet<_>>();
+
+    let calls = if call_ids.is_empty() {
+        Vec::new()
+    } else {
+        let mut query = sqlx::QueryBuilder::<Sqlite>::new(
+            "SELECT id, status, source, model, scheduler_wait_ms, duration_ms, created_at FROM llm_calls WHERE id IN (",
+        );
+        {
+            let mut separated = query.separated(", ");
+            for call_id in &call_ids {
+                separated.push_bind(call_id.clone());
+            }
+        }
+        query.push(")");
+        query
+            .build_query_as::<AdminTranslationLinkedLlmCall>()
+            .fetch_all(&state.pool)
+            .await
+            .map_err(ApiError::internal)?
+    };
+    let calls_by_id = calls
+        .into_iter()
+        .map(|call| (call.id.clone(), call))
+        .collect::<HashMap<_, _>>();
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let call_ids = serde_json::from_str::<Vec<String>>(row.llm_call_ids_json.as_str())
+                .unwrap_or_default();
+            let llm_calls = call_ids
+                .iter()
+                .filter_map(|call_id| calls_by_id.get(call_id).cloned())
+                .collect();
+            row.into_response(llm_calls)
+        })
+        .collect())
 }
 
 pub async fn admin_get_translation_request_detail(
@@ -2192,9 +2589,30 @@ pub async fn admin_get_translation_request_detail(
                 "translation request not found",
             )
         })?;
+    let attempts = if let Some(work_item_id) = request.work_item_id.as_deref() {
+        let rows = sqlx::query_as::<_, AdminTranslationAttemptEventRow>(
+            r#"
+            SELECT id, work_item_id, request_id, batch_id, scope_user_id, kind, variant, entity_id,
+                   target_lang, attempt_no, trigger, event_type, result_status, error_code,
+                   error_summary, failure_class, retry_eligible, next_retry_at,
+                   llm_call_ids_json, created_at
+            FROM translation_attempt_events
+            WHERE work_item_id = ?
+            ORDER BY created_at ASC, id ASC
+            "#,
+        )
+        .bind(work_item_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+        hydrate_translation_attempt_events(state.as_ref(), rows).await?
+    } else {
+        Vec::new()
+    };
     Ok(Json(AdminTranslationRequestDetailResponse {
         request: request.to_admin_request_list_item(),
         result: admin_translation_result_item(request.to_result()),
+        attempts,
     }))
 }
 
@@ -2578,7 +2996,6 @@ async fn ensure_translation_result_for_item(
                         result.error.as_deref(),
                     )
                 {
-                    reset_retryable_terminal_work_item(tx, work_item.id.as_str(), now).await?;
                     let request_id = if let Some(existing_request_id) =
                         load_latest_request_id_for_work_item(
                             tx,
@@ -2601,6 +3018,14 @@ async fn ensure_translation_result_for_item(
                         )
                         .await?
                     };
+                    reset_retryable_terminal_work_item(
+                        tx,
+                        work_item.id.as_str(),
+                        TranslationAttemptTrigger::ManualRetry,
+                        Some(request_id.as_str()),
+                        now,
+                    )
+                    .await?;
                     attach_request_to_work_item(
                         tx,
                         request_id.as_str(),
@@ -2764,8 +3189,16 @@ async fn insert_translation_request(
         });
     }
 
-    if let Some(work_item_id) =
-        create_work_item(state, tx, user_id, &canonical_item, &source_hash, now).await?
+    if let Some(work_item_id) = create_work_item(
+        state,
+        tx,
+        user_id,
+        &canonical_item,
+        &source_hash,
+        Some(request_id.as_str()),
+        now,
+    )
+    .await?
     {
         attach_request_to_work_item(tx, request_id.as_str(), &work_item_id, "queued", now).await?;
         upsert_translation_demand_state(
@@ -2792,7 +3225,14 @@ async fn insert_translation_request(
     if existing.result_status.as_deref() == Some("error")
         && matches!(existing.status.as_str(), "completed" | "failed")
     {
-        reset_retryable_terminal_work_item(tx, existing.id.as_str(), now).await?;
+        reset_retryable_terminal_work_item(
+            tx,
+            existing.id.as_str(),
+            translation_attempt_trigger_for_request_origin(request_origin),
+            Some(request_id.as_str()),
+            now,
+        )
+        .await?;
         attach_request_to_work_item(tx, request_id.as_str(), &existing.id, "queued", now).await?;
         upsert_translation_demand_state(
             tx,
@@ -2897,7 +3337,8 @@ async fn ensure_translation_result_demand(
         now,
     } = context;
 
-    if let Some(work_item_id) = create_work_item(state, tx, user_id, item, source_hash, now).await?
+    if let Some(work_item_id) =
+        create_work_item(state, tx, user_id, item, source_hash, Some(request_id), now).await?
     {
         attach_request_to_work_item(tx, request_id, &work_item_id, "queued", now).await?;
         upsert_translation_demand_state(
@@ -2944,7 +3385,14 @@ async fn ensure_translation_result_demand(
                 result.error.as_deref(),
             )
         {
-            reset_retryable_terminal_work_item(tx, existing.id.as_str(), now).await?;
+            reset_retryable_terminal_work_item(
+                tx,
+                existing.id.as_str(),
+                TranslationAttemptTrigger::ManualRetry,
+                Some(request_id),
+                now,
+            )
+            .await?;
             attach_request_to_work_item(tx, request_id, existing.id.as_str(), "queued", now)
                 .await?;
             upsert_translation_demand_state(
@@ -3586,12 +4034,230 @@ async fn load_work_item_by_id(
         .map_err(ApiError::internal)
 }
 
+async fn load_translation_attempt_state(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_id: &str,
+) -> Result<TranslationAttemptStateRow, ApiError> {
+    sqlx::query_as::<_, TranslationAttemptStateRow>(
+        r#"
+        SELECT attempt_count, next_attempt_trigger
+        FROM translation_work_items
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(work_item_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::internal("translation work item missing for attempt audit"))
+}
+
+async fn record_translation_attempt_event(
+    tx: &mut Transaction<'_, Sqlite>,
+    identity: &TranslationAttemptIdentity,
+    details: TranslationAttemptEventDetails<'_>,
+    now: &str,
+) -> Result<(), ApiError> {
+    let classified = details
+        .error_text
+        .and_then(|value| classify_translation_error(Some(value)));
+    let llm_call_ids_json =
+        serde_json::to_string(details.llm_call_ids).map_err(ApiError::internal)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO translation_attempt_events (
+          work_item_id, request_id, batch_id, scope_user_id, kind, variant, entity_id,
+          target_lang, attempt_no, trigger, event_type, result_status, error_code,
+          error_summary, failure_class, retry_eligible, next_retry_at, llm_call_ids_json,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(identity.work_item_id.as_str())
+    .bind(details.request_id)
+    .bind(details.batch_id)
+    .bind(identity.scope_user_id.as_str())
+    .bind(identity.kind.as_str())
+    .bind(identity.variant.as_str())
+    .bind(identity.entity_id.as_str())
+    .bind(identity.target_lang.as_str())
+    .bind(details.attempt_no.max(1))
+    .bind(details.trigger.as_str())
+    .bind(details.event_type)
+    .bind(details.result_status)
+    .bind(classified.as_ref().map(|value| value.code))
+    .bind(classified.as_ref().map(|value| value.summary))
+    .bind(details.failure_class.map(ai::LlmFailureClass::as_str))
+    .bind(i64::from(details.retry_eligible))
+    .bind(details.next_retry_at)
+    .bind(llm_call_ids_json)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+async fn record_translation_attempt_queued(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_id: &str,
+    request_id: Option<&str>,
+    trigger: TranslationAttemptTrigger,
+    now: &str,
+) -> Result<(), ApiError> {
+    let work_item = load_work_item_by_id(tx, work_item_id)
+        .await?
+        .ok_or_else(|| ApiError::internal("translation work item missing for attempt audit"))?;
+    let state = load_translation_attempt_state(tx, work_item_id).await?;
+    record_translation_attempt_event(
+        tx,
+        &TranslationAttemptIdentity::from(&work_item),
+        TranslationAttemptEventDetails {
+            request_id,
+            batch_id: None,
+            attempt_no: state.attempt_count.saturating_add(1),
+            trigger,
+            event_type: "attempt_queued",
+            result_status: None,
+            error_text: None,
+            failure_class: None,
+            retry_eligible: false,
+            next_retry_at: None,
+            llm_call_ids: &[],
+        },
+        now,
+    )
+    .await
+}
+
+async fn mark_translation_attempt_started(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item: &WorkItemRow,
+    batch_id: &str,
+    now: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        UPDATE translation_work_items
+        SET status = 'running',
+            attempt_count = attempt_count + 1,
+            started_at = COALESCE(started_at, ?),
+            updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(now)
+    .bind(now)
+    .bind(work_item.id.as_str())
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let state = load_translation_attempt_state(tx, work_item.id.as_str()).await?;
+    record_translation_attempt_event(
+        tx,
+        &TranslationAttemptIdentity::from(work_item),
+        TranslationAttemptEventDetails {
+            request_id: None,
+            batch_id: Some(batch_id),
+            attempt_no: state.attempt_count,
+            trigger: TranslationAttemptTrigger::from_db(state.next_attempt_trigger.as_str()),
+            event_type: "attempt_started",
+            result_status: None,
+            error_text: None,
+            failure_class: None,
+            retry_eligible: false,
+            next_retry_at: None,
+            llm_call_ids: &[],
+        },
+        now,
+    )
+    .await
+}
+
+async fn record_translation_attempt_completed(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item: &WorkItemRow,
+    completion: TranslationAttemptCompletion<'_>,
+    now: &str,
+) -> Result<(), ApiError> {
+    let state = load_translation_attempt_state(tx, work_item.id.as_str()).await?;
+    record_translation_attempt_event(
+        tx,
+        &TranslationAttemptIdentity::from(work_item),
+        TranslationAttemptEventDetails {
+            request_id: None,
+            batch_id: Some(completion.batch_id),
+            attempt_no: state.attempt_count.max(1),
+            trigger: TranslationAttemptTrigger::from_db(state.next_attempt_trigger.as_str()),
+            event_type: "attempt_completed",
+            result_status: Some(completion.result_status),
+            error_text: completion.error_text,
+            failure_class: completion.failure_class,
+            retry_eligible: completion.retry_eligible,
+            next_retry_at: completion.next_retry_at,
+            llm_call_ids: completion.llm_call_ids,
+        },
+        now,
+    )
+    .await
+}
+
+async fn record_translation_retry_scheduled(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item: &WorkItemRow,
+    retry_schedule: TranslationRetrySchedule<'_>,
+    now: &str,
+) -> Result<(), ApiError> {
+    let state = load_translation_attempt_state(tx, work_item.id.as_str()).await?;
+    record_translation_attempt_event(
+        tx,
+        &TranslationAttemptIdentity::from(work_item),
+        TranslationAttemptEventDetails {
+            request_id: None,
+            batch_id: Some(retry_schedule.batch_id),
+            attempt_no: state.attempt_count.saturating_add(1),
+            trigger: TranslationAttemptTrigger::AutomaticRecovery,
+            event_type: "retry_scheduled",
+            result_status: Some("error"),
+            error_text: retry_schedule.error_text,
+            failure_class: retry_schedule.failure_class,
+            retry_eligible: true,
+            next_retry_at: Some(retry_schedule.next_retry_at),
+            llm_call_ids: retry_schedule.llm_call_ids,
+        },
+        now,
+    )
+    .await
+}
+
+async fn load_translation_batch_llm_call_ids(
+    tx: &mut Transaction<'_, Sqlite>,
+    batch_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT id
+        FROM llm_calls
+        WHERE parent_translation_batch_id = ?
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )
+    .bind(batch_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(ApiError::internal)
+}
+
 async fn create_work_item(
     state: &AppState,
     tx: &mut Transaction<'_, Sqlite>,
     user_id: &str,
     item: &TranslationRequestItemInput,
     source_hash: &str,
+    request_id: Option<&str>,
     now: &str,
 ) -> Result<Option<String>, ApiError> {
     let id = crate::local_id::generate_local_id();
@@ -3638,6 +4304,32 @@ async fn create_work_item(
     if result.rows_affected() == 0 {
         Ok(None)
     } else {
+        record_translation_attempt_event(
+            tx,
+            &TranslationAttemptIdentity {
+                work_item_id: id.clone(),
+                scope_user_id: user_id.to_owned(),
+                kind: item.kind.clone(),
+                variant: item.variant.clone(),
+                entity_id: item.entity_id.clone(),
+                target_lang: item.target_lang.clone(),
+            },
+            TranslationAttemptEventDetails {
+                request_id,
+                batch_id: None,
+                attempt_no: 1,
+                trigger: TranslationAttemptTrigger::Initial,
+                event_type: "attempt_queued",
+                result_status: None,
+                error_text: None,
+                failure_class: None,
+                retry_eligible: false,
+                next_retry_at: None,
+                llm_call_ids: &[],
+            },
+            now,
+        )
+        .await?;
         Ok(Some(id))
     }
 }
@@ -3645,6 +4337,8 @@ async fn create_work_item(
 async fn reset_retryable_terminal_work_item(
     tx: &mut Transaction<'_, Sqlite>,
     work_item_id: &str,
+    trigger: TranslationAttemptTrigger,
+    request_id: Option<&str>,
     now: &str,
 ) -> Result<(), ApiError> {
     sqlx::query(
@@ -3660,18 +4354,20 @@ async fn reset_retryable_terminal_work_item(
             failure_class = NULL,
             next_retry_at = NULL,
             retry_expires_at = NULL,
+            next_attempt_trigger = ?,
             started_at = NULL,
             finished_at = NULL,
             updated_at = ?
         WHERE id = ?
         "#,
     )
+    .bind(trigger.as_str())
     .bind(now)
     .bind(work_item_id)
     .execute(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
-    Ok(())
+    record_translation_attempt_queued(tx, work_item_id, request_id, trigger, now).await
 }
 
 async fn run_translation_scheduler_once(
@@ -3996,7 +4692,14 @@ async fn requeue_ineligible_queued_batch_items(state: &AppState) -> Result<()> {
         for request_id in request_ids {
             reset_request_for_retry(&mut tx, request_id.as_str(), now.as_str()).await?;
         }
-        reset_retryable_terminal_work_item(&mut tx, work_item_id.as_str(), now.as_str()).await?;
+        reset_retryable_terminal_work_item(
+            &mut tx,
+            work_item_id.as_str(),
+            TranslationAttemptTrigger::SystemRequeue,
+            None,
+            now.as_str(),
+        )
+        .await?;
         sqlx::query(
             r#"
             UPDATE ai_translations
@@ -4214,18 +4917,7 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
         return Ok(());
     }
     for item in &batch.items {
-        sqlx::query(
-            r#"
-            UPDATE translation_work_items
-            SET status = 'running', started_at = COALESCE(started_at, ?), updated_at = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(now.as_str())
-        .bind(now.as_str())
-        .bind(item.id.as_str())
-        .execute(&mut *tx)
-        .await?;
+        mark_translation_attempt_started(&mut tx, item, batch.id.as_str(), now.as_str()).await?;
     }
     tx.commit().await?;
     drop(sqlite_write);
@@ -4249,6 +4941,7 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
         parent_task_id: None,
         parent_task_type: None,
         parent_translation_batch_id: Some(batch.id.clone()),
+        parent_brief_id: None,
     };
 
     let result = ai::with_llm_call_context(context, async {
@@ -4683,6 +5376,7 @@ async fn finalize_batch_success(
         .sqlite_writer
         .begin_immediate(&state.pool, "translation_batch_finalize")
         .await?;
+    let llm_call_ids = load_translation_batch_llm_call_ids(&mut tx, batch.id.as_str()).await?;
     for result in &results {
         let Some(work_item) = batch
             .items
@@ -4771,6 +5465,37 @@ async fn finalize_batch_success(
         .bind(result.work_item_id.as_str())
         .execute(&mut *tx)
         .await?;
+
+        record_translation_attempt_completed(
+            &mut tx,
+            work_item,
+            TranslationAttemptCompletion {
+                batch_id: batch.id.as_str(),
+                result_status: result.result_status.as_str(),
+                error_text: result.error.as_deref(),
+                failure_class,
+                retry_eligible: retry_scheduled_at.is_some(),
+                next_retry_at: retry_scheduled_at.as_deref(),
+                llm_call_ids: llm_call_ids.as_slice(),
+            },
+            now.as_str(),
+        )
+        .await?;
+        if let Some(next_retry_at) = retry_scheduled_at.as_deref() {
+            record_translation_retry_scheduled(
+                &mut tx,
+                work_item,
+                TranslationRetrySchedule {
+                    batch_id: batch.id.as_str(),
+                    next_retry_at,
+                    failure_class,
+                    error_text: result.error.as_deref(),
+                    llm_call_ids: llm_call_ids.as_slice(),
+                },
+                now.as_str(),
+            )
+            .await?;
+        }
 
         sqlx::query(
             r#"
@@ -5019,6 +5744,7 @@ async fn recover_due_translation_work_items(state: &AppState) -> Result<()> {
                 error_text = NULL,
                 next_retry_at = NULL,
                 retry_count = retry_count + 1,
+                next_attempt_trigger = 'automatic_recovery',
                 started_at = NULL,
                 finished_at = NULL,
                 updated_at = ?
@@ -5038,6 +5764,15 @@ async fn recover_due_translation_work_items(state: &AppState) -> Result<()> {
             tx.commit().await?;
             continue;
         }
+
+        record_translation_attempt_queued(
+            &mut tx,
+            item.id.as_str(),
+            None,
+            TranslationAttemptTrigger::AutomaticRecovery,
+            now.as_str(),
+        )
+        .await?;
 
         if let Some(entity_type) = map_entity_type(item.kind.as_str(), item.variant.as_str()) {
             sqlx::query(
@@ -5147,6 +5882,7 @@ async fn fail_batch_with_message(
     failure_class: Option<ai::LlmFailureClass>,
     now: &str,
 ) -> Result<(), ApiError> {
+    let llm_call_ids = load_translation_batch_llm_call_ids(tx, batch_id).await?;
     for item in items {
         sqlx::query(
             r#"
@@ -5170,6 +5906,21 @@ async fn fail_batch_with_message(
         .execute(&mut **tx)
         .await
         .map_err(ApiError::internal)?;
+        record_translation_attempt_completed(
+            tx,
+            item,
+            TranslationAttemptCompletion {
+                batch_id,
+                result_status: "error",
+                error_text: Some(message),
+                failure_class,
+                retry_eligible: false,
+                next_retry_at: None,
+                llm_call_ids: llm_call_ids.as_slice(),
+            },
+            now,
+        )
+        .await?;
         sqlx::query(
             r#"
             UPDATE translation_batch_items
@@ -6722,6 +7473,8 @@ mod tests {
             updated_at: "2026-04-15T00:00:02Z".to_owned(),
             work_item_status: Some("failed".to_owned()),
             batch_id: None,
+            retry_count: 0,
+            last_attempt_at: None,
         };
 
         let result = row.to_result();
@@ -7200,6 +7953,7 @@ mod tests {
                 batch_id = 'batch-terminal-window',
                 result_status = 'error',
                 error_text = 'boom',
+                attempt_count = 1,
                 finished_at = ?,
                 updated_at = ?
             WHERE id = ?
@@ -7296,6 +8050,36 @@ mod tests {
             refreshed_work_item
                 .get::<Option<String>, _>("finished_at")
                 .is_none()
+        );
+
+        let audit_rows = sqlx::query(
+            r#"
+            SELECT attempt_no, trigger, event_type
+            FROM translation_attempt_events
+            WHERE work_item_id = ?
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(work_item_id.as_str())
+        .fetch_all(&pool)
+        .await
+        .expect("load manual retry audit events");
+        let audit_summary = audit_rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<i64, _>("attempt_no"),
+                    row.get::<String, _>("trigger"),
+                    row.get::<String, _>("event_type"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            audit_summary,
+            vec![
+                (1, "initial".to_owned(), "attempt_queued".to_owned()),
+                (2, "manual_retry".to_owned(), "attempt_queued".to_owned()),
+            ]
         );
     }
 
@@ -8332,8 +9116,25 @@ mod tests {
         .bind("1")
         .bind("120")
         .fetch_one(&pool)
+		.await
+		.expect("load translation state");
+        let audit_row: (Option<String>, Option<String>) = sqlx::query_as(
+            r#"
+			SELECT error_code, error_summary
+			FROM translation_attempt_events
+			WHERE work_item_id = ? AND event_type = 'attempt_completed'
+			ORDER BY id DESC
+			LIMIT 1
+			"#,
+        )
+        .bind(work_item.id.as_str())
+        .fetch_one(&pool)
         .await
-        .expect("load translation state");
+        .expect("load durable attempt audit row");
+        let audit_columns = sqlx::query("PRAGMA table_info(translation_attempt_events)")
+            .fetch_all(&pool)
+            .await
+            .expect("load durable attempt audit schema");
 
         assert_eq!(request_row.0, "failed");
         assert_eq!(request_row.1.as_deref(), Some("error"));
@@ -8344,6 +9145,13 @@ mod tests {
         assert_eq!(
             state_row.1.as_deref(),
             Some("AI returned 429 Too Many Requests: rpm exhausted")
+        );
+        assert_eq!(audit_row.0.as_deref(), Some("upstream_rejected"));
+        assert_eq!(audit_row.1.as_deref(), Some("上游模型拒绝请求"));
+        assert!(
+            !audit_columns
+                .iter()
+                .any(|column| column.get::<String, _>("name") == "error_detail")
         );
     }
 
@@ -8418,6 +9226,7 @@ mod tests {
                 error_text = 'temporary translation failure',
                 failure_class = 'transient',
                 retry_count = 0,
+                attempt_count = 1,
                 next_retry_at = '2020-01-01T00:00:00Z',
                 retry_expires_at = '2099-01-01T00:00:00Z',
                 finished_at = ?,
@@ -8489,6 +9298,40 @@ mod tests {
         assert_eq!(translation_row.0, "queued");
         assert_eq!(translation_row.1, None);
         assert_eq!(translation_row.2.as_deref(), Some(work_item_id.as_str()));
+
+        let audit_rows = sqlx::query(
+            r#"
+            SELECT attempt_no, trigger, event_type
+            FROM translation_attempt_events
+            WHERE work_item_id = ?
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(work_item_id.as_str())
+        .fetch_all(&pool)
+        .await
+        .expect("load automatic recovery audit events");
+        let audit_summary = audit_rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<i64, _>("attempt_no"),
+                    row.get::<String, _>("trigger"),
+                    row.get::<String, _>("event_type"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            audit_summary,
+            vec![
+                (1, "initial".to_owned(), "attempt_queued".to_owned()),
+                (
+                    2,
+                    "automatic_recovery".to_owned(),
+                    "attempt_queued".to_owned(),
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -8688,6 +9531,7 @@ mod tests {
             SET status = 'failed',
                 result_status = 'error',
                 error_text = 'boom',
+                attempt_count = 1,
                 finished_at = ?,
                 updated_at = ?
             WHERE id = ?
@@ -8741,6 +9585,36 @@ mod tests {
         assert_eq!(
             resolved[0].work_item_id.as_deref(),
             Some(work_item_id.as_str())
+        );
+
+        let audit_rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT attempt_no, trigger, event_type, request_id
+            FROM translation_attempt_events
+            WHERE work_item_id = ?
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(work_item_id.as_str())
+        .fetch_all(&pool)
+        .await
+        .expect("load forced retry audit events");
+        assert_eq!(
+            audit_rows,
+            vec![
+                (
+                    1,
+                    "initial".to_owned(),
+                    "attempt_queued".to_owned(),
+                    Some(created.request_id.clone()),
+                ),
+                (
+                    2,
+                    "manual_retry".to_owned(),
+                    "attempt_queued".to_owned(),
+                    Some(created.request_id),
+                ),
+            ]
         );
     }
 
@@ -10112,6 +10986,72 @@ mod tests {
                 .get::<Option<String>, _>("result_status")
                 .as_deref(),
             Some("disabled")
+        );
+
+        let audit_rows = sqlx::query(
+            r#"
+            SELECT attempt_no, trigger, event_type, result_status, batch_id,
+                   retry_eligible, llm_call_ids_json
+            FROM translation_attempt_events
+            WHERE work_item_id = ?
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(
+            created
+                .result
+                .work_item_id
+                .as_deref()
+                .expect("work item id"),
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("load execution lifecycle audit events");
+        let audit_summary = audit_rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<i64, _>("attempt_no"),
+                    row.get::<String, _>("trigger"),
+                    row.get::<String, _>("event_type"),
+                    row.get::<Option<String>, _>("result_status"),
+                    row.get::<Option<String>, _>("batch_id"),
+                    row.get::<i64, _>("retry_eligible"),
+                    row.get::<String, _>("llm_call_ids_json"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            audit_summary,
+            vec![
+                (
+                    1,
+                    "initial".to_owned(),
+                    "attempt_queued".to_owned(),
+                    None,
+                    None,
+                    0,
+                    "[]".to_owned(),
+                ),
+                (
+                    1,
+                    "initial".to_owned(),
+                    "attempt_started".to_owned(),
+                    None,
+                    Some(batch_id.clone()),
+                    0,
+                    "[]".to_owned(),
+                ),
+                (
+                    1,
+                    "initial".to_owned(),
+                    "attempt_completed".to_owned(),
+                    Some("disabled".to_owned()),
+                    Some(batch_id),
+                    0,
+                    "[]".to_owned(),
+                ),
+            ]
         );
     }
 
@@ -12532,6 +13472,8 @@ mod tests {
                 updated_at: "2026-03-07T00:00:01Z".to_owned(),
                 work_item_status: Some("running".to_owned()),
                 batch_id: Some("batch-1".to_owned()),
+                retry_count: 0,
+                last_attempt_at: None,
             },
             result: TranslationResultItem {
                 producer_ref: "feed.auto_translate:release:123".to_owned(),
@@ -12594,6 +13536,8 @@ mod tests {
                 updated_at: "2026-03-07T00:00:01Z".to_owned(),
                 work_item_status: Some("running".to_owned()),
                 batch_id: Some("batch-1".to_owned()),
+                retry_count: 0,
+                last_attempt_at: None,
             },
             result: TranslationResultItem {
                 producer_ref: "feed.auto_translate:release:123".to_owned(),

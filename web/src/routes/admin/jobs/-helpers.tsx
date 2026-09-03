@@ -12,6 +12,7 @@ import {
 	type AdminJobsRouteState,
 	ADMIN_JOBS_BASE_PATH,
 	ADMIN_JOBS_LLM_PATH,
+	ADMIN_JOBS_AI_RECORDS_PATH,
 	ADMIN_JOBS_SCHEDULED_PATH,
 	ADMIN_JOBS_SUBSCRIPTIONS_PATH,
 	ADMIN_JOBS_TRANSLATIONS_PATH,
@@ -60,6 +61,15 @@ function buildAdminJobsCanonicalSearch(
 		};
 	}
 
+	if (routeState.aiRecordDetailRoute) {
+		return {
+			from: undefined,
+			view: undefined,
+			ai_attempt: routeState.aiRecordDetailRoute.attemptId ?? undefined,
+			ai_llm: routeState.aiRecordDetailRoute.llmCallId ?? undefined,
+		};
+	}
+
 	return {
 		from: undefined,
 		view: undefined,
@@ -86,7 +96,9 @@ function sameSearch(left: AdminJobsSearchInput, right: AdminJobsSearchInput) {
 		(left.llm_time_field ?? undefined) ===
 			(right.llm_time_field ?? undefined) &&
 		(left.llm_time_from ?? undefined) === (right.llm_time_from ?? undefined) &&
-		(left.llm_time_to ?? undefined) === (right.llm_time_to ?? undefined)
+		(left.llm_time_to ?? undefined) === (right.llm_time_to ?? undefined) &&
+		(left.ai_attempt ?? undefined) === (right.ai_attempt ?? undefined) &&
+		(left.ai_llm ?? undefined) === (right.ai_llm ?? undefined)
 	);
 }
 
@@ -96,9 +108,22 @@ export function AdminJobsRoutePage(props: {
 	taskId?: string;
 	llmCallId?: string;
 	subscriptionDetailTaskId?: string;
+	aiRecordKind?: "release" | "announcement" | "brief";
+	aiRecordId?: string;
+	aiRecordAttemptId?: string;
+	aiRecordLlmCallId?: string;
 }) {
-	const { primaryTab, search, taskId, llmCallId, subscriptionDetailTaskId } =
-		props;
+	const {
+		primaryTab,
+		search,
+		taskId,
+		llmCallId,
+		subscriptionDetailTaskId,
+		aiRecordKind,
+		aiRecordId,
+		aiRecordAttemptId,
+		aiRecordLlmCallId,
+	} = props;
 	const auth = useAuthBootstrap();
 	const me = useRequiredAdmin();
 	const router = useRouter();
@@ -110,8 +135,22 @@ export function AdminJobsRoutePage(props: {
 				taskId,
 				llmCallId,
 				subscriptionDetailTaskId,
+				aiRecordKind,
+				aiRecordId,
+				aiRecordAttemptId,
+				aiRecordLlmCallId,
 			}),
-		[llmCallId, primaryTab, search, subscriptionDetailTaskId, taskId],
+		[
+			aiRecordId,
+			aiRecordAttemptId,
+			aiRecordLlmCallId,
+			aiRecordKind,
+			llmCallId,
+			primaryTab,
+			search,
+			subscriptionDetailTaskId,
+			taskId,
+		],
 	);
 	const canonicalSearch = useMemo(
 		() => buildAdminJobsCanonicalSearch(routeState),
@@ -175,4 +214,5 @@ export const ADMIN_JOBS_ROUTE_PATHS = {
 	subscriptions: ADMIN_JOBS_SUBSCRIPTIONS_PATH,
 	llm: ADMIN_JOBS_LLM_PATH,
 	translations: ADMIN_JOBS_TRANSLATIONS_PATH,
+	ai_records: ADMIN_JOBS_AI_RECORDS_PATH,
 } as const;
