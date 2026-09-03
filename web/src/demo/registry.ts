@@ -174,6 +174,14 @@ export const DEMO_SCENES: DemoScene[] = [
 		personas: ["admin", "member", "guest"],
 	},
 	{
+		id: "admin-translation-audit",
+		title: "Translation Audit",
+		description: "翻译调度审计链：首次失败、自动重试与完成结果。",
+		path: "/admin/jobs/translations",
+		defaultPersona: "admin",
+		personas: ["admin", "member", "guest"],
+	},
+	{
 		id: "paused-account-resume",
 		title: "Paused Account",
 		description: "账号暂停后的自助恢复与访问同步状态。",

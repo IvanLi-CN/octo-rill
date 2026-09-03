@@ -13472,6 +13472,7 @@ where
             parent_task_id: None,
             parent_task_type: None,
             parent_translation_batch_id: None,
+            parent_brief_id: None,
         },
         fut,
     )
@@ -20261,6 +20262,7 @@ async fn translate_releases_batch_stream_worker(
         parent_task_id: Some(task_id.clone()),
         parent_task_type: Some(jobs::TASK_TRANSLATE_RELEASE_BATCH.to_owned()),
         parent_translation_batch_id: None,
+        parent_brief_id: None,
     };
 
     let result = ai::with_llm_call_context(context, async {

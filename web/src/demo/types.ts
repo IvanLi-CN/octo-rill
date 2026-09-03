@@ -8,7 +8,14 @@ import type {
 	AdminRealtimeTaskDetailResponse,
 	AdminRealtimeTaskItem,
 	AdminSyncRuntimeConfigResponse,
+	AdminTranslationAttemptEvent,
+	AdminTranslationBatchDetailResponse,
+	AdminTranslationBatchListItem,
+	AdminTranslationRequestDetailResponse,
+	AdminTranslationRequestListItem,
+	AdminTranslationStatusResponse,
 	AdminUserProfileResponse,
+	AdminWebhookPushRuntimeConfigResponse,
 	FollowingReposResponse,
 	GitHubConnectionResponse,
 	MeLinuxDoResponse,
@@ -33,6 +40,7 @@ export type DemoSceneId =
 	| "public-release-highlight-range"
 	| "admin-panel-users"
 	| "admin-jobs-running"
+	| "admin-translation-audit"
 	| "paused-account-resume";
 
 export type DemoPersonaId = "guest" | "member" | "admin";
@@ -81,11 +89,21 @@ export type DemoJobsModel = {
 	scheduledRuns: AdminRealtimeTaskItem[];
 	subscriptionRuns: AdminRealtimeTaskItem[];
 	syncRuntimeConfig: AdminSyncRuntimeConfigResponse;
+	webhookPushRuntimeConfig: AdminWebhookPushRuntimeConfigResponse;
 	llmStatus: AdminLlmSchedulerStatusResponse;
 	llmActivity: AdminLlmActivityResponse;
 	llmCalls: AdminLlmCallItem[];
 	taskDetails: Record<string, AdminRealtimeTaskDetailResponse>;
 	llmCallDetails: Record<string, AdminLlmCallDetailResponse>;
+	translationStatus: AdminTranslationStatusResponse;
+	translationRequests: AdminTranslationRequestListItem[];
+	translationBatches: AdminTranslationBatchListItem[];
+	translationAttemptEvents: AdminTranslationAttemptEvent[];
+	translationRequestDetails: Record<
+		string,
+		AdminTranslationRequestDetailResponse
+	>;
+	translationBatchDetails: Record<string, AdminTranslationBatchDetailResponse>;
 };
 
 export type DemoModel = {

@@ -2027,6 +2027,7 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
         parent_task_id: Some(task.id.clone()),
         parent_task_type: Some(task.task_type.clone()),
         parent_translation_batch_id: None,
+        parent_brief_id: None,
     };
     let heartbeat = spawn_task_lease_heartbeat(state.clone(), task.id.clone());
     let result = ai::with_llm_call_context(

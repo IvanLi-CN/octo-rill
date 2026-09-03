@@ -40,7 +40,9 @@ import { Route as AdminJobsSubscriptionsRouteImport } from './routes/admin/jobs/
 import { Route as AdminJobsScheduledRouteImport } from './routes/admin/jobs/scheduled'
 import { Route as AdminJobsLlmRouteImport } from './routes/admin/jobs/llm'
 import { Route as OwnerRepoReleasesRouteImport } from './routes/$owner/$repo/releases'
+import { Route as AdminJobsAiRecordsRouteRouteImport } from './routes/admin/jobs/ai-records/route'
 import { Route as FocusOrgOrgIndexRouteImport } from './routes/focus/org/$org/index'
+import { Route as AdminJobsAiRecordsIndexRouteImport } from './routes/admin/jobs/ai-records/index'
 import { Route as OwnerRepoReleasesIndexRouteImport } from './routes/$owner/$repo/releases/index'
 import { Route as PublicOwnerRepoReleasesRouteImport } from './routes/public/$owner/$repo/releases'
 import { Route as FocusRepoOwnerRepoRouteImport } from './routes/focus/repo/$owner/$repo'
@@ -51,6 +53,7 @@ import { Route as AdminJobsTasksTaskIdRouteRouteImport } from './routes/admin/jo
 import { Route as FocusRepoOwnerRepoIndexRouteImport } from './routes/focus/repo/$owner/$repo/index'
 import { Route as AdminJobsTasksTaskIdIndexRouteImport } from './routes/admin/jobs/tasks/$taskId/index'
 import { Route as FocusRepoOwnerRepoReleasesRouteImport } from './routes/focus/repo/$owner/$repo/releases'
+import { Route as AdminJobsAiRecordsKindRecordIdRouteImport } from './routes/admin/jobs/ai-records/$kind/$recordId'
 import { Route as OwnerRepoReleasesTagTagRouteImport } from './routes/$owner/$repo/releases/tag/$tag'
 import { Route as PublicOwnerRepoReleasesTagTagRouteImport } from './routes/public/$owner/$repo/releases/tag/$tag'
 import { Route as AdminJobsTasksTaskIdLlmCallIdRouteImport } from './routes/admin/jobs/tasks/$taskId/llm/$callId'
@@ -242,12 +245,24 @@ const OwnerRepoReleasesRoute = OwnerRepoReleasesRouteImport.update({
 } as any).lazy(() =>
   import('./routes/$owner/$repo/releases.lazy').then((d) => d.Route),
 )
+const AdminJobsAiRecordsRouteRoute = AdminJobsAiRecordsRouteRouteImport.update({
+  id: '/ai-records',
+  path: '/ai-records',
+  getParentRoute: () => AdminJobsRouteRoute,
+} as any)
 const FocusOrgOrgIndexRoute = FocusOrgOrgIndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => FocusOrgOrgRoute,
 } as any).lazy(() =>
   import('./routes/focus/org/$org/index.lazy').then((d) => d.Route),
+)
+const AdminJobsAiRecordsIndexRoute = AdminJobsAiRecordsIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => AdminJobsAiRecordsRouteRoute,
+} as any).lazy(() =>
+  import('./routes/admin/jobs/ai-records/index.lazy').then((d) => d.Route),
 )
 const OwnerRepoReleasesIndexRoute = OwnerRepoReleasesIndexRouteImport.update({
   id: '/',
@@ -326,6 +341,16 @@ const FocusRepoOwnerRepoReleasesRoute =
       (d) => d.Route,
     ),
   )
+const AdminJobsAiRecordsKindRecordIdRoute =
+  AdminJobsAiRecordsKindRecordIdRouteImport.update({
+    id: '/$kind/$recordId',
+    path: '/$kind/$recordId',
+    getParentRoute: () => AdminJobsAiRecordsRouteRoute,
+  } as any).lazy(() =>
+    import('./routes/admin/jobs/ai-records/$kind/$recordId.lazy').then(
+      (d) => d.Route,
+    ),
+  )
 const OwnerRepoReleasesTagTagRoute = OwnerRepoReleasesTagTagRouteImport.update({
   id: '/tag/$tag',
   path: '/tag/$tag',
@@ -373,6 +398,7 @@ export interface FileRoutesByFullPath {
   '/focus/mine': typeof FocusMineRouteWithChildren
   '/focus/repos': typeof FocusReposRouteWithChildren
   '/admin/': typeof AdminIndexRoute
+  '/admin/jobs/ai-records': typeof AdminJobsAiRecordsRouteRouteWithChildren
   '/$owner/$repo/releases': typeof OwnerRepoReleasesRouteWithChildren
   '/admin/jobs/llm': typeof AdminJobsLlmRoute
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
@@ -393,8 +419,10 @@ export interface FileRoutesByFullPath {
   '/focus/repo/$owner/$repo': typeof FocusRepoOwnerRepoRouteWithChildren
   '/public/$owner/$repo/releases': typeof PublicOwnerRepoReleasesRouteWithChildren
   '/$owner/$repo/releases/': typeof OwnerRepoReleasesIndexRoute
+  '/admin/jobs/ai-records/': typeof AdminJobsAiRecordsIndexRoute
   '/focus/org/$org/': typeof FocusOrgOrgIndexRoute
   '/$owner/$repo/releases/tag/$tag': typeof OwnerRepoReleasesTagTagRoute
+  '/admin/jobs/ai-records/$kind/$recordId': typeof AdminJobsAiRecordsKindRecordIdRoute
   '/focus/repo/$owner/$repo/releases': typeof FocusRepoOwnerRepoReleasesRoute
   '/admin/jobs/tasks/$taskId/': typeof AdminJobsTasksTaskIdIndexRoute
   '/focus/repo/$owner/$repo/': typeof FocusRepoOwnerRepoIndexRoute
@@ -431,8 +459,10 @@ export interface FileRoutesByTo {
   '/focus/org/$org/releases': typeof FocusOrgOrgReleasesRoute
   '/public/$owner/$repo/releases': typeof PublicOwnerRepoReleasesRouteWithChildren
   '/$owner/$repo/releases': typeof OwnerRepoReleasesIndexRoute
+  '/admin/jobs/ai-records': typeof AdminJobsAiRecordsIndexRoute
   '/focus/org/$org': typeof FocusOrgOrgIndexRoute
   '/$owner/$repo/releases/tag/$tag': typeof OwnerRepoReleasesTagTagRoute
+  '/admin/jobs/ai-records/$kind/$recordId': typeof AdminJobsAiRecordsKindRecordIdRoute
   '/focus/repo/$owner/$repo/releases': typeof FocusRepoOwnerRepoReleasesRoute
   '/admin/jobs/tasks/$taskId': typeof AdminJobsTasksTaskIdIndexRoute
   '/focus/repo/$owner/$repo': typeof FocusRepoOwnerRepoIndexRoute
@@ -459,6 +489,7 @@ export interface FileRoutesById {
   '/focus/mine': typeof FocusMineRouteWithChildren
   '/focus/repos': typeof FocusReposRouteWithChildren
   '/admin/': typeof AdminIndexRoute
+  '/admin/jobs/ai-records': typeof AdminJobsAiRecordsRouteRouteWithChildren
   '/$owner/$repo/releases': typeof OwnerRepoReleasesRouteWithChildren
   '/admin/jobs/llm': typeof AdminJobsLlmRoute
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
@@ -479,8 +510,10 @@ export interface FileRoutesById {
   '/focus/repo/$owner/$repo': typeof FocusRepoOwnerRepoRouteWithChildren
   '/public/$owner/$repo/releases': typeof PublicOwnerRepoReleasesRouteWithChildren
   '/$owner/$repo/releases/': typeof OwnerRepoReleasesIndexRoute
+  '/admin/jobs/ai-records/': typeof AdminJobsAiRecordsIndexRoute
   '/focus/org/$org/': typeof FocusOrgOrgIndexRoute
   '/$owner/$repo/releases/tag/$tag': typeof OwnerRepoReleasesTagTagRoute
+  '/admin/jobs/ai-records/$kind/$recordId': typeof AdminJobsAiRecordsKindRecordIdRoute
   '/focus/repo/$owner/$repo/releases': typeof FocusRepoOwnerRepoReleasesRoute
   '/admin/jobs/tasks/$taskId/': typeof AdminJobsTasksTaskIdIndexRoute
   '/focus/repo/$owner/$repo/': typeof FocusRepoOwnerRepoIndexRoute
@@ -508,6 +541,7 @@ export interface FileRouteTypes {
     | '/focus/mine'
     | '/focus/repos'
     | '/admin/'
+    | '/admin/jobs/ai-records'
     | '/$owner/$repo/releases'
     | '/admin/jobs/llm'
     | '/admin/jobs/scheduled'
@@ -528,8 +562,10 @@ export interface FileRouteTypes {
     | '/focus/repo/$owner/$repo'
     | '/public/$owner/$repo/releases'
     | '/$owner/$repo/releases/'
+    | '/admin/jobs/ai-records/'
     | '/focus/org/$org/'
     | '/$owner/$repo/releases/tag/$tag'
+    | '/admin/jobs/ai-records/$kind/$recordId'
     | '/focus/repo/$owner/$repo/releases'
     | '/admin/jobs/tasks/$taskId/'
     | '/focus/repo/$owner/$repo/'
@@ -566,8 +602,10 @@ export interface FileRouteTypes {
     | '/focus/org/$org/releases'
     | '/public/$owner/$repo/releases'
     | '/$owner/$repo/releases'
+    | '/admin/jobs/ai-records'
     | '/focus/org/$org'
     | '/$owner/$repo/releases/tag/$tag'
+    | '/admin/jobs/ai-records/$kind/$recordId'
     | '/focus/repo/$owner/$repo/releases'
     | '/admin/jobs/tasks/$taskId'
     | '/focus/repo/$owner/$repo'
@@ -593,6 +631,7 @@ export interface FileRouteTypes {
     | '/focus/mine'
     | '/focus/repos'
     | '/admin/'
+    | '/admin/jobs/ai-records'
     | '/$owner/$repo/releases'
     | '/admin/jobs/llm'
     | '/admin/jobs/scheduled'
@@ -613,8 +652,10 @@ export interface FileRouteTypes {
     | '/focus/repo/$owner/$repo'
     | '/public/$owner/$repo/releases'
     | '/$owner/$repo/releases/'
+    | '/admin/jobs/ai-records/'
     | '/focus/org/$org/'
     | '/$owner/$repo/releases/tag/$tag'
+    | '/admin/jobs/ai-records/$kind/$recordId'
     | '/focus/repo/$owner/$repo/releases'
     | '/admin/jobs/tasks/$taskId/'
     | '/focus/repo/$owner/$repo/'
@@ -862,12 +903,26 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof OwnerRepoReleasesRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/admin/jobs/ai-records': {
+      id: '/admin/jobs/ai-records'
+      path: '/ai-records'
+      fullPath: '/admin/jobs/ai-records'
+      preLoaderRoute: typeof AdminJobsAiRecordsRouteRouteImport
+      parentRoute: typeof AdminJobsRouteRoute
+    }
     '/focus/org/$org/': {
       id: '/focus/org/$org/'
       path: '/'
       fullPath: '/focus/org/$org/'
       preLoaderRoute: typeof FocusOrgOrgIndexRouteImport
       parentRoute: typeof FocusOrgOrgRoute
+    }
+    '/admin/jobs/ai-records/': {
+      id: '/admin/jobs/ai-records/'
+      path: '/'
+      fullPath: '/admin/jobs/ai-records/'
+      preLoaderRoute: typeof AdminJobsAiRecordsIndexRouteImport
+      parentRoute: typeof AdminJobsAiRecordsRouteRoute
     }
     '/$owner/$repo/releases/': {
       id: '/$owner/$repo/releases/'
@@ -939,6 +994,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof FocusRepoOwnerRepoReleasesRouteImport
       parentRoute: typeof FocusRepoOwnerRepoRoute
     }
+    '/admin/jobs/ai-records/$kind/$recordId': {
+      id: '/admin/jobs/ai-records/$kind/$recordId'
+      path: '/$kind/$recordId'
+      fullPath: '/admin/jobs/ai-records/$kind/$recordId'
+      preLoaderRoute: typeof AdminJobsAiRecordsKindRecordIdRouteImport
+      parentRoute: typeof AdminJobsAiRecordsRouteRoute
+    }
     '/$owner/$repo/releases/tag/$tag': {
       id: '/$owner/$repo/releases/tag/$tag'
       path: '/tag/$tag'
@@ -962,6 +1024,22 @@ declare module '@tanstack/react-router' {
     }
   }
 }
+
+interface AdminJobsAiRecordsRouteRouteChildren {
+  AdminJobsAiRecordsIndexRoute: typeof AdminJobsAiRecordsIndexRoute
+  AdminJobsAiRecordsKindRecordIdRoute: typeof AdminJobsAiRecordsKindRecordIdRoute
+}
+
+const AdminJobsAiRecordsRouteRouteChildren: AdminJobsAiRecordsRouteRouteChildren =
+  {
+    AdminJobsAiRecordsIndexRoute: AdminJobsAiRecordsIndexRoute,
+    AdminJobsAiRecordsKindRecordIdRoute: AdminJobsAiRecordsKindRecordIdRoute,
+  }
+
+const AdminJobsAiRecordsRouteRouteWithChildren =
+  AdminJobsAiRecordsRouteRoute._addFileChildren(
+    AdminJobsAiRecordsRouteRouteChildren,
+  )
 
 interface AdminJobsSubscriptionsRouteChildren {
   AdminJobsSubscriptionsTaskIdRoute: typeof AdminJobsSubscriptionsTaskIdRoute
@@ -994,6 +1072,7 @@ const AdminJobsTasksTaskIdRouteRouteWithChildren =
   )
 
 interface AdminJobsRouteRouteChildren {
+  AdminJobsAiRecordsRouteRoute: typeof AdminJobsAiRecordsRouteRouteWithChildren
   AdminJobsLlmRoute: typeof AdminJobsLlmRoute
   AdminJobsScheduledRoute: typeof AdminJobsScheduledRoute
   AdminJobsSubscriptionsRoute: typeof AdminJobsSubscriptionsRouteWithChildren
@@ -1003,6 +1082,7 @@ interface AdminJobsRouteRouteChildren {
 }
 
 const AdminJobsRouteRouteChildren: AdminJobsRouteRouteChildren = {
+  AdminJobsAiRecordsRouteRoute: AdminJobsAiRecordsRouteRouteWithChildren,
   AdminJobsLlmRoute: AdminJobsLlmRoute,
   AdminJobsScheduledRoute: AdminJobsScheduledRoute,
   AdminJobsSubscriptionsRoute: AdminJobsSubscriptionsRouteWithChildren,

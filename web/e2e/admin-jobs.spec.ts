@@ -808,6 +808,100 @@ async function installAdminJobsMocks(
 		return completedTranslationBatchDetail;
 	}
 
+	function buildTranslationAttemptEvents(entityId: string | null) {
+		if (entityId !== "290978079") return [];
+		return [
+			{
+				id: 1,
+				work_item_id: "work-translation-1",
+				request_id: "req-translation-1",
+				batch_id: null,
+				scope_user_id: CURRENT_USER_ID,
+				kind: "release_detail",
+				variant: "feed_body",
+				entity_id: "290978079",
+				target_lang: "zh-CN",
+				attempt_no: 1,
+				trigger: "initial",
+				event_type: "attempt_queued",
+				result_status: null,
+				error_code: null,
+				error_summary: null,
+				failure_class: null,
+				retry_eligible: false,
+				next_retry_at: null,
+				llm_call_ids: [],
+				created_at: "2026-04-15T03:23:00Z",
+			},
+			{
+				id: 2,
+				work_item_id: "work-translation-1",
+				request_id: null,
+				batch_id: "batch-translation-1",
+				scope_user_id: CURRENT_USER_ID,
+				kind: "release_detail",
+				variant: "feed_body",
+				entity_id: "290978079",
+				target_lang: "zh-CN",
+				attempt_no: 1,
+				trigger: "initial",
+				event_type: "attempt_completed",
+				result_status: "error",
+				error_code: "markdown_structure_mismatch",
+				error_summary: "Markdown 结构校验失败",
+				failure_class: "transient",
+				retry_eligible: true,
+				next_retry_at: "2026-04-15T03:25:00Z",
+				llm_call_ids: ["llm-call-1"],
+				created_at: "2026-04-15T03:23:11Z",
+			},
+			{
+				id: 3,
+				work_item_id: "work-translation-1",
+				request_id: null,
+				batch_id: "batch-translation-1",
+				scope_user_id: CURRENT_USER_ID,
+				kind: "release_detail",
+				variant: "feed_body",
+				entity_id: "290978079",
+				target_lang: "zh-CN",
+				attempt_no: 2,
+				trigger: "automatic_recovery",
+				event_type: "retry_scheduled",
+				result_status: "error",
+				error_code: "markdown_structure_mismatch",
+				error_summary: "Markdown 结构校验失败",
+				failure_class: "transient",
+				retry_eligible: true,
+				next_retry_at: "2026-04-15T03:25:00Z",
+				llm_call_ids: ["llm-call-1"],
+				created_at: "2026-04-15T03:23:11Z",
+			},
+			{
+				id: 4,
+				work_item_id: "work-translation-1",
+				request_id: null,
+				batch_id: null,
+				scope_user_id: CURRENT_USER_ID,
+				kind: "release_detail",
+				variant: "feed_body",
+				entity_id: "290978079",
+				target_lang: "zh-CN",
+				attempt_no: 2,
+				trigger: "automatic_recovery",
+				event_type: "attempt_queued",
+				result_status: null,
+				error_code: null,
+				error_summary: null,
+				failure_class: null,
+				retry_eligible: false,
+				next_retry_at: null,
+				llm_call_ids: [],
+				created_at: "2026-04-15T03:25:00Z",
+			},
+		];
+	}
+
 	const slots = Array.from({ length: 24 }, (_, hour) => ({
 		hour_utc: hour,
 		enabled: hour % 2 === 0,
@@ -1889,6 +1983,29 @@ async function installAdminJobsMocks(
 				page: 1,
 				page_size: 20,
 				total: requests.length,
+			});
+		}
+
+		if (
+			req.method() === "GET" &&
+			pathname === "/api/admin/jobs/translations/attempt-events"
+		) {
+			const page = Math.max(1, Number(url.searchParams.get("page") ?? "1"));
+			const pageSize = Math.max(
+				1,
+				Number(url.searchParams.get("page_size") ?? "20"),
+			);
+			const items =
+				url.searchParams.get("kind") === "release_detail" &&
+				url.searchParams.get("variant") === "feed_body"
+					? buildTranslationAttemptEvents(url.searchParams.get("entity_id"))
+					: [];
+			const offset = (page - 1) * pageSize;
+			return json(route, {
+				items: items.slice(offset, offset + pageSize),
+				page,
+				page_size: pageSize,
+				total: items.length,
 			});
 		}
 
@@ -3362,6 +3479,12 @@ test("admin can inspect translation scheduler", async ({ page }) => {
 	await expect(page.getByRole("heading", { name: "翻译调度" })).toBeVisible();
 	await expect(page.getByText("工作者板")).toBeVisible();
 	await expect(page.getByText("W4 · 用户专用")).toBeVisible();
+	const auditInput = page.getByLabel("发布记录 ID");
+	await auditInput.fill("290978079");
+	await page.getByRole("button", { name: "查询发布记录重试审计" }).click();
+	await expect(page.getByText("已安排重试")).toBeVisible();
+	await expect(page.getByText("自动重试").first()).toBeVisible();
+	await expect(page.getByText("Markdown 结构校验失败").first()).toBeVisible();
 	await page.getByRole("button", { name: "打开 W4 · 用户专用 详情" }).click();
 	await expect(page.getByRole("heading", { name: "工作者详情" })).toBeVisible();
 	await expect(page.getByText("translation-worker-4")).toBeVisible();
