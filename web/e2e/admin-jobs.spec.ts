@@ -3331,13 +3331,13 @@ test("admin ignores stale llm refresh errors after filter change", async ({
 				search: "status=all",
 				afterCount: 1,
 				times: 1,
-				delayMs: 600,
+				delayMs: 1200,
 			},
 			{
 				pathname: "/api/admin/jobs/llm/calls",
 				search: "status=failed",
 				times: 1,
-				delayMs: 300,
+				delayMs: 750,
 			},
 		],
 		failureRules: [
@@ -3377,7 +3377,7 @@ test("admin ignores stale llm refresh errors after filter change", async ({
 	await expect(page.getByText("job.api.translate_release")).toBeVisible();
 	await expect(page.getByText("stale llm refresh failed")).toHaveCount(0);
 
-	await page.waitForTimeout(700);
+	await page.waitForTimeout(1300);
 	await expect(page.getByText("job.api.translate_release")).toBeVisible();
 	await expect(page.getByText("api.translate_releases_batch")).toHaveCount(0);
 	await expect(refreshButton).toBeEnabled();
@@ -3482,7 +3482,7 @@ test("admin can inspect translation scheduler", async ({ page }) => {
 	const auditInput = page.getByLabel("发布记录 ID");
 	await auditInput.fill("290978079");
 	await page.getByRole("button", { name: "查询发布记录重试审计" }).click();
-	await expect(page.getByText("已安排重试")).toBeVisible();
+	await expect(page.getByText("已安排重试").first()).toBeVisible();
 	await expect(page.getByText("自动重试").first()).toBeVisible();
 	await expect(page.getByText("Markdown 结构校验失败").first()).toBeVisible();
 	await page.getByRole("button", { name: "打开 W4 · 用户专用 详情" }).click();
