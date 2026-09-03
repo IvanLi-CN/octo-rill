@@ -149,6 +149,68 @@ struct AttemptEventRow {
     created_at: String,
 }
 
+#[derive(Default)]
+struct AttemptBuild {
+    pipeline: String,
+    attempt_no: i64,
+    trigger: String,
+    status: String,
+    started_at: Option<String>,
+    last_attempt_at: String,
+    finished_at: Option<String>,
+    error_code: Option<String>,
+    error_summary: Option<String>,
+    failure_class: Option<String>,
+    retry_eligible: bool,
+    next_retry_at: Option<String>,
+    llm_calls: Vec<AdminCollectionLlmLink>,
+}
+
+fn apply_attempt_event(item: &mut AttemptBuild, event: &AttemptEventRow) {
+    item.trigger = event.trigger.clone();
+    item.last_attempt_at = event.created_at.clone();
+    match event.event_type.as_str() {
+        "attempt_queued" => {
+            item.status = "queued".to_owned();
+            item.started_at = None;
+            item.finished_at = None;
+            item.retry_eligible = false;
+            item.next_retry_at = None;
+        }
+        "attempt_started" => {
+            item.status = "running".to_owned();
+            item.started_at = Some(event.created_at.clone());
+        }
+        "attempt_completed" => {
+            item.status = event
+                .result_status
+                .clone()
+                .unwrap_or_else(|| "completed".to_owned());
+            item.finished_at = Some(event.created_at.clone());
+        }
+        "retry_scheduled" => {
+            item.status = "retry_scheduled".to_owned();
+            item.finished_at = Some(event.created_at.clone());
+        }
+        _ => {}
+    }
+    if let Some(value) = &event.error_code {
+        item.error_code = Some(value.clone());
+    }
+    if let Some(value) = &event.error_summary {
+        item.error_summary = Some(value.clone());
+    }
+    if let Some(value) = &event.failure_class {
+        item.failure_class = Some(value.clone());
+    }
+    if event.event_type != "attempt_queued" {
+        item.retry_eligible |= event.retry_eligible != 0;
+        if let Some(value) = &event.next_retry_at {
+            item.next_retry_at = Some(value.clone());
+        }
+    }
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct BriefCallRow {
     id: String,
@@ -564,22 +626,6 @@ async fn load_task_attempts(
             .map(|call| (call.id.clone(), call))
             .collect::<HashMap<_, _>>()
     };
-    #[derive(Default)]
-    struct AttemptBuild {
-        pipeline: String,
-        attempt_no: i64,
-        trigger: String,
-        status: String,
-        started_at: Option<String>,
-        last_attempt_at: String,
-        finished_at: Option<String>,
-        error_code: Option<String>,
-        error_summary: Option<String>,
-        failure_class: Option<String>,
-        retry_eligible: bool,
-        next_retry_at: Option<String>,
-        llm_calls: Vec<AdminCollectionLlmLink>,
-    }
     let mut grouped = HashMap::<(String, i64), AttemptBuild>::new();
     for event in events {
         let key = (event.work_item_id.clone(), event.attempt_no);
@@ -598,25 +644,7 @@ async fn load_task_attempts(
             last_attempt_at: event.created_at.clone(),
             ..AttemptBuild::default()
         });
-        item.last_attempt_at = event.created_at.clone();
-        if event.event_type == "attempt_started" {
-            item.status = "running".to_owned();
-            item.started_at = Some(event.created_at.clone());
-        } else if event.event_type == "attempt_completed" {
-            item.status = event
-                .result_status
-                .clone()
-                .unwrap_or_else(|| "completed".to_owned());
-            item.finished_at = Some(event.created_at.clone());
-        } else if event.event_type == "retry_scheduled" {
-            item.status = "retry_scheduled".to_owned();
-            item.finished_at = Some(event.created_at.clone());
-        }
-        item.error_code = event.error_code.or(item.error_code.take());
-        item.error_summary = event.error_summary.or(item.error_summary.take());
-        item.failure_class = event.failure_class.or(item.failure_class.take());
-        item.retry_eligible |= event.retry_eligible != 0;
-        item.next_retry_at = event.next_retry_at.or(item.next_retry_at.take());
+        apply_attempt_event(item, &event);
         for id in serde_json::from_str::<Vec<String>>(&event.llm_call_ids_json).unwrap_or_default()
         {
             if let Some(call) = calls_by_id.get(&id)
@@ -715,4 +743,82 @@ pub async fn admin_get_collection_record_detail(
         .await?
     };
     Ok(Json(AdminCollectionRecordDetail { record, attempts }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(trigger: &str, event_type: &str, created_at: &str) -> AttemptEventRow {
+        AttemptEventRow {
+            work_item_id: "work-item-1".to_owned(),
+            attempt_no: 2,
+            trigger: trigger.to_owned(),
+            event_type: event_type.to_owned(),
+            result_status: None,
+            error_code: None,
+            error_summary: None,
+            failure_class: None,
+            retry_eligible: 0,
+            next_retry_at: None,
+            llm_call_ids_json: "[]".to_owned(),
+            created_at: created_at.to_owned(),
+        }
+    }
+
+    #[test]
+    fn queued_event_replaces_stale_scheduled_retry_state() {
+        let mut attempt = AttemptBuild {
+            pipeline: "translation".to_owned(),
+            attempt_no: 2,
+            ..AttemptBuild::default()
+        };
+        let mut scheduled = event(
+            "automatic_recovery",
+            "retry_scheduled",
+            "2026-09-04T01:00:00Z",
+        );
+        scheduled.error_summary = Some("temporary upstream failure".to_owned());
+        scheduled.retry_eligible = 1;
+        scheduled.next_retry_at = Some("2026-09-04T01:05:00Z".to_owned());
+        apply_attempt_event(&mut attempt, &scheduled);
+
+        let queued = event(
+            "automatic_recovery",
+            "attempt_queued",
+            "2026-09-04T01:05:00Z",
+        );
+        apply_attempt_event(&mut attempt, &queued);
+
+        assert_eq!(attempt.status, "queued");
+        assert_eq!(attempt.trigger, "automatic_recovery");
+        assert_eq!(
+            attempt.error_summary.as_deref(),
+            Some("temporary upstream failure")
+        );
+        assert!(!attempt.retry_eligible);
+        assert_eq!(attempt.next_retry_at, None);
+        assert_eq!(attempt.started_at, None);
+        assert_eq!(attempt.finished_at, None);
+    }
+
+    #[test]
+    fn latest_queued_event_preserves_system_requeue_trigger() {
+        let mut attempt = AttemptBuild {
+            pipeline: "translation".to_owned(),
+            attempt_no: 1,
+            ..AttemptBuild::default()
+        };
+        apply_attempt_event(
+            &mut attempt,
+            &event("initial", "attempt_queued", "2026-09-04T01:00:00Z"),
+        );
+        apply_attempt_event(
+            &mut attempt,
+            &event("system_requeue", "attempt_queued", "2026-09-04T01:01:00Z"),
+        );
+
+        assert_eq!(attempt.status, "queued");
+        assert_eq!(attempt.trigger, "system_requeue");
+    }
 }

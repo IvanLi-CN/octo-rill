@@ -4218,7 +4218,9 @@ async fn record_translation_retry_scheduled(
         TranslationAttemptEventDetails {
             request_id: None,
             batch_id: Some(retry_schedule.batch_id),
-            attempt_no: state.attempt_count.saturating_add(1),
+            // Scheduling is outcome metadata for the attempt that failed, not
+            // the future execution that may later be requeued.
+            attempt_no: state.attempt_count.max(1),
             trigger: TranslationAttemptTrigger::AutomaticRecovery,
             event_type: "retry_scheduled",
             result_status: Some("error"),
@@ -7705,6 +7707,65 @@ mod tests {
         assert_eq!(response.status, "queued");
         assert_eq!(response.result.item.entity_id, item.entity_id);
         assert_eq!(response.result.item.producer_ref, item.producer_ref);
+    }
+
+    #[tokio::test]
+    async fn retry_schedule_is_recorded_on_the_failed_attempt() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let created = create_translation_request(
+            state.as_ref(),
+            "1",
+            "async",
+            &sample_release_item("retry-schedule-attempt"),
+        )
+        .await
+        .expect("create request");
+        let work_item_id = created
+            .result
+            .work_item_id
+            .expect("request should create a work item");
+        sqlx::query("UPDATE translation_work_items SET attempt_count = 1 WHERE id = ?")
+            .bind(work_item_id.as_str())
+            .execute(&pool)
+            .await
+            .expect("mark failed attempt count");
+
+        let (_writer_guard, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "test_retry_schedule_attempt")
+            .await
+            .expect("begin test transaction");
+        let work_item = load_work_item_by_id(&mut tx, work_item_id.as_str())
+            .await
+            .expect("load work item")
+            .expect("work item should exist");
+        let llm_call_ids = vec!["llm-call-for-failed-attempt".to_owned()];
+        record_translation_retry_scheduled(
+            &mut tx,
+            &work_item,
+            TranslationRetrySchedule {
+                batch_id: "batch-failed-attempt",
+                next_retry_at: "2026-09-04T01:05:00Z",
+                failure_class: Some(ai::LlmFailureClass::Transient),
+                error_text: Some("temporary upstream failure"),
+                llm_call_ids: &llm_call_ids,
+            },
+            "2026-09-04T01:00:00Z",
+        )
+        .await
+        .expect("record retry schedule");
+        tx.commit().await.expect("commit audit event");
+
+        let attempt_no: i64 = sqlx::query_scalar(
+            "SELECT attempt_no FROM translation_attempt_events WHERE work_item_id = ? AND event_type = 'retry_scheduled'",
+        )
+        .bind(work_item_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load retry schedule attempt number");
+        assert_eq!(attempt_no, 1);
     }
 
     #[tokio::test]

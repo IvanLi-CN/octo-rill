@@ -161,7 +161,7 @@ function TaskSummaryHeader({ label }: { label: string }) {
 		<TableHead className="whitespace-normal">
 			<div className="space-y-0.5">
 				<span className="block">{label}</span>
-				<span className="text-muted-foreground block text-[11px] font-normal">
+				<span className="text-muted-foreground block font-mono text-xs font-medium">
 					状态 · 重试 / 开始 · 上次 · 完成
 				</span>
 			</div>
@@ -289,7 +289,7 @@ function CollectionTable({
 							<div className="space-y-0.5">
 								<span className="block">{sourceHeading}</span>
 								{!isBrief ? (
-									<span className="text-muted-foreground block text-[11px] font-normal">
+									<span className="text-muted-foreground block font-mono text-xs font-medium">
 										{tab === "release" ? "发布 · 发现" : "发生 · 发现"}
 									</span>
 								) : null}
@@ -566,30 +566,48 @@ function RecordDetail({
 					</p>
 				) : (
 					<div className="divide-y border-y">
-						{attempts.map((attempt) => (
-							<button
-								key={attempt.id}
-								type="button"
-								className="block w-full py-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-								onClick={() => onOpenAttempt(attempt.id)}
-							>
-								<div className="flex flex-wrap items-center justify-between gap-2">
-									<span className="font-medium text-sm">
-										{attempt.pipeline === "translation" ? "翻译" : "润色"} · 第{" "}
-										{attempt.attempt_no} 次
+						{attempts.map((attempt) => {
+							const models = [
+								...new Set(attempt.llm_calls.map((call) => call.model)),
+							];
+							const error =
+								attempt.error_summary ??
+								[attempt.error_code, attempt.failure_class]
+									.filter(Boolean)
+									.join(" · ");
+							return (
+								<button
+									key={attempt.id}
+									type="button"
+									aria-label={`查看${attempt.pipeline === "translation" ? "翻译" : "润色"}第 ${attempt.attempt_no} 次尝试详情`}
+									className="flex w-full items-start justify-between gap-3 py-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+									onClick={() => onOpenAttempt(attempt.id)}
+								>
+									<span className="min-w-0">
+										<span className="block font-medium text-sm">
+											{attempt.pipeline === "translation" ? "翻译" : "润色"} ·
+											第 {attempt.attempt_no} 次
+										</span>
+										<span className="text-muted-foreground mt-1 block truncate text-xs">
+											{models.join(" · ") || "未关联模型调用"}
+										</span>
+										<span className="text-muted-foreground mt-1 block text-xs">
+											{attempt.trigger} ·{" "}
+											{formatDateTime(attempt.last_attempt_at)}
+										</span>
+										{error ? (
+											<span className="text-destructive mt-1 line-clamp-2 block text-xs">
+												{error}
+											</span>
+										) : null}
 									</span>
-									<RecordStatus status={attempt.status} />
-								</div>
-								<p className="text-muted-foreground mt-1 text-xs">
-									{attempt.trigger} · {formatDateTime(attempt.last_attempt_at)}
-								</p>
-								{attempt.error_summary ? (
-									<p className="text-destructive mt-1 line-clamp-2 text-xs">
-										{attempt.error_summary}
-									</p>
-								) : null}
-							</button>
-						))}
+									<span className="flex shrink-0 items-center gap-2">
+										<RecordStatus status={attempt.status} />
+										<ChevronRight className="size-4 text-muted-foreground" />
+									</span>
+								</button>
+							);
+						})}
 					</div>
 				)}
 			</section>

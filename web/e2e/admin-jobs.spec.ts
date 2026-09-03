@@ -2471,6 +2471,128 @@ test("admin jobs tabs are URL-driven and support deep links plus history", async
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
 });
 
+test("content processing audit shows retry state, model, error, and call detail", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 900 });
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+
+	const record = {
+		id: "release-audit-1",
+		kind: "release" as const,
+		repository: "octo-demo/release-lab",
+		title: "v2.31.0",
+		occurred_at: "2026-04-15T03:20:00Z",
+		detected_at: "2026-04-15T03:21:00Z",
+		generated_at: null,
+		translation: {
+			status: "queued",
+			retry_count: 1,
+			started_at: "2026-04-15T03:23:00Z",
+			last_attempt_at: "2026-04-15T03:25:00Z",
+			finished_at: null,
+		},
+		polish: {
+			status: "ready",
+			retry_count: 0,
+			started_at: "2026-04-15T03:22:00Z",
+			last_attempt_at: "2026-04-15T03:22:01Z",
+			finished_at: "2026-04-15T03:22:01Z",
+		},
+	};
+	const llmCall = {
+		id: "llm-call-1",
+		status: "failed",
+		source: "job.api.translate_release",
+		model: "gpt-4o-mini",
+	};
+	const detail = {
+		record,
+		attempts: [
+			{
+				id: "work-translation-1:1",
+				pipeline: "translation",
+				attempt_no: 1,
+				trigger: "automatic_recovery",
+				status: "retry_scheduled",
+				started_at: "2026-04-15T03:23:00Z",
+				last_attempt_at: "2026-04-15T03:23:11Z",
+				finished_at: "2026-04-15T03:23:11Z",
+				error_code: "markdown_structure_mismatch",
+				error_summary: "Markdown 结构校验失败",
+				failure_class: "transient",
+				retry_eligible: true,
+				next_retry_at: "2026-04-15T03:25:00Z",
+				llm_calls: [llmCall],
+			},
+			{
+				id: "work-translation-1:2",
+				pipeline: "translation",
+				attempt_no: 2,
+				trigger: "automatic_recovery",
+				status: "queued",
+				started_at: null,
+				last_attempt_at: "2026-04-15T03:25:00Z",
+				finished_at: null,
+				error_code: null,
+				error_summary: null,
+				failure_class: null,
+				retry_eligible: false,
+				next_retry_at: null,
+				llm_calls: [],
+			},
+		],
+	};
+	await page.route("**/api/admin/jobs/ai-records/**", async (route) => {
+		const pathname = new URL(route.request().url()).pathname;
+		if (pathname === "/api/admin/jobs/ai-records/release") {
+			return json(route, { items: [record], page: 1, page_size: 20, total: 1 });
+		}
+		if (pathname === "/api/admin/jobs/ai-records/release/release-audit-1") {
+			return json(route, detail);
+		}
+		return route.fallback();
+	});
+
+	await page.goto("/admin/jobs/ai-records", { waitUntil: "domcontentloaded" });
+	await expect(page.getByRole("tab", { name: "内容处理" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+	const recordsTable = page.getByRole("table").filter({ hasText: "v2.31.0" });
+	await expect(
+		recordsTable.getByText("v2.31.0", { exact: true }),
+	).toBeVisible();
+	expect(
+		await page.evaluate(
+			() => document.documentElement.scrollWidth <= window.innerWidth,
+		),
+	).toBe(true);
+
+	await page.getByRole("button", { name: "查看 v2.31.0 详情" }).click();
+	const recordSheet = page.getByRole("dialog", { name: "记录详情" });
+	await expect(recordSheet).toBeVisible();
+	await expect(
+		recordSheet.getByText("gpt-4o-mini", { exact: true }),
+	).toBeVisible();
+	await expect(recordSheet.getByText("Markdown 结构校验失败")).toBeVisible();
+	await expect(recordSheet.getByText("排队中", { exact: true })).toBeVisible();
+
+	await page.getByRole("button", { name: "查看翻译第 1 次尝试详情" }).click();
+	await expect(page.getByRole("dialog", { name: "尝试详情" })).toBeVisible();
+	const llmButton = page
+		.getByText("gpt-4o-mini", { exact: true })
+		.locator("xpath=ancestor::button[1]");
+	await llmButton.click();
+	await expect(
+		page.getByRole("dialog", { name: "模型调用详情" }),
+	).toBeVisible();
+	await expect(page.getByText("mock llm failed")).toBeVisible();
+	await expect(page).toHaveURL(
+		/\/admin\/jobs\/ai-records\/release\/release-audit-1\?ai_attempt=work-translation-1%3A1&ai_llm=llm-call-1$/,
+	);
+});
+
 test("admin requests grouped LLM call ordering and renders the response", async ({
 	page,
 }) => {
