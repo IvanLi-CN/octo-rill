@@ -2576,7 +2576,11 @@ test("content processing audit shows retry state, model, error, and call detail"
 		recordSheet.getByText("gpt-4o-mini", { exact: true }),
 	).toBeVisible();
 	await expect(recordSheet.getByText("Markdown 结构校验失败")).toBeVisible();
-	await expect(recordSheet.getByText("排队中", { exact: true })).toBeVisible();
+	await expect(
+		recordSheet
+			.getByRole("button", { name: "查看翻译第 2 次尝试详情" })
+			.getByText("排队中", { exact: true }),
+	).toBeVisible();
 
 	await page.getByRole("button", { name: "查看翻译第 1 次尝试详情" }).click();
 	await expect(page.getByRole("dialog", { name: "尝试详情" })).toBeVisible();
