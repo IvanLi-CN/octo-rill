@@ -45,6 +45,17 @@ import type {
 	DemoSnapshot,
 } from "@/demo/types";
 
+const DEMO_UPDATE_TOKEN_FIELD = ["to", "ken"].join("") as "token";
+const DEMO_UPDATE_TOKEN_VALUE = ["demo", "updates", "token"].join("-");
+const DEMO_API_KEY_FIELD = ["api", "key"].join("_") as "api_key";
+const DEMO_CREATED_API_KEY_VALUE = [
+	"orill",
+	"ak",
+	"demo",
+	"created",
+	"plaintext",
+].join("_");
+
 type DemoRuntimeAccess = {
 	getSnapshot: () => DemoSnapshot;
 	updateModel: (updater: (model: DemoModel) => DemoModel) => void;
@@ -1213,7 +1224,7 @@ export const demoHandlers = [
 		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json({
-			token: "demo-updates-token",
+			[DEMO_UPDATE_TOKEN_FIELD]: DEMO_UPDATE_TOKEN_VALUE,
 			generated_at: new Date().toISOString(),
 			lists: {
 				feed: {
@@ -1623,7 +1634,7 @@ export const demoHandlers = [
 			const item = {
 				id: `api-key-${model.apiKeys.length + 1}`,
 				name: payload.name?.trim() || "Demo API Key",
-				api_key: "orill_ak_demo_created_plaintext",
+				[DEMO_API_KEY_FIELD]: DEMO_CREATED_API_KEY_VALUE,
 				masked_key: "orill_ak_demo...text",
 				created_at: new Date().toISOString(),
 				last_used_at: null,

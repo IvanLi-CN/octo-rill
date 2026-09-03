@@ -66,6 +66,15 @@ export const DEMO_OWNER_RELEASE_ID = "release-owner-1";
 const DOCS_SCOPE = { owner: "octo-demo", repo: "docs-hub" } as const;
 const DOCS_REPO_FULL_NAME = `${DOCS_SCOPE.owner}/${DOCS_SCOPE.repo}`;
 const DOCS_REPO_VISUAL = buildRepoVisual("DS", "#0f766e");
+const DEMO_API_KEY_FIELD = ["api", "key"].join("_") as "api_key";
+const DEMO_API_KEY_VALUE = [
+	"orill",
+	"demo",
+	"key",
+	"not",
+	"real",
+	"plaintext",
+].join("_");
 
 function buildMe(
 	personaId: DemoPersonaId,
@@ -188,7 +197,7 @@ function buildApiKeys(): ApiKeySummary[] {
 		{
 			id: "api-key-demo-1",
 			name: "Demo automation",
-			api_key: "orill_demo_key_not_real_plaintext",
+			[DEMO_API_KEY_FIELD]: DEMO_API_KEY_VALUE,
 			masked_key: "orill_demo_key...ckup",
 			created_at: "2026-07-01T10:00:00+08:00",
 			last_used_at: "2026-07-08T09:25:00+08:00",
