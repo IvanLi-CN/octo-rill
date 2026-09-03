@@ -3231,7 +3231,7 @@ test("admin llm mobile filters keep context around the time range panel", async 
 test("admin keeps llm calls visible during sse refresh", async ({ page }) => {
 	test.slow();
 	await installAdminJobsMocks(page, {
-		responseDelayMs: 1200,
+		responseDelayMs: 4000,
 		delayedPaths: ["/api/admin/jobs/llm/calls", "/api/admin/jobs/llm/activity"],
 		emitStreamEvents: true,
 	});
