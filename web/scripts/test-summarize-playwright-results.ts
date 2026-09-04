@@ -1,4 +1,10 @@
-import { summarizePlaywrightReport } from "./summarize-playwright-results";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+	summarizePlaywrightReport,
+	writePlaywrightSummary,
+} from "./summarize-playwright-results";
 
 function assertEqual(actual: unknown, expected: unknown, label: string): void {
 	if (actual !== expected)
@@ -73,5 +79,29 @@ assertEqual(finalFailure.passed_tests, 0, "failure passed");
 assertEqual(finalFailure.failed_tests, 1, "failure failed");
 assertEqual(finalFailure.flaky_tests, 0, "failure flaky");
 assertEqual(finalFailure.retry_count, 1, "failure retries");
+
+const summaryDirectory = await mkdtemp(join(tmpdir(), "playwright-summary-"));
+const inputPath = join(summaryDirectory, "playwright-results.json");
+const outputPath = join(summaryDirectory, "playwright-summary.json");
+const testedSha = "a".repeat(40);
+try {
+	await writeFile(inputPath, JSON.stringify({ suites: [] }), "utf8");
+	const previousTestedSha = process.env.PLAYWRIGHT_TESTED_SHA;
+	process.env.PLAYWRIGHT_TESTED_SHA = testedSha;
+	try {
+		const summary = await writePlaywrightSummary(inputPath, outputPath);
+		assertEqual(summary.tested_sha, testedSha, "tested SHA result");
+		const persisted = JSON.parse(await readFile(outputPath, "utf8")) as {
+			tested_sha?: string;
+		};
+		assertEqual(persisted.tested_sha, testedSha, "tested SHA output");
+	} finally {
+		if (previousTestedSha === undefined)
+			delete process.env.PLAYWRIGHT_TESTED_SHA;
+		else process.env.PLAYWRIGHT_TESTED_SHA = previousTestedSha;
+	}
+} finally {
+	await rm(summaryDirectory, { force: true, recursive: true });
+}
 
 console.log("test-summarize-playwright-results: all checks passed");
