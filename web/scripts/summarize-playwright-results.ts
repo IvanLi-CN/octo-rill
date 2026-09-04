@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 
 export interface PlaywrightSummary {
 	schema_version: 1;
+	tested_sha?: string;
 	total_tests: number;
 	passed_tests: number;
 	failed_tests: number;
@@ -121,6 +122,8 @@ export async function writePlaywrightSummary(
 			collection_error: error instanceof Error ? error.message : String(error),
 		};
 	}
+	const testedSha = process.env.PLAYWRIGHT_TESTED_SHA?.trim();
+	if (testedSha) summary.tested_sha = testedSha;
 
 	await mkdir(dirname(outputPath), { recursive: true });
 	await writeFile(outputPath, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
