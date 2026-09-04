@@ -114,7 +114,7 @@ Returns request status, timing, and the single `result` attached to the given re
 - `GET /api/admin/jobs/translations/batches`
 - `GET /api/admin/jobs/translations/batches/{batch_id}`
 - `GET /api/admin/jobs/translations/attempt-events?entity_id={entity_id}&kind={kind?}&variant={variant?}&page={page?}&page_size={page_size?}`
-- `GET /api/admin/jobs/ai-records/{record_kind}?from={RFC3339?}&before={RFC3339?}&page={page?}&page_size={page_size?}`
+- `GET /api/admin/jobs/ai-records/{record_kind}?from={RFC3339?}&before={RFC3339?}&attempt_min={0..10?}&attempt_max={0..10?}&page={page?}&page_size={page_size?}`
 - `GET /api/admin/jobs/ai-records/{record_kind}/{record_id}`
 
 `attempt-events` requires an `entity_id`, is admin-only, and returns the matching event history in chronological order. `kind` and `variant` are optional narrowing filters. The response is paginated and has the following shape:
@@ -155,7 +155,11 @@ Returns request status, timing, and the single `result` attached to the given re
 
 Admin views expose scheduler runtime status, request aggregates, batch aggregates, trigger reason, token estimate, fan-out counts, linked `llm_call` ids, and release-level retry audit history.
 
-`ai-records` is admin-only. `record_kind` is `release`, `announcement`, or `brief`; list requests use an inclusive `from` and exclusive `before` RFC3339 range with page-number pagination. A list row contains only the source record's type-specific identity and timestamps plus the translation and/or polish task summaries: status, retry count, started time, latest attempt, and completion time. The detail endpoint returns the same record summary and its ordered attempt history, including trigger, model links, safe error classification/summary, retry eligibility, and next retry time. It never returns source text, prompts, raw model output, or raw upstream errors.
+`ai-records` is admin-only. `record_kind` is `release`, `announcement`, or `brief`; list requests use an inclusive `from` and exclusive `before` RFC3339 range with page-number pagination. The time range is applied to the source time: Release uses `COALESCE(published_at, created_at, updated_at)`, announcements use the grouped `MAX(occurred_at)`, and daily briefs use `created_at`. The original `detected_at` remains an audit field and may be null for historical records; clients display that value as `未知` and must not use it to exclude a source record.
+
+`attempt_min` and `attempt_max` are optional inclusive total-attempt bounds. `attempt_min` defaults to `0`; omitting `attempt_max` means no upper bound. Both values must be integers in `0..10`, and `attempt_max` must be greater than or equal to `attempt_min`, otherwise the server returns `400`. Release and announcement records use the maximum `attempt_count` across their applicable translation and polish work items; daily briefs use the maximum linked polish call attempt count. A record with no applicable work item or call has total attempts `0`. The attempt range is applied before total counting, ordering, and pagination.
+
+A list row contains only the source record's type-specific identity and timestamps plus the translation and/or polish task summaries: status, retry count, started time, latest attempt, and completion time. The detail endpoint returns the same record summary and its ordered attempt history, including trigger, model links, safe error classification/summary, retry eligibility, and next retry time. It never returns source text, prompts, raw model output, or raw upstream errors.
 
 
 ## Legacy endpoints

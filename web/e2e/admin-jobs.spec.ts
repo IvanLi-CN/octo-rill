@@ -2476,6 +2476,13 @@ test("content processing audit shows retry state, model, error, and call detail"
 }) => {
 	await page.setViewportSize({ width: 1440, height: 900 });
 	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	const listRequests: URL[] = [];
+	page.on("request", (request) => {
+		const url = new URL(request.url());
+		if (url.pathname === "/api/admin/jobs/ai-records/release") {
+			listRequests.push(url);
+		}
+	});
 
 	const record = {
 		id: "release-audit-1",
@@ -2578,6 +2585,27 @@ test("content processing audit shows retry state, model, error, and call detail"
 			() => document.documentElement.scrollWidth <= window.innerWidth,
 		),
 	).toBe(true);
+	const minAttempts = page.getByRole("slider", { name: "最小总尝试次数" });
+	const maxAttempts = page.getByRole("slider", { name: "最大总尝试次数" });
+	await minAttempts.press("ArrowRight");
+	await minAttempts.press("ArrowRight");
+	await maxAttempts.press("Home");
+	await maxAttempts.press("ArrowRight");
+	await maxAttempts.press("ArrowRight");
+	await maxAttempts.press("ArrowRight");
+	await expect
+		.poll(() => listRequests.at(-1)?.searchParams.get("attempt_min"))
+		.toBe("2");
+	await expect
+		.poll(() => listRequests.at(-1)?.searchParams.get("attempt_max"))
+		.toBe("5");
+	await expect
+		.poll(() => listRequests.at(-1)?.searchParams.get("page"))
+		.toBe("1");
+	await page.getByRole("button", { name: "重置尝试次数筛选" }).click();
+	await expect
+		.poll(() => listRequests.at(-1)?.searchParams.get("attempt_min") ?? null)
+		.toBeNull();
 
 	await page.getByRole("button", { name: "查看 v2.31.0 详情" }).click();
 	const recordSheet = page.getByRole("dialog", { name: "记录详情" });
@@ -2605,6 +2633,51 @@ test("content processing audit shows retry state, model, error, and call detail"
 	await expect(page).toHaveURL(
 		/\/admin\/jobs\/ai-records\/release\/release-audit-1\?ai_attempt=work-translation-1%3A1&ai_llm=llm-call-1$/,
 	);
+});
+
+test("content processing attempt filter stays full-width without mobile overflow", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 390, height: 844 });
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	const record = {
+		id: "release-mobile-1",
+		kind: "release" as const,
+		repository: "octo-demo/release-lab",
+		title: "移动端来源记录",
+		occurred_at: "2026-04-15T03:20:00Z",
+		detected_at: null,
+		generated_at: null,
+		translation: null,
+		polish: {
+			status: "not_recorded",
+			retry_count: 0,
+			started_at: null,
+			last_attempt_at: null,
+			finished_at: null,
+		},
+	};
+	await page.route("**/api/admin/jobs/ai-records/**", async (route) => {
+		const pathname = new URL(route.request().url()).pathname;
+		if (pathname === "/api/admin/jobs/ai-records/release") {
+			return json(route, { items: [record], page: 1, page_size: 20, total: 1 });
+		}
+		return route.fallback();
+	});
+
+	await page.goto("/admin/jobs/ai-records", { waitUntil: "domcontentloaded" });
+	await expect(
+		page.getByRole("button", { name: /移动端来源记录/ }),
+	).toBeVisible();
+	const filter = page.getByRole("group", { name: "尝试次数筛选" });
+	const filterBox = await filter.boundingBox();
+	expect(filterBox).not.toBeNull();
+	expect(filterBox?.width ?? 0).toBeLessThanOrEqual(358);
+	expect(
+		await page.evaluate(
+			() => document.documentElement.scrollWidth <= window.innerWidth,
+		),
+	).toBe(true);
 });
 
 test("admin requests grouped LLM call ordering and renders the response", async ({

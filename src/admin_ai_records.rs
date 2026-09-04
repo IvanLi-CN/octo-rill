@@ -7,7 +7,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, Sqlite};
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tower_sessions::Session;
 
 use crate::{api, error::ApiError, state::AppState};
@@ -44,6 +44,8 @@ impl CollectionRecordKind {
 pub struct AdminCollectionRecordListQuery {
     pub from: Option<String>,
     pub before: Option<String>,
+    pub attempt_min: Option<i64>,
+    pub attempt_max: Option<i64>,
     pub page: Option<i64>,
     pub page_size: Option<i64>,
 }
@@ -236,6 +238,37 @@ fn parse_timestamp(value: Option<String>, field: &str) -> Result<Option<String>,
     let parsed = DateTime::parse_from_rfc3339(value)
         .map_err(|_| ApiError::bad_request(format!("invalid {field} timestamp")))?;
     Ok(Some(parsed.with_timezone(&Utc).to_rfc3339()))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AttemptCountRange {
+    min: i64,
+    max: Option<i64>,
+}
+
+fn parse_attempt_count_range(
+    query: &AdminCollectionRecordListQuery,
+) -> Result<AttemptCountRange, ApiError> {
+    let min = query.attempt_min.unwrap_or(0);
+    let max = query.attempt_max;
+    if !(0..=10).contains(&min) {
+        return Err(ApiError::bad_request(
+            "attempt_min must be between 0 and 10",
+        ));
+    }
+    if let Some(value) = max {
+        if !(0..=10).contains(&value) {
+            return Err(ApiError::bad_request(
+                "attempt_max must be between 0 and 10",
+            ));
+        }
+        if value < min {
+            return Err(ApiError::bad_request(
+                "attempt_max must be greater than or equal to attempt_min",
+            ));
+        }
+    }
+    Ok(AttemptCountRange { min, max })
 }
 
 fn pagination(query: &AdminCollectionRecordListQuery) -> Result<(i64, i64, i64), ApiError> {
@@ -439,45 +472,105 @@ async fn load_brief_summaries(
 }
 
 async fn list_source_rows(
-    state: &AppState,
+    pool: &SqlitePool,
     kind: CollectionRecordKind,
     from: Option<&str>,
     before: Option<&str>,
+    attempts: AttemptCountRange,
     page_size: i64,
     offset: i64,
 ) -> Result<(Vec<SourceRecordRow>, i64), ApiError> {
-    let (base, order_by) = match kind {
-        CollectionRecordKind::Release => (
-            "SELECT CAST(r.release_id AS TEXT) AS id, COALESCE((SELECT wi.repo_full_name FROM repo_release_work_items wi WHERE wi.repo_id = r.repo_id LIMIT 1), '仓库 #' || CAST(r.repo_id AS TEXT)) AS repository, COALESCE(NULLIF(r.name, ''), r.tag_name) AS title, COALESCE(r.published_at, r.created_at, r.updated_at) AS occurred_at, r.detected_at, NULL AS generated_at FROM repo_releases r WHERE (? IS NULL OR datetime(r.detected_at) >= datetime(?)) AND (? IS NULL OR datetime(r.detected_at) < datetime(?))",
-            " ORDER BY datetime(detected_at) DESC, CAST(id AS INTEGER) DESC",
-        ),
-        CollectionRecordKind::Announcement => (
-            "SELECT lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id, MAX(e.repo_full_name) AS repository, COALESCE(MAX(NULLIF(e.title, '')), '公告') AS title, MAX(e.occurred_at) AS occurred_at, MIN(e.detected_at) AS detected_at, NULL AS generated_at FROM social_activity_events e WHERE e.kind = 'announcement' AND e.repo_full_name IS NOT NULL AND e.discussion_number IS NOT NULL AND (? IS NULL OR datetime(e.detected_at) >= datetime(?)) AND (? IS NULL OR datetime(e.detected_at) < datetime(?)) GROUP BY lower(e.repo_full_name), e.discussion_number",
-            " ORDER BY datetime(detected_at) DESC, id DESC",
-        ),
-        CollectionRecordKind::Brief => (
-            "SELECT b.id, NULL AS repository, b.date AS title, NULL AS occurred_at, NULL AS detected_at, b.created_at AS generated_at FROM briefs b WHERE (? IS NULL OR datetime(b.created_at) >= datetime(?)) AND (? IS NULL OR datetime(b.created_at) < datetime(?))",
-            " ORDER BY datetime(generated_at) DESC, id DESC",
-        ),
+    let source_sql = match kind {
+        CollectionRecordKind::Release => {
+            "WITH source_records AS (
+                SELECT
+                  CAST(r.release_id AS TEXT) AS id,
+                  COALESCE((SELECT wi.repo_full_name FROM repo_release_work_items wi WHERE wi.repo_id = r.repo_id LIMIT 1), '仓库 #' || CAST(r.repo_id AS TEXT)) AS repository,
+                  COALESCE(NULLIF(r.name, ''), r.tag_name) AS title,
+                  COALESCE(r.published_at, r.created_at, r.updated_at) AS source_time,
+                  COALESCE(r.published_at, r.created_at, r.updated_at) AS occurred_at,
+                  r.detected_at,
+                  NULL AS generated_at,
+                  COALESCE((SELECT MAX(w.attempt_count) FROM translation_work_items w WHERE w.entity_id = CAST(r.release_id AS TEXT) AND w.kind IN ('release_detail', 'release_smart')), 0) AS attempt_count
+                FROM repo_releases r
+            )
+            SELECT id, repository, title, occurred_at, detected_at, generated_at
+            FROM source_records
+            WHERE (? IS NULL OR datetime(source_time) >= datetime(?))
+              AND (? IS NULL OR datetime(source_time) < datetime(?))
+              AND attempt_count >= ?
+              AND attempt_count <= COALESCE(?, attempt_count)
+            ORDER BY datetime(source_time) DESC, CAST(id AS INTEGER) DESC"
+        }
+        CollectionRecordKind::Announcement => {
+            "WITH source_records AS (
+                SELECT
+                  lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id,
+                  MAX(e.repo_full_name) AS repository,
+                  COALESCE(MAX(NULLIF(e.title, '')), '公告') AS title,
+                  MAX(e.occurred_at) AS source_time,
+                  MAX(e.occurred_at) AS occurred_at,
+                  MIN(e.detected_at) AS detected_at,
+                  NULL AS generated_at,
+                  COALESCE((SELECT MAX(w.attempt_count) FROM translation_work_items w WHERE w.entity_id = lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AND w.kind IN ('announcement_detail', 'announcement_smart')), 0) AS attempt_count
+                FROM social_activity_events e
+                WHERE e.kind = 'announcement'
+                  AND e.repo_full_name IS NOT NULL
+                  AND e.discussion_number IS NOT NULL
+                GROUP BY lower(e.repo_full_name), e.discussion_number
+            )
+            SELECT id, repository, title, occurred_at, detected_at, generated_at
+            FROM source_records
+            WHERE (? IS NULL OR datetime(source_time) >= datetime(?))
+              AND (? IS NULL OR datetime(source_time) < datetime(?))
+              AND attempt_count >= ?
+              AND attempt_count <= COALESCE(?, attempt_count)
+            ORDER BY datetime(source_time) DESC, id DESC"
+        }
+        CollectionRecordKind::Brief => {
+            "WITH source_records AS (
+                SELECT
+                  b.id,
+                  NULL AS repository,
+                  b.date AS title,
+                  b.created_at AS source_time,
+                  NULL AS occurred_at,
+                  NULL AS detected_at,
+                  b.created_at AS generated_at,
+                  COALESCE((SELECT MAX(c.attempt_count) FROM llm_calls c WHERE c.parent_brief_id = b.id), 0) AS attempt_count
+                FROM briefs b
+            )
+            SELECT id, repository, title, occurred_at, detected_at, generated_at
+            FROM source_records
+            WHERE (? IS NULL OR datetime(source_time) >= datetime(?))
+              AND (? IS NULL OR datetime(source_time) < datetime(?))
+              AND attempt_count >= ?
+              AND attempt_count <= COALESCE(?, attempt_count)
+            ORDER BY datetime(source_time) DESC, id DESC"
+        }
     };
-    let total_sql = format!("SELECT COUNT(*) FROM ({base}) source_records");
+    let total_sql = format!("SELECT COUNT(*) FROM ({source_sql}) source_records");
     let total = sqlx::query_scalar::<_, i64>(&total_sql)
         .bind(from)
         .bind(from)
         .bind(before)
         .bind(before)
-        .fetch_one(&state.pool)
+        .bind(attempts.min)
+        .bind(attempts.max)
+        .fetch_one(pool)
         .await
         .map_err(ApiError::internal)?;
-    let sql = format!("{base}{order_by} LIMIT ? OFFSET ?");
+    let sql = format!("{source_sql} LIMIT ? OFFSET ?");
     let rows = sqlx::query_as::<_, SourceRecordRow>(&sql)
         .bind(from)
         .bind(from)
         .bind(before)
         .bind(before)
+        .bind(attempts.min)
+        .bind(attempts.max)
         .bind(page_size)
         .bind(offset)
-        .fetch_all(&state.pool)
+        .fetch_all(pool)
         .await
         .map_err(ApiError::internal)?;
     Ok((rows, total))
@@ -492,13 +585,15 @@ pub async fn admin_list_collection_records(
     let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
     let kind = CollectionRecordKind::parse(record_kind.as_str())?;
     let (page, page_size, offset) = pagination(&query)?;
+    let attempts = parse_attempt_count_range(&query)?;
     let from = parse_timestamp(query.from, "from")?;
     let before = parse_timestamp(query.before, "before")?;
     let (rows, total) = list_source_rows(
-        state.as_ref(),
+        &state.pool,
         kind,
         from.as_deref(),
         before.as_deref(),
+        attempts,
         page_size,
         offset,
     )
@@ -748,6 +843,192 @@ pub async fn admin_get_collection_record_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn test_pool() -> SqlitePool {
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create sqlite test pool")
+    }
+
+    fn list_query(
+        attempt_min: Option<i64>,
+        attempt_max: Option<i64>,
+    ) -> AdminCollectionRecordListQuery {
+        AdminCollectionRecordListQuery {
+            from: None,
+            before: None,
+            attempt_min,
+            attempt_max,
+            page: None,
+            page_size: None,
+        }
+    }
+
+    #[test]
+    fn attempt_count_range_defaults_to_zero_and_unbounded() {
+        assert_eq!(
+            parse_attempt_count_range(&list_query(None, None)).expect("default range"),
+            AttemptCountRange { min: 0, max: None }
+        );
+    }
+
+    #[test]
+    fn attempt_count_range_accepts_inclusive_bounds() {
+        assert_eq!(
+            parse_attempt_count_range(&list_query(Some(2), Some(5))).expect("bounded range"),
+            AttemptCountRange {
+                min: 2,
+                max: Some(5)
+            }
+        );
+        assert_eq!(
+            parse_attempt_count_range(&list_query(Some(10), Some(10))).expect("single value"),
+            AttemptCountRange {
+                min: 10,
+                max: Some(10)
+            }
+        );
+    }
+
+    #[test]
+    fn attempt_count_range_rejects_invalid_bounds() {
+        for query in [
+            list_query(Some(-1), None),
+            list_query(Some(11), None),
+            list_query(None, Some(-1)),
+            list_query(None, Some(11)),
+            list_query(Some(6), Some(5)),
+        ] {
+            assert!(parse_attempt_count_range(&query).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn release_source_time_and_attempt_range_apply_before_pagination() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE repo_releases (release_id INTEGER, repo_id INTEGER, name TEXT, tag_name TEXT, published_at TEXT, created_at TEXT, updated_at TEXT, detected_at TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create releases");
+        sqlx::query("CREATE TABLE repo_release_work_items (repo_id INTEGER, repo_full_name TEXT)")
+            .execute(&pool)
+            .await
+            .expect("create release work items");
+        sqlx::query(
+            "CREATE TABLE translation_work_items (entity_id TEXT, kind TEXT, attempt_count INTEGER)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create translation work items");
+        sqlx::query(
+            "INSERT INTO repo_releases (release_id, repo_id, name, tag_name, published_at, created_at, updated_at, detected_at) VALUES (100, 1, 'legacy', 'v1', '2026-07-08T09:00:00Z', '2026-07-08T09:00:00Z', '2026-07-08T09:00:00Z', NULL), (101, 1, 'processed', 'v2', '2026-07-08T08:00:00Z', '2026-07-08T08:00:00Z', '2026-07-08T08:00:00Z', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed releases");
+        sqlx::query(
+            "INSERT INTO translation_work_items (entity_id, kind, attempt_count) VALUES ('101', 'release_detail', 2), ('101', 'release_smart', 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed attempts");
+
+        let (rows, total) = list_source_rows(
+            &pool,
+            CollectionRecordKind::Release,
+            Some("2026-07-08T07:00:00Z"),
+            Some("2026-07-08T10:00:00Z"),
+            AttemptCountRange { min: 0, max: None },
+            1,
+            0,
+        )
+        .await
+        .expect("list releases");
+        assert_eq!(total, 2);
+        assert_eq!(rows[0].id, "100");
+        assert_eq!(rows[0].detected_at, None);
+
+        let (rows, total) = list_source_rows(
+            &pool,
+            CollectionRecordKind::Release,
+            Some("2026-07-08T07:00:00Z"),
+            Some("2026-07-08T10:00:00Z"),
+            AttemptCountRange { min: 2, max: None },
+            20,
+            0,
+        )
+        .await
+        .expect("filter releases by attempts");
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].id, "101");
+    }
+
+    #[tokio::test]
+    async fn announcement_and_brief_use_source_time_for_window() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE social_activity_events (repo_full_name TEXT, discussion_number INTEGER, title TEXT, occurred_at TEXT, detected_at TEXT, kind TEXT)",
+        )
+        .execute(&pool)
+            .await
+            .expect("create social events");
+        sqlx::query(
+            "CREATE TABLE translation_work_items (entity_id TEXT, kind TEXT, attempt_count INTEGER)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create announcement work items");
+        sqlx::query(
+            "INSERT INTO social_activity_events (repo_full_name, discussion_number, title, occurred_at, detected_at, kind) VALUES ('octo/demo', 42, '公告', '2026-07-08T09:00:00Z', '2026-07-08T01:00:00Z', 'announcement')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed announcement");
+        let (_, announcement_total) = list_source_rows(
+            &pool,
+            CollectionRecordKind::Announcement,
+            Some("2026-07-08T08:00:00Z"),
+            Some("2026-07-08T10:00:00Z"),
+            AttemptCountRange { min: 0, max: None },
+            20,
+            0,
+        )
+        .await
+        .expect("list announcements");
+        assert_eq!(announcement_total, 1);
+
+        sqlx::query("CREATE TABLE briefs (id TEXT, date TEXT, created_at TEXT)")
+            .execute(&pool)
+            .await
+            .expect("create briefs");
+        sqlx::query("CREATE TABLE llm_calls (parent_brief_id TEXT, attempt_count INTEGER)")
+            .execute(&pool)
+            .await
+            .expect("create brief calls");
+        sqlx::query(
+            "INSERT INTO briefs (id, date, created_at) VALUES ('brief-1', '2026-07-08', '2026-07-08T09:30:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed brief");
+        let (_, brief_total) = list_source_rows(
+            &pool,
+            CollectionRecordKind::Brief,
+            Some("2026-07-08T09:00:00Z"),
+            Some("2026-07-08T10:00:00Z"),
+            AttemptCountRange { min: 0, max: None },
+            20,
+            0,
+        )
+        .await
+        .expect("list briefs");
+        assert_eq!(brief_total, 1);
+    }
 
     fn event(trigger: &str, event_type: &str, created_at: &str) -> AttemptEventRow {
         AttemptEventRow {
