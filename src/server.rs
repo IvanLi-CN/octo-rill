@@ -40,8 +40,8 @@ use crate::runtime::SQLITE_BUSY_TIMEOUT;
 use crate::session_store::CoordinatedSqliteSessionStore;
 use crate::state::AppState;
 use crate::{
-    admin_runtime, ai, api, auth, config::AppConfig, jobs, observability, runtime, state, sync,
-    translations, version, webhook_push,
+    admin_ai_records, admin_runtime, ai, api, auth, config::AppConfig, jobs, observability,
+    runtime, state, sync, translations, version, webhook_push,
 };
 
 const SESSION_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
@@ -346,6 +346,14 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(api::admin_get_llm_call_detail),
         )
         .route(
+            "/admin/jobs/ai-records/{record_kind}",
+            get(admin_ai_records::admin_list_collection_records),
+        )
+        .route(
+            "/admin/jobs/ai-records/{record_kind}/{record_id}",
+            get(admin_ai_records::admin_get_collection_record_detail),
+        )
+        .route(
             "/admin/jobs/translations/status",
             get(translations::admin_get_translation_status),
         )
@@ -356,6 +364,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route(
             "/admin/jobs/translations/requests",
             get(translations::admin_list_translation_requests),
+        )
+        .route(
+            "/admin/jobs/translations/attempt-events",
+            get(translations::admin_list_translation_attempt_events),
         )
         .route(
             "/admin/jobs/translations/requests/{request_id}",

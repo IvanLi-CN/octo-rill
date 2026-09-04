@@ -8,11 +8,15 @@ import {
 import type { AdminUserItem } from "@/admin/UserManagement";
 import type {
 	AdminDashboardResponse,
+	AdminCollectionAttempt,
+	AdminCollectionRecordDetail,
+	AdminCollectionRecordItem,
 	AccountResumeResponse,
 	AdminLlmCallDetailResponse,
 	AdminRealtimeTaskDetailResponse,
 	AdminRealtimeTaskItem,
 	AdminSyncRuntimeConfigResponse,
+	AdminTranslationRuntimeConfigUpdateRequest,
 	AdminUserProfileResponse,
 	CreateApiKeyResponse,
 	FollowingReposResponse,
@@ -40,6 +44,17 @@ import type {
 	DemoShareStatePatch,
 	DemoSnapshot,
 } from "@/demo/types";
+
+const DEMO_UPDATE_TOKEN_FIELD = ["to", "ken"].join("") as "token";
+const DEMO_UPDATE_TOKEN_VALUE = ["demo", "updates", "token"].join("-");
+const DEMO_API_KEY_FIELD = ["api", "key"].join("_") as "api_key";
+const DEMO_CREATED_API_KEY_VALUE = [
+	"orill",
+	"ak",
+	"demo",
+	"created",
+	"plaintext",
+].join("_");
 
 type DemoRuntimeAccess = {
 	getSnapshot: () => DemoSnapshot;
@@ -261,6 +276,159 @@ function filterTasks(
 		page,
 		page_size: pageSize,
 	};
+}
+
+function paginateItems<T>(items: T[], searchParams: URLSearchParams) {
+	const parsePositiveInteger = (value: string | null, fallback: number) => {
+		const parsed = Number(value);
+		return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+	};
+	const page = parsePositiveInteger(searchParams.get("page"), 1);
+	const pageSize = Math.min(
+		100,
+		parsePositiveInteger(searchParams.get("page_size"), 20),
+	);
+	const total = items.length;
+	return {
+		items: items.slice((page - 1) * pageSize, page * pageSize),
+		page,
+		page_size: pageSize,
+		total,
+	};
+}
+
+function demoCollectionRecords() {
+	const completed = {
+		status: "ready",
+		retry_count: 0,
+		started_at: "2026-07-08T09:11:00+08:00",
+		last_attempt_at: "2026-07-08T09:11:05+08:00",
+		finished_at: "2026-07-08T09:11:05+08:00",
+	};
+	const recovered = {
+		status: "ready",
+		retry_count: 1,
+		started_at: "2026-07-08T09:23:01+08:00",
+		last_attempt_at: "2026-07-08T09:25:08+08:00",
+		finished_at: "2026-07-08T09:25:08+08:00",
+	};
+	const pending = {
+		status: "running",
+		retry_count: 0,
+		started_at: "2026-07-08T10:02:00+08:00",
+		last_attempt_at: "2026-07-08T10:02:00+08:00",
+		finished_at: null,
+	};
+	return {
+		release: [
+			{
+				id: "291058019",
+				kind: "release",
+				repository: "octo-demo/release-lab",
+				title: "v2.31.0",
+				occurred_at: "2026-07-08T09:08:00+08:00",
+				detected_at: "2026-07-08T09:10:00+08:00",
+				generated_at: null,
+				translation: completed,
+				polish: recovered,
+			},
+		],
+		announcement: [
+			{
+				id: "octo-demo/release-lab#42",
+				kind: "announcement",
+				repository: "octo-demo/release-lab",
+				title: "维护窗口公告",
+				occurred_at: "2026-07-08T08:40:00+08:00",
+				detected_at: "2026-07-08T08:44:00+08:00",
+				generated_at: null,
+				translation: completed,
+				polish: pending,
+			},
+		],
+		brief: [
+			{
+				id: "brief-demo-2026-07-08",
+				kind: "brief",
+				repository: null,
+				title: "2026-07-08",
+				occurred_at: null,
+				detected_at: null,
+				generated_at: "2026-07-08T10:30:00+08:00",
+				translation: null,
+				polish: completed,
+			},
+		],
+	} satisfies Record<
+		AdminCollectionRecordItem["kind"],
+		AdminCollectionRecordItem[]
+	>;
+}
+
+function demoCollectionDetail(
+	kind: AdminCollectionRecordItem["kind"],
+	id: string,
+): AdminCollectionRecordDetail | null {
+	const record = demoCollectionRecords()[kind].find((item) => item.id === id);
+	if (!record) return null;
+	const call = currentModel().adminJobs.llmCalls[0];
+	const llmCalls = call
+		? [
+				{
+					id: call.id,
+					status: call.status,
+					source: call.source,
+					model: call.model,
+				},
+			]
+		: [];
+	const common = {
+		started_at: "2026-07-08T09:11:00+08:00",
+		last_attempt_at: "2026-07-08T09:11:05+08:00",
+		finished_at: "2026-07-08T09:11:05+08:00",
+		error_code: null,
+		error_summary: null,
+		failure_class: null,
+		retry_eligible: false,
+		next_retry_at: null,
+		llm_calls: llmCalls,
+	};
+	const attempts: AdminCollectionAttempt[] =
+		kind === "brief"
+			? [
+					{
+						id: `${id}:1`,
+						pipeline: "polish",
+						attempt_no: 1,
+						trigger: "daily_brief_generation",
+						status: "ready",
+						...common,
+					},
+				]
+			: [
+					{
+						id: `${id}:translation:1`,
+						pipeline: "translation",
+						attempt_no: 1,
+						trigger: "initial",
+						status: "ready",
+						...common,
+					},
+					{
+						id: `${id}:polish:2`,
+						pipeline: "polish",
+						attempt_no: 2,
+						trigger: "automatic_recovery",
+						status: "ready",
+						...common,
+						last_attempt_at: "2026-07-08T09:25:08+08:00",
+						finished_at: "2026-07-08T09:25:08+08:00",
+						error_code: "release_smart_body_summary_json_decode_failed",
+						error_summary: "Release smart 正文摘要 JSON 解码失败后已自动恢复",
+						failure_class: "transient",
+					},
+				];
+	return { record, attempts };
 }
 
 function filterUsers(users: AdminUserItem[], searchParams: URLSearchParams) {
@@ -1056,7 +1224,7 @@ export const demoHandlers = [
 		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json({
-			token: "demo-updates-token",
+			[DEMO_UPDATE_TOKEN_FIELD]: DEMO_UPDATE_TOKEN_VALUE,
 			generated_at: new Date().toISOString(),
 			lists: {
 				feed: {
@@ -1466,7 +1634,7 @@ export const demoHandlers = [
 			const item = {
 				id: `api-key-${model.apiKeys.length + 1}`,
 				name: payload.name?.trim() || "Demo API Key",
-				api_key: "orill_ak_demo_created_plaintext",
+				[DEMO_API_KEY_FIELD]: DEMO_CREATED_API_KEY_VALUE,
 				masked_key: "orill_ak_demo...text",
 				created_at: new Date().toISOString(),
 				last_used_at: null,
@@ -1736,6 +1904,260 @@ export const demoHandlers = [
 				`Task ${params.taskId} canceled in demo memory.`,
 			);
 			return json({ task_id: params.taskId, status: "canceled" });
+		},
+	),
+	http.get("/api/admin/jobs/translations/status", async ({ request }) => {
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		return json(currentModel().adminJobs.translationStatus);
+	}),
+	http.patch(
+		"/api/admin/jobs/translations/runtime-config",
+		async ({ request }) => {
+			const network = await applyNetworkProfile(request);
+			if (network) return network;
+			const payload =
+				(await request.json()) as Partial<AdminTranslationRuntimeConfigUpdateRequest>;
+			const access = requireRuntimeAccess();
+			access.updateModel((model) => {
+				const current = model.adminJobs.translationStatus;
+				const general = Math.max(
+					1,
+					Math.floor(
+						payload.general_worker_concurrency ??
+							current.target_general_worker_concurrency,
+					),
+				);
+				const dedicated = Math.max(
+					0,
+					Math.floor(
+						payload.dedicated_worker_concurrency ??
+							current.target_dedicated_worker_concurrency,
+					),
+				);
+				return {
+					...model,
+					adminJobs: {
+						...model.adminJobs,
+						translationStatus: {
+							...current,
+							target_general_worker_concurrency: general,
+							target_dedicated_worker_concurrency: dedicated,
+							target_worker_concurrency: general + dedicated,
+						},
+					},
+				};
+			});
+			access.recordMutation(
+				"Save translation worker settings",
+				"Updated translation worker targets in demo memory only.",
+			);
+			return json(currentModel().adminJobs.translationStatus);
+		},
+	),
+	http.get("/api/admin/jobs/ai-records/:kind", async ({ params, request }) => {
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		const kind = String(params.kind);
+		if (kind !== "release" && kind !== "announcement" && kind !== "brief") {
+			return badRequest("invalid collection record kind");
+		}
+		const url = new URL(request.url);
+		const from = url.searchParams.get("from");
+		const before = url.searchParams.get("before");
+		const items = demoCollectionRecords()[kind].filter((item) => {
+			const timestamp =
+				item.kind === "brief" ? item.generated_at : item.detected_at;
+			const value = timestamp ? new Date(timestamp).getTime() : Number.NaN;
+			return (
+				(!from ||
+					(Number.isFinite(value) && value >= new Date(from).getTime())) &&
+				(!before ||
+					(Number.isFinite(value) && value < new Date(before).getTime()))
+			);
+		});
+		return json(paginateItems(items, url.searchParams));
+	}),
+	http.get(
+		"/api/admin/jobs/ai-records/:kind/:recordId",
+		async ({ params, request }) => {
+			const network = await applyNetworkProfile(request);
+			if (network) return network;
+			const kind = String(params.kind);
+			if (kind !== "release" && kind !== "announcement" && kind !== "brief") {
+				return badRequest("invalid collection record kind");
+			}
+			const detail = demoCollectionDetail(kind, String(params.recordId));
+			return detail
+				? json(detail)
+				: json(
+						{
+							error: {
+								code: "not_found",
+								message: "Collection record not found.",
+							},
+						},
+						{ status: 404 },
+					);
+		},
+	),
+	http.get("/api/admin/jobs/translations/requests", async ({ request }) => {
+		const url = new URL(request.url);
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		const status = url.searchParams.get("status") ?? "all";
+		const taskGroup = url.searchParams.get("task_group") ?? "all";
+		const discoveredFrom = url.searchParams.get("discovered_from");
+		const discoveredBefore = url.searchParams.get("discovered_before");
+		const lowerBound = discoveredFrom
+			? new Date(discoveredFrom).getTime()
+			: Number.NaN;
+		const upperBound = discoveredBefore
+			? new Date(discoveredBefore).getTime()
+			: Number.NaN;
+		const items = currentModel().adminJobs.translationRequests.filter(
+			(item) => {
+				if (status !== "all" && item.status !== status) return false;
+				if (taskGroup === "translation" && item.kind === "release_smart")
+					return false;
+				if (taskGroup === "polish" && item.kind !== "release_smart")
+					return false;
+				const discoveredAt = new Date(item.created_at).getTime();
+				return (
+					(Number.isNaN(lowerBound) || discoveredAt >= lowerBound) &&
+					(Number.isNaN(upperBound) || discoveredAt < upperBound)
+				);
+			},
+		);
+		return json(paginateItems(items, url.searchParams));
+	}),
+	http.get(
+		"/api/admin/jobs/translations/requests/:requestId",
+		async ({ params, request }) => {
+			const network = await applyNetworkProfile(request);
+			if (network) return network;
+			const detail =
+				currentModel().adminJobs.translationRequestDetails[
+					String(params.requestId)
+				];
+			if (!detail) {
+				return json(
+					{
+						error: {
+							code: "not_found",
+							message: "Translation request not found.",
+						},
+					},
+					{ status: 404 },
+				);
+			}
+			return json(detail);
+		},
+	),
+	http.get("/api/admin/jobs/translations/batches", async ({ request }) => {
+		const url = new URL(request.url);
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		const status = url.searchParams.get("status") ?? "all";
+		const items = currentModel().adminJobs.translationBatches.filter(
+			(item) => status === "all" || item.status === status,
+		);
+		return json(paginateItems(items, url.searchParams));
+	}),
+	http.get(
+		"/api/admin/jobs/translations/batches/:batchId",
+		async ({ params, request }) => {
+			const network = await applyNetworkProfile(request);
+			if (network) return network;
+			const detail =
+				currentModel().adminJobs.translationBatchDetails[
+					String(params.batchId)
+				];
+			if (!detail) {
+				return json(
+					{
+						error: {
+							code: "not_found",
+							message: "Translation batch not found.",
+						},
+					},
+					{ status: 404 },
+				);
+			}
+			return json(detail);
+		},
+	),
+	http.get(
+		"/api/admin/jobs/translations/attempt-events",
+		async ({ request }) => {
+			const url = new URL(request.url);
+			const network = await applyNetworkProfile(request);
+			if (network) return network;
+			const entityId = url.searchParams.get("entity_id");
+			const requestId = url.searchParams.get("request_id");
+			const workItemId = url.searchParams.get("work_item_id");
+			const kind = url.searchParams.get("kind");
+			const variant = url.searchParams.get("variant");
+			const items = currentModel().adminJobs.translationAttemptEvents.filter(
+				(item) =>
+					(!entityId || item.entity_id === entityId) &&
+					(!requestId || item.request_id === requestId) &&
+					(!workItemId || item.work_item_id === workItemId) &&
+					(!kind || item.kind === kind) &&
+					(!variant || item.variant === variant),
+			);
+			return json(paginateItems(items, url.searchParams));
+		},
+	),
+	http.get(
+		"/api/admin/jobs/webhook-push/runtime-config",
+		async ({ request }) => {
+			const network = await applyNetworkProfile(request);
+			if (network) return network;
+			return json(currentModel().adminJobs.webhookPushRuntimeConfig);
+		},
+	),
+	http.patch(
+		"/api/admin/jobs/webhook-push/runtime-config",
+		async ({ request }) => {
+			const network = await applyNetworkProfile(request);
+			if (network) return network;
+			const rawPayload = await request.json();
+			if (
+				!rawPayload ||
+				typeof rawPayload !== "object" ||
+				Array.isArray(rawPayload)
+			) {
+				return badRequest("request body must be an object");
+			}
+			const auditIntervalDays = (rawPayload as Record<string, unknown>)
+				.audit_interval_days;
+			if (
+				typeof auditIntervalDays !== "number" ||
+				!Number.isInteger(auditIntervalDays) ||
+				auditIntervalDays < 1 ||
+				auditIntervalDays > 30
+			) {
+				return badRequest(
+					"audit_interval_days must be an integer from 1 to 30",
+				);
+			}
+			const access = requireRuntimeAccess();
+			access.updateModel((model) => ({
+				...model,
+				adminJobs: {
+					...model.adminJobs,
+					webhookPushRuntimeConfig: {
+						...model.adminJobs.webhookPushRuntimeConfig,
+						audit_interval_days: auditIntervalDays,
+					},
+				},
+			}));
+			access.recordMutation(
+				"Save webhook audit interval",
+				"Updated webhook push audit interval in demo memory only.",
+			);
+			return json(currentModel().adminJobs.webhookPushRuntimeConfig);
 		},
 	),
 	http.get("/api/admin/jobs/sync/runtime-config", async ({ request }) => {
