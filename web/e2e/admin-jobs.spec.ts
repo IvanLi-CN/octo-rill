@@ -2563,6 +2563,16 @@ test("content processing audit shows retry state, model, error, and call detail"
 	await expect(
 		recordsTable.getByText("v2.31.0", { exact: true }),
 	).toBeVisible();
+	const recordTypeTabs = page
+		.getByRole("tabpanel", { name: "内容处理" })
+		.getByRole("tablist");
+	const recordTypeTabDimensions = await recordTypeTabs.evaluate((element) => ({
+		width: element.getBoundingClientRect().width,
+		parentWidth: element.parentElement?.getBoundingClientRect().width ?? 0,
+	}));
+	expect(recordTypeTabDimensions.width).toBeLessThan(
+		recordTypeTabDimensions.parentWidth / 2,
+	);
 	expect(
 		await page.evaluate(
 			() => document.documentElement.scrollWidth <= window.innerWidth,
