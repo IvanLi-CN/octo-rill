@@ -186,6 +186,38 @@ workflow_cases = (
         "ci.yml: ci_performance_acceptance must default to false",
     ),
     (
+        "dispatch-target-input",
+        lambda text: text.replace("      ci_performance_target_sha:\n", "      ci_performance_target:\n", 1),
+        "ci.yml.on.workflow_dispatch.inputs.ci_performance_target_sha must be an object",
+    ),
+    (
+        "acceptance-run-name",
+        lambda text: text.replace(
+            "run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.ci_performance_acceptance && format('CI performance acceptance {0}', inputs.ci_performance_acceptance_nonce) || 'CI Pipeline' }}\n",
+            "run-name: CI Pipeline\n",
+            1,
+        ),
+        "ci.yml: controlled acceptance run-name drifted",
+    ),
+    (
+        "acceptance-checkout-ref",
+        lambda text: text.replace(
+            "          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ci_performance_acceptance && inputs.ci_performance_target_sha || github.sha }}\n",
+            "          ref: ${{ github.sha }}\n",
+            1,
+        ),
+        "ci.yml.jobs.lint: controlled checkout ref drifted",
+    ),
+    (
+        "acceptance-tooling-ref",
+        lambda text: text.replace(
+            "          ref: ${{ github.workflow_sha }}\n",
+            "          ref: main\n",
+            1,
+        ),
+        "ci.yml: acceptance tooling must bind github.workflow_sha",
+    ),
+    (
         "docker-load",
         lambda text: text.replace("          load: true\n", "", 1),
         "ci.yml: Docker smoke build must load the image",
@@ -208,6 +240,11 @@ workflow_cases = (
             1,
         ),
         "ci.yml: Playwright summary must run with always()",
+    ),
+    (
+        "e2e-historical-json",
+        lambda text: text.replace(" --reporter=list,json", "", 1),
+        "ci.yml: controlled E2E must force a JSON reporter for immutable historical targets",
     ),
     (
         "e2e-artifact-retention",
