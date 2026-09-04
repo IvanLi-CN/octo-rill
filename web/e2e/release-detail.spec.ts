@@ -45,6 +45,7 @@ type ApiOptions = {
 	autoTranslateResolveStatuses?: Record<string, "ready" | "missing" | "error">;
 	autoTranslateResolveFailureCount?: number;
 	autoTranslateResolveDelayMs?: number;
+	autoTranslateResolveGate?: Promise<void>;
 	autoTranslateAppendPageErrorIds?: string[];
 	autoTranslateAppendCursor?: string | null;
 	smartFeedCount?: number;
@@ -55,7 +56,9 @@ type ApiOptions = {
 	smartResolveStatuses?: Record<string, "ready" | "missing" | "error">;
 	smartResolveErrors?: Record<string, TranslationErrorPayload>;
 	smartResolveDelayMs?: number;
+	smartResolveGate?: Promise<void>;
 	releaseDetailPendingPolls?: number;
+	releaseDetailCompletionGate?: Promise<void>;
 	releaseDetailInitialStatus?: "ready" | "missing" | "error";
 	releaseDetailInitialError?: TranslationErrorPayload;
 	releaseDetailSmartInitialStatus?:
@@ -74,7 +77,21 @@ type MockApiTracker = {
 	}>;
 	translationBatchEntityIds: string[][];
 	translationSingleEntityIds: string[];
+	translationRequestStatusRequestIds: string[];
 };
+
+type PendingGate = {
+	wait: Promise<void>;
+	release: () => void;
+};
+
+function createPendingGate(): PendingGate {
+	let release = () => {};
+	const wait = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	return { wait, release };
+}
 
 type TranslationErrorPayload = {
 	error?: string | null;
@@ -467,6 +484,7 @@ async function installApiMocks(
 		translationResolveRequests: [],
 		translationBatchEntityIds: [],
 		translationSingleEntityIds: [],
+		translationRequestStatusRequestIds: [],
 	};
 
 	await page.route("**/api/**", async (route) => {
@@ -776,6 +794,11 @@ async function installApiMocks(
 				);
 			}
 			if (
+				cfg.smartResolveGate &&
+				items.some((item) => item.kind === "release_smart")
+			) {
+				await cfg.smartResolveGate;
+			} else if (
 				cfg.smartResolveDelayMs &&
 				items.some((item) => item.kind === "release_smart")
 			) {
@@ -784,6 +807,11 @@ async function installApiMocks(
 				);
 			}
 			if (
+				cfg.autoTranslateResolveGate &&
+				items.some((item) => item.kind === "release_summary")
+			) {
+				await cfg.autoTranslateResolveGate;
+			} else if (
 				cfg.autoTranslateResolveDelayMs &&
 				items.some((item) => item.kind === "release_summary")
 			) {
@@ -957,11 +985,19 @@ async function installApiMocks(
 			if (!requestId) {
 				return json(route, { error: { message: "missing request id" } }, 400);
 			}
+			tracker.translationRequestStatusRequestIds.push(requestId);
 			const polls = translationRequestPolls.get(requestId) ?? 0;
 			translationRequestPolls.set(requestId, polls + 1);
 			const isPendingReleaseDetail =
 				requestId === "req-release_detail-1" &&
 				polls < cfg.releaseDetailPendingPolls;
+			if (
+				requestId === "req-release_detail-1" &&
+				!isPendingReleaseDetail &&
+				cfg.releaseDetailCompletionGate
+			) {
+				await cfg.releaseDetailCompletionGate;
+			}
 			if (requestId.startsWith("req-feed-")) {
 				const releaseId = requestId.replace("req-feed-", "");
 				return json(route, {
@@ -1109,9 +1145,10 @@ test("detail dialog defaults to smart when smart content is ready", async ({
 test("detail smart loading keeps original content visible", async ({
 	page,
 }) => {
+	const smartResolveGate = createPendingGate();
 	await installApiMocks(page, {
 		releaseDetailSmartInitialStatus: "missing",
-		smartResolveDelayMs: 3000,
+		smartResolveGate: smartResolveGate.wait,
 	});
 
 	await page.goto("/?tab=briefs&release=123");
@@ -1123,6 +1160,11 @@ test("detail smart loading keeps original content visible", async ({
 		dialog.getByRole("heading", { name: "Release 123" }),
 	).toBeVisible();
 	await expect(dialog.getByText("fix A", { exact: true })).toBeVisible();
+	smartResolveGate.release();
+	await expect(dialog.getByRole("heading", { name: "润色 123" })).toBeVisible();
+	await expect(
+		dialog.getByText("润色 release 123 的主要版本变化。", { exact: true }),
+	).toBeVisible();
 });
 
 test("shared markdown compacts raw GitHub links and keeps long links wrapped", async ({
@@ -1187,17 +1229,41 @@ test("shared markdown compacts raw GitHub links and keeps long links wrapped", a
 test("detail translate keeps polling an in-flight request until the result is ready", async ({
 	page,
 }) => {
-	await installApiMocks(page, { releaseDetailPendingPolls: 2 });
+	const translationCompletionGate = createPendingGate();
+	const tracker = await installApiMocks(page, {
+		releaseDetailPendingPolls: 2,
+		releaseDetailCompletionGate: translationCompletionGate.wait,
+		releaseDetailSmartInitialStatus: "ready",
+	});
 
 	await page.goto("/?tab=briefs&release=123");
 	await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
 
-	await page.getByRole("tab", { name: "翻译" }).click();
+	const detailDialog = page.getByRole("dialog", { name: "Release 详情" });
+	await expect(detailDialog).toBeVisible();
+	await detailDialog.getByRole("tab", { name: "翻译" }).click();
 	await expect(
-		page.getByRole("heading", { name: "发布说明 123" }),
+		detailDialog.getByRole("tab", { name: "翻译中…", selected: true }),
+	).toBeVisible();
+	await expect
+		.poll(
+			() =>
+				tracker.translationRequestStatusRequestIds.filter(
+					(requestId) => requestId === "req-release_detail-1",
+				).length,
+		)
+		.toBeGreaterThanOrEqual(3);
+	await expect(
+		detailDialog.getByRole("heading", { name: "Release 123" }),
+	).toBeVisible();
+	translationCompletionGate.release();
+	await expect(
+		detailDialog.getByRole("heading", { name: "发布说明 123" }),
 	).toBeVisible();
 	await expect(
-		page.getByText("这是 release 123 的中文详情摘要。", { exact: true }),
+		detailDialog.getByText("这是 release 123 的中文详情摘要。", {
+			exact: true,
+		}),
 	).toBeVisible();
 	await expect(page.getByText("translation wait timeout")).toHaveCount(0);
 });
@@ -1987,6 +2053,7 @@ test("feed translated response body decode error auto retries on page load", asy
 	page,
 }) => {
 	const releaseId = makeAutoTranslateReleaseId(0);
+	const autoTranslateResolveGate = createPendingGate();
 	const tracker = await installApiMocks(page, {
 		withAutoTranslateFeed: true,
 		autoTranslateFeedCount: 1,
@@ -2001,7 +2068,7 @@ test("feed translated response body decode error auto retries on page load", asy
 		autoTranslateResolveStatuses: {
 			[releaseId]: "ready",
 		},
-		autoTranslateResolveDelayMs: 3000,
+		autoTranslateResolveGate: autoTranslateResolveGate.wait,
 	});
 
 	await page.goto("/?tab=releases");
@@ -2026,6 +2093,10 @@ test("feed translated response body decode error auto retries on page load", asy
 	).toBeVisible();
 	await expect(page.getByText("翻译失败", { exact: true })).toHaveCount(0);
 	await expect(page.getByRole("button", { name: "重试翻译" })).toHaveCount(0);
+	autoTranslateResolveGate.release();
+	await expect(
+		releaseCard.getByRole("heading", { name: `发布说明 ${releaseId}` }),
+	).toBeVisible();
 });
 
 test("feed smart non-retryable upstream error stays on the error panel", async ({

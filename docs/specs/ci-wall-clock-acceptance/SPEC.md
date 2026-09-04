@@ -3,7 +3,7 @@
 ## Context and Scope
 
 - Context: CI Pipeline 的发布构建曾在无数据依赖的测试之后等待，并重复执行宿主 Rust release 编译。
-- In scope: 发布构建的调度关系、Docker 发布物运行时 smoke、完整 Frontend E2E 的 CI worker/report 合同、以及可审计的受控 control/candidate 墙钟验收。
+- In scope: 发布构建的调度关系、Docker 发布物运行时 smoke、完整 Frontend E2E 的 CI worker/report 合同、现有翻译等待用例的确定性 fixture gate，以及可审计的受控 control/candidate 墙钟验收。
 - Out of scope: 应用 Rust/前端逻辑、Dockerfile、Playwright 测试选择或删减、按文件分片、持久化 Docker/Rust cache、GitHub 分支规则和真实部署凭据。
 
 ## Terms and Interfaces
@@ -13,7 +13,7 @@
 - `Frontend E2E job`: 保持 required-check 名称不变的完整 Chromium Playwright job；CI 固定使用两个 worker，并保留测试级 retries。
 - `Playwright result artifact`: 每次 Frontend E2E run 产生的 14 天 artifact，仅包含原始 JSON reporter 输出和确定性 JSON 摘要。
 - `control target SHA`: 受控验收开始前验证并冻结的基线不可变提交。
-- `candidate target SHA`: control 的受限严格后继；候选与 control 的差异只能落在本主题声明的 CI、报告/摘要、验收、合同测试和主题文档路径。
+- `candidate target SHA`: control 的受限严格后继；候选与 control 的差异只能落在本主题声明的 CI、报告/摘要、验收、确定性 E2E fixture、合同测试和主题文档路径。
 - `acceptance dispatcher`: 当前 `main` 上承载稳定验收工具的 workflow SHA；每个受控 run 以唯一 nonce 标识，并 checkout 指定 target SHA 运行 required jobs。
 - `Acceptance driver`: 通过 `gh api` 串行 dispatch、轮询和记录 control/candidate target runs 的 Python CLI。
 
@@ -39,7 +39,7 @@
 
 ### REQ-CI-WALLCLOCK-003
 
-- The acceptance driver MUST make performance claims only from two target SHAs whose immutable existence, strict control-to-candidate ancestry, allowed file delta, dispatcher SHA, nonce-correlated runs, run attempts, ordering, required jobs, Frontend E2E job timestamps, matching deterministic Playwright test identifier sets, and Playwright result artifacts are validated. The nonce is the unique run correlation authority; timestamp fields are retained as evidence, not used to reject a nonce-matched run because GitHub exposes them at second precision.
+- The acceptance driver MUST make performance claims only from two target SHAs whose immutable existence, strict control-to-candidate ancestry, allowed file delta (including only the declared deterministic E2E fixture path), dispatcher SHA, nonce-correlated runs, run attempts, ordering, required jobs, Frontend E2E job timestamps, matching deterministic Playwright test identifier sets, and Playwright result artifacts are validated. The nonce is the unique run correlation authority; timestamp fields are retained as evidence, not used to reject a nonce-matched run because GitHub exposes them at second precision.
 - Outputs: ten serial alternating control/candidate pairs are recorded as JSON; candidate passes only with ten successful Docker-smoke runs, Frontend E2E job nearest-rank P90 at most 420 seconds, zero final failed tests, candidate retry total no greater than control, and median at most 75% of control median.
 
 ### REQ-CI-WALLCLOCK-004
