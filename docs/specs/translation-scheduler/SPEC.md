@@ -19,7 +19,7 @@
 
 - REQ-SCHEDULER: 调度器必须把翻译请求、work item、批次和结果扇出保持为独立领域模型，生产者只提交需求而不拥有组批策略。
 - REQ-ATTEMPT-AUDIT: 每次初始执行、自动恢复、手动重试及其状态转换必须在同一事务追加元数据专用的尝试事件；已到期并重新入队时，当前尝试状态必须呈现为 `queued` 而非保留过期的重试安排；事件不得保存源文本、prompt、原始模型响应或原始上游错误。
-- REQ-COLLECTION-RECORDS: 管理端必须按 Release、公告、日报分组、分页并以最近 24 小时为默认时间范围展示采集记录；行数据必须包含该类型的基础区分信息、发现时间和翻译或润色任务摘要。
+- REQ-COLLECTION-RECORDS: 管理端必须按 Release、公告、日报分组、分页并以最近 24 小时为默认时间范围展示采集记录；筛选和排序使用各类型来源时间，历史空发现时间仍保留并显示为“未知”；行数据必须包含该类型的基础区分信息、发现时间和翻译或润色任务摘要，并支持在计数和分页前按记录级总尝试次数筛选。
 - REQ-RECORD-DETAIL: 桌面端必须在抽屉展示记录详情与尝试历史，移动端必须导航至详情路由；详情必须暴露模型、错误分类、重试信息和可用下钻链接。
 
 ## Verification
@@ -51,6 +51,7 @@
 ## Related ADRs
 
 - [ADR 0001: LLM Recovery Boundary](../../adr/0001-llm-recovery-boundary.md)
+- [ADR 0003: Collection Record Time and Attempt Filtering](../../adr/0003-collection-record-time-and-attempt-filtering.md)
 
 ## 接口契约（Interfaces & Contracts）
 
@@ -107,7 +108,11 @@
 
 - Given 管理员打开“内容处理”
   When 选择 Release、公告或日报并保留默认时间范围
-  Then 分页列表默认显示最近 24 小时内的该类采集记录；每行展示该类型需要区分记录的基础信息、发现时间，以及翻译或润色的重试次数、开始、上次尝试和完成时间。
+  Then 分页列表按 Release 来源时间 `COALESCE(published_at, created_at, updated_at)`、公告聚合 `occurred_at` 或日报 `created_at` 显示最近 24 小时内的该类采集记录；即使 `detected_at` 为空也不得遗漏，并将其显示为“未知”；每行展示该类型需要区分记录的基础信息、发现时间，以及翻译或润色的重试次数、开始、上次尝试和完成时间。
+
+- Given 管理员设置总尝试次数范围
+  When 范围为 `0..10` 的闭区间或省略上限
+  Then 服务端按适用处理链路的最大总尝试次数过滤记录；无任务或调用的记录为 `0` 次，范围在总数、排序和分页前生效，越界或上限小于下限返回 `400`。
 
 - Given 管理员打开一条采集记录详情
   When 在桌面端选择列表行或在移动端进入详情路由
