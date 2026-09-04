@@ -1245,6 +1245,9 @@ test("detail translate keeps polling an in-flight request until the result is re
 	await expect(
 		detailDialog.getByRole("tab", { name: "翻译中…", selected: true }),
 	).toBeVisible();
+	await expect(
+		detailDialog.getByRole("heading", { name: "Release 123" }),
+	).toBeVisible();
 	await expect
 		.poll(
 			() =>
@@ -1254,8 +1257,8 @@ test("detail translate keeps polling an in-flight request until the result is re
 		)
 		.toBeGreaterThanOrEqual(3);
 	await expect(
-		detailDialog.getByRole("heading", { name: "Release 123" }),
-	).toBeVisible();
+		detailDialog.getByRole("heading", { name: "发布说明 123" }),
+	).toHaveCount(0);
 	translationCompletionGate.release();
 	await expect(
 		detailDialog.getByRole("heading", { name: "发布说明 123" }),
@@ -1313,6 +1316,7 @@ test("detail retry failure stays visible after switching to the original text", 
 }) => {
 	await installApiMocks(page, {
 		releaseDetailInitialStatus: "error",
+		releaseDetailSmartInitialStatus: "ready",
 		releaseDetailInitialError: {
 			error: "release detail translation failed to preserve markdown structure",
 			error_code: "markdown_structure_mismatch",
