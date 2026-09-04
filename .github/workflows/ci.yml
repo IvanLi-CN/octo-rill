@@ -387,10 +387,33 @@ jobs:
           bunx playwright install --with-deps chromium
 
       - name: Run Playwright tests
+        id: playwright
         run: |
           set -euo pipefail
           cd web
           bun run e2e
+
+      - name: Summarize Playwright results
+        id: summary
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          cd web
+          bun ./scripts/summarize-playwright-results.ts \
+            test-results/playwright-results.json \
+            test-results/playwright-summary.json
+
+      - name: Upload Playwright results
+        if: ${{ always() }}
+        continue-on-error: ${{ steps.playwright.outcome == 'failure' || steps.summary.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-e2e-results
+          path: |
+            web/test-results/playwright-results.json
+            web/test-results/playwright-summary.json
+          if-no-files-found: error
+          retention-days: 14
 
   worktree-bootstrap:
     name: Worktree Bootstrap Smoke (${{ matrix.os }})

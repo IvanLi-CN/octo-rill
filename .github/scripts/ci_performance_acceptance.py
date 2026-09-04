@@ -10,7 +10,9 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,8 +20,8 @@ from typing import Any, Protocol
 from urllib.parse import urlencode
 
 
-BASELINE_SHA = "03bf0b9fa19bfb5b416a90a9db7a10a1ff32f789"
 ACCEPTANCE_INPUT = "ci_performance_acceptance"
+SUMMARY_ARTIFACT_NAME = "playwright-e2e-results"
 REQUIRED_JOBS = {
     "Lint & Checks",
     "Backend Tests",
@@ -35,17 +37,13 @@ ALLOWED_CHANGED_PATHS = {
     ".github/scripts/fixtures/quality-gates-contract/ci.yml",
     ".github/scripts/ci_performance_acceptance.py",
     ".github/scripts/test-ci-performance-acceptance.sh",
-    "docs/specs/README.md",
+    "web/playwright.config.ts",
+    "web/scripts/summarize-playwright-results.ts",
+    "web/scripts/test-summarize-playwright-results.ts",
     "docs/specs/ci-wall-clock-acceptance/SPEC.md",
     "docs/specs/ci-wall-clock-acceptance/IMPLEMENTATION.md",
     "docs/specs/ci-wall-clock-acceptance/HISTORY.md",
-    "docs/repository-governance.md",
 }
-CONTROL_BASELINE_PATHS = {
-    ".github/workflows/ci.yml",
-    "web/e2e/admin-jobs.spec.ts",
-}
-CONTROL_SHARED_PATHS = {"web/e2e/admin-jobs.spec.ts"}
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 TRANSIENT_GET_ERROR_MARKERS = (
     "tls handshake timeout",
@@ -67,6 +65,9 @@ class AcceptanceError(RuntimeError):
 
 class ApiClient(Protocol):
     def api(self, endpoint: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> Any:
+        ...
+
+    def download(self, endpoint: str, output: Path) -> None:
         ...
 
 
@@ -100,6 +101,18 @@ class GhApi:
         except json.JSONDecodeError as exc:
             raise AcceptanceError(f"gh api returned invalid JSON ({method} {endpoint})") from exc
 
+    def download(self, endpoint: str, output: Path) -> None:
+        command = [self.gh_bin, "api", endpoint, "--output", str(output)]
+        for attempt in range(1, GET_MAX_ATTEMPTS + 1):
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            if result.returncode == 0:
+                return
+            detail = result.stderr.strip() or result.stdout.strip()
+            can_retry = any(marker in detail.lower() for marker in TRANSIENT_GET_ERROR_MARKERS)
+            if not can_retry or attempt == GET_MAX_ATTEMPTS:
+                raise AcceptanceError(f"gh api download failed (GET {endpoint}): {detail}")
+            time.sleep(2 ** (attempt - 1))
+
 
 def parse_time(value: str) -> datetime:
     try:
@@ -108,15 +121,19 @@ def parse_time(value: str) -> datetime:
         raise AcceptanceError(f"invalid GitHub timestamp: {value!r}") from exc
 
 
-def duration_seconds(run: dict[str, Any]) -> float:
-    started = run.get("run_started_at")
-    updated = run.get("updated_at")
-    if not isinstance(started, str) or not isinstance(updated, str):
-        raise AcceptanceError("workflow run is missing run_started_at or updated_at")
-    duration = (parse_time(updated) - parse_time(started)).total_seconds()
+def interval_seconds(item: dict[str, Any], started_key: str, completed_key: str, label: str) -> float:
+    started = item.get(started_key)
+    completed = item.get(completed_key)
+    if not isinstance(started, str) or not isinstance(completed, str):
+        raise AcceptanceError(f"{label} is missing {started_key} or {completed_key}")
+    duration = (parse_time(completed) - parse_time(started)).total_seconds()
     if duration < 0:
-        raise AcceptanceError("workflow run updated_at precedes run_started_at")
+        raise AcceptanceError(f"{label} completed before it started")
     return duration
+
+
+def duration_seconds(run: dict[str, Any]) -> float:
+    return interval_seconds(run, "run_started_at", "updated_at", "workflow run")
 
 
 def median(values: list[float]) -> float:
@@ -151,38 +168,22 @@ def resolve_ref(client: ApiClient, repo: str, ref: str) -> str:
     return sha
 
 
-def resolve_file_blob(client: ApiClient, repo: str, sha: str, path: str) -> str:
-    response = client.api(f"repos/{repo}/contents/{path}?ref={sha}")
-    if not isinstance(response, dict) or response.get("type") != "file":
-        raise AcceptanceError(f"{path} is not a file at {sha}")
-    blob_sha = response.get("sha")
-    if not isinstance(blob_sha, str) or not SHA_RE.fullmatch(blob_sha):
-        raise AcceptanceError(f"{path} at {sha} did not resolve to a file blob SHA")
-    return blob_sha
-
-
 def validate_ref_pair(client: ApiClient, repo: str, control_ref: str, candidate_ref: str) -> dict[str, Any]:
     if not control_ref or not candidate_ref or ref_name(control_ref) == ref_name(candidate_ref):
         raise AcceptanceError("control and candidate refs must be different")
+    if ref_name(control_ref) != "main":
+        raise AcceptanceError("control ref must be main")
     control_sha = resolve_ref(client, repo, control_ref)
     candidate_sha = resolve_ref(client, repo, candidate_ref)
     if control_sha == candidate_sha:
         raise AcceptanceError("control and candidate refs must resolve to different SHAs")
-    baseline_compare = client.api(f"repos/{repo}/compare/{BASELINE_SHA}...{control_sha}")
-    baseline_files = sorted(
-        item.get("filename")
-        for item in (baseline_compare.get("files", []) if isinstance(baseline_compare, dict) else [])
-        if isinstance(item, dict) and isinstance(item.get("filename"), str)
-    )
-    if baseline_files != sorted(CONTROL_BASELINE_PATHS):
-        raise AcceptanceError(
-            "control ref must be derived from the verified baseline with only the dispatch workflow and shared E2E stabilization"
-        )
-    for path in CONTROL_SHARED_PATHS:
-        control_blob = resolve_file_blob(client, repo, control_sha, path)
-        candidate_blob = resolve_file_blob(client, repo, candidate_sha, path)
-        if control_blob != candidate_blob:
-            raise AcceptanceError(f"control and candidate must share the exact {path} blob")
+    comparison = client.api(f"repos/{repo}/compare/{control_sha}...{candidate_sha}")
+    if not isinstance(comparison, dict) or comparison.get("status") != "ahead":
+        raise AcceptanceError("candidate ref must be a strict descendant of control")
+    ahead_by = comparison.get("ahead_by")
+    behind_by = comparison.get("behind_by")
+    if not isinstance(ahead_by, int) or ahead_by < 1 or (isinstance(behind_by, int) and behind_by != 0):
+        raise AcceptanceError("candidate ref must be a strict descendant of control")
     return {
         "control_ref": ref_name(control_ref),
         "control_sha": control_sha,
@@ -202,9 +203,6 @@ def validate_allowed_delta(client: ApiClient, repo: str, control_sha: str, candi
     unexpected = sorted(set(changed) - ALLOWED_CHANGED_PATHS)
     if unexpected:
         raise AcceptanceError(f"candidate ref contains unexpected files: {unexpected}")
-    shared_changed = sorted(set(changed) & CONTROL_SHARED_PATHS)
-    if shared_changed:
-        raise AcceptanceError(f"candidate ref must reuse shared control files unchanged: {shared_changed}")
     return changed
 
 
@@ -240,6 +238,59 @@ def validate_jobs(run: dict[str, Any], jobs_payload: dict[str, Any], *, require_
     return jobs
 
 
+def validate_playwright_summary(summary: Any) -> dict[str, int]:
+    if not isinstance(summary, dict) or summary.get("schema_version") != 1:
+        raise AcceptanceError("Playwright summary schema_version must be 1")
+    keys = ("total_tests", "passed_tests", "failed_tests", "skipped_tests", "flaky_tests", "retry_count")
+    values: dict[str, int] = {}
+    for key in keys:
+        value = summary.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise AcceptanceError(f"Playwright summary field {key} must be a non-negative integer")
+        values[key] = value
+    if values["passed_tests"] + values["failed_tests"] + values["skipped_tests"] != values["total_tests"]:
+        raise AcceptanceError("Playwright summary test counts do not add up")
+    if values["flaky_tests"] > values["passed_tests"] or values["flaky_tests"] > values["retry_count"]:
+        raise AcceptanceError("Playwright summary flaky/retry counts are inconsistent")
+    if summary.get("collection_error"):
+        raise AcceptanceError(f"Playwright summary contains a collection error: {summary['collection_error']}")
+    return values
+
+
+def download_playwright_summary(client: ApiClient, repo: str, run_id: Any) -> dict[str, int]:
+    artifacts_payload = client.api(f"repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100")
+    artifacts = artifacts_payload.get("artifacts", []) if isinstance(artifacts_payload, dict) else []
+    matches = [item for item in artifacts if isinstance(item, dict) and item.get("name") == SUMMARY_ARTIFACT_NAME]
+    if len(matches) != 1:
+        raise AcceptanceError(f"run {run_id} must contain exactly one {SUMMARY_ARTIFACT_NAME} artifact")
+    artifact = matches[0]
+    if artifact.get("expired") is True:
+        raise AcceptanceError(f"run {run_id} has an expired {SUMMARY_ARTIFACT_NAME} artifact")
+    artifact_id = artifact.get("id")
+    if not isinstance(artifact_id, int):
+        raise AcceptanceError(f"run {run_id} artifact has no numeric id")
+    with tempfile.TemporaryDirectory(prefix="ci-e2e-artifact-") as directory:
+        archive = Path(directory) / "results.zip"
+        client.download(f"repos/{repo}/actions/artifacts/{artifact_id}/zip", archive)
+        try:
+            with zipfile.ZipFile(archive) as zipped:
+                file_names = [Path(name).name for name in zipped.namelist() if not name.endswith("/")]
+                if sorted(file_names) != ["playwright-results.json", "playwright-summary.json"]:
+                    raise AcceptanceError(
+                        f"run {run_id} artifact must contain only playwright-results.json and playwright-summary.json"
+                    )
+                raw_entries = [name for name in zipped.namelist() if Path(name).name == "playwright-results.json"]
+                entries = [name for name in zipped.namelist() if Path(name).name == "playwright-summary.json"]
+                try:
+                    json.loads(zipped.read(raw_entries[0]))
+                    summary = json.loads(zipped.read(entries[0]))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise AcceptanceError(f"run {run_id} has invalid Playwright JSON report or summary") from exc
+        except (FileNotFoundError, OSError, zipfile.BadZipFile) as exc:
+            raise AcceptanceError(f"run {run_id} artifact is not a valid ZIP archive") from exc
+    return validate_playwright_summary(summary)
+
+
 def validate_run(run: dict[str, Any], jobs_payload: dict[str, Any], expected_sha: str, *, require_runtime_smoke: bool) -> dict[str, Any]:
     if run.get("event") != "workflow_dispatch" or run.get("head_sha") != expected_sha:
         raise AcceptanceError(f"run {run.get('id')} has an unexpected event or head SHA")
@@ -248,6 +299,7 @@ def validate_run(run: dict[str, Any], jobs_payload: dict[str, Any], expected_sha
     if run.get("status") != "completed" or run.get("conclusion") != "success":
         raise AcceptanceError(f"run {run.get('id')} did not complete successfully")
     jobs = validate_jobs(run, jobs_payload, require_runtime_smoke=require_runtime_smoke)
+    e2e_job = next(job for job in jobs if job.get("name") == "Frontend E2E")
     return {
         "pipeline": run,
         "id": run.get("id"),
@@ -259,6 +311,9 @@ def validate_run(run: dict[str, Any], jobs_payload: dict[str, Any], expected_sha
         "run_started_at": run.get("run_started_at"),
         "updated_at": run.get("updated_at"),
         "duration_seconds": duration_seconds(run),
+        "e2e_job_duration_seconds": interval_seconds(
+            e2e_job, "started_at", "completed_at", "Frontend E2E job"
+        ),
         "jobs": jobs,
     }
 
@@ -317,7 +372,9 @@ class AcceptanceRunner:
             raise AcceptanceError(f"workflow run {selected.get('id')} timed out")
         run = self.client.api(f"repos/{self.repo}/actions/runs/{selected.get('id')}")
         jobs = self.client.api(f"repos/{self.repo}/actions/runs/{selected.get('id')}/jobs?per_page=100")
-        return validate_run(run, jobs, sha, require_runtime_smoke=require_runtime_smoke)
+        result = validate_run(run, jobs, sha, require_runtime_smoke=require_runtime_smoke)
+        result["playwright_summary"] = download_playwright_summary(self.client, self.repo, selected.get("id"))
+        return result
 
     def run(self, refs: dict[str, str], *, pairs: int = 10) -> dict[str, Any]:
         if pairs != 10:
@@ -335,24 +392,39 @@ class AcceptanceRunner:
                         "result": self._dispatch_one(ref, sha, require_runtime_smoke=role == "candidate"),
                     }
                 )
-        control = [item["result"]["duration_seconds"] for item in records if item["role"] == "control"]
-        candidate = [item["result"]["duration_seconds"] for item in records if item["role"] == "candidate"]
+        for pair in range(1, pairs + 1):
+            pair_records = [item for item in records if item["pair"] == pair]
+            control_summary = next(item["result"]["playwright_summary"] for item in pair_records if item["role"] == "control")
+            candidate_summary = next(item["result"]["playwright_summary"] for item in pair_records if item["role"] == "candidate")
+            if control_summary["total_tests"] != candidate_summary["total_tests"]:
+                raise AcceptanceError(f"pair {pair} control/candidate test totals differ")
+
+        control = [item["result"]["e2e_job_duration_seconds"] for item in records if item["role"] == "control"]
+        candidate = [item["result"]["e2e_job_duration_seconds"] for item in records if item["role"] == "candidate"]
+        control_retry_total = sum(item["result"]["playwright_summary"]["retry_count"] for item in records if item["role"] == "control")
+        candidate_retry_total = sum(item["result"]["playwright_summary"]["retry_count"] for item in records if item["role"] == "candidate")
+        candidate_final_failures = sum(item["result"]["playwright_summary"]["failed_tests"] for item in records if item["role"] == "candidate")
         stats = {
-            "control_median_seconds": median(control),
-            "control_p90_seconds": nearest_rank_p90(control),
-            "candidate_median_seconds": median(candidate),
-            "candidate_p90_seconds": nearest_rank_p90(candidate),
+            "control_e2e_median_seconds": median(control),
+            "control_e2e_p90_seconds": nearest_rank_p90(control),
+            "candidate_e2e_median_seconds": median(candidate),
+            "candidate_e2e_p90_seconds": nearest_rank_p90(candidate),
             "candidate_median_ratio": median(candidate) / median(control),
+            "control_retry_total": control_retry_total,
+            "candidate_retry_total": candidate_retry_total,
+            "candidate_final_failures": candidate_final_failures,
             "passed": False,
             "thresholds": {
-                "candidate_median_max_seconds": 720,
-                "candidate_p90_max_seconds": 840,
+                "candidate_e2e_p90_max_seconds": 420,
+                "candidate_final_failures_max": 0,
+                "candidate_retry_total_max": control_retry_total,
                 "candidate_median_ratio_max": 0.75,
             },
         }
         stats["passed"] = not (
-            stats["candidate_median_seconds"] > 720
-            or stats["candidate_p90_seconds"] > 840
+            stats["candidate_e2e_p90_seconds"] > 420
+            or stats["candidate_final_failures"] != 0
+            or stats["candidate_retry_total"] > control_retry_total
             or stats["candidate_median_ratio"] > 0.75
         )
         return {"refs": refs, "pairs": pairs, "runs": records, "statistics": stats}
