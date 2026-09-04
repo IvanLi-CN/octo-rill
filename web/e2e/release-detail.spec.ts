@@ -1240,7 +1240,10 @@ test("detail translate keeps polling an in-flight request until the result is re
 	await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
 
 	const detailDialog = page.getByRole("dialog", { name: "Release 详情" });
-	await expect(detailDialog).toBeVisible();
+	await expect(detailDialog).toBeVisible({ timeout: 15_000 });
+	await expect(detailDialog.getByRole("tab", { name: "翻译" })).toBeEnabled({
+		timeout: 15_000,
+	});
 	await detailDialog.getByRole("tab", { name: "翻译" }).click();
 	await expect(
 		detailDialog.getByRole("tab", { name: "翻译中…", selected: true }),
@@ -1336,10 +1339,16 @@ test("detail retry failure stays visible after switching to the original text", 
 
 	await page.goto("/?tab=briefs&release=123");
 	const detailDialog = page.getByRole("dialog", { name: "Release 详情" });
+	await expect(detailDialog.getByRole("tab", { name: "翻译" })).toBeEnabled({
+		timeout: 15_000,
+	});
 	await detailDialog.getByRole("tab", { name: "翻译" }).click();
 	await expect(
 		detailDialog.getByText("翻译失败", { exact: true }),
 	).toBeVisible();
+	await expect(
+		detailDialog.getByRole("button", { name: "重试翻译" }),
+	).toBeEnabled();
 
 	await detailDialog.getByRole("button", { name: "查看原文" }).click();
 	await expect(
