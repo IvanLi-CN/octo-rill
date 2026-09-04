@@ -3,7 +3,8 @@ export type AdminJobsPrimaryTab =
 	| "scheduled"
 	| "subscriptions"
 	| "llm"
-	| "translations";
+	| "translations"
+	| "ai_records";
 
 export type TranslationViewTab = "queue" | "history";
 
@@ -40,11 +41,20 @@ export type AdminJobsSearchInput = {
 	llm_time_field?: string;
 	llm_time_from?: string;
 	llm_time_to?: string;
+	ai_attempt?: string;
+	ai_llm?: string;
 };
 
 export type TaskDrawerRoute = {
 	taskId: string;
 	llmCallId: string | null;
+};
+
+export type AiRecordDetailRoute = {
+	kind: "release" | "announcement" | "brief";
+	id: string;
+	attemptId?: string | null;
+	llmCallId?: string | null;
 };
 
 export type AdminJobsRouteState = {
@@ -54,6 +64,7 @@ export type AdminJobsRouteState = {
 	drawerFromTab: AdminJobsPrimaryTab | null;
 	subscriptionDetailTaskId?: string | null;
 	llmCallFilters?: LlmCallRouteFilters;
+	aiRecordDetailRoute?: AiRecordDetailRoute | null;
 };
 
 export const ADMIN_JOBS_BASE_PATH = "/admin/jobs";
@@ -61,6 +72,7 @@ export const ADMIN_JOBS_SCHEDULED_PATH = `${ADMIN_JOBS_BASE_PATH}/scheduled`;
 export const ADMIN_JOBS_SUBSCRIPTIONS_PATH = `${ADMIN_JOBS_BASE_PATH}/subscriptions`;
 export const ADMIN_JOBS_LLM_PATH = `${ADMIN_JOBS_BASE_PATH}/llm`;
 export const ADMIN_JOBS_TRANSLATIONS_PATH = `${ADMIN_JOBS_BASE_PATH}/translations`;
+export const ADMIN_JOBS_AI_RECORDS_PATH = `${ADMIN_JOBS_BASE_PATH}/ai-records`;
 export const ADMIN_SUBSCRIPTION_SETTINGS_AUTO_OPEN_SESSION_KEY =
 	"admin.jobs.subscription-settings.auto-open";
 
@@ -78,11 +90,15 @@ const ADMIN_JOBS_ROUTE_QUERY_KEYS = [
 	"llm_time_field",
 	"llm_time_from",
 	"llm_time_to",
+	"ai_attempt",
+	"ai_llm",
 ] as const;
 const TASK_DRAWER_ROUTE_PATTERN =
 	/^\/admin\/jobs\/tasks\/([^/]+?)(?:\/llm\/([^/]+))?$/;
 const SUBSCRIPTION_DETAIL_ROUTE_PATTERN =
 	/^\/admin\/jobs\/subscriptions\/([^/]+?)$/;
+const AI_RECORD_DETAIL_ROUTE_PATTERN =
+	/^\/admin\/jobs\/ai-records\/(release|announcement|brief)\/([^/]+?)$/;
 
 function normalizePathname(pathname: string) {
 	return pathname.replace(/\/+$/, "") || "/";
@@ -96,7 +112,8 @@ function isPrimaryTab(
 		value === "scheduled" ||
 		value === "subscriptions" ||
 		value === "llm" ||
-		value === "translations"
+		value === "translations" ||
+		value === "ai_records"
 	);
 }
 
@@ -197,8 +214,37 @@ export function buildAdminJobsBasePath(primaryTab: AdminJobsPrimaryTab) {
 			return ADMIN_JOBS_LLM_PATH;
 		case "translations":
 			return ADMIN_JOBS_TRANSLATIONS_PATH;
+		case "ai_records":
+			return ADMIN_JOBS_AI_RECORDS_PATH;
 		default:
 			return ADMIN_JOBS_BASE_PATH;
+	}
+}
+
+export function buildAiRecordDetailPath(
+	kind: AiRecordDetailRoute["kind"],
+	id: string,
+) {
+	return `${ADMIN_JOBS_AI_RECORDS_PATH}/${kind}/${encodeURIComponent(id)}`;
+}
+
+function parseAiRecordDetailRoute(
+	pathname: string,
+	searchParams: URLSearchParams,
+): AiRecordDetailRoute | null {
+	const matched = normalizePathname(pathname).match(
+		AI_RECORD_DETAIL_ROUTE_PATTERN,
+	);
+	if (!matched) return null;
+	try {
+		return {
+			kind: matched[1] as AiRecordDetailRoute["kind"],
+			id: decodeURIComponent(matched[2] ?? ""),
+			attemptId: searchParams.get("ai_attempt") || null,
+			llmCallId: searchParams.get("ai_llm") || null,
+		};
+	} catch {
+		return null;
 	}
 }
 
@@ -246,6 +292,7 @@ export function parseAdminJobsRoute(
 		? rawDrawerFromTab
 		: null;
 	const taskDrawerRoute = parseTaskDrawerRoute(pathname);
+	const aiRecordDetailRoute = parseAiRecordDetailRoute(pathname, searchParams);
 
 	if (taskDrawerRoute) {
 		return {
@@ -255,6 +302,17 @@ export function parseAdminJobsRoute(
 			drawerFromTab,
 			subscriptionDetailTaskId: null,
 			llmCallFilters,
+		};
+	}
+	if (aiRecordDetailRoute) {
+		return {
+			primaryTab: "ai_records",
+			translationView,
+			taskDrawerRoute: null,
+			drawerFromTab: null,
+			subscriptionDetailTaskId: null,
+			llmCallFilters,
+			aiRecordDetailRoute,
 		};
 	}
 
@@ -284,6 +342,8 @@ export function parseAdminJobsRoute(
 		primaryTab = "llm";
 	} else if (normalizedPath === ADMIN_JOBS_TRANSLATIONS_PATH) {
 		primaryTab = "translations";
+	} else if (normalizedPath === ADMIN_JOBS_AI_RECORDS_PATH) {
+		primaryTab = "ai_records";
 	}
 
 	return {
@@ -293,6 +353,7 @@ export function parseAdminJobsRoute(
 		drawerFromTab: null,
 		subscriptionDetailTaskId: null,
 		llmCallFilters,
+		aiRecordDetailRoute: null,
 	};
 }
 
@@ -301,16 +362,21 @@ export function buildAdminJobsRouteUrl(
 	currentSearch = "",
 ) {
 	const searchParams = new URLSearchParams(currentSearch);
-	const pathname = route.subscriptionDetailTaskId
-		? `${ADMIN_JOBS_SUBSCRIPTIONS_PATH}/${encodeURIComponent(
-				route.subscriptionDetailTaskId,
-			)}`
-		: route.taskDrawerRoute
-			? buildTaskDrawerPath(
-					route.taskDrawerRoute.taskId,
-					route.taskDrawerRoute.llmCallId,
-				)
-			: buildAdminJobsBasePath(route.primaryTab);
+	const pathname = route.aiRecordDetailRoute
+		? buildAiRecordDetailPath(
+				route.aiRecordDetailRoute.kind,
+				route.aiRecordDetailRoute.id,
+			)
+		: route.subscriptionDetailTaskId
+			? `${ADMIN_JOBS_SUBSCRIPTIONS_PATH}/${encodeURIComponent(
+					route.subscriptionDetailTaskId,
+				)}`
+			: route.taskDrawerRoute
+				? buildTaskDrawerPath(
+						route.taskDrawerRoute.taskId,
+						route.taskDrawerRoute.llmCallId,
+					)
+				: buildAdminJobsBasePath(route.primaryTab);
 
 	for (const key of ADMIN_JOBS_ROUTE_QUERY_KEYS) {
 		searchParams.delete(key);
@@ -332,6 +398,13 @@ export function buildAdminJobsRouteUrl(
 		for (const [key, value] of Object.entries(filters)) {
 			if (value) searchParams.set(key, value);
 		}
+	} else if (route.aiRecordDetailRoute) {
+		if (route.aiRecordDetailRoute.attemptId) {
+			searchParams.set("ai_attempt", route.aiRecordDetailRoute.attemptId);
+		}
+		if (route.aiRecordDetailRoute.llmCallId) {
+			searchParams.set("ai_llm", route.aiRecordDetailRoute.llmCallId);
+		}
 	}
 
 	const query = searchParams.toString();
@@ -344,6 +417,10 @@ export function buildAdminJobsRouteState(input: {
 	taskId?: string;
 	llmCallId?: string;
 	subscriptionDetailTaskId?: string;
+	aiRecordKind?: AiRecordDetailRoute["kind"];
+	aiRecordId?: string;
+	aiRecordAttemptId?: string;
+	aiRecordLlmCallId?: string;
 }): AdminJobsRouteState {
 	const translationView = parseTranslationView(input.search.view);
 	const drawerFromTab = isPrimaryTab(input.search.from)
@@ -362,6 +439,22 @@ export function buildAdminJobsRouteState(input: {
 			drawerFromTab,
 			subscriptionDetailTaskId: null,
 			llmCallFilters,
+		};
+	}
+	if (input.aiRecordKind && input.aiRecordId) {
+		return {
+			primaryTab: "ai_records",
+			translationView,
+			taskDrawerRoute: null,
+			drawerFromTab: null,
+			subscriptionDetailTaskId: null,
+			llmCallFilters,
+			aiRecordDetailRoute: {
+				kind: input.aiRecordKind,
+				id: input.aiRecordId,
+				attemptId: input.aiRecordAttemptId ?? null,
+				llmCallId: input.aiRecordLlmCallId ?? null,
+			},
 		};
 	}
 
@@ -417,5 +510,8 @@ export function validateAdminJobsSearch(search: Record<string, unknown>) {
 				: undefined,
 		llm_time_to:
 			typeof search.llm_time_to === "string" ? search.llm_time_to : undefined,
+		ai_attempt:
+			typeof search.ai_attempt === "string" ? search.ai_attempt : undefined,
+		ai_llm: typeof search.ai_llm === "string" ? search.ai_llm : undefined,
 	};
 }

@@ -5,8 +5,8 @@
 - Lifecycle: active
 - Implementation: 已交付
 - Created: 2026-03-07
-- Last: 2026-06-25
-- Summary: 已交付；PR #38 baseline plus follow-up contract sync for single-request wait snapshots and retryable release-detail requeue
+- Last: 2026-09-04
+- Summary: 已交付；统一调度器、追加式尝试审计与“内容处理”采集记录管理界面均已落地
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -19,6 +19,16 @@
 - `translation_batches` 与关联 `llm_calls` 现在持有运行期 lease；服务启动前先回收孤儿 `running` 记录，运行中按固定心跳/过期阈值做 sweep，避免请求、work item、batch、LLM 调用卡死在 `running`。
 - Release Detail `wait` 调用现在严格尊重 `max_wait_ms` 合同：预算耗尽即返回当前 request 单结果快照，前端命中 `queued/running` 后转入后台轮询，不再额外同步阻塞 20s。
 - Release Detail 批次内若遇到 retryable upstream `429` / rate-limit / plan exhaustion，批次 finalize 会把 request、work item 与 `ai_translations` 状态统一复位回 `queued`，避免把暂时性上游拥塞沉成 owner-facing 终态失败。
+- `translation_attempt_events` 已为结构化调度路径提供追加式尝试审计；管理员可按发布记录查看首次、自动恢复与手动重试的入队、开始、完成和重试安排，并下钻关联 request、batch 与 LLM 调用。重试安排归属到实际失败的尝试；已到期并重新入队的旧事件会呈现为“排队中”，不会残留过期的下次重试时间。该表长期只保留元数据与安全错误摘要，不存源文本、prompt 或模型原始响应。审计相关 schema 使用 `0070` 至 `0072`，紧随内容阅读分区的 `0069` 迁移，保证全新 SQLite 数据库可顺序应用。
+- “内容处理”按 Release、公告、日报分组展示站点采集记录，默认范围为最近 24 小时。记录类型切换在桌面端保持紧凑的内容宽度，在移动端保持整行触达面积。桌面端选择记录行后在抽屉查看尝试历史；移动端保留独立详情路由，避免用桌面交互替代移动端流程。
+- 管理端 E2E 回归把“排队中”限定为自动恢复后对应的尝试记录，验证列表直接显示模型和安全错误摘要，并可继续下钻至模型调用详情；慢速刷新 mock 使用显式等待预算，仍要求旧模型调用在加载期间保持可见。
+- Demo fixture 对密钥和令牌字段只生成占位值，不保留凭据形态的字面量；这样隔离测试箱的凭据过滤不会剔除运行时模块，浏览器回归始终覆盖提交快照。
+
+## Visual Evidence
+
+![内容处理记录列表](./assets/content-processing-records.jpg)
+![内容处理记录详情](./assets/content-processing-record-detail.jpg)
+![内容处理移动端详情](./assets/content-processing-mobile-detail.jpg)
 
 ## 实现里程碑（Milestones / Delivery checklist）
 

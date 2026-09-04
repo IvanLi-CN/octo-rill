@@ -113,8 +113,49 @@ Returns request status, timing, and the single `result` attached to the given re
 - `GET /api/admin/jobs/translations/requests/{request_id}`
 - `GET /api/admin/jobs/translations/batches`
 - `GET /api/admin/jobs/translations/batches/{batch_id}`
+- `GET /api/admin/jobs/translations/attempt-events?entity_id={entity_id}&kind={kind?}&variant={variant?}&page={page?}&page_size={page_size?}`
+- `GET /api/admin/jobs/ai-records/{record_kind}?from={RFC3339?}&before={RFC3339?}&page={page?}&page_size={page_size?}`
+- `GET /api/admin/jobs/ai-records/{record_kind}/{record_id}`
 
-Admin views expose scheduler runtime status, request aggregates, batch aggregates, trigger reason, token estimate, fan-out counts, and linked `llm_call` ids.
+`attempt-events` requires an `entity_id`, is admin-only, and returns the matching event history in chronological order. `kind` and `variant` are optional narrowing filters. The response is paginated and has the following shape:
+
+```json
+{
+  "items": [
+    {
+      "id": 42,
+      "work_item_id": "work_xxx",
+      "request_id": "req_xxx",
+      "batch_id": "batch_xxx",
+      "scope_user_id": "user_xxx",
+      "kind": "release_detail",
+      "variant": "feed_body",
+      "entity_id": "294043551",
+      "target_lang": "zh-CN",
+      "attempt_no": 2,
+      "trigger": "automatic_recovery",
+      "event_type": "attempt_queued",
+      "result_status": null,
+      "error_code": null,
+      "error_summary": null,
+      "failure_class": null,
+      "retry_eligible": false,
+      "next_retry_at": null,
+      "llm_call_ids": [],
+      "created_at": "2026-04-15T03:25:00Z"
+    }
+  ],
+  "page": 1,
+  "page_size": 20,
+  "total": 1
+}
+```
+
+`trigger` is one of `initial | manual_retry | automatic_recovery | system_requeue`. `event_type` is one of `attempt_queued | attempt_started | attempt_completed | retry_scheduled`. The endpoint exposes metadata, normalized error code/summary, and linked identifiers only; source text, prompts, raw model responses, and raw upstream error text remain outside this retention surface.
+
+Admin views expose scheduler runtime status, request aggregates, batch aggregates, trigger reason, token estimate, fan-out counts, linked `llm_call` ids, and release-level retry audit history.
+
+`ai-records` is admin-only. `record_kind` is `release`, `announcement`, or `brief`; list requests use an inclusive `from` and exclusive `before` RFC3339 range with page-number pagination. A list row contains only the source record's type-specific identity and timestamps plus the translation and/or polish task summaries: status, retry count, started time, latest attempt, and completion time. The detail endpoint returns the same record summary and its ordered attempt history, including trigger, model links, safe error classification/summary, retry eligibility, and next retry time. It never returns source text, prompts, raw model output, or raw upstream errors.
 
 
 ## Legacy endpoints

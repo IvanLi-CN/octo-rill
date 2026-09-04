@@ -1990,13 +1990,54 @@ export type AdminTranslationRequestListItem = {
 	variant: string;
 	entity_id: string;
 	batch_id: string | null;
+	retry_count: number;
 	created_at: string;
 	started_at: string | null;
+	last_attempt_at: string | null;
 	finished_at: string | null;
 	updated_at: string;
 };
 export type AdminTranslationRequestsResponse = {
 	items: AdminTranslationRequestListItem[];
+	page: number;
+	page_size: number;
+	total: number;
+};
+export type AdminTranslationAttemptEvent = {
+	id: number;
+	work_item_id: string;
+	request_id: string | null;
+	batch_id: string | null;
+	scope_user_id: LocalUserId;
+	kind: string;
+	variant: string;
+	entity_id: string;
+	target_lang: string;
+	attempt_no: number;
+	trigger:
+		| "initial"
+		| "manual_retry"
+		| "automatic_recovery"
+		| "system_requeue"
+		| string;
+	event_type:
+		| "attempt_queued"
+		| "attempt_started"
+		| "attempt_completed"
+		| "retry_scheduled"
+		| string;
+	result_status: string | null;
+	error_code: string | null;
+	error_summary: string | null;
+	failure_class: string | null;
+	retry_eligible: boolean;
+	next_retry_at: string | null;
+	llm_call_ids: string[];
+	llm_calls: AdminTranslationLinkedLlmCall[];
+	created_at: string;
+};
+export type AdminTranslationAttemptEventsResponse = {
+	items: AdminTranslationAttemptEvent[];
 	page: number;
 	page_size: number;
 	total: number;
@@ -2008,6 +2049,57 @@ export type AdminTranslationRequestDetailResponse = {
 		error_summary: string | null;
 		error_detail: string | null;
 	};
+	attempts: AdminTranslationAttemptEvent[];
+};
+export type AdminCollectionTaskSummary = {
+	status: string;
+	retry_count: number;
+	started_at: string | null;
+	last_attempt_at: string | null;
+	finished_at: string | null;
+};
+export type AdminCollectionLlmLink = {
+	id: string;
+	status: string;
+	source: string;
+	model: string;
+};
+export type AdminCollectionRecordItem = {
+	id: string;
+	kind: "release" | "announcement" | "brief";
+	repository: string | null;
+	title: string;
+	occurred_at: string | null;
+	detected_at: string | null;
+	generated_at: string | null;
+	translation: AdminCollectionTaskSummary | null;
+	polish: AdminCollectionTaskSummary;
+};
+export type AdminCollectionRecordsResponse = {
+	items: AdminCollectionRecordItem[];
+	page: number;
+	page_size: number;
+	total: number;
+};
+export type AdminCollectionAttempt = {
+	id: string;
+	pipeline: "translation" | "polish";
+	attempt_no: number;
+	trigger: string;
+	status: string;
+	started_at: string | null;
+	last_attempt_at: string;
+	finished_at: string | null;
+	error_code: string | null;
+	error_summary: string | null;
+	failure_class: string | null;
+	retry_eligible: boolean;
+	next_retry_at: string | null;
+	llm_calls: AdminCollectionLlmLink[];
+};
+export type AdminCollectionRecordDetail = {
+	record: AdminCollectionRecordItem;
+	attempts: AdminCollectionAttempt[];
 };
 export type AdminTranslationBatchListItem = {
 	id: string;
@@ -2121,6 +2213,29 @@ export async function apiGetAdminTranslationRequests(
 ): Promise<AdminTranslationRequestsResponse> {
 	return apiGet<AdminTranslationRequestsResponse>(
 		`/api/admin/jobs/translations/requests?${params.toString()}`,
+	);
+}
+export async function apiGetAdminTranslationAttemptEvents(
+	params: URLSearchParams,
+): Promise<AdminTranslationAttemptEventsResponse> {
+	return apiGet<AdminTranslationAttemptEventsResponse>(
+		`/api/admin/jobs/translations/attempt-events?${params.toString()}`,
+	);
+}
+export async function apiGetAdminCollectionRecords(
+	kind: AdminCollectionRecordItem["kind"],
+	params: URLSearchParams,
+): Promise<AdminCollectionRecordsResponse> {
+	return apiGet<AdminCollectionRecordsResponse>(
+		`/api/admin/jobs/ai-records/${kind}?${params.toString()}`,
+	);
+}
+export async function apiGetAdminCollectionRecordDetail(
+	kind: AdminCollectionRecordItem["kind"],
+	id: string,
+): Promise<AdminCollectionRecordDetail> {
+	return apiGet<AdminCollectionRecordDetail>(
+		`/api/admin/jobs/ai-records/${kind}/${encodeURIComponent(id)}`,
 	);
 }
 export async function apiGetAdminTranslationRequestDetail(

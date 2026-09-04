@@ -8378,6 +8378,7 @@ async fn upsert_repo_releases(
               created_at,
               is_prerelease,
               is_draft,
+              detected_at,
               updated_at,
               react_plus1,
               react_laugh,
@@ -8385,7 +8386,7 @@ async fn upsert_repo_releases(
               react_hooray,
               react_rocket,
               react_eyes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(release_id) DO UPDATE SET
               repo_id = excluded.repo_id,
               node_id = excluded.node_id,
@@ -8418,6 +8419,7 @@ async fn upsert_repo_releases(
                 .bind(release.created_at.as_deref())
                 .bind(release.prerelease as i64)
                 .bind(release.draft as i64)
+                .bind(now.as_str())
                 .bind(now.as_str())
                 .bind(plus1)
                 .bind(laugh)

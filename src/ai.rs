@@ -152,6 +152,7 @@ pub struct LlmCallContext {
     pub parent_task_id: Option<String>,
     pub parent_task_type: Option<String>,
     pub parent_translation_batch_id: Option<String>,
+    pub parent_brief_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1955,6 +1956,7 @@ struct LlmCallLogRecord {
     parent_task_id: Option<String>,
     parent_task_type: Option<String>,
     parent_translation_batch_id: Option<String>,
+    parent_brief_id: Option<String>,
 }
 
 fn build_llm_call_log_record() -> LlmCallLogRecord {
@@ -1973,6 +1975,7 @@ fn build_llm_call_log_record() -> LlmCallLogRecord {
         parent_translation_batch_id: context
             .as_ref()
             .and_then(|ctx| ctx.parent_translation_batch_id.clone()),
+        parent_brief_id: context.as_ref().and_then(|ctx| ctx.parent_brief_id.clone()),
     }
 }
 
@@ -1999,12 +2002,13 @@ async fn insert_llm_call(
                   parent_task_id,
                   parent_task_type,
                   parent_translation_batch_id,
+                  parent_brief_id,
                   max_tokens,
                   prompt_text,
                   input_messages_json,
                   created_at,
                   updated_at
-                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(log.id.as_str())
@@ -2014,6 +2018,7 @@ async fn insert_llm_call(
             .bind(log.parent_task_id.as_deref())
             .bind(log.parent_task_type.as_deref())
             .bind(log.parent_translation_batch_id.as_deref())
+            .bind(log.parent_brief_id.as_deref())
             .bind(i64::from(max_tokens))
             .bind(prompt_text)
             .bind(input_messages_json)
@@ -5291,6 +5296,7 @@ async fn find_normalized_brief_snapshot_id_by_window(
 async fn upsert_daily_brief_snapshot(
     state: &AppState,
     user_id: &str,
+    brief_id_to_create: &str,
     window: &UserDailyWindow,
     built: &BuiltBriefContent,
     generation_source: &str,
@@ -5381,7 +5387,7 @@ async fn upsert_daily_brief_snapshot(
         RETURNING id
         "#,
     )
-    .bind(local_id::generate_local_id())
+    .bind(brief_id_to_create)
     .bind(user_id)
     .bind(&date)
     .bind(&window_start)
@@ -5999,7 +6005,20 @@ async fn refresh_existing_brief_snapshot(
     .await?;
     let social =
         load_social_activity_digests_for_window(state, &row.user_id, &start_utc, &end_utc).await?;
-    let built = build_brief_content_from_digests(state, &row.user_id, releases, social).await?;
+    let mut context = current_llm_call_context().unwrap_or(LlmCallContext {
+        source: "daily_brief.polish".to_owned(),
+        requested_by: Some(row.user_id.clone()),
+        parent_task_id: None,
+        parent_task_type: None,
+        parent_translation_batch_id: None,
+        parent_brief_id: None,
+    });
+    context.parent_brief_id = Some(brief_id.to_owned());
+    let built = with_llm_call_context(
+        context,
+        build_brief_content_from_digests(state, &row.user_id, releases, social),
+    )
+    .await?;
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = state
         .pool
@@ -6059,8 +6078,18 @@ pub(crate) async fn generate_daily_brief_snapshot_for_window(
         return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
     }
 
-    let built = build_brief_content(state, window, user_id).await?;
-    upsert_daily_brief_snapshot(state, user_id, window, &built, generation_source).await
+    let brief_id = existing_id.unwrap_or_else(local_id::generate_local_id);
+    let mut context = current_llm_call_context().unwrap_or(LlmCallContext {
+        source: "daily_brief.polish".to_owned(),
+        requested_by: Some(user_id.to_owned()),
+        parent_task_id: None,
+        parent_task_type: None,
+        parent_translation_batch_id: None,
+        parent_brief_id: None,
+    });
+    context.parent_brief_id = Some(brief_id.clone());
+    let built = with_llm_call_context(context, build_brief_content(state, window, user_id)).await?;
+    upsert_daily_brief_snapshot(state, user_id, &brief_id, window, &built, generation_source).await
 }
 
 pub async fn generate_daily_brief_snapshot_for_key_date(
@@ -7218,6 +7247,7 @@ mod tests {
             parent_task_id: None,
             parent_task_type: None,
             parent_translation_batch_id: None,
+            parent_brief_id: None,
         };
 
         insert_llm_call(
@@ -7537,6 +7567,7 @@ mod tests {
                 parent_task_id: None,
                 parent_task_type: None,
                 parent_translation_batch_id: Some("batch-test".to_owned()),
+                parent_brief_id: None,
             };
 
             let err = with_llm_call_context(context, async {
@@ -7625,6 +7656,7 @@ mod tests {
             parent_task_id: None,
             parent_task_type: None,
             parent_translation_batch_id: Some("batch-test".to_owned()),
+            parent_brief_id: None,
         };
 
         let err = with_llm_call_context(context, async {
@@ -7690,6 +7722,7 @@ mod tests {
             parent_task_id: None,
             parent_task_type: None,
             parent_translation_batch_id: None,
+            parent_brief_id: None,
         };
 
         let err = with_llm_call_context(context, async {
@@ -7752,6 +7785,7 @@ mod tests {
             parent_task_id: None,
             parent_task_type: None,
             parent_translation_batch_id: None,
+            parent_brief_id: None,
         };
 
         let err = with_llm_call_context(context, async {
@@ -7813,6 +7847,7 @@ mod tests {
             parent_task_id: None,
             parent_task_type: Some(jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH.to_owned()),
             parent_translation_batch_id: None,
+            parent_brief_id: None,
         };
 
         let err = with_llm_call_context(context, async {
@@ -7930,6 +7965,7 @@ mod tests {
             parent_task_id: None,
             parent_task_type: None,
             parent_translation_batch_id: Some("batch-test".to_owned()),
+            parent_brief_id: None,
         };
 
         let err = with_llm_call_context(context, async {
@@ -7982,6 +8018,7 @@ mod tests {
             parent_task_id: None,
             parent_task_type: None,
             parent_translation_batch_id: None,
+            parent_brief_id: None,
         };
 
         insert_llm_call(state.as_ref(), &log, "gpt-test", 512, "prompt", Some("[]"))
@@ -8040,6 +8077,7 @@ mod tests {
             parent_task_id: None,
             parent_task_type: None,
             parent_translation_batch_id: None,
+            parent_brief_id: None,
         };
 
         insert_llm_call(state.as_ref(), &log, "gpt-test", 512, "prompt", Some("[]"))
@@ -8103,6 +8141,7 @@ mod tests {
             parent_task_id: None,
             parent_task_type: None,
             parent_translation_batch_id: None,
+            parent_brief_id: None,
         };
 
         insert_llm_call(state.as_ref(), &log, "gpt-test", 512, "prompt", Some("[]"))
@@ -8162,6 +8201,7 @@ mod tests {
             parent_task_id: None,
             parent_task_type: None,
             parent_translation_batch_id: None,
+            parent_brief_id: None,
         };
 
         insert_llm_call(state.as_ref(), &log, "gpt-test", 512, "prompt", Some("[]"))
@@ -10128,6 +10168,7 @@ mod tests {
         let stored = upsert_daily_brief_snapshot(
             state.as_ref(),
             "user-upsert-immutable",
+            "brief-created-immutable",
             &window,
             &built,
             "manual",
@@ -10273,6 +10314,7 @@ mod tests {
         let stored = upsert_daily_brief_snapshot(
             state.as_ref(),
             "user-upsert-legacy-placeholder",
+            "brief-created-legacy-placeholder",
             &window,
             &built,
             "manual",
