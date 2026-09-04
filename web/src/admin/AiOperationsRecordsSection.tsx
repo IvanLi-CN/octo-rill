@@ -898,10 +898,16 @@ export function AiOperationsRecordsSection({
 						value={tab}
 						onValueChange={(value) => setTab(value as CollectionTab)}
 					>
-						<TabsList className="grid w-full grid-cols-3">
-							<TabsTrigger value="release">Release</TabsTrigger>
-							<TabsTrigger value="announcement">公告</TabsTrigger>
-							<TabsTrigger value="brief">日报</TabsTrigger>
+						<TabsList className="grid w-full grid-cols-3 sm:inline-grid sm:w-fit">
+							<TabsTrigger className="sm:min-w-24" value="release">
+								Release
+							</TabsTrigger>
+							<TabsTrigger className="sm:min-w-24" value="announcement">
+								公告
+							</TabsTrigger>
+							<TabsTrigger className="sm:min-w-24" value="brief">
+								日报
+							</TabsTrigger>
 						</TabsList>
 					</Tabs>
 				</CardHeader>
