@@ -11,6 +11,7 @@ import type {
 	AdminCollectionAttempt,
 	AdminCollectionRecordDetail,
 	AdminCollectionRecordItem,
+	AdminCollectionTaskSummary,
 	AccountResumeResponse,
 	AdminLlmCallDetailResponse,
 	AdminRealtimeTaskDetailResponse,
@@ -319,8 +320,26 @@ function demoCollectionRecords() {
 		last_attempt_at: "2026-07-08T10:02:00+08:00",
 		finished_at: null,
 	};
+	const notRecorded = {
+		status: "not_recorded",
+		retry_count: 0,
+		started_at: null,
+		last_attempt_at: null,
+		finished_at: null,
+	};
 	return {
 		release: [
+			{
+				id: "291058010",
+				kind: "release",
+				repository: "octo-demo/release-lab",
+				title: "历史 Release（未记录处理）",
+				occurred_at: "2026-07-08T09:45:00+08:00",
+				detected_at: null,
+				generated_at: null,
+				translation: null,
+				polish: notRecorded,
+			},
 			{
 				id: "291058019",
 				kind: "release",
@@ -363,6 +382,19 @@ function demoCollectionRecords() {
 		AdminCollectionRecordItem["kind"],
 		AdminCollectionRecordItem[]
 	>;
+}
+
+function demoSummaryAttemptCount(summary: AdminCollectionTaskSummary | null) {
+	if (!summary || summary.status === "not_recorded") return 0;
+	return Math.max(1, summary.retry_count + 1);
+}
+
+function demoRecordAttemptCount(item: AdminCollectionRecordItem) {
+	if (item.kind === "brief") return demoSummaryAttemptCount(item.polish);
+	return Math.max(
+		demoSummaryAttemptCount(item.translation),
+		demoSummaryAttemptCount(item.polish),
+	);
 }
 
 function demoCollectionDetail(
@@ -1965,15 +1997,40 @@ export const demoHandlers = [
 		const url = new URL(request.url);
 		const from = url.searchParams.get("from");
 		const before = url.searchParams.get("before");
+		const parseAttemptBound = (name: string, fallback: number | null) => {
+			const raw = url.searchParams.get(name);
+			if (raw === null || raw === "") return fallback;
+			const parsed = Number(raw);
+			return Number.isInteger(parsed) ? parsed : Number.NaN;
+		};
+		const attemptMin = parseAttemptBound("attempt_min", 0) ?? 0;
+		const attemptMax = parseAttemptBound("attempt_max", null);
+		if (!Number.isInteger(attemptMin) || attemptMin < 0 || attemptMin > 10) {
+			return badRequest("attempt_min must be between 0 and 10");
+		}
+		if (
+			attemptMax !== null &&
+			(!Number.isInteger(attemptMax) || attemptMax < 0 || attemptMax > 10)
+		) {
+			return badRequest("attempt_max must be between 0 and 10");
+		}
+		if (attemptMax !== null && attemptMax < attemptMin) {
+			return badRequest(
+				"attempt_max must be greater than or equal to attempt_min",
+			);
+		}
 		const items = demoCollectionRecords()[kind].filter((item) => {
 			const timestamp =
-				item.kind === "brief" ? item.generated_at : item.detected_at;
+				item.kind === "brief" ? item.generated_at : item.occurred_at;
 			const value = timestamp ? new Date(timestamp).getTime() : Number.NaN;
+			const attemptCount = demoRecordAttemptCount(item);
 			return (
 				(!from ||
 					(Number.isFinite(value) && value >= new Date(from).getTime())) &&
 				(!before ||
-					(Number.isFinite(value) && value < new Date(before).getTime()))
+					(Number.isFinite(value) && value < new Date(before).getTime())) &&
+				attemptCount >= attemptMin &&
+				(attemptMax === null || attemptCount <= attemptMax)
 			);
 		});
 		return json(paginateItems(items, url.searchParams));
