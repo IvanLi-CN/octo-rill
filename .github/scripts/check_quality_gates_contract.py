@@ -58,6 +58,8 @@ REVIEW_POLICY_REVIEW_TYPES = {"submitted", "dismissed", "edited"}
 CI_METADATA_EDITED_GROUP = "ci-${{ github.event_name == 'pull_request' && github.event.action == 'edited' && format('metadata-{0}', github.run_id) || github.ref }}"
 LABEL_GATE_METADATA_EDITED_GROUP = "label-gate-${{ github.event.action == 'edited' && format('metadata-{0}', github.run_id) || github.event.pull_request.number || github.run_id }}"
 REVIEW_POLICY_METADATA_EDITED_GROUP = "review-policy-${{ github.event_name == 'pull_request' && github.event.action == 'edited' && format('metadata-{0}', github.run_id) || github.event.pull_request.number || github.run_id }}"
+CONTROLLED_CHECKOUT_REF = "${{ github.event_name == 'workflow_dispatch' && inputs.ci_performance_acceptance && inputs.ci_performance_target_sha || github.sha }}"
+CONTROLLED_RUN_NAME = "${{ github.event_name == 'workflow_dispatch' && inputs.ci_performance_acceptance && format('CI performance acceptance {0}', inputs.ci_performance_acceptance_nonce) || 'CI Pipeline' }}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -612,6 +614,15 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
     require(performance_input.get("type") == "boolean", "ci.yml: ci_performance_acceptance must be a boolean input")
     require(performance_input.get("required") is False, "ci.yml: ci_performance_acceptance must be optional")
     require(performance_input.get("default") is False, "ci.yml: ci_performance_acceptance must default to false")
+    for input_name in ("ci_performance_target_sha", "ci_performance_acceptance_nonce"):
+        controlled_input = require_mapping(
+            dispatch_inputs.get(input_name),
+            f"ci.yml.on.workflow_dispatch.inputs.{input_name}",
+        )
+        require(controlled_input.get("type") == "string", f"ci.yml: {input_name} must be a string input")
+        require(controlled_input.get("required") is False, f"ci.yml: {input_name} must be optional")
+        require(controlled_input.get("default") == "", f"ci.yml: {input_name} must default to empty")
+    require(workflow.get("run-name") == CONTROLLED_RUN_NAME, "ci.yml: controlled acceptance run-name drifted")
 
     build_job = job_config(workflow, "build", "ci.yml")
     require("needs" not in build_job, "ci.yml.jobs.build must not wait on unrelated jobs")
@@ -684,11 +695,43 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
     require_fail_closed(playwright_step, "ci.yml.jobs.frontend-e2e.steps['Run Playwright tests']")
     playwright_run = step_run(playwright_step, "ci.yml.jobs.frontend-e2e.steps['Run Playwright tests']")
     require("bun run e2e" in playwright_run, "ci.yml: Frontend E2E must keep the full e2e command")
+    require(
+        "PLAYWRIGHT_FORCE_JSON_REPORTER" in playwright_run
+        and "PLAYWRIGHT_JSON_OUTPUT_FILE" in playwright_run
+        and "--reporter=list,json" in playwright_run,
+        "ci.yml: controlled E2E must force a JSON reporter for immutable historical targets",
+    )
+    tooling_checkout = uses_step_config(
+        frontend_job,
+        "Checkout acceptance E2E tooling",
+        "actions/checkout@v4",
+        "ci.yml.jobs.frontend-e2e",
+    )
+    require(
+        tooling_checkout.get("if") == "${{ github.event_name == 'workflow_dispatch' && inputs.ci_performance_acceptance }}",
+        "ci.yml: acceptance E2E tooling checkout must only run for controlled dispatches",
+    )
+    tooling_with = require_mapping(
+        tooling_checkout.get("with"), "ci.yml.jobs.frontend-e2e.steps['Checkout acceptance E2E tooling'].with"
+    )
+    require(tooling_with.get("ref") == "${{ github.workflow_sha }}", "ci.yml: acceptance tooling must bind github.workflow_sha")
+    require(tooling_with.get("path") == ".ci-performance-tooling", "ci.yml: acceptance tooling path drifted")
+    source_step = step_config(frontend_job, "Resolve E2E source", "ci.yml.jobs.frontend-e2e")
+    source_run = step_run(source_step, "ci.yml.jobs.frontend-e2e.steps['Resolve E2E source']")
+    for fragment in (
+        "ACCEPTANCE_TARGET_SHA",
+        "PLAYWRIGHT_TESTED_SHA",
+        "PLAYWRIGHT_SUMMARY_SCRIPT",
+        "PLAYWRIGHT_FORCE_JSON_REPORTER",
+        "controlled acceptance checkout did not resolve the requested immutable SHA",
+    ):
+        require(fragment in source_run, f"ci.yml: controlled E2E source step must contain {fragment!r}")
     summary_step = step_config(frontend_job, "Summarize Playwright results", "ci.yml.jobs.frontend-e2e")
     require(summary_step.get("if") == "${{ always() }}", "ci.yml: Playwright summary must run with always()")
     summary_run = step_run(summary_step, "ci.yml.jobs.frontend-e2e.steps['Summarize Playwright results']")
     require(
-        "summarize-playwright-results.ts" in summary_run
+        "PLAYWRIGHT_SUMMARY_SCRIPT" in summary_run
+        and "summarize-playwright-results.ts" in summary_run
         and "playwright-results.json" in summary_run
         and "playwright-summary.json" in summary_run,
         "ci.yml: Playwright summary step must consume the JSON report and write the JSON summary",
@@ -717,6 +760,13 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
     )
     require(artifact_with.get("if-no-files-found") == "error", "ci.yml: Playwright artifact must fail closed on missing files")
     require(artifact_with.get("retention-days") == 14, "ci.yml: Playwright artifact retention must be 14 days")
+
+    for job_id in ("lint", "unit-tests", "frontend-e2e", "worktree-bootstrap", "build"):
+        checkout_with = checkout_step(job_config(workflow, job_id, "ci.yml"), "Checkout", f"ci.yml.jobs.{job_id}")
+        require(
+            checkout_with.get("ref") == CONTROLLED_CHECKOUT_REF,
+            f"ci.yml.jobs.{job_id}: controlled checkout ref drifted",
+        )
 
     lint_job = named_job_config(workflow, "lint", expected_jobs, "ci.yml")
     require_no_if(lint_job, "ci.yml.jobs.lint")

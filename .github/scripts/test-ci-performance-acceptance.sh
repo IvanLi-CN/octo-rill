@@ -11,6 +11,8 @@ import json
 import sys
 import zipfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
@@ -23,20 +25,24 @@ spec.loader.exec_module(module)
 
 
 class FakeGh:
-    def __init__(self, candidate_retry_count=1, candidate_failed_tests=0):
+    def __init__(self, candidate_retry_count=1, candidate_failed_tests=0, candidate_test_id_offset=0):
         self.control_sha = "1" * 40
         self.candidate_sha = "2" * 40
+        self.dispatch_sha = "3" * 40
         self.candidate_retry_count = candidate_retry_count
         self.candidate_failed_tests = candidate_failed_tests
+        self.candidate_test_id_offset = candidate_test_id_offset
         self.next_id = 1000
         self.runs = {}
         self.dispatches = []
 
     def api(self, endpoint, *, method="GET", payload=None):
         if endpoint.endswith("git/ref/heads/main"):
-            return {"object": {"type": "commit", "sha": self.control_sha}}
-        if endpoint.endswith("git/ref/heads/candidate"):
-            return {"object": {"type": "commit", "sha": self.candidate_sha}}
+            return {"object": {"type": "commit", "sha": self.dispatch_sha}}
+        if "/git/commits/" in endpoint:
+            sha = endpoint.rsplit("/", 1)[1]
+            assert sha in {self.control_sha, self.candidate_sha}
+            return {"sha": sha}
         if "/compare/" in endpoint:
             return {
                 "status": "ahead",
@@ -45,19 +51,26 @@ class FakeGh:
                 "files": [{"filename": path} for path in sorted(module.ALLOWED_CHANGED_PATHS)],
             }
         if endpoint.endswith("/dispatches") and method == "POST":
-            assert payload["inputs"] == {module.ACCEPTANCE_INPUT: "true"}
-            self.dispatches.append(payload["ref"])
+            assert payload["ref"] == "main"
+            inputs = payload["inputs"]
+            assert inputs[module.ACCEPTANCE_INPUT] == "true"
+            target_sha = inputs[module.ACCEPTANCE_TARGET_SHA_INPUT]
+            nonce = inputs[module.ACCEPTANCE_NONCE_INPUT]
+            assert target_sha in {self.control_sha, self.candidate_sha}
+            assert nonce
+            self.dispatches.append(target_sha)
             self.next_id += 1
-            sha = self.control_sha if payload["ref"] in {"control", "main"} else self.candidate_sha
-            started = datetime.now(timezone.utc)
-            duration = 500 if sha == self.control_sha else 300 + (self.next_id % 5) * 10
+            # GitHub workflow-run timestamps are second-resolution, unlike local dispatch time.
+            started = datetime.now(timezone.utc).replace(microsecond=0)
+            duration = 500 if target_sha == self.control_sha else 300 + (self.next_id % 5) * 10
             created = started.isoformat().replace("+00:00", "Z")
             run = {
                 "id": self.next_id,
                 "name": "CI Pipeline",
                 "event": "workflow_dispatch",
-                "head_branch": payload["ref"],
-                "head_sha": sha,
+                "head_branch": "main",
+                "head_sha": self.dispatch_sha,
+                "display_title": module.acceptance_run_title(nonce),
                 "run_attempt": 1,
                 "status": "completed",
                 "conclusion": "success",
@@ -65,10 +78,11 @@ class FakeGh:
                 "run_started_at": created,
                 "updated_at": (started + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z"),
             }
-            retry_count = 1 if sha == self.control_sha else self.candidate_retry_count
-            failed_tests = 0 if sha == self.control_sha else self.candidate_failed_tests
+            retry_count = 1 if target_sha == self.control_sha else self.candidate_retry_count
+            failed_tests = 0 if target_sha == self.control_sha else self.candidate_failed_tests
             summary = {
                 "schema_version": 1,
+                "tested_sha": target_sha,
                 "total_tests": 250,
                 "passed_tests": 250 - failed_tests,
                 "failed_tests": failed_tests,
@@ -76,20 +90,20 @@ class FakeGh:
                 "flaky_tests": min(1, retry_count) if failed_tests == 0 else 0,
                 "retry_count": retry_count,
             }
-            self.runs[self.next_id] = (run, sha, summary, duration)
+            self.runs[self.next_id] = (run, target_sha, summary, duration)
             return None
         if "/actions/workflows/ci.yml/runs?" in endpoint:
             query = parse_qs(urlparse(endpoint).query)
             sha = query["head_sha"][0]
-            return {"workflow_runs": [run for run, run_sha, _summary, _duration in self.runs.values() if run_sha == sha]}
+            return {"workflow_runs": [run for run, _target_sha, _summary, _duration in self.runs.values() if run["head_sha"] == sha]}
         if "/actions/runs/" in endpoint and endpoint.endswith("/jobs?per_page=100"):
             run_id = int(endpoint.split("/actions/runs/")[1].split("/", 1)[0])
-            run, sha, _summary, duration = self.runs[run_id]
+            run, target_sha, _summary, duration = self.runs[run_id]
             jobs = [{"name": name, "conclusion": "success", "steps": []} for name in sorted(module.REQUIRED_JOBS)]
             e2e = next(job for job in jobs if job["name"] == "Frontend E2E")
             e2e["started_at"] = run["run_started_at"]
             e2e["completed_at"] = (module.parse_time(run["run_started_at"]) + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z")
-            if sha == self.candidate_sha:
+            if target_sha == self.candidate_sha:
                 next(job for job in jobs if job["name"] == "Build (Release)")["steps"] = [
                     {"name": "Run Docker release smoke", "conclusion": "success"}
                 ]
@@ -104,22 +118,45 @@ class FakeGh:
 
     def download(self, endpoint, output):
         artifact_id = int(endpoint.split("/artifacts/")[1].split("/", 1)[0])
-        summary = self.runs[artifact_id][2]
+        _run, target_sha, summary, _duration = self.runs[artifact_id]
+        test_id_offset = self.candidate_test_id_offset if target_sha == self.candidate_sha else 0
+        report = {
+            "suites": [
+                {
+                    "title": "e2e.spec.ts",
+                    "file": "e2e.spec.ts",
+                    "specs": [
+                        {
+                            "title": f"test {index + test_id_offset}",
+                            "tests": [{"projectName": "chromium"}],
+                        }
+                        for index in range(summary["total_tests"])
+                    ],
+                }
+            ]
+        }
         with zipfile.ZipFile(output, "w") as archive:
-            archive.writestr("web/test-results/playwright-results.json", "{}")
+            archive.writestr("web/test-results/playwright-results.json", json.dumps(report))
             archive.writestr("web/test-results/playwright-summary.json", json.dumps(summary))
 
 
 def run_fake(fake):
-    refs = module.validate_ref_pair(fake, "IvanLi-CN/octo-rill", "main", "candidate")
+    refs = module.validate_target_pair(
+        fake,
+        "IvanLi-CN/octo-rill",
+        fake.control_sha,
+        fake.candidate_sha,
+        "main",
+    )
     refs["changed_paths"] = module.validate_allowed_delta(fake, "IvanLi-CN/octo-rill", refs["control_sha"], refs["candidate_sha"])
     return refs, module.AcceptanceRunner(fake, "IvanLi-CN/octo-rill", poll_interval=0, timeout_seconds=1).run(refs)
 
 
 fake = FakeGh()
 refs, result = run_fake(fake)
-expected_order = ["main", "candidate", "candidate", "main"] * 5
+expected_order = [fake.control_sha, fake.candidate_sha, fake.candidate_sha, fake.control_sha] * 5
 assert fake.dispatches == expected_order, fake.dispatches
+assert refs["dispatch_sha"] == fake.dispatch_sha
 assert len(result["runs"]) == 20
 assert result["statistics"]["candidate_e2e_p90_seconds"] <= 420
 assert result["statistics"]["candidate_final_failures"] == 0
@@ -138,36 +175,74 @@ _failed_refs, failed_result = run_fake(failed_candidate)
 assert failed_result["statistics"]["candidate_final_failures"] == 10
 assert not failed_result["statistics"]["passed"]
 
+mismatched_selection = FakeGh(candidate_test_id_offset=250)
+try:
+    run_fake(mismatched_selection)
+except module.AcceptanceError as error:
+    assert "test identifiers differ" in str(error)
+else:
+    raise AssertionError("candidate with a different equal-sized test selection must be rejected")
+
 try:
     module.validate_playwright_summary({
         "schema_version": 1,
+        "tested_sha": fake.control_sha,
         "total_tests": 2,
         "passed_tests": 1,
         "failed_tests": 0,
         "skipped_tests": 0,
         "flaky_tests": 0,
         "retry_count": 2,
-    })
+    }, fake.control_sha)
 except module.AcceptanceError:
     pass
 else:
     raise AssertionError("inconsistent summary must be rejected")
 
+valid_summary = {
+    "schema_version": 1,
+    "tested_sha": fake.candidate_sha,
+    "total_tests": 1,
+    "passed_tests": 1,
+    "failed_tests": 0,
+    "skipped_tests": 0,
+    "flaky_tests": 0,
+    "retry_count": 0,
+}
+try:
+    module.validate_playwright_summary(valid_summary, fake.control_sha)
+except module.AcceptanceError as error:
+    assert "tested_sha" in str(error)
+else:
+    raise AssertionError("mismatched tested SHA must be rejected")
+
 retry = next(iter(fake.runs.values()))[0].copy()
 retry["run_attempt"] = 2
 try:
-    module.validate_run(retry, {"jobs": []}, fake.control_sha, require_runtime_smoke=False)
+    module.validate_run(
+        retry,
+        {"jobs": []},
+        fake.dispatch_sha,
+        fake.control_sha,
+        require_runtime_smoke=False,
+    )
 except module.AcceptanceError as error:
     assert "retried" in str(error)
 else:
     raise AssertionError("retry must be rejected")
 
 try:
-    module.validate_ref_pair(fake, "IvanLi-CN/octo-rill", "main", "main")
+    module.validate_target_pair(
+        fake,
+        "IvanLi-CN/octo-rill",
+        fake.control_sha,
+        fake.control_sha,
+        "main",
+    )
 except module.AcceptanceError as error:
     assert "different" in str(error)
 else:
-    raise AssertionError("identical refs must be rejected")
+    raise AssertionError("identical target SHAs must be rejected")
 
 get_results = iter([
     SimpleNamespace(returncode=1, stderr="TLS handshake timeout", stdout=""),
@@ -207,6 +282,20 @@ try:
     else:
         raise AssertionError("POST failures must not be retried")
     assert len(post_calls) == 1
+
+    download_calls = []
+
+    def fake_download_run(command, **kwargs):
+        download_calls.append((command, kwargs))
+        return SimpleNamespace(returncode=0, stderr=b"", stdout=b"artifact-bytes")
+
+    module.subprocess.run = fake_download_run
+    with TemporaryDirectory() as directory:
+        output = Path(directory) / "artifact.zip"
+        module.GhApi().download("repos/IvanLi-CN/octo-rill/actions/artifacts/1/zip", output)
+        assert output.read_bytes() == b"artifact-bytes"
+    assert len(download_calls) == 1
+    assert "--output" not in download_calls[0][0]
 finally:
     module.subprocess.run = original_run
     module.time.sleep = original_sleep
