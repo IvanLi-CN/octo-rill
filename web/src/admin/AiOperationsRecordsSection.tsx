@@ -1,4 +1,4 @@
-import { ArrowLeft, ChevronRight, RefreshCw } from "lucide-react";
+import { ArrowLeft, ChevronRight, RefreshCw, RotateCcw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { AiRecordDetailRoute } from "@/admin/jobsRouteState";
@@ -39,13 +39,26 @@ import {
 	TableRow,
 } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+	Tooltip,
+	TooltipContent,
+	TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 type CollectionTab = AdminCollectionRecordItem["kind"];
 type TimeRangePreset = "24h" | "7d" | "30d" | "custom";
+type AttemptCountRange = { min: number; max: number | null };
 const PAGE_SIZE = 20;
+const ATTEMPT_RANGE_MAX = 10;
+const ATTEMPT_UNBOUNDED_VALUE = ATTEMPT_RANGE_MAX + 1;
+const DEFAULT_ATTEMPT_RANGE: AttemptCountRange = { min: 0, max: null };
 
 function recordNow() {
-	return __OCTO_RILL_DEMO_APP__
+	const demoUrl =
+		import.meta.env.DEV &&
+		typeof window !== "undefined" &&
+		new URL(window.location.href).searchParams.has("demo");
+	return __OCTO_RILL_DEMO_APP__ || demoUrl
 		? new Date("2026-07-08T10:30:00+08:00")
 		: new Date();
 }
@@ -98,6 +111,110 @@ function useCompactLayout() {
 		return () => media.removeEventListener("change", update);
 	}, []);
 	return compact;
+}
+
+function formatAttemptCountRange(value: AttemptCountRange) {
+	return `${value.min}–${value.max === null ? "不限" : value.max}`;
+}
+
+function AttemptCountRangeFilter({
+	value,
+	disabled = false,
+	onChange,
+}: {
+	value: AttemptCountRange;
+	disabled?: boolean;
+	onChange: (value: AttemptCountRange) => void;
+}) {
+	const upperValue = value.max ?? ATTEMPT_UNBOUNDED_VALUE;
+	const minPercent = (value.min / ATTEMPT_UNBOUNDED_VALUE) * 100;
+	const maxPercent = (upperValue / ATTEMPT_UNBOUNDED_VALUE) * 100;
+	const isFiltered =
+		value.min !== DEFAULT_ATTEMPT_RANGE.min ||
+		value.max !== DEFAULT_ATTEMPT_RANGE.max;
+
+	function updateMin(rawValue: number) {
+		const nextMin = Math.min(
+			rawValue,
+			upperValue === ATTEMPT_UNBOUNDED_VALUE ? ATTEMPT_RANGE_MAX : upperValue,
+		);
+		onChange({ min: nextMin, max: value.max });
+	}
+
+	function updateMax(rawValue: number) {
+		if (rawValue === ATTEMPT_UNBOUNDED_VALUE) {
+			onChange({ min: value.min, max: null });
+			return;
+		}
+		onChange({ min: value.min, max: Math.max(rawValue, value.min) });
+	}
+
+	return (
+		<fieldset className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center sm:gap-4">
+			<legend className="sr-only">尝试次数筛选</legend>
+			<div className="flex items-center justify-between gap-3 sm:min-w-32 sm:justify-start">
+				<span className="font-medium text-sm">尝试次数</span>
+				<span
+					className="text-muted-foreground text-sm tabular-nums"
+					aria-live="polite"
+				>
+					{formatAttemptCountRange(value)}
+				</span>
+				{isFiltered ? (
+					<Tooltip>
+						<TooltipTrigger asChild>
+							<Button
+								type="button"
+								variant="ghost"
+								size="icon"
+								className="size-9 shrink-0"
+								disabled={disabled}
+								aria-label="重置尝试次数筛选"
+								onClick={() => onChange(DEFAULT_ATTEMPT_RANGE)}
+							>
+								<RotateCcw className="size-4" />
+							</Button>
+						</TooltipTrigger>
+						<TooltipContent>重置尝试次数筛选</TooltipContent>
+					</Tooltip>
+				) : null}
+			</div>
+			<div className="relative h-11 w-full sm:w-72 sm:shrink-0">
+				<div className="absolute top-1/2 right-0 left-0 h-1.5 -translate-y-1/2 rounded-full bg-border" />
+				<div
+					className="absolute top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-primary"
+					style={{
+						left: `${minPercent}%`,
+						right: `${100 - maxPercent}%`,
+					}}
+				/>
+				<input
+					type="range"
+					min={0}
+					max={ATTEMPT_RANGE_MAX}
+					step={1}
+					value={value.min}
+					disabled={disabled}
+					aria-label="最小总尝试次数"
+					aria-valuetext={`${value.min} 次`}
+					onChange={(event) => updateMin(Number(event.target.value))}
+					className="pointer-events-none absolute inset-x-0 top-1/2 z-20 h-11 w-full -translate-y-1/2 appearance-none bg-transparent accent-primary [--thumb-size:1rem] [&::-moz-range-thumb]:pointer-events-auto [&::-moz-range-thumb]:size-[var(--thumb-size)] [&::-moz-range-thumb]:appearance-none [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-card [&::-moz-range-thumb]:bg-primary [&::-moz-range-thumb]:shadow-sm [&::-moz-range-track]:appearance-none [&::-moz-range-track]:bg-transparent [&::-webkit-slider-runnable-track]:appearance-none [&::-webkit-slider-runnable-track]:bg-transparent [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:size-[var(--thumb-size)] [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-card [&::-webkit-slider-thumb]:bg-primary [&::-webkit-slider-thumb]:shadow-sm"
+				/>
+				<input
+					type="range"
+					min={0}
+					max={ATTEMPT_UNBOUNDED_VALUE}
+					step={1}
+					value={upperValue}
+					disabled={disabled}
+					aria-label="最大总尝试次数"
+					aria-valuetext={value.max === null ? "不限" : `${value.max} 次`}
+					onChange={(event) => updateMax(Number(event.target.value))}
+					className="pointer-events-none absolute inset-x-0 top-1/2 z-10 h-11 w-full -translate-y-1/2 appearance-none bg-transparent accent-primary [--thumb-size:1rem] [&::-moz-range-thumb]:pointer-events-auto [&::-moz-range-thumb]:size-[var(--thumb-size)] [&::-moz-range-thumb]:appearance-none [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-card [&::-moz-range-thumb]:bg-primary [&::-moz-range-thumb]:shadow-sm [&::-moz-range-track]:appearance-none [&::-moz-range-track]:bg-transparent [&::-webkit-slider-runnable-track]:appearance-none [&::-webkit-slider-runnable-track]:bg-transparent [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:size-[var(--thumb-size)] [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-card [&::-webkit-slider-thumb]:bg-primary [&::-webkit-slider-thumb]:shadow-sm"
+				/>
+			</div>
+		</fieldset>
+	);
 }
 
 function statusLabel(status: string) {
@@ -329,7 +446,7 @@ function CollectionTable({
 									<p>{formatDateTime(recordTime(item), "未记录")}</p>
 									{!isBrief ? (
 										<p className="text-muted-foreground">
-											{formatDateTime(item.detected_at, "历史未记录")}
+											{formatDateTime(item.detected_at, "未知")}
 										</p>
 									) : null}
 								</div>
@@ -409,7 +526,7 @@ function CompactRecordList({
 							{formatDateTime(recordTime(item), "未记录")}
 						</span>
 						{tab !== "brief" ? (
-							<span>发现 {formatDateTime(item.detected_at, "历史未记录")}</span>
+							<span>发现 {formatDateTime(item.detected_at, "未知")}</span>
 						) : null}
 					</div>
 					<div
@@ -544,7 +661,7 @@ function RecordDetail({
 				<p className="text-muted-foreground text-xs">
 					{record.kind === "brief"
 						? `生成：${formatDateTime(record.generated_at, "历史未记录")}`
-						: `${record.kind === "release" ? "发布" : "发生"}：${formatDateTime(record.occurred_at, "未记录")} · 发现：${formatDateTime(record.detected_at, "历史未记录")}`}
+						: `${record.kind === "release" ? "发布" : "发生"}：${formatDateTime(record.occurred_at, "未记录")} · 发现：${formatDateTime(record.detected_at, "未知")}`}
 				</p>
 			</div>
 			{record.translation ? (
@@ -678,6 +795,11 @@ export function AiOperationsRecordsSection({
 	const [tab, setTab] = useState<CollectionTab>("release");
 	const [preset, setPreset] = useState<TimeRangePreset>("24h");
 	const [range, setRange] = useState(initialRange);
+	const [attemptRange, setAttemptRange] = useState<AttemptCountRange>(
+		DEFAULT_ATTEMPT_RANGE,
+	);
+	const [appliedAttemptRange, setAppliedAttemptRange] =
+		useState<AttemptCountRange>(DEFAULT_ATTEMPT_RANGE);
 	const [page, setPage] = useState(1);
 	const [items, setItems] = useState<AdminCollectionRecordItem[]>([]);
 	const [total, setTotal] = useState(0);
@@ -716,8 +838,21 @@ export function AiOperationsRecordsSection({
 		setPage(1);
 	}, []);
 	useEffect(() => {
+		const timeout = window.setTimeout(() => {
+			setAppliedAttemptRange(attemptRange);
+			setPage(1);
+		}, 250);
+		return () => window.clearTimeout(timeout);
+	}, [attemptRange]);
+	useEffect(() => {
 		setPage(1);
-	}, [tab, selectedRange.before, selectedRange.from]);
+	}, [
+		tab,
+		selectedRange.before,
+		selectedRange.from,
+		appliedAttemptRange.max,
+		appliedAttemptRange.min,
+	]);
 	useEffect(() => {
 		const requestId = listRequestRef.current + 1;
 		listRequestRef.current = requestId;
@@ -729,6 +864,12 @@ export function AiOperationsRecordsSection({
 			from: selectedRange.from,
 			before: selectedRange.before,
 		});
+		if (appliedAttemptRange.min > 0) {
+			params.set("attempt_min", String(appliedAttemptRange.min));
+		}
+		if (appliedAttemptRange.max !== null) {
+			params.set("attempt_max", String(appliedAttemptRange.max));
+		}
 		void apiGetAdminCollectionRecords(tab, params)
 			.then((response) => {
 				if (requestId !== listRequestRef.current) return;
@@ -742,7 +883,15 @@ export function AiOperationsRecordsSection({
 			.finally(() => {
 				if (requestId === listRequestRef.current) setLoading(false);
 			});
-	}, [page, reloadNonce, selectedRange.before, selectedRange.from, tab]);
+	}, [
+		page,
+		reloadNonce,
+		selectedRange.before,
+		selectedRange.from,
+		tab,
+		appliedAttemptRange.max,
+		appliedAttemptRange.min,
+	]);
 	useEffect(() => {
 		if (!detailRoute) {
 			setDetail(null);
@@ -910,6 +1059,11 @@ export function AiOperationsRecordsSection({
 							</TabsTrigger>
 						</TabsList>
 					</Tabs>
+					<AttemptCountRangeFilter
+						value={attemptRange}
+						disabled={loading}
+						onChange={setAttemptRange}
+					/>
 				</CardHeader>
 				<CardContent className="space-y-3">
 					{error ? <p className="text-destructive text-sm">{error}</p> : null}
