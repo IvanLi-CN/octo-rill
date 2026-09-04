@@ -677,6 +677,47 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
     ):
         require(required_fragment in smoke_run, f"ci.yml: Docker runtime smoke must contain {required_fragment!r}")
 
+    frontend_job = named_job_config(workflow, "frontend-e2e", expected_jobs, "ci.yml")
+    require_no_if(frontend_job, "ci.yml.jobs.frontend-e2e")
+    require_fail_closed(frontend_job, "ci.yml.jobs.frontend-e2e")
+    playwright_step = step_config(frontend_job, "Run Playwright tests", "ci.yml.jobs.frontend-e2e")
+    require_fail_closed(playwright_step, "ci.yml.jobs.frontend-e2e.steps['Run Playwright tests']")
+    playwright_run = step_run(playwright_step, "ci.yml.jobs.frontend-e2e.steps['Run Playwright tests']")
+    require("bun run e2e" in playwright_run, "ci.yml: Frontend E2E must keep the full e2e command")
+    summary_step = step_config(frontend_job, "Summarize Playwright results", "ci.yml.jobs.frontend-e2e")
+    require(summary_step.get("if") == "${{ always() }}", "ci.yml: Playwright summary must run with always()")
+    summary_run = step_run(summary_step, "ci.yml.jobs.frontend-e2e.steps['Summarize Playwright results']")
+    require(
+        "summarize-playwright-results.ts" in summary_run
+        and "playwright-results.json" in summary_run
+        and "playwright-summary.json" in summary_run,
+        "ci.yml: Playwright summary step must consume the JSON report and write the JSON summary",
+    )
+    artifact_step = uses_step_config(
+        frontend_job,
+        "Upload Playwright results",
+        "actions/upload-artifact@v4",
+        "ci.yml.jobs.frontend-e2e",
+    )
+    require(artifact_step.get("if") == "${{ always() }}", "ci.yml: Playwright artifact upload must run with always()")
+    require(
+        artifact_step.get("continue-on-error")
+        == "${{ steps.playwright.outcome == 'failure' || steps.summary.outcome == 'failure' }}",
+        "ci.yml: Playwright artifact upload must not mask the original test failure",
+    )
+    artifact_with = require_mapping(
+        artifact_step.get("with"), "ci.yml.jobs.frontend-e2e.steps['Upload Playwright results'].with"
+    )
+    require(artifact_with.get("name") == "playwright-e2e-results", "ci.yml: Playwright artifact name drifted")
+    artifact_path = str(artifact_with.get("path", ""))
+    require(
+        "web/test-results/playwright-results.json" in artifact_path
+        and "web/test-results/playwright-summary.json" in artifact_path,
+        "ci.yml: Playwright artifact must contain only the JSON report and summary",
+    )
+    require(artifact_with.get("if-no-files-found") == "error", "ci.yml: Playwright artifact must fail closed on missing files")
+    require(artifact_with.get("retention-days") == 14, "ci.yml: Playwright artifact retention must be 14 days")
+
     lint_job = named_job_config(workflow, "lint", expected_jobs, "ci.yml")
     require_no_if(lint_job, "ci.yml.jobs.lint")
     require_fail_closed(lint_job, "ci.yml.jobs.lint")

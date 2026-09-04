@@ -3,6 +3,17 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
+python3 - "$repo_root/web/playwright.config.ts" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text()
+assert "workers: process.env.CI ? 2 : undefined" in text
+assert '["list"]' in text and '["json", { outputFile: "test-results/playwright-results.json" }]' in text
+assert "retries: process.env.CI ? 2 : 0" in text
+print("test-web-playwright-contract: all checks passed")
+PY
+
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
 
@@ -188,6 +199,29 @@ workflow_cases = (
         "runtime-cleanup",
         lambda text: text.replace('            docker rm -f "$container"', '            docker rm "$container"', 1),
         "ci.yml: Docker runtime smoke must contain 'docker rm -f'",
+    ),
+    (
+        "e2e-summary-always",
+        lambda text: text.replace(
+            "      - name: Summarize Playwright results\n        id: summary\n        if: ${{ always() }}",
+            "      - name: Summarize Playwright results\n        id: summary",
+            1,
+        ),
+        "ci.yml: Playwright summary must run with always()",
+    ),
+    (
+        "e2e-artifact-retention",
+        lambda text: text.replace("          retention-days: 14\n", "", 1),
+        "ci.yml: Playwright artifact retention must be 14 days",
+    ),
+    (
+        "e2e-upload-failure",
+        lambda text: text.replace(
+            "        continue-on-error: ${{ steps.playwright.outcome == 'failure' || steps.summary.outcome == 'failure' }}\n",
+            "",
+            1,
+        ),
+        "ci.yml: Playwright artifact upload must not mask the original test failure",
     ),
 )
 
