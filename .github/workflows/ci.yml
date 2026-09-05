@@ -436,6 +436,13 @@ jobs:
             PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" \
               bun -e 'import { chromium } from "playwright"; process.stdout.write(chromium.executablePath())'
           )"
+          if [ ! -x "$browser_path" ] && [ -d "$PLAYWRIGHT_BROWSERS_PATH" ]; then
+            browser_path="$(
+              find "$PLAYWRIGHT_BROWSERS_PATH" -type f \
+                \( -path '*/chrome-linux/chrome' -o -path '*/chrome-linux64/chrome' \) \
+                -perm -111 -print -quit
+            )"
+          fi
           if [ -x "$browser_path" ]; then
             echo "Using cached Playwright browser: $browser_path"
           else
