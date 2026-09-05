@@ -42,6 +42,7 @@ ALLOWED_CHANGED_PATHS = {
     ".github/scripts/ci_performance_acceptance.py",
     ".github/scripts/test-ci-performance-acceptance.sh",
     "web/playwright.config.ts",
+    "web/e2e/pwa-installability.spec.ts",
     "web/e2e/release-detail.spec.ts",
     "web/scripts/summarize-playwright-results.ts",
     "web/scripts/test-summarize-playwright-results.ts",
