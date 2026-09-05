@@ -180,6 +180,16 @@ fn output_contract_failed(error_text: Option<&str>) -> bool {
         .is_some_and(|classified| classified.code == "output_contract_invalid")
 }
 
+fn translation_retry_disposition(contract_recovered: bool, retry_scheduled: bool) -> &'static str {
+    if contract_recovered {
+        "in_attempt_recovered"
+    } else if retry_scheduled {
+        "scheduled"
+    } else {
+        "not_needed"
+    }
+}
+
 fn admin_translation_result_item(item: TranslationResultItem) -> AdminTranslationRequestResultItem {
     let classified = (item.status == "error")
         .then(|| classify_translation_error(item.error.as_deref()))
@@ -4031,6 +4041,11 @@ async fn persist_translation_terminal_state(
     let Some(entity_type) = map_entity_type(kind, variant) else {
         return Ok(());
     };
+    if entity_type == "release_smart" && result_status == "error" {
+        // Technical release_smart failures stay on the work item so scheduler
+        // recovery can retry them; never turn them into reusable cache hits.
+        return Ok(());
+    }
     let update = sqlx::query(
         r#"
         UPDATE ai_translations
@@ -4448,11 +4463,10 @@ async fn record_translation_attempt_completed(
             } else {
                 "passed"
             }),
-            retry_disposition: Some(if completion.retry_eligible {
-                "scheduled"
-            } else {
-                "not_needed"
-            }),
+            retry_disposition: Some(translation_retry_disposition(
+                contract_recovered,
+                completion.retry_eligible,
+            )),
         },
         now,
     )
@@ -5762,11 +5776,10 @@ async fn finalize_batch_success(
         } else {
             "passed"
         })
-        .bind(if retry_scheduled_at.is_some() {
-            "scheduled"
-        } else {
-            "not_needed"
-        })
+        .bind(translation_retry_disposition(
+            contract_recovered,
+            retry_scheduled_at.is_some(),
+        ))
         .bind(retry_count)
         .bind(retry_scheduled_at.as_deref())
         .bind(retry_expires_at.as_deref())
@@ -7717,6 +7730,74 @@ mod tests {
 
         assert_eq!(classified.code, "output_contract_invalid");
         assert_eq!(classified.summary, "模型输出未通过 JSON 契约");
+    }
+
+    #[test]
+    fn translation_retry_disposition_prioritizes_in_attempt_recovery() {
+        assert_eq!(
+            translation_retry_disposition(true, false),
+            "in_attempt_recovered"
+        );
+        assert_eq!(
+            translation_retry_disposition(true, true),
+            "in_attempt_recovered"
+        );
+        assert_eq!(translation_retry_disposition(false, true), "scheduled");
+        assert_eq!(translation_retry_disposition(false, false), "not_needed");
+    }
+
+    #[tokio::test]
+    async fn release_smart_terminal_error_does_not_persist_reusable_cache() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 1, "octo").await;
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status,
+              error_text, active_work_item_id, created_at, updated_at
+            )
+            VALUES ('release-smart-cache-test', '1', 'release_smart', '42', 'zh-CN',
+                    'source-hash', 'queued', NULL, NULL, '2026-03-10T00:00:00Z',
+                    '2026-03-10T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed release smart demand state");
+
+        let mut tx = pool.begin().await.expect("begin transaction");
+        persist_translation_terminal_state(
+            &mut tx,
+            "1",
+            "release_smart",
+            "feed_card",
+            "42",
+            "zh-CN",
+            "source-hash",
+            "error",
+            None,
+            None,
+            Some("upstream failure"),
+            "work-1",
+            "2026-03-10T00:01:00Z",
+        )
+        .await
+        .expect("skip release smart technical cache persistence");
+        tx.commit().await.expect("commit transaction");
+
+        let row = sqlx::query(
+            "SELECT status, error_text, active_work_item_id FROM ai_translations WHERE id = 'release-smart-cache-test'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load release smart demand state");
+        assert_eq!(row.get::<String, _>("status"), "queued");
+        assert!(row.get::<Option<String>, _>("error_text").is_none());
+        assert_eq!(
+            row.get::<Option<String>, _>("active_work_item_id")
+                .as_deref(),
+            None
+        );
     }
 
     #[test]
