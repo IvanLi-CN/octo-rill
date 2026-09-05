@@ -1003,7 +1003,7 @@ test("install prompt appears when beforeinstallprompt fires and hides after appi
 	const server = await startStaticPwaServer();
 	try {
 		await page.goto(server.origin);
-		await waitForServiceWorkerControl(page);
+		await page.waitForLoadState("networkidle");
 
 		await dispatchBeforeInstallPrompt(page);
 		await expect(page.locator("[data-version-update-notice]")).toContainText(
