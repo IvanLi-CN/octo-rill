@@ -1,7 +1,19 @@
-import { ArrowLeft, ChevronRight, RefreshCw, RotateCcw } from "lucide-react";
+import {
+	ArrowLeft,
+	ChevronDown,
+	ChevronRight,
+	RefreshCw,
+	RotateCcw,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { AiRecordDetailRoute } from "@/admin/jobsRouteState";
+import {
+	AI_RECORD_STATUS_VALUES,
+	DEFAULT_AI_RECORD_ROUTE_FILTERS,
+	type AiRecordDetailRoute,
+	type AiRecordRouteFilters,
+	type AiRecordStatus,
+} from "@/admin/jobsRouteState";
 import {
 	type AdminCollectionAttempt,
 	type AdminCollectionRecordDetail,
@@ -16,6 +28,11 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import {
+	Popover,
+	PopoverContent,
+	PopoverTrigger,
+} from "@/components/ui/popover";
 import {
 	Select,
 	SelectContent,
@@ -219,14 +236,19 @@ function AttemptCountRangeFilter({
 
 function statusLabel(status: string) {
 	switch (status) {
+		case "not_started":
+			return "未开始";
+		case "historical_unknown":
+			return "历史未记录";
 		case "queued":
 			return "排队中";
 		case "batched":
 			return "已批处理";
 		case "running":
 			return "进行中";
-		case "completed":
 		case "succeeded":
+			return "成功";
+		case "completed":
 		case "ready":
 			return "已完成";
 		case "failed":
@@ -243,6 +265,86 @@ function statusLabel(status: string) {
 		default:
 			return status || "未记录";
 	}
+}
+
+const STATUS_LABELS: Record<AiRecordStatus, string> = {
+	not_started: "未开始",
+	queued: "排队中",
+	running: "进行中",
+	succeeded: "成功",
+	failed: "失败",
+	missing: "缺少结果",
+	disabled: "已停用",
+	historical_unknown: "历史未记录",
+};
+
+function StatusFilterMenu({
+	label,
+	value,
+	onChange,
+	disabled,
+}: {
+	label: string;
+	value: AiRecordStatus[];
+	onChange: (value: AiRecordStatus[]) => void;
+	disabled?: boolean;
+}) {
+	const summary = value.length === 0 ? "全部状态" : `${value.length} 项已选`;
+	return (
+		<Popover>
+			<PopoverTrigger asChild>
+				<Button
+					type="button"
+					variant="outline"
+					className="min-h-11 justify-between gap-3 sm:min-w-40"
+					disabled={disabled}
+					aria-label={`${label}筛选`}
+				>
+					<span className="truncate">
+						{label} · {summary}
+					</span>
+					<ChevronDown aria-hidden="true" className="size-4 shrink-0" />
+				</Button>
+			</PopoverTrigger>
+			<PopoverContent align="start" className="space-y-2 p-2">
+				<div className="flex items-center justify-between px-2 py-1">
+					<span className="font-medium text-sm">{label}状态</span>
+					{value.length > 0 ? (
+						<Button
+							type="button"
+							variant="ghost"
+							size="sm"
+							onClick={() => onChange([])}
+						>
+							清除
+						</Button>
+					) : null}
+				</div>
+				{AI_RECORD_STATUS_VALUES.map((status) => {
+					const checked = value.includes(status);
+					return (
+						<label
+							key={status}
+							className="flex cursor-pointer items-center gap-3 rounded-md px-2 py-2 text-sm hover:bg-muted"
+						>
+							<input
+								type="checkbox"
+								checked={checked}
+								onChange={() =>
+									onChange(
+										checked
+											? value.filter((item) => item !== status)
+											: [...value, status].sort(),
+									)
+								}
+							/>
+							<span>{STATUS_LABELS[status]}</span>
+						</label>
+					);
+				})}
+			</PopoverContent>
+		</Popover>
+	);
 }
 
 function statusTone(status: string) {
@@ -262,6 +364,31 @@ function statusTone(status: string) {
 			return "border-emerald-300 bg-emerald-100/90 text-emerald-900 dark:border-emerald-500/60 dark:bg-emerald-500/20 dark:text-emerald-100";
 		default:
 			return "border-border bg-muted/60 text-foreground";
+	}
+}
+
+function normalizedDisplayStatus(summary: AdminCollectionTaskSummary) {
+	if (summary.display_status) return summary.display_status;
+	switch (summary.status) {
+		case "queued":
+		case "batched":
+		case "retry_scheduled":
+			return "queued";
+		case "running":
+			return "running";
+		case "completed":
+		case "succeeded":
+		case "ready":
+			return "succeeded";
+		case "failed":
+		case "error":
+			return "failed";
+		case "missing":
+			return "missing";
+		case "disabled":
+			return "disabled";
+		default:
+			return "historical_unknown";
 	}
 }
 
@@ -291,7 +418,7 @@ function TaskSummaryCell({ summary }: { summary: AdminCollectionTaskSummary }) {
 		<TableCell className="whitespace-normal">
 			<div className="min-w-0 space-y-2">
 				<div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-					<RecordStatus status={summary.status} />
+					<RecordStatus status={normalizedDisplayStatus(summary)} />
 					<span className="text-muted-foreground text-xs">
 						{summary.retry_count} 次
 					</span>
@@ -488,7 +615,7 @@ function CompactTask({
 		<div className="border-t pt-3">
 			<div className="flex items-center justify-between gap-2">
 				<span className="text-muted-foreground text-xs">{label}</span>
-				<RecordStatus status={summary.status} />
+				<RecordStatus status={normalizedDisplayStatus(summary)} />
 			</div>
 			<p className="text-muted-foreground mt-2 text-xs">
 				重试 {summary.retry_count} · 上次{" "}
@@ -554,7 +681,7 @@ function ProcessingSummary({
 		<div className="space-y-2 border-t pt-3">
 			<div className="flex items-center justify-between gap-3">
 				<h3 className="font-medium text-sm">{label}</h3>
-				<RecordStatus status={summary.status} />
+				<RecordStatus status={normalizedDisplayStatus(summary)} />
 			</div>
 			<div className="text-muted-foreground grid grid-cols-2 gap-x-3 gap-y-2 text-xs">
 				<span>重试 {summary.retry_count} 次</span>
@@ -780,24 +907,40 @@ function LlmDetail({ detail }: { detail: AdminLlmCallDetailResponse }) {
 
 export function AiOperationsRecordsSection({
 	detailRoute,
+	filters: routeFilters,
+	onFiltersChange,
 	onOpenRecord,
 	onOpenAttempt,
 	onOpenLlm,
 	onCloseRecord,
 }: {
 	detailRoute: AiRecordDetailRoute | null;
+	filters?: AiRecordRouteFilters;
+	onFiltersChange?: (filters: AiRecordRouteFilters) => void;
 	onOpenRecord: (kind: CollectionTab, id: string) => void;
 	onOpenAttempt: (attemptId: string) => void;
 	onOpenLlm: (callId: string) => void;
 	onCloseRecord: () => void;
 }) {
 	const compact = useCompactLayout();
-	const [tab, setTab] = useState<CollectionTab>("release");
-	const [preset, setPreset] = useState<TimeRangePreset>("24h");
-	const [range, setRange] = useState(initialRange);
-	const [attemptRange, setAttemptRange] = useState<AttemptCountRange>(
-		DEFAULT_ATTEMPT_RANGE,
+	const initialFilters = routeFilters ?? DEFAULT_AI_RECORD_ROUTE_FILTERS;
+	const [tab, setTab] = useState<CollectionTab>(initialFilters.kind);
+	const [preset, setPreset] = useState<TimeRangePreset>(initialFilters.preset);
+	const [range, setRange] = useState(() =>
+		initialFilters.from && initialFilters.before
+			? { from: initialFilters.from, before: initialFilters.before }
+			: initialRange(),
 	);
+	const [translationStatuses, setTranslationStatuses] = useState<
+		AiRecordStatus[]
+	>(initialFilters.translationStatus);
+	const [polishStatuses, setPolishStatuses] = useState<AiRecordStatus[]>(
+		initialFilters.polishStatus,
+	);
+	const [attemptRange, setAttemptRange] = useState<AttemptCountRange>({
+		min: initialFilters.attemptMin,
+		max: initialFilters.attemptMax,
+	});
 	const [appliedAttemptRange, setAppliedAttemptRange] =
 		useState<AttemptCountRange>(DEFAULT_ATTEMPT_RANGE);
 	const [page, setPage] = useState(1);
@@ -816,6 +959,53 @@ export function AiOperationsRecordsSection({
 	const [detailError, setDetailError] = useState<string | null>(null);
 	const listRequestRef = useRef(0);
 	const detailRequestRef = useRef(0);
+	const commitFilters = useCallback(
+		(next: Partial<AiRecordRouteFilters>) => {
+			if (!onFiltersChange) return;
+			const currentFilters = routeFilters ?? DEFAULT_AI_RECORD_ROUTE_FILTERS;
+			onFiltersChange({
+				...currentFilters,
+				kind: tab,
+				preset,
+				from:
+					next.from ?? (preset === "custom" ? range.from : currentFilters.from),
+				before:
+					next.before ??
+					(preset === "custom" ? range.before : currentFilters.before),
+				translationStatus: translationStatuses,
+				polishStatus: polishStatuses,
+				attemptMin: attemptRange.min,
+				attemptMax: attemptRange.max,
+				...next,
+			});
+		},
+		[
+			range.before,
+			range.from,
+			attemptRange.max,
+			attemptRange.min,
+			onFiltersChange,
+			polishStatuses,
+			preset,
+			routeFilters,
+			tab,
+			translationStatuses,
+		],
+	);
+	useEffect(() => {
+		if (!routeFilters) return;
+		setTab(routeFilters.kind);
+		setPreset(routeFilters.preset);
+		if (routeFilters.from && routeFilters.before) {
+			setRange({ from: routeFilters.from, before: routeFilters.before });
+		}
+		setTranslationStatuses(routeFilters.translationStatus);
+		setPolishStatuses(routeFilters.polishStatus);
+		setAttemptRange({
+			min: routeFilters.attemptMin,
+			max: routeFilters.attemptMax,
+		});
+	}, [routeFilters]);
 	const selectedRange = useMemo(() => {
 		if (preset === "custom") return range;
 		const end = recordNow();
@@ -825,25 +1015,41 @@ export function AiOperationsRecordsSection({
 			before: end.toISOString(),
 		};
 	}, [preset, range]);
-	const setRangePreset = useCallback((next: TimeRangePreset) => {
-		setPreset(next);
-		if (next !== "custom") {
-			const end = recordNow();
-			const hours = next === "7d" ? 7 * 24 : next === "30d" ? 30 * 24 : 24;
-			setRange({
-				from: new Date(end.getTime() - hours * 60 * 60 * 1000).toISOString(),
-				before: end.toISOString(),
-			});
-		}
-		setPage(1);
-	}, []);
+	const setRangePreset = useCallback(
+		(next: TimeRangePreset) => {
+			setPreset(next);
+			if (next !== "custom") {
+				const end = recordNow();
+				const hours = next === "7d" ? 7 * 24 : next === "30d" ? 30 * 24 : 24;
+				const nextRange = {
+					from: new Date(end.getTime() - hours * 60 * 60 * 1000).toISOString(),
+					before: end.toISOString(),
+				};
+				setRange(nextRange);
+				commitFilters({ preset: next });
+			} else {
+				commitFilters({ preset: next });
+			}
+			setPage(1);
+		},
+		[commitFilters],
+	);
 	useEffect(() => {
 		const timeout = window.setTimeout(() => {
 			setAppliedAttemptRange(attemptRange);
+			if (
+				routeFilters?.attemptMin !== attemptRange.min ||
+				routeFilters?.attemptMax !== attemptRange.max
+			) {
+				commitFilters({
+					attemptMin: attemptRange.min,
+					attemptMax: attemptRange.max,
+				});
+			}
 			setPage(1);
 		}, 250);
 		return () => window.clearTimeout(timeout);
-	}, [attemptRange]);
+	}, [attemptRange, commitFilters, routeFilters]);
 	useEffect(() => {
 		setPage(1);
 	}, [
@@ -852,6 +1058,8 @@ export function AiOperationsRecordsSection({
 		selectedRange.from,
 		appliedAttemptRange.max,
 		appliedAttemptRange.min,
+		polishStatuses,
+		translationStatuses,
 	]);
 	useEffect(() => {
 		const requestId = listRequestRef.current + 1;
@@ -869,6 +1077,12 @@ export function AiOperationsRecordsSection({
 		}
 		if (appliedAttemptRange.max !== null) {
 			params.set("attempt_max", String(appliedAttemptRange.max));
+		}
+		if (translationStatuses.length > 0 && tab !== "brief") {
+			params.set("translation_status", translationStatuses.join(","));
+		}
+		if (polishStatuses.length > 0) {
+			params.set("polish_status", polishStatuses.join(","));
 		}
 		void apiGetAdminCollectionRecords(tab, params)
 			.then((response) => {
@@ -891,6 +1105,8 @@ export function AiOperationsRecordsSection({
 		tab,
 		appliedAttemptRange.max,
 		appliedAttemptRange.min,
+		polishStatuses,
+		translationStatuses,
 	]);
 	useEffect(() => {
 		if (!detailRoute) {
@@ -954,6 +1170,30 @@ export function AiOperationsRecordsSection({
 			onCloseRecord();
 		}
 	};
+	const hasFilters =
+		translationStatuses.length > 0 ||
+		polishStatuses.length > 0 ||
+		attemptRange.min > 0 ||
+		attemptRange.max !== null ||
+		preset === "custom";
+	const clearFilters = () => {
+		const nextRange = initialRange();
+		setTranslationStatuses([]);
+		setPolishStatuses([]);
+		setAttemptRange(DEFAULT_ATTEMPT_RANGE);
+		setPreset("24h");
+		setRange(nextRange);
+		commitFilters({
+			preset: "24h",
+			from: "",
+			before: "",
+			translationStatus: [],
+			polishStatus: [],
+			attemptMin: 0,
+			attemptMax: null,
+		});
+		setPage(1);
+	};
 	if (compact && detailRoute)
 		return (
 			<section aria-label="采集记录详情" className="space-y-4">
@@ -983,7 +1223,7 @@ export function AiOperationsRecordsSection({
 				<CardHeader className="gap-4">
 					<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
 						<CardTitle>采集与处理记录</CardTitle>
-						<div className="flex items-center gap-2">
+						<div className="flex flex-wrap items-center gap-2">
 							<Select
 								value={preset}
 								onValueChange={(value) =>
@@ -1015,6 +1255,61 @@ export function AiOperationsRecordsSection({
 							</Button>
 						</div>
 					</div>
+					<div className="flex flex-col gap-3 border-t pt-4 xl:flex-row xl:flex-wrap xl:items-center">
+						<Tabs
+							className="w-full min-w-0 lg:min-w-[560px] lg:flex-1"
+							value={tab}
+							onValueChange={(value) => {
+								const nextTab = value as CollectionTab;
+								setTab(nextTab);
+								commitFilters({ kind: nextTab });
+							}}
+						>
+							<TabsList className="grid w-full grid-cols-3 sm:inline-grid sm:w-fit">
+								<TabsTrigger className="sm:min-w-24" value="release">
+									Release
+								</TabsTrigger>
+								<TabsTrigger className="sm:min-w-24" value="announcement">
+									公告
+								</TabsTrigger>
+								<TabsTrigger className="sm:min-w-24" value="brief">
+									日报
+								</TabsTrigger>
+							</TabsList>
+						</Tabs>
+						<div className="flex flex-wrap items-center gap-2">
+							{tab !== "brief" ? (
+								<StatusFilterMenu
+									label="翻译"
+									value={translationStatuses}
+									onChange={(value) => {
+										setTranslationStatuses(value);
+										commitFilters({ translationStatus: value });
+									}}
+									disabled={loading}
+								/>
+							) : null}
+							<StatusFilterMenu
+								label="润色"
+								value={polishStatuses}
+								onChange={(value) => {
+									setPolishStatuses(value);
+									commitFilters({ polishStatus: value });
+								}}
+								disabled={loading}
+							/>
+						</div>
+						<AttemptCountRangeFilter
+							value={attemptRange}
+							disabled={loading}
+							onChange={setAttemptRange}
+						/>
+						{hasFilters ? (
+							<Button type="button" variant="ghost" onClick={clearFilters}>
+								清除全部筛选
+							</Button>
+						) : null}
+					</div>
 					{preset === "custom" ? (
 						<div className="grid gap-2 sm:grid-cols-2">
 							<Input
@@ -1022,48 +1317,25 @@ export function AiOperationsRecordsSection({
 								className="min-h-11"
 								type="datetime-local"
 								value={toLocalInput(range.from)}
-								onChange={(event) =>
-									setRange((current) => ({
-										...current,
-										from: localInputToIso(event.target.value),
-									}))
-								}
+								onChange={(event) => {
+									const from = localInputToIso(event.target.value);
+									setRange((current) => ({ ...current, from }));
+									commitFilters({ from, preset: "custom" });
+								}}
 							/>
 							<Input
 								aria-label="结束时间"
 								className="min-h-11"
 								type="datetime-local"
 								value={toLocalInput(range.before)}
-								onChange={(event) =>
-									setRange((current) => ({
-										...current,
-										before: localInputToIso(event.target.value),
-									}))
-								}
+								onChange={(event) => {
+									const before = localInputToIso(event.target.value);
+									setRange((current) => ({ ...current, before }));
+									commitFilters({ before, preset: "custom" });
+								}}
 							/>
 						</div>
 					) : null}
-					<Tabs
-						value={tab}
-						onValueChange={(value) => setTab(value as CollectionTab)}
-					>
-						<TabsList className="grid w-full grid-cols-3 sm:inline-grid sm:w-fit">
-							<TabsTrigger className="sm:min-w-24" value="release">
-								Release
-							</TabsTrigger>
-							<TabsTrigger className="sm:min-w-24" value="announcement">
-								公告
-							</TabsTrigger>
-							<TabsTrigger className="sm:min-w-24" value="brief">
-								日报
-							</TabsTrigger>
-						</TabsList>
-					</Tabs>
-					<AttemptCountRangeFilter
-						value={attemptRange}
-						disabled={loading}
-						onChange={setAttemptRange}
-					/>
 				</CardHeader>
 				<CardContent className="space-y-3">
 					{error ? <p className="text-destructive text-sm">{error}</p> : null}
@@ -1073,10 +1345,23 @@ export function AiOperationsRecordsSection({
 						</p>
 					) : null}
 					{!loading && !error && items.length === 0 ? (
-						<p className="text-muted-foreground border-y py-8 text-sm">
-							当前时间范围没有
-							{tab === "brief" ? "生成的日报" : "发现的采集记录"}。
-						</p>
+						<div className="text-muted-foreground flex flex-wrap items-center justify-between gap-3 border-y py-8 text-sm">
+							<p>
+								{hasFilters
+									? "当前筛选条件没有匹配记录。"
+									: `当前时间范围没有${tab === "brief" ? "生成的日报" : "发现的采集记录"}。`}
+							</p>
+							{hasFilters ? (
+								<Button
+									type="button"
+									variant="outline"
+									size="sm"
+									onClick={clearFilters}
+								>
+									清除筛选
+								</Button>
+							) : null}
+						</div>
 					) : null}
 					{!loading && !error && items.length > 0 ? (
 						<>

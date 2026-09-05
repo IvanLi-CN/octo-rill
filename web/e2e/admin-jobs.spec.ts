@@ -2570,6 +2570,12 @@ test("content processing audit shows retry state, model, error, and call detail"
 	await expect(
 		recordsTable.getByText("v2.31.0", { exact: true }),
 	).toBeVisible();
+	await page.getByRole("button", { name: "翻译筛选" }).click();
+	await page.getByRole("checkbox", { name: "排队中" }).check();
+	await expect
+		.poll(() => listRequests.at(-1)?.searchParams.get("translation_status"))
+		.toBe("queued");
+	await page.getByRole("checkbox", { name: "排队中" }).uncheck();
 	const recordTypeTabs = page
 		.getByRole("tabpanel", { name: "内容处理" })
 		.getByRole("tablist");
