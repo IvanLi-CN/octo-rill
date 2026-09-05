@@ -26,7 +26,7 @@
 
 - VER-RUST-SCHEDULER: 覆盖: REQ-SCHEDULER, REQ-ATTEMPT-AUDIT。通过 Rust 单元与集成测试验证队列、单一 Release 润色所有者、批次、自动恢复、手动重试、精确调用归因和追加式事件写入。
 - VER-ADMIN-API: 覆盖: REQ-ATTEMPT-AUDIT, REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过管理员 API 测试验证时间筛选、分页、任务摘要、尝试历史、安全错误字段与诊断载荷过期语义。
-- VER-WEB-ADMIN: 覆盖: REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过 Web 构建、Playwright 回归与 `ui_demo` 视觉证据验证分组列表、桌面抽屉、移动详情路由、模型调用与输出契约的双状态，以及尝试列表直接可见的模型、错误和重入队状态。
+- VER-WEB-ADMIN: 覆盖: REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过 Web 构建、Playwright 回归与 Storybook canvas 视觉证据验证分组列表、桌面抽屉、移动详情路由、模型调用与输出契约的双状态，以及尝试列表直接可见的模型、错误和重入队状态。
 
 ## 目标 / 非目标
 
@@ -67,7 +67,8 @@
 | `/api/admin/jobs/translations/*` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web-admin |
 | `/api/admin/jobs/ai-records/{record_kind}/*` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web-admin |
 | `translation_requests` / `translation_work_items` / `translation_batches` / `translation_batch_items` / `translation_attempt_events` | DB schema | internal | New | `./contracts/db.md` | backend | backend |
-| `llm_calls` translation parent link | DB schema | internal | Modify | `./contracts/db.md` | backend | backend / web-admin |
+| `llm_calls` delivery metadata and translation parent link | DB schema | internal | Modify | `./contracts/db.md` | backend | backend / web-admin |
+| `translation_attempt_llm_calls` | DB schema | internal | New | `./contracts/db.md` | backend | backend / web-admin |
 
 ### 契约文档（按 Kind 拆分）
 

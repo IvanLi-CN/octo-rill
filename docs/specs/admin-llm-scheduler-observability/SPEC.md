@@ -51,7 +51,9 @@
 | `GET /api/admin/jobs/llm/status` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web-admin |
 | `GET /api/admin/jobs/llm/calls` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web-admin |
 | `GET /api/admin/jobs/llm/calls/{call_id}` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web-admin |
+| `POST /api/admin/jobs/llm/calls/{call_id}/diagnostic-access` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web-admin |
 | `llm_calls` | DB schema | internal | New | `./contracts/db.md` | backend | backend |
+| `llm_diagnostic_access_audit` | DB schema | internal | New | `./contracts/db.md` | backend | backend |
 
 ### 契约文档（按 Kind 拆分）
 

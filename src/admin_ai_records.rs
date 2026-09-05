@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tower_sessions::Session;
 
-use crate::{api, error::ApiError, state::AppState};
+use crate::{api, error::ApiError, state::AppState, translations};
 
 const PAGE_SIZE_DEFAULT: i64 = 20;
 
@@ -90,6 +90,15 @@ pub struct AdminCollectionLlmLink {
     pub status: String,
     pub source: String,
     pub model: String,
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relation_role: Option<String>,
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_availability: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -105,6 +114,10 @@ pub struct AdminCollectionAttempt {
     pub error_code: Option<String>,
     pub error_summary: Option<String>,
     pub failure_class: Option<String>,
+    pub processing_stage: Option<String>,
+    pub provider_status: Option<String>,
+    pub output_contract_status: Option<String>,
+    pub retry_disposition: Option<String>,
     pub retry_eligible: bool,
     pub next_retry_at: Option<String>,
     pub llm_calls: Vec<AdminCollectionLlmLink>,
@@ -156,10 +169,24 @@ struct AttemptEventRow {
     error_code: Option<String>,
     error_summary: Option<String>,
     failure_class: Option<String>,
+    processing_stage: Option<String>,
+    provider_status: Option<String>,
+    output_contract_status: Option<String>,
+    retry_disposition: Option<String>,
     retry_eligible: i64,
     next_retry_at: Option<String>,
     llm_call_ids_json: String,
     created_at: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AttemptCallLinkRow {
+    work_item_id: String,
+    attempt_no: i64,
+    llm_call_id: String,
+    stage: String,
+    relation_role: String,
+    evidence_availability: String,
 }
 
 #[derive(Default)]
@@ -174,6 +201,10 @@ struct AttemptBuild {
     error_code: Option<String>,
     error_summary: Option<String>,
     failure_class: Option<String>,
+    processing_stage: Option<String>,
+    provider_status: Option<String>,
+    output_contract_status: Option<String>,
+    retry_disposition: Option<String>,
     retry_eligible: bool,
     next_retry_at: Option<String>,
     llm_calls: Vec<AdminCollectionLlmLink>,
@@ -215,6 +246,18 @@ fn apply_attempt_event(item: &mut AttemptBuild, event: &AttemptEventRow) {
     }
     if let Some(value) = &event.failure_class {
         item.failure_class = Some(value.clone());
+    }
+    if let Some(value) = &event.processing_stage {
+        item.processing_stage = Some(value.clone());
+    }
+    if let Some(value) = &event.provider_status {
+        item.provider_status = Some(value.clone());
+    }
+    if let Some(value) = &event.output_contract_status {
+        item.output_contract_status = Some(value.clone());
+    }
+    if let Some(value) = &event.retry_disposition {
+        item.retry_disposition = Some(value.clone());
     }
     if event.event_type != "attempt_queued" {
         item.retry_eligible |= event.retry_eligible != 0;
@@ -870,7 +913,7 @@ async fn load_task_attempts(
         .map(|task| (task.id.clone(), task.kind.clone()))
         .collect::<HashMap<_, _>>();
     let mut query = QueryBuilder::<Sqlite>::new(
-        "SELECT work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, next_retry_at, llm_call_ids_json, created_at FROM translation_attempt_events WHERE work_item_id IN (",
+        "SELECT work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, processing_stage, provider_status, output_contract_status, retry_disposition, retry_eligible, next_retry_at, llm_call_ids_json, created_at FROM translation_attempt_events WHERE work_item_id IN (",
     );
     {
         let mut separated = query.separated(", ");
@@ -914,6 +957,34 @@ async fn load_task_attempts(
             .map(|call| (call.id.clone(), call))
             .collect::<HashMap<_, _>>()
     };
+    let mut relation_query = QueryBuilder::<Sqlite>::new(
+        "SELECT work_item_id, attempt_no, llm_call_id, stage, relation_role, evidence_availability FROM translation_attempt_llm_calls WHERE work_item_id IN (",
+    );
+    {
+        let mut separated = relation_query.separated(", ");
+        for task in tasks {
+            separated.push_bind(task.id.as_str());
+        }
+    }
+    relation_query.push(")");
+    let relation_rows = relation_query
+        .build_query_as::<AttemptCallLinkRow>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let relation_by_key = relation_rows
+        .into_iter()
+        .map(|row| {
+            (
+                (
+                    row.work_item_id.clone(),
+                    row.attempt_no,
+                    row.llm_call_id.clone(),
+                ),
+                row,
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let mut grouped = HashMap::<(String, i64), AttemptBuild>::new();
     for event in events {
         let key = (event.work_item_id.clone(), event.attempt_no);
@@ -938,8 +1009,47 @@ async fn load_task_attempts(
             if let Some(call) = calls_by_id.get(&id)
                 && !item.llm_calls.iter().any(|existing| existing.id == call.id)
             {
-                item.llm_calls.push(call.clone());
+                let mut linked_call = call.clone();
+                if let Some(relation) =
+                    relation_by_key.get(&(event.work_item_id.clone(), event.attempt_no, id.clone()))
+                {
+                    linked_call.stage = Some(relation.stage.clone());
+                    linked_call.relation_role = Some(relation.relation_role.clone());
+                    linked_call.evidence_availability =
+                        Some(relation.evidence_availability.clone());
+                } else {
+                    linked_call.relation_role = Some("legacy_unverified".to_owned());
+                    linked_call.evidence_availability = Some("not_captured".to_owned());
+                }
+                item.llm_calls.push(linked_call);
             }
+        }
+        for ((_work_item_id, _attempt_no, _), relation) in
+            relation_by_key
+                .iter()
+                .filter(|((work_item_id, attempt_no, _), _)| {
+                    work_item_id == &event.work_item_id && *attempt_no == event.attempt_no
+                })
+        {
+            if item
+                .llm_calls
+                .iter()
+                .any(|existing| existing.id == relation.llm_call_id)
+            {
+                continue;
+            }
+            item.llm_calls
+                .push(calls_by_id.get(&relation.llm_call_id).cloned().unwrap_or(
+                    AdminCollectionLlmLink {
+                        id: relation.llm_call_id.clone(),
+                        status: "expired".to_owned(),
+                        source: "诊断载荷已过期".to_owned(),
+                        model: "unknown".to_owned(),
+                        stage: None,
+                        relation_role: None,
+                        evidence_availability: Some(relation.evidence_availability.clone()),
+                    },
+                ));
         }
     }
     let mut attempts = grouped
@@ -957,6 +1067,10 @@ async fn load_task_attempts(
                 error_code: item.error_code,
                 error_summary: item.error_summary,
                 failure_class: item.failure_class,
+                processing_stage: item.processing_stage,
+                provider_status: item.provider_status,
+                output_contract_status: item.output_contract_status,
+                retry_disposition: item.retry_disposition,
                 retry_eligible: item.retry_eligible,
                 next_retry_at: item.next_retry_at,
                 llm_calls: item.llm_calls,
@@ -981,26 +1095,43 @@ async fn load_brief_attempts(
     Ok(calls
         .into_iter()
         .enumerate()
-        .map(|(index, call)| AdminCollectionAttempt {
-            id: call.id.clone(),
-            pipeline: "polish".to_owned(),
-            attempt_no: i64::try_from(index + 1).unwrap_or(i64::MAX),
-            trigger: "daily_brief_generation".to_owned(),
-            status: call.status.clone(),
-            started_at: call.started_at,
-            last_attempt_at: call.updated_at,
-            finished_at: call.finished_at,
-            error_code: None,
-            error_summary: call.error_text,
-            failure_class: call.failure_class,
-            retry_eligible: false,
-            next_retry_at: None,
-            llm_calls: vec![AdminCollectionLlmLink {
-                id: call.id,
-                status: call.status,
-                source: call.source,
-                model: call.model,
-            }],
+        .map(|(index, call)| {
+            let classified = translations::classify_translation_error(call.error_text.as_deref());
+            AdminCollectionAttempt {
+                id: call.id.clone(),
+                pipeline: "polish".to_owned(),
+                attempt_no: i64::try_from(index + 1).unwrap_or(i64::MAX),
+                trigger: "daily_brief_generation".to_owned(),
+                status: call.status.clone(),
+                started_at: call.started_at,
+                last_attempt_at: call.updated_at,
+                finished_at: call.finished_at,
+                error_code: classified.as_ref().map(|value| value.code.to_owned()),
+                error_summary: classified.map(|value| value.summary.to_owned()),
+                failure_class: call.failure_class,
+                processing_stage: Some("brief".to_owned()),
+                provider_status: Some(
+                    if call.status == "succeeded" {
+                        "succeeded"
+                    } else {
+                        "failed"
+                    }
+                    .to_owned(),
+                ),
+                output_contract_status: None,
+                retry_disposition: Some("not_needed".to_owned()),
+                retry_eligible: false,
+                next_retry_at: None,
+                llm_calls: vec![AdminCollectionLlmLink {
+                    id: call.id,
+                    status: call.status,
+                    source: call.source,
+                    model: call.model,
+                    stage: None,
+                    relation_role: None,
+                    evidence_availability: None,
+                }],
+            }
         })
         .collect())
 }
@@ -1312,6 +1443,10 @@ mod tests {
             error_code: None,
             error_summary: None,
             failure_class: None,
+            processing_stage: None,
+            provider_status: None,
+            output_contract_status: None,
+            retry_disposition: None,
             retry_eligible: 0,
             next_retry_at: None,
             llm_call_ids_json: "[]".to_owned(),
