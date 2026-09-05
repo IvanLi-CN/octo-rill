@@ -110,6 +110,12 @@
 - `cd web && bun run build`
 - `cd web && bun run e2e -- admin-jobs.spec.ts`
 
+## Visual Evidence
+
+![LLM 诊断失败详情（桌面）](./assets/llm-call-diagnostic-failed.png)
+![LLM 诊断证据过期（桌面）](./assets/llm-call-diagnostic-expired.png)
+![LLM 诊断失败详情（移动端）](./assets/llm-call-diagnostic-failed-mobile.png)
+
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
 - 风险：明文保存完整 prompt/response 带来敏感信息泄漏风险（已接受）。
