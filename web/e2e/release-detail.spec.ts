@@ -2009,7 +2009,7 @@ test("feed smart response body decode error auto retries on page load", async ({
 		smartResolveStatuses: {
 			[releaseId]: "ready",
 		},
-		smartResolveDelayMs: 750,
+		smartResolveDelayMs: 3000,
 	});
 
 	await page.goto("/?tab=releases");
