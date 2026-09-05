@@ -2183,7 +2183,7 @@ test("feed auto retry falls back to the existing error panel after one failed au
 				error_detail: "AI returned 403 Forbidden: Chat upstream returned 403",
 			},
 		},
-		smartResolveDelayMs: 500,
+		smartResolveDelayMs: 1200,
 	});
 
 	await page.goto("/?tab=releases");
