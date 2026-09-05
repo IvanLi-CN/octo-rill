@@ -1176,6 +1176,9 @@ export type AdminLlmCallItem = {
 	duration_ms: number | null;
 	input_tokens: number | null;
 	output_tokens: number | null;
+	finish_reason?: string | null;
+	provider_request_id?: string | null;
+	provider_http_status?: number | null;
 	cached_input_tokens: number | null;
 	total_tokens: number | null;
 	failure_class: string | null;
@@ -1189,6 +1192,12 @@ export type AdminLlmCallItem = {
 	updated_at: string;
 };
 export type AdminLlmCallDetailResponse = AdminLlmCallItem & {
+	processing_stage?: string | null;
+	provider_status?: string | null;
+	output_contract_status?: string | null;
+	retry_disposition?: string | null;
+	relation_role?: string | null;
+	evidence_availability?: string | null;
 	input_messages_json: string | null;
 	output_messages_json: string | null;
 	prompt_text: string;
@@ -1204,6 +1213,9 @@ export type AdminLlmCallDetailResponse = AdminLlmCallItem & {
 		from_model: string | null;
 		to_model: string | null;
 		fallback_count: number | null;
+		finish_reason?: string | null;
+		provider_request_id?: string | null;
+		provider_http_status?: number | null;
 		created_at: string;
 	}[];
 };
@@ -1505,6 +1517,15 @@ export async function apiGetAdminLlmCallDetail(
 ): Promise<AdminLlmCallDetailResponse> {
 	return apiGet<AdminLlmCallDetailResponse>(
 		`/api/admin/jobs/llm/calls/${encodeURIComponent(callId)}`,
+	);
+}
+export async function apiAuditAdminLlmDiagnosticAccess(
+	callId: string,
+	action: "reveal" | "copy",
+): Promise<{ ok: boolean }> {
+	return apiPostJson<{ ok: boolean }>(
+		`/api/admin/jobs/llm/calls/${encodeURIComponent(callId)}/diagnostic-access`,
+		{ action },
 	);
 }
 export type ReleaseDetailTranslated = {
@@ -2030,6 +2051,10 @@ export type AdminTranslationAttemptEvent = {
 	error_code: string | null;
 	error_summary: string | null;
 	failure_class: string | null;
+	processing_stage?: string | null;
+	provider_status?: string | null;
+	output_contract_status?: string | null;
+	retry_disposition?: string | null;
 	retry_eligible: boolean;
 	next_retry_at: string | null;
 	llm_call_ids: string[];
@@ -2065,6 +2090,9 @@ export type AdminCollectionLlmLink = {
 	status: string;
 	source: string;
 	model: string;
+	stage?: string | null;
+	relation_role?: string | null;
+	evidence_availability?: string | null;
 };
 export type AdminCollectionRecordItem = {
 	id: string;
@@ -2095,6 +2123,10 @@ export type AdminCollectionAttempt = {
 	error_code: string | null;
 	error_summary: string | null;
 	failure_class: string | null;
+	processing_stage?: string | null;
+	provider_status?: string | null;
+	output_contract_status?: string | null;
+	retry_disposition?: string | null;
 	retry_eligible: boolean;
 	next_retry_at: string | null;
 	llm_calls: AdminCollectionLlmLink[];
@@ -2138,6 +2170,9 @@ export type AdminTranslationLinkedLlmCall = {
 	model: string;
 	scheduler_wait_ms: number;
 	duration_ms: number | null;
+	stage?: string | null;
+	relation_role?: string | null;
+	evidence_availability?: string | null;
 	created_at: string;
 };
 export type AdminTranslationBatchResultItem = TranslationResultItem & {
