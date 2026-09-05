@@ -12,9 +12,13 @@
   - batch membership and terminal per-item status/error
 - `translation_attempt_events`
   - append-only, metadata-only attempt history keyed by `work_item_id` and queryable by `entity_id + kind + variant`
-  - records `attempt_no`, `trigger`, `event_type`, terminal result or safe failure classification, retry eligibility, next retry time, and optional request/batch/LLM-call links
+  - records `attempt_no`, `trigger`, `event_type`, processing stage, terminal result or safe failure classification, retry disposition, next retry time, and optional request/batch links
   - deliberately has no foreign keys so completed audit history remains readable if operational request, batch, or LLM records are later pruned
   - never stores source blocks, prompts, raw model responses, or raw upstream error text; it retains only normalized error code and summary
+- `translation_attempt_llm_calls`
+  - append-only attribution link keyed by `work_item_id + attempt_no + llm_call_id + stage + ordinal`
+  - records the relation role and an availability snapshot without retaining prompt, response, or raw upstream errors
+  - remains readable after `llm_calls` retention cleanup so the admin surface can distinguish expired diagnostic evidence from absent attribution
 - `translation_work_items` recovery columns
   - `failure_class TEXT NULL`
   - `retry_count INTEGER NOT NULL DEFAULT 0`
@@ -36,6 +40,7 @@
 
 - `llm_calls`
   - add `parent_translation_batch_id`
+  - records provider delivery metadata, including `finish_reason`, provider request identifier, and HTTP status when available
   - add `runtime_owner_id TEXT NULL`
   - add `lease_heartbeat_at TEXT NULL`
   - add translation-specific linkage indexes for admin tracing

@@ -151,7 +151,7 @@ Returns request status, timing, and the single `result` attached to the given re
 }
 ```
 
-`trigger` is one of `initial | manual_retry | automatic_recovery | system_requeue`. `event_type` is one of `attempt_queued | attempt_started | attempt_completed | retry_scheduled`. The endpoint exposes metadata, normalized error code/summary, and linked identifiers only; source text, prompts, raw model responses, and raw upstream error text remain outside this retention surface.
+`trigger` is one of `initial | manual_retry | automatic_recovery | system_requeue`. `event_type` is one of `attempt_queued | attempt_started | attempt_completed | retry_scheduled`. Each terminal attempt also exposes its processing stage, stable error code, safe error summary, retry disposition, and stage-qualified LLM-call attribution links with `available | expired | not_captured` evidence availability. The endpoint exposes metadata and linked identifiers only; source text, prompts, raw model responses, and raw upstream error text remain outside this retention surface.
 
 Admin views expose scheduler runtime status, request aggregates, batch aggregates, trigger reason, token estimate, fan-out counts, linked `llm_call` ids, and release-level retry audit history.
 
@@ -159,7 +159,7 @@ Admin views expose scheduler runtime status, request aggregates, batch aggregate
 
 `attempt_min` and `attempt_max` are optional inclusive total-attempt bounds. `attempt_min` defaults to `0`; omitting `attempt_max` means no upper bound. Both values must be integers in `0..10`, and `attempt_max` must be greater than or equal to `attempt_min`, otherwise the server returns `400`. Release and announcement records use the maximum `attempt_count` across their applicable translation and polish work items; daily briefs use the maximum linked polish call attempt count. A record with no applicable work item or call has total attempts `0`. The attempt range is applied before total counting, ordering, and pagination.
 
-A list row contains only the source record's type-specific identity and timestamps plus the translation and/or polish task summaries: status, retry count, started time, latest attempt, and completion time. The detail endpoint returns the same record summary and its ordered attempt history, including trigger, model links, safe error classification/summary, retry eligibility, and next retry time. It never returns source text, prompts, raw model output, or raw upstream errors.
+A list row contains only the source record's type-specific identity and timestamps plus the translation and/or polish task summaries: status, retry count, started time, latest attempt, and completion time. The detail endpoint returns the same record summary and its ordered attempt history, including trigger, processing stage, provider and output-contract outcomes, stage-qualified model links, safe error classification/summary, retry eligibility, next retry time, and diagnostic evidence availability. It never returns source text, prompts, raw model output, or raw upstream errors.
 
 
 ## Legacy endpoints

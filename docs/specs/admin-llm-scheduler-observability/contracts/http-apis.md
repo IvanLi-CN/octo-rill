@@ -98,6 +98,9 @@
   "prompt_text": "full prompt ...",
   "response_text": null,
   "error_text": "上游请求被限流",
+  "finish_reason": null,
+  "provider_request_id": "provider-request-placeholder",
+  "provider_http_status": 429,
   "failure_class": "rate_limited",
   "final_model": "configured-candidate",
   "fallback_count": 1,
@@ -120,7 +123,7 @@
 }
 ```
 
-详情响应还包含安全 `failure_class`、最终路由、回退次数、逐次尝试历史与恢复时间。示例中的路由标识和内容均为合成占位值，不代表运行时配置或线上记录。
+详情响应还包含安全 `failure_class`、最终路由、回退次数、逐次尝试历史、恢复时间和可用的 provider delivery metadata。内容处理下钻额外传递该调用在尝试中的阶段、关系与输出契约结果；诊断载荷过期时，该下钻返回安全的 `expired` 证据状态而非完整 payload。示例中的路由标识和内容均为合成占位值，不代表运行时配置或线上记录。
 
 ## Extended: `GET /api/admin/jobs/events` (SSE)
 
