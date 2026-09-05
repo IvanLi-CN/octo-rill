@@ -2,8 +2,10 @@ import {
 	ArrowLeft,
 	ChevronDown,
 	ChevronRight,
+	Inbox,
 	RefreshCw,
 	RotateCcw,
+	SearchX,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -61,6 +63,7 @@ import {
 	TooltipContent,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 
 type CollectionTab = AdminCollectionRecordItem["kind"];
 type TimeRangePreset = "24h" | "7d" | "30d" | "custom";
@@ -344,6 +347,61 @@ function StatusFilterMenu({
 				})}
 			</PopoverContent>
 		</Popover>
+	);
+}
+
+function CollectionEmptyState({
+	hasFilters,
+	tab,
+	onClear,
+}: {
+	hasFilters: boolean;
+	tab: CollectionTab;
+	onClear: () => void;
+}) {
+	const Icon = hasFilters ? SearchX : Inbox;
+	const isBrief = tab === "brief";
+	const title = hasFilters
+		? "没有符合条件的记录"
+		: `当前时间范围暂无${isBrief ? "日报" : "采集记录"}`;
+	const description = hasFilters
+		? "调整翻译、润色或尝试次数筛选后再试一次。"
+		: `扩大时间范围或稍后刷新，${isBrief ? "日报" : "采集记录"}会在有新结果时显示在这里。`;
+
+	return (
+		<div
+			className={cn(
+				"flex min-h-36 flex-col gap-5 rounded-xl border border-dashed border-border/80 bg-muted/20 px-4 py-6 sm:flex-row sm:items-center sm:px-6",
+				hasFilters ? "sm:justify-between" : "sm:justify-center",
+			)}
+			data-collection-empty-state="true"
+			role="status"
+			aria-live="polite"
+		>
+			<div className="flex min-w-0 items-start gap-4 sm:max-w-2xl">
+				<div className="flex size-11 shrink-0 items-center justify-center rounded-lg border border-border/70 bg-background/70 text-muted-foreground shadow-xs">
+					<Icon aria-hidden="true" className="size-5" />
+				</div>
+				<div className="min-w-0 text-left">
+					<h3 className="font-semibold text-foreground">{title}</h3>
+					<p className="text-muted-foreground mt-1.5 text-sm leading-6">
+						{description}
+					</p>
+				</div>
+			</div>
+			{hasFilters ? (
+				<Button
+					type="button"
+					variant="outline"
+					size="sm"
+					className="w-full shrink-0 sm:w-auto"
+					onClick={onClear}
+				>
+					<RotateCcw aria-hidden="true" className="size-4" />
+					清除筛选
+				</Button>
+			) : null}
+		</div>
 	);
 }
 
@@ -1348,23 +1406,11 @@ export function AiOperationsRecordsSection({
 						</p>
 					) : null}
 					{!loading && !error && items.length === 0 ? (
-						<div className="text-muted-foreground flex flex-wrap items-center justify-between gap-3 border-y py-8 text-sm">
-							<p>
-								{hasFilters
-									? "当前筛选条件没有匹配记录。"
-									: `当前时间范围没有${tab === "brief" ? "生成的日报" : "发现的采集记录"}。`}
-							</p>
-							{hasFilters ? (
-								<Button
-									type="button"
-									variant="outline"
-									size="sm"
-									onClick={clearFilters}
-								>
-									清除筛选
-								</Button>
-							) : null}
-						</div>
+						<CollectionEmptyState
+							hasFilters={hasFilters}
+							tab={tab}
+							onClear={clearFilters}
+						/>
 					) : null}
 					{!loading && !error && items.length > 0 ? (
 						<>
