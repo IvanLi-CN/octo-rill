@@ -195,7 +195,7 @@ function DashboardUserInfoCard(props: {
 				"absolute top-full right-0 z-50 mt-2 w-[min(18rem,calc(100vw-2rem))] origin-top-right rounded-[1.6rem] border bg-card/98 p-4 shadow-lg ring-1 ring-black/5 backdrop-blur motion-reduce:duration-100 dark:ring-white/10 sm:w-64",
 				motionState === "open"
 					? "animate-in fade-in-0 duration-200 motion-safe:slide-in-from-top-1 motion-safe:zoom-in-95 motion-safe:ease-[cubic-bezier(0.16,1,0.3,1)]"
-					: "animate-out fade-out-0 duration-150 ease-in motion-safe:slide-out-to-top-1 motion-safe:zoom-out-95",
+					: "animate-out fade-out-0 duration-150 ease-in fill-mode-forwards motion-safe:slide-out-to-top-1 motion-safe:zoom-out-95",
 			)}
 			data-dashboard-user-card
 			data-dashboard-user-card-motion={motionState}
