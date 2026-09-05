@@ -20230,7 +20230,7 @@ async fn prepare_release_smart_batch(
             WHERE user_id = "#,
         );
         cache_query.push_bind(user_id);
-        cache_query.push(" AND entity_type = 'release_smart' AND lang = 'zh-CN' AND status IN ('ready', 'disabled', 'missing', 'error') AND entity_id IN (");
+        cache_query.push(" AND entity_type = 'release_smart' AND lang = 'zh-CN' AND status IN ('ready', 'disabled', 'missing') AND entity_id IN (");
         {
             let mut separated = cache_query.separated(", ");
             for item in &candidates {
@@ -20262,17 +20262,6 @@ async fn prepare_release_smart_batch(
                 || (cache.status == "missing"
                     && cache.error_text.as_deref() == Some(SMART_NO_VALUABLE_VERSION_INFO))
             {
-                terminal.insert(
-                    item.release_id,
-                    ReleaseBatchTerminalState {
-                        status: cache.status.clone(),
-                        error: cache.error_text.clone(),
-                        failure_class: None,
-                    },
-                );
-                continue;
-            }
-            if cache.status == "error" {
                 terminal.insert(
                     item.release_id,
                     ReleaseBatchTerminalState {
