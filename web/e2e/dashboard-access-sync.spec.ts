@@ -389,11 +389,27 @@ test("dashboard keeps sync as a single header action for admins", async ({
 	).toHaveCount(0);
 
 	await page.mouse.move(0, 0);
-	await page.waitForTimeout(190);
-	await expect(userCard).toHaveAttribute(
-		"data-dashboard-user-card-motion",
-		"closing",
+	const closingOpacitySamples = await page.evaluate(async () => {
+		const samples: number[] = [];
+		const startedAt = performance.now();
+		while (performance.now() - startedAt < 390) {
+			const card = document.querySelector("[data-dashboard-user-card]");
+			if (card) {
+				samples.push(Number(getComputedStyle(card).opacity));
+			}
+			await new Promise(requestAnimationFrame);
+		}
+		return samples;
+	});
+	const firstFadedSample = closingOpacitySamples.findIndex(
+		(opacity) => opacity <= 0.2,
 	);
+	expect(firstFadedSample).toBeGreaterThanOrEqual(0);
+	expect(
+		closingOpacitySamples
+			.slice(firstFadedSample + 1)
+			.every((opacity) => opacity <= 0.2),
+	).toBe(true);
 	await expect(userCard).toHaveCount(0);
 });
 
