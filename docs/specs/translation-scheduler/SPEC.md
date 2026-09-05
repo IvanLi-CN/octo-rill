@@ -17,16 +17,16 @@
 
 ## Requirements
 
-- REQ-SCHEDULER: 调度器必须把翻译请求、work item、批次和结果扇出保持为独立领域模型，生产者只提交需求而不拥有组批策略。
-- REQ-ATTEMPT-AUDIT: 每次初始执行、自动恢复、手动重试及其状态转换必须在同一事务追加元数据专用的尝试事件；已到期并重新入队时，当前尝试状态必须呈现为 `queued` 而非保留过期的重试安排；事件不得保存源文本、prompt、原始模型响应或原始上游错误。
+- REQ-SCHEDULER: 调度器必须把翻译或润色请求、work item、批次和结果扇出保持为独立领域模型，生产者只提交需求而不拥有组批策略；Release 润色只能由调度器执行和写入终态缓存。
+- REQ-ATTEMPT-AUDIT: 每次初始执行、自动恢复、手动重试及其状态转换必须在同一事务追加元数据专用的尝试事件；已到期并重新入队时，当前尝试状态必须呈现为 `queued` 而非保留过期的重试安排；事件不得保存源文本、prompt、原始模型响应或原始上游错误。每个尝试必须记录处理阶段、稳定错误代码、安全摘要、重试处置以及精确的模型调用归因链接。
 - REQ-COLLECTION-RECORDS: 管理端必须按 Release、公告、日报分组、分页并以最近 24 小时为默认时间范围展示采集记录；筛选和排序使用各类型来源时间，历史空发现时间仍保留并显示为“未知”；行数据必须包含该类型的基础区分信息、发现时间和翻译或润色任务摘要，并支持在计数和分页前按记录级总尝试次数筛选。
-- REQ-RECORD-DETAIL: 桌面端必须在抽屉展示记录详情与尝试历史，移动端必须导航至详情路由；详情必须暴露模型、错误分类、重试信息和可用下钻链接。
+- REQ-RECORD-DETAIL: 桌面端必须在抽屉展示记录详情与尝试历史，移动端必须导航至详情路由；详情必须暴露处理阶段、模型调用与输出契约的独立结果、错误分类、重试信息和可用下钻链接。诊断载荷过期时必须明确呈现为过期，不得显示为未关联模型调用。
 
 ## Verification
 
-- VER-RUST-SCHEDULER: 覆盖: REQ-SCHEDULER, REQ-ATTEMPT-AUDIT。通过 Rust 单元与集成测试验证队列、批次、自动恢复、手动重试和追加式事件写入。
-- VER-ADMIN-API: 覆盖: REQ-ATTEMPT-AUDIT, REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过管理员 API 测试验证时间筛选、分页、任务摘要、尝试历史和安全错误字段。
-- VER-WEB-ADMIN: 覆盖: REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过 Web 构建、Playwright 回归与 `ui_demo` 视觉证据验证分组列表、桌面抽屉、移动详情路由，以及尝试列表直接可见的模型、错误和重入队状态。
+- VER-RUST-SCHEDULER: 覆盖: REQ-SCHEDULER, REQ-ATTEMPT-AUDIT。通过 Rust 单元与集成测试验证队列、单一 Release 润色所有者、批次、自动恢复、手动重试、精确调用归因和追加式事件写入。
+- VER-ADMIN-API: 覆盖: REQ-ATTEMPT-AUDIT, REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过管理员 API 测试验证时间筛选、分页、任务摘要、尝试历史、安全错误字段与诊断载荷过期语义。
+- VER-WEB-ADMIN: 覆盖: REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过 Web 构建、Playwright 回归与 `ui_demo` 视觉证据验证分组列表、桌面抽屉、移动详情路由、模型调用与输出契约的双状态，以及尝试列表直接可见的模型、错误和重入队状态。
 
 ## 目标 / 非目标
 
@@ -39,6 +39,7 @@
 - 在 `/admin/jobs` 新增“翻译调度”标签页，提供调度状态、请求视图、批次视图与 LLM 调用追链。
 - 管理员可按发布记录查询追加式尝试事件，审计首次执行、自动恢复、手动重试及其关联批次和 LLM 调用。
 - 管理员可在“内容处理”中按 Release、公告和日报查看采集记录；列表按时间筛选并分页，详情提供对应翻译或润色的尝试历史与下钻链接。
+- Release 润色的所有生产者只提交调度请求，调度器是唯一可执行模型调用或写入终态润色缓存的所有者。
 - 停止为新的翻译工作创建 `translate.release*` / `translate.notification` 类 `job_tasks`。
 
 ### Non-goals
@@ -52,6 +53,7 @@
 
 - [ADR 0001: LLM Recovery Boundary](../../adr/0001-llm-recovery-boundary.md)
 - [ADR 0003: Collection Record Time and Attempt Filtering](../../adr/0003-collection-record-time-and-attempt-filtering.md)
+- [ADR 0004: AI Diagnostics Evidence Boundary](../../adr/0004-ai-diagnostics-evidence-boundary.md)
 
 ## 接口契约（Interfaces & Contracts）
 
@@ -100,7 +102,7 @@
 
 - Given 一个发布记录对应的 work item 被首次执行、手动重试或自动恢复
   When 管理员按 `entity_id` 查询尝试审计
-  Then 返回按时间追加的入队、开始、完成与重试安排事件；每条事件包含尝试序号、触发方式、结果或失败分类、是否可重试、下次重试时间和可用的 request、batch、LLM 调用关联。
+  Then 返回按时间追加的入队、开始、完成与重试安排事件；每条事件包含尝试序号、触发方式、处理阶段、结果或失败分类、是否可重试、下次重试时间和精确的 request、batch、LLM 调用归因。
 
 - Given 尝试审计长期保留
   When 管理员读取某条发布记录的历史
@@ -116,7 +118,19 @@
 
 - Given 管理员打开一条采集记录详情
   When 在桌面端选择列表行或在移动端进入详情路由
-  Then 展示该记录对应的尝试历史、模型、错误分类和可用的下钻链接；桌面端使用抽屉，移动端不复用桌面抽屉。
+  Then 展示该记录对应的尝试历史、模型调用结果、输出契约结果、错误分类和可用的下钻链接；桌面端使用抽屉，移动端不复用桌面抽屉。
+
+- Given 模型返回内容但 Release 润色输出未通过 JSON 或 schema 校验
+  When 内容处理尝试完成
+  Then 模型调用记录 provider 成功，尝试记录输出契约失败与稳定错误代码；二者不得被合并为泛化的“翻译失败”。
+
+- Given 批次包含多个 work item 或润色结果复用了已有证据
+  When 管理员查看某个处理尝试
+  Then 只显示实际参与该尝试的模型调用及其阶段和关系，不得把同批其他条目的调用推断为该尝试的调用。
+
+- Given 关联的 LLM 调用已超过诊断载荷保留期
+  When 管理员查看处理尝试
+  Then 保留调用归因和处理阶段，并明确标记诊断内容已过期。
 
 - Given 历史记录没有结构化失败分类
   When 恢复器扫描到该记录

@@ -27,6 +27,9 @@ Key columns:
 - `prompt_text TEXT NOT NULL`
 - `response_text TEXT NULL`
 - `error_text TEXT NULL`
+- `finish_reason TEXT NULL`
+- `provider_request_id TEXT NULL`
+- `provider_http_status INTEGER NULL`
 - `created_at TEXT NOT NULL`
 - `started_at TEXT NULL`
 - `finished_at TEXT NULL`
@@ -47,7 +50,7 @@ Indexes:
 
 Retention:
 
-- Background cleanup removes rows older than 7 days by `created_at`.
+- Background cleanup removes `llm_calls` rows older than 7 days by `created_at`. Durable content-processing attribution retains the call identity, stage, relation role, and an `expired` availability state without retaining the payload.
 
 ## `llm_call_events` (new)
 

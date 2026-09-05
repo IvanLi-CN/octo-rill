@@ -12,6 +12,7 @@
 - 提供调用详情（完整 prompt/response/error）与父任务跳转能力。
 - 详情支持多轮输入/输出消息展示，并展示输入/输出/缓存 token 指标。
 - 为调用级观测新增后端日志落库与 7 天自动清理。
+- 明确呈现 provider 调用结果与内容处理输出契约结果，避免将收到但不可用的模型响应标记为业务成功。
 
 ### Non-goals
 
@@ -26,6 +27,7 @@
 - DB migration：新增 `llm_calls`。
 - 后端：`src/ai.rs` 调度观测与调用日志、管理员 LLM API。
 - 后端：`src/jobs.rs` LLM 调用上下文透传。
+- 后端：provider delivery metadata 与内容处理尝试的精确、阶段化调用归因。
 - 前端：`web/src/admin/JobManagement.tsx` 增加 “LLM 调度” 标签页与筛选/详情。
 - 前端：`web/src/api.ts` 新增 LLM 调度 API 类型与请求。
 - 自动化测试：Rust API 测试 + Playwright 管理页用例 + Storybook mock。
@@ -38,6 +40,7 @@
 ## Related ADRs
 
 - [ADR 0001: LLM Recovery Boundary](../../adr/0001-llm-recovery-boundary.md)
+- [ADR 0004: AI Diagnostics Evidence Boundary](../../adr/0004-ai-diagnostics-evidence-boundary.md)
 
 ## 接口契约（Interfaces & Contracts）
 
@@ -67,7 +70,11 @@
 
 - Given 点击某条调用详情
   When 抽屉打开
-  Then 可见完整 prompt/response/error 与等待/首字/耗时/重试次数。
+  Then 可见完整 prompt/response/error、provider delivery metadata、等待/首字/耗时/重试次数，以及关联内容处理阶段的输出契约结果。
+
+- Given provider 返回了内容但内容处理未通过结构或语义校验
+  When 管理员从内容处理或 LLM 调度打开调用详情
+  Then 页面同时明确显示“模型调用成功”和对应的输出契约失败；失败响应优先呈现，prompt 默认折叠。
 
 - Given 调用已安排结构化恢复
   When 管理员查看详情
@@ -79,7 +86,7 @@
 
 - Given 日志保留策略
   When 超过 7 天
-  Then 旧记录自动清理，近 7 天可查询。
+  Then 旧诊断载荷自动清理，近 7 天可查询；仍被处理尝试引用的调用显示为诊断内容已过期而不是未关联调用。
 
 ## 实现前置条件（Definition of Ready / Preconditions）
 
