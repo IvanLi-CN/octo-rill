@@ -1255,9 +1255,9 @@ export function AiOperationsRecordsSection({
 							</Button>
 						</div>
 					</div>
-					<div className="flex flex-col gap-3 border-t pt-4 xl:flex-row xl:flex-wrap xl:items-center">
+					<div className="flex flex-col gap-3 border-t pt-4">
 						<Tabs
-							className="w-full min-w-0 lg:min-w-[560px] lg:flex-1"
+							className="w-full min-w-0 lg:min-w-[560px]"
 							value={tab}
 							onValueChange={(value) => {
 								const nextTab = value as CollectionTab;
@@ -1277,38 +1277,44 @@ export function AiOperationsRecordsSection({
 								</TabsTrigger>
 							</TabsList>
 						</Tabs>
-						<div className="flex flex-wrap items-center gap-2">
-							{tab !== "brief" ? (
+						<fieldset className="flex flex-wrap items-center gap-3 rounded-lg border border-border/70 bg-muted/30 p-2 sm:p-3">
+							<legend className="sr-only">处理状态筛选</legend>
+							<div className="flex min-w-0 flex-wrap items-center gap-2">
+								{tab !== "brief" ? (
+									<StatusFilterMenu
+										label="翻译"
+										value={translationStatuses}
+										onChange={(value) => {
+											setTranslationStatuses(value);
+											commitFilters({ translationStatus: value });
+										}}
+										disabled={loading}
+									/>
+								) : null}
 								<StatusFilterMenu
-									label="翻译"
-									value={translationStatuses}
+									label="润色"
+									value={polishStatuses}
 									onChange={(value) => {
-										setTranslationStatuses(value);
-										commitFilters({ translationStatus: value });
+										setPolishStatuses(value);
+										commitFilters({ polishStatus: value });
 									}}
 									disabled={loading}
 								/>
+							</div>
+							<div className="hidden h-6 w-px bg-border sm:block" />
+							<div className="min-w-0 flex-1 basis-full sm:basis-auto">
+								<AttemptCountRangeFilter
+									value={attemptRange}
+									disabled={loading}
+									onChange={setAttemptRange}
+								/>
+							</div>
+							{hasFilters ? (
+								<Button type="button" variant="ghost" onClick={clearFilters}>
+									清除全部筛选
+								</Button>
 							) : null}
-							<StatusFilterMenu
-								label="润色"
-								value={polishStatuses}
-								onChange={(value) => {
-									setPolishStatuses(value);
-									commitFilters({ polishStatus: value });
-								}}
-								disabled={loading}
-							/>
-						</div>
-						<AttemptCountRangeFilter
-							value={attemptRange}
-							disabled={loading}
-							onChange={setAttemptRange}
-						/>
-						{hasFilters ? (
-							<Button type="button" variant="ghost" onClick={clearFilters}>
-								清除全部筛选
-							</Button>
-						) : null}
+						</fieldset>
 					</div>
 					{preset === "custom" ? (
 						<div className="grid gap-2 sm:grid-cols-2">
