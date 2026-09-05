@@ -1,12 +1,24 @@
-# 演进记录（Dashboard 页头品牌优先重设计）
+# Dashboard 页头品牌与账号菜单主题历史
 
-## 生命周期
+> 本文件记录主题局部生命周期与兼容性背景；规范正文以 `./SPEC.md` 为准。
 
-- Lifecycle: active
-- Created: 2026-04-10
-- Last: 2026-04-10
+## Lifecycle / Compatibility
 
-## 变更记录
+- Lifecycle: active.
+- Dashboard、Storybook 与品牌展示面继续共用 `DashboardHeader`，避免品牌位和账号菜单行为分叉。
+- 账号菜单保留 hover 与 click 两种桌面入口；触摸输入保持点击固定打开语义。
 
-- 2026-04-10: 新建规格，冻结“品牌优先双层布局 + 移除统计信息 + Storybook 视觉证据”的交付口径。
-- 2026-04-10: 实现完成；已补齐 Dashboard Header Storybook 审阅面、视觉证据与前端校验，并将账号信息收敛到头像浮层。
+## Replacements / Background
+
+- 页头从统计信息优先的布局收敛为品牌位、主同步操作和账号菜单三层结构。
+- 账号菜单的可达区域扩展到头像与浮层之间的视觉间距，避免自然指针移动造成非预期关闭。
+- 离场动画在组件卸载前保持终态，避免动画时长与关闭卸载时序之间出现可见回弹。
+
+## Related Changes
+
+- 初始品牌优先页头、账号浮层与后续 hover 连续性改进均属于本主题。
+
+## References
+
+- `./SPEC.md`
+- `./IMPLEMENTATION.md`
