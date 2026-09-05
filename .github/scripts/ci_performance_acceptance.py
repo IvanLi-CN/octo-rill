@@ -62,7 +62,8 @@ TRANSIENT_GET_ERROR_MARKERS = (
     "temporarily unavailable",
     "network is unreachable",
 )
-GET_MAX_ATTEMPTS = 3
+GET_MAX_ATTEMPTS = 6
+MAX_RETRY_DELAY_SECONDS = 10
 
 
 class AcceptanceError(RuntimeError):
@@ -101,7 +102,7 @@ class GhApi:
             )
             if not can_retry or attempt == GET_MAX_ATTEMPTS:
                 raise AcceptanceError(f"gh api failed ({method} {endpoint}): {detail}")
-            time.sleep(2 ** (attempt - 1))
+            time.sleep(min(2 ** (attempt - 1), MAX_RETRY_DELAY_SECONDS))
         try:
             return json.loads(result.stdout) if result.stdout.strip() else None
         except json.JSONDecodeError as exc:
@@ -119,7 +120,7 @@ class GhApi:
             can_retry = any(marker in detail.lower() for marker in TRANSIENT_GET_ERROR_MARKERS)
             if not can_retry or attempt == GET_MAX_ATTEMPTS:
                 raise AcceptanceError(f"gh api download failed (GET {endpoint}): {detail}")
-            time.sleep(2 ** (attempt - 1))
+            time.sleep(min(2 ** (attempt - 1), MAX_RETRY_DELAY_SECONDS))
 
 
 def parse_time(value: str) -> datetime:
