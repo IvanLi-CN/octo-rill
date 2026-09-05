@@ -191,6 +191,7 @@ function DashboardUserInfoCard(props: {
 		<div
 			className="absolute top-full right-0 z-50 mt-2 w-[min(18rem,calc(100vw-2rem))] rounded-[1.6rem] border bg-card/98 p-4 shadow-lg ring-1 ring-black/5 backdrop-blur dark:ring-white/10 sm:w-64"
 			data-dashboard-user-card
+			data-visual-evidence-target
 			role="dialog"
 			aria-label="账号信息"
 		>
@@ -340,6 +341,7 @@ function DashboardUserMenu(props: {
 	followingHref: string;
 	followingLabel: string;
 }) {
+	const HOVER_CLOSE_DELAY_MS = 160;
 	const {
 		login,
 		name,
@@ -359,9 +361,49 @@ function DashboardUserMenu(props: {
 	} = props;
 	const cardId = useId();
 	const wrapperRef = useRef<HTMLFieldSetElement | null>(null);
+	const hoverCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const [hoverOpen, setHoverOpen] = useState(false);
 	const [pinnedOpen, setPinnedOpen] = useState(false);
 	const open = hoverOpen || pinnedOpen;
+
+	const clearHoverCloseTimer = useCallback(() => {
+		if (hoverCloseTimerRef.current === null) return;
+		clearTimeout(hoverCloseTimerRef.current);
+		hoverCloseTimerRef.current = null;
+	}, []);
+
+	const closeOnHoverLeave = useCallback(() => {
+		clearHoverCloseTimer();
+		hoverCloseTimerRef.current = setTimeout(() => {
+			hoverCloseTimerRef.current = null;
+			setHoverOpen(false);
+		}, HOVER_CLOSE_DELAY_MS);
+	}, [clearHoverCloseTimer]);
+
+	const openOnHoverEnter = useCallback(() => {
+		clearHoverCloseTimer();
+		setHoverOpen(true);
+	}, [clearHoverCloseTimer]);
+
+	const handlePointerEnter = useCallback(
+		(event: React.PointerEvent<HTMLFieldSetElement>) => {
+			if (event.pointerType !== "touch") {
+				openOnHoverEnter();
+			}
+		},
+		[openOnHoverEnter],
+	);
+
+	const handlePointerLeave = useCallback(
+		(event: React.PointerEvent<HTMLFieldSetElement>) => {
+			if (event.pointerType !== "touch") {
+				closeOnHoverLeave();
+			}
+		},
+		[closeOnHoverLeave],
+	);
+
+	useEffect(() => clearHoverCloseTimer, [clearHoverCloseTimer]);
 
 	useEffect(() => {
 		if (!open) return;
@@ -370,6 +412,7 @@ function DashboardUserMenu(props: {
 			const target = event.target;
 			if (!(target instanceof Node)) return;
 			if (!wrapperRef.current?.contains(target)) {
+				clearHoverCloseTimer();
 				setHoverOpen(false);
 				setPinnedOpen(false);
 			}
@@ -377,6 +420,7 @@ function DashboardUserMenu(props: {
 
 		const handleKeyDown = (event: KeyboardEvent) => {
 			if (event.key === "Escape") {
+				clearHoverCloseTimer();
 				setHoverOpen(false);
 				setPinnedOpen(false);
 			}
@@ -388,7 +432,7 @@ function DashboardUserMenu(props: {
 			window.removeEventListener("pointerdown", handlePointerDown);
 			window.removeEventListener("keydown", handleKeyDown);
 		};
-	}, [open]);
+	}, [clearHoverCloseTimer, open]);
 
 	return (
 		<fieldset
@@ -397,8 +441,8 @@ function DashboardUserMenu(props: {
 			data-app-shell-gesture-guard
 			data-dashboard-user-menu
 			aria-label="账号菜单"
-			onMouseEnter={() => setHoverOpen(true)}
-			onMouseLeave={() => setHoverOpen(false)}
+			onPointerEnter={handlePointerEnter}
+			onPointerLeave={handlePointerLeave}
 		>
 			<button
 				type="button"
@@ -412,14 +456,18 @@ function DashboardUserMenu(props: {
 				aria-label="查看账号信息"
 				aria-controls={cardId}
 				aria-expanded={open}
-				onClick={() => setPinnedOpen((current) => !current)}
-				onFocus={() => setHoverOpen(true)}
+				onClick={() => {
+					clearHoverCloseTimer();
+					setPinnedOpen((current) => !current);
+				}}
+				onFocus={openOnHoverEnter}
 				onBlur={(event) => {
 					const nextTarget = event.relatedTarget;
 					if (
 						!(nextTarget instanceof Node) ||
 						!event.currentTarget.parentElement?.contains(nextTarget)
 					) {
+						clearHoverCloseTimer();
 						setHoverOpen(false);
 					}
 				}}
@@ -433,24 +481,31 @@ function DashboardUserMenu(props: {
 			</button>
 
 			{open ? (
-				<div id={cardId}>
-					<DashboardUserInfoCard
-						login={login}
-						name={name}
-						avatarUrl={avatarUrl}
-						email={email}
-						isAdmin={isAdmin}
-						aiDisabledHint={aiDisabledHint}
-						logoutHref={logoutHref}
-						showAdminLink={showAdminLink}
-						showMineEntry={showMineEntry}
-						mineHref={mineHref}
-						mineLabel={mineLabel}
-						showFollowingEntry={showFollowingEntry}
-						followingHref={followingHref}
-						followingLabel={followingLabel}
+				<>
+					<div
+						aria-hidden="true"
+						className="pointer-events-auto absolute top-full right-0 h-2 w-[min(18rem,calc(100vw-2rem))] sm:w-64"
+						data-dashboard-user-menu-hover-bridge
 					/>
-				</div>
+					<div id={cardId}>
+						<DashboardUserInfoCard
+							login={login}
+							name={name}
+							avatarUrl={avatarUrl}
+							email={email}
+							isAdmin={isAdmin}
+							aiDisabledHint={aiDisabledHint}
+							logoutHref={logoutHref}
+							showAdminLink={showAdminLink}
+							showMineEntry={showMineEntry}
+							mineHref={mineHref}
+							mineLabel={mineLabel}
+							showFollowingEntry={showFollowingEntry}
+							followingHref={followingHref}
+							followingLabel={followingLabel}
+						/>
+					</div>
+				</>
 			) : null}
 		</fieldset>
 	);
