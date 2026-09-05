@@ -16,7 +16,7 @@
 
 - The release job builds once through Docker Buildx with `load: true`, then verifies the loaded image through a temporary runtime container.
 - The Frontend E2E job uses two CI workers and emits list plus JSON reporter output. An always-run summary step appends Job Summary and uploads only the two JSON files for 14 days. Translation loading tests use explicit pending gates to preserve assertions about visible loading and polling state without relying on wall-clock sleeps.
-- The Python driver validates and freezes control/candidate target SHAs plus the `main` dispatcher SHA before serial dispatch, verifies strict ancestry and the restricted file delta (including the declared `web/e2e/release-detail.spec.ts` fixture gate), requires nonce-correlated runs and matching artifact `tested_sha`, derives deterministic test identifiers from each raw report, downloads each run's result artifact, and writes auditable run/job records and E2E statistics.
+- The Python driver validates and freezes control/candidate target SHAs plus the `main` dispatcher SHA before serial dispatch, verifies strict ancestry and the restricted file delta (including the declared PWA readiness fixtures in `web/e2e/pwa-installability.spec.ts` and `web/e2e/release-detail.spec.ts`), requires nonce-correlated runs and matching artifact `tested_sha`, derives deterministic test identifiers from each raw report, downloads each run's result artifact, and writes auditable run/job records and E2E statistics.
 
 ## Controlled Acceptance
 
