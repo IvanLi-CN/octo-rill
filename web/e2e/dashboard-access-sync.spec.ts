@@ -319,27 +319,55 @@ test("dashboard keeps sync as a single header action for admins", async ({
 	await expect(page.getByText(/Logged in as\s+octo-admin/)).toHaveCount(0);
 	await expect(page.getByText(/Loaded\s+\d+/)).toHaveCount(0);
 	await expect(primarySyncButton).toBeVisible();
-	await expect(
-		page.getByRole("button", { name: "查看账号信息" }),
-	).toBeVisible();
-	await page.getByRole("button", { name: "查看账号信息" }).click();
-	await expect(page.locator("[data-dashboard-user-card]")).toBeVisible();
+	const profileButton = page.getByRole("button", { name: "查看账号信息" });
+	await expect(profileButton).toBeVisible();
+	await profileButton.click();
+	const userCard = page.locator("[data-dashboard-user-card]");
+	await expect(userCard).toBeVisible();
 	await expect(page.getByText("Octo Admin")).toBeVisible();
 	await expect(page.getByText("@octo-admin")).toBeVisible();
 	await expect(page.getByText("admin@example.com")).toBeVisible();
+	await expect(userCard.getByLabel("管理员")).toBeVisible();
 	await expect(
-		page.locator("[data-dashboard-user-card]").getByLabel("管理员"),
-	).toBeVisible();
-	await expect(
-		page.locator("[data-dashboard-user-card]").getByRole("link", {
+		userCard.getByRole("link", {
 			name: "管理员面板",
 		}),
 	).toBeVisible();
 	await expect(
-		page.locator("[data-dashboard-user-card]").getByRole("link", {
+		userCard.getByRole("link", {
 			name: "退出登录",
 		}),
 	).toBeVisible();
+
+	// Verify a deliberate diagonal pointer path from the avatar into the panel.
+	// The bridge keeps the hover state alive while crossing the visual gap.
+	await profileButton.click();
+	await page.mouse.move(0, 0);
+	await expect(userCard).toHaveCount(0);
+	await profileButton.hover();
+	await expect(userCard).toBeVisible();
+	const avatarBox = await profileButton.boundingBox();
+	const panelBox = await userCard.boundingBox();
+	if (!avatarBox || !panelBox) {
+		throw new Error("Expected avatar and account panel bounds");
+	}
+	const start = {
+		x: avatarBox.x + avatarBox.width / 2,
+		y: avatarBox.y + avatarBox.height / 2,
+	};
+	const end = {
+		x: panelBox.x + 16,
+		y: panelBox.y + 16,
+	};
+	for (let step = 1; step <= 12; step += 1) {
+		const progress = step / 12;
+		await page.mouse.move(
+			start.x + (end.x - start.x) * progress,
+			start.y + (end.y - start.y) * progress,
+		);
+		await page.waitForTimeout(20);
+	}
+	await expect(userCard).toBeVisible();
 	const secondaryControls = page.locator("[data-dashboard-secondary-controls]");
 	await expect(
 		secondaryControls.getByRole("button", { name: "同步" }),
@@ -359,6 +387,30 @@ test("dashboard keeps sync as a single header action for admins", async ({
 	await expect(
 		secondaryControls.getByRole("link", { name: "管理员面板" }),
 	).toHaveCount(0);
+
+	await page.mouse.move(0, 0);
+	const closingOpacitySamples = await page.evaluate(async () => {
+		const samples: number[] = [];
+		const startedAt = performance.now();
+		while (performance.now() - startedAt < 390) {
+			const card = document.querySelector("[data-dashboard-user-card]");
+			if (card) {
+				samples.push(Number(getComputedStyle(card).opacity));
+			}
+			await new Promise(requestAnimationFrame);
+		}
+		return samples;
+	});
+	const firstFadedSample = closingOpacitySamples.findIndex(
+		(opacity) => opacity <= 0.2,
+	);
+	expect(firstFadedSample).toBeGreaterThanOrEqual(0);
+	expect(
+		closingOpacitySamples
+			.slice(firstFadedSample + 1)
+			.every((opacity) => opacity <= 0.2),
+	).toBe(true);
+	await expect(userCard).toHaveCount(0);
 });
 
 test("dashboard keeps header utilities inline on tablet widths", async ({
