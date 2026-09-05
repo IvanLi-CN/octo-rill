@@ -62,7 +62,7 @@ TRANSIENT_GET_ERROR_MARKERS = (
     "temporarily unavailable",
     "network is unreachable",
 )
-GET_MAX_ATTEMPTS = 6
+GET_MAX_ATTEMPTS = 12
 MAX_RETRY_DELAY_SECONDS = 10
 
 
