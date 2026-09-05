@@ -166,6 +166,7 @@ function DashboardUserInfoCard(props: {
 	showFollowingEntry: boolean;
 	followingHref: string;
 	followingLabel: string;
+	motionState: "open" | "closing";
 }) {
 	const {
 		login,
@@ -182,6 +183,7 @@ function DashboardUserInfoCard(props: {
 		showFollowingEntry,
 		followingHref,
 		followingLabel,
+		motionState,
 	} = props;
 	const displayName = name?.trim() || login;
 	const secondaryName =
@@ -189,8 +191,14 @@ function DashboardUserInfoCard(props: {
 
 	return (
 		<div
-			className="absolute top-full right-0 z-50 mt-2 w-[min(18rem,calc(100vw-2rem))] rounded-[1.6rem] border bg-card/98 p-4 shadow-lg ring-1 ring-black/5 backdrop-blur dark:ring-white/10 sm:w-64"
+			className={cn(
+				"absolute top-full right-0 z-50 mt-2 w-[min(18rem,calc(100vw-2rem))] origin-top-right rounded-[1.6rem] border bg-card/98 p-4 shadow-lg ring-1 ring-black/5 backdrop-blur motion-reduce:duration-100 dark:ring-white/10 sm:w-64",
+				motionState === "open"
+					? "animate-in fade-in-0 duration-200 motion-safe:slide-in-from-top-1 motion-safe:zoom-in-95 motion-safe:ease-[cubic-bezier(0.16,1,0.3,1)]"
+					: "animate-out fade-out-0 duration-150 ease-in motion-safe:slide-out-to-top-1 motion-safe:zoom-out-95",
+			)}
 			data-dashboard-user-card
+			data-dashboard-user-card-motion={motionState}
 			data-visual-evidence-target
 			role="dialog"
 			aria-label="账号信息"
@@ -342,6 +350,7 @@ function DashboardUserMenu(props: {
 	followingLabel: string;
 }) {
 	const HOVER_CLOSE_DELAY_MS = 160;
+	const CARD_EXIT_DURATION_MS = 180;
 	const {
 		login,
 		name,
@@ -362,14 +371,23 @@ function DashboardUserMenu(props: {
 	const cardId = useId();
 	const wrapperRef = useRef<HTMLFieldSetElement | null>(null);
 	const hoverCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const cardExitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const [hoverOpen, setHoverOpen] = useState(false);
 	const [pinnedOpen, setPinnedOpen] = useState(false);
+	const [cardMounted, setCardMounted] = useState(false);
+	const [cardClosing, setCardClosing] = useState(false);
 	const open = hoverOpen || pinnedOpen;
 
 	const clearHoverCloseTimer = useCallback(() => {
 		if (hoverCloseTimerRef.current === null) return;
 		clearTimeout(hoverCloseTimerRef.current);
 		hoverCloseTimerRef.current = null;
+	}, []);
+
+	const clearCardExitTimer = useCallback(() => {
+		if (cardExitTimerRef.current === null) return;
+		clearTimeout(cardExitTimerRef.current);
+		cardExitTimerRef.current = null;
 	}, []);
 
 	const closeOnHoverLeave = useCallback(() => {
@@ -403,7 +421,30 @@ function DashboardUserMenu(props: {
 		[closeOnHoverLeave],
 	);
 
-	useEffect(() => clearHoverCloseTimer, [clearHoverCloseTimer]);
+	useEffect(() => {
+		if (open) {
+			clearCardExitTimer();
+			setCardMounted(true);
+			setCardClosing(false);
+			return;
+		}
+
+		if (!cardMounted) return;
+		setCardClosing(true);
+		cardExitTimerRef.current = setTimeout(() => {
+			cardExitTimerRef.current = null;
+			setCardMounted(false);
+			setCardClosing(false);
+		}, CARD_EXIT_DURATION_MS);
+	}, [cardMounted, clearCardExitTimer, open]);
+
+	useEffect(
+		() => () => {
+			clearHoverCloseTimer();
+			clearCardExitTimer();
+		},
+		[clearCardExitTimer, clearHoverCloseTimer],
+	);
 
 	useEffect(() => {
 		if (!open) return;
@@ -480,7 +521,7 @@ function DashboardUserMenu(props: {
 				/>
 			</button>
 
-			{open ? (
+			{cardMounted ? (
 				<>
 					<div
 						aria-hidden="true"
@@ -503,6 +544,7 @@ function DashboardUserMenu(props: {
 							showFollowingEntry={showFollowingEntry}
 							followingHref={followingHref}
 							followingLabel={followingLabel}
+							motionState={cardClosing ? "closing" : "open"}
 						/>
 					</div>
 				</>

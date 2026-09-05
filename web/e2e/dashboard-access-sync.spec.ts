@@ -387,6 +387,14 @@ test("dashboard keeps sync as a single header action for admins", async ({
 	await expect(
 		secondaryControls.getByRole("link", { name: "管理员面板" }),
 	).toHaveCount(0);
+
+	await page.mouse.move(0, 0);
+	await page.waitForTimeout(190);
+	await expect(userCard).toHaveAttribute(
+		"data-dashboard-user-card-motion",
+		"closing",
+	);
+	await expect(userCard).toHaveCount(0);
 });
 
 test("dashboard keeps header utilities inline on tablet widths", async ({
