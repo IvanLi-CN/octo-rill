@@ -32,6 +32,7 @@ import { TranslationWorkerBoard } from "@/admin/TranslationWorkerBoard";
 import {
 	ADMIN_JOBS_BASE_PATH,
 	ADMIN_SUBSCRIPTION_SETTINGS_AUTO_OPEN_SESSION_KEY,
+	DEFAULT_AI_RECORD_ROUTE_FILTERS,
 	buildAdminJobsRouteUrl,
 	parseLlmCallRouteFilters,
 	parseAdminJobsRoute,
@@ -4464,6 +4465,8 @@ export function JobManagement({
 	const tab = routeState.primaryTab;
 	const translationView = routeState.translationView;
 	const aiRecordDetailRoute = routeState.aiRecordDetailRoute ?? null;
+	const aiRecordFilters =
+		routeState.aiRecordFilters ?? DEFAULT_AI_RECORD_ROUTE_FILTERS;
 	const taskDrawerRoute = routeState.taskDrawerRoute;
 	const taskDrawerFromTab = routeState.drawerFromTab;
 	const activeSubscriptionDetailTaskId =
@@ -7260,6 +7263,18 @@ export function JobManagement({
 				<TabsContent value="ai_records" className="space-y-4">
 					<AiOperationsRecordsSection
 						detailRoute={aiRecordDetailRoute}
+						filters={aiRecordFilters}
+						onFiltersChange={(nextFilters) =>
+							navigateAdminJobsRoute({
+								primaryTab: "ai_records",
+								translationView,
+								taskDrawerRoute: null,
+								drawerFromTab: null,
+								subscriptionDetailTaskId: null,
+								aiRecordFilters: nextFilters,
+								aiRecordDetailRoute: null,
+							})
+						}
 						onOpenRecord={(kind, id) =>
 							navigateAdminJobsRoute({
 								primaryTab: "ai_records",
@@ -7267,6 +7282,7 @@ export function JobManagement({
 								taskDrawerRoute: null,
 								drawerFromTab: null,
 								subscriptionDetailTaskId: null,
+								aiRecordFilters,
 								aiRecordDetailRoute: {
 									kind,
 									id,
@@ -7283,6 +7299,7 @@ export function JobManagement({
 								taskDrawerRoute: null,
 								drawerFromTab: null,
 								subscriptionDetailTaskId: null,
+								aiRecordFilters,
 								aiRecordDetailRoute: {
 									...aiRecordDetailRoute,
 									attemptId: attemptId || null,
@@ -7298,6 +7315,7 @@ export function JobManagement({
 								taskDrawerRoute: null,
 								drawerFromTab: null,
 								subscriptionDetailTaskId: null,
+								aiRecordFilters,
 								aiRecordDetailRoute: {
 									...aiRecordDetailRoute,
 									llmCallId,
@@ -7311,6 +7329,7 @@ export function JobManagement({
 								taskDrawerRoute: null,
 								drawerFromTab: null,
 								subscriptionDetailTaskId: null,
+								aiRecordFilters,
 								aiRecordDetailRoute: null,
 							})
 						}

@@ -2570,6 +2570,12 @@ test("content processing audit shows retry state, model, error, and call detail"
 	await expect(
 		recordsTable.getByText("v2.31.0", { exact: true }),
 	).toBeVisible();
+	await page.getByRole("button", { name: "翻译筛选" }).click();
+	await page.getByRole("checkbox", { name: "排队中" }).check();
+	await expect
+		.poll(() => listRequests.at(-1)?.searchParams.get("translation_status"))
+		.toBe("queued");
+	await page.getByRole("checkbox", { name: "排队中" }).uncheck();
 	const recordTypeTabs = page
 		.getByRole("tabpanel", { name: "内容处理" })
 		.getByRole("tablist");
@@ -2678,6 +2684,45 @@ test("content processing attempt filter stays full-width without mobile overflow
 			() => document.documentElement.scrollWidth <= window.innerWidth,
 		),
 	).toBe(true);
+});
+
+test("content processing empty state explains filter recovery", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 900 });
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	await page.route("**/api/admin/jobs/ai-records/**", async (route) => {
+		const pathname = new URL(route.request().url()).pathname;
+		if (pathname === "/api/admin/jobs/ai-records/release") {
+			return json(route, { items: [], page: 1, page_size: 20, total: 0 });
+		}
+		return route.fallback();
+	});
+
+	await page.goto("/admin/jobs/ai-records?ai_translation_status=failed", {
+		waitUntil: "domcontentloaded",
+	});
+	const emptyState = page.locator('[data-collection-empty-state="true"]');
+	await expect(emptyState).toBeVisible();
+	await expect(
+		emptyState.getByRole("heading", { name: "没有符合条件的记录" }),
+	).toBeVisible();
+	await expect(
+		emptyState.getByRole("button", { name: "清除筛选", exact: true }),
+	).toBeVisible();
+
+	await emptyState
+		.getByRole("button", { name: "清除筛选", exact: true })
+		.click();
+	await expect(page).toHaveURL(/\/admin\/jobs\/ai-records(?:\?|$)/);
+	await expect(
+		emptyState.getByRole("heading", {
+			name: "当前时间范围暂无采集记录",
+		}),
+	).toBeVisible();
+	await expect(
+		emptyState.getByRole("button", { name: "清除筛选", exact: true }),
+	).toHaveCount(0);
 });
 
 test("admin requests grouped LLM call ordering and renders the response", async ({

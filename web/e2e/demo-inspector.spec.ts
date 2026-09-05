@@ -774,6 +774,26 @@ test("demo LLM activity buckets drill into matching call records", async ({
 	).toBe(true);
 });
 
+test("demo admin jobs status filters stay inside the mock runtime", async ({
+	page,
+}) => {
+	await page.goto(
+		"/admin/jobs/ai-records?demo=admin-jobs-running&d_persona=admin",
+	);
+
+	await expect(page.getByRole("table")).toBeVisible();
+	await page.getByRole("button", { name: "润色筛选" }).click();
+	await page.getByRole("checkbox", { name: "成功" }).check();
+
+	await expect(page).toHaveURL(/ai_polish_status=succeeded/);
+	await expect(
+		page.getByText("Internal Server Error", { exact: true }),
+	).toHaveCount(0);
+	await expect(
+		page.getByRole("table").getByText("v2.31.0", { exact: true }),
+	).toBeVisible();
+});
+
 test("demo worker ignores unmarked live requests in regular dev builds", async ({
 	page,
 }) => {
