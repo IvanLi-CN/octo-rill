@@ -1917,7 +1917,7 @@ test("feed smart localized retryable error shows neutral auto-retry waiting stat
 				error_detail: "runtime_lease_expired",
 			},
 		},
-		smartResolveDelayMs: 3000,
+		smartResolveDelayMs: 750,
 	});
 
 	await page.goto("/?tab=releases");
@@ -2009,7 +2009,7 @@ test("feed smart response body decode error auto retries on page load", async ({
 		smartResolveStatuses: {
 			[releaseId]: "ready",
 		},
-		smartResolveDelayMs: 3000,
+		smartResolveDelayMs: 750,
 	});
 
 	await page.goto("/?tab=releases");
@@ -2183,7 +2183,7 @@ test("feed auto retry falls back to the existing error panel after one failed au
 				error_detail: "AI returned 403 Forbidden: Chat upstream returned 403",
 			},
 		},
-		smartResolveDelayMs: 1200,
+		smartResolveDelayMs: 500,
 	});
 
 	await page.goto("/?tab=releases");
@@ -2218,7 +2218,7 @@ test("feed smart trigger failures coalesce and locate the card", async ({
 				error_detail: "AI returned 403 Forbidden: Chat upstream returned 403",
 			},
 		},
-		smartResolveDelayMs: 1000,
+		smartResolveDelayMs: 500,
 	});
 
 	await page.goto("/?tab=releases");
@@ -2370,7 +2370,7 @@ test("feed smart retry button spins and disables while request is in flight", as
 		smartResolveStatuses: {
 			[releaseId]: "ready",
 		},
-		smartResolveDelayMs: 3000,
+		smartResolveDelayMs: 750,
 	});
 
 	await page.goto("/?tab=releases");
