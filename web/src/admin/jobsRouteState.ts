@@ -26,6 +26,40 @@ export type LlmCallRouteFilters = {
 	finishedBefore: string;
 };
 
+export const AI_RECORD_STATUS_VALUES = [
+	"not_started",
+	"queued",
+	"running",
+	"succeeded",
+	"failed",
+	"missing",
+	"disabled",
+	"historical_unknown",
+] as const;
+export type AiRecordStatus = (typeof AI_RECORD_STATUS_VALUES)[number];
+export type AiRecordTimePreset = "24h" | "7d" | "30d" | "custom";
+export type AiRecordRouteFilters = {
+	kind: "release" | "announcement" | "brief";
+	preset: AiRecordTimePreset;
+	from: string;
+	before: string;
+	translationStatus: AiRecordStatus[];
+	polishStatus: AiRecordStatus[];
+	attemptMin: number;
+	attemptMax: number | null;
+};
+
+export const DEFAULT_AI_RECORD_ROUTE_FILTERS: AiRecordRouteFilters = {
+	kind: "release",
+	preset: "24h",
+	from: "",
+	before: "",
+	translationStatus: [],
+	polishStatus: [],
+	attemptMin: 0,
+	attemptMax: null,
+};
+
 export type AdminJobsSearchInput = {
 	from?: string;
 	view?: string;
@@ -43,6 +77,14 @@ export type AdminJobsSearchInput = {
 	llm_time_to?: string;
 	ai_attempt?: string;
 	ai_llm?: string;
+	ai_kind?: string;
+	ai_preset?: string;
+	ai_from?: string;
+	ai_before?: string;
+	ai_translation_status?: string;
+	ai_polish_status?: string;
+	ai_attempt_min?: string;
+	ai_attempt_max?: string;
 };
 
 export type TaskDrawerRoute = {
@@ -65,6 +107,7 @@ export type AdminJobsRouteState = {
 	subscriptionDetailTaskId?: string | null;
 	llmCallFilters?: LlmCallRouteFilters;
 	aiRecordDetailRoute?: AiRecordDetailRoute | null;
+	aiRecordFilters?: AiRecordRouteFilters;
 };
 
 export const ADMIN_JOBS_BASE_PATH = "/admin/jobs";
@@ -92,6 +135,14 @@ const ADMIN_JOBS_ROUTE_QUERY_KEYS = [
 	"llm_time_to",
 	"ai_attempt",
 	"ai_llm",
+	"ai_kind",
+	"ai_preset",
+	"ai_from",
+	"ai_before",
+	"ai_translation_status",
+	"ai_polish_status",
+	"ai_attempt_min",
+	"ai_attempt_max",
 ] as const;
 const TASK_DRAWER_ROUTE_PATTERN =
 	/^\/admin\/jobs\/tasks\/([^/]+?)(?:\/llm\/([^/]+))?$/;
@@ -128,6 +179,91 @@ function normalizeLlmRouteTimestamp(value: string | null | undefined) {
 	}
 	const timestamp = Date.parse(normalized);
 	return Number.isNaN(timestamp) ? "" : new Date(timestamp).toISOString();
+}
+
+function parseAiRecordStatuses(
+	value: string | null | undefined,
+): AiRecordStatus[] {
+	if (!value) return [];
+	return value
+		.split(",")
+		.map((item) => item.trim())
+		.filter((item): item is AiRecordStatus =>
+			(AI_RECORD_STATUS_VALUES as readonly string[]).includes(item),
+		)
+		.sort();
+}
+
+function parseAiRecordAttempt(
+	value: string | null | undefined,
+	fallback: number | null,
+) {
+	if (!value) return fallback;
+	const parsed = Number(value);
+	return Number.isInteger(parsed) && parsed >= 0 && parsed <= 10
+		? parsed
+		: fallback;
+}
+
+export function parseAiRecordRouteFilters(
+	search: Pick<
+		AdminJobsSearchInput,
+		| "ai_kind"
+		| "ai_preset"
+		| "ai_from"
+		| "ai_before"
+		| "ai_translation_status"
+		| "ai_polish_status"
+		| "ai_attempt_min"
+		| "ai_attempt_max"
+	>,
+): AiRecordRouteFilters {
+	const kind =
+		search.ai_kind === "announcement" || search.ai_kind === "brief"
+			? search.ai_kind
+			: "release";
+	const preset: AiRecordTimePreset =
+		search.ai_preset === "7d" ||
+		search.ai_preset === "30d" ||
+		search.ai_preset === "custom"
+			? search.ai_preset
+			: "24h";
+	const attemptMin = parseAiRecordAttempt(
+		search.ai_attempt_min,
+		DEFAULT_AI_RECORD_ROUTE_FILTERS.attemptMin,
+	) as number;
+	const parsedMax = parseAiRecordAttempt(
+		search.ai_attempt_max,
+		DEFAULT_AI_RECORD_ROUTE_FILTERS.attemptMax,
+	);
+	return {
+		kind,
+		preset,
+		from: search.ai_from ?? "",
+		before: search.ai_before ?? "",
+		translationStatus: parseAiRecordStatuses(search.ai_translation_status),
+		polishStatus: parseAiRecordStatuses(search.ai_polish_status),
+		attemptMin,
+		attemptMax:
+			parsedMax !== null && parsedMax < attemptMin ? attemptMin : parsedMax,
+	};
+}
+
+export function aiRecordRouteFiltersToSearch(
+	filters: AiRecordRouteFilters,
+): AdminJobsSearchInput {
+	return {
+		ai_kind: filters.kind === "release" ? undefined : filters.kind,
+		ai_preset: filters.preset === "24h" ? undefined : filters.preset,
+		ai_from: filters.from || undefined,
+		ai_before: filters.before || undefined,
+		ai_translation_status: filters.translationStatus.join(",") || undefined,
+		ai_polish_status: filters.polishStatus.join(",") || undefined,
+		ai_attempt_min:
+			filters.attemptMin > 0 ? String(filters.attemptMin) : undefined,
+		ai_attempt_max:
+			filters.attemptMax === null ? undefined : String(filters.attemptMax),
+	};
 }
 
 export function parseLlmCallRouteFilters(
@@ -287,12 +423,27 @@ export function parseAdminJobsRoute(
 		llm_time_to: searchParams.get("llm_time_to") ?? undefined,
 	});
 	const translationView = parseTranslationView(searchParams);
+	const parsedAiRecordFilters = parseAiRecordRouteFilters({
+		ai_kind: searchParams.get("ai_kind") ?? undefined,
+		ai_preset: searchParams.get("ai_preset") ?? undefined,
+		ai_from: searchParams.get("ai_from") ?? undefined,
+		ai_before: searchParams.get("ai_before") ?? undefined,
+		ai_translation_status:
+			searchParams.get("ai_translation_status") ?? undefined,
+		ai_polish_status: searchParams.get("ai_polish_status") ?? undefined,
+		ai_attempt_min: searchParams.get("ai_attempt_min") ?? undefined,
+		ai_attempt_max: searchParams.get("ai_attempt_max") ?? undefined,
+	});
 	const rawDrawerFromTab = searchParams.get("from");
 	const drawerFromTab = isPrimaryTab(rawDrawerFromTab)
 		? rawDrawerFromTab
 		: null;
 	const taskDrawerRoute = parseTaskDrawerRoute(pathname);
 	const aiRecordDetailRoute = parseAiRecordDetailRoute(pathname, searchParams);
+	const aiRecordFilters = {
+		...parsedAiRecordFilters,
+		kind: aiRecordDetailRoute?.kind ?? parsedAiRecordFilters.kind,
+	};
 
 	if (taskDrawerRoute) {
 		return {
@@ -302,6 +453,7 @@ export function parseAdminJobsRoute(
 			drawerFromTab,
 			subscriptionDetailTaskId: null,
 			llmCallFilters,
+			aiRecordFilters,
 		};
 	}
 	if (aiRecordDetailRoute) {
@@ -313,6 +465,7 @@ export function parseAdminJobsRoute(
 			subscriptionDetailTaskId: null,
 			llmCallFilters,
 			aiRecordDetailRoute,
+			aiRecordFilters,
 		};
 	}
 
@@ -330,6 +483,7 @@ export function parseAdminJobsRoute(
 				subscriptionDetailMatch[1] ?? "",
 			),
 			llmCallFilters,
+			aiRecordFilters,
 		};
 	}
 
@@ -354,6 +508,7 @@ export function parseAdminJobsRoute(
 		subscriptionDetailTaskId: null,
 		llmCallFilters,
 		aiRecordDetailRoute: null,
+		aiRecordFilters,
 	};
 }
 
@@ -398,11 +553,17 @@ export function buildAdminJobsRouteUrl(
 		for (const [key, value] of Object.entries(filters)) {
 			if (value) searchParams.set(key, value);
 		}
-	} else if (route.aiRecordDetailRoute) {
-		if (route.aiRecordDetailRoute.attemptId) {
+	} else if (route.primaryTab === "ai_records" || route.aiRecordDetailRoute) {
+		const filters = aiRecordRouteFiltersToSearch(
+			route.aiRecordFilters ?? DEFAULT_AI_RECORD_ROUTE_FILTERS,
+		);
+		for (const [key, value] of Object.entries(filters)) {
+			if (value) searchParams.set(key, value);
+		}
+		if (route.aiRecordDetailRoute?.attemptId) {
 			searchParams.set("ai_attempt", route.aiRecordDetailRoute.attemptId);
 		}
-		if (route.aiRecordDetailRoute.llmCallId) {
+		if (route.aiRecordDetailRoute?.llmCallId) {
 			searchParams.set("ai_llm", route.aiRecordDetailRoute.llmCallId);
 		}
 	}
@@ -427,6 +588,7 @@ export function buildAdminJobsRouteState(input: {
 		? input.search.from
 		: null;
 	const llmCallFilters = parseLlmCallRouteFilters(input.search);
+	const aiRecordFilters = parseAiRecordRouteFilters(input.search);
 
 	if (input.taskId) {
 		return {
@@ -439,6 +601,7 @@ export function buildAdminJobsRouteState(input: {
 			drawerFromTab,
 			subscriptionDetailTaskId: null,
 			llmCallFilters,
+			aiRecordFilters,
 		};
 	}
 	if (input.aiRecordKind && input.aiRecordId) {
@@ -449,6 +612,7 @@ export function buildAdminJobsRouteState(input: {
 			drawerFromTab: null,
 			subscriptionDetailTaskId: null,
 			llmCallFilters,
+			aiRecordFilters,
 			aiRecordDetailRoute: {
 				kind: input.aiRecordKind,
 				id: input.aiRecordId,
@@ -467,6 +631,7 @@ export function buildAdminJobsRouteState(input: {
 		drawerFromTab: null,
 		subscriptionDetailTaskId: input.subscriptionDetailTaskId ?? null,
 		llmCallFilters,
+		aiRecordFilters,
 	};
 }
 
@@ -513,5 +678,27 @@ export function validateAdminJobsSearch(search: Record<string, unknown>) {
 		ai_attempt:
 			typeof search.ai_attempt === "string" ? search.ai_attempt : undefined,
 		ai_llm: typeof search.ai_llm === "string" ? search.ai_llm : undefined,
+		ai_kind: typeof search.ai_kind === "string" ? search.ai_kind : undefined,
+		ai_preset:
+			typeof search.ai_preset === "string" ? search.ai_preset : undefined,
+		ai_from: typeof search.ai_from === "string" ? search.ai_from : undefined,
+		ai_before:
+			typeof search.ai_before === "string" ? search.ai_before : undefined,
+		ai_translation_status:
+			typeof search.ai_translation_status === "string"
+				? search.ai_translation_status
+				: undefined,
+		ai_polish_status:
+			typeof search.ai_polish_status === "string"
+				? search.ai_polish_status
+				: undefined,
+		ai_attempt_min:
+			typeof search.ai_attempt_min === "string"
+				? search.ai_attempt_min
+				: undefined,
+		ai_attempt_max:
+			typeof search.ai_attempt_max === "string"
+				? search.ai_attempt_max
+				: undefined,
 	};
 }

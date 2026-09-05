@@ -46,6 +46,8 @@ pub struct AdminCollectionRecordListQuery {
     pub before: Option<String>,
     pub attempt_min: Option<i64>,
     pub attempt_max: Option<i64>,
+    pub translation_status: Option<String>,
+    pub polish_status: Option<String>,
     pub page: Option<i64>,
     pub page_size: Option<i64>,
 }
@@ -53,6 +55,8 @@ pub struct AdminCollectionRecordListQuery {
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct AdminCollectionTaskSummary {
     pub status: String,
+    pub display_status: String,
+    pub status_origin: String,
     pub retry_count: i64,
     pub started_at: Option<String>,
     pub last_attempt_at: Option<String>,
@@ -133,6 +137,13 @@ struct TaskRow {
     finished_at: Option<String>,
     updated_at: String,
     last_attempt_at: Option<String>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ProcessingCoverageRow {
+    record_id: String,
+    pipeline: String,
+    status_origin: String,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -240,6 +251,157 @@ fn parse_timestamp(value: Option<String>, field: &str) -> Result<Option<String>,
     Ok(Some(parsed.with_timezone(&Utc).to_rfc3339()))
 }
 
+const DISPLAY_STATUSES: [&str; 8] = [
+    "not_started",
+    "queued",
+    "running",
+    "succeeded",
+    "failed",
+    "missing",
+    "disabled",
+    "historical_unknown",
+];
+
+fn display_status_for(status: &str, status_origin: &str) -> String {
+    match status {
+        "queued" | "batched" | "retry_scheduled" => "queued".to_owned(),
+        "running" => "running".to_owned(),
+        "completed" | "succeeded" | "ready" => "succeeded".to_owned(),
+        "failed" | "error" => "failed".to_owned(),
+        "missing" => "missing".to_owned(),
+        "disabled" => "disabled".to_owned(),
+        "not_recorded" if status_origin == "never_started" => "not_started".to_owned(),
+        "not_recorded" => "historical_unknown".to_owned(),
+        _ if status.is_empty() && status_origin == "never_started" => "not_started".to_owned(),
+        _ if status.is_empty() => "historical_unknown".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn parse_status_filter(raw: Option<String>, field: &str) -> Result<Option<Vec<String>>, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let mut values = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    if values.is_empty() {
+        return Ok(None);
+    }
+    if let Some(value) = values
+        .iter()
+        .find(|value| !DISPLAY_STATUSES.contains(&value.as_str()))
+    {
+        return Err(ApiError::bad_request(format!(
+            "{field} contains invalid status {value}"
+        )));
+    }
+    Ok(Some(values))
+}
+
+fn status_matches(summary: &AdminCollectionTaskSummary, filter: Option<&[String]>) -> bool {
+    filter.is_none_or(|values| values.iter().any(|value| value == &summary.display_status))
+}
+
+fn collection_record_kind_label(kind: CollectionRecordKind) -> &'static str {
+    match kind {
+        CollectionRecordKind::Release => "release",
+        CollectionRecordKind::Announcement => "announcement",
+        CollectionRecordKind::Brief => "brief",
+    }
+}
+
+fn collection_pipelines(kind: CollectionRecordKind) -> &'static [&'static str] {
+    match kind {
+        CollectionRecordKind::Release | CollectionRecordKind::Announcement => {
+            &["translation", "polish"]
+        }
+        CollectionRecordKind::Brief => &["polish"],
+    }
+}
+
+async fn ensure_processing_coverage(
+    pool: &SqlitePool,
+    kind: CollectionRecordKind,
+    record_ids: &[String],
+) -> Result<(), ApiError> {
+    if record_ids.is_empty() {
+        return Ok(());
+    }
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "INSERT OR IGNORE INTO admin_collection_processing_coverage (record_kind, record_id, pipeline, status_origin) ",
+    );
+    query.push("VALUES ");
+    let mut first = true;
+    for record_id in record_ids {
+        for pipeline in collection_pipelines(kind) {
+            if !first {
+                query.push(", ");
+            }
+            first = false;
+            query
+                .push("(")
+                .push_bind(collection_record_kind_label(kind))
+                .push(", ")
+                .push_bind(record_id)
+                .push(", ")
+                .push_bind(*pipeline)
+                .push(", 'never_started')");
+        }
+    }
+    query
+        .build()
+        .execute(pool)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+async fn load_processing_coverage(
+    pool: &SqlitePool,
+    kind: CollectionRecordKind,
+    record_ids: &[String],
+) -> Result<HashMap<(String, String), String>, ApiError> {
+    if record_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "SELECT record_id, pipeline, status_origin FROM admin_collection_processing_coverage WHERE record_kind = ",
+    );
+    query.push_bind(collection_record_kind_label(kind));
+    query.push(" AND record_id IN (");
+    let mut separated = query.separated(", ");
+    for record_id in record_ids {
+        separated.push_bind(record_id);
+    }
+    query.push(")");
+    let rows = query
+        .build_query_as::<ProcessingCoverageRow>()
+        .fetch_all(pool)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ((row.record_id, row.pipeline), row.status_origin))
+        .collect())
+}
+
+fn coverage_origin(
+    coverage: &HashMap<(String, String), String>,
+    record_id: &str,
+    pipeline: &str,
+) -> String {
+    coverage
+        .get(&(record_id.to_owned(), pipeline.to_owned()))
+        .cloned()
+        .unwrap_or_else(|| "historical_unknown".to_owned())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AttemptCountRange {
     min: i64,
@@ -286,7 +448,13 @@ fn source_record_item(
     task_summaries: &HashMap<String, TaskSummaries>,
     brief_summaries: &HashMap<String, AdminCollectionTaskSummary>,
 ) -> AdminCollectionRecordItem {
-    let tasks = task_summaries.get(&row.id).cloned().unwrap_or_default();
+    let tasks = task_summaries
+        .get(&row.id)
+        .cloned()
+        .unwrap_or_else(|| TaskSummaries {
+            translation: not_recorded_summary(),
+            polish: not_recorded_summary(),
+        });
     AdminCollectionRecordItem {
         id: row.id.clone(),
         kind: match kind {
@@ -312,28 +480,37 @@ fn source_record_item(
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct TaskSummaries {
     translation: AdminCollectionTaskSummary,
     polish: AdminCollectionTaskSummary,
 }
 
 fn not_recorded_summary() -> AdminCollectionTaskSummary {
+    not_recorded_summary_for("historical_unknown")
+}
+
+fn not_recorded_summary_for(status_origin: &str) -> AdminCollectionTaskSummary {
     AdminCollectionTaskSummary {
         status: "not_recorded".to_owned(),
-        ..AdminCollectionTaskSummary::default()
+        display_status: display_status_for("not_recorded", status_origin),
+        status_origin: status_origin.to_owned(),
+        ..Default::default()
     }
 }
 
-fn merge_summary(rows: &[TaskRow]) -> AdminCollectionTaskSummary {
+fn merge_summary(rows: &[TaskRow], status_origin: &str) -> AdminCollectionTaskSummary {
     let Some(latest) = rows.iter().max_by_key(|row| (&row.updated_at, &row.id)) else {
-        return not_recorded_summary();
+        return not_recorded_summary_for(status_origin);
     };
+    let status = latest
+        .result_status
+        .clone()
+        .unwrap_or_else(|| latest.status.clone());
     AdminCollectionTaskSummary {
-        status: latest
-            .result_status
-            .clone()
-            .unwrap_or_else(|| latest.status.clone()),
+        display_status: display_status_for(&status, "task"),
+        status,
+        status_origin: "task".to_owned(),
         retry_count: rows
             .iter()
             .map(|row| row.attempt_count.saturating_sub(1))
@@ -352,6 +529,7 @@ async fn load_task_summaries(
     state: &AppState,
     kind: CollectionRecordKind,
     entity_ids: &[String],
+    coverage: &HashMap<(String, String), String>,
 ) -> Result<HashMap<String, TaskSummaries>, ApiError> {
     let Some((translation_kind, polish_kind)) = kind.task_kinds() else {
         return Ok(HashMap::new());
@@ -395,14 +573,18 @@ async fn load_task_summaries(
             entry.1.push(row.task);
         }
     }
-    Ok(grouped
-        .into_iter()
-        .map(|(id, (translation, polish))| {
+    Ok(entity_ids
+        .iter()
+        .map(|id| {
+            let (translation, polish) = grouped.remove(id).unwrap_or_default();
             (
-                id,
+                id.clone(),
                 TaskSummaries {
-                    translation: merge_summary(&translation),
-                    polish: merge_summary(&polish),
+                    translation: merge_summary(
+                        &translation,
+                        &coverage_origin(coverage, id, "translation"),
+                    ),
+                    polish: merge_summary(&polish, &coverage_origin(coverage, id, "polish")),
                 },
             )
         })
@@ -412,6 +594,7 @@ async fn load_task_summaries(
 async fn load_brief_summaries(
     state: &AppState,
     brief_ids: &[String],
+    coverage: &HashMap<(String, String), String>,
 ) -> Result<HashMap<String, AdminCollectionTaskSummary>, ApiError> {
     if brief_ids.is_empty() {
         return Ok(HashMap::new());
@@ -444,13 +627,17 @@ async fn load_brief_summaries(
             .or_default()
             .push(row.call);
     }
-    Ok(grouped
-        .into_iter()
-        .map(|(id, calls)| {
+    Ok(brief_ids
+        .iter()
+        .map(|id| {
+            let calls = grouped.remove(id).unwrap_or_default();
             let latest = calls.iter().max_by_key(|call| (&call.updated_at, &call.id));
-            let summary =
-                latest.map_or_else(not_recorded_summary, |call| AdminCollectionTaskSummary {
+            let summary = latest.map_or_else(
+                || not_recorded_summary_for(&coverage_origin(coverage, id, "polish")),
+                |call| AdminCollectionTaskSummary {
                     status: call.status.clone(),
+                    display_status: display_status_for(&call.status, "task"),
+                    status_origin: "task".to_owned(),
                     retry_count: calls
                         .iter()
                         .map(|call| call.attempt_count.saturating_sub(1))
@@ -465,8 +652,9 @@ async fn load_brief_summaries(
                         .iter()
                         .filter_map(|call| call.finished_at.clone())
                         .max(),
-                });
-            (id, summary)
+                },
+            );
+            (id.clone(), summary)
         })
         .collect())
 }
@@ -477,9 +665,7 @@ async fn list_source_rows(
     from: Option<&str>,
     before: Option<&str>,
     attempts: AttemptCountRange,
-    page_size: i64,
-    offset: i64,
-) -> Result<(Vec<SourceRecordRow>, i64), ApiError> {
+) -> Result<Vec<SourceRecordRow>, ApiError> {
     let source_sql = match kind {
         CollectionRecordKind::Release => {
             "WITH source_records AS (
@@ -549,31 +735,16 @@ async fn list_source_rows(
             ORDER BY datetime(source_time) DESC, id DESC"
         }
     };
-    let total_sql = format!("SELECT COUNT(*) FROM ({source_sql}) source_records");
-    let total = sqlx::query_scalar::<_, i64>(&total_sql)
+    sqlx::query_as::<_, SourceRecordRow>(source_sql)
         .bind(from)
         .bind(from)
         .bind(before)
         .bind(before)
         .bind(attempts.min)
         .bind(attempts.max)
-        .fetch_one(pool)
-        .await
-        .map_err(ApiError::internal)?;
-    let sql = format!("{source_sql} LIMIT ? OFFSET ?");
-    let rows = sqlx::query_as::<_, SourceRecordRow>(&sql)
-        .bind(from)
-        .bind(from)
-        .bind(before)
-        .bind(before)
-        .bind(attempts.min)
-        .bind(attempts.max)
-        .bind(page_size)
-        .bind(offset)
         .fetch_all(pool)
         .await
-        .map_err(ApiError::internal)?;
-    Ok((rows, total))
+        .map_err(ApiError::internal)
 }
 
 pub async fn admin_list_collection_records(
@@ -586,32 +757,54 @@ pub async fn admin_list_collection_records(
     let kind = CollectionRecordKind::parse(record_kind.as_str())?;
     let (page, page_size, offset) = pagination(&query)?;
     let attempts = parse_attempt_count_range(&query)?;
+    let translation_filter = parse_status_filter(query.translation_status, "translation_status")?;
+    let polish_filter = parse_status_filter(query.polish_status, "polish_status")?;
     let from = parse_timestamp(query.from, "from")?;
     let before = parse_timestamp(query.before, "before")?;
-    let (rows, total) = list_source_rows(
+    let rows = list_source_rows(
         &state.pool,
         kind,
         from.as_deref(),
         before.as_deref(),
         attempts,
-        page_size,
-        offset,
     )
     .await?;
     let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
-    let task_summaries = load_task_summaries(state.as_ref(), kind, &ids).await?;
+    ensure_processing_coverage(&state.pool, kind, &ids).await?;
+    let coverage = load_processing_coverage(&state.pool, kind, &ids).await?;
+    let task_summaries = load_task_summaries(state.as_ref(), kind, &ids, &coverage).await?;
     let brief_summaries = if kind == CollectionRecordKind::Brief {
-        load_brief_summaries(state.as_ref(), &ids).await?
+        load_brief_summaries(state.as_ref(), &ids, &coverage).await?
     } else {
         HashMap::new()
     };
+    let mut items = rows
+        .into_iter()
+        .map(|row| source_record_item(kind, row, &task_summaries, &brief_summaries))
+        .filter(|item| {
+            let translation_matches = if kind == CollectionRecordKind::Brief {
+                true
+            } else {
+                item.translation
+                    .as_ref()
+                    .is_some_and(|summary| status_matches(summary, translation_filter.as_deref()))
+            };
+            translation_matches && status_matches(&item.polish, polish_filter.as_deref())
+        })
+        .collect::<Vec<_>>();
+    let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
+    let offset = usize::try_from(offset).unwrap_or(usize::MAX);
+    let page_size = usize::try_from(page_size).unwrap_or(usize::MAX);
+    let items = if offset >= items.len() {
+        Vec::new()
+    } else {
+        let end = items.len().min(offset.saturating_add(page_size));
+        items.drain(offset..end).collect()
+    };
     Ok(Json(AdminCollectionRecordsResponse {
-        items: rows
-            .into_iter()
-            .map(|row| source_record_item(kind, row, &task_summaries, &brief_summaries))
-            .collect(),
+        items,
         page,
-        page_size,
+        page_size: i64::try_from(page_size).unwrap_or(i64::MAX),
         total,
     }))
 }
@@ -821,9 +1014,11 @@ pub async fn admin_get_collection_record_detail(
     let kind = CollectionRecordKind::parse(record_kind.as_str())?;
     let source = load_source_record(state.as_ref(), kind, &record_id).await?;
     let ids = vec![source.id.clone()];
-    let task_summaries = load_task_summaries(state.as_ref(), kind, &ids).await?;
+    ensure_processing_coverage(&state.pool, kind, &ids).await?;
+    let coverage = load_processing_coverage(&state.pool, kind, &ids).await?;
+    let task_summaries = load_task_summaries(state.as_ref(), kind, &ids, &coverage).await?;
     let brief_summaries = if kind == CollectionRecordKind::Brief {
-        load_brief_summaries(state.as_ref(), &ids).await?
+        load_brief_summaries(state.as_ref(), &ids, &coverage).await?
     } else {
         HashMap::new()
     };
@@ -862,6 +1057,8 @@ mod tests {
             before: None,
             attempt_min,
             attempt_max,
+            translation_status: None,
+            polish_status: None,
             page: None,
             page_size: None,
         }
@@ -906,6 +1103,89 @@ mod tests {
         }
     }
 
+    #[test]
+    fn display_status_preserves_not_started_and_historical_unknown_origins() {
+        assert_eq!(
+            display_status_for("not_recorded", "never_started"),
+            "not_started"
+        );
+        assert_eq!(
+            display_status_for("not_recorded", "historical_unknown"),
+            "historical_unknown"
+        );
+        assert_eq!(display_status_for("failed", "task"), "failed");
+        assert_eq!(display_status_for("retry_scheduled", "task"), "queued");
+    }
+
+    #[test]
+    fn status_filter_is_sorted_deduplicated_and_validated() {
+        assert_eq!(
+            parse_status_filter(Some("failed, running,failed".to_owned()), "polish_status")
+                .expect("valid filter"),
+            Some(vec!["failed".to_owned(), "running".to_owned()])
+        );
+        assert!(parse_status_filter(Some("unknown".to_owned()), "translation_status").is_err());
+        assert_eq!(
+            parse_status_filter(Some(",,".to_owned()), "polish_status").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn status_filter_matches_within_pipeline_or_semantics() {
+        let summary = not_recorded_summary_for("never_started");
+        assert!(status_matches(&summary, None));
+        assert!(status_matches(
+            &summary,
+            Some(&["failed".to_owned(), "not_started".to_owned()])
+        ));
+        assert!(!status_matches(
+            &summary,
+            Some(&["historical_unknown".to_owned()])
+        ));
+    }
+
+    #[tokio::test]
+    async fn processing_coverage_marks_new_records_without_overwriting_legacy_origin() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE admin_collection_processing_coverage (record_kind TEXT NOT NULL, record_id TEXT NOT NULL, pipeline TEXT NOT NULL, status_origin TEXT NOT NULL, PRIMARY KEY (record_kind, record_id, pipeline))",
+        )
+        .execute(&pool)
+        .await
+        .expect("create coverage table");
+        sqlx::query(
+            "INSERT INTO admin_collection_processing_coverage (record_kind, record_id, pipeline, status_origin) VALUES ('release', 'legacy', 'translation', 'historical_unknown')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed legacy coverage");
+
+        ensure_processing_coverage(
+            &pool,
+            CollectionRecordKind::Release,
+            &["legacy".to_owned(), "new".to_owned()],
+        )
+        .await
+        .expect("ensure coverage");
+        let coverage = load_processing_coverage(
+            &pool,
+            CollectionRecordKind::Release,
+            &["legacy".to_owned(), "new".to_owned()],
+        )
+        .await
+        .expect("load coverage");
+        assert_eq!(
+            coverage_origin(&coverage, "legacy", "translation"),
+            "historical_unknown"
+        );
+        assert_eq!(
+            coverage_origin(&coverage, "new", "translation"),
+            "never_started"
+        );
+        assert_eq!(coverage_origin(&coverage, "new", "polish"), "never_started");
+    }
+
     #[tokio::test]
     async fn release_source_time_and_attempt_range_apply_before_pagination() {
         let pool = test_pool().await;
@@ -938,33 +1218,29 @@ mod tests {
         .await
         .expect("seed attempts");
 
-        let (rows, total) = list_source_rows(
+        let rows = list_source_rows(
             &pool,
             CollectionRecordKind::Release,
             Some("2026-07-08T07:00:00Z"),
             Some("2026-07-08T10:00:00Z"),
             AttemptCountRange { min: 0, max: None },
-            1,
-            0,
         )
         .await
         .expect("list releases");
-        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, "100");
         assert_eq!(rows[0].detected_at, None);
 
-        let (rows, total) = list_source_rows(
+        let rows = list_source_rows(
             &pool,
             CollectionRecordKind::Release,
             Some("2026-07-08T07:00:00Z"),
             Some("2026-07-08T10:00:00Z"),
             AttemptCountRange { min: 2, max: None },
-            20,
-            0,
         )
         .await
         .expect("filter releases by attempts");
-        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "101");
     }
 
@@ -989,18 +1265,16 @@ mod tests {
         .execute(&pool)
         .await
         .expect("seed announcement");
-        let (_, announcement_total) = list_source_rows(
+        let announcement_rows = list_source_rows(
             &pool,
             CollectionRecordKind::Announcement,
             Some("2026-07-08T08:00:00Z"),
             Some("2026-07-08T10:00:00Z"),
             AttemptCountRange { min: 0, max: None },
-            20,
-            0,
         )
         .await
         .expect("list announcements");
-        assert_eq!(announcement_total, 1);
+        assert_eq!(announcement_rows.len(), 1);
 
         sqlx::query("CREATE TABLE briefs (id TEXT, date TEXT, created_at TEXT)")
             .execute(&pool)
@@ -1016,18 +1290,16 @@ mod tests {
         .execute(&pool)
         .await
         .expect("seed brief");
-        let (_, brief_total) = list_source_rows(
+        let brief_rows = list_source_rows(
             &pool,
             CollectionRecordKind::Brief,
             Some("2026-07-08T09:00:00Z"),
             Some("2026-07-08T10:00:00Z"),
             AttemptCountRange { min: 0, max: None },
-            20,
-            0,
         )
         .await
         .expect("list briefs");
-        assert_eq!(brief_total, 1);
+        assert_eq!(brief_rows.len(), 1);
     }
 
     fn event(trigger: &str, event_type: &str, created_at: &str) -> AttemptEventRow {

@@ -301,6 +301,8 @@ function paginateItems<T>(items: T[], searchParams: URLSearchParams) {
 function demoCollectionRecords() {
 	const completed = {
 		status: "ready",
+		display_status: "succeeded",
+		status_origin: "task",
 		retry_count: 0,
 		started_at: "2026-07-08T09:11:00+08:00",
 		last_attempt_at: "2026-07-08T09:11:05+08:00",
@@ -308,6 +310,8 @@ function demoCollectionRecords() {
 	};
 	const recovered = {
 		status: "ready",
+		display_status: "succeeded",
+		status_origin: "task",
 		retry_count: 1,
 		started_at: "2026-07-08T09:23:01+08:00",
 		last_attempt_at: "2026-07-08T09:25:08+08:00",
@@ -315,6 +319,8 @@ function demoCollectionRecords() {
 	};
 	const pending = {
 		status: "running",
+		display_status: "running",
+		status_origin: "task",
 		retry_count: 0,
 		started_at: "2026-07-08T10:02:00+08:00",
 		last_attempt_at: "2026-07-08T10:02:00+08:00",
@@ -322,6 +328,8 @@ function demoCollectionRecords() {
 	};
 	const notRecorded = {
 		status: "not_recorded",
+		display_status: "historical_unknown",
+		status_origin: "historical_unknown",
 		retry_count: 0,
 		started_at: null,
 		last_attempt_at: null,
@@ -337,7 +345,7 @@ function demoCollectionRecords() {
 				occurred_at: "2026-07-08T09:45:00+08:00",
 				detected_at: null,
 				generated_at: null,
-				translation: null,
+				translation: notRecorded,
 				polish: notRecorded,
 			},
 			{
@@ -2005,6 +2013,13 @@ export const demoHandlers = [
 		};
 		const attemptMin = parseAttemptBound("attempt_min", 0) ?? 0;
 		const attemptMax = parseAttemptBound("attempt_max", null);
+		const parseStatuses = (name: string) =>
+			(url.searchParams.get(name) ?? "")
+				.split(",")
+				.map((value) => value.trim())
+				.filter(Boolean);
+		const translationStatuses = parseStatuses("translation_status");
+		const polishStatuses = parseStatuses("polish_status");
 		if (!Number.isInteger(attemptMin) || attemptMin < 0 || attemptMin > 10) {
 			return badRequest("attempt_min must be between 0 and 10");
 		}
@@ -2024,13 +2039,20 @@ export const demoHandlers = [
 				item.kind === "brief" ? item.generated_at : item.occurred_at;
 			const value = timestamp ? new Date(timestamp).getTime() : Number.NaN;
 			const attemptCount = demoRecordAttemptCount(item);
+			const translationStatus = item.translation?.display_status;
+			const polishStatus = item.polish.display_status;
 			return (
 				(!from ||
 					(Number.isFinite(value) && value >= new Date(from).getTime())) &&
 				(!before ||
 					(Number.isFinite(value) && value < new Date(before).getTime())) &&
 				attemptCount >= attemptMin &&
-				(attemptMax === null || attemptCount <= attemptMax)
+				(attemptMax === null || attemptCount <= attemptMax) &&
+				(kind === "brief" ||
+					translationStatuses.length === 0 ||
+					(translationStatus !== undefined &&
+						translationStatuses.includes(translationStatus))) &&
+				(polishStatuses.length === 0 || polishStatuses.includes(polishStatus))
 			);
 		});
 		return json(paginateItems(items, url.searchParams));

@@ -80,6 +80,7 @@ let demoWorker: ReturnType<DemoRuntimeDependencies["setupWorker"]> | null =
 	null;
 let workerStartPromise: Promise<void> | null = null;
 const DEMO_WORKER_START_TIMEOUT_MS = 4_000;
+const DEMO_WORKER_RELOAD_KEY = "octo-rill.demo-worker-reload";
 let pendingDemoRouteSyncHref: string | null = null;
 
 const runtimeState: DemoSnapshot = {
@@ -353,7 +354,30 @@ async function ensureWorkerStarted() {
 			}, DEMO_WORKER_START_TIMEOUT_MS);
 		}),
 	])
-		.then(() => undefined)
+		.then(async () => {
+			if (
+				typeof navigator === "undefined" ||
+				!("serviceWorker" in navigator) ||
+				navigator.serviceWorker.controller
+			) {
+				return;
+			}
+
+			// A tab opened before MSW registration may finish startup without being
+			// controlled. Reload once so the first API request cannot fall through to
+			// the real backend proxy.
+			if (sessionStorage.getItem(DEMO_WORKER_RELOAD_KEY) !== "1") {
+				sessionStorage.setItem(DEMO_WORKER_RELOAD_KEY, "1");
+				window.location.reload();
+				await new Promise<never>(() => undefined);
+			}
+			throw new Error(
+				"Demo mock worker is not controlling this page after reload.",
+			);
+		})
+		.then(() => {
+			sessionStorage.removeItem(DEMO_WORKER_RELOAD_KEY);
+		})
 		.catch((error) => {
 			stopDemoWorker();
 			throw error;
