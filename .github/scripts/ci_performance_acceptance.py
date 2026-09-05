@@ -422,8 +422,8 @@ class AcceptanceRunner:
     poll_interval: float = 15
     timeout_seconds: float = 2100
 
-    def _workflow_runs(self, dispatch_sha: str) -> list[dict[str, Any]]:
-        query = urlencode({"event": "workflow_dispatch", "head_sha": dispatch_sha, "per_page": "100"})
+    def _workflow_runs(self) -> list[dict[str, Any]]:
+        query = urlencode({"event": "workflow_dispatch", "per_page": "100"})
         response = self.client.api(f"repos/{self.repo}/actions/workflows/{self.workflow}/runs?{query}")
         runs = response.get("workflow_runs", []) if isinstance(response, dict) else []
         if not isinstance(runs, list) or any(not isinstance(item, dict) for item in runs):
@@ -439,9 +439,14 @@ class AcceptanceRunner:
         require_runtime_smoke: bool,
     ) -> dict[str, Any]:
         dispatch_sha = refs["dispatch_sha"]
+        current_dispatch_sha = resolve_ref(self.client, self.repo, refs["dispatch_ref"])
+        if current_dispatch_sha != dispatch_sha:
+            raise AcceptanceError(
+                f"dispatch ref {refs['dispatch_ref']!r} moved from {dispatch_sha} to {current_dispatch_sha}"
+            )
         active = [
             run
-            for run in self._workflow_runs(dispatch_sha)
+            for run in self._workflow_runs()
             if run_is_active(run)
             and isinstance(run.get("display_title"), str)
             and run["display_title"].startswith(f"{ACCEPTANCE_RUN_TITLE_PREFIX} ")
@@ -467,10 +472,9 @@ class AcceptanceRunner:
         selected: dict[str, Any] | None = None
         while time.monotonic() <= deadline:
             candidates = []
-            for run in self._workflow_runs(dispatch_sha):
+            for run in self._workflow_runs():
                 if (
-                    run.get("head_sha") == dispatch_sha
-                    and run.get("event") == "workflow_dispatch"
+                    run.get("event") == "workflow_dispatch"
                     and run.get("display_title") == expected_title
                 ):
                     candidates.append(run)
@@ -480,6 +484,10 @@ class AcceptanceRunner:
                 selected = candidates[0]
                 if selected.get("run_attempt") != 1:
                     raise AcceptanceError(f"run {selected.get('id')} was retried")
+                if selected.get("head_sha") != dispatch_sha:
+                    raise AcceptanceError(
+                        f"run {selected.get('id')} used dispatcher SHA {selected.get('head_sha')}, expected {dispatch_sha}"
+                    )
                 if selected.get("status") == "completed":
                     break
             time.sleep(self.poll_interval)
