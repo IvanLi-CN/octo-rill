@@ -14,7 +14,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from urllib.parse import parse_qs, urlparse
 
 module_path = sys.argv[1]
 spec = importlib.util.spec_from_file_location("ci_performance_acceptance", module_path)
@@ -59,6 +58,8 @@ class FakeGh:
             assert target_sha in {self.control_sha, self.candidate_sha}
             assert nonce
             self.dispatches.append(target_sha)
+            if getattr(self, "move_dispatch_after_dispatch", False):
+                self.dispatch_sha = "4" * 40
             self.next_id += 1
             # GitHub workflow-run timestamps are second-resolution, unlike local dispatch time.
             started = datetime.now(timezone.utc).replace(microsecond=0)
@@ -93,9 +94,7 @@ class FakeGh:
             self.runs[self.next_id] = (run, target_sha, summary, duration)
             return None
         if "/actions/workflows/ci.yml/runs?" in endpoint:
-            query = parse_qs(urlparse(endpoint).query)
-            sha = query["head_sha"][0]
-            return {"workflow_runs": [run for run, _target_sha, _summary, _duration in self.runs.values() if run["head_sha"] == sha]}
+            return {"workflow_runs": [run for run, _target_sha, _summary, _duration in self.runs.values()]}
         if "/actions/runs/" in endpoint and endpoint.endswith("/jobs?per_page=100"):
             run_id = int(endpoint.split("/actions/runs/")[1].split("/", 1)[0])
             run, target_sha, _summary, duration = self.runs[run_id]
@@ -182,6 +181,22 @@ except module.AcceptanceError as error:
     assert "test identifiers differ" in str(error)
 else:
     raise AssertionError("candidate with a different equal-sized test selection must be rejected")
+
+moving_dispatch = FakeGh()
+moving_dispatch.move_dispatch_after_dispatch = True
+moving_refs = module.validate_target_pair(
+    moving_dispatch,
+    "IvanLi-CN/octo-rill",
+    moving_dispatch.control_sha,
+    moving_dispatch.candidate_sha,
+    "main",
+)
+try:
+    module.AcceptanceRunner(moving_dispatch, "IvanLi-CN/octo-rill", poll_interval=0, timeout_seconds=1).run(moving_refs)
+except module.AcceptanceError as error:
+    assert "dispatcher SHA" in str(error)
+else:
+    raise AssertionError("dispatcher SHA movement must fail the acceptance")
 
 try:
     module.validate_playwright_summary({
