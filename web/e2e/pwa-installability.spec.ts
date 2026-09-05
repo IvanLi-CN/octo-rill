@@ -9,7 +9,8 @@ import {
 import path from "node:path";
 import { expect, test, type CDPSession, type Page } from "@playwright/test";
 
-test.describe.configure({ mode: "serial" });
+// Keep the PWA fixture ordered while allowing a retry to target only the failed test.
+test.describe.configure({ mode: "default" });
 
 test.beforeAll(() => {
 	execFileSync("bun", ["run", "build"], {
@@ -606,7 +607,7 @@ test("install metadata stays network-revalidated outside the service worker prec
 }) => {
 	const server = await startStaticPwaServer();
 	try {
-		await page.goto(server.origin);
+		await page.goto(server.origin, { waitUntil: "domcontentloaded" });
 		await waitForServiceWorkerControl(page);
 
 		const cdpSession = await page.context().newCDPSession(page);
@@ -911,9 +912,7 @@ test("offline authenticated boot shows an offline empty state when the active pa
 		await seedAuthenticatedStartupCache(page, {});
 
 		await context.setOffline(true);
-		await page.goto(`${server.origin}/stars`, {
-			waitUntil: "domcontentloaded",
-		});
+		await page.goto(`${server.origin}/stars`, { waitUntil: "commit" });
 
 		await expect(
 			page.locator("[data-dashboard-offline-empty-state]"),
