@@ -31,6 +31,7 @@
 
 - 账号菜单必须在头像与浮层之间保留连续的 hover 可达范围。
 - 指针以自然速度跨越该视觉间距时，浮层不得提前关闭；只有指针离开整个账号菜单后才可关闭。触摸输入仍以点击固定打开语义为准。
+- 浮层显示时必须从头像所在的右上锚点以短暂淡入和轻微位移建立空间连续性；隐藏时更快淡出。系统要求减少动态效果时保留淡入淡出并移除空间位移与缩放。
 
 ### REQ-DASHBOARD-HEADER-004
 
@@ -48,13 +49,13 @@
 
 - Method: Dashboard Header Storybook `Evidence / Account menu hover bridge` 的交互断言与视觉审阅。
 - covers: `REQ-DASHBOARD-HEADER-003`
-- Pass condition: hover 打开账号菜单后，透明 bridge 存在且面板保持原有视觉间距与可见状态。
+- Pass condition: hover 打开账号菜单后，透明 bridge 存在且面板以打开动效状态保持原有视觉间距与可见状态。
 
 ### VER-DASHBOARD-HEADER-003
 
 - Method: Playwright `dashboard-access-sync.spec.ts` 的头像到面板慢速斜向指针路径。
 - covers: `REQ-DASHBOARD-HEADER-003`
-- Pass condition: 指针逐步移动到面板内部后，账号菜单仍保持展开。
+- Pass condition: 指针逐步移动到面板内部后，账号菜单仍保持展开；离开整个菜单后，面板先进入关闭动效状态再卸载。
 
 ### VER-DASHBOARD-HEADER-004
 

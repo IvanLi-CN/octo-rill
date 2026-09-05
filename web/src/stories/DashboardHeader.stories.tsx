@@ -333,6 +333,9 @@ export const HoverBridge: Story = {
 			canvas.getByRole("dialog", { name: "账号信息" }),
 		).toBeVisible();
 		expect(
+			canvasElement.querySelector("[data-dashboard-user-card-motion='open']"),
+		).not.toBeNull();
+		expect(
 			canvasElement.querySelector("[data-dashboard-user-menu-hover-bridge]"),
 		).not.toBeNull();
 	},
@@ -340,7 +343,7 @@ export const HoverBridge: Story = {
 		docs: {
 			description: {
 				story:
-					"账号菜单保持原有视觉间距；透明 hover bridge 覆盖头像与浮层之间的过渡区域，确保指针以自然速度移动时不会提前关闭浮层。",
+					"账号菜单保持原有视觉间距；透明 hover bridge 覆盖头像与浮层之间的过渡区域，确保指针以自然速度移动时不会提前关闭浮层。面板从头像锚点轻微下落淡入，离开时更快淡出；减少动态效果时仅保留淡入淡出。",
 			},
 		},
 	},
