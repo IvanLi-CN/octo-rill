@@ -2208,13 +2208,14 @@ async fn execute_task(
         TASK_SUMMARIZE_RELEASE_SMART_BATCH => {
             let user_id = payload_local_id(payload, "user_id")?;
             let release_ids = payload_i64_array(payload, "release_ids")?;
-            let res =
-                api::summarize_releases_smart_batch_for_user(state, user_id.as_str(), &release_ids)
-                    .await
-                    .map_err(|err| {
-                        anyhow!("summarize_releases_smart_batch failed: {}", err.code())
-                    })?;
-            Ok(translate_batch_task_result_json(res.items))
+            let request_ids = translations::enqueue_release_smart_translation_requests(
+                state,
+                user_id.as_str(),
+                &release_ids,
+            )
+            .await
+            .map_err(|err| anyhow!("enqueue release smart translation failed: {}", err.code()))?;
+            Ok(json!({"queued": true, "request_ids": request_ids}))
         }
         TASK_TRANSLATE_RELEASE_DETAIL => {
             let user_id = payload_local_id(payload, "user_id")?;

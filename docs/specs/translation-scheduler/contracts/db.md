@@ -21,6 +21,11 @@
   - remains readable after `llm_calls` retention cleanup so the admin surface can distinguish expired diagnostic evidence from absent attribution
 - `translation_work_items` recovery columns
   - `failure_class TEXT NULL`
+  - `error_code TEXT NULL`
+  - `processing_stage TEXT NULL`
+  - `provider_status TEXT NULL` (`not_started | succeeded | failed`)
+  - `output_contract_status TEXT NULL` (`not_run | passed | failed | recovered`)
+  - `retry_disposition TEXT NOT NULL DEFAULT 'not_needed'` (`not_needed | scheduled | manual_only | in_attempt_recovered`)
   - `retry_count INTEGER NOT NULL DEFAULT 0`
   - `attempt_count INTEGER NOT NULL DEFAULT 0`
   - `next_attempt_trigger TEXT NOT NULL DEFAULT 'initial'`
@@ -44,6 +49,11 @@
   - add `runtime_owner_id TEXT NULL`
   - add `lease_heartbeat_at TEXT NULL`
   - add translation-specific linkage indexes for admin tracing
+  - diagnostic payload columns are retained for seven days; cleanup marks linked evidence `expired` before deleting payload rows
+
+- `llm_diagnostic_access_audit`
+  - stores only call id, administrator id, `reveal`/`copy` action, and timestamp
+  - never stores prompt, response, or raw provider error text
 
 - `runtime_owners`
   - runtime-level owner lease registry keyed by `runtime_owner_id`

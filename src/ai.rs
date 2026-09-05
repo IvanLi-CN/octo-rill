@@ -27,6 +27,7 @@ use crate::{
     },
     runtime,
     state::AppState,
+    translations,
 };
 
 const MODEL_LIMIT_UNKNOWN_FALLBACK: u32 = 32_768;
@@ -105,6 +106,7 @@ impl std::fmt::Display for LlmFailureClass {
 #[derive(Debug)]
 pub(crate) struct LlmCallFailure {
     pub(crate) class: LlmFailureClass,
+    pub(crate) call_id: Option<String>,
 }
 
 impl std::fmt::Display for LlmCallFailure {
@@ -118,6 +120,11 @@ impl std::error::Error for LlmCallFailure {}
 pub(crate) fn llm_failure_class(err: &anyhow::Error) -> Option<LlmFailureClass> {
     err.downcast_ref::<LlmCallFailure>()
         .map(|failure| failure.class)
+}
+
+pub(crate) fn llm_call_id(err: &anyhow::Error) -> Option<String> {
+    err.downcast_ref::<LlmCallFailure>()
+        .and_then(|failure| failure.call_id.clone())
 }
 
 #[derive(Debug, Default)]
@@ -599,7 +606,7 @@ where
     LLM_CALL_CONTEXT.scope(context, fut).await
 }
 
-fn current_llm_call_context() -> Option<LlmCallContext> {
+pub(crate) fn current_llm_call_context() -> Option<LlmCallContext> {
     LLM_CALL_CONTEXT.try_with(Clone::clone).ok()
 }
 
@@ -1067,6 +1074,22 @@ async fn cleanup_expired_llm_calls(state: &AppState) -> Result<u64> {
     match state
         .sqlite_writer
         .try_write("llm_call_retention_cleanup", || async {
+            sqlx::query(r#"DELETE FROM llm_diagnostic_access_audit WHERE created_at < ?"#)
+                .bind(cutoff.as_str())
+                .execute(&state.pool)
+                .await
+                .context("delete expired llm diagnostic audits failed")?;
+            sqlx::query(
+                r#"
+                UPDATE translation_attempt_llm_calls
+                SET evidence_availability = 'expired'
+                WHERE llm_call_id IN (SELECT id FROM llm_calls WHERE created_at < ?)
+                "#,
+            )
+            .bind(cutoff.as_str())
+            .execute(&state.pool)
+            .await
+            .context("mark expired llm diagnostic links failed")?;
             Ok::<_, anyhow::Error>(
                 sqlx::query(r#"DELETE FROM llm_calls WHERE created_at < ?"#)
                     .bind(cutoff.as_str())
@@ -1288,6 +1311,7 @@ struct ChatMessage<'a> {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionsResponse {
+    id: Option<String>,
     choices: Vec<Choice>,
     usage: Option<ChatCompletionsUsage>,
 }
@@ -1295,6 +1319,7 @@ struct ChatCompletionsResponse {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ChoiceMessage,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1304,6 +1329,7 @@ struct ChoiceMessage {
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionsStreamChunk {
+    id: Option<String>,
     choices: Vec<ChatCompletionsStreamChoice>,
     usage: Option<ChatCompletionsUsage>,
 }
@@ -1311,6 +1337,7 @@ struct ChatCompletionsStreamChunk {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionsStreamChoice {
     delta: ChatCompletionsStreamDelta,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1345,6 +1372,21 @@ struct ChatCompletionOutput {
     output_messages_json: String,
     first_token_wait_ms: Option<i64>,
     usage: LlmTokenUsage,
+    finish_reason: Option<String>,
+    provider_request_id: Option<String>,
+    provider_http_status: Option<i64>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ChatCompletionDiagnostic {
+    pub call_id: Option<String>,
+    pub diagnostic_captured: bool,
+    pub content: String,
+    pub finish_reason: Option<String>,
+    pub provider_request_id: Option<String>,
+    pub provider_http_status: Option<i64>,
+    pub output_tokens: Option<i64>,
 }
 
 #[allow(dead_code)]
@@ -1480,11 +1522,16 @@ fn parse_chat_completion_sse_output(
     body: &[u8],
     content_type: &str,
     first_token_wait_ms: Option<i64>,
+    provider_request_id: Option<String>,
+    provider_http_status: Option<i64>,
 ) -> std::result::Result<ChatCompletionOutput, ChatCompletionAttemptError> {
     fn build_assistant_output(
         content: String,
         usage: Option<ChatCompletionsUsage>,
         first_token_wait_ms: Option<i64>,
+        finish_reason: Option<String>,
+        provider_request_id: Option<String>,
+        provider_http_status: Option<i64>,
     ) -> ChatCompletionOutput {
         let output_messages_json = serde_json::to_string(&[ChatMessage {
             role: "assistant",
@@ -1497,6 +1544,9 @@ fn parse_chat_completion_sse_output(
             output_messages_json,
             first_token_wait_ms,
             usage: llm_token_usage_from_chat_usage(usage),
+            finish_reason,
+            provider_request_id,
+            provider_http_status,
         }
     }
 
@@ -1505,6 +1555,8 @@ fn parse_chat_completion_sse_output(
         content: &mut String,
         usage: &mut Option<ChatCompletionsUsage>,
         saw_done: &mut bool,
+        finish_reason: &mut Option<String>,
+        response_id: &mut Option<String>,
     ) -> Result<()> {
         let trimmed = data.trim();
         if trimmed.is_empty() {
@@ -1517,9 +1569,15 @@ fn parse_chat_completion_sse_output(
 
         let chunk: ChatCompletionsStreamChunk =
             serde_json::from_str(trimmed).context("decode chat completion SSE chunk failed")?;
+        if chunk.id.is_some() {
+            *response_id = chunk.id;
+        }
         for choice in chunk.choices {
             if let Some(fragment) = choice.delta.content {
                 content.push_str(&fragment);
+            }
+            if choice.finish_reason.is_some() {
+                *finish_reason = choice.finish_reason;
             }
         }
         if chunk.usage.is_some() {
@@ -1544,6 +1602,8 @@ fn parse_chat_completion_sse_output(
     let mut content = String::new();
     let mut usage = None;
     let mut saw_done = false;
+    let mut finish_reason = None;
+    let mut response_id = provider_request_id;
 
     let mut flush_event =
         |event_name: &mut Option<String>, event_data: &mut Vec<String>| -> Result<()> {
@@ -1564,7 +1624,14 @@ fn parse_chat_completion_sse_output(
                 anyhow::bail!(payload.trim().to_owned());
             }
 
-            parse_event_data(payload.as_str(), &mut content, &mut usage, &mut saw_done)
+            parse_event_data(
+                payload.as_str(),
+                &mut content,
+                &mut usage,
+                &mut saw_done,
+                &mut finish_reason,
+                &mut response_id,
+            )
         };
 
     for line in raw.lines() {
@@ -1616,7 +1683,14 @@ fn parse_chat_completion_sse_output(
 
     let content = content.trim().to_owned();
     if !content.is_empty() {
-        return Ok(build_assistant_output(content, usage, first_token_wait_ms));
+        return Ok(build_assistant_output(
+            content,
+            usage,
+            first_token_wait_ms,
+            finish_reason,
+            response_id,
+            provider_http_status,
+        ));
     }
 
     let message = if saw_done {
@@ -1759,6 +1833,9 @@ struct ChatCompletionAttemptError {
     retryable: bool,
     retry_after: Option<Duration>,
     first_token_wait_ms: Option<i64>,
+    provider_request_id: Option<String>,
+    provider_http_status: Option<i64>,
+    finish_reason: Option<String>,
 }
 
 impl ChatCompletionAttemptError {
@@ -1774,7 +1851,22 @@ impl ChatCompletionAttemptError {
             retryable: failure_class.is_recoverable(),
             retry_after,
             first_token_wait_ms,
+            provider_request_id: None,
+            provider_http_status: None,
+            finish_reason: None,
         }
+    }
+
+    fn with_provider_metadata(
+        mut self,
+        provider_request_id: Option<String>,
+        provider_http_status: Option<i64>,
+        finish_reason: Option<String>,
+    ) -> Self {
+        self.provider_request_id = provider_request_id;
+        self.provider_http_status = provider_http_status;
+        self.finish_reason = finish_reason;
+        self
     }
 }
 
@@ -1933,6 +2025,9 @@ pub(crate) struct LlmCallAdminOverride {
     pub duration_ms: Option<i64>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    pub finish_reason: Option<String>,
+    pub provider_request_id: Option<String>,
+    pub provider_http_status: Option<i64>,
     pub cached_input_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
     pub output_messages_json: Option<String>,
@@ -1979,6 +2074,52 @@ fn build_llm_call_log_record() -> LlmCallLogRecord {
     }
 }
 
+fn redact_llm_diagnostic_text(input: &str) -> String {
+    let sensitive_markers = [
+        "api_key",
+        "api-key",
+        "apikey",
+        "x-api-key",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "authorization",
+        "x-auth-token",
+        "bearer ",
+        "password",
+        "secret",
+        "private_key",
+        "private-key",
+        "jwt",
+        "cookie",
+    ];
+    let mut redacted = String::with_capacity(input.len());
+    for (index, line) in input.lines().enumerate() {
+        if index > 0 {
+            redacted.push('\n');
+        }
+        let lower = line.to_ascii_lowercase();
+        if !sensitive_markers
+            .iter()
+            .any(|marker| lower.contains(marker))
+        {
+            redacted.push_str(line);
+            continue;
+        }
+        let prefix_end = line
+            .find(':')
+            .or_else(|| line.find('='))
+            .map(|position| position.saturating_add(1));
+        if let Some(prefix_end) = prefix_end {
+            redacted.push_str(&line[..prefix_end]);
+            redacted.push_str("<redacted>");
+        } else {
+            redacted.push_str("<redacted sensitive content>");
+        }
+    }
+    redacted
+}
+
 async fn insert_llm_call(
     state: &AppState,
     log: &LlmCallLogRecord,
@@ -1988,6 +2129,8 @@ async fn insert_llm_call(
     input_messages_json: Option<&str>,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
+    let prompt_text = redact_llm_diagnostic_text(prompt_text);
+    let input_messages_json = input_messages_json.map(redact_llm_diagnostic_text);
     state
         .sqlite_writer
         .write("llm_call_insert", |_| async {
@@ -2020,8 +2163,8 @@ async fn insert_llm_call(
             .bind(log.parent_translation_batch_id.as_deref())
             .bind(log.parent_brief_id.as_deref())
             .bind(i64::from(max_tokens))
-            .bind(prompt_text)
-            .bind(input_messages_json)
+            .bind(prompt_text.as_str())
+            .bind(input_messages_json.as_deref())
             .bind(now.as_str())
             .bind(now.as_str())
             .execute(&state.pool)
@@ -2343,6 +2486,9 @@ async fn finalize_llm_call(
                     error_text = ?,
                     input_tokens = ?,
                     output_tokens = ?,
+                    finish_reason = ?,
+                    provider_request_id = ?,
+                    provider_http_status = ?,
                     cached_input_tokens = ?,
                     total_tokens = ?,
                     failure_class = ?,
@@ -2367,6 +2513,9 @@ async fn finalize_llm_call(
             .bind(update.error_text)
             .bind(update.input_tokens)
             .bind(update.output_tokens)
+            .bind(update.finish_reason)
+            .bind(update.provider_request_id)
+            .bind(update.provider_http_status)
             .bind(update.cached_input_tokens)
             .bind(update.total_tokens)
             .bind(update.failure_class)
@@ -2399,6 +2548,9 @@ async fn finalize_llm_call(
             "duration_ms": update.duration_ms,
             "input_tokens": update.input_tokens,
             "output_tokens": update.output_tokens,
+            "finish_reason": update.finish_reason,
+            "provider_request_id": update.provider_request_id,
+            "provider_http_status": update.provider_http_status,
             "cached_input_tokens": update.cached_input_tokens,
             "total_tokens": update.total_tokens,
             "has_output": update.response_text.is_some(),
@@ -2448,6 +2600,9 @@ struct FinalizeLlmCallUpdate<'a> {
     error_text: Option<&'a str>,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
+    finish_reason: Option<&'a str>,
+    provider_request_id: Option<&'a str>,
+    provider_http_status: Option<i64>,
     cached_input_tokens: Option<i64>,
     total_tokens: Option<i64>,
     failure_class: Option<&'a str>,
@@ -2523,6 +2678,15 @@ async fn chat_completion_once(
     let first_token_wait_ms = Some(first_token_wait_ms);
 
     let status = resp.status();
+    let provider_request_id = resp
+        .headers()
+        .get("x-request-id")
+        .or_else(|| resp.headers().get("request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let provider_http_status = Some(i64::from(status.as_u16()));
     let retry_after = retry_after_delay(resp.headers());
     let content_type = resp
         .headers()
@@ -2537,6 +2701,7 @@ async fn chat_completion_once(
             None,
             first_token_wait_ms,
         )
+        .with_provider_metadata(provider_request_id.clone(), provider_http_status, None)
     })?;
 
     if !status.is_success() {
@@ -2546,12 +2711,19 @@ async fn chat_completion_once(
             failure_class_for_status(status, &msg),
             retry_after,
             first_token_wait_ms,
-        ));
+        )
+        .with_provider_metadata(provider_request_id, provider_http_status, None));
     }
 
     let content_type_lower = content_type.to_ascii_lowercase();
     if content_type_lower.contains("text/event-stream") {
-        return parse_chat_completion_sse_output(&body, content_type.as_str(), first_token_wait_ms);
+        return parse_chat_completion_sse_output(
+            &body,
+            content_type.as_str(),
+            first_token_wait_ms,
+            provider_request_id,
+            provider_http_status,
+        );
     }
     if !content_type_lower.is_empty()
         && !content_type_lower.contains("application/json")
@@ -2563,7 +2735,8 @@ async fn chat_completion_once(
             LlmFailureClass::Configuration,
             None,
             first_token_wait_ms,
-        ));
+        )
+        .with_provider_metadata(provider_request_id, provider_http_status, None));
     }
 
     let resp: ChatCompletionsResponse = serde_json::from_slice(&body).map_err(|err| {
@@ -2579,10 +2752,14 @@ async fn chat_completion_once(
             None,
             first_token_wait_ms,
         )
+        .with_provider_metadata(provider_request_id.clone(), provider_http_status, None)
     })?;
 
-    let ChatCompletionsResponse { choices, usage } = resp;
+    let ChatCompletionsResponse { id, choices, usage } = resp;
 
+    let finish_reason = choices
+        .first()
+        .and_then(|choice| choice.finish_reason.clone());
     let content = choices
         .into_iter()
         .next()
@@ -2595,6 +2772,11 @@ async fn chat_completion_once(
                 LlmFailureClass::EmptyContent,
                 None,
                 first_token_wait_ms,
+            )
+            .with_provider_metadata(
+                provider_request_id.clone(),
+                provider_http_status,
+                finish_reason.clone(),
             )
         })?;
 
@@ -2610,6 +2792,9 @@ async fn chat_completion_once(
         output_messages_json,
         first_token_wait_ms,
         usage,
+        finish_reason,
+        provider_request_id: provider_request_id.or(id),
+        provider_http_status,
     })
 }
 
@@ -2619,9 +2804,21 @@ pub async fn chat_completion(
     user: &str,
     max_tokens: u32,
 ) -> Result<String> {
+    chat_completion_with_diagnostics(state, system, user, max_tokens)
+        .await
+        .map(|diagnostic| diagnostic.content)
+}
+
+pub async fn chat_completion_with_diagnostics(
+    state: &AppState,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> Result<ChatCompletionDiagnostic> {
     let Some(base_ai) = state.config.ai.clone() else {
         return Err(anyhow::Error::new(LlmCallFailure {
             class: LlmFailureClass::Configuration,
+            call_id: None,
         }));
     };
     let selected_model = select_model_for_new_calls(state).await;
@@ -2635,6 +2832,7 @@ pub async fn chat_completion(
     if candidates.is_empty() {
         return Err(anyhow::Error::new(LlmCallFailure {
             class: LlmFailureClass::Configuration,
+            call_id: None,
         }));
     }
 
@@ -2710,6 +2908,9 @@ pub async fn chat_completion(
                     duration_ms: None,
                     input_tokens: None,
                     output_tokens: None,
+                    finish_reason: None,
+                    provider_request_id: None,
+                    provider_http_status: None,
                     cached_input_tokens: None,
                     total_tokens: None,
                     output_messages_json: None,
@@ -2754,6 +2955,9 @@ pub async fn chat_completion(
                     .llm_scheduler
                     .record_model_success(model_for_call.as_str())
                     .await;
+                let diagnostic_response_text = redact_llm_diagnostic_text(output.content.as_str());
+                let diagnostic_output_messages_json =
+                    redact_llm_diagnostic_text(output.output_messages_json.as_str());
                 let duration_ms = started_at.map(|started| {
                     i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
                 });
@@ -2770,10 +2974,13 @@ pub async fn chat_completion(
                             duration_ms,
                             input_tokens: output.usage.input_tokens,
                             output_tokens: output.usage.output_tokens,
+                            finish_reason: output.finish_reason.clone(),
+                            provider_request_id: output.provider_request_id.clone(),
+                            provider_http_status: output.provider_http_status,
                             cached_input_tokens: output.usage.cached_input_tokens,
                             total_tokens: output.usage.total_tokens,
-                            output_messages_json: Some(output.output_messages_json.clone()),
-                            response_text: Some(output.content.clone()),
+                            output_messages_json: Some(diagnostic_output_messages_json.clone()),
+                            response_text: Some(diagnostic_response_text.clone()),
                             error_text: None,
                             failure_class: None,
                             final_model: Some(model_for_call.clone()),
@@ -2801,11 +3008,16 @@ pub async fn chat_completion(
                                 scheduler_wait_ms: total_wait_ms,
                                 first_token_wait_ms: output.first_token_wait_ms,
                                 duration_ms,
-                                output_messages_json: Some(output.output_messages_json.as_str()),
-                                response_text: Some(output.content.as_str()),
+                                output_messages_json: Some(
+                                    diagnostic_output_messages_json.as_str(),
+                                ),
+                                response_text: Some(diagnostic_response_text.as_str()),
                                 error_text: None,
                                 input_tokens: output.usage.input_tokens,
                                 output_tokens: output.usage.output_tokens,
+                                finish_reason: output.finish_reason.as_deref(),
+                                provider_request_id: output.provider_request_id.as_deref(),
+                                provider_http_status: output.provider_http_status,
                                 cached_input_tokens: output.usage.cached_input_tokens,
                                 total_tokens: output.usage.total_tokens,
                                 failure_class: None,
@@ -2821,7 +3033,15 @@ pub async fn chat_completion(
                     .await;
                 }
                 heartbeat.stop().await;
-                return Ok(output.content);
+                return Ok(ChatCompletionDiagnostic {
+                    call_id: llm_call_persisted.then(|| log_record.id.clone()),
+                    diagnostic_captured: llm_call_persisted,
+                    content: output.content,
+                    finish_reason: output.finish_reason,
+                    provider_request_id: output.provider_request_id,
+                    provider_http_status: output.provider_http_status,
+                    output_tokens: output.usage.output_tokens,
+                });
             }
             Err(attempt_err) => {
                 let ChatCompletionAttemptError {
@@ -2830,6 +3050,9 @@ pub async fn chat_completion(
                     retry_after,
                     err,
                     first_token_wait_ms,
+                    provider_request_id,
+                    provider_http_status,
+                    finish_reason,
                 } = attempt_err;
                 append_llm_attempt_failure_event(
                     state,
@@ -2865,6 +3088,9 @@ pub async fn chat_completion(
                                 duration_ms: None,
                                 input_tokens: None,
                                 output_tokens: None,
+                                finish_reason: finish_reason.clone(),
+                                provider_request_id: provider_request_id.clone(),
+                                provider_http_status,
                                 cached_input_tokens: None,
                                 total_tokens: None,
                                 output_messages_json: None,
@@ -2950,6 +3176,9 @@ pub async fn chat_completion(
                                 duration_ms: None,
                                 input_tokens: None,
                                 output_tokens: None,
+                                finish_reason: finish_reason.clone(),
+                                provider_request_id: provider_request_id.clone(),
+                                provider_http_status,
                                 cached_input_tokens: None,
                                 total_tokens: None,
                                 output_messages_json: None,
@@ -3033,6 +3262,9 @@ pub async fn chat_completion(
                             duration_ms,
                             input_tokens: None,
                             output_tokens: None,
+                            finish_reason: finish_reason.clone(),
+                            provider_request_id: provider_request_id.clone(),
+                            provider_http_status,
                             cached_input_tokens: None,
                             total_tokens: None,
                             output_messages_json: None,
@@ -3069,6 +3301,9 @@ pub async fn chat_completion(
                                 error_text: Some(safe_message),
                                 input_tokens: None,
                                 output_tokens: None,
+                                finish_reason: finish_reason.as_deref(),
+                                provider_request_id: provider_request_id.as_deref(),
+                                provider_http_status,
                                 cached_input_tokens: None,
                                 total_tokens: None,
                                 failure_class: Some(failure_class.as_str()),
@@ -3098,6 +3333,7 @@ pub async fn chat_completion(
                 );
                 return Err(anyhow::Error::new(LlmCallFailure {
                     class: failure_class,
+                    call_id: llm_call_persisted.then(|| log_record.id.clone()),
                 }));
             }
         }
@@ -3880,10 +4116,9 @@ fn preserves_release_link_sequence(source: &str, candidate: &str) -> bool {
 }
 
 fn release_block_has_summary_details(block: &BriefReleaseBlock) -> bool {
-    block
-        .detail_lines
-        .iter()
-        .any(|line| !line.starts_with("相关链接："))
+    block.detail_lines.iter().any(|line| {
+        !line.starts_with("相关链接：") && line != BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET
+    })
 }
 
 fn release_block_has_related_links(block: &BriefReleaseBlock) -> bool {
@@ -4527,12 +4762,15 @@ async fn load_brief_release_summary_states(
         .iter()
         .map(|release| release.release_id)
         .collect::<Vec<_>>();
-    let items = api::summarize_releases_smart_batch_internal(state, user_id, &release_ids)
+    translations::enqueue_release_smart_translation_requests(state, user_id, &release_ids)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let items = api::read_release_smart_translation_batch_for_user(state, user_id, &release_ids)
         .await
         .map_err(anyhow::Error::from)?;
     let mut summary_states = HashMap::new();
 
-    for item in items {
+    for item in items.items {
         let Ok(release_id) = item.id.parse::<i64>() else {
             continue;
         };
@@ -6651,6 +6889,18 @@ mod tests {
         jobs,
         state::build_oauth_client,
     };
+
+    #[test]
+    fn redacts_common_sensitive_diagnostic_markers() {
+        let redacted = redact_llm_diagnostic_text(
+            "api-key: live-key\nprivate_key=private-value\nX-Auth-Token: token-value\nmessage: safe",
+        );
+
+        assert!(!redacted.contains("live-key"));
+        assert!(!redacted.contains("private-value"));
+        assert!(!redacted.contains("token-value"));
+        assert!(redacted.contains("message: safe"));
+    }
 
     async fn setup_llm_state() -> Arc<AppState> {
         setup_llm_state_with_ai(None).await
@@ -9303,7 +9553,12 @@ mod tests {
         let blocks =
             extract_brief_release_blocks(&built.content_markdown).expect("parse brief blocks");
         assert_eq!(blocks.len(), 1);
-        assert!(blocks[0].detail_lines.is_empty());
+        assert!(
+            blocks[0]
+                .detail_lines
+                .iter()
+                .any(|line| line == BRIEF_RELEASE_SUMMARY_UNAVAILABLE_BULLET)
+        );
         assert!(!built.content_markdown.contains("发布 Tuckmark v0.5.2"));
     }
 

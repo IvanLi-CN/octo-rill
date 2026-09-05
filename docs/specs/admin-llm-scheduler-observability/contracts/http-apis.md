@@ -125,6 +125,12 @@
 
 详情响应还包含安全 `failure_class`、最终路由、回退次数、逐次尝试历史、恢复时间和可用的 provider delivery metadata。内容处理下钻额外传递该调用在尝试中的阶段、关系与输出契约结果；诊断载荷过期时，该下钻返回安全的 `expired` 证据状态而非完整 payload。示例中的路由标识和内容均为合成占位值，不代表运行时配置或线上记录。
 
+详情还返回 `processing_stage`、`provider_status`、`output_contract_status`、`retry_disposition`、`relation_role` 与 `evidence_availability`。Provider 成功不等于输出契约成功；例如 `provider_status=succeeded` 且 `output_contract_status=failed` 表示已收到响应但 JSON/schema 校验失败。
+
+## New: `POST /api/admin/jobs/llm/calls/{call_id}/diagnostic-access`
+
+管理员在展开或复制诊断响应时提交 `{ "action": "reveal" | "copy" }`。接口只写入 metadata-only 审计记录；调用不存在或其七天诊断载荷已过期时返回 `404`，不会恢复或回放 provider 调用。
+
 ## Extended: `GET /api/admin/jobs/events` (SSE)
 
 Besides existing `job.event`, this stream now emits `llm.call` in real time.

@@ -26,6 +26,7 @@ import {
 	apiGetAdminCollectionRecords,
 	apiGetAdminLlmCallDetail,
 } from "@/api";
+import { LlmCallDiagnosticDetail } from "@/admin/LlmCallDiagnosticDetail";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
@@ -779,6 +780,10 @@ function AttemptDetail({
 						下次重试：{formatDateTime(attempt.next_retry_at)}
 					</p>
 				) : null}
+				<p>处理阶段：{attempt.processing_stage ?? "未记录"}</p>
+				<p>Provider：{attempt.provider_status ?? "未记录"}</p>
+				<p>输出契约：{attempt.output_contract_status ?? "未记录"}</p>
+				<p>重试处置：{attempt.retry_disposition ?? "未记录"}</p>
 			</div>
 			{attempt.error_summary || attempt.error_code || attempt.failure_class ? (
 				<div className="border border-red-500/35 bg-red-500/5 p-3 text-sm">
@@ -912,52 +917,6 @@ function RecordDetail({
 						})}
 					</div>
 				)}
-			</section>
-		</div>
-	);
-}
-
-function LlmDetail({ detail }: { detail: AdminLlmCallDetailResponse }) {
-	return (
-		<div className="space-y-5">
-			<div className="space-y-1">
-				<p className="font-semibold text-base">{detail.model}</p>
-				<div className="flex items-center gap-2">
-					<RecordStatus status={detail.status} />
-					<span className="text-muted-foreground text-xs">{detail.source}</span>
-				</div>
-			</div>
-			<div className="text-muted-foreground grid gap-2 border-y py-3 text-sm sm:grid-cols-2">
-				<p>开始：{formatDateTime(detail.started_at, "未开始")}</p>
-				<p>上次尝试：{formatDateTime(detail.updated_at)}</p>
-				<p>完成：{formatDateTime(detail.finished_at, "未完成")}</p>
-				<p>调用尝试：{detail.attempt_count}</p>
-			</div>
-			{detail.error_text ? (
-				<p className="border border-red-500/35 bg-red-500/5 p-3 text-destructive text-sm">
-					{detail.error_text}
-				</p>
-			) : null}
-			<section className="space-y-3">
-				<h3 className="font-semibold text-sm">调用事件</h3>
-				<div className="divide-y border-y">
-					{detail.attempt_history.map((attempt, index) => (
-						<div key={`${attempt.created_at}:${index}`} className="py-3">
-							<div className="flex flex-wrap items-center gap-2">
-								<RecordStatus status={attempt.status} />
-								<span className="text-sm">{attempt.model ?? detail.model}</span>
-							</div>
-							<p className="text-muted-foreground mt-1 text-xs">
-								{attempt.event_type} · {formatDateTime(attempt.created_at)}
-							</p>
-							{attempt.failure_class ? (
-								<p className="text-destructive mt-1 text-xs">
-									{attempt.failure_class}
-								</p>
-							) : null}
-						</div>
-					))}
-				</div>
 			</section>
 		</div>
 	);
@@ -1208,7 +1167,7 @@ export function AiOperationsRecordsSection({
 	) : detailError ? (
 		<p className="text-destructive py-8 text-sm">{detailError}</p>
 	) : detailRoute?.llmCallId && llmDetail ? (
-		<LlmDetail detail={llmDetail} />
+		<LlmCallDiagnosticDetail detail={llmDetail} />
 	) : selectedAttempt ? (
 		<AttemptDetail attempt={selectedAttempt} onOpenLlm={onOpenLlm} />
 	) : detail ? (
