@@ -146,6 +146,10 @@ pub fn classify_translation_error(error_text: Option<&str>) -> Option<Classified
         ("body_too_long", "正文超过 3000 字符")
     } else if normalized.contains("empty summary") || normalized.contains("empty translation") {
         ("empty_translation", "模型输出为空")
+    } else if normalized.contains("ai output did not satisfy")
+        || normalized.contains("ai output did not contain usable")
+    {
+        ("output_contract_invalid", "模型输出未通过 JSON 契约")
     } else if normalized.contains("upstream model/channel rejected request")
         || normalized.contains("invalid_model_error")
         || normalized.contains("model not found")
@@ -171,6 +175,11 @@ pub fn translation_error_summary(error_text: Option<&str>) -> Option<String> {
     classify_translation_error(error_text).map(|classified| classified.summary.to_owned())
 }
 
+fn output_contract_failed(error_text: Option<&str>) -> bool {
+    classify_translation_error(error_text)
+        .is_some_and(|classified| classified.code == "output_contract_invalid")
+}
+
 fn admin_translation_result_item(item: TranslationResultItem) -> AdminTranslationRequestResultItem {
     let classified = (item.status == "error")
         .then(|| classify_translation_error(item.error.as_deref()))
@@ -183,7 +192,7 @@ fn admin_translation_result_item(item: TranslationResultItem) -> AdminTranslatio
         item,
         error_code: classified.as_ref().map(|value| value.code.to_owned()),
         error_summary: classified.as_ref().map(|value| value.summary.to_owned()),
-        error_detail: classified.map(|value| value.detail),
+        error_detail: None,
     }
 }
 
@@ -362,6 +371,10 @@ pub struct AdminTranslationAttemptEvent {
     pub next_retry_at: Option<String>,
     pub llm_call_ids: Vec<String>,
     pub llm_calls: Vec<AdminTranslationLinkedLlmCall>,
+    pub processing_stage: Option<String>,
+    pub provider_status: Option<String>,
+    pub output_contract_status: Option<String>,
+    pub retry_disposition: Option<String>,
     pub created_at: String,
 }
 
@@ -423,6 +436,12 @@ pub struct AdminTranslationLinkedLlmCall {
     pub model: String,
     pub scheduler_wait_ms: i64,
     pub duration_ms: Option<i64>,
+    #[sqlx(default)]
+    pub stage: Option<String>,
+    #[sqlx(default)]
+    pub relation_role: Option<String>,
+    #[sqlx(default)]
+    pub evidence_availability: Option<String>,
     pub created_at: String,
 }
 
@@ -470,6 +489,10 @@ struct AdminTranslationAttemptEventRow {
     retry_eligible: i64,
     next_retry_at: Option<String>,
     llm_call_ids_json: String,
+    processing_stage: Option<String>,
+    provider_status: Option<String>,
+    output_contract_status: Option<String>,
+    retry_disposition: Option<String>,
     created_at: String,
 }
 
@@ -501,6 +524,10 @@ impl AdminTranslationAttemptEventRow {
             next_retry_at: self.next_retry_at,
             llm_call_ids,
             llm_calls,
+            processing_stage: self.processing_stage,
+            provider_status: self.provider_status,
+            output_contract_status: self.output_contract_status,
+            retry_disposition: self.retry_disposition,
             created_at: self.created_at,
         }
     }
@@ -766,6 +793,10 @@ struct TranslationAttemptEventDetails<'a> {
     retry_eligible: bool,
     next_retry_at: Option<&'a str>,
     llm_call_ids: &'a [String],
+    processing_stage: Option<&'a str>,
+    provider_status: Option<&'a str>,
+    output_contract_status: Option<&'a str>,
+    retry_disposition: Option<&'a str>,
 }
 
 struct TranslationAttemptCompletion<'a> {
@@ -2478,7 +2509,8 @@ pub async fn admin_list_translation_attempt_events(
         SELECT id, work_item_id, request_id, batch_id, scope_user_id, kind, variant, entity_id,
                target_lang, attempt_no, trigger, event_type, result_status, error_code,
                error_summary, failure_class, retry_eligible, next_retry_at,
-               llm_call_ids_json, created_at
+               llm_call_ids_json, processing_stage, provider_status,
+               output_contract_status, retry_disposition, created_at
         FROM translation_attempt_events
         WHERE (? = '' OR entity_id = ?)
           AND (? = '' OR request_id = ?)
@@ -2518,12 +2550,59 @@ async fn hydrate_translation_attempt_events(
     state: &AppState,
     rows: Vec<AdminTranslationAttemptEventRow>,
 ) -> Result<Vec<AdminTranslationAttemptEvent>, ApiError> {
-    let call_ids = rows
+    #[derive(Debug, sqlx::FromRow)]
+    struct AttemptCallLinkRow {
+        work_item_id: String,
+        attempt_no: i64,
+        llm_call_id: String,
+        stage: String,
+        relation_role: String,
+        evidence_availability: String,
+    }
+
+    let work_item_ids = rows
+        .iter()
+        .map(|row| row.work_item_id.clone())
+        .collect::<HashSet<_>>();
+    let relation_rows = if work_item_ids.is_empty() {
+        Vec::new()
+    } else {
+        let mut relation_query = sqlx::QueryBuilder::<Sqlite>::new(
+            "SELECT work_item_id, attempt_no, llm_call_id, stage, relation_role, evidence_availability FROM translation_attempt_llm_calls WHERE work_item_id IN (",
+        );
+        {
+            let mut separated = relation_query.separated(", ");
+            for work_item_id in &work_item_ids {
+                separated.push_bind(work_item_id.clone());
+            }
+        }
+        relation_query.push(")");
+        relation_query
+            .build_query_as::<AttemptCallLinkRow>()
+            .fetch_all(&state.pool)
+            .await
+            .map_err(ApiError::internal)?
+    };
+    let relation_by_key = relation_rows
+        .iter()
+        .map(|row| {
+            (
+                (
+                    row.work_item_id.clone(),
+                    row.attempt_no,
+                    row.llm_call_id.clone(),
+                ),
+                row,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut call_ids = rows
         .iter()
         .flat_map(|row| {
             serde_json::from_str::<Vec<String>>(row.llm_call_ids_json.as_str()).unwrap_or_default()
         })
         .collect::<HashSet<_>>();
+    call_ids.extend(relation_rows.iter().map(|row| row.llm_call_id.clone()));
 
     let calls = if call_ids.is_empty() {
         Vec::new()
@@ -2556,7 +2635,42 @@ async fn hydrate_translation_attempt_events(
                 .unwrap_or_default();
             let llm_calls = call_ids
                 .iter()
-                .filter_map(|call_id| calls_by_id.get(call_id).cloned())
+                .filter_map(|call_id| {
+                    let relation = relation_by_key.get(&(
+                        row.work_item_id.clone(),
+                        row.attempt_no,
+                        call_id.clone(),
+                    ));
+                    calls_by_id
+                        .get(call_id)
+                        .cloned()
+                        .or_else(|| {
+                            relation.map(|relation| AdminTranslationLinkedLlmCall {
+                                id: call_id.clone(),
+                                status: "expired".to_owned(),
+                                source: "诊断载荷已过期".to_owned(),
+                                model: "unknown".to_owned(),
+                                scheduler_wait_ms: 0,
+                                duration_ms: None,
+                                stage: Some(relation.stage.clone()),
+                                relation_role: Some(relation.relation_role.clone()),
+                                evidence_availability: Some(relation.evidence_availability.clone()),
+                                created_at: String::new(),
+                            })
+                        })
+                        .map(|mut call| {
+                            if let Some(relation) = relation {
+                                call.stage = Some(relation.stage.clone());
+                                call.relation_role = Some(relation.relation_role.clone());
+                                call.evidence_availability =
+                                    Some(relation.evidence_availability.clone());
+                            } else {
+                                call.relation_role = Some("legacy_unverified".to_owned());
+                                call.evidence_availability = Some("not_captured".to_owned());
+                            }
+                            call
+                        })
+                })
                 .collect();
             row.into_response(llm_calls)
         })
@@ -2594,8 +2708,9 @@ pub async fn admin_get_translation_request_detail(
             r#"
             SELECT id, work_item_id, request_id, batch_id, scope_user_id, kind, variant, entity_id,
                    target_lang, attempt_no, trigger, event_type, result_status, error_code,
-                   error_summary, failure_class, retry_eligible, next_retry_at,
-                   llm_call_ids_json, created_at
+               error_summary, failure_class, retry_eligible, next_retry_at,
+               llm_call_ids_json, processing_stage, provider_status,
+               output_contract_status, retry_disposition, created_at
             FROM translation_attempt_events
             WHERE work_item_id = ?
             ORDER BY created_at ASC, id ASC
@@ -2916,6 +3031,36 @@ async fn create_translation_requests_batch_with_origin(
         refresh_live_batch_runtime_for_request(state, created).await?;
     }
     Ok(out)
+}
+
+pub(crate) async fn enqueue_release_smart_translation_requests(
+    state: &AppState,
+    user_id: &str,
+    release_ids: &[i64],
+) -> Result<Vec<String>, ApiError> {
+    if release_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let items = release_ids
+        .iter()
+        .map(|release_id| TranslationRequestItemInput {
+            producer_ref: format!("release.smart.scheduler:{release_id}"),
+            kind: "release_smart".to_owned(),
+            variant: "feed_card".to_owned(),
+            entity_id: release_id.to_string(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 0,
+            source_blocks: vec![TranslationSourceBlock {
+                slot: "metadata".to_owned(),
+                text: "scheduler canonicalization".to_owned(),
+            }],
+            target_slots: vec!["title_zh".to_owned(), "body_md".to_owned()],
+        })
+        .collect::<Vec<_>>();
+    let created =
+        create_translation_requests_batch_with_origin(state, user_id, "async", &items, "system")
+            .await?;
+    Ok(created.into_iter().map(|item| item.request_id).collect())
 }
 
 async fn ensure_translation_result_for_item(
@@ -4071,8 +4216,8 @@ async fn record_translation_attempt_event(
           work_item_id, request_id, batch_id, scope_user_id, kind, variant, entity_id,
           target_lang, attempt_no, trigger, event_type, result_status, error_code,
           error_summary, failure_class, retry_eligible, next_retry_at, llm_call_ids_json,
-          created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          created_at, processing_stage, provider_status, output_contract_status, retry_disposition
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(identity.work_item_id.as_str())
@@ -4094,10 +4239,89 @@ async fn record_translation_attempt_event(
     .bind(details.next_retry_at)
     .bind(llm_call_ids_json)
     .bind(now)
+    .bind(details.processing_stage)
+    .bind(details.provider_status)
+    .bind(details.output_contract_status)
+    .bind(details.retry_disposition)
     .execute(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
     Ok(())
+}
+
+async fn persist_translation_attempt_llm_call_links(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item: &WorkItemRow,
+    attempt_no: i64,
+    call_ids: &[String],
+    stage: &str,
+    evidence_availability: &str,
+) -> Result<(), ApiError> {
+    for (ordinal, call_id) in call_ids.iter().enumerate() {
+        let source =
+            sqlx::query_scalar::<_, String>("SELECT source FROM llm_calls WHERE id = ? LIMIT 1")
+                .bind(call_id.as_str())
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(ApiError::internal)?;
+        let (linked_stage, linked_role) = source
+            .as_deref()
+            .and_then(|value| value.rsplit_once(".stage."))
+            .and_then(|(_, value)| value.split_once(".role."))
+            .map(|(stage, role)| (stage.to_owned(), role.to_owned()))
+            .unwrap_or_else(|| {
+                (
+                    stage.to_owned(),
+                    if ordinal == 0 {
+                        "primary".to_owned()
+                    } else {
+                        "schema_repair".to_owned()
+                    },
+                )
+            });
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO translation_attempt_llm_calls
+              (work_item_id, attempt_no, llm_call_id, stage, ordinal, relation_role,
+               evidence_availability, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(work_item.id.as_str())
+        .bind(attempt_no.max(1))
+        .bind(call_id.as_str())
+        .bind(linked_stage)
+        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
+        .bind(linked_role)
+        .bind(evidence_availability)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut **tx)
+        .await
+        .map_err(ApiError::internal)?;
+    }
+    Ok(())
+}
+
+async fn llm_call_ids_include_role(
+    tx: &mut Transaction<'_, Sqlite>,
+    call_ids: &[String],
+    role: &str,
+) -> Result<bool, ApiError> {
+    for call_id in call_ids {
+        let source =
+            sqlx::query_scalar::<_, String>("SELECT source FROM llm_calls WHERE id = ? LIMIT 1")
+                .bind(call_id.as_str())
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(ApiError::internal)?;
+        if source
+            .as_deref()
+            .is_some_and(|value| value.ends_with(&format!(".role.{role}")))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn record_translation_attempt_queued(
@@ -4126,6 +4350,10 @@ async fn record_translation_attempt_queued(
             retry_eligible: false,
             next_retry_at: None,
             llm_call_ids: &[],
+            processing_stage: None,
+            provider_status: None,
+            output_contract_status: None,
+            retry_disposition: Some("not_needed"),
         },
         now,
     )
@@ -4171,6 +4399,10 @@ async fn mark_translation_attempt_started(
             retry_eligible: false,
             next_retry_at: None,
             llm_call_ids: &[],
+            processing_stage: None,
+            provider_status: None,
+            output_contract_status: None,
+            retry_disposition: Some("not_needed"),
         },
         now,
     )
@@ -4184,6 +4416,10 @@ async fn record_translation_attempt_completed(
     now: &str,
 ) -> Result<(), ApiError> {
     let state = load_translation_attempt_state(tx, work_item.id.as_str()).await?;
+    let contract_failed =
+        completion.result_status == "error" && output_contract_failed(completion.error_text);
+    let contract_recovered = completion.result_status != "error"
+        && llm_call_ids_include_role(tx, completion.llm_call_ids, "schema_repair").await?;
     record_translation_attempt_event(
         tx,
         &TranslationAttemptIdentity::from(work_item),
@@ -4199,6 +4435,24 @@ async fn record_translation_attempt_completed(
             retry_eligible: completion.retry_eligible,
             next_retry_at: completion.next_retry_at,
             llm_call_ids: completion.llm_call_ids,
+            processing_stage: Some(work_item.kind.as_str()),
+            provider_status: Some(if completion.result_status == "error" && !contract_failed {
+                "failed"
+            } else {
+                "succeeded"
+            }),
+            output_contract_status: Some(if completion.result_status == "error" {
+                if contract_failed { "failed" } else { "not_run" }
+            } else if contract_recovered {
+                "recovered"
+            } else {
+                "passed"
+            }),
+            retry_disposition: Some(if completion.retry_eligible {
+                "scheduled"
+            } else {
+                "not_needed"
+            }),
         },
         now,
     )
@@ -4212,6 +4466,7 @@ async fn record_translation_retry_scheduled(
     now: &str,
 ) -> Result<(), ApiError> {
     let state = load_translation_attempt_state(tx, work_item.id.as_str()).await?;
+    let contract_failed = output_contract_failed(retry_schedule.error_text);
     record_translation_attempt_event(
         tx,
         &TranslationAttemptIdentity::from(work_item),
@@ -4229,25 +4484,37 @@ async fn record_translation_retry_scheduled(
             retry_eligible: true,
             next_retry_at: Some(retry_schedule.next_retry_at),
             llm_call_ids: retry_schedule.llm_call_ids,
+            processing_stage: Some(work_item.kind.as_str()),
+            provider_status: Some(if contract_failed {
+                "succeeded"
+            } else {
+                "failed"
+            }),
+            output_contract_status: Some(if contract_failed { "failed" } else { "not_run" }),
+            retry_disposition: Some("scheduled"),
         },
         now,
     )
     .await
 }
 
-async fn load_translation_batch_llm_call_ids(
+async fn load_translation_work_item_llm_call_ids(
     tx: &mut Transaction<'_, Sqlite>,
     batch_id: &str,
+    work_item_id: &str,
 ) -> Result<Vec<String>, ApiError> {
     sqlx::query_scalar::<_, String>(
         r#"
         SELECT id
         FROM llm_calls
         WHERE parent_translation_batch_id = ?
+          AND (source LIKE ? OR source LIKE ?)
         ORDER BY created_at ASC, id ASC
         "#,
     )
     .bind(batch_id)
+    .bind(format!("%.work_item.{work_item_id}.%"))
+    .bind(format!("%.work_item.{work_item_id}"))
     .fetch_all(&mut **tx)
     .await
     .map_err(ApiError::internal)
@@ -4328,6 +4595,10 @@ async fn create_work_item(
                 retry_eligible: false,
                 next_retry_at: None,
                 llm_call_ids: &[],
+                processing_stage: None,
+                provider_status: None,
+                output_contract_status: None,
+                retry_disposition: Some("not_needed"),
             },
             now,
         )
@@ -5160,15 +5431,19 @@ async fn resolve_batch_results(
     }
 
     for (user_id, items) in release_smart_groups {
-        let release_ids = items
+        let work_items = items
             .iter()
-            .filter_map(|item| item.entity_id.parse::<i64>().ok())
+            .filter_map(|item| {
+                item.entity_id
+                    .parse::<i64>()
+                    .ok()
+                    .map(|release_id| (release_id, item.id.clone()))
+            })
             .collect::<Vec<_>>();
         let response =
-            api::summarize_releases_smart_batch_for_user(state, user_id.as_str(), &release_ids)
+            api::summarize_releases_smart_batch_for_scheduler(state, user_id.as_str(), &work_items)
                 .await?;
         let by_id = response
-            .items
             .into_iter()
             .map(|item| (item.id.clone(), item))
             .collect::<HashMap<_, _>>();
@@ -5378,7 +5653,6 @@ async fn finalize_batch_success(
         .sqlite_writer
         .begin_immediate(&state.pool, "translation_batch_finalize")
         .await?;
-    let llm_call_ids = load_translation_batch_llm_call_ids(&mut tx, batch.id.as_str()).await?;
     for result in &results {
         let Some(work_item) = batch
             .items
@@ -5388,6 +5662,16 @@ async fn finalize_batch_success(
             continue;
         };
         let failure_class = result.failure_class;
+        let contract_failed =
+            result.result_status == "error" && output_contract_failed(result.error.as_deref());
+        let llm_call_ids = load_translation_work_item_llm_call_ids(
+            &mut tx,
+            batch.id.as_str(),
+            result.work_item_id.as_str(),
+        )
+        .await?;
+        let contract_recovered = result.result_status != "error"
+            && llm_call_ids_include_role(&mut tx, &llm_call_ids, "schema_repair").await?;
         let retry_state = sqlx::query(
             "SELECT retry_count, retry_expires_at FROM translation_work_items WHERE id = ? LIMIT 1",
         )
@@ -5444,7 +5728,12 @@ async fn finalize_batch_success(
                 summary_md = ?,
                 body_md = ?,
                 error_text = ?,
+                error_code = ?,
                 failure_class = ?,
+                processing_stage = ?,
+                provider_status = ?,
+                output_contract_status = ?,
+                retry_disposition = ?,
                 retry_count = ?,
                 next_retry_at = ?,
                 retry_expires_at = ?,
@@ -5458,7 +5747,26 @@ async fn finalize_batch_success(
         .bind(result.summary_md.as_deref())
         .bind(result.body_md.as_deref())
         .bind(result.error.as_deref())
+        .bind(classify_translation_error(result.error.as_deref()).map(|value| value.code))
         .bind(failure_class.map(ai::LlmFailureClass::as_str))
+        .bind(work_item.kind.as_str())
+        .bind(if result.result_status == "error" && !contract_failed {
+            "failed"
+        } else {
+            "succeeded"
+        })
+        .bind(if result.result_status == "error" {
+            if contract_failed { "failed" } else { "not_run" }
+        } else if contract_recovered {
+            "recovered"
+        } else {
+            "passed"
+        })
+        .bind(if retry_scheduled_at.is_some() {
+            "scheduled"
+        } else {
+            "not_needed"
+        })
         .bind(retry_count)
         .bind(retry_scheduled_at.as_deref())
         .bind(retry_expires_at.as_deref())
@@ -5481,6 +5789,18 @@ async fn finalize_batch_success(
                 llm_call_ids: llm_call_ids.as_slice(),
             },
             now.as_str(),
+        )
+        .await?;
+        let attempt_no = load_translation_attempt_state(&mut tx, work_item.id.as_str())
+            .await?
+            .attempt_count;
+        persist_translation_attempt_llm_call_links(
+            &mut tx,
+            work_item,
+            attempt_no,
+            &llm_call_ids,
+            work_item.kind.as_str(),
+            "available",
         )
         .await?;
         if let Some(next_retry_at) = retry_scheduled_at.as_deref() {
@@ -5884,15 +6204,21 @@ async fn fail_batch_with_message(
     failure_class: Option<ai::LlmFailureClass>,
     now: &str,
 ) -> Result<(), ApiError> {
-    let llm_call_ids = load_translation_batch_llm_call_ids(tx, batch_id).await?;
     for item in items {
+        let llm_call_ids =
+            load_translation_work_item_llm_call_ids(tx, batch_id, item.id.as_str()).await?;
         sqlx::query(
             r#"
             UPDATE translation_work_items
             SET status = 'failed',
                 result_status = 'error',
                 error_text = ?,
+                error_code = ?,
                 failure_class = ?,
+                processing_stage = ?,
+                provider_status = 'failed',
+                output_contract_status = 'not_run',
+                retry_disposition = 'not_needed',
                 next_retry_at = NULL,
                 retry_expires_at = NULL,
                 finished_at = ?,
@@ -5901,7 +6227,9 @@ async fn fail_batch_with_message(
             "#,
         )
         .bind(message)
+        .bind(classify_translation_error(Some(message)).map(|value| value.code))
         .bind(failure_class.map(ai::LlmFailureClass::as_str))
+        .bind(item.kind.as_str())
         .bind(now)
         .bind(now)
         .bind(item.id.as_str())
@@ -5921,6 +6249,18 @@ async fn fail_batch_with_message(
                 llm_call_ids: llm_call_ids.as_slice(),
             },
             now,
+        )
+        .await?;
+        let attempt_no = load_translation_attempt_state(tx, item.id.as_str())
+            .await?
+            .attempt_count;
+        persist_translation_attempt_llm_call_links(
+            tx,
+            item,
+            attempt_no,
+            &llm_call_ids,
+            item.kind.as_str(),
+            "available",
         )
         .await?;
         sqlx::query(
@@ -6517,7 +6857,7 @@ async fn load_translation_result_items_by_batch(
                 },
                 error_code: classified.as_ref().map(|value| value.code.to_owned()),
                 error_summary: classified.as_ref().map(|value| value.summary.to_owned()),
-                error_detail: classified.map(|value| value.detail),
+                error_detail: None,
             }
         })
         .collect())
@@ -7370,6 +7710,16 @@ mod tests {
     }
 
     #[test]
+    fn classify_translation_error_maps_output_contract_failure() {
+        let classified =
+            classify_translation_error(Some("AI output did not satisfy the JSON contract"))
+                .expect("classified output contract failure");
+
+        assert_eq!(classified.code, "output_contract_invalid");
+        assert_eq!(classified.summary, "模型输出未通过 JSON 契约");
+    }
+
+    #[test]
     fn classify_translation_error_maps_safe_llm_failure_classes() {
         let cases = [
             (
@@ -7504,10 +7854,7 @@ mod tests {
         assert_eq!(result.item.error.as_deref(), Some("正文超过 3000 字符"));
         assert_eq!(result.error_code.as_deref(), Some("body_too_long"));
         assert_eq!(result.error_summary.as_deref(), Some("正文超过 3000 字符"));
-        assert_eq!(
-            result.error_detail.as_deref(),
-            Some("body exceeds 3000 chars")
-        );
+        assert_eq!(result.error_detail, None);
     }
 
     #[test]
@@ -8244,10 +8591,7 @@ mod tests {
             items[0].error_summary.as_deref(),
             Some("Markdown 结构校验失败")
         );
-        assert_eq!(
-            items[0].error_detail.as_deref(),
-            Some("release detail translation failed to preserve markdown structure")
-        );
+        assert_eq!(items[0].error_detail, None);
 
         let payload = serde_json::to_value(AdminTranslationBatchDetailResponse {
             batch: AdminTranslationBatchListItem {
@@ -8288,10 +8632,7 @@ mod tests {
             payload["items"][0]["error_summary"].as_str(),
             Some("Markdown 结构校验失败")
         );
-        assert_eq!(
-            payload["items"][0]["error_detail"].as_str(),
-            Some("release detail translation failed to preserve markdown structure")
-        );
+        assert!(payload["items"][0]["error_detail"].is_null());
     }
 
     #[tokio::test]

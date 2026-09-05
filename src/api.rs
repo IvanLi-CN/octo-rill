@@ -27,7 +27,7 @@ use crate::release_links::{
     parse_internal_release_ref, parse_release_locator_from_github_release_url,
     parse_repo_full_name_from_release_url, resolve_release_refs,
 };
-use crate::{admin_runtime, ai, api_keys, briefs, jobs, local_id, sync};
+use crate::{admin_runtime, ai, api_keys, briefs, jobs, local_id, sync, translations};
 use crate::{
     error::ApiError,
     passkeys::{
@@ -6718,6 +6718,9 @@ pub struct AdminLlmCallItem {
     duration_ms: Option<i64>,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
+    finish_reason: Option<String>,
+    provider_request_id: Option<String>,
+    provider_http_status: Option<i64>,
     cached_input_tokens: Option<i64>,
     total_tokens: Option<i64>,
     failure_class: Option<String>,
@@ -6747,6 +6750,15 @@ pub struct AdminLlmCallDetailItem {
     duration_ms: Option<i64>,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
+    finish_reason: Option<String>,
+    provider_request_id: Option<String>,
+    provider_http_status: Option<i64>,
+    processing_stage: Option<String>,
+    provider_status: Option<String>,
+    output_contract_status: Option<String>,
+    retry_disposition: Option<String>,
+    relation_role: Option<String>,
+    evidence_availability: Option<String>,
     cached_input_tokens: Option<i64>,
     total_tokens: Option<i64>,
     input_messages_json: Option<String>,
@@ -6912,6 +6924,9 @@ fn apply_llm_call_admin_override(item: &mut AdminLlmCallItem, snapshot: &ai::Llm
     item.duration_ms = snapshot.duration_ms;
     item.input_tokens = snapshot.input_tokens;
     item.output_tokens = snapshot.output_tokens;
+    item.finish_reason = snapshot.finish_reason.clone();
+    item.provider_request_id = snapshot.provider_request_id.clone();
+    item.provider_http_status = snapshot.provider_http_status;
     item.cached_input_tokens = snapshot.cached_input_tokens;
     item.total_tokens = snapshot.total_tokens;
     item.failure_class = snapshot.failure_class.clone();
@@ -6937,6 +6952,9 @@ fn apply_llm_call_detail_admin_override(
     item.duration_ms = snapshot.duration_ms;
     item.input_tokens = snapshot.input_tokens;
     item.output_tokens = snapshot.output_tokens;
+    item.finish_reason = snapshot.finish_reason.clone();
+    item.provider_request_id = snapshot.provider_request_id.clone();
+    item.provider_http_status = snapshot.provider_http_status;
     item.cached_input_tokens = snapshot.cached_input_tokens;
     item.total_tokens = snapshot.total_tokens;
     item.failure_class = snapshot.failure_class.clone();
@@ -7648,6 +7666,9 @@ async fn load_admin_llm_call_items(
           duration_ms,
           input_tokens,
           output_tokens,
+          finish_reason,
+          provider_request_id,
+          provider_http_status,
           cached_input_tokens,
           total_tokens,
           failure_class,
@@ -7848,6 +7869,60 @@ pub async fn admin_get_llm_call_detail(
           duration_ms,
           input_tokens,
           output_tokens,
+          finish_reason,
+          provider_request_id,
+          provider_http_status,
+          (
+            SELECT stage
+            FROM translation_attempt_llm_calls
+            WHERE llm_call_id = llm_calls.id
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+          ) AS processing_stage,
+          (
+            SELECT e.provider_status
+            FROM translation_attempt_llm_calls l
+            JOIN translation_attempt_events e
+              ON e.work_item_id = l.work_item_id
+             AND e.attempt_no = l.attempt_no
+            WHERE l.llm_call_id = llm_calls.id
+            ORDER BY e.created_at DESC, e.id DESC
+            LIMIT 1
+          ) AS provider_status,
+          (
+            SELECT e.output_contract_status
+            FROM translation_attempt_llm_calls l
+            JOIN translation_attempt_events e
+              ON e.work_item_id = l.work_item_id
+             AND e.attempt_no = l.attempt_no
+            WHERE l.llm_call_id = llm_calls.id
+            ORDER BY e.created_at DESC, e.id DESC
+            LIMIT 1
+          ) AS output_contract_status,
+          (
+            SELECT e.retry_disposition
+            FROM translation_attempt_llm_calls l
+            JOIN translation_attempt_events e
+              ON e.work_item_id = l.work_item_id
+             AND e.attempt_no = l.attempt_no
+            WHERE l.llm_call_id = llm_calls.id
+            ORDER BY e.created_at DESC, e.id DESC
+            LIMIT 1
+          ) AS retry_disposition,
+          (
+            SELECT relation_role
+            FROM translation_attempt_llm_calls
+            WHERE llm_call_id = llm_calls.id
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+          ) AS relation_role,
+          (
+            SELECT evidence_availability
+            FROM translation_attempt_llm_calls
+            WHERE llm_call_id = llm_calls.id
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+          ) AS evidence_availability,
           cached_input_tokens,
           total_tokens,
           input_messages_json,
@@ -7895,6 +7970,58 @@ pub async fn admin_get_llm_call_detail(
     .map_err(ApiError::internal)?;
 
     Ok(Json(item))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminLlmDiagnosticAccessRequest {
+    pub action: String,
+}
+
+pub async fn admin_audit_llm_diagnostic_access(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(call_id): Path<String>,
+    Json(request): Json<AdminLlmDiagnosticAccessRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let actor_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let call_id = parse_local_id_param(call_id, "call_id")?;
+    if !matches!(request.action.as_str(), "reveal" | "copy") {
+        return Err(ApiError::bad_request("action must be reveal or copy"));
+    }
+    let call_exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM llm_calls WHERE id = ?")
+        .bind(call_id.as_str())
+        .fetch_one(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    if call_exists == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "llm call not found or diagnostic evidence expired",
+        ));
+    }
+    let now = Utc::now().to_rfc3339();
+    state
+        .sqlite_writer
+        .write("llm_diagnostic_access_audit", |_| async {
+            sqlx::query(
+                r#"
+                INSERT INTO llm_diagnostic_access_audit (id, call_id, actor_user_id, action, created_at)
+                SELECT ?, id, ?, ?, ? FROM llm_calls WHERE id = ? LIMIT 1
+                "#,
+            )
+            .bind(local_id::generate_local_id())
+            .bind(actor_user_id.as_str())
+            .bind(request.action.as_str())
+            .bind(now.as_str())
+            .bind(call_id.as_str())
+            .execute(&state.pool)
+            .await
+            .context("insert llm diagnostic access audit failed")
+        })
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({"ok": true})))
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -19353,6 +19480,7 @@ struct PreparedReleaseSmartBatch {
     candidates: Vec<ReleaseSmartBatchCandidate>,
     pending: Vec<ReleaseSmartBatchCandidate>,
     smart: HashMap<i64, (Option<String>, Option<String>)>,
+    smart_call_ids: HashMap<i64, Vec<String>>,
     terminal: HashMap<i64, ReleaseBatchTerminalState>,
     missing: HashSet<i64>,
 }
@@ -19762,21 +19890,159 @@ fn map_public_compare_fallback_error(auth_err: ApiError, public_err: ApiError) -
     auth_err
 }
 
+#[allow(dead_code)]
 async fn summarize_release_smart_candidate_with_ai(
     state: &AppState,
     user_id: &str,
     item: &ReleaseSmartBatchCandidate,
 ) -> Result<Option<(Option<String>, Option<String>)>, ApiError> {
-    let body_prompt = release_smart_body_prompt(item);
-    let raw = ai::chat_completion(state, release_smart_body_system_prompt(), &body_prompt, 700)
+    summarize_release_smart_candidate_with_ai_diagnostics(state, user_id, item)
         .await
-        .map_err(ApiError::from_llm_error)?;
-    let parsed = parse_release_smart_summary_payload(&raw)
-        .ok_or_else(|| ApiError::internal("release smart body summary json decode failed"))?;
+        .map(|result| result.value)
+        .map_err(|(error, _)| error)
+}
+
+#[derive(Debug)]
+struct ReleaseSmartAiResult {
+    value: Option<(Option<String>, Option<String>)>,
+    call_ids: Vec<String>,
+}
+
+async fn request_release_smart_diagnostic(
+    state: &AppState,
+    system_prompt: &str,
+    user_prompt: &str,
+    max_tokens: u32,
+    stage: &str,
+    relation_role: &str,
+    call_ids: &mut Vec<String>,
+) -> Result<ai::ChatCompletionDiagnostic, ApiError> {
+    let request = async {
+        ai::chat_completion_with_diagnostics(state, system_prompt, user_prompt, max_tokens).await
+    };
+    let result = if let Some(mut context) = ai::current_llm_call_context() {
+        context.source = format!("{}.stage.{stage}.role.{relation_role}", context.source);
+        ai::with_llm_call_context(context, request).await
+    } else {
+        request.await
+    };
+    match result {
+        Ok(diagnostic) => {
+            if let Some(call_id) = diagnostic.call_id.clone() {
+                call_ids.push(call_id);
+            }
+            Ok(diagnostic)
+        }
+        Err(err) => {
+            if let Some(call_id) = ai::llm_call_id(&err) {
+                call_ids.push(call_id);
+            }
+            Err(ApiError::from_llm_error(err))
+        }
+    }
+}
+
+async fn request_release_smart_payload(
+    state: &AppState,
+    system_prompt: &str,
+    user_prompt: &str,
+    stage: &str,
+) -> std::result::Result<(ReleaseSmartSummaryPayload, Vec<String>), (ApiError, Vec<String>)> {
+    let mut call_ids = Vec::new();
+    let mut diagnostic = match request_release_smart_diagnostic(
+        state,
+        system_prompt,
+        user_prompt,
+        1024,
+        stage,
+        "primary",
+        &mut call_ids,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return Err((error, call_ids)),
+    };
+    if diagnostic.finish_reason.as_deref() == Some("length") {
+        diagnostic = match request_release_smart_diagnostic(
+            state,
+            system_prompt,
+            user_prompt,
+            1536,
+            stage,
+            "length_recovery",
+            &mut call_ids,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => return Err((error, call_ids)),
+        };
+    }
+    if let Some(parsed) = parse_release_smart_summary_payload(&diagnostic.content) {
+        return Ok((parsed, call_ids));
+    }
+
+    let repair_prompt = format!(
+        "修复下列模型输出，使其严格符合 JSON 契约 {{\"valuable\":boolean,\"title_zh\":string|null,\"summary_bullets\":string[]}}。只返回 JSON，不要解释。\n\n原始输出：\n{}",
+        diagnostic.content
+    );
+    let repaired = match request_release_smart_diagnostic(
+        state,
+        "你是 JSON 输出契约修复器。保留原始语义，不新增事实。",
+        repair_prompt.as_str(),
+        512,
+        stage,
+        "schema_repair",
+        &mut call_ids,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(err) => return Err((err, call_ids)),
+    };
+    parse_release_smart_summary_payload(&repaired.content)
+        .map(|parsed| (parsed, call_ids.clone()))
+        .ok_or_else(|| {
+            (
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "output_contract_invalid",
+                    "AI output did not satisfy the JSON contract",
+                ),
+                call_ids,
+            )
+        })
+}
+
+async fn summarize_release_smart_candidate_with_ai_diagnostics(
+    state: &AppState,
+    user_id: &str,
+    item: &ReleaseSmartBatchCandidate,
+) -> std::result::Result<ReleaseSmartAiResult, (ApiError, Vec<String>)> {
+    let body_prompt = release_smart_body_prompt(item);
+    let (parsed, mut call_ids) = request_release_smart_payload(
+        state,
+        release_smart_body_system_prompt(),
+        body_prompt.as_str(),
+        "release_smart_body",
+    )
+    .await?;
     if parsed.valuable {
-        let summary = render_smart_summary_markdown(&parsed.summary_bullets)
-            .ok_or_else(|| ApiError::internal("release smart body summary bullets missing"))?;
-        return Ok(Some((parsed.title_zh, Some(summary))));
+        let summary = render_smart_summary_markdown(&parsed.summary_bullets).ok_or_else(|| {
+            (
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "output_contract_invalid",
+                    "AI output did not contain usable summary bullets",
+                ),
+                call_ids.clone(),
+            )
+        })?;
+        return Ok(ReleaseSmartAiResult {
+            value: Some((parsed.title_zh, Some(summary))),
+            call_ids,
+        });
     }
 
     let Some(previous_tag_name) = item
@@ -19785,7 +20051,10 @@ async fn summarize_release_smart_candidate_with_ai(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return Ok(None);
+        return Ok(ReleaseSmartAiResult {
+            value: None,
+            call_ids,
+        });
     };
     let compare_range = format!("{previous_tag_name}...{}", item.tag_name);
     let digest = fetch_release_compare_digest(
@@ -19795,23 +20064,44 @@ async fn summarize_release_smart_candidate_with_ai(
         previous_tag_name,
         item.tag_name.as_str(),
     )
-    .await?;
+    .await
+    .map_err(|error| (error, call_ids.clone()))?;
     let Some(digest) = digest else {
-        return Ok(None);
+        return Ok(ReleaseSmartAiResult {
+            value: None,
+            call_ids,
+        });
     };
 
     let diff_prompt = release_smart_diff_prompt(item, &compare_range, &digest);
-    let raw = ai::chat_completion(state, release_smart_diff_system_prompt(), &diff_prompt, 700)
-        .await
-        .map_err(ApiError::from_llm_error)?;
-    let parsed = parse_release_smart_summary_payload(&raw)
-        .ok_or_else(|| ApiError::internal("release smart diff summary json decode failed"))?;
+    let (parsed, diff_call_ids) = request_release_smart_payload(
+        state,
+        release_smart_diff_system_prompt(),
+        diff_prompt.as_str(),
+        "release_smart_diff",
+    )
+    .await?;
+    call_ids.extend(diff_call_ids);
     if !parsed.valuable {
-        return Ok(None);
+        return Ok(ReleaseSmartAiResult {
+            value: None,
+            call_ids,
+        });
     }
-    let summary = render_smart_summary_markdown(&parsed.summary_bullets)
-        .ok_or_else(|| ApiError::internal("release smart diff summary bullets missing"))?;
-    Ok(Some((parsed.title_zh, Some(summary))))
+    let summary = render_smart_summary_markdown(&parsed.summary_bullets).ok_or_else(|| {
+        (
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "output_contract_invalid",
+                "AI output did not contain usable summary bullets",
+            ),
+            call_ids.clone(),
+        )
+    })?;
+    Ok(ReleaseSmartAiResult {
+        value: Some((parsed.title_zh, Some(summary))),
+        call_ids,
+    })
 }
 
 async fn prepare_release_smart_batch(
@@ -19824,6 +20114,7 @@ async fn prepare_release_smart_batch(
             candidates: Vec::new(),
             pending: Vec::new(),
             smart: HashMap::new(),
+            smart_call_ids: HashMap::new(),
             terminal: HashMap::new(),
             missing: HashSet::new(),
         });
@@ -19960,6 +20251,7 @@ async fn prepare_release_smart_batch(
 
     let mut pending = Vec::new();
     let mut smart = HashMap::<i64, (Option<String>, Option<String>)>::new();
+    let smart_call_ids = HashMap::<i64, Vec<String>>::new();
     let mut terminal = HashMap::<i64, ReleaseBatchTerminalState>::new();
 
     for item in &candidates {
@@ -20006,6 +20298,7 @@ async fn prepare_release_smart_batch(
         candidates,
         pending,
         smart,
+        smart_call_ids,
         terminal,
         missing,
     })
@@ -20075,6 +20368,11 @@ async fn upsert_release_smart_terminal_states(
         let Some(terminal_state) = terminal.get(&item.release_id) else {
             continue;
         };
+        if terminal_state.status == "error" {
+            // Technical failures remain on the work item for scheduler recovery;
+            // do not turn them into a reusable cache hit.
+            continue;
+        }
         upsert_translation_terminal_status(
             state,
             user_id,
@@ -20151,24 +20449,28 @@ fn build_release_smart_batch_item(
     }
 }
 
-pub(crate) async fn summarize_releases_smart_batch_internal(
+async fn summarize_releases_smart_batch_internal_with_diagnostics_and_work_items(
     state: &AppState,
     user_id: &str,
     release_ids: &[i64],
-) -> Result<Vec<TranslateBatchItem>, ApiError> {
+    work_item_ids: Option<&HashMap<i64, String>>,
+) -> Result<(Vec<TranslateBatchItem>, HashMap<i64, Vec<String>>), ApiError> {
     if state.config.ai.is_none() {
-        return Ok(release_ids
-            .iter()
-            .map(|release_id| TranslateBatchItem {
-                id: release_id.to_string(),
-                lang: "zh-CN".to_owned(),
-                status: "disabled".to_owned(),
-                title: None,
-                summary: None,
-                error: None,
-                failure_class: None,
-            })
-            .collect());
+        return Ok((
+            release_ids
+                .iter()
+                .map(|release_id| TranslateBatchItem {
+                    id: release_id.to_string(),
+                    lang: "zh-CN".to_owned(),
+                    status: "disabled".to_owned(),
+                    title: None,
+                    summary: None,
+                    error: None,
+                    failure_class: None,
+                })
+                .collect(),
+            HashMap::new(),
+        ));
     }
 
     let requested_at = chrono::Utc::now().to_rfc3339();
@@ -20176,21 +20478,40 @@ pub(crate) async fn summarize_releases_smart_batch_internal(
     mark_release_smart_requested(state, user_id, requested_at.as_str(), &prepared.pending).await?;
 
     for item in &prepared.pending {
-        match summarize_release_smart_candidate_with_ai(state, user_id, item).await {
-            Ok(Some(result)) => {
-                prepared.smart.insert(item.release_id, result);
+        let ai_result = if let Some(mut context) = ai::current_llm_call_context() {
+            let relation_id = work_item_ids
+                .and_then(|ids| ids.get(&item.release_id))
+                .map(String::as_str)
+                .unwrap_or(item.entity_id.as_str());
+            context.source = format!("{}.work_item.{relation_id}", context.source);
+            ai::with_llm_call_context(
+                context,
+                summarize_release_smart_candidate_with_ai_diagnostics(state, user_id, item),
+            )
+            .await
+        } else {
+            summarize_release_smart_candidate_with_ai_diagnostics(state, user_id, item).await
+        };
+        match ai_result {
+            Ok(result) => {
+                if let Some(value) = result.value {
+                    prepared.smart.insert(item.release_id, value);
+                } else {
+                    prepared.terminal.insert(
+                        item.release_id,
+                        ReleaseBatchTerminalState {
+                            status: "missing".to_owned(),
+                            error: Some(SMART_NO_VALUABLE_VERSION_INFO.to_owned()),
+                            failure_class: None,
+                        },
+                    );
+                }
+                prepared
+                    .smart_call_ids
+                    .insert(item.release_id, result.call_ids);
             }
-            Ok(None) => {
-                prepared.terminal.insert(
-                    item.release_id,
-                    ReleaseBatchTerminalState {
-                        status: "missing".to_owned(),
-                        error: Some(SMART_NO_VALUABLE_VERSION_INFO.to_owned()),
-                        failure_class: None,
-                    },
-                );
-            }
-            Err(err) => {
+            Err((err, call_ids)) => {
+                prepared.smart_call_ids.insert(item.release_id, call_ids);
                 prepared.terminal.insert(
                     item.release_id,
                     ReleaseBatchTerminalState {
@@ -20220,25 +20541,229 @@ pub(crate) async fn summarize_releases_smart_batch_internal(
     )
     .await?;
 
-    Ok(release_ids
-        .iter()
-        .map(|release_id| {
-            build_release_smart_batch_item(
-                *release_id,
-                &prepared.missing,
-                &prepared.terminal,
-                &prepared.smart,
-            )
-        })
-        .collect())
+    Ok((
+        release_ids
+            .iter()
+            .map(|release_id| {
+                build_release_smart_batch_item(
+                    *release_id,
+                    &prepared.missing,
+                    &prepared.terminal,
+                    &prepared.smart,
+                )
+            })
+            .collect(),
+        prepared.smart_call_ids,
+    ))
 }
 
+#[allow(dead_code)]
+pub(crate) async fn summarize_releases_smart_batch_internal_with_diagnostics(
+    state: &AppState,
+    user_id: &str,
+    release_ids: &[i64],
+) -> Result<(Vec<TranslateBatchItem>, HashMap<i64, Vec<String>>), ApiError> {
+    translations::enqueue_release_smart_translation_requests(state, user_id, release_ids).await?;
+    let response =
+        read_release_smart_translation_batch_for_user(state, user_id, release_ids).await?;
+    Ok((response.items, HashMap::new()))
+}
+
+pub(crate) async fn summarize_releases_smart_batch_for_scheduler(
+    state: &AppState,
+    user_id: &str,
+    work_items: &[(i64, String)],
+) -> Result<Vec<TranslateBatchItem>, ApiError> {
+    let release_ids = work_items
+        .iter()
+        .map(|(release_id, _)| *release_id)
+        .collect::<Vec<_>>();
+    let work_item_ids = work_items
+        .iter()
+        .map(|(release_id, work_item_id)| (*release_id, work_item_id.clone()))
+        .collect::<HashMap<_, _>>();
+    Ok(
+        summarize_releases_smart_batch_internal_with_diagnostics_and_work_items(
+            state,
+            user_id,
+            &release_ids,
+            Some(&work_item_ids),
+        )
+        .await?
+        .0,
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) async fn summarize_releases_smart_batch_internal(
+    state: &AppState,
+    user_id: &str,
+    release_ids: &[i64],
+) -> Result<Vec<TranslateBatchItem>, ApiError> {
+    Ok(
+        summarize_releases_smart_batch_internal_with_diagnostics(state, user_id, release_ids)
+            .await?
+            .0,
+    )
+}
+
+#[allow(dead_code)]
 pub async fn summarize_releases_smart_batch_for_user(
     state: &AppState,
     user_id: &str,
     release_ids: &[i64],
 ) -> Result<TranslateBatchResponse, ApiError> {
     let items = summarize_releases_smart_batch_internal(state, user_id, release_ids).await?;
+    Ok(TranslateBatchResponse { items })
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ReleaseSmartTranslationCacheRow {
+    entity_id: String,
+    source_hash: String,
+    status: String,
+    title: Option<String>,
+    summary: Option<String>,
+    error_text: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ReleaseSmartWorkItemStateRow {
+    entity_id: String,
+    source_hash: String,
+    status: String,
+    result_status: Option<String>,
+    error_text: Option<String>,
+    updated_at: String,
+}
+
+pub(crate) async fn read_release_smart_translation_batch_for_user(
+    state: &AppState,
+    user_id: &str,
+    release_ids: &[i64],
+) -> Result<TranslateBatchResponse, ApiError> {
+    if release_ids.is_empty() {
+        return Ok(TranslateBatchResponse { items: Vec::new() });
+    }
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT entity_id, source_hash, status, title, summary, error_text, updated_at FROM ai_translations WHERE user_id = ",
+    );
+    query.push_bind(user_id);
+    query.push(" AND entity_type = 'release_smart' AND lang = 'zh-CN' AND entity_id IN (");
+    {
+        let mut separated = query.separated(", ");
+        for release_id in release_ids {
+            separated.push_bind(release_id.to_string());
+        }
+    }
+    query.push(")");
+    let rows = query
+        .build_query_as::<ReleaseSmartTranslationCacheRow>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let by_entity = rows
+        .into_iter()
+        .map(|row| (row.entity_id.clone(), row))
+        .collect::<HashMap<_, _>>();
+    let mut work_item_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT entity_id, source_hash, status, result_status, error_text, updated_at FROM translation_work_items WHERE scope_user_id = ",
+    );
+    work_item_query.push_bind(user_id);
+    work_item_query
+        .push(" AND kind = 'release_smart' AND variant = 'feed_card' AND entity_id IN (");
+    {
+        let mut separated = work_item_query.separated(", ");
+        for release_id in release_ids {
+            separated.push_bind(release_id.to_string());
+        }
+    }
+    work_item_query.push(") ORDER BY updated_at DESC, id DESC");
+    let work_item_rows = work_item_query
+        .build_query_as::<ReleaseSmartWorkItemStateRow>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let latest_work_items = work_item_rows.into_iter().fold(
+        HashMap::<String, ReleaseSmartWorkItemStateRow>::new(),
+        |mut map, row| {
+            map.entry(row.entity_id.clone()).or_insert(row);
+            map
+        },
+    );
+    let items = release_ids
+        .iter()
+        .map(|release_id| {
+            let id = release_id.to_string();
+            let cache = by_entity.get(&id);
+            if let Some(work_item) = latest_work_items.get(&id) {
+                let cache_is_newer =
+                    cache.is_some_and(|row| row.updated_at >= work_item.updated_at);
+                let cache_matches_work =
+                    cache.is_some_and(|row| row.source_hash == work_item.source_hash);
+                if !cache_is_newer || cache_matches_work {
+                    if matches!(work_item.status.as_str(), "queued" | "running") {
+                        return TranslateBatchItem {
+                            id,
+                            lang: "zh-CN".to_owned(),
+                            status: "processing".to_owned(),
+                            title: None,
+                            summary: None,
+                            error: None,
+                            failure_class: None,
+                        };
+                    }
+                    if work_item.result_status.as_deref() == Some("error") {
+                        let classified = translations::classify_translation_error(
+                            work_item.error_text.as_deref(),
+                        );
+                        return TranslateBatchItem {
+                            id,
+                            lang: "zh-CN".to_owned(),
+                            status: "error".to_owned(),
+                            title: None,
+                            summary: None,
+                            error: classified.map(|value| value.summary.to_owned()),
+                            failure_class: None,
+                        };
+                    }
+                    if work_item.result_status.as_deref() == Some("missing") {
+                        return TranslateBatchItem {
+                            id,
+                            lang: "zh-CN".to_owned(),
+                            status: "missing".to_owned(),
+                            title: None,
+                            summary: None,
+                            error: None,
+                            failure_class: None,
+                        };
+                    }
+                }
+            }
+            let Some(row) = cache else {
+                return TranslateBatchItem {
+                    id,
+                    lang: "zh-CN".to_owned(),
+                    status: "processing".to_owned(),
+                    title: None,
+                    summary: None,
+                    error: None,
+                    failure_class: None,
+                };
+            };
+            let classified = translations::classify_translation_error(row.error_text.as_deref());
+            TranslateBatchItem {
+                id,
+                lang: "zh-CN".to_owned(),
+                status: row.status.clone(),
+                title: row.title.clone(),
+                summary: row.summary.clone(),
+                error: classified.map(|value| value.summary.to_owned()),
+                failure_class: None,
+            }
+        })
+        .collect();
     Ok(TranslateBatchResponse { items })
 }
 
@@ -27836,6 +28361,9 @@ mod tests {
                 duration_ms: Some(910),
                 input_tokens: Some(300),
                 output_tokens: Some(120),
+                finish_reason: Some("stop".to_owned()),
+                provider_request_id: Some("req-override".to_owned()),
+                provider_http_status: Some(200),
                 cached_input_tokens: Some(40),
                 total_tokens: Some(420),
                 output_messages_json: Some(

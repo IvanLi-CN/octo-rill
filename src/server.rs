@@ -346,6 +346,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(api::admin_get_llm_call_detail),
         )
         .route(
+            "/admin/jobs/llm/calls/{call_id}/diagnostic-access",
+            post(api::admin_audit_llm_diagnostic_access),
+        )
+        .route(
             "/admin/jobs/ai-records/{record_kind}",
             get(admin_ai_records::admin_list_collection_records),
         )
