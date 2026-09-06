@@ -12588,6 +12588,10 @@ pub async fn list_briefs(
     headers: HeaderMap,
 ) -> Result<Json<Vec<BriefSummaryItem>>, ApiError> {
     let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
+    let preferences = briefs::load_daily_brief_preferences(state.as_ref(), &user_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let now = Utc::now();
 
     #[derive(Debug, sqlx::FromRow)]
     struct BriefRow {
@@ -12631,6 +12635,22 @@ pub async fn list_briefs(
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::internal)?;
+    let rows = rows
+        .into_iter()
+        .filter(|row| {
+            briefs::brief_snapshot_is_visible(
+                &row.date,
+                row.window_start_utc.as_deref(),
+                row.window_end_utc.as_deref(),
+                row.effective_time_zone.as_deref(),
+                row.effective_local_boundary.as_deref(),
+                &row.generation_source,
+                &row.updated_at,
+                &preferences,
+                now,
+            )
+        })
+        .collect::<Vec<_>>();
 
     let mut release_ids_by_brief = HashMap::<String, Vec<String>>::new();
     if !rows.is_empty() {
@@ -12745,6 +12765,10 @@ pub async fn get_brief(
     Path(brief_id): Path<String>,
 ) -> Result<Json<BriefDetailItem>, ApiError> {
     let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
+    let preferences = briefs::load_daily_brief_preferences(state.as_ref(), &user_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let now = Utc::now();
 
     #[derive(Debug, sqlx::FromRow)]
     struct BriefRow {
@@ -12783,6 +12807,24 @@ pub async fn get_brief(
     .await
     .map_err(ApiError::internal)?
     .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "brief not found"))?;
+
+    if !briefs::brief_snapshot_is_visible(
+        &row.date,
+        row.window_start_utc.as_deref(),
+        row.window_end_utc.as_deref(),
+        row.effective_time_zone.as_deref(),
+        row.effective_local_boundary.as_deref(),
+        &row.generation_source,
+        &row.updated_at,
+        &preferences,
+        now,
+    ) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "brief not found",
+        ));
+    }
 
     let mut release_ids = sqlx::query_scalar::<_, i64>(
         r#"
@@ -13371,9 +13413,27 @@ async fn load_dashboard_brief_signatures(
     state: &AppState,
     user_id: &str,
 ) -> Result<Vec<String>, ApiError> {
-    let signatures = sqlx::query_scalar::<_, String>(
+    #[derive(Debug, sqlx::FromRow)]
+    struct BriefSignatureRow {
+        id: String,
+        date: String,
+        window_start_utc: Option<String>,
+        window_end_utc: Option<String>,
+        effective_time_zone: Option<String>,
+        effective_local_boundary: Option<String>,
+        generation_source: String,
+        updated_at: String,
+    }
+
+    let preferences = briefs::load_daily_brief_preferences(state, user_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let now = Utc::now();
+    let rows = sqlx::query_as::<_, BriefSignatureRow>(
         r#"
-        SELECT 'brief:' || id || '|' || updated_at
+        SELECT id, date, window_start_utc, window_end_utc,
+               effective_time_zone, effective_local_boundary,
+               generation_source, updated_at
         FROM briefs
         WHERE user_id = ?
         ORDER BY COALESCE(window_end_utc, created_at) DESC, created_at DESC, id DESC
@@ -13384,7 +13444,23 @@ async fn load_dashboard_brief_signatures(
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::internal)?;
-    Ok(signatures)
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            briefs::brief_snapshot_is_visible(
+                &row.date,
+                row.window_start_utc.as_deref(),
+                row.window_end_utc.as_deref(),
+                row.effective_time_zone.as_deref(),
+                row.effective_local_boundary.as_deref(),
+                &row.generation_source,
+                &row.updated_at,
+                &preferences,
+                now,
+            )
+        })
+        .map(|row| format!("brief:{}|{}", row.id, row.updated_at))
+        .collect())
 }
 
 async fn load_dashboard_notification_signatures(
@@ -13816,13 +13892,30 @@ pub async fn generate_brief(
     let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let mode = ReturnMode::from_query(&mode_query)?;
     let requested_date = payload.and_then(|Json(body)| body.date);
-    let key_date = requested_date
+    let requested_key_date = requested_date
         .as_deref()
         .map(|value| {
             chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
                 .map_err(|_| ApiError::bad_request("invalid date, expected YYYY-MM-DD"))
         })
         .transpose()?;
+    let preferences = briefs::load_daily_brief_preferences(state.as_ref(), &user_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let now = Utc::now();
+    let key_date = match requested_key_date {
+        Some(date) => date,
+        None => briefs::key_date_for_now(&preferences, now).map_err(ApiError::internal)?,
+    };
+    let window = briefs::compute_daily_window_for_key_date(&preferences, key_date)
+        .map_err(ApiError::internal)?;
+    if !briefs::daily_brief_window_is_closed(&window, now) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "daily_brief_window_open",
+            "日报对应的自然日尚未结束，请在次日 00:00 后生成",
+        ));
+    }
 
     if !matches!(mode, ReturnMode::Sync) {
         return enqueue_or_stream_task(
@@ -13832,7 +13925,7 @@ pub async fn generate_brief(
                 task_type: jobs::TASK_BRIEF_GENERATE.to_owned(),
                 payload: json!({
                     "user_id": user_id.clone(),
-                    "key_date": key_date.map(|value| value.to_string()),
+                    "key_date": key_date.to_string(),
                 }),
                 source: "api.generate_brief".to_owned(),
                 requested_by: Some(user_id.clone()),
@@ -13842,27 +13935,13 @@ pub async fn generate_brief(
         .await;
     }
 
-    let snapshot = if let Some(key_date) = key_date {
-        run_with_api_llm_context(
-            "api.generate_brief.sync",
-            Some(user_id.clone()),
-            ai::generate_daily_brief_snapshot_for_key_date(
-                state.as_ref(),
-                user_id.as_str(),
-                key_date,
-            ),
-        )
-        .await
-        .map_err(ApiError::internal)?
-    } else {
-        run_with_api_llm_context(
-            "api.generate_brief.sync",
-            Some(user_id.clone()),
-            ai::generate_daily_brief_snapshot_for_current(state.as_ref(), user_id.as_str()),
-        )
-        .await
-        .map_err(ApiError::internal)?
-    };
+    let snapshot = run_with_api_llm_context(
+        "api.generate_brief.sync",
+        Some(user_id.clone()),
+        ai::generate_daily_brief_snapshot_for_key_date(state.as_ref(), user_id.as_str(), key_date),
+    )
+    .await
+    .map_err(ApiError::internal)?;
 
     Ok(Json(BriefGenerateResponse {
         id: snapshot.id,
@@ -14355,6 +14434,7 @@ pub struct DashboardReadableSection {
     items_next_cursor: Option<String>,
     #[serde(rename = "activity_count")]
     item_count: usize,
+    can_generate_brief: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -16727,20 +16807,53 @@ async fn fetch_dashboard_readable_rows_for_date(
 #[derive(Debug, sqlx::FromRow)]
 struct DashboardReadableBriefDateRow {
     date: String,
+    window_start_utc: Option<String>,
+    window_end_utc: Option<String>,
+    effective_time_zone: Option<String>,
+    effective_local_boundary: Option<String>,
+    generation_source: String,
+    updated_at: String,
 }
 
 async fn load_dashboard_readable_brief_dates(
     state: &AppState,
     user_id: &str,
+    preferences: &briefs::DailyBriefPreferences,
+    now: DateTime<Utc>,
 ) -> Result<Vec<String>, ApiError> {
-    sqlx::query_as::<_, DashboardReadableBriefDateRow>(
-        "SELECT DISTINCT date FROM briefs WHERE user_id = ? ORDER BY date DESC",
+    let rows = sqlx::query_as::<_, DashboardReadableBriefDateRow>(
+        r#"
+        SELECT date, window_start_utc, window_end_utc,
+               effective_time_zone, effective_local_boundary,
+               generation_source, updated_at
+        FROM briefs
+        WHERE user_id = ?
+        ORDER BY date DESC
+        "#,
     )
     .bind(user_id)
     .fetch_all(&state.pool)
     .await
-    .map(|rows| rows.into_iter().map(|row| row.date).collect())
-    .map_err(ApiError::internal)
+    .map_err(ApiError::internal)?;
+    let mut dates = rows
+        .into_iter()
+        .filter(|row| {
+            briefs::brief_snapshot_is_visible(
+                &row.date,
+                row.window_start_utc.as_deref(),
+                row.window_end_utc.as_deref(),
+                row.effective_time_zone.as_deref(),
+                row.effective_local_boundary.as_deref(),
+                &row.generation_source,
+                &row.updated_at,
+                preferences,
+                now,
+            )
+        })
+        .map(|row| row.date)
+        .collect::<Vec<_>>();
+    dates.dedup();
+    Ok(dates)
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -16761,6 +16874,8 @@ async fn load_dashboard_readable_briefs_for_dates(
     state: &AppState,
     user_id: &str,
     dates: &[String],
+    preferences: &briefs::DailyBriefPreferences,
+    now: DateTime<Utc>,
 ) -> Result<Vec<BriefDetailItem>, ApiError> {
     if dates.is_empty() {
         return Ok(Vec::new());
@@ -16787,6 +16902,22 @@ async fn load_dashboard_readable_briefs_for_dates(
         .fetch_all(&state.pool)
         .await
         .map_err(ApiError::internal)?;
+    let rows = rows
+        .into_iter()
+        .filter(|row| {
+            briefs::brief_snapshot_is_visible(
+                &row.date,
+                row.window_start_utc.as_deref(),
+                row.window_end_utc.as_deref(),
+                row.effective_time_zone.as_deref(),
+                row.effective_local_boundary.as_deref(),
+                &row.generation_source,
+                &row.updated_at,
+                preferences,
+                now,
+            )
+        })
+        .collect::<Vec<_>>();
 
     let memberships_sql = format!(
         r#"
@@ -16947,8 +17078,10 @@ pub async fn dashboard_readable_feed(
     let preferences = briefs::load_daily_brief_preferences(state.as_ref(), &user_id)
         .await
         .map_err(ApiError::internal)?;
+    let now = Utc::now();
     let time_zone = preferences.time_zone.as_str();
-    let brief_dates = load_dashboard_readable_brief_dates(state.as_ref(), &user_id).await?;
+    let brief_dates =
+        load_dashboard_readable_brief_dates(state.as_ref(), &user_id, &preferences, now).await?;
     let mut dates = load_dashboard_readable_timestamps(state.as_ref(), &user_id)
         .await?
         .into_iter()
@@ -16973,8 +17106,14 @@ pub async fn dashboard_readable_feed(
         .take(DASHBOARD_READABLE_SECTION_LIMIT)
         .cloned()
         .collect::<Vec<_>>();
-    let briefs =
-        load_dashboard_readable_briefs_for_dates(state.as_ref(), &user_id, &selected_dates).await?;
+    let briefs = load_dashboard_readable_briefs_for_dates(
+        state.as_ref(),
+        &user_id,
+        &selected_dates,
+        &preferences,
+        now,
+    )
+    .await?;
     let mut sections = Vec::with_capacity(selected_dates.len());
     for date in &selected_dates {
         let brief = briefs
@@ -17033,6 +17172,14 @@ pub async fn dashboard_readable_feed(
         let public_brief = brief.as_ref().map(dashboard_readable_brief_public);
         let window_start = brief.as_ref().and_then(|value| value.window_start.clone());
         let window_end = brief.as_ref().and_then(|value| value.window_end.clone());
+        let can_generate_brief = if brief.is_none() {
+            let key_date =
+                NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(ApiError::internal)?;
+            briefs::daily_brief_key_date_is_closed(&preferences, key_date, now)
+                .map_err(ApiError::internal)?
+        } else {
+            false
+        };
         let section_id = encode_dashboard_readable_section_cursor_for_user(user_id.as_str(), date);
         sections.push(DashboardReadableSection {
             id: section_id,
@@ -17046,6 +17193,7 @@ pub async fn dashboard_readable_feed(
             supplemental_next_cursor: None,
             items_next_cursor,
             item_count,
+            can_generate_brief,
         });
     }
     let next_cursor = if dates.len() > selected_dates.len() {
@@ -23095,6 +23243,7 @@ mod tests {
             vec!["2026-04-30", "2026-04-29", "2026-04-28"]
         );
         assert_eq!(first.sections[0].kind, "brief");
+        assert!(!first.sections[0].can_generate_brief);
         assert_eq!(
             first.sections[0]
                 .brief
@@ -23130,8 +23279,36 @@ mod tests {
         .expect("load next readable sections");
         assert_eq!(second.sections.len(), 1);
         assert_eq!(second.sections[0].date, "2026-04-27");
+        assert!(second.sections[0].can_generate_brief);
         assert!(second.next_cursor.is_none());
     }
+
+    #[tokio::test]
+    async fn generate_brief_rejects_open_window_before_sync_or_enqueue() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        for return_mode in ["sync", "task_id"] {
+            let error = match super::generate_brief(
+                State(state.clone()),
+                setup_session(1).await,
+                HeaderMap::new(),
+                Query(ReturnModeQuery {
+                    return_mode: Some(return_mode.to_owned()),
+                }),
+                Some(Json(super::BriefGenerateRequest {
+                    date: Some("2999-01-01".to_owned()),
+                })),
+            )
+            .await
+            {
+                Ok(_) => panic!("open daily brief window must be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), "daily_brief_window_open");
+            assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
+        }
+    }
+
     use chrono::{Datelike, TimeZone};
 
     use super::{
@@ -34282,6 +34459,58 @@ line two",
         assert_eq!(item.id, "brief-2026-02-23");
         assert!(item.preview_markdown.starts_with("## 完整日报"));
         assert_eq!(item.content_markdown, full_markdown);
+    }
+
+    #[tokio::test]
+    async fn normal_user_reads_hide_premature_normalized_snapshot_but_keep_row() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date, window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, '2026-04-30', '2026-04-29T16:00:00Z', '2026-04-30T16:00:00Z',
+                    'Asia/Shanghai', '00:00', 'manual', ?,
+                    '2026-04-30T15:00:00Z', '2026-04-30T15:00:00Z')
+            "#,
+        )
+        .bind("brief-premature")
+        .bind(&user_id)
+        .bind("过早生成的日报")
+        .execute(&pool)
+        .await
+        .expect("insert premature brief");
+        let state = setup_state(pool.clone());
+
+        let Json(items) = list_briefs(
+            State(state.clone()),
+            setup_session(1).await,
+            HeaderMap::new(),
+        )
+        .await
+        .expect("list briefs");
+        assert!(items.is_empty());
+
+        let error = get_brief(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Path("brief-premature".to_owned()),
+        )
+        .await
+        .expect_err("premature brief must be hidden from direct reads");
+        assert_eq!(error.code(), "not_found");
+
+        let stored_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM briefs WHERE id = 'brief-premature'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count retained brief");
+        assert_eq!(stored_count, 1);
     }
 
     #[tokio::test]

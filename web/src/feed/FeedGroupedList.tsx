@@ -72,9 +72,17 @@ function toHistoricalBriefErrorMap(
 }
 
 const FEED_DAY_ACTION_SLOT_CLASS =
-	"flex w-full items-start justify-end pt-1 sm:h-8 sm:w-[152px] sm:shrink-0 sm:items-center sm:justify-end sm:pt-0";
+	"flex w-full items-start justify-end pt-1 sm:col-start-5 sm:col-end-6 sm:h-8 sm:w-[152px] sm:shrink-0 sm:items-center sm:justify-end sm:pt-0";
+const FEED_DAY_HEADER_CLASS =
+	"flex flex-col gap-2 py-0.5 sm:min-h-8 sm:flex-row sm:flex-wrap sm:items-center sm:gap-3 sm:py-0";
+const FEED_DAY_HEADER_WITH_ACTION_CLASS =
+	"flex flex-col gap-2 py-0.5 sm:min-h-8 sm:grid sm:grid-cols-[152px_minmax(0,1fr)_auto_minmax(0,1fr)_152px] sm:items-center sm:gap-3 sm:py-0";
+const FEED_DAY_LABEL_GROUP_CLASS =
+	"flex min-w-0 w-full flex-1 items-center gap-2 sm:w-auto sm:gap-4";
+const FEED_DAY_LABEL_GROUP_WITH_ACTION_CLASS =
+	"flex min-w-0 w-full items-center gap-2 sm:col-start-2 sm:col-end-5 sm:gap-4";
 const FEED_DAY_ACTION_BUTTON_CLASS =
-	"h-auto min-h-0 w-auto justify-end gap-1 rounded-none px-0 py-0 font-mono text-[14px] font-normal leading-[1.35] tracking-[0.02em] text-foreground/82 shadow-none hover:bg-transparent hover:text-foreground/82 focus-visible:border-transparent focus-visible:ring-0 disabled:text-foreground/82 disabled:opacity-100 sm:w-full sm:justify-end sm:text-[15px] sm:leading-none sm:tracking-wide";
+	"h-auto min-h-0 w-auto justify-end gap-1 rounded-none px-0 py-0 font-mono text-[14px] font-normal leading-[1.35] tracking-[0.02em] text-foreground/82 shadow-none hover:bg-transparent hover:text-foreground/82 focus-visible:border-transparent focus-visible:ring-0 disabled:text-foreground/82 disabled:opacity-100 sm:justify-end sm:text-[15px] sm:leading-none sm:tracking-wide";
 const FEED_BRIEF_PANEL_CLASS =
 	"bg-card/58 overflow-hidden rounded-[22px] shadow-sm ring-1 ring-inset ring-border/60 sm:rounded-[24px]";
 
@@ -412,13 +420,19 @@ function FeedDayHeader(props: {
 	return (
 		<div
 			className={cn(
-				"flex flex-col gap-2 py-0.5 sm:min-h-8 sm:flex-row sm:flex-wrap sm:items-center sm:gap-3 sm:py-0",
+				action ? FEED_DAY_HEADER_WITH_ACTION_CLASS : FEED_DAY_HEADER_CLASS,
 				className,
 			)}
 			data-feed-day-header="true"
 		>
 			{withDividerLines ? (
-				<div className="flex min-w-0 w-full flex-1 items-center gap-2 sm:w-auto sm:gap-4">
+				<div
+					className={
+						action
+							? FEED_DAY_LABEL_GROUP_WITH_ACTION_CLASS
+							: FEED_DAY_LABEL_GROUP_CLASS
+					}
+				>
 					<div
 						className="bg-border/60 h-px min-w-4 flex-1 sm:min-w-8"
 						data-feed-day-divider-before="true"

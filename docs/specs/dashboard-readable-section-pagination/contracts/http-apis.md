@@ -20,6 +20,7 @@
       "window_start": "2026-08-31T16:00:00Z",
       "window_end": "2026-09-01T16:00:00Z",
       "activity_count": 18,
+      "can_generate_brief": true,
       "items": ["FeedItem"],
       "items_next_cursor": "section_items_cursor"
     },
@@ -59,6 +60,7 @@
 - `brief.content_markdown` 是完整日报正文。该接口不得以 `preview_markdown` 或空正文代替它，也不返回 `brief.release_ids`。
 - `supplemental_items` 只包含日报没有覆盖的活动，并随完整日报区块直接返回；`supplemental_next_cursor` 为兼容字段，当前实现保留为 `null`。
 - `items` 是原始活动区块的初始明细；没有日报的历史区块与当前原始区块均使用 `kind: "raw"`。`items` 最多三十条，后续由 `items_next_cursor` 取得。
+- `can_generate_brief` 只在服务端确认该日期对应用户时区的自然日窗口已关闭且没有可见日报时为 `true`；当前或未来自然日以及过早快照均为 `false`。
 - `id`、`next_cursor`、`items_next_cursor` 与 `supplemental_next_cursor` 均为不透明 token，服务端必须绑定认证用户和区块边界验证。
 - 普通同步、日报生成和日报内容刷新不得使有效区块 cursor 返回 stale 错误。日界设置变更或用户主动刷新由客户端从无 cursor 的首屏请求重新开始。
 

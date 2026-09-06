@@ -330,6 +330,65 @@ pub fn compute_daily_window_for_key_date(
     })
 }
 
+pub fn daily_brief_window_is_closed(window: &DailyWindow, now_utc: DateTime<Utc>) -> bool {
+    window.end_utc <= now_utc
+}
+
+pub fn daily_brief_key_date_is_closed(
+    preferences: &DailyBriefPreferences,
+    key_date: NaiveDate,
+    now_utc: DateTime<Utc>,
+) -> Result<bool> {
+    Ok(daily_brief_window_is_closed(
+        &compute_daily_window_for_key_date(preferences, key_date)?,
+        now_utc,
+    ))
+}
+
+fn parse_stored_utc_timestamp(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw.trim())
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn brief_snapshot_is_visible(
+    date: &str,
+    window_start_utc: Option<&str>,
+    window_end_utc: Option<&str>,
+    effective_time_zone: Option<&str>,
+    effective_local_boundary: Option<&str>,
+    generation_source: &str,
+    updated_at: &str,
+    preferences: &DailyBriefPreferences,
+    now_utc: DateTime<Utc>,
+) -> bool {
+    let persisted_end = window_end_utc.and_then(parse_stored_utc_timestamp);
+    let computed_end = NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d")
+        .ok()
+        .and_then(|key_date| compute_daily_window_for_key_date(preferences, key_date).ok())
+        .map(|window| window.end_utc);
+    let Some(window_end) = persisted_end.or(computed_end) else {
+        return false;
+    };
+    if window_end > now_utc {
+        return false;
+    }
+
+    let normalized_snapshot = window_start_utc.is_some()
+        && window_end_utc.is_some()
+        && effective_time_zone.is_some()
+        && effective_local_boundary.is_some()
+        && generation_source != "legacy";
+    if !normalized_snapshot {
+        return true;
+    }
+
+    parse_stored_utc_timestamp(updated_at)
+        .map(|updated| updated >= window_end)
+        .unwrap_or(false)
+}
+
 pub fn key_date_for_now(
     preferences: &DailyBriefPreferences,
     now_utc: DateTime<Utc>,
@@ -659,6 +718,86 @@ mod tests {
         assert_eq!(window.start_utc.to_rfc3339(), "2026-03-08T05:00:00+00:00");
         assert_eq!(window.end_utc.to_rfc3339(), "2026-03-09T04:00:00+00:00");
         assert_eq!(window.effective_local_boundary, "00:00");
+    }
+
+    #[test]
+    fn natural_day_window_is_open_until_local_midnight() {
+        let preferences = DailyBriefPreferences {
+            local_time: NaiveTime::from_hms_opt(8, 0, 0).expect("08:00"),
+            time_zone: "Asia/Shanghai".to_owned(),
+        };
+        let key_date = NaiveDate::from_ymd_opt(2026, 4, 12).expect("date");
+        let window = compute_daily_window_for_key_date(&preferences, key_date).expect("window");
+
+        assert!(!daily_brief_window_is_closed(
+            &window,
+            Utc.with_ymd_and_hms(2026, 4, 12, 15, 59, 59)
+                .single()
+                .expect("valid datetime")
+        ));
+        assert!(daily_brief_window_is_closed(
+            &window,
+            Utc.with_ymd_and_hms(2026, 4, 12, 16, 0, 0)
+                .single()
+                .expect("valid datetime")
+        ));
+    }
+
+    #[test]
+    fn premature_normalized_snapshot_stays_hidden_until_regenerated() {
+        let preferences = DailyBriefPreferences {
+            local_time: NaiveTime::from_hms_opt(8, 0, 0).expect("08:00"),
+            time_zone: "Asia/Shanghai".to_owned(),
+        };
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 13, 1, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let window_end = "2026-04-12T16:00:00Z";
+
+        assert!(!brief_snapshot_is_visible(
+            "2026-04-12",
+            Some("2026-04-11T16:00:00Z"),
+            Some(window_end),
+            Some("Asia/Shanghai"),
+            Some("00:00"),
+            "manual",
+            "2026-04-12T12:00:00Z",
+            &preferences,
+            now,
+        ));
+        assert!(brief_snapshot_is_visible(
+            "2026-04-12",
+            Some("2026-04-11T16:00:00Z"),
+            Some(window_end),
+            Some("Asia/Shanghai"),
+            Some("00:00"),
+            "manual",
+            "2026-04-12T16:00:01Z",
+            &preferences,
+            now,
+        ));
+    }
+
+    #[test]
+    fn legacy_historical_snapshot_remains_visible_without_window_metadata() {
+        let preferences = DailyBriefPreferences {
+            local_time: NaiveTime::from_hms_opt(8, 0, 0).expect("08:00"),
+            time_zone: "Asia/Shanghai".to_owned(),
+        };
+        assert!(brief_snapshot_is_visible(
+            "2026-04-12",
+            None,
+            None,
+            None,
+            None,
+            "legacy",
+            "2026-04-12T08:00:00Z",
+            &preferences,
+            Utc.with_ymd_and_hms(2026, 4, 13, 1, 0, 0)
+                .single()
+                .expect("valid datetime"),
+        ));
     }
 
     #[test]
