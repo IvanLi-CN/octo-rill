@@ -6292,6 +6292,9 @@ pub(crate) async fn generate_daily_brief_snapshot_for_window(
     window: &UserDailyWindow,
     generation_source: &str,
 ) -> Result<StoredBrief> {
+    if window.end_utc > chrono::Utc::now() {
+        return Err(anyhow!("daily brief window open"));
+    }
     let window_start = window.start_utc.to_rfc3339();
     let window_end = window.end_utc.to_rfc3339();
     let existing_id = find_normalized_brief_snapshot_id_by_window(

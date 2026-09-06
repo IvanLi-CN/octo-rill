@@ -266,44 +266,75 @@ function buildDemoReadableFeedResponse(
 		(item) => item.kind !== "release",
 	);
 
-	return {
-		sections: model.briefs.flatMap((brief) => {
-			if (!brief.content_markdown) return [];
-			const coveredReleaseIds = new Set(brief.release_ids);
-			const coveredItems = releaseItems.filter((item) =>
-				coveredReleaseIds.has(item.id),
-			);
-			return [
-				{
-					id: `brief-${brief.id}`,
+	const briefDates = new Set(model.briefs.map((brief) => brief.date));
+	const briefSections = model.briefs.flatMap((brief) => {
+		if (!brief.content_markdown) return [];
+		const coveredReleaseIds = new Set(brief.release_ids);
+		const coveredItems = releaseItems.filter((item) =>
+			coveredReleaseIds.has(item.id),
+		);
+		return [
+			{
+				id: `brief-${brief.id}`,
+				date: brief.date,
+				kind: "brief" as const,
+				window_start: brief.window_start ?? null,
+				window_end: brief.window_end ?? null,
+				brief: {
+					id: brief.id,
 					date: brief.date,
-					kind: "brief" as const,
 					window_start: brief.window_start ?? null,
 					window_end: brief.window_end ?? null,
-					brief: {
-						id: brief.id,
-						date: brief.date,
-						window_start: brief.window_start ?? null,
-						window_end: brief.window_end ?? null,
-						effective_time_zone: brief.effective_time_zone ?? null,
-						effective_local_boundary: brief.effective_local_boundary ?? null,
-						release_count: brief.release_count,
-						release_ids: brief.release_ids,
-						preview_markdown: brief.preview_markdown ?? undefined,
-						content_markdown: brief.content_markdown,
-						covers_repo_stars: brief.covers_repo_stars ?? false,
-						covers_followers: brief.covers_followers ?? false,
-						created_at: brief.created_at,
-						updated_at: brief.updated_at ?? brief.created_at,
-					},
-					items: [],
-					supplemental_items: supplementalItems,
-					supplemental_next_cursor: null,
-					items_next_cursor: null,
-					item_count: coveredItems.length + supplementalItems.length,
+					effective_time_zone: brief.effective_time_zone ?? null,
+					effective_local_boundary: brief.effective_local_boundary ?? null,
+					release_count: brief.release_count,
+					release_ids: brief.release_ids,
+					preview_markdown: brief.preview_markdown ?? undefined,
+					content_markdown: brief.content_markdown,
+					covers_repo_stars: brief.covers_repo_stars ?? false,
+					covers_followers: brief.covers_followers ?? false,
+					created_at: brief.created_at,
+					updated_at: brief.updated_at ?? brief.created_at,
 				},
-			];
-		}),
+				items: [],
+				supplemental_items: supplementalItems,
+				supplemental_next_cursor: null,
+				items_next_cursor: null,
+				item_count: coveredItems.length + supplementalItems.length,
+				can_generate_brief: false,
+			},
+		];
+	});
+	const rawSections = Array.from(
+		new Set(
+			model.feed.items
+				.map((item) => item.ts.slice(0, 10))
+				.filter((date) => !briefDates.has(date)),
+		),
+	)
+		.sort((left, right) => right.localeCompare(left))
+		.map((date) => {
+			const items = model.feed.items.filter((item) => item.ts.startsWith(date));
+			return {
+				id: `raw-${date}`,
+				date,
+				kind: "raw" as const,
+				window_start: null,
+				window_end: null,
+				brief: null,
+				items: items.slice(0, 30),
+				supplemental_items: [],
+				supplemental_next_cursor: null,
+				items_next_cursor: items.length > 30 ? `raw-${date}-next` : null,
+				item_count: items.length,
+				can_generate_brief: true,
+			};
+		});
+
+	return {
+		sections: [...briefSections, ...rawSections].sort((left, right) =>
+			right.date.localeCompare(left.date),
+		),
 		next_cursor: null,
 	};
 }
