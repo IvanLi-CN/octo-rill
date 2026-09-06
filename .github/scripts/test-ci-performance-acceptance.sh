@@ -25,9 +25,9 @@ spec.loader.exec_module(module)
 
 class FakeGh:
     def __init__(self, candidate_retry_count=1, candidate_failed_tests=0, candidate_test_id_offset=0):
-        self.control_sha = "1" * 40
+        self.control_sha = "3" * 40
         self.candidate_sha = "2" * 40
-        self.dispatch_shas = {"main": "3" * 40, "candidate": self.candidate_sha}
+        self.dispatch_shas = {"main": self.control_sha, "candidate": self.candidate_sha}
         self.candidate_retry_count = candidate_retry_count
         self.candidate_failed_tests = candidate_failed_tests
         self.candidate_test_id_offset = candidate_test_id_offset
@@ -224,6 +224,22 @@ except module.AcceptanceError as error:
     assert "candidate dispatch ref" in str(error)
 else:
     raise AssertionError("candidate workflow ref must resolve to the candidate SHA")
+
+mismatched_control_ref = FakeGh()
+mismatched_control_ref.dispatch_shas["main"] = "4" * 40
+try:
+    module.validate_target_pair(
+        mismatched_control_ref,
+        "IvanLi-CN/octo-rill",
+        mismatched_control_ref.control_sha,
+        mismatched_control_ref.candidate_sha,
+        "main",
+        "candidate",
+    )
+except module.AcceptanceError as error:
+    assert "control dispatch ref" in str(error)
+else:
+    raise AssertionError("control workflow ref must resolve to the control SHA")
 
 try:
     module.validate_playwright_summary({

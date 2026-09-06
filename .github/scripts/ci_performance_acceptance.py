@@ -207,6 +207,8 @@ def validate_target_pair(
     candidate_sha = validate_commit_sha(client, repo, candidate_sha, "candidate SHA")
     control_dispatch_sha = resolve_ref(client, repo, control_dispatch_ref)
     candidate_dispatch_sha = resolve_ref(client, repo, candidate_dispatch_ref)
+    if control_dispatch_sha != control_sha:
+        raise AcceptanceError("control dispatch ref must resolve to the control SHA")
     if candidate_dispatch_sha != candidate_sha:
         raise AcceptanceError("candidate dispatch ref must resolve to the candidate SHA")
     comparison = client.api(f"repos/{repo}/compare/{control_sha}...{candidate_sha}")
