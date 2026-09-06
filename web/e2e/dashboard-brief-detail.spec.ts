@@ -161,6 +161,7 @@ function makeReadableRawSection(input: {
 		supplemental_items: [],
 		supplemental_next_cursor: null,
 		items_next_cursor: input.nextCursor ?? null,
+		can_generate_brief: true,
 	};
 }
 function makeScrollableFirstPage(
@@ -685,12 +686,49 @@ test("dashboard keeps a history date without a brief readable and manual", async
 	await page.goto("/");
 	await expect(page.getByText("没有日报的原始发布")).toBeVisible();
 	await expect(page.getByText("没有日报区块的明细续页")).toBeVisible();
-	await expect(page.getByRole("button", { name: "生成日报" })).toBeVisible();
+	const sectionHeader = page.locator(
+		'[data-readable-section-id="section-raw-history"] [data-readable-section-header="true"]',
+	);
+	await expect(
+		sectionHeader.getByRole("button", { name: "生成日报" }),
+	).toBeVisible();
+	await expect(page.getByRole("button", { name: "生成日报" })).toHaveCount(1);
 	await expect.poll(tracker.getReadableSectionItemRequests).toContainEqual({
 		sectionId: "section-raw-history",
 		cursor: "raw-history-page-2",
 	});
 	await expect(tracker.getFeedRequests()).toHaveLength(0);
+});
+
+test("dashboard hides brief generation for an open natural day", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const current = makeReleaseFeedItem({
+		id: "raw-current",
+		ts: "2026-04-30T10:00:00Z",
+		tag: "raw-current",
+		title: "当前自然日动态",
+	});
+	await installDashboardBriefMocks(page, {
+		readableSectionPage: () => ({
+			sections: [
+				{
+					...makeReadableRawSection({
+						id: "raw-current",
+						date: "2026-04-30",
+						items: [current],
+					}),
+					can_generate_brief: false,
+				},
+			],
+			next_cursor: null,
+		}),
+	});
+
+	await page.goto("/");
+	await expect(page.getByText("当前自然日动态")).toBeVisible();
+	await expect(page.getByRole("button", { name: "生成日报" })).toHaveCount(0);
 });
 
 test("dashboard paginates list details independently from the readable stream", async ({

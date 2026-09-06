@@ -2159,14 +2159,16 @@ async fn execute_task(
         }
         TASK_BRIEF_GENERATE => {
             let user_id = payload_local_id(payload, "user_id")?;
-            let key_date = payload_date(payload, "key_date")?;
-            let snapshot = if let Some(key_date) = key_date {
-                ai::generate_daily_brief_snapshot_for_key_date(state, user_id.as_str(), key_date)
-                    .await?
-            } else {
-                ai::generate_daily_brief_snapshot_for_current(state, user_id.as_str()).await?
-            };
             let preferences = briefs::load_daily_brief_preferences(state, user_id.as_str()).await?;
+            let key_date = payload_date(payload, "key_date")?
+                .unwrap_or(briefs::key_date_for_now(&preferences, Utc::now())?);
+            let window = briefs::compute_daily_window_for_key_date(&preferences, key_date)?;
+            if !briefs::daily_brief_window_is_closed(&window, Utc::now()) {
+                return Err(anyhow!("daily brief window open"));
+            }
+            let snapshot =
+                ai::generate_daily_brief_snapshot_for_key_date(state, user_id.as_str(), key_date)
+                    .await?;
             Ok(json!({
                 "brief_id": snapshot.id,
                 "content_length": snapshot.content_markdown.chars().count(),
