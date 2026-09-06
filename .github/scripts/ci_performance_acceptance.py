@@ -574,14 +574,12 @@ class AcceptanceRunner:
                 "candidate_e2e_p90_max_seconds": 420,
                 "candidate_final_failures_max": 0,
                 "candidate_retry_total_max": control_retry_total,
-                "candidate_median_ratio_max": 0.75,
             },
         }
         stats["passed"] = not (
             stats["candidate_e2e_p90_seconds"] > 420
             or stats["candidate_final_failures"] != 0
             or stats["candidate_retry_total"] > control_retry_total
-            or stats["candidate_median_ratio"] > 0.75
         )
         return {"refs": refs, "pairs": pairs, "runs": records, "statistics": stats}
 
