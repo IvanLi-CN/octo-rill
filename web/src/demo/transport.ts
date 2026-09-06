@@ -36,6 +36,8 @@ import {
 } from "@/demo/fixtures";
 import { hasDemoRuntimeRequestMarker } from "@/demo/requestMarker";
 import type {
+	DashboardReadableFeedResponse,
+	FeedItem,
 	FeedReactionRefreshResponse,
 	ReleaseReactions,
 } from "@/feed/types";
@@ -56,6 +58,7 @@ const DEMO_CREATED_API_KEY_VALUE = [
 	"created",
 	"plaintext",
 ].join("_");
+const DEMO_READABLE_INITIAL_LOADING_DELAY_MS = 6_000;
 
 type DemoRuntimeAccess = {
 	getSnapshot: () => DemoSnapshot;
@@ -133,6 +136,13 @@ async function applyNetworkProfile(request: Request) {
 	}
 	const { shareState } = snapshot;
 	const pathname = new URL(request.url).pathname;
+	if (
+		shareState.networkMode === "readable-loading" &&
+		pathname === "/api/dashboard/feed"
+	) {
+		await delay(DEMO_READABLE_INITIAL_LOADING_DELAY_MS);
+		return null;
+	}
 	if (shareState.networkMode === "slow") {
 		await delay(850);
 		return null;
@@ -244,6 +254,69 @@ function findReleaseReactions(
 		(feedItem) => feedItem.kind === "release" && feedItem.id === releaseId,
 	);
 	return item?.reactions ?? emptyReleaseReactions();
+}
+
+function buildDemoReadableFeedResponse(
+	model: DemoModel,
+): DashboardReadableFeedResponse {
+	const releaseItems = model.feed.items.filter(
+		(item): item is FeedItem & { kind: "release" } => item.kind === "release",
+	);
+	const supplementalItems = model.feed.items.filter(
+		(item) => item.kind !== "release",
+	);
+
+	return {
+		sections: model.briefs.flatMap((brief) => {
+			if (!brief.content_markdown) return [];
+			const coveredReleaseIds = new Set(brief.release_ids);
+			const coveredItems = releaseItems.filter((item) =>
+				coveredReleaseIds.has(item.id),
+			);
+			return [
+				{
+					id: `brief-${brief.id}`,
+					date: brief.date,
+					kind: "brief" as const,
+					window_start: brief.window_start ?? null,
+					window_end: brief.window_end ?? null,
+					brief: {
+						id: brief.id,
+						date: brief.date,
+						window_start: brief.window_start ?? null,
+						window_end: brief.window_end ?? null,
+						effective_time_zone: brief.effective_time_zone ?? null,
+						effective_local_boundary: brief.effective_local_boundary ?? null,
+						release_count: brief.release_count,
+						release_ids: brief.release_ids,
+						preview_markdown: brief.preview_markdown ?? undefined,
+						content_markdown: brief.content_markdown,
+						covers_repo_stars: brief.covers_repo_stars ?? false,
+						covers_followers: brief.covers_followers ?? false,
+						created_at: brief.created_at,
+						updated_at: brief.updated_at ?? brief.created_at,
+					},
+					items: [],
+					supplemental_items: supplementalItems,
+					supplemental_next_cursor: null,
+					items_next_cursor: null,
+					item_count: coveredItems.length + supplementalItems.length,
+				},
+			];
+		}),
+		next_cursor: null,
+	};
+}
+
+function findDemoReadableSectionItems(model: DemoModel, sectionId: string) {
+	const section = buildDemoReadableFeedResponse(model).sections.find(
+		(item) => item.id === sectionId,
+	);
+	if (!section?.brief) return null;
+	const coveredReleaseIds = new Set(section.brief.release_ids ?? []);
+	return model.feed.items.filter(
+		(item) => item.kind === "release" && coveredReleaseIds.has(item.id),
+	);
 }
 
 function filterTasks(
@@ -1234,6 +1307,34 @@ export const demoHandlers = [
 			),
 		});
 	}),
+	http.get("/api/dashboard/feed", async ({ request }) => {
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		return json(buildDemoReadableFeedResponse(currentModel()));
+	}),
+	http.get(
+		"/api/dashboard/feed/sections/:sectionId/items",
+		async ({ params, request }) => {
+			const network = await applyNetworkProfile(request);
+			if (network) return network;
+			const items = findDemoReadableSectionItems(
+				currentModel(),
+				String(params.sectionId),
+			);
+			if (!items) {
+				return json(
+					{
+						error: {
+							code: "not_found",
+							message: "Demo readable section was not found.",
+						},
+					},
+					{ status: 404 },
+				);
+			}
+			return json({ items, next_cursor: null });
+		},
+	),
 	http.head("/api/feed", async ({ request }) => {
 		const network = await applyNetworkProfile(request);
 		if (network) return network;

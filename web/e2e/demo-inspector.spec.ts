@@ -302,6 +302,63 @@ test("scene changes reset to the target specialized control context", async ({
 	expect(new URL(page.url()).searchParams.has("d_auth")).toBe(false);
 });
 
+test("demo dashboard renders readable sections with the list action in its header", async ({
+	page,
+}) => {
+	await page.goto("/?demo=dashboard-repo-publish&d_persona=member&d_own=1", {
+		waitUntil: "domcontentloaded",
+	});
+
+	const section = page.locator(
+		'[data-readable-section-id="brief-brief-2026-07-08"]',
+	);
+	const header = section.locator('[data-readable-section-header="true"]');
+	await expect(section.locator('[data-readable-brief="true"]')).toBeVisible();
+	await expect(header.getByRole("button", { name: "列表" })).toBeVisible();
+
+	await header.getByRole("button", { name: "列表" }).click();
+	await expect(
+		section.locator('[data-feed-item-key="release:release-owner-1"]'),
+	).toBeVisible();
+});
+
+test("demo dashboard keeps its layout visible while the All list is loading", async ({
+	page,
+}) => {
+	await page.goto(
+		"/?demo=dashboard-repo-publish&d_persona=member&d_own=1&d_net=readable-loading",
+		{ waitUntil: "domcontentloaded" },
+	);
+
+	const loading = page.locator("[data-readable-loading-initial='true']");
+	await expect(page.getByRole("tab", { name: "全部" })).toBeVisible();
+	await expect(page.locator("[data-app-boot]")).toHaveCount(0);
+	await expect(loading).toBeVisible();
+	await expect(
+		loading.locator("[data-readable-loading-skeleton='true']"),
+	).toHaveCount(3);
+});
+
+test("demo All list loading clears a populated readable list", async ({
+	page,
+}) => {
+	await page.goto("/?demo=dashboard-repo-publish&d_persona=member&d_own=1", {
+		waitUntil: "domcontentloaded",
+	});
+	const briefHeading = page.getByRole("heading", { name: "今日摘要" });
+	await expect(briefHeading).toBeVisible();
+
+	await page.getByLabel("Network").selectOption("readable-loading");
+
+	const loading = page.locator("[data-readable-loading-initial='true']");
+	await expect(page.getByRole("tab", { name: "全部" })).toBeVisible();
+	await expect(loading).toBeVisible();
+	await expect(
+		loading.locator("[data-readable-loading-skeleton='true']"),
+	).toHaveCount(3);
+	await expect(briefHeading).toHaveCount(0);
+});
+
 test("demo mode skips live warm auth seed on first paint", async ({ page }) => {
 	await page.addInitScript(() => {
 		localStorage.setItem(
