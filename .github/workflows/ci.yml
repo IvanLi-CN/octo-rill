@@ -440,8 +440,11 @@ jobs:
             browser_path="$(
               find "$PLAYWRIGHT_BROWSERS_PATH" -type f \
                 \( -path '*/chrome-linux/chrome' -o -path '*/chrome-linux64/chrome' \) \
-                -perm -111 -print -quit
+                -print -quit
             )"
+            if [ -n "$browser_path" ]; then
+              chmod +x "$browser_path"
+            fi
           fi
           if [ -x "$browser_path" ]; then
             echo "Using cached Playwright browser: $browser_path"
