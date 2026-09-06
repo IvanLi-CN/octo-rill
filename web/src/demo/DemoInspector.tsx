@@ -50,6 +50,7 @@ import type {
 	DemoLandingBootState,
 	DemoLandingCase,
 	DemoLandingPasskeySupport,
+	DemoNetworkMode,
 } from "@/demo/types";
 import {
 	applyDemoShareStateInPlace,
@@ -84,8 +85,9 @@ const PERSONA_OPTIONS = [
 const NETWORK_OPTIONS = [
 	{ value: "normal", label: "Normal" },
 	{ value: "slow", label: "Slow" },
+	{ value: "readable-loading", label: "All list loading" },
 	{ value: "faulty", label: "Faulty" },
-] as const;
+] as const satisfies ReadonlyArray<{ value: DemoNetworkMode; label: string }>;
 const PUBLICATION_OPTIONS = [
 	{ value: "unpublished", label: "Unpublished" },
 	{ value: "published", label: "Published" },
@@ -528,8 +530,15 @@ export function DemoInspector(props: {
 			),
 		onPersonaChange: (personaId: "guest" | "member" | "admin") =>
 			navigateWithShareState({ personaId }, { reseed: true }),
-		onNetworkChange: (networkMode: "normal" | "slow" | "faulty") =>
-			navigateWithShareState({ networkMode }, { reseed: false }),
+		onNetworkChange: (networkMode: DemoNetworkMode) =>
+			navigateWithShareState(
+				{ networkMode },
+				{
+					reseed:
+						networkMode === "readable-loading" ||
+						snapshot.shareState.networkMode === "readable-loading",
+				},
+			),
 		onIncludeOwnReleasesChange: (includeOwnReleases: boolean) =>
 			navigateWithShareState({ includeOwnReleases }, { reseed: true }),
 		onPublicationStateChange: (publicationState: "published" | "unpublished") =>
@@ -987,7 +996,7 @@ export type DemoInspectorPanelProps = {
 	onLandingPasskeySupportChange: (support: DemoLandingPasskeySupport) => void;
 	onLandingBootStateChange: (bootState: DemoLandingBootState) => void;
 	onPersonaChange: (personaId: "guest" | "member" | "admin") => void;
-	onNetworkChange: (networkMode: "normal" | "slow" | "faulty") => void;
+	onNetworkChange: (networkMode: DemoNetworkMode) => void;
 	onIncludeOwnReleasesChange: (checked: boolean) => void;
 	onPublicationStateChange: (state: "published" | "unpublished") => void;
 	onReset: () => void;
@@ -1065,7 +1074,7 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 								id={networkSelectId}
 								value={snapshot.shareState.networkMode}
 								onValueChange={(value) =>
-									props.onNetworkChange(value as "normal" | "slow" | "faulty")
+									props.onNetworkChange(value as DemoNetworkMode)
 								}
 								options={NETWORK_OPTIONS}
 								compact={isCompact}

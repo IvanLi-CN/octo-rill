@@ -239,7 +239,9 @@ export function normalizePersonaId(
 export function normalizeNetworkMode(
 	value: string | null | undefined,
 ): DemoNetworkMode {
-	if (value === "slow" || value === "faulty") return value;
+	if (value === "slow" || value === "faulty" || value === "readable-loading") {
+		return value;
+	}
 	return "normal";
 }
 
