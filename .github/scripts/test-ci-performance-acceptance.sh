@@ -24,13 +24,14 @@ spec.loader.exec_module(module)
 
 
 class FakeGh:
-    def __init__(self, candidate_retry_count=1, candidate_failed_tests=0, candidate_test_id_offset=0):
+    def __init__(self, candidate_retry_count=1, candidate_failed_tests=0, candidate_test_id_offset=0, control_failed_tests=0):
         self.control_sha = "3" * 40
         self.candidate_sha = "2" * 40
         self.dispatch_shas = {"main": self.control_sha, "candidate": self.candidate_sha}
         self.candidate_retry_count = candidate_retry_count
         self.candidate_failed_tests = candidate_failed_tests
         self.candidate_test_id_offset = candidate_test_id_offset
+        self.control_failed_tests = control_failed_tests
         self.next_id = 1000
         self.runs = {}
         self.dispatches = []
@@ -67,6 +68,7 @@ class FakeGh:
             # GitHub workflow-run timestamps are second-resolution, unlike local dispatch time.
             started = datetime.now(timezone.utc).replace(microsecond=0)
             duration = 500 if target_sha == self.control_sha else 300 + (self.next_id % 5) * 10
+            failed_tests = self.control_failed_tests if target_sha == self.control_sha else self.candidate_failed_tests
             created = started.isoformat().replace("+00:00", "Z")
             run = {
                 "id": self.next_id,
@@ -77,13 +79,12 @@ class FakeGh:
                 "display_title": module.acceptance_run_title(nonce),
                 "run_attempt": 1,
                 "status": "completed",
-                "conclusion": "success",
+                "conclusion": "failure" if target_sha == self.control_sha and failed_tests else "success",
                 "created_at": created,
                 "run_started_at": created,
                 "updated_at": (started + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z"),
             }
             retry_count = 1 if target_sha == self.control_sha else self.candidate_retry_count
-            failed_tests = 0 if target_sha == self.control_sha else self.candidate_failed_tests
             summary = {
                 "schema_version": 1,
                 "tested_sha": target_sha,
@@ -103,6 +104,7 @@ class FakeGh:
             run, target_sha, _summary, duration = self.runs[run_id]
             jobs = [{"name": name, "conclusion": "success", "steps": []} for name in sorted(module.REQUIRED_JOBS)]
             e2e = next(job for job in jobs if job["name"] == "Frontend E2E")
+            e2e["conclusion"] = run["conclusion"]
             e2e["started_at"] = run["run_started_at"]
             e2e["completed_at"] = (module.parse_time(run["run_started_at"]) + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z")
             if target_sha == self.candidate_sha:
@@ -283,11 +285,18 @@ try:
         fake.dispatch_shas["main"],
         fake.control_sha,
         require_runtime_smoke=False,
+        allow_frontend_e2e_failure=False,
     )
 except module.AcceptanceError as error:
     assert "retried" in str(error)
 else:
     raise AssertionError("retry must be rejected")
+
+control_flaky = FakeGh(control_failed_tests=1)
+_flaky_refs, flaky_result = run_fake(control_flaky)
+assert flaky_result["statistics"]["control_final_failures"] == 10
+assert flaky_result["statistics"]["candidate_final_failures"] == 0
+assert flaky_result["statistics"]["passed"]
 
 try:
     module.validate_target_pair(

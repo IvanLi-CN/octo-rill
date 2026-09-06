@@ -20,7 +20,7 @@
 
 ## Controlled Acceptance
 
-- Ten serial control/candidate pairs are required. Every run must be successful with `run_attempt=1`, all required jobs successful, a valid `playwright-e2e-results` artifact, and 10/10 candidate Docker smoke steps successful.
+- Ten serial control/candidate pairs are required. Every run must have `run_attempt=1` and a valid `playwright-e2e-results` artifact; candidate runs and all non-E2E control jobs must be successful, while a control may record a failed Frontend E2E job so its final failures remain auditable. Candidate Docker smoke steps must succeed in all 10 pairs.
 - Acceptance statistics use the `Frontend E2E` job interval and compare deterministic test identifier sets, test totals, final failures, and retry totals between each control/candidate pair. Candidate E2E P90 is capped at 420 seconds.
 
 ## Remaining Gaps

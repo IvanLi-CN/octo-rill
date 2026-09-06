@@ -255,7 +255,13 @@ def workflow_runs(client: ApiClient, repo: str, sha: str) -> list[dict[str, Any]
     return runs
 
 
-def validate_jobs(run: dict[str, Any], jobs_payload: dict[str, Any], *, require_runtime_smoke: bool) -> list[dict[str, Any]]:
+def validate_jobs(
+    run: dict[str, Any],
+    jobs_payload: dict[str, Any],
+    *,
+    require_runtime_smoke: bool,
+    allow_frontend_e2e_failure: bool,
+) -> list[dict[str, Any]]:
     jobs = jobs_payload.get("jobs", []) if isinstance(jobs_payload, dict) else []
     if not isinstance(jobs, list) or any(not isinstance(item, dict) for item in jobs):
         raise AcceptanceError(f"run {run.get('id')} returned malformed jobs")
@@ -264,8 +270,10 @@ def validate_jobs(run: dict[str, Any], jobs_payload: dict[str, Any], *, require_
     if missing:
         raise AcceptanceError(f"run {run.get('id')} is missing required jobs: {missing}")
     failed = sorted(name for name in REQUIRED_JOBS if by_name[name].get("conclusion") != "success")
-    if failed:
-        raise AcceptanceError(f"run {run.get('id')} has unsuccessful jobs: {failed}")
+    allowed_failed = {"Frontend E2E"} if allow_frontend_e2e_failure else set()
+    unexpected_failed = [name for name in failed if name not in allowed_failed]
+    if unexpected_failed:
+        raise AcceptanceError(f"run {run.get('id')} has unsuccessful jobs: {unexpected_failed}")
     if require_runtime_smoke:
         build_steps = by_name["Build (Release)"].get("steps", [])
         smoke = next((step for step in build_steps if step.get("name") == "Run Docker release smoke"), None)
@@ -394,14 +402,23 @@ def validate_run(
     expected_target_sha: str,
     *,
     require_runtime_smoke: bool,
+    allow_frontend_e2e_failure: bool,
 ) -> dict[str, Any]:
     if run.get("event") != "workflow_dispatch" or run.get("head_sha") != expected_dispatch_sha:
         raise AcceptanceError(f"run {run.get('id')} has an unexpected event or head SHA")
     if run.get("run_attempt") != 1:
         raise AcceptanceError(f"run {run.get('id')} was retried (run_attempt must be 1)")
-    if run.get("status") != "completed" or run.get("conclusion") != "success":
+    if run.get("status") != "completed":
+        raise AcceptanceError(f"run {run.get('id')} did not complete")
+    allowed_run_failure = allow_frontend_e2e_failure and run.get("conclusion") == "failure"
+    if run.get("conclusion") != "success" and not allowed_run_failure:
         raise AcceptanceError(f"run {run.get('id')} did not complete successfully")
-    jobs = validate_jobs(run, jobs_payload, require_runtime_smoke=require_runtime_smoke)
+    jobs = validate_jobs(
+        run,
+        jobs_payload,
+        require_runtime_smoke=require_runtime_smoke,
+        allow_frontend_e2e_failure=allow_frontend_e2e_failure,
+    )
     e2e_job = next(job for job in jobs if job.get("name") == "Frontend E2E")
     return {
         "pipeline": run,
@@ -516,6 +533,7 @@ class AcceptanceRunner:
             dispatch_sha,
             target_sha,
             require_runtime_smoke=require_runtime_smoke,
+            allow_frontend_e2e_failure=role == "control",
         )
         result["acceptance_nonce"] = nonce
         result["playwright_summary"] = download_playwright_summary(
@@ -559,6 +577,7 @@ class AcceptanceRunner:
         candidate = [item["result"]["e2e_job_duration_seconds"] for item in records if item["role"] == "candidate"]
         control_retry_total = sum(item["result"]["playwright_summary"]["retry_count"] for item in records if item["role"] == "control")
         candidate_retry_total = sum(item["result"]["playwright_summary"]["retry_count"] for item in records if item["role"] == "candidate")
+        control_final_failures = sum(item["result"]["playwright_summary"]["failed_tests"] for item in records if item["role"] == "control")
         candidate_final_failures = sum(item["result"]["playwright_summary"]["failed_tests"] for item in records if item["role"] == "candidate")
         stats = {
             "control_e2e_median_seconds": median(control),
@@ -568,6 +587,7 @@ class AcceptanceRunner:
             "candidate_median_ratio": median(candidate) / median(control),
             "control_retry_total": control_retry_total,
             "candidate_retry_total": candidate_retry_total,
+            "control_final_failures": control_final_failures,
             "candidate_final_failures": candidate_final_failures,
             "passed": False,
             "thresholds": {
