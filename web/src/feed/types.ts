@@ -188,6 +188,7 @@ export type DashboardReadableSection = {
 	items_next_cursor?: string | null;
 	item_count?: number;
 	activity_count?: number;
+	can_generate_brief?: boolean;
 };
 
 export type DashboardReadableFeedResponse = {

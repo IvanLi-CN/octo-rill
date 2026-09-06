@@ -24,12 +24,21 @@ import type {
 	ReadableSectionsError,
 } from "@/feed/useDashboardReadableSections";
 import type { DashboardReleaseTarget } from "@/dashboard/routeState";
+import { cn } from "@/lib/utils";
 
 const actionClass =
-	"h-auto min-h-0 w-auto justify-end gap-1 rounded-none px-0 py-0 font-mono text-sm font-normal leading-[1.35] text-foreground/82 shadow-none hover:bg-transparent hover:text-foreground/82 focus-visible:ring-0 sm:w-full";
+	"h-auto min-h-0 w-auto justify-end gap-1 rounded-none px-0 py-0 font-mono text-sm font-normal leading-[1.35] text-foreground/82 shadow-none hover:bg-transparent hover:text-foreground/82 focus-visible:ring-0";
 
 const sectionHeaderActionSlotClass =
-	"flex w-full items-start justify-end pt-1 sm:h-8 sm:w-[152px] sm:shrink-0 sm:items-center sm:justify-end sm:pt-0";
+	"flex w-full items-start justify-end pt-1 sm:col-start-5 sm:col-end-6 sm:h-8 sm:w-[152px] sm:shrink-0 sm:items-center sm:justify-end sm:pt-0";
+const sectionHeaderClass =
+	"flex flex-col gap-2 px-1 text-sm text-muted-foreground sm:flex-row sm:items-center sm:gap-3";
+const sectionHeaderWithActionClass =
+	"flex flex-col gap-2 px-1 text-sm text-muted-foreground sm:grid sm:grid-cols-[152px_minmax(0,1fr)_auto_minmax(0,1fr)_152px] sm:items-center sm:gap-3";
+const sectionDateGroupClass =
+	"flex min-w-0 w-full flex-1 items-center gap-2 sm:w-auto sm:gap-4";
+const sectionDateGroupWithActionClass =
+	"flex min-w-0 w-full items-center gap-2 sm:col-start-2 sm:col-end-5 sm:gap-4";
 
 function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -520,6 +529,18 @@ export function FeedReadableSectionList(props: {
 						)}
 						{inList ? "日报" : "列表"}
 					</Button>
+				) : section.can_generate_brief && onGenerateBriefForDate ? (
+					<Button
+						type="button"
+						variant="ghost"
+						size="sm"
+						className={actionClass}
+						disabled={generatingDate === sectionDate}
+						onClick={() => void handleGenerateBrief(sectionDate)}
+					>
+						<Newspaper className="size-4" />
+						生成日报
+					</Button>
 				) : null;
 				return (
 					<section
@@ -530,10 +551,20 @@ export function FeedReadableSectionList(props: {
 						data-feed-brief-date={sectionDate}
 					>
 						<div
-							className="flex flex-col gap-2 px-1 text-sm text-muted-foreground sm:flex-row sm:items-center sm:gap-3"
+							className={cn(
+								sectionAction
+									? sectionHeaderWithActionClass
+									: sectionHeaderClass,
+							)}
 							data-readable-section-header="true"
 						>
-							<div className="flex min-w-0 w-full flex-1 items-center gap-2 sm:w-auto sm:gap-4">
+							<div
+								className={
+									sectionAction
+										? sectionDateGroupWithActionClass
+										: sectionDateGroupClass
+								}
+							>
 								<span className="h-px min-w-4 flex-1 bg-border/70 sm:min-w-8" />
 								<span className="font-mono text-xs">
 									{sectionDate} · {sectionCount} 条动态
@@ -639,21 +670,6 @@ export function FeedReadableSectionList(props: {
 								data-readable-detail-pagination-sentinel="true"
 								className="h-1"
 							/>
-						) : null}
-						{!brief && onGenerateBriefForDate ? (
-							<div className="flex justify-end px-1">
-								<Button
-									type="button"
-									variant="ghost"
-									size="sm"
-									className={actionClass}
-									disabled={generatingDate === sectionDate}
-									onClick={() => void handleGenerateBrief(sectionDate)}
-								>
-									<Newspaper className="size-4" />
-									生成日报
-								</Button>
-							</div>
 						) : null}
 					</section>
 				);

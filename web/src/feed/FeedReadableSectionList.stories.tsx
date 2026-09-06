@@ -72,6 +72,19 @@ const briefSection: DashboardReadableSection = {
 	],
 	items_next_cursor: null,
 	item_count: 2,
+	can_generate_brief: false,
+};
+
+const rawSection: DashboardReadableSection = {
+	id: "2026-04-29",
+	date: "2026-04-29",
+	kind: "raw",
+	brief: null,
+	items: [{ ...item, ts: "2026-04-29T10:00:00Z" }],
+	supplemental_items: [],
+	items_next_cursor: null,
+	item_count: 1,
+	can_generate_brief: true,
 };
 
 const appendFailure: ReadableSectionsError = {
@@ -193,6 +206,48 @@ function Preview(props: {
 	);
 }
 
+function RawGeneratePreview() {
+	const feedCardProps = {
+		currentViewer: null,
+		sourceTab: "all" as const,
+		currentScope: null,
+		translationInFlightKeys: new Set<string>(),
+		translationAutoRetryingKeys: new Set<string>(),
+		smartInFlightKeys: new Set<string>(),
+		smartAutoRetryingKeys: new Set<string>(),
+		registerItemRef: () => () => {},
+		selectedLaneByKey: {} as Record<string, FeedLane>,
+		onSelectLane: () => {},
+		onTranslateNow: () => {},
+		onSmartNow: () => {},
+		reactionBusyKeys: new Set<string>(),
+		reactionErrorByKey: {},
+		onToggleReaction: () => {},
+	};
+	return (
+		<div
+			className="mx-auto w-full max-w-3xl bg-card p-4 text-foreground sm:p-6"
+			data-visual-evidence-surface="true"
+		>
+			<div data-visual-evidence-target="true">
+				<FeedReadableSectionList
+					sections={[rawSection]}
+					details={{}}
+					error={null}
+					loadingInitial={false}
+					loadingMore={false}
+					hasMore={false}
+					onLoadMore={() => {}}
+					onRetry={() => {}}
+					onLoadSectionItems={() => {}}
+					feedCardProps={feedCardProps}
+					onGenerateBriefForDate={async () => {}}
+				/>
+			</div>
+		</div>
+	);
+}
+
 function LoadingErrorLoadingLoopPreview() {
 	const [phase, setPhase] = useState<"loading" | "error">("loading");
 
@@ -279,6 +334,7 @@ async function verifyListTogglePlacement(canvasElement: HTMLElement) {
 const meta = {
 	title: "Feed/FeedReadableSectionList",
 	component: Preview,
+	tags: ["autodocs"],
 	parameters: {
 		layout: "fullscreen",
 		viewport: { options: READABLE_SECTION_VIEWPORTS },
@@ -324,6 +380,64 @@ export const ListLoadsCoveredRelease: Story = {
 export const ListToggleInHeader: Story = {
 	name: "List Toggle In Header",
 	render: () => <ListToggleCoveragePreview />,
+};
+
+export const GenerateBriefInRawDateHeader: Story = {
+	render: () => <RawGeneratePreview />,
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const header = canvasElement.querySelector<HTMLElement>(
+			"[data-readable-section-header='true']",
+		);
+		if (!header) throw new Error("Expected readable section header");
+		const label = header.querySelector<HTMLElement>("span.font-mono");
+		if (!label) throw new Error("Expected readable date label");
+		await expect(
+			within(header).getByRole("button", { name: "生成日报" }),
+		).toBeVisible();
+		await expect(canvas.getByText("v2.58.3")).toBeVisible();
+		await expect(
+			canvas.queryAllByRole("button", { name: "生成日报" }),
+		).toHaveLength(1);
+		const headerRect = header.getBoundingClientRect();
+		const labelRect = label.getBoundingClientRect();
+		expect(
+			Math.abs(
+				labelRect.left +
+					labelRect.width / 2 -
+					(headerRect.left + headerRect.width / 2),
+			),
+		).toBeLessThanOrEqual(1);
+	},
+};
+
+export const GenerateBriefInRawDateHeaderMobile: Story = {
+	name: "Generate Brief In Raw Date Header Mobile",
+	globals: {
+		viewport: { value: "readableSectionMobile393", isRotated: false },
+	},
+	render: () => <RawGeneratePreview />,
+	play: async ({ canvasElement }) => {
+		const header = canvasElement.querySelector<HTMLElement>(
+			"[data-readable-section-header='true']",
+		);
+		const label = header?.querySelector<HTMLElement>("span.font-mono");
+		if (!header || !label) {
+			throw new Error("Expected mobile readable header and date label");
+		}
+		const headerRect = header.getBoundingClientRect();
+		const labelRect = label.getBoundingClientRect();
+		await expect(
+			within(header).getByRole("button", { name: "生成日报" }),
+		).toBeVisible();
+		expect(
+			Math.abs(
+				labelRect.left +
+					labelRect.width / 2 -
+					(headerRect.left + headerRect.width / 2),
+			),
+		).toBeLessThanOrEqual(1);
+	},
 };
 
 export const ListToggleStaysWithHeaderMobile: Story = {

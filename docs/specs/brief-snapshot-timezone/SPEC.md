@@ -15,6 +15,7 @@
 - 让 Dashboard 历史折叠只按 snapshot memberships 命中，不再按当前服务端 Local 或 `brief.date` 反推。
 - 提供普通用户与管理员两套日报设置入口，并补齐 Storybook 场景与视觉证据。
 - 在启动后自动排队一次历史 brief 重算任务，把 legacy / boundary-based brief 迁入“昨天自然日”快照语义。
+- 普通用户只能在对应自然日窗口关闭后看到或生成日报；服务端统一守卫手动、异步和调度生成路径。
 
 ### Non-goals
 
@@ -68,6 +69,10 @@
 - Given 历史库里存在 legacy brief
   When 应用启动并触发历史重算任务
   Then 任务会幂等地把 legacy brief 迁入 snapshot 语义，并补齐 memberships。
+
+- Given 日报在其自然日窗口尚未关闭时被错误写入，或当前自然日存在旧快照
+  When 普通用户读取 Dashboard、日报列表或日报详情
+  Then 该快照不可见；窗口关闭后重新生成才恢复可见，原始动态与管理员审计记录保持不变。
 
 ## Visual Evidence
 

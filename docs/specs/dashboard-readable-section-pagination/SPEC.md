@@ -40,9 +40,11 @@
 
 ### REQ-READABLE-SECTIONS-004
 
-- 系统 MUST 将没有日报的历史日期作为原始活动区块呈现，并在该区块进入视图时按需取得首批明细。
-- 系统 MUST 保留用户显式生成日报的入口，且不得因为滚动或进入视图自动调用日报生成。
-- covers: 无日报历史的可读性与 LLM 调用边界。
+- 系统 MUST 将没有可见日报的已结束自然日作为原始活动区块呈现，并在该区块进入视图时按需取得首批明细。
+- 系统 MUST 只在服务端判定该用户时区的自然日窗口已于 00:00 关闭时提供 `can_generate_brief=true`，当前自然日和未来日期不得提供生成入口。
+- 系统 MUST 将生成入口放在所属原始日期标题的操作槽中，且不得因为滚动或进入视图自动调用日报生成。
+- 系统 MUST 将尚未完成窗口时写入的日报快照视为不可见；窗口关闭后必须重新生成，才可恢复为普通用户日报。
+- covers: 日报可见性、无日报历史的可读性与 LLM 调用边界。
 
 ### REQ-READABLE-SECTIONS-005
 
@@ -88,7 +90,7 @@
 
 - Method: Dashboard Playwright mock 与组件 interaction test。
 - covers: `REQ-READABLE-SECTIONS-003`, `REQ-READABLE-SECTIONS-004`
-- Pass condition: 初始日报流不请求区块完整明细；点击“列表”后只请求该区块首批三十条，区块内续页不阻塞主流；无日报区块不自动生成日报。
+- Pass condition: 初始日报流不请求区块完整明细；点击“列表”后只请求该区块首批三十条，区块内续页不阻塞主流；未结束日无生成入口，已结束且无可见日报的原始区块只在日期标题操作槽显示生成入口。
 
 ### VER-READABLE-SECTIONS-004
 
@@ -121,6 +123,13 @@
   ![可读区块列表切换标题动作（窄屏）](./assets/readable-section-list-toggle-header-mobile.png)
 - `ui_demo` / All list loading：首屏可读区块请求挂起时，页面 shell、导航、Demo Inspector 与三组可读区块骨架保持可见；请求完成后由真实内容替换骨架。
   ![All list loading Demo 骨架](./assets/readable-section-list-loading-skeleton-demo.png)
+
+- `storybook_canvas` / Generate Brief In Raw Date Header：已结束且没有可见日报的原始日期区块只在标题操作槽显示“生成日报”，按钮按内容宽度排列。
+  ![原始日期标题生成入口（桌面）](./assets/readable-section-generate-brief-header-desktop.png)
+  ![原始日期标题生成入口（移动 393x852）](./assets/readable-section-generate-brief-header-mobile.png)
+- `storybook_canvas` / Complete Brief And Supplemental：已生成日报时，日报正文卡片位于所属日期标题下方；日期标签仍以整行几何中心对齐，右侧操作切换为“列表”。
+  ![已生成日报状态（桌面）](./assets/readable-section-generated-brief-desktop.png)
+  ![已生成日报状态（移动 393x852）](./assets/readable-section-generated-brief-mobile.png)
 
 ## References
 
