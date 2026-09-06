@@ -192,15 +192,23 @@ def validate_target_pair(
     repo: str,
     control_sha: str,
     candidate_sha: str,
-    dispatch_ref: str,
+    control_dispatch_ref: str,
+    candidate_dispatch_ref: str,
 ) -> dict[str, Any]:
-    if ref_name(dispatch_ref) != "main":
-        raise AcceptanceError("dispatch ref must be main")
+    control_dispatch_ref = ref_name(control_dispatch_ref)
+    candidate_dispatch_ref = ref_name(candidate_dispatch_ref)
+    if control_dispatch_ref != "main":
+        raise AcceptanceError("control dispatch ref must be main")
+    if not candidate_dispatch_ref or candidate_dispatch_ref == control_dispatch_ref:
+        raise AcceptanceError("control and candidate dispatch refs must be different")
     if control_sha == candidate_sha:
         raise AcceptanceError("control and candidate SHAs must be different")
     control_sha = validate_commit_sha(client, repo, control_sha, "control SHA")
     candidate_sha = validate_commit_sha(client, repo, candidate_sha, "candidate SHA")
-    dispatch_sha = resolve_ref(client, repo, dispatch_ref)
+    control_dispatch_sha = resolve_ref(client, repo, control_dispatch_ref)
+    candidate_dispatch_sha = resolve_ref(client, repo, candidate_dispatch_ref)
+    if candidate_dispatch_sha != candidate_sha:
+        raise AcceptanceError("candidate dispatch ref must resolve to the candidate SHA")
     comparison = client.api(f"repos/{repo}/compare/{control_sha}...{candidate_sha}")
     if not isinstance(comparison, dict) or comparison.get("status") != "ahead":
         raise AcceptanceError("candidate SHA must be a strict descendant of control")
@@ -211,8 +219,10 @@ def validate_target_pair(
     return {
         "control_sha": control_sha,
         "candidate_sha": candidate_sha,
-        "dispatch_ref": ref_name(dispatch_ref),
-        "dispatch_sha": dispatch_sha,
+        "control_dispatch_ref": control_dispatch_ref,
+        "control_dispatch_sha": control_dispatch_sha,
+        "candidate_dispatch_ref": candidate_dispatch_ref,
+        "candidate_dispatch_sha": candidate_dispatch_sha,
     }
 
 
@@ -438,11 +448,12 @@ class AcceptanceRunner:
         role: str,
         require_runtime_smoke: bool,
     ) -> dict[str, Any]:
-        dispatch_sha = refs["dispatch_sha"]
-        current_dispatch_sha = resolve_ref(self.client, self.repo, refs["dispatch_ref"])
+        dispatch_ref = refs[f"{role}_dispatch_ref"]
+        dispatch_sha = refs[f"{role}_dispatch_sha"]
+        current_dispatch_sha = resolve_ref(self.client, self.repo, dispatch_ref)
         if current_dispatch_sha != dispatch_sha:
             raise AcceptanceError(
-                f"dispatch ref {refs['dispatch_ref']!r} moved from {dispatch_sha} to {current_dispatch_sha}"
+                f"dispatch ref {dispatch_ref!r} moved from {dispatch_sha} to {current_dispatch_sha}"
             )
         active = [
             run
@@ -460,7 +471,7 @@ class AcceptanceRunner:
             f"repos/{self.repo}/actions/workflows/{self.workflow}/dispatches",
             method="POST",
             payload={
-                "ref": refs["dispatch_ref"],
+                "ref": dispatch_ref,
                 "inputs": {
                     ACCEPTANCE_INPUT: "true",
                     ACCEPTANCE_TARGET_SHA_INPUT: target_sha,
@@ -578,7 +589,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""))
     parser.add_argument("--control-sha", required=True)
     parser.add_argument("--candidate-sha", required=True)
-    parser.add_argument("--dispatch-ref", default="main")
+    parser.add_argument("--control-dispatch-ref", default="main")
+    parser.add_argument("--candidate-dispatch-ref", required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--poll-interval", type=float, default=15)
     parser.add_argument("--timeout-seconds", type=float, default=2100)
@@ -597,7 +609,8 @@ def main() -> int:
             args.repo,
             args.control_sha,
             args.candidate_sha,
-            args.dispatch_ref,
+            args.control_dispatch_ref,
+            args.candidate_dispatch_ref,
         )
         refs["changed_paths"] = validate_allowed_delta(client, args.repo, refs["control_sha"], refs["candidate_sha"])
         result = AcceptanceRunner(

@@ -27,7 +27,7 @@ class FakeGh:
     def __init__(self, candidate_retry_count=1, candidate_failed_tests=0, candidate_test_id_offset=0):
         self.control_sha = "1" * 40
         self.candidate_sha = "2" * 40
-        self.dispatch_sha = "3" * 40
+        self.dispatch_shas = {"main": "3" * 40, "candidate": self.candidate_sha}
         self.candidate_retry_count = candidate_retry_count
         self.candidate_failed_tests = candidate_failed_tests
         self.candidate_test_id_offset = candidate_test_id_offset
@@ -36,8 +36,9 @@ class FakeGh:
         self.dispatches = []
 
     def api(self, endpoint, *, method="GET", payload=None):
-        if endpoint.endswith("git/ref/heads/main"):
-            return {"object": {"type": "commit", "sha": self.dispatch_sha}}
+        if "/git/ref/heads/" in endpoint:
+            ref = endpoint.rsplit("/", 1)[1]
+            return {"object": {"type": "commit", "sha": self.dispatch_shas[ref]}}
         if "/git/commits/" in endpoint:
             sha = endpoint.rsplit("/", 1)[1]
             assert sha in {self.control_sha, self.candidate_sha}
@@ -50,16 +51,18 @@ class FakeGh:
                 "files": [{"filename": path} for path in sorted(module.ALLOWED_CHANGED_PATHS)],
             }
         if endpoint.endswith("/dispatches") and method == "POST":
-            assert payload["ref"] == "main"
+            dispatch_ref = payload["ref"]
+            assert dispatch_ref in self.dispatch_shas
+            dispatch_sha = self.dispatch_shas[dispatch_ref]
             inputs = payload["inputs"]
             assert inputs[module.ACCEPTANCE_INPUT] == "true"
             target_sha = inputs[module.ACCEPTANCE_TARGET_SHA_INPUT]
             nonce = inputs[module.ACCEPTANCE_NONCE_INPUT]
             assert target_sha in {self.control_sha, self.candidate_sha}
             assert nonce
-            self.dispatches.append(target_sha)
+            self.dispatches.append((dispatch_ref, target_sha))
             if getattr(self, "move_dispatch_after_dispatch", False):
-                self.dispatch_sha = "4" * 40
+                self.dispatch_shas[getattr(self, "move_dispatch_ref", "main")] = "4" * 40
             self.next_id += 1
             # GitHub workflow-run timestamps are second-resolution, unlike local dispatch time.
             started = datetime.now(timezone.utc).replace(microsecond=0)
@@ -69,8 +72,8 @@ class FakeGh:
                 "id": self.next_id,
                 "name": "CI Pipeline",
                 "event": "workflow_dispatch",
-                "head_branch": "main",
-                "head_sha": self.dispatch_sha,
+                "head_branch": dispatch_ref,
+                "head_sha": dispatch_sha,
                 "display_title": module.acceptance_run_title(nonce),
                 "run_attempt": 1,
                 "status": "completed",
@@ -146,6 +149,7 @@ def run_fake(fake):
         fake.control_sha,
         fake.candidate_sha,
         "main",
+        "candidate",
     )
     refs["changed_paths"] = module.validate_allowed_delta(fake, "IvanLi-CN/octo-rill", refs["control_sha"], refs["candidate_sha"])
     return refs, module.AcceptanceRunner(fake, "IvanLi-CN/octo-rill", poll_interval=0, timeout_seconds=1).run(refs)
@@ -153,9 +157,15 @@ def run_fake(fake):
 
 fake = FakeGh()
 refs, result = run_fake(fake)
-expected_order = [fake.control_sha, fake.candidate_sha, fake.candidate_sha, fake.control_sha] * 5
+expected_order = [
+    ("main", fake.control_sha),
+    ("candidate", fake.candidate_sha),
+    ("candidate", fake.candidate_sha),
+    ("main", fake.control_sha),
+] * 5
 assert fake.dispatches == expected_order, fake.dispatches
-assert refs["dispatch_sha"] == fake.dispatch_sha
+assert refs["control_dispatch_sha"] == fake.dispatch_shas["main"]
+assert refs["candidate_dispatch_sha"] == fake.dispatch_shas["candidate"]
 assert len(result["runs"]) == 20
 assert result["statistics"]["candidate_e2e_p90_seconds"] <= 420
 assert result["statistics"]["candidate_final_failures"] == 0
@@ -190,13 +200,30 @@ moving_refs = module.validate_target_pair(
     moving_dispatch.control_sha,
     moving_dispatch.candidate_sha,
     "main",
+    "candidate",
 )
 try:
     module.AcceptanceRunner(moving_dispatch, "IvanLi-CN/octo-rill", poll_interval=0, timeout_seconds=1).run(moving_refs)
 except module.AcceptanceError as error:
-    assert "dispatcher SHA" in str(error)
+    assert "moved" in str(error)
 else:
     raise AssertionError("dispatcher SHA movement must fail the acceptance")
+
+mismatched_candidate_ref = FakeGh()
+mismatched_candidate_ref.dispatch_shas["candidate"] = "5" * 40
+try:
+    module.validate_target_pair(
+        mismatched_candidate_ref,
+        "IvanLi-CN/octo-rill",
+        mismatched_candidate_ref.control_sha,
+        mismatched_candidate_ref.candidate_sha,
+        "main",
+        "candidate",
+    )
+except module.AcceptanceError as error:
+    assert "candidate dispatch ref" in str(error)
+else:
+    raise AssertionError("candidate workflow ref must resolve to the candidate SHA")
 
 try:
     module.validate_playwright_summary({
@@ -237,7 +264,7 @@ try:
     module.validate_run(
         retry,
         {"jobs": []},
-        fake.dispatch_sha,
+        fake.dispatch_shas["main"],
         fake.control_sha,
         require_runtime_smoke=False,
     )
@@ -253,6 +280,7 @@ try:
         fake.control_sha,
         fake.control_sha,
         "main",
+        "candidate",
     )
 except module.AcceptanceError as error:
     assert "different" in str(error)
