@@ -79,7 +79,7 @@ let demoEventSourceFactory: DemoEventSourceFactory | null = null;
 let demoWorker: ReturnType<DemoRuntimeDependencies["setupWorker"]> | null =
 	null;
 let workerStartPromise: Promise<void> | null = null;
-const DEMO_WORKER_START_TIMEOUT_MS = 4_000;
+const DEMO_WORKER_START_TIMEOUT_MS = 15_000;
 const DEMO_WORKER_RELOAD_KEY = "octo-rill.demo-worker-reload";
 let pendingDemoRouteSyncHref: string | null = null;
 
@@ -129,7 +129,9 @@ function modelAffectingShareStateChanged(
 		current.sceneId !== next.sceneId ||
 		current.personaId !== next.personaId ||
 		current.includeOwnReleases !== next.includeOwnReleases ||
-		current.publicationState !== next.publicationState
+		current.publicationState !== next.publicationState ||
+		current.networkMode === "readable-loading" ||
+		next.networkMode === "readable-loading"
 	);
 }
 
