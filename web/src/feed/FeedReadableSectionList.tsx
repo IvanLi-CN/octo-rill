@@ -26,7 +26,10 @@ import type {
 import type { DashboardReleaseTarget } from "@/dashboard/routeState";
 
 const actionClass =
-	"h-auto min-h-0 w-auto justify-end gap-1 rounded-none px-0 py-0 font-mono text-sm font-normal leading-[1.35] text-foreground/82 shadow-none hover:bg-transparent hover:text-foreground/82 focus-visible:ring-0";
+	"h-auto min-h-0 w-auto justify-end gap-1 rounded-none px-0 py-0 font-mono text-sm font-normal leading-[1.35] text-foreground/82 shadow-none hover:bg-transparent hover:text-foreground/82 focus-visible:ring-0 sm:w-full";
+
+const sectionHeaderActionSlotClass =
+	"flex w-full items-start justify-end pt-1 sm:h-8 sm:w-[152px] sm:shrink-0 sm:items-center sm:justify-end sm:pt-0";
 
 function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -430,10 +433,37 @@ export function FeedReadableSectionList(props: {
 	if (loadingInitial && sections.length === 0) {
 		return (
 			<div
-				className="space-y-3"
+				className="space-y-4"
 				data-readable-loading-initial="true"
 				aria-busy="true"
-			/>
+				aria-live="polite"
+			>
+				<span className="sr-only">动态加载中</span>
+				{[0, 1, 2].map((index) => (
+					<section
+						key={index}
+						className="space-y-3 sm:space-y-4"
+						data-readable-loading-skeleton="true"
+					>
+						<div className="flex items-center gap-2 px-1 sm:gap-4">
+							<span className="h-px min-w-4 flex-1 bg-border/70 sm:min-w-8" />
+							<span className="h-3 w-36 animate-pulse rounded-sm bg-muted/70" />
+							<span className="h-px min-w-4 flex-1 bg-border/70 sm:min-w-8" />
+						</div>
+						<div className="overflow-hidden rounded-[22px] bg-card/58 shadow-sm ring-1 ring-inset ring-border/60">
+							<div className="flex items-center justify-between gap-3 border-b border-dashed border-border/55 px-4 py-3 sm:px-6">
+								<span className="h-4 w-16 animate-pulse rounded-sm bg-muted/70" />
+								<span className="size-5 animate-pulse rounded-full bg-muted/60" />
+							</div>
+							<div className="space-y-3 px-4 py-4 sm:px-6">
+								<span className="block h-4 w-11/12 animate-pulse rounded-sm bg-muted/60" />
+								<span className="block h-4 w-4/5 animate-pulse rounded-sm bg-muted/60" />
+								<span className="block h-4 w-3/5 animate-pulse rounded-sm bg-muted/60" />
+							</div>
+						</div>
+					</section>
+				))}
+			</div>
 		);
 	}
 	if (error?.phase === "initial" && sections.length === 0) {
@@ -475,6 +505,22 @@ export function FeedReadableSectionList(props: {
 				const detailLoading = detail?.loading ?? false;
 				const supplemental = section.supplemental_items ?? [];
 				const shownItems = mergeUnique([...rawItems, ...supplemental]);
+				const sectionAction = brief ? (
+					<Button
+						type="button"
+						variant="ghost"
+						size="sm"
+						className={actionClass}
+						onClick={() => toggleList(section.id)}
+					>
+						{inList ? (
+							<Newspaper className="size-4" />
+						) : (
+							<List className="size-4" />
+						)}
+						{inList ? "日报" : "列表"}
+					</Button>
+				) : null;
 				return (
 					<section
 						key={section.id}
@@ -484,14 +530,24 @@ export function FeedReadableSectionList(props: {
 						data-feed-brief-date={sectionDate}
 					>
 						<div
-							className="flex items-center gap-3 px-1 text-sm text-muted-foreground"
+							className="flex flex-col gap-2 px-1 text-sm text-muted-foreground sm:flex-row sm:items-center sm:gap-3"
 							data-readable-section-header="true"
 						>
-							<span className="h-px flex-1 bg-border/70" />
-							<span className="font-mono text-xs">
-								{sectionDate} · {sectionCount} 条动态
-							</span>
-							<span className="h-px flex-1 bg-border/70" />
+							<div className="flex min-w-0 w-full flex-1 items-center gap-2 sm:w-auto sm:gap-4">
+								<span className="h-px min-w-4 flex-1 bg-border/70 sm:min-w-8" />
+								<span className="font-mono text-xs">
+									{sectionDate} · {sectionCount} 条动态
+								</span>
+								<span className="h-px min-w-4 flex-1 bg-border/70 sm:min-w-8" />
+							</div>
+							{sectionAction ? (
+								<div
+									className={sectionHeaderActionSlotClass}
+									data-readable-section-action-slot="true"
+								>
+									{sectionAction}
+								</div>
+							) : null}
 						</div>
 						{brief && !inList ? (
 							<div
@@ -541,24 +597,6 @@ export function FeedReadableSectionList(props: {
 										onInternalReleaseClick={onOpenReleaseFromBrief}
 									/>
 								</div>
-							</div>
-						) : null}
-						{brief ? (
-							<div className="flex justify-end px-1">
-								<Button
-									type="button"
-									variant="ghost"
-									size="sm"
-									className={actionClass}
-									onClick={() => toggleList(section.id)}
-								>
-									{inList ? (
-										<Newspaper className="size-4" />
-									) : (
-										<List className="size-4" />
-									)}
-									{inList ? "日报" : "列表"}
-								</Button>
 							</div>
 						) : null}
 						{(inList || !brief) && detailLoading ? (

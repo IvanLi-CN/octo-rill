@@ -64,6 +64,12 @@
 - `/api/feed`、`/api/briefs` 与其现有消费者 MUST 保持兼容。
 - covers: 性能边界与兼容性。
 
+### REQ-READABLE-SECTIONS-008
+
+- 根页 `全部` tab 在首屏可读区块请求尚未完成时 MUST 保持页面骨架与区块阅读布局可见。
+- 加载中的可读区块 MUST 以稳定数量的骨架区组占位，并在请求完成后由真实区块原位替换；不得先渲染空白内容区或将加载反馈移到日期标题之外。
+- covers: 首屏布局稳定性与可读区块加载反馈。
+
 ## Verification
 
 ### VER-READABLE-SECTIONS-001
@@ -96,6 +102,12 @@
 - covers: `REQ-READABLE-SECTIONS-002`, `REQ-READABLE-SECTIONS-005`
 - Pass condition: 完整日报、补充动态、列表按需加载、三点波浪加载、错误重试和居中末页在桌面与窄屏均无重叠或溢出。
 
+### VER-READABLE-SECTIONS-006
+
+- Method: Dashboard Playwright loading-state fixture 与 Storybook interaction test。
+- covers: `REQ-READABLE-SECTIONS-008`
+- Pass condition: 首屏请求挂起时页面布局、日期标题和三组可读区块骨架可见；请求完成后真实区块替换骨架，且无空白跳变。
+
 ## Related ADRs
 
 - [ADR 0002: Dashboard 可读区块分页](../../adr/0002-dashboard-readable-section-pagination.md)
@@ -104,6 +116,11 @@
 
 - `storybook_canvas` / 主区块分页 Chip：`加载更多`、无文字三点波浪加载和错误重试在同一 24px 槽位内连续切换；加载与错误状态等高，错误文案完整可读，循环回到可再次触发的 `加载更多`。
   ![主区块分页 Chip 三态过渡](./assets/pagination-three-state-loop.gif)
+- `storybook_canvas` / 可读区块列表切换：`列表` 始终属于日期标题动作槽，桌面保持右对齐，`393x852` 窄屏在日报卡片之前换行呈现；切换后显示对应明细，并切换为 `日报`。
+  ![可读区块列表切换标题动作（桌面）](./assets/readable-section-list-toggle-header-desktop.png)
+  ![可读区块列表切换标题动作（窄屏）](./assets/readable-section-list-toggle-header-mobile.png)
+- `ui_demo` / All list loading：首屏可读区块请求挂起时，页面 shell、导航、Demo Inspector 与三组可读区块骨架保持可见；请求完成后由真实内容替换骨架。
+  ![All list loading Demo 骨架](./assets/readable-section-list-loading-skeleton-demo.png)
 
 ## References
 

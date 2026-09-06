@@ -45,7 +45,7 @@ export type DemoSceneId =
 
 export type DemoPersonaId = "guest" | "member" | "admin";
 
-export type DemoNetworkMode = "normal" | "slow" | "faulty";
+export type DemoNetworkMode = "normal" | "slow" | "faulty" | "readable-loading";
 
 export type DemoPublicationState = "published" | "unpublished";
 

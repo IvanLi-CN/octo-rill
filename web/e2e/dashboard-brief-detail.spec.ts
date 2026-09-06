@@ -628,7 +628,14 @@ test("dashboard fetches covered raw releases only after switching a brief to lis
 	await expect(page.getByText("Covered release appears in list")).toHaveCount(
 		0,
 	);
-	await page.getByRole("button", { name: "列表" }).click();
+	const section = page.locator(
+		'[data-readable-section-id="section-brief-list"]',
+	);
+	const listToggle = section
+		.locator("[data-readable-section-header='true']")
+		.getByRole("button", { name: "列表" });
+	await expect(listToggle).toBeVisible();
+	await listToggle.click();
 	await expect(page.getByText("Covered release appears in list")).toBeVisible();
 	await expect
 		.poll(tracker.getReadableSectionItemRequests)
@@ -761,6 +768,40 @@ test("dashboard shows the centered wave capsule while section details load", asy
 	).toHaveCount(3);
 	await tracker.releaseReadableSectionItems("section-brief-loading");
 	await expect(loading).toHaveCount(0);
+});
+
+test("dashboard keeps its layout visible while readable sections load initially", async ({
+	page,
+}) => {
+	await page.addInitScript(() => window.localStorage.clear());
+	const tracker = await installDashboardBriefMocks(page, {
+		deferReadableSectionPageCursors: [null],
+		readableSectionPage: () => ({
+			sections: [
+				makeReadableBriefSection({
+					id: "brief-initial-loading",
+					date: "2026-04-30",
+					content: "## 初始加载完成后的日报",
+				}),
+			],
+			next_cursor: null,
+		}),
+	});
+
+	await page.goto("/");
+	await expect.poll(tracker.getReadableSectionRequests).toContain(null);
+
+	const loading = page.locator("[data-readable-loading-initial='true']");
+	await expect(page.getByRole("tab", { name: "全部" })).toBeVisible();
+	await expect(page.locator("[data-app-boot]")).toHaveCount(0);
+	await expect(loading).toBeVisible();
+	await expect(
+		loading.locator("[data-readable-loading-skeleton='true']"),
+	).toHaveCount(3);
+
+	tracker.releaseReadableSectionPage(null);
+	await expect(loading).toHaveCount(0);
+	await expect(page.getByText("初始加载完成后的日报")).toBeVisible();
 });
 
 test("dashboard shows the centered wave capsule while a readable page loads", async ({

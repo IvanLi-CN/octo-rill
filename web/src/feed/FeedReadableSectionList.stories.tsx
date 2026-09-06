@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, waitFor, within } from "storybook/test";
 import { useEffect, useState } from "react";
+import { INITIAL_VIEWPORTS } from "storybook/viewport";
 
 import { FeedReadableSectionList } from "@/feed/FeedReadableSectionList";
 import type {
@@ -92,7 +93,20 @@ const feedbackLoopPhases: FeedbackLoopPhase[] = [
 	"error",
 ];
 
+const READABLE_SECTION_VIEWPORTS = {
+	...INITIAL_VIEWPORTS,
+	readableSectionMobile393: {
+		name: "Readable section mobile 393x852",
+		styles: {
+			height: "852px",
+			width: "393px",
+		},
+		type: "mobile",
+	},
+} as const;
+
 function Preview(props: {
+	initialLoading?: boolean;
 	loading?: boolean;
 	mainLoading?: boolean;
 	mainHasMore?: boolean;
@@ -102,6 +116,7 @@ function Preview(props: {
 	onLoadMore?: () => void;
 }) {
 	const {
+		initialLoading = false,
 		loading = false,
 		mainLoading = false,
 		mainHasMore = mainLoading,
@@ -152,10 +167,10 @@ function Preview(props: {
 				data-visual-evidence-target="true"
 			>
 				<FeedReadableSectionList
-					sections={[briefSection]}
+					sections={initialLoading ? [] : [briefSection]}
 					details={details}
 					error={error}
-					loadingInitial={false}
+					loadingInitial={initialLoading}
 					loadingMore={mainLoading}
 					hasMore={mainHasMore}
 					autoLoadMore={autoLoadMore}
@@ -232,10 +247,42 @@ function LoadMoreLoadingErrorLoopPreview() {
 	);
 }
 
+function ListToggleCoveragePreview() {
+	return (
+		<div
+			data-visual-evidence-surface="true"
+			data-readable-section-list-toggle-evidence-surface="true"
+			className="bg-background p-8 text-foreground"
+		>
+			<div
+				data-visual-evidence-target="true"
+				data-readable-section-list-toggle-evidence-target="true"
+			>
+				<Preview withDetails />
+			</div>
+		</div>
+	);
+}
+
+async function verifyListTogglePlacement(canvasElement: HTMLElement) {
+	const canvas = within(canvasElement);
+	const header = canvasElement.querySelector<HTMLElement>(
+		"[data-readable-section-header='true']",
+	);
+	if (!header) throw new Error("Expected readable section header");
+	const listToggle = within(header).getByRole("button", { name: "列表" });
+	await expect(listToggle).toBeVisible();
+	await userEvent.click(listToggle);
+	await expect(canvas.getByText("v2.58.3")).toBeVisible();
+}
+
 const meta = {
 	title: "Feed/FeedReadableSectionList",
 	component: Preview,
-	parameters: { layout: "fullscreen" },
+	parameters: {
+		layout: "fullscreen",
+		viewport: { options: READABLE_SECTION_VIEWPORTS },
+	},
 } satisfies Meta<typeof FeedReadableSectionList>;
 
 export default meta;
@@ -253,13 +300,38 @@ export const CompleteBriefAndSupplemental: Story = {
 	},
 };
 
-export const ListLoadsCoveredRelease: Story = {
-	render: () => <Preview withDetails />,
+export const InitialLoadingSkeleton: Story = {
+	tags: ["readable-initial-loading"],
+	render: () => <Preview initialLoading />,
 	play: async ({ canvasElement }) => {
-		const canvas = within(canvasElement);
-		await userEvent.click(canvas.getByRole("button", { name: "列表" }));
-		await expect(canvas.getByText("v2.58.3")).toBeVisible();
+		const loading = canvasElement.querySelector<HTMLElement>(
+			"[data-readable-loading-initial='true']",
+		);
+		if (!loading) throw new Error("Expected readable initial loading state");
+		await expect(loading).toBeVisible();
+		await expect(
+			loading.querySelectorAll("[data-readable-loading-skeleton='true']")
+				.length,
+		).toBe(3);
 	},
+};
+
+export const ListLoadsCoveredRelease: Story = {
+	render: () => <ListToggleCoveragePreview />,
+	play: ({ canvasElement }) => verifyListTogglePlacement(canvasElement),
+};
+
+export const ListToggleInHeader: Story = {
+	name: "List Toggle In Header",
+	render: () => <ListToggleCoveragePreview />,
+};
+
+export const ListToggleStaysWithHeaderMobile: Story = {
+	name: "List Toggle Stays With Header Mobile",
+	globals: {
+		viewport: { value: "readableSectionMobile393", isRotated: false },
+	},
+	render: () => <ListToggleCoveragePreview />,
 };
 
 export const ListLoadingWaveCapsule: Story = {
