@@ -119,6 +119,8 @@
 - `storybook_canvas` / 可读区块列表切换：`列表` 始终属于日期标题动作槽，桌面保持右对齐，`393x852` 窄屏在日报卡片之前换行呈现；切换后显示对应明细，并切换为 `日报`。
   ![可读区块列表切换标题动作（桌面）](./assets/readable-section-list-toggle-header-desktop.png)
   ![可读区块列表切换标题动作（窄屏）](./assets/readable-section-list-toggle-header-mobile.png)
+- `ui_demo` / All list loading：首屏可读区块请求挂起时，页面 shell、导航、Demo Inspector 与三组可读区块骨架保持可见；请求完成后由真实内容替换骨架。
+  ![All list loading Demo 骨架](./assets/readable-section-list-loading-skeleton-demo.png)
 
 ## References
 
