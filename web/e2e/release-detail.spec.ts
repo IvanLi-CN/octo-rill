@@ -1290,24 +1290,34 @@ test("detail translate failure keeps the last ready translation visible and fall
 	});
 
 	await page.goto("/?tab=briefs&release=123");
-	await page.getByRole("tab", { name: "翻译" }).click();
+	const detailDialog = page.getByRole("dialog", { name: "Release 详情" });
+	await expect(detailDialog).toBeVisible({ timeout: 15_000 });
+	const translationTab = detailDialog.getByRole("tab", { name: "翻译" });
+	await expect(translationTab).toBeEnabled({ timeout: 15_000 });
+	await translationTab.click();
 	await expect(
-		page.getByRole("heading", { name: "发布说明 123" }),
+		detailDialog.getByRole("heading", { name: "发布说明 123" }),
 	).toBeVisible();
 	await expect(
-		page.getByText("这是 release 123 的中文详情摘要。", { exact: true }),
+		detailDialog.getByText("这是 release 123 的中文详情摘要。", {
+			exact: true,
+		}),
 	).toBeVisible();
 
-	await page.getByRole("tab", { name: "翻译" }).click();
+	await translationTab.click();
 
 	await expect(
-		page.getByRole("heading", { name: "发布说明 123" }),
+		detailDialog.getByRole("heading", { name: "发布说明 123" }),
 	).toBeVisible();
 	await expect(
-		page.getByText("这是 release 123 的中文详情摘要。", { exact: true }),
+		detailDialog.getByText("这是 release 123 的中文详情摘要。", {
+			exact: true,
+		}),
 	).toBeVisible();
-	await expect(page.getByRole("tab", { name: "原文" })).toBeVisible();
-	await expect(page.getByRole("button", { name: "查看原文" })).toHaveCount(0);
+	await expect(detailDialog.getByRole("tab", { name: "原文" })).toBeVisible();
+	await expect(
+		detailDialog.getByRole("button", { name: "查看原文" }),
+	).toHaveCount(0);
 	await expect(page.getByText("翻译失败", { exact: true })).toBeVisible();
 	await expect(
 		page.getByText("Markdown 结构校验失败", { exact: true }),
@@ -1907,7 +1917,7 @@ test("feed smart localized retryable error shows neutral auto-retry waiting stat
 				error_detail: "runtime_lease_expired",
 			},
 		},
-		smartResolveDelayMs: 3000,
+		smartResolveDelayMs: 750,
 	});
 
 	await page.goto("/?tab=releases");
@@ -2208,7 +2218,7 @@ test("feed smart trigger failures coalesce and locate the card", async ({
 				error_detail: "AI returned 403 Forbidden: Chat upstream returned 403",
 			},
 		},
-		smartResolveDelayMs: 1000,
+		smartResolveDelayMs: 500,
 	});
 
 	await page.goto("/?tab=releases");
@@ -2360,7 +2370,7 @@ test("feed smart retry button spins and disables while request is in flight", as
 		smartResolveStatuses: {
 			[releaseId]: "ready",
 		},
-		smartResolveDelayMs: 3000,
+		smartResolveDelayMs: 750,
 	});
 
 	await page.goto("/?tab=releases");
