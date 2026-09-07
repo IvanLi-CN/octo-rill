@@ -13,7 +13,7 @@
   - `starred_repos` 恒纳入；
   - owned repo 仅当 `users.include_own_releases=1` 时纳入；
   - `users.is_disabled=1` 或 `users.paused_at IS NOT NULL` 的用户整池排除。
-- system release 调度改为“每 10 分钟预算窗口内最多挑选一批仓库”，默认预算字段为 `repo_refresh_system_budget_per_window`，并与 Admin Jobs 共用同一 runtime config。10 分钟是调度预算窗口，不是全池刷新完成 SLA。
+- system release 调度改为“每 `N` 分钟预算窗口内最多挑选一批仓库”，其中 `N` 唯一取自 `sync_auto_fetch_interval_minutes`（1-120 分钟），预算字段为 `repo_refresh_system_budget_per_window`，并与 Admin Jobs 共用同一 runtime config。`N` 是调度预算窗口，不是全池刷新完成 SLA。
 - 排序合同固定为：
   - `watcher_user_count DESC`
   - `watcher_repo_total_sum ASC`
@@ -30,7 +30,7 @@
 ### Non-goals
 
 - 不为长尾 repo 追加 24h/72h 的硬保底 SLA；只通过软目标频段和 aging 提升调度优先级。
-- 不把交互式 `sync.access_refresh`、手动 sync、公开 release 访问 demand 并入这 10 分钟 system budget。
+- 不把交互式 `sync.access_refresh`、手动 sync、公开 release 访问 demand 并入这 `N` 分钟 system budget。
 - Dashboard 全量同步的动态 Release 新鲜度只调整交互 demand 的复用窗口，不消费 system budget，也不改变系统调度闭环。
 - 不把仓库老化信息塞回 `/admin` 主仪表盘；治理信息只在新的 `/admin/repos` 独立页展示。
 - 不在治理页面读取链路里直接请求 GitHub；页面只读本地快照与共享队列状态。
@@ -91,17 +91,19 @@
 
 ### Budget 调度
 
-- system window 固定为 10 分钟；其语义是“本窗口最多选中多少个 repo 发起 system release 尝试”，不是“10 分钟内刷新完整个仓库池”。
+- system window 长度为当前周期冻结的 `N`；其语义是“本窗口最多选中多少个 repo 发起 system release 尝试”，不是“在 `N` 分钟内刷新完整个仓库池”。
+- 保存 `N` 时持久化严格大于保存时刻的下一个 UTC epoch 对齐边界；边界前不入队、不补跑。活动 cycle 继续使用启动时冻结的 `N+B`，新 cycle 才采用最新配置。
 - 每次 scheduler window 先用 set-based SQL 重建 active pool 快照，并按固定排序写入 `priority_rank`。
 - 软目标频段定义为：
   - `target_window = ceil(priority_rank / budget_per_window)`
   - `target_interval_minutes = target_window * 10`
-- 目标频段是按当前排序和预算推导的软目标窗口，用于解释 repo 在 system 预算下大约应多久被再次尝试；它不承诺 GitHub API 一定成功，也不代表全池必须在 10 分钟内完成。
+- 目标频段是按当前排序和预算推导的软目标窗口，用于解释 repo 在 system 预算下大约应多久被再次尝试；`target_interval_minutes = target_window * N`。它不承诺 GitHub API 一定成功，也不代表全池必须在 `N` 分钟内完成。
 - system 选仓顺序固定为：
   - 未有 system success 的 repo 优先；
   - 其后按 `system_age / target_interval` 形成的 `urgency_score` 倒序；
   - 再按 `priority_rank ASC`
 - 每轮最多挑选 `repo_refresh_system_budget_per_window` 个 repo 挂入 shared repo release queue。
+- 同一 cycle/window 在 SQLite writer 事务中至多认领一次；重叠 scheduler 只记录 `skipped`，不并发执行第二轮。
 - 交互式/手动 demand 不消费该 budget；如果某 repo 已被本轮 system 选中，而对应 release work item 后续被交互式需求复用或提升，work item 到达 `succeeded` 或 `failed` 终态时仍必须结算本轮 system attempt。
 - 失败的 system attempt 记录 `system_last_attempt_at/status/error`，但不更新 `system_last_success_at`；成功的 attempt 同时更新 `system_last_success_at` 和实际刷新成功时间。
 
@@ -117,6 +119,7 @@
 ### 全量 cycle
 
 - system full-cycle 在开始时冻结成员集。
+- cycle 同时冻结 `window_minutes`、`window_budget` 与最近一次选择窗口索引；历史任务、cycle、member 和 watcher 保存实际参数，不随当前配置回写。
 - cycle member 的完成条件是“本轮 system 选中后，对应 release work item 已处理到终态”，不是“必须成功刷新”。终态包括 `succeeded` 与 `failed`。
 - cycle 完成条件只看冻结成员：
   - 新入池 repo 进入下一轮；
@@ -146,7 +149,7 @@
   - 上次完成全量更新时间
 - 压力值定义为：
   - `sum(max(0, min(overdue_ratio, 4) - 1)) / budget_per_window`
-  - 语义是“按当前预算清掉超期积压还需多少个 10 分钟窗口”
+  - 语义是“按当前预算清掉超期积压还需多少个 `N` 分钟窗口”
 - 活动图：
   - 每格代表一个 repo
   - 顺序按治理优先级
@@ -174,8 +177,8 @@
   Then `watcher_user_count` 只把同一用户算一次，`watcher_repo_total_sum` 按关系来源重复累加。
 
 - Given `repo_refresh_system_budget_per_window=1000`
-  When 任一 10 分钟 system scheduler window 触发
-  Then 附着到 shared repo release queue 的 repo 数量不超过 1000。
+  When 任一 `N` 分钟 system scheduler window 触发
+  Then 附着到 shared repo release queue 的 repo 数量不超过 `repo_refresh_system_budget_per_window`。
 
 - Given 某 repo 仅被交互刷新而未被本轮 system 选中
   When 查看治理页
@@ -246,7 +249,6 @@
   sensitive_exclusion: `N/A`
   submission_gate: `approved`
   evidence_note: 证明暂停账号页在无演示控件或覆盖层的浅色桌面稳定 mock 场景中，复用应用画布，恢复、返回首页、退出登录、主题控件与页脚可同时清晰呈现。
-  PR: include
   ![暂停账号恢复浅色桌面证据](./assets/paused-account-light-desktop.png)
 
 - source_type: `ui_demo`
@@ -260,7 +262,6 @@
   sensitive_exclusion: `N/A`
   submission_gate: `approved`
   evidence_note: 证明暂停账号页在精确 `393x852` CSS px 浅色移动视口中没有 Demo 控件覆盖页脚，按钮、状态、主题控件与版本信息均清晰可读。
-  PR: include
   ![暂停账号恢复浅色移动证据](./assets/paused-account-light-mobile.png)
 
 - source_type: `ui_demo`
@@ -274,7 +275,6 @@
   sensitive_exclusion: `N/A`
   submission_gate: `approved`
   evidence_note: 证明暂停账号页在无演示控件或覆盖层的深色桌面稳定 mock 场景中，深色画布来自应用主题而非页面独立背景，恢复操作、主题控件与页脚均清晰可用。
-  PR: include
   ![暂停账号恢复深色桌面证据](./assets/paused-account-dark-desktop.png)
 
 - source_type: `ui_demo`
@@ -288,19 +288,20 @@
   sensitive_exclusion: `N/A`
   submission_gate: `approved`
   evidence_note: 证明暂停账号页在精确 `393x852` CSS px 深色移动视口中没有 Demo 控件覆盖页脚，恢复操作、主题控件与版本信息均清晰可读。
-  PR: include
   ![暂停账号恢复深色移动证据](./assets/paused-account-dark-mobile.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `admin-admin-repos--evidence-desktop`
-  state: `desktop governance`
+  state: `desktop governance with dynamic subscription window`
   target_program: `mock-only`
   capture_scope: `browser-viewport`
-  requested_viewport: `1440x1200`
-  viewport_strategy: `playwright-viewport`
+  requested_viewport: `1440x900`
+  viewport_strategy: `storybook-viewport`
+  margin_policy: `trim_only`
+  evidence_surface: `page`
   sensitive_exclusion: `N/A`
-  submission_gate: `owner-approved`
-  evidence_note: 证明 `/admin/repos` 在桌面视口下同时展示有效关注池 summary、可访问活动图图例、单跳预算 CTA，以及使用状态下拉、目标窗口与迫切值范围筛选的仓库明细。
+  submission_gate: `approved`
+  evidence_note: 证明 `/admin/repos` 在严格 1440x900 Storybook 视口中展示冻结的实际窗口与预算、动态 W 标签、活动图及治理摘要。
   ![仓库治理桌面证据](./assets/admin-repos-desktop.png)
 
 - source_type: `storybook_canvas`
@@ -329,8 +330,16 @@
 
 - source_type: `storybook_canvas`
   story_id_or_title: `admin-admin-jobs--subscription-sync-settings-auto-open`
-  state: `subscription sync settings dialog auto-open from governance cta`
-  evidence_note: 证明仓库刷新 budget 的唯一编辑入口已经收口到任务中心“订阅同步设置”弹窗，并支持从治理页 CTA 单跳自动展开。
+  state: `subscription sync settings unique editor, 1440x900 viewport`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `1440x900`
+  viewport_strategy: `storybook-viewport`
+  margin_policy: `trim_only`
+  evidence_surface: `page`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  evidence_note: 证明仓库刷新 budget 的唯一编辑入口已经收口到任务中心“订阅同步设置”弹窗，并在严格 1440x900 Storybook 视口内展示同步间隔、待生效边界、Release 并发和预算。
   ![订阅同步设置预算弹窗证据](./assets/subscription-sync-settings-budget-dialog.png)
 
 - source_type: `storybook_canvas`
@@ -346,7 +355,6 @@
   submission_gate: `pending-owner-approval`
   evidence_binding_sha: `958e4eb68ccc6d7c0ee9f0bc5f0e193416f3c6fd`
   evidence_note: 证明正常 1440x900 浏览器视口中的订阅同步设置弹窗将标题、Dashboard 新鲜度与链路用时帮助触发器收紧为同一节奏，并展示三档策略、1–30 分钟边界及压力不跳过仓库的约束。
-  PR: include
   ![订阅同步新鲜度策略桌面证据](./assets/subscription-sync-freshness-help-desktop.png)
 
 - source_type: `storybook_canvas`
@@ -362,7 +370,6 @@
   submission_gate: `pending-owner-approval`
   evidence_binding_sha: `958e4eb68ccc6d7c0ee9f0bc5f0e193416f3c6fd`
   evidence_note: 证明正常 393x852 浏览器视口中，弹窗以内部滚动保留标题、关闭按钮、紧凑帮助触发器与完整策略 Tooltip，且浮层未发生裁切或横向溢出。
-  PR: include
   ![订阅同步新鲜度策略移动证据](./assets/subscription-sync-freshness-help-mobile.png)
 
 - source_type: `storybook_canvas`
@@ -378,7 +385,6 @@
   submission_gate: `pending-owner-approval`
   evidence_binding_sha: `68026dd100b38992e5e3480c77e6e4d41377a387`
   evidence_note: 证明正常 1440x900 浏览器视口首屏中，管理员任务详情的统计卡片按三列排列，并展示 balanced 策略、压力档位、窗口范围、本轮抓取与缓存复用统计。
-  PR: include
   ![Dashboard Release 新鲜度桌面证据](./assets/dashboard-release-freshness-desktop.png)
 
 - source_type: `storybook_canvas`
@@ -394,7 +400,6 @@
   submission_gate: `pending-owner-approval`
   evidence_binding_sha: `68026dd100b38992e5e3480c77e6e4d41377a387`
   evidence_note: 证明正常 393x852 CSS px 移动浏览器视口首屏中，统计卡片保持单列可读，并可继续滚动查看 Release 新鲜度审计区。
-  PR: include
   ![Dashboard Release 新鲜度移动证据](./assets/dashboard-release-freshness-mobile.png)
 
 ## 关系 / Supersede
@@ -405,6 +410,10 @@
 - related:
   - [subscription-sync](../subscription-sync/SPEC.md)
   - [admin-panel-user-management](../admin-panel-user-management/SPEC.md)
+
+## Related ADRs
+
+- [ADR 0005: Unify Subscription and Governance Windows](../../adr/0005-subscription-governance-window.md)
 
 ## 参考
 

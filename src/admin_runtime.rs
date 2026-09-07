@@ -1,7 +1,7 @@
 use std::env;
 
 use anyhow::{Context, Result};
-use chrono::{NaiveTime, Utc};
+use chrono::{DateTime, NaiveTime, Utc};
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 
@@ -94,6 +94,16 @@ fn parse_daily_brief_schedule_local_time(raw: &str, config: &AppConfig) -> Naive
 
 pub fn normalize_sync_auto_fetch_interval_minutes(value: i64) -> i64 {
     value.clamp(1, 120)
+}
+
+pub fn next_sync_auto_fetch_effective_at(
+    now: DateTime<Utc>,
+    interval_minutes: i64,
+) -> DateTime<Utc> {
+    let interval_seconds = normalize_sync_auto_fetch_interval_minutes(interval_minutes) * 60;
+    let next_bucket = now.timestamp().div_euclid(interval_seconds) + 1;
+    DateTime::from_timestamp(next_bucket * interval_seconds, 0)
+        .expect("normalized interval boundary must be a valid timestamp")
 }
 
 pub fn normalize_retry_recent_failures_interval_minutes(value: i64) -> i64 {
@@ -490,7 +500,9 @@ pub async fn update_sync_auto_fetch_interval_minutes(
     interval_minutes: i64,
 ) -> Result<i64> {
     let interval_minutes = normalize_sync_auto_fetch_interval_minutes(interval_minutes);
-    let now = Utc::now().to_rfc3339();
+    let now_dt = Utc::now();
+    let now = now_dt.to_rfc3339();
+    let effective_at = next_sync_auto_fetch_effective_at(now_dt, interval_minutes).to_rfc3339();
     sqlx::query(
         r#"
         INSERT INTO admin_runtime_settings (
@@ -499,24 +511,56 @@ pub async fn update_sync_auto_fetch_interval_minutes(
           translation_general_worker_concurrency,
           translation_dedicated_worker_concurrency,
           sync_auto_fetch_interval_minutes,
+          sync_auto_fetch_effective_at,
           created_at,
           updated_at
         )
-        VALUES (1, 1, ?, ?, ?, ?, ?)
+        VALUES (1, 1, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           sync_auto_fetch_interval_minutes = excluded.sync_auto_fetch_interval_minutes,
+          sync_auto_fetch_effective_at = excluded.sync_auto_fetch_effective_at,
           updated_at = excluded.updated_at
         "#,
     )
     .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
     .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
     .bind(interval_minutes)
+    .bind(effective_at.as_str())
     .bind(now.as_str())
     .bind(now.as_str())
     .execute(pool)
     .await?;
 
     load_sync_auto_fetch_interval_minutes(pool).await
+}
+
+pub async fn load_sync_auto_fetch_effective_at(pool: &SqlitePool) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT sync_auto_fetch_effective_at
+        FROM admin_runtime_settings
+        WHERE id = 1
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?
+    .flatten())
+}
+
+pub async fn clear_sync_auto_fetch_effective_at(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE admin_runtime_settings
+        SET sync_auto_fetch_effective_at = NULL,
+            updated_at = ?
+        WHERE id = 1
+        "#,
+    )
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn load_retry_recent_failures_interval_minutes(pool: &SqlitePool) -> Result<i64> {
@@ -952,6 +996,7 @@ async fn fetch_runtime_settings(pool: &SqlitePool) -> Result<Option<AdminRuntime
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
     use std::net::SocketAddr;
     use std::sync::{Mutex, OnceLock};
 
@@ -981,6 +1026,20 @@ mod tests {
         unsafe {
             std::env::remove_var("AI_MODEL_CONTEXT_LIMIT");
         }
+    }
+
+    #[test]
+    fn subscription_sync_effective_boundary_is_strictly_after_save_time() {
+        let saved_at = Utc
+            .with_ymd_and_hms(2026, 9, 7, 10, 7, 12)
+            .single()
+            .expect("valid save time");
+
+        assert_eq!(
+            next_sync_auto_fetch_effective_at(saved_at, 30).to_rfc3339(),
+            "2026-09-07T10:30:00+00:00"
+        );
+        assert!(next_sync_auto_fetch_effective_at(saved_at, 30) > saved_at);
     }
 
     #[allow(clippy::await_holding_lock)]

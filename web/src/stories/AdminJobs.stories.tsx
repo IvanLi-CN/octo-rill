@@ -1793,6 +1793,7 @@ function AdminJobsPreview({
 		};
 		let syncRuntimeConfig = {
 			sync_auto_fetch_interval_minutes: 10,
+			sync_auto_fetch_effective_at: "2026-02-26T02:30:00Z",
 			retry_recent_failures_interval_minutes: 10,
 			repo_release_worker_concurrency: 12,
 			repo_refresh_system_budget_per_window: 1000,
@@ -3000,7 +3001,10 @@ export const SubscriptionSyncWorkflow: Story = {
 		await expect(
 			canvas.getByRole("slider", { name: "Release 抓取并发" }),
 		).toHaveAttribute("aria-valuenow", "12");
-		await expect(canvas.getByLabelText("10 分钟系统预算")).toHaveValue(1000);
+		await expect(canvas.getByLabelText("每 10 分钟系统预算")).toHaveValue(1000);
+		await expect(
+			canvas.getByRole("slider", { name: "订阅同步间隔（分钟）" }),
+		).toHaveAttribute("aria-valuenow", "10");
 		await expect(
 			canvas.getByRole("button", { name: "将 Release 抓取并发设为 16" }),
 		).toBeVisible();
@@ -3169,7 +3173,7 @@ export const ScheduledTaskIntervalSettings: Story = {
 		docs: {
 			description: {
 				story:
-					"直接展示定时任务间隔设置面板，只覆盖订阅同步间隔与失败数据重试默认 10 分钟。",
+					"直接展示定时任务间隔设置面板；订阅同步间隔在这里以只读摘要呈现，失败数据重试保持独立。",
 			},
 		},
 	},
@@ -3181,8 +3185,10 @@ export const ScheduledTaskIntervalSettings: Story = {
 		await expect(
 			canvas.getByRole("slider", { name: "失败数据重试间隔（分钟）" }),
 		).toHaveAttribute("aria-valuenow", "10");
+		await expect(canvas.getByText("订阅同步间隔")).toBeVisible();
+		await expect(canvas.getByText("打开订阅同步设置")).toBeVisible();
 		expect(canvas.queryByLabelText("Release 抓取并发输入")).toBeNull();
-		expect(canvas.queryByLabelText("10 分钟系统预算")).toBeNull();
+		expect(canvas.queryByLabelText("系统预算")).toBeNull();
 		expect(canvas.queryByText("最近三次链路用时")).toBeNull();
 	},
 };
@@ -3208,7 +3214,7 @@ export const TaskIntervalSettingsCleanDialog: Story = {
 			await canvas.findByRole("dialog", { name: "任务间隔设置" }),
 		).toBeVisible();
 		expect(canvas.queryByText("Release 抓取并发")).toBeNull();
-		expect(canvas.queryByText("10 分钟系统预算")).toBeNull();
+		expect(canvas.queryByText("系统预算")).toBeNull();
 		expect(canvas.queryByText("最近三次链路用时")).toBeNull();
 	},
 };
@@ -3233,7 +3239,10 @@ export const SubscriptionSyncSettingsAutoOpen: Story = {
 		await expect(
 			await canvas.findByRole("dialog", { name: "订阅同步设置" }),
 		).toBeVisible();
-		await expect(canvas.getByText("10 分钟系统预算")).toBeVisible();
+		await expect(canvas.getByText("每 10 分钟系统预算")).toBeVisible();
+		await expect(
+			canvas.getByRole("slider", { name: "订阅同步间隔（分钟）" }),
+		).toBeVisible();
 		await expect(canvas.getByText("最近三次链路用时")).toBeVisible();
 		const latestProfile = canvas.getByRole("button", { name: "最新" });
 		await userEvent.click(latestProfile);

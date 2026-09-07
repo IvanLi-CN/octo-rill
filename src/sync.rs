@@ -68,7 +68,6 @@ const NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE: usize = 100;
 const STARRED_RECENT_WINDOW_SIZE: usize = 50;
 const STARRED_WATERMARK_KEY: &str = "starred_sync_watermark";
 const STARRED_FULL_SYNC_KEY: &str = "starred_full_sync_at";
-const REPO_REFRESH_SYSTEM_WINDOW_MINUTES: i64 = 10;
 const REPO_REFRESH_URGENCY_CAP: f64 = 4.0;
 const REPO_REFRESH_GOVERNANCE_REBUILD_CHUNK_SIZE: usize = 500;
 const REPO_REFRESH_GOVERNANCE_RETENTION_BATCH_SIZE: i64 = 500;
@@ -212,6 +211,15 @@ pub struct SyncSubscriptionReleaseSummary {
 }
 
 #[derive(Debug, Serialize, Default, Clone)]
+pub struct SyncSubscriptionGovernanceSummary {
+    pub window_minutes: i64,
+    pub window_budget: i64,
+    pub cycle_id: Option<String>,
+    pub selection_window_index: Option<i64>,
+    pub selected_repos: usize,
+}
+
+#[derive(Debug, Serialize, Default, Clone)]
 pub struct SyncSubscriptionSocialSummary {
     pub total_users: usize,
     pub succeeded_users: usize,
@@ -239,6 +247,8 @@ pub struct SyncSubscriptionsResult {
     pub notifications: SyncSubscriptionNotificationsSummary,
     pub releases_written: usize,
     pub critical_events: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance: Option<SyncSubscriptionGovernanceSummary>,
 }
 
 pub fn skipped_subscription_result(_schedule_key: &str, skip_reason: &str) -> Value {
@@ -251,6 +261,7 @@ pub fn skipped_subscription_result(_schedule_key: &str, skip_reason: &str) -> Va
         "notifications": SyncSubscriptionNotificationsSummary::default(),
         "releases_written": 0,
         "critical_events": 0,
+        "governance": null,
     })
 }
 
@@ -4955,6 +4966,15 @@ pub async fn sync_subscriptions(
         });
 
     let context = SubscriptionRunContext::new(state, task_id).await?;
+    if let Some(source_task_id) = payload
+        .get("retry_source_task_id")
+        .and_then(Value::as_str)
+        .filter(|_| {
+            payload.get("retry_scope").and_then(Value::as_str) == Some("repo_release_watchers")
+        })
+    {
+        return retry_subscription_release_watchers(&context, source_task_id).await;
+    }
     context
         .log(
             "info",
@@ -5027,7 +5047,8 @@ pub async fn sync_subscriptions(
     )
     .await?;
 
-    let (release_summary, releases_written) = run_release_phase(&context, repos).await?;
+    let (release_summary, releases_written, governance_summary) =
+        run_release_phase(&context, repos).await?;
     let new_release_ids = load_new_release_ids_for_task(state, task_id).await?;
     if !new_release_ids.is_empty() && state.config.ai.is_some() {
         for user in &successful_users {
@@ -5132,6 +5153,7 @@ pub async fn sync_subscriptions(
             notifications: SyncSubscriptionNotificationsSummary::default(),
             releases_written,
             critical_events: context.critical_events.load(AtomicOrdering::Relaxed),
+            governance: Some(governance_summary.clone()),
         });
     }
 
@@ -5176,6 +5198,7 @@ pub async fn sync_subscriptions(
             notifications: SyncSubscriptionNotificationsSummary::default(),
             releases_written,
             critical_events: context.critical_events.load(AtomicOrdering::Relaxed),
+            governance: Some(governance_summary.clone()),
         });
     }
 
@@ -5210,6 +5233,7 @@ pub async fn sync_subscriptions(
         notifications: notifications_summary,
         releases_written,
         critical_events: context.critical_events.load(AtomicOrdering::Relaxed),
+        governance: Some(governance_summary),
     };
 
     jobs::append_task_event(
@@ -5235,6 +5259,158 @@ pub async fn sync_subscriptions(
         )
         .await?;
 
+    Ok(result)
+}
+
+async fn retry_subscription_release_watchers(
+    context: &SubscriptionRunContext,
+    source_task_id: &str,
+) -> Result<SyncSubscriptionsResult> {
+    #[derive(Debug, sqlx::FromRow)]
+    struct RetryReleaseWatcherRow {
+        work_item_id: String,
+        repo_id: i64,
+    }
+
+    let now = Utc::now();
+    let now_rfc3339 = now.to_rfc3339();
+    let deadline_at = repo_release_deadline_at(now, RepoReleaseOrigin::System);
+    let rows = context
+        .state
+        .sqlite_writer
+        .write("subscription_retry_release_watchers", |_| async {
+            let mut tx = context
+                .state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin subscription retry release tx")?;
+            let rows = sqlx::query_as::<_, RetryReleaseWatcherRow>(
+                r#"
+                SELECT rw.work_item_id, wi.repo_id
+                FROM repo_release_watchers rw
+                JOIN repo_release_work_items wi ON wi.id = rw.work_item_id
+                WHERE rw.task_id = ?
+                  AND rw.status != 'succeeded'
+                ORDER BY rw.id ASC
+                "#,
+            )
+            .bind(source_task_id)
+            .fetch_all(&mut *tx)
+            .await
+            .context("load subscription retry release watchers")?;
+
+            for row in &rows {
+                sqlx::query(
+                    r#"
+                    UPDATE repo_release_work_items
+                    SET status = ?,
+                        error_text = NULL,
+                        started_at = NULL,
+                        finished_at = NULL,
+                        deadline_at = ?,
+                        updated_at = ?
+                    WHERE id = ? AND status != ?
+                    "#,
+                )
+                .bind(jobs::STATUS_QUEUED)
+                .bind(deadline_at.as_str())
+                .bind(now_rfc3339.as_str())
+                .bind(row.work_item_id.as_str())
+                .bind(jobs::STATUS_RUNNING)
+                .execute(&mut *tx)
+                .await
+                .context("requeue subscription retry release work item")?;
+
+                upsert_repo_release_watcher(
+                    &mut tx,
+                    RepoReleaseWatcherUpsert {
+                        work_item_id: row.work_item_id.as_str(),
+                        task_id: context.task_id.as_str(),
+                        user_id: None,
+                        origin: RepoReleaseOrigin::System,
+                        reason: "subscription_retry",
+                        is_new_repo: false,
+                        reused_fresh: false,
+                        freshness_window_minutes: None,
+                        freshness_decision: None,
+                        freshness_assessment_json: None,
+                        status: "pending",
+                        error_text: None,
+                        now_rfc3339: now_rfc3339.as_str(),
+                    },
+                )
+                .await?;
+            }
+
+            tx.commit()
+                .await
+                .context("commit subscription retry release tx")?;
+            Ok::<_, anyhow::Error>(rows)
+        })
+        .await?;
+
+    let work_item_ids = rows
+        .iter()
+        .map(|row| row.work_item_id.clone())
+        .collect::<Vec<_>>();
+    let attached_repos = rows
+        .iter()
+        .map(|row| row.repo_id)
+        .collect::<HashSet<_>>()
+        .len();
+    context
+        .log(
+            "info",
+            "release",
+            "release_retry_attached",
+            "subscription retry reattached original release watcher scope",
+            json!({
+                "source_task_id": source_task_id,
+                "repos": attached_repos,
+                "watchers": rows.len(),
+                "selection": "original_task_watchers",
+            }),
+        )
+        .await?;
+
+    let waited = wait_for_release_demand(
+        context.state.as_ref(),
+        Some(context.task_id.as_str()),
+        &work_item_ids,
+        Some(attached_repos),
+    )
+    .await?;
+    let result = SyncSubscriptionsResult {
+        skipped: false,
+        skip_reason: None,
+        star: SyncSubscriptionStarSummary::default(),
+        release: SyncSubscriptionReleaseSummary {
+            total_repos: attached_repos,
+            succeeded_repos: attached_repos.saturating_sub(waited.failed),
+            failed_repos: waited.failed,
+            candidate_failures: waited.candidate_failures,
+            fetched_count: waited.fetched_count,
+            inserted_count: waited.inserted_count,
+            updated_count: waited.updated_count,
+            unchanged_count: waited.unchanged_count,
+            pages_fetched: waited.pages_fetched,
+        },
+        social: SyncSubscriptionSocialSummary::default(),
+        notifications: SyncSubscriptionNotificationsSummary::default(),
+        releases_written: waited.inserted_count + waited.updated_count,
+        critical_events: context.critical_events.load(AtomicOrdering::Relaxed),
+        governance: None,
+    };
+    context
+        .log(
+            "info",
+            "scheduler",
+            "run_completed",
+            "subscription watcher retry completed",
+            serde_json::to_value(&result).unwrap_or_else(|_| json!({"ok": true})),
+        )
+        .await?;
     Ok(result)
 }
 
@@ -5786,9 +5962,9 @@ async fn hydrate_repo_refresh_candidates(
     Ok(candidates)
 }
 
-fn current_repo_refresh_window_index(now: DateTime<Utc>) -> i64 {
+fn current_repo_refresh_window_index(now: DateTime<Utc>, window_minutes: i64) -> i64 {
     now.timestamp()
-        .div_euclid(REPO_REFRESH_SYSTEM_WINDOW_MINUTES * 60)
+        .div_euclid(admin_runtime::normalize_sync_auto_fetch_interval_minutes(window_minutes) * 60)
 }
 
 async fn upsert_repo_refresh_governance_snapshot(
@@ -5796,10 +5972,12 @@ async fn upsert_repo_refresh_governance_snapshot(
     candidate: &RepoRefreshCandidate,
     priority_rank: i64,
     budget: i64,
+    window_minutes: i64,
     now_rfc3339: &str,
 ) -> Result<()> {
     let target_window = ((priority_rank - 1) / budget) + 1;
-    let target_interval_minutes = target_window * REPO_REFRESH_SYSTEM_WINDOW_MINUTES;
+    let target_interval_minutes =
+        target_window * admin_runtime::normalize_sync_auto_fetch_interval_minutes(window_minutes);
     let target_interval_minutes_real = (target_interval_minutes.max(1)) as f64;
 
     sqlx::query(
@@ -5887,8 +6065,24 @@ async fn upsert_repo_refresh_governance_snapshot(
           cached_stargazer_count = excluded.cached_stargazer_count,
           cached_stargazer_count_updated_at = excluded.cached_stargazer_count_updated_at,
           priority_rank = excluded.priority_rank,
-          target_window = excluded.target_window,
-          target_interval_minutes = excluded.target_interval_minutes,
+          target_window = CASE
+            WHEN EXISTS (
+              SELECT 1
+              FROM repo_refresh_governance_cycles cycles
+              WHERE cycles.id = repo_refresh_governance_snapshots.active_cycle_id
+                AND cycles.status = 'active'
+            ) THEN repo_refresh_governance_snapshots.target_window
+            ELSE excluded.target_window
+          END,
+          target_interval_minutes = CASE
+            WHEN EXISTS (
+              SELECT 1
+              FROM repo_refresh_governance_cycles cycles
+              WHERE cycles.id = repo_refresh_governance_snapshots.active_cycle_id
+                AND cycles.status = 'active'
+            ) THEN repo_refresh_governance_snapshots.target_interval_minutes
+            ELSE excluded.target_interval_minutes
+          END,
           urgency_score = excluded.urgency_score,
           urgency_bucket = excluded.urgency_bucket,
           updated_at = excluded.updated_at
@@ -6351,11 +6545,12 @@ async fn rebuild_repo_refresh_governance_snapshots(
     state: &AppState,
     candidates: &[RepoRefreshCandidate],
     budget_per_window: i64,
+    window_minutes: i64,
     now: DateTime<Utc>,
 ) -> Result<RepoRefreshGovernanceRebuildStats> {
     let now_rfc3339 = now.to_rfc3339();
     let budget = admin_runtime::normalize_repo_refresh_system_budget_per_window(budget_per_window);
-    let now_window_index = current_repo_refresh_window_index(now);
+    let now_window_index = current_repo_refresh_window_index(now, window_minutes);
     let started_at = Instant::now();
     let mut stats = RepoRefreshGovernanceRebuildStats {
         candidate_repos: candidates.len(),
@@ -6433,6 +6628,7 @@ async fn rebuild_repo_refresh_governance_snapshots(
                             candidate,
                             priority_rank,
                             budget,
+                            window_minutes,
                             now_rfc3339.as_str(),
                         )
                         .await?;
@@ -6741,14 +6937,32 @@ async fn rebuild_repo_refresh_governance_snapshots(
     Ok(stats)
 }
 
+#[derive(Debug, Clone)]
+struct RepoRefreshCycleState {
+    id: String,
+    window_budget: i64,
+    window_minutes: i64,
+}
+
+#[derive(Debug)]
+struct RepoRefreshSelectionResult {
+    demand_repos: Vec<ReleaseDemandRepo>,
+    selected_repos: usize,
+    cycle_id: String,
+    window_budget: i64,
+    window_minutes: i64,
+    selection_window_index: i64,
+}
+
 async fn ensure_active_repo_refresh_cycle(
     state: &AppState,
     budget_per_window: i64,
+    window_minutes: i64,
     now: DateTime<Utc>,
-) -> Result<String> {
-    let existing = sqlx::query_scalar::<_, String>(
+) -> Result<RepoRefreshCycleState> {
+    let existing = sqlx::query(
         r#"
-        SELECT id
+        SELECT id, window_budget, window_minutes
         FROM repo_refresh_governance_cycles
         WHERE status = 'active'
         ORDER BY started_at DESC
@@ -6759,12 +6973,19 @@ async fn ensure_active_repo_refresh_cycle(
     .await
     .context("failed to load active repo refresh cycle")?;
 
-    if let Some(existing) = existing {
-        return Ok(existing);
+    if let Some(row) = existing {
+        return Ok(RepoRefreshCycleState {
+            id: row.get("id"),
+            window_budget: row.get("window_budget"),
+            window_minutes: row.get("window_minutes"),
+        });
     }
 
     let cycle_id = local_id::generate_local_id();
     let now_rfc3339 = now.to_rfc3339();
+    let window_minutes = admin_runtime::normalize_sync_auto_fetch_interval_minutes(window_minutes);
+    let window_budget =
+        admin_runtime::normalize_repo_refresh_system_budget_per_window(budget_per_window);
     let frozen_repo_rows = sqlx::query_as::<_, RepoRefreshSelectionRow>(
         r#"
         SELECT repo_id, repo_full_name, target_interval_minutes, priority_rank, urgency_score
@@ -6791,19 +7012,21 @@ async fn ensure_active_repo_refresh_cycle(
                   id,
                   status,
                   window_budget,
+                  window_minutes,
                   frozen_repo_count,
                   completed_repo_count,
                   window_index_started_at,
                   started_at,
                   updated_at
                 )
-                VALUES (?, 'active', ?, ?, 0, ?, ?, ?)
+                VALUES (?, 'active', ?, ?, ?, 0, ?, ?, ?)
                 "#,
             )
             .bind(cycle_id.as_str())
-            .bind(budget_per_window)
+            .bind(window_budget)
+            .bind(window_minutes)
             .bind(i64::try_from(frozen_repo_rows.len()).unwrap_or(i64::MAX))
-            .bind(current_repo_refresh_window_index(now))
+            .bind(current_repo_refresh_window_index(now, window_minutes))
             .bind(now_rfc3339.as_str())
             .bind(now_rfc3339.as_str())
             .execute(&mut *tx)
@@ -6863,61 +7086,25 @@ async fn ensure_active_repo_refresh_cycle(
         })
         .await?;
 
-    Ok(cycle_id)
+    Ok(RepoRefreshCycleState {
+        id: cycle_id,
+        window_budget,
+        window_minutes,
+    })
 }
 
 async fn select_budgeted_system_release_repos(
     state: &AppState,
     budget_per_window: i64,
+    window_minutes: i64,
     now: DateTime<Utc>,
-) -> Result<Vec<ReleaseDemandRepo>> {
-    let cycle_id = ensure_active_repo_refresh_cycle(state, budget_per_window, now).await?;
+) -> Result<RepoRefreshSelectionResult> {
+    let cycle =
+        ensure_active_repo_refresh_cycle(state, budget_per_window, window_minutes, now).await?;
     let now_rfc3339 = now.to_rfc3339();
-    let now_window_index = current_repo_refresh_window_index(now);
-
-    let rows = sqlx::query_as::<_, RepoRefreshSelectionRow>(
-        r#"
-        SELECT
-          snapshots.repo_id,
-          snapshots.repo_full_name,
-          snapshots.target_interval_minutes,
-          snapshots.priority_rank,
-          CASE
-            WHEN snapshots.system_last_success_at IS NULL THEN ?
-            ELSE MIN(
-              ?,
-              CAST(
-                (julianday(?) - julianday(snapshots.system_last_success_at)) * 24.0 * 60.0
-                / CAST(MAX(snapshots.target_interval_minutes, 1) AS REAL)
-              AS REAL)
-            )
-          END AS urgency_score
-        FROM repo_refresh_governance_snapshots snapshots
-        JOIN repo_refresh_governance_cycle_members members
-          ON members.cycle_id = ?
-         AND members.repo_id = snapshots.repo_id
-        WHERE snapshots.active_cycle_id = ?
-          AND snapshots.active_cycle_completed = 0
-          AND members.completed_at IS NULL
-        ORDER BY
-          CASE WHEN snapshots.system_last_success_at IS NULL THEN 0 ELSE 1 END ASC,
-          urgency_score DESC,
-          snapshots.priority_rank ASC,
-          snapshots.repo_id ASC
-        LIMIT ?
-        "#,
-    )
-    .bind(REPO_REFRESH_URGENCY_CAP)
-    .bind(REPO_REFRESH_URGENCY_CAP)
-    .bind(now_rfc3339.as_str())
-    .bind(cycle_id.as_str())
-    .bind(cycle_id.as_str())
-    .bind(budget_per_window)
-    .fetch_all(&state.pool)
-    .await
-    .context("failed to select budgeted system release repos")?;
-
-    state
+    let now_window_index = current_repo_refresh_window_index(now, cycle.window_minutes);
+    let cycle_id = cycle.id.clone();
+    let selected_rows = state
         .sqlite_writer
         .write("repo_refresh_selection_mark", |_| async {
             let mut tx = state
@@ -6925,6 +7112,63 @@ async fn select_budgeted_system_release_repos(
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo refresh selection mark tx")?;
+            let last_selection_window_index = sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT last_selection_window_index FROM repo_refresh_governance_cycles WHERE id = ? AND status = 'active' LIMIT 1",
+            )
+            .bind(cycle_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await
+            .context("load repo refresh selection window")?
+            .flatten();
+
+            if last_selection_window_index == Some(now_window_index) {
+                tx.commit()
+                    .await
+                    .context("commit unchanged repo refresh selection tx")?;
+                return Ok::<Vec<RepoRefreshSelectionRow>, anyhow::Error>(Vec::new());
+            }
+
+            let rows = sqlx::query_as::<_, RepoRefreshSelectionRow>(
+                r#"
+                SELECT
+                  snapshots.repo_id,
+                  snapshots.repo_full_name,
+                  snapshots.target_interval_minutes,
+                  snapshots.priority_rank,
+                  CASE
+                    WHEN snapshots.system_last_success_at IS NULL THEN ?
+                    ELSE MIN(
+                      ?,
+                      CAST(
+                        (julianday(?) - julianday(snapshots.system_last_success_at)) * 24.0 * 60.0
+                        / CAST(MAX(snapshots.target_interval_minutes, 1) AS REAL)
+                      AS REAL)
+                    )
+                  END AS urgency_score
+                FROM repo_refresh_governance_snapshots snapshots
+                JOIN repo_refresh_governance_cycle_members members
+                  ON members.cycle_id = ?
+                 AND members.repo_id = snapshots.repo_id
+                WHERE snapshots.active_cycle_id = ?
+                  AND snapshots.active_cycle_completed = 0
+                  AND members.completed_at IS NULL
+                ORDER BY
+                  CASE WHEN snapshots.system_last_success_at IS NULL THEN 0 ELSE 1 END ASC,
+                  urgency_score DESC,
+                  snapshots.priority_rank ASC,
+                  snapshots.repo_id ASC
+                LIMIT ?
+                "#,
+            )
+            .bind(REPO_REFRESH_URGENCY_CAP)
+            .bind(REPO_REFRESH_URGENCY_CAP)
+            .bind(now_rfc3339.as_str())
+            .bind(cycle_id.as_str())
+            .bind(cycle_id.as_str())
+            .bind(cycle.window_budget)
+            .fetch_all(&mut *tx)
+            .await
+            .context("failed to select budgeted system release repos")?;
 
             for row in &rows {
                 let urgency_bucket = if row.urgency_score >= REPO_REFRESH_URGENCY_CAP {
@@ -6961,28 +7205,52 @@ async fn select_budgeted_system_release_repos(
                 })?;
             }
 
+            sqlx::query(
+                "UPDATE repo_refresh_governance_cycles SET last_selection_window_index = ?, updated_at = ? WHERE id = ? AND status = 'active'",
+            )
+            .bind(now_window_index)
+            .bind(now_rfc3339.as_str())
+            .bind(cycle_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .context("record repo refresh selection window")?;
+
             tx.commit()
                 .await
                 .context("commit repo refresh selection mark tx")?;
-            Ok::<_, anyhow::Error>(())
+            Ok::<Vec<RepoRefreshSelectionRow>, anyhow::Error>(rows)
         })
         .await?;
 
-    Ok(rows
-        .into_iter()
+    let demand_repos = selected_rows
+        .iter()
         .map(|row| ReleaseDemandRepo {
             repo_id: row.repo_id,
-            full_name: row.repo_full_name,
+            full_name: row.repo_full_name.clone(),
             is_new_repo: false,
         })
-        .collect())
+        .collect::<Vec<_>>();
+    Ok(RepoRefreshSelectionResult {
+        selected_repos: demand_repos.len(),
+        demand_repos,
+        cycle_id: cycle.id,
+        window_budget: cycle.window_budget,
+        window_minutes: cycle.window_minutes,
+        selection_window_index: now_window_index,
+    })
 }
 
 async fn run_release_phase(
     context: &SubscriptionRunContext,
     repos: Vec<AggregatedRepo>,
-) -> Result<(SyncSubscriptionReleaseSummary, usize)> {
+) -> Result<(
+    SyncSubscriptionReleaseSummary,
+    usize,
+    SyncSubscriptionGovernanceSummary,
+)> {
     let governance_started_at = Instant::now();
+    let window_minutes =
+        admin_runtime::load_sync_auto_fetch_interval_minutes(&context.state.pool).await?;
     let budget_per_window =
         admin_runtime::load_repo_refresh_system_budget_per_window(&context.state.pool).await?;
     let candidates = hydrate_repo_refresh_candidates(context.state.as_ref(), &repos).await?;
@@ -6991,18 +7259,23 @@ async fn run_release_phase(
         context.state.as_ref(),
         &candidates,
         budget_per_window,
+        window_minutes,
         now,
     )
     .await?;
-    let demand_repos =
-        select_budgeted_system_release_repos(context.state.as_ref(), budget_per_window, now)
-            .await?;
+    let selection = select_budgeted_system_release_repos(
+        context.state.as_ref(),
+        budget_per_window,
+        window_minutes,
+        now,
+    )
+    .await?;
     let governance_elapsed_ms = governance_started_at.elapsed().as_millis();
     let attached = attach_release_demand(
         context.state.as_ref(),
         Some(context.task_id.as_str()),
         None,
-        &demand_repos,
+        &selection.demand_repos,
         RepoReleaseOrigin::System,
         "subscription_sync",
     )
@@ -7016,7 +7289,10 @@ async fn run_release_phase(
             "subscription release demand attached to shared repo queue",
             json!({
                 "repos": attached.repos,
-                "budget_per_window": budget_per_window,
+                "budget_per_window": selection.window_budget,
+                "window_minutes": selection.window_minutes,
+                "cycle_id": selection.cycle_id,
+                "selection_window_index": selection.selection_window_index,
                 "candidate_repos": repos.len(),
                 "governance_candidate_repos": candidates.len(),
                 "governance_elapsed_ms": governance_elapsed_ms,
@@ -7048,6 +7324,13 @@ async fn run_release_phase(
             pages_fetched: waited.pages_fetched,
         },
         waited.inserted_count + waited.updated_count,
+        SyncSubscriptionGovernanceSummary {
+            window_minutes: selection.window_minutes,
+            window_budget: selection.window_budget,
+            cycle_id: Some(selection.cycle_id),
+            selection_window_index: Some(selection.selection_window_index),
+            selected_repos: selection.selected_repos,
+        },
     ))
 }
 
@@ -8727,6 +9010,13 @@ async fn record_repo_refresh_governance_attempt(
                 .context("load repo refresh cycle frozen repo count")?;
 
                 if completed_repo_count >= frozen_repo_count {
+                    let cycle_window_minutes: i64 = sqlx::query_scalar(
+                        "SELECT window_minutes FROM repo_refresh_governance_cycles WHERE id = ? LIMIT 1",
+                    )
+                    .bind(active_cycle_id.as_str())
+                    .fetch_one(&mut *tx)
+                    .await
+                    .context("load repo refresh cycle window minutes")?;
                     sqlx::query(
                         r#"
                             UPDATE repo_refresh_governance_cycles
@@ -8740,7 +9030,10 @@ async fn record_repo_refresh_governance_attempt(
                             "#,
                     )
                     .bind(completed_repo_count)
-                    .bind(current_repo_refresh_window_index(Utc::now()))
+                    .bind(current_repo_refresh_window_index(
+                        Utc::now(),
+                        cycle_window_minutes,
+                    ))
                     .bind(now_rfc3339)
                     .bind(now_rfc3339)
                     .bind(active_cycle_id.as_str())
@@ -12366,6 +12659,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscription_governance_window_selection_limits_each_cycle_window() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_repo_refresh_governance_active_member(&pool, 700, "octo/window-gate").await;
+        let now = DateTime::parse_from_rfc3339("2026-03-06T12:20:00Z")
+            .expect("parse selection now")
+            .with_timezone(&Utc);
+
+        let first = super::select_budgeted_system_release_repos(state.as_ref(), 1, 30, now)
+            .await
+            .expect("first selection succeeds");
+        assert_eq!(first.window_budget, 1000);
+        assert_eq!(first.window_minutes, 10);
+        assert_eq!(first.selected_repos, 1);
+
+        let second = super::select_budgeted_system_release_repos(state.as_ref(), 1, 30, now)
+            .await
+            .expect("same-window selection succeeds");
+        assert_eq!(second.selected_repos, 0);
+        assert_eq!(second.selection_window_index, first.selection_window_index);
+
+        let last_selection_window_index: i64 = sqlx::query_scalar(
+            "SELECT last_selection_window_index FROM repo_refresh_governance_cycles WHERE id = ?",
+        )
+        .bind("cycle-governance-test")
+        .fetch_one(&pool)
+        .await
+        .expect("load selection gate");
+        assert_eq!(last_selection_window_index, first.selection_window_index);
+    }
+
+    #[tokio::test]
+    async fn subscription_governance_window_migration_preserves_legacy_cycle_tasks_and_watchers() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_sync_task(&state, "task-legacy-governance").await;
+        seed_repo_refresh_governance_active_member(&pool, 701, "octo/legacy-window").await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "work-legacy-governance",
+                repo_id: 701,
+                repo_full_name: "octo/legacy-window",
+                status: "pending",
+                deadline_at: "2026-03-06T12:30:00Z",
+                last_release_count: 0,
+                last_candidate_failures: 0,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        seed_repo_release_watcher(
+            &pool,
+            "watcher-legacy-governance",
+            "work-legacy-governance",
+            "task-legacy-governance",
+        )
+        .await;
+
+        let before_backfill = sqlx::query_as::<_, (i64, Option<i64>)>(
+            "SELECT window_minutes, last_selection_window_index FROM repo_refresh_governance_cycles WHERE id = ?",
+        )
+        .bind("cycle-governance-test")
+        .fetch_one(&pool)
+        .await
+        .expect("load legacy cycle");
+        assert_eq!(before_backfill, (10, None));
+
+        sqlx::query(
+            "UPDATE repo_refresh_governance_cycles SET last_selection_window_index = window_index_started_at WHERE last_selection_window_index IS NULL",
+        )
+        .execute(&pool)
+        .await
+        .expect("apply legacy selection-window backfill");
+        let cycle = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT window_minutes, last_selection_window_index FROM repo_refresh_governance_cycles WHERE id = ?",
+        )
+        .bind("cycle-governance-test")
+        .fetch_one(&pool)
+        .await
+        .expect("load backfilled legacy cycle");
+        assert_eq!(cycle, (10, 2954976));
+
+        let task_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_tasks WHERE id = 'task-legacy-governance'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count preserved task");
+        let watcher_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM repo_release_watchers WHERE id = 'watcher-legacy-governance'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count preserved watcher");
+        assert_eq!(task_count, 1);
+        assert_eq!(watcher_count, 1);
+    }
+
+    #[tokio::test]
     async fn rebuild_repo_refresh_governance_snapshots_updates_existing_system_success_repo() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -12416,6 +12810,7 @@ mod tests {
                 cached_stargazer_count: Some(9),
             }],
             1000,
+            10,
             now,
         )
         .await
@@ -12476,7 +12871,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let stats =
-            rebuild_repo_refresh_governance_snapshots(state.as_ref(), &candidates, 1000, now)
+            rebuild_repo_refresh_governance_snapshots(state.as_ref(), &candidates, 1000, 10, now)
                 .await
                 .expect("rebuild governance snapshots");
 
@@ -12921,6 +13316,7 @@ mod tests {
                 cached_stargazer_count: None,
             }],
             1000,
+            10,
             now,
         )
         .await
@@ -12998,6 +13394,7 @@ mod tests {
                 cached_stargazer_count: None,
             }],
             1000,
+            10,
             now,
         )
         .await
@@ -13070,6 +13467,7 @@ mod tests {
                 cached_stargazer_count: None,
             }],
             1000,
+            10,
             now,
         )
         .await
@@ -13185,6 +13583,7 @@ mod tests {
                 cached_stargazer_count: None,
             }],
             1000,
+            10,
             now,
         )
         .await

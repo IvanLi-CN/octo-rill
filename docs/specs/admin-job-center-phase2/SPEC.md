@@ -167,7 +167,6 @@
 - state: `admin-users-last-active-tooltip`
 - evidence_note: 验证用户管理列表里的“最后活动”字段默认显示 `MM/DD HH:mm`，且悬浮后使用 UI 库 tooltip 展示完整本地时间与字段语义。
 
-PR: include
 ![用户管理最后活动 tooltip](./assets/admin-users-last-active-tooltip.png)
 
 ### 最近失败数据重试定时任务
@@ -183,21 +182,21 @@ PR: include
 - state: `scheduled-tab-retry-recent-failures`
 - evidence_note: 验证“定时任务”卡片右上角存在任务间隔设置按钮，列表包含 `retry.recent_failures` 运行记录。
 
-PR: include
 ![定时任务页失败数据重试入口](./assets/admin-jobs-scheduled-retry-intervals.png)
 
 - source_type: `storybook_canvas`
 - target_program: `mock-only`
-- capture_scope: `element`
-- requested_viewport: `1440x1100`
+- capture_scope: `browser-viewport`
+- requested_viewport: `1440x900`
 - viewport_strategy: `storybook-viewport`
+- margin_policy: `trim_only`
+- evidence_surface: `page`
 - sensitive_exclusion: `N/A`
 - submission_gate: `approved`
-- story_id_or_title: `admin-admin-jobs--task-interval-settings-clean-dialog`
-- state: `task-interval-settings-clean-dialog`
-- evidence_note: 验证“任务间隔设置”弹窗包含全局日报自动出报时间、订阅同步间隔与失败数据重试间隔，不混入 worker 配置或最近链路用时。
+- story_id_or_title: `admin-admin-jobs--scheduled-task-interval-settings`
+- state: `task-interval-settings-read-only-subscription-summary`
+- evidence_note: 验证严格 1440x900 Storybook 视口中的“任务间隔设置”弹窗仅编辑日报、Webhook 与失败数据重试间隔；订阅同步间隔以只读摘要展示并跳转至唯一编辑入口。
 
-PR: include
 ![任务间隔设置弹窗](./assets/admin-jobs-task-interval-settings.png)
 
 - source_type: `storybook_canvas`
@@ -211,8 +210,11 @@ PR: include
 - state: `retry-recent-failures-detail`
 - evidence_note: 验证 `retry.recent_failures` 详情展示日报、润色、翻译三类重试摘要、任务间隔、调度键与最后错误。
 
-PR: include
 ![失败数据重试详情](./assets/admin-jobs-retry-recent-failures-detail.png)
+
+## Related ADRs
+
+- [ADR 0005: Unify Subscription and Governance Windows](../../adr/0005-subscription-governance-window.md)
 
 ## 参考（References）
 

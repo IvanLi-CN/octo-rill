@@ -93,9 +93,13 @@ const governanceOverviewSeed: AdminRepoGovernanceOverviewResponse = {
 		active_cycle_started_at: "2026-06-29T09:20:00Z",
 		active_cycle_repo_count: STORY_REPO_TOTAL,
 		active_cycle_completed_count: 3_860,
+		active_cycle_window_minutes: 10,
+		active_cycle_window_budget: 1000,
+		active_cycle_last_selection_window_index: 29_180_000,
 	},
 	settings: {
 		sync_auto_fetch_interval_minutes: 10,
+		sync_auto_fetch_effective_at: "2026-06-29T10:30:00Z",
 		retry_recent_failures_interval_minutes: 10,
 		repo_release_worker_concurrency: 8,
 		repo_refresh_system_budget_per_window: 1000,
@@ -117,7 +121,9 @@ const governanceOverviewSeed: AdminRepoGovernanceOverviewResponse = {
 		return {
 			repo_id: index + 1,
 			age_bucket: ageBucket,
-			band_label: `W${Math.floor(index / 1000) + 1}`,
+			band_label: `W${Math.floor(index / 1000) + 1} · ${
+				(Math.floor(index / 1000) + 1) * 10
+			} 分钟`,
 			urgency_score:
 				ageBucket === "fresh"
 					? 0.82

@@ -4914,7 +4914,6 @@ export function JobManagement({
 	}, []);
 
 	const saveTaskIntervalSettings = useCallback(async () => {
-		const nextInterval = clampSyncAutoFetchInterval(syncAutoFetchIntervalInput);
 		const nextRetryInterval = clampSyncAutoFetchInterval(
 			retryRecentFailuresIntervalInput,
 		);
@@ -4922,7 +4921,6 @@ export function JobManagement({
 		setSyncRuntimeConfigError(null);
 		try {
 			const res = await apiPatchAdminSyncRuntimeConfig({
-				sync_auto_fetch_interval_minutes: nextInterval,
 				retry_recent_failures_interval_minutes: nextRetryInterval,
 				daily_brief_schedule_local_time: dailyBriefScheduleLocalTimeInput,
 			});
@@ -4959,15 +4957,11 @@ export function JobManagement({
 		loadSubscriptionRuns,
 		dailyBriefScheduleLocalTimeInput,
 		retryRecentFailuresIntervalInput,
-		syncAutoFetchIntervalInput,
 		webhookPushAuditIntervalInput,
 	]);
 
 	const saveSubscriptionSyncSettings = useCallback(async () => {
-		const currentInterval = clampSyncAutoFetchInterval(
-			syncRuntimeConfig?.sync_auto_fetch_interval_minutes ??
-				syncAutoFetchIntervalInput,
-		);
+		const nextInterval = clampSyncAutoFetchInterval(syncAutoFetchIntervalInput);
 		const nextWorkerConcurrency = clampRepoReleaseWorkerConcurrency(
 			repoReleaseWorkerConcurrencyInput,
 		);
@@ -4975,7 +4969,7 @@ export function JobManagement({
 		setSyncRuntimeConfigError(null);
 		try {
 			const res = await apiPatchAdminSyncRuntimeConfig({
-				sync_auto_fetch_interval_minutes: currentInterval,
+				sync_auto_fetch_interval_minutes: nextInterval,
 				repo_release_worker_concurrency: nextWorkerConcurrency,
 				repo_refresh_system_budget_per_window: clampRepoRefreshSystemBudget(
 					repoRefreshSystemBudgetInput,
@@ -5037,6 +5031,9 @@ export function JobManagement({
 
 	const openSubscriptionSyncSettingsDialog = useCallback(() => {
 		setSyncRuntimeConfigError(null);
+		setSyncAutoFetchIntervalInput(
+			syncRuntimeConfig?.sync_auto_fetch_interval_minutes ?? 60,
+		);
 		setRepoReleaseWorkerConcurrencyInput(
 			syncRuntimeConfig?.repo_release_worker_concurrency ?? 5,
 		);
@@ -6515,13 +6512,19 @@ export function JobManagement({
 											分钟
 										</p>
 										<p className="mt-1 hidden text-muted-foreground text-xs md:block">
-											频率保持独立配置
+											预算窗口与同步频率统一
 										</p>
 									</div>
 									<div className="min-w-0 px-1 py-1 md:rounded-lg md:border md:bg-card/70 md:p-3">
 										<p className="truncate text-[10px] text-muted-foreground leading-tight md:text-xs">
 											<span className="md:hidden">系统预算</span>
-											<span className="hidden md:inline">10 分钟系统预算</span>
+											<span className="hidden md:inline">
+												每{" "}
+												{formatCount(
+													syncRuntimeConfig?.sync_auto_fetch_interval_minutes,
+												)}{" "}
+												分钟系统预算
+											</span>
 										</p>
 										<p className="mt-0.5 truncate text-base font-semibold md:mt-1 md:text-xl">
 											{formatCount(
@@ -7362,7 +7365,8 @@ export function JobManagement({
 							<DialogTitle>任务间隔设置</DialogTitle>
 						</div>
 						<DialogDescription>
-							只调整定时任务触发间隔；保存后立即生效。
+							只调整失败数据重试、日报和 Webhook
+							定时任务；订阅同步间隔请在订阅同步设置中修改。
 						</DialogDescription>
 					</DialogHeader>
 
@@ -7432,49 +7436,31 @@ export function JobManagement({
 						<div className="space-y-3 rounded-lg border bg-card/70 px-3 py-4">
 							<div className="flex items-center justify-between gap-3">
 								<div className="flex items-center gap-2">
-									<Label htmlFor="sync-auto-fetch-interval">订阅同步间隔</Label>
+									<Label>订阅同步间隔</Label>
 									<Badge variant="outline">sync.subscriptions</Badge>
 								</div>
 								<span className="rounded-md border bg-background px-2.5 py-1 font-mono text-sm font-semibold">
-									{syncAutoFetchIntervalInput} 分钟
+									{syncRuntimeConfig?.sync_auto_fetch_interval_minutes ?? 60}{" "}
+									分钟
 								</span>
 							</div>
-							<input
-								id="sync-auto-fetch-interval"
-								type="range"
-								min={0}
-								max={100}
-								step={1}
-								value={syncIntervalToSliderPosition(syncAutoFetchIntervalInput)}
-								onChange={(event) =>
-									setSyncAutoFetchIntervalInput(
-										syncSliderPositionToInterval(Number(event.target.value)),
-									)
-								}
-								aria-label="订阅同步间隔（分钟）"
-								aria-valuemin={SYNC_AUTO_FETCH_INTERVAL_MIN}
-								aria-valuemax={SYNC_AUTO_FETCH_INTERVAL_MAX}
-								aria-valuenow={syncAutoFetchIntervalInput}
-								aria-valuetext={`${syncAutoFetchIntervalInput} 分钟`}
-								className="h-2 w-full cursor-pointer accent-primary"
-							/>
-							<div className="relative h-11 text-[11px] text-muted-foreground">
-								{SYNC_AUTO_FETCH_INTERVAL_MARKS.map((mark) => (
-									<button
-										key={mark}
-										type="button"
-										className="-translate-x-1/2 absolute top-0 flex min-h-11 min-w-11 flex-col items-center gap-1 rounded-md px-1 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-										style={{ left: syncIntervalMarkPosition(mark) }}
-										onClick={() => setSyncAutoFetchIntervalInput(mark)}
-									>
-										<span className="mt-1 h-1.5 w-px bg-border" />
-										<span>{mark}</span>
-									</button>
-								))}
-							</div>
 							<p className="text-muted-foreground text-xs">
-								控制 `sync.subscriptions` 的定时触发频率。
+								{syncRuntimeConfig?.sync_auto_fetch_effective_at
+									? `已保存的变更将在 ${formatLocalDateTime(syncRuntimeConfig.sync_auto_fetch_effective_at)} 生效。`
+									: "当前配置已生效，下一轮按对齐边界触发。"}
 							</p>
+							<Button
+								type="button"
+								variant="link"
+								size="sm"
+								className="h-auto px-0"
+								onClick={() => {
+									setTaskIntervalSettingsDialogOpen(false);
+									openSubscriptionSyncSettingsDialog();
+								}}
+							>
+								打开订阅同步设置
+							</Button>
 						</div>
 						<div className="space-y-3 rounded-lg border bg-card/70 px-3 py-4">
 							<div className="flex items-center justify-between gap-3">
@@ -7604,7 +7590,9 @@ export function JobManagement({
 							</Tooltip>
 						</div>
 						<DialogDescription className="sr-only">
-							保存后立即生效；配置作用于订阅同步并发、系统刷新预算与运行记录查看。
+							订阅同步间隔、Release
+							抓取并发、系统刷新预算和新鲜度在此统一配置；间隔从下一个 UTC
+							对齐边界生效，活动治理周期保持启动时参数。
 						</DialogDescription>
 					</DialogHeader>
 
@@ -7696,6 +7684,63 @@ export function JobManagement({
 									仅作用于 Dashboard 全量同步，单仓窗口始终限制在 1–30 分钟。
 								</p>
 							</div>
+							<div className="space-y-3 border-t border-border/70 pt-4">
+								<div className="flex items-center justify-between gap-3">
+									<Label htmlFor="sync-auto-fetch-interval">订阅同步间隔</Label>
+									<span className="rounded-full border border-border/70 bg-background px-3 py-1 font-mono text-sm font-semibold">
+										{syncAutoFetchIntervalInput} 分钟
+									</span>
+								</div>
+								<input
+									id="sync-auto-fetch-interval"
+									type="range"
+									min={0}
+									max={100}
+									step={1}
+									value={syncIntervalToSliderPosition(
+										syncAutoFetchIntervalInput,
+									)}
+									onChange={(event) =>
+										setSyncAutoFetchIntervalInput(
+											syncSliderPositionToInterval(Number(event.target.value)),
+										)
+									}
+									aria-label="订阅同步间隔（分钟）"
+									aria-valuemin={SYNC_AUTO_FETCH_INTERVAL_MIN}
+									aria-valuemax={SYNC_AUTO_FETCH_INTERVAL_MAX}
+									aria-valuenow={syncAutoFetchIntervalInput}
+									aria-valuetext={`${syncAutoFetchIntervalInput} 分钟`}
+									className="h-2 w-full cursor-pointer accent-primary"
+								/>
+								<div className="relative h-11 text-[11px] text-muted-foreground">
+									{SYNC_AUTO_FETCH_INTERVAL_MARKS.map((mark) => (
+										<button
+											key={mark}
+											type="button"
+											className="-translate-x-1/2 absolute top-0 flex min-h-11 min-w-11 flex-col items-center gap-1 rounded-md px-1 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+											style={{ left: syncIntervalMarkPosition(mark) }}
+											onClick={() => setSyncAutoFetchIntervalInput(mark)}
+											aria-label={`将订阅同步间隔设为 ${mark} 分钟`}
+										>
+											<span className="mt-1 h-1.5 w-px bg-border" />
+											<span>{mark}</span>
+										</button>
+									))}
+								</div>
+								<p className="text-muted-foreground text-xs">
+									同步间隔同时定义 Release
+									治理窗口；保存后将在严格大于当前时刻的下一个 UTC
+									对齐边界生效。
+								</p>
+								{syncRuntimeConfig?.sync_auto_fetch_effective_at ? (
+									<p className="text-muted-foreground text-xs">
+										待生效时间：
+										{formatLocalDateTime(
+											syncRuntimeConfig.sync_auto_fetch_effective_at,
+										)}
+									</p>
+								) : null}
+							</div>
 							<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
 								<Label htmlFor="repo-release-worker-concurrency">
 									Release 抓取并发
@@ -7766,11 +7811,11 @@ export function JobManagement({
 								<div className="flex items-start justify-between gap-3">
 									<div className="space-y-1">
 										<Label htmlFor="repo-refresh-budget-worker-input">
-											10 分钟系统预算
+											每 {syncAutoFetchIntervalInput} 分钟系统预算
 										</Label>
 										<p className="text-muted-foreground text-xs leading-5">
-											控制系统每 10 分钟可选中的仓库上限，不会改变 Release
-											抓取并发。
+											控制系统每 {syncAutoFetchIntervalInput}{" "}
+											分钟可选中的仓库上限，不会改变 Release 抓取并发。
 										</p>
 									</div>
 									<span className="rounded-full border border-border/70 bg-background px-3 py-1 font-mono text-sm font-semibold">
@@ -7791,7 +7836,7 @@ export function JobManagement({
 									inputMode="numeric"
 								/>
 								<p className="text-muted-foreground text-xs">
-									这是唯一预算编辑入口；保存后会立刻影响下一轮系统选仓。
+									这是唯一预算编辑入口；新预算在下一完整治理周期采用，活动周期继续使用启动时快照。
 								</p>
 							</div>
 							{syncRuntimeConfigError ? (

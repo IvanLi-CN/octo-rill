@@ -8,6 +8,8 @@
 
 ## 变更记录
 
+- 2026-09-07: 统一订阅同步间隔与 Release 治理窗口；新增 `0076_subscription_governance_window.sql` 的历史周期回填、活动周期 `N+B` 快照、UTC 对齐生效边界、原 watcher 范围重试与动态 `W{n} · {minutes} 分钟` 文案。
+
 - 2026-06-29: 新建 spec，正式把“仓库治理”从 `s8qkn` 的历史非目标中拆出，收口为独立后台一级页与 budgeted system refresh contract。
 - 2026-06-29: 明确 `repo_total` 与 scheduler 共享“有效关注池”语义，替代 `n6zd8` 中 `starred ∪ owned baseline` 的旧宽口径说明。
 - 2026-06-29: 后端新增 repo governance snapshots / cycles、budgeted system 选仓与 stargazer cache 排序键；前端新增 `/admin/repos` 治理页、共享 runtime budget 编辑入口，并补齐 Storybook 桌面/窄屏证据。

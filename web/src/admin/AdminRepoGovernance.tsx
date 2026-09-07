@@ -941,11 +941,11 @@ export function AdminRepoGovernance() {
 								aria-label={`打开订阅同步设置，当前系统预算 ${
 									overview?.settings.repo_refresh_system_budget_per_window ??
 									"-"
-								} / 10 分钟`}
+								} / ${overview?.settings.sync_auto_fetch_interval_minutes ?? "-"} 分钟`}
 								title={`系统预算 ${
 									overview?.settings.repo_refresh_system_budget_per_window ??
 									"-"
-								} / 10 分钟`}
+								} / ${overview?.settings.sync_auto_fetch_interval_minutes ?? "-"} 分钟`}
 							>
 								<Settings2 />
 								<span className="sr-only">打开订阅同步设置</span>
@@ -1007,6 +1007,14 @@ export function AdminRepoGovernance() {
 									进度 {overview?.cycle.active_cycle_completed_count ?? 0}/
 									{overview?.cycle.active_cycle_repo_count ?? 0} · 开始于{" "}
 									{formatDateTime(overview?.cycle.active_cycle_started_at)}
+								</p>
+								<p className="mt-1 text-muted-foreground">
+									活动窗口 {overview?.cycle.active_cycle_window_minutes ?? "-"}{" "}
+									分钟 · 预算{" "}
+									{overview?.cycle.active_cycle_window_budget ?? "-"} ·
+									当前选择窗口{" "}
+									{overview?.cycle.active_cycle_last_selection_window_index ??
+										"-"}
 								</p>
 							</div>
 						</div>
