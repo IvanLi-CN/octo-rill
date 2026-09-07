@@ -520,6 +520,21 @@ evidence_note=验证 320px 窄屏下统计保持紧凑并列，订阅同步记�
 
 ![Subscription sync observability mobile 320](./assets/subscription-sync-workflow-mobile-320.png)
 
+source_type=storybook_canvas
+target_program=mock-only
+capture_scope=browser-viewport
+requested_viewport=1440x900
+viewport_strategy=storybook-viewport
+margin_policy=trim_only
+evidence_surface=page
+sensitive_exclusion=N/A
+submission_gate=approved
+story_id_or_title=admin-admin-jobs--scheduled-task-interval-settings
+state=subscription-sync-interval-read-only-summary
+evidence_note=验证任务间隔设置中的订阅同步间隔为只读摘要，展示待生效时间并跳转到订阅同步设置唯一编辑入口，不再提供第二个写入控件。
+
+![Subscription sync interval read-only summary](./assets/admin-jobs-task-interval-settings.png)
+
 ## Related ADRs
 
 - [ADR 0005: Unify Subscription and Governance Windows](../../adr/0005-subscription-governance-window.md)

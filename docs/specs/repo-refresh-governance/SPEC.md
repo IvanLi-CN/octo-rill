@@ -292,14 +292,16 @@
 
 - source_type: `storybook_canvas`
   story_id_or_title: `admin-admin-repos--evidence-desktop`
-  state: `desktop governance`
+  state: `desktop governance with dynamic subscription window`
   target_program: `mock-only`
   capture_scope: `browser-viewport`
-  requested_viewport: `1440x1200`
-  viewport_strategy: `playwright-viewport`
+  requested_viewport: `1440x900`
+  viewport_strategy: `storybook-viewport`
+  margin_policy: `trim_only`
+  evidence_surface: `page`
   sensitive_exclusion: `N/A`
-  submission_gate: `owner-approved`
-  evidence_note: 证明 `/admin/repos` 在桌面视口下同时展示有效关注池 summary、可访问活动图图例、单跳预算 CTA，以及使用状态下拉、目标窗口与迫切值范围筛选的仓库明细。
+  submission_gate: `approved`
+  evidence_note: 证明 `/admin/repos` 在严格 1440x900 Storybook 视口中展示冻结的实际窗口与预算、动态 W 标签、活动图及治理摘要。
   ![仓库治理桌面证据](./assets/admin-repos-desktop.png)
 
 - source_type: `storybook_canvas`
@@ -328,8 +330,16 @@
 
 - source_type: `storybook_canvas`
   story_id_or_title: `admin-admin-jobs--subscription-sync-settings-auto-open`
-  state: `subscription sync settings dialog auto-open from governance cta`
-  evidence_note: 证明仓库刷新 budget 的唯一编辑入口已经收口到任务中心“订阅同步设置”弹窗，并支持从治理页 CTA 单跳自动展开。
+  state: `subscription sync settings unique editor, 1440x900 viewport`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `1440x900`
+  viewport_strategy: `storybook-viewport`
+  margin_policy: `trim_only`
+  evidence_surface: `page`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  evidence_note: 证明仓库刷新 budget 的唯一编辑入口已经收口到任务中心“订阅同步设置”弹窗，并在严格 1440x900 Storybook 视口内展示同步间隔、待生效边界、Release 并发和预算。
   ![订阅同步设置预算弹窗证据](./assets/subscription-sync-settings-budget-dialog.png)
 
 - source_type: `storybook_canvas`
