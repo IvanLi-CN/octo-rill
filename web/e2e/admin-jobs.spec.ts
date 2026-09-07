@@ -355,6 +355,10 @@ async function installAdminJobsMocks(
 	let syncRuntimeConfig = {
 		sync_auto_fetch_interval_minutes: 10,
 		retry_recent_failures_interval_minutes: 10,
+		repo_release_worker_concurrency: 5,
+		repo_refresh_system_budget_per_window: 1000,
+		dashboard_release_freshness_profile: "balanced",
+		daily_brief_schedule_local_time: "06:00",
 		recent_sync_tasks: tasks
 			.filter((task) => task.task_type === "sync.subscriptions")
 			.filter((task) => task.id !== "task-subscriptions-skipped")
@@ -372,6 +376,11 @@ async function installAdminJobsMocks(
 				started_at: task.started_at,
 				finished_at: syncSubscriptionChainFinishedAt[task.id] ?? null,
 			})),
+	};
+	let webhookPushRuntimeConfig = {
+		audit_interval_days: 7,
+		last_started_at: null,
+		next_started_at: null,
 	};
 
 	const recentRunningWorkerUpdatedAt = new Date(
@@ -1704,22 +1713,65 @@ async function installAdminJobsMocks(
 		}
 
 		if (
+			req.method() === "GET" &&
+			pathname === "/api/admin/jobs/webhook-push/runtime-config"
+		) {
+			return json(route, webhookPushRuntimeConfig);
+		}
+
+		if (
+			req.method() === "PATCH" &&
+			pathname === "/api/admin/jobs/webhook-push/runtime-config"
+		) {
+			const body = (req.postDataJSON() ?? {}) as {
+				audit_interval_days?: number;
+			};
+			webhookPushRuntimeConfig = {
+				...webhookPushRuntimeConfig,
+				audit_interval_days: Number(
+					body.audit_interval_days ??
+						webhookPushRuntimeConfig.audit_interval_days,
+				),
+			};
+			return json(route, webhookPushRuntimeConfig);
+		}
+
+		if (
 			req.method() === "PATCH" &&
 			pathname === "/api/admin/jobs/sync/runtime-config"
 		) {
 			const body = (req.postDataJSON() ?? {}) as {
 				sync_auto_fetch_interval_minutes?: number;
 				retry_recent_failures_interval_minutes?: number;
+				repo_release_worker_concurrency?: number;
+				repo_refresh_system_budget_per_window?: number;
+				dashboard_release_freshness_profile?: string;
+				daily_brief_schedule_local_time?: string;
 			};
 			syncRuntimeConfig = {
 				...syncRuntimeConfig,
 				sync_auto_fetch_interval_minutes: Number(
-					body.sync_auto_fetch_interval_minutes ?? 60,
+					body.sync_auto_fetch_interval_minutes ??
+						syncRuntimeConfig.sync_auto_fetch_interval_minutes,
 				),
 				retry_recent_failures_interval_minutes: Number(
 					body.retry_recent_failures_interval_minutes ??
 						syncRuntimeConfig.retry_recent_failures_interval_minutes,
 				),
+				repo_release_worker_concurrency: Number(
+					body.repo_release_worker_concurrency ??
+						syncRuntimeConfig.repo_release_worker_concurrency,
+				),
+				repo_refresh_system_budget_per_window: Number(
+					body.repo_refresh_system_budget_per_window ??
+						syncRuntimeConfig.repo_refresh_system_budget_per_window,
+				),
+				dashboard_release_freshness_profile:
+					body.dashboard_release_freshness_profile ??
+					syncRuntimeConfig.dashboard_release_freshness_profile,
+				daily_brief_schedule_local_time:
+					body.daily_brief_schedule_local_time ??
+					syncRuntimeConfig.daily_brief_schedule_local_time,
 			};
 			return json(route, syncRuntimeConfig);
 		}
@@ -2335,6 +2387,130 @@ test("admin can manage jobs center", async ({ page }) => {
 	await llmCallCardAgain.getByRole("button", { name: "详情" }).click();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
 	await expect(llmSheet).not.toBeVisible();
+});
+
+test("admin task interval drafts validate only when saved", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	const patches: Array<{ pathname: string; body: Record<string, unknown> }> =
+		[];
+	page.on("request", (request) => {
+		if (request.method() !== "PATCH") return;
+		const url = new URL(request.url());
+		if (!url.pathname.includes("/api/admin/jobs/")) return;
+		patches.push({
+			pathname: url.pathname,
+			body: request.postDataJSON() as Record<string, unknown>,
+		});
+	});
+
+	await page.goto("/admin/jobs/scheduled", { waitUntil: "domcontentloaded" });
+	const settingsButton = page.getByRole("button", {
+		name: "配置定时任务间隔",
+	});
+	await expect(settingsButton).toBeEnabled();
+	await settingsButton.click();
+	const dialog = page.getByRole("dialog", { name: "任务间隔设置" });
+	const webhookInput = dialog.locator("#webhook-push-audit-interval");
+	await expect(webhookInput).toHaveValue("7");
+
+	await webhookInput.fill("");
+	await expect(webhookInput).toHaveValue("");
+	await dialog.getByRole("button", { name: "取消" }).click();
+	await expect(dialog).toHaveCount(0);
+	await settingsButton.click();
+	await expect(webhookInput).toHaveValue("7");
+
+	await webhookInput.fill("");
+	await dialog.getByRole("button", { name: "保存设置" }).click();
+	await expect(dialog.getByText("请输入 1 到 30 之间的整数。")).toBeVisible();
+	await expect(webhookInput).toHaveAttribute("aria-invalid", "true");
+	await expect(
+		patches.filter(
+			({ pathname }) =>
+				pathname === "/api/admin/jobs/sync/runtime-config" ||
+				pathname === "/api/admin/jobs/webhook-push/runtime-config",
+		),
+	).toHaveLength(0);
+
+	await webhookInput.fill("12");
+	await dialog.getByRole("button", { name: "保存设置" }).click();
+	await expect(dialog).toHaveCount(0);
+	await expect.poll(() => patches.length).toBe(2);
+	await expect
+		.poll(() =>
+			patches.some(
+				({ pathname, body }) =>
+					pathname === "/api/admin/jobs/webhook-push/runtime-config" &&
+					body.audit_interval_days === 12,
+			),
+		)
+		.toBeTruthy();
+	await expect(
+		patches.find(
+			({ pathname }) => pathname === "/api/admin/jobs/sync/runtime-config",
+		)?.body,
+	).toMatchObject({ retry_recent_failures_interval_minutes: 10 });
+});
+
+test("admin subscription number drafts recover from invalid values", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	const syncPatches: Array<Record<string, unknown>> = [];
+	page.on("request", (request) => {
+		if (
+			request.method() === "PATCH" &&
+			new URL(request.url()).pathname === "/api/admin/jobs/sync/runtime-config"
+		) {
+			syncPatches.push(request.postDataJSON() as Record<string, unknown>);
+		}
+	});
+
+	await page.goto("/admin/jobs/subscriptions/task-subscriptions-1", {
+		waitUntil: "domcontentloaded",
+	});
+	const settingsButton = page.getByRole("button", { name: "配置订阅同步设置" });
+	await expect(settingsButton).toBeVisible();
+	await settingsButton.click();
+	const dialog = page.getByRole("dialog", { name: "订阅同步设置" });
+	const concurrencyInput = dialog.locator(
+		"#repo-release-worker-concurrency-input",
+	);
+	const budgetInput = dialog.locator("#repo-refresh-budget-worker-input");
+	await expect(concurrencyInput).toHaveValue("5");
+	await expect(budgetInput).toHaveValue("1000");
+
+	await budgetInput.fill("");
+	await dialog.getByRole("button", { name: "取消" }).click();
+	await settingsButton.click();
+	await expect(budgetInput).toHaveValue("1000");
+
+	await concurrencyInput.fill("");
+	await budgetInput.fill("");
+	await dialog.getByRole("button", { name: "保存设置" }).click();
+	await expect(dialog.getByText("请输入 1 到 32 之间的整数。")).toBeVisible();
+	await expect(
+		dialog.getByText("请输入 1 到 20,000 之间的整数。"),
+	).toBeVisible();
+	await expect(concurrencyInput).toHaveAttribute("aria-invalid", "true");
+	await expect(budgetInput).toHaveAttribute("aria-invalid", "true");
+	await expect(syncPatches).toHaveLength(0);
+
+	await dialog
+		.getByRole("button", { name: "将 Release 抓取并发设为 10" })
+		.click();
+	await expect(concurrencyInput).toHaveValue("10");
+	await expect(concurrencyInput).toHaveAttribute("aria-invalid", "false");
+	await budgetInput.fill("1500");
+	await dialog.getByRole("button", { name: "保存设置" }).click();
+	await expect(dialog).toHaveCount(0);
+	await expect.poll(() => syncPatches.length).toBe(1);
+	await expect(syncPatches[0]).toMatchObject({
+		repo_release_worker_concurrency: 10,
+		repo_refresh_system_budget_per_window: 1500,
+	});
 });
 
 test("subscription workflow cards keep a neutral frame without extra left-edge decoration", async ({

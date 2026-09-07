@@ -232,25 +232,19 @@ function parsePositiveIntegerInput(value: string) {
 	return parsed;
 }
 
+function parseBoundedIntegerInput(value: string, min: number, max: number) {
+	const parsed = parsePositiveIntegerInput(value);
+	if (parsed === null || parsed < min || parsed > max) {
+		return null;
+	}
+	return parsed;
+}
+
 function clampSyncAutoFetchInterval(value: number) {
 	if (!Number.isFinite(value)) return 60;
 	return Math.min(
 		SYNC_AUTO_FETCH_INTERVAL_MAX,
 		Math.max(SYNC_AUTO_FETCH_INTERVAL_MIN, Math.round(value)),
-	);
-}
-
-function clampRepoReleaseWorkerConcurrency(value: number) {
-	return Math.min(
-		REPO_RELEASE_WORKER_MAX,
-		Math.max(REPO_RELEASE_WORKER_MIN, Math.round(value)),
-	);
-}
-
-function clampRepoRefreshSystemBudget(value: number) {
-	return Math.min(
-		REPO_REFRESH_SYSTEM_BUDGET_MAX,
-		Math.max(REPO_REFRESH_SYSTEM_BUDGET_MIN, Math.round(value)),
 	);
 }
 
@@ -4292,7 +4286,9 @@ export function JobManagement({
 	const [webhookPushRuntimeConfig, setWebhookPushRuntimeConfig] =
 		useState<AdminWebhookPushRuntimeConfigResponse | null>(null);
 	const [webhookPushAuditIntervalInput, setWebhookPushAuditIntervalInput] =
-		useState(7);
+		useState("7");
+	const [webhookPushAuditIntervalError, setWebhookPushAuditIntervalError] =
+		useState<string | null>(null);
 	const [taskIntervalSettingsDialogOpen, setTaskIntervalSettingsDialogOpen] =
 		useState(taskIntervalSettingsDialogDefaultOpen);
 	const [
@@ -4308,9 +4304,15 @@ export function JobManagement({
 	const [
 		repoReleaseWorkerConcurrencyInput,
 		setRepoReleaseWorkerConcurrencyInput,
-	] = useState(5);
+	] = useState("5");
+	const [
+		repoReleaseWorkerConcurrencyError,
+		setRepoReleaseWorkerConcurrencyError,
+	] = useState<string | null>(null);
 	const [repoRefreshSystemBudgetInput, setRepoRefreshSystemBudgetInput] =
-		useState(1000);
+		useState("1000");
+	const [repoRefreshSystemBudgetError, setRepoRefreshSystemBudgetError] =
+		useState<string | null>(null);
 	const [
 		dashboardReleaseFreshnessProfileInput,
 		setDashboardReleaseFreshnessProfileInput,
@@ -4324,6 +4326,33 @@ export function JobManagement({
 		dailyBriefScheduleLocalTimeInput,
 		setDailyBriefScheduleLocalTimeInput,
 	] = useState("06:00");
+	const parsedRepoReleaseWorkerConcurrency = parseBoundedIntegerInput(
+		repoReleaseWorkerConcurrencyInput,
+		REPO_RELEASE_WORKER_MIN,
+		REPO_RELEASE_WORKER_MAX,
+	);
+	const repoReleaseWorkerConcurrencySliderValue =
+		parsedRepoReleaseWorkerConcurrency ??
+		syncRuntimeConfig?.repo_release_worker_concurrency ??
+		REPO_RELEASE_WORKER_MIN;
+	const parsedRepoRefreshSystemBudget = parseBoundedIntegerInput(
+		repoRefreshSystemBudgetInput,
+		REPO_REFRESH_SYSTEM_BUDGET_MIN,
+		REPO_REFRESH_SYSTEM_BUDGET_MAX,
+	);
+	const repoRefreshSystemBudgetDisplayValue =
+		parsedRepoRefreshSystemBudget === null
+			? "—"
+			: String(parsedRepoRefreshSystemBudget);
+	const parsedWebhookPushAuditInterval = parseBoundedIntegerInput(
+		webhookPushAuditIntervalInput,
+		1,
+		30,
+	);
+	const webhookPushAuditIntervalDisplayValue =
+		parsedWebhookPushAuditInterval === null
+			? "—"
+			: String(parsedWebhookPushAuditInterval);
 
 	const [llmStatus, setLlmStatus] =
 		useState<AdminLlmSchedulerStatusResponse | null>(null);
@@ -4882,7 +4911,7 @@ export function JobManagement({
 			);
 			if (webhookResult.ok) {
 				setWebhookPushAuditIntervalInput(
-					webhookResult.config.audit_interval_days,
+					String(webhookResult.config.audit_interval_days),
 				);
 			}
 			setSyncAutoFetchIntervalInput(res.sync_auto_fetch_interval_minutes);
@@ -4890,9 +4919,11 @@ export function JobManagement({
 				res.retry_recent_failures_interval_minutes ??
 					RETRY_RECENT_FAILURES_INTERVAL_DEFAULT,
 			);
-			setRepoReleaseWorkerConcurrencyInput(res.repo_release_worker_concurrency);
+			setRepoReleaseWorkerConcurrencyInput(
+				String(res.repo_release_worker_concurrency),
+			);
 			setRepoRefreshSystemBudgetInput(
-				res.repo_refresh_system_budget_per_window,
+				String(res.repo_refresh_system_budget_per_window),
 			);
 			setDashboardReleaseFreshnessProfileInput(
 				res.dashboard_release_freshness_profile ?? "balanced",
@@ -4917,27 +4948,41 @@ export function JobManagement({
 		const nextRetryInterval = clampSyncAutoFetchInterval(
 			retryRecentFailuresIntervalInput,
 		);
+		const nextWebhookAuditInterval = parseBoundedIntegerInput(
+			webhookPushAuditIntervalInput,
+			1,
+			30,
+		);
+		if (nextWebhookAuditInterval === null) {
+			setWebhookPushAuditIntervalError("请输入 1 到 30 之间的整数。");
+			return;
+		}
 		setSyncRuntimeConfigSaving(true);
 		setSyncRuntimeConfigError(null);
+		setWebhookPushAuditIntervalError(null);
 		try {
 			const res = await apiPatchAdminSyncRuntimeConfig({
 				retry_recent_failures_interval_minutes: nextRetryInterval,
 				daily_brief_schedule_local_time: dailyBriefScheduleLocalTimeInput,
 			});
 			const webhookConfig = await apiPatchAdminWebhookPushRuntimeConfig(
-				Math.min(30, Math.max(1, webhookPushAuditIntervalInput)),
+				nextWebhookAuditInterval,
 			);
 			setSyncRuntimeConfig(res);
 			setWebhookPushRuntimeConfig(webhookConfig);
-			setWebhookPushAuditIntervalInput(webhookConfig.audit_interval_days);
+			setWebhookPushAuditIntervalInput(
+				String(webhookConfig.audit_interval_days),
+			);
 			setSyncAutoFetchIntervalInput(res.sync_auto_fetch_interval_minutes);
 			setRetryRecentFailuresIntervalInput(
 				res.retry_recent_failures_interval_minutes ??
 					RETRY_RECENT_FAILURES_INTERVAL_DEFAULT,
 			);
-			setRepoReleaseWorkerConcurrencyInput(res.repo_release_worker_concurrency);
+			setRepoReleaseWorkerConcurrencyInput(
+				String(res.repo_release_worker_concurrency),
+			);
 			setRepoRefreshSystemBudgetInput(
-				res.repo_refresh_system_budget_per_window,
+				String(res.repo_refresh_system_budget_per_window),
 			);
 			setDailyBriefScheduleLocalTimeInput(res.daily_brief_schedule_local_time);
 			setTaskIntervalSettingsDialogOpen(false);
@@ -4962,18 +5007,32 @@ export function JobManagement({
 
 	const saveSubscriptionSyncSettings = useCallback(async () => {
 		const nextInterval = clampSyncAutoFetchInterval(syncAutoFetchIntervalInput);
-		const nextWorkerConcurrency = clampRepoReleaseWorkerConcurrency(
+		const nextWorkerConcurrency = parseBoundedIntegerInput(
 			repoReleaseWorkerConcurrencyInput,
+			REPO_RELEASE_WORKER_MIN,
+			REPO_RELEASE_WORKER_MAX,
 		);
+		const nextSystemBudget = parseBoundedIntegerInput(
+			repoRefreshSystemBudgetInput,
+			REPO_REFRESH_SYSTEM_BUDGET_MIN,
+			REPO_REFRESH_SYSTEM_BUDGET_MAX,
+		);
+		setRepoReleaseWorkerConcurrencyError(
+			nextWorkerConcurrency === null ? "请输入 1 到 32 之间的整数。" : null,
+		);
+		setRepoRefreshSystemBudgetError(
+			nextSystemBudget === null ? "请输入 1 到 20,000 之间的整数。" : null,
+		);
+		if (nextWorkerConcurrency === null || nextSystemBudget === null) {
+			return;
+		}
 		setSyncRuntimeConfigSaving(true);
 		setSyncRuntimeConfigError(null);
 		try {
 			const res = await apiPatchAdminSyncRuntimeConfig({
 				sync_auto_fetch_interval_minutes: nextInterval,
 				repo_release_worker_concurrency: nextWorkerConcurrency,
-				repo_refresh_system_budget_per_window: clampRepoRefreshSystemBudget(
-					repoRefreshSystemBudgetInput,
-				),
+				repo_refresh_system_budget_per_window: nextSystemBudget,
 				dashboard_release_freshness_profile:
 					dashboardReleaseFreshnessProfileInput,
 			});
@@ -4983,9 +5042,11 @@ export function JobManagement({
 				res.retry_recent_failures_interval_minutes ??
 					RETRY_RECENT_FAILURES_INTERVAL_DEFAULT,
 			);
-			setRepoReleaseWorkerConcurrencyInput(res.repo_release_worker_concurrency);
+			setRepoReleaseWorkerConcurrencyInput(
+				String(res.repo_release_worker_concurrency),
+			);
 			setRepoRefreshSystemBudgetInput(
-				res.repo_refresh_system_budget_per_window,
+				String(res.repo_refresh_system_budget_per_window),
 			);
 			setDashboardReleaseFreshnessProfileInput(
 				res.dashboard_release_freshness_profile ?? "balanced",
@@ -5013,6 +5074,7 @@ export function JobManagement({
 
 	const openTaskIntervalSettingsDialog = useCallback(() => {
 		setSyncRuntimeConfigError(null);
+		setWebhookPushAuditIntervalError(null);
 		setSyncAutoFetchIntervalInput(
 			syncRuntimeConfig?.sync_auto_fetch_interval_minutes ?? 60,
 		);
@@ -5024,21 +5086,23 @@ export function JobManagement({
 			syncRuntimeConfig?.daily_brief_schedule_local_time ?? "06:00",
 		);
 		setWebhookPushAuditIntervalInput(
-			webhookPushRuntimeConfig?.audit_interval_days ?? 7,
+			String(webhookPushRuntimeConfig?.audit_interval_days ?? 7),
 		);
 		setTaskIntervalSettingsDialogOpen(true);
 	}, [syncRuntimeConfig, webhookPushRuntimeConfig]);
 
 	const openSubscriptionSyncSettingsDialog = useCallback(() => {
 		setSyncRuntimeConfigError(null);
+		setRepoReleaseWorkerConcurrencyError(null);
+		setRepoRefreshSystemBudgetError(null);
 		setSyncAutoFetchIntervalInput(
 			syncRuntimeConfig?.sync_auto_fetch_interval_minutes ?? 60,
 		);
 		setRepoReleaseWorkerConcurrencyInput(
-			syncRuntimeConfig?.repo_release_worker_concurrency ?? 5,
+			String(syncRuntimeConfig?.repo_release_worker_concurrency ?? 5),
 		);
 		setRepoRefreshSystemBudgetInput(
-			syncRuntimeConfig?.repo_refresh_system_budget_per_window ?? 1000,
+			String(syncRuntimeConfig?.repo_refresh_system_budget_per_window ?? 1000),
 		);
 		setDashboardReleaseFreshnessProfileInput(
 			syncRuntimeConfig?.dashboard_release_freshness_profile ?? "balanced",
@@ -7346,6 +7410,7 @@ export function JobManagement({
 					setTaskIntervalSettingsDialogOpen(open);
 					if (!open) {
 						setSyncRuntimeConfigError(null);
+						setWebhookPushAuditIntervalError(null);
 					}
 				}}
 			>
@@ -7415,7 +7480,7 @@ export function JobManagement({
 									<Badge variant="outline">webhook_push_audit</Badge>
 								</div>
 								<span className="rounded-md border bg-background px-2.5 py-1 font-mono text-sm font-semibold">
-									{webhookPushAuditIntervalInput} 天
+									{webhookPushAuditIntervalDisplayValue} 天
 								</span>
 							</div>
 							<Input
@@ -7424,10 +7489,22 @@ export function JobManagement({
 								min={1}
 								max={30}
 								value={webhookPushAuditIntervalInput}
-								onChange={(event) =>
-									setWebhookPushAuditIntervalInput(Number(event.target.value))
-								}
+								onChange={(event) => {
+									setWebhookPushAuditIntervalInput(event.target.value);
+									setWebhookPushAuditIntervalError(null);
+								}}
+								aria-invalid={webhookPushAuditIntervalError !== null}
+								aria-describedby="webhook-push-audit-interval-error"
 							/>
+							{webhookPushAuditIntervalError ? (
+								<p
+									id="webhook-push-audit-interval-error"
+									className="text-destructive text-xs"
+									role="alert"
+								>
+									{webhookPushAuditIntervalError}
+								</p>
+							) : null}
 							<p className="text-muted-foreground text-xs">
 								每 1–30 天自动发现新增个人仓库并补齐缺失
 								hook；权限暂停仓库会跳过。
@@ -7547,6 +7624,8 @@ export function JobManagement({
 					setSubscriptionSyncSettingsDialogOpen(open);
 					if (!open) {
 						setSyncRuntimeConfigError(null);
+						setRepoReleaseWorkerConcurrencyError(null);
+						setRepoRefreshSystemBudgetError(null);
 					}
 				}}
 			>
@@ -7752,38 +7831,43 @@ export function JobManagement({
 										min={REPO_RELEASE_WORKER_MIN}
 										max={REPO_RELEASE_WORKER_MAX}
 										value={repoReleaseWorkerConcurrencyInput}
-										onChange={(event) =>
-											setRepoReleaseWorkerConcurrencyInput(
-												clampRepoReleaseWorkerConcurrency(
-													Number(event.target.value),
-												),
-											)
-										}
+										onChange={(event) => {
+											setRepoReleaseWorkerConcurrencyInput(event.target.value);
+											setRepoReleaseWorkerConcurrencyError(null);
+										}}
 										aria-label="Release 抓取并发输入"
+										aria-invalid={repoReleaseWorkerConcurrencyError !== null}
+										aria-describedby="repo-release-worker-concurrency-error"
 										className="h-8 w-20 rounded-md border bg-background px-2 font-mono text-sm"
 									/>
 									<span className="text-muted-foreground text-xs">路</span>
 								</div>
 							</div>
+							{repoReleaseWorkerConcurrencyError ? (
+								<p
+									id="repo-release-worker-concurrency-error"
+									className="text-destructive text-xs"
+									role="alert"
+								>
+									{repoReleaseWorkerConcurrencyError}
+								</p>
+							) : null}
 							<input
 								id="repo-release-worker-concurrency"
 								type="range"
 								min={REPO_RELEASE_WORKER_MIN}
 								max={REPO_RELEASE_WORKER_MAX}
 								step={1}
-								value={repoReleaseWorkerConcurrencyInput}
-								onChange={(event) =>
-									setRepoReleaseWorkerConcurrencyInput(
-										clampRepoReleaseWorkerConcurrency(
-											Number(event.target.value),
-										),
-									)
-								}
+								value={repoReleaseWorkerConcurrencySliderValue}
+								onChange={(event) => {
+									setRepoReleaseWorkerConcurrencyInput(event.target.value);
+									setRepoReleaseWorkerConcurrencyError(null);
+								}}
 								aria-label="Release 抓取并发"
 								aria-valuemin={REPO_RELEASE_WORKER_MIN}
 								aria-valuemax={REPO_RELEASE_WORKER_MAX}
-								aria-valuenow={repoReleaseWorkerConcurrencyInput}
-								aria-valuetext={`${repoReleaseWorkerConcurrencyInput} 路 Release 抓取并发`}
+								aria-valuenow={repoReleaseWorkerConcurrencySliderValue}
+								aria-valuetext={`${repoReleaseWorkerConcurrencySliderValue} 路 Release 抓取并发`}
 								className="h-2 w-full cursor-pointer accent-primary"
 							/>
 							<div className="relative h-11 text-[11px] text-muted-foreground">
@@ -7796,7 +7880,10 @@ export function JobManagement({
 										style={{
 											left: `${((mark - REPO_RELEASE_WORKER_MIN) / (REPO_RELEASE_WORKER_MAX - REPO_RELEASE_WORKER_MIN)) * 100}%`,
 										}}
-										onClick={() => setRepoReleaseWorkerConcurrencyInput(mark)}
+										onClick={() => {
+											setRepoReleaseWorkerConcurrencyInput(String(mark));
+											setRepoReleaseWorkerConcurrencyError(null);
+										}}
 									>
 										<span className="mt-1 h-1.5 w-px bg-border" />
 										<span>{mark}</span>
@@ -7819,7 +7906,7 @@ export function JobManagement({
 										</p>
 									</div>
 									<span className="rounded-full border border-border/70 bg-background px-3 py-1 font-mono text-sm font-semibold">
-										{repoRefreshSystemBudgetInput}
+										{repoRefreshSystemBudgetDisplayValue}
 									</span>
 								</div>
 								<Input
@@ -7828,13 +7915,23 @@ export function JobManagement({
 									min={REPO_REFRESH_SYSTEM_BUDGET_MIN}
 									max={REPO_REFRESH_SYSTEM_BUDGET_MAX}
 									value={repoRefreshSystemBudgetInput}
-									onChange={(event) =>
-										setRepoRefreshSystemBudgetInput(
-											clampRepoRefreshSystemBudget(Number(event.target.value)),
-										)
-									}
+									onChange={(event) => {
+										setRepoRefreshSystemBudgetInput(event.target.value);
+										setRepoRefreshSystemBudgetError(null);
+									}}
+									aria-invalid={repoRefreshSystemBudgetError !== null}
+									aria-describedby="repo-refresh-budget-worker-input-error"
 									inputMode="numeric"
 								/>
+								{repoRefreshSystemBudgetError ? (
+									<p
+										id="repo-refresh-budget-worker-input-error"
+										className="text-destructive text-xs"
+										role="alert"
+									>
+										{repoRefreshSystemBudgetError}
+									</p>
+								) : null}
 								<p className="text-muted-foreground text-xs">
 									这是唯一预算编辑入口；新预算在下一完整治理周期采用，活动周期继续使用启动时快照。
 								</p>
