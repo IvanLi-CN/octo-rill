@@ -535,6 +535,36 @@ evidence_note=验证任务间隔设置中的订阅同步间隔为只读摘要，
 
 ![Subscription sync interval read-only summary](./assets/admin-jobs-task-interval-settings.png)
 
+source_type=mock_ui
+target_program=mock-only
+capture_scope=element
+requested_viewport=1440x1200
+viewport_strategy=playwright-mock
+margin_policy=trim_only
+evidence_surface=page
+sensitive_exclusion=N/A
+submission_gate=approved
+story_id_or_title=Admin Jobs / Task Interval Settings
+state=webhook-audit-interval-invalid-draft
+evidence_note=验证 Webhook 定时巡查周期可清空并保留空草稿，保存时显示 1–30 整数错误，错误关联字段且不遮挡控件。
+
+![Webhook interval invalid draft](./assets/admin-jobs-task-interval-settings-invalid-draft.png)
+
+source_type=mock_ui
+target_program=mock-only
+capture_scope=element
+requested_viewport=1440x1200
+viewport_strategy=playwright-mock
+margin_policy=trim_only
+evidence_surface=page
+sensitive_exclusion=N/A
+submission_gate=approved
+story_id_or_title=Admin Jobs / Subscription Sync Settings
+state=subscription-number-invalid-drafts
+evidence_note=验证 Release 抓取并发与系统预算可清空并保留非法草稿，保存时显示字段级错误，滑块可恢复合法并发值，控件布局稳定。
+
+![Subscription settings invalid drafts](./assets/admin-jobs-subscription-settings-invalid-draft.png)
+
 ## Related ADRs
 
 - [ADR 0005: Unify Subscription and Governance Windows](../../adr/0005-subscription-governance-window.md)
