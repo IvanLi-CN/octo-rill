@@ -4105,8 +4105,8 @@ mod tests {
         current_recent_failures_retry_schedule_key, current_subscription_schedule_key,
         enqueue_brief_history_recompute_if_needed, enqueue_brief_refresh_content_if_needed,
         enqueue_hour_slot_if_due, enqueue_recent_failures_retry_if_due,
-        enqueue_singleton_task_for_requester_and_payload, enqueue_task,
-        execute_brief_history_recompute_task, execute_brief_refresh_content_task,
+        enqueue_singleton_task_for_requester_and_payload, enqueue_subscription_run_if_due,
+        enqueue_task, execute_brief_history_recompute_task, execute_brief_refresh_content_task,
         execute_daily_slot_task, execute_sync_all_task_with, is_scheduled_task_type,
         load_due_daily_slot_users, load_recent_failed_brief_retry_candidates,
         load_recent_failed_translation_retry_candidates, load_translation_stream_cursor,
@@ -4216,6 +4216,57 @@ mod tests {
             current_subscription_schedule_key(on_the_half_hour, 10),
             "interval:10:1772808000"
         );
+    }
+
+    #[tokio::test]
+    async fn subscription_scheduler_waits_for_saved_interval_boundary_without_backfill() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        crate::admin_runtime::update_sync_auto_fetch_interval_minutes(&pool, 30)
+            .await
+            .expect("seed subscription interval");
+        sqlx::query(
+            "UPDATE admin_runtime_settings SET sync_auto_fetch_effective_at = ? WHERE id = 1",
+        )
+        .bind("2026-03-06T10:30:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed subscription effective boundary");
+
+        let before_boundary = enqueue_subscription_run_if_due(
+            state.as_ref(),
+            Utc.with_ymd_and_hms(2026, 3, 6, 10, 29, 59)
+                .single()
+                .expect("valid pre-boundary time"),
+        )
+        .await
+        .expect("pre-boundary scheduler check");
+        assert!(before_boundary.is_none());
+
+        let at_boundary = enqueue_subscription_run_if_due(
+            state.as_ref(),
+            Utc.with_ymd_and_hms(2026, 3, 6, 10, 30, 0)
+                .single()
+                .expect("valid boundary time"),
+        )
+        .await
+        .expect("boundary scheduler check")
+        .expect("boundary task");
+        let payload =
+            sqlx::query_scalar::<_, String>("SELECT payload_json FROM job_tasks WHERE id = ?")
+                .bind(at_boundary)
+                .fetch_one(&pool)
+                .await
+                .expect("load boundary task payload");
+        let payload: Value = serde_json::from_str(&payload).expect("parse boundary payload");
+        assert_eq!(payload["interval_minutes"], json!(30));
+        let effective_at: Option<String> = sqlx::query_scalar(
+            "SELECT sync_auto_fetch_effective_at FROM admin_runtime_settings WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load cleared effective boundary");
+        assert!(effective_at.is_none());
     }
 
     #[test]
