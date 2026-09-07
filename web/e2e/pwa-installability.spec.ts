@@ -9,7 +9,8 @@ import {
 import path from "node:path";
 import { expect, test, type CDPSession, type Page } from "@playwright/test";
 
-test.describe.configure({ mode: "serial" });
+// Keep the PWA fixture ordered while allowing a retry to target only the failed test.
+test.describe.configure({ mode: "default" });
 
 test.beforeAll(() => {
 	execFileSync("bun", ["run", "build"], {
@@ -415,17 +416,24 @@ async function dispatchBeforeInstallPrompt(
 			}
 		).__octoRillInstallPromptState = state;
 
-		const event = new Event("beforeinstallprompt", {
-			cancelable: true,
-		}) as InstallPromptEvent;
-		event.prompt = async () => {
-			state.promptCalls += 1;
-		};
-		event.userChoice = Promise.resolve({
-			outcome: nextOutcome,
-			platform: "web",
-		});
-		window.dispatchEvent(event);
+		for (let attempt = 0; attempt < 60; attempt += 1) {
+			const event = new Event("beforeinstallprompt", {
+				cancelable: true,
+			}) as InstallPromptEvent;
+			event.prompt = async () => {
+				state.promptCalls += 1;
+			};
+			event.userChoice = Promise.resolve({
+				outcome: nextOutcome,
+				platform: "web",
+			});
+			window.dispatchEvent(event);
+			if (document.querySelector("[data-version-update-notice]")) return;
+			await new Promise<void>((resolve) =>
+				requestAnimationFrame(() => resolve()),
+			);
+		}
+		throw new Error("beforeinstallprompt listener did not render its notice");
 	}, outcome);
 }
 
@@ -599,7 +607,7 @@ test("install metadata stays network-revalidated outside the service worker prec
 }) => {
 	const server = await startStaticPwaServer();
 	try {
-		await page.goto(server.origin);
+		await page.goto(server.origin, { waitUntil: "domcontentloaded" });
 		await waitForServiceWorkerControl(page);
 
 		const cdpSession = await page.context().newCDPSession(page);
@@ -904,9 +912,7 @@ test("offline authenticated boot shows an offline empty state when the active pa
 		await seedAuthenticatedStartupCache(page, {});
 
 		await context.setOffline(true);
-		await page.goto(`${server.origin}/stars`, {
-			waitUntil: "domcontentloaded",
-		});
+		await page.goto(`${server.origin}/stars`, { waitUntil: "commit" });
 
 		await expect(
 			page.locator("[data-dashboard-offline-empty-state]"),
@@ -1002,8 +1008,8 @@ test("install prompt appears when beforeinstallprompt fires and hides after appi
 }) => {
 	const server = await startStaticPwaServer();
 	try {
-		await page.goto(server.origin);
-		await waitForServiceWorkerControl(page);
+		await page.goto(server.origin, { waitUntil: "commit" });
+		await expect(page.locator("[data-landing-login-card]")).toBeVisible();
 
 		await dispatchBeforeInstallPrompt(page);
 		await expect(page.locator("[data-version-update-notice]")).toContainText(

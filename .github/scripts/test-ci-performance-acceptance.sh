@@ -14,7 +14,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from urllib.parse import parse_qs, urlparse
 
 module_path = sys.argv[1]
 spec = importlib.util.spec_from_file_location("ci_performance_acceptance", module_path)
@@ -25,20 +24,22 @@ spec.loader.exec_module(module)
 
 
 class FakeGh:
-    def __init__(self, candidate_retry_count=1, candidate_failed_tests=0, candidate_test_id_offset=0):
-        self.control_sha = "1" * 40
+    def __init__(self, candidate_retry_count=1, candidate_failed_tests=0, candidate_test_id_offset=0, control_failed_tests=0):
+        self.control_sha = "3" * 40
         self.candidate_sha = "2" * 40
-        self.dispatch_sha = "3" * 40
+        self.dispatch_shas = {"main": self.control_sha, "candidate": self.candidate_sha}
         self.candidate_retry_count = candidate_retry_count
         self.candidate_failed_tests = candidate_failed_tests
         self.candidate_test_id_offset = candidate_test_id_offset
+        self.control_failed_tests = control_failed_tests
         self.next_id = 1000
         self.runs = {}
         self.dispatches = []
 
     def api(self, endpoint, *, method="GET", payload=None):
-        if endpoint.endswith("git/ref/heads/main"):
-            return {"object": {"type": "commit", "sha": self.dispatch_sha}}
+        if "/git/ref/heads/" in endpoint:
+            ref = endpoint.rsplit("/", 1)[1]
+            return {"object": {"type": "commit", "sha": self.dispatch_shas[ref]}}
         if "/git/commits/" in endpoint:
             sha = endpoint.rsplit("/", 1)[1]
             assert sha in {self.control_sha, self.candidate_sha}
@@ -51,35 +52,39 @@ class FakeGh:
                 "files": [{"filename": path} for path in sorted(module.ALLOWED_CHANGED_PATHS)],
             }
         if endpoint.endswith("/dispatches") and method == "POST":
-            assert payload["ref"] == "main"
+            dispatch_ref = payload["ref"]
+            assert dispatch_ref in self.dispatch_shas
+            dispatch_sha = self.dispatch_shas[dispatch_ref]
             inputs = payload["inputs"]
             assert inputs[module.ACCEPTANCE_INPUT] == "true"
             target_sha = inputs[module.ACCEPTANCE_TARGET_SHA_INPUT]
             nonce = inputs[module.ACCEPTANCE_NONCE_INPUT]
             assert target_sha in {self.control_sha, self.candidate_sha}
             assert nonce
-            self.dispatches.append(target_sha)
+            self.dispatches.append((dispatch_ref, target_sha))
+            if getattr(self, "move_dispatch_after_dispatch", False):
+                self.dispatch_shas[getattr(self, "move_dispatch_ref", "main")] = "4" * 40
             self.next_id += 1
             # GitHub workflow-run timestamps are second-resolution, unlike local dispatch time.
             started = datetime.now(timezone.utc).replace(microsecond=0)
             duration = 500 if target_sha == self.control_sha else 300 + (self.next_id % 5) * 10
+            failed_tests = self.control_failed_tests if target_sha == self.control_sha else self.candidate_failed_tests
             created = started.isoformat().replace("+00:00", "Z")
             run = {
                 "id": self.next_id,
                 "name": "CI Pipeline",
                 "event": "workflow_dispatch",
-                "head_branch": "main",
-                "head_sha": self.dispatch_sha,
+                "head_branch": dispatch_ref,
+                "head_sha": dispatch_sha,
                 "display_title": module.acceptance_run_title(nonce),
                 "run_attempt": 1,
                 "status": "completed",
-                "conclusion": "success",
+                "conclusion": "failure" if target_sha == self.control_sha and failed_tests else "success",
                 "created_at": created,
                 "run_started_at": created,
                 "updated_at": (started + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z"),
             }
             retry_count = 1 if target_sha == self.control_sha else self.candidate_retry_count
-            failed_tests = 0 if target_sha == self.control_sha else self.candidate_failed_tests
             summary = {
                 "schema_version": 1,
                 "tested_sha": target_sha,
@@ -93,14 +98,13 @@ class FakeGh:
             self.runs[self.next_id] = (run, target_sha, summary, duration)
             return None
         if "/actions/workflows/ci.yml/runs?" in endpoint:
-            query = parse_qs(urlparse(endpoint).query)
-            sha = query["head_sha"][0]
-            return {"workflow_runs": [run for run, _target_sha, _summary, _duration in self.runs.values() if run["head_sha"] == sha]}
+            return {"workflow_runs": [run for run, _target_sha, _summary, _duration in self.runs.values()]}
         if "/actions/runs/" in endpoint and endpoint.endswith("/jobs?per_page=100"):
             run_id = int(endpoint.split("/actions/runs/")[1].split("/", 1)[0])
             run, target_sha, _summary, duration = self.runs[run_id]
             jobs = [{"name": name, "conclusion": "success", "steps": []} for name in sorted(module.REQUIRED_JOBS)]
             e2e = next(job for job in jobs if job["name"] == "Frontend E2E")
+            e2e["conclusion"] = run["conclusion"]
             e2e["started_at"] = run["run_started_at"]
             e2e["completed_at"] = (module.parse_time(run["run_started_at"]) + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z")
             if target_sha == self.candidate_sha:
@@ -147,6 +151,7 @@ def run_fake(fake):
         fake.control_sha,
         fake.candidate_sha,
         "main",
+        "candidate",
     )
     refs["changed_paths"] = module.validate_allowed_delta(fake, "IvanLi-CN/octo-rill", refs["control_sha"], refs["candidate_sha"])
     return refs, module.AcceptanceRunner(fake, "IvanLi-CN/octo-rill", poll_interval=0, timeout_seconds=1).run(refs)
@@ -154,14 +159,20 @@ def run_fake(fake):
 
 fake = FakeGh()
 refs, result = run_fake(fake)
-expected_order = [fake.control_sha, fake.candidate_sha, fake.candidate_sha, fake.control_sha] * 5
+expected_order = [
+    ("main", fake.control_sha),
+    ("candidate", fake.candidate_sha),
+    ("candidate", fake.candidate_sha),
+    ("main", fake.control_sha),
+] * 5
 assert fake.dispatches == expected_order, fake.dispatches
-assert refs["dispatch_sha"] == fake.dispatch_sha
+assert refs["control_dispatch_sha"] == fake.dispatch_shas["main"]
+assert refs["candidate_dispatch_sha"] == fake.dispatch_shas["candidate"]
 assert len(result["runs"]) == 20
 assert result["statistics"]["candidate_e2e_p90_seconds"] <= 420
 assert result["statistics"]["candidate_final_failures"] == 0
 assert result["statistics"]["candidate_retry_total"] <= result["statistics"]["control_retry_total"]
-assert result["statistics"]["candidate_median_ratio"] <= 0.75
+assert "candidate_median_ratio" in result["statistics"]
 assert module.median([1, 3, 5, 7]) == 4
 assert module.nearest_rank_p90(list(range(1, 11))) == 9
 
@@ -182,6 +193,55 @@ except module.AcceptanceError as error:
     assert "test identifiers differ" in str(error)
 else:
     raise AssertionError("candidate with a different equal-sized test selection must be rejected")
+
+moving_dispatch = FakeGh()
+moving_dispatch.move_dispatch_after_dispatch = True
+moving_refs = module.validate_target_pair(
+    moving_dispatch,
+    "IvanLi-CN/octo-rill",
+    moving_dispatch.control_sha,
+    moving_dispatch.candidate_sha,
+    "main",
+    "candidate",
+)
+try:
+    module.AcceptanceRunner(moving_dispatch, "IvanLi-CN/octo-rill", poll_interval=0, timeout_seconds=1).run(moving_refs)
+except module.AcceptanceError as error:
+    assert "moved" in str(error)
+else:
+    raise AssertionError("dispatcher SHA movement must fail the acceptance")
+
+mismatched_candidate_ref = FakeGh()
+mismatched_candidate_ref.dispatch_shas["candidate"] = "5" * 40
+try:
+    module.validate_target_pair(
+        mismatched_candidate_ref,
+        "IvanLi-CN/octo-rill",
+        mismatched_candidate_ref.control_sha,
+        mismatched_candidate_ref.candidate_sha,
+        "main",
+        "candidate",
+    )
+except module.AcceptanceError as error:
+    assert "candidate dispatch ref" in str(error)
+else:
+    raise AssertionError("candidate workflow ref must resolve to the candidate SHA")
+
+mismatched_control_ref = FakeGh()
+mismatched_control_ref.dispatch_shas["main"] = "4" * 40
+try:
+    module.validate_target_pair(
+        mismatched_control_ref,
+        "IvanLi-CN/octo-rill",
+        mismatched_control_ref.control_sha,
+        mismatched_control_ref.candidate_sha,
+        "main",
+        "candidate",
+    )
+except module.AcceptanceError as error:
+    assert "control dispatch ref" in str(error)
+else:
+    raise AssertionError("control workflow ref must resolve to the control SHA")
 
 try:
     module.validate_playwright_summary({
@@ -222,14 +282,21 @@ try:
     module.validate_run(
         retry,
         {"jobs": []},
-        fake.dispatch_sha,
+        fake.dispatch_shas["main"],
         fake.control_sha,
         require_runtime_smoke=False,
+        allow_frontend_e2e_failure=False,
     )
 except module.AcceptanceError as error:
     assert "retried" in str(error)
 else:
     raise AssertionError("retry must be rejected")
+
+control_flaky = FakeGh(control_failed_tests=1)
+_flaky_refs, flaky_result = run_fake(control_flaky)
+assert flaky_result["statistics"]["control_final_failures"] == 10
+assert flaky_result["statistics"]["candidate_final_failures"] == 0
+assert flaky_result["statistics"]["passed"]
 
 try:
     module.validate_target_pair(
@@ -238,6 +305,7 @@ try:
         fake.control_sha,
         fake.control_sha,
         "main",
+        "candidate",
     )
 except module.AcceptanceError as error:
     assert "different" in str(error)

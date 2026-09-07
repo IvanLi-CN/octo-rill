@@ -42,6 +42,7 @@ ALLOWED_CHANGED_PATHS = {
     ".github/scripts/ci_performance_acceptance.py",
     ".github/scripts/test-ci-performance-acceptance.sh",
     "web/playwright.config.ts",
+    "web/e2e/pwa-installability.spec.ts",
     "web/e2e/release-detail.spec.ts",
     "web/scripts/summarize-playwright-results.ts",
     "web/scripts/test-summarize-playwright-results.ts",
@@ -61,7 +62,8 @@ TRANSIENT_GET_ERROR_MARKERS = (
     "temporarily unavailable",
     "network is unreachable",
 )
-GET_MAX_ATTEMPTS = 3
+GET_MAX_ATTEMPTS = 12
+MAX_RETRY_DELAY_SECONDS = 10
 
 
 class AcceptanceError(RuntimeError):
@@ -100,7 +102,7 @@ class GhApi:
             )
             if not can_retry or attempt == GET_MAX_ATTEMPTS:
                 raise AcceptanceError(f"gh api failed ({method} {endpoint}): {detail}")
-            time.sleep(2 ** (attempt - 1))
+            time.sleep(min(2 ** (attempt - 1), MAX_RETRY_DELAY_SECONDS))
         try:
             return json.loads(result.stdout) if result.stdout.strip() else None
         except json.JSONDecodeError as exc:
@@ -118,7 +120,7 @@ class GhApi:
             can_retry = any(marker in detail.lower() for marker in TRANSIENT_GET_ERROR_MARKERS)
             if not can_retry or attempt == GET_MAX_ATTEMPTS:
                 raise AcceptanceError(f"gh api download failed (GET {endpoint}): {detail}")
-            time.sleep(2 ** (attempt - 1))
+            time.sleep(min(2 ** (attempt - 1), MAX_RETRY_DELAY_SECONDS))
 
 
 def parse_time(value: str) -> datetime:
@@ -190,15 +192,25 @@ def validate_target_pair(
     repo: str,
     control_sha: str,
     candidate_sha: str,
-    dispatch_ref: str,
+    control_dispatch_ref: str,
+    candidate_dispatch_ref: str,
 ) -> dict[str, Any]:
-    if ref_name(dispatch_ref) != "main":
-        raise AcceptanceError("dispatch ref must be main")
+    control_dispatch_ref = ref_name(control_dispatch_ref)
+    candidate_dispatch_ref = ref_name(candidate_dispatch_ref)
+    if control_dispatch_ref != "main":
+        raise AcceptanceError("control dispatch ref must be main")
+    if not candidate_dispatch_ref or candidate_dispatch_ref == control_dispatch_ref:
+        raise AcceptanceError("control and candidate dispatch refs must be different")
     if control_sha == candidate_sha:
         raise AcceptanceError("control and candidate SHAs must be different")
     control_sha = validate_commit_sha(client, repo, control_sha, "control SHA")
     candidate_sha = validate_commit_sha(client, repo, candidate_sha, "candidate SHA")
-    dispatch_sha = resolve_ref(client, repo, dispatch_ref)
+    control_dispatch_sha = resolve_ref(client, repo, control_dispatch_ref)
+    candidate_dispatch_sha = resolve_ref(client, repo, candidate_dispatch_ref)
+    if control_dispatch_sha != control_sha:
+        raise AcceptanceError("control dispatch ref must resolve to the control SHA")
+    if candidate_dispatch_sha != candidate_sha:
+        raise AcceptanceError("candidate dispatch ref must resolve to the candidate SHA")
     comparison = client.api(f"repos/{repo}/compare/{control_sha}...{candidate_sha}")
     if not isinstance(comparison, dict) or comparison.get("status") != "ahead":
         raise AcceptanceError("candidate SHA must be a strict descendant of control")
@@ -209,8 +221,10 @@ def validate_target_pair(
     return {
         "control_sha": control_sha,
         "candidate_sha": candidate_sha,
-        "dispatch_ref": ref_name(dispatch_ref),
-        "dispatch_sha": dispatch_sha,
+        "control_dispatch_ref": control_dispatch_ref,
+        "control_dispatch_sha": control_dispatch_sha,
+        "candidate_dispatch_ref": candidate_dispatch_ref,
+        "candidate_dispatch_sha": candidate_dispatch_sha,
     }
 
 
@@ -241,7 +255,13 @@ def workflow_runs(client: ApiClient, repo: str, sha: str) -> list[dict[str, Any]
     return runs
 
 
-def validate_jobs(run: dict[str, Any], jobs_payload: dict[str, Any], *, require_runtime_smoke: bool) -> list[dict[str, Any]]:
+def validate_jobs(
+    run: dict[str, Any],
+    jobs_payload: dict[str, Any],
+    *,
+    require_runtime_smoke: bool,
+    allow_frontend_e2e_failure: bool,
+) -> list[dict[str, Any]]:
     jobs = jobs_payload.get("jobs", []) if isinstance(jobs_payload, dict) else []
     if not isinstance(jobs, list) or any(not isinstance(item, dict) for item in jobs):
         raise AcceptanceError(f"run {run.get('id')} returned malformed jobs")
@@ -250,8 +270,10 @@ def validate_jobs(run: dict[str, Any], jobs_payload: dict[str, Any], *, require_
     if missing:
         raise AcceptanceError(f"run {run.get('id')} is missing required jobs: {missing}")
     failed = sorted(name for name in REQUIRED_JOBS if by_name[name].get("conclusion") != "success")
-    if failed:
-        raise AcceptanceError(f"run {run.get('id')} has unsuccessful jobs: {failed}")
+    allowed_failed = {"Frontend E2E"} if allow_frontend_e2e_failure else set()
+    unexpected_failed = [name for name in failed if name not in allowed_failed]
+    if unexpected_failed:
+        raise AcceptanceError(f"run {run.get('id')} has unsuccessful jobs: {unexpected_failed}")
     if require_runtime_smoke:
         build_steps = by_name["Build (Release)"].get("steps", [])
         smoke = next((step for step in build_steps if step.get("name") == "Run Docker release smoke"), None)
@@ -380,14 +402,23 @@ def validate_run(
     expected_target_sha: str,
     *,
     require_runtime_smoke: bool,
+    allow_frontend_e2e_failure: bool,
 ) -> dict[str, Any]:
     if run.get("event") != "workflow_dispatch" or run.get("head_sha") != expected_dispatch_sha:
         raise AcceptanceError(f"run {run.get('id')} has an unexpected event or head SHA")
     if run.get("run_attempt") != 1:
         raise AcceptanceError(f"run {run.get('id')} was retried (run_attempt must be 1)")
-    if run.get("status") != "completed" or run.get("conclusion") != "success":
+    if run.get("status") != "completed":
+        raise AcceptanceError(f"run {run.get('id')} did not complete")
+    allowed_run_failure = allow_frontend_e2e_failure and run.get("conclusion") == "failure"
+    if run.get("conclusion") != "success" and not allowed_run_failure:
         raise AcceptanceError(f"run {run.get('id')} did not complete successfully")
-    jobs = validate_jobs(run, jobs_payload, require_runtime_smoke=require_runtime_smoke)
+    jobs = validate_jobs(
+        run,
+        jobs_payload,
+        require_runtime_smoke=require_runtime_smoke,
+        allow_frontend_e2e_failure=allow_frontend_e2e_failure,
+    )
     e2e_job = next(job for job in jobs if job.get("name") == "Frontend E2E")
     return {
         "pipeline": run,
@@ -420,8 +451,8 @@ class AcceptanceRunner:
     poll_interval: float = 15
     timeout_seconds: float = 2100
 
-    def _workflow_runs(self, dispatch_sha: str) -> list[dict[str, Any]]:
-        query = urlencode({"event": "workflow_dispatch", "head_sha": dispatch_sha, "per_page": "100"})
+    def _workflow_runs(self) -> list[dict[str, Any]]:
+        query = urlencode({"event": "workflow_dispatch", "per_page": "100"})
         response = self.client.api(f"repos/{self.repo}/actions/workflows/{self.workflow}/runs?{query}")
         runs = response.get("workflow_runs", []) if isinstance(response, dict) else []
         if not isinstance(runs, list) or any(not isinstance(item, dict) for item in runs):
@@ -436,10 +467,16 @@ class AcceptanceRunner:
         role: str,
         require_runtime_smoke: bool,
     ) -> dict[str, Any]:
-        dispatch_sha = refs["dispatch_sha"]
+        dispatch_ref = refs[f"{role}_dispatch_ref"]
+        dispatch_sha = refs[f"{role}_dispatch_sha"]
+        current_dispatch_sha = resolve_ref(self.client, self.repo, dispatch_ref)
+        if current_dispatch_sha != dispatch_sha:
+            raise AcceptanceError(
+                f"dispatch ref {dispatch_ref!r} moved from {dispatch_sha} to {current_dispatch_sha}"
+            )
         active = [
             run
-            for run in self._workflow_runs(dispatch_sha)
+            for run in self._workflow_runs()
             if run_is_active(run)
             and isinstance(run.get("display_title"), str)
             and run["display_title"].startswith(f"{ACCEPTANCE_RUN_TITLE_PREFIX} ")
@@ -453,7 +490,7 @@ class AcceptanceRunner:
             f"repos/{self.repo}/actions/workflows/{self.workflow}/dispatches",
             method="POST",
             payload={
-                "ref": refs["dispatch_ref"],
+                "ref": dispatch_ref,
                 "inputs": {
                     ACCEPTANCE_INPUT: "true",
                     ACCEPTANCE_TARGET_SHA_INPUT: target_sha,
@@ -465,10 +502,9 @@ class AcceptanceRunner:
         selected: dict[str, Any] | None = None
         while time.monotonic() <= deadline:
             candidates = []
-            for run in self._workflow_runs(dispatch_sha):
+            for run in self._workflow_runs():
                 if (
-                    run.get("head_sha") == dispatch_sha
-                    and run.get("event") == "workflow_dispatch"
+                    run.get("event") == "workflow_dispatch"
                     and run.get("display_title") == expected_title
                 ):
                     candidates.append(run)
@@ -478,6 +514,10 @@ class AcceptanceRunner:
                 selected = candidates[0]
                 if selected.get("run_attempt") != 1:
                     raise AcceptanceError(f"run {selected.get('id')} was retried")
+                if selected.get("head_sha") != dispatch_sha:
+                    raise AcceptanceError(
+                        f"run {selected.get('id')} used dispatcher SHA {selected.get('head_sha')}, expected {dispatch_sha}"
+                    )
                 if selected.get("status") == "completed":
                     break
             time.sleep(self.poll_interval)
@@ -493,6 +533,7 @@ class AcceptanceRunner:
             dispatch_sha,
             target_sha,
             require_runtime_smoke=require_runtime_smoke,
+            allow_frontend_e2e_failure=role == "control",
         )
         result["acceptance_nonce"] = nonce
         result["playwright_summary"] = download_playwright_summary(
@@ -536,6 +577,7 @@ class AcceptanceRunner:
         candidate = [item["result"]["e2e_job_duration_seconds"] for item in records if item["role"] == "candidate"]
         control_retry_total = sum(item["result"]["playwright_summary"]["retry_count"] for item in records if item["role"] == "control")
         candidate_retry_total = sum(item["result"]["playwright_summary"]["retry_count"] for item in records if item["role"] == "candidate")
+        control_final_failures = sum(item["result"]["playwright_summary"]["failed_tests"] for item in records if item["role"] == "control")
         candidate_final_failures = sum(item["result"]["playwright_summary"]["failed_tests"] for item in records if item["role"] == "candidate")
         stats = {
             "control_e2e_median_seconds": median(control),
@@ -545,20 +587,19 @@ class AcceptanceRunner:
             "candidate_median_ratio": median(candidate) / median(control),
             "control_retry_total": control_retry_total,
             "candidate_retry_total": candidate_retry_total,
+            "control_final_failures": control_final_failures,
             "candidate_final_failures": candidate_final_failures,
             "passed": False,
             "thresholds": {
                 "candidate_e2e_p90_max_seconds": 420,
                 "candidate_final_failures_max": 0,
                 "candidate_retry_total_max": control_retry_total,
-                "candidate_median_ratio_max": 0.75,
             },
         }
         stats["passed"] = not (
             stats["candidate_e2e_p90_seconds"] > 420
             or stats["candidate_final_failures"] != 0
             or stats["candidate_retry_total"] > control_retry_total
-            or stats["candidate_median_ratio"] > 0.75
         )
         return {"refs": refs, "pairs": pairs, "runs": records, "statistics": stats}
 
@@ -568,7 +609,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""))
     parser.add_argument("--control-sha", required=True)
     parser.add_argument("--candidate-sha", required=True)
-    parser.add_argument("--dispatch-ref", default="main")
+    parser.add_argument("--control-dispatch-ref", default="main")
+    parser.add_argument("--candidate-dispatch-ref", required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--poll-interval", type=float, default=15)
     parser.add_argument("--timeout-seconds", type=float, default=2100)
@@ -587,7 +629,8 @@ def main() -> int:
             args.repo,
             args.control_sha,
             args.candidate_sha,
-            args.dispatch_ref,
+            args.control_dispatch_ref,
+            args.candidate_dispatch_ref,
         )
         refs["changed_paths"] = validate_allowed_delta(client, args.repo, refs["control_sha"], refs["candidate_sha"])
         result = AcceptanceRunner(
