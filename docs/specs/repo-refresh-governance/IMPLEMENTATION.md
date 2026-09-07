@@ -6,7 +6,7 @@
 - Implementation: 已交付
 - Created: 2026-06-29
 - Last: 2026-08-10
-- Summary: 已交付；effective repo pool、10 分钟 budgeted governance snapshots、attempt-based system cycle ledger、chunked governance rebuild、`/admin/repos` 独立治理页、闲置账号暂停与自助恢复、Dashboard Release 自适应新鲜度与任务审计、预算编辑收口到订阅同步设置弹窗、仓库明细目标窗口/迫切值筛选、带主题模式切换的暂停恢复页、策略帮助与移动弹窗适配、Storybook 和 build validation 已完成
+- Summary: 已交付；effective repo pool、按订阅同步间隔冻结的 budgeted governance snapshots、attempt-based system cycle ledger、chunked governance rebuild、`/admin/repos` 独立治理页、闲置账号暂停与自助恢复、Dashboard Release 自适应新鲜度与任务审计、预算编辑收口到订阅同步设置弹窗、仓库明细目标窗口/迫切值筛选、带主题模式切换的暂停恢复页、策略帮助与移动弹窗适配、Storybook 和 build validation 已完成
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -16,6 +16,7 @@
 - Account suspension: `users.paused_at`、03:15 时区维护与 missed-run recovery 已交付；暂停会话通过 `GET /api/me` 读取状态并从 `/account/paused` 自助恢复，业务 API、API key、后台候选池和有效关注池均排除暂停账号。
 - Governance retention: active-cycle reconciliation excludes completed history; completed member rows are pruned in best-effort 500-row transactions under a SQLite-persisted, shared 50000-row-per-minute budget while cycle summaries remain queryable.
 - Existing production databases require a separately approved maintenance window before converting to incremental auto-vacuum with a full `VACUUM`.
+- Migration `0076_subscription_governance_window.sql` adds `window_minutes`, `last_selection_window_index`, and `sync_auto_fetch_effective_at`; existing cycles backfill `window_minutes=10` and preserve their prior selection index, while tasks, members, and watchers remain untouched.
 
 ## 实现里程碑
 

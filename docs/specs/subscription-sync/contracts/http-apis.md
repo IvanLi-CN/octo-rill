@@ -37,6 +37,7 @@ Response shape:
 ```json
 {
   "sync_auto_fetch_interval_minutes": 10,
+  "sync_auto_fetch_effective_at": "2026-04-27T08:30:00Z",
   "retry_recent_failures_interval_minutes": 10,
   "repo_release_worker_concurrency": 5,
   "recent_sync_tasks": [
@@ -56,6 +57,7 @@ Response shape:
 Notes:
 
 - `sync_auto_fetch_interval_minutes` is global, admin-only, and clamped by validation to `1-120`, defaulting to `60`.
+- `sync_auto_fetch_effective_at` is nullable when no pending interval change exists; otherwise it is the next strictly-later UTC epoch-aligned boundary.
 - `retry_recent_failures_interval_minutes` is global, admin-only, and clamped by validation to `1-120`, defaulting to `10`.
 - `repo_release_worker_concurrency` is global, admin-only, clamped by validation to `1-32`, and defaults to `5`.
 - `repo_release_worker_concurrency` controls active shared repo release worker slots only; it does not change `sync.subscriptions` scheduler cadence.
@@ -75,9 +77,12 @@ Request shape:
 }
 ```
 
+`sync_auto_fetch_interval_minutes` is optional. Omit it when changing retry, daily brief, webhook, worker, budget, or freshness settings so the pending subscription-sync effective time is preserved.
+
 Behavior:
 
 - `sync_auto_fetch_interval_minutes` must be between `1` and `120`.
+- When present, `sync_auto_fetch_interval_minutes` becomes effective only at the returned `sync_auto_fetch_effective_at` boundary; the scheduler does not catch up before it.
 - `retry_recent_failures_interval_minutes`, when present, must be between `1` and `120`.
 - `repo_release_worker_concurrency`, when present, must be between `1` and `32`.
 - The response uses the same shape as `GET /api/admin/jobs/sync/runtime-config`.
@@ -100,7 +105,7 @@ Route behavior:
 - Shows `sync.subscriptions` runs as a workflow list.
 - Links each run to `/admin/jobs/subscriptions/{task_id}`.
 - Shares `GET/PATCH /api/admin/jobs/sync/runtime-config` with the scheduled tab for the settings button.
-- The shared settings dialog groups `sync.subscriptions` and `retry.recent_failures` intervals separately.
+- The shared settings dialog makes `sync.subscriptions` interval/budget the only editable subscription controls; the scheduled task dialog shows a read-only summary and link, while `retry.recent_failures` remains separately editable.
 
 ## `/admin/jobs/subscriptions/{task_id}`
 
