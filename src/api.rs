@@ -1573,6 +1573,7 @@ fn api_key_summary_from_row(
 #[derive(Debug, Serialize)]
 pub struct SyncRuntimeConfigResponse {
     sync_auto_fetch_interval_minutes: i64,
+    sync_auto_fetch_effective_at: Option<String>,
     retry_recent_failures_interval_minutes: i64,
     repo_release_worker_concurrency: usize,
     repo_refresh_system_budget_per_window: i64,
@@ -1583,7 +1584,7 @@ pub struct SyncRuntimeConfigResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct SyncRuntimeConfigPatchRequest {
-    sync_auto_fetch_interval_minutes: i64,
+    sync_auto_fetch_interval_minutes: Option<i64>,
     retry_recent_failures_interval_minutes: Option<i64>,
     repo_release_worker_concurrency: Option<i64>,
     repo_refresh_system_budget_per_window: Option<i64>,
@@ -1604,6 +1605,9 @@ pub struct AdminRepoGovernanceCycleSummary {
     active_cycle_started_at: Option<String>,
     active_cycle_repo_count: i64,
     active_cycle_completed_count: i64,
+    active_cycle_window_minutes: Option<i64>,
+    active_cycle_window_budget: Option<i64>,
+    active_cycle_last_selection_window_index: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1725,6 +1729,10 @@ async fn load_sync_runtime_config(state: &AppState) -> Result<SyncRuntimeConfigR
     let interval = admin_runtime::load_sync_auto_fetch_interval_minutes(&state.pool)
         .await
         .map_err(ApiError::internal)?;
+    let sync_auto_fetch_effective_at =
+        admin_runtime::load_sync_auto_fetch_effective_at(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
     let repo_release_worker_concurrency =
         admin_runtime::load_repo_release_worker_concurrency(&state.pool)
             .await
@@ -1748,6 +1756,7 @@ async fn load_sync_runtime_config(state: &AppState) -> Result<SyncRuntimeConfigR
 
     Ok(SyncRuntimeConfigResponse {
         sync_auto_fetch_interval_minutes: interval,
+        sync_auto_fetch_effective_at,
         retry_recent_failures_interval_minutes,
         repo_release_worker_concurrency,
         repo_refresh_system_budget_per_window,
@@ -1820,7 +1829,9 @@ async fn persist_sync_runtime_config(
     state: &AppState,
     req: SyncRuntimeConfigPatchRequest,
 ) -> Result<SyncRuntimeConfigResponse, ApiError> {
-    if !(1..=120).contains(&req.sync_auto_fetch_interval_minutes) {
+    if let Some(interval) = req.sync_auto_fetch_interval_minutes
+        && !(1..=120).contains(&interval)
+    {
         return Err(ApiError::bad_request(
             "sync_auto_fetch_interval_minutes must be between 1 and 120",
         ));
@@ -1863,12 +1874,11 @@ async fn persist_sync_runtime_config(
         validate_daily_brief_schedule_against_enabled_slots(state, local_time).await?;
     }
 
-    admin_runtime::update_sync_auto_fetch_interval_minutes(
-        &state.pool,
-        req.sync_auto_fetch_interval_minutes,
-    )
-    .await
-    .map_err(ApiError::internal)?;
+    if let Some(interval) = req.sync_auto_fetch_interval_minutes {
+        admin_runtime::update_sync_auto_fetch_interval_minutes(&state.pool, interval)
+            .await
+            .map_err(ApiError::internal)?;
+    }
     if let Some(interval) = req.retry_recent_failures_interval_minutes {
         admin_runtime::update_retry_recent_failures_interval_minutes(&state.pool, interval)
             .await
@@ -1969,7 +1979,14 @@ pub async fn admin_get_repo_governance_overview(
 
     let active_cycle_row = sqlx::query(
         r#"
-        SELECT id, started_at, frozen_repo_count, completed_repo_count
+        SELECT
+          id,
+          started_at,
+          frozen_repo_count,
+          completed_repo_count,
+          window_minutes,
+          window_budget,
+          last_selection_window_index
         FROM repo_refresh_governance_cycles
         WHERE status = 'active'
         ORDER BY started_at DESC
@@ -1986,6 +2003,9 @@ pub async fn admin_get_repo_governance_overview(
             active_cycle_started_at: row.get("started_at"),
             active_cycle_repo_count: row.get("frozen_repo_count"),
             active_cycle_completed_count: row.get("completed_repo_count"),
+            active_cycle_window_minutes: row.get("window_minutes"),
+            active_cycle_window_budget: row.get("window_budget"),
+            active_cycle_last_selection_window_index: row.get("last_selection_window_index"),
         }
     } else {
         AdminRepoGovernanceCycleSummary {
@@ -1993,6 +2013,9 @@ pub async fn admin_get_repo_governance_overview(
             active_cycle_started_at: None,
             active_cycle_repo_count: 0,
             active_cycle_completed_count: 0,
+            active_cycle_window_minutes: None,
+            active_cycle_window_budget: None,
+            active_cycle_last_selection_window_index: None,
         }
     };
 
@@ -2001,6 +2024,7 @@ pub async fn admin_get_repo_governance_overview(
         SELECT
           repo_id,
           actual_last_success_at,
+          target_window,
           target_interval_minutes,
           urgency_score,
           system_last_attempt_status
@@ -2038,16 +2062,8 @@ pub async fn admin_get_repo_governance_overview(
                 })
                 .unwrap_or("unknown")
                 .to_owned();
-            let band_label = if target_interval_minutes <= 10 {
-                "10m"
-            } else if target_interval_minutes <= 60 {
-                "1h"
-            } else if target_interval_minutes <= 6 * 60 {
-                "6h"
-            } else {
-                "long"
-            }
-            .to_owned();
+            let target_window: i64 = row.get("target_window");
+            let band_label = format!("W{target_window} · {target_interval_minutes} 分钟");
             AdminRepoGovernanceGridCell {
                 repo_id: row.get("repo_id"),
                 age_bucket,
@@ -4416,6 +4432,15 @@ pub struct AdminSyncSubscriptionReleaseDiagnostics {
 }
 
 #[derive(Debug, Serialize)]
+pub struct AdminSyncSubscriptionGovernanceDiagnostics {
+    window_minutes: i64,
+    window_budget: i64,
+    cycle_id: Option<String>,
+    selection_window_index: Option<i64>,
+    selected_repos: i64,
+}
+
+#[derive(Debug, Serialize)]
 pub struct AdminSyncSubscriptionSocialDiagnostics {
     total_users: i64,
     succeeded_users: i64,
@@ -4539,6 +4564,7 @@ pub struct AdminSyncSubscriptionsDiagnostics {
     log_download_path: Option<String>,
     star: AdminSyncSubscriptionStarDiagnostics,
     release: AdminSyncSubscriptionReleaseDiagnostics,
+    governance: Option<AdminSyncSubscriptionGovernanceDiagnostics>,
     social: AdminSyncSubscriptionSocialDiagnostics,
     notifications: AdminSyncSubscriptionNotificationsDiagnostics,
     releases_written: i64,
@@ -5730,6 +5756,7 @@ fn build_sync_subscriptions_diagnostics(
     let result_object = result_value.as_ref().and_then(serde_json::Value::as_object);
     let star_object = json_object_get_object(result_object, "star");
     let release_object = json_object_get_object(result_object, "release");
+    let governance_object = json_object_get_object(result_object, "governance");
     let social_object = json_object_get_object(result_object, "social");
     let notifications_object = json_object_get_object(result_object, "notifications");
 
@@ -5754,6 +5781,13 @@ fn build_sync_subscriptions_diagnostics(
         unchanged_count: json_object_get_i64(release_object, "unchanged_count").unwrap_or(0),
         pages_fetched: json_object_get_i64(release_object, "pages_fetched").unwrap_or(0),
     };
+    let governance = governance_object.map(|object| AdminSyncSubscriptionGovernanceDiagnostics {
+        window_minutes: json_object_get_i64(Some(object), "window_minutes").unwrap_or(0),
+        window_budget: json_object_get_i64(Some(object), "window_budget").unwrap_or(0),
+        cycle_id: json_object_get_string(Some(object), "cycle_id"),
+        selection_window_index: json_object_get_i64(Some(object), "selection_window_index"),
+        selected_repos: json_object_get_i64(Some(object), "selected_repos").unwrap_or(0),
+    });
     let mut social = AdminSyncSubscriptionSocialDiagnostics {
         total_users: json_object_get_i64(social_object, "total_users").unwrap_or(0),
         succeeded_users: json_object_get_i64(social_object, "succeeded_users").unwrap_or(0),
@@ -5868,6 +5902,7 @@ fn build_sync_subscriptions_diagnostics(
             log_download_path,
             star,
             release,
+            governance,
             social,
             notifications,
             releases_written,
@@ -36245,7 +36280,7 @@ echo should_not_be_in_excerpt
         let settings = super::persist_sync_runtime_config(
             state.as_ref(),
             super::SyncRuntimeConfigPatchRequest {
-                sync_auto_fetch_interval_minutes: 10,
+                sync_auto_fetch_interval_minutes: Some(10),
                 retry_recent_failures_interval_minutes: Some(15),
                 repo_release_worker_concurrency: Some(12),
                 repo_refresh_system_budget_per_window: None,
@@ -36257,6 +36292,7 @@ echo should_not_be_in_excerpt
         .expect("sync settings update should succeed");
 
         assert_eq!(settings.sync_auto_fetch_interval_minutes, 10);
+        assert!(settings.sync_auto_fetch_effective_at.is_some());
         assert_eq!(settings.retry_recent_failures_interval_minutes, 15);
         assert_eq!(settings.repo_release_worker_concurrency, 12);
         assert_eq!(settings.dashboard_release_freshness_profile, "capacity");
@@ -36281,6 +36317,45 @@ echo should_not_be_in_excerpt
     }
 
     #[tokio::test]
+    async fn persist_sync_runtime_config_without_interval_preserves_effective_at() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        let initial = super::persist_sync_runtime_config(
+            state.as_ref(),
+            super::SyncRuntimeConfigPatchRequest {
+                sync_auto_fetch_interval_minutes: Some(30),
+                retry_recent_failures_interval_minutes: None,
+                repo_release_worker_concurrency: None,
+                repo_refresh_system_budget_per_window: None,
+                dashboard_release_freshness_profile: None,
+                daily_brief_schedule_local_time: None,
+            },
+        )
+        .await
+        .expect("initial interval update should succeed");
+        let effective_at = initial.sync_auto_fetch_effective_at.clone();
+
+        let updated = super::persist_sync_runtime_config(
+            state.as_ref(),
+            super::SyncRuntimeConfigPatchRequest {
+                sync_auto_fetch_interval_minutes: None,
+                retry_recent_failures_interval_minutes: Some(15),
+                repo_release_worker_concurrency: None,
+                repo_refresh_system_budget_per_window: None,
+                dashboard_release_freshness_profile: None,
+                daily_brief_schedule_local_time: None,
+            },
+        )
+        .await
+        .expect("non-interval update should succeed");
+
+        assert_eq!(updated.sync_auto_fetch_interval_minutes, 30);
+        assert_eq!(updated.sync_auto_fetch_effective_at, effective_at);
+        assert_eq!(updated.retry_recent_failures_interval_minutes, 15);
+    }
+
+    #[tokio::test]
     async fn persist_sync_runtime_config_rejects_unknown_freshness_profile() {
         let pool = setup_pool().await;
         let state = setup_state(pool);
@@ -36288,7 +36363,7 @@ echo should_not_be_in_excerpt
         let err = super::persist_sync_runtime_config(
             state.as_ref(),
             super::SyncRuntimeConfigPatchRequest {
-                sync_auto_fetch_interval_minutes: 10,
+                sync_auto_fetch_interval_minutes: Some(10),
                 retry_recent_failures_interval_minutes: None,
                 repo_release_worker_concurrency: None,
                 repo_refresh_system_budget_per_window: None,
@@ -36315,7 +36390,7 @@ echo should_not_be_in_excerpt
             let err = super::persist_sync_runtime_config(
                 state.as_ref(),
                 super::SyncRuntimeConfigPatchRequest {
-                    sync_auto_fetch_interval_minutes: interval,
+                    sync_auto_fetch_interval_minutes: Some(interval),
                     retry_recent_failures_interval_minutes: None,
                     repo_release_worker_concurrency: None,
                     repo_refresh_system_budget_per_window: None,
@@ -36342,7 +36417,7 @@ echo should_not_be_in_excerpt
         let err = super::persist_sync_runtime_config(
             state.as_ref(),
             super::SyncRuntimeConfigPatchRequest {
-                sync_auto_fetch_interval_minutes: 10,
+                sync_auto_fetch_interval_minutes: Some(10),
                 retry_recent_failures_interval_minutes: Some(0),
                 repo_release_worker_concurrency: None,
                 repo_refresh_system_budget_per_window: None,
@@ -36368,7 +36443,7 @@ echo should_not_be_in_excerpt
         let err = super::persist_sync_runtime_config(
             state.as_ref(),
             super::SyncRuntimeConfigPatchRequest {
-                sync_auto_fetch_interval_minutes: 10,
+                sync_auto_fetch_interval_minutes: Some(10),
                 retry_recent_failures_interval_minutes: None,
                 repo_release_worker_concurrency: Some(33),
                 repo_refresh_system_budget_per_window: None,

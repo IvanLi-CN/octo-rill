@@ -30,7 +30,7 @@
   - 挂到共享 repo release queue
   - 等待关联 outcome 并输出 `Release + social + Inbox` 摘要
 - `GET /api/me` 返回 `access_sync` 元信息，前端可直接附着到用户自己的 task SSE。
-- Admin Jobs 允许管理员配置全局自动获取间隔，并展示最近三次 `sync.subscriptions` 用时。
+- Admin Jobs 允许管理员在“订阅同步设置”中配置全局自动获取间隔，并展示最近三次 `sync.subscriptions` 用时；该间隔同时是 Release 治理预算窗口长度。
 - Admin Jobs 提供订阅同步专用视图和详情入口，支持查看所有 `sync.subscriptions` 运行，不论来自定时、手动还是重试。
 - Release 阶段支持运行时调整共享 repo release worker 数量；该设置只影响吞吐，不降低调度频率。
 - Release 抓取使用 GitHub conditional request 复用 `ETag` / `Last-Modified`，未变化仓库可以快速完成 watcher，而不是下载完整 release 列表。
@@ -108,8 +108,9 @@
 
 ### Admin Jobs 全局自动获取控制
 
-- Admin Jobs 的定时任务页展示全局 `sync_auto_fetch_interval_minutes` 控件，允许保存 `1-120` 分钟。
+- “订阅同步设置”是 `sync_auto_fetch_interval_minutes` 的唯一编辑入口，允许保存 `1-120` 分钟；“任务间隔设置”只读展示当前值、下次生效时间并跳转到该入口。
 - 该配置保存在 `admin_runtime_settings`，仅影响全局 `sync.subscriptions` 定时拉取，不影响账号访问状态。
+- 保存后持久化 `sync_auto_fetch_effective_at`，取严格大于保存时刻的下一个 UTC epoch 对齐边界；边界前不得入队或补跑，边界后才按新间隔触发。
 - 同一区域展示最近三次全局 `sync.subscriptions` 任务：
   - 来源为 `job_tasks.task_type = sync.subscriptions`
   - 排除 `result_json.skipped = true` 的跳过记录
@@ -126,7 +127,7 @@
 - `/admin/jobs/subscriptions` 是订阅同步专用入口。
 - 列表只展示 `task_type = sync.subscriptions` 的任务，覆盖定时、手动、重试来源。
 - 列表页和详情页共享设置入口，设置项包括：
-  - 全局自动获取间隔；
+  - 全局自动获取间隔与 Release 治理预算窗口；
   - Release worker 数量。
 - 详情按工作流阶段展示：
   - collect；
@@ -158,6 +159,11 @@
 - 若账号在旧版本里已经持有 `follower_current_members` / `repo_star_current_members`，但对应社交事件为空，则 social 阶段必须在下一次正常 sync 中自动完成事件流可见化，不依赖手工 SQL 补写。
 - social / notifications 阶段遇到 GitHub nullable bool（如 `usesCustomOpenGraphImage = null`、`unread = null`）时，必须按兼容默认值继续同步，而不是把整轮任务降级成 decode_error。
 - social 或 Inbox 若失败，访问刷新任务仍返回成功，并把对应错误附带到阶段事件 / 结果 JSON 中。
+
+### 订阅同步治理周期与管理员重试
+
+- 每个治理 cycle 冻结启动时的 `N+B`，任务结果、cycle、事件和 diagnostics 保存实际 `N`、`B`、cycle ID 与选择窗口。
+- 管理员重试只复用原任务 `repo_release_watchers` 中失败或未完成的 work item，不重新水合候选仓库、不执行新的预算选择，也不绕过同一 cycle/window 的 `B` 上限。
 
 ### 共享 repo release queue
 
@@ -250,7 +256,15 @@
 
 - Given 管理员在 Admin Jobs 定时任务页配置 `1-120` 分钟自动获取间隔
   When 保存设置
-  Then 后端持久化全局 `sync_auto_fetch_interval_minutes`，后续 scheduler 按该间隔判断是否触发 `sync.subscriptions`。
+  Then 后端持久化全局 `sync_auto_fetch_interval_minutes` 与严格大于保存时刻的 `sync_auto_fetch_effective_at`，后续 scheduler 在边界后按该间隔判断是否触发 `sync.subscriptions`。
+
+- Given 当前存在活动治理 cycle
+  When 管理员保存新的同步间隔或预算
+  Then 当前 cycle 继续使用启动时的 `N+B`，新配置只在下一完整 cycle 采用，历史 diagnostics 不被改写。
+
+- Given 管理员重试已结束的 `sync.subscriptions`
+  When 原任务存在失败或未完成的 `repo_release_watchers`
+  Then 新任务只处理这些 watcher 对应的 work item，不产生新的候选仓库选择。
 
 - Given 系统已有最近三次 `sync.subscriptions` 历史
   When 打开 Admin Jobs 定时任务页
@@ -478,7 +492,6 @@ story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
 state=subscription-sync-neutral-frame
 evidence_note=验证订阅同步工作流卡片使用统一中性外框，不再出现左上角异常图案或左侧额外装饰，状态仅通过 badge 与阶段摘要表达。
 
-PR: include
 ![Subscription sync neutral frame accent](./assets/subscription-sync-workflow-neutral-frame-storybook.png)
 
 source_type=storybook_canvas
@@ -506,3 +519,7 @@ state=subscription-sync-observability-mobile-320
 evidence_note=验证 320px 窄屏下统计保持紧凑并列，订阅同步记录高度受控，阶段指标与异常摘要不遮挡、不溢出。
 
 ![Subscription sync observability mobile 320](./assets/subscription-sync-workflow-mobile-320.png)
+
+## Related ADRs
+
+- [ADR 0005: Unify Subscription and Governance Windows](../../adr/0005-subscription-governance-window.md)

@@ -420,6 +420,14 @@ pub async fn enqueue_subscription_run_if_due(
 ) -> Result<Option<String>> {
     let interval_minutes =
         admin_runtime::load_sync_auto_fetch_interval_minutes(&state.pool).await?;
+    if let Some(effective_at) =
+        admin_runtime::load_sync_auto_fetch_effective_at(&state.pool).await?
+        && DateTime::parse_from_rfc3339(effective_at.as_str())
+            .map(|value| value.with_timezone(&Utc) > now)
+            .unwrap_or(false)
+    {
+        return Ok(None);
+    }
     let schedule_key = current_subscription_schedule_key(now, interval_minutes);
     let row = sqlx::query_as::<_, DispatchStateRow>(
         r#"
@@ -471,6 +479,7 @@ pub async fn enqueue_subscription_run_if_due(
         &task.task_id,
     )
     .await?;
+    admin_runtime::clear_sync_auto_fetch_effective_at(&state.pool).await?;
     Ok(Some(task.task_id))
 }
 
@@ -1315,8 +1324,22 @@ pub async fn retry_task(
         return Err(anyhow!("scheduled webhook audit tasks cannot be retried"));
     }
 
-    let payload: Value =
+    let mut payload: Value =
         serde_json::from_str(&source.payload_json).context("invalid source payload")?;
+    if source.task_type == TASK_SYNC_SUBSCRIPTIONS
+        && let Value::Object(object) = &mut payload
+    {
+        object.insert(
+            "retry_source_task_id".to_owned(),
+            Value::String(task_id.to_owned()),
+        );
+        object.insert(
+            "retry_scope".to_owned(),
+            Value::String("repo_release_watchers".to_owned()),
+        );
+        object.insert("trigger".to_owned(), Value::String("retry".to_owned()));
+        object.remove("schedule_key");
+    }
     let new_task = enqueue_task(
         state,
         NewTask {

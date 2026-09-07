@@ -7,6 +7,8 @@
 
 ## 历史摘要
 
+- 2026-09-07: 订阅同步间隔成为 Release 治理窗口的唯一长度；保存后按 UTC 对齐边界生效，活动周期冻结实际 `N+B`，任务间隔弹窗改为只读摘要，管理员重试限定为原任务失败或未完成 watcher 范围。
+
 - 2026-06-29: 原本写在本 spec non-goals/out-of-scope 中的“**不新增专门的 repo release 管理后台页面**”已被 [#rap6f](../repo-refresh-governance/SPEC.md) 显式 supersede；仓库治理页、budget 调度与全量闭环状态改由新 topic spec 负责。
 - 2026-06-26: `sync.access_refresh` 失败链路补齐诊断闭环：Star 阶段现在会写入 `task.progress(stage=star_failed)` 与 access-refresh task log，管理员可直接看到 `error_kind`、`error_stage`、`elapsed_ms`、`timeout_ms`、`http_status` 与 `error_chain`；同轮只读 probe 也确认 101 到 GitHub 会出现 `HTTP 200` 后 body 读取超时 / EOF，问题更接近上游传输链路而非业务逻辑分支。
 - 2026-06-26: 新增本地主诊断回路 `web/e2e/access-sync-admin-link.spec.ts`，用同一条 mock task state 证明 `Dashboard 点击同步 -> /api/sync/all?return_mode=task_id -> task-access-click -> Admin Jobs 实时任务详情` 的 `task_id` 一致；此前的 Storybook 截图只保留为 Admin 失败详情 UI 预览，不再作为该链路的主证据。

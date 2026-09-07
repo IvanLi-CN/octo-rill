@@ -394,6 +394,7 @@ export type SyncAutoFetchTaskItem = {
 };
 export type AdminSyncRuntimeConfigResponse = {
 	sync_auto_fetch_interval_minutes: number;
+	sync_auto_fetch_effective_at?: string | null;
 	retry_recent_failures_interval_minutes: number;
 	repo_release_worker_concurrency: number;
 	repo_refresh_system_budget_per_window: number;
@@ -419,6 +420,9 @@ export type AdminRepoGovernanceOverviewResponse = {
 		active_cycle_started_at: string | null;
 		active_cycle_repo_count: number;
 		active_cycle_completed_count: number;
+		active_cycle_window_minutes?: number | null;
+		active_cycle_window_budget?: number | null;
+		active_cycle_last_selection_window_index?: number | null;
 	};
 	settings: AdminSyncRuntimeConfigResponse;
 	grid_cells: AdminRepoGovernanceGridCell[];
@@ -521,7 +525,7 @@ export type AdminPublicReleaseReposResponse = {
 	cache_cleanup?: AdminPublicReleaseCacheCleanup | null;
 };
 export type AdminSyncRuntimeConfigUpdateRequest = {
-	sync_auto_fetch_interval_minutes: number;
+	sync_auto_fetch_interval_minutes?: number;
 	retry_recent_failures_interval_minutes?: number;
 	repo_release_worker_concurrency?: number;
 	repo_refresh_system_budget_per_window?: number;
@@ -934,6 +938,13 @@ export type AdminSyncSubscriptionsDiagnostics = {
 		unchanged_count: number;
 		pages_fetched: number;
 	};
+	governance?: {
+		window_minutes: number;
+		window_budget: number;
+		cycle_id: string | null;
+		selection_window_index: number | null;
+		selected_repos: number;
+	} | null;
 	social: {
 		total_users: number;
 		succeeded_users: number;

@@ -105,15 +105,24 @@ Notes:
 Additional global sync runtime setting:
 
 - `sync_auto_fetch_interval_minutes INTEGER NOT NULL DEFAULT 60`
+- `sync_auto_fetch_effective_at TEXT NULL`
 - `repo_release_worker_concurrency INTEGER NOT NULL DEFAULT 5`
 
 Notes:
 
 - Valid range is `1-120`.
 - The value controls global `sync.subscriptions` scheduler cadence.
+- The same value is the Release governance window length `N`; saves persist the next strictly-later UTC aligned boundary in `sync_auto_fetch_effective_at`.
 - The setting is not user- or account-scoped.
 - `repo_release_worker_concurrency` valid range is `1-32`.
 - `repo_release_worker_concurrency` controls active shared repo release worker slots and must not affect scheduler cadence.
+
+### `repo_refresh_governance_cycles`
+
+- `window_minutes INTEGER NOT NULL DEFAULT 10` is the cycle's frozen `N`.
+- `window_budget INTEGER NOT NULL` is the cycle's frozen `B`.
+- `last_selection_window_index INTEGER NULL` is the atomic per-cycle/window selection gate.
+- Migration `0076_subscription_governance_window.sql` backfills existing cycles with `window_minutes=10` and `last_selection_window_index=window_index_started_at` without rewriting tasks, members, or watchers.
 
 ### `repo_release_sync_state`
 

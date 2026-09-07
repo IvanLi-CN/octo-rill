@@ -1,5 +1,12 @@
 # 实现状态（全局 Repo Release 复用与访问触发增量同步）
 
+## Window Contract
+
+- `sync_auto_fetch_interval_minutes` is the only editable subscription interval and the Release governance window length.
+- `sync_auto_fetch_effective_at` records the next aligned UTC boundary; active cycles retain their frozen `N+B` snapshot.
+- The task interval dialog is read-only for this value and links to the subscription settings dialog.
+- Administrator retry reuses failed or incomplete watchers from the source task and does not create a new governance selection.
+
 ## 当前状态
 
 - Lifecycle: active
