@@ -320,7 +320,7 @@ assert skip_intent.reason == "intent_skip"
 assert module.select_matching_tag(["v2.11.0", "v2.11.0-rc.28c3ff8"], "stable") == "v2.11.0"
 assert module.select_matching_tag(["v2.11.0", "v2.11.0-rc.28c3ff8"], "rc") == "v2.11.0-rc.28c3ff8"
 
-legacy_repair_candidate = module.ReleaseCandidate(
+legacy_published_candidate = module.ReleaseCandidate(
     sha="legacy00000000000000000000000000000000000",
     pr_number=6,
     pr_url="https://github.com/IvanLi-CN/octo-rill/pull/6",
@@ -334,7 +334,6 @@ legacy_repair_candidate = module.ReleaseCandidate(
     ),
     matching_tag="v0.1.4",
     release_exists=True,
-    comment_exists=False,
 )
 latest_published_candidate = module.ReleaseCandidate(
     sha="published000000000000000000000000000000000",
@@ -343,7 +342,6 @@ latest_published_candidate = module.ReleaseCandidate(
     intent=stable_intent,
     matching_tag="v2.10.0",
     release_exists=True,
-    comment_exists=True,
 )
 recent_repair_candidate = module.ReleaseCandidate(
     sha="repair000000000000000000000000000000000000",
@@ -351,8 +349,7 @@ recent_repair_candidate = module.ReleaseCandidate(
     pr_url="https://github.com/IvanLi-CN/octo-rill/pull/64",
     intent=stable_intent,
     matching_tag="v2.10.1",
-    release_exists=True,
-    comment_exists=False,
+    release_exists=False,
 )
 missing_sixty_three = module.ReleaseCandidate(
     sha="28c3ff8f919d881f8e4bdc63c9bb9aae1543cfe9",
@@ -361,7 +358,6 @@ missing_sixty_three = module.ReleaseCandidate(
     intent=stable_intent,
     matching_tag=None,
     release_exists=False,
-    comment_exists=False,
 )
 missing_sixty_two = module.ReleaseCandidate(
     sha="991bee71b861c7b1be0038fc0909928186c369e2",
@@ -370,10 +366,11 @@ missing_sixty_two = module.ReleaseCandidate(
     intent=stable_intent,
     matching_tag=None,
     release_exists=False,
-    comment_exists=False,
 )
 
-candidates = [legacy_repair_candidate, latest_published_candidate, missing_sixty_three, missing_sixty_two]
+candidates = [legacy_published_candidate, latest_published_candidate, missing_sixty_three, missing_sixty_two]
+assert legacy_published_candidate.is_fully_published is True
+assert legacy_published_candidate.pending_reason == ""
 selected = module.select_release_candidate(
     candidates,
     default_sha=missing_sixty_two.sha,
@@ -387,7 +384,7 @@ assert selected.unpublished_count == 2
 assert selected.repair_count == 0
 
 repair_only = module.select_release_candidate(
-    [legacy_repair_candidate, latest_published_candidate, recent_repair_candidate],
+    [legacy_published_candidate, latest_published_candidate, recent_repair_candidate],
     default_sha=recent_repair_candidate.sha,
     requested_sha=None,
     exclude_shas=set(),
@@ -435,11 +432,6 @@ class CandidateClient:
     def release_exists(self, repo: str, tag: str) -> bool:
         assert repo == "IvanLi-CN/octo-rill"
         return True
-
-    def has_managed_comment(self, repo: str, pr_number: int) -> bool:
-        assert repo == "IvanLi-CN/octo-rill"
-        return True
-
 
 original_first_parent_commits = module.list_first_parent_commits
 original_tags_pointing_at = module.list_tags_pointing_at
@@ -605,8 +597,12 @@ assert release_missing_with.get("token") == "${{ secrets.RELEASE_TOKEN != '' && 
 assert 'git push origin "refs/tags/${tag}"' not in release_workflow_text
 
 audit_job = contract.job_config(release_workflow, "audit-backfill", "release.yml")
+assert audit_job.get("needs") == ["plan", "await-ci", "prepare", "docker-release"]
 assert "github.event_name == 'push'" in audit_job.get("if", "")
 assert "needs.await-ci.result == 'success'" in audit_job.get("if", "")
+assert "pr-release-comment" not in audit_job.get("if", "")
+assert "pr-release-comment" not in release_workflow_text
+assert "release_pr_comment.py" not in release_workflow_text
 audit_permissions = contract.require_mapping(
     audit_job.get("permissions"),
     "release.yml.jobs.audit-backfill.permissions",
@@ -630,7 +626,6 @@ assert notify_job.get("needs") == [
     "await-ci",
     "prepare",
     "docker-release",
-    "pr-release-comment",
     "audit-backfill",
 ]
 notify_if = notify_job.get("if", "")
@@ -641,7 +636,6 @@ for needed_job in [
     "await-ci",
     "prepare",
     "docker-release",
-    "pr-release-comment",
     "audit-backfill",
 ]:
     assert f"needs.{needed_job}.result == 'failure'" in notify_if
