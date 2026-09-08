@@ -47,7 +47,7 @@ Release 是主阅读对象，承担最多的衍生能力：
   - `## 获星与关注`：仅当同一自然日内实际存在 `repo_star_received` 或 `follower_received` 动态时出现；只渲染有数据的 `### 获星` / `### 关注` 小节，不再输出空社交占位
 - 链接策略：
   - release 主链接：站内链接 `/<owner>/<repo>/releases/tag/<tag>?from=briefs`，点击后在 `日报` 上下文展示详情卡
-  - 其他链接：跳转 GitHub（仓库页、release 原文页、相关 GitHub 链接）；相关链接显示文本应尽量短，优先使用 `#123`、短 SHA 等 GitHub-aware 标签，避免正文过长
+  - 其他链接：跳转 GitHub（仓库页、release 原文页、相关 GitHub 链接）；日报正文保存相关 GitHub URL 的裸地址，前端仅对没有专用标题的等值裸链接做紧凑展示：PR / Issue 为 `#123`，commit 为 7 位 SHA，release 为 tag，compare 为 `base...head`，标准行号片段直接追加；人工标题与非 GitHub URL 保持原样
 - 正文约束：
   - 卡头负责展示日期、时间窗口与边界信息；正文不再重复输出时间窗口/项目计数等概览元数据
   - 落库前会剥离整篇外层 Markdown code fence，避免整篇日报被当作代码块渲染
