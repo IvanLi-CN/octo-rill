@@ -4128,6 +4128,23 @@ fn release_block_has_related_links(block: &BriefReleaseBlock) -> bool {
         .any(|line| line.starts_with("相关链接："))
 }
 
+fn release_block_related_links_are_bare_urls(block: &BriefReleaseBlock) -> bool {
+    block
+        .detail_lines
+        .iter()
+        .filter(|line| line.starts_with("相关链接："))
+        .all(|line| {
+            line.trim_start_matches("相关链接：")
+                .split(" · ")
+                .all(|link| {
+                    let link = link.trim();
+                    link.starts_with("https://github.com/")
+                        || link.starts_with("https://www.github.com/")
+                        || link.starts_with("https://raw.githubusercontent.com/")
+                })
+        })
+}
+
 fn preserves_release_detail_presence(source: &str, candidate: &str) -> bool {
     let Some(source_blocks) = extract_brief_release_blocks(source) else {
         return false;
@@ -4149,6 +4166,8 @@ fn preserves_release_detail_presence(source: &str, candidate: &str) -> bool {
                     == release_block_has_summary_details(candidate_block)
                 && release_block_has_related_links(source_block)
                     == release_block_has_related_links(candidate_block)
+                && (!release_block_has_related_links(source_block)
+                    || release_block_related_links_are_bare_urls(candidate_block))
         })
 }
 
@@ -4867,7 +4886,7 @@ fn build_brief_markdown(repos: &[RepoRendered], social: &SocialSummaryRendered) 
                     let links = release
                         .related_links
                         .iter()
-                        .map(|url| format!("[{}]({})", compact_link_label(url), url))
+                        .map(String::as_str)
                         .collect::<Vec<_>>()
                         .join(" · ");
                     out.push_str(&format!("  - 相关链接：{}\n", links));
@@ -5251,7 +5270,7 @@ async fn polish_brief_markdown(
         }
     };
     let prompt = format!(
-        "请在不删减任何 release 条目与社交摘要的前提下，对下面日报做一次统一润色。\n\n硬性要求：\n1) 保留所有链接原样（尤其 /owner/repo/releases/tag/<tag>?from=briefs）；\n{social_structure_rule}\n3) 默认使用简体中文优化可读性；技术术语、代码标识符、commit type、包名、API 名、项目名、版本号和原始标题可以保留英文；\n4) 不要输出 markdown code block，也不要把整篇内容包进 ```markdown ```；\n5) 不新增编造事实；\n6) release 与 repo 的顺序必须保持不变；\n7) 必须严格保持 Markdown 层级：仓库标题保持 `### [repo](...)`；每条 release 保持顶层 `- [title](/owner/repo/releases/tag/<tag>?from=briefs)`；release 下若原本有摘要与“相关链接”，必须继续保持缩进两个空格的子 bullet `  - ...`；\n8) 若某条 release 原文没有任何子 bullet，润色后也必须保持没有子 bullet；禁止补写“发布 xxx”“版本发布”“更新要点”之类空泛内容；\n9) 不得把 release 下的子 bullet 改写成普通段落、硬换行文本或空行分隔；\n10) 除章节、仓库标题、release block 之间已有的单个空行外，不得新增额外空行；\n11) 你只能改写既有 bullet 的措辞、去重或压缩重复表达，不能改结构。\n\n日报原文：\n{markdown}",
+        "请在不删减任何 release 条目与社交摘要的前提下，对下面日报做一次统一润色。\n\n硬性要求：\n1) 保留所有链接原样（尤其 /owner/repo/releases/tag/<tag>?from=briefs）；相关链接行中的 GitHub URL 必须继续以裸 URL 形式出现，禁止改写成 `[标题](URL)`；\n{social_structure_rule}\n3) 默认使用简体中文优化可读性；技术术语、代码标识符、commit type、包名、API 名、项目名、版本号和原始标题可以保留英文；\n4) 不要输出 markdown code block，也不要把整篇内容包进 ```markdown ```；\n5) 不新增编造事实；\n6) release 与 repo 的顺序必须保持不变；\n7) 必须严格保持 Markdown 层级：仓库标题保持 `### [repo](...)`；每条 release 保持顶层 `- [title](/owner/repo/releases/tag/<tag>?from=briefs)`；release 下若原本有摘要与“相关链接”，必须继续保持缩进两个空格的子 bullet `  - ...`；\n8) 若某条 release 原文没有任何子 bullet，润色后也必须保持没有子 bullet；禁止补写“发布 xxx”“版本发布”“更新要点”之类空泛内容；\n9) 不得把 release 下的子 bullet 改写成普通段落、硬换行文本或空行分隔；\n10) 除章节、仓库标题、release block 之间已有的单个空行外，不得新增额外空行；\n11) 你只能改写既有 bullet 的措辞、去重或压缩重复表达，不能改结构。\n\n日报原文：\n{markdown}",
     );
 
     let polished = chat_completion(
@@ -9625,6 +9644,12 @@ mod tests {
         assert!(release_block_has_related_links(&blocks[0]));
         assert!(!built.content_markdown.contains("发布 Tuckmark v0.5.2"));
         assert!(built.content_markdown.contains("相关链接："));
+        assert!(
+            built
+                .content_markdown
+                .contains("https://github.com/IvanLi-CN/tuckmark/compare/v0.5.1...v0.5.2")
+        );
+        assert!(!built.content_markdown.contains("[compare]("));
     }
 
     #[tokio::test]
