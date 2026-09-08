@@ -369,61 +369,18 @@ jobs:
           cache-from: type=registry,ref=${{ steps.image.outputs.image }}:buildcache
           cache-to: type=registry,ref=${{ steps.image.outputs.image }}:buildcache,mode=max
 
-  pr-release-comment:
-    name: Comment PR with release version
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs: [prepare, docker-release]
-    if: ${{ needs.prepare.outputs.should_release == 'true' && needs.prepare.outputs.pr_number != '' }}
-    permissions:
-      contents: read
-      issues: write
-      pull-requests: write
-    steps:
-      - name: Checkout workflow revision
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.workflow_sha }}
-
-      - name: Upsert PR release comment
-        id: comment
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SHOULD_RELEASE: ${{ needs.prepare.outputs.should_release }}
-          PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
-          APP_EFFECTIVE_VERSION: ${{ needs.prepare.outputs.app_effective_version }}
-          APP_RELEASE_TAG: ${{ needs.prepare.outputs.app_release_tag }}
-        run: python3 ./.github/scripts/release_pr_comment.py
-
-      - name: Write summary
-        if: always()
-        shell: bash
-        run: |
-          {
-            echo "### Release PR comment"
-            echo "- pr: #${{ needs.prepare.outputs.pr_number }}"
-            echo "- action: ${{ steps.comment.outputs.comment_action }}"
-            echo "- tag: ${{ needs.prepare.outputs.app_release_tag }}"
-            echo "- release: ${{ steps.comment.outputs.release_url }}"
-            if [[ -n "${{ steps.comment.outputs.comment_url }}" ]]; then
-              echo "- comment: ${{ steps.comment.outputs.comment_url }}"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-
   audit-backfill:
     name: Dispatch next backfill
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [plan, await-ci, prepare, docker-release, pr-release-comment]
+    needs: [plan, await-ci, prepare, docker-release]
     if: >-
       always() &&
       github.event_name == 'push' &&
       needs.plan.result == 'success' &&
       needs.await-ci.result == 'success' &&
       (needs.prepare.result == 'success' || needs.await-ci.outputs.allow_release == 'false') &&
-      (needs.docker-release.result == 'success' || needs.docker-release.result == 'skipped') &&
-      (needs.pr-release-comment.result == 'success' || needs.pr-release-comment.result == 'skipped')
+      (needs.docker-release.result == 'success' || needs.docker-release.result == 'skipped')
     permissions:
       contents: read
       issues: read
@@ -478,7 +435,7 @@ jobs:
 
   notify-on-failure:
     name: Notify manual release failure
-    needs: [plan, await-ci, prepare, docker-release, pr-release-comment, audit-backfill]
+    needs: [plan, await-ci, prepare, docker-release, audit-backfill]
     if: >-
       always() &&
       github.event_name == 'workflow_dispatch' &&
@@ -487,7 +444,6 @@ jobs:
         needs.await-ci.result == 'failure' ||
         needs.prepare.result == 'failure' ||
         needs.docker-release.result == 'failure' ||
-        needs.pr-release-comment.result == 'failure' ||
         needs.audit-backfill.result == 'failure'
       )
     permissions:

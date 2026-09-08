@@ -2,17 +2,16 @@
 
 ## 当前状态
 
-- Lifecycle: active
-- Implementation: 已交付
+- Lifecycle: superseded
+- Implementation: 已退役
 - Created: 2026-04-04
-- Last: 2026-04-28
-- Summary: 已交付；release run 可在 GitHub API 瞬时失败时对读取请求有界重试，PR 评论仍保持幂等更新，并已覆盖远端直接断开连接的重试场景。
+- Last: 2026-09-08
+- Summary: 已退役；release workflow 不再写入 source PR，也不再把 PR 评论作为发布完整性或 backfill 条件。成功发布结果由 release-owning agent 向 owner 报告。
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
+- Superseded by: [../release-reliability-backfill/SPEC.md](../release-reliability-backfill/SPEC.md)
 
-## 实现里程碑
+## 退役说明
 
-- [x] M1: 新增 release PR 评论 helper，完成受控评论 upsert 行为。
-- [x] M2: release workflow 接线完成，并将新测试纳入 CI。
-- [x] M3: 真实 release run 回归确认 PR 评论幂等更新。
-- [x] M4: Release backfill GitHub API 读取请求加入有界重试，覆盖 5xx / 429 / 网络瞬断。
+- 原评论 helper、专用测试和 workflow job 已删除。
+- Release backfill 只检查 release tag 与 GitHub Release；不访问 PR comments API。
