@@ -167,6 +167,12 @@ const RAW_GITHUB_PULL_URL =
 	"https://github.com/CherryHQ/cherry-studio/pull/14247";
 const RAW_GITHUB_COMMIT_URL =
 	"https://github.com/CherryHQ/cherry-studio/commit/4d8f459e7869d3e0b57fafe1b7a9034cb9b2d999";
+const RAW_GITHUB_FILE_LINE_URL =
+	"https://github.com/CherryHQ/cherry-studio/blob/4d8f459e7869d3e0b57fafe1b7a9034cb9b2d999/src/main.ts?plain=1#L42";
+const RAW_GITHUB_COMPARE_URL =
+	"https://github.com/CherryHQ/cherry-studio/compare/v2.71.0...v2.71.1#files_bucket";
+const RAW_GITHUB_ENCODED_COMPARE_URL =
+	"https://github.com/CherryHQ/cherry-studio/compare/release%2Fv2.71.0...v2.71.1#files_bucket";
 const RAW_EXTERNAL_DOCS_URL =
 	"https://docs.example.com/releases/cherry-studio/2026/04/21/notes/with/a/very/long/path/that/should/wrap/inside/the/dashboard/brief/card?source=dashboard&view=full&lang=zh-CN";
 const RAW_EXTERNAL_STATUS_URL =
@@ -3133,6 +3139,9 @@ const githubAutolinkWrapBriefs: BriefItem[] = [
 			`- [skills workspace links](${storyBriefReleaseHref("CherryHQ", "cherry-studio", "v1.0.0")}) · 2026-04-20T15:18:00Z · [GitHub Release](https://github.com/CherryHQ/cherry-studio/releases/tag/v1.0.0)`,
 			`  - 原始 GitHub PR autolink 会被压缩成短标签：${RAW_GITHUB_PULL_URL}`,
 			"  - 已有自定义标签保持原样：[#13840](https://github.com/CherryHQ/cherry-studio/pull/13840)",
+			`  - GitHub compare 版本范围保持可读：${RAW_GITHUB_COMPARE_URL}`,
+			`  - 编码 ref 保持可读：${RAW_GITHUB_ENCODED_COMPARE_URL}`,
+			`  - 文件行号锚点保持可读：${RAW_GITHUB_FILE_LINE_URL}`,
 			`  - 非 GitHub 长链接继续保留原文，但必须允许自动换行：${RAW_EXTERNAL_DOCS_URL}`,
 			"",
 			"## 获星与关注",
@@ -3214,6 +3223,8 @@ const githubAutolinkWrapReleaseDetail: ReleaseDetailResponse = {
 		"## Release detail",
 		"",
 		`- Raw commit autolink should compact to a short SHA: ${RAW_GITHUB_COMMIT_URL}`,
+		`- Encoded compare refs should stay readable: ${RAW_GITHUB_ENCODED_COMPARE_URL}`,
+		`- File line anchors should stay readable: ${RAW_GITHUB_FILE_LINE_URL}`,
 		`- Long external incident links should remain readable and wrap safely: ${RAW_EXTERNAL_STATUS_URL}`,
 	].join("\n"),
 	html_url: "https://github.com/CherryHQ/cherry-studio/releases/tag/v1.0.0",
@@ -5145,6 +5156,16 @@ export const EvidenceBriefsGithubAutolinkWrap: Story = {
 		await expect(canvas.getByRole("link", { name: "#14247" })).toBeVisible();
 		await expect(canvas.getByRole("link", { name: "#13840" })).toBeVisible();
 		await expect(
+			canvas.getByRole("link", {
+				name: /^v2\.71\.0\.\.\.v2\.71\.1$/,
+			}),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("link", {
+				name: "release/v2.71.0...v2.71.1",
+			}),
+		).toBeVisible();
+		await expect(
 			canvas.getByRole("link", { name: "GitHub Release" }),
 		).toBeVisible();
 		await expect(
@@ -5190,6 +5211,14 @@ export const EvidenceBriefsGithubAutolinkWrapDetail: Story = {
 
 		await expect(
 			dialogScope.getByRole("link", { name: "4d8f459" }),
+		).toBeVisible();
+		await expect(
+			dialogScope.getByRole("link", {
+				name: "release/v2.71.0...v2.71.1",
+			}),
+		).toBeVisible();
+		await expect(
+			dialogScope.getByRole("link", { name: "src/main.ts#L42" }),
 		).toBeVisible();
 		await expect(
 			dialogScope.getByRole("link", { name: RAW_EXTERNAL_STATUS_URL }),

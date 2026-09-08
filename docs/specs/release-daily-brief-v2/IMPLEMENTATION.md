@@ -5,8 +5,8 @@
 - Lifecycle: active
 - Implementation: 已交付
 - Created: 2026-04-16
-- Last: 2026-07-19
-- Summary: 已交付；fast-track / canonical brief markdown validator + refresh drift repair landed；日报生成已复用 release_smart 的 valuable/compare 事实链路，低信息 release 不再补伪摘要
+- Last: 2026-09-08
+- Summary: 已交付；fast-track / canonical brief markdown validator + refresh drift repair landed；日报生成已复用 release_smart 的 valuable/compare 事实链路，related links 保存为裸 URL 并由共享 Markdown 统一紧凑展示
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -14,6 +14,9 @@
 
 - `docs/product.md`: 日报内容结构改为 `项目更新 + 获星与关注`
 - `docs/product.md`: 日报 release 要点默认中文倾向、release_smart 复用与 AI 失败兜底口径
+- `docs/product.md`: related GitHub URL 的裸地址存储与共享 Markdown 紧凑展示规则
+- `web/src/components/Markdown.tsx`: GitHub PR / Issue / commit / release / compare 裸链接压缩与行号片段
+- `web/src/components/Markdown.stories.tsx`: 共享 Markdown autodocs 与裸链接交互覆盖
 - `docs/specs/README.md`: 登记本 spec，收口后写入 PR 号与状态
 - `docs/specs/release-daily-brief-v2/SPEC.md`: 同步实现状态、视觉证据、release_smart 复用语义与验证结果
 
@@ -35,6 +38,7 @@ None
 - [x] M4: Storybook、文档、视觉证据与快车道收口完成。
 - [x] M5: 日报 summary / polish prompt 补齐默认简体中文契约；AI 不可用或 parse failed 时使用中文提示式 fallback，避免直接复用原始 release notes bullet。
 - [x] M6: 日报 release 要点复用 `release_smart` 的 valuable / compare fallback 语义，低信息 release 不再补伪摘要。
+- [x] M7: related links 改为裸 GitHub URL canonical contract；共享 Markdown 覆盖 compare、编码 ref、行号片段、自定义标题与长外链。
 
 ## 验证结果
 
@@ -42,11 +46,12 @@ None
 
 - `cargo fmt --check`
 - `cargo clippy --all-targets -- -D warnings`
-- `cargo test` → `386 passed`
+- `cargo test` → `760 passed; 0 failed`
 - `cd web && bun run lint`
 - `cd web && bun run build`
 - `cd web && bun run storybook:build`
-- `cd web && bun run e2e -- e2e/release-detail.spec.ts` → `21 passed`
+- `cd web && bun run test:storybook` → `9 passed`
+- `cd web && bun run e2e -- e2e/release-detail.spec.ts` → 新增链接场景通过；整文件在本机 5-worker 并发下出现既有 Release 初始化时序抖动（`33–37/38 passed`），失败用例单独重跑通过，未修改原测试命令或并发设置。
 
 ## 变更记录
 
