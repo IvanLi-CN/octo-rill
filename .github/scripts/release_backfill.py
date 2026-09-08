@@ -19,8 +19,6 @@ from pathlib import Path
 from typing import Any, Iterable
 
 API_VERSION = "2022-11-28"
-COMMENT_MARKER = "<!-- octo-rill:release-version -->"
-DEFAULT_COMMENT_AUTHOR = "github-actions[bot]"
 DEFAULT_GITHUB_API_MAX_ATTEMPTS = 4
 DEFAULT_GITHUB_API_TIMEOUT_SECONDS = 30
 RETRYABLE_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -46,7 +44,6 @@ class ReleaseCandidate:
     intent: ReleaseIntent
     matching_tag: str | None
     release_exists: bool
-    comment_exists: bool
 
     @property
     def pending_kind(self) -> str | None:
@@ -54,7 +51,7 @@ class ReleaseCandidate:
             return None
         if not self.matching_tag:
             return "unpublished"
-        if not self.release_exists or not self.comment_exists:
+        if not self.release_exists:
             return "repair"
         return None
 
@@ -64,13 +61,11 @@ class ReleaseCandidate:
             return "missing_tag"
         if not self.release_exists:
             return "missing_github_release"
-        if not self.comment_exists:
-            return "missing_pr_comment"
         return ""
 
     @property
     def is_fully_published(self) -> bool:
-        return bool(self.matching_tag and self.release_exists and self.comment_exists)
+        return bool(self.matching_tag and self.release_exists)
 
 
 @dataclass(frozen=True)
@@ -90,7 +85,6 @@ class GitHubApiClient:
         self.max_attempts = DEFAULT_GITHUB_API_MAX_ATTEMPTS
         self.timeout_seconds = DEFAULT_GITHUB_API_TIMEOUT_SECONDS
         self._release_cache: dict[str, bool] = {}
-        self._comment_cache: dict[int, bool] = {}
 
     def request_json(
         self,
@@ -141,21 +135,6 @@ class GitHubApiClient:
             raise RuntimeError(f"GitHub API GET {path} returned non-array JSON")
         return [item for item in decoded if isinstance(item, dict)]
 
-    def paginate(self, path: str, *, query: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        page = 1
-        items: list[dict[str, Any]] = []
-        while True:
-            page_query = {"per_page": 100, "page": page}
-            if query:
-                page_query.update(query)
-            payload = self.request_json_list(path, query=page_query)
-            if not payload:
-                return items
-            items.extend(payload)
-            if len(payload) < 100:
-                return items
-            page += 1
-
     def pull_for_commit(self, repo: str, sha: str) -> tuple[int, str] | None:
         pulls = self.request_json_list(f"/repos/{repo}/commits/{sha}/pulls", query={"per_page": 100})
         if len(pulls) != 1:
@@ -186,21 +165,6 @@ class GitHubApiClient:
         )
         exists = payload is not None
         self._release_cache[tag] = exists
-        return exists
-
-    def has_managed_comment(
-        self,
-        repo: str,
-        pr_number: int,
-        *,
-        author_login: str = DEFAULT_COMMENT_AUTHOR,
-    ) -> bool:
-        cached = self._comment_cache.get(pr_number)
-        if cached is not None:
-            return cached
-        comments = self.paginate(f"/repos/{repo}/issues/{pr_number}/comments")
-        exists = any(is_managed_comment(comment, author_login=author_login) for comment in comments)
-        self._comment_cache[pr_number] = exists
         return exists
 
     def dispatch_workflow(self, repo: str, workflow_id: str, ref: str, head_sha: str) -> None:
@@ -346,16 +310,6 @@ def write_output(key: str, value: str) -> None:
             handle.write(f"{key}={value}\n")
 
 
-def is_managed_comment(comment: dict[str, Any], *, author_login: str) -> bool:
-    body = comment.get("body")
-    user = comment.get("user")
-    if not isinstance(body, str) or COMMENT_MARKER not in body:
-        return False
-    if not isinstance(user, dict):
-        return False
-    return user.get("login") == author_login
-
-
 def parse_release_intent(labels: Iterable[str]) -> ReleaseIntent:
     names = [label for label in labels if label]
     allowed_type = {
@@ -491,10 +445,8 @@ def build_release_candidates(
         tags = list_tags_pointing_at(repo_root, sha)
         matching_tag = select_matching_tag(tags, intent.channel)
         release_exists = False
-        comment_exists = False
         if matching_tag:
             release_exists = client.release_exists(repo, matching_tag)
-            comment_exists = client.has_managed_comment(repo, pr_number)
 
         candidate = ReleaseCandidate(
             sha=sha,
@@ -503,7 +455,6 @@ def build_release_candidates(
             intent=intent,
             matching_tag=matching_tag,
             release_exists=release_exists,
-            comment_exists=comment_exists,
         )
         existing_index = candidate_index_by_pr.get(pr_number)
         if existing_index is not None:
