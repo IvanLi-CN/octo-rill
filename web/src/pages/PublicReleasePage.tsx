@@ -809,7 +809,7 @@ export function PublicReleasePage(props: {
 									repoFullName={repoFullName}
 									repoVisual={repoVisual}
 									labelAs="h1"
-									className="max-w-full shrink-0"
+									className="min-w-0 max-w-full flex-[1_1_100%] sm:flex-1"
 									labelClassName="break-words text-3xl font-semibold tracking-normal"
 									visualClassName="size-10"
 								/>

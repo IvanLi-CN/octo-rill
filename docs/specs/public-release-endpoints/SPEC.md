@@ -162,7 +162,7 @@
 
 - Given 公开 Release 列表在 390px 移动视口渲染
   When 标题与 selector 无法同时容纳
-  Then selector 整块显示在标题下方，字标高度为 28px，页面没有横向溢出。
+  Then selector 整块显示在标题下方，仓库名最多显示两行并在必要时使用保留尾部的中间省略，字标高度为 28px，页面没有横向溢出。
 
 - Given 公开 Release 列表已加载多条记录
   When 用户阅读页面级标题带与任一 Release 卡片
@@ -357,7 +357,7 @@
 - source_type: `storybook_canvas`
   story_id_or_title: `public-publicreleasepage--long-repo-and-tag-detail`
   state: `public-release-detail-mobile-edge`
-  evidence_note: 验证 390px 移动端公开详情页的最终布局：页头 LOGO 高度为 28px，右上角 GitHub 按钮使用外链图标打开仓库 Releases 页面；正文区把头像、项目名、时间/tag 作为仓库信息组，超长 repo full name 与超长 tag 单行省略，仓库名与日期行无额外垂直空隙；右侧小尺寸原文/翻译/润色选择器固定尺寸且右端对齐，短内容时页脚贴底并保留指向仓库根路径的 GitHub 入口，全页无横向溢出。
+  evidence_note: 验证 390px 移动端公开详情页的最终布局：页头 LOGO 高度为 28px，右上角 GitHub 按钮使用外链图标打开仓库 Releases 页面；正文区把头像、项目名、时间/tag 作为仓库信息组，超长 repo full name 最多显示两行，必要时使用保留尾部的中间省略，超长 tag 仍按既有策略处理，仓库名与日期行无额外垂直空隙；右侧小尺寸原文/翻译/润色选择器固定尺寸且右端对齐，短内容时页脚贴底并保留指向仓库根路径的 GitHub 入口，全页无横向溢出。
   image:
   ![公开 Release 详情页移动端极端文本](./assets/public-release-evidence-detail-mobile-edge-v8.png)
 

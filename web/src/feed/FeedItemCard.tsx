@@ -1348,18 +1348,18 @@ export function ReleaseFeedCard(props: {
 					<div className="flex items-start gap-2">
 						<div className="min-w-0 flex-1">
 							{showRepoIdentity ? (
-								<div className="flex flex-wrap items-center gap-2">
+								<div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
 									{repoFocusTarget ? (
 										<InternalLink
 											href={repoFocusTarget.href}
 											to={repoFocusTarget.to}
 											params={repoFocusTarget.params}
-											className="min-w-0"
+											className="block min-w-0 max-w-full flex-1"
 										>
 											<RepoIdentity
 												repoFullName={item.repo_full_name}
 												repoVisual={item.repo_visual}
-												className="min-w-0 min-h-8"
+												className="min-w-0 min-h-8 max-w-full flex-1"
 												labelClassName={repoIdentityLabelClassName}
 												visualClassName="size-8"
 												labelSuffix={
@@ -1373,7 +1373,7 @@ export function ReleaseFeedCard(props: {
 										<RepoIdentity
 											repoFullName={item.repo_full_name}
 											repoVisual={item.repo_visual}
-											className="min-w-0 min-h-8"
+											className="min-w-0 min-h-8 max-w-full flex-1"
 											labelClassName={repoIdentityLabelClassName}
 											visualClassName="size-8"
 											labelSuffix={
@@ -1573,12 +1573,12 @@ export function ReleaseFeedCard(props: {
 										href={repoFocusTarget.href}
 										to={repoFocusTarget.to}
 										params={repoFocusTarget.params}
-										className="min-w-0"
+										className="block min-w-0 max-w-full flex-1"
 									>
 										<RepoIdentity
 											repoFullName={item.repo_full_name}
 											repoVisual={item.repo_visual}
-											className="min-h-8 w-full min-w-0"
+											className="min-h-8 w-full min-w-0 max-w-full flex-1"
 											labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
 											visualClassName="size-8"
 										>
@@ -1593,7 +1593,7 @@ export function ReleaseFeedCard(props: {
 									<RepoIdentity
 										repoFullName={item.repo_full_name}
 										repoVisual={item.repo_visual}
-										className="min-h-8 w-full min-w-0"
+										className="min-h-8 w-full min-w-0 max-w-full flex-1"
 										labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
 										visualClassName="size-8"
 									>
