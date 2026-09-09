@@ -33,13 +33,14 @@ The PWA layer is an enhancement around the existing React + Vite app shell and A
 - `index.html`, `sw.js`, and `manifest.webmanifest` must not be served with long immutable cache headers; content-hashed install icon PNGs must be served with immutable cache headers.
 - The app should proactively ask the registered Service Worker to check for updates when the page becomes visible and when backend version polling detects frontend version drift.
 - A waiting Service Worker must be activated only after the user clicks the existing refresh action.
+- The full-width app-shell update notice must keep its message and complete action group on one row when their content fits; when they do not fit, the complete action group moves to the next row and remains right-aligned within the notice content area. The visible action controls keep their established visual dimensions while their touch hit area is at least 36px high.
 - Offline anonymous boot must distinguish network unavailability from authentication failure and keep login-only actions visibly unavailable until connectivity is restored.
 - Offline authenticated boot should reuse recent auth and dashboard warm caches: if the active page has cached content, show a small offline cache notice while preserving that content; if the active page has no cache, show a large offline empty state with retry instead of a misleading empty list.
 - Dashboard server-state may use short-lived React Query persistence for PWA responsiveness, but only for whitelisted Dashboard query keys. This does not relax the Service Worker rule: `/api/**`, `/auth/**`, OAuth, passkey, SSE, mutation, and admin detail responses remain network-only and are not cached by the PWA layer.
 
 ## Related ADRs
 
-- None
+None
 
 ## Acceptance
 
@@ -49,6 +50,7 @@ The PWA layer is an enhancement around the existing React + Vite app shell and A
 - A browser-owned Chromium V1-to-V2 update regression uses one browser context to prove normal startup and update checking obtain the V2 Manifest and hashed install icons without an uninstall or reinstall step. It is a network/update contract and does not claim an OS-installed record; a dedicated real-installed PWA regression is available with `OCTORILL_REAL_PWA_TEST=1` on a ChromeOS runner with the DevTools PWA handler. This does not claim automatic migration of existing iOS/iPadOS Web Clips.
 - Auth, passkey, OAuth, API, and SSE paths continue to use network behavior.
 - The existing version update notice can represent both server version drift and Service Worker update availability.
+- At 375px, a short update message and the refresh action remain on one row; at 320px or with the update-plus-install state, the action group wraps as one unit and remains right-aligned.
 - The app shell can render a clear offline boundary when `/api/me` cannot be reached from a cached PWA shell.
 - Already-authenticated offline visits preserve active-page warm feed content when available and show a distinct no-cache offline empty state when unavailable.
 - Browser Back/Forward and short-lived PWA restores may reuse Dashboard React Query cache for up to 1 hour, then reconcile through normal network requests without caching private API responses in the Service Worker.
@@ -65,6 +67,8 @@ The PWA layer is an enhancement around the existing React + Vite app shell and A
 - Update + install state: [update-install.png](./assets/update-install.png)
 - Install-only state: [install-only.png](./assets/install-only.png)
 - Update-only state: [update-only.png](./assets/update-only.png)
+- Mobile update-only content feed: [update-only-mobile.png](./assets/update-only-mobile.png)
+- Mobile update-and-install content feed: [update-install-mobile.png](./assets/update-install-mobile.png)
 - Offline anonymous boot fallback: [offline-boot-fallback.png](./assets/offline-boot-fallback.png)
 - Offline authenticated dashboard with cached content: [offline-dashboard-cached-content.png](./assets/offline-dashboard-cached-content.png)
 - Offline authenticated dashboard without cached content: [offline-dashboard-empty-state.png](./assets/offline-dashboard-empty-state.png)
