@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR 0006](./0006-decouple-star-sync-schedules.md).
 
 ## Context
 
@@ -21,8 +21,8 @@ Accepted
 
 ## Compatibility
 
-The migration is additive. Existing cycle rows retain their status, budget, timestamps, members, tasks, and watchers. A nullable effective timestamp means an installation with no pending change is already effective. PATCH requests may omit the interval when changing retry, daily brief, or webhook settings; omitted interval leaves its effective timestamp untouched.
+The historical migration remains additive. Existing cycle rows retain their status, budget, timestamps, members, tasks, and watchers. The successor keeps the Release-governance parts of this decision, but moves Star scheduling, membership reconciliation, and its runtime controls to an independent coordinator.
 
 ## Consequences
 
-History remains factual even after administrators change the current interval. A new cycle adopts the latest saved values only after the current cycle completes. The UI has one write path, and operational retry is constrained to the original watcher scope.
+History remains factual even after administrators change the current interval. A new Release-governance cycle adopts the latest saved values only after the current cycle completes. Star synchronization no longer shares this interval or its task path.

@@ -1339,7 +1339,7 @@ async function installAdminJobsMocks(
 							: JSON.stringify({
 									skipped: false,
 									skip_reason: null,
-									star: {
+									collect: {
 										total_users: 12,
 										succeeded_users: 11,
 										failed_users: 1,
@@ -1389,7 +1389,7 @@ async function installAdminJobsMocks(
 							log_available: true,
 							log_download_path:
 								"/api/admin/jobs/realtime/task-subscriptions-1/log",
-							star: {
+							collect: {
 								total_users: 12,
 								succeeded_users: 11,
 								failed_users: 1,
@@ -1558,7 +1558,7 @@ async function installAdminJobsMocks(
 						result_json: JSON.stringify({
 							skipped: true,
 							skip_reason: "previous_run_active",
-							star: {
+							collect: {
 								total_users: 0,
 								succeeded_users: 0,
 								failed_users: 0,
@@ -1607,7 +1607,7 @@ async function installAdminJobsMocks(
 							skip_reason: "previous_run_active",
 							log_available: false,
 							log_download_path: null,
-							star: {
+							collect: {
 								total_users: 0,
 								succeeded_users: 0,
 								failed_users: 0,
@@ -4266,7 +4266,7 @@ test("skipped subscription workflow renders skipped semantics", async ({
 	).toBeVisible();
 	await expect(
 		page.locator("[data-slot='badge']").getByText("已跳过"),
-	).toHaveCount(7);
+	).toHaveCount(6);
 	await expect(page.getByText("业务结果")).toBeVisible();
 	await expect(
 		page.getByText("上一轮订阅同步仍在执行，本轮仅记录跳过结果。"),

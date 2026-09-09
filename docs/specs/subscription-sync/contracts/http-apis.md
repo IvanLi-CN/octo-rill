@@ -56,7 +56,7 @@ Response shape:
 
 Notes:
 
-- `sync_auto_fetch_interval_minutes` is global, admin-only, and clamped by validation to `1-120`, defaulting to `60`.
+- `sync_auto_fetch_interval_minutes` is global, admin-only, and clamped by validation to `1-120`, defaulting to `60`; it controls Release subscription/governance only. Star cadence is defined by [star-sync-reconciliation](../../star-sync-reconciliation/contracts/http-apis.md).
 - `sync_auto_fetch_effective_at` is nullable when no pending interval change exists; otherwise it is the next strictly-later UTC epoch-aligned boundary.
 - `retry_recent_failures_interval_minutes` is global, admin-only, and clamped by validation to `1-120`, defaulting to `10`.
 - `repo_release_worker_concurrency` is global, admin-only, clamped by validation to `1-32`, and defaults to `5`.
