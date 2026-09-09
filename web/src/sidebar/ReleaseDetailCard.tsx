@@ -820,7 +820,7 @@ export function ReleaseDetailCard(props: {
 								<RepoIdentity
 									repoFullName={activeDetail.repo_full_name ?? null}
 									repoVisual={activeDetail.repo_visual ?? null}
-									className="max-w-full"
+									className="min-w-0 max-w-full flex-1"
 									labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
 									visualClassName="size-8"
 								/>

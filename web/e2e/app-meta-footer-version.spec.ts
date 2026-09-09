@@ -178,6 +178,68 @@ test("app shell shows an update notice when backend version differs from the emb
 	).toHaveAttribute("href", EMBEDDED_FRONTEND_VERSION_RELEASE_HREF);
 });
 
+test("update notice keeps a single refresh action inline at 375px", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 375, height: 812 });
+	await accelerateVersionPolling(page);
+	let currentVersion = "0.1.0";
+	await mockVersionApis(page, {
+		versionMode: "success",
+		healthMode: "failure",
+		getVersion: () => currentVersion,
+	});
+	await page.goto("/");
+
+	const notice = page.locator("[data-version-update-notice]");
+	await expect(notice).toHaveCount(0);
+	currentVersion = "0.1.1";
+	await expect(notice).toContainText("检测到新版本 v0.1.1");
+	const geometry = await page.evaluate(() => {
+		const content = document.querySelector<HTMLElement>(
+			"[data-version-update-notice-content]",
+		);
+		const message = document.querySelector<HTMLElement>(
+			"[data-version-update-message]",
+		);
+		const actions = document.querySelector<HTMLElement>(
+			"[data-version-update-actions]",
+		);
+		const refresh = actions?.querySelector<HTMLElement>(
+			"button:not([data-pwa-install-action])",
+		);
+		if (!(content && message && actions && refresh)) {
+			throw new Error("update notice geometry markers are missing");
+		}
+		const contentRect = content.getBoundingClientRect();
+		const messageRect = message.getBoundingClientRect();
+		const actionsRect = actions.getBoundingClientRect();
+		const refreshRect = refresh.getBoundingClientRect();
+		const contentStyles = getComputedStyle(content);
+		const refreshHitHeight = Number.parseFloat(
+			getComputedStyle(refresh, "::before").height,
+		);
+		return {
+			contentRight:
+				contentRect.right - Number.parseFloat(contentStyles.paddingRight),
+			messageCenter: messageRect.top + messageRect.height / 2,
+			actionsCenter: actionsRect.top + actionsRect.height / 2,
+			actionsRight: actionsRect.right,
+			refreshHeight: refreshRect.height,
+			refreshHitHeight,
+		};
+	});
+
+	expect(
+		Math.abs(geometry.actionsRight - geometry.contentRight),
+	).toBeLessThanOrEqual(1);
+	expect(
+		Math.abs(geometry.actionsCenter - geometry.messageCenter),
+	).toBeLessThanOrEqual(1);
+	expect(geometry.refreshHeight).toBe(28);
+	expect(geometry.refreshHitHeight).toBe(36);
+});
+
 test("app shell can detect updates via /api/health fallback polling", async ({
 	page,
 }) => {
