@@ -105,36 +105,36 @@
 
 ## Visual Evidence
 
-- source_type: storybook_canvas
-  story_id_or_title: Pages/App Boot / Landing Lazy Pending
+- source_type: ui_demo
+  story_id_or_title: ui_demo: ./demo/?demo=app-boot&d_controls=hidden / Landing Lazy Pending
   state: landing lazy pending
   evidence_note: 验证匿名访问 `/` 且 Landing chunk 仍在拉取时，页面继续保持中性 AppBoot，不提前露出登录 CTA。
   image:
   ![Landing lazy pending](./assets/landing-lazy-pending.png)
 
-- source_type: storybook_canvas
-  story_id_or_title: Pages/App Boot / Dashboard Warm Skeleton
+- source_type: ui_demo
+  story_id_or_title: ui_demo: ./demo/?demo=app-boot&d_controls=hidden / Dashboard Warm Skeleton
   state: dashboard warm skeleton
   evidence_note: 验证已登录访问 `/` 时，Dashboard surface pending 阶段使用工作台壳层 skeleton，而不是白屏或回退 Landing。
   image:
   ![Dashboard warm skeleton](./assets/dashboard-warm-skeleton.png)
 
-- source_type: storybook_canvas
-  story_id_or_title: Pages/App Boot / Settings Warm Skeleton
+- source_type: ui_demo
+  story_id_or_title: ui_demo: ./demo/?demo=app-boot&d_controls=hidden / Settings Warm Skeleton
   state: settings warm skeleton
   evidence_note: 验证 `/settings` 懒路由 pending 阶段保持 shell-level skeleton，并保留页头/页脚结构。
   image:
   ![Settings warm skeleton](./assets/settings-warm-skeleton.png)
 
-- source_type: storybook_canvas
-  story_id_or_title: Pages/App Boot / Admin Dashboard Warm Skeleton
+- source_type: ui_demo
+  story_id_or_title: ui_demo: ./demo/?demo=app-boot&d_controls=hidden / Admin Dashboard Warm Skeleton
   state: admin dashboard warm skeleton
   evidence_note: 验证 `/admin` 懒路由 pending 阶段展示管理员壳层 skeleton。
   image:
   ![Admin dashboard warm skeleton](./assets/admin-dashboard-warm-skeleton.png)
 
-- source_type: storybook_canvas
-  story_id_or_title: Pages/App Boot / Admin Jobs Warm Skeleton
+- source_type: ui_demo
+  story_id_or_title: ui_demo: ./demo/?demo=app-boot&d_controls=hidden / Admin Jobs Warm Skeleton
   state: admin jobs warm skeleton
   evidence_note: 验证 `/admin/jobs*` 懒路由 pending 阶段展示 jobs shell skeleton，并为任务抽屉/调度视图保留稳定框架。
   image:

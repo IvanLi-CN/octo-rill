@@ -28,7 +28,7 @@
 
 - `web/src/feed/FeedItemCard.tsx`
 - `web/public/reactions/*`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `web/e2e/release-detail.spec.ts`
 - `docs/specs/README.md`
 
@@ -113,8 +113,8 @@
 
 ## Visual Evidence
 
-- source_type: storybook_canvas
-  story_id_or_title: Pages/Dashboard · Evidence / Reaction Bubble Polish
+- source_type: ui_demo
+  story_id_or_title: ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish · Evidence / Reaction Bubble Polish
   state: reaction footer polish
   evidence_note: 验证 6 个 reaction 已切换为本地扁平化 SVG，按钮保持真圆，计数 badge 独立浮在按钮外侧。
 
@@ -135,6 +135,6 @@
 ## 参考（References）
 
 - `web/src/feed/FeedItemCard.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `web/e2e/release-detail.spec.ts`
 - `web/public/reactions/README.md`

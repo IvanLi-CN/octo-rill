@@ -32,7 +32,7 @@
 - `web/src/api.ts`
 - `web/src/pages/Dashboard.tsx`
 - `web/src/feed/**`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `docs/product.md`
 - `docs/specs/README.md`
 
@@ -207,4 +207,4 @@
 
 - `web/src/pages/Dashboard.tsx`
 - `web/src/feed/FeedList.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`

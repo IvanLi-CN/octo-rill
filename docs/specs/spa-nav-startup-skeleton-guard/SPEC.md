@@ -31,7 +31,7 @@
 - `web/src/pages/Dashboard.tsx`
 - `web/src/feed/FeedList.tsx`
 - `web/src/feed/FeedGroupedList.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `web/e2e/dashboard-social-activity.spec.ts`
 - `docs/specs/spa-nav-startup-skeleton-guard/SPEC.md`
 - `docs/specs/README.md`
@@ -126,16 +126,16 @@
 
 ### UI / Storybook (if applicable)
 
-- Stories to add/update: `web/src/stories/Dashboard.stories.tsx`
-- Docs pages / state galleries to add/update: `Pages/Dashboard` autodocs
+- Stories to add/update: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
+- Docs pages / state galleries to add/update: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish` autodocs
 - `play` / interaction coverage to add/update: `PostBootStarsTabSwitchKeepsShell`, `HistoryStarsCacheHitKeepsContent`
 - Visual evidence source: `storybook_canvas`
 - Owner-facing screenshot persistence: `docs/specs/spa-nav-startup-skeleton-guard/assets/dashboard-history-stars-cache-hit.png`
 
 ## Visual Evidence
 
-- source_type: `storybook_canvas`
-- story_id_or_title: `Pages/Dashboard/HistoryStarsCacheHitKeepsContent`
+- source_type: `ui_demo`
+- story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish HistoryStarsCacheHitKeepsContent`
 - scenario: browser Forward 回到已访问过的 `加星` route，Dashboard 使用 React Query cache 同步显示星标列表。
 - evidence_note: `torvalds` 星标内容立即可见，`data-feed-loading-skeleton="true"`、`data-dashboard-boot-header`、`data-app-boot` 均不存在。
 
@@ -165,4 +165,4 @@ PR: include
 - `docs/specs/dashboard-startup-skeleton-header-tabs-alignment/SPEC.md`
 - `docs/specs/tanstack-router-auth-boot-no-login-flicker/SPEC.md`
 - `web/src/pages/Dashboard.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`

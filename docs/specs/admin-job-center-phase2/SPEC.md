@@ -222,4 +222,4 @@
 - `src/server.rs`
 - `src/translations.rs`
 - `web/src/admin/JobManagement.tsx`
-- `web/src/stories/AdminJobs.stories.tsx`
+- `ui_demo: ./demo/admin/jobs?demo=admin-jobs-running`

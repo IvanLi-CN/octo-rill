@@ -13,7 +13,11 @@ import type {
 	AdminTranslationRequestDetailResponse,
 	AdminTranslationRequestListItem,
 	AdminUserProfileResponse,
+	AdminRepoGovernanceListResponse,
+	AdminRepoGovernanceOverviewResponse,
+	AnnouncementDetailResponse,
 	ApiKeySummary,
+	AuthBindContextResponse,
 	FollowingReposResponse,
 	GitHubConnectionResponse,
 	MeLinuxDoResponse,
@@ -1836,6 +1840,143 @@ function buildAdminJobsStream(): {
 	];
 }
 
+function buildAdminRepoGovernance(
+	adminJobs: DemoJobsModel,
+): DemoModel["adminRepoGovernance"] {
+	const settings = adminJobs.syncRuntimeConfig;
+	const items: AdminRepoGovernanceListResponse["items"] = [
+		{
+			repo_id: 1,
+			repo_full_name: OWNER_REPO_FULL_NAME,
+			watcher_user_count: 24,
+			watcher_repo_total_sum: 38,
+			cached_stargazer_count: 412,
+			priority_rank: 1,
+			target_window: 1,
+			target_interval_minutes: 10,
+			urgency_score: 2.4,
+			urgency_bucket: "due",
+			system_last_selected_at: NOW,
+			system_last_success_at: "2026-07-08T09:58:00+08:00",
+			system_last_attempt_at: NOW,
+			system_last_attempt_status: "succeeded",
+			system_last_attempt_error: null,
+			actual_last_success_at: "2026-07-08T10:00:00+08:00",
+			actual_last_success_source: "interactive",
+		},
+		{
+			repo_id: 2,
+			repo_full_name: DOCS_REPO_FULL_NAME,
+			watcher_user_count: 12,
+			watcher_repo_total_sum: 17,
+			cached_stargazer_count: 96,
+			priority_rank: 2,
+			target_window: 2,
+			target_interval_minutes: 30,
+			urgency_score: 1.2,
+			urgency_bucket: "warm",
+			system_last_selected_at: "2026-07-08T09:20:00+08:00",
+			system_last_success_at: null,
+			system_last_attempt_at: "2026-07-08T09:20:03+08:00",
+			system_last_attempt_status: "failed",
+			system_last_attempt_error: "upstream timeout",
+			actual_last_success_at: null,
+			actual_last_success_source: null,
+		},
+	];
+
+	const gridCells: AdminRepoGovernanceOverviewResponse["grid_cells"] =
+		items.map((item) => ({
+			repo_id: item.repo_id,
+			age_bucket: item.repo_id === 1 ? "fresh" : "aging",
+			band_label: item.repo_id === 1 ? "W1 · 10 分钟" : "W2 · 30 分钟",
+			urgency_score: item.urgency_score,
+			system_attempt_status: item.system_last_attempt_status,
+		}));
+
+	return {
+		overview: {
+			summary: {
+				dedup_repo_count: items.length,
+				pressure_windows: 1.8,
+				last_full_cycle_completed_at: "2026-07-08T09:10:00+08:00",
+			},
+			cycle: {
+				active_cycle_id: "cycle-demo-01",
+				active_cycle_started_at: "2026-07-08T09:20:00+08:00",
+				active_cycle_repo_count: items.length,
+				active_cycle_completed_count: 1,
+				active_cycle_window_minutes: 10,
+				active_cycle_window_budget:
+					settings.repo_refresh_system_budget_per_window,
+				active_cycle_last_selection_window_index: 1,
+			},
+			settings,
+			grid_cells: gridCells,
+		},
+		list: {
+			items,
+			page: 1,
+			page_size: 60,
+			total: items.length,
+			target_window_options: [
+				{ target_window: 1, repo_count: 1 },
+				{ target_window: 2, repo_count: 1 },
+			],
+		},
+	};
+}
+
+function buildBindContext(): AuthBindContextResponse {
+	return {
+		linuxdo_available: true,
+		pending_linuxdo: {
+			linuxdo_user_id: 9527,
+			username: "octo-linuxdo",
+			name: "Octo LinuxDO",
+			avatar_url: svgAvatarDataUrl("LD", "#ca8a04"),
+			trust_level: 3,
+			active: true,
+			silenced: false,
+		},
+		pending_passkey: {
+			label: "MacBook Pro Touch ID",
+			created_at: "2026-07-08T09:00:00+08:00",
+		},
+	};
+}
+
+function buildAnnouncementDetail(): AnnouncementDetailResponse {
+	return {
+		repo_full_name: OWNER_REPO_FULL_NAME,
+		discussion_number: 42,
+		discussion_key: `${OWNER_REPO_FULL_NAME}#42`,
+		repo_visual: OWNER_REPO_VISUAL,
+		title: "公告：站内 discussion 阅读页已上线",
+		body: "## What's changed\n\n- 公告进入站内详情页\n- 原文、翻译和润色共享同一阅读 lane",
+		html_url: "https://github.com/octo-demo/release-lab/discussions/42",
+		occurred_at: "2026-07-08T09:40:00+08:00",
+		actor: {
+			login: "octo-demo-owner",
+			avatar_url: OWNER_REPO_VISUAL.owner_avatar_url,
+			html_url: "https://github.com/octo-demo-owner",
+		},
+		translated: {
+			lang: "zh-CN",
+			status: "ready",
+			title: "公告：站内 discussion 阅读页已上线",
+			summary: "- 公告详情支持站内阅读\n- 返回工作台会恢复原 scope",
+		},
+		smart: {
+			lang: "zh-CN",
+			status: "ready",
+			title: "公告：站内阅读流已对齐",
+			summary:
+				"## 润色摘要\n\n- 默认进入润色 lane。\n- GitHub 仍作为外部 escape hatch。",
+		},
+	};
+}
+
 export function buildDemoModel(input: {
 	sceneId: DemoSceneId;
 	personaId: DemoPersonaId;
@@ -1850,6 +1991,7 @@ export function buildDemoModel(input: {
 	const profile = buildProfile(me, input.includeOwnReleases);
 	const adminUsers = buildAdminUsers();
 	const adminUserProfiles = buildAdminUserProfiles(adminUsers);
+	const adminJobs = buildAdminJobs();
 
 	return {
 		me,
@@ -1866,9 +2008,12 @@ export function buildDemoModel(input: {
 		publicReleaseDetail: buildPublicReleaseDetail(),
 		publicReleaseList: buildPublicReleaseList(),
 		publicationStatus: buildPublicationStatus(input.publicationState),
+		adminRepoGovernance: buildAdminRepoGovernance(adminJobs),
+		bindContext: buildBindContext(),
+		announcementDetail: buildAnnouncementDetail(),
 		adminUsers,
 		adminUserProfiles,
-		adminJobs: buildAdminJobs(),
+		adminJobs,
 		taskStreams: buildTaskStreams(),
 		adminJobsStream: buildAdminJobsStream(),
 	};

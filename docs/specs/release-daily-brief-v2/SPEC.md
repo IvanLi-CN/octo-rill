@@ -36,7 +36,7 @@
 - `docs/product.md`
 - `web/src/components/Markdown.tsx`
 - `web/src/components/Markdown.stories.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `web/e2e/release-detail.spec.ts`
 - `web/src/admin/TaskTypeDetailSection.tsx`
 - `web/src/stories/TaskTypeDetailSection.stories.tsx`
@@ -172,7 +172,7 @@ None
 
 ### UI / Storybook (if applicable)
 
-- Stories to add/update: `web/src/stories/Dashboard.stories.tsx`, `web/src/stories/TaskTypeDetailSection.stories.tsx`
+- Stories to add/update: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`, `web/src/stories/TaskTypeDetailSection.stories.tsx`
 - Docs pages / state galleries to add/update: 复用现有 Dashboard / admin task detail stories
 - `play` / interaction coverage to add/update: brief V2 正文可见性、历史日组展开收起、任务详情 diagnostics 展示
 - Visual regression baseline changes (if any): Storybook 截图更新为 V2 正文与历史刷新任务详情
@@ -199,15 +199,15 @@ None
 
 ## Visual Evidence
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard / Briefs Focused`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish  Briefs Focused`
   state: `briefs_tab_v2_body`
   evidence_note: 证明独立 `日报` tab 中正文只保留 `项目更新 + 获星与关注`，并显示紧凑短链接、compare 范围与行号片段。
   image:
   ![Dashboard 日报 tab V2 正文](./assets/dashboard-briefs-focused.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard / Evidence / All History Collapsed To Briefs`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish  Evidence / All History Collapsed To Briefs`
   state: `historical_group_embedded_brief`
   evidence_note: 证明 `全部` tab 的历史日组内嵌 brief 已切换为 V2 正文结构，且相关链接文本为短标签。
   image:
@@ -256,4 +256,4 @@ None
 - `docs/specs/dashboard-day-grouping/SPEC.md`
 - `docs/specs/dashboard-brief-detail-auto-height/SPEC.md`
 - `src/ai.rs`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`

@@ -30,7 +30,7 @@
 ### In scope
 
 - `web/src/feed/FeedItemCard.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `web/e2e/dashboard-social-activity.spec.ts`
 - `docs/specs/README.md`
 - `docs/specs/dashboard-social-mobile-compact-layout/SPEC.md`
@@ -132,13 +132,13 @@
 
 - `docs/specs/dashboard-social-activity/SPEC.md`
 - `web/src/feed/FeedItemCard.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `web/e2e/dashboard-social-activity.spec.ts`
 
 ## Visual Evidence
 
-- source_type: storybook_canvas
-  story_id_or_title: Pages/Dashboard · Evidence / Mobile Social Edge Case Matrix
+- source_type: ui_demo
+  story_id_or_title: ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish · Evidence / Mobile Social Edge Case Matrix
   state: mobile social cards with entity-group edge alignment
   evidence_note: 验证在 390px 移动端宽度下，右长、左长、双长与短 follower 连续列表都以真实实体组为贴边基准；右侧实体组的 trailing whitespace 已收敛。
 
