@@ -46,6 +46,18 @@ function truncateChars(raw: string, maxChars: number) {
 	return `${chars.slice(0, maxChars).join("")}…`;
 }
 
+function decodePathSegment(raw: string) {
+	try {
+		return decodeURIComponent(raw);
+	} catch {
+		return raw;
+	}
+}
+
+function compactGithubLineAnchor(raw: string) {
+	return /^#L\d+(?:-L\d+)?$/.test(raw) ? raw : "";
+}
+
 function collectTextContent(node: ReactNode): string {
 	if (node == null || typeof node === "boolean") return "";
 	if (typeof node === "string" || typeof node === "number") {
@@ -66,7 +78,7 @@ function compactGithubLinkLabel(raw: string): string | null {
 		if (!GITHUB_HOSTS.has(parsed.host)) return null;
 		const segments = parsed.pathname
 			.split("/")
-			.map((segment) => segment.trim())
+			.map((segment) => decodePathSegment(segment.trim()))
 			.filter(Boolean);
 
 		if (segments.length >= 4) {
@@ -79,6 +91,18 @@ function compactGithubLinkLabel(raw: string): string | null {
 					break;
 				case "commit":
 					return segments[3].slice(0, 7);
+				case "compare":
+					if (segments[3]) {
+						return segments[3];
+					}
+					break;
+				case "blob":
+				case "blame":
+					if (segments.length >= 5) {
+						const filePath = segments.slice(4).join("/");
+						return `${truncateChars(filePath, 32)}${compactGithubLineAnchor(parsed.hash)}`;
+					}
+					break;
 				case "releases":
 					if (segments[3] === "tag" && segments[4]) {
 						return truncateChars(segments[4], 32);

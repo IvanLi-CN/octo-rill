@@ -4,14 +4,14 @@
 
 - 当前 `.github/workflows/release.yml` 依赖 `workflow_run(CI Pipeline completed)`，只有 `push@main` 的 CI 结论为 `success` 才继续发版。
 - 已确认存在已合并的稳定版变更因对应 `push@main` CI 被 `cancelled`，导致 Release workflow 被触发但直接 `skipped`。
-- 现状缺少自动 audit/backfill：一旦主干 CI 被取消，后续没有机制补发 tag / GitHub Release / Docker image / PR release comment。
+- 现状缺少自动 audit/backfill：一旦主干 CI 被取消，后续没有机制补发 tag / GitHub Release / Docker image。
 - GitHub Actions 默认 `GITHUB_TOKEN` 无法为历史提交创建缺失的 release tag；当 backfill target 不是当前 `main` HEAD 且目标 tag 尚不存在时，workflow 需要仓库 secret `RELEASE_TOKEN`（具备创建历史 release tag 的 GitHub token），否则只能先手动把目标 tag 推到远端再重跑 release。
 
 ## 目标
 
 - 将 Release 触发从 `workflow_run(CI success)` 改为 `push@main` 直接驱动，并保留 `workflow_dispatch(head_sha)` 作为显式补发入口。
 - 在主干存在更早的漏发版本时，优先按合并顺序补发最早的漏项，避免版本号跳号或倒序。
-- 为已打 tag 但缺少 GitHub Release / PR release comment 的提交提供可重跑、幂等的 repair 路径。
+- 为已打 tag 但缺少 GitHub Release 的提交提供可重跑、幂等的 repair 路径。
 - 修复 PR 自身必须保持 `type:skip + channel:stable`，不能抢占产品版本号。
 
 ## 非目标
@@ -20,6 +20,7 @@
 - 不回补 `type:docs` / `type:skip` PR 的版本发布。
 - 不修改产品运行时 HTTP API、数据库 schema、前端/后端业务逻辑。
 - 不深挖是谁取消了 `CI Pipeline`；本轮只移除这条脆弱依赖。
+- 不将 source PR 评论作为发布成功、repair 或 backfill 完整性条件；成功发布结果由 release-owning agent 向 owner 报告。
 
 ## 关键约束
 
@@ -31,6 +32,7 @@
 - 当 target SHA 不是当前 `main` HEAD 且对应 release tag 尚不存在时，workflow 必须在创建 release 前显式校验 `RELEASE_TOKEN` 是否可用；若不可用，需给出可执行的 fallback（预先推送目标 tag 后再重跑）。
 - 当目标 tag 已经存在时，workflow 必须复用现有 tag 创建/更新 GitHub Release，而不是继续传入会触发历史 tag 创建的参数。
 - 已确认的历史漏发项必须按 first-parent 主干顺序补发，不能按发现时间或重试时间倒序处理。
+- 发布 workflow 不回写 source PR；发布完成后的结果由 release-owning agent 向 owner 报告。
 
 ## 实现要求
 
@@ -66,4 +68,4 @@
 
 - Given 主干存在连续的历史漏发项
   When 修复变更合入后触发 backfill
-  Then 稳定版按 first-parent 顺序连续发布，且对应 tag / GitHub Release / PR release comment / Docker image 全部齐全。
+  Then 稳定版按 first-parent 顺序连续发布，且对应 tag / GitHub Release / Docker image 全部齐全。
