@@ -150,16 +150,16 @@ PR: include
 
 ![Error feedback surfaces storybook evidence](./assets/error-feedback-surfaces-storybook.png)
 
-- source_type: storybook_canvas
-  story_id_or_title: Pages/Dashboard · Evidence / Feed Initial Failure Surface
+- source_type: ui_demo
+  story_id_or_title: ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish · Evidence / Feed Initial Failure Surface
   state: feed 首载失败且当前列表为空
   evidence_note: 验证 Dashboard 主列直接切换为区域错误态，并保留就地重试动作，侧栏内容不被错误横幅挤压。
 PR: include
 
 ![Feed initial failure storybook evidence](./assets/feed-initial-failure-storybook.png)
 
-- source_type: storybook_canvas
-  story_id_or_title: Pages/Dashboard · Evidence / Release Detail Translation Failure
+- source_type: ui_demo
+  story_id_or_title: ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish · Evidence / Release Detail Translation Failure
   state: release detail 翻译失败正文区替换
   evidence_note: 验证 release detail modal 在翻译失败时切换为正文区 ErrorStatePanel，并保留重试、查看原文与 GitHub 动作。
 PR: include

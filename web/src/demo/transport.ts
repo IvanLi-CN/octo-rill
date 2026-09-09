@@ -18,6 +18,9 @@ import type {
 	AdminRealtimeTaskItem,
 	AdminSyncRuntimeConfigResponse,
 	AdminTranslationRuntimeConfigUpdateRequest,
+	AdminRepoGovernanceListResponse,
+	AnnouncementDetailResponse,
+	AuthBindContextResponse,
 	AdminUserProfileResponse,
 	CreateApiKeyResponse,
 	FollowingReposResponse,
@@ -1639,6 +1642,25 @@ export const demoHandlers = [
 		return json(buildTaskAcceptedResponse(taskId, "sync.notifications"));
 	}),
 	http.get(
+		"/api/repos/:owner/:repo/discussions/:number/detail",
+		async ({ params, request }) => {
+			const network = await applyNetworkProfile(request);
+			if (network) return network;
+			const detail = currentModel().announcementDetail;
+			if (
+				params.owner !== "octo-demo" ||
+				params.repo !== "release-lab" ||
+				String(params.number) !== String(detail.discussion_number)
+			) {
+				return json(
+					{ error: { code: "not_found", message: "Discussion not found." } },
+					{ status: 404 },
+				);
+			}
+			return json(detail satisfies AnnouncementDetailResponse);
+		},
+	),
+	http.get(
 		"/api/public/repos/:owner/:repo/releases/content",
 		async ({ request }) => {
 			const network = await applyNetworkProfile(request);
@@ -1720,6 +1742,11 @@ export const demoHandlers = [
 		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		return json({ items: currentModel().passkeys });
+	}),
+	http.get("/api/auth/bind-context", async ({ request }) => {
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		return json(currentModel().bindContext satisfies AuthBindContextResponse);
 	}),
 	http.post("/api/auth/passkeys/register/options", async ({ request }) => {
 		const url = new URL(request.url);
@@ -2030,6 +2057,49 @@ export const demoHandlers = [
 		if (network) return network;
 		const window = url.searchParams.get("window") === "30d" ? "30d" : "7d";
 		return json(buildAdminDashboardResponse(currentModel(), window));
+	}),
+	http.get("/api/admin/repos/overview", async ({ request }) => {
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		return json(currentModel().adminRepoGovernance.overview);
+	}),
+	http.get("/api/admin/repos", async ({ request }) => {
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		const model = currentModel();
+		const url = new URL(request.url);
+		const query = (url.searchParams.get("query") ?? "").trim().toLowerCase();
+		const aging = url.searchParams.get("aging");
+		const targetWindows = new Set(
+			(url.searchParams.get("target_windows") ?? "")
+				.split(",")
+				.filter(Boolean)
+				.map((value) => Number(value)),
+		);
+		const urgencyMin = Number(url.searchParams.get("urgency_min") ?? "NaN");
+		const items = model.adminRepoGovernance.list.items.filter((item) => {
+			if (query && !item.repo_full_name.toLowerCase().includes(query))
+				return false;
+			if (targetWindows.size > 0 && !targetWindows.has(item.target_window)) {
+				return false;
+			}
+			if (Number.isFinite(urgencyMin) && item.urgency_score < urgencyMin) {
+				return false;
+			}
+			if (
+				aging === "missing" &&
+				item.system_last_attempt_status === "succeeded"
+			) {
+				return false;
+			}
+			if (aging === "stale" && item.urgency_bucket !== "stale") return false;
+			return true;
+		});
+		return json({
+			...model.adminRepoGovernance.list,
+			items,
+			total: items.length,
+		} satisfies AdminRepoGovernanceListResponse);
 	}),
 	http.get("/api/admin/jobs/overview", async ({ request }) => {
 		const network = await applyNetworkProfile(request);

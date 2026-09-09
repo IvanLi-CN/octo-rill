@@ -16,4 +16,4 @@
 - `docs-site/docs/product.md`
 - `docs-site/docs/config.md`
 - `docs-site/docs/quick-start.md`
-- `web/src/pages/Landing.tsx`、`web/src/stories/AppLanding.stories.tsx` 与 `web/e2e/landing-login.spec.ts` 覆盖统一认证动作状态、OAuth 首击反馈、重复点击拦截及互斥禁用。
+- `web/src/pages/Landing.tsx`、`ui_demo: ./demo/?demo=landing-welcome` 与 `web/e2e/landing-login.spec.ts` 覆盖统一认证动作状态、OAuth 首击反馈、重复点击拦截及互斥禁用。

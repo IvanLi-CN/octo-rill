@@ -36,7 +36,7 @@
 - `web/src/routes/focus/**`
 - `web/src/auth/startupCache.ts`
 - `src/api.rs`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `docs/specs/README.md`
 
 ### Out of scope

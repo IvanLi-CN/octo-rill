@@ -130,8 +130,8 @@
 
 ### UI / Storybook (if applicable)
 
-- Stories to add/update: `web/src/stories/AppShell.stories.tsx`、`web/src/stories/AppMetaFooter.stories.tsx`、必要的 `Dashboard.stories.tsx` provider 接线。
-- Docs pages / state galleries to add/update: Storybook autodocs for app shell version notice states。
+- Demo links to add/update: `./demo/focus/repo/octo-demo/release-lab?demo=app-shell&d_shell=update-install`；组件级继续维护 `web/src/stories/AppMetaFooter.stories.tsx`。
+- Docs pages / state galleries to add/update: `ui_demo` 深链覆盖 app shell version notice states。
 - `play` / interaction coverage to add/update: App shell 更新提示的显隐与刷新动作。
 - Visual regression baseline changes (if any): 在本 spec 的 `## Visual Evidence` 中记录稳定截图。
 

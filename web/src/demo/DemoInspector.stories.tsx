@@ -22,6 +22,7 @@ const baseSnapshot = {
 		landingAuthAction: "idle" as const,
 		landingPasskeySupport: "supported" as const,
 		landingBootState: "ready" as const,
+		appShellState: "steady" as const,
 		controlsHidden: false,
 	},
 	model: buildDemoModel({

@@ -30,7 +30,7 @@
 - `web/src/feed/FeedList.tsx`
 - `web/src/feed/FeedItemCard.tsx`
 - `web/src/inbox/InboxList.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `docs/specs/README.md`
 
 ### Out of scope
@@ -197,4 +197,4 @@ PR: include
 
 - `web/src/pages/Dashboard.tsx`
 - `web/src/pages/DashboardHeader.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`

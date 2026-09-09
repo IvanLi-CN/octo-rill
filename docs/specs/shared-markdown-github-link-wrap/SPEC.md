@@ -26,7 +26,7 @@
 ### In scope
 
 - `web/src/components/Markdown.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `web/e2e/release-detail.spec.ts`
 - `docs/specs/README.md`
 - `docs/specs/shared-markdown-github-link-wrap/SPEC.md`
@@ -101,15 +101,15 @@
 ## Visual Evidence
 
 - evidence_head_sha: `06654c6a73b258493904f2518ad74d5334af88e8`
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/Evidence / Briefs GitHub Autolink Wrap`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish Evidence / Briefs GitHub Autolink Wrap`
   state: `brief-card-github-autolink-wrap`
   evidence_note: 验证 briefs 卡片中的裸 GitHub PR autolink 已收敛为 `#14247`，已有 `GitHub Release` / `#13840` 文案保持不变，同时长外链不会撑破卡片。
   image:
   ![Briefs 卡片 GitHub autolink 短标签与自动换行](./assets/briefs-github-autolink-wrap.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/Evidence / Briefs GitHub Autolink Wrap Detail`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish Evidence / Briefs GitHub Autolink Wrap Detail`
   state: `release-detail-github-autolink-wrap`
   evidence_note: 验证 release detail 弹窗中的裸 GitHub commit autolink 已压缩为短 SHA，长外链仍保持原文并允许自动换行。
   image:

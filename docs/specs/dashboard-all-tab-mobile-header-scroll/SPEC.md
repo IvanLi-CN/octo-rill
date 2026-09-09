@@ -26,7 +26,7 @@
 
 - `web/src/layout/AppShell.tsx`
 - `web/src/index.css`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `web/scripts/verify-mobile-header-drag.mjs`
 - `web/e2e/dashboard-access-sync.spec.ts`
 - `docs/specs/dashboard-all-tab-mobile-header-scroll/SPEC.md`
@@ -116,7 +116,7 @@
   viewport_strategy: storybook-viewport
   sensitive_exclusion: N/A
   submission_gate: owner-approved
-  story_id_or_title: `Pages/Dashboard / Mobile Runtime Parity All`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish  Mobile Runtime Parity All`
   state: sanitized runtime-parity all-tab shell
   evidence_note: 主人已在 IAB 中确认脱敏后的 `Mobile Runtime Parity All` 审阅面“看起来没问题了”。该正式 Story 保留线上 `全部` tab 的长滚动密度与 `release + repo_star_received` 混合结构，但不再携带原始线上响应；原始线上响应只作为临时复现基线保留在本地 scratch，不进入正式仓库资产。
   image:

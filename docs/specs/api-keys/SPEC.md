@@ -137,7 +137,7 @@
 
 ### UI / Storybook (if applicable)
 
-- Stories to add/update: `Pages/Settings` API Key section states。
+- Stories to add/update: `ui_demo: ./demo/settings?demo=settings-my-releases` API Key section states。
 - Docs pages / state galleries to add/update: Settings state gallery 覆盖 API Key 空态、列表态、创建成功态。
 - `play` / interaction coverage to add/update: 默认 settings story 能切到 API Key；API Key story 验证创建成功提示与列表内容。
 - Visual regression baseline changes: 新增 API Key settings 视觉证据。

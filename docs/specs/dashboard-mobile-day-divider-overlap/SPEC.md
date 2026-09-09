@@ -26,7 +26,7 @@
 ### In scope
 
 - `web/src/feed/FeedGroupedList.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `web/e2e/dashboard-access-sync.spec.ts`
 - `docs/specs/README.md`
 - `docs/specs/dashboard-mobile-day-divider-overlap/SPEC.md`
@@ -97,12 +97,12 @@
 
 ## Visual Evidence
 
-- source_type: storybook_canvas
+- source_type: ui_demo
   target_program: mock-only
   capture_scope: element
   sensitive_exclusion: N/A
   submission_gate: approved
-  story_id_or_title: Pages/Dashboard / Evidence / Mobile Mixed Activity Day Divider No Overlap
+  story_id_or_title: ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish  Evidence / Mobile Mixed Activity Day Divider No Overlap
   state: 375px mobile grouped feed with mixed historical activity
   evidence_note: 证明当前日 reaction footer 下方的历史 divider 已缩短为 `4 条动态`，并且右侧 `列表` action 与标题文本保持安全分离，桌面端对齐口径不回退。
   image:
