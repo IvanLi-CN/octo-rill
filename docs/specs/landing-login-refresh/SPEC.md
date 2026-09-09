@@ -27,7 +27,7 @@
 ### In scope
 
 - `web/src/pages/Landing.tsx`
-- `web/src/stories/AppLanding.stories.tsx`
+- `ui_demo: ./demo/?demo=landing-welcome`
 - `web/e2e/landing-login.spec.ts`
 - `docs/specs/README.md`
 
@@ -119,7 +119,7 @@
 
 ### UI / Storybook (if applicable)
 
-- Stories to add/update: `web/src/stories/AppLanding.stories.tsx`
+- Stories to add/update: `ui_demo: ./demo/?demo=landing-welcome`
 - Docs pages / state galleries to add/update: Landing autodocs
 - `play` / interaction coverage to add/update: 默认态、错误态、移动端 CTA 断言
 - Visual regression baseline changes (if any): 本 spec 的 `## Visual Evidence`

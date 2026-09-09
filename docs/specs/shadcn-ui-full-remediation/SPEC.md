@@ -114,8 +114,8 @@ None
 
 ### UI / Storybook (if applicable)
 
-- Stories to add/update: `Dashboard.stories.tsx`、`AdminPanel.stories.tsx`、`AdminJobs.stories.tsx`。
-- Visual regression baseline changes: 需要为 Dashboard、Admin Users、Admin Jobs 生成新的 Storybook 视觉证据。
+- Demo links to add/update: `./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`、`./demo/admin/users?demo=admin-panel-users`、`./demo/admin/jobs?demo=admin-jobs-running`。
+- Visual regression baseline changes: 需要为 Dashboard、Admin Users、Admin Jobs 生成新的 `ui_demo` 视觉证据。
 
 ### Quality checks
 

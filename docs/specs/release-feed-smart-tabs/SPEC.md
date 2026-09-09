@@ -260,92 +260,92 @@
 
 ## Visual Evidence
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/PageDefaultLaneSwitching`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish PageDefaultLaneSwitching`
   state: `page-default-lane-switching`
   evidence_note: 验证顶部页面级默认显示模式切换器采用图标+文本，切到 `翻译` 后当前 release feed 立即统一切换，同时卡片内 selector 已收敛为 icon-only。
 
   ![页面级默认显示模式切换](./assets/release-page-default-lane-switching.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/Evidence/Desktop Dark Lane Selector`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish Evidence/Desktop Dark Lane Selector`
   state: `desktop-dark-page-lane-selector-polish`
   evidence_note: 验证暗色桌面下页面级阅读模式切换器与管理员入口同高、同基线、低阴影，控件不再在顶部控制带里显得漂浮或抢焦点。
 
   ![暗色桌面阅读模式控件](./assets/dashboard-lane-selector-dark.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/Evidence/Tablet Header Inline`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish Evidence/Tablet Header Inline`
   state: `tablet-page-lane-selector-alignment`
   evidence_note: 验证窄平板控制带中页面级阅读模式切换器与管理员入口保持同高、同基线，并与 tabs 控制带维持稳定间距。
 
   ![窄平板阅读模式控件对齐](./assets/dashboard-lane-selector-tablet.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/SmartReadyBody`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish SmartReadyBody`
   state: `smart-ready-body`
   evidence_note: 验证默认落在“润色” tab，且正文可直接生成版本变化要点而非直译。
 
   ![润色（正文直出）](./assets/release-smart-ready-body-focused.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/SmartReadyBody`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish SmartReadyBody`
   state: `release-card-lane-tooltip`
   evidence_note: 验证卡片内 icon-only selector 的 `润色` hover 只显示产品内 tooltip，且 `原文 / 翻译 / 润色` 触发器不再携带浏览器原生 `title`。
 
   ![Release 卡片 lane tooltip](./assets/release-card-lane-tooltip.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/SmartReadyDiff`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish SmartReadyDiff`
   state: `smart-ready-diff`
   evidence_note: 验证 release body 无价值时，润色回退到 diff digest，并输出适合快速理解版本变化的中文要点。
 
   ![润色（diff 回退）](./assets/release-smart-ready-diff-focused.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/SmartLoading`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish SmartLoading`
   state: `smart-loading`
   evidence_note: 验证润色 lane 缺数据时正文继续显示原文，同时仅通过 selector option 的呼吸态表达加载状态，不再把正文区替换成空白加载面板。
 
   ![润色加载时保留原文](./assets/release-smart-loading-original-fallback.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/SmartRetryActionLoading`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish SmartRetryActionLoading`
   state: `smart-retry-action-loading`
   evidence_note: 验证错误态卡片点击“重试润色”后，按钮立即进入旋转 loading，并在 smart 请求进行期间保持禁用，避免重复点击。
 
   ![重试润色按钮加载中](./assets/release-smart-retry-action-loading-focused.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/SmartUpstreamRetrying`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish SmartUpstreamRetrying`
   state: `smart-auto-retry-pending`
   evidence_note: 验证 retryable `润色失败` 在本页自动补救期间改为居中的中性等待面，不再显示红色错误块、详情 disclosure 或手动重试按钮。
 
   ![润色自动补救等待态](./assets/release-smart-auto-retry-pending.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/SmartInsufficient`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish SmartInsufficient`
   state: `smart-insufficient`
   evidence_note: 验证 body 与 diff 都没有有效版本信息时，卡片收敛为仅版本号折叠样式，不再渲染 tabs 与正文区。
 
   ![仅版本号折叠卡片](./assets/release-smart-insufficient-focused.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/ReleaseDetailSmartDefaultReady`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish ReleaseDetailSmartDefaultReady`
   state: `release-detail-smart-default-ready`
   evidence_note: 验证 Release 详情弹窗默认选中 `润色`，并优先展示 `release_smart/feed_card` 缓存，同时保留 GitHub 与关闭动作。
 
   ![Release 详情默认润色](./assets/release-detail-smart-default-ready.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/ReleaseDetailSmartLoadingOriginalFallback`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish ReleaseDetailSmartLoadingOriginalFallback`
   state: `release-detail-smart-loading-original-fallback`
   evidence_note: 验证 Release 详情弹窗在 smart 缺失时显示 `润色中…`，正文继续保留原始 release notes。
 
   ![Release 详情润色生成中保留原文](./assets/release-detail-smart-loading-original-fallback.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/SmartFailureToastLocateCard`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish SmartFailureToastLocateCard`
   state: `smart-failure-toast-with-retry-and-locate`
   target_program: `mock-only`
   capture_scope: `element`
@@ -358,8 +358,8 @@
 
   ![润色失败 toast 操作](./assets/release-smart-failure-toast.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/SmartFailureToastLocateCard`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish SmartFailureToastLocateCard`
   state: `smart-failure-card-with-local-retry`
   target_program: `mock-only`
   capture_scope: `element`

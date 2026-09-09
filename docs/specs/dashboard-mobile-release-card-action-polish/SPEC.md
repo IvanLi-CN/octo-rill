@@ -29,7 +29,7 @@
 
 - `web/src/feed/FeedItemCard.tsx`
 - `web/src/pages/Dashboard.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `web/e2e/release-detail.spec.ts`
 - `docs/specs/README.md`
 - `docs/specs/dashboard-mobile-release-card-action-polish/SPEC.md`
@@ -107,16 +107,16 @@
 
 ## Visual Evidence
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/MobileReleaseCardActionPolish`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish MobileReleaseCardActionPolish`
   state: `mobile-release-card-action-polish-default`
   evidence_note: 验证移动端 release 卡片已去掉单卡 lane tabs，顶部只保留页面级阅读模式入口，同时 GitHub 打开入口收敛到卡片右上角的 icon-only 链接。
   PR: include
   image:
   ![移动端 release 卡片操作收敛（默认）](./assets/mobile-release-card-actions.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/MobileReleaseCardActionPolish`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish MobileReleaseCardActionPolish`
   state: `mobile-release-card-action-polish-translated`
   evidence_note: 验证移动端顶部页面级 lane menu 切到 `翻译` 后，release 卡片会统一切换到翻译标题与正文。
   PR: include

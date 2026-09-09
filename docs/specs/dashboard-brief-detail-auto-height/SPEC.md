@@ -27,7 +27,7 @@
 
 - `web/src/sidebar/ReleaseDailyCard.tsx`
 - `web/src/sidebar/ReleaseDetailCard.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `docs/specs/README.md`
 
 ### Out of scope
@@ -72,7 +72,7 @@
 ## 接口契约（Interfaces & Contracts）
 
 - 无公开 API 或类型契约变更。
-- `Dashboard.stories.tsx` 允许新增用于 Storybook 的 mock props 与 fetch 拦截，仅服务于稳定预览，不影响运行时代码路径。
+- `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish` 提供稳定的 mock props 与 fetch 拦截，仅服务于页面验收，不影响运行时代码路径。
 
 ## 验收标准（Acceptance Criteria）
 
@@ -85,7 +85,7 @@
   Then 页面会出现 `Release 详情` 模态弹窗，Dashboard 主列不再插入第二张详情卡片，且详情 Markdown 容器不包含 `max-h-96` / `overflow-auto` 风格约束。
 
 - Given Storybook 长内容场景
-  When 进入长日报与长详情 story
+  When 进入长日报与长详情 `ui_demo`
   Then 可以稳定复现“日报卡片随内容扩展、详情以弹窗打开”的状态。
 
 ## 实现前置条件（Definition of Ready / Preconditions）
@@ -130,4 +130,4 @@
 
 - `web/src/sidebar/ReleaseDailyCard.tsx`
 - `web/src/sidebar/ReleaseDetailCard.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`

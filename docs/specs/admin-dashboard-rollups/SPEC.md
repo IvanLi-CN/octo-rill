@@ -155,8 +155,8 @@
 
 ### UI / Storybook
 
-- Stories: `web/src/stories/AdminDashboard.stories.tsx`
-- Visual evidence: 使用 Storybook 产出 dashboard 总览图
+- Demo: `./demo/admin/?demo=admin-dashboard-overview`
+- Visual evidence: 使用 `ui_demo` 产出 dashboard 总览图
 - Charting library: `recharts`
 
 ### Quality checks
@@ -195,4 +195,4 @@
 - `migrations/0037_admin_dashboard_rollups.sql`
 - `migrations/0041_admin_dashboard_business_rollups.sql`
 - `web/src/admin/AdminDashboard.tsx`
-- `web/src/stories/AdminDashboard.stories.tsx`
+- `ui_demo: ./demo/admin/?demo=admin-dashboard-overview`

@@ -66,8 +66,8 @@ Response:
 
 ![Dashboard new feed batch](./assets/quasi-realtime-new-feed-batch.png)
 
-- source_type: storybook_canvas
-- story_id_or_title: Pages/Dashboard / Evidence / Live updates feed batch
+- source_type: ui_demo
+- story_id_or_title: ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish  Evidence / Live updates feed batch
 - scenario: Dashboard Feed 发现新批次但尚未自动插入
 - evidence_note: 验证列表内“刚刚同步”批次分隔、用户控制的展开动作、新 release 卡片在时间元信息旁保留青蓝同步色、带层次和持续低声量呼吸动效的 session-only 圆点暗示，以及未受影响的 Inbox 侧栏保持稳定。
 - requested_viewport: 1773x929 CSS px
@@ -75,8 +75,8 @@ Response:
 
 ![Dashboard continuous feed boundary](./assets/continuous-feed-boundary.png)
 
-- source_type: storybook_canvas
-- story_id_or_title: Pages/Dashboard / Live updates / Continuous feed push
+- source_type: ui_demo
+- story_id_or_title: ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish  Live updates / Continuous feed push
 - scenario: Dashboard Feed 持续发现新动态并把新卡片插入旧内容上方
 - evidence_note: 验证后续推送会新增新的“上方有 N 条新动态”分割线，原分割线在视口内继续作为布局锚点保留；连续推送只保持阅读锚点，不主动滚动到分割线，用户可点击任一分割线主动滚动到对应新内容顶部。
 - requested_viewport: 1280x720 CSS px

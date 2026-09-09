@@ -34,7 +34,7 @@
 - `web/src/pages/Dashboard.tsx`
 - `web/src/stories/DashboardHeader.stories.tsx`
 - `web/src/stories/AdminHeader.stories.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `web/e2e/dashboard-access-sync.spec.ts`
 - `web/e2e/admin-users.spec.ts`
 - `web/e2e/admin-jobs.spec.ts`
@@ -143,7 +143,7 @@
 
 ### UI / Storybook (if applicable)
 
-- Stories to add/update: `web/src/stories/DashboardHeader.stories.tsx`、`web/src/stories/Dashboard.stories.tsx`、`web/src/stories/AdminHeader.stories.tsx`
+- Stories to add/update: `web/src/stories/DashboardHeader.stories.tsx`、`ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`、`web/src/stories/AdminHeader.stories.tsx`
 - Visual evidence source: Storybook canvas
 - Visual evidence sink: `## Visual Evidence`
 
@@ -184,7 +184,7 @@
   viewport_strategy: `storybook-viewport`
   sensitive_exclusion: `N/A`
   submission_gate: `approved`
-  story_id_or_title: `Pages/Dashboard / Regression / Narrow Tablet 757`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish  Regression / Narrow Tablet 757`
   state: `dashboard-page-narrow-tablet-757`
   evidence_note: 验证 Dashboard 页面在 `757x827` 下维持单主列与页头同排合同，且 `Inbox Quick List` 侧栏仍保持隐藏。
   PR: include
@@ -198,7 +198,7 @@
   viewport_strategy: `storybook-viewport`
   sensitive_exclusion: `N/A`
   submission_gate: `approved`
-  story_id_or_title: `Pages/Dashboard / Evidence / Tablet Header Inline`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish  Evidence / Tablet Header Inline`
   state: `dashboard-page-tablet-853`
   evidence_note: 保留 `853x1280` canonical tablet 证据，证明原平板口径仍保持页头同排与单主列内容区，不因窄平板 follow-up 回退。
   image:

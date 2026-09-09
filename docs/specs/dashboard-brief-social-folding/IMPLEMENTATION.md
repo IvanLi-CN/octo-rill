@@ -14,7 +14,7 @@
 
 - `docs/product.md`
 - `docs/specs/README.md`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 
 ## 计划资产（Plan assets）
 

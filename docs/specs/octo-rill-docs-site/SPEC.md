@@ -50,7 +50,7 @@
 ### Storybook 文档体验
 - 核心组：Landing、Dashboard、Admin Panel、Admin Jobs、Task Type Detail、UI Primitives、App Meta Footer。
 - 每个核心组都要有可读的 docs 描述（组件用途、适用页面或关键交互）。
-- Storybook 分组命名固定为 `Pages/Landing`、`Pages/Dashboard`、`Admin/Admin Panel`、`Admin/Admin Jobs`、`Admin/Task Type Detail`、`Layout/App Meta Footer`、`UI/Primitives`，并便于从公开文档站跳转定位。
+- 页面级入口固定由 `ui_demo` 提供：`./demo/?demo=landing-welcome`、`./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`、`./demo/admin/users?demo=admin-panel-users`、`./demo/admin/jobs?demo=admin-jobs-running`；Storybook 继续保留 `Admin/Task Type Detail`、`Layout/App Meta Footer`、`UI/Primitives` 等组件与 fragment 分组，并便于从公开文档站跳转定位。
 
 ## 接口契约（Interfaces & Contracts）
 

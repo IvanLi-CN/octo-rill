@@ -27,7 +27,7 @@ Release Feed 与 Release 详情曾采用 `custom social preview -> owner/org ava
 
 - `web/src/lib/repoVisual.ts` 的前端候选图解析。
 - Release Feed 与 Release 详情共用的 `RepoIdentity` 展示收口。
-- `web/src/stories/Dashboard.stories.tsx` 的状态说明与 play 断言。
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish` 的状态说明与 play 断言。
 - `web/e2e/release-detail.spec.ts` 的回归断言。
 - 本 spec 的 `## Visual Evidence` 与 specs index。
 

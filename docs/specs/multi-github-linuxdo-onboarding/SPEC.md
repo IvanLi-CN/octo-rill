@@ -203,7 +203,7 @@
 
 ### UI / Storybook (if applicable)
 
-- Stories to add/update: `AppLanding`、`Settings`、`BindGitHub`。
+- Stories to add/update: `ui_demo`、`Settings`、`ui_demo`。
 - Docs pages / state galleries to add/update: Settings GitHub 账号 / PAT owner / LinuxDO onboarding 状态画廊。
 - `play` / interaction coverage to add/update: Landing CTA 可见性、OAuth 跳转中互斥反馈、可分享 `d_case` Landing Case 预设与 `d_auth` / `d_passkey` / `d_auth_boot` 场景控制、Settings 深链 section、补绑页状态展示。
 - 最终 owner-facing 视觉证据写入本 spec 的 `## Visual Evidence`。
@@ -220,24 +220,22 @@
 
 ## Visual Evidence
 
-Landing 双登录入口（storybook_canvas: `Pages/Landing / Default`）
+Landing 双登录入口（ui_demo: `./demo/?demo=landing-welcome`）
 ![Landing dual login entry](./assets/landing-dual-login.png)
 
 Landing 认证动作互斥与场景专属控制（controlled demo: `Landing / Custom`）
-PR: include
 ![Landing auth feedback controls](./assets/landing-auth-feedback-controls.png)
 
 Landing GitHub OAuth 跳转中移动态（controlled demo: `Landing / GitHub OAuth pending`）
-PR: include
 ![Landing auth feedback mobile](./assets/landing-auth-feedback-mobile.png)
 
-LinuxDO 首登补绑页（storybook_canvas: `Pages/BindGitHub / Pending Linux Do`）
+LinuxDO 首登补绑页（ui_demo: `./demo/bind/github?demo=bind-github-pending`）
 ![Bind GitHub pending LinuxDO](./assets/bind-github-pending-linuxdo.png)
 
-Settings GitHub 多账号管理（storybook_canvas: `Pages/Settings / Git Hub Accounts`）
+Settings GitHub 多账号管理（ui_demo: `./demo/settings?demo=settings-my-releases`）
 ![Settings GitHub accounts](./assets/settings-github-accounts.png)
 
-Settings GitHub PAT owner 展示（storybook_canvas: `Pages/Settings / Deep Linked Git Hub Pat`）
+Settings GitHub PAT owner 展示（ui_demo: `./demo/settings?demo=settings-my-releases`）
 ![Settings GitHub PAT owner](./assets/settings-github-pat-owner.png)
 
 ## 方案概述（Approach, high-level）

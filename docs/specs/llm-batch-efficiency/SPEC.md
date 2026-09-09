@@ -187,7 +187,7 @@
 ## Visual Evidence
 
 - 本任务不提交静态截图资产。
-- 可通过 Storybook `Pages/Dashboard/VisibleWindowQueue` 与 `Pages/Dashboard/VisibleWindowSettling` 复现可见窗口自动翻译状态。
+- 可通过 `ui_demo` `./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish` 与对应 Playwright 场景复现可见窗口自动翻译状态。
 
 ## 参考（References）
 

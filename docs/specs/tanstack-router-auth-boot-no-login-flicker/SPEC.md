@@ -105,7 +105,7 @@
 
 ### Testing
 
-- Storybook：新增 `Pages/App Boot` 稳定审阅入口，至少覆盖冷启动品牌初始化态、Dashboard skeleton、Admin skeleton。
+- Web Demo：新增 `./demo/?demo=app-boot&d_controls=hidden` 稳定审阅入口，至少覆盖冷启动品牌初始化态、Dashboard skeleton、Admin skeleton。
 - Playwright：覆盖首次 cold init、未登录 boot、Dashboard/Admin SPA 导航不重复 boot、关键 deep link 兼容。
 - Browser verification：通过本地预览复核 boot surface、Dashboard → Admin → Dashboard 导航，以及 Admin Jobs 深链。
 
@@ -119,7 +119,7 @@
 ## Visual Evidence
 
 - 证据绑定：本地 `HEAD`（2026-04-15）
-- 证据源：Storybook stable canvas + Playwright 路由回归
+- 证据源：`ui_demo` 页面 + Playwright 路由回归
 - 浏览器说明：Chrome DevTools 会话在本轮发生连接超时，最终截图改由本地 Playwright 对同一 Storybook iframe 稳定捕获；路由行为仍由 Playwright e2e 全量验证。
 
 ### 冷启动品牌初始化态（无登录 CTA）
@@ -128,14 +128,14 @@
 
 ![冷启动品牌初始化态（非移动端）](./assets/app-boot-cold-init-desktop.png)
 
-- Story: `Pages/App Boot / Cold Init`
+- Demo: `./demo/?demo=app-boot&d_controls=hidden`
 - 证明点：桌面冷启动只显示裸露的 `wordmark` 品牌识别体与软光效，不再套 icon 背景卡片或轮廓圆环；同时不出现 `连接到 GitHub` CTA，也不暗示用户是否已登录。
 
 #### 移动端
 
 ![冷启动品牌初始化态（移动端）](./assets/app-boot-cold-init-mobile.png)
 
-- Story: `Pages/App Boot / Cold Init`
+- Demo: `./demo/?demo=app-boot&d_controls=hidden`
 - 证明点：移动端冷启动切到单一 `mark` 品牌识别体，仅保留软光效，不再叠加 app icon 背景或额外轮廓圆圈；维持同一中性初始化语义，不因为窄视口退化成登录卡或双 Logo。
 
 
@@ -143,7 +143,7 @@
 
 ![Dashboard 路由骨架](./assets/dashboard-startup-skeleton.png)
 
-- Story: `Pages/App Boot / Dashboard Warm Skeleton`
+- Demo: `./demo/?demo=app-boot&d_controls=hidden`
 - 证明点：已识别登录但没有匹配热缓存时，直接显示当前目标页的 Dashboard layout skeleton，而不是回退到 Landing 或露出登录 CTA。
 
 
