@@ -4,6 +4,7 @@ import {
 } from "@/dashboard/routeState";
 import { buildSettingsHref } from "@/settings/routeState";
 import type {
+	DemoAppShellState,
 	DemoLandingAuthAction,
 	DemoLandingBootState,
 	DemoLandingCase,
@@ -63,6 +64,17 @@ export const LANDING_BOOT_STATE_OPTIONS = [
 	label: string;
 }>;
 
+export const APP_SHELL_STATE_OPTIONS = [
+	{ value: "steady", label: "Steady" },
+	{ value: "update", label: "Update available" },
+	{ value: "install", label: "Installable" },
+	{ value: "update-install", label: "Update and install" },
+	{ value: "unknown", label: "Unknown version" },
+] as const satisfies ReadonlyArray<{
+	value: DemoAppShellState;
+	label: string;
+}>;
+
 type DemoLandingControls = Pick<
 	DemoShareState,
 	"landingAuthAction" | "landingPasskeySupport" | "landingBootState"
@@ -118,6 +130,22 @@ export const DEMO_SCENES: DemoScene[] = [
 		personas: ["guest", "member", "admin"],
 	},
 	{
+		id: "app-boot",
+		title: "App Boot",
+		description: "受控启动界面，固定停留在初始化状态。",
+		path: "/",
+		defaultPersona: "guest",
+		personas: ["guest", "member", "admin"],
+	},
+	{
+		id: "app-shell",
+		title: "App Shell",
+		description: "共享应用壳层的版本更新、安装和未知版本状态。",
+		path: buildDashboardScopeHref(repoScope),
+		defaultPersona: "member",
+		personas: ["member", "admin", "guest"],
+	},
+	{
 		id: "dashboard-repo-publish",
 		title: "Dashboard",
 		description: "repo scope 原始信息流、发布控制与 simulated sync。",
@@ -166,6 +194,22 @@ export const DEMO_SCENES: DemoScene[] = [
 		personas: ["admin", "member", "guest"],
 	},
 	{
+		id: "admin-dashboard-overview",
+		title: "Admin Dashboard",
+		description: "后台业务与任务汇总仪表盘。",
+		path: "/admin/",
+		defaultPersona: "admin",
+		personas: ["admin"],
+	},
+	{
+		id: "admin-repos-overview",
+		title: "Admin Repos",
+		description: "后台仓库刷新治理、预算和老化列表。",
+		path: "/admin/repos",
+		defaultPersona: "admin",
+		personas: ["admin"],
+	},
+	{
 		id: "admin-jobs-running",
 		title: "Admin Jobs",
 		description: "任务中心运行态、设置保存与流式刷新入口。",
@@ -180,6 +224,30 @@ export const DEMO_SCENES: DemoScene[] = [
 		path: "/admin/jobs/translations",
 		defaultPersona: "admin",
 		personas: ["admin", "member", "guest"],
+	},
+	{
+		id: "bind-github-pending",
+		title: "Bind GitHub",
+		description: "LinuxDO / Passkey 待绑定 GitHub 的受控状态。",
+		path: "/bind/github?linuxdo=connected&passkey=created",
+		defaultPersona: "guest",
+		personas: ["guest", "member"],
+	},
+	{
+		id: "announcement-detail",
+		title: "Announcement Detail",
+		description: "公告 discussion 详情、翻译和润色 lane。",
+		path: "/octo-demo/release-lab/discussions/42?from=feed",
+		defaultPersona: "member",
+		personas: ["member", "admin"],
+	},
+	{
+		id: "not-found",
+		title: "Not Found",
+		description: "应用壳层启动后的未知路由 404 页面。",
+		path: "/demo-missing-route",
+		defaultPersona: "guest",
+		personas: ["guest", "member", "admin"],
 	},
 	{
 		id: "paused-account-resume",
@@ -216,8 +284,14 @@ export function resolveDefaultSceneId(
 			? pathname.slice(normalizedBasepath.length) || "/"
 			: pathname || "/";
 
+	if (normalizedPath === "/admin/" || normalizedPath === "/admin") {
+		return "admin-dashboard-overview";
+	}
+	if (normalizedPath.startsWith("/admin/repos")) return "admin-repos-overview";
 	if (normalizedPath.startsWith("/admin/jobs")) return "admin-jobs-running";
 	if (normalizedPath.startsWith("/admin")) return "admin-panel-users";
+	if (normalizedPath.startsWith("/bind/github")) return "bind-github-pending";
+	if (normalizedPath.includes("/discussions/")) return "announcement-detail";
 	if (normalizedPath.startsWith("/account/paused"))
 		return "paused-account-resume";
 	if (normalizedPath.startsWith("/settings")) return "settings-my-releases";
@@ -288,6 +362,14 @@ export function normalizePublicationState(
 	return value === "published" ? "published" : "unpublished";
 }
 
+export function normalizeAppShellState(
+	value: string | null | undefined,
+): DemoAppShellState {
+	return APP_SHELL_STATE_OPTIONS.some((option) => option.value === value)
+		? (value as DemoAppShellState)
+		: "steady";
+}
+
 export function readDemoShareState(url: URL, basepath: string): DemoShareState {
 	const sceneIdRaw = url.searchParams.get("demo") as DemoSceneId | null;
 	const sceneId = DEMO_SCENE_BY_ID.has(sceneIdRaw ?? "")
@@ -319,6 +401,7 @@ export function readDemoShareState(url: URL, basepath: string): DemoShareState {
 			url.searchParams.get("d_auth_boot"),
 			landingCaseControls.landingBootState,
 		),
+		appShellState: normalizeAppShellState(url.searchParams.get("d_shell")),
 		controlsHidden: url.searchParams.get("d_controls") === "hidden",
 	};
 }
@@ -335,6 +418,7 @@ export function buildDefaultDemoShareState(
 		publicationState: "unpublished",
 		landingCase: "default",
 		...DEFAULT_LANDING_CONTROLS,
+		appShellState: "steady",
 		controlsHidden: false,
 	};
 }
@@ -375,6 +459,9 @@ export function applyDemoShareStateToSearchParams(
 	}
 	if (state.landingBootState !== landingCaseControls.landingBootState) {
 		target.set("d_auth_boot", state.landingBootState);
+	}
+	if (state.appShellState !== "steady") {
+		target.set("d_shell", state.appShellState);
 	}
 	if (state.controlsHidden) {
 		target.set("d_controls", "hidden");

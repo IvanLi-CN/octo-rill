@@ -47,7 +47,7 @@
 ### SHOULD
 
 - 全局 404 页面应复用现有 Landing / Settings 的壳层视觉语言，并为已登录用户提供回到工作台、进入设置页的 CTA。
-- Storybook 应提供稳定的 `Pages/Not Found` 与 `Pages/Settings` 入口，供后续视觉证据复用。
+- Web Demo 应提供稳定的 `./demo/demo-missing-route?demo=not-found` 与 `./demo/settings?demo=settings-my-releases` 入口，供后续视觉证据复用。
 
 ## 验收标准（Acceptance Criteria）
 
@@ -83,8 +83,8 @@
 
 ### UI / Storybook
 
-- Stories to add/update: `Pages/Not Found`、现有 `Pages/Settings`
-- Docs pages / state galleries to add/update: `Pages/Not Found` autodocs
+- Demo links to add/update: `./demo/demo-missing-route?demo=not-found`、现有 `./demo/settings?demo=settings-my-releases`
+- Docs pages / state galleries to add/update: `ui_demo` 404 deep link
 - `play` / interaction coverage: 404 CTA 可见性、Settings 直达态回归
 
 ### Quality checks
@@ -97,7 +97,7 @@
 ## Visual Evidence
 
 - 本任务不在规格中持久化截图资产。
-- 视觉验收依赖稳定的 `Pages/Settings`、`Pages/Not Found` Storybook canvas，以及 `web/e2e/settings.spec.ts` 对直达 `/settings` 与未知前端路径 404 的回归覆盖。
+- 视觉验收依赖稳定的 `ui_demo` 页面 `./demo/settings?demo=settings-my-releases`、`./demo/demo-missing-route?demo=not-found`，以及 `web/e2e/settings.spec.ts` 对直达 `/settings` 与未知前端路径 404 的回归覆盖。
 
 ## 方案概述（Approach, high-level）
 

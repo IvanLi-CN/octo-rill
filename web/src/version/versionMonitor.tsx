@@ -70,6 +70,25 @@ const defaultValue: VersionMonitorValue = {
 	promptInstallPwa: defaultPromptInstallPwa,
 };
 
+function readDemoAppShellState():
+	| "steady"
+	| "update"
+	| "install"
+	| "update-install"
+	| "unknown"
+	| null {
+	if (typeof window === "undefined") return null;
+	const params = new URLSearchParams(window.location.search);
+	if (params.get("demo") !== "app-shell") return null;
+	const value = params.get("d_shell");
+	return value === "update" ||
+		value === "install" ||
+		value === "update-install" ||
+		value === "unknown"
+		? value
+		: "steady";
+}
+
 const VersionMonitorContext = createContext<VersionMonitorValue>(defaultValue);
 
 export function normalizeVersion(raw: string): string {
@@ -165,6 +184,7 @@ function useVersionMonitorController(
 	const serviceWorkerUpdateCheckRef = useRef<(() => void) | null>(null);
 	const pendingServiceWorkerUpdateCheckRef = useRef(false);
 	const pwaInstallPromptRef = useRef<BeforeInstallPromptEvent | null>(null);
+	const demoAppShellState = readDemoAppShellState();
 
 	useEffect(() => {
 		hasUpdateRef.current = hasUpdate || hasServiceWorkerUpdate;
@@ -322,8 +342,28 @@ function useVersionMonitorController(
 		requestServiceWorkerUpdateCheck,
 	]);
 
-	return useMemo(
-		() => ({
+	return useMemo(() => {
+		if (demoAppShellState && demoAppShellState !== "steady") {
+			const hasDemoUpdate =
+				demoAppShellState === "update" ||
+				demoAppShellState === "update-install";
+			const hasDemoInstall =
+				demoAppShellState === "install" ||
+				demoAppShellState === "update-install";
+			return {
+				loadedVersion:
+					demoAppShellState === "unknown" ? VERSION_UNKNOWN : loadedVersion,
+				availableVersion: hasDemoUpdate ? "v2.32.0" : null,
+				hasUpdate: hasDemoUpdate,
+				hasServiceWorkerUpdate: false,
+				canInstallPwa: hasDemoInstall,
+				isPwaInstalled: false,
+				refreshPage: () => {},
+				promptInstallPwa: async () => {},
+			};
+		}
+
+		return {
 			loadedVersion,
 			availableVersion,
 			hasUpdate,
@@ -339,17 +379,17 @@ function useVersionMonitorController(
 				defaultRefreshPage();
 			},
 			promptInstallPwa,
-		}),
-		[
-			availableVersion,
-			canInstallPwa,
-			hasServiceWorkerUpdate,
-			hasUpdate,
-			isPwaInstalled,
-			loadedVersion,
-			promptInstallPwa,
-		],
-	);
+		};
+	}, [
+		availableVersion,
+		canInstallPwa,
+		hasServiceWorkerUpdate,
+		hasUpdate,
+		isPwaInstalled,
+		loadedVersion,
+		promptInstallPwa,
+		demoAppShellState,
+	]);
 }
 
 export function VersionMonitorProvider(props: VersionMonitorProviderProps) {

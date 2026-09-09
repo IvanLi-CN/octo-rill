@@ -339,12 +339,12 @@ evidence_note=验证 access sync 在 task.running 到 star_refreshed 之间显�
 ![Dashboard header warmup](./assets/dashboard-header-warmup.png)
 
 
-source_type=storybook_canvas
+source_type=ui_demo
 target_program=mock-only
 capture_scope=element
 sensitive_exclusion=N/A
 submission_gate=pending-owner-approval
-story_id_or_title=Pages/Dashboard/AccessSyncEmptyState
+story_id_or_title=ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish AccessSyncEmptyState
 state=auto-sync-empty-state
 evidence_note=验证访问触发同步期间，Dashboard 空态不再提示手动 Sync all，而是展示 staged refresh 文案
 
@@ -368,7 +368,7 @@ requested_viewport=default
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
 submission_gate=approved
-story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
+story_id_or_title=ui_demo: ./demo/admin/jobs?demo=admin-jobs-running/Subscription Sync Workflow
 state=subscription-sync-list
 evidence_note=验证 `/admin/jobs/subscriptions` 专用列表页展示 sync.subscriptions 工作流列表、Release worker 当前配置与统一设置入口。
 
@@ -381,7 +381,7 @@ requested_viewport=default
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
 submission_gate=approved
-story_id_or_title=Admin/Admin Jobs/Subscription Sync Detail
+story_id_or_title=ui_demo: ./demo/admin/jobs?demo=admin-jobs-running/Subscription Sync Detail
 state=subscription-sync-detail
 evidence_note=验证订阅同步独立详情页可见 Star、Release、Social、Inbox 阶段摘要、失败主因、最近关键事件与子任务链路。
 
@@ -393,7 +393,7 @@ capture_scope=element
 requested_viewport=default
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
-story_id_or_title=Admin/Admin Jobs/Subscription Sync Detail Running
+story_id_or_title=ui_demo: ./demo/admin/jobs?demo=admin-jobs-running/Subscription Sync Detail Running
 state=subscription-sync-detail-running
 submission_gate=approved
 evidence_note=验证运行中的订阅同步详情页按真实工作流推进：Collect、Star、Repo Collect 已完成，Release Queue 正在处理，Social 与 Notifications 等待上游阶段结束。
@@ -407,7 +407,7 @@ requested_viewport=default
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
 submission_gate=approved
-story_id_or_title=Admin/Admin Jobs/Subscription Sync Settings
+story_id_or_title=ui_demo: ./demo/admin/jobs?demo=admin-jobs-running/Subscription Sync Settings
 state=subscription-sync-settings
 evidence_note=验证列表页和详情语义共用的设置面板包含 Release worker 数量滑块与数字输入，且说明该设置不改变同步频率。
 
@@ -420,7 +420,7 @@ requested_viewport=default
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
 submission_gate=pending-owner-approval
-story_id_or_title=Admin/Admin Jobs/Subscription Sync Detail Skipped
+story_id_or_title=ui_demo: ./demo/admin/jobs?demo=admin-jobs-running/Subscription Sync Detail Skipped
 state=subscription-sync-detail-skipped
 evidence_note=验证被跳过的订阅同步详情页顶部与阶段总览均显示“已跳过”，不再把 0/0 阶段误标为“等待”。
 
@@ -433,7 +433,7 @@ requested_viewport=default
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
 submission_gate=pending-owner-approval
-story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
+story_id_or_title=ui_demo: ./demo/admin/jobs?demo=admin-jobs-running/Subscription Sync Workflow
 state=subscription-sync-settings-filtered-history
 evidence_note=验证配置弹窗最近链路用时只展示非跳过记录，被跳过记录不再作为左侧配置参考。
 
@@ -446,7 +446,7 @@ requested_viewport=1440x1200
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
 submission_gate=pending-owner-approval
-story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
+story_id_or_title=ui_demo: ./demo/admin/jobs?demo=admin-jobs-running/Subscription Sync Workflow
 state=subscription-sync-list-skipped-status
 evidence_note=验证订阅同步列表中底层 succeeded 但 `skipped=true` 的任务显示“已跳过”，不再显示“成功”。
 
@@ -459,7 +459,7 @@ requested_viewport=default
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
 submission_gate=pending-owner-approval
-story_id_or_title=Admin/Admin Jobs/Subscription Sync Detail Running
+story_id_or_title=ui_demo: ./demo/admin/jobs?demo=admin-jobs-running/Subscription Sync Detail Running
 state=release-incremental-stats
 evidence_note=验证 Release Queue 阶段展示“扫描 / 新增 / 更新 / 未变”的真实统计口径，不再把 GitHub 返回条数标成写入量。
 
@@ -472,7 +472,7 @@ requested_viewport=1440x900
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
 submission_gate=approved
-story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
+story_id_or_title=ui_demo: ./demo/admin/jobs?demo=admin-jobs-running/Subscription Sync Workflow
 state=subscription-sync-observability-desktop
 evidence_note=验证桌面端订阅同步列表保留高密度业务状态、阶段统计、异常焦点与配置统计，未把部分完成或失败记录显示为成功。
 
@@ -485,7 +485,7 @@ requested_viewport=1440x900
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
 submission_gate=approved
-story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
+story_id_or_title=ui_demo: ./demo/admin/jobs?demo=admin-jobs-running/Subscription Sync Workflow
 state=subscription-sync-neutral-frame
 evidence_note=验证订阅同步工作流卡片使用统一中性外框，不再出现左上角异常图案或左侧额外装饰，状态仅通过 badge 与阶段摘要表达。
 
@@ -498,7 +498,7 @@ requested_viewport=390x900
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
 submission_gate=approved
-story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
+story_id_or_title=ui_demo: ./demo/admin/jobs?demo=admin-jobs-running/Subscription Sync Workflow
 state=subscription-sync-observability-mobile-390
 evidence_note=验证 390px 窄屏下任务总览、订阅同步统计和工作流记录均为扁平布局，无卡片套卡片、无横向溢出。
 
@@ -511,7 +511,7 @@ requested_viewport=320x900
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
 submission_gate=approved
-story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
+story_id_or_title=ui_demo: ./demo/admin/jobs?demo=admin-jobs-running/Subscription Sync Workflow
 state=subscription-sync-observability-mobile-320
 evidence_note=验证 320px 窄屏下统计保持紧凑并列，订阅同步记录高度受控，阶段指标与异常摘要不遮挡、不溢出。
 

@@ -34,7 +34,7 @@
 - `web/src/routes/**`
 - `web/src/components/Markdown.tsx`
 - `web/src/sidebar/ReleaseDetailCard.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `src/api.rs`
 - `src/ai.rs`
 - `src/jobs.rs`
@@ -143,8 +143,8 @@
 
 ### UI / Storybook (if applicable)
 
-- Stories to add/update: `web/src/stories/Dashboard.stories.tsx`
-- Docs pages / state galleries to add/update: 复用 `Pages/Dashboard` 稳定 route-backed stories
+- Stories to add/update: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
+- Docs pages / state galleries to add/update: 复用 `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish` 稳定 route-backed stories
 - `play` / interaction coverage to add/update: tab 切换 pathname 同步、canonical release detail restore、legacy ingress replace
 - Visual evidence source: targeted browser URL 证明 + Storybook 稳定故事
 

@@ -12,7 +12,7 @@
 
 - 冻结 `/demo/` 为公开 `web demo` 子应用前缀，使用 `demo=<scene-id>` 作为 scene 入口，`d_*` 作为分享态命名空间。
 - 让 demo runtime 在 `AuthBootstrap` 之前完成模式识别与 MSW worker 启动，确保 mock-only 模式不会命中真实 `/api/**`、真实登录或真实后端写路径。
-- 首版覆盖 `Landing / Dashboard / Settings / Public Release / Admin Panel / Admin Jobs` 六个页面级 surface。
+- 页面级 surface 覆盖 `Landing / Dashboard / Settings / Public Release / Admin Panel / Admin Dashboard / Admin Repos / Admin Jobs / Bind GitHub / Announcement Detail / Not Found / App Boot / App Shell`，并为每个 surface 提供稳定深链。
 - 交付结构化 inspector：常规桌面宽度保持可悬浮、可吸边、可收起；当浏览器宽度足够容纳 Web App 最宽版心时，默认切换为固定贴住视口最左边、占满全高的 pinned left rail，但仍支持收起成 bubble 以恢复正常 Web App layout；同时支持 scene、persona、network、关键 data toggles、share link 与 recent simulated writes。
 - 把 GitHub Pages 装配扩展为 `docs-site + /storybook/ + /demo/`，并在根 `404.html` 上只对 `/demo/**` 开启 deep-link recovery。
 
@@ -50,13 +50,20 @@
 
 ### Scene registry
 
-- 首版 scene ids：
+- scene ids：
   - `landing-welcome`
+  - `app-boot`
+  - `app-shell`
   - `dashboard-repo-publish`
   - `settings-my-releases`
   - `public-release-ready`
   - `admin-panel-users`
+  - `admin-dashboard-overview`
+  - `admin-repos-overview`
   - `admin-jobs-running`
+  - `bind-github-pending`
+  - `announcement-detail`
+  - `not-found`
 - scene 需要绑定正式 route suffix，并允许通过 `d_persona`、`d_net`、`d_own`、`d_pub` 复现关键状态。
 - demo 中的写操作只更新内存态，并在 inspector 中记录为 simulated write。
 - demo fixtures 中的 owner / repo / 邮箱 / PAT mask / API key 必须使用明显的合成样例；secret-like 输入在 demo UI 中不得回显原始值或前缀。
@@ -104,6 +111,7 @@
 - `d_net=normal|slow|faulty`
 - `d_own=1`
 - `d_pub=published`
+- `d_shell=steady|update|install|update-install|unknown`
 - `d_restore=<encoded-path>`：仅供 404 recovery 内部回跳使用
 
 ## 验收标准（Acceptance Criteria）
@@ -130,7 +138,6 @@
   target_program: `mock-only`
   capture_scope: `browser-viewport`
   submission_gate: `captured`
-  PR: include
   captured_at: `2026-07-09`
   route: `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
   state: `dashboard-repo-publish`
@@ -142,7 +149,6 @@
   target_program: `mock-only`
   capture_scope: `browser-viewport`
   submission_gate: `captured`
-  PR: include
   captured_at: `2026-07-09`
   route: `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
   state: `dashboard-repo-publish`
@@ -154,7 +160,6 @@
   target_program: `mock-only`
   capture_scope: `browser-viewport`
   submission_gate: `captured`
-  PR: include
   captured_at: `2026-07-09`
   route: `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
   state: `dashboard-repo-publish`
@@ -166,7 +171,6 @@
   target_program: `mock-only`
   capture_scope: `browser-viewport`
   submission_gate: `captured`
-  PR: include
   captured_at: `2026-07-09`
   route: `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
   state: `dashboard-repo-publish`
@@ -178,7 +182,6 @@
   target_program: `mock-only`
   capture_scope: `browser-viewport`
   submission_gate: `captured`
-  PR: include
   captured_at: `2026-07-09`
   route: `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
   state: `dashboard-repo-publish`
@@ -190,7 +193,6 @@
   target_program: `mock-only`
   capture_scope: `browser-viewport`
   submission_gate: `captured`
-  PR: include
   captured_at: `2026-07-09`
   route: `/demo/settings?section=api-keys&demo=settings-my-releases`
   state: `settings-my-releases`
@@ -202,7 +204,6 @@
   target_program: `mock-only`
   capture_scope: `drawer-surface`
   submission_gate: `captured`
-  PR: include
   captured_at: `2026-07-09`
   route: `/demo/settings?section=my-releases&demo=settings-my-releases`
   state: `settings-my-releases`
@@ -214,13 +215,40 @@
   target_program: `mock-only`
   capture_scope: `browser-viewport`
   submission_gate: `captured`
-  PR: include
   captured_at: `2026-07-09`
   route: `/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish&d_persona=member`
   state: `dashboard-repo-publish`
   evidence_note: `Actions & Share` 的 share deep link 已从横向滚动文本块收口为只读单行 input。常规桌面宽度下不再出现额外的横向滚动条；owner 可以像普通 input 一样聚焦、移动光标、局部选择并复制当前 deep link，而不需要先拖动滚动条找尾部。
 
 ![Desktop dashboard demo with readonly share input](./assets/dashboard-desktop-share-readonly-input.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  submission_gate: `captured`
+  visual_comparison: `current-only`
+  captured_at: `2026-09-09`
+  requested_viewport: `1440x900`
+  viewport_strategy: `browser-emulation`
+  route: `/demo/focus/repo/octo-demo/release-lab?demo=app-shell&d_shell=update-install&d_controls=hidden`
+  state: `app-shell / update-install`
+  evidence_note: App Shell Demo 在无真实 service worker 的条件下稳定展示新版本提示、安装入口、刷新动作与固定仓库内容；该新增场景没有历史同路径基线，因此保留为 current-only 证据，不覆盖既有 Dashboard 资产。
+
+![App Shell update and install demo](./assets/app-shell-update-install-desktop.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  submission_gate: `captured`
+  visual_comparison: `current-only`
+  captured_at: `2026-09-09`
+  requested_viewport: `393x852`
+  viewport_strategy: `browser-emulation`
+  route: `/demo/focus/repo/octo-demo/release-lab?demo=app-shell&d_shell=update-install&d_controls=hidden`
+  state: `app-shell / update-install`
+  evidence_note: 同一 App Shell 场景在默认移动验收视口 `393x852` 下保持更新提示、安装按钮、刷新入口与仓库卡片可读，无真实认证或后端依赖。
+
+![App Shell update and install mobile demo](./assets/app-shell-update-install-mobile.png)
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 

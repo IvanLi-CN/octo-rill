@@ -28,7 +28,7 @@
 - `src/server.rs`
 - `src/translations.rs`
 - `web/src/pages/Settings.tsx`
-- `web/src/stories/Settings.stories.tsx`
+- `ui_demo: ./demo/settings?demo=settings-my-releases`
 - `web/e2e/settings.spec.ts`
 
 ## References

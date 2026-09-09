@@ -16,6 +16,10 @@ import type {
 	AdminTranslationStatusResponse,
 	AdminUserProfileResponse,
 	AdminWebhookPushRuntimeConfigResponse,
+	AdminRepoGovernanceOverviewResponse,
+	AdminRepoGovernanceListResponse,
+	AnnouncementDetailResponse,
+	AuthBindContextResponse,
 	FollowingReposResponse,
 	GitHubConnectionResponse,
 	MeLinuxDoResponse,
@@ -33,14 +37,21 @@ import type { PasskeySummary, ApiKeySummary } from "@/api";
 
 export type DemoSceneId =
 	| "landing-welcome"
+	| "app-boot"
+	| "app-shell"
 	| "dashboard-repo-publish"
 	| "settings-my-releases"
 	| "public-release-ready"
 	| "public-release-highlight-discrete"
 	| "public-release-highlight-range"
 	| "admin-panel-users"
+	| "admin-dashboard-overview"
+	| "admin-repos-overview"
 	| "admin-jobs-running"
 	| "admin-translation-audit"
+	| "bind-github-pending"
+	| "announcement-detail"
+	| "not-found"
 	| "paused-account-resume";
 
 export type DemoPersonaId = "guest" | "member" | "admin";
@@ -69,6 +80,13 @@ export type DemoLandingAuthAction =
 export type DemoLandingPasskeySupport = "supported" | "unsupported";
 
 export type DemoLandingBootState = "ready" | "network-unavailable";
+
+export type DemoAppShellState =
+	| "steady"
+	| "update"
+	| "install"
+	| "update-install"
+	| "unknown";
 
 export type DemoMutationRecord = {
 	id: string;
@@ -121,6 +139,12 @@ export type DemoModel = {
 	publicReleaseDetail: ReleaseDetailResponse;
 	publicReleaseList: PublicReleaseListResponse;
 	publicationStatus: RepoPublicReleasePublicationStatusResponse;
+	adminRepoGovernance: {
+		overview: AdminRepoGovernanceOverviewResponse;
+		list: AdminRepoGovernanceListResponse;
+	};
+	bindContext: AuthBindContextResponse;
+	announcementDetail: AnnouncementDetailResponse;
 	adminUsers: AdminUserItem[];
 	adminUserProfiles: Record<string, AdminUserProfileResponse>;
 	adminJobs: DemoJobsModel;
@@ -147,6 +171,7 @@ export type DemoShareState = {
 	landingAuthAction: DemoLandingAuthAction;
 	landingPasskeySupport: DemoLandingPasskeySupport;
 	landingBootState: DemoLandingBootState;
+	appShellState: DemoAppShellState;
 	controlsHidden: boolean;
 };
 

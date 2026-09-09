@@ -23,13 +23,34 @@ description: OctoRill 页面级 mock-only demo、视觉证据与验收入口。
 
 ## 直接入口
 
-- <a href="./demo/">打开 <code>/demo/</code></a>
+- <a href="./demo/">
+    打开 <code>/demo/</code>
+  </a>
 - <a href="./demo/?demo=landing-welcome">Landing</a>
-- <a href="./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish">Dashboard</a>
-- <a href="./demo/settings?section=my-releases&amp;demo=settings-my-releases">Settings</a>
-- <a href="./demo/public/octo-demo/release-lab/releases/tag/v2.31.0?demo=public-release-ready">Public Release</a>
+- <a href="./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish">
+    Dashboard
+  </a>
+- <a href="./demo/settings?section=my-releases&amp;demo=settings-my-releases">
+    Settings
+  </a>
+- <a href="./demo/public/octo-demo/release-lab/releases/tag/v2.31.0?demo=public-release-ready">
+    Public Release
+  </a>
 - <a href="./demo/admin/users?demo=admin-panel-users">Admin Panel</a>
+- <a href="./demo/admin/?demo=admin-dashboard-overview">Admin Dashboard</a>
+- <a href="./demo/admin/repos?demo=admin-repos-overview">Admin Repos</a>
 - <a href="./demo/admin/jobs?demo=admin-jobs-running">Admin Jobs</a>
+- <a href="./demo/bind/github?linuxdo=connected&amp;passkey=created&amp;demo=bind-github-pending">
+    Bind GitHub
+  </a>
+- <a href="./demo/octo-demo/release-lab/discussions/42?from=feed&amp;demo=announcement-detail">
+    Announcement Detail
+  </a>
+- <a href="./demo/demo-missing-route?demo=not-found">Not Found</a>
+- <a href="./demo/?demo=app-boot&amp;d_controls=hidden">App Boot</a>
+- <a href="./demo/focus/repo/octo-demo/release-lab?demo=app-shell&amp;d_shell=update-install&amp;d_controls=hidden">
+    App Shell / Update + Install
+  </a>
 
 ## 分享态合同
 
@@ -38,6 +59,7 @@ description: OctoRill 页面级 mock-only demo、视觉证据与验收入口。
 - `d_net=`：`normal | slow | faulty`
 - `d_own=1`：打开“我的发布”
 - `d_pub=published`：演示 repo public release 已发布
+- `d_shell=`：`steady | update | install | update-install | unknown`
 
 面板位置只存本地；scene、persona、network 和关键 toggle 会写进 URL，方便复现同一条验收链接。
 

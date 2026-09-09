@@ -28,7 +28,7 @@
 
 - `web/src/pages/Settings.tsx`
 - `web/src/settings/GitHubPatGuideCard.tsx`
-- `web/src/stories/Settings.stories.tsx`
+- `ui_demo: ./demo/settings?demo=settings-my-releases`
 - `web/src/stories/GitHubPatGuideCard.stories.tsx`
 - `web/e2e/settings.spec.ts`
 - `docs/specs/github-pat-inline-guide-mock/SPEC.md`
@@ -120,5 +120,5 @@ GitHub 实际界面 vs OctoRill 参考界面对比（desktop/mobile × light/dar
 - https://github.com/settings/tokens
 - web/src/pages/Settings.tsx
 - web/src/settings/GitHubPatGuideCard.tsx
-- web/src/stories/Settings.stories.tsx
+- ui_demo: ./demo/settings?demo=settings-my-releases
 - web/src/stories/GitHubPatGuideCard.stories.tsx

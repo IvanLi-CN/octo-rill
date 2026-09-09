@@ -129,7 +129,7 @@
 
 ### UI / Storybook (if applicable)
 
-- Stories to add/update: `web/src/stories/AdminJobs.stories.tsx`, `web/src/stories/Dashboard.stories.tsx`, `web/src/stories/TranslationWorkerBoard.stories.tsx`
+- Stories to add/update: `ui_demo: ./demo/admin/jobs?demo=admin-jobs-running`, `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`, `web/src/stories/TranslationWorkerBoard.stories.tsx`
 - `play` / interaction coverage to add/update: `LLM 调度` 设置弹窗打开、校验、保存成功；Dashboard 长正文翻译状态
 - Visual evidence: 管理端 `LLM 调度` 弹窗与 Dashboard 长正文译文各至少一张 Storybook canvas 图
 

@@ -42,10 +42,10 @@
 - `web/src/sidebar/ReleaseDailyCard.tsx`
 - `web/src/sidebar/BriefListCard.tsx`
 - `web/src/sidebar/InboxQuickList.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `web/src/stories/DashboardHeader.stories.tsx`
-- `web/src/stories/AppShell.stories.tsx`
-- `web/src/stories/AdminPanel.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=app-shell&d_shell=update-install`
+- `ui_demo: ./demo/admin/users?demo=admin-panel-users`
 - `web/e2e/dashboard-access-sync.spec.ts`
 - `web/e2e/admin-users.spec.ts`
 - `web/e2e/admin-jobs.spec.ts`
@@ -175,7 +175,7 @@
 
 ### UI / Storybook (if applicable)
 
-- Stories to add/update: `web/src/stories/Dashboard.stories.tsx`、`web/src/stories/DashboardHeader.stories.tsx`、`web/src/stories/AppShell.stories.tsx`、`web/src/stories/AdminPanel.stories.tsx`
+- Stories to add/update: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`、`web/src/stories/DashboardHeader.stories.tsx`、`ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=app-shell&d_shell=update-install`、`ui_demo: ./demo/admin/users?demo=admin-panel-users`
 - Visual evidence source: Storybook + browser mobile viewport capture
 - Visual evidence sink: `## Visual Evidence`
 

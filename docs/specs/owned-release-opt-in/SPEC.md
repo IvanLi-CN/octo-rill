@@ -116,7 +116,7 @@
 
 ### Storybook / Visual
 
-- Settings 必须提供 `Pages/Settings / Deep Linked My Releases` 场景。
+- Settings 必须提供 `ui_demo: ./demo/settings?demo=settings-my-releases / Deep Linked My Releases` 场景。
 - Dashboard 必须提供 owner-only release 开 / 关与 `加星` 隔离的稳定场景。
 - 最终 owner-facing 视觉证据写入本 spec 的 `## Visual Evidence`。
 
@@ -129,15 +129,15 @@
 
 ![Switch gallery](./assets/switch-gallery.png)
 
-- source_type: storybook_canvas
-  story_id_or_title: `Pages/Settings / Deep Linked My Releases`
+- source_type: ui_demo
+  story_id_or_title: `ui_demo: ./demo/settings?demo=settings-my-releases / Deep Linked My Releases`
   state: my releases enabled
   evidence_note: 设置页新增独立“我的发布”section，并复用统一 Switch primitive；开启后会回显“已纳入我的发布”，只影响 Release 阅读面。
 
 ![Settings my releases enabled](./assets/settings-my-releases-on.png)
 
-- source_type: storybook_canvas
-  story_id_or_title: `Pages/Dashboard / Evidence / Owner Releases All Tab`
+- source_type: ui_demo
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish  Evidence / Owner Releases All Tab`
   state: owned release visible in all feed
   evidence_note: 开启“我的发布”后，owner-only repo release 会进入 `全部` 时间线，与真实 starred repo release 并列展示。
 

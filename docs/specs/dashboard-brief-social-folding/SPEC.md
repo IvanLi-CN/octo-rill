@@ -28,7 +28,7 @@
 - `src/ai.rs`
 - `src/jobs.rs`
 - `web/src/feed/FeedGroupedList.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `docs/product.md`
 - `docs/specs/README.md`
 
@@ -122,24 +122,24 @@
 
 ## Visual Evidence
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard / Evidence / All History Collapsed To Briefs`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish  Evidence / All History Collapsed To Briefs`
   state: `historical_brief_social_folded`
   evidence_note: 证明 `全部` tab 的历史日报视图只保留日报卡片，获星 / 关注不再以独立社交卡片残留在 brief 前后。
   PR: include
   image:
   ![全部 tab 历史日报折叠后不再残留社交卡片](./assets/dashboard-history-brief-social-folded.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard / All History Fallback To Release Cards`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish  All History Fallback To Release Cards`
   state: `generated_brief_one_sided_social`
   evidence_note: 证明历史 fallback 日组生成 brief 后，仅渲染有数据的 `### 关注` 小节，不再补空的 `### 获星`。
   PR: include
   image:
   ![历史 fallback 日组生成后的单侧社交摘要](./assets/dashboard-history-brief-one-sided-social.png)
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard / Evidence / Briefs Project Only`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish  Evidence / Briefs Project Only`
   state: `briefs_tab_project_only`
   evidence_note: 证明独立 `日报` tab 在窗口内只有 Release 时，只保留 `## 项目更新`，没有社交空态占位。
   PR: include

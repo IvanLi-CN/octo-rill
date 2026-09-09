@@ -210,13 +210,17 @@ async function loadAuthSnapshot(force = false) {
 export function AuthBootstrapProvider(props: { children: ReactNode }) {
 	const { children } = props;
 	const demoSnapshot = useDemoSnapshot();
+	const demoBootRequested =
+		demoSnapshot.active && demoSnapshot.shareState.sceneId === "app-boot";
 	const [snapshot, setSnapshot] = useState<AuthSnapshot>(() =>
 		resolveInitialAuthSnapshot(demoSnapshot),
 	);
 	const [bootPresentation, setBootPresentation] = useState<StartupPresentation>(
 		demoSnapshot.active ? "live" : (startupSeed?.presentation ?? "cold-init"),
 	);
-	const [isBootstrapping, setIsBootstrapping] = useState(!demoSnapshot.active);
+	const [isBootstrapping, setIsBootstrapping] = useState(
+		!demoSnapshot.active || demoBootRequested,
+	);
 
 	useEffect(() => {
 		if (demoSnapshot.active) {
@@ -225,8 +229,8 @@ export function AuthBootstrapProvider(props: { children: ReactNode }) {
 			);
 			inflightSnapshotPromise = null;
 			setSnapshot(nextSnapshot);
-			setBootPresentation("live");
-			setIsBootstrapping(false);
+			setBootPresentation(demoBootRequested ? "cold-init" : "live");
+			setIsBootstrapping(demoBootRequested);
 			return;
 		}
 
@@ -242,7 +246,7 @@ export function AuthBootstrapProvider(props: { children: ReactNode }) {
 		return () => {
 			cancelled = true;
 		};
-	}, [demoSnapshot.active, demoSnapshot.model?.me]);
+	}, [demoBootRequested, demoSnapshot.active, demoSnapshot.model?.me]);
 
 	const refreshAuth = useCallback(async () => {
 		if (demoSnapshot.active) {
@@ -251,8 +255,8 @@ export function AuthBootstrapProvider(props: { children: ReactNode }) {
 			);
 			inflightSnapshotPromise = null;
 			setSnapshot(nextSnapshot);
-			setBootPresentation("live");
-			setIsBootstrapping(false);
+			setBootPresentation(demoBootRequested ? "cold-init" : "live");
+			setIsBootstrapping(demoBootRequested);
 			return nextSnapshot.me;
 		}
 
@@ -262,7 +266,7 @@ export function AuthBootstrapProvider(props: { children: ReactNode }) {
 		setBootPresentation("live");
 		setIsBootstrapping(false);
 		return nextSnapshot.me;
-	}, [demoSnapshot.active, demoSnapshot.model?.me]);
+	}, [demoBootRequested, demoSnapshot.active, demoSnapshot.model?.me]);
 
 	const value = useMemo<AuthBootstrapValue>(
 		() => ({

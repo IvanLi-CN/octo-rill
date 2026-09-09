@@ -125,12 +125,12 @@
 
 ### LLM 设置弹窗打开态
 
-- source_type: `storybook_canvas`
+- source_type: `ui_demo`
 - target_program: `mock-only`
 - capture_scope: `browser-viewport`
 - sensitive_exclusion: `N/A`
 - submission_gate: `owner-approved`
-- story_id_or_title: `Admin/Admin Jobs / LlmSettingsDialog`
+- story_id_or_title: `ui_demo: ./demo/admin/jobs?demo=admin-jobs-running / LlmSettingsDialog`
 - state: `llm-settings-dialog-open`
 - evidence_note: 验证 `LLM 调度` 卡片右上角设置按钮可打开对话框，并回填当前并发上限与缩容说明。
 
@@ -138,12 +138,12 @@
 
 ### 翻译设置弹窗打开态
 
-- source_type: `storybook_canvas`
+- source_type: `ui_demo`
 - target_program: `mock-only`
 - capture_scope: `browser-viewport`
 - sensitive_exclusion: `N/A`
 - submission_gate: `owner-approved`
-- story_id_or_title: `Admin/Admin Jobs / TranslationSettingsDialog`
+- story_id_or_title: `ui_demo: ./demo/admin/jobs?demo=admin-jobs-running / TranslationSettingsDialog`
 - state: `translation-settings-dialog-open`
 - evidence_note: 验证 `工作者板` 右上角设置按钮可打开双输入对话框，并展示排空缩容说明。
 
@@ -151,12 +151,12 @@
 
 ### 翻译设置保存后工作者板收敛态
 
-- source_type: `storybook_canvas`
+- source_type: `ui_demo`
 - target_program: `mock-only`
 - capture_scope: `browser-viewport`
 - sensitive_exclusion: `N/A`
 - submission_gate: `owner-approved`
-- story_id_or_title: `Admin/Admin Jobs / TranslationSettingsSaved`
+- story_id_or_title: `ui_demo: ./demo/admin/jobs?demo=admin-jobs-running / TranslationSettingsSaved`
 - state: `translation-worker-board-resized`
 - evidence_note: 验证保存 `5 general + 2 dedicated` 后，工作者板文案、卡片数量与顺序立即收敛到新运行时配置。
 

@@ -44,7 +44,7 @@
 - `migrations/0032_repo_star_sync_baselines.sql`
 - `web/src/feed/**`
 - `web/src/pages/Dashboard.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `migrations/0042_social_activity_event_targets.sql`
 - `web/e2e/**`
 - `docs/specs/dashboard-social-activity/SPEC.md`
@@ -258,5 +258,5 @@ PR: include
 - `migrations/0042_social_activity_event_targets.sql`
 - `web/src/pages/Dashboard.tsx`
 - `web/src/feed/FeedGroupedList.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `migrations/0042_social_activity_event_targets.sql`

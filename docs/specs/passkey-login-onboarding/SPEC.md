@@ -175,16 +175,15 @@
 
 ## Visual Evidence
 
-PR: none
 
-Landing Passkey 入口（storybook: `Pages/AppLanding / Default`）
+Landing Passkey 入口（ui_demo: `./demo/?demo=landing-welcome`）
 ![Landing passkey entry](./assets/landing-passkey-entry.png)
 
-Settings Passkeys 空态（storybook: `Pages/Settings / Passkeys Empty`）
+Settings Passkeys 空态（ui_demo: `./demo/settings?demo=settings-my-releases`）
 ![Settings passkeys empty](./assets/settings-passkeys-empty.png)
 
-Settings Passkeys 多设备态（storybook: `Pages/Settings / Passkeys Multiple Devices`）
+Settings Passkeys 多设备态（ui_demo: `./demo/settings?demo=settings-my-releases`）
 ![Settings passkeys devices](./assets/settings-passkeys-devices.png)
 
-Bind GitHub 待挂接 Passkey（storybook: `Pages/BindGitHub / Pending Passkey`）
+Bind GitHub 待挂接 Passkey（ui_demo: `./demo/bind/github?demo=bind-github-pending`）
 ![Bind GitHub pending passkey](./assets/bind-github-pending-passkey.png)

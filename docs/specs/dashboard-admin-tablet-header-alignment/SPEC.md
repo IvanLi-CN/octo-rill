@@ -30,7 +30,7 @@
 - `web/src/pages/DashboardHeader.tsx`
 - `web/src/layout/AdminHeader.tsx`
 - `web/src/stories/DashboardHeader.stories.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `web/src/stories/AdminHeader.stories.tsx`
 - `web/e2e/dashboard-access-sync.spec.ts`
 - `web/e2e/admin-users.spec.ts`
@@ -136,7 +136,7 @@
 
 ### UI / Storybook (if applicable)
 
-- Stories to add/update: `web/src/stories/DashboardHeader.stories.tsx`、`web/src/stories/Dashboard.stories.tsx`、`web/src/stories/AdminHeader.stories.tsx`
+- Stories to add/update: `web/src/stories/DashboardHeader.stories.tsx`、`ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`、`web/src/stories/AdminHeader.stories.tsx`
 - Visual evidence source: Storybook canvas
 - Visual evidence sink: `## Visual Evidence`
 
@@ -176,7 +176,7 @@
   viewport_strategy: `devtools-emulate`
   sensitive_exclusion: `N/A`
   submission_gate: `approved`
-  story_id_or_title: `Pages/Dashboard / Evidence / Tablet Header Inline`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish  Evidence / Tablet Header Inline`
   state: `tablet-inline-dashboard-page`
   evidence_note: 验证 Dashboard 页面级壳层在平板口径下维持页头主行同排、tabs / secondary controls 仍位于后续控制带，同时 feed 页已移除右侧 Inbox 侧栏列。
   PR: include

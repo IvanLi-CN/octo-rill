@@ -26,7 +26,7 @@
 ### In scope
 
 - `web/src/pages/AppBoot.tsx`
-- `web/src/stories/AppBoot.stories.tsx`
+- `ui_demo: ./demo/?demo=app-boot&d_controls=hidden`
 - `docs/specs/dashboard-startup-skeleton-header-tabs-alignment/assets/`
 - `docs/specs/README.md`
 
@@ -44,7 +44,7 @@
 - warm skeleton 左侧品牌区必须回到真实 Dashboard header 的品牌层级：桌面显示 `OctoRill` + 固定副标题文案，移动端隐藏副标题并保持单行品牌壳层。
 - warm skeleton 右侧主操作区必须补成与真实页头接近的占位簇，而不是只剩单个主题切换控件。
 - warm skeleton tabs / control band 只能渲染中性占位块，不得出现 `动态`、`日报`、`通知` 或其他具体 tabs 文案。
-- Storybook `Pages/App Boot / Dashboard Warm Skeleton` 必须补充审阅断言，明确校验“无 login pill、无具体 tabs 文案、无登录 CTA”。
+- Web Demo `./demo/?demo=app-boot&d_controls=hidden` 必须补充审阅断言，明确校验“无 login pill、无具体 tabs 文案、无登录 CTA”。
 - 视觉证据必须重新生成并写回本 spec，证明新的 warm skeleton 已向真实 Dashboard 壳层收敛。
 
 ### SHOULD
@@ -76,7 +76,7 @@
   When 页面渲染 `DashboardStartupSkeleton`
   Then 左上品牌区不再出现 login pill，且整体轮廓接近真实 Dashboard header。
 
-- Given 进入 `Pages/App Boot / Dashboard Warm Skeleton`
+- Given 进入 `ui_demo` `./demo/?demo=app-boot&d_controls=hidden`
   When 检查顶部 control band
   Then 仍可识别为主导航占位，但不存在 `动态`、`日报`、`通知` 等具体 tabs 文案。
 
@@ -105,8 +105,8 @@
 
 ### UI / Storybook (if applicable)
 
-- Stories to add/update: `web/src/stories/AppBoot.stories.tsx`（含移动端 shell 审阅入口）
-- Docs pages / state galleries to add/update: `Pages/App Boot` autodocs
+- Stories to add/update: `ui_demo: ./demo/?demo=app-boot&d_controls=hidden`（含移动端 shell 审阅入口）
+- Docs pages / state galleries to add/update: `ui_demo` `./demo/?demo=app-boot&d_controls=hidden`
 - `play` / interaction coverage to add/update: `Dashboard Warm Skeleton` 对“无 login pill / 无具体 tabs 文案 / 无登录 CTA”的断言；`Dashboard Warm Skeleton / Mobile shell` 对“副标题隐藏 / 单行 header / mobile actions 可见”的断言
 - Visual regression baseline changes (if any): `docs/specs/dashboard-startup-skeleton-header-tabs-alignment/assets/dashboard-warm-skeleton-top-shell.png`, `docs/specs/dashboard-startup-skeleton-header-tabs-alignment/assets/dashboard-warm-skeleton-mobile-shell.png`
 
@@ -119,7 +119,7 @@
 ## Visual Evidence
 
 - 证据绑定：本地 `HEAD`（2026-04-16）
-- 证据源：Storybook stable canvas（`Pages/App Boot / Dashboard Warm Skeleton`）
+- 证据源：`ui_demo` 页面（`./demo/?demo=app-boot&d_controls=hidden`）
 
 ![Dashboard warm skeleton 顶部壳层已收敛](./assets/dashboard-warm-skeleton-top-shell.png)
 

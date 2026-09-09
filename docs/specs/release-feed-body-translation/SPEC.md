@@ -54,8 +54,8 @@
 
 ## Visual Evidence
 
-- source_type: `storybook_canvas`
-  story_id_or_title: `Pages/Dashboard/TranslatedUpstreamRetrying`
+- source_type: `ui_demo`
+  story_id_or_title: `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish TranslatedUpstreamRetrying`
   state: `translation-auto-retry-pending`
   evidence_note: 验证 retryable `翻译失败` 在本页自动补救期间改为居中的中性等待面，不再显示红色错误块、详情 disclosure 或手动重试按钮。
 

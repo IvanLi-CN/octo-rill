@@ -98,6 +98,7 @@ const runtimeState: DemoSnapshot = {
 		landingAuthAction: "idle",
 		landingPasskeySupport: "supported",
 		landingBootState: "ready",
+		appShellState: "steady",
 		controlsHidden: false,
 	},
 	model: null,

@@ -27,7 +27,7 @@
 ### In scope
 
 - `web/src/feed/FeedItemCard.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `web/e2e/release-detail.spec.ts`
 - `docs/specs/README.md`
 - `docs/specs/release-reaction-compact-size/SPEC.md`
@@ -109,13 +109,13 @@
 
 - `docs/specs/release-reaction-bubble-polish/SPEC.md`
 - `web/src/feed/FeedItemCard.tsx`
-- `web/src/stories/Dashboard.stories.tsx`
+- `ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish`
 - `web/e2e/release-detail.spec.ts`
 
 ## Visual Evidence
 
-- source_type: storybook_canvas
-  story_id_or_title: Pages/Dashboard · Evidence / Reaction Compact
+- source_type: ui_demo
+  story_id_or_title: ui_demo: ./demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish · Evidence / Reaction Compact
   state: compact reaction footer
   evidence_note: 验证 release card 底部反馈按钮已轻微缩小到 36px 口径，图标约 18px，外置 badge 同步收紧且未回退为胶囊布局。
 
