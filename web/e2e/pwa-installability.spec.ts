@@ -1029,6 +1029,7 @@ test("install prompt click calls the native prompt and still coexists with refre
 }) => {
 	const server = await startStaticPwaServer();
 	try {
+		await page.setViewportSize({ width: 320, height: 640 });
 		await page.goto(server.origin);
 		await waitForServiceWorkerControl(page);
 
@@ -1044,6 +1045,45 @@ test("install prompt click calls the native prompt and still coexists with refre
 		);
 		await expect(page.getByRole("button", { name: "刷新" })).toBeVisible();
 		await expect(page.getByRole("button", { name: "安装" })).toBeVisible();
+		const geometry = await page.evaluate(() => {
+			const content = document.querySelector<HTMLElement>(
+				"[data-version-update-notice-content]",
+			);
+			const message = document.querySelector<HTMLElement>(
+				"[data-version-update-message]",
+			);
+			const actions = document.querySelector<HTMLElement>(
+				"[data-version-update-actions]",
+			);
+			const buttons = actions?.querySelectorAll<HTMLButtonElement>("button");
+			if (!(content && message && actions && buttons?.length === 2)) {
+				throw new Error("update notice geometry markers are missing");
+			}
+			const contentRect = content.getBoundingClientRect();
+			const contentStyles = getComputedStyle(content);
+			const messageRect = message.getBoundingClientRect();
+			const actionsRect = actions.getBoundingClientRect();
+			return {
+				contentRight:
+					contentRect.right - Number.parseFloat(contentStyles.paddingRight),
+				actionsRight: actionsRect.right,
+				messageBottom: messageRect.bottom,
+				actionsTop: actionsRect.top,
+				buttonHeights: Array.from(
+					buttons,
+					(button) => button.getBoundingClientRect().height,
+				),
+				hitHeights: Array.from(buttons, (button) =>
+					Number.parseFloat(getComputedStyle(button, "::before").height),
+				),
+			};
+		});
+		expect(
+			Math.abs(geometry.actionsRight - geometry.contentRight),
+		).toBeLessThanOrEqual(1);
+		expect(geometry.actionsTop).toBeGreaterThan(geometry.messageBottom);
+		expect(geometry.buttonHeights).toEqual([28, 28]);
+		expect(geometry.hitHeights).toEqual([36, 36]);
 
 		await page.getByRole("button", { name: "安装" }).click();
 		await expect
