@@ -235,6 +235,62 @@ function summarizeTranslateBatchProgress(
 	return { processed, lastStage };
 }
 
+function summarizeStarReconciliationProgress(
+	detail: AdminRealtimeTaskDetailResponse,
+) {
+	let processedPages: number | null = null;
+	let processedItems: number | null = null;
+	let totalCountAtStart: number | null = null;
+	const orderedEvents = [...detail.events].sort(
+		(a, b) =>
+			a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id),
+	);
+	for (const event of orderedEvents) {
+		if (event.event_type !== "task.progress") continue;
+		const payload = parseJsonRecord(event.payload_json);
+		const nextProcessedPages = readNumber(payload, "processed_pages");
+		const nextProcessedItems = readNumber(payload, "processed_items");
+		const nextTotalCountAtStart = readNumber(payload, "total_count_at_start");
+		if (nextProcessedPages !== null) processedPages = nextProcessedPages;
+		if (nextProcessedItems !== null) processedItems = nextProcessedItems;
+		if (nextTotalCountAtStart !== null) {
+			totalCountAtStart = nextTotalCountAtStart;
+		}
+	}
+	return { processedPages, processedItems, totalCountAtStart };
+}
+
+function starReconciliationSliceState(
+	taskStatus: string,
+	resultStatus: string | null,
+	hasNextPage: boolean | null,
+): string {
+	if (resultStatus === "succeeded") return "已完成";
+	if (resultStatus === "skipped") return "已跳过";
+	if (resultStatus === "failed") return "失败";
+	if (hasNextPage === true) return "等待下一分片";
+	if (taskStatus === "running") return "执行中";
+	if (taskStatus === "queued") return "排队中";
+	if (taskStatus === "succeeded") return "已完成";
+	if (taskStatus === "failed") return "失败";
+	return taskStatus;
+}
+
+function formatCompletionPercent(
+	processedItems: number | null,
+	totalCountAtStart: number | null,
+): string | null {
+	if (
+		processedItems === null ||
+		totalCountAtStart === null ||
+		totalCountAtStart <= 0
+	) {
+		return null;
+	}
+	const percent = Math.min(100, (processedItems / totalCountAtStart) * 100);
+	return `${Math.round(percent * 10) / 10}%`;
+}
+
 function buildTaskDetailPageModel(
 	detail: AdminRealtimeTaskDetailResponse,
 ): TaskDetailPageModel {
@@ -252,6 +308,88 @@ function buildTaskDetailPageModel(
 				fields: buildFields(
 					field("目标用户", userId ? `#${userId}` : null),
 					field("同步仓库数", syncedRepos !== null ? `${syncedRepos}` : null),
+				),
+			};
+		}
+		case "sync.starred.delta": {
+			const resultUserId = readString(result, "user_id");
+			const githubConnectionId =
+				readString(result, "github_connection_id") ??
+				readString(payload, "github_connection_id");
+			const itemsObserved = readNumber(result, "items_observed");
+			return {
+				pageTitle: "星标增量同步详情页",
+				pageSummary:
+					"展示单个 GitHub connection 的最新 Star 窗口写入结果；增量同步不会删除旧 membership。",
+				fields: buildFields(
+					field(
+						"目标用户",
+						resultUserId || userId ? `#${resultUserId ?? userId}` : null,
+					),
+					field("GitHub connection", githubConnectionId),
+					field("触发方式", readString(payload, "trigger")),
+					field(
+						"本次观察 Star",
+						itemsObserved !== null ? `${itemsObserved}` : null,
+					),
+				),
+			};
+		}
+		case "sync.starred.reconcile": {
+			const progress = summarizeStarReconciliationProgress(detail);
+			const githubConnectionId =
+				readString(result, "github_connection_id") ??
+				readString(payload, "github_connection_id");
+			const epochId =
+				readString(result, "epoch_id") ?? readString(payload, "epoch_id");
+			const processedPages =
+				readNumber(result, "processed_pages") ?? progress.processedPages;
+			const processedItems =
+				readNumber(result, "processed_items") ?? progress.processedItems;
+			const totalCountAtStart =
+				readNumber(result, "total_count_at_start") ??
+				progress.totalCountAtStart;
+			const hasNextPage = readBoolean(result, "has_next_page");
+			const resultStatus = readString(result, "status");
+			const membershipRemoved = readNumber(result, "membership_removed");
+			return {
+				pageTitle: "星标全量对账详情页",
+				pageSummary:
+					"展示单个 epoch 的串行页分片进度；只有终页成功后才会删除本轮未见的旧 membership。",
+				fields: buildFields(
+					field(
+						"已处理页数",
+						processedPages !== null ? `${processedPages}` : null,
+					),
+					field(
+						"已处理项目",
+						processedItems !== null ? `${processedItems}` : null,
+					),
+					field(
+						"起始总数",
+						totalCountAtStart !== null ? `${totalCountAtStart}` : null,
+					),
+					field(
+						"完成度",
+						formatCompletionPercent(processedItems, totalCountAtStart),
+					),
+					field(
+						"分片状态",
+						starReconciliationSliceState(
+							task.status,
+							resultStatus,
+							hasNextPage,
+						),
+					),
+					field("目标用户", userId ? `#${userId}` : null),
+					field("GitHub connection", githubConnectionId),
+					field("对账 epoch", epochId),
+					field("触发方式", readString(payload, "trigger")),
+					field("下一分片不早于", readString(result, "next_slice_not_before")),
+					field(
+						"终页移除 membership",
+						membershipRemoved !== null ? `${membershipRemoved}` : null,
+					),
 				),
 			};
 		}
@@ -609,7 +747,7 @@ function buildTaskDetailPageModel(
 			return {
 				pageTitle: "订阅同步详情页",
 				pageSummary:
-					"展示半小时全用户订阅同步的 Star、Release、social 与 Inbox 四阶段结果、关键事件与日志入口。",
+					"展示全用户订阅同步的仓库聚合、Release、social 与 Inbox 阶段结果、关键事件与日志入口。",
 				fields: buildFields(
 					field(
 						"触发方式",
@@ -622,10 +760,8 @@ function buildTaskDetailPageModel(
 					field("本轮状态", skipped === true ? "已跳过" : "已执行"),
 					field("跳过原因", skipReason),
 					field(
-						"Star 成功/总计",
-						diagnostics
-							? `${diagnostics.star.succeeded_users}/${diagnostics.star.total_users}`
-							: null,
+						"采集用户",
+						diagnostics ? `${diagnostics.collect.total_users}` : null,
 					),
 					field(
 						"Release 成功/总计",
@@ -938,7 +1074,10 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 	const result = parseJsonRecord(props.detail.task.result_json);
 	const diagnostics = props.detail.diagnostics ?? null;
 	const accessRefreshDiagnostics = diagnostics?.sync_access_refresh ?? null;
-	const syncDiagnostics = diagnostics?.sync_subscriptions ?? null;
+	const syncDiagnostics =
+		props.detail.task.task_type === "sync.subscriptions"
+			? (diagnostics?.sync_subscriptions ?? null)
+			: null;
 	const eventMeta = props.detail.event_meta ?? null;
 	const isEventsTruncated = eventMeta?.truncated === true;
 	const detailCardClass = "rounded-lg border p-3";
@@ -1469,15 +1608,14 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 			{syncDiagnostics ? (
 				<div className="grid gap-2 md:grid-cols-3">
 					<div className={detailCardClass}>
-						<p className="text-muted-foreground text-[11px]">Star 阶段摘要</p>
+						<p className="text-muted-foreground text-[11px]">
+							Collect 阶段摘要
+						</p>
 						<p className="mt-1 text-sm font-semibold">
-							{syncDiagnostics.star.succeeded_users}/
-							{syncDiagnostics.star.total_users}
-							位用户成功
+							{syncDiagnostics.collect.total_users} 位启用用户
 						</p>
 						<p className="text-muted-foreground mt-1 text-xs">
-							失败 {syncDiagnostics.star.failed_users} · 仓库快照{" "}
-							{syncDiagnostics.star.total_repos}
+							本轮从已物化的可见仓库集开始聚合 Release demand。
 						</p>
 					</div>
 					<div className={detailCardClass}>

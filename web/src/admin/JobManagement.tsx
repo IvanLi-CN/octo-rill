@@ -158,6 +158,9 @@ const NUMBER_FORMATTER = new Intl.NumberFormat();
 const SYNC_AUTO_FETCH_INTERVAL_MIN = 1;
 const SYNC_AUTO_FETCH_INTERVAL_MAX = 120;
 const SYNC_AUTO_FETCH_INTERVAL_MARKS = [1, 5, 10, 15, 30, 60, 120];
+const STAR_SYNC_FULL_SWEEP_INTERVAL_MIN = 60;
+const STAR_SYNC_FULL_SWEEP_INTERVAL_MAX = 10_080;
+const STAR_SYNC_FULL_SWEEP_INTERVAL_MARKS = [60, 360, 1_440, 4_320, 10_080];
 const RETRY_RECENT_FAILURES_INTERVAL_DEFAULT = 10;
 const REPO_RELEASE_WORKER_MIN = 1;
 const REPO_RELEASE_WORKER_MAX = 32;
@@ -266,6 +269,40 @@ function syncSliderPositionToInterval(position: number) {
 
 function syncIntervalMarkPosition(value: number) {
 	return `${syncIntervalToSliderPosition(value)}%`;
+}
+
+function clampStarSyncFullSweepInterval(value: number) {
+	if (!Number.isFinite(value)) return 1_440;
+	return Math.min(
+		STAR_SYNC_FULL_SWEEP_INTERVAL_MAX,
+		Math.max(STAR_SYNC_FULL_SWEEP_INTERVAL_MIN, Math.round(value)),
+	);
+}
+
+function starSyncFullSweepToSliderPosition(value: number) {
+	const clamped = clampStarSyncFullSweepInterval(value);
+	const minLog = Math.log(STAR_SYNC_FULL_SWEEP_INTERVAL_MIN);
+	const maxLog = Math.log(STAR_SYNC_FULL_SWEEP_INTERVAL_MAX);
+	return Math.round(((Math.log(clamped) - minLog) / (maxLog - minLog)) * 100);
+}
+
+function starSyncSliderPositionToFullSweep(position: number) {
+	const normalized = Math.min(100, Math.max(0, position)) / 100;
+	const minLog = Math.log(STAR_SYNC_FULL_SWEEP_INTERVAL_MIN);
+	const maxLog = Math.log(STAR_SYNC_FULL_SWEEP_INTERVAL_MAX);
+	return clampStarSyncFullSweepInterval(
+		Math.round(Math.exp(minLog + normalized * (maxLog - minLog)) / 60) * 60,
+	);
+}
+
+function starSyncFullSweepMarkPosition(value: number) {
+	return `${starSyncFullSweepToSliderPosition(value)}%`;
+}
+
+function formatStarSyncFullSweepInterval(value: number) {
+	if (value % 1_440 === 0) return `${value / 1_440} 天`;
+	if (value % 60 === 0) return `${value / 60} 小时`;
+	return `${value} 分钟`;
 }
 
 function SyncTaskDurationButton(props: {
@@ -1104,6 +1141,10 @@ function taskTypeLabel(taskType: string) {
 			return "定时日报";
 		case "sync.subscriptions":
 			return "订阅同步";
+		case "sync.starred.delta":
+			return "星标增量同步";
+		case "sync.starred.reconcile":
+			return "星标全量对账";
 		case "retry.recent_failures":
 			return "失败数据重试";
 		case "webhook.push.audit":
@@ -1472,11 +1513,19 @@ type RealtimeStatusFilter =
 const DEFAULT_LLM_CALL_ROUTE_FILTERS = parseLlmCallRouteFilters({});
 
 const TASK_PAGE_SIZE = 20;
-const SCHEDULED_TASK_TYPES = new Set([
+const USER_SYNC_TASK_TYPES = new Set([
+	"sync.starred.delta",
+	"sync.starred.reconcile",
+]);
+const GENERAL_SCHEDULED_TASK_TYPES = new Set([
 	"brief.daily_slot",
 	"sync.subscriptions",
 	"retry.recent_failures",
 	"webhook.push.audit",
+]);
+const SCHEDULED_TASK_TYPES = new Set([
+	...GENERAL_SCHEDULED_TASK_TYPES,
+	...USER_SYNC_TASK_TYPES,
 ]);
 const STREAM_REFRESH_DELAY_MS = 600;
 const STREAM_RECONNECT_DELAY_MS = 1500;
@@ -1502,6 +1551,7 @@ type JobManagementProps = {
 	) => void;
 	taskIntervalSettingsDialogDefaultOpen?: boolean;
 	subscriptionSyncSettingsDialogDefaultOpen?: boolean;
+	starSyncSettingsDialogDefaultOpen?: boolean;
 	syncSettingsHelpTooltip?: SyncSettingsHelpTooltip;
 };
 
@@ -3747,7 +3797,6 @@ function buildSubscriptionWorkflowStages(
 					["调度键", diagnostics.schedule_key ?? "-"],
 				],
 			),
-			skippedStage("star", "Star", "本轮未同步 starred repos。"),
 			skippedStage("repo", "Repo Collect", "本轮未聚合可见仓库。"),
 			skippedStage("release", "Release Queue", "本轮未派发 release workers。"),
 			skippedStage("social", "Social", "本轮未同步社交事件。"),
@@ -3759,8 +3808,6 @@ function buildSubscriptionWorkflowStages(
 		];
 	}
 
-	const starDone =
-		diagnostics.star.succeeded_users + diagnostics.star.failed_users;
 	const releaseDone =
 		diagnostics.release.succeeded_repos + diagnostics.release.failed_repos;
 	const socialDone =
@@ -3774,9 +3821,9 @@ function buildSubscriptionWorkflowStages(
 			id: "collect",
 			label: "Collect",
 			description: "确定触发来源、调度窗口与本轮工作集。",
-			total: diagnostics.star.total_users,
-			succeeded: diagnostics.star.total_users,
-			done: diagnostics.star.total_users,
+			total: diagnostics.collect.total_users,
+			succeeded: diagnostics.collect.total_users,
+			done: diagnostics.collect.total_users,
 			failed: 0,
 			meta: [
 				["触发", diagnostics.trigger ?? "-"],
@@ -3788,31 +3835,14 @@ function buildSubscriptionWorkflowStages(
 			],
 		},
 		{
-			id: "star",
-			label: "Star",
-			description: "逐用户同步 starred repos，生成可见仓库集合。",
-			total: diagnostics.star.total_users,
-			succeeded: diagnostics.star.succeeded_users,
-			done: starDone,
-			failed: diagnostics.star.failed_users,
-			meta: [
-				["成功用户", formatCount(diagnostics.star.succeeded_users)],
-				["失败用户", formatCount(diagnostics.star.failed_users)],
-				["可见仓库", formatCount(diagnostics.star.total_repos)],
-			],
-		},
-		{
 			id: "repo",
 			label: "Repo Collect",
-			description: "聚合去重仓库，形成共享 Release 抓取队列。",
+			description: "从任务开始时已物化的可见仓库聚合共享 Release 抓取队列。",
 			total: diagnostics.release.total_repos,
 			succeeded: diagnostics.release.total_repos,
 			done: diagnostics.release.total_repos,
 			failed: 0,
-			meta: [
-				["输入仓库", formatCount(diagnostics.star.total_repos)],
-				["待抓取仓库", formatCount(diagnostics.release.total_repos)],
-			],
+			meta: [["待抓取仓库", formatCount(diagnostics.release.total_repos)]],
 		},
 		{
 			id: "release",
@@ -4227,6 +4257,7 @@ export function JobManagement({
 	onNavigateRoute,
 	taskIntervalSettingsDialogDefaultOpen = false,
 	subscriptionSyncSettingsDialogDefaultOpen = false,
+	starSyncSettingsDialogDefaultOpen = false,
 	syncSettingsHelpTooltip,
 }: JobManagementProps) {
 	const isRouteControlled = controlledRouteState !== undefined;
@@ -4268,6 +4299,13 @@ export function JobManagement({
 	const [scheduledRunPage, setScheduledRunPage] = useState(1);
 	const [scheduledRunsLoadPhase, setScheduledRunsLoadPhase] =
 		useState<ListLoadPhase>("idle");
+	const [userSyncRunStatusFilter, setUserSyncRunStatusFilter] =
+		useState<RealtimeStatusFilter>("all");
+	const [userSyncRuns, setUserSyncRuns] = useState<AdminRealtimeTaskItem[]>([]);
+	const [userSyncRunTotal, setUserSyncRunTotal] = useState(0);
+	const [userSyncRunPage, setUserSyncRunPage] = useState(1);
+	const [userSyncRunsLoadPhase, setUserSyncRunsLoadPhase] =
+		useState<ListLoadPhase>("idle");
 	const [subscriptionRuns, setSubscriptionRuns] = useState<
 		AdminRealtimeTaskItem[]
 	>([]);
@@ -4295,8 +4333,20 @@ export function JobManagement({
 		subscriptionSyncSettingsDialogOpen,
 		setSubscriptionSyncSettingsDialogOpen,
 	] = useState(subscriptionSyncSettingsDialogDefaultOpen);
+	const [starSyncSettingsDialogOpen, setStarSyncSettingsDialogOpen] = useState(
+		starSyncSettingsDialogDefaultOpen,
+	);
 	const [syncAutoFetchIntervalInput, setSyncAutoFetchIntervalInput] =
 		useState(60);
+	const [starSyncDeltaIntervalInput, setStarSyncDeltaIntervalInput] =
+		useState("30");
+	const [starSyncFullSweepIntervalInput, setStarSyncFullSweepIntervalInput] =
+		useState("1440");
+	const [starSyncDeltaIntervalError, setStarSyncDeltaIntervalError] = useState<
+		string | null
+	>(null);
+	const [starSyncFullSweepIntervalError, setStarSyncFullSweepIntervalError] =
+		useState<string | null>(null);
 	const [
 		retryRecentFailuresIntervalInput,
 		setRetryRecentFailuresIntervalInput,
@@ -4335,6 +4385,23 @@ export function JobManagement({
 		parsedRepoReleaseWorkerConcurrency ??
 		syncRuntimeConfig?.repo_release_worker_concurrency ??
 		REPO_RELEASE_WORKER_MIN;
+	const starSyncDeltaIntervalSliderValue = clampSyncAutoFetchInterval(
+		parseBoundedIntegerInput(
+			starSyncDeltaIntervalInput,
+			SYNC_AUTO_FETCH_INTERVAL_MIN,
+			SYNC_AUTO_FETCH_INTERVAL_MAX,
+		) ??
+			syncRuntimeConfig?.star_sync_delta_interval_minutes ??
+			30,
+	);
+	const starSyncFullSweepIntervalSliderValue =
+		parseBoundedIntegerInput(
+			starSyncFullSweepIntervalInput,
+			STAR_SYNC_FULL_SWEEP_INTERVAL_MIN,
+			STAR_SYNC_FULL_SWEEP_INTERVAL_MAX,
+		) ??
+		syncRuntimeConfig?.star_sync_full_sweep_interval_minutes ??
+		1_440;
 	const parsedRepoRefreshSystemBudget = parseBoundedIntegerInput(
 		repoRefreshSystemBudgetInput,
 		REPO_REFRESH_SYSTEM_BUDGET_MIN,
@@ -4421,6 +4488,9 @@ export function JobManagement({
 	const scheduledRunsLoadedOnceRef = useRef(false);
 	const scheduledRunsInitialRequestInFlightRef = useRef(false);
 	const scheduledRunsRequestIdRef = useRef(0);
+	const userSyncRunsLoadedOnceRef = useRef(false);
+	const userSyncRunsInitialRequestInFlightRef = useRef(false);
+	const userSyncRunsRequestIdRef = useRef(0);
 	const subscriptionRunsLoadedOnceRef = useRef(false);
 	const subscriptionRunsInitialRequestInFlightRef = useRef(false);
 	const subscriptionRunsRequestIdRef = useRef(0);
@@ -4466,6 +4536,10 @@ export function JobManagement({
 	const scheduledRunTotalPages = useMemo(
 		() => Math.max(1, Math.ceil(scheduledRunTotal / TASK_PAGE_SIZE)),
 		[scheduledRunTotal],
+	);
+	const userSyncRunTotalPages = useMemo(
+		() => Math.max(1, Math.ceil(userSyncRunTotal / TASK_PAGE_SIZE)),
+		[userSyncRunTotal],
 	);
 	const subscriptionRunTotalPages = useMemo(
 		() => Math.max(1, Math.ceil(subscriptionRunTotal / TASK_PAGE_SIZE)),
@@ -4520,6 +4594,8 @@ export function JobManagement({
 	const tasksActionsDisabled = detailLoading || tasksLoadPhase !== "idle";
 	const scheduledRunActionsDisabled =
 		detailLoading || scheduledRunsLoadPhase !== "idle";
+	const userSyncRunActionsDisabled =
+		detailLoading || userSyncRunsLoadPhase !== "idle";
 	const llmCallsRefreshing = llmCallsLoadPhase === "refreshing";
 	const llmStatusRefreshing = llmStatusLoading && llmStatus !== null;
 	const llmActivityRefreshing = llmActivityLoading && llmActivity !== null;
@@ -4536,6 +4612,11 @@ export function JobManagement({
 		hasData: scheduledRuns.length > 0,
 		hasError: listError !== null,
 	});
+	const userSyncListSurface = useListSurfaceState({
+		loading: userSyncRunsLoadPhase !== "idle" || syncRuntimeConfigLoading,
+		hasData: userSyncRuns.length > 0,
+		hasError: listError !== null,
+	});
 	const subscriptionListSurface = useListSurfaceState({
 		loading: subscriptionRunsLoadPhase !== "idle" || syncRuntimeConfigLoading,
 		hasData: subscriptionRuns.length > 0,
@@ -4550,6 +4631,7 @@ export function JobManagement({
 		overviewLoading ||
 		tasksLoadPhase !== "idle" ||
 		scheduledRunsLoadPhase !== "idle" ||
+		userSyncRunsLoadPhase !== "idle" ||
 		subscriptionRunsLoadPhase !== "idle" ||
 		syncRuntimeConfigLoading ||
 		llmStatusLoading ||
@@ -4812,7 +4894,7 @@ export function JobManagement({
 					return;
 				}
 				const scheduledItems = res.items.filter((task) =>
-					SCHEDULED_TASK_TYPES.has(task.task_type),
+					GENERAL_SCHEDULED_TASK_TYPES.has(task.task_type),
 				);
 				const scheduledTotal =
 					scheduledItems.length === res.items.length
@@ -4834,6 +4916,57 @@ export function JobManagement({
 			}
 		},
 		[scheduledRunPage, scheduledRunStatusFilter],
+	);
+
+	const loadUserSyncRuns = useCallback(
+		async (options?: LoadOptions) => {
+			if (
+				options?.background &&
+				!userSyncRunsLoadedOnceRef.current &&
+				userSyncRunsInitialRequestInFlightRef.current
+			) {
+				return;
+			}
+			const requestId = userSyncRunsRequestIdRef.current + 1;
+			userSyncRunsRequestIdRef.current = requestId;
+			userSyncRunsInitialRequestInFlightRef.current =
+				!userSyncRunsLoadedOnceRef.current;
+			setUserSyncRunsLoadPhase(
+				resolveListLoadPhase(userSyncRunsLoadedOnceRef.current, options),
+			);
+			try {
+				const params = new URLSearchParams();
+				params.set("status", userSyncRunStatusFilter);
+				params.set("task_group", "user_sync");
+				params.set("page", String(userSyncRunPage));
+				params.set("page_size", String(TASK_PAGE_SIZE));
+				const res = await apiGetAdminRealtimeTasks(params);
+				if (requestId !== userSyncRunsRequestIdRef.current) {
+					return;
+				}
+				const userSyncItems = res.items.filter((task) =>
+					USER_SYNC_TASK_TYPES.has(task.task_type),
+				);
+				const userSyncTotal =
+					userSyncItems.length === res.items.length
+						? res.total
+						: userSyncItems.length;
+				setUserSyncRuns(userSyncItems);
+				setUserSyncRunTotal(userSyncTotal);
+				userSyncRunsLoadedOnceRef.current = true;
+			} catch (err) {
+				if (requestId !== userSyncRunsRequestIdRef.current) {
+					return;
+				}
+				throw err;
+			} finally {
+				if (requestId === userSyncRunsRequestIdRef.current) {
+					setUserSyncRunsLoadPhase("idle");
+					userSyncRunsInitialRequestInFlightRef.current = false;
+				}
+			}
+		},
+		[userSyncRunPage, userSyncRunStatusFilter],
 	);
 
 	const loadSubscriptionRuns = useCallback(
@@ -4915,6 +5048,12 @@ export function JobManagement({
 				);
 			}
 			setSyncAutoFetchIntervalInput(res.sync_auto_fetch_interval_minutes);
+			setStarSyncDeltaIntervalInput(
+				String(res.star_sync_delta_interval_minutes ?? 30),
+			);
+			setStarSyncFullSweepIntervalInput(
+				String(res.star_sync_full_sweep_interval_minutes ?? 1440),
+			);
 			setRetryRecentFailuresIntervalInput(
 				res.retry_recent_failures_interval_minutes ??
 					RETRY_RECENT_FAILURES_INTERVAL_DEFAULT,
@@ -5069,7 +5208,62 @@ export function JobManagement({
 		repoRefreshSystemBudgetInput,
 		dashboardReleaseFreshnessProfileInput,
 		syncAutoFetchIntervalInput,
-		syncRuntimeConfig,
+	]);
+
+	const saveStarSyncSettings = useCallback(async () => {
+		const nextDeltaInterval = parseBoundedIntegerInput(
+			starSyncDeltaIntervalInput,
+			SYNC_AUTO_FETCH_INTERVAL_MIN,
+			SYNC_AUTO_FETCH_INTERVAL_MAX,
+		);
+		const nextFullSweepInterval = parseBoundedIntegerInput(
+			starSyncFullSweepIntervalInput,
+			STAR_SYNC_FULL_SWEEP_INTERVAL_MIN,
+			STAR_SYNC_FULL_SWEEP_INTERVAL_MAX,
+		);
+		setStarSyncDeltaIntervalError(
+			nextDeltaInterval === null ? "请选择 1 到 120 分钟之间的间隔。" : null,
+		);
+		setStarSyncFullSweepIntervalError(
+			nextFullSweepInterval === null
+				? "请选择 60 分钟到 7 天之间的扫描目标。"
+				: null,
+		);
+		if (nextDeltaInterval === null || nextFullSweepInterval === null) {
+			return;
+		}
+
+		setSyncRuntimeConfigSaving(true);
+		setSyncRuntimeConfigError(null);
+		try {
+			const res = await apiPatchAdminSyncRuntimeConfig({
+				star_sync_delta_interval_minutes: nextDeltaInterval,
+				star_sync_full_sweep_interval_minutes: nextFullSweepInterval,
+			});
+			setSyncRuntimeConfig(res);
+			setStarSyncDeltaIntervalInput(
+				String(res.star_sync_delta_interval_minutes ?? nextDeltaInterval),
+			);
+			setStarSyncFullSweepIntervalInput(
+				String(
+					res.star_sync_full_sweep_interval_minutes ?? nextFullSweepInterval,
+				),
+			);
+			setStarSyncSettingsDialogOpen(false);
+			await Promise.all([
+				loadUserSyncRuns({ background: true }),
+				loadOverview({ background: true }),
+			]);
+		} catch (err) {
+			setSyncRuntimeConfigError(normalizeErrorMessage(err));
+		} finally {
+			setSyncRuntimeConfigSaving(false);
+		}
+	}, [
+		loadOverview,
+		loadUserSyncRuns,
+		starSyncDeltaIntervalInput,
+		starSyncFullSweepIntervalInput,
 	]);
 
 	const openTaskIntervalSettingsDialog = useCallback(() => {
@@ -5108,6 +5302,19 @@ export function JobManagement({
 			syncRuntimeConfig?.dashboard_release_freshness_profile ?? "balanced",
 		);
 		setSubscriptionSyncSettingsDialogOpen(true);
+	}, [syncRuntimeConfig]);
+
+	const openStarSyncSettingsDialog = useCallback(() => {
+		setSyncRuntimeConfigError(null);
+		setStarSyncDeltaIntervalError(null);
+		setStarSyncFullSweepIntervalError(null);
+		setStarSyncDeltaIntervalInput(
+			String(syncRuntimeConfig?.star_sync_delta_interval_minutes ?? 30),
+		);
+		setStarSyncFullSweepIntervalInput(
+			String(syncRuntimeConfig?.star_sync_full_sweep_interval_minutes ?? 1_440),
+		);
+		setStarSyncSettingsDialogOpen(true);
 	}, [syncRuntimeConfig]);
 
 	useEffect(() => {
@@ -5361,6 +5568,7 @@ export function JobManagement({
 					loadOverview({ background: true }),
 					loadRealtimeTasks(options),
 					loadScheduledRuns(options),
+					loadUserSyncRuns(options),
 					loadSubscriptionRuns(options),
 					loadSyncRuntimeConfig(options),
 					loadLlmSchedulerStatus(options),
@@ -5375,6 +5583,7 @@ export function JobManagement({
 			loadOverview,
 			loadRealtimeTasks,
 			loadScheduledRuns,
+			loadUserSyncRuns,
 			loadSubscriptionRuns,
 			loadSyncRuntimeConfig,
 			loadLlmSchedulerStatus,
@@ -5435,6 +5644,7 @@ export function JobManagement({
 					loadOverview({ background: true }),
 					loadRealtimeTasks({ background: true }),
 					loadScheduledRuns({ background: true }),
+					loadUserSyncRuns({ background: true }),
 					loadSubscriptionRuns({ background: true }),
 					loadSyncRuntimeConfig({ background: true }),
 					loadLlmSchedulerStatus({ background: true }),
@@ -5492,6 +5702,7 @@ export function JobManagement({
 		loadOverview,
 		loadRealtimeTasks,
 		loadScheduledRuns,
+		loadUserSyncRuns,
 		loadSubscriptionRuns,
 		loadSyncRuntimeConfig,
 		loadLlmSchedulerStatus,
@@ -5559,6 +5770,16 @@ export function JobManagement({
 			setListError(normalizeErrorMessage(err));
 		});
 	}, [loadScheduledRuns]);
+
+	useEffect(() => {
+		setListError(null);
+		const options = userSyncRunsLoadedOnceRef.current
+			? { background: true }
+			: undefined;
+		void loadUserSyncRuns(options).catch((err) => {
+			setListError(normalizeErrorMessage(err));
+		});
+	}, [loadUserSyncRuns]);
 
 	useEffect(() => {
 		setListError(null);
@@ -6059,7 +6280,7 @@ export function JobManagement({
 				className="space-y-4"
 			>
 				<div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-					<TabsList className="grid !h-[72px] w-full grid-cols-3 auto-rows-[32px] sm:!h-auto sm:grid-cols-5 lg:inline-flex lg:w-auto">
+					<TabsList className="grid !h-[72px] w-full grid-cols-3 auto-rows-[32px] sm:grid-cols-4 lg:!h-auto lg:grid-cols-7 xl:inline-flex xl:w-auto">
 						<TabsTrigger
 							value="realtime"
 							className="!h-8 font-mono text-[11px] sm:text-xs"
@@ -6071,6 +6292,12 @@ export function JobManagement({
 							className="!h-8 font-mono text-[11px] sm:text-xs"
 						>
 							定时任务
+						</TabsTrigger>
+						<TabsTrigger
+							value="user_sync"
+							className="!h-8 font-mono text-[11px] sm:text-xs"
+						>
+							用户同步
 						</TabsTrigger>
 						<TabsTrigger
 							value="subscriptions"
@@ -6504,6 +6731,277 @@ export function JobManagement({
 										onClick={() =>
 											setScheduledRunPage((prev) =>
 												Math.min(scheduledRunTotalPages, prev + 1),
+											)
+										}
+									>
+										下一页
+									</Button>
+								</div>
+							</div>
+						</CardContent>
+					</Card>
+				</TabsContent>
+
+				<TabsContent value="user_sync">
+					<Card className="border-0 bg-transparent shadow-none sm:border sm:bg-card sm:shadow-sm">
+						<CardHeader className="flex flex-row items-start justify-between gap-4 px-0 pb-3 sm:px-6 sm:pb-6">
+							<div className="space-y-1.5">
+								<CardTitle>用户同步</CardTitle>
+								<p className="text-muted-foreground text-sm">
+									星标增量与全量对账的独立计划任务。
+								</p>
+							</div>
+							<Button
+								type="button"
+								variant="outline"
+								size="icon"
+								aria-label="打开用户同步设置"
+								onClick={openStarSyncSettingsDialog}
+								disabled={!syncRuntimeConfig || syncRuntimeConfigSaving}
+							>
+								<Settings2 />
+							</Button>
+						</CardHeader>
+						<CardContent className="space-y-4 px-0 pb-0 pt-0 sm:px-6 sm:pb-6">
+							<div
+								className="grid grid-cols-2 gap-2 md:grid-cols-4 md:gap-3"
+								data-testid="user-sync-metrics"
+							>
+								<div className="min-w-0 px-1 py-1 md:rounded-lg md:border md:bg-card/70 md:p-3">
+									<p className="truncate text-[10px] text-muted-foreground leading-tight md:text-xs">
+										星标增量
+									</p>
+									<p className="mt-0.5 truncate text-base font-semibold md:mt-1 md:text-xl">
+										{formatCount(
+											syncRuntimeConfig?.star_sync_delta_interval_minutes ?? 30,
+										)}{" "}
+										分钟
+									</p>
+									<p className="mt-1 hidden text-muted-foreground text-xs md:block">
+										下次仅读取最新窗口
+									</p>
+								</div>
+								<div className="min-w-0 px-1 py-1 md:rounded-lg md:border md:bg-card/70 md:p-3">
+									<p className="truncate text-[10px] text-muted-foreground leading-tight md:text-xs">
+										全量扫描目标
+									</p>
+									<p className="mt-0.5 truncate text-base font-semibold md:mt-1 md:text-xl">
+										{formatStarSyncFullSweepInterval(
+											syncRuntimeConfig?.star_sync_full_sweep_interval_minutes ??
+												1_440,
+										)}
+									</p>
+									<p className="mt-1 hidden text-muted-foreground text-xs md:block">
+										每轮拆成等价分片
+									</p>
+								</div>
+								<div className="min-w-0 px-1 py-1 md:rounded-lg md:border md:bg-card/70 md:p-3">
+									<p className="truncate text-[10px] text-muted-foreground leading-tight md:text-xs">
+										全量进度
+									</p>
+									<p className="mt-0.5 truncate text-base font-semibold md:mt-1 md:text-xl">
+										{syncRuntimeConfig?.star_sync?.active_epochs[0]
+											? `${formatCount(syncRuntimeConfig.star_sync.active_epochs[0].processed_items)} / ${formatCount(syncRuntimeConfig.star_sync.active_epochs[0].total_count_at_start)}`
+											: "空闲"}
+									</p>
+									<p className="mt-1 hidden text-muted-foreground text-xs md:block">
+										当前全量扫描 Epoch
+									</p>
+								</div>
+								<div className="min-w-0 px-1 py-1 md:rounded-lg md:border md:bg-card/70 md:p-3">
+									<p className="truncate text-[10px] text-muted-foreground leading-tight md:text-xs">
+										上次全量完成
+									</p>
+									<p className="mt-0.5 truncate font-mono text-sm font-semibold md:mt-1 md:text-base">
+										{formatLocalDateTime(
+											syncRuntimeConfig?.star_sync
+												?.last_full_sweep_completed_at ?? null,
+										)}
+									</p>
+									<p className="mt-1 hidden text-muted-foreground text-xs md:block">
+										最后一轮完整扫描
+									</p>
+								</div>
+							</div>
+
+							<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+								<FilterSelect
+									value={userSyncRunStatusFilter}
+									onValueChange={(nextValue) => {
+										setUserSyncRunPage(1);
+										setUserSyncRunStatusFilter(nextValue);
+									}}
+									options={REALTIME_STATUS_FILTER_OPTIONS}
+									placeholder="状态筛选"
+									ariaLabel="用户同步任务状态筛选"
+									className="w-full sm:w-[220px]"
+								/>
+								<p className="text-muted-foreground text-xs">
+									共 {formatCount(userSyncRunTotal)} 条
+								</p>
+							</div>
+
+							<ListSurfaceShell
+								state={userSyncListSurface.state}
+								refreshing={userSyncListSurface.showRefreshing}
+								className="space-y-3"
+							>
+								{userSyncListSurface.showRefreshing ? (
+									<ListRefreshingNotice label="用户同步记录更新中..." />
+								) : null}
+								{listError && userSyncRuns.length > 0 ? (
+									<ListInlineError
+										title="用户同步刷新失败"
+										summary={listError}
+										actionLabel="重试"
+										onAction={() =>
+											void Promise.all([
+												loadUserSyncRuns({ background: true }),
+												loadSyncRuntimeConfig({ background: true }),
+											])
+										}
+									/>
+								) : null}
+								{userSyncListSurface.state === "blocking-error" ? (
+									<ListBlockingErrorState
+										title="用户同步加载失败"
+										summary={listError ?? "当前无法读取用户同步记录。"}
+										actionLabel="重试"
+										onAction={() =>
+											void Promise.all([
+												loadUserSyncRuns(),
+												loadSyncRuntimeConfig(),
+											])
+										}
+									/>
+								) : userSyncListSurface.state === "initial-loading" ? (
+									<CardListSkeleton count={3} />
+								) : userSyncListSurface.state === "empty" ? (
+									<ListEmptyState
+										title="暂无用户同步记录"
+										description="当前筛选条件下没有星标增量或全量对账任务。"
+									/>
+								) : (
+									<div className="space-y-2">
+										{userSyncRuns.map((task) => {
+											const busy = taskActionBusyId === task.id;
+											const displayStatus = realtimeTaskDisplayStatus(task);
+											const tone = taskStatusTone(displayStatus);
+											return (
+												<div
+													key={task.id}
+													className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between"
+												>
+													<div className="min-w-0">
+														<div className="flex flex-wrap items-center gap-2">
+															<p className="font-medium text-sm">
+																{taskTypeLabel(task.task_type)}
+															</p>
+															<StatusBadge
+																label={taskStatusLabel(displayStatus)}
+																tone={tone}
+															/>
+															{task.cancel_requested ? (
+																<FlagBadge
+																	label="已请求取消"
+																	className={cancelRequestedBadgeClass}
+																/>
+															) : null}
+														</div>
+														<p className="text-muted-foreground mt-1 text-xs">
+															类型：
+															<span className="font-mono">
+																{task.task_type}
+															</span>
+														</p>
+														<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
+															ID: {task.id}
+														</p>
+														<div className="mt-1 flex flex-wrap gap-1.5 text-xs">
+															<span className="bg-muted/60 rounded px-2 py-0.5">
+																创建 {formatLocalHm(task.created_at)}
+															</span>
+															<span className="bg-muted/60 rounded px-2 py-0.5">
+																开始 {formatLocalHm(task.started_at)}
+															</span>
+															<span className="bg-muted/60 rounded px-2 py-0.5">
+																完成 {formatLocalHm(task.finished_at)}
+															</span>
+														</div>
+														{task.error_message ? (
+															<p className="text-destructive mt-1 text-xs font-medium">
+																失败原因：{task.error_message}
+															</p>
+														) : null}
+													</div>
+													<div className="flex flex-wrap gap-2">
+														<Button
+															variant="outline"
+															disabled={userSyncRunActionsDisabled}
+															onClick={() => void onOpenTaskDetail(task.id)}
+														>
+															详情
+														</Button>
+														<Button
+															variant="outline"
+															disabled={
+																userSyncRunActionsDisabled ||
+																busy ||
+																task.status === "queued" ||
+																task.status === "running"
+															}
+															onClick={() => void onRetryTask(task.id)}
+														>
+															重试
+														</Button>
+														<Button
+															variant="destructive"
+															disabled={
+																userSyncRunActionsDisabled ||
+																busy ||
+																task.status === "succeeded" ||
+																task.status === "failed" ||
+																task.status === "canceled"
+															}
+															onClick={() => void onCancelTask(task.id)}
+														>
+															取消
+														</Button>
+													</div>
+												</div>
+											);
+										})}
+									</div>
+								)}
+							</ListSurfaceShell>
+
+							<div className="flex items-center justify-between">
+								<p className="text-muted-foreground text-xs">
+									第 {userSyncRunPage}/{userSyncRunTotalPages} 页
+								</p>
+								<div className="flex gap-2">
+									<Button
+										variant="outline"
+										size="sm"
+										disabled={
+											userSyncRunPage <= 1 || userSyncRunsLoadPhase !== "idle"
+										}
+										onClick={() =>
+											setUserSyncRunPage((prev) => Math.max(1, prev - 1))
+										}
+									>
+										上一页
+									</Button>
+									<Button
+										variant="outline"
+										size="sm"
+										disabled={
+											userSyncRunPage >= userSyncRunTotalPages ||
+											userSyncRunsLoadPhase !== "idle"
+										}
+										onClick={() =>
+											setUserSyncRunPage((prev) =>
+												Math.min(userSyncRunTotalPages, prev + 1),
 											)
 										}
 									>
@@ -7626,6 +8124,8 @@ export function JobManagement({
 						setSyncRuntimeConfigError(null);
 						setRepoReleaseWorkerConcurrencyError(null);
 						setRepoRefreshSystemBudgetError(null);
+						setStarSyncDeltaIntervalError(null);
+						setStarSyncFullSweepIntervalError(null);
 					}
 				}}
 			>
@@ -7634,9 +8134,7 @@ export function JobManagement({
 					onOpenAutoFocus={(event) => {
 						event.preventDefault();
 						window.requestAnimationFrame(() => {
-							document
-								.getElementById("repo-release-worker-concurrency-input")
-								?.focus();
+							document.getElementById("sync-auto-fetch-interval")?.focus();
 						});
 					}}
 				>
@@ -8012,6 +8510,216 @@ export function JobManagement({
 							disabled={syncRuntimeConfigSaving}
 						>
 							{syncRuntimeConfigSaving ? "保存中…" : "保存设置"}
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
+
+			<Dialog
+				open={starSyncSettingsDialogOpen}
+				onOpenChange={(open) => {
+					setStarSyncSettingsDialogOpen(open);
+					if (!open) {
+						setSyncRuntimeConfigError(null);
+						setStarSyncDeltaIntervalError(null);
+						setStarSyncFullSweepIntervalError(null);
+					}
+				}}
+			>
+				<DialogContent className="max-w-xl">
+					<DialogHeader>
+						<DialogTitle>用户同步设置</DialogTitle>
+						<DialogDescription>
+							星标增量与全量对账是独立的用户同步计划；调整频率不会影响订阅
+							同步或 Release 治理窗口。
+						</DialogDescription>
+					</DialogHeader>
+
+					<div className="space-y-6">
+						<div className="space-y-3">
+							<div className="flex items-center justify-between gap-3">
+								<Label htmlFor="star-sync-delta-interval">星标增量间隔</Label>
+								<span className="rounded-full border border-border/70 bg-background px-3 py-1 font-mono text-sm font-semibold">
+									{starSyncDeltaIntervalSliderValue} 分钟
+								</span>
+							</div>
+							<input
+								id="star-sync-delta-interval"
+								type="range"
+								min={0}
+								max={100}
+								step={1}
+								value={syncIntervalToSliderPosition(
+									starSyncDeltaIntervalSliderValue,
+								)}
+								onChange={(event) => {
+									setStarSyncDeltaIntervalInput(
+										String(
+											syncSliderPositionToInterval(Number(event.target.value)),
+										),
+									);
+									setStarSyncDeltaIntervalError(null);
+								}}
+								aria-label="星标增量间隔（分钟）"
+								aria-valuemin={SYNC_AUTO_FETCH_INTERVAL_MIN}
+								aria-valuemax={SYNC_AUTO_FETCH_INTERVAL_MAX}
+								aria-valuenow={starSyncDeltaIntervalSliderValue}
+								aria-valuetext={`${starSyncDeltaIntervalSliderValue} 分钟`}
+								aria-invalid={starSyncDeltaIntervalError !== null}
+								aria-describedby={
+									starSyncDeltaIntervalError
+										? "star-sync-delta-interval-error"
+										: undefined
+								}
+								className="h-2 w-full cursor-pointer accent-primary"
+							/>
+							<div className="relative h-11 text-[11px] text-muted-foreground">
+								{SYNC_AUTO_FETCH_INTERVAL_MARKS.map((mark) => (
+									<button
+										key={mark}
+										type="button"
+										className="-translate-x-1/2 absolute top-0 flex min-h-11 min-w-11 flex-col items-center gap-1 rounded-md px-1 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+										style={{ left: syncIntervalMarkPosition(mark) }}
+										onClick={() => {
+											setStarSyncDeltaIntervalInput(String(mark));
+											setStarSyncDeltaIntervalError(null);
+										}}
+										aria-label={`将星标增量间隔设为 ${mark} 分钟`}
+									>
+										<span className="mt-1 h-1.5 w-px bg-border" />
+										<span>{mark}</span>
+									</button>
+								))}
+							</div>
+							{starSyncDeltaIntervalError ? (
+								<p
+									id="star-sync-delta-interval-error"
+									className="text-destructive text-xs"
+									role="alert"
+								>
+									{starSyncDeltaIntervalError}
+								</p>
+							) : null}
+							<p className="text-muted-foreground text-xs">
+								每次只读取最新窗口，用于快速发现新增星标。
+							</p>
+						</div>
+
+						<div className="space-y-3 border-t border-border/70 pt-5">
+							<div className="flex items-center justify-between gap-3">
+								<Label htmlFor="star-sync-full-sweep-interval">
+									星标全量扫描目标
+								</Label>
+								<span className="rounded-full border border-border/70 bg-background px-3 py-1 font-mono text-sm font-semibold">
+									{formatStarSyncFullSweepInterval(
+										starSyncFullSweepIntervalSliderValue,
+									)}
+								</span>
+							</div>
+							<input
+								id="star-sync-full-sweep-interval"
+								type="range"
+								min={0}
+								max={100}
+								step={1}
+								value={starSyncFullSweepToSliderPosition(
+									starSyncFullSweepIntervalSliderValue,
+								)}
+								onChange={(event) => {
+									setStarSyncFullSweepIntervalInput(
+										String(
+											starSyncSliderPositionToFullSweep(
+												Number(event.target.value),
+											),
+										),
+									);
+									setStarSyncFullSweepIntervalError(null);
+								}}
+								aria-label="星标全量扫描目标（分钟）"
+								aria-valuemin={STAR_SYNC_FULL_SWEEP_INTERVAL_MIN}
+								aria-valuemax={STAR_SYNC_FULL_SWEEP_INTERVAL_MAX}
+								aria-valuenow={starSyncFullSweepIntervalSliderValue}
+								aria-valuetext={formatStarSyncFullSweepInterval(
+									starSyncFullSweepIntervalSliderValue,
+								)}
+								aria-invalid={starSyncFullSweepIntervalError !== null}
+								aria-describedby={
+									starSyncFullSweepIntervalError
+										? "star-sync-full-sweep-interval-error"
+										: undefined
+								}
+								className="h-2 w-full cursor-pointer accent-primary"
+							/>
+							<div className="relative h-11 text-[11px] text-muted-foreground">
+								{STAR_SYNC_FULL_SWEEP_INTERVAL_MARKS.map((mark) => (
+									<button
+										key={mark}
+										type="button"
+										className="-translate-x-1/2 absolute top-0 flex min-h-11 min-w-11 flex-col items-center gap-1 rounded-md px-1 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+										style={{ left: starSyncFullSweepMarkPosition(mark) }}
+										onClick={() => {
+											setStarSyncFullSweepIntervalInput(String(mark));
+											setStarSyncFullSweepIntervalError(null);
+										}}
+										aria-label={`将星标全量扫描目标设为 ${formatStarSyncFullSweepInterval(mark)}`}
+									>
+										<span className="mt-1 h-1.5 w-px bg-border" />
+										<span>{formatStarSyncFullSweepInterval(mark)}</span>
+									</button>
+								))}
+							</div>
+							{starSyncFullSweepIntervalError ? (
+								<p
+									id="star-sync-full-sweep-interval-error"
+									className="text-destructive text-xs"
+									role="alert"
+								>
+									{starSyncFullSweepIntervalError}
+								</p>
+							) : null}
+							<p className="text-muted-foreground text-xs">
+								每轮按连接顺序切成单页任务；目标周期按整小时对齐。
+							</p>
+						</div>
+
+						{syncRuntimeConfig?.star_sync ? (
+							<div className="grid gap-2 border-t border-border/70 pt-5 text-xs text-muted-foreground sm:grid-cols-2">
+								<p>
+									上次增量：
+									{formatLocalDateTime(
+										syncRuntimeConfig.star_sync.last_delta_completed_at,
+									)}
+								</p>
+								<p>
+									上次全量：
+									{formatLocalDateTime(
+										syncRuntimeConfig.star_sync.last_full_sweep_completed_at,
+									)}
+								</p>
+							</div>
+						) : null}
+						{syncRuntimeConfigError ? (
+							<p className="text-destructive text-sm">
+								{syncRuntimeConfigError}
+							</p>
+						) : null}
+					</div>
+
+					<DialogFooter>
+						<Button
+							type="button"
+							variant="outline"
+							onClick={() => setStarSyncSettingsDialogOpen(false)}
+							disabled={syncRuntimeConfigSaving}
+						>
+							取消
+						</Button>
+						<Button
+							type="button"
+							onClick={() => void saveStarSyncSettings()}
+							disabled={syncRuntimeConfigSaving}
+						>
+							{syncRuntimeConfigSaving ? "保存中…" : "保存用户同步设置"}
 						</Button>
 					</DialogFooter>
 				</DialogContent>

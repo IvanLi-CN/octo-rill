@@ -192,6 +192,34 @@ const scheduledRunsSeed: AdminRealtimeTaskItem[] = [
 		updated_at: "2026-02-27T14:45:01Z",
 	},
 	{
+		id: "task-starred-reconcile-1455",
+		task_type: "sync.starred.reconcile",
+		status: "running",
+		source: "scheduler",
+		requested_by: null,
+		parent_task_id: null,
+		cancel_requested: false,
+		error_message: null,
+		created_at: "2026-02-27T14:55:00Z",
+		started_at: "2026-02-27T14:55:01Z",
+		finished_at: null,
+		updated_at: "2026-02-27T14:57:10Z",
+	},
+	{
+		id: "task-starred-delta-1450",
+		task_type: "sync.starred.delta",
+		status: "succeeded",
+		source: "scheduler",
+		requested_by: null,
+		parent_task_id: null,
+		cancel_requested: false,
+		error_message: null,
+		created_at: "2026-02-27T14:50:00Z",
+		started_at: "2026-02-27T14:50:01Z",
+		finished_at: "2026-02-27T14:50:08Z",
+		updated_at: "2026-02-27T14:50:08Z",
+	},
+	{
 		id: "task-subscription-1440",
 		task_type: "sync.subscriptions",
 		status: "running",
@@ -736,6 +764,52 @@ const translationBatchDetailFailedSeed = {
 function buildTaskDetail(
 	task: AdminRealtimeTaskItem,
 ): AdminRealtimeTaskDetailResponse {
+	if (task.task_type === "sync.starred.reconcile") {
+		return {
+			task: {
+				...task,
+				payload_json: JSON.stringify({
+					user_id: RECENT_EVENT_USER_ID,
+					github_connection_id: "gh-primary",
+					epoch_id: "star-epoch-storybook",
+					trigger: "schedule",
+				}),
+				result_json: null,
+			},
+			events: [
+				{
+					id: `${task.id}-event-1`,
+					event_type: "task.progress",
+					payload_json: JSON.stringify({
+						processed_pages: 8,
+						processed_items: 576,
+						total_count_at_start: 2880,
+					}),
+					created_at: task.updated_at,
+				},
+			],
+		};
+	}
+
+	if (task.task_type === "sync.starred.delta") {
+		return {
+			task: {
+				...task,
+				payload_json: JSON.stringify({
+					user_id: RECENT_EVENT_USER_ID,
+					github_connection_id: "gh-primary",
+					trigger: "schedule",
+				}),
+				result_json: JSON.stringify({
+					user_id: RECENT_EVENT_USER_ID,
+					github_connection_id: "gh-primary",
+					items_observed: 14,
+				}),
+			},
+			events: [],
+		};
+	}
+
 	if (task.task_type === "retry.recent_failures") {
 		const skipped = task.id.endsWith("skipped");
 		return {
@@ -882,11 +956,8 @@ function buildTaskDetail(
 					result_json: JSON.stringify({
 						skipped: true,
 						skip_reason: "previous_run_active",
-						star: {
+						collect: {
 							total_users: 0,
-							succeeded_users: 0,
-							failed_users: 0,
-							total_repos: 0,
 						},
 						release: {
 							total_repos: 0,
@@ -951,11 +1022,8 @@ function buildTaskDetail(
 						skip_reason: "previous_run_active",
 						log_available: false,
 						log_download_path: null,
-						star: {
+						collect: {
 							total_users: 0,
-							succeeded_users: 0,
-							failed_users: 0,
-							total_repos: 0,
 						},
 						release: {
 							total_repos: 0,
@@ -1000,11 +1068,8 @@ function buildTaskDetail(
 					result_json: JSON.stringify({
 						skipped: false,
 						skip_reason: null,
-						star: {
+						collect: {
 							total_users: 12,
-							succeeded_users: 12,
-							failed_users: 0,
-							total_repos: 340,
 						},
 						release: {
 							total_repos: 128,
@@ -1057,11 +1122,8 @@ function buildTaskDetail(
 						log_available: true,
 						log_download_path:
 							"/api/admin/jobs/realtime/task-subscription-1420/log",
-						star: {
+						collect: {
 							total_users: 12,
-							succeeded_users: 12,
-							failed_users: 0,
-							total_repos: 340,
 						},
 						release: {
 							total_repos: 128,
@@ -1105,11 +1167,8 @@ function buildTaskDetail(
 					}),
 					result_json: JSON.stringify({
 						skipped: false,
-						star: {
+						collect: {
 							total_users: 12,
-							succeeded_users: 9,
-							failed_users: 3,
-							total_repos: 220,
 						},
 						release: {
 							total_repos: 88,
@@ -1162,11 +1221,8 @@ function buildTaskDetail(
 						log_available: true,
 						log_download_path:
 							"/api/admin/jobs/realtime/task-subscription-1410/log",
-						star: {
+						collect: {
 							total_users: 12,
-							succeeded_users: 9,
-							failed_users: 3,
-							total_repos: 220,
 						},
 						release: {
 							total_repos: 88,
@@ -1245,18 +1301,6 @@ function buildTaskDetail(
 						created_at: "2026-02-27T14:40:03Z",
 					},
 					{
-						id: "evt-task-1440-4",
-						event_type: "task.progress",
-						payload_json: JSON.stringify({
-							stage: "star_summary",
-							total_users: 12,
-							succeeded_users: 11,
-							failed_users: 1,
-							total_repos: 340,
-						}),
-						created_at: "2026-02-27T14:40:39Z",
-					},
-					{
 						id: "evt-task-1440-5",
 						event_type: "task.progress",
 						payload_json: JSON.stringify({
@@ -1296,11 +1340,8 @@ function buildTaskDetail(
 						log_available: true,
 						log_download_path:
 							"/api/admin/jobs/realtime/task-subscription-1440/log",
-						star: {
+						collect: {
 							total_users: 12,
-							succeeded_users: 11,
-							failed_users: 1,
-							total_repos: 340,
 						},
 						release: {
 							total_repos: 128,
@@ -1377,11 +1418,8 @@ function buildTaskDetail(
 				result_json: JSON.stringify({
 					skipped: false,
 					skip_reason: null,
-					star: {
+					collect: {
 						total_users: 12,
-						succeeded_users: 11,
-						failed_users: 1,
-						total_repos: 340,
 					},
 					release: {
 						total_repos: 128,
@@ -1430,17 +1468,6 @@ function buildTaskDetail(
 					event_type: "task.progress",
 					payload_json: JSON.stringify({ stage: "collect", total_users: 12 }),
 					created_at: "2026-02-27T14:30:03Z",
-				},
-				{
-					id: "evt-task-1004",
-					event_type: "task.progress",
-					payload_json: JSON.stringify({
-						stage: "star_summary",
-						total_users: 12,
-						succeeded_users: 11,
-						failed_users: 1,
-					}),
-					created_at: "2026-02-27T14:30:36Z",
 				},
 				{
 					id: "evt-task-1005",
@@ -1513,11 +1540,8 @@ function buildTaskDetail(
 					log_available: true,
 					log_download_path:
 						"/api/admin/jobs/realtime/task-subscription-1430/log",
-					star: {
+					collect: {
 						total_users: 12,
-						succeeded_users: 11,
-						failed_users: 1,
-						total_repos: 340,
 					},
 					release: {
 						total_repos: 128,
@@ -1669,6 +1693,7 @@ type AdminJobsPreviewProps = {
 	translationState?: "default" | "busy" | "recovered" | "failed";
 	taskIntervalSettingsDialogDefaultOpen?: boolean;
 	subscriptionSyncSettingsDialogDefaultOpen?: boolean;
+	starSyncSettingsDialogDefaultOpen?: boolean;
 	syncSettingsHelpTooltip?: "dialog" | "freshness" | "duration";
 };
 
@@ -1707,6 +1732,7 @@ function AdminJobsPreview({
 	translationState = "default",
 	taskIntervalSettingsDialogDefaultOpen = false,
 	subscriptionSyncSettingsDialogDefaultOpen = false,
+	starSyncSettingsDialogDefaultOpen = false,
 	syncSettingsHelpTooltip,
 }: AdminJobsPreviewProps) {
 	const [ready, setReady] = useState(false);
@@ -1794,6 +1820,22 @@ function AdminJobsPreview({
 		let syncRuntimeConfig = {
 			sync_auto_fetch_interval_minutes: 10,
 			sync_auto_fetch_effective_at: "2026-02-26T02:30:00Z",
+			star_sync_delta_interval_minutes: 30,
+			star_sync_full_sweep_interval_minutes: 1440,
+			star_sync: {
+				last_delta_completed_at: "2026-02-26T02:00:00Z",
+				last_full_sweep_completed_at: "2026-02-25T02:00:00Z",
+				active_epochs: [
+					{
+						github_connection_id: "github-connection-story",
+						processed_pages: 5,
+						processed_items: 144,
+						total_count_at_start: 2880,
+						completion_percent: 5,
+						next_slice_not_before: "2026-02-27T14:58:00Z",
+					},
+				],
+			},
 			retry_recent_failures_interval_minutes: 10,
 			repo_release_worker_concurrency: 12,
 			repo_refresh_system_budget_per_window: 1000,
@@ -2027,12 +2069,20 @@ function AdminJobsPreview({
 							"retry.recent_failures",
 						].includes(item.task_type),
 					);
+				} else if (taskGroup === "user_sync") {
+					rows = rows.filter((item) =>
+						["sync.starred.delta", "sync.starred.reconcile"].includes(
+							item.task_type,
+						),
+					);
 				} else if (taskGroup === "realtime") {
 					rows = rows.filter(
 						(item) =>
 							![
 								"brief.daily_slot",
 								"sync.subscriptions",
+								"sync.starred.delta",
+								"sync.starred.reconcile",
 								"retry.recent_failures",
 							].includes(item.task_type),
 					);
@@ -2166,6 +2216,8 @@ function AdminJobsPreview({
 			) {
 				const body = (await req.json()) as {
 					sync_auto_fetch_interval_minutes?: number;
+					star_sync_delta_interval_minutes?: number;
+					star_sync_full_sweep_interval_minutes?: number;
 					retry_recent_failures_interval_minutes?: number;
 					repo_release_worker_concurrency?: number;
 					repo_refresh_system_budget_per_window?: number;
@@ -2175,6 +2227,14 @@ function AdminJobsPreview({
 					...syncRuntimeConfig,
 					sync_auto_fetch_interval_minutes: Number(
 						body.sync_auto_fetch_interval_minutes ?? 60,
+					),
+					star_sync_delta_interval_minutes: Number(
+						body.star_sync_delta_interval_minutes ??
+							syncRuntimeConfig.star_sync_delta_interval_minutes,
+					),
+					star_sync_full_sweep_interval_minutes: Number(
+						body.star_sync_full_sweep_interval_minutes ??
+							syncRuntimeConfig.star_sync_full_sweep_interval_minutes,
 					),
 					retry_recent_failures_interval_minutes: Number(
 						body.retry_recent_failures_interval_minutes ??
@@ -2725,6 +2785,7 @@ function AdminJobsPreview({
 			subscriptionSyncSettingsDialogDefaultOpen={
 				subscriptionSyncSettingsDialogDefaultOpen
 			}
+			starSyncSettingsDialogDefaultOpen={starSyncSettingsDialogDefaultOpen}
 			syncSettingsHelpTooltip={syncSettingsHelpTooltip}
 		/>
 	);
@@ -2781,12 +2842,42 @@ export const ScheduledTab: Story = {
 			canvas.getByRole("button", { name: "配置定时任务间隔" }),
 		).toBeVisible();
 		await expect(canvas.getByText("失败数据重试")).toBeVisible();
+		expect(canvas.queryByText("星标增量同步")).toBeNull();
 		await expect(
 			canvas.queryByRole("button", { name: "打开订阅同步设置" }),
 		).not.toBeInTheDocument();
 		await waitFor(() =>
 			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
 				"/admin/jobs/scheduled",
+			),
+		);
+	},
+};
+
+export const UserSyncTab: Story = {
+	render: () => <AdminJobsPreview routeUrl="/admin/jobs/user-sync" />,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"用户同步独立页签，展示星标增量、全量对账进度与对应的计划任务运行记录。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "用户同步" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("button", { name: "打开用户同步设置" }),
+		).toBeVisible();
+		await expect(canvas.getByText("星标增量同步")).toBeVisible();
+		await expect(canvas.getByText("星标全量对账")).toBeVisible();
+		expect(canvas.queryByText("订阅同步工作流")).toBeNull();
+		await waitFor(() =>
+			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
+				"/admin/jobs/user-sync",
 			),
 		);
 	},
@@ -3138,7 +3229,7 @@ export const SubscriptionSyncDetailRunning: Story = {
 		docs: {
 			description: {
 				story:
-					"运行中的订阅同步详情页：Star 与 Repo Collect 已完成，Release Queue 正在处理，Social 与 Notifications 等待上游阶段结束。",
+					"运行中的订阅同步详情页：Collect 与 Repo Collect 已完成，Release Queue 正在处理，Social 与 Notifications 等待上游阶段结束。",
 			},
 		},
 	},
@@ -3243,6 +3334,8 @@ export const SubscriptionSyncSettingsAutoOpen: Story = {
 		await expect(
 			canvas.getByRole("slider", { name: "订阅同步间隔（分钟）" }),
 		).toBeVisible();
+		expect(canvas.queryByText("星标增量间隔")).toBeNull();
+		expect(canvas.queryByText("星标全量扫描目标")).toBeNull();
 		await expect(canvas.getByText("最近三次链路用时")).toBeVisible();
 		const latestProfile = canvas.getByRole("button", { name: "最新" });
 		await userEvent.click(latestProfile);
@@ -3251,6 +3344,42 @@ export const SubscriptionSyncSettingsAutoOpen: Story = {
 			"aria-pressed",
 			"false",
 		);
+	},
+};
+
+export const StarSyncSettingsAutoOpen: Story = {
+	render: () => (
+		<AdminJobsPreview
+			routeUrl="/admin/jobs/user-sync"
+			starSyncSettingsDialogDefaultOpen
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"用户同步页独立配置星标任务；两个滑块沿用订阅同步的常用频率刻度。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			await canvas.findByRole("dialog", { name: "用户同步设置" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("slider", { name: "星标增量间隔（分钟）" }),
+		).toHaveAttribute("aria-valuenow", "30");
+		await expect(
+			canvas.getByRole("slider", { name: "星标全量扫描目标（分钟）" }),
+		).toHaveAttribute("aria-valuenow", "1440");
+		expect(
+			canvas.queryByRole("spinbutton", { name: "星标增量间隔精确分钟数" }),
+		).toBeNull();
+		expect(
+			canvas.queryByRole("spinbutton", { name: "星标全量扫描目标精确分钟数" }),
+		).toBeNull();
+		expect(canvas.queryByText("订阅同步间隔")).toBeNull();
 	},
 };
 
