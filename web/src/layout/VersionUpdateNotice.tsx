@@ -52,17 +52,26 @@ export function VersionUpdateNotice() {
 			className="border-b border-amber-200/70 bg-amber-50/80 dark:border-amber-500/25 dark:bg-amber-500/10"
 			data-version-update-notice
 		>
-			<div className="mx-auto flex max-w-6xl flex-col gap-2 px-6 py-2 sm:min-h-10 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
-				<p className="min-w-0 text-[13px] text-amber-950/85 dark:text-amber-100/90 sm:text-sm">
+			<div
+				className="mx-auto flex max-w-6xl flex-wrap items-center gap-x-3 gap-y-2 px-6 py-2"
+				data-version-update-notice-content
+			>
+				<p
+					className="min-w-0 flex-[1_1_auto] text-[13px] text-amber-950/85 dark:text-amber-100/90 sm:text-sm"
+					data-version-update-message
+				>
 					{message}
 				</p>
-				<div className="flex flex-wrap items-center gap-2 sm:justify-end">
+				<div
+					className="ml-auto flex shrink-0 flex-nowrap items-center gap-2 whitespace-nowrap"
+					data-version-update-actions
+				>
 					{showInstallAction ? (
 						<Button
 							type="button"
 							variant="outline"
 							size="sm"
-							className="h-7 border-amber-300/70 bg-amber-100/70 px-2.5 text-xs text-amber-950 hover:bg-amber-100 hover:text-amber-950 dark:border-amber-400/30 dark:bg-amber-500/10 dark:text-amber-50 dark:hover:bg-amber-500/20 dark:hover:text-amber-50"
+							className="relative h-7 before:pointer-events-auto before:absolute before:inset-x-0 before:-inset-y-[5px] before:content-[''] border-amber-300/70 bg-amber-100/70 px-2.5 text-xs text-amber-950 hover:bg-amber-100 hover:text-amber-950 dark:border-amber-400/30 dark:bg-amber-500/10 dark:text-amber-50 dark:hover:bg-amber-500/20 dark:hover:text-amber-50"
 							data-pwa-install-action
 							onClick={() => {
 								void promptInstallPwa?.();
@@ -77,7 +86,7 @@ export function VersionUpdateNotice() {
 							type="button"
 							variant="ghost"
 							size="sm"
-							className="h-7 px-2.5 text-xs text-amber-950 hover:bg-amber-100 hover:text-amber-950 dark:text-amber-50 dark:hover:bg-amber-500/20 dark:hover:text-amber-50"
+							className="relative h-7 before:pointer-events-auto before:absolute before:inset-x-0 before:-inset-y-1 before:content-[''] px-2.5 text-xs text-amber-950 hover:bg-amber-100 hover:text-amber-950 dark:text-amber-50 dark:hover:bg-amber-500/20 dark:hover:text-amber-50"
 							onClick={refreshPage}
 						>
 							<RefreshCcw className="size-3.5" />
