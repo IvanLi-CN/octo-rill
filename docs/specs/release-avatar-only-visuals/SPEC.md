@@ -47,6 +47,10 @@ Release Feed 与 Release 详情曾采用 `custom social preview -> owner/org ava
   - 仅 `owner_avatar_url` 参与 Release 图标渲染；
   - avatar 缺失或加载失败时退回 `text-only`；
   - `open_graph_image_url` 与 `uses_custom_open_graph_image` 只保留兼容语义，不再进入候选图列表。
+- `RepoIdentity` 的仓库名契约统一为：
+  - 可用宽度内完整显示并允许换行，最多两行；
+  - 超过两行时使用中间省略，保留 owner/repo 前缀与仓库名末尾至少 8 个字符；
+  - 完整仓库名继续作为链接可访问名称与桌面 `title`，不得使用尾部省略或引入横向滚动。
 
 ## 功能与行为规格（Functional/Behavior Spec）
 
@@ -65,6 +69,7 @@ Release Feed 与 Release 详情曾采用 `custom social preview -> owner/org ava
 
 - `pages-dashboard--release-repo-visuals` 继续承担多态画廊，但预期改成 avatar-only + text-only。
 - `pages-dashboard--briefs-long-content-with-detail` 继续验证从 brief 打开的 Release 详情弹窗。
+- `pages-dashboard--mobile-repo-identity-two-line` 与 `pages-dashboard--mobile-repo-identity-middle-ellipsis` 固定在 390px 视口，分别验证完整两行与中间省略尾部保真。
 - Playwright 至少覆盖“同时有 avatar + social preview metadata 时仍显示 avatar”。
 
 ## 验收标准（Acceptance Criteria）

@@ -1188,6 +1188,26 @@ function makeMockFeed(): FeedItem[] {
 	];
 }
 
+const REPO_IDENTITY_SINGLE_LINE_NAME = "acme/rocket";
+const REPO_IDENTITY_TWO_LINE_NAME = "acme/release-notes-for-mobile";
+const REPO_IDENTITY_EXTREME_NAME =
+	"owner-with-a-very-long-github-handle/repository-name-that-keeps-terminal-tail-2026";
+
+function makeRepoIdentityOverflowFeed(
+	repoFullName: string,
+	id = "repo-identity-overflow",
+): FeedItem[] {
+	return [
+		buildFeedItem(id, {
+			repo_full_name: repoFullName,
+			repo_visual: repoVisualFixtures.text,
+			title: "Repository identity overflow regression",
+			body: "- The repository name remains identifiable at narrow widths",
+			html_url: `https://github.com/${repoFullName}/releases/tag/v1.0.0`,
+		}),
+	];
+}
+
 function makeHistoricalBriefErrorFocusFeed(): FeedItem[] {
 	return [makeMockFeed()[4]!];
 }
@@ -6526,6 +6546,159 @@ export const MobileReleaseCardActionPolish: Story = {
 		await expect(
 			releaseCardCanvas.getByRole("heading", { name: "v2.63.0（稳定版）" }),
 		).toBeVisible();
+	},
+};
+
+export const MobileRepoIdentityTwoLine: Story = {
+	name: "Evidence / Mobile repo identity two lines",
+	tags: ["repo-identity-overflow"],
+	args: {
+		initialTab: "releases",
+		feedItems: makeRepoIdentityOverflowFeed(
+			REPO_IDENTITY_TWO_LINE_NAME,
+			"repo-identity-two-line",
+		),
+	},
+	parameters: {
+		viewport: {
+			defaultViewport: "dashboardMobile390",
+		},
+		docs: {
+			description: {
+				story:
+					"正常长度的仓库完整名称在移动端允许换行，但最多占用两行，并保持完整可访问名称。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const card = canvasElement.querySelector<HTMLElement>(
+			'[data-feed-item-key="release:repo-identity-two-line"]',
+		);
+		if (!card) throw new Error("Expected two-line repository card");
+		const label = card.querySelector<HTMLElement>(
+			'[data-repo-identity-label="true"]',
+		);
+		if (!label) throw new Error("Expected repository identity label");
+
+		await waitFor(() => {
+			expect(label.dataset.repoIdentityLabelMode).toBe("full");
+		});
+		expect(label).toHaveTextContent(REPO_IDENTITY_TWO_LINE_NAME);
+		expect(
+			canvas.getByRole("link", { name: REPO_IDENTITY_TWO_LINE_NAME }),
+		).toBeVisible();
+		const lineHeight = Number.parseFloat(
+			window.getComputedStyle(label).lineHeight,
+		);
+		expect(label.getBoundingClientRect().height).toBeLessThanOrEqual(
+			lineHeight * 2 + 1,
+		);
+		expectNoHorizontalOverflow(card);
+	},
+};
+
+export const MobileRepoIdentitySingleLine: Story = {
+	name: "Evidence / Mobile repo identity single line",
+	tags: ["repo-identity-overflow"],
+	args: {
+		initialTab: "releases",
+		feedItems: makeRepoIdentityOverflowFeed(
+			REPO_IDENTITY_SINGLE_LINE_NAME,
+			"repo-identity-single-line",
+		),
+	},
+	parameters: {
+		viewport: {
+			defaultViewport: "dashboardMobile390",
+		},
+		docs: {
+			description: {
+				story:
+					"短仓库名称在移动端保持完整单行显示，同时继续使用统一的链接可访问名称与宽度约束。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const card = canvasElement.querySelector<HTMLElement>(
+			'[data-feed-item-key="release:repo-identity-single-line"]',
+		);
+		if (!card) throw new Error("Expected single-line repository card");
+		const label = card.querySelector<HTMLElement>(
+			'[data-repo-identity-label="true"]',
+		);
+		if (!label) throw new Error("Expected repository identity label");
+
+		await waitFor(() => {
+			expect(label.dataset.repoIdentityLabelMode).toBe("full");
+		});
+		expect(label).toHaveTextContent(REPO_IDENTITY_SINGLE_LINE_NAME);
+		expect(
+			canvas.getByRole("link", { name: REPO_IDENTITY_SINGLE_LINE_NAME }),
+		).toBeVisible();
+		const lineHeight = Number.parseFloat(
+			window.getComputedStyle(label).lineHeight,
+		);
+		expect(label.getBoundingClientRect().height).toBeLessThanOrEqual(
+			lineHeight + 1,
+		);
+		expectNoHorizontalOverflow(card);
+	},
+};
+
+export const MobileRepoIdentityMiddleEllipsis: Story = {
+	name: "Evidence / Mobile repo identity middle ellipsis",
+	tags: ["repo-identity-overflow"],
+	args: {
+		initialTab: "releases",
+		feedItems: makeRepoIdentityOverflowFeed(
+			REPO_IDENTITY_EXTREME_NAME,
+			"repo-identity-extreme",
+		),
+	},
+	parameters: {
+		viewport: {
+			defaultViewport: "dashboardMobile390",
+		},
+		docs: {
+			description: {
+				story:
+					"极端长度的仓库名称使用中间省略保留仓库尾部；省略后的可见文本不以省略号结尾，完整名称仍作为链接名称可访问。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const card = canvasElement.querySelector<HTMLElement>(
+			'[data-feed-item-key="release:repo-identity-extreme"]',
+		);
+		if (!card) throw new Error("Expected extreme repository card");
+		const label = card.querySelector<HTMLElement>(
+			'[data-repo-identity-label="true"]',
+		);
+		if (!label) throw new Error("Expected repository identity label");
+
+		await waitFor(() => {
+			expect(label.dataset.repoIdentityLabelMode).toBe("compact");
+		});
+		const compactText =
+			label.querySelector<HTMLElement>("[aria-hidden='true']")?.textContent ??
+			"";
+		expect(compactText).toContain(
+			REPO_IDENTITY_EXTREME_NAME.split("/")[1]!.slice(-8),
+		);
+		expect(compactText).not.toMatch(/…$/);
+		expect(
+			canvas.getByRole("link", { name: REPO_IDENTITY_EXTREME_NAME }),
+		).toBeVisible();
+		const lineHeight = Number.parseFloat(
+			window.getComputedStyle(label).lineHeight,
+		);
+		expect(label.getBoundingClientRect().height).toBeLessThanOrEqual(
+			lineHeight * 2 + 1,
+		);
+		expectNoHorizontalOverflow(card);
 	},
 };
 

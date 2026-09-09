@@ -21,6 +21,7 @@ export default defineConfig((env) =>
 									"landing-auth-feedback",
 									"feed-pagination-feedback",
 									"readable-initial-loading",
+									"repo-identity-overflow",
 								],
 								exclude: [],
 								skip: [],
