@@ -15,6 +15,7 @@ import {
 	ADMIN_JOBS_AI_RECORDS_PATH,
 	ADMIN_JOBS_SCHEDULED_PATH,
 	ADMIN_JOBS_SUBSCRIPTIONS_PATH,
+	ADMIN_JOBS_USER_SYNC_PATH,
 	ADMIN_JOBS_TRANSLATIONS_PATH,
 } from "@/admin/jobsRouteState";
 import { AdminJobs } from "@/pages/AdminJobs";
@@ -170,6 +171,7 @@ export function AdminJobsRoutePage(props: {
 					? routeState.drawerFromTab
 					: canonicalSearch.from === "realtime" ||
 							canonicalSearch.from === "scheduled" ||
+							canonicalSearch.from === "user_sync" ||
 							canonicalSearch.from === "llm" ||
 							canonicalSearch.from === "translations"
 						? canonicalSearch.from
@@ -211,6 +213,7 @@ export function AdminJobsRoutePage(props: {
 export const ADMIN_JOBS_ROUTE_PATHS = {
 	realtime: ADMIN_JOBS_BASE_PATH,
 	scheduled: ADMIN_JOBS_SCHEDULED_PATH,
+	user_sync: ADMIN_JOBS_USER_SYNC_PATH,
 	subscriptions: ADMIN_JOBS_SUBSCRIPTIONS_PATH,
 	llm: ADMIN_JOBS_LLM_PATH,
 	translations: ADMIN_JOBS_TRANSLATIONS_PATH,

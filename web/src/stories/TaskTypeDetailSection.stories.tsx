@@ -216,6 +216,46 @@ export const SyncStarred: Story = {
 	},
 };
 
+export const SyncStarredDelta: Story = {
+	args: {
+		detail: buildDetail(
+			"sync.starred.delta",
+			{
+				user_id: TARGET_USER_ID,
+				github_connection_id: "gh-primary",
+				trigger: "schedule",
+			},
+			{
+				user_id: TARGET_USER_ID,
+				github_connection_id: "gh-primary",
+				items_observed: 37,
+			},
+		),
+	},
+};
+
+export const SyncStarredReconcile: Story = {
+	args: {
+		detail: buildDetail(
+			"sync.starred.reconcile",
+			{
+				user_id: TARGET_USER_ID,
+				github_connection_id: "gh-primary",
+				epoch_id: "star-epoch-20260226",
+				trigger: "schedule",
+			},
+			null,
+			[
+				{
+					processed_pages: 3,
+					processed_items: 300,
+					total_count_at_start: 721,
+				},
+			],
+		),
+	},
+};
+
 export const SyncReleases: Story = {
 	args: {
 		detail: buildDetail(
@@ -436,11 +476,8 @@ export const SyncSubscriptions: Story = {
 			{
 				skipped: false,
 				skip_reason: null,
-				star: {
+				collect: {
 					total_users: 12,
-					succeeded_users: 11,
-					failed_users: 1,
-					total_repos: 340,
 				},
 				release: {
 					total_repos: 128,
@@ -467,12 +504,6 @@ export const SyncSubscriptions: Story = {
 			},
 			[
 				{ stage: "collect", total_users: 12 },
-				{
-					stage: "star_summary",
-					total_users: 12,
-					succeeded_users: 11,
-					failed_users: 1,
-				},
 				{ stage: "repo_collect", total_repos: 128 },
 				{
 					stage: "release_summary",
@@ -513,11 +544,8 @@ export const SyncSubscriptions: Story = {
 						log_available: true,
 						log_download_path:
 							"/api/admin/jobs/realtime/task-sync.subscriptions/log",
-						star: {
+						collect: {
 							total_users: 12,
-							succeeded_users: 11,
-							failed_users: 1,
-							total_repos: 340,
 						},
 						release: {
 							total_repos: 128,
@@ -619,11 +647,8 @@ export const SyncSubscriptionsSkipped: Story = {
 			{
 				skipped: true,
 				skip_reason: "previous_run_active",
-				star: {
+				collect: {
 					total_users: 0,
-					succeeded_users: 0,
-					failed_users: 0,
-					total_repos: 0,
 				},
 				release: {
 					total_repos: 0,
@@ -664,11 +689,8 @@ export const SyncSubscriptionsSkipped: Story = {
 						log_available: true,
 						log_download_path:
 							"/api/admin/jobs/realtime/task-sync.subscriptions/log",
-						star: {
+						collect: {
 							total_users: 0,
-							succeeded_users: 0,
-							failed_users: 0,
-							total_repos: 0,
 						},
 						release: {
 							total_repos: 0,

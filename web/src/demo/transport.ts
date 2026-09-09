@@ -354,6 +354,17 @@ function filterTasks(
 	items: AdminRealtimeTaskItem[],
 	searchParams: URLSearchParams,
 ) {
+	const userSyncTaskTypes = new Set([
+		"sync.starred.delta",
+		"sync.starred.reconcile",
+	]);
+	const scheduledTaskTypes = new Set([
+		"brief.daily_slot",
+		"sync.subscriptions",
+		"retry.recent_failures",
+		"webhook.push.audit",
+		...userSyncTaskTypes,
+	]);
 	const status = searchParams.get("status") ?? "all";
 	const taskType = searchParams.get("task_type");
 	const taskGroup = searchParams.get("task_group");
@@ -368,10 +379,17 @@ function filterTasks(
 		filtered = filtered.filter((item) => item.task_type === taskType);
 	}
 	if (taskGroup === "realtime") {
-		filtered = filtered.filter((item) => item.source !== "scheduler");
-	}
-	if (taskGroup === "scheduled") {
-		filtered = filtered.filter((item) => item.source === "scheduler");
+		filtered = filtered.filter(
+			(item) => !scheduledTaskTypes.has(item.task_type),
+		);
+	} else if (taskGroup === "scheduled") {
+		filtered = filtered.filter(
+			(item) =>
+				scheduledTaskTypes.has(item.task_type) &&
+				!userSyncTaskTypes.has(item.task_type),
+		);
+	} else if (taskGroup === "user_sync") {
+		filtered = filtered.filter((item) => userSyncTaskTypes.has(item.task_type));
 	}
 
 	const start = Math.max(0, (page - 1) * pageSize);
@@ -2391,6 +2409,13 @@ export const demoHandlers = [
 					sync_auto_fetch_interval_minutes:
 						payload.sync_auto_fetch_interval_minutes ??
 						model.adminJobs.syncRuntimeConfig.sync_auto_fetch_interval_minutes,
+					star_sync_delta_interval_minutes:
+						payload.star_sync_delta_interval_minutes ??
+						model.adminJobs.syncRuntimeConfig.star_sync_delta_interval_minutes,
+					star_sync_full_sweep_interval_minutes:
+						payload.star_sync_full_sweep_interval_minutes ??
+						model.adminJobs.syncRuntimeConfig
+							.star_sync_full_sweep_interval_minutes,
 					retry_recent_failures_interval_minutes:
 						payload.retry_recent_failures_interval_minutes ??
 						model.adminJobs.syncRuntimeConfig

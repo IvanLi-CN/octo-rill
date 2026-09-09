@@ -548,6 +548,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             sync::spawn_repo_release_recovery_worker(app_state.clone());
         jobs::spawn_hourly_scheduler(app_state.clone());
         jobs::spawn_subscription_scheduler(app_state.clone());
+        jobs::spawn_star_sync_scheduler(app_state.clone());
         jobs::spawn_recent_failures_retry_scheduler(app_state.clone());
         jobs::spawn_webhook_push_scheduler(app_state.clone());
         jobs::spawn_account_pause_scheduler(app_state.clone());

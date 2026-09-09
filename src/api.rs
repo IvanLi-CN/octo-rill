@@ -1574,6 +1574,9 @@ fn api_key_summary_from_row(
 pub struct SyncRuntimeConfigResponse {
     sync_auto_fetch_interval_minutes: i64,
     sync_auto_fetch_effective_at: Option<String>,
+    star_sync_delta_interval_minutes: i64,
+    star_sync_full_sweep_interval_minutes: i64,
+    star_sync: sync::StarSyncRuntimeStatus,
     retry_recent_failures_interval_minutes: i64,
     repo_release_worker_concurrency: usize,
     repo_refresh_system_budget_per_window: i64,
@@ -1585,6 +1588,8 @@ pub struct SyncRuntimeConfigResponse {
 #[derive(Debug, Deserialize)]
 pub struct SyncRuntimeConfigPatchRequest {
     sync_auto_fetch_interval_minutes: Option<i64>,
+    star_sync_delta_interval_minutes: Option<i64>,
+    star_sync_full_sweep_interval_minutes: Option<i64>,
     retry_recent_failures_interval_minutes: Option<i64>,
     repo_release_worker_concurrency: Option<i64>,
     repo_refresh_system_budget_per_window: Option<i64>,
@@ -1733,6 +1738,17 @@ async fn load_sync_runtime_config(state: &AppState) -> Result<SyncRuntimeConfigR
         admin_runtime::load_sync_auto_fetch_effective_at(&state.pool)
             .await
             .map_err(ApiError::internal)?;
+    let star_sync_delta_interval_minutes =
+        admin_runtime::load_star_sync_delta_interval_minutes(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    let star_sync_full_sweep_interval_minutes =
+        admin_runtime::load_star_sync_full_sweep_interval_minutes(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    let star_sync = sync::load_star_sync_runtime_status(state)
+        .await
+        .map_err(ApiError::internal)?;
     let repo_release_worker_concurrency =
         admin_runtime::load_repo_release_worker_concurrency(&state.pool)
             .await
@@ -1757,6 +1773,9 @@ async fn load_sync_runtime_config(state: &AppState) -> Result<SyncRuntimeConfigR
     Ok(SyncRuntimeConfigResponse {
         sync_auto_fetch_interval_minutes: interval,
         sync_auto_fetch_effective_at,
+        star_sync_delta_interval_minutes,
+        star_sync_full_sweep_interval_minutes,
+        star_sync,
         retry_recent_failures_interval_minutes,
         repo_release_worker_concurrency,
         repo_refresh_system_budget_per_window,
@@ -1836,6 +1855,20 @@ async fn persist_sync_runtime_config(
             "sync_auto_fetch_interval_minutes must be between 1 and 120",
         ));
     }
+    if let Some(interval) = req.star_sync_delta_interval_minutes
+        && !(1..=120).contains(&interval)
+    {
+        return Err(ApiError::bad_request(
+            "star_sync_delta_interval_minutes must be between 1 and 120",
+        ));
+    }
+    if let Some(interval) = req.star_sync_full_sweep_interval_minutes
+        && !(60..=10_080).contains(&interval)
+    {
+        return Err(ApiError::bad_request(
+            "star_sync_full_sweep_interval_minutes must be between 60 and 10080",
+        ));
+    }
     if let Some(interval) = req.retry_recent_failures_interval_minutes
         && !(1..=120).contains(&interval)
     {
@@ -1876,6 +1909,16 @@ async fn persist_sync_runtime_config(
 
     if let Some(interval) = req.sync_auto_fetch_interval_minutes {
         admin_runtime::update_sync_auto_fetch_interval_minutes(&state.pool, interval)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    if let Some(interval) = req.star_sync_delta_interval_minutes {
+        admin_runtime::update_star_sync_delta_interval_minutes(&state.pool, interval)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    if let Some(interval) = req.star_sync_full_sweep_interval_minutes {
+        admin_runtime::update_star_sync_full_sweep_interval_minutes(&state.pool, interval)
             .await
             .map_err(ApiError::internal)?;
     }
@@ -3906,6 +3949,10 @@ pub async fn admin_list_realtime_tasks(
         .iter()
         .map(|task| (*task).to_owned())
         .collect::<Vec<_>>();
+    let user_sync_tasks = [
+        jobs::TASK_SYNC_STARRED_DELTA.to_owned(),
+        jobs::TASK_SYNC_STARRED_RECONCILE.to_owned(),
+    ];
     let mut total_query =
         QueryBuilder::<sqlx::Sqlite>::new("SELECT COUNT(*) FROM job_tasks WHERE 1 = 1");
     append_admin_realtime_task_filters(
@@ -3915,6 +3962,7 @@ pub async fn admin_list_realtime_tasks(
         exclude_task_type.clone(),
         task_group.clone(),
         &scheduled_tasks,
+        &user_sync_tasks,
     );
     let total = total_query
         .build_query_scalar::<i64>()
@@ -3949,6 +3997,7 @@ pub async fn admin_list_realtime_tasks(
         exclude_task_type,
         task_group.clone(),
         &scheduled_tasks,
+        &user_sync_tasks,
     );
     items_query.push(" ORDER BY created_at DESC, id DESC LIMIT ");
     items_query.push_bind(page_size);
@@ -3966,7 +4015,11 @@ pub async fn admin_list_realtime_tasks(
     let mut items = items
         .into_iter()
         .filter(|item| match task_group.as_str() {
-            "scheduled" => jobs::is_scheduled_task_type(&item.task_type),
+            "scheduled" => {
+                jobs::is_scheduled_task_type(&item.task_type)
+                    && !user_sync_tasks.contains(&item.task_type)
+            }
+            "user_sync" => user_sync_tasks.contains(&item.task_type),
             "realtime" => !jobs::is_scheduled_task_type(&item.task_type),
             _ => true,
         })
@@ -3988,6 +4041,7 @@ fn append_admin_realtime_task_filters<'a>(
     exclude_task_type: String,
     task_group: String,
     scheduled_tasks: &'a [String],
+    user_sync_tasks: &'a [String],
 ) {
     if status != "all" {
         query.push(" AND status = ");
@@ -4006,6 +4060,20 @@ fn append_admin_realtime_task_filters<'a>(
             query.push(" AND task_type IN (");
             let mut separated = query.separated(", ");
             for task in scheduled_tasks {
+                separated.push_bind(task);
+            }
+            separated.push_unseparated(")");
+            query.push(" AND task_type NOT IN (");
+            let mut separated = query.separated(", ");
+            for task in user_sync_tasks {
+                separated.push_bind(task);
+            }
+            separated.push_unseparated(")");
+        }
+        "user_sync" => {
+            query.push(" AND task_type IN (");
+            let mut separated = query.separated(", ");
+            for task in user_sync_tasks {
                 separated.push_bind(task);
             }
             separated.push_unseparated(")");
@@ -4074,8 +4142,6 @@ async fn load_subscription_diagnostic_progress_events(
           AND json_valid(payload_json)
           AND json_extract(payload_json, '$.stage') IN (
             'collect',
-            'star_progress',
-            'star_summary',
             'repo_collect',
             'release_attached',
             'release_progress',
@@ -4122,8 +4188,6 @@ async fn load_subscription_diagnostic_progress_events_for_tasks(
           AND json_valid(payload_json)
           AND json_extract(payload_json, '$.stage') IN (
             'collect',
-            'star_progress',
-            'star_summary',
             'repo_collect',
             'release_attached',
             'release_progress',
@@ -4411,11 +4475,8 @@ pub struct AdminRetryRecentFailuresDiagnostics {
 }
 
 #[derive(Debug, Serialize)]
-pub struct AdminSyncSubscriptionStarDiagnostics {
+pub struct AdminSyncSubscriptionCollectDiagnostics {
     total_users: i64,
-    succeeded_users: i64,
-    failed_users: i64,
-    total_repos: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -4562,7 +4623,7 @@ pub struct AdminSyncSubscriptionsDiagnostics {
     skip_reason: Option<String>,
     log_available: bool,
     log_download_path: Option<String>,
-    star: AdminSyncSubscriptionStarDiagnostics,
+    collect: AdminSyncSubscriptionCollectDiagnostics,
     release: AdminSyncSubscriptionReleaseDiagnostics,
     governance: Option<AdminSyncSubscriptionGovernanceDiagnostics>,
     social: AdminSyncSubscriptionSocialDiagnostics,
@@ -5754,7 +5815,8 @@ fn build_sync_subscriptions_diagnostics(
         .and_then(serde_json::Value::as_object);
     let result_value = parse_json_value(task.result_json.as_deref());
     let result_object = result_value.as_ref().and_then(serde_json::Value::as_object);
-    let star_object = json_object_get_object(result_object, "star");
+    let collect_object = json_object_get_object(result_object, "collect");
+    let legacy_star_object = json_object_get_object(result_object, "star");
     let release_object = json_object_get_object(result_object, "release");
     let governance_object = json_object_get_object(result_object, "governance");
     let social_object = json_object_get_object(result_object, "social");
@@ -5764,11 +5826,10 @@ fn build_sync_subscriptions_diagnostics(
     let skip_reason = json_object_get_string(result_object, "skip_reason");
     let trigger = json_object_get_string(payload_object, "trigger");
     let schedule_key = json_object_get_string(payload_object, "schedule_key");
-    let mut star = AdminSyncSubscriptionStarDiagnostics {
-        total_users: json_object_get_i64(star_object, "total_users").unwrap_or(0),
-        succeeded_users: json_object_get_i64(star_object, "succeeded_users").unwrap_or(0),
-        failed_users: json_object_get_i64(star_object, "failed_users").unwrap_or(0),
-        total_repos: json_object_get_i64(star_object, "total_repos").unwrap_or(0),
+    let mut collect = AdminSyncSubscriptionCollectDiagnostics {
+        total_users: json_object_get_i64(collect_object, "total_users")
+            .or_else(|| json_object_get_i64(legacy_star_object, "total_users"))
+            .unwrap_or(0),
     };
     let mut release = AdminSyncSubscriptionReleaseDiagnostics {
         total_repos: json_object_get_i64(release_object, "total_repos").unwrap_or(0),
@@ -5807,12 +5868,12 @@ fn build_sync_subscriptions_diagnostics(
     apply_sync_subscription_progress_events(
         events,
         result_object.is_none(),
-        star_object.is_none(),
+        collect_object.is_none(),
         release_object.is_none(),
         social_object.is_none(),
         notifications_object.is_none(),
         json_object_get_i64(result_object, "releases_written").is_none(),
-        &mut star,
+        &mut collect,
         &mut release,
         &mut social,
         &mut notifications,
@@ -5820,7 +5881,6 @@ fn build_sync_subscriptions_diagnostics(
     );
     let log_available = realtime_task_log_available(task);
     let log_download_path = log_available.then(|| realtime_task_log_download_path(&task.id));
-    let star_pending = (star.total_users - star.succeeded_users - star.failed_users).max(0);
     let release_pending =
         (release.total_repos - release.succeeded_repos - release.failed_repos).max(0);
     let social_pending = (social.total_users - social.succeeded_users - social.failed_users).max(0);
@@ -5852,25 +5912,21 @@ fn build_sync_subscriptions_diagnostics(
         business_outcome("partial", "已取消", "任务在执行中被取消，结果可能不完整。")
     } else if task.status == jobs::STATUS_QUEUED || task.status == jobs::STATUS_RUNNING {
         business_outcome("unknown", "处理中", "任务正在执行中，结果尚未稳定。")
-    } else if star.total_users == 0 {
+    } else if collect.total_users == 0
+        && release.total_repos == 0
+        && social.total_users == 0
+        && notifications.total_users == 0
+    {
         business_outcome("ok", "无需执行", "当前没有可同步的启用用户。")
-    } else if star.succeeded_users == 0 && star.failed_users > 0 {
-        business_outcome(
-            "failed",
-            "业务失败",
-            "Star 阶段全部失败，未进入仓库抓取阶段。",
-        )
     } else if release.total_repos > 0 && release.succeeded_repos == 0 && release.failed_repos > 0 {
         business_outcome(
             "failed",
             "业务失败",
             "Release 阶段全部失败，未能写入任何仓库结果。",
         )
-    } else if star.failed_users > 0
-        || release.failed_repos > 0
+    } else if release.failed_repos > 0
         || social.failed_users > 0
         || notifications.failed_users > 0
-        || star_pending > 0
         || release_pending > 0
         || social_pending > 0
         || notifications_pending > 0
@@ -5882,11 +5938,7 @@ fn build_sync_subscriptions_diagnostics(
             "任务已结束，但仍存在失败、剩余工作项或关键告警，请查看阶段摘要与最近关键事件。",
         )
     } else if release.total_repos == 0 {
-        business_outcome(
-            "ok",
-            "业务成功",
-            "Star 阶段已完成，本轮没有需要抓取 Release 的仓库。",
-        )
+        business_outcome("ok", "业务成功", "本轮没有需要抓取 Release 的仓库。")
     } else {
         business_outcome("ok", "业务成功", "订阅同步任务已完成。")
     };
@@ -5900,7 +5952,7 @@ fn build_sync_subscriptions_diagnostics(
             skip_reason,
             log_available,
             log_download_path,
-            star,
+            collect,
             release,
             governance,
             social,
@@ -5916,12 +5968,12 @@ fn build_sync_subscriptions_diagnostics(
 fn apply_sync_subscription_progress_events(
     events: &[AdminTaskEventItem],
     fill_all: bool,
-    fill_star: bool,
+    fill_collect: bool,
     fill_release: bool,
     fill_social: bool,
     fill_notifications: bool,
     fill_releases_written: bool,
-    star: &mut AdminSyncSubscriptionStarDiagnostics,
+    collect: &mut AdminSyncSubscriptionCollectDiagnostics,
     release: &mut AdminSyncSubscriptionReleaseDiagnostics,
     social: &mut AdminSyncSubscriptionSocialDiagnostics,
     notifications: &mut AdminSyncSubscriptionNotificationsDiagnostics,
@@ -5941,34 +5993,10 @@ fn apply_sync_subscription_progress_events(
 
         match stage.as_str() {
             "collect" => {
-                if (fill_all || fill_star)
+                if (fill_all || fill_collect)
                     && let Some(total_users) = json_object_get_i64(payload_object, "total_users")
                 {
-                    star.total_users = total_users;
-                }
-            }
-            "star_progress" => {
-                if fill_all || fill_star {
-                    star.total_users = json_object_get_i64(payload_object, "total_users")
-                        .unwrap_or(star.total_users);
-                    star.succeeded_users = json_object_get_i64(payload_object, "succeeded_users")
-                        .unwrap_or(star.succeeded_users);
-                    star.failed_users = json_object_get_i64(payload_object, "failed_users")
-                        .unwrap_or(star.failed_users);
-                    star.total_repos = json_object_get_i64(payload_object, "total_repos")
-                        .unwrap_or(star.total_repos);
-                }
-            }
-            "star_summary" => {
-                if fill_all || fill_star {
-                    star.total_users = json_object_get_i64(payload_object, "total_users")
-                        .unwrap_or(star.total_users);
-                    star.succeeded_users = json_object_get_i64(payload_object, "succeeded_users")
-                        .unwrap_or(star.succeeded_users);
-                    star.failed_users = json_object_get_i64(payload_object, "failed_users")
-                        .unwrap_or(star.failed_users);
-                    star.total_repos = json_object_get_i64(payload_object, "total_repos")
-                        .unwrap_or(star.total_repos);
+                    collect.total_users = total_users;
                 }
             }
             "repo_collect" => {
@@ -13254,6 +13282,70 @@ pub(crate) async fn clear_user_repo_association_source_tx(
     .bind(user_id)
     .execute(&mut **tx)
     .await?;
+
+    Ok(())
+}
+
+pub(crate) async fn clear_user_repo_association_source_for_repo_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    user_id: &str,
+    source: UserRepoAssociationSource,
+    repo_id: i64,
+    repo_full_name: &str,
+    now: &str,
+) -> Result<(), sqlx::Error> {
+    let column = match source {
+        UserRepoAssociationSource::PersonalOwned => "has_personal_owned_source",
+        UserRepoAssociationSource::GitHubStar => "has_github_star_source",
+        UserRepoAssociationSource::ManualFeed => "has_manual_feed_source",
+    };
+    let matching = "user_id = ? AND (repo_id = ? OR repo_full_name_lower = lower(?))";
+    let sql =
+        format!("UPDATE user_repo_associations SET {column} = 0, updated_at = ? WHERE {matching}");
+    sqlx::query(sql.as_str())
+        .bind(now)
+        .bind(user_id)
+        .bind(repo_id)
+        .bind(repo_full_name)
+        .execute(&mut **tx)
+        .await?;
+
+    let sql = format!(
+        r#"
+        UPDATE user_repo_associations
+        SET is_following = CASE
+              WHEN has_personal_owned_source != 0 OR has_github_star_source != 0 THEN 1
+              ELSE 0
+            END,
+            updated_at = ?
+        WHERE {matching}
+          AND follow_state_source = 'system_default'
+        "#
+    );
+    sqlx::query(sql.as_str())
+        .bind(now)
+        .bind(user_id)
+        .bind(repo_id)
+        .bind(repo_full_name)
+        .execute(&mut **tx)
+        .await?;
+
+    let sql = format!(
+        r#"
+        DELETE FROM user_repo_associations
+        WHERE {matching}
+          AND has_personal_owned_source = 0
+          AND has_github_star_source = 0
+          AND has_manual_feed_source = 0
+          AND is_following = 0
+        "#
+    );
+    sqlx::query(sql.as_str())
+        .bind(user_id)
+        .bind(repo_id)
+        .bind(repo_full_name)
+        .execute(&mut **tx)
+        .await?;
 
     Ok(())
 }
@@ -26552,6 +26644,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_list_realtime_tasks_separates_user_sync_from_general_schedules() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+
+        let created_at = "2026-03-06T14:30:00Z";
+        seed_admin_dashboard_task(
+            &pool,
+            "task-starred-delta",
+            jobs::TASK_SYNC_STARRED_DELTA,
+            jobs::STATUS_SUCCEEDED,
+            test_user_id(1).as_str(),
+            created_at,
+        )
+        .await;
+        seed_admin_dashboard_task(
+            &pool,
+            "task-starred-reconcile",
+            jobs::TASK_SYNC_STARRED_RECONCILE,
+            jobs::STATUS_RUNNING,
+            test_user_id(1).as_str(),
+            "2026-03-06T14:31:00Z",
+        )
+        .await;
+        seed_admin_dashboard_task(
+            &pool,
+            "task-general-schedule",
+            jobs::TASK_BRIEF_DAILY_SLOT,
+            jobs::STATUS_SUCCEEDED,
+            test_user_id(1).as_str(),
+            "2026-03-06T14:32:00Z",
+        )
+        .await;
+
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+        let user_sync = admin_list_realtime_tasks(
+            State(state.clone()),
+            session,
+            Query(AdminRealtimeTasksQuery {
+                status: Some("all".to_owned()),
+                task_type: None,
+                exclude_task_type: None,
+                task_group: Some("user_sync".to_owned()),
+                page: Some(1),
+                page_size: Some(20),
+            }),
+        )
+        .await
+        .expect("user sync task list should succeed")
+        .0;
+
+        assert_eq!(user_sync.total, 2);
+        assert_eq!(user_sync.items.len(), 2);
+        assert!(user_sync.items.iter().all(|item| {
+            matches!(
+                item.task_type.as_str(),
+                jobs::TASK_SYNC_STARRED_DELTA | jobs::TASK_SYNC_STARRED_RECONCILE
+            )
+        }));
+
+        let scheduled = admin_list_realtime_tasks(
+            State(state),
+            setup_session(1).await,
+            Query(AdminRealtimeTasksQuery {
+                status: Some("all".to_owned()),
+                task_type: None,
+                exclude_task_type: None,
+                task_group: Some("scheduled".to_owned()),
+                page: Some(1),
+                page_size: Some(20),
+            }),
+        )
+        .await
+        .expect("scheduled task list should succeed")
+        .0;
+
+        assert_eq!(scheduled.total, 1);
+        assert_eq!(scheduled.items[0].id, "task-general-schedule");
+    }
+
+    #[tokio::test]
     async fn refresh_admin_dashboard_rollups_backfills_recent_rows() {
         let pool = setup_pool().await;
         sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
@@ -29334,6 +29511,24 @@ mod tests {
     }
 
     #[test]
+    fn task_diagnostics_sync_subscriptions_retry_is_not_reported_as_empty() {
+        let task = test_task_detail_item(
+            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            jobs::STATUS_SUCCEEDED,
+            r#"{"trigger":"retry"}"#,
+            Some(
+                r#"{"skipped":false,"collect":{"total_users":0},"release":{"total_repos":1,"succeeded_repos":1,"failed_repos":0,"candidate_failures":0},"social":{"total_users":0,"succeeded_users":0,"failed_users":0,"repo_stars":0,"followers":0,"events":0},"notifications":{"total_users":0,"succeeded_users":0,"failed_users":0,"notifications":0},"releases_written":1,"critical_events":0}"#,
+            ),
+            None,
+        );
+
+        let diagnostics = build_task_diagnostics(&task, &[], &[]).expect("diagnostics");
+
+        assert_eq!(diagnostics.business_outcome.code, "ok");
+        assert_eq!(diagnostics.business_outcome.label, "业务成功");
+    }
+
+    #[test]
     fn task_diagnostics_sync_subscriptions_running_uses_progress_events() {
         let task = test_task_detail_item(
             jobs::TASK_SYNC_SUBSCRIPTIONS,
@@ -29376,9 +29571,7 @@ mod tests {
             sync_diag.schedule_key.as_deref(),
             Some("interval:10:1777954200")
         );
-        assert_eq!(sync_diag.star.total_users, 13);
-        assert_eq!(sync_diag.star.succeeded_users, 13);
-        assert_eq!(sync_diag.star.total_repos, 13801);
+        assert_eq!(sync_diag.collect.total_users, 13);
         assert_eq!(sync_diag.release.total_repos, 12255);
         assert_eq!(sync_diag.release.succeeded_repos, 4482);
         assert_eq!(sync_diag.release.failed_repos, 7773);
@@ -29555,7 +29748,7 @@ mod tests {
             sync_diag.log_download_path.as_deref(),
             Some("/api/admin/jobs/realtime/task-test/log")
         );
-        assert_eq!(sync_diag.star.succeeded_users, 10);
+        assert_eq!(sync_diag.collect.total_users, 12);
         assert_eq!(sync_diag.release.failed_repos, 1);
         assert_eq!(sync_diag.social.failed_users, 1);
         assert_eq!(sync_diag.notifications.failed_users, 2);
@@ -30359,7 +30552,7 @@ mod tests {
         let early_events = [
             (
                 "3333333333333331",
-                r#"{"stage":"star_summary","total_users":12,"succeeded_users":11,"failed_users":1,"total_repos":340}"#,
+                r#"{"stage":"collect","total_users":12}"#,
                 "2026-03-06T14:30:01Z",
             ),
             (
@@ -30422,8 +30615,7 @@ mod tests {
             .expect("diagnostics")
             .sync_subscriptions
             .expect("sync diagnostics");
-        assert_eq!(sync.star.total_users, 12);
-        assert_eq!(sync.star.succeeded_users, 11);
+        assert_eq!(sync.collect.total_users, 12);
         assert_eq!(sync.release.total_repos, 128);
         assert_eq!(sync.release.succeeded_repos, 0);
     }
@@ -36281,6 +36473,8 @@ echo should_not_be_in_excerpt
             state.as_ref(),
             super::SyncRuntimeConfigPatchRequest {
                 sync_auto_fetch_interval_minutes: Some(10),
+                star_sync_delta_interval_minutes: Some(30),
+                star_sync_full_sweep_interval_minutes: Some(1440),
                 retry_recent_failures_interval_minutes: Some(15),
                 repo_release_worker_concurrency: Some(12),
                 repo_refresh_system_budget_per_window: None,
@@ -36293,14 +36487,23 @@ echo should_not_be_in_excerpt
 
         assert_eq!(settings.sync_auto_fetch_interval_minutes, 10);
         assert!(settings.sync_auto_fetch_effective_at.is_some());
+        assert_eq!(settings.star_sync_delta_interval_minutes, 30);
+        assert_eq!(settings.star_sync_full_sweep_interval_minutes, 1440);
         assert_eq!(settings.retry_recent_failures_interval_minutes, 15);
         assert_eq!(settings.repo_release_worker_concurrency, 12);
         assert_eq!(settings.dashboard_release_freshness_profile, "capacity");
         assert_eq!(settings.daily_brief_schedule_local_time, "07:00");
 
-        let row = sqlx::query_as::<_, (i64, i64, i64, String, String)>(
+        let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, String, String)>(
             r#"
-            SELECT sync_auto_fetch_interval_minutes, retry_recent_failures_interval_minutes, repo_release_worker_concurrency, dashboard_release_freshness_profile, daily_brief_schedule_local_time
+            SELECT
+              sync_auto_fetch_interval_minutes,
+              star_sync_delta_interval_minutes,
+              star_sync_full_sweep_interval_minutes,
+              retry_recent_failures_interval_minutes,
+              repo_release_worker_concurrency,
+              dashboard_release_freshness_profile,
+              daily_brief_schedule_local_time
             FROM admin_runtime_settings
             WHERE id = 1
             "#,
@@ -36310,10 +36513,12 @@ echo should_not_be_in_excerpt
         .expect("load sync runtime config");
 
         assert_eq!(row.0, 10);
-        assert_eq!(row.1, 15);
-        assert_eq!(row.2, 12);
-        assert_eq!(row.3, "capacity");
-        assert_eq!(row.4, "07:00");
+        assert_eq!(row.1, 30);
+        assert_eq!(row.2, 1440);
+        assert_eq!(row.3, 15);
+        assert_eq!(row.4, 12);
+        assert_eq!(row.5, "capacity");
+        assert_eq!(row.6, "07:00");
     }
 
     #[tokio::test]
@@ -36325,6 +36530,8 @@ echo should_not_be_in_excerpt
             state.as_ref(),
             super::SyncRuntimeConfigPatchRequest {
                 sync_auto_fetch_interval_minutes: Some(30),
+                star_sync_delta_interval_minutes: None,
+                star_sync_full_sweep_interval_minutes: None,
                 retry_recent_failures_interval_minutes: None,
                 repo_release_worker_concurrency: None,
                 repo_refresh_system_budget_per_window: None,
@@ -36340,6 +36547,8 @@ echo should_not_be_in_excerpt
             state.as_ref(),
             super::SyncRuntimeConfigPatchRequest {
                 sync_auto_fetch_interval_minutes: None,
+                star_sync_delta_interval_minutes: None,
+                star_sync_full_sweep_interval_minutes: None,
                 retry_recent_failures_interval_minutes: Some(15),
                 repo_release_worker_concurrency: None,
                 repo_refresh_system_budget_per_window: None,
@@ -36364,6 +36573,8 @@ echo should_not_be_in_excerpt
             state.as_ref(),
             super::SyncRuntimeConfigPatchRequest {
                 sync_auto_fetch_interval_minutes: Some(10),
+                star_sync_delta_interval_minutes: None,
+                star_sync_full_sweep_interval_minutes: None,
                 retry_recent_failures_interval_minutes: None,
                 repo_release_worker_concurrency: None,
                 repo_refresh_system_budget_per_window: None,
@@ -36391,6 +36602,8 @@ echo should_not_be_in_excerpt
                 state.as_ref(),
                 super::SyncRuntimeConfigPatchRequest {
                     sync_auto_fetch_interval_minutes: Some(interval),
+                    star_sync_delta_interval_minutes: None,
+                    star_sync_full_sweep_interval_minutes: None,
                     retry_recent_failures_interval_minutes: None,
                     repo_release_worker_concurrency: None,
                     repo_refresh_system_budget_per_window: None,
@@ -36418,6 +36631,8 @@ echo should_not_be_in_excerpt
             state.as_ref(),
             super::SyncRuntimeConfigPatchRequest {
                 sync_auto_fetch_interval_minutes: Some(10),
+                star_sync_delta_interval_minutes: None,
+                star_sync_full_sweep_interval_minutes: None,
                 retry_recent_failures_interval_minutes: Some(0),
                 repo_release_worker_concurrency: None,
                 repo_refresh_system_budget_per_window: None,
@@ -36444,6 +36659,8 @@ echo should_not_be_in_excerpt
             state.as_ref(),
             super::SyncRuntimeConfigPatchRequest {
                 sync_auto_fetch_interval_minutes: Some(10),
+                star_sync_delta_interval_minutes: None,
+                star_sync_full_sweep_interval_minutes: None,
                 retry_recent_failures_interval_minutes: None,
                 repo_release_worker_concurrency: Some(33),
                 repo_refresh_system_budget_per_window: None,
