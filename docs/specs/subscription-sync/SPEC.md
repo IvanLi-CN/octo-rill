@@ -132,12 +132,12 @@
   - Release worker 数量。
   - Star delta interval 与 full-sweep completion target；这两项仅控制独立 Star Sync Coordinator，详情见 [star-sync-reconciliation](../star-sync-reconciliation/SPEC.md)。
 - 详情按工作流阶段展示：
-  - collect；
   - repo collect；
   - Release queue；
   - social；
   - Inbox；
   - translation / smart preheat child tasks。
+- 本轮适用用户数量作为任务元信息展示，不作为独立处理阶段；`collect` 事件仍保留在执行时间线中用于诊断。
 - 每个阶段至少展示整体状态、完成/总量、最近关键事件；Release 阶段还应展示 worker 目标并发、成功/失败 repo、candidate failures 与超时/退避线索。
 - 当 `sync.subscriptions` 的业务结果为 `skipped=true` 时，详情页展示状态为“已跳过”；各阶段展示“已跳过/未执行”语义和跳过原因，不把 0/0 误判为“等待”。
 - 运行中的 `sync.subscriptions` 任务在 `result_json` 尚未写入前，详情 API 必须从当前任务的 `task.progress` 事件派生 `diagnostics.sync_subscriptions`，让阶段总览实时展示已经完成的 repo collect、Release queue、social 和 Inbox 摘要。
@@ -357,7 +357,7 @@ sensitive_exclusion=N/A
 submission_gate=approved  
 story_id_or_title=Admin/Task Type Detail/SyncSubscriptions  
 state=scheduler-social-and-inbox-summary  
-evidence_note=验证 Admin Jobs 的 sync.subscriptions 详情页已展示 Star、Release、Social、Inbox 四阶段摘要与最近关键事件。
+evidence_note=验证 Admin Jobs 的 sync.subscriptions 详情页已展示 Repo Collect、Release、Social、Inbox 四阶段摘要与最近关键事件。
 
 ![Admin sync subscriptions detail](./assets/admin-sync-subscriptions-detail.png)
 
@@ -383,7 +383,7 @@ sensitive_exclusion=N/A
 submission_gate=approved
 story_id_or_title=ui_demo: ./demo/admin/jobs?demo=admin-jobs-running/Subscription Sync Detail
 state=subscription-sync-detail
-evidence_note=验证订阅同步独立详情页可见 Star、Release、Social、Inbox 阶段摘要、失败主因、最近关键事件与子任务链路。
+evidence_note=验证订阅同步独立详情页可见 Repo Collect、Release、Social、Inbox 阶段摘要、失败主因、最近关键事件与子任务链路。
 
 ![Subscription sync detail](./assets/subscription-sync-detail.png)
 
@@ -396,7 +396,7 @@ sensitive_exclusion=N/A
 story_id_or_title=ui_demo: ./demo/admin/jobs?demo=admin-jobs-running/Subscription Sync Detail Running
 state=subscription-sync-detail-running
 submission_gate=approved
-evidence_note=验证运行中的订阅同步详情页按真实工作流推进：Collect、Star、Repo Collect 已完成，Release Queue 正在处理，Social 与 Notifications 等待上游阶段结束。
+evidence_note=验证运行中的订阅同步详情页按真实工作流推进：Repo Collect 已完成，Release Queue 正在处理，Social 与 Notifications 等待上游阶段结束；适用用户数作为元信息展示。
 
 ![Subscription sync detail running](./assets/admin-sync-subscriptions-detail-running.png)
 

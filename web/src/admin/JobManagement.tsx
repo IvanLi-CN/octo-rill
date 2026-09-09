@@ -3751,20 +3751,7 @@ function subscriptionRecentEventSummary(
 function buildSubscriptionWorkflowStages(
 	diagnostics: AdminSyncSubscriptionsDiagnostics | null | undefined,
 ): SubscriptionWorkflowStage[] {
-	if (!diagnostics) {
-		return [
-			{
-				id: "collect",
-				label: "Collect",
-				description: "加载任务参数、调度键与目标用户。",
-				total: 0,
-				succeeded: 0,
-				done: 0,
-				failed: 0,
-				meta: [["状态", "等待诊断数据"]],
-			},
-		];
-	}
+	if (!diagnostics) return [];
 
 	const skipReason =
 		diagnostics.skip_reason === "previous_run_active"
@@ -3788,15 +3775,6 @@ function buildSubscriptionWorkflowStages(
 			meta: [["跳过原因", skipReason], ...meta],
 		});
 		return [
-			skippedStage(
-				"collect",
-				"Collect",
-				"调度器检测到上一轮仍在执行，本轮仅记录跳过结果。",
-				[
-					["触发", diagnostics.trigger ?? "-"],
-					["调度键", diagnostics.schedule_key ?? "-"],
-				],
-			),
 			skippedStage("repo", "Repo Collect", "本轮未聚合可见仓库。"),
 			skippedStage("release", "Release Queue", "本轮未派发 release workers。"),
 			skippedStage("social", "Social", "本轮未同步社交事件。"),
@@ -3817,23 +3795,6 @@ function buildSubscriptionWorkflowStages(
 		diagnostics.notifications.failed_users;
 
 	return [
-		{
-			id: "collect",
-			label: "Collect",
-			description: "确定触发来源、调度窗口与本轮工作集。",
-			total: diagnostics.collect.total_users,
-			succeeded: diagnostics.collect.total_users,
-			done: diagnostics.collect.total_users,
-			failed: 0,
-			meta: [
-				["触发", diagnostics.trigger ?? "-"],
-				["调度键", diagnostics.schedule_key ?? "-"],
-				[
-					"跳过",
-					diagnostics.skipped ? (diagnostics.skip_reason ?? "是") : "否",
-				],
-			],
-		},
 		{
 			id: "repo",
 			label: "Repo Collect",
@@ -4059,7 +4020,17 @@ function SubscriptionWorkflowDetailPage(props: {
 
 			<Card>
 				<CardHeader>
-					<CardTitle>阶段总览</CardTitle>
+					<div className="flex flex-wrap items-center justify-between gap-2">
+						<CardTitle>阶段总览</CardTitle>
+						{diagnostics ? (
+							<span
+								className="text-muted-foreground text-xs"
+								data-testid="subscription-detail-user-scope"
+							>
+								适用用户 {formatCount(diagnostics.collect.total_users)}
+							</span>
+						) : null}
+					</div>
 				</CardHeader>
 				<CardContent className="space-y-3">
 					{stages.map((stage, index) => {
@@ -7216,7 +7187,7 @@ export function JobManagement({
 													>
 														<div className="grid gap-1 sm:gap-1.5">
 															<div className="flex items-start justify-between gap-2 border-b pb-1.5 sm:gap-3 sm:pb-2">
-																<div className="flex min-w-0 items-center gap-2">
+																<div className="flex min-w-0 flex-wrap items-center gap-2">
 																	<p className="shrink-0 font-medium text-[13px] sm:text-sm">
 																		订阅同步工作流
 																	</p>
@@ -7229,6 +7200,17 @@ export function JobManagement({
 																	<span className="hidden rounded-md border bg-background px-1.5 py-0.5 font-mono text-[11px] sm:inline">
 																		{sourceLabel(task.source)}
 																	</span>
+																	{diagnostics ? (
+																		<span
+																			className="text-[11px] text-muted-foreground"
+																			data-testid="subscription-workflow-user-scope"
+																		>
+																			用户范围{" "}
+																			{formatCount(
+																				diagnostics.collect.total_users,
+																			)}
+																		</span>
+																	) : null}
 																</div>
 																<div className="min-w-0 shrink text-right">
 																	<p
@@ -7263,8 +7245,14 @@ export function JobManagement({
 															{diagnostics ? (
 																<div className="overflow-x-auto">
 																	<div
-																		className="grid grid-cols-3 gap-px bg-border/70 text-[10px] sm:min-w-[672px] sm:grid-cols-6 sm:text-[11px]"
+																		className="grid grid-cols-4 gap-px bg-border/70 text-[10px] sm:min-w-[672px] sm:grid-cols-[repeat(var(--subscription-stage-columns),minmax(0,1fr))] sm:text-[11px]"
 																		data-testid="subscription-workflow-stage-grid"
+																		style={
+																			{
+																				"--subscription-stage-columns":
+																					stages.length,
+																			} as React.CSSProperties
+																		}
 																	>
 																		{stages.map((stage) => {
 																			const pending =
