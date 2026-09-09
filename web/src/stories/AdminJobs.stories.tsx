@@ -2991,7 +2991,7 @@ export const SubscriptionSyncWorkflow: Story = {
 			expect(card.getBoundingClientRect().height <= 200).toBe(true);
 			const stagePanel = Array.from(card.querySelectorAll("div")).find(
 				(element) =>
-					element.textContent?.includes("Collect") &&
+					element.textContent?.includes("Repo Collect") &&
 					element.textContent?.includes("Inbox"),
 			);
 			expect(stagePanel).toBeTruthy();
@@ -2999,6 +2999,14 @@ export const SubscriptionSyncWorkflow: Story = {
 				'[data-testid="subscription-workflow-stage-grid"]',
 			);
 			expect(stageGrid).toBeTruthy();
+			if (stageGrid) {
+				expect(stageGrid.children).toHaveLength(4);
+				expect(
+					Array.from(stageGrid.children).some((element) =>
+						element.textContent?.trim().startsWith("Collect"),
+					),
+				).toBe(false);
+			}
 			const issueSummary = Array.from(card.querySelectorAll("p")).find(
 				(element) => element.textContent?.includes("异常焦点"),
 			);
@@ -3017,6 +3025,18 @@ export const SubscriptionSyncWorkflow: Story = {
 				expect(stageGridStyle.borderLeftWidth).toBe("0px");
 				expect(stageGridStyle.borderRightWidth).toBe("0px");
 				expect(stageGridStyle.borderRadius).toBe("0px");
+				if (storyWindow.innerWidth >= 640) {
+					const desktopColumnCount = stageGridStyle.gridTemplateColumns
+						.trim()
+						.split(/\s+/).length;
+					expect(desktopColumnCount).toBe(stageGrid.children.length);
+				}
+				if (storyWindow.innerWidth < 640) {
+					const mobileColumnCount = stageGridStyle.gridTemplateColumns
+						.trim()
+						.split(/\s+/).length;
+					expect(mobileColumnCount).toBe(4);
+				}
 			}
 			if (storyWindow && storyWindow.innerWidth < 640) {
 				const style = storyWindow.getComputedStyle(card);
@@ -3229,7 +3249,7 @@ export const SubscriptionSyncDetailRunning: Story = {
 		docs: {
 			description: {
 				story:
-					"运行中的订阅同步详情页：Collect 与 Repo Collect 已完成，Release Queue 正在处理，Social 与 Notifications 等待上游阶段结束。",
+					"运行中的订阅同步详情页：Repo Collect 已完成，Release Queue 正在处理，Social 与 Notifications 等待上游阶段结束。",
 			},
 		},
 	},

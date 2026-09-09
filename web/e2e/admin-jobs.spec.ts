@@ -4266,13 +4266,13 @@ test("skipped subscription workflow renders skipped semantics", async ({
 	).toBeVisible();
 	await expect(
 		page.locator("[data-slot='badge']").getByText("已跳过"),
-	).toHaveCount(6);
+	).toHaveCount(5);
 	await expect(page.getByText("业务结果")).toBeVisible();
 	await expect(
 		page.getByText("上一轮订阅同步仍在执行，本轮仅记录跳过结果。"),
 	).toBeVisible();
 	await expect(
-		page.locator("#subscription-stage-collect").getByText("上一轮仍在执行", {
+		page.locator("#subscription-stage-repo").getByText("上一轮仍在执行", {
 			exact: true,
 		}),
 	).toBeVisible();
