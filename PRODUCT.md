@@ -1,8 +1,10 @@
 # Product
 
-## Register
+<!-- impeccable:product-schema 1 -->
 
-product
+## Platform
+
+web
 
 ## Users
 
@@ -18,19 +20,30 @@ OctoRill is a personal GitHub activity workspace. It does not replace GitHub. It
 
 Success means the user can quickly understand the current window of activity, read release content in the most useful lane, review a stable daily brief, notice direct social feedback, and jump to GitHub only when the original workflow belongs there.
 
-## Brand Personality
+## Positioning
+
+OctoRill is a personal reading workspace for the GitHub activity that matters to one user. It improves continuity across releases, social feedback, daily briefs, and Inbox context while leaving GitHub as the source of truth and destination for workflows it owns.
+
+## Operating Context
+
+The primary loop is a repeated Dashboard reading session: a user scans the current activity window, changes between reading lanes, checks a daily brief, and follows an original GitHub link when deeper context or action is needed. Admins separately operate synchronization, translation, scheduling, LLM runtime, and user-management health.
+
+## Capabilities and Constraints
+
+The product collects release activity, direct social feedback, daily summaries, and GitHub Inbox context. It supports translation and polished reading lanes but does not become a full GitHub client or take over GitHub-native workflows. Product UI is Chinese-first; detailed behavior, permissions, and data semantics remain in `docs/product.md`.
+
+## Brand Commitments
 
 Precise, calm, and companionable.
 
 The interface should feel like a focused reading instrument with enough warmth to make recurring personal use pleasant. It should be technically credible, restrained under load, and clear about what it does not own.
 
-## Anti-references
+## Evidence on Hand
 
-OctoRill should not look or behave like a full GitHub clone, a generic AI news dashboard, a metrics-first admin console, or a noisy social feed.
+- `docs/product.md` is the internal reference for product semantics and implementation boundaries.
+- `web/src/` and the existing Storybook stories provide implemented UI examples for the reading and operational surfaces.
 
-Avoid designs that make releases feel like disposable notifications, bury original GitHub context, over-celebrate AI output, or turn operational tools into the main product story.
-
-## Design Principles
+## Product Principles
 
 1. Preserve personal context: every surface should make it clear why this item is relevant to the current user.
 2. Let reading lead: prioritize scanability, stable grouping, and lane switching over decorative density.
