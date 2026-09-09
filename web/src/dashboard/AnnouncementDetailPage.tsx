@@ -465,7 +465,7 @@ export function AnnouncementDetailPage(props: {
 							<RepoIdentity
 								repoFullName={detail.repo_full_name}
 								repoVisual={detail.repo_visual}
-								className="min-h-8 w-full min-w-0"
+								className="min-h-8 w-full min-w-0 max-w-full flex-1"
 								labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
 								visualClassName="size-8"
 							>
