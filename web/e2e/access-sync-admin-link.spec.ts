@@ -215,7 +215,10 @@ test("dashboard sync click creates the same access-refresh task visible in admin
 		}
 
 		if (req.method() === "GET" && pathname === "/api/admin/jobs/realtime") {
-			if (searchParams.get("task_group") === "scheduled") {
+			if (
+				searchParams.get("task_group") === "scheduled" ||
+				searchParams.get("task_group") === "user_sync"
+			) {
 				return json(route, {
 					items: [],
 					page: 1,

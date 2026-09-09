@@ -395,6 +395,20 @@ export type SyncAutoFetchTaskItem = {
 export type AdminSyncRuntimeConfigResponse = {
 	sync_auto_fetch_interval_minutes: number;
 	sync_auto_fetch_effective_at?: string | null;
+	star_sync_delta_interval_minutes?: number;
+	star_sync_full_sweep_interval_minutes?: number;
+	star_sync?: {
+		last_delta_completed_at: string | null;
+		last_full_sweep_completed_at: string | null;
+		active_epochs: Array<{
+			github_connection_id: string;
+			processed_pages: number;
+			processed_items: number;
+			total_count_at_start: number | null;
+			completion_percent: number | null;
+			next_slice_not_before: string | null;
+		}>;
+	};
 	retry_recent_failures_interval_minutes: number;
 	repo_release_worker_concurrency: number;
 	repo_refresh_system_budget_per_window: number;
@@ -526,6 +540,8 @@ export type AdminPublicReleaseReposResponse = {
 };
 export type AdminSyncRuntimeConfigUpdateRequest = {
 	sync_auto_fetch_interval_minutes?: number;
+	star_sync_delta_interval_minutes?: number;
+	star_sync_full_sweep_interval_minutes?: number;
 	retry_recent_failures_interval_minutes?: number;
 	repo_release_worker_concurrency?: number;
 	repo_refresh_system_budget_per_window?: number;
@@ -921,11 +937,8 @@ export type AdminSyncSubscriptionsDiagnostics = {
 	skip_reason: string | null;
 	log_available: boolean;
 	log_download_path: string | null;
-	star: {
+	collect: {
 		total_users: number;
-		succeeded_users: number;
-		failed_users: number;
-		total_repos: number;
 	};
 	release: {
 		total_repos: number;

@@ -677,11 +677,8 @@ function buildTaskDiagnostics(): AdminTaskDiagnostics {
 			skip_reason: null,
 			log_available: true,
 			log_download_path: "/api/admin/jobs/realtime/task-sync-subscriptions/log",
-			star: {
+			collect: {
 				total_users: 28,
-				succeeded_users: 27,
-				failed_users: 1,
-				total_repos: 92,
 			},
 			release: {
 				total_repos: 92,
@@ -1392,6 +1389,34 @@ function buildAdminJobs(): DemoJobsModel {
 
 	const scheduledRuns: AdminRealtimeTaskItem[] = [
 		{
+			id: "task-starred-reconcile-0845",
+			task_type: "sync.starred.reconcile",
+			status: "running",
+			source: "scheduler",
+			requested_by: null,
+			parent_task_id: null,
+			cancel_requested: false,
+			error_message: null,
+			created_at: "2026-07-08T08:45:00+08:00",
+			started_at: "2026-07-08T08:45:01+08:00",
+			finished_at: null,
+			updated_at: NOW,
+		},
+		{
+			id: "task-starred-delta-0840",
+			task_type: "sync.starred.delta",
+			status: "succeeded",
+			source: "scheduler",
+			requested_by: null,
+			parent_task_id: null,
+			cancel_requested: false,
+			error_message: null,
+			created_at: "2026-07-08T08:40:00+08:00",
+			started_at: "2026-07-08T08:40:01+08:00",
+			finished_at: "2026-07-08T08:40:05+08:00",
+			updated_at: "2026-07-08T08:40:05+08:00",
+		},
+		{
 			id: "task-brief-slot-08",
 			task_type: "brief.daily_slot",
 			status: "running",
@@ -1550,6 +1575,60 @@ function buildAdminJobs(): DemoJobsModel {
 	).length;
 
 	const taskDetails: Record<string, AdminRealtimeTaskDetailResponse> = {
+		"task-starred-reconcile-0845": {
+			task: {
+				...scheduledRuns[0],
+				payload_json: JSON.stringify({
+					user_id: USER_ID,
+					trigger: "schedule",
+					github_connection_id: "github-connection-demo",
+					epoch_id: "star-epoch-demo",
+				}),
+				result_json: null,
+			},
+			events: [
+				{
+					id: "task-starred-reconcile-event-1",
+					event_type: "task.progress",
+					payload_json: JSON.stringify({
+						processed_pages: 8,
+						processed_items: 576,
+						total_count_at_start: 2880,
+					}),
+					created_at: NOW,
+				},
+			],
+			event_meta: {
+				returned: 1,
+				total: 1,
+				limit: 50,
+				truncated: false,
+			},
+			diagnostics: null,
+		},
+		"task-starred-delta-0840": {
+			task: {
+				...scheduledRuns[1],
+				payload_json: JSON.stringify({
+					user_id: USER_ID,
+					trigger: "schedule",
+					github_connection_id: "github-connection-demo",
+				}),
+				result_json: JSON.stringify({
+					user_id: USER_ID,
+					github_connection_id: "github-connection-demo",
+					items_observed: 14,
+				}),
+			},
+			events: [],
+			event_meta: {
+				returned: 0,
+				total: 0,
+				limit: 50,
+				truncated: false,
+			},
+			diagnostics: null,
+		},
 		"task-sync-subscriptions": {
 			task: {
 				...realtimeTasks[0],
@@ -1595,6 +1674,22 @@ function buildAdminJobs(): DemoJobsModel {
 		subscriptionRuns,
 		syncRuntimeConfig: {
 			sync_auto_fetch_interval_minutes: 60,
+			star_sync_delta_interval_minutes: 30,
+			star_sync_full_sweep_interval_minutes: 1440,
+			star_sync: {
+				last_delta_completed_at: "2026-07-08T08:40:00+08:00",
+				last_full_sweep_completed_at: "2026-07-07T08:40:00+08:00",
+				active_epochs: [
+					{
+						github_connection_id: "github-connection-demo",
+						processed_pages: 8,
+						processed_items: 576,
+						total_count_at_start: 2880,
+						completion_percent: 20,
+						next_slice_not_before: "2026-07-08T08:46:00+08:00",
+					},
+				],
+			},
 			retry_recent_failures_interval_minutes: 30,
 			repo_release_worker_concurrency: 6,
 			repo_refresh_system_budget_per_window: 800,

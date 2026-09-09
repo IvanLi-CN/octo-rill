@@ -35,6 +35,7 @@ import { Route as FocusReposReleasesRouteImport } from './routes/focus/repos/rel
 import { Route as FocusOrgOrgRouteImport } from './routes/focus/org/$org'
 import { Route as FocusMineReleasesRouteImport } from './routes/focus/mine/releases'
 import { Route as FocusFollowingReleasesRouteImport } from './routes/focus/following/releases'
+import { Route as AdminJobsUserSyncRouteImport } from './routes/admin/jobs/user-sync'
 import { Route as AdminJobsTranslationsRouteImport } from './routes/admin/jobs/translations'
 import { Route as AdminJobsSubscriptionsRouteImport } from './routes/admin/jobs/subscriptions'
 import { Route as AdminJobsScheduledRouteImport } from './routes/admin/jobs/scheduled'
@@ -209,6 +210,13 @@ const FocusFollowingReleasesRoute = FocusFollowingReleasesRouteImport.update({
   getParentRoute: () => FocusFollowingRoute,
 } as any).lazy(() =>
   import('./routes/focus/following/releases.lazy').then((d) => d.Route),
+)
+const AdminJobsUserSyncRoute = AdminJobsUserSyncRouteImport.update({
+  id: '/user-sync',
+  path: '/user-sync',
+  getParentRoute: () => AdminJobsRouteRoute,
+} as any).lazy(() =>
+  import('./routes/admin/jobs/user-sync.lazy').then((d) => d.Route),
 )
 const AdminJobsTranslationsRoute = AdminJobsTranslationsRouteImport.update({
   id: '/translations',
@@ -404,6 +412,7 @@ export interface FileRoutesByFullPath {
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
   '/admin/jobs/subscriptions': typeof AdminJobsSubscriptionsRouteWithChildren
   '/admin/jobs/translations': typeof AdminJobsTranslationsRoute
+  '/admin/jobs/user-sync': typeof AdminJobsUserSyncRoute
   '/focus/following/releases': typeof FocusFollowingReleasesRoute
   '/focus/mine/releases': typeof FocusMineReleasesRoute
   '/focus/org/$org': typeof FocusOrgOrgRouteWithChildren
@@ -447,6 +456,7 @@ export interface FileRoutesByTo {
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
   '/admin/jobs/subscriptions': typeof AdminJobsSubscriptionsRouteWithChildren
   '/admin/jobs/translations': typeof AdminJobsTranslationsRoute
+  '/admin/jobs/user-sync': typeof AdminJobsUserSyncRoute
   '/focus/following/releases': typeof FocusFollowingReleasesRoute
   '/focus/mine/releases': typeof FocusMineReleasesRoute
   '/focus/repos/releases': typeof FocusReposReleasesRoute
@@ -495,6 +505,7 @@ export interface FileRoutesById {
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
   '/admin/jobs/subscriptions': typeof AdminJobsSubscriptionsRouteWithChildren
   '/admin/jobs/translations': typeof AdminJobsTranslationsRoute
+  '/admin/jobs/user-sync': typeof AdminJobsUserSyncRoute
   '/focus/following/releases': typeof FocusFollowingReleasesRoute
   '/focus/mine/releases': typeof FocusMineReleasesRoute
   '/focus/org/$org': typeof FocusOrgOrgRouteWithChildren
@@ -547,6 +558,7 @@ export interface FileRouteTypes {
     | '/admin/jobs/scheduled'
     | '/admin/jobs/subscriptions'
     | '/admin/jobs/translations'
+    | '/admin/jobs/user-sync'
     | '/focus/following/releases'
     | '/focus/mine/releases'
     | '/focus/org/$org'
@@ -590,6 +602,7 @@ export interface FileRouteTypes {
     | '/admin/jobs/scheduled'
     | '/admin/jobs/subscriptions'
     | '/admin/jobs/translations'
+    | '/admin/jobs/user-sync'
     | '/focus/following/releases'
     | '/focus/mine/releases'
     | '/focus/repos/releases'
@@ -637,6 +650,7 @@ export interface FileRouteTypes {
     | '/admin/jobs/scheduled'
     | '/admin/jobs/subscriptions'
     | '/admin/jobs/translations'
+    | '/admin/jobs/user-sync'
     | '/focus/following/releases'
     | '/focus/mine/releases'
     | '/focus/org/$org'
@@ -868,6 +882,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof FocusFollowingReleasesRouteImport
       parentRoute: typeof FocusFollowingRoute
     }
+    '/admin/jobs/user-sync': {
+      id: '/admin/jobs/user-sync'
+      path: '/user-sync'
+      fullPath: '/admin/jobs/user-sync'
+      preLoaderRoute: typeof AdminJobsUserSyncRouteImport
+      parentRoute: typeof AdminJobsRouteRoute
+    }
     '/admin/jobs/translations': {
       id: '/admin/jobs/translations'
       path: '/translations'
@@ -1077,6 +1098,7 @@ interface AdminJobsRouteRouteChildren {
   AdminJobsScheduledRoute: typeof AdminJobsScheduledRoute
   AdminJobsSubscriptionsRoute: typeof AdminJobsSubscriptionsRouteWithChildren
   AdminJobsTranslationsRoute: typeof AdminJobsTranslationsRoute
+  AdminJobsUserSyncRoute: typeof AdminJobsUserSyncRoute
   AdminJobsIndexRoute: typeof AdminJobsIndexRoute
   AdminJobsTasksTaskIdRouteRoute: typeof AdminJobsTasksTaskIdRouteRouteWithChildren
 }
@@ -1087,6 +1109,7 @@ const AdminJobsRouteRouteChildren: AdminJobsRouteRouteChildren = {
   AdminJobsScheduledRoute: AdminJobsScheduledRoute,
   AdminJobsSubscriptionsRoute: AdminJobsSubscriptionsRouteWithChildren,
   AdminJobsTranslationsRoute: AdminJobsTranslationsRoute,
+  AdminJobsUserSyncRoute: AdminJobsUserSyncRoute,
   AdminJobsIndexRoute: AdminJobsIndexRoute,
   AdminJobsTasksTaskIdRouteRoute: AdminJobsTasksTaskIdRouteRouteWithChildren,
 }

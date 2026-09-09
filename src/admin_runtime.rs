@@ -45,6 +45,8 @@ pub struct LlmModelHealth {
 }
 
 pub const DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES: i64 = 60;
+pub const DEFAULT_STAR_SYNC_DELTA_INTERVAL_MINUTES: i64 = 30;
+pub const DEFAULT_STAR_SYNC_FULL_SWEEP_INTERVAL_MINUTES: i64 = 1440;
 pub const DEFAULT_RETRY_RECENT_FAILURES_INTERVAL_MINUTES: i64 = 10;
 pub const DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY: usize = 8;
 pub const MAX_REPO_RELEASE_WORKER_CONCURRENCY: usize = 32;
@@ -94,6 +96,14 @@ fn parse_daily_brief_schedule_local_time(raw: &str, config: &AppConfig) -> Naive
 
 pub fn normalize_sync_auto_fetch_interval_minutes(value: i64) -> i64 {
     value.clamp(1, 120)
+}
+
+pub fn normalize_star_sync_delta_interval_minutes(value: i64) -> i64 {
+    value.clamp(1, 120)
+}
+
+pub fn normalize_star_sync_full_sweep_interval_minutes(value: i64) -> i64 {
+    value.clamp(60, 10_080)
 }
 
 pub fn next_sync_auto_fetch_effective_at(
@@ -493,6 +503,110 @@ pub async fn load_sync_auto_fetch_interval_minutes(pool: &SqlitePool) -> Result<
     .unwrap_or(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES);
 
     Ok(normalize_sync_auto_fetch_interval_minutes(interval))
+}
+
+pub async fn load_star_sync_delta_interval_minutes(pool: &SqlitePool) -> Result<i64> {
+    let interval = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT star_sync_delta_interval_minutes
+        FROM admin_runtime_settings
+        WHERE id = 1
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(DEFAULT_STAR_SYNC_DELTA_INTERVAL_MINUTES);
+
+    Ok(normalize_star_sync_delta_interval_minutes(interval))
+}
+
+pub async fn load_star_sync_full_sweep_interval_minutes(pool: &SqlitePool) -> Result<i64> {
+    let interval = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT star_sync_full_sweep_interval_minutes
+        FROM admin_runtime_settings
+        WHERE id = 1
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(DEFAULT_STAR_SYNC_FULL_SWEEP_INTERVAL_MINUTES);
+
+    Ok(normalize_star_sync_full_sweep_interval_minutes(interval))
+}
+
+pub async fn update_star_sync_delta_interval_minutes(
+    pool: &SqlitePool,
+    interval_minutes: i64,
+) -> Result<i64> {
+    let interval_minutes = normalize_star_sync_delta_interval_minutes(interval_minutes);
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO admin_runtime_settings (
+          id,
+          llm_max_concurrency,
+          translation_general_worker_concurrency,
+          translation_dedicated_worker_concurrency,
+          sync_auto_fetch_interval_minutes,
+          star_sync_delta_interval_minutes,
+          created_at,
+          updated_at
+        )
+        VALUES (1, 1, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          star_sync_delta_interval_minutes = excluded.star_sync_delta_interval_minutes,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
+    .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
+    .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
+    .bind(interval_minutes)
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .execute(pool)
+    .await?;
+
+    load_star_sync_delta_interval_minutes(pool).await
+}
+
+pub async fn update_star_sync_full_sweep_interval_minutes(
+    pool: &SqlitePool,
+    interval_minutes: i64,
+) -> Result<i64> {
+    let interval_minutes = normalize_star_sync_full_sweep_interval_minutes(interval_minutes);
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO admin_runtime_settings (
+          id,
+          llm_max_concurrency,
+          translation_general_worker_concurrency,
+          translation_dedicated_worker_concurrency,
+          sync_auto_fetch_interval_minutes,
+          star_sync_full_sweep_interval_minutes,
+          created_at,
+          updated_at
+        )
+        VALUES (1, 1, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          star_sync_full_sweep_interval_minutes = excluded.star_sync_full_sweep_interval_minutes,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
+    .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
+    .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
+    .bind(interval_minutes)
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .execute(pool)
+    .await?;
+
+    load_star_sync_full_sweep_interval_minutes(pool).await
 }
 
 pub async fn update_sync_auto_fetch_interval_minutes(
