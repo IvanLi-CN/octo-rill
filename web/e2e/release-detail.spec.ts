@@ -1173,6 +1173,12 @@ test("shared markdown compacts raw GitHub links and keeps long links wrapped", a
 	const rawPrUrl = "https://github.com/CherryHQ/cherry-studio/pull/14247";
 	const rawCommitUrl =
 		"https://github.com/CherryHQ/cherry-studio/commit/4d8f459e7869d3e0b57fafe1b7a9034cb9b2d999";
+	const rawFileLineUrl =
+		"https://github.com/CherryHQ/cherry-studio/blob/4d8f459e7869d3e0b57fafe1b7a9034cb9b2d999/src/main.ts?plain=1#L42";
+	const rawCompareUrl =
+		"https://github.com/CherryHQ/cherry-studio/compare/v2.71.0...v2.71.1#files_bucket";
+	const rawEncodedCompareUrl =
+		"https://github.com/CherryHQ/cherry-studio/compare/release%2Fv2.71.0...v2.71.1#files_bucket";
 	const rawDocsUrl =
 		"https://docs.example.com/releases/cherry-studio/2026/04/21/notes/with/a/very/long/path/that/should/wrap/inside/the/dashboard/brief/card?source=dashboard&view=full&lang=zh-CN";
 	const rawStatusUrl =
@@ -1187,10 +1193,15 @@ test("shared markdown compacts raw GitHub links and keeps long links wrapped", a
 			`- [skills workspace links](${buildCanonicalReleaseHref("CherryHQ", "cherry-studio", "v1.0.0")}) · 2026-04-20T15:18:00Z · [GitHub Release](https://github.com/CherryHQ/cherry-studio/releases/tag/v1.0.0)`,
 			`  - 原始 GitHub PR autolink 会被压缩成短标签：${rawPrUrl}`,
 			"  - 已有短标签保持不变：[#13840](https://github.com/CherryHQ/cherry-studio/pull/13840)",
+			`  - GitHub compare 版本范围保持可读：${rawCompareUrl}`,
+			`  - 编码 ref 保持可读：${rawEncodedCompareUrl}`,
+			`  - 文件行号锚点保持可读：${rawFileLineUrl}`,
 			`  - 长文档链接继续保留原文并允许换行：${rawDocsUrl}`,
 		].join("\n"),
 		translatedSummary: [
 			`- 原始 commit autolink 会压缩成短 SHA：${rawCommitUrl}`,
+			`- 文件行号锚点应保持可读：${rawFileLineUrl}`,
+			`- 编码 compare ref 应显示为版本范围：${rawEncodedCompareUrl}`,
 			`- 长状态页链接继续保留原文并允许换行：${rawStatusUrl}`,
 		].join("\n"),
 	});
@@ -1201,6 +1212,15 @@ test("shared markdown compacts raw GitHub links and keeps long links wrapped", a
 	const briefPanel = page.getByRole("tabpanel", { name: "日报" });
 	await expect(briefPanel.getByRole("link", { name: "#14247" })).toBeVisible();
 	await expect(briefPanel.getByRole("link", { name: "#13840" })).toBeVisible();
+	await expect(
+		briefPanel.getByRole("link", {
+			name: "v2.71.0...v2.71.1",
+			exact: true,
+		}),
+	).toBeVisible();
+	await expect(
+		briefPanel.getByRole("link", { name: "release/v2.71.0...v2.71.1" }),
+	).toBeVisible();
 	await expect(
 		briefPanel.getByRole("link", { name: "GitHub Release" }),
 	).toBeVisible();
@@ -1218,6 +1238,14 @@ test("shared markdown compacts raw GitHub links and keeps long links wrapped", a
 	await detailDialog.getByRole("tab", { name: "翻译" }).click();
 	await expect(
 		detailDialog.getByRole("link", { name: "4d8f459" }),
+	).toBeVisible();
+	await expect(
+		detailDialog.getByRole("link", {
+			name: "release/v2.71.0...v2.71.1",
+		}),
+	).toBeVisible();
+	await expect(
+		detailDialog.getByRole("link", { name: "src/main.ts#L42" }),
 	).toBeVisible();
 	await expect(detailDialog.locator(`a[href="${rawStatusUrl}"]`)).toBeVisible();
 	await expect(detailDialog).not.toContainText(rawCommitUrl);

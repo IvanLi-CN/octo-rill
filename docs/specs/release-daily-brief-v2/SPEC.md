@@ -4,7 +4,7 @@
 
 - 当前 Release 日报正文仍以 `## 概览` 开头，并把时间窗口、项目数、预发布数等元数据直接堆进正文，导致内容主体被稀释。
 - 部分已生成日报被整篇 ` ```markdown ` 代码块包裹，前台会把整段正文渲染成错误的代码块样式。
-- 相关链接目前直接展示完整 GitHub URL，正文过长且可读性差。
+- 相关链接若直接展示完整 GitHub URL，正文过长且可读性差；前端共享 Markdown 需要统一压缩裸 GitHub 链接。
 - 现有日报只覆盖 Release，没有把同一时间窗口内的“仓库获星”和“账号被关注”纳入日报摘要。
 - 现有快照去重逻辑在命中同一窗口的已标准化 brief 时直接复用旧行，导致旧格式快照无法原位刷新。
 
@@ -15,7 +15,7 @@
 - 把日报正文收敛为内容本体：移除 `## 概览` 与正文中的时间窗口，只保留 `## 项目更新` 与 `## 获星与关注` 两个稳定章节。
 - 在同一窗口内同时汇总 Release、仓库获星与账号被关注，并采用紧凑摘要而不是完整社交卡片复刻。
 - 彻底消灭整篇日报被单层 markdown fence 包裹的落库结果，同时保留合法嵌套代码块。
-- 将 related links 收敛成 GitHub-aware 最短标签：PR / Issue 用 `#123`，commit 用短 SHA，其它 GitHub 链接用紧凑 fallback。
+- 生成内容中的 related links 统一保存为 ` · ` 分隔的裸 GitHub URL；共享 Markdown 仅在链接文字等于 URL 时压缩：PR / Issue 用 `#123`，commit 用 7 位 SHA，release 用 tag，compare 用单段 percent-decoding 后的 `base...head`，标准 `#L<line>` 或 `#L<start>-L<end>` 直接追加，其它 GitHub 路径沿用紧凑 fallback。
 - 为已存在的标准化 brief 提供原位刷新路径，并补一条历史内容修复任务，批量更新旧格式 / fenced-format 快照。
 - 同步更新 Storybook、测试、产品文档与视觉证据。
 
@@ -26,7 +26,7 @@
 - 不把日报扩展成完整时间线流水账；社交信息只输出紧凑摘要。
 - 不在本轮引入新的人工编辑后台或额外的运营 UI。
 
-## 范围（Scope）
+## Context and Scope
 
 ### In scope
 
@@ -34,6 +34,8 @@
 - `src/jobs.rs`
 - `src/api.rs`
 - `docs/product.md`
+- `web/src/components/Markdown.tsx`
+- `web/src/components/Markdown.stories.tsx`
 - `web/src/stories/Dashboard.stories.tsx`
 - `web/e2e/release-detail.spec.ts`
 - `web/src/admin/TaskTypeDetailSection.tsx`
@@ -44,20 +46,20 @@
 
 - Dashboard `日报` tab 卡头与右侧列表布局
 - Feed 社交卡片组件与 Dashboard 信息架构
-- 非日报用途的 Markdown 渲染规则
+- 非日报用途的 Markdown 渲染规则（共享组件的裸 GitHub URL 压缩规则仍作为消费面契约）
 
-## 需求（Requirements）
+## Requirements
 
 ### MUST
 
-- 新生成 brief 正文不得再包含 `## 概览`、`时间窗口（本地）` 或等价概览文案。
+- REQ-BRIEF-STRUCTURE: 新生成 brief 正文不得再包含 `## 概览`、`时间窗口（本地）` 或等价概览文案。
 - brief 正文必须稳定包含 `## 项目更新` 与 `## 获星与关注` 两个章节；任一类数据为空时也要输出对应空态。
 - `## 项目更新` 继续按仓库分组，保留 release 主链接 `/?tab=briefs&release=<release_id>` 与 GitHub Release 外链。
 - `## 项目更新` 中的仓库标题必须保持 `### [owner/repo](...)`；每条 release 必须保持顶层 `- [title](/?tab=briefs&release=...)`；release 详情只允许在确有可提炼变更时以连续的 `  - ...` 子 bullet 组成，低信息 release 只保留主行。
 - release 要点提取必须复用 `release_smart` 的事实链路：`body valuable -> 直接总结`，否则走 compare fallback；两者都无价值时，不得编造任何伪摘要或固定占位文案。
 - `## 获星与关注` 必须覆盖同一窗口内的 `repo_star_received` 与 `follower_received` 事件，并按最新事件倒序展示紧凑摘要。
-- related links 不得再直出完整 GitHub URL；PR / Issue 显示 `#编号`，commit 显示短 SHA。
-- 润色后的日报若被单层 markdown fence 包裹，落库前必须剥离该外层 fence。
+- REQ-GITHUB-LINKS: related links 的 canonical Markdown 必须使用 ` · ` 分隔的裸 GitHub URL，不得生成不存在的标题；前端显示时 PR / Issue 为 `#编号`，commit 为 7 位 SHA，release 为 tag，compare 为可读的 `base...head`，标准行号片段直接追加。人工 Markdown 标题、查询参数、非行号 fragment 与非 GitHub URL 保持其原有可见文字与 href。
+- REQ-POLISH-CANONICAL: 润色后的日报若被单层 markdown fence 包裹，落库前必须剥离该外层 fence。
 - 润色结果若把 release 子 bullet 改写成段落、硬换行文本、双空行或其它非 canonical 结构，必须拒绝并回退到 deterministic markdown。
 - 润色结果若把 release 子 bullet 改写成段落、硬换行文本、双空行或其它非 canonical 结构，必须拒绝并回退到 deterministic markdown；润色阶段也不得为零子 bullet 的 release 补写“发布 xxx”“版本发布”“更新要点”等空泛内容。
 - Release 要点生成与润色 prompt 必须声明默认使用简体中文整理日报内容，同时允许保留代码标识符、commit type、包名、API 名、项目名、版本号和原始标题等必要英文。
@@ -118,7 +120,15 @@ None
 
 - Given 某个 release body 中提取到了 PR、Issue 或 commit 链接
   When 日报正文渲染相关链接
-  Then 显示文本分别为 `#编号`、`#编号`、短 SHA，而不是完整 GitHub URL。
+  Then canonical 正文保存裸 URL，前端显示文本分别为 `#编号`、`#编号`、7 位 SHA，而不是完整 GitHub URL。
+
+- Given 某个 release body 中提取到了 compare、编码 ref 或标准行号 fragment 链接
+  When 日报正文渲染相关链接
+  Then compare 显示为解码后的 `base...head`，标准行号直接追加，query 与其它 fragment 仅保留在 href 中。
+
+- Given 某个 related GitHub URL 已经有人工 Markdown 标题
+  When 日报正文渲染相关链接
+  Then 保留人工标题，不应用裸链接紧凑规则。
 
 - Given 某个 release body 无价值但 compare digest 提取到了明确变更
   When 日报正文渲染该 release
@@ -176,12 +186,23 @@ None
 - `cd web && bun run build`
 - `cd web && bun run storybook:build`
 
+## Verification
+
+- VER-BRIEF-STRUCTURE covers: REQ-BRIEF-STRUCTURE; `cargo test` and the Dashboard / Release detail Storybook and Playwright scenarios verify the V2 body shape.
+- VER-GITHUB-LINKS covers: REQ-GITHUB-LINKS; `cargo test build_brief_content_from_digests_rejects_polish_adding_pseudo_summary_to_link_only_release`, `Components/Markdown / GithubAutolinks`, Dashboard stories, and `release-detail.spec.ts` verify bare URL canonical output and compact PR / Issue / commit / release / compare / line-anchor labels.
+- VER-POLISH-CANONICAL covers: REQ-POLISH-CANONICAL; Rust canonical validation tests verify deterministic fallback when polish changes related URLs into titled links.
+- VER-QUALITY-GATES covers: REQ-BRIEF-STRUCTURE, REQ-GITHUB-LINKS, REQ-POLISH-CANONICAL; `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `web:lint`, `web:build`, `web:storybook-build`, and the targeted Playwright test provide the mechanical gate.
+
+## Related ADRs
+
+None
+
 ## Visual Evidence
 
 - source_type: `storybook_canvas`
   story_id_or_title: `Pages/Dashboard / Briefs Focused`
   state: `briefs_tab_v2_body`
-  evidence_note: 证明独立 `日报` tab 中正文只保留 `项目更新 + 获星与关注`，并显示紧凑短链接 `#13840` / `4d8f459`。
+  evidence_note: 证明独立 `日报` tab 中正文只保留 `项目更新 + 获星与关注`，并显示紧凑短链接、compare 范围与行号片段。
   image:
   ![Dashboard 日报 tab V2 正文](./assets/dashboard-briefs-focused.png)
 
@@ -191,6 +212,23 @@ None
   evidence_note: 证明 `全部` tab 的历史日组内嵌 brief 已切换为 V2 正文结构，且相关链接文本为短标签。
   image:
   ![Dashboard 历史日组内嵌日报](./assets/dashboard-history-brief.png)
+
+- source_type: `storybook_canvas`
+  target_program: `mock-only`
+  capture_scope: `element`
+  requested_viewport: `none`
+  viewport_strategy: `storybook-viewport`
+  margin_policy: `require_margin`
+  evidence_surface: `component`
+  surface_selector: `[data-visual-evidence-surface]`
+  target_selector: `[data-visual-evidence-target]`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  story_id_or_title: `Components/Markdown / GithubAutolinks`
+  state: `github_bare_url_compaction`
+  evidence_note: 证明共享 Markdown 对 PR、Issue、commit、compare、编码 compare ref 与真实代码文件行号片段统一压缩，同时保留外部长链接。
+  image:
+  ![共享 Markdown GitHub 裸链接紧凑展示](./assets/markdown-github-autolinks.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `Admin/Task Type Detail / BriefRefreshContent`

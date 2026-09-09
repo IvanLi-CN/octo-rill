@@ -4,7 +4,7 @@
 
 - Lifecycle: active
 - Created: 2026-04-16
-- Last: 2026-07-19
+- Last: 2026-09-08
 
 ## 变更记录
 
@@ -12,6 +12,7 @@
 - 2026-04-19: 收紧 brief canonical Markdown 契约，新增结构校验 / deterministic fallback，并把 V2 正文层级漂移纳入历史刷新。
 - 2026-05-10: 明确日报 release 要点默认简体中文倾向；AI 不可用或摘要不可解析时，deterministic fallback 改为中文提示式摘要，不直接复用原始 release notes bullet。
 - 2026-07-19: 日报 release 要点复用 `release_smart` 的 valuable / compare fallback 语义，低信息 release 不再补伪摘要；历史 brief 可原位刷新去伪摘要。
+- 2026-09-08: related links 改为 ` · ` 分隔的裸 GitHub URL；共享 Markdown 统一压缩 PR、Issue、commit、release、compare 与标准行号片段，既有 brief 无需迁移。
 
 ## 变更记录（Change log）
 
@@ -19,3 +20,4 @@
 - 2026-04-19: 收紧 brief canonical Markdown 契约，新增结构校验 / deterministic fallback，并把 V2 正文层级漂移纳入历史刷新。
 - 2026-04-22: 同步 brief release 主链接 current truth；新生成内容默认输出 `/<owner>/<repo>/releases/tag/<tag>?from=briefs`，legacy query 链接继续兼容。
 - 2026-07-19: 日报 release 要点改为复用 `release_smart` 的 valuable / compare fallback 事实链路；低信息 release 不再生成伪摘要，历史 brief refresh 继续原位修复。
+- 2026-09-08: related links 改为 ` · ` 分隔的裸 GitHub URL；共享 Markdown 统一压缩 PR、Issue、commit、release、compare 与标准行号片段，既有 brief 无需迁移。
