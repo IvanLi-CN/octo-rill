@@ -1,5 +1,7 @@
 # 全局 Repo Release 复用与访问触发增量同步
 
+> Star 的独立 delta/full reconciliation 与频率设置由 [star-sync-reconciliation](../star-sync-reconciliation/SPEC.md) 接管。本 topic 保留 Release、social、Inbox 与访问刷新编排。
+
 ## 背景 / 问题陈述
 
 旧实现把 Release 同步和存储都绑定在用户维度：
@@ -18,19 +20,18 @@
 - 引入共享 `repo_releases` 缓存，所有用户从 `starred_repos + repo_releases` 读取 Release。
 - 引入全局 `repo_release_work_items` / `repo_release_watchers`，把访问触发、手动同步、定时订阅同步统一汇聚到 repo 级共享队列。
 - 新增 `sync.access_refresh`：
-  - 覆盖 `Star + Release + social + Inbox`
+  - 覆盖 `Star delta + Release + social + Inbox`
   - 首访或超过 1 小时未访问时自动触发
   - `star_refreshed` 后立即让前端刷新可见缓存
   - Release work 完成后再刷新一次，并在 social / Inbox 阶段结束后收口
   - 首次成功拿到 social snapshot 时直接写入可见社交事件
   - social / Inbox 失败保持 best-effort，不把整轮访问刷新降级成硬失败
 - `sync.subscriptions` 改成：
-  - 刷新用户 Star
-  - 聚合 repo demand
+  - 基于已物化的有效可见 repo 聚合 demand
   - 挂到共享 repo release queue
   - 等待关联 outcome 并输出 `Release + social + Inbox` 摘要
 - `GET /api/me` 返回 `access_sync` 元信息，前端可直接附着到用户自己的 task SSE。
-- Admin Jobs 允许管理员在“订阅同步设置”中配置全局自动获取间隔，并展示最近三次 `sync.subscriptions` 用时；该间隔同时是 Release 治理预算窗口长度。
+- Admin Jobs 允许管理员在“订阅同步设置”中配置 Release 全局自动获取间隔，并展示最近三次 `sync.subscriptions` 用时；该间隔同时是 Release 治理预算窗口长度。Star cadence 由独立 topic 配置。
 - Admin Jobs 提供订阅同步专用视图和详情入口，支持查看所有 `sync.subscriptions` 运行，不论来自定时、手动还是重试。
 - Release 阶段支持运行时调整共享 repo release worker 数量；该设置只影响吞吐，不降低调度频率。
 - Release 抓取使用 GitHub conditional request 复用 `ETag` / `Last-Modified`，未变化仓库可以快速完成 watcher，而不是下载完整 release 列表。
@@ -129,9 +130,9 @@
 - 列表页和详情页共享设置入口，设置项包括：
   - 全局自动获取间隔与 Release 治理预算窗口；
   - Release worker 数量。
+  - Star delta interval 与 full-sweep completion target；这两项仅控制独立 Star Sync Coordinator，详情见 [star-sync-reconciliation](../star-sync-reconciliation/SPEC.md)。
 - 详情按工作流阶段展示：
   - collect；
-  - Star；
   - repo collect；
   - Release queue；
   - social；
@@ -139,12 +140,12 @@
   - translation / smart preheat child tasks。
 - 每个阶段至少展示整体状态、完成/总量、最近关键事件；Release 阶段还应展示 worker 目标并发、成功/失败 repo、candidate failures 与超时/退避线索。
 - 当 `sync.subscriptions` 的业务结果为 `skipped=true` 时，详情页展示状态为“已跳过”；各阶段展示“已跳过/未执行”语义和跳过原因，不把 0/0 误判为“等待”。
-- 运行中的 `sync.subscriptions` 任务在 `result_json` 尚未写入前，详情 API 必须从当前任务的 `task.progress` 事件派生 `diagnostics.sync_subscriptions`，让阶段总览实时展示已经完成的 Star、repo collect、Release queue、social 和 Inbox 摘要。
+- 运行中的 `sync.subscriptions` 任务在 `result_json` 尚未写入前，详情 API 必须从当前任务的 `task.progress` 事件派生 `diagnostics.sync_subscriptions`，让阶段总览实时展示已经完成的 repo collect、Release queue、social 和 Inbox 摘要。
 
 ### `sync.access_refresh`
 
 - 阶段固定为：
-  1. 刷新当前用户 Star 快照
+  1. 刷新当前用户 Star delta
   2. 触发 `task.progress(stage=star_refreshed)`
   3. 将当前可见 repo 挂到共享 repo release queue
   4. 触发 `task.progress(stage=release_attached)`
@@ -198,12 +199,8 @@
 
 ### `sync.subscriptions`
 
-- Star 阶段仍然按用户活跃度刷新 `starred_repos`，失败用户不会参与 repo 聚合。
-- 定时订阅同步的 Star 阶段默认使用最近 Star 窗口：
-  - 已有本地水位的用户只拉 GraphQL `first=50`；
-  - 遇到 `starredAt <= starred_sync_watermark` 即停止；
-  - 浅同步只 upsert 最近窗口，不删除旧 star；
-  - 首次同步、手动修复或低频 reconciliation 才允许完整翻页并替换全量快照。
+- Star delta/full reconciliation 由独立 Star Sync Coordinator 调度；本任务不 fetch Star，也不以本轮 Star 成功集筛选用户。
+- Release、social 和 Inbox 基于任务启动时已物化的有效可见 repo / enabled user 事实运行；Star 的后续增删在下一轮 task 或访问刷新中自然生效。
 - Release 阶段不再 inline 抓 GitHub Release，也不再 fan-out 写用户私有 `releases`。
 - Release 阶段改成：
   - 聚合 repo demand
@@ -212,7 +209,7 @@
   - 在任务结果里输出 repo 级摘要
 - Release 阶段等待共享 queue 时必须主动收敛已过期 work item；不能因 pending watcher 永久存在而让根 `sync.subscriptions` 长期保持 `running`。
 - Release queue 的 claim / attach / watcher 写路径必须在事务开始时声明写意图，避免 SQLite WAL 多连接下先读后写的事务在升级写锁时因陈旧快照失败。
-- Release 结束后继续按 Star 成功用户 fan-out：
+- Release 结束后按当前 enabled user fan-out：
   - `social_summary`：调用 `sync_social_activity_best_effort`，聚合 `repo_stars / followers / events`
   - `notifications_summary`：调用 `sync_notifications`，聚合新增通知数
 - social 同步若遇到 owned-repo GraphQL 的视觉字段返回 `null`，必须按兼容值归一化，不得把该用户整个 social 阶段直接降级成 `source_degraded`。
@@ -291,8 +288,8 @@
   Then 只依赖“当前用户 star 可见 + 共享 repo release 缓存”，不依赖用户私有 `releases`。
 
 - Given `sync.subscriptions` 被 scheduler 按全局自动获取间隔触发
-  When 本轮 Star / Release 摘要已经完成
-  Then 同一 task 还会继续发出 `social_summary` 与 `notifications_summary`，并在 `result_json` 中包含四段聚合摘要。
+  When 本轮 `collect` / Release 摘要已经完成
+  Then 同一 task 还会继续发出 `social_summary` 与 `notifications_summary`，并在 `result_json` 中包含 `collect`、Release、social 与 notifications 四段摘要。
 
 - Given 当前用户尚未建立 social baseline
   When `sync.access_refresh` 或 `sync.subscriptions` 首次成功拿到 followers / repo stargazers snapshot
@@ -323,7 +320,7 @@
   Then 顶部状态和业务结果显示“已跳过”，阶段总览不显示“等待”，设置弹窗最近链路用时也不展示该跳过记录。
 
 - Given 管理员打开运行中的 `/admin/jobs/subscriptions/{task_id}`
-  When 该任务已经发出 `star_summary`、`repo_collect` 或 `release_summary` 事件但 `result_json` 仍为空
+  When 该任务已经发出 `collect`、`repo_collect` 或 `release_summary` 事件但 `result_json` 仍为空
   Then 阶段总览从事件派生实时统计，不应把已完成阶段显示为等待或 `0 / 0`。
 
 ## Visual Evidence

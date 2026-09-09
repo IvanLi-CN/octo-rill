@@ -1,6 +1,7 @@
 export type AdminJobsPrimaryTab =
 	| "realtime"
 	| "scheduled"
+	| "user_sync"
 	| "subscriptions"
 	| "llm"
 	| "translations"
@@ -112,6 +113,7 @@ export type AdminJobsRouteState = {
 
 export const ADMIN_JOBS_BASE_PATH = "/admin/jobs";
 export const ADMIN_JOBS_SCHEDULED_PATH = `${ADMIN_JOBS_BASE_PATH}/scheduled`;
+export const ADMIN_JOBS_USER_SYNC_PATH = `${ADMIN_JOBS_BASE_PATH}/user-sync`;
 export const ADMIN_JOBS_SUBSCRIPTIONS_PATH = `${ADMIN_JOBS_BASE_PATH}/subscriptions`;
 export const ADMIN_JOBS_LLM_PATH = `${ADMIN_JOBS_BASE_PATH}/llm`;
 export const ADMIN_JOBS_TRANSLATIONS_PATH = `${ADMIN_JOBS_BASE_PATH}/translations`;
@@ -161,6 +163,7 @@ function isPrimaryTab(
 	return (
 		value === "realtime" ||
 		value === "scheduled" ||
+		value === "user_sync" ||
 		value === "subscriptions" ||
 		value === "llm" ||
 		value === "translations" ||
@@ -344,6 +347,8 @@ export function buildAdminJobsBasePath(primaryTab: AdminJobsPrimaryTab) {
 	switch (primaryTab) {
 		case "scheduled":
 			return ADMIN_JOBS_SCHEDULED_PATH;
+		case "user_sync":
+			return ADMIN_JOBS_USER_SYNC_PATH;
 		case "subscriptions":
 			return ADMIN_JOBS_SUBSCRIPTIONS_PATH;
 		case "llm":
@@ -490,6 +495,8 @@ export function parseAdminJobsRoute(
 	let primaryTab: AdminJobsPrimaryTab = "realtime";
 	if (normalizedPath === ADMIN_JOBS_SCHEDULED_PATH) {
 		primaryTab = "scheduled";
+	} else if (normalizedPath === ADMIN_JOBS_USER_SYNC_PATH) {
+		primaryTab = "user_sync";
 	} else if (normalizedPath === ADMIN_JOBS_SUBSCRIPTIONS_PATH) {
 		primaryTab = "subscriptions";
 	} else if (normalizedPath === ADMIN_JOBS_LLM_PATH) {

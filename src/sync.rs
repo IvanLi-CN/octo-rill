@@ -30,6 +30,8 @@ use crate::{
 
 const REST_API_BASE: &str = "https://api.github.com";
 const API_VERSION: &str = "2022-11-28";
+#[cfg(test)]
+#[allow(dead_code)]
 const SUBSCRIPTION_STAR_WORKERS: usize = 5;
 const SUBSCRIPTION_SOCIAL_WORKERS: usize = 4;
 const SUBSCRIPTION_NOTIFICATION_WORKERS: usize = 5;
@@ -65,8 +67,15 @@ const NOTIFICATIONS_SINCE_KEY: &str = "notifications_since";
 const NOTIFICATION_OPEN_URL_REPAIR_KEY: &str = "notifications_open_url_repair_v2";
 const NOTIFICATION_OPEN_URL_REPAIR_PENDING: &str = "pending";
 const NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE: usize = 100;
+#[cfg(test)]
+#[allow(dead_code)]
 const STARRED_RECENT_WINDOW_SIZE: usize = 50;
+const STAR_SYNC_DELTA_PAGE_SIZE: usize = 50;
+const STAR_SYNC_FULL_PAGE_SIZE: usize = 100;
+const STAR_SYNC_EPOCH_LEASE_MINUTES: i64 = 2;
+#[cfg(test)]
 const STARRED_WATERMARK_KEY: &str = "starred_sync_watermark";
+#[cfg(test)]
 const STARRED_FULL_SYNC_KEY: &str = "starred_full_sync_at";
 const REPO_REFRESH_URGENCY_CAP: f64 = 4.0;
 const REPO_REFRESH_GOVERNANCE_REBUILD_CHUNK_SIZE: usize = 500;
@@ -153,6 +162,43 @@ pub struct SyncStarredResult {
 }
 
 #[derive(Debug, Serialize)]
+pub struct SyncStarredDeltaResult {
+    pub user_id: String,
+    pub github_connection_id: String,
+    pub items_observed: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncStarredReconcileResult {
+    pub epoch_id: String,
+    pub github_connection_id: String,
+    pub processed_pages: usize,
+    pub processed_items: usize,
+    pub total_count_at_start: Option<i64>,
+    pub has_next_page: bool,
+    pub next_slice_not_before: Option<String>,
+    pub status: String,
+    pub membership_removed: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StarSyncEpochRuntimeStatus {
+    pub github_connection_id: String,
+    pub processed_pages: usize,
+    pub processed_items: usize,
+    pub total_count_at_start: Option<i64>,
+    pub completion_percent: Option<f64>,
+    pub next_slice_not_before: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StarSyncRuntimeStatus {
+    pub last_delta_completed_at: Option<String>,
+    pub last_full_sweep_completed_at: Option<String>,
+    pub active_epochs: Vec<StarSyncEpochRuntimeStatus>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct SyncReleasesResult {
     pub repos: usize,
     pub releases: usize,
@@ -190,11 +236,18 @@ pub struct SyncSocialActivityResult {
 }
 
 #[derive(Debug, Serialize, Default, Clone)]
-pub struct SyncSubscriptionStarSummary {
+pub struct SyncSubscriptionCollectSummary {
     pub total_users: usize,
-    pub succeeded_users: usize,
-    pub failed_users: usize,
-    pub total_repos: usize,
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[derive(Debug, Serialize, Default, Clone)]
+struct SyncSubscriptionStarSummary {
+    total_users: usize,
+    succeeded_users: usize,
+    failed_users: usize,
+    total_repos: usize,
 }
 
 #[derive(Debug, Serialize, Default, Clone)]
@@ -241,7 +294,7 @@ pub struct SyncSubscriptionNotificationsSummary {
 pub struct SyncSubscriptionsResult {
     pub skipped: bool,
     pub skip_reason: Option<String>,
-    pub star: SyncSubscriptionStarSummary,
+    pub collect: SyncSubscriptionCollectSummary,
     pub release: SyncSubscriptionReleaseSummary,
     pub social: SyncSubscriptionSocialSummary,
     pub notifications: SyncSubscriptionNotificationsSummary,
@@ -255,7 +308,7 @@ pub fn skipped_subscription_result(_schedule_key: &str, skip_reason: &str) -> Va
     json!({
         "skipped": true,
         "skip_reason": skip_reason,
-        "star": SyncSubscriptionStarSummary::default(),
+        "collect": SyncSubscriptionCollectSummary::default(),
         "release": SyncSubscriptionReleaseSummary::default(),
         "social": SyncSubscriptionSocialSummary::default(),
         "notifications": SyncSubscriptionNotificationsSummary::default(),
@@ -716,6 +769,10 @@ struct OwnedRepoViewer {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StarredRepositories {
+    #[serde(default)]
+    total_count: i64,
+    #[serde(default)]
+    is_over_limit: bool,
     page_info: PageInfo,
     edges: Vec<StarredEdge>,
 }
@@ -1130,21 +1187,82 @@ struct OwnedRepoSource {
     access_token: String,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct StarPhaseSuccess {
     user_id: String,
     last_active_at: Option<String>,
+    #[allow(dead_code)]
     repo_count: usize,
-    #[cfg_attr(not(test), allow(dead_code))]
     repos: Vec<StarredRepoSnapshot>,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct StarredFetchResult {
     repos: Vec<StarredRepoSnapshot>,
     is_full_snapshot: bool,
     watermark: Option<String>,
     connection_watermarks: Vec<(String, String)>,
+}
+
+#[derive(Debug)]
+struct StarredPageResult {
+    repos: Vec<StarredRepoSnapshot>,
+    has_next_page: bool,
+    end_cursor: Option<String>,
+    total_count: i64,
+    is_over_limit: bool,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct StarSyncEpochRow {
+    id: String,
+    user_id: String,
+    github_connection_id: String,
+    status: String,
+    started_at: String,
+    next_cursor: Option<String>,
+    total_count_at_start: Option<i64>,
+    processed_pages: i64,
+    processed_items: i64,
+    next_slice_not_before: Option<String>,
+    lease_expires_at: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct StarredMembershipRow {
+    repo_id: i64,
+    full_name: String,
+    owner_login: String,
+    name: String,
+    description: Option<String>,
+    html_url: String,
+    stargazed_at: Option<String>,
+    is_private: i64,
+    repo_stargazer_count: Option<i64>,
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: i64,
+}
+
+impl StarredMembershipRow {
+    fn into_snapshot(self) -> StarredRepoSnapshot {
+        StarredRepoSnapshot {
+            repo_id: self.repo_id,
+            full_name: self.full_name,
+            owner_login: self.owner_login,
+            name: self.name,
+            description: self.description,
+            html_url: self.html_url,
+            stargazed_at: self.stargazed_at.unwrap_or_default(),
+            is_private: self.is_private != 0,
+            repo_stargazer_count: self.repo_stargazer_count,
+            owner_avatar_url: self.owner_avatar_url,
+            open_graph_image_url: self.open_graph_image_url,
+            uses_custom_open_graph_image: self.uses_custom_open_graph_image != 0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1360,6 +1478,7 @@ struct SyncRequestError {
     phase: &'static str,
     message: String,
     retryable: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
     status: Option<u16>,
     timeout_ms: Option<u64>,
 }
@@ -1440,6 +1559,7 @@ struct SyncStarredFailureDiagnostic {
 }
 
 impl SyncStarredFailureDiagnostic {
+    #[cfg(test)]
     fn from_request_error(
         err: SyncRequestError,
         elapsed_ms: u64,
@@ -1485,6 +1605,7 @@ impl SyncStarredFailureDiagnostic {
 
 #[derive(Debug)]
 enum SyncStarredExecutionError {
+    #[cfg_attr(not(test), allow(dead_code))]
     Upstream(SyncStarredFailureDiagnostic),
     Local(anyhow::Error),
 }
@@ -1606,15 +1727,9 @@ async fn sync_starred_for_access_refresh(
     state: &AppState,
     user_id: &str,
 ) -> std::result::Result<SyncStarredResult, SyncStarredExecutionError> {
-    sync_starred_core_with_fetch_and_sleep(
-        state,
-        user_id,
-        || async { fetch_starred_snapshot(state, user_id, false).await },
-        |attempt| async move {
-            tokio::time::sleep(subscription_retry_delay(attempt)).await;
-        },
-    )
-    .await
+    sync_starred_delta_for_user(state, user_id)
+        .await
+        .map_err(SyncStarredExecutionError::Local)
 }
 
 #[cfg(test)]
@@ -1635,6 +1750,7 @@ where
         .map_err(SyncStarredExecutionError::into_anyhow)
 }
 
+#[cfg(test)]
 async fn sync_starred_core_with_fetch_and_sleep<Fetch, FetchFut, Sleep, SleepFut>(
     state: &AppState,
     user_id: &str,
@@ -5018,23 +5134,13 @@ pub async fn sync_subscriptions(
     )
     .await?;
 
-    let (successful_users, star_summary) = run_star_phase(&context, users).await?;
-    jobs::append_task_event(
-        state,
-        task_id,
-        "task.progress",
-        json!({
-            "task_id": task_id,
-            "stage": "star_summary",
-            "total_users": star_summary.total_users,
-            "succeeded_users": star_summary.succeeded_users,
-            "failed_users": star_summary.failed_users,
-            "total_repos": star_summary.total_repos,
-        }),
-    )
-    .await?;
+    // Star delta/full reconciliation is scheduled independently. This run consumes
+    // the already materialized visible repository set instead of fetching Star inline.
+    let collect_summary = SyncSubscriptionCollectSummary {
+        total_users: users.len(),
+    };
 
-    let repos = aggregate_release_visible_repos(&context, &successful_users).await?;
+    let repos = aggregate_release_visible_repos(&context, &users).await?;
     jobs::append_task_event(
         state,
         task_id,
@@ -5051,22 +5157,21 @@ pub async fn sync_subscriptions(
         run_release_phase(&context, repos).await?;
     let new_release_ids = load_new_release_ids_for_task(state, task_id).await?;
     if !new_release_ids.is_empty() && state.config.ai.is_some() {
-        for user in &successful_users {
+        for user in &users {
             let user_release_ids =
-                load_user_relevant_release_ids(state, user.user_id.as_str(), &new_release_ids)
-                    .await?;
+                load_user_relevant_release_ids(state, user.id.as_str(), &new_release_ids).await?;
             let smart_preheat_release_ids = merge_smart_preheat_release_ids(
                 &user_release_ids,
                 &load_recent_release_ids_for_user(
                     state,
-                    user.user_id.as_str(),
+                    user.id.as_str(),
                     SMART_PREHEAT_RECENT_RELEASE_LIMIT,
                 )
                 .await
                 .unwrap_or_else(|err| {
                     tracing::warn!(
                         ?err,
-                        user_id = user.user_id.as_str(),
+                        user_id = user.id.as_str(),
                         "sync.subscriptions: load recent release ids for smart preheat failed"
                     );
                     Vec::new()
@@ -5075,7 +5180,7 @@ pub async fn sync_subscriptions(
             if !user_release_ids.is_empty()
                 && let Err(err) = enqueue_background_release_translation_task(
                     state,
-                    user.user_id.as_str(),
+                    user.id.as_str(),
                     &user_release_ids,
                     "sync.subscriptions.auto_translate",
                     Some(task_id),
@@ -5085,14 +5190,14 @@ pub async fn sync_subscriptions(
             {
                 tracing::warn!(
                     ?err,
-                    user_id = user.user_id.as_str(),
+                    user_id = user.id.as_str(),
                     "sync.subscriptions: enqueue background translation failed"
                 );
             }
             if !smart_preheat_release_ids.is_empty()
                 && let Err(err) = enqueue_background_release_smart_task(
                     state,
-                    user.user_id.as_str(),
+                    user.id.as_str(),
                     &smart_preheat_release_ids,
                     "sync.subscriptions.auto_smart",
                     Some(task_id),
@@ -5102,7 +5207,7 @@ pub async fn sync_subscriptions(
             {
                 tracing::warn!(
                     ?err,
-                    user_id = user.user_id.as_str(),
+                    user_id = user.id.as_str(),
                     "sync.subscriptions: enqueue background smart summary failed"
                 );
             }
@@ -5137,8 +5242,7 @@ pub async fn sync_subscriptions(
                 "run_canceled",
                 "subscription sync canceled before social phase",
                 json!({
-                    "total_users": star_summary.total_users,
-                    "successful_users": star_summary.succeeded_users,
+                    "total_users": collect_summary.total_users,
                     "release_repos": release_summary.total_repos,
                     "releases_written": releases_written,
                 }),
@@ -5147,7 +5251,7 @@ pub async fn sync_subscriptions(
         return Ok(SyncSubscriptionsResult {
             skipped: false,
             skip_reason: None,
-            star: star_summary,
+            collect: collect_summary,
             release: release_summary,
             social: SyncSubscriptionSocialSummary::default(),
             notifications: SyncSubscriptionNotificationsSummary::default(),
@@ -5157,7 +5261,7 @@ pub async fn sync_subscriptions(
         });
     }
 
-    let social_summary = run_social_phase(&context, &successful_users).await?;
+    let social_summary = run_social_phase(&context, &users).await?;
     jobs::append_task_event(
         state,
         task_id,
@@ -5192,7 +5296,7 @@ pub async fn sync_subscriptions(
         return Ok(SyncSubscriptionsResult {
             skipped: false,
             skip_reason: None,
-            star: star_summary,
+            collect: collect_summary,
             release: release_summary,
             social: social_summary,
             notifications: SyncSubscriptionNotificationsSummary::default(),
@@ -5202,7 +5306,7 @@ pub async fn sync_subscriptions(
         });
     }
 
-    let notifications_summary = run_notifications_phase(&context, &successful_users).await?;
+    let notifications_summary = run_notifications_phase(&context, &users).await?;
     if let Err(err) = prune_subscription_sync_history(state).await {
         tracing::warn!(
             ?err,
@@ -5227,7 +5331,7 @@ pub async fn sync_subscriptions(
     let result = SyncSubscriptionsResult {
         skipped: false,
         skip_reason: None,
-        star: star_summary,
+        collect: collect_summary,
         release: release_summary,
         social: social_summary,
         notifications: notifications_summary,
@@ -5384,7 +5488,7 @@ async fn retry_subscription_release_watchers(
     let result = SyncSubscriptionsResult {
         skipped: false,
         skip_reason: None,
-        star: SyncSubscriptionStarSummary::default(),
+        collect: SyncSubscriptionCollectSummary::default(),
         release: SyncSubscriptionReleaseSummary {
             total_repos: attached_repos,
             succeeded_repos: attached_repos.saturating_sub(waited.failed),
@@ -5414,6 +5518,8 @@ async fn retry_subscription_release_watchers(
     Ok(result)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn run_star_phase(
     context: &SubscriptionRunContext,
     users: Vec<EligibleUserRow>,
@@ -5497,6 +5603,8 @@ async fn run_star_phase(
     Ok((successful_users, summary))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn emit_star_progress(
     context: &SubscriptionRunContext,
     progress: &mut SubscriptionProgressEmitter,
@@ -5518,6 +5626,8 @@ async fn emit_star_progress(
         .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn collect_star_result(
     joined: Option<Result<Result<Option<StarPhaseSuccess>>, tokio::task::JoinError>>,
     successful_users: &mut Vec<StarPhaseSuccess>,
@@ -5542,6 +5652,8 @@ fn collect_star_result(
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn sync_starred_for_user(
     context: SubscriptionRunContext,
     user: EligibleUserRow,
@@ -5561,6 +5673,7 @@ async fn sync_starred_for_user(
     .await
 }
 
+#[cfg(test)]
 async fn sync_starred_for_user_with_fetch<Fetch, FetchFut, Sleep, SleepFut>(
     context: SubscriptionRunContext,
     user: EligibleUserRow,
@@ -5771,25 +5884,24 @@ fn aggregate_repos(users: &[StarPhaseSuccess]) -> Vec<AggregatedRepo> {
 
 async fn aggregate_release_visible_repos(
     context: &SubscriptionRunContext,
-    users: &[StarPhaseSuccess],
+    users: &[EligibleUserRow],
 ) -> Result<Vec<AggregatedRepo>> {
     let mut grouped = HashMap::<i64, AggregatedRepo>::new();
 
     for user in users {
         if let Err(err) =
-            refresh_owned_repo_release_visibility(context.state.as_ref(), user.user_id.as_str())
-                .await
+            refresh_owned_repo_release_visibility(context.state.as_ref(), user.id.as_str()).await
         {
             tracing::warn!(
                 ?err,
-                user_id = user.user_id.as_str(),
+                user_id = user.id.as_str(),
                 "sync.subscriptions: refresh owned repo release visibility failed"
             );
         }
 
         let repos = load_user_release_visible_repo_aggregation_rows(
             context.state.as_ref(),
-            user.user_id.as_str(),
+            user.id.as_str(),
         )
         .await?;
         for repo in repos {
@@ -5803,7 +5915,7 @@ async fn aggregate_release_visible_repos(
                 });
             entry.is_private = entry.is_private || repo.is_private != 0;
             entry.related_users.push(RelatedUserRef {
-                user_id: user.user_id.clone(),
+                user_id: user.id.clone(),
                 last_active_at: user.last_active_at.clone(),
                 relation_count: usize::try_from(repo.relation_count).unwrap_or(1).max(1),
             });
@@ -7336,7 +7448,7 @@ async fn run_release_phase(
 
 async fn run_social_phase(
     context: &SubscriptionRunContext,
-    users: &[StarPhaseSuccess],
+    users: &[EligibleUserRow],
 ) -> Result<SyncSubscriptionSocialSummary> {
     let mut join_set = JoinSet::new();
     let mut summary = SyncSubscriptionSocialSummary {
@@ -7393,7 +7505,7 @@ async fn run_social_phase(
             return Ok(summary);
         }
         let worker_context = context.clone();
-        let user_id = user.user_id.clone();
+        let user_id = user.id.clone();
         join_set.spawn(async move { sync_social_for_user(worker_context, user_id).await });
     }
 
@@ -7607,7 +7719,7 @@ async fn sync_social_for_user(
 
 async fn run_notifications_phase(
     context: &SubscriptionRunContext,
-    users: &[StarPhaseSuccess],
+    users: &[EligibleUserRow],
 ) -> Result<SyncSubscriptionNotificationsSummary> {
     let mut join_set = JoinSet::new();
     let mut summary = SyncSubscriptionNotificationsSummary {
@@ -7664,7 +7776,7 @@ async fn run_notifications_phase(
             return Ok(summary);
         }
         let worker_context = context.clone();
-        let user_id = user.user_id.clone();
+        let user_id = user.id.clone();
         join_set.spawn(async move { sync_notifications_for_user(worker_context, user_id).await });
     }
 
@@ -10611,6 +10723,8 @@ async fn fetch_repo_stargazers_snapshot(
     Ok(RepoStargazerFetchResult { members, partial })
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn fetch_starred_snapshot(
     state: &AppState,
     user_id: &str,
@@ -10722,6 +10836,982 @@ async fn count_user_starred_repos(state: &AppState, user_id: &str) -> Result<usi
     Ok(usize::try_from(count).unwrap_or_default())
 }
 
+pub async fn load_star_sync_runtime_status(state: &AppState) -> Result<StarSyncRuntimeStatus> {
+    let last_delta_completed_at = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT MAX(finished_at)
+        FROM job_tasks
+        WHERE task_type = ?
+          AND status = ?
+        "#,
+    )
+    .bind(jobs::TASK_SYNC_STARRED_DELTA)
+    .bind(jobs::STATUS_SUCCEEDED)
+    .fetch_one(&state.pool)
+    .await
+    .context("load last star delta completion")?;
+    let last_full_sweep_completed_at = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT MAX(completed_at)
+        FROM star_sync_epochs
+        WHERE status = 'succeeded'
+        "#,
+    )
+    .fetch_one(&state.pool)
+    .await
+    .context("load last star full sweep completion")?;
+    let rows = sqlx::query_as::<_, StarSyncEpochRow>(
+        r#"
+        SELECT
+          id,
+          user_id,
+          github_connection_id,
+          status,
+          started_at,
+          next_cursor,
+          total_count_at_start,
+          processed_pages,
+          processed_items,
+          next_slice_not_before,
+          lease_owner_id,
+          lease_expires_at
+        FROM star_sync_epochs
+        WHERE status IN ('queued', 'running')
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .context("load active star reconciliation epochs")?;
+
+    let active_epochs = rows
+        .into_iter()
+        .map(|row| {
+            let completion_percent = row.total_count_at_start.and_then(|total| {
+                (total > 0).then(|| {
+                    ((row.processed_items.max(0) as f64 / total as f64) * 100.0).min(100.0)
+                })
+            });
+            StarSyncEpochRuntimeStatus {
+                github_connection_id: row.github_connection_id,
+                processed_pages: usize::try_from(row.processed_pages.max(0)).unwrap_or_default(),
+                processed_items: usize::try_from(row.processed_items.max(0)).unwrap_or_default(),
+                total_count_at_start: row.total_count_at_start,
+                completion_percent,
+                next_slice_not_before: row.next_slice_not_before,
+            }
+        })
+        .collect();
+
+    Ok(StarSyncRuntimeStatus {
+        last_delta_completed_at,
+        last_full_sweep_completed_at,
+        active_epochs,
+    })
+}
+
+async fn load_sync_github_connection(
+    state: &AppState,
+    user_id: &str,
+    github_connection_id: &str,
+) -> Result<SyncGitHubConnection, SyncRequestError> {
+    load_sync_github_connections(state, user_id)
+        .await?
+        .into_iter()
+        .find(|connection| connection.id == github_connection_id)
+        .ok_or_else(|| {
+            SyncRequestError::non_retryable(
+                "credentials_invalid",
+                format!("user #{user_id} has no github connection #{github_connection_id}"),
+                None,
+            )
+        })
+}
+
+fn starred_snapshot_from_edge(edge: StarredEdge) -> Option<StarredRepoSnapshot> {
+    let repo_id = edge.node.database_id?;
+    let uses_custom_open_graph_image = edge.node.uses_custom_open_graph_image();
+    Some(StarredRepoSnapshot {
+        repo_id,
+        full_name: edge.node.name_with_owner,
+        owner_login: edge.node.owner.login,
+        name: edge.node.name,
+        description: edge.node.description,
+        html_url: edge.node.url,
+        stargazed_at: edge.starred_at,
+        is_private: edge.node.is_private,
+        repo_stargazer_count: edge.node.stargazer_count,
+        owner_avatar_url: edge.node.owner.avatar_url,
+        open_graph_image_url: edge.node.open_graph_image_url,
+        uses_custom_open_graph_image,
+    })
+}
+
+async fn fetch_starred_page_with_token(
+    state: &AppState,
+    token: &str,
+    after: Option<&str>,
+    first: usize,
+) -> Result<StarredPageResult, SyncRequestError> {
+    let query = r#"
+      query($after: String, $first: Int!) {
+        viewer {
+          starredRepositories(first: $first, after: $after, orderBy: {field: STARRED_AT, direction: DESC}) {
+            totalCount
+            isOverLimit
+            pageInfo { hasNextPage endCursor }
+            edges {
+              starredAt
+              node {
+                databaseId
+                nameWithOwner
+                name
+                description
+                url
+                isPrivate
+                stargazerCount
+                openGraphImageUrl
+                usesCustomOpenGraphImage
+                owner {
+                  login
+                  avatarUrl(size: 80)
+                }
+              }
+            }
+          }
+        }
+      }
+    "#;
+    let mut attempt = 1;
+    let payload = 'fetch: loop {
+        let result = with_subscription_timeout("sync starred graphql page", async {
+            let response = state
+                .http
+                .post(state.github_graphql_url.clone())
+                .bearer_auth(token)
+                .header(USER_AGENT, "OctoRill")
+                .header(ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", API_VERSION)
+                .json(&json!({
+                    "query": query,
+                    "variables": { "after": after, "first": first },
+                }))
+                .send()
+                .await
+                .map_err(|err| classify_reqwest_error("sync starred graphql page", err))?;
+            fetch_json_response::<GraphQlResponse<StarredData>>(
+                response,
+                "sync starred graphql page",
+            )
+            .await
+        })
+        .await;
+
+        match result {
+            Ok(payload) => {
+                if let Some(errors) = payload.errors.as_ref().filter(|items| !items.is_empty()) {
+                    let err = classify_graphql_errors("sync starred graphql page", errors);
+                    if err.retryable && attempt < SUBSCRIPTION_RETRY_LIMIT {
+                        tracing::warn!(
+                            event = "upstream.call",
+                            operation = "sync.starred.page.retry",
+                            attempt,
+                            retry_limit = SUBSCRIPTION_RETRY_LIMIT,
+                            error_stage = err.phase,
+                            error_kind = err.reason_code,
+                            error_chain = %err.message,
+                            "starred page fetch: retryable graphql failure"
+                        );
+                        tokio::time::sleep(subscription_retry_delay(attempt)).await;
+                        attempt += 1;
+                        continue 'fetch;
+                    }
+                    return Err(err);
+                }
+                break payload;
+            }
+            Err(err) if err.retryable && attempt < SUBSCRIPTION_RETRY_LIMIT => {
+                tracing::warn!(
+                    event = "upstream.call",
+                    operation = "sync.starred.page.retry",
+                    attempt,
+                    retry_limit = SUBSCRIPTION_RETRY_LIMIT,
+                    error_stage = err.phase,
+                    error_kind = err.reason_code,
+                    error_chain = %err.message,
+                    "starred page fetch: retryable upstream failure"
+                );
+                tokio::time::sleep(subscription_retry_delay(attempt)).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    };
+    let page = payload
+        .data
+        .ok_or_else(|| {
+            SyncRequestError::non_retryable(
+                "graphql_missing_data",
+                "sync starred graphql page: missing graphql data",
+                None,
+            )
+        })?
+        .viewer
+        .starred_repositories;
+    let mut repos = page
+        .edges
+        .into_iter()
+        .filter_map(starred_snapshot_from_edge)
+        .collect::<Vec<_>>();
+    repos.sort_by(|left, right| {
+        right
+            .stargazed_at
+            .cmp(&left.stargazed_at)
+            .then_with(|| left.full_name.cmp(&right.full_name))
+    });
+    Ok(StarredPageResult {
+        repos,
+        has_next_page: page.page_info.has_next_page,
+        end_cursor: page.page_info.end_cursor,
+        total_count: page.total_count.max(0),
+        is_over_limit: page.is_over_limit,
+    })
+}
+
+async fn upsert_user_starred_repo_from_memberships_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    user_id: &str,
+    repo_id: i64,
+    fallback_full_name: &str,
+    now: &str,
+) -> Result<()> {
+    let membership = sqlx::query_as::<_, StarredMembershipRow>(
+        r#"
+        SELECT
+          repo_id,
+          full_name,
+          owner_login,
+          name,
+          description,
+          html_url,
+          stargazed_at,
+          is_private,
+          repo_stargazer_count,
+          owner_avatar_url,
+          open_graph_image_url,
+          uses_custom_open_graph_image
+        FROM starred_repo_connection_memberships
+        WHERE user_id = ?
+          AND repo_id = ?
+        ORDER BY stargazed_at DESC, updated_at DESC, id ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(repo_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("load aggregate star membership")?;
+
+    let Some(snapshot) = membership.map(StarredMembershipRow::into_snapshot) else {
+        sqlx::query("DELETE FROM starred_repos WHERE user_id = ? AND repo_id = ?")
+            .bind(user_id)
+            .bind(repo_id)
+            .execute(&mut **tx)
+            .await
+            .context("delete aggregate starred repo")?;
+        crate::api::clear_user_repo_association_source_for_repo_tx(
+            tx,
+            user_id,
+            crate::api::UserRepoAssociationSource::GitHubStar,
+            repo_id,
+            fallback_full_name,
+            now,
+        )
+        .await
+        .context("clear aggregate github star association")?;
+        return Ok(());
+    };
+
+    sqlx::query(
+        r#"
+        INSERT INTO starred_repos (
+          id, user_id, repo_id, full_name, owner_login, name, description, html_url,
+          stargazed_at, is_private, updated_at, owner_avatar_url, open_graph_image_url,
+          uses_custom_open_graph_image, repo_stargazer_count, repo_stargazer_count_updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, repo_id) DO UPDATE SET
+          full_name = excluded.full_name,
+          owner_login = excluded.owner_login,
+          name = excluded.name,
+          description = excluded.description,
+          html_url = excluded.html_url,
+          stargazed_at = excluded.stargazed_at,
+          is_private = excluded.is_private,
+          updated_at = excluded.updated_at,
+          owner_avatar_url = excluded.owner_avatar_url,
+          open_graph_image_url = excluded.open_graph_image_url,
+          uses_custom_open_graph_image = excluded.uses_custom_open_graph_image,
+          repo_stargazer_count = excluded.repo_stargazer_count,
+          repo_stargazer_count_updated_at = excluded.repo_stargazer_count_updated_at
+        "#,
+    )
+    .bind(local_id::generate_local_id())
+    .bind(user_id)
+    .bind(snapshot.repo_id)
+    .bind(snapshot.full_name.as_str())
+    .bind(snapshot.owner_login.as_str())
+    .bind(snapshot.name.as_str())
+    .bind(snapshot.description.as_deref())
+    .bind(snapshot.html_url.as_str())
+    .bind(snapshot.stargazed_at.as_str())
+    .bind(snapshot.is_private as i64)
+    .bind(now)
+    .bind(snapshot.owner_avatar_url.as_deref())
+    .bind(snapshot.open_graph_image_url.as_deref())
+    .bind(snapshot.uses_custom_open_graph_image as i64)
+    .bind(snapshot.repo_stargazer_count)
+    .bind(snapshot.repo_stargazer_count.map(|_| now))
+    .execute(&mut **tx)
+    .await
+    .context("upsert aggregate starred repo")?;
+    let association = user_repo_association_from_starred_snapshot(&snapshot, now);
+    crate::api::upsert_user_repo_association_tx(tx, user_id, &association, now)
+        .await
+        .context("upsert aggregate github star association")?;
+    Ok(())
+}
+
+async fn apply_starred_membership_page(
+    state: &AppState,
+    user_id: &str,
+    github_connection_id: &str,
+    repos: &[StarredRepoSnapshot],
+    epoch_id: Option<&str>,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    let (_writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "star_sync_membership_page",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin star membership page transaction")?;
+    for repo in repos {
+        sqlx::query(
+            r#"
+            INSERT INTO starred_repo_connection_memberships (
+              id, user_id, github_connection_id, repo_id, full_name, owner_login, name,
+              description, html_url, stargazed_at, is_private, owner_avatar_url,
+              open_graph_image_url, uses_custom_open_graph_image, repo_stargazer_count,
+              last_seen_epoch_id, last_delta_seen_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, github_connection_id, repo_id) DO UPDATE SET
+              full_name = excluded.full_name,
+              owner_login = excluded.owner_login,
+              name = excluded.name,
+              description = excluded.description,
+              html_url = excluded.html_url,
+              stargazed_at = excluded.stargazed_at,
+              is_private = excluded.is_private,
+              owner_avatar_url = excluded.owner_avatar_url,
+              open_graph_image_url = excluded.open_graph_image_url,
+              uses_custom_open_graph_image = excluded.uses_custom_open_graph_image,
+              repo_stargazer_count = excluded.repo_stargazer_count,
+              last_seen_epoch_id = COALESCE(excluded.last_seen_epoch_id, starred_repo_connection_memberships.last_seen_epoch_id),
+              last_delta_seen_at = COALESCE(excluded.last_delta_seen_at, starred_repo_connection_memberships.last_delta_seen_at),
+              updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id)
+        .bind(github_connection_id)
+        .bind(repo.repo_id)
+        .bind(repo.full_name.as_str())
+        .bind(repo.owner_login.as_str())
+        .bind(repo.name.as_str())
+        .bind(repo.description.as_deref())
+        .bind(repo.html_url.as_str())
+        .bind(repo.stargazed_at.as_str())
+        .bind(repo.is_private as i64)
+        .bind(repo.owner_avatar_url.as_deref())
+        .bind(repo.open_graph_image_url.as_deref())
+        .bind(repo.uses_custom_open_graph_image as i64)
+        .bind(repo.repo_stargazer_count)
+        .bind(epoch_id)
+        .bind(epoch_id.is_none().then_some(now.as_str()))
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("upsert star connection membership {}", repo.full_name))?;
+        upsert_user_starred_repo_from_memberships_tx(
+            &mut tx,
+            user_id,
+            repo.repo_id,
+            repo.full_name.as_str(),
+            now.as_str(),
+        )
+        .await?;
+    }
+    tx.commit()
+        .await
+        .context("commit star membership page transaction")?;
+    Ok(())
+}
+
+pub async fn sync_starred_delta(
+    state: &AppState,
+    user_id: &str,
+    github_connection_id: &str,
+) -> Result<SyncStarredDeltaResult> {
+    let connection = load_sync_github_connection(state, user_id, github_connection_id)
+        .await
+        .map_err(SyncRequestError::into_anyhow)?;
+    let page = fetch_starred_page_with_token(
+        state,
+        connection.access_token.as_str(),
+        None,
+        STAR_SYNC_DELTA_PAGE_SIZE,
+    )
+    .await
+    .map_err(SyncRequestError::into_anyhow)?;
+    if page.is_over_limit {
+        // A delta never removes memberships, so a partial GitHub response can
+        // still advance freshness without risking a false unstar.
+        tracing::warn!(
+            user_id,
+            github_connection_id,
+            "star delta received an over-limit GitHub connection"
+        );
+    }
+    apply_starred_membership_page(state, user_id, github_connection_id, &page.repos, None).await?;
+    Ok(SyncStarredDeltaResult {
+        user_id: user_id.to_owned(),
+        github_connection_id: github_connection_id.to_owned(),
+        items_observed: page.repos.len(),
+    })
+}
+
+pub async fn sync_starred_delta_for_user(
+    state: &AppState,
+    user_id: &str,
+) -> Result<SyncStarredResult> {
+    let connections = load_sync_github_connections(state, user_id)
+        .await
+        .map_err(SyncRequestError::into_anyhow)?;
+    for connection in connections {
+        sync_starred_delta(state, user_id, connection.id.as_str()).await?;
+    }
+    Ok(SyncStarredResult {
+        repos: count_user_starred_repos(state, user_id).await?,
+    })
+}
+
+fn star_sync_timestamp_due(value: Option<&str>, now: DateTime<Utc>) -> bool {
+    value
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_none_or(|value| value.with_timezone(&Utc) <= now)
+}
+
+pub async fn ensure_star_reconciliation_epoch_due(
+    state: &AppState,
+    user_id: &str,
+    github_connection_id: &str,
+    full_sweep_interval_minutes: i64,
+    now: DateTime<Utc>,
+) -> Result<Option<String>> {
+    let interval =
+        admin_runtime::normalize_star_sync_full_sweep_interval_minutes(full_sweep_interval_minutes);
+    let now_rfc3339 = now.to_rfc3339();
+    let (_writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "star_sync_epoch_due",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin star epoch due transaction")?;
+    let active = sqlx::query_as::<_, StarSyncEpochRow>(
+        r#"
+        SELECT
+          id,
+          user_id,
+          github_connection_id,
+          status,
+          started_at,
+          next_cursor,
+          total_count_at_start,
+          processed_pages,
+          processed_items,
+          next_slice_not_before,
+          lease_owner_id,
+          lease_expires_at
+        FROM star_sync_epochs
+        WHERE github_connection_id = ?
+          AND status IN ('queued', 'running')
+        ORDER BY created_at ASC, id ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(github_connection_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("load active star reconciliation epoch")?;
+    if let Some(active) = active {
+        let ready = star_sync_timestamp_due(active.next_slice_not_before.as_deref(), now)
+            && star_sync_timestamp_due(active.lease_expires_at.as_deref(), now);
+        tx.commit()
+            .await
+            .context("commit active star epoch due transaction")?;
+        return Ok(ready.then_some(active.id));
+    }
+
+    let last_completed_at = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT completed_at
+        FROM star_sync_epochs
+        WHERE github_connection_id = ?
+          AND status = 'succeeded'
+        ORDER BY completed_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(github_connection_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("load latest completed star epoch")?
+    .flatten();
+    let due_after = now - chrono::Duration::minutes(interval);
+    let due = last_completed_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_none_or(|value| value.with_timezone(&Utc) <= due_after);
+    if !due {
+        tx.commit()
+            .await
+            .context("commit not-due star epoch transaction")?;
+        return Ok(None);
+    }
+
+    let epoch_id = local_id::generate_local_id();
+    sqlx::query(
+        r#"
+        INSERT INTO star_sync_epochs (
+          id, user_id, github_connection_id, status, started_at, next_cursor,
+          total_count_at_start, processed_pages, processed_items, next_slice_not_before,
+          lease_owner_id, lease_expires_at, completed_at, failure_reason, created_at, updated_at
+        ) VALUES (?, ?, ?, 'queued', ?, NULL, NULL, 0, 0, ?, NULL, NULL, NULL, NULL, ?, ?)
+        "#,
+    )
+    .bind(epoch_id.as_str())
+    .bind(user_id)
+    .bind(github_connection_id)
+    .bind(now_rfc3339.as_str())
+    .bind(now_rfc3339.as_str())
+    .bind(now_rfc3339.as_str())
+    .bind(now_rfc3339.as_str())
+    .execute(&mut *tx)
+    .await
+    .context("create star reconciliation epoch")?;
+    tx.commit()
+        .await
+        .context("commit created star reconciliation epoch")?;
+    Ok(Some(epoch_id))
+}
+
+async fn claim_star_reconciliation_epoch_slice(
+    state: &AppState,
+    epoch_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<StarSyncEpochRow>> {
+    let lease_expires_at =
+        (now + chrono::Duration::minutes(STAR_SYNC_EPOCH_LEASE_MINUTES)).to_rfc3339();
+    let now_rfc3339 = now.to_rfc3339();
+    let (_writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "star_sync_epoch_claim",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin star epoch claim transaction")?;
+    let epoch = sqlx::query_as::<_, StarSyncEpochRow>(
+        r#"
+        SELECT
+          id,
+          user_id,
+          github_connection_id,
+          status,
+          started_at,
+          next_cursor,
+          total_count_at_start,
+          processed_pages,
+          processed_items,
+          next_slice_not_before,
+          lease_owner_id,
+          lease_expires_at
+        FROM star_sync_epochs
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(epoch_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("load star epoch for slice claim")?;
+    let Some(epoch) = epoch else {
+        tx.commit()
+            .await
+            .context("commit missing star epoch claim")?;
+        return Ok(None);
+    };
+    let can_claim = matches!(epoch.status.as_str(), "queued" | "running")
+        && star_sync_timestamp_due(epoch.next_slice_not_before.as_deref(), now)
+        && star_sync_timestamp_due(epoch.lease_expires_at.as_deref(), now);
+    if !can_claim {
+        tx.commit()
+            .await
+            .context("commit skipped star epoch claim")?;
+        return Ok(None);
+    }
+    sqlx::query(
+        r#"
+        UPDATE star_sync_epochs
+        SET status = 'running',
+            lease_owner_id = ?,
+            lease_expires_at = ?,
+            updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(state.runtime_owner_id.as_str())
+    .bind(lease_expires_at.as_str())
+    .bind(now_rfc3339.as_str())
+    .bind(epoch_id)
+    .execute(&mut *tx)
+    .await
+    .context("claim star epoch slice")?;
+    tx.commit().await.context("commit star epoch slice claim")?;
+    Ok(Some(epoch))
+}
+
+async fn fail_star_reconciliation_epoch(
+    state: &AppState,
+    epoch_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    state
+        .sqlite_writer
+        .write("star_sync_epoch_fail", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE star_sync_epochs
+                SET status = 'failed',
+                    completed_at = ?,
+                    failure_reason = ?,
+                    lease_owner_id = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN ('queued', 'running')
+                "#,
+            )
+            .bind(now.as_str())
+            .bind(reason)
+            .bind(now.as_str())
+            .bind(epoch_id)
+            .execute(&state.pool)
+            .await
+            .context("mark star epoch failed")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+}
+
+async fn schedule_next_star_reconciliation_slice(
+    state: &AppState,
+    epoch: &StarSyncEpochRow,
+    page: &StarredPageResult,
+    full_sweep_interval_minutes: i64,
+    now: DateTime<Utc>,
+) -> Result<SyncStarredReconcileResult> {
+    let Some(next_cursor) = page.end_cursor.as_deref() else {
+        fail_star_reconciliation_epoch(state, epoch.id.as_str(), "missing_end_cursor").await?;
+        anyhow::bail!("star reconciliation response hasNextPage without endCursor");
+    };
+    let total_count = epoch
+        .total_count_at_start
+        .unwrap_or(page.total_count)
+        .max(0);
+    let expected_pages = ((total_count + STAR_SYNC_FULL_PAGE_SIZE as i64 - 1)
+        / STAR_SYNC_FULL_PAGE_SIZE as i64)
+        .max(1);
+    let full_sweep_seconds =
+        admin_runtime::normalize_star_sync_full_sweep_interval_minutes(full_sweep_interval_minutes)
+            * 60;
+    let page_spacing_seconds = (full_sweep_seconds / expected_pages).max(20);
+    let next_slice_not_before =
+        (now + chrono::Duration::seconds(page_spacing_seconds)).to_rfc3339();
+    let processed_pages = epoch.processed_pages + 1;
+    let processed_items =
+        epoch.processed_items + i64::try_from(page.repos.len()).unwrap_or(i64::MAX);
+    let now_rfc3339 = now.to_rfc3339();
+    state
+        .sqlite_writer
+        .write("star_sync_epoch_schedule_next", |_| async {
+            let update = sqlx::query(
+                r#"
+                UPDATE star_sync_epochs
+                SET status = 'queued',
+                    next_cursor = ?,
+                    total_count_at_start = COALESCE(total_count_at_start, ?),
+                    processed_pages = ?,
+                    processed_items = ?,
+                    next_slice_not_before = ?,
+                    lease_owner_id = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status = 'running'
+                  AND lease_owner_id = ?
+                "#,
+            )
+            .bind(next_cursor)
+            .bind(page.total_count)
+            .bind(processed_pages)
+            .bind(processed_items)
+            .bind(next_slice_not_before.as_str())
+            .bind(now_rfc3339.as_str())
+            .bind(epoch.id.as_str())
+            .bind(state.runtime_owner_id.as_str())
+            .execute(&state.pool)
+            .await
+            .context("schedule next star reconciliation slice")?;
+            if update.rows_affected() != 1 {
+                anyhow::bail!("star reconciliation lease was lost before scheduling next slice");
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(SyncStarredReconcileResult {
+        epoch_id: epoch.id.clone(),
+        github_connection_id: epoch.github_connection_id.clone(),
+        processed_pages: usize::try_from(processed_pages.max(0)).unwrap_or_default(),
+        processed_items: usize::try_from(processed_items.max(0)).unwrap_or_default(),
+        total_count_at_start: Some(total_count),
+        has_next_page: true,
+        next_slice_not_before: Some(next_slice_not_before),
+        status: "queued".to_owned(),
+        membership_removed: 0,
+    })
+}
+
+async fn finalize_star_reconciliation_epoch(
+    state: &AppState,
+    epoch: &StarSyncEpochRow,
+    page: &StarredPageResult,
+    now: DateTime<Utc>,
+) -> Result<SyncStarredReconcileResult> {
+    #[derive(sqlx::FromRow)]
+    struct StaleMembershipRow {
+        repo_id: i64,
+        full_name: String,
+    }
+
+    let now_rfc3339 = now.to_rfc3339();
+    let (_writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "star_sync_epoch_finalize",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin star reconciliation finalize transaction")?;
+    let stale = sqlx::query_as::<_, StaleMembershipRow>(
+        r#"
+        SELECT repo_id, full_name
+        FROM starred_repo_connection_memberships
+        WHERE user_id = ?
+          AND github_connection_id = ?
+          AND (last_seen_epoch_id IS NULL OR last_seen_epoch_id != ?)
+          AND (last_delta_seen_at IS NULL OR datetime(last_delta_seen_at) < datetime(?))
+        ORDER BY repo_id ASC
+        "#,
+    )
+    .bind(epoch.user_id.as_str())
+    .bind(epoch.github_connection_id.as_str())
+    .bind(epoch.id.as_str())
+    .bind(epoch.started_at.as_str())
+    .fetch_all(&mut *tx)
+    .await
+    .context("load stale star memberships")?;
+    sqlx::query(
+        r#"
+        DELETE FROM starred_repo_connection_memberships
+        WHERE user_id = ?
+          AND github_connection_id = ?
+          AND (last_seen_epoch_id IS NULL OR last_seen_epoch_id != ?)
+          AND (last_delta_seen_at IS NULL OR datetime(last_delta_seen_at) < datetime(?))
+        "#,
+    )
+    .bind(epoch.user_id.as_str())
+    .bind(epoch.github_connection_id.as_str())
+    .bind(epoch.id.as_str())
+    .bind(epoch.started_at.as_str())
+    .execute(&mut *tx)
+    .await
+    .context("delete stale star memberships")?;
+    for stale_repo in &stale {
+        upsert_user_starred_repo_from_memberships_tx(
+            &mut tx,
+            epoch.user_id.as_str(),
+            stale_repo.repo_id,
+            stale_repo.full_name.as_str(),
+            now_rfc3339.as_str(),
+        )
+        .await?;
+    }
+    let processed_pages = epoch.processed_pages + 1;
+    let processed_items =
+        epoch.processed_items + i64::try_from(page.repos.len()).unwrap_or(i64::MAX);
+    let update = sqlx::query(
+        r#"
+        UPDATE star_sync_epochs
+        SET status = 'succeeded',
+            total_count_at_start = COALESCE(total_count_at_start, ?),
+            processed_pages = ?,
+            processed_items = ?,
+            next_slice_not_before = NULL,
+            lease_owner_id = NULL,
+            lease_expires_at = NULL,
+            completed_at = ?,
+            failure_reason = NULL,
+            updated_at = ?
+        WHERE id = ?
+          AND status = 'running'
+          AND lease_owner_id = ?
+        "#,
+    )
+    .bind(page.total_count)
+    .bind(processed_pages)
+    .bind(processed_items)
+    .bind(now_rfc3339.as_str())
+    .bind(now_rfc3339.as_str())
+    .bind(epoch.id.as_str())
+    .bind(state.runtime_owner_id.as_str())
+    .execute(&mut *tx)
+    .await
+    .context("complete star reconciliation epoch")?;
+    if update.rows_affected() != 1 {
+        anyhow::bail!("star reconciliation lease was lost before finalize");
+    }
+    tx.commit()
+        .await
+        .context("commit star reconciliation finalize transaction")?;
+    Ok(SyncStarredReconcileResult {
+        epoch_id: epoch.id.clone(),
+        github_connection_id: epoch.github_connection_id.clone(),
+        processed_pages: usize::try_from(processed_pages.max(0)).unwrap_or_default(),
+        processed_items: usize::try_from(processed_items.max(0)).unwrap_or_default(),
+        total_count_at_start: Some(
+            epoch
+                .total_count_at_start
+                .unwrap_or(page.total_count)
+                .max(0),
+        ),
+        has_next_page: false,
+        next_slice_not_before: None,
+        status: "succeeded".to_owned(),
+        membership_removed: stale.len(),
+    })
+}
+
+pub async fn sync_starred_reconciliation_slice(
+    state: &AppState,
+    epoch_id: &str,
+) -> Result<SyncStarredReconcileResult> {
+    let now = Utc::now();
+    let Some(epoch) = claim_star_reconciliation_epoch_slice(state, epoch_id, now).await? else {
+        return Ok(SyncStarredReconcileResult {
+            epoch_id: epoch_id.to_owned(),
+            github_connection_id: String::new(),
+            processed_pages: 0,
+            processed_items: 0,
+            total_count_at_start: None,
+            has_next_page: false,
+            next_slice_not_before: None,
+            status: "skipped".to_owned(),
+            membership_removed: 0,
+        });
+    };
+    let connection = match load_sync_github_connection(
+        state,
+        epoch.user_id.as_str(),
+        epoch.github_connection_id.as_str(),
+    )
+    .await
+    {
+        Ok(connection) => connection,
+        Err(err) => {
+            fail_star_reconciliation_epoch(state, epoch.id.as_str(), err.message.as_str()).await?;
+            return Err(err.into_anyhow());
+        }
+    };
+    let page = match fetch_starred_page_with_token(
+        state,
+        connection.access_token.as_str(),
+        epoch.next_cursor.as_deref(),
+        STAR_SYNC_FULL_PAGE_SIZE,
+    )
+    .await
+    {
+        Ok(page) => page,
+        Err(err) => {
+            fail_star_reconciliation_epoch(state, epoch.id.as_str(), err.message.as_str()).await?;
+            return Err(err.into_anyhow());
+        }
+    };
+    if page.is_over_limit {
+        fail_star_reconciliation_epoch(state, epoch.id.as_str(), "github_is_over_limit").await?;
+        anyhow::bail!("star reconciliation refused to prune an over-limit GitHub connection");
+    }
+    if let Err(err) = apply_starred_membership_page(
+        state,
+        epoch.user_id.as_str(),
+        epoch.github_connection_id.as_str(),
+        &page.repos,
+        Some(epoch.id.as_str()),
+    )
+    .await
+    {
+        fail_star_reconciliation_epoch(state, epoch.id.as_str(), err.to_string().as_str()).await?;
+        return Err(err);
+    }
+    let full_sweep_interval_minutes =
+        admin_runtime::load_star_sync_full_sweep_interval_minutes(&state.pool).await?;
+    if page.has_next_page {
+        schedule_next_star_reconciliation_slice(
+            state,
+            &epoch,
+            &page,
+            full_sweep_interval_minutes,
+            now,
+        )
+        .await
+    } else {
+        finalize_star_reconciliation_epoch(state, &epoch, &page, now).await
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
 async fn fetch_starred_snapshot_with_token(
     state: &AppState,
     token: &str,
@@ -10867,6 +11957,7 @@ async fn replace_starred_repos(
     .await
 }
 
+#[cfg(test)]
 async fn replace_starred_repos_with_priority(
     state: &AppState,
     user_id: &str,
@@ -10941,6 +12032,7 @@ async fn replace_starred_repos_with_priority(
     Ok(())
 }
 
+#[cfg(test)]
 async fn upsert_starred_repos(
     state: &AppState,
     user_id: &str,
@@ -12637,11 +13729,9 @@ mod tests {
             .expect("build subscription context");
         let repos = aggregate_release_visible_repos(
             &context,
-            &[StarPhaseSuccess {
-                user_id: user_id.clone(),
+            &[EligibleUserRow {
+                id: user_id.clone(),
                 last_active_at: Some("2026-03-06T12:00:00Z".to_owned()),
-                repo_count: 2,
-                repos: vec![],
             }],
         )
         .await
@@ -19767,7 +20857,7 @@ mod tests {
         .await
         .expect("run sync subscriptions");
 
-        assert_eq!(result.star.total_users, 0);
+        assert_eq!(result.collect.total_users, 0);
         assert_eq!(result.social.total_users, 0);
         assert_eq!(result.notifications.notifications, 0);
 
@@ -19788,8 +20878,6 @@ mod tests {
             stages,
             vec![
                 "collect".to_owned(),
-                "star_progress".to_owned(),
-                "star_summary".to_owned(),
                 "repo_collect".to_owned(),
                 "release_summary".to_owned(),
                 "social_progress".to_owned(),
@@ -20127,6 +21215,147 @@ mod tests {
         .await
         .expect("load page count");
         assert_eq!(page_count, 12);
+    }
+
+    #[tokio::test]
+    async fn star_reconciliation_prunes_only_stale_memberships_not_seen_by_later_delta() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("star-reconciliation-prune");
+        let connection_id = test_user_id("star-reconciliation-connection");
+        let epoch_id = test_user_id("star-reconciliation-epoch");
+        seed_user(&pool, user_id.as_str()).await;
+        let encrypted = state
+            .encryption_key
+            .encrypt_str("test-token")
+            .expect("encrypt github access token");
+        sqlx::query(
+            r#"
+            INSERT INTO github_connections (
+              id,
+              user_id,
+              github_user_id,
+              login,
+              access_token_ciphertext,
+              access_token_nonce,
+              scopes,
+              linked_at,
+              updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(connection_id.as_str())
+        .bind(user_id.as_str())
+        .bind(30_215_105_i64)
+        .bind("octo")
+        .bind(encrypted.ciphertext)
+        .bind(encrypted.nonce)
+        .bind("read:user")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("2026-03-06T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed github connection");
+        seed_starred_repo_row(&pool, user_id.as_str(), 42, "octo/stale").await;
+        seed_starred_repo_row(&pool, user_id.as_str(), 43, "octo/reobserved").await;
+        let started_at = "2026-03-07T00:00:00+00:00";
+        let now = DateTime::parse_from_rfc3339("2026-03-07T01:00:00Z")
+            .expect("parse fixed time")
+            .with_timezone(&Utc);
+        sqlx::query(
+            r#"
+            INSERT INTO star_sync_epochs (
+              id, user_id, github_connection_id, status, started_at, next_cursor,
+              total_count_at_start, processed_pages, processed_items, next_slice_not_before,
+              lease_owner_id, lease_expires_at, completed_at, failure_reason, created_at, updated_at
+            ) VALUES (?, ?, ?, 'running', ?, NULL, 2, 0, 0, NULL, ?, ?, NULL, NULL, ?, ?)
+            "#,
+        )
+        .bind(epoch_id.as_str())
+        .bind(user_id.as_str())
+        .bind(connection_id.as_str())
+        .bind(started_at)
+        .bind(state.runtime_owner_id.as_str())
+        .bind("2026-03-07T01:02:00+00:00")
+        .bind(started_at)
+        .bind(started_at)
+        .execute(&pool)
+        .await
+        .expect("seed running epoch");
+        for (repo_id, full_name, last_delta_seen_at) in [
+            (42_i64, "octo/stale", "2026-03-06T23:00:00Z"),
+            (43_i64, "octo/reobserved", "2026-03-07T00:00:01Z"),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO starred_repo_connection_memberships (
+                  id, user_id, github_connection_id, repo_id, full_name, owner_login, name,
+                  description, html_url, stargazed_at, is_private, owner_avatar_url,
+                  open_graph_image_url, uses_custom_open_graph_image, repo_stargazer_count,
+                  last_seen_epoch_id, last_delta_seen_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'octo', ?, NULL, ?, ?, 0, NULL, NULL, 0, 0, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(local_id::generate_local_id())
+            .bind(user_id.as_str())
+            .bind(connection_id.as_str())
+            .bind(repo_id)
+            .bind(full_name)
+            .bind(full_name.rsplit('/').next().expect("repo name"))
+            .bind(format!("https://github.com/{full_name}"))
+            .bind("2026-03-06T12:00:00Z")
+            .bind("previous-epoch")
+            .bind(last_delta_seen_at)
+            .bind(started_at)
+            .bind(started_at)
+            .execute(&pool)
+            .await
+            .expect("seed connection membership");
+        }
+
+        let result = super::finalize_star_reconciliation_epoch(
+            state.as_ref(),
+            &super::StarSyncEpochRow {
+                id: epoch_id,
+                user_id: user_id.clone(),
+                github_connection_id: connection_id.clone(),
+                status: "running".to_owned(),
+                started_at: started_at.to_owned(),
+                next_cursor: None,
+                total_count_at_start: Some(2),
+                processed_pages: 0,
+                processed_items: 0,
+                next_slice_not_before: None,
+                lease_expires_at: Some("2026-03-07T01:02:00+00:00".to_owned()),
+            },
+            &super::StarredPageResult {
+                repos: Vec::new(),
+                has_next_page: false,
+                end_cursor: None,
+                total_count: 2,
+                is_over_limit: false,
+            },
+            now,
+        )
+        .await
+        .expect("finalize reconciliation epoch");
+
+        assert_eq!(result.membership_removed, 1);
+        let remaining_memberships = sqlx::query_scalar::<_, i64>(
+            "SELECT repo_id FROM starred_repo_connection_memberships ORDER BY repo_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("load remaining memberships");
+        assert_eq!(remaining_memberships, vec![43]);
+        let remaining_repos = sqlx::query_scalar::<_, i64>(
+            "SELECT repo_id FROM starred_repos WHERE user_id = ? ORDER BY repo_id",
+        )
+        .bind(user_id.as_str())
+        .fetch_all(&pool)
+        .await
+        .expect("load aggregate starred repos");
+        assert_eq!(remaining_repos, vec![43]);
     }
 
     #[tokio::test]
