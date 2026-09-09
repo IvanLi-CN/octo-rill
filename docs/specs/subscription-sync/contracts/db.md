@@ -95,7 +95,7 @@ Constraints / indexes:
 
 Notes:
 
-- `sync.access_refresh` and `sync.subscriptions` both use watchers to attach repo demand to shared work items.
+- `sync.access_refresh` and `sync.subscriptions` both use watchers to attach Release repo demand to shared work items. Star membership reconciliation is specified in [star-sync-reconciliation](../../star-sync-reconciliation/contracts/db.md).
 - Watchers are marked `succeeded` immediately when an existing fresh cache is reusable.
 
 ## Historical tables
@@ -113,7 +113,7 @@ Notes:
 - Valid range is `1-120`.
 - The value controls global `sync.subscriptions` scheduler cadence.
 - The same value is the Release governance window length `N`; saves persist the next strictly-later UTC aligned boundary in `sync_auto_fetch_effective_at`.
-- The setting is not user- or account-scoped.
+- The setting is not user- or account-scoped. Star runtime settings are independent and live in [star-sync-reconciliation](../../star-sync-reconciliation/contracts/db.md).
 - `repo_release_worker_concurrency` valid range is `1-32`.
 - `repo_release_worker_concurrency` controls active shared repo release worker slots and must not affect scheduler cadence.
 
