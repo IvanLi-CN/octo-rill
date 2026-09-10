@@ -47,6 +47,17 @@ pub async fn current_mode(pool: &SqlitePool) -> Result<ContentProcessingMode> {
     {
         Ok(mode) => mode,
         Err(SqlxError::Database(error)) if error.message().contains("no such table") => {
+            let migration_applied = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 78",
+            )
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(Some(0))
+            .unwrap_or(0)
+                > 0;
+            if migration_applied {
+                anyhow::bail!("content processing control table is missing after migration 0078");
+            }
             return Ok(ContentProcessingMode::Legacy);
         }
         Err(error) => return Err(error).context("failed to load content processing mode"),
@@ -87,10 +98,34 @@ pub async fn legacy_mode_in_transaction(tx: &mut Transaction<'_, Sqlite>) -> Res
     {
         Ok(mode) => mode,
         Err(SqlxError::Database(error)) if error.message().contains("no such table") => {
+            let migration_applied = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 78",
+            )
+            .fetch_optional(&mut **tx)
+            .await
+            .unwrap_or(Some(0))
+            .unwrap_or(0)
+                > 0;
+            if migration_applied {
+                anyhow::bail!("content processing control table is missing after migration 0078");
+            }
             return Ok(true);
         }
         Err(error) => return Err(error.into()),
     };
+    if mode.is_none() {
+        let migration_applied = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 78",
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .unwrap_or(Some(0))
+        .unwrap_or(0)
+            > 0;
+        if migration_applied {
+            anyhow::bail!("content processing control row is missing after migration 0078");
+        }
+    }
     Ok(mode
         .as_deref()
         .map(ContentProcessingMode::parse)
@@ -152,6 +187,25 @@ async fn transition_to_global_in_transaction(
             .await?;
     if mode.as_deref() != Some(ContentProcessingMode::RollbackFreeze.as_str()) {
         return Ok(false);
+    }
+    for table in ["translation_batches", "translation_work_items"] {
+        let table_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(&mut **tx)
+        .await?
+            > 0;
+        if table_exists {
+            let running = sqlx::query_scalar::<_, i64>(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE status = 'running'"
+            ))
+            .fetch_one(&mut **tx)
+            .await?;
+            if running > 0 {
+                return Ok(false);
+            }
+        }
     }
     record_legacy_observations(tx).await?;
     let changed = sqlx::query(
@@ -786,7 +840,7 @@ pub async fn read_global_resource(
     expected_source_hash: &str,
 ) -> Result<Option<(String, Value)>, ApiError> {
     let row = sqlx::query(
-        "WITH params(resource_type, resource_id, pipeline, variant, source_hash, protocol_version) AS (SELECT ?, ?, ?, ?, ?, ?) SELECT COALESCE((SELECT status FROM content_work_items w, params p WHERE w.canonical_resource_type = p.resource_type AND w.canonical_resource_id = p.resource_id AND w.pipeline = p.pipeline AND w.variant = p.variant AND w.target_lang = 'zh-CN' AND w.source_hash = p.source_hash AND w.protocol_version = p.protocol_version ORDER BY datetime(w.updated_at) DESC, w.id DESC LIMIT 1), 'ready') AS status, (SELECT p.payload_json FROM content_result_projections p, params x WHERE p.canonical_resource_type = x.resource_type AND p.canonical_resource_id = x.resource_id AND p.pipeline = x.pipeline AND p.variant = x.variant AND p.target_lang = 'zh-CN' AND p.protocol_version = x.protocol_version ORDER BY datetime(p.updated_at) DESC, p.id DESC LIMIT 1) AS payload_json, CASE WHEN EXISTS (SELECT 1 FROM content_work_items w, params p WHERE w.canonical_resource_type = p.resource_type AND w.canonical_resource_id = p.resource_id AND w.pipeline = p.pipeline AND w.variant = p.variant AND w.target_lang = 'zh-CN' AND w.source_hash = p.source_hash AND w.protocol_version = p.protocol_version) OR EXISTS (SELECT 1 FROM content_result_projections p, params x WHERE p.canonical_resource_type = x.resource_type AND p.canonical_resource_id = x.resource_id AND p.pipeline = x.pipeline AND p.variant = x.variant AND p.target_lang = 'zh-CN' AND p.protocol_version = x.protocol_version) THEN 1 ELSE 0 END AS present",
+        "WITH params(resource_type, resource_id, pipeline, variant, source_hash, protocol_version) AS (SELECT ?, ?, ?, ?, ?, ?) SELECT COALESCE((SELECT status FROM content_work_items w, params p WHERE w.canonical_resource_type = p.resource_type AND w.canonical_resource_id = p.resource_id AND w.pipeline = p.pipeline AND w.variant = p.variant AND w.target_lang = 'zh-CN' AND w.source_hash = p.source_hash AND w.protocol_version = p.protocol_version ORDER BY datetime(w.updated_at) DESC, w.id DESC LIMIT 1), 'ready') AS status, (SELECT p.payload_json FROM content_result_projections p, params x WHERE p.canonical_resource_type = x.resource_type AND p.canonical_resource_id = x.resource_id AND p.pipeline = x.pipeline AND p.variant = x.variant AND p.target_lang = 'zh-CN' AND p.protocol_version = x.protocol_version AND (p.source_hash = x.source_hash OR EXISTS (SELECT 1 FROM content_work_items w2, params y WHERE w2.canonical_resource_type = y.resource_type AND w2.canonical_resource_id = y.resource_id AND w2.pipeline = y.pipeline AND w2.variant = y.variant AND w2.target_lang = 'zh-CN' AND w2.source_hash = y.source_hash AND w2.protocol_version = y.protocol_version)) ORDER BY CASE WHEN p.source_hash = x.source_hash THEN 0 ELSE 1 END, datetime(p.updated_at) DESC, p.id DESC LIMIT 1) AS payload_json, CASE WHEN EXISTS (SELECT 1 FROM content_work_items w, params p WHERE w.canonical_resource_type = p.resource_type AND w.canonical_resource_id = p.resource_id AND w.pipeline = p.pipeline AND w.variant = p.variant AND w.target_lang = 'zh-CN' AND w.source_hash = p.source_hash AND w.protocol_version = p.protocol_version) OR EXISTS (SELECT 1 FROM content_result_projections p, params x WHERE p.canonical_resource_type = x.resource_type AND p.canonical_resource_id = x.resource_id AND p.pipeline = x.pipeline AND p.variant = x.variant AND p.target_lang = 'zh-CN' AND p.protocol_version = x.protocol_version AND p.source_hash = x.source_hash) THEN 1 ELSE 0 END AS present",
     )
     .bind(resource_type)
     .bind(resource_id)
@@ -1221,6 +1275,9 @@ async fn cancel_deleted_work(state: &AppState, work: &WorkRow) -> Result<()> {
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_cancel_deleted")
         .await?;
+    ensure_global_mode_in_transaction(&mut tx)
+        .await
+        .map_err(|error| anyhow!(error.to_string()))?;
     cancel_deleted_work_in_transaction(&mut tx, work).await?;
     tx.commit().await.map_err(Into::into)
 }
@@ -1265,6 +1322,9 @@ async fn block_config_work(state: &AppState, work: &WorkRow) -> Result<()> {
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_block_config")
         .await?;
+    ensure_global_mode_in_transaction(&mut tx)
+        .await
+        .map_err(|error| anyhow!(error.to_string()))?;
     sqlx::query("UPDATE content_work_items SET status = 'blocked_config', failure_class = 'configuration', finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?")
         .bind(&now)
         .bind(&now)

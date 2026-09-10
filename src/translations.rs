@@ -3335,7 +3335,7 @@ async fn create_translation_requests_batch_with_origin(
     Ok(out)
 }
 
-async fn ensure_legacy_writer_transaction(
+pub(crate) async fn ensure_legacy_writer_transaction(
     tx: &mut Transaction<'_, Sqlite>,
 ) -> Result<(), ApiError> {
     if content_processing::legacy_mode_in_transaction(tx)
