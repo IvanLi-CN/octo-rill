@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -8,7 +9,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tower_sessions::Session;
@@ -599,6 +600,7 @@ fn legacy_conflict_summary() -> AdminCollectionTaskSummary {
 #[derive(Debug, sqlx::FromRow)]
 struct GlobalTaskRow {
     pipeline: String,
+    source_hash: String,
     status: String,
     attempt_count: i64,
     started_at: Option<String>,
@@ -624,7 +626,7 @@ async fn load_global_task_rows(
         return Ok(Vec::new());
     }
     let mut query = QueryBuilder::<Sqlite>::new(
-        "SELECT pipeline, status, attempt_count, started_at, finished_at, updated_at, (SELECT MAX(created_at) FROM content_attempt_events e WHERE e.work_item_id = content_work_items.id) AS last_attempt_at, canonical_resource_id, (SELECT p.work_item_id FROM content_result_projections p WHERE p.canonical_resource_type = content_work_items.canonical_resource_type AND p.canonical_resource_id = content_work_items.canonical_resource_id AND p.pipeline = content_work_items.pipeline AND p.variant = content_work_items.variant AND p.target_lang = content_work_items.target_lang AND p.protocol_version = content_work_items.protocol_version ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_work_item_id, (SELECT p.source_hash FROM content_result_projections p WHERE p.canonical_resource_type = content_work_items.canonical_resource_type AND p.canonical_resource_id = content_work_items.canonical_resource_id AND p.pipeline = content_work_items.pipeline AND p.variant = content_work_items.variant AND p.target_lang = content_work_items.target_lang AND p.protocol_version = content_work_items.protocol_version ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_source_hash, (SELECT p.updated_at FROM content_result_projections p WHERE p.canonical_resource_type = content_work_items.canonical_resource_type AND p.canonical_resource_id = content_work_items.canonical_resource_id AND p.pipeline = content_work_items.pipeline AND p.variant = content_work_items.variant AND p.target_lang = content_work_items.target_lang AND p.protocol_version = content_work_items.protocol_version ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_updated_at FROM content_work_items WHERE canonical_resource_type = ",
+        "SELECT pipeline, source_hash, status, attempt_count, started_at, finished_at, updated_at, (SELECT MAX(created_at) FROM content_attempt_events e WHERE e.work_item_id = content_work_items.id) AS last_attempt_at, canonical_resource_id, (SELECT p.work_item_id FROM content_result_projections p WHERE p.canonical_resource_type = content_work_items.canonical_resource_type AND p.canonical_resource_id = content_work_items.canonical_resource_id AND p.pipeline = content_work_items.pipeline AND p.variant = content_work_items.variant AND p.target_lang = content_work_items.target_lang AND p.protocol_version = content_work_items.protocol_version ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_work_item_id, (SELECT p.source_hash FROM content_result_projections p WHERE p.canonical_resource_type = content_work_items.canonical_resource_type AND p.canonical_resource_id = content_work_items.canonical_resource_id AND p.pipeline = content_work_items.pipeline AND p.variant = content_work_items.variant AND p.target_lang = content_work_items.target_lang AND p.protocol_version = content_work_items.protocol_version ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_source_hash, (SELECT p.updated_at FROM content_result_projections p WHERE p.canonical_resource_type = content_work_items.canonical_resource_type AND p.canonical_resource_id = content_work_items.canonical_resource_id AND p.pipeline = content_work_items.pipeline AND p.variant = content_work_items.variant AND p.target_lang = content_work_items.target_lang AND p.protocol_version = content_work_items.protocol_version ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_updated_at FROM content_work_items WHERE canonical_resource_type = ",
     );
     query.push_bind(collection_record_kind_label(kind));
     query.push(" AND canonical_resource_id IN (");
@@ -636,7 +638,7 @@ async fn load_global_task_rows(
     }
     query.push(")");
     query.push(" AND ((pipeline = 'translation' AND variant IN ('detail', 'summary')) OR (pipeline = 'polishing' AND variant = 'smart'))");
-    query.push(" ORDER BY CASE status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'ready' THEN 3 WHEN 'failed' THEN 4 WHEN 'superseded' THEN 9 ELSE 5 END, CASE WHEN pipeline = 'translation' AND variant = 'detail' THEN 0 ELSE 1 END, julianday(updated_at) DESC, updated_at DESC, id DESC");
+    query.push(" ORDER BY julianday(created_at) DESC, created_at DESC, CASE status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'ready' THEN 3 WHEN 'failed' THEN 4 WHEN 'superseded' THEN 9 ELSE 5 END, CASE WHEN pipeline = 'translation' AND variant = 'detail' THEN 0 ELSE 1 END, julianday(updated_at) DESC, updated_at DESC, id DESC");
     let rows = match query
         .build_query_as::<GlobalTaskRow>()
         .fetch_all(&state.pool)
@@ -704,6 +706,7 @@ fn global_summary(row: &GlobalTaskRow) -> AdminCollectionTaskSummary {
         global_work: Some(AdminContentProcessingEvidence {
             status: row.status.clone(),
             status_origin: "global_work".to_owned(),
+            source_hash: Some(row.source_hash.clone()),
             updated_at: Some(row.updated_at.clone()),
             ..Default::default()
         }),
@@ -717,6 +720,26 @@ fn global_summary(row: &GlobalTaskRow) -> AdminCollectionTaskSummary {
             }
         }),
         ..Default::default()
+    }
+}
+
+fn compare_attempt_timestamps(left: &str, right: &str) -> Ordering {
+    let parse = |value: &str| {
+        DateTime::parse_from_rfc3339(value)
+            .map(|parsed| parsed.with_timezone(&Utc))
+            .ok()
+            .or_else(|| {
+                NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+                    .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))
+                    .ok()
+                    .map(|parsed| parsed.and_utc())
+            })
+    };
+    match (parse(left), parse(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => left.cmp(right),
     }
 }
 
@@ -1430,7 +1453,10 @@ async fn load_task_attempts(
             },
         )
         .collect::<Vec<_>>();
-    attempts.sort_by_key(|attempt| attempt.last_attempt_at.clone());
+    attempts.sort_by(|left, right| {
+        compare_attempt_timestamps(&left.last_attempt_at, &right.last_attempt_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
     Ok(attempts)
 }
 
@@ -1592,7 +1618,10 @@ async fn load_global_attempts(
         }
     }
     let mut attempts = grouped.into_values().collect::<Vec<_>>();
-    attempts.sort_by_key(|attempt| attempt.last_attempt_at.clone());
+    attempts.sort_by(|left, right| {
+        compare_attempt_timestamps(&left.last_attempt_at, &right.last_attempt_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
     Ok(attempts)
 }
 

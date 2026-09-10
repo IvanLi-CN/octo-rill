@@ -19953,6 +19953,9 @@ fn global_source_hash_from_fields(
             text: title,
         },
     ];
+    let has_body = body
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
     if let Some(body) = body.filter(|value| !value.trim().is_empty()) {
         source_blocks.push(translations::TranslationSourceBlock {
             slot: "body_markdown".to_owned(),
@@ -19960,7 +19963,11 @@ fn global_source_hash_from_fields(
         });
     }
     let target_slots = if kind.ends_with("_detail") || variant == "detail" {
-        vec!["title_zh".to_owned(), "body_md".to_owned()]
+        if has_body {
+            vec!["title_zh".to_owned(), "body_md".to_owned()]
+        } else {
+            vec!["title_zh".to_owned()]
+        }
     } else {
         vec!["title_zh".to_owned(), "summary_md".to_owned()]
     };
@@ -20062,6 +20069,7 @@ async fn global_release_request_item(
         .unwrap_or(row.tag_name.as_str())
         .to_owned();
     let body = row.body.unwrap_or_default().replace("\r\n", "\n");
+    let has_body = !body.trim().is_empty();
     let repo_full_name = resolve_release_full_name(&row.html_url, row.repo_id);
     let mut source_blocks = vec![
         translations::TranslationSourceBlock {
@@ -20073,14 +20081,16 @@ async fn global_release_request_item(
             text: title,
         },
     ];
-    if !body.trim().is_empty() {
+    if has_body {
         source_blocks.push(translations::TranslationSourceBlock {
             slot: "body_markdown".to_owned(),
-            text: body,
+            text: body.clone(),
         });
     }
-    let target_slots = if kind.ends_with("_detail") {
+    let target_slots = if kind.ends_with("_detail") && has_body {
         vec!["title_zh".to_owned(), "body_md".to_owned()]
+    } else if kind.ends_with("_detail") {
+        vec!["title_zh".to_owned()]
     } else {
         vec!["title_zh".to_owned(), "summary_md".to_owned()]
     };
@@ -20246,6 +20256,7 @@ async fn global_announcement_request_item(
     let source =
         resolve_announcement_detail_source_for_user(state, user_id, discussion_key).await?;
     let body = source.body.unwrap_or_default().replace("\r\n", "\n");
+    let has_body = !body.trim().is_empty();
     let mut source_blocks = vec![
         translations::TranslationSourceBlock {
             slot: "metadata".to_owned(),
@@ -20259,10 +20270,10 @@ async fn global_announcement_request_item(
             text: source.title,
         },
     ];
-    if !body.trim().is_empty() {
+    if has_body {
         source_blocks.push(translations::TranslationSourceBlock {
             slot: "body_markdown".to_owned(),
-            text: body,
+            text: body.clone(),
         });
     }
     let variant = if kind.ends_with("_detail") {
@@ -20285,6 +20296,8 @@ async fn global_announcement_request_item(
         source_blocks,
         target_slots: if kind.ends_with("_smart") {
             vec!["title_zh".to_owned(), "summary_md".to_owned()]
+        } else if !has_body {
+            vec!["title_zh".to_owned()]
         } else {
             vec!["title_zh".to_owned(), "body_md".to_owned()]
         },
