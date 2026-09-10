@@ -17,7 +17,7 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
-use sqlx::{QueryBuilder, Row, Sqlite};
+use sqlx::{QueryBuilder, Row, Sqlite, Transaction};
 use tokio::{io::AsyncReadExt, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
@@ -10901,9 +10901,12 @@ pub async fn unpublish_repo_public_release(
         .execute(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
+        let cleanup =
+            cleanup_public_release_repo_cache_if_unused_in_transaction(&mut tx, repo_id, full_name)
+                .await?;
         tx.commit().await.map_err(ApiError::internal)?;
         drop(_sqlite_write);
-        Some(cleanup_public_release_repo_cache_if_unused(state.as_ref(), repo_id, full_name).await?)
+        Some(cleanup)
     } else {
         tx.commit().await.map_err(ApiError::internal)?;
         drop(_sqlite_write);
@@ -12883,6 +12886,11 @@ pub async fn admin_delete_public_release_repo(
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
     let usage_id = parse_local_id_param(usage_id, "public_repo_usage_id")?;
 
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "admin_public_release_usage_delete")
+        .await
+        .map_err(ApiError::internal)?;
     let deleted_usage = sqlx::query_as::<_, (Option<i64>, String)>(
         r#"
         SELECT repo_id, full_name
@@ -12891,7 +12899,7 @@ pub async fn admin_delete_public_release_repo(
         "#,
     )
     .bind(usage_id.as_str())
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
 
@@ -12910,7 +12918,7 @@ pub async fn admin_delete_public_release_repo(
         "#,
     )
     .bind(usage_id.as_str())
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(ApiError::internal)?
     .rows_affected();
@@ -12923,7 +12931,10 @@ pub async fn admin_delete_public_release_repo(
     }
 
     let cache_cleanup =
-        cleanup_public_release_repo_cache_if_unused(state.as_ref(), repo_id, full_name).await?;
+        cleanup_public_release_repo_cache_if_unused_in_transaction(&mut tx, repo_id, full_name)
+            .await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    drop(_sqlite_write);
 
     let Json(mut response) = admin_list_public_release_repos(
         State(state),
@@ -12939,8 +12950,8 @@ pub async fn admin_delete_public_release_repo(
     Ok(Json(response))
 }
 
-async fn cleanup_public_release_repo_cache_if_unused(
-    state: &AppState,
+async fn cleanup_public_release_repo_cache_if_unused_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
     repo_id: Option<i64>,
     full_name: String,
 ) -> Result<AdminPublicRepoCacheCleanup, ApiError> {
@@ -12954,18 +12965,10 @@ async fn cleanup_public_release_repo_cache_if_unused(
         });
     };
 
-    // Serialize the mode check, usage checks and deletes. Once the content
-    // model is frozen or global, old cache rows are historical evidence.
-    let (_lock, mut tx) = state
-        .sqlite_writer
-        .begin_immediate(&state.pool, "legacy_public_release_cache_cleanup")
-        .await
-        .map_err(ApiError::internal)?;
-    if !content_processing::legacy_mode_in_transaction(&mut tx)
+    if !content_processing::legacy_mode_in_transaction(tx)
         .await
         .map_err(ApiError::internal)?
     {
-        tx.rollback().await.map_err(ApiError::internal)?;
         return Ok(AdminPublicRepoCacheCleanup {
             repo_id: Some(repo_id),
             full_name,
@@ -12983,7 +12986,7 @@ async fn cleanup_public_release_repo_cache_if_unused(
         "#,
     )
     .bind(repo_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
     if remaining_public_usage > 0 {
@@ -13004,7 +13007,7 @@ async fn cleanup_public_release_repo_cache_if_unused(
         "#,
     )
     .bind(repo_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
     if user_visible_usage > 0 {
@@ -13026,7 +13029,7 @@ async fn cleanup_public_release_repo_cache_if_unused(
         "#,
     )
     .bind(repo_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
     if brief_usage > 0 {
@@ -13047,7 +13050,7 @@ async fn cleanup_public_release_repo_cache_if_unused(
         "#,
     )
     .bind(repo_id)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
 
@@ -13063,7 +13066,7 @@ async fn cleanup_public_release_repo_cache_if_unused(
             "#,
         )
         .bind(release_id_text.as_str())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(ApiError::internal)?
         .rows_affected();
@@ -13074,7 +13077,7 @@ async fn cleanup_public_release_repo_cache_if_unused(
             "#,
         )
         .bind(release_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(ApiError::internal)?
         .rows_affected() as i64;
@@ -13086,7 +13089,7 @@ async fn cleanup_public_release_repo_cache_if_unused(
         "#,
     )
     .bind(repo_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
     sqlx::query(
@@ -13096,11 +13099,9 @@ async fn cleanup_public_release_repo_cache_if_unused(
         "#,
     )
     .bind(repo_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
-    tx.commit().await.map_err(ApiError::internal)?;
-
     Ok(AdminPublicRepoCacheCleanup {
         repo_id: Some(repo_id),
         full_name,

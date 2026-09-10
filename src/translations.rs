@@ -1881,26 +1881,51 @@ async fn sync_running_batch_slot_updates(
         return Ok(());
     }
     let updated_at = Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    let has_control_table = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'content_processing_control'",
+    )
+    .fetch_one(&mut *tx)
+    .await?
+        > 0;
     for update in updates {
-        sqlx::query(
-            r#"
-            UPDATE translation_batches
-            SET worker_slot = ?, worker_kind = ?, updated_at = ?
-            WHERE id = ? AND status = 'running' AND worker_id = ?
-              AND EXISTS (
-                SELECT 1 FROM content_processing_control
-                WHERE id = 1 AND mode = 'legacy'
-              )
-            "#,
-        )
-        .bind(update.worker_slot)
-        .bind(update.worker_kind.as_str())
-        .bind(updated_at.as_str())
-        .bind(update.batch_id.as_str())
-        .bind(update.worker_id.as_str())
-        .execute(pool)
-        .await?;
+        if has_control_table {
+            sqlx::query(
+                r#"
+                UPDATE translation_batches
+                SET worker_slot = ?, worker_kind = ?, updated_at = ?
+                WHERE id = ? AND status = 'running' AND worker_id = ?
+                  AND EXISTS (
+                    SELECT 1 FROM content_processing_control
+                    WHERE id = 1 AND mode = 'legacy'
+                  )
+                "#,
+            )
+            .bind(update.worker_slot)
+            .bind(update.worker_kind.as_str())
+            .bind(updated_at.as_str())
+            .bind(update.batch_id.as_str())
+            .bind(update.worker_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE translation_batches
+                SET worker_slot = ?, worker_kind = ?, updated_at = ?
+                WHERE id = ? AND status = 'running' AND worker_id = ?
+                "#,
+            )
+            .bind(update.worker_slot)
+            .bind(update.worker_kind.as_str())
+            .bind(updated_at.as_str())
+            .bind(update.batch_id.as_str())
+            .bind(update.worker_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        }
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -2088,7 +2113,7 @@ pub(crate) fn stream_global_translation_request_response_for_api(
     request_id: String,
 ) -> Response {
     let stream = async_stream::stream! {
-        let mut last_phase = String::new();
+        let mut last_event_key = String::new();
         loop {
             match content_processing::get_request(state.as_ref(), &user_id, &request_id).await {
                 Ok(Some(snapshot)) => {
@@ -2103,7 +2128,8 @@ pub(crate) fn stream_global_translation_request_response_for_api(
                         "failed" | "cancelled" | "superseded" | "blocked_config" => "failed",
                         _ => "completed",
                     };
-                    if phase != last_phase {
+                    let event_key = format!("{phase}:{status}");
+                    if event_key != last_event_key {
                         let event = json!({
                             "event": phase,
                             "request_id": request_id,
@@ -2115,7 +2141,7 @@ pub(crate) fn stream_global_translation_request_response_for_api(
                         let mut payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_owned());
                         payload.push('\n');
                         yield Ok::<_, Infallible>(axum::body::Bytes::from(payload));
-                        last_phase = phase.to_owned();
+                        last_event_key = event_key;
                     }
                     if phase == "completed" || phase == "failed" {
                         break;
@@ -6550,25 +6576,49 @@ async fn heartbeat_translation_batch_lease(state: &AppState, batch_id: &str) -> 
     state
         .sqlite_writer
         .write("translation_batch_heartbeat", |_| async {
-            sqlx::query(
-                r#"
-                UPDATE translation_batches
-                SET lease_heartbeat_at = ?, updated_at = ?
-                WHERE id = ?
-                  AND status = 'running'
-                  AND runtime_owner_id = ?
-                  AND EXISTS (
-                    SELECT 1 FROM content_processing_control
-                    WHERE id = 1 AND mode = 'legacy'
-                  )
-                "#,
+            let has_control_table = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'content_processing_control'",
             )
-            .bind(now.as_str())
-            .bind(now.as_str())
-            .bind(batch_id)
-            .bind(state.runtime_owner_id.as_str())
-            .execute(&state.pool)
-            .await?;
+            .fetch_one(&state.pool)
+            .await?
+                > 0;
+            if has_control_table {
+                sqlx::query(
+                    r#"
+                    UPDATE translation_batches
+                    SET lease_heartbeat_at = ?, updated_at = ?
+                    WHERE id = ?
+                      AND status = 'running'
+                      AND runtime_owner_id = ?
+                      AND EXISTS (
+                        SELECT 1 FROM content_processing_control
+                        WHERE id = 1 AND mode = 'legacy'
+                      )
+                    "#,
+                )
+                .bind(now.as_str())
+                .bind(now.as_str())
+                .bind(batch_id)
+                .bind(state.runtime_owner_id.as_str())
+                .execute(&state.pool)
+                .await?;
+            } else {
+                sqlx::query(
+                    r#"
+                    UPDATE translation_batches
+                    SET lease_heartbeat_at = ?, updated_at = ?
+                    WHERE id = ?
+                      AND status = 'running'
+                      AND runtime_owner_id = ?
+                    "#,
+                )
+                .bind(now.as_str())
+                .bind(now.as_str())
+                .bind(batch_id)
+                .bind(state.runtime_owner_id.as_str())
+                .execute(&state.pool)
+                .await?;
+            }
             Ok::<(), anyhow::Error>(())
         })
         .await?;
@@ -6781,6 +6831,29 @@ async fn recover_runtime_state_with_mode(
 
     let now = Utc::now();
     let cutoff = runtime::stale_cutoff_timestamp(now);
+    let pending_linked_call_batches = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT tb.id FROM translation_batches tb JOIN llm_calls lc ON lc.parent_translation_batch_id = tb.id WHERE tb.status = 'failed' AND tb.error_text = ? AND lc.status IN ('queued', 'running') ORDER BY tb.id",
+    )
+    .bind(runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+    .fetch_all(&state.pool)
+    .await?;
+    for batch_id in pending_linked_call_batches {
+        if let Err(error) = ai::recover_linked_llm_calls_for_batch(
+            state,
+            batch_id.as_str(),
+            runtime::RUNTIME_LEASE_EXPIRED_ERROR,
+            None,
+            None,
+        )
+        .await
+        {
+            tracing::warn!(
+                ?error,
+                batch_id = batch_id.as_str(),
+                "linked LLM call recovery will be retried"
+            );
+        }
+    }
     let stale_batches = match mode {
         runtime::RuntimeRecoveryMode::Startup => {
             sqlx::query_as::<_, StaleBatchRow>(

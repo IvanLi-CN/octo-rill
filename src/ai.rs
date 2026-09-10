@@ -1382,6 +1382,7 @@ struct ChatCompletionOutput {
 pub struct ChatCompletionDiagnostic {
     pub call_id: Option<String>,
     pub diagnostic_captured: bool,
+    pub model: String,
     pub content: String,
     pub finish_reason: Option<String>,
     pub provider_request_id: Option<String>,
@@ -3036,6 +3037,7 @@ pub async fn chat_completion_with_diagnostics(
                 return Ok(ChatCompletionDiagnostic {
                     call_id: llm_call_persisted.then(|| log_record.id.clone()),
                     diagnostic_captured: llm_call_persisted,
+                    model: model_for_call,
                     content: output.content,
                     finish_reason: output.finish_reason,
                     provider_request_id: output.provider_request_id,
