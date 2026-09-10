@@ -263,6 +263,8 @@ function statusLabel(status: string) {
 		case "completed":
 		case "ready":
 			return "已完成";
+		case "not_applicable":
+			return "不适用";
 		case "failed":
 		case "error":
 			return "失败";

@@ -266,6 +266,13 @@ export function ReleaseDetailCard(props: {
 			void fetchReleaseDetail(targetRelease)
 				.then((response) => {
 					if (loadRequestSeqRef.current !== requestSeq) return;
+					const requestId = response.translated?.request_id;
+					if (requestId) {
+						pendingTranslationRequestRef.current = {
+							releaseId: response.release_id,
+							requestId,
+						};
+					}
 					setDetail(response);
 					setDetailTargetKey(releaseTargetKey(targetRelease));
 					onResolvedDetail?.(response);

@@ -183,6 +183,13 @@ export function AnnouncementDetailPage(props: {
 		void apiGetAnnouncementDetail({ owner, repo, number })
 			.then((response) => {
 				if (loadRequestSeqRef.current !== requestSeq) return;
+				const requestId = response.translated?.request_id;
+				if (requestId) {
+					pendingTranslationRequestRef.current = {
+						discussionKey: response.discussion_key,
+						requestId,
+					};
+				}
 				setDetail(response);
 			})
 			.catch((error) => {
