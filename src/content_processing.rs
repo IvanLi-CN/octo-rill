@@ -331,6 +331,15 @@ fn configuration_fingerprint(model_profile: &str) -> String {
     ai::sha256_hex(&format!("{GLOBAL_PROTOCOL_VERSION}\nmodel={model_profile}"))
 }
 
+async fn current_model_profile(state: &AppState) -> String {
+    let selected = ai::select_model_for_new_calls(state).await;
+    if selected.model.trim().is_empty() {
+        "ai-disabled".to_owned()
+    } else {
+        selected.model
+    }
+}
+
 fn request_result(work: &WorkRow, projection: Option<Value>) -> Value {
     let mut result = projection.unwrap_or_else(|| {
         json!({
@@ -491,12 +500,7 @@ pub async fn submit_item(
     }
     let (resource_type, pipeline) = canonical_identity(item);
     let hash = source_hash(item).map_err(ApiError::internal)?;
-    let selected = ai::select_model_for_new_calls(state).await;
-    let model_profile = if selected.model.trim().is_empty() {
-        "ai-disabled".to_owned()
-    } else {
-        selected.model
-    };
+    let model_profile = current_model_profile(state).await;
     let snapshot = serde_json::to_string(&json!({
         "source_blocks": item.source_blocks,
         "target_slots": item.target_slots,
@@ -781,8 +785,9 @@ pub async fn read_global_resource(
     variant: &str,
     expected_source_hash: &str,
 ) -> Result<Option<(String, Value)>, ApiError> {
+    let model_profile = current_model_profile(state).await;
     let row = sqlx::query(
-        "WITH params(resource_type, resource_id, pipeline, variant, source_hash, protocol_version) AS (SELECT ?, ?, ?, ?, ?, ?) SELECT COALESCE((SELECT status FROM content_work_items w, params p WHERE w.canonical_resource_type = p.resource_type AND w.canonical_resource_id = p.resource_id AND w.pipeline = p.pipeline AND w.variant = p.variant AND w.target_lang = 'zh-CN' AND w.source_hash = p.source_hash AND w.protocol_version = p.protocol_version ORDER BY datetime(w.updated_at) DESC, w.id DESC LIMIT 1), 'ready') AS status, (SELECT p.payload_json FROM content_result_projections p, params x WHERE p.canonical_resource_type = x.resource_type AND p.canonical_resource_id = x.resource_id AND p.pipeline = x.pipeline AND p.variant = x.variant AND p.target_lang = 'zh-CN' AND p.protocol_version = x.protocol_version ORDER BY datetime(p.updated_at) DESC, p.id DESC LIMIT 1) AS payload_json, CASE WHEN EXISTS (SELECT 1 FROM content_work_items w, params p WHERE w.canonical_resource_type = p.resource_type AND w.canonical_resource_id = p.resource_id AND w.pipeline = p.pipeline AND w.variant = p.variant AND w.target_lang = 'zh-CN' AND w.source_hash = p.source_hash AND w.protocol_version = p.protocol_version) OR EXISTS (SELECT 1 FROM content_result_projections p, params x WHERE p.canonical_resource_type = x.resource_type AND p.canonical_resource_id = x.resource_id AND p.pipeline = x.pipeline AND p.variant = x.variant AND p.target_lang = 'zh-CN' AND p.protocol_version = x.protocol_version) THEN 1 ELSE 0 END AS present",
+        "WITH params(resource_type, resource_id, pipeline, variant, source_hash, protocol_version, model_profile) AS (SELECT ?, ?, ?, ?, ?, ?, ?) SELECT COALESCE((SELECT status FROM content_work_items w, params p WHERE w.canonical_resource_type = p.resource_type AND w.canonical_resource_id = p.resource_id AND w.pipeline = p.pipeline AND w.variant = p.variant AND w.target_lang = 'zh-CN' AND w.source_hash = p.source_hash AND w.protocol_version = p.protocol_version AND w.model_profile = p.model_profile ORDER BY datetime(w.updated_at) DESC, w.id DESC LIMIT 1), 'ready') AS status, (SELECT p.payload_json FROM content_result_projections p, params x WHERE p.canonical_resource_type = x.resource_type AND p.canonical_resource_id = x.resource_id AND p.pipeline = x.pipeline AND p.variant = x.variant AND p.target_lang = 'zh-CN' AND p.protocol_version = x.protocol_version AND p.model_profile = x.model_profile ORDER BY datetime(p.updated_at) DESC, p.id DESC LIMIT 1) AS payload_json, CASE WHEN EXISTS (SELECT 1 FROM content_work_items w, params p WHERE w.canonical_resource_type = p.resource_type AND w.canonical_resource_id = p.resource_id AND w.pipeline = p.pipeline AND w.variant = p.variant AND w.target_lang = 'zh-CN' AND w.source_hash = p.source_hash AND w.protocol_version = p.protocol_version AND w.model_profile = p.model_profile) OR EXISTS (SELECT 1 FROM content_result_projections p, params x WHERE p.canonical_resource_type = x.resource_type AND p.canonical_resource_id = x.resource_id AND p.pipeline = x.pipeline AND p.variant = x.variant AND p.target_lang = 'zh-CN' AND p.protocol_version = x.protocol_version AND p.model_profile = x.model_profile) THEN 1 ELSE 0 END AS present",
     )
     .bind(resource_type)
     .bind(resource_id)
@@ -790,6 +795,7 @@ pub async fn read_global_resource(
     .bind(variant)
     .bind(expected_source_hash)
     .bind(GLOBAL_PROTOCOL_VERSION)
+    .bind(&model_profile)
     .fetch_optional(&state.pool)
     .await
     .map_err(ApiError::internal)?;
