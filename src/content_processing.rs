@@ -1152,7 +1152,7 @@ async fn recover_due(state: &AppState) -> Result<()> {
         .await?;
     ensure_global_mode_in_transaction(&mut tx).await?;
     sqlx::query(
-        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), id, attempt_count, 'automatic_recovery', 'attempt_queued', 'queued', 1, ? FROM content_work_items WHERE status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(?) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(?))",
+        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), id, CASE WHEN attempt_count < 1 THEN 1 ELSE attempt_count END, 'automatic_recovery', 'attempt_queued', 'queued', 1, ? FROM content_work_items WHERE status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(?) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(?))",
     )
     .bind(&now)
     .bind(&now)
