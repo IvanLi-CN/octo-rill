@@ -116,6 +116,12 @@ function hasReadyTranslatedContent(
 	return Boolean(translated.title?.trim() || translated.summary?.trim());
 }
 
+function hasTranslatedProjection(
+	translated: ReleaseDetailResponse["translated"] | null | undefined,
+) {
+	return Boolean(translated?.title?.trim() || translated?.summary?.trim());
+}
+
 function shouldResolveSmart(
 	smart: ReleaseDetailResponse["smart"] | null | undefined,
 ) {
@@ -612,10 +618,9 @@ export function ReleaseDetailCard(props: {
 			activeDetail.name?.trim() && activeDetail.name.trim().length > 0
 				? activeDetail.name
 				: activeDetail.tag_name;
-		const translatedTitle =
-			activeDetail.translated?.status === "ready"
-				? activeDetail.translated.title
-				: null;
+		const translatedTitle = hasTranslatedProjection(activeDetail.translated)
+			? activeDetail.translated?.title
+			: null;
 		const smartTitle =
 			activeDetail.smart?.status === "ready" ? activeDetail.smart.title : null;
 		const title =
@@ -625,10 +630,9 @@ export function ReleaseDetailCard(props: {
 					? smartTitle?.trim() || originalTitle
 					: originalTitle;
 
-		const translatedBody =
-			activeDetail.translated?.status === "ready"
-				? activeDetail.translated.summary
-				: null;
+		const translatedBody = hasTranslatedProjection(activeDetail.translated)
+			? activeDetail.translated?.summary
+			: null;
 		const smartBody =
 			activeDetail.smart?.status === "ready"
 				? activeDetail.smart.summary

@@ -271,6 +271,55 @@ export const FailedResponseWithDiagnostics: Story = {
 	],
 };
 
+export const GlobalEvidenceOverview: Story = {
+	args: {
+		detailRoute: {
+			kind: "release",
+			id: recordDetail.record.id,
+		},
+		onFiltersChange: () => undefined,
+		onOpenRecord: () => undefined,
+		onOpenAttempt: () => undefined,
+		onOpenLlm: () => undefined,
+		onCloseRecord: () => undefined,
+	},
+	decorators: [
+		(Story) => {
+			const originalFetch = useRef(window.fetch);
+			const restoreFetch = originalFetch.current;
+			window.fetch = async (input, init) => {
+				const url = new URL(
+					typeof input === "string" ? input : input.toString(),
+					window.location.origin,
+				);
+				if (url.pathname.endsWith("/ai-records/release")) {
+					return new Response(JSON.stringify(listResponse), { status: 200 });
+				}
+				if (url.pathname.endsWith("/ai-records/release/383114065")) {
+					return new Response(JSON.stringify(recordDetail), { status: 200 });
+				}
+				return restoreFetch(input, init);
+			};
+			useEffect(
+				() => () => {
+					window.fetch = restoreFetch;
+				},
+				[restoreFetch],
+			);
+			return (
+				<div
+					data-visual-evidence-surface
+					className="mx-auto box-border w-full max-w-[1072px] bg-background p-6"
+				>
+					<div data-visual-evidence-target className="mx-auto max-w-5xl p-6">
+						<Story />
+					</div>
+				</div>
+			);
+		},
+	],
+};
+
 export const ExpiredDiagnosticEvidence: Story = {
 	args: {
 		detailRoute: {

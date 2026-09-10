@@ -105,6 +105,12 @@ function hasReadyTranslatedContent(
 	return Boolean(translated.title?.trim() || translated.summary?.trim());
 }
 
+function hasTranslatedProjection(
+	translated: AnnouncementDetailResponse["translated"] | null | undefined,
+) {
+	return Boolean(translated?.title?.trim() || translated?.summary?.trim());
+}
+
 function shouldResolveSmart(
 	smart: AnnouncementDetailResponse["smart"] | null | undefined,
 ) {
@@ -508,8 +514,9 @@ export function AnnouncementDetailPage(props: {
 	const display = useMemo(() => {
 		if (!detail) return null;
 		const originalTitle = detail.title;
-		const translatedTitle =
-			detail.translated?.status === "ready" ? detail.translated.title : null;
+		const translatedTitle = hasTranslatedProjection(detail.translated)
+			? detail.translated?.title
+			: null;
 		const smartTitle =
 			detail.smart?.status === "ready" ? detail.smart.title : null;
 		const title =
@@ -518,8 +525,9 @@ export function AnnouncementDetailPage(props: {
 				: selectedLane === "smart"
 					? smartTitle?.trim() || originalTitle
 					: originalTitle;
-		const translatedBody =
-			detail.translated?.status === "ready" ? detail.translated.summary : null;
+		const translatedBody = hasTranslatedProjection(detail.translated)
+			? detail.translated?.summary
+			: null;
 		const smartBody =
 			detail.smart?.status === "ready" ? detail.smart.summary : null;
 		const originalBody = detail.body?.trim() ? detail.body : null;

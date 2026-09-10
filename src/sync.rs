@@ -61,6 +61,7 @@ const DISCUSSION_ANNOUNCEMENT_PAGE_SIZE: usize = 10;
 const REPO_RELEASE_PRIORITY_SYSTEM: i64 = 1;
 const REPO_RELEASE_PRIORITY_INTERACTIVE: i64 = 2;
 const REPO_RELEASE_DEADLINE_EXPIRED_ERROR: &str = "repo_release_deadline_expired";
+const RELEASE_CONTENT_ENQUEUE_PENDING_ERROR: &str = "content_processing_enqueue_pending";
 const SUBSCRIPTION_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_secs(2);
 const GITHUB_WEB_BASE: &str = "https://github.com";
 const GITHUB_NOTIFICATIONS_PAGE_SIZE: usize = 50;
@@ -1869,6 +1870,13 @@ pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleas
             (before_release_updates.get(&release_id) != Some(&updated_at)).then_some(release_id)
         })
         .collect::<Vec<_>>();
+    changed_release_ids.extend(
+        load_pending_release_content_ids_for_user(state, user_id)
+            .await
+            .context("sync.releases: load pending content processing ids")?,
+    );
+    changed_release_ids.sort_unstable();
+    changed_release_ids.dedup();
     changed_release_ids.sort_unstable_by(|left, right| right.cmp(left));
     let smart_preheat_release_ids = merge_smart_preheat_release_ids(
         &changed_release_ids,
@@ -1883,7 +1891,7 @@ pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleas
                 Vec::new()
             }),
     );
-    enqueue_background_release_translation_task(
+    if let Err(error) = enqueue_background_release_translation_task(
         state,
         user_id,
         &changed_release_ids,
@@ -1892,8 +1900,13 @@ pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleas
         Some(user_id),
     )
     .await
-    .context("sync.releases: enqueue background translation")?;
-    enqueue_background_release_smart_task(
+    {
+        mark_release_content_enqueue_pending(state, &changed_release_ids)
+            .await
+            .context("sync.releases: record pending translation enqueue")?;
+        return Err(error).context("sync.releases: enqueue background translation");
+    }
+    if let Err(error) = enqueue_background_release_smart_task(
         state,
         user_id,
         &smart_preheat_release_ids,
@@ -1902,7 +1915,15 @@ pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleas
         Some(user_id),
     )
     .await
-    .context("sync.releases: enqueue background smart summary")?;
+    {
+        mark_release_content_enqueue_pending(state, &changed_release_ids)
+            .await
+            .context("sync.releases: record pending smart enqueue")?;
+        return Err(error).context("sync.releases: enqueue background smart summary");
+    }
+    clear_release_content_enqueue_pending(state, &changed_release_ids)
+        .await
+        .context("sync.releases: clear pending content processing ids")?;
 
     Ok(SyncReleasesResult {
         repos: demand.repos,
@@ -3799,6 +3820,93 @@ async fn load_recent_release_ids_for_user(
     .fetch_all(&state.pool)
     .await
     .context("failed to query recent release ids for user")
+}
+
+async fn load_pending_release_content_ids_for_user(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Vec<i64>> {
+    let payloads = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT wi.last_new_release_ids_json
+        FROM repo_release_work_items wi
+        JOIN repo_release_watchers rw ON rw.work_item_id = wi.id
+        WHERE rw.user_id = ?
+          AND wi.error_text = ?
+          AND wi.last_new_release_ids_json IS NOT NULL
+        GROUP BY wi.id
+        "#,
+    )
+    .bind(user_id)
+    .bind(RELEASE_CONTENT_ENQUEUE_PENDING_ERROR)
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to query pending release content ids")?;
+
+    let mut ids = Vec::new();
+    for payload in payloads {
+        let values = serde_json::from_str::<Vec<i64>>(&payload)
+            .with_context(|| "failed to parse pending release content ids")?;
+        ids.extend(values);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+async fn mark_release_content_enqueue_pending(state: &AppState, release_ids: &[i64]) -> Result<()> {
+    if release_ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat_n("?", release_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "UPDATE repo_release_work_items SET error_text = ? WHERE repo_id IN (SELECT DISTINCT repo_id FROM repo_releases WHERE release_id IN ({placeholders})) AND last_new_release_ids_json IS NOT NULL"
+    );
+    state
+        .sqlite_writer
+        .write("release_content_enqueue_pending", |_| async {
+            let mut query_builder = sqlx::query(&query).bind(RELEASE_CONTENT_ENQUEUE_PENDING_ERROR);
+            for release_id in release_ids {
+                query_builder = query_builder.bind(release_id);
+            }
+            query_builder
+                .execute(&state.pool)
+                .await
+                .context("failed to mark pending release content enqueue")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+}
+
+async fn clear_release_content_enqueue_pending(
+    state: &AppState,
+    release_ids: &[i64],
+) -> Result<()> {
+    if release_ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat_n("?", release_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "UPDATE repo_release_work_items SET error_text = NULL WHERE error_text = ? AND repo_id IN (SELECT DISTINCT repo_id FROM repo_releases WHERE release_id IN ({placeholders}))"
+    );
+    state
+        .sqlite_writer
+        .write("release_content_enqueue_pending_clear", |_| async {
+            let mut query_builder = sqlx::query(&query).bind(RELEASE_CONTENT_ENQUEUE_PENDING_ERROR);
+            for release_id in release_ids {
+                query_builder = query_builder.bind(release_id);
+            }
+            query_builder
+                .execute(&state.pool)
+                .await
+                .context("failed to clear pending release content enqueue")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
 }
 
 fn merge_smart_preheat_release_ids(
@@ -8344,9 +8452,13 @@ async fn execute_repo_release_work_item(
             .await
             {
                 Ok(RepoReleaseFetchOutcome::Updated(fetch_result)) => {
-                    let mut stats =
-                        upsert_repo_releases(state, work_item.repo_id, &fetch_result.releases)
-                            .await?;
+                    let mut stats = upsert_repo_releases(
+                        state,
+                        work_item.repo_id,
+                        &fetch_result.releases,
+                        Some(work_item),
+                    )
+                    .await?;
                     stats.pages_fetched = fetch_result.pages_fetched;
                     stats.stopped_reason = fetch_result.stopped_reason;
                     record_repo_release_sync_success(
@@ -8405,8 +8517,13 @@ async fn execute_repo_release_work_item(
         .await
         {
             Ok(RepoReleaseFetchOutcome::Updated(fetch_result)) => {
-                let mut stats =
-                    upsert_repo_releases(state, work_item.repo_id, &fetch_result.releases).await?;
+                let mut stats = upsert_repo_releases(
+                    state,
+                    work_item.repo_id,
+                    &fetch_result.releases,
+                    Some(work_item),
+                )
+                .await?;
                 stats.pages_fetched = fetch_result.pages_fetched;
                 stats.stopped_reason = fetch_result.stopped_reason;
                 record_repo_release_sync_success(
@@ -8764,11 +8881,40 @@ async fn upsert_repo_releases(
     state: &AppState,
     repo_id: i64,
     releases: &[GitHubRelease],
+    lease: Option<&RepoReleaseWorkItemRow>,
 ) -> Result<RepoReleaseWriteStats> {
     let now = Utc::now().to_rfc3339();
     state
         .sqlite_writer
         .write("repo_release_upsert", |_| async {
+            if let Some(work_item) = lease {
+                let lease_is_current = sqlx::query_scalar::<_, i64>(
+                    r#"
+                    SELECT 1
+                    FROM repo_release_work_items
+                    WHERE id = ?
+                      AND status = ?
+                      AND runtime_owner_id = ?
+                      AND started_at = ?
+                      AND julianday(deadline_at) > julianday(?)
+                    LIMIT 1
+                    "#,
+                )
+                .bind(&work_item.id)
+                .bind(jobs::STATUS_RUNNING)
+                .bind(state.runtime_owner_id.as_str())
+                .bind(work_item.started_at.as_deref().unwrap_or_default())
+                .bind(now.as_str())
+                .fetch_optional(&state.pool)
+                .await
+                .context("failed to validate repo release work item lease")?
+                .is_some();
+                if !lease_is_current {
+                    return Err(anyhow!(
+                        "repo release work item lease lost before release snapshot write"
+                    ));
+                }
+            }
             let mut stats = RepoReleaseWriteStats {
                 fetched_count: releases.len(),
                 stopped_reason: "completed".to_owned(),
@@ -21252,24 +21398,26 @@ mod tests {
             reactions: None,
         };
 
-        let inserted = upsert_repo_releases(state.as_ref(), 42, std::slice::from_ref(&release))
-            .await
-            .expect("insert release");
+        let inserted =
+            upsert_repo_releases(state.as_ref(), 42, std::slice::from_ref(&release), None)
+                .await
+                .expect("insert release");
         assert_eq!(inserted.fetched_count, 1);
         assert_eq!(inserted.inserted_count, 1);
         assert_eq!(inserted.updated_count, 0);
         assert_eq!(inserted.unchanged_count, 0);
 
-        let unchanged = upsert_repo_releases(state.as_ref(), 42, std::slice::from_ref(&release))
-            .await
-            .expect("unchanged release");
+        let unchanged =
+            upsert_repo_releases(state.as_ref(), 42, std::slice::from_ref(&release), None)
+                .await
+                .expect("unchanged release");
         assert_eq!(unchanged.inserted_count, 0);
         assert_eq!(unchanged.updated_count, 0);
         assert_eq!(unchanged.unchanged_count, 1);
 
         let mut edited = release;
         edited.body = Some("edited body".to_owned());
-        let updated = upsert_repo_releases(state.as_ref(), 42, &[edited])
+        let updated = upsert_repo_releases(state.as_ref(), 42, &[edited], None)
             .await
             .expect("update release");
         assert_eq!(updated.inserted_count, 0);
