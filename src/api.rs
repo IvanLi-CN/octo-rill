@@ -8527,7 +8527,6 @@ async fn build_release_detail_response(
             "translation",
             "detail",
             global_translation_hash.as_str(),
-            None,
         )
         .await?;
         let smart = content_processing::read_global_resource(
@@ -8537,7 +8536,6 @@ async fn build_release_detail_response(
             "polishing",
             "smart",
             global_smart_hash.as_str(),
-            None,
         )
         .await?;
         let project_string = |project: &Option<(String, Value)>, key: &str| {
@@ -9244,7 +9242,6 @@ async fn build_announcement_detail_response(
             "translation",
             "detail",
             global_translation_hash.as_str(),
-            Some(user_id),
         )
         .await?;
         let smart = content_processing::read_global_resource(
@@ -9254,7 +9251,6 @@ async fn build_announcement_detail_response(
             "polishing",
             "smart",
             global_smart_hash.as_str(),
-            Some(user_id),
         )
         .await?;
         let project_string = |project: &Option<(String, Value)>, key: &str| {
@@ -11373,7 +11369,6 @@ async fn load_public_release_translation_rows(
                     pipeline,
                     variant,
                     expected_source_hash.as_str(),
-                    None,
                 )
                 .await?
                 {
@@ -16542,7 +16537,7 @@ async fn fetch_feed_items(
         .fetch_all(&state.pool)
         .await
         .map_err(ApiError::internal)?;
-    overlay_global_feed_processing(state, user_id, &mut rows).await?;
+    overlay_global_feed_processing(state, &mut rows).await?;
     Ok(rows)
 }
 
@@ -16553,7 +16548,6 @@ async fn read_first_global_resource_variant(
     pipeline: &str,
     variants: &[&str],
     expected_source_hashes: &[String],
-    requester_id: Option<&str>,
 ) -> Result<Option<(String, Value)>, ApiError> {
     for (variant, expected_source_hash) in variants.iter().zip(expected_source_hashes) {
         if let Some(result) = content_processing::read_global_resource(
@@ -16563,7 +16557,6 @@ async fn read_first_global_resource_variant(
             pipeline,
             variant,
             expected_source_hash,
-            requester_id,
         )
         .await?
         {
@@ -16575,7 +16568,6 @@ async fn read_first_global_resource_variant(
 
 async fn overlay_global_feed_processing(
     state: &AppState,
-    user_id: &str,
     rows: &mut [FeedRow],
 ) -> Result<(), ApiError> {
     if content_processing::current_mode(&state.pool)
@@ -16595,7 +16587,6 @@ async fn overlay_global_feed_processing(
         } else {
             "announcement"
         };
-        let requester_id = (resource_type == "announcement").then_some(user_id);
         let resource_id = row
             .translation_entity_id
             .clone()
@@ -16714,7 +16705,6 @@ async fn overlay_global_feed_processing(
                     "summary",
                 ),
             ],
-            requester_id,
         )
         .await?
         {
@@ -16767,7 +16757,6 @@ async fn overlay_global_feed_processing(
                 },
                 "detail",
             )],
-            requester_id,
         )
         .await?
         {
@@ -16830,7 +16819,6 @@ async fn overlay_global_feed_processing(
                     "smart",
                 ),
             ],
-            requester_id,
         )
         .await?
         {
