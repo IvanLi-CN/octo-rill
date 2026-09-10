@@ -68,7 +68,9 @@ export function LlmCallDiagnosticDetail({
 					>
 						{statusLabel(detail.status)}
 					</Badge>
-					<span className="text-muted-foreground text-xs">{detail.source}</span>
+					<span className="text-muted-foreground min-w-0 break-all text-xs">
+						{detail.source}
+					</span>
 				</div>
 			</div>
 			<div className="text-muted-foreground grid gap-2 border-y py-3 text-sm sm:grid-cols-2">

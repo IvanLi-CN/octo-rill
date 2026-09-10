@@ -6,10 +6,17 @@ import { openAppEventSource } from "@/demo/eventSource";
 export class ApiError extends Error {
 	public status: number;
 	public code: string;
-	constructor(status: number, message: string, code = "unknown_error") {
+	public payload?: unknown;
+	constructor(
+		status: number,
+		message: string,
+		code = "unknown_error",
+		payload?: unknown,
+	) {
 		super(message);
 		this.status = status;
 		this.code = code;
+		this.payload = payload;
 	}
 }
 async function parseJson(res: Response) {
@@ -30,10 +37,11 @@ function toApiError(res: Response, body: unknown) {
 			res.status,
 			String(payload.error?.message ?? res.statusText),
 			String(payload.error?.code ?? "unknown_error"),
+			body,
 		);
 	}
 	if (typeof body === "string" && body.trim()) {
-		return new ApiError(res.status, body.trim());
+		return new ApiError(res.status, body.trim(), "unknown_error", body);
 	}
 	const statusText = res.statusText.trim();
 	return new ApiError(
@@ -41,6 +49,8 @@ function toApiError(res: Response, body: unknown) {
 		statusText && statusText.toLowerCase() !== "unknown"
 			? statusText
 			: `Request failed (HTTP ${res.status})`,
+		"unknown_error",
+		body,
 	);
 }
 
@@ -1817,7 +1827,8 @@ export type TranslationRequestItemInput = {
 		| "announcement_summary"
 		| "announcement_smart"
 		| "announcement_detail"
-		| "notification";
+		| "notification"
+		| "notification_smart";
 	variant: string;
 	entity_id: string;
 	target_lang: string;
@@ -1851,17 +1862,31 @@ export type TranslationBatchSubmitRequest = {
 };
 export type TranslationResolveRequest = {
 	items: TranslationRequestItemInput[];
+	request_ids?: Record<string, string>;
 	retry_on_error?: boolean;
 };
 export type TranslationSubmitRequest =
 	| TranslationSingleSubmitRequest
 	| TranslationBatchSubmitRequest;
 export type TranslationResultItem = {
+	request_id?: string;
 	producer_ref: string;
 	entity_id: string;
 	kind: string;
 	variant: string;
-	status: "queued" | "running" | "ready" | "disabled" | "missing" | "error";
+	status:
+		| "queued"
+		| "running"
+		| "failed"
+		| "ready"
+		| "disabled"
+		| "missing"
+		| "error"
+		| "not_applicable"
+		| "deferred_provider"
+		| "blocked_config"
+		| "cancelled"
+		| "superseded";
 	title_zh: string | null;
 	summary_md: string | null;
 	body_md: string | null;
@@ -1874,14 +1899,37 @@ export type TranslationResultItem = {
 };
 export type TranslationRequestResponse = {
 	request_id: string;
-	status: "queued" | "running" | "completed" | "failed";
+	status:
+		| "queued"
+		| "running"
+		| "ready"
+		| "completed"
+		| "failed"
+		| "not_applicable"
+		| "deferred_provider"
+		| "blocked_config"
+		| "cancelled"
+		| "superseded";
 	result: TranslationResultItem;
 };
 
 export function isPendingTranslationResultStatus(
 	status: TranslationResultItem["status"],
 ) {
-	return status === "queued" || status === "running";
+	return (
+		status === "queued" ||
+		status === "running" ||
+		status === "deferred_provider"
+	);
+}
+
+export async function apiRetryTranslationRequest(
+	requestId: string,
+): Promise<TranslationRequestResponse> {
+	return apiPostJson<TranslationRequestResponse>(
+		`/api/translate/requests/${encodeURIComponent(requestId)}/retry`,
+		{},
+	);
 }
 
 export function mapTranslationResultToReleaseDetailTranslated(
@@ -1891,13 +1939,14 @@ export function mapTranslationResultToReleaseDetailTranslated(
 		result.status !== "ready" &&
 		result.status !== "disabled" &&
 		result.status !== "missing" &&
-		result.status !== "error"
+		result.status !== "error" &&
+		result.status !== "failed"
 	) {
 		return null;
 	}
 	return {
 		lang: "zh-CN",
-		status: result.status,
+		status: result.status === "failed" ? "error" : result.status,
 		title: result.title_zh,
 		summary: result.body_md,
 		error_code: result.error_code,
@@ -1912,7 +1961,8 @@ export function mapTranslationResultToReleaseDetailSmart(
 		result.status !== "ready" &&
 		result.status !== "disabled" &&
 		result.status !== "missing" &&
-		result.status !== "error"
+		result.status !== "error" &&
+		result.status !== "failed"
 	) {
 		return null;
 	}
@@ -1925,9 +1975,11 @@ export function mapTranslationResultToReleaseDetailSmart(
 	const status =
 		result.status === "missing" && result.error === "no_valuable_version_info"
 			? "insufficient"
-			: result.status === "error" && retryable
+			: (result.status === "error" || result.status === "failed") && retryable
 				? "missing"
-				: result.status;
+				: result.status === "failed"
+					? "error"
+					: result.status;
 	return {
 		lang: "zh-CN",
 		status,
@@ -1937,7 +1989,8 @@ export function mapTranslationResultToReleaseDetailSmart(
 		error_summary: result.error_summary,
 		error_detail: result.error_detail,
 		auto_translate:
-			status === "insufficient" || (result.status === "error" && !retryable)
+			status === "insufficient" ||
+			((result.status === "error" || result.status === "failed") && !retryable)
 				? false
 				: retryable || undefined,
 	};
@@ -2221,9 +2274,23 @@ export async function apiSubmitTranslationRequest(
 	body: TranslationSubmitRequest,
 	init?: RequestInit,
 ): Promise<TranslationRequestResponse | TranslationBatchSubmitResponse> {
-	return apiPostJson<
-		TranslationRequestResponse | TranslationBatchSubmitResponse
-	>("/api/translate/requests", body, init);
+	try {
+		return await apiPostJson<
+			TranslationRequestResponse | TranslationBatchSubmitResponse
+		>("/api/translate/requests", body, init);
+	} catch (error) {
+		if (
+			error instanceof ApiError &&
+			error.status === 409 &&
+			error.code === "content_processing_active" &&
+			error.payload &&
+			typeof error.payload === "object" &&
+			"request_id" in error.payload
+		) {
+			return error.payload as TranslationRequestResponse;
+		}
+		throw error;
+	}
 }
 export async function apiOpenTranslationRequestStream(
 	body: TranslationStreamSubmitRequest,

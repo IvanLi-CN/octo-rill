@@ -244,8 +244,16 @@ function statusLabel(status: string) {
 			return "未开始";
 		case "historical_unknown":
 			return "历史未记录";
+		case "legacy_cached":
+			return "旧缓存";
+		case "legacy_conflict":
+			return "旧事实冲突";
 		case "queued":
 			return "排队中";
+		case "deferred_provider":
+			return "提供方暂缓";
+		case "blocked_config":
+			return "配置阻塞";
 		case "batched":
 			return "已批处理";
 		case "running":
@@ -262,6 +270,10 @@ function statusLabel(status: string) {
 			return "缺少结果";
 		case "disabled":
 			return "已停用";
+		case "cancelled":
+			return "已取消";
+		case "superseded":
+			return "已替代";
 		case "retry_scheduled":
 			return "已安排重试";
 		case "not_recorded":
@@ -280,6 +292,13 @@ const STATUS_LABELS: Record<AiRecordStatus, string> = {
 	missing: "缺少结果",
 	disabled: "已停用",
 	historical_unknown: "历史未记录",
+	legacy_cached: "旧缓存",
+	legacy_conflict: "旧事实冲突",
+	deferred_provider: "提供方暂缓",
+	blocked_config: "配置阻塞",
+	cancelled: "已取消",
+	superseded: "已替代",
+	not_applicable: "不适用",
 };
 
 function StatusFilterMenu({
@@ -416,6 +435,7 @@ function statusTone(status: string) {
 		case "queued":
 		case "batched":
 		case "retry_scheduled":
+		case "deferred_provider":
 			return "border-amber-300 bg-amber-100/90 text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100";
 		case "completed":
 		case "succeeded":

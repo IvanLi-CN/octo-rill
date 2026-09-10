@@ -1,5 +1,7 @@
 # HTTP API contracts
 
+> Legacy scheduler API contract. Any user-scoped attempt field in this document describes retained historical data only; current content-processing ownership, result semantics, retry coordination and transition responses are defined by [global-translation-and-polish](../../global-translation-and-polish/contracts/http-apis.md).
+
 ## `POST /api/translate/requests`
 
 ### Request

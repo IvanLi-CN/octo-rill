@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use axum::{
     Json,
@@ -10,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tower_sessions::Session;
 
-use crate::{api, error::ApiError, state::AppState, translations};
+use crate::{api, content_processing, error::ApiError, state::AppState, translations};
 
 const PAGE_SIZE_DEFAULT: i64 = 20;
 
@@ -294,7 +297,7 @@ fn parse_timestamp(value: Option<String>, field: &str) -> Result<Option<String>,
     Ok(Some(parsed.with_timezone(&Utc).to_rfc3339()))
 }
 
-const DISPLAY_STATUSES: [&str; 8] = [
+const DISPLAY_STATUSES: [&str; 15] = [
     "not_started",
     "queued",
     "running",
@@ -303,6 +306,13 @@ const DISPLAY_STATUSES: [&str; 8] = [
     "missing",
     "disabled",
     "historical_unknown",
+    "legacy_cached",
+    "legacy_conflict",
+    "deferred_provider",
+    "blocked_config",
+    "cancelled",
+    "superseded",
+    "not_applicable",
 ];
 
 fn display_status_for(status: &str, status_origin: &str) -> String {
@@ -313,6 +323,8 @@ fn display_status_for(status: &str, status_origin: &str) -> String {
         "failed" | "error" => "failed".to_owned(),
         "missing" => "missing".to_owned(),
         "disabled" => "disabled".to_owned(),
+        "legacy_cached" => "legacy_cached".to_owned(),
+        "legacy_conflict" => "legacy_conflict".to_owned(),
         "not_recorded" if status_origin == "never_started" => "not_started".to_owned(),
         "not_recorded" => "historical_unknown".to_owned(),
         _ if status.is_empty() && status_origin == "never_started" => "not_started".to_owned(),
@@ -359,6 +371,7 @@ fn collection_record_kind_label(kind: CollectionRecordKind) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn collection_pipelines(kind: CollectionRecordKind) -> &'static [&'static str] {
     match kind {
         CollectionRecordKind::Release | CollectionRecordKind::Announcement => {
@@ -368,6 +381,7 @@ fn collection_pipelines(kind: CollectionRecordKind) -> &'static [&'static str] {
     }
 }
 
+#[cfg(test)]
 async fn ensure_processing_coverage(
     pool: &SqlitePool,
     kind: CollectionRecordKind,
@@ -542,6 +556,190 @@ fn not_recorded_summary_for(status_origin: &str) -> AdminCollectionTaskSummary {
     }
 }
 
+fn legacy_cached_summary() -> AdminCollectionTaskSummary {
+    AdminCollectionTaskSummary {
+        status: "legacy_cached".to_owned(),
+        display_status: "legacy_cached".to_owned(),
+        status_origin: "legacy_cached".to_owned(),
+        ..Default::default()
+    }
+}
+
+fn legacy_conflict_summary() -> AdminCollectionTaskSummary {
+    AdminCollectionTaskSummary {
+        status: "legacy_conflict".to_owned(),
+        display_status: "legacy_conflict".to_owned(),
+        status_origin: "legacy_conflict".to_owned(),
+        ..Default::default()
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct GlobalTaskRow {
+    pipeline: String,
+    status: String,
+    attempt_count: i64,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    updated_at: String,
+    last_attempt_at: Option<String>,
+    canonical_resource_id: String,
+}
+
+fn missing_table(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(database) if database.message().contains("no such table"))
+}
+
+async fn load_global_task_rows(
+    state: &AppState,
+    kind: CollectionRecordKind,
+    entity_ids: &[String],
+) -> Result<Vec<GlobalTaskRow>, ApiError> {
+    if entity_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "SELECT pipeline, status, attempt_count, started_at, finished_at, updated_at, (SELECT MAX(created_at) FROM content_attempt_events e WHERE e.work_item_id = content_work_items.id) AS last_attempt_at, canonical_resource_id FROM content_work_items WHERE canonical_resource_type = ",
+    );
+    query.push_bind(collection_record_kind_label(kind));
+    query.push(" AND canonical_resource_id IN (");
+    {
+        let mut separated = query.separated(", ");
+        for id in entity_ids {
+            separated.push_bind(id);
+        }
+    }
+    query.push(")");
+    query.push(" ORDER BY datetime(updated_at) DESC, id DESC");
+    let rows = match query
+        .build_query_as::<GlobalTaskRow>()
+        .fetch_all(&state.pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) if missing_table(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(ApiError::internal(error)),
+    };
+    Ok(rows)
+}
+
+async fn load_global_attempt_counts(
+    state: &AppState,
+    kind: CollectionRecordKind,
+    entity_ids: &[String],
+) -> Result<HashMap<String, i64>, ApiError> {
+    if entity_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "SELECT canonical_resource_id, MAX(attempt_count) AS attempt_count FROM content_work_items WHERE canonical_resource_type = ",
+    );
+    query.push_bind(collection_record_kind_label(kind));
+    query.push(" AND canonical_resource_id IN (");
+    {
+        let mut separated = query.separated(", ");
+        for id in entity_ids {
+            separated.push_bind(id);
+        }
+    }
+    query.push(") GROUP BY canonical_resource_id");
+    #[derive(Debug, sqlx::FromRow)]
+    struct AttemptCountRow {
+        canonical_resource_id: String,
+        attempt_count: i64,
+    }
+    let rows = match query
+        .build_query_as::<AttemptCountRow>()
+        .fetch_all(&state.pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) if missing_table(&error) => return Ok(HashMap::new()),
+        Err(error) => return Err(ApiError::internal(error)),
+    };
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.canonical_resource_id, row.attempt_count))
+        .collect())
+}
+
+fn global_summary(row: &GlobalTaskRow) -> AdminCollectionTaskSummary {
+    AdminCollectionTaskSummary {
+        status: row.status.clone(),
+        display_status: display_status_for(&row.status, "global_work"),
+        status_origin: "global_work".to_owned(),
+        retry_count: row.attempt_count.saturating_sub(1),
+        started_at: row.started_at.clone(),
+        last_attempt_at: row
+            .last_attempt_at
+            .clone()
+            .or_else(|| Some(row.updated_at.clone())),
+        finished_at: row.finished_at.clone(),
+    }
+}
+
+async fn load_legacy_cache_origins(
+    state: &AppState,
+    kind: CollectionRecordKind,
+    entity_ids: &[String],
+) -> Result<HashSet<(String, String)>, ApiError> {
+    if entity_ids.is_empty() || kind == CollectionRecordKind::Brief {
+        return Ok(HashSet::new());
+    }
+    let (translation_types, polish_types) = match kind {
+        CollectionRecordKind::Release => {
+            (&["release_detail", "release"][..], &["release_smart"][..])
+        }
+        CollectionRecordKind::Announcement => (
+            &["announcement_detail", "announcement"][..],
+            &["announcement_smart"][..],
+        ),
+        CollectionRecordKind::Brief => unreachable!(),
+    };
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "SELECT entity_id, entity_type FROM ai_translations WHERE lang = 'zh-CN' AND status = 'ready' AND (title IS NOT NULL OR summary IS NOT NULL) AND entity_id IN (",
+    );
+    {
+        let mut separated = query.separated(", ");
+        for id in entity_ids {
+            separated.push_bind(id);
+        }
+    }
+    query.push(") AND entity_type IN (");
+    {
+        let mut separated = query.separated(", ");
+        for entity_type in translation_types.iter().chain(polish_types.iter()) {
+            separated.push_bind(*entity_type);
+        }
+    }
+    query.push(")");
+    #[derive(Debug, sqlx::FromRow)]
+    struct LegacyCacheRow {
+        entity_id: String,
+        entity_type: String,
+    }
+    let rows = match query
+        .build_query_as::<LegacyCacheRow>()
+        .fetch_all(&state.pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) if missing_table(&error) => return Ok(HashSet::new()),
+        Err(error) => return Err(ApiError::internal(error)),
+    };
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let pipeline = if translation_types.contains(&row.entity_type.as_str()) {
+                "translation"
+            } else {
+                "polish"
+            };
+            (row.entity_id, pipeline.to_owned())
+        })
+        .collect())
+}
+
 fn merge_summary(rows: &[TaskRow], status_origin: &str) -> AdminCollectionTaskSummary {
     let Some(latest) = rows.iter().max_by_key(|row| (&row.updated_at, &row.id)) else {
         return not_recorded_summary_for(status_origin);
@@ -607,6 +805,23 @@ async fn load_task_summaries(
         .fetch_all(&state.pool)
         .await
         .map_err(ApiError::internal)?;
+    let global_rows = load_global_task_rows(state, kind, entity_ids).await?;
+    let global_mode = content_processing::current_mode(&state.pool)
+        .await
+        .unwrap_or(content_processing::ContentProcessingMode::Legacy)
+        == content_processing::ContentProcessingMode::Global;
+    let global_by_key = global_rows.iter().fold(HashMap::new(), |mut by_key, row| {
+        let pipeline = if row.pipeline == "polishing" {
+            "polish"
+        } else {
+            "translation"
+        };
+        by_key
+            .entry((row.canonical_resource_id.clone(), pipeline.to_owned()))
+            .or_insert(row);
+        by_key
+    });
+    let legacy_cache = load_legacy_cache_origins(state, kind, entity_ids).await?;
     let mut grouped = HashMap::<String, (Vec<TaskRow>, Vec<TaskRow>)>::new();
     for row in rows {
         let entry = grouped.entry(row.entity_id).or_default();
@@ -620,14 +835,55 @@ async fn load_task_summaries(
         .iter()
         .map(|id| {
             let (translation, polish) = grouped.remove(id).unwrap_or_default();
+            let translation_summary = global_by_key
+                .get(&(id.clone(), "translation".to_owned()))
+                .map(|row| global_summary(row))
+                .or_else(|| {
+                    if global_mode && !translation.is_empty() {
+                        return Some(legacy_conflict_summary());
+                    }
+                    if translation.is_empty()
+                        && legacy_cache.contains(&(id.clone(), "translation".to_owned()))
+                    {
+                        Some(legacy_cached_summary())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| {
+                    if global_mode && !translation.is_empty() {
+                        legacy_conflict_summary()
+                    } else {
+                        merge_summary(&translation, &coverage_origin(coverage, id, "translation"))
+                    }
+                });
+            let polish_summary = global_by_key
+                .get(&(id.clone(), "polish".to_owned()))
+                .map(|row| global_summary(row))
+                .or_else(|| {
+                    if global_mode && !polish.is_empty() {
+                        return Some(legacy_conflict_summary());
+                    }
+                    if polish.is_empty()
+                        && legacy_cache.contains(&(id.clone(), "polish".to_owned()))
+                    {
+                        Some(legacy_cached_summary())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| {
+                    if global_mode && !polish.is_empty() {
+                        legacy_conflict_summary()
+                    } else {
+                        merge_summary(&polish, &coverage_origin(coverage, id, "polish"))
+                    }
+                });
             (
                 id.clone(),
                 TaskSummaries {
-                    translation: merge_summary(
-                        &translation,
-                        &coverage_origin(coverage, id, "translation"),
-                    ),
-                    polish: merge_summary(&polish, &coverage_origin(coverage, id, "polish")),
+                    translation: translation_summary,
+                    polish: polish_summary,
                 },
             )
         })
@@ -804,16 +1060,28 @@ pub async fn admin_list_collection_records(
     let polish_filter = parse_status_filter(query.polish_status, "polish_status")?;
     let from = parse_timestamp(query.from, "from")?;
     let before = parse_timestamp(query.before, "before")?;
+    let global_mode = content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global;
     let rows = list_source_rows(
         &state.pool,
         kind,
         from.as_deref(),
         before.as_deref(),
-        attempts,
+        if global_mode {
+            AttemptCountRange { min: 0, max: None }
+        } else {
+            attempts
+        },
     )
     .await?;
     let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
-    ensure_processing_coverage(&state.pool, kind, &ids).await?;
+    let global_attempt_counts = if global_mode {
+        load_global_attempt_counts(state.as_ref(), kind, &ids).await?
+    } else {
+        HashMap::new()
+    };
     let coverage = load_processing_coverage(&state.pool, kind, &ids).await?;
     let task_summaries = load_task_summaries(state.as_ref(), kind, &ids, &coverage).await?;
     let brief_summaries = if kind == CollectionRecordKind::Brief {
@@ -823,6 +1091,13 @@ pub async fn admin_list_collection_records(
     };
     let mut items = rows
         .into_iter()
+        .filter(|row| {
+            if !global_mode {
+                return true;
+            }
+            let attempt_count = global_attempt_counts.get(&row.id).copied().unwrap_or(0);
+            attempt_count >= attempts.min && attempts.max.is_none_or(|max| attempt_count <= max)
+        })
         .map(|row| source_record_item(kind, row, &task_summaries, &brief_summaries))
         .filter(|item| {
             let translation_matches = if kind == CollectionRecordKind::Brief {
@@ -1081,6 +1356,168 @@ async fn load_task_attempts(
     Ok(attempts)
 }
 
+async fn load_global_attempts(
+    state: &AppState,
+    kind: CollectionRecordKind,
+    entity_id: &str,
+) -> Result<Vec<AdminCollectionAttempt>, ApiError> {
+    #[derive(Debug, sqlx::FromRow)]
+    struct GlobalAttemptRow {
+        event_id: String,
+        work_item_id: String,
+        pipeline: String,
+        attempt_no: i64,
+        trigger: String,
+        event_type: String,
+        result_status: Option<String>,
+        error_code: Option<String>,
+        error_summary: Option<String>,
+        failure_class: Option<String>,
+        retry_eligible: i64,
+        next_retry_at: Option<String>,
+        created_at: String,
+    }
+    let rows = match sqlx::query_as::<_, GlobalAttemptRow>(
+        "SELECT e.id AS event_id, e.work_item_id, w.pipeline, e.attempt_no, e.trigger, e.event_type, e.result_status, e.error_code, e.error_summary, e.failure_class, e.retry_eligible, e.next_retry_at, e.created_at FROM content_attempt_events e JOIN content_work_items w ON w.id = e.work_item_id WHERE w.canonical_resource_type = ? AND w.canonical_resource_id = ? ORDER BY datetime(e.created_at) ASC, e.id ASC",
+    )
+    .bind(collection_record_kind_label(kind))
+    .bind(entity_id)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) if missing_table(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(ApiError::internal(error)),
+    };
+    let mut call_query = QueryBuilder::<Sqlite>::new(
+        "SELECT id, status, model FROM content_attempt_llm_calls WHERE attempt_event_id IN (",
+    );
+    {
+        let mut separated = call_query.separated(", ");
+        for row in &rows {
+            separated.push_bind(row.event_id.as_str());
+        }
+    }
+    call_query.push(")");
+    #[derive(Debug, sqlx::FromRow)]
+    struct GlobalCallRow {
+        id: String,
+        status: String,
+        model: String,
+        attempt_event_id: String,
+    }
+    let calls = if rows.is_empty() {
+        Vec::new()
+    } else {
+        match call_query
+            .build_query_as::<GlobalCallRow>()
+            .fetch_all(&state.pool)
+            .await
+        {
+            Ok(calls) => calls,
+            Err(error) if missing_table(&error) => Vec::new(),
+            Err(error) => return Err(ApiError::internal(error)),
+        }
+    };
+    let calls_by_event = calls.into_iter().fold(
+        HashMap::<String, Vec<AdminCollectionLlmLink>>::new(),
+        |mut grouped, call| {
+            grouped
+                .entry(call.attempt_event_id)
+                .or_default()
+                .push(AdminCollectionLlmLink {
+                    id: call.id,
+                    status: call.status,
+                    source: "global_content_processing".to_owned(),
+                    model: call.model,
+                    stage: Some("provider_call".to_owned()),
+                    relation_role: Some("primary".to_owned()),
+                    evidence_availability: Some("captured".to_owned()),
+                });
+            grouped
+        },
+    );
+    let mut grouped = HashMap::<(String, i64), AdminCollectionAttempt>::new();
+    for row in rows {
+        let key = (row.work_item_id.clone(), row.attempt_no);
+        let attempt = grouped
+            .entry(key)
+            .or_insert_with(|| AdminCollectionAttempt {
+                id: format!("{}:{}", row.work_item_id, row.attempt_no),
+                pipeline: if row.pipeline == "polishing" {
+                    "polish".to_owned()
+                } else {
+                    "translation".to_owned()
+                },
+                attempt_no: row.attempt_no,
+                trigger: row.trigger.clone(),
+                status: "queued".to_owned(),
+                started_at: None,
+                last_attempt_at: row.created_at.clone(),
+                finished_at: None,
+                error_code: None,
+                error_summary: None,
+                failure_class: None,
+                processing_stage: None,
+                provider_status: None,
+                output_contract_status: None,
+                retry_disposition: None,
+                retry_eligible: false,
+                next_retry_at: None,
+                llm_calls: Vec::new(),
+            });
+        attempt.trigger = row.trigger;
+        attempt.last_attempt_at = row.created_at.clone();
+        match row.event_type.as_str() {
+            "attempt_started" => {
+                attempt.status = "running".to_owned();
+                attempt.started_at = Some(row.created_at.clone());
+            }
+            "attempt_completed" => {
+                attempt.status = row.result_status.unwrap_or_else(|| "completed".to_owned());
+                attempt.finished_at = Some(row.created_at.clone());
+            }
+            "retry_scheduled" => {
+                attempt.status = "retry_scheduled".to_owned();
+                attempt.finished_at = Some(row.created_at.clone());
+            }
+            "attempt_queued" => {
+                attempt.status = "queued".to_owned();
+                attempt.started_at = None;
+                attempt.finished_at = None;
+            }
+            _ => {}
+        }
+        if row.error_code.is_some() {
+            attempt.error_code = row.error_code;
+        }
+        if row.error_summary.is_some() {
+            attempt.error_summary = row.error_summary;
+        }
+        if row.failure_class.is_some() {
+            attempt.failure_class = row.failure_class;
+        }
+        attempt.retry_eligible |= row.retry_eligible != 0;
+        if row.next_retry_at.is_some() {
+            attempt.next_retry_at = row.next_retry_at;
+        }
+        if let Some(calls) = calls_by_event.get(&row.event_id) {
+            for call in calls {
+                if !attempt
+                    .llm_calls
+                    .iter()
+                    .any(|existing| existing.id == call.id)
+                {
+                    attempt.llm_calls.push(call.clone());
+                }
+            }
+        }
+    }
+    let mut attempts = grouped.into_values().collect::<Vec<_>>();
+    attempts.sort_by_key(|attempt| attempt.last_attempt_at.clone());
+    Ok(attempts)
+}
+
 async fn load_brief_attempts(
     state: &AppState,
     brief_id: &str,
@@ -1145,7 +1582,6 @@ pub async fn admin_get_collection_record_detail(
     let kind = CollectionRecordKind::parse(record_kind.as_str())?;
     let source = load_source_record(state.as_ref(), kind, &record_id).await?;
     let ids = vec![source.id.clone()];
-    ensure_processing_coverage(&state.pool, kind, &ids).await?;
     let coverage = load_processing_coverage(&state.pool, kind, &ids).await?;
     let task_summaries = load_task_summaries(state.as_ref(), kind, &ids, &coverage).await?;
     let brief_summaries = if kind == CollectionRecordKind::Brief {
@@ -1157,11 +1593,19 @@ pub async fn admin_get_collection_record_detail(
     let attempts = if kind == CollectionRecordKind::Brief {
         load_brief_attempts(state.as_ref(), &record.id).await?
     } else {
-        load_task_attempts(
-            state.as_ref(),
-            &load_record_tasks(state.as_ref(), kind, &record.id).await?,
-        )
-        .await?
+        let global = load_global_attempts(state.as_ref(), kind, &record.id).await?;
+        let mode = content_processing::current_mode(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+        if global.is_empty() && mode == content_processing::ContentProcessingMode::Legacy {
+            load_task_attempts(
+                state.as_ref(),
+                &load_record_tasks(state.as_ref(), kind, &record.id).await?,
+            )
+            .await?
+        } else {
+            global
+        }
     };
     Ok(Json(AdminCollectionRecordDetail { record, attempts }))
 }

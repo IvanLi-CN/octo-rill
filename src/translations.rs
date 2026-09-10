@@ -15,12 +15,15 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use tokio::time::sleep;
 use tower_sessions::Session;
 use tracing::warn;
 
-use crate::{admin_runtime, ai, api, error::ApiError, runtime, state::AppState};
+use crate::{
+    admin_runtime, ai, api, content_processing, error::ApiError, runtime, state::AppState,
+};
 
 const TRANSLATION_PROTOCOL_VERSION: &str = "translation-request.v1";
 const TRANSLATION_MODEL_PROFILE_DISABLED: &str = "ai-disabled";
@@ -89,6 +92,8 @@ pub struct TranslationSubmitRequest {
 pub struct TranslationResolveRequest {
     pub items: Vec<TranslationRequestItemInput>,
     #[serde(default)]
+    pub request_ids: HashMap<String, String>,
+    #[serde(default)]
     pub retry_on_error: bool,
 }
 
@@ -148,6 +153,7 @@ pub fn classify_translation_error(error_text: Option<&str>) -> Option<Classified
         ("empty_translation", "模型输出为空")
     } else if normalized.contains("ai output did not satisfy")
         || normalized.contains("ai output did not contain usable")
+        || normalized.contains("global content output")
     {
         ("output_contract_invalid", "模型输出未通过 JSON 契约")
     } else if normalized.contains("upstream model/channel rejected request")
@@ -1930,6 +1936,20 @@ fn request_effective_status_sql(status_column: &str, work_item_status_column: &s
 }
 
 pub async fn spawn_translation_scheduler(state: Arc<AppState>) {
+    match content_processing::ensure_legacy_writer_runtime(&state.pool).await {
+        Ok(false) => {
+            tracing::info!("legacy translation scheduler disabled by content processing mode");
+            return;
+        }
+        Err(err) => {
+            warn!(
+                ?err,
+                "failed to read content processing mode; keeping legacy scheduler disabled"
+            );
+            return;
+        }
+        Ok(true) => {}
+    }
     state
         .translation_scheduler
         .spawn_initial_workers(state.clone())
@@ -1967,6 +1987,14 @@ pub async fn submit_translation_request(
 ) -> Result<Response, ApiError> {
     let user_id = api::require_business_user_id(state.as_ref(), &session, &headers).await?;
     let mode = normalize_mode(req.mode.trim())?;
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        return submit_global_translation_request(state.as_ref(), &user_id, mode, req).await;
+    }
+    content_processing::ensure_legacy_writer(&state.pool).await?;
 
     match normalize_submit_payload(mode, req)? {
         NormalizedTranslationSubmit::Single(item) => {
@@ -2006,16 +2034,191 @@ pub async fn submit_translation_request(
     }
 }
 
+async fn submit_global_translation_request(
+    state: &AppState,
+    user_id: &str,
+    mode: &str,
+    req: TranslationSubmitRequest,
+) -> Result<Response, ApiError> {
+    match normalize_submit_payload(mode, req)? {
+        NormalizedTranslationSubmit::Single(item) => {
+            let item = api::canonical_global_translation_item(state, user_id, &item).await?;
+            let (status, response) =
+                content_processing::submit_item(state, user_id, mode, &item).await?;
+            if mode == "stream" {
+                return Ok(stream_global_translation_request_response_for_api(
+                    Arc::new(state.clone()),
+                    user_id.to_owned(),
+                    response.request_id,
+                ));
+            }
+            Ok((status, Json(response)).into_response())
+        }
+        NormalizedTranslationSubmit::Batch(items) => {
+            let mut responses = Vec::with_capacity(items.len());
+            let mut status = StatusCode::ACCEPTED;
+            for item in items {
+                let item = api::canonical_global_translation_item(state, user_id, &item).await?;
+                let (item_status, response) =
+                    content_processing::submit_item(state, user_id, mode, &item).await?;
+                if item_status == StatusCode::CONFLICT {
+                    status = StatusCode::CONFLICT;
+                }
+                responses.push(response);
+            }
+            Ok((status, Json(json!({ "requests": responses }))).into_response())
+        }
+    }
+}
+
+pub(crate) fn stream_global_translation_request_response_for_api(
+    state: Arc<AppState>,
+    user_id: String,
+    request_id: String,
+) -> Response {
+    let stream = async_stream::stream! {
+        let mut last_phase = String::new();
+        loop {
+            match content_processing::get_request(state.as_ref(), &user_id, &request_id).await {
+                Ok(Some(snapshot)) => {
+                    let status = snapshot
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("queued");
+                    let phase = match status {
+                        "queued" => "queued",
+                        "running" => "running",
+                        "failed" | "cancelled" | "superseded" | "blocked_config" => "failed",
+                        _ => "completed",
+                    };
+                    if phase != last_phase {
+                        let event = json!({
+                            "event": phase,
+                            "request_id": request_id,
+                            "status": status,
+                            "batch_id": snapshot.get("result").and_then(|result| result.get("batch_id")),
+                            "result": (phase == "completed" || phase == "failed").then(|| snapshot.get("result").cloned().unwrap_or_else(|| json!({}))),
+                            "error": (phase == "failed").then(|| snapshot.get("result").and_then(|result| result.get("error")).cloned().unwrap_or(Value::Null)),
+                        });
+                        let mut payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_owned());
+                        payload.push('\n');
+                        yield Ok::<_, Infallible>(axum::body::Bytes::from(payload));
+                        last_phase = phase.to_owned();
+                    }
+                    if phase == "completed" || phase == "failed" {
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => {
+                    let mut payload = serde_json::to_string(&json!({
+                        "event": "failed",
+                        "request_id": request_id,
+                        "status": "failed",
+                        "error": "translation request not found",
+                    })).unwrap_or_else(|_| "{}".to_owned());
+                    payload.push('\n');
+                    yield Ok::<_, Infallible>(axum::body::Bytes::from(payload));
+                    break;
+                }
+            }
+            sleep(TRANSLATION_STREAM_POLL_INTERVAL).await;
+        }
+    };
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
+    );
+    response
+}
+
 pub async fn get_translation_request(
     State(state): State<Arc<AppState>>,
     session: Session,
     headers: HeaderMap,
     Path(request_id): Path<String>,
-) -> Result<Json<TranslationRequestResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let user_id = api::require_business_user_id(state.as_ref(), &session, &headers).await?;
     let request_id = api::parse_local_id_param(request_id, "request_id")?;
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        != content_processing::ContentProcessingMode::Legacy
+        && let Some(response) =
+            content_processing::get_request(state.as_ref(), &user_id, &request_id).await?
+    {
+        return Ok(Json(response).into_response());
+    }
     let detail = load_translation_request_detail(state.as_ref(), &user_id, &request_id).await?;
-    Ok(Json(detail_to_public_response(detail)))
+    Ok(Json(detail_to_public_response(detail)).into_response())
+}
+
+pub async fn retry_translation_request(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let user_id = api::require_business_user_id(state.as_ref(), &session, &headers).await?;
+    let request_id = api::parse_local_id_param(request_id, "request_id")?;
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        != content_processing::ContentProcessingMode::Global
+    {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "content_processing_legacy",
+            "global content processing is not active",
+        ));
+    }
+    let snapshot = content_processing::get_request(state.as_ref(), &user_id, &request_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "translation request not found",
+            )
+        })?;
+    let result = snapshot.get("result").cloned().unwrap_or_else(|| json!({}));
+    let authorization_probe = TranslationRequestItemInput {
+        producer_ref: result
+            .get("producer_ref")
+            .and_then(Value::as_str)
+            .unwrap_or("retry")
+            .to_owned(),
+        kind: result
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        variant: result
+            .get("variant")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        entity_id: result
+            .get("entity_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        target_lang: "zh-CN".to_owned(),
+        max_wait_ms: 0,
+        source_blocks: Vec::new(),
+        target_slots: Vec::new(),
+    };
+    api::canonical_global_translation_item(state.as_ref(), &user_id, &authorization_probe).await?;
+    let (status, body) =
+        content_processing::retry_request(state.as_ref(), &user_id, &request_id).await?;
+    let mut response = (status, Json(body)).into_response();
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("300"));
+    }
+    Ok(response)
 }
 
 pub async fn resolve_translation_results(
@@ -2023,8 +2226,69 @@ pub async fn resolve_translation_results(
     session: Session,
     headers: HeaderMap,
     Json(req): Json<TranslationResolveRequest>,
-) -> Result<Json<TranslationResolveResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let user_id = api::require_business_user_id(state.as_ref(), &session, &headers).await?;
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        let items = normalize_request_items(&req.items)?;
+        let mut responses = Vec::with_capacity(items.len());
+        for item in items {
+            let canonical_item =
+                api::canonical_global_translation_item(state.as_ref(), &user_id, &item).await?;
+            let (_status, response) = if let Some(request_id) =
+                req.request_ids.get(&item.producer_ref)
+            {
+                let response =
+                    content_processing::get_request(state.as_ref(), &user_id, request_id)
+                        .await?
+                        .ok_or_else(|| {
+                            ApiError::new(
+                                StatusCode::NOT_FOUND,
+                                "not_found",
+                                "translation request not found",
+                            )
+                        })?;
+                let request_id = response
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(request_id.as_str())
+                    .to_owned();
+                let work_item_id = response
+                    .get("work_item_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let status = response
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("queued")
+                    .to_owned();
+                let result = response.get("result").cloned().unwrap_or_else(|| json!({}));
+                let poll_url = format!("/api/translate/requests/{request_id}");
+                (
+                    StatusCode::OK,
+                    content_processing::GlobalSubmissionResponse {
+                        request_id,
+                        work_item_id,
+                        status,
+                        poll_url,
+                        result,
+                    },
+                )
+            } else {
+                content_processing::submit_item(state.as_ref(), &user_id, "async", &canonical_item)
+                    .await?
+            };
+            let mut result = response.result;
+            result["request_id"] = Value::String(response.request_id);
+            responses.push(result);
+        }
+        return Ok(Json(json!({ "items": responses })).into_response());
+    }
+    content_processing::ensure_legacy_writer(&state.pool).await?;
     let items = normalize_request_items(&req.items)?;
     let items =
         resolve_translation_results_for_user(state.as_ref(), &user_id, &items, req.retry_on_error)
@@ -2034,7 +2298,8 @@ pub async fn resolve_translation_results(
             .into_iter()
             .map(public_translation_result_item)
             .collect(),
-    }))
+    })
+    .into_response())
 }
 
 pub async fn stream_translation_request(
@@ -2044,6 +2309,22 @@ pub async fn stream_translation_request(
     Path(request_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let user_id = api::require_business_user_id(state.as_ref(), &session, &headers).await?;
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        != content_processing::ContentProcessingMode::Legacy
+        && let Some(response) =
+            content_processing::get_request(state.as_ref(), &user_id, request_id.trim()).await?
+    {
+        let body = serde_json::to_string(&response).map_err(ApiError::internal)? + "\n";
+        let mut out = Response::new(Body::from(body));
+        out.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
+        );
+        return Ok(out);
+    }
+    content_processing::ensure_legacy_writer(&state.pool).await?;
     let request_id = api::parse_local_id_param(request_id, "request_id")?;
     ensure_request_owner(state.as_ref(), &user_id, &request_id).await?;
     Ok(stream_translation_request_response(
@@ -2890,6 +3171,7 @@ async fn create_translation_request_with_origin(
         .begin_immediate(&state.pool, "translation_request")
         .await
         .map_err(ApiError::internal)?;
+    ensure_legacy_writer_transaction(&mut tx).await?;
     let created = insert_translation_request(
         state,
         &mut tx,
@@ -3020,6 +3302,7 @@ async fn create_translation_requests_batch_with_origin(
         .begin_immediate(&state.pool, "translation_request_batch")
         .await
         .map_err(ApiError::internal)?;
+    ensure_legacy_writer_transaction(&mut tx).await?;
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         out.push(
@@ -3043,11 +3326,29 @@ async fn create_translation_requests_batch_with_origin(
     Ok(out)
 }
 
+async fn ensure_legacy_writer_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> Result<(), ApiError> {
+    if content_processing::legacy_mode_in_transaction(tx)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "content_processing_transition",
+            "content processing is controlled by a non-legacy mode; poll the request status before retrying",
+        ))
+    }
+}
+
 pub(crate) async fn enqueue_release_smart_translation_requests(
     state: &AppState,
     user_id: &str,
     release_ids: &[i64],
 ) -> Result<Vec<String>, ApiError> {
+    content_processing::ensure_legacy_writer(&state.pool).await?;
     if release_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -4661,6 +4962,9 @@ async fn run_translation_scheduler_once(
     state: &AppState,
     worker: TranslationWorkerProfile,
 ) -> Result<()> {
+    if !content_processing::ensure_legacy_writer_runtime(&state.pool).await? {
+        return Ok(());
+    }
     if !state
         .translation_scheduler
         .worker_is_desired(worker.worker_id.as_str())
@@ -4820,6 +5124,10 @@ async fn claim_next_batch(
         .sqlite_writer
         .begin_immediate(&state.pool, "translation_batch_claim")
         .await?;
+    if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
+        tx.rollback().await?;
+        return Ok(None);
+    }
     let mut request_ids = HashSet::new();
     for item in &selected {
         let rows = sqlx::query_scalar::<_, String>(
@@ -4949,6 +5257,10 @@ async fn requeue_ineligible_queued_batch_items(state: &AppState) -> Result<()> {
         .sqlite_writer
         .begin_immediate(&state.pool, "translation_batch_ineligible_requeue")
         .await?;
+    if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
+        tx.rollback().await?;
+        return Ok(());
+    }
     let items = sqlx::query_as::<_, (String, String)>(
         r#"
         SELECT b.id, w.id
@@ -5141,6 +5453,11 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
         .sqlite_writer
         .begin_immediate(&state.pool, "translation_batch_start")
         .await?;
+    if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
+        tx.rollback().await?;
+        drop(sqlite_write);
+        return Ok(());
+    }
     let rows_affected = sqlx::query(
         r#"
         UPDATE translation_batches
@@ -5667,6 +5984,10 @@ async fn finalize_batch_success(
         .sqlite_writer
         .begin_immediate(&state.pool, "translation_batch_finalize")
         .await?;
+    if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
+        tx.rollback().await?;
+        return Ok(());
+    }
     for result in &results {
         let Some(work_item) = batch
             .items
@@ -5947,6 +6268,10 @@ async fn finalize_batch_failure(
         .sqlite_writer
         .begin_immediate(&state.pool, "translation_batch_finalize")
         .await?;
+    if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
+        tx.rollback().await?;
+        return Ok(());
+    }
     fail_batch_with_message(
         &mut tx,
         batch.id.as_str(),
@@ -5972,6 +6297,9 @@ struct DueTranslationRecoveryRow {
 }
 
 async fn recover_due_translation_work_items(state: &AppState) -> Result<()> {
+    if !content_processing::ensure_legacy_writer_runtime(&state.pool).await? {
+        return Ok(());
+    }
     let config = admin_runtime::load_llm_recovery_runtime_config(&state.pool).await?;
     if !config.enabled || config.rollout_percent == 0 {
         return Ok(());
@@ -6035,6 +6363,10 @@ async fn recover_due_translation_work_items(state: &AppState) -> Result<()> {
             .sqlite_writer
             .begin_immediate(&state.pool, "translation_work_item_recovery")
             .await?;
+        if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
+            tx.rollback().await?;
+            return Ok(());
+        }
 
         let latest_hash = sqlx::query_scalar::<_, Option<String>>(
             r#"
@@ -6379,6 +6711,9 @@ async fn recover_runtime_state_with_mode(
     state: &AppState,
     mode: runtime::RuntimeRecoveryMode,
 ) -> Result<()> {
+    if !content_processing::ensure_legacy_writer_runtime(&state.pool).await? {
+        return Ok(());
+    }
     #[derive(Debug, sqlx::FromRow)]
     struct StaleBatchRow {
         id: String,
@@ -6452,6 +6787,10 @@ async fn recover_runtime_state_with_mode(
             .sqlite_writer
             .begin_immediate(&state.pool, "translation_batch_recovery")
             .await?;
+        if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
+            tx.rollback().await?;
+            return Ok(());
+        }
         let items = load_batch_work_items(&mut tx, batch.id.as_str()).await?;
         let now = Utc::now().to_rfc3339();
         fail_batch_with_message(
@@ -6942,6 +7281,7 @@ fn normalize_request_items(
                 | "announcement_smart"
                 | "announcement_detail"
                 | "notification"
+                | "notification_smart"
         ) {
             return Err(ApiError::bad_request(format!(
                 "unsupported translation kind: {kind}"
