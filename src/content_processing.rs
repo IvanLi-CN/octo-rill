@@ -25,6 +25,44 @@ pub enum ContentProcessingMode {
     Global,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ContentProcessingTransitionError {
+    pub mode: ContentProcessingMode,
+}
+
+impl std::fmt::Display for ContentProcessingTransitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "content processing is temporarily frozen in {} mode",
+            self.mode.as_str()
+        )
+    }
+}
+
+impl std::error::Error for ContentProcessingTransitionError {}
+
+pub fn transition_error(mode: ContentProcessingMode) -> anyhow::Error {
+    anyhow::Error::new(ContentProcessingTransitionError { mode })
+}
+
+pub fn api_error_from_anyhow(error: anyhow::Error) -> ApiError {
+    if let Some(transition) = error.downcast_ref::<ContentProcessingTransitionError>() {
+        return ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "content_processing_transition",
+            "content processing is temporarily frozen; poll the request status before retrying",
+        )
+        .with_details(json!({
+            "mode": transition.mode.as_str(),
+            "request_id": Value::Null,
+            "work_item_id": Value::Null,
+            "poll_url": Value::Null,
+        }));
+    }
+    ApiError::internal(error)
+}
+
 impl ContentProcessingMode {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -2521,6 +2559,13 @@ mod tests {
             assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(error.code(), "content_processing_transition");
         }
+    }
+
+    #[test]
+    fn transition_error_maps_to_pollable_service_unavailable() {
+        let error = api_error_from_anyhow(transition_error(ContentProcessingMode::RollbackFreeze));
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code(), "content_processing_transition");
     }
 
     #[tokio::test]

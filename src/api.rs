@@ -14564,7 +14564,7 @@ where
         .map_err(ApiError::internal)?;
     let releases = sync_releases(state, user_id)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(content_processing::api_error_from_anyhow)?;
     let (social, social_error) = sync_social(state, user_id).await;
     let notifications = sync_notifications(state, user_id)
         .await
@@ -14594,7 +14594,7 @@ pub async fn sync_releases(
     if matches!(mode, ReturnMode::Sync) {
         let res = sync::sync_releases(state.as_ref(), user_id.as_str())
             .await
-            .map_err(ApiError::internal)?;
+            .map_err(content_processing::api_error_from_anyhow)?;
         return Ok(Json(res).into_response());
     }
 

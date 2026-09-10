@@ -3953,24 +3953,30 @@ async fn enqueue_background_release_translation_task(
         return Ok(None);
     }
 
-    if content_processing::current_mode(&state.pool).await?
-        == content_processing::ContentProcessingMode::Global
-    {
-        for release_id in release_ids {
-            let item = crate::api::global_release_request_item(
-                state,
-                user_id,
-                *release_id,
-                "release_summary",
-                source,
-            )
-            .await
-            .map_err(|error| anyhow!(error.to_string()))?;
-            content_processing::submit_item(state, user_id, "async", &item)
+    match content_processing::current_mode(&state.pool).await? {
+        content_processing::ContentProcessingMode::Global => {
+            for release_id in release_ids {
+                let item = crate::api::global_release_request_item(
+                    state,
+                    user_id,
+                    *release_id,
+                    "release_summary",
+                    source,
+                )
                 .await
                 .map_err(|error| anyhow!(error.to_string()))?;
+                content_processing::submit_item(state, user_id, "async", &item)
+                    .await
+                    .map_err(|error| anyhow!(error.to_string()))?;
+            }
+            return Ok(None);
         }
-        return Ok(None);
+        content_processing::ContentProcessingMode::RollbackFreeze => {
+            return Err(content_processing::transition_error(
+                content_processing::ContentProcessingMode::RollbackFreeze,
+            ));
+        }
+        content_processing::ContentProcessingMode::Legacy => {}
     }
 
     let task = jobs::enqueue_task(
@@ -4003,24 +4009,30 @@ async fn enqueue_background_release_smart_task(
         return Ok(None);
     }
 
-    if content_processing::current_mode(&state.pool).await?
-        == content_processing::ContentProcessingMode::Global
-    {
-        for release_id in release_ids {
-            let item = crate::api::global_release_request_item(
-                state,
-                user_id,
-                *release_id,
-                "release_smart",
-                source,
-            )
-            .await
-            .map_err(|error| anyhow!(error.to_string()))?;
-            content_processing::submit_item(state, user_id, "async", &item)
+    match content_processing::current_mode(&state.pool).await? {
+        content_processing::ContentProcessingMode::Global => {
+            for release_id in release_ids {
+                let item = crate::api::global_release_request_item(
+                    state,
+                    user_id,
+                    *release_id,
+                    "release_smart",
+                    source,
+                )
                 .await
                 .map_err(|error| anyhow!(error.to_string()))?;
+                content_processing::submit_item(state, user_id, "async", &item)
+                    .await
+                    .map_err(|error| anyhow!(error.to_string()))?;
+            }
+            return Ok(None);
         }
-        return Ok(None);
+        content_processing::ContentProcessingMode::RollbackFreeze => {
+            return Err(content_processing::transition_error(
+                content_processing::ContentProcessingMode::RollbackFreeze,
+            ));
+        }
+        content_processing::ContentProcessingMode::Legacy => {}
     }
 
     let task = jobs::enqueue_task(
@@ -13324,6 +13336,7 @@ fn fallback_notification_open_url(thread_id: Option<&str>, repo_full_name: Optio
 
 #[cfg(test)]
 mod tests {
+    use crate::content_processing;
     use anyhow::{Context, anyhow};
     use chrono::{DateTime, Utc};
     use sqlx::Row;
@@ -20907,6 +20920,59 @@ mod tests {
             serde_json::from_str(&rows[1].2).expect("parse smart payload");
         assert_eq!(first_payload, expected_payload);
         assert_eq!(second_payload, expected_payload);
+    }
+
+    #[tokio::test]
+    async fn enqueue_background_release_ai_tasks_are_frozen_without_legacy_fallback() {
+        let pool = setup_pool().await;
+        sqlx::query("UPDATE content_processing_control SET mode = 'rollback_freeze' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .expect("freeze content processing mode");
+        let mut state = setup_state(pool.clone());
+        Arc::get_mut(&mut state).expect("unique state").config.ai = Some(crate::config::AiConfig {
+            base_url: url::Url::parse("https://example.invalid/v1").expect("parse ai url"),
+            model: "gpt-test".to_owned(),
+            api_key: "test-key".to_owned(),
+        });
+
+        let translation_error = super::enqueue_background_release_translation_task(
+            state.as_ref(),
+            "user-freeze",
+            &[101],
+            "sync.releases.auto_translate",
+            None,
+            Some("user-freeze"),
+        )
+        .await
+        .expect_err("translation enqueue must be frozen");
+        assert!(
+            translation_error
+                .downcast_ref::<content_processing::ContentProcessingTransitionError>()
+                .is_some()
+        );
+
+        let smart_error = super::enqueue_background_release_smart_task(
+            state.as_ref(),
+            "user-freeze",
+            &[101],
+            "sync.releases.auto_smart",
+            None,
+            Some("user-freeze"),
+        )
+        .await
+        .expect_err("smart enqueue must be frozen");
+        assert!(
+            smart_error
+                .downcast_ref::<content_processing::ContentProcessingTransitionError>()
+                .is_some()
+        );
+
+        let task_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_tasks")
+            .fetch_one(&pool)
+            .await
+            .expect("count legacy tasks");
+        assert_eq!(task_count, 0);
     }
 
     #[test]
