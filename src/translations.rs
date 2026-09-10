@@ -2245,7 +2245,7 @@ pub async fn resolve_translation_results(
         for item in items {
             let canonical_item =
                 api::canonical_global_translation_item(state.as_ref(), &user_id, &item).await?;
-            let (_status, response) = if let Some(request_id) =
+            let (_status, mut response) = if let Some(request_id) =
                 req.request_ids.get(&item.producer_ref)
             {
                 let response =
@@ -2290,6 +2290,36 @@ pub async fn resolve_translation_results(
                 content_processing::submit_item(state.as_ref(), &user_id, "async", &canonical_item)
                     .await?
             };
+            if req.retry_on_error && response.status == "failed" {
+                let (_retry_status, retry_body) = content_processing::retry_request(
+                    state.as_ref(),
+                    &user_id,
+                    &response.request_id,
+                )
+                .await?;
+                response.request_id = retry_body
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(response.request_id.as_str())
+                    .to_owned();
+                response.work_item_id = retry_body
+                    .get("work_item_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(response.work_item_id.as_str())
+                    .to_owned();
+                response.status = retry_body
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or(response.status.as_str())
+                    .to_owned();
+                response.poll_url = retry_body
+                    .get("poll_url")
+                    .and_then(Value::as_str)
+                    .unwrap_or(response.poll_url.as_str())
+                    .to_owned();
+                response.result = retry_body.get("result").cloned().unwrap_or(response.result);
+                response.error = retry_body.get("error").cloned();
+            }
             let mut result = response.result;
             result["request_id"] = Value::String(response.request_id);
             responses.push(result);
@@ -6314,35 +6344,6 @@ async fn recover_due_translation_work_items(state: &AppState) -> Result<()> {
         return Ok(());
     }
 
-    // A newer source supersedes an old failed plan. This is deliberately a
-    // metadata-only update and never exposes source content.
-    sqlx::query(
-        r#"
-        UPDATE translation_work_items AS old
-        SET next_retry_at = NULL,
-            retry_expires_at = NULL,
-            failure_class = NULL,
-            updated_at = ?
-        WHERE old.status = 'completed'
-          AND old.next_retry_at IS NOT NULL
-          AND EXISTS (
-            SELECT 1
-            FROM translation_work_items AS newer
-            WHERE newer.scope_user_id = old.scope_user_id
-              AND newer.kind = old.kind
-              AND newer.variant = old.variant
-              AND newer.entity_id = old.entity_id
-              AND newer.target_lang = old.target_lang
-              AND newer.source_hash != old.source_hash
-              AND (newer.created_at > old.created_at
-                   OR (newer.created_at = old.created_at AND newer.id > old.id))
-          )
-        "#,
-    )
-    .bind(Utc::now().to_rfc3339())
-    .execute(&state.pool)
-    .await?;
-
     let now = Utc::now().to_rfc3339();
     let due_items = sqlx::query_as::<_, DueTranslationRecoveryRow>(
         r#"
@@ -6375,6 +6376,42 @@ async fn recover_due_translation_work_items(state: &AppState) -> Result<()> {
         if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
             tx.rollback().await?;
             return Ok(());
+        }
+
+        // A newer source supersedes an old failed plan. This metadata-only
+        // update stays in the same serialized transaction as the mode check.
+        let superseded = sqlx::query(
+            r#"
+            UPDATE translation_work_items AS old
+            SET next_retry_at = NULL,
+                retry_expires_at = NULL,
+                failure_class = NULL,
+                updated_at = ?
+            WHERE old.id = ?
+              AND old.status = 'completed'
+              AND old.next_retry_at IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM translation_work_items AS newer
+                WHERE newer.scope_user_id = old.scope_user_id
+                  AND newer.kind = old.kind
+                  AND newer.variant = old.variant
+                  AND newer.entity_id = old.entity_id
+                  AND newer.target_lang = old.target_lang
+                  AND newer.source_hash != old.source_hash
+                  AND (newer.created_at > old.created_at
+                       OR (newer.created_at = old.created_at AND newer.id > old.id))
+              )
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(item.id.as_str())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if superseded > 0 {
+            tx.commit().await?;
+            continue;
         }
 
         let latest_hash = sqlx::query_scalar::<_, Option<String>>(

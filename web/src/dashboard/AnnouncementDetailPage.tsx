@@ -14,6 +14,7 @@ import {
 	ApiError,
 	apiGetAnnouncementDetail,
 	apiGetTranslationRequest,
+	apiRetryTranslationRequest,
 	apiResolveTranslationResults,
 	apiTranslateAnnouncementDetail,
 	isPendingTranslationResultStatus,
@@ -225,104 +226,113 @@ export function AnnouncementDetailPage(props: {
 	const activeSmartError =
 		selectedLane === "smart" ? (smartError ?? detailSmartError) : null;
 
-	const onTranslate = useCallback(() => {
-		if (!detail || translating) return;
-		const requestSeq = translateRequestSeqRef.current + 1;
-		translateRequestSeqRef.current = requestSeq;
-		const requestDiscussionKey = detail.discussion_key;
-		const preserveReadyTranslation = hasReadyTranslatedContent(
-			detail.translated,
-		);
-		setTranslating(true);
-		setTranslateError(null);
-		void (async () => {
-			let requestId =
-				pendingTranslationRequestRef.current?.discussionKey ===
-				requestDiscussionKey
-					? pendingTranslationRequestRef.current.requestId
-					: null;
-			let response: TranslationRequestResponse | null = null;
-			for (let attempt = 0; attempt < 2; attempt += 1) {
-				try {
-					response = requestId
-						? await apiGetTranslationRequest(requestId)
-						: await apiTranslateAnnouncementDetail(detail);
-					const deadline = Date.now() + REQUEST_STATUS_POLL_WINDOW_MS;
-					while (isPendingTranslationResultStatus(response.result.status)) {
+	const onTranslate = useCallback(
+		(options?: { retry?: boolean }) => {
+			if (!detail || translating) return;
+			const requestSeq = translateRequestSeqRef.current + 1;
+			translateRequestSeqRef.current = requestSeq;
+			const requestDiscussionKey = detail.discussion_key;
+			const preserveReadyTranslation = hasReadyTranslatedContent(
+				detail.translated,
+			);
+			setTranslating(true);
+			setTranslateError(null);
+			void (async () => {
+				let requestId =
+					pendingTranslationRequestRef.current?.discussionKey ===
+					requestDiscussionKey
+						? pendingTranslationRequestRef.current.requestId
+						: null;
+				let response: TranslationRequestResponse | null = null;
+				for (let attempt = 0; attempt < 2; attempt += 1) {
+					try {
+						response =
+							options?.retry && requestId
+								? await apiRetryTranslationRequest(requestId)
+								: requestId
+									? await apiGetTranslationRequest(requestId)
+									: await apiTranslateAnnouncementDetail(detail);
 						pendingTranslationRequestRef.current = {
 							discussionKey: requestDiscussionKey,
 							requestId: response.request_id,
 						};
-						if (Date.now() >= deadline) {
-							return;
+						const deadline = Date.now() + REQUEST_STATUS_POLL_WINDOW_MS;
+						while (isPendingTranslationResultStatus(response.result.status)) {
+							pendingTranslationRequestRef.current = {
+								discussionKey: requestDiscussionKey,
+								requestId: response.request_id,
+							};
+							if (Date.now() >= deadline) {
+								return;
+							}
+							if (translateRequestSeqRef.current !== requestSeq) return;
+							await sleep(REQUEST_STATUS_POLL_INTERVAL_MS);
+							if (translateRequestSeqRef.current !== requestSeq) return;
+							response = await apiGetTranslationRequest(response.request_id);
 						}
-						if (translateRequestSeqRef.current !== requestSeq) return;
-						await sleep(REQUEST_STATUS_POLL_INTERVAL_MS);
-						if (translateRequestSeqRef.current !== requestSeq) return;
-						response = await apiGetTranslationRequest(response.request_id);
+						break;
+					} catch (error) {
+						if (!isMissingTranslationRequestError(error) || attempt === 1) {
+							throw error;
+						}
+						pendingTranslationRequestRef.current = null;
+						requestId = null;
 					}
-					break;
-				} catch (error) {
-					if (!isMissingTranslationRequestError(error) || attempt === 1) {
-						throw error;
-					}
-					pendingTranslationRequestRef.current = null;
-					requestId = null;
 				}
-			}
-			if (!response) {
-				throw new Error("translation request could not be recovered");
-			}
-			pendingTranslationRequestRef.current = null;
-			if (translateRequestSeqRef.current !== requestSeq) return;
-			const translated = mapTranslationResultToAnnouncementDetailTranslated(
-				response.result,
-			);
-			if (!translated) {
-				throw new Error(resolveErrorSummary(response.result, "翻译失败"));
-			}
-			if (preserveReadyTranslation && translated.status !== "ready") {
-				const failure =
-					translated.status === "disabled"
-						? toUiError(response.result, "AI 未配置，暂时无法重新翻译。")
-						: toUiError(response.result, "翻译失败，请稍后重试。");
-				pushErrorToast(
-					translated.status === "disabled" ? "翻译不可用" : "翻译失败",
-					failure.summary,
-					{ detail: failure.detail },
-				);
-				return;
-			}
-			setDetail((prev) => {
-				if (!prev) return prev;
-				if (prev.discussion_key !== requestDiscussionKey) return prev;
-				return { ...prev, translated };
-			});
-			setTranslateError(
-				translated.status === "error"
-					? toUiError(translated, "这次翻译没有成功完成。")
-					: null,
-			);
-			if (translated.status === "ready") {
-				setSelectedLane("translated");
-			}
-		})()
-			.catch((error) => {
+				if (!response) {
+					throw new Error("translation request could not be recovered");
+				}
 				if (translateRequestSeqRef.current !== requestSeq) return;
-				if (preserveReadyTranslation) {
-					const failure = toUnknownUiError(error, "翻译失败，请稍后重试。");
-					pushErrorToast("翻译失败", failure.summary, {
-						detail: failure.detail,
-					});
+				const translated = mapTranslationResultToAnnouncementDetailTranslated(
+					response.result,
+				);
+				if (!translated) {
+					throw new Error(resolveErrorSummary(response.result, "翻译失败"));
+				}
+				if (preserveReadyTranslation && translated.status !== "ready") {
+					const failure =
+						translated.status === "disabled"
+							? toUiError(response.result, "AI 未配置，暂时无法重新翻译。")
+							: toUiError(response.result, "翻译失败，请稍后重试。");
+					pushErrorToast(
+						translated.status === "disabled" ? "翻译不可用" : "翻译失败",
+						failure.summary,
+						{ detail: failure.detail },
+					);
 					return;
 				}
-				setTranslateError(toUnknownUiError(error, "翻译失败，请稍后重试。"));
-			})
-			.finally(() => {
-				if (translateRequestSeqRef.current !== requestSeq) return;
-				setTranslating(false);
-			});
-	}, [detail, pushErrorToast, translating]);
+				setDetail((prev) => {
+					if (!prev) return prev;
+					if (prev.discussion_key !== requestDiscussionKey) return prev;
+					return { ...prev, translated };
+				});
+				setTranslateError(
+					translated.status === "error"
+						? toUiError(translated, "这次翻译没有成功完成。")
+						: null,
+				);
+				if (translated.status === "ready") {
+					setSelectedLane("translated");
+				}
+			})()
+				.catch((error) => {
+					if (translateRequestSeqRef.current !== requestSeq) return;
+					if (preserveReadyTranslation) {
+						const failure = toUnknownUiError(error, "翻译失败，请稍后重试。");
+						pushErrorToast("翻译失败", failure.summary, {
+							detail: failure.detail,
+						});
+						return;
+					}
+					setTranslateError(toUnknownUiError(error, "翻译失败，请稍后重试。"));
+				})
+				.finally(() => {
+					if (translateRequestSeqRef.current !== requestSeq) return;
+					setTranslating(false);
+				});
+		},
+		[detail, pushErrorToast, translating],
+	);
 
 	const onResolveSmart = useCallback(
 		(options?: { selectLane?: boolean; retryOnError?: boolean }) => {
@@ -591,7 +601,7 @@ export function AnnouncementDetailPage(props: {
 										variant="outline"
 										size="sm"
 										className="font-mono text-xs"
-										onClick={onTranslate}
+										onClick={() => onTranslate({ retry: true })}
 										disabled={translating}
 									>
 										<RefreshCcw className="size-4" />
