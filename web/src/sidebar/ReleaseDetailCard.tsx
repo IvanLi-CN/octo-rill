@@ -126,6 +126,36 @@ function shouldResolveSmart(
 	);
 }
 
+function pendingStatusMessage(
+	status:
+		| NonNullable<ReleaseDetailResponse["translated"]>["status"]
+		| undefined,
+) {
+	return status === "deferred_provider"
+		? "翻译已提交，供应商暂缓处理。"
+		: status === "running"
+			? "翻译正在后台处理中。"
+			: "翻译已排队，正在后台处理中。";
+}
+
+function pendingPolishStatusMessage(
+	status: NonNullable<ReleaseDetailResponse["smart"]>["status"] | undefined,
+) {
+	return status === "deferred_provider"
+		? "润色已提交，供应商暂缓处理。"
+		: status === "running"
+			? "润色正在后台处理中。"
+			: "润色已排队，正在后台处理中。";
+}
+
+function isPendingDetailStatus(status: string | undefined) {
+	return (
+		status === "queued" ||
+		status === "running" ||
+		status === "deferred_provider"
+	);
+}
+
 function truncateChars(raw: string, maxChars: number) {
 	return Array.from(raw).slice(0, maxChars).join("");
 }
@@ -339,6 +369,14 @@ export function ReleaseDetailCard(props: {
 
 	const activeSmartError =
 		selectedLane === "smart" ? (smartError ?? detailSmartError) : null;
+	const activeTranslationPending =
+		selectedLane === "translated" &&
+		activeDetail?.translated != null &&
+		isPendingDetailStatus(activeDetail.translated.status);
+	const activeSmartPending =
+		selectedLane === "smart" &&
+		activeDetail?.smart != null &&
+		isPendingDetailStatus(activeDetail.smart.status);
 
 	const onTranslate = useCallback(
 		(options?: { retry?: boolean }) => {
@@ -493,6 +531,15 @@ export function ReleaseDetailCard(props: {
 
 				while (result && isPendingTranslationResultStatus(result.status)) {
 					if (Date.now() >= deadline) {
+						const pendingSmart =
+							mapTranslationResultToReleaseDetailSmart(result);
+						if (pendingSmart) {
+							setDetail((prev) => {
+								if (!prev || prev.release_id !== requestReleaseId) return prev;
+								return { ...prev, smart: pendingSmart };
+							});
+							setSmartError(null);
+						}
 						return;
 					}
 					if (smartRequestSeqRef.current !== requestSeq) return;
@@ -641,8 +688,10 @@ export function ReleaseDetailCard(props: {
 								{RELEASE_DETAIL_LANES.map((option) => {
 									const isSelected = selectedLane === option.lane;
 									const isBusy =
-										(option.lane === "translated" && translating) ||
-										(option.lane === "smart" && smartResolving);
+										(option.lane === "translated" &&
+											(translating || activeTranslationPending)) ||
+										(option.lane === "smart" &&
+											(smartResolving || activeSmartPending));
 									const wasSelected = selectedLane === option.lane;
 									const isDisabled =
 										loading ||
@@ -854,6 +903,16 @@ export function ReleaseDetailCard(props: {
 							/>
 						) : display ? (
 							<div className="space-y-3">
+								{activeTranslationPending ? (
+									<p role="status" className="text-sm text-muted-foreground">
+										{pendingStatusMessage(activeDetail?.translated?.status)}
+									</p>
+								) : null}
+								{activeSmartPending ? (
+									<p role="status" className="text-sm text-muted-foreground">
+										{pendingPolishStatusMessage(activeDetail?.smart?.status)}
+									</p>
+								) : null}
 								<h3 className="text-sm font-semibold tracking-tight">
 									{display.title}
 								</h3>

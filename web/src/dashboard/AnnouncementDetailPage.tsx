@@ -115,6 +115,38 @@ function shouldResolveSmart(
 	);
 }
 
+function pendingStatusMessage(
+	status:
+		| NonNullable<AnnouncementDetailResponse["translated"]>["status"]
+		| undefined,
+) {
+	return status === "deferred_provider"
+		? "翻译已提交，供应商暂缓处理。"
+		: status === "running"
+			? "翻译正在后台处理中。"
+			: "翻译已排队，正在后台处理中。";
+}
+
+function pendingPolishStatusMessage(
+	status:
+		| NonNullable<AnnouncementDetailResponse["smart"]>["status"]
+		| undefined,
+) {
+	return status === "deferred_provider"
+		? "润色已提交，供应商暂缓处理。"
+		: status === "running"
+			? "润色正在后台处理中。"
+			: "润色已排队，正在后台处理中。";
+}
+
+function isPendingDetailStatus(status: string | undefined) {
+	return (
+		status === "queued" ||
+		status === "running" ||
+		status === "deferred_provider"
+	);
+}
+
 function buildAnnouncementSmartRequestItem(detail: AnnouncementDetailResponse) {
 	const title = detail.title.trim() || `discussion:${detail.discussion_number}`;
 	const body = detail.body?.trim();
@@ -232,6 +264,14 @@ export function AnnouncementDetailPage(props: {
 
 	const activeSmartError =
 		selectedLane === "smart" ? (smartError ?? detailSmartError) : null;
+	const activeTranslationPending =
+		selectedLane === "translated" &&
+		detail?.translated != null &&
+		isPendingDetailStatus(detail.translated.status);
+	const activeSmartPending =
+		selectedLane === "smart" &&
+		detail?.smart != null &&
+		isPendingDetailStatus(detail.smart.status);
 
 	const onTranslate = useCallback(
 		(options?: { retry?: boolean }) => {
@@ -387,6 +427,16 @@ export function AnnouncementDetailPage(props: {
 
 				while (result && isPendingTranslationResultStatus(result.status)) {
 					if (Date.now() >= deadline) {
+						const pendingSmart =
+							mapTranslationResultToAnnouncementDetailSmart(result);
+						if (pendingSmart) {
+							setDetail((prev) => {
+								if (!prev || prev.discussion_key !== requestDiscussionKey)
+									return prev;
+								return { ...prev, smart: pendingSmart };
+							});
+							setSmartError(null);
+						}
 						return;
 					}
 					if (smartRequestSeqRef.current !== requestSeq) return;
@@ -528,8 +578,10 @@ export function AnnouncementDetailPage(props: {
 							{ANNOUNCEMENT_DETAIL_LANES.map((option) => {
 								const isSelected = selectedLane === option.lane;
 								const isBusy =
-									(option.lane === "translated" && translating) ||
-									(option.lane === "smart" && smartResolving);
+									(option.lane === "translated" &&
+										(translating || activeTranslationPending)) ||
+									(option.lane === "smart" &&
+										(smartResolving || activeSmartPending));
 								const wasSelected = selectedLane === option.lane;
 								const isDisabled =
 									loading ||
@@ -687,6 +739,16 @@ export function AnnouncementDetailPage(props: {
 						/>
 					) : display ? (
 						<div className="space-y-4">
+							{activeTranslationPending ? (
+								<p role="status" className="text-sm text-muted-foreground">
+									{pendingStatusMessage(detail?.translated?.status)}
+								</p>
+							) : null}
+							{activeSmartPending ? (
+								<p role="status" className="text-sm text-muted-foreground">
+									{pendingPolishStatusMessage(detail?.smart?.status)}
+								</p>
+							) : null}
 							<h1 className="text-balance text-[1.5rem] font-semibold leading-tight tracking-tight sm:text-[1.75rem]">
 								{display.title}
 							</h1>
