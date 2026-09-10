@@ -975,9 +975,16 @@ pub async fn get_request(
     };
     api::canonical_global_translation_item(state, user_id, &authorization_probe).await?;
     let projection = sqlx::query_scalar::<_, String>(
-        "SELECT payload_json FROM content_result_projections WHERE work_item_id = ? LIMIT 1",
+        "SELECT payload_json FROM content_result_projections WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND model_profile = ? AND source_hash = ? ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
     )
-    .bind(&work.id)
+    .bind(&work.canonical_resource_type)
+    .bind(&work.canonical_resource_id)
+    .bind(&work.pipeline)
+    .bind(&work.variant)
+    .bind(&work.target_lang)
+    .bind(&work.protocol_version)
+    .bind(&work.model_profile)
+    .bind(&work.source_hash)
     .fetch_optional(&state.pool)
     .await
     .map_err(ApiError::internal)?
@@ -1204,30 +1211,33 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
     };
     let batch_id = local_id::generate_local_id().to_string();
     let attempt_id = local_id::generate_local_id().to_string();
-    let previous_attempt_no = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT MAX(attempt_no) FROM content_attempt_events WHERE work_item_id = ?",
+    let pending_attempt = sqlx::query_as::<_, (i64, String)>(
+        "SELECT e.attempt_no, e.trigger FROM content_attempt_events e WHERE e.work_item_id = ? AND e.event_type = 'attempt_queued' AND NOT EXISTS (SELECT 1 FROM content_attempt_events started WHERE started.work_item_id = e.work_item_id AND started.attempt_no = e.attempt_no AND started.event_type = 'attempt_started') ORDER BY e.attempt_no DESC LIMIT 1",
     )
     .bind(&row.id)
-    .fetch_one(&mut *tx)
-    .await?
-    .unwrap_or(row.attempt_count)
-    .max(row.attempt_count)
-    .max(0);
-    let next_attempt_no = previous_attempt_no.saturating_add(1);
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (next_attempt_no, trigger_reason) = pending_attempt
+        .map(|(attempt_no, trigger)| (attempt_no.max(1), trigger))
+        .unwrap_or_else(|| {
+            (
+                row.attempt_count.max(0).saturating_add(1),
+                if row.priority >= 3 {
+                    "manual_retry".to_owned()
+                } else {
+                    "initial".to_owned()
+                },
+            )
+        });
     let now = Utc::now().to_rfc3339();
     let lease_expires_at = (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
-    let trigger_reason = if row.priority >= 3 {
-        "manual_retry"
-    } else {
-        "initial"
-    };
     sqlx::query("INSERT INTO content_batches (id, partition_key, target_lang, protocol_version, model_profile, trigger_reason, worker_id, worker_kind, request_count, item_count, estimated_input_tokens, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'content-general-1', 'general', (SELECT COUNT(*) FROM content_request_links WHERE work_item_id = ?), 1, ?, 'running', ?, ?)")
         .bind(&batch_id)
         .bind(format!("{}:{}", row.target_lang, row.model_profile))
         .bind(&row.target_lang)
     .bind(&row.protocol_version)
     .bind(&row.model_profile)
-    .bind(trigger_reason)
+    .bind(trigger_reason.as_str())
         .bind(&row.id)
         .bind(row.token_estimate)
         .bind(&now)
@@ -1278,7 +1288,7 @@ async fn recover_due(state: &AppState) -> Result<()> {
         .await?;
     ensure_global_mode_in_transaction(&mut tx).await?;
     sqlx::query(
-        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), id, CASE WHEN attempt_count < 1 THEN 1 ELSE attempt_count END, 'automatic_recovery', 'attempt_queued', 'queued', 1, ? FROM content_work_items WHERE status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(?) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(?))",
+        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), id, CASE WHEN attempt_count < 1 THEN 1 ELSE attempt_count + 1 END, 'automatic_recovery', 'attempt_queued', 'queued', 1, ? FROM content_work_items WHERE status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(?) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(?))",
     )
     .bind(&now)
     .bind(&now)
@@ -1342,7 +1352,7 @@ async fn recover_due(state: &AppState) -> Result<()> {
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, retry_eligible, next_retry_at, created_at) SELECT lower(hex(randomblob(16))), id, attempt_count, 'automatic_recovery', 'attempt_queued', 1, ?, ? FROM content_work_items WHERE status = 'queued' AND next_retry_at = ?",
+        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, retry_eligible, next_retry_at, created_at) SELECT lower(hex(randomblob(16))), id, attempt_count + 1, 'automatic_recovery', 'attempt_queued', 1, ?, ? FROM content_work_items WHERE status = 'queued' AND next_retry_at = ?",
     )
     .bind(&recovery_retry_at)
     .bind(&now)
@@ -1377,7 +1387,7 @@ async fn defer_queued_for_provider(state: &AppState) -> Result<()> {
         .bind((Utc::now() + chrono::Duration::hours(24)).to_rfc3339())
         .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, next_retry_at, created_at) SELECT lower(hex(randomblob(16))), id, CASE WHEN attempt_count < 1 THEN 1 ELSE attempt_count END, 'system_requeue', 'attempt_queued', 'deferred_provider', 1, ?, CURRENT_TIMESTAMP FROM content_work_items WHERE status = 'deferred_provider' AND next_retry_at = ?")
+    sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, next_retry_at, created_at) SELECT lower(hex(randomblob(16))), id, CASE WHEN attempt_count < 1 THEN 1 ELSE attempt_count + 1 END, 'system_requeue', 'attempt_queued', 'deferred_provider', 1, ?, CURRENT_TIMESTAMP FROM content_work_items WHERE status = 'deferred_provider' AND next_retry_at = ?")
         .bind(&retry_at)
         .bind(&retry_at)
         .execute(&mut *tx)
