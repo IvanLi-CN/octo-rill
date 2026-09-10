@@ -804,7 +804,7 @@ pub async fn submit_item(
         .await
         .map_err(ApiError::internal)?
     };
-    sqlx::query("UPDATE content_result_projections SET active_work_item_id = ?, updated_at = ? WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND model_profile = ? AND (active_work_item_id IS NULL OR active_work_item_id <> ?)")
+    sqlx::query("UPDATE content_result_projections SET active_work_item_id = ?, updated_at = ? WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND model_profile = ? AND source_hash = ? AND (active_work_item_id IS NULL OR active_work_item_id <> ?)")
         .bind(&work.id)
         .bind(&now)
         .bind(resource_type)
@@ -814,6 +814,7 @@ pub async fn submit_item(
         .bind(&item.target_lang)
         .bind(GLOBAL_PROTOCOL_VERSION)
         .bind(&model_profile)
+        .bind(&work.source_hash)
         .bind(&work.id)
         .execute(&mut *tx)
         .await
@@ -1784,7 +1785,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(&work.id)
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("INSERT INTO content_result_projections (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash, work_item_id, active_work_item_id, payload_json, published_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile) DO UPDATE SET source_hash = excluded.source_hash, work_item_id = excluded.work_item_id, active_work_item_id = excluded.active_work_item_id, payload_json = excluded.payload_json, published_at = excluded.published_at, updated_at = excluded.updated_at")
+            sqlx::query("INSERT INTO content_result_projections (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash, work_item_id, active_work_item_id, payload_json, published_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash) DO UPDATE SET work_item_id = excluded.work_item_id, active_work_item_id = excluded.active_work_item_id, payload_json = excluded.payload_json, published_at = excluded.published_at, updated_at = excluded.updated_at")
                 .bind(local_id::generate_local_id().to_string())
                 .bind(&work.canonical_resource_type)
                 .bind(&work.canonical_resource_id)
