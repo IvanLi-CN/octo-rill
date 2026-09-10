@@ -989,10 +989,9 @@ pub async fn admin_patch_user(
 
     let (_lock, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "legacy_public_release_cache_cleanup")
+        .begin_immediate(&state.pool, "admin_patch_user")
         .await
         .map_err(ApiError::internal)?;
-    translations::ensure_legacy_writer_transaction(&mut tx).await?;
     let target = sqlx::query_as::<_, AdminPatchTargetRow>(
         r#"
         SELECT id, is_admin, is_disabled, paused_at
@@ -12860,13 +12859,18 @@ async fn cleanup_public_release_repo_cache_if_unused(
         });
     };
 
-    // Once the content model is frozen or global, the old translation cache is
-    // historical evidence and must not be deleted by legacy cleanup paths.
-    if content_processing::current_mode(&state.pool)
+    // Serialize the mode check, usage checks and deletes. Once the content
+    // model is frozen or global, old cache rows are historical evidence.
+    let (_lock, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "legacy_public_release_cache_cleanup")
+        .await
+        .map_err(ApiError::internal)?;
+    if !content_processing::legacy_mode_in_transaction(&mut tx)
         .await
         .map_err(ApiError::internal)?
-        != content_processing::ContentProcessingMode::Legacy
     {
+        tx.rollback().await.map_err(ApiError::internal)?;
         return Ok(AdminPublicRepoCacheCleanup {
             repo_id: Some(repo_id),
             full_name,
@@ -12884,7 +12888,7 @@ async fn cleanup_public_release_repo_cache_if_unused(
         "#,
     )
     .bind(repo_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
     if remaining_public_usage > 0 {
@@ -12905,7 +12909,7 @@ async fn cleanup_public_release_repo_cache_if_unused(
         "#,
     )
     .bind(repo_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
     if user_visible_usage > 0 {
@@ -12927,7 +12931,7 @@ async fn cleanup_public_release_repo_cache_if_unused(
         "#,
     )
     .bind(repo_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
     if brief_usage > 0 {
@@ -12948,11 +12952,10 @@ async fn cleanup_public_release_repo_cache_if_unused(
         "#,
     )
     .bind(repo_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
 
-    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     let mut deleted_ai_cache_count = 0u64;
     let mut deleted_release_count = 0i64;
     for release_id in release_ids {
@@ -20777,6 +20780,12 @@ async fn upsert_translation_terminal_status(
     error_text: Option<&str>,
 ) -> Result<(), ApiError> {
     let now = chrono::Utc::now().to_rfc3339();
+    let (_lock, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "legacy_translation_terminal_status")
+        .await
+        .map_err(ApiError::internal)?;
+    translations::ensure_legacy_writer_transaction(&mut tx).await?;
     sqlx::query(
         r#"
         INSERT INTO ai_translations (
@@ -20807,9 +20816,10 @@ async fn upsert_translation_terminal_status(
     .bind(&now)
     .bind(&now)
     .bind(requested_at)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
     Ok(())
 }
 

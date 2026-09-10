@@ -47,14 +47,20 @@ pub async fn current_mode(pool: &SqlitePool) -> Result<ContentProcessingMode> {
     {
         Ok(mode) => mode,
         Err(SqlxError::Database(error)) if error.message().contains("no such table") => {
-            let migration_applied = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 78",
+            let migration_table_exists = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
             )
-            .fetch_optional(pool)
-            .await
-            .unwrap_or(Some(0))
-            .unwrap_or(0)
+            .fetch_one(pool)
+            .await?
                 > 0;
+            let migration_applied = migration_table_exists
+                && sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 78",
+                )
+                .fetch_optional(pool)
+                .await?
+                .unwrap_or(0)
+                    > 0;
             if migration_applied {
                 anyhow::bail!("content processing control table is missing after migration 0078");
             }
@@ -98,14 +104,20 @@ pub async fn legacy_mode_in_transaction(tx: &mut Transaction<'_, Sqlite>) -> Res
     {
         Ok(mode) => mode,
         Err(SqlxError::Database(error)) if error.message().contains("no such table") => {
-            let migration_applied = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 78",
+            let migration_table_exists = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
             )
-            .fetch_optional(&mut **tx)
-            .await
-            .unwrap_or(Some(0))
-            .unwrap_or(0)
+            .fetch_one(&mut **tx)
+            .await?
                 > 0;
+            let migration_applied = migration_table_exists
+                && sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 78",
+                )
+                .fetch_optional(&mut **tx)
+                .await?
+                .unwrap_or(0)
+                    > 0;
             if migration_applied {
                 anyhow::bail!("content processing control table is missing after migration 0078");
             }
@@ -114,14 +126,20 @@ pub async fn legacy_mode_in_transaction(tx: &mut Transaction<'_, Sqlite>) -> Res
         Err(error) => return Err(error.into()),
     };
     if mode.is_none() {
-        let migration_applied = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 78",
+        let migration_table_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
         )
-        .fetch_optional(&mut **tx)
-        .await
-        .unwrap_or(Some(0))
-        .unwrap_or(0)
+        .fetch_one(&mut **tx)
+        .await?
             > 0;
+        let migration_applied = migration_table_exists
+            && sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 78",
+            )
+            .fetch_optional(&mut **tx)
+            .await?
+            .unwrap_or(0)
+                > 0;
         if migration_applied {
             anyhow::bail!("content processing control row is missing after migration 0078");
         }
@@ -197,12 +215,12 @@ async fn transition_to_global_in_transaction(
         .await?
             > 0;
         if table_exists {
-            let running = sqlx::query_scalar::<_, i64>(&format!(
-                "SELECT COUNT(*) FROM {table} WHERE status = 'running'"
+            let active = sqlx::query_scalar::<_, i64>(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE status NOT IN ('completed', 'failed')"
             ))
             .fetch_one(&mut **tx)
             .await?;
-            if running > 0 {
+            if active > 0 {
                 return Ok(false);
             }
         }
@@ -1073,8 +1091,30 @@ async fn recover_due(state: &AppState) -> Result<()> {
     .bind(&now)
     .execute(&mut *tx)
     .await?;
+    let expired_running = "status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(?)";
+    sqlx::query(&format!(
+        "UPDATE content_batch_items SET result_status = 'failed', error_code = 'runtime_lease_expired', updated_at = ? WHERE work_item_id IN (SELECT id FROM content_work_items WHERE {expired_running})"
+    ))
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "UPDATE content_batches SET status = 'failed', error_code = 'runtime_lease_expired', error_summary = 'worker lease expired', finished_at = ?, updated_at = ? WHERE id IN (SELECT batch_id FROM content_work_items WHERE {expired_running} AND batch_id IS NOT NULL) AND status = 'running'"
+    ))
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), id, attempt_count, 'automatic_recovery', 'attempt_completed', 'failed', 'runtime_lease_expired', 'worker lease expired', 'runtime_lease_expired', 1, ? FROM content_work_items WHERE {expired_running}"
+    ))
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query(
-        "UPDATE content_work_items SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, next_retry_at = NULL, updated_at = ? WHERE status = 'running' AND lease_expires_at IS NOT NULL AND datetime(lease_expires_at) <= datetime(?)",
+        "UPDATE content_work_items SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, next_retry_at = NULL, updated_at = ? WHERE status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(?)",
     )
     .bind(&now)
     .bind(&now)
@@ -1385,6 +1425,19 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             .fetch_optional(&mut *tx)
             .await?;
     if mode.as_deref() != Some(ContentProcessingMode::Global.as_str()) {
+        tx.rollback().await?;
+        return Ok(());
+    }
+    let now_for_lease = Utc::now().to_rfc3339();
+    let claim_is_current = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM content_work_items WHERE id = ? AND status = 'running' AND attempt_count = ? AND lease_owner = 'content-general-1' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(?)",
+    )
+    .bind(&work.id)
+    .bind(work.attempt_count)
+    .bind(&now_for_lease)
+    .fetch_one(&mut *tx)
+    .await?;
+    if claim_is_current == 0 {
         tx.rollback().await?;
         return Ok(());
     }
