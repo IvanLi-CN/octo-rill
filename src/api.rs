@@ -19583,7 +19583,7 @@ fn line_prefix_kind(line: &str) -> &'static str {
     "plain"
 }
 
-fn markdown_structure_preserved(source: &str, translated: &str) -> bool {
+pub(crate) fn markdown_structure_preserved(source: &str, translated: &str) -> bool {
     let normalized_source = source.replace("\r\n", "\n");
     let src_lines: Vec<&str> = normalized_source
         .lines()
@@ -19983,6 +19983,19 @@ fn global_source_hash_from_fields(
     })
 }
 
+fn with_source_observed_at(
+    mut source_blocks: Vec<translations::TranslationSourceBlock>,
+) -> Vec<translations::TranslationSourceBlock> {
+    source_blocks.insert(
+        0,
+        translations::TranslationSourceBlock {
+            slot: "source_observed_at".to_owned(),
+            text: Utc::now().to_rfc3339(),
+        },
+    );
+    source_blocks
+}
+
 fn global_release_source_hash(
     release_id: i64,
     repo_full_name: &str,
@@ -20026,7 +20039,7 @@ fn global_announcement_source_hash(
     )
 }
 
-async fn global_release_request_item(
+pub(crate) async fn global_release_request_item(
     state: &AppState,
     user_id: &str,
     release_id: i64,
@@ -20108,7 +20121,7 @@ async fn global_release_request_item(
         entity_id: release_id.to_string(),
         target_lang: "zh-CN".to_owned(),
         max_wait_ms: 60_000,
-        source_blocks,
+        source_blocks: with_source_observed_at(source_blocks),
         target_slots,
     })
 }
@@ -20158,7 +20171,7 @@ async fn global_notification_request_item(
         entity_id: row.thread_id,
         target_lang: "zh-CN".to_owned(),
         max_wait_ms: 60_000,
-        source_blocks: vec![
+        source_blocks: with_source_observed_at(vec![
             translations::TranslationSourceBlock {
                 slot: "metadata".to_owned(),
                 text: format!("repo={repo}\nreason={reason}\nsubject_type={subject_type}"),
@@ -20167,7 +20180,7 @@ async fn global_notification_request_item(
                 slot: "title".to_owned(),
                 text: title,
             },
-        ],
+        ]),
         target_slots: vec!["title_zh".to_owned(), "summary_md".to_owned()],
     })
 }
@@ -20293,7 +20306,7 @@ async fn global_announcement_request_item(
         ),
         target_lang: "zh-CN".to_owned(),
         max_wait_ms: 60_000,
-        source_blocks,
+        source_blocks: with_source_observed_at(source_blocks),
         target_slots: if kind.ends_with("_smart") {
             vec!["title_zh".to_owned(), "summary_md".to_owned()]
         } else if !has_body {

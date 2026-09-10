@@ -317,7 +317,7 @@ async fn record_legacy_observations(tx: &mut Transaction<'_, Sqlite>) -> Result<
         > 0;
     if has_ai_translations {
         sqlx::query(
-            "INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT 'legacy-cache-' || id, 'ai_translations', id, CASE WHEN entity_type LIKE 'release%' THEN 'release' WHEN entity_type LIKE 'announcement%' THEN 'announcement' WHEN entity_type IN ('notification', 'notification_smart') THEN 'notification' ELSE NULL END, entity_id, CASE WHEN entity_type LIKE '%smart' THEN 'polishing' ELSE 'translation' END, CASE WHEN status = 'ready' AND (title IS NOT NULL OR summary IS NOT NULL) THEN 'legacy_cached' ELSE 'legacy_conflict' END, '{\"source\":\"ai_translations\",\"status\":\"' || replace(status, '\"', '') || '\"}' , CURRENT_TIMESTAMP FROM ai_translations",
+            "INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT 'legacy-cache-' || id, 'ai_translations', id, CASE WHEN entity_type LIKE 'release%' THEN 'release' WHEN entity_type LIKE 'announcement%' THEN 'announcement' WHEN entity_type IN ('notification', 'notification_smart') THEN 'notification' ELSE NULL END, entity_id, CASE WHEN entity_type LIKE '%smart' THEN 'polishing' ELSE 'translation' END, CASE WHEN status = 'ready' AND (title IS NOT NULL OR summary IS NOT NULL) THEN 'legacy_cached' ELSE 'legacy_conflict' END, '{\"source\":\"ai_translations\",\"status\":\"' || replace(status, '\"', '') || '\",\"source_hash\":\"' || replace(source_hash, '\"', '') || '\"}' , CURRENT_TIMESTAMP FROM ai_translations",
         )
         .execute(&mut **tx)
         .await?;
@@ -331,7 +331,7 @@ async fn record_legacy_observations(tx: &mut Transaction<'_, Sqlite>) -> Result<
         > 0;
     if has_translation_work_items {
         sqlx::query(
-            "INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT 'legacy-work-' || id, 'translation_work_items', id, CASE WHEN kind LIKE 'release%' THEN 'release' WHEN kind LIKE 'announcement%' THEN 'announcement' WHEN kind IN ('notification', 'notification_smart') THEN 'notification' ELSE NULL END, entity_id, CASE WHEN kind LIKE '%smart' THEN 'polishing' ELSE 'translation' END, 'legacy_conflict', '{\"source\":\"translation_work_items\",\"status\":\"' || replace(COALESCE(status, ''), '\"', '') || '\"}' , CURRENT_TIMESTAMP FROM translation_work_items",
+            "INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT 'legacy-work-' || w.id, 'translation_work_items', w.id, CASE WHEN w.kind LIKE 'release%' THEN 'release' WHEN w.kind LIKE 'announcement%' THEN 'announcement' WHEN w.kind IN ('notification', 'notification_smart') THEN 'notification' ELSE NULL END, w.entity_id, CASE WHEN w.kind LIKE '%smart' THEN 'polishing' ELSE 'translation' END, CASE WHEN w.status = 'completed' AND COALESCE(w.result_status, '') = 'ready' AND EXISTS (SELECT 1 FROM ai_translations c WHERE c.user_id = w.scope_user_id AND c.entity_id = w.entity_id AND c.lang = w.target_lang AND c.source_hash = w.source_hash AND c.status = 'ready' AND (c.title IS NOT NULL OR c.summary IS NOT NULL)) THEN 'legacy_cached' ELSE 'legacy_conflict' END, '{\"source\":\"translation_work_items\",\"status\":\"' || replace(COALESCE(w.status, ''), '\"', '') || '\",\"source_hash\":\"' || replace(COALESCE(w.source_hash, ''), '\"', '') || '\"}' , CURRENT_TIMESTAMP FROM translation_work_items w",
         )
         .execute(&mut **tx)
         .await?;
@@ -475,12 +475,17 @@ fn canonical_identity(
 }
 
 fn source_hash(item: &translations::TranslationRequestItemInput) -> Result<String> {
+    let source_blocks = item
+        .source_blocks
+        .iter()
+        .filter(|block| block.slot != "source_observed_at")
+        .collect::<Vec<_>>();
     let source = serde_json::to_string(&json!({
         "kind": item.kind,
         "variant": item.variant,
         "entity_id": item.entity_id,
         "target_lang": item.target_lang,
-        "source_blocks": item.source_blocks,
+        "source_blocks": source_blocks,
         "target_slots": item.target_slots,
     }))?;
     Ok(ai::sha256_hex(&format!(
@@ -747,7 +752,7 @@ pub async fn submit_item(
         exact_existing
     } else {
         sqlx::query_as::<_, WorkRow>(
-            "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND source_hash = ? AND protocol_version = ? ORDER BY CASE status WHEN 'ready' THEN 0 WHEN 'queued' THEN 1 WHEN 'running' THEN 2 WHEN 'deferred_provider' THEN 3 WHEN 'blocked_config' THEN 4 ELSE 5 END, datetime(updated_at) DESC, id DESC LIMIT 1",
+            "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND source_hash = ? AND protocol_version = ? AND status IN ('queued', 'running', 'ready', 'deferred_provider', 'blocked_config') ORDER BY CASE status WHEN 'ready' THEN 0 WHEN 'queued' THEN 1 WHEN 'running' THEN 2 WHEN 'deferred_provider' THEN 3 WHEN 'blocked_config' THEN 4 ELSE 5 END, datetime(updated_at) DESC, id DESC LIMIT 1",
         )
         .bind(resource_type)
         .bind(&item.entity_id)
@@ -762,10 +767,58 @@ pub async fn submit_item(
     };
     let existing_work = existing.is_some();
     let work = if let Some(existing) = existing {
-        existing
+        if matches!(
+            existing.status.as_str(),
+            "failed" | "cancelled" | "superseded" | "not_applicable"
+        ) {
+            let projection_exists = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_result_projections WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND model_profile = ? AND source_hash = ?",
+            )
+            .bind(resource_type)
+            .bind(&item.entity_id)
+            .bind(pipeline)
+            .bind(&item.variant)
+            .bind(&item.target_lang)
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(&model_profile)
+            .bind(&hash)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?
+                > 0;
+            let status = if model_profile == "ai-disabled" {
+                "blocked_config"
+            } else if projection_exists {
+                "ready"
+            } else {
+                "queued"
+            };
+            sqlx::query(
+                "UPDATE content_work_items SET model_profile = ?, source_snapshot_json = ?, configuration_fingerprint = ?, status = ?, priority = 0, cache_hit = ?, batch_id = NULL, lease_owner = NULL, lease_expires_at = NULL, next_retry_at = NULL, retry_expires_at = NULL, retry_after_at = NULL, failure_class = NULL, cancelled_at = NULL, finished_at = NULL, updated_at = ? WHERE id = ?",
+            )
+            .bind(&model_profile)
+            .bind(&snapshot)
+            .bind(runtime_configuration_fingerprint(state, &model_profile).await)
+            .bind(status)
+            .bind(if projection_exists { 1_i64 } else { 0_i64 })
+            .bind(&now)
+            .bind(&existing.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
+            sqlx::query_as::<_, WorkRow>(
+                "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE id = ?",
+            )
+            .bind(&existing.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?
+        } else {
+            existing
+        }
     } else {
         let supersedes_work_item_id = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND source_hash <> ? ORDER BY datetime(created_at) DESC, id DESC LIMIT 1",
+            "SELECT id FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND source_hash <> ? AND status NOT IN ('cancelled', 'superseded') ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
         )
         .bind(resource_type)
         .bind(&item.entity_id)
@@ -1220,7 +1273,7 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
         .await?;
     ensure_global_mode_in_transaction(&mut tx).await?;
     let Some(row) = sqlx::query_as::<_, WorkRow>(
-        "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE status = 'queued' AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime('now')) AND (priority >= 3 OR datetime(created_at) <= datetime('now', '-60 seconds')) AND (priority < 3 OR (SELECT COUNT(*) FROM content_batches WHERE status = 'running' AND trigger_reason = 'manual_retry') < ?) ORDER BY priority DESC, datetime(created_at) ASC, id ASC LIMIT 1",
+        "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE status = 'queued' AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime('now')) AND ((priority < 3 AND datetime(created_at) <= datetime('now', '-60 seconds')) OR (priority >= 3 AND EXISTS (SELECT 1 FROM content_attempt_events pending WHERE pending.work_item_id = content_work_items.id AND pending.event_type = 'attempt_queued' AND pending.trigger = 'manual_retry' AND NOT EXISTS (SELECT 1 FROM content_attempt_events started WHERE started.work_item_id = pending.work_item_id AND started.attempt_no = pending.attempt_no AND started.event_type = 'attempt_started')) AND (SELECT COUNT(*) FROM content_batches WHERE status = 'running' AND trigger_reason = 'manual_retry') < ?)) ORDER BY priority DESC, datetime(created_at) ASC, id ASC LIMIT 1",
     )
     .bind(manual_limit)
     .fetch_optional(&mut *tx)
@@ -1316,7 +1369,7 @@ async fn recover_due(state: &AppState) -> Result<()> {
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "UPDATE content_work_items SET status = 'queued', next_retry_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(?) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(?))",
+        "UPDATE content_work_items SET status = 'queued', priority = 0, next_retry_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(?) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(?))",
     )
     .bind(&now)
     .bind(&now)
@@ -1375,7 +1428,7 @@ async fn recover_due(state: &AppState) -> Result<()> {
     let recovery_retry_at = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
     let recovery_expires_at = (Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
     sqlx::query(
-        "UPDATE content_work_items SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, updated_at = ? WHERE status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(?)",
+        "UPDATE content_work_items SET status = 'queued', priority = 0, lease_owner = NULL, lease_expires_at = NULL, next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, updated_at = ? WHERE status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(?)",
     )
     .bind(&recovery_retry_at)
     .bind(&recovery_expires_at)
@@ -1415,7 +1468,7 @@ async fn defer_queued_for_provider(state: &AppState) -> Result<()> {
         .begin_immediate(&state.pool, "content_processing_defer_provider")
         .await?;
     ensure_global_mode_in_transaction(&mut tx).await?;
-    sqlx::query("UPDATE content_work_items SET status = 'deferred_provider', next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), updated_at = CURRENT_TIMESTAMP WHERE status = 'queued'")
+    sqlx::query("UPDATE content_work_items SET status = 'deferred_provider', priority = 0, next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), updated_at = CURRENT_TIMESTAMP WHERE status = 'queued'")
         .bind(&retry_at)
         .bind((Utc::now() + chrono::Duration::hours(24)).to_rfc3339())
         .execute(&mut *tx)
@@ -1436,12 +1489,25 @@ fn build_prompt(snapshot: &SourceSnapshot, pipeline: &str) -> (String, String) {
         "你是严谨的技术文档翻译助手。只输出 JSON，不要解释。保留事实、链接、代码和 Markdown 结构。"
     };
     let user = json!({
-        "source_blocks": snapshot.source_blocks,
+        "source_blocks": snapshot
+            .source_blocks
+            .iter()
+            .filter(|block| block.slot != "source_observed_at")
+            .collect::<Vec<_>>(),
         "target_slots": snapshot.target_slots,
         "output": {"title_zh": "string|null", "summary_md": "string|null", "body_md": "string|null"}
     })
     .to_string();
     (system.to_owned(), user)
+}
+
+fn source_observed_at(raw_snapshot: &str) -> Option<DateTime<Utc>> {
+    serde_json::from_str::<SourceSnapshot>(raw_snapshot)
+        .ok()?
+        .source_blocks
+        .into_iter()
+        .find(|block| block.slot == "source_observed_at")
+        .and_then(|block| parse_storage_timestamp(&block.text))
 }
 
 fn parse_storage_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -1498,6 +1564,21 @@ fn validate_output(
             return Err(anyhow!(
                 "global content output target slot is missing text: {slot}"
             ));
+        }
+        if matches!(slot.as_str(), "summary_md" | "body_md")
+            && let Some(source) = source_blocks
+                .iter()
+                .find(|block| block.slot == "body_markdown")
+                .map(|block| block.text.as_str())
+        {
+            let translated = value
+                .as_str()
+                .ok_or_else(|| anyhow!("global content output target slot is not text: {slot}"))?;
+            if !crate::api::markdown_structure_preserved(source, translated) {
+                return Err(anyhow!(
+                    "global content output failed to preserve markdown structure: {slot}"
+                ));
+            }
         }
     }
     Ok(output)
@@ -1574,8 +1655,8 @@ async fn supersede_replaced_work_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     work: &WorkRow,
 ) -> Result<bool> {
-    let replaced = sqlx::query_scalar::<_, i64>(
-        "SELECT EXISTS (SELECT 1 FROM content_work_items newer WHERE newer.id <> ? AND newer.canonical_resource_type = ? AND newer.canonical_resource_id = ? AND newer.pipeline = ? AND newer.variant = ? AND newer.target_lang = ? AND newer.protocol_version = ? AND (julianday(newer.created_at) > julianday(?) OR (julianday(newer.created_at) = julianday(?) AND newer.id > ?)) AND newer.status NOT IN ('cancelled', 'superseded'))",
+    let candidates = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT id, source_snapshot_json, created_at FROM content_work_items WHERE id <> ? AND canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND status NOT IN ('cancelled', 'superseded')",
     )
     .bind(&work.id)
     .bind(&work.canonical_resource_type)
@@ -1584,12 +1665,15 @@ async fn supersede_replaced_work_in_transaction(
     .bind(&work.variant)
     .bind(&work.target_lang)
     .bind(&work.protocol_version)
-    .bind(&work.created_at)
-    .bind(&work.created_at)
-    .bind(&work.id)
-    .fetch_one(&mut **tx)
-    .await?
-        != 0;
+    .fetch_all(&mut **tx)
+    .await?;
+    let work_revision = source_observed_at(&work.source_snapshot_json);
+    let replaced = candidates.into_iter().any(|(id, snapshot, created_at)| {
+        match (work_revision, source_observed_at(&snapshot)) {
+            (Some(work_revision), Some(candidate_revision)) => candidate_revision > work_revision,
+            _ => created_at > work.created_at || (created_at == work.created_at && id > work.id),
+        }
+    });
     if !replaced {
         return Ok(false);
     }
@@ -1870,11 +1954,11 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(work.attempt_count)
                 .fetch_one(&mut *tx)
                 .await?;
-            let linked_call_audit = if let Some(batch_id) = work.batch_id.as_deref() {
+            let linked_call_audit = if let Some(call_id) = diagnostic.call_id.as_deref() {
                 sqlx::query_as::<_, (Option<String>, String, Option<i64>, Option<i64>, Option<i64>)>(
-                    "SELECT provider_request_id, COALESCE(final_model, model), duration_ms, input_tokens, output_tokens FROM llm_calls WHERE parent_translation_batch_id = ? ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
+                    "SELECT provider_request_id, COALESCE(final_model, model), duration_ms, input_tokens, output_tokens FROM llm_calls WHERE id = ? LIMIT 1",
                 )
-                .bind(batch_id)
+                .bind(call_id)
                 .fetch_optional(&mut *tx)
                 .await?
             } else {
@@ -1901,7 +1985,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .and_then(|(_, _, _, _, output_tokens)| *output_tokens)
                 .or(diagnostic.output_tokens);
             sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, created_at) VALUES (?, ?, ?, ?, 'succeeded', ?, ?, ?, ?)")
-                .bind(local_id::generate_local_id().to_string())
+                .bind(diagnostic.call_id.clone().unwrap_or_else(|| local_id::generate_local_id().to_string()))
                 .bind(&attempt_event_id)
                 .bind(provider_call_id)
                 .bind(model)
@@ -1911,8 +1995,14 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(&now)
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'ready', 0, ? FROM content_attempt_events WHERE id = ?")
+            let token_count = match (input_tokens, output_tokens) {
+                (Some(input), Some(output)) => Some(input.saturating_add(output)),
+                _ => None,
+            };
+            sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, duration_ms, token_count, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'ready', 0, ?, ?, ? FROM content_attempt_events WHERE id = ?")
                 .bind(local_id::generate_local_id().to_string())
+                .bind(duration_ms)
+                .bind(token_count)
                 .bind(&now)
                 .bind(&attempt_event_id)
                 .execute(&mut *tx)
@@ -1984,18 +2074,19 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             .fetch_one(&mut *tx)
             .await?;
             let error_summary = translations::translation_error_summary(Some(error_text.as_str()));
-            let linked_call_audit = if let Some(batch_id) = work.batch_id.as_deref() {
+            let linked_call_id = ai::llm_call_id(&error);
+            let linked_call_audit = if let Some(call_id) = linked_call_id.as_deref() {
                 sqlx::query_as::<_, (Option<String>, String, Option<i64>, Option<i64>, Option<i64>)>(
-                    "SELECT provider_request_id, COALESCE(final_model, model), duration_ms, input_tokens, output_tokens FROM llm_calls WHERE parent_translation_batch_id = ? ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
+                    "SELECT provider_request_id, COALESCE(final_model, model), duration_ms, input_tokens, output_tokens FROM llm_calls WHERE id = ? LIMIT 1",
                 )
-                .bind(batch_id)
+                .bind(call_id)
                 .fetch_optional(&mut *tx)
                 .await?
             } else {
                 None
             };
             sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, error_code, error_summary, created_at) VALUES (?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?)")
-                .bind(local_id::generate_local_id().to_string())
+                .bind(linked_call_id.unwrap_or_else(|| local_id::generate_local_id().to_string()))
                 .bind(&attempt_event_id)
                 .bind(linked_call_audit.as_ref().and_then(|(provider_id, _, _, _, _)| provider_id.as_deref()).unwrap_or("unknown"))
                 .bind(linked_call_audit.as_ref().map_or(work.model_profile.as_str(), |(_, model, _, _, _)| model.as_str()))
@@ -2025,13 +2116,26 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(work.batch_id.as_deref().unwrap_or_default())
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, next_retry_at, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'failed', ?, ?, ?, ?, ?, ? FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started'")
+            let token_count = match (
+                linked_call_audit
+                    .as_ref()
+                    .and_then(|(_, _, _, input_tokens, _)| *input_tokens),
+                linked_call_audit
+                    .as_ref()
+                    .and_then(|(_, _, _, _, output_tokens)| *output_tokens),
+            ) {
+                (Some(input), Some(output)) => Some(input.saturating_add(output)),
+                _ => None,
+            };
+            sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, next_retry_at, duration_ms, token_count, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'failed', ?, ?, ?, ?, ?, ?, ?, ?, ? FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started'")
                 .bind(local_id::generate_local_id().to_string())
                 .bind(&class)
                 .bind(error_summary)
                 .bind(&class)
                 .bind(i64::from(next_retry.is_some()))
                 .bind(&next_retry)
+                .bind(linked_call_audit.as_ref().and_then(|(_, _, duration_ms, _, _)| *duration_ms))
+                .bind(token_count)
                 .bind(now_text.as_str())
                 .bind(&work.id)
                 .bind(work.attempt_count)
@@ -2287,7 +2391,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::raw_sql(
-            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, kind TEXT NOT NULL, entity_id TEXT NOT NULL, status TEXT NOT NULL); CREATE TABLE ai_translations (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, status TEXT NOT NULL, title TEXT, summary TEXT, value TEXT NOT NULL); INSERT INTO translation_work_items VALUES ('legacy-1', 'release_summary', 'release-1', 'completed'); INSERT INTO ai_translations VALUES ('cache-1', 'user-1', 'release', 'release-1', 'ready', 'Cached title', 'Cached summary', 'cached');",
+            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, scope_user_id TEXT NOT NULL, kind TEXT NOT NULL, entity_id TEXT NOT NULL, target_lang TEXT NOT NULL, source_hash TEXT NOT NULL, result_status TEXT, status TEXT NOT NULL); CREATE TABLE ai_translations (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, lang TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL, title TEXT, summary TEXT, value TEXT NOT NULL); INSERT INTO translation_work_items VALUES ('legacy-1', 'user-1', 'release_summary', 'release-1', 'zh-CN', 'hash-1', 'ready', 'completed'); INSERT INTO ai_translations VALUES ('cache-1', 'user-1', 'release', 'release-1', 'zh-CN', 'hash-1', 'ready', 'Cached title', 'Cached summary', 'cached');",
         )
         .execute(&pool)
         .await
@@ -2358,6 +2462,13 @@ mod tests {
                 .await
                 .unwrap(),
             2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT classification FROM content_legacy_observations WHERE legacy_table = 'translation_work_items'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            "legacy_cached"
         );
     }
 
@@ -2525,6 +2636,56 @@ mod tests {
         )
         .expect("bodyless detail output is valid");
         assert_eq!(output["body_md"], Value::Null);
+    }
+
+    #[test]
+    fn output_validation_rejects_markdown_structure_loss() {
+        let error = validate_output(
+            r#"{"summary_md":"plain text"}"#,
+            &["summary_md".to_owned()],
+            &[translations::TranslationSourceBlock {
+                slot: "body_markdown".to_owned(),
+                text: "- one\n- two".to_owned(),
+            }],
+        )
+        .expect_err("markdown structure must be preserved");
+        assert!(error.to_string().contains("preserve markdown structure"));
+    }
+
+    #[test]
+    fn source_observed_at_is_ordering_metadata_not_content_identity() {
+        let item = translations::TranslationRequestItemInput {
+            producer_ref: "test".to_owned(),
+            kind: "release_summary".to_owned(),
+            variant: "summary".to_owned(),
+            entity_id: "release-1".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 0,
+            source_blocks: vec![
+                translations::TranslationSourceBlock {
+                    slot: "source_observed_at".to_owned(),
+                    text: "2026-01-01T00:00:00Z".to_owned(),
+                },
+                translations::TranslationSourceBlock {
+                    slot: "title".to_owned(),
+                    text: "Release".to_owned(),
+                },
+            ],
+            target_slots: vec!["title_zh".to_owned()],
+        };
+        let mut later = item.clone();
+        later.source_blocks[0].text = "2026-01-01T00:01:00Z".to_owned();
+        assert_eq!(source_hash(&item).unwrap(), source_hash(&later).unwrap());
+        assert!(
+            source_observed_at(
+                &serde_json::to_string(&json!({
+                    "source_blocks": item.source_blocks,
+                    "target_slots": item.target_slots,
+                }))
+                .unwrap()
+            )
+            .is_some()
+        );
     }
 
     #[test]

@@ -413,30 +413,28 @@ export function ReleaseDetailCard(props: {
 								releaseId: requestReleaseId,
 								requestId: response.request_id,
 							};
+							const pendingTranslated =
+								mapTranslationResultToReleaseDetailTranslated(response.result);
+							if (pendingTranslated) {
+								setDetail((prev) => {
+									if (!prev || prev.release_id !== requestReleaseId)
+										return prev;
+									const translated =
+										preserveReadyTranslation &&
+										prev.translated?.status === "ready"
+											? {
+													...prev.translated,
+													status: pendingTranslated.status,
+													error_code: pendingTranslated.error_code,
+													error_summary: pendingTranslated.error_summary,
+													error_detail: pendingTranslated.error_detail,
+												}
+											: pendingTranslated;
+									return { ...prev, translated };
+								});
+								setTranslateError(null);
+							}
 							if (Date.now() >= deadline) {
-								const pendingTranslated =
-									mapTranslationResultToReleaseDetailTranslated(
-										response.result,
-									);
-								if (pendingTranslated) {
-									setDetail((prev) => {
-										if (!prev || prev.release_id !== requestReleaseId)
-											return prev;
-										const translated =
-											preserveReadyTranslation &&
-											prev.translated?.status === "ready"
-												? {
-														...prev.translated,
-														status: pendingTranslated.status,
-														error_code: pendingTranslated.error_code,
-														error_summary: pendingTranslated.error_summary,
-														error_detail: pendingTranslated.error_detail,
-													}
-												: pendingTranslated;
-										return { ...prev, translated };
-									});
-									setTranslateError(null);
-								}
 								return;
 							}
 							if (translateRequestSeqRef.current !== requestSeq) return;

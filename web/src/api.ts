@@ -2247,6 +2247,8 @@ export type AdminContentProcessingEvidence = {
 	work_item_id: string | null;
 	source_hash: string | null;
 	updated_at: string | null;
+	legacy_table?: string | null;
+	legacy_primary_key?: string | null;
 };
 export type AdminCollectionLlmLink = {
 	id: string;
@@ -2259,7 +2261,7 @@ export type AdminCollectionLlmLink = {
 };
 export type AdminCollectionRecordItem = {
 	id: string;
-	kind: "release" | "announcement" | "brief";
+	kind: "release" | "announcement" | "notification" | "brief";
 	repository: string | null;
 	title: string;
 	occurred_at: string | null;

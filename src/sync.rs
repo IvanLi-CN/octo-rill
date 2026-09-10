@@ -1883,7 +1883,7 @@ pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleas
                 Vec::new()
             }),
     );
-    if let Err(err) = enqueue_background_release_translation_task(
+    enqueue_background_release_translation_task(
         state,
         user_id,
         &changed_release_ids,
@@ -1892,14 +1892,8 @@ pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleas
         Some(user_id),
     )
     .await
-    {
-        tracing::warn!(
-            ?err,
-            user_id,
-            "sync.releases: enqueue background translation failed"
-        );
-    }
-    if let Err(err) = enqueue_background_release_smart_task(
+    .context("sync.releases: enqueue background translation")?;
+    enqueue_background_release_smart_task(
         state,
         user_id,
         &smart_preheat_release_ids,
@@ -1908,13 +1902,7 @@ pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleas
         Some(user_id),
     )
     .await
-    {
-        tracing::warn!(
-            ?err,
-            user_id,
-            "sync.releases: enqueue background smart summary failed"
-        );
-    }
+    .context("sync.releases: enqueue background smart summary")?;
 
     Ok(SyncReleasesResult {
         repos: demand.repos,
@@ -2135,7 +2123,7 @@ pub async fn sync_social_activity(
         }
     };
     events += insert_feed_activity_events(state, user_id, feed_events.as_slice()).await?;
-    enqueue_global_announcement_work(state, user_id, feed_events.as_slice()).await;
+    enqueue_global_announcement_work(state, user_id, feed_events.as_slice()).await?;
 
     Ok(SyncSocialActivityResult {
         repo_stars: repo_collection.repo_stars,
@@ -2154,11 +2142,11 @@ async fn enqueue_global_announcement_work(
     state: &AppState,
     user_id: &str,
     events: &[FeedActivityEventSnapshot],
-) {
+) -> Result<()> {
     if content_processing::current_mode(&state.pool).await.ok()
         != Some(content_processing::ContentProcessingMode::Global)
     {
-        return;
+        return Ok(());
     }
     for event in events.iter().filter(|event| event.kind == "announcement") {
         let (Some(repo), Some(number)) = (event.repo_full_name.as_deref(), event.discussion_number)
@@ -2180,20 +2168,15 @@ async fn enqueue_global_announcement_work(
                 source_blocks: Vec::new(),
                 target_slots: Vec::new(),
             };
-            match crate::api::canonical_global_translation_item(state, user_id, &item).await {
-                Ok(canonical) => {
-                    if let Err(error) =
-                        content_processing::submit_item(state, user_id, "async", &canonical).await
-                    {
-                        tracing::warn!(?error, user_id, %entity_id, kind, "sync: enqueue global announcement processing failed");
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(?error, user_id, %entity_id, kind, "sync: resolve global announcement source failed");
-                }
-            }
+            let canonical = crate::api::canonical_global_translation_item(state, user_id, &item)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            content_processing::submit_item(state, user_id, "async", &canonical)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
         }
     }
+    Ok(())
 }
 
 pub async fn sync_social_activity_best_effort(
@@ -3862,6 +3845,26 @@ async fn enqueue_background_release_translation_task(
         return Ok(None);
     }
 
+    if content_processing::current_mode(&state.pool).await?
+        == content_processing::ContentProcessingMode::Global
+    {
+        for release_id in release_ids {
+            let item = crate::api::global_release_request_item(
+                state,
+                user_id,
+                *release_id,
+                "release_summary",
+                source,
+            )
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+            content_processing::submit_item(state, user_id, "async", &item)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+        }
+        return Ok(None);
+    }
+
     let task = jobs::enqueue_task(
         state,
         jobs::NewTask {
@@ -3889,6 +3892,26 @@ async fn enqueue_background_release_smart_task(
     requested_by: Option<&str>,
 ) -> Result<Option<String>> {
     if release_ids.is_empty() || state.config.ai.is_none() {
+        return Ok(None);
+    }
+
+    if content_processing::current_mode(&state.pool).await?
+        == content_processing::ContentProcessingMode::Global
+    {
+        for release_id in release_ids {
+            let item = crate::api::global_release_request_item(
+                state,
+                user_id,
+                *release_id,
+                "release_smart",
+                source,
+            )
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+            content_processing::submit_item(state, user_id, "async", &item)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+        }
         return Ok(None);
     }
 
@@ -5230,8 +5253,8 @@ pub async fn sync_subscriptions(
                     Vec::new()
                 }),
             );
-            if !user_release_ids.is_empty()
-                && let Err(err) = enqueue_background_release_translation_task(
+            if !user_release_ids.is_empty() {
+                enqueue_background_release_translation_task(
                     state,
                     user.id.as_str(),
                     &user_release_ids,
@@ -5240,15 +5263,15 @@ pub async fn sync_subscriptions(
                     None,
                 )
                 .await
-            {
-                tracing::warn!(
-                    ?err,
-                    user_id = user.id.as_str(),
-                    "sync.subscriptions: enqueue background translation failed"
-                );
+                .with_context(|| {
+                    format!(
+                        "sync.subscriptions: enqueue background translation for {}",
+                        user.id
+                    )
+                })?;
             }
-            if !smart_preheat_release_ids.is_empty()
-                && let Err(err) = enqueue_background_release_smart_task(
+            if !smart_preheat_release_ids.is_empty() {
+                enqueue_background_release_smart_task(
                     state,
                     user.id.as_str(),
                     &smart_preheat_release_ids,
@@ -5257,12 +5280,12 @@ pub async fn sync_subscriptions(
                     None,
                 )
                 .await
-            {
-                tracing::warn!(
-                    ?err,
-                    user_id = user.id.as_str(),
-                    "sync.subscriptions: enqueue background smart summary failed"
-                );
+                .with_context(|| {
+                    format!(
+                        "sync.subscriptions: enqueue background smart summary for {}",
+                        user.id
+                    )
+                })?;
             }
         }
     }
@@ -12578,7 +12601,7 @@ where
         }
         notifications += res.len();
         upsert_notifications(state, user_id, &res, &sync_started_at).await?;
-        enqueue_global_notification_work(state, user_id, &res).await;
+        enqueue_global_notification_work(state, user_id, &res).await?;
         if res.len() < GITHUB_NOTIFICATIONS_PAGE_SIZE {
             break;
         }
@@ -12614,11 +12637,11 @@ async fn enqueue_global_notification_work(
     state: &AppState,
     user_id: &str,
     notifications: &[GitHubNotification],
-) {
+) -> Result<()> {
     if content_processing::current_mode(&state.pool).await.ok()
         != Some(content_processing::ContentProcessingMode::Global)
     {
-        return;
+        return Ok(());
     }
     for notification in notifications {
         for (kind, variant) in [("notification", "shared"), ("notification_smart", "smart")] {
@@ -12632,20 +12655,15 @@ async fn enqueue_global_notification_work(
                 source_blocks: Vec::new(),
                 target_slots: Vec::new(),
             };
-            match crate::api::canonical_global_translation_item(state, user_id, &item).await {
-                Ok(canonical) => {
-                    if let Err(error) =
-                        content_processing::submit_item(state, user_id, "async", &canonical).await
-                    {
-                        tracing::warn!(?error, user_id, notification_id = %notification.id, kind, "sync: enqueue global notification processing failed");
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(?error, user_id, notification_id = %notification.id, kind, "sync: resolve global notification source failed");
-                }
-            }
+            let canonical = crate::api::canonical_global_translation_item(state, user_id, &item)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            content_processing::submit_item(state, user_id, "async", &canonical)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
         }
     }
+    Ok(())
 }
 
 async fn upsert_notifications(

@@ -1,8 +1,4 @@
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 
 use axum::{
     Json,
@@ -22,6 +18,7 @@ const PAGE_SIZE_DEFAULT: i64 = 20;
 enum CollectionRecordKind {
     Release,
     Announcement,
+    Notification,
     Brief,
 }
 
@@ -30,6 +27,7 @@ impl CollectionRecordKind {
         match raw {
             "release" => Ok(Self::Release),
             "announcement" => Ok(Self::Announcement),
+            "notification" => Ok(Self::Notification),
             "brief" => Ok(Self::Brief),
             _ => Err(ApiError::bad_request("invalid collection record kind")),
         }
@@ -39,6 +37,7 @@ impl CollectionRecordKind {
         match self {
             Self::Release => Some(("release_detail", "release_smart")),
             Self::Announcement => Some(("announcement_detail", "announcement_smart")),
+            Self::Notification => Some(("notification", "notification_smart")),
             Self::Brief => None,
         }
     }
@@ -63,6 +62,8 @@ pub struct AdminContentProcessingEvidence {
     pub work_item_id: Option<String>,
     pub source_hash: Option<String>,
     pub updated_at: Option<String>,
+    pub legacy_table: Option<String>,
+    pub legacy_primary_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -166,6 +167,13 @@ struct TaskRow {
     finished_at: Option<String>,
     updated_at: String,
     last_attempt_at: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct TaskWithEntityRow {
+    #[sqlx(flatten)]
+    task: TaskRow,
+    entity_id: String,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -380,6 +388,7 @@ fn collection_record_kind_label(kind: CollectionRecordKind) -> &'static str {
     match kind {
         CollectionRecordKind::Release => "release",
         CollectionRecordKind::Announcement => "announcement",
+        CollectionRecordKind::Notification => "notification",
         CollectionRecordKind::Brief => "brief",
     }
 }
@@ -387,9 +396,9 @@ fn collection_record_kind_label(kind: CollectionRecordKind) -> &'static str {
 #[cfg(test)]
 fn collection_pipelines(kind: CollectionRecordKind) -> &'static [&'static str] {
     match kind {
-        CollectionRecordKind::Release | CollectionRecordKind::Announcement => {
-            &["translation", "polish"]
-        }
+        CollectionRecordKind::Release
+        | CollectionRecordKind::Announcement
+        | CollectionRecordKind::Notification => &["translation", "polish"],
         CollectionRecordKind::Brief => &["polish"],
     }
 }
@@ -530,6 +539,7 @@ fn source_record_item(
         kind: match kind {
             CollectionRecordKind::Release => "release",
             CollectionRecordKind::Announcement => "announcement",
+            CollectionRecordKind::Notification => "notification",
             CollectionRecordKind::Brief => "brief",
         }
         .to_owned(),
@@ -569,16 +579,13 @@ fn not_recorded_summary_for(status_origin: &str) -> AdminCollectionTaskSummary {
     }
 }
 
-fn legacy_cached_summary() -> AdminCollectionTaskSummary {
+fn legacy_evidence_summary(evidence: AdminContentProcessingEvidence) -> AdminCollectionTaskSummary {
+    let status = evidence.status.clone();
     AdminCollectionTaskSummary {
-        status: "legacy_cached".to_owned(),
-        display_status: "legacy_cached".to_owned(),
-        status_origin: "legacy_cached".to_owned(),
-        legacy_evidence: Some(AdminContentProcessingEvidence {
-            status: "legacy_cached".to_owned(),
-            status_origin: "legacy_cached".to_owned(),
-            ..Default::default()
-        }),
+        status: status.clone(),
+        display_status: status.clone(),
+        status_origin: "legacy_evidence".to_owned(),
+        legacy_evidence: Some(evidence),
         ..Default::default()
     }
 }
@@ -717,6 +724,7 @@ fn global_summary(row: &GlobalTaskRow) -> AdminCollectionTaskSummary {
                 work_item_id: Some(work_item_id.clone()),
                 source_hash: row.projection_source_hash.clone(),
                 updated_at: row.projection_updated_at.clone(),
+                ..Default::default()
             }
         }),
         ..Default::default()
@@ -743,66 +751,78 @@ fn compare_attempt_timestamps(left: &str, right: &str) -> Ordering {
     }
 }
 
-async fn load_legacy_cache_origins(
+async fn load_legacy_observations(
     state: &AppState,
     kind: CollectionRecordKind,
     entity_ids: &[String],
-) -> Result<HashSet<(String, String)>, ApiError> {
+) -> Result<HashMap<(String, String), AdminContentProcessingEvidence>, ApiError> {
     if entity_ids.is_empty() || kind == CollectionRecordKind::Brief {
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     }
-    let (translation_types, polish_types) = match kind {
-        CollectionRecordKind::Release => {
-            (&["release_detail", "release"][..], &["release_smart"][..])
-        }
-        CollectionRecordKind::Announcement => (
-            &["announcement_detail", "announcement"][..],
-            &["announcement_smart"][..],
-        ),
-        CollectionRecordKind::Brief => unreachable!(),
-    };
     let mut query = QueryBuilder::<Sqlite>::new(
-        "SELECT entity_id, entity_type FROM ai_translations WHERE lang = 'zh-CN' AND status = 'ready' AND (title IS NOT NULL OR summary IS NOT NULL) AND entity_id IN (",
+        "SELECT canonical_resource_id, pipeline, classification, legacy_table, legacy_primary_key, observed_at, observation_basis_json FROM content_legacy_observations WHERE canonical_resource_type = ",
     );
+    query.push_bind(collection_record_kind_label(kind));
+    query.push(" AND canonical_resource_id IN (");
     {
         let mut separated = query.separated(", ");
         for id in entity_ids {
             separated.push_bind(id);
         }
     }
-    query.push(") AND entity_type IN (");
-    {
-        let mut separated = query.separated(", ");
-        for entity_type in translation_types.iter().chain(polish_types.iter()) {
-            separated.push_bind(*entity_type);
-        }
-    }
     query.push(")");
     #[derive(Debug, sqlx::FromRow)]
-    struct LegacyCacheRow {
-        entity_id: String,
-        entity_type: String,
+    struct LegacyObservationRow {
+        canonical_resource_id: Option<String>,
+        pipeline: Option<String>,
+        classification: String,
+        legacy_table: String,
+        legacy_primary_key: String,
+        observed_at: String,
+        observation_basis_json: String,
     }
     let rows = match query
-        .build_query_as::<LegacyCacheRow>()
+        .build_query_as::<LegacyObservationRow>()
         .fetch_all(&state.pool)
         .await
     {
         Ok(rows) => rows,
-        Err(error) if missing_table(&error) => return Ok(HashSet::new()),
+        Err(error) if missing_table(&error) => return Ok(HashMap::new()),
         Err(error) => return Err(ApiError::internal(error)),
     };
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let pipeline = if translation_types.contains(&row.entity_type.as_str()) {
-                "translation"
-            } else {
-                "polish"
-            };
-            (row.entity_id, pipeline.to_owned())
-        })
-        .collect())
+    let mut observations = HashMap::new();
+    for row in rows {
+        let (Some(entity_id), Some(pipeline)) = (row.canonical_resource_id, row.pipeline) else {
+            continue;
+        };
+        let key = (entity_id, pipeline);
+        let source_hash = serde_json::from_str::<serde_json::Value>(&row.observation_basis_json)
+            .ok()
+            .and_then(|basis| {
+                basis
+                    .get("source_hash")
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned)
+            });
+        let candidate = AdminContentProcessingEvidence {
+            status: row.classification,
+            status_origin: "legacy_evidence".to_owned(),
+            source_hash,
+            updated_at: Some(row.observed_at),
+            legacy_table: Some(row.legacy_table),
+            legacy_primary_key: Some(row.legacy_primary_key),
+            ..Default::default()
+        };
+        observations
+            .entry(key)
+            .and_modify(|existing: &mut AdminContentProcessingEvidence| {
+                if existing.status != "legacy_conflict" && candidate.status == "legacy_conflict" {
+                    *existing = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
+    }
+    Ok(observations)
 }
 
 fn merge_summary(rows: &[TaskRow], status_origin: &str) -> AdminCollectionTaskSummary {
@@ -844,38 +864,36 @@ async fn load_task_summaries(
     if entity_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let mut query = QueryBuilder::<Sqlite>::new(
-        "SELECT w.id, w.kind, w.status, w.result_status, w.attempt_count, w.started_at, w.finished_at, w.updated_at, (SELECT MAX(e.created_at) FROM translation_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at, w.entity_id FROM translation_work_items w WHERE w.kind IN (",
-    );
-    {
-        let mut separated = query.separated(", ");
-        separated.push_bind(translation_kind);
-        separated.push_bind(polish_kind);
-    }
-    query.push(") AND w.entity_id IN (");
-    {
-        let mut separated = query.separated(", ");
-        for id in entity_ids {
-            separated.push_bind(id);
-        }
-    }
-    query.push(")");
-    #[derive(Debug, sqlx::FromRow)]
-    struct TaskWithEntityRow {
-        #[sqlx(flatten)]
-        task: TaskRow,
-        entity_id: String,
-    }
-    let rows = query
-        .build_query_as::<TaskWithEntityRow>()
-        .fetch_all(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
-    let global_rows = load_global_task_rows(state, kind, entity_ids).await?;
     let global_mode = content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
         == content_processing::ContentProcessingMode::Global;
+    let rows = if global_mode {
+        Vec::new()
+    } else {
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT w.id, w.kind, w.status, w.result_status, w.attempt_count, w.started_at, w.finished_at, w.updated_at, (SELECT MAX(e.created_at) FROM translation_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at, w.entity_id FROM translation_work_items w WHERE w.kind IN (",
+        );
+        {
+            let mut separated = query.separated(", ");
+            separated.push_bind(translation_kind);
+            separated.push_bind(polish_kind);
+        }
+        query.push(") AND w.entity_id IN (");
+        {
+            let mut separated = query.separated(", ");
+            for id in entity_ids {
+                separated.push_bind(id);
+            }
+        }
+        query.push(")");
+        query
+            .build_query_as::<TaskWithEntityRow>()
+            .fetch_all(&state.pool)
+            .await
+            .map_err(ApiError::internal)?
+    };
+    let global_rows = load_global_task_rows(state, kind, entity_ids).await?;
     let global_by_key = global_rows.iter().fold(HashMap::new(), |mut by_key, row| {
         let pipeline = if row.pipeline == "polishing" {
             "polish"
@@ -887,7 +905,7 @@ async fn load_task_summaries(
             .or_insert(row);
         by_key
     });
-    let legacy_cache = load_legacy_cache_origins(state, kind, entity_ids).await?;
+    let legacy_observations = load_legacy_observations(state, kind, entity_ids).await?;
     let mut grouped = HashMap::<String, (Vec<TaskRow>, Vec<TaskRow>)>::new();
     for row in rows {
         let entry = grouped.entry(row.entity_id).or_default();
@@ -905,33 +923,16 @@ async fn load_task_summaries(
                 .get(&(id.clone(), "translation".to_owned()))
                 .map(|row| {
                     let mut summary = global_summary(row);
-                    if !translation.is_empty()
-                        || legacy_cache.contains(&(id.clone(), "translation".to_owned()))
-                    {
-                        summary.legacy_evidence = Some(AdminContentProcessingEvidence {
-                            status: if translation.is_empty() {
-                                "legacy_cached"
-                            } else {
-                                "legacy_conflict"
-                            }
-                            .to_owned(),
-                            status_origin: "legacy_evidence".to_owned(),
-                            ..Default::default()
-                        });
-                    }
+                    summary.legacy_evidence = legacy_observations
+                        .get(&(id.clone(), "translation".to_owned()))
+                        .cloned();
                     summary
                 })
                 .or_else(|| {
-                    if global_mode && !translation.is_empty() {
-                        return Some(legacy_conflict_summary());
-                    }
-                    if translation.is_empty()
-                        && legacy_cache.contains(&(id.clone(), "translation".to_owned()))
-                    {
-                        Some(legacy_cached_summary())
-                    } else {
-                        None
-                    }
+                    legacy_observations
+                        .get(&(id.clone(), "translation".to_owned()))
+                        .cloned()
+                        .map(legacy_evidence_summary)
                 })
                 .unwrap_or_else(|| {
                     if global_mode && !translation.is_empty() {
@@ -944,33 +945,16 @@ async fn load_task_summaries(
                 .get(&(id.clone(), "polish".to_owned()))
                 .map(|row| {
                     let mut summary = global_summary(row);
-                    if !polish.is_empty()
-                        || legacy_cache.contains(&(id.clone(), "polish".to_owned()))
-                    {
-                        summary.legacy_evidence = Some(AdminContentProcessingEvidence {
-                            status: if polish.is_empty() {
-                                "legacy_cached"
-                            } else {
-                                "legacy_conflict"
-                            }
-                            .to_owned(),
-                            status_origin: "legacy_evidence".to_owned(),
-                            ..Default::default()
-                        });
-                    }
+                    summary.legacy_evidence = legacy_observations
+                        .get(&(id.clone(), "polish".to_owned()))
+                        .cloned();
                     summary
                 })
                 .or_else(|| {
-                    if global_mode && !polish.is_empty() {
-                        return Some(legacy_conflict_summary());
-                    }
-                    if polish.is_empty()
-                        && legacy_cache.contains(&(id.clone(), "polish".to_owned()))
-                    {
-                        Some(legacy_cached_summary())
-                    } else {
-                        None
-                    }
+                    legacy_observations
+                        .get(&(id.clone(), "polish".to_owned()))
+                        .cloned()
+                        .map(legacy_evidence_summary)
                 })
                 .unwrap_or_else(|| {
                     if global_mode && !polish.is_empty() {
@@ -1062,13 +1046,24 @@ async fn load_brief_summaries(
 async fn list_source_rows(
     pool: &SqlitePool,
     kind: CollectionRecordKind,
+    global_mode: bool,
     from: Option<&str>,
     before: Option<&str>,
     attempts: AttemptCountRange,
 ) -> Result<Vec<SourceRecordRow>, ApiError> {
+    let attempt_count_sql = if global_mode {
+        "0".to_owned()
+    } else {
+        match kind {
+            CollectionRecordKind::Release => "COALESCE((SELECT MAX(w.attempt_count) FROM translation_work_items w WHERE w.entity_id = CAST(r.release_id AS TEXT) AND w.kind IN ('release_detail', 'release_smart')), 0)".to_owned(),
+            CollectionRecordKind::Announcement => "COALESCE((SELECT MAX(w.attempt_count) FROM translation_work_items w WHERE w.entity_id = lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AND w.kind IN ('announcement_detail', 'announcement_smart')), 0)".to_owned(),
+            CollectionRecordKind::Notification => "COALESCE((SELECT MAX(w.attempt_count) FROM translation_work_items w WHERE w.entity_id = n.thread_id AND w.kind IN ('notification', 'notification_smart')), 0)".to_owned(),
+            CollectionRecordKind::Brief => "COALESCE((SELECT MAX(c.attempt_count) FROM llm_calls c WHERE c.parent_brief_id = b.id), 0)".to_owned(),
+        }
+    };
     let source_sql = match kind {
         CollectionRecordKind::Release => {
-            "WITH source_records AS (
+            format!("WITH source_records AS (
                 SELECT
                   CAST(r.release_id AS TEXT) AS id,
                   COALESCE((SELECT wi.repo_full_name FROM repo_release_work_items wi WHERE wi.repo_id = r.repo_id LIMIT 1), '仓库 #' || CAST(r.repo_id AS TEXT)) AS repository,
@@ -1077,7 +1072,7 @@ async fn list_source_rows(
                   COALESCE(r.published_at, r.created_at, r.updated_at) AS occurred_at,
                   r.detected_at,
                   NULL AS generated_at,
-                  COALESCE((SELECT MAX(w.attempt_count) FROM translation_work_items w WHERE w.entity_id = CAST(r.release_id AS TEXT) AND w.kind IN ('release_detail', 'release_smart')), 0) AS attempt_count
+                  {attempt_count_sql} AS attempt_count
                 FROM repo_releases r
             )
             SELECT id, repository, title, occurred_at, detected_at, generated_at
@@ -1086,10 +1081,11 @@ async fn list_source_rows(
               AND (? IS NULL OR datetime(source_time) < datetime(?))
               AND attempt_count >= ?
               AND attempt_count <= COALESCE(?, attempt_count)
-            ORDER BY datetime(source_time) DESC, CAST(id AS INTEGER) DESC"
+            ORDER BY datetime(source_time) DESC, CAST(id AS INTEGER) DESC")
         }
         CollectionRecordKind::Announcement => {
-            "WITH source_records AS (
+            format!(
+                "WITH source_records AS (
                 SELECT
                   lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id,
                   MAX(e.repo_full_name) AS repository,
@@ -1098,7 +1094,7 @@ async fn list_source_rows(
                   MAX(e.occurred_at) AS occurred_at,
                   MIN(e.detected_at) AS detected_at,
                   NULL AS generated_at,
-                  COALESCE((SELECT MAX(w.attempt_count) FROM translation_work_items w WHERE w.entity_id = lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AND w.kind IN ('announcement_detail', 'announcement_smart')), 0) AS attempt_count
+                  {attempt_count_sql} AS attempt_count
                 FROM social_activity_events e
                 WHERE e.kind = 'announcement'
                   AND e.repo_full_name IS NOT NULL
@@ -1112,9 +1108,35 @@ async fn list_source_rows(
               AND attempt_count >= ?
               AND attempt_count <= COALESCE(?, attempt_count)
             ORDER BY datetime(source_time) DESC, id DESC"
+            )
+        }
+        CollectionRecordKind::Notification => {
+            format!(
+                "WITH source_records AS (
+                SELECT
+                  n.thread_id AS id,
+                  MAX(n.repo_full_name) AS repository,
+                  COALESCE(MAX(NULLIF(n.subject_title, '')), '通知') AS title,
+                  MAX(n.updated_at) AS source_time,
+                  MAX(n.updated_at) AS occurred_at,
+                  MIN(n.created_at) AS detected_at,
+                  NULL AS generated_at,
+                  {attempt_count_sql} AS attempt_count
+                FROM notifications n
+                GROUP BY n.thread_id
+            )
+            SELECT id, repository, title, occurred_at, detected_at, generated_at
+            FROM source_records
+            WHERE (? IS NULL OR datetime(source_time) >= datetime(?))
+              AND (? IS NULL OR datetime(source_time) < datetime(?))
+              AND attempt_count >= ?
+              AND attempt_count <= COALESCE(?, attempt_count)
+            ORDER BY datetime(source_time) DESC, id DESC"
+            )
         }
         CollectionRecordKind::Brief => {
-            "WITH source_records AS (
+            format!(
+                "WITH source_records AS (
                 SELECT
                   b.id,
                   NULL AS repository,
@@ -1123,7 +1145,7 @@ async fn list_source_rows(
                   NULL AS occurred_at,
                   NULL AS detected_at,
                   b.created_at AS generated_at,
-                  COALESCE((SELECT MAX(c.attempt_count) FROM llm_calls c WHERE c.parent_brief_id = b.id), 0) AS attempt_count
+                  {attempt_count_sql} AS attempt_count
                 FROM briefs b
             )
             SELECT id, repository, title, occurred_at, detected_at, generated_at
@@ -1133,9 +1155,10 @@ async fn list_source_rows(
               AND attempt_count >= ?
               AND attempt_count <= COALESCE(?, attempt_count)
             ORDER BY datetime(source_time) DESC, id DESC"
+            )
         }
     };
-    sqlx::query_as::<_, SourceRecordRow>(source_sql)
+    sqlx::query_as::<_, SourceRecordRow>(&source_sql)
         .bind(from)
         .bind(from)
         .bind(before)
@@ -1168,6 +1191,7 @@ pub async fn admin_list_collection_records(
     let rows = list_source_rows(
         &state.pool,
         kind,
+        global_mode,
         from.as_deref(),
         before.as_deref(),
         if global_mode {
@@ -1239,6 +1263,9 @@ async fn load_source_record(
         }
         CollectionRecordKind::Announcement => {
             "SELECT lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id, MAX(e.repo_full_name) AS repository, COALESCE(MAX(NULLIF(e.title, '')), '公告') AS title, MAX(e.occurred_at) AS occurred_at, MIN(e.detected_at) AS detected_at, NULL AS generated_at FROM social_activity_events e WHERE e.kind = 'announcement' AND lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) = ? GROUP BY lower(e.repo_full_name), e.discussion_number LIMIT 1"
+        }
+        CollectionRecordKind::Notification => {
+            "SELECT n.thread_id AS id, MAX(n.repo_full_name) AS repository, COALESCE(MAX(NULLIF(n.subject_title, '')), '通知') AS title, MAX(n.updated_at) AS occurred_at, MIN(n.created_at) AS detected_at, NULL AS generated_at FROM notifications n WHERE n.thread_id = ? GROUP BY n.thread_id LIMIT 1"
         }
         CollectionRecordKind::Brief => {
             "SELECT b.id, NULL AS repository, b.date AS title, NULL AS occurred_at, NULL AS detected_at, b.created_at AS generated_at FROM briefs b WHERE b.id = ? LIMIT 1"
@@ -1903,6 +1930,7 @@ mod tests {
         let rows = list_source_rows(
             &pool,
             CollectionRecordKind::Release,
+            false,
             Some("2026-07-08T07:00:00Z"),
             Some("2026-07-08T10:00:00Z"),
             AttemptCountRange { min: 0, max: None },
@@ -1916,6 +1944,7 @@ mod tests {
         let rows = list_source_rows(
             &pool,
             CollectionRecordKind::Release,
+            false,
             Some("2026-07-08T07:00:00Z"),
             Some("2026-07-08T10:00:00Z"),
             AttemptCountRange { min: 2, max: None },
@@ -1950,6 +1979,7 @@ mod tests {
         let announcement_rows = list_source_rows(
             &pool,
             CollectionRecordKind::Announcement,
+            false,
             Some("2026-07-08T08:00:00Z"),
             Some("2026-07-08T10:00:00Z"),
             AttemptCountRange { min: 0, max: None },
@@ -1975,6 +2005,7 @@ mod tests {
         let brief_rows = list_source_rows(
             &pool,
             CollectionRecordKind::Brief,
+            false,
             Some("2026-07-08T09:00:00Z"),
             Some("2026-07-08T10:00:00Z"),
             AttemptCountRange { min: 0, max: None },
@@ -1982,6 +2013,41 @@ mod tests {
         .await
         .expect("list briefs");
         assert_eq!(brief_rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn notification_source_rows_group_users_by_thread_id() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE notifications (user_id TEXT, thread_id TEXT, repo_full_name TEXT, subject_title TEXT, updated_at TEXT, created_at TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create notifications");
+        sqlx::query(
+            "CREATE TABLE translation_work_items (entity_id TEXT, kind TEXT, attempt_count INTEGER)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create notification work items");
+        sqlx::query(
+            "INSERT INTO notifications (user_id, thread_id, repo_full_name, subject_title, updated_at, created_at) VALUES ('user-a', 'thread-1', 'octo/demo', 'Issue update', '2026-07-08T09:00:00Z', '2026-07-08T08:00:00Z'), ('user-b', 'thread-1', 'octo/demo', 'Issue update', '2026-07-08T09:05:00Z', '2026-07-08T08:05:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed notifications");
+        let rows = list_source_rows(
+            &pool,
+            CollectionRecordKind::Notification,
+            false,
+            Some("2026-07-08T08:00:00Z"),
+            Some("2026-07-08T10:00:00Z"),
+            AttemptCountRange { min: 0, max: None },
+        )
+        .await
+        .expect("list notifications");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "thread-1");
     }
 
     fn event(trigger: &str, event_type: &str, created_at: &str) -> AttemptEventRow {
