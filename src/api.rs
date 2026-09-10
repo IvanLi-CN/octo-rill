@@ -7921,7 +7921,7 @@ pub async fn admin_get_llm_call_detail(
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
     let call_id = parse_local_id_param(call_id, "call_id")?;
 
-    let mut item = sqlx::query_as::<_, AdminLlmCallDetailItem>(
+    let legacy_item = sqlx::query_as::<_, AdminLlmCallDetailItem>(
         r#"
         SELECT
           id,
@@ -8016,8 +8016,83 @@ pub async fn admin_get_llm_call_detail(
     .bind(call_id.as_str())
     .fetch_optional(&state.pool)
     .await
-    .map_err(ApiError::internal)?
-    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "llm call not found"))?;
+    .map_err(ApiError::internal)?;
+
+    let mut item = if let Some(item) = legacy_item {
+        item
+    } else {
+        let global_call = match sqlx::query(
+            r#"
+            SELECT c.id, c.status, c.model, c.provider_call_id, c.output_tokens,
+                   c.created_at, e.attempt_no, e.result_status, e.error_summary,
+                   e.failure_class
+            FROM content_attempt_llm_calls c
+            JOIN content_attempt_events e ON e.id = c.attempt_event_id
+            WHERE c.id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(call_id.as_str())
+        .fetch_optional(&state.pool)
+        .await
+        {
+            Ok(row) => row,
+            Err(sqlx::Error::Database(error)) if error.message().contains("no such table") => None,
+            Err(error) => return Err(ApiError::internal(error)),
+        };
+        let Some(global_call) = global_call else {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "llm call not found",
+            ));
+        };
+        let status = global_call.get::<String, _>("status");
+        let created_at = global_call.get::<String, _>("created_at");
+        AdminLlmCallDetailItem {
+            id: global_call.get::<String, _>("id"),
+            status: status.clone(),
+            source: "global_content_processing".to_owned(),
+            model: global_call.get::<String, _>("model"),
+            requested_by: None,
+            parent_task_id: None,
+            parent_task_type: None,
+            max_tokens: 0,
+            attempt_count: global_call.get::<i64, _>("attempt_no"),
+            scheduler_wait_ms: 0,
+            first_token_wait_ms: None,
+            duration_ms: None,
+            input_tokens: None,
+            output_tokens: global_call.get::<Option<i64>, _>("output_tokens"),
+            finish_reason: None,
+            provider_request_id: global_call.get::<Option<String>, _>("provider_call_id"),
+            provider_http_status: None,
+            processing_stage: Some("provider_call".to_owned()),
+            provider_status: global_call.get::<Option<String>, _>("result_status"),
+            output_contract_status: None,
+            retry_disposition: None,
+            relation_role: Some("primary".to_owned()),
+            evidence_availability: Some("captured".to_owned()),
+            cached_input_tokens: None,
+            total_tokens: None,
+            input_messages_json: None,
+            output_messages_json: None,
+            prompt_text: String::new(),
+            response_text: None,
+            error_text: global_call.get::<Option<String>, _>("error_summary"),
+            failure_class: global_call.get::<Option<String>, _>("failure_class"),
+            final_model: None,
+            fallback_count: 0,
+            retry_scheduled_at: None,
+            recovery_attempt_count: 0,
+            created_at: created_at.clone(),
+            started_at: Some(created_at.clone()),
+            finished_at: (status == "succeeded" || status == "failed")
+                .then_some(created_at.clone()),
+            updated_at: created_at,
+            attempt_history: Vec::new(),
+        }
+    };
 
     if let Some(snapshot) = state.llm_scheduler.admin_overrides().await.get(&item.id) {
         apply_llm_call_detail_admin_override(&mut item, snapshot);

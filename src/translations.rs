@@ -3403,7 +3403,12 @@ pub(crate) async fn ensure_legacy_writer_transaction(
             StatusCode::SERVICE_UNAVAILABLE,
             "content_processing_transition",
             "content processing is controlled by a non-legacy mode; poll the request status before retrying",
-        ))
+        )
+        .with_details(serde_json::json!({
+            "request_id": serde_json::Value::Null,
+            "work_item_id": serde_json::Value::Null,
+            "poll_url": serde_json::Value::Null,
+        })))
     }
 }
 
