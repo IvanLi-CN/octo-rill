@@ -808,7 +808,7 @@ async fn load_task_summaries(
     let global_rows = load_global_task_rows(state, kind, entity_ids).await?;
     let global_mode = content_processing::current_mode(&state.pool)
         .await
-        .unwrap_or(content_processing::ContentProcessingMode::Legacy)
+        .map_err(ApiError::internal)?
         == content_processing::ContentProcessingMode::Global;
     let global_by_key = global_rows.iter().fold(HashMap::new(), |mut by_key, row| {
         let pipeline = if row.pipeline == "polishing" {

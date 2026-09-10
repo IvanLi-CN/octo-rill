@@ -399,15 +399,20 @@ pub(crate) fn source_hash_for_item(item: &translations::TranslationRequestItemIn
     source_hash(item).expect("translation request source fields are serializable")
 }
 
-fn runtime_configuration_fingerprint(state: &AppState, model_profile: &str) -> String {
+async fn runtime_configuration_fingerprint(state: &AppState, model_profile: &str) -> String {
     let (base_url, api_key) = state
         .config
         .ai
         .as_ref()
         .map(|config| (config.base_url.to_string(), ai::sha256_hex(&config.api_key)))
         .unwrap_or_default();
+    let routing = state
+        .llm_scheduler
+        .routing_status(state.config.ai.as_ref().map(|config| config.model.as_str()))
+        .await;
     ai::sha256_hex(&format!(
-        "{GLOBAL_PROTOCOL_VERSION}\nmodel={model_profile}\nbase_url={base_url}\napi_key_hash={api_key}"
+        "{GLOBAL_PROTOCOL_VERSION}\nmodel={model_profile}\nbase_url={base_url}\napi_key_hash={api_key}\nroute={}",
+        routing.llm_models.join(",")
     ))
 }
 
@@ -694,7 +699,7 @@ pub async fn submit_item(
         .bind(GLOBAL_PROTOCOL_VERSION)
         .bind(&model_profile)
         .bind(&snapshot)
-        .bind(runtime_configuration_fingerprint(state, &model_profile))
+        .bind(runtime_configuration_fingerprint(state, &model_profile).await)
         .bind(status)
         .bind(if projection_exists { 1_i64 } else { 0_i64 })
         .bind(i64::try_from(item.source_blocks.iter().map(|block| block.text.len()).sum::<usize>()).unwrap_or(i64::MAX))
@@ -937,8 +942,9 @@ pub async fn latest_request_id_for_resource(
     target_lang: &str,
     source_hash: &str,
 ) -> Result<Option<String>, ApiError> {
+    let model_profile = current_model_profile(state).await;
     sqlx::query_scalar::<_, String>(
-        "SELECT l.request_id FROM content_request_links l JOIN content_work_items w ON w.id = l.work_item_id WHERE l.requester_id = ? AND w.canonical_resource_type = ? AND w.canonical_resource_id = ? AND w.pipeline = ? AND w.variant = ? AND w.target_lang = ? AND w.source_hash = ? AND w.protocol_version = ? ORDER BY datetime(l.created_at) DESC, l.request_id DESC LIMIT 1",
+        "SELECT l.request_id FROM content_request_links l JOIN content_work_items w ON w.id = l.work_item_id WHERE l.requester_id = ? AND w.canonical_resource_type = ? AND w.canonical_resource_id = ? AND w.pipeline = ? AND w.variant = ? AND w.target_lang = ? AND w.source_hash = ? AND w.protocol_version = ? ORDER BY CASE WHEN w.model_profile = ? THEN 0 ELSE 1 END, datetime(l.created_at) DESC, l.request_id DESC LIMIT 1",
     )
     .bind(requester_id)
     .bind(resource_type)
@@ -948,6 +954,7 @@ pub async fn latest_request_id_for_resource(
     .bind(target_lang)
     .bind(source_hash)
     .bind(GLOBAL_PROTOCOL_VERSION)
+    .bind(model_profile)
     .fetch_optional(&state.pool)
     .await
     .map_err(ApiError::internal)
@@ -1071,7 +1078,7 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
         .await?;
     ensure_global_mode_in_transaction(&mut tx).await?;
     let Some(row) = sqlx::query_as::<_, WorkRow>(
-        "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE status = 'queued' AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (priority >= 3 OR datetime(created_at) <= datetime('now', '-60 seconds')) AND (priority < 3 OR (SELECT COUNT(*) FROM content_batches WHERE status = 'running' AND trigger_reason = 'manual_retry') < ?) ORDER BY priority DESC, datetime(created_at) ASC, id ASC LIMIT 1",
+        "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE status = 'queued' AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime('now')) AND (priority >= 3 OR datetime(created_at) <= datetime('now', '-60 seconds')) AND (priority < 3 OR (SELECT COUNT(*) FROM content_batches WHERE status = 'running' AND trigger_reason = 'manual_retry') < ?) ORDER BY priority DESC, datetime(created_at) ASC, id ASC LIMIT 1",
     )
     .bind(manual_limit)
     .fetch_optional(&mut *tx)
@@ -1259,19 +1266,11 @@ fn validate_output(raw: &str, target_slots: &[String]) -> Result<Value> {
                 "global content output is missing target slot: {slot}"
             ));
         };
-        if !value.is_null() && value.as_str().is_none() {
+        if value.as_str().is_none_or(|text| text.trim().is_empty()) {
             return Err(anyhow!(
-                "global content output target slot is not text: {slot}"
+                "global content output target slot is missing text: {slot}"
             ));
         }
-    }
-    if !target_slots.iter().any(|slot| {
-        object
-            .get(slot)
-            .and_then(Value::as_str)
-            .is_some_and(|text| !text.trim().is_empty())
-    }) {
-        return Err(anyhow!("global content output is empty"));
     }
     Ok(output)
 }
@@ -1524,7 +1523,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             ensure_global_mode_in_transaction(&mut tx)
                 .await
                 .map_err(|error| anyhow!(error.to_string()))?;
-            sqlx::query("UPDATE content_work_items SET status = 'deferred_provider', next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running' AND attempt_count = ?")
+            let updated = sqlx::query("UPDATE content_work_items SET status = 'deferred_provider', next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running' AND attempt_count = ?")
                 .bind(&next_retry_at)
                 .bind(&retry_expires_at)
                 .bind(&next_retry_at)
@@ -1533,10 +1532,34 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(work.attempt_count)
                 .execute(&mut *tx)
                 .await?;
+            if updated.rows_affected() == 0 {
+                tx.commit().await?;
+                return Ok(());
+            }
+            sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, retry_eligible, next_retry_at, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'deferred_provider', 'provider_cooldown', 'model profile is cooling down', 1, ?, ? FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started'")
+                .bind(local_id::generate_local_id().to_string())
+                .bind(&next_retry_at)
+                .bind(now.to_rfc3339())
+                .bind(&work.id)
+                .bind(work.attempt_count)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE content_batch_items SET result_status = 'deferred_provider', error_code = 'provider_cooldown', error_summary = 'model profile is cooling down', updated_at = ? WHERE work_item_id = ? AND batch_id = ?")
+                .bind(now.to_rfc3339())
+                .bind(&work.id)
+                .bind(work.batch_id.as_deref().unwrap_or_default())
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE content_batches SET status = 'completed', finished_at = ?, updated_at = ?, error_code = 'provider_cooldown', error_summary = 'model profile is cooling down' WHERE id = ? AND status = 'running'")
+                .bind(now.to_rfc3339())
+                .bind(now.to_rfc3339())
+                .bind(work.batch_id.as_deref().unwrap_or_default())
+                .execute(&mut *tx)
+                .await?;
             tx.commit().await?;
             return Ok(());
         }
-        if runtime_configuration_fingerprint(state, &work.model_profile)
+        if runtime_configuration_fingerprint(state, &work.model_profile).await
             != work.configuration_fingerprint
         {
             block_config_work(state, &work).await?;
@@ -1545,7 +1568,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
         block_config_work(state, &work).await?;
         return Ok(());
     }
-    if runtime_configuration_fingerprint(state, &work.model_profile)
+    if runtime_configuration_fingerprint(state, &work.model_profile).await
         != work.configuration_fingerprint
     {
         block_config_work(state, &work).await?;
@@ -1614,7 +1637,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(local_id::generate_local_id().to_string())
                 .bind(&attempt_event_id)
                 .bind(diagnostic.provider_request_id.as_deref().unwrap_or("unknown"))
-                .bind(&work.model_profile)
+                .bind(&diagnostic.model)
                 .bind(diagnostic.output_tokens)
                 .bind(&now)
                 .execute(&mut *tx)
