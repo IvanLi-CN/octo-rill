@@ -1881,7 +1881,7 @@ async fn sync_running_batch_slot_updates(
         return Ok(());
     }
     let updated_at = Utc::now().to_rfc3339();
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let has_control_table = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'content_processing_control'",
     )
@@ -6052,6 +6052,10 @@ async fn finalize_batch_success(
         tx.rollback().await?;
         return Ok(());
     }
+    if !legacy_batch_claim_is_current(&mut tx, state, batch).await? {
+        tx.rollback().await?;
+        return Ok(());
+    }
     for result in &results {
         let Some(work_item) = batch
             .items
@@ -6336,6 +6340,10 @@ async fn finalize_batch_failure(
         tx.rollback().await?;
         return Ok(());
     }
+    if !legacy_batch_claim_is_current(&mut tx, state, batch).await? {
+        tx.rollback().await?;
+        return Ok(());
+    }
     fail_batch_with_message(
         &mut tx,
         batch.id.as_str(),
@@ -6347,6 +6355,23 @@ async fn finalize_batch_failure(
     .await?;
     tx.commit().await?;
     Ok(())
+}
+
+async fn legacy_batch_claim_is_current(
+    tx: &mut Transaction<'_, Sqlite>,
+    state: &AppState,
+    batch: &ClaimedBatch,
+) -> Result<bool> {
+    let cutoff = runtime::stale_cutoff_timestamp(Utc::now());
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM translation_batches WHERE id = ? AND status = 'running' AND runtime_owner_id = ? AND lease_heartbeat_at IS NOT NULL AND julianday(lease_heartbeat_at) > julianday(?)",
+    )
+    .bind(batch.id.as_str())
+    .bind(state.runtime_owner_id.as_str())
+    .bind(cutoff.as_str())
+    .fetch_one(&mut **tx)
+    .await?
+        == 1)
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -10019,6 +10044,7 @@ mod tests {
         .execute(&pool)
         .await
         .expect("restore running request");
+        let heartbeat_at = Utc::now().to_rfc3339();
         sqlx::query(
             r#"
             UPDATE translation_batches
@@ -10032,7 +10058,7 @@ mod tests {
             "#,
         )
         .bind(state.runtime_owner_id.as_str())
-        .bind("2026-03-30T00:00:00Z")
+        .bind(heartbeat_at.as_str())
         .bind("2026-03-30T00:00:00Z")
         .bind(batch.id.as_str())
         .execute(&pool)

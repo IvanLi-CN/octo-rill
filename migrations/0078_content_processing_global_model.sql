@@ -124,7 +124,7 @@ CREATE TABLE content_result_projections (
   updated_at TEXT NOT NULL,
   UNIQUE (
     canonical_resource_type, canonical_resource_id, pipeline, variant,
-    target_lang, protocol_version, model_profile
+    target_lang, protocol_version, model_profile, source_hash
   ),
   FOREIGN KEY (work_item_id) REFERENCES content_work_items(id),
   FOREIGN KEY (active_work_item_id) REFERENCES content_work_items(id)
