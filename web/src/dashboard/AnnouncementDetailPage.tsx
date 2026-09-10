@@ -270,6 +270,29 @@ export function AnnouncementDetailPage(props: {
 								requestId: response.request_id,
 							};
 							if (Date.now() >= deadline) {
+								const pendingTranslated =
+									mapTranslationResultToAnnouncementDetailTranslated(
+										response.result,
+									);
+								if (pendingTranslated) {
+									setDetail((prev) => {
+										if (!prev || prev.discussion_key !== requestDiscussionKey)
+											return prev;
+										const translated =
+											preserveReadyTranslation &&
+											prev.translated?.status === "ready"
+												? {
+														...prev.translated,
+														status: pendingTranslated.status,
+														error_code: pendingTranslated.error_code,
+														error_summary: pendingTranslated.error_summary,
+														error_detail: pendingTranslated.error_detail,
+													}
+												: pendingTranslated;
+										return { ...prev, translated };
+									});
+									setTranslateError(null);
+								}
 								return;
 							}
 							if (translateRequestSeqRef.current !== requestSeq) return;

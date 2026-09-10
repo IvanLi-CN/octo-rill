@@ -56,6 +56,15 @@ pub struct AdminCollectionRecordListQuery {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
+pub struct AdminContentProcessingEvidence {
+    pub status: String,
+    pub status_origin: String,
+    pub work_item_id: Option<String>,
+    pub source_hash: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct AdminCollectionTaskSummary {
     pub status: String,
     pub display_status: String,
@@ -64,6 +73,9 @@ pub struct AdminCollectionTaskSummary {
     pub started_at: Option<String>,
     pub last_attempt_at: Option<String>,
     pub finished_at: Option<String>,
+    pub global_work: Option<AdminContentProcessingEvidence>,
+    pub result_projection: Option<AdminContentProcessingEvidence>,
+    pub legacy_evidence: Option<AdminContentProcessingEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -561,6 +573,11 @@ fn legacy_cached_summary() -> AdminCollectionTaskSummary {
         status: "legacy_cached".to_owned(),
         display_status: "legacy_cached".to_owned(),
         status_origin: "legacy_cached".to_owned(),
+        legacy_evidence: Some(AdminContentProcessingEvidence {
+            status: "legacy_cached".to_owned(),
+            status_origin: "legacy_cached".to_owned(),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -570,6 +587,11 @@ fn legacy_conflict_summary() -> AdminCollectionTaskSummary {
         status: "legacy_conflict".to_owned(),
         display_status: "legacy_conflict".to_owned(),
         status_origin: "legacy_conflict".to_owned(),
+        legacy_evidence: Some(AdminContentProcessingEvidence {
+            status: "legacy_conflict".to_owned(),
+            status_origin: "legacy_conflict".to_owned(),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -584,6 +606,9 @@ struct GlobalTaskRow {
     updated_at: String,
     last_attempt_at: Option<String>,
     canonical_resource_id: String,
+    projection_work_item_id: Option<String>,
+    projection_source_hash: Option<String>,
+    projection_updated_at: Option<String>,
 }
 
 fn missing_table(error: &sqlx::Error) -> bool {
@@ -599,7 +624,7 @@ async fn load_global_task_rows(
         return Ok(Vec::new());
     }
     let mut query = QueryBuilder::<Sqlite>::new(
-        "SELECT pipeline, status, attempt_count, started_at, finished_at, updated_at, (SELECT MAX(created_at) FROM content_attempt_events e WHERE e.work_item_id = content_work_items.id) AS last_attempt_at, canonical_resource_id FROM content_work_items WHERE canonical_resource_type = ",
+        "SELECT pipeline, status, attempt_count, started_at, finished_at, updated_at, (SELECT MAX(created_at) FROM content_attempt_events e WHERE e.work_item_id = content_work_items.id) AS last_attempt_at, canonical_resource_id, (SELECT p.work_item_id FROM content_result_projections p WHERE p.canonical_resource_type = content_work_items.canonical_resource_type AND p.canonical_resource_id = content_work_items.canonical_resource_id AND p.pipeline = content_work_items.pipeline AND p.variant = content_work_items.variant AND p.target_lang = content_work_items.target_lang AND p.protocol_version = content_work_items.protocol_version ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_work_item_id, (SELECT p.source_hash FROM content_result_projections p WHERE p.canonical_resource_type = content_work_items.canonical_resource_type AND p.canonical_resource_id = content_work_items.canonical_resource_id AND p.pipeline = content_work_items.pipeline AND p.variant = content_work_items.variant AND p.target_lang = content_work_items.target_lang AND p.protocol_version = content_work_items.protocol_version ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_source_hash, (SELECT p.updated_at FROM content_result_projections p WHERE p.canonical_resource_type = content_work_items.canonical_resource_type AND p.canonical_resource_id = content_work_items.canonical_resource_id AND p.pipeline = content_work_items.pipeline AND p.variant = content_work_items.variant AND p.target_lang = content_work_items.target_lang AND p.protocol_version = content_work_items.protocol_version ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_updated_at FROM content_work_items WHERE canonical_resource_type = ",
     );
     query.push_bind(collection_record_kind_label(kind));
     query.push(" AND canonical_resource_id IN (");
@@ -610,7 +635,8 @@ async fn load_global_task_rows(
         }
     }
     query.push(")");
-    query.push(" ORDER BY datetime(updated_at) DESC, id DESC");
+    query.push(" AND ((pipeline = 'translation' AND variant = 'detail') OR (pipeline = 'polishing' AND variant = 'smart'))");
+    query.push(" ORDER BY CASE status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'ready' THEN 3 WHEN 'failed' THEN 4 WHEN 'superseded' THEN 9 ELSE 5 END, datetime(updated_at) DESC, id DESC");
     let rows = match query
         .build_query_as::<GlobalTaskRow>()
         .fetch_all(&state.pool)
@@ -675,6 +701,22 @@ fn global_summary(row: &GlobalTaskRow) -> AdminCollectionTaskSummary {
             .clone()
             .or_else(|| Some(row.updated_at.clone())),
         finished_at: row.finished_at.clone(),
+        global_work: Some(AdminContentProcessingEvidence {
+            status: row.status.clone(),
+            status_origin: "global_work".to_owned(),
+            updated_at: Some(row.updated_at.clone()),
+            ..Default::default()
+        }),
+        result_projection: row.projection_work_item_id.as_ref().map(|work_item_id| {
+            AdminContentProcessingEvidence {
+                status: "ready".to_owned(),
+                status_origin: "result_projection".to_owned(),
+                work_item_id: Some(work_item_id.clone()),
+                source_hash: row.projection_source_hash.clone(),
+                updated_at: row.projection_updated_at.clone(),
+            }
+        }),
+        ..Default::default()
     }
 }
 
@@ -763,6 +805,7 @@ fn merge_summary(rows: &[TaskRow], status_origin: &str) -> AdminCollectionTaskSu
             .filter_map(|row| row.last_attempt_at.clone())
             .max(),
         finished_at: rows.iter().filter_map(|row| row.finished_at.clone()).max(),
+        ..Default::default()
     }
 }
 
@@ -951,6 +994,7 @@ async fn load_brief_summaries(
                         .iter()
                         .filter_map(|call| call.finished_at.clone())
                         .max(),
+                    ..Default::default()
                 },
             );
             (id.clone(), summary)
@@ -1378,7 +1422,7 @@ async fn load_global_attempts(
         created_at: String,
     }
     let rows = match sqlx::query_as::<_, GlobalAttemptRow>(
-        "SELECT e.id AS event_id, e.work_item_id, w.pipeline, e.attempt_no, e.trigger, e.event_type, e.result_status, e.error_code, e.error_summary, e.failure_class, e.retry_eligible, e.next_retry_at, e.created_at FROM content_attempt_events e JOIN content_work_items w ON w.id = e.work_item_id WHERE w.canonical_resource_type = ? AND w.canonical_resource_id = ? ORDER BY datetime(e.created_at) ASC, e.id ASC",
+        "SELECT e.id AS event_id, e.work_item_id, w.pipeline, e.attempt_no, e.trigger, e.event_type, e.result_status, e.error_code, e.error_summary, e.failure_class, e.retry_eligible, e.next_retry_at, e.created_at FROM content_attempt_events e JOIN content_work_items w ON w.id = e.work_item_id WHERE w.canonical_resource_type = ? AND w.canonical_resource_id = ? ORDER BY julianday(e.created_at) ASC, e.created_at ASC, e.id ASC",
     )
     .bind(collection_record_kind_label(kind))
     .bind(entity_id)

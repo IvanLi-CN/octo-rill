@@ -2237,6 +2237,16 @@ export type AdminCollectionTaskSummary = {
 	started_at: string | null;
 	last_attempt_at: string | null;
 	finished_at: string | null;
+	global_work?: AdminContentProcessingEvidence | null;
+	result_projection?: AdminContentProcessingEvidence | null;
+	legacy_evidence?: AdminContentProcessingEvidence | null;
+};
+export type AdminContentProcessingEvidence = {
+	status: string;
+	status_origin: string;
+	work_item_id: string | null;
+	source_hash: string | null;
+	updated_at: string | null;
 };
 export type AdminCollectionLlmLink = {
 	id: string;

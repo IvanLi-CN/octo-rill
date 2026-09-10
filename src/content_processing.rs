@@ -726,7 +726,7 @@ pub async fn submit_item(
         .await
         .map_err(ApiError::internal)?;
     ensure_global_mode_in_transaction(&mut tx).await?;
-    let existing = sqlx::query_as::<_, WorkRow>(
+    let exact_existing = sqlx::query_as::<_, WorkRow>(
         "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND source_hash = ? AND protocol_version = ? AND model_profile = ? LIMIT 1",
     )
     .bind(resource_type)
@@ -740,6 +740,26 @@ pub async fn submit_item(
     .fetch_optional(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
+    // A model-profile change alone must not re-run an already published global
+    // result. Explicit refreshes create a new source hash; ordinary requests
+    // continue to use the best existing work for this unchanged source.
+    let existing = if exact_existing.is_some() {
+        exact_existing
+    } else {
+        sqlx::query_as::<_, WorkRow>(
+            "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND source_hash = ? AND protocol_version = ? ORDER BY CASE status WHEN 'ready' THEN 0 WHEN 'queued' THEN 1 WHEN 'running' THEN 2 WHEN 'deferred_provider' THEN 3 WHEN 'blocked_config' THEN 4 ELSE 5 END, datetime(updated_at) DESC, id DESC LIMIT 1",
+        )
+        .bind(resource_type)
+        .bind(&item.entity_id)
+        .bind(pipeline)
+        .bind(&item.variant)
+        .bind(&item.target_lang)
+        .bind(&hash)
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?
+    };
     let existing_work = existing.is_some();
     let work = if let Some(existing) = existing {
         existing
@@ -1158,7 +1178,7 @@ pub async fn retry_request(
     .max(row.attempt_count)
     .max(0);
     let next_attempt_no = previous_attempt_no.saturating_add(1);
-    sqlx::query("UPDATE content_work_items SET status = ?, priority = 3, next_retry_at = ?, retry_expires_at = ?, retry_after_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    sqlx::query("UPDATE content_work_items SET status = ?, priority = 3, next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(retry_status)
         .bind(&next_retry_at)
         .bind(&retry_expires_at)
@@ -1311,7 +1331,7 @@ async fn recover_due(state: &AppState) -> Result<()> {
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, failure_class, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), id, CASE WHEN attempt_count < 1 THEN 1 ELSE attempt_count END, 'automatic_recovery', 'attempt_completed', 'failed', 'provider_unavailable', 'provider_unavailable', 0, ? FROM content_work_items WHERE status = 'failed' AND failure_class = 'provider_unavailable' AND next_retry_at IS NULL AND retry_expires_at IS NULL AND updated_at = ?",
+        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, failure_class, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), w.id, COALESCE((SELECT MAX(pending.attempt_no) FROM content_attempt_events pending WHERE pending.work_item_id = w.id AND pending.event_type = 'attempt_queued'), CASE WHEN w.attempt_count < 1 THEN 1 ELSE w.attempt_count END), 'automatic_recovery', 'attempt_completed', 'failed', 'provider_unavailable', 'provider_unavailable', 0, ? FROM content_work_items w WHERE w.status = 'failed' AND w.failure_class = 'provider_unavailable' AND w.next_retry_at IS NULL AND w.retry_expires_at IS NULL AND w.updated_at = ?",
     )
     .bind(&now)
     .bind(&now)
@@ -1800,12 +1820,44 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(work.attempt_count)
                 .fetch_one(&mut *tx)
                 .await?;
-            sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, output_tokens, created_at) VALUES (?, ?, ?, ?, 'succeeded', ?, ?)")
+            let linked_call_audit = if let Some(batch_id) = work.batch_id.as_deref() {
+                sqlx::query_as::<_, (Option<String>, String, Option<i64>, Option<i64>, Option<i64>)>(
+                    "SELECT provider_request_id, COALESCE(final_model, model), duration_ms, input_tokens, output_tokens FROM llm_calls WHERE parent_translation_batch_id = ? ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
+                )
+                .bind(batch_id)
+                .fetch_optional(&mut *tx)
+                .await?
+            } else {
+                None
+            };
+            let provider_call_id = linked_call_audit
+                .as_ref()
+                .and_then(|(provider_id, _, _, _, _)| provider_id.as_deref())
+                .or(diagnostic.provider_request_id.as_deref())
+                .unwrap_or("unknown");
+            let model = linked_call_audit
+                .as_ref()
+                .map_or(diagnostic.model.as_str(), |(_, model, _, _, _)| {
+                    model.as_str()
+                });
+            let duration_ms = linked_call_audit
+                .as_ref()
+                .and_then(|(_, _, duration_ms, _, _)| *duration_ms);
+            let input_tokens = linked_call_audit
+                .as_ref()
+                .and_then(|(_, _, _, input_tokens, _)| *input_tokens);
+            let output_tokens = linked_call_audit
+                .as_ref()
+                .and_then(|(_, _, _, _, output_tokens)| *output_tokens)
+                .or(diagnostic.output_tokens);
+            sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, created_at) VALUES (?, ?, ?, ?, 'succeeded', ?, ?, ?, ?)")
                 .bind(local_id::generate_local_id().to_string())
                 .bind(&attempt_event_id)
-                .bind(diagnostic.provider_request_id.as_deref().unwrap_or("unknown"))
-                .bind(&diagnostic.model)
-                .bind(diagnostic.output_tokens)
+                .bind(provider_call_id)
+                .bind(model)
+                .bind(duration_ms)
+                .bind(input_tokens)
+                .bind(output_tokens)
                 .bind(&now)
                 .execute(&mut *tx)
                 .await?;
@@ -1888,8 +1940,8 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             .await?;
             let error_summary = translations::translation_error_summary(Some(error_text.as_str()));
             let linked_call_audit = if let Some(batch_id) = work.batch_id.as_deref() {
-                sqlx::query_as::<_, (Option<String>, String)>(
-                    "SELECT provider_request_id, COALESCE(final_model, model) FROM llm_calls WHERE parent_translation_batch_id = ? ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
+                sqlx::query_as::<_, (Option<String>, String, Option<i64>, Option<i64>, Option<i64>)>(
+                    "SELECT provider_request_id, COALESCE(final_model, model), duration_ms, input_tokens, output_tokens FROM llm_calls WHERE parent_translation_batch_id = ? ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
                 )
                 .bind(batch_id)
                 .fetch_optional(&mut *tx)
@@ -1897,17 +1949,20 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             } else {
                 None
             };
-            sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, error_code, error_summary, created_at) VALUES (?, ?, ?, ?, 'failed', ?, ?, ?)")
+            sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, error_code, error_summary, created_at) VALUES (?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?)")
                 .bind(local_id::generate_local_id().to_string())
                 .bind(&attempt_event_id)
-                .bind(linked_call_audit.as_ref().and_then(|(provider_id, _)| provider_id.as_deref()).unwrap_or("unknown"))
-                .bind(linked_call_audit.as_ref().map_or(work.model_profile.as_str(), |(_, model)| model.as_str()))
+                .bind(linked_call_audit.as_ref().and_then(|(provider_id, _, _, _, _)| provider_id.as_deref()).unwrap_or("unknown"))
+                .bind(linked_call_audit.as_ref().map_or(work.model_profile.as_str(), |(_, model, _, _, _)| model.as_str()))
+                .bind(linked_call_audit.as_ref().and_then(|(_, _, duration_ms, _, _)| *duration_ms))
+                .bind(linked_call_audit.as_ref().and_then(|(_, _, _, input_tokens, _)| *input_tokens))
+                .bind(linked_call_audit.as_ref().and_then(|(_, _, _, _, output_tokens)| *output_tokens))
                 .bind(&class)
                 .bind(error_summary.as_deref())
                 .bind(&now)
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("UPDATE content_work_items SET status = 'failed', failure_class = ?, next_retry_at = ?, retry_expires_at = ?, retry_after_at = ?, finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?")
+            sqlx::query("UPDATE content_work_items SET status = 'failed', failure_class = ?, next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?")
                 .bind(&class)
                 .bind(&next_retry)
                 .bind(&retry_expires)
@@ -1966,7 +2021,14 @@ pub async fn run_once(state: &AppState) -> Result<()> {
         .await
         .general_worker_concurrency
         .max(1);
-    let manual_limit = i64::try_from(worker_count.saturating_sub(1)).unwrap_or(i64::MAX);
+    // With a single general worker there is no separate background slot to
+    // reserve; allowing one manual slot prevents accepted retries starving
+    // forever. With two or more workers, retain one slot for background work.
+    let manual_limit = if worker_count > 1 {
+        i64::try_from(worker_count.saturating_sub(1)).unwrap_or(i64::MAX)
+    } else {
+        1
+    };
     if let Some(work) = claim_next(state, manual_limit).await?
         && let Err(error) = execute(state, work).await
     {
@@ -2018,8 +2080,17 @@ pub fn spawn_global_scheduler(state: Arc<AppState>) -> tokio::task::AbortHandle 
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
     use super::*;
+    use crate::config::AppConfig;
+    use crate::crypto::EncryptionKey;
+    use crate::observability::LoggingThresholds;
+    use crate::state::{build_oauth_client, build_webauthn};
+    use crate::translations::{TranslationRuntimeConfig, TranslationSchedulerController};
     use sqlx::sqlite::SqlitePoolOptions;
+    use url::Url;
 
     async fn pool(mode: &str) -> SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -2037,6 +2108,92 @@ mod tests {
             .await
             .unwrap();
         pool
+    }
+
+    async fn global_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/0078_content_processing_global_model.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE content_processing_control SET mode = 'global' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool
+    }
+
+    fn global_state(pool: SqlitePool) -> Arc<AppState> {
+        let encryption_key =
+            EncryptionKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:58090".parse::<SocketAddr>().unwrap(),
+            public_base_url: Url::parse("http://127.0.0.1:58090").unwrap(),
+            database_url: "sqlite::memory:".to_owned(),
+            sqlite_pool_max_connections: 1,
+            static_dir: None,
+            task_log_dir: std::env::temp_dir().join("octo-rill-content-processing-tests"),
+            job_worker_concurrency: 1,
+            encryption_key: encryption_key.clone(),
+            github: crate::config::GitHubOAuthConfig {
+                client_id: "test-client-id".to_owned(),
+                client_secret: "test-client-secret".to_owned(),
+                redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback").unwrap(),
+            },
+            linuxdo: None,
+            ai: None,
+            ai_max_concurrency: 1,
+            ai_daily_at_local: None,
+            app_default_time_zone: "UTC".to_owned(),
+            logging: LoggingThresholds::default(),
+        };
+        let github_oauth = build_oauth_client(&config).unwrap();
+        let webauthn = build_webauthn(&config).unwrap();
+        Arc::new(AppState {
+            config,
+            pool,
+            sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
+            api_key_last_used_touches: crate::api_keys::ApiKeyLastUsedTouchQueue::new(),
+            http: reqwest::Client::new(),
+            github_rest_http: reqwest::Client::new(),
+            github_rest_api_base: Url::parse("https://api.github.com/").unwrap(),
+            github_graphql_url: Url::parse("https://api.github.com/graphql").unwrap(),
+            github_oauth,
+            linuxdo_oauth: None,
+            webauthn,
+            encryption_key,
+            llm_scheduler: Arc::new(ai::LlmScheduler::new(1)),
+            translation_scheduler: Arc::new(TranslationSchedulerController::new(
+                TranslationRuntimeConfig::default(),
+            )),
+            runtime_owner_id: "content-processing-test-owner".to_owned(),
+        })
+    }
+
+    async fn insert_test_work(
+        pool: &SqlitePool,
+        id: &str,
+        status: &str,
+        attempt_count: i64,
+        next_retry_at: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, next_retry_at, created_at, updated_at) VALUES (?, 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-1', ?, 'test-model', '{}', 'config-1', ?, 0, 0, 1, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(id)
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .bind(status)
+        .bind(attempt_count)
+        .bind(next_retry_at)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -2085,18 +2242,18 @@ mod tests {
             .await
             .unwrap();
         sqlx::raw_sql(
-            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, status TEXT NOT NULL); CREATE TABLE ai_translations (id TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO translation_work_items VALUES ('legacy-1', 'ready'); INSERT INTO ai_translations VALUES ('cache-1', 'cached');",
+            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, kind TEXT NOT NULL, entity_id TEXT NOT NULL, status TEXT NOT NULL); CREATE TABLE ai_translations (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, status TEXT NOT NULL, title TEXT, summary TEXT, value TEXT NOT NULL); INSERT INTO translation_work_items VALUES ('legacy-1', 'release_summary', 'release-1', 'completed'); INSERT INTO ai_translations VALUES ('cache-1', 'user-1', 'release', 'release-1', 'ready', 'Cached title', 'Cached summary', 'cached');",
         )
         .execute(&pool)
         .await
         .unwrap();
-        let before_work: (String, String) =
-            sqlx::query_as("SELECT id, status FROM translation_work_items")
+        let before_work: (String, String, String, String) =
+            sqlx::query_as("SELECT id, kind, entity_id, status FROM translation_work_items")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        let before_cache: (String, String) =
-            sqlx::query_as("SELECT id, value FROM ai_translations")
+        let before_cache: (String, String, String, String, String, String, String, String) =
+            sqlx::query_as("SELECT id, user_id, entity_type, entity_id, status, title, summary, value FROM ai_translations")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -2108,12 +2265,12 @@ mod tests {
         .await
         .unwrap();
 
-        let after_work: (String, String) =
-            sqlx::query_as("SELECT id, status FROM translation_work_items")
+        let after_work: (String, String, String, String) =
+            sqlx::query_as("SELECT id, kind, entity_id, status FROM translation_work_items")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        let after_cache: (String, String) = sqlx::query_as("SELECT id, value FROM ai_translations")
+        let after_cache: (String, String, String, String, String, String, String, String) = sqlx::query_as("SELECT id, user_id, entity_type, entity_id, status, title, summary, value FROM ai_translations")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -2142,6 +2299,21 @@ mod tests {
                 .unwrap(),
             0
         );
+        let mut tx = pool.begin().await.unwrap();
+        assert!(
+            transition_to_rollback_freeze_in_transaction(&mut tx, "freeze-1")
+                .await
+                .unwrap()
+        );
+        tx.commit().await.unwrap();
+        assert!(transition_to_global(&pool, "global-1").await.unwrap());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM content_legacy_observations")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -2154,5 +2326,65 @@ mod tests {
             assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(error.code(), "content_processing_transition");
         }
+    }
+
+    #[tokio::test]
+    async fn manual_retry_reuses_next_attempt_and_claims_it_once() {
+        let pool = global_pool().await;
+        insert_test_work(&pool, "work-1", "failed", 1, None).await;
+        sqlx::query("INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, created_at) VALUES ('attempt-1', 'work-1', 1, 'initial', 'attempt_completed', 'failed', CURRENT_TIMESTAMP)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO content_request_links (id, request_id, work_item_id, requester_type, requester_id, authorization_snapshot_json, producer_ref, request_source, delivery_mode, created_at, updated_at) VALUES ('link-1', 'request-1', 'work-1', 'user', 'user-1', '{}', 'test', 'api', 'async', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = global_state(pool.clone());
+
+        let (status, body) = retry_request(&state, "user-1", "request-1").await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["status"], "queued");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT attempt_no FROM content_attempt_events WHERE work_item_id = 'work-1' AND event_type = 'attempt_queued'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2
+        );
+
+        let claimed = claim_next(&state, 1).await.unwrap().unwrap();
+        assert_eq!(claimed.attempt_count, 2);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM content_attempt_events WHERE work_item_id = 'work-1' AND attempt_no = 2 AND event_type = 'attempt_started'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_recovery_normalizes_zero_attempts_to_one() {
+        let pool = global_pool().await;
+        insert_test_work(&pool, "work-2", "failed", 0, Some("2000-01-01T00:00:00Z")).await;
+        sqlx::query(
+            "UPDATE content_work_items SET created_at = '2000-01-01T00:00:00Z' WHERE id = 'work-2'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = global_state(pool.clone());
+
+        recover_due(&state).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT attempt_no FROM content_attempt_events WHERE work_item_id = 'work-2' AND event_type = 'attempt_queued'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        let claimed = claim_next(&state, 1).await.unwrap().unwrap();
+        assert_eq!(claimed.attempt_count, 1);
     }
 }
