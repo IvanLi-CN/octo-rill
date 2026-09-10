@@ -399,8 +399,16 @@ pub(crate) fn source_hash_for_item(item: &translations::TranslationRequestItemIn
     source_hash(item).expect("translation request source fields are serializable")
 }
 
-fn configuration_fingerprint(model_profile: &str) -> String {
-    ai::sha256_hex(&format!("{GLOBAL_PROTOCOL_VERSION}\nmodel={model_profile}"))
+fn runtime_configuration_fingerprint(state: &AppState, model_profile: &str) -> String {
+    let (base_url, api_key) = state
+        .config
+        .ai
+        .as_ref()
+        .map(|config| (config.base_url.to_string(), ai::sha256_hex(&config.api_key)))
+        .unwrap_or_default();
+    ai::sha256_hex(&format!(
+        "{GLOBAL_PROTOCOL_VERSION}\nmodel={model_profile}\nbase_url={base_url}\napi_key_hash={api_key}"
+    ))
 }
 
 async fn current_model_profile(state: &AppState) -> String {
@@ -556,11 +564,44 @@ pub async fn submit_item(
     match processing_mode {
         ContentProcessingMode::Global => {}
         ContentProcessingMode::RollbackFreeze => {
+            let (resource_type, pipeline) = canonical_identity(item);
+            let hash = source_hash(item).map_err(ApiError::internal)?;
+            let details = sqlx::query(
+                "SELECT w.id AS work_item_id, w.status, l.request_id FROM content_work_items w LEFT JOIN content_request_links l ON l.work_item_id = w.id AND l.requester_id = ? WHERE w.canonical_resource_type = ? AND w.canonical_resource_id = ? AND w.pipeline = ? AND w.variant = ? AND w.target_lang = ? AND w.source_hash = ? AND w.protocol_version = ? ORDER BY datetime(w.updated_at) DESC, w.id DESC, datetime(l.created_at) DESC LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(resource_type)
+            .bind(&item.entity_id)
+            .bind(pipeline)
+            .bind(&item.variant)
+            .bind(&item.target_lang)
+            .bind(&hash)
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(ApiError::internal)?
+            .map(|row| {
+                let request_id = row.get::<Option<String>, _>("request_id");
+                json!({
+                    "mode": ContentProcessingMode::RollbackFreeze.as_str(),
+                    "work_item_id": row.get::<String, _>("work_item_id"),
+                    "status": row.get::<String, _>("status"),
+                    "request_id": request_id,
+                    "poll_url": request_id.map(|id| format!("/api/translate/requests/{id}")),
+                })
+            })
+            .unwrap_or_else(|| json!({
+                "mode": ContentProcessingMode::RollbackFreeze.as_str(),
+                "request_id": Value::Null,
+                "work_item_id": Value::Null,
+                "poll_url": Value::Null,
+            }));
             return Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "content_processing_transition",
                 "content processing is temporarily frozen; poll the request status before retrying",
-            ));
+            )
+            .with_details(details));
         }
         ContentProcessingMode::Legacy => {
             return Err(ApiError::new(
@@ -653,7 +694,7 @@ pub async fn submit_item(
         .bind(GLOBAL_PROTOCOL_VERSION)
         .bind(&model_profile)
         .bind(&snapshot)
-        .bind(configuration_fingerprint(&model_profile))
+        .bind(runtime_configuration_fingerprint(state, &model_profile))
         .bind(status)
         .bind(if projection_exists { 1_i64 } else { 0_i64 })
         .bind(i64::try_from(item.source_blocks.iter().map(|block| block.text.len()).sum::<usize>()).unwrap_or(i64::MAX))
@@ -885,6 +926,33 @@ pub async fn read_global_resource(
     Ok(Some((status, payload)))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn latest_request_id_for_resource(
+    state: &AppState,
+    requester_id: &str,
+    resource_type: &str,
+    resource_id: &str,
+    pipeline: &str,
+    variant: &str,
+    target_lang: &str,
+    source_hash: &str,
+) -> Result<Option<String>, ApiError> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT l.request_id FROM content_request_links l JOIN content_work_items w ON w.id = l.work_item_id WHERE l.requester_id = ? AND w.canonical_resource_type = ? AND w.canonical_resource_id = ? AND w.pipeline = ? AND w.variant = ? AND w.target_lang = ? AND w.source_hash = ? AND w.protocol_version = ? ORDER BY datetime(l.created_at) DESC, l.request_id DESC LIMIT 1",
+    )
+    .bind(requester_id)
+    .bind(resource_type)
+    .bind(resource_id)
+    .bind(pipeline)
+    .bind(variant)
+    .bind(target_lang)
+    .bind(source_hash)
+    .bind(GLOBAL_PROTOCOL_VERSION)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
 pub async fn retry_request(
     state: &AppState,
     user_id: &str,
@@ -1113,11 +1181,24 @@ async fn recover_due(state: &AppState) -> Result<()> {
     .bind(&now)
     .execute(&mut *tx)
     .await?;
+    let recovery_retry_at = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+    let recovery_expires_at = (Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
     sqlx::query(
-        "UPDATE content_work_items SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, next_retry_at = NULL, updated_at = ? WHERE status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(?)",
+        "UPDATE content_work_items SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, updated_at = ? WHERE status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(?)",
     )
+    .bind(&recovery_retry_at)
+    .bind(&recovery_expires_at)
+    .bind(&recovery_retry_at)
     .bind(&now)
     .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, retry_eligible, next_retry_at, created_at) SELECT lower(hex(randomblob(16))), id, attempt_count, 'automatic_recovery', 'attempt_queued', 1, ?, ? FROM content_work_items WHERE status = 'queued' AND next_retry_at = ?",
+    )
+    .bind(&recovery_retry_at)
+    .bind(&now)
+    .bind(&recovery_retry_at)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1329,13 +1410,18 @@ async fn cancel_deleted_work_in_transaction(
     work: &WorkRow,
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    sqlx::query("UPDATE content_work_items SET status = 'cancelled', cancelled_at = ?, finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?")
+    let updated = sqlx::query("UPDATE content_work_items SET status = 'cancelled', cancelled_at = ?, finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running' AND attempt_count = ? AND lease_owner = 'content-general-1' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(?)")
         .bind(&now)
         .bind(&now)
         .bind(&now)
         .bind(&work.id)
+        .bind(work.attempt_count)
+        .bind(&now)
         .execute(&mut **tx)
         .await?;
+    if updated.rows_affected() == 0 {
+        return Ok(());
+    }
     sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'cancelled', 0, ? FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started'")
         .bind(local_id::generate_local_id().to_string())
         .bind(&now)
@@ -1367,12 +1453,18 @@ async fn block_config_work(state: &AppState, work: &WorkRow) -> Result<()> {
     ensure_global_mode_in_transaction(&mut tx)
         .await
         .map_err(|error| anyhow!(error.to_string()))?;
-    sqlx::query("UPDATE content_work_items SET status = 'blocked_config', failure_class = 'configuration', finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?")
+    let updated = sqlx::query("UPDATE content_work_items SET status = 'blocked_config', failure_class = 'configuration', finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running' AND attempt_count = ? AND lease_owner = 'content-general-1' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(?)")
         .bind(&now)
         .bind(&now)
         .bind(&work.id)
+        .bind(work.attempt_count)
+        .bind(&now)
         .execute(&mut *tx)
         .await?;
+    if updated.rows_affected() == 0 {
+        tx.commit().await?;
+        return Ok(());
+    }
     sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'blocked_config', 'configuration', 'model configuration changed before execution', 'configuration', 0, ? FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started'")
         .bind(local_id::generate_local_id().to_string())
         .bind(&now)
@@ -1405,16 +1497,77 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
         .context("invalid global source snapshot")?;
     let selected_model = ai::select_model_for_new_calls(state).await;
     if selected_model.model != work.model_profile {
+        let routing = state
+            .llm_scheduler
+            .routing_status(state.config.ai.as_ref().map(|config| config.model.as_str()))
+            .await;
+        let model_is_cooling_down = routing
+            .model_statuses
+            .iter()
+            .find(|status| status.model == work.model_profile)
+            .is_some_and(|status| status.status == "cooldown");
+        if model_is_cooling_down {
+            let now = Utc::now();
+            let next_retry_at = routing
+                .model_statuses
+                .iter()
+                .find(|status| status.model == work.model_profile)
+                .and_then(|status| status.cooldown_until.clone())
+                .unwrap_or_else(|| {
+                    (now + chrono::Duration::seconds(PROVIDER_DEFER_SECS)).to_rfc3339()
+                });
+            let retry_expires_at = (now + chrono::Duration::hours(24)).to_rfc3339();
+            let (_lock, mut tx) = state
+                .sqlite_writer
+                .begin_immediate(&state.pool, "content_processing_defer_model")
+                .await?;
+            ensure_global_mode_in_transaction(&mut tx)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            sqlx::query("UPDATE content_work_items SET status = 'deferred_provider', next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running' AND attempt_count = ?")
+                .bind(&next_retry_at)
+                .bind(&retry_expires_at)
+                .bind(&next_retry_at)
+                .bind(now.to_rfc3339())
+                .bind(&work.id)
+                .bind(work.attempt_count)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            return Ok(());
+        }
+        if runtime_configuration_fingerprint(state, &work.model_profile)
+            != work.configuration_fingerprint
+        {
+            block_config_work(state, &work).await?;
+            return Ok(());
+        }
+        block_config_work(state, &work).await?;
+        return Ok(());
+    }
+    if runtime_configuration_fingerprint(state, &work.model_profile)
+        != work.configuration_fingerprint
+    {
         block_config_work(state, &work).await?;
         return Ok(());
     }
     let (system, user) = build_prompt(&snapshot, &work.pipeline);
-    let result = ai::chat_completion_with_diagnostics(state, &system, &user, 3_000)
-        .await
-        .and_then(|diagnostic| {
-            validate_output(&diagnostic.content, &snapshot.target_slots)
-                .map(|output| (diagnostic, output))
-        });
+    let result = tokio::time::timeout(
+        Duration::from_secs(4 * 60),
+        ai::chat_completion_with_diagnostics(state, &system, &user, 3_000),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::Error::new(ai::LlmCallFailure {
+            class: ai::LlmFailureClass::Transient,
+            call_id: None,
+        })
+    })
+    .and_then(|result| result)
+    .and_then(|diagnostic| {
+        validate_output(&diagnostic.content, &snapshot.target_slots)
+            .map(|output| (diagnostic, output))
+    });
     let now = Utc::now().to_rfc3339();
     let (_lock, mut tx) = state
         .sqlite_writer

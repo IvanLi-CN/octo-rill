@@ -8456,6 +8456,28 @@ async fn build_release_detail_response(
         };
         let translation_status = translation.as_ref().map(|(status, _)| status.clone());
         let smart_status = smart.as_ref().map(|(status, _)| status.clone());
+        let translation_request_id = content_processing::latest_request_id_for_resource(
+            state,
+            user_id,
+            "release",
+            release_id.as_str(),
+            "translation",
+            "detail",
+            "zh-CN",
+            global_translation_hash.as_str(),
+        )
+        .await?;
+        let smart_request_id = content_processing::latest_request_id_for_resource(
+            state,
+            user_id,
+            "release",
+            release_id.as_str(),
+            "polishing",
+            "smart",
+            "zh-CN",
+            global_smart_hash.as_str(),
+        )
+        .await?;
         let translated = match translation_status.as_deref() {
             Some("ready") => {
                 let title = project_string(&translation, "title_zh");
@@ -8506,6 +8528,14 @@ async fn build_release_detail_response(
                 .or_else(|| Some(smart_item(status, None, None, Some(false), None))),
             None => Some(smart_missing_item(None)),
         };
+        let translated = translated.map(|mut item| {
+            item.request_id = translation_request_id.clone();
+            item
+        });
+        let smart = smart.map(|mut item| {
+            item.request_id = smart_request_id.clone();
+            item
+        });
         let repo_visual = repo_visual_from_parts(
             row.owner_avatar_url,
             row.open_graph_image_url,
@@ -9141,6 +9171,28 @@ async fn build_announcement_detail_response(
         };
         let project_status =
             |project: &Option<(String, Value)>| project.as_ref().map(|(status, _)| status.clone());
+        let translation_request_id = content_processing::latest_request_id_for_resource(
+            state,
+            user_id,
+            "announcement",
+            discussion_key.as_str(),
+            "translation",
+            "detail",
+            "zh-CN",
+            global_translation_hash.as_str(),
+        )
+        .await?;
+        let smart_request_id = content_processing::latest_request_id_for_resource(
+            state,
+            user_id,
+            "announcement",
+            discussion_key.as_str(),
+            "polishing",
+            "smart",
+            "zh-CN",
+            global_smart_hash.as_str(),
+        )
+        .await?;
         let translated = match project_status(&translation).as_deref() {
             Some("ready") => Some(translated_item(
                 "ready",
@@ -9208,6 +9260,14 @@ async fn build_announcement_detail_response(
             Some(status) => smart_terminal_item(status, None),
             None => Some(smart_missing_item(None)),
         };
+        let translated = translated.map(|mut item| {
+            item.request_id = translation_request_id.clone();
+            item
+        });
+        let smart = smart.map(|mut item| {
+            item.request_id = smart_request_id.clone();
+            item
+        });
         return Ok(AnnouncementDetailResponse {
             repo_full_name: source.repo_full_name,
             discussion_number: source.discussion_number,
@@ -9956,6 +10016,11 @@ async fn upsert_public_release_usage(
         (true, true) => (0_i64, 0_i64, 0_i64, 1_i64),
     };
 
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "public_release_usage_register")
+        .await
+        .map_err(ApiError::internal)?;
     sqlx::query(
         r#"
         INSERT INTO public_repo_release_usage (
@@ -9991,9 +10056,11 @@ async fn upsert_public_release_usage(
     .bind(page_detail_inc)
     .bind(now.as_str())
     .bind(now.as_str())
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    drop(_sqlite_write);
 
     let row = sqlx::query_as::<_, PublicReleaseUsageRow>(
         r#"
@@ -10149,6 +10216,11 @@ async fn resolve_public_release_usage_from_local_metadata(
             .await
             .map_err(ApiError::internal)?
     {
+        let (_sqlite_write, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "public_release_usage_sync_status")
+            .await
+            .map_err(ApiError::internal)?;
         sqlx::query(
             r#"
             UPDATE public_repo_release_usage
@@ -10160,9 +10232,10 @@ async fn resolve_public_release_usage_from_local_metadata(
         )
         .bind(now.as_str())
         .bind(full_name_lower)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
     }
 
     sqlx::query_as::<_, PublicReleaseUsageRow>(
@@ -10665,6 +10738,11 @@ pub async fn publish_repo_public_release(
         "pending"
     };
 
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "public_release_usage_publish")
+        .await
+        .map_err(ApiError::internal)?;
     sqlx::query(
         r#"
         INSERT INTO public_repo_release_usage (
@@ -10711,9 +10789,11 @@ pub async fn publish_repo_public_release(
     .bind(now.as_str())
     .bind(now.as_str())
     .bind(now.as_str())
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    drop(_sqlite_write);
 
     if release_count == 0
         && sync::enqueue_public_repo_release_sync(
@@ -10724,6 +10804,11 @@ pub async fn publish_repo_public_release(
         .await
         .map_err(ApiError::internal)?
     {
+        let (_sqlite_write, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "public_release_usage_publish_status")
+            .await
+            .map_err(ApiError::internal)?;
         sqlx::query(
             r#"
             UPDATE public_repo_release_usage
@@ -10735,9 +10820,10 @@ pub async fn publish_repo_public_release(
         )
         .bind(now.as_str())
         .bind(full_name_lower.as_str())
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
     }
 
     let visible = load_repo_public_release_visible_row(
@@ -10784,6 +10870,11 @@ pub async fn unpublish_repo_public_release(
             "only viewer-owned private repositories can be unpublished",
         ));
     }
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "public_release_usage_unpublish")
+        .await
+        .map_err(ApiError::internal)?;
     let deleted_usage = sqlx::query_as::<_, (Option<i64>, String)>(
         r#"
         SELECT repo_id, full_name
@@ -10794,7 +10885,7 @@ pub async fn unpublish_repo_public_release(
         "#,
     )
     .bind(full_name_lower.as_str())
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
 
@@ -10807,11 +10898,15 @@ pub async fn unpublish_repo_public_release(
             "#,
         )
         .bind(full_name_lower.as_str())
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
+        drop(_sqlite_write);
         Some(cleanup_public_release_repo_cache_if_unused(state.as_ref(), repo_id, full_name).await?)
     } else {
+        tx.commit().await.map_err(ApiError::internal)?;
+        drop(_sqlite_write);
         None
     };
 
@@ -15170,6 +15265,8 @@ pub struct TranslatedItem {
     error_summary: Option<String>,
     error_detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     auto_translate: Option<bool>,
 }
 
@@ -15182,6 +15279,8 @@ pub struct SmartItem {
     error_code: Option<String>,
     error_summary: Option<String>,
     error_detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_translate: Option<bool>,
 }
@@ -17086,6 +17185,7 @@ fn translated_item(
         error_code,
         error_summary,
         error_detail,
+        request_id: None,
         auto_translate,
     }
 }
@@ -17106,6 +17206,7 @@ fn smart_item(
         error_code,
         error_summary,
         error_detail,
+        request_id: None,
         auto_translate,
     }
 }

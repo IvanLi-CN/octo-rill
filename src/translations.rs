@@ -1887,6 +1887,10 @@ async fn sync_running_batch_slot_updates(
             UPDATE translation_batches
             SET worker_slot = ?, worker_kind = ?, updated_at = ?
             WHERE id = ? AND status = 'running' AND worker_id = ?
+              AND EXISTS (
+                SELECT 1 FROM content_processing_control
+                WHERE id = 1 AND mode = 'legacy'
+              )
             "#,
         )
         .bind(update.worker_slot)
@@ -2095,6 +2099,7 @@ pub(crate) fn stream_global_translation_request_response_for_api(
                     let phase = match status {
                         "queued" => "queued",
                         "running" => "running",
+                        "deferred_provider" => "queued",
                         "failed" | "cancelled" | "superseded" | "blocked_config" => "failed",
                         _ => "completed",
                     };
@@ -6466,10 +6471,13 @@ async fn recover_due_translation_work_items(state: &AppState) -> Result<()> {
               AND result_status = 'error'
               AND next_retry_at IS NOT NULL
               AND julianday(next_retry_at) <= julianday(?)
+              AND retry_expires_at IS NOT NULL
+              AND julianday(retry_expires_at) > julianday(?)
             "#,
         )
         .bind(now.as_str())
         .bind(item.id.as_str())
+        .bind(now.as_str())
         .bind(now.as_str())
         .execute(&mut *tx)
         .await?;
@@ -6549,6 +6557,10 @@ async fn heartbeat_translation_batch_lease(state: &AppState, batch_id: &str) -> 
                 WHERE id = ?
                   AND status = 'running'
                   AND runtime_owner_id = ?
+                  AND EXISTS (
+                    SELECT 1 FROM content_processing_control
+                    WHERE id = 1 AND mode = 'legacy'
+                  )
                 "#,
             )
             .bind(now.as_str())
@@ -6820,15 +6832,6 @@ async fn recover_runtime_state_with_mode(
     };
 
     for batch in stale_batches {
-        ai::recover_linked_llm_calls_for_batch(
-            state,
-            batch.id.as_str(),
-            runtime::RUNTIME_LEASE_EXPIRED_ERROR,
-            batch.runtime_owner_id.as_deref(),
-            batch.lease_heartbeat_at.as_deref(),
-        )
-        .await?;
-
         let (_sqlite_write, mut tx) = state
             .sqlite_writer
             .begin_immediate(&state.pool, "translation_batch_recovery")
@@ -6836,6 +6839,22 @@ async fn recover_runtime_state_with_mode(
         if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
             tx.rollback().await?;
             return Ok(());
+        }
+        let current = sqlx::query_as::<_, StaleBatchRow>(
+            "SELECT id, runtime_owner_id, lease_heartbeat_at FROM translation_batches WHERE id = ? AND status = 'running' LIMIT 1",
+        )
+        .bind(batch.id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(current) = current else {
+            tx.rollback().await?;
+            continue;
+        };
+        if current.runtime_owner_id != batch.runtime_owner_id
+            || current.lease_heartbeat_at != batch.lease_heartbeat_at
+        {
+            tx.rollback().await?;
+            continue;
         }
         let items = load_batch_work_items(&mut tx, batch.id.as_str()).await?;
         let now = Utc::now().to_rfc3339();
@@ -6849,6 +6868,15 @@ async fn recover_runtime_state_with_mode(
         )
         .await?;
         tx.commit().await?;
+        drop(_sqlite_write);
+        ai::recover_linked_llm_calls_for_batch(
+            state,
+            batch.id.as_str(),
+            runtime::RUNTIME_LEASE_EXPIRED_ERROR,
+            batch.runtime_owner_id.as_deref(),
+            batch.lease_heartbeat_at.as_deref(),
+        )
+        .await?;
     }
 
     Ok(())

@@ -1570,6 +1570,7 @@ export type ReleaseDetailTranslated = {
 	error_code?: string | null;
 	error_summary?: string | null;
 	error_detail?: string | null;
+	request_id?: string | null;
 	auto_translate?: boolean;
 };
 export type ReleaseDetailSmart = {
@@ -1580,6 +1581,7 @@ export type ReleaseDetailSmart = {
 	error_code?: string | null;
 	error_summary?: string | null;
 	error_detail?: string | null;
+	request_id?: string | null;
 	auto_translate?: boolean;
 };
 export type ReleaseDetailResponse = {
@@ -2049,7 +2051,17 @@ export type TranslationResolveResponse = {
 export type TranslationRequestStreamEvent = {
 	event: "queued" | "batched" | "running" | "completed" | "failed";
 	request_id: string;
-	status: "queued" | "running" | "completed" | "failed";
+	status:
+		| "queued"
+		| "running"
+		| "deferred_provider"
+		| "completed"
+		| "failed"
+		| "ready"
+		| "not_applicable"
+		| "blocked_config"
+		| "cancelled"
+		| "superseded";
 	batch_id?: string | null;
 	result?: TranslationResultItem | null;
 	error?: string | null;

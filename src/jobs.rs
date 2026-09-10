@@ -22,8 +22,8 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
 use crate::{
-    admin_runtime, ai, api, briefs, local_id, runtime, state::AppState, sync, translations,
-    webhook_push,
+    admin_runtime, ai, api, briefs, content_processing, local_id, runtime, state::AppState, sync,
+    translations, webhook_push,
 };
 
 pub const STATUS_QUEUED: &str = "queued";
@@ -2416,6 +2416,20 @@ async fn execute_task(
         TASK_SUMMARIZE_RELEASE_SMART_BATCH => {
             let user_id = payload_local_id(payload, "user_id")?;
             let release_ids = payload_i64_array(payload, "release_ids")?;
+            if content_processing::current_mode(&state.pool)
+                .await
+                .map_err(|err| anyhow!("load content processing mode failed: {err}"))?
+                == content_processing::ContentProcessingMode::Global
+            {
+                let res = api::summarize_releases_smart_batch_for_user(
+                    state,
+                    user_id.as_str(),
+                    &release_ids,
+                )
+                .await
+                .map_err(|err| anyhow!("global smart preheat failed: {}", err.code()))?;
+                return Ok(translate_batch_task_result_json(res.items));
+            }
             let request_ids = translations::enqueue_release_smart_translation_requests(
                 state,
                 user_id.as_str(),

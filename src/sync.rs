@@ -8754,8 +8754,10 @@ async fn upsert_repo_releases(
                         continue;
                     }
                     stats.updated_count += 1;
+                    stats.new_release_ids.push(release.id);
                 } else {
                     stats.inserted_count += 1;
+                    stats.new_release_ids.push(release.id);
                 }
 
                 sqlx::query(
@@ -8825,9 +8827,6 @@ async fn upsert_repo_releases(
                 .execute(&state.pool)
                 .await
                 .with_context(|| format!("failed to upsert shared release {}", release.tag_name))?;
-                if existing.is_none() {
-                    stats.new_release_ids.push(release.id);
-                }
             }
             Ok::<_, anyhow::Error>(stats)
         })
