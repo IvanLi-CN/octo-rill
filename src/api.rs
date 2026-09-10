@@ -20149,10 +20149,27 @@ async fn global_notification_request_item(
     if thread_id.is_empty() {
         return Err(ApiError::bad_request("thread_id is required"));
     }
-    let row = sqlx::query_as::<_, NotificationBatchSourceRow>(
-        "SELECT thread_id, repo_full_name, subject_title, reason, subject_type FROM notifications WHERE user_id = ? AND thread_id = ? LIMIT 1",
+    // Authorization is user-scoped, but the global source identity is not. Pick
+    // a deterministic canonical row after checking access, and never include
+    // requester-specific notification fields in the shared source snapshot.
+    let authorized = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(SELECT 1 FROM notifications WHERE user_id = ? AND thread_id = ?)",
     )
     .bind(user_id)
+    .bind(thread_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if authorized == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "notification not found",
+        ));
+    }
+    let row = sqlx::query_as::<_, NotificationBatchSourceRow>(
+        "SELECT thread_id, repo_full_name, subject_title, reason, subject_type FROM notifications WHERE thread_id = ? ORDER BY COALESCE(repo_full_name, ''), COALESCE(subject_title, ''), COALESCE(subject_type, ''), id LIMIT 1",
+    )
     .bind(thread_id)
     .fetch_optional(&state.pool)
     .await
@@ -20162,7 +20179,6 @@ async fn global_notification_request_item(
         .repo_full_name
         .unwrap_or_else(|| "(unknown repo)".to_owned());
     let title = row.subject_title.unwrap_or_else(|| "(no title)".to_owned());
-    let reason = row.reason.unwrap_or_default();
     let subject_type = row.subject_type.unwrap_or_default();
     Ok(translations::TranslationRequestItemInput {
         producer_ref: "api.translate_notification".to_owned(),
@@ -20171,18 +20187,30 @@ async fn global_notification_request_item(
         entity_id: row.thread_id,
         target_lang: "zh-CN".to_owned(),
         max_wait_ms: 60_000,
-        source_blocks: with_source_observed_at(vec![
-            translations::TranslationSourceBlock {
-                slot: "metadata".to_owned(),
-                text: format!("repo={repo}\nreason={reason}\nsubject_type={subject_type}"),
-            },
-            translations::TranslationSourceBlock {
-                slot: "title".to_owned(),
-                text: title,
-            },
-        ]),
+        source_blocks: with_source_observed_at(global_notification_source_blocks(
+            &repo,
+            &title,
+            &subject_type,
+        )),
         target_slots: vec!["title_zh".to_owned(), "summary_md".to_owned()],
     })
+}
+
+fn global_notification_source_blocks(
+    repo: &str,
+    title: &str,
+    subject_type: &str,
+) -> Vec<translations::TranslationSourceBlock> {
+    vec![
+        translations::TranslationSourceBlock {
+            slot: "metadata".to_owned(),
+            text: format!("repo={repo}\nsubject_type={subject_type}"),
+        },
+        translations::TranslationSourceBlock {
+            slot: "title".to_owned(),
+            text: title.to_owned(),
+        },
+    ]
 }
 
 /// Build a global request item from the canonical server-side source.
@@ -25017,6 +25045,31 @@ pub(crate) async fn ensure_owned_repo_visual_columns(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn global_notification_identity_excludes_requester_specific_reason() {
+        let source_blocks =
+            super::global_notification_source_blocks("octo/demo", "Issue updated", "Issue");
+        let first = crate::translations::TranslationRequestItemInput {
+            producer_ref: "test-a".to_owned(),
+            kind: "notification".to_owned(),
+            variant: "shared".to_owned(),
+            entity_id: "thread-1".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 0,
+            source_blocks: source_blocks.clone(),
+            target_slots: vec!["title_zh".to_owned(), "summary_md".to_owned()],
+        };
+        let second = crate::translations::TranslationRequestItemInput {
+            producer_ref: "test-b".to_owned(),
+            source_blocks,
+            ..first.clone()
+        };
+        assert_eq!(
+            crate::content_processing::source_hash_for_item(&first),
+            crate::content_processing::source_hash_for_item(&second)
+        );
+    }
+
     #[test]
     fn dashboard_readable_section_cursor_is_opaque_and_stable() {
         let encoded = encode_dashboard_readable_section_cursor("2026-04-30");

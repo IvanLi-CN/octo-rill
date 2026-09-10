@@ -25,6 +25,8 @@ pub enum ContentProcessingMode {
     Global,
 }
 
+pub const CONTENT_PROCESSING_MIGRATION_VERSION: i64 = 78;
+
 #[derive(Debug, Clone, Copy)]
 pub struct ContentProcessingTransitionError {
     pub mode: ContentProcessingMode,
@@ -99,8 +101,9 @@ pub async fn current_mode(pool: &SqlitePool) -> Result<ContentProcessingMode> {
                 > 0;
             let migration_applied = migration_table_exists
                 && sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 78",
+                    "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ?",
                 )
+                .bind(CONTENT_PROCESSING_MIGRATION_VERSION)
                 .fetch_optional(pool)
                 .await?
                 .unwrap_or(0)
@@ -162,8 +165,9 @@ pub async fn legacy_mode_in_transaction(tx: &mut Transaction<'_, Sqlite>) -> Res
                 > 0;
             let migration_applied = migration_table_exists
                 && sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 78",
+                    "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ?",
                 )
+                .bind(CONTENT_PROCESSING_MIGRATION_VERSION)
                 .fetch_optional(&mut **tx)
                 .await?
                 .unwrap_or(0)
@@ -184,8 +188,9 @@ pub async fn legacy_mode_in_transaction(tx: &mut Transaction<'_, Sqlite>) -> Res
             > 0;
         let migration_applied = migration_table_exists
             && sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 78",
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ?",
             )
+            .bind(CONTENT_PROCESSING_MIGRATION_VERSION)
             .fetch_optional(&mut **tx)
             .await?
             .unwrap_or(0)
@@ -562,46 +567,21 @@ async fn current_model_profile(state: &AppState) -> String {
 }
 
 fn request_result(work: &WorkRow, projection: Option<Value>) -> Value {
-    let mut result = projection.unwrap_or_else(|| {
-        json!({
-            "producer_ref": "(global)",
-            "entity_id": work.canonical_resource_id,
-            "kind": work.canonical_resource_type,
-            "variant": work.variant,
-            "status": work.status,
-            "title_zh": null,
-            "summary_md": null,
-            "body_md": null,
-            "error": null,
-            "error_code": null,
-            "error_summary": null,
-            "error_detail": null,
-            "work_item_id": work.id,
-            "batch_id": work.batch_id,
-        })
-    });
-    if result.get("status").is_none() {
-        result["status"] = Value::String(work.status.clone());
-    }
-    if result.get("work_item_id").is_none() {
-        result["work_item_id"] = Value::String(work.id.clone());
-    }
-    if result.get("batch_id").is_none() {
-        result["batch_id"] = work
-            .batch_id
-            .clone()
-            .map(Value::String)
-            .unwrap_or(Value::Null);
-    }
-    if result.get("entity_id").is_none() {
-        result["entity_id"] = Value::String(work.canonical_resource_id.clone());
-    }
-    if result.get("kind").is_none() {
-        result["kind"] = Value::String(kind_for_work(work));
-    }
-    if result.get("variant").is_none() {
-        result["variant"] = Value::String(work.variant.clone());
-    }
+    let mut result = projection
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    // Control metadata is server-owned. A persisted/model-provided field must
+    // never be allowed to change the work identity or lifecycle state.
+    result["status"] = Value::String(work.status.clone());
+    result["work_item_id"] = Value::String(work.id.clone());
+    result["batch_id"] = work
+        .batch_id
+        .clone()
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    result["entity_id"] = Value::String(work.canonical_resource_id.clone());
+    result["kind"] = Value::String(kind_for_work(work));
+    result["variant"] = Value::String(work.variant.clone());
     result
 }
 
@@ -699,6 +679,9 @@ pub async fn submit_item(
     mode: &str,
     item: &translations::TranslationRequestItemInput,
 ) -> Result<(StatusCode, GlobalSubmissionResponse), ApiError> {
+    // This is the scheduler admission transaction. API adapters only provide
+    // an already-authorized immutable request; provider calls, attempts and
+    // terminal projections remain scheduler-worker responsibilities.
     let processing_mode = current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?;
@@ -921,7 +904,7 @@ pub async fn submit_item(
         .await
         .map_err(ApiError::internal)?
     };
-    sqlx::query("UPDATE content_result_projections SET active_work_item_id = ?, updated_at = ? WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND model_profile = ? AND (active_work_item_id IS NULL OR active_work_item_id <> ?)")
+    sqlx::query("UPDATE content_result_projections SET active_work_item_id = ?, updated_at = ? WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND model_profile = ? AND source_hash = ? AND (active_work_item_id IS NULL OR active_work_item_id <> ?)")
         .bind(&work.id)
         .bind(&now)
         .bind(resource_type)
@@ -931,6 +914,7 @@ pub async fn submit_item(
         .bind(&item.target_lang)
         .bind(GLOBAL_PROTOCOL_VERSION)
         .bind(&model_profile)
+        .bind(&hash)
         .bind(&work.id)
         .execute(&mut *tx)
         .await
@@ -1115,8 +1099,8 @@ pub async fn read_global_resource(
     expected_source_hash: &str,
 ) -> Result<Option<(String, Value)>, ApiError> {
     let model_profile = current_model_profile(state).await;
-    let row = sqlx::query(
-        "WITH params(resource_type, resource_id, pipeline, variant, source_hash, protocol_version, model_profile) AS (SELECT ?, ?, ?, ?, ?, ?, ?) SELECT COALESCE((SELECT status FROM content_work_items w, params p WHERE w.canonical_resource_type = p.resource_type AND w.canonical_resource_id = p.resource_id AND w.pipeline = p.pipeline AND w.variant = p.variant AND w.target_lang = 'zh-CN' AND w.source_hash = p.source_hash AND w.protocol_version = p.protocol_version AND w.model_profile = p.model_profile ORDER BY datetime(w.updated_at) DESC, w.id DESC LIMIT 1), (SELECT status FROM content_work_items w, params p WHERE w.canonical_resource_type = p.resource_type AND w.canonical_resource_id = p.resource_id AND w.pipeline = p.pipeline AND w.variant = p.variant AND w.target_lang = 'zh-CN' AND w.source_hash = p.source_hash AND w.protocol_version = p.protocol_version ORDER BY datetime(w.updated_at) DESC, w.id DESC LIMIT 1), 'ready') AS status, (SELECT p.payload_json FROM content_result_projections p, params x WHERE p.canonical_resource_type = x.resource_type AND p.canonical_resource_id = x.resource_id AND p.pipeline = x.pipeline AND p.variant = x.variant AND p.target_lang = 'zh-CN' AND p.protocol_version = x.protocol_version AND (p.source_hash = x.source_hash OR (EXISTS (SELECT 1 FROM content_work_items w2, params y WHERE w2.canonical_resource_type = y.resource_type AND w2.canonical_resource_id = y.resource_id AND w2.pipeline = y.pipeline AND w2.variant = y.variant AND w2.target_lang = 'zh-CN' AND w2.source_hash = y.source_hash AND w2.protocol_version = y.protocol_version))) ORDER BY CASE WHEN p.model_profile = x.model_profile AND p.source_hash = x.source_hash THEN 0 WHEN p.source_hash = x.source_hash THEN 1 ELSE 2 END, datetime(p.updated_at) DESC, p.id DESC LIMIT 1) AS payload_json, CASE WHEN EXISTS (SELECT 1 FROM content_work_items w, params p WHERE w.canonical_resource_type = p.resource_type AND w.canonical_resource_id = p.resource_id AND w.pipeline = p.pipeline AND w.variant = p.variant AND w.target_lang = 'zh-CN' AND w.source_hash = p.source_hash AND w.protocol_version = p.protocol_version) OR EXISTS (SELECT 1 FROM content_result_projections p, params x WHERE p.canonical_resource_type = x.resource_type AND p.canonical_resource_id = x.resource_id AND p.pipeline = x.pipeline AND p.variant = x.variant AND p.target_lang = 'zh-CN' AND p.protocol_version = x.protocol_version AND p.source_hash = x.source_hash) THEN 1 ELSE 0 END AS present",
+    let current = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT id, status, supersedes_work_item_id FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = 'zh-CN' AND source_hash = ? AND protocol_version = ? AND model_profile = ? ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
     )
     .bind(resource_type)
     .bind(resource_id)
@@ -1128,16 +1112,63 @@ pub async fn read_global_resource(
     .fetch_optional(&state.pool)
     .await
     .map_err(ApiError::internal)?;
-    let Some(row) = row else {
-        return Ok(None);
+    let status = if let Some((_, status, _)) = &current {
+        status.clone()
+    } else {
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = 'zh-CN' AND source_hash = ? AND protocol_version = ? ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
+        )
+        .bind(resource_type)
+        .bind(resource_id)
+        .bind(pipeline)
+        .bind(variant)
+        .bind(expected_source_hash)
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        .unwrap_or_else(|| "ready".to_owned())
     };
-    if row.get::<i64, _>("present") == 0 {
+    let exact_projection = sqlx::query_scalar::<_, String>(
+        "SELECT payload_json FROM content_result_projections WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = 'zh-CN' AND protocol_version = ? AND model_profile = ? AND source_hash = ? LIMIT 1",
+    )
+    .bind(resource_type)
+    .bind(resource_id)
+    .bind(pipeline)
+    .bind(variant)
+    .bind(GLOBAL_PROTOCOL_VERSION)
+    .bind(&model_profile)
+    .bind(expected_source_hash)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let retained_projection = if exact_projection.is_none() {
+        if let Some((_, _, Some(superseded_id))) = &current {
+            sqlx::query_scalar::<_, String>(
+                "SELECT p.payload_json FROM content_result_projections p WHERE p.canonical_resource_type = ? AND p.canonical_resource_id = ? AND p.pipeline = ? AND p.variant = ? AND p.target_lang = 'zh-CN' AND p.protocol_version = ? AND p.work_item_id = ? LIMIT 1",
+            )
+            .bind(resource_type)
+            .bind(resource_id)
+            .bind(pipeline)
+            .bind(variant)
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(superseded_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(ApiError::internal)?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let payload_json = exact_projection.or(retained_projection);
+    if current.is_none() && payload_json.is_none() {
         return Ok(None);
     }
-    let status: String = row.get("status");
-    let payload = row
-        .get::<Option<String>, _>("payload_json")
-        .and_then(|raw| serde_json::from_str(&raw).ok())
+    let payload = payload_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
         .unwrap_or_else(|| json!({}));
     Ok(Some((status, payload)))
 }
@@ -1176,6 +1207,8 @@ pub async fn retry_request(
     user_id: &str,
     request_id: &str,
 ) -> Result<(StatusCode, Value), ApiError> {
+    // Manual retry is a scheduler command, serialized through the same writer
+    // boundary as claims. The API layer delegates authorization and shaping.
     let breaker_open = provider_breaker_open(state).await;
     let (_lock, mut tx) = state
         .sqlite_writer
@@ -1598,7 +1631,13 @@ fn validate_output(
             && !source_blocks
                 .iter()
                 .any(|block| block.slot == "body_markdown" && !block.text.trim().is_empty());
-        if !body_without_source && value.as_str().is_none_or(|text| text.trim().is_empty()) {
+        if body_without_source {
+            if !value.is_null() && value.as_str().is_none_or(|text| text.trim().is_empty()) {
+                return Err(anyhow!(
+                    "global content output target slot must be null or non-empty text: {slot}"
+                ));
+            }
+        } else if value.as_str().is_none_or(|text| text.trim().is_empty()) {
             return Err(anyhow!(
                 "global content output target slot is missing text: {slot}"
             ));
@@ -1619,7 +1658,13 @@ fn validate_output(
             }
         }
     }
-    Ok(output)
+    // Persist only declared content slots. The model is not allowed to inject
+    // lifecycle, identity, or other control fields into a result projection.
+    let projection = target_slots
+        .iter()
+        .filter_map(|slot| object.get(slot).map(|value| (slot.clone(), value.clone())))
+        .collect();
+    Ok(Value::Object(projection))
 }
 
 #[derive(Debug)]
@@ -2306,6 +2351,7 @@ pub fn spawn_global_scheduler(state: Arc<AppState>) -> tokio::task::AbortHandle 
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::net::SocketAddr;
     use std::sync::Arc;
 
@@ -2342,6 +2388,12 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
+        sqlx::query(
+        "CREATE TABLE notifications (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, thread_id TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
         sqlx::raw_sql(include_str!(
             "../migrations/0078_content_processing_global_model.sql"
         ))
@@ -2468,7 +2520,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::raw_sql(
-            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, scope_user_id TEXT NOT NULL, kind TEXT NOT NULL, entity_id TEXT NOT NULL, target_lang TEXT NOT NULL, source_hash TEXT NOT NULL, result_status TEXT, status TEXT NOT NULL); CREATE TABLE ai_translations (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, lang TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL, title TEXT, summary TEXT, value TEXT NOT NULL); INSERT INTO translation_work_items VALUES ('legacy-1', 'user-1', 'release_summary', 'release-1', 'zh-CN', 'hash-1', 'ready', 'completed'); INSERT INTO ai_translations VALUES ('cache-1', 'user-1', 'release', 'release-1', 'zh-CN', 'hash-1', 'ready', 'Cached title', 'Cached summary', 'cached');",
+            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, scope_user_id TEXT NOT NULL, kind TEXT NOT NULL, entity_id TEXT NOT NULL, target_lang TEXT NOT NULL, source_hash TEXT NOT NULL, result_status TEXT, status TEXT NOT NULL); CREATE TABLE ai_translations (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, lang TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL, title TEXT, summary TEXT, value TEXT NOT NULL); CREATE TABLE notifications (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, thread_id TEXT NOT NULL); INSERT INTO translation_work_items VALUES ('legacy-1', 'user-1', 'release_summary', 'release-1', 'zh-CN', 'hash-1', 'ready', 'completed'); INSERT INTO ai_translations VALUES ('cache-1', 'user-1', 'release', 'release-1', 'zh-CN', 'hash-1', 'ready', 'Cached title', 'Cached summary', 'cached');",
         )
         .execute(&pool)
         .await
@@ -2509,6 +2561,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(new_table_count, 9);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_notifications_thread_id'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
         assert_eq!(
             sqlx::query_scalar::<_, String>(
                 "SELECT mode FROM content_processing_control WHERE id = 1",
@@ -2559,6 +2620,38 @@ mod tests {
             assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(error.code(), "content_processing_transition");
         }
+    }
+
+    #[tokio::test]
+    async fn migration_preceding_migrator_is_rejected_after_global_schema() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let current_migrations = sqlx::migrate!("./migrations");
+        let pre_cutover_migrator = sqlx::migrate::Migrator {
+            migrations: Cow::Owned(
+                current_migrations
+                    .iter()
+                    .filter(|migration| migration.version < CONTENT_PROCESSING_MIGRATION_VERSION)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: false,
+            locking: true,
+            no_tx: false,
+        };
+        let error = pre_cutover_migrator
+            .run(&pool)
+            .await
+            .expect_err("a migrator without 0078 must be rejected");
+        assert!(matches!(
+            error,
+            sqlx::migrate::MigrateError::VersionMissing(CONTENT_PROCESSING_MIGRATION_VERSION)
+        ));
     }
 
     #[test]
@@ -2720,6 +2813,31 @@ mod tests {
         )
         .expect("bodyless detail output is valid");
         assert_eq!(output["body_md"], Value::Null);
+    }
+
+    #[test]
+    fn bodyless_detail_output_rejects_non_text_body() {
+        let error = validate_output(
+            r#"{"title_zh":"标题","body_md":{}}"#,
+            &["title_zh".to_owned(), "body_md".to_owned()],
+            &[translations::TranslationSourceBlock {
+                slot: "title".to_owned(),
+                text: "Title".to_owned(),
+            }],
+        )
+        .expect_err("bodyless body must remain null or text");
+        assert!(error.to_string().contains("null or non-empty text"));
+    }
+
+    #[test]
+    fn output_validation_drops_untrusted_control_metadata() {
+        let output = validate_output(
+            r#"{"title_zh":"标题","status":"ready","work_item_id":"attacker","batch_id":"attacker"}"#,
+            &["title_zh".to_owned()],
+            &[],
+        )
+        .expect("declared output is valid");
+        assert_eq!(output, json!({"title_zh": "标题"}));
     }
 
     #[test]

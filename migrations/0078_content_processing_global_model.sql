@@ -213,3 +213,8 @@ CREATE TABLE content_legacy_observations (
 
 CREATE INDEX idx_content_legacy_observations_resource
   ON content_legacy_observations(canonical_resource_type, canonical_resource_id, pipeline);
+
+-- Global notification admission authorizes by user_id but reads a canonical
+-- source row by thread_id; keep that lookup indexed on the legacy table.
+CREATE INDEX IF NOT EXISTS idx_notifications_thread_id
+  ON notifications(thread_id);

@@ -85,6 +85,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .await
         .context("failed to open sqlite database")?;
 
+    // SQLx validates every applied migration before startup. This deliberately
+    // rejects a migration-preceding binary once 0078 has been applied.
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await

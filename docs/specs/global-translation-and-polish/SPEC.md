@@ -9,7 +9,7 @@
 ## Requirements
 
 - REQ-GTP-IDENTITY: Release、公告和通知的翻译与润色必须按 `(canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile)` 形成唯一全局工作身份。`scope_user_id`、请求者、请求模式、来源和重试触发者不得参与工作去重或结果身份。首个目标语言为 `zh-CN`；每用户模型、提示词、语言或密钥配置不属于本主题。
-- REQ-GTP-OWNERSHIP: 调度器必须是全局工作项、尝试事件和结果投影的唯一写入者。所有既有翻译或润色入口必须成为调度请求适配器，保留 `async`、`wait`、`stream` 交付语义；遗留 `sync` 入口映射为有界 `wait`，到期返回可轮询的 pending 快照。全局 worker 只能消费冻结源快照，不得使用任一请求者的 OAuth 身份或可变用户上下文；任何直接模型调用或直接终态缓存写入都不得绕过调度器。
+- REQ-GTP-OWNERSHIP: 调度器拥有全局持久化边界：授权后的请求只能通过调度器 admission/retry command 在同一 SQLite writer 事务中创建或重新排队工作项；调度 worker 是尝试事件、模型调用和结果投影的唯一写入者。所有既有翻译或润色入口必须成为调度请求适配器，保留 `async`、`wait`、`stream` 交付语义；遗留 `sync` 入口映射为有界 `wait`，到期返回可轮询的 pending 快照。全局 worker 只能消费冻结源快照，不得使用任一请求者的 OAuth 身份或可变用户上下文；任何直接模型调用或直接终态缓存写入都不得绕过调度器。
 - REQ-GTP-AUTHORIZATION: 请求者关联必须记录调用者或系统生产者、授权时刻、请求来源和关联的全局工作项。资源访问控制始终在请求、轮询、读取结果和重试时检查；全局共享不得向未获授权者暴露私有资源、输出、请求关联或诊断信息。
 - REQ-GTP-RESULTS: 只有通过输出契约和业务校验的内容可以发布为结果投影。来源更新创建新工作项并在六十秒去抖后提交；旧的已发布结果在刷新期间保持可读，直到新投影原子替换。删除的来源必须取消或抑制未完成工作，且不得发布结果。
 - REQ-GTP-CACHE-HIT: 命中与全局工作身份完全一致的当前有效结果投影时，若没有保留的当前工作项，调度器必须创建状态为 `ready`、`cache_hit=true`、尝试次数为零的全局工作项并关联请求者。该工作项只记录真实缓存命中，不得由旧事实或无效输出创建。
@@ -56,7 +56,7 @@
 ## Visual Evidence
 
 - source_type: storybook_canvas
-  story_id_or_title: Admin/AiOperationsRecordsSection/FailedResponseWithDiagnostics
+  story_id_or_title: Admin/AiOperationsRecordsSection/GlobalEvidenceOverview
   state: desktop diagnostic detail
   requested_viewport: 1440x1000
   viewport_strategy: storybook-viewport
@@ -71,7 +71,7 @@
   image: ![AI operations records desktop](./assets/ai-operations-records-desktop.png)
 
 - source_type: storybook_canvas
-  story_id_or_title: Admin/AiOperationsRecordsSection/FailedResponseWithDiagnostics
+  story_id_or_title: Admin/AiOperationsRecordsSection/GlobalEvidenceOverview
   state: mobile diagnostic detail
   requested_viewport: 393x852
   viewport_strategy: storybook-viewport

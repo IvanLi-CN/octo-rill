@@ -15,7 +15,7 @@
 
 ## Database Migration Plan
 
-当前分支最高迁移号为 `0077`。下一条迁移在实际落地时必须使用当时的下一个单调编号，并且只创建下列新表、索引和控制记录：
+当前实现使用迁移 `0078_content_processing_global_model.sql`，只创建下列新表、索引和控制记录：
 
 - `content_processing_control`：单行模式栅栏，取值为 `legacy`、`rollback_freeze` 或 `global`；记录切换代号和更新时间。它是旧新写入者共同读取的唯一切换事实。
 - `content_work_items`：包含全局身份、不可变来源快照、冻结配置指纹、优先级、调度状态、租约关联、恢复元数据和取消／替代关系。唯一索引覆盖 `REQ-GTP-IDENTITY` 的全部字段。
@@ -24,6 +24,7 @@
 - `content_request_links`：保存请求者或系统生产者、授权快照、请求来源、交付模式、关联工作项和响应事实；它是重试竞争时仍要写入的关联记录。
 - `content_attempt_events` 和 `content_attempt_llm_calls`：追加式的全局尝试和精确模型调用归因，仅保存安全元数据。
 - `content_legacy_observations`：引用旧表的原始主键和只读分类，保存 `legacy_cached` 或 `legacy_conflict` 的判定依据；不复制旧内容、不反向修改旧表。
+- `idx_notifications_thread_id`：为按全局通知线程读取 canonical source 提供 `thread_id` 前导索引；授权仍使用用户行单独校验。
 
 迁移不执行 `DROP TABLE`、表改名、数据重建、旧行 `UPDATE`、旧行 `DELETE` 或把旧数据插入全局工作／结果／尝试表。`translation_work_items`、`translation_requests`、旧尝试事件和 `ai_translations` 继续存在；应用仅把它们当作旧事实读取。
 
@@ -35,8 +36,8 @@ SQLx 默认会校验数据库中每一个已应用迁移是否存在于当前二
 
 ## Implementation Boundaries
 
-- Scheduler runtime owns claiming, batching, provider invocation, attempt events, result publication and automatic recovery.
-- API adapters own authorization, requester association and response shaping; they never directly create terminal output.
+- Scheduler runtime owns admission/retry transactions, claiming, batching, provider invocation, attempt events, result publication and automatic recovery; provider/attempt/projection writes stay behind this boundary.
+- API adapters own authorization, requester association and response shaping; they delegate admission/retry to the scheduler boundary and never directly create terminal output.
 - Source ingestion owns coverage submission; admin list and detail GETs only read.
 - Admin read model joins the global work, result and legacy observation independently, rather than inferring any one from another.
 - Web clients treat active-retry `409` and transition `503` as status synchronization outcomes, then poll the supplied link. They do not optimistically invent a local attempt.
