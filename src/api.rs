@@ -10719,6 +10719,12 @@ pub async fn publish_repo_public_release(
         ));
     }
 
+    let now = chrono::Utc::now().to_rfc3339();
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "public_release_usage_publish")
+        .await
+        .map_err(ApiError::internal)?;
     let release_count: i64 = sqlx::query_scalar(
         r#"
         SELECT COUNT(*)
@@ -10728,21 +10734,14 @@ pub async fn publish_repo_public_release(
         "#,
     )
     .bind(owned.repo_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
-    let now = chrono::Utc::now().to_rfc3339();
     let initial_status = if release_count > 0 {
         "ready"
     } else {
         "pending"
     };
-
-    let (_sqlite_write, mut tx) = state
-        .sqlite_writer
-        .begin_immediate(&state.pool, "public_release_usage_publish")
-        .await
-        .map_err(ApiError::internal)?;
     sqlx::query(
         r#"
         INSERT INTO public_repo_release_usage (
