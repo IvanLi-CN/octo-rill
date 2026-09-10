@@ -2019,7 +2019,7 @@ pub async fn submit_translation_request(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         return submit_global_translation_request(state.as_ref(), &user_id, mode, req).await;
     }
