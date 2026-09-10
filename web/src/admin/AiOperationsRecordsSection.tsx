@@ -388,10 +388,10 @@ function CollectionEmptyState({
 	const isBrief = tab === "brief";
 	const title = hasFilters
 		? "没有符合条件的记录"
-		: `当前时间范围暂无${isBrief ? "日报" : "采集记录"}`;
+		: `当前时间范围暂无${isBrief ? "日报" : tab === "notification" ? "通知" : "采集记录"}`;
 	const description = hasFilters
 		? "调整翻译、润色或尝试次数筛选后再试一次。"
-		: `扩大时间范围或稍后刷新，${isBrief ? "日报" : "采集记录"}会在有新结果时显示在这里。`;
+		: `扩大时间范围或稍后刷新，${isBrief ? "日报" : tab === "notification" ? "通知" : "采集记录"}会在有新结果时显示在这里。`;
 
 	return (
 		<div
@@ -613,7 +613,9 @@ function CollectionTable({
 		? "日报日期"
 		: tab === "release"
 			? "Release 标题"
-			: "公告标题";
+			: tab === "notification"
+				? "通知标题"
+				: "公告标题";
 	const sourceHeading = isBrief ? "生成时间" : "来源时间";
 	return (
 		<div className="hidden min-[1180px]:block">
@@ -638,7 +640,11 @@ function CollectionTable({
 								<span className="block">{sourceHeading}</span>
 								{!isBrief ? (
 									<span className="text-muted-foreground block font-mono text-xs font-medium">
-										{tab === "release" ? "发布 · 发现" : "发生 · 发现"}
+										{tab === "release"
+											? "发布 · 发现"
+											: tab === "notification"
+												? "更新 · 发现"
+												: "发生 · 发现"}
 									</span>
 								) : null}
 							</div>
@@ -754,7 +760,13 @@ function CompactRecordList({
 					</div>
 					<div className="text-muted-foreground mt-3 grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs">
 						<span>
-							{tab === "brief" ? "生成" : tab === "release" ? "发布" : "发生"}{" "}
+							{tab === "brief"
+								? "生成"
+								: tab === "release"
+									? "发布"
+									: tab === "notification"
+										? "更新"
+										: "发生"}{" "}
 							{formatDateTime(recordTime(item), "未记录")}
 						</span>
 						{tab !== "brief" ? (
@@ -898,7 +910,7 @@ function RecordDetail({
 				<p className="text-muted-foreground text-xs">
 					{record.kind === "brief"
 						? `生成：${formatDateTime(record.generated_at, "历史未记录")}`
-						: `${record.kind === "release" ? "发布" : "发生"}：${formatDateTime(record.occurred_at, "未记录")} · 发现：${formatDateTime(record.detected_at, "未知")}`}
+						: `${record.kind === "release" ? "发布" : record.kind === "notification" ? "更新" : "发生"}：${formatDateTime(record.occurred_at, "未记录")} · 发现：${formatDateTime(record.detected_at, "未知")}`}
 				</p>
 			</div>
 			{record.translation ? (
@@ -1295,12 +1307,15 @@ export function AiOperationsRecordsSection({
 								commitFilters({ kind: nextTab });
 							}}
 						>
-							<TabsList className="grid w-full grid-cols-3 sm:inline-grid sm:w-fit">
+							<TabsList className="grid w-full grid-cols-4 sm:inline-grid sm:w-fit">
 								<TabsTrigger className="sm:min-w-24" value="release">
 									Release
 								</TabsTrigger>
 								<TabsTrigger className="sm:min-w-24" value="announcement">
 									公告
+								</TabsTrigger>
+								<TabsTrigger className="sm:min-w-24" value="notification">
+									通知
 								</TabsTrigger>
 								<TabsTrigger className="sm:min-w-24" value="brief">
 									日报

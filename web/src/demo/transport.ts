@@ -498,6 +498,19 @@ function demoCollectionRecords() {
 				polish: pending,
 			},
 		],
+		notification: [
+			{
+				id: "github-thread-42",
+				kind: "notification",
+				repository: "octo-demo/release-lab",
+				title: "Issue #42 有新活动",
+				occurred_at: "2026-07-08T08:20:00+08:00",
+				detected_at: "2026-07-08T08:21:00+08:00",
+				generated_at: null,
+				translation: completed,
+				polish: pending,
+			},
+		],
 		brief: [
 			{
 				id: "brief-demo-2026-07-08",
@@ -2219,7 +2232,12 @@ export const demoHandlers = [
 		const network = await applyNetworkProfile(request);
 		if (network) return network;
 		const kind = String(params.kind);
-		if (kind !== "release" && kind !== "announcement" && kind !== "brief") {
+		if (
+			kind !== "release" &&
+			kind !== "announcement" &&
+			kind !== "notification" &&
+			kind !== "brief"
+		) {
 			return badRequest("invalid collection record kind");
 		}
 		const url = new URL(request.url);
@@ -2283,7 +2301,12 @@ export const demoHandlers = [
 			const network = await applyNetworkProfile(request);
 			if (network) return network;
 			const kind = String(params.kind);
-			if (kind !== "release" && kind !== "announcement" && kind !== "brief") {
+			if (
+				kind !== "release" &&
+				kind !== "announcement" &&
+				kind !== "notification" &&
+				kind !== "brief"
+			) {
 				return badRequest("invalid collection record kind");
 			}
 			const detail = demoCollectionDetail(kind, String(params.recordId));

@@ -109,7 +109,7 @@ export function AdminJobsRoutePage(props: {
 	taskId?: string;
 	llmCallId?: string;
 	subscriptionDetailTaskId?: string;
-	aiRecordKind?: "release" | "announcement" | "brief";
+	aiRecordKind?: "release" | "announcement" | "notification" | "brief";
 	aiRecordId?: string;
 	aiRecordAttemptId?: string;
 	aiRecordLlmCallId?: string;
