@@ -39,6 +39,11 @@ impl ApiError {
         self.code
     }
 
+    #[cfg(test)]
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
     pub fn failure_class(&self) -> Option<&'static str> {
         self.failure_class
     }

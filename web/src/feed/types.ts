@@ -206,7 +206,19 @@ export type TranslateResponse = {
 export type TranslateBatchItem = {
 	id: string;
 	lang: string;
-	status: "ready" | "disabled" | "missing" | "error" | "processing";
+	status:
+		| "ready"
+		| "disabled"
+		| "missing"
+		| "error"
+		| "processing"
+		| "queued"
+		| "running"
+		| "deferred_provider"
+		| "blocked_config"
+		| "not_applicable"
+		| "cancelled"
+		| "superseded";
 	title: string | null;
 	summary: string | null;
 	error: string | null;

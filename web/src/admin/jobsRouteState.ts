@@ -36,6 +36,13 @@ export const AI_RECORD_STATUS_VALUES = [
 	"missing",
 	"disabled",
 	"historical_unknown",
+	"legacy_cached",
+	"legacy_conflict",
+	"deferred_provider",
+	"blocked_config",
+	"cancelled",
+	"superseded",
+	"not_applicable",
 ] as const;
 export type AiRecordStatus = (typeof AI_RECORD_STATUS_VALUES)[number];
 export type AiRecordTimePreset = "24h" | "7d" | "30d" | "custom";
