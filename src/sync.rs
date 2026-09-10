@@ -25,7 +25,8 @@ use sqlx::{QueryBuilder, Row, Sqlite};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex, task::JoinSet};
 
 use crate::{
-    admin_runtime, jobs, local_id, runtime, sqlite_write::SqliteWritePriority, state::AppState,
+    admin_runtime, content_processing, jobs, local_id, runtime, sqlite_write::SqliteWritePriority,
+    state::AppState, translations,
 };
 
 const REST_API_BASE: &str = "https://api.github.com";
@@ -2134,6 +2135,7 @@ pub async fn sync_social_activity(
         }
     };
     events += insert_feed_activity_events(state, user_id, feed_events.as_slice()).await?;
+    enqueue_global_announcement_work(state, user_id, feed_events.as_slice()).await;
 
     Ok(SyncSocialActivityResult {
         repo_stars: repo_collection.repo_stars,
@@ -2146,6 +2148,52 @@ pub async fn sync_social_activity(
             .collect(),
         source_errors,
     })
+}
+
+async fn enqueue_global_announcement_work(
+    state: &AppState,
+    user_id: &str,
+    events: &[FeedActivityEventSnapshot],
+) {
+    if content_processing::current_mode(&state.pool).await.ok()
+        != Some(content_processing::ContentProcessingMode::Global)
+    {
+        return;
+    }
+    for event in events.iter().filter(|event| event.kind == "announcement") {
+        let (Some(repo), Some(number)) = (event.repo_full_name.as_deref(), event.discussion_number)
+        else {
+            continue;
+        };
+        let entity_id = crate::api::announcement_discussion_key(repo, number);
+        for (kind, variant) in [
+            ("announcement_detail", "detail"),
+            ("announcement_smart", "smart"),
+        ] {
+            let item = translations::TranslationRequestItemInput {
+                producer_ref: format!("sync.global.announcement:{entity_id}:{variant}"),
+                kind: kind.to_owned(),
+                variant: variant.to_owned(),
+                entity_id: entity_id.clone(),
+                target_lang: "zh-CN".to_owned(),
+                max_wait_ms: 0,
+                source_blocks: Vec::new(),
+                target_slots: Vec::new(),
+            };
+            match crate::api::canonical_global_translation_item(state, user_id, &item).await {
+                Ok(canonical) => {
+                    if let Err(error) =
+                        content_processing::submit_item(state, user_id, "async", &canonical).await
+                    {
+                        tracing::warn!(?error, user_id, %entity_id, kind, "sync: enqueue global announcement processing failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(?error, user_id, %entity_id, kind, "sync: resolve global announcement source failed");
+                }
+            }
+        }
+    }
 }
 
 pub async fn sync_social_activity_best_effort(
@@ -12530,6 +12578,7 @@ where
         }
         notifications += res.len();
         upsert_notifications(state, user_id, &res, &sync_started_at).await?;
+        enqueue_global_notification_work(state, user_id, &res).await;
         if res.len() < GITHUB_NOTIFICATIONS_PAGE_SIZE {
             break;
         }
@@ -12559,6 +12608,44 @@ where
         notifications,
         since,
     })
+}
+
+async fn enqueue_global_notification_work(
+    state: &AppState,
+    user_id: &str,
+    notifications: &[GitHubNotification],
+) {
+    if content_processing::current_mode(&state.pool).await.ok()
+        != Some(content_processing::ContentProcessingMode::Global)
+    {
+        return;
+    }
+    for notification in notifications {
+        for (kind, variant) in [("notification", "shared"), ("notification_smart", "smart")] {
+            let item = translations::TranslationRequestItemInput {
+                producer_ref: format!("sync.global.notification:{}:{variant}", notification.id),
+                kind: kind.to_owned(),
+                variant: variant.to_owned(),
+                entity_id: notification.id.clone(),
+                target_lang: "zh-CN".to_owned(),
+                max_wait_ms: 0,
+                source_blocks: Vec::new(),
+                target_slots: Vec::new(),
+            };
+            match crate::api::canonical_global_translation_item(state, user_id, &item).await {
+                Ok(canonical) => {
+                    if let Err(error) =
+                        content_processing::submit_item(state, user_id, "async", &canonical).await
+                    {
+                        tracing::warn!(?error, user_id, notification_id = %notification.id, kind, "sync: enqueue global notification processing failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(?error, user_id, notification_id = %notification.id, kind, "sync: resolve global notification source failed");
+                }
+            }
+        }
+    }
 }
 
 async fn upsert_notifications(

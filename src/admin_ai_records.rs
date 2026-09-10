@@ -635,8 +635,8 @@ async fn load_global_task_rows(
         }
     }
     query.push(")");
-    query.push(" AND ((pipeline = 'translation' AND variant = 'detail') OR (pipeline = 'polishing' AND variant = 'smart'))");
-    query.push(" ORDER BY CASE status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'ready' THEN 3 WHEN 'failed' THEN 4 WHEN 'superseded' THEN 9 ELSE 5 END, datetime(updated_at) DESC, id DESC");
+    query.push(" AND ((pipeline = 'translation' AND variant IN ('detail', 'summary')) OR (pipeline = 'polishing' AND variant = 'smart'))");
+    query.push(" ORDER BY CASE status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'ready' THEN 3 WHEN 'failed' THEN 4 WHEN 'superseded' THEN 9 ELSE 5 END, CASE WHEN pipeline = 'translation' AND variant = 'detail' THEN 0 ELSE 1 END, julianday(updated_at) DESC, updated_at DESC, id DESC");
     let rows = match query
         .build_query_as::<GlobalTaskRow>()
         .fetch_all(&state.pool)
@@ -880,7 +880,24 @@ async fn load_task_summaries(
             let (translation, polish) = grouped.remove(id).unwrap_or_default();
             let translation_summary = global_by_key
                 .get(&(id.clone(), "translation".to_owned()))
-                .map(|row| global_summary(row))
+                .map(|row| {
+                    let mut summary = global_summary(row);
+                    if !translation.is_empty()
+                        || legacy_cache.contains(&(id.clone(), "translation".to_owned()))
+                    {
+                        summary.legacy_evidence = Some(AdminContentProcessingEvidence {
+                            status: if translation.is_empty() {
+                                "legacy_cached"
+                            } else {
+                                "legacy_conflict"
+                            }
+                            .to_owned(),
+                            status_origin: "legacy_evidence".to_owned(),
+                            ..Default::default()
+                        });
+                    }
+                    summary
+                })
                 .or_else(|| {
                     if global_mode && !translation.is_empty() {
                         return Some(legacy_conflict_summary());
@@ -902,7 +919,24 @@ async fn load_task_summaries(
                 });
             let polish_summary = global_by_key
                 .get(&(id.clone(), "polish".to_owned()))
-                .map(|row| global_summary(row))
+                .map(|row| {
+                    let mut summary = global_summary(row);
+                    if !polish.is_empty()
+                        || legacy_cache.contains(&(id.clone(), "polish".to_owned()))
+                    {
+                        summary.legacy_evidence = Some(AdminContentProcessingEvidence {
+                            status: if polish.is_empty() {
+                                "legacy_cached"
+                            } else {
+                                "legacy_conflict"
+                            }
+                            .to_owned(),
+                            status_origin: "legacy_evidence".to_owned(),
+                            ..Default::default()
+                        });
+                    }
+                    summary
+                })
                 .or_else(|| {
                     if global_mode && !polish.is_empty() {
                         return Some(legacy_conflict_summary());

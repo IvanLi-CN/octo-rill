@@ -497,6 +497,25 @@ function TaskSummaryHeader({ label }: { label: string }) {
 	);
 }
 
+function EvidenceLines({ summary }: { summary: AdminCollectionTaskSummary }) {
+	const entries = [
+		["全局工作", summary.global_work],
+		["结果投影", summary.result_projection],
+		["旧事实", summary.legacy_evidence],
+	] as const;
+	return entries.some(([, evidence]) => evidence) ? (
+		<div className="space-y-0.5 text-[11px] text-muted-foreground">
+			{entries.map(([label, evidence]) =>
+				evidence ? (
+					<span key={label} className="block truncate">
+						{label}：{evidence.status}
+					</span>
+				) : null,
+			)}
+		</div>
+	) : null;
+}
+
 function TaskSummaryCell({ summary }: { summary: AdminCollectionTaskSummary }) {
 	return (
 		<TableCell className="whitespace-normal">
@@ -512,6 +531,7 @@ function TaskSummaryCell({ summary }: { summary: AdminCollectionTaskSummary }) {
 					<span>{formatDateTime(summary.last_attempt_at, "未尝试")}</span>
 					<span>{formatDateTime(summary.finished_at, "未完成")}</span>
 				</div>
+				<EvidenceLines summary={summary} />
 			</div>
 		</TableCell>
 	);
@@ -705,6 +725,7 @@ function CompactTask({
 				重试 {summary.retry_count} · 上次{" "}
 				{formatDateTime(summary.last_attempt_at, "未尝试")}
 			</p>
+			<EvidenceLines summary={summary} />
 		</div>
 	);
 }
@@ -775,6 +796,7 @@ function ProcessingSummary({
 				</span>
 				<span>完成 {formatDateTime(summary.finished_at, "未完成")}</span>
 			</div>
+			<EvidenceLines summary={summary} />
 		</div>
 	);
 }
