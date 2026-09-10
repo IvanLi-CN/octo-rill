@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
@@ -195,6 +201,64 @@ pub async fn transition_to_global_state(state: &AppState, switch_token: &str) ->
     Ok(changed)
 }
 
+pub async fn transition_to_rollback_freeze_state(
+    state: &AppState,
+    switch_token: &str,
+) -> Result<bool> {
+    let (_lock, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "content_processing_freeze")
+        .await
+        .context("failed to begin serialized content freeze")?;
+    let changed = transition_to_rollback_freeze_in_transaction(&mut tx, switch_token).await?;
+    tx.commit()
+        .await
+        .context("failed to commit content freeze")?;
+    Ok(changed)
+}
+
+async fn transition_to_rollback_freeze_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    switch_token: &str,
+) -> Result<bool> {
+    let mode =
+        sqlx::query_scalar::<_, String>("SELECT mode FROM content_processing_control WHERE id = 1")
+            .fetch_optional(&mut **tx)
+            .await?;
+    if mode.as_deref() != Some(ContentProcessingMode::Legacy.as_str()) {
+        return Ok(false);
+    }
+    for table in ["translation_batches", "translation_work_items"] {
+        let table_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(&mut **tx)
+        .await?
+            > 0;
+        if table_exists {
+            let active = sqlx::query_scalar::<_, i64>(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE status NOT IN ('completed', 'failed')"
+            ))
+            .fetch_one(&mut **tx)
+            .await?;
+            if active > 0 {
+                return Ok(false);
+            }
+        }
+    }
+    let changed = sqlx::query(
+        "UPDATE content_processing_control SET mode = 'rollback_freeze', switch_token = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND mode = 'legacy'",
+    )
+    .bind(switch_token)
+    .execute(&mut **tx)
+    .await
+    .context("failed to transition content processing into freeze")?
+    .rows_affected()
+        == 1;
+    Ok(changed)
+}
+
 async fn transition_to_global_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     switch_token: &str,
@@ -294,6 +358,29 @@ pub async fn admin_cutover(
         StatusCode::CONFLICT,
         "content_processing_cutover_not_ready",
         "content processing must be in rollback_freeze before cutover",
+    ))
+}
+
+pub async fn admin_freeze(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(request): Json<CutoverRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let _ = api::require_admin_user_id(state.as_ref(), &session).await?;
+    let switch_token = request.switch_token.trim();
+    if switch_token.is_empty() {
+        return Err(ApiError::bad_request("switch_token is required"));
+    }
+    if transition_to_rollback_freeze_state(state.as_ref(), switch_token)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        return Ok((StatusCode::OK, Json(json!({"mode": "rollback_freeze"}))));
+    }
+    Err(ApiError::new(
+        StatusCode::CONFLICT,
+        "content_processing_freeze_not_ready",
+        "content processing must be in legacy mode with no active legacy batches before freeze",
     ))
 }
 
@@ -1046,9 +1133,11 @@ pub async fn retry_request(
     };
     let next_retry_at = breaker_open
         .then(|| (Utc::now() + chrono::Duration::seconds(PROVIDER_DEFER_SECS)).to_rfc3339());
-    sqlx::query("UPDATE content_work_items SET status = ?, priority = 3, next_retry_at = ?, retry_after_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    let retry_expires_at = (Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+    sqlx::query("UPDATE content_work_items SET status = ?, priority = 3, next_retry_at = ?, retry_expires_at = ?, retry_after_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(retry_status)
         .bind(&next_retry_at)
+        .bind(&retry_expires_at)
         .bind(&row.id)
         .execute(&mut *tx)
         .await
@@ -1063,6 +1152,16 @@ pub async fn retry_request(
     )
     .await
     .map_err(ApiError::internal)?;
+    sqlx::query("INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, next_retry_at, created_at) VALUES (?, ?, CASE WHEN ? < 1 THEN 1 ELSE ? + 1 END, 'manual_retry', 'attempt_queued', ?, 1, ?, CURRENT_TIMESTAMP)")
+        .bind(local_id::generate_local_id().to_string())
+        .bind(&row.id)
+        .bind(row.attempt_count)
+        .bind(row.attempt_count)
+        .bind(retry_status)
+        .bind(&next_retry_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
     tx.commit().await.map_err(ApiError::internal)?;
     let mut body = public_response(&row, &request_id, projection);
     body["status"] = Value::String(retry_status.to_owned());
@@ -1174,6 +1273,13 @@ async fn recover_due(state: &AppState) -> Result<()> {
     .bind(&now)
     .execute(&mut *tx)
     .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, failure_class, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), id, CASE WHEN attempt_count < 1 THEN 1 ELSE attempt_count END, 'automatic_recovery', 'attempt_completed', 'failed', 'provider_unavailable', 'provider_unavailable', 0, ? FROM content_work_items WHERE status = 'failed' AND failure_class = 'provider_unavailable' AND next_retry_at IS NULL AND retry_expires_at IS NULL AND updated_at = ?",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
     let expired_running = "status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(?)";
     sqlx::query(&format!(
         "UPDATE content_batch_items SET result_status = 'failed', error_code = 'runtime_lease_expired', updated_at = ? WHERE work_item_id IN (SELECT id FROM content_work_items WHERE {expired_running}) AND batch_id IN (SELECT batch_id FROM content_work_items WHERE {expired_running} AND batch_id IS NOT NULL)"
@@ -1242,6 +1348,11 @@ async fn defer_queued_for_provider(state: &AppState) -> Result<()> {
     sqlx::query("UPDATE content_work_items SET status = 'deferred_provider', next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), updated_at = CURRENT_TIMESTAMP WHERE status = 'queued'")
         .bind(&retry_at)
         .bind((Utc::now() + chrono::Duration::hours(24)).to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, next_retry_at, created_at) SELECT lower(hex(randomblob(16))), id, CASE WHEN attempt_count < 1 THEN 1 ELSE attempt_count END, 'system_requeue', 'attempt_queued', 'deferred_provider', 1, ?, CURRENT_TIMESTAMP FROM content_work_items WHERE status = 'deferred_provider' AND next_retry_at = ?")
+        .bind(&retry_at)
+        .bind(&retry_at)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -1355,7 +1466,7 @@ async fn supersede_replaced_work_in_transaction(
     work: &WorkRow,
 ) -> Result<bool> {
     let replaced = sqlx::query_scalar::<_, i64>(
-        "SELECT EXISTS (SELECT 1 FROM content_work_items newer WHERE newer.id <> ? AND newer.canonical_resource_type = ? AND newer.canonical_resource_id = ? AND newer.pipeline = ? AND newer.variant = ? AND newer.target_lang = ? AND newer.protocol_version = ? AND datetime(newer.created_at) > datetime(?) AND newer.status NOT IN ('cancelled', 'superseded'))",
+        "SELECT EXISTS (SELECT 1 FROM content_work_items newer WHERE newer.id <> ? AND newer.canonical_resource_type = ? AND newer.canonical_resource_id = ? AND newer.pipeline = ? AND newer.variant = ? AND newer.target_lang = ? AND newer.protocol_version = ? AND julianday(newer.created_at) > julianday(?) AND newer.status NOT IN ('cancelled', 'superseded'))",
     )
     .bind(&work.id)
     .bind(&work.canonical_resource_type)
@@ -1831,6 +1942,7 @@ pub fn spawn_global_scheduler(state: Arc<AppState>) -> tokio::task::AbortHandle 
     tokio::spawn(async move {
         let mut workers = JoinSet::new();
         let mut worker_count = 0usize;
+        let desired_workers = Arc::new(AtomicUsize::new(0));
         loop {
             let desired = state
                 .translation_scheduler
@@ -1838,13 +1950,20 @@ pub fn spawn_global_scheduler(state: Arc<AppState>) -> tokio::task::AbortHandle 
                 .await
                 .general_worker_concurrency
                 .max(1);
-            if desired != worker_count {
-                workers.abort_all();
-                while workers.join_next().await.is_some() {}
-                for _ in 0..desired {
+            desired_workers.store(desired, Ordering::Release);
+            while workers.try_join_next().is_some() {
+                worker_count = worker_count.saturating_sub(1);
+            }
+            if desired > worker_count {
+                let first_new_worker = worker_count;
+                for worker_index in first_new_worker..desired {
                     let worker_state = state.clone();
+                    let worker_target = desired_workers.clone();
                     workers.spawn(async move {
                         loop {
+                            if worker_index >= worker_target.load(Ordering::Acquire) {
+                                break;
+                            }
                             if let Err(error) = run_once(worker_state.as_ref()).await {
                                 warn!(?error, "global content processing scheduler failed");
                             }
@@ -1896,6 +2015,29 @@ mod tests {
             ContentProcessingMode::Global
         );
         assert!(!transition_to_global(&pool, "cutover-2").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn legacy_mode_can_enter_the_controlled_freeze_window() {
+        let pool = pool("legacy").await;
+        let mut tx = pool.begin().await.unwrap();
+        assert!(
+            transition_to_rollback_freeze_in_transaction(&mut tx, "freeze-1")
+                .await
+                .unwrap()
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(
+            current_mode(&pool).await.unwrap(),
+            ContentProcessingMode::RollbackFreeze
+        );
+        let mut tx = pool.begin().await.unwrap();
+        assert!(
+            !transition_to_rollback_freeze_in_transaction(&mut tx, "freeze-2")
+                .await
+                .unwrap()
+        );
+        tx.rollback().await.unwrap();
     }
 
     #[tokio::test]

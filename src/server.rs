@@ -370,6 +370,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             post(content_processing::admin_cutover),
         )
         .route(
+            "/admin/jobs/content-processing/freeze",
+            post(content_processing::admin_freeze),
+        )
+        .route(
             "/admin/jobs/translations/requests",
             get(translations::admin_list_translation_requests),
         )

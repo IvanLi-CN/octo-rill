@@ -42,6 +42,8 @@ During `rollback_freeze`, every content-processing submission returns `503 Servi
 
 The operational cutover endpoint `POST /api/admin/jobs/content-processing/cutover` accepts `{ "switch_token": "..." }`. It performs the single `rollback_freeze -> global` transaction and returns `409 content_processing_cutover_not_ready` for any other current mode.
 
+The operational freeze endpoint `POST /api/admin/jobs/content-processing/freeze` accepts the same payload. It performs the serialized `legacy -> rollback_freeze` transition only after legacy batches have reached a terminal state, and returns `409 content_processing_freeze_not_ready` otherwise. This is the compatibility release's controlled handoff into the PR-2 cutover window.
+
 ## Read Semantics
 
 - Public and authenticated resource reads return only the current validated result projection when the caller is authorized for the canonical resource. A prior projection may remain present while its newer work is `queued` or `running`.
