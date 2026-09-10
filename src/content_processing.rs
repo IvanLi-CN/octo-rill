@@ -1224,6 +1224,15 @@ pub async fn read_global_resource(
     if current.is_none() && payload_json.is_none() {
         return Ok(None);
     }
+    let status = if payload_json.is_some()
+        && matches!(
+            status.as_str(),
+            "failed" | "cancelled" | "superseded" | "not_applicable" | "blocked_config"
+        ) {
+        "ready".to_owned()
+    } else {
+        status
+    };
     let payload = payload_json
         .as_deref()
         .and_then(|raw| serde_json::from_str(raw).ok())
