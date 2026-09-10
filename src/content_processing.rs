@@ -1565,7 +1565,7 @@ fn validate_output(
                 "global content output target slot is missing text: {slot}"
             ));
         }
-        if matches!(slot.as_str(), "summary_md" | "body_md")
+        if slot == "body_md"
             && let Some(source) = source_blocks
                 .iter()
                 .find(|block| block.slot == "body_markdown")
@@ -1582,6 +1582,26 @@ fn validate_output(
         }
     }
     Ok(output)
+}
+
+#[derive(Debug)]
+struct OutputValidationFailure {
+    call_id: Option<String>,
+    message: String,
+}
+
+impl std::fmt::Display for OutputValidationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for OutputValidationFailure {}
+
+fn output_validation_call_id(error: &anyhow::Error) -> Option<String> {
+    error
+        .downcast_ref::<OutputValidationFailure>()
+        .and_then(|failure| failure.call_id.clone())
 }
 
 async fn source_exists(state: &AppState, work: &WorkRow) -> Result<bool> {
@@ -1905,12 +1925,19 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
     })
     .and_then(|result| result)
     .and_then(|diagnostic| {
+        let call_id = diagnostic.call_id.clone();
         validate_output(
             &diagnostic.content,
             &snapshot.target_slots,
             &snapshot.source_blocks,
         )
         .map(|output| (diagnostic, output))
+        .map_err(|error| {
+            anyhow::Error::new(OutputValidationFailure {
+                call_id,
+                message: error.to_string(),
+            })
+        })
     });
     let now = Utc::now().to_rfc3339();
     let (_lock, mut tx) = state
@@ -1984,7 +2011,9 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .as_ref()
                 .and_then(|(_, _, _, _, output_tokens)| *output_tokens)
                 .or(diagnostic.output_tokens);
-            sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, created_at) VALUES (?, ?, ?, ?, 'succeeded', ?, ?, ?, ?)")
+            // Provider pricing is not part of the existing llm_calls contract; persist an explicit
+            // unknown cost instead of deriving a value from model names or token counts.
+            sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, cost_microunits, created_at) VALUES (?, ?, ?, ?, 'succeeded', ?, ?, ?, ?, ?)")
                 .bind(diagnostic.call_id.clone().unwrap_or_else(|| local_id::generate_local_id().to_string()))
                 .bind(&attempt_event_id)
                 .bind(provider_call_id)
@@ -1992,6 +2021,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(duration_ms)
                 .bind(input_tokens)
                 .bind(output_tokens)
+                .bind(Option::<i64>::None)
                 .bind(&now)
                 .execute(&mut *tx)
                 .await?;
@@ -1999,10 +2029,11 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 (Some(input), Some(output)) => Some(input.saturating_add(output)),
                 _ => None,
             };
-            sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, duration_ms, token_count, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'ready', 0, ?, ?, ? FROM content_attempt_events WHERE id = ?")
+            sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, duration_ms, token_count, cost_microunits, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'ready', 0, ?, ?, ?, ? FROM content_attempt_events WHERE id = ?")
                 .bind(local_id::generate_local_id().to_string())
                 .bind(duration_ms)
                 .bind(token_count)
+                .bind(Option::<i64>::None)
                 .bind(&now)
                 .bind(&attempt_event_id)
                 .execute(&mut *tx)
@@ -2046,13 +2077,18 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
         Err(error) => {
             let error_text = error.to_string();
             let llm_class = ai::llm_failure_class(&error);
-            let class = llm_class
-                .map(|value| value.as_str().to_owned())
-                .or_else(|| {
-                    translations::classify_translation_error(Some(error_text.as_str()))
-                        .map(|value| value.code.to_owned())
-                })
-                .unwrap_or_else(|| "unknown_internal_error".to_owned());
+            let output_validation_failed = output_validation_call_id(&error).is_some();
+            let class = if output_validation_failed {
+                "output_contract_invalid".to_owned()
+            } else {
+                llm_class
+                    .map(|value| value.as_str().to_owned())
+                    .or_else(|| {
+                        translations::classify_translation_error(Some(error_text.as_str()))
+                            .map(|value| value.code.to_owned())
+                    })
+                    .unwrap_or_else(|| "unknown_internal_error".to_owned())
+            };
             let retryable = llm_class.is_some_and(ai::LlmFailureClass::is_recoverable)
                 || class == "output_contract_invalid";
             let now = Utc::now();
@@ -2074,7 +2110,8 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             .fetch_one(&mut *tx)
             .await?;
             let error_summary = translations::translation_error_summary(Some(error_text.as_str()));
-            let linked_call_id = ai::llm_call_id(&error);
+            let linked_call_id =
+                ai::llm_call_id(&error).or_else(|| output_validation_call_id(&error));
             let linked_call_audit = if let Some(call_id) = linked_call_id.as_deref() {
                 sqlx::query_as::<_, (Option<String>, String, Option<i64>, Option<i64>, Option<i64>)>(
                     "SELECT provider_request_id, COALESCE(final_model, model), duration_ms, input_tokens, output_tokens FROM llm_calls WHERE id = ? LIMIT 1",
@@ -2085,7 +2122,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             } else {
                 None
             };
-            sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, error_code, error_summary, created_at) VALUES (?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?)")
+            sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, cost_microunits, error_code, error_summary, created_at) VALUES (?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?)")
                 .bind(linked_call_id.unwrap_or_else(|| local_id::generate_local_id().to_string()))
                 .bind(&attempt_event_id)
                 .bind(linked_call_audit.as_ref().and_then(|(provider_id, _, _, _, _)| provider_id.as_deref()).unwrap_or("unknown"))
@@ -2093,6 +2130,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(linked_call_audit.as_ref().and_then(|(_, _, duration_ms, _, _)| *duration_ms))
                 .bind(linked_call_audit.as_ref().and_then(|(_, _, _, input_tokens, _)| *input_tokens))
                 .bind(linked_call_audit.as_ref().and_then(|(_, _, _, _, output_tokens)| *output_tokens))
+                .bind(Option::<i64>::None)
                 .bind(&class)
                 .bind(error_summary.as_deref())
                 .bind(now_text.as_str())
@@ -2127,7 +2165,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 (Some(input), Some(output)) => Some(input.saturating_add(output)),
                 _ => None,
             };
-            sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, next_retry_at, duration_ms, token_count, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'failed', ?, ?, ?, ?, ?, ?, ?, ?, ? FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started'")
+            sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, next_retry_at, duration_ms, token_count, cost_microunits, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'failed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started'")
                 .bind(local_id::generate_local_id().to_string())
                 .bind(&class)
                 .bind(error_summary)
@@ -2136,6 +2174,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(&next_retry)
                 .bind(linked_call_audit.as_ref().and_then(|(_, _, duration_ms, _, _)| *duration_ms))
                 .bind(token_count)
+                .bind(Option::<i64>::None)
                 .bind(now_text.as_str())
                 .bind(&work.id)
                 .bind(work.attempt_count)
@@ -2641,8 +2680,8 @@ mod tests {
     #[test]
     fn output_validation_rejects_markdown_structure_loss() {
         let error = validate_output(
-            r#"{"summary_md":"plain text"}"#,
-            &["summary_md".to_owned()],
+            r#"{"body_md":"plain text"}"#,
+            &["body_md".to_owned()],
             &[translations::TranslationSourceBlock {
                 slot: "body_markdown".to_owned(),
                 text: "- one\n- two".to_owned(),

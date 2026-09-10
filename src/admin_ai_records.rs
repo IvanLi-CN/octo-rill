@@ -1,4 +1,8 @@
-use std::{cmp::Ordering, collections::HashMap, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use axum::{
     Json,
@@ -644,7 +648,7 @@ async fn load_global_task_rows(
         }
     }
     query.push(")");
-    query.push(" AND ((pipeline = 'translation' AND variant IN ('detail', 'summary')) OR (pipeline = 'polishing' AND variant = 'smart'))");
+    query.push(" AND ((pipeline = 'translation' AND variant IN ('detail', 'summary', 'shared')) OR (pipeline = 'polishing' AND variant = 'smart'))");
     query.push(" ORDER BY julianday(created_at) DESC, created_at DESC, CASE status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'ready' THEN 3 WHEN 'failed' THEN 4 WHEN 'superseded' THEN 9 ELSE 5 END, CASE WHEN pipeline = 'translation' AND variant = 'detail' THEN 0 ELSE 1 END, julianday(updated_at) DESC, updated_at DESC, id DESC");
     let rows = match query
         .build_query_as::<GlobalTaskRow>()
@@ -790,12 +794,44 @@ async fn load_legacy_observations(
         Err(error) if missing_table(&error) => return Ok(HashMap::new()),
         Err(error) => return Err(ApiError::internal(error)),
     };
+    let mut paired_history = HashSet::new();
+    let mut source_by_key = HashMap::<(String, String, String), HashSet<String>>::new();
+    for row in &rows {
+        let (Some(entity_id), Some(pipeline)) =
+            (row.canonical_resource_id.clone(), row.pipeline.clone())
+        else {
+            continue;
+        };
+        let Some(source_hash) =
+            serde_json::from_str::<serde_json::Value>(&row.observation_basis_json)
+                .ok()
+                .and_then(|basis| {
+                    basis
+                        .get("source_hash")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                })
+        else {
+            continue;
+        };
+        let key = (entity_id, pipeline, source_hash);
+        source_by_key
+            .entry(key)
+            .or_default()
+            .insert(row.legacy_table.clone());
+    }
+    for (key, sources) in source_by_key {
+        if sources.contains("ai_translations") && sources.contains("translation_work_items") {
+            paired_history.insert(key);
+        }
+    }
+
     let mut observations = HashMap::new();
     for row in rows {
         let (Some(entity_id), Some(pipeline)) = (row.canonical_resource_id, row.pipeline) else {
             continue;
         };
-        let key = (entity_id, pipeline);
+        let key = (entity_id.clone(), pipeline.clone());
         let source_hash = serde_json::from_str::<serde_json::Value>(&row.observation_basis_json)
             .ok()
             .and_then(|basis| {
@@ -804,6 +840,15 @@ async fn load_legacy_observations(
                     .and_then(|value| value.as_str())
                     .map(ToOwned::to_owned)
             });
+        if let Some(source_hash) = source_hash.as_deref()
+            && paired_history.contains(&(
+                entity_id.clone(),
+                pipeline.clone(),
+                source_hash.to_owned(),
+            ))
+        {
+            continue;
+        }
         let candidate = AdminContentProcessingEvidence {
             status: row.classification,
             status_origin: "legacy_evidence".to_owned(),
