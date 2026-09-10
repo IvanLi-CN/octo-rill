@@ -1206,6 +1206,16 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
     };
     let batch_id = local_id::generate_local_id().to_string();
     let attempt_id = local_id::generate_local_id().to_string();
+    let previous_attempt_no = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MAX(attempt_no) FROM content_attempt_events WHERE work_item_id = ?",
+    )
+    .bind(&row.id)
+    .fetch_one(&mut *tx)
+    .await?
+    .unwrap_or(row.attempt_count)
+    .max(row.attempt_count)
+    .max(0);
+    let next_attempt_no = previous_attempt_no.saturating_add(1);
     let now = Utc::now().to_rfc3339();
     let lease_expires_at = (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
     let trigger_reason = if row.priority >= 3 {
@@ -1236,8 +1246,9 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
         .bind(&now)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE content_work_items SET status = 'running', batch_id = ?, attempt_count = attempt_count + 1, started_at = ?, lease_owner = 'content-general-1', lease_expires_at = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE content_work_items SET status = 'running', batch_id = ?, attempt_count = ?, started_at = ?, lease_owner = 'content-general-1', lease_expires_at = ?, updated_at = ? WHERE id = ?")
         .bind(&batch_id)
+        .bind(next_attempt_no)
         .bind(&now)
         .bind(&lease_expires_at)
         .bind(&now)
@@ -1247,7 +1258,7 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
     sqlx::query("INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, created_at) VALUES (?, ?, ?, ?, 'attempt_started', ?)")
         .bind(&attempt_id)
         .bind(&row.id)
-        .bind(row.attempt_count + 1)
+        .bind(next_attempt_no)
         .bind(trigger_reason)
         .bind(&now)
         .execute(&mut *tx)
@@ -1256,7 +1267,7 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
     Ok(Some(WorkRow {
         status: "running".to_owned(),
         batch_id: Some(batch_id),
-        attempt_count: row.attempt_count + 1,
+        attempt_count: next_attempt_no,
         ..row
     }))
 }

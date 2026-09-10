@@ -22,7 +22,8 @@ use tower_sessions::Session;
 use tracing::warn;
 
 use crate::{
-    admin_runtime, ai, api, content_processing, error::ApiError, runtime, state::AppState,
+    admin_runtime, ai, api, content_processing, error::ApiError, runtime,
+    sqlite_write::SqliteWriteCoordinator, state::AppState,
 };
 
 const TRANSLATION_PROTOCOL_VERSION: &str = "translation-request.v1";
@@ -1405,7 +1406,9 @@ impl TranslationSchedulerController {
         state: Arc<AppState>,
         config: TranslationRuntimeConfig,
     ) -> Result<TranslationRuntimeConfig> {
-        let config = self.sync_runtime_with_config(&state.pool, config).await?;
+        let config = self
+            .sync_runtime_with_config_coordinated(state.as_ref(), config)
+            .await?;
         self.ensure_workers_running(state).await;
         Ok(config)
     }
@@ -1414,9 +1417,29 @@ impl TranslationSchedulerController {
         self.ensure_workers_running(state).await;
     }
 
+    #[cfg(test)]
     async fn sync_runtime_with_config(
         &self,
         pool: &SqlitePool,
+        config: TranslationRuntimeConfig,
+    ) -> Result<TranslationRuntimeConfig> {
+        self.sync_runtime_with_config_internal(pool, None, config)
+            .await
+    }
+
+    async fn sync_runtime_with_config_coordinated(
+        &self,
+        state: &AppState,
+        config: TranslationRuntimeConfig,
+    ) -> Result<TranslationRuntimeConfig> {
+        self.sync_runtime_with_config_internal(&state.pool, Some(&state.sqlite_writer), config)
+            .await
+    }
+
+    async fn sync_runtime_with_config_internal(
+        &self,
+        pool: &SqlitePool,
+        sqlite_writer: Option<&SqliteWriteCoordinator>,
         config: TranslationRuntimeConfig,
     ) -> Result<TranslationRuntimeConfig> {
         let config = TranslationRuntimeConfig::new(
@@ -1465,7 +1488,8 @@ impl TranslationSchedulerController {
             refresh_translation_runtime_updated_at(&mut runtime);
         }
         drop(runtime);
-        sync_running_batch_slot_updates(pool, &batch_slot_updates).await?;
+        sync_running_batch_slot_updates_with_writer(sqlite_writer, pool, &batch_slot_updates)
+            .await?;
         Ok(config)
     }
 
@@ -1492,7 +1516,7 @@ impl TranslationSchedulerController {
         loop {
             let Some(profile) = self.profile_by_worker_id(worker_id.as_str()).await else {
                 if let Err(err) = self
-                    .remove_worker_runtime(&state.pool, worker_id.as_str())
+                    .remove_worker_runtime_coordinated(state.as_ref(), worker_id.as_str())
                     .await
                 {
                     warn!(
@@ -1590,7 +1614,27 @@ impl TranslationSchedulerController {
         .abort_handle()
     }
 
+    #[cfg(test)]
     async fn remove_worker_runtime(&self, pool: &SqlitePool, worker_id: &str) -> Result<()> {
+        self.remove_worker_runtime_internal(pool, None, worker_id)
+            .await
+    }
+
+    async fn remove_worker_runtime_coordinated(
+        &self,
+        state: &AppState,
+        worker_id: &str,
+    ) -> Result<()> {
+        self.remove_worker_runtime_internal(&state.pool, Some(&state.sqlite_writer), worker_id)
+            .await
+    }
+
+    async fn remove_worker_runtime_internal(
+        &self,
+        pool: &SqlitePool,
+        sqlite_writer: Option<&SqliteWriteCoordinator>,
+        worker_id: &str,
+    ) -> Result<()> {
         let desired_config = self.desired_config().await;
         let mut runtime = self.runtime.write().await;
         let previous_topology = runtime
@@ -1609,7 +1653,8 @@ impl TranslationSchedulerController {
             refresh_translation_runtime_updated_at(&mut runtime);
         }
         drop(runtime);
-        sync_running_batch_slot_updates(pool, &batch_slot_updates).await?;
+        sync_running_batch_slot_updates_with_writer(sqlite_writer, pool, &batch_slot_updates)
+            .await?;
         Ok(())
     }
 
@@ -1880,12 +1925,40 @@ async fn sync_running_batch_slot_updates(
     if updates.is_empty() {
         return Ok(());
     }
-    let updated_at = Utc::now().to_rfc3339();
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    sync_running_batch_slot_updates_in_transaction(&mut tx, updates).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn sync_running_batch_slot_updates_with_writer(
+    sqlite_writer: Option<&SqliteWriteCoordinator>,
+    pool: &SqlitePool,
+    updates: &[RunningBatchSlotUpdate],
+) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let Some(sqlite_writer) = sqlite_writer else {
+        return sync_running_batch_slot_updates(pool, updates).await;
+    };
+    let (_permit, mut tx) = sqlite_writer
+        .begin_immediate(pool, "translation_worker_runtime_slots")
+        .await?;
+    sync_running_batch_slot_updates_in_transaction(&mut tx, updates).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn sync_running_batch_slot_updates_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    updates: &[RunningBatchSlotUpdate],
+) -> Result<()> {
+    let updated_at = Utc::now().to_rfc3339();
     let has_control_table = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'content_processing_control'",
     )
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?
         > 0;
     for update in updates {
@@ -1906,7 +1979,7 @@ async fn sync_running_batch_slot_updates(
             .bind(updated_at.as_str())
             .bind(update.batch_id.as_str())
             .bind(update.worker_id.as_str())
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         } else {
             sqlx::query(
@@ -1921,11 +1994,10 @@ async fn sync_running_batch_slot_updates(
             .bind(updated_at.as_str())
             .bind(update.batch_id.as_str())
             .bind(update.worker_id.as_str())
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
     }
-    tx.commit().await?;
     Ok(())
 }
 
@@ -5041,7 +5113,7 @@ async fn run_translation_scheduler_once(
     {
         state
             .translation_scheduler
-            .remove_worker_runtime(&state.pool, worker.worker_id.as_str())
+            .remove_worker_runtime_coordinated(state, worker.worker_id.as_str())
             .await?;
         return Ok(());
     }
@@ -5061,7 +5133,7 @@ async fn run_translation_scheduler_once(
         } else {
             state
                 .translation_scheduler
-                .remove_worker_runtime(&state.pool, worker.worker_id.as_str())
+                .remove_worker_runtime_coordinated(state, worker.worker_id.as_str())
                 .await?;
         }
         return Ok(());
@@ -5584,7 +5656,7 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
         } else {
             state
                 .translation_scheduler
-                .remove_worker_runtime(&state.pool, worker.worker_id.as_str())
+                .remove_worker_runtime_coordinated(state, worker.worker_id.as_str())
                 .await?;
         }
         return Ok(());
@@ -5640,7 +5712,7 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
             } else {
                 state
                     .translation_scheduler
-                    .remove_worker_runtime(&state.pool, worker.worker_id.as_str())
+                    .remove_worker_runtime_coordinated(state, worker.worker_id.as_str())
                     .await?;
             }
             res
@@ -5663,7 +5735,7 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
             } else {
                 state
                     .translation_scheduler
-                    .remove_worker_runtime(&state.pool, worker.worker_id.as_str())
+                    .remove_worker_runtime_coordinated(state, worker.worker_id.as_str())
                     .await?;
             }
             res
