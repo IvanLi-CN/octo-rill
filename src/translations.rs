@@ -2378,23 +2378,17 @@ pub async fn stream_translation_request(
     Path(request_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let user_id = api::require_business_user_id(state.as_ref(), &session, &headers).await?;
+    let request_id = api::parse_local_id_param(request_id, "request_id")?;
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
         != content_processing::ContentProcessingMode::Legacy
-        && let Some(response) =
-            content_processing::get_request(state.as_ref(), &user_id, request_id.trim()).await?
     {
-        let body = serde_json::to_string(&response).map_err(ApiError::internal)? + "\n";
-        let mut out = Response::new(Body::from(body));
-        out.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
-        );
-        return Ok(out);
+        return Ok(stream_global_translation_request_response_for_api(
+            state, user_id, request_id,
+        ));
     }
     content_processing::ensure_legacy_writer(&state.pool).await?;
-    let request_id = api::parse_local_id_param(request_id, "request_id")?;
     ensure_request_owner(state.as_ref(), &user_id, &request_id).await?;
     Ok(stream_translation_request_response(
         state,

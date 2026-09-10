@@ -1564,7 +1564,18 @@ export async function apiAuditAdminLlmDiagnosticAccess(
 }
 export type ReleaseDetailTranslated = {
 	lang: string;
-	status: "ready" | "missing" | "disabled" | "error";
+	status:
+		| "ready"
+		| "missing"
+		| "disabled"
+		| "error"
+		| "not_applicable"
+		| "queued"
+		| "running"
+		| "deferred_provider"
+		| "blocked_config"
+		| "cancelled"
+		| "superseded";
 	title: string | null;
 	summary: string | null;
 	error_code?: string | null;
@@ -1575,7 +1586,19 @@ export type ReleaseDetailTranslated = {
 };
 export type ReleaseDetailSmart = {
 	lang: string;
-	status: "ready" | "missing" | "disabled" | "error" | "insufficient";
+	status:
+		| "ready"
+		| "missing"
+		| "disabled"
+		| "error"
+		| "insufficient"
+		| "not_applicable"
+		| "queued"
+		| "running"
+		| "deferred_provider"
+		| "blocked_config"
+		| "cancelled"
+		| "superseded";
 	title: string | null;
 	summary: string | null;
 	error_code?: string | null;
@@ -1956,7 +1979,14 @@ export function mapTranslationResultToReleaseDetailTranslated(
 		result.status !== "disabled" &&
 		result.status !== "missing" &&
 		result.status !== "error" &&
-		result.status !== "failed"
+		result.status !== "failed" &&
+		result.status !== "not_applicable" &&
+		result.status !== "queued" &&
+		result.status !== "running" &&
+		result.status !== "deferred_provider" &&
+		result.status !== "blocked_config" &&
+		result.status !== "cancelled" &&
+		result.status !== "superseded"
 	) {
 		return null;
 	}
@@ -1978,7 +2008,14 @@ export function mapTranslationResultToReleaseDetailSmart(
 		result.status !== "disabled" &&
 		result.status !== "missing" &&
 		result.status !== "error" &&
-		result.status !== "failed"
+		result.status !== "failed" &&
+		result.status !== "not_applicable" &&
+		result.status !== "queued" &&
+		result.status !== "running" &&
+		result.status !== "deferred_provider" &&
+		result.status !== "blocked_config" &&
+		result.status !== "cancelled" &&
+		result.status !== "superseded"
 	) {
 		return null;
 	}

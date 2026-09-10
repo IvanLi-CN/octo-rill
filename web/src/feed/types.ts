@@ -1,12 +1,30 @@
 import type { RepoVisual } from "@/lib/repoVisual";
 
-export type TranslatedStatus = "ready" | "missing" | "disabled" | "error";
+export type TranslatedStatus =
+	| "ready"
+	| "missing"
+	| "disabled"
+	| "error"
+	| "queued"
+	| "running"
+	| "deferred_provider"
+	| "blocked_config"
+	| "not_applicable"
+	| "cancelled"
+	| "superseded";
 export type SmartStatus =
 	| "ready"
 	| "missing"
 	| "disabled"
 	| "error"
-	| "insufficient";
+	| "insufficient"
+	| "queued"
+	| "running"
+	| "deferred_provider"
+	| "blocked_config"
+	| "not_applicable"
+	| "cancelled"
+	| "superseded";
 
 export type TranslatedItem = {
 	lang: string;
