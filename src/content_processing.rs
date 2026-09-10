@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
-use chrono::Utc;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Error as SqlxError, Row, Sqlite, SqlitePool, Transaction};
@@ -1178,7 +1178,7 @@ pub async fn retry_request(
     .max(row.attempt_count)
     .max(0);
     let next_attempt_no = previous_attempt_no.saturating_add(1);
-    sqlx::query("UPDATE content_work_items SET status = ?, priority = 3, next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    sqlx::query("UPDATE content_work_items SET status = ?, priority = 3, next_retry_at = ?, retry_expires_at = CASE WHEN retry_expires_at IS NULL OR julianday(retry_expires_at) <= julianday('now') THEN ? ELSE retry_expires_at END, retry_after_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(retry_status)
         .bind(&next_retry_at)
         .bind(&retry_expires_at)
@@ -1331,7 +1331,20 @@ async fn recover_due(state: &AppState) -> Result<()> {
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, failure_class, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), w.id, COALESCE((SELECT MAX(pending.attempt_no) FROM content_attempt_events pending WHERE pending.work_item_id = w.id AND pending.event_type = 'attempt_queued'), CASE WHEN w.attempt_count < 1 THEN 1 ELSE w.attempt_count END), 'automatic_recovery', 'attempt_completed', 'failed', 'provider_unavailable', 'provider_unavailable', 0, ? FROM content_work_items w WHERE w.status = 'failed' AND w.failure_class = 'provider_unavailable' AND w.next_retry_at IS NULL AND w.retry_expires_at IS NULL AND w.updated_at = ?",
+        "UPDATE content_attempt_events SET result_status = 'failed', error_code = 'provider_unavailable', error_summary = 'provider cooldown expired', failure_class = 'provider_unavailable', retry_eligible = 0, next_retry_at = NULL WHERE event_type = 'attempt_completed' AND result_status = 'deferred_provider' AND work_item_id IN (SELECT id FROM content_work_items WHERE status = 'failed' AND failure_class = 'provider_unavailable' AND next_retry_at IS NULL AND retry_expires_at IS NULL AND updated_at = ?)",
+    )
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, failure_class, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), w.id, COALESCE((SELECT MAX(pending.attempt_no) FROM content_attempt_events pending WHERE pending.work_item_id = w.id AND pending.event_type = 'attempt_queued'), (SELECT MAX(started.attempt_no) FROM content_attempt_events started WHERE started.work_item_id = w.id AND started.event_type = 'attempt_started'), CASE WHEN w.attempt_count < 1 THEN 1 ELSE w.attempt_count END), 'automatic_recovery', 'attempt_completed', 'failed', 'provider_unavailable', 'provider_unavailable', 0, ? FROM content_work_items w WHERE w.status = 'failed' AND w.failure_class = 'provider_unavailable' AND w.next_retry_at IS NULL AND w.retry_expires_at IS NULL AND w.updated_at = ? AND NOT EXISTS (SELECT 1 FROM content_attempt_events completed WHERE completed.work_item_id = w.id AND completed.event_type = 'attempt_completed')",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE content_batch_items SET result_status = 'failed', error_code = 'provider_unavailable', error_summary = 'provider cooldown expired', updated_at = ? WHERE result_status = 'deferred_provider' AND work_item_id IN (SELECT id FROM content_work_items WHERE status = 'failed' AND failure_class = 'provider_unavailable' AND next_retry_at IS NULL AND retry_expires_at IS NULL AND updated_at = ?)",
     )
     .bind(&now)
     .bind(&now)
@@ -1431,7 +1444,42 @@ fn build_prompt(snapshot: &SourceSnapshot, pipeline: &str) -> (String, String) {
     (system.to_owned(), user)
 }
 
-fn validate_output(raw: &str, target_slots: &[String]) -> Result<Value> {
+fn parse_storage_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+                .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))
+                .ok()
+                .map(|parsed| parsed.and_utc())
+        })
+}
+
+fn next_retry_at_for_failure(
+    attempt_count: i64,
+    retry_expires_at: Option<&str>,
+    retryable: bool,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let retry_window_open = retry_expires_at
+        .and_then(parse_storage_timestamp)
+        .is_none_or(|expires_at| expires_at > now);
+    if !retryable || !retry_window_open {
+        return None;
+    }
+    let delay_index = attempt_count
+        .saturating_sub(1)
+        .min(i64::try_from(RETRY_DELAYS_SECS.len() - 1).unwrap_or(0))
+        as usize;
+    Some((now + chrono::Duration::seconds(RETRY_DELAYS_SECS[delay_index])).to_rfc3339())
+}
+
+fn validate_output(
+    raw: &str,
+    target_slots: &[String],
+    source_blocks: &[translations::TranslationSourceBlock],
+) -> Result<Value> {
     let output = serde_json::from_str::<Value>(raw).context("global content output is not JSON")?;
     let object = output
         .as_object()
@@ -1442,7 +1490,11 @@ fn validate_output(raw: &str, target_slots: &[String]) -> Result<Value> {
                 "global content output is missing target slot: {slot}"
             ));
         };
-        if value.as_str().is_none_or(|text| text.trim().is_empty()) {
+        let body_without_source = slot == "body_md"
+            && !source_blocks
+                .iter()
+                .any(|block| block.slot == "body_markdown" && !block.text.trim().is_empty());
+        if !body_without_source && value.as_str().is_none_or(|text| text.trim().is_empty()) {
             return Err(anyhow!(
                 "global content output target slot is missing text: {slot}"
             ));
@@ -1523,7 +1575,7 @@ async fn supersede_replaced_work_in_transaction(
     work: &WorkRow,
 ) -> Result<bool> {
     let replaced = sqlx::query_scalar::<_, i64>(
-        "SELECT EXISTS (SELECT 1 FROM content_work_items newer WHERE newer.id <> ? AND newer.canonical_resource_type = ? AND newer.canonical_resource_id = ? AND newer.pipeline = ? AND newer.variant = ? AND newer.target_lang = ? AND newer.protocol_version = ? AND julianday(newer.created_at) > julianday(?) AND newer.status NOT IN ('cancelled', 'superseded'))",
+        "SELECT EXISTS (SELECT 1 FROM content_work_items newer WHERE newer.id <> ? AND newer.canonical_resource_type = ? AND newer.canonical_resource_id = ? AND newer.pipeline = ? AND newer.variant = ? AND newer.target_lang = ? AND newer.protocol_version = ? AND (julianday(newer.created_at) > julianday(?) OR (julianday(newer.created_at) = julianday(?) AND newer.id > ?)) AND newer.status NOT IN ('cancelled', 'superseded'))",
     )
     .bind(&work.id)
     .bind(&work.canonical_resource_type)
@@ -1533,6 +1585,8 @@ async fn supersede_replaced_work_in_transaction(
     .bind(&work.target_lang)
     .bind(&work.protocol_version)
     .bind(&work.created_at)
+    .bind(&work.created_at)
+    .bind(&work.id)
     .fetch_one(&mut **tx)
     .await?
         != 0;
@@ -1671,35 +1725,32 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
     let snapshot = serde_json::from_str::<SourceSnapshot>(&work.source_snapshot_json)
         .context("invalid global source snapshot")?;
     let selected_model = ai::select_model_for_new_calls(state).await;
-    if selected_model.model != work.model_profile {
-        let routing = state
-            .llm_scheduler
-            .routing_status(state.config.ai.as_ref().map(|config| config.model.as_str()))
-            .await;
-        let model_is_cooling_down = routing
+    let routing = state
+        .llm_scheduler
+        .routing_status(state.config.ai.as_ref().map(|config| config.model.as_str()))
+        .await;
+    let model_is_cooling_down = routing
+        .model_statuses
+        .iter()
+        .find(|status| status.model == work.model_profile)
+        .is_some_and(|status| status.status == "cooldown");
+    if model_is_cooling_down {
+        let now = Utc::now();
+        let next_retry_at = routing
             .model_statuses
             .iter()
             .find(|status| status.model == work.model_profile)
-            .is_some_and(|status| status.status == "cooldown");
-        if model_is_cooling_down {
-            let now = Utc::now();
-            let next_retry_at = routing
-                .model_statuses
-                .iter()
-                .find(|status| status.model == work.model_profile)
-                .and_then(|status| status.cooldown_until.clone())
-                .unwrap_or_else(|| {
-                    (now + chrono::Duration::seconds(PROVIDER_DEFER_SECS)).to_rfc3339()
-                });
-            let retry_expires_at = (now + chrono::Duration::hours(24)).to_rfc3339();
-            let (_lock, mut tx) = state
-                .sqlite_writer
-                .begin_immediate(&state.pool, "content_processing_defer_model")
-                .await?;
-            ensure_global_mode_in_transaction(&mut tx)
-                .await
-                .map_err(|error| anyhow!(error.to_string()))?;
-            let updated = sqlx::query("UPDATE content_work_items SET status = 'deferred_provider', next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running' AND attempt_count = ?")
+            .and_then(|status| status.cooldown_until.clone())
+            .unwrap_or_else(|| (now + chrono::Duration::seconds(PROVIDER_DEFER_SECS)).to_rfc3339());
+        let retry_expires_at = (now + chrono::Duration::hours(24)).to_rfc3339();
+        let (_lock, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "content_processing_defer_model")
+            .await?;
+        ensure_global_mode_in_transaction(&mut tx)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let updated = sqlx::query("UPDATE content_work_items SET status = 'deferred_provider', next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running' AND attempt_count = ?")
                 .bind(&next_retry_at)
                 .bind(&retry_expires_at)
                 .bind(&next_retry_at)
@@ -1708,11 +1759,11 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(work.attempt_count)
                 .execute(&mut *tx)
                 .await?;
-            if updated.rows_affected() == 0 {
-                tx.commit().await?;
-                return Ok(());
-            }
-            sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, retry_eligible, next_retry_at, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'deferred_provider', 'provider_cooldown', 'model profile is cooling down', 1, ?, ? FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started'")
+        if updated.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(());
+        }
+        sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, retry_eligible, next_retry_at, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'deferred_provider', 'provider_cooldown', 'model profile is cooling down', 1, ?, ? FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started'")
                 .bind(local_id::generate_local_id().to_string())
                 .bind(&next_retry_at)
                 .bind(now.to_rfc3339())
@@ -1720,27 +1771,22 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(work.attempt_count)
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("UPDATE content_batch_items SET result_status = 'deferred_provider', error_code = 'provider_cooldown', error_summary = 'model profile is cooling down', updated_at = ? WHERE work_item_id = ? AND batch_id = ?")
+        sqlx::query("UPDATE content_batch_items SET result_status = 'deferred_provider', error_code = 'provider_cooldown', error_summary = 'model profile is cooling down', updated_at = ? WHERE work_item_id = ? AND batch_id = ?")
                 .bind(now.to_rfc3339())
                 .bind(&work.id)
                 .bind(work.batch_id.as_deref().unwrap_or_default())
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("UPDATE content_batches SET status = 'completed', finished_at = ?, updated_at = ?, error_code = 'provider_cooldown', error_summary = 'model profile is cooling down' WHERE id = ? AND status = 'running'")
+        sqlx::query("UPDATE content_batches SET status = 'completed', finished_at = ?, updated_at = ?, error_code = 'provider_cooldown', error_summary = 'model profile is cooling down' WHERE id = ? AND status = 'running'")
                 .bind(now.to_rfc3339())
                 .bind(now.to_rfc3339())
                 .bind(work.batch_id.as_deref().unwrap_or_default())
                 .execute(&mut *tx)
                 .await?;
-            tx.commit().await?;
-            return Ok(());
-        }
-        if runtime_configuration_fingerprint(state, &work.model_profile).await
-            != work.configuration_fingerprint
-        {
-            block_config_work(state, &work).await?;
-            return Ok(());
-        }
+        tx.commit().await?;
+        return Ok(());
+    }
+    if selected_model.model != work.model_profile {
         block_config_work(state, &work).await?;
         return Ok(());
     }
@@ -1775,8 +1821,12 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
     })
     .and_then(|result| result)
     .and_then(|diagnostic| {
-        validate_output(&diagnostic.content, &snapshot.target_slots)
-            .map(|output| (diagnostic, output))
+        validate_output(
+            &diagnostic.content,
+            &snapshot.target_slots,
+            &snapshot.source_blocks,
+        )
+        .map(|output| (diagnostic, output))
     });
     let now = Utc::now().to_rfc3339();
     let (_lock, mut tx) = state
@@ -1915,19 +1965,14 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .unwrap_or_else(|| "unknown_internal_error".to_owned());
             let retryable = llm_class.is_some_and(ai::LlmFailureClass::is_recoverable)
                 || class == "output_contract_invalid";
-            let next_retry = if retryable
-                && work.attempt_count <= i64::try_from(RETRY_DELAYS_SECS.len()).unwrap_or(i64::MAX)
-            {
-                Some(
-                    (Utc::now()
-                        + chrono::Duration::seconds(
-                            RETRY_DELAYS_SECS[(work.attempt_count - 1).max(0) as usize],
-                        ))
-                    .to_rfc3339(),
-                )
-            } else {
-                None
-            };
+            let now = Utc::now();
+            let next_retry = next_retry_at_for_failure(
+                work.attempt_count,
+                work.retry_expires_at.as_deref(),
+                retryable,
+                now,
+            );
+            let now_text = now.to_rfc3339();
             let retry_after =
                 (Utc::now() + chrono::Duration::seconds(RETRY_COOLDOWN_SECS)).to_rfc3339();
             let retry_expires = (Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
@@ -1959,7 +2004,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(linked_call_audit.as_ref().and_then(|(_, _, _, _, output_tokens)| *output_tokens))
                 .bind(&class)
                 .bind(error_summary.as_deref())
-                .bind(&now)
+                .bind(now_text.as_str())
                 .execute(&mut *tx)
                 .await?;
             sqlx::query("UPDATE content_work_items SET status = 'failed', failure_class = ?, next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?")
@@ -1967,15 +2012,15 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(&next_retry)
                 .bind(&retry_expires)
                 .bind(&retry_after)
-                .bind(&now)
-                .bind(&now)
+                .bind(now_text.as_str())
+                .bind(now_text.as_str())
                 .bind(&work.id)
                 .execute(&mut *tx)
                 .await?;
             sqlx::query("UPDATE content_batch_items SET result_status = 'failed', error_code = ?, error_summary = ?, updated_at = ? WHERE work_item_id = ? AND batch_id = ?")
                 .bind(&class)
                 .bind(error_summary.as_deref())
-                .bind(&now)
+                .bind(now_text.as_str())
                 .bind(&work.id)
                 .bind(work.batch_id.as_deref().unwrap_or_default())
                 .execute(&mut *tx)
@@ -1987,14 +2032,14 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(&class)
                 .bind(i64::from(next_retry.is_some()))
                 .bind(&next_retry)
-                .bind(&now)
+                .bind(now_text.as_str())
                 .bind(&work.id)
                 .bind(work.attempt_count)
                 .execute(&mut *tx)
                 .await?;
             sqlx::query("UPDATE content_batches SET status = 'failed', finished_at = ?, updated_at = ?, error_code = ?, error_summary = ? WHERE id = ?")
-                .bind(&now)
-                .bind(&now)
+                .bind(now_text.as_str())
+                .bind(now_text.as_str())
                 .bind(&class)
                 .bind(&class)
                 .bind(work.batch_id.as_deref().unwrap_or_default())
@@ -2386,5 +2431,110 @@ mod tests {
         );
         let claimed = claim_next(&state, 1).await.unwrap().unwrap();
         assert_eq!(claimed.attempt_count, 1);
+    }
+
+    #[tokio::test]
+    async fn expired_manual_retry_reopens_the_retry_window() {
+        let pool = global_pool().await;
+        insert_test_work(&pool, "work-expired", "failed", 1, None).await;
+        sqlx::query(
+            "UPDATE content_work_items SET retry_expires_at = '2000-01-01T00:00:00Z' WHERE id = 'work-expired'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, created_at) VALUES ('attempt-expired', 'work-expired', 1, 'initial', 'attempt_completed', 'failed', CURRENT_TIMESTAMP)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO content_request_links (id, request_id, work_item_id, requester_type, requester_id, authorization_snapshot_json, producer_ref, request_source, delivery_mode, created_at, updated_at) VALUES ('link-expired', 'request-expired', 'work-expired', 'user', 'user-1', '{}', 'test', 'api', 'async', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = global_state(pool.clone());
+
+        let (status, _) = retry_request(&state, "user-1", "request-expired")
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let retry_expires_at: String = sqlx::query_scalar(
+            "SELECT retry_expires_at FROM content_work_items WHERE id = 'work-expired'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(parse_storage_timestamp(&retry_expires_at).unwrap() > Utc::now());
+        assert_eq!(
+            claim_next(&state, 1).await.unwrap().unwrap().attempt_count,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_cooldown_expiry_closes_the_existing_attempt_audit() {
+        let pool = global_pool().await;
+        insert_test_work(
+            &pool,
+            "work-provider-expired",
+            "deferred_provider",
+            1,
+            Some("2000-01-01T00:00:00Z"),
+        )
+        .await;
+        sqlx::query("UPDATE content_work_items SET retry_expires_at = '2000-01-01T00:00:00Z' WHERE id = 'work-provider-expired'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, created_at) VALUES ('provider-started', 'work-provider-expired', 1, 'initial', 'attempt_started', NULL, CURRENT_TIMESTAMP), ('provider-completed', 'work-provider-expired', 1, 'initial', 'attempt_completed', 'deferred_provider', CURRENT_TIMESTAMP)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = global_state(pool.clone());
+
+        recover_due(&state).await.unwrap();
+        let audit: (String, String, String) = sqlx::query_as("SELECT result_status, error_code, failure_class FROM content_attempt_events WHERE id = 'provider-completed'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            audit,
+            (
+                "failed".to_owned(),
+                "provider_unavailable".to_owned(),
+                "provider_unavailable".to_owned()
+            )
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM content_attempt_events WHERE work_item_id = 'work-provider-expired' AND event_type = 'attempt_completed'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn bodyless_detail_output_accepts_a_null_body() {
+        let output = validate_output(
+            r#"{"title_zh":"标题","body_md":null}"#,
+            &["title_zh".to_owned(), "body_md".to_owned()],
+            &[translations::TranslationSourceBlock {
+                slot: "title".to_owned(),
+                text: "Title".to_owned(),
+            }],
+        )
+        .expect("bodyless detail output is valid");
+        assert_eq!(output["body_md"], Value::Null);
+    }
+
+    #[test]
+    fn automatic_retry_uses_the_last_delay_until_expiry() {
+        let now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let next = next_retry_at_for_failure(6, Some("2026-01-02T00:00:00Z"), true, now)
+            .expect("sixth attempt remains retryable");
+        assert_eq!(next, "2026-01-01T04:00:00+00:00");
+        assert!(next_retry_at_for_failure(6, Some("2025-12-31T23:59:59Z"), true, now,).is_none());
     }
 }
