@@ -8504,6 +8504,15 @@ async fn build_release_detail_response(
         "release_detail",
         "detail",
     );
+    let global_summary_hash = global_release_source_hash(
+        row.release_id,
+        &resolved_full_name,
+        &row.tag_name,
+        row.name.as_deref(),
+        row.body.as_deref(),
+        "release_summary",
+        "summary",
+    );
     let global_smart_hash = global_release_source_hash(
         row.release_id,
         &resolved_full_name,
@@ -8528,7 +8537,16 @@ async fn build_release_detail_response(
             "detail",
             global_translation_hash.as_str(),
         )
-        .await?;
+        .await?
+        .or(content_processing::read_global_resource(
+            state,
+            "release",
+            release_id.as_str(),
+            "translation",
+            "summary",
+            global_summary_hash.as_str(),
+        )
+        .await?);
         let smart = content_processing::read_global_resource(
             state,
             "release",
@@ -8557,7 +8575,18 @@ async fn build_release_detail_response(
             "zh-CN",
             global_translation_hash.as_str(),
         )
-        .await?;
+        .await?
+        .or(content_processing::latest_request_id_for_resource(
+            state,
+            user_id,
+            "release",
+            release_id.as_str(),
+            "translation",
+            "summary",
+            "zh-CN",
+            global_summary_hash.as_str(),
+        )
+        .await?);
         let smart_request_id = content_processing::latest_request_id_for_resource(
             state,
             user_id,
