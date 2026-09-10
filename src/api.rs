@@ -987,7 +987,12 @@ pub async fn admin_patch_user(
         paused_at: Option<String>,
     }
 
-    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let (_lock, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "legacy_public_release_cache_cleanup")
+        .await
+        .map_err(ApiError::internal)?;
+    translations::ensure_legacy_writer_transaction(&mut tx).await?;
     let target = sqlx::query_as::<_, AdminPatchTargetRow>(
         r#"
         SELECT id, is_admin, is_disabled, paused_at
@@ -19519,6 +19524,12 @@ async fn upsert_translation(
     t: TranslationUpsert<'_>,
 ) -> Result<(), ApiError> {
     let now = chrono::Utc::now().to_rfc3339();
+    let (_lock, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "legacy_translation_upsert")
+        .await
+        .map_err(ApiError::internal)?;
+    translations::ensure_legacy_writer_transaction(&mut tx).await?;
     sqlx::query(
         r#"
         INSERT INTO ai_translations (
@@ -19549,9 +19560,10 @@ async fn upsert_translation(
     .bind(&now)
     .bind(&now)
     .bind(requested_at)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
     Ok(())
 }
 
@@ -19561,6 +19573,12 @@ async fn mark_translation_requested(
     requested_at: &str,
     t: TranslationUpsert<'_>,
 ) -> Result<(), ApiError> {
+    let (_lock, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "legacy_translation_request")
+        .await
+        .map_err(ApiError::internal)?;
+    translations::ensure_legacy_writer_transaction(&mut tx).await?;
     sqlx::query(
         r#"
         INSERT INTO ai_translations (
@@ -19588,9 +19606,10 @@ async fn mark_translation_requested(
     .bind(t.source_hash)
     .bind(requested_at)
     .bind(requested_at)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
     Ok(())
 }
 
