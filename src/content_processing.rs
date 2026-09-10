@@ -1351,7 +1351,7 @@ async fn defer_queued_for_provider(state: &AppState) -> Result<()> {
         .bind((Utc::now() + chrono::Duration::hours(24)).to_rfc3339())
         .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, next_retry_at, created_at) SELECT lower(hex(randomblob(16))), id, CASE WHEN attempt_count < 1 THEN 1 ELSE attempt_count END, 'system_requeue', 'attempt_queued', 'deferred_provider', 1, ?, CURRENT_TIMESTAMP FROM content_work_items WHERE status = 'deferred_provider' AND next_retry_at = ?")
+    sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, next_retry_at, created_at) SELECT lower(hex(randomblob(16))), id, CASE WHEN attempt_count < 1 THEN 1 ELSE attempt_count END, 'system_requeue', 'attempt_queued', 'deferred_provider', 1, ?, CURRENT_TIMESTAMP FROM content_work_items WHERE status = 'deferred_provider' AND next_retry_at = ?")
         .bind(&retry_at)
         .bind(&retry_at)
         .execute(&mut *tx)
