@@ -911,8 +911,11 @@ pub async fn submit_item(
     .fetch_one(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
-    if let Some(supersedes_work_item_id) = supersedes_work_item_id {
-        sqlx::query("UPDATE content_result_projections SET active_work_item_id = ?, updated_at = ? WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND work_item_id = ? AND (active_work_item_id IS NULL OR active_work_item_id <> ?)")
+    if supersedes_work_item_id.is_some() {
+        // Advance every retained projection for this resource. This keeps the
+        // pointer transitive when a second refresh arrives before the first
+        // replacement has published.
+        sqlx::query("UPDATE content_result_projections SET active_work_item_id = ?, updated_at = ? WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND source_hash <> ? AND (active_work_item_id IS NULL OR active_work_item_id <> ?)")
             .bind(&work.id)
             .bind(&now)
             .bind(resource_type)
@@ -921,7 +924,7 @@ pub async fn submit_item(
             .bind(&item.variant)
             .bind(&item.target_lang)
             .bind(GLOBAL_PROTOCOL_VERSION)
-            .bind(&supersedes_work_item_id)
+            .bind(&hash)
             .bind(&work.id)
             .execute(&mut *tx)
             .await
@@ -1182,19 +1185,35 @@ pub async fn read_global_resource(
     .await
     .map_err(ApiError::internal)?;
     let retained_projection = if exact_projection.is_none() {
-        if let Some((_, _, Some(superseded_id), _)) = &current {
-            sqlx::query_scalar::<_, String>(
-                "SELECT p.payload_json FROM content_result_projections p WHERE p.canonical_resource_type = ? AND p.canonical_resource_id = ? AND p.pipeline = ? AND p.variant = ? AND p.target_lang = 'zh-CN' AND p.protocol_version = ? AND p.work_item_id = ? LIMIT 1",
+        if let Some((current_id, _, _, _)) = &current {
+            let active_projection = sqlx::query_scalar::<_, String>(
+                "SELECT p.payload_json FROM content_result_projections p JOIN content_work_items w ON w.id = p.work_item_id WHERE p.canonical_resource_type = ? AND p.canonical_resource_id = ? AND p.pipeline = ? AND p.variant = ? AND p.target_lang = 'zh-CN' AND p.protocol_version = ? AND p.active_work_item_id = ? ORDER BY datetime(p.updated_at) DESC, p.id DESC LIMIT 1",
             )
             .bind(resource_type)
             .bind(resource_id)
             .bind(pipeline)
             .bind(variant)
             .bind(GLOBAL_PROTOCOL_VERSION)
-            .bind(superseded_id)
+            .bind(current_id)
             .fetch_optional(&state.pool)
             .await
-            .map_err(ApiError::internal)?
+            .map_err(ApiError::internal)?;
+            if active_projection.is_some() {
+                active_projection
+            } else {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT p.payload_json FROM content_result_projections p JOIN content_work_items w ON w.id = p.work_item_id WHERE p.canonical_resource_type = ? AND p.canonical_resource_id = ? AND p.pipeline = ? AND p.variant = ? AND p.target_lang = 'zh-CN' AND p.protocol_version = ? AND p.source_hash <> ? AND w.status = 'ready' ORDER BY datetime(p.updated_at) DESC, p.id DESC LIMIT 1",
+                )
+                .bind(resource_type)
+                .bind(resource_id)
+                .bind(pipeline)
+                .bind(variant)
+                .bind(GLOBAL_PROTOCOL_VERSION)
+                .bind(expected_source_hash)
+                .fetch_optional(&state.pool)
+                .await
+                .map_err(ApiError::internal)?
+            }
         } else {
             None
         }
@@ -2724,6 +2743,55 @@ mod tests {
         assert_eq!(status, "ready");
         assert_eq!(payload["title_zh"], "保留标题");
         assert_eq!(payload["body_md"], "保留摘要");
+    }
+
+    #[tokio::test]
+    async fn retained_projection_survives_chained_source_refreshes() {
+        let pool = global_pool().await;
+        insert_test_work(&pool, "refresh-w1", "ready", 0, None).await;
+        for (id, hash, supersedes, status) in [
+            ("refresh-w2", "hash-2", Some("refresh-w1"), "queued"),
+            ("refresh-w3", "hash-3", Some("refresh-w2"), "queued"),
+        ] {
+            sqlx::query(
+                "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, supersedes_work_item_id, attempt_count, created_at, updated_at) VALUES (?, 'release', 'release-1', 'translation', 'summary', 'zh-CN', ?, ?, 'test-model', '{}', 'config-1', ?, 0, 0, 1, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            )
+            .bind(id)
+            .bind(hash)
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(status)
+            .bind(supersedes)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO content_result_projections (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash, work_item_id, active_work_item_id, payload_json, published_at, updated_at) VALUES (?, 'release', 'release-1', 'translation', 'summary', 'zh-CN', ?, 'test-model', 'hash-1', ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind("refresh-projection")
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .bind("refresh-w1")
+        .bind("refresh-w3")
+        .bind(r#"{"title_zh":"连续刷新仍可见","body_md":"保留旧摘要"}"#)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = global_state(pool);
+        let (status, payload) = read_global_resource(
+            &state,
+            "release",
+            "release-1",
+            "translation",
+            "summary",
+            "hash-3",
+        )
+        .await
+        .unwrap()
+        .expect("retained projection should survive chained refreshes");
+        assert_eq!(status, "queued");
+        assert_eq!(payload["title_zh"], "连续刷新仍可见");
+        assert_eq!(payload["body_md"], "保留旧摘要");
     }
 
     #[test]

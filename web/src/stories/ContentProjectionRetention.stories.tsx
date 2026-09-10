@@ -122,6 +122,10 @@ export const RetainedPolishProjectionRelease: Story = {
 };
 
 export const RetainedPolishProjectionAnnouncement: Story = {
+	args: {
+		target: null,
+		onClose: fn(),
+	},
 	render: () => (
 		<AnnouncementDetailPage
 			owner="octo-rill"
