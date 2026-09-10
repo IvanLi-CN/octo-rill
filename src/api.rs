@@ -8400,6 +8400,24 @@ async fn build_release_detail_response(
         &row.tag_name,
         row.previous_tag_name.as_deref(),
     );
+    let global_translation_hash = global_release_source_hash(
+        row.release_id,
+        &resolved_full_name,
+        &row.tag_name,
+        row.name.as_deref(),
+        Some(original_body.as_str()),
+        "release_detail",
+        "detail",
+    );
+    let global_smart_hash = global_release_source_hash(
+        row.release_id,
+        &resolved_full_name,
+        &row.tag_name,
+        row.name.as_deref(),
+        row.body.as_deref(),
+        "release_smart",
+        "smart",
+    );
 
     if content_processing::current_mode(&state.pool)
         .await
@@ -8413,6 +8431,7 @@ async fn build_release_detail_response(
             release_id.as_str(),
             "translation",
             "detail",
+            global_translation_hash.as_str(),
         )
         .await?;
         let smart = content_processing::read_global_resource(
@@ -8421,6 +8440,7 @@ async fn build_release_detail_response(
             release_id.as_str(),
             "polishing",
             "smart",
+            global_smart_hash.as_str(),
         )
         .await?;
         let project_string = |project: &Option<(String, Value)>, key: &str| {
@@ -9066,6 +9086,25 @@ async fn build_announcement_detail_response(
 ) -> Result<AnnouncementDetailResponse, ApiError> {
     let discussion_key =
         announcement_discussion_key(&source.repo_full_name, source.discussion_number);
+    let original_body = source.body.clone().unwrap_or_default();
+    let global_translation_hash = global_announcement_source_hash(
+        discussion_key.as_str(),
+        &source.repo_full_name,
+        source.discussion_number,
+        source.title.as_str(),
+        Some(original_body.as_str()),
+        "announcement_detail",
+        "detail",
+    );
+    let global_smart_hash = global_announcement_source_hash(
+        discussion_key.as_str(),
+        &source.repo_full_name,
+        source.discussion_number,
+        source.title.as_str(),
+        source.body.as_deref(),
+        "announcement_smart",
+        "smart",
+    );
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
@@ -9077,6 +9116,7 @@ async fn build_announcement_detail_response(
             discussion_key.as_str(),
             "translation",
             "detail",
+            global_translation_hash.as_str(),
         )
         .await?;
         let smart = content_processing::read_global_resource(
@@ -9085,6 +9125,7 @@ async fn build_announcement_detail_response(
             discussion_key.as_str(),
             "polishing",
             "smart",
+            global_smart_hash.as_str(),
         )
         .await?;
         let project_string = |project: &Option<(String, Value)>, key: &str| {
@@ -9179,7 +9220,6 @@ async fn build_announcement_detail_response(
     }
     let translation_state =
         load_announcement_translation_state(state, user_id, discussion_key.as_str()).await?;
-    let original_body = source.body.clone().unwrap_or_default();
     let source_hash = announcement_detail_source_hash(
         &source.repo_full_name,
         Some(source.discussion_number),
@@ -11091,6 +11131,8 @@ async fn load_public_release_translation_rows(
     state: &AppState,
     release_ids: &[i64],
     entity_type: &str,
+    repo_full_name: &str,
+    base_rows: &[PublicReleaseBaseRow],
 ) -> Result<HashMap<i64, PublicReleaseTranslationRow>, ApiError> {
     if release_ids.is_empty() {
         return Ok(HashMap::new());
@@ -11109,14 +11151,32 @@ async fn load_public_release_translation_rows(
         let mut results = HashMap::new();
         for release_id in release_ids {
             let release_id_string = release_id.to_string();
+            let Some(base) = base_rows.iter().find(|row| row.release_id == *release_id) else {
+                continue;
+            };
+            let kind = if entity_type == "release_smart" {
+                "release_smart"
+            } else {
+                "release_detail"
+            };
             let mut global_result = None;
             for variant in variants {
+                let expected_source_hash = global_release_source_hash(
+                    *release_id,
+                    repo_full_name,
+                    &base.tag_name,
+                    base.name.as_deref(),
+                    base.body.as_deref(),
+                    kind,
+                    variant,
+                );
                 if let Some(result) = content_processing::read_global_resource(
                     state,
                     "release",
                     release_id_string.as_str(),
                     pipeline,
                     variant,
+                    expected_source_hash.as_str(),
                 )
                 .await?
                 {
@@ -11333,12 +11393,26 @@ async fn load_public_release_rows(
     let load_translated = content == "all" || content == "translated";
     let load_smart = content == "all" || content == "polished";
     let translated = if load_translated {
-        load_public_release_translation_rows(state, &release_ids, "release_detail").await?
+        load_public_release_translation_rows(
+            state,
+            &release_ids,
+            "release_detail",
+            repo_full_name,
+            &base_rows,
+        )
+        .await?
     } else {
         HashMap::new()
     };
     let smart = if load_smart {
-        load_public_release_translation_rows(state, &release_ids, "release_smart").await?
+        load_public_release_translation_rows(
+            state,
+            &release_ids,
+            "release_smart",
+            repo_full_name,
+            &base_rows,
+        )
+        .await?
     } else {
         HashMap::new()
     };
@@ -16275,14 +16349,16 @@ async fn read_first_global_resource_variant(
     resource_id: &str,
     pipeline: &str,
     variants: &[&str],
+    expected_source_hashes: &[String],
 ) -> Result<Option<(String, Value)>, ApiError> {
-    for variant in variants {
+    for (variant, expected_source_hash) in variants.iter().zip(expected_source_hashes) {
         if let Some(result) = content_processing::read_global_resource(
             state,
             resource_type,
             resource_id,
             pipeline,
             variant,
+            expected_source_hash,
         )
         .await?
         {
@@ -16383,12 +16459,54 @@ async fn overlay_global_feed_processing(
         row.smart_error_text = None;
         row.smart_work_status = None;
 
+        let global_hash_for_variant = |kind: &str, variant: &str| {
+            if resource_type == "announcement" {
+                global_announcement_source_hash(
+                    resource_id.as_str(),
+                    repo,
+                    row.discussion_number.unwrap_or_default(),
+                    title,
+                    row.release_body.as_deref(),
+                    kind,
+                    variant,
+                )
+            } else {
+                global_release_source_hash(
+                    row.entity_id.parse::<i64>().unwrap_or_default(),
+                    repo,
+                    row.release_tag_name.as_deref().unwrap_or_default(),
+                    Some(title),
+                    row.release_body.as_deref(),
+                    kind,
+                    variant,
+                )
+            }
+        };
+
         if let Some((status, payload)) = read_first_global_resource_variant(
             state,
             resource_type,
             resource_id.as_str(),
             "translation",
             &["feed_body", "summary"],
+            &[
+                global_hash_for_variant(
+                    if resource_type == "announcement" {
+                        "announcement_summary"
+                    } else {
+                        "release_summary"
+                    },
+                    "feed_body",
+                ),
+                global_hash_for_variant(
+                    if resource_type == "announcement" {
+                        "announcement_summary"
+                    } else {
+                        "release_summary"
+                    },
+                    "summary",
+                ),
+            ],
         )
         .await?
         {
@@ -16433,6 +16551,14 @@ async fn overlay_global_feed_processing(
             resource_id.as_str(),
             "translation",
             &["detail"],
+            &[global_hash_for_variant(
+                if resource_type == "announcement" {
+                    "announcement_detail"
+                } else {
+                    "release_detail"
+                },
+                "detail",
+            )],
         )
         .await?
         {
@@ -16477,6 +16603,24 @@ async fn overlay_global_feed_processing(
             resource_id.as_str(),
             "polishing",
             &["feed_card", "smart"],
+            &[
+                global_hash_for_variant(
+                    if resource_type == "announcement" {
+                        "announcement_smart"
+                    } else {
+                        "release_smart"
+                    },
+                    "feed_card",
+                ),
+                global_hash_for_variant(
+                    if resource_type == "announcement" {
+                        "announcement_smart"
+                    } else {
+                        "release_smart"
+                    },
+                    "smart",
+                ),
+            ],
         )
         .await?
         {
@@ -19546,6 +19690,90 @@ struct GlobalReleaseSourceRow {
     tag_name: String,
     name: Option<String>,
     body: Option<String>,
+}
+
+fn global_source_hash_from_fields(
+    kind: &str,
+    variant: &str,
+    entity_id: &str,
+    metadata: String,
+    title: String,
+    body: Option<String>,
+) -> String {
+    let mut source_blocks = vec![
+        translations::TranslationSourceBlock {
+            slot: "metadata".to_owned(),
+            text: metadata,
+        },
+        translations::TranslationSourceBlock {
+            slot: "title".to_owned(),
+            text: title,
+        },
+    ];
+    if let Some(body) = body.filter(|value| !value.trim().is_empty()) {
+        source_blocks.push(translations::TranslationSourceBlock {
+            slot: "body_markdown".to_owned(),
+            text: body,
+        });
+    }
+    let target_slots = if kind.ends_with("_detail") || variant == "detail" {
+        vec!["title_zh".to_owned(), "body_md".to_owned()]
+    } else {
+        vec!["title_zh".to_owned(), "summary_md".to_owned()]
+    };
+    content_processing::source_hash_for_item(&translations::TranslationRequestItemInput {
+        producer_ref: String::new(),
+        kind: kind.to_owned(),
+        variant: variant.to_owned(),
+        entity_id: entity_id.to_owned(),
+        target_lang: "zh-CN".to_owned(),
+        max_wait_ms: 0,
+        source_blocks,
+        target_slots,
+    })
+}
+
+fn global_release_source_hash(
+    release_id: i64,
+    repo_full_name: &str,
+    tag_name: &str,
+    name: Option<&str>,
+    body: Option<&str>,
+    kind: &str,
+    variant: &str,
+) -> String {
+    let title = name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(tag_name)
+        .to_owned();
+    global_source_hash_from_fields(
+        kind,
+        variant,
+        &release_id.to_string(),
+        format!("{repo_full_name}\n{tag_name}"),
+        title,
+        body.map(|value| value.replace("\r\n", "\n")),
+    )
+}
+
+fn global_announcement_source_hash(
+    discussion_key: &str,
+    repo_full_name: &str,
+    discussion_number: i64,
+    title: &str,
+    body: Option<&str>,
+    kind: &str,
+    variant: &str,
+) -> String {
+    global_source_hash_from_fields(
+        kind,
+        variant,
+        discussion_key,
+        announcement_translation_metadata_text(repo_full_name, Some(discussion_number)),
+        title.to_owned(),
+        body.map(|value| value.replace("\r\n", "\n")),
+    )
 }
 
 async fn global_release_request_item(

@@ -211,6 +211,7 @@ export type TranslateBatchItem = {
 		| "disabled"
 		| "missing"
 		| "error"
+		| "failed"
 		| "processing"
 		| "queued"
 		| "running"

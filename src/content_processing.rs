@@ -98,6 +98,24 @@ pub async fn legacy_mode_in_transaction(tx: &mut Transaction<'_, Sqlite>) -> Res
         .is_none_or(|mode| mode == ContentProcessingMode::Legacy))
 }
 
+async fn ensure_global_mode_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> Result<(), ApiError> {
+    let mode =
+        sqlx::query_scalar::<_, String>("SELECT mode FROM content_processing_control WHERE id = 1")
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(ApiError::internal)?;
+    if mode.as_deref() == Some(ContentProcessingMode::Global.as_str()) {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "content_processing_transition",
+        "content processing is not in global mode; poll the request status before retrying",
+    ))
+}
+
 #[allow(dead_code)]
 pub async fn transition_to_global(pool: &SqlitePool, switch_token: &str) -> Result<bool> {
     let mut tx = pool
@@ -214,6 +232,8 @@ pub struct GlobalSubmissionResponse {
     pub status: String,
     pub poll_url: String,
     pub result: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -303,6 +323,10 @@ fn source_hash(item: &translations::TranslationRequestItemInput) -> Result<Strin
     )))
 }
 
+pub(crate) fn source_hash_for_item(item: &translations::TranslationRequestItemInput) -> String {
+    source_hash(item).expect("translation request source fields are serializable")
+}
+
 fn configuration_fingerprint(model_profile: &str) -> String {
     ai::sha256_hex(&format!("{GLOBAL_PROTOCOL_VERSION}\nmodel={model_profile}"))
 }
@@ -352,6 +376,13 @@ fn request_result(work: &WorkRow, projection: Option<Value>) -> Value {
 }
 
 fn kind_for_work(work: &WorkRow) -> String {
+    if work.canonical_resource_type == "notification" {
+        return if work.variant == "smart" {
+            "notification_smart".to_owned()
+        } else {
+            "notification".to_owned()
+        };
+    }
     match work.variant.as_str() {
         "detail" => format!("{}_detail", work.canonical_resource_type),
         "smart" => format!("{}_smart", work.canonical_resource_type),
@@ -479,6 +510,7 @@ pub async fn submit_item(
         .begin_immediate(&state.pool, "content_processing_submit")
         .await
         .map_err(ApiError::internal)?;
+    ensure_global_mode_in_transaction(&mut tx).await?;
     let existing = sqlx::query_as::<_, WorkRow>(
         "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND source_hash = ? AND protocol_version = ? AND model_profile = ? LIMIT 1",
     )
@@ -605,6 +637,7 @@ pub async fn submit_item(
                 status: work.status.clone(),
                 poll_url,
                 result,
+                error: None,
             },
         ));
     }
@@ -634,7 +667,14 @@ pub async fn submit_item(
         status: work.status.clone(),
         poll_url: format!("/api/translate/requests/{request_id}"),
         result,
+        error: None,
     };
+    if status_code == StatusCode::CONFLICT {
+        body.error = Some(json!({
+            "code": "content_processing_active",
+            "message": "content processing is already queued or running",
+        }));
+    }
     if mode == "wait" {
         let deadline = std::time::Instant::now()
             + Duration::from_millis(
@@ -739,26 +779,17 @@ pub async fn read_global_resource(
     resource_id: &str,
     pipeline: &str,
     variant: &str,
+    expected_source_hash: &str,
 ) -> Result<Option<(String, Value)>, ApiError> {
     let row = sqlx::query(
-        "SELECT COALESCE((SELECT status FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = 'zh-CN' ORDER BY updated_at DESC, id DESC LIMIT 1), 'ready') AS status, (SELECT payload_json FROM content_result_projections WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = 'zh-CN' ORDER BY updated_at DESC, id DESC LIMIT 1) AS payload_json, CASE WHEN EXISTS (SELECT 1 FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = 'zh-CN') OR EXISTS (SELECT 1 FROM content_result_projections WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = 'zh-CN') THEN 1 ELSE 0 END AS present",
+        "WITH params(resource_type, resource_id, pipeline, variant, source_hash, protocol_version) AS (SELECT ?, ?, ?, ?, ?, ?) SELECT COALESCE((SELECT status FROM content_work_items w, params p WHERE w.canonical_resource_type = p.resource_type AND w.canonical_resource_id = p.resource_id AND w.pipeline = p.pipeline AND w.variant = p.variant AND w.target_lang = 'zh-CN' AND w.source_hash = p.source_hash AND w.protocol_version = p.protocol_version ORDER BY datetime(w.updated_at) DESC, w.id DESC LIMIT 1), 'ready') AS status, (SELECT p.payload_json FROM content_result_projections p, params x WHERE p.canonical_resource_type = x.resource_type AND p.canonical_resource_id = x.resource_id AND p.pipeline = x.pipeline AND p.variant = x.variant AND p.target_lang = 'zh-CN' AND p.protocol_version = x.protocol_version ORDER BY datetime(p.updated_at) DESC, p.id DESC LIMIT 1) AS payload_json, CASE WHEN EXISTS (SELECT 1 FROM content_work_items w, params p WHERE w.canonical_resource_type = p.resource_type AND w.canonical_resource_id = p.resource_id AND w.pipeline = p.pipeline AND w.variant = p.variant AND w.target_lang = 'zh-CN' AND w.source_hash = p.source_hash AND w.protocol_version = p.protocol_version) OR EXISTS (SELECT 1 FROM content_result_projections p, params x WHERE p.canonical_resource_type = x.resource_type AND p.canonical_resource_id = x.resource_id AND p.pipeline = x.pipeline AND p.variant = x.variant AND p.target_lang = 'zh-CN' AND p.protocol_version = x.protocol_version) THEN 1 ELSE 0 END AS present",
     )
     .bind(resource_type)
     .bind(resource_id)
     .bind(pipeline)
     .bind(variant)
-    .bind(resource_type)
-    .bind(resource_id)
-    .bind(pipeline)
-    .bind(variant)
-    .bind(resource_type)
-    .bind(resource_id)
-    .bind(pipeline)
-    .bind(variant)
-    .bind(resource_type)
-    .bind(resource_id)
-    .bind(pipeline)
-    .bind(variant)
+    .bind(expected_source_hash)
+    .bind(GLOBAL_PROTOCOL_VERSION)
     .fetch_optional(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -787,6 +818,7 @@ pub async fn retry_request(
         .begin_immediate(&state.pool, "content_processing_retry")
         .await
         .map_err(ApiError::internal)?;
+    ensure_global_mode_in_transaction(&mut tx).await?;
     let row = sqlx::query_as::<_, WorkRow>(
         "SELECT w.id, w.canonical_resource_type, w.canonical_resource_id, w.pipeline, w.variant, w.target_lang, w.source_hash, w.protocol_version, w.model_profile, w.source_snapshot_json, w.configuration_fingerprint, w.status, w.priority, w.cache_hit, w.token_estimate, w.batch_id, w.attempt_count, w.next_retry_at, w.retry_expires_at, w.retry_after_at, w.created_at FROM content_request_links l JOIN content_work_items w ON w.id = l.work_item_id WHERE l.request_id = ? AND l.requester_id = ? LIMIT 1",
     )
@@ -891,6 +923,7 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_claim")
         .await?;
+    ensure_global_mode_in_transaction(&mut tx).await?;
     let Some(row) = sqlx::query_as::<_, WorkRow>(
         "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE status = 'queued' AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (priority >= 3 OR datetime(created_at) <= datetime('now', '-60 seconds')) AND (priority < 3 OR (SELECT COUNT(*) FROM content_batches WHERE status = 'running' AND trigger_reason = 'manual_retry') < ?) ORDER BY priority DESC, datetime(created_at) ASC, id ASC LIMIT 1",
     )
@@ -964,6 +997,7 @@ async fn recover_due(state: &AppState) -> Result<()> {
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_recover")
         .await?;
+    ensure_global_mode_in_transaction(&mut tx).await?;
     sqlx::query(
         "UPDATE content_work_items SET status = 'queued', next_retry_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(?) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(?))",
     )
@@ -1008,6 +1042,7 @@ async fn defer_queued_for_provider(state: &AppState) -> Result<()> {
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_defer_provider")
         .await?;
+    ensure_global_mode_in_transaction(&mut tx).await?;
     sqlx::query("UPDATE content_work_items SET status = 'deferred_provider', next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), updated_at = CURRENT_TIMESTAMP WHERE status = 'queued'")
         .bind(&retry_at)
         .bind((Utc::now() + chrono::Duration::hours(24)).to_rfc3339())
