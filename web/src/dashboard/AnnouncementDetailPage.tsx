@@ -111,6 +111,12 @@ function hasTranslatedProjection(
 	return Boolean(translated?.title?.trim() || translated?.summary?.trim());
 }
 
+function hasSmartProjection(
+	smart: AnnouncementDetailResponse["smart"] | null | undefined,
+) {
+	return Boolean(smart?.title?.trim() || smart?.summary?.trim());
+}
+
 function shouldResolveSmart(
 	smart: AnnouncementDetailResponse["smart"] | null | undefined,
 ) {
@@ -517,8 +523,9 @@ export function AnnouncementDetailPage(props: {
 		const translatedTitle = hasTranslatedProjection(detail.translated)
 			? detail.translated?.title
 			: null;
-		const smartTitle =
-			detail.smart?.status === "ready" ? detail.smart.title : null;
+		const smartTitle = hasSmartProjection(detail.smart)
+			? detail.smart?.title
+			: null;
 		const title =
 			selectedLane === "translated"
 				? translatedTitle?.trim() || originalTitle
@@ -528,8 +535,9 @@ export function AnnouncementDetailPage(props: {
 		const translatedBody = hasTranslatedProjection(detail.translated)
 			? detail.translated?.summary
 			: null;
-		const smartBody =
-			detail.smart?.status === "ready" ? detail.smart.summary : null;
+		const smartBody = hasSmartProjection(detail.smart)
+			? detail.smart?.summary
+			: null;
 		const originalBody = detail.body?.trim() ? detail.body : null;
 		const body =
 			selectedLane === "translated"

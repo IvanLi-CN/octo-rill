@@ -27,6 +27,11 @@
 
 ## State and Publication Invariants
 
+The scheduler-owned admission/retry transaction may create or requeue a work item
+after an API adapter has completed authorization. API adapters do not perform
+provider calls or write attempt events, model-call links, or terminal result
+projections; those writes remain worker-owned.
+
 - `content_work_items.status` is one of `queued`, `running`, `ready`, `failed`, `not_applicable`, `deferred_provider`, `blocked_config`, `cancelled` or `superseded`.
 - `queued -> running` is scheduler claim only. `running -> ready` requires a valid output; `running -> failed` records a terminal attempt; `running -> blocked_config` and `running -> deferred_provider` preserve a non-provider execution block; `running -> cancelled` or `running -> superseded` requires source cancellation or replacement. `not_applicable` is terminal without a provider call.
 - A structured recoverable `failed` attempt can transition through a recorded recovery event back to `queued`; a manual retry may take a terminal `failed` item to `queued` only after its cooldown. A scheduler-controlled provider probe may take `deferred_provider` to `queued`. No other actor may do so.
