@@ -1390,7 +1390,7 @@ async fn load_global_attempts(
         Err(error) => return Err(ApiError::internal(error)),
     };
     let mut call_query = QueryBuilder::<Sqlite>::new(
-        "SELECT id, status, model FROM content_attempt_llm_calls WHERE attempt_event_id IN (",
+        "SELECT id, attempt_event_id, status, model FROM content_attempt_llm_calls WHERE attempt_event_id IN (",
     );
     {
         let mut separated = call_query.separated(", ");

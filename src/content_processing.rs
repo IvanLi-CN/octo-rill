@@ -1152,6 +1152,14 @@ async fn recover_due(state: &AppState) -> Result<()> {
         .await?;
     ensure_global_mode_in_transaction(&mut tx).await?;
     sqlx::query(
+        "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), id, attempt_count, 'automatic_recovery', 'attempt_queued', 'queued', 1, ? FROM content_work_items WHERE status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(?) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(?))",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
         "UPDATE content_work_items SET status = 'queued', next_retry_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(?) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(?))",
     )
     .bind(&now)
@@ -1168,7 +1176,7 @@ async fn recover_due(state: &AppState) -> Result<()> {
     .await?;
     let expired_running = "status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(?)";
     sqlx::query(&format!(
-        "UPDATE content_batch_items SET result_status = 'failed', error_code = 'runtime_lease_expired', updated_at = ? WHERE work_item_id IN (SELECT id FROM content_work_items WHERE {expired_running})"
+        "UPDATE content_batch_items SET result_status = 'failed', error_code = 'runtime_lease_expired', updated_at = ? WHERE work_item_id IN (SELECT id FROM content_work_items WHERE {expired_running}) AND batch_id IN (SELECT batch_id FROM content_work_items WHERE {expired_running} AND batch_id IS NOT NULL)"
     ))
     .bind(&now)
     .bind(&now)
@@ -1575,9 +1583,20 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
         return Ok(());
     }
     let (system, user) = build_prompt(&snapshot, &work.pipeline);
+    let call_context = ai::LlmCallContext {
+        source: format!("content_processing.global.{}", work.pipeline),
+        requested_by: None,
+        parent_task_id: None,
+        parent_task_type: None,
+        parent_translation_batch_id: work.batch_id.clone(),
+        parent_brief_id: None,
+    };
     let result = tokio::time::timeout(
         Duration::from_secs(4 * 60),
-        ai::chat_completion_with_diagnostics(state, &system, &user, 3_000),
+        ai::with_llm_call_context(
+            call_context,
+            ai::chat_completion_with_diagnostics(state, &system, &user, 3_000),
+        ),
     )
     .await
     .map_err(|_| {
@@ -1720,10 +1739,21 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             .fetch_one(&mut *tx)
             .await?;
             let error_summary = translations::translation_error_summary(Some(error_text.as_str()));
-            sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, error_code, error_summary, created_at) VALUES (?, ?, 'unknown', ?, 'failed', ?, ?, ?)")
+            let linked_call_audit = if let Some(batch_id) = work.batch_id.as_deref() {
+                sqlx::query_as::<_, (Option<String>, String)>(
+                    "SELECT provider_request_id, COALESCE(final_model, model) FROM llm_calls WHERE parent_translation_batch_id = ? ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
+                )
+                .bind(batch_id)
+                .fetch_optional(&mut *tx)
+                .await?
+            } else {
+                None
+            };
+            sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, error_code, error_summary, created_at) VALUES (?, ?, ?, ?, 'failed', ?, ?, ?)")
                 .bind(local_id::generate_local_id().to_string())
                 .bind(&attempt_event_id)
-                .bind(&work.model_profile)
+                .bind(linked_call_audit.as_ref().and_then(|(provider_id, _)| provider_id.as_deref()).unwrap_or("unknown"))
+                .bind(linked_call_audit.as_ref().map_or(work.model_profile.as_str(), |(_, model)| model.as_str()))
                 .bind(&class)
                 .bind(error_summary.as_deref())
                 .bind(&now)
@@ -1737,6 +1767,14 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(&now)
                 .bind(&now)
                 .bind(&work.id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE content_batch_items SET result_status = 'failed', error_code = ?, error_summary = ?, updated_at = ? WHERE work_item_id = ? AND batch_id = ?")
+                .bind(&class)
+                .bind(error_summary.as_deref())
+                .bind(&now)
+                .bind(&work.id)
+                .bind(work.batch_id.as_deref().unwrap_or_default())
                 .execute(&mut *tx)
                 .await?;
             sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, next_retry_at, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'failed', ?, ?, ?, ?, ?, ? FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started'")
@@ -1791,25 +1829,33 @@ pub async fn run_once(state: &AppState) -> Result<()> {
 
 pub fn spawn_global_scheduler(state: Arc<AppState>) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
-        let worker_count = state
-            .translation_scheduler
-            .desired_config()
-            .await
-            .general_worker_concurrency
-            .max(1);
         let mut workers = JoinSet::new();
-        for _ in 0..worker_count {
-            let worker_state = state.clone();
-            workers.spawn(async move {
-                loop {
-                    if let Err(error) = run_once(worker_state.as_ref()).await {
-                        warn!(?error, "global content processing scheduler failed");
-                    }
-                    sleep(Duration::from_millis(250)).await;
+        let mut worker_count = 0usize;
+        loop {
+            let desired = state
+                .translation_scheduler
+                .desired_config()
+                .await
+                .general_worker_concurrency
+                .max(1);
+            if desired != worker_count {
+                workers.abort_all();
+                while workers.join_next().await.is_some() {}
+                for _ in 0..desired {
+                    let worker_state = state.clone();
+                    workers.spawn(async move {
+                        loop {
+                            if let Err(error) = run_once(worker_state.as_ref()).await {
+                                warn!(?error, "global content processing scheduler failed");
+                            }
+                            sleep(Duration::from_millis(250)).await;
+                        }
+                    });
                 }
-            });
+                worker_count = desired;
+            }
+            sleep(Duration::from_millis(250)).await;
         }
-        while workers.join_next().await.is_some() {}
     })
     .abort_handle()
 }
