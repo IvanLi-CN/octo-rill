@@ -1926,10 +1926,24 @@ export function isPendingTranslationResultStatus(
 export async function apiRetryTranslationRequest(
 	requestId: string,
 ): Promise<TranslationRequestResponse> {
-	return apiPostJson<TranslationRequestResponse>(
-		`/api/translate/requests/${encodeURIComponent(requestId)}/retry`,
-		{},
-	);
+	try {
+		return await apiPostJson<TranslationRequestResponse>(
+			`/api/translate/requests/${encodeURIComponent(requestId)}/retry`,
+			{},
+		);
+	} catch (error) {
+		if (
+			error instanceof ApiError &&
+			error.status === 409 &&
+			error.code === "content_processing_active" &&
+			error.payload &&
+			typeof error.payload === "object" &&
+			"request_id" in error.payload
+		) {
+			return error.payload as TranslationRequestResponse;
+		}
+		throw error;
+	}
 }
 
 export function mapTranslationResultToReleaseDetailTranslated(
@@ -2007,11 +2021,23 @@ export function mapTranslationResultToAnnouncementDetailSmart(
 }
 export type TranslationBatchSubmitItemResponse = {
 	request_id: string;
-	status: "queued" | "running" | "completed" | "failed";
-	producer_ref: string;
-	entity_id: string;
-	kind: string;
-	variant: string;
+	status:
+		| "queued"
+		| "running"
+		| "completed"
+		| "failed"
+		| "ready"
+		| "deferred_provider"
+		| "blocked_config"
+		| "cancelled"
+		| "superseded";
+	producer_ref?: string;
+	entity_id?: string;
+	kind?: string;
+	variant?: string;
+	work_item_id?: string;
+	poll_url?: string;
+	result?: TranslationResultItem;
 };
 export type TranslationBatchSubmitResponse = {
 	requests: TranslationBatchSubmitItemResponse[];
@@ -2285,9 +2311,11 @@ export async function apiSubmitTranslationRequest(
 			error.code === "content_processing_active" &&
 			error.payload &&
 			typeof error.payload === "object" &&
-			"request_id" in error.payload
+			("request_id" in error.payload || "requests" in error.payload)
 		) {
-			return error.payload as TranslationRequestResponse;
+			return error.payload as
+				| TranslationRequestResponse
+				| TranslationBatchSubmitResponse;
 		}
 		throw error;
 	}

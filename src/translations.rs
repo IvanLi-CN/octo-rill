@@ -2066,7 +2066,14 @@ async fn submit_global_translation_request(
                 }
                 responses.push(response);
             }
-            Ok((status, Json(json!({ "requests": responses }))).into_response())
+            let mut body = json!({ "requests": responses });
+            if status == StatusCode::CONFLICT {
+                body["error"] = json!({
+                    "code": "content_processing_active",
+                    "message": "one or more content-processing requests are already queued or running",
+                });
+            }
+            Ok((status, Json(body)).into_response())
         }
     }
 }
@@ -2276,6 +2283,7 @@ pub async fn resolve_translation_results(
                         status,
                         poll_url,
                         result,
+                        error: None,
                     },
                 )
             } else {
@@ -3206,6 +3214,7 @@ async fn resolve_translation_results_for_user(
         .begin_immediate(&state.pool, "translation_result_resolve")
         .await
         .map_err(ApiError::internal)?;
+    ensure_legacy_writer_transaction(&mut tx).await?;
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         let canonical_item = canonicalize_translation_result_item(&mut tx, user_id, item).await?;
