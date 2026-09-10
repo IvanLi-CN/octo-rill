@@ -84,3 +84,29 @@
   submission_gate: pending-owner-approval
   evidence_note: 移动宽度下详情内容不横向溢出，长模型标识可断行。
   image: ![AI operations records mobile](./assets/ai-operations-records-mobile.png)
+
+- source_type: storybook_canvas
+  story_id_or_title: Content Projection Retention/RetainedPolishProjectionRelease
+  state: release retained smart projection
+  requested_viewport: 1440x1000
+  viewport_strategy: storybook-viewport
+  capture_scope: browser-viewport
+  margin_policy: trim_only
+  evidence_surface: page
+  sensitive_exclusion: N/A (mock-only Storybook fixture)
+  submission_gate: pending-owner-approval
+  evidence_note: Release 详情在全局接口以 ready + auto_translate 形状返回时，保留已有润色投影并继续显示“润色”入口。
+  image: ![Release retained smart projection](./assets/content-projection-retention-release.png)
+
+- source_type: storybook_canvas
+  story_id_or_title: Content Projection Retention/RetainedPolishProjectionAnnouncement
+  state: announcement retained smart projection
+  requested_viewport: 393x852
+  viewport_strategy: storybook-viewport
+  capture_scope: browser-viewport
+  margin_policy: trim_only
+  evidence_surface: page
+  sensitive_exclusion: N/A (mock-only Storybook fixture)
+  submission_gate: pending-owner-approval
+  evidence_note: 公告详情与 Release 使用同一全局润色投影合同，移动宽度下保留摘要且不改名“润色”。
+  image: ![Announcement retained smart projection](./assets/content-projection-retention-announcement-mobile.png)
