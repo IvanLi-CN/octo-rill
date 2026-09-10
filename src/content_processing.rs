@@ -904,6 +904,29 @@ pub async fn submit_item(
         .await
         .map_err(ApiError::internal)?
     };
+    let supersedes_work_item_id = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT supersedes_work_item_id FROM content_work_items WHERE id = ?",
+    )
+    .bind(&work.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    if let Some(supersedes_work_item_id) = supersedes_work_item_id {
+        sqlx::query("UPDATE content_result_projections SET active_work_item_id = ?, updated_at = ? WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND work_item_id = ? AND (active_work_item_id IS NULL OR active_work_item_id <> ?)")
+            .bind(&work.id)
+            .bind(&now)
+            .bind(resource_type)
+            .bind(&item.entity_id)
+            .bind(pipeline)
+            .bind(&item.variant)
+            .bind(&item.target_lang)
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(&supersedes_work_item_id)
+            .bind(&work.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
+    }
     sqlx::query("UPDATE content_result_projections SET active_work_item_id = ?, updated_at = ? WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND model_profile = ? AND source_hash = ? AND (active_work_item_id IS NULL OR active_work_item_id <> ?)")
         .bind(&work.id)
         .bind(&now)
@@ -1099,8 +1122,8 @@ pub async fn read_global_resource(
     expected_source_hash: &str,
 ) -> Result<Option<(String, Value)>, ApiError> {
     let model_profile = current_model_profile(state).await;
-    let current = sqlx::query_as::<_, (String, String, Option<String>)>(
-        "SELECT id, status, supersedes_work_item_id FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = 'zh-CN' AND source_hash = ? AND protocol_version = ? AND model_profile = ? ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
+    let current = sqlx::query_as::<_, (String, String, Option<String>, String)>(
+        "SELECT id, status, supersedes_work_item_id, model_profile FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = 'zh-CN' AND source_hash = ? AND protocol_version = ? AND model_profile = ? ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
     )
     .bind(resource_type)
     .bind(resource_id)
@@ -1112,7 +1135,23 @@ pub async fn read_global_resource(
     .fetch_optional(&state.pool)
     .await
     .map_err(ApiError::internal)?;
-    let status = if let Some((_, status, _)) = &current {
+    let current = if current.is_some() {
+        current
+    } else {
+        sqlx::query_as::<_, (String, String, Option<String>, String)>(
+            "SELECT id, status, supersedes_work_item_id, model_profile FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = 'zh-CN' AND source_hash = ? AND protocol_version = ? ORDER BY CASE status WHEN 'ready' THEN 0 WHEN 'queued' THEN 1 WHEN 'running' THEN 2 WHEN 'deferred_provider' THEN 3 WHEN 'blocked_config' THEN 4 ELSE 5 END, datetime(updated_at) DESC, id DESC LIMIT 1",
+        )
+        .bind(resource_type)
+        .bind(resource_id)
+        .bind(pipeline)
+        .bind(variant)
+        .bind(expected_source_hash)
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+    };
+    let status = if let Some((_, status, _, _)) = &current {
         status.clone()
     } else {
         sqlx::query_scalar::<_, String>(
@@ -1130,20 +1169,20 @@ pub async fn read_global_resource(
         .unwrap_or_else(|| "ready".to_owned())
     };
     let exact_projection = sqlx::query_scalar::<_, String>(
-        "SELECT payload_json FROM content_result_projections WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = 'zh-CN' AND protocol_version = ? AND model_profile = ? AND source_hash = ? LIMIT 1",
+        "SELECT payload_json FROM content_result_projections WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = 'zh-CN' AND protocol_version = ? AND source_hash = ? ORDER BY CASE WHEN model_profile = ? THEN 0 ELSE 1 END, datetime(updated_at) DESC, id DESC LIMIT 1",
     )
     .bind(resource_type)
     .bind(resource_id)
     .bind(pipeline)
     .bind(variant)
     .bind(GLOBAL_PROTOCOL_VERSION)
-    .bind(&model_profile)
     .bind(expected_source_hash)
+    .bind(&model_profile)
     .fetch_optional(&state.pool)
     .await
     .map_err(ApiError::internal)?;
     let retained_projection = if exact_projection.is_none() {
-        if let Some((_, _, Some(superseded_id))) = &current {
+        if let Some((_, _, Some(superseded_id), _)) = &current {
             sqlx::query_scalar::<_, String>(
                 "SELECT p.payload_json FROM content_result_projections p WHERE p.canonical_resource_type = ? AND p.canonical_resource_id = ? AND p.pipeline = ? AND p.variant = ? AND p.target_lang = 'zh-CN' AND p.protocol_version = ? AND p.work_item_id = ? LIMIT 1",
             )
@@ -2652,6 +2691,39 @@ mod tests {
             error,
             sqlx::migrate::MigrateError::VersionMissing(CONTENT_PROCESSING_MIGRATION_VERSION)
         ));
+    }
+
+    #[tokio::test]
+    async fn ready_projection_remains_readable_after_model_profile_changes() {
+        let pool = global_pool().await;
+        insert_test_work(&pool, "model-a-work", "ready", 0, None).await;
+        sqlx::query(
+            "INSERT INTO content_result_projections (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash, work_item_id, active_work_item_id, payload_json, published_at, updated_at) VALUES (?, 'release', 'release-1', 'translation', 'summary', 'zh-CN', ?, 'test-model', 'hash-1', ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind("model-a-projection")
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .bind("model-a-work")
+        .bind("model-a-work")
+        .bind(r#"{"title_zh":"保留标题","body_md":"保留摘要"}"#)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = global_state(pool);
+        let (status, payload) = read_global_resource(
+            &state,
+            "release",
+            "release-1",
+            "translation",
+            "summary",
+            "hash-1",
+        )
+        .await
+        .unwrap()
+        .expect("ready projection should survive a model-profile change");
+        assert_eq!(status, "ready");
+        assert_eq!(payload["title_zh"], "保留标题");
+        assert_eq!(payload["body_md"], "保留摘要");
     }
 
     #[test]
