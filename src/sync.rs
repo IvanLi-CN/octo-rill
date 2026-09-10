@@ -1849,7 +1849,7 @@ where
 }
 
 pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleasesResult> {
-    let before_release_ids = load_release_ids_for_user(state, user_id).await?;
+    let before_release_updates = load_release_updated_at_for_user(state, user_id).await?;
     let _owned_release_visibility_refreshed =
         refresh_owned_repo_release_visibility(state, user_id).await?;
     let demand = attach_and_wait_for_user_release_demand(
@@ -1861,14 +1861,16 @@ pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleas
     )
     .await?;
 
-    let after_release_ids = load_release_ids_for_user(state, user_id).await?;
-    let mut new_release_ids = after_release_ids
-        .difference(&before_release_ids)
-        .copied()
+    let after_release_updates = load_release_updated_at_for_user(state, user_id).await?;
+    let mut changed_release_ids = after_release_updates
+        .into_iter()
+        .filter_map(|(release_id, updated_at)| {
+            (before_release_updates.get(&release_id) != Some(&updated_at)).then_some(release_id)
+        })
         .collect::<Vec<_>>();
-    new_release_ids.sort_unstable_by(|left, right| right.cmp(left));
+    changed_release_ids.sort_unstable_by(|left, right| right.cmp(left));
     let smart_preheat_release_ids = merge_smart_preheat_release_ids(
-        &new_release_ids,
+        &changed_release_ids,
         &load_recent_release_ids_for_user(state, user_id, SMART_PREHEAT_RECENT_RELEASE_LIMIT)
             .await
             .unwrap_or_else(|err| {
@@ -1883,7 +1885,7 @@ pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleas
     if let Err(err) = enqueue_background_release_translation_task(
         state,
         user_id,
-        &new_release_ids,
+        &changed_release_ids,
         "sync.releases.auto_translate",
         None,
         Some(user_id),
@@ -3655,10 +3657,13 @@ async fn materialize_repo_star_current_members_tx(
     Ok(inserted)
 }
 
-async fn load_release_ids_for_user(state: &AppState, user_id: &str) -> Result<HashSet<i64>> {
-    let rows = sqlx::query_scalar::<_, i64>(
+async fn load_release_updated_at_for_user(
+    state: &AppState,
+    user_id: &str,
+) -> Result<HashMap<i64, String>> {
+    let rows = sqlx::query_as::<_, (i64, String)>(
         r#"
-        SELECT DISTINCT r.release_id
+        SELECT DISTINCT r.release_id, r.updated_at
         FROM repo_releases r
         JOIN user_following_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
@@ -3667,7 +3672,7 @@ async fn load_release_ids_for_user(state: &AppState, user_id: &str) -> Result<Ha
     .bind(user_id)
     .fetch_all(&state.pool)
     .await
-    .context("failed to query release ids for user")?;
+    .context("failed to query release update markers for user")?;
     Ok(rows.into_iter().collect())
 }
 

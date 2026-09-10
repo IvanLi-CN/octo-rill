@@ -331,7 +331,10 @@ function StatusFilterMenu({
 					<ChevronDown aria-hidden="true" className="size-4 shrink-0" />
 				</Button>
 			</PopoverTrigger>
-			<PopoverContent align="start" className="space-y-2 p-2">
+			<PopoverContent
+				align="start"
+				className="max-h-[min(70vh,32rem)] space-y-2 overflow-y-auto p-2"
+			>
 				<div className="flex items-center justify-between px-2 py-1">
 					<span className="font-medium text-sm">{label}状态</span>
 					{value.length > 0 ? (
