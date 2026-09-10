@@ -1135,6 +1135,17 @@ pub async fn retry_request(
     let next_retry_at = breaker_open
         .then(|| (Utc::now() + chrono::Duration::seconds(PROVIDER_DEFER_SECS)).to_rfc3339());
     let retry_expires_at = (Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+    let previous_attempt_no = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MAX(attempt_no) FROM content_attempt_events WHERE work_item_id = ?",
+    )
+    .bind(&row.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?
+    .unwrap_or(row.attempt_count)
+    .max(row.attempt_count)
+    .max(0);
+    let next_attempt_no = previous_attempt_no.saturating_add(1);
     sqlx::query("UPDATE content_work_items SET status = ?, priority = 3, next_retry_at = ?, retry_expires_at = ?, retry_after_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .bind(retry_status)
         .bind(&next_retry_at)
@@ -1153,11 +1164,10 @@ pub async fn retry_request(
     )
     .await
     .map_err(ApiError::internal)?;
-    sqlx::query("INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, next_retry_at, created_at) VALUES (?, ?, CASE WHEN ? < 1 THEN 1 ELSE ? + 1 END, 'manual_retry', 'attempt_queued', ?, 1, ?, CURRENT_TIMESTAMP)")
+    sqlx::query("INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, next_retry_at, created_at) VALUES (?, ?, ?, 'manual_retry', 'attempt_queued', ?, 1, ?, CURRENT_TIMESTAMP)")
         .bind(local_id::generate_local_id().to_string())
         .bind(&row.id)
-        .bind(row.attempt_count)
-        .bind(row.attempt_count)
+        .bind(next_attempt_no)
         .bind(retry_status)
         .bind(&next_retry_at)
         .execute(&mut *tx)
