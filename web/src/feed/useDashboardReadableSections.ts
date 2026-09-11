@@ -99,6 +99,7 @@ export function useDashboardReadableSections(options?: {
 	const detailsRef = useRef(details);
 	detailsRef.current = details;
 	const requestIdRef = useRef(0);
+	const refreshInFlightRef = useRef(false);
 	const cursorInFlightRef = useRef(new Set<string>());
 	const cursorCompletedRef = useRef(new Set<string>());
 	const detailCursorInFlightRef = useRef(new Set<string>());
@@ -106,6 +107,7 @@ export function useDashboardReadableSections(options?: {
 
 	const loadSections = useCallback(async (preserveContent: boolean) => {
 		const requestId = ++requestIdRef.current;
+		refreshInFlightRef.current = preserveContent;
 		cursorInFlightRef.current.clear();
 		cursorCompletedRef.current.clear();
 		detailCursorInFlightRef.current.clear();
@@ -120,6 +122,15 @@ export function useDashboardReadableSections(options?: {
 			setSections([]);
 			setNextCursor(null);
 			setDetails({});
+		} else {
+			setDetails((current) =>
+				Object.fromEntries(
+					Object.entries(current).map(([sectionId, detail]) => [
+						sectionId,
+						{ ...detail, loading: false },
+					]),
+				),
+			);
 		}
 		let usedLegacyFallback = false;
 		try {
@@ -188,7 +199,10 @@ export function useDashboardReadableSections(options?: {
 				at: Date.now(),
 			});
 		} finally {
-			if (requestId === requestIdRef.current) setLoadingInitial(false);
+			if (requestId === requestIdRef.current) {
+				refreshInFlightRef.current = false;
+				setLoadingInitial(false);
+			}
 		}
 	}, []);
 
@@ -197,6 +211,7 @@ export function useDashboardReadableSections(options?: {
 
 	useEffect(() => {
 		if (!enabled) {
+			refreshInFlightRef.current = false;
 			setLoadingInitial(false);
 			setLoadingMore(false);
 			setError(null);
@@ -218,6 +233,7 @@ export function useDashboardReadableSections(options?: {
 		const requestKey = `${requestId}:${cursor ?? ""}`;
 		if (
 			!cursor ||
+			refreshInFlightRef.current ||
 			loadingMore ||
 			loadingInitial ||
 			cursorInFlightRef.current.has(requestKey) ||

@@ -2053,6 +2053,12 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 	page,
 }) => {
 	let feedCalls = 0;
+	let taskCompleted = false;
+	page.on("console", (message) => {
+		if (message.text() === "readable-sync-task-completed") {
+			taskCompleted = true;
+		}
+	});
 	await page.addInitScript(
 		({ taskId }) => {
 			type TestWindow = Window & {
@@ -2064,10 +2070,15 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 			state.__taskEventSourceCount = 0;
 			let contentSeen = false;
 			let skeletonVisible = false;
+			const contentReadyCallbacks: Array<() => void> = [];
 			const observeReadableState = () => {
-				contentSeen =
-					contentSeen ||
-					Boolean(document.querySelector("[data-readable-section-list]"));
+				const nextContentSeen = Boolean(
+					document.querySelector("[data-readable-section-list]"),
+				);
+				if (!contentSeen && nextContentSeen) {
+					contentSeen = true;
+					for (const callback of contentReadyCallbacks.splice(0)) callback();
+				}
 				const nextSkeletonVisible = Boolean(
 					document.querySelector("[data-readable-loading-initial]") &&
 						document.querySelector("[data-readable-loading-skeleton]"),
@@ -2097,13 +2108,13 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 			const taskEventPlan = [
 				{
 					index: 0,
-					delay: 1000,
+					delay: 500,
 					type: "task.running",
 					payload: { task_id: taskId, status: "running" },
 				},
 				{
 					index: 1,
-					delay: 3000,
+					delay: 1200,
 					type: "task.progress",
 					payload: {
 						task_id: taskId,
@@ -2113,7 +2124,7 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 				},
 				{
 					index: 2,
-					delay: 7000,
+					delay: 2600,
 					type: "task.completed",
 					payload: { task_id: taskId, status: "succeeded" },
 				},
@@ -2134,6 +2145,7 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 					Set<(event: Event | MessageEvent<string>) => unknown>
 				>();
 				private timers: number[] = [];
+				private startOnContentReady: (() => void) | null = null;
 
 				constructor(url: string | URL) {
 					this.url = String(url);
@@ -2148,20 +2160,33 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 					if (!this.url.endsWith(`/api/tasks/${taskId}/events`)) return;
 					state.__taskEventSourceCount =
 						(state.__taskEventSourceCount ?? 0) + 1;
-					for (const taskEvent of taskEventPlan) {
-						const replay = emittedTaskEvents.has(taskEvent.index);
-						this.timers.push(
-							window.setTimeout(
-								() => {
-									if (!replay) {
-										if (emittedTaskEvents.has(taskEvent.index)) return;
-										emittedTaskEvents.add(taskEvent.index);
-									}
-									this.dispatch(taskEvent.type, taskEvent.payload);
-								},
-								replay ? 0 : taskEvent.delay,
-							),
-						);
+					const scheduleTaskEvents = () => {
+						for (const taskEvent of taskEventPlan) {
+							const replay = emittedTaskEvents.has(taskEvent.index);
+							this.timers.push(
+								window.setTimeout(
+									() => {
+										if (!replay) {
+											if (emittedTaskEvents.has(taskEvent.index)) return;
+											emittedTaskEvents.add(taskEvent.index);
+										}
+										const emit = () =>
+											this.dispatch(taskEvent.type, taskEvent.payload);
+										if (taskEvent.index === 2) {
+											console.log("readable-sync-task-completed");
+										}
+										emit();
+									},
+									replay ? 0 : taskEvent.delay,
+								),
+							);
+						}
+					};
+					if (contentSeen) {
+						scheduleTaskEvents();
+					} else {
+						this.startOnContentReady = scheduleTaskEvents;
+						contentReadyCallbacks.push(scheduleTaskEvents);
 					}
 				}
 
@@ -2183,6 +2208,13 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 
 				close() {
 					this.readyState = 2;
+					if (this.startOnContentReady) {
+						const index = contentReadyCallbacks.indexOf(
+							this.startOnContentReady,
+						);
+						if (index >= 0) contentReadyCallbacks.splice(index, 1);
+						this.startOnContentReady = null;
+					}
 					for (const timer of this.timers) window.clearTimeout(timer);
 					this.timers = [];
 				}
@@ -2243,7 +2275,7 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 			if (feedCalls > 1) {
 				await new Promise((resolve) => setTimeout(resolve, 350));
 			}
-			const title = feedCalls <= 2 ? "Cached release" : "Fresh release";
+			const title = taskCompleted ? "Fresh release" : "Cached release";
 			const item = buildReleaseFeedItem("readable-sync-item", { title });
 			return json(route, {
 				sections: [
@@ -2309,10 +2341,16 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 				.__taskEventSourceCount ?? 0,
 	);
 	expect(sourceCountAfterContent).toBeGreaterThan(0);
-	await expect(page.getByText("Fresh release")).toBeVisible({ timeout: 3000 });
+	const feedCallsAfterContent = feedCalls;
+	await expect
+		.poll(() => feedCalls, { timeout: 3000 })
+		.toBeGreaterThan(feedCallsAfterContent);
+	await expect(page.getByText("Cached release")).toBeVisible();
+	await expect(page.getByText("Fresh release")).toBeVisible({ timeout: 5000 });
 	await page.waitForTimeout(250);
 
 	expect(feedCalls).toBeGreaterThanOrEqual(2);
+	expect(taskCompleted).toBe(true);
 	expect(
 		await page.evaluate(
 			() =>
