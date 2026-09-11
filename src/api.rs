@@ -14386,7 +14386,7 @@ async fn enqueue_or_stream_task(
             status: task.status,
         })
         .into_response()),
-        ReturnMode::Sse => Ok(jobs::task_sse_response(state, task.task_id)),
+        ReturnMode::Sse => Ok(jobs::task_sse_response(state, task.task_id, None)),
         ReturnMode::Sync => Err(ApiError::internal("unexpected sync return mode")),
     }
 }
@@ -14408,7 +14408,7 @@ async fn enqueue_singleton_or_stream_task(
             status: task.status,
         })
         .into_response()),
-        ReturnMode::Sse => Ok(jobs::task_sse_response(state, task.task_id)),
+        ReturnMode::Sse => Ok(jobs::task_sse_response(state, task.task_id, None)),
         ReturnMode::Sync => Err(ApiError::internal("unexpected sync return mode")),
     }
 }
@@ -14439,7 +14439,12 @@ pub async fn task_events_sse(
             "task not found",
         ));
     }
-    Ok(jobs::task_sse_response(state, task_id))
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    Ok(jobs::task_sse_response(state, task_id, last_event_id))
 }
 
 async fn run_with_api_llm_context<F, T>(source: &str, requested_by: Option<String>, fut: F) -> T
@@ -25323,7 +25328,7 @@ mod tests {
         release_smart_diff_prompt, require_active_user_id, require_business_user_id,
         resolve_release_full_name, should_retry_public_compare_without_auth,
         smart_error_is_retryable, split_markdown_chunks, summarize_release_smart_candidate_with_ai,
-        sync_all, sync_notifications, sync_releases, sync_starred,
+        sync_all, sync_notifications, sync_releases, sync_starred, task_events_sse,
         translate_release_detail_for_user, translate_releases_batch_for_user,
         translate_response_from_batch_item, unpublish_repo_public_release, upsert_translation,
     };
@@ -25733,6 +25738,40 @@ mod tests {
             .await
             .expect("insert session user id");
         session
+    }
+
+    #[tokio::test]
+    async fn task_events_sse_keeps_task_ownership_boundary_independent_of_cursor() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "other-user", 0, 0).await;
+        let state = setup_state(pool.clone());
+        let task = jobs::enqueue_task(
+            state.as_ref(),
+            jobs::NewTask {
+                task_type: jobs::TASK_SYNC_RELEASES.to_owned(),
+                payload: serde_json::json!({}),
+                source: "test".to_owned(),
+                requested_by: Some(test_user_id(1)),
+                parent_task_id: None,
+            },
+        )
+        .await
+        .expect("enqueue task");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "last-event-id",
+            HeaderValue::from_static("event-from-another-task"),
+        );
+        let result = task_events_sse(
+            State(state),
+            setup_session(2).await,
+            headers,
+            Path(task.task_id),
+        )
+        .await;
+
+        assert!(result.is_err());
     }
 
     async fn seed_github_connection(
