@@ -170,6 +170,12 @@ export function useDashboardReadableSections(options?: {
 	const loadSections = useCallback(
 		async (preserveContent: boolean, options?: { throwOnError?: boolean }) => {
 			const requestId = ++requestIdRef.current;
+			const isSuperseded = () => requestId !== requestIdRef.current;
+			const rejectIfSuperseded = () => {
+				if (!isSuperseded()) return false;
+				if (options?.throwOnError) throw new Error("刷新已取消");
+				return true;
+			};
 			refreshInFlightRef.current = preserveContent;
 			cursorInFlightRef.current.clear();
 			cursorCompletedRef.current.clear();
@@ -213,7 +219,7 @@ export function useDashboardReadableSections(options?: {
 						cause instanceof TypeError;
 					if (!endpointUnavailable) throw cause;
 					const legacy = await apiGet<FeedResponse>("/api/feed?limit=30");
-					if (requestId !== requestIdRef.current) return;
+					if (rejectIfSuperseded()) return;
 					usedLegacyFallback = true;
 					const legacyItems = legacy.items ?? [];
 					const firstTimestamp =
@@ -237,7 +243,7 @@ export function useDashboardReadableSections(options?: {
 						next_cursor: legacy.next_cursor ?? null,
 					};
 				}
-				if (requestId !== requestIdRef.current) return;
+				if (rejectIfSuperseded()) return;
 				setLegacyFallback(usedLegacyFallback);
 				const nextSections = response.sections ?? [];
 				const previousSections = new Map(
@@ -275,7 +281,7 @@ export function useDashboardReadableSections(options?: {
 					);
 				}
 			} catch (cause) {
-				if (requestId !== requestIdRef.current) return;
+				if (rejectIfSuperseded()) return;
 				const description = describeNetworkAwareError(
 					cause,
 					"可读动态加载失败，请稍后重试。",
@@ -301,17 +307,23 @@ export function useDashboardReadableSections(options?: {
 	const refresh = useCallback(
 		(options?: { throwOnError?: boolean }) => {
 			const generation = lifecycleGenerationRef.current;
-			const queued = refreshQueueRef.current.then(() =>
-				generation === lifecycleGenerationRef.current && enabled
-					? loadSections(true, options)
-					: options?.throwOnError
-						? Promise.reject(new Error("刷新已取消"))
-						: undefined,
-			);
+			const queued = refreshQueueRef.current.then(async () => {
+				if (generation !== lifecycleGenerationRef.current || !enabled) {
+					if (options?.throwOnError) throw new Error("刷新已取消");
+					return;
+				}
+				await loadSections(true, options);
+				if (
+					generation !== lifecycleGenerationRef.current &&
+					options?.throwOnError
+				) {
+					throw new Error("刷新已取消");
+				}
+			});
 			refreshQueueRef.current = queued.catch(() => undefined);
 			return queued;
 		},
-		[loadSections],
+		[enabled, loadSections],
 	);
 
 	useEffect(() => {
