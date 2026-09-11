@@ -174,7 +174,11 @@ export function useDashboardReadableSections(options?: {
 	const detailCursorCompletedRef = useRef(new Set<string>());
 
 	const loadSections = useCallback(
-		async (preserveContent: boolean, options?: { throwOnError?: boolean }) => {
+		async (
+			preserveContent: boolean,
+			options?: { throwOnError?: boolean; onStart?: () => void },
+		) => {
+			options?.onStart?.();
 			const requestId = ++requestIdRef.current;
 			const isSuperseded = () => requestId !== requestIdRef.current;
 			const rejectIfSuperseded = (): ReadableRefreshResult | null => {
@@ -316,7 +320,7 @@ export function useDashboardReadableSections(options?: {
 
 	const loadInitial = useCallback(() => loadSections(false), [loadSections]);
 	const refresh = useCallback(
-		(options?: { throwOnError?: boolean }) => {
+		(options?: { throwOnError?: boolean; onStart?: () => void }) => {
 			const generation = lifecycleGenerationRef.current;
 			const priority = options?.throwOnError
 				? ++refreshPriorityRef.current
