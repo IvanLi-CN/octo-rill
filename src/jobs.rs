@@ -1651,6 +1651,7 @@ pub fn task_sse_response(
         } else {
             0
         };
+        let mut terminal_event_missing_polls = 0_u8;
         loop {
             #[derive(Debug, sqlx::FromRow)]
             struct EventRow {
@@ -1698,7 +1699,30 @@ pub fn task_sse_response(
                 break;
             };
             if is_terminal_status(&status) {
-                // Allow one more quick poll to flush late events.
+                let terminal_event_exists = sqlx::query_scalar::<_, i64>(
+                    r#"
+                    SELECT 1
+                    FROM job_task_events
+                    WHERE task_id = ? AND event_type = 'task.completed'
+                    LIMIT 1
+                    "#,
+                )
+                .bind(&task_id)
+                .fetch_optional(&state.pool)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+                if !terminal_event_exists {
+                    terminal_event_missing_polls = terminal_event_missing_polls.saturating_add(1);
+                    if terminal_event_missing_polls >= 50 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                // Allow one more quick poll to flush events committed alongside
+                // the terminal event before closing the stream.
                 tokio::time::sleep(Duration::from_millis(120)).await;
                 let rows = sqlx::query_as::<_, EventRow>(
                     r#"
@@ -4384,6 +4408,19 @@ mod tests {
             .await
             .expect("insert task event");
         }
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.completed', ?, ?)
+            "#,
+        )
+        .bind("sse-event-terminal")
+        .bind(task_id)
+        .bind(r#"{"status":"succeeded"}"#)
+        .bind("2026-03-06T00:00:01Z")
+        .execute(&pool)
+        .await
+        .expect("insert terminal task event");
 
         let initial_body = to_bytes(
             task_sse_response(state.clone(), task_id.to_owned(), None).into_body(),
@@ -4394,7 +4431,7 @@ mod tests {
         let initial_text = String::from_utf8(initial_body.to_vec()).expect("valid SSE body");
         assert_eq!(
             sse_event_ids(&initial_text),
-            vec!["sse-event-1", "sse-event-2"]
+            vec!["sse-event-1", "sse-event-2", "sse-event-terminal"]
         );
 
         let resumed_body = to_bytes(
@@ -4405,7 +4442,10 @@ mod tests {
         .await
         .expect("collect resumed SSE response");
         let resumed_text = String::from_utf8(resumed_body.to_vec()).expect("valid SSE body");
-        assert_eq!(sse_event_ids(&resumed_text), vec!["sse-event-2"]);
+        assert_eq!(
+            sse_event_ids(&resumed_text),
+            vec!["sse-event-2", "sse-event-terminal"]
+        );
     }
 
     #[tokio::test]
@@ -4441,6 +4481,19 @@ mod tests {
             .await
             .expect("insert task event");
         }
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.completed', ?, ?)
+            "#,
+        )
+        .bind("sse-fallback-event-terminal")
+        .bind(task_id)
+        .bind(r#"{"status":"succeeded"}"#)
+        .bind("2026-03-06T00:00:01Z")
+        .execute(&pool)
+        .await
+        .expect("insert terminal fallback event");
 
         for cursor in [
             Some("missing".to_owned()),
@@ -4455,7 +4508,11 @@ mod tests {
             let text = String::from_utf8(body.to_vec()).expect("valid SSE body");
             assert_eq!(
                 sse_event_ids(&text),
-                vec!["sse-fallback-event-1", "sse-fallback-event-2"]
+                vec![
+                    "sse-fallback-event-1",
+                    "sse-fallback-event-2",
+                    "sse-fallback-event-terminal"
+                ]
             );
         }
     }

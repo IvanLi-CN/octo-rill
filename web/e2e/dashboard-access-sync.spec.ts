@@ -2130,7 +2130,7 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 				{
 					index: 2,
 					id: "task-event-2",
-					delay: 2600,
+					delay: 5000,
 					type: "task.completed",
 					payload: { task_id: taskId, status: "succeeded" },
 				},

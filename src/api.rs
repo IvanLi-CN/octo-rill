@@ -25821,6 +25821,19 @@ mod tests {
             .await
             .expect("insert task event");
         }
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.completed', ?, ?)
+            "#,
+        )
+        .bind("api-sse-event-terminal")
+        .bind(task.task_id.as_str())
+        .bind(r#"{"status":"succeeded"}"#)
+        .bind("2026-03-06T00:00:01Z")
+        .execute(&pool)
+        .await
+        .expect("insert terminal API task event");
 
         let mut headers = HeaderMap::new();
         headers.insert("last-event-id", HeaderValue::from_static("api-sse-event-1"));
@@ -25836,7 +25849,10 @@ mod tests {
             .await
             .expect("collect authorized SSE response");
         let text = String::from_utf8(body.to_vec()).expect("valid SSE body");
-        assert_eq!(sse_event_ids(&text), vec!["api-sse-event-2"]);
+        assert_eq!(
+            sse_event_ids(&text),
+            vec!["api-sse-event-2", "api-sse-event-terminal"]
+        );
     }
 
     async fn seed_github_connection(
