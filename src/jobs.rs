@@ -4454,6 +4454,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_sse_response_flushes_late_terminal_event_once() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "sse-late-terminal-task";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_SUCCEEDED, 0).await;
+
+        let insert_pool = pool.clone();
+        let insert_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.completed', ?, ?)
+                "#,
+            )
+            .bind("sse-late-terminal-event")
+            .bind(task_id)
+            .bind(r#"{"status":"succeeded"}"#)
+            .bind("2026-03-06T00:00:01Z")
+            .execute(&insert_pool)
+            .await
+            .expect("insert late terminal event");
+        });
+
+        let body = to_bytes(
+            task_sse_response(state, task_id.to_owned(), None).into_body(),
+            usize::MAX,
+        )
+        .await
+        .expect("collect terminal SSE response");
+        insert_task.await.expect("join late event insert");
+
+        let text = String::from_utf8(body.to_vec()).expect("valid SSE body");
+        assert_eq!(text.matches("id: sse-late-terminal-event").count(), 1);
+    }
+
+    #[tokio::test]
     async fn requester_payload_singleton_keeps_distinct_webhook_operations() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());

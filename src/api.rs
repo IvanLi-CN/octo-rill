@@ -25774,6 +25774,64 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn task_events_sse_forwards_last_event_id_for_authorized_task() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task = jobs::enqueue_task(
+            state.as_ref(),
+            jobs::NewTask {
+                task_type: jobs::TASK_SYNC_RELEASES.to_owned(),
+                payload: serde_json::json!({}),
+                source: "test".to_owned(),
+                requested_by: Some(test_user_id(1)),
+                parent_task_id: None,
+            },
+        )
+        .await
+        .expect("enqueue task");
+        sqlx::query("UPDATE job_tasks SET status = 'succeeded' WHERE id = ?")
+            .bind(task.task_id.as_str())
+            .execute(&pool)
+            .await
+            .expect("complete task");
+        for (event_id, payload) in [
+            ("api-sse-event-1", r#"{"stage":"star_refreshed"}"#),
+            ("api-sse-event-2", r#"{"stage":"release_summary"}"#),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', ?, ?)
+                "#,
+            )
+            .bind(event_id)
+            .bind(task.task_id.as_str())
+            .bind(payload)
+            .bind("2026-03-06T00:00:01Z")
+            .execute(&pool)
+            .await
+            .expect("insert task event");
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", HeaderValue::from_static("api-sse-event-1"));
+        let response = task_events_sse(
+            State(state),
+            setup_session(1).await,
+            headers,
+            Path(task.task_id),
+        )
+        .await
+        .expect("authorized task SSE");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("collect authorized SSE response");
+        let text = String::from_utf8(body.to_vec()).expect("valid SSE body");
+        assert!(!text.contains("id: api-sse-event-1"));
+        assert_eq!(text.matches("id: api-sse-event-2").count(), 1);
+    }
+
     async fn seed_github_connection(
         pool: &SqlitePool,
         user_id: &str,

@@ -3066,6 +3066,8 @@ export function Dashboard(props: {
 
 		const source = openAppEventSource(accessTaskStream.eventPath);
 		let reconnectTimer: number | null = null;
+		let completionInFlight = false;
+		let streamSettled = false;
 		const clearReconnectTimer = () => {
 			if (reconnectTimer === null) return;
 			window.clearTimeout(reconnectTimer);
@@ -3088,6 +3090,11 @@ export function Dashboard(props: {
 			}
 		};
 		const failStream = (message: string) => {
+			if (streamSettled || completionInFlight) {
+				clearReconnectTimer();
+				return;
+			}
+			streamSettled = true;
 			clearReconnectTimer();
 			setAccessSyncStage((current) =>
 				current === "completed" ? current : "failed",
@@ -3142,9 +3149,12 @@ export function Dashboard(props: {
 		};
 
 		const onCompleted = (event: Event) => {
+			if (streamSettled || completionInFlight) return;
+			completionInFlight = true;
 			const payload = parsePayload(event as MessageEvent<string>);
 			const completedTaskId = accessTaskStream.taskId;
 			const complete = async () => {
+				if (streamSettled) return;
 				clearReconnectTimer();
 				const failed =
 					payload.status !== "succeeded"
@@ -3172,6 +3182,9 @@ export function Dashboard(props: {
 						clearDashboardLiveNoticesRef.current();
 						await checkDashboardUpdatesRef.current({ emit: false });
 					} catch (error) {
+						if (streamSettled) return;
+						streamSettled = true;
+						clearReconnectTimer();
 						const resolvedError =
 							error instanceof Error ? error : new Error(String(error));
 						notifyGlobalErrorRef.current(
@@ -3189,6 +3202,9 @@ export function Dashboard(props: {
 				} else if (payload.error) {
 					pushErrorToastRef.current("后台同步失败", payload.error);
 				}
+				if (streamSettled) return;
+				streamSettled = true;
+				clearReconnectTimer();
 				source.close();
 				settleTaskWaiterRef.current(completedTaskId, failed);
 				setAccessTaskStream((current) =>
@@ -3215,6 +3231,7 @@ export function Dashboard(props: {
 		};
 
 		return () => {
+			streamSettled = true;
 			clearReconnectTimer();
 			source.removeEventListener("task.running", onRunning);
 			source.removeEventListener("task.progress", onProgress);
