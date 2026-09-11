@@ -2689,7 +2689,9 @@ export function Dashboard(props: {
 		if (
 			!notice ||
 			(readableSectionsActive
-				? readableSections.loadingInitial || readableSections.loadingRefresh
+				? readableSections.loadingInitial ||
+					readableSections.loadingRefresh ||
+					readableSections.error?.phase === "refresh"
 				: feed.loadingInitial)
 		)
 			return;
@@ -2707,15 +2709,13 @@ export function Dashboard(props: {
 		if (readableSectionsActive) {
 			void refreshFeed()
 				.then((result) => {
-					if (result === "superseded") {
+					if (result !== "applied") {
 						if (
 							hydratedFeedNoticeRef.current.get(notice.boundaryId) ===
 							hydratedKey
 						) {
 							hydratedFeedNoticeRef.current.delete(notice.boundaryId);
 						}
-					}
-					if (result !== "applied") {
 						return;
 					}
 					restoreFeedScrollAnchor(anchor);
@@ -2785,6 +2785,7 @@ export function Dashboard(props: {
 		notifyGlobalError,
 		readableSections.loadingInitial,
 		readableSections.loadingRefresh,
+		readableSections.error?.phase,
 		readableSectionsActive,
 		refreshFeed,
 	]);
