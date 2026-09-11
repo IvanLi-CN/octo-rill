@@ -2675,7 +2675,15 @@ export function Dashboard(props: {
 		if (readableSectionsActive) {
 			void refreshFeed()
 				.then((applied) => {
-					if (applied === false) return;
+					if (applied === false) {
+						if (
+							hydratedFeedNoticeRef.current.get(notice.boundaryId) ===
+							hydratedKey
+						) {
+							hydratedFeedNoticeRef.current.delete(notice.boundaryId);
+						}
+						return;
+					}
 					restoreFeedScrollAnchor(anchor);
 					dismissFeedBoundary(notice.boundaryId);
 					void checkDashboardUpdates({ emit: false, include: ["feed"] });
