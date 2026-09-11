@@ -2246,7 +2246,18 @@ async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
 
 async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
     if task.cancel_requested != 0 {
-        finalize_task(state.as_ref(), &task.id, STATUS_CANCELED, None, None).await?;
+        if !finalize_task_if_owned(
+            state.as_ref(),
+            &task.id,
+            STATUS_CANCELED,
+            None,
+            None,
+            state.runtime_owner_id.as_str(),
+        )
+        .await?
+        {
+            return Ok(());
+        }
         append_task_event(
             state.as_ref(),
             &task.id,
@@ -2279,8 +2290,19 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
         .await
         .unwrap_or(false)
     {
-        finalize_task(state.as_ref(), &task.id, STATUS_CANCELED, None, None).await?;
+        let finalized = finalize_task_if_owned(
+            state.as_ref(),
+            &task.id,
+            STATUS_CANCELED,
+            None,
+            None,
+            state.runtime_owner_id.as_str(),
+        )
+        .await?;
         heartbeat.stop().await;
+        if !finalized {
+            return Ok(());
+        }
         append_task_event(
             state.as_ref(),
             &task.id,
@@ -2293,15 +2315,19 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
 
     match result {
         Ok(result_json) => {
-            finalize_task(
+            let finalized = finalize_task_if_owned(
                 state.as_ref(),
                 &task.id,
                 STATUS_SUCCEEDED,
                 Some(result_json),
                 None,
+                state.runtime_owner_id.as_str(),
             )
             .await?;
             heartbeat.stop().await;
+            if !finalized {
+                return Ok(());
+            }
             append_task_event(
                 state.as_ref(),
                 &task.id,
@@ -2312,15 +2338,19 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
         }
         Err(err) => {
             let message = err.to_string();
-            finalize_task(
+            let finalized = finalize_task_if_owned(
                 state.as_ref(),
                 &task.id,
                 STATUS_FAILED,
                 None,
                 Some(message.clone()),
+                state.runtime_owner_id.as_str(),
             )
             .await?;
             heartbeat.stop().await;
+            if !finalized {
+                return Ok(());
+            }
             append_task_event(
                 state.as_ref(),
                 &task.id,
@@ -4066,6 +4096,55 @@ async fn finalize_task(
     Ok(())
 }
 
+async fn finalize_task_if_owned(
+    state: &AppState,
+    task_id: &str,
+    status: &str,
+    result: Option<Value>,
+    error_message: Option<String>,
+    runtime_owner_id: &str,
+) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let result_json = result
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("serialize task result")?;
+
+    state
+        .sqlite_writer
+        .write("job_task_finalize_owned", |_| async {
+            let updated = sqlx::query(
+                r#"
+				UPDATE job_tasks
+				SET status = ?,
+				    result_json = ?,
+				    error_message = ?,
+				    finished_at = ?,
+				    runtime_owner_id = NULL,
+				    lease_heartbeat_at = NULL,
+				    updated_at = ?
+				WHERE id = ?
+				  AND status = ?
+				  AND runtime_owner_id = ?
+				"#,
+            )
+            .bind(status)
+            .bind(result_json.as_deref())
+            .bind(error_message.as_deref())
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(task_id)
+            .bind(STATUS_RUNNING)
+            .bind(runtime_owner_id)
+            .execute(&state.pool)
+            .await
+            .context("failed to finalize owned task")?;
+            Ok(updated.rows_affected() > 0)
+        })
+        .await
+}
+
 async fn heartbeat_task_lease(state: &AppState, task_id: &str) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     state
@@ -4359,7 +4438,7 @@ mod tests {
         enqueue_singleton_task_for_requester_and_payload, enqueue_star_sync_runs_if_due,
         enqueue_subscription_run_if_due, enqueue_task, execute_brief_history_recompute_task,
         execute_brief_refresh_content_task, execute_daily_slot_task, execute_sync_all_task_with,
-        is_scheduled_task_type, load_due_daily_slot_users,
+        finalize_task_if_owned, is_scheduled_task_type, load_due_daily_slot_users,
         load_recent_failed_brief_retry_candidates, load_recent_failed_translation_retry_candidates,
         load_translation_stream_cursor, load_translation_stream_rows, mark_brief_generation_source,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
@@ -5580,6 +5659,58 @@ mod tests {
         .await
         .expect("load recovery event");
         assert_eq!(event_type, "task.recovered_failed");
+    }
+
+    #[tokio::test]
+    async fn recovered_task_cannot_be_finalized_by_stale_worker() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        seed_task(
+            &pool,
+            "stale-worker-task",
+            TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+        recover_runtime_state(state.as_ref())
+            .await
+            .expect("recover runtime state");
+
+        let finalized = finalize_task_if_owned(
+            state.as_ref(),
+            "stale-worker-task",
+            STATUS_SUCCEEDED,
+            Some(json!({"stale": true})),
+            None,
+            state.runtime_owner_id.as_str(),
+        )
+        .await
+        .expect("finalize stale worker task");
+
+        assert!(!finalized);
+        let status =
+            sqlx::query_scalar::<_, String>(r#"SELECT status FROM job_tasks WHERE id = ?"#)
+                .bind("stale-worker-task")
+                .fetch_one(&pool)
+                .await
+                .expect("load recovered task status");
+        assert_eq!(status, STATUS_FAILED);
+
+        let event_types = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT event_type
+            FROM job_task_events
+            WHERE task_id = ?
+            ORDER BY rowid ASC
+            "#,
+        )
+        .bind("stale-worker-task")
+        .fetch_all(&pool)
+        .await
+        .expect("load recovered task events");
+        assert_eq!(event_types, vec!["task.recovered_failed"]);
     }
 
     #[tokio::test]
