@@ -431,6 +431,16 @@ export function FeedReadableSectionList(props: {
 		};
 	}, [details, listSections, loadingRefresh, onLoadSectionItems, sections]);
 
+	useEffect(() => {
+		if (loadingRefresh) return;
+		for (const sectionId of listSections) {
+			const section = sections.find((candidate) => candidate.id === sectionId);
+			if (section?.brief && !details[sectionId]) {
+				onLoadSectionItems(sectionId);
+			}
+		}
+	}, [details, listSections, loadingRefresh, onLoadSectionItems, sections]);
+
 	const toggleList = useCallback(
 		(sectionId: string) => {
 			const enteringList = !listSections.has(sectionId);
@@ -440,9 +450,9 @@ export function FeedReadableSectionList(props: {
 				else next.add(sectionId);
 				return next;
 			});
-			if (enteringList) onLoadSectionItems(sectionId);
+			if (enteringList && !loadingRefresh) onLoadSectionItems(sectionId);
 		},
-		[listSections, onLoadSectionItems],
+		[listSections, loadingRefresh, onLoadSectionItems],
 	);
 
 	if (loadingInitial && sections.length === 0) {

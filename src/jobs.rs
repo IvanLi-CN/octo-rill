@@ -1703,7 +1703,8 @@ pub fn task_sse_response(
                     r#"
                     SELECT 1
                     FROM job_task_events
-                    WHERE task_id = ? AND event_type = 'task.completed'
+                    WHERE task_id = ?
+                      AND event_type IN ('task.completed', 'task.canceled', 'task.recovered_failed')
                     LIMIT 1
                     "#,
                 )
@@ -4340,8 +4341,8 @@ mod tests {
     use std::{net::SocketAddr, sync::Arc};
 
     use super::{
-        NewTask, RetryTranslationCandidateRow, SMART_NO_VALUABLE_VERSION_INFO, STATUS_FAILED,
-        STATUS_QUEUED, STATUS_RUNNING, STATUS_SUCCEEDED, TASK_BRIEF_DAILY_SLOT,
+        NewTask, RetryTranslationCandidateRow, SMART_NO_VALUABLE_VERSION_INFO, STATUS_CANCELED,
+        STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, STATUS_SUCCEEDED, TASK_BRIEF_DAILY_SLOT,
         TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT, TASK_RETRY_RECENT_FAILURES,
         TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_RELEASES,
         TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE, TASK_SYNC_SUBSCRIPTIONS,
@@ -4571,6 +4572,45 @@ mod tests {
             sse_event_ids(&text),
             vec!["sse-terminal-before-flush", "sse-late-terminal-event"]
         );
+    }
+
+    #[tokio::test]
+    async fn task_sse_response_recognizes_canceled_and_recovered_terminal_events() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        for (index, (task_id, event_type, status)) in [
+            ("sse-canceled-task", "task.canceled", STATUS_CANCELED),
+            ("sse-recovered-task", "task.recovered_failed", STATUS_FAILED),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            seed_task(&pool, task_id, TASK_SYNC_RELEASES, status, index as i64).await;
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(format!("{task_id}-event"))
+            .bind(task_id)
+            .bind(event_type)
+            .bind(format!(r#"{{"task_id":"{task_id}","status":"{status}"}}"#))
+            .bind("2026-03-06T00:00:01Z")
+            .execute(&pool)
+            .await
+            .expect("insert non-completed terminal event");
+
+            let body = to_bytes(
+                task_sse_response(state.clone(), task_id.to_owned(), None).into_body(),
+                usize::MAX,
+            )
+            .await
+            .expect("collect non-completed terminal SSE response");
+            let text = String::from_utf8(body.to_vec()).expect("valid SSE body");
+            let expected_id = format!("{task_id}-event");
+            assert_eq!(sse_event_ids(&text), vec![expected_id.as_str()]);
+        }
     }
 
     #[tokio::test]

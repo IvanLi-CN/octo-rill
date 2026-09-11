@@ -219,12 +219,24 @@ export function useDashboardReadableSections(options?: {
 				);
 				setDetails((current) =>
 					Object.fromEntries(
-						Object.entries(current).filter(([sectionId]) => {
+						Object.entries(current).flatMap(([sectionId, detail]) => {
 							const previous = previousSections.get(sectionId);
 							const next = nextSectionsById.get(sectionId);
-							return Boolean(
-								previous && next && !sectionPageChanged(previous, next),
-							);
+							if (!previous || !next) return [];
+							if (!sectionPageChanged(previous, next)) {
+								return [[sectionId, detail]];
+							}
+							return [
+								[
+									sectionId,
+									{
+										...detail,
+										nextCursor: next.items_next_cursor ?? null,
+										loading: false,
+										error: null,
+									},
+								],
+							];
 						}),
 					),
 				);

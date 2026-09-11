@@ -3222,6 +3222,8 @@ export function Dashboard(props: {
 		source.addEventListener("task.running", onRunning);
 		source.addEventListener("task.progress", onProgress);
 		source.addEventListener("task.completed", onCompleted);
+		source.addEventListener("task.canceled", onCompleted);
+		source.addEventListener("task.recovered_failed", onCompleted);
 		source.onerror = () => {
 			if (source.readyState === EventSource.CLOSED) {
 				failStream("后台任务事件流已断开，请刷新页面后重试。");
@@ -3240,6 +3242,8 @@ export function Dashboard(props: {
 			source.removeEventListener("task.running", onRunning);
 			source.removeEventListener("task.progress", onProgress);
 			source.removeEventListener("task.completed", onCompleted);
+			source.removeEventListener("task.canceled", onCompleted);
+			source.removeEventListener("task.recovered_failed", onCompleted);
 			source.close();
 		};
 	}, [accessTaskStream]);
@@ -3334,6 +3338,8 @@ export function Dashboard(props: {
 
 			source.onopen = clearReconnectTimer;
 			source.addEventListener("task.completed", onCompleted);
+			source.addEventListener("task.canceled", onCompleted);
+			source.addEventListener("task.recovered_failed", onCompleted);
 			source.onerror = () => {
 				if (source.readyState === EventSource.CLOSED) {
 					failStream("后台同步事件流已断开，请刷新页面后重试。");
@@ -3912,6 +3918,7 @@ export function Dashboard(props: {
 		const readableEmpty =
 			rootReadable &&
 			!readableSections.loadingInitial &&
+			!readableSections.loadingRefresh &&
 			!readableSections.error &&
 			readableSections.sections.length === 0;
 		return (
