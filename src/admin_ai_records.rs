@@ -323,14 +323,29 @@ fn parse_timestamp(value: Option<String>, field: &str) -> Result<Option<String>,
     Ok(Some(parsed.with_timezone(&Utc).to_rfc3339()))
 }
 
-fn validate_collection_window(from: Option<&str>, before: Option<&str>) -> Result<(), ApiError> {
-    let (Some(from), Some(before)) = (from, before) else {
-        return Ok(());
-    };
-    let from = DateTime::parse_from_rfc3339(from)
-        .map_err(|_| ApiError::bad_request("invalid from timestamp"))?;
-    let before = DateTime::parse_from_rfc3339(before)
-        .map_err(|_| ApiError::bad_request("invalid before timestamp"))?;
+fn normalize_collection_window(
+    from: Option<String>,
+    before: Option<String>,
+) -> Result<(String, String), ApiError> {
+    let now = Utc::now();
+    let parsed_from = from
+        .as_deref()
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map(|parsed| parsed.with_timezone(&Utc))
+                .map_err(|_| ApiError::bad_request("invalid from timestamp"))
+        })
+        .transpose()?;
+    let parsed_before = before
+        .as_deref()
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map(|parsed| parsed.with_timezone(&Utc))
+                .map_err(|_| ApiError::bad_request("invalid before timestamp"))
+        })
+        .transpose()?;
+    let before = parsed_before.unwrap_or(now);
+    let from = parsed_from.unwrap_or(before - chrono::Duration::days(31));
     let span = before.signed_duration_since(from);
     if span < chrono::Duration::zero() {
         return Err(ApiError::bad_request("before must be after from"));
@@ -340,7 +355,7 @@ fn validate_collection_window(from: Option<&str>, before: Option<&str>) -> Resul
             "collection record window cannot exceed 31 days",
         ));
     }
-    Ok(())
+    Ok((from.to_rfc3339(), before.to_rfc3339()))
 }
 
 const DISPLAY_STATUSES: [&str; 15] = [
@@ -1239,6 +1254,11 @@ fn collection_query_sql(
                     ) AS row_rank
                 FROM llm_calls c
             ),
+            brief_attempts AS (
+                SELECT parent_brief_id AS entity_id, MAX(attempt_count) AS attempt_count
+                FROM llm_calls
+                GROUP BY parent_brief_id
+            ),
             status_projection AS (
                 SELECT
                     s.*,
@@ -1247,10 +1267,11 @@ fn collection_query_sql(
                         WHEN b.raw_status IS NULL THEN 'historical_unknown'
                         ELSE b.raw_status
                     END AS polish_status,
-                    COALESCE(b.attempt_count, 0) AS attempt_count
+                    COALESCE(ba.attempt_count, 0) AS attempt_count
                 FROM source_records s
                 LEFT JOIN brief_rows b
                   ON b.entity_id = s.id AND b.row_rank = 1
+                LEFT JOIN brief_attempts ba ON ba.entity_id = s.id
             )",
         );
     } else {
@@ -1332,7 +1353,7 @@ fn collection_query_sql(
                             PARTITION BY w.canonical_resource_id,
                                 CASE WHEN w.pipeline = 'polishing' THEN 'polish' ELSE 'translation' END
                             ORDER BY
-                                w.created_at DESC,
+                                datetime(w.created_at) DESC,
                                 CASE w.status
                                     WHEN 'queued' THEN 0
                                     WHEN 'running' THEN 1
@@ -1343,7 +1364,7 @@ fn collection_query_sql(
                                     ELSE 5
                                 END,
                                 CASE WHEN w.pipeline = 'translation' AND w.variant = 'detail' THEN 0 ELSE 1 END,
-                                w.updated_at DESC,
+                                datetime(w.updated_at) DESC,
                                 w.id DESC
                         ) AS row_rank
                     FROM content_work_items w
@@ -1436,7 +1457,8 @@ fn collection_query_sql(
         sql.push_str(" AND attempt_count <= ?");
         binds.push(CollectionQueryBind::Integer(max));
     }
-    if let Some(values) = translation_filter
+    if kind != CollectionRecordKind::Brief
+        && let Some(values) = translation_filter
         && !values.is_empty()
     {
         sql.push_str(" AND translation_status IN (");
@@ -1465,9 +1487,9 @@ fn collection_query_sql(
     sql.push(')');
     if let Some((page_size, offset)) = page {
         let order = if kind == CollectionRecordKind::Release {
-            "ORDER BY source_time DESC, CAST(id AS INTEGER) DESC"
+            "ORDER BY datetime(source_time) DESC, CAST(id AS INTEGER) DESC"
         } else {
-            "ORDER BY source_time DESC, id DESC"
+            "ORDER BY datetime(source_time) DESC, id DESC"
         };
         sql.push_str(" SELECT id, repository, title, occurred_at, detected_at, generated_at FROM filtered_records ");
         sql.push_str(order);
@@ -1548,6 +1570,42 @@ async fn list_collection_page(
     );
     let rows = execute_collection_query::<SourceRecordRow>(pool, &page_sql, &page_binds).await?;
     Ok((total, rows))
+}
+
+async fn run_bounded_collection_read<F, T>(
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    read: F,
+) -> Result<T, ApiError>
+where
+    F: std::future::Future<Output = Result<T, ApiError>> + Send + 'static,
+    T: Send + 'static,
+{
+    run_bounded_collection_read_with_budget(_permit, read, Duration::from_secs(5)).await
+}
+
+async fn run_bounded_collection_read_with_budget<F, T>(
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    read: F,
+    budget: Duration,
+) -> Result<T, ApiError>
+where
+    F: std::future::Future<Output = Result<T, ApiError>> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut read_handle = tokio::spawn(read);
+    match tokio::time::timeout(budget, &mut read_handle).await {
+        Ok(joined) => joined.map_err(ApiError::internal)?,
+        Err(_) => {
+            read_handle.abort();
+            let _ = read_handle.await;
+            Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "admin_collection_records_timeout",
+                "admin collection records read timed out",
+            )
+            .with_retry_after(1))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1692,11 +1750,7 @@ pub async fn admin_list_collection_records(
     let polish_filter = parse_status_filter(query.polish_status, "polish_status")?;
     let from = parse_timestamp(query.from, "from")?;
     let before = parse_timestamp(query.before, "before")?;
-    validate_collection_window(from.as_deref(), before.as_deref())?;
-    let global_mode = content_processing::current_mode(&state.pool)
-        .await
-        .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global;
+    let (from, before) = normalize_collection_window(from, before)?;
     let _permit = state
         .admin_collection_read_gate
         .clone()
@@ -1709,13 +1763,18 @@ pub async fn admin_list_collection_records(
             )
             .with_retry_after(1)
         })?;
-    let read = async {
+    let read_state = state.clone();
+    let read = async move {
+        let global_mode = content_processing::current_mode(&read_state.pool)
+            .await
+            .map_err(ApiError::internal)?
+            == content_processing::ContentProcessingMode::Global;
         let (total, rows) = list_collection_page(
-            &state.pool,
+            &read_state.pool,
             kind,
             global_mode,
-            from.as_deref(),
-            before.as_deref(),
+            Some(&from),
+            Some(&before),
             attempts,
             translation_filter.as_deref(),
             polish_filter.as_deref(),
@@ -1724,10 +1783,11 @@ pub async fn admin_list_collection_records(
         )
         .await?;
         let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
-        let coverage = load_processing_coverage(&state.pool, kind, &ids).await?;
-        let task_summaries = load_task_summaries(state.as_ref(), kind, &ids, &coverage).await?;
+        let coverage = load_processing_coverage(&read_state.pool, kind, &ids).await?;
+        let task_summaries =
+            load_task_summaries(read_state.as_ref(), kind, &ids, &coverage).await?;
         let brief_summaries = if kind == CollectionRecordKind::Brief {
-            load_brief_summaries(state.as_ref(), &ids, &coverage).await?
+            load_brief_summaries(read_state.as_ref(), &ids, &coverage).await?
         } else {
             HashMap::new()
         };
@@ -1737,16 +1797,7 @@ pub async fn admin_list_collection_records(
             .collect::<Vec<_>>();
         Ok::<_, ApiError>((total, items))
     };
-    let (total, items) = tokio::time::timeout(Duration::from_secs(5), read)
-        .await
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "admin_collection_records_timeout",
-                "admin collection records read timed out",
-            )
-            .with_retry_after(1)
-        })??;
+    let (total, items) = run_bounded_collection_read(_permit, read).await?;
     Ok(Json(AdminCollectionRecordsResponse {
         items,
         page,
@@ -1768,7 +1819,7 @@ async fn load_source_record(
             "SELECT lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id, MAX(e.repo_full_name) AS repository, COALESCE(MAX(NULLIF(e.title, '')), '公告') AS title, MAX(e.occurred_at) AS occurred_at, MIN(e.detected_at) AS detected_at, NULL AS generated_at FROM social_activity_events e WHERE e.kind = 'announcement' AND lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) = ? GROUP BY lower(e.repo_full_name), e.discussion_number LIMIT 1"
         }
         CollectionRecordKind::Notification => {
-            "SELECT n.thread_id AS id, MAX(n.repo_full_name) AS repository, COALESCE(MAX(NULLIF(n.subject_title, '')), '通知') AS title, MAX(n.updated_at) AS occurred_at, NULL AS detected_at, NULL AS generated_at FROM notifications n WHERE n.thread_id = ? GROUP BY n.thread_id LIMIT 1"
+            "WITH ranked_notifications AS (SELECT n.*, ROW_NUMBER() OVER (PARTITION BY n.thread_id ORDER BY n.updated_at DESC, n.id DESC) AS source_rank FROM notifications n WHERE n.thread_id = ?) SELECT n.thread_id AS id, n.repo_full_name AS repository, COALESCE(NULLIF(n.subject_title, ''), '通知') AS title, n.updated_at AS occurred_at, NULL AS detected_at, NULL AS generated_at FROM ranked_notifications n WHERE n.source_rank = 1 LIMIT 1"
         }
         CollectionRecordKind::Brief => {
             "SELECT b.id, NULL AS repository, b.date AS title, NULL AS occurred_at, NULL AS detected_at, b.created_at AS generated_at FROM briefs b WHERE b.id = ? LIMIT 1"
@@ -2590,12 +2641,20 @@ mod tests {
     async fn notification_source_record_uses_unknown_detected_time() {
         let pool = test_pool().await;
         create_notifications_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE notifications SET repo_full_name = 'octo/new', subject_title = 'Newest issue' WHERE id = 'notification-2'",
+        )
+        .execute(&pool)
+        .await
+        .expect("update newest notification");
 
         let row = load_source_record(&pool, CollectionRecordKind::Notification, "thread-1")
             .await
             .expect("load notification");
 
         assert_eq!(row.id, "thread-1");
+        assert_eq!(row.repository.as_deref(), Some("octo/new"));
+        assert_eq!(row.title, "Newest issue");
         assert_eq!(row.occurred_at.as_deref(), Some("2026-07-08T09:05:00Z"));
         assert_eq!(row.detected_at, None);
     }
@@ -2603,26 +2662,93 @@ mod tests {
     #[test]
     fn collection_query_window_rejects_more_than_31_days() {
         assert!(
-            validate_collection_window(
-                Some("2026-07-01T00:00:00+00:00"),
-                Some("2026-08-01T00:00:01+00:00"),
+            normalize_collection_window(
+                Some("2026-07-01T00:00:00+00:00".to_owned()),
+                Some("2026-08-01T00:00:01+00:00".to_owned()),
             )
             .is_err()
         );
         assert!(
-            validate_collection_window(
-                Some("2026-07-01T00:00:00+00:00"),
-                Some("2026-08-01T00:00:00+00:00"),
+            normalize_collection_window(
+                Some("2026-07-01T00:00:00+00:00".to_owned()),
+                Some("2026-08-01T00:00:00+00:00".to_owned()),
             )
             .is_ok()
         );
         assert!(
-            validate_collection_window(
-                Some("2026-07-02T00:00:00+00:00"),
-                Some("2026-07-01T00:00:00+00:00"),
+            normalize_collection_window(
+                Some("2026-07-02T00:00:00+00:00".to_owned()),
+                Some("2026-07-01T00:00:00+00:00".to_owned()),
             )
             .is_err()
         );
+        let (from, before) = normalize_collection_window(None, None).expect("default window");
+        assert!(
+            DateTime::parse_from_rfc3339(&before)
+                .unwrap()
+                .signed_duration_since(DateTime::parse_from_rfc3339(&from).unwrap())
+                <= chrono::Duration::days(31)
+        );
+    }
+
+    #[tokio::test]
+    async fn brief_attempt_filter_uses_historical_max_and_ignores_translation_filter() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE briefs (id TEXT PRIMARY KEY, date TEXT NOT NULL, created_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create briefs");
+        sqlx::query(
+            "CREATE TABLE llm_calls (
+                id TEXT PRIMARY KEY,
+                parent_brief_id TEXT,
+                status TEXT NOT NULL,
+                source TEXT NOT NULL,
+                model TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                updated_at TEXT NOT NULL,
+                error_text TEXT,
+                failure_class TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create llm calls");
+        sqlx::query(
+            "INSERT INTO briefs (id, date, created_at) VALUES ('brief-1', '2026-07-08', '2026-07-08T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed brief");
+        sqlx::query(
+            "INSERT INTO llm_calls (id, parent_brief_id, status, source, model, attempt_count, updated_at)
+             VALUES ('call-old', 'brief-1', 'failed', 'test', 'test', 3, '2026-07-08T00:01:00Z'),
+                    ('call-new', 'brief-1', 'succeeded', 'test', 'test', 1, '2026-07-08T00:02:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed brief calls");
+
+        let (total, rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Brief,
+            false,
+            Some("2026-07-07T00:00:00Z"),
+            Some("2026-07-09T00:00:00Z"),
+            AttemptCountRange { min: 3, max: None },
+            Some(&["succeeded".to_owned()]),
+            None,
+            20,
+            0,
+        )
+        .await
+        .expect("list briefs");
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
     }
 
     #[tokio::test]
@@ -2639,6 +2765,26 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
         drop(permit);
+        assert!(gate.try_acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn collection_read_timeout_cancels_before_releasing_permit() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = gate.clone().try_acquire_owned().expect("read permit");
+        let error = run_bounded_collection_read_with_budget(
+            permit,
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok::<_, ApiError>(())
+            },
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("read should time out");
+        let response = axum::response::IntoResponse::into_response(error);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
         assert!(gate.try_acquire().is_ok());
     }
 

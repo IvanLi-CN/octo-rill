@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useRef } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import { AiOperationsRecordsSection } from "@/admin/AiOperationsRecordsSection";
 import type {
@@ -441,4 +442,69 @@ export const BusyRead: Story = {
 			);
 		},
 	],
+	play: async ({ canvasElement }) => {
+		await expect(
+			within(canvasElement).getByText("读取暂时繁忙，请稍后刷新。"),
+		).toBeVisible();
+	},
+};
+
+export const CancelsStaleRead: Story = {
+	args: {
+		detailRoute: null,
+		onFiltersChange: () => undefined,
+		onOpenRecord: () => undefined,
+		onOpenAttempt: () => undefined,
+		onOpenLlm: () => undefined,
+		onCloseRecord: () => undefined,
+	},
+	decorators: [
+		(Story) => {
+			const originalFetch = useRef(window.fetch);
+			const restoreFetch = originalFetch.current;
+			(
+				window as Window & { __adminCollectionAbortCount?: number }
+			).__adminCollectionAbortCount = 0;
+			window.fetch = async (input, init) => {
+				const url = new URL(
+					typeof input === "string" ? input : input.toString(),
+					window.location.origin,
+				);
+				if (url.pathname.endsWith("/ai-records/release")) {
+					return await new Promise<Response>((_resolve, reject) => {
+						init?.signal?.addEventListener("abort", () => {
+							const target = window as Window & {
+								__adminCollectionAbortCount?: number;
+							};
+							target.__adminCollectionAbortCount =
+								(target.__adminCollectionAbortCount ?? 0) + 1;
+							reject(new DOMException("aborted", "AbortError"));
+						});
+					});
+				}
+				if (url.pathname.endsWith("/ai-records/announcement")) {
+					return new Response(JSON.stringify(listResponse), { status: 200 });
+				}
+				return restoreFetch(input, init);
+			};
+			useEffect(
+				() => () => {
+					window.fetch = restoreFetch;
+				},
+				[restoreFetch],
+			);
+			return <Story />;
+		},
+	],
+	play: async ({ canvasElement }) => {
+		await userEvent.click(
+			within(canvasElement).getByRole("tab", { name: "公告" }),
+		);
+		await waitFor(() => {
+			expect(
+				(window as Window & { __adminCollectionAbortCount?: number })
+					.__adminCollectionAbortCount,
+			).toBeGreaterThan(0);
+		});
+	},
 };
