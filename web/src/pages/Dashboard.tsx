@@ -2617,7 +2617,8 @@ export function Dashboard(props: {
 		async (notice = activeFeedNotice) => {
 			if (!notice) return;
 			if (readableSectionsActive) {
-				await refreshFeed();
+				const applied = await refreshFeed();
+				if (applied === false) return;
 				dismissFeedBoundary(notice.boundaryId);
 				await checkDashboardUpdates({ emit: false, include: ["feed"] });
 				return;
@@ -2673,7 +2674,8 @@ export function Dashboard(props: {
 		);
 		if (readableSectionsActive) {
 			void refreshFeed()
-				.then(() => {
+				.then((applied) => {
+					if (applied === false) return;
 					restoreFeedScrollAnchor(anchor);
 					dismissFeedBoundary(notice.boundaryId);
 					void checkDashboardUpdates({ emit: false, include: ["feed"] });
