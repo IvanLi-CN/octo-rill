@@ -2066,6 +2066,8 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 				__postContentReadableSkeletonMounts?: number;
 				__taskEventSourceCount?: number;
 				__taskEventSourceActive?: number;
+				__taskEventSourceCountAtContent?: number;
+				__taskEventSourceActiveAtContent?: number;
 				__taskEventDeliveries?: string[];
 			};
 			const state = window as TestWindow;
@@ -2173,6 +2175,12 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 					state.__taskEventSourceActive =
 						(state.__taskEventSourceActive ?? 0) + 1;
 					const scheduleTaskEvents = () => {
+						if (state.__taskEventSourceCountAtContent === undefined) {
+							state.__taskEventSourceCountAtContent =
+								state.__taskEventSourceCount ?? 0;
+							state.__taskEventSourceActiveAtContent =
+								state.__taskEventSourceActive ?? 0;
+						}
 						for (const taskEvent of taskEventPlan) {
 							const replay = emittedTaskEvents.has(taskEvent.index);
 							this.timers.push(
@@ -2359,20 +2367,22 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 
 	await page.goto("/");
 	await expect(page.getByText("Cached release")).toBeVisible();
-	const sourceStatsAfterContent = await page.evaluate(() => {
+	const sourceStatsAtContent = await page.evaluate(() => {
 		const state = window as typeof window & {
 			__taskEventSourceCount?: number;
 			__taskEventSourceActive?: number;
+			__taskEventSourceCountAtContent?: number;
+			__taskEventSourceActiveAtContent?: number;
 		};
 		return {
-			count: state.__taskEventSourceCount ?? 0,
-			active: state.__taskEventSourceActive ?? 0,
+			count: state.__taskEventSourceCountAtContent ?? 0,
+			active: state.__taskEventSourceActiveAtContent ?? 0,
 		};
 	});
 	// Vite dev mode replays mount effects once under React StrictMode; the
 	// production invariant is one active connection and no growth afterward.
-	expect(sourceStatsAfterContent.active).toBe(1);
-	expect(sourceStatsAfterContent.count).toBeLessThanOrEqual(2);
+	expect(sourceStatsAtContent.active).toBe(1);
+	expect(sourceStatsAtContent.count).toBeLessThanOrEqual(2);
 	await expect
 		.poll(() => feedResponseTitles.length, { timeout: 3000 })
 		.toBeGreaterThanOrEqual(2);
@@ -2398,7 +2408,7 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 		};
 	});
 	expect(sourceStatsAfterCompletion).toEqual({
-		count: sourceStatsAfterContent.count,
+		count: sourceStatsAtContent.count,
 		active: 0,
 	});
 	expect(
