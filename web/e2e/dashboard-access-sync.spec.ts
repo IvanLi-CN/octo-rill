@@ -2049,6 +2049,289 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 	}
 });
 
+test("dashboard keeps readable content mounted while access sync replays task events", async ({
+	page,
+}) => {
+	let feedCalls = 0;
+	await page.addInitScript(
+		({ taskId }) => {
+			type TestWindow = Window & {
+				__postContentReadableSkeletonMounts?: number;
+				__taskEventSourceCount?: number;
+			};
+			const state = window as TestWindow;
+			state.__postContentReadableSkeletonMounts = 0;
+			state.__taskEventSourceCount = 0;
+			let contentSeen = false;
+			let skeletonVisible = false;
+			const observeReadableState = () => {
+				contentSeen =
+					contentSeen ||
+					Boolean(document.querySelector("[data-readable-section-list]"));
+				const nextSkeletonVisible = Boolean(
+					document.querySelector("[data-readable-loading-initial]") &&
+						document.querySelector("[data-readable-loading-skeleton]"),
+				);
+				if (contentSeen && nextSkeletonVisible && !skeletonVisible) {
+					state.__postContentReadableSkeletonMounts =
+						(state.__postContentReadableSkeletonMounts ?? 0) + 1;
+				}
+				skeletonVisible = nextSkeletonVisible;
+			};
+			const observer = new MutationObserver(observeReadableState);
+			const observeDocument = () => {
+				if (!document.documentElement) return;
+				observer.observe(document.documentElement, {
+					childList: true,
+					subtree: true,
+				});
+				observeReadableState();
+			};
+			if (document.documentElement) {
+				observeDocument();
+			} else {
+				document.addEventListener("DOMContentLoaded", observeDocument, {
+					once: true,
+				});
+			}
+			const taskEventPlan = [
+				{
+					index: 0,
+					delay: 1000,
+					type: "task.running",
+					payload: { task_id: taskId, status: "running" },
+				},
+				{
+					index: 1,
+					delay: 3000,
+					type: "task.progress",
+					payload: {
+						task_id: taskId,
+						stage: "star_refreshed",
+						repos: 1,
+					},
+				},
+				{
+					index: 2,
+					delay: 7000,
+					type: "task.completed",
+					payload: { task_id: taskId, status: "succeeded" },
+				},
+			] as const;
+			const emittedTaskEvents = new Set<number>();
+
+			class MockEventSource {
+				url: string;
+				readyState = 1;
+				withCredentials = false;
+				onopen: ((this: EventSource, event: Event) => unknown) | null = null;
+				onmessage:
+					| ((this: EventSource, event: MessageEvent<string>) => unknown)
+					| null = null;
+				onerror: ((this: EventSource, event: Event) => unknown) | null = null;
+				private listeners = new Map<
+					string,
+					Set<(event: Event | MessageEvent<string>) => unknown>
+				>();
+				private timers: number[] = [];
+
+				constructor(url: string | URL) {
+					this.url = String(url);
+					this.timers.push(
+						window.setTimeout(() => {
+							this.onopen?.call(
+								this as unknown as EventSource,
+								new Event("open"),
+							);
+						}, 0),
+					);
+					if (!this.url.endsWith(`/api/tasks/${taskId}/events`)) return;
+					state.__taskEventSourceCount =
+						(state.__taskEventSourceCount ?? 0) + 1;
+					for (const taskEvent of taskEventPlan) {
+						const replay = emittedTaskEvents.has(taskEvent.index);
+						this.timers.push(
+							window.setTimeout(
+								() => {
+									if (!replay) {
+										if (emittedTaskEvents.has(taskEvent.index)) return;
+										emittedTaskEvents.add(taskEvent.index);
+									}
+									this.dispatch(taskEvent.type, taskEvent.payload);
+								},
+								replay ? 0 : taskEvent.delay,
+							),
+						);
+					}
+				}
+
+				addEventListener(
+					type: string,
+					listener: (event: Event | MessageEvent<string>) => unknown,
+				) {
+					const current = this.listeners.get(type) ?? new Set();
+					current.add(listener);
+					this.listeners.set(type, current);
+				}
+
+				removeEventListener(
+					type: string,
+					listener: (event: Event | MessageEvent<string>) => unknown,
+				) {
+					this.listeners.get(type)?.delete(listener);
+				}
+
+				close() {
+					this.readyState = 2;
+					for (const timer of this.timers) window.clearTimeout(timer);
+					this.timers = [];
+				}
+
+				private dispatch(type: string, payload: unknown) {
+					if (this.readyState === 2) return;
+					const event = new MessageEvent(type, {
+						data: JSON.stringify(payload),
+					});
+					for (const listener of this.listeners.get(type) ?? []) {
+						listener.call(this as unknown as EventSource, event);
+					}
+					this.onmessage?.call(this as unknown as EventSource, event);
+				}
+			}
+
+			Object.defineProperty(window, "EventSource", {
+				configurable: true,
+				writable: true,
+				value: MockEventSource,
+			});
+		},
+		{ taskId: "task-readable-replay" },
+	);
+
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const url = new URL(req.url());
+		const { pathname } = url;
+
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse(
+					{
+						id: "2f4k7m9p3x6c8v2a",
+						github_user_id: 10,
+						login: "octo",
+						name: "Octo",
+						avatar_url: null,
+						email: null,
+						is_admin: false,
+					},
+					{
+						access_sync: {
+							task_id: "task-readable-replay",
+							task_type: "sync.access_refresh",
+							event_path: "/api/tasks/task-readable-replay/events",
+							reason: "inactive_over_1h",
+						},
+					},
+				),
+			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			feedCalls += 1;
+			if (feedCalls > 1) {
+				await new Promise((resolve) => setTimeout(resolve, 350));
+			}
+			const title = feedCalls <= 2 ? "Cached release" : "Fresh release";
+			const item = buildReleaseFeedItem("readable-sync-item", { title });
+			return json(route, {
+				sections: [
+					{
+						id: "2026-04-09",
+						date: "2026-04-09",
+						kind: "raw",
+						item_count: 1,
+						brief: null,
+						items: [item],
+						items_next_cursor: null,
+						supplemental_items: [],
+					},
+				],
+				next_cursor: null,
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			return json(route, []);
+		}
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			return json(route, []);
+		}
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: false,
+				masked_token: null,
+				check: { state: "idle", message: null, checked_at: null },
+			});
+		}
+		if (req.method() === "GET" && pathname === "/api/health") {
+			return json(route, { ok: true, version: "1.2.3" });
+		}
+		if (req.method() === "GET" && pathname === "/api/dashboard/updates") {
+			return json(route, {
+				token: "updates-token",
+				lists: {
+					feed: { changed: false, new_count: 0, latest_keys: [] },
+					briefs: { changed: false, new_count: 0, latest_keys: [] },
+					notifications: { changed: false, new_count: 0, latest_keys: [] },
+				},
+			});
+		}
+
+		return json(
+			route,
+			{
+				error: {
+					code: "not_found",
+					message: `unhandled ${req.method()} ${pathname}`,
+				},
+			},
+			404,
+		);
+	});
+
+	await page.goto("/");
+	await expect(page.getByText("Cached release")).toBeVisible();
+	const sourceCountAfterContent = await page.evaluate(
+		() =>
+			(window as typeof window & { __taskEventSourceCount?: number })
+				.__taskEventSourceCount ?? 0,
+	);
+	expect(sourceCountAfterContent).toBeGreaterThan(0);
+	await expect(page.getByText("Fresh release")).toBeVisible({ timeout: 3000 });
+	await page.waitForTimeout(250);
+
+	expect(feedCalls).toBeGreaterThanOrEqual(2);
+	expect(
+		await page.evaluate(
+			() =>
+				(window as typeof window & { __taskEventSourceCount?: number })
+					.__taskEventSourceCount ?? 0,
+		),
+	).toBe(sourceCountAfterContent);
+	expect(
+		await page.evaluate(
+			() =>
+				(
+					window as typeof window & {
+						__postContentReadableSkeletonMounts?: number;
+					}
+				).__postContentReadableSkeletonMounts,
+		),
+	).toBe(0);
+});
+
 test("dashboard opens access sync warmup bubble immediately after clicking sync", async ({
 	page,
 }) => {

@@ -1704,7 +1704,7 @@ export function Dashboard(props: {
 		enabled: scope?.kind === "following" || scope?.kind === "repo",
 	});
 	const refreshFeed = readableSectionsActive
-		? readableSections.loadInitial
+		? readableSections.refresh
 		: feed.refresh;
 	const followingRepos = followingReposQuery.data ?? null;
 	const followingReposLoading = followingReposQuery.isLoading;
@@ -2763,6 +2763,18 @@ export function Dashboard(props: {
 	const settleTaskWaiter = useCallback((taskId: string, error?: Error) => {
 		taskWaitersRef.current.get(taskId)?.settle(error);
 	}, []);
+	const refreshAllRef = useRef(refreshAll);
+	refreshAllRef.current = refreshAll;
+	const checkDashboardUpdatesRef = useRef(checkDashboardUpdates);
+	checkDashboardUpdatesRef.current = checkDashboardUpdates;
+	const clearDashboardLiveNoticesRef = useRef(clearDashboardLiveNotices);
+	clearDashboardLiveNoticesRef.current = clearDashboardLiveNotices;
+	const notifyGlobalErrorRef = useRef(notifyGlobalError);
+	notifyGlobalErrorRef.current = notifyGlobalError;
+	const pushErrorToastRef = useRef(pushErrorToast);
+	pushErrorToastRef.current = pushErrorToast;
+	const settleTaskWaiterRef = useRef(settleTaskWaiter);
+	settleTaskWaiterRef.current = settleTaskWaiter;
 
 	const trackTaskStream = useCallback(
 		(task: TaskAcceptedResponse, mode: TaskStreamMode) => {
@@ -3060,8 +3072,12 @@ export function Dashboard(props: {
 			reconnectTimer = null;
 		};
 		const refreshOnUi = () => {
-			void refreshAll().catch((error) => {
-				notifyGlobalError("页面刷新失败", error, "页面刷新失败，请稍后重试。");
+			void refreshAllRef.current().catch((error) => {
+				notifyGlobalErrorRef.current(
+					"页面刷新失败",
+					error,
+					"页面刷新失败，请稍后重试。",
+				);
 			});
 		};
 		const parsePayload = (event: MessageEvent<string>): TaskEventPayload => {
@@ -3085,9 +3101,9 @@ export function Dashboard(props: {
 						}
 					: null,
 			);
-			pushErrorToast("同步事件流已断开", message);
+			pushErrorToastRef.current("同步事件流已断开", message);
 			source.close();
-			settleTaskWaiter(accessTaskStream.taskId, new Error(message));
+			settleTaskWaiterRef.current(accessTaskStream.taskId, new Error(message));
 			setAccessTaskStream((current) =>
 				current?.taskId === accessTaskStream.taskId ? null : current,
 			);
@@ -3152,29 +3168,29 @@ export function Dashboard(props: {
 				}));
 				if (payload.status === "succeeded") {
 					try {
-						await refreshAll();
-						clearDashboardLiveNotices();
-						await checkDashboardUpdates({ emit: false });
+						await refreshAllRef.current();
+						clearDashboardLiveNoticesRef.current();
+						await checkDashboardUpdatesRef.current({ emit: false });
 					} catch (error) {
 						const resolvedError =
 							error instanceof Error ? error : new Error(String(error));
-						notifyGlobalError(
+						notifyGlobalErrorRef.current(
 							"同步后刷新失败",
 							resolvedError,
 							"同步已完成，但页面刷新失败，请稍后重试。",
 						);
 						source.close();
-						settleTaskWaiter(completedTaskId, resolvedError);
+						settleTaskWaiterRef.current(completedTaskId, resolvedError);
 						setAccessTaskStream((current) =>
 							current?.taskId === completedTaskId ? null : current,
 						);
 						return;
 					}
 				} else if (payload.error) {
-					pushErrorToast("后台同步失败", payload.error);
+					pushErrorToastRef.current("后台同步失败", payload.error);
 				}
 				source.close();
-				settleTaskWaiter(completedTaskId, failed);
+				settleTaskWaiterRef.current(completedTaskId, failed);
 				setAccessTaskStream((current) =>
 					current?.taskId === completedTaskId ? null : current,
 				);
@@ -3205,15 +3221,7 @@ export function Dashboard(props: {
 			source.removeEventListener("task.completed", onCompleted);
 			source.close();
 		};
-	}, [
-		accessTaskStream,
-		checkDashboardUpdates,
-		clearDashboardLiveNotices,
-		notifyGlobalError,
-		pushErrorToast,
-		refreshAll,
-		settleTaskWaiter,
-	]);
+	}, [accessTaskStream]);
 
 	useEffect(() => {
 		if (refreshTaskStreams.length === 0) return;

@@ -1626,9 +1626,31 @@ pub async fn append_task_event(
     Ok(())
 }
 
-pub fn task_sse_response(state: Arc<AppState>, task_id: String) -> Response {
+pub fn task_sse_response(
+    state: Arc<AppState>,
+    task_id: String,
+    last_event_id: Option<String>,
+) -> Response {
     let events = stream! {
-        let mut last_event_seq = 0_i64;
+        let mut last_event_seq = if let Some(last_event_id) = last_event_id.as_deref() {
+            sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT rowid
+                FROM job_task_events
+                WHERE task_id = ? AND id = ?
+                LIMIT 1
+                "#,
+            )
+            .bind(&task_id)
+            .bind(last_event_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+        } else {
+            0
+        };
         loop {
             #[derive(Debug, sqlx::FromRow)]
             struct EventRow {
@@ -4311,9 +4333,10 @@ mod tests {
         load_translation_stream_cursor, load_translation_stream_rows, mark_brief_generation_source,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
         recover_runtime_state, recover_runtime_state_on_startup, retry_candidate_is_retryable,
-        run_account_pause_maintenance_if_due, update_daily_brief_hour_slot_dispatch,
-        upsert_dispatch_state,
+        run_account_pause_maintenance_if_due, task_sse_response,
+        update_daily_brief_hour_slot_dispatch, upsert_dispatch_state,
     };
+    use axum::body::to_bytes;
     use chrono::{Duration, NaiveTime, TimeZone, Utc};
     use serde_json::{Value, json};
     use sqlx::{
@@ -4328,6 +4351,107 @@ mod tests {
         state::{AppState, build_oauth_client},
         sync,
     };
+
+    #[tokio::test]
+    async fn task_sse_response_resumes_after_last_event_id() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "sse-resume-task";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_SUCCEEDED, 0).await;
+
+        for (event_id, payload) in [
+            ("sse-event-1", r#"{"stage":"star_refreshed"}"#),
+            ("sse-event-2", r#"{"stage":"release_summary"}"#),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', ?, ?)
+                "#,
+            )
+            .bind(event_id)
+            .bind(task_id)
+            .bind(payload)
+            .bind("2026-03-06T00:00:01Z")
+            .execute(&pool)
+            .await
+            .expect("insert task event");
+        }
+
+        let initial_body = to_bytes(
+            task_sse_response(state.clone(), task_id.to_owned(), None).into_body(),
+            usize::MAX,
+        )
+        .await
+        .expect("collect initial SSE response");
+        let initial_text = String::from_utf8(initial_body.to_vec()).expect("valid SSE body");
+        assert!(initial_text.contains("id: sse-event-1"));
+        assert!(initial_text.contains("id: sse-event-2"));
+        assert_eq!(initial_text.matches("id: sse-event-2").count(), 1);
+
+        let resumed_body = to_bytes(
+            task_sse_response(state, task_id.to_owned(), Some("sse-event-1".to_owned()))
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .expect("collect resumed SSE response");
+        let resumed_text = String::from_utf8(resumed_body.to_vec()).expect("valid SSE body");
+        assert!(!resumed_text.contains("id: sse-event-1"));
+        assert!(resumed_text.contains("id: sse-event-2"));
+        assert_eq!(resumed_text.matches("id: sse-event-2").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn task_sse_response_replays_from_start_for_unknown_or_foreign_cursor() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "sse-fallback-task";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_SUCCEEDED, 0).await;
+        seed_task(
+            &pool,
+            "sse-other-task",
+            TASK_SYNC_RELEASES,
+            STATUS_SUCCEEDED,
+            1,
+        )
+        .await;
+
+        for (event_id, task) in [
+            ("sse-fallback-event-1", task_id),
+            ("sse-fallback-event-2", task_id),
+            ("sse-foreign-event", "sse-other-task"),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', '{}', ?)
+                "#,
+            )
+            .bind(event_id)
+            .bind(task)
+            .bind("2026-03-06T00:00:01Z")
+            .execute(&pool)
+            .await
+            .expect("insert task event");
+        }
+
+        for cursor in [
+            Some("missing".to_owned()),
+            Some("sse-foreign-event".to_owned()),
+        ] {
+            let body = to_bytes(
+                task_sse_response(state.clone(), task_id.to_owned(), cursor).into_body(),
+                usize::MAX,
+            )
+            .await
+            .expect("collect fallback SSE response");
+            let text = String::from_utf8(body.to_vec()).expect("valid SSE body");
+            assert!(text.contains("id: sse-fallback-event-1"));
+            assert!(text.contains("id: sse-fallback-event-2"));
+            assert!(!text.contains("id: sse-foreign-event"));
+        }
+    }
 
     #[tokio::test]
     async fn requester_payload_singleton_keeps_distinct_webhook_operations() {

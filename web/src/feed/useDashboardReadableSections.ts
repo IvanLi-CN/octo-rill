@@ -17,7 +17,7 @@ import {
 } from "@/lib/errorPresentation";
 
 export type ReadableSectionsError = {
-	phase: "initial" | "append";
+	phase: "initial" | "refresh" | "append";
 	message: string;
 	kind: NetworkErrorKind;
 	detail: string | null;
@@ -104,19 +104,24 @@ export function useDashboardReadableSections(options?: {
 	const detailCursorInFlightRef = useRef(new Set<string>());
 	const detailCursorCompletedRef = useRef(new Set<string>());
 
-	const loadInitial = useCallback(async () => {
+	const loadSections = useCallback(async (preserveContent: boolean) => {
 		const requestId = ++requestIdRef.current;
 		cursorInFlightRef.current.clear();
 		cursorCompletedRef.current.clear();
 		detailCursorInFlightRef.current.clear();
 		detailCursorCompletedRef.current.clear();
-		setLoadingInitial(true);
+		if (!preserveContent) {
+			setLoadingInitial(true);
+		}
 		setLoadingMore(false);
 		setError(null);
-		setLegacyFallback(false);
-		setSections([]);
-		setNextCursor(null);
-		setDetails({});
+		if (!preserveContent) {
+			setLegacyFallback(false);
+			setSections([]);
+			setNextCursor(null);
+			setDetails({});
+		}
+		let usedLegacyFallback = false;
 		try {
 			let response: DashboardReadableFeedResponse;
 			try {
@@ -133,7 +138,7 @@ export function useDashboardReadableSections(options?: {
 				if (!endpointUnavailable) throw cause;
 				const legacy = await apiGet<FeedResponse>("/api/feed?limit=30");
 				if (requestId !== requestIdRef.current) return;
-				setLegacyFallback(true);
+				usedLegacyFallback = true;
 				const legacyItems = legacy.items ?? [];
 				const firstTimestamp = legacyItems[0]?.ts ?? new Date(0).toISOString();
 				response = {
@@ -156,19 +161,39 @@ export function useDashboardReadableSections(options?: {
 				};
 			}
 			if (requestId !== requestIdRef.current) return;
+			setLegacyFallback(usedLegacyFallback);
 			setSections(response.sections ?? []);
 			setNextCursor(response.next_cursor ?? null);
+			if (preserveContent) {
+				const sectionIds = new Set(
+					(response.sections ?? []).map((section) => section.id),
+				);
+				setDetails((current) =>
+					Object.fromEntries(
+						Object.entries(current).filter(([sectionId]) =>
+							sectionIds.has(sectionId),
+						),
+					),
+				);
+			}
 		} catch (cause) {
 			if (requestId !== requestIdRef.current) return;
 			const description = describeNetworkAwareError(
 				cause,
 				"可读动态加载失败，请稍后重试。",
 			);
-			setError({ phase: "initial", ...description, at: Date.now() });
+			setError({
+				phase: preserveContent ? "refresh" : "initial",
+				...description,
+				at: Date.now(),
+			});
 		} finally {
 			if (requestId === requestIdRef.current) setLoadingInitial(false);
 		}
 	}, []);
+
+	const loadInitial = useCallback(() => loadSections(false), [loadSections]);
+	const refresh = useCallback(() => loadSections(true), [loadSections]);
 
 	useEffect(() => {
 		if (!enabled) {
@@ -253,8 +278,12 @@ export function useDashboardReadableSections(options?: {
 			await loadMore();
 			return;
 		}
+		if (error?.phase === "refresh") {
+			await refresh();
+			return;
+		}
 		await loadInitial();
-	}, [error?.phase, loadInitial, loadMore]);
+	}, [error?.phase, loadInitial, loadMore, refresh]);
 
 	const loadSectionItems = useCallback(
 		async (sectionId: string, cursor?: string | null) => {
@@ -400,6 +429,7 @@ export function useDashboardReadableSections(options?: {
 		details,
 		stats,
 		loadInitial,
+		refresh,
 		loadMore,
 		retry,
 		loadSectionItems,
