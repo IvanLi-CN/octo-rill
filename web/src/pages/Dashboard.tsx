@@ -1972,6 +1972,8 @@ export function Dashboard(props: {
 	const notificationsLoadingRequestIdRef = useRef(0);
 	const sidebarRefreshQueueRef = useRef<Promise<void>>(Promise.resolve());
 	const notificationsRefreshQueueRef = useRef<Promise<void>>(Promise.resolve());
+	const sidebarRefreshPriorityRef = useRef(0);
+	const notificationsRefreshPriorityRef = useRef(0);
 	const [sidebarLoading, setSidebarLoading] = useState(
 		() => !bootedFromWarmStart && !hasCachedBriefs,
 	);
@@ -2150,10 +2152,22 @@ export function Dashboard(props: {
 		[notifications.length, notifyGlobalError],
 	);
 	const loadNotifications = useCallback(
-		(phase: DashboardSectionError["phase"] = "initial") => {
-			const queued = notificationsRefreshQueueRef.current.then(() =>
-				loadNotificationsUnqueued(phase),
-			);
+		(
+			phase: DashboardSectionError["phase"] = "initial",
+			options?: { priority?: boolean },
+		) => {
+			const priority = options?.priority
+				? ++notificationsRefreshPriorityRef.current
+				: notificationsRefreshPriorityRef.current;
+			if (options?.priority) {
+				const immediate = loadNotificationsUnqueued(phase);
+				notificationsRefreshQueueRef.current = immediate.catch(() => undefined);
+				return immediate;
+			}
+			const queued = notificationsRefreshQueueRef.current.then(() => {
+				if (priority !== notificationsRefreshPriorityRef.current) return;
+				return loadNotificationsUnqueued(phase);
+			});
 			notificationsRefreshQueueRef.current = queued.catch(() => undefined);
 			return queued;
 		},
@@ -2164,6 +2178,7 @@ export function Dashboard(props: {
 			background?: boolean;
 			includeNotifications?: boolean;
 			preferredBriefId?: string | null;
+			throwOnError?: boolean;
 		}) => {
 			const requestId = ++sidebarRequestIdRef.current;
 			setBriefsError(null);
@@ -2174,7 +2189,7 @@ export function Dashboard(props: {
 				const [briefsResult, notificationsResult] = await Promise.allSettled([
 					apiGet<BriefItem[]>("/api/briefs"),
 					options?.includeNotifications
-						? loadNotifications(phase)
+						? loadNotifications(phase, { priority: options?.throwOnError })
 						: Promise.resolve(),
 				]);
 				if (
@@ -2243,14 +2258,22 @@ export function Dashboard(props: {
 			background?: boolean;
 			includeNotifications?: boolean;
 			preferredBriefId?: string | null;
+			throwOnError?: boolean;
 		}) => {
+			const priority = options?.throwOnError
+				? ++sidebarRefreshPriorityRef.current
+				: sidebarRefreshPriorityRef.current;
 			const loadingRequestId = ++sidebarLoadingRequestIdRef.current;
 			if (!options?.background) {
 				setSidebarLoading(true);
 			}
-			const queued = sidebarRefreshQueueRef.current.then(() =>
-				refreshSidebarUnqueued(options),
-			);
+			const run = async () => {
+				if (priority !== sidebarRefreshPriorityRef.current) return;
+				await refreshSidebarUnqueued(options);
+			};
+			const queued = options?.throwOnError
+				? run()
+				: sidebarRefreshQueueRef.current.then(run);
 			sidebarRefreshQueueRef.current = queued.catch(() => undefined);
 			return queued.finally(() => {
 				if (loadingRequestId === sidebarLoadingRequestIdRef.current) {
@@ -2454,6 +2477,7 @@ export function Dashboard(props: {
 			if (!scopedMode) {
 				tasks.push(
 					refreshSidebar({
+						throwOnError: options?.throwOnError,
 						includeNotifications:
 							hasDesktopSidebarInbox ||
 							tab === "inbox" ||
@@ -2617,8 +2641,8 @@ export function Dashboard(props: {
 		async (notice = activeFeedNotice) => {
 			if (!notice) return;
 			if (readableSectionsActive) {
-				const applied = await refreshFeed();
-				if (applied === false) return;
+				const result = await refreshFeed();
+				if (result !== "applied") return;
 				dismissFeedBoundary(notice.boundaryId);
 				await checkDashboardUpdates({ emit: false, include: ["feed"] });
 				return;
@@ -2674,14 +2698,16 @@ export function Dashboard(props: {
 		);
 		if (readableSectionsActive) {
 			void refreshFeed()
-				.then((applied) => {
-					if (applied === false) {
+				.then((result) => {
+					if (result === "superseded") {
 						if (
 							hydratedFeedNoticeRef.current.get(notice.boundaryId) ===
 							hydratedKey
 						) {
 							hydratedFeedNoticeRef.current.delete(notice.boundaryId);
 						}
+					}
+					if (result !== "applied") {
 						return;
 					}
 					restoreFeedScrollAnchor(anchor);
