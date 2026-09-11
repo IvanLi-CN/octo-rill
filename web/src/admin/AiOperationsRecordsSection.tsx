@@ -1239,8 +1239,8 @@ export function AiOperationsRecordsSection({
 				}
 				setError({
 					title: "无法读取采集记录",
-					message:
-						cause instanceof Error ? cause.message : "请检查连接后重试。",
+					message: "读取记录时发生错误，请稍后重试。",
+					code: cause instanceof ApiError ? cause.code : undefined,
 				});
 			})
 			.finally(() => {
