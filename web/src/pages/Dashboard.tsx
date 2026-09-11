@@ -375,6 +375,7 @@ type BriefGenerateResponse = {
 
 const SYNC_ALL_LABEL = "同步";
 const TASK_STREAM_RECOVERY_GRACE_MS = 5000;
+const TASK_STREAM_COMPLETION_GRACE_MS = 30000;
 const ACCESS_SYNC_TOTAL_STEPS = 4;
 const FEED_REACTION_REFRESH_TTL_MS = 15_000;
 const FEED_REACTION_REFRESH_BATCH_SIZE = 100;
@@ -1967,6 +1968,8 @@ export function Dashboard(props: {
 	);
 	const sidebarRequestIdRef = useRef(0);
 	const notificationsRequestIdRef = useRef(0);
+	const sidebarRefreshQueueRef = useRef<Promise<void>>(Promise.resolve());
+	const notificationsRefreshQueueRef = useRef<Promise<void>>(Promise.resolve());
 	const [sidebarLoading, setSidebarLoading] = useState(
 		() => !bootedFromWarmStart && !hasCachedBriefs,
 	);
@@ -2121,7 +2124,7 @@ export function Dashboard(props: {
 		[dismissToast, feedItemsRef, focusFeedItem, notifyGlobalError],
 	);
 
-	const loadNotifications = useCallback(
+	const loadNotificationsUnqueued = useCallback(
 		async (phase: DashboardSectionError["phase"] = "initial") => {
 			const requestId = ++notificationsRequestIdRef.current;
 			setNotificationsError(null);
@@ -2144,7 +2147,17 @@ export function Dashboard(props: {
 		},
 		[notifications.length, notifyGlobalError],
 	);
-	const refreshSidebar = useCallback(
+	const loadNotifications = useCallback(
+		(phase: DashboardSectionError["phase"] = "initial") => {
+			const queued = notificationsRefreshQueueRef.current.then(() =>
+				loadNotificationsUnqueued(phase),
+			);
+			notificationsRefreshQueueRef.current = queued.catch(() => undefined);
+			return queued;
+		},
+		[loadNotificationsUnqueued],
+	);
+	const refreshSidebarUnqueued = useCallback(
 		async (options?: {
 			background?: boolean;
 			includeNotifications?: boolean;
@@ -2229,6 +2242,20 @@ export function Dashboard(props: {
 			}
 		},
 		[briefs.length, loadNotifications, notifyGlobalError, routeSelectedBriefId],
+	);
+	const refreshSidebar = useCallback(
+		(options?: {
+			background?: boolean;
+			includeNotifications?: boolean;
+			preferredBriefId?: string | null;
+		}) => {
+			const queued = sidebarRefreshQueueRef.current.then(() =>
+				refreshSidebarUnqueued(options),
+			);
+			sidebarRefreshQueueRef.current = queued.catch(() => undefined);
+			return queued;
+		},
+		[refreshSidebarUnqueued],
 	);
 	const refreshNotifications = useCallback(
 		async (options?: { background?: boolean }) => {
@@ -3175,7 +3202,7 @@ export function Dashboard(props: {
 			completionTimer = window.setTimeout(() => {
 				completionTimer = null;
 				failStream("同步完成后的页面刷新超时，请刷新页面后重试。", true);
-			}, TASK_STREAM_RECOVERY_GRACE_MS);
+			}, TASK_STREAM_COMPLETION_GRACE_MS);
 			const complete = async () => {
 				if (streamSettled) return;
 				clearReconnectTimer();
@@ -3192,8 +3219,10 @@ export function Dashboard(props: {
 					}));
 					try {
 						await refreshAllRef.current({ throwOnError: true });
+						if (streamSettled) return;
 						clearDashboardLiveNoticesRef.current();
 						await checkDashboardUpdatesRef.current({ emit: false });
+						if (streamSettled) return;
 					} catch (error) {
 						if (streamSettled) return;
 						setAccessSyncStage("failed");
@@ -3353,7 +3382,7 @@ export function Dashboard(props: {
 				lifecycle.completionTimer = window.setTimeout(() => {
 					lifecycle.completionTimer = null;
 					failStream("同步完成后的页面刷新超时，请刷新页面后重试。", true);
-				}, TASK_STREAM_RECOVERY_GRACE_MS);
+				}, TASK_STREAM_COMPLETION_GRACE_MS);
 				const complete = async () => {
 					if (lifecycle.settled) return;
 					clearReconnectTimer();
@@ -3364,8 +3393,10 @@ export function Dashboard(props: {
 					if (payload.status === "succeeded") {
 						try {
 							await refreshAllRef.current({ throwOnError: true });
+							if (lifecycle.settled) return;
 							clearDashboardLiveNoticesRef.current();
 							await checkDashboardUpdatesRef.current({ emit: false });
+							if (lifecycle.settled) return;
 						} catch (error) {
 							if (lifecycle.settled) return;
 							const resolvedError =
