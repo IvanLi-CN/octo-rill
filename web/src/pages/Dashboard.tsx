@@ -1968,6 +1968,8 @@ export function Dashboard(props: {
 	);
 	const sidebarRequestIdRef = useRef(0);
 	const notificationsRequestIdRef = useRef(0);
+	const sidebarLoadingRequestIdRef = useRef(0);
+	const notificationsLoadingRequestIdRef = useRef(0);
 	const sidebarRefreshQueueRef = useRef<Promise<void>>(Promise.resolve());
 	const notificationsRefreshQueueRef = useRef<Promise<void>>(Promise.resolve());
 	const [sidebarLoading, setSidebarLoading] = useState(
@@ -2164,9 +2166,6 @@ export function Dashboard(props: {
 			preferredBriefId?: string | null;
 		}) => {
 			const requestId = ++sidebarRequestIdRef.current;
-			if (!options?.background) {
-				setSidebarLoading(true);
-			}
 			setBriefsError(null);
 			try {
 				const phase: DashboardSectionError["phase"] = options?.background
@@ -2235,10 +2234,6 @@ export function Dashboard(props: {
 					notifyGlobalError("侧栏刷新失败", error, message);
 				}
 				throw error;
-			} finally {
-				if (requestId === sidebarRequestIdRef.current) {
-					setSidebarLoading(false);
-				}
 			}
 		},
 		[briefs.length, loadNotifications, notifyGlobalError, routeSelectedBriefId],
@@ -2249,16 +2244,25 @@ export function Dashboard(props: {
 			includeNotifications?: boolean;
 			preferredBriefId?: string | null;
 		}) => {
+			const loadingRequestId = ++sidebarLoadingRequestIdRef.current;
+			if (!options?.background) {
+				setSidebarLoading(true);
+			}
 			const queued = sidebarRefreshQueueRef.current.then(() =>
 				refreshSidebarUnqueued(options),
 			);
 			sidebarRefreshQueueRef.current = queued.catch(() => undefined);
-			return queued;
+			return queued.finally(() => {
+				if (loadingRequestId === sidebarLoadingRequestIdRef.current) {
+					setSidebarLoading(false);
+				}
+			});
 		},
 		[refreshSidebarUnqueued],
 	);
 	const refreshNotifications = useCallback(
 		async (options?: { background?: boolean }) => {
+			const loadingRequestId = ++notificationsLoadingRequestIdRef.current;
 			if (!options?.background) {
 				setNotificationsLoading(true);
 			}
@@ -2266,7 +2270,9 @@ export function Dashboard(props: {
 				await loadNotifications(options?.background ? "refresh" : "initial");
 				notificationsBootstrapCompletedRef.current = true;
 			} finally {
-				setNotificationsLoading(false);
+				if (loadingRequestId === notificationsLoadingRequestIdRef.current) {
+					setNotificationsLoading(false);
+				}
 			}
 		},
 		[loadNotifications],
