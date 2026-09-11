@@ -2180,7 +2180,9 @@ export function Dashboard(props: {
 			includeNotifications?: boolean;
 			preferredBriefId?: string | null;
 			throwOnError?: boolean;
+			onStart?: () => void;
 		}) => {
+			options?.onStart?.();
 			const requestId = ++sidebarRequestIdRef.current;
 			setBriefsError(null);
 			try {
@@ -2260,6 +2262,7 @@ export function Dashboard(props: {
 			includeNotifications?: boolean;
 			preferredBriefId?: string | null;
 			throwOnError?: boolean;
+			onStart?: () => void;
 		}) => {
 			const priority = options?.throwOnError
 				? ++sidebarRefreshPriorityRef.current
@@ -2480,7 +2483,7 @@ export function Dashboard(props: {
 	]);
 
 	const refreshAll = useCallback(
-		async (options?: { throwOnError?: boolean }) => {
+		async (options?: { throwOnError?: boolean; onStart?: () => void }) => {
 			const tasks: Array<Promise<unknown>> = [refreshFeed(options)];
 			if (!scopedMode) {
 				tasks.push(
@@ -2490,6 +2493,7 @@ export function Dashboard(props: {
 							hasDesktopSidebarInbox ||
 							tab === "inbox" ||
 							notificationsBootstrapCompletedRef.current,
+						onStart: options?.onStart,
 					}),
 				);
 			}
@@ -3170,6 +3174,7 @@ export function Dashboard(props: {
 		const source = openAppEventSource(accessTaskStream.eventPath);
 		let reconnectTimer: number | null = null;
 		let completionTimer: number | null = null;
+		let completionTimerStarted = false;
 		let completionInFlight = false;
 		let streamSettled = false;
 		const clearReconnectTimer = () => {
@@ -3264,10 +3269,14 @@ export function Dashboard(props: {
 			completionInFlight = true;
 			const payload = parsePayload(event as MessageEvent<string>);
 			const completedTaskId = accessTaskStream.taskId;
-			completionTimer = window.setTimeout(() => {
-				completionTimer = null;
-				failStream("同步完成后的页面刷新超时，请刷新页面后重试。", true);
-			}, TASK_STREAM_COMPLETION_GRACE_MS);
+			const startCompletionTimer = () => {
+				if (completionTimerStarted || streamSettled) return;
+				completionTimerStarted = true;
+				completionTimer = window.setTimeout(() => {
+					completionTimer = null;
+					failStream("同步完成后的页面刷新超时，请刷新页面后重试。", true);
+				}, TASK_STREAM_COMPLETION_GRACE_MS);
+			};
 			const complete = async () => {
 				if (streamSettled) return;
 				clearReconnectTimer();
@@ -3283,7 +3292,10 @@ export function Dashboard(props: {
 						detail: "正在刷新页面内容",
 					}));
 					try {
-						await refreshAllRef.current({ throwOnError: true });
+						await refreshAllRef.current({
+							throwOnError: true,
+							onStart: startCompletionTimer,
+						});
 						if (streamSettled) return;
 						clearDashboardLiveNoticesRef.current();
 						await checkDashboardUpdatesRef.current({ emit: false });
@@ -3444,10 +3456,15 @@ export function Dashboard(props: {
 				lifecycle.completionInFlight = true;
 				const payload = parsePayload(event as MessageEvent<string>);
 				const completedTaskId = task.taskId;
-				lifecycle.completionTimer = window.setTimeout(() => {
-					lifecycle.completionTimer = null;
-					failStream("同步完成后的页面刷新超时，请刷新页面后重试。", true);
-				}, TASK_STREAM_COMPLETION_GRACE_MS);
+				let completionTimerStarted = false;
+				const startCompletionTimer = () => {
+					if (completionTimerStarted || lifecycle.settled) return;
+					completionTimerStarted = true;
+					lifecycle.completionTimer = window.setTimeout(() => {
+						lifecycle.completionTimer = null;
+						failStream("同步完成后的页面刷新超时，请刷新页面后重试。", true);
+					}, TASK_STREAM_COMPLETION_GRACE_MS);
+				};
 				const complete = async () => {
 					if (lifecycle.settled) return;
 					clearReconnectTimer();
@@ -3457,7 +3474,10 @@ export function Dashboard(props: {
 							: undefined;
 					if (payload.status === "succeeded") {
 						try {
-							await refreshAllRef.current({ throwOnError: true });
+							await refreshAllRef.current({
+								throwOnError: true,
+								onStart: startCompletionTimer,
+							});
 							if (lifecycle.settled) return;
 							clearDashboardLiveNoticesRef.current();
 							await checkDashboardUpdatesRef.current({ emit: false });

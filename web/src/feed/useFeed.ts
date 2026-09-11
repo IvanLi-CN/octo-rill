@@ -231,8 +231,13 @@ export function useFeed(
 	}, [queryKey]);
 
 	const loadInitial = useCallback(
-		async (options?: { freshKeys?: string[]; throwOnError?: boolean }) => {
+		async (options?: {
+			freshKeys?: string[];
+			throwOnError?: boolean;
+			onStart?: () => void;
+		}) => {
 			if (!enabled) return;
+			options?.onStart?.();
 			reqIdRef.current += 1;
 			const reqId = reqIdRef.current;
 
@@ -322,7 +327,11 @@ export function useFeed(
 	]);
 
 	const refresh = useCallback(
-		async (options?: { freshKeys?: string[]; throwOnError?: boolean }) => {
+		async (options?: {
+			freshKeys?: string[];
+			throwOnError?: boolean;
+			onStart?: () => void;
+		}) => {
 			await loadInitial(options);
 		},
 		[loadInitial],
