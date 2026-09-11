@@ -234,7 +234,7 @@ export function useDashboardReadableSections(options?: {
 										sectionId,
 										{
 											...detail,
-											nextCursor: next.items_next_cursor ?? null,
+											nextCursor: null,
 											loading: false,
 											error: null,
 											refreshPending: true,

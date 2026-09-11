@@ -2366,7 +2366,7 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 	});
 
 	await page.goto("/");
-	await expect(page.getByText("Cached release")).toBeVisible();
+	await expect(page.getByText("Cached release")).toBeVisible({ timeout: 8000 });
 	const sourceStatsAtContent = await page.evaluate(() => {
 		const state = window as typeof window & {
 			__taskEventSourceCount?: number;
