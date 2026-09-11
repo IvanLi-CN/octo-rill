@@ -1592,23 +1592,39 @@ where
     T: Send + 'static,
 {
     let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+    let (cancel_sender, mut cancel_receiver) = tokio::sync::oneshot::channel();
+    let mut read_handle = tokio::spawn(read);
     tokio::spawn(async move {
-        let result = match tokio::spawn(read).await {
-            Ok(result) => result,
-            Err(error) => Err(ApiError::internal(error)),
-        };
-        let _ = result_sender.send(result);
+        tokio::select! {
+            result = &mut read_handle => {
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) => Err(ApiError::internal(error)),
+                };
+                let _ = result_sender.send(result);
+            }
+            _ = &mut cancel_receiver => {
+                read_handle.abort();
+                let _ = read_handle.await;
+            }
+        }
         drop(permit);
     });
     match tokio::time::timeout(budget, result_receiver).await {
         Ok(Ok(result)) => result,
         Ok(Err(_)) => Err(ApiError::internal("collection read supervisor stopped")),
-        Err(_) => Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "admin_collection_records_timeout",
-            "admin collection records read timed out",
-        )
-        .with_retry_after(1)),
+        Err(_) => {
+            // Ask the supervisor to cancel and await the query task before it
+            // releases the permit. Caller cancellation follows the same path
+            // because the supervisor owns both resources independently.
+            let _ = cancel_sender.send(());
+            Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "admin_collection_records_timeout",
+                "admin collection records read timed out",
+            )
+            .with_retry_after(1))
+        }
     }
 }
 
@@ -2780,10 +2796,7 @@ mod tests {
         let permit = gate.clone().try_acquire_owned().expect("read permit");
         let error = run_bounded_collection_read_with_budget(
             permit,
-            async {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                Ok::<_, ApiError>(())
-            },
+            std::future::pending::<Result<(), ApiError>>(),
             Duration::from_millis(1),
         )
         .await
@@ -2792,7 +2805,23 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
         assert!(gate.try_acquire().is_err());
-        tokio::time::sleep(Duration::from_millis(75)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(gate.try_acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn collection_read_caller_cancellation_keeps_gate_until_cleanup() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = gate.clone().try_acquire_owned().expect("read permit");
+        let task = tokio::spawn(run_bounded_collection_read_with_budget(
+            permit,
+            std::future::pending::<Result<(), ApiError>>(),
+            Duration::from_secs(5),
+        ));
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(gate.try_acquire().is_ok());
     }
 
