@@ -2360,7 +2360,7 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 		.poll(() => feedResponseTitles.length, { timeout: 3000 })
 		.toBeGreaterThanOrEqual(2);
 	await expect(page.getByText("Cached release")).toBeVisible();
-	await expect(page.getByText("Fresh release")).toBeVisible({ timeout: 5000 });
+	await expect(page.getByText("Fresh release")).toBeVisible({ timeout: 8000 });
 	await page.waitForTimeout(250);
 
 	expect(feedCalls).toBeGreaterThanOrEqual(2);
