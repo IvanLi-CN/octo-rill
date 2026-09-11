@@ -32,6 +32,8 @@ export type ReadableSectionDetails = {
 	refreshPending?: boolean;
 };
 
+export type ReadableRefreshResult = "applied" | "superseded" | "failed";
+
 function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
 }
@@ -160,9 +162,10 @@ export function useDashboardReadableSections(options?: {
 	detailsRef.current = details;
 	const requestIdRef = useRef(0);
 	const lifecycleGenerationRef = useRef(0);
-	const refreshQueueRef = useRef<Promise<boolean | undefined>>(
+	const refreshQueueRef = useRef<Promise<ReadableRefreshResult | undefined>>(
 		Promise.resolve(undefined),
 	);
+	const refreshPriorityRef = useRef(0);
 	const refreshInFlightRef = useRef(false);
 	const cursorInFlightRef = useRef(new Set<string>());
 	const cursorCompletedRef = useRef(new Set<string>());
@@ -173,10 +176,10 @@ export function useDashboardReadableSections(options?: {
 		async (preserveContent: boolean, options?: { throwOnError?: boolean }) => {
 			const requestId = ++requestIdRef.current;
 			const isSuperseded = () => requestId !== requestIdRef.current;
-			const rejectIfSuperseded = () => {
-				if (!isSuperseded()) return false;
+			const rejectIfSuperseded = (): ReadableRefreshResult | null => {
+				if (!isSuperseded()) return null;
 				if (options?.throwOnError) throw new Error("刷新已取消");
-				return true;
+				return "superseded";
 			};
 			refreshInFlightRef.current = preserveContent;
 			cursorInFlightRef.current.clear();
@@ -221,7 +224,8 @@ export function useDashboardReadableSections(options?: {
 						cause instanceof TypeError;
 					if (!endpointUnavailable) throw cause;
 					const legacy = await apiGet<FeedResponse>("/api/feed?limit=30");
-					if (rejectIfSuperseded()) return false;
+					const superseded = rejectIfSuperseded();
+					if (superseded) return superseded;
 					usedLegacyFallback = true;
 					const legacyItems = legacy.items ?? [];
 					const firstTimestamp =
@@ -245,7 +249,8 @@ export function useDashboardReadableSections(options?: {
 						next_cursor: legacy.next_cursor ?? null,
 					};
 				}
-				if (rejectIfSuperseded()) return false;
+				const superseded = rejectIfSuperseded();
+				if (superseded) return superseded;
 				setLegacyFallback(usedLegacyFallback);
 				const nextSections = response.sections ?? [];
 				const previousSections = new Map(
@@ -282,9 +287,10 @@ export function useDashboardReadableSections(options?: {
 						),
 					);
 				}
-				return true;
+				return "applied";
 			} catch (cause) {
-				if (rejectIfSuperseded()) return false;
+				const superseded = rejectIfSuperseded();
+				if (superseded) return superseded;
 				const description = describeNetworkAwareError(
 					cause,
 					"可读动态加载失败，请稍后重试。",
@@ -295,7 +301,7 @@ export function useDashboardReadableSections(options?: {
 					at: Date.now(),
 				});
 				if (options?.throwOnError) throw cause;
-				return false;
+				return "failed";
 			} finally {
 				if (requestId === requestIdRef.current) {
 					refreshInFlightRef.current = false;
@@ -311,20 +317,31 @@ export function useDashboardReadableSections(options?: {
 	const refresh = useCallback(
 		(options?: { throwOnError?: boolean }) => {
 			const generation = lifecycleGenerationRef.current;
-			const queued = refreshQueueRef.current.then(async () => {
+			const priority = options?.throwOnError
+				? ++refreshPriorityRef.current
+				: refreshPriorityRef.current;
+			if (options?.throwOnError) {
 				if (generation !== lifecycleGenerationRef.current || !enabled) {
-					if (options?.throwOnError) throw new Error("刷新已取消");
-					return false;
+					return Promise.reject(new Error("刷新已取消"));
 				}
-				const applied = await loadSections(true, options);
-				if (
-					generation !== lifecycleGenerationRef.current &&
-					options?.throwOnError
-				) {
-					throw new Error("刷新已取消");
-				}
-				return applied;
-			});
+				const immediate = loadSections(true, options);
+				refreshQueueRef.current = immediate.catch(() => undefined);
+				return immediate;
+			}
+			const queued = refreshQueueRef.current.then(
+				async (): Promise<ReadableRefreshResult> => {
+					if (
+						generation !== lifecycleGenerationRef.current ||
+						priority !== refreshPriorityRef.current ||
+						!enabled
+					) {
+						if (options?.throwOnError) throw new Error("刷新已取消");
+						return "superseded";
+					}
+					const result = await loadSections(true, options);
+					return result;
+				},
+			);
 			refreshQueueRef.current = queued.catch(() => undefined);
 			return queued;
 		},
