@@ -1974,6 +1974,7 @@ export function Dashboard(props: {
 	const notificationsRefreshQueueRef = useRef<Promise<void>>(Promise.resolve());
 	const sidebarRefreshPriorityRef = useRef(0);
 	const notificationsRefreshPriorityRef = useRef(0);
+	const strictSidebarRefreshRef = useRef<Promise<void> | null>(null);
 	const [sidebarLoading, setSidebarLoading] = useState(
 		() => !bootedFromWarmStart && !hasCachedBriefs,
 	);
@@ -2267,13 +2268,20 @@ export function Dashboard(props: {
 			if (!options?.background) {
 				setSidebarLoading(true);
 			}
-			const run = async () => {
-				if (priority !== sidebarRefreshPriorityRef.current) return;
+			const run = async (checkPriority: boolean) => {
+				if (checkPriority && priority !== sidebarRefreshPriorityRef.current) {
+					return;
+				}
 				await refreshSidebarUnqueued(options);
 			};
 			const queued = options?.throwOnError
-				? run()
-				: sidebarRefreshQueueRef.current.then(run);
+				? (strictSidebarRefreshRef.current ?? Promise.resolve()).then(() =>
+						run(false),
+					)
+				: sidebarRefreshQueueRef.current.then(() => run(true));
+			if (options?.throwOnError) {
+				strictSidebarRefreshRef.current = queued.catch(() => undefined);
+			}
 			sidebarRefreshQueueRef.current = queued.catch(() => undefined);
 			return queued.finally(() => {
 				if (loadingRequestId === sidebarLoadingRequestIdRef.current) {

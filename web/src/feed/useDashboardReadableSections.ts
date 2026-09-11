@@ -166,6 +166,7 @@ export function useDashboardReadableSections(options?: {
 		Promise.resolve(undefined),
 	);
 	const refreshPriorityRef = useRef(0);
+	const strictRefreshRef = useRef<Promise<ReadableRefreshResult> | null>(null);
 	const refreshInFlightRef = useRef(false);
 	const cursorInFlightRef = useRef(new Set<string>());
 	const cursorCompletedRef = useRef(new Set<string>());
@@ -321,11 +322,17 @@ export function useDashboardReadableSections(options?: {
 				? ++refreshPriorityRef.current
 				: refreshPriorityRef.current;
 			if (options?.throwOnError) {
-				if (generation !== lifecycleGenerationRef.current || !enabled) {
-					return Promise.reject(new Error("刷新已取消"));
-				}
-				const immediate = loadSections(true, options);
-				refreshQueueRef.current = immediate.catch(() => undefined);
+				const previous =
+					strictRefreshRef.current ??
+					Promise.resolve<ReadableRefreshResult>("applied");
+				const immediate = previous.then(() => {
+					if (generation !== lifecycleGenerationRef.current || !enabled) {
+						return Promise.reject(new Error("刷新已取消"));
+					}
+					return loadSections(true, options);
+				});
+				strictRefreshRef.current = immediate.catch(() => "failed");
+				refreshQueueRef.current = strictRefreshRef.current;
 				return immediate;
 			}
 			const queued = refreshQueueRef.current.then(
