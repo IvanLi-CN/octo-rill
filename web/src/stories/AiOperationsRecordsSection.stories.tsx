@@ -458,9 +458,15 @@ export const BusyRead: Story = {
 	play: async ({ canvasElement }) => {
 		await waitFor(() =>
 			expect(
-				within(canvasElement).getByText("读取暂时繁忙，请稍后刷新。"),
+				within(canvasElement).getByRole("heading", {
+					name: "记录暂时无法读取",
+				}),
 			).toBeVisible(),
 		);
+		const errorPanel = within(canvasElement).getByRole("alert");
+		expect(
+			within(errorPanel).getByRole("button", { name: "刷新记录" }),
+		).toBeVisible();
 	},
 };
 
