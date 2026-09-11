@@ -121,11 +121,11 @@ function CollectionReadErrorState({
 }) {
 	return (
 		<div
-			className="flex flex-col gap-4 rounded-xl border border-destructive/30 bg-destructive/[0.06] p-5 sm:flex-row sm:items-start sm:p-6"
+			className="flex flex-col gap-4 rounded-xl border border-amber-300/45 bg-amber-50/80 p-5 sm:flex-row sm:items-start sm:p-6 dark:border-amber-300/20 dark:bg-amber-950/20"
 			role="alert"
 			aria-live="polite"
 		>
-			<div className="flex size-11 shrink-0 items-center justify-center rounded-lg bg-destructive/10 text-destructive">
+			<div className="flex size-11 shrink-0 items-center justify-center rounded-lg border border-amber-300/45 bg-amber-100/80 text-amber-700 dark:border-amber-300/20 dark:bg-amber-400/10 dark:text-amber-200">
 				<CircleAlert className="size-5" aria-hidden="true" />
 			</div>
 			<div className="min-w-0 flex-1 space-y-2">
@@ -138,13 +138,7 @@ function CollectionReadErrorState({
 					</p>
 				</div>
 				<div className="flex flex-wrap items-center gap-3">
-					<Button
-						type="button"
-						variant="outline"
-						size="sm"
-						className="border-destructive/35 bg-background/80 text-destructive hover:bg-destructive/10 hover:text-destructive"
-						onClick={onRetry}
-					>
+					<Button type="button" onClick={onRetry}>
 						<RefreshCw className="size-4" aria-hidden="true" />
 						刷新记录
 					</Button>
