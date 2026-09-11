@@ -116,3 +116,31 @@
   submission_gate: pending-owner-approval
   evidence_note: 公告详情与 Release 使用同一全局润色投影合同，移动宽度下保留摘要且不改名“润色”。
   image: ![Announcement retained smart projection](./assets/content-projection-retention-announcement-mobile.png)
+
+- source_type: storybook_canvas
+  story_id_or_title: Admin/AiOperationsRecordsSection/BusyReadState
+  state: desktop collection read busy state
+  target_program: mock-only
+  capture_scope: browser-viewport
+  requested_viewport: 1072x488
+  viewport_strategy: storybook-viewport
+  margin_policy: require_margin
+  evidence_surface: component
+  sensitive_exclusion: N/A (mock-only Storybook fixture)
+  submission_gate: approved
+  evidence_note: 读取繁忙时使用与现有黑色“刷新记录”按钮协调的琥珀色告警块，错误区域不显示多余空白。
+  image: ![管理采集记录桌面端读取繁忙状态](./assets/busy-read-desktop.png)
+
+- source_type: storybook_canvas
+  story_id_or_title: Admin/AiOperationsRecordsSection/BusyReadState
+  state: mobile collection read busy state
+  target_program: mock-only
+  capture_scope: browser-viewport
+  requested_viewport: 361x792
+  viewport_strategy: storybook-viewport
+  margin_policy: require_margin
+  evidence_surface: component
+  sensitive_exclusion: N/A (mock-only Storybook fixture)
+  submission_gate: approved
+  evidence_note: 移动宽度下告警内容、原有刷新按钮和保留筛选提示自然换行，无重叠或横向溢出。
+  image: ![管理采集记录移动端读取繁忙状态](./assets/busy-read-mobile.png)
