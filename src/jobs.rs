@@ -4343,6 +4343,7 @@ mod tests {
         Row, SqlitePool,
         sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     };
+    use tokio_stream::StreamExt;
     use url::Url;
 
     use crate::{
@@ -4460,33 +4461,50 @@ mod tests {
         let task_id = "sse-late-terminal-task";
         seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_SUCCEEDED, 0).await;
 
-        let insert_pool = pool.clone();
-        let insert_task = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-            sqlx::query(
-                r#"
-                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
-                VALUES (?, ?, 'task.completed', ?, ?)
-                "#,
-            )
-            .bind("sse-late-terminal-event")
-            .bind(task_id)
-            .bind(r#"{"status":"succeeded"}"#)
-            .bind("2026-03-06T00:00:01Z")
-            .execute(&insert_pool)
-            .await
-            .expect("insert late terminal event");
-        });
-
-        let body = to_bytes(
-            task_sse_response(state, task_id.to_owned(), None).into_body(),
-            usize::MAX,
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.progress', ?, ?)
+            "#,
         )
+        .bind("sse-terminal-before-flush")
+        .bind(task_id)
+        .bind(r#"{"stage":"release_summary"}"#)
+        .bind("2026-03-06T00:00:01Z")
+        .execute(&pool)
         .await
-        .expect("collect terminal SSE response");
-        insert_task.await.expect("join late event insert");
+        .expect("insert initial terminal event");
 
-        let text = String::from_utf8(body.to_vec()).expect("valid SSE body");
+        let mut stream = task_sse_response(state, task_id.to_owned(), None)
+            .into_body()
+            .into_data_stream();
+        let first_chunk = stream
+            .next()
+            .await
+            .expect("initial terminal event chunk")
+            .expect("read initial terminal event chunk");
+
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.completed', ?, ?)
+            "#,
+        )
+        .bind("sse-late-terminal-event")
+        .bind(task_id)
+        .bind(r#"{"status":"succeeded"}"#)
+        .bind("2026-03-06T00:00:01Z")
+        .execute(&pool)
+        .await
+        .expect("insert late terminal event");
+
+        let mut body = first_chunk.to_vec();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk.expect("read terminal SSE chunk"));
+        }
+
+        let text = String::from_utf8(body).expect("valid SSE body");
+        assert!(text.contains("id: sse-terminal-before-flush"));
         assert_eq!(text.matches("id: sse-late-terminal-event").count(), 1);
     }
 

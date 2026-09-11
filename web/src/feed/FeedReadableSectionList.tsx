@@ -289,6 +289,7 @@ export function FeedReadableSectionList(props: {
 	details: Record<string, ReadableSectionDetails>;
 	error: ReadableSectionsError | null;
 	loadingInitial: boolean;
+	loadingRefresh?: boolean;
 	loadingMore: boolean;
 	hasMore: boolean;
 	autoLoadMore?: boolean;
@@ -306,6 +307,7 @@ export function FeedReadableSectionList(props: {
 		details,
 		error,
 		loadingInitial,
+		loadingRefresh = false,
 		loadingMore,
 		hasMore,
 		autoLoadMore = true,
@@ -342,13 +344,14 @@ export function FeedReadableSectionList(props: {
 
 	useEffect(() => {
 		requestVisibleRef.current = false;
-	}, [hasMore, sections.length]);
+	}, [hasMore, loadingRefresh, sections.length]);
 
 	useEffect(() => {
 		if (
 			!autoLoadMore ||
 			!hasMore ||
 			loadingInitial ||
+			loadingRefresh ||
 			loadingMore ||
 			error?.phase === "append"
 		)
@@ -376,6 +379,7 @@ export function FeedReadableSectionList(props: {
 		error?.phase,
 		hasMore,
 		loadingInitial,
+		loadingRefresh,
 		loadingMore,
 		onLoadMore,
 	]);

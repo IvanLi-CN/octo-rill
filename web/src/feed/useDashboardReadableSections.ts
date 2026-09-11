@@ -90,6 +90,7 @@ export function useDashboardReadableSections(options?: {
 	const [sections, setSections] = useState<DashboardReadableSection[]>([]);
 	const [nextCursor, setNextCursor] = useState<string | null>(null);
 	const [loadingInitial, setLoadingInitial] = useState(true);
+	const [loadingRefresh, setLoadingRefresh] = useState(false);
 	const [loadingMore, setLoadingMore] = useState(false);
 	const [error, setError] = useState<ReadableSectionsError | null>(null);
 	const [legacyFallback, setLegacyFallback] = useState(false);
@@ -115,6 +116,7 @@ export function useDashboardReadableSections(options?: {
 		if (!preserveContent) {
 			setLoadingInitial(true);
 		}
+		setLoadingRefresh(preserveContent);
 		setLoadingMore(false);
 		setError(null);
 		if (!preserveContent) {
@@ -201,6 +203,7 @@ export function useDashboardReadableSections(options?: {
 		} finally {
 			if (requestId === requestIdRef.current) {
 				refreshInFlightRef.current = false;
+				setLoadingRefresh(false);
 				setLoadingInitial(false);
 			}
 		}
@@ -212,6 +215,7 @@ export function useDashboardReadableSections(options?: {
 	useEffect(() => {
 		if (!enabled) {
 			refreshInFlightRef.current = false;
+			setLoadingRefresh(false);
 			setLoadingInitial(false);
 			setLoadingMore(false);
 			setError(null);
@@ -439,6 +443,7 @@ export function useDashboardReadableSections(options?: {
 		nextCursor,
 		hasMore: Boolean(nextCursor),
 		loadingInitial,
+		loadingRefresh,
 		loadingMore,
 		error,
 		legacyFallback,

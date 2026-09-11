@@ -4030,6 +4030,7 @@ export function Dashboard(props: {
 						details={readableSections.details}
 						error={readableSections.error}
 						loadingInitial={readableSections.loadingInitial}
+						loadingRefresh={readableSections.loadingRefresh}
 						loadingMore={readableSections.loadingMore}
 						hasMore={readableSections.hasMore}
 						onLoadMore={() => void readableSections.loadMore()}
