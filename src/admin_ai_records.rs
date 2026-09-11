@@ -1164,7 +1164,7 @@ async fn list_source_rows(
                   COALESCE(MAX(NULLIF(n.subject_title, '')), '通知') AS title,
                   MAX(n.updated_at) AS source_time,
                   MAX(n.updated_at) AS occurred_at,
-                  MIN(n.created_at) AS detected_at,
+                  NULL AS detected_at,
                   NULL AS generated_at,
                   {attempt_count_sql} AS attempt_count
                 FROM notifications n
@@ -1298,7 +1298,7 @@ pub async fn admin_list_collection_records(
 }
 
 async fn load_source_record(
-    state: &AppState,
+    pool: &SqlitePool,
     kind: CollectionRecordKind,
     id: &str,
 ) -> Result<SourceRecordRow, ApiError> {
@@ -1310,7 +1310,7 @@ async fn load_source_record(
             "SELECT lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id, MAX(e.repo_full_name) AS repository, COALESCE(MAX(NULLIF(e.title, '')), '公告') AS title, MAX(e.occurred_at) AS occurred_at, MIN(e.detected_at) AS detected_at, NULL AS generated_at FROM social_activity_events e WHERE e.kind = 'announcement' AND lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) = ? GROUP BY lower(e.repo_full_name), e.discussion_number LIMIT 1"
         }
         CollectionRecordKind::Notification => {
-            "SELECT n.thread_id AS id, MAX(n.repo_full_name) AS repository, COALESCE(MAX(NULLIF(n.subject_title, '')), '通知') AS title, MAX(n.updated_at) AS occurred_at, MIN(n.created_at) AS detected_at, NULL AS generated_at FROM notifications n WHERE n.thread_id = ? GROUP BY n.thread_id LIMIT 1"
+            "SELECT n.thread_id AS id, MAX(n.repo_full_name) AS repository, COALESCE(MAX(NULLIF(n.subject_title, '')), '通知') AS title, MAX(n.updated_at) AS occurred_at, NULL AS detected_at, NULL AS generated_at FROM notifications n WHERE n.thread_id = ? GROUP BY n.thread_id LIMIT 1"
         }
         CollectionRecordKind::Brief => {
             "SELECT b.id, NULL AS repository, b.date AS title, NULL AS occurred_at, NULL AS detected_at, b.created_at AS generated_at FROM briefs b WHERE b.id = ? LIMIT 1"
@@ -1318,7 +1318,7 @@ async fn load_source_record(
     };
     sqlx::query_as::<_, SourceRecordRow>(sql)
         .bind(id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(pool)
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(|| {
@@ -1759,7 +1759,7 @@ pub async fn admin_get_collection_record_detail(
 ) -> Result<Json<AdminCollectionRecordDetail>, ApiError> {
     let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
     let kind = CollectionRecordKind::parse(record_kind.as_str())?;
-    let source = load_source_record(state.as_ref(), kind, &record_id).await?;
+    let source = load_source_record(&state.pool, kind, &record_id).await?;
     let ids = vec![source.id.clone()];
     let coverage = load_processing_coverage(&state.pool, kind, &ids).await?;
     let task_summaries = load_task_summaries(state.as_ref(), kind, &ids, &coverage).await?;
@@ -1800,6 +1800,48 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .expect("create sqlite test pool")
+    }
+
+    async fn create_notifications_fixture(pool: &SqlitePool) {
+        sqlx::query("CREATE TABLE users (id TEXT PRIMARY KEY)")
+            .execute(pool)
+            .await
+            .expect("create users");
+        sqlx::query("INSERT INTO users (id) VALUES ('user-a'), ('user-b'), ('user-c')")
+            .execute(pool)
+            .await
+            .expect("seed users");
+        sqlx::query(
+            "CREATE TABLE notifications (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                repo_full_name TEXT,
+                subject_title TEXT,
+                subject_type TEXT,
+                reason TEXT,
+                updated_at TEXT,
+                unread INTEGER NOT NULL DEFAULT 1,
+                url TEXT,
+                html_url TEXT,
+                last_seen_at TEXT,
+                UNIQUE(user_id, thread_id),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )",
+        )
+        .execute(pool)
+        .await
+        .expect("create notifications");
+        sqlx::query(
+            "INSERT INTO notifications (id, user_id, thread_id, repo_full_name, subject_title, subject_type, reason, updated_at, unread, url, html_url, last_seen_at)
+             VALUES
+                ('notification-1', 'user-a', 'thread-1', 'octo/demo', 'Issue update', 'Issue', 'mention', '2026-07-08T09:00:00Z', 1, 'https://example.test/1', 'https://example.test/1', '2026-07-08T09:00:00Z'),
+                ('notification-2', 'user-b', 'thread-1', 'octo/demo', 'Issue update', 'Issue', 'mention', '2026-07-08T09:05:00Z', 1, 'https://example.test/1', 'https://example.test/1', '2026-07-08T09:05:00Z'),
+                ('notification-3', 'user-c', 'thread-2', 'octo/demo', 'Older issue', 'Issue', 'mention', '2026-07-08T08:30:00Z', 1, 'https://example.test/2', 'https://example.test/2', '2026-07-08T08:30:00Z')",
+        )
+        .execute(pool)
+        .await
+        .expect("seed notifications");
     }
 
     fn list_query(
@@ -2063,29 +2105,18 @@ mod tests {
     #[tokio::test]
     async fn notification_source_rows_group_users_by_thread_id() {
         let pool = test_pool().await;
-        sqlx::query(
-            "CREATE TABLE notifications (user_id TEXT, thread_id TEXT, repo_full_name TEXT, subject_title TEXT, updated_at TEXT, created_at TEXT)",
-        )
-        .execute(&pool)
-        .await
-        .expect("create notifications");
+        create_notifications_fixture(&pool).await;
         sqlx::query(
             "CREATE TABLE translation_work_items (entity_id TEXT, kind TEXT, attempt_count INTEGER)",
         )
         .execute(&pool)
         .await
         .expect("create notification work items");
-        sqlx::query(
-            "INSERT INTO notifications (user_id, thread_id, repo_full_name, subject_title, updated_at, created_at) VALUES ('user-a', 'thread-1', 'octo/demo', 'Issue update', '2026-07-08T09:00:00Z', '2026-07-08T08:00:00Z'), ('user-b', 'thread-1', 'octo/demo', 'Issue update', '2026-07-08T09:05:00Z', '2026-07-08T08:05:00Z')",
-        )
-        .execute(&pool)
-        .await
-        .expect("seed notifications");
         let rows = list_source_rows(
             &pool,
             CollectionRecordKind::Notification,
             false,
-            Some("2026-07-08T08:00:00Z"),
+            Some("2026-07-08T09:04:00Z"),
             Some("2026-07-08T10:00:00Z"),
             AttemptCountRange { min: 0, max: None },
         )
@@ -2093,6 +2124,22 @@ mod tests {
         .expect("list notifications");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "thread-1");
+        assert_eq!(rows[0].occurred_at.as_deref(), Some("2026-07-08T09:05:00Z"));
+        assert_eq!(rows[0].detected_at, None);
+    }
+
+    #[tokio::test]
+    async fn notification_source_record_uses_unknown_detected_time() {
+        let pool = test_pool().await;
+        create_notifications_fixture(&pool).await;
+
+        let row = load_source_record(&pool, CollectionRecordKind::Notification, "thread-1")
+            .await
+            .expect("load notification");
+
+        assert_eq!(row.id, "thread-1");
+        assert_eq!(row.occurred_at.as_deref(), Some("2026-07-08T09:05:00Z"));
+        assert_eq!(row.detected_at, None);
     }
 
     fn event(trigger: &str, event_type: &str, created_at: &str) -> AttemptEventRow {
