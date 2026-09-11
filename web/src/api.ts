@@ -58,8 +58,9 @@ function resolveApiRequestPath(path: string) {
 	return isDemoMode() ? appendDemoRuntimeRequestMarker(path) : path;
 }
 
-export async function apiGet<T>(path: string): Promise<T> {
+export async function apiGet<T>(path: string, init?: RequestInit): Promise<T> {
 	const res = await fetch(resolveApiRequestPath(path), {
+		...init,
 		credentials: "include",
 	});
 	if (!res.ok) {
@@ -2443,9 +2444,11 @@ export async function apiGetAdminTranslationAttemptEvents(
 export async function apiGetAdminCollectionRecords(
 	kind: AdminCollectionRecordItem["kind"],
 	params: URLSearchParams,
+	signal?: AbortSignal,
 ): Promise<AdminCollectionRecordsResponse> {
 	return apiGet<AdminCollectionRecordsResponse>(
 		`/api/admin/jobs/ai-records/${kind}?${params.toString()}`,
+		{ signal },
 	);
 }
 export async function apiGetAdminCollectionRecordDetail(

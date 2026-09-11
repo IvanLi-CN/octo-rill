@@ -17,6 +17,7 @@ import {
 	type AiRecordStatus,
 } from "@/admin/jobsRouteState";
 import {
+	ApiError,
 	type AdminCollectionAttempt,
 	type AdminCollectionRecordDetail,
 	type AdminCollectionRecordItem,
@@ -1140,6 +1141,7 @@ export function AiOperationsRecordsSection({
 	useEffect(() => {
 		const requestId = listRequestRef.current + 1;
 		listRequestRef.current = requestId;
+		const abortController = new AbortController();
 		setLoading(true);
 		setError(null);
 		const params = new URLSearchParams({
@@ -1160,7 +1162,7 @@ export function AiOperationsRecordsSection({
 		if (polishStatuses.length > 0) {
 			params.set("polish_status", polishStatuses.join(","));
 		}
-		void apiGetAdminCollectionRecords(tab, params)
+		void apiGetAdminCollectionRecords(tab, params, abortController.signal)
 			.then((response) => {
 				if (requestId !== listRequestRef.current) return;
 				setItems(response.items);
@@ -1168,11 +1170,22 @@ export function AiOperationsRecordsSection({
 			})
 			.catch((cause: unknown) => {
 				if (requestId !== listRequestRef.current) return;
+				if (cause instanceof DOMException && cause.name === "AbortError")
+					return;
+				if (
+					cause instanceof ApiError &&
+					(cause.code === "admin_collection_records_busy" ||
+						cause.code === "admin_collection_records_timeout")
+				) {
+					setError("读取暂时繁忙，请稍后刷新。");
+					return;
+				}
 				setError(cause instanceof Error ? cause.message : "无法读取采集记录。");
 			})
 			.finally(() => {
 				if (requestId === listRequestRef.current) setLoading(false);
 			});
+		return () => abortController.abort();
 	}, [
 		page,
 		reloadNonce,

@@ -2517,6 +2517,7 @@ mod tests {
             translation_scheduler: Arc::new(TranslationSchedulerController::new(
                 TranslationRuntimeConfig::default(),
             )),
+            admin_collection_read_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             runtime_owner_id: "content-processing-test-owner".to_owned(),
         })
     }
@@ -2587,7 +2588,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::raw_sql(
-            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, scope_user_id TEXT NOT NULL, kind TEXT NOT NULL, entity_id TEXT NOT NULL, target_lang TEXT NOT NULL, source_hash TEXT NOT NULL, result_status TEXT, status TEXT NOT NULL); CREATE TABLE ai_translations (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, lang TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL, title TEXT, summary TEXT, value TEXT NOT NULL); CREATE TABLE notifications (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, thread_id TEXT NOT NULL); INSERT INTO translation_work_items VALUES ('legacy-1', 'user-1', 'release_summary', 'release-1', 'zh-CN', 'hash-1', 'ready', 'completed'); INSERT INTO ai_translations VALUES ('cache-1', 'user-1', 'release', 'release-1', 'zh-CN', 'hash-1', 'ready', 'Cached title', 'Cached summary', 'cached');",
+            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, scope_user_id TEXT NOT NULL, kind TEXT NOT NULL, entity_id TEXT NOT NULL, target_lang TEXT NOT NULL, source_hash TEXT NOT NULL, result_status TEXT, status TEXT NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP); CREATE TABLE ai_translations (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, lang TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL, title TEXT, summary TEXT, value TEXT NOT NULL); CREATE TABLE notifications (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, thread_id TEXT NOT NULL, updated_at TEXT); INSERT INTO translation_work_items (id, scope_user_id, kind, entity_id, target_lang, source_hash, result_status, status) VALUES ('legacy-1', 'user-1', 'release_summary', 'release-1', 'zh-CN', 'hash-1', 'ready', 'completed'); INSERT INTO ai_translations VALUES ('cache-1', 'user-1', 'release', 'release-1', 'zh-CN', 'hash-1', 'ready', 'Cached title', 'Cached summary', 'cached');",
         )
         .execute(&pool)
         .await
@@ -2605,6 +2606,12 @@ mod tests {
 
         sqlx::raw_sql(include_str!(
             "../migrations/0078_content_processing_global_model.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/0079_admin_collection_read_budget_indexes.sql"
         ))
         .execute(&pool)
         .await
@@ -2630,12 +2637,12 @@ mod tests {
         assert_eq!(new_table_count, 9);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_notifications_thread_id'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN ('idx_notifications_admin_canonical_source', 'idx_translation_work_items_admin_entity_kind_attempt')",
             )
             .fetch_one(&pool)
             .await
             .unwrap(),
-            1
+            2
         );
         assert_eq!(
             sqlx::query_scalar::<_, String>(

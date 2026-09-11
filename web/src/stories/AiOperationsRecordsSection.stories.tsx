@@ -204,7 +204,16 @@ const meta = {
 	component: AiOperationsRecordsSection,
 	tags: ["autodocs"],
 	parameters: {
-		viewport: { viewports: INITIAL_VIEWPORTS, defaultViewport: "desktop" },
+		viewport: {
+			viewports: {
+				...INITIAL_VIEWPORTS,
+				adminMobile: {
+					name: "Admin mobile",
+					styles: { width: "393px", height: "852px" },
+				},
+			},
+			defaultViewport: "desktop",
+		},
 		docs: {
 			description: {
 				component:
@@ -359,6 +368,58 @@ export const ExpiredDiagnosticEvidence: Story = {
 				}
 				if (url.pathname.endsWith(`/llm/calls/${expiredCall.id}`)) {
 					return new Response(JSON.stringify(expiredCall), { status: 200 });
+				}
+				return restoreFetch(input, init);
+			};
+			useEffect(
+				() => () => {
+					window.fetch = restoreFetch;
+				},
+				[restoreFetch],
+			);
+			return (
+				<div
+					data-visual-evidence-surface
+					className="mx-auto box-border w-full max-w-[1072px] bg-background p-6"
+				>
+					<div data-visual-evidence-target className="mx-auto max-w-5xl p-6">
+						<Story />
+					</div>
+				</div>
+			);
+		},
+	],
+};
+
+export const BusyRead: Story = {
+	args: {
+		detailRoute: null,
+		onFiltersChange: () => undefined,
+		onOpenRecord: () => undefined,
+		onOpenAttempt: () => undefined,
+		onOpenLlm: () => undefined,
+		onCloseRecord: () => undefined,
+	},
+	decorators: [
+		(Story) => {
+			const originalFetch = useRef(window.fetch);
+			const restoreFetch = originalFetch.current;
+			window.fetch = async (input, init) => {
+				const url = new URL(
+					typeof input === "string" ? input : input.toString(),
+					window.location.origin,
+				);
+				if (url.pathname.endsWith("/ai-records/release")) {
+					return new Response(
+						JSON.stringify({
+							ok: false,
+							error: {
+								code: "admin_collection_records_busy",
+								message: "admin collection records are temporarily busy",
+							},
+						}),
+						{ status: 503, headers: { "content-type": "application/json" } },
+					);
 				}
 				return restoreFetch(input, init);
 			};
