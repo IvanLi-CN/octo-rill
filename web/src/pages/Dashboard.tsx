@@ -1546,6 +1546,10 @@ export function Dashboard(props: {
 			initialAccessTask ? accessSyncProgressFromStage("waiting") : null,
 		);
 	const refreshTaskSourcesRef = useRef<Map<string, EventSource>>(new Map());
+	const refreshTaskReconnectTimersRef = useRef<Map<string, number>>(new Map());
+	const refreshTaskLifecyclesRef = useRef<
+		Map<string, { settled: boolean; completionInFlight: boolean }>
+	>(new Map());
 	const syncAllInFlightRef = useRef(false);
 	const taskWaitersRef = useRef<
 		Map<
@@ -3250,10 +3254,13 @@ export function Dashboard(props: {
 
 			const source = openAppEventSource(task.eventPath);
 			let reconnectTimer: number | null = null;
+			const lifecycle = { settled: false, completionInFlight: false };
+			refreshTaskLifecyclesRef.current.set(task.taskId, lifecycle);
 			const clearReconnectTimer = () => {
 				if (reconnectTimer === null) return;
 				window.clearTimeout(reconnectTimer);
 				reconnectTimer = null;
+				refreshTaskReconnectTimersRef.current.delete(task.taskId);
 			};
 			refreshTaskSourcesRef.current.set(task.taskId, source);
 
@@ -3265,22 +3272,33 @@ export function Dashboard(props: {
 				}
 			};
 			const close = () => {
+				lifecycle.settled = true;
+				clearReconnectTimer();
 				source.close();
 				refreshTaskSourcesRef.current.delete(task.taskId);
+				refreshTaskLifecyclesRef.current.delete(task.taskId);
 				setRefreshTaskStreams((current) =>
 					current.filter((item) => item.taskId !== task.taskId),
 				);
 			};
 			const failStream = (message: string) => {
+				if (lifecycle.settled || lifecycle.completionInFlight) {
+					clearReconnectTimer();
+					return;
+				}
+				lifecycle.settled = true;
 				clearReconnectTimer();
-				pushErrorToast("后台同步事件流异常", message);
-				settleTaskWaiter(task.taskId, new Error(message));
+				pushErrorToastRef.current("后台同步事件流异常", message);
+				settleTaskWaiterRef.current(task.taskId, new Error(message));
 				close();
 			};
 			const onCompleted = (event: Event) => {
+				if (lifecycle.settled || lifecycle.completionInFlight) return;
+				lifecycle.completionInFlight = true;
 				const payload = parsePayload(event as MessageEvent<string>);
 				const completedTaskId = task.taskId;
 				const complete = async () => {
+					if (lifecycle.settled) return;
 					clearReconnectTimer();
 					const failed =
 						payload.status !== "succeeded"
@@ -3288,25 +3306,27 @@ export function Dashboard(props: {
 							: undefined;
 					if (payload.status === "succeeded") {
 						try {
-							await refreshAll();
-							clearDashboardLiveNotices();
-							await checkDashboardUpdates({ emit: false });
+							await refreshAllRef.current();
+							clearDashboardLiveNoticesRef.current();
+							await checkDashboardUpdatesRef.current({ emit: false });
 						} catch (error) {
+							if (lifecycle.settled) return;
 							const resolvedError =
 								error instanceof Error ? error : new Error(String(error));
-							notifyGlobalError(
+							notifyGlobalErrorRef.current(
 								"同步后刷新失败",
 								resolvedError,
 								"同步已完成，但页面刷新失败，请稍后重试。",
 							);
-							settleTaskWaiter(completedTaskId, resolvedError);
+							settleTaskWaiterRef.current(completedTaskId, resolvedError);
 							close();
 							return;
 						}
 					} else if (payload.error) {
-						pushErrorToast("后台同步失败", payload.error);
+						pushErrorToastRef.current("后台同步失败", payload.error);
 					}
-					settleTaskWaiter(completedTaskId, failed);
+					if (lifecycle.settled) return;
+					settleTaskWaiterRef.current(completedTaskId, failed);
 					close();
 				};
 				void complete();
@@ -3322,22 +3342,24 @@ export function Dashboard(props: {
 				if (reconnectTimer !== null) return;
 				reconnectTimer = window.setTimeout(() => {
 					reconnectTimer = null;
+					refreshTaskReconnectTimersRef.current.delete(task.taskId);
 					failStream("后台同步事件流恢复超时，请刷新页面后重试。");
 				}, TASK_STREAM_RECOVERY_GRACE_MS);
+				refreshTaskReconnectTimersRef.current.set(task.taskId, reconnectTimer);
 			};
 		}
-	}, [
-		notifyGlobalError,
-		pushErrorToast,
-		refreshTaskStreams,
-		refreshAll,
-		checkDashboardUpdates,
-		clearDashboardLiveNotices,
-		settleTaskWaiter,
-	]);
+	}, [refreshTaskStreams]);
 
 	useEffect(() => {
 		return () => {
+			for (const lifecycle of refreshTaskLifecyclesRef.current.values()) {
+				lifecycle.settled = true;
+			}
+			refreshTaskLifecyclesRef.current.clear();
+			for (const timer of refreshTaskReconnectTimersRef.current.values()) {
+				window.clearTimeout(timer);
+			}
+			refreshTaskReconnectTimersRef.current.clear();
 			for (const source of refreshTaskSourcesRef.current.values()) {
 				source.close();
 			}
@@ -3960,6 +3982,28 @@ export function Dashboard(props: {
 									</Button>
 								</div>
 							</div>
+						</div>
+					</div>
+				) : null}
+
+				{rootReadable && readableSections.error?.phase === "refresh" ? (
+					<div
+						className="mb-4 rounded-xl border border-amber-300/45 bg-amber-50/80 px-4 py-3 text-sm text-amber-950 shadow-sm dark:border-amber-300/20 dark:bg-amber-950/20 dark:text-amber-100"
+						data-dashboard-readable-refresh-error="true"
+						role="alert"
+					>
+						<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+							<p className="min-w-0">{readableSections.error.message}</p>
+							<Button
+								type="button"
+								variant="outline"
+								size="sm"
+								className="w-full border-amber-300/60 bg-background/70 font-mono text-xs hover:bg-background sm:w-auto"
+								onClick={() => void readableSections.retry()}
+							>
+								<RefreshCcw className="size-4" />
+								重试刷新
+							</Button>
 						</div>
 					</div>
 				) : null}

@@ -75,6 +75,35 @@ function updateItems(
 	}));
 }
 
+function sectionPageChanged(
+	previous: DashboardReadableSection,
+	next: DashboardReadableSection,
+) {
+	if (
+		(previous.items_next_cursor ?? null) !== (next.items_next_cursor ?? null) ||
+		(previous.item_count ?? previous.activity_count ?? 0) !==
+			(next.item_count ?? next.activity_count ?? 0)
+	)
+		return true;
+	const previousKeys = (previous.items ?? []).map(itemKey);
+	const nextKeys = (next.items ?? []).map(itemKey);
+	if (
+		previousKeys.length !== nextKeys.length ||
+		previousKeys.some((key, index) => key !== nextKeys[index])
+	)
+		return true;
+	const previousSupplementalKeys = (previous.supplemental_items ?? []).map(
+		itemKey,
+	);
+	const nextSupplementalKeys = (next.supplemental_items ?? []).map(itemKey);
+	return (
+		previousSupplementalKeys.length !== nextSupplementalKeys.length ||
+		previousSupplementalKeys.some(
+			(key, index) => key !== nextSupplementalKeys[index],
+		)
+	);
+}
+
 export function useDashboardReadableSections(options?: {
 	userId?: string;
 	viewerStateKey?: string | null;
@@ -97,6 +126,8 @@ export function useDashboardReadableSections(options?: {
 	const [details, setDetails] = useState<
 		Record<string, ReadableSectionDetails>
 	>({});
+	const sectionsRef = useRef(sections);
+	sectionsRef.current = sections;
 	const detailsRef = useRef(details);
 	detailsRef.current = details;
 	const requestIdRef = useRef(0);
@@ -122,6 +153,7 @@ export function useDashboardReadableSections(options?: {
 		if (!preserveContent) {
 			setLegacyFallback(false);
 			setSections([]);
+			sectionsRef.current = [];
 			setNextCursor(null);
 			setDetails({});
 		} else {
@@ -175,17 +207,25 @@ export function useDashboardReadableSections(options?: {
 			}
 			if (requestId !== requestIdRef.current) return;
 			setLegacyFallback(usedLegacyFallback);
-			setSections(response.sections ?? []);
+			const nextSections = response.sections ?? [];
+			const previousSections = new Map(
+				sectionsRef.current.map((section) => [section.id, section]),
+			);
+			setSections(nextSections);
 			setNextCursor(response.next_cursor ?? null);
 			if (preserveContent) {
-				const sectionIds = new Set(
-					(response.sections ?? []).map((section) => section.id),
+				const nextSectionsById = new Map(
+					nextSections.map((section) => [section.id, section]),
 				);
 				setDetails((current) =>
 					Object.fromEntries(
-						Object.entries(current).filter(([sectionId]) =>
-							sectionIds.has(sectionId),
-						),
+						Object.entries(current).filter(([sectionId]) => {
+							const previous = previousSections.get(sectionId);
+							const next = nextSectionsById.get(sectionId);
+							return Boolean(
+								previous && next && !sectionPageChanged(previous, next),
+							);
+						}),
 					),
 				);
 			}
@@ -221,6 +261,7 @@ export function useDashboardReadableSections(options?: {
 			setError(null);
 			setLegacyFallback(false);
 			setSections([]);
+			sectionsRef.current = [];
 			setNextCursor(null);
 			setDetails({});
 			return;
