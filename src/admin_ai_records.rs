@@ -2,6 +2,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
 
 use axum::{
@@ -322,6 +323,41 @@ fn parse_timestamp(value: Option<String>, field: &str) -> Result<Option<String>,
     Ok(Some(parsed.with_timezone(&Utc).to_rfc3339()))
 }
 
+fn normalize_collection_window(
+    from: Option<String>,
+    before: Option<String>,
+) -> Result<(String, String), ApiError> {
+    let now = Utc::now();
+    let parsed_from = from
+        .as_deref()
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map(|parsed| parsed.with_timezone(&Utc))
+                .map_err(|_| ApiError::bad_request("invalid from timestamp"))
+        })
+        .transpose()?;
+    let parsed_before = before
+        .as_deref()
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map(|parsed| parsed.with_timezone(&Utc))
+                .map_err(|_| ApiError::bad_request("invalid before timestamp"))
+        })
+        .transpose()?;
+    let before = parsed_before.unwrap_or(now);
+    let from = parsed_from.unwrap_or(before - chrono::Duration::days(31));
+    let span = before.signed_duration_since(from);
+    if span < chrono::Duration::zero() {
+        return Err(ApiError::bad_request("before must be after from"));
+    }
+    if span > chrono::Duration::days(31) {
+        return Err(ApiError::bad_request(
+            "collection record window cannot exceed 31 days",
+        ));
+    }
+    Ok((from.to_rfc3339(), before.to_rfc3339()))
+}
+
 const DISPLAY_STATUSES: [&str; 15] = [
     "not_started",
     "queued",
@@ -384,6 +420,7 @@ fn parse_status_filter(raw: Option<String>, field: &str) -> Result<Option<Vec<St
     Ok(Some(values))
 }
 
+#[cfg(test)]
 fn status_matches(summary: &AdminCollectionTaskSummary, filter: Option<&[String]>) -> bool {
     filter.is_none_or(|values| values.iter().any(|value| value == &summary.display_status))
 }
@@ -662,46 +699,6 @@ async fn load_global_task_rows(
     Ok(rows)
 }
 
-async fn load_global_attempt_counts(
-    state: &AppState,
-    kind: CollectionRecordKind,
-    entity_ids: &[String],
-) -> Result<HashMap<String, i64>, ApiError> {
-    if entity_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let mut query = QueryBuilder::<Sqlite>::new(
-        "SELECT canonical_resource_id, MAX(attempt_count) AS attempt_count FROM content_work_items WHERE canonical_resource_type = ",
-    );
-    query.push_bind(collection_record_kind_label(kind));
-    query.push(" AND canonical_resource_id IN (");
-    {
-        let mut separated = query.separated(", ");
-        for id in entity_ids {
-            separated.push_bind(id);
-        }
-    }
-    query.push(") GROUP BY canonical_resource_id");
-    #[derive(Debug, sqlx::FromRow)]
-    struct AttemptCountRow {
-        canonical_resource_id: String,
-        attempt_count: i64,
-    }
-    let rows = match query
-        .build_query_as::<AttemptCountRow>()
-        .fetch_all(&state.pool)
-        .await
-    {
-        Ok(rows) => rows,
-        Err(error) if missing_table(&error) => return Ok(HashMap::new()),
-        Err(error) => return Err(ApiError::internal(error)),
-    };
-    Ok(rows
-        .into_iter()
-        .map(|row| (row.canonical_resource_id, row.attempt_count))
-        .collect())
-}
-
 fn global_summary(row: &GlobalTaskRow) -> AdminCollectionTaskSummary {
     AdminCollectionTaskSummary {
         status: row.status.clone(),
@@ -902,6 +899,7 @@ async fn load_task_summaries(
     kind: CollectionRecordKind,
     entity_ids: &[String],
     coverage: &HashMap<(String, String), String>,
+    global_mode: bool,
 ) -> Result<HashMap<String, TaskSummaries>, ApiError> {
     let Some((translation_kind, polish_kind)) = kind.task_kinds() else {
         return Ok(HashMap::new());
@@ -909,10 +907,6 @@ async fn load_task_summaries(
     if entity_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let global_mode = content_processing::current_mode(&state.pool)
-        .await
-        .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global;
     let rows = if global_mode {
         Vec::new()
     } else {
@@ -1088,6 +1082,553 @@ async fn load_brief_summaries(
         .collect())
 }
 
+#[derive(Clone)]
+enum CollectionQueryBind {
+    Text(String),
+    Integer(i64),
+}
+
+fn sql_display_status(raw_status: &str, origin: &str) -> String {
+    format!(
+        "CASE
+            WHEN {raw_status} IN ('queued', 'batched', 'retry_scheduled') THEN 'queued'
+            WHEN {raw_status} = 'running' THEN 'running'
+            WHEN {raw_status} IN ('completed', 'succeeded', 'ready') THEN 'succeeded'
+            WHEN {raw_status} IN ('failed', 'error') THEN 'failed'
+            WHEN {raw_status} = 'missing' THEN 'missing'
+            WHEN {raw_status} = 'disabled' THEN 'disabled'
+            WHEN {raw_status} = 'legacy_cached' THEN 'legacy_cached'
+            WHEN {raw_status} = 'legacy_conflict' THEN 'legacy_conflict'
+            WHEN {raw_status} = 'not_recorded' AND {origin} = 'never_started' THEN 'not_started'
+            WHEN {raw_status} = 'not_recorded' THEN 'historical_unknown'
+            WHEN ({raw_status} IS NULL OR {raw_status} = '') AND {origin} = 'never_started' THEN 'not_started'
+            WHEN {raw_status} IS NULL OR {raw_status} = '' THEN 'historical_unknown'
+            ELSE {raw_status}
+        END",
+    )
+}
+
+fn sql_legacy_status(latest: &str, observation: &str, coverage: &str) -> String {
+    let raw = format!("CASE WHEN {observation} IS NOT NULL THEN {observation} ELSE {latest} END");
+    let origin =
+        format!("CASE WHEN {observation} IS NOT NULL THEN 'legacy_evidence' ELSE {coverage} END");
+    sql_display_status(&raw, &origin)
+}
+
+fn sql_global_status(
+    latest: &str,
+    observation: &str,
+    legacy_latest: &str,
+    coverage: &str,
+) -> String {
+    let raw = format!(
+        "CASE
+            WHEN {latest} IS NOT NULL THEN {latest}
+            WHEN {observation} IS NOT NULL THEN {observation}
+            WHEN {legacy_latest} IS NOT NULL THEN 'legacy_conflict'
+            ELSE NULL
+        END"
+    );
+    let origin = format!(
+        "CASE
+            WHEN {latest} IS NOT NULL THEN 'global_work'
+            WHEN {observation} IS NOT NULL THEN 'legacy_evidence'
+            WHEN {legacy_latest} IS NOT NULL THEN 'legacy_conflict'
+            ELSE {coverage}
+        END"
+    );
+    sql_display_status(&raw, &origin)
+}
+
+fn notification_kind_sql(kind: CollectionRecordKind) -> (&'static str, &'static str) {
+    match kind {
+        CollectionRecordKind::Release => ("release_detail", "release_smart"),
+        CollectionRecordKind::Announcement => ("announcement_detail", "announcement_smart"),
+        CollectionRecordKind::Notification => ("notification", "notification_smart"),
+        CollectionRecordKind::Brief => ("", ""),
+    }
+}
+
+fn source_records_sql(kind: CollectionRecordKind) -> String {
+    match kind {
+        CollectionRecordKind::Release => "release_repositories AS (
+                SELECT repo_id, MIN(repo_full_name) AS repository
+                FROM repo_release_work_items
+                GROUP BY repo_id
+            ),
+            source_records AS (
+                SELECT
+                    CAST(r.release_id AS TEXT) AS id,
+                    COALESCE(rr.repository, '仓库 #' || CAST(r.repo_id AS TEXT)) AS repository,
+                    COALESCE(NULLIF(r.name, ''), r.tag_name) AS title,
+                    COALESCE(r.published_at, r.created_at, r.updated_at) AS source_time,
+                    COALESCE(r.published_at, r.created_at, r.updated_at) AS occurred_at,
+                    r.detected_at,
+                    NULL AS generated_at
+                FROM repo_releases r
+                LEFT JOIN release_repositories rr ON rr.repo_id = r.repo_id
+            )"
+        .to_owned(),
+        CollectionRecordKind::Announcement => "source_records AS (
+                SELECT
+                    lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id,
+                    MAX(e.repo_full_name) AS repository,
+                    COALESCE(MAX(NULLIF(e.title, '')), '公告') AS title,
+                    MAX(e.occurred_at) AS source_time,
+                    MAX(e.occurred_at) AS occurred_at,
+                    MIN(e.detected_at) AS detected_at,
+                    NULL AS generated_at
+                FROM social_activity_events e
+                WHERE e.kind = 'announcement'
+                  AND e.repo_full_name IS NOT NULL
+                  AND e.discussion_number IS NOT NULL
+                GROUP BY lower(e.repo_full_name), e.discussion_number
+            )"
+        .to_owned(),
+        CollectionRecordKind::Notification => "notification_rows AS (
+                SELECT
+                    n.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY n.thread_id
+                        ORDER BY n.updated_at DESC, n.id DESC
+                    ) AS source_rank
+                FROM notifications n
+            ),
+            source_records AS (
+                SELECT
+                    n.thread_id AS id,
+                    n.repo_full_name AS repository,
+                    COALESCE(NULLIF(n.subject_title, ''), '通知') AS title,
+                    n.updated_at AS source_time,
+                    n.updated_at AS occurred_at,
+                    NULL AS detected_at,
+                    NULL AS generated_at
+                FROM notification_rows n
+                WHERE n.source_rank = 1
+            )"
+        .to_owned(),
+        CollectionRecordKind::Brief => "source_records AS (
+                SELECT
+                    b.id,
+                    NULL AS repository,
+                    b.date AS title,
+                    b.created_at AS source_time,
+                    NULL AS occurred_at,
+                    NULL AS detected_at,
+                    b.created_at AS generated_at
+                FROM briefs b
+            )"
+        .to_owned(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collection_query_sql(
+    kind: CollectionRecordKind,
+    global_mode: bool,
+    from: Option<&str>,
+    before: Option<&str>,
+    attempts: AttemptCountRange,
+    translation_filter: Option<&[String]>,
+    polish_filter: Option<&[String]>,
+    page: Option<(i64, i64)>,
+) -> (String, Vec<CollectionQueryBind>) {
+    let mut binds = Vec::new();
+    let mut sql = String::from("WITH ");
+    sql.push_str(&source_records_sql(kind));
+
+    if kind == CollectionRecordKind::Brief {
+        sql.push_str(
+            ",
+            brief_rows AS (
+                SELECT
+                    c.parent_brief_id AS entity_id,
+                    c.status AS raw_status,
+                    c.attempt_count,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY c.parent_brief_id
+                        ORDER BY c.updated_at DESC, c.id DESC
+                    ) AS row_rank
+                FROM llm_calls c
+            ),
+            brief_attempts AS (
+                SELECT parent_brief_id AS entity_id, MAX(attempt_count) AS attempt_count
+                FROM llm_calls
+                GROUP BY parent_brief_id
+            ),
+            status_projection AS (
+                SELECT
+                    s.*,
+                    NULL AS translation_status,
+                    CASE
+                        WHEN b.raw_status IS NULL THEN 'historical_unknown'
+                        ELSE b.raw_status
+                    END AS polish_status,
+                    COALESCE(ba.attempt_count, 0) AS attempt_count
+                FROM source_records s
+                LEFT JOIN brief_rows b
+                  ON b.entity_id = s.id AND b.row_rank = 1
+                LEFT JOIN brief_attempts ba ON ba.entity_id = s.id
+            )",
+        );
+    } else {
+        let (translation_kind, polish_kind) = notification_kind_sql(kind);
+        let resource_type = collection_record_kind_label(kind);
+        let legacy_task_rows = format!(
+            "legacy_task_rows AS (
+                SELECT
+                    w.entity_id,
+                    CASE WHEN w.kind = '{polish_kind}' THEN 'polish' ELSE 'translation' END AS pipeline,
+                    COALESCE(w.result_status, w.status) AS raw_status,
+                    w.attempt_count,
+                    w.updated_at,
+                    w.id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY w.entity_id,
+                            CASE WHEN w.kind = '{polish_kind}' THEN 'polish' ELSE 'translation' END
+                        ORDER BY w.updated_at DESC, w.id DESC
+                    ) AS row_rank
+                FROM translation_work_items w
+                WHERE w.kind IN ('{translation_kind}', '{polish_kind}')
+            ),
+            legacy_latest AS (
+                SELECT entity_id, pipeline, raw_status, attempt_count
+                FROM legacy_task_rows
+                WHERE row_rank = 1
+            ),
+            legacy_attempts AS (
+                SELECT entity_id, MAX(attempt_count) AS attempt_count
+                FROM legacy_task_rows
+                GROUP BY entity_id
+            ),
+            legacy_observation_rows AS (
+                SELECT
+                    canonical_resource_id AS entity_id,
+                    CASE WHEN pipeline = 'polishing' THEN 'polish' ELSE 'translation' END AS pipeline,
+                    legacy_table,
+                    json_extract(observation_basis_json, '$.source_hash') AS source_hash,
+                    classification
+                FROM content_legacy_observations
+                WHERE canonical_resource_type = '{resource_type}'
+                  AND json_extract(observation_basis_json, '$.source_hash') IS NOT NULL
+            ),
+            legacy_observations AS (
+                SELECT
+                    entity_id,
+                    pipeline,
+                    CASE WHEN MAX(CASE WHEN classification = 'legacy_conflict' THEN 1 ELSE 0 END) = 1
+                        THEN 'legacy_conflict' ELSE 'legacy_cached' END AS raw_status
+                FROM legacy_observation_rows r
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM legacy_observation_rows paired
+                    WHERE paired.entity_id = r.entity_id
+                      AND paired.pipeline = r.pipeline
+                      AND paired.source_hash = r.source_hash
+                      AND paired.legacy_table <> r.legacy_table
+                )
+                GROUP BY entity_id, pipeline
+            ),
+            coverage AS (
+                SELECT record_id AS entity_id, pipeline, status_origin
+                FROM admin_collection_processing_coverage
+                WHERE record_kind = '{resource_type}'
+            )"
+        );
+        sql.push_str(", ");
+        sql.push_str(&legacy_task_rows);
+        if global_mode {
+            sql.push_str(
+                ",
+                global_task_rows AS (
+                    SELECT
+                        w.canonical_resource_id AS entity_id,
+                        CASE WHEN w.pipeline = 'polishing' THEN 'polish' ELSE 'translation' END AS pipeline,
+                        w.status AS raw_status,
+                        w.attempt_count,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY w.canonical_resource_id,
+                                CASE WHEN w.pipeline = 'polishing' THEN 'polish' ELSE 'translation' END
+                            ORDER BY
+                                julianday(w.created_at) DESC,
+                                w.created_at DESC,
+                                CASE w.status
+                                    WHEN 'queued' THEN 0
+                                    WHEN 'running' THEN 1
+                                    WHEN 'deferred_provider' THEN 2
+                                    WHEN 'ready' THEN 3
+                                    WHEN 'failed' THEN 4
+                                    WHEN 'superseded' THEN 9
+                                    ELSE 5
+                                END,
+                                CASE WHEN w.pipeline = 'translation' AND w.variant = 'detail' THEN 0 ELSE 1 END,
+                                julianday(w.updated_at) DESC,
+                                w.updated_at DESC,
+                                w.id DESC
+                        ) AS row_rank
+                    FROM content_work_items w
+                    WHERE w.canonical_resource_type = '{resource_type}'
+                      AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
+                        OR (w.pipeline = 'polishing' AND w.variant = 'smart'))
+                ),
+                global_latest AS (
+                    SELECT entity_id, pipeline, raw_status, attempt_count
+                    FROM global_task_rows
+                    WHERE row_rank = 1
+                ),
+                global_attempts AS (
+                    SELECT canonical_resource_id AS entity_id, MAX(attempt_count) AS attempt_count
+                    FROM content_work_items
+                    WHERE canonical_resource_type = '{resource_type}'
+                    GROUP BY canonical_resource_id
+                ),
+                status_projection AS (
+                    SELECT
+                        s.*,
+                        {translation_status} AS translation_status,
+                        {polish_status} AS polish_status,
+                        COALESCE(ga.attempt_count, 0) AS attempt_count
+                    FROM source_records s
+                    LEFT JOIN global_latest gt ON gt.entity_id = s.id AND gt.pipeline = 'translation'
+                    LEFT JOIN global_latest gp ON gp.entity_id = s.id AND gp.pipeline = 'polish'
+                    LEFT JOIN legacy_latest lt ON lt.entity_id = s.id AND lt.pipeline = 'translation'
+                    LEFT JOIN legacy_latest lp ON lp.entity_id = s.id AND lp.pipeline = 'polish'
+                    LEFT JOIN legacy_observations ot ON ot.entity_id = s.id AND ot.pipeline = 'translation'
+                    LEFT JOIN legacy_observations op ON op.entity_id = s.id AND op.pipeline = 'polish'
+                    LEFT JOIN coverage ct ON ct.entity_id = s.id AND ct.pipeline = 'translation'
+                    LEFT JOIN coverage cp ON cp.entity_id = s.id AND cp.pipeline = 'polish'
+                    LEFT JOIN global_attempts ga ON ga.entity_id = s.id
+                )",
+            );
+            let translation_status = sql_global_status(
+                "gt.raw_status",
+                "ot.raw_status",
+                "lt.raw_status",
+                "ct.status_origin",
+            );
+            let polish_status = sql_global_status(
+                "gp.raw_status",
+                "op.raw_status",
+                "lp.raw_status",
+                "cp.status_origin",
+            );
+            sql = sql.replace("{resource_type}", resource_type);
+            sql = sql.replacen("{translation_status}", &translation_status, 1);
+            sql = sql.replacen("{polish_status}", &polish_status, 1);
+        } else {
+            let translation_status =
+                sql_legacy_status("lt.raw_status", "ot.raw_status", "ct.status_origin");
+            let polish_status =
+                sql_legacy_status("lp.raw_status", "op.raw_status", "cp.status_origin");
+            sql.push_str(&format!(
+                ",
+                status_projection AS (
+                    SELECT
+                        s.*,
+                        {translation_status} AS translation_status,
+                        {polish_status} AS polish_status,
+                        COALESCE(la.attempt_count, 0) AS attempt_count
+                    FROM source_records s
+                    LEFT JOIN legacy_latest lt ON lt.entity_id = s.id AND lt.pipeline = 'translation'
+                    LEFT JOIN legacy_latest lp ON lp.entity_id = s.id AND lp.pipeline = 'polish'
+                    LEFT JOIN legacy_observations ot ON ot.entity_id = s.id AND ot.pipeline = 'translation'
+                    LEFT JOIN legacy_observations op ON op.entity_id = s.id AND op.pipeline = 'polish'
+                    LEFT JOIN coverage ct ON ct.entity_id = s.id AND ct.pipeline = 'translation'
+                    LEFT JOIN coverage cp ON cp.entity_id = s.id AND cp.pipeline = 'polish'
+                    LEFT JOIN legacy_attempts la ON la.entity_id = s.id
+                )"
+            ));
+        }
+    }
+
+    sql.push_str(", filtered_records AS (SELECT * FROM status_projection WHERE 1 = 1");
+    if let Some(value) = from {
+        sql.push_str(" AND datetime(source_time) >= datetime(?)");
+        binds.push(CollectionQueryBind::Text(value.to_owned()));
+    }
+    if let Some(value) = before {
+        sql.push_str(" AND datetime(source_time) < datetime(?)");
+        binds.push(CollectionQueryBind::Text(value.to_owned()));
+    }
+    sql.push_str(" AND attempt_count >= ?");
+    binds.push(CollectionQueryBind::Integer(attempts.min));
+    if let Some(max) = attempts.max {
+        sql.push_str(" AND attempt_count <= ?");
+        binds.push(CollectionQueryBind::Integer(max));
+    }
+    if kind != CollectionRecordKind::Brief
+        && let Some(values) = translation_filter
+        && !values.is_empty()
+    {
+        sql.push_str(" AND translation_status IN (");
+        for (index, _) in values.iter().enumerate() {
+            if index > 0 {
+                sql.push_str(", ");
+            }
+            sql.push('?');
+        }
+        sql.push(')');
+        binds.extend(values.iter().cloned().map(CollectionQueryBind::Text));
+    }
+    if let Some(values) = polish_filter
+        && !values.is_empty()
+    {
+        sql.push_str(" AND polish_status IN (");
+        for (index, _) in values.iter().enumerate() {
+            if index > 0 {
+                sql.push_str(", ");
+            }
+            sql.push('?');
+        }
+        sql.push(')');
+        binds.extend(values.iter().cloned().map(CollectionQueryBind::Text));
+    }
+    sql.push(')');
+    if let Some((page_size, offset)) = page {
+        let order = if kind == CollectionRecordKind::Release {
+            "ORDER BY datetime(source_time) DESC, CAST(id AS INTEGER) DESC"
+        } else {
+            "ORDER BY datetime(source_time) DESC, id DESC"
+        };
+        sql.push_str(" SELECT id, repository, title, occurred_at, detected_at, generated_at FROM filtered_records ");
+        sql.push_str(order);
+        sql.push_str(" LIMIT ? OFFSET ?");
+        binds.push(CollectionQueryBind::Integer(page_size));
+        binds.push(CollectionQueryBind::Integer(offset));
+    }
+    (sql, binds)
+}
+
+async fn execute_collection_query<T>(
+    pool: &SqlitePool,
+    sql: &str,
+    binds: &[CollectionQueryBind],
+) -> Result<Vec<T>, ApiError>
+where
+    T: for<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> + Send + Unpin,
+{
+    let mut query = sqlx::query_as::<_, T>(sql);
+    for bind in binds {
+        query = match bind {
+            CollectionQueryBind::Text(value) => query.bind(value.clone()),
+            CollectionQueryBind::Integer(value) => query.bind(*value),
+        };
+    }
+    query.fetch_all(pool).await.map_err(ApiError::internal)
+}
+
+async fn execute_collection_scalar(
+    pool: &SqlitePool,
+    sql: &str,
+    binds: &[CollectionQueryBind],
+) -> Result<i64, ApiError> {
+    let mut query = sqlx::query_scalar::<_, i64>(sql);
+    for bind in binds {
+        query = match bind {
+            CollectionQueryBind::Text(value) => query.bind(value.clone()),
+            CollectionQueryBind::Integer(value) => query.bind(*value),
+        };
+    }
+    query.fetch_one(pool).await.map_err(ApiError::internal)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn list_collection_page(
+    pool: &SqlitePool,
+    kind: CollectionRecordKind,
+    global_mode: bool,
+    from: Option<&str>,
+    before: Option<&str>,
+    attempts: AttemptCountRange,
+    translation_filter: Option<&[String]>,
+    polish_filter: Option<&[String]>,
+    page_size: i64,
+    offset: i64,
+) -> Result<(i64, Vec<SourceRecordRow>), ApiError> {
+    let (count_sql, count_binds) = collection_query_sql(
+        kind,
+        global_mode,
+        from,
+        before,
+        attempts,
+        translation_filter,
+        polish_filter,
+        None,
+    );
+    let count_sql = format!("{count_sql} SELECT COUNT(*) FROM filtered_records");
+    let total = execute_collection_scalar(pool, &count_sql, &count_binds).await?;
+    let (page_sql, page_binds) = collection_query_sql(
+        kind,
+        global_mode,
+        from,
+        before,
+        attempts,
+        translation_filter,
+        polish_filter,
+        Some((page_size, offset)),
+    );
+    let rows = execute_collection_query::<SourceRecordRow>(pool, &page_sql, &page_binds).await?;
+    Ok((total, rows))
+}
+
+async fn run_bounded_collection_read<F, T>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    read: F,
+) -> Result<T, ApiError>
+where
+    F: std::future::Future<Output = Result<T, ApiError>> + Send + 'static,
+    T: Send + 'static,
+{
+    run_bounded_collection_read_with_budget(permit, read, Duration::from_secs(5)).await
+}
+
+async fn run_bounded_collection_read_with_budget<F, T>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    read: F,
+    budget: Duration,
+) -> Result<T, ApiError>
+where
+    F: std::future::Future<Output = Result<T, ApiError>> + Send + 'static,
+    T: Send + 'static,
+{
+    let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+    let (cancel_sender, mut cancel_receiver) = tokio::sync::oneshot::channel();
+    let mut read_handle = tokio::spawn(read);
+    tokio::spawn(async move {
+        tokio::select! {
+            result = &mut read_handle => {
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) => Err(ApiError::internal(error)),
+                };
+                let _ = result_sender.send(result);
+            }
+            _ = &mut cancel_receiver => {
+                read_handle.abort();
+                let _ = read_handle.await;
+            }
+        }
+        drop(permit);
+    });
+    match tokio::time::timeout(budget, result_receiver).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(ApiError::internal("collection read supervisor stopped")),
+        Err(_) => {
+            // Ask the supervisor to cancel and await the query task before it
+            // releases the permit. Caller cancellation follows the same path
+            // because the supervisor owns both resources independently.
+            let _ = cancel_sender.send(());
+            Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "admin_collection_records_timeout",
+                "admin collection records read timed out",
+            )
+            .with_retry_after(1))
+        }
+    }
+}
+
+#[cfg(test)]
 async fn list_source_rows(
     pool: &SqlitePool,
     kind: CollectionRecordKind,
@@ -1229,70 +1770,58 @@ pub async fn admin_list_collection_records(
     let polish_filter = parse_status_filter(query.polish_status, "polish_status")?;
     let from = parse_timestamp(query.from, "from")?;
     let before = parse_timestamp(query.before, "before")?;
-    let global_mode = content_processing::current_mode(&state.pool)
-        .await
-        .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global;
-    let rows = list_source_rows(
-        &state.pool,
-        kind,
-        global_mode,
-        from.as_deref(),
-        before.as_deref(),
-        if global_mode {
-            AttemptCountRange { min: 0, max: None }
+    let (from, before) = normalize_collection_window(from, before)?;
+    let _permit = state
+        .admin_collection_read_gate
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "admin_collection_records_busy",
+                "admin collection records are temporarily busy",
+            )
+            .with_retry_after(1)
+        })?;
+    let read_state = state.clone();
+    let read = async move {
+        let global_mode = content_processing::current_mode(&read_state.pool)
+            .await
+            .map_err(ApiError::internal)?
+            == content_processing::ContentProcessingMode::Global;
+        let (total, rows) = list_collection_page(
+            &read_state.pool,
+            kind,
+            global_mode,
+            Some(&from),
+            Some(&before),
+            attempts,
+            translation_filter.as_deref(),
+            polish_filter.as_deref(),
+            page_size,
+            offset,
+        )
+        .await?;
+        let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+        let coverage = load_processing_coverage(&read_state.pool, kind, &ids).await?;
+        let task_summaries =
+            load_task_summaries(read_state.as_ref(), kind, &ids, &coverage, global_mode).await?;
+        let brief_summaries = if kind == CollectionRecordKind::Brief {
+            load_brief_summaries(read_state.as_ref(), &ids, &coverage).await?
         } else {
-            attempts
-        },
-    )
-    .await?;
-    let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
-    let global_attempt_counts = if global_mode {
-        load_global_attempt_counts(state.as_ref(), kind, &ids).await?
-    } else {
-        HashMap::new()
+            HashMap::new()
+        };
+        let items = rows
+            .into_iter()
+            .map(|row| source_record_item(kind, row, &task_summaries, &brief_summaries))
+            .collect::<Vec<_>>();
+        Ok::<_, ApiError>((total, items))
     };
-    let coverage = load_processing_coverage(&state.pool, kind, &ids).await?;
-    let task_summaries = load_task_summaries(state.as_ref(), kind, &ids, &coverage).await?;
-    let brief_summaries = if kind == CollectionRecordKind::Brief {
-        load_brief_summaries(state.as_ref(), &ids, &coverage).await?
-    } else {
-        HashMap::new()
-    };
-    let mut items = rows
-        .into_iter()
-        .filter(|row| {
-            if !global_mode {
-                return true;
-            }
-            let attempt_count = global_attempt_counts.get(&row.id).copied().unwrap_or(0);
-            attempt_count >= attempts.min && attempts.max.is_none_or(|max| attempt_count <= max)
-        })
-        .map(|row| source_record_item(kind, row, &task_summaries, &brief_summaries))
-        .filter(|item| {
-            let translation_matches = if kind == CollectionRecordKind::Brief {
-                true
-            } else {
-                item.translation
-                    .as_ref()
-                    .is_some_and(|summary| status_matches(summary, translation_filter.as_deref()))
-            };
-            translation_matches && status_matches(&item.polish, polish_filter.as_deref())
-        })
-        .collect::<Vec<_>>();
-    let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
-    let offset = usize::try_from(offset).unwrap_or(usize::MAX);
-    let page_size = usize::try_from(page_size).unwrap_or(usize::MAX);
-    let items = if offset >= items.len() {
-        Vec::new()
-    } else {
-        let end = items.len().min(offset.saturating_add(page_size));
-        items.drain(offset..end).collect()
-    };
+    let (total, items) = run_bounded_collection_read(_permit, read).await?;
     Ok(Json(AdminCollectionRecordsResponse {
         items,
         page,
-        page_size: i64::try_from(page_size).unwrap_or(i64::MAX),
+        page_size,
         total,
     }))
 }
@@ -1310,7 +1839,7 @@ async fn load_source_record(
             "SELECT lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id, MAX(e.repo_full_name) AS repository, COALESCE(MAX(NULLIF(e.title, '')), '公告') AS title, MAX(e.occurred_at) AS occurred_at, MIN(e.detected_at) AS detected_at, NULL AS generated_at FROM social_activity_events e WHERE e.kind = 'announcement' AND lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) = ? GROUP BY lower(e.repo_full_name), e.discussion_number LIMIT 1"
         }
         CollectionRecordKind::Notification => {
-            "SELECT n.thread_id AS id, MAX(n.repo_full_name) AS repository, COALESCE(MAX(NULLIF(n.subject_title, '')), '通知') AS title, MAX(n.updated_at) AS occurred_at, NULL AS detected_at, NULL AS generated_at FROM notifications n WHERE n.thread_id = ? GROUP BY n.thread_id LIMIT 1"
+            "WITH ranked_notifications AS (SELECT n.*, ROW_NUMBER() OVER (PARTITION BY n.thread_id ORDER BY n.updated_at DESC, n.id DESC) AS source_rank FROM notifications n WHERE n.thread_id = ?) SELECT n.thread_id AS id, n.repo_full_name AS repository, COALESCE(NULLIF(n.subject_title, ''), '通知') AS title, n.updated_at AS occurred_at, NULL AS detected_at, NULL AS generated_at FROM ranked_notifications n WHERE n.source_rank = 1 LIMIT 1"
         }
         CollectionRecordKind::Brief => {
             "SELECT b.id, NULL AS repository, b.date AS title, NULL AS occurred_at, NULL AS detected_at, b.created_at AS generated_at FROM briefs b WHERE b.id = ? LIMIT 1"
@@ -1762,7 +2291,12 @@ pub async fn admin_get_collection_record_detail(
     let source = load_source_record(&state.pool, kind, &record_id).await?;
     let ids = vec![source.id.clone()];
     let coverage = load_processing_coverage(&state.pool, kind, &ids).await?;
-    let task_summaries = load_task_summaries(state.as_ref(), kind, &ids, &coverage).await?;
+    let global_mode = content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global;
+    let task_summaries =
+        load_task_summaries(state.as_ref(), kind, &ids, &coverage, global_mode).await?;
     let brief_summaries = if kind == CollectionRecordKind::Brief {
         load_brief_summaries(state.as_ref(), &ids, &coverage).await?
     } else {
@@ -1773,10 +2307,7 @@ pub async fn admin_get_collection_record_detail(
         load_brief_attempts(state.as_ref(), &record.id).await?
     } else {
         let global = load_global_attempts(state.as_ref(), kind, &record.id).await?;
-        let mode = content_processing::current_mode(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-        if global.is_empty() && mode == content_processing::ContentProcessingMode::Legacy {
+        if global.is_empty() && !global_mode {
             load_task_attempts(
                 state.as_ref(),
                 &load_record_tasks(state.as_ref(), kind, &record.id).await?,
@@ -1996,11 +2527,23 @@ mod tests {
             .await
             .expect("create release work items");
         sqlx::query(
-            "CREATE TABLE translation_work_items (entity_id TEXT, kind TEXT, attempt_count INTEGER)",
+            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, entity_id TEXT, kind TEXT, status TEXT, result_status TEXT, attempt_count INTEGER, updated_at TEXT)",
         )
         .execute(&pool)
         .await
         .expect("create translation work items");
+        sqlx::query(
+            "CREATE TABLE content_legacy_observations (canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, legacy_table TEXT, observation_basis_json TEXT, classification TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create legacy observations");
+        sqlx::query(
+            "CREATE TABLE admin_collection_processing_coverage (record_kind TEXT, record_id TEXT, pipeline TEXT, status_origin TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create processing coverage");
         sqlx::query(
             "INSERT INTO repo_releases (release_id, repo_id, name, tag_name, published_at, created_at, updated_at, detected_at) VALUES (100, 1, 'legacy', 'v1', '2026-07-08T09:00:00Z', '2026-07-08T09:00:00Z', '2026-07-08T09:00:00Z', NULL), (101, 1, 'processed', 'v2', '2026-07-08T08:00:00Z', '2026-07-08T08:00:00Z', '2026-07-08T08:00:00Z', NULL)",
         )
@@ -2008,36 +2551,46 @@ mod tests {
         .await
         .expect("seed releases");
         sqlx::query(
-            "INSERT INTO translation_work_items (entity_id, kind, attempt_count) VALUES ('101', 'release_detail', 2), ('101', 'release_smart', 1)",
+            "INSERT INTO translation_work_items (id, entity_id, kind, status, attempt_count, updated_at) VALUES ('work-101-detail', '101', 'release_detail', 'completed', 2, '2026-07-08T08:01:00Z'), ('work-101-smart', '101', 'release_smart', 'completed', 1, '2026-07-08T08:02:00Z')",
         )
         .execute(&pool)
         .await
         .expect("seed attempts");
 
-        let rows = list_source_rows(
+        let (total, rows) = list_collection_page(
             &pool,
             CollectionRecordKind::Release,
             false,
             Some("2026-07-08T07:00:00Z"),
             Some("2026-07-08T10:00:00Z"),
             AttemptCountRange { min: 0, max: None },
+            None,
+            None,
+            1,
+            0,
         )
         .await
         .expect("list releases");
-        assert_eq!(rows.len(), 2);
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "100");
         assert_eq!(rows[0].detected_at, None);
 
-        let rows = list_source_rows(
+        let (total, rows) = list_collection_page(
             &pool,
             CollectionRecordKind::Release,
             false,
             Some("2026-07-08T07:00:00Z"),
             Some("2026-07-08T10:00:00Z"),
             AttemptCountRange { min: 2, max: None },
+            None,
+            None,
+            1,
+            0,
         )
         .await
         .expect("filter releases by attempts");
+        assert_eq!(total, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "101");
     }
@@ -2052,27 +2605,44 @@ mod tests {
             .await
             .expect("create social events");
         sqlx::query(
-            "CREATE TABLE translation_work_items (entity_id TEXT, kind TEXT, attempt_count INTEGER)",
+            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, entity_id TEXT, kind TEXT, status TEXT, result_status TEXT, attempt_count INTEGER, updated_at TEXT)",
         )
         .execute(&pool)
         .await
         .expect("create announcement work items");
+        sqlx::query(
+            "CREATE TABLE content_legacy_observations (canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, legacy_table TEXT, observation_basis_json TEXT, classification TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create legacy observations");
+        sqlx::query(
+            "CREATE TABLE admin_collection_processing_coverage (record_kind TEXT, record_id TEXT, pipeline TEXT, status_origin TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create processing coverage");
         sqlx::query(
             "INSERT INTO social_activity_events (repo_full_name, discussion_number, title, occurred_at, detected_at, kind) VALUES ('octo/demo', 42, '公告', '2026-07-08T09:00:00Z', '2026-07-08T01:00:00Z', 'announcement')",
         )
         .execute(&pool)
         .await
         .expect("seed announcement");
-        let announcement_rows = list_source_rows(
+        let (announcement_total, announcement_rows) = list_collection_page(
             &pool,
             CollectionRecordKind::Announcement,
             false,
             Some("2026-07-08T08:00:00Z"),
             Some("2026-07-08T10:00:00Z"),
             AttemptCountRange { min: 0, max: None },
+            None,
+            None,
+            20,
+            0,
         )
         .await
         .expect("list announcements");
+        assert_eq!(announcement_total, 1);
         assert_eq!(announcement_rows.len(), 1);
 
         sqlx::query("CREATE TABLE briefs (id TEXT, date TEXT, created_at TEXT)")
@@ -2132,14 +2702,325 @@ mod tests {
     async fn notification_source_record_uses_unknown_detected_time() {
         let pool = test_pool().await;
         create_notifications_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE notifications SET repo_full_name = 'octo/new', subject_title = 'Newest issue' WHERE id = 'notification-2'",
+        )
+        .execute(&pool)
+        .await
+        .expect("update newest notification");
 
         let row = load_source_record(&pool, CollectionRecordKind::Notification, "thread-1")
             .await
             .expect("load notification");
 
         assert_eq!(row.id, "thread-1");
+        assert_eq!(row.repository.as_deref(), Some("octo/new"));
+        assert_eq!(row.title, "Newest issue");
         assert_eq!(row.occurred_at.as_deref(), Some("2026-07-08T09:05:00Z"));
         assert_eq!(row.detected_at, None);
+    }
+
+    #[tokio::test]
+    async fn notification_canonical_source_breaks_updated_at_ties_by_id() {
+        let pool = test_pool().await;
+        create_notifications_fixture(&pool).await;
+        sqlx::query("INSERT INTO users (id) VALUES ('user-d')")
+            .execute(&pool)
+            .await
+            .expect("seed tie-break user");
+        sqlx::query(
+            "UPDATE notifications SET repo_full_name = 'octo/lower', subject_title = 'Lower ID', updated_at = '2026-07-08T08:30:00Z' WHERE id = 'notification-3'",
+        )
+        .execute(&pool)
+        .await
+        .expect("update lower id notification");
+        sqlx::query(
+            "INSERT INTO notifications (id, user_id, thread_id, repo_full_name, subject_title, updated_at) VALUES ('notification-4', 'user-d', 'thread-2', 'octo/higher', 'Higher ID', '2026-07-08T08:30:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed higher id notification");
+
+        let row = load_source_record(&pool, CollectionRecordKind::Notification, "thread-2")
+            .await
+            .expect("load tied notification");
+
+        assert_eq!(row.repository.as_deref(), Some("octo/higher"));
+        assert_eq!(row.title, "Higher ID");
+        assert_eq!(row.occurred_at.as_deref(), Some("2026-07-08T08:30:00Z"));
+    }
+
+    #[test]
+    fn collection_query_window_rejects_more_than_31_days() {
+        assert!(
+            normalize_collection_window(
+                Some("2026-07-01T00:00:00+00:00".to_owned()),
+                Some("2026-08-01T00:00:01+00:00".to_owned()),
+            )
+            .is_err()
+        );
+        assert!(
+            normalize_collection_window(
+                Some("2026-07-01T00:00:00+00:00".to_owned()),
+                Some("2026-08-01T00:00:00+00:00".to_owned()),
+            )
+            .is_ok()
+        );
+        assert!(
+            normalize_collection_window(
+                Some("2026-07-02T00:00:00+00:00".to_owned()),
+                Some("2026-07-01T00:00:00+00:00".to_owned()),
+            )
+            .is_err()
+        );
+        let (from, before) = normalize_collection_window(None, None).expect("default window");
+        assert!(
+            DateTime::parse_from_rfc3339(&before)
+                .unwrap()
+                .signed_duration_since(DateTime::parse_from_rfc3339(&from).unwrap())
+                <= chrono::Duration::days(31)
+        );
+    }
+
+    #[tokio::test]
+    async fn brief_attempt_filter_uses_historical_max_and_ignores_translation_filter() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE briefs (id TEXT PRIMARY KEY, date TEXT NOT NULL, created_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create briefs");
+        sqlx::query(
+            "CREATE TABLE llm_calls (
+                id TEXT PRIMARY KEY,
+                parent_brief_id TEXT,
+                status TEXT NOT NULL,
+                source TEXT NOT NULL,
+                model TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                updated_at TEXT NOT NULL,
+                error_text TEXT,
+                failure_class TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create llm calls");
+        sqlx::query(
+            "INSERT INTO briefs (id, date, created_at) VALUES ('brief-1', '2026-07-08', '2026-07-08T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed brief");
+        sqlx::query(
+            "INSERT INTO llm_calls (id, parent_brief_id, status, source, model, attempt_count, updated_at)
+             VALUES ('call-old', 'brief-1', 'failed', 'test', 'test', 3, '2026-07-08T00:01:00Z'),
+                    ('call-new', 'brief-1', 'succeeded', 'test', 'test', 1, '2026-07-08T00:02:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed brief calls");
+
+        let (total, rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Brief,
+            false,
+            Some("2026-07-07T00:00:00Z"),
+            Some("2026-07-09T00:00:00Z"),
+            AttemptCountRange { min: 3, max: None },
+            Some(&["succeeded".to_owned()]),
+            None,
+            20,
+            0,
+        )
+        .await
+        .expect("list briefs");
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn collection_read_gate_errors_are_retryable_and_release() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = gate.clone().acquire_owned().await.expect("first permit");
+        let error = ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admin_collection_records_busy",
+            "admin collection records are temporarily busy",
+        )
+        .with_retry_after(1);
+        let response = axum::response::IntoResponse::into_response(error);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
+        drop(permit);
+        assert!(gate.try_acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn collection_read_timeout_cancels_before_releasing_permit() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = gate.clone().try_acquire_owned().expect("read permit");
+        let error = run_bounded_collection_read_with_budget(
+            permit,
+            std::future::pending::<Result<(), ApiError>>(),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("read should time out");
+        let response = axum::response::IntoResponse::into_response(error);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
+        assert!(gate.try_acquire().is_err());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(gate.try_acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn collection_read_caller_cancellation_keeps_gate_until_cleanup() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = gate.clone().try_acquire_owned().expect("read permit");
+        let task = tokio::spawn(run_bounded_collection_read_with_budget(
+            permit,
+            std::future::pending::<Result<(), ApiError>>(),
+            Duration::from_secs(5),
+        ));
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(gate.try_acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn collection_query_paginates_after_filters() {
+        let pool = test_pool().await;
+        create_notifications_fixture(&pool).await;
+        sqlx::query(
+            "CREATE TABLE translation_work_items (
+                id TEXT PRIMARY KEY,
+                entity_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                result_status TEXT,
+                attempt_count INTEGER NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create processing work items");
+        sqlx::query(
+            "CREATE TABLE content_legacy_observations (
+                canonical_resource_id TEXT,
+                canonical_resource_type TEXT,
+                pipeline TEXT,
+                classification TEXT,
+                legacy_table TEXT,
+                legacy_primary_key TEXT,
+                observation_basis_json TEXT,
+                observed_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create legacy observations");
+        sqlx::query(
+            "CREATE TABLE admin_collection_processing_coverage (
+                record_kind TEXT NOT NULL,
+                record_id TEXT NOT NULL,
+                pipeline TEXT NOT NULL,
+                status_origin TEXT NOT NULL,
+                PRIMARY KEY (record_kind, record_id, pipeline)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create processing coverage");
+        sqlx::query(
+            "INSERT INTO admin_collection_processing_coverage (record_kind, record_id, pipeline, status_origin)
+             VALUES ('notification', 'thread-1', 'translation', 'never_started'),
+                    ('notification', 'thread-1', 'polish', 'never_started'),
+                    ('notification', 'thread-2', 'translation', 'never_started'),
+                    ('notification', 'thread-2', 'polish', 'never_started')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed processing coverage");
+        sqlx::query(
+            "INSERT INTO translation_work_items (id, entity_id, kind, status, result_status, attempt_count, updated_at)
+             VALUES ('work-1', 'thread-1', 'notification', 'completed', 'ready', 2, '2026-07-08T09:06:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed notification processing");
+
+        let (total, rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Notification,
+            false,
+            Some("2026-07-08T08:00:00Z"),
+            Some("2026-07-08T10:00:00Z"),
+            AttemptCountRange { min: 0, max: None },
+            Some(&["succeeded".to_owned()]),
+            None,
+            1,
+            0,
+        )
+        .await
+        .expect("read filtered notification page");
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "thread-1");
+        assert_eq!(rows[0].detected_at, None);
+
+        sqlx::query(
+            "CREATE TABLE content_work_items (
+                id TEXT PRIMARY KEY,
+                canonical_resource_type TEXT NOT NULL,
+                canonical_resource_id TEXT NOT NULL,
+                pipeline TEXT NOT NULL,
+                variant TEXT NOT NULL,
+                target_lang TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                protocol_version TEXT NOT NULL,
+                model_profile TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create global work items");
+        sqlx::query(
+            "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, status, attempt_count, created_at, updated_at)
+             VALUES ('global-1', 'notification', 'thread-1', 'translation', 'detail', 'zh-CN', 'hash-1', 'v1', 'test', 'ready', 1, '2026-07-08T09:06:00Z', '2026-07-08T09:06:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed global work");
+        let (global_total, global_rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Notification,
+            true,
+            Some("2026-07-08T08:00:00Z"),
+            Some("2026-07-08T10:00:00Z"),
+            AttemptCountRange { min: 1, max: None },
+            Some(&["succeeded".to_owned()]),
+            None,
+            20,
+            0,
+        )
+        .await
+        .expect("read global notification page");
+        assert_eq!(global_total, 1);
+        assert_eq!(global_rows[0].id, "thread-1");
     }
 
     fn event(trigger: &str, event_type: &str, created_at: &str) -> AttemptEventRow {

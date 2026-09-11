@@ -1486,6 +1486,7 @@ mod tests {
             linuxdo_oauth: None,
             webauthn,
             encryption_key: config.encryption_key.clone(),
+            admin_collection_read_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             runtime_owner_id: generate_local_id(),
             pool,
             sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),

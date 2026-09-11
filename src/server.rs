@@ -162,6 +162,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         linuxdo_oauth,
         webauthn,
         encryption_key: config.encryption_key.clone(),
+        admin_collection_read_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         runtime_owner_id: crate::local_id::generate_local_id(),
     });
     app_state
