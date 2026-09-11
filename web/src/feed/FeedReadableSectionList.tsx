@@ -353,7 +353,8 @@ export function FeedReadableSectionList(props: {
 			loadingInitial ||
 			loadingRefresh ||
 			loadingMore ||
-			error?.phase === "append"
+			error?.phase === "append" ||
+			error?.phase === "refresh"
 		)
 			return;
 		const element = sentinelRef.current;
@@ -403,6 +404,7 @@ export function FeedReadableSectionList(props: {
 			if (
 				!element ||
 				!detailCursor ||
+				loadingRefresh ||
 				detail?.loading ||
 				detail?.error ||
 				detailRequestVisibleRef.current.has(`${sectionId}:${detailCursor}`)
@@ -427,7 +429,7 @@ export function FeedReadableSectionList(props: {
 				observer.disconnect();
 			});
 		};
-	}, [details, listSections, onLoadSectionItems, sections]);
+	}, [details, listSections, loadingRefresh, onLoadSectionItems, sections]);
 
 	const toggleList = useCallback(
 		(sectionId: string) => {
