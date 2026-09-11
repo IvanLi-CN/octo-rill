@@ -1725,28 +1725,34 @@ pub fn task_sse_response(
                 // Allow one more quick poll to flush events committed alongside
                 // the terminal event before closing the stream.
                 tokio::time::sleep(Duration::from_millis(120)).await;
-                let rows = sqlx::query_as::<_, EventRow>(
-                    r#"
-                    SELECT rowid AS seq, id, event_type, payload_json
-                    FROM job_task_events
-                    WHERE task_id = ? AND rowid > ?
-                    ORDER BY rowid ASC
-                    LIMIT 100
-                    "#,
-                )
-                .bind(&task_id)
-                .bind(last_event_seq)
-                .fetch_all(&state.pool)
-                .await
-                .unwrap_or_default();
+                loop {
+                    let rows = sqlx::query_as::<_, EventRow>(
+                        r#"
+                        SELECT rowid AS seq, id, event_type, payload_json
+                        FROM job_task_events
+                        WHERE task_id = ? AND rowid > ?
+                        ORDER BY rowid ASC
+                        LIMIT 100
+                        "#,
+                    )
+                    .bind(&task_id)
+                    .bind(last_event_seq)
+                    .fetch_all(&state.pool)
+                    .await
+                    .unwrap_or_default();
 
-                for row in rows {
-                    yield Ok::<Event, Infallible>(
-                        Event::default()
-                            .id(row.id)
-                            .event(row.event_type)
-                            .data(row.payload_json),
-                    );
+                    if rows.is_empty() {
+                        break;
+                    }
+                    for row in rows {
+                        last_event_seq = row.seq;
+                        yield Ok::<Event, Infallible>(
+                            Event::default()
+                                .id(row.id)
+                                .event(row.event_type)
+                                .data(row.payload_json),
+                        );
+                    }
                 }
                 break;
             }
@@ -4572,6 +4578,55 @@ mod tests {
             sse_event_ids(&text),
             vec!["sse-terminal-before-flush", "sse-late-terminal-event"]
         );
+    }
+
+    #[tokio::test]
+    async fn task_sse_response_flushes_terminal_event_after_multiple_pages() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "sse-long-terminal-task";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_SUCCEEDED, 0).await;
+
+        for index in 0..205 {
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', '{}', ?)
+                "#,
+            )
+            .bind(format!("sse-long-event-{index:03}"))
+            .bind(task_id)
+            .bind("2026-03-06T00:00:01Z")
+            .execute(&pool)
+            .await
+            .expect("insert long-history task event");
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.completed', ?, ?)
+            "#,
+        )
+        .bind("sse-long-terminal-event")
+        .bind(task_id)
+        .bind(r#"{"status":"succeeded"}"#)
+        .bind("2026-03-06T00:00:01Z")
+        .execute(&pool)
+        .await
+        .expect("insert long-history terminal event");
+
+        let body = to_bytes(
+            task_sse_response(state, task_id.to_owned(), None).into_body(),
+            usize::MAX,
+        )
+        .await
+        .expect("collect long-history SSE response");
+        let text = String::from_utf8(body.to_vec()).expect("valid long-history SSE body");
+        let ids = sse_event_ids(&text);
+        assert_eq!(ids.len(), 206);
+        assert_eq!(ids.first(), Some(&"sse-long-event-000"));
+        assert_eq!(ids.get(204), Some(&"sse-long-event-204"));
+        assert_eq!(ids.last(), Some(&"sse-long-terminal-event"));
     }
 
     #[tokio::test]

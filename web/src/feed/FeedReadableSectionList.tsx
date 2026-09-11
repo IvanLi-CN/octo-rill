@@ -406,6 +406,7 @@ export function FeedReadableSectionList(props: {
 				!detailCursor ||
 				loadingRefresh ||
 				detail?.loading ||
+				detail?.refreshPending ||
 				detail?.error ||
 				detailRequestVisibleRef.current.has(`${sectionId}:${detailCursor}`)
 			)
@@ -433,6 +434,11 @@ export function FeedReadableSectionList(props: {
 
 	useEffect(() => {
 		if (loadingRefresh) return;
+		for (const [sectionId, detail] of Object.entries(details)) {
+			if (detail.refreshPending && !detail.loading) {
+				onLoadSectionItems(sectionId);
+			}
+		}
 		for (const sectionId of listSections) {
 			const section = sections.find((candidate) => candidate.id === sectionId);
 			if (section?.brief && !details[sectionId]) {

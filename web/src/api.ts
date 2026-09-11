@@ -164,7 +164,13 @@ export async function apiPostTaskSse(
 
 			for (const block of consumeBlocks()) {
 				const event = parseSseEventBlock(block);
-				if (event.eventType !== "task.completed" || !event.data) continue;
+				if (
+					(event.eventType !== "task.completed" &&
+						event.eventType !== "task.canceled" &&
+						event.eventType !== "task.recovered_failed") ||
+					!event.data
+				)
+					continue;
 				const payload = JSON.parse(event.data) as TaskSseTerminalEvent;
 				if (payload.status === "succeeded") return payload;
 				throw new ApiError(

@@ -2412,20 +2412,23 @@ export function Dashboard(props: {
 		tab,
 	]);
 
-	const refreshAll = useCallback(async () => {
-		const tasks: Array<Promise<unknown>> = [refreshFeed()];
-		if (!scopedMode) {
-			tasks.push(
-				refreshSidebar({
-					includeNotifications:
-						hasDesktopSidebarInbox ||
-						tab === "inbox" ||
-						notificationsBootstrapCompletedRef.current,
-				}),
-			);
-		}
-		await Promise.all(tasks);
-	}, [hasDesktopSidebarInbox, refreshFeed, refreshSidebar, scopedMode, tab]);
+	const refreshAll = useCallback(
+		async (options?: { throwOnError?: boolean }) => {
+			const tasks: Array<Promise<unknown>> = [refreshFeed(options)];
+			if (!scopedMode) {
+				tasks.push(
+					refreshSidebar({
+						includeNotifications:
+							hasDesktopSidebarInbox ||
+							tab === "inbox" ||
+							notificationsBootstrapCompletedRef.current,
+					}),
+				);
+			}
+			await Promise.all(tasks);
+		},
+		[hasDesktopSidebarInbox, refreshFeed, refreshSidebar, scopedMode, tab],
+	);
 
 	const onDashboardLiveUpdate = useCallback(
 		(notices: DashboardLiveUpdateNotice[]) => {
@@ -2462,7 +2465,7 @@ export function Dashboard(props: {
 		enabled:
 			shellHydrated &&
 			(readableSectionsActive
-				? !readableSections.loadingInitial
+				? !readableSections.loadingInitial && !readableSections.loadingRefresh
 				: !feed.loadingInitial),
 		feedType: feedRequestType,
 		includeBriefs: !scopedMode,
@@ -2617,7 +2620,7 @@ export function Dashboard(props: {
 		if (
 			!notice ||
 			(readableSectionsActive
-				? readableSections.loadingInitial
+				? readableSections.loadingInitial || readableSections.loadingRefresh
 				: feed.loadingInitial)
 		)
 			return;
@@ -2701,6 +2704,7 @@ export function Dashboard(props: {
 		feedRequestType,
 		notifyGlobalError,
 		readableSections.loadingInitial,
+		readableSections.loadingRefresh,
 		readableSectionsActive,
 		refreshFeed,
 	]);
@@ -3094,7 +3098,7 @@ export function Dashboard(props: {
 			}
 		};
 		const failStream = (message: string) => {
-			if (streamSettled || completionInFlight) {
+			if (streamSettled) {
 				clearReconnectTimer();
 				return;
 			}
@@ -3121,6 +3125,7 @@ export function Dashboard(props: {
 		};
 
 		const onProgress = (event: Event) => {
+			if (streamSettled || completionInFlight) return;
 			const payload = parsePayload(event as MessageEvent<string>);
 			if (payload.stage === "star_refreshed") {
 				setAccessSyncStage("star_refreshed");
@@ -3182,7 +3187,7 @@ export function Dashboard(props: {
 				}));
 				if (payload.status === "succeeded") {
 					try {
-						await refreshAllRef.current();
+						await refreshAllRef.current({ throwOnError: true });
 						clearDashboardLiveNoticesRef.current();
 						await checkDashboardUpdatesRef.current({ emit: false });
 					} catch (error) {
@@ -3286,7 +3291,7 @@ export function Dashboard(props: {
 				);
 			};
 			const failStream = (message: string) => {
-				if (lifecycle.settled || lifecycle.completionInFlight) {
+				if (lifecycle.settled) {
 					clearReconnectTimer();
 					return;
 				}
@@ -3310,7 +3315,7 @@ export function Dashboard(props: {
 							: undefined;
 					if (payload.status === "succeeded") {
 						try {
-							await refreshAllRef.current();
+							await refreshAllRef.current({ throwOnError: true });
 							clearDashboardLiveNoticesRef.current();
 							await checkDashboardUpdatesRef.current({ emit: false });
 						} catch (error) {
