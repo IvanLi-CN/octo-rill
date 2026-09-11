@@ -25372,6 +25372,12 @@ mod tests {
         crate::local_id::test_local_id(&format!("user-{id}"))
     }
 
+    fn sse_event_ids(body: &str) -> Vec<&str> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("id: "))
+            .collect()
+    }
+
     fn test_feed_row(node_id: Option<&str>) -> FeedRow {
         FeedRow {
             kind: "release".to_owned(),
@@ -25771,7 +25777,9 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        let error = result.expect_err("foreign task must be rejected");
+        assert_eq!(error.code(), "not_found");
+        assert_eq!(error.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -25828,8 +25836,7 @@ mod tests {
             .await
             .expect("collect authorized SSE response");
         let text = String::from_utf8(body.to_vec()).expect("valid SSE body");
-        assert!(!text.contains("id: api-sse-event-1"));
-        assert_eq!(text.matches("id: api-sse-event-2").count(), 1);
+        assert_eq!(sse_event_ids(&text), vec!["api-sse-event-2"]);
     }
 
     async fn seed_github_connection(

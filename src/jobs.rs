@@ -4353,6 +4353,12 @@ mod tests {
         sync,
     };
 
+    fn sse_event_ids(body: &str) -> Vec<&str> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("id: "))
+            .collect()
+    }
+
     #[tokio::test]
     async fn task_sse_response_resumes_after_last_event_id() {
         let pool = setup_pool().await;
@@ -4386,9 +4392,10 @@ mod tests {
         .await
         .expect("collect initial SSE response");
         let initial_text = String::from_utf8(initial_body.to_vec()).expect("valid SSE body");
-        assert!(initial_text.contains("id: sse-event-1"));
-        assert!(initial_text.contains("id: sse-event-2"));
-        assert_eq!(initial_text.matches("id: sse-event-2").count(), 1);
+        assert_eq!(
+            sse_event_ids(&initial_text),
+            vec!["sse-event-1", "sse-event-2"]
+        );
 
         let resumed_body = to_bytes(
             task_sse_response(state, task_id.to_owned(), Some("sse-event-1".to_owned()))
@@ -4398,9 +4405,7 @@ mod tests {
         .await
         .expect("collect resumed SSE response");
         let resumed_text = String::from_utf8(resumed_body.to_vec()).expect("valid SSE body");
-        assert!(!resumed_text.contains("id: sse-event-1"));
-        assert!(resumed_text.contains("id: sse-event-2"));
-        assert_eq!(resumed_text.matches("id: sse-event-2").count(), 1);
+        assert_eq!(sse_event_ids(&resumed_text), vec!["sse-event-2"]);
     }
 
     #[tokio::test]
@@ -4448,9 +4453,10 @@ mod tests {
             .await
             .expect("collect fallback SSE response");
             let text = String::from_utf8(body.to_vec()).expect("valid SSE body");
-            assert!(text.contains("id: sse-fallback-event-1"));
-            assert!(text.contains("id: sse-fallback-event-2"));
-            assert!(!text.contains("id: sse-foreign-event"));
+            assert_eq!(
+                sse_event_ids(&text),
+                vec!["sse-fallback-event-1", "sse-fallback-event-2"]
+            );
         }
     }
 
@@ -4504,8 +4510,10 @@ mod tests {
         }
 
         let text = String::from_utf8(body).expect("valid SSE body");
-        assert!(text.contains("id: sse-terminal-before-flush"));
-        assert_eq!(text.matches("id: sse-late-terminal-event").count(), 1);
+        assert_eq!(
+            sse_event_ids(&text),
+            vec!["sse-terminal-before-flush", "sse-late-terminal-event"]
+        );
     }
 
     #[tokio::test]
