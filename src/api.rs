@@ -17,7 +17,7 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
-use sqlx::{QueryBuilder, Row, Sqlite};
+use sqlx::{QueryBuilder, Row, Sqlite, Transaction};
 use tokio::{io::AsyncReadExt, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
@@ -27,7 +27,9 @@ use crate::release_links::{
     parse_internal_release_ref, parse_release_locator_from_github_release_url,
     parse_repo_full_name_from_release_url, resolve_release_refs,
 };
-use crate::{admin_runtime, ai, api_keys, briefs, jobs, local_id, sync, translations};
+use crate::{
+    admin_runtime, ai, api_keys, briefs, content_processing, jobs, local_id, sync, translations,
+};
 use crate::{
     error::ApiError,
     passkeys::{
@@ -985,7 +987,11 @@ pub async fn admin_patch_user(
         paused_at: Option<String>,
     }
 
-    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let (_lock, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "admin_patch_user")
+        .await
+        .map_err(ApiError::internal)?;
     let target = sqlx::query_as::<_, AdminPatchTargetRow>(
         r#"
         SELECT id, is_admin, is_disabled, paused_at
@@ -7915,7 +7921,7 @@ pub async fn admin_get_llm_call_detail(
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
     let call_id = parse_local_id_param(call_id, "call_id")?;
 
-    let mut item = sqlx::query_as::<_, AdminLlmCallDetailItem>(
+    let legacy_item = sqlx::query_as::<_, AdminLlmCallDetailItem>(
         r#"
         SELECT
           id,
@@ -8010,8 +8016,83 @@ pub async fn admin_get_llm_call_detail(
     .bind(call_id.as_str())
     .fetch_optional(&state.pool)
     .await
-    .map_err(ApiError::internal)?
-    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "llm call not found"))?;
+    .map_err(ApiError::internal)?;
+
+    let mut item = if let Some(item) = legacy_item {
+        item
+    } else {
+        let global_call = match sqlx::query(
+            r#"
+            SELECT c.id, c.status, c.model, c.provider_call_id, c.output_tokens,
+                   c.created_at, e.attempt_no, e.result_status, e.error_summary,
+                   e.failure_class
+            FROM content_attempt_llm_calls c
+            JOIN content_attempt_events e ON e.id = c.attempt_event_id
+            WHERE c.id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(call_id.as_str())
+        .fetch_optional(&state.pool)
+        .await
+        {
+            Ok(row) => row,
+            Err(sqlx::Error::Database(error)) if error.message().contains("no such table") => None,
+            Err(error) => return Err(ApiError::internal(error)),
+        };
+        let Some(global_call) = global_call else {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "llm call not found",
+            ));
+        };
+        let status = global_call.get::<String, _>("status");
+        let created_at = global_call.get::<String, _>("created_at");
+        AdminLlmCallDetailItem {
+            id: global_call.get::<String, _>("id"),
+            status: status.clone(),
+            source: "global_content_processing".to_owned(),
+            model: global_call.get::<String, _>("model"),
+            requested_by: None,
+            parent_task_id: None,
+            parent_task_type: None,
+            max_tokens: 0,
+            attempt_count: global_call.get::<i64, _>("attempt_no"),
+            scheduler_wait_ms: 0,
+            first_token_wait_ms: None,
+            duration_ms: None,
+            input_tokens: None,
+            output_tokens: global_call.get::<Option<i64>, _>("output_tokens"),
+            finish_reason: None,
+            provider_request_id: global_call.get::<Option<String>, _>("provider_call_id"),
+            provider_http_status: None,
+            processing_stage: Some("provider_call".to_owned()),
+            provider_status: global_call.get::<Option<String>, _>("result_status"),
+            output_contract_status: None,
+            retry_disposition: None,
+            relation_role: Some("primary".to_owned()),
+            evidence_availability: Some("captured".to_owned()),
+            cached_input_tokens: None,
+            total_tokens: None,
+            input_messages_json: None,
+            output_messages_json: None,
+            prompt_text: String::new(),
+            response_text: None,
+            error_text: global_call.get::<Option<String>, _>("error_summary"),
+            failure_class: global_call.get::<Option<String>, _>("failure_class"),
+            final_model: None,
+            fallback_count: 0,
+            retry_scheduled_at: None,
+            recovery_attempt_count: 0,
+            created_at: created_at.clone(),
+            started_at: Some(created_at.clone()),
+            finished_at: (status == "succeeded" || status == "failed")
+                .then_some(created_at.clone()),
+            updated_at: created_at,
+            attempt_history: Vec::new(),
+        }
+    };
 
     if let Some(snapshot) = state.llm_scheduler.admin_overrides().await.get(&item.id) {
         apply_llm_call_detail_admin_override(&mut item, snapshot);
@@ -8051,12 +8132,28 @@ pub async fn admin_audit_llm_diagnostic_access(
     if !matches!(request.action.as_str(), "reveal" | "copy") {
         return Err(ApiError::bad_request("action must be reveal or copy"));
     }
-    let call_exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM llm_calls WHERE id = ?")
+    let legacy_call_exists =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM llm_calls WHERE id = ?")
+            .bind(call_id.as_str())
+            .fetch_one(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    let global_call_exists = if legacy_call_exists == 0 {
+        match sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM content_attempt_llm_calls WHERE id = ?",
+        )
         .bind(call_id.as_str())
         .fetch_one(&state.pool)
         .await
-        .map_err(ApiError::internal)?;
-    if call_exists == 0 {
+        {
+            Ok(count) => count,
+            Err(sqlx::Error::Database(error)) if error.message().contains("no such table") => 0,
+            Err(error) => return Err(ApiError::internal(error)),
+        }
+    } else {
+        0
+    };
+    if legacy_call_exists == 0 && global_call_exists == 0 {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -8070,14 +8167,14 @@ pub async fn admin_audit_llm_diagnostic_access(
             sqlx::query(
                 r#"
                 INSERT INTO llm_diagnostic_access_audit (id, call_id, actor_user_id, action, created_at)
-                SELECT ?, id, ?, ?, ? FROM llm_calls WHERE id = ? LIMIT 1
+                VALUES (?, ?, ?, ?, ?)
                 "#,
             )
             .bind(local_id::generate_local_id())
+            .bind(call_id.as_str())
             .bind(actor_user_id.as_str())
             .bind(request.action.as_str())
             .bind(now.as_str())
-            .bind(call_id.as_str())
             .execute(&state.pool)
             .await
             .context("insert llm diagnostic access audit failed")
@@ -8398,6 +8495,188 @@ async fn build_release_detail_response(
         &row.tag_name,
         row.previous_tag_name.as_deref(),
     );
+    let global_translation_hash = global_release_source_hash(
+        row.release_id,
+        &resolved_full_name,
+        &row.tag_name,
+        row.name.as_deref(),
+        Some(original_body.as_str()),
+        "release_detail",
+        "detail",
+    );
+    let global_summary_hash = global_release_source_hash(
+        row.release_id,
+        &resolved_full_name,
+        &row.tag_name,
+        row.name.as_deref(),
+        row.body.as_deref(),
+        "release_summary",
+        "summary",
+    );
+    let global_smart_hash = global_release_source_hash(
+        row.release_id,
+        &resolved_full_name,
+        &row.tag_name,
+        row.name.as_deref(),
+        row.body.as_deref(),
+        "release_smart",
+        "smart",
+    );
+
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        let release_id = row.release_id.to_string();
+        let translation = content_processing::read_global_resource(
+            state,
+            "release",
+            release_id.as_str(),
+            "translation",
+            "detail",
+            global_translation_hash.as_str(),
+        )
+        .await?
+        .or(content_processing::read_global_resource(
+            state,
+            "release",
+            release_id.as_str(),
+            "translation",
+            "summary",
+            global_summary_hash.as_str(),
+        )
+        .await?);
+        let smart = content_processing::read_global_resource(
+            state,
+            "release",
+            release_id.as_str(),
+            "polishing",
+            "smart",
+            global_smart_hash.as_str(),
+        )
+        .await?;
+        let project_string = |project: &Option<(String, Value)>, key: &str| {
+            project
+                .as_ref()
+                .and_then(|(_, payload)| payload.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        let translation_status = translation.as_ref().map(|(status, _)| status.clone());
+        let smart_status = smart.as_ref().map(|(status, _)| status.clone());
+        let translation_request_id = content_processing::latest_request_id_for_resource(
+            state,
+            user_id,
+            "release",
+            release_id.as_str(),
+            "translation",
+            "detail",
+            "zh-CN",
+            global_translation_hash.as_str(),
+        )
+        .await?
+        .or(content_processing::latest_request_id_for_resource(
+            state,
+            user_id,
+            "release",
+            release_id.as_str(),
+            "translation",
+            "summary",
+            "zh-CN",
+            global_summary_hash.as_str(),
+        )
+        .await?);
+        let smart_request_id = content_processing::latest_request_id_for_resource(
+            state,
+            user_id,
+            "release",
+            release_id.as_str(),
+            "polishing",
+            "smart",
+            "zh-CN",
+            global_smart_hash.as_str(),
+        )
+        .await?;
+        let translated = match translation_status.as_deref() {
+            Some("ready") => {
+                let title = project_string(&translation, "title_zh");
+                let summary = project_string(&translation, "body_md")
+                    .or_else(|| project_string(&translation, "summary_md"));
+                if release_detail_translation_ready(
+                    Some(original_body.as_str()),
+                    summary.as_deref(),
+                ) {
+                    Some(translated_item("ready", title, summary, None, None))
+                } else {
+                    Some(translated_item(
+                        "error",
+                        None,
+                        None,
+                        Some(false),
+                        Some(RELEASE_DETAIL_MARKDOWN_MISMATCH_ERROR),
+                    ))
+                }
+            }
+            Some("queued" | "running" | "deferred_provider" | "blocked_config") => {
+                let title = project_string(&translation, "title_zh");
+                let summary = project_string(&translation, "body_md")
+                    .or_else(|| project_string(&translation, "summary_md"));
+                translated_ready_item(title, summary, Some(true))
+                    .or_else(|| Some(translated_missing_item(true)))
+            }
+            Some(status) => translated_terminal_item(status, None)
+                .or_else(|| Some(translated_item(status, None, None, Some(false), None))),
+            None => Some(translated_missing_item(true)),
+        };
+        let smart = match smart_status.as_deref() {
+            Some("ready") => smart_ready_item(
+                project_string(&smart, "title_zh"),
+                project_string(&smart, "summary_md"),
+                None,
+            )
+            .or_else(|| Some(smart_missing_item(None))),
+            Some("queued" | "running" | "deferred_provider" | "blocked_config") => {
+                smart_ready_item(
+                    project_string(&smart, "title_zh"),
+                    project_string(&smart, "summary_md"),
+                    Some(true),
+                )
+                .or_else(|| Some(smart_missing_item(Some(true))))
+            }
+            Some(status) => smart_terminal_item(status, None)
+                .or_else(|| Some(smart_item(status, None, None, Some(false), None))),
+            None => Some(smart_missing_item(None)),
+        };
+        let translated = translated.map(|mut item| {
+            item.request_id = translation_request_id.clone();
+            item
+        });
+        let smart = smart.map(|mut item| {
+            item.request_id = smart_request_id.clone();
+            item
+        });
+        let repo_visual = repo_visual_from_parts(
+            row.owner_avatar_url,
+            row.open_graph_image_url,
+            row.uses_custom_open_graph_image.unwrap_or(0) != 0,
+        );
+        return Ok(ReleaseDetailResponse {
+            release_id: row.release_id.to_string(),
+            repo_full_name: row.repo_full_name.or(Some(resolved_full_name)),
+            repo_visual,
+            tag_name: row.tag_name,
+            previous_tag_name: row.previous_tag_name,
+            name: row.name,
+            body: row.body,
+            html_url: row.html_url,
+            published_at: row.published_at,
+            is_prerelease: row.is_prerelease,
+            is_draft: row.is_draft,
+            translated,
+            smart,
+        });
+    }
     let translation_fresh = row.trans_source_hash.as_deref() == Some(source_hash.as_str());
     let smart_fresh = row.smart_source_hash.as_deref() == Some(smart_source_hash.as_str());
 
@@ -8961,9 +9240,170 @@ async fn build_announcement_detail_response(
 ) -> Result<AnnouncementDetailResponse, ApiError> {
     let discussion_key =
         announcement_discussion_key(&source.repo_full_name, source.discussion_number);
+    let original_body = source.body.clone().unwrap_or_default();
+    let global_translation_hash = global_announcement_source_hash(
+        discussion_key.as_str(),
+        &source.repo_full_name,
+        source.discussion_number,
+        source.title.as_str(),
+        Some(original_body.as_str()),
+        "announcement_detail",
+        "detail",
+    );
+    let global_smart_hash = global_announcement_source_hash(
+        discussion_key.as_str(),
+        &source.repo_full_name,
+        source.discussion_number,
+        source.title.as_str(),
+        source.body.as_deref(),
+        "announcement_smart",
+        "smart",
+    );
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        let translation = content_processing::read_global_resource(
+            state,
+            "announcement",
+            discussion_key.as_str(),
+            "translation",
+            "detail",
+            global_translation_hash.as_str(),
+        )
+        .await?;
+        let smart = content_processing::read_global_resource(
+            state,
+            "announcement",
+            discussion_key.as_str(),
+            "polishing",
+            "smart",
+            global_smart_hash.as_str(),
+        )
+        .await?;
+        let project_string = |project: &Option<(String, Value)>, key: &str| {
+            project
+                .as_ref()
+                .and_then(|(_, payload)| payload.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        let project_status =
+            |project: &Option<(String, Value)>| project.as_ref().map(|(status, _)| status.clone());
+        let translation_request_id = content_processing::latest_request_id_for_resource(
+            state,
+            user_id,
+            "announcement",
+            discussion_key.as_str(),
+            "translation",
+            "detail",
+            "zh-CN",
+            global_translation_hash.as_str(),
+        )
+        .await?;
+        let smart_request_id = content_processing::latest_request_id_for_resource(
+            state,
+            user_id,
+            "announcement",
+            discussion_key.as_str(),
+            "polishing",
+            "smart",
+            "zh-CN",
+            global_smart_hash.as_str(),
+        )
+        .await?;
+        let translated = match project_status(&translation).as_deref() {
+            Some("ready") => Some(translated_item(
+                "ready",
+                project_string(&translation, "title_zh"),
+                project_string(&translation, "body_md")
+                    .or_else(|| project_string(&translation, "summary_md")),
+                None,
+                None,
+            )),
+            Some("queued" | "running" | "deferred_provider")
+                if project_string(&translation, "body_md").is_some()
+                    || project_string(&translation, "summary_md").is_some() =>
+            {
+                Some(translated_item(
+                    "ready",
+                    project_string(&translation, "title_zh"),
+                    project_string(&translation, "body_md")
+                        .or_else(|| project_string(&translation, "summary_md")),
+                    Some(true),
+                    None,
+                ))
+            }
+            Some("failed") => Some(translated_item(
+                "error",
+                None,
+                None,
+                Some(false),
+                Some("global content processing failed"),
+            )),
+            Some("queued" | "running" | "deferred_provider" | "blocked_config") => {
+                Some(translated_missing_item(true))
+            }
+            Some(status) => translated_terminal_item(status, None),
+            None => Some(translated_missing_item(true)),
+        };
+        let smart = match project_status(&smart).as_deref() {
+            Some("ready") => Some(smart_item(
+                "ready",
+                project_string(&smart, "title_zh"),
+                project_string(&smart, "summary_md"),
+                None,
+                None,
+            )),
+            Some("queued" | "running" | "deferred_provider")
+                if project_string(&smart, "summary_md").is_some() =>
+            {
+                Some(smart_item(
+                    "ready",
+                    project_string(&smart, "title_zh"),
+                    project_string(&smart, "summary_md"),
+                    Some(true),
+                    None,
+                ))
+            }
+            Some("failed") => Some(smart_item(
+                "error",
+                None,
+                None,
+                Some(false),
+                Some("global content processing failed"),
+            )),
+            Some("queued" | "running" | "deferred_provider" | "blocked_config") => {
+                Some(smart_missing_item(Some(true)))
+            }
+            Some(status) => smart_terminal_item(status, None),
+            None => Some(smart_missing_item(None)),
+        };
+        let translated = translated.map(|mut item| {
+            item.request_id = translation_request_id.clone();
+            item
+        });
+        let smart = smart.map(|mut item| {
+            item.request_id = smart_request_id.clone();
+            item
+        });
+        return Ok(AnnouncementDetailResponse {
+            repo_full_name: source.repo_full_name,
+            discussion_number: source.discussion_number,
+            discussion_key,
+            repo_visual: source.repo_visual,
+            title: source.title,
+            body: source.body,
+            html_url: source.html_url,
+            occurred_at: source.occurred_at,
+            actor: source.actor,
+            translated,
+            smart,
+        });
+    }
     let translation_state =
         load_announcement_translation_state(state, user_id, discussion_key.as_str()).await?;
-    let original_body = source.body.clone().unwrap_or_default();
     let source_hash = announcement_detail_source_hash(
         &source.repo_full_name,
         Some(source.discussion_number),
@@ -9302,6 +9742,7 @@ struct PublicReleaseRow {
     smart_title: Option<String>,
     smart_summary: Option<String>,
     smart_error_text: Option<String>,
+    global_mode: bool,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -9695,6 +10136,11 @@ async fn upsert_public_release_usage(
         (true, true) => (0_i64, 0_i64, 0_i64, 1_i64),
     };
 
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "public_release_usage_register")
+        .await
+        .map_err(ApiError::internal)?;
     sqlx::query(
         r#"
         INSERT INTO public_repo_release_usage (
@@ -9730,9 +10176,11 @@ async fn upsert_public_release_usage(
     .bind(page_detail_inc)
     .bind(now.as_str())
     .bind(now.as_str())
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    drop(_sqlite_write);
 
     let row = sqlx::query_as::<_, PublicReleaseUsageRow>(
         r#"
@@ -9888,6 +10336,11 @@ async fn resolve_public_release_usage_from_local_metadata(
             .await
             .map_err(ApiError::internal)?
     {
+        let (_sqlite_write, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "public_release_usage_sync_status")
+            .await
+            .map_err(ApiError::internal)?;
         sqlx::query(
             r#"
             UPDATE public_repo_release_usage
@@ -9899,9 +10352,10 @@ async fn resolve_public_release_usage_from_local_metadata(
         )
         .bind(now.as_str())
         .bind(full_name_lower)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
     }
 
     sqlx::query_as::<_, PublicReleaseUsageRow>(
@@ -10385,6 +10839,12 @@ pub async fn publish_repo_public_release(
         ));
     }
 
+    let now = chrono::Utc::now().to_rfc3339();
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "public_release_usage_publish")
+        .await
+        .map_err(ApiError::internal)?;
     let release_count: i64 = sqlx::query_scalar(
         r#"
         SELECT COUNT(*)
@@ -10394,16 +10854,14 @@ pub async fn publish_repo_public_release(
         "#,
     )
     .bind(owned.repo_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
-    let now = chrono::Utc::now().to_rfc3339();
     let initial_status = if release_count > 0 {
         "ready"
     } else {
         "pending"
     };
-
     sqlx::query(
         r#"
         INSERT INTO public_repo_release_usage (
@@ -10450,9 +10908,11 @@ pub async fn publish_repo_public_release(
     .bind(now.as_str())
     .bind(now.as_str())
     .bind(now.as_str())
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    drop(_sqlite_write);
 
     if release_count == 0
         && sync::enqueue_public_repo_release_sync(
@@ -10463,6 +10923,11 @@ pub async fn publish_repo_public_release(
         .await
         .map_err(ApiError::internal)?
     {
+        let (_sqlite_write, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "public_release_usage_publish_status")
+            .await
+            .map_err(ApiError::internal)?;
         sqlx::query(
             r#"
             UPDATE public_repo_release_usage
@@ -10474,9 +10939,10 @@ pub async fn publish_repo_public_release(
         )
         .bind(now.as_str())
         .bind(full_name_lower.as_str())
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
     }
 
     let visible = load_repo_public_release_visible_row(
@@ -10523,6 +10989,11 @@ pub async fn unpublish_repo_public_release(
             "only viewer-owned private repositories can be unpublished",
         ));
     }
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "public_release_usage_unpublish")
+        .await
+        .map_err(ApiError::internal)?;
     let deleted_usage = sqlx::query_as::<_, (Option<i64>, String)>(
         r#"
         SELECT repo_id, full_name
@@ -10533,7 +11004,7 @@ pub async fn unpublish_repo_public_release(
         "#,
     )
     .bind(full_name_lower.as_str())
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
 
@@ -10546,11 +11017,18 @@ pub async fn unpublish_repo_public_release(
             "#,
         )
         .bind(full_name_lower.as_str())
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
-        Some(cleanup_public_release_repo_cache_if_unused(state.as_ref(), repo_id, full_name).await?)
+        let cleanup =
+            cleanup_public_release_repo_cache_if_unused_in_transaction(&mut tx, repo_id, full_name)
+                .await?;
+        tx.commit().await.map_err(ApiError::internal)?;
+        drop(_sqlite_write);
+        Some(cleanup)
     } else {
+        tx.commit().await.map_err(ApiError::internal)?;
+        drop(_sqlite_write);
         None
     };
 
@@ -10585,6 +11063,23 @@ fn public_translation_item(row: &PublicReleaseRow, content: &str) -> Option<Tran
         .unwrap_or(&row.tag_name)
         .to_owned();
     let original_body = row.body.clone().unwrap_or_default();
+    if row.global_mode {
+        return match row.trans_status.as_deref() {
+            Some("ready") => {
+                translated_ready_item(row.trans_title.clone(), row.trans_summary.clone(), None)
+                    .or_else(|| Some(translated_missing_item(true)))
+            }
+            Some("failed") => Some(translated_item(
+                "error",
+                None,
+                None,
+                Some(false),
+                row.trans_error_text.as_deref(),
+            )),
+            Some(status) => translated_terminal_item(status, row.trans_error_text.as_deref()),
+            None => Some(translated_missing_item(true)),
+        };
+    }
     let source_hash =
         release_detail_source_hash(&row.repo_full_name, &original_title, &original_body);
     if row.trans_source_hash.as_deref() != Some(source_hash.as_str()) {
@@ -10611,6 +11106,23 @@ fn public_smart_item(row: &PublicReleaseRow, content: &str) -> Option<SmartItem>
         .filter(|value| !value.is_empty())
         .unwrap_or(&row.tag_name)
         .to_owned();
+    if row.global_mode {
+        return match row.smart_status.as_deref() {
+            Some("ready") => {
+                smart_ready_item(row.smart_title.clone(), row.smart_summary.clone(), None)
+                    .or_else(|| Some(smart_missing_item(None)))
+            }
+            Some("failed") => Some(smart_item(
+                "error",
+                None,
+                None,
+                Some(false),
+                row.smart_error_text.as_deref(),
+            )),
+            Some(status) => smart_terminal_item(status, row.smart_error_text.as_deref()),
+            None => Some(smart_missing_item(None)),
+        };
+    }
     let smart_body = release_feed_body(row.body.as_deref());
     let source_hash = crate::translations::release_smart_feed_source_hash(
         row.release_id.to_string().as_str(),
@@ -10840,9 +11352,109 @@ async fn load_public_release_translation_rows(
     state: &AppState,
     release_ids: &[i64],
     entity_type: &str,
+    repo_full_name: &str,
+    base_rows: &[PublicReleaseBaseRow],
 ) -> Result<HashMap<i64, PublicReleaseTranslationRow>, ApiError> {
     if release_ids.is_empty() {
         return Ok(HashMap::new());
+    }
+
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        let (pipeline, variants): (&str, &[&str]) = if entity_type == "release_smart" {
+            ("polishing", &["smart", "feed_card"])
+        } else {
+            ("translation", &["detail"])
+        };
+        let mut results = HashMap::new();
+        for release_id in release_ids {
+            let release_id_string = release_id.to_string();
+            let Some(base) = base_rows.iter().find(|row| row.release_id == *release_id) else {
+                continue;
+            };
+            let kind = if entity_type == "release_smart" {
+                "release_smart"
+            } else {
+                "release_detail"
+            };
+            let mut global_result = None;
+            for variant in variants {
+                let expected_source_hash = global_release_source_hash(
+                    *release_id,
+                    repo_full_name,
+                    &base.tag_name,
+                    base.name.as_deref(),
+                    base.body.as_deref(),
+                    kind,
+                    variant,
+                );
+                if let Some(result) = content_processing::read_global_resource(
+                    state,
+                    "release",
+                    release_id_string.as_str(),
+                    pipeline,
+                    variant,
+                    expected_source_hash.as_str(),
+                )
+                .await?
+                {
+                    global_result = Some(result);
+                    break;
+                }
+            }
+            let Some((status, payload)) = global_result else {
+                continue;
+            };
+            let has_text = payload
+                .get("title_zh")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+                || payload
+                    .get("body_md")
+                    .or_else(|| payload.get("summary_md"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty());
+            let display_status = if matches!(
+                status.as_str(),
+                "queued" | "running" | "deferred_provider" | "blocked_config"
+            ) && has_text
+            {
+                "ready".to_owned()
+            } else {
+                status
+            };
+            results.insert(
+                *release_id,
+                PublicReleaseTranslationRow {
+                    release_id: *release_id,
+                    source_hash: payload
+                        .get("source_hash")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    status: display_status,
+                    title: payload
+                        .get("title_zh")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    summary: payload
+                        .get("body_md")
+                        .or_else(|| payload.get("summary_md"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    error_text: payload
+                        .get("error_detail")
+                        .or_else(|| payload.get("error_summary"))
+                        .or_else(|| payload.get("error"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                },
+            );
+        }
+        return Ok(results);
     }
 
     let mut ready_query = QueryBuilder::<sqlx::Sqlite>::new(
@@ -10931,6 +11543,7 @@ fn public_release_row_from_parts(
     repo_visual: Option<&PublicReleaseRepoVisualRow>,
     translated: Option<&PublicReleaseTranslationRow>,
     smart: Option<&PublicReleaseTranslationRow>,
+    global_mode: bool,
 ) -> PublicReleaseRow {
     PublicReleaseRow {
         release_id: base.release_id,
@@ -10957,6 +11570,7 @@ fn public_release_row_from_parts(
         smart_title: smart.and_then(|row| row.title.clone()),
         smart_summary: smart.and_then(|row| row.summary.clone()),
         smart_error_text: smart.and_then(|row| row.error_text.clone()),
+        global_mode,
     }
 }
 
@@ -10989,6 +11603,10 @@ async fn load_public_release_rows(
     }
 
     let repo_visual = load_public_release_repo_visual(state, repo_id).await?;
+    let global_mode = content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global;
     let release_ids = base_rows
         .iter()
         .map(|row| row.release_id)
@@ -10996,12 +11614,26 @@ async fn load_public_release_rows(
     let load_translated = content == "all" || content == "translated";
     let load_smart = content == "all" || content == "polished";
     let translated = if load_translated {
-        load_public_release_translation_rows(state, &release_ids, "release_detail").await?
+        load_public_release_translation_rows(
+            state,
+            &release_ids,
+            "release_detail",
+            repo_full_name,
+            &base_rows,
+        )
+        .await?
     } else {
         HashMap::new()
     };
     let smart = if load_smart {
-        load_public_release_translation_rows(state, &release_ids, "release_smart").await?
+        load_public_release_translation_rows(
+            state,
+            &release_ids,
+            "release_smart",
+            repo_full_name,
+            &base_rows,
+        )
+        .await?
     } else {
         HashMap::new()
     };
@@ -11017,6 +11649,7 @@ async fn load_public_release_rows(
                 repo_visual.as_ref(),
                 detail_row,
                 smart_row,
+                global_mode,
             )
         })
         .collect())
@@ -12372,6 +13005,11 @@ pub async fn admin_delete_public_release_repo(
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
     let usage_id = parse_local_id_param(usage_id, "public_repo_usage_id")?;
 
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "admin_public_release_usage_delete")
+        .await
+        .map_err(ApiError::internal)?;
     let deleted_usage = sqlx::query_as::<_, (Option<i64>, String)>(
         r#"
         SELECT repo_id, full_name
@@ -12380,7 +13018,7 @@ pub async fn admin_delete_public_release_repo(
         "#,
     )
     .bind(usage_id.as_str())
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
 
@@ -12399,7 +13037,7 @@ pub async fn admin_delete_public_release_repo(
         "#,
     )
     .bind(usage_id.as_str())
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(ApiError::internal)?
     .rows_affected();
@@ -12412,7 +13050,10 @@ pub async fn admin_delete_public_release_repo(
     }
 
     let cache_cleanup =
-        cleanup_public_release_repo_cache_if_unused(state.as_ref(), repo_id, full_name).await?;
+        cleanup_public_release_repo_cache_if_unused_in_transaction(&mut tx, repo_id, full_name)
+            .await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    drop(_sqlite_write);
 
     let Json(mut response) = admin_list_public_release_repos(
         State(state),
@@ -12428,8 +13069,8 @@ pub async fn admin_delete_public_release_repo(
     Ok(Json(response))
 }
 
-async fn cleanup_public_release_repo_cache_if_unused(
-    state: &AppState,
+async fn cleanup_public_release_repo_cache_if_unused_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
     repo_id: Option<i64>,
     full_name: String,
 ) -> Result<AdminPublicRepoCacheCleanup, ApiError> {
@@ -12443,6 +13084,19 @@ async fn cleanup_public_release_repo_cache_if_unused(
         });
     };
 
+    if !content_processing::legacy_mode_in_transaction(tx)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        return Ok(AdminPublicRepoCacheCleanup {
+            repo_id: Some(repo_id),
+            full_name,
+            deleted_release_count: 0,
+            deleted_ai_cache_count: 0,
+            skipped_reason: Some("content_processing_transition".to_owned()),
+        });
+    }
+
     let remaining_public_usage = sqlx::query_scalar::<_, i64>(
         r#"
         SELECT COUNT(*)
@@ -12451,7 +13105,7 @@ async fn cleanup_public_release_repo_cache_if_unused(
         "#,
     )
     .bind(repo_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
     if remaining_public_usage > 0 {
@@ -12472,7 +13126,7 @@ async fn cleanup_public_release_repo_cache_if_unused(
         "#,
     )
     .bind(repo_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
     if user_visible_usage > 0 {
@@ -12494,7 +13148,7 @@ async fn cleanup_public_release_repo_cache_if_unused(
         "#,
     )
     .bind(repo_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
     if brief_usage > 0 {
@@ -12515,11 +13169,10 @@ async fn cleanup_public_release_repo_cache_if_unused(
         "#,
     )
     .bind(repo_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
 
-    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     let mut deleted_ai_cache_count = 0u64;
     let mut deleted_release_count = 0i64;
     for release_id in release_ids {
@@ -12532,7 +13185,7 @@ async fn cleanup_public_release_repo_cache_if_unused(
             "#,
         )
         .bind(release_id_text.as_str())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(ApiError::internal)?
         .rows_affected();
@@ -12543,7 +13196,7 @@ async fn cleanup_public_release_repo_cache_if_unused(
             "#,
         )
         .bind(release_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(ApiError::internal)?
         .rows_affected() as i64;
@@ -12555,7 +13208,7 @@ async fn cleanup_public_release_repo_cache_if_unused(
         "#,
     )
     .bind(repo_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
     sqlx::query(
@@ -12565,11 +13218,9 @@ async fn cleanup_public_release_repo_cache_if_unused(
         "#,
     )
     .bind(repo_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
-    tx.commit().await.map_err(ApiError::internal)?;
-
     Ok(AdminPublicRepoCacheCleanup {
         repo_id: Some(repo_id),
         full_name,
@@ -13913,7 +14564,7 @@ where
         .map_err(ApiError::internal)?;
     let releases = sync_releases(state, user_id)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(content_processing::api_error_from_anyhow)?;
     let (social, social_error) = sync_social(state, user_id).await;
     let notifications = sync_notifications(state, user_id)
         .await
@@ -13943,7 +14594,7 @@ pub async fn sync_releases(
     if matches!(mode, ReturnMode::Sync) {
         let res = sync::sync_releases(state.as_ref(), user_id.as_str())
             .await
-            .map_err(ApiError::internal)?;
+            .map_err(content_processing::api_error_from_anyhow)?;
         return Ok(Json(res).into_response());
     }
 
@@ -14734,6 +15385,8 @@ pub struct TranslatedItem {
     error_summary: Option<String>,
     error_detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     auto_translate: Option<bool>,
 }
 
@@ -14746,6 +15399,8 @@ pub struct SmartItem {
     error_code: Option<String>,
     error_summary: Option<String>,
     error_detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_translate: Option<bool>,
 }
@@ -15878,38 +16533,358 @@ async fn fetch_feed_items(
         .bind(user_id)
         .bind(user_id)
         .bind(user_id);
-    qy.bind(if scoped_all || types.releases {
-        1_i64
-    } else {
-        0_i64
-    })
-    .bind(if types.stars { 1_i64 } else { 0_i64 })
-    .bind(if scoped_all {
-        0_i64
-    } else if types.followers {
-        1_i64
-    } else {
-        0_i64
-    })
-    .bind(if scoped_all || types.ambient {
-        1_i64
-    } else {
-        0_i64
-    })
-    .bind(if time_window.is_some() { 1_i64 } else { 0_i64 })
-    .bind(time_window.map(|(start, _)| start))
-    .bind(time_window.map(|(_, end)| end))
-    .bind(if has_cursor { 1_i64 } else { 0_i64 })
-    .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
-    .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
-    .bind(cursor.as_ref().map(|c| c.kind_rank))
-    .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
-    .bind(cursor.as_ref().map(|c| c.kind_rank))
-    .bind(cursor.as_ref().map(|c| c.id_key.as_str()))
-    .bind(limit)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::internal)
+    let mut rows = qy
+        .bind(if scoped_all || types.releases {
+            1_i64
+        } else {
+            0_i64
+        })
+        .bind(if types.stars { 1_i64 } else { 0_i64 })
+        .bind(if scoped_all {
+            0_i64
+        } else if types.followers {
+            1_i64
+        } else {
+            0_i64
+        })
+        .bind(if scoped_all || types.ambient {
+            1_i64
+        } else {
+            0_i64
+        })
+        .bind(if time_window.is_some() { 1_i64 } else { 0_i64 })
+        .bind(time_window.map(|(start, _)| start))
+        .bind(time_window.map(|(_, end)| end))
+        .bind(if has_cursor { 1_i64 } else { 0_i64 })
+        .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
+        .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
+        .bind(cursor.as_ref().map(|c| c.kind_rank))
+        .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
+        .bind(cursor.as_ref().map(|c| c.kind_rank))
+        .bind(cursor.as_ref().map(|c| c.id_key.as_str()))
+        .bind(limit)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    overlay_global_feed_processing(state, &mut rows).await?;
+    Ok(rows)
+}
+
+async fn read_first_global_resource_variant(
+    state: &AppState,
+    resource_type: &str,
+    resource_id: &str,
+    pipeline: &str,
+    variants: &[&str],
+    expected_source_hashes: &[String],
+) -> Result<Option<(String, Value)>, ApiError> {
+    for (variant, expected_source_hash) in variants.iter().zip(expected_source_hashes) {
+        if let Some(result) = content_processing::read_global_resource(
+            state,
+            resource_type,
+            resource_id,
+            pipeline,
+            variant,
+            expected_source_hash,
+        )
+        .await?
+        {
+            return Ok(Some(result));
+        }
+    }
+    Ok(None)
+}
+
+async fn overlay_global_feed_processing(
+    state: &AppState,
+    rows: &mut [FeedRow],
+) -> Result<(), ApiError> {
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        != content_processing::ContentProcessingMode::Global
+    {
+        return Ok(());
+    }
+
+    for row in rows.iter_mut() {
+        if !matches!(row.kind.as_str(), "release" | "announcement") {
+            continue;
+        }
+        let resource_type = if row.kind == "release" {
+            "release"
+        } else {
+            "announcement"
+        };
+        let resource_id = row
+            .translation_entity_id
+            .clone()
+            .or_else(|| {
+                row.discussion_number.map(|number| {
+                    format!("{}#{number}", row.repo_full_name.as_deref().unwrap_or(""))
+                })
+            })
+            .unwrap_or_else(|| row.entity_id.clone());
+        let body = release_feed_body(row.release_body.as_deref());
+        let title = row.title.as_deref().unwrap_or("");
+        let repo = row.repo_full_name.as_deref().unwrap_or("");
+        let translation_hash = if row.kind == "announcement" {
+            announcement_feed_translation_source_hash(
+                repo,
+                row.discussion_number,
+                title,
+                body.as_deref(),
+            )
+        } else {
+            release_feed_translation_source_hash(repo, title, body.as_deref())
+        };
+        let detail_hash = if row.kind == "announcement" {
+            announcement_detail_source_hash(
+                repo,
+                row.discussion_number,
+                title,
+                row.release_body.as_deref().unwrap_or(""),
+            )
+        } else {
+            release_detail_source_hash(repo, title, row.release_body.as_deref().unwrap_or(""))
+        };
+        let smart_hash = if row.kind == "announcement" {
+            crate::translations::announcement_smart_feed_source_hash(
+                resource_id.as_str(),
+                repo,
+                row.discussion_number,
+                title,
+                row.release_body.as_deref(),
+            )
+        } else {
+            crate::translations::release_smart_feed_source_hash(
+                row.entity_id.as_str(),
+                repo,
+                title,
+                body.as_deref(),
+                row.release_tag_name.as_deref().unwrap_or(""),
+                row.release_previous_tag_name.as_deref(),
+            )
+        };
+
+        row.trans_source_hash = None;
+        row.trans_status = None;
+        row.trans_title = None;
+        row.trans_summary = None;
+        row.trans_error_text = None;
+        row.trans_work_status = None;
+        row.detail_trans_source_hash = None;
+        row.detail_trans_status = None;
+        row.detail_trans_title = None;
+        row.detail_trans_summary = None;
+        row.detail_trans_error_text = None;
+        row.detail_trans_work_status = None;
+        row.smart_source_hash = None;
+        row.smart_status = None;
+        row.smart_title = None;
+        row.smart_summary = None;
+        row.smart_error_text = None;
+        row.smart_work_status = None;
+
+        let global_hash_for_variant = |kind: &str, variant: &str| {
+            if resource_type == "announcement" {
+                global_announcement_source_hash(
+                    resource_id.as_str(),
+                    repo,
+                    row.discussion_number.unwrap_or_default(),
+                    title,
+                    row.release_body.as_deref(),
+                    kind,
+                    variant,
+                )
+            } else {
+                global_release_source_hash(
+                    row.entity_id.parse::<i64>().unwrap_or_default(),
+                    repo,
+                    row.release_tag_name.as_deref().unwrap_or_default(),
+                    Some(title),
+                    row.release_body.as_deref(),
+                    kind,
+                    variant,
+                )
+            }
+        };
+
+        if let Some((status, payload)) = read_first_global_resource_variant(
+            state,
+            resource_type,
+            resource_id.as_str(),
+            "translation",
+            &["feed_body", "summary"],
+            &[
+                global_hash_for_variant(
+                    if resource_type == "announcement" {
+                        "announcement_summary"
+                    } else {
+                        "release_summary"
+                    },
+                    "feed_body",
+                ),
+                global_hash_for_variant(
+                    if resource_type == "announcement" {
+                        "announcement_summary"
+                    } else {
+                        "release_summary"
+                    },
+                    "summary",
+                ),
+            ],
+        )
+        .await?
+        {
+            let has_text = payload
+                .get("title_zh")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+                || payload
+                    .get("body_md")
+                    .or_else(|| payload.get("summary_md"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty());
+            let display_status = if matches!(
+                status.as_str(),
+                "queued" | "running" | "deferred_provider" | "blocked_config"
+            ) {
+                if has_text { "ready" } else { "missing" }
+            } else {
+                status.as_str()
+            };
+            row.trans_source_hash = Some(translation_hash);
+            row.trans_status = Some(display_status.to_owned());
+            row.trans_title = payload
+                .get("title_zh")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            row.trans_summary = payload
+                .get("body_md")
+                .or_else(|| payload.get("summary_md"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            row.trans_error_text = payload
+                .get("error_detail")
+                .or_else(|| payload.get("error_summary"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            row.trans_work_status = Some(status);
+        }
+        if let Some((status, payload)) = read_first_global_resource_variant(
+            state,
+            resource_type,
+            resource_id.as_str(),
+            "translation",
+            &["detail"],
+            &[global_hash_for_variant(
+                if resource_type == "announcement" {
+                    "announcement_detail"
+                } else {
+                    "release_detail"
+                },
+                "detail",
+            )],
+        )
+        .await?
+        {
+            let has_text = payload
+                .get("title_zh")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+                || payload
+                    .get("body_md")
+                    .or_else(|| payload.get("summary_md"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty());
+            let display_status = if matches!(
+                status.as_str(),
+                "queued" | "running" | "deferred_provider" | "blocked_config"
+            ) {
+                if has_text { "ready" } else { "missing" }
+            } else {
+                status.as_str()
+            };
+            row.detail_trans_source_hash = Some(detail_hash);
+            row.detail_trans_status = Some(display_status.to_owned());
+            row.detail_trans_title = payload
+                .get("title_zh")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            row.detail_trans_summary = payload
+                .get("body_md")
+                .or_else(|| payload.get("summary_md"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            row.detail_trans_error_text = payload
+                .get("error_detail")
+                .or_else(|| payload.get("error_summary"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            row.detail_trans_work_status = Some(status);
+        }
+        if let Some((status, payload)) = read_first_global_resource_variant(
+            state,
+            resource_type,
+            resource_id.as_str(),
+            "polishing",
+            &["feed_card", "smart"],
+            &[
+                global_hash_for_variant(
+                    if resource_type == "announcement" {
+                        "announcement_smart"
+                    } else {
+                        "release_smart"
+                    },
+                    "feed_card",
+                ),
+                global_hash_for_variant(
+                    if resource_type == "announcement" {
+                        "announcement_smart"
+                    } else {
+                        "release_smart"
+                    },
+                    "smart",
+                ),
+            ],
+        )
+        .await?
+        {
+            let has_text = payload
+                .get("title_zh")
+                .or_else(|| payload.get("summary_md"))
+                .or_else(|| payload.get("body_md"))
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty());
+            let display_status = if matches!(
+                status.as_str(),
+                "queued" | "running" | "deferred_provider" | "blocked_config"
+            ) {
+                if has_text { "ready" } else { "missing" }
+            } else {
+                status.as_str()
+            };
+            row.smart_source_hash = Some(smart_hash);
+            row.smart_status = Some(display_status.to_owned());
+            row.smart_title = payload
+                .get("title_zh")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            row.smart_summary = payload
+                .get("summary_md")
+                .or_else(|| payload.get("body_md"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            row.smart_error_text = payload
+                .get("error_detail")
+                .or_else(|| payload.get("error_summary"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            row.smart_work_status = Some(status);
+        }
+    }
+    Ok(())
 }
 
 async fn fetch_visible_release_reaction_rows(
@@ -16330,6 +17305,7 @@ fn translated_item(
         error_code,
         error_summary,
         error_detail,
+        request_id: None,
         auto_translate,
     }
 }
@@ -16350,6 +17326,7 @@ fn smart_item(
         error_code,
         error_summary,
         error_detail,
+        request_id: None,
         auto_translate,
     }
 }
@@ -16364,6 +17341,17 @@ fn translated_terminal_item(status: &str, error_text: Option<&str>) -> Option<Tr
             Some(false),
             if status == "error" { error_text } else { None },
         )),
+        "failed" => Some(translated_item(
+            "error",
+            None,
+            None,
+            Some(false),
+            error_text,
+        )),
+        "queued" | "running" | "not_applicable" | "deferred_provider" | "blocked_config"
+        | "cancelled" | "superseded" => {
+            Some(translated_item(status, None, None, Some(true), error_text))
+        }
         _ => None,
     }
 }
@@ -16438,6 +17426,11 @@ fn smart_terminal_item(status: &str, error_text: Option<&str>) -> Option<SmartIt
             Some(smart_item("insufficient", None, None, Some(false), None))
         }
         "missing" | "error" => Some(smart_item(status, None, None, Some(false), error_text)),
+        "failed" => Some(smart_item("error", None, None, Some(false), error_text)),
+        "queued" | "running" | "not_applicable" | "deferred_provider" | "blocked_config"
+        | "cancelled" | "superseded" => {
+            Some(smart_item(status, None, None, Some(true), error_text))
+        }
         _ => None,
     }
 }
@@ -18590,7 +19583,7 @@ fn line_prefix_kind(line: &str) -> &'static str {
     "plain"
 }
 
-fn markdown_structure_preserved(source: &str, translated: &str) -> bool {
+pub(crate) fn markdown_structure_preserved(source: &str, translated: &str) -> bool {
     let normalized_source = source.replace("\r\n", "\n");
     let src_lines: Vec<&str> = normalized_source
         .lines()
@@ -18755,6 +19748,12 @@ async fn upsert_translation(
     t: TranslationUpsert<'_>,
 ) -> Result<(), ApiError> {
     let now = chrono::Utc::now().to_rfc3339();
+    let (_lock, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "legacy_translation_upsert")
+        .await
+        .map_err(ApiError::internal)?;
+    translations::ensure_legacy_writer_transaction(&mut tx).await?;
     sqlx::query(
         r#"
         INSERT INTO ai_translations (
@@ -18785,9 +19784,10 @@ async fn upsert_translation(
     .bind(&now)
     .bind(&now)
     .bind(requested_at)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
     Ok(())
 }
 
@@ -18797,6 +19797,12 @@ async fn mark_translation_requested(
     requested_at: &str,
     t: TranslationUpsert<'_>,
 ) -> Result<(), ApiError> {
+    let (_lock, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "legacy_translation_request")
+        .await
+        .map_err(ApiError::internal)?;
+    translations::ensure_legacy_writer_transaction(&mut tx).await?;
     sqlx::query(
         r#"
         INSERT INTO ai_translations (
@@ -18824,9 +19830,10 @@ async fn mark_translation_requested(
     .bind(t.source_hash)
     .bind(requested_at)
     .bind(requested_at)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
     Ok(())
 }
 
@@ -18916,6 +19923,426 @@ struct ReleaseBatchSourceRow {
     tag_name: String,
     name: Option<String>,
     body: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct GlobalReleaseSourceRow {
+    repo_id: i64,
+    starred_repo_id: Option<i64>,
+    html_url: String,
+    tag_name: String,
+    name: Option<String>,
+    body: Option<String>,
+}
+
+fn global_source_hash_from_fields(
+    kind: &str,
+    variant: &str,
+    entity_id: &str,
+    metadata: String,
+    title: String,
+    body: Option<String>,
+) -> String {
+    let mut source_blocks = vec![
+        translations::TranslationSourceBlock {
+            slot: "metadata".to_owned(),
+            text: metadata,
+        },
+        translations::TranslationSourceBlock {
+            slot: "title".to_owned(),
+            text: title,
+        },
+    ];
+    let has_body = body
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    if let Some(body) = body.filter(|value| !value.trim().is_empty()) {
+        source_blocks.push(translations::TranslationSourceBlock {
+            slot: "body_markdown".to_owned(),
+            text: body,
+        });
+    }
+    let target_slots = if kind.ends_with("_detail") || variant == "detail" {
+        if has_body {
+            vec!["title_zh".to_owned(), "body_md".to_owned()]
+        } else {
+            vec!["title_zh".to_owned()]
+        }
+    } else {
+        vec!["title_zh".to_owned(), "summary_md".to_owned()]
+    };
+    content_processing::source_hash_for_item(&translations::TranslationRequestItemInput {
+        producer_ref: String::new(),
+        kind: kind.to_owned(),
+        variant: variant.to_owned(),
+        entity_id: entity_id.to_owned(),
+        target_lang: "zh-CN".to_owned(),
+        max_wait_ms: 0,
+        source_blocks,
+        target_slots,
+    })
+}
+
+fn with_source_observed_at(
+    mut source_blocks: Vec<translations::TranslationSourceBlock>,
+) -> Vec<translations::TranslationSourceBlock> {
+    source_blocks.insert(
+        0,
+        translations::TranslationSourceBlock {
+            slot: "source_observed_at".to_owned(),
+            text: Utc::now().to_rfc3339(),
+        },
+    );
+    source_blocks
+}
+
+fn global_release_source_hash(
+    release_id: i64,
+    repo_full_name: &str,
+    tag_name: &str,
+    name: Option<&str>,
+    body: Option<&str>,
+    kind: &str,
+    variant: &str,
+) -> String {
+    let title = name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(tag_name)
+        .to_owned();
+    global_source_hash_from_fields(
+        kind,
+        variant,
+        &release_id.to_string(),
+        format!("{repo_full_name}\n{tag_name}"),
+        title,
+        body.map(|value| value.replace("\r\n", "\n")),
+    )
+}
+
+fn global_announcement_source_hash(
+    discussion_key: &str,
+    repo_full_name: &str,
+    discussion_number: i64,
+    title: &str,
+    body: Option<&str>,
+    kind: &str,
+    variant: &str,
+) -> String {
+    global_source_hash_from_fields(
+        kind,
+        variant,
+        discussion_key,
+        announcement_translation_metadata_text(repo_full_name, Some(discussion_number)),
+        title.to_owned(),
+        body.map(|value| value.replace("\r\n", "\n")),
+    )
+}
+
+pub(crate) async fn global_release_request_item(
+    state: &AppState,
+    user_id: &str,
+    release_id: i64,
+    kind: &str,
+    producer_ref: &str,
+) -> Result<translations::TranslationRequestItemInput, ApiError> {
+    let row = sqlx::query_as::<_, GlobalReleaseSourceRow>(
+        r#"
+        SELECT r.repo_id, sr.repo_id AS starred_repo_id, r.html_url, r.tag_name, r.name, r.body
+        FROM repo_releases r
+        LEFT JOIN user_release_visible_repos sr
+          ON sr.user_id = ? AND sr.repo_id = r.repo_id
+        WHERE r.release_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(release_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "release not found"))?;
+
+    let locator = parse_release_locator_from_github_release_url(&row.html_url);
+    if row.starred_repo_id.is_none()
+        && !user_has_brief_access_to_release(state, user_id, release_id, locator.as_ref()).await?
+    {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "release not found",
+        ));
+    }
+
+    let title = row
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(row.tag_name.as_str())
+        .to_owned();
+    let body = row.body.unwrap_or_default().replace("\r\n", "\n");
+    let has_body = !body.trim().is_empty();
+    let repo_full_name = resolve_release_full_name(&row.html_url, row.repo_id);
+    let mut source_blocks = vec![
+        translations::TranslationSourceBlock {
+            slot: "metadata".to_owned(),
+            text: format!("{repo_full_name}\n{}", row.tag_name),
+        },
+        translations::TranslationSourceBlock {
+            slot: "title".to_owned(),
+            text: title,
+        },
+    ];
+    if has_body {
+        source_blocks.push(translations::TranslationSourceBlock {
+            slot: "body_markdown".to_owned(),
+            text: body.clone(),
+        });
+    }
+    let target_slots = if kind.ends_with("_detail") && has_body {
+        vec!["title_zh".to_owned(), "body_md".to_owned()]
+    } else if kind.ends_with("_detail") {
+        vec!["title_zh".to_owned()]
+    } else {
+        vec!["title_zh".to_owned(), "summary_md".to_owned()]
+    };
+    let variant = if kind.ends_with("_detail") {
+        "detail"
+    } else if kind.ends_with("_smart") {
+        "smart"
+    } else {
+        "summary"
+    };
+    Ok(translations::TranslationRequestItemInput {
+        producer_ref: producer_ref.to_owned(),
+        kind: kind.to_owned(),
+        variant: variant.to_owned(),
+        entity_id: release_id.to_string(),
+        target_lang: "zh-CN".to_owned(),
+        max_wait_ms: 60_000,
+        source_blocks: with_source_observed_at(source_blocks),
+        target_slots,
+    })
+}
+
+async fn submit_global_release(
+    state: &AppState,
+    user_id: &str,
+    release_id_raw: &str,
+    kind: &str,
+    producer_ref: &str,
+) -> Result<Response, ApiError> {
+    let release_id = parse_release_id_param(release_id_raw)?;
+    let item = global_release_request_item(state, user_id, release_id, kind, producer_ref).await?;
+    let (status, response) =
+        content_processing::submit_item(state, user_id, "async", &item).await?;
+    Ok((status, Json(response)).into_response())
+}
+
+async fn global_notification_request_item(
+    state: &AppState,
+    user_id: &str,
+    thread_id: &str,
+) -> Result<translations::TranslationRequestItemInput, ApiError> {
+    let thread_id = thread_id.trim();
+    if thread_id.is_empty() {
+        return Err(ApiError::bad_request("thread_id is required"));
+    }
+    // Authorization is user-scoped, but the global source identity is not. Pick
+    // a deterministic canonical row after checking access, and never include
+    // requester-specific notification fields in the shared source snapshot.
+    let authorized = sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(SELECT 1 FROM notifications WHERE user_id = ? AND thread_id = ?)",
+    )
+    .bind(user_id)
+    .bind(thread_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if authorized == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "notification not found",
+        ));
+    }
+    let row = sqlx::query_as::<_, NotificationBatchSourceRow>(
+        "SELECT thread_id, repo_full_name, subject_title, reason, subject_type FROM notifications WHERE thread_id = ? ORDER BY COALESCE(repo_full_name, ''), COALESCE(subject_title, ''), COALESCE(subject_type, ''), id LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "notification not found"))?;
+    let repo = row
+        .repo_full_name
+        .unwrap_or_else(|| "(unknown repo)".to_owned());
+    let title = row.subject_title.unwrap_or_else(|| "(no title)".to_owned());
+    let subject_type = row.subject_type.unwrap_or_default();
+    Ok(translations::TranslationRequestItemInput {
+        producer_ref: "api.translate_notification".to_owned(),
+        kind: "notification".to_owned(),
+        variant: "shared".to_owned(),
+        entity_id: row.thread_id,
+        target_lang: "zh-CN".to_owned(),
+        max_wait_ms: 60_000,
+        source_blocks: with_source_observed_at(global_notification_source_blocks(
+            &repo,
+            &title,
+            &subject_type,
+        )),
+        target_slots: vec!["title_zh".to_owned(), "summary_md".to_owned()],
+    })
+}
+
+fn global_notification_source_blocks(
+    repo: &str,
+    title: &str,
+    subject_type: &str,
+) -> Vec<translations::TranslationSourceBlock> {
+    vec![
+        translations::TranslationSourceBlock {
+            slot: "metadata".to_owned(),
+            text: format!("repo={repo}\nsubject_type={subject_type}"),
+        },
+        translations::TranslationSourceBlock {
+            slot: "title".to_owned(),
+            text: title.to_owned(),
+        },
+    ]
+}
+
+/// Build a global request item from the canonical server-side source.
+///
+/// The generic translation endpoint is intentionally not allowed to trust the
+/// caller-provided source blocks: a global projection is shared by all users,
+/// so both authorization and source freshness must be resolved here.
+pub(crate) async fn canonical_global_translation_item(
+    state: &AppState,
+    user_id: &str,
+    item: &translations::TranslationRequestItemInput,
+) -> Result<translations::TranslationRequestItemInput, ApiError> {
+    let mut canonical = match item.kind.as_str() {
+        "release_summary" | "release_smart" | "release_detail" => {
+            let release_id = parse_release_id_param(item.entity_id.as_str())?;
+            global_release_request_item(
+                state,
+                user_id,
+                release_id,
+                item.kind.as_str(),
+                item.producer_ref.as_str(),
+            )
+            .await?
+        }
+        "announcement_summary" | "announcement_smart" | "announcement_detail" => {
+            global_announcement_request_item(
+                state,
+                user_id,
+                item.entity_id.as_str(),
+                item.kind.as_str(),
+                item.producer_ref.as_str(),
+            )
+            .await?
+        }
+        "notification" | "notification_smart" => {
+            let mut notification =
+                global_notification_request_item(state, user_id, item.entity_id.as_str()).await?;
+            if item.kind == "notification_smart" {
+                notification.kind = "notification_smart".to_owned();
+                notification.variant = "smart".to_owned();
+            }
+            notification
+        }
+        _ => {
+            return Err(ApiError::bad_request(format!(
+                "unsupported translation kind: {}",
+                item.kind
+            )));
+        }
+    };
+    canonical.max_wait_ms = item.max_wait_ms;
+    canonical.producer_ref = item.producer_ref.trim().to_owned();
+    Ok(canonical)
+}
+
+fn global_result_to_translate_response(result: Value) -> TranslateResponse {
+    let status = result
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("queued")
+        .to_owned();
+    TranslateResponse {
+        lang: "zh-CN".to_owned(),
+        status,
+        title: result
+            .get("title_zh")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        summary: result
+            .get("body_md")
+            .or_else(|| result.get("summary_md"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }
+}
+
+async fn global_announcement_request_item(
+    state: &AppState,
+    user_id: &str,
+    discussion_key: &str,
+    kind: &str,
+    producer_ref: &str,
+) -> Result<translations::TranslationRequestItemInput, ApiError> {
+    let source =
+        resolve_announcement_detail_source_for_user(state, user_id, discussion_key).await?;
+    let body = source.body.unwrap_or_default().replace("\r\n", "\n");
+    let has_body = !body.trim().is_empty();
+    let mut source_blocks = vec![
+        translations::TranslationSourceBlock {
+            slot: "metadata".to_owned(),
+            text: announcement_translation_metadata_text(
+                source.repo_full_name.as_str(),
+                Some(source.discussion_number),
+            ),
+        },
+        translations::TranslationSourceBlock {
+            slot: "title".to_owned(),
+            text: source.title,
+        },
+    ];
+    if has_body {
+        source_blocks.push(translations::TranslationSourceBlock {
+            slot: "body_markdown".to_owned(),
+            text: body.clone(),
+        });
+    }
+    let variant = if kind.ends_with("_detail") {
+        "detail"
+    } else if kind.ends_with("_smart") {
+        "smart"
+    } else {
+        "summary"
+    };
+    Ok(translations::TranslationRequestItemInput {
+        producer_ref: producer_ref.to_owned(),
+        kind: kind.to_owned(),
+        variant: variant.to_owned(),
+        entity_id: announcement_discussion_key(
+            source.repo_full_name.as_str(),
+            source.discussion_number,
+        ),
+        target_lang: "zh-CN".to_owned(),
+        max_wait_ms: 60_000,
+        source_blocks: with_source_observed_at(source_blocks),
+        target_slots: if kind.ends_with("_smart") {
+            vec!["title_zh".to_owned(), "summary_md".to_owned()]
+        } else if !has_body {
+            vec!["title_zh".to_owned()]
+        } else {
+            vec!["title_zh".to_owned(), "body_md".to_owned()]
+        },
+    })
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -19628,6 +21055,12 @@ async fn upsert_translation_terminal_status(
     error_text: Option<&str>,
 ) -> Result<(), ApiError> {
     let now = chrono::Utc::now().to_rfc3339();
+    let (_lock, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "legacy_translation_terminal_status")
+        .await
+        .map_err(ApiError::internal)?;
+    translations::ensure_legacy_writer_transaction(&mut tx).await?;
     sqlx::query(
         r#"
         INSERT INTO ai_translations (
@@ -19658,9 +21091,10 @@ async fn upsert_translation_terminal_status(
     .bind(&now)
     .bind(&now)
     .bind(requested_at)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
     Ok(())
 }
 
@@ -19734,6 +21168,47 @@ pub async fn translate_releases_batch_for_user(
     user_id: &str,
     release_ids: &[i64],
 ) -> Result<TranslateBatchResponse, ApiError> {
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        let mut items = Vec::with_capacity(release_ids.len());
+        for release_id in release_ids {
+            let input = global_release_request_item(
+                state,
+                user_id,
+                *release_id,
+                "release_summary",
+                "api.translate_releases_batch",
+            )
+            .await?;
+            let (_, response) =
+                content_processing::submit_item(state, user_id, "async", &input).await?;
+            let result = response.result;
+            items.push(TranslateBatchItem {
+                id: input.entity_id,
+                lang: input.target_lang,
+                status: result
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("queued")
+                    .to_owned(),
+                title: result
+                    .get("title_zh")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                summary: result
+                    .get("summary_md")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                error: None,
+                failure_class: None,
+            });
+        }
+        return Ok(TranslateBatchResponse { items });
+    }
+    content_processing::ensure_legacy_writer(&state.pool).await?;
     let items = translate_releases_batch_internal(state, user_id, release_ids).await?;
     Ok(TranslateBatchResponse { items })
 }
@@ -20877,6 +22352,47 @@ pub async fn summarize_releases_smart_batch_for_user(
     user_id: &str,
     release_ids: &[i64],
 ) -> Result<TranslateBatchResponse, ApiError> {
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        let mut items = Vec::with_capacity(release_ids.len());
+        for release_id in release_ids {
+            let input = global_release_request_item(
+                state,
+                user_id,
+                *release_id,
+                "release_smart",
+                "api.summarize_releases_smart_batch",
+            )
+            .await?;
+            let (_, response) =
+                content_processing::submit_item(state, user_id, "async", &input).await?;
+            let result = response.result;
+            items.push(TranslateBatchItem {
+                id: input.entity_id,
+                lang: input.target_lang,
+                status: result
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("queued")
+                    .to_owned(),
+                title: result
+                    .get("title_zh")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                summary: result
+                    .get("summary_md")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                error: None,
+                failure_class: None,
+            });
+        }
+        return Ok(TranslateBatchResponse { items });
+    }
+    content_processing::ensure_legacy_writer(&state.pool).await?;
     let items = summarize_releases_smart_batch_internal(state, user_id, release_ids).await?;
     Ok(TranslateBatchResponse { items })
 }
@@ -21359,6 +22875,48 @@ pub async fn translate_releases_batch(
 ) -> Result<Json<TranslateBatchResponse>, ApiError> {
     let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let release_ids = parse_unique_release_ids(&req.release_ids, 60)?;
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        let mut items = Vec::with_capacity(release_ids.len());
+        for release_id in release_ids {
+            let input = global_release_request_item(
+                state.as_ref(),
+                &user_id,
+                release_id,
+                "release_summary",
+                "api.translate_releases_batch",
+            )
+            .await?;
+            let (status, response) =
+                content_processing::submit_item(state.as_ref(), &user_id, "async", &input).await?;
+            let response_status = response.status.clone();
+            let result = response.result;
+            items.push(TranslateBatchItem {
+                id: input.entity_id,
+                lang: input.target_lang,
+                status: if status == StatusCode::CONFLICT {
+                    "processing".to_owned()
+                } else {
+                    response_status
+                },
+                title: result
+                    .get("title_zh")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                summary: result
+                    .get("summary_md")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                error: None,
+                failure_class: None,
+            });
+        }
+        return Ok(Json(TranslateBatchResponse { items }));
+    }
+    content_processing::ensure_legacy_writer(&state.pool).await?;
     let items = run_with_api_llm_context(
         "api.translate_releases_batch",
         Some(user_id.clone()),
@@ -21379,6 +22937,38 @@ pub async fn translate_releases_batch_stream(
 ) -> Result<Response, ApiError> {
     let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let release_ids = parse_unique_release_ids(&req.release_ids, 60)?;
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        let mut responses = Vec::with_capacity(release_ids.len());
+        for release_id in release_ids {
+            let input = global_release_request_item(
+                state.as_ref(),
+                &user_id,
+                release_id,
+                "release_summary",
+                "api.translate_releases_batch_stream",
+            )
+            .await?;
+            let (_, response) =
+                content_processing::submit_item(state.as_ref(), &user_id, "stream", &input).await?;
+            responses.push(response);
+        }
+        let body = responses
+            .into_iter()
+            .map(|response| serde_json::to_string(&response).map(|line| format!("{line}\n")))
+            .collect::<Result<String, _>>()
+            .map_err(ApiError::internal)?;
+        let mut response = Response::new(Body::from(body));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
+        );
+        return Ok(response);
+    }
+    content_processing::ensure_legacy_writer(&state.pool).await?;
     let tracking_task = jobs::start_inline_task(
         state.as_ref(),
         jobs::NewTask {
@@ -21429,6 +23019,24 @@ pub async fn translate_release_for_user(
     user_id: &str,
     release_id_raw: &str,
 ) -> Result<TranslateResponse, ApiError> {
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        let release_id = parse_release_id_param(release_id_raw)?;
+        let input = global_release_request_item(
+            state,
+            user_id,
+            release_id,
+            "release_summary",
+            "api.translate_release",
+        )
+        .await?;
+        let (_, response) = content_processing::submit_item(state, user_id, "wait", &input).await?;
+        return Ok(global_result_to_translate_response(response.result));
+    }
+    content_processing::ensure_legacy_writer(&state.pool).await?;
     let release_id = parse_release_id_param(release_id_raw)?;
     let mut items = translate_releases_batch_internal(state, user_id, &[release_id]).await?;
     let Some(item) = items.pop() else {
@@ -21448,6 +23056,22 @@ pub async fn translate_release(
     let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let release_id = req.release_id.trim().to_owned();
     let mode = ReturnMode::from_query(&mode_query)?;
+
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        return submit_global_release(
+            state.as_ref(),
+            &user_id,
+            release_id.as_str(),
+            "release_summary",
+            "api.translate_release",
+        )
+        .await;
+    }
+    content_processing::ensure_legacy_writer(&state.pool).await?;
 
     if matches!(mode, ReturnMode::Sync) {
         let translated = run_with_api_llm_context(
@@ -21921,6 +23545,22 @@ pub async fn translate_release_detail(
     let release_id = req.release_id.trim().to_owned();
     let mode = ReturnMode::from_query(&mode_query)?;
 
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        return submit_global_release(
+            state.as_ref(),
+            &user_id,
+            release_id.as_str(),
+            "release_detail",
+            "api.translate_release_detail",
+        )
+        .await;
+    }
+    content_processing::ensure_legacy_writer(&state.pool).await?;
+
     if matches!(mode, ReturnMode::Sync) {
         let translated = run_with_api_llm_context(
             "api.translate_release_detail.sync",
@@ -21957,6 +23597,24 @@ pub async fn translate_release_detail_for_user(
     user_id: &str,
     release_id_raw: &str,
 ) -> Result<TranslateResponse, ApiError> {
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        let release_id = parse_release_id_param(release_id_raw)?;
+        let input = global_release_request_item(
+            state,
+            user_id,
+            release_id,
+            "release_detail",
+            "api.translate_release_detail",
+        )
+        .await?;
+        let (_, response) = content_processing::submit_item(state, user_id, "wait", &input).await?;
+        return Ok(global_result_to_translate_response(response.result));
+    }
+    content_processing::ensure_legacy_writer(&state.pool).await?;
     let release_id = parse_release_id_param(release_id_raw)?;
     let mut items = translate_release_detail_batch_internal(state, user_id, &[release_id]).await?;
     let Some(item) = items.pop() else {
@@ -22021,6 +23679,44 @@ pub async fn translate_release_detail_batch(
 ) -> Result<Json<TranslateBatchResponse>, ApiError> {
     let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let release_ids = parse_unique_release_ids(&req.release_ids, 20)?;
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        let mut items = Vec::with_capacity(release_ids.len());
+        for release_id in release_ids {
+            let input = global_release_request_item(
+                state.as_ref(),
+                &user_id,
+                release_id,
+                "release_detail",
+                "api.translate_release_detail_batch",
+            )
+            .await?;
+            let (_, response) =
+                content_processing::submit_item(state.as_ref(), &user_id, "async", &input).await?;
+            let response_status = response.status.clone();
+            let result = response.result;
+            items.push(TranslateBatchItem {
+                id: input.entity_id,
+                lang: input.target_lang,
+                status: response_status,
+                title: result
+                    .get("title_zh")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                summary: result
+                    .get("body_md")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                error: None,
+                failure_class: None,
+            });
+        }
+        return Ok(Json(TranslateBatchResponse { items }));
+    }
+    content_processing::ensure_legacy_writer(&state.pool).await?;
     let items = run_with_api_llm_context(
         "api.translate_release_detail_batch",
         Some(user_id.clone()),
@@ -22266,6 +23962,23 @@ pub async fn translate_announcement_detail_for_user(
     user_id: &str,
     discussion_key_raw: &str,
 ) -> Result<TranslateResponse, ApiError> {
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        let item = global_announcement_request_item(
+            state,
+            user_id,
+            discussion_key_raw,
+            "announcement_detail",
+            "api.translate_announcement_detail",
+        )
+        .await?;
+        let (_, response) = content_processing::submit_item(state, user_id, "wait", &item).await?;
+        return Ok(global_result_to_translate_response(response.result));
+    }
+    content_processing::ensure_legacy_writer(&state.pool).await?;
     translate_announcement_detail_internal(state, user_id, discussion_key_raw).await
 }
 
@@ -22459,6 +24172,23 @@ pub async fn summarize_announcement_smart_for_user(
     user_id: &str,
     discussion_key_raw: &str,
 ) -> Result<TranslateResponse, ApiError> {
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        let item = global_announcement_request_item(
+            state,
+            user_id,
+            discussion_key_raw,
+            "announcement_smart",
+            "api.summarize_announcement_smart",
+        )
+        .await?;
+        let (_, response) = content_processing::submit_item(state, user_id, "wait", &item).await?;
+        return Ok(global_result_to_translate_response(response.result));
+    }
+    content_processing::ensure_legacy_writer(&state.pool).await?;
     summarize_announcement_smart_internal(state, user_id, discussion_key_raw).await
 }
 
@@ -22978,6 +24708,38 @@ pub async fn translate_notifications_batch(
 ) -> Result<Json<TranslateBatchResponse>, ApiError> {
     let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let thread_ids = parse_unique_thread_ids(&req.thread_ids, 60)?;
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        let mut items = Vec::with_capacity(thread_ids.len());
+        for thread_id in thread_ids {
+            let input =
+                global_notification_request_item(state.as_ref(), &user_id, &thread_id).await?;
+            let (_, response) =
+                content_processing::submit_item(state.as_ref(), &user_id, "async", &input).await?;
+            let response_status = response.status.clone();
+            let result = response.result;
+            items.push(TranslateBatchItem {
+                id: input.entity_id,
+                lang: input.target_lang,
+                status: response_status,
+                title: result
+                    .get("title_zh")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                summary: result
+                    .get("summary_md")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                error: None,
+                failure_class: None,
+            });
+        }
+        return Ok(Json(TranslateBatchResponse { items }));
+    }
+    content_processing::ensure_legacy_writer(&state.pool).await?;
     let items = run_with_api_llm_context(
         "api.translate_notifications_batch",
         Some(user_id.clone()),
@@ -23000,6 +24762,36 @@ pub async fn translate_notification(
     let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
     let thread_id = req.thread_id.trim().to_owned();
     let mode = ReturnMode::from_query(&mode_query)?;
+
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        let input = global_notification_request_item(state.as_ref(), &user_id, &thread_id).await?;
+        let (status, response) = content_processing::submit_item(
+            state.as_ref(),
+            &user_id,
+            match mode {
+                ReturnMode::Sync => "wait",
+                ReturnMode::TaskId => "async",
+                ReturnMode::Sse => "stream",
+            },
+            &input,
+        )
+        .await?;
+        if matches!(mode, ReturnMode::Sse) {
+            return Ok(
+                translations::stream_global_translation_request_response_for_api(
+                    state,
+                    user_id,
+                    response.request_id,
+                ),
+            );
+        }
+        return Ok((status, Json(response)).into_response());
+    }
+    content_processing::ensure_legacy_writer(&state.pool).await?;
 
     if matches!(mode, ReturnMode::Sync) {
         let translated = run_with_api_llm_context(
@@ -23037,6 +24829,18 @@ pub async fn translate_notification_for_user(
     if thread_id.is_empty() {
         return Err(ApiError::bad_request("thread_id is required"));
     }
+
+    if content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global
+    {
+        let input = global_notification_request_item(state, &user_id, &thread_id).await?;
+        let (_, response) =
+            content_processing::submit_item(state, &user_id, "wait", &input).await?;
+        return Ok(global_result_to_translate_response(response.result));
+    }
+    content_processing::ensure_legacy_writer(&state.pool).await?;
 
     let mut items =
         translate_notifications_batch_internal(state, &user_id, std::slice::from_ref(&thread_id))
@@ -23241,6 +25045,31 @@ pub(crate) async fn ensure_owned_repo_visual_columns(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn global_notification_identity_excludes_requester_specific_reason() {
+        let source_blocks =
+            super::global_notification_source_blocks("octo/demo", "Issue updated", "Issue");
+        let first = crate::translations::TranslationRequestItemInput {
+            producer_ref: "test-a".to_owned(),
+            kind: "notification".to_owned(),
+            variant: "shared".to_owned(),
+            entity_id: "thread-1".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 0,
+            source_blocks: source_blocks.clone(),
+            target_slots: vec!["title_zh".to_owned(), "summary_md".to_owned()],
+        };
+        let second = crate::translations::TranslationRequestItemInput {
+            producer_ref: "test-b".to_owned(),
+            source_blocks,
+            ..first.clone()
+        };
+        assert_eq!(
+            crate::content_processing::source_hash_for_item(&first),
+            crate::content_processing::source_hash_for_item(&second)
+        );
+    }
+
     #[test]
     fn dashboard_readable_section_cursor_is_opaque_and_stable() {
         let encoded = encode_dashboard_readable_section_cursor("2026-04-30");

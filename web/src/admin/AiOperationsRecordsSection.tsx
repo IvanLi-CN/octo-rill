@@ -244,8 +244,16 @@ function statusLabel(status: string) {
 			return "未开始";
 		case "historical_unknown":
 			return "历史未记录";
+		case "legacy_cached":
+			return "旧缓存";
+		case "legacy_conflict":
+			return "旧事实冲突";
 		case "queued":
 			return "排队中";
+		case "deferred_provider":
+			return "提供方暂缓";
+		case "blocked_config":
+			return "配置阻塞";
 		case "batched":
 			return "已批处理";
 		case "running":
@@ -255,6 +263,8 @@ function statusLabel(status: string) {
 		case "completed":
 		case "ready":
 			return "已完成";
+		case "not_applicable":
+			return "不适用";
 		case "failed":
 		case "error":
 			return "失败";
@@ -262,6 +272,10 @@ function statusLabel(status: string) {
 			return "缺少结果";
 		case "disabled":
 			return "已停用";
+		case "cancelled":
+			return "已取消";
+		case "superseded":
+			return "已替代";
 		case "retry_scheduled":
 			return "已安排重试";
 		case "not_recorded":
@@ -280,6 +294,13 @@ const STATUS_LABELS: Record<AiRecordStatus, string> = {
 	missing: "缺少结果",
 	disabled: "已停用",
 	historical_unknown: "历史未记录",
+	legacy_cached: "旧缓存",
+	legacy_conflict: "旧事实冲突",
+	deferred_provider: "提供方暂缓",
+	blocked_config: "配置阻塞",
+	cancelled: "已取消",
+	superseded: "已替代",
+	not_applicable: "不适用",
 };
 
 function StatusFilterMenu({
@@ -310,7 +331,10 @@ function StatusFilterMenu({
 					<ChevronDown aria-hidden="true" className="size-4 shrink-0" />
 				</Button>
 			</PopoverTrigger>
-			<PopoverContent align="start" className="space-y-2 p-2">
+			<PopoverContent
+				align="start"
+				className="max-h-[min(70vh,32rem)] space-y-2 overflow-y-auto p-2"
+			>
 				<div className="flex items-center justify-between px-2 py-1">
 					<span className="font-medium text-sm">{label}状态</span>
 					{value.length > 0 ? (
@@ -364,10 +388,10 @@ function CollectionEmptyState({
 	const isBrief = tab === "brief";
 	const title = hasFilters
 		? "没有符合条件的记录"
-		: `当前时间范围暂无${isBrief ? "日报" : "采集记录"}`;
+		: `当前时间范围暂无${isBrief ? "日报" : tab === "notification" ? "通知" : "采集记录"}`;
 	const description = hasFilters
 		? "调整翻译、润色或尝试次数筛选后再试一次。"
-		: `扩大时间范围或稍后刷新，${isBrief ? "日报" : "采集记录"}会在有新结果时显示在这里。`;
+		: `扩大时间范围或稍后刷新，${isBrief ? "日报" : tab === "notification" ? "通知" : "采集记录"}会在有新结果时显示在这里。`;
 
 	return (
 		<div
@@ -416,6 +440,7 @@ function statusTone(status: string) {
 		case "queued":
 		case "batched":
 		case "retry_scheduled":
+		case "deferred_provider":
 			return "border-amber-300 bg-amber-100/90 text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100";
 		case "completed":
 		case "succeeded":
@@ -472,6 +497,25 @@ function TaskSummaryHeader({ label }: { label: string }) {
 	);
 }
 
+function EvidenceLines({ summary }: { summary: AdminCollectionTaskSummary }) {
+	const entries = [
+		["全局工作", summary.global_work],
+		["结果投影", summary.result_projection],
+		["旧事实", summary.legacy_evidence],
+	] as const;
+	return entries.some(([, evidence]) => evidence) ? (
+		<div className="space-y-0.5 text-[11px] text-muted-foreground">
+			{entries.map(([label, evidence]) =>
+				evidence ? (
+					<span key={label} className="block truncate">
+						{label}：{evidence.status}
+					</span>
+				) : null,
+			)}
+		</div>
+	) : null;
+}
+
 function TaskSummaryCell({ summary }: { summary: AdminCollectionTaskSummary }) {
 	return (
 		<TableCell className="whitespace-normal">
@@ -487,6 +531,7 @@ function TaskSummaryCell({ summary }: { summary: AdminCollectionTaskSummary }) {
 					<span>{formatDateTime(summary.last_attempt_at, "未尝试")}</span>
 					<span>{formatDateTime(summary.finished_at, "未完成")}</span>
 				</div>
+				<EvidenceLines summary={summary} />
 			</div>
 		</TableCell>
 	);
@@ -568,7 +613,9 @@ function CollectionTable({
 		? "日报日期"
 		: tab === "release"
 			? "Release 标题"
-			: "公告标题";
+			: tab === "notification"
+				? "通知标题"
+				: "公告标题";
 	const sourceHeading = isBrief ? "生成时间" : "来源时间";
 	return (
 		<div className="hidden min-[1180px]:block">
@@ -593,7 +640,11 @@ function CollectionTable({
 								<span className="block">{sourceHeading}</span>
 								{!isBrief ? (
 									<span className="text-muted-foreground block font-mono text-xs font-medium">
-										{tab === "release" ? "发布 · 发现" : "发生 · 发现"}
+										{tab === "release"
+											? "发布 · 发现"
+											: tab === "notification"
+												? "更新 · 发现"
+												: "发生 · 发现"}
 									</span>
 								) : null}
 							</div>
@@ -680,6 +731,7 @@ function CompactTask({
 				重试 {summary.retry_count} · 上次{" "}
 				{formatDateTime(summary.last_attempt_at, "未尝试")}
 			</p>
+			<EvidenceLines summary={summary} />
 		</div>
 	);
 }
@@ -708,7 +760,13 @@ function CompactRecordList({
 					</div>
 					<div className="text-muted-foreground mt-3 grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs">
 						<span>
-							{tab === "brief" ? "生成" : tab === "release" ? "发布" : "发生"}{" "}
+							{tab === "brief"
+								? "生成"
+								: tab === "release"
+									? "发布"
+									: tab === "notification"
+										? "更新"
+										: "发生"}{" "}
 							{formatDateTime(recordTime(item), "未记录")}
 						</span>
 						{tab !== "brief" ? (
@@ -750,6 +808,7 @@ function ProcessingSummary({
 				</span>
 				<span>完成 {formatDateTime(summary.finished_at, "未完成")}</span>
 			</div>
+			<EvidenceLines summary={summary} />
 		</div>
 	);
 }
@@ -851,7 +910,7 @@ function RecordDetail({
 				<p className="text-muted-foreground text-xs">
 					{record.kind === "brief"
 						? `生成：${formatDateTime(record.generated_at, "历史未记录")}`
-						: `${record.kind === "release" ? "发布" : "发生"}：${formatDateTime(record.occurred_at, "未记录")} · 发现：${formatDateTime(record.detected_at, "未知")}`}
+						: `${record.kind === "release" ? "发布" : record.kind === "notification" ? "更新" : "发生"}：${formatDateTime(record.occurred_at, "未记录")} · 发现：${formatDateTime(record.detected_at, "未知")}`}
 				</p>
 			</div>
 			{record.translation ? (
@@ -1248,12 +1307,15 @@ export function AiOperationsRecordsSection({
 								commitFilters({ kind: nextTab });
 							}}
 						>
-							<TabsList className="grid w-full grid-cols-3 sm:inline-grid sm:w-fit">
+							<TabsList className="grid w-full grid-cols-4 sm:inline-grid sm:w-fit">
 								<TabsTrigger className="sm:min-w-24" value="release">
 									Release
 								</TabsTrigger>
 								<TabsTrigger className="sm:min-w-24" value="announcement">
 									公告
+								</TabsTrigger>
+								<TabsTrigger className="sm:min-w-24" value="notification">
+									通知
 								</TabsTrigger>
 								<TabsTrigger className="sm:min-w-24" value="brief">
 									日报

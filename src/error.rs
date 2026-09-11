@@ -3,6 +3,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use serde_json::Value;
 use serde_json::json;
 
 #[derive(Debug)]
@@ -11,6 +12,7 @@ pub struct ApiError {
     code: &'static str,
     message: String,
     failure_class: Option<&'static str>,
+    details: Option<Value>,
 }
 
 impl ApiError {
@@ -20,7 +22,13 @@ impl ApiError {
             code,
             message: message.into(),
             failure_class: None,
+            details: None,
         }
+    }
+
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
     }
 
     pub fn from_llm_error(err: anyhow::Error) -> Self {
@@ -30,6 +38,7 @@ impl ApiError {
                 code: "llm_error",
                 message: class.safe_message().to_owned(),
                 failure_class: Some(class.as_str()),
+                details: None,
             };
         }
         Self::internal(err)
@@ -37,6 +46,11 @@ impl ApiError {
 
     pub fn code(&self) -> &'static str {
         self.code
+    }
+
+    #[cfg(test)]
+    pub fn status(&self) -> StatusCode {
+        self.status
     }
 
     pub fn failure_class(&self) -> Option<&'static str> {
@@ -66,17 +80,21 @@ impl std::error::Error for ApiError {}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(json!({
-                "ok": false,
-                "error": {
-                    "code": self.code,
-                    "message": self.message,
-                    "failure_class": self.failure_class,
-                }
-            })),
-        )
-            .into_response()
+        let mut body = json!({
+            "ok": false,
+            "error": {
+                "code": self.code,
+                "message": self.message,
+                "failure_class": self.failure_class,
+            },
+        });
+        if let Some(details) = self.details.and_then(|value| value.as_object().cloned())
+            && let Some(body_object) = body.as_object_mut()
+        {
+            for (key, value) in details {
+                body_object.insert(key, value);
+            }
+        }
+        (self.status, Json(body)).into_response()
     }
 }

@@ -1,5 +1,7 @@
 # DB contracts
 
+> Historical contract for the delivered `0019` request-table rebuild. The user-scoped tables and destructive migration described here are not the current global content-processing contract; see [global-translation-and-polish](../../global-translation-and-polish/contracts/db.md).
+
 ## Rebuilt tables
 
 ### `translation_requests`

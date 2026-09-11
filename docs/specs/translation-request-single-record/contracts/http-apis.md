@@ -1,5 +1,7 @@
 # HTTP API contracts
 
+> Historical request contract for the delivered single-record scheduler. Current request ownership, active-retry `409`, cutover `503`, and global status semantics are defined by [global-translation-and-polish](../../global-translation-and-polish/contracts/http-apis.md).
+
 ## `POST /api/translate/requests`
 
 ### Single request body

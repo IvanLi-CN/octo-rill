@@ -6,6 +6,7 @@ mod api_keys;
 mod auth;
 mod briefs;
 mod config;
+mod content_processing;
 mod crypto;
 mod error;
 mod github;

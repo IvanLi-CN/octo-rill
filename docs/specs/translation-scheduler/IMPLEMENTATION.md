@@ -12,6 +12,8 @@
 
 ## 当前实现说明
 
+当前实现中的用户范围工作复用和缓存写入仅是全局化改造的迁移起点；它们的替换合同由[全局翻译与润色工作模型](../global-translation-and-polish/SPEC.md)拥有。本主题继续保留批处理、租约、恢复和尝试审计的实现说明。
+
 - 统一翻译调度器已落地：请求、去重 work item、batch 与 `llm_calls.parent_translation_batch_id` 已入库。
 - 新生产者入口已切到 `POST/GET /api/translate/requests*`，旧翻译接口仍保留兼容 shim 并复用同一翻译核心，避免前后端滚动发布时缓存 bundle 立刻失效。
 - Feed 自动翻译改为 `stream` 请求，Release Detail 改为 `wait` 请求，管理员在 `/admin/jobs` 可查看“翻译调度”标签页与批次/LLM 追链。

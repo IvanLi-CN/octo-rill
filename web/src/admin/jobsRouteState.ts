@@ -36,11 +36,18 @@ export const AI_RECORD_STATUS_VALUES = [
 	"missing",
 	"disabled",
 	"historical_unknown",
+	"legacy_cached",
+	"legacy_conflict",
+	"deferred_provider",
+	"blocked_config",
+	"cancelled",
+	"superseded",
+	"not_applicable",
 ] as const;
 export type AiRecordStatus = (typeof AI_RECORD_STATUS_VALUES)[number];
 export type AiRecordTimePreset = "24h" | "7d" | "30d" | "custom";
 export type AiRecordRouteFilters = {
-	kind: "release" | "announcement" | "brief";
+	kind: "release" | "announcement" | "notification" | "brief";
 	preset: AiRecordTimePreset;
 	from: string;
 	before: string;
@@ -94,7 +101,7 @@ export type TaskDrawerRoute = {
 };
 
 export type AiRecordDetailRoute = {
-	kind: "release" | "announcement" | "brief";
+	kind: "release" | "announcement" | "notification" | "brief";
 	id: string;
 	attemptId?: string | null;
 	llmCallId?: string | null;
@@ -151,7 +158,7 @@ const TASK_DRAWER_ROUTE_PATTERN =
 const SUBSCRIPTION_DETAIL_ROUTE_PATTERN =
 	/^\/admin\/jobs\/subscriptions\/([^/]+?)$/;
 const AI_RECORD_DETAIL_ROUTE_PATTERN =
-	/^\/admin\/jobs\/ai-records\/(release|announcement|brief)\/([^/]+?)$/;
+	/^\/admin\/jobs\/ai-records\/(release|announcement|notification|brief)\/([^/]+?)$/;
 
 function normalizePathname(pathname: string) {
 	return pathname.replace(/\/+$/, "") || "/";
@@ -222,7 +229,9 @@ export function parseAiRecordRouteFilters(
 	>,
 ): AiRecordRouteFilters {
 	const kind =
-		search.ai_kind === "announcement" || search.ai_kind === "brief"
+		search.ai_kind === "announcement" ||
+		search.ai_kind === "notification" ||
+		search.ai_kind === "brief"
 			? search.ai_kind
 			: "release";
 	const preset: AiRecordTimePreset =

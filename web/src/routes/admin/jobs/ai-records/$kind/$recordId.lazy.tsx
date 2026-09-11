@@ -14,7 +14,9 @@ function AdminJobsAiRecordDetailRouteComponent() {
 	const search = routeApi.useSearch();
 	const params = routeApi.useParams();
 	const kind =
-		params.kind === "announcement" || params.kind === "brief"
+		params.kind === "announcement" ||
+		params.kind === "notification" ||
+		params.kind === "brief"
 			? params.kind
 			: "release";
 
