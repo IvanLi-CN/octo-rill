@@ -899,6 +899,7 @@ async fn load_task_summaries(
     kind: CollectionRecordKind,
     entity_ids: &[String],
     coverage: &HashMap<(String, String), String>,
+    global_mode: bool,
 ) -> Result<HashMap<String, TaskSummaries>, ApiError> {
     let Some((translation_kind, polish_kind)) = kind.task_kinds() else {
         return Ok(HashMap::new());
@@ -906,10 +907,6 @@ async fn load_task_summaries(
     if entity_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let global_mode = content_processing::current_mode(&state.pool)
-        .await
-        .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global;
     let rows = if global_mode {
         Vec::new()
     } else {
@@ -1353,7 +1350,8 @@ fn collection_query_sql(
                             PARTITION BY w.canonical_resource_id,
                                 CASE WHEN w.pipeline = 'polishing' THEN 'polish' ELSE 'translation' END
                             ORDER BY
-                                datetime(w.created_at) DESC,
+                                julianday(w.created_at) DESC,
+                                w.created_at DESC,
                                 CASE w.status
                                     WHEN 'queued' THEN 0
                                     WHEN 'running' THEN 1
@@ -1364,7 +1362,8 @@ fn collection_query_sql(
                                     ELSE 5
                                 END,
                                 CASE WHEN w.pipeline = 'translation' AND w.variant = 'detail' THEN 0 ELSE 1 END,
-                                datetime(w.updated_at) DESC,
+                                julianday(w.updated_at) DESC,
+                                w.updated_at DESC,
                                 w.id DESC
                         ) AS row_rank
                     FROM content_work_items w
@@ -1573,18 +1572,18 @@ async fn list_collection_page(
 }
 
 async fn run_bounded_collection_read<F, T>(
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    permit: tokio::sync::OwnedSemaphorePermit,
     read: F,
 ) -> Result<T, ApiError>
 where
     F: std::future::Future<Output = Result<T, ApiError>> + Send + 'static,
     T: Send + 'static,
 {
-    run_bounded_collection_read_with_budget(_permit, read, Duration::from_secs(5)).await
+    run_bounded_collection_read_with_budget(permit, read, Duration::from_secs(5)).await
 }
 
 async fn run_bounded_collection_read_with_budget<F, T>(
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    permit: tokio::sync::OwnedSemaphorePermit,
     read: F,
     budget: Duration,
 ) -> Result<T, ApiError>
@@ -1592,19 +1591,24 @@ where
     F: std::future::Future<Output = Result<T, ApiError>> + Send + 'static,
     T: Send + 'static,
 {
-    let mut read_handle = tokio::spawn(read);
-    match tokio::time::timeout(budget, &mut read_handle).await {
-        Ok(joined) => joined.map_err(ApiError::internal)?,
-        Err(_) => {
-            read_handle.abort();
-            let _ = read_handle.await;
-            Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "admin_collection_records_timeout",
-                "admin collection records read timed out",
-            )
-            .with_retry_after(1))
-        }
+    let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = match tokio::spawn(read).await {
+            Ok(result) => result,
+            Err(error) => Err(ApiError::internal(error)),
+        };
+        let _ = result_sender.send(result);
+        drop(permit);
+    });
+    match tokio::time::timeout(budget, result_receiver).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(ApiError::internal("collection read supervisor stopped")),
+        Err(_) => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admin_collection_records_timeout",
+            "admin collection records read timed out",
+        )
+        .with_retry_after(1)),
     }
 }
 
@@ -1785,7 +1789,7 @@ pub async fn admin_list_collection_records(
         let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
         let coverage = load_processing_coverage(&read_state.pool, kind, &ids).await?;
         let task_summaries =
-            load_task_summaries(read_state.as_ref(), kind, &ids, &coverage).await?;
+            load_task_summaries(read_state.as_ref(), kind, &ids, &coverage, global_mode).await?;
         let brief_summaries = if kind == CollectionRecordKind::Brief {
             load_brief_summaries(read_state.as_ref(), &ids, &coverage).await?
         } else {
@@ -2271,7 +2275,12 @@ pub async fn admin_get_collection_record_detail(
     let source = load_source_record(&state.pool, kind, &record_id).await?;
     let ids = vec![source.id.clone()];
     let coverage = load_processing_coverage(&state.pool, kind, &ids).await?;
-    let task_summaries = load_task_summaries(state.as_ref(), kind, &ids, &coverage).await?;
+    let global_mode = content_processing::current_mode(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        == content_processing::ContentProcessingMode::Global;
+    let task_summaries =
+        load_task_summaries(state.as_ref(), kind, &ids, &coverage, global_mode).await?;
     let brief_summaries = if kind == CollectionRecordKind::Brief {
         load_brief_summaries(state.as_ref(), &ids, &coverage).await?
     } else {
@@ -2282,10 +2291,7 @@ pub async fn admin_get_collection_record_detail(
         load_brief_attempts(state.as_ref(), &record.id).await?
     } else {
         let global = load_global_attempts(state.as_ref(), kind, &record.id).await?;
-        let mode = content_processing::current_mode(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-        if global.is_empty() && mode == content_processing::ContentProcessingMode::Legacy {
+        if global.is_empty() && !global_mode {
             load_task_attempts(
                 state.as_ref(),
                 &load_record_tasks(state.as_ref(), kind, &record.id).await?,
@@ -2785,6 +2791,8 @@ mod tests {
         let response = axum::response::IntoResponse::into_response(error);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
+        assert!(gate.try_acquire().is_err());
+        tokio::time::sleep(Duration::from_millis(75)).await;
         assert!(gate.try_acquire().is_ok());
     }
 

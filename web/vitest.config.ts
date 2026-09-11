@@ -23,6 +23,7 @@ export default defineConfig((env) =>
 									"readable-initial-loading",
 									"repo-identity-overflow",
 									"content-projection-retention",
+									"admin-collection-read-budget",
 								],
 								exclude: [],
 								skip: [],

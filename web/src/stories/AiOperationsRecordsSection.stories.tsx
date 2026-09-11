@@ -246,11 +246,14 @@ export const FailedResponseWithDiagnostics: Story = {
 			const originalFetch = useRef(window.fetch);
 			const restoreFetch = originalFetch.current;
 			window.fetch = async (input, init) => {
+				const requestInput = input instanceof Request ? input.url : input;
 				const url = new URL(
-					typeof input === "string" ? input : input.toString(),
+					typeof requestInput === "string"
+						? requestInput
+						: requestInput.toString(),
 					window.location.origin,
 				);
-				if (url.pathname.endsWith("/ai-records/release")) {
+				if (url.pathname.includes("/ai-records/release")) {
 					return new Response(JSON.stringify(listResponse), { status: 200 });
 				}
 				if (url.pathname.endsWith("/ai-records/release/383114065")) {
@@ -298,11 +301,14 @@ export const GlobalEvidenceOverview: Story = {
 			const originalFetch = useRef(window.fetch);
 			const restoreFetch = originalFetch.current;
 			window.fetch = async (input, init) => {
+				const requestInput = input instanceof Request ? input.url : input;
 				const url = new URL(
-					typeof input === "string" ? input : input.toString(),
+					typeof requestInput === "string"
+						? requestInput
+						: requestInput.toString(),
 					window.location.origin,
 				);
-				if (url.pathname.endsWith("/ai-records/release")) {
+				if (url.pathname.includes("/ai-records/release")) {
 					return new Response(JSON.stringify(listResponse), { status: 200 });
 				}
 				if (url.pathname.endsWith("/ai-records/release/383114065")) {
@@ -349,11 +355,14 @@ export const ExpiredDiagnosticEvidence: Story = {
 			const originalFetch = useRef(window.fetch);
 			const restoreFetch = originalFetch.current;
 			window.fetch = async (input, init) => {
+				const requestInput = input instanceof Request ? input.url : input;
 				const url = new URL(
-					typeof input === "string" ? input : input.toString(),
+					typeof requestInput === "string"
+						? requestInput
+						: requestInput.toString(),
 					window.location.origin,
 				);
-				if (url.pathname.endsWith("/ai-records/release")) {
+				if (url.pathname.includes("/ai-records/release")) {
 					return new Response(
 						JSON.stringify({
 							...listResponse,
@@ -393,6 +402,7 @@ export const ExpiredDiagnosticEvidence: Story = {
 };
 
 export const BusyRead: Story = {
+	tags: ["admin-collection-read-budget"],
 	args: {
 		detailRoute: null,
 		onFiltersChange: () => undefined,
@@ -406,11 +416,14 @@ export const BusyRead: Story = {
 			const originalFetch = useRef(window.fetch);
 			const restoreFetch = originalFetch.current;
 			window.fetch = async (input, init) => {
+				const requestInput = input instanceof Request ? input.url : input;
 				const url = new URL(
-					typeof input === "string" ? input : input.toString(),
+					typeof requestInput === "string"
+						? requestInput
+						: requestInput.toString(),
 					window.location.origin,
 				);
-				if (url.pathname.endsWith("/ai-records/release")) {
+				if (url.pathname.includes("/ai-records/release")) {
 					return new Response(
 						JSON.stringify({
 							ok: false,
@@ -443,13 +456,16 @@ export const BusyRead: Story = {
 		},
 	],
 	play: async ({ canvasElement }) => {
-		await expect(
-			within(canvasElement).getByText("读取暂时繁忙，请稍后刷新。"),
-		).toBeVisible();
+		await waitFor(() =>
+			expect(
+				within(canvasElement).getByText("读取暂时繁忙，请稍后刷新。"),
+			).toBeVisible(),
+		);
 	},
 };
 
 export const CancelsStaleRead: Story = {
+	tags: ["admin-collection-read-budget"],
 	args: {
 		detailRoute: null,
 		onFiltersChange: () => undefined,
@@ -466,11 +482,14 @@ export const CancelsStaleRead: Story = {
 				window as Window & { __adminCollectionAbortCount?: number }
 			).__adminCollectionAbortCount = 0;
 			window.fetch = async (input, init) => {
+				const requestInput = input instanceof Request ? input.url : input;
 				const url = new URL(
-					typeof input === "string" ? input : input.toString(),
+					typeof requestInput === "string"
+						? requestInput
+						: requestInput.toString(),
 					window.location.origin,
 				);
-				if (url.pathname.endsWith("/ai-records/release")) {
+				if (url.pathname.includes("/ai-records/release")) {
 					return await new Promise<Response>((_resolve, reject) => {
 						init?.signal?.addEventListener("abort", () => {
 							const target = window as Window & {
