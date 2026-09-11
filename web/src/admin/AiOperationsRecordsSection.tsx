@@ -121,7 +121,7 @@ function CollectionReadErrorState({
 }) {
 	return (
 		<div
-			className="flex min-h-56 flex-col gap-4 rounded-xl border border-destructive/30 bg-destructive/[0.06] p-5 sm:flex-row sm:items-start sm:p-6"
+			className="flex flex-col gap-4 rounded-xl border border-destructive/30 bg-destructive/[0.06] p-5 sm:flex-row sm:items-start sm:p-6"
 			role="alert"
 			aria-live="polite"
 		>
@@ -138,7 +138,13 @@ function CollectionReadErrorState({
 					</p>
 				</div>
 				<div className="flex flex-wrap items-center gap-3">
-					<Button type="button" onClick={onRetry}>
+					<Button
+						type="button"
+						variant="outline"
+						size="sm"
+						className="border-destructive/35 bg-background/80 text-destructive hover:bg-destructive/10 hover:text-destructive"
+						onClick={onRetry}
+					>
 						<RefreshCw className="size-4" aria-hidden="true" />
 						刷新记录
 					</Button>
