@@ -2064,10 +2064,12 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 			type TestWindow = Window & {
 				__postContentReadableSkeletonMounts?: number;
 				__taskEventSourceCount?: number;
+				__taskEventDeliveries?: string[];
 			};
 			const state = window as TestWindow;
 			state.__postContentReadableSkeletonMounts = 0;
 			state.__taskEventSourceCount = 0;
+			state.__taskEventDeliveries = [];
 			let contentSeen = false;
 			let skeletonVisible = false;
 			const contentReadyCallbacks: Array<() => void> = [];
@@ -2108,12 +2110,14 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 			const taskEventPlan = [
 				{
 					index: 0,
+					id: "task-event-0",
 					delay: 500,
 					type: "task.running",
 					payload: { task_id: taskId, status: "running" },
 				},
 				{
 					index: 1,
+					id: "task-event-1",
 					delay: 1200,
 					type: "task.progress",
 					payload: {
@@ -2124,6 +2128,7 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 				},
 				{
 					index: 2,
+					id: "task-event-2",
 					delay: 2600,
 					type: "task.completed",
 					payload: { task_id: taskId, status: "succeeded" },
@@ -2171,7 +2176,11 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 											emittedTaskEvents.add(taskEvent.index);
 										}
 										const emit = () =>
-											this.dispatch(taskEvent.type, taskEvent.payload);
+											this.dispatch(
+												taskEvent.type,
+												taskEvent.payload,
+												taskEvent.id,
+											);
 										if (taskEvent.index === 2) {
 											console.log("readable-sync-task-completed");
 										}
@@ -2219,10 +2228,12 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 					this.timers = [];
 				}
 
-				private dispatch(type: string, payload: unknown) {
+				private dispatch(type: string, payload: unknown, lastEventId: string) {
 					if (this.readyState === 2) return;
+					state.__taskEventDeliveries?.push(lastEventId);
 					const event = new MessageEvent(type, {
 						data: JSON.stringify(payload),
+						lastEventId,
 					});
 					for (const listener of this.listeners.get(type) ?? []) {
 						listener.call(this as unknown as EventSource, event);
@@ -2358,6 +2369,13 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 					.__taskEventSourceCount ?? 0,
 		),
 	).toBe(sourceCountAfterContent);
+	expect(
+		await page.evaluate(
+			() =>
+				(window as typeof window & { __taskEventDeliveries?: string[] })
+					.__taskEventDeliveries ?? [],
+		),
+	).toEqual(["task-event-0", "task-event-1", "task-event-2"]);
 	expect(
 		await page.evaluate(
 			() =>
