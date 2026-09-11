@@ -36,6 +36,22 @@ function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
 }
 
+function itemContentChanged(previous: FeedItem, next: FeedItem) {
+	if (previous.kind !== next.kind || previous.id !== next.id) return true;
+	const comparable = (item: FeedItem) => {
+		const base = { ...item } as Record<string, unknown>;
+		const lanes = isLaneCapableFeedItem(item)
+			? { translated: item.translated, smart: item.smart }
+			: null;
+		delete base.translated;
+		delete base.smart;
+		return { base, lanes };
+	};
+	const previousComparable = comparable(previous);
+	const nextComparable = comparable(next);
+	return JSON.stringify(previousComparable) !== JSON.stringify(nextComparable);
+}
+
 function mergeItems(existing: FeedItem[], incoming: FeedItem[]) {
 	const out = existing.slice();
 	const indexes = new Map(out.map((item, index) => [itemKey(item), index]));
@@ -86,21 +102,32 @@ function sectionPageChanged(
 			(next.item_count ?? next.activity_count ?? 0)
 	)
 		return true;
-	const previousKeys = (previous.items ?? []).map(itemKey);
-	const nextKeys = (next.items ?? []).map(itemKey);
+	const previousItems = previous.items ?? [];
+	const nextItems = next.items ?? [];
+	const previousKeys = previousItems.map(itemKey);
+	const nextKeys = nextItems.map(itemKey);
 	if (
 		previousKeys.length !== nextKeys.length ||
-		previousKeys.some((key, index) => key !== nextKeys[index])
+		previousKeys.some(
+			(key, index) =>
+				key !== nextKeys[index] ||
+				itemContentChanged(previousItems[index], nextItems[index]),
+		)
 	)
 		return true;
-	const previousSupplementalKeys = (previous.supplemental_items ?? []).map(
-		itemKey,
-	);
-	const nextSupplementalKeys = (next.supplemental_items ?? []).map(itemKey);
+	const previousSupplementalItems = previous.supplemental_items ?? [];
+	const nextSupplementalItems = next.supplemental_items ?? [];
+	const previousSupplementalKeys = previousSupplementalItems.map(itemKey);
+	const nextSupplementalKeys = nextSupplementalItems.map(itemKey);
 	return (
 		previousSupplementalKeys.length !== nextSupplementalKeys.length ||
 		previousSupplementalKeys.some(
-			(key, index) => key !== nextSupplementalKeys[index],
+			(key, index) =>
+				key !== nextSupplementalKeys[index] ||
+				itemContentChanged(
+					previousSupplementalItems[index],
+					nextSupplementalItems[index],
+				),
 		)
 	);
 }
@@ -132,6 +159,7 @@ export function useDashboardReadableSections(options?: {
 	const detailsRef = useRef(details);
 	detailsRef.current = details;
 	const requestIdRef = useRef(0);
+	const refreshQueueRef = useRef<Promise<void>>(Promise.resolve());
 	const refreshInFlightRef = useRef(false);
 	const cursorInFlightRef = useRef(new Set<string>());
 	const cursorCompletedRef = useRef(new Set<string>());
@@ -270,7 +298,13 @@ export function useDashboardReadableSections(options?: {
 
 	const loadInitial = useCallback(() => loadSections(false), [loadSections]);
 	const refresh = useCallback(
-		(options?: { throwOnError?: boolean }) => loadSections(true, options),
+		(options?: { throwOnError?: boolean }) => {
+			const queued = refreshQueueRef.current.then(() =>
+				loadSections(true, options),
+			);
+			refreshQueueRef.current = queued.catch(() => undefined);
+			return queued;
+		},
 		[loadSections],
 	);
 

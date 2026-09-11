@@ -3183,29 +3183,26 @@ export function Dashboard(props: {
 					payload.status !== "succeeded"
 						? new Error(payload.error ?? "后台同步失败")
 						: undefined;
-				setAccessSyncStage(
-					payload.status === "succeeded" ? "completed" : "failed",
-				);
-				setAccessSyncProgress((current) => ({
-					currentStep:
-						payload.status === "succeeded"
-							? ACCESS_SYNC_TOTAL_STEPS
-							: (current?.currentStep ?? 0),
-					totalSteps: ACCESS_SYNC_TOTAL_STEPS,
-					stageLabel:
-						payload.status === "succeeded" ? "同步完成" : "后台同步失败",
-					detail:
-						payload.status === "succeeded"
-							? "正在刷新页面内容"
-							: (payload.error ?? "后台同步失败"),
-				}));
 				if (payload.status === "succeeded") {
+					setAccessSyncProgress((current) => ({
+						currentStep: current?.currentStep ?? ACCESS_SYNC_TOTAL_STEPS,
+						totalSteps: ACCESS_SYNC_TOTAL_STEPS,
+						stageLabel: "正在刷新页面内容",
+						detail: "正在刷新页面内容",
+					}));
 					try {
 						await refreshAllRef.current({ throwOnError: true });
 						clearDashboardLiveNoticesRef.current();
 						await checkDashboardUpdatesRef.current({ emit: false });
 					} catch (error) {
 						if (streamSettled) return;
+						setAccessSyncStage("failed");
+						setAccessSyncProgress((current) => ({
+							currentStep: current?.currentStep ?? 0,
+							totalSteps: ACCESS_SYNC_TOTAL_STEPS,
+							stageLabel: "同步后刷新失败",
+							detail: "同步已完成，但页面刷新失败，请稍后重试。",
+						}));
 						streamSettled = true;
 						clearReconnectTimer();
 						clearCompletionTimer();
@@ -3223,8 +3220,24 @@ export function Dashboard(props: {
 						);
 						return;
 					}
-				} else if (payload.error) {
-					pushErrorToastRef.current("后台同步失败", payload.error);
+					setAccessSyncStage("completed");
+					setAccessSyncProgress(() => ({
+						currentStep: ACCESS_SYNC_TOTAL_STEPS,
+						totalSteps: ACCESS_SYNC_TOTAL_STEPS,
+						stageLabel: "同步完成",
+						detail: "页面内容已刷新",
+					}));
+				} else {
+					setAccessSyncStage("failed");
+					setAccessSyncProgress((current) => ({
+						currentStep: current?.currentStep ?? 0,
+						totalSteps: ACCESS_SYNC_TOTAL_STEPS,
+						stageLabel: "后台同步失败",
+						detail: payload.error ?? "后台同步失败",
+					}));
+					if (payload.error) {
+						pushErrorToastRef.current("后台同步失败", payload.error);
+					}
 				}
 				if (streamSettled) return;
 				streamSettled = true;

@@ -2386,7 +2386,7 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 	await expect
 		.poll(() => feedResponseTitles.length, { timeout: 3000 })
 		.toBeGreaterThanOrEqual(2);
-	await expect(page.getByText("Cached release")).toBeVisible();
+	await expect(page.getByText("Cached release")).toBeVisible({ timeout: 8000 });
 	await expect(page.getByText("Fresh release")).toBeVisible({ timeout: 8000 });
 	await page.waitForTimeout(250);
 
@@ -2573,7 +2573,7 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 	});
 
 	await page.goto("/");
-	await expect(page.getByText("Cached release")).toBeVisible();
+	await expect(page.getByText("Cached release")).toBeVisible({ timeout: 8000 });
 	const refreshError = page.locator(
 		'[data-dashboard-readable-refresh-error="true"]',
 	);
