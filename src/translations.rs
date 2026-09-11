@@ -14873,6 +14873,7 @@ mod tests {
             linuxdo_oauth: None,
             webauthn,
             encryption_key,
+            admin_collection_read_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             runtime_owner_id: "translation-test-runtime-owner".to_owned(),
         })
     }

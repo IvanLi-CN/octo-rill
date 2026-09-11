@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useRef } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import { AiOperationsRecordsSection } from "@/admin/AiOperationsRecordsSection";
 import type {
@@ -204,7 +205,16 @@ const meta = {
 	component: AiOperationsRecordsSection,
 	tags: ["autodocs"],
 	parameters: {
-		viewport: { viewports: INITIAL_VIEWPORTS, defaultViewport: "desktop" },
+		viewport: {
+			viewports: {
+				...INITIAL_VIEWPORTS,
+				adminMobile: {
+					name: "Admin mobile",
+					styles: { width: "393px", height: "852px" },
+				},
+			},
+			defaultViewport: "desktop",
+		},
 		docs: {
 			description: {
 				component:
@@ -236,11 +246,14 @@ export const FailedResponseWithDiagnostics: Story = {
 			const originalFetch = useRef(window.fetch);
 			const restoreFetch = originalFetch.current;
 			window.fetch = async (input, init) => {
+				const requestInput = input instanceof Request ? input.url : input;
 				const url = new URL(
-					typeof input === "string" ? input : input.toString(),
+					typeof requestInput === "string"
+						? requestInput
+						: requestInput.toString(),
 					window.location.origin,
 				);
-				if (url.pathname.endsWith("/ai-records/release")) {
+				if (url.pathname.includes("/ai-records/release")) {
 					return new Response(JSON.stringify(listResponse), { status: 200 });
 				}
 				if (url.pathname.endsWith("/ai-records/release/383114065")) {
@@ -288,11 +301,14 @@ export const GlobalEvidenceOverview: Story = {
 			const originalFetch = useRef(window.fetch);
 			const restoreFetch = originalFetch.current;
 			window.fetch = async (input, init) => {
+				const requestInput = input instanceof Request ? input.url : input;
 				const url = new URL(
-					typeof input === "string" ? input : input.toString(),
+					typeof requestInput === "string"
+						? requestInput
+						: requestInput.toString(),
 					window.location.origin,
 				);
-				if (url.pathname.endsWith("/ai-records/release")) {
+				if (url.pathname.includes("/ai-records/release")) {
 					return new Response(JSON.stringify(listResponse), { status: 200 });
 				}
 				if (url.pathname.endsWith("/ai-records/release/383114065")) {
@@ -339,11 +355,14 @@ export const ExpiredDiagnosticEvidence: Story = {
 			const originalFetch = useRef(window.fetch);
 			const restoreFetch = originalFetch.current;
 			window.fetch = async (input, init) => {
+				const requestInput = input instanceof Request ? input.url : input;
 				const url = new URL(
-					typeof input === "string" ? input : input.toString(),
+					typeof requestInput === "string"
+						? requestInput
+						: requestInput.toString(),
 					window.location.origin,
 				);
-				if (url.pathname.endsWith("/ai-records/release")) {
+				if (url.pathname.includes("/ai-records/release")) {
 					return new Response(
 						JSON.stringify({
 							...listResponse,
@@ -380,4 +399,137 @@ export const ExpiredDiagnosticEvidence: Story = {
 			);
 		},
 	],
+};
+
+export const BusyRead: Story = {
+	tags: ["admin-collection-read-budget"],
+	args: {
+		detailRoute: null,
+		onFiltersChange: () => undefined,
+		onOpenRecord: () => undefined,
+		onOpenAttempt: () => undefined,
+		onOpenLlm: () => undefined,
+		onCloseRecord: () => undefined,
+	},
+	decorators: [
+		(Story) => {
+			const originalFetch = useRef(window.fetch);
+			const restoreFetch = originalFetch.current;
+			window.fetch = async (input, init) => {
+				const requestInput = input instanceof Request ? input.url : input;
+				const url = new URL(
+					typeof requestInput === "string"
+						? requestInput
+						: requestInput.toString(),
+					window.location.origin,
+				);
+				if (url.pathname.includes("/ai-records/release")) {
+					return new Response(
+						JSON.stringify({
+							ok: false,
+							error: {
+								code: "admin_collection_records_busy",
+								message: "admin collection records are temporarily busy",
+							},
+						}),
+						{ status: 503, headers: { "content-type": "application/json" } },
+					);
+				}
+				return restoreFetch(input, init);
+			};
+			useEffect(
+				() => () => {
+					window.fetch = restoreFetch;
+				},
+				[restoreFetch],
+			);
+			return (
+				<div
+					data-visual-evidence-surface
+					className="mx-auto box-border w-full max-w-[1072px] bg-background p-6"
+				>
+					<div data-visual-evidence-target className="mx-auto max-w-5xl p-6">
+						<Story />
+					</div>
+				</div>
+			);
+		},
+	],
+	play: async ({ canvasElement }) => {
+		await waitFor(() =>
+			expect(
+				within(canvasElement).getByRole("heading", {
+					name: "记录暂时无法读取",
+				}),
+			).toBeVisible(),
+		);
+		const errorPanel = within(canvasElement).getByRole("alert");
+		expect(
+			within(errorPanel).getByRole("button", { name: "刷新记录" }),
+		).toBeVisible();
+	},
+};
+
+export const CancelsStaleRead: Story = {
+	tags: ["admin-collection-read-budget"],
+	args: {
+		detailRoute: null,
+		onFiltersChange: () => undefined,
+		onOpenRecord: () => undefined,
+		onOpenAttempt: () => undefined,
+		onOpenLlm: () => undefined,
+		onCloseRecord: () => undefined,
+	},
+	decorators: [
+		(Story) => {
+			const originalFetch = useRef(window.fetch);
+			const restoreFetch = originalFetch.current;
+			(
+				window as Window & { __adminCollectionAbortCount?: number }
+			).__adminCollectionAbortCount = 0;
+			window.fetch = async (input, init) => {
+				const requestInput = input instanceof Request ? input.url : input;
+				const url = new URL(
+					typeof requestInput === "string"
+						? requestInput
+						: requestInput.toString(),
+					window.location.origin,
+				);
+				if (url.pathname.includes("/ai-records/release")) {
+					return await new Promise<Response>((_resolve, reject) => {
+						init?.signal?.addEventListener("abort", () => {
+							const target = window as Window & {
+								__adminCollectionAbortCount?: number;
+							};
+							target.__adminCollectionAbortCount =
+								(target.__adminCollectionAbortCount ?? 0) + 1;
+							reject(new DOMException("aborted", "AbortError"));
+						});
+					});
+				}
+				if (url.pathname.endsWith("/ai-records/announcement")) {
+					return new Response(JSON.stringify(listResponse), { status: 200 });
+				}
+				return restoreFetch(input, init);
+			};
+			useEffect(
+				() => () => {
+					window.fetch = restoreFetch;
+				},
+				[restoreFetch],
+			);
+			return <Story />;
+		},
+	],
+	play: async ({ canvasElement }) => {
+		await userEvent.click(
+			within(canvasElement).getByRole("tab", { name: "公告" }),
+		);
+		await waitFor(() => {
+			expect(
+				(window as Window & { __adminCollectionAbortCount?: number })
+					.__adminCollectionAbortCount,
+			).toBeGreaterThan(0);
+		});
+	},
 };

@@ -2,6 +2,7 @@ import {
 	ArrowLeft,
 	ChevronDown,
 	ChevronRight,
+	CircleAlert,
 	Inbox,
 	RefreshCw,
 	RotateCcw,
@@ -17,6 +18,7 @@ import {
 	type AiRecordStatus,
 } from "@/admin/jobsRouteState";
 import {
+	ApiError,
 	type AdminCollectionAttempt,
 	type AdminCollectionRecordDetail,
 	type AdminCollectionRecordItem,
@@ -69,6 +71,11 @@ import { cn } from "@/lib/utils";
 type CollectionTab = AdminCollectionRecordItem["kind"];
 type TimeRangePreset = "24h" | "7d" | "30d" | "custom";
 type AttemptCountRange = { min: number; max: number | null };
+type CollectionReadError = {
+	title: string;
+	message: string;
+	code?: string;
+};
 const PAGE_SIZE = 20;
 const ATTEMPT_RANGE_MAX = 10;
 const ATTEMPT_UNBOUNDED_VALUE = ATTEMPT_RANGE_MAX + 1;
@@ -103,6 +110,50 @@ function formatDateTime(value: string | null | undefined, missing = "-") {
 		minute: "2-digit",
 		hour12: false,
 	}).format(date);
+}
+
+function CollectionReadErrorState({
+	error,
+	onRetry,
+}: {
+	error: CollectionReadError;
+	onRetry: () => void;
+}) {
+	return (
+		<div
+			className="flex flex-col gap-4 rounded-xl border border-amber-300/45 bg-amber-50/80 p-5 sm:flex-row sm:items-start sm:p-6 dark:border-amber-300/20 dark:bg-amber-950/20"
+			role="alert"
+			aria-live="polite"
+		>
+			<div className="flex size-11 shrink-0 items-center justify-center rounded-lg border border-amber-300/45 bg-amber-100/80 text-amber-700 dark:border-amber-300/20 dark:bg-amber-400/10 dark:text-amber-200">
+				<CircleAlert className="size-5" aria-hidden="true" />
+			</div>
+			<div className="min-w-0 flex-1 space-y-2">
+				<div>
+					<h3 className="text-base font-semibold text-foreground">
+						{error.title}
+					</h3>
+					<p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
+						{error.message}
+					</p>
+				</div>
+				<div className="flex flex-wrap items-center gap-3">
+					<Button type="button" onClick={onRetry}>
+						<RefreshCw className="size-4" aria-hidden="true" />
+						刷新记录
+					</Button>
+					<span className="text-xs text-muted-foreground">
+						当前筛选条件会保留
+					</span>
+				</div>
+				{error.code ? (
+					<p className="font-mono text-[11px] text-muted-foreground/80">
+						{error.code}
+					</p>
+				) : null}
+			</div>
+		</div>
+	);
 }
 
 function toLocalInput(value: string) {
@@ -1024,7 +1075,7 @@ export function AiOperationsRecordsSection({
 	const [total, setTotal] = useState(0);
 	const [loading, setLoading] = useState(false);
 	const [reloadNonce, setReloadNonce] = useState(0);
-	const [error, setError] = useState<string | null>(null);
+	const [error, setError] = useState<CollectionReadError | null>(null);
 	const [detail, setDetail] = useState<AdminCollectionRecordDetail | null>(
 		null,
 	);
@@ -1140,6 +1191,7 @@ export function AiOperationsRecordsSection({
 	useEffect(() => {
 		const requestId = listRequestRef.current + 1;
 		listRequestRef.current = requestId;
+		const abortController = new AbortController();
 		setLoading(true);
 		setError(null);
 		const params = new URLSearchParams({
@@ -1160,7 +1212,7 @@ export function AiOperationsRecordsSection({
 		if (polishStatuses.length > 0) {
 			params.set("polish_status", polishStatuses.join(","));
 		}
-		void apiGetAdminCollectionRecords(tab, params)
+		void apiGetAdminCollectionRecords(tab, params, abortController.signal)
 			.then((response) => {
 				if (requestId !== listRequestRef.current) return;
 				setItems(response.items);
@@ -1168,11 +1220,33 @@ export function AiOperationsRecordsSection({
 			})
 			.catch((cause: unknown) => {
 				if (requestId !== listRequestRef.current) return;
-				setError(cause instanceof Error ? cause.message : "无法读取采集记录。");
+				if (cause instanceof DOMException && cause.name === "AbortError")
+					return;
+				if (
+					cause instanceof ApiError &&
+					(cause.code === "admin_collection_records_busy" ||
+						cause.code === "admin_collection_records_timeout")
+				) {
+					setError({
+						title: "记录暂时无法读取",
+						message:
+							cause.code === "admin_collection_records_timeout"
+								? "这次读取超过了安全时间，数据没有被截断。请稍后重新读取。"
+								: "读取服务正在处理其他请求。请稍后重新读取，当前筛选条件会继续保留。",
+						code: cause.code,
+					});
+					return;
+				}
+				setError({
+					title: "无法读取采集记录",
+					message: "读取记录时发生错误，请稍后重试。",
+					code: cause instanceof ApiError ? cause.code : undefined,
+				});
 			})
 			.finally(() => {
 				if (requestId === listRequestRef.current) setLoading(false);
 			});
+		return () => abortController.abort();
 	}, [
 		page,
 		reloadNonce,
@@ -1420,7 +1494,12 @@ export function AiOperationsRecordsSection({
 					) : null}
 				</CardHeader>
 				<CardContent className="space-y-3">
-					{error ? <p className="text-destructive text-sm">{error}</p> : null}
+					{error ? (
+						<CollectionReadErrorState
+							error={error}
+							onRetry={() => setReloadNonce((current) => current + 1)}
+						/>
+					) : null}
 					{loading ? (
 						<p className="text-muted-foreground py-8 text-sm">
 							正在加载记录...
