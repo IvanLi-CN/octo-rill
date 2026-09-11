@@ -2065,11 +2065,13 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 			type TestWindow = Window & {
 				__postContentReadableSkeletonMounts?: number;
 				__taskEventSourceCount?: number;
+				__taskEventSourceActive?: number;
 				__taskEventDeliveries?: string[];
 			};
 			const state = window as TestWindow;
 			state.__postContentReadableSkeletonMounts = 0;
 			state.__taskEventSourceCount = 0;
+			state.__taskEventSourceActive = 0;
 			state.__taskEventDeliveries = [];
 			let contentSeen = false;
 			let skeletonVisible = false;
@@ -2168,6 +2170,8 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 					if (!this.url.endsWith(`/api/tasks/${taskId}/events`)) return;
 					state.__taskEventSourceCount =
 						(state.__taskEventSourceCount ?? 0) + 1;
+					state.__taskEventSourceActive =
+						(state.__taskEventSourceActive ?? 0) + 1;
 					const scheduleTaskEvents = () => {
 						for (const taskEvent of taskEventPlan) {
 							const replay = emittedTaskEvents.has(taskEvent.index);
@@ -2219,7 +2223,12 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 				}
 
 				close() {
+					if (this.readyState === 2) return;
 					this.readyState = 2;
+					if (this.url.endsWith(`/api/tasks/${taskId}/events`)) {
+						state.__taskEventSourceActive =
+							(state.__taskEventSourceActive ?? 1) - 1;
+					}
 					if (this.startOnContentReady) {
 						const index = contentReadyCallbacks.indexOf(
 							this.startOnContentReady,
@@ -2350,12 +2359,20 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 
 	await page.goto("/");
 	await expect(page.getByText("Cached release")).toBeVisible();
-	const sourceCountAfterContent = await page.evaluate(
-		() =>
-			(window as typeof window & { __taskEventSourceCount?: number })
-				.__taskEventSourceCount ?? 0,
-	);
-	expect(sourceCountAfterContent).toBeGreaterThan(0);
+	const sourceStatsAfterContent = await page.evaluate(() => {
+		const state = window as typeof window & {
+			__taskEventSourceCount?: number;
+			__taskEventSourceActive?: number;
+		};
+		return {
+			count: state.__taskEventSourceCount ?? 0,
+			active: state.__taskEventSourceActive ?? 0,
+		};
+	});
+	// Vite dev mode replays mount effects once under React StrictMode; the
+	// production invariant is one active connection and no growth afterward.
+	expect(sourceStatsAfterContent.active).toBe(1);
+	expect(sourceStatsAfterContent.count).toBeLessThanOrEqual(2);
 	await expect
 		.poll(() => feedResponseTitles.length, { timeout: 3000 })
 		.toBeGreaterThanOrEqual(2);
@@ -2370,13 +2387,20 @@ test("dashboard keeps readable content mounted while access sync replays task ev
 	]);
 	expect(feedResponseTitles.at(-1)).toBe("Fresh release");
 	expect(taskCompleted).toBe(true);
-	expect(
-		await page.evaluate(
-			() =>
-				(window as typeof window & { __taskEventSourceCount?: number })
-					.__taskEventSourceCount ?? 0,
-		),
-	).toBe(sourceCountAfterContent);
+	const sourceStatsAfterCompletion = await page.evaluate(() => {
+		const state = window as typeof window & {
+			__taskEventSourceCount?: number;
+			__taskEventSourceActive?: number;
+		};
+		return {
+			count: state.__taskEventSourceCount ?? 0,
+			active: state.__taskEventSourceActive ?? 0,
+		};
+	});
+	expect(sourceStatsAfterCompletion).toEqual({
+		count: sourceStatsAfterContent.count,
+		active: 0,
+	});
 	expect(
 		await page.evaluate(
 			() =>

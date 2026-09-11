@@ -29,6 +29,7 @@ export type ReadableSectionDetails = {
 	nextCursor: string | null;
 	loading: boolean;
 	error: string | null;
+	refreshPending?: boolean;
 };
 
 function itemKey(item: Pick<FeedItem, "kind" | "id">) {
@@ -137,132 +138,141 @@ export function useDashboardReadableSections(options?: {
 	const detailCursorInFlightRef = useRef(new Set<string>());
 	const detailCursorCompletedRef = useRef(new Set<string>());
 
-	const loadSections = useCallback(async (preserveContent: boolean) => {
-		const requestId = ++requestIdRef.current;
-		refreshInFlightRef.current = preserveContent;
-		cursorInFlightRef.current.clear();
-		cursorCompletedRef.current.clear();
-		detailCursorInFlightRef.current.clear();
-		detailCursorCompletedRef.current.clear();
-		if (!preserveContent) {
-			setLoadingInitial(true);
-		}
-		setLoadingRefresh(preserveContent);
-		setLoadingMore(false);
-		setError(null);
-		if (!preserveContent) {
-			setLegacyFallback(false);
-			setSections([]);
-			sectionsRef.current = [];
-			setNextCursor(null);
-			setDetails({});
-		} else {
-			setDetails((current) =>
-				Object.fromEntries(
-					Object.entries(current).map(([sectionId, detail]) => [
-						sectionId,
-						{ ...detail, loading: false },
-					]),
-				),
-			);
-		}
-		let usedLegacyFallback = false;
-		try {
-			let response: DashboardReadableFeedResponse;
-			try {
-				response = await apiGet<DashboardReadableFeedResponse>(
-					"/api/dashboard/feed",
-				);
-			} catch (cause) {
-				// Keep rolling deployments and older test fixtures usable while the
-				// readable endpoint is introduced. A successful readable response
-				// always remains the only normal root-feed path.
-				const endpointUnavailable =
-					(cause instanceof ApiError && cause.status === 404) ||
-					cause instanceof TypeError;
-				if (!endpointUnavailable) throw cause;
-				const legacy = await apiGet<FeedResponse>("/api/feed?limit=30");
-				if (requestId !== requestIdRef.current) return;
-				usedLegacyFallback = true;
-				const legacyItems = legacy.items ?? [];
-				const firstTimestamp = legacyItems[0]?.ts ?? new Date(0).toISOString();
-				response = {
-					sections:
-						legacyItems.length > 0
-							? [
-									{
-										id: "legacy-feed",
-										date: firstTimestamp.slice(0, 10),
-										kind: "raw",
-										item_count: legacyItems.length,
-										brief: null,
-										items: legacyItems,
-										items_next_cursor: null,
-										supplemental_items: [],
-									},
-								]
-							: [],
-					next_cursor: legacy.next_cursor ?? null,
-				};
+	const loadSections = useCallback(
+		async (preserveContent: boolean, options?: { throwOnError?: boolean }) => {
+			const requestId = ++requestIdRef.current;
+			refreshInFlightRef.current = preserveContent;
+			cursorInFlightRef.current.clear();
+			cursorCompletedRef.current.clear();
+			detailCursorInFlightRef.current.clear();
+			detailCursorCompletedRef.current.clear();
+			if (!preserveContent) {
+				setLoadingInitial(true);
 			}
-			if (requestId !== requestIdRef.current) return;
-			setLegacyFallback(usedLegacyFallback);
-			const nextSections = response.sections ?? [];
-			const previousSections = new Map(
-				sectionsRef.current.map((section) => [section.id, section]),
-			);
-			setSections(nextSections);
-			setNextCursor(response.next_cursor ?? null);
-			if (preserveContent) {
-				const nextSectionsById = new Map(
-					nextSections.map((section) => [section.id, section]),
-				);
+			setLoadingRefresh(preserveContent);
+			setLoadingMore(false);
+			setError(null);
+			if (!preserveContent) {
+				setLegacyFallback(false);
+				setSections([]);
+				sectionsRef.current = [];
+				setNextCursor(null);
+				setDetails({});
+			} else {
 				setDetails((current) =>
 					Object.fromEntries(
-						Object.entries(current).flatMap(([sectionId, detail]) => {
-							const previous = previousSections.get(sectionId);
-							const next = nextSectionsById.get(sectionId);
-							if (!previous || !next) return [];
-							if (!sectionPageChanged(previous, next)) {
-								return [[sectionId, detail]];
-							}
-							return [
-								[
-									sectionId,
-									{
-										...detail,
-										nextCursor: next.items_next_cursor ?? null,
-										loading: false,
-										error: null,
-									},
-								],
-							];
-						}),
+						Object.entries(current).map(([sectionId, detail]) => [
+							sectionId,
+							{ ...detail, loading: false },
+						]),
 					),
 				);
 			}
-		} catch (cause) {
-			if (requestId !== requestIdRef.current) return;
-			const description = describeNetworkAwareError(
-				cause,
-				"可读动态加载失败，请稍后重试。",
-			);
-			setError({
-				phase: preserveContent ? "refresh" : "initial",
-				...description,
-				at: Date.now(),
-			});
-		} finally {
-			if (requestId === requestIdRef.current) {
-				refreshInFlightRef.current = false;
-				setLoadingRefresh(false);
-				setLoadingInitial(false);
+			let usedLegacyFallback = false;
+			try {
+				let response: DashboardReadableFeedResponse;
+				try {
+					response = await apiGet<DashboardReadableFeedResponse>(
+						"/api/dashboard/feed",
+					);
+				} catch (cause) {
+					// Keep rolling deployments and older test fixtures usable while the
+					// readable endpoint is introduced. A successful readable response
+					// always remains the only normal root-feed path.
+					const endpointUnavailable =
+						(cause instanceof ApiError && cause.status === 404) ||
+						cause instanceof TypeError;
+					if (!endpointUnavailable) throw cause;
+					const legacy = await apiGet<FeedResponse>("/api/feed?limit=30");
+					if (requestId !== requestIdRef.current) return;
+					usedLegacyFallback = true;
+					const legacyItems = legacy.items ?? [];
+					const firstTimestamp =
+						legacyItems[0]?.ts ?? new Date(0).toISOString();
+					response = {
+						sections:
+							legacyItems.length > 0
+								? [
+										{
+											id: "legacy-feed",
+											date: firstTimestamp.slice(0, 10),
+											kind: "raw",
+											item_count: legacyItems.length,
+											brief: null,
+											items: legacyItems,
+											items_next_cursor: null,
+											supplemental_items: [],
+										},
+									]
+								: [],
+						next_cursor: legacy.next_cursor ?? null,
+					};
+				}
+				if (requestId !== requestIdRef.current) return;
+				setLegacyFallback(usedLegacyFallback);
+				const nextSections = response.sections ?? [];
+				const previousSections = new Map(
+					sectionsRef.current.map((section) => [section.id, section]),
+				);
+				setSections(nextSections);
+				setNextCursor(response.next_cursor ?? null);
+				if (preserveContent) {
+					const nextSectionsById = new Map(
+						nextSections.map((section) => [section.id, section]),
+					);
+					setDetails((current) =>
+						Object.fromEntries(
+							Object.entries(current).flatMap(([sectionId, detail]) => {
+								const previous = previousSections.get(sectionId);
+								const next = nextSectionsById.get(sectionId);
+								if (!previous || !next) return [];
+								if (!sectionPageChanged(previous, next)) {
+									return [[sectionId, detail]];
+								}
+								return [
+									[
+										sectionId,
+										{
+											...detail,
+											nextCursor: next.items_next_cursor ?? null,
+											loading: false,
+											error: null,
+											refreshPending: true,
+										},
+									],
+								];
+							}),
+						),
+					);
+				}
+			} catch (cause) {
+				if (requestId !== requestIdRef.current) return;
+				const description = describeNetworkAwareError(
+					cause,
+					"可读动态加载失败，请稍后重试。",
+				);
+				setError({
+					phase: preserveContent ? "refresh" : "initial",
+					...description,
+					at: Date.now(),
+				});
+				if (options?.throwOnError) throw cause;
+			} finally {
+				if (requestId === requestIdRef.current) {
+					refreshInFlightRef.current = false;
+					setLoadingRefresh(false);
+					setLoadingInitial(false);
+				}
 			}
-		}
-	}, []);
+		},
+		[],
+	);
 
 	const loadInitial = useCallback(() => loadSections(false), [loadSections]);
-	const refresh = useCallback(() => loadSections(true), [loadSections]);
+	const refresh = useCallback(
+		(options?: { throwOnError?: boolean }) => loadSections(true, options),
+		[loadSections],
+	);
 
 	useEffect(() => {
 		if (!enabled) {
@@ -365,6 +375,7 @@ export function useDashboardReadableSections(options?: {
 			const normalizedCursor = cursor ?? "__initial__";
 			const requestKey = `${requestId}:${sectionId}:${normalizedCursor}`;
 			const current = detailsRef.current[sectionId];
+			const replaceAfterRefresh = Boolean(current?.refreshPending && !cursor);
 			if (
 				current?.loading ||
 				detailCursorInFlightRef.current.has(requestKey) ||
@@ -401,13 +412,16 @@ export function useDashboardReadableSections(options?: {
 					return {
 						...previous,
 						[sectionId]: {
-							items: mergeItems(before.items, response.items ?? []),
+							items: replaceAfterRefresh
+								? (response.items ?? [])
+								: mergeItems(before.items, response.items ?? []),
 							nextCursor:
 								response.next_cursor && response.next_cursor !== cursor
 									? response.next_cursor
 									: null,
 							loading: false,
 							error: null,
+							refreshPending: false,
 						},
 					};
 				});
@@ -422,6 +436,7 @@ export function useDashboardReadableSections(options?: {
 							cause,
 							"列表加载失败，请稍后重试。",
 						).message,
+						refreshPending: false,
 					},
 				}));
 			} finally {
