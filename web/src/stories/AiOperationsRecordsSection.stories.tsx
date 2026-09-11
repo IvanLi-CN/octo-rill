@@ -77,7 +77,36 @@ const recordDetail: AdminCollectionRecordDetail = {
 		occurred_at: "2026-09-05T05:55:00Z",
 		detected_at: "2026-09-05T06:00:00Z",
 		generated_at: null,
-		translation: null,
+		translation: {
+			status: "running",
+			display_status: "running",
+			status_origin: "global_work",
+			retry_count: 1,
+			started_at: "2026-09-05T06:08:00Z",
+			last_attempt_at: "2026-09-05T06:09:00Z",
+			finished_at: null,
+			global_work: {
+				status: "running",
+				status_origin: "global_work",
+				work_item_id: "global-work-383114065",
+				source_hash: "hash-demo",
+				updated_at: "2026-09-05T06:09:00Z",
+			},
+			result_projection: {
+				status: "ready",
+				status_origin: "result_projection",
+				work_item_id: "global-work-old",
+				source_hash: "hash-old",
+				updated_at: "2026-09-05T06:00:00Z",
+			},
+			legacy_evidence: {
+				status: "legacy_conflict",
+				status_origin: "legacy_evidence",
+				work_item_id: null,
+				source_hash: null,
+				updated_at: null,
+			},
+		},
 		polish: {
 			status: "failed",
 			display_status: "failed",
@@ -86,6 +115,21 @@ const recordDetail: AdminCollectionRecordDetail = {
 			started_at: "2026-09-05T06:10:00Z",
 			last_attempt_at: "2026-09-05T06:10:01Z",
 			finished_at: "2026-09-05T06:10:01Z",
+			global_work: {
+				status: "failed",
+				status_origin: "global_work",
+				work_item_id: "global-work-383114065",
+				source_hash: "hash-demo",
+				updated_at: "2026-09-05T06:10:01Z",
+			},
+			result_projection: null,
+			legacy_evidence: {
+				status: "legacy_cached",
+				status_origin: "legacy_evidence",
+				work_item_id: null,
+				source_hash: null,
+				updated_at: "2026-09-05T05:59:00Z",
+			},
 		},
 	},
 	attempts: [
@@ -204,6 +248,55 @@ export const FailedResponseWithDiagnostics: Story = {
 				}
 				if (url.pathname.endsWith(`/llm/calls/${failedCall.id}`)) {
 					return new Response(JSON.stringify(failedCall), { status: 200 });
+				}
+				return restoreFetch(input, init);
+			};
+			useEffect(
+				() => () => {
+					window.fetch = restoreFetch;
+				},
+				[restoreFetch],
+			);
+			return (
+				<div
+					data-visual-evidence-surface
+					className="mx-auto box-border w-full max-w-[1072px] bg-background p-6"
+				>
+					<div data-visual-evidence-target className="mx-auto max-w-5xl p-6">
+						<Story />
+					</div>
+				</div>
+			);
+		},
+	],
+};
+
+export const GlobalEvidenceOverview: Story = {
+	args: {
+		detailRoute: {
+			kind: "release",
+			id: recordDetail.record.id,
+		},
+		onFiltersChange: () => undefined,
+		onOpenRecord: () => undefined,
+		onOpenAttempt: () => undefined,
+		onOpenLlm: () => undefined,
+		onCloseRecord: () => undefined,
+	},
+	decorators: [
+		(Story) => {
+			const originalFetch = useRef(window.fetch);
+			const restoreFetch = originalFetch.current;
+			window.fetch = async (input, init) => {
+				const url = new URL(
+					typeof input === "string" ? input : input.toString(),
+					window.location.origin,
+				);
+				if (url.pathname.endsWith("/ai-records/release")) {
+					return new Response(JSON.stringify(listResponse), { status: 200 });
+				}
+				if (url.pathname.endsWith("/ai-records/release/383114065")) {
+					return new Response(JSON.stringify(recordDetail), { status: 200 });
 				}
 				return restoreFetch(input, init);
 			};

@@ -96,7 +96,19 @@ function buildSummaryRequestItem(item: FeedItem): TranslationRequestItemInput {
 }
 
 function mapTranslationItemToFeedTranslated(item: {
-	status: "ready" | "disabled" | "missing" | "error" | "queued" | "running";
+	status:
+		| "ready"
+		| "disabled"
+		| "missing"
+		| "error"
+		| "failed"
+		| "queued"
+		| "running"
+		| "deferred_provider"
+		| "blocked_config"
+		| "not_applicable"
+		| "cancelled"
+		| "superseded";
 	title_zh: string | null;
 	summary_md: string | null;
 	body_md?: string | null;
@@ -139,6 +151,10 @@ function mapTranslationItemToFeedTranslated(item: {
 				auto_translate: false,
 			};
 		case "error":
+		case "failed":
+		case "blocked_config":
+		case "cancelled":
+		case "superseded":
 			return {
 				lang: "zh-CN",
 				status: "error",
@@ -181,6 +197,7 @@ type Deferred<T> = {
 type TranslationTask = {
 	sourceKey: string;
 	requestItem: TranslationRequestItemInput;
+	requestId?: string;
 	createdAtMs: number;
 	rejectOnFailure: boolean;
 	deferred: Deferred<TranslateResponse | null>;
@@ -305,7 +322,15 @@ function resultLabel(result: TranslationResultItem) {
 function isTerminalTranslationResultStatus(
 	status: TranslationResultItem["status"],
 ) {
-	return status === "error" || status === "missing";
+	return (
+		status === "error" ||
+		status === "failed" ||
+		status === "missing" ||
+		status === "blocked_config" ||
+		status === "not_applicable" ||
+		status === "cancelled" ||
+		status === "superseded"
+	);
 }
 
 export function useAutoTranslate(params: {
@@ -506,6 +531,7 @@ export function useAutoTranslate(params: {
 					);
 					continue;
 				}
+				task.requestId = resolved.request_id ?? task.requestId;
 
 				if (isPendingTranslationResultStatus(resolved.status)) {
 					if (Date.now() - task.createdAtMs > REQUEST_PENDING_MAX_AGE_MS) {
@@ -571,8 +597,17 @@ export function useAutoTranslate(params: {
 			) {
 				const chunk = entries.slice(index, index + RESOLVE_RESULTS_MAX_ITEMS);
 				try {
+					const request_ids = Object.fromEntries(
+						chunk
+							.filter(({ task }) => task.requestId)
+							.map(({ candidate, task }) => [
+								candidate.requestItem.producer_ref,
+								task.requestId as string,
+							]),
+					);
 					const response = await apiResolveTranslationResults({
 						items: chunk.map(({ candidate }) => candidate.requestItem),
+						request_ids,
 						retry_on_error: options?.retryOnError ?? false,
 					});
 					applyResolvedResults(chunk, response.items);

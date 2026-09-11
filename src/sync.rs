@@ -25,7 +25,8 @@ use sqlx::{QueryBuilder, Row, Sqlite};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex, task::JoinSet};
 
 use crate::{
-    admin_runtime, jobs, local_id, runtime, sqlite_write::SqliteWritePriority, state::AppState,
+    admin_runtime, content_processing, jobs, local_id, runtime, sqlite_write::SqliteWritePriority,
+    state::AppState, translations,
 };
 
 const REST_API_BASE: &str = "https://api.github.com";
@@ -60,6 +61,7 @@ const DISCUSSION_ANNOUNCEMENT_PAGE_SIZE: usize = 10;
 const REPO_RELEASE_PRIORITY_SYSTEM: i64 = 1;
 const REPO_RELEASE_PRIORITY_INTERACTIVE: i64 = 2;
 const REPO_RELEASE_DEADLINE_EXPIRED_ERROR: &str = "repo_release_deadline_expired";
+const RELEASE_CONTENT_ENQUEUE_PENDING_ERROR: &str = "content_processing_enqueue_pending";
 const SUBSCRIPTION_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_secs(2);
 const GITHUB_WEB_BASE: &str = "https://github.com";
 const GITHUB_NOTIFICATIONS_PAGE_SIZE: usize = 50;
@@ -1849,7 +1851,7 @@ where
 }
 
 pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleasesResult> {
-    let before_release_ids = load_release_ids_for_user(state, user_id).await?;
+    let before_release_updates = load_release_updated_at_for_user(state, user_id).await?;
     let _owned_release_visibility_refreshed =
         refresh_owned_repo_release_visibility(state, user_id).await?;
     let demand = attach_and_wait_for_user_release_demand(
@@ -1861,14 +1863,23 @@ pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleas
     )
     .await?;
 
-    let after_release_ids = load_release_ids_for_user(state, user_id).await?;
-    let mut new_release_ids = after_release_ids
-        .difference(&before_release_ids)
-        .copied()
+    let after_release_updates = load_release_updated_at_for_user(state, user_id).await?;
+    let mut changed_release_ids = after_release_updates
+        .into_iter()
+        .filter_map(|(release_id, updated_at)| {
+            (before_release_updates.get(&release_id) != Some(&updated_at)).then_some(release_id)
+        })
         .collect::<Vec<_>>();
-    new_release_ids.sort_unstable_by(|left, right| right.cmp(left));
+    changed_release_ids.extend(
+        load_pending_release_content_ids_for_user(state, user_id)
+            .await
+            .context("sync.releases: load pending content processing ids")?,
+    );
+    changed_release_ids.sort_unstable();
+    changed_release_ids.dedup();
+    changed_release_ids.sort_unstable_by(|left, right| right.cmp(left));
     let smart_preheat_release_ids = merge_smart_preheat_release_ids(
-        &new_release_ids,
+        &changed_release_ids,
         &load_recent_release_ids_for_user(state, user_id, SMART_PREHEAT_RECENT_RELEASE_LIMIT)
             .await
             .unwrap_or_else(|err| {
@@ -1880,23 +1891,22 @@ pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleas
                 Vec::new()
             }),
     );
-    if let Err(err) = enqueue_background_release_translation_task(
+    if let Err(error) = enqueue_background_release_translation_task(
         state,
         user_id,
-        &new_release_ids,
+        &changed_release_ids,
         "sync.releases.auto_translate",
         None,
         Some(user_id),
     )
     .await
     {
-        tracing::warn!(
-            ?err,
-            user_id,
-            "sync.releases: enqueue background translation failed"
-        );
+        mark_release_content_enqueue_pending(state, &changed_release_ids)
+            .await
+            .context("sync.releases: record pending translation enqueue")?;
+        return Err(error).context("sync.releases: enqueue background translation");
     }
-    if let Err(err) = enqueue_background_release_smart_task(
+    if let Err(error) = enqueue_background_release_smart_task(
         state,
         user_id,
         &smart_preheat_release_ids,
@@ -1906,12 +1916,14 @@ pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleas
     )
     .await
     {
-        tracing::warn!(
-            ?err,
-            user_id,
-            "sync.releases: enqueue background smart summary failed"
-        );
+        mark_release_content_enqueue_pending(state, &changed_release_ids)
+            .await
+            .context("sync.releases: record pending smart enqueue")?;
+        return Err(error).context("sync.releases: enqueue background smart summary");
     }
+    clear_release_content_enqueue_pending(state, &changed_release_ids)
+        .await
+        .context("sync.releases: clear pending content processing ids")?;
 
     Ok(SyncReleasesResult {
         repos: demand.repos,
@@ -2132,6 +2144,7 @@ pub async fn sync_social_activity(
         }
     };
     events += insert_feed_activity_events(state, user_id, feed_events.as_slice()).await?;
+    enqueue_global_announcement_work(state, user_id, feed_events.as_slice()).await?;
 
     Ok(SyncSocialActivityResult {
         repo_stars: repo_collection.repo_stars,
@@ -2144,6 +2157,47 @@ pub async fn sync_social_activity(
             .collect(),
         source_errors,
     })
+}
+
+async fn enqueue_global_announcement_work(
+    state: &AppState,
+    user_id: &str,
+    events: &[FeedActivityEventSnapshot],
+) -> Result<()> {
+    if content_processing::current_mode(&state.pool).await.ok()
+        != Some(content_processing::ContentProcessingMode::Global)
+    {
+        return Ok(());
+    }
+    for event in events.iter().filter(|event| event.kind == "announcement") {
+        let (Some(repo), Some(number)) = (event.repo_full_name.as_deref(), event.discussion_number)
+        else {
+            continue;
+        };
+        let entity_id = crate::api::announcement_discussion_key(repo, number);
+        for (kind, variant) in [
+            ("announcement_detail", "detail"),
+            ("announcement_smart", "smart"),
+        ] {
+            let item = translations::TranslationRequestItemInput {
+                producer_ref: format!("sync.global.announcement:{entity_id}:{variant}"),
+                kind: kind.to_owned(),
+                variant: variant.to_owned(),
+                entity_id: entity_id.clone(),
+                target_lang: "zh-CN".to_owned(),
+                max_wait_ms: 0,
+                source_blocks: Vec::new(),
+                target_slots: Vec::new(),
+            };
+            let canonical = crate::api::canonical_global_translation_item(state, user_id, &item)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            content_processing::submit_item(state, user_id, "async", &canonical)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 pub async fn sync_social_activity_best_effort(
@@ -3655,10 +3709,13 @@ async fn materialize_repo_star_current_members_tx(
     Ok(inserted)
 }
 
-async fn load_release_ids_for_user(state: &AppState, user_id: &str) -> Result<HashSet<i64>> {
-    let rows = sqlx::query_scalar::<_, i64>(
+async fn load_release_updated_at_for_user(
+    state: &AppState,
+    user_id: &str,
+) -> Result<HashMap<i64, String>> {
+    let rows = sqlx::query_as::<_, (i64, String)>(
         r#"
-        SELECT DISTINCT r.release_id
+        SELECT DISTINCT r.release_id, r.updated_at
         FROM repo_releases r
         JOIN user_following_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
@@ -3667,7 +3724,7 @@ async fn load_release_ids_for_user(state: &AppState, user_id: &str) -> Result<Ha
     .bind(user_id)
     .fetch_all(&state.pool)
     .await
-    .context("failed to query release ids for user")?;
+    .context("failed to query release update markers for user")?;
     Ok(rows.into_iter().collect())
 }
 
@@ -3765,6 +3822,93 @@ async fn load_recent_release_ids_for_user(
     .context("failed to query recent release ids for user")
 }
 
+async fn load_pending_release_content_ids_for_user(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Vec<i64>> {
+    let payloads = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT wi.last_new_release_ids_json
+        FROM repo_release_work_items wi
+        JOIN repo_release_watchers rw ON rw.work_item_id = wi.id
+        WHERE rw.user_id = ?
+          AND wi.error_text = ?
+          AND wi.last_new_release_ids_json IS NOT NULL
+        GROUP BY wi.id
+        "#,
+    )
+    .bind(user_id)
+    .bind(RELEASE_CONTENT_ENQUEUE_PENDING_ERROR)
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to query pending release content ids")?;
+
+    let mut ids = Vec::new();
+    for payload in payloads {
+        let values = serde_json::from_str::<Vec<i64>>(&payload)
+            .with_context(|| "failed to parse pending release content ids")?;
+        ids.extend(values);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+async fn mark_release_content_enqueue_pending(state: &AppState, release_ids: &[i64]) -> Result<()> {
+    if release_ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat_n("?", release_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "UPDATE repo_release_work_items SET error_text = ? WHERE repo_id IN (SELECT DISTINCT repo_id FROM repo_releases WHERE release_id IN ({placeholders})) AND last_new_release_ids_json IS NOT NULL"
+    );
+    state
+        .sqlite_writer
+        .write("release_content_enqueue_pending", |_| async {
+            let mut query_builder = sqlx::query(&query).bind(RELEASE_CONTENT_ENQUEUE_PENDING_ERROR);
+            for release_id in release_ids {
+                query_builder = query_builder.bind(release_id);
+            }
+            query_builder
+                .execute(&state.pool)
+                .await
+                .context("failed to mark pending release content enqueue")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+}
+
+async fn clear_release_content_enqueue_pending(
+    state: &AppState,
+    release_ids: &[i64],
+) -> Result<()> {
+    if release_ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat_n("?", release_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "UPDATE repo_release_work_items SET error_text = NULL WHERE error_text = ? AND repo_id IN (SELECT DISTINCT repo_id FROM repo_releases WHERE release_id IN ({placeholders}))"
+    );
+    state
+        .sqlite_writer
+        .write("release_content_enqueue_pending_clear", |_| async {
+            let mut query_builder = sqlx::query(&query).bind(RELEASE_CONTENT_ENQUEUE_PENDING_ERROR);
+            for release_id in release_ids {
+                query_builder = query_builder.bind(release_id);
+            }
+            query_builder
+                .execute(&state.pool)
+                .await
+                .context("failed to clear pending release content enqueue")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+}
+
 fn merge_smart_preheat_release_ids(
     new_release_ids: &[i64],
     recent_release_ids: &[i64],
@@ -3809,6 +3953,32 @@ async fn enqueue_background_release_translation_task(
         return Ok(None);
     }
 
+    match content_processing::current_mode(&state.pool).await? {
+        content_processing::ContentProcessingMode::Global => {
+            for release_id in release_ids {
+                let item = crate::api::global_release_request_item(
+                    state,
+                    user_id,
+                    *release_id,
+                    "release_summary",
+                    source,
+                )
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+                content_processing::submit_item(state, user_id, "async", &item)
+                    .await
+                    .map_err(|error| anyhow!(error.to_string()))?;
+            }
+            return Ok(None);
+        }
+        content_processing::ContentProcessingMode::RollbackFreeze => {
+            return Err(content_processing::transition_error(
+                content_processing::ContentProcessingMode::RollbackFreeze,
+            ));
+        }
+        content_processing::ContentProcessingMode::Legacy => {}
+    }
+
     let task = jobs::enqueue_task(
         state,
         jobs::NewTask {
@@ -3837,6 +4007,32 @@ async fn enqueue_background_release_smart_task(
 ) -> Result<Option<String>> {
     if release_ids.is_empty() || state.config.ai.is_none() {
         return Ok(None);
+    }
+
+    match content_processing::current_mode(&state.pool).await? {
+        content_processing::ContentProcessingMode::Global => {
+            for release_id in release_ids {
+                let item = crate::api::global_release_request_item(
+                    state,
+                    user_id,
+                    *release_id,
+                    "release_smart",
+                    source,
+                )
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+                content_processing::submit_item(state, user_id, "async", &item)
+                    .await
+                    .map_err(|error| anyhow!(error.to_string()))?;
+            }
+            return Ok(None);
+        }
+        content_processing::ContentProcessingMode::RollbackFreeze => {
+            return Err(content_processing::transition_error(
+                content_processing::ContentProcessingMode::RollbackFreeze,
+            ));
+        }
+        content_processing::ContentProcessingMode::Legacy => {}
     }
 
     let task = jobs::enqueue_task(
@@ -5177,8 +5373,8 @@ pub async fn sync_subscriptions(
                     Vec::new()
                 }),
             );
-            if !user_release_ids.is_empty()
-                && let Err(err) = enqueue_background_release_translation_task(
+            if !user_release_ids.is_empty() {
+                enqueue_background_release_translation_task(
                     state,
                     user.id.as_str(),
                     &user_release_ids,
@@ -5187,15 +5383,15 @@ pub async fn sync_subscriptions(
                     None,
                 )
                 .await
-            {
-                tracing::warn!(
-                    ?err,
-                    user_id = user.id.as_str(),
-                    "sync.subscriptions: enqueue background translation failed"
-                );
+                .with_context(|| {
+                    format!(
+                        "sync.subscriptions: enqueue background translation for {}",
+                        user.id
+                    )
+                })?;
             }
-            if !smart_preheat_release_ids.is_empty()
-                && let Err(err) = enqueue_background_release_smart_task(
+            if !smart_preheat_release_ids.is_empty() {
+                enqueue_background_release_smart_task(
                     state,
                     user.id.as_str(),
                     &smart_preheat_release_ids,
@@ -5204,12 +5400,12 @@ pub async fn sync_subscriptions(
                     None,
                 )
                 .await
-            {
-                tracing::warn!(
-                    ?err,
-                    user_id = user.id.as_str(),
-                    "sync.subscriptions: enqueue background smart summary failed"
-                );
+                .with_context(|| {
+                    format!(
+                        "sync.subscriptions: enqueue background smart summary for {}",
+                        user.id
+                    )
+                })?;
             }
         }
     }
@@ -8268,9 +8464,13 @@ async fn execute_repo_release_work_item(
             .await
             {
                 Ok(RepoReleaseFetchOutcome::Updated(fetch_result)) => {
-                    let mut stats =
-                        upsert_repo_releases(state, work_item.repo_id, &fetch_result.releases)
-                            .await?;
+                    let mut stats = upsert_repo_releases(
+                        state,
+                        work_item.repo_id,
+                        &fetch_result.releases,
+                        Some(work_item),
+                    )
+                    .await?;
                     stats.pages_fetched = fetch_result.pages_fetched;
                     stats.stopped_reason = fetch_result.stopped_reason;
                     record_repo_release_sync_success(
@@ -8329,8 +8529,13 @@ async fn execute_repo_release_work_item(
         .await
         {
             Ok(RepoReleaseFetchOutcome::Updated(fetch_result)) => {
-                let mut stats =
-                    upsert_repo_releases(state, work_item.repo_id, &fetch_result.releases).await?;
+                let mut stats = upsert_repo_releases(
+                    state,
+                    work_item.repo_id,
+                    &fetch_result.releases,
+                    Some(work_item),
+                )
+                .await?;
                 stats.pages_fetched = fetch_result.pages_fetched;
                 stats.stopped_reason = fetch_result.stopped_reason;
                 record_repo_release_sync_success(
@@ -8688,11 +8893,40 @@ async fn upsert_repo_releases(
     state: &AppState,
     repo_id: i64,
     releases: &[GitHubRelease],
+    lease: Option<&RepoReleaseWorkItemRow>,
 ) -> Result<RepoReleaseWriteStats> {
     let now = Utc::now().to_rfc3339();
     state
         .sqlite_writer
         .write("repo_release_upsert", |_| async {
+            if let Some(work_item) = lease {
+                let lease_is_current = sqlx::query_scalar::<_, i64>(
+                    r#"
+                    SELECT 1
+                    FROM repo_release_work_items
+                    WHERE id = ?
+                      AND status = ?
+                      AND runtime_owner_id = ?
+                      AND started_at = ?
+                      AND julianday(deadline_at) > julianday(?)
+                    LIMIT 1
+                    "#,
+                )
+                .bind(&work_item.id)
+                .bind(jobs::STATUS_RUNNING)
+                .bind(state.runtime_owner_id.as_str())
+                .bind(work_item.started_at.as_deref().unwrap_or_default())
+                .bind(now.as_str())
+                .fetch_optional(&state.pool)
+                .await
+                .context("failed to validate repo release work item lease")?
+                .is_some();
+                if !lease_is_current {
+                    return Err(anyhow!(
+                        "repo release work item lease lost before release snapshot write"
+                    ));
+                }
+            }
             let mut stats = RepoReleaseWriteStats {
                 fetched_count: releases.len(),
                 stopped_reason: "completed".to_owned(),
@@ -8754,8 +8988,10 @@ async fn upsert_repo_releases(
                         continue;
                     }
                     stats.updated_count += 1;
+                    stats.new_release_ids.push(release.id);
                 } else {
                     stats.inserted_count += 1;
+                    stats.new_release_ids.push(release.id);
                 }
 
                 sqlx::query(
@@ -8825,9 +9061,6 @@ async fn upsert_repo_releases(
                 .execute(&state.pool)
                 .await
                 .with_context(|| format!("failed to upsert shared release {}", release.tag_name))?;
-                if existing.is_none() {
-                    stats.new_release_ids.push(release.id);
-                }
             }
             Ok::<_, anyhow::Error>(stats)
         })
@@ -12526,6 +12759,7 @@ where
         }
         notifications += res.len();
         upsert_notifications(state, user_id, &res, &sync_started_at).await?;
+        enqueue_global_notification_work(state, user_id, &res).await?;
         if res.len() < GITHUB_NOTIFICATIONS_PAGE_SIZE {
             break;
         }
@@ -12555,6 +12789,39 @@ where
         notifications,
         since,
     })
+}
+
+async fn enqueue_global_notification_work(
+    state: &AppState,
+    user_id: &str,
+    notifications: &[GitHubNotification],
+) -> Result<()> {
+    if content_processing::current_mode(&state.pool).await.ok()
+        != Some(content_processing::ContentProcessingMode::Global)
+    {
+        return Ok(());
+    }
+    for notification in notifications {
+        for (kind, variant) in [("notification", "shared"), ("notification_smart", "smart")] {
+            let item = translations::TranslationRequestItemInput {
+                producer_ref: format!("sync.global.notification:{}:{variant}", notification.id),
+                kind: kind.to_owned(),
+                variant: variant.to_owned(),
+                entity_id: notification.id.clone(),
+                target_lang: "zh-CN".to_owned(),
+                max_wait_ms: 0,
+                source_blocks: Vec::new(),
+                target_slots: Vec::new(),
+            };
+            let canonical = crate::api::canonical_global_translation_item(state, user_id, &item)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+            content_processing::submit_item(state, user_id, "async", &canonical)
+                .await
+                .map_err(|error| anyhow!(error.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 async fn upsert_notifications(
@@ -13069,6 +13336,7 @@ fn fallback_notification_open_url(thread_id: Option<&str>, repo_full_name: Optio
 
 #[cfg(test)]
 mod tests {
+    use crate::content_processing;
     use anyhow::{Context, anyhow};
     use chrono::{DateTime, Utc};
     use sqlx::Row;
@@ -20654,6 +20922,59 @@ mod tests {
         assert_eq!(second_payload, expected_payload);
     }
 
+    #[tokio::test]
+    async fn enqueue_background_release_ai_tasks_are_frozen_without_legacy_fallback() {
+        let pool = setup_pool().await;
+        sqlx::query("UPDATE content_processing_control SET mode = 'rollback_freeze' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .expect("freeze content processing mode");
+        let mut state = setup_state(pool.clone());
+        Arc::get_mut(&mut state).expect("unique state").config.ai = Some(crate::config::AiConfig {
+            base_url: url::Url::parse("https://example.invalid/v1").expect("parse ai url"),
+            model: "gpt-test".to_owned(),
+            api_key: "test-key".to_owned(),
+        });
+
+        let translation_error = super::enqueue_background_release_translation_task(
+            state.as_ref(),
+            "user-freeze",
+            &[101],
+            "sync.releases.auto_translate",
+            None,
+            Some("user-freeze"),
+        )
+        .await
+        .expect_err("translation enqueue must be frozen");
+        assert!(
+            translation_error
+                .downcast_ref::<content_processing::ContentProcessingTransitionError>()
+                .is_some()
+        );
+
+        let smart_error = super::enqueue_background_release_smart_task(
+            state.as_ref(),
+            "user-freeze",
+            &[101],
+            "sync.releases.auto_smart",
+            None,
+            Some("user-freeze"),
+        )
+        .await
+        .expect_err("smart enqueue must be frozen");
+        assert!(
+            smart_error
+                .downcast_ref::<content_processing::ContentProcessingTransitionError>()
+                .is_some()
+        );
+
+        let task_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_tasks")
+            .fetch_one(&pool)
+            .await
+            .expect("count legacy tasks");
+        assert_eq!(task_count, 0);
+    }
+
     #[test]
     fn merge_smart_preheat_release_ids_keeps_newest_and_extends_recent_window() {
         let merged =
@@ -21143,24 +21464,26 @@ mod tests {
             reactions: None,
         };
 
-        let inserted = upsert_repo_releases(state.as_ref(), 42, std::slice::from_ref(&release))
-            .await
-            .expect("insert release");
+        let inserted =
+            upsert_repo_releases(state.as_ref(), 42, std::slice::from_ref(&release), None)
+                .await
+                .expect("insert release");
         assert_eq!(inserted.fetched_count, 1);
         assert_eq!(inserted.inserted_count, 1);
         assert_eq!(inserted.updated_count, 0);
         assert_eq!(inserted.unchanged_count, 0);
 
-        let unchanged = upsert_repo_releases(state.as_ref(), 42, std::slice::from_ref(&release))
-            .await
-            .expect("unchanged release");
+        let unchanged =
+            upsert_repo_releases(state.as_ref(), 42, std::slice::from_ref(&release), None)
+                .await
+                .expect("unchanged release");
         assert_eq!(unchanged.inserted_count, 0);
         assert_eq!(unchanged.updated_count, 0);
         assert_eq!(unchanged.unchanged_count, 1);
 
         let mut edited = release;
         edited.body = Some("edited body".to_owned());
-        let updated = upsert_repo_releases(state.as_ref(), 42, &[edited])
+        let updated = upsert_repo_releases(state.as_ref(), 42, &[edited], None)
             .await
             .expect("update release");
         assert_eq!(updated.inserted_count, 0);

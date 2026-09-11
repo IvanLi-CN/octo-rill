@@ -16,6 +16,7 @@ import {
 	apiGetReleaseDetailByRepoTag,
 	apiResolveTranslationResults,
 	apiGetTranslationRequest,
+	apiRetryTranslationRequest,
 	apiTranslateReleaseDetail,
 	isPendingTranslationResultStatus,
 	mapTranslationResultToReleaseDetailSmart,
@@ -115,6 +116,18 @@ function hasReadyTranslatedContent(
 	return Boolean(translated.title?.trim() || translated.summary?.trim());
 }
 
+function hasTranslatedProjection(
+	translated: ReleaseDetailResponse["translated"] | null | undefined,
+) {
+	return Boolean(translated?.title?.trim() || translated?.summary?.trim());
+}
+
+function hasSmartProjection(
+	smart: ReleaseDetailResponse["smart"] | null | undefined,
+) {
+	return Boolean(smart?.title?.trim() || smart?.summary?.trim());
+}
+
 function shouldResolveSmart(
 	smart: ReleaseDetailResponse["smart"] | null | undefined,
 ) {
@@ -122,6 +135,36 @@ function shouldResolveSmart(
 		!smart ||
 		(smart.status === "missing" && smart.auto_translate !== false) ||
 		(smart.status === "error" && smart.auto_translate !== false)
+	);
+}
+
+function pendingStatusMessage(
+	status:
+		| NonNullable<ReleaseDetailResponse["translated"]>["status"]
+		| undefined,
+) {
+	return status === "deferred_provider"
+		? "翻译已提交，供应商暂缓处理。"
+		: status === "running"
+			? "翻译正在后台处理中。"
+			: "翻译已排队，正在后台处理中。";
+}
+
+function pendingPolishStatusMessage(
+	status: NonNullable<ReleaseDetailResponse["smart"]>["status"] | undefined,
+) {
+	return status === "deferred_provider"
+		? "润色已提交，供应商暂缓处理。"
+		: status === "running"
+			? "润色正在后台处理中。"
+			: "润色已排队，正在后台处理中。";
+}
+
+function isPendingDetailStatus(status: string | undefined) {
+	return (
+		status === "queued" ||
+		status === "running" ||
+		status === "deferred_provider"
 	);
 }
 
@@ -265,6 +308,13 @@ export function ReleaseDetailCard(props: {
 			void fetchReleaseDetail(targetRelease)
 				.then((response) => {
 					if (loadRequestSeqRef.current !== requestSeq) return;
+					const requestId = response.translated?.request_id;
+					if (requestId) {
+						pendingTranslationRequestRef.current = {
+							releaseId: response.release_id,
+							requestId,
+						};
+					}
 					setDetail(response);
 					setDetailTargetKey(releaseTargetKey(targetRelease));
 					onResolvedDetail?.(response);
@@ -331,104 +381,142 @@ export function ReleaseDetailCard(props: {
 
 	const activeSmartError =
 		selectedLane === "smart" ? (smartError ?? detailSmartError) : null;
+	const activeTranslationPending =
+		selectedLane === "translated" &&
+		activeDetail?.translated != null &&
+		isPendingDetailStatus(activeDetail.translated.status);
+	const activeSmartPending =
+		selectedLane === "smart" &&
+		activeDetail?.smart != null &&
+		isPendingDetailStatus(activeDetail.smart.status);
 
-	const onTranslate = useCallback(() => {
-		if (!activeDetail || translating) return;
-		const requestSeq = translateRequestSeqRef.current + 1;
-		translateRequestSeqRef.current = requestSeq;
-		const requestReleaseId = activeDetail.release_id;
-		const preserveReadyTranslation = hasReadyTranslatedContent(
-			activeDetail.translated,
-		);
-		setTranslating(true);
-		setTranslateError(null);
-		void (async () => {
-			let requestId =
-				pendingTranslationRequestRef.current?.releaseId === requestReleaseId
-					? pendingTranslationRequestRef.current.requestId
-					: null;
-			let response: TranslationRequestResponse | null = null;
-			for (let attempt = 0; attempt < 2; attempt += 1) {
-				try {
-					response = requestId
-						? await apiGetTranslationRequest(requestId)
-						: await apiTranslateReleaseDetail(activeDetail);
-					const deadline = Date.now() + REQUEST_STATUS_POLL_WINDOW_MS;
-					while (isPendingTranslationResultStatus(response.result.status)) {
+	const onTranslate = useCallback(
+		(options?: { retry?: boolean }) => {
+			if (!activeDetail || translating) return;
+			const requestSeq = translateRequestSeqRef.current + 1;
+			translateRequestSeqRef.current = requestSeq;
+			const requestReleaseId = activeDetail.release_id;
+			const preserveReadyTranslation = hasReadyTranslatedContent(
+				activeDetail.translated,
+			);
+			setTranslating(true);
+			setTranslateError(null);
+			void (async () => {
+				let requestId =
+					pendingTranslationRequestRef.current?.releaseId === requestReleaseId
+						? pendingTranslationRequestRef.current.requestId
+						: null;
+				let response: TranslationRequestResponse | null = null;
+				for (let attempt = 0; attempt < 2; attempt += 1) {
+					try {
+						response =
+							options?.retry && requestId
+								? await apiRetryTranslationRequest(requestId)
+								: requestId
+									? await apiGetTranslationRequest(requestId)
+									: await apiTranslateReleaseDetail(activeDetail);
 						pendingTranslationRequestRef.current = {
 							releaseId: requestReleaseId,
 							requestId: response.request_id,
 						};
-						if (Date.now() >= deadline) {
-							return;
+						const deadline = Date.now() + REQUEST_STATUS_POLL_WINDOW_MS;
+						while (isPendingTranslationResultStatus(response.result.status)) {
+							pendingTranslationRequestRef.current = {
+								releaseId: requestReleaseId,
+								requestId: response.request_id,
+							};
+							const pendingTranslated =
+								mapTranslationResultToReleaseDetailTranslated(response.result);
+							if (pendingTranslated) {
+								setDetail((prev) => {
+									if (!prev || prev.release_id !== requestReleaseId)
+										return prev;
+									const translated =
+										preserveReadyTranslation &&
+										prev.translated?.status === "ready"
+											? {
+													...prev.translated,
+													status: pendingTranslated.status,
+													error_code: pendingTranslated.error_code,
+													error_summary: pendingTranslated.error_summary,
+													error_detail: pendingTranslated.error_detail,
+												}
+											: pendingTranslated;
+									return { ...prev, translated };
+								});
+								setTranslateError(null);
+							}
+							if (Date.now() >= deadline) {
+								return;
+							}
+							if (translateRequestSeqRef.current !== requestSeq) return;
+							await sleep(REQUEST_STATUS_POLL_INTERVAL_MS);
+							if (translateRequestSeqRef.current !== requestSeq) return;
+							response = await apiGetTranslationRequest(response.request_id);
 						}
-						if (translateRequestSeqRef.current !== requestSeq) return;
-						await sleep(REQUEST_STATUS_POLL_INTERVAL_MS);
-						if (translateRequestSeqRef.current !== requestSeq) return;
-						response = await apiGetTranslationRequest(response.request_id);
+						break;
+					} catch (error) {
+						if (!isMissingTranslationRequestError(error) || attempt === 1) {
+							throw error;
+						}
+						pendingTranslationRequestRef.current = null;
+						requestId = null;
 					}
-					break;
-				} catch (error) {
-					if (!isMissingTranslationRequestError(error) || attempt === 1) {
-						throw error;
-					}
-					pendingTranslationRequestRef.current = null;
-					requestId = null;
 				}
-			}
-			if (!response) {
-				throw new Error("translation request could not be recovered");
-			}
-			pendingTranslationRequestRef.current = null;
-			if (translateRequestSeqRef.current !== requestSeq) return;
-			const translated = mapTranslationResultToReleaseDetailTranslated(
-				response.result,
-			);
-			if (!translated) {
-				throw new Error(resolveErrorSummary(response.result, "翻译失败"));
-			}
-			if (preserveReadyTranslation && translated.status !== "ready") {
-				const failure =
-					translated.status === "disabled"
-						? toUiError(response.result, "AI 未配置，暂时无法重新翻译。")
-						: toUiError(response.result, "翻译失败，请稍后重试。");
-				pushErrorToast(
-					translated.status === "disabled" ? "翻译不可用" : "翻译失败",
-					failure.summary,
-					{ detail: failure.detail },
-				);
-				return;
-			}
-			setDetail((prev) => {
-				if (!prev) return prev;
-				if (prev.release_id !== requestReleaseId) return prev;
-				return { ...prev, translated };
-			});
-			setTranslateError(
-				translated.status === "error"
-					? toUiError(translated, "这次翻译没有成功完成。")
-					: null,
-			);
-			if (translated.status === "ready") {
-				setSelectedLane("translated");
-			}
-		})()
-			.catch((error) => {
+				if (!response) {
+					throw new Error("translation request could not be recovered");
+				}
 				if (translateRequestSeqRef.current !== requestSeq) return;
-				if (preserveReadyTranslation) {
-					const failure = toUnknownUiError(error, "翻译失败，请稍后重试。");
-					pushErrorToast("翻译失败", failure.summary, {
-						detail: failure.detail,
-					});
+				const translated = mapTranslationResultToReleaseDetailTranslated(
+					response.result,
+				);
+				if (!translated) {
+					throw new Error(resolveErrorSummary(response.result, "翻译失败"));
+				}
+				if (preserveReadyTranslation && translated.status !== "ready") {
+					const failure =
+						translated.status === "disabled"
+							? toUiError(response.result, "AI 未配置，暂时无法重新翻译。")
+							: toUiError(response.result, "翻译失败，请稍后重试。");
+					pushErrorToast(
+						translated.status === "disabled" ? "翻译不可用" : "翻译失败",
+						failure.summary,
+						{ detail: failure.detail },
+					);
 					return;
 				}
-				setTranslateError(toUnknownUiError(error, "翻译失败，请稍后重试。"));
-			})
-			.finally(() => {
-				if (translateRequestSeqRef.current !== requestSeq) return;
-				setTranslating(false);
-			});
-	}, [activeDetail, pushErrorToast, translating]);
+				setDetail((prev) => {
+					if (!prev) return prev;
+					if (prev.release_id !== requestReleaseId) return prev;
+					return { ...prev, translated };
+				});
+				setTranslateError(
+					translated.status === "error"
+						? toUiError(translated, "这次翻译没有成功完成。")
+						: null,
+				);
+				if (translated.status === "ready") {
+					setSelectedLane("translated");
+				}
+			})()
+				.catch((error) => {
+					if (translateRequestSeqRef.current !== requestSeq) return;
+					if (preserveReadyTranslation) {
+						const failure = toUnknownUiError(error, "翻译失败，请稍后重试。");
+						pushErrorToast("翻译失败", failure.summary, {
+							detail: failure.detail,
+						});
+						return;
+					}
+					setTranslateError(toUnknownUiError(error, "翻译失败，请稍后重试。"));
+				})
+				.finally(() => {
+					if (translateRequestSeqRef.current !== requestSeq) return;
+					setTranslating(false);
+				});
+		},
+		[activeDetail, pushErrorToast, translating],
+	);
 
 	const onResolveSmart = useCallback(
 		(options?: { selectLane?: boolean; retryOnError?: boolean }) => {
@@ -453,6 +541,15 @@ export function ReleaseDetailCard(props: {
 
 				while (result && isPendingTranslationResultStatus(result.status)) {
 					if (Date.now() >= deadline) {
+						const pendingSmart =
+							mapTranslationResultToReleaseDetailSmart(result);
+						if (pendingSmart) {
+							setDetail((prev) => {
+								if (!prev || prev.release_id !== requestReleaseId) return prev;
+								return { ...prev, smart: pendingSmart };
+							});
+							setSmartError(null);
+						}
 						return;
 					}
 					if (smartRequestSeqRef.current !== requestSeq) return;
@@ -527,12 +624,12 @@ export function ReleaseDetailCard(props: {
 			activeDetail.name?.trim() && activeDetail.name.trim().length > 0
 				? activeDetail.name
 				: activeDetail.tag_name;
-		const translatedTitle =
-			activeDetail.translated?.status === "ready"
-				? activeDetail.translated.title
-				: null;
-		const smartTitle =
-			activeDetail.smart?.status === "ready" ? activeDetail.smart.title : null;
+		const translatedTitle = hasTranslatedProjection(activeDetail.translated)
+			? activeDetail.translated?.title
+			: null;
+		const smartTitle = hasSmartProjection(activeDetail.smart)
+			? activeDetail.smart?.title
+			: null;
 		const title =
 			selectedLane === "translated"
 				? translatedTitle?.trim() || originalTitle
@@ -540,14 +637,12 @@ export function ReleaseDetailCard(props: {
 					? smartTitle?.trim() || originalTitle
 					: originalTitle;
 
-		const translatedBody =
-			activeDetail.translated?.status === "ready"
-				? activeDetail.translated.summary
-				: null;
-		const smartBody =
-			activeDetail.smart?.status === "ready"
-				? activeDetail.smart.summary
-				: null;
+		const translatedBody = hasTranslatedProjection(activeDetail.translated)
+			? activeDetail.translated?.summary
+			: null;
+		const smartBody = hasSmartProjection(activeDetail.smart)
+			? activeDetail.smart?.summary
+			: null;
 		const originalBody = activeDetail.body?.trim() ? activeDetail.body : null;
 		const body =
 			selectedLane === "translated"
@@ -601,8 +696,10 @@ export function ReleaseDetailCard(props: {
 								{RELEASE_DETAIL_LANES.map((option) => {
 									const isSelected = selectedLane === option.lane;
 									const isBusy =
-										(option.lane === "translated" && translating) ||
-										(option.lane === "smart" && smartResolving);
+										(option.lane === "translated" &&
+											(translating || activeTranslationPending)) ||
+										(option.lane === "smart" &&
+											(smartResolving || activeSmartPending));
 									const wasSelected = selectedLane === option.lane;
 									const isDisabled =
 										loading ||
@@ -724,7 +821,7 @@ export function ReleaseDetailCard(props: {
 											variant="outline"
 											size="sm"
 											className="font-mono text-xs"
-											onClick={onTranslate}
+											onClick={() => onTranslate({ retry: true })}
 											disabled={translating}
 										>
 											<RefreshCcw className="size-4" />
@@ -814,6 +911,16 @@ export function ReleaseDetailCard(props: {
 							/>
 						) : display ? (
 							<div className="space-y-3">
+								{activeTranslationPending ? (
+									<p role="status" className="text-sm text-muted-foreground">
+										{pendingStatusMessage(activeDetail?.translated?.status)}
+									</p>
+								) : null}
+								{activeSmartPending ? (
+									<p role="status" className="text-sm text-muted-foreground">
+										{pendingPolishStatusMessage(activeDetail?.smart?.status)}
+									</p>
+								) : null}
 								<h3 className="text-sm font-semibold tracking-tight">
 									{display.title}
 								</h3>

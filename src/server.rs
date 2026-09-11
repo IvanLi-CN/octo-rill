@@ -40,8 +40,8 @@ use crate::runtime::SQLITE_BUSY_TIMEOUT;
 use crate::session_store::CoordinatedSqliteSessionStore;
 use crate::state::AppState;
 use crate::{
-    admin_ai_records, admin_runtime, ai, api, auth, config::AppConfig, jobs, observability,
-    runtime, state, sync, translations, version, webhook_push,
+    admin_ai_records, admin_runtime, ai, api, auth, config::AppConfig, content_processing, jobs,
+    observability, runtime, state, sync, translations, version, webhook_push,
 };
 
 const SESSION_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
@@ -85,6 +85,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .await
         .context("failed to open sqlite database")?;
 
+    // SQLx validates every applied migration before startup. This deliberately
+    // rejects a migration-preceding binary once 0078 has been applied.
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
@@ -366,6 +368,14 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             patch(translations::admin_patch_translation_runtime_config),
         )
         .route(
+            "/admin/jobs/content-processing/cutover",
+            post(content_processing::admin_cutover),
+        )
+        .route(
+            "/admin/jobs/content-processing/freeze",
+            post(content_processing::admin_freeze),
+        )
+        .route(
             "/admin/jobs/translations/requests",
             get(translations::admin_list_translation_requests),
         )
@@ -436,6 +446,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route(
             "/translate/requests/{request_id}",
             get(translations::get_translation_request),
+        )
+        .route(
+            "/translate/requests/{request_id}/retry",
+            post(translations::retry_translation_request),
         )
         .route(
             "/translate/results",
@@ -569,6 +583,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             sync::spawn_repo_refresh_governance_retention_task(app_state.clone());
         let llm_call_recovery_abort_handle = ai::spawn_llm_call_recovery_task(app_state.clone());
         translations::spawn_translation_scheduler(app_state.clone()).await;
+        let global_content_processing_abort_handle =
+            content_processing::spawn_global_scheduler(app_state.clone());
         let translation_recovery_abort_handle =
             translations::spawn_translation_recovery_task(app_state.clone());
 
@@ -582,6 +598,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             task_recovery_abort_handle,
             repo_release_recovery_abort_handle,
             translation_recovery_abort_handle,
+            global_content_processing_abort_handle,
         ];
         if let Some(handle) = model_catalog_abort_handle {
             abort_handles.push(handle);

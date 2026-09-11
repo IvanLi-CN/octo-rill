@@ -22,6 +22,7 @@ export default defineConfig((env) =>
 									"feed-pagination-feedback",
 									"readable-initial-loading",
 									"repo-identity-overflow",
+									"content-projection-retention",
 								],
 								exclude: [],
 								skip: [],
