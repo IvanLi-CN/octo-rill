@@ -159,6 +159,7 @@ export function useDashboardReadableSections(options?: {
 	const detailsRef = useRef(details);
 	detailsRef.current = details;
 	const requestIdRef = useRef(0);
+	const lifecycleGenerationRef = useRef(0);
 	const refreshQueueRef = useRef<Promise<void>>(Promise.resolve());
 	const refreshInFlightRef = useRef(false);
 	const cursorInFlightRef = useRef(new Set<string>());
@@ -299,8 +300,13 @@ export function useDashboardReadableSections(options?: {
 	const loadInitial = useCallback(() => loadSections(false), [loadSections]);
 	const refresh = useCallback(
 		(options?: { throwOnError?: boolean }) => {
+			const generation = lifecycleGenerationRef.current;
 			const queued = refreshQueueRef.current.then(() =>
-				loadSections(true, options),
+				generation === lifecycleGenerationRef.current && enabled
+					? loadSections(true, options)
+					: options?.throwOnError
+						? Promise.reject(new Error("刷新已取消"))
+						: undefined,
 			);
 			refreshQueueRef.current = queued.catch(() => undefined);
 			return queued;
@@ -310,6 +316,7 @@ export function useDashboardReadableSections(options?: {
 
 	useEffect(() => {
 		if (!enabled) {
+			lifecycleGenerationRef.current += 1;
 			refreshInFlightRef.current = false;
 			setLoadingRefresh(false);
 			setLoadingInitial(false);
@@ -324,6 +331,7 @@ export function useDashboardReadableSections(options?: {
 		}
 		void loadInitial();
 		return () => {
+			lifecycleGenerationRef.current += 1;
 			requestIdRef.current += 1;
 		};
 	}, [enabled, loadInitial, signature]);

@@ -4244,14 +4244,18 @@ async fn recover_runtime_state_with_mode(
     .context("failed to load stale runtime tasks")?;
 
     for task in stale_tasks {
-        finalize_task(
+        if !recover_task_if_stale(
             state,
             task.id.as_str(),
-            STATUS_FAILED,
-            None,
-            Some(runtime::RUNTIME_LEASE_EXPIRED_ERROR.to_owned()),
+            task.runtime_owner_id.as_deref(),
+            task.lease_heartbeat_at.as_deref(),
+            cutoff.as_str(),
+            mode,
         )
-        .await?;
+        .await?
+        {
+            continue;
+        }
         append_task_event(
             state,
             task.id.as_str(),
@@ -4268,6 +4272,100 @@ async fn recover_runtime_state_with_mode(
     }
 
     Ok(())
+}
+
+async fn recover_task_if_stale(
+    state: &AppState,
+    task_id: &str,
+    previous_runtime_owner_id: Option<&str>,
+    previous_lease_heartbeat_at: Option<&str>,
+    cutoff: &str,
+    mode: runtime::RuntimeRecoveryMode,
+) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    state
+        .sqlite_writer
+        .write("job_task_recover", |_| async {
+            let updated = match mode {
+                runtime::RuntimeRecoveryMode::Startup => sqlx::query(
+                    r#"
+						UPDATE job_tasks
+						SET status = ?,
+						    error_message = ?,
+						    finished_at = ?,
+						    runtime_owner_id = NULL,
+						    lease_heartbeat_at = NULL,
+						    updated_at = ?
+						WHERE id = ?
+						  AND status = ?
+						  AND runtime_owner_id IS ?
+						  AND lease_heartbeat_at IS ?
+						  AND (
+						    runtime_owner_id IS NULL
+						    OR lease_heartbeat_at IS NULL
+						    OR julianday(lease_heartbeat_at) <= julianday(?)
+						    OR (
+						      runtime_owner_id != ?
+						      AND NOT EXISTS (
+						        SELECT 1
+						        FROM runtime_owners
+						        WHERE runtime_owner_id = job_tasks.runtime_owner_id
+						          AND julianday(lease_heartbeat_at) > julianday(?)
+						      )
+						    )
+						  )
+						"#,
+                )
+                .bind(STATUS_FAILED)
+                .bind(runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+                .bind(now.as_str())
+                .bind(now.as_str())
+                .bind(task_id)
+                .bind(STATUS_RUNNING)
+                .bind(previous_runtime_owner_id)
+                .bind(previous_lease_heartbeat_at)
+                .bind(cutoff)
+                .bind(state.runtime_owner_id.as_str())
+                .bind(cutoff)
+                .execute(&state.pool)
+                .await
+                .context("failed to recover stale startup task")?,
+                runtime::RuntimeRecoveryMode::Sweep => sqlx::query(
+                    r#"
+						UPDATE job_tasks
+						SET status = ?,
+						    error_message = ?,
+						    finished_at = ?,
+						    runtime_owner_id = NULL,
+						    lease_heartbeat_at = NULL,
+						    updated_at = ?
+						WHERE id = ?
+						  AND status = ?
+						  AND runtime_owner_id IS ?
+						  AND lease_heartbeat_at IS ?
+						  AND (
+						    runtime_owner_id IS NULL
+						    OR lease_heartbeat_at IS NULL
+						    OR julianday(lease_heartbeat_at) <= julianday(?)
+						  )
+						"#,
+                )
+                .bind(STATUS_FAILED)
+                .bind(runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+                .bind(now.as_str())
+                .bind(now.as_str())
+                .bind(task_id)
+                .bind(STATUS_RUNNING)
+                .bind(previous_runtime_owner_id)
+                .bind(previous_lease_heartbeat_at)
+                .bind(cutoff)
+                .execute(&state.pool)
+                .await
+                .context("failed to recover stale task")?,
+            };
+            Ok(updated.rows_affected() > 0)
+        })
+        .await
 }
 
 pub(crate) async fn is_task_cancel_requested(state: &AppState, task_id: &str) -> Result<bool> {
@@ -4442,8 +4540,8 @@ mod tests {
         load_recent_failed_brief_retry_candidates, load_recent_failed_translation_retry_candidates,
         load_translation_stream_cursor, load_translation_stream_rows, mark_brief_generation_source,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
-        recover_runtime_state, recover_runtime_state_on_startup, retry_candidate_is_retryable,
-        run_account_pause_maintenance_if_due, task_sse_response,
+        recover_runtime_state, recover_runtime_state_on_startup, recover_task_if_stale,
+        retry_candidate_is_retryable, run_account_pause_maintenance_if_due, task_sse_response,
         update_daily_brief_hour_slot_dispatch, upsert_dispatch_state,
     };
     use axum::body::to_bytes;
@@ -5711,6 +5809,93 @@ mod tests {
         .await
         .expect("load recovered task events");
         assert_eq!(event_types, vec!["task.recovered_failed"]);
+    }
+
+    #[tokio::test]
+    async fn stale_recovery_requires_the_original_lease_snapshot() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_task(
+            &pool,
+            "lease-revived-task",
+            TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE job_tasks
+            SET runtime_owner_id = ?, lease_heartbeat_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("worker-a")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("lease-revived-task")
+        .execute(&pool)
+        .await
+        .expect("seed stale lease");
+        sqlx::query(r#"UPDATE job_tasks SET lease_heartbeat_at = ? WHERE id = ?"#)
+            .bind("2026-03-06T00:02:00Z")
+            .bind("lease-revived-task")
+            .execute(&pool)
+            .await
+            .expect("revive lease");
+
+        let recovered = recover_task_if_stale(
+            state.as_ref(),
+            "lease-revived-task",
+            Some("worker-a"),
+            Some("2026-03-06T00:00:00Z"),
+            "2026-03-06T00:01:00Z",
+            super::runtime::RuntimeRecoveryMode::Sweep,
+        )
+        .await
+        .expect("recover task");
+
+        assert!(!recovered);
+        let status =
+            sqlx::query_scalar::<_, String>(r#"SELECT status FROM job_tasks WHERE id = ?"#)
+                .bind("lease-revived-task")
+                .fetch_one(&pool)
+                .await
+                .expect("load revived task status");
+        assert_eq!(status, STATUS_RUNNING);
+    }
+
+    #[tokio::test]
+    async fn concurrent_recovery_appends_only_one_terminal_event() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_task(
+            &pool,
+            "concurrent-recovery-task",
+            TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+
+        let (first, second) = tokio::join!(
+            recover_runtime_state(state.as_ref()),
+            recover_runtime_state(state.as_ref()),
+        );
+        first.expect("first recovery");
+        second.expect("second recovery");
+
+        let event_count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_task_events
+            WHERE task_id = ? AND event_type = 'task.recovered_failed'
+            "#,
+        )
+        .bind("concurrent-recovery-task")
+        .fetch_one(&pool)
+        .await
+        .expect("count recovery events");
+        assert_eq!(event_count, 1);
     }
 
     #[tokio::test]
