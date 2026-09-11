@@ -2527,11 +2527,23 @@ mod tests {
             .await
             .expect("create release work items");
         sqlx::query(
-            "CREATE TABLE translation_work_items (entity_id TEXT, kind TEXT, attempt_count INTEGER)",
+            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, entity_id TEXT, kind TEXT, status TEXT, result_status TEXT, attempt_count INTEGER, updated_at TEXT)",
         )
         .execute(&pool)
         .await
         .expect("create translation work items");
+        sqlx::query(
+            "CREATE TABLE content_legacy_observations (canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, legacy_table TEXT, observation_basis_json TEXT, classification TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create legacy observations");
+        sqlx::query(
+            "CREATE TABLE admin_collection_processing_coverage (record_kind TEXT, record_id TEXT, pipeline TEXT, status_origin TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create processing coverage");
         sqlx::query(
             "INSERT INTO repo_releases (release_id, repo_id, name, tag_name, published_at, created_at, updated_at, detected_at) VALUES (100, 1, 'legacy', 'v1', '2026-07-08T09:00:00Z', '2026-07-08T09:00:00Z', '2026-07-08T09:00:00Z', NULL), (101, 1, 'processed', 'v2', '2026-07-08T08:00:00Z', '2026-07-08T08:00:00Z', '2026-07-08T08:00:00Z', NULL)",
         )
@@ -2539,36 +2551,46 @@ mod tests {
         .await
         .expect("seed releases");
         sqlx::query(
-            "INSERT INTO translation_work_items (entity_id, kind, attempt_count) VALUES ('101', 'release_detail', 2), ('101', 'release_smart', 1)",
+            "INSERT INTO translation_work_items (id, entity_id, kind, status, attempt_count, updated_at) VALUES ('work-101-detail', '101', 'release_detail', 'completed', 2, '2026-07-08T08:01:00Z'), ('work-101-smart', '101', 'release_smart', 'completed', 1, '2026-07-08T08:02:00Z')",
         )
         .execute(&pool)
         .await
         .expect("seed attempts");
 
-        let rows = list_source_rows(
+        let (total, rows) = list_collection_page(
             &pool,
             CollectionRecordKind::Release,
             false,
             Some("2026-07-08T07:00:00Z"),
             Some("2026-07-08T10:00:00Z"),
             AttemptCountRange { min: 0, max: None },
+            None,
+            None,
+            1,
+            0,
         )
         .await
         .expect("list releases");
-        assert_eq!(rows.len(), 2);
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "100");
         assert_eq!(rows[0].detected_at, None);
 
-        let rows = list_source_rows(
+        let (total, rows) = list_collection_page(
             &pool,
             CollectionRecordKind::Release,
             false,
             Some("2026-07-08T07:00:00Z"),
             Some("2026-07-08T10:00:00Z"),
             AttemptCountRange { min: 2, max: None },
+            None,
+            None,
+            1,
+            0,
         )
         .await
         .expect("filter releases by attempts");
+        assert_eq!(total, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "101");
     }
@@ -2583,27 +2605,44 @@ mod tests {
             .await
             .expect("create social events");
         sqlx::query(
-            "CREATE TABLE translation_work_items (entity_id TEXT, kind TEXT, attempt_count INTEGER)",
+            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, entity_id TEXT, kind TEXT, status TEXT, result_status TEXT, attempt_count INTEGER, updated_at TEXT)",
         )
         .execute(&pool)
         .await
         .expect("create announcement work items");
+        sqlx::query(
+            "CREATE TABLE content_legacy_observations (canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, legacy_table TEXT, observation_basis_json TEXT, classification TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create legacy observations");
+        sqlx::query(
+            "CREATE TABLE admin_collection_processing_coverage (record_kind TEXT, record_id TEXT, pipeline TEXT, status_origin TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create processing coverage");
         sqlx::query(
             "INSERT INTO social_activity_events (repo_full_name, discussion_number, title, occurred_at, detected_at, kind) VALUES ('octo/demo', 42, '公告', '2026-07-08T09:00:00Z', '2026-07-08T01:00:00Z', 'announcement')",
         )
         .execute(&pool)
         .await
         .expect("seed announcement");
-        let announcement_rows = list_source_rows(
+        let (announcement_total, announcement_rows) = list_collection_page(
             &pool,
             CollectionRecordKind::Announcement,
             false,
             Some("2026-07-08T08:00:00Z"),
             Some("2026-07-08T10:00:00Z"),
             AttemptCountRange { min: 0, max: None },
+            None,
+            None,
+            20,
+            0,
         )
         .await
         .expect("list announcements");
+        assert_eq!(announcement_total, 1);
         assert_eq!(announcement_rows.len(), 1);
 
         sqlx::query("CREATE TABLE briefs (id TEXT, date TEXT, created_at TEXT)")
@@ -2679,6 +2718,36 @@ mod tests {
         assert_eq!(row.title, "Newest issue");
         assert_eq!(row.occurred_at.as_deref(), Some("2026-07-08T09:05:00Z"));
         assert_eq!(row.detected_at, None);
+    }
+
+    #[tokio::test]
+    async fn notification_canonical_source_breaks_updated_at_ties_by_id() {
+        let pool = test_pool().await;
+        create_notifications_fixture(&pool).await;
+        sqlx::query("INSERT INTO users (id) VALUES ('user-d')")
+            .execute(&pool)
+            .await
+            .expect("seed tie-break user");
+        sqlx::query(
+            "UPDATE notifications SET repo_full_name = 'octo/lower', subject_title = 'Lower ID', updated_at = '2026-07-08T08:30:00Z' WHERE id = 'notification-3'",
+        )
+        .execute(&pool)
+        .await
+        .expect("update lower id notification");
+        sqlx::query(
+            "INSERT INTO notifications (id, user_id, thread_id, repo_full_name, subject_title, updated_at) VALUES ('notification-4', 'user-d', 'thread-2', 'octo/higher', 'Higher ID', '2026-07-08T08:30:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed higher id notification");
+
+        let row = load_source_record(&pool, CollectionRecordKind::Notification, "thread-2")
+            .await
+            .expect("load tied notification");
+
+        assert_eq!(row.repository.as_deref(), Some("octo/higher"));
+        assert_eq!(row.title, "Higher ID");
+        assert_eq!(row.occurred_at.as_deref(), Some("2026-07-08T08:30:00Z"));
     }
 
     #[test]

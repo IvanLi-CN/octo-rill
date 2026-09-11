@@ -2644,6 +2644,20 @@ mod tests {
             .unwrap(),
             2
         );
+        let notification_index_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_notifications_admin_canonical_source'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(notification_index_sql.contains("(thread_id, updated_at DESC, id DESC)"));
+        let work_item_index_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_translation_work_items_admin_entity_kind_attempt'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(work_item_index_sql.contains("(entity_id, kind, attempt_count DESC)"));
         assert_eq!(
             sqlx::query_scalar::<_, String>(
                 "SELECT mode FROM content_processing_control WHERE id = 1",
