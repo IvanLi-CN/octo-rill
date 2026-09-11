@@ -441,14 +441,12 @@ export function useDashboardReadableSections(options?: {
 
 	const retry = useCallback(async () => {
 		if (error?.phase === "append") {
-			await loadMore();
-			return;
+			return loadMore();
 		}
 		if (error?.phase === "refresh") {
-			await refresh();
-			return;
+			return refresh();
 		}
-		await loadInitial();
+		return loadInitial();
 	}, [error?.phase, loadInitial, loadMore, refresh]);
 
 	const loadSectionItems = useCallback(
