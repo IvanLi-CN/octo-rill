@@ -2683,6 +2683,19 @@ export function Dashboard(props: {
 			scrollToFreshFeedTop,
 		],
 	);
+	const retryReadableSections = useCallback(async () => {
+		const result = await readableSections.retry();
+		if (result !== "applied") return;
+		const notice = activeFeedNotice;
+		if (!notice) return;
+		dismissFeedBoundary(notice.boundaryId);
+		await checkDashboardUpdates({ emit: false, include: ["feed"] });
+	}, [
+		activeFeedNotice,
+		checkDashboardUpdates,
+		dismissFeedBoundary,
+		readableSections.retry,
+	]);
 
 	useEffect(() => {
 		const notice = activeFeedNotice;
@@ -2709,7 +2722,7 @@ export function Dashboard(props: {
 		if (readableSectionsActive) {
 			void refreshFeed()
 				.then((result) => {
-					if (result !== "applied") {
+					if (result === "superseded") {
 						if (
 							hydratedFeedNoticeRef.current.get(notice.boundaryId) ===
 							hydratedKey
@@ -2718,6 +2731,7 @@ export function Dashboard(props: {
 						}
 						return;
 					}
+					if (result !== "applied") return;
 					restoreFeedScrollAnchor(anchor);
 					dismissFeedBoundary(notice.boundaryId);
 					void checkDashboardUpdates({ emit: false, include: ["feed"] });
@@ -4141,7 +4155,7 @@ export function Dashboard(props: {
 								variant="outline"
 								size="sm"
 								className="w-full border-amber-300/60 bg-background/70 font-mono text-xs hover:bg-background sm:w-auto"
-								onClick={() => void readableSections.retry()}
+								onClick={() => void retryReadableSections()}
 							>
 								<RefreshCcw className="size-4" />
 								重试刷新

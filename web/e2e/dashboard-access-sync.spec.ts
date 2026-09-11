@@ -2434,13 +2434,9 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 	page,
 }) => {
 	let feedCalls = 0;
+	let updatesCalls = 0;
 	let failRefresh = true;
-	let refreshWindowOpen = false;
-	page.on("console", (message) => {
-		if (message.text() === "readable-refresh-start") {
-			refreshWindowOpen = true;
-		}
-	});
+	let liveNoticeReceived = false;
 	await page.addInitScript(
 		({ taskId }) => {
 			class MockEventSource {
@@ -2451,19 +2447,6 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 				constructor(url: string | URL) {
 					window.setTimeout(() => this.onopen?.(new Event("open")), 0);
 					if (!String(url).endsWith(`/api/tasks/${taskId}/events`)) return;
-					window.setTimeout(() => {
-						const event = new MessageEvent("task.progress", {
-							data: JSON.stringify({
-								task_id: taskId,
-								stage: "star_refreshed",
-								repos: 1,
-							}),
-						});
-						console.log("readable-refresh-start");
-						for (const listener of this.listeners.get("task.progress") ?? []) {
-							listener(event);
-						}
-					}, 800);
 				}
 
 				addEventListener(type: string, listener: (event: Event) => unknown) {
@@ -2515,7 +2498,7 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 		}
 		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
 			feedCalls += 1;
-			if (refreshWindowOpen && failRefresh) {
+			if (liveNoticeReceived && failRefresh) {
 				return json(
 					route,
 					{ error: { code: "upstream", message: "temporary refresh failure" } },
@@ -2556,10 +2539,19 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 			return json(route, { ok: true, version: "1.2.3" });
 		}
 		if (req.method() === "GET" && pathname === "/api/dashboard/updates") {
+			updatesCalls += 1;
+			if (updatesCalls === 1) liveNoticeReceived = true;
 			return json(route, {
-				token: "updates-token",
+				token: `updates-token-${updatesCalls}`,
 				lists: {
-					feed: { changed: false, new_count: 0, latest_keys: [] },
+					feed:
+						updatesCalls === 1
+							? {
+									changed: true,
+									new_count: 1,
+									latest_keys: ["release:refresh-error-item"],
+								}
+							: { changed: false, new_count: 0, latest_keys: [] },
 					briefs: { changed: false, new_count: 0, latest_keys: [] },
 					notifications: { changed: false, new_count: 0, latest_keys: [] },
 				},
@@ -2579,10 +2571,14 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 	);
 	await expect(refreshError).toBeVisible();
 	await expect(page.getByText("Cached release")).toBeVisible();
+	const callsBeforeRetry = feedCalls;
+	expect(callsBeforeRetry).toBeGreaterThanOrEqual(2);
 	failRefresh = false;
 	await refreshError.getByRole("button", { name: "重试刷新" }).click();
 	await expect(page.getByText("Fresh release")).toBeVisible();
-	expect(feedCalls).toBeGreaterThanOrEqual(2);
+	await page.waitForTimeout(250);
+	expect(feedCalls).toBe(callsBeforeRetry + 1);
+	expect(updatesCalls).toBeGreaterThanOrEqual(2);
 });
 
 test("dashboard opens access sync warmup bubble immediately after clicking sync", async ({
