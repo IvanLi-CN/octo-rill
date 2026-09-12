@@ -1,4 +1,6 @@
 import {
+	ChevronDown,
+	ChevronRight,
 	ArrowLeft,
 	CalendarClock,
 	Copy,
@@ -10,7 +12,7 @@ import {
 	Package,
 	Plus,
 	ShieldAlert,
-	SearchCheck,
+	RefreshCw,
 	Trash2,
 	Unlink2,
 	Webhook,
@@ -34,6 +36,7 @@ import {
 	type PasskeySummary,
 	type MeProfileResponse,
 	type WebhookPushSettingsResponse,
+	type WebhookPushDesiredState,
 	apiCreateMeApiKey,
 	apiDeleteMeApiKey,
 	apiDeleteMePasskey,
@@ -49,9 +52,7 @@ import {
 	apiPostPasskeyRegisterVerify,
 	apiPatchMeProfile,
 	apiPatchMeWebhookPush,
-	apiRegisterMeWebhookPush,
-	apiCheckMeWebhookPush,
-	apiDeleteMeWebhookPushHooks,
+	apiReconcileMeWebhookPush,
 } from "@/api";
 import {
 	browserSupportsPasskeys,
@@ -246,6 +247,18 @@ function formatDateTime(value: string | null | undefined) {
 	return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
+function formatRelativeCheck(value: string | null | undefined) {
+	if (!value) return "尚未检查";
+	const elapsed = Math.max(0, Date.now() - new Date(value).getTime());
+	const minutes = Math.floor(elapsed / 60_000);
+	if (minutes < 1) return "刚刚完成";
+	if (minutes < 60) return `${minutes} 分钟前`;
+	const hours = Math.floor(minutes / 60);
+	if (hours < 24) return `${hours} 小时前`;
+	const days = Math.floor(hours / 24);
+	return `${days} 天前`;
+}
+
 function avatarFallbackText(name: string | null | undefined, login: string) {
 	const source = (name ?? login).trim();
 	const normalized = source
@@ -394,6 +407,15 @@ export function SettingsPage(props: {
 		null,
 	);
 	const [webhookPushConfirmOpen, setWebhookPushConfirmOpen] = useState(false);
+	const [webhookPushConfirmMode, setWebhookPushConfirmMode] = useState<
+		"enable" | "disable" | "my-releases"
+	>("enable");
+	const [webhookDisableChoice, setWebhookDisableChoice] = useState<
+		"paused" | "deleted"
+	>("paused");
+	const [expandedWebhookOwners, setExpandedWebhookOwners] = useState<
+		Record<string, boolean>
+	>({});
 
 	const activeGitHubStatusMeta = githubStatus
 		? (GITHUB_STATUS_META[githubStatus] ?? null)
@@ -729,22 +751,18 @@ export function SettingsPage(props: {
 	}, [briefProfileDraft, includeOwnReleases, loadWebhookPush, onProfileSaved]);
 
 	const runWebhookPushAction = useCallback(
-		async (action: "register" | "check" | "delete", repoId?: number) => {
-			const busyKey = repoId === undefined ? action : `${action}:${repoId}`;
+		async (repoId?: number) => {
+			const busyKey =
+				repoId === undefined ? "reconcile" : `reconcile:${repoId}`;
 			setWebhookPushBusy(busyKey);
 			setWebhookPushError(null);
 			setWebhookPushNotice(null);
 			try {
-				const task =
-					action === "register"
-						? await apiRegisterMeWebhookPush(repoId)
-						: action === "check"
-							? await apiCheckMeWebhookPush(repoId)
-							: await apiDeleteMeWebhookPushHooks();
+				await apiReconcileMeWebhookPush(repoId);
 				setWebhookPushNotice(
-					task.reused
-						? "相同操作已在队列中，无需重复提交。"
-						: `${action === "register" ? "注册" : action === "check" ? "检查" : "删除"}任务已排队。`,
+					repoId === undefined
+						? "检查并修复任务已排队。"
+						: "该仓库的修复任务已排队。",
 				);
 				window.setTimeout(() => void loadWebhookPush(), 1200);
 			} catch (err) {
@@ -756,20 +774,21 @@ export function SettingsPage(props: {
 		[loadWebhookPush],
 	);
 
+	const openWebhookDisableDialog = useCallback(
+		(mode: "disable" | "my-releases") => {
+			setWebhookPushConfirmMode(mode);
+			setWebhookDisableChoice("paused");
+			setWebhookPushConfirmOpen(true);
+		},
+		[],
+	);
+
 	const onWebhookPushToggle = useCallback(
 		(checked: boolean) => {
 			setWebhookPushError(null);
 			setWebhookPushNotice(null);
 			if (!checked) {
-				setWebhookPushBusy("toggle");
-				void apiPatchMeWebhookPush(false)
-					.then(() => loadWebhookPush())
-					.catch((err) =>
-						setWebhookPushError(
-							err instanceof Error ? err.message : String(err),
-						),
-					)
-					.finally(() => setWebhookPushBusy(null));
+				openWebhookDisableDialog("disable");
 				return;
 			}
 			if (!includeOwnReleases) {
@@ -788,25 +807,62 @@ export function SettingsPage(props: {
 				);
 				return;
 			}
+			setWebhookPushConfirmMode("enable");
 			setWebhookPushConfirmOpen(true);
 		},
-		[includeOwnReleases, webhookPush],
+		[includeOwnReleases, openWebhookDisableDialog, webhookPush],
 	);
 
-	const confirmWebhookPushEnable = useCallback(() => {
+	const onOwnReleasesToggle = useCallback(
+		(checked: boolean) => {
+			if (!checked) {
+				openWebhookDisableDialog("my-releases");
+				return;
+			}
+			setIncludeOwnReleases(checked);
+		},
+		[openWebhookDisableDialog],
+	);
+
+	const confirmWebhookPushAction = useCallback(() => {
 		setWebhookPushBusy("toggle");
 		setWebhookPushError(null);
-		void apiPatchMeWebhookPush(true)
+		const desiredState: WebhookPushDesiredState =
+			webhookPushConfirmMode === "enable" ? "enabled" : webhookDisableChoice;
+		const updateOwnReleases = webhookPushConfirmMode === "my-releases";
+		void (
+			updateOwnReleases
+				? apiPatchMeProfile({
+						...briefProfileDraft,
+						include_own_releases: false,
+						webhook_push_desired_state: desiredState,
+					})
+				: apiPatchMeWebhookPush(desiredState)
+		)
 			.then(async () => {
+				if (updateOwnReleases) setIncludeOwnReleases(false);
+				await loadBriefProfile();
 				await loadWebhookPush();
 				setWebhookPushConfirmOpen(false);
-				setWebhookPushNotice("Webhook 推送已开启，全部注册任务已排队。");
+				setWebhookPushNotice(
+					desiredState === "enabled"
+						? "Webhook 推送已启用，对齐任务已排队。"
+						: desiredState === "paused"
+							? "已停止本地接收，暂停 Hook 的任务已排队。"
+							: "已停止本地接收，删除 Hook 的任务已排队。",
+				);
 			})
 			.catch((err) =>
 				setWebhookPushError(err instanceof Error ? err.message : String(err)),
 			)
 			.finally(() => setWebhookPushBusy(null));
-	}, [loadWebhookPush]);
+	}, [
+		briefProfileDraft,
+		loadBriefProfile,
+		loadWebhookPush,
+		webhookDisableChoice,
+		webhookPushConfirmMode,
+	]);
 
 	const patTone = useMemo(() => {
 		if (patCheckState === "valid") return "success";
@@ -1524,7 +1580,7 @@ export function SettingsPage(props: {
 										</div>
 										<Switch
 											checked={includeOwnReleases}
-											onCheckedChange={setIncludeOwnReleases}
+											onCheckedChange={onOwnReleasesToggle}
 											aria-label="我的发布"
 											disabled={profileBusy}
 										/>
@@ -1565,15 +1621,17 @@ export function SettingsPage(props: {
 														Webhook 推送
 													</p>
 													<Badge
-														variant={
-															webhookPush?.enabled ? "secondary" : "outline"
+														className={
+															webhookPush?.desired_state === "enabled"
+																? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+																: "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300"
 														}
 													>
 														{webhookPushLoading
 															? "读取中"
-															: webhookPush?.enabled
-																? "已开启"
-																: "已关闭"}
+															: webhookPush?.desired_state === "enabled"
+																? "已启用"
+																: "未启用"}
 													</Badge>
 												</div>
 												<p className="text-muted-foreground text-sm leading-6">
@@ -1587,12 +1645,12 @@ export function SettingsPage(props: {
 												) : null}
 											</div>
 											<Switch
-												checked={webhookPush?.enabled ?? false}
+												checked={webhookPush?.desired_state === "enabled"}
 												onCheckedChange={onWebhookPushToggle}
 												aria-label="Webhook 推送"
 												disabled={
 													webhookPushLoading ||
-													webhookPushBusy === "toggle" ||
+													webhookPushBusy !== null ||
 													(!includeOwnReleases && !webhookPush?.enabled)
 												}
 											/>
@@ -1652,17 +1710,29 @@ export function SettingsPage(props: {
 
 										<div className="mt-4 grid gap-3 sm:grid-cols-2">
 											<DetailItem
-												label="最近定时巡查"
+												label="最近完成检查"
 												value={
-													webhookPush?.schedule.last_started_at
-														? formatDateTime(
-																webhookPush.schedule.last_started_at,
-															)
-														: "尚未执行"
+													webhookPush?.desired_state === "enabled" ? (
+														<span
+															title={
+																webhookPush.last_completed_check_at
+																	? formatDateTime(
+																			webhookPush.last_completed_check_at,
+																		)
+																	: undefined
+															}
+														>
+															{formatRelativeCheck(
+																webhookPush.last_completed_check_at,
+															)}
+														</span>
+													) : (
+														"未启用"
+													)
 												}
 											/>
 											<DetailItem
-												label="下次定时巡查"
+												label="后台巡查"
 												value={
 													webhookPush?.schedule.next_started_at
 														? formatDateTime(
@@ -1670,154 +1740,177 @@ export function SettingsPage(props: {
 															)
 														: `每 ${webhookPush?.schedule.audit_interval_days ?? 7} 天`
 												}
-												hint="权限暂停的仓库会跳过，直到手动注册成功。"
+												hint="已启用目标会由后台任务持续对齐。"
 											/>
 										</div>
 
 										<div className="mt-4 flex flex-wrap gap-2">
-											{webhookPush?.enabled ? (
-												<>
-													<Button
-														className="max-sm:min-h-11"
-														size="sm"
-														variant="outline"
-														disabled={webhookPushBusy !== null}
-														onClick={() =>
-															void runWebhookPushAction("register")
-														}
-													>
-														{webhookPushBusy === "register" ? (
-															<LoaderCircle className="size-4 animate-spin" />
-														) : (
-															<Webhook className="size-4" />
-														)}
-														全部注册 Webhook
-													</Button>
-													<Button
-														className="max-sm:min-h-11"
-														size="sm"
-														variant="outline"
-														disabled={webhookPushBusy !== null}
-														onClick={() => void runWebhookPushAction("check")}
-													>
-														{webhookPushBusy === "check" ? (
-															<LoaderCircle className="size-4 animate-spin" />
-														) : (
-															<SearchCheck className="size-4" />
-														)}
-														全部检查 Webhook
-													</Button>
-												</>
-											) : (
-												<Button
-													className="max-sm:min-h-11"
-													size="sm"
-													variant="destructive"
-													disabled={
-														(webhookPush?.summary.removable ?? 0) === 0 ||
-														webhookPushBusy !== null
-													}
-													onClick={() => void runWebhookPushAction("delete")}
-												>
-													{webhookPushBusy === "delete" ? (
-														<LoaderCircle className="size-4 animate-spin" />
-													) : (
-														<Trash2 className="size-4" />
-													)}
-													全部删除 Webhook
-												</Button>
-											)}
+											<Button
+												className="max-sm:min-h-11"
+												size="sm"
+												variant="outline"
+												disabled={
+													webhookPushBusy !== null ||
+													webhookPush?.operation !== null ||
+													!includeOwnReleases ||
+													webhookPush?.desired_state !== "enabled"
+												}
+												onClick={() => void runWebhookPushAction()}
+											>
+												{webhookPushBusy === "reconcile" ? (
+													<LoaderCircle className="size-4 animate-spin" />
+												) : (
+													<RefreshCw className="size-4" />
+												)}
+												立即检查并修复
+											</Button>
 										</div>
 
-										{webhookPush?.repos.length ? (
-											<div className="mt-5 divide-y rounded-lg border">
-												{webhookPush.repos.map((repo) => (
-													<div
-														className="flex flex-col gap-3 p-3 sm:flex-row sm:items-center sm:justify-between"
-														key={repo.repo_id}
-													>
-														<div className="min-w-0 space-y-1">
-															<div className="flex flex-wrap items-center gap-2">
-																<p className="truncate font-medium text-sm">
-																	{repo.repo_full_name}
-																</p>
-																<Badge
-																	variant={
-																		repo.permission_paused
-																			? "destructive"
-																			: repo.status === "registered"
-																				? "secondary"
-																				: "outline"
-																	}
-																>
-																	{repo.permission_paused
-																		? "权限暂停"
-																		: repo.status === "delete_pending"
-																			? "删除中"
-																			: repo.status === "registered"
-																				? "已注册"
-																				: repo.status === "missing"
-																					? "缺失"
-																					: "异常"}
-																</Badge>
-															</div>
-															{repo.error_message ? (
-																<p className="text-destructive text-sm">
-																	{repo.error_message}
-																</p>
-															) : null}
-															{repo.permission_paused ? (
-																<InternalLink
-																	className="inline-flex text-sm underline underline-offset-4"
-																	href={buildSettingsHref("github-pat")}
-																	to={buildSettingsHref("github-pat")}
-																>
-																	更新 classic PAT 的 repo 或 public_repo 权限
-																</InternalLink>
+										{webhookPush?.owner_groups.length ? (
+											<div className="mt-5 space-y-3">
+												{webhookPush.owner_groups.map((group) => {
+													const expanded =
+														expandedWebhookOwners[group.owner_login] ??
+														webhookPush.desired_state !== "paused";
+													return (
+														<div
+															className="overflow-hidden rounded-lg border"
+															key={group.owner_login}
+														>
+															<button
+																className="flex min-h-12 w-full items-center justify-between gap-3 bg-muted/20 px-3 py-2 text-left hover:bg-muted/35"
+																type="button"
+																aria-expanded={expanded}
+																onClick={() =>
+																	setExpandedWebhookOwners((current) => ({
+																		...current,
+																		[group.owner_login]: !expanded,
+																	}))
+																}
+															>
+																<span className="flex min-w-0 items-center gap-2">
+																	{expanded ? (
+																		<ChevronDown className="size-4" />
+																	) : (
+																		<ChevronRight className="size-4" />
+																	)}
+																	<span className="truncate font-medium text-sm">
+																		@{group.owner_login}
+																	</span>
+																</span>
+																<span className="text-muted-foreground text-xs">
+																	{group.repo_count} 个仓库 ·{" "}
+																	{group.pending_count} 项待处理
+																</span>
+															</button>
+															{expanded ? (
+																<div className="divide-y">
+																	{group.repos.map((repo) => (
+																		<div
+																			className="flex flex-col gap-3 p-3 sm:flex-row sm:items-center sm:justify-between"
+																			key={repo.repo_id}
+																		>
+																			<div className="min-w-0 space-y-1">
+																				<div className="flex flex-wrap items-center gap-2">
+																					<p className="truncate font-medium text-sm">
+																						{repo.repo_name}
+																					</p>
+																					<Badge
+																						variant={
+																							repo.permission_paused ||
+																							repo.status === "error"
+																								? "destructive"
+																								: repo.status === "registered"
+																									? "secondary"
+																									: "outline"
+																						}
+																					>
+																						{repo.permission_paused
+																							? "权限暂停"
+																							: repo.status ===
+																									"waiting_registration"
+																								? "等待注册"
+																								: repo.status === "registering"
+																									? "注册中"
+																									: repo.status === "processing"
+																										? "处理中"
+																										: repo.status ===
+																												"delete_pending"
+																											? "处理中"
+																											: repo.status ===
+																													"registered"
+																												? "已注册"
+																												: repo.status ===
+																														"missing"
+																													? "缺失"
+																													: "待处理"}
+																					</Badge>
+																				</div>
+																				{repo.error_message ? (
+																					<div className="space-y-1">
+																						<p className="text-destructive text-sm">
+																							{repo.error_message}
+																						</p>
+																						<details className="text-muted-foreground text-xs">
+																							<summary className="cursor-pointer select-none">
+																								技术详情
+																							</summary>
+																							<div className="mt-1 space-y-1 font-mono leading-5">
+																								{repo.error_kind ? (
+																									<p>类型：{repo.error_kind}</p>
+																								) : null}
+																								<p>状态：{repo.status}</p>
+																							</div>
+																						</details>
+																					</div>
+																				) : null}
+																				{repo.permission_paused ? (
+																					<InternalLink
+																						className="inline-flex text-sm underline underline-offset-4"
+																						href={buildSettingsHref(
+																							"github-pat",
+																						)}
+																						to={buildSettingsHref("github-pat")}
+																					>
+																						更新 classic PAT 的 repo 或
+																						public_repo 权限
+																					</InternalLink>
+																				) : null}
+																			</div>
+																			{webhookPush.desired_state ===
+																			"enabled" ? (
+																				<Button
+																					className="max-sm:min-h-11"
+																					size="sm"
+																					variant="outline"
+																					disabled={
+																						webhookPushBusy !== null ||
+																						webhookPush.operation !== null ||
+																						!includeOwnReleases
+																					}
+																					aria-label={`重试 ${repo.repo_name}`}
+																					onClick={() =>
+																						void runWebhookPushAction(
+																							repo.repo_id,
+																						)
+																					}
+																				>
+																					{webhookPushBusy ===
+																					`reconcile:${repo.repo_id}` ? (
+																						<LoaderCircle className="size-4 animate-spin" />
+																					) : (
+																						<RefreshCw className="size-4" />
+																					)}
+																					重试
+																				</Button>
+																			) : null}
+																		</div>
+																	))}
+																</div>
 															) : null}
 														</div>
-														{webhookPush.enabled ? (
-															<div className="flex shrink-0 gap-2">
-																<Button
-																	className="max-sm:min-h-11"
-																	size="sm"
-																	variant="outline"
-																	disabled={
-																		!webhookPush.enabled ||
-																		webhookPushBusy !== null
-																	}
-																	onClick={() =>
-																		void runWebhookPushAction(
-																			"register",
-																			repo.repo_id,
-																		)
-																	}
-																>
-																	{repo.status === "registered"
-																		? "重新注册 Webhook"
-																		: "注册 Webhook"}
-																</Button>
-																<Button
-																	className="max-sm:min-h-11"
-																	size="sm"
-																	variant="ghost"
-																	disabled={
-																		!webhookPush.enabled ||
-																		webhookPushBusy !== null
-																	}
-																	onClick={() =>
-																		void runWebhookPushAction(
-																			"check",
-																			repo.repo_id,
-																		)
-																	}
-																>
-																	检查
-																</Button>
-															</div>
-														) : null}
-													</div>
-												))}
+													);
+												})}
 											</div>
 										) : null}
 									</div>
@@ -1830,18 +1923,78 @@ export function SettingsPage(props: {
 							>
 								<AlertDialogContent>
 									<AlertDialogHeader>
-										<AlertDialogTitle>开启 Webhook 推送？</AlertDialogTitle>
-										<AlertDialogDescription className="space-y-3 text-left leading-6">
-											<span className="block">
-												本次启用立即使用当前 classic PAT 的{" "}
-												<strong>repo</strong> 或 <strong>public_repo</strong>{" "}
-												权限，在 PAT 所属账号的个人 owner 仓库中注册仅监听
-												Release 的 webhook。
-											</span>
-											<span className="block">
-												本次启用会为当前用户生成并加密保存签名
-												secret；当前接收范围仅为新 Release，事件进入同步队列。
-											</span>
+										<AlertDialogTitle>
+											{webhookPushConfirmMode === "enable"
+												? "启用 Webhook 推送？"
+												: webhookDisableChoice === "paused"
+													? "暂停 Webhook 推送？"
+													: "删除 Webhook？"}
+										</AlertDialogTitle>
+										<AlertDialogDescription asChild>
+											<div className="space-y-3 text-left leading-6">
+												{webhookPushConfirmMode === "enable" ? (
+													<>
+														<span className="block">
+															本次启用使用当前 classic PAT 的{" "}
+															<strong>repo</strong> 或{" "}
+															<strong>public_repo</strong> 权限，在 PAT
+															所属账号的个人 owner 仓库中注册仅监听 Release 的
+															webhook。
+														</span>
+														<span className="block">
+															远端注册会在后台执行；未完成前显示“等待注册”或“注册中”。
+														</span>
+													</>
+												) : (
+													<>
+														<span className="block">
+															本地会立即停止接收 Webhook，远端操作在后台执行。
+														</span>
+														<fieldset
+															className="flex gap-2"
+															aria-label="关闭方式"
+														>
+															<Button
+																type="button"
+																size="sm"
+																aria-pressed={webhookDisableChoice === "paused"}
+																variant={
+																	webhookDisableChoice === "paused"
+																		? "secondary"
+																		: "outline"
+																}
+																onClick={() =>
+																	setWebhookDisableChoice("paused")
+																}
+															>
+																保留并暂停 Hook
+															</Button>
+															<Button
+																type="button"
+																size="sm"
+																aria-pressed={
+																	webhookDisableChoice === "deleted"
+																}
+																variant={
+																	webhookDisableChoice === "deleted"
+																		? "destructive"
+																		: "outline"
+																}
+																onClick={() =>
+																	setWebhookDisableChoice("deleted")
+																}
+															>
+																删除 Hook
+															</Button>
+														</fieldset>
+														{webhookPushConfirmMode === "my-releases" ? (
+															<span className="block">
+																关闭“我的发布”也会应用相同的 Hook 处理方式。
+															</span>
+														) : null}
+													</>
+												)}
+											</div>
 										</AlertDialogDescription>
 									</AlertDialogHeader>
 									<AlertDialogFooter>
@@ -1852,15 +2005,19 @@ export function SettingsPage(props: {
 											disabled={webhookPushBusy === "toggle"}
 											onClick={(event) => {
 												event.preventDefault();
-												confirmWebhookPushEnable();
+												confirmWebhookPushAction();
 											}}
 										>
 											{webhookPushBusy === "toggle" ? (
 												<LoaderCircle className="size-4 animate-spin" />
-											) : (
+											) : webhookPushConfirmMode === "enable" ? (
 												<Webhook className="size-4" />
+											) : (
+												<RefreshCw className="size-4" />
 											)}
-											确认开启并注册
+											{webhookPushConfirmMode === "enable"
+												? "确认启用"
+												: "确认并排队"}
 										</AlertDialogAction>
 									</AlertDialogFooter>
 								</AlertDialogContent>

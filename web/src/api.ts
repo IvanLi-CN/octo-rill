@@ -359,7 +359,21 @@ export type WebhookPushRepoStatus = {
 	last_checked_at: string | null;
 	last_registered_at: string | null;
 };
+export type WebhookPushDesiredState = "enabled" | "paused" | "deleted";
+export type WebhookPushOperation = {
+	task_id: string;
+	status: string;
+	operation: string;
+	available_at: string | null;
+};
+export type WebhookPushOwnerGroup = {
+	owner_login: string;
+	repo_count: number;
+	pending_count: number;
+	repos: WebhookPushRepoStatus[];
+};
 export type WebhookPushSettingsResponse = {
+	desired_state: WebhookPushDesiredState;
 	enabled: boolean;
 	include_own_releases: boolean;
 	callback_ready: boolean;
@@ -381,18 +395,23 @@ export type WebhookPushSettingsResponse = {
 		last_started_at: string | null;
 		next_started_at: string | null;
 	};
+	operation: WebhookPushOperation | null;
+	last_completed_check_at: string | null;
+	owner_groups: WebhookPushOwnerGroup[];
 	repos: WebhookPushRepoStatus[];
 };
 export type WebhookPushTaskResponse = {
 	task_id: string;
 	status: string;
 	reused: boolean;
+	operation: string;
 };
 export type WebhookPushPatchResponse = {
+	desired_state: WebhookPushDesiredState;
 	enabled: boolean;
-	task_id: string | null;
-	status: string | null;
-	reused: boolean;
+	task_id: string;
+	status: string;
+	operation: string;
 };
 export type AdminWebhookPushRuntimeConfigResponse = {
 	audit_interval_days: number;
@@ -568,6 +587,7 @@ export type AdminSyncRuntimeConfigUpdateRequest = {
 export type DailyBriefProfilePatchRequest = {
 	daily_brief_time_zone: string;
 	include_own_releases?: boolean;
+	webhook_push_desired_state?: WebhookPushDesiredState;
 };
 export type LinuxDoConnectionResponse = {
 	linuxdo_user_id: number;
@@ -1315,34 +1335,21 @@ export async function apiGetMeWebhookPush(): Promise<WebhookPushSettingsResponse
 	return apiGet<WebhookPushSettingsResponse>("/api/me/webhook-push");
 }
 export async function apiPatchMeWebhookPush(
-	enabled: boolean,
+	desiredState: WebhookPushDesiredState,
 ): Promise<WebhookPushPatchResponse> {
 	return apiPatchJson<WebhookPushPatchResponse>("/api/me/webhook-push", {
-		enabled,
+		desired_state: desiredState,
 	});
 }
-export async function apiRegisterMeWebhookPush(
+export async function apiReconcileMeWebhookPush(
 	repoId?: number,
 ): Promise<WebhookPushTaskResponse> {
 	return apiPostJson<WebhookPushTaskResponse>(
-		repoId === undefined
-			? "/api/me/webhook-push/register"
-			: `/api/me/webhook-push/repos/${repoId}/register`,
-		{},
+		"/api/me/webhook-push/reconcile",
+		{
+			repo_id: repoId,
+		},
 	);
-}
-export async function apiCheckMeWebhookPush(
-	repoId?: number,
-): Promise<WebhookPushTaskResponse> {
-	return apiPostJson<WebhookPushTaskResponse>(
-		repoId === undefined
-			? "/api/me/webhook-push/check"
-			: `/api/me/webhook-push/repos/${repoId}/check`,
-		{},
-	);
-}
-export async function apiDeleteMeWebhookPushHooks(): Promise<WebhookPushTaskResponse> {
-	return apiDeleteJson<WebhookPushTaskResponse>("/api/me/webhook-push/hooks");
 }
 export async function apiGetAdminWebhookPushRuntimeConfig(): Promise<AdminWebhookPushRuntimeConfigResponse> {
 	return apiGet<AdminWebhookPushRuntimeConfigResponse>(

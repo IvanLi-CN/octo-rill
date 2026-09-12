@@ -177,7 +177,7 @@ async function installSettingsMocks(
 		options?.githubConnections ?? defaultGitHubConnections;
 	let passkeys = options?.passkeys ?? [];
 	let apiKeys = options?.apiKeys ?? [];
-	let webhookPushEnabled = false;
+	let webhookPushDesiredState: "enabled" | "paused" | "deleted" = "deleted";
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
 		const url = new URL(req.url());
@@ -355,9 +355,17 @@ async function installSettingsMocks(
 
 		if (req.method() === "PATCH" && pathname === "/api/me/profile") {
 			const payload = req.postDataJSON() as
-				| { include_own_releases?: boolean }
+				| {
+						include_own_releases?: boolean;
+						webhook_push_desired_state?: "enabled" | "paused" | "deleted";
+				  }
 				| undefined;
 			includeOwnReleases = payload?.include_own_releases ?? includeOwnReleases;
+			if (payload?.webhook_push_desired_state) {
+				webhookPushDesiredState = payload.webhook_push_desired_state;
+			} else if (!includeOwnReleases && webhookPushDesiredState === "enabled") {
+				webhookPushDesiredState = "paused";
+			}
 			return json(route, {
 				user_id: "storybook-user",
 				daily_brief_schedule_local_time: "06:00",
@@ -368,8 +376,26 @@ async function installSettingsMocks(
 		}
 
 		if (req.method() === "GET" && pathname === "/api/me/webhook-push") {
+			const repo = {
+				repo_id: 1001,
+				owner_login: "storybook-user",
+				repo_name: "octo-rill",
+				repo_full_name: "storybook-user/octo-rill",
+				is_private: false,
+				hook_id: webhookPushDesiredState === "deleted" ? null : 801,
+				status:
+					webhookPushDesiredState === "enabled"
+						? "waiting_registration"
+						: "registered",
+				error_kind: null,
+				error_message: null,
+				permission_paused: false,
+				last_checked_at: null,
+				last_registered_at: null,
+			};
 			return json(route, {
-				enabled: webhookPushEnabled,
+				desired_state: webhookPushDesiredState,
+				enabled: webhookPushDesiredState === "enabled",
 				include_own_releases: includeOwnReleases,
 				callback_ready: true,
 				pat: {
@@ -380,7 +406,7 @@ async function installSettingsMocks(
 				summary: {
 					total: 1,
 					registered: 0,
-					missing: 1,
+					missing: 0,
 					permission_paused: 0,
 					errors: 0,
 					removable: 0,
@@ -390,29 +416,45 @@ async function installSettingsMocks(
 					last_started_at: null,
 					next_started_at: null,
 				},
-				repos: [],
+				operation: null,
+				last_completed_check_at: null,
+				owner_groups: [
+					{
+						owner_login: "storybook-user",
+						repo_count: 1,
+						pending_count: 1,
+						repos: [repo],
+					},
+				],
+				repos: [repo],
 			});
 		}
 
 		if (req.method() === "PATCH" && pathname === "/api/me/webhook-push") {
-			webhookPushEnabled = Boolean(
-				(req.postDataJSON() as { enabled?: boolean } | null)?.enabled,
-			);
+			webhookPushDesiredState =
+				(
+					req.postDataJSON() as {
+						desired_state?: "enabled" | "paused" | "deleted";
+					} | null
+				)?.desired_state ?? "deleted";
 			return json(route, {
-				enabled: webhookPushEnabled,
-				task_id: webhookPushEnabled ? "webhook-task" : null,
-				status: webhookPushEnabled ? "queued" : null,
+				desired_state: webhookPushDesiredState,
+				enabled: webhookPushDesiredState === "enabled",
+				task_id: "webhook-task",
+				status: "queued",
+				operation: "reconcile",
 				reused: false,
 			});
 		}
 
 		if (
-			pathname.startsWith("/api/me/webhook-push/") &&
-			(req.method() === "POST" || req.method() === "DELETE")
+			req.method() === "POST" &&
+			pathname === "/api/me/webhook-push/reconcile"
 		) {
 			return json(route, {
 				task_id: "webhook-task",
 				status: "queued",
+				operation: "reconcile",
 				reused: false,
 			});
 		}
@@ -1015,7 +1057,7 @@ test("settings deep link saves my releases opt-in", async ({ page }) => {
 	await expect(myReleasesSection).toContainText("已纳入我的发布");
 });
 
-test("webhook push requires confirmation and exposes no patrol action", async ({
+test("webhook push shows target state and owner-grouped reconciliation", async ({
 	page,
 }) => {
 	await installPasskeyBrowserMock(page);
@@ -1032,26 +1074,21 @@ test("webhook push requires confirmation and exposes no patrol action", async ({
 	await section.getByRole("switch", { name: "Webhook 推送" }).click();
 
 	const confirmation = page.getByRole("alertdialog", {
-		name: "开启 Webhook 推送？",
+		name: "启用 Webhook 推送？",
 	});
 	await expect(confirmation).toContainText("repo 或 public_repo");
 	await expect(confirmation).toContainText("仅监听 Release");
-	await confirmation.getByRole("button", { name: "确认开启并注册" }).click();
+	await confirmation.getByRole("button", { name: "确认启用" }).click();
 	await expect(
-		section.getByText("Webhook 推送已开启，全部注册任务已排队。", {
+		section.getByText("Webhook 推送已启用，对齐任务已排队。", {
 			exact: true,
 		}),
 	).toBeVisible();
+	await expect(section).toContainText("@storybook-user");
+	await expect(section).toContainText("等待注册");
 	await expect(
-		section.getByRole("button", { name: "全部注册 Webhook" }),
+		section.getByRole("button", { name: "立即检查并修复" }),
 	).toBeVisible();
-	await expect(
-		section.getByRole("button", { name: "全部检查 Webhook" }),
-	).toBeVisible();
-	await expect(
-		section.getByRole("button", { name: "全部删除 Webhook" }),
-	).toHaveCount(0);
-	await expect(section.getByRole("button", { name: /巡查/ })).toHaveCount(0);
 });
 
 test("unknown app route shows not-found page after app shell boot", async ({

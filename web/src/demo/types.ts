@@ -16,6 +16,7 @@ import type {
 	AdminTranslationStatusResponse,
 	AdminUserProfileResponse,
 	AdminWebhookPushRuntimeConfigResponse,
+	WebhookPushSettingsResponse,
 	AdminRepoGovernanceOverviewResponse,
 	AdminRepoGovernanceListResponse,
 	AnnouncementDetailResponse,
@@ -133,6 +134,7 @@ export type DemoModel = {
 	passkeys: PasskeySummary[];
 	apiKeys: ApiKeySummary[];
 	reactionToken: ReactionTokenStatusResponse;
+	webhookPush: WebhookPushSettingsResponse;
 	followingRepos: FollowingReposResponse;
 	personalRepos: PersonalReposResponse;
 	feed: FeedResponse;
