@@ -1903,8 +1903,8 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 			{
 				taskId: "task-access-1",
 				runningDelayMs: 60,
-				starDelayMs: 2200,
-				completeDelayMs: 4300,
+				starDelayMs: 6000,
+				completeDelayMs: 9000,
 			},
 		);
 
