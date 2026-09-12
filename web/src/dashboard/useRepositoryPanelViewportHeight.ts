@@ -82,13 +82,18 @@ export function useRepositoryPanelViewportHeight(options: {
 				) +
 				Number.parseFloat(listStyle?.paddingTop ?? "0") +
 				Number.parseFloat(listStyle?.paddingBottom ?? "0");
-			const shortList =
-				items.length < 2 && naturalListHeight < minimumListHeight;
 			const panelChromeHeight = Math.max(
 				0,
 				panel.getBoundingClientRect().height -
 					(list?.getBoundingClientRect().height ?? 0),
 			);
+			const availableListHeight = Math.max(
+				0,
+				availableHeight - panelChromeHeight,
+			);
+			const shortList =
+				naturalListHeight < minimumListHeight ||
+				availableListHeight <= minimumListHeight + 1;
 			const contentCapped =
 				panelChromeHeight + naturalListHeight > availableHeight;
 

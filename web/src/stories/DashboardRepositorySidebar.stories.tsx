@@ -380,6 +380,29 @@ export const CompactLongFollowing: Story = {
 	},
 };
 
+export const ViewportLimitedLongFollowing: Story = {
+	args: { count: 18, label: "关注仓库", topInset: 182 },
+	parameters: {
+		viewport: { defaultViewport: "dashboardRepository1171x620" },
+		docs: {
+			description: {
+				story:
+					"即使有 18 个项目，当可用列表视口只能容纳两张卡时也进入视口填充状态。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		await waitFor(() => {
+			expect(
+				canvasElement.querySelector(
+					'[data-dashboard-repository-panel-state="viewport-fill"]',
+				),
+			).not.toBeNull();
+		});
+		await expectLongRepositoryListGeometry(canvasElement);
+	},
+};
+
 export const CompactLongAssociated: Story = {
 	args: { count: 19, label: "关联仓库", topInset: 142 },
 	parameters: {

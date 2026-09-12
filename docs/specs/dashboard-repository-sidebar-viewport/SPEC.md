@@ -30,7 +30,7 @@
 
 - The system MUST reserve a repository-list viewport at least as tall as two project cards for every desktop repository-list state, including long lists.
 - Inputs: actual first project-card height when present, otherwise a `76px` per-card fallback; panel chrome height and the available sidebar height.
-- Outputs: empty, loading, and one-item states keep a stable near-viewport panel that ends `16px` above the footer. Lists whose natural content reaches two cards grow naturally and only cap at the available height; long lists expose at least two complete cards and scroll only inside the list. When panel chrome would consume that minimum, the panel enters its compact density without crossing the footer boundary.
+- Outputs: empty, loading, and one-item states keep a stable near-viewport panel that ends `16px` above the footer. Lists whose natural content reaches two cards grow naturally and only cap at the available height; long lists expose at least two complete cards and scroll only inside the list. When the available list viewport can contain no more than two project cards, the panel enters the viewport-fill state even when the data set is long. When panel chrome would consume that minimum, the panel enters its compact density without crossing the footer boundary.
 
 ### REQ-DASHBOARD-REPOSITORY-SIDEBAR-004
 

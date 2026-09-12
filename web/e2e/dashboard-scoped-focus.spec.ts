@@ -757,6 +757,24 @@ test("long repository lists retain two visible cards on compact desktops", async
 	await expectRepositoryListGeometry(personalPanel);
 });
 
+test("long repository lists enter viewport fill when the viewport fits only two cards", async ({
+	page,
+}) => {
+	await installScopedFocusMocks(page, { repositoryListCount: 18 });
+	await page.setViewportSize({ width: 1171, height: 560 });
+
+	await page.goto("/focus/following");
+	const panel = page.locator(
+		'[data-dashboard-scope-summary="following"][data-dashboard-scope-summary-layout="desktop"]',
+	);
+	await expect(panel).toBeVisible();
+	await expect(panel).toHaveAttribute(
+		"data-dashboard-repository-panel-state",
+		"viewport-fill",
+	);
+	await expectRepositoryListGeometry(panel);
+});
+
 test("two-card repository lists keep their natural height and scroll with the document", async ({
 	page,
 }) => {
