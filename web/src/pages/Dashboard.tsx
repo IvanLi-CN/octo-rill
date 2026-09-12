@@ -2180,10 +2180,20 @@ export function Dashboard(props: {
 			includeNotifications?: boolean;
 			preferredBriefId?: string | null;
 			throwOnError?: boolean;
-			onStart?: () => void;
+			onStart?: (cancel: () => void) => void;
+			onQueue?: (cancel: () => void) => void;
 		}) => {
-			options?.onStart?.();
 			const requestId = ++sidebarRequestIdRef.current;
+			let cancelled = false;
+			const cancelRefresh = () => {
+				if (cancelled || requestId !== sidebarRequestIdRef.current) return;
+				cancelled = true;
+				sidebarRequestIdRef.current += 1;
+				if (sidebarLoadingRequestIdRef.current === requestId) {
+					setSidebarLoading(false);
+				}
+			};
+			options?.onStart?.(cancelRefresh);
 			setBriefsError(null);
 			try {
 				const phase: DashboardSectionError["phase"] = options?.background
@@ -2262,7 +2272,8 @@ export function Dashboard(props: {
 			includeNotifications?: boolean;
 			preferredBriefId?: string | null;
 			throwOnError?: boolean;
-			onStart?: () => void;
+			onStart?: (cancel: () => void) => void;
+			onQueue?: (cancel: () => void) => void;
 		}) => {
 			const priority = options?.throwOnError
 				? ++sidebarRefreshPriorityRef.current
@@ -2277,11 +2288,35 @@ export function Dashboard(props: {
 				}
 				await refreshSidebarUnqueued(options);
 			};
-			const queued = options?.throwOnError
-				? (strictSidebarRefreshRef.current ?? Promise.resolve()).then(() =>
-						run(false),
-					)
-				: sidebarRefreshQueueRef.current.then(() => run(true));
+			let queued: Promise<void>;
+			if (options?.throwOnError) {
+				let cancelled = false;
+				let cancelOperation!: () => void;
+				const released = new Promise<never>((_, reject) => {
+					cancelOperation = () => {
+						if (cancelled) return;
+						cancelled = true;
+						reject(new Error("刷新已取消"));
+					};
+				});
+				options.onQueue?.(cancelOperation);
+				const operation = (
+					strictSidebarRefreshRef.current ?? Promise.resolve()
+				).then(() => {
+					if (cancelled) return Promise.reject(new Error("刷新已取消"));
+					return refreshSidebarUnqueued({
+						...options,
+						onStart: (cancel) =>
+							options?.onStart?.(() => {
+								cancel();
+								cancelOperation();
+							}),
+					});
+				});
+				queued = Promise.race([operation, released]);
+			} else {
+				queued = sidebarRefreshQueueRef.current.then(() => run(true));
+			}
 			if (options?.throwOnError) {
 				strictSidebarRefreshRef.current = queued.catch(() => undefined);
 			}
@@ -2483,7 +2518,11 @@ export function Dashboard(props: {
 	]);
 
 	const refreshAll = useCallback(
-		async (options?: { throwOnError?: boolean; onStart?: () => void }) => {
+		async (options?: {
+			throwOnError?: boolean;
+			onStart?: (cancel: () => void) => void;
+			onQueue?: (cancel: () => void) => void;
+		}) => {
 			const tasks: Array<Promise<unknown>> = [refreshFeed(options)];
 			if (!scopedMode) {
 				tasks.push(
@@ -2493,7 +2532,8 @@ export function Dashboard(props: {
 							hasDesktopSidebarInbox ||
 							tab === "inbox" ||
 							notificationsBootstrapCompletedRef.current,
-						onStart: options?.onStart,
+						onStart: (cancel) => options?.onStart?.(cancel),
+						onQueue: (cancel) => options?.onQueue?.(cancel),
 					}),
 				);
 			}
@@ -3177,15 +3217,20 @@ export function Dashboard(props: {
 		let completionTimerStarted = false;
 		let completionInFlight = false;
 		let streamSettled = false;
+		const queuedRefreshCancels = new Set<() => void>();
+		const activeRefreshCancels = new Set<() => void>();
 		const clearReconnectTimer = () => {
 			if (reconnectTimer === null) return;
 			window.clearTimeout(reconnectTimer);
 			reconnectTimer = null;
 		};
 		const clearCompletionTimer = () => {
-			if (completionTimer === null) return;
-			window.clearTimeout(completionTimer);
-			completionTimer = null;
+			if (completionTimer !== null) {
+				window.clearTimeout(completionTimer);
+				completionTimer = null;
+			}
+			queuedRefreshCancels.clear();
+			activeRefreshCancels.clear();
 		};
 		const refreshOnUi = () => {
 			void refreshAllRef.current().catch((error) => {
@@ -3269,11 +3314,14 @@ export function Dashboard(props: {
 			completionInFlight = true;
 			const payload = parsePayload(event as MessageEvent<string>);
 			const completedTaskId = accessTaskStream.taskId;
-			const startCompletionTimer = () => {
+			const startCompletionTimer = (cancel: () => void) => {
+				activeRefreshCancels.add(cancel);
 				if (completionTimerStarted || streamSettled) return;
 				completionTimerStarted = true;
 				completionTimer = window.setTimeout(() => {
 					completionTimer = null;
+					for (const cancel of queuedRefreshCancels) cancel();
+					for (const cancel of activeRefreshCancels) cancel();
 					failStream("同步完成后的页面刷新超时，请刷新页面后重试。", true);
 				}, TASK_STREAM_COMPLETION_GRACE_MS);
 			};
@@ -3295,6 +3343,7 @@ export function Dashboard(props: {
 						await refreshAllRef.current({
 							throwOnError: true,
 							onStart: startCompletionTimer,
+							onQueue: (cancel) => queuedRefreshCancels.add(cancel),
 						});
 						if (streamSettled) return;
 						clearDashboardLiveNoticesRef.current();
@@ -3404,6 +3453,8 @@ export function Dashboard(props: {
 				completionInFlight: false,
 				completionTimer: null as number | null,
 			};
+			const queuedRefreshCancels = new Set<() => void>();
+			const activeRefreshCancels = new Set<() => void>();
 			refreshTaskLifecyclesRef.current.set(task.taskId, lifecycle);
 			const clearReconnectTimer = () => {
 				if (reconnectTimer === null) return;
@@ -3412,9 +3463,12 @@ export function Dashboard(props: {
 				refreshTaskReconnectTimersRef.current.delete(task.taskId);
 			};
 			const clearCompletionTimer = () => {
-				if (lifecycle.completionTimer === null) return;
-				window.clearTimeout(lifecycle.completionTimer);
-				lifecycle.completionTimer = null;
+				if (lifecycle.completionTimer !== null) {
+					window.clearTimeout(lifecycle.completionTimer);
+					lifecycle.completionTimer = null;
+				}
+				queuedRefreshCancels.clear();
+				activeRefreshCancels.clear();
 			};
 			refreshTaskSourcesRef.current.set(task.taskId, source);
 
@@ -3457,11 +3511,14 @@ export function Dashboard(props: {
 				const payload = parsePayload(event as MessageEvent<string>);
 				const completedTaskId = task.taskId;
 				let completionTimerStarted = false;
-				const startCompletionTimer = () => {
+				const startCompletionTimer = (cancel: () => void) => {
+					activeRefreshCancels.add(cancel);
 					if (completionTimerStarted || lifecycle.settled) return;
 					completionTimerStarted = true;
 					lifecycle.completionTimer = window.setTimeout(() => {
 						lifecycle.completionTimer = null;
+						for (const cancel of queuedRefreshCancels) cancel();
+						for (const cancel of activeRefreshCancels) cancel();
 						failStream("同步完成后的页面刷新超时，请刷新页面后重试。", true);
 					}, TASK_STREAM_COMPLETION_GRACE_MS);
 				};
@@ -3477,6 +3534,7 @@ export function Dashboard(props: {
 							await refreshAllRef.current({
 								throwOnError: true,
 								onStart: startCompletionTimer,
+								onQueue: (cancel) => queuedRefreshCancels.add(cancel),
 							});
 							if (lifecycle.settled) return;
 							clearDashboardLiveNoticesRef.current();
