@@ -20,6 +20,22 @@ _Avoid_: 私有仓库, star baseline, watched repo
 The user preference that controls whether owned-repository baselines participate in release visibility. It describes release inclusion, not repository ownership or sync freshness.
 _Avoid_: 私有仓库开关, owner repo enabled
 
+**Webhook 推送目标状态**:
+The user's intended lifecycle for release notifications: enabled, paused, or deleted. It is an instruction that remains stable while the remote GitHub Hook is being reconciled.
+_Avoid_: 当前 Hook 状态, 注册结果, 接收状态
+
+**Webhook Hook 观察状态**:
+The latest local observation of a repository's OctoRill-managed GitHub Hook, such as registered, missing, conflicted, permission-paused, or errored. It describes what was observed, not what the user wants.
+_Avoid_: Webhook 推送目标状态, 健康开关
+
+**Webhook 对齐操作**:
+A user-scoped background operation that moves verified GitHub Hooks toward the persisted Webhook 推送目标状态 and records progress, retries, and terminal errors.
+_Avoid_: 注册按钮, 同步请求, 检查记录
+
+**协作取消**:
+A request for a running Webhook 对齐操作 to stop at a safe remote-request boundary. It does not change the user's Webhook 推送目标状态.
+_Avoid_: 撤销目标状态, 删除 Hook, 人工重试
+
 **LLM 逻辑调用**:
 一次由 OctoRill 调度并最终归属于单个模型的 provider 请求。内部路由重试仍属于同一次逻辑调用；其成功只表示已收到模型响应，不表示响应已通过业务输出契约。
 _Avoid_: 内容处理尝试, 业务处理成功, 单次重试
