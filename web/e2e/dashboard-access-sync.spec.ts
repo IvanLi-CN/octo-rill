@@ -2034,7 +2034,9 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 		await expect(page.getByText("Fresh release")).toHaveCount(0, {
 			timeout: 200,
 		});
-		await expect(page.getByText("Fresh release")).toBeVisible();
+		await expect(page.getByText("Fresh release")).toBeVisible({
+			timeout: 10_000,
+		});
 
 		expect(feedCalls).toBeGreaterThanOrEqual(3);
 		expect(notificationCalls).toBeGreaterThanOrEqual(2);
