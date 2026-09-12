@@ -3214,6 +3214,7 @@ export function Dashboard(props: {
 		const source = openAppEventSource(accessTaskStream.eventPath);
 		let reconnectTimer: number | null = null;
 		let completionTimer: number | null = null;
+		let queuedCompletionTimer: number | null = null;
 		let completionTimerStarted = false;
 		let completionInFlight = false;
 		let streamSettled = false;
@@ -3228,6 +3229,10 @@ export function Dashboard(props: {
 			if (completionTimer !== null) {
 				window.clearTimeout(completionTimer);
 				completionTimer = null;
+			}
+			if (queuedCompletionTimer !== null) {
+				window.clearTimeout(queuedCompletionTimer);
+				queuedCompletionTimer = null;
 			}
 			queuedRefreshCancels.clear();
 			activeRefreshCancels.clear();
@@ -3317,12 +3322,30 @@ export function Dashboard(props: {
 			const startCompletionTimer = (cancel: () => void) => {
 				activeRefreshCancels.add(cancel);
 				if (completionTimerStarted || streamSettled) return;
+				if (queuedCompletionTimer !== null) {
+					window.clearTimeout(queuedCompletionTimer);
+					queuedCompletionTimer = null;
+				}
 				completionTimerStarted = true;
 				completionTimer = window.setTimeout(() => {
 					completionTimer = null;
 					for (const cancel of queuedRefreshCancels) cancel();
 					for (const cancel of activeRefreshCancels) cancel();
 					failStream("同步完成后的页面刷新超时，请刷新页面后重试。", true);
+				}, TASK_STREAM_COMPLETION_GRACE_MS);
+			};
+			const startQueuedCompletionTimer = () => {
+				if (
+					completionTimerStarted ||
+					streamSettled ||
+					queuedCompletionTimer !== null
+				)
+					return;
+				queuedCompletionTimer = window.setTimeout(() => {
+					queuedCompletionTimer = null;
+					for (const cancel of queuedRefreshCancels) cancel();
+					for (const cancel of activeRefreshCancels) cancel();
+					failStream("同步完成后的页面刷新排队超时，请刷新页面后重试。", true);
 				}, TASK_STREAM_COMPLETION_GRACE_MS);
 			};
 			const complete = async () => {
@@ -3333,6 +3356,7 @@ export function Dashboard(props: {
 						? new Error(payload.error ?? "后台同步失败")
 						: undefined;
 				if (payload.status === "succeeded") {
+					startQueuedCompletionTimer();
 					setAccessSyncProgress((current) => ({
 						currentStep: current?.currentStep ?? ACCESS_SYNC_TOTAL_STEPS,
 						totalSteps: ACCESS_SYNC_TOTAL_STEPS,
@@ -3452,6 +3476,7 @@ export function Dashboard(props: {
 				settled: false,
 				completionInFlight: false,
 				completionTimer: null as number | null,
+				queuedCompletionTimer: null as number | null,
 			};
 			const queuedRefreshCancels = new Set<() => void>();
 			const activeRefreshCancels = new Set<() => void>();
@@ -3466,6 +3491,10 @@ export function Dashboard(props: {
 				if (lifecycle.completionTimer !== null) {
 					window.clearTimeout(lifecycle.completionTimer);
 					lifecycle.completionTimer = null;
+				}
+				if (lifecycle.queuedCompletionTimer !== null) {
+					window.clearTimeout(lifecycle.queuedCompletionTimer);
+					lifecycle.queuedCompletionTimer = null;
 				}
 				queuedRefreshCancels.clear();
 				activeRefreshCancels.clear();
@@ -3514,12 +3543,33 @@ export function Dashboard(props: {
 				const startCompletionTimer = (cancel: () => void) => {
 					activeRefreshCancels.add(cancel);
 					if (completionTimerStarted || lifecycle.settled) return;
+					if (lifecycle.queuedCompletionTimer !== null) {
+						window.clearTimeout(lifecycle.queuedCompletionTimer);
+						lifecycle.queuedCompletionTimer = null;
+					}
 					completionTimerStarted = true;
 					lifecycle.completionTimer = window.setTimeout(() => {
 						lifecycle.completionTimer = null;
 						for (const cancel of queuedRefreshCancels) cancel();
 						for (const cancel of activeRefreshCancels) cancel();
 						failStream("同步完成后的页面刷新超时，请刷新页面后重试。", true);
+					}, TASK_STREAM_COMPLETION_GRACE_MS);
+				};
+				const startQueuedCompletionTimer = () => {
+					if (
+						completionTimerStarted ||
+						lifecycle.settled ||
+						lifecycle.queuedCompletionTimer !== null
+					)
+						return;
+					lifecycle.queuedCompletionTimer = window.setTimeout(() => {
+						lifecycle.queuedCompletionTimer = null;
+						for (const cancel of queuedRefreshCancels) cancel();
+						for (const cancel of activeRefreshCancels) cancel();
+						failStream(
+							"同步完成后的页面刷新排队超时，请刷新页面后重试。",
+							true,
+						);
 					}, TASK_STREAM_COMPLETION_GRACE_MS);
 				};
 				const complete = async () => {
@@ -3530,6 +3580,7 @@ export function Dashboard(props: {
 							? new Error(payload.error ?? "后台同步失败")
 							: undefined;
 					if (payload.status === "succeeded") {
+						startQueuedCompletionTimer();
 						try {
 							await refreshAllRef.current({
 								throwOnError: true,
