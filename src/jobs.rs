@@ -53,6 +53,13 @@ pub const TASK_TRANSLATE_NOTIFICATION: &str = "translate.notification";
 pub const TASK_WEBHOOK_PUSH_MANAGE: &str = "webhook.push.manage";
 pub const TASK_WEBHOOK_PUSH_AUDIT: &str = "webhook.push.audit";
 
+fn is_webhook_push_task_type(task_type: &str) -> bool {
+    matches!(
+        task_type,
+        TASK_WEBHOOK_PUSH_MANAGE | TASK_WEBHOOK_PUSH_AUDIT
+    )
+}
+
 pub const SCHEDULED_TASK_TYPES: &[&str] = &[
     TASK_BRIEF_DAILY_SLOT,
     TASK_SYNC_SUBSCRIPTIONS,
@@ -1307,6 +1314,7 @@ pub async fn enqueue_singleton_task_by_type(
     }
 }
 
+#[allow(dead_code)]
 pub async fn enqueue_singleton_task_for_requester_and_payload(
     state: &AppState,
     new_task: NewTask,
@@ -1343,7 +1351,7 @@ pub async fn enqueue_singleton_task_for_requester_and_payload(
     }
 }
 
-fn is_unique_violation(error: &anyhow::Error) -> bool {
+pub(crate) fn is_unique_violation(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<sqlx::Error>()
@@ -1354,6 +1362,7 @@ fn is_unique_violation(error: &anyhow::Error) -> bool {
     })
 }
 
+#[allow(dead_code)]
 async fn find_inflight_task_for_requester_and_payload(
     state: &AppState,
     task_type: &str,
@@ -1454,6 +1463,54 @@ pub async fn complete_task(
     finalize_task(state, task_id, status, result, error_message).await
 }
 
+pub async fn reschedule_task(
+    state: &AppState,
+    task_id: &str,
+    available_at: DateTime<Utc>,
+    result: Value,
+) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let available_at = available_at.to_rfc3339();
+    let updated = state
+        .sqlite_writer
+        .write_foreground("job_task_reschedule", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE job_tasks
+                SET status = ?, available_at = ?, started_at = NULL,
+                    runtime_owner_id = NULL, lease_heartbeat_at = NULL,
+                    cancel_requested = 0, updated_at = ?
+                WHERE id = ? AND status = ?
+                "#,
+            )
+            .bind(STATUS_QUEUED)
+            .bind(&available_at)
+            .bind(&now)
+            .bind(task_id)
+            .bind(STATUS_RUNNING)
+            .execute(&state.pool)
+            .await
+            .context("failed to reschedule task")
+        })
+        .await?;
+    if updated.rows_affected() == 0 {
+        return Ok(false);
+    }
+    append_task_event(
+        state,
+        task_id,
+        "task.rescheduled",
+        json!({
+            "task_id": task_id,
+            "status": STATUS_QUEUED,
+            "available_at": available_at,
+            "result": result,
+        }),
+    )
+    .await?;
+    Ok(true)
+}
+
 pub async fn retry_task(
     state: &AppState,
     task_id: &str,
@@ -1521,6 +1578,39 @@ pub async fn retry_task(
 pub async fn cancel_task(state: &AppState, task_id: &str) -> Result<String> {
     let now = Utc::now().to_rfc3339();
 
+    let requested_queued_webhook = state
+        .sqlite_writer
+        .write_foreground("job_task_cancel_queued_webhook", |_| async {
+            sqlx::query(
+                r#"
+                    UPDATE job_tasks
+                    SET cancel_requested = 1, updated_at = ?
+                    WHERE id = ? AND status = ?
+                      AND task_type IN (?, ?)
+                    "#,
+            )
+            .bind(now.as_str())
+            .bind(task_id)
+            .bind(STATUS_QUEUED)
+            .bind(TASK_WEBHOOK_PUSH_MANAGE)
+            .bind(TASK_WEBHOOK_PUSH_AUDIT)
+            .execute(&state.pool)
+            .await
+            .context("failed to request queued webhook cancellation")
+        })
+        .await?;
+
+    if requested_queued_webhook.rows_affected() > 0 {
+        append_task_event(
+            state,
+            task_id,
+            "task.cancel_requested",
+            json!({"task_id": task_id, "status": STATUS_QUEUED}),
+        )
+        .await?;
+        return Ok(STATUS_QUEUED.to_owned());
+    }
+
     let canceled_queued = state
         .sqlite_writer
         .write_foreground("job_task_cancel_queued", |_| async {
@@ -1529,6 +1619,7 @@ pub async fn cancel_task(state: &AppState, task_id: &str) -> Result<String> {
                     UPDATE job_tasks
                     SET status = ?, cancel_requested = 1, finished_at = ?, updated_at = ?
                     WHERE id = ? AND status = ?
+                      AND task_type NOT IN (?, ?)
                     "#,
             )
             .bind(STATUS_CANCELED)
@@ -1536,6 +1627,8 @@ pub async fn cancel_task(state: &AppState, task_id: &str) -> Result<String> {
             .bind(now.as_str())
             .bind(task_id)
             .bind(STATUS_QUEUED)
+            .bind(TASK_WEBHOOK_PUSH_MANAGE)
+            .bind(TASK_WEBHOOK_PUSH_AUDIT)
             .execute(&state.pool)
             .await
             .context("failed to cancel queued task")
@@ -2167,6 +2260,7 @@ async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
         SELECT id
         FROM job_tasks
         WHERE status = ?
+          AND (available_at IS NULL OR available_at <= ?)
           AND (
             task_type NOT IN (?, ?)
             OR NOT EXISTS (
@@ -2181,6 +2275,7 @@ async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
         "#,
     )
     .bind(STATUS_QUEUED)
+    .bind(Utc::now().to_rfc3339())
     .bind(TASK_SYNC_SUBSCRIPTIONS)
     .bind(TASK_RETRY_RECENT_FAILURES)
     .bind(STATUS_RUNNING)
@@ -2246,6 +2341,16 @@ async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
 
 async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
     if task.cancel_requested != 0 {
+        if is_webhook_push_task_type(task.task_type.as_str()) {
+            let _ = reschedule_task(
+                state.as_ref(),
+                &task.id,
+                Utc::now(),
+                json!({"reason": "cancel_requested", "task_type": task.task_type}),
+            )
+            .await?;
+            return Ok(());
+        }
         if !finalize_task_if_owned(
             state.as_ref(),
             &task.id,
@@ -2290,6 +2395,17 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
         .await
         .unwrap_or(false)
     {
+        if is_webhook_push_task_type(task.task_type.as_str()) {
+            let _ = reschedule_task(
+                state.as_ref(),
+                &task.id,
+                Utc::now(),
+                json!({"reason": "cancel_requested", "task_type": task.task_type}),
+            )
+            .await?;
+            heartbeat.stop().await;
+            return Ok(());
+        }
         let finalized = finalize_task_if_owned(
             state.as_ref(),
             &task.id,
@@ -4529,14 +4645,15 @@ mod tests {
         TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT, TASK_RETRY_RECENT_FAILURES,
         TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_RELEASES,
         TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE, TASK_SYNC_SUBSCRIPTIONS,
-        TASK_WEBHOOK_PUSH_AUDIT, TranslationStreamCursor, claim_next_queued_task,
-        current_recent_failures_retry_schedule_key, current_subscription_schedule_key,
-        enqueue_brief_history_recompute_if_needed, enqueue_brief_refresh_content_if_needed,
-        enqueue_hour_slot_if_due, enqueue_recent_failures_retry_if_due,
-        enqueue_singleton_task_for_requester_and_payload, enqueue_star_sync_runs_if_due,
-        enqueue_subscription_run_if_due, enqueue_task, execute_brief_history_recompute_task,
-        execute_brief_refresh_content_task, execute_daily_slot_task, execute_sync_all_task_with,
-        finalize_task_if_owned, is_scheduled_task_type, load_due_daily_slot_users,
+        TASK_WEBHOOK_PUSH_AUDIT, TASK_WEBHOOK_PUSH_MANAGE, TranslationStreamCursor, cancel_task,
+        claim_next_queued_task, current_recent_failures_retry_schedule_key,
+        current_subscription_schedule_key, enqueue_brief_history_recompute_if_needed,
+        enqueue_brief_refresh_content_if_needed, enqueue_hour_slot_if_due,
+        enqueue_recent_failures_retry_if_due, enqueue_singleton_task_for_requester,
+        enqueue_star_sync_runs_if_due, enqueue_subscription_run_if_due, enqueue_task,
+        execute_brief_history_recompute_task, execute_brief_refresh_content_task,
+        execute_daily_slot_task, execute_sync_all_task_with, finalize_task_if_owned,
+        is_scheduled_task_type, load_due_daily_slot_users,
         load_recent_failed_brief_retry_candidates, load_recent_failed_translation_retry_candidates,
         load_translation_stream_cursor, load_translation_stream_rows, mark_brief_generation_source,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
@@ -4846,7 +4963,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requester_payload_singleton_keeps_distinct_webhook_operations() {
+    async fn requester_singleton_reuses_distinct_webhook_operations() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         sqlx::query(
@@ -4872,34 +4989,26 @@ mod tests {
             parent_task_id: None,
         };
 
-        let first = enqueue_singleton_task_for_requester_and_payload(
-            state.as_ref(),
-            build_task("register", Some(1)),
-        )
-        .await
-        .expect("enqueue first task");
-        let reused = enqueue_singleton_task_for_requester_and_payload(
-            state.as_ref(),
-            build_task("register", Some(1)),
-        )
-        .await
-        .expect("reuse identical task");
-        let other_repo = enqueue_singleton_task_for_requester_and_payload(
-            state.as_ref(),
-            build_task("register", Some(2)),
-        )
-        .await
-        .expect("enqueue other repo task");
-        let delete = enqueue_singleton_task_for_requester_and_payload(
-            state.as_ref(),
-            build_task("delete", None),
-        )
-        .await
-        .expect("enqueue delete task");
+        let first =
+            enqueue_singleton_task_for_requester(state.as_ref(), build_task("register", Some(1)))
+                .await
+                .expect("enqueue first task");
+        let reused =
+            enqueue_singleton_task_for_requester(state.as_ref(), build_task("register", Some(1)))
+                .await
+                .expect("reuse identical task");
+        let other_repo =
+            enqueue_singleton_task_for_requester(state.as_ref(), build_task("register", Some(2)))
+                .await
+                .expect("enqueue other repo task");
+        let delete =
+            enqueue_singleton_task_for_requester(state.as_ref(), build_task("delete", None))
+                .await
+                .expect("enqueue delete task");
 
         assert_eq!(first.task_id, reused.task_id);
-        assert_ne!(first.task_id, other_repo.task_id);
-        assert_ne!(first.task_id, delete.task_id);
+        assert_eq!(first.task_id, other_repo.task_id);
+        assert_eq!(first.task_id, delete.task_id);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM job_tasks WHERE requested_by = 'webhook-user'",
@@ -4907,8 +5016,46 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("count webhook tasks"),
-            3
+            1
         );
+    }
+
+    #[tokio::test]
+    async fn queued_webhook_cancel_requests_boundary_reschedule() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 90_011, "queued-webhook-cancel").await;
+        let task = enqueue_task(
+            state.as_ref(),
+            NewTask {
+                task_type: TASK_WEBHOOK_PUSH_MANAGE.to_owned(),
+                payload: json!({
+                    "user_id": "90011",
+                    "operation": "reconcile",
+                    "repo_id": null,
+                }),
+                source: "test".to_owned(),
+                requested_by: Some("90011".to_owned()),
+                parent_task_id: None,
+            },
+        )
+        .await
+        .expect("enqueue webhook task");
+
+        assert_eq!(
+            cancel_task(state.as_ref(), &task.task_id)
+                .await
+                .expect("request queued webhook cancellation"),
+            STATUS_QUEUED
+        );
+        let row = sqlx::query_as::<_, (String, i64)>(
+            "SELECT status, cancel_requested FROM job_tasks WHERE id = ?",
+        )
+        .bind(&task.task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load queued webhook task");
+        assert_eq!(row, (STATUS_QUEUED.to_owned(), 1));
     }
 
     #[test]

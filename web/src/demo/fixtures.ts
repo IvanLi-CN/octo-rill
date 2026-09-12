@@ -29,6 +29,7 @@ import type {
 	ReleaseDetailResponse,
 	RepoPublicReleasePublicationStatusResponse,
 	TranslationResultItem,
+	WebhookPushSettingsResponse,
 } from "@/api";
 import type { FeedItem, FeedResponse } from "@/feed/types";
 import type { RepoVisual } from "@/lib/repoVisual";
@@ -223,6 +224,61 @@ function buildReactionToken(): ReactionTokenStatusResponse {
 			message: "PAT 可用",
 			checked_at: "2026-07-08T09:12:00+08:00",
 		},
+	};
+}
+
+function buildWebhookPushSettings(
+	includeOwnReleases: boolean,
+): WebhookPushSettingsResponse {
+	const desiredState = includeOwnReleases ? "enabled" : "deleted";
+	const repo = {
+		repo_id: 7001,
+		owner_login: "octo-demo-owner",
+		repo_name: "release-lab",
+		repo_full_name: "octo-demo-owner/release-lab",
+		is_private: false,
+		hook_id: includeOwnReleases ? 91001 : null,
+		status: includeOwnReleases ? "waiting_registration" : "not_configured",
+		error_kind: null,
+		error_message: null,
+		permission_paused: false,
+		last_checked_at: null,
+		last_registered_at: null,
+	};
+	return {
+		desired_state: desiredState,
+		enabled: desiredState === "enabled",
+		include_own_releases: includeOwnReleases,
+		callback_ready: true,
+		pat: {
+			configured: true,
+			valid: true,
+			owner_login: "octo-demo-owner",
+		},
+		summary: {
+			total: 1,
+			registered: 0,
+			missing: 0,
+			permission_paused: 0,
+			errors: 0,
+			removable: includeOwnReleases ? 1 : 0,
+		},
+		schedule: {
+			audit_interval_days: 7,
+			last_started_at: "2026-07-07T06:00:00+08:00",
+			next_started_at: "2026-07-14T06:00:00+08:00",
+		},
+		operation: null,
+		last_completed_check_at: null,
+		owner_groups: [
+			{
+				owner_login: repo.owner_login,
+				repo_count: 1,
+				pending_count: includeOwnReleases ? 1 : 0,
+				repos: [repo],
+			},
+		],
+		repos: [repo],
 	};
 }
 
@@ -2001,6 +2057,7 @@ export function buildDemoModel(input: {
 		passkeys: buildPasskeys(),
 		apiKeys: buildApiKeys(),
 		reactionToken: buildReactionToken(),
+		webhookPush: buildWebhookPushSettings(input.includeOwnReleases),
 		followingRepos: buildFollowingRepos(),
 		feed: buildFeed(input.includeOwnReleases),
 		briefs: buildBriefs(),

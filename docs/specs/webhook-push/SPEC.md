@@ -6,10 +6,25 @@
 
 本能力允许用户显式授权 OctoRill 使用其已保存的 classic PAT，为该 PAT 所属 GitHub 账号的个人 owner 仓库注册 Release webhook。Webhook 是快速发现信号，现有 Release 同步仍是数据写入路径。
 
-## Goals
+## Context and Scope
 
-- 在“我的发布”中提供默认关闭的“Webhook 推送”子开关。
-- 提供“全部注册 Webhook”“全部检查 Webhook”“全部删除 Webhook”以及逐仓注册/检查入口。
+本主题覆盖用户“我的发布”页面中的 Webhook 目标状态、GitHub Hook 对齐任务、本地接收门禁、持久化任务恢复，以及面向用户的状态展示。Release 同步、签名验证和 delivery 去重仍沿用现有语义；本主题只改变 Hook 的管理边界和状态表达。
+
+## Requirements
+
+- `REQ-WP-001`: 系统 MUST 将用户意图持久化为 `enabled`、`paused` 或 `deleted`，并且运行时观察结果不得反向改写该意图。
+- `REQ-WP-002`: 所有 GitHub Hook 的创建、激活、暂停、删除和检查 MUST 由可恢复的后台对齐任务异步执行，HTTP mutation 不得直接调用 GitHub。
+- `REQ-WP-003`: 目标为 `paused` 或 `deleted` 时，系统 MUST 在任何远端调用前关闭本地接收门禁；远端失败不得改变持久化目标。
+- `REQ-WP-004`: 每名用户 MUST 同时最多存在一项未终态的管理或 audit 操作；暂时失败 MUST 按 `1/5/15` 分钟退避并尊重更晚的 `Retry-After`。
+- `REQ-WP-005`: worker 仅可变更已验证为 OctoRill 管理、Hook ID、callback URL、`release` event 和仓库身份均匹配的 GitHub Hook。
+- `REQ-WP-006`: 用户 API MUST 暴露目标状态、当前 operation、最近完成检查时间、Owner 分组和派生仓库状态，并移除旧的扁平管理路由合同。
+- `REQ-WP-007`: 设置页 MUST 按 Owner 分组仓库，并区分健康目标状态、等待/执行进度和仓库错误；删除选择不得要求第二次确认。
+- `REQ-WP-008`: 启用目标 MUST 显示本用户最近一次全量检查完成时间；定时 audit 只在没有人工任务时对齐启用目标，人工重试不得与上一轮重叠。
+
+### Goals
+
+- 在“我的发布”中提供默认未启用的“Webhook 推送”目标状态。
+- 提供统一的“立即检查并修复”入口，以及逐仓修复入口；Hook 的注册、暂停、恢复和删除全部由异步对齐任务执行。
 - 开启后立即注册，并由管理员配置的后台定时巡查查漏补缺；默认周期 7 天。
 - 权限错误按仓库暂停自动巡查，直到人工注册成功。
 - 验证 GitHub HMAC 签名并幂等接收新发布 Release 事件，再复用共享 Release 同步队列。
@@ -30,15 +45,17 @@
 
 ### 开关与前置条件
 
-- `users.webhook_push_enabled` 默认 `0`。
-- “Webhook 推送”依赖 `include_own_releases=1`。关闭“我的发布”时必须同时关闭“Webhook 推送”，但不得隐式删除 GitHub hooks。
-- 开启前必须确认：
+- `users.webhook_push_desired_state` 默认 `deleted`，合法值为 `enabled|paused|deleted`。
+- `users.webhook_push_enabled` 是本地接收门禁；目标为 `paused` 或 `deleted` 时必须先置为 `0`。
+- “Webhook 推送”依赖 `include_own_releases=1`。关闭“我的发布”时必须进入同一“暂停或删除 Hook”选择流程，不得隐式删除 GitHub hooks。
+- 开启前必须确认本地已持久化的前置条件：
   - 已保存 PAT 且最近校验有效；
   - PAT owner 是当前用户已绑定的 GitHub 账号；
   - classic PAT scope 包含 `public_repo` 或 `repo`；
   - `OCTORILL_PUBLIC_BASE_URL` 是 GitHub 可访问的 HTTPS 地址。
-- 开启必须经过二次确认。确认内容只说明当前授权动作：权限用途、仅监听新发布 Release 和 secret 加密保存。关闭后 hooks 仍保留的行为由关闭状态下可用的“全部删除 Webhook”操作体现，不放入开启确认弹窗。
-- 开启成功后立即排队一次全量注册。单仓失败不回滚开关。
+- 开启必须经过二次确认。确认内容只说明当前授权动作：权限用途、仅监听新发布 Release 和 secret 加密保存。关闭时在同一选择弹窗中选择保留并暂停或删除 Hook；选择删除后直接提交，不再二次确认。
+- 启用目标成功后立即排队一次全量注册。单仓失败不回滚目标；页面显示“等待注册”或“注册中”，不显示异常。
+- HTTP mutation 不调用 GitHub；worker 在任何 Hook 变更前实时复核 PAT owner、scope 和 GitHub 身份，失败时保留目标并按任务状态展示。
 
 ### 仓库范围
 
@@ -51,15 +68,15 @@
 - 注册先列出仓库 hooks，按 callback URL 与 `release` event 识别 OctoRill hook。
 - 没有匹配项时创建；恰好一个匹配项时确保 active、JSON content type、Release event 与当前 secret；多个匹配项标记冲突，不自动删除。
 - 全量注册包含 `permission_paused` 仓库；成功后解除该仓库暂停。
-- 检查只读核对 hook，不创建、更新或解除暂停。
-- 批量删除仅在“Webhook 推送”关闭时允许，只删除数据库记录了 hook ID 的 OctoRill hooks。
+- 检查并修复核对 hook，并按目标状态创建、激活、暂停或删除；所有远端调用均由后台任务执行。
+- 批量删除仅在目标为 `deleted` 时执行，只删除数据库记录了 hook ID 且通过身份校验的 OctoRill hooks。
 - 关闭后接收端忽略事件。删除失败保留 hook 记录和错误，允许再次删除。
 
 ### 定时巡查
 
 - 管理员配置 `webhook_push_audit_interval_days`，合法范围 `1..=30`，默认 `7`。
-- 定时巡查仅处理 `include_own_releases=1 AND webhook_push_enabled=1` 的用户。
-- 每轮刷新 PAT owner 的个人仓库基线，检查并注册缺失 hooks。
+- 定时巡查处理启用目标用户，并恢复处理暂停或删除目标中仍保留远端 Hook 的用户。
+- 每轮刷新 PAT owner 的个人仓库基线，按持久目标检查并修复缺失、未激活或应暂停/删除的 hooks。
 - `permission_paused` 仓库必须跳过；401、403、仍存在基线时的 404，以及 GitHub 明确返回的权限错误进入该状态。
 - 网络、限流和 GitHub 5xx 为暂时错误，不进入权限暂停。
 
@@ -75,32 +92,31 @@
 
 - “Webhook 推送”位于 `/settings?section=my-releases` 现有卡片内，使用独立 Switch。
 - 卡片必须展示启用状态、PAT owner、已注册/缺失/权限暂停/可删除数量、最近与下次定时巡查。
-- 固定全量按钮名称：
-  - `全部注册 Webhook`
-  - `全部检查 Webhook`
-  - `全部删除 Webhook`
-- 仓库行提供 `注册 Webhook` / `重新注册 Webhook` 和 `检查`。
-- 页面不得出现可点击的“巡查”或“立即巡查”。
+- 固定全量按钮名称：`立即检查并修复`。
+- 仓库行提供逐仓 `重试`；页面不得出现“注册 Webhook”“删除 Webhook”或可点击的“巡查”。
+- 页面按 Owner 分组显示仓库，行内不重复显示 Owner。
+- 启用目标显示本用户最近完成检查时间；首次显示“尚未检查”。
 - 权限错误必须给出 repo、失败原因与 classic PAT 修复指引；无 PAT 时链接到同一设置页的 GitHub PAT section。
 
-## Acceptance Criteria
+## Verification
 
-- 默认关闭且不创建外部 hook；不满足前置条件时不能开启。
-- 开启确认后立即异步注册，部分失败仍保持开启并逐仓展示。
-- 定时巡查跳过权限暂停仓库；人工注册成功恢复该仓库自动巡查资格。
-- 全量检查没有外部写入；批量删除只删除 OctoRill hook。
-- 重复 delivery 只产生一次 Release demand；非 published action 不产生 demand。
-- 设置页桌面、移动端以及深色/浅色主题无溢出，所有按钮和 Switch 有可访问名称与忙碌状态。
+- `VER-WP-001` (covers: `REQ-WP-001`): SQLite migration and state-machine tests prove the three target states persist, historical rows map without external calls, and task failures never overwrite the target.
+- `VER-WP-002` (covers: `REQ-WP-002`): API route tests and mock GitHub transport prove mutations enqueue work and every Hook mutation runs only in the worker.
+- `VER-WP-003` (covers: `REQ-WP-003`): receiver and operation tests prove paused/deleted delivery is ignored before remote work and failed remote work preserves the target.
+- `VER-WP-004` (covers: `REQ-WP-004`): job lease, delayed retry, `Retry-After`, cancellation-boundary, and worker-recovery tests prove one inflight operation per user and three scheduled retries at `1/5/15` minutes.
+- `VER-WP-005` (covers: `REQ-WP-005`): managed-hook identity tests prove unmatched Hook ID, callback, event, or repository identity is reported and never mutated.
+- `VER-WP-006` (covers: `REQ-WP-006`): HTTP contract tests prove the new GET/PATCH/reconcile routes return operation snapshots, derived states, check timestamps, and Owner groups without the old flat management contract.
+- `VER-WP-007` (covers: `REQ-WP-007`): Settings Playwright and mock-only visual tests prove Owner grouping, waiting/working/error states, healthy colors, the close-choice dialog, and direct delete submission on desktop and mobile.
+- `VER-WP-008` (covers: `REQ-WP-008`): audit scheduling and Settings tests prove the last completed check is shown with relative/local-time detail and manual retry is blocked while the prior operation is active.
+
+## Related ADRs
+
+- [0010 Webhook Push Desired State](../../adr/0010-webhook-push-desired-state.md)
 
 ## Visual Evidence
 
 证据来源为 mock-only Storybook 完整页面 fallback，绑定 Settings story 的桌面与移动视口。
 
-PR: include
-![Webhook 启用确认弹窗](./assets/webhook-confirmation-desktop.png)
+![Webhook 目标状态、等待注册与 Owner 分组](./assets/webhook-desired-state-desktop.png)
 
-PR: include
-![Webhook 权限暂停与部分成功状态](./assets/webhook-permission-paused-desktop.png)
-
-PR: include
-![Webhook 关闭状态下移动端全部删除](./assets/webhook-delete-ready-mobile.png)
+![移动端暂停保留 Hook 与折叠 Owner 分组](./assets/webhook-desired-state-mobile-paused.png)

@@ -95,6 +95,131 @@ function currentModel() {
 	return model;
 }
 
+function demoWebhookConflictResponse() {
+	return json(
+		{
+			error: {
+				code: "webhook_push_operation_in_progress",
+				message: "Webhook 对齐操作尚未完成，请等待本轮结束。",
+			},
+		},
+		{ status: 409 },
+	);
+}
+
+function queueDemoWebhookReconcile(
+	desiredState: "enabled" | "paused" | "deleted",
+	repoId?: number,
+) {
+	const access = requireRuntimeAccess();
+	const current = currentModel().webhookPush;
+	if (current.operation) {
+		throw new Error("webhook_push_operation_in_progress");
+	}
+	const taskId = "demo-webhook-task";
+	const now = new Date().toISOString();
+	const progressStatus =
+		desiredState === "enabled" ? "registering" : "processing";
+	access.updateModel((model) => ({
+		...model,
+		webhookPush: {
+			...model.webhookPush,
+			desired_state: desiredState,
+			enabled: desiredState === "enabled",
+			operation: {
+				task_id: taskId,
+				status: "queued",
+				operation: "reconcile",
+				available_at: null,
+			},
+			owner_groups: model.webhookPush.owner_groups.map((group) => ({
+				...group,
+				repos: group.repos.map((repo) =>
+					(repoId === undefined || repo.repo_id === repoId) &&
+					!repo.error_message
+						? { ...repo, status: progressStatus }
+						: repo,
+				),
+			})),
+			repos: model.webhookPush.repos.map((repo) =>
+				(repoId === undefined || repo.repo_id === repoId) && !repo.error_message
+					? { ...repo, status: progressStatus }
+					: repo,
+			),
+		},
+	}));
+	window.setTimeout(() => {
+		access.updateModel((model) => {
+			const completedAt = new Date().toISOString();
+			const completeRepo = (
+				repo: (typeof model.webhookPush.repos)[number],
+			) => ({
+				...repo,
+				hook_id: desiredState === "deleted" ? null : (repo.hook_id ?? 91001),
+				status: desiredState === "deleted" ? "not_configured" : "registered",
+				last_checked_at:
+					desiredState === "enabled" ? completedAt : repo.last_checked_at,
+				last_registered_at:
+					desiredState === "enabled" ? completedAt : repo.last_registered_at,
+				error_kind: null,
+				error_message: null,
+			});
+			const repos = model.webhookPush.repos.map((repo) =>
+				repoId === undefined || repo.repo_id === repoId
+					? completeRepo(repo)
+					: repo,
+			);
+			return {
+				...model,
+				webhookPush: {
+					...model.webhookPush,
+					operation: null,
+					last_completed_check_at:
+						desiredState === "enabled"
+							? completedAt
+							: model.webhookPush.last_completed_check_at,
+					summary: {
+						...model.webhookPush.summary,
+						registered: repos.filter((repo) => repo.status === "registered")
+							.length,
+						missing: repos.filter((repo) => repo.status === "missing").length,
+						removable: repos.filter((repo) => repo.hook_id !== null).length,
+					},
+					owner_groups: model.webhookPush.owner_groups.map((group) => ({
+						...group,
+						repos: group.repos.map((repo) =>
+							repoId === undefined || repo.repo_id === repoId
+								? completeRepo(repo)
+								: repo,
+						),
+						pending_count: group.repos.filter((repo) => {
+							const nextRepo =
+								repoId === undefined || repo.repo_id === repoId
+									? completeRepo(repo)
+									: repo;
+							return (
+								Boolean(nextRepo.error_message) ||
+								[
+									"missing",
+									"error",
+									"conflict",
+									"permission_paused",
+									"waiting_registration",
+									"registering",
+									"processing",
+									"delete_pending",
+								].includes(nextRepo.status)
+							);
+						}).length,
+					})),
+					repos,
+				},
+			};
+		});
+	}, 700);
+	return { taskId, now };
+}
+
 function buildDemoAuthRedirect(intent: "login" | "connect" | "logout") {
 	const snapshot = currentSnapshot();
 	if (intent === "logout") {
@@ -1906,8 +2031,18 @@ export const demoHandlers = [
 		const payload = (await request.json()) as Partial<{
 			daily_brief_time_zone: string;
 			include_own_releases: boolean;
+			webhook_push_desired_state: "enabled" | "paused" | "deleted";
 		}>;
 		const access = requireRuntimeAccess();
+		if (
+			currentModel().webhookPush.operation &&
+			(payload.webhook_push_desired_state ||
+				payload.include_own_releases === false)
+		) {
+			return demoWebhookConflictResponse();
+		}
+		const previousWebhookState = currentModel().webhookPush.desired_state;
+		let nextWebhookState: "enabled" | "paused" | "deleted" | null = null;
 		access.updateModel((model) => {
 			const nextProfile = {
 				...model.profile,
@@ -1935,8 +2070,23 @@ export const demoHandlers = [
 								model,
 								nextProfile.include_own_releases,
 							),
+				webhookPush: {
+					...model.webhookPush,
+					include_own_releases: nextProfile.include_own_releases,
+					desired_state:
+						payload.webhook_push_desired_state ??
+						(payload.include_own_releases === false &&
+						model.webhookPush.desired_state === "enabled"
+							? "paused"
+							: model.webhookPush.desired_state),
+					enabled:
+						(payload.webhook_push_desired_state ??
+							model.webhookPush.desired_state) === "enabled" &&
+						nextProfile.include_own_releases,
+				},
 			};
 		});
+		nextWebhookState = currentModel().webhookPush.desired_state;
 		access.recordMutation(
 			"Save settings profile",
 			"Saved my releases / brief profile fields in demo memory only.",
@@ -1946,7 +2096,81 @@ export const demoHandlers = [
 				includeOwnReleases: payload.include_own_releases,
 			});
 		}
+		if (
+			(payload.webhook_push_desired_state ||
+				payload.include_own_releases === false) &&
+			nextWebhookState !== previousWebhookState
+		) {
+			queueDemoWebhookReconcile(nextWebhookState ?? "paused");
+		}
 		return json(currentModel().profile);
+	}),
+	http.get("/api/me/webhook-push", async ({ request }) => {
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		return json(currentModel().webhookPush);
+	}),
+	http.patch("/api/me/webhook-push", async ({ request }) => {
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		const payload = (await request.json()) as {
+			desired_state?: "enabled" | "paused" | "deleted";
+		};
+		const desiredState = payload.desired_state ?? "deleted";
+		const access = requireRuntimeAccess();
+		let taskId: string;
+		try {
+			({ taskId } = queueDemoWebhookReconcile(desiredState));
+		} catch (error) {
+			if (
+				error instanceof Error &&
+				error.message === "webhook_push_operation_in_progress"
+			) {
+				return demoWebhookConflictResponse();
+			}
+			throw error;
+		}
+		access.recordMutation(
+			"Reconcile webhook push",
+			`Desired state set to ${desiredState} in demo memory only.`,
+		);
+		return json({
+			desired_state: desiredState,
+			enabled: desiredState === "enabled",
+			task_id: taskId,
+			status: "queued",
+			operation: "reconcile",
+			reused: false,
+		});
+	}),
+	http.post("/api/me/webhook-push/reconcile", async ({ request }) => {
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		const repoId = (
+			(await request.json().catch(() => ({}))) as { repo_id?: number }
+		).repo_id;
+		let taskId: string;
+		try {
+			({ taskId } = queueDemoWebhookReconcile(
+				currentModel().webhookPush.desired_state,
+				repoId,
+			));
+		} catch (error) {
+			if (
+				error instanceof Error &&
+				error.message === "webhook_push_operation_in_progress"
+			) {
+				return demoWebhookConflictResponse();
+			}
+			throw error;
+		}
+		return json({
+			task_id: taskId,
+			status: "queued",
+			operation: "reconcile",
+			reused: false,
+			repo_id: repoId,
+		});
 	}),
 	http.get("/api/reaction-token/status", async ({ request }) => {
 		const network = await applyNetworkProfile(request);
