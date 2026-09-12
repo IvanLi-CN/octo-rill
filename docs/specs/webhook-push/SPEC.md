@@ -33,13 +33,14 @@
 - `users.webhook_push_desired_state` 默认 `deleted`，合法值为 `enabled|paused|deleted`。
 - `users.webhook_push_enabled` 是本地接收门禁；目标为 `paused` 或 `deleted` 时必须先置为 `0`。
 - “Webhook 推送”依赖 `include_own_releases=1`。关闭“我的发布”时必须进入同一“暂停或删除 Hook”选择流程，不得隐式删除 GitHub hooks。
-- 开启前必须确认：
+- 开启前必须确认本地已持久化的前置条件：
   - 已保存 PAT 且最近校验有效；
   - PAT owner 是当前用户已绑定的 GitHub 账号；
   - classic PAT scope 包含 `public_repo` 或 `repo`；
   - `OCTORILL_PUBLIC_BASE_URL` 是 GitHub 可访问的 HTTPS 地址。
 - 开启必须经过二次确认。确认内容只说明当前授权动作：权限用途、仅监听新发布 Release 和 secret 加密保存。关闭时在同一选择弹窗中选择保留并暂停或删除 Hook；选择删除后直接提交，不再二次确认。
 - 启用目标成功后立即排队一次全量注册。单仓失败不回滚目标；页面显示“等待注册”或“注册中”，不显示异常。
+- HTTP mutation 不调用 GitHub；worker 在任何 Hook 变更前实时复核 PAT owner、scope 和 GitHub 身份，失败时保留目标并按任务状态展示。
 
 ### 仓库范围
 
