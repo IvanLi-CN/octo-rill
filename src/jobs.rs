@@ -1626,9 +1626,32 @@ pub async fn append_task_event(
     Ok(())
 }
 
-pub fn task_sse_response(state: Arc<AppState>, task_id: String) -> Response {
+pub fn task_sse_response(
+    state: Arc<AppState>,
+    task_id: String,
+    last_event_id: Option<String>,
+) -> Response {
     let events = stream! {
-        let mut last_event_seq = 0_i64;
+        let mut last_event_seq = if let Some(last_event_id) = last_event_id.as_deref() {
+            sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT rowid
+                FROM job_task_events
+                WHERE task_id = ? AND id = ?
+                LIMIT 1
+                "#,
+            )
+            .bind(&task_id)
+            .bind(last_event_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+        } else {
+            0
+        };
+        let mut terminal_event_missing_polls = 0_u8;
         loop {
             #[derive(Debug, sqlx::FromRow)]
             struct EventRow {
@@ -1676,30 +1699,60 @@ pub fn task_sse_response(state: Arc<AppState>, task_id: String) -> Response {
                 break;
             };
             if is_terminal_status(&status) {
-                // Allow one more quick poll to flush late events.
-                tokio::time::sleep(Duration::from_millis(120)).await;
-                let rows = sqlx::query_as::<_, EventRow>(
+                let terminal_event_exists = sqlx::query_scalar::<_, i64>(
                     r#"
-                    SELECT rowid AS seq, id, event_type, payload_json
+                    SELECT 1
                     FROM job_task_events
-                    WHERE task_id = ? AND rowid > ?
-                    ORDER BY rowid ASC
-                    LIMIT 100
+                    WHERE task_id = ?
+                      AND event_type IN ('task.completed', 'task.canceled', 'task.recovered_failed')
+                    LIMIT 1
                     "#,
                 )
                 .bind(&task_id)
-                .bind(last_event_seq)
-                .fetch_all(&state.pool)
+                .fetch_optional(&state.pool)
                 .await
-                .unwrap_or_default();
+                .ok()
+                .flatten()
+                .is_some();
+                if !terminal_event_exists {
+                    terminal_event_missing_polls = terminal_event_missing_polls.saturating_add(1);
+                    if terminal_event_missing_polls >= 50 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                // Allow one more quick poll to flush events committed alongside
+                // the terminal event before closing the stream.
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                loop {
+                    let rows = sqlx::query_as::<_, EventRow>(
+                        r#"
+                        SELECT rowid AS seq, id, event_type, payload_json
+                        FROM job_task_events
+                        WHERE task_id = ? AND rowid > ?
+                        ORDER BY rowid ASC
+                        LIMIT 100
+                        "#,
+                    )
+                    .bind(&task_id)
+                    .bind(last_event_seq)
+                    .fetch_all(&state.pool)
+                    .await
+                    .unwrap_or_default();
 
-                for row in rows {
-                    yield Ok::<Event, Infallible>(
-                        Event::default()
-                            .id(row.id)
-                            .event(row.event_type)
-                            .data(row.payload_json),
-                    );
+                    if rows.is_empty() {
+                        break;
+                    }
+                    for row in rows {
+                        last_event_seq = row.seq;
+                        yield Ok::<Event, Infallible>(
+                            Event::default()
+                                .id(row.id)
+                                .event(row.event_type)
+                                .data(row.payload_json),
+                        );
+                    }
                 }
                 break;
             }
@@ -2193,7 +2246,18 @@ async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
 
 async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
     if task.cancel_requested != 0 {
-        finalize_task(state.as_ref(), &task.id, STATUS_CANCELED, None, None).await?;
+        if !finalize_task_if_owned(
+            state.as_ref(),
+            &task.id,
+            STATUS_CANCELED,
+            None,
+            None,
+            state.runtime_owner_id.as_str(),
+        )
+        .await?
+        {
+            return Ok(());
+        }
         append_task_event(
             state.as_ref(),
             &task.id,
@@ -2226,8 +2290,19 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
         .await
         .unwrap_or(false)
     {
-        finalize_task(state.as_ref(), &task.id, STATUS_CANCELED, None, None).await?;
+        let finalized = finalize_task_if_owned(
+            state.as_ref(),
+            &task.id,
+            STATUS_CANCELED,
+            None,
+            None,
+            state.runtime_owner_id.as_str(),
+        )
+        .await?;
         heartbeat.stop().await;
+        if !finalized {
+            return Ok(());
+        }
         append_task_event(
             state.as_ref(),
             &task.id,
@@ -2240,15 +2315,19 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
 
     match result {
         Ok(result_json) => {
-            finalize_task(
+            let finalized = finalize_task_if_owned(
                 state.as_ref(),
                 &task.id,
                 STATUS_SUCCEEDED,
                 Some(result_json),
                 None,
+                state.runtime_owner_id.as_str(),
             )
             .await?;
             heartbeat.stop().await;
+            if !finalized {
+                return Ok(());
+            }
             append_task_event(
                 state.as_ref(),
                 &task.id,
@@ -2259,15 +2338,19 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
         }
         Err(err) => {
             let message = err.to_string();
-            finalize_task(
+            let finalized = finalize_task_if_owned(
                 state.as_ref(),
                 &task.id,
                 STATUS_FAILED,
                 None,
                 Some(message.clone()),
+                state.runtime_owner_id.as_str(),
             )
             .await?;
             heartbeat.stop().await;
+            if !finalized {
+                return Ok(());
+            }
             append_task_event(
                 state.as_ref(),
                 &task.id,
@@ -4013,6 +4096,55 @@ async fn finalize_task(
     Ok(())
 }
 
+async fn finalize_task_if_owned(
+    state: &AppState,
+    task_id: &str,
+    status: &str,
+    result: Option<Value>,
+    error_message: Option<String>,
+    runtime_owner_id: &str,
+) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let result_json = result
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("serialize task result")?;
+
+    state
+        .sqlite_writer
+        .write("job_task_finalize_owned", |_| async {
+            let updated = sqlx::query(
+                r#"
+				UPDATE job_tasks
+				SET status = ?,
+				    result_json = ?,
+				    error_message = ?,
+				    finished_at = ?,
+				    runtime_owner_id = NULL,
+				    lease_heartbeat_at = NULL,
+				    updated_at = ?
+				WHERE id = ?
+				  AND status = ?
+				  AND runtime_owner_id = ?
+				"#,
+            )
+            .bind(status)
+            .bind(result_json.as_deref())
+            .bind(error_message.as_deref())
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(task_id)
+            .bind(STATUS_RUNNING)
+            .bind(runtime_owner_id)
+            .execute(&state.pool)
+            .await
+            .context("failed to finalize owned task")?;
+            Ok(updated.rows_affected() > 0)
+        })
+        .await
+}
+
 async fn heartbeat_task_lease(state: &AppState, task_id: &str) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     state
@@ -4112,14 +4244,18 @@ async fn recover_runtime_state_with_mode(
     .context("failed to load stale runtime tasks")?;
 
     for task in stale_tasks {
-        finalize_task(
+        if !recover_task_if_stale(
             state,
             task.id.as_str(),
-            STATUS_FAILED,
-            None,
-            Some(runtime::RUNTIME_LEASE_EXPIRED_ERROR.to_owned()),
+            task.runtime_owner_id.as_deref(),
+            task.lease_heartbeat_at.as_deref(),
+            cutoff.as_str(),
+            mode,
         )
-        .await?;
+        .await?
+        {
+            continue;
+        }
         append_task_event(
             state,
             task.id.as_str(),
@@ -4136,6 +4272,100 @@ async fn recover_runtime_state_with_mode(
     }
 
     Ok(())
+}
+
+async fn recover_task_if_stale(
+    state: &AppState,
+    task_id: &str,
+    previous_runtime_owner_id: Option<&str>,
+    previous_lease_heartbeat_at: Option<&str>,
+    cutoff: &str,
+    mode: runtime::RuntimeRecoveryMode,
+) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    state
+        .sqlite_writer
+        .write("job_task_recover", |_| async {
+            let updated = match mode {
+                runtime::RuntimeRecoveryMode::Startup => sqlx::query(
+                    r#"
+						UPDATE job_tasks
+						SET status = ?,
+						    error_message = ?,
+						    finished_at = ?,
+						    runtime_owner_id = NULL,
+						    lease_heartbeat_at = NULL,
+						    updated_at = ?
+						WHERE id = ?
+						  AND status = ?
+						  AND runtime_owner_id IS ?
+						  AND lease_heartbeat_at IS ?
+						  AND (
+						    runtime_owner_id IS NULL
+						    OR lease_heartbeat_at IS NULL
+						    OR julianday(lease_heartbeat_at) <= julianday(?)
+						    OR (
+						      runtime_owner_id != ?
+						      AND NOT EXISTS (
+						        SELECT 1
+						        FROM runtime_owners
+						        WHERE runtime_owner_id = job_tasks.runtime_owner_id
+						          AND julianday(lease_heartbeat_at) > julianday(?)
+						      )
+						    )
+						  )
+						"#,
+                )
+                .bind(STATUS_FAILED)
+                .bind(runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+                .bind(now.as_str())
+                .bind(now.as_str())
+                .bind(task_id)
+                .bind(STATUS_RUNNING)
+                .bind(previous_runtime_owner_id)
+                .bind(previous_lease_heartbeat_at)
+                .bind(cutoff)
+                .bind(state.runtime_owner_id.as_str())
+                .bind(cutoff)
+                .execute(&state.pool)
+                .await
+                .context("failed to recover stale startup task")?,
+                runtime::RuntimeRecoveryMode::Sweep => sqlx::query(
+                    r#"
+						UPDATE job_tasks
+						SET status = ?,
+						    error_message = ?,
+						    finished_at = ?,
+						    runtime_owner_id = NULL,
+						    lease_heartbeat_at = NULL,
+						    updated_at = ?
+						WHERE id = ?
+						  AND status = ?
+						  AND runtime_owner_id IS ?
+						  AND lease_heartbeat_at IS ?
+						  AND (
+						    runtime_owner_id IS NULL
+						    OR lease_heartbeat_at IS NULL
+						    OR julianday(lease_heartbeat_at) <= julianday(?)
+						  )
+						"#,
+                )
+                .bind(STATUS_FAILED)
+                .bind(runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+                .bind(now.as_str())
+                .bind(now.as_str())
+                .bind(task_id)
+                .bind(STATUS_RUNNING)
+                .bind(previous_runtime_owner_id)
+                .bind(previous_lease_heartbeat_at)
+                .bind(cutoff)
+                .execute(&state.pool)
+                .await
+                .context("failed to recover stale task")?,
+            };
+            Ok(updated.rows_affected() > 0)
+        })
+        .await
 }
 
 pub(crate) async fn is_task_cancel_requested(state: &AppState, task_id: &str) -> Result<bool> {
@@ -4294,8 +4524,8 @@ mod tests {
     use std::{net::SocketAddr, sync::Arc};
 
     use super::{
-        NewTask, RetryTranslationCandidateRow, SMART_NO_VALUABLE_VERSION_INFO, STATUS_FAILED,
-        STATUS_QUEUED, STATUS_RUNNING, STATUS_SUCCEEDED, TASK_BRIEF_DAILY_SLOT,
+        NewTask, RetryTranslationCandidateRow, SMART_NO_VALUABLE_VERSION_INFO, STATUS_CANCELED,
+        STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, STATUS_SUCCEEDED, TASK_BRIEF_DAILY_SLOT,
         TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT, TASK_RETRY_RECENT_FAILURES,
         TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_RELEASES,
         TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE, TASK_SYNC_SUBSCRIPTIONS,
@@ -4306,20 +4536,22 @@ mod tests {
         enqueue_singleton_task_for_requester_and_payload, enqueue_star_sync_runs_if_due,
         enqueue_subscription_run_if_due, enqueue_task, execute_brief_history_recompute_task,
         execute_brief_refresh_content_task, execute_daily_slot_task, execute_sync_all_task_with,
-        is_scheduled_task_type, load_due_daily_slot_users,
+        finalize_task_if_owned, is_scheduled_task_type, load_due_daily_slot_users,
         load_recent_failed_brief_retry_candidates, load_recent_failed_translation_retry_candidates,
         load_translation_stream_cursor, load_translation_stream_rows, mark_brief_generation_source,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
-        recover_runtime_state, recover_runtime_state_on_startup, retry_candidate_is_retryable,
-        run_account_pause_maintenance_if_due, update_daily_brief_hour_slot_dispatch,
-        upsert_dispatch_state,
+        recover_runtime_state, recover_runtime_state_on_startup, recover_task_if_stale,
+        retry_candidate_is_retryable, run_account_pause_maintenance_if_due, task_sse_response,
+        update_daily_brief_hour_slot_dispatch, upsert_dispatch_state,
     };
+    use axum::body::to_bytes;
     use chrono::{Duration, NaiveTime, TimeZone, Utc};
     use serde_json::{Value, json};
     use sqlx::{
         Row, SqlitePool,
         sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     };
+    use tokio_stream::StreamExt;
     use url::Url;
 
     use crate::{
@@ -4328,6 +4560,290 @@ mod tests {
         state::{AppState, build_oauth_client},
         sync,
     };
+
+    fn sse_event_ids(body: &str) -> Vec<&str> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("id: "))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn task_sse_response_resumes_after_last_event_id() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "sse-resume-task";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_SUCCEEDED, 0).await;
+
+        for (event_id, payload) in [
+            ("sse-event-1", r#"{"stage":"star_refreshed"}"#),
+            ("sse-event-2", r#"{"stage":"release_summary"}"#),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', ?, ?)
+                "#,
+            )
+            .bind(event_id)
+            .bind(task_id)
+            .bind(payload)
+            .bind("2026-03-06T00:00:01Z")
+            .execute(&pool)
+            .await
+            .expect("insert task event");
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.completed', ?, ?)
+            "#,
+        )
+        .bind("sse-event-terminal")
+        .bind(task_id)
+        .bind(r#"{"status":"succeeded"}"#)
+        .bind("2026-03-06T00:00:01Z")
+        .execute(&pool)
+        .await
+        .expect("insert terminal task event");
+
+        let initial_body = to_bytes(
+            task_sse_response(state.clone(), task_id.to_owned(), None).into_body(),
+            usize::MAX,
+        )
+        .await
+        .expect("collect initial SSE response");
+        let initial_text = String::from_utf8(initial_body.to_vec()).expect("valid SSE body");
+        assert_eq!(
+            sse_event_ids(&initial_text),
+            vec!["sse-event-1", "sse-event-2", "sse-event-terminal"]
+        );
+
+        let resumed_body = to_bytes(
+            task_sse_response(state, task_id.to_owned(), Some("sse-event-1".to_owned()))
+                .into_body(),
+            usize::MAX,
+        )
+        .await
+        .expect("collect resumed SSE response");
+        let resumed_text = String::from_utf8(resumed_body.to_vec()).expect("valid SSE body");
+        assert_eq!(
+            sse_event_ids(&resumed_text),
+            vec!["sse-event-2", "sse-event-terminal"]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_sse_response_replays_from_start_for_unknown_or_foreign_cursor() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "sse-fallback-task";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_SUCCEEDED, 0).await;
+        seed_task(
+            &pool,
+            "sse-other-task",
+            TASK_SYNC_RELEASES,
+            STATUS_SUCCEEDED,
+            1,
+        )
+        .await;
+
+        for (event_id, task) in [
+            ("sse-fallback-event-1", task_id),
+            ("sse-fallback-event-2", task_id),
+            ("sse-foreign-event", "sse-other-task"),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', '{}', ?)
+                "#,
+            )
+            .bind(event_id)
+            .bind(task)
+            .bind("2026-03-06T00:00:01Z")
+            .execute(&pool)
+            .await
+            .expect("insert task event");
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.completed', ?, ?)
+            "#,
+        )
+        .bind("sse-fallback-event-terminal")
+        .bind(task_id)
+        .bind(r#"{"status":"succeeded"}"#)
+        .bind("2026-03-06T00:00:01Z")
+        .execute(&pool)
+        .await
+        .expect("insert terminal fallback event");
+
+        for cursor in [
+            Some("missing".to_owned()),
+            Some("sse-foreign-event".to_owned()),
+        ] {
+            let body = to_bytes(
+                task_sse_response(state.clone(), task_id.to_owned(), cursor).into_body(),
+                usize::MAX,
+            )
+            .await
+            .expect("collect fallback SSE response");
+            let text = String::from_utf8(body.to_vec()).expect("valid SSE body");
+            assert_eq!(
+                sse_event_ids(&text),
+                vec![
+                    "sse-fallback-event-1",
+                    "sse-fallback-event-2",
+                    "sse-fallback-event-terminal"
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn task_sse_response_flushes_late_terminal_event_once() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "sse-late-terminal-task";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_SUCCEEDED, 0).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.progress', ?, ?)
+            "#,
+        )
+        .bind("sse-terminal-before-flush")
+        .bind(task_id)
+        .bind(r#"{"stage":"release_summary"}"#)
+        .bind("2026-03-06T00:00:01Z")
+        .execute(&pool)
+        .await
+        .expect("insert initial terminal event");
+
+        let mut stream = task_sse_response(state, task_id.to_owned(), None)
+            .into_body()
+            .into_data_stream();
+        let first_chunk = stream
+            .next()
+            .await
+            .expect("initial terminal event chunk")
+            .expect("read initial terminal event chunk");
+
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.completed', ?, ?)
+            "#,
+        )
+        .bind("sse-late-terminal-event")
+        .bind(task_id)
+        .bind(r#"{"status":"succeeded"}"#)
+        .bind("2026-03-06T00:00:01Z")
+        .execute(&pool)
+        .await
+        .expect("insert late terminal event");
+
+        let mut body = first_chunk.to_vec();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk.expect("read terminal SSE chunk"));
+        }
+
+        let text = String::from_utf8(body).expect("valid SSE body");
+        assert_eq!(
+            sse_event_ids(&text),
+            vec!["sse-terminal-before-flush", "sse-late-terminal-event"]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_sse_response_flushes_terminal_event_after_multiple_pages() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let task_id = "sse-long-terminal-task";
+        seed_task(&pool, task_id, TASK_SYNC_RELEASES, STATUS_SUCCEEDED, 0).await;
+
+        for index in 0..205 {
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', '{}', ?)
+                "#,
+            )
+            .bind(format!("sse-long-event-{index:03}"))
+            .bind(task_id)
+            .bind("2026-03-06T00:00:01Z")
+            .execute(&pool)
+            .await
+            .expect("insert long-history task event");
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.completed', ?, ?)
+            "#,
+        )
+        .bind("sse-long-terminal-event")
+        .bind(task_id)
+        .bind(r#"{"status":"succeeded"}"#)
+        .bind("2026-03-06T00:00:01Z")
+        .execute(&pool)
+        .await
+        .expect("insert long-history terminal event");
+
+        let body = to_bytes(
+            task_sse_response(state, task_id.to_owned(), None).into_body(),
+            usize::MAX,
+        )
+        .await
+        .expect("collect long-history SSE response");
+        let text = String::from_utf8(body.to_vec()).expect("valid long-history SSE body");
+        let ids = sse_event_ids(&text);
+        assert_eq!(ids.len(), 206);
+        assert_eq!(ids.first(), Some(&"sse-long-event-000"));
+        assert_eq!(ids.get(204), Some(&"sse-long-event-204"));
+        assert_eq!(ids.last(), Some(&"sse-long-terminal-event"));
+    }
+
+    #[tokio::test]
+    async fn task_sse_response_recognizes_canceled_and_recovered_terminal_events() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        for (index, (task_id, event_type, status)) in [
+            ("sse-canceled-task", "task.canceled", STATUS_CANCELED),
+            ("sse-recovered-task", "task.recovered_failed", STATUS_FAILED),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            seed_task(&pool, task_id, TASK_SYNC_RELEASES, status, index as i64).await;
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(format!("{task_id}-event"))
+            .bind(task_id)
+            .bind(event_type)
+            .bind(format!(r#"{{"task_id":"{task_id}","status":"{status}"}}"#))
+            .bind("2026-03-06T00:00:01Z")
+            .execute(&pool)
+            .await
+            .expect("insert non-completed terminal event");
+
+            let body = to_bytes(
+                task_sse_response(state.clone(), task_id.to_owned(), None).into_body(),
+                usize::MAX,
+            )
+            .await
+            .expect("collect non-completed terminal SSE response");
+            let text = String::from_utf8(body.to_vec()).expect("valid SSE body");
+            let expected_id = format!("{task_id}-event");
+            assert_eq!(sse_event_ids(&text), vec![expected_id.as_str()]);
+        }
+    }
 
     #[tokio::test]
     async fn requester_payload_singleton_keeps_distinct_webhook_operations() {
@@ -5241,6 +5757,145 @@ mod tests {
         .await
         .expect("load recovery event");
         assert_eq!(event_type, "task.recovered_failed");
+    }
+
+    #[tokio::test]
+    async fn recovered_task_cannot_be_finalized_by_stale_worker() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        seed_task(
+            &pool,
+            "stale-worker-task",
+            TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+        recover_runtime_state(state.as_ref())
+            .await
+            .expect("recover runtime state");
+
+        let finalized = finalize_task_if_owned(
+            state.as_ref(),
+            "stale-worker-task",
+            STATUS_SUCCEEDED,
+            Some(json!({"stale": true})),
+            None,
+            state.runtime_owner_id.as_str(),
+        )
+        .await
+        .expect("finalize stale worker task");
+
+        assert!(!finalized);
+        let status =
+            sqlx::query_scalar::<_, String>(r#"SELECT status FROM job_tasks WHERE id = ?"#)
+                .bind("stale-worker-task")
+                .fetch_one(&pool)
+                .await
+                .expect("load recovered task status");
+        assert_eq!(status, STATUS_FAILED);
+
+        let event_types = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT event_type
+            FROM job_task_events
+            WHERE task_id = ?
+            ORDER BY rowid ASC
+            "#,
+        )
+        .bind("stale-worker-task")
+        .fetch_all(&pool)
+        .await
+        .expect("load recovered task events");
+        assert_eq!(event_types, vec!["task.recovered_failed"]);
+    }
+
+    #[tokio::test]
+    async fn stale_recovery_requires_the_original_lease_snapshot() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_task(
+            &pool,
+            "lease-revived-task",
+            TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE job_tasks
+            SET runtime_owner_id = ?, lease_heartbeat_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("worker-a")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("lease-revived-task")
+        .execute(&pool)
+        .await
+        .expect("seed stale lease");
+        sqlx::query(r#"UPDATE job_tasks SET lease_heartbeat_at = ? WHERE id = ?"#)
+            .bind("2026-03-06T00:02:00Z")
+            .bind("lease-revived-task")
+            .execute(&pool)
+            .await
+            .expect("revive lease");
+
+        let recovered = recover_task_if_stale(
+            state.as_ref(),
+            "lease-revived-task",
+            Some("worker-a"),
+            Some("2026-03-06T00:00:00Z"),
+            "2026-03-06T00:01:00Z",
+            super::runtime::RuntimeRecoveryMode::Sweep,
+        )
+        .await
+        .expect("recover task");
+
+        assert!(!recovered);
+        let status =
+            sqlx::query_scalar::<_, String>(r#"SELECT status FROM job_tasks WHERE id = ?"#)
+                .bind("lease-revived-task")
+                .fetch_one(&pool)
+                .await
+                .expect("load revived task status");
+        assert_eq!(status, STATUS_RUNNING);
+    }
+
+    #[tokio::test]
+    async fn concurrent_recovery_appends_only_one_terminal_event() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_task(
+            &pool,
+            "concurrent-recovery-task",
+            TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+
+        let (first, second) = tokio::join!(
+            recover_runtime_state(state.as_ref()),
+            recover_runtime_state(state.as_ref()),
+        );
+        first.expect("first recovery");
+        second.expect("second recovery");
+
+        let event_count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_task_events
+            WHERE task_id = ? AND event_type = 'task.recovered_failed'
+            "#,
+        )
+        .bind("concurrent-recovery-task")
+        .fetch_one(&pool)
+        .await
+        .expect("count recovery events");
+        assert_eq!(event_count, 1);
     }
 
     #[tokio::test]

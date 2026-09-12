@@ -289,6 +289,7 @@ export function FeedReadableSectionList(props: {
 	details: Record<string, ReadableSectionDetails>;
 	error: ReadableSectionsError | null;
 	loadingInitial: boolean;
+	loadingRefresh?: boolean;
 	loadingMore: boolean;
 	hasMore: boolean;
 	autoLoadMore?: boolean;
@@ -306,6 +307,7 @@ export function FeedReadableSectionList(props: {
 		details,
 		error,
 		loadingInitial,
+		loadingRefresh = false,
 		loadingMore,
 		hasMore,
 		autoLoadMore = true,
@@ -342,15 +344,17 @@ export function FeedReadableSectionList(props: {
 
 	useEffect(() => {
 		requestVisibleRef.current = false;
-	}, [hasMore, sections.length]);
+	}, [hasMore, loadingRefresh, sections.length]);
 
 	useEffect(() => {
 		if (
 			!autoLoadMore ||
 			!hasMore ||
 			loadingInitial ||
+			loadingRefresh ||
 			loadingMore ||
-			error?.phase === "append"
+			error?.phase === "append" ||
+			error?.phase === "refresh"
 		)
 			return;
 		const element = sentinelRef.current;
@@ -376,6 +380,7 @@ export function FeedReadableSectionList(props: {
 		error?.phase,
 		hasMore,
 		loadingInitial,
+		loadingRefresh,
 		loadingMore,
 		onLoadMore,
 	]);
@@ -399,7 +404,9 @@ export function FeedReadableSectionList(props: {
 			if (
 				!element ||
 				!detailCursor ||
+				loadingRefresh ||
 				detail?.loading ||
+				detail?.refreshPending ||
 				detail?.error ||
 				detailRequestVisibleRef.current.has(`${sectionId}:${detailCursor}`)
 			)
@@ -423,7 +430,22 @@ export function FeedReadableSectionList(props: {
 				observer.disconnect();
 			});
 		};
-	}, [details, listSections, onLoadSectionItems, sections]);
+	}, [details, listSections, loadingRefresh, onLoadSectionItems, sections]);
+
+	useEffect(() => {
+		if (loadingRefresh) return;
+		for (const [sectionId, detail] of Object.entries(details)) {
+			if (detail.refreshPending && !detail.loading) {
+				onLoadSectionItems(sectionId);
+			}
+		}
+		for (const sectionId of listSections) {
+			const section = sections.find((candidate) => candidate.id === sectionId);
+			if (section?.brief && !details[sectionId]) {
+				onLoadSectionItems(sectionId);
+			}
+		}
+	}, [details, listSections, loadingRefresh, onLoadSectionItems, sections]);
 
 	const toggleList = useCallback(
 		(sectionId: string) => {
@@ -434,9 +456,9 @@ export function FeedReadableSectionList(props: {
 				else next.add(sectionId);
 				return next;
 			});
-			if (enteringList) onLoadSectionItems(sectionId);
+			if (enteringList && !loadingRefresh) onLoadSectionItems(sectionId);
 		},
-		[listSections, onLoadSectionItems],
+		[listSections, loadingRefresh, onLoadSectionItems],
 	);
 
 	if (loadingInitial && sections.length === 0) {
