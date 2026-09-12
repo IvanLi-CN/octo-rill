@@ -485,18 +485,95 @@ function buildFollowingRepos(): FollowingReposResponse {
 			manual_feed: true,
 		},
 	};
+	const associatedOnlyRepo: FollowingReposResponse["items"][number] = {
+		...associatedRepo,
+		repo_id: 1004,
+		full_name: "octo-demo/security-lab",
+		name: "security-lab",
+		html_url: "https://github.com/octo-demo/security-lab",
+		description: "Associated security review fixtures.",
+		first_associated_at: "2026-07-08T10:00:00+08:00",
+	};
+	const extraFollowingRepos = [
+		["octo-demo/mobile-lab", "Mobile release experiments"],
+		["octo-demo/changelog", "Product changelog and release notes"],
+		["octo-demo/ops-console", "Operations dashboard"],
+		["octo-demo/design-system", "Shared UI primitives"],
+		["octo-demo/automation-kit", "Workflow automation examples"],
+		["octo-demo/archive-room", "Archived project fixtures"],
+		["octo-demo/webhooks", "Webhook delivery fixtures"],
+		["octo-demo/translation-lab", "Translation QA workspace"],
+		["octo-demo/release-train", "Release train planning"],
+		["octo-demo/api-gateway", "API gateway examples"],
+		["octo-demo/playground", "Experimental playground"],
+		["octo-demo/metrics-hub", "Repository metrics"],
+		["octo-demo/docs-preview", "Documentation preview"],
+		["octo-demo/integration-tests", "Integration test fixtures"],
+		["octo-demo/community", "Community examples"],
+		["octo-demo/nightly-build", "Nightly build status"],
+	] as const;
+	const extraItems: FollowingReposResponse["items"] = extraFollowingRepos.map(
+		([fullName, description], index) => {
+			const [ownerLogin, name] = fullName.split("/");
+			return {
+				repo_id: 1_100 + index,
+				full_name: fullName,
+				owner_login: ownerLogin,
+				name,
+				html_url: `https://github.com/${fullName}`,
+				description,
+				is_private: false,
+				first_source: "manual_feed",
+				first_associated_at: `2026-07-${String(5 + index).padStart(2, "0")}T10:00:00+08:00`,
+				last_seen_at: NOW,
+				is_following: true,
+				follow_state_source: "manual_feed",
+				repo_visual: null,
+				sources: {
+					personal_owned: false,
+					github_star: false,
+					manual_feed: true,
+				},
+			};
+		},
+	);
+	const followingItems = [ownerRepo, docsRepo, ...extraItems];
+	const associatedItems = [
+		...followingItems,
+		associatedRepo,
+		associatedOnlyRepo,
+	];
 
 	return {
-		following_count: 2,
-		associated_count: 3,
-		items: [ownerRepo, docsRepo],
-		associated_items: [ownerRepo, docsRepo, associatedRepo],
+		following_count: followingItems.length,
+		associated_count: associatedItems.length,
+		items: followingItems,
+		associated_items: associatedItems,
 	};
 }
 
 function buildPersonalRepos(): PersonalReposResponse {
 	const ownerLogin = "octo-demo-owner";
-	const names = ["release-lab", "docs-hub", "quiet-project"];
+	const names = [
+		"release-lab",
+		"docs-hub",
+		"quiet-project",
+		"mobile-lab",
+		"changelog",
+		"ops-console",
+		"archive-room",
+		"design-system",
+		"webhooks",
+		"translation-lab",
+		"release-train",
+		"api-gateway",
+		"playground",
+		"metrics-hub",
+		"docs-preview",
+		"integration-tests",
+		"community",
+		"nightly-build",
+	];
 	return {
 		owner_login: ownerLogin,
 		total_count: names.length,
@@ -507,7 +584,12 @@ function buildPersonalRepos(): PersonalReposResponse {
 			name,
 			html_url: `https://github.com/${ownerLogin}/${name}`,
 			updated_at: "2026-07-08T08:00:00+08:00",
-			release_count: name === "quiet-project" ? 0 : 1,
+			release_count:
+				name === "quiet-project" || name === "archive-room"
+					? 0
+					: index % 3 === 0
+						? 2
+						: 1,
 			repo_visual: null,
 		})),
 	};

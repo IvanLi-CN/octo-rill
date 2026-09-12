@@ -17,10 +17,19 @@ const REPOSITORY_SIDEBAR_VIEWPORTS = {
 		styles: { height: "768px", width: "1024px" },
 		type: "desktop",
 	},
+	dashboardRepository1171x620: {
+		name: "Repository sidebar compact desktop 1171x620",
+		styles: { height: "620px", width: "1171px" },
+		type: "desktop",
+	},
 } as const;
 
-function RepositorySidebarPreview(props: { count: number; label: string }) {
-	const { panelRef, listRef, panelStyle, shortList } =
+function RepositorySidebarPreview(props: {
+	count: number;
+	label: string;
+	topInset?: number;
+}) {
+	const { panelRef, listRef, panelStyle, listStyle, shortList, compact } =
 		useRepositoryPanelViewportHeight({ enabled: true, itemCount: props.count });
 
 	return (
@@ -28,15 +37,24 @@ function RepositorySidebarPreview(props: { count: number; label: string }) {
 			className="bg-background min-h-screen p-8"
 			data-visual-evidence-surface
 		>
-			<div className="flex min-h-[680px] justify-end">
+			<div
+				className="flex min-h-[680px] justify-end"
+				style={props.topInset ? { paddingTop: props.topInset } : undefined}
+			>
 				<div
 					ref={panelRef}
-					className="flex min-h-0 w-[360px] flex-col rounded-[28px] border border-border/70 bg-card/82 p-5 shadow-sm"
+					className={[
+						"flex min-h-0 w-[360px] flex-col rounded-[28px] border border-border/70 bg-card/82 shadow-sm",
+						compact ? "p-3" : "p-5",
+					].join(" ")}
 					style={panelStyle}
 					data-visual-evidence-target
 					data-dashboard-repository-panel="true"
 					data-dashboard-repository-panel-state={
 						shortList ? "viewport-fill" : "natural-capped"
+					}
+					data-dashboard-repository-panel-density={
+						compact ? "compact" : "comfortable"
 					}
 				>
 					<div className="flex items-start justify-between gap-3">
@@ -52,24 +70,66 @@ function RepositorySidebarPreview(props: { count: number; label: string }) {
 							{props.count} 个仓库
 						</span>
 					</div>
-					<p className="mt-3 text-sm leading-6 text-muted-foreground">
+					<p
+						className={
+							compact
+								? "mt-1 line-clamp-1 text-xs leading-4 text-muted-foreground"
+								: "mt-3 text-sm leading-6 text-muted-foreground"
+						}
+					>
 						查看你当前关注仓库的发布与相关动态。
 					</p>
-					<div className="mt-4 grid grid-cols-2 gap-2">
-						<div className="rounded-xl bg-muted/38 px-4 py-3">
+					<div
+						className={[
+							"grid grid-cols-2 gap-2",
+							compact ? "mt-2" : "mt-4",
+						].join(" ")}
+					>
+						<div
+							className={[
+								"rounded-xl bg-muted/38",
+								compact ? "px-3 py-1.5" : "px-4 py-3",
+							].join(" ")}
+						>
 							<p className="font-mono text-[11px] text-muted-foreground">
 								关注仓库
 							</p>
-							<p className="mt-1 text-lg font-semibold">{props.count}</p>
+							<p
+								className={
+									compact
+										? "text-base font-semibold"
+										: "mt-1 text-lg font-semibold"
+								}
+							>
+								{props.count}
+							</p>
 						</div>
-						<div className="rounded-xl px-4 py-3">
+						<div
+							className={[
+								"rounded-xl",
+								compact ? "px-3 py-1.5" : "px-4 py-3",
+							].join(" ")}
+						>
 							<p className="font-mono text-[11px] text-muted-foreground">
 								关联仓库
 							</p>
-							<p className="mt-1 text-lg font-semibold">{props.count + 1}</p>
+							<p
+								className={
+									compact
+										? "text-base font-semibold"
+										: "mt-1 text-lg font-semibold"
+								}
+							>
+								{props.count + 1}
+							</p>
 						</div>
 					</div>
-					<div className="mt-4 flex min-h-0 flex-1 flex-col border-t border-border/60 pt-4">
+					<div
+						className={[
+							"flex min-h-0 flex-1 flex-col overflow-hidden border-t border-border/60",
+							compact ? "mt-2 pt-2" : "mt-4 pt-4",
+						].join(" ")}
+					>
 						<div className="flex items-center justify-between gap-3">
 							<p className="text-sm font-medium">{props.label}</p>
 							<p className="font-mono text-[11px] text-muted-foreground">
@@ -78,7 +138,11 @@ function RepositorySidebarPreview(props: { count: number; label: string }) {
 						</div>
 						<ul
 							ref={listRef}
-							className="mt-3 min-h-0 flex-1 divide-y divide-border/50 overflow-y-auto"
+							className={[
+								"min-h-0 flex-1 divide-y divide-border/50 overflow-y-auto",
+								compact ? "mt-2" : "mt-3",
+							].join(" ")}
+							style={listStyle}
 							data-dashboard-repository-list="true"
 						>
 							{Array.from({ length: props.count }, (_, index) => (
@@ -118,7 +182,7 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"仓库侧栏在桌面端以固定页脚为下界；少于两张项目卡时填满可用高度，长列表只在列表区滚动。",
+					"仓库侧栏以固定页脚为下界；列表可视区至少容纳两张项目卡，长列表只在列表区滚动。",
 			},
 		},
 	},
@@ -127,6 +191,20 @@ const meta = {
 
 export default meta;
 type Story = StoryObj<typeof meta>;
+
+async function expectTwoVisibleRepositoryCards(canvasElement: HTMLElement) {
+	const list = canvasElement.querySelector<HTMLElement>(
+		'[data-dashboard-repository-list="true"]',
+	);
+	if (!list) throw new Error("Expected repository list");
+	const firstItem = list.querySelector<HTMLElement>(
+		"[data-dashboard-repository-item]",
+	);
+	const itemHeight = firstItem?.getBoundingClientRect().height ?? 76;
+	await waitFor(() => {
+		expect(list.clientHeight).toBeGreaterThanOrEqual(itemHeight * 2 - 2);
+	});
+}
 
 export const ShortFollowing: Story = {
 	play: async ({ canvasElement }) => {
@@ -148,6 +226,7 @@ export const ShortFollowing: Story = {
 			footer.getBoundingClientRect().top - panel.getBoundingClientRect().bottom;
 		expect(gap).toBeGreaterThanOrEqual(14);
 		expect(gap).toBeLessThanOrEqual(18);
+		await expectTwoVisibleRepositoryCards(canvasElement);
 	},
 };
 
@@ -171,11 +250,12 @@ export const EmptyFollowing: Story = {
 		await expect(
 			canvasElement.querySelectorAll("[data-dashboard-repository-item]"),
 		).toHaveLength(0);
+		await expectTwoVisibleRepositoryCards(canvasElement);
 	},
 };
 
 export const LongFollowing: Story = {
-	args: { count: 12, label: "关注仓库" },
+	args: { count: 18, label: "关注仓库" },
 	play: async ({ canvasElement }) => {
 		await waitFor(() => {
 			expect(
@@ -186,7 +266,7 @@ export const LongFollowing: Story = {
 		});
 		await expect(
 			canvasElement.querySelectorAll("[data-dashboard-repository-item]"),
-		).toHaveLength(12);
+		).toHaveLength(18);
 		const list = canvasElement.querySelector<HTMLElement>(
 			'[data-dashboard-repository-list="true"]',
 		);
@@ -195,6 +275,7 @@ export const LongFollowing: Story = {
 		await waitFor(() => {
 			expect(list.scrollHeight).toBeGreaterThan(list.clientHeight);
 		});
+		await expectTwoVisibleRepositoryCards(canvasElement);
 		const panel = canvasElement.querySelector<HTMLElement>(
 			'[data-dashboard-repository-panel="true"]',
 		);
@@ -229,6 +310,7 @@ export const PersonalRepositories: Story = {
 		await expect(
 			canvasElement.querySelectorAll("[data-dashboard-repository-item]"),
 		).toHaveLength(1);
+		await expectTwoVisibleRepositoryCards(canvasElement);
 		const panel = canvasElement.querySelector<HTMLElement>(
 			'[data-dashboard-repository-panel="true"]',
 		);
@@ -240,5 +322,27 @@ export const PersonalRepositories: Story = {
 			footer.getBoundingClientRect().top - panel.getBoundingClientRect().bottom;
 		expect(gap).toBeGreaterThanOrEqual(14);
 		expect(gap).toBeLessThanOrEqual(18);
+	},
+};
+
+export const CompactLongFollowing: Story = {
+	args: { count: 18, label: "关注仓库", topInset: 142 },
+	parameters: {
+		viewport: { defaultViewport: "dashboardRepository1171x620" },
+		docs: {
+			description: {
+				story: "矮桌面会压缩非列表信息区，但至少完整显示两张项目卡。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		await expectTwoVisibleRepositoryCards(canvasElement);
+	},
+};
+
+export const LongPersonalRepositories: Story = {
+	args: { count: 18, label: "个人仓库" },
+	play: async ({ canvasElement }) => {
+		await expectTwoVisibleRepositoryCards(canvasElement);
 	},
 };

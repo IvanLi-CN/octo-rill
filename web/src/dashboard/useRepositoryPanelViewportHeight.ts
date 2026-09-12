@@ -2,10 +2,13 @@ import { useLayoutEffect, useRef, useState } from "react";
 
 const FOOTER_GAP_PX = 16;
 const FALLBACK_REPOSITORY_ITEM_HEIGHT_PX = 76;
+const COMPACT_EXIT_HYSTERESIS_PX = 64;
 
 type RepositoryPanelLayout = {
 	availableHeight: number | null;
+	minimumListHeight: number | null;
 	shortList: boolean;
+	compact: boolean;
 };
 
 export function useRepositoryPanelViewportHeight(options: {
@@ -17,12 +20,19 @@ export function useRepositoryPanelViewportHeight(options: {
 	const listRef = useRef<HTMLUListElement>(null);
 	const [layout, setLayout] = useState<RepositoryPanelLayout>({
 		availableHeight: null,
+		minimumListHeight: null,
 		shortList: false,
+		compact: false,
 	});
 
 	useLayoutEffect(() => {
 		if (!options.enabled) {
-			setLayout({ availableHeight: null, shortList: false });
+			setLayout({
+				availableHeight: null,
+				minimumListHeight: null,
+				shortList: false,
+				compact: false,
+			});
 			return;
 		}
 
@@ -62,15 +72,32 @@ export function useRepositoryPanelViewportHeight(options: {
 				Number.parseFloat(listStyle?.paddingTop ?? "0") +
 				Number.parseFloat(listStyle?.paddingBottom ?? "0");
 			const shortList = naturalListHeight < twoItemHeight;
+			const panelChromeHeight = Math.max(
+				0,
+				panel.getBoundingClientRect().height -
+					(list?.getBoundingClientRect().height ?? 0),
+			);
 
 			setLayout((current) => {
+				const compactThreshold =
+					panelChromeHeight +
+					twoItemHeight +
+					(current.compact ? COMPACT_EXIT_HYSTERESIS_PX : 0);
+				const compact = availableHeight < compactThreshold;
 				if (
 					current.availableHeight === availableHeight &&
-					current.shortList === shortList
+					current.minimumListHeight === twoItemHeight &&
+					current.shortList === shortList &&
+					current.compact === compact
 				) {
 					return current;
 				}
-				return { availableHeight, shortList };
+				return {
+					availableHeight,
+					minimumListHeight: twoItemHeight,
+					shortList,
+					compact,
+				};
 			});
 		};
 
@@ -120,22 +147,27 @@ export function useRepositoryPanelViewportHeight(options: {
 	const panelStyle =
 		layout.availableHeight !== null
 			? {
+					height: `${layout.availableHeight}px`,
 					maxHeight: `${layout.availableHeight}px`,
-					...(layout.shortList
-						? { height: `${layout.availableHeight}px` }
-						: {}),
 				}
+			: undefined;
+	const listStyle =
+		layout.minimumListHeight !== null
+			? { minHeight: `${layout.minimumListHeight}px` }
 			: undefined;
 
 	return {
 		panelRef,
 		listRef,
 		panelStyle,
+		listStyle,
 		shortList: layout.shortList,
+		compact: layout.compact,
 	};
 }
 
 export const repositoryPanelViewportConstants = {
 	footerGapPx: FOOTER_GAP_PX,
 	fallbackItemHeightPx: FALLBACK_REPOSITORY_ITEM_HEIGHT_PX,
+	compactExitHysteresisPx: COMPACT_EXIT_HYSTERESIS_PX,
 } as const;

@@ -28,9 +28,9 @@
 
 ### REQ-DASHBOARD-REPOSITORY-SIDEBAR-003
 
-- The system MUST fill the available panel height when the rendered repository list is shorter than two project cards.
-- Inputs: actual first project-card height when present, otherwise a `76px` per-card fallback.
-- Outputs: empty, loading, and one-item states keep a stable near-viewport panel instead of collapsing.
+- The system MUST reserve a repository-list viewport at least as tall as two project cards for every desktop repository-list state, including long lists.
+- Inputs: actual first project-card height when present, otherwise a `76px` per-card fallback; panel chrome height and the available sidebar height.
+- Outputs: empty, loading, and one-item states keep a stable near-viewport panel; long lists expose at least two complete cards and scroll only inside the list. When panel chrome would consume that minimum, the panel enters its compact density without crossing the footer boundary.
 
 ### REQ-DASHBOARD-REPOSITORY-SIDEBAR-004
 
@@ -42,7 +42,7 @@
 
 ### VER-DASHBOARD-REPOSITORY-SIDEBAR-001
 
-- Method: Dashboard Playwright coverage at `1440x900`, `1024x768`, and below `1024px`.
+- Method: Dashboard Playwright coverage at `1440x900`, `1024x768`, `1171x620`, and below `1024px`.
 - covers: `REQ-DASHBOARD-REPOSITORY-SIDEBAR-001`, `REQ-DASHBOARD-REPOSITORY-SIDEBAR-004`
 - Pass condition: root desktop, Focus following, and Focus mine render the intended panels; narrow layouts do not render the desktop sidebar or issue the root-only following request.
 
@@ -50,7 +50,7 @@
 
 - Method: Storybook repository-sidebar states plus DOM geometry assertions.
 - covers: `REQ-DASHBOARD-REPOSITORY-SIDEBAR-002`, `REQ-DASHBOARD-REPOSITORY-SIDEBAR-003`
-- Pass condition: short panels end `16px` above the footer, long panels cap at that boundary, and overflow belongs to the list container.
+- Pass condition: every desktop panel ends `16px` above the footer, its list viewport is at least two rendered project-card heights (or `152px` when empty), and long-list overflow belongs to the list container. The compact `1171x620` state covers following, associated, and personal repository lists.
 
 ## Related ADRs
 
@@ -59,14 +59,16 @@ None
 ## Visual Evidence
 
 - Source: `ui_demo` for Dashboard page states and `storybook_docs` for the reusable repository panel.
-- Requested viewports: `1440x900` and `1024x768` CSS px.
-- Geometry receipts: root short list `16px` footer gap at both desktop viewports; Storybook short list `16px` gap; Storybook long list has internal overflow (`scrollHeight > clientHeight`) and a `16px` footer gap; personal repository list grows naturally below the cap.
+- Requested viewports: `1440x900`, `1024x768`, and `1171x620` CSS px.
+- Geometry receipts: every desktop list has a `16px` footer gap; empty-list fallback is `152px`; long following, associated, and personal lists have internal overflow (`scrollHeight > clientHeight`) while retaining at least two visible project-card heights.
 - Assets:
   - `./assets/root-following-1440x900.png`
   - `./assets/root-following-1024x768.png`
+  - `./assets/root-following-1171x620.png`
   - `./assets/personal-repositories-1440x900.png`
   - `./assets/short-following-1440x900.png`
   - `./assets/long-following-1440x900.png`
+  - `./assets/story-compact-long-following-1171x620.png`
   - `./assets/story-personal-1440x900.png`
 
 ## References

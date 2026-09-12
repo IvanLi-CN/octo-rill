@@ -676,7 +676,9 @@ function ScopedSummaryCard(props: {
 		panelRef: repositoryPanelRef,
 		listRef: repositoryListRef,
 		panelStyle: repositoryPanelStyle,
+		listStyle: repositoryListStyle,
 		shortList: repositoryPanelShortList,
+		compact: repositoryPanelCompact,
 	} = useRepositoryPanelViewportHeight({
 		enabled: repositoryPanelEnabled,
 		itemCount: repositoryPanelItemCount,
@@ -968,7 +970,11 @@ function ScopedSummaryCard(props: {
 			ref={repositoryPanelRef}
 			className={[
 				"rounded-[28px] border border-border/70 bg-card/82 shadow-sm backdrop-blur",
-				desktop ? "min-h-0 p-5" : "mb-4 p-4 sm:p-5",
+				desktop
+					? repositoryPanelCompact
+						? "min-h-0 p-3"
+						: "min-h-0 p-5"
+					: "mb-4 p-4 sm:p-5",
 				repositoryPanelEnabled ? "flex flex-col" : null,
 			].join(" ")}
 			style={repositoryPanelStyle}
@@ -984,30 +990,53 @@ function ScopedSummaryCard(props: {
 						: "natural-capped"
 					: "natural"
 			}
+			data-dashboard-repository-panel-density={
+				repositoryPanelCompact ? "compact" : "comfortable"
+			}
 		>
 			<div className="flex items-start justify-between gap-3">
 				<div className="min-w-0">
 					<p className="font-mono text-[11px] uppercase tracking-[0.22em] text-muted-foreground">
 						{summary.kicker}
 					</p>
-					<h2 className="mt-1 text-xl font-semibold tracking-tight text-foreground">
+					<h2
+						className={
+							repositoryPanelCompact
+								? "text-lg font-semibold tracking-tight text-foreground"
+								: "mt-1 text-xl font-semibold tracking-tight text-foreground"
+						}
+					>
 						{summary.title}
 					</h2>
 				</div>
-				<div className="inline-flex shrink-0 items-center gap-2 rounded-full border border-border/70 bg-muted/35 px-3 py-1 font-mono text-[11px] text-muted-foreground">
+				<div
+					className={[
+						"inline-flex shrink-0 items-center gap-2 rounded-full border border-border/70 bg-muted/35 font-mono text-[11px] text-muted-foreground",
+						repositoryPanelCompact ? "px-2 py-0.5" : "px-3 py-1",
+					].join(" ")}
+				>
 					<span>{summary.chip}</span>
 					<span aria-hidden="true">·</span>
 					<span>{summary.secondary}</span>
 				</div>
 			</div>
 
-			<p className="mt-3 text-sm leading-6 text-muted-foreground">
+			<p
+				className={
+					repositoryPanelCompact
+						? "mt-1 line-clamp-1 text-xs leading-4 text-muted-foreground"
+						: "mt-3 text-sm leading-6 text-muted-foreground"
+				}
+			>
 				{summary.description}
 			</p>
 
 			{scope.kind === "following" ? (
 				<div
-					className="mt-4 grid gap-2 sm:grid-cols-2"
+					className={[
+						"grid gap-2 sm:grid-cols-2",
+						repositoryPanelCompact ? "mt-2" : "mt-4",
+					].join(" ")}
 					data-dashboard-following-stat-grid="true"
 				>
 					<button
@@ -1016,7 +1045,8 @@ function ScopedSummaryCard(props: {
 						data-dashboard-following-stat="following"
 						onClick={() => handleFollowingListViewChange("following")}
 						className={[
-							"rounded-xl px-4 py-3 text-left transition-colors",
+							"rounded-xl text-left transition-colors",
+							repositoryPanelCompact ? "px-3 py-1.5" : "px-4 py-3",
 							followingListView === "following"
 								? "bg-muted/38 text-foreground"
 								: "bg-transparent text-muted-foreground hover:bg-muted/20 hover:text-foreground",
@@ -1025,7 +1055,13 @@ function ScopedSummaryCard(props: {
 						<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
 							关注仓库
 						</p>
-						<p className="mt-1 text-lg font-semibold text-foreground">
+						<p
+							className={
+								repositoryPanelCompact
+									? "text-base font-semibold text-foreground"
+									: "mt-1 text-lg font-semibold text-foreground"
+							}
+						>
 							{followingRepoCount}
 						</p>
 					</button>
@@ -1035,7 +1071,8 @@ function ScopedSummaryCard(props: {
 						data-dashboard-following-stat="associated"
 						onClick={() => handleFollowingListViewChange("associated")}
 						className={[
-							"rounded-xl px-4 py-3 text-left transition-colors",
+							"rounded-xl text-left transition-colors",
+							repositoryPanelCompact ? "px-3 py-1.5" : "px-4 py-3",
 							followingListView === "associated"
 								? "bg-muted/38 text-foreground"
 								: "bg-transparent text-muted-foreground hover:bg-muted/20 hover:text-foreground",
@@ -1044,7 +1081,13 @@ function ScopedSummaryCard(props: {
 						<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
 							关联仓库
 						</p>
-						<p className="mt-1 text-lg font-semibold text-foreground">
+						<p
+							className={
+								repositoryPanelCompact
+									? "text-base font-semibold text-foreground"
+									: "mt-1 text-lg font-semibold text-foreground"
+							}
+						>
 							{associatedRepoCount}
 						</p>
 					</button>
@@ -1148,8 +1191,18 @@ function ScopedSummaryCard(props: {
 			) : null}
 
 			{personalRepoItems.length > 0 ? (
-				<div className="mt-4 flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border/65 bg-background/72">
-					<div className="flex items-center justify-between border-b border-border/60 px-3 py-2">
+				<div
+					className={[
+						"flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border/65 bg-background/72",
+						repositoryPanelCompact ? "mt-2" : "mt-4",
+					].join(" ")}
+				>
+					<div
+						className={[
+							"flex items-center justify-between border-b border-border/60 px-3",
+							repositoryPanelCompact ? "py-1.5" : "py-2",
+						].join(" ")}
+					>
 						<p className="text-sm font-medium text-foreground">仓库列表</p>
 						<p className="font-mono text-[11px] text-muted-foreground">
 							{personalRepos?.total_count ?? personalRepoItems.length} 个
@@ -1157,7 +1210,11 @@ function ScopedSummaryCard(props: {
 					</div>
 					<ul
 						ref={repositoryListRef}
-						className="min-h-0 flex-1 scroll-pb-3 overflow-y-auto pb-3"
+						className={[
+							"min-h-0 flex-1 scroll-pb-3 overflow-y-auto",
+							repositoryPanelCompact ? "pb-2" : "pb-3",
+						].join(" ")}
+						style={repositoryListStyle}
 						data-dashboard-personal-repo-list="true"
 						data-dashboard-repository-list="true"
 					>
@@ -1200,7 +1257,12 @@ function ScopedSummaryCard(props: {
 					</ul>
 				</div>
 			) : scope.kind === "following" ? (
-				<div className="mt-4 flex min-h-0 flex-1 flex-col border-t border-border/60 pt-4">
+				<div
+					className={[
+						"flex min-h-0 flex-1 flex-col overflow-hidden border-t border-border/60",
+						repositoryPanelCompact ? "mt-2 pt-2" : "mt-4 pt-4",
+					].join(" ")}
+				>
 					<div className="flex items-center justify-between gap-3">
 						<p className="text-sm font-medium text-foreground">
 							{followingListView === "following" ? "关注仓库" : "关联仓库"}
@@ -1211,7 +1273,11 @@ function ScopedSummaryCard(props: {
 					</div>
 					<ul
 						ref={repositoryListRef}
-						className="mt-3 min-h-0 flex-1 divide-y divide-border/50 overflow-y-auto"
+						className={[
+							"min-h-0 flex-1 divide-y divide-border/50 overflow-y-auto",
+							repositoryPanelCompact ? "mt-2" : "mt-3",
+						].join(" ")}
+						style={repositoryListStyle}
 						data-dashboard-following-repo-list={followingListView}
 						data-dashboard-repository-list="true"
 					>

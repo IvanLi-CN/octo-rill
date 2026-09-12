@@ -1,4 +1,10 @@
-import { expect, test, type Page, type Route } from "@playwright/test";
+import {
+	expect,
+	test,
+	type Locator,
+	type Page,
+	type Route,
+} from "@playwright/test";
 
 import { buildMockMeResponse } from "./mockApi";
 
@@ -8,6 +14,40 @@ function json(route: Route, payload: unknown, status = 200) {
 		contentType: "application/json",
 		body: JSON.stringify(payload),
 	});
+}
+
+async function expectRepositoryListGeometry(panel: Locator) {
+	const geometry = await panel.evaluate((element) => {
+		const footer = document.querySelector<HTMLElement>(
+			'[data-app-meta-footer="true"]',
+		);
+		const list = element.querySelector<HTMLElement>(
+			'[data-dashboard-repository-list="true"]',
+		);
+		const firstItem = list?.querySelector<HTMLElement>(
+			"[data-dashboard-repository-item]",
+		);
+		if (!footer || !list || !firstItem) {
+			throw new Error(
+				"Expected a footer, repository list, and repository item",
+			);
+		}
+		return {
+			footerGap:
+				footer.getBoundingClientRect().top -
+				element.getBoundingClientRect().bottom,
+			itemHeight: firstItem.getBoundingClientRect().height,
+			listClientHeight: list.clientHeight,
+			listScrollHeight: list.scrollHeight,
+		};
+	});
+
+	expect(geometry.footerGap).toBeGreaterThanOrEqual(14);
+	expect(geometry.footerGap).toBeLessThanOrEqual(18);
+	expect(geometry.listClientHeight).toBeGreaterThanOrEqual(
+		geometry.itemHeight * 2 - 2,
+	);
+	expect(geometry.listScrollHeight).toBeGreaterThan(geometry.listClientHeight);
 }
 
 function buildScopedRelease(
@@ -72,90 +112,97 @@ async function installScopedFocusMocks(
 	options?: {
 		includeOwnReleases?: boolean;
 		holdBriefGeneration?: boolean;
+		personalRepositoryCount?: number;
+		repositoryListCount?: number;
 	},
 ) {
 	const includeOwnReleases = options?.includeOwnReleases ?? false;
 	const holdBriefGeneration = options?.holdBriefGeneration ?? false;
+	const personalRepositoryCount = options?.personalRepositoryCount ?? 3;
+	const repositoryListCount = options?.repositoryListCount ?? 1;
 	const viewerLogin = "story-viewer";
-	const personalRepos = ["octo-rill", "dockrev", "no-release-repo"].map(
-		(name, index) => ({
-			repo_id: 9_000 + index,
-			full_name: `${viewerLogin}/${name}`,
-			owner_login: viewerLogin,
-			name,
-			html_url: `https://github.com/${viewerLogin}/${name}`,
-			updated_at: "2026-04-30T08:00:00Z",
-			release_count: name === "no-release-repo" ? 0 : 1,
-			repo_visual: null,
-		}),
-	);
+	const personalRepoNames = [
+		"octo-rill",
+		"dockrev",
+		"no-release-repo",
+		...Array.from(
+			{ length: Math.max(0, personalRepositoryCount - 3) },
+			(_, index) => `fixture-repository-${index + 1}`,
+		),
+	].slice(0, personalRepositoryCount);
+	const personalRepos = personalRepoNames.map((name, index) => ({
+		repo_id: 9_000 + index,
+		full_name: `${viewerLogin}/${name}`,
+		owner_login: viewerLogin,
+		name,
+		html_url: `https://github.com/${viewerLogin}/${name}`,
+		updated_at: "2026-04-30T08:00:00Z",
+		release_count: name === "no-release-repo" ? 0 : 1,
+		repo_visual: null,
+	}));
+	const releaseLabRepo = {
+		repo_id: 9_101,
+		full_name: "octo-demo/release-lab",
+		owner_login: "octo-demo",
+		name: "release-lab",
+		html_url: "https://github.com/octo-demo/release-lab",
+		description: "Followed repository",
+		is_private: false,
+		first_source: "github_star",
+		first_associated_at: "2026-04-01T08:00:00Z",
+		last_seen_at: "2026-04-30T08:00:00Z",
+		is_following: true,
+		follow_state_source: "github_star",
+		repo_visual: null,
+		sources: {
+			personal_owned: false,
+			github_star: true,
+			manual_feed: false,
+		},
+	};
+	const docsHubRepo = {
+		repo_id: 9_102,
+		full_name: "octo-demo/docs-hub",
+		owner_login: "octo-demo",
+		name: "docs-hub",
+		html_url: "https://github.com/octo-demo/docs-hub",
+		description: "Associated repository",
+		is_private: false,
+		first_source: "manual_feed",
+		first_associated_at: "2026-04-02T08:00:00Z",
+		last_seen_at: "2026-04-30T08:00:00Z",
+		is_following: false,
+		follow_state_source: "manual_feed",
+		repo_visual: null,
+		sources: {
+			personal_owned: false,
+			github_star: false,
+			manual_feed: true,
+		},
+	};
+	const followingItems = [
+		releaseLabRepo,
+		...Array.from(
+			{ length: Math.max(0, repositoryListCount - 1) },
+			(_, index) => {
+				const name = `fixture-following-${index + 1}`;
+				return {
+					...releaseLabRepo,
+					repo_id: 9_200 + index,
+					full_name: `octo-demo/${name}`,
+					name,
+					html_url: `https://github.com/octo-demo/${name}`,
+					description: "Long followed repository fixture",
+					first_associated_at: `2026-04-${String(index + 2).padStart(2, "0")}T08:00:00Z`,
+				};
+			},
+		),
+	];
 	const followingRepos = {
-		following_count: 1,
-		associated_count: 2,
-		items: [
-			{
-				repo_id: 9_101,
-				full_name: "octo-demo/release-lab",
-				owner_login: "octo-demo",
-				name: "release-lab",
-				html_url: "https://github.com/octo-demo/release-lab",
-				description: "Followed repository",
-				is_private: false,
-				first_source: "github_star",
-				first_associated_at: "2026-04-01T08:00:00Z",
-				last_seen_at: "2026-04-30T08:00:00Z",
-				is_following: true,
-				follow_state_source: "github_star",
-				repo_visual: null,
-				sources: {
-					personal_owned: false,
-					github_star: true,
-					manual_feed: false,
-				},
-			},
-		],
-		associated_items: [
-			{
-				repo_id: 9_101,
-				full_name: "octo-demo/release-lab",
-				owner_login: "octo-demo",
-				name: "release-lab",
-				html_url: "https://github.com/octo-demo/release-lab",
-				description: "Followed repository",
-				is_private: false,
-				first_source: "github_star",
-				first_associated_at: "2026-04-01T08:00:00Z",
-				last_seen_at: "2026-04-30T08:00:00Z",
-				is_following: true,
-				follow_state_source: "github_star",
-				repo_visual: null,
-				sources: {
-					personal_owned: false,
-					github_star: true,
-					manual_feed: false,
-				},
-			},
-			{
-				repo_id: 9_102,
-				full_name: "octo-demo/docs-hub",
-				owner_login: "octo-demo",
-				name: "docs-hub",
-				html_url: "https://github.com/octo-demo/docs-hub",
-				description: "Associated repository",
-				is_private: false,
-				first_source: "manual_feed",
-				first_associated_at: "2026-04-02T08:00:00Z",
-				last_seen_at: "2026-04-30T08:00:00Z",
-				is_following: false,
-				follow_state_source: "manual_feed",
-				repo_visual: null,
-				sources: {
-					personal_owned: false,
-					github_star: false,
-					manual_feed: true,
-				},
-			},
-		],
+		following_count: followingItems.length,
+		associated_count: followingItems.length + 1,
+		items: followingItems,
+		associated_items: [...followingItems, docsHubRepo],
 	};
 
 	await page.route("**/api/**", async (route) => {
@@ -529,6 +576,46 @@ test("root all at 1024px keeps the following sidebar above the footer", async ({
 			}),
 		)
 		.toBe(16);
+});
+
+test("long repository lists retain two visible cards on compact desktops", async ({
+	page,
+}) => {
+	await installScopedFocusMocks(page, {
+		personalRepositoryCount: 18,
+		repositoryListCount: 18,
+	});
+	await page.setViewportSize({ width: 1171, height: 620 });
+
+	await page.goto("/");
+	const rootFollowingPanel = page.locator(
+		'[data-dashboard-repository-panel="true"][data-dashboard-scope-summary="following"]',
+	);
+	await expect(rootFollowingPanel).toBeVisible();
+	await expect(rootFollowingPanel).toHaveAttribute(
+		"data-dashboard-repository-panel-density",
+		"compact",
+	);
+	await expectRepositoryListGeometry(rootFollowingPanel);
+
+	await page.goto("/focus/following");
+	const followingPanel = page.locator(
+		'[data-dashboard-scope-summary="following"][data-dashboard-scope-summary-layout="desktop"]',
+	);
+	await expect(followingPanel).toBeVisible();
+	await expectRepositoryListGeometry(followingPanel);
+	await followingPanel.getByRole("button", { name: "关联仓库 19" }).click();
+	await expect(
+		followingPanel.locator('[data-dashboard-following-repo-list="associated"]'),
+	).toBeVisible();
+	await expectRepositoryListGeometry(followingPanel);
+
+	await page.goto("/focus/mine");
+	const personalPanel = page.locator(
+		'[data-dashboard-scope-summary="mine"][data-dashboard-scope-summary-layout="desktop"]',
+	);
+	await expect(personalPanel).toBeVisible();
+	await expectRepositoryListGeometry(personalPanel);
 });
 
 test("following focus keeps the associated repository switch in the bounded sidebar", async ({

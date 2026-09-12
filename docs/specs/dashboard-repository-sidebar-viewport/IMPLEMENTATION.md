@@ -15,7 +15,7 @@
 ## Coverage / rollout summary
 
 - Desktop root following sidebar is rendered at the existing `lg` breakpoint.
-- Short repository lists fill the measured space above the fixed footer; longer lists scroll inside the repository list.
+- Every desktop repository list reserves two rendered project-card heights above the fixed footer. When a compact viewport cannot fit that list alongside normal panel chrome, the non-list panel content compacts and longer lists scroll inside the repository list.
 
 ## Remaining Gaps
 
