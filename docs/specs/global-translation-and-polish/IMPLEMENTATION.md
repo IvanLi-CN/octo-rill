@@ -15,7 +15,7 @@
 
 ## Database Migration Plan
 
-当前实现使用迁移 `0078_content_processing_global_model.sql`，只创建下列新表、索引和控制记录：
+当前实现使用迁移 `0078_content_processing_global_model.sql` 和追加迁移 `0079_admin_collection_read_budget_indexes.sql`，只创建下列新表、索引和控制记录：
 
 - `content_processing_control`：单行模式栅栏，取值为 `legacy`、`rollback_freeze` 或 `global`；记录切换代号和更新时间。它是旧新写入者共同读取的唯一切换事实。
 - `content_work_items`：包含全局身份、不可变来源快照、冻结配置指纹、优先级、调度状态、租约关联、恢复元数据和取消／替代关系。唯一索引覆盖 `REQ-GTP-IDENTITY` 的全部字段。
@@ -25,8 +25,18 @@
 - `content_attempt_events` 和 `content_attempt_llm_calls`：追加式的全局尝试和精确模型调用归因，仅保存安全元数据。
 - `content_legacy_observations`：引用旧表的原始主键和只读分类，保存 `legacy_cached` 或 `legacy_conflict` 的判定依据；不复制旧内容、不反向修改旧表。
 - `idx_notifications_thread_id`：为按全局通知线程读取 canonical source 提供 `thread_id` 前导索引；授权仍使用用户行单独校验。
+- `idx_notifications_admin_canonical_source`：按通知线程、更新时间和稳定行 ID 支持管理读取的规范来源选择。
+- `idx_translation_work_items_admin_entity_kind_attempt`：按实体、处理种类和尝试次数支持管理候选集筛选。
 
 迁移不执行 `DROP TABLE`、表改名、数据重建、旧行 `UPDATE`、旧行 `DELETE` 或把旧数据插入全局工作／结果／尝试表。`translation_work_items`、`translation_requests`、旧尝试事件和 `ai_translations` 继续存在；应用仅把它们当作旧事实读取。
+
+## Admin Collection Read Budget
+
+Release、公告、通知和日报的管理列表都先在 SQLite 中构造规范来源、旧事实／全局处理状态和筛选候选集，再精确计算总数并只读取当前页 ID。通知按 `updated_at DESC, id DESC` 选取每个 `thread_id` 的唯一来源；不存在可靠的首次发现时间时仍返回 `NULL`。
+
+列表请求把缺省或单边时间条件归一化为不超过 31 天的 UTC 窗口，完整读取（模式读取、候选查询、总数、当前页装载和摘要投影）共享一个容量为一的进程内闸门和五秒预算。闸门繁忙或读取超时分别返回 `admin_collection_records_busy`／`admin_collection_records_timeout`、HTTP 503 和 `Retry-After: 1`；超时会先取消并等待 SQL 任务清理，再释放许可。
+
+管理端客户端在切换种类、筛选或页码时取消失效请求，不自动重试；上述 503 显示既有页面内的人工刷新提示。线上形状副本验证了两项索引被选用，四类 31 天读取的三十次预热后测量均满足 p95 1 秒、p99 2 秒和单次 5 秒预算。
 
 ## Rollback and Data Safety
 

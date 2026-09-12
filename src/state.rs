@@ -6,6 +6,7 @@ use oauth2::{
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::{net::IpAddr, sync::Arc, time::Duration};
+use tokio::sync::Semaphore;
 use url::Url;
 use uuid::Uuid;
 use webauthn_rs::{
@@ -51,6 +52,7 @@ pub struct AppState {
     pub encryption_key: EncryptionKey,
     pub llm_scheduler: Arc<LlmScheduler>,
     pub translation_scheduler: Arc<TranslationSchedulerController>,
+    pub admin_collection_read_gate: Arc<Semaphore>,
     pub runtime_owner_id: String,
 }
 

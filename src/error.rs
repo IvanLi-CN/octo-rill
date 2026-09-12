@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde_json::Value;
@@ -13,6 +13,7 @@ pub struct ApiError {
     message: String,
     failure_class: Option<&'static str>,
     details: Option<Value>,
+    retry_after_seconds: Option<u64>,
 }
 
 impl ApiError {
@@ -23,11 +24,17 @@ impl ApiError {
             message: message.into(),
             failure_class: None,
             details: None,
+            retry_after_seconds: None,
         }
     }
 
     pub fn with_details(mut self, details: Value) -> Self {
         self.details = Some(details);
+        self
+    }
+
+    pub fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after_seconds = Some(seconds);
         self
     }
 
@@ -39,6 +46,7 @@ impl ApiError {
                 message: class.safe_message().to_owned(),
                 failure_class: Some(class.as_str()),
                 details: None,
+                retry_after_seconds: None,
             };
         }
         Self::internal(err)
@@ -95,6 +103,12 @@ impl IntoResponse for ApiError {
                 body_object.insert(key, value);
             }
         }
-        (self.status, Json(body)).into_response()
+        let mut response = (self.status, Json(body)).into_response();
+        if let Some(seconds) = self.retry_after_seconds
+            && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response
     }
 }
