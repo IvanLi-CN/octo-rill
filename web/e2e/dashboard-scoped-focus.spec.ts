@@ -89,6 +89,74 @@ async function installScopedFocusMocks(
 			repo_visual: null,
 		}),
 	);
+	const followingRepos = {
+		following_count: 1,
+		associated_count: 2,
+		items: [
+			{
+				repo_id: 9_101,
+				full_name: "octo-demo/release-lab",
+				owner_login: "octo-demo",
+				name: "release-lab",
+				html_url: "https://github.com/octo-demo/release-lab",
+				description: "Followed repository",
+				is_private: false,
+				first_source: "github_star",
+				first_associated_at: "2026-04-01T08:00:00Z",
+				last_seen_at: "2026-04-30T08:00:00Z",
+				is_following: true,
+				follow_state_source: "github_star",
+				repo_visual: null,
+				sources: {
+					personal_owned: false,
+					github_star: true,
+					manual_feed: false,
+				},
+			},
+		],
+		associated_items: [
+			{
+				repo_id: 9_101,
+				full_name: "octo-demo/release-lab",
+				owner_login: "octo-demo",
+				name: "release-lab",
+				html_url: "https://github.com/octo-demo/release-lab",
+				description: "Followed repository",
+				is_private: false,
+				first_source: "github_star",
+				first_associated_at: "2026-04-01T08:00:00Z",
+				last_seen_at: "2026-04-30T08:00:00Z",
+				is_following: true,
+				follow_state_source: "github_star",
+				repo_visual: null,
+				sources: {
+					personal_owned: false,
+					github_star: true,
+					manual_feed: false,
+				},
+			},
+			{
+				repo_id: 9_102,
+				full_name: "octo-demo/docs-hub",
+				owner_login: "octo-demo",
+				name: "docs-hub",
+				html_url: "https://github.com/octo-demo/docs-hub",
+				description: "Associated repository",
+				is_private: false,
+				first_source: "manual_feed",
+				first_associated_at: "2026-04-02T08:00:00Z",
+				last_seen_at: "2026-04-30T08:00:00Z",
+				is_following: false,
+				follow_state_source: "manual_feed",
+				repo_visual: null,
+				sources: {
+					personal_owned: false,
+					github_star: false,
+					manual_feed: true,
+				},
+			},
+		],
+	};
 
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
@@ -119,6 +187,10 @@ async function installScopedFocusMocks(
 				total_count: personalRepos.length,
 				repos: personalRepos,
 			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/repos/following") {
+			return json(route, followingRepos);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {
@@ -164,6 +236,19 @@ async function installScopedFocusMocks(
 								),
 							]
 						: [],
+					next_cursor: null,
+				});
+			}
+
+			if (scope === "following") {
+				return json(route, {
+					items: [
+						buildScopedRelease(
+							"following-release-1",
+							"octo-demo/release-lab",
+							"v1.0.0",
+						),
+					],
 					next_cursor: null,
 				});
 			}
@@ -361,6 +446,182 @@ async function installScopedFocusMocks(
 		);
 	});
 }
+
+test("root all desktop renders the following repository sidebar within the footer boundary", async ({
+	page,
+}) => {
+	await installScopedFocusMocks(page);
+	await page.setViewportSize({ width: 1440, height: 900 });
+	await page.goto("/");
+
+	const panel = page.locator(
+		'[data-dashboard-repository-panel="true"][data-dashboard-scope-summary="following"]',
+	);
+	await expect(panel).toBeVisible();
+	await expect(panel).toHaveAttribute(
+		"data-dashboard-repository-panel-state",
+		"viewport-fill",
+	);
+	await expect(panel.getByText("octo-demo/release-lab")).toBeVisible();
+	await expect
+		.poll(
+			() =>
+				panel.evaluate((element) => {
+					const footer = document.querySelector<HTMLElement>(
+						'[data-app-meta-footer="true"]',
+					);
+					if (!footer) return -1;
+					return (
+						footer.getBoundingClientRect().top -
+						element.getBoundingClientRect().bottom
+					);
+				}),
+			{ timeout: 5_000 },
+		)
+		.toBe(16);
+
+	const geometry = await panel.evaluate((element) => {
+		const footer = document.querySelector<HTMLElement>(
+			'[data-app-meta-footer="true"]',
+		);
+		if (!footer) throw new Error("Expected fixed AppMetaFooter");
+		const panelRect = element.getBoundingClientRect();
+		const footerRect = footer.getBoundingClientRect();
+		return {
+			gap: footerRect.top - panelRect.bottom,
+			panelTop: panelRect.top,
+			panelBottom: panelRect.bottom,
+			panelHeight: panelRect.height,
+			styleHeight: getComputedStyle(element).height,
+			styleMaxHeight: getComputedStyle(element).maxHeight,
+		};
+	});
+	expect(geometry.gap).toBeGreaterThanOrEqual(14);
+	expect(geometry.gap).toBeLessThanOrEqual(18);
+});
+
+test("root all at 1024px keeps the following sidebar above the footer", async ({
+	page,
+}) => {
+	await installScopedFocusMocks(page);
+	await page.setViewportSize({ width: 1024, height: 768 });
+	await page.goto("/");
+
+	const panel = page.locator(
+		'[data-dashboard-repository-panel="true"][data-dashboard-scope-summary="following"]',
+	);
+	await expect(panel).toBeVisible();
+	await expect(panel).toHaveAttribute(
+		"data-dashboard-repository-panel-state",
+		"viewport-fill",
+	);
+	await expect
+		.poll(() =>
+			panel.evaluate((element) => {
+				const footer = document.querySelector<HTMLElement>(
+					'[data-app-meta-footer="true"]',
+				);
+				if (!footer) return -1;
+				return (
+					footer.getBoundingClientRect().top -
+					element.getBoundingClientRect().bottom
+				);
+			}),
+		)
+		.toBe(16);
+});
+
+test("following focus keeps the associated repository switch in the bounded sidebar", async ({
+	page,
+}) => {
+	await installScopedFocusMocks(page);
+	await page.setViewportSize({ width: 1024, height: 768 });
+	await page.goto("/focus/following");
+
+	const panel = page.locator(
+		'[data-dashboard-scope-summary="following"][data-dashboard-scope-summary-layout="desktop"]',
+	);
+	await expect(panel).toBeVisible();
+	await expect(
+		panel.locator('[data-dashboard-following-repo-list="following"]'),
+	).toBeVisible();
+	await panel.getByRole("button", { name: "关联仓库 2" }).click();
+	await expect(
+		panel.locator('[data-dashboard-following-repo-list="associated"]'),
+	).toBeVisible();
+	await expect(panel.getByText("octo-demo/docs-hub")).toBeVisible();
+});
+
+test("personal repositories keep release labels, navigation, and the footer gap", async ({
+	page,
+}) => {
+	await installScopedFocusMocks(page);
+	await page.setViewportSize({ width: 1024, height: 768 });
+	await page.goto("/focus/mine");
+
+	const panel = page.locator(
+		'[data-dashboard-scope-summary="mine"][data-dashboard-scope-summary-layout="desktop"]',
+	);
+	await expect(panel).toBeVisible();
+	await expect(panel).toHaveAttribute(
+		"data-dashboard-repository-panel-state",
+		"natural-capped",
+	);
+	await expect(panel.getByText("1 个发布").first()).toBeVisible();
+	await expect(panel.getByText("暂无发布")).toBeVisible();
+	await expect(
+		panel.getByRole("link", { name: /story-viewer\/octo-rill/ }),
+	).toHaveAttribute("href", "/focus/repo/story-viewer/octo-rill");
+	const gap = await panel.evaluate((element) => {
+		const footer = document.querySelector<HTMLElement>(
+			'[data-app-meta-footer="true"]',
+		);
+		if (!footer) throw new Error("Expected fixed AppMetaFooter");
+		return (
+			footer.getBoundingClientRect().top -
+			element.getBoundingClientRect().bottom
+		);
+	});
+	expect(gap).toBeGreaterThanOrEqual(14);
+});
+
+test("narrow root dashboard does not request or render the following sidebar", async ({
+	page,
+}) => {
+	await installScopedFocusMocks(page);
+	let followingRequestCount = 0;
+	page.on("request", (request) => {
+		if (new URL(request.url()).pathname === "/api/repos/following") {
+			followingRequestCount += 1;
+		}
+	});
+	await page.setViewportSize({ width: 1023, height: 768 });
+	await page.goto("/");
+
+	await expect(
+		page.locator('[data-dashboard-repository-panel="true"]'),
+	).toHaveCount(0);
+	expect(followingRequestCount).toBe(0);
+});
+
+test("other root tabs do not request or render the following sidebar", async ({
+	page,
+}) => {
+	await installScopedFocusMocks(page);
+	let followingRequestCount = 0;
+	page.on("request", (request) => {
+		if (new URL(request.url()).pathname === "/api/repos/following") {
+			followingRequestCount += 1;
+		}
+	});
+	await page.setViewportSize({ width: 1440, height: 900 });
+	await page.goto("/releases");
+
+	await expect(
+		page.locator('[data-dashboard-repository-panel="true"]'),
+	).toHaveCount(0);
+	expect(followingRequestCount).toBe(0);
+});
 
 test("repo identity on release card opens scoped focus route and keeps releases sub-tab when source tab is releases", async ({
 	page,
