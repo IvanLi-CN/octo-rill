@@ -21,6 +21,7 @@ import type {
 	AnnouncementDetailResponse,
 	AuthBindContextResponse,
 	FollowingReposResponse,
+	PersonalReposResponse,
 	GitHubConnectionResponse,
 	MeLinuxDoResponse,
 	MeProfileResponse,
@@ -133,6 +134,7 @@ export type DemoModel = {
 	apiKeys: ApiKeySummary[];
 	reactionToken: ReactionTokenStatusResponse;
 	followingRepos: FollowingReposResponse;
+	personalRepos: PersonalReposResponse;
 	feed: FeedResponse;
 	briefs: BriefItem[];
 	notifications: NotificationItem[];
