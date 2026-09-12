@@ -23,6 +23,7 @@ export function AppMetaFooter() {
 				footerHidden ? "pointer-events-none translate-y-full" : "translate-y-0"
 			}`}
 			data-app-meta-footer-hidden={footerHidden ? "true" : "false"}
+			data-app-meta-footer="true"
 			style={{
 				left: "var(--app-meta-footer-left, 0px)",
 				right: "var(--app-meta-footer-right, 0px)",

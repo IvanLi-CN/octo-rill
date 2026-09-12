@@ -104,6 +104,7 @@ import {
 	resolveDashboardScopeRepoNames,
 } from "@/dashboard/scopeSummary";
 import { RepoPublicReleaseControls } from "@/dashboard/RepoPublicReleaseControls";
+import { useRepositoryPanelViewportHeight } from "@/dashboard/useRepositoryPanelViewportHeight";
 import {
 	type DashboardLiveUpdateNotice,
 	useDashboardLiveUpdates,
@@ -655,6 +656,32 @@ function ScopedSummaryCard(props: {
 			? (stickyAssociatedItems ?? associatedRepoItems)
 			: (stickyFollowingItems ?? followingRepoItems);
 	const visibleRepoNames = repoNames.slice(0, repoChipLimit);
+	const repositoryPanelEnabled =
+		desktop && (scope.kind === "mine" || scope.kind === "following");
+	const repositoryPanelItemCount =
+		scope.kind === "mine"
+			? personalRepoItems.length
+			: scope.kind === "following"
+				? followingListItems.length
+				: 0;
+	const repositoryPanelItemsKey =
+		scope.kind === "mine"
+			? personalRepoItems.map((repo) => repo.full_name).join("|")
+			: scope.kind === "following"
+				? `${followingListView}:${followingListItems
+						.map((repo) => repo.full_name)
+						.join("|")}`
+				: "";
+	const {
+		panelRef: repositoryPanelRef,
+		listRef: repositoryListRef,
+		panelStyle: repositoryPanelStyle,
+		shortList: repositoryPanelShortList,
+	} = useRepositoryPanelViewportHeight({
+		enabled: repositoryPanelEnabled,
+		itemCount: repositoryPanelItemCount,
+		itemsKey: repositoryPanelItemsKey,
+	});
 	const publicReleaseUrl = resolveRepoPublicReleaseUrl(
 		publicationStatus,
 		scope,
@@ -711,13 +738,21 @@ function ScopedSummaryCard(props: {
 			if (scope.kind !== "following") {
 				return;
 			}
+			const nextItems = updateFollowingRepoSnapshot(
+				followingListItems,
+				fullName,
+				isFollowing,
+			);
 			setFollowingListSnapshots((current) => ({
 				...current,
-				[followingListView]: updateFollowingRepoSnapshot(
-					followingListItems,
-					fullName,
-					isFollowing,
-				),
+				[followingListView]:
+					followingListView === "following" && !isFollowing
+						? nextItems.filter(
+								(repo) =>
+									normalizeFollowingRepoKey(repo.full_name) !==
+									normalizeFollowingRepoKey(fullName),
+							)
+						: nextItems,
 			}));
 		},
 		[followingListItems, followingListView, scope.kind],
@@ -930,12 +965,25 @@ function ScopedSummaryCard(props: {
 
 	return (
 		<div
+			ref={repositoryPanelRef}
 			className={[
 				"rounded-[28px] border border-border/70 bg-card/82 shadow-sm backdrop-blur",
-				desktop ? "p-5" : "mb-4 p-4 sm:p-5",
+				desktop ? "min-h-0 p-5" : "mb-4 p-4 sm:p-5",
+				repositoryPanelEnabled ? "flex flex-col" : null,
 			].join(" ")}
+			style={repositoryPanelStyle}
 			data-dashboard-scope-summary={scope.kind}
 			data-dashboard-scope-summary-layout={desktop ? "desktop" : "mobile"}
+			data-dashboard-repository-panel={
+				repositoryPanelEnabled ? "true" : "false"
+			}
+			data-dashboard-repository-panel-state={
+				repositoryPanelEnabled
+					? repositoryPanelShortList
+						? "viewport-fill"
+						: "natural-capped"
+					: "natural"
+			}
 		>
 			<div className="flex items-start justify-between gap-3">
 				<div className="min-w-0">
@@ -1100,7 +1148,7 @@ function ScopedSummaryCard(props: {
 			) : null}
 
 			{personalRepoItems.length > 0 ? (
-				<div className="mt-4 overflow-hidden rounded-2xl border border-border/65 bg-background/72">
+				<div className="mt-4 flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border/65 bg-background/72">
 					<div className="flex items-center justify-between border-b border-border/60 px-3 py-2">
 						<p className="text-sm font-medium text-foreground">仓库列表</p>
 						<p className="font-mono text-[11px] text-muted-foreground">
@@ -1108,8 +1156,10 @@ function ScopedSummaryCard(props: {
 						</p>
 					</div>
 					<ul
-						className="max-h-80 scroll-pb-3 overflow-y-auto pb-3"
+						ref={repositoryListRef}
+						className="min-h-0 flex-1 scroll-pb-3 overflow-y-auto pb-3"
 						data-dashboard-personal-repo-list="true"
+						data-dashboard-repository-list="true"
 					>
 						{personalRepoItems.map((repo) => {
 							const href = buildDashboardScopeHref({
@@ -1125,6 +1175,7 @@ function ScopedSummaryCard(props: {
 								<li
 									key={repo.full_name}
 									className="border-b border-border/50 last:border-b-0"
+									data-dashboard-repository-item="true"
 								>
 									<InternalLink
 										href={href}
@@ -1149,7 +1200,7 @@ function ScopedSummaryCard(props: {
 					</ul>
 				</div>
 			) : scope.kind === "following" ? (
-				<div className="mt-4 border-t border-border/60 pt-4">
+				<div className="mt-4 flex min-h-0 flex-1 flex-col border-t border-border/60 pt-4">
 					<div className="flex items-center justify-between gap-3">
 						<p className="text-sm font-medium text-foreground">
 							{followingListView === "following" ? "关注仓库" : "关联仓库"}
@@ -1159,8 +1210,10 @@ function ScopedSummaryCard(props: {
 						</p>
 					</div>
 					<ul
-						className="mt-3 max-h-80 divide-y divide-border/50 overflow-y-auto"
+						ref={repositoryListRef}
+						className="mt-3 min-h-0 flex-1 divide-y divide-border/50 overflow-y-auto"
 						data-dashboard-following-repo-list={followingListView}
+						data-dashboard-repository-list="true"
 					>
 						{followingListItems.map((repo) => {
 							const href = buildDashboardScopeHref({
@@ -1169,13 +1222,17 @@ function ScopedSummaryCard(props: {
 								repo: repo.name,
 							});
 							return (
-								<li key={repo.full_name} className="py-3 first:pt-0 last:pb-0">
+								<li
+									key={repo.full_name}
+									className="py-3 first:pt-0 last:pb-0"
+									data-dashboard-repository-item="true"
+								>
 									<div className="flex items-start justify-between gap-3">
 										<div className="min-w-0">
 											<InternalLink
 												href={href}
 												to={href}
-												className="block truncate font-mono text-[12px] font-medium text-foreground"
+												className="block truncate font-mono text-[12px] font-medium text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/45"
 											>
 												{repo.full_name}
 											</InternalLink>
@@ -1703,10 +1760,16 @@ export function Dashboard(props: {
 	]);
 	const feedItemsRef = useRef(activeFeedItems);
 	feedItemsRef.current = activeFeedItems;
+	const hasDesktopRepositorySidebar = useMediaQuery("(min-width: 1024px)");
+	const rootFollowingSidebarEnabled =
+		hasDesktopRepositorySidebar && tab === "all" && scope === null;
 	const followingReposQuery = useQuery<FollowingReposResponse>({
 		queryKey: ["dashboard", "following-repos", me.user.id],
 		queryFn: apiGetFollowingRepos,
-		enabled: scope?.kind === "following" || scope?.kind === "repo",
+		enabled:
+			rootFollowingSidebarEnabled ||
+			scope?.kind === "following" ||
+			scope?.kind === "repo",
 	});
 	const refreshFeed = readableSectionsActive
 		? readableSections.refresh
@@ -4143,9 +4206,11 @@ export function Dashboard(props: {
 	const renderSidebar =
 		!hasActiveAnnouncementDetail &&
 		((tab === "briefs" && hasTabletSidebar) || renderSidebarInbox);
+	const renderRootFollowingSidebar =
+		rootFollowingSidebarEnabled && !hasActiveAnnouncementDetail;
 	const dashboardContentLayoutClassName = scopedMode
 		? "grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px] lg:gap-6"
-		: renderSidebar
+		: renderRootFollowingSidebar || renderSidebar
 			? "grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6"
 			: "grid gap-4 md:gap-6";
 	const bootNetworkUnavailable =
@@ -4684,7 +4749,7 @@ export function Dashboard(props: {
 								<div className="lg:hidden">
 									<ScopedSummaryCard
 										scope={scope}
-										feedItems={feed.items}
+										feedItems={activeFeedItems}
 										personalRepos={scope.kind === "mine" ? personalRepos : null}
 										personalReposLoading={
 											scope.kind === "mine" && personalReposLoading
@@ -4835,6 +4900,20 @@ export function Dashboard(props: {
 											? followingReposError
 											: null
 									}
+									reloadFollowingRepos={async () => {
+										await followingReposQuery.refetch();
+									}}
+									desktop
+								/>
+							</aside>
+						) : renderRootFollowingSidebar ? (
+							<aside className="hidden space-y-4 lg:block">
+								<ScopedSummaryCard
+									scope={{ kind: "following" }}
+									feedItems={feed.items}
+									followingRepos={followingRepos}
+									followingReposLoading={followingReposLoading}
+									followingReposError={followingReposError}
 									reloadFollowingRepos={async () => {
 										await followingReposQuery.refetch();
 									}}
