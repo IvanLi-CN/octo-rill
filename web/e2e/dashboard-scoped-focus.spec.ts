@@ -50,6 +50,30 @@ async function expectRepositoryListGeometry(panel: Locator) {
 	expect(geometry.listScrollHeight).toBeGreaterThan(geometry.listClientHeight);
 }
 
+async function expectEmptyRepositoryListGeometry(panel: Locator) {
+	const geometry = await panel.evaluate((element) => {
+		const footer = document.querySelector<HTMLElement>(
+			'[data-app-meta-footer="true"]',
+		);
+		const list = element.querySelector<HTMLElement>(
+			'[data-dashboard-repository-list="true"]',
+		);
+		if (!footer || !list) {
+			throw new Error("Expected a footer and repository list");
+		}
+		return {
+			footerGap:
+				footer.getBoundingClientRect().top -
+				element.getBoundingClientRect().bottom,
+			listClientHeight: list.clientHeight,
+		};
+	});
+
+	expect(geometry.footerGap).toBeGreaterThanOrEqual(14);
+	expect(geometry.footerGap).toBeLessThanOrEqual(18);
+	expect(geometry.listClientHeight).toBeGreaterThanOrEqual(150);
+}
+
 function buildScopedRelease(
 	id: string,
 	repoFullName: string,
@@ -113,13 +137,27 @@ async function installScopedFocusMocks(
 		includeOwnReleases?: boolean;
 		holdBriefGeneration?: boolean;
 		personalRepositoryCount?: number;
+		holdPersonalRepos?: boolean;
+		personalReposError?: boolean;
 		repositoryListCount?: number;
 	},
 ) {
 	const includeOwnReleases = options?.includeOwnReleases ?? false;
 	const holdBriefGeneration = options?.holdBriefGeneration ?? false;
 	const personalRepositoryCount = options?.personalRepositoryCount ?? 3;
+	const holdPersonalRepos = options?.holdPersonalRepos ?? false;
+	const personalReposError = options?.personalReposError ?? false;
 	const repositoryListCount = options?.repositoryListCount ?? 1;
+	let releasePersonalReposRequest: (() => void) | null = null;
+	let markPersonalReposRequestStarted: (() => void) | null = null;
+	const personalReposRequestStarted = new Promise<void>((resolve) => {
+		markPersonalReposRequestStarted = resolve;
+	});
+	const personalReposGate = holdPersonalRepos
+		? new Promise<void>((resolve) => {
+				releasePersonalReposRequest = resolve;
+			})
+		: null;
 	const viewerLogin = "story-viewer";
 	const personalRepoNames = [
 		"octo-rill",
@@ -198,7 +236,7 @@ async function installScopedFocusMocks(
 			},
 		),
 	];
-	const followingRepos = {
+	let followingRepos = {
 		following_count: followingItems.length,
 		associated_count: followingItems.length + 1,
 		items: followingItems,
@@ -229,6 +267,20 @@ async function installScopedFocusMocks(
 		}
 
 		if (req.method() === "GET" && pathname === "/api/me/personal-repos") {
+			markPersonalReposRequestStarted?.();
+			if (personalReposGate) await personalReposGate;
+			if (personalReposError) {
+				return json(
+					route,
+					{
+						error: {
+							code: "personal_repos_unavailable",
+							message: "Personal repositories are unavailable.",
+						},
+					},
+					500,
+				);
+			}
 			return json(route, {
 				owner_login: viewerLogin,
 				total_count: personalRepos.length,
@@ -238,6 +290,45 @@ async function installScopedFocusMocks(
 
 		if (req.method() === "GET" && pathname === "/api/repos/following") {
 			return json(route, followingRepos);
+		}
+
+		const followingMutation = pathname.match(
+			/^\/api\/repos\/([^/]+)\/([^/]+)\/following$/,
+		);
+		if (
+			followingMutation &&
+			(req.method() === "PUT" || req.method() === "DELETE")
+		) {
+			const fullName = `${decodeURIComponent(followingMutation[1])}/${decodeURIComponent(
+				followingMutation[2],
+			)}`;
+			const target = followingRepos.associated_items.find(
+				(item) => item.full_name === fullName,
+			);
+			if (!target) {
+				return json(
+					route,
+					{ error: { code: "not_found", message: "Repository not found." } },
+					404,
+				);
+			}
+			const isFollowing = req.method() === "PUT";
+			const nextAssociatedItems = followingRepos.associated_items.map((item) =>
+				item.full_name === fullName
+					? { ...item, is_following: isFollowing }
+					: item,
+			);
+			const nextItems = nextAssociatedItems.filter((item) => item.is_following);
+			followingRepos = {
+				following_count: nextItems.length,
+				associated_count: nextAssociatedItems.length,
+				items: nextItems,
+				associated_items: nextAssociatedItems,
+			};
+			return json(
+				route,
+				nextAssociatedItems.find((item) => item.full_name === fullName),
+			);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {
@@ -492,6 +583,11 @@ async function installScopedFocusMocks(
 			404,
 		);
 	});
+
+	return {
+		waitForPersonalReposRequest: () => personalReposRequestStarted,
+		releasePersonalRepos: () => releasePersonalReposRequest?.(),
+	};
 }
 
 test("root all desktop renders the following repository sidebar within the footer boundary", async ({
@@ -609,6 +705,38 @@ test("long repository lists retain two visible cards on compact desktops", async
 		followingPanel.locator('[data-dashboard-following-repo-list="associated"]'),
 	).toBeVisible();
 	await expectRepositoryListGeometry(followingPanel);
+	await expect(
+		followingPanel.getByRole("button", { name: "关联仓库 19" }),
+	).toHaveAttribute("aria-pressed", "true");
+	await followingPanel
+		.getByRole("button", { name: "取消关注" })
+		.first()
+		.click();
+	await expect(
+		followingPanel.getByRole("button", { name: "关注仓库 17" }),
+	).toBeVisible();
+	await expect(
+		followingPanel.getByRole("button", { name: "关联仓库 19" }),
+	).toBeVisible();
+	await expect(
+		followingPanel
+			.locator('[data-dashboard-following-repo-list="associated"]')
+			.getByRole("button", { name: "关注仓库" })
+			.first(),
+	).toBeVisible();
+	await expectRepositoryListGeometry(followingPanel);
+	await followingPanel
+		.locator('[data-dashboard-following-repo-list="associated"]')
+		.getByRole("button", { name: "关注仓库" })
+		.first()
+		.click();
+	await expect(
+		followingPanel.getByRole("button", { name: "关注仓库 18" }),
+	).toBeVisible();
+	await expect(
+		followingPanel.getByRole("button", { name: "取消关注" }).first(),
+	).toBeVisible();
+	await expectRepositoryListGeometry(followingPanel);
 
 	await page.goto("/focus/mine");
 	const personalPanel = page.locator(
@@ -616,6 +744,43 @@ test("long repository lists retain two visible cards on compact desktops", async
 	);
 	await expect(personalPanel).toBeVisible();
 	await expectRepositoryListGeometry(personalPanel);
+});
+
+test("two-card repository lists keep their natural height and scroll with the document", async ({
+	page,
+}) => {
+	await installScopedFocusMocks(page, { repositoryListCount: 2 });
+	await page.setViewportSize({ width: 1440, height: 900 });
+	await page.goto("/focus/following");
+
+	const panel = page.locator(
+		'[data-dashboard-scope-summary="following"][data-dashboard-scope-summary-layout="desktop"]',
+	);
+	await expect(panel).toBeVisible();
+	await expect(panel).toHaveAttribute(
+		"data-dashboard-repository-panel-state",
+		"natural-capped",
+	);
+	const before = await panel.evaluate((element) => ({
+		height: element.getBoundingClientRect().height,
+		inlineHeight: element.style.height,
+		top: element.getBoundingClientRect().top,
+	}));
+	expect(before.inlineHeight).toBe("");
+
+	await page.evaluate(() => {
+		document.body.style.paddingBottom = "1200px";
+		window.scrollTo({ top: 320 });
+	});
+	await expect
+		.poll(() => page.evaluate(() => window.scrollY))
+		.toBeGreaterThan(0);
+	const after = await panel.evaluate((element) => ({
+		height: element.getBoundingClientRect().height,
+		top: element.getBoundingClientRect().top,
+	}));
+	expect(Math.abs(after.height - before.height)).toBeLessThanOrEqual(1);
+	expect(after.top).toBeLessThan(before.top - 1);
 });
 
 test("following focus keeps the associated repository switch in the bounded sidebar", async ({
@@ -670,6 +835,45 @@ test("personal repositories keep release labels, navigation, and the footer gap"
 		);
 	});
 	expect(gap).toBeGreaterThanOrEqual(14);
+});
+
+test("personal repository placeholders reserve the two-card fallback height", async ({
+	page,
+}) => {
+	const mocks = await installScopedFocusMocks(page, {
+		personalRepositoryCount: 0,
+		holdPersonalRepos: true,
+	});
+	await page.setViewportSize({ width: 1024, height: 768 });
+	await page.goto("/focus/mine");
+
+	const panel = page.locator(
+		'[data-dashboard-scope-summary="mine"][data-dashboard-scope-summary-layout="desktop"]',
+	);
+	await expect(panel).toBeVisible();
+	await mocks.waitForPersonalReposRequest();
+	await expect(panel.getByText("正在加载个人仓库…")).toBeVisible();
+	await expectEmptyRepositoryListGeometry(panel);
+	mocks.releasePersonalRepos();
+	await expect(panel.getByText("暂无个人仓库。")).toBeVisible();
+	await expectEmptyRepositoryListGeometry(panel);
+});
+
+test("personal repository errors stay inside the bounded list viewport", async ({
+	page,
+}) => {
+	await installScopedFocusMocks(page, { personalReposError: true });
+	await page.setViewportSize({ width: 1024, height: 768 });
+	await page.goto("/focus/mine");
+
+	const panel = page.locator(
+		'[data-dashboard-scope-summary="mine"][data-dashboard-scope-summary-layout="desktop"]',
+	);
+	await expect(panel).toBeVisible();
+	await expect(
+		panel.getByText("个人仓库清单加载失败，当前动态仍可继续浏览。"),
+	).toBeVisible();
+	await expectEmptyRepositoryListGeometry(panel);
 });
 
 test("narrow root dashboard does not request or render the following sidebar", async ({

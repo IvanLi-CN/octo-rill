@@ -8,6 +8,7 @@ type RepositoryPanelLayout = {
 	availableHeight: number | null;
 	minimumListHeight: number | null;
 	shortList: boolean;
+	contentCapped: boolean;
 	compact: boolean;
 };
 
@@ -22,6 +23,7 @@ export function useRepositoryPanelViewportHeight(options: {
 		availableHeight: null,
 		minimumListHeight: null,
 		shortList: false,
+		contentCapped: false,
 		compact: false,
 	});
 
@@ -31,6 +33,7 @@ export function useRepositoryPanelViewportHeight(options: {
 				availableHeight: null,
 				minimumListHeight: null,
 				shortList: false,
+				contentCapped: false,
 				compact: false,
 			});
 			return;
@@ -71,12 +74,14 @@ export function useRepositoryPanelViewportHeight(options: {
 				) +
 				Number.parseFloat(listStyle?.paddingTop ?? "0") +
 				Number.parseFloat(listStyle?.paddingBottom ?? "0");
-			const shortList = naturalListHeight < twoItemHeight;
+			const shortList = items.length < 2 && naturalListHeight < twoItemHeight;
 			const panelChromeHeight = Math.max(
 				0,
 				panel.getBoundingClientRect().height -
 					(list?.getBoundingClientRect().height ?? 0),
 			);
+			const contentCapped =
+				panelChromeHeight + naturalListHeight > availableHeight;
 
 			setLayout((current) => {
 				const compactThreshold =
@@ -88,6 +93,7 @@ export function useRepositoryPanelViewportHeight(options: {
 					current.availableHeight === availableHeight &&
 					current.minimumListHeight === twoItemHeight &&
 					current.shortList === shortList &&
+					current.contentCapped === contentCapped &&
 					current.compact === compact
 				) {
 					return current;
@@ -96,6 +102,7 @@ export function useRepositoryPanelViewportHeight(options: {
 					availableHeight,
 					minimumListHeight: twoItemHeight,
 					shortList,
+					contentCapped,
 					compact,
 				};
 			});
@@ -110,7 +117,7 @@ export function useRepositoryPanelViewportHeight(options: {
 		};
 
 		scheduleMeasure();
-		const observer = new ResizeObserver(measure);
+		const observer = new ResizeObserver(scheduleMeasure);
 		observer.observe(panel);
 		const footer = document.querySelector<HTMLElement>(
 			'[data-app-meta-footer="true"]',
@@ -126,29 +133,22 @@ export function useRepositoryPanelViewportHeight(options: {
 		}
 
 		window.addEventListener("resize", scheduleMeasure);
-		window.addEventListener("scroll", scheduleMeasure, { passive: true });
-		document.addEventListener("scroll", scheduleMeasure, {
-			capture: true,
-			passive: true,
-		});
 		window.visualViewport?.addEventListener("resize", scheduleMeasure);
-		window.visualViewport?.addEventListener("scroll", scheduleMeasure);
 		return () => {
 			if (frame !== null) window.cancelAnimationFrame(frame);
 			observer.disconnect();
 			window.removeEventListener("resize", scheduleMeasure);
-			window.removeEventListener("scroll", scheduleMeasure);
-			document.removeEventListener("scroll", scheduleMeasure, true);
 			window.visualViewport?.removeEventListener("resize", scheduleMeasure);
-			window.visualViewport?.removeEventListener("scroll", scheduleMeasure);
 		};
 	}, [options.enabled, options.itemCount, options.itemsKey]);
 
 	const panelStyle =
 		layout.availableHeight !== null
 			? {
-					height: `${layout.availableHeight}px`,
 					maxHeight: `${layout.availableHeight}px`,
+					...(layout.shortList || layout.contentCapped
+						? { height: `${layout.availableHeight}px` }
+						: {}),
 				}
 			: undefined;
 	const listStyle =
@@ -162,6 +162,7 @@ export function useRepositoryPanelViewportHeight(options: {
 		panelStyle,
 		listStyle,
 		shortList: layout.shortList,
+		contentCapped: layout.contentCapped,
 		compact: layout.compact,
 	};
 }

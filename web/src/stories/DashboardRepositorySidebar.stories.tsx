@@ -144,6 +144,7 @@ function RepositorySidebarPreview(props: {
 							].join(" ")}
 							style={listStyle}
 							data-dashboard-repository-list="true"
+							data-dashboard-repository-list-label={props.label}
 						>
 							{Array.from({ length: props.count }, (_, index) => (
 								<li
@@ -204,6 +205,32 @@ async function expectTwoVisibleRepositoryCards(canvasElement: HTMLElement) {
 	await waitFor(() => {
 		expect(list.clientHeight).toBeGreaterThanOrEqual(itemHeight * 2 - 2);
 	});
+}
+
+async function expectLongRepositoryListGeometry(canvasElement: HTMLElement) {
+	const panel = canvasElement.querySelector<HTMLElement>(
+		'[data-dashboard-repository-panel="true"]',
+	);
+	const footer = canvasElement.querySelector<HTMLElement>(
+		'[data-app-meta-footer="true"]',
+	);
+	const list = canvasElement.querySelector<HTMLElement>(
+		'[data-dashboard-repository-list="true"]',
+	);
+	if (!panel || !footer || !list) {
+		throw new Error("Expected panel, footer, and repository list");
+	}
+	await waitFor(() => {
+		const gap =
+			footer.getBoundingClientRect().top - panel.getBoundingClientRect().bottom;
+		expect(gap).toBeGreaterThanOrEqual(14);
+		expect(gap).toBeLessThanOrEqual(18);
+	});
+	expect(getComputedStyle(list).overflowY).toBe("auto");
+	await waitFor(() => {
+		expect(list.scrollHeight).toBeGreaterThan(list.clientHeight);
+	});
+	await expectTwoVisibleRepositoryCards(canvasElement);
 }
 
 export const ShortFollowing: Story = {
@@ -267,26 +294,7 @@ export const LongFollowing: Story = {
 		await expect(
 			canvasElement.querySelectorAll("[data-dashboard-repository-item]"),
 		).toHaveLength(18);
-		const list = canvasElement.querySelector<HTMLElement>(
-			'[data-dashboard-repository-list="true"]',
-		);
-		if (!list) throw new Error("Expected repository list");
-		expect(getComputedStyle(list).overflowY).toBe("auto");
-		await waitFor(() => {
-			expect(list.scrollHeight).toBeGreaterThan(list.clientHeight);
-		});
-		await expectTwoVisibleRepositoryCards(canvasElement);
-		const panel = canvasElement.querySelector<HTMLElement>(
-			'[data-dashboard-repository-panel="true"]',
-		);
-		const footer = canvasElement.querySelector<HTMLElement>(
-			'[data-app-meta-footer="true"]',
-		);
-		if (!panel || !footer) throw new Error("Expected panel and footer");
-		const gap =
-			footer.getBoundingClientRect().top - panel.getBoundingClientRect().bottom;
-		expect(gap).toBeGreaterThanOrEqual(14);
-		expect(gap).toBeLessThanOrEqual(18);
+		await expectLongRepositoryListGeometry(canvasElement);
 	},
 };
 
@@ -336,13 +344,55 @@ export const CompactLongFollowing: Story = {
 		},
 	},
 	play: async ({ canvasElement }) => {
-		await expectTwoVisibleRepositoryCards(canvasElement);
+		await waitFor(() => {
+			expect(
+				canvasElement.querySelector(
+					'[data-dashboard-repository-panel-density="compact"]',
+				),
+			).not.toBeNull();
+		});
+		await expectLongRepositoryListGeometry(canvasElement);
+	},
+};
+
+export const CompactLongAssociated: Story = {
+	args: { count: 19, label: "关联仓库", topInset: 142 },
+	parameters: {
+		viewport: { defaultViewport: "dashboardRepository1171x620" },
+	},
+	play: async ({ canvasElement }) => {
+		await expect(
+			canvasElement.querySelector(
+				'[data-dashboard-repository-list-label="关联仓库"]',
+			),
+		).not.toBeNull();
+		await expectLongRepositoryListGeometry(canvasElement);
 	},
 };
 
 export const LongPersonalRepositories: Story = {
 	args: { count: 18, label: "个人仓库" },
 	play: async ({ canvasElement }) => {
-		await expectTwoVisibleRepositoryCards(canvasElement);
+		await expect(
+			canvasElement.querySelector(
+				'[data-dashboard-repository-list-label="个人仓库"]',
+			),
+		).not.toBeNull();
+		await expectLongRepositoryListGeometry(canvasElement);
+	},
+};
+
+export const CompactLongPersonalRepositories: Story = {
+	args: { count: 18, label: "个人仓库", topInset: 142 },
+	parameters: {
+		viewport: { defaultViewport: "dashboardRepository1171x620" },
+	},
+	play: async ({ canvasElement }) => {
+		await expect(
+			canvasElement.querySelector(
+				'[data-dashboard-repository-list-label="个人仓库"]',
+			),
+		).not.toBeNull();
+		await expectLongRepositoryListGeometry(canvasElement);
 	},
 };

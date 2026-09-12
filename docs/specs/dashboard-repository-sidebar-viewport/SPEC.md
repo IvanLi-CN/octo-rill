@@ -9,7 +9,7 @@
 ## Terms and Interfaces
 
 - 项目卡: 仓库列表中的单个仓库项目行；高度阈值以两张项目卡为基准。
-- 可用侧栏高度: 固定 AppMetaFooter 顶部到侧栏顶部的距离，扣除 `16px` 页脚间距。
+- 可用侧栏高度: 初始布局以及尺寸、内容或字体变化时，固定 AppMetaFooter 顶部到侧栏顶部的距离，扣除 `16px` 页脚间距。
 - Interface: `ScopedSummaryCard` 内部仓库列表、`AppMetaFooter` 的 DOM 标记和 Dashboard 桌面侧栏布局。
 
 ## Requirements
@@ -23,14 +23,14 @@
 ### REQ-DASHBOARD-REPOSITORY-SIDEBAR-002
 
 - The system MUST cap the repository sidebar at the available viewport height defined by the fixed footer top minus `16px`.
-- Inputs: panel top, footer top, visual viewport changes, repository item dimensions, and list content height.
-- Outputs: lists scroll internally when content exceeds the cap, and the panel never crosses the footer gap.
+- Inputs: panel top, footer top, visual viewport resizing, repository item dimensions, and list content height.
+- Outputs: lists scroll internally when content exceeds the cap, and the panel never crosses the footer gap at layout time. Ordinary document scrolling MUST NOT trigger a height recalculation or cause a bottom-sticky effect; the panel remains in the reading flow.
 
 ### REQ-DASHBOARD-REPOSITORY-SIDEBAR-003
 
 - The system MUST reserve a repository-list viewport at least as tall as two project cards for every desktop repository-list state, including long lists.
 - Inputs: actual first project-card height when present, otherwise a `76px` per-card fallback; panel chrome height and the available sidebar height.
-- Outputs: empty, loading, and one-item states keep a stable near-viewport panel; long lists expose at least two complete cards and scroll only inside the list. When panel chrome would consume that minimum, the panel enters its compact density without crossing the footer boundary.
+- Outputs: empty, loading, and one-item states keep a stable near-viewport panel that ends `16px` above the footer. Lists whose natural content reaches two cards grow naturally and only cap at the available height; long lists expose at least two complete cards and scroll only inside the list. When panel chrome would consume that minimum, the panel enters its compact density without crossing the footer boundary.
 
 ### REQ-DASHBOARD-REPOSITORY-SIDEBAR-004
 
@@ -50,7 +50,7 @@
 
 - Method: Storybook repository-sidebar states plus DOM geometry assertions.
 - covers: `REQ-DASHBOARD-REPOSITORY-SIDEBAR-002`, `REQ-DASHBOARD-REPOSITORY-SIDEBAR-003`
-- Pass condition: every desktop panel ends `16px` above the footer, its list viewport is at least two rendered project-card heights (or `152px` when empty), and long-list overflow belongs to the list container. The compact `1171x620` state covers following, associated, and personal repository lists.
+- Pass condition: empty, loading, and one-item panels end `16px` above the footer; two-or-more-item panels retain natural height until the cap and never cross the footer boundary. Every list viewport is at least two rendered project-card heights (or `152px` when empty), and long-list overflow belongs to the list container. The compact `1171x620` state covers following, associated, and personal repository lists, including follow-state mutation and normal document scrolling.
 
 ## Related ADRs
 
@@ -60,7 +60,7 @@ None
 
 - Source: `ui_demo` for Dashboard page states and `storybook_docs` for the reusable repository panel.
 - Requested viewports: `1440x900`, `1024x768`, and `1171x620` CSS px.
-- Geometry receipts: every desktop list has a `16px` footer gap; empty-list fallback is `152px`; long following, associated, and personal lists have internal overflow (`scrollHeight > clientHeight`) while retaining at least two visible project-card heights.
+- Geometry receipts: short panels have a `16px` footer gap; two-or-more-item panels remain natural until their cap; empty-list fallback is `152px`; long following, associated, and personal lists have internal overflow (`scrollHeight > clientHeight`) while retaining at least two visible project-card heights.
 - Assets:
   - `./assets/root-following-1440x900.png`
   - `./assets/root-following-1024x768.png`
