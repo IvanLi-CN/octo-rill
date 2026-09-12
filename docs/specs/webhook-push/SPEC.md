@@ -6,7 +6,22 @@
 
 本能力允许用户显式授权 OctoRill 使用其已保存的 classic PAT，为该 PAT 所属 GitHub 账号的个人 owner 仓库注册 Release webhook。Webhook 是快速发现信号，现有 Release 同步仍是数据写入路径。
 
-## Goals
+## Context and Scope
+
+本主题覆盖用户“我的发布”页面中的 Webhook 目标状态、GitHub Hook 对齐任务、本地接收门禁、持久化任务恢复，以及面向用户的状态展示。Release 同步、签名验证和 delivery 去重仍沿用现有语义；本主题只改变 Hook 的管理边界和状态表达。
+
+## Requirements
+
+- `REQ-WP-001`: 系统 MUST 将用户意图持久化为 `enabled`、`paused` 或 `deleted`，并且运行时观察结果不得反向改写该意图。
+- `REQ-WP-002`: 所有 GitHub Hook 的创建、激活、暂停、删除和检查 MUST 由可恢复的后台对齐任务异步执行，HTTP mutation 不得直接调用 GitHub。
+- `REQ-WP-003`: 目标为 `paused` 或 `deleted` 时，系统 MUST 在任何远端调用前关闭本地接收门禁；远端失败不得改变持久化目标。
+- `REQ-WP-004`: 每名用户 MUST 同时最多存在一项未终态的管理或 audit 操作；暂时失败 MUST 按 `1/5/15` 分钟退避并尊重更晚的 `Retry-After`。
+- `REQ-WP-005`: worker 仅可变更已验证为 OctoRill 管理、Hook ID、callback URL、`release` event 和仓库身份均匹配的 GitHub Hook。
+- `REQ-WP-006`: 用户 API MUST 暴露目标状态、当前 operation、最近完成检查时间、Owner 分组和派生仓库状态，并移除旧的扁平管理路由合同。
+- `REQ-WP-007`: 设置页 MUST 按 Owner 分组仓库，并区分健康目标状态、等待/执行进度和仓库错误；删除选择不得要求第二次确认。
+- `REQ-WP-008`: 启用目标 MUST 显示本用户最近一次全量检查完成时间；定时 audit 只在没有人工任务时对齐启用目标，人工重试不得与上一轮重叠。
+
+### Goals
 
 - 在“我的发布”中提供默认未启用的“Webhook 推送”目标状态。
 - 提供统一的“立即检查并修复”入口，以及逐仓修复入口；Hook 的注册、暂停、恢复和删除全部由异步对齐任务执行。
@@ -83,15 +98,20 @@
 - 启用目标显示本用户最近完成检查时间；首次显示“尚未检查”。
 - 权限错误必须给出 repo、失败原因与 classic PAT 修复指引；无 PAT 时链接到同一设置页的 GitHub PAT section。
 
-## Acceptance Criteria
+## Verification
 
-- 默认关闭且不创建外部 hook；不满足前置条件时不能开启。
-- 启用、暂停、恢复和删除均异步执行；部分失败仍保持目标状态并逐仓展示。
-- 每名用户同一时间最多一个未终态的 Webhook 管理或 audit 操作；远程暂时错误按 `1/5/15` 分钟退避重试三次。
-- 定时巡查跳过权限暂停仓库；人工修复成功恢复该仓库自动巡查资格。
-- 所有 Hook 变更均在后台任务中执行；批量删除只删除通过 OctoRill 身份校验的 Hook。
-- 重复 delivery 只产生一次 Release demand；非 published action 不产生 demand。
-- 设置页桌面、移动端以及深色/浅色主题无溢出，所有按钮和 Switch 有可访问名称与忙碌状态。
+- `VER-WP-001` (covers: `REQ-WP-001`): SQLite migration and state-machine tests prove the three target states persist, historical rows map without external calls, and task failures never overwrite the target.
+- `VER-WP-002` (covers: `REQ-WP-002`): API route tests and mock GitHub transport prove mutations enqueue work and every Hook mutation runs only in the worker.
+- `VER-WP-003` (covers: `REQ-WP-003`): receiver and operation tests prove paused/deleted delivery is ignored before remote work and failed remote work preserves the target.
+- `VER-WP-004` (covers: `REQ-WP-004`): job lease, delayed retry, `Retry-After`, cancellation-boundary, and worker-recovery tests prove one inflight operation per user and three scheduled retries at `1/5/15` minutes.
+- `VER-WP-005` (covers: `REQ-WP-005`): managed-hook identity tests prove unmatched Hook ID, callback, event, or repository identity is reported and never mutated.
+- `VER-WP-006` (covers: `REQ-WP-006`): HTTP contract tests prove the new GET/PATCH/reconcile routes return operation snapshots, derived states, check timestamps, and Owner groups without the old flat management contract.
+- `VER-WP-007` (covers: `REQ-WP-007`): Settings Playwright and mock-only visual tests prove Owner grouping, waiting/working/error states, healthy colors, the close-choice dialog, and direct delete submission on desktop and mobile.
+- `VER-WP-008` (covers: `REQ-WP-008`): audit scheduling and Settings tests prove the last completed check is shown with relative/local-time detail and manual retry is blocked while the prior operation is active.
+
+## Related ADRs
+
+- [0010 Webhook Push Desired State](../../adr/0010-webhook-push-desired-state.md)
 
 ## Visual Evidence
 
