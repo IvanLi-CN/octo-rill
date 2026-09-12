@@ -182,10 +182,12 @@ export function useFeed(
 	const query = useQuery<DashboardFeedQueryData>({
 		queryKey,
 		enabled,
-		queryFn: async () => {
+		queryFn: async ({ signal }) => {
 			const current =
 				queryClient.getQueryData<DashboardFeedQueryData>(queryKey);
-			const res = await apiGet<FeedResponse>(buildFeedUrl(30, type, scope));
+			const res = await apiGet<FeedResponse>(buildFeedUrl(30, type, scope), {
+				signal,
+			});
 			return {
 				type,
 				scopeSignature,
@@ -231,15 +233,31 @@ export function useFeed(
 	}, [queryKey]);
 
 	const loadInitial = useCallback(
-		async (options?: { freshKeys?: string[]; throwOnError?: boolean }) => {
+		async (options?: {
+			freshKeys?: string[];
+			throwOnError?: boolean;
+			onStart?: (cancel: () => void) => void;
+		}) => {
 			if (!enabled) return;
 			reqIdRef.current += 1;
 			const reqId = reqIdRef.current;
+			const cancelled = Symbol("feed-refresh-cancelled");
+			let cancelRefresh = () => undefined;
+			const cancellation = new Promise<typeof cancelled>((resolve) => {
+				cancelRefresh = () => {
+					if (reqId !== reqIdRef.current) return;
+					reqIdRef.current += 1;
+					void queryClient.cancelQueries({ queryKey, exact: true });
+					resolve(cancelled);
+				};
+			});
+			options?.onStart?.(cancelRefresh);
 
 			// Cancel any in-flight "load more" state; we are replacing the list.
 			setLoadingMore(false);
 			setAppendError(null);
-			const result = await query.refetch();
+			const result = await Promise.race([query.refetch(), cancellation]);
+			if (result === cancelled) return;
 			if (reqId !== reqIdRef.current) return;
 			if (result.error) {
 				if (options?.throwOnError) {
@@ -251,7 +269,7 @@ export function useFeed(
 				setFreshKeys(new Set(options?.freshKeys ?? []));
 			}
 		},
-		[enabled, query.refetch],
+		[enabled, query.refetch, queryClient, queryKey],
 	);
 
 	const loadMore = useCallback(async () => {
@@ -269,9 +287,10 @@ export function useFeed(
 			});
 			const page = await queryClient.fetchQuery<DashboardFeedQueryData>({
 				queryKey: pageQueryKey,
-				queryFn: async () => {
+				queryFn: async ({ signal }) => {
 					const res = await apiGet<FeedResponse>(
 						buildFeedUrl(30, type, scope, currentNextCursor),
+						{ signal },
 					);
 					return {
 						type,
@@ -322,7 +341,11 @@ export function useFeed(
 	]);
 
 	const refresh = useCallback(
-		async (options?: { freshKeys?: string[]; throwOnError?: boolean }) => {
+		async (options?: {
+			freshKeys?: string[];
+			throwOnError?: boolean;
+			onStart?: (cancel: () => void) => void;
+		}) => {
 			await loadInitial(options);
 		},
 		[loadInitial],

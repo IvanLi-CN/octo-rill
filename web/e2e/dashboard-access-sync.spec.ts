@@ -1903,8 +1903,8 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 			{
 				taskId: "task-access-1",
 				runningDelayMs: 60,
-				starDelayMs: 2200,
-				completeDelayMs: 4300,
+				starDelayMs: 6000,
+				completeDelayMs: 9000,
 			},
 		);
 
@@ -2034,7 +2034,9 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 		await expect(page.getByText("Fresh release")).toHaveCount(0, {
 			timeout: 200,
 		});
-		await expect(page.getByText("Fresh release")).toBeVisible();
+		await expect(page.getByText("Fresh release")).toBeVisible({
+			timeout: 10_000,
+		});
 
 		expect(feedCalls).toBeGreaterThanOrEqual(3);
 		expect(notificationCalls).toBeGreaterThanOrEqual(2);
@@ -2047,6 +2049,538 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 			clearTimeout(freshTimer);
 		}
 	}
+});
+
+test("dashboard keeps readable content mounted while access sync replays task events", async ({
+	page,
+}) => {
+	let feedCalls = 0;
+	let taskCompleted = false;
+	const feedResponseTitles: string[] = [];
+	page.on("console", (message) => {
+		if (message.text() === "readable-sync-task-completed") {
+			taskCompleted = true;
+		}
+	});
+	await page.addInitScript(
+		({ taskId }) => {
+			type TestWindow = Window & {
+				__postContentReadableSkeletonMounts?: number;
+				__taskEventSourceCount?: number;
+				__taskEventSourceActive?: number;
+				__taskEventSourceCountAtContent?: number;
+				__taskEventSourceActiveAtContent?: number;
+				__taskEventDeliveries?: string[];
+			};
+			const state = window as TestWindow;
+			state.__postContentReadableSkeletonMounts = 0;
+			state.__taskEventSourceCount = 0;
+			state.__taskEventSourceActive = 0;
+			state.__taskEventDeliveries = [];
+			let contentSeen = false;
+			let skeletonVisible = false;
+			const contentReadyCallbacks: Array<() => void> = [];
+			const observeReadableState = () => {
+				const nextContentSeen = Boolean(
+					document.querySelector("[data-readable-section-list]"),
+				);
+				if (!contentSeen && nextContentSeen) {
+					contentSeen = true;
+					for (const callback of contentReadyCallbacks.splice(0)) callback();
+				}
+				const nextSkeletonVisible = Boolean(
+					document.querySelector("[data-readable-loading-initial]") &&
+						document.querySelector("[data-readable-loading-skeleton]"),
+				);
+				if (contentSeen && nextSkeletonVisible && !skeletonVisible) {
+					state.__postContentReadableSkeletonMounts =
+						(state.__postContentReadableSkeletonMounts ?? 0) + 1;
+				}
+				skeletonVisible = nextSkeletonVisible;
+			};
+			const observer = new MutationObserver(observeReadableState);
+			const observeDocument = () => {
+				if (!document.documentElement) return;
+				observer.observe(document.documentElement, {
+					childList: true,
+					subtree: true,
+				});
+				observeReadableState();
+			};
+			if (document.documentElement) {
+				observeDocument();
+			} else {
+				document.addEventListener("DOMContentLoaded", observeDocument, {
+					once: true,
+				});
+			}
+			const taskEventPlan = [
+				{
+					index: 0,
+					id: "task-event-0",
+					delay: 500,
+					type: "task.running",
+					payload: { task_id: taskId, status: "running" },
+				},
+				{
+					index: 1,
+					id: "task-event-1",
+					delay: 1200,
+					type: "task.progress",
+					payload: {
+						task_id: taskId,
+						stage: "star_refreshed",
+						repos: 1,
+					},
+				},
+				{
+					index: 2,
+					id: "task-event-2",
+					delay: 5000,
+					type: "task.completed",
+					payload: { task_id: taskId, status: "succeeded" },
+				},
+			] as const;
+			// The first connection receives two historical events immediately. This
+			// exercises replay without allowing the app to create a replacement source.
+			const emittedTaskEvents = new Set<number>([0, 1]);
+
+			class MockEventSource {
+				url: string;
+				readyState = 1;
+				withCredentials = false;
+				onopen: ((this: EventSource, event: Event) => unknown) | null = null;
+				onmessage:
+					| ((this: EventSource, event: MessageEvent<string>) => unknown)
+					| null = null;
+				onerror: ((this: EventSource, event: Event) => unknown) | null = null;
+				private listeners = new Map<
+					string,
+					Set<(event: Event | MessageEvent<string>) => unknown>
+				>();
+				private timers: number[] = [];
+				private startOnContentReady: (() => void) | null = null;
+
+				constructor(url: string | URL) {
+					this.url = String(url);
+					this.timers.push(
+						window.setTimeout(() => {
+							this.onopen?.call(
+								this as unknown as EventSource,
+								new Event("open"),
+							);
+						}, 0),
+					);
+					if (!this.url.endsWith(`/api/tasks/${taskId}/events`)) return;
+					state.__taskEventSourceCount =
+						(state.__taskEventSourceCount ?? 0) + 1;
+					state.__taskEventSourceActive =
+						(state.__taskEventSourceActive ?? 0) + 1;
+					const scheduleTaskEvents = () => {
+						if (state.__taskEventSourceCountAtContent === undefined) {
+							state.__taskEventSourceCountAtContent =
+								state.__taskEventSourceCount ?? 0;
+							state.__taskEventSourceActiveAtContent =
+								state.__taskEventSourceActive ?? 0;
+						}
+						for (const taskEvent of taskEventPlan) {
+							const replay = emittedTaskEvents.has(taskEvent.index);
+							this.timers.push(
+								window.setTimeout(
+									() => {
+										if (!replay) {
+											if (emittedTaskEvents.has(taskEvent.index)) return;
+											emittedTaskEvents.add(taskEvent.index);
+										}
+										const emit = () =>
+											this.dispatch(
+												taskEvent.type,
+												taskEvent.payload,
+												taskEvent.id,
+											);
+										if (taskEvent.index === 2) {
+											console.log("readable-sync-task-completed");
+										}
+										emit();
+									},
+									replay ? 0 : taskEvent.delay,
+								),
+							);
+						}
+					};
+					if (contentSeen) {
+						scheduleTaskEvents();
+					} else {
+						this.startOnContentReady = scheduleTaskEvents;
+						contentReadyCallbacks.push(scheduleTaskEvents);
+					}
+				}
+
+				addEventListener(
+					type: string,
+					listener: (event: Event | MessageEvent<string>) => unknown,
+				) {
+					const current = this.listeners.get(type) ?? new Set();
+					current.add(listener);
+					this.listeners.set(type, current);
+				}
+
+				removeEventListener(
+					type: string,
+					listener: (event: Event | MessageEvent<string>) => unknown,
+				) {
+					this.listeners.get(type)?.delete(listener);
+				}
+
+				close() {
+					if (this.readyState === 2) return;
+					this.readyState = 2;
+					if (this.url.endsWith(`/api/tasks/${taskId}/events`)) {
+						state.__taskEventSourceActive =
+							(state.__taskEventSourceActive ?? 1) - 1;
+					}
+					if (this.startOnContentReady) {
+						const index = contentReadyCallbacks.indexOf(
+							this.startOnContentReady,
+						);
+						if (index >= 0) contentReadyCallbacks.splice(index, 1);
+						this.startOnContentReady = null;
+					}
+					for (const timer of this.timers) window.clearTimeout(timer);
+					this.timers = [];
+				}
+
+				private dispatch(type: string, payload: unknown, lastEventId: string) {
+					if (this.readyState === 2) return;
+					state.__taskEventDeliveries?.push(lastEventId);
+					const event = new MessageEvent(type, {
+						data: JSON.stringify(payload),
+						lastEventId,
+					});
+					for (const listener of this.listeners.get(type) ?? []) {
+						listener.call(this as unknown as EventSource, event);
+					}
+					this.onmessage?.call(this as unknown as EventSource, event);
+				}
+			}
+
+			Object.defineProperty(window, "EventSource", {
+				configurable: true,
+				writable: true,
+				value: MockEventSource,
+			});
+		},
+		{ taskId: "task-readable-replay" },
+	);
+
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const url = new URL(req.url());
+		const { pathname } = url;
+
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse(
+					{
+						id: "2f4k7m9p3x6c8v2a",
+						github_user_id: 10,
+						login: "octo",
+						name: "Octo",
+						avatar_url: null,
+						email: null,
+						is_admin: false,
+					},
+					{
+						access_sync: {
+							task_id: "task-readable-replay",
+							task_type: "sync.access_refresh",
+							event_path: "/api/tasks/task-readable-replay/events",
+							reason: "inactive_over_1h",
+						},
+					},
+				),
+			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			feedCalls += 1;
+			const title = taskCompleted ? "Fresh release" : "Cached release";
+			feedResponseTitles.push(title);
+			if (feedCalls > 1) {
+				await new Promise((resolve) => setTimeout(resolve, 350));
+			}
+			const item = buildReleaseFeedItem("readable-sync-item", { title });
+			return json(route, {
+				sections: [
+					{
+						id: "2026-04-09",
+						date: "2026-04-09",
+						kind: "raw",
+						item_count: 1,
+						brief: null,
+						items: [item],
+						items_next_cursor: null,
+						supplemental_items: [],
+					},
+				],
+				next_cursor: null,
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			return json(route, []);
+		}
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			return json(route, []);
+		}
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: false,
+				masked_token: null,
+				check: { state: "idle", message: null, checked_at: null },
+			});
+		}
+		if (req.method() === "GET" && pathname === "/api/health") {
+			return json(route, { ok: true, version: "1.2.3" });
+		}
+		if (req.method() === "GET" && pathname === "/api/dashboard/updates") {
+			return json(route, {
+				token: "updates-token",
+				lists: {
+					feed: { changed: false, new_count: 0, latest_keys: [] },
+					briefs: { changed: false, new_count: 0, latest_keys: [] },
+					notifications: { changed: false, new_count: 0, latest_keys: [] },
+				},
+			});
+		}
+
+		return json(
+			route,
+			{
+				error: {
+					code: "not_found",
+					message: `unhandled ${req.method()} ${pathname}`,
+				},
+			},
+			404,
+		);
+	});
+
+	await page.goto("/");
+	await expect(page.getByText("Cached release")).toBeVisible({ timeout: 8000 });
+	const sourceStatsAtContent = await page.evaluate(() => {
+		const state = window as typeof window & {
+			__taskEventSourceCount?: number;
+			__taskEventSourceActive?: number;
+			__taskEventSourceCountAtContent?: number;
+			__taskEventSourceActiveAtContent?: number;
+		};
+		return {
+			count: state.__taskEventSourceCountAtContent ?? 0,
+			active: state.__taskEventSourceActiveAtContent ?? 0,
+		};
+	});
+	// Vite dev mode replays mount effects once under React StrictMode; the
+	// production invariant is one active connection and no growth afterward.
+	expect(sourceStatsAtContent.active).toBe(1);
+	expect(sourceStatsAtContent.count).toBeLessThanOrEqual(2);
+	await expect
+		.poll(() => feedResponseTitles.length, { timeout: 3000 })
+		.toBeGreaterThanOrEqual(2);
+	await expect(page.getByText("Cached release")).toBeVisible({ timeout: 8000 });
+	await expect(page.getByText("Fresh release")).toBeVisible({ timeout: 8000 });
+	await page.waitForTimeout(250);
+
+	expect(feedCalls).toBeGreaterThanOrEqual(2);
+	expect(feedResponseTitles.slice(0, 2)).toEqual([
+		"Cached release",
+		"Cached release",
+	]);
+	expect(feedResponseTitles.at(-1)).toBe("Fresh release");
+	expect(taskCompleted).toBe(true);
+	const sourceStatsAfterCompletion = await page.evaluate(() => {
+		const state = window as typeof window & {
+			__taskEventSourceCount?: number;
+			__taskEventSourceActive?: number;
+		};
+		return {
+			count: state.__taskEventSourceCount ?? 0,
+			active: state.__taskEventSourceActive ?? 0,
+		};
+	});
+	expect(sourceStatsAfterCompletion).toEqual({
+		count: sourceStatsAtContent.count,
+		active: 0,
+	});
+	expect(
+		await page.evaluate(
+			() =>
+				(window as typeof window & { __taskEventDeliveries?: string[] })
+					.__taskEventDeliveries ?? [],
+		),
+	).toEqual(["task-event-0", "task-event-1", "task-event-2"]);
+	expect(
+		await page.evaluate(
+			() =>
+				(
+					window as typeof window & {
+						__postContentReadableSkeletonMounts?: number;
+					}
+				).__postContentReadableSkeletonMounts,
+		),
+	).toBe(0);
+});
+
+test("dashboard keeps readable content and exposes refresh retry after a transient failure", async ({
+	page,
+}) => {
+	let feedCalls = 0;
+	let updatesCalls = 0;
+	let failRefresh = true;
+	let liveNoticeReceived = false;
+	await page.addInitScript(
+		({ taskId }) => {
+			class MockEventSource {
+				readyState = 1;
+				onopen: ((event: Event) => unknown) | null = null;
+				private listeners = new Map<string, Set<(event: Event) => unknown>>();
+
+				constructor(url: string | URL) {
+					window.setTimeout(() => this.onopen?.(new Event("open")), 0);
+					if (!String(url).endsWith(`/api/tasks/${taskId}/events`)) return;
+				}
+
+				addEventListener(type: string, listener: (event: Event) => unknown) {
+					const listeners = this.listeners.get(type) ?? new Set();
+					listeners.add(listener);
+					this.listeners.set(type, listeners);
+				}
+
+				removeEventListener(type: string, listener: (event: Event) => unknown) {
+					this.listeners.get(type)?.delete(listener);
+				}
+
+				close() {
+					this.readyState = 2;
+				}
+			}
+
+			window.EventSource = MockEventSource as unknown as typeof EventSource;
+		},
+		{ taskId: "task-readable-refresh-error" },
+	);
+
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const { pathname } = new URL(req.url());
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse(
+					{
+						id: "2f4k7m9p3x6c8v2a",
+						github_user_id: 10,
+						login: "octo",
+						name: "Octo",
+						avatar_url: null,
+						email: null,
+						is_admin: false,
+					},
+					{
+						access_sync: {
+							task_id: "task-readable-refresh-error",
+							task_type: "sync.access_refresh",
+							event_path: "/api/tasks/task-readable-refresh-error/events",
+							reason: "inactive_over_1h",
+						},
+					},
+				),
+			);
+		}
+		if (req.method() === "GET" && pathname === "/api/dashboard/feed") {
+			feedCalls += 1;
+			if (liveNoticeReceived && failRefresh) {
+				return json(
+					route,
+					{ error: { code: "upstream", message: "temporary refresh failure" } },
+					503,
+				);
+			}
+			const title = failRefresh ? "Cached release" : "Fresh release";
+			return json(route, {
+				sections: [
+					{
+						id: "2026-04-09",
+						date: "2026-04-09",
+						kind: "raw",
+						item_count: 1,
+						brief: null,
+						items: [buildReleaseFeedItem("refresh-error-item", { title })],
+						items_next_cursor: null,
+						supplemental_items: [],
+					},
+				],
+				next_cursor: null,
+			});
+		}
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			return json(route, []);
+		}
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			return json(route, []);
+		}
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: false,
+				masked_token: null,
+				check: { state: "idle", message: null, checked_at: null },
+			});
+		}
+		if (req.method() === "GET" && pathname === "/api/health") {
+			return json(route, { ok: true, version: "1.2.3" });
+		}
+		if (req.method() === "GET" && pathname === "/api/dashboard/updates") {
+			updatesCalls += 1;
+			if (updatesCalls === 1) liveNoticeReceived = true;
+			return json(route, {
+				token: `updates-token-${updatesCalls}`,
+				lists: {
+					feed:
+						updatesCalls === 1
+							? {
+									changed: true,
+									new_count: 1,
+									latest_keys: ["release:refresh-error-item"],
+								}
+							: { changed: false, new_count: 0, latest_keys: [] },
+					briefs: { changed: false, new_count: 0, latest_keys: [] },
+					notifications: { changed: false, new_count: 0, latest_keys: [] },
+				},
+			});
+		}
+		return json(
+			route,
+			{ error: { code: "not_found", message: "unhandled" } },
+			404,
+		);
+	});
+
+	await page.goto("/");
+	await expect(page.getByText("Cached release")).toBeVisible({ timeout: 8000 });
+	const refreshError = page.locator(
+		'[data-dashboard-readable-refresh-error="true"]',
+	);
+	await expect(refreshError).toBeVisible();
+	await expect(page.getByText("Cached release")).toBeVisible();
+	const callsBeforeRetry = feedCalls;
+	expect(callsBeforeRetry).toBeGreaterThanOrEqual(2);
+	failRefresh = false;
+	await refreshError.getByRole("button", { name: "重试刷新" }).click();
+	await expect(page.getByText("Fresh release")).toBeVisible();
+	await page.waitForTimeout(250);
+	expect(feedCalls).toBe(callsBeforeRetry + 1);
+	expect(updatesCalls).toBeGreaterThanOrEqual(2);
 });
 
 test("dashboard opens access sync warmup bubble immediately after clicking sync", async ({

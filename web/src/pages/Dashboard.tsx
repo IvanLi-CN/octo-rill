@@ -375,6 +375,7 @@ type BriefGenerateResponse = {
 
 const SYNC_ALL_LABEL = "同步";
 const TASK_STREAM_RECOVERY_GRACE_MS = 5000;
+const TASK_STREAM_COMPLETION_GRACE_MS = 30000;
 const ACCESS_SYNC_TOTAL_STEPS = 4;
 const FEED_REACTION_REFRESH_TTL_MS = 15_000;
 const FEED_REACTION_REFRESH_BATCH_SIZE = 100;
@@ -1546,6 +1547,10 @@ export function Dashboard(props: {
 			initialAccessTask ? accessSyncProgressFromStage("waiting") : null,
 		);
 	const refreshTaskSourcesRef = useRef<Map<string, EventSource>>(new Map());
+	const refreshTaskReconnectTimersRef = useRef<Map<string, number>>(new Map());
+	const refreshTaskLifecyclesRef = useRef<
+		Map<string, { settled: boolean; completionInFlight: boolean }>
+	>(new Map());
 	const syncAllInFlightRef = useRef(false);
 	const taskWaitersRef = useRef<
 		Map<
@@ -1704,7 +1709,7 @@ export function Dashboard(props: {
 		enabled: scope?.kind === "following" || scope?.kind === "repo",
 	});
 	const refreshFeed = readableSectionsActive
-		? readableSections.loadInitial
+		? readableSections.refresh
 		: feed.refresh;
 	const followingRepos = followingReposQuery.data ?? null;
 	const followingReposLoading = followingReposQuery.isLoading;
@@ -1961,7 +1966,15 @@ export function Dashboard(props: {
 	const reactionTokenBootstrapRequestedRef = useRef(
 		sessionState?.reactionTokenBootstrapped === true,
 	);
-	const notificationsRequestInFlightRef = useRef(false);
+	const sidebarRequestIdRef = useRef(0);
+	const notificationsRequestIdRef = useRef(0);
+	const sidebarLoadingRequestIdRef = useRef(0);
+	const notificationsLoadingRequestIdRef = useRef(0);
+	const sidebarRefreshQueueRef = useRef<Promise<void>>(Promise.resolve());
+	const notificationsRefreshQueueRef = useRef<Promise<void>>(Promise.resolve());
+	const sidebarRefreshPriorityRef = useRef(0);
+	const notificationsRefreshPriorityRef = useRef(0);
+	const strictSidebarRefreshRef = useRef<Promise<void> | null>(null);
 	const [sidebarLoading, setSidebarLoading] = useState(
 		() => !bootedFromWarmStart && !hasCachedBriefs,
 	);
@@ -2116,17 +2129,16 @@ export function Dashboard(props: {
 		[dismissToast, feedItemsRef, focusFeedItem, notifyGlobalError],
 	);
 
-	const loadNotifications = useCallback(
+	const loadNotificationsUnqueued = useCallback(
 		async (phase: DashboardSectionError["phase"] = "initial") => {
-			if (notificationsRequestInFlightRef.current) {
-				return;
-			}
-			notificationsRequestInFlightRef.current = true;
+			const requestId = ++notificationsRequestIdRef.current;
 			setNotificationsError(null);
 			try {
 				const items = await apiGet<NotificationItem[]>("/api/notifications");
+				if (requestId !== notificationsRequestIdRef.current) return;
 				setNotifications(sortNotifications(items));
 			} catch (error) {
+				if (requestId !== notificationsRequestIdRef.current) return;
 				const message = describeUnknownError(
 					error,
 					"Inbox 加载失败，请稍后重试。",
@@ -2136,21 +2148,52 @@ export function Dashboard(props: {
 					notifyGlobalError("Inbox 刷新失败", error, message);
 				}
 				throw error;
-			} finally {
-				notificationsRequestInFlightRef.current = false;
 			}
 		},
 		[notifications.length, notifyGlobalError],
 	);
-	const refreshSidebar = useCallback(
+	const loadNotifications = useCallback(
+		(
+			phase: DashboardSectionError["phase"] = "initial",
+			options?: { priority?: boolean },
+		) => {
+			const priority = options?.priority
+				? ++notificationsRefreshPriorityRef.current
+				: notificationsRefreshPriorityRef.current;
+			if (options?.priority) {
+				const immediate = loadNotificationsUnqueued(phase);
+				notificationsRefreshQueueRef.current = immediate.catch(() => undefined);
+				return immediate;
+			}
+			const queued = notificationsRefreshQueueRef.current.then(() => {
+				if (priority !== notificationsRefreshPriorityRef.current) return;
+				return loadNotificationsUnqueued(phase);
+			});
+			notificationsRefreshQueueRef.current = queued.catch(() => undefined);
+			return queued;
+		},
+		[loadNotificationsUnqueued],
+	);
+	const refreshSidebarUnqueued = useCallback(
 		async (options?: {
 			background?: boolean;
 			includeNotifications?: boolean;
 			preferredBriefId?: string | null;
+			throwOnError?: boolean;
+			onStart?: (cancel: () => void) => void;
+			onQueue?: (cancel: () => void) => void;
 		}) => {
-			if (!options?.background) {
-				setSidebarLoading(true);
-			}
+			const requestId = ++sidebarRequestIdRef.current;
+			let cancelled = false;
+			const cancelRefresh = () => {
+				if (cancelled || requestId !== sidebarRequestIdRef.current) return;
+				cancelled = true;
+				sidebarRequestIdRef.current += 1;
+				if (sidebarLoadingRequestIdRef.current === requestId) {
+					setSidebarLoading(false);
+				}
+			};
+			options?.onStart?.(cancelRefresh);
 			setBriefsError(null);
 			try {
 				const phase: DashboardSectionError["phase"] = options?.background
@@ -2159,7 +2202,7 @@ export function Dashboard(props: {
 				const [briefsResult, notificationsResult] = await Promise.allSettled([
 					apiGet<BriefItem[]>("/api/briefs"),
 					options?.includeNotifications
-						? loadNotifications(phase)
+						? loadNotifications(phase, { priority: options?.throwOnError })
 						: Promise.resolve(),
 				]);
 				if (
@@ -2177,6 +2220,7 @@ export function Dashboard(props: {
 				if (briefsResult.status === "rejected") {
 					throw briefsResult.reason;
 				}
+				if (requestId !== sidebarRequestIdRef.current) return;
 				const b = briefsResult.value;
 				setBriefs((current) =>
 					mergeBriefSummariesWithCachedDetails(b, current),
@@ -2202,6 +2246,7 @@ export function Dashboard(props: {
 					notificationsBootstrapCompletedRef.current = true;
 				}
 			} catch (error) {
+				if (requestId !== sidebarRequestIdRef.current) return;
 				if (isSidebarBootstrapNotificationsError(error)) {
 					throw error.cause;
 				}
@@ -2217,14 +2262,76 @@ export function Dashboard(props: {
 					notifyGlobalError("侧栏刷新失败", error, message);
 				}
 				throw error;
-			} finally {
-				setSidebarLoading(false);
 			}
 		},
 		[briefs.length, loadNotifications, notifyGlobalError, routeSelectedBriefId],
 	);
+	const refreshSidebar = useCallback(
+		(options?: {
+			background?: boolean;
+			includeNotifications?: boolean;
+			preferredBriefId?: string | null;
+			throwOnError?: boolean;
+			onStart?: (cancel: () => void) => void;
+			onQueue?: (cancel: () => void) => void;
+		}) => {
+			const priority = options?.throwOnError
+				? ++sidebarRefreshPriorityRef.current
+				: sidebarRefreshPriorityRef.current;
+			const loadingRequestId = ++sidebarLoadingRequestIdRef.current;
+			if (!options?.background) {
+				setSidebarLoading(true);
+			}
+			const run = async (checkPriority: boolean) => {
+				if (checkPriority && priority !== sidebarRefreshPriorityRef.current) {
+					return;
+				}
+				await refreshSidebarUnqueued(options);
+			};
+			let queued: Promise<void>;
+			if (options?.throwOnError) {
+				let cancelled = false;
+				let cancelOperation!: () => void;
+				const released = new Promise<never>((_, reject) => {
+					cancelOperation = () => {
+						if (cancelled) return;
+						cancelled = true;
+						reject(new Error("刷新已取消"));
+					};
+				});
+				options.onQueue?.(cancelOperation);
+				const operation = (
+					strictSidebarRefreshRef.current ?? Promise.resolve()
+				).then(() => {
+					if (cancelled) return Promise.reject(new Error("刷新已取消"));
+					return refreshSidebarUnqueued({
+						...options,
+						onStart: (cancel) =>
+							options?.onStart?.(() => {
+								cancel();
+								cancelOperation();
+							}),
+					});
+				});
+				queued = Promise.race([operation, released]);
+			} else {
+				queued = sidebarRefreshQueueRef.current.then(() => run(true));
+			}
+			if (options?.throwOnError) {
+				strictSidebarRefreshRef.current = queued.catch(() => undefined);
+			}
+			sidebarRefreshQueueRef.current = queued.catch(() => undefined);
+			return queued.finally(() => {
+				if (loadingRequestId === sidebarLoadingRequestIdRef.current) {
+					setSidebarLoading(false);
+				}
+			});
+		},
+		[refreshSidebarUnqueued],
+	);
 	const refreshNotifications = useCallback(
 		async (options?: { background?: boolean }) => {
+			const loadingRequestId = ++notificationsLoadingRequestIdRef.current;
 			if (!options?.background) {
 				setNotificationsLoading(true);
 			}
@@ -2232,7 +2339,9 @@ export function Dashboard(props: {
 				await loadNotifications(options?.background ? "refresh" : "initial");
 				notificationsBootstrapCompletedRef.current = true;
 			} finally {
-				setNotificationsLoading(false);
+				if (loadingRequestId === notificationsLoadingRequestIdRef.current) {
+					setNotificationsLoading(false);
+				}
 			}
 		},
 		[loadNotifications],
@@ -2408,20 +2517,30 @@ export function Dashboard(props: {
 		tab,
 	]);
 
-	const refreshAll = useCallback(async () => {
-		const tasks: Array<Promise<unknown>> = [refreshFeed()];
-		if (!scopedMode) {
-			tasks.push(
-				refreshSidebar({
-					includeNotifications:
-						hasDesktopSidebarInbox ||
-						tab === "inbox" ||
-						notificationsBootstrapCompletedRef.current,
-				}),
-			);
-		}
-		await Promise.all(tasks);
-	}, [hasDesktopSidebarInbox, refreshFeed, refreshSidebar, scopedMode, tab]);
+	const refreshAll = useCallback(
+		async (options?: {
+			throwOnError?: boolean;
+			onStart?: (cancel: () => void) => void;
+			onQueue?: (cancel: () => void) => void;
+		}) => {
+			const tasks: Array<Promise<unknown>> = [refreshFeed(options)];
+			if (!scopedMode) {
+				tasks.push(
+					refreshSidebar({
+						throwOnError: options?.throwOnError,
+						includeNotifications:
+							hasDesktopSidebarInbox ||
+							tab === "inbox" ||
+							notificationsBootstrapCompletedRef.current,
+						onStart: (cancel) => options?.onStart?.(cancel),
+						onQueue: (cancel) => options?.onQueue?.(cancel),
+					}),
+				);
+			}
+			await Promise.all(tasks);
+		},
+		[hasDesktopSidebarInbox, refreshFeed, refreshSidebar, scopedMode, tab],
+	);
 
 	const onDashboardLiveUpdate = useCallback(
 		(notices: DashboardLiveUpdateNotice[]) => {
@@ -2458,7 +2577,7 @@ export function Dashboard(props: {
 		enabled:
 			shellHydrated &&
 			(readableSectionsActive
-				? !readableSections.loadingInitial
+				? !readableSections.loadingInitial && !readableSections.loadingRefresh
 				: !feed.loadingInitial),
 		feedType: feedRequestType,
 		includeBriefs: !scopedMode,
@@ -2574,7 +2693,8 @@ export function Dashboard(props: {
 		async (notice = activeFeedNotice) => {
 			if (!notice) return;
 			if (readableSectionsActive) {
-				await refreshFeed();
+				const result = await refreshFeed();
+				if (result !== "applied") return;
 				dismissFeedBoundary(notice.boundaryId);
 				await checkDashboardUpdates({ emit: false, include: ["feed"] });
 				return;
@@ -2607,13 +2727,28 @@ export function Dashboard(props: {
 			scrollToFreshFeedTop,
 		],
 	);
+	const retryReadableSections = useCallback(async () => {
+		const result = await readableSections.retry();
+		if (result !== "applied") return;
+		const notice = activeFeedNotice;
+		if (!notice) return;
+		dismissFeedBoundary(notice.boundaryId);
+		await checkDashboardUpdates({ emit: false, include: ["feed"] });
+	}, [
+		activeFeedNotice,
+		checkDashboardUpdates,
+		dismissFeedBoundary,
+		readableSections.retry,
+	]);
 
 	useEffect(() => {
 		const notice = activeFeedNotice;
 		if (
 			!notice ||
 			(readableSectionsActive
-				? readableSections.loadingInitial
+				? readableSections.loadingInitial ||
+					readableSections.loadingRefresh ||
+					readableSections.error?.phase === "refresh"
 				: feed.loadingInitial)
 		)
 			return;
@@ -2630,7 +2765,17 @@ export function Dashboard(props: {
 		);
 		if (readableSectionsActive) {
 			void refreshFeed()
-				.then(() => {
+				.then((result) => {
+					if (result === "superseded") {
+						if (
+							hydratedFeedNoticeRef.current.get(notice.boundaryId) ===
+							hydratedKey
+						) {
+							hydratedFeedNoticeRef.current.delete(notice.boundaryId);
+						}
+						return;
+					}
+					if (result !== "applied") return;
 					restoreFeedScrollAnchor(anchor);
 					dismissFeedBoundary(notice.boundaryId);
 					void checkDashboardUpdates({ emit: false, include: ["feed"] });
@@ -2697,6 +2842,8 @@ export function Dashboard(props: {
 		feedRequestType,
 		notifyGlobalError,
 		readableSections.loadingInitial,
+		readableSections.loadingRefresh,
+		readableSections.error?.phase,
 		readableSectionsActive,
 		refreshFeed,
 	]);
@@ -2763,6 +2910,18 @@ export function Dashboard(props: {
 	const settleTaskWaiter = useCallback((taskId: string, error?: Error) => {
 		taskWaitersRef.current.get(taskId)?.settle(error);
 	}, []);
+	const refreshAllRef = useRef(refreshAll);
+	refreshAllRef.current = refreshAll;
+	const checkDashboardUpdatesRef = useRef(checkDashboardUpdates);
+	checkDashboardUpdatesRef.current = checkDashboardUpdates;
+	const clearDashboardLiveNoticesRef = useRef(clearDashboardLiveNotices);
+	clearDashboardLiveNoticesRef.current = clearDashboardLiveNotices;
+	const notifyGlobalErrorRef = useRef(notifyGlobalError);
+	notifyGlobalErrorRef.current = notifyGlobalError;
+	const pushErrorToastRef = useRef(pushErrorToast);
+	pushErrorToastRef.current = pushErrorToast;
+	const settleTaskWaiterRef = useRef(settleTaskWaiter);
+	settleTaskWaiterRef.current = settleTaskWaiter;
 
 	const trackTaskStream = useCallback(
 		(task: TaskAcceptedResponse, mode: TaskStreamMode) => {
@@ -3054,14 +3213,37 @@ export function Dashboard(props: {
 
 		const source = openAppEventSource(accessTaskStream.eventPath);
 		let reconnectTimer: number | null = null;
+		let completionTimer: number | null = null;
+		let queuedCompletionTimer: number | null = null;
+		let completionTimerStarted = false;
+		let completionInFlight = false;
+		let streamSettled = false;
+		const queuedRefreshCancels = new Set<() => void>();
+		const activeRefreshCancels = new Set<() => void>();
 		const clearReconnectTimer = () => {
 			if (reconnectTimer === null) return;
 			window.clearTimeout(reconnectTimer);
 			reconnectTimer = null;
 		};
+		const clearCompletionTimer = () => {
+			if (completionTimer !== null) {
+				window.clearTimeout(completionTimer);
+				completionTimer = null;
+			}
+			if (queuedCompletionTimer !== null) {
+				window.clearTimeout(queuedCompletionTimer);
+				queuedCompletionTimer = null;
+			}
+			queuedRefreshCancels.clear();
+			activeRefreshCancels.clear();
+		};
 		const refreshOnUi = () => {
-			void refreshAll().catch((error) => {
-				notifyGlobalError("页面刷新失败", error, "页面刷新失败，请稍后重试。");
+			void refreshAllRef.current().catch((error) => {
+				notifyGlobalErrorRef.current(
+					"页面刷新失败",
+					error,
+					"页面刷新失败，请稍后重试。",
+				);
 			});
 		};
 		const parsePayload = (event: MessageEvent<string>): TaskEventPayload => {
@@ -3071,8 +3253,14 @@ export function Dashboard(props: {
 				return {};
 			}
 		};
-		const failStream = (message: string) => {
+		const failStream = (message: string, allowCompletion = false) => {
+			if (streamSettled || (completionInFlight && !allowCompletion)) {
+				clearReconnectTimer();
+				return;
+			}
+			streamSettled = true;
 			clearReconnectTimer();
+			clearCompletionTimer();
 			setAccessSyncStage((current) =>
 				current === "completed" ? current : "failed",
 			);
@@ -3085,15 +3273,16 @@ export function Dashboard(props: {
 						}
 					: null,
 			);
-			pushErrorToast("同步事件流已断开", message);
+			pushErrorToastRef.current("同步事件流已断开", message);
 			source.close();
-			settleTaskWaiter(accessTaskStream.taskId, new Error(message));
+			settleTaskWaiterRef.current(accessTaskStream.taskId, new Error(message));
 			setAccessTaskStream((current) =>
 				current?.taskId === accessTaskStream.taskId ? null : current,
 			);
 		};
 
 		const onProgress = (event: Event) => {
+			if (streamSettled || completionInFlight) return;
 			const payload = parsePayload(event as MessageEvent<string>);
 			if (payload.stage === "star_refreshed") {
 				setAccessSyncStage("star_refreshed");
@@ -3126,55 +3315,115 @@ export function Dashboard(props: {
 		};
 
 		const onCompleted = (event: Event) => {
+			if (streamSettled || completionInFlight) return;
+			completionInFlight = true;
 			const payload = parsePayload(event as MessageEvent<string>);
 			const completedTaskId = accessTaskStream.taskId;
+			const startCompletionTimer = (cancel: () => void) => {
+				activeRefreshCancels.add(cancel);
+				if (completionTimerStarted || streamSettled) return;
+				if (queuedCompletionTimer !== null) {
+					window.clearTimeout(queuedCompletionTimer);
+					queuedCompletionTimer = null;
+				}
+				completionTimerStarted = true;
+				completionTimer = window.setTimeout(() => {
+					completionTimer = null;
+					for (const cancel of queuedRefreshCancels) cancel();
+					for (const cancel of activeRefreshCancels) cancel();
+					failStream("同步完成后的页面刷新超时，请刷新页面后重试。", true);
+				}, TASK_STREAM_COMPLETION_GRACE_MS);
+			};
+			const startQueuedCompletionTimer = () => {
+				if (
+					completionTimerStarted ||
+					streamSettled ||
+					queuedCompletionTimer !== null
+				)
+					return;
+				queuedCompletionTimer = window.setTimeout(() => {
+					queuedCompletionTimer = null;
+					for (const cancel of queuedRefreshCancels) cancel();
+					for (const cancel of activeRefreshCancels) cancel();
+					failStream("同步完成后的页面刷新排队超时，请刷新页面后重试。", true);
+				}, TASK_STREAM_COMPLETION_GRACE_MS);
+			};
 			const complete = async () => {
+				if (streamSettled) return;
 				clearReconnectTimer();
 				const failed =
 					payload.status !== "succeeded"
 						? new Error(payload.error ?? "后台同步失败")
 						: undefined;
-				setAccessSyncStage(
-					payload.status === "succeeded" ? "completed" : "failed",
-				);
-				setAccessSyncProgress((current) => ({
-					currentStep:
-						payload.status === "succeeded"
-							? ACCESS_SYNC_TOTAL_STEPS
-							: (current?.currentStep ?? 0),
-					totalSteps: ACCESS_SYNC_TOTAL_STEPS,
-					stageLabel:
-						payload.status === "succeeded" ? "同步完成" : "后台同步失败",
-					detail:
-						payload.status === "succeeded"
-							? "正在刷新页面内容"
-							: (payload.error ?? "后台同步失败"),
-				}));
 				if (payload.status === "succeeded") {
+					startQueuedCompletionTimer();
+					setAccessSyncProgress((current) => ({
+						currentStep: current?.currentStep ?? ACCESS_SYNC_TOTAL_STEPS,
+						totalSteps: ACCESS_SYNC_TOTAL_STEPS,
+						stageLabel: "正在刷新页面内容",
+						detail: "正在刷新页面内容",
+					}));
 					try {
-						await refreshAll();
-						clearDashboardLiveNotices();
-						await checkDashboardUpdates({ emit: false });
+						await refreshAllRef.current({
+							throwOnError: true,
+							onStart: startCompletionTimer,
+							onQueue: (cancel) => queuedRefreshCancels.add(cancel),
+						});
+						if (streamSettled) return;
+						clearDashboardLiveNoticesRef.current();
+						await checkDashboardUpdatesRef.current({ emit: false });
+						if (streamSettled) return;
 					} catch (error) {
+						if (streamSettled) return;
+						setAccessSyncStage("failed");
+						setAccessSyncProgress((current) => ({
+							currentStep: current?.currentStep ?? 0,
+							totalSteps: ACCESS_SYNC_TOTAL_STEPS,
+							stageLabel: "同步后刷新失败",
+							detail: "同步已完成，但页面刷新失败，请稍后重试。",
+						}));
+						streamSettled = true;
+						clearReconnectTimer();
+						clearCompletionTimer();
 						const resolvedError =
 							error instanceof Error ? error : new Error(String(error));
-						notifyGlobalError(
+						notifyGlobalErrorRef.current(
 							"同步后刷新失败",
 							resolvedError,
 							"同步已完成，但页面刷新失败，请稍后重试。",
 						);
 						source.close();
-						settleTaskWaiter(completedTaskId, resolvedError);
+						settleTaskWaiterRef.current(completedTaskId, resolvedError);
 						setAccessTaskStream((current) =>
 							current?.taskId === completedTaskId ? null : current,
 						);
 						return;
 					}
-				} else if (payload.error) {
-					pushErrorToast("后台同步失败", payload.error);
+					setAccessSyncStage("completed");
+					setAccessSyncProgress(() => ({
+						currentStep: ACCESS_SYNC_TOTAL_STEPS,
+						totalSteps: ACCESS_SYNC_TOTAL_STEPS,
+						stageLabel: "同步完成",
+						detail: "页面内容已刷新",
+					}));
+				} else {
+					setAccessSyncStage("failed");
+					setAccessSyncProgress((current) => ({
+						currentStep: current?.currentStep ?? 0,
+						totalSteps: ACCESS_SYNC_TOTAL_STEPS,
+						stageLabel: "后台同步失败",
+						detail: payload.error ?? "后台同步失败",
+					}));
+					if (payload.error) {
+						pushErrorToastRef.current("后台同步失败", payload.error);
+					}
 				}
+				if (streamSettled) return;
+				streamSettled = true;
+				clearReconnectTimer();
+				clearCompletionTimer();
 				source.close();
-				settleTaskWaiter(completedTaskId, failed);
+				settleTaskWaiterRef.current(completedTaskId, failed);
 				setAccessTaskStream((current) =>
 					current?.taskId === completedTaskId ? null : current,
 				);
@@ -3186,6 +3435,8 @@ export function Dashboard(props: {
 		source.addEventListener("task.running", onRunning);
 		source.addEventListener("task.progress", onProgress);
 		source.addEventListener("task.completed", onCompleted);
+		source.addEventListener("task.canceled", onCompleted);
+		source.addEventListener("task.recovered_failed", onCompleted);
 		source.onerror = () => {
 			if (source.readyState === EventSource.CLOSED) {
 				failStream("后台任务事件流已断开，请刷新页面后重试。");
@@ -3199,21 +3450,17 @@ export function Dashboard(props: {
 		};
 
 		return () => {
+			streamSettled = true;
 			clearReconnectTimer();
+			clearCompletionTimer();
 			source.removeEventListener("task.running", onRunning);
 			source.removeEventListener("task.progress", onProgress);
 			source.removeEventListener("task.completed", onCompleted);
+			source.removeEventListener("task.canceled", onCompleted);
+			source.removeEventListener("task.recovered_failed", onCompleted);
 			source.close();
 		};
-	}, [
-		accessTaskStream,
-		checkDashboardUpdates,
-		clearDashboardLiveNotices,
-		notifyGlobalError,
-		pushErrorToast,
-		refreshAll,
-		settleTaskWaiter,
-	]);
+	}, [accessTaskStream]);
 
 	useEffect(() => {
 		if (refreshTaskStreams.length === 0) return;
@@ -3225,10 +3472,32 @@ export function Dashboard(props: {
 
 			const source = openAppEventSource(task.eventPath);
 			let reconnectTimer: number | null = null;
+			const lifecycle = {
+				settled: false,
+				completionInFlight: false,
+				completionTimer: null as number | null,
+				queuedCompletionTimer: null as number | null,
+			};
+			const queuedRefreshCancels = new Set<() => void>();
+			const activeRefreshCancels = new Set<() => void>();
+			refreshTaskLifecyclesRef.current.set(task.taskId, lifecycle);
 			const clearReconnectTimer = () => {
 				if (reconnectTimer === null) return;
 				window.clearTimeout(reconnectTimer);
 				reconnectTimer = null;
+				refreshTaskReconnectTimersRef.current.delete(task.taskId);
+			};
+			const clearCompletionTimer = () => {
+				if (lifecycle.completionTimer !== null) {
+					window.clearTimeout(lifecycle.completionTimer);
+					lifecycle.completionTimer = null;
+				}
+				if (lifecycle.queuedCompletionTimer !== null) {
+					window.clearTimeout(lifecycle.queuedCompletionTimer);
+					lifecycle.queuedCompletionTimer = null;
+				}
+				queuedRefreshCancels.clear();
+				activeRefreshCancels.clear();
 			};
 			refreshTaskSourcesRef.current.set(task.taskId, source);
 
@@ -3240,48 +3509,106 @@ export function Dashboard(props: {
 				}
 			};
 			const close = () => {
+				lifecycle.settled = true;
+				clearReconnectTimer();
+				clearCompletionTimer();
 				source.close();
 				refreshTaskSourcesRef.current.delete(task.taskId);
+				refreshTaskLifecyclesRef.current.delete(task.taskId);
 				setRefreshTaskStreams((current) =>
 					current.filter((item) => item.taskId !== task.taskId),
 				);
 			};
-			const failStream = (message: string) => {
+			const failStream = (message: string, allowCompletion = false) => {
+				if (
+					lifecycle.settled ||
+					(lifecycle.completionInFlight && !allowCompletion)
+				) {
+					clearReconnectTimer();
+					return;
+				}
+				lifecycle.settled = true;
 				clearReconnectTimer();
-				pushErrorToast("后台同步事件流异常", message);
-				settleTaskWaiter(task.taskId, new Error(message));
+				clearCompletionTimer();
+				pushErrorToastRef.current("后台同步事件流异常", message);
+				settleTaskWaiterRef.current(task.taskId, new Error(message));
 				close();
 			};
 			const onCompleted = (event: Event) => {
+				if (lifecycle.settled || lifecycle.completionInFlight) return;
+				lifecycle.completionInFlight = true;
 				const payload = parsePayload(event as MessageEvent<string>);
 				const completedTaskId = task.taskId;
+				let completionTimerStarted = false;
+				const startCompletionTimer = (cancel: () => void) => {
+					activeRefreshCancels.add(cancel);
+					if (completionTimerStarted || lifecycle.settled) return;
+					if (lifecycle.queuedCompletionTimer !== null) {
+						window.clearTimeout(lifecycle.queuedCompletionTimer);
+						lifecycle.queuedCompletionTimer = null;
+					}
+					completionTimerStarted = true;
+					lifecycle.completionTimer = window.setTimeout(() => {
+						lifecycle.completionTimer = null;
+						for (const cancel of queuedRefreshCancels) cancel();
+						for (const cancel of activeRefreshCancels) cancel();
+						failStream("同步完成后的页面刷新超时，请刷新页面后重试。", true);
+					}, TASK_STREAM_COMPLETION_GRACE_MS);
+				};
+				const startQueuedCompletionTimer = () => {
+					if (
+						completionTimerStarted ||
+						lifecycle.settled ||
+						lifecycle.queuedCompletionTimer !== null
+					)
+						return;
+					lifecycle.queuedCompletionTimer = window.setTimeout(() => {
+						lifecycle.queuedCompletionTimer = null;
+						for (const cancel of queuedRefreshCancels) cancel();
+						for (const cancel of activeRefreshCancels) cancel();
+						failStream(
+							"同步完成后的页面刷新排队超时，请刷新页面后重试。",
+							true,
+						);
+					}, TASK_STREAM_COMPLETION_GRACE_MS);
+				};
 				const complete = async () => {
+					if (lifecycle.settled) return;
 					clearReconnectTimer();
 					const failed =
 						payload.status !== "succeeded"
 							? new Error(payload.error ?? "后台同步失败")
 							: undefined;
 					if (payload.status === "succeeded") {
+						startQueuedCompletionTimer();
 						try {
-							await refreshAll();
-							clearDashboardLiveNotices();
-							await checkDashboardUpdates({ emit: false });
+							await refreshAllRef.current({
+								throwOnError: true,
+								onStart: startCompletionTimer,
+								onQueue: (cancel) => queuedRefreshCancels.add(cancel),
+							});
+							if (lifecycle.settled) return;
+							clearDashboardLiveNoticesRef.current();
+							await checkDashboardUpdatesRef.current({ emit: false });
+							if (lifecycle.settled) return;
 						} catch (error) {
+							if (lifecycle.settled) return;
 							const resolvedError =
 								error instanceof Error ? error : new Error(String(error));
-							notifyGlobalError(
+							notifyGlobalErrorRef.current(
 								"同步后刷新失败",
 								resolvedError,
 								"同步已完成，但页面刷新失败，请稍后重试。",
 							);
-							settleTaskWaiter(completedTaskId, resolvedError);
+							settleTaskWaiterRef.current(completedTaskId, resolvedError);
 							close();
 							return;
 						}
 					} else if (payload.error) {
-						pushErrorToast("后台同步失败", payload.error);
+						pushErrorToastRef.current("后台同步失败", payload.error);
 					}
-					settleTaskWaiter(completedTaskId, failed);
+					if (lifecycle.settled) return;
+					settleTaskWaiterRef.current(completedTaskId, failed);
 					close();
 				};
 				void complete();
@@ -3289,6 +3616,8 @@ export function Dashboard(props: {
 
 			source.onopen = clearReconnectTimer;
 			source.addEventListener("task.completed", onCompleted);
+			source.addEventListener("task.canceled", onCompleted);
+			source.addEventListener("task.recovered_failed", onCompleted);
 			source.onerror = () => {
 				if (source.readyState === EventSource.CLOSED) {
 					failStream("后台同步事件流已断开，请刷新页面后重试。");
@@ -3297,22 +3626,24 @@ export function Dashboard(props: {
 				if (reconnectTimer !== null) return;
 				reconnectTimer = window.setTimeout(() => {
 					reconnectTimer = null;
+					refreshTaskReconnectTimersRef.current.delete(task.taskId);
 					failStream("后台同步事件流恢复超时，请刷新页面后重试。");
 				}, TASK_STREAM_RECOVERY_GRACE_MS);
+				refreshTaskReconnectTimersRef.current.set(task.taskId, reconnectTimer);
 			};
 		}
-	}, [
-		notifyGlobalError,
-		pushErrorToast,
-		refreshTaskStreams,
-		refreshAll,
-		checkDashboardUpdates,
-		clearDashboardLiveNotices,
-		settleTaskWaiter,
-	]);
+	}, [refreshTaskStreams]);
 
 	useEffect(() => {
 		return () => {
+			for (const lifecycle of refreshTaskLifecyclesRef.current.values()) {
+				lifecycle.settled = true;
+			}
+			refreshTaskLifecyclesRef.current.clear();
+			for (const timer of refreshTaskReconnectTimersRef.current.values()) {
+				window.clearTimeout(timer);
+			}
+			refreshTaskReconnectTimersRef.current.clear();
 			for (const source of refreshTaskSourcesRef.current.values()) {
 				source.close();
 			}
@@ -3865,6 +4196,7 @@ export function Dashboard(props: {
 		const readableEmpty =
 			rootReadable &&
 			!readableSections.loadingInitial &&
+			!readableSections.loadingRefresh &&
 			!readableSections.error &&
 			readableSections.sections.length === 0;
 		return (
@@ -3939,6 +4271,28 @@ export function Dashboard(props: {
 					</div>
 				) : null}
 
+				{rootReadable && readableSections.error?.phase === "refresh" ? (
+					<div
+						className="mb-4 rounded-xl border border-amber-300/45 bg-amber-50/80 px-4 py-3 text-sm text-amber-950 shadow-sm dark:border-amber-300/20 dark:bg-amber-950/20 dark:text-amber-100"
+						data-dashboard-readable-refresh-error="true"
+						role="alert"
+					>
+						<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+							<p className="min-w-0">{readableSections.error.message}</p>
+							<Button
+								type="button"
+								variant="outline"
+								size="sm"
+								className="w-full border-amber-300/60 bg-background/70 font-mono text-xs hover:bg-background sm:w-auto"
+								onClick={() => void retryReadableSections()}
+							>
+								<RefreshCcw className="size-4" />
+								重试刷新
+							</Button>
+						</div>
+					</div>
+				) : null}
+
 				{readableEmpty ||
 				(!rootReadable &&
 					!blockingFeedError &&
@@ -4005,6 +4359,7 @@ export function Dashboard(props: {
 						details={readableSections.details}
 						error={readableSections.error}
 						loadingInitial={readableSections.loadingInitial}
+						loadingRefresh={readableSections.loadingRefresh}
 						loadingMore={readableSections.loadingMore}
 						hasMore={readableSections.hasMore}
 						onLoadMore={() => void readableSections.loadMore()}
