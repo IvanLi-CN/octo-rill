@@ -338,7 +338,7 @@ fn parse_scopes(headers: &HeaderMap) -> Vec<String> {
         .collect()
 }
 
-async fn validate_pat(
+async fn validate_pat_with_github(
     state: &AppState,
     user_id: &str,
 ) -> Result<(String, i64, String, bool), ApiError> {
@@ -442,6 +442,38 @@ async fn validate_pat(
     }
     let allows_private = scopes.iter().any(|scope| scope == "repo");
     Ok((token, github_user.id, github_user.login, allows_private))
+}
+
+async fn validate_pat_prerequisites(state: &AppState, user_id: &str) -> Result<(), ApiError> {
+    let Some((pat, token)) = load_pat(state, user_id).await? else {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "pat_required",
+            "请先在 GitHub PAT 设置中保存 classic PAT。",
+        ));
+    };
+    if pat.last_check_state != "valid" {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "pat_invalid",
+            "当前 GitHub PAT 未通过校验，请重新校验并保存。",
+        ));
+    }
+    if token.starts_with("github_pat_") {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "classic_pat_required",
+            "Webhook 推送当前仅支持 classic PAT。",
+        ));
+    }
+    if pat.owner_github_user_id.is_none() || pat.owner_login.is_none() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "pat_owner_mismatch",
+            "PAT 所属 GitHub 账号未绑定到当前 OctoRill 账号。",
+        ));
+    }
+    Ok(())
 }
 
 fn generate_secret() -> String {
@@ -792,7 +824,7 @@ pub async fn patch_settings(
                 "服务尚未配置 GitHub 可访问的 HTTPS 公共地址，请联系管理员。",
             ));
         }
-        validate_pat(state.as_ref(), &user_id).await?;
+        validate_pat_prerequisites(state.as_ref(), &user_id).await?;
         ensure_secret_and_key(state.as_ref(), &user_id).await?;
     }
     ensure_no_inflight_operation(state.as_ref(), &user_id).await?;
@@ -1004,9 +1036,6 @@ pub async fn reconcile(
             "my_releases_disabled",
             "请先开启“我的发布”。",
         ));
-    }
-    if config.webhook_push_desired_state == DESIRED_ENABLED {
-        validate_pat(state.as_ref(), &user_id).await?;
     }
     Ok(Json(task_response(
         enqueue_manage(
@@ -1865,7 +1894,7 @@ async fn execute_for_user_locked(
     }
     let (token, owner_github_user_id, owner_login, allows_private, secret, callback) = {
         let (token, owner_github_user_id, owner_login, allows_private) =
-            match validate_pat(state, user_id).await {
+            match validate_pat_with_github(state, user_id).await {
                 Ok(value) => value,
                 Err(error)
                     if scheduled
