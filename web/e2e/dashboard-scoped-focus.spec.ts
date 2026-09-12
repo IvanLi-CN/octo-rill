@@ -24,14 +24,17 @@ async function expectRepositoryListGeometry(panel: Locator) {
 		const list = element.querySelector<HTMLElement>(
 			'[data-dashboard-repository-list="true"]',
 		);
-		const firstItem = list?.querySelector<HTMLElement>(
-			"[data-dashboard-repository-item]",
-		);
-		if (!footer || !list || !firstItem) {
+		const items = Array.from(
+			list?.querySelectorAll<HTMLElement>("[data-dashboard-repository-item]") ??
+				[],
+		).slice(0, 2);
+		const [firstItem, secondItem] = items;
+		if (!footer || !list || !firstItem || !secondItem) {
 			throw new Error(
-				"Expected a footer, repository list, and repository item",
+				"Expected a footer, repository list, and two repository items",
 			);
 		}
+		const listRect = list.getBoundingClientRect();
 		return {
 			footerGap:
 				footer.getBoundingClientRect().top -
@@ -39,6 +42,10 @@ async function expectRepositoryListGeometry(panel: Locator) {
 			itemHeight: firstItem.getBoundingClientRect().height,
 			listClientHeight: list.clientHeight,
 			listScrollHeight: list.scrollHeight,
+			firstItemTop: firstItem.getBoundingClientRect().top,
+			secondItemBottom: secondItem.getBoundingClientRect().bottom,
+			listTop: listRect.top,
+			listBottom: listRect.bottom,
 		};
 	});
 
@@ -46,6 +53,10 @@ async function expectRepositoryListGeometry(panel: Locator) {
 	expect(geometry.footerGap).toBeLessThanOrEqual(18);
 	expect(geometry.listClientHeight).toBeGreaterThanOrEqual(
 		geometry.itemHeight * 2 - 2,
+	);
+	expect(geometry.firstItemTop).toBeGreaterThanOrEqual(geometry.listTop - 1);
+	expect(geometry.secondItemBottom).toBeLessThanOrEqual(
+		geometry.listBottom + 1,
 	);
 	expect(geometry.listScrollHeight).toBeGreaterThan(geometry.listClientHeight);
 }

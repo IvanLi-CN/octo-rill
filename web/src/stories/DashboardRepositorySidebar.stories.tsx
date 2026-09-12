@@ -193,7 +193,7 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-async function expectTwoVisibleRepositoryCards(canvasElement: HTMLElement) {
+async function expectTwoCardViewportCapacity(canvasElement: HTMLElement) {
 	const list = canvasElement.querySelector<HTMLElement>(
 		'[data-dashboard-repository-list="true"]',
 	);
@@ -204,6 +204,30 @@ async function expectTwoVisibleRepositoryCards(canvasElement: HTMLElement) {
 	const itemHeight = firstItem?.getBoundingClientRect().height ?? 76;
 	await waitFor(() => {
 		expect(list.clientHeight).toBeGreaterThanOrEqual(itemHeight * 2 - 2);
+	});
+}
+
+async function expectTwoFullyVisibleRepositoryCards(
+	canvasElement: HTMLElement,
+) {
+	const list = canvasElement.querySelector<HTMLElement>(
+		'[data-dashboard-repository-list="true"]',
+	);
+	if (!list) throw new Error("Expected repository list");
+	const [firstItem, secondItem] = Array.from(
+		list.querySelectorAll<HTMLElement>("[data-dashboard-repository-item]"),
+	).slice(0, 2);
+	if (!firstItem || !secondItem) {
+		throw new Error("Expected two repository items");
+	}
+	await waitFor(() => {
+		const listRect = list.getBoundingClientRect();
+		expect(firstItem.getBoundingClientRect().top).toBeGreaterThanOrEqual(
+			listRect.top - 1,
+		);
+		expect(secondItem.getBoundingClientRect().bottom).toBeLessThanOrEqual(
+			listRect.bottom + 1,
+		);
 	});
 }
 
@@ -230,7 +254,8 @@ async function expectLongRepositoryListGeometry(canvasElement: HTMLElement) {
 	await waitFor(() => {
 		expect(list.scrollHeight).toBeGreaterThan(list.clientHeight);
 	});
-	await expectTwoVisibleRepositoryCards(canvasElement);
+	await expectTwoCardViewportCapacity(canvasElement);
+	await expectTwoFullyVisibleRepositoryCards(canvasElement);
 }
 
 export const ShortFollowing: Story = {
@@ -253,7 +278,7 @@ export const ShortFollowing: Story = {
 			footer.getBoundingClientRect().top - panel.getBoundingClientRect().bottom;
 		expect(gap).toBeGreaterThanOrEqual(14);
 		expect(gap).toBeLessThanOrEqual(18);
-		await expectTwoVisibleRepositoryCards(canvasElement);
+		await expectTwoCardViewportCapacity(canvasElement);
 	},
 };
 
@@ -277,7 +302,7 @@ export const EmptyFollowing: Story = {
 		await expect(
 			canvasElement.querySelectorAll("[data-dashboard-repository-item]"),
 		).toHaveLength(0);
-		await expectTwoVisibleRepositoryCards(canvasElement);
+		await expectTwoCardViewportCapacity(canvasElement);
 	},
 };
 
@@ -318,7 +343,7 @@ export const PersonalRepositories: Story = {
 		await expect(
 			canvasElement.querySelectorAll("[data-dashboard-repository-item]"),
 		).toHaveLength(1);
-		await expectTwoVisibleRepositoryCards(canvasElement);
+		await expectTwoCardViewportCapacity(canvasElement);
 		const panel = canvasElement.querySelector<HTMLElement>(
 			'[data-dashboard-repository-panel="true"]',
 		);

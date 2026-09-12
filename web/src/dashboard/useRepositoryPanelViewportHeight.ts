@@ -62,10 +62,18 @@ export function useRepositoryPanelViewportHeight(options: {
 					)
 				: [];
 			const firstItem = items[0];
+			const secondItem = items[1];
 			const itemHeight =
 				firstItem?.getBoundingClientRect().height ??
 				FALLBACK_REPOSITORY_ITEM_HEIGHT_PX;
-			const twoItemHeight = itemHeight * 2;
+			const listRect = list?.getBoundingClientRect();
+			const minimumListHeight =
+				secondItem && listRect
+					? Math.max(
+							0,
+							secondItem.getBoundingClientRect().bottom - listRect.top,
+						)
+					: itemHeight * 2;
 			const listStyle = list ? getComputedStyle(list) : null;
 			const naturalListHeight =
 				items.reduce(
@@ -74,7 +82,8 @@ export function useRepositoryPanelViewportHeight(options: {
 				) +
 				Number.parseFloat(listStyle?.paddingTop ?? "0") +
 				Number.parseFloat(listStyle?.paddingBottom ?? "0");
-			const shortList = items.length < 2 && naturalListHeight < twoItemHeight;
+			const shortList =
+				items.length < 2 && naturalListHeight < minimumListHeight;
 			const panelChromeHeight = Math.max(
 				0,
 				panel.getBoundingClientRect().height -
@@ -86,12 +95,12 @@ export function useRepositoryPanelViewportHeight(options: {
 			setLayout((current) => {
 				const compactThreshold =
 					panelChromeHeight +
-					twoItemHeight +
+					minimumListHeight +
 					(current.compact ? COMPACT_EXIT_HYSTERESIS_PX : 0);
 				const compact = availableHeight < compactThreshold;
 				if (
 					current.availableHeight === availableHeight &&
-					current.minimumListHeight === twoItemHeight &&
+					current.minimumListHeight === minimumListHeight &&
 					current.shortList === shortList &&
 					current.contentCapped === contentCapped &&
 					current.compact === compact
@@ -100,7 +109,7 @@ export function useRepositoryPanelViewportHeight(options: {
 				}
 				return {
 					availableHeight,
-					minimumListHeight: twoItemHeight,
+					minimumListHeight,
 					shortList,
 					contentCapped,
 					compact,
