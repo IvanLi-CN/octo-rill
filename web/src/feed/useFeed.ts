@@ -234,17 +234,27 @@ export function useFeed(
 		async (options?: {
 			freshKeys?: string[];
 			throwOnError?: boolean;
-			onStart?: () => void;
+			onStart?: (cancel: () => void) => void;
 		}) => {
 			if (!enabled) return;
-			options?.onStart?.();
 			reqIdRef.current += 1;
 			const reqId = reqIdRef.current;
+			const cancelled = Symbol("feed-refresh-cancelled");
+			let cancelRefresh = () => undefined;
+			const cancellation = new Promise<typeof cancelled>((resolve) => {
+				cancelRefresh = () => {
+					if (reqId !== reqIdRef.current) return;
+					reqIdRef.current += 1;
+					resolve(cancelled);
+				};
+			});
+			options?.onStart?.(cancelRefresh);
 
 			// Cancel any in-flight "load more" state; we are replacing the list.
 			setLoadingMore(false);
 			setAppendError(null);
-			const result = await query.refetch();
+			const result = await Promise.race([query.refetch(), cancellation]);
+			if (result === cancelled) return;
 			if (reqId !== reqIdRef.current) return;
 			if (result.error) {
 				if (options?.throwOnError) {
@@ -330,7 +340,7 @@ export function useFeed(
 		async (options?: {
 			freshKeys?: string[];
 			throwOnError?: boolean;
-			onStart?: () => void;
+			onStart?: (cancel: () => void) => void;
 		}) => {
 			await loadInitial(options);
 		},

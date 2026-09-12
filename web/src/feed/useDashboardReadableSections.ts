@@ -176,10 +176,23 @@ export function useDashboardReadableSections(options?: {
 	const loadSections = useCallback(
 		async (
 			preserveContent: boolean,
-			options?: { throwOnError?: boolean; onStart?: () => void },
+			options?: {
+				throwOnError?: boolean;
+				onStart?: (cancel: () => void) => void;
+				onQueue?: (cancel: () => void) => void;
+			},
 		) => {
-			options?.onStart?.();
 			const requestId = ++requestIdRef.current;
+			let cancelled = false;
+			const cancelRefresh = () => {
+				if (cancelled || requestId !== requestIdRef.current) return;
+				cancelled = true;
+				requestIdRef.current += 1;
+				refreshInFlightRef.current = false;
+				setLoadingRefresh(false);
+				setLoadingInitial(false);
+			};
+			options?.onStart?.(cancelRefresh);
 			const isSuperseded = () => requestId !== requestIdRef.current;
 			const rejectIfSuperseded = (): ReadableRefreshResult | null => {
 				if (!isSuperseded()) return null;
@@ -320,7 +333,11 @@ export function useDashboardReadableSections(options?: {
 
 	const loadInitial = useCallback(() => loadSections(false), [loadSections]);
 	const refresh = useCallback(
-		(options?: { throwOnError?: boolean; onStart?: () => void }) => {
+		(options?: {
+			throwOnError?: boolean;
+			onStart?: (cancel: () => void) => void;
+			onQueue?: (cancel: () => void) => void;
+		}) => {
 			const generation = lifecycleGenerationRef.current;
 			const priority = options?.throwOnError
 				? ++refreshPriorityRef.current
@@ -329,12 +346,34 @@ export function useDashboardReadableSections(options?: {
 				const previous =
 					strictRefreshRef.current ??
 					Promise.resolve<ReadableRefreshResult>("applied");
-				const immediate = previous.then(() => {
-					if (generation !== lifecycleGenerationRef.current || !enabled) {
+				let cancelOperation!: () => void;
+				let cancelled = false;
+				const released = new Promise<never>((_, reject) => {
+					cancelOperation = () => {
+						if (cancelled) return;
+						cancelled = true;
+						reject(new Error("刷新已取消"));
+					};
+				});
+				options.onQueue?.(cancelOperation);
+				const operation = previous.then(() => {
+					if (
+						cancelled ||
+						generation !== lifecycleGenerationRef.current ||
+						!enabled
+					) {
 						return Promise.reject(new Error("刷新已取消"));
 					}
-					return loadSections(true, options);
+					return loadSections(true, {
+						...options,
+						onStart: (cancel) =>
+							options?.onStart?.(() => {
+								cancel();
+								cancelOperation();
+							}),
+					});
 				});
+				const immediate = Promise.race([operation, released]);
 				strictRefreshRef.current = immediate.catch(() => "failed");
 				refreshQueueRef.current = strictRefreshRef.current;
 				return immediate;
