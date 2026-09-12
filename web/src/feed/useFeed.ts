@@ -182,10 +182,12 @@ export function useFeed(
 	const query = useQuery<DashboardFeedQueryData>({
 		queryKey,
 		enabled,
-		queryFn: async () => {
+		queryFn: async ({ signal }) => {
 			const current =
 				queryClient.getQueryData<DashboardFeedQueryData>(queryKey);
-			const res = await apiGet<FeedResponse>(buildFeedUrl(30, type, scope));
+			const res = await apiGet<FeedResponse>(buildFeedUrl(30, type, scope), {
+				signal,
+			});
 			return {
 				type,
 				scopeSignature,
@@ -245,6 +247,7 @@ export function useFeed(
 				cancelRefresh = () => {
 					if (reqId !== reqIdRef.current) return;
 					reqIdRef.current += 1;
+					void queryClient.cancelQueries({ queryKey, exact: true });
 					resolve(cancelled);
 				};
 			});
@@ -266,7 +269,7 @@ export function useFeed(
 				setFreshKeys(new Set(options?.freshKeys ?? []));
 			}
 		},
-		[enabled, query.refetch],
+		[enabled, query.refetch, queryClient, queryKey],
 	);
 
 	const loadMore = useCallback(async () => {
@@ -284,9 +287,10 @@ export function useFeed(
 			});
 			const page = await queryClient.fetchQuery<DashboardFeedQueryData>({
 				queryKey: pageQueryKey,
-				queryFn: async () => {
+				queryFn: async ({ signal }) => {
 					const res = await apiGet<FeedResponse>(
 						buildFeedUrl(30, type, scope, currentNextCursor),
+						{ signal },
 					);
 					return {
 						type,
