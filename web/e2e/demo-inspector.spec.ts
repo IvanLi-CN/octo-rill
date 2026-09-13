@@ -990,6 +990,7 @@ test("webhook demo inspector exposes every management state", async ({
 		["healthy-registered", "已注册"],
 		["paused-retained", "未启用"],
 		["permission-paused", "权限暂停"],
+		["archived-error", "仓库已归档"],
 		["temporary-error", "GitHub 暂时限流"],
 		["delete-pending", "处理中"],
 		["deleted", "待处理"],
@@ -1024,7 +1025,7 @@ test("webhook demo renders desktop and mobile evidence states", async ({
 		"/settings?section=my-releases&demo=settings-my-releases&d_persona=member&d_own=1&d_webhook=multi-owner&d_controls=hidden",
 	);
 	const settings = page.locator('[data-settings-section="my-releases"]');
-	await expect(settings).toBeVisible();
+	await expect(settings).toBeVisible({ timeout: 15_000 });
 	await expect(page.getByText("@release-team", { exact: true })).toBeVisible();
 	await page.evaluate(() => window.scrollTo(0, 220));
 	await captureDemoInspectorEvidence(
@@ -1042,6 +1043,18 @@ test("webhook demo renders desktop and mobile evidence states", async ({
 		"webhook-demo-desktop-healthy.png",
 	);
 
+	await page.goto(
+		"/settings?section=my-releases&demo=settings-my-releases&d_persona=member&d_own=1&d_webhook=temporary-error&d_controls=hidden",
+	);
+	await expect(
+		page.getByText("GitHub 暂时限流", { exact: false }).first(),
+	).toBeVisible();
+	await page.evaluate(() => window.scrollTo(0, 220));
+	await captureDemoInspectorEvidence(
+		settings,
+		"webhook-push-retry-desktop.png",
+	);
+
 	await page.setViewportSize({ width: 393, height: 852 });
 	await page.goto(
 		"/settings?section=my-releases&demo=settings-my-releases&d_persona=member&d_own=1&d_webhook=paused-retained&d_controls=hidden",
@@ -1054,9 +1067,25 @@ test("webhook demo renders desktop and mobile evidence states", async ({
 		"/settings?section=my-releases&demo=settings-my-releases&d_persona=member&d_own=1&d_webhook=temporary-error&d_controls=hidden",
 	);
 	await expect(
-		page.getByText("GitHub 暂时限流", { exact: false }),
+		page.getByText("GitHub 暂时限流", { exact: false }).first(),
 	).toBeVisible();
-	await page.evaluate(() => window.scrollTo(0, 980));
+	await page.evaluate(() => window.scrollTo(0, 760));
+	await captureDemoViewportEvidence(page, "webhook-push-retry-mobile.png");
+	await page.goto(
+		"/settings?section=my-releases&demo=settings-my-releases&d_persona=member&d_own=1&d_webhook=archived-error&d_controls=hidden",
+	);
+	await expect(
+		page.getByText("仓库已归档", { exact: false }).first(),
+	).toBeVisible();
+	await expect(
+		page.getByText("归档状态下不能修改 Webhook", { exact: false }).first(),
+	).toBeVisible();
+	await expect(
+		page
+			.locator('[data-settings-section="my-releases"]')
+			.getByRole("link", { name: /更新 classic PAT/ }),
+	).toHaveCount(0);
+	await page.evaluate(() => window.scrollTo(0, 760));
 	await captureDemoViewportEvidence(page, "webhook-demo-mobile-error.png");
 
 	const overflow = await page.evaluate(

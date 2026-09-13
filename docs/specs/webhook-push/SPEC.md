@@ -15,18 +15,20 @@
 - `REQ-WP-001`: 系统 MUST 将用户意图持久化为 `enabled`、`paused` 或 `deleted`，并且运行时观察结果不得反向改写该意图。
 - `REQ-WP-002`: 所有 GitHub Hook 的创建、激活、暂停、删除和检查 MUST 由可恢复的后台对齐任务异步执行，HTTP mutation 不得直接调用 GitHub。
 - `REQ-WP-003`: 目标为 `paused` 或 `deleted` 时，系统 MUST 在任何远端调用前关闭本地接收门禁；远端失败不得改变持久化目标。
-- `REQ-WP-004`: 每名用户 MUST 同时最多存在一项未终态的管理或 audit 操作；暂时失败 MUST 按 `1/5/15` 分钟退避并尊重更晚的 `Retry-After`。
+- `REQ-WP-004`: 每名用户 MUST 同时最多存在一项未终态的 manage 操作；全局 audit 只能投递每用户 manage 任务，暂时失败 MUST 按 `1/5/15` 分钟退避并尊重更晚的 `Retry-After`。
 - `REQ-WP-005`: worker 仅可变更已验证为 OctoRill 管理、Hook ID、callback URL、`release` event 和仓库身份均匹配的 GitHub Hook。
 - `REQ-WP-006`: 用户 API MUST 暴露目标状态、当前 operation、最近完成检查时间、Owner 分组和派生仓库状态，并移除旧的扁平管理路由合同。
 - `REQ-WP-007`: 设置页 MUST 按 Owner 分组仓库，并区分健康目标状态、等待/执行进度和仓库错误；删除选择不得要求第二次确认。
-- `REQ-WP-008`: 启用目标 MUST 显示本用户最近一次全量检查完成时间；定时 audit 只在没有人工任务时对齐启用目标，人工重试不得与上一轮重叠。
+- `REQ-WP-008`: 启用目标 MUST 显示本用户最近一次全量检查完成时间；定时 audit 只在没有人工任务时投递对齐任务，人工重试不得与上一轮重叠。
+- `REQ-WP-009`: API MUST 暴露待处理数量与最新终态失败；新的 queued/running 或成功任务出现后 MUST 隐藏旧失败。
+- `REQ-WP-010`: GitHub 明确报告仓库已归档或只读时，系统 MUST 将仓库标记为 `archived` 终态错误，不得提示用户修改 PAT 或自动修改 Hook。
 
 ### Goals
 
 - 在“我的发布”中提供默认未启用的“Webhook 推送”目标状态。
 - 提供统一的“立即检查并修复”入口，以及逐仓修复入口；Hook 的注册、暂停、恢复和删除全部由异步对齐任务执行。
 - 开启后立即注册，并由管理员配置的后台定时巡查查漏补缺；默认周期 7 天。
-- 权限错误按仓库暂停自动巡查，直到人工注册成功。
+- 权限错误按仓库暂停自动巡查，直到人工注册成功；归档仓库作为不可修复的终态观察错误保留。
 - 验证 GitHub HMAC 签名并幂等接收新发布 Release 事件，再复用共享 Release 同步队列。
 
 ## Non-goals
@@ -77,7 +79,8 @@
 - 管理员配置 `webhook_push_audit_interval_days`，合法范围 `1..=30`，默认 `7`。
 - 定时巡查处理启用目标用户，并恢复处理暂停或删除目标中仍保留远端 Hook 的用户。
 - 每轮刷新 PAT owner 的个人仓库基线，按持久目标检查并修复缺失、未激活或应暂停/删除的 hooks。
-- `permission_paused` 仓库必须跳过；401、403、仍存在基线时的 404，以及 GitHub 明确返回的权限错误进入该状态。
+- 每名用户只投递一个带 `scheduled=true` 的 manage 任务；已有 queued/running manage 时复用该任务，不在 audit 任务内执行 GitHub 请求。
+- `permission_paused` 仓库必须跳过；401、403、仍存在基线时的 404，以及 GitHub 明确返回的权限错误进入该状态。归档或只读错误进入 `archived`，不进入 `permission_paused`。
 - 网络、限流和 GitHub 5xx 为暂时错误，不进入权限暂停。
 
 ### Webhook 接收
@@ -91,12 +94,14 @@
 ## UI Contract
 
 - “Webhook 推送”位于 `/settings?section=my-releases` 现有卡片内，使用独立 Switch。
-- 卡片必须展示启用状态、PAT owner、已注册/缺失/权限暂停/可删除数量、最近与下次定时巡查。
+- 卡片必须展示启用状态、PAT owner、已注册/缺失/权限暂停/可删除/待处理数量、最近与下次定时巡查。
+- 卡片必须展示最新终态失败的简短原因、重试次数和可行动的“立即检查并修复”；归档仓库只显示归档原因，不提供 PAT 修复指引。
 - 固定全量按钮名称：`立即检查并修复`。
 - 仓库行提供逐仓 `重试`；页面不得出现“注册 Webhook”“删除 Webhook”或可点击的“巡查”。
 - 页面按 Owner 分组显示仓库，行内不重复显示 Owner。
 - 启用目标显示本用户最近完成检查时间；首次显示“尚未检查”。
 - 权限错误必须给出 repo、失败原因与 classic PAT 修复指引；无 PAT 时链接到同一设置页的 GitHub PAT section。
+- 仓库归档错误必须显示 `仓库已归档`，不得显示“权限暂停”或 PAT 修复链接。
 
 ## Verification
 
@@ -121,6 +126,10 @@
 
 ![Web Demo 桌面健康已注册状态](./assets/webhook-demo-desktop-healthy.png)
 
+![Web Demo 桌面暂时错误与可行动修复](./assets/webhook-push-retry-desktop.png)
+
 ![Web Demo 移动端暂停保留 Hook 与折叠 Owner 分组](./assets/webhook-demo-mobile-paused.png)
+
+![Web Demo 移动端暂时错误与可行动修复](./assets/webhook-push-retry-mobile.png)
 
 ![Web Demo 移动端暂时错误与逐仓重试](./assets/webhook-demo-mobile-error.png)

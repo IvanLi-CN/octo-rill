@@ -357,13 +357,10 @@ async function installSettingsMocks(
 			const payload = req.postDataJSON() as
 				| {
 						include_own_releases?: boolean;
-						webhook_push_desired_state?: "enabled" | "paused" | "deleted";
 				  }
 				| undefined;
 			includeOwnReleases = payload?.include_own_releases ?? includeOwnReleases;
-			if (payload?.webhook_push_desired_state) {
-				webhookPushDesiredState = payload.webhook_push_desired_state;
-			} else if (!includeOwnReleases && webhookPushDesiredState === "enabled") {
+			if (!includeOwnReleases && webhookPushDesiredState === "enabled") {
 				webhookPushDesiredState = "paused";
 			}
 			return json(route, {
@@ -376,6 +373,12 @@ async function installSettingsMocks(
 		}
 
 		if (req.method() === "GET" && pathname === "/api/me/webhook-push") {
+			const webhookRepoStatus =
+				webhookPushDesiredState === "enabled"
+					? "waiting_registration"
+					: webhookPushDesiredState === "paused"
+						? "registered"
+						: "not_configured";
 			const repo = {
 				repo_id: 1001,
 				owner_login: "storybook-user",
@@ -383,10 +386,7 @@ async function installSettingsMocks(
 				repo_full_name: "storybook-user/octo-rill",
 				is_private: false,
 				hook_id: webhookPushDesiredState === "deleted" ? null : 801,
-				status:
-					webhookPushDesiredState === "enabled"
-						? "waiting_registration"
-						: "registered",
+				status: webhookRepoStatus,
 				error_kind: null,
 				error_message: null,
 				permission_paused: false,
@@ -405,11 +405,12 @@ async function installSettingsMocks(
 				},
 				summary: {
 					total: 1,
-					registered: 0,
+					registered: webhookPushDesiredState === "paused" ? 1 : 0,
 					missing: 0,
 					permission_paused: 0,
 					errors: 0,
-					removable: 0,
+					removable: webhookPushDesiredState === "deleted" ? 0 : 1,
+					pending: webhookPushDesiredState === "enabled" ? 1 : 0,
 				},
 				schedule: {
 					audit_interval_days: 7,
@@ -417,16 +418,16 @@ async function installSettingsMocks(
 					next_started_at: null,
 				},
 				operation: null,
+				last_operation_failure: null,
 				last_completed_check_at: null,
 				owner_groups: [
 					{
 						owner_login: "storybook-user",
 						repo_count: 1,
-						pending_count: 1,
+						pending_count: webhookPushDesiredState === "enabled" ? 1 : 0,
 						repos: [repo],
 					},
 				],
-				repos: [repo],
 			});
 		}
 

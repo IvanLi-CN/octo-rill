@@ -1469,28 +1469,69 @@ pub async fn reschedule_task(
     available_at: DateTime<Utc>,
     result: Value,
 ) -> Result<bool> {
+    reschedule_task_inner(state, task_id, available_at, None, result).await
+}
+
+pub async fn reschedule_task_with_retry_count(
+    state: &AppState,
+    task_id: &str,
+    available_at: DateTime<Utc>,
+    retry_count: u8,
+    result: Value,
+) -> Result<bool> {
+    reschedule_task_inner(state, task_id, available_at, Some(retry_count), result).await
+}
+
+async fn reschedule_task_inner(
+    state: &AppState,
+    task_id: &str,
+    available_at: DateTime<Utc>,
+    retry_count: Option<u8>,
+    result: Value,
+) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     let available_at = available_at.to_rfc3339();
     let updated = state
         .sqlite_writer
         .write_foreground("job_task_reschedule", |_| async {
-            sqlx::query(
-                r#"
-                UPDATE job_tasks
-                SET status = ?, available_at = ?, started_at = NULL,
-                    runtime_owner_id = NULL, lease_heartbeat_at = NULL,
-                    cancel_requested = 0, updated_at = ?
-                WHERE id = ? AND status = ?
-                "#,
-            )
-            .bind(STATUS_QUEUED)
-            .bind(&available_at)
-            .bind(&now)
-            .bind(task_id)
-            .bind(STATUS_RUNNING)
-            .execute(&state.pool)
-            .await
-            .context("failed to reschedule task")
+            if let Some(retry_count) = retry_count {
+                sqlx::query(
+                    r#"
+                    UPDATE job_tasks
+                    SET status = ?, available_at = ?, payload_json = json_set(payload_json, '$.retry_count', ?),
+                        started_at = NULL, runtime_owner_id = NULL, lease_heartbeat_at = NULL,
+                        cancel_requested = 0, updated_at = ?
+                    WHERE id = ? AND status = ?
+                    "#,
+                )
+                .bind(STATUS_QUEUED)
+                .bind(&available_at)
+                .bind(i64::from(retry_count))
+                .bind(&now)
+                .bind(task_id)
+                .bind(STATUS_RUNNING)
+                .execute(&state.pool)
+                .await
+                .context("failed to reschedule task")
+            } else {
+                sqlx::query(
+                    r#"
+                    UPDATE job_tasks
+                    SET status = ?, available_at = ?, started_at = NULL,
+                        runtime_owner_id = NULL, lease_heartbeat_at = NULL,
+                        cancel_requested = 0, updated_at = ?
+                    WHERE id = ? AND status = ?
+                    "#,
+                )
+                .bind(STATUS_QUEUED)
+                .bind(&available_at)
+                .bind(&now)
+                .bind(task_id)
+                .bind(STATUS_RUNNING)
+                .execute(&state.pool)
+                .await
+                .context("failed to reschedule task")
+            }
         })
         .await?;
     if updated.rows_affected() == 0 {
