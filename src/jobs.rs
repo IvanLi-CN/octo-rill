@@ -4443,6 +4443,11 @@ async fn recover_task_if_stale(
     state
         .sqlite_writer
         .write("job_task_recover", |_| async {
+            let mut tx = state
+                .pool
+                .begin()
+                .await
+                .context("failed to begin stale task recovery transaction")?;
             let updated = match mode {
                 runtime::RuntimeRecoveryMode::Startup => sqlx::query(
                     r#"
@@ -4484,7 +4489,7 @@ async fn recover_task_if_stale(
                 .bind(cutoff)
                 .bind(state.runtime_owner_id.as_str())
                 .bind(cutoff)
-                .execute(&state.pool)
+                .execute(&mut *tx)
                 .await
                 .context("failed to recover stale startup task")?,
                 runtime::RuntimeRecoveryMode::Sweep => sqlx::query(
@@ -4516,11 +4521,22 @@ async fn recover_task_if_stale(
                 .bind(previous_runtime_owner_id)
                 .bind(previous_lease_heartbeat_at)
                 .bind(cutoff)
-                .execute(&state.pool)
+                .execute(&mut *tx)
                 .await
                 .context("failed to recover stale task")?,
             };
-            Ok(updated.rows_affected() > 0)
+            let recovered = updated.rows_affected() > 0;
+            if recovered {
+                sqlx::query("DELETE FROM webhook_push_user_operation_leases WHERE task_id = ?")
+                    .bind(task_id)
+                    .execute(&mut *tx)
+                    .await
+                    .context("failed to release stale webhook operation lease")?;
+            }
+            tx.commit()
+                .await
+                .context("failed to commit stale task recovery transaction")?;
+            Ok(recovered)
         })
         .await
 }
@@ -5906,6 +5922,16 @@ mod tests {
         .execute(&pool)
         .await
         .expect("mark task stale");
+        seed_user(&pool, 90_999, "stale-user").await;
+        sqlx::query(
+            "INSERT INTO webhook_push_user_operation_leases (user_id, task_id, expires_at) VALUES (?, ?, ?)",
+        )
+        .bind("90999")
+        .bind("stale-task")
+        .bind("2026-03-06T00:10:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed stale webhook lease");
 
         recover_runtime_state(state.as_ref())
             .await
@@ -5930,6 +5956,14 @@ mod tests {
         );
         assert_eq!(row.get::<Option<String>, _>("runtime_owner_id"), None);
         assert_eq!(row.get::<Option<String>, _>("lease_heartbeat_at"), None);
+        let lease_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM webhook_push_user_operation_leases WHERE task_id = ?",
+        )
+        .bind("stale-task")
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered webhook lease");
+        assert_eq!(lease_count, 0);
 
         let event_type = sqlx::query_scalar::<_, String>(
             r#"

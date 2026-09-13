@@ -8,4 +8,4 @@ The scheduled audit is a dispatcher, not a second remote worker. It records the 
 
 All webhook worker persistence goes through `SqliteWriteCoordinator` for short local write sections. A busy error that survives coordinator retries is rescheduled with the existing task `available_at` and `retry_count` backoff, so a transient SQLite outage cannot replace the user's desired state with an observation failure.
 
-An archived or read-only GitHub repository is represented as an `archived` observation error. It is not a PAT permission failure: the UI explains that GitHub disallows Hook changes for the archived repository and does not direct the user to change credentials.
+An archived or read-only GitHub repository is represented as an `archived` observation error. It is not a PAT permission failure: the UI explains that GitHub disallows Hook changes for the archived repository and does not direct the user to change credentials. Because the deployed `0066` SQLite CHECK predates this observation label, the row persists with `status='error'` and `error_kind='archived'`; the API derives `status='archived'` for clients.
