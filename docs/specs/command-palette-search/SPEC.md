@@ -146,7 +146,11 @@ None
 
 ## Visual Evidence
 
-- None
+- Desktop command palette with search results and quota status:
+  `./assets/command-palette-desktop.png`
+- Responsive 393x852 command palette state:
+  `./assets/command-palette-mobile393.png`
+- Both assets are mock-only Web Demo captures covering the search and command-panel surface; the owner confirmed the rendered states in Chrome.
 
 ## References
 
