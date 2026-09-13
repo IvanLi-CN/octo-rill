@@ -80,6 +80,8 @@ Dashboard 采用主列 + 侧栏结构，核心标签为：
 - `日报`（canonical path：`/briefs`）
 - `收件箱`（canonical path：`/inbox`）
 
+桌面端 `全部` 页的右栏展示关注仓库；`/focus/following` 和 `/focus/mine` 的仓库列表沿用相同的视口边界规则。列表短于两张仓库项目卡时，面板填充到固定页脚上方 `16px`；较长列表在面板内滚动。移动端继续使用正文流。
+
 右侧侧栏长期承担 Inbox 快捷入口；在 `日报` 标签下还同时承担日报列表。Release 详情的 canonical deep link 采用 `/<owner>/<repo>/releases/tag/<tag>?from=<tab>`，其中 `from` 只表达返回上下文，默认 `briefs`。登录态 announcement 详情的 canonical deep link 采用 `/<owner>/<repo>/discussions/<number>?from=<tab>`；命中后仍留在 Dashboard 壳层内阅读，不提供独立 public announcement page。
 
 ### Focus pages
