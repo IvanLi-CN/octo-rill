@@ -24,7 +24,6 @@ export default defineConfig((env) =>
 									"repo-identity-overflow",
 									"content-projection-retention",
 									"admin-collection-read-budget",
-									"dashboard-repository-sidebar-viewport",
 								],
 								exclude: [],
 								skip: [],
