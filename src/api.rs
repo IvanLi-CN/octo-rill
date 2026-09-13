@@ -29,6 +29,7 @@ use crate::release_links::{
 };
 use crate::{
     admin_runtime, ai, api_keys, briefs, content_processing, jobs, local_id, sync, translations,
+    webhook_push,
 };
 use crate::{
     error::ApiError,
@@ -1142,6 +1143,8 @@ pub struct DailyBriefProfilePatchRequest {
     daily_brief_time_zone: String,
     #[serde(default)]
     include_own_releases: Option<bool>,
+    #[serde(default)]
+    webhook_push_desired_state: Option<String>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -1285,6 +1288,8 @@ async fn persist_daily_brief_profile(
     user_id: &str,
     req: DailyBriefProfilePatchRequest,
 ) -> Result<DailyBriefProfileResponse, ApiError> {
+    let operation_lock = webhook_push::user_operation_lock(user_id);
+    let _operation_guard = operation_lock.lock().await;
     let time_zone = briefs::parse_daily_brief_time_zone(&req.daily_brief_time_zone)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     briefs::validate_hour_aligned_time_zone(&time_zone, chrono::Utc::now())
@@ -1312,21 +1317,62 @@ async fn persist_daily_brief_profile(
         )));
     }
 
+    let current_webhook = sqlx::query_as::<_, (i64, String)>(
+        "SELECT include_own_releases, webhook_push_desired_state FROM users WHERE id = ?",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "user not found"))?;
+    let next_include_own_releases = req
+        .include_own_releases
+        .map(i64::from)
+        .unwrap_or(current_webhook.0)
+        != 0;
+    let next_desired_state = req
+        .webhook_push_desired_state
+        .clone()
+        .or_else(|| {
+            (req.include_own_releases == Some(false) && current_webhook.1 == "enabled")
+                .then(|| "paused".to_owned())
+        })
+        .unwrap_or_else(|| current_webhook.1.clone());
+    if !matches!(
+        next_desired_state.as_str(),
+        "enabled" | "paused" | "deleted"
+    ) {
+        return Err(ApiError::bad_request(
+            "webhook_push_desired_state must be enabled, paused, or deleted",
+        ));
+    }
+    if !next_include_own_releases && next_desired_state == "enabled" {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "my_releases_required",
+            "关闭“我的发布”时不能保持启用 Webhook 推送。",
+        ));
+    }
+    let webhook_state_changed = next_desired_state != current_webhook.1;
+    if webhook_state_changed {
+        webhook_push::ensure_no_inflight_operation(state, user_id).await?;
+    }
+
     let now = chrono::Utc::now().to_rfc3339();
     state
         .sqlite_writer
         .write_foreground("daily_brief_profile_update", |_| async {
-            sqlx::query(
+            let updated = sqlx::query(
                 r#"
                 UPDATE users
                 SET daily_brief_time_zone = ?,
                     include_own_releases = COALESCE(?, include_own_releases),
-                    webhook_push_enabled = CASE
-                      WHEN ? = 0 THEN 0
-                      ELSE webhook_push_enabled
-                    END,
+                    webhook_push_desired_state = ?,
+                    webhook_push_enabled = ?,
                     updated_at = ?
                 WHERE id = ?
+                  AND include_own_releases = ?
+                  AND webhook_push_desired_state = ?
                 "#,
             )
             .bind(time_zone.as_str())
@@ -1334,18 +1380,85 @@ async fn persist_daily_brief_profile(
                 req.include_own_releases
                     .map(|value| if value { 1_i64 } else { 0_i64 }),
             )
-            .bind(
-                req.include_own_releases
-                    .map(|value| if value { 1_i64 } else { 0_i64 }),
-            )
+            .bind(&next_desired_state)
+            .bind(i64::from(
+                next_include_own_releases && next_desired_state == "enabled",
+            ))
             .bind(now.as_str())
             .bind(user_id)
+            .bind(current_webhook.0)
+            .bind(&current_webhook.1)
             .execute(&state.pool)
             .await?;
-            Ok::<(), anyhow::Error>(())
+            Ok::<u64, anyhow::Error>(updated.rows_affected())
         })
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(ApiError::internal)
+        .and_then(|rows| {
+            if rows == 0 {
+                Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "webhook_push_operation_in_progress",
+                    "用户设置刚刚发生变化，请刷新后重试。",
+                ))
+            } else {
+                Ok(())
+            }
+        })?;
+
+    if webhook_state_changed
+        && let Err(error) =
+            webhook_push::enqueue_reconcile_for_user(state, user_id, "profile").await
+    {
+        let rollback_now = chrono::Utc::now().to_rfc3339();
+        let rollback = state
+            .sqlite_writer
+            .write_foreground("daily_brief_profile_webhook_rollback", |_| async {
+                sqlx::query(
+                    r#"
+                    UPDATE users
+                    SET include_own_releases = ?,
+                        webhook_push_desired_state = ?,
+                        webhook_push_enabled = ?,
+                        updated_at = ?
+                        WHERE id = ?
+                          AND include_own_releases = ?
+                          AND webhook_push_desired_state = ?
+                          AND NOT EXISTS (
+                            SELECT 1 FROM job_tasks
+                            WHERE task_type = ?
+                              AND requested_by = ?
+                              AND status IN (?, ?)
+                          )
+                        "#,
+                )
+                .bind(current_webhook.0)
+                .bind(&current_webhook.1)
+                .bind(i64::from(
+                    current_webhook.0 != 0 && current_webhook.1 == "enabled",
+                ))
+                .bind(&rollback_now)
+                .bind(user_id)
+                .bind(i64::from(next_include_own_releases))
+                .bind(&next_desired_state)
+                .bind(jobs::TASK_WEBHOOK_PUSH_MANAGE)
+                .bind(user_id)
+                .bind(jobs::STATUS_QUEUED)
+                .bind(jobs::STATUS_RUNNING)
+                .execute(&state.pool)
+                .await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await;
+        if let Err(rollback_error) = rollback {
+            tracing::error!(
+                user_id,
+                ?rollback_error,
+                "failed to roll back profile webhook state after enqueue failure"
+            );
+        }
+        return Err(error);
+    }
 
     load_daily_brief_profile(state, user_id).await
 }
@@ -38370,6 +38483,7 @@ echo should_not_be_in_excerpt
             super::DailyBriefProfilePatchRequest {
                 daily_brief_time_zone: "America/New_York".to_owned(),
                 include_own_releases: None,
+                webhook_push_desired_state: None,
             },
         )
         .await
@@ -38390,6 +38504,7 @@ echo should_not_be_in_excerpt
             super::DailyBriefProfilePatchRequest {
                 daily_brief_time_zone: "America/New_York".to_owned(),
                 include_own_releases: None,
+                webhook_push_desired_state: None,
             },
         )
         .await
@@ -38841,6 +38956,7 @@ echo should_not_be_in_excerpt
             super::DailyBriefProfilePatchRequest {
                 daily_brief_time_zone: "Asia/Shanghai".to_owned(),
                 include_own_releases: Some(true),
+                webhook_push_desired_state: None,
             },
         )
         .await
@@ -38875,6 +38991,7 @@ echo should_not_be_in_excerpt
             super::DailyBriefProfilePatchRequest {
                 daily_brief_time_zone: "Asia/Tokyo".to_owned(),
                 include_own_releases: None,
+                webhook_push_desired_state: None,
             },
         )
         .await
