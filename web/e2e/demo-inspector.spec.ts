@@ -46,6 +46,15 @@ async function captureDemoInspectorEvidence(target: Locator, filename: string) {
 	});
 }
 
+async function captureDemoViewportEvidence(page: Page, filename: string) {
+	if (!DEMO_INSPECTOR_EVIDENCE_DIR) return;
+	mkdirSync(DEMO_INSPECTOR_EVIDENCE_DIR, { recursive: true });
+	await page.screenshot({
+		path: resolve(DEMO_INSPECTOR_EVIDENCE_DIR, filename),
+		animations: "disabled",
+	});
+}
+
 test("demo auth affordances stay inside mock runtime", async ({ page }) => {
 	await page.goto("/?demo=landing-welcome");
 
@@ -962,6 +971,98 @@ test("settings scene share url preserves existing route query", async ({
 	await expect(shareInput).not.toHaveValue(
 		/settings\?section=my-releases\?demo=/,
 	);
+});
+
+test("webhook demo inspector exposes every management state", async ({
+	page,
+}) => {
+	await page.goto(
+		"/settings?section=my-releases&demo=settings-my-releases&d_persona=member",
+	);
+
+	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
+	const scenario = inspector.getByLabel("Webhook scenario");
+	await expect(scenario).toBeVisible();
+
+	const cases = [
+		["waiting-registration", "等待注册"],
+		["registering", "注册中"],
+		["healthy-registered", "已注册"],
+		["paused-retained", "未启用"],
+		["permission-paused", "权限暂停"],
+		["temporary-error", "GitHub 暂时限流"],
+		["delete-pending", "处理中"],
+		["deleted", "待处理"],
+		["multi-owner", "@release-team"],
+	] as const;
+
+	for (const [value, visibleText] of cases) {
+		await scenario.selectOption(value);
+		await expect(scenario).toHaveValue(value);
+		await expect(
+			page.getByText(visibleText, { exact: false }).first(),
+		).toBeVisible();
+		await expect(page).toHaveURL(/demo=settings-my-releases/);
+		if (value === "deleted") {
+			await expect(
+				inspector.getByLabel("Include My Releases"),
+			).not.toBeChecked();
+		}
+	}
+
+	await expect(page).toHaveURL(/d_webhook=multi-owner/);
+	await expect(
+		page.getByText("@octo-demo-owner", { exact: true }),
+	).toBeVisible();
+});
+
+test("webhook demo renders desktop and mobile evidence states", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 1000 });
+	await page.goto(
+		"/settings?section=my-releases&demo=settings-my-releases&d_persona=member&d_own=1&d_webhook=multi-owner&d_controls=hidden",
+	);
+	const settings = page.locator('[data-settings-section="my-releases"]');
+	await expect(settings).toBeVisible();
+	await expect(page.getByText("@release-team", { exact: true })).toBeVisible();
+	await page.evaluate(() => window.scrollTo(0, 220));
+	await captureDemoInspectorEvidence(
+		settings,
+		"webhook-demo-desktop-multi-owner.png",
+	);
+
+	await page.goto(
+		"/settings?section=my-releases&demo=settings-my-releases&d_persona=member&d_own=1&d_webhook=healthy-registered&d_controls=hidden",
+	);
+	await expect(page.getByText("已启用", { exact: true })).toBeVisible();
+	await page.evaluate(() => window.scrollTo(0, 220));
+	await captureDemoInspectorEvidence(
+		settings,
+		"webhook-demo-desktop-healthy.png",
+	);
+
+	await page.setViewportSize({ width: 393, height: 852 });
+	await page.goto(
+		"/settings?section=my-releases&demo=settings-my-releases&d_persona=member&d_own=1&d_webhook=paused-retained&d_controls=hidden",
+	);
+	await expect(page.getByText("未启用", { exact: true }).first()).toBeVisible();
+	await page.evaluate(() => window.scrollTo(0, 1150));
+	await captureDemoViewportEvidence(page, "webhook-demo-mobile-paused.png");
+
+	await page.goto(
+		"/settings?section=my-releases&demo=settings-my-releases&d_persona=member&d_own=1&d_webhook=temporary-error&d_controls=hidden",
+	);
+	await expect(
+		page.getByText("GitHub 暂时限流", { exact: false }),
+	).toBeVisible();
+	await page.evaluate(() => window.scrollTo(0, 980));
+	await captureDemoViewportEvidence(page, "webhook-demo-mobile-error.png");
+
+	const overflow = await page.evaluate(
+		() => document.documentElement.scrollWidth <= window.innerWidth,
+	);
+	expect(overflow).toBe(true);
 });
 
 test("demo inspector share url follows in-scene route changes", async ({

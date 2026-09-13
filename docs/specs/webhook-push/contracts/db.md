@@ -3,6 +3,8 @@
 ## `users`
 
 - `webhook_push_enabled INTEGER NOT NULL DEFAULT 0`
+- `webhook_push_desired_state TEXT NOT NULL DEFAULT 'deleted' CHECK (webhook_push_desired_state IN ('enabled', 'paused', 'deleted'))`
+- `webhook_push_last_completed_check_at TEXT`
 - `webhook_push_secret_ciphertext BLOB`
 - `webhook_push_secret_nonce BLOB`
 - `webhook_push_callback_key TEXT UNIQUE`
@@ -16,6 +18,12 @@
 - 错误：`error_kind`, `error_message`, `permission_paused`
 - 时间：`last_checked_at`, `last_registered_at`, `updated_at`
 - `status`: `unknown|missing|registered|conflict|permission_paused|error|delete_pending`
+
+Rows are observations of a repository Hook. A missing row for an enabled target is derived as `waiting_registration`, not `unknown` or `missing`.
+
+## `job_tasks`
+
+- `available_at TEXT`: nullable UTC time used by durable delayed retries; queued tasks are claimable only when this is null or due.
 
 ## `webhook_push_deliveries`
 

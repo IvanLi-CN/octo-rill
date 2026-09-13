@@ -207,20 +207,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/me/webhook-push",
             get(webhook_push::get_settings).patch(webhook_push::patch_settings),
         )
-        .route(
-            "/me/webhook-push/register",
-            post(webhook_push::register_all),
-        )
-        .route("/me/webhook-push/check", post(webhook_push::check_all))
-        .route("/me/webhook-push/hooks", delete(webhook_push::delete_all))
-        .route(
-            "/me/webhook-push/repos/{repo_id}/register",
-            post(webhook_push::register_repo),
-        )
-        .route(
-            "/me/webhook-push/repos/{repo_id}/check",
-            post(webhook_push::check_repo),
-        )
+        .route("/me/webhook-push/reconcile", post(webhook_push::reconcile))
         .route(
             "/me/api-keys",
             get(api::me_get_api_keys).post(api::me_create_api_key),

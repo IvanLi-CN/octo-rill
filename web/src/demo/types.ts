@@ -16,6 +16,7 @@ import type {
 	AdminTranslationStatusResponse,
 	AdminUserProfileResponse,
 	AdminWebhookPushRuntimeConfigResponse,
+	WebhookPushSettingsResponse,
 	AdminRepoGovernanceOverviewResponse,
 	AdminRepoGovernanceListResponse,
 	AnnouncementDetailResponse,
@@ -60,6 +61,17 @@ export type DemoPersonaId = "guest" | "member" | "admin";
 export type DemoNetworkMode = "normal" | "slow" | "faulty" | "readable-loading";
 
 export type DemoPublicationState = "published" | "unpublished";
+
+export type DemoWebhookScenario =
+	| "waiting-registration"
+	| "registering"
+	| "healthy-registered"
+	| "paused-retained"
+	| "permission-paused"
+	| "temporary-error"
+	| "delete-pending"
+	| "deleted"
+	| "multi-owner";
 
 export type DemoLandingCase =
 	| "default"
@@ -133,6 +145,7 @@ export type DemoModel = {
 	passkeys: PasskeySummary[];
 	apiKeys: ApiKeySummary[];
 	reactionToken: ReactionTokenStatusResponse;
+	webhookPush: WebhookPushSettingsResponse;
 	followingRepos: FollowingReposResponse;
 	personalRepos: PersonalReposResponse;
 	feed: FeedResponse;
@@ -168,6 +181,7 @@ export type DemoShareState = {
 	personaId: DemoPersonaId;
 	networkMode: DemoNetworkMode;
 	includeOwnReleases: boolean;
+	webhookScenario: DemoWebhookScenario;
 	publicationState: DemoPublicationState;
 	landingCase: DemoLandingCase;
 	landingAuthAction: DemoLandingAuthAction;

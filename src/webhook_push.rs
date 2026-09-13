@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use axum::{
     Json,
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -29,18 +29,22 @@ use crate::{
 
 const OP_REGISTER: &str = "register";
 const OP_CHECK: &str = "check";
+const OP_PAUSE: &str = "pause";
 const OP_DELETE: &str = "delete";
+const OP_RECONCILE: &str = "reconcile";
+const DESIRED_ENABLED: &str = "enabled";
+const DESIRED_PAUSED: &str = "paused";
+const DESIRED_DELETED: &str = "deleted";
 const STATUS_REGISTERED: &str = "registered";
 const STATUS_MISSING: &str = "missing";
 const STATUS_PERMISSION_PAUSED: &str = "permission_paused";
 const STATUS_ERROR: &str = "error";
 const STATUS_CONFLICT: &str = "conflict";
-const STATUS_DELETE_PENDING: &str = "delete_pending";
 const DELIVERY_RETENTION_DAYS: i64 = 30;
 
 type HmacSha256 = Hmac<Sha256>;
 
-fn user_operation_lock(user_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn user_operation_lock(user_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
     LOCKS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -55,6 +59,8 @@ fn user_operation_lock(user_id: &str) -> Arc<tokio::sync::Mutex<()>> {
 struct UserConfigRow {
     include_own_releases: i64,
     webhook_push_enabled: i64,
+    webhook_push_desired_state: String,
+    webhook_push_last_completed_check_at: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -93,12 +99,32 @@ pub struct WebhookRepoStatus {
 
 #[derive(Debug, Serialize)]
 pub struct WebhookPushSettingsResponse {
+    desired_state: String,
     enabled: bool,
     include_own_releases: bool,
     callback_ready: bool,
     pat: PatStatus,
     summary: WebhookSummary,
     schedule: ScheduleStatus,
+    operation: Option<WebhookOperationSnapshot>,
+    last_completed_check_at: Option<String>,
+    owner_groups: Vec<WebhookOwnerGroup>,
+    repos: Vec<WebhookRepoStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct WebhookOperationSnapshot {
+    task_id: String,
+    status: String,
+    operation: String,
+    available_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WebhookOwnerGroup {
+    owner_login: String,
+    repo_count: usize,
+    pending_count: usize,
     repos: Vec<WebhookRepoStatus>,
 }
 
@@ -128,7 +154,12 @@ struct ScheduleStatus {
 
 #[derive(Debug, Deserialize)]
 pub struct PatchSettingsRequest {
-    enabled: bool,
+    desired_state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReconcileRequest {
+    repo_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -136,6 +167,7 @@ pub struct TaskEnqueueResponse {
     task_id: String,
     status: String,
     reused: bool,
+    operation: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,6 +233,18 @@ struct GitHubHookConfig {
     content_type: Option<String>,
 }
 
+fn repo_identity_matches(
+    identity: &GitHubRepoIdentity,
+    expected_owner_github_user_id: i64,
+    repo: &TargetRepo,
+) -> bool {
+    identity.id == repo.repo_id
+        && identity.owner.id == expected_owner_github_user_id
+        && identity
+            .full_name
+            .eq_ignore_ascii_case(&repo.repo_full_name)
+}
+
 #[derive(Debug, Serialize)]
 struct HookRequest<'a> {
     name: &'static str,
@@ -221,6 +265,7 @@ struct HookRequestConfig<'a> {
 struct GitHubCallError {
     status: Option<StatusCode>,
     rate_limited: bool,
+    retry_after: Option<Duration>,
     message: String,
 }
 
@@ -242,7 +287,8 @@ fn callback_ready(state: &AppState) -> bool {
 async fn load_user_config(state: &AppState, user_id: &str) -> Result<UserConfigRow, ApiError> {
     sqlx::query_as::<_, UserConfigRow>(
         r#"
-        SELECT include_own_releases, webhook_push_enabled
+        SELECT include_own_releases, webhook_push_enabled,
+               webhook_push_desired_state, webhook_push_last_completed_check_at
         FROM users WHERE id = ?
         "#,
     )
@@ -292,7 +338,7 @@ fn parse_scopes(headers: &HeaderMap) -> Vec<String> {
         .collect()
 }
 
-async fn validate_pat(
+async fn validate_pat_with_github(
     state: &AppState,
     user_id: &str,
 ) -> Result<(String, i64, String, bool), ApiError> {
@@ -398,6 +444,38 @@ async fn validate_pat(
     Ok((token, github_user.id, github_user.login, allows_private))
 }
 
+async fn validate_pat_prerequisites(state: &AppState, user_id: &str) -> Result<(), ApiError> {
+    let Some((pat, token)) = load_pat(state, user_id).await? else {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "pat_required",
+            "请先在 GitHub PAT 设置中保存 classic PAT。",
+        ));
+    };
+    if pat.last_check_state != "valid" {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "pat_invalid",
+            "当前 GitHub PAT 未通过校验，请重新校验并保存。",
+        ));
+    }
+    if token.starts_with("github_pat_") {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "classic_pat_required",
+            "Webhook 推送当前仅支持 classic PAT。",
+        ));
+    }
+    if pat.owner_github_user_id.is_none() || pat.owner_login.is_none() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "pat_owner_mismatch",
+            "PAT 所属 GitHub 账号未绑定到当前 OctoRill 账号。",
+        ));
+    }
+    Ok(())
+}
+
 fn generate_secret() -> String {
     URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
 }
@@ -493,6 +571,7 @@ async fn list_repo_statuses(
     state: &AppState,
     user_id: &str,
     owner_login: Option<&str>,
+    desired_state: &str,
 ) -> Result<Vec<WebhookRepoStatus>, ApiError> {
     let owner_login = owner_login.unwrap_or("");
     sqlx::query_as::<_, WebhookRepoStatus>(
@@ -504,7 +583,7 @@ async fn list_repo_statuses(
                ob.repo_full_name,
                CASE WHEN ob.is_private IS NULL THEN NULL ELSE ob.is_private != 0 END AS is_private,
                wr.hook_id,
-               COALESCE(wr.status, 'unknown') AS status,
+               COALESCE(wr.status, CASE WHEN ? = 'enabled' THEN 'waiting_registration' ELSE 'not_configured' END) AS status,
                wr.error_kind, wr.error_message,
                COALESCE(wr.permission_paused, 0) != 0 AS permission_paused,
                wr.last_checked_at, wr.last_registered_at
@@ -529,6 +608,7 @@ async fn list_repo_statuses(
         ) ORDER BY lower(repo_full_name)
         "#,
     )
+    .bind(desired_state)
     .bind(user_id)
     .bind(owner_login)
     .bind(user_id)
@@ -547,7 +627,7 @@ fn summarize(repos: &[WebhookRepoStatus]) -> WebhookSummary {
             .count(),
         missing: repos
             .iter()
-            .filter(|repo| repo.status == STATUS_MISSING || repo.status == "unknown")
+            .filter(|repo| repo.status == STATUS_MISSING)
             .count(),
         permission_paused: repos.iter().filter(|repo| repo.permission_paused).count(),
         errors: repos
@@ -558,6 +638,102 @@ fn summarize(repos: &[WebhookRepoStatus]) -> WebhookSummary {
     }
 }
 
+fn group_by_owner(repos: &[WebhookRepoStatus]) -> Vec<WebhookOwnerGroup> {
+    let mut groups = Vec::<WebhookOwnerGroup>::new();
+    for repo in repos.iter().cloned() {
+        let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.owner_login.eq_ignore_ascii_case(&repo.owner_login))
+        else {
+            groups.push(WebhookOwnerGroup {
+                owner_login: repo.owner_login.clone(),
+                repo_count: 1,
+                pending_count: usize::from(repo_needs_attention(&repo)),
+                repos: vec![repo],
+            });
+            continue;
+        };
+        group.repo_count += 1;
+        group.pending_count += usize::from(repo_needs_attention(&repo));
+        group.repos.push(repo);
+    }
+    groups.sort_by_key(|group| group.owner_login.to_ascii_lowercase());
+    groups
+}
+
+fn repo_needs_attention(repo: &WebhookRepoStatus) -> bool {
+    repo.error_message.is_some()
+        || matches!(
+            repo.status.as_str(),
+            STATUS_MISSING
+                | STATUS_PERMISSION_PAUSED
+                | STATUS_ERROR
+                | STATUS_CONFLICT
+                | "waiting_registration"
+                | "registering"
+                | "processing"
+                | "delete_pending"
+        )
+}
+
+async fn current_operation(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Option<WebhookOperationSnapshot>, ApiError> {
+    let row = sqlx::query_as::<_, (String, String, String, Option<String>)>(
+        r#"
+        SELECT id, status, COALESCE(json_extract(payload_json, '$.operation'), 'reconcile'), available_at
+        FROM job_tasks
+        WHERE task_type = ? AND requested_by = ? AND status IN (?, ?)
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(jobs::TASK_WEBHOOK_PUSH_MANAGE)
+    .bind(user_id)
+    .bind(jobs::STATUS_QUEUED)
+    .bind(jobs::STATUS_RUNNING)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if let Some((task_id, status, operation, available_at)) = row {
+        return Ok(Some(WebhookOperationSnapshot {
+            task_id,
+            status,
+            operation,
+            available_at,
+        }));
+    }
+
+    let audit_row = sqlx::query_as::<_, (String, String, Option<String>)>(
+        r#"
+        SELECT task.id, task.status, task.available_at
+        FROM webhook_push_user_operation_leases lease
+        JOIN job_tasks task ON task.id = lease.task_id
+        WHERE lease.user_id = ?
+          AND task.task_type = ?
+          AND task.status IN (?, ?)
+        ORDER BY task.created_at DESC, task.id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(jobs::TASK_WEBHOOK_PUSH_AUDIT)
+    .bind(jobs::STATUS_QUEUED)
+    .bind(jobs::STATUS_RUNNING)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(
+        audit_row.map(|(task_id, status, available_at)| WebhookOperationSnapshot {
+            task_id,
+            status,
+            operation: OP_RECONCILE.to_owned(),
+            available_at,
+        }),
+    )
+}
+
 pub async fn get_settings(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -566,9 +742,30 @@ pub async fn get_settings(
     let config = load_user_config(state.as_ref(), &user_id).await?;
     let pat = load_pat(state.as_ref(), &user_id).await?;
     let owner_login = pat.as_ref().and_then(|(row, _)| row.owner_login.as_deref());
-    let repos = list_repo_statuses(state.as_ref(), &user_id, owner_login).await?;
+    let mut repos = list_repo_statuses(
+        state.as_ref(),
+        &user_id,
+        owner_login,
+        &config.webhook_push_desired_state,
+    )
+    .await?;
     let schedule = runtime_config(state.as_ref()).await?;
+    let operation = current_operation(state.as_ref(), &user_id).await?;
+    if operation.is_some() {
+        let progress_status = if config.webhook_push_desired_state == DESIRED_ENABLED {
+            "registering"
+        } else {
+            "processing"
+        };
+        for repo in &mut repos {
+            if !matches!(repo.status.as_str(), STATUS_ERROR | STATUS_CONFLICT) {
+                repo.status = progress_status.to_owned();
+            }
+        }
+    }
+    let owner_groups = group_by_owner(&repos);
     Ok(Json(WebhookPushSettingsResponse {
+        desired_state: config.webhook_push_desired_state.clone(),
         enabled: config.webhook_push_enabled != 0,
         include_own_releases: config.include_own_releases != 0,
         callback_ready: callback_ready(state.as_ref()),
@@ -585,6 +782,9 @@ pub async fn get_settings(
             last_started_at: schedule.last_started_at,
             next_started_at: schedule.next_started_at,
         },
+        operation,
+        last_completed_check_at: config.webhook_push_last_completed_check_at,
+        owner_groups,
         repos,
     }))
 }
@@ -595,8 +795,21 @@ pub async fn patch_settings(
     Json(request): Json<PatchSettingsRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let user_id = api::require_active_user_id(state.as_ref(), &session).await?;
+    let operation_lock = user_operation_lock(&user_id);
+    let _operation_guard = operation_lock.lock().await;
     let config = load_user_config(state.as_ref(), &user_id).await?;
-    if request.enabled {
+    let desired_state = request
+        .desired_state
+        .ok_or_else(|| ApiError::bad_request("desired_state is required"))?;
+    if !matches!(
+        desired_state.as_str(),
+        DESIRED_ENABLED | DESIRED_PAUSED | DESIRED_DELETED
+    ) {
+        return Err(ApiError::bad_request(
+            "desired_state must be enabled, paused, or deleted",
+        ));
+    }
+    if desired_state == DESIRED_ENABLED {
         if config.include_own_releases == 0 {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
@@ -611,43 +824,159 @@ pub async fn patch_settings(
                 "服务尚未配置 GitHub 可访问的 HTTPS 公共地址，请联系管理员。",
             ));
         }
-        validate_pat(state.as_ref(), &user_id).await?;
+        validate_pat_prerequisites(state.as_ref(), &user_id).await?;
         ensure_secret_and_key(state.as_ref(), &user_id).await?;
     }
+    ensure_no_inflight_operation(state.as_ref(), &user_id).await?;
     let now = Utc::now().to_rfc3339();
     state
         .sqlite_writer
         .write_foreground("webhook_push_settings", |_| async {
-            sqlx::query("UPDATE users SET webhook_push_enabled = ?, updated_at = ? WHERE id = ?")
-                .bind(if request.enabled { 1_i64 } else { 0_i64 })
+            let updated = sqlx::query(
+                "UPDATE users SET webhook_push_desired_state = ?, webhook_push_enabled = ?, updated_at = ? WHERE id = ? AND webhook_push_desired_state = ? AND webhook_push_enabled = ?",
+            )
+                .bind(&desired_state)
+                .bind(if desired_state == DESIRED_ENABLED { 1_i64 } else { 0_i64 })
                 .bind(&now)
                 .bind(&user_id)
+                .bind(&config.webhook_push_desired_state)
+                .bind(config.webhook_push_enabled)
                 .execute(&state.pool)
                 .await?;
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, anyhow::Error>(updated.rows_affected())
         })
         .await
-        .map_err(ApiError::internal)?;
-    let task = if request.enabled {
-        Some(enqueue_manage(state.as_ref(), &user_id, OP_REGISTER, None, "enable").await?)
-    } else {
-        None
+        .map_err(ApiError::internal)
+        .and_then(|rows| {
+            if rows == 0 {
+                Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "webhook_push_operation_in_progress",
+                    "Webhook 推送目标刚刚发生变化，请刷新后重试。",
+                ))
+            } else {
+                Ok(())
+            }
+        })?;
+    let task = match enqueue_manage(
+        state.as_ref(),
+        &user_id,
+        OP_RECONCILE,
+        None,
+        "desired_state",
+    )
+    .await
+    {
+        Ok(task) => task,
+        Err(error) => {
+            let rollback_now = Utc::now().to_rfc3339();
+            let rollback = state
+                .sqlite_writer
+                .write_foreground("webhook_push_settings_rollback", |_| async {
+                    sqlx::query(
+                        r#"
+                        UPDATE users
+                        SET webhook_push_desired_state = ?,
+                            webhook_push_enabled = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                          AND webhook_push_desired_state = ?
+                          AND NOT EXISTS (
+                            SELECT 1 FROM job_tasks
+                            WHERE task_type = ?
+                              AND requested_by = ?
+                              AND status IN (?, ?)
+                          )
+                        "#,
+                    )
+                    .bind(&config.webhook_push_desired_state)
+                    .bind(config.webhook_push_enabled)
+                    .bind(&rollback_now)
+                    .bind(&user_id)
+                    .bind(&desired_state)
+                    .bind(jobs::TASK_WEBHOOK_PUSH_MANAGE)
+                    .bind(&user_id)
+                    .bind(jobs::STATUS_QUEUED)
+                    .bind(jobs::STATUS_RUNNING)
+                    .execute(&state.pool)
+                    .await?;
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await;
+            if let Err(rollback_error) = rollback {
+                tracing::error!(
+                    user_id,
+                    ?rollback_error,
+                    "failed to roll back webhook push desired state after enqueue failure"
+                );
+            }
+            return Err(error);
+        }
     };
-    let task = task.map(task_response);
     Ok(Json(json!({
-        "enabled": request.enabled,
-        "task_id": task.as_ref().map(|task| task.task_id.as_str()),
-        "status": task.as_ref().map(|task| task.status.as_str()),
-        "reused": task.as_ref().is_some_and(|task| task.reused),
+        "desired_state": desired_state,
+        "enabled": desired_state == DESIRED_ENABLED,
+        "task_id": task.task_id,
+        "status": task.status,
+        "operation": OP_RECONCILE,
+        "reused": task.reused,
     })))
 }
 
-fn task_response(task: EnqueuedTask) -> TaskEnqueueResponse {
+fn task_response(task: EnqueuedTask, operation: &str) -> TaskEnqueueResponse {
     TaskEnqueueResponse {
         task_id: task.task_id,
         status: task.status,
         reused: task.reused,
+        operation: operation.to_owned(),
     }
+}
+
+pub(crate) async fn ensure_no_inflight_operation(
+    state: &AppState,
+    user_id: &str,
+) -> Result<(), ApiError> {
+    if let Some(task) =
+        jobs::find_inflight_task_for_requester(state, jobs::TASK_WEBHOOK_PUSH_MANAGE, user_id)
+            .await
+            .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "webhook_push_operation_in_progress",
+            format!(
+                "Webhook 对齐操作 {} 尚未完成，请等待本轮结束。",
+                task.task_id
+            ),
+        ));
+    }
+    let now = Utc::now().to_rfc3339();
+    let leased_task = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT lease.task_id
+        FROM webhook_push_user_operation_leases lease
+        JOIN job_tasks task ON task.id = lease.task_id
+        WHERE lease.user_id = ?
+          AND lease.expires_at >= ?
+          AND task.status IN (?, ?)
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(now)
+    .bind(jobs::STATUS_QUEUED)
+    .bind(jobs::STATUS_RUNNING)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if let Some(task_id) = leased_task {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "webhook_push_operation_in_progress",
+            format!("Webhook 对齐操作 {} 尚未完成，请等待本轮结束。", task_id),
+        ));
+    }
+    Ok(())
 }
 
 async fn enqueue_manage(
@@ -657,120 +986,67 @@ async fn enqueue_manage(
     repo_id: Option<i64>,
     source: &str,
 ) -> Result<EnqueuedTask, ApiError> {
-    jobs::enqueue_singleton_task_for_requester_and_payload(
+    ensure_no_inflight_operation(state, user_id).await?;
+    let result = jobs::enqueue_task(
         state,
         NewTask {
             task_type: jobs::TASK_WEBHOOK_PUSH_MANAGE.to_owned(),
-            payload: json!({"user_id": user_id, "operation": operation, "repo_id": repo_id}),
+            payload: json!({
+                "user_id": user_id,
+                "operation": operation,
+                "repo_id": repo_id,
+            }),
             source: source.to_owned(),
             requested_by: Some(user_id.to_owned()),
             parent_task_id: None,
         },
     )
-    .await
-    .map_err(ApiError::internal)
-}
-
-async fn require_manage_enabled(state: &AppState, user_id: &str) -> Result<(), ApiError> {
-    let config = load_user_config(state, user_id).await?;
-    if config.include_own_releases == 0 || config.webhook_push_enabled == 0 {
-        return Err(ApiError::new(
+    .await;
+    match result {
+        Ok(task) => Ok(task),
+        Err(error) if jobs::is_unique_violation(&error) => Err(ApiError::new(
             StatusCode::CONFLICT,
-            "webhook_push_disabled",
-            "请先开启“我的发布”和“Webhook 推送”。",
-        ));
+            "webhook_push_operation_in_progress",
+            "Webhook 对齐操作尚未完成，请等待本轮结束。",
+        )),
+        Err(error) => Err(ApiError::internal(error)),
     }
-    Ok(())
 }
 
-pub async fn register_all(
-    State(state): State<Arc<AppState>>,
-    session: Session,
-) -> Result<Json<TaskEnqueueResponse>, ApiError> {
-    let user_id = api::require_active_user_id(state.as_ref(), &session).await?;
-    require_manage_enabled(state.as_ref(), &user_id).await?;
-    validate_pat(state.as_ref(), &user_id).await?;
-    Ok(Json(task_response(
-        enqueue_manage(state.as_ref(), &user_id, OP_REGISTER, None, "manual").await?,
-    )))
+pub(crate) async fn enqueue_reconcile_for_user(
+    state: &AppState,
+    user_id: &str,
+    source: &str,
+) -> Result<EnqueuedTask, ApiError> {
+    enqueue_manage(state, user_id, OP_RECONCILE, None, source).await
 }
 
-pub async fn check_all(
+pub async fn reconcile(
     State(state): State<Arc<AppState>>,
     session: Session,
+    Json(request): Json<ReconcileRequest>,
 ) -> Result<Json<TaskEnqueueResponse>, ApiError> {
     let user_id = api::require_active_user_id(state.as_ref(), &session).await?;
-    require_manage_enabled(state.as_ref(), &user_id).await?;
-    validate_pat(state.as_ref(), &user_id).await?;
-    Ok(Json(task_response(
-        enqueue_manage(state.as_ref(), &user_id, OP_CHECK, None, "manual").await?,
-    )))
-}
-
-pub async fn delete_all(
-    State(state): State<Arc<AppState>>,
-    session: Session,
-) -> Result<Json<TaskEnqueueResponse>, ApiError> {
-    let user_id = api::require_active_user_id(state.as_ref(), &session).await?;
+    let operation_lock = user_operation_lock(&user_id);
+    let _operation_guard = operation_lock.lock().await;
     let config = load_user_config(state.as_ref(), &user_id).await?;
-    if config.webhook_push_enabled != 0 {
+    if config.include_own_releases == 0 {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
-            "disable_webhook_push_first",
-            "请先关闭“Webhook 推送”，再全部删除 Webhook。",
+            "my_releases_disabled",
+            "请先开启“我的发布”。",
         ));
     }
-    validate_pat(state.as_ref(), &user_id).await?;
-    state
-        .sqlite_writer
-        .write_foreground("webhook_push_delete_pending", |_| async {
-            sqlx::query(
-                "UPDATE webhook_push_repos SET status = ?, updated_at = ? WHERE user_id = ? AND hook_id IS NOT NULL",
-            )
-            .bind(STATUS_DELETE_PENDING)
-            .bind(Utc::now().to_rfc3339())
-            .bind(&user_id)
-            .execute(&state.pool)
-            .await?;
-            Ok::<_, anyhow::Error>(())
-        })
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(Json(task_response(
-        enqueue_manage(state.as_ref(), &user_id, OP_DELETE, None, "manual").await?,
-    )))
-}
-
-pub async fn register_repo(
-    State(state): State<Arc<AppState>>,
-    session: Session,
-    Path(repo_id): Path<i64>,
-) -> Result<Json<TaskEnqueueResponse>, ApiError> {
-    let user_id = api::require_active_user_id(state.as_ref(), &session).await?;
-    require_manage_enabled(state.as_ref(), &user_id).await?;
-    validate_pat(state.as_ref(), &user_id).await?;
     Ok(Json(task_response(
         enqueue_manage(
             state.as_ref(),
             &user_id,
-            OP_REGISTER,
-            Some(repo_id),
+            OP_RECONCILE,
+            request.repo_id,
             "manual",
         )
         .await?,
-    )))
-}
-
-pub async fn check_repo(
-    State(state): State<Arc<AppState>>,
-    session: Session,
-    Path(repo_id): Path<i64>,
-) -> Result<Json<TaskEnqueueResponse>, ApiError> {
-    let user_id = api::require_active_user_id(state.as_ref(), &session).await?;
-    require_manage_enabled(state.as_ref(), &user_id).await?;
-    validate_pat(state.as_ref(), &user_id).await?;
-    Ok(Json(task_response(
-        enqueue_manage(state.as_ref(), &user_id, OP_CHECK, Some(repo_id), "manual").await?,
+        OP_RECONCILE,
     )))
 }
 
@@ -834,6 +1110,7 @@ async fn resolve_delete_target(
         .map_err(|error| GitHubCallError {
             status: None,
             rate_limited: false,
+            retry_after: None,
             message: error.to_string(),
         })?;
     let response = state
@@ -848,6 +1125,7 @@ async fn resolve_delete_target(
         .map_err(|error| GitHubCallError {
             status: error.status(),
             rate_limited: false,
+            retry_after: None,
             message: error.to_string(),
         })?;
     if !response.status().is_success() {
@@ -859,13 +1137,15 @@ async fn resolve_delete_target(
         .map_err(|error| GitHubCallError {
             status: None,
             rate_limited: false,
+            retry_after: None,
             message: error.to_string(),
         })?;
-    if identity.id != repo.repo_id || identity.owner.id != expected_owner_github_user_id {
+    if !repo_identity_matches(&identity, expected_owner_github_user_id, repo) {
         return Err(GitHubCallError {
             status: Some(StatusCode::FORBIDDEN),
             rate_limited: false,
-            message: "GitHub PAT owner does not match the repository hook owner".to_owned(),
+            retry_after: None,
+            message: "GitHub repository identity does not match the managed repository".to_owned(),
         });
     }
     let (owner_login, repo_name) =
@@ -875,6 +1155,7 @@ async fn resolve_delete_target(
             .ok_or_else(|| GitHubCallError {
                 status: None,
                 rate_limited: false,
+                retry_after: None,
                 message: "GitHub repository full_name is invalid".to_owned(),
             })?;
     Ok(TargetRepo {
@@ -888,6 +1169,12 @@ async fn resolve_delete_target(
 
 async fn response_error(response: reqwest::Response) -> GitHubCallError {
     let status = response.status();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs);
     let rate_limited = response
         .headers()
         .get("x-ratelimit-remaining")
@@ -898,6 +1185,7 @@ async fn response_error(response: reqwest::Response) -> GitHubCallError {
     GitHubCallError {
         status: Some(status),
         rate_limited,
+        retry_after,
         message: format!(
             "GitHub webhook API returned {status}: {}",
             body.chars().take(240).collect::<String>()
@@ -913,6 +1201,7 @@ async fn list_hooks(
     let mut url = github_url(state, repo, "").map_err(|err| GitHubCallError {
         status: None,
         rate_limited: false,
+        retry_after: None,
         message: err.to_string(),
     })?;
     let mut hooks = Vec::new();
@@ -933,6 +1222,7 @@ async fn list_hooks(
             .map_err(|err| GitHubCallError {
                 status: err.status(),
                 rate_limited: false,
+                retry_after: None,
                 message: err.to_string(),
             })?;
         if !response.status().is_success() {
@@ -945,6 +1235,7 @@ async fn list_hooks(
                 .map_err(|err| GitHubCallError {
                     status: None,
                     rate_limited: false,
+                    retry_after: None,
                     message: err.to_string(),
                 })?;
         let is_last_page = page_hooks.len() < 100;
@@ -956,6 +1247,7 @@ async fn list_hooks(
     Err(GitHubCallError {
         status: None,
         rate_limited: false,
+        retry_after: None,
         message: "GitHub hook list exceeds the supported 500-hook limit".to_owned(),
     })
 }
@@ -970,6 +1262,7 @@ async fn create_hook(
     let url = github_url(state, repo, "").map_err(|err| GitHubCallError {
         status: None,
         rate_limited: false,
+        retry_after: None,
         message: err.to_string(),
     })?;
     let response = state
@@ -995,6 +1288,7 @@ async fn create_hook(
         .map_err(|err| GitHubCallError {
             status: err.status(),
             rate_limited: false,
+            retry_after: None,
             message: err.to_string(),
         })?;
     if !response.status().is_success() {
@@ -1003,6 +1297,7 @@ async fn create_hook(
     response.json().await.map_err(|err| GitHubCallError {
         status: None,
         rate_limited: false,
+        retry_after: None,
         message: err.to_string(),
     })
 }
@@ -1012,12 +1307,14 @@ async fn update_hook(
     token: &str,
     repo: &TargetRepo,
     hook_id: i64,
+    active: bool,
     callback: &str,
     secret: &str,
 ) -> std::result::Result<GitHubHook, GitHubCallError> {
     let url = github_url(state, repo, &format!("/{hook_id}")).map_err(|err| GitHubCallError {
         status: None,
         rate_limited: false,
+        retry_after: None,
         message: err.to_string(),
     })?;
     let response = state
@@ -1028,7 +1325,7 @@ async fn update_hook(
         .header("X-GitHub-Api-Version", "2022-11-28")
         .json(&HookRequest {
             name: "web",
-            active: true,
+            active,
             events: ["release"],
             config: HookRequestConfig {
                 url: callback,
@@ -1043,6 +1340,7 @@ async fn update_hook(
         .map_err(|err| GitHubCallError {
             status: err.status(),
             rate_limited: false,
+            retry_after: None,
             message: err.to_string(),
         })?;
     if !response.status().is_success() {
@@ -1051,6 +1349,7 @@ async fn update_hook(
     response.json().await.map_err(|err| GitHubCallError {
         status: None,
         rate_limited: false,
+        retry_after: None,
         message: err.to_string(),
     })
 }
@@ -1064,6 +1363,7 @@ async fn delete_hook(
     let url = github_url(state, repo, &format!("/{hook_id}")).map_err(|err| GitHubCallError {
         status: None,
         rate_limited: false,
+        retry_after: None,
         message: err.to_string(),
     })?;
     let response = state
@@ -1078,6 +1378,7 @@ async fn delete_hook(
         .map_err(|err| GitHubCallError {
             status: err.status(),
             rate_limited: false,
+            retry_after: None,
             message: err.to_string(),
         })?;
     if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
@@ -1098,6 +1399,20 @@ fn is_permission_error(error: &GitHubCallError) -> bool {
         error.status,
         Some(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND)
     )
+}
+
+fn is_retryable_error(error: &GitHubCallError) -> bool {
+    error.rate_limited || error.status.is_none_or(|status| status.is_server_error())
+}
+
+fn retry_delay(attempt: u8, retry_after: Option<Duration>) -> chrono::Duration {
+    let backoff = match attempt {
+        0 => Duration::from_secs(60),
+        1 => Duration::from_secs(5 * 60),
+        _ => Duration::from_secs(15 * 60),
+    };
+    let delay = retry_after.unwrap_or(backoff).max(backoff);
+    chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::minutes(15))
 }
 
 async fn pause_user_repos_for_permission_error(
@@ -1166,6 +1481,26 @@ async fn persist_repo_state(
     Ok(())
 }
 
+struct RepoOperationResult {
+    outcome: &'static str,
+    retryable: bool,
+    retry_after: Option<Duration>,
+}
+
+fn repo_operation_failed(error: &GitHubCallError) -> RepoOperationResult {
+    RepoOperationResult {
+        outcome: "failed",
+        retryable: is_retryable_error(error),
+        retry_after: error.retry_after,
+    }
+}
+
+fn hook_matches(hook: &GitHubHook, hook_id: Option<i64>, callback: &str) -> bool {
+    hook_id.is_none_or(|expected| hook.id == expected)
+        && hook.config.url.as_deref() == Some(callback)
+        && hook.events.iter().any(|event| event == "release")
+}
+
 async fn run_repo_operation(
     state: &AppState,
     user_id: &str,
@@ -1174,81 +1509,20 @@ async fn run_repo_operation(
     token: &str,
     callback: &str,
     secret: &str,
-) -> Result<&'static str> {
-    if operation == OP_DELETE {
-        let stored = sqlx::query_as::<_, (Option<i64>, String)>(
-            "SELECT hook_id, callback_url FROM webhook_push_repos WHERE user_id = ? AND repo_id = ?",
-        )
-        .bind(user_id)
-        .bind(repo.repo_id)
-        .fetch_optional(&state.pool)
-        .await?;
-        let Some((Some(hook_id), stored_callback)) = stored else {
-            return Ok("skipped");
-        };
-        let hooks = match list_hooks(state, token, repo).await {
-            Ok(hooks) => hooks,
-            Err(error) => {
-                let permission_paused = is_permission_error(&error);
-                sqlx::query(
-                    "UPDATE webhook_push_repos SET status = ?, error_kind = ?, error_message = ?, permission_paused = ?, updated_at = ? WHERE user_id = ? AND repo_id = ?",
-                )
-                .bind(if permission_paused { STATUS_PERMISSION_PAUSED } else { STATUS_ERROR })
-                .bind(if permission_paused { "permission" } else { "github_error" })
-                .bind(error.message)
-                .bind(if permission_paused { 1_i64 } else { 0_i64 })
-                .bind(Utc::now().to_rfc3339())
-                .bind(user_id)
-                .bind(repo.repo_id)
-                .execute(&state.pool)
-                .await?;
-                return Ok("failed");
-            }
-        };
-        let still_owned = hooks.iter().any(|hook| {
-            hook.id == hook_id
-                && hook.config.url.as_deref() == Some(stored_callback.as_str())
-                && hook.events.iter().any(|event| event == "release")
-        });
-        if !still_owned {
-            sqlx::query(
-                "UPDATE webhook_push_repos SET hook_id = NULL, status = ?, error_kind = NULL, error_message = NULL, updated_at = ? WHERE user_id = ? AND repo_id = ?",
-            )
-            .bind(STATUS_MISSING)
-            .bind(Utc::now().to_rfc3339())
-            .bind(user_id)
-            .bind(repo.repo_id)
-            .execute(&state.pool)
-            .await?;
-            return Ok("skipped");
-        }
-        match delete_hook(state, token, repo, hook_id).await {
-            Ok(()) => {
-                sqlx::query("DELETE FROM webhook_push_repos WHERE user_id = ? AND repo_id = ?")
-                    .bind(user_id)
-                    .bind(repo.repo_id)
-                    .execute(&state.pool)
-                    .await?;
-                return Ok("deleted");
-            }
-            Err(error) => {
-                let permission_paused = is_permission_error(&error);
-                sqlx::query(
-                    "UPDATE webhook_push_repos SET status = ?, error_kind = ?, error_message = ?, permission_paused = ?, updated_at = ? WHERE user_id = ? AND repo_id = ?",
-                )
-                .bind(if permission_paused { STATUS_PERMISSION_PAUSED } else { STATUS_ERROR })
-                .bind(if permission_paused { "permission" } else { "github_error" })
-                .bind(&error.message)
-                .bind(if permission_paused { 1_i64 } else { 0_i64 })
-                .bind(Utc::now().to_rfc3339())
-                .bind(user_id)
-                .bind(repo.repo_id)
-                .execute(&state.pool)
-                .await?;
-                return Ok("failed");
-            }
-        }
-    }
+) -> Result<RepoOperationResult> {
+    let stored = sqlx::query_as::<_, (Option<i64>, String)>(
+        "SELECT hook_id, callback_url FROM webhook_push_repos WHERE user_id = ? AND repo_id = ?",
+    )
+    .bind(user_id)
+    .bind(repo.repo_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    let stored_hook_id = stored.as_ref().and_then(|row| row.0);
+    let managed_callback = stored
+        .as_ref()
+        .map(|row| row.1.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(callback);
 
     let hooks = match list_hooks(state, token, repo).await {
         Ok(hooks) => hooks,
@@ -1262,30 +1536,161 @@ async fn run_repo_operation(
                 state,
                 user_id,
                 repo,
-                callback,
-                (status, None, Some(&error), false),
+                managed_callback,
+                (status, stored_hook_id, Some(&error), false),
             )
             .await?;
-            return Ok("failed");
+            return Ok(repo_operation_failed(&error));
         }
     };
+
+    if operation == OP_DELETE || operation == OP_PAUSE {
+        let Some(hook_id) = stored_hook_id else {
+            return Ok(RepoOperationResult {
+                outcome: "skipped",
+                retryable: false,
+                retry_after: None,
+            });
+        };
+        let Some(hook) = hooks
+            .iter()
+            .find(|hook| hook_matches(hook, Some(hook_id), managed_callback))
+        else {
+            let status = if hooks.iter().any(|hook| hook.id == hook_id) {
+                STATUS_CONFLICT
+            } else {
+                STATUS_MISSING
+            };
+            sqlx::query(
+                "UPDATE webhook_push_repos SET status = ?, error_kind = NULL, error_message = NULL, updated_at = ? WHERE user_id = ? AND repo_id = ?",
+            )
+            .bind(status)
+            .bind(Utc::now().to_rfc3339())
+            .bind(user_id)
+            .bind(repo.repo_id)
+            .execute(&state.pool)
+            .await?;
+            return Ok(RepoOperationResult {
+                outcome: "skipped",
+                retryable: false,
+                retry_after: None,
+            });
+        };
+
+        if operation == OP_PAUSE {
+            match update_hook(state, token, repo, hook.id, false, managed_callback, secret).await {
+                Ok(updated) => {
+                    persist_repo_state(
+                        state,
+                        user_id,
+                        repo,
+                        managed_callback,
+                        (STATUS_REGISTERED, Some(updated.id), None, false),
+                    )
+                    .await?;
+                    return Ok(RepoOperationResult {
+                        outcome: "paused",
+                        retryable: false,
+                        retry_after: None,
+                    });
+                }
+                Err(error) => {
+                    persist_repo_state(
+                        state,
+                        user_id,
+                        repo,
+                        managed_callback,
+                        (
+                            if is_permission_error(&error) {
+                                STATUS_PERMISSION_PAUSED
+                            } else {
+                                STATUS_ERROR
+                            },
+                            Some(hook.id),
+                            Some(&error),
+                            false,
+                        ),
+                    )
+                    .await?;
+                    return Ok(repo_operation_failed(&error));
+                }
+            }
+        }
+
+        match delete_hook(state, token, repo, hook_id).await {
+            Ok(()) => {
+                sqlx::query("DELETE FROM webhook_push_repos WHERE user_id = ? AND repo_id = ?")
+                    .bind(user_id)
+                    .bind(repo.repo_id)
+                    .execute(&state.pool)
+                    .await?;
+                return Ok(RepoOperationResult {
+                    outcome: "deleted",
+                    retryable: false,
+                    retry_after: None,
+                });
+            }
+            Err(error) => {
+                persist_repo_state(
+                    state,
+                    user_id,
+                    repo,
+                    managed_callback,
+                    (
+                        if is_permission_error(&error) {
+                            STATUS_PERMISSION_PAUSED
+                        } else {
+                            STATUS_ERROR
+                        },
+                        Some(hook_id),
+                        Some(&error),
+                        false,
+                    ),
+                )
+                .await?;
+                return Ok(repo_operation_failed(&error));
+            }
+        }
+    }
+
     let matches = hooks
         .iter()
-        .filter(|hook| {
-            hook.config.url.as_deref() == Some(callback)
-                && hook.events.iter().any(|event| event == "release")
-        })
+        .filter(|hook| hook_matches(hook, stored_hook_id, managed_callback))
         .collect::<Vec<_>>();
+    if stored_hook_id.is_some()
+        && matches.is_empty()
+        && hooks
+            .iter()
+            .any(|hook| hook_matches(hook, None, managed_callback))
+    {
+        persist_repo_state(
+            state,
+            user_id,
+            repo,
+            managed_callback,
+            (STATUS_CONFLICT, stored_hook_id, None, false),
+        )
+        .await?;
+        return Ok(RepoOperationResult {
+            outcome: "conflict",
+            retryable: false,
+            retry_after: None,
+        });
+    }
     if matches.len() > 1 {
         persist_repo_state(
             state,
             user_id,
             repo,
-            callback,
+            managed_callback,
             (STATUS_CONFLICT, None, None, false),
         )
         .await?;
-        return Ok("conflict");
+        return Ok(RepoOperationResult {
+            outcome: "conflict",
+            retryable: false,
+            retry_after: None,
+        });
     }
     if operation == OP_CHECK {
         if let Some(hook) = matches.first() {
@@ -1296,7 +1701,7 @@ async fn run_repo_operation(
                 state,
                 user_id,
                 repo,
-                callback,
+                managed_callback,
                 (
                     if healthy {
                         STATUS_REGISTERED
@@ -1309,27 +1714,28 @@ async fn run_repo_operation(
                 ),
             )
             .await?;
-            return Ok(if healthy { "registered" } else { "failed" });
+            return Ok(RepoOperationResult {
+                outcome: if healthy { "registered" } else { "failed" },
+                retryable: false,
+                retry_after: None,
+            });
         }
         persist_repo_state(
             state,
             user_id,
             repo,
-            callback,
+            managed_callback,
             (STATUS_MISSING, None, None, false),
         )
         .await?;
-        sqlx::query(
-            "UPDATE webhook_push_repos SET hook_id = NULL WHERE user_id = ? AND repo_id = ?",
-        )
-        .bind(user_id)
-        .bind(repo.repo_id)
-        .execute(&state.pool)
-        .await?;
-        return Ok("missing");
+        return Ok(RepoOperationResult {
+            outcome: "missing",
+            retryable: false,
+            retry_after: None,
+        });
     }
     let result = if let Some(hook) = matches.first() {
-        update_hook(state, token, repo, hook.id, callback, secret).await
+        update_hook(state, token, repo, hook.id, true, managed_callback, secret).await
     } else {
         create_hook(state, token, repo, callback, secret).await
     };
@@ -1343,7 +1749,11 @@ async fn run_repo_operation(
                 (STATUS_REGISTERED, Some(hook.id), None, true),
             )
             .await?;
-            Ok("registered")
+            Ok(RepoOperationResult {
+                outcome: "registered",
+                retryable: false,
+                retry_after: None,
+            })
         }
         Err(error) => {
             let status = if is_permission_error(&error) {
@@ -1356,10 +1766,10 @@ async fn run_repo_operation(
                 user_id,
                 repo,
                 callback,
-                (status, None, Some(&error), false),
+                (status, stored_hook_id, Some(&error), false),
             )
             .await?;
-            Ok("failed")
+            Ok(repo_operation_failed(&error))
         }
     }
 }
@@ -1422,17 +1832,33 @@ async fn execute_for_user(
     operation: &str,
     repo_id: Option<i64>,
     scheduled: bool,
+    retry_count: u8,
 ) -> Result<Value> {
     while !try_acquire_user_operation_lease(state, user_id, task_id).await? {
         if jobs::is_task_cancel_requested(state, task_id).await? {
-            return Ok(json!({"canceled": true}));
+            let _ = jobs::reschedule_task(
+                state,
+                task_id,
+                Utc::now(),
+                json!({"operation": operation, "reason": "cancel_requested"}),
+            )
+            .await?;
+            return Ok(json!({"operation": operation, "rescheduled": true}));
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
     let operation_lock = user_operation_lock(user_id);
     let _operation_guard = operation_lock.lock().await;
-    let result =
-        execute_for_user_locked(state, task_id, user_id, operation, repo_id, scheduled).await;
+    let result = execute_for_user_locked(
+        state,
+        task_id,
+        user_id,
+        operation,
+        repo_id,
+        scheduled,
+        retry_count,
+    )
+    .await;
     release_user_operation_lease(state, user_id, task_id).await;
     result
 }
@@ -1444,75 +1870,66 @@ async fn execute_for_user_locked(
     operation: &str,
     repo_id: Option<i64>,
     scheduled: bool,
+    retry_count: u8,
 ) -> Result<Value> {
     let config = load_user_config(state, user_id)
         .await
         .map_err(|err| anyhow!(err.to_string()))?;
-    if config.include_own_releases == 0 || config.webhook_push_enabled == 0 {
-        if operation != OP_DELETE {
+    let effective_operation = if operation == OP_RECONCILE {
+        match config.webhook_push_desired_state.as_str() {
+            DESIRED_ENABLED => OP_REGISTER,
+            DESIRED_PAUSED => OP_PAUSE,
+            DESIRED_DELETED => OP_DELETE,
+            _ => return Err(anyhow!("invalid persisted webhook desired state")),
+        }
+    } else {
+        operation
+    };
+    if config.include_own_releases == 0 || config.webhook_push_desired_state != DESIRED_ENABLED {
+        if !matches!(effective_operation, OP_DELETE | OP_PAUSE) {
             return Ok(json!({"skipped": true, "reason": "disabled"}));
         }
-    } else if operation == OP_DELETE {
+    } else if effective_operation == OP_DELETE {
         return Ok(json!({"skipped": true, "reason": "re_enabled"}));
     }
-    let (token, owner_github_user_id, owner_login, allows_private, secret, callback) =
-        if operation == OP_DELETE {
-            let (pat, token) = load_pat(state, user_id)
-                .await
-                .map_err(|err| anyhow!(err.to_string()))?
-                .ok_or_else(|| anyhow!("GitHub PAT is not configured"))?;
-            let owner_github_user_id = pat
-                .owner_github_user_id
-                .ok_or_else(|| anyhow!("GitHub PAT owner id is not available"))?;
-            let owner_login = pat
-                .owner_login
-                .ok_or_else(|| anyhow!("GitHub PAT owner is not available"))?;
-            (
-                token,
-                owner_github_user_id,
-                owner_login,
-                false,
-                String::new(),
-                String::new(),
-            )
-        } else {
-            let (token, owner_github_user_id, owner_login, allows_private) =
-                match validate_pat(state, user_id).await {
-                    Ok(value) => value,
-                    Err(error)
-                        if scheduled
-                            && matches!(
-                                error.code(),
-                                "pat_invalid"
-                                    | "pat_scope_missing"
-                                    | "pat_owner_mismatch"
-                                    | "classic_pat_required"
-                            ) =>
-                    {
-                        pause_user_repos_for_permission_error(state, user_id, error.code(), &error)
-                            .await?;
-                        return Ok(json!({
-                            "skipped": true,
-                            "reason": "permission_paused",
-                            "error_code": error.code()
-                        }));
-                    }
-                    Err(error) => return Err(anyhow!(error.to_string())),
-                };
-            let (secret, key) = ensure_secret_and_key(state, user_id)
-                .await
-                .map_err(|err| anyhow!(err.to_string()))?;
-            let callback = callback_url(state, &key).map_err(|err| anyhow!(err.to_string()))?;
-            (
-                token,
-                owner_github_user_id,
-                owner_login,
-                allows_private,
-                secret,
-                callback,
-            )
-        };
-    if operation == OP_REGISTER
+    let (token, owner_github_user_id, owner_login, allows_private, secret, callback) = {
+        let (token, owner_github_user_id, owner_login, allows_private) =
+            match validate_pat_with_github(state, user_id).await {
+                Ok(value) => value,
+                Err(error)
+                    if scheduled
+                        && matches!(
+                            error.code(),
+                            "pat_invalid"
+                                | "pat_scope_missing"
+                                | "pat_owner_mismatch"
+                                | "classic_pat_required"
+                        ) =>
+                {
+                    pause_user_repos_for_permission_error(state, user_id, error.code(), &error)
+                        .await?;
+                    return Ok(json!({
+                        "skipped": true,
+                        "reason": "permission_paused",
+                        "error_code": error.code()
+                    }));
+                }
+                Err(error) => return Err(anyhow!(error.to_string())),
+            };
+        let (secret, key) = ensure_secret_and_key(state, user_id)
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let callback = callback_url(state, &key).map_err(|err| anyhow!(err.to_string()))?;
+        (
+            token,
+            owner_github_user_id,
+            owner_login,
+            allows_private,
+            secret,
+            callback,
+        )
+    };
+    if effective_operation == OP_REGISTER
         && let Err(error) = sync::refresh_owned_repo_release_visibility(state, user_id).await
     {
         tracing::warn!(
@@ -1521,15 +1938,20 @@ async fn execute_for_user_locked(
             "webhook push: owned repo refresh failed; using cached baseline"
         );
     }
-    let targets = if operation == OP_DELETE {
+    let targets = if matches!(effective_operation, OP_DELETE | OP_PAUSE) {
         sqlx::query_as::<_, TargetRepo>(
             r#"
             SELECT repo_id, owner_github_user_id, owner_login, repo_name, repo_full_name
-            FROM webhook_push_repos WHERE user_id = ? AND hook_id IS NOT NULL
+            FROM webhook_push_repos
+            WHERE user_id = ?
+              AND hook_id IS NOT NULL
+              AND (? IS NULL OR repo_id = ?)
             ORDER BY lower(repo_full_name)
             "#,
         )
         .bind(user_id)
+        .bind(repo_id)
+        .bind(repo_id)
         .fetch_all(&state.pool)
         .await?
     } else {
@@ -1545,14 +1967,18 @@ async fn execute_for_user_locked(
         .await?
     };
     let mut counts = HashMap::<&str, usize>::new();
+    let mut retry_after: Option<Duration> = None;
+    let mut retryable_failure = false;
     for (index, repo) in targets.iter().enumerate() {
         if jobs::is_task_cancel_requested(state, task_id).await? {
-            return Ok(json!({
-                "operation": operation,
-                "total": targets.len(),
-                "counts": counts,
-                "canceled": true,
-            }));
+            let _ = jobs::reschedule_task(
+                state,
+                task_id,
+                Utc::now(),
+                json!({"operation": effective_operation, "reason": "cancel_requested"}),
+            )
+            .await?;
+            return Ok(json!({"operation": effective_operation, "rescheduled": true}));
         }
         renew_user_operation_lease(state, user_id, task_id).await?;
         let result = match resolve_delete_target(state, &token, owner_github_user_id, repo).await {
@@ -1561,7 +1987,7 @@ async fn execute_for_user_locked(
                     state,
                     user_id,
                     &resolved_repo,
-                    operation,
+                    effective_operation,
                     &token,
                     &callback,
                     &secret,
@@ -1570,7 +1996,7 @@ async fn execute_for_user_locked(
             }
             Err(error) => {
                 let permission_paused = is_permission_error(&error);
-                if operation == OP_DELETE {
+                if matches!(effective_operation, OP_DELETE | OP_PAUSE) {
                     sqlx::query(
                         "UPDATE webhook_push_repos SET status = ?, error_kind = ?, error_message = ?, permission_paused = ?, updated_at = ? WHERE user_id = ? AND repo_id = ?",
                     )
@@ -1602,22 +2028,76 @@ async fn execute_for_user_locked(
                     )
                     .await?;
                 }
-                "failed"
+                repo_operation_failed(&error)
             }
         };
-        *counts.entry(result).or_default() += 1;
+        retryable_failure |= result.retryable;
+        retry_after = match (retry_after, result.retry_after) {
+            (Some(current), Some(candidate)) => Some(current.max(candidate)),
+            (current, candidate) => current.or(candidate),
+        };
+        *counts.entry(result.outcome).or_default() += 1;
         jobs::append_task_event(
             state,
             task_id,
             "task.progress",
             json!({
-                "stage": operation, "repo_id": repo.repo_id, "repo": repo.repo_full_name,
-                "index": index + 1, "total": targets.len(), "result": result,
+                "stage": effective_operation, "repo_id": repo.repo_id, "repo": repo.repo_full_name,
+                "index": index + 1, "total": targets.len(), "result": result.outcome,
             }),
         )
         .await?;
     }
-    Ok(json!({"operation": operation, "total": targets.len(), "counts": counts}))
+    if jobs::is_task_cancel_requested(state, task_id).await? {
+        let _ = jobs::reschedule_task(
+            state,
+            task_id,
+            Utc::now(),
+            json!({"operation": effective_operation, "reason": "cancel_requested"}),
+        )
+        .await?;
+        return Ok(json!({"operation": effective_operation, "rescheduled": true}));
+    }
+    if retryable_failure && retry_count < 3 {
+        let delay = retry_delay(retry_count, retry_after);
+        sqlx::query(
+            "UPDATE job_tasks SET payload_json = json_set(payload_json, '$.retry_count', ?) WHERE id = ?",
+        )
+        .bind(i64::from(retry_count + 1))
+        .bind(task_id)
+        .execute(&state.pool)
+        .await?;
+        let _ = jobs::reschedule_task(
+            state,
+            task_id,
+            Utc::now() + delay,
+            json!({
+                "operation": effective_operation,
+                "retry_count": retry_count + 1,
+                "retry_after_seconds": delay.num_seconds(),
+            }),
+        )
+        .await?;
+        return Ok(json!({
+            "operation": effective_operation,
+            "total": targets.len(),
+            "counts": counts,
+            "rescheduled": true,
+            "retry_count": retry_count + 1,
+        }));
+    }
+    if repo_id.is_none() && effective_operation == OP_REGISTER {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE users SET webhook_push_last_completed_check_at = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(user_id)
+        .execute(&state.pool)
+        .await?;
+    }
+    Ok(json!({"operation": effective_operation, "total": targets.len(), "counts": counts}))
 }
 
 pub async fn execute_manage_task(
@@ -1634,7 +2114,21 @@ pub async fn execute_manage_task(
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("webhook push operation missing"))?;
     let repo_id = payload.get("repo_id").and_then(Value::as_i64);
-    execute_for_user(state, task_id, user_id, operation, repo_id, false).await
+    let retry_count = payload
+        .get("retry_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(3) as u8;
+    execute_for_user(
+        state,
+        task_id,
+        user_id,
+        operation,
+        repo_id,
+        false,
+        retry_count,
+    )
+    .await
 }
 
 pub async fn execute_audit_task(state: &AppState, task_id: &str) -> Result<Value> {
@@ -1645,12 +2139,31 @@ pub async fn execute_audit_task(state: &AppState, task_id: &str) -> Result<Value
         .execute(&state.pool)
         .await?;
     let users = sqlx::query_scalar::<_, String>(
-        "SELECT id FROM users WHERE include_own_releases != 0 AND webhook_push_enabled != 0 ORDER BY id",
-    ).fetch_all(&state.pool).await?;
+        r#"
+        SELECT id
+        FROM users
+        WHERE (
+            include_own_releases != 0
+            AND webhook_push_desired_state = 'enabled'
+          )
+          OR (
+            webhook_push_desired_state IN ('paused', 'deleted')
+            AND EXISTS (
+              SELECT 1
+              FROM webhook_push_repos
+              WHERE webhook_push_repos.user_id = users.id
+                AND webhook_push_repos.hook_id IS NOT NULL
+            )
+          )
+        ORDER BY id
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
     let mut succeeded = 0usize;
     let mut failed = 0usize;
     for user_id in &users {
-        match execute_for_user(state, task_id, user_id, OP_REGISTER, None, true).await {
+        match execute_for_user(state, task_id, user_id, OP_RECONCILE, None, true, 0).await {
             Ok(_) => succeeded += 1,
             Err(error) => {
                 failed += 1;
@@ -1755,6 +2268,7 @@ fn should_enqueue_release(
     event: &str,
     payload: &ReleasePayload,
     expected_repo_id: i64,
+    expected_repo_full_name: &str,
     repo_status: &str,
 ) -> bool {
     include_own_releases
@@ -1762,10 +2276,10 @@ fn should_enqueue_release(
         && event == "release"
         && payload.action.as_deref() == Some("published")
         && payload.release.as_ref().is_some_and(|item| !item.draft)
-        && payload
-            .repository
-            .as_ref()
-            .is_some_and(|item| item.id == expected_repo_id)
+        && payload.repository.as_ref().is_some_and(|item| {
+            item.id == expected_repo_id
+                && item.full_name.eq_ignore_ascii_case(expected_repo_full_name)
+        })
         && repo_status == STATUS_REGISTERED
 }
 
@@ -1807,11 +2321,11 @@ pub async fn receive(
             "X-Hub-Signature-256 is malformed",
         ));
     }
-    let row = sqlx::query_as::<_, (String, i64, i64, Vec<u8>, Vec<u8>, i64, String)>(
+    let row = sqlx::query_as::<_, (String, i64, String, Vec<u8>, Vec<u8>, i64, String, String)>(
         r#"
-        SELECT u.id, u.include_own_releases, u.webhook_push_enabled,
+        SELECT u.id, u.include_own_releases, u.webhook_push_desired_state,
                u.webhook_push_secret_ciphertext, u.webhook_push_secret_nonce,
-               wr.repo_id, wr.status
+               wr.repo_id, wr.repo_full_name, wr.status
         FROM users u
         JOIN webhook_push_repos wr ON wr.user_id = u.id AND wr.hook_id = ?
         WHERE u.webhook_push_callback_key = ?
@@ -1861,8 +2375,15 @@ pub async fn receive(
     let action = payload.action.as_deref().unwrap_or("");
     let release = payload.release.as_ref();
     let repo = payload.repository.as_ref();
-    let should_queue =
-        should_enqueue_release(row.1 != 0, row.2 != 0, event, &payload, row.5, &row.6);
+    let should_queue = should_enqueue_release(
+        row.1 != 0,
+        row.2 == DESIRED_ENABLED,
+        event,
+        &payload,
+        row.5,
+        &row.6,
+        &row.7,
+    );
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         "INSERT OR IGNORE INTO webhook_push_deliveries (delivery_id, hook_id, repo_id, event, action, received_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1974,21 +2495,72 @@ mod tests {
             "release",
             &payload,
             42,
+            "owner/repo",
+            STATUS_REGISTERED,
+        ));
+        assert!(!should_enqueue_release(
+            true,
+            true,
+            "release",
+            &payload,
+            42,
+            "other/repo",
             STATUS_REGISTERED,
         ));
 
         for candidate in [
-            should_enqueue_release(false, true, "release", &payload, 42, STATUS_REGISTERED),
-            should_enqueue_release(true, false, "release", &payload, 42, STATUS_REGISTERED),
-            should_enqueue_release(true, true, "push", &payload, 42, STATUS_REGISTERED),
-            should_enqueue_release(true, true, "release", &payload, 99, STATUS_REGISTERED),
-            should_enqueue_release(true, true, "release", &payload, 42, STATUS_MISSING),
+            should_enqueue_release(
+                false,
+                true,
+                "release",
+                &payload,
+                42,
+                "owner/repo",
+                STATUS_REGISTERED,
+            ),
+            should_enqueue_release(
+                true,
+                false,
+                "release",
+                &payload,
+                42,
+                "owner/repo",
+                STATUS_REGISTERED,
+            ),
+            should_enqueue_release(
+                true,
+                true,
+                "push",
+                &payload,
+                42,
+                "owner/repo",
+                STATUS_REGISTERED,
+            ),
+            should_enqueue_release(
+                true,
+                true,
+                "release",
+                &payload,
+                99,
+                "owner/repo",
+                STATUS_REGISTERED,
+            ),
+            should_enqueue_release(
+                true,
+                true,
+                "release",
+                &payload,
+                42,
+                "owner/repo",
+                STATUS_MISSING,
+            ),
             should_enqueue_release(
                 true,
                 true,
                 "release",
                 &release_payload("edited", 42, false),
                 42,
+                "owner/repo",
                 STATUS_REGISTERED,
             ),
             should_enqueue_release(
@@ -1997,10 +2569,193 @@ mod tests {
                 "release",
                 &release_payload("published", 42, true),
                 42,
+                "owner/repo",
                 STATUS_REGISTERED,
             ),
         ] {
             assert!(!candidate);
         }
+    }
+
+    #[test]
+    fn paused_target_is_healthy_but_receiver_does_not_enqueue() {
+        let payload = release_payload("published", 42, false);
+        assert!(!should_enqueue_release(
+            true,
+            false,
+            "release",
+            &payload,
+            42,
+            "owner/repo",
+            STATUS_REGISTERED,
+        ));
+    }
+
+    #[test]
+    fn retry_delay_uses_three_backoff_slots_and_later_retry_after() {
+        assert_eq!(retry_delay(0, None), chrono::Duration::minutes(1));
+        assert_eq!(retry_delay(1, None), chrono::Duration::minutes(5));
+        assert_eq!(retry_delay(2, None), chrono::Duration::minutes(15));
+        assert_eq!(
+            retry_delay(0, Some(Duration::from_secs(90))),
+            chrono::Duration::seconds(90)
+        );
+    }
+
+    #[test]
+    fn managed_hook_identity_requires_id_callback_and_release_event() {
+        let hook = GitHubHook {
+            id: 7,
+            active: true,
+            events: vec!["release".to_owned()],
+            config: GitHubHookConfig {
+                url: Some("https://octo.example/hook".to_owned()),
+                content_type: Some("json".to_owned()),
+            },
+        };
+        assert!(hook_matches(&hook, Some(7), "https://octo.example/hook"));
+        assert!(!hook_matches(&hook, Some(8), "https://octo.example/hook"));
+        assert!(!hook_matches(&hook, Some(7), "https://other.example/hook"));
+    }
+
+    #[test]
+    fn managed_repository_identity_requires_canonical_name() {
+        let repo = TargetRepo {
+            repo_id: 42,
+            owner_github_user_id: Some(7),
+            owner_login: "owner".to_owned(),
+            repo_name: "repo".to_owned(),
+            repo_full_name: "owner/repo".to_owned(),
+        };
+        let identity = GitHubRepoIdentity {
+            id: 42,
+            full_name: "Owner/Repo".to_owned(),
+            owner: GitHubUser {
+                id: 7,
+                login: "owner".to_owned(),
+            },
+        };
+        assert!(repo_identity_matches(&identity, 7, &repo));
+        assert!(!repo_identity_matches(
+            &GitHubRepoIdentity {
+                full_name: "owner/renamed".to_owned(),
+                ..identity
+            },
+            7,
+            &repo
+        ));
+    }
+
+    #[tokio::test]
+    async fn desired_state_migration_maps_legacy_rows_without_external_side_effects() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE users (id TEXT PRIMARY KEY, webhook_push_enabled INTEGER NOT NULL);
+            CREATE TABLE webhook_push_repos (user_id TEXT NOT NULL, hook_id INTEGER);
+            CREATE TABLE job_tasks (
+              id TEXT PRIMARY KEY,
+              task_type TEXT NOT NULL,
+              requested_by TEXT,
+              status TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              error_message TEXT,
+              finished_at TEXT,
+              runtime_owner_id TEXT,
+              lease_heartbeat_at TEXT,
+              cancel_requested INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE webhook_push_user_operation_leases (
+              user_id TEXT PRIMARY KEY,
+              task_id TEXT NOT NULL,
+              expires_at TEXT NOT NULL
+            );
+            INSERT INTO users (id, webhook_push_enabled) VALUES ('enabled', 1), ('paused', 0), ('deleted', 0);
+            INSERT INTO webhook_push_repos (user_id, hook_id) VALUES ('paused', 9001);
+            INSERT INTO job_tasks (
+              id, task_type, requested_by, status, payload_json, created_at, updated_at
+            ) VALUES
+              ('manage-1', 'webhook.push.manage', 'enabled', 'queued', '{"operation":"register"}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+              ('manage-2', 'webhook.push.manage', 'enabled', 'running', '{"operation":"delete"}', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z'),
+              ('manage-3', 'webhook.push.manage', 'enabled', 'queued', '{"operation":"check"}', '2026-01-03T00:00:00Z', '2026-01-03T00:00:00Z'),
+              ('audit-1', 'webhook.push.audit', 'audit', 'queued', '{"operation":"audit"}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+              ('audit-2', 'webhook.push.audit', 'audit', 'running', '{"operation":"audit"}', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z');
+            INSERT INTO webhook_push_user_operation_leases (user_id, task_id, expires_at)
+            VALUES
+              ('enabled', 'manage-2', '2026-01-04T00:00:00Z'),
+              ('audit', 'audit-2', '2026-01-04T00:00:00Z');
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create legacy schema");
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/0080_webhook_push_desired_state.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("apply desired state migration");
+
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, webhook_push_desired_state FROM users ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read migrated desired states");
+        assert_eq!(
+            rows,
+            vec![
+                ("deleted".to_owned(), "deleted".to_owned()),
+                ("enabled".to_owned(), "enabled".to_owned()),
+                ("paused".to_owned(), "paused".to_owned()),
+            ]
+        );
+        let task_rows = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT id, status, error_message FROM job_tasks ORDER BY CASE task_type WHEN 'webhook.push.manage' THEN 0 ELSE 1 END, id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read migrated task rows");
+        assert_eq!(task_rows.len(), 5);
+        assert_eq!(task_rows[0].1, "canceled");
+        assert_eq!(task_rows[1].1, "running");
+        assert_eq!(task_rows[2].1, "canceled");
+        assert_eq!(task_rows[3].0, "audit-1");
+        assert_eq!(task_rows[3].1, "queued");
+        assert_eq!(task_rows[4].0, "audit-2");
+        assert_eq!(task_rows[4].1, "running");
+        assert!(sqlx::query(
+            "INSERT INTO job_tasks (id, task_type, requested_by, status, payload_json, created_at, updated_at) VALUES ('manage-4', 'webhook.push.manage', 'enabled', 'queued', '{}', '2026-01-04T00:00:00Z', '2026-01-04T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        let lease_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM webhook_push_user_operation_leases")
+                .fetch_one(&pool)
+                .await
+                .expect("count migrated leases");
+        assert_eq!(lease_count, 2);
+        let audit_lease_task = sqlx::query_scalar::<_, String>(
+            "SELECT task_id FROM webhook_push_user_operation_leases WHERE user_id = 'audit'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("audit lease survives migration");
+        assert_eq!(audit_lease_task, "audit-2");
+        let available_at_column = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info('job_tasks') WHERE name = 'available_at'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("check available_at column");
+        assert_eq!(available_at_column, 1);
     }
 }

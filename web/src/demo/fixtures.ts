@@ -30,6 +30,8 @@ import type {
 	ReleaseDetailResponse,
 	RepoPublicReleasePublicationStatusResponse,
 	TranslationResultItem,
+	WebhookPushRepoStatus,
+	WebhookPushSettingsResponse,
 } from "@/api";
 import type { FeedItem, FeedResponse } from "@/feed/types";
 import type { RepoVisual } from "@/lib/repoVisual";
@@ -41,6 +43,7 @@ import type {
 	DemoPersonaId,
 	DemoPublicationState,
 	DemoSceneId,
+	DemoWebhookScenario,
 } from "@/demo/types";
 
 function svgAvatarDataUrl(
@@ -224,6 +227,178 @@ function buildReactionToken(): ReactionTokenStatusResponse {
 			message: "PAT 可用",
 			checked_at: "2026-07-08T09:12:00+08:00",
 		},
+	};
+}
+
+function buildWebhookPushSettings(
+	includeOwnReleases: boolean,
+	scenario: DemoWebhookScenario = includeOwnReleases
+		? "waiting-registration"
+		: "deleted",
+): WebhookPushSettingsResponse {
+	const desiredState =
+		scenario === "paused-retained"
+			? "paused"
+			: scenario === "deleted" || scenario === "delete-pending"
+				? "deleted"
+				: "enabled";
+	const checkedAt = "2026-07-08T09:45:00+08:00";
+	const registeredAt = "2026-07-07T18:20:00+08:00";
+	const baseRepo = (
+		repoId: number,
+		ownerLogin: string,
+		repoName: string,
+	): WebhookPushRepoStatus => ({
+		repo_id: repoId,
+		owner_login: ownerLogin,
+		repo_name: repoName,
+		repo_full_name: `${ownerLogin}/${repoName}`,
+		is_private: false,
+		hook_id: null,
+		status: "waiting_registration",
+		error_kind: null,
+		error_message: null,
+		permission_paused: false,
+		last_checked_at: null,
+		last_registered_at: null,
+	});
+	const repos = [baseRepo(7001, "octo-demo-owner", "release-lab")];
+	let operation: WebhookPushSettingsResponse["operation"] = null;
+	let lastCompletedCheckAt: string | null = null;
+
+	const markRegistered = (repo: WebhookPushRepoStatus, hookId: number) => ({
+		...repo,
+		hook_id: hookId,
+		status: "registered",
+		last_checked_at: checkedAt,
+		last_registered_at: registeredAt,
+	});
+
+	switch (scenario) {
+		case "registering":
+			repos[0] = { ...repos[0], status: "registering" };
+			operation = {
+				task_id: "demo-webhook-registering",
+				status: "running",
+				operation: "reconcile",
+				available_at: null,
+			};
+			break;
+		case "healthy-registered":
+			repos[0] = markRegistered(repos[0], 91001);
+			lastCompletedCheckAt = checkedAt;
+			break;
+		case "paused-retained":
+			repos[0] = markRegistered(repos[0], 91001);
+			lastCompletedCheckAt = checkedAt;
+			break;
+		case "permission-paused":
+			repos[0] = {
+				...repos[0],
+				hook_id: 91001,
+				status: "permission_paused",
+				permission_paused: true,
+				error_kind: "permission",
+				error_message: "当前 classic PAT 缺少 repo 或 public_repo 权限。",
+			};
+			break;
+		case "temporary-error":
+			repos[0] = {
+				...repos[0],
+				status: "error",
+				error_kind: "github_rate_limit",
+				error_message: "GitHub 暂时限流，稍后可再次检查并修复。",
+			};
+			break;
+		case "delete-pending":
+			repos[0] = { ...repos[0], hook_id: 91001, status: "delete_pending" };
+			operation = {
+				task_id: "demo-webhook-delete-pending",
+				status: "queued",
+				operation: "reconcile",
+				available_at: "2026-07-08T10:35:00+08:00",
+			};
+			break;
+		case "multi-owner":
+			repos.splice(
+				0,
+				1,
+				markRegistered(repos[0], 91001),
+				{
+					...baseRepo(7002, "octo-demo-owner", "docs-hub"),
+					status: "missing",
+				},
+				{
+					...baseRepo(7003, "release-team", "mobile-app"),
+					status: "error",
+					error_kind: "github_timeout",
+					error_message: "GitHub 响应超时，可逐仓重试。",
+				},
+			);
+			lastCompletedCheckAt = checkedAt;
+			break;
+		case "waiting-registration":
+			repos[0] = { ...repos[0], status: "waiting_registration" };
+			break;
+		case "deleted":
+			repos[0] = {
+				...repos[0],
+				status: "not_configured",
+			};
+			break;
+	}
+
+	const ownerGroups = Array.from(
+		repos.reduce((groups, repo) => {
+			const group = groups.get(repo.owner_login) ?? [];
+			group.push(repo);
+			groups.set(repo.owner_login, group);
+			return groups;
+		}, new Map<string, WebhookPushRepoStatus[]>()),
+	).map(([ownerLogin, ownerRepos]) => ({
+		owner_login: ownerLogin,
+		repo_count: ownerRepos.length,
+		pending_count: ownerRepos.filter(
+			(repo) =>
+				repo.status !== "registered" && repo.status !== "not_configured",
+		).length,
+		repos: ownerRepos,
+	}));
+	const registered = repos.filter(
+		(repo) => repo.status === "registered",
+	).length;
+	const permissionPaused = repos.filter(
+		(repo) => repo.permission_paused,
+	).length;
+	const errors = repos.filter((repo) => repo.status === "error").length;
+	const removable = repos.filter((repo) => repo.hook_id !== null).length;
+	return {
+		desired_state: desiredState,
+		enabled: desiredState === "enabled" && includeOwnReleases,
+		include_own_releases: includeOwnReleases,
+		callback_ready: true,
+		pat: {
+			configured: true,
+			valid: true,
+			owner_login: "octo-demo-owner",
+		},
+		summary: {
+			total: repos.length,
+			registered,
+			missing: repos.filter((repo) => repo.status === "missing").length,
+			permission_paused: permissionPaused,
+			errors,
+			removable,
+		},
+		schedule: {
+			audit_interval_days: 7,
+			last_started_at: "2026-07-07T06:00:00+08:00",
+			next_started_at: "2026-07-14T06:00:00+08:00",
+		},
+		operation,
+		last_completed_check_at: lastCompletedCheckAt,
+		owner_groups: ownerGroups,
+		repos,
 	};
 }
 
@@ -2103,6 +2278,7 @@ export function buildDemoModel(input: {
 	sceneId: DemoSceneId;
 	personaId: DemoPersonaId;
 	includeOwnReleases: boolean;
+	webhookScenario?: DemoWebhookScenario;
 	publicationState: DemoPublicationState;
 }): DemoModel {
 	const me = buildMe(
@@ -2123,6 +2299,11 @@ export function buildDemoModel(input: {
 		passkeys: buildPasskeys(),
 		apiKeys: buildApiKeys(),
 		reactionToken: buildReactionToken(),
+		webhookPush: buildWebhookPushSettings(
+			input.includeOwnReleases,
+			input.webhookScenario ??
+				(input.includeOwnReleases ? "waiting-registration" : "deleted"),
+		),
 		followingRepos: buildFollowingRepos(),
 		personalRepos: buildPersonalRepos(),
 		feed: buildFeed(input.includeOwnReleases),
