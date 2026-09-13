@@ -1119,7 +1119,7 @@ pub(crate) async fn enqueue_reconcile_for_user(
 pub async fn reconcile(
     State(state): State<Arc<AppState>>,
     session: Session,
-    Json(request): Json<ReconcileRequest>,
+    request: Option<Json<ReconcileRequest>>,
 ) -> Result<Json<TaskEnqueueResponse>, ApiError> {
     let user_id = api::require_active_user_id(state.as_ref(), &session).await?;
     let operation_lock = user_operation_lock(&user_id);
@@ -1132,15 +1132,9 @@ pub async fn reconcile(
             "请先开启“我的发布”。",
         ));
     }
+    let repo_id = request.and_then(|Json(request)| request.repo_id);
     Ok(Json(task_response(
-        enqueue_manage(
-            state.as_ref(),
-            &user_id,
-            OP_RECONCILE,
-            request.repo_id,
-            "manual",
-        )
-        .await?,
+        enqueue_manage(state.as_ref(), &user_id, OP_RECONCILE, repo_id, "manual").await?,
         OP_RECONCILE,
     )))
 }
@@ -2837,6 +2831,21 @@ pub async fn receive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Body, extract::FromRequest, http::Request};
+
+    #[tokio::test]
+    async fn reconcile_accepts_empty_body_as_full_reconcile() {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/me/webhook-push/reconcile")
+            .body(Body::empty())
+            .expect("build empty reconcile request");
+
+        let parsed = Option::<Json<ReconcileRequest>>::from_request(request, &())
+            .await
+            .expect("empty reconcile body should be accepted");
+        assert!(parsed.is_none());
+    }
 
     #[test]
     fn signature_verification_accepts_known_digest() {
