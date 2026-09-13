@@ -44,6 +44,7 @@ import {
 	LANDING_BOOT_STATE_OPTIONS,
 	LANDING_CASE_OPTIONS,
 	LANDING_PASSKEY_SUPPORT_OPTIONS,
+	WEBHOOK_SCENARIO_OPTIONS,
 } from "@/demo/registry";
 import type {
 	DemoLandingAuthAction,
@@ -51,6 +52,7 @@ import type {
 	DemoLandingCase,
 	DemoLandingPasskeySupport,
 	DemoNetworkMode,
+	DemoWebhookScenario,
 } from "@/demo/types";
 import {
 	applyDemoShareStateInPlace,
@@ -540,7 +542,25 @@ export function DemoInspector(props: {
 				},
 			),
 		onIncludeOwnReleasesChange: (includeOwnReleases: boolean) =>
-			navigateWithShareState({ includeOwnReleases }, { reseed: true }),
+			navigateWithShareState(
+				{
+					includeOwnReleases,
+					webhookScenario: includeOwnReleases
+						? snapshot.shareState.webhookScenario === "deleted"
+							? "waiting-registration"
+							: snapshot.shareState.webhookScenario
+						: "deleted",
+				},
+				{ reseed: true },
+			),
+		onWebhookScenarioChange: (webhookScenario: DemoWebhookScenario) =>
+			navigateWithShareState(
+				{
+					webhookScenario,
+					includeOwnReleases: webhookScenario !== "deleted",
+				},
+				{ reseed: true },
+			),
 		onPublicationStateChange: (publicationState: "published" | "unpublished") =>
 			navigateWithShareState({ publicationState }, { reseed: true }),
 		onReset: resetToSceneDefaults,
@@ -998,6 +1018,7 @@ export type DemoInspectorPanelProps = {
 	onPersonaChange: (personaId: "guest" | "member" | "admin") => void;
 	onNetworkChange: (networkMode: DemoNetworkMode) => void;
 	onIncludeOwnReleasesChange: (checked: boolean) => void;
+	onWebhookScenarioChange: (scenario: DemoWebhookScenario) => void;
 	onPublicationStateChange: (state: "published" | "unpublished") => void;
 	onReset: () => void;
 	onCopyShareLink: () => void;
@@ -1014,6 +1035,7 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 	const personaSelectId = useId();
 	const networkSelectId = useId();
 	const includeOwnReleasesSwitchId = useId();
+	const webhookScenarioSelectId = useId();
 	const publicationStateSelectId = useId();
 	const shareInputId = useId();
 
@@ -1219,6 +1241,25 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 										)
 									}
 									options={PUBLICATION_OPTIONS}
+									compact={isCompact}
+								/>
+							</div>
+						) : null}
+						{snapshot.shareState.sceneId === "settings-my-releases" ? (
+							<div
+								className={cn("space-y-1.5", isCompact && "space-y-0.5")}
+								data-demo-webhook-scenario-control="true"
+							>
+								<Label htmlFor={webhookScenarioSelectId}>
+									Webhook scenario
+								</Label>
+								<InspectorSelect
+									id={webhookScenarioSelectId}
+									value={snapshot.shareState.webhookScenario}
+									onValueChange={(value) =>
+										props.onWebhookScenarioChange(value as DemoWebhookScenario)
+									}
+									options={WEBHOOK_SCENARIO_OPTIONS}
 									compact={isCompact}
 								/>
 							</div>

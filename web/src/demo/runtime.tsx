@@ -30,6 +30,7 @@ type DemoRuntimeDependencies = {
 		sceneId: DemoSceneId;
 		personaId: DemoShareState["personaId"];
 		includeOwnReleases: boolean;
+		webhookScenario: DemoShareState["webhookScenario"];
 		publicationState: DemoShareState["publicationState"];
 	}) => DemoModel;
 	demoHandlers: typeof import("@/demo/transport")["demoHandlers"];
@@ -93,6 +94,7 @@ const runtimeState: DemoSnapshot = {
 		personaId: "guest",
 		networkMode: "normal",
 		includeOwnReleases: false,
+		webhookScenario: "deleted",
 		publicationState: "unpublished",
 		landingCase: "default",
 		landingAuthAction: "idle",
@@ -130,6 +132,7 @@ function modelAffectingShareStateChanged(
 		current.sceneId !== next.sceneId ||
 		current.personaId !== next.personaId ||
 		current.includeOwnReleases !== next.includeOwnReleases ||
+		current.webhookScenario !== next.webhookScenario ||
 		current.publicationState !== next.publicationState ||
 		current.networkMode === "readable-loading" ||
 		next.networkMode === "readable-loading"
@@ -291,6 +294,7 @@ function seedModel(shareState: DemoShareState): DemoModel {
 		sceneId: shareState.sceneId,
 		personaId: shareState.personaId,
 		includeOwnReleases: shareState.includeOwnReleases,
+		webhookScenario: shareState.webhookScenario,
 		publicationState: shareState.publicationState,
 	});
 }
