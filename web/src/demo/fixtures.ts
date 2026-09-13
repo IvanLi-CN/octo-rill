@@ -19,6 +19,7 @@ import type {
 	ApiKeySummary,
 	AuthBindContextResponse,
 	FollowingReposResponse,
+	PersonalReposResponse,
 	GitHubConnectionResponse,
 	MeLinuxDoResponse,
 	MeProfileResponse,
@@ -424,52 +425,173 @@ function buildNotifications(): NotificationItem[] {
 }
 
 function buildFollowingRepos(): FollowingReposResponse {
-	return {
-		following_count: 2,
-		associated_count: 3,
-		items: [
-			{
-				repo_id: 1001,
-				full_name: OWNER_REPO_FULL_NAME,
-				owner_login: OWNER_SCOPE.owner,
-				name: OWNER_SCOPE.repo,
-				html_url: "https://github.com/octo-demo/release-lab",
-				description: "Fictional private repo for mock-only acceptance.",
-				is_private: true,
-				first_source: "personal_owned",
-				first_associated_at: "2026-07-01T10:00:00+08:00",
+	const ownerRepo: FollowingReposResponse["items"][number] = {
+		repo_id: 1001,
+		full_name: OWNER_REPO_FULL_NAME,
+		owner_login: OWNER_SCOPE.owner,
+		name: OWNER_SCOPE.repo,
+		html_url: "https://github.com/octo-demo/release-lab",
+		description: "Fictional private repo for mock-only acceptance.",
+		is_private: true,
+		first_source: "personal_owned",
+		first_associated_at: "2026-07-01T10:00:00+08:00",
+		last_seen_at: NOW,
+		is_following: true,
+		follow_state_source: "manual_feed",
+		repo_visual: OWNER_REPO_VISUAL,
+		sources: {
+			personal_owned: true,
+			github_star: false,
+			manual_feed: true,
+		},
+	};
+	const docsRepo: FollowingReposResponse["items"][number] = {
+		repo_id: 1002,
+		full_name: DOCS_REPO_FULL_NAME,
+		owner_login: DOCS_SCOPE.owner,
+		name: DOCS_SCOPE.repo,
+		html_url: "https://github.com/octo-demo/docs-hub",
+		description: "Public docs and Pages assembly",
+		is_private: false,
+		first_source: "github_star",
+		first_associated_at: "2026-07-03T10:00:00+08:00",
+		last_seen_at: NOW,
+		is_following: true,
+		follow_state_source: "github_star",
+		repo_visual: DOCS_REPO_VISUAL,
+		sources: {
+			personal_owned: false,
+			github_star: true,
+			manual_feed: false,
+		},
+	};
+	const associatedRepo: FollowingReposResponse["items"][number] = {
+		repo_id: 1003,
+		full_name: "octo-demo/release-notes",
+		owner_login: "octo-demo",
+		name: "release-notes",
+		html_url: "https://github.com/octo-demo/release-notes",
+		description: "Associated repository without an active follow.",
+		is_private: false,
+		first_source: "manual_feed",
+		first_associated_at: "2026-07-04T10:00:00+08:00",
+		last_seen_at: NOW,
+		is_following: false,
+		follow_state_source: "manual_feed",
+		repo_visual: null,
+		sources: {
+			personal_owned: false,
+			github_star: false,
+			manual_feed: true,
+		},
+	};
+	const associatedOnlyRepo: FollowingReposResponse["items"][number] = {
+		...associatedRepo,
+		repo_id: 1004,
+		full_name: "octo-demo/security-lab",
+		name: "security-lab",
+		html_url: "https://github.com/octo-demo/security-lab",
+		description: "Associated security review fixtures.",
+		first_associated_at: "2026-07-08T10:00:00+08:00",
+	};
+	const extraFollowingRepos = [
+		["octo-demo/mobile-lab", "Mobile release experiments"],
+		["octo-demo/changelog", "Product changelog and release notes"],
+		["octo-demo/ops-console", "Operations dashboard"],
+		["octo-demo/design-system", "Shared UI primitives"],
+		["octo-demo/automation-kit", "Workflow automation examples"],
+		["octo-demo/archive-room", "Archived project fixtures"],
+		["octo-demo/webhooks", "Webhook delivery fixtures"],
+		["octo-demo/translation-lab", "Translation QA workspace"],
+		["octo-demo/release-train", "Release train planning"],
+		["octo-demo/api-gateway", "API gateway examples"],
+		["octo-demo/playground", "Experimental playground"],
+		["octo-demo/metrics-hub", "Repository metrics"],
+		["octo-demo/docs-preview", "Documentation preview"],
+		["octo-demo/integration-tests", "Integration test fixtures"],
+		["octo-demo/community", "Community examples"],
+		["octo-demo/nightly-build", "Nightly build status"],
+	] as const;
+	const extraItems: FollowingReposResponse["items"] = extraFollowingRepos.map(
+		([fullName, description], index) => {
+			const [ownerLogin, name] = fullName.split("/");
+			return {
+				repo_id: 1_100 + index,
+				full_name: fullName,
+				owner_login: ownerLogin,
+				name,
+				html_url: `https://github.com/${fullName}`,
+				description,
+				is_private: false,
+				first_source: "manual_feed",
+				first_associated_at: `2026-07-${String(5 + index).padStart(2, "0")}T10:00:00+08:00`,
 				last_seen_at: NOW,
 				is_following: true,
 				follow_state_source: "manual_feed",
-				repo_visual: OWNER_REPO_VISUAL,
+				repo_visual: null,
 				sources: {
-					personal_owned: true,
+					personal_owned: false,
 					github_star: false,
 					manual_feed: true,
 				},
-			},
-			{
-				repo_id: 1002,
-				full_name: DOCS_REPO_FULL_NAME,
-				owner_login: DOCS_SCOPE.owner,
-				name: DOCS_SCOPE.repo,
-				html_url: "https://github.com/octo-demo/docs-hub",
-				description: "Public docs and Pages assembly",
-				is_private: false,
-				first_source: "github_star",
-				first_associated_at: "2026-07-03T10:00:00+08:00",
-				last_seen_at: NOW,
-				is_following: true,
-				follow_state_source: "github_star",
-				repo_visual: DOCS_REPO_VISUAL,
-				sources: {
-					personal_owned: false,
-					github_star: true,
-					manual_feed: false,
-				},
-			},
-		],
-		associated_items: [],
+			};
+		},
+	);
+	const followingItems = [ownerRepo, docsRepo, ...extraItems];
+	const associatedItems = [
+		...followingItems,
+		associatedRepo,
+		associatedOnlyRepo,
+	];
+
+	return {
+		following_count: followingItems.length,
+		associated_count: associatedItems.length,
+		items: followingItems,
+		associated_items: associatedItems,
+	};
+}
+
+function buildPersonalRepos(): PersonalReposResponse {
+	const ownerLogin = "octo-demo-owner";
+	const names = [
+		"release-lab",
+		"docs-hub",
+		"quiet-project",
+		"mobile-lab",
+		"changelog",
+		"ops-console",
+		"archive-room",
+		"design-system",
+		"webhooks",
+		"translation-lab",
+		"release-train",
+		"api-gateway",
+		"playground",
+		"metrics-hub",
+		"docs-preview",
+		"integration-tests",
+		"community",
+		"nightly-build",
+	];
+	return {
+		owner_login: ownerLogin,
+		total_count: names.length,
+		repos: names.map((name, index) => ({
+			repo_id: 7_001 + index,
+			full_name: `${ownerLogin}/${name}`,
+			owner_login: ownerLogin,
+			name,
+			html_url: `https://github.com/${ownerLogin}/${name}`,
+			updated_at: "2026-07-08T08:00:00+08:00",
+			release_count:
+				name === "quiet-project" || name === "archive-room"
+					? 0
+					: index % 3 === 0
+						? 2
+						: 1,
+			repo_visual: null,
+		})),
 	};
 }
 
@@ -2002,6 +2124,7 @@ export function buildDemoModel(input: {
 		apiKeys: buildApiKeys(),
 		reactionToken: buildReactionToken(),
 		followingRepos: buildFollowingRepos(),
+		personalRepos: buildPersonalRepos(),
 		feed: buildFeed(input.includeOwnReleases),
 		briefs: buildBriefs(),
 		notifications: buildNotifications(),

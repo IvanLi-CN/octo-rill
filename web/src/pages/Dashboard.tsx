@@ -104,6 +104,7 @@ import {
 	resolveDashboardScopeRepoNames,
 } from "@/dashboard/scopeSummary";
 import { RepoPublicReleaseControls } from "@/dashboard/RepoPublicReleaseControls";
+import { useRepositoryPanelViewportHeight } from "@/dashboard/useRepositoryPanelViewportHeight";
 import {
 	type DashboardLiveUpdateNotice,
 	useDashboardLiveUpdates,
@@ -655,6 +656,34 @@ function ScopedSummaryCard(props: {
 			? (stickyAssociatedItems ?? associatedRepoItems)
 			: (stickyFollowingItems ?? followingRepoItems);
 	const visibleRepoNames = repoNames.slice(0, repoChipLimit);
+	const repositoryPanelEnabled =
+		desktop && (scope.kind === "mine" || scope.kind === "following");
+	const repositoryPanelItemCount =
+		scope.kind === "mine"
+			? personalRepoItems.length
+			: scope.kind === "following"
+				? followingListItems.length
+				: 0;
+	const repositoryPanelItemsKey =
+		scope.kind === "mine"
+			? personalRepoItems.map((repo) => repo.full_name).join("|")
+			: scope.kind === "following"
+				? `${followingListView}:${followingListItems
+						.map((repo) => repo.full_name)
+						.join("|")}`
+				: "";
+	const {
+		panelRef: repositoryPanelRef,
+		listRef: repositoryListRef,
+		panelStyle: repositoryPanelStyle,
+		listStyle: repositoryListStyle,
+		shortList: repositoryPanelShortList,
+		compact: repositoryPanelCompact,
+	} = useRepositoryPanelViewportHeight({
+		enabled: repositoryPanelEnabled,
+		itemCount: repositoryPanelItemCount,
+		itemsKey: repositoryPanelItemsKey,
+	});
 	const publicReleaseUrl = resolveRepoPublicReleaseUrl(
 		publicationStatus,
 		scope,
@@ -711,13 +740,21 @@ function ScopedSummaryCard(props: {
 			if (scope.kind !== "following") {
 				return;
 			}
+			const nextItems = updateFollowingRepoSnapshot(
+				followingListItems,
+				fullName,
+				isFollowing,
+			);
 			setFollowingListSnapshots((current) => ({
 				...current,
-				[followingListView]: updateFollowingRepoSnapshot(
-					followingListItems,
-					fullName,
-					isFollowing,
-				),
+				[followingListView]:
+					followingListView === "following" && !isFollowing
+						? nextItems.filter(
+								(repo) =>
+									normalizeFollowingRepoKey(repo.full_name) !==
+									normalizeFollowingRepoKey(fullName),
+							)
+						: nextItems,
 			}));
 		},
 		[followingListItems, followingListView, scope.kind],
@@ -930,36 +967,76 @@ function ScopedSummaryCard(props: {
 
 	return (
 		<div
+			ref={repositoryPanelRef}
 			className={[
 				"rounded-[28px] border border-border/70 bg-card/82 shadow-sm backdrop-blur",
-				desktop ? "p-5" : "mb-4 p-4 sm:p-5",
+				desktop
+					? repositoryPanelCompact
+						? "min-h-0 p-3"
+						: "min-h-0 p-5"
+					: "mb-4 p-4 sm:p-5",
+				repositoryPanelEnabled ? "flex flex-col" : null,
 			].join(" ")}
+			style={repositoryPanelStyle}
 			data-dashboard-scope-summary={scope.kind}
 			data-dashboard-scope-summary-layout={desktop ? "desktop" : "mobile"}
+			data-dashboard-repository-panel={
+				repositoryPanelEnabled ? "true" : "false"
+			}
+			data-dashboard-repository-panel-state={
+				repositoryPanelEnabled
+					? repositoryPanelShortList
+						? "viewport-fill"
+						: "natural-capped"
+					: "natural"
+			}
+			data-dashboard-repository-panel-density={
+				repositoryPanelCompact ? "compact" : "comfortable"
+			}
 		>
 			<div className="flex items-start justify-between gap-3">
 				<div className="min-w-0">
 					<p className="font-mono text-[11px] uppercase tracking-[0.22em] text-muted-foreground">
 						{summary.kicker}
 					</p>
-					<h2 className="mt-1 text-xl font-semibold tracking-tight text-foreground">
+					<h2
+						className={
+							repositoryPanelCompact
+								? "text-lg font-semibold tracking-tight text-foreground"
+								: "mt-1 text-xl font-semibold tracking-tight text-foreground"
+						}
+					>
 						{summary.title}
 					</h2>
 				</div>
-				<div className="inline-flex shrink-0 items-center gap-2 rounded-full border border-border/70 bg-muted/35 px-3 py-1 font-mono text-[11px] text-muted-foreground">
+				<div
+					className={[
+						"inline-flex shrink-0 items-center gap-2 rounded-full border border-border/70 bg-muted/35 font-mono text-[11px] text-muted-foreground",
+						repositoryPanelCompact ? "px-2 py-0.5" : "px-3 py-1",
+					].join(" ")}
+				>
 					<span>{summary.chip}</span>
 					<span aria-hidden="true">·</span>
 					<span>{summary.secondary}</span>
 				</div>
 			</div>
 
-			<p className="mt-3 text-sm leading-6 text-muted-foreground">
+			<p
+				className={
+					repositoryPanelCompact
+						? "mt-1 line-clamp-1 text-xs leading-4 text-muted-foreground"
+						: "mt-3 text-sm leading-6 text-muted-foreground"
+				}
+			>
 				{summary.description}
 			</p>
 
 			{scope.kind === "following" ? (
 				<div
-					className="mt-4 grid gap-2 sm:grid-cols-2"
+					className={[
+						"grid gap-2 sm:grid-cols-2",
+						repositoryPanelCompact ? "mt-2" : "mt-4",
+					].join(" ")}
 					data-dashboard-following-stat-grid="true"
 				>
 					<button
@@ -968,7 +1045,8 @@ function ScopedSummaryCard(props: {
 						data-dashboard-following-stat="following"
 						onClick={() => handleFollowingListViewChange("following")}
 						className={[
-							"rounded-xl px-4 py-3 text-left transition-colors",
+							"rounded-xl text-left transition-colors",
+							repositoryPanelCompact ? "px-3 py-1.5" : "px-4 py-3",
 							followingListView === "following"
 								? "bg-muted/38 text-foreground"
 								: "bg-transparent text-muted-foreground hover:bg-muted/20 hover:text-foreground",
@@ -977,7 +1055,13 @@ function ScopedSummaryCard(props: {
 						<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
 							关注仓库
 						</p>
-						<p className="mt-1 text-lg font-semibold text-foreground">
+						<p
+							className={
+								repositoryPanelCompact
+									? "text-base font-semibold text-foreground"
+									: "mt-1 text-lg font-semibold text-foreground"
+							}
+						>
 							{followingRepoCount}
 						</p>
 					</button>
@@ -987,7 +1071,8 @@ function ScopedSummaryCard(props: {
 						data-dashboard-following-stat="associated"
 						onClick={() => handleFollowingListViewChange("associated")}
 						className={[
-							"rounded-xl px-4 py-3 text-left transition-colors",
+							"rounded-xl text-left transition-colors",
+							repositoryPanelCompact ? "px-3 py-1.5" : "px-4 py-3",
 							followingListView === "associated"
 								? "bg-muted/38 text-foreground"
 								: "bg-transparent text-muted-foreground hover:bg-muted/20 hover:text-foreground",
@@ -996,7 +1081,13 @@ function ScopedSummaryCard(props: {
 						<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
 							关联仓库
 						</p>
-						<p className="mt-1 text-lg font-semibold text-foreground">
+						<p
+							className={
+								repositoryPanelCompact
+									? "text-base font-semibold text-foreground"
+									: "mt-1 text-lg font-semibold text-foreground"
+							}
+						>
 							{associatedRepoCount}
 						</p>
 					</button>
@@ -1021,32 +1112,6 @@ function ScopedSummaryCard(props: {
 					</div>
 				</div>
 			)}
-
-			{scope.kind === "mine" && personalReposLoading && !personalRepos ? (
-				<p className="mt-4 rounded-2xl border border-dashed border-border/65 px-3 py-2 text-sm text-muted-foreground">
-					正在加载个人仓库…
-				</p>
-			) : null}
-
-			{scope.kind === "mine" && personalReposError ? (
-				<p className="mt-4 rounded-2xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-					个人仓库清单加载失败，当前动态仍可继续浏览。
-				</p>
-			) : null}
-
-			{scope.kind === "following" &&
-			followingReposLoading &&
-			!followingRepos ? (
-				<p className="mt-4 rounded-2xl border border-dashed border-border/65 px-3 py-2 text-sm text-muted-foreground">
-					正在加载关注仓库…
-				</p>
-			) : null}
-
-			{scope.kind === "following" && followingReposError ? (
-				<p className="mt-4 rounded-2xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-					关注仓库清单加载失败，当前动态仍可继续浏览。
-				</p>
-			) : null}
 
 			{scope.kind === "repo" ? (
 				<div className="mt-4 rounded-2xl border border-border/65 bg-background/72 px-4 py-3">
@@ -1099,57 +1164,93 @@ function ScopedSummaryCard(props: {
 				</p>
 			) : null}
 
-			{personalRepoItems.length > 0 ? (
-				<div className="mt-4 overflow-hidden rounded-2xl border border-border/65 bg-background/72">
-					<div className="flex items-center justify-between border-b border-border/60 px-3 py-2">
+			{scope.kind === "mine" ? (
+				<div
+					className={[
+						"flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-border/65 bg-background/72",
+						repositoryPanelCompact ? "mt-2" : "mt-4",
+					].join(" ")}
+				>
+					<div
+						className={[
+							"flex items-center justify-between border-b border-border/60 px-3",
+							repositoryPanelCompact ? "py-1.5" : "py-2",
+						].join(" ")}
+					>
 						<p className="text-sm font-medium text-foreground">仓库列表</p>
 						<p className="font-mono text-[11px] text-muted-foreground">
 							{personalRepos?.total_count ?? personalRepoItems.length} 个
 						</p>
 					</div>
 					<ul
-						className="max-h-80 scroll-pb-3 overflow-y-auto pb-3"
+						ref={repositoryListRef}
+						className={[
+							"min-h-0 flex-1 scroll-pb-3 overflow-y-auto",
+							repositoryPanelCompact ? "pb-2" : "pb-3",
+						].join(" ")}
+						style={repositoryListStyle}
 						data-dashboard-personal-repo-list="true"
+						data-dashboard-repository-list="true"
 					>
-						{personalRepoItems.map((repo) => {
-							const href = buildDashboardScopeHref({
-								kind: "repo",
-								owner: repo.owner_login,
-								repo: repo.name,
-							});
-							const releaseLabel =
-								repo.release_count > 0
-									? `${repo.release_count} 个发布`
-									: "暂无发布";
-							return (
-								<li
-									key={repo.full_name}
-									className="border-b border-border/50 last:border-b-0"
-								>
-									<InternalLink
-										href={href}
-										to={href}
-										className="group flex min-w-0 items-center justify-between gap-3 px-3 py-2.5 text-left transition-colors hover:bg-muted/35 focus-visible:bg-muted/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/45"
+						{personalRepoItems.length > 0 ? (
+							personalRepoItems.map((repo) => {
+								const href = buildDashboardScopeHref({
+									kind: "repo",
+									owner: repo.owner_login,
+									repo: repo.name,
+								});
+								const releaseLabel =
+									repo.release_count > 0
+										? `${repo.release_count} 个发布`
+										: "暂无发布";
+								return (
+									<li
+										key={repo.full_name}
+										className="border-b border-border/50 last:border-b-0"
+										data-dashboard-repository-item="true"
 									>
-										<span className="min-w-0">
-											<span className="block truncate font-mono text-[12px] font-medium text-foreground">
-												{repo.full_name}
+										<InternalLink
+											href={href}
+											to={href}
+											className="group flex min-w-0 items-center justify-between gap-3 px-3 py-2.5 text-left transition-colors hover:bg-muted/35 focus-visible:bg-muted/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/45"
+										>
+											<span className="min-w-0">
+												<span className="block truncate font-mono text-[12px] font-medium text-foreground">
+													{repo.full_name}
+												</span>
+												<span className="mt-0.5 block truncate text-xs text-muted-foreground">
+													更新 {formatPersonalRepoUpdatedAt(repo.updated_at)}
+												</span>
 											</span>
-											<span className="mt-0.5 block truncate text-xs text-muted-foreground">
-												更新 {formatPersonalRepoUpdatedAt(repo.updated_at)}
+											<span className="shrink-0 rounded-full border border-border/65 bg-card/70 px-2 py-0.5 text-[11px] text-muted-foreground group-hover:text-foreground">
+												{releaseLabel}
 											</span>
-										</span>
-										<span className="shrink-0 rounded-full border border-border/65 bg-card/70 px-2 py-0.5 text-[11px] text-muted-foreground group-hover:text-foreground">
-											{releaseLabel}
-										</span>
-									</InternalLink>
-								</li>
-							);
-						})}
+										</InternalLink>
+									</li>
+								);
+							})
+						) : personalReposLoading && !personalRepos ? (
+							<li className="flex min-h-[76px] items-center px-3 py-3 text-sm text-muted-foreground">
+								正在加载个人仓库…
+							</li>
+						) : personalReposError ? (
+							<li className="flex min-h-[76px] items-center px-3 py-3 text-sm text-destructive">
+								个人仓库清单加载失败，当前动态仍可继续浏览。
+							</li>
+						) : (
+							<li className="flex min-h-[76px] items-center px-3 py-3 text-sm text-muted-foreground">
+								暂无个人仓库。
+							</li>
+						)}
 					</ul>
 				</div>
 			) : scope.kind === "following" ? (
-				<div className="mt-4 border-t border-border/60 pt-4">
+				<div
+					className={[
+						"flex min-h-0 flex-1 flex-col overflow-hidden border-t border-border/60",
+						repositoryPanelCompact ? "mt-2 pt-2" : "mt-4 pt-4",
+					].join(" ")}
+				>
 					<div className="flex items-center justify-between gap-3">
 						<p className="text-sm font-medium text-foreground">
 							{followingListView === "following" ? "关注仓库" : "关联仓库"}
@@ -1159,68 +1260,94 @@ function ScopedSummaryCard(props: {
 						</p>
 					</div>
 					<ul
-						className="mt-3 max-h-80 divide-y divide-border/50 overflow-y-auto"
+						ref={repositoryListRef}
+						className={[
+							"min-h-0 flex-1 divide-y divide-border/50 overflow-y-auto",
+							repositoryPanelCompact ? "mt-2" : "mt-3",
+						].join(" ")}
+						style={repositoryListStyle}
 						data-dashboard-following-repo-list={followingListView}
+						data-dashboard-repository-list="true"
 					>
-						{followingListItems.map((repo) => {
-							const href = buildDashboardScopeHref({
-								kind: "repo",
-								owner: repo.owner_login,
-								repo: repo.name,
-							});
-							return (
-								<li key={repo.full_name} className="py-3 first:pt-0 last:pb-0">
-									<div className="flex items-start justify-between gap-3">
-										<div className="min-w-0">
-											<InternalLink
-												href={href}
-												to={href}
-												className="block truncate font-mono text-[12px] font-medium text-foreground"
-											>
-												{repo.full_name}
-											</InternalLink>
-											<p className="mt-0.5 text-xs text-muted-foreground">
-												{followingRepoSourceText(repo)}
-											</p>
-											<p className="mt-0.5 text-xs text-muted-foreground">
-												首次关联{" "}
-												{formatPersonalRepoUpdatedAt(repo.first_associated_at)}
-											</p>
-										</div>
-										<Button
-											type="button"
-											size="icon"
-											variant="outline"
-											className="rounded-full border-border/70 bg-background/72 text-foreground hover:bg-background/72 hover:text-foreground"
-											disabled={followBusy !== null}
-											aria-label={repo.is_following ? "取消关注" : "关注仓库"}
-											title={repo.is_following ? "取消关注" : "关注仓库"}
-											onClick={() => {
-												if (repo.is_following) {
-													unfollowRepo({
+						{followingListItems.length > 0 ? (
+							followingListItems.map((repo) => {
+								const href = buildDashboardScopeHref({
+									kind: "repo",
+									owner: repo.owner_login,
+									repo: repo.name,
+								});
+								return (
+									<li
+										key={repo.full_name}
+										className="py-3 first:pt-0 last:pb-0"
+										data-dashboard-repository-item="true"
+									>
+										<div className="flex items-start justify-between gap-3">
+											<div className="min-w-0">
+												<InternalLink
+													href={href}
+													to={href}
+													className="block truncate font-mono text-[12px] font-medium text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/45"
+												>
+													{repo.full_name}
+												</InternalLink>
+												<p className="mt-0.5 text-xs text-muted-foreground">
+													{followingRepoSourceText(repo)}
+												</p>
+												<p className="mt-0.5 text-xs text-muted-foreground">
+													首次关联{" "}
+													{formatPersonalRepoUpdatedAt(
+														repo.first_associated_at,
+													)}
+												</p>
+											</div>
+											<Button
+												type="button"
+												size="icon"
+												variant="outline"
+												className="rounded-full border-border/70 bg-background/72 text-foreground hover:bg-background/72 hover:text-foreground"
+												disabled={followBusy !== null}
+												aria-label={repo.is_following ? "取消关注" : "关注仓库"}
+												title={repo.is_following ? "取消关注" : "关注仓库"}
+												onClick={() => {
+													if (repo.is_following) {
+														unfollowRepo({
+															owner: repo.owner_login,
+															repo: repo.name,
+															fullName: repo.full_name,
+														});
+														return;
+													}
+													followRepo({
 														owner: repo.owner_login,
 														repo: repo.name,
 														fullName: repo.full_name,
 													});
-													return;
-												}
-												followRepo({
-													owner: repo.owner_login,
-													repo: repo.name,
-													fullName: repo.full_name,
-												});
-											}}
-										>
-											{repo.is_following ? (
-												<Eye className="size-4" />
-											) : (
-												<EyeOff className="size-4" />
-											)}
-										</Button>
-									</div>
-								</li>
-							);
-						})}
+												}}
+											>
+												{repo.is_following ? (
+													<Eye className="size-4" />
+												) : (
+													<EyeOff className="size-4" />
+												)}
+											</Button>
+										</div>
+									</li>
+								);
+							})
+						) : followingReposLoading && !followingRepos ? (
+							<li className="flex min-h-[76px] items-center px-3 py-3 text-sm text-muted-foreground">
+								正在加载关注仓库…
+							</li>
+						) : followingReposError ? (
+							<li className="flex min-h-[76px] items-center px-3 py-3 text-sm text-destructive">
+								关注仓库清单加载失败，当前动态仍可继续浏览。
+							</li>
+						) : (
+							<li className="flex min-h-[76px] items-center px-3 py-3 text-sm text-muted-foreground">
+								暂无{followingListView === "following" ? "关注" : "关联"}仓库。
+							</li>
+						)}
 					</ul>
 				</div>
 			) : repoNames.length > 0 ? (
@@ -1703,10 +1830,16 @@ export function Dashboard(props: {
 	]);
 	const feedItemsRef = useRef(activeFeedItems);
 	feedItemsRef.current = activeFeedItems;
+	const hasDesktopRepositorySidebar = useMediaQuery("(min-width: 1024px)");
+	const rootFollowingSidebarEnabled =
+		hasDesktopRepositorySidebar && tab === "all" && scope === null;
 	const followingReposQuery = useQuery<FollowingReposResponse>({
 		queryKey: ["dashboard", "following-repos", me.user.id],
 		queryFn: apiGetFollowingRepos,
-		enabled: scope?.kind === "following" || scope?.kind === "repo",
+		enabled:
+			rootFollowingSidebarEnabled ||
+			scope?.kind === "following" ||
+			scope?.kind === "repo",
 	});
 	const refreshFeed = readableSectionsActive
 		? readableSections.refresh
@@ -4143,9 +4276,11 @@ export function Dashboard(props: {
 	const renderSidebar =
 		!hasActiveAnnouncementDetail &&
 		((tab === "briefs" && hasTabletSidebar) || renderSidebarInbox);
+	const renderRootFollowingSidebar =
+		rootFollowingSidebarEnabled && !hasActiveAnnouncementDetail;
 	const dashboardContentLayoutClassName = scopedMode
 		? "grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px] lg:gap-6"
-		: renderSidebar
+		: renderRootFollowingSidebar || renderSidebar
 			? "grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6"
 			: "grid gap-4 md:gap-6";
 	const bootNetworkUnavailable =
@@ -4684,7 +4819,7 @@ export function Dashboard(props: {
 								<div className="lg:hidden">
 									<ScopedSummaryCard
 										scope={scope}
-										feedItems={feed.items}
+										feedItems={activeFeedItems}
 										personalRepos={scope.kind === "mine" ? personalRepos : null}
 										personalReposLoading={
 											scope.kind === "mine" && personalReposLoading
@@ -4835,6 +4970,20 @@ export function Dashboard(props: {
 											? followingReposError
 											: null
 									}
+									reloadFollowingRepos={async () => {
+										await followingReposQuery.refetch();
+									}}
+									desktop
+								/>
+							</aside>
+						) : renderRootFollowingSidebar ? (
+							<aside className="hidden space-y-4 lg:block">
+								<ScopedSummaryCard
+									scope={{ kind: "following" }}
+									feedItems={feed.items}
+									followingRepos={followingRepos}
+									followingReposLoading={followingReposLoading}
+									followingReposError={followingReposError}
 									reloadFollowingRepos={async () => {
 										await followingReposQuery.refetch();
 									}}
