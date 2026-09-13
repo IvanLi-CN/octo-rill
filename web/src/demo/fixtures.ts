@@ -427,7 +427,9 @@ function buildWebhookPushSettings(
 		summary: {
 			total: repos.length,
 			registered,
-			missing: repos.filter((repo) => repo.status === "missing").length,
+			missing: repos.filter((repo) =>
+				["missing", "waiting_registration"].includes(repo.status),
+			).length,
 			permission_paused: permissionPaused,
 			errors,
 			removable,

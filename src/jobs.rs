@@ -2636,7 +2636,7 @@ async fn execute_task(
         TASK_WEBHOOK_PUSH_MANAGE => {
             webhook_push::execute_manage_task(state, task_id, payload).await
         }
-        TASK_WEBHOOK_PUSH_AUDIT => webhook_push::execute_audit_task(state, task_id).await,
+        TASK_WEBHOOK_PUSH_AUDIT => webhook_push::execute_audit_task(state, task_id, payload).await,
         TASK_TRANSLATE_RELEASE => {
             let user_id = payload_local_id(payload, "user_id")?;
             let release_id = payload_string(payload, "release_id")?;
@@ -6537,6 +6537,76 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed user");
+    }
+
+    #[tokio::test]
+    async fn webhook_audit_partial_dispatch_reschedules_same_task() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "dispatch-fails").await;
+        seed_user(&pool, 2, "dispatch-succeeds").await;
+        sqlx::query(
+            "UPDATE users SET include_own_releases = 1, webhook_push_desired_state = 'enabled' WHERE id IN ('1', '2')",
+        )
+        .execute(&pool)
+        .await
+        .expect("enable webhook audit users");
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id, task_type, status, source, payload_json, created_at, updated_at
+            ) VALUES ('audit-retry', 'webhook.push.audit', 'running', 'scheduler', '{}', ?, ?)
+            "#,
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("insert audit task");
+        sqlx::raw_sql(
+            r#"
+            CREATE TRIGGER fail_one_webhook_dispatch
+            BEFORE INSERT ON job_tasks
+            WHEN NEW.task_type = 'webhook.push.manage' AND NEW.requested_by = '1'
+            BEGIN
+              SELECT RAISE(ABORT, 'forced audit dispatch failure');
+            END;
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("install dispatch failure trigger");
+
+        let result = crate::webhook_push::execute_audit_task(
+            state.as_ref(),
+            "audit-retry",
+            &json!({"retry_count": 0}),
+        )
+        .await
+        .expect("audit should reschedule after partial dispatch");
+        assert_eq!(result["rescheduled"], json!(true));
+        assert_eq!(result["retry_count"], json!(1));
+
+        let (status, retry_count, available_at): (String, i64, Option<String>) = sqlx::query_as(
+            "SELECT status, json_extract(payload_json, '$.retry_count'), available_at FROM job_tasks WHERE id = 'audit-retry'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read rescheduled audit task");
+        assert_eq!(status, STATUS_QUEUED);
+        assert_eq!(retry_count, 1);
+        let available_at = available_at.expect("audit retry should have a delay");
+        let retry_at = chrono::DateTime::parse_from_rfc3339(&available_at)
+            .expect("parse audit retry timestamp");
+        assert!(retry_at > chrono::Utc::now());
+
+        let dispatched_users = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM job_tasks WHERE task_type = 'webhook.push.manage' AND requested_by = '2' AND status = 'queued'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count successful dispatches");
+        assert_eq!(dispatched_users, 1);
     }
 
     async fn seed_translation_request(

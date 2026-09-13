@@ -653,7 +653,12 @@ fn summarize(repos: &[WebhookRepoStatus]) -> WebhookSummary {
             .count(),
         missing: repos
             .iter()
-            .filter(|repo| repo.status == STATUS_MISSING)
+            .filter(|repo| {
+                matches!(
+                    repo.status.as_str(),
+                    STATUS_MISSING | "waiting_registration"
+                )
+            })
             .count(),
         permission_paused: repos.iter().filter(|repo| repo.permission_paused).count(),
         errors: repos
@@ -2431,7 +2436,12 @@ pub async fn execute_manage_task(
     }
 }
 
-pub async fn execute_audit_task(state: &AppState, task_id: &str) -> Result<Value> {
+pub async fn execute_audit_task(state: &AppState, task_id: &str, payload: &Value) -> Result<Value> {
+    let retry_count = payload
+        .get("retry_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(3) as u8;
     let users = sqlx::query_scalar::<_, String>(
         r#"
         SELECT id
@@ -2499,11 +2509,37 @@ pub async fn execute_audit_task(state: &AppState, task_id: &str) -> Result<Value
         })
         .await;
     if !dispatch_errors.is_empty() {
-        return Err(anyhow!(
+        let message = format!(
             "webhook push audit dispatch failed for {} user(s): {}",
             dispatch_errors.len(),
             dispatch_errors.join("; ")
-        ));
+        );
+        if retry_count < 3 {
+            let next_retry_count = retry_count + 1;
+            let delay = retry_delay(retry_count, None);
+            let available_at = Utc::now() + delay;
+            let rescheduled = jobs::reschedule_task_with_retry_count(
+                state,
+                task_id,
+                available_at,
+                next_retry_count,
+                json!({
+                    "reason": "dispatch_failed",
+                    "error": message,
+                    "retry_count": next_retry_count,
+                }),
+            )
+            .await?;
+            if rescheduled {
+                return Ok(json!({
+                    "rescheduled": true,
+                    "retry_count": next_retry_count,
+                    "available_at": available_at.to_rfc3339(),
+                    "dispatch_errors": dispatch_errors,
+                }));
+            }
+        }
+        return Err(anyhow!(message));
     }
     let now = Utc::now().to_rfc3339();
     state
@@ -2951,6 +2987,28 @@ mod tests {
             retry_delay(0, Some(Duration::from_secs(90))),
             chrono::Duration::seconds(90)
         );
+    }
+
+    #[test]
+    fn waiting_registration_is_missing_and_pending_until_registered() {
+        let repo = WebhookRepoStatus {
+            repo_id: 1,
+            owner_login: "owner".to_owned(),
+            repo_name: "repo".to_owned(),
+            repo_full_name: "owner/repo".to_owned(),
+            is_private: Some(false),
+            hook_id: None,
+            status: "waiting_registration".to_owned(),
+            error_kind: None,
+            error_message: None,
+            permission_paused: false,
+            last_checked_at: None,
+            last_registered_at: None,
+        };
+
+        let summary = summarize(&[repo]);
+        assert_eq!(summary.missing, 1);
+        assert_eq!(summary.pending, 1);
     }
 
     #[test]

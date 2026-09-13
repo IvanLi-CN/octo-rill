@@ -1801,9 +1801,7 @@ export function SettingsPage(props: {
 												variant="outline"
 												disabled={
 													webhookPushBusy !== null ||
-													webhookPush?.operation !== null ||
-													!includeOwnReleases ||
-													webhookPush?.desired_state !== "enabled"
+													webhookPush?.operation !== null
 												}
 												onClick={() => void runWebhookPushAction()}
 											>
@@ -1940,16 +1938,25 @@ export function SettingsPage(props: {
 																					</p>
 																				) : null}
 																			</div>
-																			{webhookPush.desired_state ===
-																			"enabled" ? (
+																			{repo.error_message ||
+																			repo.permission_paused ||
+																			[
+																				"missing",
+																				"waiting_registration",
+																				"registering",
+																				"processing",
+																				"delete_pending",
+																				"error",
+																				"conflict",
+																				"archived",
+																			].includes(repo.status) ? (
 																				<Button
 																					className="max-sm:min-h-11"
 																					size="sm"
 																					variant="outline"
 																					disabled={
 																						webhookPushBusy !== null ||
-																						webhookPush.operation !== null ||
-																						!includeOwnReleases
+																						webhookPush.operation !== null
 																					}
 																					aria-label={`重试 ${repo.repo_name}`}
 																					onClick={() =>
