@@ -62,6 +62,17 @@ export type DemoNetworkMode = "normal" | "slow" | "faulty" | "readable-loading";
 
 export type DemoPublicationState = "published" | "unpublished";
 
+export type DemoWebhookScenario =
+	| "waiting-registration"
+	| "registering"
+	| "healthy-registered"
+	| "paused-retained"
+	| "permission-paused"
+	| "temporary-error"
+	| "delete-pending"
+	| "deleted"
+	| "multi-owner";
+
 export type DemoLandingCase =
 	| "default"
 	| "custom"
@@ -170,6 +181,7 @@ export type DemoShareState = {
 	personaId: DemoPersonaId;
 	networkMode: DemoNetworkMode;
 	includeOwnReleases: boolean;
+	webhookScenario: DemoWebhookScenario;
 	publicationState: DemoPublicationState;
 	landingCase: DemoLandingCase;
 	landingAuthAction: DemoLandingAuthAction;

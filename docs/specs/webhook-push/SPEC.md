@@ -115,8 +115,12 @@
 
 ## Visual Evidence
 
-证据来源为 mock-only Storybook 完整页面 fallback，绑定 Settings story 的桌面与移动视口。
+证据来源为 mock-only Web Demo（`settings-my-releases`），通过 `d_webhook` 深链复现状态，桌面使用页面级截图，移动使用 `393x852` CSS 视口。
 
-![Webhook 目标状态、等待注册与 Owner 分组](./assets/webhook-desired-state-desktop.png)
+![Web Demo 桌面多 Owner 分组与可行动错误](./assets/webhook-demo-desktop-multi-owner.png)
 
-![移动端暂停保留 Hook 与折叠 Owner 分组](./assets/webhook-desired-state-mobile-paused.png)
+![Web Demo 桌面健康已注册状态](./assets/webhook-demo-desktop-healthy.png)
+
+![Web Demo 移动端暂停保留 Hook 与折叠 Owner 分组](./assets/webhook-demo-mobile-paused.png)
+
+![Web Demo 移动端暂时错误与逐仓重试](./assets/webhook-demo-mobile-error.png)

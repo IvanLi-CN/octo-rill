@@ -15,6 +15,7 @@ import type {
 	DemoScene,
 	DemoSceneId,
 	DemoShareState,
+	DemoWebhookScenario,
 } from "@/demo/types";
 
 const repoScope: DashboardScope = {
@@ -72,6 +73,21 @@ export const APP_SHELL_STATE_OPTIONS = [
 	{ value: "unknown", label: "Unknown version" },
 ] as const satisfies ReadonlyArray<{
 	value: DemoAppShellState;
+	label: string;
+}>;
+
+export const WEBHOOK_SCENARIO_OPTIONS = [
+	{ value: "waiting-registration", label: "等待注册" },
+	{ value: "registering", label: "注册中" },
+	{ value: "healthy-registered", label: "已注册" },
+	{ value: "paused-retained", label: "暂停并保留 Hook" },
+	{ value: "permission-paused", label: "权限暂停" },
+	{ value: "temporary-error", label: "暂时错误" },
+	{ value: "delete-pending", label: "删除中" },
+	{ value: "deleted", label: "已删除" },
+	{ value: "multi-owner", label: "多 Owner 分组" },
+] as const satisfies ReadonlyArray<{
+	value: DemoWebhookScenario;
 	label: string;
 }>;
 
@@ -362,6 +378,15 @@ export function normalizePublicationState(
 	return value === "published" ? "published" : "unpublished";
 }
 
+export function normalizeWebhookScenario(
+	value: string | null | undefined,
+	fallback: DemoWebhookScenario,
+): DemoWebhookScenario {
+	return WEBHOOK_SCENARIO_OPTIONS.some((option) => option.value === value)
+		? (value as DemoWebhookScenario)
+		: fallback;
+}
+
 export function normalizeAppShellState(
 	value: string | null | undefined,
 ): DemoAppShellState {
@@ -378,6 +403,10 @@ export function readDemoShareState(url: URL, basepath: string): DemoShareState {
 	const defaults = buildDefaultDemoShareState(sceneId);
 	const landingCase = normalizeLandingCase(url.searchParams.get("d_case"));
 	const landingCaseControls = getLandingCaseControls(landingCase);
+	const webhookScenario = normalizeWebhookScenario(
+		url.searchParams.get("d_webhook"),
+		defaults.webhookScenario,
+	);
 
 	return {
 		sceneId,
@@ -386,7 +415,10 @@ export function readDemoShareState(url: URL, basepath: string): DemoShareState {
 			defaults.personaId,
 		),
 		networkMode: normalizeNetworkMode(url.searchParams.get("d_net")),
-		includeOwnReleases: url.searchParams.get("d_own") === "1",
+		includeOwnReleases:
+			url.searchParams.get("d_own") === "1" ||
+			(sceneId === "settings-my-releases" && webhookScenario !== "deleted"),
+		webhookScenario,
 		publicationState: normalizePublicationState(url.searchParams.get("d_pub")),
 		landingCase,
 		landingAuthAction: normalizeLandingAuthAction(
@@ -415,6 +447,8 @@ export function buildDefaultDemoShareState(
 		personaId: scene.defaultPersona,
 		networkMode: "normal",
 		includeOwnReleases: false,
+		webhookScenario:
+			sceneId === "settings-my-releases" ? "deleted" : "waiting-registration",
 		publicationState: "unpublished",
 		landingCase: "default",
 		...DEFAULT_LANDING_CONTROLS,
@@ -441,6 +475,12 @@ export function applyDemoShareStateToSearchParams(
 	}
 	if (state.includeOwnReleases) {
 		target.set("d_own", "1");
+	}
+	if (
+		state.sceneId === "settings-my-releases" &&
+		state.webhookScenario !== "deleted"
+	) {
+		target.set("d_webhook", state.webhookScenario);
 	}
 	if (state.publicationState === "published") {
 		target.set("d_pub", "published");

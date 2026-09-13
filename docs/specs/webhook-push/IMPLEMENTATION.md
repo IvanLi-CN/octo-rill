@@ -13,6 +13,6 @@
 - [x] M1: 数据表、PAT capability 与 GitHub hook client。
 - [x] M2: 注册/检查/删除任务、权限暂停和定时巡查。
 - [x] M3: HMAC receiver、delivery 去重与 Release demand。
-- [x] M4: Settings/Admin UI、Storybook、E2E 与视觉证据。
+- [x] M4: Settings/Admin UI、Web Demo、E2E 与视觉证据。
 - [x] M4b: 目标状态、异步对齐、持久退避重试和 Owner 分组整改。
 - [ ] M5: 完整验证、PR 与 review convergence。
