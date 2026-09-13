@@ -22,15 +22,15 @@
 
 ### REQ-DASHBOARD-REPOSITORY-SIDEBAR-002
 
-- The system MUST cap the repository sidebar at the available viewport height defined by the fixed footer top minus `16px`.
+- The system MUST use the available viewport height defined by the fixed footer top minus `16px` as the preferred cap for the repository sidebar.
 - Inputs: panel top, footer top, visual viewport resizing, repository item dimensions, and list content height.
-- Outputs: lists scroll internally when content exceeds the cap, and the panel never crosses the footer gap at layout time. Ordinary document scrolling MUST NOT trigger a height recalculation or cause a bottom-sticky effect; the panel remains in the reading flow.
+- Outputs: when the available height can contain the two-card minimum, lists scroll internally when content exceeds the cap and the panel ends `16px` above the footer. When it cannot contain that minimum, the panel MUST expand to contain the complete two-card minimum even if that crosses the footer boundary; cards MUST NOT be compressed or clipped. Ordinary document scrolling MUST NOT trigger a height recalculation or cause a bottom-sticky effect; the panel remains in the reading flow.
 
 ### REQ-DASHBOARD-REPOSITORY-SIDEBAR-003
 
 - The system MUST reserve a repository-list viewport at least as tall as two project cards for every desktop repository-list state, including long lists.
 - Inputs: actual first project-card height when present, otherwise a `76px` per-card fallback; panel chrome height and the available sidebar height.
-- Outputs: empty, loading, and one-item states keep a stable near-viewport panel that ends `16px` above the footer. Lists whose natural content reaches two cards grow naturally and only cap at the available height; long lists expose at least two complete cards and scroll only inside the list. When the available list viewport can contain no more than two project cards, the panel enters the viewport-fill state even when the data set is long. When panel chrome would consume that minimum, the panel enters its compact density without crossing the footer boundary.
+- Outputs: empty, loading, and one-item states keep a stable two-card minimum panel and end `16px` above the footer when space permits. Lists whose natural content reaches two cards grow naturally and only cap at the available height when that height is sufficient; long lists expose at least two complete cards and scroll only inside the list. When the available list viewport can contain no more than two project cards, the panel enters the viewport-fill state even when the data set is long. When panel chrome would consume that minimum, the panel enters its compact density; the two-card minimum takes precedence over the footer boundary.
 
 ### REQ-DASHBOARD-REPOSITORY-SIDEBAR-004
 
@@ -50,7 +50,7 @@
 
 - Method: Storybook repository-sidebar states plus DOM geometry assertions.
 - covers: `REQ-DASHBOARD-REPOSITORY-SIDEBAR-002`, `REQ-DASHBOARD-REPOSITORY-SIDEBAR-003`
-- Pass condition: empty, loading, and one-item panels end `16px` above the footer; two-or-more-item panels retain natural height until the cap and never cross the footer boundary. Every list viewport is at least two rendered project-card heights (or `152px` when empty), and long-list overflow belongs to the list container. The compact `1171x620` state covers following, associated, and personal repository lists, including follow-state mutation and normal document scrolling.
+- Pass condition: empty, loading, and one-item panels end `16px` above the footer when space permits; two-or-more-item panels retain natural height until the cap, and the panel expands beyond the footer only when needed to contain the two-card minimum. Every list viewport is at least two rendered project-card heights (or `152px` when empty), and long-list overflow belongs to the list container. The compact `1171x620` state covers following, associated, and personal repository lists, including follow-state mutation and normal document scrolling.
 
 ## Related ADRs
 
@@ -60,7 +60,7 @@ None
 
 - Source: `ui_demo` for Dashboard page states and `storybook_docs` for the reusable repository panel.
 - Requested viewports: `1440x900`, `1024x768`, and `1171x620` CSS px.
-- Geometry receipts: short panels have a `16px` footer gap; two-or-more-item panels remain natural until their cap; empty-list fallback is `152px`; long following, associated, and personal lists have internal overflow (`scrollHeight > clientHeight`) while retaining at least two visible project-card heights.
+- Geometry receipts: panels have a `16px` footer gap whenever the two-card minimum fits; otherwise the panel minimum takes precedence and fully contains two cards; empty-list fallback is `152px`; long following, associated, and personal lists have internal overflow (`scrollHeight > clientHeight`) while retaining at least two visible project-card heights.
 - Assets:
   - `./assets/root-following-1440x900.png`
   - `./assets/root-following-1024x768.png`
@@ -69,6 +69,7 @@ None
   - `./assets/short-following-1440x900.png`
   - `./assets/long-following-1440x900.png`
   - `./assets/story-compact-long-following-1171x620.png`
+  - `./assets/story-short-viewport-long-following-1171x560.png`
   - `./assets/story-personal-1440x900.png`
 
 ## References

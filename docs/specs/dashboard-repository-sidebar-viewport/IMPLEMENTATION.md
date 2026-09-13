@@ -15,7 +15,7 @@
 ## Coverage / rollout summary
 
 - Desktop root following sidebar is rendered at the existing `lg` breakpoint.
-- Every desktop repository list reserves two rendered project-card heights above the fixed footer. Lists shorter than two cards fill to the footer boundary; all other lists retain natural height until that boundary. When a compact viewport cannot fit the two-card minimum alongside normal panel chrome, the non-list panel content compacts and longer lists scroll inside the repository list without changing height during normal document scrolling.
+- Every desktop repository list reserves two rendered project-card heights. Lists shorter than two cards fill to the footer boundary when that space is available; all other lists retain natural height until the preferred footer cap. When a compact viewport cannot fit the two-card minimum alongside normal panel chrome, the non-list panel content compacts and the panel expands to contain the complete two-card minimum; longer lists scroll inside the repository list without changing height during normal document scrolling.
 
 ## Remaining Gaps
 

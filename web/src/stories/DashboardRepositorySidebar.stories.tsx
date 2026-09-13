@@ -22,6 +22,11 @@ const REPOSITORY_SIDEBAR_VIEWPORTS = {
 		styles: { height: "620px", width: "1171px" },
 		type: "desktop",
 	},
+	dashboardRepository1171x560: {
+		name: "Repository sidebar short desktop 1171x560",
+		styles: { height: "560px", width: "1171px" },
+		type: "desktop",
+	},
 } as const;
 
 function RepositorySidebarPreview(props: {
@@ -231,7 +236,10 @@ async function expectTwoFullyVisibleRepositoryCards(
 	});
 }
 
-async function expectLongRepositoryListGeometry(canvasElement: HTMLElement) {
+async function expectLongRepositoryListGeometry(
+	canvasElement: HTMLElement,
+	options?: { allowFooterOverlap?: boolean },
+) {
 	const panel = canvasElement.querySelector<HTMLElement>(
 		'[data-dashboard-repository-panel="true"]',
 	);
@@ -247,8 +255,10 @@ async function expectLongRepositoryListGeometry(canvasElement: HTMLElement) {
 	await waitFor(() => {
 		const gap =
 			footer.getBoundingClientRect().top - panel.getBoundingClientRect().bottom;
-		expect(gap).toBeGreaterThanOrEqual(14);
-		expect(gap).toBeLessThanOrEqual(18);
+		if (!options?.allowFooterOverlap) {
+			expect(gap).toBeGreaterThanOrEqual(14);
+			expect(gap).toBeLessThanOrEqual(18);
+		}
 	});
 	expect(getComputedStyle(list).overflowY).toBe("auto");
 	await waitFor(() => {
@@ -256,6 +266,9 @@ async function expectLongRepositoryListGeometry(canvasElement: HTMLElement) {
 	});
 	await expectTwoCardViewportCapacity(canvasElement);
 	await expectTwoFullyVisibleRepositoryCards(canvasElement);
+	expect(list.getBoundingClientRect().bottom).toBeLessThanOrEqual(
+		panel.getBoundingClientRect().bottom + 1,
+	);
 }
 
 export const ShortFollowing: Story = {
@@ -380,6 +393,31 @@ export const CompactLongFollowing: Story = {
 	},
 };
 
+export const ShortViewportLongFollowing: Story = {
+	args: { count: 18, label: "关注仓库", topInset: 142 },
+	parameters: {
+		viewport: { defaultViewport: "dashboardRepository1171x560" },
+		docs: {
+			description: {
+				story:
+					"当页脚上方不足以容纳两张项目卡时，面板扩展到两卡最小高度，列表仍在内部滚动。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		await waitFor(() => {
+			expect(
+				canvasElement.querySelector(
+					'[data-dashboard-repository-panel-state="viewport-fill"]',
+				),
+			).not.toBeNull();
+		});
+		await expectLongRepositoryListGeometry(canvasElement, {
+			allowFooterOverlap: true,
+		});
+	},
+};
+
 export const ViewportLimitedLongFollowing: Story = {
 	args: { count: 18, label: "关注仓库", topInset: 182 },
 	parameters: {
@@ -399,7 +437,9 @@ export const ViewportLimitedLongFollowing: Story = {
 				),
 			).not.toBeNull();
 		});
-		await expectLongRepositoryListGeometry(canvasElement);
+		await expectLongRepositoryListGeometry(canvasElement, {
+			allowFooterOverlap: true,
+		});
 	},
 };
 

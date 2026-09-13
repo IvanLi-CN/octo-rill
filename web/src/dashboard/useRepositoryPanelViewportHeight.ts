@@ -7,9 +7,19 @@ const COMPACT_EXIT_HYSTERESIS_PX = 64;
 type RepositoryPanelLayout = {
 	availableHeight: number | null;
 	minimumListHeight: number | null;
+	minimumPanelHeight: number | null;
 	shortList: boolean;
 	contentCapped: boolean;
 	compact: boolean;
+};
+
+const EMPTY_LAYOUT: RepositoryPanelLayout = {
+	availableHeight: null,
+	minimumListHeight: null,
+	minimumPanelHeight: null,
+	shortList: false,
+	contentCapped: false,
+	compact: false,
 };
 
 export function useRepositoryPanelViewportHeight(options: {
@@ -19,23 +29,11 @@ export function useRepositoryPanelViewportHeight(options: {
 }) {
 	const panelRef = useRef<HTMLDivElement>(null);
 	const listRef = useRef<HTMLUListElement>(null);
-	const [layout, setLayout] = useState<RepositoryPanelLayout>({
-		availableHeight: null,
-		minimumListHeight: null,
-		shortList: false,
-		contentCapped: false,
-		compact: false,
-	});
+	const [layout, setLayout] = useState<RepositoryPanelLayout>(EMPTY_LAYOUT);
 
 	useLayoutEffect(() => {
 		if (!options.enabled) {
-			setLayout({
-				availableHeight: null,
-				minimumListHeight: null,
-				shortList: false,
-				contentCapped: false,
-				compact: false,
-			});
+			setLayout(EMPTY_LAYOUT);
 			return;
 		}
 
@@ -45,7 +43,8 @@ export function useRepositoryPanelViewportHeight(options: {
 
 		let frame: number | null = null;
 		const measure = () => {
-			const panelTop = panel.getBoundingClientRect().top;
+			const panelRect = panel.getBoundingClientRect();
+			const panelTop = panelRect.top;
 			const footer = document.querySelector<HTMLElement>(
 				'[data-app-meta-footer="true"]',
 			);
@@ -82,10 +81,15 @@ export function useRepositoryPanelViewportHeight(options: {
 				) +
 				Number.parseFloat(listStyle?.paddingTop ?? "0") +
 				Number.parseFloat(listStyle?.paddingBottom ?? "0");
-			const panelChromeHeight = Math.max(
-				0,
-				panel.getBoundingClientRect().height -
-					(list?.getBoundingClientRect().height ?? 0),
+			const panelComputedStyle = getComputedStyle(panel);
+			const panelBottomInset =
+				Number.parseFloat(panelComputedStyle.paddingBottom ?? "0") +
+				Number.parseFloat(panelComputedStyle.borderBottomWidth ?? "0");
+			const panelChromeHeight = listRect
+				? Math.max(0, listRect.top - panelRect.top) + panelBottomInset
+				: panelRect.height;
+			const minimumPanelHeight = Math.ceil(
+				panelChromeHeight + minimumListHeight,
 			);
 			const availableListHeight = Math.max(
 				0,
@@ -106,6 +110,7 @@ export function useRepositoryPanelViewportHeight(options: {
 				if (
 					current.availableHeight === availableHeight &&
 					current.minimumListHeight === minimumListHeight &&
+					current.minimumPanelHeight === minimumPanelHeight &&
 					current.shortList === shortList &&
 					current.contentCapped === contentCapped &&
 					current.compact === compact
@@ -115,6 +120,7 @@ export function useRepositoryPanelViewportHeight(options: {
 				return {
 					availableHeight,
 					minimumListHeight,
+					minimumPanelHeight,
 					shortList,
 					contentCapped,
 					compact,
@@ -157,12 +163,17 @@ export function useRepositoryPanelViewportHeight(options: {
 	}, [options.enabled, options.itemCount, options.itemsKey]);
 
 	const panelStyle =
-		layout.availableHeight !== null
+		layout.availableHeight !== null && layout.minimumPanelHeight !== null
 			? {
-					maxHeight: `${layout.availableHeight}px`,
-					...(layout.shortList || layout.contentCapped
-						? { height: `${layout.availableHeight}px` }
-						: {}),
+					minHeight: `${layout.minimumPanelHeight}px`,
+					...(layout.availableHeight >= layout.minimumPanelHeight
+						? {
+								maxHeight: `${layout.availableHeight}px`,
+								...(layout.shortList || layout.contentCapped
+									? { height: `${layout.availableHeight}px` }
+									: {}),
+							}
+						: { height: `${layout.minimumPanelHeight}px` }),
 				}
 			: undefined;
 	const listStyle =

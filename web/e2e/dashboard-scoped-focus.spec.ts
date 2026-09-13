@@ -16,7 +16,10 @@ function json(route: Route, payload: unknown, status = 200) {
 	});
 }
 
-async function expectRepositoryListGeometry(panel: Locator) {
+async function expectRepositoryListGeometry(
+	panel: Locator,
+	options?: { allowFooterOverlap?: boolean },
+) {
 	const geometry = await panel.evaluate((element) => {
 		const footer = document.querySelector<HTMLElement>(
 			'[data-app-meta-footer="true"]',
@@ -46,11 +49,13 @@ async function expectRepositoryListGeometry(panel: Locator) {
 			secondItemBottom: secondItem.getBoundingClientRect().bottom,
 			listTop: listRect.top,
 			listBottom: listRect.bottom,
+			panelBottom: element.getBoundingClientRect().bottom,
 		};
 	});
-
-	expect(geometry.footerGap).toBeGreaterThanOrEqual(14);
-	expect(geometry.footerGap).toBeLessThanOrEqual(18);
+	if (!options?.allowFooterOverlap) {
+		expect(geometry.footerGap).toBeGreaterThanOrEqual(14);
+		expect(geometry.footerGap).toBeLessThanOrEqual(18);
+	}
 	expect(geometry.listClientHeight).toBeGreaterThanOrEqual(
 		geometry.itemHeight * 2 - 2,
 	);
@@ -58,6 +63,7 @@ async function expectRepositoryListGeometry(panel: Locator) {
 	expect(geometry.secondItemBottom).toBeLessThanOrEqual(
 		geometry.listBottom + 1,
 	);
+	expect(geometry.listBottom).toBeLessThanOrEqual(geometry.panelBottom + 1);
 	expect(geometry.listScrollHeight).toBeGreaterThan(geometry.listClientHeight);
 }
 
@@ -703,19 +709,25 @@ test("long repository lists retain two visible cards on compact desktops", async
 		"data-dashboard-repository-panel-density",
 		"compact",
 	);
-	await expectRepositoryListGeometry(rootFollowingPanel);
+	await expectRepositoryListGeometry(rootFollowingPanel, {
+		allowFooterOverlap: true,
+	});
 
 	await page.goto("/focus/following");
 	const followingPanel = page.locator(
 		'[data-dashboard-scope-summary="following"][data-dashboard-scope-summary-layout="desktop"]',
 	);
 	await expect(followingPanel).toBeVisible();
-	await expectRepositoryListGeometry(followingPanel);
+	await expectRepositoryListGeometry(followingPanel, {
+		allowFooterOverlap: true,
+	});
 	await followingPanel.getByRole("button", { name: "关联仓库 19" }).click();
 	await expect(
 		followingPanel.locator('[data-dashboard-following-repo-list="associated"]'),
 	).toBeVisible();
-	await expectRepositoryListGeometry(followingPanel);
+	await expectRepositoryListGeometry(followingPanel, {
+		allowFooterOverlap: true,
+	});
 	await expect(
 		followingPanel.getByRole("button", { name: "关联仓库 19" }),
 	).toHaveAttribute("aria-pressed", "true");
@@ -735,7 +747,9 @@ test("long repository lists retain two visible cards on compact desktops", async
 			.getByRole("button", { name: "关注仓库" })
 			.first(),
 	).toBeVisible();
-	await expectRepositoryListGeometry(followingPanel);
+	await expectRepositoryListGeometry(followingPanel, {
+		allowFooterOverlap: true,
+	});
 	await followingPanel
 		.locator('[data-dashboard-following-repo-list="associated"]')
 		.getByRole("button", { name: "关注仓库" })
@@ -747,14 +761,18 @@ test("long repository lists retain two visible cards on compact desktops", async
 	await expect(
 		followingPanel.getByRole("button", { name: "取消关注" }).first(),
 	).toBeVisible();
-	await expectRepositoryListGeometry(followingPanel);
+	await expectRepositoryListGeometry(followingPanel, {
+		allowFooterOverlap: true,
+	});
 
 	await page.goto("/focus/mine");
 	const personalPanel = page.locator(
 		'[data-dashboard-scope-summary="mine"][data-dashboard-scope-summary-layout="desktop"]',
 	);
 	await expect(personalPanel).toBeVisible();
-	await expectRepositoryListGeometry(personalPanel);
+	await expectRepositoryListGeometry(personalPanel, {
+		allowFooterOverlap: true,
+	});
 });
 
 test("long repository lists enter viewport fill when the viewport fits only two cards", async ({
@@ -772,7 +790,7 @@ test("long repository lists enter viewport fill when the viewport fits only two 
 		"data-dashboard-repository-panel-state",
 		"viewport-fill",
 	);
-	await expectRepositoryListGeometry(panel);
+	await expectRepositoryListGeometry(panel, { allowFooterOverlap: true });
 });
 
 test("two-card repository lists keep their natural height and scroll with the document", async ({
