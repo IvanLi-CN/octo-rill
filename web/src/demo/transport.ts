@@ -1485,6 +1485,11 @@ export const demoHandlers = [
 		if (network) return network;
 		return json(currentModel().followingRepos);
 	}),
+	http.get("/api/me/personal-repos", async ({ request }) => {
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		return json(currentModel().personalRepos);
+	}),
 	http.put("/api/repos/:owner/:repo/following", async ({ params, request }) => {
 		const network = await applyNetworkProfile(request);
 		if (network) return network;
@@ -1492,9 +1497,10 @@ export const demoHandlers = [
 		const fullName = `${params.owner}/${params.repo}`;
 		let nextItem: FollowingReposResponse["items"][number] | null = null;
 		access.updateModel((model) => {
-			const existing = model.followingRepos.items.find(
-				(item) => item.full_name === fullName,
-			);
+			const associatedItems = model.followingRepos.associated_items;
+			const existing =
+				associatedItems.find((item) => item.full_name === fullName) ??
+				model.followingRepos.items.find((item) => item.full_name === fullName);
 			nextItem = existing
 				? {
 						...existing,
@@ -1521,17 +1527,22 @@ export const demoHandlers = [
 							manual_feed: true,
 						},
 					};
-			const nextItems = existing
-				? model.followingRepos.items.map((item) =>
+			const nextAssociatedItems = associatedItems.some(
+				(item) => item.full_name === fullName,
+			)
+				? associatedItems.map((item) =>
 						item.full_name === fullName ? nextItem! : item,
 					)
-				: [nextItem!, ...model.followingRepos.items];
+				: [nextItem!, ...associatedItems];
+			const nextItems = nextAssociatedItems.filter((item) => item.is_following);
 			return {
 				...model,
 				followingRepos: {
 					...model.followingRepos,
 					following_count: nextItems.filter((item) => item.is_following).length,
+					associated_count: nextAssociatedItems.length,
 					items: nextItems,
+					associated_items: nextAssociatedItems,
 				},
 			};
 		});
@@ -1550,22 +1561,28 @@ export const demoHandlers = [
 			const fullName = `${params.owner}/${params.repo}`;
 			let nextItem: FollowingReposResponse["items"][number] | null = null;
 			access.updateModel((model) => {
-				const nextItems = model.followingRepos.items.map((item) => {
-					if (item.full_name !== fullName) return item;
-					nextItem = {
-						...item,
-						is_following: false,
-						follow_state_source: "demo_removed",
-					};
-					return nextItem;
-				});
+				const nextAssociatedItems = model.followingRepos.associated_items.map(
+					(item) => {
+						if (item.full_name !== fullName) return item;
+						nextItem = {
+							...item,
+							is_following: false,
+							follow_state_source: "demo_removed",
+						};
+						return nextItem;
+					},
+				);
+				const nextItems = nextAssociatedItems.filter(
+					(item) => item.is_following,
+				);
 				return {
 					...model,
 					followingRepos: {
 						...model.followingRepos,
-						following_count: nextItems.filter((item) => item.is_following)
-							.length,
+						following_count: nextItems.length,
+						associated_count: nextAssociatedItems.length,
 						items: nextItems,
+						associated_items: nextAssociatedItems,
 					},
 				};
 			});
