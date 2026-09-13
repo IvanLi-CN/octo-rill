@@ -17,7 +17,8 @@
 - hook：`hook_id`, `callback_url`, `status`
 - 错误：`error_kind`, `error_message`, `permission_paused`
 - 时间：`last_checked_at`, `last_registered_at`, `updated_at`
-- `status`: `missing|registered|conflict|permission_paused|archived|error|delete_pending|waiting_registration|registering|processing|not_configured`
+- `status` persists only values accepted by the deployed `0066` CHECK constraint: `unknown|missing|registered|conflict|permission_paused|error|delete_pending`.
+- The API derives the public `archived` observation when `error_kind = 'archived'`; this preserves archived visibility without rewriting an already-deployed SQLite constraint.
 
 Rows are observations of a repository Hook. A missing row for an enabled target is derived as `waiting_registration`, not `unknown` or `missing`.
 

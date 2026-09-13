@@ -605,7 +605,10 @@ async fn list_repo_statuses(
                ob.repo_full_name,
                CASE WHEN ob.is_private IS NULL THEN NULL ELSE ob.is_private != 0 END AS is_private,
                wr.hook_id,
-               COALESCE(wr.status, CASE WHEN ? = 'enabled' THEN 'waiting_registration' ELSE 'not_configured' END) AS status,
+               CASE
+                 WHEN wr.error_kind = 'archived' THEN 'archived'
+                 ELSE COALESCE(wr.status, CASE WHEN ? = 'enabled' THEN 'waiting_registration' ELSE 'not_configured' END)
+               END AS status,
                wr.error_kind, wr.error_message,
                COALESCE(wr.permission_paused, 0) != 0 AS permission_paused,
                wr.last_checked_at, wr.last_registered_at
@@ -616,7 +619,8 @@ async fn list_repo_statuses(
           AND lower(substr(ob.repo_full_name, 1, instr(ob.repo_full_name, '/') - 1)) = lower(?)
         UNION ALL
         SELECT wr.repo_id, wr.owner_login, wr.repo_name, wr.repo_full_name,
-               NULL AS is_private, wr.hook_id, wr.status,
+               NULL AS is_private, wr.hook_id,
+               CASE WHEN wr.error_kind = 'archived' THEN 'archived' ELSE wr.status END AS status,
                wr.error_kind, wr.error_message,
                wr.permission_paused != 0 AS permission_paused,
                wr.last_checked_at, wr.last_registered_at
@@ -1116,7 +1120,7 @@ pub async fn reconcile(
     let operation_lock = user_operation_lock(&user_id);
     let _operation_guard = operation_lock.lock().await;
     let config = load_user_config(state.as_ref(), &user_id).await?;
-    if config.include_own_releases == 0 {
+    if config.include_own_releases == 0 && config.webhook_push_desired_state == DESIRED_ENABLED {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "my_releases_disabled",
@@ -1261,8 +1265,20 @@ async fn response_error(response: reqwest::Response) -> GitHubCallError {
         .headers()
         .get("retry-after")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_secs);
+        .and_then(|value| {
+            value
+                .parse::<u64>()
+                .map(Duration::from_secs)
+                .or_else(|_| {
+                    DateTime::parse_from_rfc2822(value)
+                        .ok()
+                        .and_then(|retry_at| {
+                            (retry_at.with_timezone(&Utc) - Utc::now()).to_std().ok()
+                        })
+                        .ok_or(())
+                })
+                .ok()
+        });
     let rate_limited = response
         .headers()
         .get("x-ratelimit-remaining")
@@ -1510,6 +1526,14 @@ fn status_for_error(error: &GitHubCallError) -> &'static str {
     }
 }
 
+fn persisted_status(status: &str) -> &str {
+    if status == STATUS_ARCHIVED {
+        STATUS_ERROR
+    } else {
+        status
+    }
+}
+
 fn is_retryable_error(error: &GitHubCallError) -> bool {
     error.rate_limited || error.status.is_none_or(|status| status.is_server_error())
 }
@@ -1541,6 +1565,7 @@ async fn pause_user_repos_for_permission_error(
                 SET status = 'permission_paused', permission_paused = 1,
                     error_kind = ?, error_message = ?, updated_at = ?
                 WHERE user_id = ?
+                  AND COALESCE(error_kind, '') != 'archived'
                 "#,
             )
             .bind(error_code)
@@ -1565,6 +1590,10 @@ async fn persist_repo_state(
     let (status, hook_id, error, clear_pause) = update;
     let now = Utc::now().to_rfc3339();
     let permission_paused = error.is_some_and(is_permission_error);
+    // Migration 0066 predates the archived presentation state. Keep the
+    // persisted value within its deployed CHECK constraint and derive the
+    // public archived state from error_kind in list_repo_statuses.
+    let persisted_status = persisted_status(status);
     let clear_permission_pause =
         clear_pause || error.is_some_and(|current| !is_permission_error(current));
     let error_kind = error.map(|err| {
@@ -1609,7 +1638,7 @@ async fn persist_repo_state(
             .bind(&repo.repo_full_name)
             .bind(hook_id)
             .bind(callback)
-            .bind(status)
+            .bind(persisted_status)
             .bind(error_kind)
             .bind(error_message.as_deref())
             .bind(if permission_paused { 1_i64 } else { 0_i64 })
@@ -1704,6 +1733,33 @@ async fn run_repo_operation(
             return Ok(repo_operation_failed(&error));
         }
     };
+
+    let managed_hooks = hooks
+        .iter()
+        .filter(|hook| hook_matches(hook, None, managed_callback))
+        .collect::<Vec<_>>();
+    let stored_hook_conflict = stored_hook_id.is_some_and(|stored_id| {
+        managed_hooks
+            .first()
+            .is_some_and(|hook| hook.id != stored_id)
+            || (managed_hooks.is_empty() && hooks.iter().any(|hook| hook.id == stored_id))
+    });
+    if managed_hooks.len() > 1 || stored_hook_conflict {
+        persist_repo_state(
+            state,
+            user_id,
+            repo,
+            managed_callback,
+            (STATUS_CONFLICT, stored_hook_id, None, false),
+        )
+        .await?;
+        return Ok(RepoOperationResult {
+            outcome: "conflict",
+            retryable: false,
+            retry_after: None,
+            error_message: None,
+        });
+    }
 
     if operation == OP_DELETE || operation == OP_PAUSE {
         let Some(hook_id) = stored_hook_id else {
@@ -1836,47 +1892,7 @@ async fn run_repo_operation(
         }
     }
 
-    let matches = hooks
-        .iter()
-        .filter(|hook| hook_matches(hook, stored_hook_id, managed_callback))
-        .collect::<Vec<_>>();
-    if stored_hook_id.is_some()
-        && matches.is_empty()
-        && hooks
-            .iter()
-            .any(|hook| hook_matches(hook, None, managed_callback))
-    {
-        persist_repo_state(
-            state,
-            user_id,
-            repo,
-            managed_callback,
-            (STATUS_CONFLICT, stored_hook_id, None, false),
-        )
-        .await?;
-        return Ok(RepoOperationResult {
-            outcome: "conflict",
-            retryable: false,
-            retry_after: None,
-            error_message: None,
-        });
-    }
-    if matches.len() > 1 {
-        persist_repo_state(
-            state,
-            user_id,
-            repo,
-            managed_callback,
-            (STATUS_CONFLICT, None, None, false),
-        )
-        .await?;
-        return Ok(RepoOperationResult {
-            outcome: "conflict",
-            retryable: false,
-            retry_after: None,
-            error_message: None,
-        });
-    }
+    let matches = managed_hooks;
     if operation == OP_CHECK {
         if let Some(hook) = matches.first() {
             let healthy = hook.active
@@ -1977,6 +1993,7 @@ async fn try_acquire_user_operation_lease(
                   task_id = excluded.task_id,
                   expires_at = excluded.expires_at
                 WHERE webhook_push_user_operation_leases.expires_at < ?
+                   OR webhook_push_user_operation_leases.task_id = excluded.task_id
                 "#,
             )
             .bind(user_id)
@@ -2013,8 +2030,12 @@ async fn renew_user_operation_lease(state: &AppState, user_id: &str, task_id: &s
     Ok(())
 }
 
-async fn release_user_operation_lease(state: &AppState, user_id: &str, task_id: &str) {
-    let _ = state
+async fn release_user_operation_lease(
+    state: &AppState,
+    user_id: &str,
+    task_id: &str,
+) -> Result<()> {
+    state
         .sqlite_writer
         .write("webhook_push_lease_release", |_| async {
             sqlx::query(
@@ -2026,7 +2047,8 @@ async fn release_user_operation_lease(state: &AppState, user_id: &str, task_id: 
             .await
             .context("release webhook operation lease")
         })
-        .await;
+        .await?;
+    Ok(())
 }
 
 async fn execute_for_user(
@@ -2063,7 +2085,18 @@ async fn execute_for_user(
         retry_count,
     )
     .await;
-    release_user_operation_lease(state, user_id, task_id).await;
+    let release_result = release_user_operation_lease(state, user_id, task_id).await;
+    if let Err(error) = release_result {
+        tracing::error!(
+            user_id,
+            task_id,
+            ?error,
+            "failed to release webhook operation lease"
+        );
+        if result.is_ok() {
+            return Err(error);
+        }
+    }
     result
 }
 
@@ -2423,6 +2456,7 @@ pub async fn execute_audit_task(state: &AppState, task_id: &str) -> Result<Value
     .await?;
     let mut queued = 0usize;
     let mut reused = 0usize;
+    let mut dispatch_errors = Vec::new();
     for user_id in &users {
         let task = jobs::enqueue_singleton_task_for_requester(
             state,
@@ -2439,11 +2473,18 @@ pub async fn execute_audit_task(state: &AppState, task_id: &str) -> Result<Value
                 parent_task_id: Some(task_id.to_owned()),
             },
         )
-        .await?;
-        if task.reused {
-            reused += 1;
-        } else {
-            queued += 1;
+        .await;
+        match task {
+            Ok(task) if task.reused => reused += 1,
+            Ok(_) => queued += 1,
+            Err(error) => {
+                tracing::warn!(
+                    user_id = user_id.as_str(),
+                    ?error,
+                    "webhook push audit dispatch failed for user"
+                );
+                dispatch_errors.push(format!("{user_id}: {error}"));
+            }
         }
     }
     let cutoff = (Utc::now() - chrono::Duration::days(DELIVERY_RETENTION_DAYS)).to_rfc3339();
@@ -2457,6 +2498,13 @@ pub async fn execute_audit_task(state: &AppState, task_id: &str) -> Result<Value
                 .context("prune webhook delivery history")
         })
         .await;
+    if !dispatch_errors.is_empty() {
+        return Err(anyhow!(
+            "webhook push audit dispatch failed for {} user(s): {}",
+            dispatch_errors.len(),
+            dispatch_errors.join("; ")
+        ));
+    }
     let now = Utc::now().to_rfc3339();
     state
         .sqlite_writer
@@ -3072,6 +3120,8 @@ mod tests {
         assert!(is_archived_error(&error));
         assert!(!is_permission_error(&error));
         assert_eq!(status_for_error(&error), STATUS_ARCHIVED);
+        assert_eq!(persisted_status(STATUS_ARCHIVED), STATUS_ERROR);
+        assert_eq!(persisted_status(STATUS_REGISTERED), STATUS_REGISTERED);
     }
 
     #[test]
