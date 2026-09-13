@@ -199,6 +199,25 @@ export const SearchResults: Story = {
 	},
 };
 
+export const ClearSearchResetsQuota: Story = {
+	render: () => (
+		<PalettePreview
+			initialOpen
+			isAdmin={false}
+			initialQuery="命令面板"
+			searchTransport={mockSearchTransport}
+		/>
+	),
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement.ownerDocument.body);
+		const input = canvas.getByRole("combobox", { name: "搜索内容或执行动作" });
+		await waitFor(() => expect(canvas.getByText(/剩余 47\/50/)).toBeVisible());
+		await userEvent.click(canvas.getByRole("button", { name: "清除搜索" }));
+		await expect(input).toHaveValue("");
+		await expect(canvas.queryByText(/剩余 47\/50/)).not.toBeInTheDocument();
+	},
+};
+
 export const Actions: Story = {
 	render: () => (
 		<PalettePreview
