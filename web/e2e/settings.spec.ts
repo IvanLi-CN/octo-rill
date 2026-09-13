@@ -168,6 +168,15 @@ async function installSettingsMocks(
 		reactionTokenMessage?: string | null;
 		reactionTokenOwnerLogin?: string | null;
 		includeOwnReleases?: boolean;
+		webhookPushDesiredState?: "enabled" | "paused" | "deleted";
+		webhookPushRepoStatus?:
+			| "waiting_registration"
+			| "registered"
+			| "not_configured"
+			| "error"
+			| "archived";
+		webhookPushRepoHookId?: number | null;
+		webhookPushRepoError?: string | null;
 		withReactionFeed?: boolean;
 		onApiKeysGet?: () => void;
 	},
@@ -177,7 +186,8 @@ async function installSettingsMocks(
 		options?.githubConnections ?? defaultGitHubConnections;
 	let passkeys = options?.passkeys ?? [];
 	let apiKeys = options?.apiKeys ?? [];
-	let webhookPushDesiredState: "enabled" | "paused" | "deleted" = "deleted";
+	let webhookPushDesiredState: "enabled" | "paused" | "deleted" =
+		options?.webhookPushDesiredState ?? "deleted";
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
 		const url = new URL(req.url());
@@ -374,21 +384,24 @@ async function installSettingsMocks(
 
 		if (req.method() === "GET" && pathname === "/api/me/webhook-push") {
 			const webhookRepoStatus =
-				webhookPushDesiredState === "enabled"
+				options?.webhookPushRepoStatus ??
+				(webhookPushDesiredState === "enabled"
 					? "waiting_registration"
 					: webhookPushDesiredState === "paused"
 						? "registered"
-						: "not_configured";
+						: "not_configured");
 			const repo = {
 				repo_id: 1001,
 				owner_login: "storybook-user",
 				repo_name: "octo-rill",
 				repo_full_name: "storybook-user/octo-rill",
 				is_private: false,
-				hook_id: webhookPushDesiredState === "deleted" ? null : 801,
+				hook_id:
+					options?.webhookPushRepoHookId ??
+					(webhookPushDesiredState === "deleted" ? null : 801),
 				status: webhookRepoStatus,
-				error_kind: null,
-				error_message: null,
+				error_kind: options?.webhookPushRepoError ? "github_error" : null,
+				error_message: options?.webhookPushRepoError ?? null,
 				permission_paused: false,
 				last_checked_at: null,
 				last_registered_at: null,
@@ -406,11 +419,19 @@ async function installSettingsMocks(
 				summary: {
 					total: 1,
 					registered: webhookPushDesiredState === "paused" ? 1 : 0,
-					missing: 0,
+					missing: ["missing", "waiting_registration"].includes(
+						webhookRepoStatus,
+					)
+						? 1
+						: 0,
 					permission_paused: 0,
-					errors: 0,
-					removable: webhookPushDesiredState === "deleted" ? 0 : 1,
-					pending: webhookPushDesiredState === "enabled" ? 1 : 0,
+					errors: ["error", "archived"].includes(webhookRepoStatus) ? 1 : 0,
+					removable: repo.hook_id === null ? 0 : 1,
+					pending:
+						repo.error_message !== null ||
+						!["registered", "not_configured"].includes(webhookRepoStatus)
+							? 1
+							: 0,
 				},
 				schedule: {
 					audit_interval_days: 7,
@@ -424,7 +445,11 @@ async function installSettingsMocks(
 					{
 						owner_login: "storybook-user",
 						repo_count: 1,
-						pending_count: webhookPushDesiredState === "enabled" ? 1 : 0,
+						pending_count:
+							repo.error_message !== null ||
+							!["registered", "not_configured"].includes(webhookRepoStatus)
+								? 1
+								: 0,
 						repos: [repo],
 					},
 				],
@@ -1091,6 +1116,50 @@ test("webhook push shows target state and owner-grouped reconciliation", async (
 		section.getByRole("button", { name: "立即检查并修复" }),
 	).toBeVisible();
 });
+
+for (const desiredState of ["paused", "deleted"] as const) {
+	test(`webhook push keeps repair controls for ${desiredState} targets`, async ({
+		page,
+	}) => {
+		await installPasskeyBrowserMock(page);
+		await installSettingsMocks(page, {
+			includeOwnReleases: true,
+			webhookPushDesiredState: desiredState,
+			webhookPushRepoStatus: "error",
+			webhookPushRepoHookId: 801,
+			webhookPushRepoError: "GitHub 暂时不可用，可再次检查并修复。",
+		});
+
+		await page.goto("/settings?section=my-releases");
+		const section = page.locator('[data-settings-section="my-releases"]');
+		if (desiredState === "paused") {
+			await section
+				.getByRole("button", { name: /@storybook-user 1 个仓库/ })
+				.click();
+		}
+		await expect(
+			section.getByText("GitHub 暂时不可用", { exact: false }),
+		).toBeVisible();
+
+		const fullReconcile = section.getByRole("button", {
+			name: "立即检查并修复",
+		});
+		await expect(fullReconcile).toBeEnabled();
+
+		const repoRetry = section.getByRole("button", {
+			name: "重试 octo-rill",
+		});
+		await expect(repoRetry).toBeEnabled();
+
+		const reconcileRequest = page.waitForRequest(
+			(request) =>
+				request.method() === "POST" &&
+				new URL(request.url()).pathname === "/api/me/webhook-push/reconcile",
+		);
+		await fullReconcile.click();
+		await expect((await reconcileRequest).method()).toBe("POST");
+	});
+}
 
 test("unknown app route shows not-found page after app shell boot", async ({
 	page,

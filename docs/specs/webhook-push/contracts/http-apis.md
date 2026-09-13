@@ -9,9 +9,11 @@
 
 会排队后台任务的写操作返回 `{ "task_id": string, "status": string, "operation": string }`，前端通过现有 task API/SSE 跟踪。目标状态写入成功后，即使远端任务失败也保留该目标。
 
-`GET /api/me/webhook-push` 的 `summary.pending` 是当前仓库观察中需要用户关注或仍在对齐的数量。`last_operation_failure` 为最新终态失败任务的 `{ task_id, operation, error_message, failed_at, retry_count }`；存在更晚的 queued/running 或 succeeded manage 任务时返回 `null`。
+`GET /api/me/webhook-push` 的 `summary.pending` 是当前仓库观察中需要用户关注或仍在对齐的数量；`summary.missing` 同时包含真实缺失和启用目标尚未生成本地 Hook 记录的 `waiting_registration` 仓库。`last_operation_failure` 为最新终态失败任务的 `{ task_id, operation, error_message, failed_at, retry_count }`；存在更晚的 queued/running 或 succeeded manage 任务时返回 `null`。
 
 定时 audit 任务只负责枚举用户并投递带 `scheduled: true` 的 `webhook.push.manage` 任务；它不执行 GitHub 请求，也不持有用户级远端操作 lease。
+
+audit 在部分用户派发失败时继续处理其余用户，并将同一 audit 任务按 `retry_count` 以 `1/5/15` 分钟退避重新排队；只有重试耗尽才进入终态失败，成功派发的用户不会重复创建未终态任务。
 
 ## Admin APIs
 

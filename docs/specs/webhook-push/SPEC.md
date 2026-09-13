@@ -15,7 +15,7 @@
 - `REQ-WP-001`: 系统 MUST 将用户意图持久化为 `enabled`、`paused` 或 `deleted`，并且运行时观察结果不得反向改写该意图。
 - `REQ-WP-002`: 所有 GitHub Hook 的创建、激活、暂停、删除和检查 MUST 由可恢复的后台对齐任务异步执行，HTTP mutation 不得直接调用 GitHub。
 - `REQ-WP-003`: 目标为 `paused` 或 `deleted` 时，系统 MUST 在任何远端调用前关闭本地接收门禁；远端失败不得改变持久化目标。
-- `REQ-WP-004`: 每名用户 MUST 同时最多存在一项未终态的 manage 操作；全局 audit 只能投递每用户 manage 任务，暂时失败 MUST 按 `1/5/15` 分钟退避并尊重更晚的 `Retry-After`。
+- `REQ-WP-004`: 每名用户 MUST 同时最多存在一项未终态的 manage 操作；全局 audit 只能投递每用户 manage 任务，暂时失败 MUST 按 `1/5/15` 分钟退避并尊重更晚的 `Retry-After`。部分用户派发失败时 audit MUST 继续处理其余用户并重排同一 audit 任务，避免重复投递。
 - `REQ-WP-005`: worker 仅可变更已验证为 OctoRill 管理、Hook ID、callback URL、`release` event 和仓库身份均匹配的 GitHub Hook。
 - `REQ-WP-006`: 用户 API MUST 暴露目标状态、当前 operation、最近完成检查时间、Owner 分组和派生仓库状态，并移除旧的扁平管理路由合同。
 - `REQ-WP-007`: 设置页 MUST 按 Owner 分组仓库，并区分健康目标状态、等待/执行进度和仓库错误；删除选择不得要求第二次确认。
