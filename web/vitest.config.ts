@@ -25,6 +25,7 @@ export default defineConfig((env) =>
 									"content-projection-retention",
 									"admin-collection-read-budget",
 									"dashboard-repository-sidebar-viewport",
+									"command-palette-search",
 								],
 								exclude: [],
 								skip: [],

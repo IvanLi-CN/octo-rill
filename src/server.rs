@@ -252,6 +252,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(api::public_get_repo_release_content),
         )
         .route("/notifications", get(api::list_notifications))
+        .route(
+            "/search",
+            get(api::search).layer(middleware::from_fn(version_no_store_cache)),
+        )
         .route("/webhooks/github/releases", post(webhook_push::receive))
         .route("/dashboard/updates", get(api::dashboard_updates))
         .route("/dashboard/feed", get(api::dashboard_readable_feed))

@@ -1711,6 +1711,7 @@ export function Dashboard(props: {
 	const activeReleaseId = routeState.activeReleaseId;
 	const activeReleaseLocator = routeState.activeReleaseLocator;
 	const activeAnnouncementLocator = routeState.activeAnnouncementLocator;
+	const activeDetailLane = routeState.lane ?? null;
 	const releaseReturnTab = routeState.releaseReturnTab;
 	const routeSelectedBriefId = routeState.selectedBriefId;
 	const activeReleaseTarget = useMemo(
@@ -1722,11 +1723,13 @@ export function Dashboard(props: {
 						fromTab: releaseReturnTab,
 						scope,
 						selectedBriefId: routeSelectedBriefId,
+						lane: activeDetailLane,
 					})
 				: null,
 		[
 			activeReleaseId,
 			activeReleaseLocator,
+			activeDetailLane,
 			releaseReturnTab,
 			routeSelectedBriefId,
 			scope,
@@ -4194,6 +4197,7 @@ export function Dashboard(props: {
 				activeReleaseId: target.releaseId,
 				activeReleaseLocator: target.locator,
 				activeAnnouncementLocator: null,
+				lane: target.lane ?? null,
 				releaseReturnTab: target.fromTab,
 			});
 		},
@@ -4255,6 +4259,7 @@ export function Dashboard(props: {
 					activeReleaseId: detail.release_id,
 					activeReleaseLocator: locator,
 					activeAnnouncementLocator: null,
+					lane: activeDetailLane,
 					releaseReturnTab,
 				},
 				{ replace: true },
@@ -4262,6 +4267,7 @@ export function Dashboard(props: {
 		},
 		[
 			activeReleaseLocator,
+			activeDetailLane,
 			releaseReturnTab,
 			routeSelectedBriefId,
 			scope,
@@ -4753,8 +4759,11 @@ export function Dashboard(props: {
 					aiDisabledHint={aiDisabledHint}
 					busy={Boolean(busy)}
 					syncingAll={syncingAll}
+					syncingInbox={syncingInbox}
 					syncProgress={accessSyncProgress}
 					onSyncAll={onSyncAll}
+					onSyncInbox={onSyncInbox}
+					onGenerateBrief={onGenerateBrief}
 					mineHref={buildDashboardScopeHref({ kind: "mine" })}
 					mineLabel={DASHBOARD_MINE_ENTRY_LABEL}
 					followingHref={buildDashboardScopeHref({ kind: "following" })}
@@ -4853,6 +4862,7 @@ export function Dashboard(props: {
 									repo={activeAnnouncementLocator.repo}
 									number={activeAnnouncementLocator.number}
 									onBack={onCloseAnnouncementDetail}
+									initialLane={activeDetailLane}
 								/>
 							) : (
 								<>
