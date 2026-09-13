@@ -263,6 +263,57 @@ export type MeResponse = {
 		include_own_releases: boolean;
 	};
 };
+
+export type SearchLane = "original" | "translated" | "smart";
+export type SearchResultType =
+	| "release"
+	| "announcement"
+	| "brief"
+	| "notification"
+	| "repository";
+
+export type SearchResult = {
+	id: string;
+	resource_type?: SearchResultType;
+	type?: SearchResultType;
+	title: string;
+	snippet?: string | null;
+	excerpt?: string | null;
+	repo_full_name?: string | null;
+	repository?: {
+		owner: string;
+		name: string;
+		full_name: string;
+	} | null;
+	source_time?: string | null;
+	updated_at?: string | null;
+	unread: boolean | null;
+	is_following?: boolean | null;
+	matched_lane?: SearchLane | null;
+	matched_lanes?: SearchLane[];
+	target_path?: string;
+	target_url?: string | null;
+	target?: { href: string; lane?: SearchLane | null };
+};
+
+export type SearchResponse = {
+	query?: string;
+	items: SearchResult[];
+	remaining?: number;
+	remaining_requests?: number;
+	reset_at: string | null;
+};
+
+export async function apiSearch(
+	query: string,
+	signal?: AbortSignal,
+): Promise<SearchResponse> {
+	const params = new URLSearchParams({ q: query });
+	return apiGet<SearchResponse>(`/api/search?${params.toString()}`, {
+		cache: "no-store",
+		signal,
+	});
+}
 export type AccountResumeResponse = {
 	status: "enabled";
 	access_sync: {

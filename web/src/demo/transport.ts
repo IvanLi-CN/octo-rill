@@ -30,6 +30,8 @@ import type {
 	PublicReleaseListItem,
 	ReactionTokenCheckResponse,
 	ReactionTokenStatusResponse,
+	SearchResponse,
+	SearchResult,
 } from "@/api";
 import { buildDemoHref } from "@/demo/registry";
 import {
@@ -44,6 +46,7 @@ import type {
 	FeedReactionRefreshResponse,
 	ReleaseReactions,
 } from "@/feed/types";
+import type { BriefItem } from "@/sidebar/ReleaseDailyCard";
 import type {
 	DemoEventFrame,
 	DemoModel,
@@ -300,6 +303,285 @@ function json(data: unknown, init?: ResponseInit) {
 			...(init?.headers ?? {}),
 		},
 	});
+}
+
+type DemoParsedSearchQuery = {
+	terms: string[];
+	owner: string | null;
+	repo: string | null;
+	type: SearchResult["resource_type"] | null;
+	after: string | null;
+	before: string | null;
+	unread: boolean;
+};
+
+function parseDemoSearchQuery(rawQuery: string): DemoParsedSearchQuery | null {
+	const raw = rawQuery.trim();
+	if (!raw || raw.length > 256) return null;
+	const tokens: Array<{ value: string; quoted: boolean }> = [];
+	let value = "";
+	let quoted = false;
+	let tokenQuoted = false;
+	for (const character of raw) {
+		if (character === '"') {
+			if (!quoted && value) return null;
+			quoted = !quoted;
+			tokenQuoted = true;
+			continue;
+		}
+		if (/\s/.test(character) && !quoted) {
+			if (value) tokens.push({ value, quoted: tokenQuoted });
+			value = "";
+			tokenQuoted = false;
+			continue;
+		}
+		value += character;
+	}
+	if (quoted || (!value && tokenQuoted)) return null;
+	if (value) tokens.push({ value, quoted: tokenQuoted });
+	if (tokens.length === 0) return null;
+
+	const seen = new Set<string>();
+	const parsed: DemoParsedSearchQuery = {
+		terms: [],
+		owner: null,
+		repo: null,
+		type: null,
+		after: null,
+		before: null,
+		unread: false,
+	};
+	for (const token of tokens) {
+		const filter = !token.quoted
+			? token.value.match(/^([A-Za-z]+):(.*)$/)
+			: null;
+		if (!filter) {
+			parsed.terms.push(token.value.toLocaleLowerCase());
+			continue;
+		}
+		const key = filter[1].toLocaleLowerCase();
+		const filterValue = filter[2].trim();
+		if (!filterValue || !seen.add(key)) return null;
+		switch (key) {
+			case "owner":
+				if (filterValue.includes("/")) return null;
+				parsed.owner = filterValue.toLocaleLowerCase();
+				break;
+			case "repo":
+				if (!/^[A-Za-z0-9_.~/-]+$/.test(filterValue)) return null;
+				parsed.repo = filterValue.toLocaleLowerCase().replace(/^\/+|\/+$/g, "");
+				break;
+			case "type": {
+				const normalized = filterValue.toLocaleLowerCase();
+				if (
+					![
+						"release",
+						"announcement",
+						"brief",
+						"notification",
+						"repository",
+					].includes(normalized)
+				)
+					return null;
+				parsed.type = normalized as SearchResult["resource_type"];
+				break;
+			}
+			case "after":
+			case "before":
+				if (
+					!/^\d{4}-\d{2}-\d{2}$/.test(filterValue) ||
+					!isValidSearchDate(filterValue)
+				)
+					return null;
+				parsed[key] = `${filterValue}T00:00:00Z`;
+				break;
+			case "is":
+				if (filterValue.toLocaleLowerCase() !== "unread") return null;
+				parsed.unread = true;
+				break;
+			default:
+				return null;
+		}
+	}
+	if (parsed.terms.length > 16) return null;
+	if (parsed.after && parsed.before && parsed.after > parsed.before)
+		return null;
+	if (parsed.unread && parsed.type && parsed.type !== "notification")
+		return null;
+	if (
+		parsed.owner &&
+		parsed.repo?.includes("/") &&
+		!parsed.repo.startsWith(`${parsed.owner}/`)
+	)
+		return null;
+	if (
+		parsed.terms.length === 0 &&
+		!parsed.owner &&
+		!parsed.repo &&
+		!parsed.type &&
+		!parsed.after &&
+		!parsed.before &&
+		!parsed.unread
+	)
+		return null;
+	return parsed;
+}
+
+function isValidSearchDate(value: string) {
+	const [year, month, day] = value.split("-").map(Number);
+	const date = new Date(Date.UTC(year, month - 1, day));
+	return (
+		date.getUTCFullYear() === year &&
+		date.getUTCMonth() === month - 1 &&
+		date.getUTCDate() === day
+	);
+}
+
+function previousIsoDate(value: string) {
+	const date = new Date(`${value}T00:00:00Z`);
+	date.setUTCDate(date.getUTCDate() - 1);
+	return date.toISOString().slice(0, 10);
+}
+
+function buildDemoSearchResponse(
+	query: string,
+	parsed: DemoParsedSearchQuery,
+): SearchResponse {
+	const model = currentModel();
+	const {
+		terms,
+		owner,
+		repo,
+		type,
+		after,
+		before,
+		unread: unreadOnly,
+	} = parsed;
+	const items: SearchResult[] = [];
+	for (const item of model.feed.items) {
+		if (item.kind !== "release" && item.kind !== "announcement") continue;
+		const translated = [item.translated?.title, item.translated?.summary]
+			.filter(Boolean)
+			.join(" ");
+		const smart = [item.smart?.title, item.smart?.summary]
+			.filter(Boolean)
+			.join(" ");
+		const original = `${item.title ?? ""} ${item.body ?? ""}`;
+		const targetPath = item.html_url?.replace("https://github.com", "") ?? "/";
+		const laneMatches = (text: string) =>
+			terms.length > 0 &&
+			terms.every((term) => text.toLocaleLowerCase().includes(term));
+		const matchedLane = laneMatches(smart)
+			? "smart"
+			: laneMatches(translated)
+				? "translated"
+				: "original";
+		const matchedLanes = [
+			["original", laneMatches(original)],
+			["translated", laneMatches(translated)],
+			["smart", laneMatches(smart)],
+		]
+			.filter(([, matches]) => matches)
+			.map(([lane]) => lane as "original" | "translated" | "smart");
+		items.push({
+			id: item.id,
+			resource_type: item.kind,
+			title: item.title ?? item.id,
+			snippet: [original, translated, smart].filter(Boolean).join(" "),
+			repo_full_name: item.repo_full_name,
+			source_time: item.ts,
+			updated_at: item.ts,
+			unread: item.unread === null ? null : item.unread !== 0,
+			matched_lane: matchedLane,
+			matched_lanes: matchedLanes.length > 0 ? matchedLanes : ["original"],
+			target_path: targetPath,
+			target_url: item.html_url,
+		});
+	}
+	for (const notification of model.notifications) {
+		items.push({
+			id: notification.thread_id,
+			resource_type: "notification",
+			title: notification.subject_title ?? notification.thread_id,
+			snippet:
+				`${notification.subject_type ?? ""} ${notification.reason ?? ""}`.trim(),
+			repo_full_name: notification.repo_full_name,
+			source_time: notification.updated_at,
+			updated_at: notification.updated_at,
+			unread: notification.unread !== 0,
+			matched_lane: "original",
+			target_url: notification.html_url,
+		});
+	}
+	for (const brief of model.briefs) {
+		items.push({
+			id: brief.id,
+			resource_type: "brief",
+			title: `日报 ${brief.date}`,
+			snippet: brief.preview_markdown,
+			source_time: brief.updated_at,
+			updated_at: brief.updated_at,
+			unread: false,
+			matched_lane: "original",
+			target_path: `/briefs?brief=${encodeURIComponent(brief.id)}`,
+		});
+	}
+	const repositoryItems = Array.from(
+		new Map(
+			[
+				...model.followingRepos.associated_items,
+				...model.followingRepos.items,
+			].map((repo) => [repo.full_name.toLocaleLowerCase(), repo] as const),
+		).values(),
+	);
+	for (const repo of repositoryItems) {
+		items.push({
+			id: repo.full_name,
+			resource_type: "repository",
+			title: repo.full_name,
+			snippet: repo.description,
+			repo_full_name: repo.full_name,
+			source_time: repo.last_seen_at,
+			updated_at: repo.last_seen_at,
+			unread: false,
+			is_following: repo.is_following,
+			matched_lane: "original",
+			target_path: `/focus/repo/${repo.owner_login}/${repo.name}`,
+			target_url: repo.html_url,
+		});
+	}
+	const filtered = items.filter((result) => {
+		const haystack = [result.title, result.snippet, result.repo_full_name]
+			.filter(Boolean)
+			.join(" ")
+			.toLocaleLowerCase();
+		return (
+			(!terms.length || terms.every((term) => haystack.includes(term))) &&
+			(!owner ||
+				result.repo_full_name?.toLocaleLowerCase().startsWith(`${owner}/`)) &&
+			(!repo ||
+				result.repo_full_name?.toLocaleLowerCase() === repo ||
+				result.repo_full_name?.toLocaleLowerCase().endsWith(`/${repo}`)) &&
+			(!type || result.resource_type === type) &&
+			(!after || (result.source_time ?? "") >= after) &&
+			(!before || (result.source_time ?? "") <= before) &&
+			(!unreadOnly ||
+				(result.resource_type === "notification" && result.unread === true))
+		);
+	});
+	filtered.sort((left, right) => {
+		const timeDelta =
+			Date.parse(right.source_time ?? "") - Date.parse(left.source_time ?? "");
+		if (Number.isFinite(timeDelta) && timeDelta !== 0) return timeDelta;
+		return right.id.localeCompare(left.id);
+	});
+	return {
+		query,
+		items: filtered.slice(0, 20),
+		remaining: 49,
+		remaining_requests: 49,
+		reset_at: new Date(Date.now() + 300_000).toISOString(),
+	};
 }
 
 function badRequest(message: string) {
@@ -1502,6 +1784,19 @@ export const demoHandlers = [
 		if (network) return network;
 		return json(buildDemoReadableFeedResponse(currentModel()));
 	}),
+	http.get("/api/search", async ({ request }) => {
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		const query = new URL(request.url).searchParams.get("q") ?? "";
+		const parsed = parseDemoSearchQuery(query);
+		if (!parsed) {
+			return json(
+				{ error: { code: "invalid_search_query", message: "搜索请求无效" } },
+				{ status: 400 },
+			);
+		}
+		return json(buildDemoSearchResponse(query, parsed));
+	}),
 	http.get(
 		"/api/dashboard/feed/sections/:sectionId/items",
 		async ({ params, request }) => {
@@ -1585,6 +1880,43 @@ export const demoHandlers = [
 				content_markdown: undefined,
 			})),
 		);
+	}),
+	http.post("/api/briefs/generate", async ({ request }) => {
+		const network = await applyNetworkProfile(request);
+		if (network) return network;
+		const model = currentModel();
+		const payload = (await request.json().catch(() => null)) as {
+			date?: unknown;
+		} | null;
+		const requestedDate =
+			typeof payload?.date === "string" && isValidSearchDate(payload.date)
+				? payload.date
+				: "2026-07-09";
+		const generatedAt = `${requestedDate}T08:10:00+08:00`;
+		const windowStart = previousIsoDate(requestedDate);
+		const generated: BriefItem = {
+			id: `brief-demo-generated-${model.briefs.length + 1}`,
+			date: requestedDate,
+			window_start: `${windowStart}T08:00:00+08:00`,
+			window_end: `${requestedDate}T08:00:00+08:00`,
+			effective_time_zone: "Asia/Shanghai",
+			effective_local_boundary: "08:00",
+			release_count: 0,
+			release_ids: [],
+			preview_markdown: "- Demo 已生成一份新的本地日报\n",
+			content_markdown: "# Demo 日报\n\n本地 mock action 已生成新的日报。\n",
+			created_at: generatedAt,
+			updated_at: generatedAt,
+		};
+		requireRuntimeAccess().updateModel((current) => ({
+			...current,
+			briefs: [generated, ...current.briefs],
+		}));
+		requireRuntimeAccess().recordMutation(
+			"Generate brief",
+			`Created ${generated.id} in the mock workspace.`,
+		);
+		return json(generated);
 	}),
 	http.get("/api/briefs/:briefId", async ({ params, request }) => {
 		const network = await applyNetworkProfile(request);

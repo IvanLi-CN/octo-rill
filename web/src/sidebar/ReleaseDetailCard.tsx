@@ -168,6 +168,22 @@ function isPendingDetailStatus(status: string | undefined) {
 	);
 }
 
+function shouldFallbackToOriginal(
+	projection:
+		| ReleaseDetailResponse["translated"]
+		| ReleaseDetailResponse["smart"]
+		| null
+		| undefined,
+) {
+	if (projection?.status === "ready") {
+		return !(projection.title?.trim() || projection.summary?.trim());
+	}
+	return (
+		!projection ||
+		(!isPendingDetailStatus(projection.status) && projection.status !== "error")
+	);
+}
+
 function truncateChars(raw: string, maxChars: number) {
 	return Array.from(raw).slice(0, maxChars).join("");
 }
@@ -217,6 +233,7 @@ function normalizeReleaseTarget(
 		releaseId: normalizeReleaseId(target.releaseId) ?? null,
 		locator: target.locator ?? null,
 		fromTab: target.fromTab,
+		lane: target.lane ?? null,
 	};
 }
 
@@ -277,6 +294,7 @@ export function ReleaseDetailCard(props: {
 		null,
 	);
 	const [selectedLane, setSelectedLane] = useState<ReleaseDetailLane>("smart");
+	const initialLane = normalizedTarget?.lane ?? null;
 	const [detail, setDetail] = useState<ReleaseDetailResponse | null>(null);
 	const [detailTargetKey, setDetailTargetKey] = useState<string | null>(null);
 	const translateRequestSeqRef = useRef(0);
@@ -301,7 +319,7 @@ export function ReleaseDetailCard(props: {
 			setTranslateError(null);
 			setSmartError(null);
 			if (options?.resetDisplay !== false) {
-				setSelectedLane("smart");
+				setSelectedLane(targetRelease.lane ?? "smart");
 				setDetail(null);
 				setDetailTargetKey(null);
 			}
@@ -351,7 +369,8 @@ export function ReleaseDetailCard(props: {
 			return;
 		}
 		loadDetail(normalizedTarget, { resetDisplay: true });
-	}, [activeTargetKey, loadDetail, normalizedTarget]);
+		setSelectedLane(initialLane ?? "smart");
+	}, [activeTargetKey, initialLane, loadDetail, normalizedTarget]);
 
 	const activeDetail = useMemo(() => {
 		if (!detail || !activeTargetKey || detailTargetKey !== activeTargetKey) {
@@ -607,12 +626,15 @@ export function ReleaseDetailCard(props: {
 
 	useEffect(() => {
 		if (!activeDetail) return;
-		if (selectedLane === "smart" && activeDetail.smart?.status === "disabled") {
+		if (
+			selectedLane === "smart" &&
+			shouldFallbackToOriginal(activeDetail.smart)
+		) {
 			setSelectedLane("original");
 		}
 		if (
 			selectedLane === "translated" &&
-			activeDetail.translated?.status === "disabled"
+			shouldFallbackToOriginal(activeDetail.translated)
 		) {
 			setSelectedLane("original");
 		}
