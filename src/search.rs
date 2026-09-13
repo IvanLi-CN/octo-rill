@@ -1100,7 +1100,7 @@ mod tests {
         );
 
         sqlx::raw_sql(include_str!(
-            "../migrations/0080_command_palette_search.sql"
+            "../migrations/0081_command_palette_search.sql"
         ))
         .execute(&pool)
         .await
