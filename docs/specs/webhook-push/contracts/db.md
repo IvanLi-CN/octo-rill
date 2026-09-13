@@ -28,6 +28,12 @@ Rows are observations of a repository Hook. A missing row for an enabled target 
 - Webhook manage and audit payloads store `retry_count`; manage payloads additionally store `scheduled`. SQLite busy exhaustion and partial audit dispatch failures reschedule the same task using `available_at` before a terminal failure.
 - Webhook worker local writes use `SqliteWriteCoordinator`; the writer permit never spans GitHub requests.
 
+Rows are observations of a repository Hook. A missing row for an enabled target is derived as `waiting_registration`, not `unknown` or `missing`.
+
+## `job_tasks`
+
+- `available_at TEXT`: nullable UTC time used by durable delayed retries; queued tasks are claimable only when this is null or due.
+
 ## `webhook_push_deliveries`
 
 - 主键：`delivery_id`

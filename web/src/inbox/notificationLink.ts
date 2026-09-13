@@ -26,17 +26,19 @@ function isFallbackNotificationHref(notification: {
 	html_url: string | null;
 	repo_full_name: string | null;
 }) {
+	const normalized = notification.html_url
+		? normalizeGithubUrl(notification.html_url)
+		: null;
+	if (notification.html_url && !normalized) {
+		return true;
+	}
 	if (!notification.html_url || !notification.repo_full_name) {
-		const normalized = notification.html_url
-			? normalizeGithubUrl(notification.html_url)
-			: null;
 		const threadHref = notificationThreadHref(notification.thread_id);
 		return (
 			normalized === GITHUB_NOTIFICATIONS_URL &&
 			(!threadHref || normalized !== threadHref)
 		);
 	}
-	const normalized = normalizeGithubUrl(notification.html_url);
 	const threadHref = notificationThreadHref(notification.thread_id);
 	return (
 		(normalized === GITHUB_NOTIFICATIONS_URL &&

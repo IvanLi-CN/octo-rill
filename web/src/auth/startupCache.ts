@@ -222,6 +222,7 @@ export function readDashboardWarmSnapshot(input: {
 		cached.routeState.activeReleaseLocatorKey ?? null;
 	const cachedActiveAnnouncementLocatorKey =
 		cached.routeState.activeAnnouncementLocatorKey ?? null;
+	const cachedLane = cached.routeState.lane ?? null;
 	const cachedSelectedBriefId = cached.routeState.selectedBriefId ?? null;
 	const cachedReleaseReturnTab = cached.routeState.releaseReturnTab ?? "briefs";
 	const cachedScopeSignature = cached.routeState.scopeSignature ?? null;
@@ -234,6 +235,7 @@ export function readDashboardWarmSnapshot(input: {
 			input.routeState.activeReleaseLocatorKey ||
 		cachedActiveAnnouncementLocatorKey !==
 			input.routeState.activeAnnouncementLocatorKey ||
+		cachedLane !== (input.routeState.lane ?? null) ||
 		cachedReleaseReturnTab !== input.routeState.releaseReturnTab
 	) {
 		return null;
@@ -246,6 +248,7 @@ export function readDashboardWarmSnapshot(input: {
 			selectedBriefId: cachedSelectedBriefId,
 			activeReleaseLocatorKey: cachedActiveReleaseLocatorKey,
 			activeAnnouncementLocatorKey: cachedActiveAnnouncementLocatorKey,
+			lane: cachedLane,
 			releaseReturnTab: cachedReleaseReturnTab,
 		},
 	};

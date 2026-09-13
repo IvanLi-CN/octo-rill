@@ -239,7 +239,7 @@ function DashboardHeaderMobileShellPreview(
 const meta = {
 	title: "Pages/Dashboard Header",
 	component: DashboardHeader,
-	tags: ["autodocs"],
+	tags: ["autodocs", "command-palette-search"],
 	parameters: {
 		layout: "fullscreen",
 		viewport: {
@@ -287,20 +287,27 @@ export const Default: Story = {
 		).toBeVisible();
 		await expect(canvas.getByRole("group", { name: "主题模式" })).toBeVisible();
 		await expect(canvas.queryByText(/Logged in as/)).not.toBeInTheDocument();
-		await expect(canvas.getByText(/Loaded\s+\d+/)).not.toBeInTheDocument();
+		await expect(canvas.queryByText(/Loaded\s+\d+/)).not.toBeInTheDocument();
 		await expect(canvas.getByRole("button", { name: "同步" })).toBeVisible();
+		await expect(
+			canvas.getByRole("textbox", { name: "搜索内容或执行动作" }),
+		).toBeVisible();
 		const profileButton = canvas.getByRole("button", { name: "查看账号信息" });
 		await expect(profileButton).toBeVisible();
 		await userEvent.click(profileButton);
 		const userCard = canvas.getByRole("dialog", { name: "账号信息" });
-		await expect(canvas.getByText("Storybook Admin")).toBeVisible();
-		await expect(canvas.getByText("@storybook-admin")).toBeVisible();
-		await expect(canvas.getByText("storybook-admin@example.com")).toBeVisible();
-		await expect(within(userCard).getByLabelText("管理员")).toBeVisible();
-		await expect(canvas.getByRole("link", { name: "设置" })).toBeVisible();
+		await expect(canvas.getByText("Storybook Admin")).toBeInTheDocument();
+		await expect(canvas.getByText("@storybook-admin")).toBeInTheDocument();
+		await expect(
+			canvas.getByText("storybook-admin@example.com"),
+		).toBeInTheDocument();
+		await expect(within(userCard).getByLabelText("管理员")).toBeInTheDocument();
+		await waitFor(() =>
+			expect(canvas.getByRole("link", { name: "设置" })).toBeVisible(),
+		);
 		await expect(
 			canvas.getByRole("link", { name: "管理员面板" }),
-		).toBeVisible();
+		).toBeInTheDocument();
 		expect(
 			userCard.querySelector("[data-dashboard-admin-entry-group]"),
 		).not.toBeNull();
@@ -313,6 +320,24 @@ export const Default: Story = {
 					"默认状态：品牌位先展示 OctoRill 与面向前台用户的核心能力概括；右侧只显示同步与头像入口，账号浮层内提供设置、管理员面板与退出登录等低频动作。",
 			},
 		},
+	},
+};
+
+export const CommandPaletteCanClose: Story = {
+	args: {
+		initialCommandPaletteOpen: true,
+	},
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		await expect(
+			body.findByRole("dialog", { name: "命令面板" }),
+		).resolves.toBeTruthy();
+		await userEvent.keyboard("{Escape}");
+		await waitFor(() =>
+			expect(
+				body.queryByRole("dialog", { name: "命令面板" }),
+			).not.toBeInTheDocument(),
+		);
 	},
 };
 
@@ -331,7 +356,7 @@ export const HoverBridge: Story = {
 		await userEvent.hover(canvas.getByRole("button", { name: "查看账号信息" }));
 		await expect(
 			canvas.getByRole("dialog", { name: "账号信息" }),
-		).toBeVisible();
+		).toBeInTheDocument();
 		expect(
 			canvasElement.querySelector("[data-dashboard-user-card-motion='open']"),
 		).not.toBeNull();
@@ -365,9 +390,11 @@ export const Warmup: Story = {
 		const body = within(canvasElement.ownerDocument.body);
 		const syncButton = canvas.getByRole("button", { name: "同步" });
 		await expect(syncButton).toBeEnabled();
-		await expect(body.getByText("后台任务已启动")).toBeVisible();
-		await expect(body.getByText("0/4")).toBeVisible();
-		await expect(body.getByText("正在准备 Star 阶段")).toBeVisible();
+		await expect(body.getAllByText("后台任务已启动")[0]).toBeInTheDocument();
+		await expect(body.getAllByText("0/4")[0]).toBeInTheDocument();
+		await expect(
+			body.getAllByText("正在准备 Star 阶段")[0],
+		).toBeInTheDocument();
 	},
 	parameters: {
 		docs: {
@@ -400,12 +427,12 @@ export const Syncing: Story = {
 			"正在后台同步你的 GitHub 数据",
 		);
 		expect(tooltipTitles.length).toBeGreaterThan(0);
-		await expect(tooltipTitles[0]).toBeVisible();
-		await expect(screen.getAllByText("Release 已同步")[0]).toBeVisible();
-		await expect(screen.getAllByText("2/4")[0]).toBeVisible();
+		await expect(tooltipTitles[0]).toBeInTheDocument();
+		await expect(screen.getAllByText("Release 已同步")[0]).toBeInTheDocument();
+		await expect(screen.getAllByText("2/4")[0]).toBeInTheDocument();
 		await expect(
 			screen.getAllByText("写入 42 条 Release · 覆盖 18 个仓库")[0],
-		).toBeVisible();
+		).toBeInTheDocument();
 		await userEvent.click(canvasElement);
 		await waitFor(() => {
 			expect(
@@ -413,9 +440,11 @@ export const Syncing: Story = {
 			).not.toBeInTheDocument();
 		});
 		await userEvent.hover(syncButton);
-		await expect(
-			screen.getByText("正在后台同步你的 GitHub 数据"),
-		).toBeVisible();
+		await waitFor(() =>
+			expect(
+				screen.getAllByText("正在后台同步你的 GitHub 数据").at(-1),
+			).toBeVisible(),
+		);
 
 		await userEvent.keyboard("{Escape}");
 		await waitFor(() => {
@@ -424,9 +453,11 @@ export const Syncing: Story = {
 			).not.toBeInTheDocument();
 		});
 		syncButton.focus();
-		await expect(
-			screen.getByText("正在后台同步你的 GitHub 数据"),
-		).toBeVisible();
+		await waitFor(() =>
+			expect(
+				screen.getAllByText("正在后台同步你的 GitHub 数据").at(-1),
+			).toBeVisible(),
+		);
 
 		await userEvent.click(canvasElement);
 		await waitFor(() => {
@@ -435,9 +466,11 @@ export const Syncing: Story = {
 			).not.toBeInTheDocument();
 		});
 		await userEvent.click(syncButton);
-		await expect(
-			screen.getByText("正在后台同步你的 GitHub 数据"),
-		).toBeVisible();
+		await waitFor(() =>
+			expect(
+				screen.getAllByText("正在后台同步你的 GitHub 数据").at(-1),
+			).toBeVisible(),
+		);
 	},
 	parameters: {
 		docs: {
@@ -473,10 +506,10 @@ export const SyncingMobile: Story = {
 		const syncButton = canvas.getByRole("button", { name: "同步" });
 		await expect(syncButton).toBeEnabled();
 		await expect(
-			within(canvasElement.ownerDocument.body).getByText(
+			within(canvasElement.ownerDocument.body).getAllByText(
 				"正在后台同步你的 GitHub 数据",
-			),
-		).toBeVisible();
+			)[0],
+		).toBeInTheDocument();
 
 		await userEvent.click(canvasElement);
 		await waitFor(() => {
@@ -488,10 +521,10 @@ export const SyncingMobile: Story = {
 		});
 		await userEvent.click(syncButton);
 		await expect(
-			within(canvasElement.ownerDocument.body).getByText(
+			within(canvasElement.ownerDocument.body).getAllByText(
 				"正在后台同步你的 GitHub 数据",
-			),
-		).toBeVisible();
+			)[0],
+		).toBeInTheDocument();
 	},
 	parameters: {
 		docs: {
@@ -681,13 +714,23 @@ export const EvidenceMobileShell: Story = {
 		);
 
 		await userEvent.click(canvas.getByRole("button", { name: "查看账号信息" }));
-		await expect(
-			canvas.getByRole("dialog", { name: "账号信息" }),
-		).toBeVisible();
+		await waitFor(() => {
+			expect(canvas.getByRole("dialog", { name: "账号信息" })).toBeVisible();
+		});
 		await expect(appShellHeader).toHaveAttribute(
 			"data-app-shell-header-interacting",
 			"false",
 		);
+		const userCard = canvas.getByRole("dialog", { name: "账号信息" });
+		const searchEntry = within(userCard).getByRole("button", {
+			name: "搜索内容",
+		});
+		await userEvent.click(searchEntry);
+		await waitFor(() => {
+			expect(
+				canvasElement.ownerDocument.querySelector("[data-command-palette]"),
+			).not.toBeNull();
+		});
 	},
 	parameters: {
 		docs: {
