@@ -28,8 +28,8 @@ use crate::release_links::{
     parse_repo_full_name_from_release_url, resolve_release_refs,
 };
 use crate::{
-    admin_runtime, ai, api_keys, briefs, content_processing, jobs, local_id, sync, translations,
-    webhook_push,
+    admin_runtime, ai, api_keys, briefs, content_processing, jobs, local_id,
+    search as search_service, sync, translations, webhook_push,
 };
 use crate::{
     error::ApiError,
@@ -13375,6 +13375,24 @@ pub async fn list_notifications(
     Ok(Json(items))
 }
 
+pub async fn search(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    headers: HeaderMap,
+    Query(request): Query<search_service::SearchRequest>,
+) -> Result<Json<search_service::SearchResponse>, ApiError> {
+    let user_id = require_business_user_id(state.as_ref(), &session, &headers).await?;
+    let raw_query = request.q.unwrap_or_default();
+    let parsed = search_service::parse_query(&raw_query)?;
+    let (remaining, reset_at) = search_service::consume_quota(state.as_ref(), &user_id).await?;
+    let items = search_service::query(state.as_ref(), &user_id, &parsed).await?;
+    Ok(Json(search_service::SearchResponse {
+        items,
+        remaining_requests: remaining,
+        reset_at: Some(reset_at),
+    }))
+}
+
 const BRIEF_PREVIEW_MARKDOWN_MAX_CHARS: usize = 600;
 
 fn brief_preview_markdown(content_markdown: &str) -> String {
@@ -25435,7 +25453,7 @@ mod tests {
         release_detail_source_hash, release_detail_translation_ready, release_excerpt,
         release_feed_body, release_reactions_status, release_smart_body_prompt,
         release_smart_diff_prompt, require_active_user_id, require_business_user_id,
-        resolve_release_full_name, should_retry_public_compare_without_auth,
+        resolve_release_full_name, search, should_retry_public_compare_without_auth,
         smart_error_is_retryable, split_markdown_chunks, summarize_release_smart_candidate_with_ai,
         sync_all, sync_notifications, sync_releases, sync_starred, task_events_sse,
         translate_release_detail_for_user, translate_releases_batch_for_user,
@@ -25443,6 +25461,7 @@ mod tests {
     };
     use crate::ai;
     use crate::error::ApiError;
+    use crate::search::SearchRequest;
     use std::{
         fs,
         net::SocketAddr,
@@ -25855,6 +25874,293 @@ mod tests {
             .await
             .expect("insert session user id");
         session
+    }
+
+    async fn seed_search_repo_association(
+        pool: &SqlitePool,
+        user_index: i64,
+        repo_id: i64,
+        full_name: &str,
+        is_following: bool,
+    ) {
+        let (owner_login, repo_name) = full_name.split_once('/').expect("search repo full name");
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO user_repo_associations (
+              id, user_id, repo_id, repo_full_name, repo_full_name_lower,
+              owner_login, repo_name, html_url, description, is_private,
+              first_source, first_associated_at, last_seen_at, is_following,
+              follow_state_source, has_personal_owned_source, has_github_star_source,
+              has_manual_feed_source, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'github_star', ?, ?, ?,
+                    'system_default', 0, 1, 0, ?, ?)
+            "#,
+        )
+        .bind(format!("search-association-{user_index}-{repo_id}"))
+        .bind(test_user_id(user_index))
+        .bind(repo_id)
+        .bind(full_name)
+        .bind(full_name.to_ascii_lowercase())
+        .bind(owner_login)
+        .bind(repo_name)
+        .bind(format!("https://github.com/{full_name}"))
+        .bind("search fixture repository")
+        .bind(now)
+        .bind(now)
+        .bind(if is_following { 1_i64 } else { 0_i64 })
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed search repo association");
+    }
+
+    #[tokio::test]
+    async fn search_contract() {
+        let pool = setup_pool().await;
+        seed_search_repo_association(&pool, 1, 42, "openai/codex", true).await;
+        seed_repo_release(&pool, 42, 4201).await;
+        seed_release_detail_translation(
+            &pool,
+            test_user_id(1).as_str(),
+            "4201",
+            "search-source-hash",
+            Some("中文标题"),
+            Some("中文摘要"),
+        )
+        .await;
+        seed_social_event(
+            &pool,
+            test_user_id(1).as_str(),
+            SeedSocialEventArgs {
+                kind: "announcement",
+                event_id: "announcement-search-1",
+                repo_id: Some(42),
+                repo_full_name: Some("openai/codex"),
+                repo_owner_avatar_url: None,
+                repo_open_graph_image_url: None,
+                repo_uses_custom_open_graph_image: None,
+                title: Some("公告标题"),
+                body: Some("公告正文"),
+                html_url: Some("https://github.com/openai/codex/discussions/1"),
+                actor_login: "octocat",
+                occurred_at: "2026-02-22T00:00:00Z",
+            },
+        )
+        .await;
+        seed_brief(
+            &pool,
+            test_user_id(1).as_str(),
+            "2026-02-22",
+            "日报正文关键字",
+        )
+        .await;
+        seed_notification(
+            &pool,
+            test_user_id(1).as_str(),
+            "search-thread",
+            "2026-02-22T00:00:00Z",
+        )
+        .await;
+
+        let state = setup_state(pool.clone());
+        let Json(response) = search(
+            State(state.clone()),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(SearchRequest {
+                q: Some("中文".to_owned()),
+            }),
+        )
+        .await
+        .expect("search translated text");
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(response.items[0].result_type, "release");
+        assert_eq!(response.items[0].matched_lane, "translated");
+        assert_eq!(response.items[0].matched_lanes, vec!["translated"]);
+        assert_eq!(response.items[0].target.lane.as_deref(), Some("translated"));
+        assert_eq!(response.remaining_requests, 49);
+
+        let Json(filtered) = search(
+            State(state.clone()),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(SearchRequest {
+                q: Some(
+                    "owner:openai repo:codex type:release after:2026-02-01 before:2026-03-01"
+                        .to_owned(),
+                ),
+            }),
+        )
+        .await
+        .expect("search filters");
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].id, "release:4201");
+
+        let error = search(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(SearchRequest {
+                q: Some("owner:openai owner:other".to_owned()),
+            }),
+        )
+        .await
+        .expect_err("duplicate filter must fail");
+        assert_eq!(error.code(), "invalid_search_query");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        let quota_count = sqlx::query_scalar::<_, i64>(
+            "SELECT request_count FROM search_rate_limits WHERE user_id = ?",
+        )
+        .bind(test_user_id(1))
+        .fetch_one(&pool)
+        .await
+        .expect("read search quota");
+        assert_eq!(quota_count, 2);
+    }
+
+    #[tokio::test]
+    async fn search_permission_and_rate_limit() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "other-user", 0, 0).await;
+        seed_search_repo_association(&pool, 1, 42, "openai/codex", true).await;
+        seed_search_repo_association(&pool, 2, 99, "private/hidden", true).await;
+        seed_repo_release(&pool, 42, 4201).await;
+        sqlx::query("UPDATE repo_releases SET name = 'Visible release' WHERE release_id = 4201")
+            .execute(&pool)
+            .await
+            .expect("name visible release");
+        seed_repo_release(&pool, 99, 9901).await;
+        sqlx::query("UPDATE repo_releases SET name = 'Secret release' WHERE release_id = 9901")
+            .execute(&pool)
+            .await
+            .expect("name secret release");
+        seed_social_event(
+            &pool,
+            test_user_id(1).as_str(),
+            SeedSocialEventArgs {
+                kind: "announcement",
+                event_id: "hidden-announcement",
+                repo_id: Some(99),
+                repo_full_name: Some("private/hidden"),
+                repo_owner_avatar_url: None,
+                repo_open_graph_image_url: None,
+                repo_uses_custom_open_graph_image: None,
+                title: Some("Secret announcement"),
+                body: Some("secret announcement body"),
+                html_url: Some("https://github.com/private/hidden/discussions/1"),
+                actor_login: "octocat",
+                occurred_at: "2026-02-22T00:00:00Z",
+            },
+        )
+        .await;
+        sqlx::query(
+            "UPDATE social_activity_events SET discussion_number = 1 WHERE id = 'hidden-announcement'",
+        )
+        .execute(&pool)
+        .await
+        .expect("set hidden announcement discussion number");
+        seed_brief(
+            &pool,
+            test_user_id(2).as_str(),
+            "2026-02-22",
+            "secret user brief",
+        )
+        .await;
+        seed_notification(
+            &pool,
+            test_user_id(2).as_str(),
+            "hidden-thread",
+            "2026-02-22T00:00:00Z",
+        )
+        .await;
+
+        let state = setup_state(pool.clone());
+        let Json(response) = search(
+            State(state.clone()),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(SearchRequest {
+                q: Some("secret".to_owned()),
+            }),
+        )
+        .await
+        .expect("search hidden content");
+        assert!(response.items.is_empty());
+
+        let invalid = search(
+            State(state.clone()),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(SearchRequest {
+                q: Some("unknown:value".to_owned()),
+            }),
+        )
+        .await
+        .expect_err("unknown filter must fail");
+        assert_eq!(invalid.code(), "invalid_search_query");
+
+        for request_number in 1..=48 {
+            let Json(response) = search(
+                State(state.clone()),
+                setup_session(1).await,
+                HeaderMap::new(),
+                Query(SearchRequest {
+                    q: Some(format!("q{request_number}")),
+                }),
+            )
+            .await
+            .expect("quota request");
+            assert_eq!(response.remaining_requests, 50 - request_number - 1);
+        }
+        let Json(fiftieth) = search(
+            State(state.clone()),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(SearchRequest {
+                q: Some("q50".to_owned()),
+            }),
+        )
+        .await
+        .expect("50th request succeeds");
+        assert_eq!(fiftieth.remaining_requests, 0);
+
+        let limited = search(
+            State(state.clone()),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(SearchRequest {
+                q: Some("q51".to_owned()),
+            }),
+        )
+        .await
+        .expect_err("51st request must be limited");
+        assert_eq!(limited.code(), "search_rate_limited");
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        let limited_body = response_json(limited.into_response()).await;
+        assert!(limited_body["retry_after_seconds"].as_u64().is_some());
+        assert!(limited_body["reset_at"].as_str().is_some());
+
+        sqlx::query(
+            "UPDATE search_rate_limits SET window_started_at = window_started_at - 301 WHERE user_id = ?",
+        )
+        .bind(test_user_id(1))
+        .execute(&pool)
+        .await
+        .expect("expire quota window");
+        let Json(reset) = search(
+            State(state),
+            setup_session(1).await,
+            HeaderMap::new(),
+            Query(SearchRequest {
+                q: Some("after-reset".to_owned()),
+            }),
+        )
+        .await
+        .expect("expired window resets");
+        assert_eq!(reset.remaining_requests, 49);
     }
 
     #[tokio::test]

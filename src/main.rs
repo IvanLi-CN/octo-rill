@@ -17,6 +17,7 @@ mod observability;
 mod passkeys;
 mod release_links;
 mod runtime;
+mod search;
 mod server;
 mod session_store;
 mod sqlite_write;
