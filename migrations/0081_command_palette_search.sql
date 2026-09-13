@@ -631,6 +631,19 @@ CREATE TRIGGER IF NOT EXISTS search_briefs_ad AFTER DELETE ON briefs BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS search_repo_associations_ai AFTER INSERT ON user_repo_associations BEGIN
+  DELETE FROM search_documents_fts
+  WHERE doc_id IN (
+    SELECT id FROM search_documents
+    WHERE user_id=NEW.user_id
+      AND resource_type='repository'
+      AND repo_id=NEW.repo_id
+      AND id <> 'repository:'||NEW.user_id||':'||NEW.repo_full_name_lower
+  );
+  DELETE FROM search_documents
+  WHERE user_id=NEW.user_id
+    AND resource_type='repository'
+    AND repo_id=NEW.repo_id
+    AND id <> 'repository:'||NEW.user_id||':'||NEW.repo_full_name_lower;
   INSERT INTO search_documents (id,user_id,resource_type,resource_id,repo_id,repo_full_name,owner_login,title,body,source_time,target_path,target_url,created_at,updated_at)
   VALUES ('repository:'||NEW.user_id||':'||NEW.repo_full_name_lower,NEW.user_id,'repository',NEW.repo_full_name_lower,NEW.repo_id,NEW.repo_full_name,NEW.owner_login,NEW.repo_name,NEW.description,NEW.updated_at,'/focus/repo/'||NEW.owner_login||'/'||NEW.repo_name,NEW.html_url,NEW.created_at,NEW.updated_at)
   ON CONFLICT(user_id,resource_type,resource_id) DO UPDATE SET repo_id=excluded.repo_id,repo_full_name=excluded.repo_full_name,owner_login=excluded.owner_login,title=excluded.title,body=excluded.body,source_time=excluded.source_time,target_path=excluded.target_path,target_url=excluded.target_url,updated_at=excluded.updated_at;
@@ -646,6 +659,19 @@ CREATE TRIGGER IF NOT EXISTS search_repo_associations_ai AFTER INSERT ON user_re
 END;
 
 CREATE TRIGGER IF NOT EXISTS search_repo_associations_au AFTER UPDATE ON user_repo_associations BEGIN
+  DELETE FROM search_documents_fts
+  WHERE doc_id IN (
+    SELECT id FROM search_documents
+    WHERE user_id=NEW.user_id
+      AND resource_type='repository'
+      AND repo_id=NEW.repo_id
+      AND id <> 'repository:'||NEW.user_id||':'||NEW.repo_full_name_lower
+  );
+  DELETE FROM search_documents
+  WHERE user_id=NEW.user_id
+    AND resource_type='repository'
+    AND repo_id=NEW.repo_id
+    AND id <> 'repository:'||NEW.user_id||':'||NEW.repo_full_name_lower;
   DELETE FROM search_documents_fts
   WHERE doc_id='repository:'||OLD.user_id||':'||OLD.repo_full_name_lower
     AND lower(OLD.repo_full_name_lower) <> lower(NEW.repo_full_name_lower)
@@ -681,6 +707,19 @@ CREATE TRIGGER IF NOT EXISTS search_repo_associations_ad AFTER DELETE ON user_re
 END;
 
 CREATE TRIGGER IF NOT EXISTS search_starred_repos_ai AFTER INSERT ON starred_repos BEGIN
+  DELETE FROM search_documents_fts
+  WHERE doc_id IN (
+    SELECT id FROM search_documents
+    WHERE user_id=NEW.user_id
+      AND resource_type='repository'
+      AND repo_id=NEW.repo_id
+      AND id <> 'repository:'||NEW.user_id||':'||lower(NEW.full_name)
+  );
+  DELETE FROM search_documents
+  WHERE user_id=NEW.user_id
+    AND resource_type='repository'
+    AND repo_id=NEW.repo_id
+    AND id <> 'repository:'||NEW.user_id||':'||lower(NEW.full_name);
   INSERT INTO search_documents (id,user_id,resource_type,resource_id,repo_id,repo_full_name,owner_login,title,body,source_time,target_path,target_url,created_at,updated_at)
   SELECT 'repository:'||NEW.user_id||':'||lower(NEW.full_name),NEW.user_id,'repository',lower(NEW.full_name),NEW.repo_id,NEW.full_name,NEW.owner_login,NEW.name,NEW.description,NEW.updated_at,'/focus/repo/'||NEW.owner_login||'/'||NEW.name,NEW.html_url,NEW.updated_at,NEW.updated_at
   WHERE NOT EXISTS (SELECT 1 FROM user_repo_associations ura WHERE ura.user_id=NEW.user_id AND ura.repo_full_name_lower=lower(NEW.full_name))
@@ -690,6 +729,19 @@ CREATE TRIGGER IF NOT EXISTS search_starred_repos_ai AFTER INSERT ON starred_rep
 END;
 
 CREATE TRIGGER IF NOT EXISTS search_starred_repos_au AFTER UPDATE ON starred_repos BEGIN
+  DELETE FROM search_documents_fts
+  WHERE doc_id IN (
+    SELECT id FROM search_documents
+    WHERE user_id=NEW.user_id
+      AND resource_type='repository'
+      AND repo_id=NEW.repo_id
+      AND id <> 'repository:'||NEW.user_id||':'||lower(NEW.full_name)
+  );
+  DELETE FROM search_documents
+  WHERE user_id=NEW.user_id
+    AND resource_type='repository'
+    AND repo_id=NEW.repo_id
+    AND id <> 'repository:'||NEW.user_id||':'||lower(NEW.full_name);
   DELETE FROM search_documents_fts
   WHERE doc_id='repository:'||OLD.user_id||':'||lower(OLD.full_name)
     AND lower(OLD.full_name) <> lower(NEW.full_name)

@@ -1326,6 +1326,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repository_rename_deduplicates_star_and_association_projection() {
+        let pool = setup_pool().await;
+        seed_repo_association(&pool).await;
+        sqlx::query(
+            r#"
+            INSERT INTO starred_repos (
+              id, user_id, repo_id, full_name, owner_login, name, description,
+              html_url, stargazed_at, is_private, updated_at
+            ) VALUES ('search-starred-rename', 'search-user', 42, 'octo/rill',
+                      'octo', 'rill', 'starred repository',
+                      'https://github.com/octo/rill', '2026-02-23T00:00:00Z', 0,
+                      '2026-02-23T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed starred rename fixture");
+
+        sqlx::query(
+            "UPDATE starred_repos SET full_name = 'octo/renamed', owner_login = 'octo', name = 'renamed', html_url = 'https://github.com/octo/renamed' WHERE id = 'search-starred-rename'",
+        )
+        .execute(&pool)
+        .await
+        .expect("rename starred repository");
+        sqlx::query(
+            r#"
+            INSERT INTO user_repo_associations (
+              id, user_id, repo_id, repo_full_name, repo_full_name_lower,
+              owner_login, repo_name, html_url, description, is_private,
+              first_source, first_associated_at, last_seen_at, is_following,
+              follow_state_source, has_personal_owned_source, has_github_star_source,
+              has_manual_feed_source, created_at, updated_at
+            )
+            VALUES ('search-association-renamed', 'search-user', 42, 'octo/renamed', 'octo/renamed',
+                    'octo', 'renamed', 'https://github.com/octo/renamed', 'renamed repository', 0,
+                    'github_star', '2026-02-23T00:00:00Z', '2026-02-24T00:00:00Z', 1,
+                    'system_default', 0, 1, 0, '2026-02-23T00:00:00Z', '2026-02-24T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("insert renamed association");
+
+        let projections = sqlx::query_as::<_, (String, String)>(
+            "SELECT id, repo_full_name FROM search_documents WHERE user_id = 'search-user' AND resource_type = 'repository' AND repo_id = 42 ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read renamed repository projections");
+        assert_eq!(
+            projections,
+            vec![(
+                "repository:search-user:octo/renamed".to_owned(),
+                "octo/renamed".to_owned(),
+            )]
+        );
+    }
+
+    #[tokio::test]
     async fn filtered_results_apply_predicates_before_limit() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
