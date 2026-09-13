@@ -15,7 +15,7 @@
 
 ## Related Changes
 
-- None
+- Repository rename projection cleanup keeps one canonical repository result when star synchronization updates the name before the user association projection.
 
 ## References
 
