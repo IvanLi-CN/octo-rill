@@ -265,6 +265,8 @@ function buildWebhookPushSettings(
 	const repos = [baseRepo(7001, "octo-demo-owner", "release-lab")];
 	let operation: WebhookPushSettingsResponse["operation"] = null;
 	let lastCompletedCheckAt: string | null = null;
+	let lastOperationFailure: WebhookPushSettingsResponse["last_operation_failure"] =
+		null;
 
 	const markRegistered = (repo: WebhookPushRepoStatus, hookId: number) => ({
 		...repo,
@@ -302,12 +304,35 @@ function buildWebhookPushSettings(
 				error_message: "当前 classic PAT 缺少 repo 或 public_repo 权限。",
 			};
 			break;
+		case "archived-error":
+			repos[0] = {
+				...repos[0],
+				hook_id: 91001,
+				status: "archived",
+				error_kind: "archived",
+				error_message: "GitHub 已将此仓库归档，归档状态下不能修改 Webhook。",
+			};
+			lastOperationFailure = {
+				task_id: "demo-webhook-archived",
+				operation: "reconcile",
+				error_message: "Webhook 对齐未完成：仓库已归档。",
+				failed_at: checkedAt,
+				retry_count: 3,
+			};
+			break;
 		case "temporary-error":
 			repos[0] = {
 				...repos[0],
 				status: "error",
 				error_kind: "github_rate_limit",
 				error_message: "GitHub 暂时限流，稍后可再次检查并修复。",
+			};
+			lastOperationFailure = {
+				task_id: "demo-webhook-temporary-error",
+				operation: "reconcile",
+				error_message: "GitHub 暂时限流，自动重试已耗尽。",
+				failed_at: checkedAt,
+				retry_count: 3,
 			};
 			break;
 		case "delete-pending":
@@ -370,8 +395,25 @@ function buildWebhookPushSettings(
 	const permissionPaused = repos.filter(
 		(repo) => repo.permission_paused,
 	).length;
-	const errors = repos.filter((repo) => repo.status === "error").length;
+	const errors = repos.filter((repo) =>
+		["error", "archived"].includes(repo.status),
+	).length;
 	const removable = repos.filter((repo) => repo.hook_id !== null).length;
+	const pending = repos.filter(
+		(repo) =>
+			Boolean(repo.error_message) ||
+			[
+				"missing",
+				"error",
+				"conflict",
+				"permission_paused",
+				"archived",
+				"waiting_registration",
+				"registering",
+				"processing",
+				"delete_pending",
+			].includes(repo.status),
+	).length;
 	return {
 		desired_state: desiredState,
 		enabled: desiredState === "enabled" && includeOwnReleases,
@@ -389,6 +431,7 @@ function buildWebhookPushSettings(
 			permission_paused: permissionPaused,
 			errors,
 			removable,
+			pending,
 		},
 		schedule: {
 			audit_interval_days: 7,
@@ -396,9 +439,9 @@ function buildWebhookPushSettings(
 			next_started_at: "2026-07-14T06:00:00+08:00",
 		},
 		operation,
+		last_operation_failure: lastOperationFailure,
 		last_completed_check_at: lastCompletedCheckAt,
 		owner_groups: ownerGroups,
-		repos,
 	};
 }
 

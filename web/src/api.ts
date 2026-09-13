@@ -389,6 +389,7 @@ export type WebhookPushSettingsResponse = {
 		permission_paused: number;
 		errors: number;
 		removable: number;
+		pending: number;
 	};
 	schedule: {
 		audit_interval_days: number;
@@ -396,9 +397,15 @@ export type WebhookPushSettingsResponse = {
 		next_started_at: string | null;
 	};
 	operation: WebhookPushOperation | null;
+	last_operation_failure: {
+		task_id: string;
+		operation: string;
+		error_message: string;
+		failed_at: string;
+		retry_count: number;
+	} | null;
 	last_completed_check_at: string | null;
 	owner_groups: WebhookPushOwnerGroup[];
-	repos: WebhookPushRepoStatus[];
 };
 export type WebhookPushTaskResponse = {
 	task_id: string;
@@ -587,7 +594,6 @@ export type AdminSyncRuntimeConfigUpdateRequest = {
 export type DailyBriefProfilePatchRequest = {
 	daily_brief_time_zone: string;
 	include_own_releases?: boolean;
-	webhook_push_desired_state?: WebhookPushDesiredState;
 };
 export type LinuxDoConnectionResponse = {
 	linuxdo_user_id: number;

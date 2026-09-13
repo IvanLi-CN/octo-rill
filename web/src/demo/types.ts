@@ -68,6 +68,7 @@ export type DemoWebhookScenario =
 	| "healthy-registered"
 	| "paused-retained"
 	| "permission-paused"
+	| "archived-error"
 	| "temporary-error"
 	| "delete-pending"
 	| "deleted"

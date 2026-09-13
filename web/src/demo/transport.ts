@@ -30,6 +30,7 @@ import type {
 	PublicReleaseListItem,
 	ReactionTokenCheckResponse,
 	ReactionTokenStatusResponse,
+	WebhookPushSettingsResponse,
 } from "@/api";
 import { buildDemoHref } from "@/demo/registry";
 import {
@@ -95,6 +96,10 @@ function currentModel() {
 	return model;
 }
 
+function webhookRepos(settings: WebhookPushSettingsResponse) {
+	return settings.owner_groups.flatMap((group) => group.repos);
+}
+
 function demoWebhookConflictResponse() {
 	return json(
 		{
@@ -141,19 +146,12 @@ function queueDemoWebhookReconcile(
 						: repo,
 				),
 			})),
-			repos: model.webhookPush.repos.map((repo) =>
-				(repoId === undefined || repo.repo_id === repoId) && !repo.error_message
-					? { ...repo, status: progressStatus }
-					: repo,
-			),
 		},
 	}));
 	window.setTimeout(() => {
 		access.updateModel((model) => {
 			const completedAt = new Date().toISOString();
-			const completeRepo = (
-				repo: (typeof model.webhookPush.repos)[number],
-			) => ({
+			const completeRepo = (repo: ReturnType<typeof webhookRepos>[number]) => ({
 				...repo,
 				hook_id: desiredState === "deleted" ? null : (repo.hook_id ?? 91001),
 				status: desiredState === "deleted" ? "not_configured" : "registered",
@@ -164,7 +162,7 @@ function queueDemoWebhookReconcile(
 				error_kind: null,
 				error_message: null,
 			});
-			const repos = model.webhookPush.repos.map((repo) =>
+			const repos = webhookRepos(model.webhookPush).map((repo) =>
 				repoId === undefined || repo.repo_id === repoId
 					? completeRepo(repo)
 					: repo,
@@ -184,7 +182,23 @@ function queueDemoWebhookReconcile(
 							.length,
 						missing: repos.filter((repo) => repo.status === "missing").length,
 						removable: repos.filter((repo) => repo.hook_id !== null).length,
+						pending: repos.filter(
+							(repo) =>
+								Boolean(repo.error_message) ||
+								[
+									"missing",
+									"error",
+									"conflict",
+									"permission_paused",
+									"archived",
+									"waiting_registration",
+									"registering",
+									"processing",
+									"delete_pending",
+								].includes(repo.status),
+						).length,
 					},
+					last_operation_failure: null,
 					owner_groups: model.webhookPush.owner_groups.map((group) => ({
 						...group,
 						repos: group.repos.map((repo) =>
@@ -204,6 +218,7 @@ function queueDemoWebhookReconcile(
 									"error",
 									"conflict",
 									"permission_paused",
+									"archived",
 									"waiting_registration",
 									"registering",
 									"processing",
@@ -212,7 +227,6 @@ function queueDemoWebhookReconcile(
 							);
 						}).length,
 					})),
-					repos,
 				},
 			};
 		});
@@ -2048,13 +2062,11 @@ export const demoHandlers = [
 		const payload = (await request.json()) as Partial<{
 			daily_brief_time_zone: string;
 			include_own_releases: boolean;
-			webhook_push_desired_state: "enabled" | "paused" | "deleted";
 		}>;
 		const access = requireRuntimeAccess();
 		if (
 			currentModel().webhookPush.operation &&
-			(payload.webhook_push_desired_state ||
-				payload.include_own_releases === false)
+			payload.include_own_releases === false
 		) {
 			return demoWebhookConflictResponse();
 		}
@@ -2091,14 +2103,12 @@ export const demoHandlers = [
 					...model.webhookPush,
 					include_own_releases: nextProfile.include_own_releases,
 					desired_state:
-						payload.webhook_push_desired_state ??
-						(payload.include_own_releases === false &&
+						payload.include_own_releases === false &&
 						model.webhookPush.desired_state === "enabled"
 							? "paused"
-							: model.webhookPush.desired_state),
+							: model.webhookPush.desired_state,
 					enabled:
-						(payload.webhook_push_desired_state ??
-							model.webhookPush.desired_state) === "enabled" &&
+						model.webhookPush.desired_state === "enabled" &&
 						nextProfile.include_own_releases,
 				},
 			};
@@ -2114,8 +2124,7 @@ export const demoHandlers = [
 			});
 		}
 		if (
-			(payload.webhook_push_desired_state ||
-				payload.include_own_releases === false) &&
+			payload.include_own_releases === false &&
 			nextWebhookState !== previousWebhookState
 		) {
 			queueDemoWebhookReconcile(nextWebhookState ?? "paused");

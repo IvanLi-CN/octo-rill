@@ -832,11 +832,12 @@ export function SettingsPage(props: {
 		const updateOwnReleases = webhookPushConfirmMode === "my-releases";
 		void (
 			updateOwnReleases
-				? apiPatchMeProfile({
-						...briefProfileDraft,
-						include_own_releases: false,
-						webhook_push_desired_state: desiredState,
-					})
+				? apiPatchMeWebhookPush(desiredState).then(() =>
+						apiPatchMeProfile({
+							...briefProfileDraft,
+							include_own_releases: false,
+						}),
+					)
 				: apiPatchMeWebhookPush(desiredState)
 		)
 			.then(async () => {
@@ -1686,8 +1687,53 @@ export function SettingsPage(props: {
 												{webhookPushNotice}
 											</div>
 										) : null}
+										{webhookPush?.last_operation_failure ? (
+											<div
+												className={cn(
+													"mt-4 rounded-lg border px-3 py-3 text-sm",
+													statusToneClassName("error"),
+												)}
+												data-webhook-last-failure
+											>
+												<div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+													<div className="min-w-0 space-y-1">
+														<p className="font-medium">上次对齐未完成</p>
+														<p>
+															{webhookPush.last_operation_failure.error_message}
+														</p>
+														<p className="text-xs opacity-80">
+															已重试{" "}
+															{webhookPush.last_operation_failure.retry_count}{" "}
+															次 ·{" "}
+															<span
+																title={formatDateTime(
+																	webhookPush.last_operation_failure.failed_at,
+																)}
+															>
+																{formatRelativeCheck(
+																	webhookPush.last_operation_failure.failed_at,
+																)}
+															</span>
+														</p>
+													</div>
+													<Button
+														className="shrink-0 max-sm:min-h-11"
+														size="sm"
+														variant="outline"
+														disabled={
+															webhookPushBusy !== null ||
+															webhookPush?.operation !== null
+														}
+														onClick={() => void runWebhookPushAction()}
+													>
+														<RefreshCw className="size-4" />
+														立即检查并修复
+													</Button>
+												</div>
+											</div>
+										) : null}
 
-										<div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+										<div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
 											<DetailItem
 												label="已注册"
 												value={String(webhookPush?.summary.registered ?? 0)}
@@ -1705,6 +1751,10 @@ export function SettingsPage(props: {
 											<DetailItem
 												label="可清理"
 												value={String(webhookPush?.summary.removable ?? 0)}
+											/>
+											<DetailItem
+												label="待处理"
+												value={String(webhookPush?.summary.pending ?? 0)}
 											/>
 										</div>
 
@@ -1818,7 +1868,8 @@ export function SettingsPage(props: {
 																					<Badge
 																						variant={
 																							repo.permission_paused ||
-																							repo.status === "error"
+																							repo.status === "error" ||
+																							repo.status === "archived"
 																								? "destructive"
 																								: repo.status === "registered"
 																									? "secondary"
@@ -1843,7 +1894,13 @@ export function SettingsPage(props: {
 																												: repo.status ===
 																														"missing"
 																													? "缺失"
-																													: "待处理"}
+																													: repo.status ===
+																															"archived"
+																														? "仓库已归档"
+																														: repo.status ===
+																																"not_configured"
+																															? "未配置"
+																															: "待处理"}
 																					</Badge>
 																				</div>
 																				{repo.error_message ? (
@@ -1875,6 +1932,12 @@ export function SettingsPage(props: {
 																						更新 classic PAT 的 repo 或
 																						public_repo 权限
 																					</InternalLink>
+																				) : repo.status === "archived" ? (
+																					<p className="text-muted-foreground text-sm">
+																						GitHub
+																						已将此仓库归档，归档状态下不能修改
+																						Webhook。
+																					</p>
 																				) : null}
 																			</div>
 																			{webhookPush.desired_state ===

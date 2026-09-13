@@ -17,13 +17,15 @@
 - hook：`hook_id`, `callback_url`, `status`
 - 错误：`error_kind`, `error_message`, `permission_paused`
 - 时间：`last_checked_at`, `last_registered_at`, `updated_at`
-- `status`: `unknown|missing|registered|conflict|permission_paused|error|delete_pending`
+- `status`: `missing|registered|conflict|permission_paused|archived|error|delete_pending|waiting_registration|registering|processing|not_configured`
 
 Rows are observations of a repository Hook. A missing row for an enabled target is derived as `waiting_registration`, not `unknown` or `missing`.
 
 ## `job_tasks`
 
 - `available_at TEXT`: nullable UTC time used by durable delayed retries; queued tasks are claimable only when this is null or due.
+- Webhook manage payload stores `retry_count` and optional `scheduled`; SQLite busy exhaustion reschedules the same task using `available_at` before a terminal failure.
+- Webhook worker local writes use `SqliteWriteCoordinator`; the writer permit never spans GitHub requests.
 
 ## `webhook_push_deliveries`
 

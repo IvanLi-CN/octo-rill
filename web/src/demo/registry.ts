@@ -82,6 +82,7 @@ export const WEBHOOK_SCENARIO_OPTIONS = [
 	{ value: "healthy-registered", label: "已注册" },
 	{ value: "paused-retained", label: "暂停并保留 Hook" },
 	{ value: "permission-paused", label: "权限暂停" },
+	{ value: "archived-error", label: "仓库已归档" },
 	{ value: "temporary-error", label: "暂时错误" },
 	{ value: "delete-pending", label: "删除中" },
 	{ value: "deleted", label: "已删除" },
