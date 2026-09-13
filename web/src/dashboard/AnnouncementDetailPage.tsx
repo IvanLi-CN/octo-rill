@@ -27,6 +27,7 @@ import { Markdown } from "@/components/Markdown";
 import { RepoIdentity } from "@/components/repo/RepoIdentity";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import type { DashboardDetailLane } from "@/dashboard/routeState";
 import { formatIsoShortLocal } from "@/lib/datetime";
 import {
 	describeUnknownError,
@@ -159,6 +160,22 @@ function isPendingDetailStatus(status: string | undefined) {
 	);
 }
 
+function shouldFallbackToOriginal(
+	projection:
+		| AnnouncementDetailResponse["translated"]
+		| AnnouncementDetailResponse["smart"]
+		| null
+		| undefined,
+) {
+	if (projection?.status === "ready") {
+		return !(projection.title?.trim() || projection.summary?.trim());
+	}
+	return (
+		!projection ||
+		(!isPendingDetailStatus(projection.status) && projection.status !== "error")
+	);
+}
+
 function buildAnnouncementSmartRequestItem(detail: AnnouncementDetailResponse) {
 	const title = detail.title.trim() || `discussion:${detail.discussion_number}`;
 	const body = detail.body?.trim();
@@ -189,8 +206,9 @@ export function AnnouncementDetailPage(props: {
 	repo: string;
 	number: string;
 	onBack: () => void;
+	initialLane?: DashboardDetailLane | null;
 }) {
-	const { owner, repo, number, onBack } = props;
+	const { owner, repo, number, onBack, initialLane = null } = props;
 	const { pushErrorToast } = useAppToast();
 	const [loading, setLoading] = useState(false);
 	const [translating, setTranslating] = useState(false);
@@ -222,7 +240,7 @@ export function AnnouncementDetailPage(props: {
 		setLoadError(null);
 		setTranslateError(null);
 		setSmartError(null);
-		setSelectedLane("smart");
+		setSelectedLane(initialLane ?? "smart");
 		setDetail(null);
 		void apiGetAnnouncementDetail({ owner, repo, number })
 			.then((response) => {
@@ -244,7 +262,7 @@ export function AnnouncementDetailPage(props: {
 				if (loadRequestSeqRef.current !== requestSeq) return;
 				setLoading(false);
 			});
-	}, [number, owner, repo]);
+	}, [initialLane, number, owner, repo]);
 
 	useEffect(() => {
 		translateRequestSeqRef.current += 1;
@@ -253,7 +271,7 @@ export function AnnouncementDetailPage(props: {
 		setTranslating(false);
 		setSmartResolving(false);
 		loadDetail();
-	}, [loadDetail]);
+	}, [initialLane, loadDetail]);
 
 	const detailTranslationError = useMemo(() => {
 		if (detail?.translated?.status !== "error") {
@@ -506,12 +524,12 @@ export function AnnouncementDetailPage(props: {
 
 	useEffect(() => {
 		if (!detail) return;
-		if (selectedLane === "smart" && detail.smart?.status === "disabled") {
+		if (selectedLane === "smart" && shouldFallbackToOriginal(detail.smart)) {
 			setSelectedLane("original");
 		}
 		if (
 			selectedLane === "translated" &&
-			detail.translated?.status === "disabled"
+			shouldFallbackToOriginal(detail.translated)
 		) {
 			setSelectedLane("original");
 		}

@@ -3,6 +3,7 @@ import {
 	Eye,
 	LogOut,
 	RefreshCcw,
+	Search,
 	Settings,
 	ShieldCheck,
 	Sparkles,
@@ -20,6 +21,7 @@ import { BrandLogo } from "@/components/brand/BrandLogo";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { Button } from "@/components/ui/button";
 import { resolveDemoSafeAuthHref } from "@/demo/auth";
+import { useDemoSnapshot } from "@/demo/runtime";
 import {
 	Tooltip,
 	TooltipContent,
@@ -29,6 +31,7 @@ import { clearAllWarmStartupCaches } from "@/auth/startupCache";
 import { useAppShellChrome } from "@/layout/AppShell";
 import { InternalLink } from "@/lib/internalNavigation";
 import { cn } from "@/lib/utils";
+import { CommandPalette } from "@/search/CommandPalette";
 
 export type DashboardSyncProgress = {
 	currentStep: number;
@@ -46,8 +49,11 @@ export type DashboardHeaderProps = {
 	aiDisabledHint?: boolean;
 	busy?: boolean;
 	syncingAll?: boolean;
+	syncingInbox?: boolean;
 	syncProgress?: DashboardSyncProgress | null;
 	onSyncAll?: () => void;
+	onSyncInbox?: () => void;
+	onGenerateBrief?: () => void | Promise<void>;
 	logoutHref?: string;
 	mobileControlBand?: React.ReactNode;
 	showMineEntry?: boolean;
@@ -56,6 +62,8 @@ export type DashboardHeaderProps = {
 	showFollowingEntry?: boolean;
 	followingHref?: string;
 	followingLabel?: string;
+	initialCommandPaletteOpen?: boolean;
+	initialCommandPaletteQuery?: string;
 };
 
 function clampUnit(value: number) {
@@ -166,6 +174,7 @@ function DashboardUserInfoCard(props: {
 	showFollowingEntry: boolean;
 	followingHref: string;
 	followingLabel: string;
+	onOpenSearch: (trigger?: HTMLElement | null) => void;
 	motionState: "open" | "closing";
 }) {
 	const {
@@ -183,6 +192,7 @@ function DashboardUserInfoCard(props: {
 		showFollowingEntry,
 		followingHref,
 		followingLabel,
+		onOpenSearch,
 		motionState,
 	} = props;
 	const displayName = name?.trim() || login;
@@ -251,6 +261,16 @@ function DashboardUserInfoCard(props: {
 			) : null}
 
 			<div className="mt-4 border-t border-border/70 pt-3">
+				<Button
+					type="button"
+					variant="ghost"
+					className="mb-2 w-full justify-start px-2 sm:hidden"
+					onClick={() => onOpenSearch()}
+					data-dashboard-search-menu-entry="true"
+				>
+					<Search className="size-4" />
+					搜索内容
+				</Button>
 				{showMineEntry ? (
 					<Button
 						asChild
@@ -348,6 +368,7 @@ function DashboardUserMenu(props: {
 	showFollowingEntry: boolean;
 	followingHref: string;
 	followingLabel: string;
+	onOpenSearch: (trigger?: HTMLElement | null) => void;
 }) {
 	const HOVER_CLOSE_DELAY_MS = 160;
 	const CARD_EXIT_DURATION_MS = 180;
@@ -367,9 +388,11 @@ function DashboardUserMenu(props: {
 		showFollowingEntry,
 		followingHref,
 		followingLabel,
+		onOpenSearch,
 	} = props;
 	const cardId = useId();
 	const wrapperRef = useRef<HTMLFieldSetElement | null>(null);
+	const userButtonRef = useRef<HTMLButtonElement | null>(null);
 	const hoverCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const cardExitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const [hoverOpen, setHoverOpen] = useState(false);
@@ -475,6 +498,13 @@ function DashboardUserMenu(props: {
 		};
 	}, [clearHoverCloseTimer, open]);
 
+	const handleOpenSearch = useCallback(() => {
+		clearHoverCloseTimer();
+		setHoverOpen(false);
+		setPinnedOpen(false);
+		onOpenSearch(userButtonRef.current);
+	}, [clearHoverCloseTimer, onOpenSearch]);
+
 	return (
 		<fieldset
 			ref={wrapperRef}
@@ -486,6 +516,7 @@ function DashboardUserMenu(props: {
 			onPointerLeave={handlePointerLeave}
 		>
 			<button
+				ref={userButtonRef}
 				type="button"
 				className={cn(
 					"inline-flex items-center justify-center overflow-hidden rounded-full border border-border/70 bg-card shadow-sm transition hover:border-foreground/20 hover:shadow",
@@ -544,6 +575,7 @@ function DashboardUserMenu(props: {
 							showFollowingEntry={showFollowingEntry}
 							followingHref={followingHref}
 							followingLabel={followingLabel}
+							onOpenSearch={handleOpenSearch}
 							motionState={cardClosing ? "closing" : "open"}
 						/>
 					</div>
@@ -564,6 +596,8 @@ export function DashboardHeader({
 	syncingAll = false,
 	syncProgress = null,
 	onSyncAll,
+	onSyncInbox,
+	onGenerateBrief,
 	logoutHref = "/auth/logout",
 	mobileControlBand = null,
 	showMineEntry = true,
@@ -572,7 +606,10 @@ export function DashboardHeader({
 	showFollowingEntry = true,
 	followingHref = "/focus/following",
 	followingLabel = "关注仓库",
+	initialCommandPaletteOpen = false,
+	initialCommandPaletteQuery = "",
 }: DashboardHeaderProps) {
+	const demoSnapshot = useDemoSnapshot();
 	const safeLogoutHref = resolveDemoSafeAuthHref(logoutHref, "logout");
 	const {
 		compactHeader,
@@ -601,8 +638,97 @@ export function DashboardHeader({
 		mobileControlBand && mobileChromeEnabled && isMobileViewport,
 	);
 	const syncTriggerRef = useRef<HTMLButtonElement | null>(null);
+	const searchTriggerRef = useRef<HTMLElement | null>(null);
+	const initialPaletteKeyRef = useRef<string | null>(null);
+	const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+	const [headerSearchQuery, setHeaderSearchQuery] = useState("");
 	const [syncTooltipDismissed, setSyncTooltipDismissed] = useState(false);
 	const showSyncTooltip = syncingAll && !syncTooltipDismissed;
+	const demoPalettePreset = demoSnapshot.active
+		? (() => {
+				const scenePreset =
+					demoSnapshot.shareState.sceneId === "dashboard-command-search"
+						? "search"
+						: demoSnapshot.shareState.sceneId === "dashboard-command-actions"
+							? "actions"
+							: demoSnapshot.shareState.sceneId === "dashboard-command-admin"
+								? "admin"
+								: null;
+				if (scenePreset) return scenePreset;
+				if (typeof window === "undefined") return null;
+				return new URL(window.location.href).searchParams.get("palette");
+			})()
+		: null;
+	const demoPaletteQuery =
+		demoPalettePreset === "search"
+			? "demo"
+			: demoPalettePreset === "actions" || demoPalettePreset === "admin"
+				? ">"
+				: initialCommandPaletteQuery;
+	const shouldOpenInitialCommandPalette =
+		initialCommandPaletteOpen || demoPalettePreset !== null;
+	const initialPaletteKey = shouldOpenInitialCommandPalette
+		? `${demoSnapshot.active ? demoSnapshot.shareState.sceneId : "header"}:${demoPalettePreset ?? "initial"}:${demoPaletteQuery}`
+		: null;
+
+	const openCommandPalette = useCallback(
+		(trigger?: HTMLElement | null) => {
+			if (commandPaletteOpen) return;
+			if (trigger) {
+				searchTriggerRef.current = trigger;
+			} else {
+				const active = document.activeElement;
+				if (active instanceof HTMLElement) {
+					searchTriggerRef.current = active;
+				}
+			}
+			setCommandPaletteOpen(true);
+		},
+		[commandPaletteOpen],
+	);
+	const handleHeaderSearchChange = useCallback(
+		(event: React.ChangeEvent<HTMLInputElement>) => {
+			setHeaderSearchQuery(event.target.value);
+			if (!commandPaletteOpen) openCommandPalette();
+		},
+		[commandPaletteOpen, openCommandPalette],
+	);
+	const handleCommandPaletteOpenChange = useCallback((nextOpen: boolean) => {
+		setCommandPaletteOpen(nextOpen);
+		if (!nextOpen) setHeaderSearchQuery("");
+	}, []);
+
+	useEffect(() => {
+		const handleGlobalShortcut = (event: KeyboardEvent) => {
+			if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+				event.preventDefault();
+				openCommandPalette();
+			}
+		};
+		window.addEventListener("keydown", handleGlobalShortcut);
+		return () => window.removeEventListener("keydown", handleGlobalShortcut);
+	}, [openCommandPalette]);
+
+	useEffect(() => {
+		if (!shouldOpenInitialCommandPalette || initialPaletteKey === null) {
+			initialPaletteKeyRef.current = null;
+			return;
+		}
+		if (
+			commandPaletteOpen ||
+			initialPaletteKeyRef.current === initialPaletteKey
+		) {
+			return;
+		}
+		initialPaletteKeyRef.current = initialPaletteKey;
+		setHeaderSearchQuery(demoPaletteQuery);
+		setCommandPaletteOpen(true);
+	}, [
+		commandPaletteOpen,
+		demoPaletteQuery,
+		initialPaletteKey,
+		shouldOpenInitialCommandPalette,
+	]);
 
 	useEffect(() => {
 		if (!syncingAll) {
@@ -657,7 +783,6 @@ export function DashboardHeader({
 		},
 		[revealSyncTooltip],
 	);
-
 	return (
 		<div
 			className={cn(
@@ -784,6 +909,35 @@ export function DashboardHeader({
 					</div>
 				</InternalLink>
 
+				<div className="hidden min-w-0 flex-[1_1_22rem] lg:flex lg:max-w-md">
+					<div className="relative w-full">
+						<Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+						<input
+							ref={(element) => {
+								if (element) searchTriggerRef.current = element;
+							}}
+							value={headerSearchQuery}
+							aria-label="搜索内容或执行动作"
+							placeholder="搜索内容或执行动作"
+							className="h-10 w-full rounded-xl border border-border/70 bg-background/70 pr-16 pl-9 text-sm outline-none transition-colors placeholder:text-muted-foreground hover:border-foreground/25 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/40"
+							data-app-shell-gesture-guard
+							onChange={handleHeaderSearchChange}
+							onClick={() => openCommandPalette()}
+							onKeyDown={(event) => {
+								if (event.key === "Enter" || event.key === "ArrowDown") {
+									openCommandPalette();
+								}
+							}}
+						/>
+						<kbd className="pointer-events-none absolute top-1/2 right-2.5 hidden -translate-y-1/2 items-center rounded-md border border-border/70 bg-muted/30 px-1.5 py-1 font-mono text-[10px] text-muted-foreground xl:inline-flex">
+							{typeof navigator !== "undefined" &&
+							/Mac/i.test(navigator.platform)
+								? "⌘K"
+								: "Ctrl K"}
+						</kbd>
+					</div>
+				</div>
+
 				<div
 					className={cn(
 						"flex items-center gap-2 self-start lg:justify-end",
@@ -803,6 +957,22 @@ export function DashboardHeader({
 					}
 					data-dashboard-primary-actions
 				>
+					<Button
+						type="button"
+						variant="outline"
+						size="icon"
+						className="hidden rounded-full sm:inline-flex lg:hidden"
+						data-app-shell-gesture-guard
+						aria-label="搜索内容或执行动作"
+						title="搜索内容或执行动作"
+						ref={(element) => {
+							if (element) searchTriggerRef.current = element;
+						}}
+						onClick={() => openCommandPalette()}
+						data-dashboard-search-button="true"
+					>
+						<Search className="size-4" />
+					</Button>
 					<div
 						data-app-shell-gesture-guard
 						style={
@@ -887,6 +1057,7 @@ export function DashboardHeader({
 						showFollowingEntry={showFollowingEntry}
 						followingHref={followingHref}
 						followingLabel={followingLabel}
+						onOpenSearch={openCommandPalette}
 					/>
 				</div>
 			</div>
@@ -916,6 +1087,18 @@ export function DashboardHeader({
 					{mobileControlBand}
 				</div>
 			) : null}
+
+			<CommandPalette
+				open={commandPaletteOpen}
+				onOpenChange={handleCommandPaletteOpenChange}
+				initialQuery={headerSearchQuery}
+				isAdmin={isAdmin}
+				busy={busy ? "busy" : null}
+				onSyncAll={onSyncAll}
+				onSyncInbox={onSyncInbox}
+				onGenerateBrief={onGenerateBrief}
+				restoreFocusRef={searchTriggerRef}
+			/>
 		</div>
 	);
 }
