@@ -826,6 +826,8 @@ export function CommandPalette({
 							aria-label="清除搜索"
 							onClick={() => {
 								setQuery("");
+								setRemaining(null);
+								setResetAt(null);
 								inputRef.current?.focus();
 							}}
 						>
