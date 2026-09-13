@@ -35,6 +35,7 @@ export function PausedAccountPage() {
 					scope: undefined,
 					items: undefined,
 					org: undefined,
+					lane: undefined,
 				},
 				replace: true,
 			});

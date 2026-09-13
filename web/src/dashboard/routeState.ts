@@ -18,6 +18,8 @@ export type DashboardDiscussionLocator = {
 	number: string;
 };
 
+export type DashboardDetailLane = "original" | "translated" | "smart";
+
 export type DashboardScope =
 	| {
 			kind: "repo";
@@ -47,6 +49,7 @@ export type DashboardReleaseTarget = {
 	fromTab: DashboardTab;
 	scope?: DashboardScope | null;
 	selectedBriefId?: string | null;
+	lane?: DashboardDetailLane | null;
 };
 
 export type DashboardRouteState = {
@@ -56,6 +59,7 @@ export type DashboardRouteState = {
 	activeReleaseId: string | null;
 	activeReleaseLocator: DashboardReleaseLocator | null;
 	activeAnnouncementLocator: DashboardDiscussionLocator | null;
+	lane?: DashboardDetailLane | null;
 	releaseReturnTab: DashboardTab;
 };
 
@@ -66,6 +70,7 @@ export type DashboardWarmRouteState = {
 	activeReleaseId: string | null;
 	activeReleaseLocatorKey: string | null;
 	activeAnnouncementLocatorKey: string | null;
+	lane?: DashboardDetailLane | null;
 	releaseReturnTab: DashboardTab;
 };
 
@@ -124,6 +129,14 @@ function normalizeRepoNamePart(value: string | null | undefined) {
 function normalizeBriefId(value: string | null | undefined) {
 	const normalized = value?.trim() ?? "";
 	return normalized ? normalized : null;
+}
+
+function normalizeDetailLane(
+	value: string | null | undefined,
+): DashboardDetailLane | null {
+	return value === "original" || value === "translated" || value === "smart"
+		? value
+		: null;
 }
 
 function normalizeRepoFullName(value: string | null | undefined) {
@@ -322,6 +335,7 @@ export function buildDashboardReleaseHref(
 	options?: {
 		scope?: DashboardScope | null;
 		selectedBriefId?: string | null;
+		lane?: DashboardDetailLane | null;
 	},
 ) {
 	const params = buildDashboardScopeQueryParams(options?.scope ?? null);
@@ -337,6 +351,8 @@ export function buildDashboardReleaseHref(
 	if (selectedBriefId) {
 		params.set("brief", selectedBriefId);
 	}
+	const lane = normalizeDetailLane(options?.lane);
+	if (lane) params.set("lane", lane);
 	const query = params.toString();
 	return `${buildDashboardReleasePath(locator)}${query ? `?${query}` : ""}`;
 }
@@ -347,6 +363,7 @@ export function buildDashboardDiscussionHref(
 	options?: {
 		scope?: DashboardScope | null;
 		selectedBriefId?: string | null;
+		lane?: DashboardDetailLane | null;
 	},
 ) {
 	const params = buildDashboardScopeQueryParams(options?.scope ?? null);
@@ -362,6 +379,8 @@ export function buildDashboardDiscussionHref(
 	if (selectedBriefId) {
 		params.set("brief", selectedBriefId);
 	}
+	const lane = normalizeDetailLane(options?.lane);
+	if (lane) params.set("lane", lane);
 	const query = params.toString();
 	return `${buildDashboardDiscussionPath(locator)}${query ? `?${query}` : ""}`;
 }
@@ -374,6 +393,7 @@ export function buildDashboardRouteUrl(routeState: DashboardRouteState) {
 			{
 				scope: routeState.scope,
 				selectedBriefId: routeState.selectedBriefId,
+				lane: routeState.lane,
 			},
 		);
 		if (typeof window === "undefined") {
@@ -388,6 +408,7 @@ export function buildDashboardRouteUrl(routeState: DashboardRouteState) {
 			{
 				scope: routeState.scope,
 				selectedBriefId: routeState.selectedBriefId,
+				lane: routeState.lane,
 			},
 		);
 		if (typeof window === "undefined") {
@@ -414,6 +435,7 @@ export function buildDashboardRouteUrl(routeState: DashboardRouteState) {
 	if (selectedBriefId) {
 		params.set("brief", selectedBriefId);
 	}
+	if (routeState.lane) params.set("lane", routeState.lane);
 	if (routeState.activeReleaseId) {
 		params.set(
 			routeState.scope ? "from" : "tab",
@@ -462,6 +484,7 @@ export function buildDashboardRouteNavigation(
 		if (selectedBriefId) {
 			params.set("brief", selectedBriefId);
 		}
+		if (routeState.lane) params.set("lane", routeState.lane);
 		if (typeof window !== "undefined") {
 			copyDemoSearchParams(readCurrentDemoSearchParams(), params);
 		}
@@ -492,6 +515,7 @@ export function buildDashboardRouteNavigation(
 		if (selectedBriefId) {
 			params.set("brief", selectedBriefId);
 		}
+		if (routeState.lane) params.set("lane", routeState.lane);
 		if (typeof window !== "undefined") {
 			copyDemoSearchParams(readCurrentDemoSearchParams(), params);
 		}
@@ -518,6 +542,7 @@ export function buildDashboardRouteNavigation(
 				),
 			);
 			searchParams.set("release", routeState.activeReleaseId);
+			if (routeState.lane) searchParams.set("lane", routeState.lane);
 		}
 		if (typeof window !== "undefined") {
 			copyDemoSearchParams(readCurrentDemoSearchParams(), searchParams);
@@ -577,6 +602,7 @@ export function buildDashboardRouteNavigation(
 			normalizeDashboardReturnTab(routeState.releaseReturnTab, null),
 		);
 		searchParams.set("release", routeState.activeReleaseId);
+		if (routeState.lane) searchParams.set("lane", routeState.lane);
 	}
 	if (typeof window !== "undefined") {
 		copyDemoSearchParams(readCurrentDemoSearchParams(), searchParams);
@@ -601,6 +627,7 @@ export function buildDashboardWarmRouteState(
 		activeAnnouncementLocatorKey: routeState.activeAnnouncementLocator
 			? buildDashboardDiscussionLocatorKey(routeState.activeAnnouncementLocator)
 			: null,
+		lane: routeState.lane ?? null,
 		releaseReturnTab: routeState.releaseReturnTab,
 	};
 }
@@ -699,6 +726,7 @@ function searchParamsFromInput(
 				release?: string | null;
 				from?: string | null;
 				brief?: string | null;
+				lane?: string | null;
 				scope?: string | null;
 				items?: string | null;
 				org?: string | null;
@@ -717,6 +745,7 @@ function searchParamsFromInput(
 	if (input?.release) params.set("release", input.release);
 	if (input?.from) params.set("from", input.from);
 	if (input?.brief) params.set("brief", input.brief);
+	if (input?.lane) params.set("lane", input.lane);
 	if (input?.scope) params.set("scope", input.scope);
 	if (input?.items) params.set("items", input.items);
 	if (input?.org) params.set("org", input.org);
@@ -760,6 +789,7 @@ export function parseLegacyDashboardRouteState(input: {
 	release?: string | null;
 	from?: string | null;
 	brief?: string | null;
+	lane?: string | null;
 }): DashboardRouteState {
 	const releaseId = normalizeReleaseId(input.release);
 	const releaseReturnTab = normalizeDashboardReturnTab(input.tab);
@@ -774,6 +804,7 @@ export function parseLegacyDashboardRouteState(input: {
 			activeReleaseId: releaseId,
 			activeReleaseLocator: null,
 			activeAnnouncementLocator: null,
+			lane: normalizeDetailLane(input.lane),
 			releaseReturnTab,
 		};
 	}
@@ -789,6 +820,7 @@ export function parseLegacyDashboardRouteState(input: {
 		activeReleaseId: null,
 		activeReleaseLocator: null,
 		activeAnnouncementLocator: null,
+		lane: null,
 		releaseReturnTab: "briefs",
 	};
 }
@@ -803,6 +835,7 @@ export function parseDashboardRouteState(input: {
 				release?: string | null;
 				from?: string | null;
 				brief?: string | null;
+				lane?: string | null;
 				scope?: string | null;
 				items?: string | null;
 				org?: string | null;
@@ -817,6 +850,7 @@ export function parseDashboardRouteState(input: {
 	repo?: string | null;
 	tag?: string | null;
 	number?: string | number | null;
+	lane?: string | null;
 }): DashboardRouteState {
 	const pathname = normalizePathname(input.pathname ?? "/");
 	const searchParams = searchParamsFromInput(
@@ -825,6 +859,7 @@ export function parseDashboardRouteState(input: {
 			release: input.release,
 			from: input.from,
 			brief: input.brief,
+			lane: input.lane,
 		},
 	);
 	const parsedScopePath = parseDashboardScopePathname(pathname, searchParams);
@@ -842,6 +877,7 @@ export function parseDashboardRouteState(input: {
 			input.from ?? searchParams.get("from"),
 			detailScope,
 		);
+		const lane = normalizeDetailLane(input.lane ?? searchParams.get("lane"));
 		return {
 			tab: fromTab,
 			scope: detailScope,
@@ -852,6 +888,7 @@ export function parseDashboardRouteState(input: {
 			activeReleaseId: null,
 			activeReleaseLocator: null,
 			activeAnnouncementLocator: locator,
+			lane,
 			releaseReturnTab: fromTab,
 		};
 	}
@@ -868,6 +905,7 @@ export function parseDashboardRouteState(input: {
 			input.from ?? searchParams.get("from"),
 			detailScope,
 		);
+		const lane = normalizeDetailLane(input.lane ?? searchParams.get("lane"));
 		return {
 			tab: fromTab,
 			scope: detailScope,
@@ -878,6 +916,7 @@ export function parseDashboardRouteState(input: {
 			activeReleaseId: null,
 			activeReleaseLocator: locator,
 			activeAnnouncementLocator: null,
+			lane,
 			releaseReturnTab: fromTab,
 		};
 	}
@@ -891,6 +930,7 @@ export function parseDashboardRouteState(input: {
 			searchParams.get("from"),
 			detailScope,
 		);
+		const lane = normalizeDetailLane(searchParams.get("lane"));
 		return {
 			tab: fromTab,
 			scope: detailScope,
@@ -901,6 +941,7 @@ export function parseDashboardRouteState(input: {
 			activeReleaseId: null,
 			activeReleaseLocator: null,
 			activeAnnouncementLocator: discussionLocator,
+			lane,
 			releaseReturnTab: fromTab,
 		};
 	}
@@ -914,6 +955,7 @@ export function parseDashboardRouteState(input: {
 			searchParams.get("from"),
 			detailScope,
 		);
+		const lane = normalizeDetailLane(searchParams.get("lane"));
 		return {
 			tab: fromTab,
 			scope: detailScope,
@@ -924,6 +966,7 @@ export function parseDashboardRouteState(input: {
 			activeReleaseId: null,
 			activeReleaseLocator: releaseLocator,
 			activeAnnouncementLocator: null,
+			lane,
 			releaseReturnTab: fromTab,
 		};
 	}
@@ -944,6 +987,7 @@ export function parseDashboardRouteState(input: {
 				activeReleaseId: releaseId,
 				activeReleaseLocator: null,
 				activeAnnouncementLocator: null,
+				lane: normalizeDetailLane(searchParams.get("lane")),
 				releaseReturnTab: fromTab,
 			};
 		}
@@ -964,6 +1008,7 @@ export function parseDashboardRouteState(input: {
 			release: searchParams.get("release"),
 			from: searchParams.get("from"),
 			brief: searchParams.get("brief"),
+			lane: searchParams.get("lane"),
 		});
 	}
 
@@ -998,6 +1043,7 @@ export function validateDashboardSearch(search: Record<string, unknown>) {
 		scope: typeof search.scope === "string" ? search.scope : undefined,
 		items: typeof search.items === "string" ? search.items : undefined,
 		org: typeof search.org === "string" ? search.org : undefined,
+		lane: typeof search.lane === "string" ? search.lane : undefined,
 	};
 }
 
@@ -1079,6 +1125,7 @@ export function buildDashboardReleaseTarget(input: {
 	fromTab?: DashboardTab | null;
 	scope?: DashboardScope | null;
 	selectedBriefId?: string | null;
+	lane?: DashboardDetailLane | null;
 }): DashboardReleaseTarget {
 	const fromTab = normalizeDashboardReturnTab(
 		input.fromTab,
@@ -1093,6 +1140,7 @@ export function buildDashboardReleaseTarget(input: {
 			tab: fromTab,
 			scope: input.scope ?? null,
 		}),
+		lane: normalizeDetailLane(input.lane),
 	};
 }
 
@@ -1124,6 +1172,7 @@ export function parseInternalDashboardReleaseTarget(
 						scope,
 					},
 				),
+				lane: normalizeDetailLane(url.searchParams.get("lane")),
 			};
 		}
 		const scoped = parseDashboardScopePathname(url.pathname, url.searchParams);
@@ -1139,6 +1188,7 @@ export function parseInternalDashboardReleaseTarget(
 				),
 				scope: scoped.scope,
 				selectedBriefId: null,
+				lane: normalizeDetailLane(url.searchParams.get("lane")),
 			};
 		}
 		if (normalizePathname(url.pathname) !== "/") return null;
@@ -1154,6 +1204,7 @@ export function parseInternalDashboardReleaseTarget(
 				tab: fromTab,
 				scope: null,
 			}),
+			lane: normalizeDetailLane(url.searchParams.get("lane")),
 		};
 	} catch {
 		return null;
