@@ -175,12 +175,14 @@ function shouldFallbackToOriginal(
 		| null
 		| undefined,
 ) {
+	if (!projection || projection.status === "missing") {
+		return false;
+	}
 	if (projection?.status === "ready") {
 		return !(projection.title?.trim() || projection.summary?.trim());
 	}
 	return (
-		!projection ||
-		(!isPendingDetailStatus(projection.status) && projection.status !== "error")
+		!isPendingDetailStatus(projection.status) && projection.status !== "error"
 	);
 }
 
