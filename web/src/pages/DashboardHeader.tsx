@@ -639,6 +639,7 @@ export function DashboardHeader({
 	);
 	const syncTriggerRef = useRef<HTMLButtonElement | null>(null);
 	const searchTriggerRef = useRef<HTMLElement | null>(null);
+	const headerFocusRef = useRef<HTMLDivElement | null>(null);
 	const initialPaletteKeyRef = useRef<string | null>(null);
 	const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
 	const [headerSearchQuery, setHeaderSearchQuery] = useState("");
@@ -680,8 +681,10 @@ export function DashboardHeader({
 				searchTriggerRef.current = trigger;
 			} else {
 				const active = document.activeElement;
-				if (active instanceof HTMLElement) {
+				if (active instanceof HTMLElement && active !== document.body) {
 					searchTriggerRef.current = active;
+				} else {
+					searchTriggerRef.current = headerFocusRef.current;
 				}
 			}
 			setCommandPaletteOpen(true);
@@ -723,12 +726,16 @@ export function DashboardHeader({
 			return;
 		}
 		initialPaletteKeyRef.current = initialPaletteKey;
+		if (!searchTriggerRef.current) {
+			searchTriggerRef.current = headerFocusRef.current;
+		}
 		setHeaderSearchQuery(demoPaletteQuery);
 		setCommandPaletteOpen(true);
 	}, [
 		commandPaletteOpen,
 		demoPaletteQuery,
 		initialPaletteKey,
+		searchTriggerRef,
 		shouldOpenInitialCommandPalette,
 	]);
 
@@ -804,6 +811,8 @@ export function DashboardHeader({
 			data-dashboard-header-interacting={headerInteracting ? "true" : "false"}
 		>
 			<div
+				ref={headerFocusRef}
+				tabIndex={-1}
 				className={cn(
 					"flex flex-col gap-3 sm:grid sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start sm:gap-x-4 sm:gap-y-3 lg:flex lg:flex-row lg:items-start lg:justify-between",
 					interactiveMotionClass,
