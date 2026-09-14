@@ -61,6 +61,20 @@ function mockSearchTransport(query: string, signal?: AbortSignal) {
 	});
 }
 
+function indexStatusTransport(status: "building" | "paused_low_disk") {
+	return (_query: string, signal?: AbortSignal) =>
+		new Promise<SearchResponse>((resolve, reject) => {
+			const timer = window.setTimeout(() => {
+				if (signal?.aborted) return;
+				resolve({ ...SEARCH_FIXTURE, index_status: status });
+			}, 30);
+			signal?.addEventListener("abort", () => {
+				window.clearTimeout(timer);
+				reject(new DOMException("Aborted", "AbortError"));
+			});
+		});
+}
+
 function rateLimitedTransport(
 	_query: string,
 	_signal?: AbortSignal,
@@ -196,6 +210,40 @@ export const SearchResults: Story = {
 		);
 		await expect(canvas.getByText("翻译命中")).toBeVisible();
 		await expect(canvas.getByText(/剩余 47\/50/)).toBeVisible();
+	},
+};
+
+export const IndexBuilding: Story = {
+	render: () => (
+		<PalettePreview
+			initialOpen
+			isAdmin={false}
+			initialQuery="命令面板"
+			searchTransport={indexStatusTransport("building")}
+		/>
+	),
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement.ownerDocument.body);
+		await waitFor(() =>
+			expect(canvas.getByRole("status")).toHaveTextContent(/正在建立本地索引/),
+		);
+	},
+};
+
+export const IndexPausedLowDisk: Story = {
+	render: () => (
+		<PalettePreview
+			initialOpen
+			isAdmin={false}
+			initialQuery="命令面板"
+			searchTransport={indexStatusTransport("paused_low_disk")}
+		/>
+	),
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement.ownerDocument.body);
+		await waitFor(() =>
+			expect(canvas.getByRole("status")).toHaveTextContent(/等待磁盘空间/),
+		);
 	},
 };
 

@@ -265,6 +265,7 @@ export type MeResponse = {
 };
 
 export type SearchLane = "original" | "translated" | "smart";
+export type SearchIndexStatus = "building" | "ready" | "paused_low_disk";
 export type SearchResultType =
 	| "release"
 	| "announcement"
@@ -302,6 +303,7 @@ export type SearchResponse = {
 	remaining?: number;
 	remaining_requests?: number;
 	reset_at: string | null;
+	index_status?: SearchIndexStatus;
 };
 
 export async function apiSearch(

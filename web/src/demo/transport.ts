@@ -595,6 +595,16 @@ function buildDemoSearchResponse(
 		remaining: 49,
 		remaining_requests: 49,
 		reset_at: new Date(Date.now() + 300_000).toISOString(),
+		index_status:
+			typeof window !== "undefined" &&
+			new URL(window.location.href).searchParams.get("index_status") ===
+				"paused_low_disk"
+				? "paused_low_disk"
+				: typeof window !== "undefined" &&
+						new URL(window.location.href).searchParams.get("index_status") ===
+							"building"
+					? "building"
+					: "ready",
 	};
 }
 

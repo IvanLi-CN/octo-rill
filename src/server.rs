@@ -41,7 +41,7 @@ use crate::session_store::CoordinatedSqliteSessionStore;
 use crate::state::AppState;
 use crate::{
     admin_ai_records, admin_runtime, ai, api, auth, config::AppConfig, content_processing, jobs,
-    observability, runtime, state, sync, translations, version, webhook_push,
+    observability, runtime, search_index, state, sync, translations, version, webhook_push,
 };
 
 const SESSION_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
@@ -85,12 +85,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .await
         .context("failed to open sqlite database")?;
 
-    // SQLx validates every applied migration before startup. This deliberately
-    // rejects a migration-preceding binary once 0078 has been applied.
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .context("failed to apply database migrations")?;
+    crate::database_migrations::run(&pool).await?;
 
     state::backfill_github_connections(&pool)
         .await
@@ -559,6 +554,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         jobs::spawn_webhook_push_scheduler(app_state.clone());
         jobs::spawn_account_pause_scheduler(app_state.clone());
         jobs::spawn_admin_dashboard_rollup_scheduler(app_state.clone());
+        let search_index_abort_handle = search_index::spawn_worker(app_state.clone());
         if let Err(err) = jobs::enqueue_brief_history_recompute_if_needed(app_state.as_ref()).await
         {
             tracing::warn!(?err, "failed to enqueue brief history recompute bootstrap");
@@ -591,6 +587,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             repo_release_recovery_abort_handle,
             translation_recovery_abort_handle,
             global_content_processing_abort_handle,
+            search_index_abort_handle,
         ];
         if let Some(handle) = model_catalog_abort_handle {
             abort_handles.push(handle);
@@ -1039,6 +1036,7 @@ mod tests {
         routing::get,
     };
     use serde_json::Value;
+    use sqlx::sqlite::SqlitePoolOptions;
     use std::{
         fs, io,
         sync::{Arc, Mutex as StdMutex, OnceLock},
@@ -1602,8 +1600,7 @@ mod tests {
             .await
             .expect("read sqlite pragmas");
 
-        sqlx::migrate!("./migrations")
-            .run(&pool)
+        crate::database_migrations::run(&pool)
             .await
             .expect("run migrations after configuring a new database");
 
@@ -1615,6 +1612,30 @@ mod tests {
         assert_eq!(pragmas.journal_mode, "wal");
         assert_eq!(pragmas.busy_timeout_ms, 5000);
         assert_eq!(pragmas.synchronous, 1);
+    }
+
+    #[tokio::test]
+    async fn search_recovery_startup_keeps_indexing_out_of_migration() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite pool");
+        crate::database_migrations::run(&pool)
+            .await
+            .expect("run schema-only recovery migration");
+        let applied_legacy = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 81",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read migration history");
+        let projection_rows = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents")
+            .fetch_one(&pool)
+            .await
+            .expect("read search projection");
+        assert_eq!(applied_legacy, 0);
+        assert_eq!(projection_rows, 0);
     }
 
     #[test]

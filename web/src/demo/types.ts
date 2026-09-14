@@ -43,6 +43,8 @@ export type DemoSceneId =
 	| "app-shell"
 	| "dashboard-repo-publish"
 	| "dashboard-command-search"
+	| "dashboard-command-building"
+	| "dashboard-command-paused"
 	| "dashboard-command-actions"
 	| "dashboard-command-admin"
 	| "settings-my-releases"
