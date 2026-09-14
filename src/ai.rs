@@ -6999,8 +6999,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .expect("create sqlite memory db");
-        sqlx::migrate!("./migrations")
-            .run(&pool)
+        crate::database_migrations::run(&pool)
             .await
             .expect("run migrations");
         setup_llm_state_with_pool(pool, base_url).await
@@ -7024,8 +7023,7 @@ mod tests {
             .connect_with(options)
             .await
             .expect("create sqlite wal test db");
-        sqlx::migrate!("./migrations")
-            .run(&pool)
+        crate::database_migrations::run(&pool)
             .await
             .expect("run migrations");
         setup_llm_state_with_pool(pool, None).await

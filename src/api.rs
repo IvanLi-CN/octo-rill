@@ -13386,10 +13386,12 @@ pub async fn search(
     let parsed = search_service::parse_query(&raw_query)?;
     let (remaining, reset_at) = search_service::consume_quota(state.as_ref(), &user_id).await?;
     let items = search_service::query(state.as_ref(), &user_id, &parsed).await?;
+    let index_status = search_service::index_status(state.as_ref()).await?;
     Ok(Json(search_service::SearchResponse {
         items,
         remaining_requests: remaining,
         reset_at: Some(reset_at),
+        index_status,
     }))
 }
 
@@ -25705,8 +25707,7 @@ mod tests {
             .connect_with(options)
             .await
             .expect("create sqlite memory db");
-        sqlx::migrate!("./migrations")
-            .run(&pool)
+        crate::database_migrations::run(&pool)
             .await
             .expect("run migrations");
         super::ensure_owned_repo_visual_columns(&pool)

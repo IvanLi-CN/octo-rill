@@ -102,6 +102,14 @@
 - 必须提供 mock-only Web Demo 与 Storybook 状态，覆盖空输入、搜索结果、actions、加载、错误、限流、桌面输入、中等图标和头像回退状态。
 - covers: 响应式可用性与可复现视觉状态。
 
+### REQ-CPS-013
+
+- 数据库迁移 MUST 将历史 `0081_command_palette_search.sql` 视为兼容证据，不得在新部署中重新执行其全量回填；新的 `0082_command_palette_search_recovery.sql` 只创建搜索 schema、触发器和持久化索引状态。
+- 服务 MUST 在 TCP listener 绑定后通过可中断的后台 worker 分阶段建立本地投影。每个 `Background` SQLite 事务最多处理 100 个源 rowid，并提交阶段游标，使重启后可以继续且重复执行保持幂等。
+- worker MUST 在写入前检查数据库目录的 `statvfs` 可用空间；低于 `OCTORILL_SEARCH_INDEX_MIN_FREE_BYTES`（默认 20 GiB）时暂停并将搜索状态标记为 `paused_low_disk`，不得继续写入 FTS/WAL。索引状态 MUST 以 `building`、`ready` 或 `paused_low_disk` 出现在搜索响应中。
+- 迁移运行器 MUST 只对白名单历史版本 `81` 接受精确 SHA-384 checksum；dirty、缺失、未知或 checksum 不匹配的迁移历史 MUST 终止启动。
+- covers: 启动可用性、可恢复索引、资源保护与迁移兼容性。
+
 ## Verification
 
 ### VER-CPS-001
@@ -139,6 +147,12 @@
 - Method: mock-only Web Demo and Storybook canvas at desktop, compact icon, avatar fallback and 393x852 viewports in light and dark surfaces.
 - covers: `REQ-CPS-012`
 - Pass condition: all required states are reachable and visually stable without overlap, clipping, or loss of focus visibility.
+
+### VER-CPS-007
+
+- Method: migration compatibility, schema-only recovery migration, bounded worker and startup fixtures, plus Demo/Storybook status scenes.
+- covers: `REQ-CPS-013`
+- Pass condition: historical `0081` is accepted only with its exact checksum, fresh databases apply schema-only `0082`, listener startup does not wait for full indexing, worker resumes at persisted cursors in batches of at most 100 rows, low disk pauses without FTS writes, and `index_status` is visible in `building`/`paused_low_disk` demo states.
 
 ## Related ADRs
 
