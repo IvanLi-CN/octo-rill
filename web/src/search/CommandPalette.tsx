@@ -34,6 +34,7 @@ import {
 	apiUnfollowRepo,
 	ApiError,
 	type SearchLane,
+	type SearchIndexStatus,
 	type SearchResponse,
 	type SearchResult,
 	type SearchResultType,
@@ -165,6 +166,17 @@ function formatResetAt(value: string | null | undefined) {
 	const date = new Date(value);
 	if (Number.isNaN(date.getTime())) return null;
 	return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function formatIndexStatus(status: SearchIndexStatus | null) {
+	switch (status) {
+		case "building":
+			return "正在建立本地索引，当前只显示已完成的内容。";
+		case "paused_low_disk":
+			return "本地索引等待磁盘空间，当前只显示已完成的内容。";
+		default:
+			return null;
+	}
 }
 
 function buildSearchResultTarget(result: SearchResult) {
@@ -362,6 +374,7 @@ function ActionRow(props: {
 		<button
 			type="button"
 			id={id}
+			tabIndex={-1}
 			role="option"
 			aria-selected={active}
 			disabled={disabled}
@@ -417,6 +430,9 @@ export function CommandPalette({
 	const [error, setError] = useState<string | null>(null);
 	const [remaining, setRemaining] = useState<number | null>(null);
 	const [resetAt, setResetAt] = useState<string | null>(null);
+	const [indexStatus, setIndexStatus] = useState<SearchIndexStatus | null>(
+		null,
+	);
 	const [activeIndex, setActiveIndex] = useState(0);
 	const [confirmGenerate, setConfirmGenerate] = useState(false);
 	const [confirmFollow, setConfirmFollow] = useState<SearchResult | null>(null);
@@ -526,6 +542,7 @@ export function CommandPalette({
 		setError(null);
 		setRemaining(null);
 		setResetAt(null);
+		setIndexStatus(null);
 		setActiveIndex(0);
 		setConfirmGenerate(false);
 		setConfirmFollow(null);
@@ -571,6 +588,7 @@ export function CommandPalette({
 						response.remaining ?? response.remaining_requests ?? null,
 					);
 					setResetAt(response.reset_at ?? null);
+					setIndexStatus(response.index_status ?? "ready");
 					setActiveIndex(0);
 				})
 				.catch((reason: unknown) => {
@@ -755,8 +773,10 @@ export function CommandPalette({
 				container={portalContainer}
 				className="top-[10vh] max-w-[calc(100%-2rem)] translate-y-0 overflow-hidden p-0 sm:top-[14vh] sm:max-w-2xl"
 				onCloseAutoFocus={(event) => {
-					event.preventDefault();
-					restoreFocusRef?.current?.focus();
+					if (restoreFocusRef?.current) {
+						event.preventDefault();
+						restoreFocusRef.current.focus();
+					}
 				}}
 				showCloseButton={false}
 				data-command-palette
@@ -784,6 +804,7 @@ export function CommandPalette({
 							setError(null);
 							setRemaining(null);
 							setResetAt(null);
+							setIndexStatus(null);
 							setLoading(
 								Boolean(
 									nextQuery.trim() && !nextQuery.trimStart().startsWith(">"),
@@ -808,7 +829,7 @@ export function CommandPalette({
 						aria-autocomplete="list"
 						aria-expanded="true"
 						aria-controls={
-							confirmGenerate || confirmFollow
+							confirmGenerate || confirmFollow || !hasListEntries
 								? undefined
 								: "command-palette-results"
 						}
@@ -828,6 +849,7 @@ export function CommandPalette({
 								setQuery("");
 								setRemaining(null);
 								setResetAt(null);
+								setIndexStatus(null);
 								inputRef.current?.focus();
 							}}
 						>
@@ -839,10 +861,16 @@ export function CommandPalette({
 					</kbd>
 				</div>
 
-				<div
-					id="command-palette-results"
-					className="max-h-[min(60vh,34rem)] overflow-y-auto py-2"
-				>
+				<div className="max-h-[min(60vh,34rem)] overflow-y-auto py-2">
+					{query.trim() && formatIndexStatus(indexStatus) ? (
+						<p
+							role="status"
+							aria-live="polite"
+							className="px-5 pt-2 text-xs text-muted-foreground"
+						>
+							{formatIndexStatus(indexStatus)}
+						</p>
+					) : null}
 					{confirmGenerate ? (
 						<div {...contentRegionProps} className="space-y-4 px-5 py-6">
 							<div className="flex items-start gap-3">
@@ -944,7 +972,7 @@ export function CommandPalette({
 						</div>
 					) : actionMode || !query.trim() ? (
 						visibleActions.length > 0 ? (
-							<div {...contentRegionProps}>
+							<div {...contentRegionProps} id="command-palette-results">
 								{visibleActions.map((action, index) => (
 									<ActionRow
 										key={action.id}
@@ -967,7 +995,7 @@ export function CommandPalette({
 						)
 					) : results.length > 0 ? (
 						<>
-							<div {...contentRegionProps}>
+							<div {...contentRegionProps} id="command-palette-results">
 								{results.map((result, index) => (
 									<SearchResultRow
 										key={`${resultType(result)}:${result.id}`}

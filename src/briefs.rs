@@ -604,8 +604,7 @@ mod tests {
             .connect_with(options)
             .await
             .expect("create sqlite db");
-        sqlx::migrate!("./migrations")
-            .run(&pool)
+        crate::database_migrations::run(&pool)
             .await
             .expect("run migrations");
         sqlx::query(

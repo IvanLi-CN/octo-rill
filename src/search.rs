@@ -32,6 +32,7 @@ pub struct SearchResponse {
     pub items: Vec<SearchResult>,
     pub remaining_requests: i64,
     pub reset_at: Option<String>,
+    pub index_status: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -439,6 +440,20 @@ pub async fn query(
         .collect())
 }
 
+pub async fn index_status(state: &AppState) -> Result<String, ApiError> {
+    let status = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM search_projection_backfill_state WHERE id = 1",
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(match status.as_deref() {
+        Some("ready") => "ready".to_owned(),
+        Some("paused_low_disk") => "paused_low_disk".to_owned(),
+        _ => "building".to_owned(),
+    })
+}
+
 fn to_result(row: SearchDocumentRow, terms: &[String]) -> SearchResult {
     let original = format!(
         "{} {} {}",
@@ -618,8 +633,7 @@ mod tests {
             .connect_with(options)
             .await
             .expect("create search sqlite db");
-        sqlx::migrate!("./migrations")
-            .run(&pool)
+        crate::database_migrations::run(&pool)
             .await
             .expect("run search migrations");
         sqlx::query(
@@ -635,6 +649,40 @@ mod tests {
         .await
         .expect("seed search user");
         pool
+    }
+
+    #[tokio::test]
+    async fn migration_is_schema_only() {
+        let pool = setup_pool().await;
+        let projection_rows = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents")
+            .fetch_one(&pool)
+            .await
+            .expect("count search projection rows");
+        let fts_rows = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents_fts")
+            .fetch_one(&pool)
+            .await
+            .expect("count search FTS rows");
+        let quota_rows = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_rate_limits")
+            .fetch_one(&pool)
+            .await
+            .expect("count search quota rows");
+        assert_eq!(projection_rows, 0);
+        assert_eq!(fts_rows, 0);
+        assert_eq!(quota_rows, 0);
+        let state = sqlx::query_as::<_, (String, i64)>(
+            "SELECT status, cursor FROM search_projection_backfill_state WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read initial projection state");
+        assert_eq!(state, ("pending".to_owned(), 0));
+        let trigger_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'search_%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count search triggers");
+        assert!(trigger_count > 0);
     }
 
     fn setup_state(pool: SqlitePool) -> Arc<AppState> {
@@ -1100,7 +1148,7 @@ mod tests {
         );
 
         sqlx::raw_sql(include_str!(
-            "../migrations/0081_command_palette_search.sql"
+            "../migrations/legacy/0081_command_palette_search.sql"
         ))
         .execute(&pool)
         .await
@@ -1129,6 +1177,110 @@ mod tests {
             .await
             .expect("query after projection delete");
         assert_eq!(after_delete.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn projection_backfill_resumes_in_bounded_batches() {
+        let pool = setup_pool().await;
+        seed_repo_association(&pool).await;
+        seed_release(&pool).await;
+        sqlx::query(
+            r#"
+            INSERT INTO social_activity_events (
+              id, user_id, kind, repo_id, repo_full_name, title, body, html_url,
+              actor_github_user_id, actor_login, occurred_at, detected_at,
+              created_at, updated_at
+            ) VALUES ('search-announcement-backfill', 'search-user', 'announcement', 42,
+                      'octo/rill', 'Backfill announcement', 'announcement body',
+                      'https://github.com/octo/rill/discussions/7', 99, 'octocat',
+                      '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z',
+                      '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed announcement for backfill");
+        let state = setup_state(pool.clone());
+
+        for _ in 0..=crate::search_index::PHASE_COUNT * 2 + 2 {
+            crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
+                .await
+                .expect("run search projection batch");
+        }
+
+        let status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM search_projection_backfill_state WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read backfill status");
+        assert_eq!(status, "ready");
+        let results = query(&state, "search-user", &parse_query("legacy").unwrap())
+            .await
+            .expect("query backfilled release");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "release:4201");
+        let announcements = query(
+            &state,
+            "search-user",
+            &parse_query("Backfill announcement").unwrap(),
+        )
+        .await
+        .expect("query backfilled announcement");
+        assert_eq!(announcements.len(), 1);
+        assert_eq!(
+            announcements[0].id,
+            "announcement:search-announcement-backfill"
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_backfill_pauses_below_disk_watermark() {
+        let pool = setup_pool().await;
+        seed_repo_association(&pool).await;
+        seed_release(&pool).await;
+        let state = setup_state(pool.clone());
+        let before = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents")
+            .fetch_one(&pool)
+            .await
+            .expect("count existing search documents");
+        crate::search_index::run_batch_for_test(state.as_ref(), 0)
+            .await
+            .expect("record low disk status");
+        let status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM search_projection_backfill_state WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read paused backfill status");
+        assert_eq!(status, "paused_low_disk");
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents")
+            .fetch_one(&pool)
+            .await
+            .expect("count search documents");
+        assert_eq!(count, before);
+    }
+
+    #[tokio::test]
+    async fn search_reports_index_status() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        assert_eq!(index_status(state.as_ref()).await.unwrap(), "building");
+        sqlx::query(
+            "UPDATE search_projection_backfill_state SET status = 'paused_low_disk' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("pause search index");
+        assert_eq!(
+            index_status(state.as_ref()).await.unwrap(),
+            "paused_low_disk"
+        );
+        sqlx::query("UPDATE search_projection_backfill_state SET status = 'ready' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .expect("ready search index");
+        assert_eq!(index_status(state.as_ref()).await.unwrap(), "ready");
     }
 
     #[tokio::test]
@@ -1270,6 +1422,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backfill_prefers_ready_projection_over_newer_running_projection() {
+        let pool = setup_pool().await;
+        seed_repo_association(&pool).await;
+        seed_release(&pool).await;
+        sqlx::query(
+            r#"
+            INSERT INTO content_work_items (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, source_hash, protocol_version, model_profile,
+              source_snapshot_json, configuration_fingerprint, status,
+              created_at, updated_at
+            ) VALUES
+              ('search-work-ready', 'release', '4201', 'translation', 'summary', 'zh-CN',
+               'search-hash-ready', 'content-processing.v1', 'test-model', '{}', 'test-config',
+               'ready', '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z'),
+              ('search-work-running', 'release', '4201', 'translation', 'summary', 'zh-CN',
+               'search-hash-running', 'content-processing.v1', 'test-model', '{}', 'test-config',
+               'running', '2026-02-23T00:00:00Z', '2026-02-23T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed ready and running work items");
+        sqlx::query(
+            r#"
+            INSERT INTO content_result_projections (
+              id, canonical_resource_type, canonical_resource_id, pipeline, variant,
+              target_lang, protocol_version, model_profile, source_hash, work_item_id,
+              active_work_item_id, payload_json, published_at, updated_at
+            ) VALUES
+              ('search-projection-ready', 'release', '4201', 'translation', 'summary', 'zh-CN',
+               'content-processing.v1', 'test-model', 'search-hash-ready', 'search-work-ready',
+               'search-work-ready', '{"title":"ready projection text"}',
+               '2026-02-22T00:00:00Z', '2026-02-22T00:00:00Z'),
+              ('search-projection-running', 'release', '4201', 'translation', 'summary', 'zh-CN',
+               'content-processing.v1', 'test-model', 'search-hash-running', 'search-work-running',
+               'search-work-running', '{"title":"running projection text"}',
+               '2026-02-23T00:00:00Z', '2026-02-23T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed ready and running projections");
+        sqlx::query(
+            "UPDATE search_documents SET translated_text = 'stale projection text' WHERE id = 'release:4201'",
+        )
+        .execute(&pool)
+        .await
+        .expect("make search projection stale");
+
+        let state = setup_state(pool.clone());
+        for _ in 0..=crate::search_index::PHASE_COUNT * 2 + 2 {
+            crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
+                .await
+                .expect("run search projection batch");
+        }
+
+        let projected = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT translated_text FROM search_documents WHERE id = 'release:4201'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read recovered projection text");
+        assert_eq!(projected.as_deref(), Some("ready projection text"));
+    }
+
+    #[tokio::test]
     async fn association_repairs_release_metadata() {
         let pool = setup_pool().await;
         seed_release(&pool).await;
@@ -1294,6 +1513,87 @@ mod tests {
             after_association.1.as_deref(),
             Some("/octo/rill/releases/tag/v1.0.0")
         );
+    }
+
+    #[tokio::test]
+    async fn owned_release_visibility_repairs_cached_release_metadata() {
+        let pool = setup_pool().await;
+        seed_release(&pool).await;
+        let before = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT repo_full_name, target_path FROM search_documents WHERE id = 'release:4201'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read release before owned baseline");
+        assert_eq!(before, (None, None));
+
+        sqlx::query("UPDATE users SET include_own_releases = 1 WHERE id = 'search-user'")
+            .execute(&pool)
+            .await
+            .expect("enable owned release visibility");
+        sqlx::query(
+            r#"
+            INSERT INTO owned_repo_star_baselines (
+              id, user_id, repo_id, repo_full_name, initialized_at, updated_at
+            ) VALUES ('search-owned-baseline', 'search-user', 42, 'octo/rill',
+                      '2026-02-23T00:00:00Z', '2026-02-23T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("insert owned repository baseline");
+
+        let state = setup_state(pool.clone());
+        let visible = query(
+            &state,
+            "search-user",
+            &parse_query("legacy owner:octo repo:octo/rill").unwrap(),
+        )
+        .await
+        .expect("query owned release after baseline");
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].target.href, "/octo/rill/releases/tag/v1.0.0");
+
+        sqlx::query("UPDATE search_documents SET target_path = NULL WHERE id = 'release:4201'")
+            .execute(&pool)
+            .await
+            .expect("simulate legacy release target");
+        sqlx::query(
+            "UPDATE search_projection_backfill_state SET phase = 'releases', cursor = 0, status = 'building' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("rewind release backfill state");
+        for _ in 0..=crate::search_index::PHASE_COUNT * 2 + 2 {
+            crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
+                .await
+                .expect("repair legacy release target");
+        }
+        let recovered = query(
+            &state,
+            "search-user",
+            &parse_query("legacy owner:octo repo:octo/rill").unwrap(),
+        )
+        .await
+        .expect("query repaired legacy release");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].target.href, "/octo/rill/releases/tag/v1.0.0");
+
+        sqlx::query(
+            "UPDATE owned_repo_star_baselines SET repo_full_name = 'octo/renamed', updated_at = '2026-02-24T00:00:00Z' WHERE id = 'search-owned-baseline'",
+        )
+        .execute(&pool)
+        .await
+        .expect("rename owned repository baseline");
+        let renamed = query(
+            &state,
+            "search-user",
+            &parse_query("legacy owner:octo repo:octo/renamed").unwrap(),
+        )
+        .await
+        .expect("query renamed owned release");
+        assert_eq!(renamed.len(), 1);
+        assert_eq!(renamed[0].target.href, "/octo/renamed/releases/tag/v1.0.0");
     }
 
     #[tokio::test]
