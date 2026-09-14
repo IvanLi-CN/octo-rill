@@ -647,7 +647,9 @@ export function DashboardHeader({
 	const demoPalettePreset = demoSnapshot.active
 		? (() => {
 				const scenePreset =
-					demoSnapshot.shareState.sceneId === "dashboard-command-search"
+					demoSnapshot.shareState.sceneId === "dashboard-command-search" ||
+					demoSnapshot.shareState.sceneId === "dashboard-command-building" ||
+					demoSnapshot.shareState.sceneId === "dashboard-command-paused"
 						? "search"
 						: demoSnapshot.shareState.sceneId === "dashboard-command-actions"
 							? "actions"

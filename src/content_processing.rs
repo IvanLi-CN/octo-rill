@@ -2717,7 +2717,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        crate::database_migrations::run(&pool).await.unwrap();
 
         let current_migrations = sqlx::migrate!("./migrations");
         let pre_cutover_migrator = sqlx::migrate::Migrator {
