@@ -17,7 +17,16 @@
 - hook：`hook_id`, `callback_url`, `status`
 - 错误：`error_kind`, `error_message`, `permission_paused`
 - 时间：`last_checked_at`, `last_registered_at`, `updated_at`
-- `status`: `unknown|missing|registered|conflict|permission_paused|error|delete_pending`
+- `status` persists only values accepted by the deployed `0066` CHECK constraint: `unknown|missing|registered|conflict|permission_paused|error|delete_pending`.
+- The API derives the public `archived` observation when `error_kind = 'archived'`; this preserves archived visibility without rewriting an already-deployed SQLite constraint.
+
+Rows are observations of a repository Hook. A missing row for an enabled target is derived as `waiting_registration`, not `unknown` or an error observation; the HTTP `summary.missing` count includes this waiting state so an enabled repository is visible as pending registration.
+
+## `job_tasks`
+
+- `available_at TEXT`: nullable UTC time used by durable delayed retries; queued tasks are claimable only when this is null or due.
+- Webhook manage and audit payloads store `retry_count`; manage payloads additionally store `scheduled`. SQLite busy exhaustion and partial audit dispatch failures reschedule the same task using `available_at` before a terminal failure.
+- Webhook worker local writes use `SqliteWriteCoordinator`; the writer permit never spans GitHub requests.
 
 Rows are observations of a repository Hook. A missing row for an enabled target is derived as `waiting_registration`, not `unknown` or `missing`.
 
