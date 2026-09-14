@@ -4,7 +4,7 @@
 
 - Lifecycle: active
 - Implementation: 已实现，等待 PR 收敛
-- Summary: backend, scheduler, receiver, Settings/Admin UI, tests and visual evidence complete
+- Summary: backend, scheduler, receiver, Settings/Admin UI, recovery states, tests and visual evidence in progress
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -15,4 +15,5 @@
 - [x] M3: HMAC receiver、delivery 去重与 Release demand。
 - [x] M4: Settings/Admin UI、Web Demo、E2E 与视觉证据。
 - [x] M4b: 目标状态、异步对齐、持久退避重试和 Owner 分组整改。
+- [x] M4c: SQLite busy 恢复、每用户 audit dispatch、失败快照和归档错误分类。
 - [ ] M5: 完整验证、PR 与 review convergence。

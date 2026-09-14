@@ -1143,8 +1143,6 @@ pub struct DailyBriefProfilePatchRequest {
     daily_brief_time_zone: String,
     #[serde(default)]
     include_own_releases: Option<bool>,
-    #[serde(default)]
-    webhook_push_desired_state: Option<String>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -1330,14 +1328,12 @@ async fn persist_daily_brief_profile(
         .map(i64::from)
         .unwrap_or(current_webhook.0)
         != 0;
-    let next_desired_state = req
-        .webhook_push_desired_state
-        .clone()
-        .or_else(|| {
-            (req.include_own_releases == Some(false) && current_webhook.1 == "enabled")
-                .then(|| "paused".to_owned())
-        })
-        .unwrap_or_else(|| current_webhook.1.clone());
+    let next_desired_state =
+        if req.include_own_releases == Some(false) && current_webhook.1 == "enabled" {
+            "paused".to_owned()
+        } else {
+            current_webhook.1.clone()
+        };
     if !matches!(
         next_desired_state.as_str(),
         "enabled" | "paused" | "deleted"
@@ -38790,7 +38786,6 @@ echo should_not_be_in_excerpt
             super::DailyBriefProfilePatchRequest {
                 daily_brief_time_zone: "America/New_York".to_owned(),
                 include_own_releases: None,
-                webhook_push_desired_state: None,
             },
         )
         .await
@@ -38811,7 +38806,6 @@ echo should_not_be_in_excerpt
             super::DailyBriefProfilePatchRequest {
                 daily_brief_time_zone: "America/New_York".to_owned(),
                 include_own_releases: None,
-                webhook_push_desired_state: None,
             },
         )
         .await
@@ -39263,7 +39257,6 @@ echo should_not_be_in_excerpt
             super::DailyBriefProfilePatchRequest {
                 daily_brief_time_zone: "Asia/Shanghai".to_owned(),
                 include_own_releases: Some(true),
-                webhook_push_desired_state: None,
             },
         )
         .await
@@ -39298,7 +39291,6 @@ echo should_not_be_in_excerpt
             super::DailyBriefProfilePatchRequest {
                 daily_brief_time_zone: "Asia/Tokyo".to_owned(),
                 include_own_releases: None,
-                webhook_push_desired_state: None,
             },
         )
         .await
