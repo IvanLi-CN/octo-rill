@@ -22258,8 +22258,7 @@ mod tests {
             .connect_with(options)
             .await
             .expect("create sqlite memory db");
-        sqlx::migrate!("./migrations")
-            .run(&pool)
+        crate::database_migrations::run(&pool)
             .await
             .expect("run migrations");
         crate::api::ensure_owned_repo_visual_columns(&pool)

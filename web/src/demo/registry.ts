@@ -178,6 +178,22 @@ export const DEMO_SCENES: DemoScene[] = [
 		personas: ["member", "admin"],
 	},
 	{
+		id: "dashboard-command-building",
+		title: "Command Palette · Indexing",
+		description: "本地索引渐进建立中，展示可用的部分搜索结果与状态提示。",
+		path: `${buildDashboardScopeHref(repoScope)}?palette=search&index_status=building`,
+		defaultPersona: "member",
+		personas: ["member", "admin"],
+	},
+	{
+		id: "dashboard-command-paused",
+		title: "Command Palette · Low Disk",
+		description: "磁盘空间不足时暂停索引，展示可理解的降级状态。",
+		path: `${buildDashboardScopeHref(repoScope)}?palette=search&index_status=paused_low_disk`,
+		defaultPersona: "member",
+		personas: ["member", "admin"],
+	},
+	{
 		id: "dashboard-command-actions",
 		title: "Command Palette · Actions",
 		description: "打开命令面板的 actions 模式，体验导航、同步与日报确认。",
