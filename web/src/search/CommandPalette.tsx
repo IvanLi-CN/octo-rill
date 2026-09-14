@@ -374,6 +374,7 @@ function ActionRow(props: {
 		<button
 			type="button"
 			id={id}
+			tabIndex={-1}
 			role="option"
 			aria-selected={active}
 			disabled={disabled}

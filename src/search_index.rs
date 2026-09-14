@@ -554,8 +554,9 @@ fn available_bytes(path: &Path) -> io::Result<u64> {
             return Err(io::Error::last_os_error());
         }
         let stats = unsafe { stats.assume_init() };
-        (stats.f_bavail as u64)
-            .checked_mul(stats.f_frsize)
+        u128::from(stats.f_bavail)
+            .checked_mul(u128::from(stats.f_frsize))
+            .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or_else(|| io::Error::other("free-space value overflow"))
     }
     #[cfg(not(unix))]
