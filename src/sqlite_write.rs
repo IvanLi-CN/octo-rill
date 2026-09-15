@@ -35,6 +35,7 @@ pub struct SqliteWriteRuntimeStatus {
 pub enum SqliteWritePriority {
     Foreground,
     Background,
+    Migration,
     BestEffort,
 }
 
@@ -84,12 +85,13 @@ impl SqliteWritePriority {
         match self {
             Self::Foreground => "foreground",
             Self::Background => "background",
+            Self::Migration => "migration",
             Self::BestEffort => "best_effort",
         }
     }
 
     fn waits_for_foreground(self) -> bool {
-        matches!(self, Self::Background | Self::BestEffort)
+        matches!(self, Self::Background | Self::Migration | Self::BestEffort)
     }
 }
 

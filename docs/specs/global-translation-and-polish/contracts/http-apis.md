@@ -36,13 +36,17 @@ The client treats this as synchronization with the active work, immediately rend
 
 When provider health has opened the persistent circuit, an authorized retry records the association but receives the current `deferred_provider` state and a polling URL. Only the scheduler's controlled probe may initiate another provider call.
 
-## Transition Response
+## Persistent Migration Operations
 
-During `rollback_freeze`, every content-processing submission returns `503 Service Unavailable` with the same `request_id`, `work_item_id` when known, current mode and a polling URL. It neither falls back to old direct writes nor creates a partially switched work item.
+Valid content-processing submissions remain on the existing admission contract during DDL, DML and historical backfill. A historical `legacy` or `rollback_freeze` control value is repaired to `global` inside the same `BEGIN IMMEDIATE` transaction that creates or associates the authoritative `content_work_items` row. No migration-specific `503`, freeze route or cutover route exists.
 
-The operational cutover endpoint `POST /api/admin/jobs/content-processing/cutover` accepts `{ "switch_token": "..." }`. It performs the single `rollback_freeze -> global` transaction and returns `409 content_processing_cutover_not_ready` for any other current mode.
+Administrators can inspect and control the online operator through the existing admin boundary:
 
-The operational freeze endpoint `POST /api/admin/jobs/content-processing/freeze` accepts the same payload. It performs the serialized `legacy -> rollback_freeze` transition only after legacy batches have reached a terminal state, and returns `409 content_processing_freeze_not_ready` otherwise. This is the compatibility release's controlled handoff into the PR-2 cutover window.
+- `GET /admin/jobs/migrations` and `GET /admin/jobs/migrations/{migration_id}` return the immutable run and operation definition checksums, ordered status, cursor, progress, owner heartbeat and redacted error summary.
+- `POST /admin/jobs/migrations/{migration_id}/pause` requests a pause at the next committed batch boundary.
+- `POST /admin/jobs/migrations/{migration_id}/resume` clears the pause request and resumes from the durable cursor.
+
+The operator uses a named persistent lease after runtime-owner registration. Each historical backfill transaction processes at most 100 rows and yields to foreground SQLite writers before acquiring its permit.
 
 ## Read Semantics
 

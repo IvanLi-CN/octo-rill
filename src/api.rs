@@ -8635,7 +8635,7 @@ async fn build_release_detail_response(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let release_id = row.release_id.to_string();
         let translation = content_processing::read_global_resource(
@@ -9371,7 +9371,7 @@ async fn build_announcement_detail_response(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let translation = content_processing::read_global_resource(
             state,
@@ -11471,7 +11471,7 @@ async fn load_public_release_translation_rows(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let (pipeline, variants): (&str, &[&str]) = if entity_type == "release_smart" {
             ("polishing", &["smart", "feed_card"])
@@ -11715,7 +11715,7 @@ async fn load_public_release_rows(
     let global_mode = content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global;
+        != content_processing::ContentProcessingMode::Legacy;
     let release_ids = base_rows
         .iter()
         .map(|row| row.release_id)
@@ -13192,19 +13192,6 @@ async fn cleanup_public_release_repo_cache_if_unused_in_transaction(
             skipped_reason: Some("repo_not_resolved".to_owned()),
         });
     };
-
-    if !content_processing::legacy_mode_in_transaction(tx)
-        .await
-        .map_err(ApiError::internal)?
-    {
-        return Ok(AdminPublicRepoCacheCleanup {
-            repo_id: Some(repo_id),
-            full_name,
-            deleted_release_count: 0,
-            deleted_ai_cache_count: 0,
-            skipped_reason: Some("content_processing_transition".to_owned()),
-        });
-    }
 
     let remaining_public_usage = sqlx::query_scalar::<_, i64>(
         r#"
@@ -14698,7 +14685,7 @@ where
         .map_err(ApiError::internal)?;
     let releases = sync_releases(state, user_id)
         .await
-        .map_err(content_processing::api_error_from_anyhow)?;
+        .map_err(ApiError::internal)?;
     let (social, social_error) = sync_social(state, user_id).await;
     let notifications = sync_notifications(state, user_id)
         .await
@@ -14728,7 +14715,7 @@ pub async fn sync_releases(
     if matches!(mode, ReturnMode::Sync) {
         let res = sync::sync_releases(state.as_ref(), user_id.as_str())
             .await
-            .map_err(content_processing::api_error_from_anyhow)?;
+            .map_err(ApiError::internal)?;
         return Ok(Json(res).into_response());
     }
 
@@ -16736,7 +16723,7 @@ async fn overlay_global_feed_processing(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        != content_processing::ContentProcessingMode::Global
+        == content_processing::ContentProcessingMode::Legacy
     {
         return Ok(());
     }
@@ -21305,7 +21292,7 @@ pub async fn translate_releases_batch_for_user(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let mut items = Vec::with_capacity(release_ids.len());
         for release_id in release_ids {
@@ -22489,7 +22476,7 @@ pub async fn summarize_releases_smart_batch_for_user(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let mut items = Vec::with_capacity(release_ids.len());
         for release_id in release_ids {
@@ -23012,7 +22999,7 @@ pub async fn translate_releases_batch(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let mut items = Vec::with_capacity(release_ids.len());
         for release_id in release_ids {
@@ -23074,7 +23061,7 @@ pub async fn translate_releases_batch_stream(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let mut responses = Vec::with_capacity(release_ids.len());
         for release_id in release_ids {
@@ -23156,7 +23143,7 @@ pub async fn translate_release_for_user(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let release_id = parse_release_id_param(release_id_raw)?;
         let input = global_release_request_item(
@@ -23194,7 +23181,7 @@ pub async fn translate_release(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         return submit_global_release(
             state.as_ref(),
@@ -23682,7 +23669,7 @@ pub async fn translate_release_detail(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         return submit_global_release(
             state.as_ref(),
@@ -23734,7 +23721,7 @@ pub async fn translate_release_detail_for_user(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let release_id = parse_release_id_param(release_id_raw)?;
         let input = global_release_request_item(
@@ -23816,7 +23803,7 @@ pub async fn translate_release_detail_batch(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let mut items = Vec::with_capacity(release_ids.len());
         for release_id in release_ids {
@@ -24099,7 +24086,7 @@ pub async fn translate_announcement_detail_for_user(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let item = global_announcement_request_item(
             state,
@@ -24309,7 +24296,7 @@ pub async fn summarize_announcement_smart_for_user(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let item = global_announcement_request_item(
             state,
@@ -24845,7 +24832,7 @@ pub async fn translate_notifications_batch(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let mut items = Vec::with_capacity(thread_ids.len());
         for thread_id in thread_ids {
@@ -24900,7 +24887,7 @@ pub async fn translate_notification(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let input = global_notification_request_item(state.as_ref(), &user_id, &thread_id).await?;
         let (status, response) = content_processing::submit_item(
@@ -24967,7 +24954,7 @@ pub async fn translate_notification_for_user(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let input = global_notification_request_item(state, &user_id, &thread_id).await?;
         let (_, response) =

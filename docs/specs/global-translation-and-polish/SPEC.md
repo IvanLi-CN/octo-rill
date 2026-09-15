@@ -4,7 +4,7 @@
 
 管理端曾仅以 `translation_work_items` 推断当前状态，而 Release 明细翻译可以直接写入 `ai_translations`。这使存在结果缓存但没有工作项的记录显示为“未开始”。同时，现有翻译与润色工作项以 `scope_user_id` 隔离，重复执行相同规范资源，并把全局内容处理错误建模成用户局部状态。
 
-本主题将 Release、公告和通知的翻译与润色统一为全局工作与结果模型。它复用既有调度器的批处理、租约、恢复和诊断能力，但拥有全局身份、请求关联、结果投影、旧事实保留、切换和回滚合同。日报生成和日报内容处理不在范围内。
+本主题将 Release、公告和通知的翻译与润色统一为全局工作与结果模型。它复用既有调度器的批处理、租约、恢复和诊断能力，但拥有全局身份、请求关联、结果投影、旧事实保留和前向修复合同。日报生成和日报内容处理不在范围内。
 
 ## Requirements
 
@@ -21,8 +21,8 @@
 - REQ-GTP-ADMIN-READS: 管理页和详情读取必须是纯读取，不得补覆盖范围、创建工作项、重试或写入缓存。它必须分别展示当前全局工作状态、当前结果投影和旧事实来源；只有旧缓存且没有全局工作或结果时显示 `legacy_cached`，旧工作与缓存无法一致解释时显示 `legacy_conflict`。不得以缓存回退伪造“已完成”“未开始”或尝试次数。
 - REQ-GTP-ADMIN-READ-BUDGET: 管理采集记录列表的查询窗最长三十一天，必须在数据库中以完全相同的筛选语义分别取得精确总数和当前页标识，并且只装载当前页的处理摘要。列表不得使用结果缓存、请求合并或内存全量分页；源站读取预算为五秒，同类并发读取容量耗尽时返回带 `Retry-After` 的 `503`。
 - REQ-GTP-LEGACY: 现有 `translation_work_items`、`translation_requests`、尝试事件和 `ai_translations` 行必须保留为只读历史事实；其中 `release_smart`、`announcement_smart` 等润色记录与翻译记录适用同一保留规则。迁移只能从其读取并记录可追溯的旧事实观察，绝不把旧缓存、旧状态或旧尝试合成为全局工作、全局结果或新的尝试历史。
-- REQ-GTP-CUTOVER: 全局模型必须经由单一写入者切换，不得长期双写。切换前必须停止旧写入路径并完成运行中旧批次的受控收口；切换后由全局调度器接收新的覆盖请求。转换期间内容处理请求返回带轮询信息的 `503`，而不是部分落入新旧两个模型。
-- REQ-GTP-COMPATIBILITY: 数据库演进必须使用扩展表、索引和控制记录。必须先发布含有该迁移且仍能安全运行旧行为的兼容版本，再发布不含新迁移的全局切换版本。兼容版本在检测到全局模式时禁用旧内容处理写入，允许降级后二进制继续打开数据库；不含该迁移版本的更旧应用不得作为回滚目标。
+- REQ-GTP-MIGRATION: 持久化状态迁移必须把 DDL、DML 和历史回填拆为有序、可观测、可暂停的操作；每个 run 和 operation 的定义 checksum 不可变，已部署状态只允许 forward repair。迁移 lease 由已注册的 runtime owner 持有，前台 SQLite 写入优先于迁移批次。
+- REQ-GTP-COMPATIBILITY: 空数据库在 HTTP 监听前完成 SQLx 初始化；已有数据库只校验已应用 migration history 的版本、checksum 和 dirty 状态。在线控制表在服务已注册 runtime owner 后由命名 lease bootstrap 创建，兼容代码在控制表可用前后都能处理提交路径，不改变单实例 Compose/SQLite 拓扑。
 - REQ-GTP-NAMING: 所有面向用户和管理员的功能名称保持“翻译”和“润色”。本主题不得以“完整翻译”“智能变更摘要”或任何替代名称重命名现有能力。
 - REQ-GTP-OBSERVABILITY: 尝试审计必须记录配置指纹、提供方调用标识、时长、令牌、成本、稳定错误码与脱敏摘要，并保持尝试到模型调用的精确归因。原始提示词、完整响应和未脱敏上游错误不进入常规管理读取或长期尝试审计。
 
@@ -39,7 +39,7 @@
 - VER-GTP-LIFECYCLE: covers: REQ-GTP-RESULTS, REQ-GTP-CACHE-HIT, REQ-GTP-LIFECYCLE, REQ-GTP-CONFIGURATION, REQ-GTP-RETRY-COORDINATION, REQ-GTP-PROVIDER-GUARD。验证来源变更、删除、有效与无效输出、当前结果命中生成零次尝试的 `ready` 工作项、配置不可用、自动恢复、五分钟冷却、并发手动重试 `409`、熔断下的 `deferred_provider`、优先级与至少一个后台名额。
 - VER-GTP-ADMIN: covers: REQ-GTP-ADMIN-READS, REQ-GTP-LEGACY, REQ-GTP-NAMING, REQ-GTP-OBSERVABILITY。验证管理 GET 无写入，旧缓存不会被伪造成工作项，`legacy_cached` 与 `legacy_conflict` 有可追溯来源，诊断安全字段正确，界面始终显示“翻译”和“润色”。
 - VER-GTP-ADMIN-READ-BUDGET: covers: REQ-GTP-ADMIN-READ-BUDGET, REQ-GTP-NOTIFICATION-SOURCE。以生产形状的通知、遗留工作项和全局工作项夹具验证四类列表：总数与页码精确、状态筛选在分页前完成、跨用户同一通知线程使用规范来源、超过三十一天被拒绝、超时与并发饱和返回可重试 `503`，且释放读取容量。
-- VER-GTP-CUTOVER: covers: REQ-GTP-CUTOVER, REQ-GTP-COMPATIBILITY。以旧事实混合、运行中旧批次、切换冻结、全局写入启用和切换版本降级到兼容版本的数据库副本验证：旧行未改变，转换无双写，兼容版本可启动且旧写入者失效，更旧版本被部署检查拒绝。
+- VER-GTP-MIGRATION: covers: REQ-GTP-MIGRATION, REQ-GTP-COMPATIBILITY。以空库、已有 SQLx history、暂停后的 cursor、失败重入和前台写压力验证：DDL/DML/backfill 顺序不变、每批不超过 100 行、旧事实未改变、forward repair 可恢复，且有效提交持续返回既有 `202` 或活跃工作 `409`。
 
 ## Interfaces & Contracts
 
@@ -58,6 +58,7 @@
 - [ADR 0007: 全局翻译与润色工作模型](../../adr/0007-global-translation-and-polish-work-model.md)
 - [ADR 0008: 规范通知来源选择](../../adr/0008-canonical-notification-source-selection.md)
 - [ADR 0009: 管理采集记录读取预算](../../adr/0009-admin-collection-record-read-budget.md)
+- [ADR 0011: 无感持久化状态迁移](../../adr/0011-online-persistent-state-migrations.md)
 
 ## Visual Evidence
 

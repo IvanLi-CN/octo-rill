@@ -15,7 +15,7 @@
 
 | Table | Ownership | Required facts |
 | --- | --- | --- |
-| `content_processing_control` | cutover controller | singleton mode, switch token, update time |
+| `content_processing_control` | admission compatibility record | singleton historical mode and update time; `legacy`/`rollback_freeze` are repaired forward to `global` during valid submission admission |
 | `content_work_items` | scheduler | global identity, source snapshot/hash, frozen configuration, lifecycle, priority, recovery and source-supersession facts |
 | `content_batches` | scheduler | durable general-worker batch, partition, trigger, lease and aggregate result facts |
 | `content_batch_items` | scheduler | ordered batch membership, request count, token estimate and item result facts |
@@ -23,7 +23,10 @@
 | `content_request_links` | API adapter | requester/system producer, authorization snapshot, request source, delivery mode, global work item and returned response fact |
 | `content_attempt_events` | scheduler | append-only attempt number, trigger, state transition, safe error, retry disposition and timing |
 | `content_attempt_llm_calls` | scheduler | exact attempt-to-call relation, call identifier and safe metrics |
-| `content_legacy_observations` | migration/read model | old table, old primary key, canonical resource facts where known, classification and immutable observation basis |
+| `content_legacy_observations` | migration/read model | old table, old primary key, source-hash incarnation, canonical resource facts where known, classification and immutable observation basis |
+| `online_migration_leases` | online migration operator | named lease owner, expiry and update time |
+| `online_migration_runs` | online migration operator | immutable migration definition checksum, lifecycle, pause request, owner heartbeat and redacted failure |
+| `online_migration_operations` | online migration operator | immutable operation definition checksum, ordered DDL/DML/backfill kind, cursor, row progress, pause and owner facts |
 
 ## State and Publication Invariants
 
@@ -45,7 +48,7 @@ projections; those writes remain worker-owned.
 ## Legacy Boundary
 
 - No migration modifies `translation_work_items`, `translation_requests`, their attempts or `ai_translations`.
-- `content_legacy_observations` can identify legacy evidence but cannot be used as a foreign-key source for a global result or work state.
+- `content_legacy_observations` can identify legacy evidence but cannot be used as a foreign-key source for a global result or work state. Its durable identity is `(legacy_table, legacy_primary_key, legacy_source_hash)`, so deleting and recreating a legacy row with changed source content preserves both observations.
 - `legacy_cached` means a displayable old cache lacks matching work evidence. `legacy_conflict` means old evidence cannot be safely reconciled. Neither classification creates an attempt count or current status.
 
 ## Polishing Migration Mapping
@@ -63,6 +66,6 @@ This is a schema migration for polishing as well as translation: it adds the glo
 
 ## Control-Mode Invariants
 
-- `legacy` permits only the compatibility version's legacy writers.
-- `rollback_freeze` permits no content-processing writer and returns the transition response to new requests.
-- `global` permits only global writers. Compatibility-version legacy writers must fail closed in this mode.
+- `legacy`, `rollback_freeze` and `global` are recognized historical values. A valid global admission transaction atomically changes the first two values to `global` before creating or associating the authoritative work item.
+- The global scheduler is the only writer of new content-processing work, attempts and projections. Legacy tables remain read-only observation sources.
+- There is no freeze/cutover route and no migration-specific admission error. Existing `202 Accepted` and active-work `409 Conflict` semantics remain the only admission outcomes for valid submissions.
