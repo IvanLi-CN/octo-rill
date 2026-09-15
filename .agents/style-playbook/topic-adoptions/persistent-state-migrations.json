@@ -4,7 +4,7 @@
     "docs/specs/persistent-state-migrations/SPEC.md",
     "docs/specs/persistent-state-migrations/migration-record.json"
   ],
-  "implementation_commit": "eaf399d9d2d4eec8293c905925fbfe6c9d4f052b",
+  "implementation_commit": "f02d406c54c4f575e2b767a82640f2161975c833",
   "playbook_commit": "4c09ce4a3e77ffb5cae97adf0c59da4d77e88536",
   "policy_observations": [
     {
