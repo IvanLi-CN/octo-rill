@@ -398,6 +398,20 @@ export type MeProfileResponse = {
 	include_own_releases: boolean;
 	last_active_at: string | null;
 };
+export type WebhookPushRepoStatusValue =
+	| "registered"
+	| "missing"
+	| "waiting_registration"
+	| "registering"
+	| "processing"
+	| "delete_pending"
+	| "permission_paused"
+	| "archived"
+	| "pat_scope_excluded"
+	| "out_of_scope"
+	| "not_configured"
+	| "error"
+	| "conflict";
 export type WebhookPushRepoStatus = {
 	repo_id: number;
 	owner_login: string;
@@ -405,7 +419,7 @@ export type WebhookPushRepoStatus = {
 	repo_full_name: string;
 	is_private: boolean | null;
 	hook_id: number | null;
-	status: string;
+	status: WebhookPushRepoStatusValue;
 	error_kind: string | null;
 	error_message: string | null;
 	permission_paused: boolean;
