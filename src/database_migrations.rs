@@ -21,6 +21,13 @@ pub async fn run(pool: &SqlitePool) -> Result<()> {
     let applied = load_applied_migrations(pool).await?;
     validate_history(applied.as_deref(), &MIGRATOR)?;
 
+    // A database with SQLx history is already deployed durable state. Its
+    // history is validation-only; structural changes use the online operator
+    // after the compatible HTTP process is running.
+    if applied.is_some() {
+        return Ok(());
+    }
+
     let mut migrator = sqlx::migrate!("./migrations");
     // Version 81 is intentionally kept as historical evidence outside the
     // discovered source set. validate_history narrows this exception to that
@@ -208,5 +215,41 @@ mod tests {
         .await
         .expect("read search state");
         assert_eq!(state, "pending");
+    }
+
+    #[tokio::test]
+    async fn existing_history_is_validated_without_applying_pending_sqlx_migrations() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        let first = MIGRATOR.iter().next().expect("first migration");
+        sqlx::raw_sql(
+            "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TEXT NOT NULL, success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create SQLx history");
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations (version, description, installed_on, success, checksum, execution_time) VALUES (?, ?, CURRENT_TIMESTAMP, 1, ?, 0)",
+        )
+        .bind(first.version)
+        .bind(first.description.as_ref())
+        .bind(first.checksum.as_ref())
+        .execute(&pool)
+        .await
+        .expect("insert SQLx history");
+
+        run(&pool).await.expect("validate existing history");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 2",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read SQLx history"),
+            0
+        );
     }
 }

@@ -2272,17 +2272,6 @@ pub async fn retry_translation_request(
 ) -> Result<Response, ApiError> {
     let user_id = api::require_business_user_id(state.as_ref(), &session, &headers).await?;
     let request_id = api::parse_local_id_param(request_id, "request_id")?;
-    if content_processing::current_mode(&state.pool)
-        .await
-        .map_err(ApiError::internal)?
-        != content_processing::ContentProcessingMode::Global
-    {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "content_processing_legacy",
-            "global content processing is not active",
-        ));
-    }
     let snapshot = content_processing::get_request(state.as_ref(), &user_id, &request_id)
         .await?
         .ok_or_else(|| {
@@ -2341,7 +2330,7 @@ pub async fn resolve_translation_results(
     if content_processing::current_mode(&state.pool)
         .await
         .map_err(ApiError::internal)?
-        == content_processing::ContentProcessingMode::Global
+        != content_processing::ContentProcessingMode::Legacy
     {
         let items = normalize_request_items(&req.items)?;
         let mut responses = Vec::with_capacity(items.len());
@@ -3465,23 +3454,10 @@ async fn create_translation_requests_batch_with_origin(
 pub(crate) async fn ensure_legacy_writer_transaction(
     tx: &mut Transaction<'_, Sqlite>,
 ) -> Result<(), ApiError> {
-    if content_processing::legacy_mode_in_transaction(tx)
+    let _ = content_processing::legacy_mode_in_transaction(tx)
         .await
-        .map_err(ApiError::internal)?
-    {
-        Ok(())
-    } else {
-        Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "content_processing_transition",
-            "content processing is controlled by a non-legacy mode; poll the request status before retrying",
-        )
-        .with_details(serde_json::json!({
-            "request_id": serde_json::Value::Null,
-            "work_item_id": serde_json::Value::Null,
-            "poll_url": serde_json::Value::Null,
-        })))
-    }
+        .map_err(ApiError::internal)?;
+    Ok(())
 }
 
 pub(crate) async fn enqueue_release_smart_translation_requests(
