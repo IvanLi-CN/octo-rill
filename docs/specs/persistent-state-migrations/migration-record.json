@@ -45,7 +45,7 @@
       {
         "id": "backfill-001",
         "definition_checksum": "abfd0ba152798ac3ba49736a257e0c34f4ca5a576691abbf4e3e199f4d49a4e3",
-        "description": "Record legacy translation_work_items and ai_translations observations by SQLite rowid cursor in batches of at most 100 rows; legacy text IDs are not used as ordering cursors.",
+        "description": "Record unobserved legacy translation_work_items and ai_translations rows in batches of at most 100; durable observation absence is the completion predicate and SQLite rowid is retained only as an informational progress cursor. Legacy work or non-displayable cache evidence is classified as legacy_conflict, while only displayable ready cache evidence is legacy_cached.",
         "order": 3,
         "depends_on": ["ddl-001", "dml-001"],
         "observable": true,

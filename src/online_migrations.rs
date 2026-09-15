@@ -243,7 +243,7 @@ async fn ensure_bootstrap(state: &AppState) -> Result<bool> {
     let now = chrono::Utc::now().to_rfc3339();
     let expires = (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
     sqlx::query(
-        "INSERT INTO online_migration_leases (lease_name, owner_id, lease_expires_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(lease_name) DO UPDATE SET owner_id = excluded.owner_id, lease_expires_at = excluded.lease_expires_at, updated_at = excluded.updated_at WHERE online_migration_leases.owner_id = excluded.owner_id OR datetime(online_migration_leases.lease_expires_at) <= datetime('now') OR NOT EXISTS (SELECT 1 FROM runtime_owners WHERE runtime_owner_id = online_migration_leases.owner_id AND datetime(lease_heartbeat_at) > datetime('now', '-90 seconds'))",
+        "INSERT INTO online_migration_leases (lease_name, owner_id, lease_expires_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(lease_name) DO UPDATE SET owner_id = excluded.owner_id, lease_expires_at = excluded.lease_expires_at, updated_at = excluded.updated_at WHERE online_migration_leases.owner_id = excluded.owner_id OR (datetime(online_migration_leases.lease_expires_at) <= datetime('now') AND NOT EXISTS (SELECT 1 FROM runtime_owners WHERE runtime_owner_id = online_migration_leases.owner_id AND datetime(lease_heartbeat_at) > datetime('now', '-90 seconds')))",
     )
     .bind(LEASE_NAME)
     .bind(&state.runtime_owner_id)
@@ -463,8 +463,9 @@ async fn backfill_batch(
         .split_once('|')
         .unwrap_or(("translation_work_items", ""));
     // Legacy primary keys are nanoid/text values and do not provide a stable
-    // ordering. Use SQLite's insertion rowid as the durable cursor so rows
-    // created while the backfill is running cannot sort behind an ID cursor.
+    // ordering. The cursor records the last observed SQLite rowid for
+    // operators, but observation absence is the completion/re-entry predicate:
+    // SQLite may reuse a deleted rowid and such a row must still be observed.
     let last_rowid = last_rowid.parse::<i64>().unwrap_or(0);
     let table_exists = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -481,8 +482,7 @@ async fn backfill_batch(
     }
 
     if phase == "translation_work_items" {
-        let rows = sqlx::query("SELECT rowid AS migration_rowid, id, kind, entity_id, source_hash, status FROM translation_work_items WHERE rowid > ? ORDER BY rowid LIMIT ?")
-            .bind(last_rowid)
+        let rows = sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.kind, legacy.entity_id, legacy.source_hash, legacy.status FROM translation_work_items AS legacy WHERE NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'translation_work_items' AND observation.legacy_primary_key = legacy.id) ORDER BY legacy.rowid LIMIT ?")
             .bind(OP_BATCH_SIZE)
             .fetch_all(&mut **tx)
             .await?;
@@ -505,6 +505,7 @@ async fn backfill_batch(
                 &entity_id,
                 &source_hash,
                 &status,
+                false,
             )
             .await?;
             next = rowid;
@@ -516,8 +517,7 @@ async fn backfill_batch(
         ));
     }
 
-    let rows = sqlx::query("SELECT rowid AS migration_rowid, id, entity_type, entity_id, source_hash FROM ai_translations WHERE rowid > ? ORDER BY rowid LIMIT ?")
-        .bind(last_rowid)
+    let rows = sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.entity_type, legacy.entity_id, legacy.source_hash, legacy.status, legacy.title, legacy.summary FROM ai_translations AS legacy WHERE NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'ai_translations' AND observation.legacy_primary_key = legacy.id) ORDER BY legacy.rowid LIMIT ?")
         .bind(OP_BATCH_SIZE)
         .fetch_all(&mut **tx)
         .await?;
@@ -531,6 +531,14 @@ async fn backfill_batch(
         let kind: String = row.get("entity_type");
         let entity_id: String = row.get("entity_id");
         let source_hash: String = row.get("source_hash");
+        let status: String = row.get("status");
+        let title: Option<String> = row.get("title");
+        let summary: Option<String> = row.get("summary");
+        let displayable = status == "ready"
+            && [title.as_deref(), summary.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|value| !value.trim().is_empty());
         insert_observation(
             tx,
             "ai_translations",
@@ -538,7 +546,8 @@ async fn backfill_batch(
             &kind,
             &entity_id,
             &source_hash,
-            "cached",
+            &status,
+            displayable,
         )
         .await?;
         next = rowid;
@@ -546,6 +555,7 @@ async fn backfill_batch(
     Ok((format!("ai_translations|{next}"), rows.len() as i64, false))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn insert_observation(
     tx: &mut Transaction<'_, Sqlite>,
     table: &str,
@@ -554,6 +564,7 @@ async fn insert_observation(
     entity_id: &str,
     source_hash: &str,
     status: &str,
+    displayable_cache: bool,
 ) -> Result<()> {
     let resource_type = ["release", "announcement", "notification"]
         .iter()
@@ -564,14 +575,20 @@ async fn insert_observation(
     } else {
         "translation"
     };
-    let basis = json!({"kind": kind, "source_hash": source_hash, "status": status}).to_string();
-    sqlx::query("INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) VALUES (?, ?, ?, ?, ?, ?, 'legacy_cached', ?, CURRENT_TIMESTAMP)")
+    let classification = if table == "ai_translations" && displayable_cache {
+        "legacy_cached"
+    } else {
+        "legacy_conflict"
+    };
+    let basis = json!({"kind": kind, "source_hash": source_hash, "status": status, "classification": classification}).to_string();
+    sqlx::query("INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)")
         .bind(local_id::generate_local_id().to_string())
         .bind(table)
         .bind(id)
         .bind(resource_type)
         .bind(entity_id)
         .bind(pipeline)
+        .bind(classification)
         .bind(basis)
         .execute(&mut **tx)
         .await?;
@@ -760,7 +777,7 @@ mod tests {
             .await
             .expect("connect sqlite");
         sqlx::raw_sql(
-            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, kind TEXT NOT NULL, entity_id TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL); CREATE TABLE content_legacy_observations (id TEXT PRIMARY KEY, legacy_table TEXT NOT NULL, legacy_primary_key TEXT NOT NULL, canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, classification TEXT NOT NULL, observation_basis_json TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(legacy_table, legacy_primary_key));",
+            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, kind TEXT NOT NULL, entity_id TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL); CREATE TABLE ai_translations (id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL, title TEXT, summary TEXT); CREATE TABLE content_legacy_observations (id TEXT PRIMARY KEY, legacy_table TEXT NOT NULL, legacy_primary_key TEXT NOT NULL, canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, classification TEXT NOT NULL, observation_basis_json TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(legacy_table, legacy_primary_key));",
         )
         .execute(&pool)
         .await
@@ -866,11 +883,11 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert fixture row");
-        for _ in 0..2 {
+        for (index, expected_processed) in [1, 0].into_iter().enumerate() {
             let mut tx = pool.begin().await.expect("begin batch");
             let (_, processed, _) = backfill_batch(&mut tx, "").await.expect("backfill row");
             tx.commit().await.expect("commit batch");
-            assert_eq!(processed, 1);
+            assert_eq!(processed, expected_processed, "re-entry pass {index}");
         }
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM content_legacy_observations")
@@ -923,6 +940,185 @@ mod tests {
                 .await
                 .expect("count observations"),
             3
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_reobserves_rowid_reused_after_delete() {
+        let pool = pool().await;
+        for id in ["first", "second"] {
+            sqlx::query(
+                "INSERT INTO translation_work_items (id, kind, entity_id, source_hash, status) VALUES (?, 'release_summary', ?, 'hash', 'completed')",
+            )
+            .bind(id)
+            .bind(format!("release-{id}"))
+            .execute(&pool)
+            .await
+            .expect("insert fixture row");
+        }
+
+        let mut tx = pool.begin().await.expect("begin first batch");
+        let (cursor, processed, _) = backfill_batch(&mut tx, "")
+            .await
+            .expect("backfill initial rows");
+        tx.commit().await.expect("commit initial batch");
+        assert_eq!(processed, 2);
+        assert_eq!(cursor, "translation_work_items|2");
+
+        sqlx::query("DELETE FROM translation_work_items WHERE id = 'second'")
+            .execute(&pool)
+            .await
+            .expect("delete highest rowid");
+        sqlx::query(
+            "INSERT INTO translation_work_items (id, kind, entity_id, source_hash, status) VALUES ('reused', 'release_summary', 'release-reused', 'hash', 'completed')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert row with reused rowid");
+
+        let mut tx = pool.begin().await.expect("begin resumed batch");
+        let (next_cursor, processed, complete) = backfill_batch(&mut tx, &cursor)
+            .await
+            .expect("backfill reused rowid");
+        tx.commit().await.expect("commit resumed batch");
+        assert_eq!(processed, 1);
+        assert!(!complete);
+        assert_eq!(next_cursor, "translation_work_items|2");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_legacy_observations WHERE legacy_table = 'translation_work_items'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count work observations"),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_classifies_legacy_evidence_without_promoting_it() {
+        let pool = pool().await;
+        sqlx::query(
+            "INSERT INTO translation_work_items (id, kind, entity_id, source_hash, status) VALUES ('failed-work', 'release_summary', 'release-failed', 'work-hash', 'failed')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert failed legacy work");
+        sqlx::query(
+            "INSERT INTO ai_translations (id, entity_type, entity_id, source_hash, status, title, summary) VALUES ('ready-cache', 'release', 'release-ready', 'cache-hash', 'ready', 'Cached title', NULL), ('incomplete-cache', 'release', 'release-incomplete', 'incomplete-hash', 'queued', NULL, NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert legacy cache evidence");
+
+        let mut tx = pool.begin().await.expect("begin work observation");
+        let (_, processed, _) = backfill_batch(&mut tx, "")
+            .await
+            .expect("observe legacy work");
+        tx.commit().await.expect("commit work observation");
+        assert_eq!(processed, 1);
+
+        let mut tx = pool.begin().await.expect("begin cache observation");
+        let (_, processed, _) = backfill_batch(&mut tx, "ai_translations|")
+            .await
+            .expect("observe legacy caches");
+        tx.commit().await.expect("commit cache observation");
+        assert_eq!(processed, 2);
+
+        let rows = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT legacy_table, legacy_primary_key, classification FROM content_legacy_observations ORDER BY legacy_table, legacy_primary_key",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("load classifications");
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "ai_translations".to_owned(),
+                    "incomplete-cache".to_owned(),
+                    "legacy_conflict".to_owned(),
+                ),
+                (
+                    "ai_translations".to_owned(),
+                    "ready-cache".to_owned(),
+                    "legacy_cached".to_owned(),
+                ),
+                (
+                    "translation_work_items".to_owned(),
+                    "failed-work".to_owned(),
+                    "legacy_conflict".to_owned(),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_does_not_reclaim_expired_lease_with_live_owner() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        sqlx::query(
+            "CREATE TABLE runtime_owners (runtime_owner_id TEXT PRIMARY KEY, lease_heartbeat_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create runtime owners");
+        sqlx::query(
+            "INSERT INTO runtime_owners (runtime_owner_id, lease_heartbeat_at, created_at, updated_at) VALUES ('owner-b', datetime('now'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert live owner");
+        for statement in BOOTSTRAP_DDL {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("create migration control table");
+        }
+        sqlx::query(
+            "INSERT INTO online_migration_leases (lease_name, owner_id, lease_expires_at, updated_at) VALUES (?, 'owner-b', datetime('now', '-1 second'), CURRENT_TIMESTAMP)",
+        )
+        .bind(LEASE_NAME)
+        .execute(&pool)
+        .await
+        .expect("insert expired lease");
+
+        let state = test_state(pool.clone(), "owner-a");
+        assert!(!ensure_bootstrap(&state).await.expect("bootstrap lease"));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT owner_id FROM online_migration_leases WHERE lease_name = ?",
+            )
+            .bind(LEASE_NAME)
+            .fetch_one(&pool)
+            .await
+            .expect("read protected lease"),
+            "owner-b"
+        );
+
+        sqlx::query(
+            "UPDATE runtime_owners SET lease_heartbeat_at = datetime('now', '-91 seconds') WHERE runtime_owner_id = 'owner-b'",
+        )
+        .execute(&pool)
+        .await
+        .expect("stale the old owner");
+        assert!(
+            ensure_bootstrap(&state)
+                .await
+                .expect("take over stale lease")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT owner_id FROM online_migration_leases WHERE lease_name = ?",
+            )
+            .bind(LEASE_NAME)
+            .fetch_one(&pool)
+            .await
+            .expect("read taken lease"),
+            "owner-a"
         );
     }
 
