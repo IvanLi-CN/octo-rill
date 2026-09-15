@@ -23,7 +23,7 @@
 | `content_request_links` | API adapter | requester/system producer, authorization snapshot, request source, delivery mode, global work item and returned response fact |
 | `content_attempt_events` | scheduler | append-only attempt number, trigger, state transition, safe error, retry disposition and timing |
 | `content_attempt_llm_calls` | scheduler | exact attempt-to-call relation, call identifier and safe metrics |
-| `content_legacy_observations` | migration/read model | old table, old primary key, canonical resource facts where known, classification and immutable observation basis |
+| `content_legacy_observations` | migration/read model | old table, old primary key, source-hash incarnation, canonical resource facts where known, classification and immutable observation basis |
 | `online_migration_leases` | online migration operator | named lease owner, expiry and update time |
 | `online_migration_runs` | online migration operator | immutable migration definition checksum, lifecycle, pause request, owner heartbeat and redacted failure |
 | `online_migration_operations` | online migration operator | immutable operation definition checksum, ordered DDL/DML/backfill kind, cursor, row progress, pause and owner facts |
@@ -48,7 +48,7 @@ projections; those writes remain worker-owned.
 ## Legacy Boundary
 
 - No migration modifies `translation_work_items`, `translation_requests`, their attempts or `ai_translations`.
-- `content_legacy_observations` can identify legacy evidence but cannot be used as a foreign-key source for a global result or work state.
+- `content_legacy_observations` can identify legacy evidence but cannot be used as a foreign-key source for a global result or work state. Its durable identity is `(legacy_table, legacy_primary_key, legacy_source_hash)`, so deleting and recreating a legacy row with changed source content preserves both observations.
 - `legacy_cached` means a displayable old cache lacks matching work evidence. `legacy_conflict` means old evidence cannot be safely reconciled. Neither classification creates an attempt count or current status.
 
 ## Polishing Migration Mapping

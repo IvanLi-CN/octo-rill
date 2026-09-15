@@ -13,29 +13,47 @@ use tracing::warn;
 
 use crate::{api, local_id, sqlite_write::SqliteWritePriority, state::AppState};
 
-const MIGRATION_ID: &str = "content-processing-online-v1";
-const MIGRATION_CHECKSUM: &str = "d7bf80e8389baa89db826966758ef410a960853bbae98605c0137504469a6846";
+const MIGRATION_ID: &str = "content-processing-online-v2";
+const MIGRATION_CHECKSUM: &str = "cfe818b1c2b5d9259fb75292565f884bf1dcfa6c942e89b5f0f56318756365a5";
 const OP_BATCH_SIZE: i64 = 100;
 const LEASE_NAME: &str = "online-migration-operator";
+
+const SUPERSEDED_MIGRATION_ID: &str = "content-processing-online-v1";
+const SUPERSEDED_MIGRATION_CHECKSUM: &str =
+    "d7bf80e8389baa89db826966758ef410a960853bbae98605c0137504469a6846";
+const SUPERSEDED_OPERATION_DEFINITIONS: &[(&str, &str)] = &[
+    (
+        "ddl-001",
+        "65d459e9ec29e136329dc8bb8a2bbd7bf87280999ce7d6ae2ecef3118cad0d36",
+    ),
+    (
+        "dml-001",
+        "bd49f0b3c9584c116821cb8a70473424b5035cc2a912c393b349869bf76d6b13",
+    ),
+    (
+        "backfill-001",
+        "abfd0ba152798ac3ba49736a257e0c34f4ca5a576691abbf4e3e199f4d49a4e3",
+    ),
+];
 
 const OPERATION_DEFINITIONS: &[(&str, &str, i64, &str)] = &[
     (
         "ddl-001",
         "ddl",
         1,
-        "65d459e9ec29e136329dc8bb8a2bbd7bf87280999ce7d6ae2ecef3118cad0d36",
+        "f7b45687294d5ab6f3a56c4d9912ee1c53dc4b87a6b9ecd8082d9fc1f9362efb",
     ),
     (
         "dml-001",
         "dml",
         2,
-        "bd49f0b3c9584c116821cb8a70473424b5035cc2a912c393b349869bf76d6b13",
+        "3da06836e70dc23fcab713f671032815c90a08ddf99867805763a42519c4ebb5",
     ),
     (
         "backfill-001",
         "backfill",
         3,
-        "abfd0ba152798ac3ba49736a257e0c34f4ca5a576691abbf4e3e199f4d49a4e3",
+        "c83d2911124381439418c871a2441ad8ea1c7ba3b6eefc7965fc1c6ad346ccdf",
     ),
 ];
 
@@ -175,6 +193,7 @@ async fn run_once(state: &AppState) -> Result<()> {
     };
     match operation.operation_kind.as_str() {
         "ddl" => {
+            ensure_legacy_observation_identity_schema(&mut tx).await?;
             update_operation(
                 &mut tx,
                 &state.runtime_owner_id,
@@ -228,6 +247,63 @@ async fn run_once(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+async fn ensure_legacy_observation_identity_schema(tx: &mut Transaction<'_, Sqlite>) -> Result<()> {
+    let table_exists = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'content_legacy_observations'",
+    )
+    .fetch_one(&mut **tx)
+    .await?
+        != 0;
+    if !table_exists {
+        sqlx::query(
+            "CREATE TABLE content_legacy_observations (id TEXT PRIMARY KEY, legacy_table TEXT NOT NULL, legacy_primary_key TEXT NOT NULL, legacy_source_hash TEXT NOT NULL, canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT CHECK (pipeline IS NULL OR pipeline IN ('translation', 'polishing')), classification TEXT NOT NULL CHECK (classification IN ('legacy_cached', 'legacy_conflict')), observation_basis_json TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE (legacy_table, legacy_primary_key, legacy_source_hash))",
+        )
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX idx_content_legacy_observations_resource ON content_legacy_observations(canonical_resource_type, canonical_resource_id, pipeline)",
+        )
+        .execute(&mut **tx)
+        .await?;
+        return Ok(());
+    }
+
+    let columns = sqlx::query("PRAGMA table_info(content_legacy_observations)")
+        .fetch_all(&mut **tx)
+        .await?;
+    if columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "legacy_source_hash")
+    {
+        return Ok(());
+    }
+
+    sqlx::query(
+        "CREATE TABLE content_legacy_observations_repair (id TEXT PRIMARY KEY, legacy_table TEXT NOT NULL, legacy_primary_key TEXT NOT NULL, legacy_source_hash TEXT NOT NULL, canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT CHECK (pipeline IS NULL OR pipeline IN ('translation', 'polishing')), classification TEXT NOT NULL CHECK (classification IN ('legacy_cached', 'legacy_conflict')), observation_basis_json TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE (legacy_table, legacy_primary_key, legacy_source_hash))",
+    )
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO content_legacy_observations_repair (id, legacy_table, legacy_primary_key, legacy_source_hash, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT id, legacy_table, legacy_primary_key, COALESCE(json_extract(observation_basis_json, '$.source_hash'), ''), canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at FROM content_legacy_observations",
+    )
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DROP TABLE content_legacy_observations")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "ALTER TABLE content_legacy_observations_repair RENAME TO content_legacy_observations",
+    )
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX idx_content_legacy_observations_resource ON content_legacy_observations(canonical_resource_type, canonical_resource_id, pipeline)",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn ensure_bootstrap(state: &AppState) -> Result<bool> {
     let (_permit, mut tx) = state
         .sqlite_writer
@@ -240,6 +316,7 @@ async fn ensure_bootstrap(state: &AppState) -> Result<bool> {
     for statement in BOOTSTRAP_DDL {
         sqlx::query(statement).execute(&mut *tx).await?;
     }
+    validate_superseded_migration_identity(&mut tx).await?;
     let now = chrono::Utc::now().to_rfc3339();
     let expires = (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
     sqlx::query(
@@ -307,6 +384,37 @@ async fn ensure_bootstrap(state: &AppState) -> Result<bool> {
     }
     tx.commit().await?;
     Ok(true)
+}
+
+async fn validate_superseded_migration_identity(tx: &mut Transaction<'_, Sqlite>) -> Result<()> {
+    let existing_checksum = sqlx::query_scalar::<_, String>(
+        "SELECT definition_checksum FROM online_migration_runs WHERE migration_id = ?",
+    )
+    .bind(SUPERSEDED_MIGRATION_ID)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(existing_checksum) = existing_checksum
+        && existing_checksum != SUPERSEDED_MIGRATION_CHECKSUM
+    {
+        anyhow::bail!("superseded online migration definition checksum mismatch");
+    }
+    for (operation_id, checksum) in SUPERSEDED_OPERATION_DEFINITIONS {
+        let existing_checksum = sqlx::query_scalar::<_, String>(
+            "SELECT definition_checksum FROM online_migration_operations WHERE migration_id = ? AND operation_id = ?",
+        )
+        .bind(SUPERSEDED_MIGRATION_ID)
+        .bind(operation_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(existing_checksum) = existing_checksum
+            && existing_checksum != *checksum
+        {
+            anyhow::bail!(
+                "superseded online migration operation definition checksum mismatch: {operation_id}"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn redact_error_summary(error: &str) -> String {
@@ -482,7 +590,7 @@ async fn backfill_batch(
     }
 
     if phase == "translation_work_items" {
-        let rows = sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.kind, legacy.entity_id, legacy.source_hash, legacy.status FROM translation_work_items AS legacy WHERE NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'translation_work_items' AND observation.legacy_primary_key = legacy.id) ORDER BY legacy.rowid LIMIT ?")
+        let rows = sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.kind, legacy.entity_id, legacy.source_hash, legacy.status FROM translation_work_items AS legacy WHERE NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'translation_work_items' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
             .bind(OP_BATCH_SIZE)
             .fetch_all(&mut **tx)
             .await?;
@@ -517,7 +625,7 @@ async fn backfill_batch(
         ));
     }
 
-    let rows = sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.entity_type, legacy.entity_id, legacy.source_hash, legacy.status, legacy.title, legacy.summary FROM ai_translations AS legacy WHERE NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'ai_translations' AND observation.legacy_primary_key = legacy.id) ORDER BY legacy.rowid LIMIT ?")
+    let rows = sqlx::query("SELECT legacy.rowid AS migration_rowid, legacy.id, legacy.entity_type, legacy.entity_id, legacy.source_hash, legacy.status, legacy.title, legacy.summary FROM ai_translations AS legacy WHERE NOT EXISTS (SELECT 1 FROM content_legacy_observations observation WHERE observation.legacy_table = 'ai_translations' AND observation.legacy_primary_key = legacy.id AND observation.legacy_source_hash = legacy.source_hash) ORDER BY legacy.rowid LIMIT ?")
         .bind(OP_BATCH_SIZE)
         .fetch_all(&mut **tx)
         .await?;
@@ -581,10 +689,11 @@ async fn insert_observation(
         "legacy_conflict"
     };
     let basis = json!({"kind": kind, "source_hash": source_hash, "status": status, "classification": classification}).to_string();
-    sqlx::query("INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)")
+    sqlx::query("INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, legacy_source_hash, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)")
         .bind(local_id::generate_local_id().to_string())
         .bind(table)
         .bind(id)
+        .bind(source_hash)
         .bind(resource_type)
         .bind(entity_id)
         .bind(pipeline)
@@ -777,7 +886,7 @@ mod tests {
             .await
             .expect("connect sqlite");
         sqlx::raw_sql(
-            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, kind TEXT NOT NULL, entity_id TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL); CREATE TABLE ai_translations (id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL, title TEXT, summary TEXT); CREATE TABLE content_legacy_observations (id TEXT PRIMARY KEY, legacy_table TEXT NOT NULL, legacy_primary_key TEXT NOT NULL, canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, classification TEXT NOT NULL, observation_basis_json TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(legacy_table, legacy_primary_key));",
+            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, kind TEXT NOT NULL, entity_id TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL); CREATE TABLE ai_translations (id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, source_hash TEXT NOT NULL, status TEXT NOT NULL, title TEXT, summary TEXT); CREATE TABLE content_legacy_observations (id TEXT PRIMARY KEY, legacy_table TEXT NOT NULL, legacy_primary_key TEXT NOT NULL, legacy_source_hash TEXT NOT NULL, canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, classification TEXT NOT NULL, observation_basis_json TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(legacy_table, legacy_primary_key, legacy_source_hash));",
         )
         .execute(&pool)
         .await
@@ -944,7 +1053,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backfill_reobserves_rowid_reused_after_delete() {
+    async fn backfill_reobserves_reused_primary_key_after_delete() {
         let pool = pool().await;
         for id in ["first", "second"] {
             sqlx::query(
@@ -970,7 +1079,7 @@ mod tests {
             .await
             .expect("delete highest rowid");
         sqlx::query(
-            "INSERT INTO translation_work_items (id, kind, entity_id, source_hash, status) VALUES ('reused', 'release_summary', 'release-reused', 'hash', 'completed')",
+            "INSERT INTO translation_work_items (id, kind, entity_id, source_hash, status) VALUES ('second', 'release_summary', 'release-reused', 'hash-new', 'completed')",
         )
         .execute(&pool)
         .await
@@ -1119,6 +1228,96 @@ mod tests {
             .await
             .expect("read taken lease"),
             "owner-a"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_mutated_superseded_migration_identity() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        sqlx::query(
+            "CREATE TABLE runtime_owners (runtime_owner_id TEXT PRIMARY KEY, lease_heartbeat_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create runtime owners");
+        for statement in BOOTSTRAP_DDL {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("create migration control table");
+        }
+        sqlx::query(
+            "INSERT INTO online_migration_runs (migration_id, definition_checksum, status, created_at, updated_at) VALUES (?, 'mutated', 'failed', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(SUPERSEDED_MIGRATION_ID)
+        .execute(&pool)
+        .await
+        .expect("insert mutated historical run");
+
+        let state = test_state(pool, "owner-a");
+        let error = ensure_bootstrap(&state)
+            .await
+            .expect_err("mutated historical identity must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("superseded online migration definition checksum mismatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn ddl_rebuilds_observation_identity_without_losing_history() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        sqlx::query(
+            "CREATE TABLE content_legacy_observations (id TEXT PRIMARY KEY, legacy_table TEXT NOT NULL, legacy_primary_key TEXT NOT NULL, canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, classification TEXT NOT NULL, observation_basis_json TEXT NOT NULL, observed_at TEXT NOT NULL, UNIQUE(legacy_table, legacy_primary_key))",
+        )
+        .execute(&pool)
+        .await
+        .expect("create historical observation table");
+        sqlx::query(
+            "INSERT INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) VALUES ('observation-1', 'translation_work_items', 'work-1', 'release', 'release-1', 'translation', 'legacy_conflict', '{\"source_hash\":\"hash-1\"}', CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed historical observation");
+
+        let mut tx = pool.begin().await.expect("begin schema repair");
+        ensure_legacy_observation_identity_schema(&mut tx)
+            .await
+            .expect("repair observation identity");
+        tx.commit().await.expect("commit schema repair");
+
+        sqlx::query(
+            "INSERT INTO content_legacy_observations (id, legacy_table, legacy_primary_key, legacy_source_hash, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) VALUES ('observation-2', 'translation_work_items', 'work-1', 'hash-2', 'release', 'release-1', 'translation', 'legacy_conflict', '{\"source_hash\":\"hash-2\"}', CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert reused primary key incarnation");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_legacy_observations WHERE legacy_primary_key = 'work-1'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count preserved incarnations"),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT legacy_source_hash FROM content_legacy_observations WHERE id = 'observation-1'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read preserved source hash"),
+            "hash-1"
         );
     }
 

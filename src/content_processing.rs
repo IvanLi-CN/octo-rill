@@ -15,7 +15,10 @@ use sqlx::{Error as SqlxError, Row, Sqlite, SqlitePool, Transaction};
 use tokio::{task::JoinSet, time::sleep};
 use tracing::warn;
 
-use crate::{ai, api, error::ApiError, local_id, state::AppState, translations};
+use crate::{
+    ai, api, error::ApiError, local_id, sqlite_write::SqliteWritePriority, state::AppState,
+    translations,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentProcessingMode {
@@ -439,7 +442,11 @@ pub async fn submit_item(
     let work_id = local_id::generate_local_id().to_string();
     let (_lock, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "content_processing_submit")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "content_processing_submit",
+            SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     ensure_global_mode_in_transaction(&mut tx).await?;
@@ -970,7 +977,11 @@ pub async fn retry_request(
     let breaker_open = provider_breaker_open(state).await;
     let (_lock, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "content_processing_retry")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "content_processing_retry",
+            SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     ensure_global_mode_in_transaction(&mut tx).await?;
