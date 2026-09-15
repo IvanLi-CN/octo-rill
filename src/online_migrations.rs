@@ -107,9 +107,10 @@ async fn mark_failed(state: &AppState, error: &str) -> Result<()> {
     let safe_error = redact_error_summary(error);
     let now = chrono::Utc::now().to_rfc3339();
     let owns_lease = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM online_migration_leases WHERE lease_name = ? AND owner_id = ? AND datetime(lease_expires_at) > datetime('now')",
+        "SELECT COUNT(*) FROM online_migration_leases WHERE lease_name = ? AND owner_id = ? AND datetime(lease_expires_at) > datetime('now') AND EXISTS (SELECT 1 FROM runtime_owners WHERE runtime_owner_id = ? AND datetime(lease_heartbeat_at) > datetime('now', '-90 seconds'))",
     )
     .bind(LEASE_NAME)
+    .bind(&state.runtime_owner_id)
     .bind(&state.runtime_owner_id)
     .fetch_one(&mut *tx)
     .await?
@@ -118,22 +119,24 @@ async fn mark_failed(state: &AppState, error: &str) -> Result<()> {
         tx.rollback().await.ok();
         return Ok(());
     }
-    sqlx::query("UPDATE online_migration_runs SET status = 'failed', last_error = ?, updated_at = ? WHERE migration_id = ? AND status != 'completed' AND EXISTS (SELECT 1 FROM online_migration_leases WHERE lease_name = ? AND owner_id = ? AND datetime(lease_expires_at) > datetime('now'))")
+    sqlx::query("UPDATE online_migration_runs SET status = 'failed', last_error = ?, updated_at = ? WHERE migration_id = ? AND status != 'completed' AND EXISTS (SELECT 1 FROM online_migration_leases WHERE lease_name = ? AND owner_id = ? AND datetime(lease_expires_at) > datetime('now')) AND EXISTS (SELECT 1 FROM runtime_owners WHERE runtime_owner_id = ? AND datetime(lease_heartbeat_at) > datetime('now', '-90 seconds'))")
         .bind(&safe_error)
         .bind(&now)
         .bind(MIGRATION_ID)
         .bind(LEASE_NAME)
         .bind(&state.runtime_owner_id)
+        .bind(&state.runtime_owner_id)
         .execute(&mut *tx)
         .await?;
     sqlx::query(
-        "UPDATE online_migration_operations SET status = 'failed', last_error = ?, updated_at = ? WHERE migration_id = ? AND operation_id = (SELECT operation_id FROM online_migration_operations WHERE migration_id = ? AND status != 'completed' ORDER BY operation_order LIMIT 1) AND EXISTS (SELECT 1 FROM online_migration_leases WHERE lease_name = ? AND owner_id = ? AND datetime(lease_expires_at) > datetime('now'))",
+        "UPDATE online_migration_operations SET status = 'failed', last_error = ?, updated_at = ? WHERE migration_id = ? AND operation_id = (SELECT operation_id FROM online_migration_operations WHERE migration_id = ? AND status != 'completed' ORDER BY operation_order LIMIT 1) AND EXISTS (SELECT 1 FROM online_migration_leases WHERE lease_name = ? AND owner_id = ? AND datetime(lease_expires_at) > datetime('now')) AND EXISTS (SELECT 1 FROM runtime_owners WHERE runtime_owner_id = ? AND datetime(lease_heartbeat_at) > datetime('now', '-90 seconds'))",
     )
     .bind(&safe_error)
     .bind(&now)
     .bind(MIGRATION_ID)
     .bind(MIGRATION_ID)
     .bind(LEASE_NAME)
+    .bind(&state.runtime_owner_id)
     .bind(&state.runtime_owner_id)
     .execute(&mut *tx)
     .await?;
@@ -488,10 +491,11 @@ async fn load_next_operation(state: &AppState) -> Result<Option<Operation>> {
 async fn renew_lease(tx: &mut Transaction<'_, Sqlite>, state: &AppState) -> Result<bool> {
     let now = chrono::Utc::now().to_rfc3339();
     let expires = (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
-    Ok(sqlx::query("UPDATE online_migration_leases SET lease_expires_at = ?, updated_at = ? WHERE lease_name = ? AND owner_id = ?")
+    Ok(sqlx::query("UPDATE online_migration_leases SET lease_expires_at = ?, updated_at = ? WHERE lease_name = ? AND owner_id = ? AND EXISTS (SELECT 1 FROM runtime_owners WHERE runtime_owner_id = ? AND datetime(lease_heartbeat_at) > datetime('now', '-90 seconds'))")
         .bind(&expires)
         .bind(&now)
         .bind(LEASE_NAME)
+        .bind(&state.runtime_owner_id)
         .bind(&state.runtime_owner_id)
         .execute(&mut **tx)
         .await?
@@ -1346,6 +1350,18 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .expect("connect sqlite");
+        sqlx::query(
+            "CREATE TABLE runtime_owners (runtime_owner_id TEXT PRIMARY KEY, lease_heartbeat_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create runtime owners");
+        sqlx::query(
+            "INSERT INTO runtime_owners (runtime_owner_id, lease_heartbeat_at, created_at, updated_at) VALUES ('owner-a', datetime('now'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert current runtime owner");
         for statement in BOOTSTRAP_DDL {
             sqlx::query(statement)
                 .execute(&pool)
@@ -1391,6 +1407,96 @@ mod tests {
         .await
         .expect("read operation status");
         assert_eq!(operation_status, "running");
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_owner_cannot_renew_or_mark_active_migration_failed() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        sqlx::query(
+            "CREATE TABLE runtime_owners (runtime_owner_id TEXT PRIMARY KEY, lease_heartbeat_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create runtime owners");
+        sqlx::query(
+            "INSERT INTO runtime_owners (runtime_owner_id, lease_heartbeat_at, created_at, updated_at) VALUES ('owner-a', datetime('now', '-91 seconds'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert stale runtime owner");
+        for statement in BOOTSTRAP_DDL {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("create migration control table");
+        }
+        sqlx::query("INSERT INTO online_migration_runs (migration_id, definition_checksum, status, created_at, updated_at) VALUES (?, ?, 'running', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+            .bind(MIGRATION_ID)
+            .bind(MIGRATION_CHECKSUM)
+            .execute(&pool)
+            .await
+            .expect("insert migration run");
+        sqlx::query("INSERT INTO online_migration_operations (migration_id, operation_id, definition_checksum, operation_kind, operation_order, status, updated_at) VALUES (?, 'ddl-001', ?, 'ddl', 1, 'running', CURRENT_TIMESTAMP)")
+            .bind(MIGRATION_ID)
+            .bind(OPERATION_DEFINITIONS[0].3)
+            .execute(&pool)
+            .await
+            .expect("insert migration operation");
+        sqlx::query("INSERT INTO online_migration_leases (lease_name, owner_id, lease_expires_at, updated_at) VALUES (?, 'owner-a', datetime('now', '+30 seconds'), CURRENT_TIMESTAMP)")
+            .bind(LEASE_NAME)
+            .execute(&pool)
+            .await
+            .expect("insert active lease");
+
+        let state = test_state(pool.clone(), "owner-a");
+        let previous_expiry = sqlx::query_scalar::<_, String>(
+            "SELECT lease_expires_at FROM online_migration_leases WHERE lease_name = ?",
+        )
+        .bind(LEASE_NAME)
+        .fetch_one(&pool)
+        .await
+        .expect("read original lease expiry");
+        let mut tx = pool.begin().await.expect("begin stale renewal");
+        assert!(!renew_lease(&mut tx, &state).await.expect("renew lease"));
+        tx.rollback().await.expect("rollback stale renewal");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT lease_expires_at FROM online_migration_leases WHERE lease_name = ?",
+            )
+            .bind(LEASE_NAME)
+            .fetch_one(&pool)
+            .await
+            .expect("read unchanged lease expiry"),
+            previous_expiry
+        );
+
+        mark_failed(&state, "stale runtime owner error")
+            .await
+            .expect("ignore stale owner failure");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM online_migration_runs WHERE migration_id = ?",
+            )
+            .bind(MIGRATION_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read run status"),
+            "running"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM online_migration_operations WHERE migration_id = ? AND operation_id = 'ddl-001'",
+            )
+            .bind(MIGRATION_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read operation status"),
+            "running"
+        );
     }
 
     async fn issue_admin_session(session: Session) -> StatusCode {
