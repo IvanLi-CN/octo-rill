@@ -88,19 +88,35 @@ async fn mark_failed(state: &AppState, error: &str) -> Result<()> {
         .await?;
     let safe_error = redact_error_summary(error);
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query("UPDATE online_migration_runs SET status = 'failed', last_error = ?, updated_at = ? WHERE migration_id = ? AND status != 'completed'")
+    let owns_lease = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM online_migration_leases WHERE lease_name = ? AND owner_id = ? AND datetime(lease_expires_at) > datetime('now')",
+    )
+    .bind(LEASE_NAME)
+    .bind(&state.runtime_owner_id)
+    .fetch_one(&mut *tx)
+    .await?
+        > 0;
+    if !owns_lease {
+        tx.rollback().await.ok();
+        return Ok(());
+    }
+    sqlx::query("UPDATE online_migration_runs SET status = 'failed', last_error = ?, updated_at = ? WHERE migration_id = ? AND status != 'completed' AND EXISTS (SELECT 1 FROM online_migration_leases WHERE lease_name = ? AND owner_id = ? AND datetime(lease_expires_at) > datetime('now'))")
         .bind(&safe_error)
         .bind(&now)
         .bind(MIGRATION_ID)
+        .bind(LEASE_NAME)
+        .bind(&state.runtime_owner_id)
         .execute(&mut *tx)
         .await?;
     sqlx::query(
-        "UPDATE online_migration_operations SET status = 'failed', last_error = ?, updated_at = ? WHERE migration_id = ? AND operation_id = (SELECT operation_id FROM online_migration_operations WHERE migration_id = ? AND status != 'completed' ORDER BY operation_order LIMIT 1)",
+        "UPDATE online_migration_operations SET status = 'failed', last_error = ?, updated_at = ? WHERE migration_id = ? AND operation_id = (SELECT operation_id FROM online_migration_operations WHERE migration_id = ? AND status != 'completed' ORDER BY operation_order LIMIT 1) AND EXISTS (SELECT 1 FROM online_migration_leases WHERE lease_name = ? AND owner_id = ? AND datetime(lease_expires_at) > datetime('now'))",
     )
     .bind(&safe_error)
     .bind(&now)
     .bind(MIGRATION_ID)
     .bind(MIGRATION_ID)
+    .bind(LEASE_NAME)
+    .bind(&state.runtime_owner_id)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -333,7 +349,13 @@ fn redact_error_summary(error: &str) -> String {
             break;
         }
     }
-    redacted.truncate(500);
+    if redacted.len() > 500 {
+        let mut end = 500;
+        while !redacted.is_char_boundary(end) {
+            end -= 1;
+        }
+        redacted.truncate(end);
+    }
     redacted
 }
 
@@ -437,9 +459,13 @@ async fn backfill_batch(
     tx: &mut Transaction<'_, Sqlite>,
     cursor: &str,
 ) -> Result<(String, i64, bool)> {
-    let (phase, last_id) = cursor
+    let (phase, last_rowid) = cursor
         .split_once('|')
         .unwrap_or(("translation_work_items", ""));
+    // Legacy primary keys are nanoid/text values and do not provide a stable
+    // ordering. Use SQLite's insertion rowid as the durable cursor so rows
+    // created while the backfill is running cannot sort behind an ID cursor.
+    let last_rowid = last_rowid.parse::<i64>().unwrap_or(0);
     let table_exists = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
     )
@@ -455,16 +481,17 @@ async fn backfill_batch(
     }
 
     if phase == "translation_work_items" {
-        let rows = sqlx::query("SELECT id, kind, entity_id, source_hash, status FROM translation_work_items WHERE id > ? ORDER BY id LIMIT ?")
-            .bind(last_id)
+        let rows = sqlx::query("SELECT rowid AS migration_rowid, id, kind, entity_id, source_hash, status FROM translation_work_items WHERE rowid > ? ORDER BY rowid LIMIT ?")
+            .bind(last_rowid)
             .bind(OP_BATCH_SIZE)
             .fetch_all(&mut **tx)
             .await?;
         if rows.is_empty() {
             return Ok(("ai_translations|".to_owned(), 0, false));
         }
-        let mut next = last_id.to_owned();
+        let mut next = last_rowid;
         for row in &rows {
+            let rowid: i64 = row.get("migration_rowid");
             let id: String = row.get("id");
             let kind: String = row.get("kind");
             let entity_id: String = row.get("entity_id");
@@ -480,7 +507,7 @@ async fn backfill_batch(
                 &status,
             )
             .await?;
-            next = id;
+            next = rowid;
         }
         return Ok((
             format!("translation_work_items|{next}"),
@@ -489,16 +516,17 @@ async fn backfill_batch(
         ));
     }
 
-    let rows = sqlx::query("SELECT id, entity_type, entity_id, source_hash FROM ai_translations WHERE id > ? ORDER BY id LIMIT ?")
-        .bind(last_id)
+    let rows = sqlx::query("SELECT rowid AS migration_rowid, id, entity_type, entity_id, source_hash FROM ai_translations WHERE rowid > ? ORDER BY rowid LIMIT ?")
+        .bind(last_rowid)
         .bind(OP_BATCH_SIZE)
         .fetch_all(&mut **tx)
         .await?;
     if rows.is_empty() {
         return Ok((cursor.to_owned(), 0, true));
     }
-    let mut next = last_id.to_owned();
+    let mut next = last_rowid;
     for row in &rows {
+        let rowid: i64 = row.get("migration_rowid");
         let id: String = row.get("id");
         let kind: String = row.get("entity_type");
         let entity_id: String = row.get("entity_id");
@@ -513,7 +541,7 @@ async fn backfill_batch(
             "cached",
         )
         .await?;
-        next = id;
+        next = rowid;
     }
     Ok((format!("ai_translations|{next}"), rows.len() as i64, false))
 }
@@ -584,7 +612,7 @@ pub async fn admin_list(
                 "pause_requested": row.get::<i64, _>("pause_requested") != 0,
                 "owner_id": row.get::<Option<String>, _>("owner_id"),
                 "lease_heartbeat_at": row.get::<Option<String>, _>("lease_heartbeat_at"),
-                "last_error": row.get::<Option<String>, _>("last_error"),
+                "last_error": row.get::<Option<String>, _>("last_error").map(|error| redact_error_summary(&error)),
                 "started_at": row.get::<Option<String>, _>("started_at"),
                 "completed_at": row.get::<Option<String>, _>("completed_at"),
                 "created_at": row.get::<String, _>("created_at"),
@@ -603,7 +631,7 @@ pub async fn admin_list(
                 "status": row.get::<String, _>("status"),
                 "cursor": row.get::<String, _>("cursor"),
                 "rows_processed": row.get::<i64, _>("rows_processed"),
-                "last_error": row.get::<Option<String>, _>("last_error"),
+                "last_error": row.get::<Option<String>, _>("last_error").map(|error| redact_error_summary(&error)),
                 "owner_id": row.get::<Option<String>, _>("owner_id"),
                 "lease_heartbeat_at": row.get::<Option<String>, _>("lease_heartbeat_at"),
                 "started_at": row.get::<Option<String>, _>("started_at"),
@@ -643,6 +671,9 @@ pub async fn admin_pause(
             "migration not found",
         ));
     }
+    ensure_bootstrap(state.as_ref())
+        .await
+        .map_err(crate::error::ApiError::internal)?;
     let (_permit, mut tx) = state
         .sqlite_writer
         .begin_immediate_with_priority(
@@ -676,6 +707,9 @@ pub async fn admin_resume(
             "migration not found",
         ));
     }
+    ensure_bootstrap(state.as_ref())
+        .await
+        .map_err(crate::error::ApiError::internal)?;
     let (_permit, mut tx) = state
         .sqlite_writer
         .begin_immediate_with_priority(
@@ -698,8 +732,26 @@ pub async fn admin_resume(
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
     use super::*;
+    use crate::ai::LlmScheduler;
+    use crate::config::AppConfig;
+    use crate::crypto::EncryptionKey;
+    use crate::observability::LoggingThresholds;
+    use crate::state::{build_oauth_client, build_webauthn};
+    use crate::translations::{TranslationRuntimeConfig, TranslationSchedulerController};
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode, header},
+        routing::{get, post},
+    };
     use sqlx::sqlite::SqlitePoolOptions;
+    use tower::ServiceExt;
+    use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
+    use url::Url;
 
     async fn pool() -> sqlx::SqlitePool {
         let pool = SqlitePoolOptions::new()
@@ -714,6 +766,57 @@ mod tests {
         .await
         .expect("create migration fixture");
         pool
+    }
+
+    fn test_state(pool: sqlx::SqlitePool, runtime_owner_id: &str) -> Arc<AppState> {
+        let encryption_key =
+            EncryptionKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .expect("build encryption key");
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:58090"
+                .parse::<SocketAddr>()
+                .expect("parse bind addr"),
+            public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public url"),
+            database_url: "sqlite::memory:".to_owned(),
+            sqlite_pool_max_connections: 1,
+            static_dir: None,
+            task_log_dir: std::env::temp_dir().join("octo-rill-online-migration-tests"),
+            job_worker_concurrency: 1,
+            encryption_key: encryption_key.clone(),
+            github: crate::config::GitHubOAuthConfig {
+                client_id: "test-client-id".to_owned(),
+                client_secret: "test-client-secret".to_owned(),
+                redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback")
+                    .expect("parse redirect url"),
+            },
+            linuxdo: None,
+            ai: None,
+            ai_max_concurrency: 1,
+            ai_daily_at_local: None,
+            app_default_time_zone: "UTC".to_owned(),
+            logging: LoggingThresholds::default(),
+        };
+        Arc::new(AppState {
+            config: config.clone(),
+            pool,
+            sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
+            api_key_last_used_touches: crate::api_keys::ApiKeyLastUsedTouchQueue::new(),
+            http: reqwest::Client::new(),
+            github_rest_http: reqwest::Client::new(),
+            github_rest_api_base: Url::parse("https://api.github.com/").expect("parse api url"),
+            github_graphql_url: Url::parse("https://api.github.com/graphql")
+                .expect("parse graphql url"),
+            github_oauth: build_oauth_client(&config).expect("build github oauth"),
+            linuxdo_oauth: None,
+            webauthn: build_webauthn(&config).expect("build webauthn"),
+            encryption_key,
+            llm_scheduler: Arc::new(LlmScheduler::new(1)),
+            translation_scheduler: Arc::new(TranslationSchedulerController::new(
+                TranslationRuntimeConfig::default(),
+            )),
+            admin_collection_read_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            runtime_owner_id: runtime_owner_id.to_owned(),
+        })
     }
 
     #[tokio::test]
@@ -735,7 +838,7 @@ mod tests {
         tx.commit().await.expect("commit first batch");
         assert_eq!(processed, 100);
         assert!(!complete);
-        assert!(cursor.starts_with("translation_work_items|work-099"));
+        assert_eq!(cursor, "translation_work_items|100");
 
         let mut tx = pool.begin().await.expect("begin second batch");
         let (next_cursor, processed, complete) = backfill_batch(&mut tx, &cursor)
@@ -744,7 +847,7 @@ mod tests {
         tx.commit().await.expect("commit second batch");
         assert_eq!(processed, 5);
         assert!(!complete);
-        assert!(next_cursor.starts_with("translation_work_items|work-104"));
+        assert_eq!(next_cursor, "translation_work_items|105");
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM content_legacy_observations")
                 .fetch_one(&pool)
@@ -778,6 +881,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn backfill_cursor_uses_rowid_for_random_legacy_ids() {
+        let pool = pool().await;
+        for id in ["z-last", "a-first"] {
+            sqlx::query(
+                "INSERT INTO translation_work_items (id, kind, entity_id, source_hash, status) VALUES (?, 'release_summary', ?, 'hash', 'completed')",
+            )
+            .bind(id)
+            .bind(format!("release-{id}"))
+            .execute(&pool)
+            .await
+            .expect("insert fixture row");
+        }
+
+        let mut tx = pool.begin().await.expect("begin first batch");
+        let (cursor, processed, complete) = backfill_batch(&mut tx, "").await.expect("first batch");
+        tx.commit().await.expect("commit first batch");
+        assert_eq!(processed, 2);
+        assert!(!complete);
+        assert_eq!(cursor, "translation_work_items|2");
+
+        sqlx::query(
+            "INSERT INTO translation_work_items (id, kind, entity_id, source_hash, status) VALUES ('0-new', 'release_summary', 'release-new', 'hash', 'completed')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert row after cursor");
+
+        let mut tx = pool.begin().await.expect("begin second batch");
+        let (next_cursor, processed, complete) = backfill_batch(&mut tx, &cursor)
+            .await
+            .expect("second batch");
+        tx.commit().await.expect("commit second batch");
+        assert_eq!(processed, 1);
+        assert!(!complete);
+        assert_eq!(next_cursor, "translation_work_items|3");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM content_legacy_observations")
+                .fetch_one(&pool)
+                .await
+                .expect("count observations"),
+            3
+        );
+    }
+
     #[test]
     fn migration_failure_summary_is_redacted_and_bounded() {
         let summary = redact_error_summary(
@@ -787,5 +935,225 @@ mod tests {
         assert!(!summary.contains("private-value"));
         assert!(summary.contains("authorization=<redacted>"));
         assert!(summary.len() <= 500);
+    }
+
+    #[test]
+    fn migration_failure_summary_truncates_at_utf8_boundary() {
+        let summary = redact_error_summary(&"界".repeat(200));
+        assert!(summary.len() <= 500);
+        assert!(summary.is_char_boundary(summary.len()));
+    }
+
+    #[tokio::test]
+    async fn stale_owner_cannot_mark_active_migration_failed() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        for statement in BOOTSTRAP_DDL {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("create migration control table");
+        }
+        sqlx::query("INSERT INTO online_migration_runs (migration_id, definition_checksum, status, created_at, updated_at) VALUES (?, ?, 'running', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+            .bind(MIGRATION_ID)
+            .bind(MIGRATION_CHECKSUM)
+            .execute(&pool)
+            .await
+            .expect("insert migration run");
+        sqlx::query("INSERT INTO online_migration_operations (migration_id, operation_id, definition_checksum, operation_kind, operation_order, status, updated_at) VALUES (?, 'ddl-001', ?, 'ddl', 1, 'running', CURRENT_TIMESTAMP)")
+            .bind(MIGRATION_ID)
+            .bind(OPERATION_DEFINITIONS[0].3)
+            .execute(&pool)
+            .await
+            .expect("insert migration operation");
+        sqlx::query("INSERT INTO online_migration_leases (lease_name, owner_id, lease_expires_at, updated_at) VALUES (?, 'owner-b', datetime('now', '+30 seconds'), CURRENT_TIMESTAMP)")
+            .bind(LEASE_NAME)
+            .execute(&pool)
+            .await
+            .expect("insert active lease");
+
+        let state = test_state(pool.clone(), "owner-a");
+        mark_failed(&state, "stale owner error")
+            .await
+            .expect("mark failed");
+
+        let run_status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM online_migration_runs WHERE migration_id = ?",
+        )
+        .bind(MIGRATION_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("read run status");
+        assert_eq!(run_status, "running");
+        let operation_status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM online_migration_operations WHERE migration_id = ? AND operation_id = 'ddl-001'",
+        )
+        .bind(MIGRATION_ID)
+        .fetch_one(&pool)
+        .await
+        .expect("read operation status");
+        assert_eq!(operation_status, "running");
+    }
+
+    async fn issue_admin_session(session: Session) -> StatusCode {
+        session
+            .insert(
+                "user_id",
+                crate::local_id::test_local_id("online-migration-admin"),
+            )
+            .await
+            .expect("insert admin session");
+        StatusCode::NO_CONTENT
+    }
+
+    #[tokio::test]
+    async fn admin_http_read_redacts_persisted_error_summary() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        sqlx::query("CREATE TABLE users (id TEXT PRIMARY KEY, is_admin INTEGER NOT NULL, is_disabled INTEGER NOT NULL, paused_at TEXT, last_active_at TEXT)")
+            .execute(&pool)
+            .await
+            .expect("create users table");
+        sqlx::query("INSERT INTO users (id, is_admin, is_disabled) VALUES (?, 1, 0)")
+            .bind(crate::local_id::test_local_id("online-migration-admin"))
+            .execute(&pool)
+            .await
+            .expect("insert admin user");
+        for statement in BOOTSTRAP_DDL {
+            sqlx::query(statement)
+                .execute(&pool)
+                .await
+                .expect("create migration control table");
+        }
+        sqlx::query("INSERT INTO online_migration_runs (migration_id, definition_checksum, status, last_error, created_at, updated_at) VALUES (?, ?, 'failed', 'authorization=Bearer live-secret', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+            .bind(MIGRATION_ID)
+            .bind(MIGRATION_CHECKSUM)
+            .execute(&pool)
+            .await
+            .expect("insert failed migration run");
+        let state = test_state(pool, "online-admin-runtime");
+        let app = Router::new()
+            .route("/login", get(issue_admin_session))
+            .route("/admin/jobs/migrations", get(admin_list))
+            .with_state(state)
+            .layer(SessionManagerLayer::new(MemoryStore::default()).with_name("sid"));
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/login")
+                    .body(Body::empty())
+                    .expect("build login request"),
+            )
+            .await
+            .expect("login response");
+        let cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .expect("session cookie")
+            .to_owned();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/jobs/migrations")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .expect("build admin request"),
+            )
+            .await
+            .expect("admin response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read admin response body");
+        let payload: Value = serde_json::from_slice(&body).expect("parse admin response");
+        let last_error = payload["run"]["last_error"].as_str().expect("last error");
+        assert_eq!(last_error, "authorization=<redacted>");
+        assert!(!last_error.contains("live-secret"));
+    }
+
+    #[tokio::test]
+    async fn admin_pause_bootstraps_control_tables_before_updating_request() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        sqlx::query("CREATE TABLE users (id TEXT PRIMARY KEY, is_admin INTEGER NOT NULL, is_disabled INTEGER NOT NULL, paused_at TEXT, last_active_at TEXT)")
+            .execute(&pool)
+            .await
+            .expect("create users table");
+        sqlx::query("INSERT INTO users (id, is_admin, is_disabled) VALUES (?, 1, 0)")
+            .bind(crate::local_id::test_local_id("online-migration-admin"))
+            .execute(&pool)
+            .await
+            .expect("insert admin user");
+        sqlx::query("CREATE TABLE runtime_owners (runtime_owner_id TEXT PRIMARY KEY, lease_heartbeat_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("create runtime owners table");
+        sqlx::query("INSERT INTO runtime_owners (runtime_owner_id, lease_heartbeat_at, created_at, updated_at) VALUES (?, datetime('now'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+            .bind("online-admin-runtime")
+            .execute(&pool)
+            .await
+            .expect("insert runtime owner");
+        let state = test_state(pool.clone(), "online-admin-runtime");
+        let app = Router::new()
+            .route("/login", get(issue_admin_session))
+            .route(
+                "/admin/jobs/migrations/{migration_id}/pause",
+                post(admin_pause),
+            )
+            .with_state(state)
+            .layer(SessionManagerLayer::new(MemoryStore::default()).with_name("sid"));
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/login")
+                    .body(Body::empty())
+                    .expect("build login request"),
+            )
+            .await
+            .expect("login response");
+        let cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .expect("session cookie")
+            .to_owned();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/jobs/migrations/{MIGRATION_ID}/pause"))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .expect("build pause request"),
+            )
+            .await
+            .expect("pause response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT pause_requested FROM online_migration_runs WHERE migration_id = ?",
+            )
+            .bind(MIGRATION_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read pause request"),
+            1
+        );
     }
 }

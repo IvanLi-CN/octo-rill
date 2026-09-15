@@ -6,7 +6,7 @@
 
 After `runtime::register_runtime_owner`, the server starts the online operator. A named `online-migration-operator` lease creates the control tables and idempotently registers one run with three operations: `ddl-001`, `dml-001`, and `backfill-001`. Each operation has an immutable definition checksum.
 
-The operator claims a migration-priority SQLite permit, renews the persistent lease, checks pause state, and commits one operation step. The backfill reads legacy rows by cursor and processes no more than 100 rows. Errors are truncated before being stored on both the run and the current operation; a later process version repairs forward from the durable operation state.
+The operator claims a migration-priority SQLite permit, renews the persistent lease, checks pause state, and commits one operation step. The backfill reads legacy rows by SQLite `rowid` cursor and processes no more than 100 rows, so random legacy text IDs cannot cause rows to sort behind the cursor. Errors are truncated at a UTF-8 boundary before being stored on both the run and the current operation; a later process version repairs forward from the durable operation state.
 
 ## Content Admission
 
