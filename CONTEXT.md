@@ -25,12 +25,20 @@ The user's intended lifecycle for release notifications: enabled, paused, or del
 _Avoid_: 当前 Hook 状态, 注册结果, 接收状态
 
 **Webhook Hook 观察状态**:
-The latest local observation of a repository's OctoRill-managed GitHub Hook, such as registered, missing, conflicted, permission-paused, or errored. It describes what was observed, not what the user wants.
+The latest local observation of a repository's OctoRill-managed GitHub Hook, such as registered, archived, conflicted, permission-paused, outside-PAT-scope, or errored. It describes what was observed, not what the user wants.
 _Avoid_: Webhook 推送目标状态, 健康开关
 
 **Webhook 对齐操作**:
-A user-scoped background operation that moves verified GitHub Hooks toward the persisted Webhook 推送目标状态 and records progress, retries, and terminal errors.
+A user-scoped background operation that moves verified GitHub Hooks toward the persisted Webhook 推送目标状态 and records each repository's disposition independently.
 _Avoid_: 注册按钮, 同步请求, 检查记录
+
+**Webhook 仓库处置结果**:
+The result of reconciling one repository, such as registered, archived, action-required, or outside-PAT-scope. It does not determine whether the enclosing Webhook 对齐操作 completed.
+_Avoid_: 批次失败, Webhook 推送目标状态, 全局错误
+
+**Webhook 对齐需求**:
+A durable per-user request created with a newly persisted eligible owned-repository baseline and consumed by a Webhook 对齐操作. It coalesces concurrent discovery without dropping work while an operation is in flight.
+_Avoid_: 直接注册, 尽力入队, 新仓库任务
 
 **协作取消**:
 A request for a running Webhook 对齐操作 to stop at a safe remote-request boundary. It does not change the user's Webhook 推送目标状态.

@@ -991,6 +991,8 @@ test("webhook demo inspector exposes every management state", async ({
 		["paused-retained", "未启用"],
 		["permission-paused", "权限暂停"],
 		["archived-error", "仓库已归档"],
+		["pat-scope-excluded", "PAT 权限不覆盖"],
+		["out-of-scope", "已移出范围"],
 		["temporary-error", "GitHub 暂时限流"],
 		["delete-pending", "处理中"],
 		["deleted", "待处理"],
@@ -1055,6 +1057,24 @@ test("webhook demo renders desktop and mobile evidence states", async ({
 		"webhook-push-retry-desktop.png",
 	);
 
+	await page.goto(
+		"/settings?section=my-releases&demo=settings-my-releases&d_persona=member&d_own=1&d_webhook=non-actionable-mixed&d_controls=hidden",
+	);
+	await expect(
+		page.getByText("仓库已归档", { exact: false }).first(),
+	).toBeVisible();
+	await expect(
+		page.getByText("PAT 权限不覆盖", { exact: false }).first(),
+	).toBeVisible();
+	await expect(
+		page.getByText("已移出范围", { exact: false }).first(),
+	).toBeVisible();
+	await page.evaluate(() => window.scrollTo(0, 220));
+	await captureDemoInspectorEvidence(
+		settings,
+		"webhook-push-non-actionable-desktop.png",
+	);
+
 	await page.setViewportSize({ width: 393, height: 852 });
 	await page.goto(
 		"/settings?section=my-releases&demo=settings-my-releases&d_persona=member&d_own=1&d_webhook=paused-retained&d_controls=hidden",
@@ -1087,6 +1107,32 @@ test("webhook demo renders desktop and mobile evidence states", async ({
 	).toHaveCount(0);
 	await page.evaluate(() => window.scrollTo(0, 760));
 	await captureDemoViewportEvidence(page, "webhook-demo-mobile-error.png");
+
+	await page.goto(
+		"/settings?section=my-releases&demo=settings-my-releases&d_persona=member&d_own=1&d_webhook=non-actionable-mixed&d_controls=hidden",
+	);
+	await expect(
+		page.getByText("仓库已归档", { exact: false }).first(),
+	).toBeVisible();
+	await expect(
+		page.getByText("PAT 权限不覆盖", { exact: false }).first(),
+	).toBeVisible();
+	await expect(
+		page.getByText("已移出范围", { exact: false }).first(),
+	).toBeVisible();
+	await expect(
+		page.locator('[data-settings-section="my-releases"]').getByRole("button", {
+			name: /重试/,
+		}),
+	).toHaveCount(0);
+	await page
+		.getByText("仓库已归档", { exact: false })
+		.first()
+		.scrollIntoViewIfNeeded();
+	await captureDemoViewportEvidence(
+		page,
+		"webhook-push-non-actionable-mobile.png",
+	);
 
 	const overflow = await page.evaluate(
 		() => document.documentElement.scrollWidth <= window.innerWidth,
