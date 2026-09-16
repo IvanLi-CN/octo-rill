@@ -236,6 +236,24 @@ function buildWebhookPushSettings(
 		? "waiting-registration"
 		: "deleted",
 ): WebhookPushSettingsResponse {
+	const nonActionableStatuses = new Set([
+		"archived",
+		"pat_scope_excluded",
+		"out_of_scope",
+	]);
+	const needsAttention = (repo: WebhookPushRepoStatus) =>
+		!nonActionableStatuses.has(repo.status) &&
+		(Boolean(repo.error_message) ||
+			[
+				"missing",
+				"error",
+				"conflict",
+				"permission_paused",
+				"waiting_registration",
+				"registering",
+				"processing",
+				"delete_pending",
+			].includes(repo.status));
 	const desiredState =
 		scenario === "paused-retained"
 			? "paused"
@@ -268,7 +286,10 @@ function buildWebhookPushSettings(
 	let lastOperationFailure: WebhookPushSettingsResponse["last_operation_failure"] =
 		null;
 
-	const markRegistered = (repo: WebhookPushRepoStatus, hookId: number) => ({
+	const markRegistered = (
+		repo: WebhookPushRepoStatus,
+		hookId: number,
+	): WebhookPushRepoStatus => ({
 		...repo,
 		hook_id: hookId,
 		status: "registered",
@@ -312,12 +333,26 @@ function buildWebhookPushSettings(
 				error_kind: "archived",
 				error_message: "GitHub 已将此仓库归档，归档状态下不能修改 Webhook。",
 			};
-			lastOperationFailure = {
-				task_id: "demo-webhook-archived",
-				operation: "reconcile",
-				error_message: "Webhook 对齐未完成：仓库已归档。",
-				failed_at: checkedAt,
-				retry_count: 3,
+			break;
+		case "pat-scope-excluded":
+			repos[0] = {
+				...repos[0],
+				is_private: true,
+				status: "pat_scope_excluded",
+				error_kind: "pat_scope_excluded",
+				error_message:
+					"当前 classic PAT 不包含 repo 权限，暂不请求此私有仓库的 Webhook。",
+			};
+			break;
+		case "out-of-scope":
+			repos[0] = {
+				...repos[0],
+				owner_login: "previous-owner",
+				repo_full_name: "previous-owner/release-lab",
+				hook_id: 91002,
+				status: "out_of_scope",
+				error_kind: "out_of_scope",
+				error_message: "此仓库已不属于当前 PAT owner，已停止接收 Release。",
 			};
 			break;
 		case "temporary-error":
@@ -362,6 +397,34 @@ function buildWebhookPushSettings(
 			);
 			lastCompletedCheckAt = checkedAt;
 			break;
+		case "non-actionable-mixed":
+			repos.splice(
+				0,
+				1,
+				{
+					...repos[0],
+					hook_id: 91001,
+					status: "archived",
+					error_kind: "archived",
+					error_message: "GitHub 已将此仓库归档，归档状态下不能修改 Webhook。",
+				},
+				{
+					...baseRepo(7002, "octo-demo-owner", "private-lab"),
+					is_private: true,
+					status: "pat_scope_excluded",
+					error_kind: "pat_scope_excluded",
+					error_message:
+						"当前 classic PAT 不包含 repo 权限，暂不请求此私有仓库的 Webhook。",
+				},
+				{
+					...baseRepo(7003, "previous-owner", "moved-project"),
+					hook_id: 91003,
+					status: "out_of_scope",
+					error_kind: "out_of_scope",
+					error_message: "此仓库已不属于当前 PAT owner，已停止接收 Release。",
+				},
+			);
+			break;
 		case "waiting-registration":
 			repos[0] = { ...repos[0], status: "waiting_registration" };
 			break;
@@ -383,10 +446,7 @@ function buildWebhookPushSettings(
 	).map(([ownerLogin, ownerRepos]) => ({
 		owner_login: ownerLogin,
 		repo_count: ownerRepos.length,
-		pending_count: ownerRepos.filter(
-			(repo) =>
-				repo.status !== "registered" && repo.status !== "not_configured",
-		).length,
+		pending_count: ownerRepos.filter(needsAttention).length,
 		repos: ownerRepos,
 	}));
 	const registered = repos.filter(
@@ -396,24 +456,14 @@ function buildWebhookPushSettings(
 		(repo) => repo.permission_paused,
 	).length;
 	const errors = repos.filter((repo) =>
-		["error", "archived"].includes(repo.status),
+		["error", "conflict"].includes(repo.status),
 	).length;
-	const removable = repos.filter((repo) => repo.hook_id !== null).length;
-	const pending = repos.filter(
+	const removable = repos.filter(
 		(repo) =>
-			Boolean(repo.error_message) ||
-			[
-				"missing",
-				"error",
-				"conflict",
-				"permission_paused",
-				"archived",
-				"waiting_registration",
-				"registering",
-				"processing",
-				"delete_pending",
-			].includes(repo.status),
+			repo.hook_id !== null &&
+			!["archived", "pat_scope_excluded", "out_of_scope"].includes(repo.status),
 	).length;
+	const pending = repos.filter(needsAttention).length;
 	return {
 		desired_state: desiredState,
 		enabled: desiredState === "enabled" && includeOwnReleases,

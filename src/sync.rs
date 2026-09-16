@@ -2999,6 +2999,7 @@ async fn apply_social_activity_snapshot_with_options(
         .iter()
         .map(|(repo, _)| repo.repo_id)
         .collect::<HashSet<_>>();
+    let mut newly_persisted_repo_baseline = false;
 
     #[cfg(test)]
     wait_for_social_activity_snapshot_after_reads_hook().await;
@@ -3181,6 +3182,8 @@ async fn apply_social_activity_snapshot_with_options(
                 continue;
             }
 
+            newly_persisted_repo_baseline |= !was_known_repo;
+
             let snapshot_initialized =
                 repo_snapshot_initialized_ids.contains(&repo.repo_id) || fetched_snapshot_this_run;
             upsert_owned_repo_star_baseline_tx(
@@ -3318,9 +3321,56 @@ async fn apply_social_activity_snapshot_with_options(
         .context("upsert repo star sync baseline")?;
     }
 
+    let should_dispatch_webhook_reconcile = newly_persisted_repo_baseline
+        && sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM users
+            WHERE id = ?
+              AND include_own_releases != 0
+              AND webhook_push_enabled != 0
+              AND webhook_push_desired_state = 'enabled'
+            "#,
+        )
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("check webhook push target before advancing reconcile demand")?
+            != 0;
+    if should_dispatch_webhook_reconcile {
+        sqlx::query(
+            r#"
+            INSERT INTO webhook_push_reconcile_demands (
+              user_id, requested_generation, completed_generation, requested_at, updated_at
+            ) VALUES (?, 1, 0, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              requested_generation = webhook_push_reconcile_demands.requested_generation + 1,
+              requested_at = excluded.requested_at,
+              updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(user_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .context("advance webhook push reconcile demand")?;
+    }
+
     tx.commit()
         .await
         .context("commit social activity snapshot tx")?;
+    drop(_sqlite_write);
+    if should_dispatch_webhook_reconcile
+        && let Err(error) =
+            crate::webhook_push::dispatch_pending_reconcile_demands(state, user_id).await
+    {
+        tracing::warn!(
+            user_id,
+            ?error,
+            "social activity snapshot committed but webhook reconcile dispatch failed"
+        );
+    }
     Ok(events_written)
 }
 
@@ -18881,6 +18931,100 @@ mod tests {
         .expect("load new repo star event");
         assert_eq!(row.0, "octo/beta");
         assert_eq!(row.1, "new-star");
+    }
+
+    #[tokio::test]
+    async fn social_activity_new_owned_repo_advances_webhook_reconcile_generation() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-webhook-demand");
+        seed_user(&pool, user_id.as_str()).await;
+        sqlx::query(
+            "UPDATE users SET include_own_releases = 1, webhook_push_enabled = 1, webhook_push_desired_state = 'enabled' WHERE id = ?",
+        )
+        .bind(user_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("enable webhook push target");
+
+        let repo = OwnedRepoSnapshot {
+            repo_id: 52,
+            full_name: "octo/webhook-demand".to_owned(),
+            is_private: false,
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
+            repo_stargazer_count: None,
+        };
+        apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            std::slice::from_ref(&repo),
+            &[(repo.clone(), vec![])],
+            &[],
+        )
+        .await
+        .expect("persist initial owned repo");
+
+        let generation = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT requested_generation, completed_generation FROM webhook_push_reconcile_demands WHERE user_id = ?",
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("read initial reconcile demand");
+        assert_eq!(generation, (1, 0));
+
+        apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            std::slice::from_ref(&repo),
+            &[(repo.clone(), vec![])],
+            &[],
+        )
+        .await
+        .expect("persist unchanged owned repo");
+        let unchanged_generation = sqlx::query_scalar::<_, i64>(
+            "SELECT requested_generation FROM webhook_push_reconcile_demands WHERE user_id = ?",
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("read unchanged reconcile demand");
+        assert_eq!(unchanged_generation, 1);
+
+        let new_repo = OwnedRepoSnapshot {
+            repo_id: 53,
+            full_name: "octo/webhook-demand-new".to_owned(),
+            ..repo
+        };
+        let new_repo_members = [(new_repo.clone(), vec![])];
+        apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            std::slice::from_ref(&new_repo),
+            &new_repo_members,
+            &[],
+        )
+        .await
+        .expect("persist newly discovered owned repo");
+        let advanced_generation = sqlx::query_scalar::<_, i64>(
+            "SELECT requested_generation FROM webhook_push_reconcile_demands WHERE user_id = ?",
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("read advanced reconcile demand");
+        assert_eq!(advanced_generation, 2);
+
+        let task_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM job_tasks WHERE task_type = 'webhook.push.manage' AND requested_by = ? AND status IN ('queued', 'running')",
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("count coalesced webhook tasks");
+        assert_eq!(task_count, 1);
     }
 
     #[tokio::test]

@@ -32,6 +32,7 @@ import type {
 	ReactionTokenStatusResponse,
 	SearchResponse,
 	SearchResult,
+	WebhookPushRepoStatus,
 	WebhookPushSettingsResponse,
 } from "@/api";
 import { buildDemoHref } from "@/demo/registry";
@@ -103,6 +104,29 @@ function webhookRepos(settings: WebhookPushSettingsResponse) {
 	return settings.owner_groups.flatMap((group) => group.repos);
 }
 
+const WEBHOOK_NON_ACTIONABLE_STATUSES = new Set<
+	WebhookPushRepoStatus["status"]
+>(["archived", "pat_scope_excluded", "out_of_scope"]);
+
+function webhookRepoNeedsAttention(
+	repo: ReturnType<typeof webhookRepos>[number],
+) {
+	return (
+		!WEBHOOK_NON_ACTIONABLE_STATUSES.has(repo.status) &&
+		(Boolean(repo.error_message) ||
+			[
+				"missing",
+				"error",
+				"conflict",
+				"permission_paused",
+				"waiting_registration",
+				"registering",
+				"processing",
+				"delete_pending",
+			].includes(repo.status))
+	);
+}
+
 function demoWebhookConflictResponse() {
 	return json(
 		{
@@ -144,7 +168,8 @@ function queueDemoWebhookReconcile(
 				...group,
 				repos: group.repos.map((repo) =>
 					(repoId === undefined || repo.repo_id === repoId) &&
-					!repo.error_message
+					!repo.error_message &&
+					!WEBHOOK_NON_ACTIONABLE_STATUSES.has(repo.status)
 						? { ...repo, status: progressStatus }
 						: repo,
 				),
@@ -154,7 +179,9 @@ function queueDemoWebhookReconcile(
 	window.setTimeout(() => {
 		access.updateModel((model) => {
 			const completedAt = new Date().toISOString();
-			const completeRepo = (repo: ReturnType<typeof webhookRepos>[number]) => ({
+			const completeRepo = (
+				repo: ReturnType<typeof webhookRepos>[number],
+			): WebhookPushRepoStatus => ({
 				...repo,
 				hook_id: desiredState === "deleted" ? null : (repo.hook_id ?? 91001),
 				status: desiredState === "deleted" ? "not_configured" : "registered",
@@ -165,8 +192,11 @@ function queueDemoWebhookReconcile(
 				error_kind: null,
 				error_message: null,
 			});
-			const repos = webhookRepos(model.webhookPush).map((repo) =>
-				repoId === undefined || repo.repo_id === repoId
+			const repos: WebhookPushRepoStatus[] = webhookRepos(
+				model.webhookPush,
+			).map((repo) =>
+				(repoId === undefined || repo.repo_id === repoId) &&
+				!WEBHOOK_NON_ACTIONABLE_STATUSES.has(repo.status)
 					? completeRepo(repo)
 					: repo,
 			);
@@ -184,22 +214,12 @@ function queueDemoWebhookReconcile(
 						registered: repos.filter((repo) => repo.status === "registered")
 							.length,
 						missing: repos.filter((repo) => repo.status === "missing").length,
-						removable: repos.filter((repo) => repo.hook_id !== null).length,
-						pending: repos.filter(
+						removable: repos.filter(
 							(repo) =>
-								Boolean(repo.error_message) ||
-								[
-									"missing",
-									"error",
-									"conflict",
-									"permission_paused",
-									"archived",
-									"waiting_registration",
-									"registering",
-									"processing",
-									"delete_pending",
-								].includes(repo.status),
+								repo.hook_id !== null &&
+								!WEBHOOK_NON_ACTIONABLE_STATUSES.has(repo.status),
 						).length,
+						pending: repos.filter(webhookRepoNeedsAttention).length,
 					},
 					last_operation_failure: null,
 					owner_groups: model.webhookPush.owner_groups.map((group) => ({
@@ -211,23 +231,11 @@ function queueDemoWebhookReconcile(
 						),
 						pending_count: group.repos.filter((repo) => {
 							const nextRepo =
-								repoId === undefined || repo.repo_id === repoId
+								(repoId === undefined || repo.repo_id === repoId) &&
+								!WEBHOOK_NON_ACTIONABLE_STATUSES.has(repo.status)
 									? completeRepo(repo)
 									: repo;
-							return (
-								Boolean(nextRepo.error_message) ||
-								[
-									"missing",
-									"error",
-									"conflict",
-									"permission_paused",
-									"archived",
-									"waiting_registration",
-									"registering",
-									"processing",
-									"delete_pending",
-								].includes(nextRepo.status)
-							);
+							return webhookRepoNeedsAttention(nextRepo);
 						}).length,
 					})),
 				},

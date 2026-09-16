@@ -1896,9 +1896,15 @@ export function SettingsPage(props: {
 																															"archived"
 																														? "仓库已归档"
 																														: repo.status ===
-																																"not_configured"
-																															? "未配置"
-																															: "待处理"}
+																																"pat_scope_excluded"
+																															? "PAT 权限不覆盖"
+																															: repo.status ===
+																																	"out_of_scope"
+																																? "已移出范围"
+																																: repo.status ===
+																																		"not_configured"
+																																	? "未配置"
+																																	: "待处理"}
 																					</Badge>
 																				</div>
 																				{repo.error_message ? (
@@ -1936,11 +1942,20 @@ export function SettingsPage(props: {
 																						已将此仓库归档，归档状态下不能修改
 																						Webhook。
 																					</p>
+																				) : repo.status ===
+																					"pat_scope_excluded" ? (
+																					<p className="text-muted-foreground text-sm">
+																						当前 classic PAT 不包含 repo
+																						权限，暂不请求此私有仓库的 Webhook。
+																					</p>
+																				) : repo.status === "out_of_scope" ? (
+																					<p className="text-muted-foreground text-sm">
+																						此仓库已不属于当前 PAT
+																						owner，已停止接收 Release。
+																					</p>
 																				) : null}
 																			</div>
-																			{repo.error_message ||
-																			repo.permission_paused ||
-																			[
+																			{[
 																				"missing",
 																				"waiting_registration",
 																				"registering",
@@ -1948,7 +1963,6 @@ export function SettingsPage(props: {
 																				"delete_pending",
 																				"error",
 																				"conflict",
-																				"archived",
 																			].includes(repo.status) ? (
 																				<Button
 																					className="max-sm:min-h-11"

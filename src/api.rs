@@ -14905,6 +14905,8 @@ pub struct ReactionTokenCheckResponse {
     state: String, // valid | invalid
     message: String,
     owner: Option<ReactionTokenOwnerSummary>,
+    #[serde(skip)]
+    allows_private_repos: Option<bool>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -14990,6 +14992,7 @@ async fn check_reaction_pat_with_github(
                 state: "invalid".to_owned(),
                 message: "classic PAT needs public_repo (public) or repo (private)".to_owned(),
                 owner: None,
+                allows_private_repos: None,
             });
         }
 
@@ -15016,6 +15019,7 @@ async fn check_reaction_pat_with_github(
                         "PAT owner is not bound to the current OctoRill account; bind that GitHub account first"
                             .to_owned(),
                     owner: None,
+                    allows_private_repos: None,
                 });
             };
             Some(ReactionTokenOwnerSummary {
@@ -15035,6 +15039,7 @@ async fn check_reaction_pat_with_github(
             state: "valid".to_owned(),
             message: "token is valid".to_owned(),
             owner,
+            allows_private_repos: (!scopes.is_empty()).then(|| has_repo_scope(scopes)),
         });
     }
 
@@ -15043,6 +15048,7 @@ async fn check_reaction_pat_with_github(
             state: "invalid".to_owned(),
             message: "token is invalid or expired".to_owned(),
             owner: None,
+            allows_private_repos: None,
         });
     }
 
@@ -15058,6 +15064,7 @@ async fn check_reaction_pat_with_github(
             state: "invalid".to_owned(),
             message: "token cannot access GitHub user API; check PAT permissions".to_owned(),
             owner: None,
+            allows_private_repos: None,
         });
     }
 
@@ -15081,7 +15088,8 @@ async fn load_reaction_pat_status_row(
           last_checked_at,
           owner_github_connection_id,
           owner_github_user_id,
-          owner_login
+          owner_login,
+          webhook_push_allows_private_repos
         FROM reaction_pat_tokens
         WHERE user_id = ?
         "#,
@@ -15135,6 +15143,10 @@ async fn persist_reaction_pat_check_result(
         SET last_check_state = ?,
             last_check_message = ?,
             last_checked_at = ?,
+            webhook_push_allows_private_repos = CASE
+              WHEN ? = 'valid' THEN webhook_push_allows_private_repos
+              ELSE NULL
+            END,
             updated_at = ?
         WHERE user_id = ?
         "#,
@@ -15142,6 +15154,22 @@ async fn persist_reaction_pat_check_result(
     .bind(check_state)
     .bind(check_message)
     .bind(chrono::Utc::now().to_rfc3339())
+    .bind(check_state)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+async fn clear_reaction_pat_scope_observation(
+    state: &AppState,
+    user_id: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "UPDATE reaction_pat_tokens SET webhook_push_allows_private_repos = NULL, updated_at = ? WHERE user_id = ?",
+    )
     .bind(chrono::Utc::now().to_rfc3339())
     .bind(user_id)
     .execute(&state.pool)
@@ -15208,6 +15236,9 @@ pub async fn check_reaction_token(
     let checked =
         check_reaction_pat_with_github(state.as_ref(), req.token.as_str(), Some(user_id.as_str()))
             .await?;
+    if checked.state != "valid" {
+        clear_reaction_pat_scope_observation(state.as_ref(), &user_id).await?;
+    }
     Ok(Json(checked))
 }
 
@@ -15225,6 +15256,7 @@ pub async fn upsert_reaction_token(
     let checked =
         check_reaction_pat_with_github(state.as_ref(), token, Some(user_id.as_str())).await?;
     if checked.state != "valid" {
+        clear_reaction_pat_scope_observation(state.as_ref(), &user_id).await?;
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "pat_invalid",
@@ -15251,9 +15283,10 @@ pub async fn upsert_reaction_token(
         INSERT INTO reaction_pat_tokens (
           user_id, token_ciphertext, token_nonce, masked_token,
           last_check_state, last_check_message, last_checked_at, updated_at,
-          owner_github_connection_id, owner_github_user_id, owner_login
+          owner_github_connection_id, owner_github_user_id, owner_login,
+          webhook_push_allows_private_repos
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
           token_ciphertext = excluded.token_ciphertext,
           token_nonce = excluded.token_nonce,
@@ -15264,7 +15297,8 @@ pub async fn upsert_reaction_token(
           updated_at = excluded.updated_at,
           owner_github_connection_id = excluded.owner_github_connection_id,
           owner_github_user_id = excluded.owner_github_user_id,
-          owner_login = excluded.owner_login
+          owner_login = excluded.owner_login,
+          webhook_push_allows_private_repos = excluded.webhook_push_allows_private_repos
         "#,
     )
     .bind(user_id.as_str())
@@ -15278,6 +15312,7 @@ pub async fn upsert_reaction_token(
     .bind(owner.github_connection_id.as_str())
     .bind(owner.github_user_id)
     .bind(owner.login.as_str())
+    .bind(checked.allows_private_repos)
     .execute(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -25179,6 +25214,13 @@ pub(crate) async fn ensure_owned_repo_visual_columns(
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, sync::atomic::AtomicBool};
+
+    use axum::body::{Body, Bytes};
+    use hmac::Mac;
+
+    use crate::webhook_push;
+
     #[test]
     fn global_notification_identity_excludes_requester_specific_reason() {
         let source_blocks =
@@ -28464,6 +28506,533 @@ mod tests {
         assert_eq!(paused_user.account_status, "paused");
         assert_eq!(paused_user.repo_total, 0);
         assert!(paused_user.paused_at.is_some());
+    }
+
+    #[derive(Default)]
+    struct WebhookWorkerMock {
+        requests: std::sync::Mutex<HashMap<String, usize>>,
+        fail_user: AtomicBool,
+    }
+
+    async fn webhook_worker_mock_handler(
+        axum::extract::State(mock): axum::extract::State<Arc<WebhookWorkerMock>>,
+        request: axum::http::Request<Body>,
+    ) -> axum::response::Response {
+        let method = request.method().as_str().to_owned();
+        let path = request.uri().path().to_owned();
+        let key = format!("{method} {path}");
+        let request_count = {
+            let mut requests = mock.requests.lock().expect("lock webhook mock requests");
+            let count = requests.entry(key).or_default();
+            *count += 1;
+            *count
+        };
+
+        let response = |status: StatusCode, body: &str| {
+            axum::response::Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .expect("build webhook mock response")
+        };
+
+        if path == "/user" && mock.fail_user.load(Ordering::Relaxed) {
+            return response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporary user lookup failure",
+            );
+        }
+        if path == "/user" {
+            return axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .header("x-oauth-scopes", "repo")
+                .body(Body::from(r#"{"id":30215105,"login":"IvanLi-CN"}"#))
+                .expect("build github user response");
+        }
+        if path == "/repositories/101" && request_count == 1 {
+            return response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporary repository lookup failure",
+            );
+        }
+        if path == "/repositories/101" || path == "/repositories/102" {
+            let repo_id = path
+                .rsplit('/')
+                .next()
+                .expect("repository id")
+                .parse::<i64>()
+                .expect("numeric repository id");
+            let repo_name = if repo_id == 101 {
+                "repo-one"
+            } else {
+                "repo-two"
+            };
+            return response(
+                StatusCode::OK,
+                &format!(
+                    r#"{{"id":{repo_id},"full_name":"IvanLi-CN/{repo_name}","owner":{{"id":30215105,"login":"IvanLi-CN"}},"archived":false}}"#
+                ),
+            );
+        }
+        if method == "GET" && path.ends_with("/hooks") {
+            return response(StatusCode::OK, "[]");
+        }
+        if method == "POST" && path.ends_with("/hooks") {
+            let hook_id = if path.contains("repo-one") {
+                1101
+            } else {
+                1102
+            };
+            return response(
+                StatusCode::CREATED,
+                &format!(
+                    r#"{{"id":{hook_id},"active":true,"events":["release"],"config":{{"url":"http://mock.invalid/webhook","content_type":"json"}}}}"#
+                ),
+            );
+        }
+        response(StatusCode::NOT_FOUND, "not found")
+    }
+
+    #[tokio::test]
+    async fn webhook_worker_isolates_repo_failure_and_retries_only_failed_repo() {
+        let pool = setup_pool().await;
+        set_include_own_releases(&pool, true).await;
+        sqlx::query(
+            "UPDATE users SET webhook_push_desired_state = 'enabled', webhook_push_enabled = 1 WHERE id = ?",
+        )
+        .bind(test_user_id(1))
+        .execute(&pool)
+        .await
+        .expect("enable webhook push for worker test");
+        seed_owned_repo_baseline(&pool, 101, "IvanLi-CN/repo-one").await;
+        seed_owned_repo_baseline(&pool, 102, "IvanLi-CN/repo-two").await;
+
+        let mut state = setup_state(pool.clone());
+        let encrypted = state
+            .encryption_key
+            .encrypt_str("ghp_worker_test_token")
+            .expect("encrypt worker test PAT");
+        sqlx::query(
+            r#"
+            INSERT INTO reaction_pat_tokens (
+              user_id, token_ciphertext, token_nonce, masked_token,
+              last_check_state, last_check_message, last_checked_at, updated_at,
+              owner_github_user_id, owner_login, webhook_push_allows_private_repos
+            ) VALUES (?, ?, ?, ?, 'valid', 'token is valid', ?, ?, ?, ?, 1)
+            "#,
+        )
+        .bind(test_user_id(1))
+        .bind(encrypted.ciphertext)
+        .bind(encrypted.nonce)
+        .bind("ghp_...oken")
+        .bind("2026-02-23T00:00:00Z")
+        .bind("2026-02-23T00:00:00Z")
+        .bind(30215105_i64)
+        .bind("IvanLi-CN")
+        .execute(&pool)
+        .await
+        .expect("seed valid worker PAT");
+
+        let mock = Arc::new(WebhookWorkerMock::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind github worker mock");
+        let address = listener
+            .local_addr()
+            .expect("read github worker mock address");
+        let app = axum::Router::new()
+            .fallback(webhook_worker_mock_handler)
+            .with_state(mock.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve github worker mock");
+        });
+        Arc::get_mut(&mut state)
+            .expect("unique worker test state")
+            .github_rest_api_base =
+            url::Url::parse(&format!("http://{address}/")).expect("parse github worker mock URL");
+
+        let task = jobs::enqueue_task(
+            state.as_ref(),
+            jobs::NewTask {
+                task_type: jobs::TASK_WEBHOOK_PUSH_MANAGE.to_owned(),
+                payload: json!({
+                    "user_id": test_user_id(1),
+                    "operation": "reconcile",
+                    "repo_id": Value::Null,
+                    "scheduled": false,
+                    "retry_count": 0,
+                    "retry_repo_ids": [],
+                }),
+                source: "worker-test".to_owned(),
+                requested_by: Some(test_user_id(1)),
+                parent_task_id: None,
+            },
+        )
+        .await
+        .expect("enqueue worker test task");
+        sqlx::query("UPDATE job_tasks SET status = ? WHERE id = ?")
+            .bind(jobs::STATUS_RUNNING)
+            .bind(&task.task_id)
+            .execute(&pool)
+            .await
+            .expect("mark worker test task running");
+
+        let first = crate::webhook_push::execute_manage_task(
+            state.as_ref(),
+            &task.task_id,
+            &serde_json::json!({
+                "user_id": test_user_id(1),
+                "operation": "reconcile",
+                "repo_id": null,
+                "scheduled": false,
+                "retry_count": 0,
+                "retry_repo_ids": [],
+            }),
+        )
+        .await
+        .expect("first worker pass");
+        assert_eq!(first["rescheduled"], true);
+
+        let first_payload =
+            sqlx::query_scalar::<_, String>("SELECT payload_json FROM job_tasks WHERE id = ?")
+                .bind(&task.task_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read retry payload");
+        let retry_payload: Value =
+            serde_json::from_str(&first_payload).expect("parse retry payload");
+        assert_eq!(retry_payload["retry_repo_ids"], json!([101]));
+        assert_eq!(retry_payload["retry_count"], 1);
+
+        let second_calls_before = *mock
+            .requests
+            .lock()
+            .expect("lock request counts")
+            .get("GET /repositories/102")
+            .expect("healthy repo lookup count");
+        sqlx::query("UPDATE job_tasks SET status = ? WHERE id = ?")
+            .bind(jobs::STATUS_RUNNING)
+            .bind(&task.task_id)
+            .execute(&pool)
+            .await
+            .expect("reopen retry task");
+        crate::webhook_push::execute_manage_task(state.as_ref(), &task.task_id, &retry_payload)
+            .await
+            .expect("retry worker pass");
+
+        let healthy_lookup_count = mock
+            .requests
+            .lock()
+            .expect("lock final request counts")
+            .get("GET /repositories/102")
+            .copied();
+        assert_eq!(healthy_lookup_count, Some(second_calls_before));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM webhook_push_repos WHERE user_id = ? AND repo_id = 102",
+            )
+            .bind(test_user_id(1))
+            .fetch_one(&pool)
+            .await
+            .expect("read healthy repo status"),
+            "registered"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM webhook_push_repos WHERE user_id = ? AND repo_id = 101",
+            )
+            .bind(test_user_id(1))
+            .fetch_one(&pool)
+            .await
+            .expect("read recovered repo status"),
+            "registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_reconcile_preflight_failure_uses_bounded_backoff() {
+        let pool = setup_pool().await;
+        set_include_own_releases(&pool, true).await;
+        sqlx::query(
+            "UPDATE users SET webhook_push_desired_state = 'enabled', webhook_push_enabled = 1 WHERE id = ?",
+        )
+        .bind(test_user_id(1))
+        .execute(&pool)
+        .await
+        .expect("enable preflight retry test");
+        let mut state = setup_state(pool.clone());
+        let encrypted = state
+            .encryption_key
+            .encrypt_str("ghp_preflight_retry_token")
+            .expect("encrypt preflight retry PAT");
+        sqlx::query(
+            r#"
+            INSERT INTO reaction_pat_tokens (
+              user_id, token_ciphertext, token_nonce, masked_token,
+              last_check_state, last_check_message, last_checked_at, updated_at,
+              owner_github_user_id, owner_login, webhook_push_allows_private_repos
+            ) VALUES (?, ?, ?, ?, 'valid', 'token is valid', ?, ?, ?, ?, 1)
+            "#,
+        )
+        .bind(test_user_id(1))
+        .bind(encrypted.ciphertext)
+        .bind(encrypted.nonce)
+        .bind("ghp_...oken")
+        .bind("2026-02-23T00:00:00Z")
+        .bind("2026-02-23T00:00:00Z")
+        .bind(30215105_i64)
+        .bind("IvanLi-CN")
+        .execute(&pool)
+        .await
+        .expect("seed preflight retry PAT");
+        sqlx::query(
+            r#"
+            INSERT INTO webhook_push_reconcile_demands (
+              user_id, requested_generation, completed_generation, requested_at, updated_at
+            ) VALUES (?, 4, 0, ?, ?)
+            "#,
+        )
+        .bind(test_user_id(1))
+        .bind("2026-02-23T00:00:00Z")
+        .bind("2026-02-23T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed preflight demand");
+
+        let mock = Arc::new(WebhookWorkerMock::default());
+        mock.fail_user.store(true, Ordering::Relaxed);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind preflight retry mock");
+        let address = listener.local_addr().expect("read preflight retry address");
+        let app = axum::Router::new()
+            .fallback(webhook_worker_mock_handler)
+            .with_state(mock);
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve preflight retry mock");
+        });
+        Arc::get_mut(&mut state)
+            .expect("unique preflight retry state")
+            .github_rest_api_base =
+            url::Url::parse(&format!("http://{address}/")).expect("parse preflight retry URL");
+
+        let task = jobs::enqueue_task(
+            state.as_ref(),
+            jobs::NewTask {
+                task_type: jobs::TASK_WEBHOOK_PUSH_MANAGE.to_owned(),
+                payload: json!({
+                    "user_id": test_user_id(1),
+                    "operation": "reconcile",
+                    "repo_id": Value::Null,
+                    "scheduled": true,
+                    "demand_generation": 4,
+                    "retry_count": 0,
+                    "retry_repo_ids": [],
+                }),
+                source: "preflight-retry-test".to_owned(),
+                requested_by: Some(test_user_id(1)),
+                parent_task_id: None,
+            },
+        )
+        .await
+        .expect("enqueue preflight retry task");
+
+        let mut payload = json!({
+            "user_id": test_user_id(1),
+            "operation": "reconcile",
+            "repo_id": null,
+            "scheduled": true,
+            "demand_generation": 4,
+            "retry_count": 0,
+            "retry_repo_ids": [],
+        });
+        for attempt in 0..=3 {
+            sqlx::query("UPDATE job_tasks SET status = ? WHERE id = ?")
+                .bind(jobs::STATUS_RUNNING)
+                .bind(&task.task_id)
+                .execute(&pool)
+                .await
+                .expect("reopen preflight retry task");
+            let result =
+                crate::webhook_push::execute_manage_task(state.as_ref(), &task.task_id, &payload)
+                    .await;
+            if attempt < 3 {
+                let value = result.expect("preflight failure should reschedule");
+                assert_eq!(value["retry_count"], attempt + 1);
+                let stored: String =
+                    sqlx::query_scalar("SELECT payload_json FROM job_tasks WHERE id = ?")
+                        .bind(&task.task_id)
+                        .fetch_one(&pool)
+                        .await
+                        .expect("read preflight retry payload");
+                payload = serde_json::from_str(&stored).expect("parse preflight retry payload");
+            } else {
+                assert!(
+                    result.is_err(),
+                    "retry exhaustion should leave a terminal failure"
+                );
+            }
+        }
+        sqlx::query("UPDATE job_tasks SET status = 'failed', error_message = 'github unavailable' WHERE id = ?")
+            .bind(&task.task_id)
+            .execute(&pool)
+            .await
+            .expect("mark exhausted preflight failure");
+        assert!(
+            crate::webhook_push::dispatch_pending_reconcile_demands(
+                state.as_ref(),
+                &test_user_id(1)
+            )
+            .await
+            .expect("dispatch should inspect exhausted failure")
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_receiver_blocks_private_scope_exclusions_and_out_of_scope_releases() {
+        let pool = setup_pool().await;
+        set_include_own_releases(&pool, true).await;
+        sqlx::query(
+            "UPDATE users SET webhook_push_desired_state = 'enabled', webhook_push_enabled = 1 WHERE id = ?",
+        )
+        .bind(test_user_id(1))
+        .execute(&pool)
+        .await
+        .expect("enable receiver test");
+        seed_owned_repo_baseline_with_privacy(&pool, 201, "IvanLi-CN/private-repo", true).await;
+
+        let state = setup_state(pool.clone());
+        let pat = state
+            .encryption_key
+            .encrypt_str("ghp_receiver_test_token")
+            .expect("encrypt receiver PAT");
+        let secret = state
+            .encryption_key
+            .encrypt_str("receiver-secret")
+            .expect("encrypt receiver secret");
+        sqlx::query(
+            r#"
+            INSERT INTO reaction_pat_tokens (
+              user_id, token_ciphertext, token_nonce, masked_token,
+              last_check_state, last_check_message, last_checked_at, updated_at,
+              owner_github_user_id, owner_login, webhook_push_allows_private_repos
+            ) VALUES (?, ?, ?, ?, 'valid', 'token is valid', ?, ?, ?, ?, 0)
+            "#,
+        )
+        .bind(test_user_id(1))
+        .bind(pat.ciphertext)
+        .bind(pat.nonce)
+        .bind("ghp_...oken")
+        .bind("2026-02-23T00:00:00Z")
+        .bind("2026-02-23T00:00:00Z")
+        .bind(30215105_i64)
+        .bind("IvanLi-CN")
+        .execute(&pool)
+        .await
+        .expect("seed receiver PAT");
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET webhook_push_secret_ciphertext = ?, webhook_push_secret_nonce = ?,
+                webhook_push_callback_key = 'receiver-key'
+            WHERE id = ?
+            "#,
+        )
+        .bind(secret.ciphertext)
+        .bind(secret.nonce)
+        .bind(test_user_id(1))
+        .execute(&pool)
+        .await
+        .expect("seed receiver secret");
+        sqlx::query(
+            r#"
+            INSERT INTO webhook_push_repos (
+              user_id, repo_id, owner_github_user_id, owner_login, repo_name,
+              repo_full_name, hook_id, callback_url, status, updated_at
+            ) VALUES (?, 201, 30215105, 'IvanLi-CN', 'private-repo',
+                      'IvanLi-CN/private-repo', 9201, 'https://example.test/webhook', 'registered', ?)
+            "#,
+        )
+        .bind(test_user_id(1))
+        .bind("2026-02-23T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed receiver hook");
+
+        let body = r#"{"action":"published","release":{"id":7,"draft":false},"repository":{"id":201,"full_name":"IvanLi-CN/private-repo"}}"#;
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"receiver-secret")
+            .expect("create receiver signature");
+        mac.update(body.as_bytes());
+        let signature = format!(
+            "sha256={}",
+            mac.finalize()
+                .into_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-github-delivery",
+            HeaderValue::from_static("scope-excluded"),
+        );
+        headers.insert("x-github-event", HeaderValue::from_static("release"));
+        headers.insert("x-github-hook-id", HeaderValue::from_static("9201"));
+        headers.insert(
+            "x-hub-signature-256",
+            HeaderValue::from_str(&signature).expect("build receiver signature header"),
+        );
+        let Json(private_result) = webhook_push::receive(
+            State(state.clone()),
+            Query(webhook_push::ReceiverQuery {
+                key: "receiver-key".to_owned(),
+            }),
+            headers.clone(),
+            Bytes::from(body),
+        )
+        .await
+        .expect("scope-excluded release should be accepted");
+        assert_eq!(private_result["queued"], false);
+        assert_eq!(private_result["reason"], "ignored");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT processing_state FROM webhook_push_deliveries WHERE delivery_id = 'scope-excluded'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read ignored delivery"),
+            "ignored"
+        );
+
+        sqlx::query(
+            "UPDATE reaction_pat_tokens SET owner_login = 'DifferentOwner' WHERE user_id = ?",
+        )
+        .bind(test_user_id(1))
+        .execute(&pool)
+        .await
+        .expect("move PAT owner out of scope");
+        headers.insert(
+            "x-github-delivery",
+            HeaderValue::from_static("out-of-scope"),
+        );
+        let Json(out_of_scope_result) = webhook_push::receive(
+            State(state),
+            Query(webhook_push::ReceiverQuery {
+                key: "receiver-key".to_owned(),
+            }),
+            headers,
+            Bytes::from(body),
+        )
+        .await
+        .expect("out-of-scope release should be accepted");
+        assert_eq!(out_of_scope_result["queued"], false);
+        assert_eq!(out_of_scope_result["reason"], "unknown_hook");
     }
 
     struct RepoGovernanceSnapshotSeed<'a> {

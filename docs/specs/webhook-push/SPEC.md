@@ -15,13 +15,17 @@
 - `REQ-WP-001`: 系统 MUST 将用户意图持久化为 `enabled`、`paused` 或 `deleted`，并且运行时观察结果不得反向改写该意图。
 - `REQ-WP-002`: 所有 GitHub Hook 的创建、激活、暂停、删除和检查 MUST 由可恢复的后台对齐任务异步执行，HTTP mutation 不得直接调用 GitHub。
 - `REQ-WP-003`: 目标为 `paused` 或 `deleted` 时，系统 MUST 在任何远端调用前关闭本地接收门禁；远端失败不得改变持久化目标。
-- `REQ-WP-004`: 每名用户 MUST 同时最多存在一项未终态的 manage 操作；全局 audit 只能投递每用户 manage 任务，暂时失败 MUST 按 `1/5/15` 分钟退避并尊重更晚的 `Retry-After`。部分用户派发失败时 audit MUST 继续处理其余用户并重排同一 audit 任务，避免重复投递。
+- `REQ-WP-004`: 每名用户 MUST 同时最多存在一项未终态的 manage 操作；全局 audit 只能投递每用户 manage 任务。单仓远端结果不得中止其余目标的处置；临时 GitHub 或 SQLite 失败 MUST 仅保留受影响工作，并按 `1/5/15` 分钟退避且尊重更晚的 `Retry-After`。部分用户派发失败时 audit MUST 继续处理其余用户并重排同一 audit 任务，避免重复投递。
 - `REQ-WP-005`: worker 仅可变更已验证为 OctoRill 管理、Hook ID、callback URL、`release` event 和仓库身份均匹配的 GitHub Hook。
 - `REQ-WP-006`: 用户 API MUST 暴露目标状态、当前 operation、最近完成检查时间、Owner 分组和派生仓库状态，并移除旧的扁平管理路由合同。
 - `REQ-WP-007`: 设置页 MUST 按 Owner 分组仓库，并区分健康目标状态、等待/执行进度和仓库错误；删除选择不得要求第二次确认。
 - `REQ-WP-008`: 启用目标 MUST 显示本用户最近一次全量检查完成时间；定时 audit 只在没有人工任务时投递对齐任务，人工重试不得与上一轮重叠。
 - `REQ-WP-009`: API MUST 暴露待处理数量与最新终态失败；新的 queued/running 或成功任务出现后 MUST 隐藏旧失败。
 - `REQ-WP-010`: GitHub 明确报告仓库已归档或只读时，系统 MUST 将仓库标记为 `archived` 终态错误，不得提示用户修改 PAT 或自动修改 Hook。
+- `REQ-WP-011`: 已归档仓库 MUST 作为可见、不可操作的仓库处置结果保留；它不计入待处理、不提供重试入口，也不阻塞全量检查完成。
+- `REQ-WP-012`: 已知为私有但不受当前 classic PAT scope 覆盖的自有仓库 MUST 显示 `pat_scope_excluded`，不得显示为等待注册或重复发起 GitHub Hook 请求。
+- `REQ-WP-013`: 首次成功持久化的、属于已启用目标用户的合格自有仓库基线 MUST 在同一 SQLite 事务中创建或推进 Webhook 对齐需求。系统 MUST 在提交后投递对齐；已有操作运行时，需求 MUST 保留并在该操作结束后触发一次跟进对齐。
+- `REQ-WP-014`: 不再属于当前 PAT owner 的仓库 MUST 停止本地 Release 接收并显示为 `out_of_scope`。系统不得因所有权移出范围而自动删除远端 Hook。
 
 ### Goals
 
@@ -64,13 +68,17 @@
 - 目标仓库来自 PAT owner 对应 GitHub connection 刷新的 `owned_repo_star_baselines`。
 - 仅处理 `owner_login` 与 PAT owner login 一致的个人 owner 仓库。
 - `public_repo` PAT 仅选择公开仓库；`repo` PAT 可覆盖公开与私有仓库。
+- 已知私有但不受当前 PAT scope 覆盖的基线保留在列表中，并派生为 `pat_scope_excluded`；它不是 `waiting_registration`，不触发远端调用。PAT scope 覆盖变化后重新进入对齐范围。
+- 移出当前 PAT owner 范围的已观察仓库保留为 `out_of_scope`，不再接收 Release，也不触发自动远端删除。
 
 ### 注册、检查和删除
 
 - 注册先列出仓库 hooks，按 callback URL 与 `release` event 识别 OctoRill hook。
 - 没有匹配项时创建；恰好一个匹配项时确保 active、JSON content type、Release event 与当前 secret；多个匹配项标记冲突，不自动删除。
-- 全量注册包含 `permission_paused` 仓库；成功后解除该仓库暂停。
+- 交互式全量注册包含 `permission_paused` 仓库并在成功后解除暂停；定时巡查跳过这类仓库，直到 PAT 权限或 owner 校验恢复，避免无效远端请求。
 - 检查并修复核对 hook，并按目标状态创建、激活、暂停或删除；所有远端调用均由后台任务执行。
+- worker 必须为每个目标记录独立处置结果，并在单仓 GitHub 错误、归档或 scope 排除后继续处理后续目标。归档、`pat_scope_excluded` 与需要人工处理的单仓结果不得使批次本身失败；只要全部目标已得到处置，`last_completed_check_at` 必须更新。
+- 临时失败重试必须只覆盖未完成或临时失败的仓库，不能重新对健康仓库发起不必要的 GitHub Hook 请求。无法持久化单仓处置结果的 SQLite 故障按基础设施故障重排，不得静默跳过该仓库。
 - 批量删除仅在目标为 `deleted` 时执行，只删除数据库记录了 hook ID 且通过身份校验的 OctoRill hooks。
 - 关闭后接收端忽略事件。删除失败保留 hook 记录和错误，允许再次删除。
 
@@ -82,6 +90,13 @@
 - 每名用户只投递一个带 `scheduled=true` 的 manage 任务；已有 queued/running manage 时复用该任务，不在 audit 任务内执行 GitHub 请求。
 - `permission_paused` 仓库必须跳过；401、403、仍存在基线时的 404，以及 GitHub 明确返回的权限错误进入该状态。归档或只读错误进入 `archived`，不进入 `permission_paused`。
 - 网络、限流和 GitHub 5xx 为暂时错误，不进入权限暂停。
+
+### 新仓库对齐需求
+
+- 自有仓库发现以实际持久化的 `owned_repo_star_baselines` 为准；尚未完成基线持久化的 GitHub snapshot 不得触发 Webhook 注册。
+- 基线事务为已启用目标用户首次写入合格仓库时，必须原子地推进该用户的 Webhook 对齐需求 generation。事务提交后，调度器立即尝试投递全量对齐。
+- 每个对齐任务携带其消费的 generation。任务仅在已处置完整目标集后确认该 generation；运行期间出现更高 generation 时，调度器必须在当前任务终态后投递一次跟进对齐。
+- 需求投递失败、进程重启或已有任务占用时，未确认 generation 必须保留并由调度器恢复；周期 audit 是审计兜底，不是新仓库注册的唯一触发器。
 
 ### Webhook 接收
 
@@ -95,7 +110,8 @@
 
 - “Webhook 推送”位于 `/settings?section=my-releases` 现有卡片内，使用独立 Switch。
 - 卡片必须展示启用状态、PAT owner、已注册/缺失/权限暂停/可删除/待处理数量、最近与下次定时巡查。
-- 卡片必须展示最新终态失败的简短原因、重试次数和可行动的“立即检查并修复”；归档仓库只显示归档原因，不提供 PAT 修复指引。
+- 卡片必须展示最新基础设施终态失败的简短原因、重试次数和可行动的“立即检查并修复”；单仓处置结果显示在对应行内，不能把已完成但有需关注仓库的批次误报为失败。
+- 归档仓库只显示归档原因，不提供重试或 PAT 修复指引，且不计入待处理。`pat_scope_excluded` 显示当前 PAT 未覆盖的原因，不显示为等待注册；`out_of_scope` 显示仓库已不在当前 owner 管理范围。
 - 固定全量按钮名称：`立即检查并修复`。
 - 仓库行提供逐仓 `重试`；页面不得出现“注册 Webhook”“删除 Webhook”或可点击的“巡查”。
 - 页面按 Owner 分组显示仓库，行内不重复显示 Owner。
@@ -113,6 +129,9 @@
 - `VER-WP-006` (covers: `REQ-WP-006`): HTTP contract tests prove the new GET/PATCH/reconcile routes return operation snapshots, derived states, check timestamps, and Owner groups without the old flat management contract.
 - `VER-WP-007` (covers: `REQ-WP-007`): Settings Playwright and mock-only visual tests prove Owner grouping, waiting/working/error states, healthy colors, the close-choice dialog, and direct delete submission on desktop and mobile.
 - `VER-WP-008` (covers: `REQ-WP-008`): audit scheduling and Settings tests prove the last completed check is shown with relative/local-time detail and manual retry is blocked while the prior operation is active.
+- `VER-WP-009` (covers: `REQ-WP-004`, `REQ-WP-011`): mocked multi-repository worker tests prove archived and repository-local failures do not skip later targets, healthy repositories are not retried, and a completed sweep updates the completion timestamp.
+- `VER-WP-010` (covers: `REQ-WP-012`, `REQ-WP-014`): API and Settings tests prove PAT-scope exclusions and ownership-scope exits are distinct from waiting registration, permission pauses, and archived repositories.
+- `VER-WP-011` (covers: `REQ-WP-013`): transaction and restart tests prove a newly persisted baseline and its reconciliation demand commit atomically, active work produces exactly one follow-up pass, and an unconsumed demand is dispatched after restart.
 
 ## Related ADRs
 
