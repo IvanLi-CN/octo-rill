@@ -22,17 +22,23 @@
 
 Rows are observations of a repository Hook. A missing row for an enabled target is derived as `waiting_registration`, not `unknown` or an error observation; the HTTP `summary.missing` count includes this waiting state so an enabled repository is visible as pending registration.
 
+The API derives `pat_scope_excluded` for a known-private owned baseline outside the current validated classic PAT scope, and `out_of_scope` for an observed repository no longer owned by the current PAT owner. Neither requires a remote Hook mutation.
+
+## `webhook_push_reconcile_demands`
+
+- 主键：`user_id`
+- `requested_generation INTEGER NOT NULL`
+- `completed_generation INTEGER NOT NULL DEFAULT 0`
+- `requested_at TEXT NOT NULL`
+- `updated_at TEXT NOT NULL`
+
+The owned-baseline transaction increments `requested_generation` only when it first persists an eligible repository for an enabled Webhook target. A dispatcher may enqueue or reuse one manage task for the user after commit; it must not advance `completed_generation` until that task has independently disposed every target for its captured generation. A newer requested generation remains durable while a task is running and requires one follow-up reconciliation. If the task exhausts its infrastructure retry budget without a durable disposition, the failed task suppresses automatic redispatch for that generation; an explicit reconcile can recover it without losing the demand.
+
 ## `job_tasks`
 
 - `available_at TEXT`: nullable UTC time used by durable delayed retries; queued tasks are claimable only when this is null or due.
-- Webhook manage and audit payloads store `retry_count`; manage payloads additionally store `scheduled`. SQLite busy exhaustion and partial audit dispatch failures reschedule the same task using `available_at` before a terminal failure.
+- Webhook manage and audit payloads store `retry_count`; manage payloads additionally store `scheduled` and, when dispatched from a demand, its captured reconciliation generation. SQLite busy exhaustion and partial audit dispatch failures reschedule the same task using `available_at` before a terminal failure.
 - Webhook worker local writes use `SqliteWriteCoordinator`; the writer permit never spans GitHub requests.
-
-Rows are observations of a repository Hook. A missing row for an enabled target is derived as `waiting_registration`, not `unknown` or `missing`.
-
-## `job_tasks`
-
-- `available_at TEXT`: nullable UTC time used by durable delayed retries; queued tasks are claimable only when this is null or due.
 
 ## `webhook_push_deliveries`
 

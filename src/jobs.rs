@@ -267,6 +267,14 @@ pub fn spawn_recent_failures_retry_scheduler(state: Arc<AppState>) {
 pub fn spawn_webhook_push_scheduler(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
+            if let Err(err) =
+                webhook_push::dispatch_all_pending_reconcile_demands(state.as_ref()).await
+            {
+                tracing::warn!(
+                    ?err,
+                    "webhook push scheduler: dispatch pending demand failed"
+                );
+            }
             if let Err(err) = webhook_push::enqueue_audit_if_due(state.as_ref(), Utc::now()).await {
                 tracing::warn!(?err, "webhook push scheduler: enqueue due audit failed");
             }
@@ -1293,7 +1301,115 @@ pub async fn enqueue_singleton_task_for_requester(
     {
         return Ok(existing);
     }
-    enqueue_task(state, new_task).await
+    let task_type = new_task.task_type.clone();
+    let requested_by = new_task.requested_by.clone();
+    match enqueue_task(state, new_task).await {
+        Ok(task) => Ok(task),
+        Err(error) if is_unique_violation(&error) => find_inflight_task_for_requester(
+            state,
+            &task_type,
+            requested_by
+                .as_deref()
+                .context("singleton task requester disappeared after unique conflict")?,
+        )
+        .await?
+        .context("inflight requester task disappeared after unique conflict"),
+        Err(error) => Err(error),
+    }
+}
+
+/// Enqueue a requester singleton only while its captured reconcile generation
+/// is still pending. The demand check and task insert share one SQLite write
+/// statement so a concurrent generation acknowledgement cannot create stale
+/// work.
+pub async fn enqueue_singleton_task_for_requester_if_generation_pending(
+    state: &AppState,
+    new_task: NewTask,
+    generation: i64,
+) -> Result<Option<EnqueuedTask>> {
+    let _guard = task_singleton_enqueue_lock().lock().await;
+    let requested_by = new_task
+        .requested_by
+        .as_deref()
+        .context("generation singleton task requires requested_by")?
+        .to_owned();
+    let task_type = new_task.task_type.clone();
+    if let Some(existing) =
+        find_inflight_task_for_requester(state, &task_type, &requested_by).await?
+    {
+        return Ok(Some(existing));
+    }
+
+    let task_id = crate::local_id::generate_local_id();
+    let now = Utc::now().to_rfc3339();
+    let payload_json = serde_json::to_string(&new_task.payload).context("serialize payload")?;
+    let inserted = state
+        .sqlite_writer
+        .write_foreground("job_task_insert_if_reconcile_pending", |_| async {
+            let result = sqlx::query(
+                r#"
+                INSERT INTO job_tasks (
+                  id, task_type, status, source, requested_by, parent_task_id,
+                  payload_json, log_file_path, created_at, started_at,
+                  runtime_owner_id, lease_heartbeat_at, updated_at
+                )
+                SELECT ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL, NULL, ?
+                WHERE EXISTS (
+                  SELECT 1
+                  FROM webhook_push_reconcile_demands
+                  WHERE user_id = ?
+                    AND requested_generation = ?
+                    AND completed_generation < ?
+                )
+                "#,
+            )
+            .bind(&task_id)
+            .bind(&new_task.task_type)
+            .bind(STATUS_QUEUED)
+            .bind(&new_task.source)
+            .bind(Some(requested_by.as_str()))
+            .bind(new_task.parent_task_id.as_deref())
+            .bind(&payload_json)
+            .bind(&now)
+            .bind(&now)
+            .bind(&requested_by)
+            .bind(generation)
+            .bind(generation)
+            .execute(&state.pool)
+            .await
+            .context("insert generation-gated job task")?;
+            Ok::<_, anyhow::Error>(result.rows_affected() != 0)
+        })
+        .await;
+
+    match inserted {
+        Ok(true) => {
+            let task = EnqueuedTask {
+                task_id,
+                task_type: new_task.task_type.clone(),
+                status: STATUS_QUEUED.to_owned(),
+                reused: false,
+            };
+            append_task_event(
+                state,
+                &task.task_id,
+                "task.created",
+                json!({
+                    "task_id": task.task_id,
+                    "task_type": new_task.task_type,
+                    "status": STATUS_QUEUED,
+                    "source": new_task.source,
+                }),
+            )
+            .await?;
+            Ok(Some(task))
+        }
+        Ok(false) => Ok(None),
+        Err(error) if is_unique_violation(&error) => {
+            Ok(find_inflight_task_for_requester(state, &task_type, &requested_by).await?)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub async fn enqueue_singleton_task_by_type(
@@ -1469,7 +1585,7 @@ pub async fn reschedule_task(
     available_at: DateTime<Utc>,
     result: Value,
 ) -> Result<bool> {
-    reschedule_task_inner(state, task_id, available_at, None, result).await
+    reschedule_task_inner(state, task_id, available_at, None, None, result).await
 }
 
 pub async fn reschedule_task_with_retry_count(
@@ -1479,7 +1595,34 @@ pub async fn reschedule_task_with_retry_count(
     retry_count: u8,
     result: Value,
 ) -> Result<bool> {
-    reschedule_task_inner(state, task_id, available_at, Some(retry_count), result).await
+    reschedule_task_inner(
+        state,
+        task_id,
+        available_at,
+        Some(retry_count),
+        None,
+        result,
+    )
+    .await
+}
+
+pub async fn reschedule_task_with_payload(
+    state: &AppState,
+    task_id: &str,
+    available_at: DateTime<Utc>,
+    payload: Value,
+    result: Value,
+) -> Result<bool> {
+    let payload_json = serde_json::to_string(&payload).context("serialize rescheduled payload")?;
+    reschedule_task_inner(
+        state,
+        task_id,
+        available_at,
+        None,
+        Some(payload_json),
+        result,
+    )
+    .await
 }
 
 async fn reschedule_task_inner(
@@ -1487,6 +1630,7 @@ async fn reschedule_task_inner(
     task_id: &str,
     available_at: DateTime<Utc>,
     retry_count: Option<u8>,
+    payload_json: Option<String>,
     result: Value,
 ) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
@@ -1494,7 +1638,26 @@ async fn reschedule_task_inner(
     let updated = state
         .sqlite_writer
         .write_foreground("job_task_reschedule", |_| async {
-            if let Some(retry_count) = retry_count {
+            if let Some(payload_json) = payload_json.as_deref() {
+                sqlx::query(
+                    r#"
+                    UPDATE job_tasks
+                    SET status = ?, available_at = ?, payload_json = ?,
+                        started_at = NULL, runtime_owner_id = NULL, lease_heartbeat_at = NULL,
+                        cancel_requested = 0, updated_at = ?
+                    WHERE id = ? AND status = ?
+                    "#,
+                )
+                .bind(STATUS_QUEUED)
+                .bind(&available_at)
+                .bind(payload_json)
+                .bind(&now)
+                .bind(task_id)
+                .bind(STATUS_RUNNING)
+                .execute(&state.pool)
+                .await
+                .context("failed to reschedule task with payload")
+            } else if let Some(retry_count) = retry_count {
                 sqlx::query(
                     r#"
                     UPDATE job_tasks
@@ -2492,6 +2655,18 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
                 json!({"task_id": task.id, "status": STATUS_SUCCEEDED}),
             )
             .await?;
+            if task.task_type == TASK_WEBHOOK_PUSH_MANAGE
+                && let Some(user_id) = payload.get("user_id").and_then(Value::as_str)
+                && let Err(error) =
+                    webhook_push::dispatch_pending_reconcile_demands(state.as_ref(), user_id).await
+            {
+                tracing::warn!(
+                    task_id = task.id,
+                    user_id,
+                    ?error,
+                    "completed webhook task left a pending reconcile demand"
+                );
+            }
         }
         Err(err) => {
             let message = err.to_string();
@@ -2515,6 +2690,18 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
                 json!({"task_id": task.id, "status": STATUS_FAILED, "error": message}),
             )
             .await?;
+            if task.task_type == TASK_WEBHOOK_PUSH_MANAGE
+                && let Some(user_id) = payload.get("user_id").and_then(Value::as_str)
+                && let Err(error) =
+                    webhook_push::dispatch_pending_reconcile_demands(state.as_ref(), user_id).await
+            {
+                tracing::warn!(
+                    task_id = task.id,
+                    user_id,
+                    ?error,
+                    "failed webhook task left a pending reconcile demand"
+                );
+            }
         }
     }
 
@@ -4707,10 +4894,10 @@ mod tests {
         current_subscription_schedule_key, enqueue_brief_history_recompute_if_needed,
         enqueue_brief_refresh_content_if_needed, enqueue_hour_slot_if_due,
         enqueue_recent_failures_retry_if_due, enqueue_singleton_task_for_requester,
-        enqueue_star_sync_runs_if_due, enqueue_subscription_run_if_due, enqueue_task,
-        execute_brief_history_recompute_task, execute_brief_refresh_content_task,
-        execute_daily_slot_task, execute_sync_all_task_with, finalize_task_if_owned,
-        is_scheduled_task_type, load_due_daily_slot_users,
+        enqueue_singleton_task_for_requester_if_generation_pending, enqueue_star_sync_runs_if_due,
+        enqueue_subscription_run_if_due, enqueue_task, execute_brief_history_recompute_task,
+        execute_brief_refresh_content_task, execute_daily_slot_task, execute_sync_all_task_with,
+        finalize_task_if_owned, is_scheduled_task_type, load_due_daily_slot_users,
         load_recent_failed_brief_retry_candidates, load_recent_failed_translation_retry_candidates,
         load_translation_stream_cursor, load_translation_stream_rows, mark_brief_generation_source,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
@@ -6605,6 +6792,159 @@ mod tests {
         .await
         .expect("count successful dispatches");
         assert_eq!(dispatched_users, 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_reconcile_dispatch_captures_generation_and_coalesces_singleton() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 3, "demand-user").await;
+        sqlx::query(
+            "UPDATE users SET include_own_releases = 1, webhook_push_enabled = 1, webhook_push_desired_state = 'enabled' WHERE id = '3'",
+        )
+        .execute(&pool)
+        .await
+        .expect("enable demand user");
+        sqlx::query(
+            r#"
+            INSERT INTO webhook_push_reconcile_demands (
+              user_id, requested_generation, completed_generation, requested_at, updated_at
+            ) VALUES ('3', 7, 4, '2026-03-07T00:00:00Z', '2026-03-07T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed pending reconcile demand");
+
+        let first = crate::webhook_push::dispatch_pending_reconcile_demands(state.as_ref(), "3")
+            .await
+            .expect("dispatch pending reconcile demand")
+            .expect("demand should dispatch");
+        let second = crate::webhook_push::dispatch_pending_reconcile_demands(state.as_ref(), "3")
+            .await
+            .expect("reuse pending reconcile demand")
+            .expect("pending demand should still see singleton task");
+        assert_eq!(first.task_id, second.task_id);
+        assert!(second.reused);
+
+        let (payload_json, task_count): (String, i64) = sqlx::query_as(
+            "SELECT payload_json, (SELECT COUNT(*) FROM job_tasks WHERE task_type = 'webhook.push.manage' AND requested_by = '3' AND status IN ('queued', 'running')) FROM job_tasks WHERE id = ?",
+        )
+        .bind(first.task_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("read dispatched reconcile task");
+        let payload: Value = serde_json::from_str(&payload_json).expect("parse task payload");
+        assert_eq!(payload["demand_generation"], json!(7));
+        assert_eq!(payload["retry_repo_ids"], json!([]));
+        assert_eq!(payload["scheduled"], json!(false));
+        assert_eq!(task_count, 1);
+
+        sqlx::query(
+            "UPDATE webhook_push_reconcile_demands SET requested_generation = 8 WHERE user_id = '3'",
+        )
+        .execute(&pool)
+        .await
+        .expect("advance reconcile demand generation");
+        let stale = enqueue_singleton_task_for_requester_if_generation_pending(
+            state.as_ref(),
+            NewTask {
+                task_type: TASK_WEBHOOK_PUSH_MANAGE.to_owned(),
+                payload: json!({
+                    "user_id": "3",
+                    "operation": "reconcile",
+                    "demand_generation": 7,
+                }),
+                source: "stale-generation-test".to_owned(),
+                requested_by: Some("3".to_owned()),
+                parent_task_id: None,
+            },
+            7,
+        )
+        .await
+        .expect("stale generation enqueue check");
+        assert!(stale.is_some(), "existing singleton should be reused");
+        assert_eq!(stale.expect("existing task").task_id, first.task_id);
+
+        sqlx::query("UPDATE job_tasks SET status = 'succeeded' WHERE id = ?")
+            .bind(first.task_id.as_str())
+            .execute(&pool)
+            .await
+            .expect("finish stale generation task");
+        let stale = enqueue_singleton_task_for_requester_if_generation_pending(
+            state.as_ref(),
+            NewTask {
+                task_type: TASK_WEBHOOK_PUSH_MANAGE.to_owned(),
+                payload: json!({
+                    "user_id": "3",
+                    "operation": "reconcile",
+                    "demand_generation": 7,
+                }),
+                source: "stale-generation-test".to_owned(),
+                requested_by: Some("3".to_owned()),
+                parent_task_id: None,
+            },
+            7,
+        )
+        .await
+        .expect("stale generation insert check");
+        assert!(stale.is_none(), "old generation must not enqueue new work");
+        sqlx::query(
+            "UPDATE webhook_push_reconcile_demands SET requested_generation = 7 WHERE user_id = '3'",
+        )
+        .execute(&pool)
+        .await
+        .expect("restore reconcile demand generation");
+
+        sqlx::query(
+            "UPDATE webhook_push_reconcile_demands SET completed_generation = requested_generation WHERE user_id = '3'",
+        )
+        .execute(&pool)
+        .await
+        .expect("complete seeded reconcile demand");
+        assert!(
+            crate::webhook_push::dispatch_pending_reconcile_demands(state.as_ref(), "3")
+                .await
+                .expect("check completed reconcile demand")
+                .is_none()
+        );
+
+        sqlx::query(
+            "UPDATE job_tasks SET status = 'succeeded', finished_at = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .bind(first.task_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("finish initial reconcile task");
+        sqlx::query(
+            "UPDATE webhook_push_reconcile_demands SET completed_generation = 6 WHERE user_id = '3'",
+        )
+        .execute(&pool)
+        .await
+        .expect("restore pending reconcile demand");
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id, task_type, status, source, requested_by, payload_json, created_at, updated_at,
+              finished_at, error_message
+            ) VALUES ('failed-generation', 'webhook.push.manage', 'failed', 'worker', '3',
+              '{"demand_generation":7,"retry_count":0}', ?, ?, ?, 'pat_invalid')
+            "#,
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed exhausted generation failure");
+        assert!(
+            crate::webhook_push::dispatch_pending_reconcile_demands(state.as_ref(), "3")
+                .await
+                .expect("check exhausted reconcile demand")
+                .is_none()
+        );
     }
 
     async fn seed_translation_request(

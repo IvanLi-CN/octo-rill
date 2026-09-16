@@ -208,5 +208,125 @@ mod tests {
         .await
         .expect("read search state");
         assert_eq!(state, "pending");
+
+        let demand_table = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'webhook_push_reconcile_demands'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read webhook reconcile demand table");
+        assert_eq!(demand_table, 1);
+        let scope_column = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pragma_table_info('reaction_pat_tokens') WHERE name = 'webhook_push_allows_private_repos'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read webhook PAT scope column");
+        assert_eq!(scope_column, 1);
+    }
+
+    #[tokio::test]
+    async fn full_0082_history_upgrades_to_reconcile_demands_without_losing_observations() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE _sqlx_migrations (
+              version BIGINT PRIMARY KEY NOT NULL,
+              description TEXT NOT NULL,
+              installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              success BOOLEAN NOT NULL,
+              checksum BLOB NOT NULL,
+              execution_time BIGINT NOT NULL
+            );
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create migration history");
+
+        for migration in MIGRATOR.iter().filter(|migration| migration.version < 83) {
+            sqlx::raw_sql(&migration.sql)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "apply migration {} {}: {error}",
+                        migration.version, migration.description
+                    )
+                });
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (?, ?, 1, ?, 0)",
+            )
+            .bind(migration.version)
+            .bind(migration.description.as_ref())
+            .bind(migration.checksum.as_ref())
+            .execute(&pool)
+            .await
+            .expect("record applied migration");
+        }
+
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO users (id, github_user_id, login, created_at, updated_at) VALUES ('user-1', 30215105, 'IvanLi-CN', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed migrated user");
+        sqlx::query(
+            r#"
+            INSERT INTO reaction_pat_tokens (
+              user_id, token_ciphertext, token_nonce, masked_token,
+              last_check_state, last_check_message, last_checked_at, updated_at
+            ) VALUES ('user-1', X'01', X'02', 'ghp_...1234', 'valid', 'token is valid', ?, ?)
+            "#,
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed migrated PAT");
+        sqlx::query(
+            r#"
+            INSERT INTO webhook_push_repos (
+              user_id, repo_id, owner_login, repo_name, repo_full_name,
+              hook_id, callback_url, status, updated_at
+            ) VALUES ('user-1', 101, 'IvanLi-CN', 'octo-rill', 'IvanLi-CN/octo-rill',
+                      9001, 'https://example.test/webhook', 'registered', ?)
+            "#,
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed migrated webhook observation");
+
+        run(&pool).await.expect("apply reconcile demand migration");
+
+        let demand_table = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'webhook_push_reconcile_demands'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read demand table");
+        assert_eq!(demand_table, 1);
+        let scope = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT webhook_push_allows_private_repos FROM reaction_pat_tokens WHERE user_id = 'user-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read nullable PAT scope");
+        assert_eq!(scope, None);
+        let hook_id = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT hook_id FROM webhook_push_repos WHERE user_id = 'user-1' AND repo_id = 101",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read retained webhook observation");
+        assert_eq!(hook_id, Some(9001));
     }
 }

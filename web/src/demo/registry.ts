@@ -83,10 +83,13 @@ export const WEBHOOK_SCENARIO_OPTIONS = [
 	{ value: "paused-retained", label: "暂停并保留 Hook" },
 	{ value: "permission-paused", label: "权限暂停" },
 	{ value: "archived-error", label: "仓库已归档" },
+	{ value: "pat-scope-excluded", label: "PAT 权限不覆盖" },
+	{ value: "out-of-scope", label: "已移出范围" },
 	{ value: "temporary-error", label: "暂时错误" },
 	{ value: "delete-pending", label: "删除中" },
 	{ value: "deleted", label: "已删除" },
 	{ value: "multi-owner", label: "多 Owner 分组" },
+	{ value: "non-actionable-mixed", label: "不可操作状态" },
 ] as const satisfies ReadonlyArray<{
 	value: DemoWebhookScenario;
 	label: string;

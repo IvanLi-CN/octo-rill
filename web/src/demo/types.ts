@@ -74,10 +74,13 @@ export type DemoWebhookScenario =
 	| "paused-retained"
 	| "permission-paused"
 	| "archived-error"
+	| "pat-scope-excluded"
+	| "out-of-scope"
 	| "temporary-error"
 	| "delete-pending"
 	| "deleted"
-	| "multi-owner";
+	| "multi-owner"
+	| "non-actionable-mixed";
 
 export type DemoLandingCase =
 	| "default"

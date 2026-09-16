@@ -174,7 +174,9 @@ async function installSettingsMocks(
 			| "registered"
 			| "not_configured"
 			| "error"
-			| "archived";
+			| "archived"
+			| "pat_scope_excluded"
+			| "out_of_scope";
 		webhookPushRepoHookId?: number | null;
 		webhookPushRepoError?: string | null;
 		withReactionFeed?: boolean;
@@ -392,16 +394,34 @@ async function installSettingsMocks(
 						: "not_configured");
 			const repo = {
 				repo_id: 1001,
-				owner_login: "storybook-user",
+				owner_login:
+					webhookRepoStatus === "out_of_scope"
+						? "previous-owner"
+						: "storybook-user",
 				repo_name: "octo-rill",
-				repo_full_name: "storybook-user/octo-rill",
-				is_private: false,
+				repo_full_name:
+					webhookRepoStatus === "out_of_scope"
+						? "previous-owner/octo-rill"
+						: "storybook-user/octo-rill",
+				is_private: webhookRepoStatus === "pat_scope_excluded",
 				hook_id:
 					options?.webhookPushRepoHookId ??
 					(webhookPushDesiredState === "deleted" ? null : 801),
 				status: webhookRepoStatus,
-				error_kind: options?.webhookPushRepoError ? "github_error" : null,
-				error_message: options?.webhookPushRepoError ?? null,
+				error_kind: options?.webhookPushRepoError
+					? "github_error"
+					: webhookRepoStatus === "pat_scope_excluded"
+						? "pat_scope_excluded"
+						: webhookRepoStatus === "out_of_scope"
+							? "out_of_scope"
+							: null,
+				error_message:
+					options?.webhookPushRepoError ??
+					(webhookRepoStatus === "pat_scope_excluded"
+						? "当前 classic PAT 不包含 repo 权限，暂不请求此私有仓库的 Webhook。"
+						: webhookRepoStatus === "out_of_scope"
+							? "此仓库已不属于当前 PAT owner，已停止接收 Release。"
+							: null),
 				permission_paused: false,
 				last_checked_at: null,
 				last_registered_at: null,
@@ -425,11 +445,20 @@ async function installSettingsMocks(
 						? 1
 						: 0,
 					permission_paused: 0,
-					errors: ["error", "archived"].includes(webhookRepoStatus) ? 1 : 0,
-					removable: repo.hook_id === null ? 0 : 1,
+					errors: ["error", "conflict"].includes(webhookRepoStatus) ? 1 : 0,
+					removable:
+						repo.hook_id !== null &&
+						!["archived", "pat_scope_excluded", "out_of_scope"].includes(
+							webhookRepoStatus,
+						)
+							? 1
+							: 0,
 					pending:
-						repo.error_message !== null ||
-						!["registered", "not_configured"].includes(webhookRepoStatus)
+						!["archived", "pat_scope_excluded", "out_of_scope"].includes(
+							webhookRepoStatus,
+						) &&
+						(repo.error_message !== null ||
+							!["registered", "not_configured"].includes(webhookRepoStatus))
 							? 1
 							: 0,
 				},
@@ -443,11 +472,14 @@ async function installSettingsMocks(
 				last_completed_check_at: null,
 				owner_groups: [
 					{
-						owner_login: "storybook-user",
+						owner_login: repo.owner_login,
 						repo_count: 1,
 						pending_count:
-							repo.error_message !== null ||
-							!["registered", "not_configured"].includes(webhookRepoStatus)
+							!["archived", "pat_scope_excluded", "out_of_scope"].includes(
+								webhookRepoStatus,
+							) &&
+							(repo.error_message !== null ||
+								!["registered", "not_configured"].includes(webhookRepoStatus))
 								? 1
 								: 0,
 						repos: [repo],
@@ -1158,6 +1190,31 @@ for (const desiredState of ["paused", "deleted"] as const) {
 		);
 		await fullReconcile.click();
 		await expect((await reconcileRequest).method()).toBe("POST");
+	});
+}
+
+for (const [status, label] of [
+	["archived", "仓库已归档"],
+	["pat_scope_excluded", "PAT 权限不覆盖"],
+	["out_of_scope", "已移出范围"],
+] as const) {
+	test(`webhook push keeps ${status} repositories visible without retry`, async ({
+		page,
+	}) => {
+		await installPasskeyBrowserMock(page);
+		await installSettingsMocks(page, {
+			includeOwnReleases: true,
+			reactionTokenConfigured: true,
+			reactionTokenState: "valid",
+			webhookPushDesiredState: "enabled",
+			webhookPushRepoStatus: status,
+		});
+
+		await page.goto("/settings?section=my-releases");
+		const section = page.locator('[data-settings-section="my-releases"]');
+		await expect(section).toContainText(label);
+		await expect(section).toContainText("1 个仓库 · 0 项待处理");
+		await expect(section.getByRole("button", { name: /重试/ })).toHaveCount(0);
 	});
 }
 
