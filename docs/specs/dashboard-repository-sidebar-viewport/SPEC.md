@@ -3,8 +3,8 @@
 ## Context and Scope
 
 - Context: Dashboard 的仓库侧栏需要在桌面阅读流中保持可扫描、可滚动，并避免短列表收缩成过小的卡片。
-- In scope: 根 Dashboard「全部」页的关注仓库右栏、`/focus/following` 的关注/关联仓库列表、`/focus/mine` 的个人仓库列表，以及它们的桌面视口高度边界。
-- Out of scope: 后端仓库数据、路由语义、移动端新增侧栏和左侧 Feed 项目卡。
+- In scope: `/focus/following` 的关注/关联仓库列表、`/focus/mine` 的个人仓库列表，以及它们的桌面视口高度边界。
+- Out of scope: 根 Dashboard「全部」页的 Inbox 快捷侧栏、后端仓库数据、路由语义、移动端新增侧栏和左侧 Feed 项目卡。
 
 ## Terms and Interfaces
 
@@ -16,9 +16,9 @@
 
 ### REQ-DASHBOARD-REPOSITORY-SIDEBAR-001
 
-- The system MUST render the root Dashboard「全部」tab's following-repository sidebar at `min-width: 1024px`, while retaining the existing Focus following and mine repository surfaces.
+- The system MUST render the Focus following and mine repository sidebars at `min-width: 1024px`, while retaining the root Dashboard「全部」tab's Inbox quick list.
 - Inputs: authenticated Dashboard data and the existing following/personal repository responses.
-- Outputs: the root desktop reading flow exposes a following-repository panel without changing API or route semantics.
+- Outputs: scoped desktop reading flows expose their repository panels without changing root Dashboard Inbox behavior, API, or route semantics.
 
 ### REQ-DASHBOARD-REPOSITORY-SIDEBAR-002
 
@@ -44,7 +44,7 @@
 
 - Method: Dashboard Playwright coverage at `1440x900`, `1024x768`, `1171x620`, and below `1024px`.
 - covers: `REQ-DASHBOARD-REPOSITORY-SIDEBAR-001`, `REQ-DASHBOARD-REPOSITORY-SIDEBAR-004`
-- Pass condition: root desktop, Focus following, and Focus mine render the intended panels; narrow layouts do not render the desktop sidebar or issue the root-only following request.
+- Pass condition: root desktop `全部` renders Inbox; Focus following and Focus mine render the intended repository panels; narrow layouts do not render the desktop repository sidebar or issue a root-only following request.
 
 ### VER-DASHBOARD-REPOSITORY-SIDEBAR-002
 
@@ -62,9 +62,8 @@ None
 - Requested viewports: `1440x900`, `1024x768`, and `1171x620` CSS px.
 - Geometry receipts: panels have a `16px` footer gap whenever the two-card minimum fits; otherwise the panel minimum takes precedence and fully contains two cards; empty-list fallback is `152px`; long following, associated, and personal lists have internal overflow (`scrollHeight > clientHeight`) while retaining at least two visible project-card heights.
 - Assets:
-  - `./assets/root-following-1440x900.png`
-  - `./assets/root-following-1024x768.png`
-  - `./assets/root-following-1171x620.png`
+  - `./assets/root-inbox-1440x900.png`
+  - `./assets/focus-following-1440x900.png`
   - `./assets/personal-repositories-1440x900.png`
   - `./assets/short-following-1440x900.png`
   - `./assets/long-following-1440x900.png`
