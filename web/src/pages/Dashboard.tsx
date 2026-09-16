@@ -1833,16 +1833,10 @@ export function Dashboard(props: {
 	]);
 	const feedItemsRef = useRef(activeFeedItems);
 	feedItemsRef.current = activeFeedItems;
-	const hasDesktopRepositorySidebar = useMediaQuery("(min-width: 1024px)");
-	const rootFollowingSidebarEnabled =
-		hasDesktopRepositorySidebar && tab === "all" && scope === null;
 	const followingReposQuery = useQuery<FollowingReposResponse>({
 		queryKey: ["dashboard", "following-repos", me.user.id],
 		queryFn: apiGetFollowingRepos,
-		enabled:
-			rootFollowingSidebarEnabled ||
-			scope?.kind === "following" ||
-			scope?.kind === "repo",
+		enabled: scope?.kind === "following" || scope?.kind === "repo",
 	});
 	const refreshFeed = readableSectionsActive
 		? readableSections.refresh
@@ -4282,11 +4276,9 @@ export function Dashboard(props: {
 	const renderSidebar =
 		!hasActiveAnnouncementDetail &&
 		((tab === "briefs" && hasTabletSidebar) || renderSidebarInbox);
-	const renderRootFollowingSidebar =
-		rootFollowingSidebarEnabled && !hasActiveAnnouncementDetail;
 	const dashboardContentLayoutClassName = scopedMode
 		? "grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px] lg:gap-6"
-		: renderRootFollowingSidebar || renderSidebar
+		: renderSidebar
 			? "grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6"
 			: "grid gap-4 md:gap-6";
 	const bootNetworkUnavailable =
@@ -4980,20 +4972,6 @@ export function Dashboard(props: {
 											? followingReposError
 											: null
 									}
-									reloadFollowingRepos={async () => {
-										await followingReposQuery.refetch();
-									}}
-									desktop
-								/>
-							</aside>
-						) : renderRootFollowingSidebar ? (
-							<aside className="hidden space-y-4 lg:block">
-								<ScopedSummaryCard
-									scope={{ kind: "following" }}
-									feedItems={feed.items}
-									followingRepos={followingRepos}
-									followingReposLoading={followingReposLoading}
-									followingReposError={followingReposError}
 									reloadFollowingRepos={async () => {
 										await followingReposQuery.refetch();
 									}}
