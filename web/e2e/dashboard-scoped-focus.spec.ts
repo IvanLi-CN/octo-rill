@@ -607,91 +607,49 @@ async function installScopedFocusMocks(
 	};
 }
 
-test("root all desktop renders the following repository sidebar within the footer boundary", async ({
+test("root all desktop renders the Inbox quick list instead of a repository sidebar", async ({
 	page,
 }) => {
 	await installScopedFocusMocks(page);
+	let followingRequestCount = 0;
+	page.on("request", (request) => {
+		if (new URL(request.url()).pathname === "/api/repos/following") {
+			followingRequestCount += 1;
+		}
+	});
 	await page.setViewportSize({ width: 1440, height: 900 });
 	await page.goto("/");
 
-	const panel = page.locator(
-		'[data-dashboard-repository-panel="true"][data-dashboard-scope-summary="following"]',
-	);
-	await expect(panel).toBeVisible();
-	await expect(panel).toHaveAttribute(
-		"data-dashboard-repository-panel-state",
-		"viewport-fill",
-	);
-	await expect(panel.getByText("octo-demo/release-lab")).toBeVisible();
-	await expect
-		.poll(
-			() =>
-				panel.evaluate((element) => {
-					const footer = document.querySelector<HTMLElement>(
-						'[data-app-meta-footer="true"]',
-					);
-					if (!footer) return -1;
-					return (
-						footer.getBoundingClientRect().top -
-						element.getBoundingClientRect().bottom
-					);
-				}),
-			{ timeout: 5_000 },
-		)
-		.toBe(16);
-
-	const geometry = await panel.evaluate((element) => {
-		const footer = document.querySelector<HTMLElement>(
-			'[data-app-meta-footer="true"]',
-		);
-		if (!footer) throw new Error("Expected fixed AppMetaFooter");
-		const panelRect = element.getBoundingClientRect();
-		const footerRect = footer.getBoundingClientRect();
-		return {
-			gap: footerRect.top - panelRect.bottom,
-			panelTop: panelRect.top,
-			panelBottom: panelRect.bottom,
-			panelHeight: panelRect.height,
-			styleHeight: getComputedStyle(element).height,
-			styleMaxHeight: getComputedStyle(element).maxHeight,
-		};
-	});
-	expect(geometry.gap).toBeGreaterThanOrEqual(14);
-	expect(geometry.gap).toBeLessThanOrEqual(18);
+	await expect(
+		page.locator('[data-dashboard-sidebar-inbox="true"]'),
+	).toBeVisible();
+	await expect(
+		page.locator('[data-dashboard-sidebar-inbox="true"]').getByText("Inbox", {
+			exact: true,
+		}),
+	).toBeVisible();
+	await expect(
+		page.locator('[data-dashboard-repository-panel="true"]'),
+	).toHaveCount(0);
+	expect(followingRequestCount).toBe(0);
 });
 
-test("root all at 1024px keeps the following sidebar above the footer", async ({
+test("root all at 1024px keeps the Inbox quick list visible", async ({
 	page,
 }) => {
 	await installScopedFocusMocks(page);
 	await page.setViewportSize({ width: 1024, height: 768 });
 	await page.goto("/");
 
-	const panel = page.locator(
-		'[data-dashboard-repository-panel="true"][data-dashboard-scope-summary="following"]',
-	);
-	await expect(panel).toBeVisible();
-	await expect(panel).toHaveAttribute(
-		"data-dashboard-repository-panel-state",
-		"viewport-fill",
-	);
-	await expect
-		.poll(() =>
-			panel.evaluate((element) => {
-				const footer = document.querySelector<HTMLElement>(
-					'[data-app-meta-footer="true"]',
-				);
-				if (!footer) return -1;
-				return (
-					footer.getBoundingClientRect().top -
-					element.getBoundingClientRect().bottom
-				);
-			}),
-		)
-		.toBe(16);
+	await expect(
+		page.locator('[data-dashboard-sidebar-inbox="true"]'),
+	).toBeVisible();
+	await expect(
+		page.locator('[data-dashboard-repository-panel="true"]'),
+	).toHaveCount(0);
 });
 
-test("long repository lists retain two visible cards on compact desktops", async ({
+test("long repository lists retain two visible cards on compact focus desktops", async ({
 	page,
 }) => {
 	await installScopedFocusMocks(page, {
@@ -699,19 +657,6 @@ test("long repository lists retain two visible cards on compact desktops", async
 		repositoryListCount: 18,
 	});
 	await page.setViewportSize({ width: 1171, height: 620 });
-
-	await page.goto("/");
-	const rootFollowingPanel = page.locator(
-		'[data-dashboard-repository-panel="true"][data-dashboard-scope-summary="following"]',
-	);
-	await expect(rootFollowingPanel).toBeVisible();
-	await expect(rootFollowingPanel).toHaveAttribute(
-		"data-dashboard-repository-panel-density",
-		"compact",
-	);
-	await expectRepositoryListGeometry(rootFollowingPanel, {
-		allowFooterOverlap: true,
-	});
 
 	await page.goto("/focus/following");
 	const followingPanel = page.locator(
