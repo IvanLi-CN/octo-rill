@@ -6,7 +6,7 @@
 
 ## Replacements / Background
 
-- The topic records the stable viewport-height contract for the root following sidebar and the existing Focus repository lists.
+- The topic records the stable viewport-height contract for the existing Focus repository lists. The root Dashboard `全部` tab remains an Inbox quick-list surface and is intentionally outside this repository-sidebar contract.
 
 ## Related Changes
 
