@@ -62,6 +62,8 @@ None
 - Requested viewports: `1440x900`, `1024x768`, and `1171x620` CSS px.
 - Geometry receipts: panels have a `16px` footer gap whenever the two-card minimum fits; otherwise the panel minimum takes precedence and fully contains two cards; empty-list fallback is `152px`; long following, associated, and personal lists have internal overflow (`scrollHeight > clientHeight`) while retaining at least two visible project-card heights.
 - Assets:
+  - `./assets/root-inbox-1440x900.png`
+  - `./assets/focus-following-1440x900.png`
   - `./assets/personal-repositories-1440x900.png`
   - `./assets/short-following-1440x900.png`
   - `./assets/long-following-1440x900.png`
