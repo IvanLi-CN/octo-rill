@@ -117,6 +117,16 @@ cargo check --locked --all-targets --all-features
 (cd docs-site && bun run build)
 ```
 
+这些命令属于显式本地验证。普通 `git commit` 有意只保留快速格式化、适用的前端 lint 和提交消息检查，不运行 Rust 全量测试或 Clippy。完整后端测试命令为：
+
+```bash
+cargo test --locked --all-features
+```
+
+PR CI 负责完整交付门禁，包括适用的前端 E2E、worktree bootstrap 和发布构建 smoke。合并后的 `main` push CI 必须针对同一目标 SHA 成功，发布自动化才能继续发布。浏览器、Docker、跨平台和性能验证属于 CI 或 `$shared-testbox`，不属于普通提交的隐式检查。详见[仓库治理](./docs/repository-governance.md)和 [ADR 0011](./docs/adr/0011-test-responsibilities-by-delivery-stage.md)。
+
+hook 迁移已经落地到仓库中的 `lefthook.yml`；普通提交现在只执行上述快速检查。
+
 ## 更多文档
 
 - 公共文档站：[ivanli-cn.github.io/octo-rill](https://ivanli-cn.github.io/octo-rill/)
