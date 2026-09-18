@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "social-preview-dark",
+  "source_kind": "recovered-fidelity-master",
+  "canonical_export": "brand/exports/octo-rill-github-social-preview-dark.png",
+  "canonical_export_sha256": "ea52ec488258735b399d0c247f835aec23dabca0565a5b651c3f89111f76a0de",
+  "canvas": {
+    "width": 1774,
+    "height": 887
+  },
+  "source_archive": "source.ora",
+  "archive": {
+    "layer_path": "data/fidelity-master.png",
+    "composite_path": "mergedimage.png",
+    "layer_name": "Fidelity master (flattened)"
+  },
+  "recovery": {
+    "original_editable_layers_available": false,
+    "recovered_from": "canonical-export",
+    "limitations": "The original independent scene, controls, logo, and typography layers are unavailable."
+  }
+}

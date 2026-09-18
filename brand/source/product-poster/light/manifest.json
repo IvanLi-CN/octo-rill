@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "product-poster-light",
+  "source_kind": "recovered-fidelity-master",
+  "canonical_export": "brand/exports/octo-rill-product-poster-light.png",
+  "canonical_export_sha256": "795fdb24746f1d83555741ab6aacb30bae7a631418bd4f873590c11faa09939c",
+  "canvas": {
+    "width": 3072,
+    "height": 3840
+  },
+  "source_archive": "source.ora",
+  "archive": {
+    "layer_path": "data/fidelity-master.png",
+    "composite_path": "mergedimage.png",
+    "layer_name": "Fidelity master (flattened)"
+  },
+  "recovery": {
+    "original_editable_layers_available": false,
+    "recovered_from": "canonical-export",
+    "limitations": "The original independent illustration, card, logo, and typography layers are unavailable."
+  }
+}
