@@ -117,6 +117,16 @@ cargo check --locked --all-targets --all-features
 (cd docs-site && bun run build)
 ```
 
+These commands are explicit local validation. An ordinary `git commit` is intentionally limited to fast formatting, applicable web lint, and commit-message checks; it does not run the Rust test suite or Clippy. The complete backend test command is:
+
+```bash
+cargo test --locked --all-features
+```
+
+Pull-request CI owns the complete delivery gate, including applicable frontend E2E, worktree bootstrap, and release-build smoke checks. The `main` push CI for the merged SHA must succeed before release automation publishes anything. Browser, Docker, cross-platform, and performance validation are CI or `$shared-testbox` work, not implicit local commit checks. See [repository governance](./docs/repository-governance.md) and [ADR 0011](./docs/adr/0011-test-responsibilities-by-delivery-stage.md).
+
+The hook migration is implemented in the checked-in `lefthook.yml`: ordinary commits now use only the fast checks described above.
+
 ## More docs
 
 - Public docs site: [ivanli-cn.github.io/octo-rill](https://ivanli-cn.github.io/octo-rill/)
