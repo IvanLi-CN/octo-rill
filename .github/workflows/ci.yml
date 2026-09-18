@@ -84,6 +84,9 @@ jobs:
       - name: Cargo check
         run: cargo check --locked --all-targets --all-features
 
+      - name: Validate brand media source packages
+        run: python3 scripts/brand_media_sources.py --check
+
       - name: Set up Bun (optional)
         if: hashFiles('web/package.json') != ''
         uses: oven-sh/setup-bun@v2
