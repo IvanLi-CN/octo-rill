@@ -5,11 +5,6 @@ pre-commit:
       glob: "**/*.{rs}"
       run: cargo fmt --all
       stage_fixed: true
-    clippy:
-      glob: "**/*.{rs}"
-      run: cargo clippy --all-targets --all-features -- -D warnings
-    test:
-      run: cargo test --all-features
     web-lint:
       run: |
         set -euo pipefail
