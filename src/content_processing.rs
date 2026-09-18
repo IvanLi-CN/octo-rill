@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::http::StatusCode;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -15,8 +15,10 @@ use sqlx::{Error as SqlxError, Row, Sqlite, SqlitePool, Transaction};
 use tokio::{task::JoinSet, time::sleep};
 use tracing::warn;
 
-use crate::{ai, api, error::ApiError, local_id, state::AppState, translations};
-use tower_sessions::Session;
+use crate::{
+    ai, api, error::ApiError, local_id, sqlite_write::SqliteWritePriority, state::AppState,
+    translations,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentProcessingMode {
@@ -27,43 +29,7 @@ pub enum ContentProcessingMode {
 
 pub const CONTENT_PROCESSING_MIGRATION_VERSION: i64 = 78;
 
-#[derive(Debug, Clone, Copy)]
-pub struct ContentProcessingTransitionError {
-    pub mode: ContentProcessingMode,
-}
-
-impl std::fmt::Display for ContentProcessingTransitionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "content processing is temporarily frozen in {} mode",
-            self.mode.as_str()
-        )
-    }
-}
-
-impl std::error::Error for ContentProcessingTransitionError {}
-
-pub fn transition_error(mode: ContentProcessingMode) -> anyhow::Error {
-    anyhow::Error::new(ContentProcessingTransitionError { mode })
-}
-
-pub fn api_error_from_anyhow(error: anyhow::Error) -> ApiError {
-    if let Some(transition) = error.downcast_ref::<ContentProcessingTransitionError>() {
-        return ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "content_processing_transition",
-            "content processing is temporarily frozen; poll the request status before retrying",
-        )
-        .with_details(json!({
-            "mode": transition.mode.as_str(),
-            "request_id": Value::Null,
-            "work_item_id": Value::Null,
-            "poll_url": Value::Null,
-        }));
-    }
-    ApiError::internal(error)
-}
+const INSERT_FAILED_ATTEMPT_EVENT_SQL: &str = "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, next_retry_at, duration_ms, token_count, cost_microunits, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'failed', ?, ?, ?, ?, ?, ?, ?, ?, ? FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started'";
 
 impl ContentProcessingMode {
     pub const fn as_str(self) -> &'static str {
@@ -122,24 +88,8 @@ pub async fn current_mode(pool: &SqlitePool) -> Result<ContentProcessingMode> {
 }
 
 pub async fn ensure_legacy_writer(pool: &SqlitePool) -> Result<(), ApiError> {
-    let mode = current_mode(pool).await.map_err(ApiError::internal)?;
-    if mode == ContentProcessingMode::Legacy {
-        return Ok(());
-    }
-    Err(ApiError::new(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "content_processing_transition",
-        format!(
-            "content processing is controlled by mode {}; poll the request status before retrying",
-            mode.as_str()
-        ),
-    )
-    .with_details(json!({
-        "mode": mode.as_str(),
-        "request_id": Value::Null,
-        "work_item_id": Value::Null,
-        "poll_url": Value::Null,
-    })))
+    let _ = current_mode(pool).await.map_err(ApiError::internal)?;
+    Ok(())
 }
 
 pub async fn ensure_legacy_writer_runtime(pool: &SqlitePool) -> Result<bool> {
@@ -209,6 +159,13 @@ pub async fn legacy_mode_in_transaction(tx: &mut Transaction<'_, Sqlite>) -> Res
 async fn ensure_global_mode_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
 ) -> Result<(), ApiError> {
+    let updated = sqlx::query(
+        "UPDATE content_processing_control SET mode = 'global', updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND mode IN ('legacy', 'rollback_freeze')",
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?
+    .rows_affected();
     let mode =
         sqlx::query_scalar::<_, String>("SELECT mode FROM content_processing_control WHERE id = 1")
             .fetch_optional(&mut **tx)
@@ -217,222 +174,12 @@ async fn ensure_global_mode_in_transaction(
     if mode.as_deref() == Some(ContentProcessingMode::Global.as_str()) {
         return Ok(());
     }
-    Err(ApiError::new(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "content_processing_transition",
-        "content processing is not in global mode; poll the request status before retrying",
-    ))
+    Err(ApiError::internal(anyhow!(
+        "content processing mode cannot be admitted as global (updated_rows={updated}, mode={mode:?})"
+    )))
 }
 
 #[allow(dead_code)]
-pub async fn transition_to_global(pool: &SqlitePool, switch_token: &str) -> Result<bool> {
-    let mut tx = pool
-        .begin()
-        .await
-        .context("failed to begin content mode transition")?;
-    let changed = transition_to_global_in_transaction(&mut tx, switch_token).await?;
-    tx.commit()
-        .await
-        .context("failed to commit content mode transition")?;
-    Ok(changed)
-}
-
-pub async fn transition_to_global_state(state: &AppState, switch_token: &str) -> Result<bool> {
-    let (_lock, mut tx) = state
-        .sqlite_writer
-        .begin_immediate(&state.pool, "content_processing_cutover")
-        .await
-        .context("failed to begin serialized content mode transition")?;
-    let changed = transition_to_global_in_transaction(&mut tx, switch_token).await?;
-    tx.commit()
-        .await
-        .context("failed to commit content mode transition")?;
-    Ok(changed)
-}
-
-pub async fn transition_to_rollback_freeze_state(
-    state: &AppState,
-    switch_token: &str,
-) -> Result<bool> {
-    let (_lock, mut tx) = state
-        .sqlite_writer
-        .begin_immediate(&state.pool, "content_processing_freeze")
-        .await
-        .context("failed to begin serialized content freeze")?;
-    let changed = transition_to_rollback_freeze_in_transaction(&mut tx, switch_token).await?;
-    tx.commit()
-        .await
-        .context("failed to commit content freeze")?;
-    Ok(changed)
-}
-
-async fn transition_to_rollback_freeze_in_transaction(
-    tx: &mut Transaction<'_, Sqlite>,
-    switch_token: &str,
-) -> Result<bool> {
-    let mode =
-        sqlx::query_scalar::<_, String>("SELECT mode FROM content_processing_control WHERE id = 1")
-            .fetch_optional(&mut **tx)
-            .await?;
-    if mode.as_deref() != Some(ContentProcessingMode::Legacy.as_str()) {
-        return Ok(false);
-    }
-    for table in ["translation_batches", "translation_work_items"] {
-        let table_exists = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
-        )
-        .bind(table)
-        .fetch_one(&mut **tx)
-        .await?
-            > 0;
-        if table_exists {
-            let active = sqlx::query_scalar::<_, i64>(&format!(
-                "SELECT COUNT(*) FROM {table} WHERE status NOT IN ('completed', 'failed')"
-            ))
-            .fetch_one(&mut **tx)
-            .await?;
-            if active > 0 {
-                return Ok(false);
-            }
-        }
-    }
-    let changed = sqlx::query(
-        "UPDATE content_processing_control SET mode = 'rollback_freeze', switch_token = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND mode = 'legacy'",
-    )
-    .bind(switch_token)
-    .execute(&mut **tx)
-    .await
-    .context("failed to transition content processing into freeze")?
-    .rows_affected()
-        == 1;
-    Ok(changed)
-}
-
-async fn transition_to_global_in_transaction(
-    tx: &mut Transaction<'_, Sqlite>,
-    switch_token: &str,
-) -> Result<bool> {
-    let mode =
-        sqlx::query_scalar::<_, String>("SELECT mode FROM content_processing_control WHERE id = 1")
-            .fetch_optional(&mut **tx)
-            .await?;
-    if mode.as_deref() != Some(ContentProcessingMode::RollbackFreeze.as_str()) {
-        return Ok(false);
-    }
-    for table in ["translation_batches", "translation_work_items"] {
-        let table_exists = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
-        )
-        .bind(table)
-        .fetch_one(&mut **tx)
-        .await?
-            > 0;
-        if table_exists {
-            let active = sqlx::query_scalar::<_, i64>(&format!(
-                "SELECT COUNT(*) FROM {table} WHERE status NOT IN ('completed', 'failed')"
-            ))
-            .fetch_one(&mut **tx)
-            .await?;
-            if active > 0 {
-                return Ok(false);
-            }
-        }
-    }
-    record_legacy_observations(tx).await?;
-    let changed = sqlx::query(
-        "UPDATE content_processing_control SET mode = 'global', switch_token = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND mode = 'rollback_freeze'",
-    )
-    .bind(switch_token)
-    .execute(&mut **tx)
-    .await
-        .context("failed to transition content processing mode")?
-        .rows_affected()
-        == 1;
-    Ok(changed)
-}
-
-async fn record_legacy_observations(tx: &mut Transaction<'_, Sqlite>) -> Result<()> {
-    let has_ai_translations = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'ai_translations'",
-    )
-    .fetch_one(&mut **tx)
-    .await?
-        > 0;
-    if has_ai_translations {
-        sqlx::query(
-            "INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT 'legacy-cache-' || id, 'ai_translations', id, CASE WHEN entity_type LIKE 'release%' THEN 'release' WHEN entity_type LIKE 'announcement%' THEN 'announcement' WHEN entity_type IN ('notification', 'notification_smart') THEN 'notification' ELSE NULL END, entity_id, CASE WHEN entity_type LIKE '%smart' THEN 'polishing' ELSE 'translation' END, CASE WHEN status = 'ready' AND (title IS NOT NULL OR summary IS NOT NULL) THEN 'legacy_cached' ELSE 'legacy_conflict' END, '{\"source\":\"ai_translations\",\"status\":\"' || replace(status, '\"', '') || '\",\"source_hash\":\"' || replace(source_hash, '\"', '') || '\"}' , CURRENT_TIMESTAMP FROM ai_translations",
-        )
-        .execute(&mut **tx)
-        .await?;
-    }
-
-    let has_translation_work_items = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'translation_work_items'",
-    )
-    .fetch_one(&mut **tx)
-    .await?
-        > 0;
-    if has_translation_work_items {
-        sqlx::query(
-            "INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT 'legacy-work-' || w.id, 'translation_work_items', w.id, CASE WHEN w.kind LIKE 'release%' THEN 'release' WHEN w.kind LIKE 'announcement%' THEN 'announcement' WHEN w.kind IN ('notification', 'notification_smart') THEN 'notification' ELSE NULL END, w.entity_id, CASE WHEN w.kind LIKE '%smart' THEN 'polishing' ELSE 'translation' END, CASE WHEN w.status = 'completed' AND COALESCE(w.result_status, '') = 'ready' AND EXISTS (SELECT 1 FROM ai_translations c WHERE c.user_id = w.scope_user_id AND c.entity_id = w.entity_id AND c.lang = w.target_lang AND c.source_hash = w.source_hash AND c.status = 'ready' AND (c.title IS NOT NULL OR c.summary IS NOT NULL)) THEN 'legacy_cached' ELSE 'legacy_conflict' END, '{\"source\":\"translation_work_items\",\"status\":\"' || replace(COALESCE(w.status, ''), '\"', '') || '\",\"source_hash\":\"' || replace(COALESCE(w.source_hash, ''), '\"', '') || '\"}' , CURRENT_TIMESTAMP FROM translation_work_items w",
-        )
-        .execute(&mut **tx)
-        .await?;
-    }
-    Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CutoverRequest {
-    pub switch_token: String,
-}
-
-pub async fn admin_cutover(
-    State(state): State<Arc<AppState>>,
-    session: Session,
-    Json(request): Json<CutoverRequest>,
-) -> Result<impl IntoResponse, ApiError> {
-    let _ = api::require_admin_user_id(state.as_ref(), &session).await?;
-    let switch_token = request.switch_token.trim();
-    if switch_token.is_empty() {
-        return Err(ApiError::bad_request("switch_token is required"));
-    }
-    if transition_to_global_state(state.as_ref(), switch_token)
-        .await
-        .map_err(ApiError::internal)?
-    {
-        return Ok((StatusCode::OK, Json(json!({"mode": "global"}))));
-    }
-    Err(ApiError::new(
-        StatusCode::CONFLICT,
-        "content_processing_cutover_not_ready",
-        "content processing must be in rollback_freeze before cutover",
-    ))
-}
-
-pub async fn admin_freeze(
-    State(state): State<Arc<AppState>>,
-    session: Session,
-    Json(request): Json<CutoverRequest>,
-) -> Result<impl IntoResponse, ApiError> {
-    let _ = api::require_admin_user_id(state.as_ref(), &session).await?;
-    let switch_token = request.switch_token.trim();
-    if switch_token.is_empty() {
-        return Err(ApiError::bad_request("switch_token is required"));
-    }
-    if transition_to_rollback_freeze_state(state.as_ref(), switch_token)
-        .await
-        .map_err(ApiError::internal)?
-    {
-        return Ok((StatusCode::OK, Json(json!({"mode": "rollback_freeze"}))));
-    }
-    Err(ApiError::new(
-        StatusCode::CONFLICT,
-        "content_processing_freeze_not_ready",
-        "content processing must be in legacy mode with no active legacy batches before freeze",
-    ))
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct GlobalSubmissionResponse {
     pub request_id: String,
@@ -682,59 +429,6 @@ pub async fn submit_item(
     // This is the scheduler admission transaction. API adapters only provide
     // an already-authorized immutable request; provider calls, attempts and
     // terminal projections remain scheduler-worker responsibilities.
-    let processing_mode = current_mode(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
-    match processing_mode {
-        ContentProcessingMode::Global => {}
-        ContentProcessingMode::RollbackFreeze => {
-            let (resource_type, pipeline) = canonical_identity(item);
-            let hash = source_hash(item).map_err(ApiError::internal)?;
-            let details = sqlx::query(
-                "SELECT w.id AS work_item_id, w.status, l.request_id FROM content_work_items w LEFT JOIN content_request_links l ON l.work_item_id = w.id AND l.requester_id = ? WHERE w.canonical_resource_type = ? AND w.canonical_resource_id = ? AND w.pipeline = ? AND w.variant = ? AND w.target_lang = ? AND w.source_hash = ? AND w.protocol_version = ? ORDER BY datetime(w.updated_at) DESC, w.id DESC, datetime(l.created_at) DESC LIMIT 1",
-            )
-            .bind(user_id)
-            .bind(resource_type)
-            .bind(&item.entity_id)
-            .bind(pipeline)
-            .bind(&item.variant)
-            .bind(&item.target_lang)
-            .bind(&hash)
-            .bind(GLOBAL_PROTOCOL_VERSION)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(ApiError::internal)?
-            .map(|row| {
-                let request_id = row.get::<Option<String>, _>("request_id");
-                json!({
-                    "mode": ContentProcessingMode::RollbackFreeze.as_str(),
-                    "work_item_id": row.get::<String, _>("work_item_id"),
-                    "status": row.get::<String, _>("status"),
-                    "request_id": request_id,
-                    "poll_url": request_id.map(|id| format!("/api/translate/requests/{id}")),
-                })
-            })
-            .unwrap_or_else(|| json!({
-                "mode": ContentProcessingMode::RollbackFreeze.as_str(),
-                "request_id": Value::Null,
-                "work_item_id": Value::Null,
-                "poll_url": Value::Null,
-            }));
-            return Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "content_processing_transition",
-                "content processing is temporarily frozen; poll the request status before retrying",
-            )
-            .with_details(details));
-        }
-        ContentProcessingMode::Legacy => {
-            return Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "content_processing_legacy",
-                "global content processing is not active",
-            ));
-        }
-    }
     let (resource_type, pipeline) = canonical_identity(item);
     let hash = source_hash(item).map_err(ApiError::internal)?;
     let model_profile = current_model_profile(state).await;
@@ -748,7 +442,11 @@ pub async fn submit_item(
     let work_id = local_id::generate_local_id().to_string();
     let (_lock, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "content_processing_submit")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "content_processing_submit",
+            SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     ensure_global_mode_in_transaction(&mut tx).await?;
@@ -1279,7 +977,11 @@ pub async fn retry_request(
     let breaker_open = provider_breaker_open(state).await;
     let (_lock, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "content_processing_retry")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "content_processing_retry",
+            SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     ensure_global_mode_in_transaction(&mut tx).await?;
@@ -1442,13 +1144,14 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
         });
     let now = Utc::now().to_rfc3339();
     let lease_expires_at = (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
-    sqlx::query("INSERT INTO content_batches (id, partition_key, target_lang, protocol_version, model_profile, trigger_reason, worker_id, worker_kind, request_count, item_count, estimated_input_tokens, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'content-general-1', 'general', (SELECT COUNT(*) FROM content_request_links WHERE work_item_id = ?), 1, ?, 'running', ?, ?)")
+    sqlx::query("INSERT INTO content_batches (id, partition_key, target_lang, protocol_version, model_profile, trigger_reason, worker_id, worker_kind, request_count, item_count, estimated_input_tokens, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'general', (SELECT COUNT(*) FROM content_request_links WHERE work_item_id = ?), 1, ?, 'running', ?, ?)")
         .bind(&batch_id)
         .bind(format!("{}:{}", row.target_lang, row.model_profile))
         .bind(&row.target_lang)
     .bind(&row.protocol_version)
     .bind(&row.model_profile)
     .bind(trigger_reason.as_str())
+        .bind(&state.runtime_owner_id)
         .bind(&row.id)
         .bind(row.token_estimate)
         .bind(&now)
@@ -1465,11 +1168,12 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
         .bind(&now)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE content_work_items SET status = 'running', batch_id = ?, attempt_count = ?, started_at = ?, lease_owner = 'content-general-1', lease_expires_at = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE content_work_items SET status = 'running', batch_id = ?, attempt_count = ?, started_at = ?, lease_owner = ?, lease_expires_at = ?, updated_at = ? WHERE id = ?")
         .bind(&batch_id)
-        .bind(next_attempt_no)
-        .bind(&now)
-        .bind(&lease_expires_at)
+    .bind(next_attempt_no)
+    .bind(&now)
+        .bind(&state.runtime_owner_id)
+    .bind(&lease_expires_at)
         .bind(&now)
         .bind(&row.id)
         .execute(&mut *tx)
@@ -1541,18 +1245,26 @@ async fn recover_due(state: &AppState) -> Result<()> {
     .bind(&now)
     .execute(&mut *tx)
     .await?;
-    let expired_running = "status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(?)";
+    let runtime_owners_exists = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'runtime_owners'",
+    )
+    .fetch_one(&mut *tx)
+    .await?
+        != 0;
+    let expired_running = if runtime_owners_exists {
+        "status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday('now') AND NOT EXISTS (SELECT 1 FROM runtime_owners owner WHERE owner.runtime_owner_id = content_work_items.lease_owner AND julianday(owner.lease_heartbeat_at) > julianday('now', '-90 seconds'))"
+    } else {
+        "status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday('now')"
+    };
     sqlx::query(&format!(
         "UPDATE content_batch_items SET result_status = 'failed', error_code = 'runtime_lease_expired', updated_at = ? WHERE work_item_id IN (SELECT id FROM content_work_items WHERE {expired_running}) AND batch_id IN (SELECT batch_id FROM content_work_items WHERE {expired_running} AND batch_id IS NOT NULL)"
     ))
-    .bind(&now)
     .bind(&now)
     .execute(&mut *tx)
     .await?;
     sqlx::query(&format!(
         "UPDATE content_batches SET status = 'failed', error_code = 'runtime_lease_expired', error_summary = 'worker lease expired', finished_at = ?, updated_at = ? WHERE id IN (SELECT batch_id FROM content_work_items WHERE {expired_running} AND batch_id IS NOT NULL) AND status = 'running'"
     ))
-    .bind(&now)
     .bind(&now)
     .bind(&now)
     .execute(&mut *tx)
@@ -1565,9 +1277,9 @@ async fn recover_due(state: &AppState) -> Result<()> {
     .await?;
     let recovery_retry_at = (Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
     let recovery_expires_at = (Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
-    sqlx::query(
-        "UPDATE content_work_items SET status = 'queued', priority = 0, lease_owner = NULL, lease_expires_at = NULL, next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, updated_at = ? WHERE status = 'running' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) <= julianday(?)",
-    )
+    sqlx::query(&format!(
+        "UPDATE content_work_items SET status = 'queued', priority = 0, lease_owner = NULL, lease_expires_at = NULL, next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, updated_at = ? WHERE {expired_running} AND julianday(lease_expires_at) <= julianday(?)"
+    ))
     .bind(&recovery_retry_at)
     .bind(&recovery_expires_at)
     .bind(&recovery_retry_at)
@@ -1884,22 +1596,24 @@ async fn cancel_deleted_work(state: &AppState, work: &WorkRow) -> Result<()> {
     ensure_global_mode_in_transaction(&mut tx)
         .await
         .map_err(|error| anyhow!(error.to_string()))?;
-    cancel_deleted_work_in_transaction(&mut tx, work).await?;
+    cancel_deleted_work_in_transaction(&mut tx, work, &state.runtime_owner_id).await?;
     tx.commit().await.map_err(Into::into)
 }
 
 async fn cancel_deleted_work_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     work: &WorkRow,
+    owner_id: &str,
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    let updated = sqlx::query("UPDATE content_work_items SET status = 'cancelled', cancelled_at = ?, finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running' AND attempt_count = ? AND lease_owner = 'content-general-1' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(?)")
+    let updated = sqlx::query("UPDATE content_work_items SET status = 'cancelled', cancelled_at = ?, finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running' AND attempt_count = ? AND lease_owner = ? AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(?)")
         .bind(&now)
         .bind(&now)
         .bind(&now)
-        .bind(&work.id)
-        .bind(work.attempt_count)
-        .bind(&now)
+    .bind(&work.id)
+    .bind(work.attempt_count)
+        .bind(owner_id)
+    .bind(&now)
         .execute(&mut **tx)
         .await?;
     if updated.rows_affected() == 0 {
@@ -1936,12 +1650,13 @@ async fn block_config_work(state: &AppState, work: &WorkRow) -> Result<()> {
     ensure_global_mode_in_transaction(&mut tx)
         .await
         .map_err(|error| anyhow!(error.to_string()))?;
-    let updated = sqlx::query("UPDATE content_work_items SET status = 'blocked_config', failure_class = 'configuration', finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running' AND attempt_count = ? AND lease_owner = 'content-general-1' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(?)")
+    let updated = sqlx::query("UPDATE content_work_items SET status = 'blocked_config', failure_class = 'configuration', finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running' AND attempt_count = ? AND lease_owner = ? AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(?)")
         .bind(&now)
         .bind(&now)
-        .bind(&work.id)
-        .bind(work.attempt_count)
-        .bind(&now)
+    .bind(&work.id)
+    .bind(work.attempt_count)
+        .bind(&state.runtime_owner_id)
+    .bind(&now)
         .execute(&mut *tx)
         .await?;
     if updated.rows_affected() == 0 {
@@ -1972,6 +1687,37 @@ async fn block_config_work(state: &AppState, work: &WorkRow) -> Result<()> {
 }
 
 async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
+    let heartbeat_state = state.clone();
+    let heartbeat_work_id = work.id.clone();
+    let heartbeat_attempt = work.attempt_count;
+    let heartbeat_owner = state.runtime_owner_id.clone();
+    let heartbeat = crate::runtime::spawn_lease_heartbeat(
+        "content_work_item",
+        Duration::from_secs(10),
+        move || {
+            let state = heartbeat_state.clone();
+            let work_id = heartbeat_work_id.clone();
+            let owner = heartbeat_owner.clone();
+            async move {
+                let lease_expires_at = (Utc::now() + chrono::Duration::seconds(90)).to_rfc3339();
+                sqlx::query("UPDATE content_work_items SET lease_expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'running' AND attempt_count = ? AND lease_owner = ?")
+                    .bind(&lease_expires_at)
+                    .bind(&work_id)
+                    .bind(heartbeat_attempt)
+                    .bind(&owner)
+                    .execute(&state.pool)
+                    .await
+                    .context("heartbeat content work item lease")?;
+                Ok(())
+            }
+        },
+    );
+    let result = execute_inner(state, work).await;
+    heartbeat.stop().await;
+    result
+}
+
+async fn execute_inner(state: &AppState, work: WorkRow) -> Result<()> {
     if !source_exists(state, &work).await? {
         cancel_deleted_work(state, &work).await?;
         return Ok(());
@@ -2104,10 +1850,11 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
     }
     let now_for_lease = Utc::now().to_rfc3339();
     let claim_is_current = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM content_work_items WHERE id = ? AND status = 'running' AND attempt_count = ? AND lease_owner = 'content-general-1' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(?)",
+        "SELECT COUNT(*) FROM content_work_items WHERE id = ? AND status = 'running' AND attempt_count = ? AND lease_owner = ? AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(?)",
     )
     .bind(&work.id)
     .bind(work.attempt_count)
+    .bind(&state.runtime_owner_id)
     .bind(&now_for_lease)
     .fetch_one(&mut *tx)
     .await?;
@@ -2116,7 +1863,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
         return Ok(());
     }
     if !source_exists_in_transaction(&mut tx, &work).await? {
-        cancel_deleted_work_in_transaction(&mut tx, &work).await?;
+        cancel_deleted_work_in_transaction(&mut tx, &work, &state.runtime_owner_id).await?;
         tx.commit().await?;
         return Ok(());
     }
@@ -2315,14 +2062,18 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 (Some(input), Some(output)) => Some(input.saturating_add(output)),
                 _ => None,
             };
-            sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, next_retry_at, duration_ms, token_count, cost_microunits, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'failed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started'")
+            sqlx::query(INSERT_FAILED_ATTEMPT_EVENT_SQL)
                 .bind(local_id::generate_local_id().to_string())
                 .bind(&class)
                 .bind(error_summary)
                 .bind(&class)
                 .bind(i64::from(next_retry.is_some()))
                 .bind(&next_retry)
-                .bind(linked_call_audit.as_ref().and_then(|(_, _, duration_ms, _, _)| *duration_ms))
+                .bind(
+                    linked_call_audit
+                        .as_ref()
+                        .and_then(|(_, _, duration_ms, _, _)| *duration_ms),
+                )
                 .bind(token_count)
                 .bind(Option::<i64>::None)
                 .bind(now_text.as_str())
@@ -2543,44 +2294,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_modes_and_transitions_only_from_freeze() {
-        let pool = pool("rollback_freeze").await;
-        assert_eq!(
-            current_mode(&pool).await.unwrap(),
-            ContentProcessingMode::RollbackFreeze
-        );
-        assert!(transition_to_global(&pool, "cutover-1").await.unwrap());
-        assert_eq!(
-            current_mode(&pool).await.unwrap(),
-            ContentProcessingMode::Global
-        );
-        assert!(!transition_to_global(&pool, "cutover-2").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn legacy_mode_can_enter_the_controlled_freeze_window() {
-        let pool = pool("legacy").await;
-        let mut tx = pool.begin().await.unwrap();
-        assert!(
-            transition_to_rollback_freeze_in_transaction(&mut tx, "freeze-1")
-                .await
-                .unwrap()
-        );
-        tx.commit().await.unwrap();
-        assert_eq!(
-            current_mode(&pool).await.unwrap(),
-            ContentProcessingMode::RollbackFreeze
-        );
-        let mut tx = pool.begin().await.unwrap();
-        assert!(
-            !transition_to_rollback_freeze_in_transaction(&mut tx, "freeze-2")
-                .await
-                .unwrap()
-        );
-        tx.rollback().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn migration_preserves_legacy_rows_and_creates_only_global_tables() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -2675,38 +2388,64 @@ mod tests {
             0
         );
         let mut tx = pool.begin().await.unwrap();
-        assert!(
-            transition_to_rollback_freeze_in_transaction(&mut tx, "freeze-1")
-                .await
-                .unwrap()
-        );
+        ensure_global_mode_in_transaction(&mut tx).await.unwrap();
         tx.commit().await.unwrap();
-        assert!(transition_to_global(&pool, "global-1").await.unwrap());
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM content_legacy_observations")
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, String>("SELECT classification FROM content_legacy_observations WHERE legacy_table = 'translation_work_items'")
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-            "legacy_cached"
+            current_mode(&pool).await.unwrap(),
+            ContentProcessingMode::Global
         );
     }
 
     #[tokio::test]
-    async fn legacy_writer_is_frozen_in_rollback_and_global_modes() {
-        for mode in ["rollback_freeze", "global"] {
+    async fn historical_modes_remain_admissible_and_are_repaired_forward() {
+        for mode in ["legacy", "rollback_freeze", "global"] {
             let pool = pool(mode).await;
-            let error = ensure_legacy_writer(&pool)
+            ensure_legacy_writer(&pool).await.unwrap();
+            let mut tx = pool.begin().await.unwrap();
+            ensure_global_mode_in_transaction(&mut tx).await.unwrap();
+            tx.commit().await.unwrap();
+            assert_eq!(
+                current_mode(&pool).await.unwrap(),
+                ContentProcessingMode::Global
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_submission_repairs_historical_mode_without_migration_error() {
+        for mode in ["legacy", "rollback_freeze"] {
+            let pool = global_pool().await;
+            sqlx::query("UPDATE content_processing_control SET mode = ? WHERE id = 1")
+                .bind(mode)
+                .execute(&pool)
                 .await
-                .expect_err("writer must be blocked");
-            assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(error.code(), "content_processing_transition");
+                .unwrap();
+            let state = global_state(pool.clone());
+            let item = translations::TranslationRequestItemInput {
+                producer_ref: format!("test.{mode}"),
+                kind: "release_summary".to_owned(),
+                variant: "summary".to_owned(),
+                entity_id: "release-1".to_owned(),
+                target_lang: "zh-CN".to_owned(),
+                max_wait_ms: 0,
+                source_blocks: vec![translations::TranslationSourceBlock {
+                    slot: "title".to_owned(),
+                    text: "source".to_owned(),
+                }],
+                target_slots: vec!["title_zh".to_owned()],
+            };
+            let (status, response) = submit_item(&state, "user-1", "async", &item).await.unwrap();
+            assert_eq!(status, StatusCode::ACCEPTED);
+            assert!(!response.request_id.is_empty());
+            assert_eq!(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT mode FROM content_processing_control WHERE id = 1",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                "global"
+            );
         }
     }
 
@@ -2822,13 +2561,6 @@ mod tests {
         assert_eq!(status, "queued");
         assert_eq!(payload["title_zh"], "连续刷新仍可见");
         assert_eq!(payload["body_md"], "保留旧摘要");
-    }
-
-    #[test]
-    fn transition_error_maps_to_pollable_service_unavailable() {
-        let error = api_error_from_anyhow(transition_error(ContentProcessingMode::RollbackFreeze));
-        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(error.code(), "content_processing_transition");
     }
 
     #[tokio::test]
@@ -2968,6 +2700,50 @@ mod tests {
                 .await
                 .unwrap(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_attempt_completion_audit_matches_schema() {
+        let pool = global_pool().await;
+        insert_test_work(&pool, "work-failed", "running", 1, None).await;
+        sqlx::query("INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, created_at) VALUES ('attempt-started', 'work-failed', 1, 'initial', 'attempt_started', CURRENT_TIMESTAMP)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query(INSERT_FAILED_ATTEMPT_EVENT_SQL)
+            .bind("attempt-completed")
+            .bind("provider_unavailable")
+            .bind("rate limited")
+            .bind("provider_unavailable")
+            .bind(1_i64)
+            .bind("2026-09-14T00:00:00Z")
+            .bind(120_i64)
+            .bind(42_i64)
+            .bind(Option::<i64>::None)
+            .bind("2026-09-14T00:00:00Z")
+            .bind("work-failed")
+            .bind(1_i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let audit: (String, String, String, String, i64) = sqlx::query_as(
+            "SELECT result_status, error_code, error_summary, failure_class, retry_eligible FROM content_attempt_events WHERE id = 'attempt-completed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            audit,
+            (
+                "failed".to_owned(),
+                "provider_unavailable".to_owned(),
+                "rate limited".to_owned(),
+                "provider_unavailable".to_owned(),
+                1,
+            )
         );
     }
 

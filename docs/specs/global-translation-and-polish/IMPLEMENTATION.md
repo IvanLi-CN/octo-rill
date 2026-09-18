@@ -6,18 +6,18 @@
 
 ## Delivery Shape
 
-1. 在兼容版本中加入全局扩展表、`content_processing_control` 控制记录和启动前模式保护。默认模式为 `legacy`；该版本仍运行旧模型，但已经包含并应用所有切换前需要的迁移。
-2. 兼容版本必须在 `global` 或 `rollback_freeze` 模式下阻止旧入口、旧调度器和直接缓存写入，返回可轮询的维护响应。它仍可启动、读取一般业务数据和保留旧内容处理事实，因此是数据库迁移后的最低回滚版本。
-3. 在受控窗口暂停内容处理接收，等待运行中的旧批次到达终态；超时的批次只按既有租约恢复规则收口，不迁移为全局尝试。写入 `rollback_freeze`，使所有新内容处理请求得到 `503` 和状态轮询信息。
+1. 在监听前由 SQLx 完成空库初始化，并对已有库只读校验已应用 history 的版本、checksum 和 dirty 状态。
+2. 服务注册 `runtime_owner` 后，在线 operator 通过命名持久 lease bootstrap 创建 run/operation 控制表；DDL、DML、历史回填按独立 operation 顺序推进。
+3. 有效内容提交始终走全局 admission。提交事务先把 `legacy` 或 `rollback_freeze` 前向修复为 `global`，再创建或关联唯一工作项；迁移不会返回专属 `503`，也不需要停机窗口。
 4. 从旧表和缓存只读取并写入旧事实观察：`ai_translations.entity_type IN ('release_smart', 'announcement_smart')` 与相应 `translation_work_items.kind`／尝试事件必须和翻译记录一并处理。有可显示缓存而无对应工作证据的记为 `legacy_cached`；存在不可一致解释的工作与缓存证据记为 `legacy_conflict`。不复制或修改旧行，不创建全局工作项、结果投影或虚构尝试。
-5. 部署切换版本。它不携带新的数据库迁移，只读取已存在的扩展表，并在一个数据库事务中把模式从 `rollback_freeze` 切换为 `global`；提交后由全局调度器读取该控制状态并接管新的覆盖请求和交互入口。
-6. 在稳定期只通过全局读模型展示状态，并持续监测未预期的旧写入。发现问题时暂停全局调度器并回退到兼容版本；兼容版本保持全局模式保护，避免恢复旧写入，随后以前向修复恢复服务。
+5. 历史回填按最多 100 行的 cursor 批次执行，在提交后释放 SQLite permit；前台写入等待时 migration priority 让行。pause/resume、owner heartbeat 和脱敏错误都持久化。
+6. 故障只通过识别现状的 forward repair 收敛；不做 down-migration、蓝绿切换或拓扑改造。
 
 ## Database Migration Plan
 
 当前实现使用迁移 `0078_content_processing_global_model.sql` 和追加迁移 `0079_admin_collection_read_budget_indexes.sql`，只创建下列新表、索引和控制记录：
 
-- `content_processing_control`：单行模式栅栏，取值为 `legacy`、`rollback_freeze` 或 `global`；记录切换代号和更新时间。它是旧新写入者共同读取的唯一切换事实。
+- `content_processing_control`：单行历史控制记录，取值为 `legacy`、`rollback_freeze` 或 `global`；有效 admission 会在同一事务中将前两者修复为 `global`。
 - `content_work_items`：包含全局身份、不可变来源快照、冻结配置指纹、优先级、调度状态、租约关联、恢复元数据和取消／替代关系。唯一索引覆盖 `REQ-GTP-IDENTITY` 的全部字段。
 - `content_batches` 与 `content_batch_items`：持久化调度批次、工作成员、分区、令牌估算、触发原因和批次结果，唯一 worker kind 为 `general`。
 - `content_result_projections`：按规范资源、处理链路、变体、语言、协议和模型档案保存最新已验证投影、已发布来源哈希、当前工作项和活动工作项。更新使用同一事务替换投影；刷新中的工作绝不清空旧投影。
@@ -27,6 +27,7 @@
 - `idx_notifications_thread_id`：为按全局通知线程读取 canonical source 提供 `thread_id` 前导索引；授权仍使用用户行单独校验。
 - `idx_notifications_admin_canonical_source`：按通知线程、更新时间和稳定行 ID 支持管理读取的规范来源选择。
 - `idx_translation_work_items_admin_entity_kind_attempt`：按实体、处理种类和尝试次数支持管理候选集筛选。
+- `online_migration_leases`、`online_migration_runs`、`online_migration_operations`：持久化命名 lease、不可变定义 checksum、DDL/DML/backfill 顺序、cursor、pause、owner heartbeat 和脱敏失败。
 
 迁移不执行 `DROP TABLE`、表改名、数据重建、旧行 `UPDATE`、旧行 `DELETE` 或把旧数据插入全局工作／结果／尝试表。`translation_work_items`、`translation_requests`、旧尝试事件和 `ai_translations` 继续存在；应用仅把它们当作旧事实读取。
 
@@ -42,7 +43,7 @@ Release、公告、通知和日报的管理列表都先在 SQLite 中构造规�
 
 SQLx 默认会校验数据库中每一个已应用迁移是否存在于当前二进制。因而，一旦扩展迁移已应用，迁移前的旧应用会因未知迁移版本而无法启动；这不是数据库损坏，而是运行时拒绝在未知模式下打开数据库。部署系统必须显式禁止此类回滚。
 
-兼容版本包含扩展迁移，并在看到 `global` 或 `rollback_freeze` 时禁止旧内容处理写入。因此从全局切换版本回退到兼容版本时：数据库可打开；旧表、全局表和所有历史行仍在；内容处理保持受控暂停，不会把旧用户隔离模型重新写活；服务以兼容版本的一般功能运行，直到以前向修复恢复全局处理。不得把兼容版本之后产生的全局数据解释为旧模型的当前状态。
+已部署状态不支持 down-migration。停止或发现缺陷的版本由后续 forward repair 识别 run/operation 现状并继续；旧表、全局表和历史行仍在，内容提交保持原有 `202`/`409` 合同。
 
 ## Implementation Boundaries
 
@@ -50,8 +51,8 @@ SQLx 默认会校验数据库中每一个已应用迁移是否存在于当前二
 - API adapters own authorization, requester association and response shaping; they delegate admission/retry to the scheduler boundary and never directly create terminal output.
 - Source ingestion owns coverage submission; admin list and detail GETs only read.
 - Admin read model joins the global work, result and legacy observation independently, rather than inferring any one from another.
-- Web clients treat active-retry `409` and transition `503` as status synchronization outcomes, then poll the supplied link. They do not optimistically invent a local attempt.
+- Web clients treat active-retry `409` as the status synchronization outcome and poll the supplied link. There is no transition `503` contract.
 
 ## Completion Evidence
 
-Implementation is complete only after the verification scenarios in [SPEC.md](./SPEC.md) pass against a migration-bearing compatibility build and a migration-free global cutover build. The release checklist must prove the database can start under the compatibility build after cutover, that migration-preceding binaries are rejected before deployment, and that no legacy table changed during old-fact observation.
+Implementation is complete only after the verification scenarios in [SPEC.md](./SPEC.md) pass against a fresh database and an existing database with validated SQLx history. The release checklist must prove pause/resume re-entry, forward repair, unchanged legacy rows and no migration-specific admission error.

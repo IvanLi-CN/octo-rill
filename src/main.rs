@@ -15,6 +15,7 @@ mod jobs;
 mod linuxdo;
 mod local_id;
 mod observability;
+mod online_migrations;
 mod passkeys;
 mod release_links;
 mod runtime;

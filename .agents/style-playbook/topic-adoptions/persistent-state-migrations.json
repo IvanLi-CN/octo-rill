@@ -1,0 +1,18 @@
+{
+  "evidence": [
+    "src/online_migrations.rs",
+    "docs/specs/persistent-state-migrations/SPEC.md",
+    "docs/specs/persistent-state-migrations/migration-record.json"
+  ],
+  "implementation_commit": "9844718205dbebfdacabf47df64c1194923e6a1b",
+  "playbook_commit": "4c09ce4a3e77ffb5cae97adf0c59da4d77e88536",
+  "policy_observations": [
+    {
+      "reason": "package-and-lock-verified",
+      "slug": "persistent-state-migrations",
+      "state": "installed"
+    }
+  ],
+  "schema_version": 1,
+  "topic": "persistent-state-migrations"
+}
