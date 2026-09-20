@@ -659,6 +659,131 @@ type ActivityRequestWindow = Window & {
 	__collectionActivityPaths?: string[];
 };
 
+type ActivityCancellationWindow = ActivityRequestWindow & {
+	__collectionActivityAbortCount?: number;
+	__collectionActivityNowOffset?: number;
+};
+
+export const ResumesActivityReadAfterListCancellation: Story = {
+	tags: ["admin-collection-activity"],
+	args: {
+		detailRoute: null,
+		onFiltersChange: () => undefined,
+		onOpenRecord: () => undefined,
+		onOpenAttempt: () => undefined,
+		onOpenLlm: () => undefined,
+		onCloseRecord: () => undefined,
+	},
+	decorators: [
+		(Story) => {
+			const originalFetch = useRef(window.fetch);
+			const originalNow = useRef(Date.now);
+			const activityCallCount = useRef(0);
+			const restoreFetch = originalFetch.current;
+			const requestWindow = window as ActivityCancellationWindow;
+			requestWindow.__collectionActivityPaths = [];
+			requestWindow.__collectionActivityAbortCount = 0;
+			requestWindow.__collectionActivityNowOffset = 0;
+			Date.now = () =>
+				originalNow.current() +
+				(requestWindow.__collectionActivityNowOffset ?? 0);
+			window.fetch = async (input, init) => {
+				const requestInput = input instanceof Request ? input.url : input;
+				const url = new URL(
+					typeof requestInput === "string"
+						? requestInput
+						: requestInput.toString(),
+					window.location.origin,
+				);
+				if (url.pathname.endsWith("/activity")) {
+					requestWindow.__collectionActivityPaths?.push(url.pathname);
+					activityCallCount.current += 1;
+					if (activityCallCount.current === 3) {
+						return await new Promise<Response>((_resolve, reject) => {
+							const signal = init?.signal;
+							const rejectOnAbort = () => {
+								requestWindow.__collectionActivityAbortCount =
+									(requestWindow.__collectionActivityAbortCount ?? 0) + 1;
+								reject(new DOMException("aborted", "AbortError"));
+							};
+							if (signal?.aborted) rejectOnAbort();
+							else
+								signal?.addEventListener("abort", rejectOnAbort, {
+									once: true,
+								});
+						});
+					}
+					const kind = url.pathname
+						.split("/")
+						.at(-2) as AdminCollectionActivityResponse["kind"];
+					return new Response(JSON.stringify(activityResponse(kind)), {
+						status: 200,
+					});
+				}
+				const listKind = url.pathname.match(
+					/\/ai-records\/(release|announcement|notification|brief)$/,
+				)?.[1] as AdminCollectionActivityResponse["kind"] | undefined;
+				if (listKind) {
+					return new Response(
+						JSON.stringify({
+							...listResponse,
+							items: listResponse.items.map((item) => ({
+								...item,
+								kind: listKind,
+							})),
+							total: 40,
+						}),
+						{ status: 200 },
+					);
+				}
+				return restoreFetch(input, init);
+			};
+			useEffect(
+				() => () => {
+					window.fetch = restoreFetch;
+					Date.now = originalNow.current;
+					delete requestWindow.__collectionActivityPaths;
+					delete requestWindow.__collectionActivityAbortCount;
+					delete requestWindow.__collectionActivityNowOffset;
+				},
+				[originalNow, restoreFetch, requestWindow],
+			);
+			return <Story />;
+		},
+	],
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const requestWindow = window as ActivityCancellationWindow;
+		const releasePath = "/api/admin/jobs/ai-records/release/activity";
+		await waitFor(() =>
+			expect(requestWindow.__collectionActivityPaths).toEqual([releasePath]),
+		);
+		requestWindow.__collectionActivityNowOffset = 6_000;
+		await userEvent.click(canvas.getByRole("tab", { name: "公告" }));
+		await waitFor(() =>
+			expect(requestWindow.__collectionActivityPaths).toContain(
+				"/api/admin/jobs/ai-records/announcement/activity",
+			),
+		);
+		await userEvent.click(canvas.getByRole("tab", { name: "Release" }));
+		await waitFor(() =>
+			expect(
+				requestWindow.__collectionActivityPaths?.filter(
+					(path) => path === releasePath,
+				),
+			).toHaveLength(2),
+		);
+		await userEvent.click(canvas.getByRole("button", { name: "下一页" }));
+		await waitFor(() =>
+			expect(requestWindow.__collectionActivityAbortCount).toBe(1),
+		);
+		await waitFor(() =>
+			expect(requestWindow.__collectionActivityPaths).toHaveLength(4),
+		);
+		await waitFor(() => expect(canvas.getByText(/第 2\/2 页/)).toBeVisible());
+	},
+};
+
 export const ActivityTabIsolation: Story = {
 	tags: ["admin-collection-activity"],
 	args: {
