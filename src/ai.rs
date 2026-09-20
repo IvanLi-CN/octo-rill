@@ -442,9 +442,7 @@ impl LlmScheduler {
         for model in &ordered_models {
             let cooldown_until = health_for_model(&routing.health, model)
                 .and_then(|entry| entry.cooldown_until.filter(|until| *until > now));
-            let Some(cooldown_until) = cooldown_until else {
-                return None;
-            };
+            let cooldown_until = cooldown_until?;
             cooldowns.push(cooldown_until);
         }
         cooldowns.into_iter().min().map(|until| until.to_rfc3339())

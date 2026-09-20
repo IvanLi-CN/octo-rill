@@ -4,7 +4,6 @@ use anyhow::{Context, Result, anyhow};
 use axum::{Json, extract::State, http::StatusCode};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use tower_sessions::Session;
 
@@ -1093,6 +1092,7 @@ pub async fn admin_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn pool() -> SqlitePool {
