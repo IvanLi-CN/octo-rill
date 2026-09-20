@@ -71,7 +71,7 @@
 
 控制记录保存阶段、处理量、阶段总量、最近 ID、恢复数、错误码和完成时间。管理员可读取状态并在批次边界暂停、恢复；失败后可从已提交游标前向继续。`GET /api/admin/jobs/content-processing/identity-upgrade` 返回进度，`POST` 接收 `{"action":"pause"}` 或 `{"action":"resume"}`。升级完成还会请求既有搜索索引 content-projection phase 重算，以统一当前投影读取。
 
-每次新尝试在 `attempt_started` 中写安全配置快照、按顺序排列的模型路由快照及配置指纹。快照不保存 URL 原文、用户凭据或密钥；只保留 URL origin、完整 URL 的 SHA-256、API key 的 SHA-256 和模型路由。调用期间使用该次记录的路由顺序，后续尝试重新读取当时的有效配置。
+每次新尝试在 `attempt_started` 中写安全配置快照、按顺序排列的模型路由快照及配置指纹。worker 在领取工作项的同一 SQLite 写事务中读取持久化模型路由并写入开始事件；这让跨实例配置更新与 claim 按数据库写锁线性排序，避免 runtime 尚未 heartbeat 的实例用旧路由开始新尝试。快照不保存 URL 原文、用户凭据或密钥；只保留 URL origin、完整 URL 的 SHA-256、API key 的 SHA-256 和模型路由。调用期间使用该次记录的路由顺序，后续尝试重新读取当时的有效配置。
 
 Feed 翻译与润色 hook 将 `blocked_config` 保持为原请求的 pending 状态，状态轮询间隔为 30 秒，网络错误退避最高 5 分钟，不受普通 pending 的最大等待年龄限制。已发布的匹配结果不会因模型变化重跑；卡片保留服务端返回的可读结果并显示既定等待文案，不提供手动重试入口。
 
