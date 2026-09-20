@@ -26,7 +26,7 @@ import type {
 import { Button } from "@/components/ui/button";
 
 const DOM_CELL_LIMIT = 8_000;
-const CELL_SIZE = 14;
+const CELL_SIZE = 24;
 const CELL_GAP = 3;
 const HOUR_LABEL_WIDTH = 70;
 const VIEWPORT_HEIGHT = 320;
@@ -205,7 +205,7 @@ const DomActivityRows = memo(function DomActivityRows({
 							{formatHour(bucket.started_at)}
 						</time>
 						<div
-							className="grid min-h-3.5 content-start justify-start gap-[3px]"
+							className="grid min-h-6 content-start justify-start gap-[3px]"
 							style={{
 								gridTemplateColumns: `repeat(auto-fill, ${CELL_SIZE}px)`,
 							}}
@@ -214,7 +214,7 @@ const DomActivityRows = memo(function DomActivityRows({
 								<button
 									key={`${cell.id}:${cell.source_time}`}
 									type="button"
-									className={`size-3.5 rounded-[2px] ring-1 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring ${STATUS_CLASS[cell.composite_status]}`}
+									className={`size-6 rounded-[2px] ring-1 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring ${STATUS_CLASS[cell.composite_status]}`}
 									aria-label={cellLabel(cell)}
 									aria-describedby={
 										activeCell === cell
@@ -261,6 +261,39 @@ type CanvasBucketLayout = {
 	lineCount: number;
 };
 
+function verticalNeighborIndex(
+	buckets: AdminCollectionActivityBucket[],
+	layouts: CanvasBucketLayout[],
+	columns: number,
+	currentIndex: number,
+	currentBucketIndex: number,
+	direction: -1 | 1,
+) {
+	const currentLayout = layouts[currentBucketIndex];
+	const localIndex = currentIndex - currentLayout.start;
+	const currentLine = Math.floor(localIndex / columns);
+	const column = localIndex % columns;
+	let bucketIndex = currentBucketIndex;
+	let line = currentLine + direction;
+
+	while (bucketIndex >= 0 && bucketIndex < buckets.length) {
+		const bucket = buckets[bucketIndex];
+		const layout = layouts[bucketIndex];
+		if (bucket.cells.length > 0 && line >= 0 && line < layout.lineCount) {
+			const lineStart = line * columns;
+			const cellsInLine = Math.min(columns, bucket.cells.length - lineStart);
+			return layout.start + lineStart + Math.min(column, cellsInLine - 1);
+		}
+
+		bucketIndex += direction;
+		if (bucketIndex >= 0 && bucketIndex < buckets.length) {
+			line = direction < 0 ? layouts[bucketIndex].lineCount - 1 : 0;
+		}
+	}
+
+	return currentIndex;
+}
+
 const CanvasActivityGrid = memo(function CanvasActivityGrid({
 	buckets,
 	kind,
@@ -278,8 +311,8 @@ const CanvasActivityGrid = memo(function CanvasActivityGrid({
 	const [activeIndex, setActiveIndex] = useState<number | null>(null);
 	const cells = useMemo(
 		() =>
-			buckets.flatMap((bucket) =>
-				bucket.cells.map((cell) => ({ bucket, cell })),
+			buckets.flatMap((bucket, bucketIndex) =>
+				bucket.cells.map((cell) => ({ bucketIndex, cell })),
 			),
 		[buckets],
 	);
@@ -414,6 +447,9 @@ const CanvasActivityGrid = memo(function CanvasActivityGrid({
 			);
 			const column = Math.floor((x - HOUR_LABEL_WIDTH) / CELL_STEP);
 			if (line < 0 || column < 0 || column >= columns) return null;
+			const localX = (x - HOUR_LABEL_WIDTH) % CELL_STEP;
+			const localY = (y - layout.top - layout.headerHeight) % CELL_STEP;
+			if (localX >= CELL_SIZE || localY >= CELL_SIZE) return null;
 			const cellIndex = line * columns + column;
 			if (cellIndex >= buckets[bucketIndex].cells.length) return null;
 			return layout.start + cellIndex;
@@ -424,7 +460,7 @@ const CanvasActivityGrid = memo(function CanvasActivityGrid({
 	const onGridKeyDown = useCallback(
 		(event: KeyboardEvent<HTMLDivElement>) => {
 			if (cells.length === 0) return;
-			const current = activeIndex ?? 0;
+			const current = Math.min(activeIndex ?? 0, cells.length - 1);
 			let next: number | null = null;
 			switch (event.key) {
 				case "ArrowLeft":
@@ -434,10 +470,24 @@ const CanvasActivityGrid = memo(function CanvasActivityGrid({
 					next = Math.min(cells.length - 1, current + 1);
 					break;
 				case "ArrowUp":
-					next = Math.max(0, current - columns);
+					next = verticalNeighborIndex(
+						buckets,
+						layouts,
+						columns,
+						current,
+						cells[current]?.bucketIndex ?? 0,
+						-1,
+					);
 					break;
 				case "ArrowDown":
-					next = Math.min(cells.length - 1, current + columns);
+					next = verticalNeighborIndex(
+						buckets,
+						layouts,
+						columns,
+						current,
+						cells[current]?.bucketIndex ?? 0,
+						1,
+					);
 					break;
 				case "Home":
 					next = 0;
@@ -459,13 +509,12 @@ const CanvasActivityGrid = memo(function CanvasActivityGrid({
 			event.preventDefault();
 			setActiveIndex(next);
 		},
-		[activeIndex, cells, columns, kind, onOpenRecord],
+		[activeIndex, buckets, cells, columns, kind, layouts, onOpenRecord],
 	);
 
 	useEffect(() => {
 		if (activeIndex === null || !active) return;
-		const bucketIndex = buckets.indexOf(active.bucket);
-		const layout = layouts[bucketIndex];
+		const layout = layouts[active.bucketIndex];
 		const localIndex = activeIndex - layout.start;
 		const cellTop =
 			layout.top +

@@ -1226,9 +1226,10 @@ export function AiOperationsRecordsSection({
 	useEffect(() => {
 		const requestId = listRequestRef.current + 1;
 		listRequestRef.current = requestId;
-		activityControllerRef.current?.abort();
+		const interruptedActivityRequest = activityControllerRef.current;
+		interruptedActivityRequest?.abort();
 		activityControllerRef.current = null;
-		if (activityPendingRef.current && !activityCacheRef.current.has(tab)) {
+		if (interruptedActivityRequest) {
 			activityNeedsReadRef.current = true;
 		}
 		activityPendingRef.current = false;

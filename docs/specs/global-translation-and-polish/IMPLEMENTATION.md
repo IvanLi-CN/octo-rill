@@ -43,9 +43,9 @@ Release、公告、通知和日报的管理列表都先在 SQLite 中构造规�
 
 Release、公告、通知和日报活动读取在服务端按固定 UTC 十二小时半开窗先构造规范来源候选，再将 global、legacy、coverage 或 brief LLM 状态限制到这些候选。公告沿用 discussion 的 `MAX(occurred_at)` 聚合与全历史 canonical 校验；通知使用 `updated_at DESC, id DESC`；摘要计数由响应中的完整 cells 计算。活动 GET 复用列表的单许可、五秒监督器与 503 语义。
 
-迁移 `0084` 在 Release、公告、通知、日报来源时间及日报最新 LLM call 上新增索引。100,000 条/类的无内容合成数据库副本上，EXPLAIN 确认了四类来源时间索引、公告 canonical 索引、通知 canonical 索引和日报最新 call 索引；每类预热后测 30 次。窗口返回数分别为 5,000、2,500、2,500、5,000；p95 为 193ms、154ms、66ms、132ms，p99 为 231ms、156ms、67ms、145ms，最大值为 231ms，均在读取预算内。完整命令和执行逻辑由忽略的 `admin_collection_activity_production_shape_budget` 测试承载。
+迁移 `0084` 在 Release、公告、通知、日报来源时间及日报最新 LLM call 上新增索引。100,000 条/类的无内容合成数据库副本上，EXPLAIN 确认了四类来源时间索引、公告 canonical 索引、通知 canonical 索引和日报最新 call 索引；每类预热后测 30 次。窗口返回数分别为 5,000、2,500、2,500、5,000；p95 为 894ms、456ms、251ms、384ms，p99 为 909ms、456ms、259ms、402ms，最大值为 909ms，均在读取预算内。每次采样均断言窗口返回数，完整命令和执行逻辑由忽略的 `admin_collection_activity_production_shape_budget` 测试承载。
 
-管理端只请求当前 tab 的活动接口；tab 切换等待当前列表读取结束，随后按 kind 使用五秒内存缓存。筛选和翻页只更新列表；手动刷新或活动读取失败后的重试才会重新读取图表。超过 8,000 cells 时切换到固定视口 Canvas、滚动虚拟绘制和可访问 active gridcell；数据本身不截断。
+管理端只请求当前 tab 的活动接口；tab 切换等待当前列表读取结束，随后按 kind 使用五秒内存缓存。筛选和翻页只更新列表；手动刷新或活动读取失败后的重试才会重新读取图表。DOM 与 Canvas 的活动格均为 24 CSS px；Canvas 仅命中格子边界内的指针输入，上下方向键按每小时独立视觉行移动并在小时边界保持列位置。超过 8,000 cells 时切换到固定视口 Canvas、滚动虚拟绘制和可访问 active gridcell；数据本身不截断。
 
 ## Rollback and Data Safety
 

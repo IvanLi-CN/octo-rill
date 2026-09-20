@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, fn, userEvent, within } from "storybook/test";
+import { expect, fireEvent, fn, userEvent, within } from "storybook/test";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
 
 import { AdminCollectionActivity } from "@/admin/AdminCollectionActivity";
@@ -179,6 +179,9 @@ export const CurrentWindowOverview: Story = {
 		const firstCell = canvas.getByRole("button", {
 			name: /Bun v1\.4\.2/,
 		});
+		const target = firstCell.getBoundingClientRect();
+		await expect(target.width).toBeGreaterThanOrEqual(24);
+		await expect(target.height).toBeGreaterThanOrEqual(24);
 		await userEvent.hover(firstCell);
 		await expect(canvas.getByRole("tooltip")).toHaveTextContent("oven-sh/bun");
 		await userEvent.click(firstCell);
@@ -249,14 +252,54 @@ export const DenseCanvas: Story = {
 	play: async ({ canvasElement, args }) => {
 		const canvas = within(canvasElement);
 		const grid = canvas.getByRole("grid", { name: "最近十二小时内容活动" });
+		const scroll = grid.parentElement;
+		const drawingSurface = grid.querySelector("canvas");
 		await expect(
 			canvas.getByTestId("collection-activity-canvas-grid"),
 		).toBeVisible();
-		grid.focus();
-		await userEvent.keyboard("{ArrowRight}{Enter}");
-		await expect(args.onOpenRecord).toHaveBeenCalledWith(
-			"release",
-			expect.stringMatching(/^dense-/),
+		if (!scroll || !drawingSurface)
+			throw new Error("Expected the virtualized activity canvas");
+
+		const rect = drawingSurface.getBoundingClientRect();
+		fireEvent.click(drawingSurface, {
+			clientX: rect.left + 95,
+			clientY: rect.top + 28,
+		});
+		await expect(args.onOpenRecord).not.toHaveBeenCalled();
+
+		const columns = Math.max(1, Math.floor((rect.width - 70 - 8) / 27));
+		const firstHourCellCount = Math.ceil(8_001 / 12);
+		const firstHourHeight =
+			23 + Math.ceil(firstHourCellCount / columns) * 27 + 8;
+		scroll.scrollTop = firstHourHeight;
+		fireEvent.scroll(scroll);
+		fireEvent.pointerMove(drawingSurface, {
+			clientX: rect.left + 75,
+			clientY: rect.top + 28,
+		});
+		await expect(grid).toHaveAttribute(
+			"aria-activedescendant",
+			"collection-activity-grid-cell-667",
 		);
+		grid.focus();
+		await userEvent.keyboard("{ArrowUp}");
+		const previousHourLastLine =
+			Math.floor((firstHourCellCount - 1) / columns) * columns;
+		await expect(grid).toHaveAttribute(
+			"aria-activedescendant",
+			`collection-activity-grid-cell-${previousHourLastLine}`,
+		);
+		await userEvent.keyboard("{ArrowDown}");
+		await expect(grid).toHaveAttribute(
+			"aria-activedescendant",
+			"collection-activity-grid-cell-667",
+		);
+		grid.focus();
+		await userEvent.keyboard("{Enter}");
+		await expect(args.onOpenRecord).toHaveBeenCalledWith("release", "dense-1");
+		await userEvent.keyboard("{Escape}");
+		scroll.scrollTop = 0;
+		fireEvent.scroll(scroll);
+		grid.blur();
 	},
 };

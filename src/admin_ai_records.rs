@@ -4106,6 +4106,12 @@ mod tests {
             CollectionRecordKind::Notification,
             CollectionRecordKind::Brief,
         ] {
+            let expected_rows = match kind {
+                CollectionRecordKind::Release => 5_000,
+                CollectionRecordKind::Announcement => 2_500,
+                CollectionRecordKind::Notification => 2_500,
+                CollectionRecordKind::Brief => 5_000,
+            };
             let explain = format!("EXPLAIN QUERY PLAN {}", activity_query_sql(kind, true));
             let plan = sqlx::query_as::<_, ExplainPlanRow>(&explain)
                 .bind(WINDOW_FROM)
@@ -4149,6 +4155,11 @@ mod tests {
                 let rows = load_activity_rows(&pool, kind, true, WINDOW_FROM, WINDOW_BEFORE)
                     .await
                     .expect("run bounded activity query");
+                assert_eq!(
+                    rows.len(),
+                    expected_rows,
+                    "{kind:?} activity row count changed at sample {sample}"
+                );
                 if sample > 0 {
                     elapsed.push(started.elapsed());
                 }
