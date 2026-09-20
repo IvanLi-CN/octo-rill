@@ -2618,7 +2618,7 @@ mod tests {
         .unwrap();
 
         sqlx::query(
-            "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, attempt_count, created_at, updated_at) VALUES ('global-model-a', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-1', 'protocol-1', 'model-a', '{}', 'config-a', 'blocked_config', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('global-model-b', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-1', 'protocol-1', 'model-b', '{}', 'config-b', 'ready', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, attempt_count, created_at, updated_at) VALUES ('global-model-a', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-1', 'protocol-1', 'model-a', '{}', 'config-a', 'blocked_config', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('global-model-b', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-1', 'protocol-1', 'model-b', '{}', 'config-b', 'ready', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('global-model-c', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-2', 'protocol-1', 'model-a', '{}', 'config-a', 'ready', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('global-model-d', 'release', 'release-2', 'translation', 'summary', 'zh-CN', 'hash-3', 'protocol-1', 'model-c', '{}', 'config-c', 'ready', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .execute(&pool)
         .await
@@ -2762,11 +2762,16 @@ mod tests {
                 .any(|column| column == "model_profile")
         );
 
-        for (id, source_hash) in [("identity-a", "hash-1"), ("identity-b", "hash-2")] {
+        for (id, resource_id, source_hash) in [
+            ("identity-a", "release-1", "hash-1"),
+            ("identity-b", "release-1", "hash-2"),
+            ("identity-c", "release-2", "hash-3"),
+        ] {
             sqlx::query(
-                "INSERT INTO content_work_identities (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, created_at, updated_at) VALUES (?, 'release', 'release-1', 'translation', 'summary', 'zh-CN', ?, 'protocol-1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                "INSERT INTO content_work_identities (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, created_at, updated_at) VALUES (?, 'release', ?, 'translation', 'summary', 'zh-CN', ?, 'protocol-1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
             )
             .bind(id)
+            .bind(resource_id)
             .bind(source_hash)
             .execute(&pool)
             .await
@@ -2778,6 +2783,54 @@ mod tests {
         .execute(&pool)
         .await;
         assert!(duplicate_identity.is_err());
+        for (work_item_id, identity_id, resource_id, source_hash) in [
+            ("global-model-a", "identity-a", "release-1", "hash-1"),
+            ("global-model-b", "identity-a", "release-1", "hash-1"),
+            ("global-model-c", "identity-b", "release-1", "hash-2"),
+            ("global-model-d", "identity-c", "release-2", "hash-3"),
+        ] {
+            sqlx::query(
+                "INSERT INTO content_work_identity_members (work_item_id, identity_id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, linked_at) VALUES (?, ?, 'release', ?, 'translation', 'summary', 'zh-CN', ?, 'protocol-1', CURRENT_TIMESTAMP)",
+            )
+            .bind(work_item_id)
+            .bind(identity_id)
+            .bind(resource_id)
+            .bind(source_hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let mismatched_member = sqlx::query(
+            "INSERT INTO content_work_identity_members (work_item_id, identity_id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, linked_at) VALUES ('global-model-c', 'identity-a', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-1', 'protocol-1', CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mismatched_member.is_err());
+
+        sqlx::query(
+            "INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ('identity-a', 'global-model-a', 'global-model-c', NULL, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mismatched_projection_work = sqlx::query(
+            "INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ('identity-a', 'global-model-c', NULL, NULL, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mismatched_projection_work.is_err());
+        let mismatched_active_work = sqlx::query(
+            "INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ('identity-a', 'global-model-a', 'global-model-d', NULL, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mismatched_active_work.is_err());
+        sqlx::query(
+            "INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ('identity-b', 'global-model-c', NULL, NULL, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN ('idx_notifications_admin_canonical_source', 'idx_translation_work_items_admin_entity_kind_attempt')",
