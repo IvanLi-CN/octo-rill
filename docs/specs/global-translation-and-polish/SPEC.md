@@ -20,6 +20,7 @@
 - REQ-GTP-PROVIDER-GUARD: 持久化的提供方熔断与路由健康状态优先于人工重试。熔断打开时，授权请求仍创建请求者关联，但工作项保持或转入 `deferred_provider`；只有调度器拥有的受控探测可以恢复提供方调用，人工请求不得绕过熔断。
 - REQ-GTP-ADMIN-READS: 管理页和详情读取必须是纯读取，不得补覆盖范围、创建工作项、重试或写入缓存。它必须分别展示当前全局工作状态、当前结果投影和旧事实来源；只有旧缓存且没有全局工作或结果时显示 `legacy_cached`，旧工作与缓存无法一致解释时显示 `legacy_conflict`。不得以缓存回退伪造“已完成”“未开始”或尝试次数。
 - REQ-GTP-ADMIN-READ-BUDGET: 管理采集记录列表的查询窗最长三十一天，必须在数据库中以完全相同的筛选语义分别取得精确总数和当前页标识，并且只装载当前页的处理摘要。列表不得使用结果缓存、请求合并或内存全量分页；源站读取预算为五秒，同类并发读取容量耗尽时返回带 `Retry-After` 的 `503`。
+- REQ-GTP-ADMIN-ACTIVITY: 内容处理管理页的 Release、公告、通知、日报各 tab 必须提供独立的只读活动概览。活动窗固定为 UTC 当前整点及其之前连续十一个小时组成的半开区间，含当前未完整小时；以规范采集记录来源时间归桶，与列表筛选、分页无关。每条窗内规范记录必须表示为一个 cell，并提供标题、仓库（日报为空）、来源时间、适用 pipeline 的既有 `display_status` 和综合状态；摘要精确统计窗内内容总数、完成、处理中、异常，并提供中性数量。异常优先于处理中；无异常且至少一个适用 lane 排队或运行时为处理中；所有适用 lane 均为成功或不适用时为完成；其余为中性。活动读取不得补覆盖范围或派生处理事实，必须使用有界来源候选、既有管理员读取闸门及五秒预算；超限时完整失败，不得静默截断。
 - REQ-GTP-LEGACY: 现有 `translation_work_items`、`translation_requests`、尝试事件和 `ai_translations` 行必须保留为只读历史事实；其中 `release_smart`、`announcement_smart` 等润色记录与翻译记录适用同一保留规则。迁移只能从其读取并记录可追溯的旧事实观察，绝不把旧缓存、旧状态或旧尝试合成为全局工作、全局结果或新的尝试历史。
 - REQ-GTP-CUTOVER: 全局模型必须经由单一写入者切换，不得长期双写。切换前必须停止旧写入路径并完成运行中旧批次的受控收口；切换后由全局调度器接收新的覆盖请求。转换期间内容处理请求返回带轮询信息的 `503`，而不是部分落入新旧两个模型。
 - REQ-GTP-COMPATIBILITY: 数据库演进必须使用扩展表、索引和控制记录。必须先发布含有该迁移且仍能安全运行旧行为的兼容版本，再发布不含新迁移的全局切换版本。兼容版本在检测到全局模式时禁用旧内容处理写入，允许降级后二进制继续打开数据库；不含该迁移版本的更旧应用不得作为回滚目标。
@@ -42,6 +43,7 @@
 - VER-GTP-LIFECYCLE: covers: REQ-GTP-RESULTS, REQ-GTP-CACHE-HIT, REQ-GTP-LIFECYCLE, REQ-GTP-CONFIGURATION, REQ-GTP-RETRY-COORDINATION, REQ-GTP-PROVIDER-GUARD。验证来源变更、删除、有效与无效输出、跨模型当前结果命中生成零次尝试的 `ready` 工作项、运行中尝试固定其配置快照、后续尝试使用新配置、无效配置进入 `blocked_config` 后只由配置更新事件唤醒、有效结果不因配置变化重跑、五分钟冷却、并发手动重试 `409`、熔断下的 `deferred_provider`、优先级与至少一个后台名额。
 - VER-GTP-ADMIN: covers: REQ-GTP-ADMIN-READS, REQ-GTP-LEGACY, REQ-GTP-NAMING, REQ-GTP-OBSERVABILITY。验证管理 GET 无写入，旧缓存不会被伪造成工作项，`legacy_cached` 与 `legacy_conflict` 有可追溯来源，诊断安全字段正确，界面始终显示“翻译”和“润色”。
 - VER-GTP-ADMIN-READ-BUDGET: covers: REQ-GTP-ADMIN-READ-BUDGET, REQ-GTP-NOTIFICATION-SOURCE。以生产形状的通知、遗留工作项和全局工作项夹具验证四类列表：总数与页码精确、状态筛选在分页前完成、跨用户同一通知线程使用规范来源、超过三十一天被拒绝、超时与并发饱和返回可重试 `503`，且释放读取容量。
+- VER-GTP-ADMIN-ACTIVITY: covers: REQ-GTP-ADMIN-ACTIVITY, REQ-GTP-ADMIN-READS, REQ-GTP-NOTIFICATION-SOURCE。验证四种来源时间和规范化、UTC 十二小时边界、单格与 summary 数量一致、既有 lane 显示状态及综合状态优先级、无读写副作用，以及生产形状查询计划和读取延迟预算。
 - VER-GTP-CUTOVER: covers: REQ-GTP-CUTOVER, REQ-GTP-COMPATIBILITY。以旧事实混合、运行中旧批次、切换冻结、全局写入启用和切换版本降级到兼容版本的数据库副本验证：旧行未改变，转换无双写，兼容版本可启动且旧写入者失效，更旧版本被部署检查拒绝。
 - VER-GTP-IDENTITY-MIGRATION: covers: REQ-GTP-IDENTITY, REQ-GTP-RESULTS, REQ-GTP-CONFIGURATION, REQ-GTP-IDENTITY-MIGRATION。以同一新身份下含多个模型专属有效投影、重复工作项、请求关联和历史尝试的数据库副本验证：最近发布的有效投影成为唯一当前结果，历史关联仍可追溯；只有无源哈希匹配有效投影的阻塞身份被自动排队一次，并遵循正常调度边界；存在有效投影的阻塞项不触发模型调用。
 - VER-GTP-IDENTITY-UPGRADE-COMPATIBILITY: covers: REQ-GTP-IDENTITY-UPGRADE-COMPATIBILITY。验证兼容迁移只添加 schema 与 pending 控制记录、不回填或改变现有数据；兼容版本重复启动可打开数据库，缺少该迁移的旧二进制被拒绝；后续身份回填可暂停、重入并按阶段报告完成。
@@ -53,7 +55,9 @@
 | Global content-processing request API | HTTP API | external | Modify | [http-apis.md](./contracts/http-apis.md) | backend | web, existing producers |
 | Content-processing status and retry API | HTTP API | external | Modify | [http-apis.md](./contracts/http-apis.md) | backend | web, admin |
 | AI records and detail API | HTTP API | external | Modify | [http-apis.md](./contracts/http-apis.md) | backend | admin web |
+| AI records activity API | HTTP API | external | Add | [http-apis.md](./contracts/http-apis.md) | backend | admin web |
 | Global work, result, requester and legacy-evidence tables | DB schema | internal | Modify | [db.md](./contracts/db.md) | backend | scheduler, API, admin read model |
+| Admin collection activity indexes | SQLite migration | internal | Add | [db.md](./contracts/db.md) | backend | admin activity read |
 | Existing user-scoped scheduler and cache tables | DB schema | internal | Retain read-only | [db.md](./contracts/db.md) | backend | legacy evidence reader |
 
 ## Related ADRs
@@ -150,3 +154,51 @@
   submission_gate: approved
   evidence_note: 移动宽度下告警内容、原有刷新按钮和保留筛选提示自然换行，无重叠或横向溢出。
   image: ![管理采集记录移动端读取繁忙状态](./assets/busy-read-mobile.png)
+
+- source_type: storybook_canvas
+  target_program: mock-only
+  story_id_or_title: Admin/AdminCollectionActivity/Current Window Overview
+  state: desktop current-window overview with selected record details
+  requested_viewport: 1440x1000
+  viewport_strategy: storybook-viewport
+  capture_scope: element
+  margin_policy: require_margin
+  evidence_surface: component
+  surface_selector: "[data-visual-evidence-surface]"
+  target_selector: "[data-visual-evidence-target]"
+  sensitive_exclusion: N/A (synthetic Storybook fixture)
+  submission_gate: approved
+  evidence_note: 桌面活动图展示四项统计、中性状态图例、完整的 12 小时纵轴及选中记录详情。
+  image: ![内容处理活动图桌面视图](./assets/admin-collection-activity-desktop.png)
+
+- source_type: storybook_canvas
+  target_program: mock-only
+  story_id_or_title: Admin/AdminCollectionActivity/Mobile Overview
+  state: 393px mobile overview
+  requested_viewport: 393x852
+  viewport_strategy: storybook-viewport
+  capture_scope: element
+  margin_policy: require_margin
+  evidence_surface: component
+  surface_selector: "[data-visual-evidence-surface]"
+  target_selector: "[data-visual-evidence-target]"
+  sensitive_exclusion: N/A (synthetic Storybook fixture)
+  submission_gate: approved
+  evidence_note: 393px 移动宽度下统计项自然折行，状态图例与最近 12 小时纵轴完整可读且无横向溢出。
+  image: ![内容处理活动图移动视图](./assets/admin-collection-activity-mobile.png)
+
+- source_type: storybook_canvas
+  target_program: mock-only
+  story_id_or_title: Admin/AdminCollectionActivity/Dense Canvas
+  state: 8001-cell virtual Canvas
+  requested_viewport: 1440x1000
+  viewport_strategy: storybook-viewport
+  capture_scope: element
+  margin_policy: require_margin
+  evidence_surface: component
+  surface_selector: "[data-visual-evidence-surface]"
+  target_selector: "[data-visual-evidence-target]"
+  sensitive_exclusion: N/A (synthetic Storybook fixture)
+  submission_gate: approved
+  evidence_note: 超过 8000 格时使用可滚动 Canvas 展示逐条状态格与多行小时布局，未聚合或截断。
+  image: ![内容处理活动图高密度 Canvas](./assets/admin-collection-activity-canvas.png)

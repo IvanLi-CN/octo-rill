@@ -52,6 +52,65 @@ The operational freeze endpoint `POST /api/admin/jobs/content-processing/freeze`
 - A lane without a global work or result but with retained cache evidence reports `legacy_cached`; a lane with irreconcilable retained evidence reports `legacy_conflict`. Neither is serialized as `ready`, `failed`, `unstarted` or an attempt count.
 - User-visible and administrator-facing labels are exactly “翻译” and “润色”.
 
+## Admin Collection Activity
+
+`GET /api/admin/jobs/ai-records/{kind}/activity` is an administrator-only,
+side-effect-free read for `release`, `announcement`, `notification` or `brief`.
+It accepts no list filters or pagination parameters. Its fixed window starts at
+the UTC hour containing the server's current time minus eleven hours and ends
+at the next UTC hour boundary; both endpoints are serialized as UTC RFC 3339
+timestamps, with the end exclusive. The response always contains twelve
+hourly buckets in newest-first order, including the current partial hour.
+
+The response shape is:
+
+```json
+{
+  "kind": "release",
+  "bucket_minutes": 60,
+  "bucket_count": 12,
+  "window_started_at": "2026-09-20T00:00:00Z",
+  "window_ended_at": "2026-09-20T12:00:00Z",
+  "summary": {
+    "content_count": 2,
+    "completed_count": 1,
+    "processing_count": 0,
+    "exception_count": 1,
+    "neutral_count": 0
+  },
+  "buckets": [
+    {
+      "started_at": "2026-09-20T11:00:00Z",
+      "ended_at": "2026-09-20T12:00:00Z",
+      "cells": [
+        {
+          "id": "383114065",
+          "title": "Bun v1.4.2",
+          "repository": "oven-sh/bun",
+          "source_time": "2026-09-20T11:55:00Z",
+          "translation_status": "succeeded",
+          "polish_status": "failed",
+          "composite_status": "exception"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Each canonical source record appears exactly once in its source-time bucket.
+`translation_status` is `null` for briefs; `repository` is `null` for briefs.
+Lane statuses use the existing `display_status` vocabulary. Composite status
+is `completed`, `processing`, `exception` or `neutral`, and follows the
+precedence defined by `REQ-GTP-ADMIN-ACTIVITY`. The summary counts the same
+records as the cells and includes neutral records even though the UI presents
+their count in the legend.
+
+The read uses the existing single-permit admin collection gate and five-second
+budget. Saturation and timeout preserve the list endpoint's 503 error codes,
+`Retry-After: 1`, and complete-failure behavior; the endpoint never returns a
+partial set of cells.
+
 ## Retry Authorization
 
 Any caller authorized to read the canonical resource may request retry of a terminal global failure. The service applies the same cooldown, lifecycle and access checks regardless of which authorized caller made the original request. `blocked_config` is not a terminal failure and is not manually retried; a relevant valid configuration update resumes it through the scheduler.

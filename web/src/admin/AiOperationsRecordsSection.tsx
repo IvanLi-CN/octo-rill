@@ -19,16 +19,19 @@ import {
 } from "@/admin/jobsRouteState";
 import {
 	ApiError,
+	type AdminCollectionActivityResponse,
 	type AdminCollectionAttempt,
 	type AdminCollectionRecordDetail,
 	type AdminCollectionRecordItem,
 	type AdminCollectionTaskSummary,
 	type AdminLlmCallDetailResponse,
 	apiGetAdminCollectionRecordDetail,
+	apiGetAdminCollectionActivity,
 	apiGetAdminCollectionRecords,
 	apiGetAdminLlmCallDetail,
 } from "@/api";
 import { LlmCallDiagnosticDetail } from "@/admin/LlmCallDiagnosticDetail";
+import { AdminCollectionActivity } from "@/admin/AdminCollectionActivity";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
@@ -77,6 +80,7 @@ type CollectionReadError = {
 	code?: string;
 };
 const PAGE_SIZE = 20;
+const ACTIVITY_CACHE_MS = 5_000;
 const ATTEMPT_RANGE_MAX = 10;
 const ATTEMPT_UNBOUNDED_VALUE = ATTEMPT_RANGE_MAX + 1;
 const DEFAULT_ATTEMPT_RANGE: AttemptCountRange = { min: 0, max: null };
@@ -1075,6 +1079,12 @@ export function AiOperationsRecordsSection({
 	const [total, setTotal] = useState(0);
 	const [loading, setLoading] = useState(false);
 	const [reloadNonce, setReloadNonce] = useState(0);
+	const [activity, setActivity] =
+		useState<AdminCollectionActivityResponse | null>(null);
+	const [activityLoading, setActivityLoading] = useState(false);
+	const [activityError, setActivityError] = useState<string | null>(null);
+	const [activityRetryNonce, setActivityRetryNonce] = useState(0);
+	const [listReadCycle, setListReadCycle] = useState(0);
 	const [error, setError] = useState<CollectionReadError | null>(null);
 	const [detail, setDetail] = useState<AdminCollectionRecordDetail | null>(
 		null,
@@ -1086,6 +1096,21 @@ export function AiOperationsRecordsSection({
 	const [detailError, setDetailError] = useState<string | null>(null);
 	const listRequestRef = useRef(0);
 	const detailRequestRef = useRef(0);
+	const activityRequestRef = useRef(0);
+	const activityControllerRef = useRef<AbortController | null>(null);
+	const activityCacheRef = useRef(
+		new Map<
+			CollectionTab,
+			{ data: AdminCollectionActivityResponse; storedAt: number }
+		>(),
+	);
+	const activityNeedsReadRef = useRef(true);
+	const activityForceReadRef = useRef(false);
+	const activityPendingRef = useRef(false);
+	const listReadActiveRef = useRef(false);
+	const activityTabRef = useRef(tab);
+	const handledReloadNonceRef = useRef(0);
+	const handledActivityRetryNonceRef = useRef(0);
 	const commitFilters = useCallback(
 		(next: Partial<AiRecordRouteFilters>) => {
 			if (!onFiltersChange) return;
@@ -1189,8 +1214,26 @@ export function AiOperationsRecordsSection({
 		translationStatuses,
 	]);
 	useEffect(() => {
+		if (activityTabRef.current !== tab) {
+			activityTabRef.current = tab;
+			activityNeedsReadRef.current = true;
+		}
+		const cached = activityCacheRef.current.get(tab);
+		setActivity(cached?.data ?? null);
+		setActivityError(null);
+		setActivityLoading(!cached);
+	}, [tab]);
+	useEffect(() => {
 		const requestId = listRequestRef.current + 1;
 		listRequestRef.current = requestId;
+		const interruptedActivityRequest = activityControllerRef.current;
+		interruptedActivityRequest?.abort();
+		activityControllerRef.current = null;
+		if (interruptedActivityRequest) {
+			activityNeedsReadRef.current = true;
+		}
+		activityPendingRef.current = false;
+		listReadActiveRef.current = true;
 		const abortController = new AbortController();
 		setLoading(true);
 		setError(null);
@@ -1244,9 +1287,17 @@ export function AiOperationsRecordsSection({
 				});
 			})
 			.finally(() => {
-				if (requestId === listRequestRef.current) setLoading(false);
+				if (requestId === listRequestRef.current) {
+					setLoading(false);
+					listReadActiveRef.current = false;
+					setListReadCycle((current) => current + 1);
+				}
 			});
-		return () => abortController.abort();
+		return () => {
+			abortController.abort();
+			if (requestId === listRequestRef.current)
+				listReadActiveRef.current = false;
+		};
 	}, [
 		page,
 		reloadNonce,
@@ -1258,6 +1309,71 @@ export function AiOperationsRecordsSection({
 		polishStatuses,
 		translationStatuses,
 	]);
+	useEffect(() => {
+		if (!activityNeedsReadRef.current || listReadActiveRef.current) return;
+
+		const cached = activityCacheRef.current.get(tab);
+		const reloadRequested = reloadNonce > handledReloadNonceRef.current;
+		const retryRequested =
+			activityRetryNonce > handledActivityRetryNonceRef.current;
+		const forceRead =
+			activityForceReadRef.current || reloadRequested || retryRequested;
+		handledReloadNonceRef.current = reloadNonce;
+		handledActivityRetryNonceRef.current = activityRetryNonce;
+		activityNeedsReadRef.current = false;
+		activityForceReadRef.current = false;
+
+		if (
+			!forceRead &&
+			cached &&
+			Date.now() - cached.storedAt < ACTIVITY_CACHE_MS
+		) {
+			setActivity(cached.data);
+			setActivityError(null);
+			setActivityLoading(false);
+			return;
+		}
+
+		const requestId = activityRequestRef.current + 1;
+		activityRequestRef.current = requestId;
+		const abortController = new AbortController();
+		activityControllerRef.current = abortController;
+		activityPendingRef.current = true;
+		setActivityLoading(
+			!cached || forceRead || Date.now() - cached.storedAt >= ACTIVITY_CACHE_MS,
+		);
+		setActivityError(null);
+		void apiGetAdminCollectionActivity(tab, abortController.signal)
+			.then((response) => {
+				if (requestId !== activityRequestRef.current) return;
+				const entry = { data: response, storedAt: Date.now() };
+				activityCacheRef.current.set(tab, entry);
+				setActivity(response);
+			})
+			.catch((cause: unknown) => {
+				if (requestId !== activityRequestRef.current) return;
+				if (cause instanceof DOMException && cause.name === "AbortError")
+					return;
+				if (cause instanceof ApiError) {
+					setActivityError(
+						cause.code === "admin_collection_records_busy"
+							? "读取服务正忙，请稍后重试。"
+							: cause.code === "admin_collection_records_timeout"
+								? "活动读取超过安全时间，数据未被截断。"
+								: "读取活动数据失败，请稍后重试。",
+					);
+					return;
+				}
+				setActivityError("读取活动数据失败，请稍后重试。");
+			})
+			.finally(() => {
+				if (requestId !== activityRequestRef.current) return;
+				activityPendingRef.current = false;
+				activityControllerRef.current = null;
+				setActivityLoading(false);
+			});
+		return () => abortController.abort();
+	}, [activityRetryNonce, listReadCycle, reloadNonce, tab]);
 	useEffect(() => {
 		if (!detailRoute) {
 			setDetail(null);
@@ -1377,6 +1493,12 @@ export function AiOperationsRecordsSection({
 							value={tab}
 							onValueChange={(value) => {
 								const nextTab = value as CollectionTab;
+								activityNeedsReadRef.current = true;
+								activityForceReadRef.current = false;
+								const cached = activityCacheRef.current.get(nextTab);
+								setActivity(cached?.data ?? null);
+								setActivityLoading(!cached);
+								setActivityError(null);
 								setTab(nextTab);
 								commitFilters({ kind: nextTab });
 							}}
@@ -1420,7 +1542,11 @@ export function AiOperationsRecordsSection({
 								variant="outline"
 								size="icon"
 								className="size-11"
-								onClick={() => setReloadNonce((current) => current + 1)}
+								onClick={() => {
+									activityNeedsReadRef.current = true;
+									activityForceReadRef.current = true;
+									setReloadNonce((current) => current + 1);
+								}}
 								disabled={loading}
 								aria-label="刷新记录"
 							>
@@ -1428,6 +1554,17 @@ export function AiOperationsRecordsSection({
 							</Button>
 						</div>
 					</div>
+					<AdminCollectionActivity
+						data={activity}
+						loading={activityLoading}
+						error={activityError}
+						onRetry={() => {
+							activityNeedsReadRef.current = true;
+							activityForceReadRef.current = true;
+							setActivityRetryNonce((current) => current + 1);
+						}}
+						onOpenRecord={onOpenRecord}
+					/>
 					<fieldset className="flex flex-wrap items-center gap-3 rounded-lg border border-border/70 bg-muted/30 p-2 sm:p-3">
 						<legend className="sr-only">处理状态筛选</legend>
 						<div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -1497,7 +1634,11 @@ export function AiOperationsRecordsSection({
 					{error ? (
 						<CollectionReadErrorState
 							error={error}
-							onRetry={() => setReloadNonce((current) => current + 1)}
+							onRetry={() => {
+								activityNeedsReadRef.current = true;
+								activityForceReadRef.current = true;
+								setReloadNonce((current) => current + 1);
+							}}
 						/>
 					) : null}
 					{loading ? (

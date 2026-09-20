@@ -21,3 +21,16 @@
 | 日报 | 0.01s | 0.01s | 0.01s |
 
 所有测量均低于 1s p95、2s p99 和 5s 单次读取预算。该文件不替代线上发布检查；生产数据库仍只允许通过受控只读副本执行验证。
+
+## Activity Read Validation
+
+迁移 `0085_admin_collection_activity_indexes.sql` 只新增索引。查询计划和延迟验证在 SQLite 内存合成副本上进行，每类创建 100,000 条源行，不含真实记录内容；每类先预热一次，再测 30 次。EXPLAIN 必须命中来源时间索引，并命中公告 canonical、通知 canonical、日报最新 LLM call 索引。
+
+| 记录类型 | 12h cells | p95 | p99 | 最大值 |
+| --- | ---: | ---: | ---: | ---: |
+| Release | 5,000 | 0.193s | 0.231s | 0.231s |
+| 公告 | 2,500 | 0.154s | 0.156s | 0.156s |
+| 通知 | 2,500 | 0.066s | 0.067s | 0.067s |
+| 日报 | 5,000 | 0.132s | 0.145s | 0.145s |
+
+验证命令：`cargo test --locked admin_collection_activity_production_shape_budget -- --ignored --nocapture`。输出只包含 kind、行数、索引计划与耗时，不包含记录内容；四类均满足 p95 1s、p99 2s 和单次 5s 预算。
