@@ -48,6 +48,21 @@ projections; those writes remain worker-owned.
 - `content_legacy_observations` can identify legacy evidence but cannot be used as a foreign-key source for a global result or work state.
 - `legacy_cached` means a displayable old cache lacks matching work evidence. `legacy_conflict` means old evidence cannot be safely reconciled. Neither classification creates an attempt count or current status.
 
+## Admin Activity Read Indexes
+
+The activity read first restricts source records to its fixed twelve-hour UTC
+window using `julianday(...)` expressions, then joins processing state only for
+those bounded canonical records. Its additive indexes must use the same
+expressions as the window predicates and canonical-source lookups:
+
+- Releases: source-time expression `julianday(COALESCE(published_at, created_at, updated_at))` followed by `release_id`.
+- Announcements: bounded-time lookup by `kind` and `julianday(occurred_at)`, plus canonical discussion lookup by `kind`, `lower(repo_full_name)`, `discussion_number` and `julianday(occurred_at)`.
+- Notifications: bounded-time lookup by `julianday(updated_at)` followed by thread and stable row identity; canonical selection remains `updated_at DESC, id DESC` within `thread_id`.
+- Briefs: source time `julianday(created_at)` followed by `id`; latest linked polish call by `parent_brief_id`, `updated_at DESC` and `id DESC`, matching the existing list projection.
+
+These are additive DDL-only indexes. Applying them does not backfill,
+reclassify, rewrite or delete source, work, observation or result rows.
+
 ## Polishing Migration Mapping
 
 The global tables are shared by both pipelines. A global polishing item uses `pipeline='polishing'`; it has the same global identity, source snapshot, frozen configuration, result projection, requester association and attempt audit as translation.

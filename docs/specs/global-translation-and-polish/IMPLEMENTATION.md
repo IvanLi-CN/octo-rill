@@ -27,6 +27,7 @@
 - `idx_notifications_thread_id`：为按全局通知线程读取 canonical source 提供 `thread_id` 前导索引；授权仍使用用户行单独校验。
 - `idx_notifications_admin_canonical_source`：按通知线程、更新时间和稳定行 ID 支持管理读取的规范来源选择。
 - `idx_translation_work_items_admin_entity_kind_attempt`：按实体、处理种类和尝试次数支持管理候选集筛选。
+- `0084_admin_collection_activity_indexes.sql`：只添加活动时间窗与日报最新调用查询所需的表达式索引，不改写历史行。
 
 迁移不执行 `DROP TABLE`、表改名、数据重建、旧行 `UPDATE`、旧行 `DELETE` 或把旧数据插入全局工作／结果／尝试表。`translation_work_items`、`translation_requests`、旧尝试事件和 `ai_translations` 继续存在；应用仅把它们当作旧事实读取。
 
@@ -37,6 +38,14 @@ Release、公告、通知和日报的管理列表都先在 SQLite 中构造规�
 列表请求把缺省或单边时间条件归一化为不超过 31 天的 UTC 窗口，完整读取（模式读取、候选查询、总数、当前页装载和摘要投影）共享一个容量为一的进程内闸门和五秒预算。闸门繁忙或读取超时分别返回 `admin_collection_records_busy`／`admin_collection_records_timeout`、HTTP 503 和 `Retry-After: 1`；超时会先取消并等待 SQL 任务清理，再释放许可。
 
 管理端客户端在切换种类、筛选或页码时取消失效请求，不自动重试；上述 503 显示既有页面内的人工刷新提示。线上形状副本验证了两项索引被选用，四类 31 天读取的三十次预热后测量均满足 p95 1 秒、p99 2 秒和单次 5 秒预算。
+
+## Admin Collection Activity
+
+Release、公告、通知和日报活动读取在服务端按固定 UTC 十二小时半开窗先构造规范来源候选，再将 global、legacy、coverage 或 brief LLM 状态限制到这些候选。公告沿用 discussion 的 `MAX(occurred_at)` 聚合与全历史 canonical 校验；通知使用 `updated_at DESC, id DESC`；摘要计数由响应中的完整 cells 计算。活动 GET 复用列表的单许可、五秒监督器与 503 语义。
+
+迁移 `0084` 在 Release、公告、通知、日报来源时间及日报最新 LLM call 上新增索引。100,000 条/类的无内容合成数据库副本上，EXPLAIN 确认了四类来源时间索引、公告 canonical 索引、通知 canonical 索引和日报最新 call 索引；每类预热后测 30 次。窗口返回数分别为 5,000、2,500、2,500、5,000；p95 为 193ms、154ms、66ms、132ms，p99 为 231ms、156ms、67ms、145ms，最大值为 231ms，均在读取预算内。完整命令和执行逻辑由忽略的 `admin_collection_activity_production_shape_budget` 测试承载。
+
+管理端只请求当前 tab 的活动接口；tab 切换等待当前列表读取结束，随后按 kind 使用五秒内存缓存。筛选和翻页只更新列表；手动刷新或活动读取失败后的重试才会重新读取图表。超过 8,000 cells 时切换到固定视口 Canvas、滚动虚拟绘制和可访问 active gridcell；数据本身不截断。
 
 ## Rollback and Data Safety
 

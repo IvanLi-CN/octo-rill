@@ -10,7 +10,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, SecondsFormat, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tower_sessions::Session;
@@ -104,6 +104,54 @@ pub struct AdminCollectionRecordsResponse {
     pub page: i64,
     pub page_size: i64,
     pub total: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminCollectionActivityCell {
+    pub id: String,
+    pub title: String,
+    pub repository: Option<String>,
+    pub source_time: String,
+    pub translation_status: Option<String>,
+    pub polish_status: String,
+    pub composite_status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminCollectionActivityBucket {
+    pub started_at: String,
+    pub ended_at: String,
+    pub cells: Vec<AdminCollectionActivityCell>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AdminCollectionActivitySummary {
+    pub content_count: usize,
+    pub completed_count: usize,
+    pub processing_count: usize,
+    pub exception_count: usize,
+    pub neutral_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminCollectionActivityResponse {
+    pub kind: String,
+    pub bucket_minutes: u8,
+    pub bucket_count: u8,
+    pub window_started_at: String,
+    pub window_ended_at: String,
+    pub summary: AdminCollectionActivitySummary,
+    pub buckets: Vec<AdminCollectionActivityBucket>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AdminCollectionActivityRow {
+    id: String,
+    title: String,
+    repository: Option<String>,
+    source_time: String,
+    translation_status: Option<String>,
+    polish_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -1222,6 +1270,429 @@ fn source_records_sql(kind: CollectionRecordKind) -> String {
     }
 }
 
+fn activity_source_ctes(kind: CollectionRecordKind) -> String {
+    match kind {
+        CollectionRecordKind::Release => "bounded_source_records AS MATERIALIZED (
+                SELECT
+                    CAST(r.release_id AS TEXT) AS id,
+                    COALESCE(
+                        (SELECT MIN(wi.repo_full_name)
+                         FROM repo_release_work_items wi
+                         WHERE wi.repo_id = r.repo_id),
+                        '仓库 #' || CAST(r.repo_id AS TEXT)
+                    ) AS repository,
+                    COALESCE(NULLIF(r.name, ''), r.tag_name) AS title,
+                    COALESCE(r.published_at, r.created_at, r.updated_at) AS source_time
+                FROM repo_releases r
+                WHERE julianday(COALESCE(r.published_at, r.created_at, r.updated_at)) >= julianday(?)
+                  AND julianday(COALESCE(r.published_at, r.created_at, r.updated_at)) < julianday(?)
+            )"
+        .to_owned(),
+        CollectionRecordKind::Announcement => "bounded_announcement_keys AS MATERIALIZED (
+                SELECT
+                    lower(e.repo_full_name) AS repo_key,
+                    e.discussion_number,
+                    MAX(e.occurred_at) AS source_time
+                FROM social_activity_events e
+                WHERE e.kind = 'announcement'
+                  AND e.repo_full_name IS NOT NULL
+                  AND e.discussion_number IS NOT NULL
+                  AND julianday(e.occurred_at) >= julianday(?)
+                  AND julianday(e.occurred_at) < julianday(?)
+                GROUP BY lower(e.repo_full_name), e.discussion_number
+            ),
+            canonical_announcement_keys AS MATERIALIZED (
+                SELECT c.repo_key, c.discussion_number, c.source_time
+                FROM bounded_announcement_keys c
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM social_activity_events newer
+                    WHERE newer.kind = 'announcement'
+                      AND lower(newer.repo_full_name) = c.repo_key
+                      AND newer.discussion_number = c.discussion_number
+                      AND newer.occurred_at > c.source_time
+                )
+            ),
+            bounded_source_records AS MATERIALIZED (
+                SELECT
+                    c.repo_key || '#' || CAST(c.discussion_number AS TEXT) AS id,
+                    MAX(e.repo_full_name) AS repository,
+                    COALESCE(MAX(NULLIF(e.title, '')), '公告') AS title,
+                    MAX(e.occurred_at) AS source_time
+                FROM canonical_announcement_keys c
+                JOIN social_activity_events e
+                  ON e.kind = 'announcement'
+                 AND lower(e.repo_full_name) = c.repo_key
+                 AND e.discussion_number = c.discussion_number
+                GROUP BY c.repo_key, c.discussion_number
+            )"
+        .to_owned(),
+        CollectionRecordKind::Notification => "bounded_source_records AS MATERIALIZED (
+                SELECT
+                    n.thread_id AS id,
+                    n.repo_full_name AS repository,
+                    COALESCE(NULLIF(n.subject_title, ''), '通知') AS title,
+                    n.updated_at AS source_time
+                FROM notifications n
+                WHERE julianday(n.updated_at) >= julianday(?)
+                  AND julianday(n.updated_at) < julianday(?)
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM notifications newer
+                    WHERE newer.thread_id = n.thread_id
+                      AND (newer.updated_at > n.updated_at
+                        OR (newer.updated_at = n.updated_at AND newer.id > n.id))
+                  )
+            )"
+        .to_owned(),
+        CollectionRecordKind::Brief => "bounded_source_records AS MATERIALIZED (
+                SELECT
+                    b.id,
+                    NULL AS repository,
+                    b.date AS title,
+                    b.created_at AS source_time
+                FROM briefs b
+                WHERE julianday(b.created_at) >= julianday(?)
+                  AND julianday(b.created_at) < julianday(?)
+            )"
+        .to_owned(),
+    }
+}
+
+fn activity_query_sql(kind: CollectionRecordKind, global_mode: bool) -> String {
+    let mut sql = String::from("WITH ");
+    sql.push_str(&activity_source_ctes(kind));
+
+    if kind == CollectionRecordKind::Brief {
+        sql.push_str(
+            ", brief_call_rows AS MATERIALIZED (
+                SELECT
+                    c.parent_brief_id AS entity_id,
+                    c.status AS raw_status,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY c.parent_brief_id
+                        ORDER BY c.updated_at DESC, c.id DESC
+                    ) AS row_rank
+                FROM llm_calls c
+                JOIN bounded_source_records s ON s.id = c.parent_brief_id
+            ),
+            coverage AS MATERIALIZED (
+                SELECT c.record_id AS entity_id, c.status_origin
+                FROM admin_collection_processing_coverage c
+                JOIN bounded_source_records s ON s.id = c.record_id
+                WHERE c.record_kind = 'brief' AND c.pipeline = 'polish'
+            ),
+            status_projection AS (
+                SELECT
+                    s.*,
+                    NULL AS translation_status,
+                    CASE
+                        WHEN b.raw_status IS NULL THEN ",
+        );
+        sql.push_str(&sql_display_status(
+            "'not_recorded'",
+            "COALESCE(c.status_origin, 'historical_unknown')",
+        ));
+        sql.push_str(" ELSE ");
+        sql.push_str(&sql_display_status("b.raw_status", "'task'"));
+        sql.push_str(
+            " END AS polish_status
+                FROM bounded_source_records s
+                LEFT JOIN brief_call_rows b ON b.entity_id = s.id AND b.row_rank = 1
+                LEFT JOIN coverage c ON c.entity_id = s.id
+            )",
+        );
+    } else {
+        let (translation_kind, polish_kind) = notification_kind_sql(kind);
+        let resource_type = collection_record_kind_label(kind);
+        sql.push_str(&format!(
+            ", legacy_task_rows AS MATERIALIZED (
+                SELECT
+                    w.entity_id,
+                    CASE WHEN w.kind = '{polish_kind}' THEN 'polish' ELSE 'translation' END AS pipeline,
+                    COALESCE(w.result_status, w.status) AS raw_status,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY w.entity_id,
+                            CASE WHEN w.kind = '{polish_kind}' THEN 'polish' ELSE 'translation' END
+                        ORDER BY w.updated_at DESC, w.id DESC
+                    ) AS row_rank
+                FROM translation_work_items w
+                JOIN bounded_source_records s ON s.id = w.entity_id
+                WHERE w.kind IN ('{translation_kind}', '{polish_kind}')
+            ),
+            legacy_latest AS (
+                SELECT entity_id, pipeline, raw_status
+                FROM legacy_task_rows
+                WHERE row_rank = 1
+            ),
+            legacy_observation_rows AS MATERIALIZED (
+                SELECT
+                    o.canonical_resource_id AS entity_id,
+                    CASE WHEN o.pipeline = 'polishing' THEN 'polish' ELSE 'translation' END AS pipeline,
+                    o.legacy_table,
+                    json_extract(o.observation_basis_json, '$.source_hash') AS source_hash,
+                    o.classification
+                FROM content_legacy_observations o
+                JOIN bounded_source_records s ON s.id = o.canonical_resource_id
+                WHERE o.canonical_resource_type = '{resource_type}'
+                  AND json_extract(o.observation_basis_json, '$.source_hash') IS NOT NULL
+            ),
+            legacy_observations AS (
+                SELECT
+                    r.entity_id,
+                    r.pipeline,
+                    CASE WHEN MAX(CASE WHEN r.classification = 'legacy_conflict' THEN 1 ELSE 0 END) = 1
+                        THEN 'legacy_conflict' ELSE 'legacy_cached' END AS raw_status
+                FROM legacy_observation_rows r
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM legacy_observation_rows paired
+                    WHERE paired.entity_id = r.entity_id
+                      AND paired.pipeline = r.pipeline
+                      AND paired.source_hash = r.source_hash
+                      AND paired.legacy_table <> r.legacy_table
+                )
+                GROUP BY r.entity_id, r.pipeline
+            ),
+            coverage AS MATERIALIZED (
+                SELECT c.record_id AS entity_id, c.pipeline, c.status_origin
+                FROM admin_collection_processing_coverage c
+                JOIN bounded_source_records s ON s.id = c.record_id
+                WHERE c.record_kind = '{resource_type}'
+            )"
+        ));
+
+        if global_mode {
+            sql.push_str(&format!(
+                ", global_task_rows AS MATERIALIZED (
+                    SELECT
+                        w.canonical_resource_id AS entity_id,
+                        CASE WHEN w.pipeline = 'polishing' THEN 'polish' ELSE 'translation' END AS pipeline,
+                        w.status AS raw_status,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY w.canonical_resource_id,
+                                CASE WHEN w.pipeline = 'polishing' THEN 'polish' ELSE 'translation' END
+                            ORDER BY
+                                julianday(w.created_at) DESC,
+                                w.created_at DESC,
+                                CASE w.status
+                                    WHEN 'queued' THEN 0
+                                    WHEN 'running' THEN 1
+                                    WHEN 'deferred_provider' THEN 2
+                                    WHEN 'ready' THEN 3
+                                    WHEN 'failed' THEN 4
+                                    WHEN 'superseded' THEN 9
+                                    ELSE 5
+                                END,
+                                CASE WHEN w.pipeline = 'translation' AND w.variant = 'detail' THEN 0 ELSE 1 END,
+                                julianday(w.updated_at) DESC,
+                                w.updated_at DESC,
+                                w.id DESC
+                        ) AS row_rank
+                    FROM content_work_items w
+                    JOIN bounded_source_records s ON s.id = w.canonical_resource_id
+                    WHERE w.canonical_resource_type = '{resource_type}'
+                      AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
+                        OR (w.pipeline = 'polishing' AND w.variant = 'smart'))
+                ),
+                global_latest AS (
+                    SELECT entity_id, pipeline, raw_status
+                    FROM global_task_rows
+                    WHERE row_rank = 1
+                ),
+                status_projection AS (
+                    SELECT
+                        s.*,
+                        {translation_status} AS translation_status,
+                        {polish_status} AS polish_status
+                    FROM bounded_source_records s
+                    LEFT JOIN global_latest gt ON gt.entity_id = s.id AND gt.pipeline = 'translation'
+                    LEFT JOIN global_latest gp ON gp.entity_id = s.id AND gp.pipeline = 'polish'
+                    LEFT JOIN legacy_latest lt ON lt.entity_id = s.id AND lt.pipeline = 'translation'
+                    LEFT JOIN legacy_latest lp ON lp.entity_id = s.id AND lp.pipeline = 'polish'
+                    LEFT JOIN legacy_observations ot ON ot.entity_id = s.id AND ot.pipeline = 'translation'
+                    LEFT JOIN legacy_observations op ON op.entity_id = s.id AND op.pipeline = 'polish'
+                    LEFT JOIN coverage ct ON ct.entity_id = s.id AND ct.pipeline = 'translation'
+                    LEFT JOIN coverage cp ON cp.entity_id = s.id AND cp.pipeline = 'polish'
+                )",
+                translation_status = sql_global_status(
+                    "gt.raw_status",
+                    "ot.raw_status",
+                    "lt.raw_status",
+                    "ct.status_origin",
+                ),
+                polish_status = sql_global_status(
+                    "gp.raw_status",
+                    "op.raw_status",
+                    "lp.raw_status",
+                    "cp.status_origin",
+                ),
+            ));
+        } else {
+            sql.push_str(&format!(
+                ", status_projection AS (
+                    SELECT
+                        s.*,
+                        {translation_status} AS translation_status,
+                        {polish_status} AS polish_status
+                    FROM bounded_source_records s
+                    LEFT JOIN legacy_latest lt ON lt.entity_id = s.id AND lt.pipeline = 'translation'
+                    LEFT JOIN legacy_latest lp ON lp.entity_id = s.id AND lp.pipeline = 'polish'
+                    LEFT JOIN legacy_observations ot ON ot.entity_id = s.id AND ot.pipeline = 'translation'
+                    LEFT JOIN legacy_observations op ON op.entity_id = s.id AND op.pipeline = 'polish'
+                    LEFT JOIN coverage ct ON ct.entity_id = s.id AND ct.pipeline = 'translation'
+                    LEFT JOIN coverage cp ON cp.entity_id = s.id AND cp.pipeline = 'polish'
+                )",
+                translation_status = sql_legacy_status(
+                    "lt.raw_status",
+                    "ot.raw_status",
+                    "ct.status_origin",
+                ),
+                polish_status = sql_legacy_status(
+                    "lp.raw_status",
+                    "op.raw_status",
+                    "cp.status_origin",
+                ),
+            ));
+        }
+    }
+
+    sql.push_str(
+        " SELECT id, title, repository, source_time,
+                 translation_status, polish_status
+          FROM status_projection
+          ORDER BY julianday(source_time) DESC, source_time DESC, id DESC",
+    );
+    sql
+}
+
+async fn load_activity_rows(
+    pool: &SqlitePool,
+    kind: CollectionRecordKind,
+    global_mode: bool,
+    window_started_at: &str,
+    window_ended_at: &str,
+) -> Result<Vec<AdminCollectionActivityRow>, ApiError> {
+    sqlx::query_as::<_, AdminCollectionActivityRow>(&activity_query_sql(kind, global_mode))
+        .bind(window_started_at)
+        .bind(window_ended_at)
+        .fetch_all(pool)
+        .await
+        .map_err(ApiError::internal)
+}
+
+fn composite_activity_status(translation: Option<&str>, polish: &str) -> &'static str {
+    let lanes = [translation, Some(polish)];
+    if lanes
+        .into_iter()
+        .flatten()
+        .any(|status| matches!(status, "failed" | "deferred_provider" | "blocked_config"))
+    {
+        "exception"
+    } else if lanes
+        .into_iter()
+        .flatten()
+        .any(|status| matches!(status, "queued" | "running"))
+    {
+        "processing"
+    } else if lanes
+        .into_iter()
+        .flatten()
+        .all(|status| matches!(status, "succeeded" | "not_applicable"))
+    {
+        "completed"
+    } else {
+        "neutral"
+    }
+}
+
+fn parse_activity_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+                .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))
+                .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f"))
+                .ok()
+                .map(|parsed| parsed.and_utc())
+        })
+}
+
+fn activity_timestamp(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+}
+
+fn activity_window(now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) {
+    let current_hour = now
+        .date_naive()
+        .and_hms_opt(now.hour(), 0, 0)
+        .expect("valid start of UTC hour")
+        .and_utc();
+    let window_ended_at = current_hour + chrono::Duration::hours(1);
+    let window_started_at = window_ended_at - chrono::Duration::hours(12);
+    (current_hour, window_started_at, window_ended_at)
+}
+
+fn build_activity_response(
+    kind: CollectionRecordKind,
+    now: DateTime<Utc>,
+    rows: Vec<AdminCollectionActivityRow>,
+) -> AdminCollectionActivityResponse {
+    let (current_hour, window_started_at, window_ended_at) = activity_window(now);
+    let mut buckets = (0..12)
+        .map(|age| {
+            let started_at = current_hour - chrono::Duration::hours(age);
+            AdminCollectionActivityBucket {
+                started_at: activity_timestamp(started_at),
+                ended_at: activity_timestamp(started_at + chrono::Duration::hours(1)),
+                cells: Vec::new(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut summary = AdminCollectionActivitySummary::default();
+    for row in rows {
+        let Some(source_time) = parse_activity_timestamp(&row.source_time) else {
+            continue;
+        };
+        if source_time < window_started_at || source_time >= window_ended_at {
+            continue;
+        }
+        let source_hour = source_time.timestamp().div_euclid(3600) * 3600;
+        let age = ((current_hour.timestamp() - source_hour) / 3600) as usize;
+        if age >= buckets.len() {
+            continue;
+        }
+        let composite_status =
+            composite_activity_status(row.translation_status.as_deref(), &row.polish_status);
+        summary.content_count += 1;
+        match composite_status {
+            "completed" => summary.completed_count += 1,
+            "processing" => summary.processing_count += 1,
+            "exception" => summary.exception_count += 1,
+            _ => summary.neutral_count += 1,
+        }
+        buckets[age].cells.push(AdminCollectionActivityCell {
+            id: row.id,
+            title: row.title,
+            repository: row.repository,
+            source_time: activity_timestamp(source_time),
+            translation_status: row.translation_status,
+            polish_status: row.polish_status,
+            composite_status: composite_status.to_owned(),
+        });
+    }
+    AdminCollectionActivityResponse {
+        kind: collection_record_kind_label(kind).to_owned(),
+        bucket_minutes: 60,
+        bucket_count: 12,
+        window_started_at: activity_timestamp(window_started_at),
+        window_ended_at: activity_timestamp(window_ended_at),
+        summary,
+        buckets,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collection_query_sql(
     kind: CollectionRecordKind,
@@ -1826,6 +2297,50 @@ pub async fn admin_list_collection_records(
     }))
 }
 
+pub async fn admin_get_collection_activity(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(record_kind): Path<String>,
+) -> Result<Json<AdminCollectionActivityResponse>, ApiError> {
+    let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
+    let kind = CollectionRecordKind::parse(record_kind.as_str())?;
+    let permit = state
+        .admin_collection_read_gate
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "admin_collection_records_busy",
+                "admin collection records are temporarily busy",
+            )
+            .with_retry_after(1)
+        })?;
+    let now = Utc::now();
+    let (window_started_at, window_ended_at) = {
+        let (_, started_at, ended_at) = activity_window(now);
+        (activity_timestamp(started_at), activity_timestamp(ended_at))
+    };
+    let read_state = state.clone();
+    let read = async move {
+        let global_mode = content_processing::current_mode(&read_state.pool)
+            .await
+            .map_err(ApiError::internal)?
+            == content_processing::ContentProcessingMode::Global;
+        let rows = load_activity_rows(
+            &read_state.pool,
+            kind,
+            global_mode,
+            &window_started_at,
+            &window_ended_at,
+        )
+        .await?;
+        Ok::<_, ApiError>(build_activity_response(kind, now, rows))
+    };
+    let response = run_bounded_collection_read(permit, read).await?;
+    Ok(Json(response))
+}
+
 async fn load_source_record(
     pool: &SqlitePool,
     kind: CollectionRecordKind,
@@ -2331,6 +2846,63 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .expect("create sqlite test pool")
+    }
+
+    async fn create_activity_status_tables(pool: &SqlitePool) {
+        sqlx::query(
+            "CREATE TABLE translation_work_items (
+                id TEXT PRIMARY KEY,
+                entity_id TEXT,
+                kind TEXT,
+                status TEXT,
+                result_status TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT
+            )",
+        )
+        .execute(pool)
+        .await
+        .expect("create activity legacy work items");
+        sqlx::query(
+            "CREATE TABLE content_legacy_observations (
+                canonical_resource_type TEXT,
+                canonical_resource_id TEXT,
+                pipeline TEXT,
+                legacy_table TEXT,
+                observation_basis_json TEXT,
+                classification TEXT
+            )",
+        )
+        .execute(pool)
+        .await
+        .expect("create activity legacy observations");
+        sqlx::query(
+            "CREATE TABLE admin_collection_processing_coverage (
+                record_kind TEXT,
+                record_id TEXT,
+                pipeline TEXT,
+                status_origin TEXT
+            )",
+        )
+        .execute(pool)
+        .await
+        .expect("create activity coverage");
+    }
+
+    fn activity_row(
+        id: &str,
+        source_time: &str,
+        translation_status: Option<&str>,
+        polish_status: &str,
+    ) -> AdminCollectionActivityRow {
+        AdminCollectionActivityRow {
+            id: id.to_owned(),
+            title: id.to_owned(),
+            repository: None,
+            source_time: source_time.to_owned(),
+            translation_status: translation_status.map(ToOwned::to_owned),
+            polish_status: polish_status.to_owned(),
+        }
     }
 
     async fn create_notifications_fixture(pool: &SqlitePool) {
@@ -3078,6 +3650,530 @@ mod tests {
         assert_eq!(attempt.next_retry_at, None);
         assert_eq!(attempt.started_at, None);
         assert_eq!(attempt.finished_at, None);
+    }
+
+    #[tokio::test]
+    async fn activity_reads_canonical_sources_inside_the_window() {
+        let pool = test_pool().await;
+        create_activity_status_tables(&pool).await;
+        sqlx::query(
+            "CREATE TABLE repo_releases (
+                release_id INTEGER, repo_id INTEGER, name TEXT, tag_name TEXT,
+                published_at TEXT, created_at TEXT, updated_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create activity releases");
+        sqlx::query("CREATE TABLE repo_release_work_items (repo_id INTEGER, repo_full_name TEXT)")
+            .execute(&pool)
+            .await
+            .expect("create activity release repositories");
+        sqlx::query("INSERT INTO repo_release_work_items VALUES (1, 'octo/releases')")
+            .execute(&pool)
+            .await
+            .expect("seed activity release repository");
+        sqlx::query(
+            "INSERT INTO repo_releases VALUES
+                (101, 1, 'Release in window', 'v1', '2026-07-08T08:30:00Z', NULL, NULL),
+                (102, 1, 'Release at exclusive end', 'v2', '2026-07-08T10:00:00Z', NULL, NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed activity releases");
+
+        sqlx::query(
+            "CREATE TABLE social_activity_events (
+                repo_full_name TEXT, discussion_number INTEGER, title TEXT,
+                occurred_at TEXT, detected_at TEXT, kind TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create activity announcements");
+        sqlx::query(
+            "INSERT INTO social_activity_events VALUES
+                ('octo/announce', 42, 'Announcement', '2026-07-08T08:40:00Z', NULL, 'announcement'),
+                ('octo/announce', 42, 'Zulu title', '2026-07-08T09:10:00Z', NULL, 'announcement'),
+                ('octo/announce', 43, 'Older in window', '2026-07-08T09:00:00Z', NULL, 'announcement'),
+                ('octo/announce', 43, 'Canonical outside window', '2026-07-08T10:01:00Z', NULL, 'announcement')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed activity announcements");
+
+        create_notifications_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE notifications SET updated_at = '2026-07-08T10:01:00Z' WHERE id = 'notification-3'",
+        )
+        .execute(&pool)
+        .await
+        .expect("move canonical notification outside the window");
+
+        sqlx::query("CREATE TABLE briefs (id TEXT, date TEXT, created_at TEXT)")
+            .execute(&pool)
+            .await
+            .expect("create activity briefs");
+        sqlx::query(
+            "CREATE TABLE llm_calls (id TEXT, parent_brief_id TEXT, status TEXT, updated_at TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create activity brief calls");
+        sqlx::query(
+            "INSERT INTO briefs VALUES
+                ('brief-1', '2026-07-08', '2026-07-08T08:20:00Z'),
+                ('brief-2', '2026-07-08', '2026-07-08T10:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed activity briefs");
+        sqlx::query(
+            "INSERT INTO llm_calls VALUES
+                ('call-1', 'brief-1', 'failed', '2026-07-08T09:00:00Z'),
+                ('call-2', 'brief-2', 'succeeded', '2026-07-08T09:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed activity brief calls");
+
+        let from = "2026-07-08T08:00:00Z";
+        let before = "2026-07-08T10:00:00Z";
+        let releases =
+            load_activity_rows(&pool, CollectionRecordKind::Release, false, from, before)
+                .await
+                .expect("read release activity");
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].id, "101");
+        assert_eq!(releases[0].repository.as_deref(), Some("octo/releases"));
+
+        let announcements = load_activity_rows(
+            &pool,
+            CollectionRecordKind::Announcement,
+            false,
+            from,
+            before,
+        )
+        .await
+        .expect("read announcement activity");
+        assert_eq!(announcements.len(), 1);
+        assert_eq!(announcements[0].id, "octo/announce#42");
+        assert_eq!(announcements[0].title, "Zulu title");
+        assert_eq!(announcements[0].source_time, "2026-07-08T09:10:00Z");
+
+        let notifications = load_activity_rows(
+            &pool,
+            CollectionRecordKind::Notification,
+            false,
+            from,
+            before,
+        )
+        .await
+        .expect("read notification activity");
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].id, "thread-1");
+        assert_eq!(notifications[0].source_time, "2026-07-08T09:05:00Z");
+
+        let briefs = load_activity_rows(&pool, CollectionRecordKind::Brief, false, from, before)
+            .await
+            .expect("read brief activity");
+        assert_eq!(briefs.len(), 1);
+        assert_eq!(briefs[0].id, "brief-1");
+        assert_eq!(briefs[0].translation_status, None);
+        assert_eq!(briefs[0].polish_status, "failed");
+    }
+
+    #[tokio::test]
+    async fn global_activity_statuses_use_the_existing_display_mapping() {
+        let pool = test_pool().await;
+        create_activity_status_tables(&pool).await;
+        sqlx::query(
+            "CREATE TABLE repo_releases (
+                release_id INTEGER, repo_id INTEGER, name TEXT, tag_name TEXT,
+                published_at TEXT, created_at TEXT, updated_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create global activity releases");
+        sqlx::query("CREATE TABLE repo_release_work_items (repo_id INTEGER, repo_full_name TEXT)")
+            .execute(&pool)
+            .await
+            .expect("create global activity repositories");
+        sqlx::query(
+            "INSERT INTO repo_releases VALUES (101, 1, 'Release', 'v1', '2026-07-08T08:30:00Z', NULL, NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed global activity release");
+        sqlx::query(
+            "CREATE TABLE content_work_items (
+                id TEXT, canonical_resource_type TEXT, canonical_resource_id TEXT,
+                pipeline TEXT, variant TEXT, status TEXT, created_at TEXT, updated_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create activity global work");
+        sqlx::query(
+            "INSERT INTO content_work_items VALUES
+                ('translation-detail', 'release', '101', 'translation', 'detail', 'ready', '2026-07-08T08:40:00Z', '2026-07-08T08:41:00Z'),
+                ('translation-summary', 'release', '101', 'translation', 'summary', 'running', '2026-07-08T08:50:00Z', '2026-07-08T08:51:00Z'),
+                ('polish-smart', 'release', '101', 'polishing', 'smart', 'blocked_config', '2026-07-08T08:55:00Z', '2026-07-08T08:56:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed activity global work");
+
+        let rows = load_activity_rows(
+            &pool,
+            CollectionRecordKind::Release,
+            true,
+            "2026-07-08T08:00:00Z",
+            "2026-07-08T10:00:00Z",
+        )
+        .await
+        .expect("read global release activity");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].translation_status.as_deref(), Some("running"));
+        assert_eq!(rows[0].polish_status, "blocked_config");
+        assert_eq!(
+            composite_activity_status(
+                rows[0].translation_status.as_deref(),
+                &rows[0].polish_status
+            ),
+            "exception"
+        );
+    }
+
+    #[test]
+    fn activity_window_and_composite_status_rules_are_exact() {
+        let now = DateTime::parse_from_rfc3339("2026-07-08T09:37:00Z")
+            .expect("parse activity test time")
+            .with_timezone(&Utc);
+        let response = build_activity_response(
+            CollectionRecordKind::Release,
+            now,
+            vec![
+                activity_row("current", "2026-07-08T09:05:00Z", Some("running"), "failed"),
+                activity_row(
+                    "previous",
+                    "2026-07-08T08:59:00Z",
+                    Some("not_applicable"),
+                    "succeeded",
+                ),
+                activity_row(
+                    "oldest",
+                    "2026-07-07T22:00:00Z",
+                    Some("legacy_cached"),
+                    "historical_unknown",
+                ),
+                activity_row("outside", "2026-07-07T21:59:59Z", None, "failed"),
+                activity_row("future", "2026-07-08T10:00:00Z", None, "failed"),
+            ],
+        );
+        assert_eq!(response.bucket_count, 12);
+        assert_eq!(response.window_started_at, "2026-07-07T22:00:00Z");
+        assert_eq!(response.window_ended_at, "2026-07-08T10:00:00Z");
+        assert_eq!(response.buckets[0].started_at, "2026-07-08T09:00:00Z");
+        assert_eq!(response.buckets[0].cells[0].id, "current");
+        assert_eq!(response.buckets[1].cells[0].id, "previous");
+        assert_eq!(response.buckets[11].cells[0].id, "oldest");
+        assert_eq!(response.summary.content_count, 3);
+        assert_eq!(response.summary.exception_count, 1);
+        assert_eq!(response.summary.completed_count, 1);
+        assert_eq!(response.summary.neutral_count, 1);
+        assert_eq!(
+            composite_activity_status(Some("queued"), "failed"),
+            "exception"
+        );
+        assert_eq!(
+            composite_activity_status(Some("succeeded"), "queued"),
+            "processing"
+        );
+        assert_eq!(
+            composite_activity_status(Some("not_applicable"), "succeeded"),
+            "completed"
+        );
+        assert_eq!(
+            composite_activity_status(Some("legacy_conflict"), "missing"),
+            "neutral"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "run on codex-testbox for the bounded activity read budget"]
+    async fn admin_collection_activity_production_shape_budget() {
+        use std::time::Instant;
+
+        #[derive(Debug, sqlx::FromRow)]
+        struct ExplainPlanRow {
+            detail: String,
+        }
+
+        const SOURCE_ROWS: i64 = 100_000;
+        const WINDOW_FROM: &str = "2026-09-20T00:00:00Z";
+        const WINDOW_BEFORE: &str = "2026-09-20T12:00:00Z";
+        let pool = test_pool().await;
+        create_activity_status_tables(&pool).await;
+
+        sqlx::query(
+            "CREATE TABLE repo_releases (
+                release_id INTEGER PRIMARY KEY,
+                repo_id INTEGER NOT NULL,
+                name TEXT,
+                tag_name TEXT,
+                published_at TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create benchmark releases");
+        sqlx::query(
+            "CREATE TABLE repo_release_work_items (
+                repo_id INTEGER NOT NULL UNIQUE,
+                repo_full_name TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create benchmark release repositories");
+        sqlx::query(
+            "WITH RECURSIVE ids(x) AS (
+                VALUES(0) UNION ALL SELECT x + 1 FROM ids WHERE x < 99
+            )
+            INSERT INTO repo_release_work_items
+            SELECT x, 'octo/repository-' || x FROM ids",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed benchmark repositories");
+        sqlx::query(
+            "WITH RECURSIVE ids(x) AS (
+                VALUES(1) UNION ALL SELECT x + 1 FROM ids WHERE x < 100000
+            )
+            INSERT INTO repo_releases
+            SELECT x, x % 100, 'Release ' || x, 'v' || x,
+                CASE WHEN x % 20 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-09-18T00:00:00Z' END,
+                NULL, NULL
+            FROM ids",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed benchmark releases");
+
+        sqlx::query(
+            "CREATE TABLE social_activity_events (
+                repo_full_name TEXT,
+                discussion_number INTEGER,
+                title TEXT,
+                occurred_at TEXT,
+                detected_at TEXT,
+                kind TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create benchmark announcements");
+        sqlx::query(
+            "WITH RECURSIVE ids(x) AS (
+                VALUES(1) UNION ALL SELECT x + 1 FROM ids WHERE x < 100000
+            )
+            INSERT INTO social_activity_events
+            SELECT 'octo/repository-' || (x % 100), (x + 1) / 2,
+                'Announcement ' || x,
+                CASE WHEN x % 40 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-09-18T00:00:00Z' END,
+                '2026-09-20T09:30:00Z', 'announcement'
+            FROM ids",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed benchmark announcements");
+
+        sqlx::query(
+            "CREATE TABLE notifications (
+                id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                repo_full_name TEXT,
+                subject_title TEXT,
+                updated_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create benchmark notifications");
+        sqlx::query(
+            "CREATE INDEX idx_notifications_admin_canonical_source
+             ON notifications(thread_id, updated_at DESC, id DESC)",
+        )
+        .execute(&pool)
+        .await
+        .expect("index benchmark notification canonical sources");
+        sqlx::query(
+            "WITH RECURSIVE ids(x) AS (
+                VALUES(1) UNION ALL SELECT x + 1 FROM ids WHERE x < 100000
+            )
+            INSERT INTO notifications
+            SELECT 'notification-' || x, 'thread-' || ((x + 1) / 2),
+                'octo/repository-' || (x % 100), 'Notification ' || x,
+                CASE WHEN x % 40 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-09-18T00:00:00Z' END
+            FROM ids",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed benchmark notifications");
+
+        sqlx::query("CREATE TABLE briefs (id TEXT PRIMARY KEY, date TEXT, created_at TEXT)")
+            .execute(&pool)
+            .await
+            .expect("create benchmark briefs");
+        sqlx::query(
+            "CREATE TABLE llm_calls (
+                id TEXT PRIMARY KEY,
+                parent_brief_id TEXT,
+                status TEXT,
+                updated_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create benchmark brief calls");
+        sqlx::query(
+            "WITH RECURSIVE ids(x) AS (
+                VALUES(1) UNION ALL SELECT x + 1 FROM ids WHERE x < 100000
+            )
+            INSERT INTO briefs
+            SELECT 'brief-' || x, '2026-09-20',
+                CASE WHEN x % 20 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-09-18T00:00:00Z' END
+            FROM ids",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed benchmark briefs");
+        sqlx::query(
+            "INSERT INTO llm_calls
+            SELECT 'call-' || id, id, 'succeeded', '2026-09-20T09:25:00Z'
+            FROM briefs WHERE CAST(substr(id, 7) AS INTEGER) % 20 = 0",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed benchmark brief calls");
+
+        sqlx::query(
+            "CREATE TABLE content_work_items (
+                id TEXT PRIMARY KEY,
+                canonical_resource_type TEXT,
+                canonical_resource_id TEXT,
+                pipeline TEXT,
+                variant TEXT,
+                status TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create benchmark global work");
+        sqlx::query(
+            "CREATE INDEX idx_content_work_items_resource
+             ON content_work_items(canonical_resource_type, canonical_resource_id, pipeline)",
+        )
+        .execute(&pool)
+        .await
+        .expect("index benchmark global work");
+        sqlx::query(
+            "INSERT INTO content_work_items
+            SELECT 'translation-' || release_id, 'release', CAST(release_id AS TEXT),
+                'translation', 'detail', 'ready', '2026-09-20T09:25:00Z', '2026-09-20T09:25:00Z'
+            FROM repo_releases WHERE release_id % 20 = 0",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed benchmark global work");
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/0084_admin_collection_activity_indexes.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("apply activity indexes to the synthetic copy");
+
+        for kind in [
+            CollectionRecordKind::Release,
+            CollectionRecordKind::Announcement,
+            CollectionRecordKind::Notification,
+            CollectionRecordKind::Brief,
+        ] {
+            let explain = format!("EXPLAIN QUERY PLAN {}", activity_query_sql(kind, true));
+            let plan = sqlx::query_as::<_, ExplainPlanRow>(&explain)
+                .bind(WINDOW_FROM)
+                .bind(WINDOW_BEFORE)
+                .fetch_all(&pool)
+                .await
+                .expect("explain activity query");
+            let plan = plan
+                .into_iter()
+                .map(|row| row.detail)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let expected_indexes = match kind {
+                CollectionRecordKind::Release => {
+                    &["idx_repo_releases_admin_activity_source_time"][..]
+                }
+                CollectionRecordKind::Announcement => &[
+                    "idx_social_activity_events_admin_activity_time",
+                    "idx_social_activity_events_admin_activity_canonical",
+                ][..],
+                CollectionRecordKind::Notification => &[
+                    "idx_notifications_admin_activity_source_time",
+                    "idx_notifications_admin_canonical_source",
+                ][..],
+                CollectionRecordKind::Brief => &[
+                    "idx_briefs_admin_activity_source_time",
+                    "idx_llm_calls_admin_brief_latest",
+                ][..],
+            };
+            for expected_index in expected_indexes {
+                assert!(
+                    plan.contains(expected_index),
+                    "{kind:?} activity query did not select {expected_index}: {plan}"
+                );
+            }
+
+            let mut elapsed = Vec::with_capacity(30);
+            let mut row_count = 0usize;
+            for sample in 0..31 {
+                let started = Instant::now();
+                let rows = load_activity_rows(&pool, kind, true, WINDOW_FROM, WINDOW_BEFORE)
+                    .await
+                    .expect("run bounded activity query");
+                if sample > 0 {
+                    elapsed.push(started.elapsed());
+                }
+                row_count = rows.len();
+            }
+            elapsed.sort_unstable();
+            let p95 = elapsed[(elapsed.len() * 95).div_ceil(100) - 1];
+            let p99 = elapsed[(elapsed.len() * 99).div_ceil(100) - 1];
+            let maximum = *elapsed.last().expect("benchmark samples");
+            println!(
+                "activity_benchmark kind={} source_rows={} selected_rows={} p95_ms={} p99_ms={} max_ms={}",
+                collection_record_kind_label(kind),
+                SOURCE_ROWS,
+                row_count,
+                p95.as_millis(),
+                p99.as_millis(),
+                maximum.as_millis()
+            );
+            assert!(p95 < Duration::from_secs(1), "{kind:?} p95 was {p95:?}");
+            assert!(p99 < Duration::from_secs(2), "{kind:?} p99 was {p99:?}");
+            assert!(
+                maximum < Duration::from_secs(5),
+                "{kind:?} max was {maximum:?}"
+            );
+        }
     }
 
     #[test]

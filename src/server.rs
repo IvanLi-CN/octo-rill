@@ -343,6 +343,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(admin_ai_records::admin_list_collection_records),
         )
         .route(
+            "/admin/jobs/ai-records/{record_kind}/activity",
+            get(admin_ai_records::admin_get_collection_activity),
+        )
+        .route(
             "/admin/jobs/ai-records/{record_kind}/{record_id}",
             get(admin_ai_records::admin_get_collection_record_detail),
         )
