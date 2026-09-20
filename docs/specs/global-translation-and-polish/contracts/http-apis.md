@@ -47,6 +47,7 @@ The operational freeze endpoint `POST /api/admin/jobs/content-processing/freeze`
 ## Read Semantics
 
 - Public and authenticated resource reads return only the current validated result projection when the caller is authorized for the canonical resource. A prior projection may remain present while its newer work is `queued` or `running`.
+- Model-route or configuration changes alone do not invalidate a published projection or create work for an unchanged source. A projection is a cache hit only when its `published_source_hash` matches the current source hash.
 - Admin AI-record list and detail GETs are side-effect free. Each pipeline lane reports `global_work`, `result_projection` and `legacy_evidence` separately.
 - A lane without a global work or result but with retained cache evidence reports `legacy_cached`; a lane with irreconcilable retained evidence reports `legacy_conflict`. Neither is serialized as `ready`, `failed`, `unstarted` or an attempt count.
 - User-visible and administrator-facing labels are exactly “翻译” and “润色”.
@@ -112,4 +113,4 @@ partial set of cells.
 
 ## Retry Authorization
 
-Any caller authorized to read the canonical resource may request retry of a terminal global failure. The service applies the same cooldown, lifecycle and access checks regardless of which authorized caller made the original request.
+Any caller authorized to read the canonical resource may request retry of a terminal global failure. The service applies the same cooldown, lifecycle and access checks regardless of which authorized caller made the original request. `blocked_config` is not a terminal failure and is not manually retried; a relevant valid configuration update resumes it through the scheduler.

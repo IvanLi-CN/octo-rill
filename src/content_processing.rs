@@ -2617,6 +2617,44 @@ mod tests {
         .await
         .unwrap();
 
+        sqlx::query(
+            "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, attempt_count, created_at, updated_at) VALUES ('global-model-a', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-1', 'protocol-1', 'model-a', '{}', 'config-a', 'blocked_config', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('global-model-b', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-1', 'protocol-1', 'model-b', '{}', 'config-b', 'ready', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('global-model-c', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-2', 'protocol-1', 'model-a', '{}', 'config-a', 'ready', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('global-model-d', 'release', 'release-2', 'translation', 'summary', 'zh-CN', 'hash-3', 'protocol-1', 'model-c', '{}', 'config-c', 'ready', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('global-model-e', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-2', 'protocol-1', 'model-b', '{}', 'config-b', 'ready', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_request_links (id, request_id, work_item_id, requester_type, requester_id, authorization_snapshot_json, producer_ref, request_source, delivery_mode, created_at, updated_at) VALUES ('request-link-a', 'request-a', 'global-model-a', 'user', 'user-1', '{}', 'test', 'test', 'async', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, retry_eligible, created_at) VALUES ('attempt-start-a', 'global-model-a', 1, 'initial', 'attempt_started', 0, CURRENT_TIMESTAMP), ('attempt-end-a', 'global-model-a', 1, 'initial', 'attempt_completed', 0, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, created_at) VALUES ('call-a', 'attempt-start-a', 'provider-call-a', 'model-a', 'failed', CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_result_projections (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash, work_item_id, payload_json, published_at, updated_at) VALUES ('projection-a', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'protocol-1', 'model-a', 'hash-1', 'global-model-a', '{\"title_zh\":\"A\"}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('projection-b', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'protocol-1', 'model-b', 'hash-1', 'global-model-b', '{\"title_zh\":\"B\"}', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z'), ('projection-c', 'release', 'release-2', 'translation', 'summary', 'zh-CN', 'protocol-1', 'model-c', 'hash-3', 'global-model-d', '{\"title_zh\":\"C\"}', '2026-01-03T00:00:00Z', '2026-01-03T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/0084_content_processing_model_independent_identity.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+
         let after_work: (String, String, String, String) =
             sqlx::query_as("SELECT id, kind, entity_id, status FROM translation_work_items")
                 .fetch_one(&pool)
@@ -2629,12 +2667,214 @@ mod tests {
         assert_eq!(before_work, after_work);
         assert_eq!(before_cache, after_cache);
         let new_table_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('content_processing_control', 'content_work_items', 'content_batches', 'content_batch_items', 'content_result_projections', 'content_request_links', 'content_attempt_events', 'content_attempt_llm_calls', 'content_legacy_observations')",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('content_processing_control', 'content_work_items', 'content_batches', 'content_batch_items', 'content_result_projections', 'content_request_links', 'content_attempt_events', 'content_attempt_llm_calls', 'content_legacy_observations', 'content_work_identities', 'content_work_identity_members', 'content_current_result_projections', 'content_identity_upgrade_control')",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(new_table_count, 9);
+        assert_eq!(new_table_count, 13);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_work_items WHERE id IN ('global-model-a', 'global-model-b') AND source_hash = 'hash-1'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_result_projections WHERE id IN ('projection-a', 'projection-b')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_request_links WHERE id = 'request-link-a'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_events WHERE work_item_id = 'global-model-a'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_llm_calls WHERE id = 'call-a'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        for table in [
+            "content_work_identities",
+            "content_work_identity_members",
+            "content_current_result_projections",
+        ] {
+            let row_count = sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(row_count, 0, "compatibility migration backfilled {table}");
+        }
+        let upgrade_state: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT status, phase, cursor FROM content_identity_upgrade_control WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            upgrade_state,
+            (
+                "pending".to_owned(),
+                "work_identity_backfill".to_owned(),
+                None
+            )
+        );
+        let attempt_snapshot: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT configuration_snapshot_json, route_snapshot_json, configuration_fingerprint FROM content_attempt_events WHERE id = 'attempt-start-a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempt_snapshot, (None, None, None));
+        let model_independent_columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('content_work_identities') ORDER BY cid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !model_independent_columns
+                .iter()
+                .any(|column| column == "model_profile")
+        );
+
+        for (id, resource_id, source_hash) in [
+            ("identity-a", "release-1", "hash-1"),
+            ("identity-b", "release-1", "hash-2"),
+            ("identity-c", "release-2", "hash-3"),
+        ] {
+            sqlx::query(
+                "INSERT INTO content_work_identities (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, created_at, updated_at) VALUES (?, 'release', ?, 'translation', 'summary', 'zh-CN', ?, 'protocol-1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            )
+            .bind(id)
+            .bind(resource_id)
+            .bind(source_hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let duplicate_identity = sqlx::query(
+            "INSERT INTO content_work_identities (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, created_at, updated_at) VALUES ('identity-duplicate', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-1', 'protocol-1', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(duplicate_identity.is_err());
+        for (work_item_id, identity_id, resource_id, source_hash) in [
+            ("global-model-a", "identity-a", "release-1", "hash-1"),
+            ("global-model-b", "identity-a", "release-1", "hash-1"),
+            ("global-model-c", "identity-b", "release-1", "hash-2"),
+            ("global-model-d", "identity-c", "release-2", "hash-3"),
+        ] {
+            sqlx::query(
+                "INSERT INTO content_work_identity_members (work_item_id, identity_id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, linked_at) VALUES (?, ?, 'release', ?, 'translation', 'summary', 'zh-CN', ?, 'protocol-1', CURRENT_TIMESTAMP)",
+            )
+            .bind(work_item_id)
+            .bind(identity_id)
+            .bind(resource_id)
+            .bind(source_hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let mismatched_work_member = sqlx::query(
+            "INSERT INTO content_work_identity_members (work_item_id, identity_id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, linked_at) VALUES ('global-model-e', 'identity-a', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-1', 'protocol-1', CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mismatched_work_member.is_err());
+        let mismatched_identity_member = sqlx::query(
+            "INSERT INTO content_work_identity_members (work_item_id, identity_id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, linked_at) VALUES ('global-model-e', 'identity-a', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-2', 'protocol-1', CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mismatched_identity_member.is_err());
+
+        sqlx::query(
+            "INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ('identity-a', 'global-model-a', 'global-model-c', 'projection-b', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mismatched_projection_provenance = sqlx::query(
+            "INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ('identity-b', 'global-model-c', NULL, 'projection-a', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mismatched_projection_provenance.is_err());
+        let mismatched_projection_resource = sqlx::query(
+            "INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ('identity-c', 'global-model-d', NULL, 'projection-a', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mismatched_projection_resource.is_err());
+        let mismatched_projection_work = sqlx::query(
+            "INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ('identity-a', 'global-model-c', NULL, NULL, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mismatched_projection_work.is_err());
+        let mismatched_active_work = sqlx::query(
+            "INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ('identity-a', 'global-model-a', 'global-model-d', NULL, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mismatched_active_work.is_err());
+        let invalid_active_work_update = sqlx::query(
+            "UPDATE content_current_result_projections SET active_work_item_id = 'global-model-d' WHERE identity_id = 'identity-a'",
+        )
+        .execute(&pool)
+        .await;
+        assert!(invalid_active_work_update.is_err());
+        let valid_active_work_update = sqlx::query(
+            "UPDATE content_current_result_projections SET active_work_item_id = 'global-model-b' WHERE identity_id = 'identity-a'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(valid_active_work_update.rows_affected(), 1);
+        let invalid_provenance_update = sqlx::query(
+            "UPDATE content_current_result_projections SET source_projection_id = 'projection-c' WHERE identity_id = 'identity-a'",
+        )
+        .execute(&pool)
+        .await;
+        assert!(invalid_provenance_update.is_err());
+        let valid_provenance_update = sqlx::query(
+            "UPDATE content_current_result_projections SET source_projection_id = 'projection-a' WHERE identity_id = 'identity-a'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(valid_provenance_update.rows_affected(), 1);
+        sqlx::query(
+            "INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ('identity-b', 'global-model-c', NULL, NULL, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN ('idx_notifications_admin_canonical_source', 'idx_translation_work_items_admin_entity_kind_attempt')",

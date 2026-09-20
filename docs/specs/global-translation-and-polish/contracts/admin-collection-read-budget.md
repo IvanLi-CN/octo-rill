@@ -24,7 +24,7 @@
 
 ## Activity Read Validation
 
-迁移 `0084_admin_collection_activity_indexes.sql` 只新增索引。查询计划和延迟验证在 SQLite 内存合成副本上进行，每类创建 100,000 条源行，不含真实记录内容；每类先预热一次，再测 30 次。EXPLAIN 必须命中来源时间索引，并命中公告 canonical、通知 canonical、日报最新 LLM call 索引。
+迁移 `0085_admin_collection_activity_indexes.sql` 只新增索引。查询计划和延迟验证在 SQLite 内存合成副本上进行，每类创建 100,000 条源行，不含真实记录内容；每类先预热一次，再测 30 次。EXPLAIN 必须命中来源时间索引，并命中公告 canonical、通知 canonical、日报最新 LLM call 索引。
 
 | 记录类型 | 12h cells | p95 | p99 | 最大值 |
 | --- | ---: | ---: | ---: | ---: |
