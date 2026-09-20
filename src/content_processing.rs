@@ -2618,7 +2618,7 @@ mod tests {
         .unwrap();
 
         sqlx::query(
-            "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, attempt_count, created_at, updated_at) VALUES ('global-model-a', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-1', 'protocol-1', 'model-a', '{}', 'config-a', 'blocked_config', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('global-model-b', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-1', 'protocol-1', 'model-b', '{}', 'config-b', 'ready', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('global-model-c', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-2', 'protocol-1', 'model-a', '{}', 'config-a', 'ready', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('global-model-d', 'release', 'release-2', 'translation', 'summary', 'zh-CN', 'hash-3', 'protocol-1', 'model-c', '{}', 'config-c', 'ready', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, attempt_count, created_at, updated_at) VALUES ('global-model-a', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-1', 'protocol-1', 'model-a', '{}', 'config-a', 'blocked_config', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('global-model-b', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-1', 'protocol-1', 'model-b', '{}', 'config-b', 'ready', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('global-model-c', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-2', 'protocol-1', 'model-a', '{}', 'config-a', 'ready', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('global-model-d', 'release', 'release-2', 'translation', 'summary', 'zh-CN', 'hash-3', 'protocol-1', 'model-c', '{}', 'config-c', 'ready', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('global-model-e', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-2', 'protocol-1', 'model-b', '{}', 'config-b', 'ready', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .execute(&pool)
         .await
@@ -2642,7 +2642,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO content_result_projections (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash, work_item_id, payload_json, published_at, updated_at) VALUES ('projection-a', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'protocol-1', 'model-a', 'hash-1', 'global-model-a', '{\"title_zh\":\"A\"}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('projection-b', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'protocol-1', 'model-b', 'hash-1', 'global-model-b', '{\"title_zh\":\"B\"}', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')",
+            "INSERT INTO content_result_projections (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash, work_item_id, payload_json, published_at, updated_at) VALUES ('projection-a', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'protocol-1', 'model-a', 'hash-1', 'global-model-a', '{\"title_zh\":\"A\"}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('projection-b', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'protocol-1', 'model-b', 'hash-1', 'global-model-b', '{\"title_zh\":\"B\"}', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z'), ('projection-c', 'release', 'release-2', 'translation', 'summary', 'zh-CN', 'protocol-1', 'model-c', 'hash-3', 'global-model-d', '{\"title_zh\":\"C\"}', '2026-01-03T00:00:00Z', '2026-01-03T00:00:00Z')",
         )
         .execute(&pool)
         .await
@@ -2800,19 +2800,37 @@ mod tests {
             .await
             .unwrap();
         }
-        let mismatched_member = sqlx::query(
-            "INSERT INTO content_work_identity_members (work_item_id, identity_id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, linked_at) VALUES ('global-model-c', 'identity-a', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-1', 'protocol-1', CURRENT_TIMESTAMP)",
+        let mismatched_work_member = sqlx::query(
+            "INSERT INTO content_work_identity_members (work_item_id, identity_id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, linked_at) VALUES ('global-model-e', 'identity-a', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-1', 'protocol-1', CURRENT_TIMESTAMP)",
         )
         .execute(&pool)
         .await;
-        assert!(mismatched_member.is_err());
+        assert!(mismatched_work_member.is_err());
+        let mismatched_identity_member = sqlx::query(
+            "INSERT INTO content_work_identity_members (work_item_id, identity_id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, linked_at) VALUES ('global-model-e', 'identity-a', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'hash-2', 'protocol-1', CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mismatched_identity_member.is_err());
 
         sqlx::query(
-            "INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ('identity-a', 'global-model-a', 'global-model-c', NULL, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            "INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ('identity-a', 'global-model-a', 'global-model-c', 'projection-b', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
         .execute(&pool)
         .await
         .unwrap();
+        let mismatched_projection_provenance = sqlx::query(
+            "INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ('identity-b', 'global-model-c', NULL, 'projection-a', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mismatched_projection_provenance.is_err());
+        let mismatched_projection_resource = sqlx::query(
+            "INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ('identity-c', 'global-model-d', NULL, 'projection-a', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(mismatched_projection_resource.is_err());
         let mismatched_projection_work = sqlx::query(
             "INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ('identity-a', 'global-model-c', NULL, NULL, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )
@@ -2825,6 +2843,32 @@ mod tests {
         .execute(&pool)
         .await;
         assert!(mismatched_active_work.is_err());
+        let invalid_active_work_update = sqlx::query(
+            "UPDATE content_current_result_projections SET active_work_item_id = 'global-model-d' WHERE identity_id = 'identity-a'",
+        )
+        .execute(&pool)
+        .await;
+        assert!(invalid_active_work_update.is_err());
+        let valid_active_work_update = sqlx::query(
+            "UPDATE content_current_result_projections SET active_work_item_id = 'global-model-b' WHERE identity_id = 'identity-a'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(valid_active_work_update.rows_affected(), 1);
+        let invalid_provenance_update = sqlx::query(
+            "UPDATE content_current_result_projections SET source_projection_id = 'projection-c' WHERE identity_id = 'identity-a'",
+        )
+        .execute(&pool)
+        .await;
+        assert!(invalid_provenance_update.is_err());
+        let valid_provenance_update = sqlx::query(
+            "UPDATE content_current_result_projections SET source_projection_id = 'projection-a' WHERE identity_id = 'identity-a'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(valid_provenance_update.rows_affected(), 1);
         sqlx::query(
             "INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES ('identity-b', 'global-model-c', NULL, NULL, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         )

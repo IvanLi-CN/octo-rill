@@ -120,6 +120,48 @@ BEGIN
   SELECT RAISE(ABORT, 'active work item identity scope mismatch');
 END;
 
+CREATE TRIGGER trg_content_current_result_projections_source_scope_insert
+BEFORE INSERT ON content_current_result_projections
+WHEN NEW.source_projection_id IS NOT NULL
+ AND NOT EXISTS (
+   SELECT 1
+   FROM content_work_identities AS identity
+   JOIN content_result_projections AS source
+     ON source.id = NEW.source_projection_id
+   WHERE identity.id = NEW.identity_id
+     AND source.canonical_resource_type = identity.canonical_resource_type
+     AND source.canonical_resource_id = identity.canonical_resource_id
+     AND source.pipeline = identity.pipeline
+     AND source.variant = identity.variant
+     AND source.target_lang = identity.target_lang
+     AND source.source_hash = identity.source_hash
+     AND source.protocol_version = identity.protocol_version
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'source projection identity mismatch');
+END;
+
+CREATE TRIGGER trg_content_current_result_projections_source_scope_update
+BEFORE UPDATE OF identity_id, source_projection_id ON content_current_result_projections
+WHEN NEW.source_projection_id IS NOT NULL
+ AND NOT EXISTS (
+   SELECT 1
+   FROM content_work_identities AS identity
+   JOIN content_result_projections AS source
+     ON source.id = NEW.source_projection_id
+   WHERE identity.id = NEW.identity_id
+     AND source.canonical_resource_type = identity.canonical_resource_type
+     AND source.canonical_resource_id = identity.canonical_resource_id
+     AND source.pipeline = identity.pipeline
+     AND source.variant = identity.variant
+     AND source.target_lang = identity.target_lang
+     AND source.source_hash = identity.source_hash
+     AND source.protocol_version = identity.protocol_version
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'source projection identity mismatch');
+END;
+
 CREATE TABLE content_identity_upgrade_control (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   generation INTEGER NOT NULL CHECK (generation >= 1),
