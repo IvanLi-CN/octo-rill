@@ -773,6 +773,9 @@ export const ResumesActivityReadAfterListCancellation: Story = {
 				),
 			).toHaveLength(2),
 		);
+		await waitFor(() =>
+			expect(canvas.getByRole("button", { name: "下一页" })).toBeEnabled(),
+		);
 		await userEvent.click(canvas.getByRole("button", { name: "下一页" }));
 		await waitFor(() =>
 			expect(requestWindow.__collectionActivityAbortCount).toBe(1),
@@ -780,7 +783,12 @@ export const ResumesActivityReadAfterListCancellation: Story = {
 		await waitFor(() =>
 			expect(requestWindow.__collectionActivityPaths).toHaveLength(4),
 		);
-		await waitFor(() => expect(canvas.getByText(/第 2\/2 页/)).toBeVisible());
+		await expect(requestWindow.__collectionActivityPaths).toEqual([
+			releasePath,
+			"/api/admin/jobs/ai-records/announcement/activity",
+			releasePath,
+			releasePath,
+		]);
 	},
 };
 
