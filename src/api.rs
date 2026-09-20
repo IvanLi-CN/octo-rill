@@ -7482,12 +7482,18 @@ pub async fn admin_patch_llm_runtime_config(
             .await
             .map_err(ApiError::internal)?,
     };
+    let previous_route = state
+        .llm_scheduler
+        .routing_status(state.config.ai.as_ref().map(|cfg| cfg.model.as_str()))
+        .await
+        .llm_models;
     let llm_models = match req.llm_models {
         Some(models) => parse_llm_models(models)?,
         None => admin_runtime::load_llm_models(&state.pool)
             .await
             .map_err(ApiError::internal)?,
     };
+    let route_changed = previous_route != llm_models;
     let current_recovery = admin_runtime::load_llm_recovery_runtime_config(&state.pool)
         .await
         .map_err(ApiError::internal)?;
@@ -7519,6 +7525,11 @@ pub async fn admin_patch_llm_runtime_config(
     admin_runtime::sync_persisted_runtime_settings(state.clone())
         .await
         .map_err(ApiError::internal)?;
+    if route_changed {
+        content_processing::on_runtime_configuration_reload(state.as_ref())
+            .await
+            .map_err(ApiError::internal)?;
+    }
 
     Ok(Json(
         load_admin_llm_scheduler_status_response(state.as_ref()).await?,

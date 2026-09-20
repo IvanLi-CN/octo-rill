@@ -25,7 +25,7 @@
 - REQ-GTP-CUTOVER: 全局模型必须经由单一写入者切换，不得长期双写。切换前必须停止旧写入路径并完成运行中旧批次的受控收口；切换后由全局调度器接收新的覆盖请求。转换期间内容处理请求返回带轮询信息的 `503`，而不是部分落入新旧两个模型。
 - REQ-GTP-COMPATIBILITY: 数据库演进必须使用扩展表、索引和控制记录。必须先发布含有该迁移且仍能安全运行旧行为的兼容版本，再发布不含新迁移的全局切换版本。兼容版本在检测到全局模式时禁用旧内容处理写入，允许降级后二进制继续打开数据库；不含该迁移版本的更旧应用不得作为回滚目标。
 - REQ-GTP-IDENTITY-MIGRATION: 升级到模型无关身份时，必须保留既有尝试、模型调用和请求者关联的可追溯性。对同一新投影身份存在多个模型专属有效投影的情况，选择最近发布的有效投影作为唯一当前投影，其他投影不得继续参与当前结果读取。对既有 `blocked_config` 工作，只为没有源哈希完全匹配的有效当前投影的身份自动排入一次恢复；已有匹配投影时保留结果且不重跑。恢复使用常规调度器、并发、优先级和 provider 防护，不得合成尝试历史。
-- REQ-GTP-IDENTITY-UPGRADE-COMPATIBILITY: 模型无关身份升级先发布只扩展 schema 的兼容版本；它保留现有模型专属身份行为，不回填或改写既有工作、投影和尝试数据。后续身份切换版本使用该 schema，执行可暂停、幂等且可观察的身份与投影回填，不增加新的数据库迁移。兼容版本必须能打开切换后的 schema 并作为回退目标；缺少该扩展迁移的更旧版本不受支持。结构变更与历史回填是分开的操作，各自具有完成信号和暂停点。
+- REQ-GTP-IDENTITY-UPGRADE-COMPATIBILITY: 模型无关身份升级先发布只扩展 schema 的兼容版本；它保留现有模型专属身份行为，不回填或改写既有工作、投影和尝试数据。后续身份切换版本使用该 schema，执行可暂停、幂等且可观察的身份与投影回填，不增加新的数据库迁移。升级期间的新 admission 必须在创建工作项的同一事务内注册规范身份和成员映射；全局 worker 在回填完成前不得 claim 工作。回填重新扫描未映射工作，不能仅因已越过 ID 游标就漏掉晚到记录。兼容版本必须能打开切换后的 schema 并作为回退目标；缺少该扩展迁移的更旧版本不受支持。结构变更与历史回填是分开的操作，各自具有完成信号和暂停点。
 - REQ-GTP-NAMING: 所有面向用户和管理员的功能名称保持“翻译”和“润色”。本主题不得以“完整翻译”“智能变更摘要”或任何替代名称重命名现有能力。
 - REQ-GTP-OBSERVABILITY: 每次尝试审计必须记录尝试级配置指纹与路由快照、提供方调用标识、时长、令牌、成本、稳定错误码与脱敏摘要，并保持尝试到实际模型调用的精确归因。原始密钥、提示词、完整响应和未脱敏上游错误不进入常规管理读取或长期尝试审计。
 
@@ -46,7 +46,7 @@
 - VER-GTP-ADMIN-ACTIVITY: covers: REQ-GTP-ADMIN-ACTIVITY, REQ-GTP-ADMIN-READS, REQ-GTP-NOTIFICATION-SOURCE。验证四种来源时间和规范化、UTC 十二小时边界、单格与 summary 数量一致、既有 lane 显示状态及综合状态优先级、无读写副作用，以及生产形状查询计划和读取延迟预算。
 - VER-GTP-CUTOVER: covers: REQ-GTP-CUTOVER, REQ-GTP-COMPATIBILITY。以旧事实混合、运行中旧批次、切换冻结、全局写入启用和切换版本降级到兼容版本的数据库副本验证：旧行未改变，转换无双写，兼容版本可启动且旧写入者失效，更旧版本被部署检查拒绝。
 - VER-GTP-IDENTITY-MIGRATION: covers: REQ-GTP-IDENTITY, REQ-GTP-RESULTS, REQ-GTP-CONFIGURATION, REQ-GTP-IDENTITY-MIGRATION。以同一新身份下含多个模型专属有效投影、重复工作项、请求关联和历史尝试的数据库副本验证：最近发布的有效投影成为唯一当前结果，历史关联仍可追溯；只有无源哈希匹配有效投影的阻塞身份被自动排队一次，并遵循正常调度边界；存在有效投影的阻塞项不触发模型调用。
-- VER-GTP-IDENTITY-UPGRADE-COMPATIBILITY: covers: REQ-GTP-IDENTITY-UPGRADE-COMPATIBILITY。验证兼容迁移只添加 schema 与 pending 控制记录、不回填或改变现有数据；兼容版本重复启动可打开数据库，缺少该迁移的旧二进制被拒绝；后续身份回填可暂停、重入并按阶段报告完成。
+- VER-GTP-IDENTITY-UPGRADE-COMPATIBILITY: covers: REQ-GTP-IDENTITY-UPGRADE-COMPATIBILITY。验证兼容迁移只添加 schema 与 pending 控制记录、不回填或改变现有数据；兼容版本重复启动可打开数据库，缺少该迁移的旧二进制被拒绝；后续身份回填可暂停、重入并按阶段报告完成；回填中插入一个排序早于当前游标的工作项仍会被映射；回填未完成时 worker 不启动 provider 调用。
 
 ## Interfaces & Contracts
 
@@ -54,6 +54,7 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | Global content-processing request API | HTTP API | external | Modify | [http-apis.md](./contracts/http-apis.md) | backend | web, existing producers |
 | Content-processing status and retry API | HTTP API | external | Modify | [http-apis.md](./contracts/http-apis.md) | backend | web, admin |
+| Content identity-upgrade operations | HTTP API | internal | Add | [http-apis.md](./contracts/http-apis.md) | backend | operators |
 | AI records and detail API | HTTP API | external | Modify | [http-apis.md](./contracts/http-apis.md) | backend | admin web |
 | AI records activity API | HTTP API | external | Add | [http-apis.md](./contracts/http-apis.md) | backend | admin web |
 | Global work, result, requester and legacy-evidence tables | DB schema | internal | Modify | [db.md](./contracts/db.md) | backend | scheduler, API, admin read model |

@@ -193,6 +193,31 @@ async fn mark_failed(state: &AppState, error: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) async fn refresh_content_projection_phase(state: &AppState) -> Result<bool> {
+    let (_permit, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "search_content_projection_refresh",
+            SqliteWritePriority::Background,
+        )
+        .await?;
+    let current = load_state(&mut tx).await?;
+    let current_phase = phase_index(&current.phase)?;
+    let content_phase = phase_index("content_projections")?;
+    if current_phase < content_phase {
+        tx.rollback().await?;
+        return Ok(true);
+    }
+    if current.status == "paused_low_disk" {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    update_state(&mut tx, "content_projections", 0, "building", None).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 async fn load_state(tx: &mut Transaction<'_, Sqlite>) -> Result<BackfillState> {
     sqlx::query_as::<_, BackfillState>(
         "SELECT phase, cursor, status FROM search_projection_backfill_state WHERE id = 1",
@@ -344,18 +369,23 @@ async fn apply_content_projection_batch(
     push_rowids(&mut query, rowids);
     query.push(")");
     let rows = query.build().fetch_all(&mut **tx).await?;
+    let identity_upgrade_complete =
+        crate::content_identity_upgrade::is_complete_in_transaction(tx).await?;
     for row in rows {
         let resource_type: String = row.get("canonical_resource_type");
         let resource_id: String = row.get("canonical_resource_id");
         let pipeline: String = row.get("pipeline");
-        let text = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT trim(COALESCE(json_extract(p.payload_json, '$.title'), json_extract(p.payload_json, '$.title_zh'), '') || ' ' || COALESCE(json_extract(p.payload_json, '$.summary'), json_extract(p.payload_json, '$.body_md'), '')) FROM content_result_projections p WHERE p.canonical_resource_type = ? AND p.canonical_resource_id = ? AND p.pipeline = ? AND p.target_lang = 'zh-CN' ORDER BY CASE WHEN EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = p.active_work_item_id AND w.status = 'ready') THEN 0 ELSE 1 END, p.updated_at DESC, p.id DESC LIMIT 1",
-        )
-        .bind(&resource_type)
-        .bind(&resource_id)
-        .bind(&pipeline)
-        .fetch_one(&mut **tx)
-        .await?;
+        let projection_text_query = if identity_upgrade_complete {
+            "SELECT trim(COALESCE(json_extract(p.payload_json, '$.title'), json_extract(p.payload_json, '$.title_zh'), '') || ' ' || COALESCE(json_extract(p.payload_json, '$.summary'), json_extract(p.payload_json, '$.body_md'), '')) FROM content_current_result_projections p JOIN content_work_identities i ON i.id = p.identity_id LEFT JOIN content_work_items active ON active.id = COALESCE(p.active_work_item_id, p.work_item_id) WHERE i.canonical_resource_type = ? AND i.canonical_resource_id = ? AND i.pipeline = ? AND i.target_lang = 'zh-CN' ORDER BY CASE WHEN active.status = 'ready' THEN 0 ELSE 1 END, julianday(p.published_at) DESC, p.published_at DESC, i.source_hash DESC LIMIT 1"
+        } else {
+            "SELECT trim(COALESCE(json_extract(p.payload_json, '$.title'), json_extract(p.payload_json, '$.title_zh'), '') || ' ' || COALESCE(json_extract(p.payload_json, '$.summary'), json_extract(p.payload_json, '$.body_md'), '')) FROM content_result_projections p WHERE p.canonical_resource_type = ? AND p.canonical_resource_id = ? AND p.pipeline = ? AND p.target_lang = 'zh-CN' ORDER BY CASE WHEN EXISTS (SELECT 1 FROM content_work_items w WHERE w.id = p.active_work_item_id AND w.status = 'ready') THEN 0 ELSE 1 END, p.updated_at DESC, p.id DESC LIMIT 1"
+        };
+        let text = sqlx::query_scalar::<_, Option<String>>(projection_text_query)
+            .bind(&resource_type)
+            .bind(&resource_id)
+            .bind(&pipeline)
+            .fetch_optional(&mut **tx)
+            .await?;
         let column = if pipeline == "polishing" {
             "smart_text"
         } else {
@@ -365,7 +395,7 @@ async fn apply_content_projection_batch(
             "UPDATE search_documents SET {column} = ?, updated_at = MAX(updated_at, CURRENT_TIMESTAMP) WHERE resource_type = ? AND resource_id = ?"
         );
         sqlx::query(&sql)
-            .bind(text)
+            .bind(text.flatten())
             .bind(resource_type)
             .bind(resource_id)
             .execute(&mut **tx)

@@ -59,6 +59,24 @@
 - Recovery：失败后可回退到迁移 0084 兼容版本；不 down-migrate，缺少该迁移的旧二进制必须拒绝部署。
 - Validation：以当前 schema 数据库夹具验证工作、投影、请求、尝试和调用关联不变，新结构为空且控制状态为 pending；重复启动兼容版本成功，迁移前二进制因未知迁移被拒绝。
 
+## Migration-Free Identity Cutover Runtime
+
+身份切换版本只使用已部署的迁移 0084，不增加 DDL。全局调度 worker 在身份控制记录完成前不 claim 工作；新 admission 可以继续进入队列，但必须在同一 writer 事务内注册模型无关身份、关联该身份下所有模型专属工作，并把可用的匹配结果写入当前投影。
+
+升级 worker 以小事务分阶段执行：
+
+1. `work_identity_backfill` 为尚未映射的历史工作建立规范身份与成员关系。每批重新选择未映射工作，因此暂停后或回填期间到达且排序早于上次处理 ID 的行不会被游标跳过。
+2. `projection_backfill` 为每个身份选择最近发布的有效模型专属投影；来源时间相同按投影 ID 稳定决胜。存在有效投影时，保留一个 ready 工作，其余同身份的活动或可恢复工作标记为 `superseded`，不改写既有尝试与调用记录。
+3. `blocked_config_recovery` 对没有匹配当前投影的身份至多排入一个自动恢复请求。配置无效时阶段会完成但不会调用 provider；有效配置更新或启动时运行时重载再触发恢复扫描。
+
+控制记录保存阶段、处理量、阶段总量、最近 ID、恢复数、错误码和完成时间。管理员可读取状态并在批次边界暂停、恢复；失败后可从已提交游标前向继续。`GET /api/admin/jobs/content-processing/identity-upgrade` 返回进度，`POST` 接收 `{"action":"pause"}` 或 `{"action":"resume"}`。升级完成还会请求既有搜索索引 content-projection phase 重算，以统一当前投影读取。
+
+每次新尝试在 `attempt_started` 中写安全配置快照、按顺序排列的模型路由快照及配置指纹。快照不保存 URL 原文、用户凭据或密钥；只保留 URL origin、完整 URL 的 SHA-256、API key 的 SHA-256 和模型路由。调用期间使用该次记录的路由顺序，后续尝试重新读取当时的有效配置。
+
+Feed 翻译与润色 hook 将 `blocked_config` 保持为原请求的 pending 状态，状态轮询间隔为 30 秒，网络错误退避最高 5 分钟，不受普通 pending 的最大等待年龄限制。已发布的匹配结果不会因模型变化重跑；卡片保留服务端返回的可读结果并显示既定等待文案，不提供手动重试入口。
+
+运行时配置更新只有在模型路由实际变化时唤醒阻塞项；启动时会先完成运行时设置和路由恢复，再执行一次恢复扫描。尝试配置不再读取工作项创建时的模型档案或配置指纹。
+
 ## Admin Collection Read Budget
 
 Release、公告、通知和日报的管理列表都先在 SQLite 中构造规范来源、旧事实／全局处理状态和筛选候选集，再精确计算总数并只读取当前页 ID。通知按 `updated_at DESC, id DESC` 选取每个 `thread_id` 的唯一来源；不存在可靠的首次发现时间时仍返回 `NULL`。

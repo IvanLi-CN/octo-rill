@@ -265,7 +265,30 @@ function TranslatedLane(props: {
 }) {
 	const { item, onTranslateNow, isAutoRetrying } = props;
 
+	if (item.translated?.status === "blocked_config") {
+		return (
+			<div className="space-y-3">
+				<p role="status" className="text-sm text-muted-foreground">
+					等待模型配置恢复，恢复后会自动继续
+				</p>
+				{item.translated.summary?.trim() ? (
+					<Markdown content={item.translated.summary} />
+				) : (
+					<OriginalLane item={item} />
+				)}
+			</div>
+		);
+	}
+
 	if (item.translated?.status === "ready" && item.translated.summary?.trim()) {
+		return <Markdown content={item.translated.summary} />;
+	}
+	if (
+		(item.translated?.status === "queued" ||
+			item.translated?.status === "running" ||
+			item.translated?.status === "deferred_provider") &&
+		item.translated.summary?.trim()
+	) {
 		return <Markdown content={item.translated.summary} />;
 	}
 
@@ -314,7 +337,30 @@ function SmartLane(props: {
 }) {
 	const { item, onSmartNow, isSmartGenerating, isAutoRetrying } = props;
 
+	if (item.smart?.status === "blocked_config") {
+		return (
+			<div className="space-y-3">
+				<p role="status" className="text-sm text-muted-foreground">
+					等待模型配置恢复，恢复后会自动继续
+				</p>
+				{item.smart.summary?.trim() ? (
+					<Markdown content={item.smart.summary} />
+				) : (
+					<OriginalLane item={item} />
+				)}
+			</div>
+		);
+	}
+
 	if (item.smart?.status === "ready" && item.smart.summary?.trim()) {
+		return <Markdown content={item.smart.summary} />;
+	}
+	if (
+		(item.smart?.status === "queued" ||
+			item.smart?.status === "running" ||
+			item.smart?.status === "deferred_provider") &&
+		item.smart.summary?.trim()
+	) {
 		return <Markdown content={item.smart.summary} />;
 	}
 
