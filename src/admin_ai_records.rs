@@ -4094,7 +4094,7 @@ mod tests {
         .expect("seed benchmark global work");
 
         sqlx::raw_sql(include_str!(
-            "../migrations/0084_admin_collection_activity_indexes.sql"
+            "../migrations/0085_admin_collection_activity_indexes.sql"
         ))
         .execute(&pool)
         .await

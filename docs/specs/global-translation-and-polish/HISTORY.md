@@ -13,3 +13,5 @@
 - A result found only in legacy evidence is not promoted to a current global result or work state.
 - The migration-bearing compatibility version is the earliest application version permitted after the global schema exists. A migration-preceding binary is intentionally unsupported after that point.
 - Admin activity indexes are additive DDL; the activity reader does not backfill or mutate retained collection, legacy or global work facts.
+- Model-specific global work and projection rows are reconciled to model-independent identities without discarding attempt, model-call or requester-link history. The latest published valid projection is the current result; existing blocked work is requeued only when no matching valid projection exists.
+- The model-independent identity upgrade is separate from the already completed global cutover: its compatibility release adds schema only, and its later identity cutover adds no new migration.
