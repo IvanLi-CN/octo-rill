@@ -26,7 +26,8 @@
 - `translation_work_items` 记录 `failure_class`、`retry_count`、`next_retry_at` 与 24 小时 `retry_expires_at`。
 - 只对具备结构化失败分类的可恢复项自动恢复；历史未分类失败保持失败，仅允许人工重试。
 
-## Translation `model_profile`
+## Legacy Translation `model_profile`
 
-- `translation_work_items.model_profile` 与 `translation_batches.model_profile` 改为记录稳定的有序模型列表画像。
+- 仍由本主题管理的旧 `translation_work_items.model_profile` 与 `translation_batches.model_profile` 记录稳定的有序模型列表画像。
 - 不再使用“本次实际命中的单个模型”作为 profile，避免 failover 造成缓存键分叉。
+- 此画像不定义全局 `content_work_items` 或 `content_result_projections` 的身份；其模型无关合同由 [全局翻译与润色工作模型](../../global-translation-and-polish/contracts/db.md) 拥有。
