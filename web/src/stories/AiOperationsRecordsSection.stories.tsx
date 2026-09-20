@@ -5,6 +5,7 @@ import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import { AiOperationsRecordsSection } from "@/admin/AiOperationsRecordsSection";
 import type {
+	AdminCollectionActivityResponse,
 	AdminCollectionRecordDetail,
 	AdminCollectionRecordsResponse,
 	AdminLlmCallDetailResponse,
@@ -171,6 +172,82 @@ const listResponse: AdminCollectionRecordsResponse = {
 	total: 1,
 };
 
+function activityResponse(
+	kind: AdminCollectionRecordDetail["record"]["kind"] = "release",
+): AdminCollectionActivityResponse {
+	const windowStart = new Date("2026-09-20T00:00:00Z");
+	const cells = [
+		{
+			id: "383114065",
+			title: "Bun v1.4.2",
+			repository: "oven-sh/bun",
+			source_time: "2026-09-20T11:55:00Z",
+			translation_status: "running",
+			polish_status: "failed",
+			composite_status: "exception" as const,
+		},
+		{
+			id: "announcement-42",
+			title: "Runtime compatibility notice",
+			repository: "oven-sh/bun",
+			source_time: "2026-09-20T10:35:00Z",
+			translation_status: "succeeded",
+			polish_status: "queued",
+			composite_status: "processing" as const,
+		},
+		{
+			id: "notification-32",
+			title: "New security advisory",
+			repository: "oven-sh/bun",
+			source_time: "2026-09-20T09:30:00Z",
+			translation_status: "succeeded",
+			polish_status: "not_applicable",
+			composite_status: "completed" as const,
+		},
+		{
+			id: "release-previous",
+			title: "A release with historical evidence only",
+			repository: "oven-sh/bun",
+			source_time: "2026-09-20T08:15:00Z",
+			translation_status: "historical_unknown",
+			polish_status: "legacy_cached",
+			composite_status: "neutral" as const,
+		},
+	];
+	const cellsByHour = new Map<number, typeof cells>();
+	for (const cell of cells) {
+		const hour = Number(cell.source_time.slice(11, 13));
+		const bucketIndex = 11 - hour;
+		const bucketCells = cellsByHour.get(bucketIndex) ?? [];
+		bucketCells.push(cell);
+		cellsByHour.set(bucketIndex, bucketCells);
+	}
+	return {
+		kind,
+		bucket_minutes: 60,
+		bucket_count: 12,
+		window_started_at: windowStart.toISOString(),
+		window_ended_at: "2026-09-20T12:00:00Z",
+		summary: {
+			content_count: cells.length,
+			completed_count: 1,
+			processing_count: 1,
+			exception_count: 1,
+			neutral_count: 1,
+		},
+		buckets: Array.from({ length: 12 }, (_, index) => {
+			const startedAt = new Date(
+				windowStart.getTime() + (11 - index) * 3_600_000,
+			);
+			return {
+				started_at: startedAt.toISOString(),
+				ended_at: new Date(startedAt.getTime() + 3_600_000).toISOString(),
+				cells: cellsByHour.get(index) ?? [],
+			};
+		}),
+	};
+}
+
 export const expiredCall: AdminLlmCallDetailResponse = {
 	...failedCall,
 	id: "call-release-smart-expired",
@@ -253,6 +330,14 @@ export const FailedResponseWithDiagnostics: Story = {
 						: requestInput.toString(),
 					window.location.origin,
 				);
+				if (url.pathname.endsWith("/activity")) {
+					const kind = url.pathname
+						.split("/")
+						.at(-2) as AdminCollectionActivityResponse["kind"];
+					return new Response(JSON.stringify(activityResponse(kind)), {
+						status: 200,
+					});
+				}
 				if (url.pathname.includes("/ai-records/release")) {
 					return new Response(JSON.stringify(listResponse), { status: 200 });
 				}
@@ -308,6 +393,14 @@ export const GlobalEvidenceOverview: Story = {
 						: requestInput.toString(),
 					window.location.origin,
 				);
+				if (url.pathname.endsWith("/activity")) {
+					const kind = url.pathname
+						.split("/")
+						.at(-2) as AdminCollectionActivityResponse["kind"];
+					return new Response(JSON.stringify(activityResponse(kind)), {
+						status: 200,
+					});
+				}
 				if (url.pathname.includes("/ai-records/release")) {
 					return new Response(JSON.stringify(listResponse), { status: 200 });
 				}
@@ -362,6 +455,14 @@ export const ExpiredDiagnosticEvidence: Story = {
 						: requestInput.toString(),
 					window.location.origin,
 				);
+				if (url.pathname.endsWith("/activity")) {
+					const kind = url.pathname
+						.split("/")
+						.at(-2) as AdminCollectionActivityResponse["kind"];
+					return new Response(JSON.stringify(activityResponse(kind)), {
+						status: 200,
+					});
+				}
 				if (url.pathname.includes("/ai-records/release")) {
 					return new Response(
 						JSON.stringify({
@@ -423,6 +524,18 @@ export const BusyRead: Story = {
 						: requestInput.toString(),
 					window.location.origin,
 				);
+				if (url.pathname.endsWith("/activity")) {
+					return new Response(
+						JSON.stringify({
+							ok: false,
+							error: {
+								code: "admin_collection_records_busy",
+								message: "admin collection records are temporarily busy",
+							},
+						}),
+						{ status: 503, headers: { "content-type": "application/json" } },
+					);
+				}
 				if (url.pathname.includes("/ai-records/release")) {
 					return new Response(
 						JSON.stringify({
@@ -495,6 +608,14 @@ export const CancelsStaleRead: Story = {
 						: requestInput.toString(),
 					window.location.origin,
 				);
+				if (url.pathname.endsWith("/activity")) {
+					const kind = url.pathname
+						.split("/")
+						.at(-2) as AdminCollectionActivityResponse["kind"];
+					return new Response(JSON.stringify(activityResponse(kind)), {
+						status: 200,
+					});
+				}
 				if (url.pathname.includes("/ai-records/release")) {
 					return await new Promise<Response>((_resolve, reject) => {
 						init?.signal?.addEventListener("abort", () => {
@@ -531,5 +652,108 @@ export const CancelsStaleRead: Story = {
 					.__adminCollectionAbortCount,
 			).toBeGreaterThan(0);
 		});
+	},
+};
+
+type ActivityRequestWindow = Window & {
+	__collectionActivityPaths?: string[];
+};
+
+export const ActivityTabIsolation: Story = {
+	tags: ["admin-collection-activity"],
+	args: {
+		detailRoute: null,
+		onFiltersChange: () => undefined,
+		onOpenRecord: () => undefined,
+		onOpenAttempt: () => undefined,
+		onOpenLlm: () => undefined,
+		onCloseRecord: () => undefined,
+	},
+	decorators: [
+		(Story) => {
+			const originalFetch = useRef(window.fetch);
+			const restoreFetch = originalFetch.current;
+			const requestWindow = window as ActivityRequestWindow;
+			requestWindow.__collectionActivityPaths = [];
+			window.fetch = async (input, init) => {
+				const requestInput = input instanceof Request ? input.url : input;
+				const url = new URL(
+					typeof requestInput === "string"
+						? requestInput
+						: requestInput.toString(),
+					window.location.origin,
+				);
+				if (url.pathname.endsWith("/activity")) {
+					requestWindow.__collectionActivityPaths?.push(url.pathname);
+					const kind = url.pathname
+						.split("/")
+						.at(-2) as AdminCollectionActivityResponse["kind"];
+					return new Response(JSON.stringify(activityResponse(kind)), {
+						status: 200,
+					});
+				}
+				if (
+					/\/ai-records\/(release|announcement|notification|brief)$/.test(
+						url.pathname,
+					)
+				) {
+					const kind = url.pathname
+						.split("/")
+						.at(-1) as AdminCollectionActivityResponse["kind"];
+					return new Response(
+						JSON.stringify({
+							...listResponse,
+							items: listResponse.items.map((item) => ({ ...item, kind })),
+							total: 40,
+						}),
+						{ status: 200 },
+					);
+				}
+				return restoreFetch(input, init);
+			};
+			useEffect(
+				() => () => {
+					window.fetch = restoreFetch;
+					delete requestWindow.__collectionActivityPaths;
+				},
+				[restoreFetch, requestWindow],
+			);
+			return (
+				<div
+					data-visual-evidence-surface
+					className="mx-auto box-border w-full max-w-[1072px] bg-background p-6"
+				>
+					<div data-visual-evidence-target className="mx-auto max-w-5xl p-6">
+						<Story />
+					</div>
+				</div>
+			);
+		},
+	],
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const requestWindow = window as ActivityRequestWindow;
+		await waitFor(() =>
+			expect(requestWindow.__collectionActivityPaths).toContain(
+				"/api/admin/jobs/ai-records/release/activity",
+			),
+		);
+		await userEvent.click(canvas.getByRole("tab", { name: "公告" }));
+		await waitFor(() =>
+			expect(requestWindow.__collectionActivityPaths).toContain(
+				"/api/admin/jobs/ai-records/announcement/activity",
+			),
+		);
+		const requestCount = requestWindow.__collectionActivityPaths?.length ?? 0;
+		const nextPageButton = canvas.getByRole("button", { name: "下一页" });
+		await waitFor(() => {
+			expect(canvas.getByText(/第 1\/2 页/)).toBeVisible();
+			expect(nextPageButton).toBeEnabled();
+		});
+		await userEvent.click(nextPageButton);
+		await waitFor(() => expect(canvas.getByText(/第 2\/2 页/)).toBeVisible());
+		await expect(requestWindow.__collectionActivityPaths).toHaveLength(
+			requestCount,
+		);
 	},
 };
