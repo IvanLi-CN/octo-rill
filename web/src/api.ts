@@ -2363,6 +2363,40 @@ export type AdminCollectionRecordsResponse = {
 	page_size: number;
 	total: number;
 };
+export type AdminCollectionActivityStatus =
+	| "completed"
+	| "processing"
+	| "exception"
+	| "neutral";
+export type AdminCollectionActivityCell = {
+	id: string;
+	title: string;
+	repository: string | null;
+	source_time: string;
+	translation_status: string | null;
+	polish_status: string;
+	composite_status: AdminCollectionActivityStatus;
+};
+export type AdminCollectionActivityBucket = {
+	started_at: string;
+	ended_at: string;
+	cells: AdminCollectionActivityCell[];
+};
+export type AdminCollectionActivityResponse = {
+	kind: AdminCollectionRecordItem["kind"];
+	bucket_minutes: 60;
+	bucket_count: 12;
+	window_started_at: string;
+	window_ended_at: string;
+	summary: {
+		content_count: number;
+		completed_count: number;
+		processing_count: number;
+		exception_count: number;
+		neutral_count: number;
+	};
+	buckets: AdminCollectionActivityBucket[];
+};
 export type AdminCollectionAttempt = {
 	id: string;
 	pipeline: "translation" | "polish";
@@ -2534,6 +2568,15 @@ export async function apiGetAdminCollectionRecords(
 ): Promise<AdminCollectionRecordsResponse> {
 	return apiGet<AdminCollectionRecordsResponse>(
 		`/api/admin/jobs/ai-records/${kind}?${params.toString()}`,
+		{ signal },
+	);
+}
+export async function apiGetAdminCollectionActivity(
+	kind: AdminCollectionRecordItem["kind"],
+	signal?: AbortSignal,
+): Promise<AdminCollectionActivityResponse> {
+	return apiGet<AdminCollectionActivityResponse>(
+		`/api/admin/jobs/ai-records/${kind}/activity`,
 		{ signal },
 	);
 }
