@@ -19,6 +19,7 @@ const SECONDARY_PREFETCH_COUNT = 10;
 const INITIAL_SMART_PREFETCH_COUNT = 12;
 const REQUEST_ERROR_RECOVERY_MAX_RETRIES = 3;
 const REQUEST_STATUS_POLL_INTERVAL_MS = 250;
+const BLOCKED_CONFIG_POLL_INTERVAL_MS = 30_000;
 const AUTO_SMART_MAX_WAIT_MS = 500;
 const REQUEST_STATUS_POLL_WINDOW_MS = 20_000;
 const REQUEST_RESUME_WINDOW_MAX_RETRIES = 15;
@@ -159,9 +160,30 @@ function mapTranslationItemToFeedSmart(item: {
 				error_detail: item.error_detail ?? null,
 				auto_translate: false,
 			};
+		case "blocked_config":
+			return {
+				lang: "zh-CN",
+				status: "blocked_config",
+				title: item.title_zh,
+				summary,
+				error_code: item.error_code ?? null,
+				error_summary: "等待模型配置恢复，恢复后会自动继续",
+				error_detail: item.error_detail ?? null,
+			};
+		case "queued":
+		case "running":
+		case "deferred_provider":
+			return {
+				lang: "zh-CN",
+				status: item.status,
+				title: item.title_zh,
+				summary,
+				error_code: item.error_code ?? null,
+				error_summary: item.error_summary ?? null,
+				error_detail: item.error_detail ?? null,
+			};
 		case "error":
 		case "failed":
-		case "blocked_config":
 		case "cancelled":
 		case "superseded":
 			return {
@@ -213,6 +235,8 @@ type TranslationTask = {
 	requestItem: TranslationRequestItemInput;
 	requestId?: string;
 	createdAtMs: number;
+	lastStatus?: TranslationResultItem["status"];
+	nextPollAtMs?: number;
 	rejectOnFailure: boolean;
 	deferred: Deferred<SmartResolveResponse | null>;
 	promise: Promise<SmartResolveResponse | null>;
@@ -341,7 +365,6 @@ function isTerminalTranslationResultStatus(
 		status === "failed" ||
 		status === "missing" ||
 		status === "not_applicable" ||
-		status === "blocked_config" ||
 		status === "cancelled" ||
 		status === "superseded"
 	);
@@ -568,7 +591,26 @@ export function useAutoSmart(params: {
 				task.requestId = resolved.request_id ?? task.requestId;
 
 				if (isPendingTranslationResultStatus(resolved.status)) {
-					if (Date.now() - task.createdAtMs > REQUEST_PENDING_MAX_AGE_MS) {
+					const now = Date.now();
+					task.nextPollAtMs =
+						now +
+						(resolved.status === "blocked_config"
+							? BLOCKED_CONFIG_POLL_INTERVAL_MS
+							: REQUEST_STATUS_POLL_INTERVAL_MS);
+					if (task.lastStatus !== resolved.status) {
+						const pending = mapTranslationItemToFeedSmart(resolved);
+						if (pending) {
+							onSmart(
+								{ kind: candidate.item.kind, id: candidate.item.id },
+								pending,
+							);
+						}
+						task.lastStatus = resolved.status;
+					}
+					if (
+						resolved.status !== "blocked_config" &&
+						Date.now() - task.createdAtMs > REQUEST_PENDING_MAX_AGE_MS
+					) {
 						finalizeFailure(
 							candidate,
 							task,
@@ -677,9 +719,13 @@ export function useAutoSmart(params: {
 				});
 			}
 			const windowKeys = buildVisibleWindowKeys(windowEntries, viewportHeight);
+			const now = Date.now();
 			const pending = Array.from(requestTasksRef.current.entries()).map(
 				([key, task]) => {
 					if (!task.rejectOnFailure && !windowKeys.has(key)) {
+						return null;
+					}
+					if (task.nextPollAtMs !== undefined && task.nextPollAtMs > now) {
 						return null;
 					}
 					const item = itemByKeyRef.current.get(key);
@@ -713,6 +759,13 @@ export function useAutoSmart(params: {
 					for (const { candidate, task } of chunk) {
 						const count =
 							(pollErrorCountRef.current.get(candidate.key) ?? 0) + 1;
+						if (task.lastStatus === "blocked_config") {
+							pollErrorCountRef.current.set(candidate.key, count);
+							task.nextPollAtMs =
+								Date.now() +
+								Math.min(BLOCKED_CONFIG_POLL_INTERVAL_MS * count, 5 * 60_000);
+							continue;
+						}
 						if (count >= REQUEST_ERROR_RECOVERY_MAX_RETRIES) {
 							finalizeFailure(candidate, task, error);
 						} else {
@@ -734,10 +787,19 @@ export function useAutoSmart(params: {
 		if (!enabled || !mountedRef.current || requestTasksRef.current.size === 0)
 			return;
 		if (pollTimerRef.current !== null || pollBusyRef.current) return;
-		pollTimerRef.current = window.setTimeout(() => {
-			pollTimerRef.current = null;
-			void pollPendingTasks();
-		}, REQUEST_STATUS_POLL_INTERVAL_MS);
+		const now = Date.now();
+		const nextPollAt = Math.min(
+			...Array.from(requestTasksRef.current.values()).map(
+				(task) => task.nextPollAtMs ?? now,
+			),
+		);
+		pollTimerRef.current = window.setTimeout(
+			() => {
+				pollTimerRef.current = null;
+				void pollPendingTasks();
+			},
+			Math.max(0, nextPollAt - now),
+		);
 	}, [enabled, pollPendingTasks]);
 
 	schedulePendingPollRef.current = schedulePendingPoll;

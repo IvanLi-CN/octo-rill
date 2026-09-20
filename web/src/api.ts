@@ -2031,7 +2031,8 @@ export function isPendingTranslationResultStatus(
 	return (
 		status === "queued" ||
 		status === "running" ||
-		status === "deferred_provider"
+		status === "deferred_provider" ||
+		status === "blocked_config"
 	);
 }
 

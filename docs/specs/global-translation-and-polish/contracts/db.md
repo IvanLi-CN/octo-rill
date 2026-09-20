@@ -63,7 +63,7 @@ projections; those writes remain worker-owned.
 - The migration-bearing compatibility release adds the identity registry, member mapping, current-projection table, nullable attempt-snapshot columns and a pending upgrade-control row. It does not populate the registry, copy projections, rewrite work, or change the current model-specific runtime behavior.
 - The registry unique key includes `source_hash` and excludes model/configuration fields. The current-projection row is unique by its registry identity, so different source versions cannot collapse into one result.
 - The compatibility binary retains the existing model-specific tables and indexes. It can open the later cutover schema and is the supported rollback target; a binary without the compatibility migration is not supported after the migration is applied.
-- The later identity cutover performs work-member reconciliation, projection backfill and blocked-configuration recovery as separately observable, pauseable, idempotent phases. DDL completion alone does not mark the upgrade complete.
+- The later identity cutover performs work-member reconciliation, projection backfill and blocked-configuration recovery as separately observable, pauseable, idempotent phases. Work-member backfill must select unmapped rows until none remain; a lexical cursor alone is not sufficient when admissions may continue during the upgrade. New admissions register the identity and members in their admission transaction. DDL completion alone does not mark the upgrade complete.
 
 ## Model-Independent Identity Migration
 

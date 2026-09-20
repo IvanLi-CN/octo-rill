@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tower_sessions::Session;
 
-use crate::{api, content_processing, error::ApiError, state::AppState, translations};
+use crate::{
+    api, content_identity_upgrade, content_processing, error::ApiError, state::AppState,
+    translations,
+};
 
 const PAGE_SIZE_DEFAULT: i64 = 20;
 
@@ -721,11 +724,28 @@ async fn load_global_task_rows(
     if entity_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let mut query = QueryBuilder::<Sqlite>::new(
-        "SELECT pipeline, source_hash, status, attempt_count, started_at, finished_at, updated_at, (SELECT MAX(created_at) FROM content_attempt_events e WHERE e.work_item_id = content_work_items.id) AS last_attempt_at, canonical_resource_id, (SELECT p.work_item_id FROM content_result_projections p WHERE p.canonical_resource_type = content_work_items.canonical_resource_type AND p.canonical_resource_id = content_work_items.canonical_resource_id AND p.pipeline = content_work_items.pipeline AND p.variant = content_work_items.variant AND p.target_lang = content_work_items.target_lang AND p.protocol_version = content_work_items.protocol_version AND p.model_profile = content_work_items.model_profile AND p.source_hash = content_work_items.source_hash ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_work_item_id, (SELECT p.source_hash FROM content_result_projections p WHERE p.canonical_resource_type = content_work_items.canonical_resource_type AND p.canonical_resource_id = content_work_items.canonical_resource_id AND p.pipeline = content_work_items.pipeline AND p.variant = content_work_items.variant AND p.target_lang = content_work_items.target_lang AND p.protocol_version = content_work_items.protocol_version AND p.model_profile = content_work_items.model_profile AND p.source_hash = content_work_items.source_hash ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_source_hash, (SELECT p.updated_at FROM content_result_projections p WHERE p.canonical_resource_type = content_work_items.canonical_resource_type AND p.canonical_resource_id = content_work_items.canonical_resource_id AND p.pipeline = content_work_items.pipeline AND p.variant = content_work_items.variant AND p.target_lang = content_work_items.target_lang AND p.protocol_version = content_work_items.protocol_version AND p.model_profile = content_work_items.model_profile AND p.source_hash = content_work_items.source_hash ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_updated_at FROM content_work_items WHERE canonical_resource_type = ",
-    );
+    let identity_control_exists = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'content_identity_upgrade_control'",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+        > 0;
+    let identity_upgrade_complete = if identity_control_exists {
+        content_identity_upgrade::is_complete(&state.pool)
+            .await
+            .map_err(ApiError::internal)?
+    } else {
+        false
+    };
+    let source = if identity_upgrade_complete {
+        "WITH ranked_members AS (SELECT m.identity_id, w.*, ROW_NUMBER() OVER (PARTITION BY m.identity_id ORDER BY CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'ready' THEN 4 WHEN 'failed' THEN 5 WHEN 'superseded' THEN 9 ELSE 6 END, w.attempt_count DESC, julianday(w.updated_at) DESC, w.updated_at DESC, w.id DESC) AS member_rank FROM content_work_identity_members m JOIN content_work_items w ON w.id = m.work_item_id), canonical_work AS (SELECT * FROM ranked_members WHERE member_rank = 1) SELECT w.pipeline, i.source_hash, w.status, w.attempt_count, w.started_at, w.finished_at, w.updated_at, (SELECT MAX(e.created_at) FROM content_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at, w.canonical_resource_id, p.work_item_id AS projection_work_item_id, i.source_hash AS projection_source_hash, p.updated_at AS projection_updated_at FROM canonical_work w JOIN content_work_identities i ON i.id = w.identity_id LEFT JOIN content_current_result_projections p ON p.identity_id = i.id WHERE w.canonical_resource_type = "
+    } else {
+        "SELECT w.pipeline, w.source_hash, w.status, w.attempt_count, w.started_at, w.finished_at, w.updated_at, (SELECT MAX(e.created_at) FROM content_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at, w.canonical_resource_id, (SELECT p.work_item_id FROM content_result_projections p WHERE p.canonical_resource_type = w.canonical_resource_type AND p.canonical_resource_id = w.canonical_resource_id AND p.pipeline = w.pipeline AND p.variant = w.variant AND p.target_lang = w.target_lang AND p.protocol_version = w.protocol_version AND p.model_profile = w.model_profile AND p.source_hash = w.source_hash ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_work_item_id, (SELECT p.source_hash FROM content_result_projections p WHERE p.canonical_resource_type = w.canonical_resource_type AND p.canonical_resource_id = w.canonical_resource_id AND p.pipeline = w.pipeline AND p.variant = w.variant AND p.target_lang = w.target_lang AND p.protocol_version = w.protocol_version AND p.model_profile = w.model_profile AND p.source_hash = w.source_hash ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_source_hash, (SELECT p.updated_at FROM content_result_projections p WHERE p.canonical_resource_type = w.canonical_resource_type AND p.canonical_resource_id = w.canonical_resource_id AND p.pipeline = w.pipeline AND p.variant = w.variant AND p.target_lang = w.target_lang AND p.protocol_version = w.protocol_version AND p.model_profile = w.model_profile AND p.source_hash = w.source_hash ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_updated_at FROM content_work_items w WHERE w.canonical_resource_type = "
+    };
+    let mut query = QueryBuilder::<Sqlite>::new(source);
     query.push_bind(collection_record_kind_label(kind));
-    query.push(" AND canonical_resource_id IN (");
+    query.push(" AND w.canonical_resource_id IN (");
     {
         let mut separated = query.separated(", ");
         for id in entity_ids {
@@ -733,8 +753,8 @@ async fn load_global_task_rows(
         }
     }
     query.push(")");
-    query.push(" AND ((pipeline = 'translation' AND variant IN ('detail', 'summary', 'shared')) OR (pipeline = 'polishing' AND variant = 'smart'))");
-    query.push(" ORDER BY julianday(created_at) DESC, created_at DESC, CASE status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'ready' THEN 3 WHEN 'failed' THEN 4 WHEN 'superseded' THEN 9 ELSE 5 END, CASE WHEN pipeline = 'translation' AND variant = 'detail' THEN 0 ELSE 1 END, julianday(updated_at) DESC, updated_at DESC, id DESC");
+    query.push(" AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared')) OR (w.pipeline = 'polishing' AND w.variant = 'smart'))");
+    query.push(" ORDER BY julianday(w.created_at) DESC, w.created_at DESC, CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'ready' THEN 4 WHEN 'failed' THEN 5 WHEN 'superseded' THEN 9 ELSE 6 END, CASE WHEN w.pipeline = 'translation' AND w.variant = 'detail' THEN 0 ELSE 1 END, julianday(w.updated_at) DESC, w.updated_at DESC, w.id DESC");
     let rows = match query
         .build_query_as::<GlobalTaskRow>()
         .fetch_all(&state.pool)
