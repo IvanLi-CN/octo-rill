@@ -2,9 +2,19 @@
 
 ## Current State
 
-当前运行时仍以用户隔离的 `translation_work_items` 和 `ai_translations` 为事实来源。Release 明细翻译存在直接结果缓存路径，管理页却只读取工作项，因此会把“已有缓存、没有工作项”显示为“未开始”。Release 润色也仍按 `scope_user_id` 分组；它没有同一条缺工作项的直接写入路径，但同样不符合全局共享的目标。
+全局内容处理调度器与结果投影已在运行；旧的用户隔离表保留为历史事实。当前实现仍把 `model_profile` 纳入全局工作项和结果投影身份，并在工作项级冻结配置指纹。worker 在执行前发现配置指纹变化时会将工作项置为 `blocked_config`；现有用户重试入口只接受 `failed`，因此这类工作不能靠该入口恢复。前端目前把 `blocked_config` 当作终态错误并停止轮询。模型无关身份、尝试级配置快照、配置变更事件驱动的恢复和可恢复等待呈现尚未实现。
 
-## Delivery Shape
+## Approved Identity Update
+
+后续身份切换必须将工作与结果投影身份统一为不含模型路由或配置指纹的规范资源、处理链路、变体、目标语言、源哈希和协议版本。每次新尝试在开始时快照当时有效的安全配置与有序模型路由；一次运行中的尝试保持该快照，后续尝试重新读取当前配置。敏感密钥只允许以不可逆指纹表示，实际命中的模型仍通过尝试到模型调用的关联记录。
+
+数据库升级须保留既有尝试、模型调用、请求者关联和已发布输出的可追溯性。同一完整结果身份（包含 `source_hash`）下存在多个模型专属有效投影时，最近发布的有效投影成为唯一当前投影，同一发布时间以稳定 ID 决胜，其他记录只作为历史事实。对既有 `blocked_config` 工作按新身份归并；仅当没有源哈希完全匹配的有效当前投影时，自动排入一次恢复。已存在匹配投影的内容不重跑；恢复走正常调度器、并发和 provider 防护。有效配置更新或运行时配置重载会重新验证阻塞项；配置仍无效时不进行定时 provider 重试。界面将 `blocked_config` 显示为 pending 并继续轮询原请求，使用“等待模型配置恢复，恢复后会自动继续”；不增加手动重试入口或改变 API wire shape。源内容未变时不提供强制重生成命令。
+
+当前兼容阶段只准备后续身份升级所需的 schema，不执行上述运行时行为切换或数据回填。
+
+## Original Global Cutover Shape
+
+全局切换已经启用。以下步骤记录原有切换与回滚安全边界，不是本次模型无关身份升级的待执行步骤。
 
 1. 在兼容版本中加入全局扩展表、`content_processing_control` 控制记录和启动前模式保护。默认模式为 `legacy`；该版本仍运行旧模型，但已经包含并应用所有切换前需要的迁移。
 2. 兼容版本必须在 `global` 或 `rollback_freeze` 模式下阻止旧入口、旧调度器和直接缓存写入，返回可轮询的维护响应。它仍可启动、读取一般业务数据和保留旧内容处理事实，因此是数据库迁移后的最低回滚版本。
@@ -13,14 +23,14 @@
 5. 部署切换版本。它不携带新的数据库迁移，只读取已存在的扩展表，并在一个数据库事务中把模式从 `rollback_freeze` 切换为 `global`；提交后由全局调度器读取该控制状态并接管新的覆盖请求和交互入口。
 6. 在稳定期只通过全局读模型展示状态，并持续监测未预期的旧写入。发现问题时暂停全局调度器并回退到兼容版本；兼容版本保持全局模式保护，避免恢复旧写入，随后以前向修复恢复服务。
 
-## Database Migration Plan
+## Existing Database Migration
 
-当前实现使用迁移 `0078_content_processing_global_model.sql` 和追加迁移 `0079_admin_collection_read_budget_indexes.sql`，只创建下列新表、索引和控制记录：
+当前实现使用迁移 `0078_content_processing_global_model.sql` 和追加迁移 `0079_admin_collection_read_budget_indexes.sql` 创建全局表、索引和控制记录：
 
 - `content_processing_control`：单行模式栅栏，取值为 `legacy`、`rollback_freeze` 或 `global`；记录切换代号和更新时间。它是旧新写入者共同读取的唯一切换事实。
-- `content_work_items`：包含全局身份、不可变来源快照、冻结配置指纹、优先级、调度状态、租约关联、恢复元数据和取消／替代关系。唯一索引覆盖 `REQ-GTP-IDENTITY` 的全部字段。
+- `content_work_items`：包含全局身份、不可变来源快照、工作级配置指纹、优先级、调度状态、租约关联、恢复元数据和取消／替代关系。当前唯一索引仍包含 `model_profile`，这与新批准的身份合同不一致。
 - `content_batches` 与 `content_batch_items`：持久化调度批次、工作成员、分区、令牌估算、触发原因和批次结果，唯一 worker kind 为 `general`。
-- `content_result_projections`：按规范资源、处理链路、变体、语言、协议和模型档案保存最新已验证投影、已发布来源哈希、当前工作项和活动工作项。更新使用同一事务替换投影；刷新中的工作绝不清空旧投影。
+- `content_result_projections`：当前按规范资源、处理链路、变体、语言、协议和模型档案保存已验证投影、已发布来源哈希、当前工作项和活动工作项。新合同要求去除模型档案分组并只解析一个当前投影。
 - `content_request_links`：保存请求者或系统生产者、授权快照、请求来源、交付模式、关联工作项和响应事实；它是重试竞争时仍要写入的关联记录。
 - `content_attempt_events` 和 `content_attempt_llm_calls`：追加式的全局尝试和精确模型调用归因，仅保存安全元数据。
 - `content_legacy_observations`：引用旧表的原始主键和只读分类，保存 `legacy_cached` 或 `legacy_conflict` 的判定依据；不复制旧内容、不反向修改旧表。
@@ -28,7 +38,25 @@
 - `idx_notifications_admin_canonical_source`：按通知线程、更新时间和稳定行 ID 支持管理读取的规范来源选择。
 - `idx_translation_work_items_admin_entity_kind_attempt`：按实体、处理种类和尝试次数支持管理候选集筛选。
 
-迁移不执行 `DROP TABLE`、表改名、数据重建、旧行 `UPDATE`、旧行 `DELETE` 或把旧数据插入全局工作／结果／尝试表。`translation_work_items`、`translation_requests`、旧尝试事件和 `ai_translations` 继续存在；应用仅把它们当作旧事实读取。
+这些原始切换迁移不执行 `DROP TABLE`、表改名、数据重建、旧行 `UPDATE`、旧行 `DELETE` 或把旧数据插入全局工作／结果／尝试表。`translation_work_items`、`translation_requests`、旧尝试事件和 `ai_translations` 继续存在；应用仅把它们当作旧事实读取。
+
+## Identity Upgrade Migration
+
+迁移 `0084_content_processing_model_independent_identity.sql` 是身份升级的兼容结构阶段。它作用于已包含当前全局 schema（迁移至 0083）的 SQLite 数据库：
+
+- 只添加 `content_work_identities`、`content_work_identity_members`、`content_current_result_projections`、`content_identity_upgrade_control` 和尝试级安全配置/路由快照列；控制记录以 pending 开始。
+- 不复制结果、不关联既有工作、不重写工作/投影，也不切换当前 model-specific 运行行为。
+- 后续身份切换版本不得增加新迁移；它按可暂停、幂等且有阶段进度的流程归并工作与投影，然后处理符合条件的 `blocked_config` 恢复。
+- 数据回填按完整身份执行。多个模型专属有效投影按 `published_at` 最新者胜出，同一时间以稳定 ID 决胜；匹配当前源哈希的有效结果不重跑。
+
+迁移记录与运行边界：
+
+- Durable state：应用运行时 SQLite 数据库及全局工作、请求、尝试、调用和投影事实。
+- Compatibility range：迁移前的现有 schema 可升级到迁移 0084；部署后只有包含 0084 的兼容版本及其后续版本支持打开数据库。
+- DDL：新增模型无关身份注册、旧工作成员映射、当前结果投影、升级进度控制，以及可空尝试快照列。兼容版本只运行现有 model-specific 行为。
+- DML/backfill：迁移 0084 不转换历史行；后续版本分阶段、可暂停、幂等地回填，并分别报告工作映射、投影选择和阻塞恢复的进度。
+- Recovery：失败后可回退到迁移 0084 兼容版本；不 down-migrate，缺少该迁移的旧二进制必须拒绝部署。
+- Validation：以当前 schema 数据库夹具验证工作、投影、请求、尝试和调用关联不变，新结构为空且控制状态为 pending；重复启动兼容版本成功，迁移前二进制因未知迁移被拒绝。
 
 ## Admin Collection Read Budget
 
@@ -44,6 +72,8 @@ SQLx 默认会校验数据库中每一个已应用迁移是否存在于当前二
 
 兼容版本包含扩展迁移，并在看到 `global` 或 `rollback_freeze` 时禁止旧内容处理写入。因此从全局切换版本回退到兼容版本时：数据库可打开；旧表、全局表和所有历史行仍在；内容处理保持受控暂停，不会把旧用户隔离模型重新写活；服务以兼容版本的一般功能运行，直到以前向修复恢复全局处理。不得把兼容版本之后产生的全局数据解释为旧模型的当前状态。
 
+模型无关身份升级有自己的回滚下界：应用迁移 `0084` 后，第一阶段兼容版本是支持的最低二进制；缺少 `0084` 的更早版本不支持启动。后续切换版本不增加新迁移，但仍保留对已应用迁移 `0084` 的识别；失败时可回退到兼容版本而不反向修改数据库。
+
 ## Implementation Boundaries
 
 - Scheduler runtime owns admission/retry transactions, claiming, batching, provider invocation, attempt events, result publication and automatic recovery; provider/attempt/projection writes stay behind this boundary.
@@ -54,4 +84,4 @@ SQLx 默认会校验数据库中每一个已应用迁移是否存在于当前二
 
 ## Completion Evidence
 
-Implementation is complete only after the verification scenarios in [SPEC.md](./SPEC.md) pass against a migration-bearing compatibility build and a migration-free global cutover build. The release checklist must prove the database can start under the compatibility build after cutover, that migration-preceding binaries are rejected before deployment, and that no legacy table changed during old-fact observation.
+Identity-upgrade implementation is complete only after the verification scenarios in [SPEC.md](./SPEC.md) pass against the migration-bearing compatibility build and the later migration-free identity cutover build. The release checklist must prove the database can start under the compatibility build after cutover, that migration-preceding binaries are rejected, and that compatibility migration 0084 performs no historical-data backfill.
