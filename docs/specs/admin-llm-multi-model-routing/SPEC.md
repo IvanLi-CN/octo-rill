@@ -1,6 +1,6 @@
 # 管理员 LLM 多模型路由与故障切换
 
-## 背景 / 问题陈述
+## Context and Scope
 
 - 当前运行时只接受单个 `AI_MODEL`，管理员后台只能配置 `max_concurrency` 与可选的 `ai_model_context_limit`。
 - 管理员无法在控制台维护多个候选模型，也无法调整优先顺序。
@@ -42,25 +42,28 @@
 - 可配置桶宽、桶数、历史回填、跨实例聚合或独立健康面板。
 - 用活动颜色表达成功率；活动颜色只表达成功与失败终态调用总量。
 
-## 需求（Requirements）
+## Requirements
 
 ### MUST
 
-- `PATCH /api/admin/jobs/llm/runtime-config` 必须支持提交有序 `llm_models` 数组，数组元素为 trim 后的非空模型 ID。
-- 管理端模型列表必须至少保留 1 个模型，且 trim / normalize 后不得重复。
-- 新请求选模顺序固定为管理员排序后的第一个可用模型；若全部处于冷却，则选择 `cooldown_until` 最早到期的模型继续探测，不得直接返回“无模型可用”。
-- 模型级最终失败的定义必须是：该候选已完成当前逻辑调用允许的瞬态 / 限流重试后仍失败，或在该候选上得到空内容；单次逻辑调用所有候选的上游尝试总数不得超过 8 次。
-- 某模型在滚动窗口内累计两次相关最终失败后进入 10 分钟冷却；成功不会抹除窗口历史。
-- `effective_model_input_limit` 必须与“下一次新请求将会选中的模型”一致；所有批处理预算也必须按该实际候选模型计算。
+- REQ-LLM-MODEL-SETTINGS: `PATCH /api/admin/jobs/llm/runtime-config` MUST accept an ordered `llm_models` array of non-empty model IDs.
+- REQ-LLM-MODEL-VALIDATION: 管理端模型列表必须至少保留 1 个模型，且 trim / normalize 后不得重复。
+- REQ-LLM-ROUTE-SELECTION: 新请求选模顺序固定为管理员排序后的第一个可用模型；若全部处于冷却，则选择 `cooldown_until` 最早到期的模型继续探测，不得直接返回“无模型可用”。
+- REQ-LLM-FAILOVER-BOUNDS: 模型级最终失败是该候选完成允许的瞬态/限流重试后仍失败，或该候选返回空内容；单次逻辑调用的全部候选上游尝试总数不得超过 8 次。
+- REQ-LLM-COOLDOWN: 某模型在滚动窗口内累计两次相关最终失败后进入 10 分钟冷却；成功不会抹除窗口历史。
+- REQ-LLM-CONTEXT-BUDGET: `effective_model_input_limit` 必须与下一次新请求将选中的模型一致；所有批处理预算也必须按实际候选模型计算。
 
 ### SHOULD
 
-- 管理台状态接口暴露逐模型状态：模型名、排序位置、冷却状态、连续失败次数、冷却截止时间、该模型的有效输入上限及来源。
-- 翻译批次 / work item 的 `model_profile` 改为记录稳定的“有序模型路由画像”，避免 failover 把缓存键打散。
+- REQ-LLM-MODEL-STATUS: 管理台状态接口暴露逐模型状态：模型名、排序位置、冷却状态、连续失败次数、冷却截止时间、该模型的有效输入上限及来源。
+- REQ-LLM-LEGACY-PROFILE: 仍由本主题管理的遗留 `translation_work_items` / `translation_batches` 以 `model_profile` 记录稳定的有序模型路由画像。全局内容工作项与结果投影的身份由 [全局翻译与润色工作模型](../global-translation-and-polish/SPEC.md) 管理，不绑定模型路由。
 
 ### COULD
 
-- 后续再补按模型维度的 24h 健康聚合与管理端筛选项。
+- 后续可补按模型维度的 24h 健康聚合与管理端筛选项。
+- REQ-LLM-ACTIVITY-WINDOW: 管理端活动接口固定返回当前 UTC 小时及前 49 小时的逐模型终态统计，并以 `finished_at` 为首选活动时间。
+- REQ-LLM-ACTIVITY-LAYOUT: 活动网格按可用容器宽度显示最多 50 桶，不产生横向溢出；窄屏使用优先级标记和网格下方模型图例，聚合浮窗不得覆盖网格或越出视口。
+- REQ-LLM-CALL-DRILLDOWN: 活动图与模型卡片的调用跳转必须保留精确模型和约定时间范围，清除冲突筛选并将完整筛选写入可恢复 URL。
 
 ## 功能与行为规格（Functional / Behavior Spec）
 
@@ -90,7 +93,7 @@
 - 全局手动覆盖值 `ai_model_context_limit` 继续存在；若不为空，对所有模型都生效。
 - 若覆盖值为空，则按“本次实际选中的模型”解析 `effective_model_input_limit` 与 source。
 - release detail chunk budget、release batch budget、notification batch budget、日报批处理预算都必须改为依赖该选模结果。
-- `translation_work_items.model_profile` / `translation_batches.model_profile` 改为稳定记录有序模型列表画像，而不是单次实际命中的模型。
+- 对仍由本主题管理的遗留 `translation_work_items.model_profile` / `translation_batches.model_profile`，稳定记录有序模型列表画像，而不是单次实际命中的模型。全局 `content_work_items` 和结果投影不以模型画像作为身份，详见全局翻译与润色主题。
 
 ### 4. 管理端状态接口
 
@@ -153,7 +156,13 @@
 - [contracts/http-apis.md](./contracts/http-apis.md)
 - [contracts/db.md](./contracts/db.md)
 
-## 验收标准（Acceptance Criteria）
+## Verification
+
+- VER-LLM-ROUTING covers: REQ-LLM-MODEL-SETTINGS, REQ-LLM-MODEL-VALIDATION, REQ-LLM-ROUTE-SELECTION, REQ-LLM-FAILOVER-BOUNDS, REQ-LLM-COOLDOWN。
+- VER-LLM-BUDGET covers: REQ-LLM-CONTEXT-BUDGET。
+- VER-LLM-STATUS covers: REQ-LLM-MODEL-STATUS, REQ-LLM-LEGACY-PROFILE。
+- VER-LLM-ACTIVITY covers: REQ-LLM-ACTIVITY-WINDOW, REQ-LLM-ACTIVITY-LAYOUT。
+- VER-LLM-DRILLDOWN covers: REQ-LLM-CALL-DRILLDOWN。
 
 - Given 管理员打开 `/admin/jobs/llm` 设置弹窗
   When 查看模型配置区域
@@ -206,14 +215,6 @@
 - Given 活动桶存在成功或失败调用
   When 渲染活动图
   Then 界面显示颜色图例；无调用使用中性色、无失败调用按调用量显示蓝绿色阶、部分失败使用警告色、全部失败使用错误色，且文字与聚合窗提供非颜色语义。
-
-## 非功能性验收 / 质量门槛（Quality Gates）
-
-- Rust tests: `cargo test`
-- Rust lint: `cargo clippy --all-targets -- -D warnings`
-- Web checks: `cd web && bun run lint`、`cd web && bun run build`
-- Storybook / UI checks: `cd web && bun run storybook:build`
-- E2E: `cd web && bun run e2e -- admin-jobs.spec.ts`
 
 ## Visual Evidence
 

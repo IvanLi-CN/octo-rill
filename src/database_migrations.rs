@@ -119,6 +119,8 @@ fn validate_history(applied: Option<&[AppliedMigration]>, migrator: &Migrator) -
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
 
@@ -328,5 +330,154 @@ mod tests {
         .await
         .expect("read retained webhook observation");
         assert_eq!(hook_id, Some(9001));
+    }
+
+    #[tokio::test]
+    async fn identity_compatibility_migrator_reopens_schema_and_pre_0084_build_is_rejected() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+
+        let current_migrations = sqlx::migrate!("./migrations");
+        let pre_identity_compatibility_migrator = Migrator {
+            migrations: Cow::Owned(
+                current_migrations
+                    .iter()
+                    .filter(|migration| migration.version < 84)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: true,
+            locking: true,
+            no_tx: false,
+        };
+        pre_identity_compatibility_migrator
+            .run(&pool)
+            .await
+            .expect("apply schema through version 83");
+        sqlx::query(
+            "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, attempt_count, created_at, updated_at) VALUES ('model-a-work', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'same-source', 'protocol-1', 'model-a', '{}', 'config-a', 'blocked_config', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), ('model-b-work', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'same-source', 'protocol-1', 'model-b', '{}', 'config-b', 'ready', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed model-specific work rows");
+        sqlx::query(
+            "INSERT INTO content_request_links (id, request_id, work_item_id, requester_type, requester_id, authorization_snapshot_json, producer_ref, request_source, delivery_mode, created_at, updated_at) VALUES ('request-link-a', 'request-a', 'model-a-work', 'user', 'user-a', '{}', 'test', 'test', 'async', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed requester association");
+        sqlx::query(
+            "INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, retry_eligible, created_at) VALUES ('attempt-start-a', 'model-a-work', 1, 'initial', 'attempt_started', 0, CURRENT_TIMESTAMP), ('attempt-end-a', 'model-a-work', 1, 'initial', 'attempt_completed', 0, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed attempt history");
+        sqlx::query(
+            "INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, created_at) VALUES ('call-a', 'attempt-start-a', 'provider-call-a', 'model-a', 'failed', CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed model-call history");
+        sqlx::query(
+            "INSERT INTO content_result_projections (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash, work_item_id, payload_json, published_at, updated_at) VALUES ('projection-a', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'protocol-1', 'model-a', 'same-source', 'model-a-work', '{\"title_zh\":\"A\"}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), ('projection-b', 'release', 'release-1', 'translation', 'summary', 'zh-CN', 'protocol-1', 'model-b', 'same-source', 'model-b-work', '{\"title_zh\":\"B\"}', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed model-specific projection candidates");
+
+        run(&pool)
+            .await
+            .expect("apply identity compatibility migration");
+        run(&pool)
+            .await
+            .expect("compatibility build reopens migrated schema");
+
+        for table in [
+            "content_work_identities",
+            "content_work_identity_members",
+            "content_current_result_projections",
+        ] {
+            let row_count = sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await
+                .expect("read empty identity upgrade table");
+            assert_eq!(row_count, 0, "compatibility release backfilled {table}");
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_work_items WHERE id IN ('model-a-work', 'model-b-work')",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read retained global work rows"),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_result_projections WHERE id IN ('projection-a', 'projection-b')",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read retained projection rows"),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_request_links WHERE id = 'request-link-a'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read retained requester association"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_events WHERE work_item_id = 'model-a-work'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read retained attempt events"),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_llm_calls WHERE id = 'call-a'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read retained provider-call association"),
+            1
+        );
+        let attempt_snapshot: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT configuration_snapshot_json, route_snapshot_json, configuration_fingerprint FROM content_attempt_events WHERE id = 'attempt-start-a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read nullable compatibility snapshot columns");
+        assert_eq!(attempt_snapshot, (None, None, None));
+
+        let pre_identity_compatibility_migrator = Migrator {
+            migrations: Cow::Owned(
+                current_migrations
+                    .iter()
+                    .filter(|migration| migration.version < 84)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: false,
+            locking: true,
+            no_tx: false,
+        };
+        let error = pre_identity_compatibility_migrator
+            .run(&pool)
+            .await
+            .expect_err("a pre-0084 build must not open the upgraded database");
+        assert!(matches!(
+            error,
+            sqlx::migrate::MigrateError::VersionMissing(84)
+        ));
     }
 }
