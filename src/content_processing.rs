@@ -2613,7 +2613,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 (Some(input), Some(output)) => Some(input.saturating_add(output)),
                 _ => None,
             };
-            sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, next_retry_at, duration_ms, token_count, cost_microunits, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'failed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started'")
+            sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, next_retry_at, duration_ms, token_count, cost_microunits, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'failed', ?, ?, ?, ?, ?, ?, ?, ?, ? FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started'")
                 .bind(local_id::generate_local_id().to_string())
                 .bind(&class)
                 .bind(error_summary)
@@ -2729,6 +2729,7 @@ mod tests {
     use crate::observability::LoggingThresholds;
     use crate::state::{build_oauth_client, build_webauthn};
     use crate::translations::{TranslationRuntimeConfig, TranslationSchedulerController};
+    use axum::{Router, routing::post};
     use sqlx::sqlite::SqlitePoolOptions;
     use url::Url;
 
@@ -2774,6 +2775,24 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query("UPDATE content_processing_control SET mode = 'global' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE content_identity_upgrade_control SET status = 'completed', phase = 'complete' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool
+    }
+
+    async fn global_execution_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::database_migrations::run(&pool).await.unwrap();
         sqlx::query("UPDATE content_processing_control SET mode = 'global' WHERE id = 1")
             .execute(&pool)
             .await
@@ -2837,6 +2856,17 @@ mod tests {
         })
     }
 
+    async fn spawn_test_ai_server(app: Router) -> Url {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test ai server");
+        let addr = listener.local_addr().expect("resolve test ai server addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test ai app");
+        });
+        Url::parse(&format!("http://{addr}/v1/")).expect("parse test ai base url")
+    }
+
     async fn insert_test_work(
         pool: &SqlitePool,
         id: &str,
@@ -2855,6 +2885,127 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_persists_failure_finalization_atomically() {
+        let pool = global_execution_pool().await;
+        sqlx::query("INSERT INTO repo_releases (id, repo_id, release_id, tag_name, html_url, updated_at) VALUES ('test-release', 1, 12345, 'v1', 'https://example.test/releases/12345', CURRENT_TIMESTAMP)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let source_snapshot = json!({
+            "source_blocks": [{"slot": "title", "text": "A release title"}],
+            "target_slots": ["title_zh"]
+        });
+        sqlx::query("INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, created_at, updated_at) VALUES ('execute-failure-work', 'release', '12345', 'translation', 'summary', 'zh-CN', 'source-hash', ?, 'test-model', ?, 'test-fingerprint', 'queued', 0, 0, 1, 0, '2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z')")
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(source_snapshot.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": {"message": "synthetic provider failure"}})),
+                )
+            }),
+        ))
+        .await;
+        let mut state = global_state(pool.clone());
+        Arc::get_mut(&mut state)
+            .expect("state has a single owner")
+            .config
+            .ai
+            .as_mut()
+            .expect("AI configuration")
+            .base_url = base_url;
+
+        let work = claim_next(&state, 1)
+            .await
+            .unwrap()
+            .expect("queued work should be claimed");
+        let attempt_no = work.attempt_count;
+        let batch_id = work.batch_id.clone().expect("claimed work has a batch");
+        let execution = execute(&state, work).await;
+        assert!(
+            execution.is_ok(),
+            "failure finalizer returned: {execution:?}"
+        );
+
+        let (work_status, failure_class, work_retry, lease_owner, lease_expires_at): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as("SELECT status, failure_class, next_retry_at, lease_owner, lease_expires_at FROM content_work_items WHERE id = 'execute-failure-work'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(work_status, "failed");
+        assert!(failure_class.is_some());
+        assert_eq!(lease_owner, None);
+        assert_eq!(lease_expires_at, None);
+
+        let (result_status, event_class, retry_eligible, event_retry): (
+            String,
+            Option<String>,
+            i64,
+            Option<String>,
+        ) = sqlx::query_as("SELECT result_status, failure_class, retry_eligible, next_retry_at FROM content_attempt_events WHERE work_item_id = 'execute-failure-work' AND attempt_no = ? AND event_type = 'attempt_completed'")
+            .bind(attempt_no)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(result_status, "failed");
+        assert_eq!(event_class, failure_class);
+        assert_eq!(work_retry, event_retry);
+        assert_eq!(retry_eligible, 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM content_attempt_events WHERE work_item_id = 'execute-failure-work' AND attempt_no = ? AND event_type = 'attempt_completed'")
+                .bind(attempt_no)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let started_event_id: String = sqlx::query_scalar(
+            "SELECT id FROM content_attempt_events WHERE work_item_id = 'execute-failure-work' AND attempt_no = ? AND event_type = 'attempt_started'",
+        )
+        .bind(attempt_no)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (call_status, linked_event_id): (String, String) = sqlx::query_as(
+            "SELECT status, attempt_event_id FROM content_attempt_llm_calls WHERE attempt_event_id = ?",
+        )
+        .bind(&started_event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(call_status, "failed");
+        assert_eq!(linked_event_id, started_event_id);
+
+        let batch_item_status: String = sqlx::query_scalar(
+            "SELECT result_status FROM content_batch_items WHERE work_item_id = 'execute-failure-work' AND batch_id = ?",
+        )
+        .bind(&batch_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let batch_status: String =
+            sqlx::query_scalar("SELECT status FROM content_batches WHERE id = ?")
+                .bind(&batch_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(batch_item_status, "failed");
+        assert_eq!(batch_status, "failed");
     }
 
     #[tokio::test]
