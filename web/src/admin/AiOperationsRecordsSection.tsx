@@ -1319,6 +1319,9 @@ export function AiOperationsRecordsSection({
 		translationStatuses,
 	]);
 	useEffect(() => {
+		return () => activityControllerRef.current?.abort();
+	}, [activityRetryNonce, reloadNonce, tab]);
+	useEffect(() => {
 		if (!activityNeedsReadRef.current || !listReadSettledRef.current) return;
 
 		const cached = activityCacheRef.current.get(tab);
@@ -1379,7 +1382,6 @@ export function AiOperationsRecordsSection({
 				activityControllerRef.current = null;
 				setActivityLoading(false);
 			});
-		return () => abortController.abort();
 	}, [activityRetryNonce, listReadCycle, reloadNonce, tab]);
 	useEffect(() => {
 		if (!detailRoute) {

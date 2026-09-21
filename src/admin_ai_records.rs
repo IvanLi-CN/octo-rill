@@ -594,8 +594,8 @@ struct AttemptCountRange {
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct CollectionListKey {
     kind: CollectionRecordKind,
-    from: String,
-    before: String,
+    from: Option<String>,
+    before: Option<String>,
     attempts: AttemptCountRange,
     translation_filter: Vec<String>,
     polish_filter: Vec<String>,
@@ -741,6 +741,23 @@ struct GlobalTaskRow {
     projection_work_item_id: Option<String>,
     projection_source_hash: Option<String>,
     projection_updated_at: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct GlobalAttemptRow {
+    event_id: String,
+    work_item_id: String,
+    pipeline: String,
+    attempt_no: i64,
+    trigger: String,
+    event_type: String,
+    result_status: Option<String>,
+    error_code: Option<String>,
+    error_summary: Option<String>,
+    failure_class: Option<String>,
+    retry_eligible: i64,
+    next_retry_at: Option<String>,
+    created_at: String,
 }
 
 fn missing_table(error: &sqlx::Error) -> bool {
@@ -1270,9 +1287,44 @@ fn notification_kind_sql(kind: CollectionRecordKind) -> (&'static str, &'static 
     }
 }
 
-fn source_records_sql(kind: CollectionRecordKind) -> String {
+fn source_window_sql(
+    expression: &str,
+    from: Option<&str>,
+    before: Option<&str>,
+    binds: &mut Vec<CollectionQueryBind>,
+) -> String {
+    let mut predicates = Vec::new();
+    if let Some(value) = from {
+        predicates.push(format!("julianday({expression}) >= julianday(?)"));
+        binds.push(CollectionQueryBind::Text(value.to_owned()));
+    }
+    if let Some(value) = before {
+        predicates.push(format!("julianday({expression}) < julianday(?)"));
+        binds.push(CollectionQueryBind::Text(value.to_owned()));
+    }
+    if predicates.is_empty() {
+        "1 = 1".to_owned()
+    } else {
+        predicates.join(" AND ")
+    }
+}
+
+fn source_records_sql(
+    kind: CollectionRecordKind,
+    from: Option<&str>,
+    before: Option<&str>,
+    binds: &mut Vec<CollectionQueryBind>,
+) -> String {
     match kind {
-        CollectionRecordKind::Release => "release_repositories AS (
+        CollectionRecordKind::Release => {
+            let window = source_window_sql(
+                "COALESCE(r.published_at, r.created_at, r.updated_at)",
+                from,
+                before,
+                binds,
+            );
+            format!(
+                "release_repositories AS (
                 SELECT repo_id, MIN(repo_full_name) AS repository
                 FROM repo_release_work_items
                 GROUP BY repo_id
@@ -1288,21 +1340,14 @@ fn source_records_sql(kind: CollectionRecordKind) -> String {
                     NULL AS generated_at
                 FROM repo_releases r
                 LEFT JOIN release_repositories rr ON rr.repo_id = r.repo_id
+                WHERE {window}
             )"
-        .to_owned(),
-        CollectionRecordKind::Announcement => "announcement_rows AS (
-                SELECT
-                    e.*,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY lower(e.repo_full_name), e.discussion_number
-                        ORDER BY julianday(e.occurred_at) DESC, e.occurred_at DESC, e.rowid DESC
-                    ) AS source_rank
-                FROM social_activity_events e
-                WHERE e.kind = 'announcement'
-                  AND e.repo_full_name IS NOT NULL
-                  AND e.discussion_number IS NOT NULL
-            ),
-            raw_source_records AS (
+            )
+        }
+        CollectionRecordKind::Announcement => {
+            let window = source_window_sql("e.occurred_at", from, before, binds);
+            format!(
+                "raw_source_records AS (
                 SELECT
                     lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id,
                     e.repo_full_name AS repository,
@@ -1311,11 +1356,27 @@ fn source_records_sql(kind: CollectionRecordKind) -> String {
                     e.occurred_at AS occurred_at,
                     e.detected_at,
                     NULL AS generated_at
-                FROM announcement_rows e
-                WHERE e.source_rank = 1
+                FROM social_activity_events e
+                WHERE e.kind = 'announcement'
+                  AND e.repo_full_name IS NOT NULL
+                  AND e.discussion_number IS NOT NULL
+                  AND {window}
+                  AND e.rowid = (
+                    SELECT latest.rowid
+                    FROM social_activity_events latest
+                    WHERE latest.kind = 'announcement'
+                      AND lower(latest.repo_full_name) = lower(e.repo_full_name)
+                      AND latest.discussion_number = e.discussion_number
+                    ORDER BY latest.occurred_at DESC, latest.rowid ASC
+                    LIMIT 1
+                  )
             )"
-        .to_owned(),
-        CollectionRecordKind::Notification => "raw_source_records AS (
+            )
+        }
+        CollectionRecordKind::Notification => {
+            let window = source_window_sql("n.updated_at", from, before, binds);
+            format!(
+                "raw_source_records AS (
                 SELECT
                     n.thread_id AS id,
                     n.repo_full_name AS repository,
@@ -1325,7 +1386,7 @@ fn source_records_sql(kind: CollectionRecordKind) -> String {
                     NULL AS detected_at,
                     NULL AS generated_at
                 FROM notifications n
-                WHERE 1 = 1
+                WHERE {window}
                   AND NOT EXISTS (
                     SELECT 1
                     FROM notifications newer
@@ -1334,8 +1395,12 @@ fn source_records_sql(kind: CollectionRecordKind) -> String {
                         OR (newer.updated_at = n.updated_at AND newer.id > n.id))
                   )
             )"
-        .to_owned(),
-        CollectionRecordKind::Brief => "raw_source_records AS (
+            )
+        }
+        CollectionRecordKind::Brief => {
+            let window = source_window_sql("b.created_at", from, before, binds);
+            format!(
+                "raw_source_records AS (
                 SELECT
                     b.id,
                     NULL AS repository,
@@ -1345,8 +1410,10 @@ fn source_records_sql(kind: CollectionRecordKind) -> String {
                     NULL AS detected_at,
                     b.created_at AS generated_at
                 FROM briefs b
+                WHERE {window}
             )"
-        .to_owned(),
+            )
+        }
     }
 }
 
@@ -1368,29 +1435,26 @@ fn activity_source_ctes(kind: CollectionRecordKind) -> String {
                   AND julianday(COALESCE(r.published_at, r.created_at, r.updated_at)) < julianday(?)
             )"
         .to_owned(),
-        CollectionRecordKind::Announcement => "bounded_announcement_keys AS MATERIALIZED (
+        CollectionRecordKind::Announcement => "bounded_announcement_rows AS MATERIALIZED (
                 SELECT
+                    e.rowid AS source_rowid,
                     lower(e.repo_full_name) AS repo_key,
                     e.discussion_number,
-                    MAX(e.occurred_at) AS source_time
+                    e.occurred_at AS source_time
                 FROM social_activity_events e
                 WHERE e.kind = 'announcement'
                   AND e.repo_full_name IS NOT NULL
                   AND e.discussion_number IS NOT NULL
-                  AND julianday(e.occurred_at) >= julianday(?)
-                  AND julianday(e.occurred_at) < julianday(?)
-                GROUP BY lower(e.repo_full_name), e.discussion_number
-            ),
-            canonical_announcement_keys AS MATERIALIZED (
-                SELECT c.repo_key, c.discussion_number, c.source_time
-                FROM bounded_announcement_keys c
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM social_activity_events newer
-                    WHERE newer.kind = 'announcement'
-                      AND lower(newer.repo_full_name) = c.repo_key
-                      AND newer.discussion_number = c.discussion_number
-                      AND newer.occurred_at > c.source_time
+                    AND julianday(e.occurred_at) >= julianday(?)
+                    AND julianday(e.occurred_at) < julianday(?)
+                  AND e.rowid = (
+                    SELECT latest.rowid
+                    FROM social_activity_events latest
+                    WHERE latest.kind = 'announcement'
+                      AND lower(latest.repo_full_name) = lower(e.repo_full_name)
+                      AND latest.discussion_number = e.discussion_number
+                    ORDER BY latest.occurred_at DESC, latest.rowid ASC
+                    LIMIT 1
                 )
             ),
             bounded_source_records AS MATERIALIZED (
@@ -1398,21 +1462,10 @@ fn activity_source_ctes(kind: CollectionRecordKind) -> String {
                     c.repo_key || '#' || CAST(c.discussion_number AS TEXT) AS id,
                     e.repo_full_name AS repository,
                     COALESCE(NULLIF(e.title, ''), '公告') AS title,
-                    e.occurred_at AS source_time
-                FROM canonical_announcement_keys c
+                    c.source_time
+                FROM bounded_announcement_rows c
                 JOIN social_activity_events e
-                  ON e.kind = 'announcement'
-                 AND lower(e.repo_full_name) = c.repo_key
-                 AND e.discussion_number = c.discussion_number
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM social_activity_events newer
-                    WHERE newer.kind = 'announcement'
-                      AND lower(newer.repo_full_name) = c.repo_key
-                      AND newer.discussion_number = c.discussion_number
-                      AND (newer.occurred_at > e.occurred_at
-                        OR (newer.occurred_at = e.occurred_at AND newer.rowid > e.rowid))
-                )
+                  ON e.rowid = c.source_rowid
             )"
         .to_owned(),
         CollectionRecordKind::Notification => "bounded_source_records AS MATERIALIZED (
@@ -1577,9 +1630,10 @@ fn activity_query_sql(kind: CollectionRecordKind, global_mode: bool) -> String {
                                 w.updated_at DESC,
                                 w.id DESC
                         ) AS row_rank
-                    FROM content_work_items w
-                    JOIN bounded_source_records s ON s.id = w.canonical_resource_id
+                    FROM bounded_source_records s
+                    CROSS JOIN content_work_items w
                     WHERE w.canonical_resource_type = '{resource_type}'
+                      AND w.canonical_resource_id = s.id
                       AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
                         OR (w.pipeline = 'polishing' AND w.variant = 'smart'))
                 ),
@@ -1794,18 +1848,9 @@ fn collection_query_sql(
 ) -> (String, Vec<CollectionQueryBind>) {
     let mut binds = Vec::new();
     let mut sql = String::from("WITH ");
-    let source_sql = source_records_sql(kind);
+    let source_sql = source_records_sql(kind, from, before, &mut binds);
     sql.push_str(&source_sql);
-    sql.push_str(", source_records AS MATERIALIZED (SELECT * FROM raw_source_records WHERE 1 = 1");
-    if let Some(value) = from {
-        sql.push_str(" AND julianday(source_time) >= julianday(?)");
-        binds.push(CollectionQueryBind::Text(value.to_owned()));
-    }
-    if let Some(value) = before {
-        sql.push_str(" AND julianday(source_time) < julianday(?)");
-        binds.push(CollectionQueryBind::Text(value.to_owned()));
-    }
-    sql.push(')');
+    sql.push_str(", source_records AS MATERIALIZED (SELECT * FROM raw_source_records)");
 
     if kind == CollectionRecordKind::Brief {
         sql.push_str(
@@ -1941,9 +1986,10 @@ fn collection_query_sql(
                                 w.updated_at DESC,
                                 w.id DESC
                         ) AS row_rank
-                    FROM content_work_items w
-                    JOIN source_records s ON s.id = w.canonical_resource_id
-                    WHERE w.canonical_resource_type = '{resource_type}'
+                FROM source_records s
+                CROSS JOIN content_work_items w
+                WHERE w.canonical_resource_type = '{resource_type}'
+                  AND w.canonical_resource_id = s.id
                       AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
                         OR (w.pipeline = 'polishing' AND w.variant = 'smart'))
                 ),
@@ -1953,13 +1999,14 @@ fn collection_query_sql(
                     WHERE row_rank = 1
                 ),
                 global_attempts AS (
-                    SELECT canonical_resource_id AS entity_id, MAX(attempt_count) AS attempt_count
-                    FROM content_work_items w
-                    JOIN source_records s ON s.id = w.canonical_resource_id
-                    WHERE canonical_resource_type = '{resource_type}'
+                    SELECT w.canonical_resource_id AS entity_id, MAX(w.attempt_count) AS attempt_count
+                    FROM source_records s
+                    CROSS JOIN content_work_items w
+                    WHERE w.canonical_resource_type = '{resource_type}'
+                      AND w.canonical_resource_id = s.id
                       AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
                         OR (w.pipeline = 'polishing' AND w.variant = 'smart'))
-                    GROUP BY canonical_resource_id
+                    GROUP BY w.canonical_resource_id
                 ),
                 status_projection AS (
                     SELECT
@@ -2446,11 +2493,13 @@ pub async fn admin_list_collection_records(
     let polish_filter = parse_status_filter(query.polish_status, "polish_status")?;
     let from = parse_timestamp(query.from, "from")?;
     let before = parse_timestamp(query.before, "before")?;
+    let requested_from = from.clone();
+    let requested_before = before.clone();
     let (from, before) = normalize_collection_window(from, before)?;
     let key = CollectionListKey {
         kind,
-        from: from.clone(),
-        before: before.clone(),
+        from: requested_from,
+        before: requested_before,
         attempts,
         translation_filter: translation_filter.clone().unwrap_or_default(),
         polish_filter: polish_filter.clone().unwrap_or_default(),
@@ -2549,7 +2598,7 @@ async fn load_source_record(
             "SELECT CAST(r.release_id AS TEXT) AS id, COALESCE((SELECT wi.repo_full_name FROM repo_release_work_items wi WHERE wi.repo_id = r.repo_id LIMIT 1), '仓库 #' || CAST(r.repo_id AS TEXT)) AS repository, COALESCE(NULLIF(r.name, ''), r.tag_name) AS title, COALESCE(r.published_at, r.created_at, r.updated_at) AS occurred_at, r.detected_at, NULL AS generated_at FROM repo_releases r WHERE r.release_id = ? LIMIT 1"
         }
         CollectionRecordKind::Announcement => {
-            "WITH ranked_announcements AS (SELECT e.*, ROW_NUMBER() OVER (PARTITION BY lower(e.repo_full_name), e.discussion_number ORDER BY julianday(e.occurred_at) DESC, e.occurred_at DESC, e.rowid DESC) AS source_rank FROM social_activity_events e WHERE e.kind = 'announcement' AND lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) = ?) SELECT lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id, e.repo_full_name AS repository, COALESCE(NULLIF(e.title, ''), '公告') AS title, e.occurred_at, e.detected_at, NULL AS generated_at FROM ranked_announcements e WHERE e.source_rank = 1 LIMIT 1"
+            "WITH ranked_announcements AS (SELECT e.*, ROW_NUMBER() OVER (PARTITION BY lower(e.repo_full_name), e.discussion_number ORDER BY e.occurred_at DESC, e.rowid ASC) AS source_rank FROM social_activity_events e WHERE e.kind = 'announcement' AND lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) = ?) SELECT lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id, e.repo_full_name AS repository, COALESCE(NULLIF(e.title, ''), '公告') AS title, e.occurred_at, e.detected_at, NULL AS generated_at FROM ranked_announcements e WHERE e.source_rank = 1 LIMIT 1"
         }
         CollectionRecordKind::Notification => {
             "WITH ranked_notifications AS (SELECT n.*, ROW_NUMBER() OVER (PARTITION BY n.thread_id ORDER BY n.updated_at DESC, n.id DESC) AS source_rank FROM notifications n WHERE n.thread_id = ?) SELECT n.thread_id AS id, n.repo_full_name AS repository, COALESCE(NULLIF(n.subject_title, ''), '通知') AS title, n.updated_at AS occurred_at, NULL AS detected_at, NULL AS generated_at FROM ranked_notifications n WHERE n.source_rank = 1 LIMIT 1"
@@ -2779,29 +2828,11 @@ async fn load_global_attempts(
     kind: CollectionRecordKind,
     entity_id: &str,
 ) -> Result<Vec<AdminCollectionAttempt>, ApiError> {
-    #[derive(Debug, sqlx::FromRow)]
-    struct GlobalAttemptRow {
-        event_id: String,
-        work_item_id: String,
-        pipeline: String,
-        attempt_no: i64,
-        trigger: String,
-        event_type: String,
-        result_status: Option<String>,
-        error_code: Option<String>,
-        error_summary: Option<String>,
-        failure_class: Option<String>,
-        retry_eligible: i64,
-        next_retry_at: Option<String>,
-        created_at: String,
-    }
-    let rows = match sqlx::query_as::<_, GlobalAttemptRow>(
-        "SELECT e.id AS event_id, e.work_item_id, w.pipeline, e.attempt_no, e.trigger, e.event_type, e.result_status, e.error_code, e.error_summary, e.failure_class, e.retry_eligible, e.next_retry_at, e.created_at FROM content_attempt_events e JOIN content_work_items w ON w.id = e.work_item_id WHERE w.canonical_resource_type = ? AND w.canonical_resource_id = ? AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared')) OR (w.pipeline = 'polishing' AND w.variant = 'smart')) ORDER BY julianday(e.created_at) ASC, e.created_at ASC, e.id ASC",
-    )
-    .bind(collection_record_kind_label(kind))
-    .bind(entity_id)
-    .fetch_all(&state.pool)
-    .await
+    let rows = match sqlx::query_as::<_, GlobalAttemptRow>(GLOBAL_ATTEMPT_ROWS_SQL)
+        .bind(collection_record_kind_label(kind))
+        .bind(entity_id)
+        .fetch_all(&state.pool)
+        .await
     {
         Ok(rows) => rows,
         Err(error) if missing_table(&error) => return Ok(Vec::new()),
@@ -2938,6 +2969,8 @@ async fn load_global_attempts(
     });
     Ok(attempts)
 }
+
+const GLOBAL_ATTEMPT_ROWS_SQL: &str = "SELECT e.id AS event_id, e.work_item_id, w.pipeline, e.attempt_no, e.trigger, e.event_type, e.result_status, e.error_code, e.error_summary, e.failure_class, e.retry_eligible, e.next_retry_at, e.created_at FROM content_attempt_events e JOIN content_work_items w ON w.id = e.work_item_id WHERE w.canonical_resource_type = ? AND w.canonical_resource_id = ? AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared')) OR (w.pipeline = 'polishing' AND w.variant = 'smart')) ORDER BY julianday(e.created_at) ASC, e.created_at ASC, e.id ASC";
 
 async fn load_brief_attempts(
     state: &AppState,
@@ -3595,6 +3628,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_detail_attempts_exclude_unsupported_variants() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE content_work_items (id TEXT, canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, variant TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create global work items");
+        sqlx::query(
+            "CREATE TABLE content_attempt_events (id TEXT, work_item_id TEXT, attempt_no INTEGER, trigger TEXT, event_type TEXT, result_status TEXT, error_code TEXT, error_summary TEXT, failure_class TEXT, retry_eligible INTEGER, next_retry_at TEXT, created_at TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create global attempt events");
+        sqlx::query(
+            "INSERT INTO content_work_items VALUES ('supported', 'release', 'release-1', 'translation', 'detail'), ('unsupported', 'release', 'release-1', 'translation', 'other')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed global variants");
+        sqlx::query(
+            "INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, retry_eligible, created_at) VALUES ('supported-event', 'supported', 1, 'initial', 'attempt_started', 0, CURRENT_TIMESTAMP), ('unsupported-event', 'unsupported', 1, 'initial', 'attempt_started', 0, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed attempt events");
+
+        let rows = sqlx::query_as::<_, GlobalAttemptRow>(GLOBAL_ATTEMPT_ROWS_SQL)
+            .bind("release")
+            .bind("release-1")
+            .fetch_all(&pool)
+            .await
+            .expect("load supported global attempts");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_id, "supported-event");
+    }
+
+    #[tokio::test]
     async fn notification_source_record_uses_unknown_detected_time() {
         let pool = test_pool().await;
         create_notifications_fixture(&pool).await;
@@ -3744,8 +3815,8 @@ mod tests {
 
         let key = CollectionListKey {
             kind: CollectionRecordKind::Release,
-            from: "singleflight-test-from".to_owned(),
-            before: "singleflight-test-before".to_owned(),
+            from: None,
+            before: None,
             attempts: AttemptCountRange { min: 0, max: None },
             translation_filter: Vec::new(),
             polish_filter: Vec::new(),
@@ -3798,6 +3869,18 @@ mod tests {
             .expect("second singleflight read")
             .expect("second result");
         assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+
+        let default_window_key = CollectionListKey {
+            kind: CollectionRecordKind::Release,
+            from: None,
+            before: None,
+            attempts: AttemptCountRange { min: 0, max: None },
+            translation_filter: Vec::new(),
+            polish_filter: Vec::new(),
+            page: 1,
+            page_size: 20,
+        };
+        assert_eq!(key, default_window_key);
     }
 
     #[tokio::test]
@@ -4066,6 +4149,7 @@ mod tests {
             "INSERT INTO social_activity_events VALUES
                 ('octo/announce', 42, 'Announcement', '2026-07-08T08:40:00Z', NULL, 'announcement'),
                 ('octo/announce', 42, 'Zulu title', '2026-07-08T09:10:00Z', NULL, 'announcement'),
+                ('octo/announce', 42, 'Alpha title tie-break', '2026-07-08T09:10:00Z', NULL, 'announcement'),
                 ('octo/announce', 43, 'Older in window', '2026-07-08T09:00:00Z', NULL, 'announcement'),
                 ('octo/announce', 43, 'Canonical outside window', '2026-07-08T10:01:00Z', NULL, 'announcement')",
         )
@@ -4275,6 +4359,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "run on codex-testbox for the bounded activity read budget"]
     async fn admin_collection_activity_production_shape_budget() {
+        use sqlx::Row;
         use std::time::Instant;
 
         #[derive(Debug, sqlx::FromRow)]
@@ -4443,6 +4528,7 @@ mod tests {
                 pipeline TEXT,
                 variant TEXT,
                 status TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT,
                 updated_at TEXT
             )",
@@ -4460,12 +4546,31 @@ mod tests {
         sqlx::query(
             "INSERT INTO content_work_items
             SELECT 'translation-' || release_id, 'release', CAST(release_id AS TEXT),
-                'translation', 'detail', 'ready', '2026-09-20T09:25:00Z', '2026-09-20T09:25:00Z'
+                'translation', 'detail', 'ready', 1, '2026-09-20T09:25:00Z', '2026-09-20T09:25:00Z'
             FROM repo_releases WHERE release_id % 20 = 0",
         )
         .execute(&pool)
         .await
         .expect("seed benchmark global work");
+        sqlx::query(
+            "INSERT INTO content_work_items
+            SELECT 'announcement-' || lower(repo_full_name) || '#' || discussion_number,
+                'announcement', lower(repo_full_name) || '#' || discussion_number,
+                'translation', 'detail', 'ready', 1, '2026-09-20T09:25:00Z', '2026-09-20T09:25:00Z'
+            FROM (SELECT DISTINCT repo_full_name, discussion_number FROM social_activity_events)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed benchmark announcement work");
+        sqlx::query(
+            "INSERT INTO content_work_items
+            SELECT 'notification-' || thread_id, 'notification', thread_id,
+                'translation', 'detail', 'ready', 1, '2026-09-20T09:25:00Z', '2026-09-20T09:25:00Z'
+            FROM (SELECT DISTINCT thread_id FROM notifications)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed benchmark notification work");
 
         sqlx::raw_sql(include_str!(
             "../migrations/0073_admin_collection_source_time_indexes.sql"
@@ -4510,6 +4615,7 @@ mod tests {
                 .map(|row| row.detail)
                 .collect::<Vec<_>>()
                 .join(" | ");
+            println!("activity_explain kind={kind:?} plan={plan}");
             let expected_indexes = match kind {
                 CollectionRecordKind::Release => {
                     &["idx_repo_releases_admin_activity_source_time"][..]
@@ -4531,6 +4637,14 @@ mod tests {
                 assert!(
                     plan.contains(expected_index),
                     "{kind:?} activity query did not select {expected_index}: {plan}"
+                );
+            }
+            if kind != CollectionRecordKind::Brief {
+                assert!(
+                    plan.contains(
+                        "SEARCH w USING INDEX idx_content_work_items_resource (canonical_resource_type=? AND canonical_resource_id=?)"
+                    ),
+                    "{kind:?} global activity query did not probe work items from bounded source IDs: {plan}"
                 );
             }
 
@@ -4584,6 +4698,61 @@ mod tests {
                 CollectionRecordKind::Notification,
                 CollectionRecordKind::Brief,
             ] {
+                let (list_sql, list_binds) = collection_query_sql(
+                    kind,
+                    true,
+                    Some(from),
+                    Some(before),
+                    AttemptCountRange { min: 0, max: None },
+                    None,
+                    None,
+                    Some((20, 0)),
+                );
+                let explain_sql = format!("EXPLAIN QUERY PLAN {list_sql}");
+                let mut explain = sqlx::query(&explain_sql);
+                for bind in &list_binds {
+                    explain = match bind {
+                        CollectionQueryBind::Text(value) => explain.bind(value.clone()),
+                        CollectionQueryBind::Integer(value) => explain.bind(*value),
+                    };
+                }
+                let plan = explain
+                    .fetch_all(&pool)
+                    .await
+                    .expect("explain collection list query")
+                    .into_iter()
+                    .map(|row| row.get::<String, _>("detail"))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let expected_source_indexes = match kind {
+                    CollectionRecordKind::Release => {
+                        &["idx_repo_releases_admin_activity_source_time"][..]
+                    }
+                    CollectionRecordKind::Announcement => &[
+                        "idx_social_activity_events_admin_activity_time",
+                        "idx_social_activity_events_admin_activity_canonical",
+                    ][..],
+                    CollectionRecordKind::Notification => &[
+                        "idx_notifications_admin_activity_source_time",
+                        "idx_notifications_admin_canonical_source",
+                    ][..],
+                    CollectionRecordKind::Brief => &["idx_briefs_admin_activity_source_time"][..],
+                };
+                for expected_index in expected_source_indexes {
+                    assert!(
+                        plan.contains(expected_index),
+                        "{kind:?} global list query did not select {expected_index}: {plan}"
+                    );
+                }
+                if kind != CollectionRecordKind::Brief {
+                    assert!(
+                        plan.contains(
+                            "SEARCH w USING INDEX idx_content_work_items_resource (canonical_resource_type=? AND canonical_resource_id=?)"
+                        ),
+                        "{kind:?} global list query did not probe work items from bounded source IDs: {plan}"
+                    );
+                }
+
                 // Keep the all-window list gate bounded; activity reads retain 30 samples above.
                 let mut elapsed = Vec::with_capacity(11);
                 let mut total = 0;

@@ -662,9 +662,10 @@ type ActivityRequestWindow = Window & {
 type ActivityCancellationWindow = ActivityRequestWindow & {
 	__collectionActivityAbortCount?: number;
 	__collectionActivityNowOffset?: number;
+	__resolveCollectionActivity?: () => void;
 };
 
-export const ResumesActivityReadAfterListCancellation: Story = {
+export const ActivityReadIsIndependentOfListPaging: Story = {
 	tags: ["admin-collection-activity"],
 	args: {
 		detailRoute: null,
@@ -699,8 +700,18 @@ export const ResumesActivityReadAfterListCancellation: Story = {
 					requestWindow.__collectionActivityPaths?.push(url.pathname);
 					activityCallCount.current += 1;
 					if (activityCallCount.current === 3) {
-						return await new Promise<Response>((_resolve, reject) => {
+						return await new Promise<Response>((resolve, reject) => {
 							const signal = init?.signal;
+							const kind = url.pathname
+								.split("/")
+								.at(-2) as AdminCollectionActivityResponse["kind"];
+							requestWindow.__resolveCollectionActivity = () => {
+								resolve(
+									new Response(JSON.stringify(activityResponse(kind)), {
+										status: 200,
+									}),
+								);
+							};
 							const rejectOnAbort = () => {
 								requestWindow.__collectionActivityAbortCount =
 									(requestWindow.__collectionActivityAbortCount ?? 0) + 1;
@@ -745,6 +756,7 @@ export const ResumesActivityReadAfterListCancellation: Story = {
 					delete requestWindow.__collectionActivityPaths;
 					delete requestWindow.__collectionActivityAbortCount;
 					delete requestWindow.__collectionActivityNowOffset;
+					delete requestWindow.__resolveCollectionActivity;
 				},
 				[originalNow, restoreFetch, requestWindow],
 			);
@@ -777,18 +789,13 @@ export const ResumesActivityReadAfterListCancellation: Story = {
 			expect(canvas.getByRole("button", { name: "下一页" })).toBeEnabled(),
 		);
 		await userEvent.click(canvas.getByRole("button", { name: "下一页" }));
+		await expect(canvas.getByText("共 40 条 · 第 2/2 页")).toBeVisible();
+		await expect(requestWindow.__collectionActivityAbortCount).toBe(0);
+		await expect(requestWindow.__collectionActivityPaths).toHaveLength(3);
+		requestWindow.__resolveCollectionActivity?.();
 		await waitFor(() =>
-			expect(requestWindow.__collectionActivityAbortCount).toBe(1),
+			expect(canvas.queryByText("正在更新")).not.toBeInTheDocument(),
 		);
-		await waitFor(() =>
-			expect(requestWindow.__collectionActivityPaths).toHaveLength(4),
-		);
-		await expect(requestWindow.__collectionActivityPaths).toEqual([
-			releasePath,
-			"/api/admin/jobs/ai-records/announcement/activity",
-			releasePath,
-			releasePath,
-		]);
 	},
 };
 
