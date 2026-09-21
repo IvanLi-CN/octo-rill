@@ -624,12 +624,25 @@ async fn has_valid_runtime_configuration_in_transaction(
 }
 
 pub async fn on_runtime_configuration_reload(state: &AppState) -> Result<()> {
-    let requeued = content_identity_upgrade::requeue_blocked_config(
-        &state.pool,
-        &state.sqlite_writer,
-        has_valid_runtime_configuration(state).await,
-    )
-    .await?;
+    let mut requeued = 0_i64;
+    loop {
+        let (_permit, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "content_identity_config_recovery")
+            .await?;
+        if !has_valid_runtime_configuration_in_transaction(state, &mut tx).await? {
+            tx.rollback().await?;
+            break;
+        }
+        let now = Utc::now().to_rfc3339();
+        let (batch_requeued, has_more) =
+            content_identity_upgrade::requeue_blocked_config_batch(&mut tx, &now).await?;
+        tx.commit().await?;
+        requeued = requeued.saturating_add(batch_requeued);
+        if !has_more {
+            break;
+        }
+    }
     if requeued > 0 {
         tracing::info!(
             requeued,
@@ -3509,6 +3522,68 @@ mod tests {
             .await
             .unwrap(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_configuration_reload_revalidates_persisted_routes_before_requeue() {
+        let pool = global_pool().await;
+        sqlx::query(
+            "CREATE TABLE admin_runtime_settings (id INTEGER PRIMARY KEY, llm_models_json TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO admin_runtime_settings (id, llm_models_json) VALUES (1, '[]')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_test_work(&pool, "blocked-work", "blocked_config", 1, None).await;
+        let now = Utc::now().to_rfc3339();
+        let mut tx = pool.begin().await.unwrap();
+        content_identity_upgrade::ensure_identity_for_work(&mut tx, "blocked-work", &now)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let mut state = global_state(pool.clone());
+        Arc::get_mut(&mut state)
+            .expect("state has a single owner")
+            .config
+            .ai
+            .as_mut()
+            .expect("AI configuration")
+            .model
+            .clear();
+        assert!(
+            crate::admin_runtime::default_llm_models(&state.config).is_empty(),
+            "test requires no legacy environment model override"
+        );
+        state
+            .llm_scheduler
+            .set_model_routing(vec!["stale-route".to_owned()])
+            .await;
+        assert!(has_valid_runtime_configuration(&state).await);
+
+        on_runtime_configuration_reload(&state).await.unwrap();
+
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM content_work_items WHERE id = 'blocked-work'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "blocked_config"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_events WHERE work_item_id = 'blocked-work' AND event_type = 'attempt_queued' AND trigger = 'automatic_recovery'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
         );
     }
 

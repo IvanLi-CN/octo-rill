@@ -63,7 +63,7 @@
 
 身份切换版本只使用已部署的迁移 0084，不增加 DDL。全局调度 worker 在身份控制记录完成前不 claim 工作；新 admission 可以继续进入队列，但必须在同一 writer 事务内注册模型无关身份、关联该身份下所有模型专属工作，并把可用的匹配结果写入当前投影。
 
-admission 与手动重试在 writer 事务中读取持久化模型路由后再确定是否排队；worker claim 使用同一事务内读取的路由写入 `attempt_started`。因此路由更新与工作创建、重试或尝试开始之间都有单一 SQLite 写入顺序，配置更新后的恢复扫描不会漏掉排在更新之后提交的 `blocked_config` 工作。恢复扫描排除已有匹配投影或 queued、running、deferred_provider 工作的 identity；空的不可恢复批次会前进并终止，不重复占用 SQLite writer。
+admission 与手动重试在 writer 事务中读取持久化模型路由后再确定是否排队；worker claim 使用同一事务内读取的路由写入 `attempt_started`。因此路由更新与工作创建、重试或尝试开始之间都有单一 SQLite 写入顺序，配置更新后的恢复扫描不会漏掉排在更新之后提交的 `blocked_config` 工作。每轮阻塞恢复批次也在 writer 事务内重新读取持久路由并验证配置；若配置已无效，则保留阻塞状态且不追加排队事件。恢复扫描排除已有匹配投影或 queued、running、deferred_provider 工作的 identity；无可处理项或批次未产生进展时会终止，不重复占用 SQLite writer。
 
 升级 worker 以小事务分阶段执行：
 

@@ -818,53 +818,34 @@ pub(crate) async fn is_complete_in_transaction(tx: &mut Transaction<'_, Sqlite>)
     Ok(state.0 == "completed" && state.1 == "complete")
 }
 
-pub(crate) async fn requeue_blocked_config(
-    pool: &SqlitePool,
-    writer: &SqliteWriteCoordinator,
-    configuration_valid: bool,
-) -> Result<i64> {
-    if !configuration_valid {
-        return Ok(0);
-    }
-    let mut requeued = 0_i64;
-    loop {
-        let (_permit, mut tx) = writer
-            .begin_immediate_with_priority(
-                pool,
-                "content_identity_config_recovery",
-                SqliteWritePriority::Background,
-            )
+pub(crate) async fn requeue_blocked_config_batch(
+    tx: &mut Transaction<'_, Sqlite>,
+    now: &str,
+) -> Result<(i64, bool)> {
+    let upgrade_state: (String, String) =
+        sqlx::query_as("SELECT status, phase FROM content_identity_upgrade_control WHERE id = 1")
+            .fetch_one(&mut **tx)
             .await?;
-        let upgrade_state: (String, String) = sqlx::query_as(
-            "SELECT status, phase FROM content_identity_upgrade_control WHERE id = 1",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-        let recovery_phase_open = upgrade_state.0 == "running"
-            && upgrade_state.1 == UpgradePhase::BlockedConfigRecovery.as_str();
-        if upgrade_state.0 != "completed" && !recovery_phase_open {
-            tx.rollback().await?;
-            return Ok(requeued);
-        }
-        let identities = sqlx::query_scalar::<_, String>(
-            "SELECT DISTINCT m.identity_id FROM content_work_identity_members m JOIN content_work_items w ON w.id = m.work_item_id WHERE w.status = 'blocked_config' AND NOT EXISTS (SELECT 1 FROM content_current_result_projections p WHERE p.identity_id = m.identity_id) AND NOT EXISTS (SELECT 1 FROM content_work_identity_members active_member JOIN content_work_items active_work ON active_work.id = active_member.work_item_id WHERE active_member.identity_id = m.identity_id AND active_work.status IN ('queued', 'running', 'deferred_provider')) ORDER BY m.identity_id LIMIT ?",
-        )
-        .bind(BATCH_SIZE)
-        .fetch_all(&mut *tx)
-        .await?;
-        let now = Utc::now().to_rfc3339();
-        for identity_id in &identities {
-            if requeue_blocked_identity(&mut tx, identity_id, &now).await? {
-                requeued = requeued.saturating_add(1);
-            }
-        }
-        let count = identities.len();
-        tx.commit().await?;
-        if count < usize::try_from(BATCH_SIZE).unwrap_or(usize::MAX) {
-            break;
+    let recovery_phase_open = upgrade_state.0 == "running"
+        && upgrade_state.1 == UpgradePhase::BlockedConfigRecovery.as_str();
+    if upgrade_state.0 != "completed" && !recovery_phase_open {
+        return Ok((0, false));
+    }
+    let identities = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT m.identity_id FROM content_work_identity_members m JOIN content_work_items w ON w.id = m.work_item_id WHERE w.status = 'blocked_config' AND NOT EXISTS (SELECT 1 FROM content_current_result_projections p WHERE p.identity_id = m.identity_id) AND NOT EXISTS (SELECT 1 FROM content_work_identity_members active_member JOIN content_work_items active_work ON active_work.id = active_member.work_item_id WHERE active_member.identity_id = m.identity_id AND active_work.status IN ('queued', 'running', 'deferred_provider')) ORDER BY m.identity_id LIMIT ?",
+    )
+    .bind(BATCH_SIZE)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut requeued = 0_i64;
+    for identity_id in &identities {
+        if requeue_blocked_identity(tx, identity_id, now).await? {
+            requeued = requeued.saturating_add(1);
         }
     }
-    Ok(requeued)
+    let has_more =
+        identities.len() >= usize::try_from(BATCH_SIZE).unwrap_or(usize::MAX) && requeued > 0;
+    Ok((requeued, has_more))
 }
 
 pub fn spawn_worker(state: Arc<AppState>) -> tokio::task::AbortHandle {
@@ -1132,6 +1113,23 @@ mod tests {
         panic!("identity upgrade did not complete");
     }
 
+    async fn run_recovery_batch(
+        pool: &SqlitePool,
+        writer: &SqliteWriteCoordinator,
+    ) -> Result<(i64, bool)> {
+        let (_permit, mut tx) = writer
+            .begin_immediate_with_priority(
+                pool,
+                "content_identity_config_recovery_test",
+                SqliteWritePriority::Background,
+            )
+            .await?;
+        let now = Utc::now().to_rfc3339();
+        let result = requeue_blocked_config_batch(&mut tx, &now).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
     #[tokio::test]
     async fn upgrade_preserves_model_history_and_chooses_latest_valid_projection() {
         let pool = pool().await;
@@ -1222,10 +1220,10 @@ mod tests {
 
         let writer = SqliteWriteCoordinator::new();
         assert_eq!(
-            requeue_blocked_config(&pool, &writer, true)
+            run_recovery_batch(&pool, &writer)
                 .await
                 .expect("configuration reload recovery"),
-            1
+            (1, false)
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -1246,10 +1244,10 @@ mod tests {
             1
         );
         assert_eq!(
-            requeue_blocked_config(&pool, &writer, true)
+            run_recovery_batch(&pool, &writer)
                 .await
                 .expect("idempotent configuration reload recovery"),
-            0
+            (0, false)
         );
     }
 
@@ -1293,15 +1291,11 @@ mod tests {
         .expect("mark cutover complete");
 
         let writer = SqliteWriteCoordinator::new();
-        let requeued = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            requeue_blocked_config(&pool, &writer, true),
-        )
-        .await
-        .expect("recovery must terminate when no identity is eligible")
-        .expect("configuration recovery");
+        let batch = run_recovery_batch(&pool, &writer)
+            .await
+            .expect("configuration recovery");
 
-        assert_eq!(requeued, 0);
+        assert_eq!(batch, (0, false));
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM content_work_items WHERE status = 'blocked_config'",
