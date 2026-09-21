@@ -4,6 +4,8 @@
 
 Accepted
 
+ADR 0013 supersedes only this ADR's rejection of coalescing in-flight reads. The 31-day window, exact-count, bounded-query, and timeout decisions remain active.
+
 管理员采集记录列表读取以精确总数和页码为合同，但不得为此读取全量记录、全量处理摘要后再在内存筛选和分页。每次请求的采集记录查询窗最长三十一天；服务以五秒为源站读取预算，并发的同类列表读取在本进程容量用尽时返回可重试的 `503` 与 `Retry-After`。查询不使用结果缓存或请求合并：它必须在数据库内先确定符合筛选条件的精确总数和当前页标识，再仅装载该页详情。
 
 ## Considered Options
