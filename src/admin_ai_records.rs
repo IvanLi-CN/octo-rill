@@ -412,6 +412,20 @@ fn normalize_collection_window(
     Ok((from.to_rfc3339(), before.to_rfc3339()))
 }
 
+fn collection_list_window_key(
+    requested_from: Option<String>,
+    requested_before: Option<String>,
+    normalized_from: String,
+    normalized_before: String,
+) -> (Option<String>, Option<String>) {
+    match (requested_from, requested_before) {
+        (None, None) => (None, None),
+        (None, Some(_)) => (Some(normalized_from), Some(normalized_before)),
+        (Some(from), None) => (Some(from), None),
+        (Some(_), Some(_)) => (Some(normalized_from), Some(normalized_before)),
+    }
+}
+
 const DISPLAY_STATUSES: [&str; 15] = [
     "not_started",
     "queued",
@@ -2494,11 +2508,19 @@ pub async fn admin_list_collection_records(
     let polish_filter = parse_status_filter(query.polish_status, "polish_status")?;
     let from = parse_timestamp(query.from, "from")?;
     let before = parse_timestamp(query.before, "before")?;
+    let requested_from = from.clone();
+    let requested_before = before.clone();
     let (from, before) = normalize_collection_window(from, before)?;
+    let (key_from, key_before) = collection_list_window_key(
+        requested_from,
+        requested_before,
+        from.clone(),
+        before.clone(),
+    );
     let key = CollectionListKey {
         kind,
-        from: Some(from.clone()),
-        before: Some(before.clone()),
+        from: key_from,
+        before: key_before,
         attempts,
         translation_filter: translation_filter.clone().unwrap_or_default(),
         polish_filter: polish_filter.clone().unwrap_or_default(),
@@ -3745,6 +3767,32 @@ mod tests {
                 .unwrap()
                 .signed_duration_since(DateTime::parse_from_rfc3339(&from).unwrap())
                 <= chrono::Duration::days(31)
+        );
+    }
+
+    #[test]
+    fn collection_list_window_key_stabilizes_rolling_defaults() {
+        assert_eq!(
+            collection_list_window_key(None, None, "from-a".to_owned(), "before-a".to_owned()),
+            (None, None)
+        );
+        assert_eq!(
+            collection_list_window_key(
+                Some("from-a".to_owned()),
+                None,
+                "from-a".to_owned(),
+                "before-a".to_owned(),
+            ),
+            (Some("from-a".to_owned()), None)
+        );
+        assert_eq!(
+            collection_list_window_key(
+                None,
+                Some("before-a".to_owned()),
+                "from-a".to_owned(),
+                "before-a".to_owned(),
+            ),
+            (Some("from-a".to_owned()), Some("before-a".to_owned()))
         );
     }
 
