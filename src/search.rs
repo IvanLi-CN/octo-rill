@@ -727,7 +727,6 @@ mod tests {
             github_graphql_url: Url::parse("https://api.github.com/graphql").unwrap(),
             linuxdo_oauth: None,
             encryption_key,
-            admin_collection_read_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             runtime_owner_id: "search-test-runtime".to_owned(),
         })
     }

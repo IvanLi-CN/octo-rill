@@ -1,7 +1,8 @@
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
-    sync::Arc,
+    future::Future,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -12,17 +13,14 @@ use axum::{
 };
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Timelike, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, Sqlite, SqlitePool};
+use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 use tower_sessions::Session;
 
-use crate::{
-    api, content_identity_upgrade, content_processing, error::ApiError, state::AppState,
-    translations,
-};
+use crate::{api, content_processing, error::ApiError, state::AppState, translations};
 
 const PAGE_SIZE_DEFAULT: i64 = 20;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum CollectionRecordKind {
     Release,
     Announcement,
@@ -101,7 +99,7 @@ pub struct AdminCollectionRecordItem {
     pub polish: AdminCollectionTaskSummary,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AdminCollectionRecordsResponse {
     pub items: Vec<AdminCollectionRecordItem>,
     pub page: i64,
@@ -136,7 +134,7 @@ pub struct AdminCollectionActivitySummary {
     pub neutral_count: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AdminCollectionActivityResponse {
     pub kind: String,
     pub bucket_minutes: u8,
@@ -210,6 +208,8 @@ struct SourceRecordRow {
     occurred_at: Option<String>,
     detected_at: Option<String>,
     generated_at: Option<String>,
+    #[sqlx(default)]
+    total_count: i64,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -409,6 +409,20 @@ fn normalize_collection_window(
     Ok((from.to_rfc3339(), before.to_rfc3339()))
 }
 
+fn collection_list_window_key(
+    requested_from: Option<String>,
+    requested_before: Option<String>,
+    normalized_from: String,
+    normalized_before: String,
+) -> (Option<String>, Option<String>) {
+    match (requested_from, requested_before) {
+        (None, None) => (None, None),
+        (None, Some(_)) => (Some(normalized_from), Some(normalized_before)),
+        (Some(from), None) => (Some(from), None),
+        (Some(_), Some(_)) => (Some(normalized_from), Some(normalized_before)),
+    }
+}
+
 const DISPLAY_STATUSES: [&str; 15] = [
     "not_started",
     "queued",
@@ -538,6 +552,15 @@ async fn load_processing_coverage(
     kind: CollectionRecordKind,
     record_ids: &[String],
 ) -> Result<HashMap<(String, String), String>, ApiError> {
+    let mut connection = pool.acquire().await.map_err(ApiError::internal)?;
+    load_processing_coverage_in_connection(&mut connection, kind, record_ids).await
+}
+
+async fn load_processing_coverage_in_connection(
+    connection: &mut SqliteConnection,
+    kind: CollectionRecordKind,
+    record_ids: &[String],
+) -> Result<HashMap<(String, String), String>, ApiError> {
     if record_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -553,7 +576,7 @@ async fn load_processing_coverage(
     query.push(")");
     let rows = query
         .build_query_as::<ProcessingCoverageRow>()
-        .fetch_all(pool)
+        .fetch_all(&mut *connection)
         .await
         .map_err(ApiError::internal)?;
     Ok(rows
@@ -573,10 +596,29 @@ fn coverage_origin(
         .unwrap_or_else(|| "historical_unknown".to_owned())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct AttemptCountRange {
     min: i64,
     max: Option<i64>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct CollectionListKey {
+    kind: CollectionRecordKind,
+    from: Option<String>,
+    before: Option<String>,
+    attempts: AttemptCountRange,
+    translation_filter: Vec<String>,
+    polish_filter: Vec<String>,
+    page: i64,
+    page_size: i64,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct CollectionActivityKey {
+    kind: CollectionRecordKind,
+    window_started_at: String,
+    window_ended_at: String,
 }
 
 fn parse_attempt_count_range(
@@ -712,32 +754,47 @@ struct GlobalTaskRow {
     projection_updated_at: Option<String>,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct GlobalAttemptRow {
+    event_id: String,
+    work_item_id: String,
+    pipeline: String,
+    attempt_no: i64,
+    trigger: String,
+    event_type: String,
+    result_status: Option<String>,
+    error_code: Option<String>,
+    error_summary: Option<String>,
+    failure_class: Option<String>,
+    retry_eligible: i64,
+    next_retry_at: Option<String>,
+    created_at: String,
+}
+
 fn missing_table(error: &sqlx::Error) -> bool {
     matches!(error, sqlx::Error::Database(database) if database.message().contains("no such table"))
 }
 
-async fn load_global_task_rows(
-    state: &AppState,
+async fn load_global_task_rows_in_connection(
+    connection: &mut SqliteConnection,
     kind: CollectionRecordKind,
     entity_ids: &[String],
 ) -> Result<Vec<GlobalTaskRow>, ApiError> {
     if entity_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let identity_control_exists = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'content_identity_upgrade_control'",
+    let identity_upgrade_state = match sqlx::query_as::<_, (String, String)>(
+        "SELECT status, phase FROM content_identity_upgrade_control WHERE id = 1",
     )
-    .fetch_one(&state.pool)
+    .fetch_optional(&mut *connection)
     .await
-    .map_err(ApiError::internal)?
-        > 0;
-    let identity_upgrade_complete = if identity_control_exists {
-        content_identity_upgrade::is_complete(&state.pool)
-            .await
-            .map_err(ApiError::internal)?
-    } else {
-        false
+    {
+        Ok(state) => state,
+        Err(error) if missing_table(&error) => None,
+        Err(error) => return Err(ApiError::internal(error)),
     };
+    let identity_upgrade_complete = identity_upgrade_state
+        .is_some_and(|(status, phase)| status == "completed" && phase == "complete");
     let source = if identity_upgrade_complete {
         "WITH ranked_members AS (SELECT m.identity_id, w.*, ROW_NUMBER() OVER (PARTITION BY m.identity_id ORDER BY CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'ready' THEN 4 WHEN 'failed' THEN 5 WHEN 'superseded' THEN 9 ELSE 6 END, w.attempt_count DESC, julianday(w.updated_at) DESC, w.updated_at DESC, w.id DESC) AS member_rank FROM content_work_identity_members m JOIN content_work_items w ON w.id = m.work_item_id), canonical_work AS (SELECT * FROM ranked_members WHERE member_rank = 1) SELECT w.pipeline, i.source_hash, w.status, w.attempt_count, w.started_at, w.finished_at, w.updated_at, (SELECT MAX(e.created_at) FROM content_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at, w.canonical_resource_id, p.work_item_id AS projection_work_item_id, i.source_hash AS projection_source_hash, p.updated_at AS projection_updated_at FROM canonical_work w JOIN content_work_identities i ON i.id = w.identity_id LEFT JOIN content_current_result_projections p ON p.identity_id = i.id WHERE w.canonical_resource_type = "
     } else {
@@ -757,7 +814,7 @@ async fn load_global_task_rows(
     query.push(" ORDER BY julianday(w.created_at) DESC, w.created_at DESC, CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'ready' THEN 4 WHEN 'failed' THEN 5 WHEN 'superseded' THEN 9 ELSE 6 END, CASE WHEN w.pipeline = 'translation' AND w.variant = 'detail' THEN 0 ELSE 1 END, julianday(w.updated_at) DESC, w.updated_at DESC, w.id DESC");
     let rows = match query
         .build_query_as::<GlobalTaskRow>()
-        .fetch_all(&state.pool)
+        .fetch_all(&mut *connection)
         .await
     {
         Ok(rows) => rows,
@@ -820,8 +877,8 @@ fn compare_attempt_timestamps(left: &str, right: &str) -> Ordering {
     }
 }
 
-async fn load_legacy_observations(
-    state: &AppState,
+async fn load_legacy_observations_in_connection(
+    connection: &mut SqliteConnection,
     kind: CollectionRecordKind,
     entity_ids: &[String],
 ) -> Result<HashMap<(String, String), AdminContentProcessingEvidence>, ApiError> {
@@ -852,7 +909,7 @@ async fn load_legacy_observations(
     }
     let rows = match query
         .build_query_as::<LegacyObservationRow>()
-        .fetch_all(&state.pool)
+        .fetch_all(&mut *connection)
         .await
     {
         Ok(rows) => rows,
@@ -969,6 +1026,18 @@ async fn load_task_summaries(
     coverage: &HashMap<(String, String), String>,
     global_mode: bool,
 ) -> Result<HashMap<String, TaskSummaries>, ApiError> {
+    let mut connection = state.pool.acquire().await.map_err(ApiError::internal)?;
+    load_task_summaries_in_connection(&mut connection, kind, entity_ids, coverage, global_mode)
+        .await
+}
+
+async fn load_task_summaries_in_connection(
+    connection: &mut SqliteConnection,
+    kind: CollectionRecordKind,
+    entity_ids: &[String],
+    coverage: &HashMap<(String, String), String>,
+    global_mode: bool,
+) -> Result<HashMap<String, TaskSummaries>, ApiError> {
     let Some((translation_kind, polish_kind)) = kind.task_kinds() else {
         return Ok(HashMap::new());
     };
@@ -996,11 +1065,11 @@ async fn load_task_summaries(
         query.push(")");
         query
             .build_query_as::<TaskWithEntityRow>()
-            .fetch_all(&state.pool)
+            .fetch_all(&mut *connection)
             .await
             .map_err(ApiError::internal)?
     };
-    let global_rows = load_global_task_rows(state, kind, entity_ids).await?;
+    let global_rows = load_global_task_rows_in_connection(connection, kind, entity_ids).await?;
     let global_by_key = global_rows.iter().fold(HashMap::new(), |mut by_key, row| {
         let pipeline = if row.pipeline == "polishing" {
             "polish"
@@ -1012,7 +1081,8 @@ async fn load_task_summaries(
             .or_insert(row);
         by_key
     });
-    let legacy_observations = load_legacy_observations(state, kind, entity_ids).await?;
+    let legacy_observations =
+        load_legacy_observations_in_connection(connection, kind, entity_ids).await?;
     let mut grouped = HashMap::<String, (Vec<TaskRow>, Vec<TaskRow>)>::new();
     for row in rows {
         let entry = grouped.entry(row.entity_id).or_default();
@@ -1086,6 +1156,15 @@ async fn load_brief_summaries(
     brief_ids: &[String],
     coverage: &HashMap<(String, String), String>,
 ) -> Result<HashMap<String, AdminCollectionTaskSummary>, ApiError> {
+    let mut connection = state.pool.acquire().await.map_err(ApiError::internal)?;
+    load_brief_summaries_in_connection(&mut connection, brief_ids, coverage).await
+}
+
+async fn load_brief_summaries_in_connection(
+    connection: &mut SqliteConnection,
+    brief_ids: &[String],
+    coverage: &HashMap<(String, String), String>,
+) -> Result<HashMap<String, AdminCollectionTaskSummary>, ApiError> {
     if brief_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -1107,7 +1186,7 @@ async fn load_brief_summaries(
     }
     let rows = query
         .build_query_as::<BriefCallWithParentRow>()
-        .fetch_all(&state.pool)
+        .fetch_all(&mut *connection)
         .await
         .map_err(ApiError::internal)?;
     let mut grouped = HashMap::<String, Vec<BriefCallRow>>::new();
@@ -1217,14 +1296,49 @@ fn notification_kind_sql(kind: CollectionRecordKind) -> (&'static str, &'static 
     }
 }
 
-fn source_records_sql(kind: CollectionRecordKind) -> String {
+fn source_window_sql(
+    expression: &str,
+    from: Option<&str>,
+    before: Option<&str>,
+    binds: &mut Vec<CollectionQueryBind>,
+) -> String {
+    let mut predicates = Vec::new();
+    if let Some(value) = from {
+        predicates.push(format!("julianday({expression}) >= julianday(?)"));
+        binds.push(CollectionQueryBind::Text(value.to_owned()));
+    }
+    if let Some(value) = before {
+        predicates.push(format!("julianday({expression}) < julianday(?)"));
+        binds.push(CollectionQueryBind::Text(value.to_owned()));
+    }
+    if predicates.is_empty() {
+        "1 = 1".to_owned()
+    } else {
+        predicates.join(" AND ")
+    }
+}
+
+fn source_records_sql(
+    kind: CollectionRecordKind,
+    from: Option<&str>,
+    before: Option<&str>,
+    binds: &mut Vec<CollectionQueryBind>,
+) -> String {
     match kind {
-        CollectionRecordKind::Release => "release_repositories AS (
+        CollectionRecordKind::Release => {
+            let window = source_window_sql(
+                "COALESCE(r.published_at, r.created_at, r.updated_at)",
+                from,
+                before,
+                binds,
+            );
+            format!(
+                "release_repositories AS (
                 SELECT repo_id, MIN(repo_full_name) AS repository
                 FROM repo_release_work_items
                 GROUP BY repo_id
             ),
-            source_records AS (
+            raw_source_records AS (
                 SELECT
                     CAST(r.release_id AS TEXT) AS id,
                     COALESCE(rr.repository, '仓库 #' || CAST(r.repo_id AS TEXT)) AS repository,
@@ -1235,34 +1349,43 @@ fn source_records_sql(kind: CollectionRecordKind) -> String {
                     NULL AS generated_at
                 FROM repo_releases r
                 LEFT JOIN release_repositories rr ON rr.repo_id = r.repo_id
+                WHERE {window}
             )"
-        .to_owned(),
-        CollectionRecordKind::Announcement => "source_records AS (
+            )
+        }
+        CollectionRecordKind::Announcement => {
+            let window = source_window_sql("e.occurred_at", from, before, binds);
+            format!(
+                "raw_source_records AS (
                 SELECT
                     lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id,
-                    MAX(e.repo_full_name) AS repository,
-                    COALESCE(MAX(NULLIF(e.title, '')), '公告') AS title,
-                    MAX(e.occurred_at) AS source_time,
-                    MAX(e.occurred_at) AS occurred_at,
-                    MIN(e.detected_at) AS detected_at,
+                    e.repo_full_name AS repository,
+                    COALESCE(NULLIF(e.title, ''), '公告') AS title,
+                    e.occurred_at AS source_time,
+                    e.occurred_at AS occurred_at,
+                    e.detected_at,
                     NULL AS generated_at
                 FROM social_activity_events e
                 WHERE e.kind = 'announcement'
                   AND e.repo_full_name IS NOT NULL
                   AND e.discussion_number IS NOT NULL
-                GROUP BY lower(e.repo_full_name), e.discussion_number
+                  AND {window}
+                  AND e.rowid = (
+                    SELECT latest.rowid
+                    FROM social_activity_events latest
+                    WHERE latest.kind = 'announcement'
+                      AND lower(latest.repo_full_name) = lower(e.repo_full_name)
+                      AND latest.discussion_number = e.discussion_number
+                    ORDER BY latest.occurred_at DESC, latest.rowid ASC
+                    LIMIT 1
+                  )
             )"
-        .to_owned(),
-        CollectionRecordKind::Notification => "notification_rows AS (
-                SELECT
-                    n.*,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY n.thread_id
-                        ORDER BY n.updated_at DESC, n.id DESC
-                    ) AS source_rank
-                FROM notifications n
-            ),
-            source_records AS (
+            )
+        }
+        CollectionRecordKind::Notification => {
+            let window = source_window_sql("n.updated_at", from, before, binds);
+            format!(
+                "raw_source_records AS (
                 SELECT
                     n.thread_id AS id,
                     n.repo_full_name AS repository,
@@ -1271,11 +1394,22 @@ fn source_records_sql(kind: CollectionRecordKind) -> String {
                     n.updated_at AS occurred_at,
                     NULL AS detected_at,
                     NULL AS generated_at
-                FROM notification_rows n
-                WHERE n.source_rank = 1
+                FROM notifications n
+                WHERE {window}
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM notifications newer
+                    WHERE newer.thread_id = n.thread_id
+                      AND (newer.updated_at > n.updated_at
+                        OR (newer.updated_at = n.updated_at AND newer.id > n.id))
+                  )
             )"
-        .to_owned(),
-        CollectionRecordKind::Brief => "source_records AS (
+            )
+        }
+        CollectionRecordKind::Brief => {
+            let window = source_window_sql("b.created_at", from, before, binds);
+            format!(
+                "raw_source_records AS (
                 SELECT
                     b.id,
                     NULL AS repository,
@@ -1285,8 +1419,10 @@ fn source_records_sql(kind: CollectionRecordKind) -> String {
                     NULL AS detected_at,
                     b.created_at AS generated_at
                 FROM briefs b
+                WHERE {window}
             )"
-        .to_owned(),
+            )
+        }
     }
 }
 
@@ -1308,43 +1444,37 @@ fn activity_source_ctes(kind: CollectionRecordKind) -> String {
                   AND julianday(COALESCE(r.published_at, r.created_at, r.updated_at)) < julianday(?)
             )"
         .to_owned(),
-        CollectionRecordKind::Announcement => "bounded_announcement_keys AS MATERIALIZED (
+        CollectionRecordKind::Announcement => "bounded_announcement_rows AS MATERIALIZED (
                 SELECT
+                    e.rowid AS source_rowid,
                     lower(e.repo_full_name) AS repo_key,
                     e.discussion_number,
-                    MAX(e.occurred_at) AS source_time
+                    e.occurred_at AS source_time
                 FROM social_activity_events e
                 WHERE e.kind = 'announcement'
                   AND e.repo_full_name IS NOT NULL
                   AND e.discussion_number IS NOT NULL
-                  AND julianday(e.occurred_at) >= julianday(?)
-                  AND julianday(e.occurred_at) < julianday(?)
-                GROUP BY lower(e.repo_full_name), e.discussion_number
-            ),
-            canonical_announcement_keys AS MATERIALIZED (
-                SELECT c.repo_key, c.discussion_number, c.source_time
-                FROM bounded_announcement_keys c
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM social_activity_events newer
-                    WHERE newer.kind = 'announcement'
-                      AND lower(newer.repo_full_name) = c.repo_key
-                      AND newer.discussion_number = c.discussion_number
-                      AND newer.occurred_at > c.source_time
+                    AND julianday(e.occurred_at) >= julianday(?)
+                    AND julianday(e.occurred_at) < julianday(?)
+                  AND e.rowid = (
+                    SELECT latest.rowid
+                    FROM social_activity_events latest
+                    WHERE latest.kind = 'announcement'
+                      AND lower(latest.repo_full_name) = lower(e.repo_full_name)
+                      AND latest.discussion_number = e.discussion_number
+                    ORDER BY latest.occurred_at DESC, latest.rowid ASC
+                    LIMIT 1
                 )
             ),
             bounded_source_records AS MATERIALIZED (
                 SELECT
                     c.repo_key || '#' || CAST(c.discussion_number AS TEXT) AS id,
-                    MAX(e.repo_full_name) AS repository,
-                    COALESCE(MAX(NULLIF(e.title, '')), '公告') AS title,
-                    MAX(e.occurred_at) AS source_time
-                FROM canonical_announcement_keys c
+                    e.repo_full_name AS repository,
+                    COALESCE(NULLIF(e.title, ''), '公告') AS title,
+                    c.source_time
+                FROM bounded_announcement_rows c
                 JOIN social_activity_events e
-                  ON e.kind = 'announcement'
-                 AND lower(e.repo_full_name) = c.repo_key
-                 AND e.discussion_number = c.discussion_number
-                GROUP BY c.repo_key, c.discussion_number
+                  ON e.rowid = c.source_rowid
             )"
         .to_owned(),
         CollectionRecordKind::Notification => "bounded_source_records AS MATERIALIZED (
@@ -1509,9 +1639,10 @@ fn activity_query_sql(kind: CollectionRecordKind, global_mode: bool) -> String {
                                 w.updated_at DESC,
                                 w.id DESC
                         ) AS row_rank
-                    FROM content_work_items w
-                    JOIN bounded_source_records s ON s.id = w.canonical_resource_id
+                    FROM bounded_source_records s
+                    CROSS JOIN content_work_items w
                     WHERE w.canonical_resource_type = '{resource_type}'
+                      AND w.canonical_resource_id = s.id
                       AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
                         OR (w.pipeline = 'polishing' AND w.variant = 'smart'))
                 ),
@@ -1726,7 +1857,9 @@ fn collection_query_sql(
 ) -> (String, Vec<CollectionQueryBind>) {
     let mut binds = Vec::new();
     let mut sql = String::from("WITH ");
-    sql.push_str(&source_records_sql(kind));
+    let source_sql = source_records_sql(kind, from, before, &mut binds);
+    sql.push_str(&source_sql);
+    sql.push_str(", source_records AS MATERIALIZED (SELECT * FROM raw_source_records)");
 
     if kind == CollectionRecordKind::Brief {
         sql.push_str(
@@ -1741,10 +1874,12 @@ fn collection_query_sql(
                         ORDER BY c.updated_at DESC, c.id DESC
                     ) AS row_rank
                 FROM llm_calls c
+                JOIN source_records s ON s.id = c.parent_brief_id
             ),
             brief_attempts AS (
                 SELECT parent_brief_id AS entity_id, MAX(attempt_count) AS attempt_count
-                FROM llm_calls
+                FROM llm_calls c
+                JOIN source_records s ON s.id = c.parent_brief_id
                 GROUP BY parent_brief_id
             ),
             status_projection AS (
@@ -1780,6 +1915,7 @@ fn collection_query_sql(
                         ORDER BY w.updated_at DESC, w.id DESC
                     ) AS row_rank
                 FROM translation_work_items w
+                JOIN source_records s ON s.id = w.entity_id
                 WHERE w.kind IN ('{translation_kind}', '{polish_kind}')
             ),
             legacy_latest AS (
@@ -1800,6 +1936,7 @@ fn collection_query_sql(
                     json_extract(observation_basis_json, '$.source_hash') AS source_hash,
                     classification
                 FROM content_legacy_observations
+                JOIN source_records s ON s.id = canonical_resource_id
                 WHERE canonical_resource_type = '{resource_type}'
                   AND json_extract(observation_basis_json, '$.source_hash') IS NOT NULL
             ),
@@ -1823,6 +1960,7 @@ fn collection_query_sql(
             coverage AS (
                 SELECT record_id AS entity_id, pipeline, status_origin
                 FROM admin_collection_processing_coverage
+                JOIN source_records s ON s.id = record_id
                 WHERE record_kind = '{resource_type}'
             )"
         );
@@ -1857,8 +1995,10 @@ fn collection_query_sql(
                                 w.updated_at DESC,
                                 w.id DESC
                         ) AS row_rank
-                    FROM content_work_items w
-                    WHERE w.canonical_resource_type = '{resource_type}'
+                FROM source_records s
+                CROSS JOIN content_work_items w
+                WHERE w.canonical_resource_type = '{resource_type}'
+                  AND w.canonical_resource_id = s.id
                       AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
                         OR (w.pipeline = 'polishing' AND w.variant = 'smart'))
                 ),
@@ -1868,10 +2008,14 @@ fn collection_query_sql(
                     WHERE row_rank = 1
                 ),
                 global_attempts AS (
-                    SELECT canonical_resource_id AS entity_id, MAX(attempt_count) AS attempt_count
-                    FROM content_work_items
-                    WHERE canonical_resource_type = '{resource_type}'
-                    GROUP BY canonical_resource_id
+                    SELECT w.canonical_resource_id AS entity_id, MAX(w.attempt_count) AS attempt_count
+                    FROM source_records s
+                    CROSS JOIN content_work_items w
+                    WHERE w.canonical_resource_type = '{resource_type}'
+                      AND w.canonical_resource_id = s.id
+                      AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
+                        OR (w.pipeline = 'polishing' AND w.variant = 'smart'))
+                    GROUP BY w.canonical_resource_id
                 ),
                 status_projection AS (
                     SELECT
@@ -1933,14 +2077,6 @@ fn collection_query_sql(
     }
 
     sql.push_str(", filtered_records AS (SELECT * FROM status_projection WHERE 1 = 1");
-    if let Some(value) = from {
-        sql.push_str(" AND datetime(source_time) >= datetime(?)");
-        binds.push(CollectionQueryBind::Text(value.to_owned()));
-    }
-    if let Some(value) = before {
-        sql.push_str(" AND datetime(source_time) < datetime(?)");
-        binds.push(CollectionQueryBind::Text(value.to_owned()));
-    }
     sql.push_str(" AND attempt_count >= ?");
     binds.push(CollectionQueryBind::Integer(attempts.min));
     if let Some(max) = attempts.max {
@@ -1981,7 +2117,7 @@ fn collection_query_sql(
         } else {
             "ORDER BY datetime(source_time) DESC, id DESC"
         };
-        sql.push_str(" SELECT id, repository, title, occurred_at, detected_at, generated_at FROM filtered_records ");
+        sql.push_str(" SELECT id, repository, title, occurred_at, detected_at, generated_at, COUNT(*) OVER () AS total_count FROM filtered_records ");
         sql.push_str(order);
         sql.push_str(" LIMIT ? OFFSET ?");
         binds.push(CollectionQueryBind::Integer(page_size));
@@ -1990,8 +2126,8 @@ fn collection_query_sql(
     (sql, binds)
 }
 
-async fn execute_collection_query<T>(
-    pool: &SqlitePool,
+async fn execute_collection_query_in_connection<T>(
+    connection: &mut SqliteConnection,
     sql: &str,
     binds: &[CollectionQueryBind],
 ) -> Result<Vec<T>, ApiError>
@@ -2005,11 +2141,14 @@ where
             CollectionQueryBind::Integer(value) => query.bind(*value),
         };
     }
-    query.fetch_all(pool).await.map_err(ApiError::internal)
+    query
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(ApiError::internal)
 }
 
-async fn execute_collection_scalar(
-    pool: &SqlitePool,
+async fn execute_collection_scalar_in_connection(
+    connection: &mut SqliteConnection,
     sql: &str,
     binds: &[CollectionQueryBind],
 ) -> Result<i64, ApiError> {
@@ -2020,10 +2159,14 @@ async fn execute_collection_scalar(
             CollectionQueryBind::Integer(value) => query.bind(*value),
         };
     }
-    query.fetch_one(pool).await.map_err(ApiError::internal)
+    query
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(ApiError::internal)
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn list_collection_page(
     pool: &SqlitePool,
     kind: CollectionRecordKind,
@@ -2036,7 +2179,9 @@ async fn list_collection_page(
     page_size: i64,
     offset: i64,
 ) -> Result<(i64, Vec<SourceRecordRow>), ApiError> {
-    let (count_sql, count_binds) = collection_query_sql(
+    let mut connection = pool.acquire().await.map_err(ApiError::internal)?;
+    list_collection_page_in_connection(
+        &mut connection,
         kind,
         global_mode,
         from,
@@ -2044,10 +2189,25 @@ async fn list_collection_page(
         attempts,
         translation_filter,
         polish_filter,
-        None,
-    );
-    let count_sql = format!("{count_sql} SELECT COUNT(*) FROM filtered_records");
-    let total = execute_collection_scalar(pool, &count_sql, &count_binds).await?;
+        page_size,
+        offset,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn list_collection_page_in_connection(
+    connection: &mut SqliteConnection,
+    kind: CollectionRecordKind,
+    global_mode: bool,
+    from: Option<&str>,
+    before: Option<&str>,
+    attempts: AttemptCountRange,
+    translation_filter: Option<&[String]>,
+    polish_filter: Option<&[String]>,
+    page_size: i64,
+    offset: i64,
+) -> Result<(i64, Vec<SourceRecordRow>), ApiError> {
     let (page_sql, page_binds) = collection_query_sql(
         kind,
         global_mode,
@@ -2058,65 +2218,147 @@ async fn list_collection_page(
         polish_filter,
         Some((page_size, offset)),
     );
-    let rows = execute_collection_query::<SourceRecordRow>(pool, &page_sql, &page_binds).await?;
+    let rows = execute_collection_query_in_connection::<SourceRecordRow>(
+        connection,
+        &page_sql,
+        &page_binds,
+    )
+    .await?;
+    let total = if let Some(row) = rows.first() {
+        row.total_count
+    } else {
+        let (count_sql, count_binds) = collection_query_sql(
+            kind,
+            global_mode,
+            from,
+            before,
+            attempts,
+            translation_filter,
+            polish_filter,
+            None,
+        );
+        let count_sql = format!("{count_sql} SELECT COUNT(*) FROM filtered_records");
+        execute_collection_scalar_in_connection(connection, &count_sql, &count_binds).await?
+    };
     Ok((total, rows))
 }
 
-async fn run_bounded_collection_read<F, T>(
-    permit: tokio::sync::OwnedSemaphorePermit,
-    read: F,
-) -> Result<T, ApiError>
-where
-    F: std::future::Future<Output = Result<T, ApiError>> + Send + 'static,
-    T: Send + 'static,
-{
-    run_bounded_collection_read_with_budget(permit, read, Duration::from_secs(5)).await
+struct SharedRead<T> {
+    result: tokio::sync::watch::Receiver<Option<Result<Arc<T>, ApiError>>>,
 }
 
-async fn run_bounded_collection_read_with_budget<F, T>(
-    permit: tokio::sync::OwnedSemaphorePermit,
-    read: F,
-    budget: Duration,
-) -> Result<T, ApiError>
+type CollectionListFlights =
+    tokio::sync::Mutex<HashMap<CollectionListKey, Arc<SharedRead<AdminCollectionRecordsResponse>>>>;
+type CollectionActivityFlights = tokio::sync::Mutex<
+    HashMap<CollectionActivityKey, Arc<SharedRead<AdminCollectionActivityResponse>>>,
+>;
+
+static COLLECTION_LIST_FLIGHTS: OnceLock<Arc<CollectionListFlights>> = OnceLock::new();
+static COLLECTION_ACTIVITY_FLIGHTS: OnceLock<Arc<CollectionActivityFlights>> = OnceLock::new();
+
+async fn bounded_collection_read<F, T>(read: F) -> Result<T, ApiError>
 where
-    F: std::future::Future<Output = Result<T, ApiError>> + Send + 'static,
-    T: Send + 'static,
+    F: Future<Output = Result<T, ApiError>> + Send,
+    T: Send,
 {
-    let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
-    let (cancel_sender, mut cancel_receiver) = tokio::sync::oneshot::channel();
-    let mut read_handle = tokio::spawn(read);
-    tokio::spawn(async move {
-        tokio::select! {
-            result = &mut read_handle => {
-                let result = match result {
-                    Ok(result) => result,
-                    Err(error) => Err(ApiError::internal(error)),
-                };
-                let _ = result_sender.send(result);
-            }
-            _ = &mut cancel_receiver => {
-                read_handle.abort();
-                let _ = read_handle.await;
-            }
+    bounded_collection_read_with_budget(read, Duration::from_secs(5)).await
+}
+
+async fn bounded_collection_read_with_budget<F, T>(read: F, budget: Duration) -> Result<T, ApiError>
+where
+    F: Future<Output = Result<T, ApiError>> + Send,
+    T: Send,
+{
+    tokio::time::timeout(budget, read).await.map_err(|_| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admin_collection_records_timeout",
+            "admin collection records read timed out",
+        )
+        .with_retry_after(1)
+    })?
+}
+
+async fn await_shared_read<T: Clone>(flight: Arc<SharedRead<T>>) -> Result<Arc<T>, ApiError> {
+    let mut result_receiver = flight.result.clone();
+    loop {
+        let result = result_receiver.borrow_and_update().clone();
+        if let Some(result) = result {
+            return result;
         }
-        drop(permit);
-    });
-    match tokio::time::timeout(budget, result_receiver).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err(ApiError::internal("collection read supervisor stopped")),
-        Err(_) => {
-            // Ask the supervisor to cancel and await the query task before it
-            // releases the permit. Caller cancellation follows the same path
-            // because the supervisor owns both resources independently.
-            let _ = cancel_sender.send(());
-            Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "admin_collection_records_timeout",
-                "admin collection records read timed out",
-            )
-            .with_retry_after(1))
+        if result_receiver.changed().await.is_err() {
+            return Err(ApiError::internal(
+                "shared collection read ended without a result",
+            ));
         }
     }
+}
+
+async fn run_keyed_singleflight<K, T, F>(
+    flights: Arc<tokio::sync::Mutex<HashMap<K, Arc<SharedRead<T>>>>>,
+    key: K,
+    read: F,
+) -> Result<T, ApiError>
+where
+    K: Clone + Eq + std::hash::Hash + Send + 'static,
+    T: Clone + Send + Sync + 'static,
+    F: Future<Output = Result<T, ApiError>> + Send + 'static,
+{
+    let (flight, result_sender) = {
+        let mut guard = flights.lock().await;
+        if let Some(flight) = guard.get(&key) {
+            (flight.clone(), None)
+        } else {
+            let (sender, receiver) = tokio::sync::watch::channel(None);
+            let flight = Arc::new(SharedRead { result: receiver });
+            guard.insert(key.clone(), flight.clone());
+            (flight, Some(sender))
+        }
+    };
+    if let Some(result_sender) = result_sender {
+        let task_flights = flights.clone();
+        tokio::spawn(async move {
+            let result = match tokio::spawn(async move {
+                bounded_collection_read(read).await.map(Arc::new)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(ApiError::internal("shared collection read task failed")),
+            };
+            task_flights.lock().await.remove(&key);
+            result_sender.send_replace(Some(result));
+        });
+    }
+    await_shared_read(flight)
+        .await
+        .map(|value| (*value).clone())
+}
+
+async fn run_collection_list_singleflight<F>(
+    key: CollectionListKey,
+    read: F,
+) -> Result<AdminCollectionRecordsResponse, ApiError>
+where
+    F: Future<Output = Result<AdminCollectionRecordsResponse, ApiError>> + Send + 'static,
+{
+    let flights = COLLECTION_LIST_FLIGHTS
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(HashMap::new())))
+        .clone();
+    run_keyed_singleflight(flights, key, read).await
+}
+
+async fn run_collection_activity_singleflight<F>(
+    key: CollectionActivityKey,
+    read: F,
+) -> Result<AdminCollectionActivityResponse, ApiError>
+where
+    F: Future<Output = Result<AdminCollectionActivityResponse, ApiError>> + Send + 'static,
+{
+    let flights = COLLECTION_ACTIVITY_FLIGHTS
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(HashMap::new())))
+        .clone();
+    run_keyed_singleflight(flights, key, read).await
 }
 
 #[cfg(test)]
@@ -2261,27 +2503,34 @@ pub async fn admin_list_collection_records(
     let polish_filter = parse_status_filter(query.polish_status, "polish_status")?;
     let from = parse_timestamp(query.from, "from")?;
     let before = parse_timestamp(query.before, "before")?;
+    let requested_from = from.clone();
+    let requested_before = before.clone();
     let (from, before) = normalize_collection_window(from, before)?;
-    let _permit = state
-        .admin_collection_read_gate
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "admin_collection_records_busy",
-                "admin collection records are temporarily busy",
-            )
-            .with_retry_after(1)
-        })?;
+    let (key_from, key_before) = collection_list_window_key(
+        requested_from,
+        requested_before,
+        from.clone(),
+        before.clone(),
+    );
+    let key = CollectionListKey {
+        kind,
+        from: key_from,
+        before: key_before,
+        attempts,
+        translation_filter: translation_filter.clone().unwrap_or_default(),
+        polish_filter: polish_filter.clone().unwrap_or_default(),
+        page,
+        page_size,
+    };
     let read_state = state.clone();
     let read = async move {
-        let global_mode = content_processing::current_mode(&read_state.pool)
+        let mut transaction = read_state.pool.begin().await.map_err(ApiError::internal)?;
+        let legacy_mode = content_processing::legacy_mode_in_transaction(&mut transaction)
             .await
-            .map_err(ApiError::internal)?
-            == content_processing::ContentProcessingMode::Global;
-        let (total, rows) = list_collection_page(
-            &read_state.pool,
+            .map_err(ApiError::internal)?;
+        let global_mode = !legacy_mode;
+        let (total, rows) = list_collection_page_in_connection(
+            &mut transaction,
             kind,
             global_mode,
             Some(&from),
@@ -2294,11 +2543,12 @@ pub async fn admin_list_collection_records(
         )
         .await?;
         let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
-        let coverage = load_processing_coverage(&read_state.pool, kind, &ids).await?;
+        let coverage = load_processing_coverage_in_connection(&mut transaction, kind, &ids).await?;
         let task_summaries =
-            load_task_summaries(read_state.as_ref(), kind, &ids, &coverage, global_mode).await?;
+            load_task_summaries_in_connection(&mut transaction, kind, &ids, &coverage, global_mode)
+                .await?;
         let brief_summaries = if kind == CollectionRecordKind::Brief {
-            load_brief_summaries(read_state.as_ref(), &ids, &coverage).await?
+            load_brief_summaries_in_connection(&mut transaction, &ids, &coverage).await?
         } else {
             HashMap::new()
         };
@@ -2306,15 +2556,16 @@ pub async fn admin_list_collection_records(
             .into_iter()
             .map(|row| source_record_item(kind, row, &task_summaries, &brief_summaries))
             .collect::<Vec<_>>();
-        Ok::<_, ApiError>((total, items))
+        let response = AdminCollectionRecordsResponse {
+            items,
+            page,
+            page_size,
+            total,
+        };
+        transaction.commit().await.map_err(ApiError::internal)?;
+        Ok::<_, ApiError>(response)
     };
-    let (total, items) = run_bounded_collection_read(_permit, read).await?;
-    Ok(Json(AdminCollectionRecordsResponse {
-        items,
-        page,
-        page_size,
-        total,
-    }))
+    Ok(Json(run_collection_list_singleflight(key, read).await?))
 }
 
 pub async fn admin_get_collection_activity(
@@ -2324,22 +2575,15 @@ pub async fn admin_get_collection_activity(
 ) -> Result<Json<AdminCollectionActivityResponse>, ApiError> {
     let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
     let kind = CollectionRecordKind::parse(record_kind.as_str())?;
-    let permit = state
-        .admin_collection_read_gate
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "admin_collection_records_busy",
-                "admin collection records are temporarily busy",
-            )
-            .with_retry_after(1)
-        })?;
     let now = Utc::now();
     let (window_started_at, window_ended_at) = {
         let (_, started_at, ended_at) = activity_window(now);
         (activity_timestamp(started_at), activity_timestamp(ended_at))
+    };
+    let key = CollectionActivityKey {
+        kind,
+        window_started_at: window_started_at.clone(),
+        window_ended_at: window_ended_at.clone(),
     };
     let read_state = state.clone();
     let read = async move {
@@ -2357,8 +2601,7 @@ pub async fn admin_get_collection_activity(
         .await?;
         Ok::<_, ApiError>(build_activity_response(kind, now, rows))
     };
-    let response = run_bounded_collection_read(permit, read).await?;
-    Ok(Json(response))
+    Ok(Json(run_collection_activity_singleflight(key, read).await?))
 }
 
 async fn load_source_record(
@@ -2371,7 +2614,7 @@ async fn load_source_record(
             "SELECT CAST(r.release_id AS TEXT) AS id, COALESCE((SELECT wi.repo_full_name FROM repo_release_work_items wi WHERE wi.repo_id = r.repo_id LIMIT 1), '仓库 #' || CAST(r.repo_id AS TEXT)) AS repository, COALESCE(NULLIF(r.name, ''), r.tag_name) AS title, COALESCE(r.published_at, r.created_at, r.updated_at) AS occurred_at, r.detected_at, NULL AS generated_at FROM repo_releases r WHERE r.release_id = ? LIMIT 1"
         }
         CollectionRecordKind::Announcement => {
-            "SELECT lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id, MAX(e.repo_full_name) AS repository, COALESCE(MAX(NULLIF(e.title, '')), '公告') AS title, MAX(e.occurred_at) AS occurred_at, MIN(e.detected_at) AS detected_at, NULL AS generated_at FROM social_activity_events e WHERE e.kind = 'announcement' AND lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) = ? GROUP BY lower(e.repo_full_name), e.discussion_number LIMIT 1"
+            "WITH ranked_announcements AS (SELECT e.*, ROW_NUMBER() OVER (PARTITION BY lower(e.repo_full_name), e.discussion_number ORDER BY e.occurred_at DESC, e.rowid ASC) AS source_rank FROM social_activity_events e WHERE e.kind = 'announcement' AND lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) = ?) SELECT lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id, e.repo_full_name AS repository, COALESCE(NULLIF(e.title, ''), '公告') AS title, e.occurred_at, e.detected_at, NULL AS generated_at FROM ranked_announcements e WHERE e.source_rank = 1 LIMIT 1"
         }
         CollectionRecordKind::Notification => {
             "WITH ranked_notifications AS (SELECT n.*, ROW_NUMBER() OVER (PARTITION BY n.thread_id ORDER BY n.updated_at DESC, n.id DESC) AS source_rank FROM notifications n WHERE n.thread_id = ?) SELECT n.thread_id AS id, n.repo_full_name AS repository, COALESCE(NULLIF(n.subject_title, ''), '通知') AS title, n.updated_at AS occurred_at, NULL AS detected_at, NULL AS generated_at FROM ranked_notifications n WHERE n.source_rank = 1 LIMIT 1"
@@ -2601,29 +2844,11 @@ async fn load_global_attempts(
     kind: CollectionRecordKind,
     entity_id: &str,
 ) -> Result<Vec<AdminCollectionAttempt>, ApiError> {
-    #[derive(Debug, sqlx::FromRow)]
-    struct GlobalAttemptRow {
-        event_id: String,
-        work_item_id: String,
-        pipeline: String,
-        attempt_no: i64,
-        trigger: String,
-        event_type: String,
-        result_status: Option<String>,
-        error_code: Option<String>,
-        error_summary: Option<String>,
-        failure_class: Option<String>,
-        retry_eligible: i64,
-        next_retry_at: Option<String>,
-        created_at: String,
-    }
-    let rows = match sqlx::query_as::<_, GlobalAttemptRow>(
-        "SELECT e.id AS event_id, e.work_item_id, w.pipeline, e.attempt_no, e.trigger, e.event_type, e.result_status, e.error_code, e.error_summary, e.failure_class, e.retry_eligible, e.next_retry_at, e.created_at FROM content_attempt_events e JOIN content_work_items w ON w.id = e.work_item_id WHERE w.canonical_resource_type = ? AND w.canonical_resource_id = ? ORDER BY julianday(e.created_at) ASC, e.created_at ASC, e.id ASC",
-    )
-    .bind(collection_record_kind_label(kind))
-    .bind(entity_id)
-    .fetch_all(&state.pool)
-    .await
+    let rows = match sqlx::query_as::<_, GlobalAttemptRow>(GLOBAL_ATTEMPT_ROWS_SQL)
+        .bind(collection_record_kind_label(kind))
+        .bind(entity_id)
+        .fetch_all(&state.pool)
+        .await
     {
         Ok(rows) => rows,
         Err(error) if missing_table(&error) => return Ok(Vec::new()),
@@ -2760,6 +2985,8 @@ async fn load_global_attempts(
     });
     Ok(attempts)
 }
+
+const GLOBAL_ATTEMPT_ROWS_SQL: &str = "SELECT e.id AS event_id, e.work_item_id, w.pipeline, e.attempt_no, e.trigger, e.event_type, e.result_status, e.error_code, e.error_summary, e.failure_class, e.retry_eligible, e.next_retry_at, e.created_at FROM content_attempt_events e JOIN content_work_items w ON w.id = e.work_item_id WHERE w.canonical_resource_type = ? AND w.canonical_resource_id = ? AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared')) OR (w.pipeline = 'polishing' AND w.variant = 'smart')) ORDER BY julianday(e.created_at) ASC, e.created_at ASC, e.id ASC";
 
 async fn load_brief_attempts(
     state: &AppState,
@@ -3265,6 +3492,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn announcement_window_filters_after_canonicalization() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE social_activity_events (repo_full_name TEXT, discussion_number INTEGER, title TEXT, occurred_at TEXT, detected_at TEXT, kind TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create social events");
+        sqlx::query(
+            "INSERT INTO social_activity_events (repo_full_name, discussion_number, title, occurred_at, kind) VALUES ('octo/demo', 42, 'Zulu old title', '2026-07-08T09:00:00Z', 'announcement'), ('octo/demo', 42, 'Alpha latest title', '2026-07-08T10:01:00Z', 'announcement')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed announcement history");
+        sqlx::query(
+            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, entity_id TEXT, kind TEXT, status TEXT, result_status TEXT, attempt_count INTEGER, updated_at TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create announcement work items");
+        sqlx::query(
+            "CREATE TABLE content_legacy_observations (canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, legacy_table TEXT, observation_basis_json TEXT, classification TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create announcement legacy observations");
+        sqlx::query(
+            "CREATE TABLE admin_collection_processing_coverage (record_kind TEXT, record_id TEXT, pipeline TEXT, status_origin TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create announcement coverage");
+        let (total, rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Announcement,
+            false,
+            Some("2026-07-08T08:00:00Z"),
+            Some("2026-07-08T10:00:00Z"),
+            AttemptCountRange { min: 0, max: None },
+            None,
+            None,
+            20,
+            0,
+        )
+        .await
+        .expect("list canonical announcements");
+        assert_eq!(total, 0);
+        assert!(rows.is_empty());
+
+        let (all_total, all_rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Announcement,
+            false,
+            Some("2026-07-08T08:00:00Z"),
+            Some("2026-07-08T11:00:00Z"),
+            AttemptCountRange { min: 0, max: None },
+            None,
+            None,
+            20,
+            0,
+        )
+        .await
+        .expect("list canonical announcement title");
+        assert_eq!(all_total, 1);
+        assert_eq!(all_rows[0].title, "Alpha latest title");
+    }
+
+    #[tokio::test]
     async fn notification_source_rows_group_users_by_thread_id() {
         let pool = test_pool().await;
         create_notifications_fixture(&pool).await;
@@ -3274,6 +3569,18 @@ mod tests {
         .execute(&pool)
         .await
         .expect("create notification work items");
+        sqlx::query(
+            "CREATE TABLE content_legacy_observations (canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, legacy_table TEXT, observation_basis_json TEXT, classification TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create notification legacy observations");
+        sqlx::query(
+            "CREATE TABLE admin_collection_processing_coverage (record_kind TEXT, record_id TEXT, pipeline TEXT, status_origin TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create notification coverage");
         let rows = list_source_rows(
             &pool,
             CollectionRecordKind::Notification,
@@ -3288,6 +3595,90 @@ mod tests {
         assert_eq!(rows[0].id, "thread-1");
         assert_eq!(rows[0].occurred_at.as_deref(), Some("2026-07-08T09:05:00Z"));
         assert_eq!(rows[0].detected_at, None);
+    }
+
+    #[tokio::test]
+    async fn notification_window_filters_after_latest_thread_selection() {
+        let pool = test_pool().await;
+        create_notifications_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE notifications SET updated_at = '2026-07-08T10:01:00Z' WHERE id = 'notification-2'",
+        )
+        .execute(&pool)
+        .await
+        .expect("move latest notification outside window");
+        sqlx::query(
+            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, entity_id TEXT, kind TEXT, status TEXT, result_status TEXT, attempt_count INTEGER, updated_at TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create notification work items");
+        sqlx::query(
+            "CREATE TABLE content_legacy_observations (canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, legacy_table TEXT, observation_basis_json TEXT, classification TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create notification legacy observations");
+        sqlx::query(
+            "CREATE TABLE admin_collection_processing_coverage (record_kind TEXT, record_id TEXT, pipeline TEXT, status_origin TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create notification coverage");
+        let (total, rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Notification,
+            false,
+            Some("2026-07-08T08:00:00Z"),
+            Some("2026-07-08T10:00:00Z"),
+            AttemptCountRange { min: 0, max: None },
+            None,
+            None,
+            20,
+            0,
+        )
+        .await
+        .expect("list canonical notifications");
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].id, "thread-2");
+    }
+
+    #[tokio::test]
+    async fn global_detail_attempts_exclude_unsupported_variants() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE content_work_items (id TEXT, canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, variant TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create global work items");
+        sqlx::query(
+            "CREATE TABLE content_attempt_events (id TEXT, work_item_id TEXT, attempt_no INTEGER, trigger TEXT, event_type TEXT, result_status TEXT, error_code TEXT, error_summary TEXT, failure_class TEXT, retry_eligible INTEGER, next_retry_at TEXT, created_at TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create global attempt events");
+        sqlx::query(
+            "INSERT INTO content_work_items VALUES ('supported', 'release', 'release-1', 'translation', 'detail'), ('unsupported', 'release', 'release-1', 'translation', 'other')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed global variants");
+        sqlx::query(
+            "INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, retry_eligible, created_at) VALUES ('supported-event', 'supported', 1, 'initial', 'attempt_started', 0, CURRENT_TIMESTAMP), ('unsupported-event', 'unsupported', 1, 'initial', 'attempt_started', 0, CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed attempt events");
+
+        let rows = sqlx::query_as::<_, GlobalAttemptRow>(GLOBAL_ATTEMPT_ROWS_SQL)
+            .bind("release")
+            .bind("release-1")
+            .fetch_all(&pool)
+            .await
+            .expect("load supported global attempts");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_id, "supported-event");
     }
 
     #[tokio::test]
@@ -3374,6 +3765,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn collection_list_window_key_stabilizes_rolling_defaults() {
+        assert_eq!(
+            collection_list_window_key(None, None, "from-a".to_owned(), "before-a".to_owned()),
+            (None, None)
+        );
+        assert_eq!(
+            collection_list_window_key(
+                Some("from-a".to_owned()),
+                None,
+                "from-a".to_owned(),
+                "before-a".to_owned(),
+            ),
+            (Some("from-a".to_owned()), None)
+        );
+        assert_eq!(
+            collection_list_window_key(
+                None,
+                Some("before-a".to_owned()),
+                "from-a".to_owned(),
+                "before-a".to_owned(),
+            ),
+            (Some("from-a".to_owned()), Some("before-a".to_owned()))
+        );
+    }
+
     #[tokio::test]
     async fn brief_attempt_filter_uses_historical_max_and_ignores_translation_filter() {
         let pool = test_pool().await;
@@ -3435,28 +3852,366 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collection_read_gate_errors_are_retryable_and_release() {
-        let gate = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = gate.clone().acquire_owned().await.expect("first permit");
-        let error = ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "admin_collection_records_busy",
-            "admin collection records are temporarily busy",
-        )
-        .with_retry_after(1);
-        let response = axum::response::IntoResponse::into_response(error);
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
-        drop(permit);
-        assert!(gate.try_acquire().is_ok());
+    async fn identical_collection_list_reads_share_one_in_flight_execution() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::task::Poll;
+
+        let key = CollectionListKey {
+            kind: CollectionRecordKind::Release,
+            from: None,
+            before: None,
+            attempts: AttemptCountRange { min: 0, max: None },
+            translation_filter: Vec::new(),
+            polish_filter: Vec::new(),
+            page: 1,
+            page_size: 20,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let response = || {
+            Ok::<_, ApiError>(AdminCollectionRecordsResponse {
+                items: Vec::new(),
+                page: 1,
+                page_size: 20,
+                total: 0,
+            })
+        };
+        let first_calls = calls.clone();
+        let first_started = started.clone();
+        let first_release = release.clone();
+        let first_key = key.clone();
+        let first = tokio::spawn(async move {
+            run_collection_list_singleflight(first_key, async move {
+                first_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                first_started.notify_one();
+                first_release.notified().await;
+                response()
+            })
+            .await
+        });
+        started.notified().await;
+
+        let second_calls = calls.clone();
+        let second_key = key.clone();
+        let mut second = Box::pin(run_collection_list_singleflight(second_key, async move {
+            second_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            response()
+        }));
+        let second_joined = std::future::poll_fn(|context| match second.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(true),
+            Poll::Ready(_) => Poll::Ready(false),
+        })
+        .await;
+        assert!(second_joined, "second caller should join the active flight");
+        release.notify_one();
+
+        first
+            .await
+            .expect("first singleflight read")
+            .expect("first result");
+        second.await.expect("second result");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+
+        let default_window_key = CollectionListKey {
+            kind: CollectionRecordKind::Release,
+            from: None,
+            before: None,
+            attempts: AttemptCountRange { min: 0, max: None },
+            translation_filter: Vec::new(),
+            polish_filter: Vec::new(),
+            page: 1,
+            page_size: 20,
+        };
+        assert_eq!(key, default_window_key);
     }
 
     #[tokio::test]
-    async fn collection_read_timeout_cancels_before_releasing_permit() {
-        let gate = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = gate.clone().try_acquire_owned().expect("read permit");
-        let error = run_bounded_collection_read_with_budget(
-            permit,
+    async fn completed_flight_is_removed_before_result_is_published() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let flights = Arc::new(tokio::sync::Mutex::new(HashMap::<
+            String,
+            Arc<SharedRead<i64>>,
+        >::new()));
+        let key = "completed-flight".to_owned();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let read_finished = Arc::new(tokio::sync::Notify::new());
+        let first_calls = calls.clone();
+        let first_started = started.clone();
+        let first_release = release.clone();
+        let first_read_finished = read_finished.clone();
+        let first_flights = flights.clone();
+        let first_key = key.clone();
+        let first = tokio::spawn(async move {
+            run_keyed_singleflight(first_flights, first_key, async move {
+                first_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                first_started.notify_one();
+                first_release.notified().await;
+                first_read_finished.notify_one();
+                Ok::<_, ApiError>(41_i64)
+            })
+            .await
+        });
+        started.notified().await;
+
+        let flight_guard = flights.lock().await;
+        let flight = flight_guard
+            .get(&key)
+            .expect("leader inserted its flight")
+            .clone();
+        let mut result_receiver = flight.result.clone();
+        release.notify_one();
+        read_finished.notified().await;
+
+        let published_while_key_was_locked =
+            tokio::time::timeout(Duration::from_millis(100), result_receiver.changed())
+                .await
+                .is_ok();
+        assert!(
+            !published_while_key_was_locked,
+            "the result must not be published while its key is still registered"
+        );
+        drop(flight_guard);
+
+        assert_eq!(
+            first.await.expect("leader task").expect("leader result"),
+            41
+        );
+        assert!(!flights.lock().await.contains_key(&key));
+
+        let retry_calls = calls.clone();
+        let retry = run_keyed_singleflight(flights, key, async move {
+            retry_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok::<_, ApiError>(42_i64)
+        })
+        .await
+        .expect("same-key request starts a fresh read");
+
+        assert_eq!(retry, 42);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn panicking_collection_read_is_shared_and_same_key_retry_recovers() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::task::Poll;
+
+        let flights = Arc::new(tokio::sync::Mutex::new(HashMap::<
+            String,
+            Arc<SharedRead<i64>>,
+        >::new()));
+        let key = "panicking-flight".to_owned();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let panic_now = Arc::new(tokio::sync::Notify::new());
+        let first_calls = calls.clone();
+        let first_started = started.clone();
+        let first_panic_now = panic_now.clone();
+        let first_flights = flights.clone();
+        let first_key = key.clone();
+        let first = tokio::spawn(async move {
+            run_keyed_singleflight(first_flights, first_key, async move {
+                first_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                first_started.notify_one();
+                first_panic_now.notified().await;
+                panic!("collection read panic");
+            })
+            .await
+        });
+        started.notified().await;
+
+        let waiter_calls = calls.clone();
+        let mut waiter = Box::pin(run_keyed_singleflight(
+            flights.clone(),
+            key.clone(),
+            async move {
+                waiter_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok::<_, ApiError>(1_i64)
+            },
+        ));
+        let waiter_joined = std::future::poll_fn(|context| match waiter.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(true),
+            Poll::Ready(_) => Poll::Ready(false),
+        })
+        .await;
+        assert!(
+            waiter_joined,
+            "second caller should await the shared result"
+        );
+        panic_now.notify_one();
+
+        assert!(first.await.expect("leader task").is_err());
+        assert!(waiter.await.is_err());
+
+        let retry_calls = calls.clone();
+        let retry = run_keyed_singleflight(flights, key, async move {
+            retry_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok::<_, ApiError>(42_i64)
+        })
+        .await;
+
+        assert_eq!(retry.expect("same-key retry succeeds"), 42);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn shared_read_observes_result_published_before_waiter_starts() {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        sender.send_replace(Some(Ok(Arc::new(42_i64))));
+        let flight = Arc::new(SharedRead { result: receiver });
+
+        let value = await_shared_read(flight)
+            .await
+            .expect("published shared result");
+        assert_eq!(*value, 42);
+    }
+
+    #[tokio::test]
+    async fn identical_collection_activity_reads_share_one_in_flight_execution() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::task::Poll;
+
+        let key = CollectionActivityKey {
+            kind: CollectionRecordKind::Release,
+            window_started_at: "singleflight-activity-start".to_owned(),
+            window_ended_at: "singleflight-activity-end".to_owned(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let response = || {
+            Ok::<_, ApiError>(AdminCollectionActivityResponse {
+                kind: "release".to_owned(),
+                bucket_minutes: 60,
+                bucket_count: 0,
+                window_started_at: "singleflight-activity-start".to_owned(),
+                window_ended_at: "singleflight-activity-end".to_owned(),
+                summary: AdminCollectionActivitySummary::default(),
+                buckets: Vec::new(),
+            })
+        };
+        let first_calls = calls.clone();
+        let first_started = started.clone();
+        let first_release = release.clone();
+        let first_key = key.clone();
+        let first = tokio::spawn(async move {
+            run_collection_activity_singleflight(first_key, async move {
+                first_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                first_started.notify_one();
+                first_release.notified().await;
+                response()
+            })
+            .await
+        });
+        started.notified().await;
+
+        let second_calls = calls.clone();
+        let second_key = key;
+        let second = tokio::spawn(async move {
+            run_collection_activity_singleflight(second_key, async move {
+                second_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                response()
+            })
+            .await
+        });
+        let mut second = Box::pin(second);
+        let second_joined = std::future::poll_fn(|context| match second.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(true),
+            Poll::Ready(_) => Poll::Ready(false),
+        })
+        .await;
+        assert!(second_joined, "second caller should join the active flight");
+        release.notify_one();
+
+        first
+            .await
+            .expect("first activity read")
+            .expect("first activity result");
+        second
+            .await
+            .expect("second activity read")
+            .expect("second activity result");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn list_and_activity_reads_do_not_block_each_other() {
+        let list_started = Arc::new(tokio::sync::Notify::new());
+        let activity_started = Arc::new(tokio::sync::Notify::new());
+        let list_release = Arc::new(tokio::sync::Notify::new());
+        let activity_release = Arc::new(tokio::sync::Notify::new());
+        let list_key = CollectionListKey {
+            kind: CollectionRecordKind::Brief,
+            from: Some("isolation-list-start".to_owned()),
+            before: Some("isolation-list-end".to_owned()),
+            attempts: AttemptCountRange { min: 0, max: None },
+            translation_filter: Vec::new(),
+            polish_filter: Vec::new(),
+            page: 91,
+            page_size: 20,
+        };
+        let activity_key = CollectionActivityKey {
+            kind: CollectionRecordKind::Brief,
+            window_started_at: "isolation-activity-start".to_owned(),
+            window_ended_at: "isolation-activity-end".to_owned(),
+        };
+
+        let list_started_signal = list_started.clone();
+        let list_release_signal = list_release.clone();
+        let list_read = tokio::spawn(async move {
+            run_collection_list_singleflight(list_key, async move {
+                list_started_signal.notify_one();
+                list_release_signal.notified().await;
+                Ok::<_, ApiError>(AdminCollectionRecordsResponse {
+                    items: Vec::new(),
+                    page: 91,
+                    page_size: 20,
+                    total: 0,
+                })
+            })
+            .await
+        });
+        let activity_started_signal = activity_started.clone();
+        let activity_release_signal = activity_release.clone();
+        let activity_read = tokio::spawn(async move {
+            run_collection_activity_singleflight(activity_key, async move {
+                activity_started_signal.notify_one();
+                activity_release_signal.notified().await;
+                Ok::<_, ApiError>(AdminCollectionActivityResponse {
+                    kind: "brief".to_owned(),
+                    bucket_minutes: 60,
+                    bucket_count: 0,
+                    window_started_at: "isolation-activity-start".to_owned(),
+                    window_ended_at: "isolation-activity-end".to_owned(),
+                    summary: AdminCollectionActivitySummary::default(),
+                    buckets: Vec::new(),
+                })
+            })
+            .await
+        });
+
+        list_started.notified().await;
+        activity_started.notified().await;
+        activity_release.notify_one();
+        tokio::time::timeout(Duration::from_millis(100), activity_read)
+            .await
+            .expect("activity read must finish while list remains pending")
+            .expect("activity task")
+            .expect("activity response");
+
+        list_release.notify_one();
+        list_read.await.expect("list task").expect("list response");
+    }
+
+    #[tokio::test]
+    async fn collection_read_timeout_is_retryable_without_an_application_gate() {
+        let error = bounded_collection_read_with_budget(
             std::future::pending::<Result<(), ApiError>>(),
             Duration::from_millis(1),
         )
@@ -3465,25 +4220,6 @@ mod tests {
         let response = axum::response::IntoResponse::into_response(error);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
-        assert!(gate.try_acquire().is_err());
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(gate.try_acquire().is_ok());
-    }
-
-    #[tokio::test]
-    async fn collection_read_caller_cancellation_keeps_gate_until_cleanup() {
-        let gate = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = gate.clone().try_acquire_owned().expect("read permit");
-        let task = tokio::spawn(run_bounded_collection_read_with_budget(
-            permit,
-            std::future::pending::<Result<(), ApiError>>(),
-            Duration::from_secs(5),
-        ));
-        tokio::task::yield_now().await;
-        task.abort();
-        let _ = task.await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(gate.try_acquire().is_ok());
     }
 
     #[tokio::test]
@@ -3613,6 +4349,30 @@ mod tests {
         .expect("read global notification page");
         assert_eq!(global_total, 1);
         assert_eq!(global_rows[0].id, "thread-1");
+
+        sqlx::query(
+            "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, status, attempt_count, created_at, updated_at)
+             VALUES ('global-unrelated', 'notification', 'thread-1', 'translation', 'unrelated', 'zh-CN', 'hash-unrelated', 'v1', 'test', 'ready', 9, '2026-07-08T09:07:00Z', '2026-07-08T09:07:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed unrelated global work");
+        let (filtered_total, filtered_rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Notification,
+            true,
+            Some("2026-07-08T08:00:00Z"),
+            Some("2026-07-08T10:00:00Z"),
+            AttemptCountRange { min: 2, max: None },
+            None,
+            None,
+            20,
+            0,
+        )
+        .await
+        .expect("filter global attempts by supported variants");
+        assert_eq!(filtered_total, 0);
+        assert!(filtered_rows.is_empty());
     }
 
     fn event(trigger: &str, event_type: &str, created_at: &str) -> AttemptEventRow {
@@ -3715,6 +4475,7 @@ mod tests {
             "INSERT INTO social_activity_events VALUES
                 ('octo/announce', 42, 'Announcement', '2026-07-08T08:40:00Z', NULL, 'announcement'),
                 ('octo/announce', 42, 'Zulu title', '2026-07-08T09:10:00Z', NULL, 'announcement'),
+                ('octo/announce', 42, 'Alpha title tie-break', '2026-07-08T09:10:00Z', NULL, 'announcement'),
                 ('octo/announce', 43, 'Older in window', '2026-07-08T09:00:00Z', NULL, 'announcement'),
                 ('octo/announce', 43, 'Canonical outside window', '2026-07-08T10:01:00Z', NULL, 'announcement')",
         )
@@ -3924,6 +4685,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "run on codex-testbox for the bounded activity read budget"]
     async fn admin_collection_activity_production_shape_budget() {
+        use sqlx::Row;
         use std::time::Instant;
 
         #[derive(Debug, sqlx::FromRow)]
@@ -3945,7 +4707,8 @@ mod tests {
                 tag_name TEXT,
                 published_at TEXT,
                 created_at TEXT,
-                updated_at TEXT
+                updated_at TEXT,
+                detected_at TEXT
             )",
         )
         .execute(&pool)
@@ -3976,8 +4739,8 @@ mod tests {
             )
             INSERT INTO repo_releases
             SELECT x, x % 100, 'Release ' || x, 'v' || x,
-                CASE WHEN x % 20 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-09-18T00:00:00Z' END,
-                NULL, NULL
+                CASE WHEN x % 20 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-08-18T00:00:00Z' END,
+                NULL, NULL, NULL
             FROM ids",
         )
         .execute(&pool)
@@ -4002,9 +4765,9 @@ mod tests {
                 VALUES(1) UNION ALL SELECT x + 1 FROM ids WHERE x < 100000
             )
             INSERT INTO social_activity_events
-            SELECT 'octo/repository-' || (x % 100), (x + 1) / 2,
+            SELECT 'octo/repository-' || ((x - 1) / 40 % 100), (x + 39) / 40,
                 'Announcement ' || x,
-                CASE WHEN x % 40 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-09-18T00:00:00Z' END,
+                CASE WHEN x % 40 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-08-18T00:00:00Z' END,
                 '2026-09-20T09:30:00Z', 'announcement'
             FROM ids",
         )
@@ -4038,7 +4801,7 @@ mod tests {
             INSERT INTO notifications
             SELECT 'notification-' || x, 'thread-' || ((x + 1) / 2),
                 'octo/repository-' || (x % 100), 'Notification ' || x,
-                CASE WHEN x % 40 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-09-18T00:00:00Z' END
+                CASE WHEN x % 40 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-08-18T00:00:00Z' END
             FROM ids",
         )
         .execute(&pool)
@@ -4054,7 +4817,9 @@ mod tests {
                 id TEXT PRIMARY KEY,
                 parent_brief_id TEXT,
                 status TEXT,
-                updated_at TEXT
+                updated_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT
             )",
         )
         .execute(&pool)
@@ -4066,15 +4831,15 @@ mod tests {
             )
             INSERT INTO briefs
             SELECT 'brief-' || x, '2026-09-20',
-                CASE WHEN x % 20 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-09-18T00:00:00Z' END
+                CASE WHEN x % 20 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-08-18T00:00:00Z' END
             FROM ids",
         )
         .execute(&pool)
         .await
         .expect("seed benchmark briefs");
         sqlx::query(
-            "INSERT INTO llm_calls
-            SELECT 'call-' || id, id, 'succeeded', '2026-09-20T09:25:00Z'
+            "INSERT INTO llm_calls (id, parent_brief_id, status, updated_at, attempt_count, created_at)
+            SELECT 'call-' || id, id, 'succeeded', '2026-09-20T09:25:00Z', 1, '2026-09-20T09:25:00Z'
             FROM briefs WHERE CAST(substr(id, 7) AS INTEGER) % 20 = 0",
         )
         .execute(&pool)
@@ -4089,6 +4854,7 @@ mod tests {
                 pipeline TEXT,
                 variant TEXT,
                 status TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT,
                 updated_at TEXT
             )",
@@ -4106,13 +4872,44 @@ mod tests {
         sqlx::query(
             "INSERT INTO content_work_items
             SELECT 'translation-' || release_id, 'release', CAST(release_id AS TEXT),
-                'translation', 'detail', 'ready', '2026-09-20T09:25:00Z', '2026-09-20T09:25:00Z'
+                'translation', 'detail', 'ready', 1, '2026-09-20T09:25:00Z', '2026-09-20T09:25:00Z'
             FROM repo_releases WHERE release_id % 20 = 0",
         )
         .execute(&pool)
         .await
         .expect("seed benchmark global work");
+        sqlx::query(
+            "INSERT INTO content_work_items
+            SELECT 'announcement-' || lower(repo_full_name) || '#' || discussion_number,
+                'announcement', lower(repo_full_name) || '#' || discussion_number,
+                'translation', 'detail', 'ready', 1, '2026-09-20T09:25:00Z', '2026-09-20T09:25:00Z'
+            FROM (SELECT DISTINCT repo_full_name, discussion_number FROM social_activity_events)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed benchmark announcement work");
+        sqlx::query(
+            "INSERT INTO content_work_items
+            SELECT 'notification-' || thread_id, 'notification', thread_id,
+                'translation', 'detail', 'ready', 1, '2026-09-20T09:25:00Z', '2026-09-20T09:25:00Z'
+            FROM (SELECT DISTINCT thread_id FROM notifications)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed benchmark notification work");
 
+        sqlx::raw_sql(include_str!(
+            "../migrations/0073_admin_collection_source_time_indexes.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("apply source-time indexes to the synthetic copy");
+        sqlx::raw_sql(include_str!(
+            "../migrations/0079_admin_collection_read_budget_indexes.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("apply read-budget indexes to the synthetic copy");
         sqlx::raw_sql(include_str!(
             "../migrations/0085_admin_collection_activity_indexes.sql"
         ))
@@ -4144,6 +4941,7 @@ mod tests {
                 .map(|row| row.detail)
                 .collect::<Vec<_>>()
                 .join(" | ");
+            println!("activity_explain kind={kind:?} plan={plan}");
             let expected_indexes = match kind {
                 CollectionRecordKind::Release => {
                     &["idx_repo_releases_admin_activity_source_time"][..]
@@ -4165,6 +4963,14 @@ mod tests {
                 assert!(
                     plan.contains(expected_index),
                     "{kind:?} activity query did not select {expected_index}: {plan}"
+                );
+            }
+            if kind != CollectionRecordKind::Brief {
+                assert!(
+                    plan.contains(
+                        "SEARCH w USING INDEX idx_content_work_items_resource (canonical_resource_type=? AND canonical_resource_id=?)"
+                    ),
+                    "{kind:?} global activity query did not probe work items from bounded source IDs: {plan}"
                 );
             }
 
@@ -4204,6 +5010,126 @@ mod tests {
                 maximum < Duration::from_secs(5),
                 "{kind:?} max was {maximum:?}"
             );
+        }
+
+        let list_windows = [
+            ("24h", "2026-09-19T12:00:00Z", "2026-09-20T12:00:00Z"),
+            ("7d", "2026-09-13T12:00:00Z", "2026-09-20T12:00:00Z"),
+            ("30d", "2026-08-21T12:00:00Z", "2026-09-20T12:00:00Z"),
+        ];
+        for (window, from, before) in list_windows {
+            for kind in [
+                CollectionRecordKind::Release,
+                CollectionRecordKind::Announcement,
+                CollectionRecordKind::Notification,
+                CollectionRecordKind::Brief,
+            ] {
+                let (list_sql, list_binds) = collection_query_sql(
+                    kind,
+                    true,
+                    Some(from),
+                    Some(before),
+                    AttemptCountRange { min: 0, max: None },
+                    None,
+                    None,
+                    Some((20, 0)),
+                );
+                let explain_sql = format!("EXPLAIN QUERY PLAN {list_sql}");
+                let mut explain = sqlx::query(&explain_sql);
+                for bind in &list_binds {
+                    explain = match bind {
+                        CollectionQueryBind::Text(value) => explain.bind(value.clone()),
+                        CollectionQueryBind::Integer(value) => explain.bind(*value),
+                    };
+                }
+                let plan = explain
+                    .fetch_all(&pool)
+                    .await
+                    .expect("explain collection list query")
+                    .into_iter()
+                    .map(|row| row.get::<String, _>("detail"))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let expected_source_indexes = match kind {
+                    CollectionRecordKind::Release => {
+                        &["idx_repo_releases_admin_activity_source_time"][..]
+                    }
+                    CollectionRecordKind::Announcement => &[
+                        "idx_social_activity_events_admin_activity_time",
+                        "idx_social_activity_events_admin_activity_canonical",
+                    ][..],
+                    CollectionRecordKind::Notification => &[
+                        "idx_notifications_admin_activity_source_time",
+                        "idx_notifications_admin_canonical_source",
+                    ][..],
+                    CollectionRecordKind::Brief => &["idx_briefs_admin_activity_source_time"][..],
+                };
+                for expected_index in expected_source_indexes {
+                    assert!(
+                        plan.contains(expected_index),
+                        "{kind:?} global list query did not select {expected_index}: {plan}"
+                    );
+                }
+                if kind != CollectionRecordKind::Brief {
+                    assert!(
+                        plan.contains(
+                            "SEARCH w USING INDEX idx_content_work_items_resource (canonical_resource_type=? AND canonical_resource_id=?)"
+                        ),
+                        "{kind:?} global list query did not probe work items from bounded source IDs: {plan}"
+                    );
+                }
+
+                // Keep the all-window list gate bounded; activity reads retain 30 samples above.
+                let mut elapsed = Vec::with_capacity(11);
+                let mut total = 0;
+                for sample in 0..12 {
+                    let started = Instant::now();
+                    let (next_total, rows) = list_collection_page(
+                        &pool,
+                        kind,
+                        true,
+                        Some(from),
+                        Some(before),
+                        AttemptCountRange { min: 0, max: None },
+                        None,
+                        None,
+                        20,
+                        0,
+                    )
+                    .await
+                    .expect("run bounded collection list query");
+                    assert!(!rows.is_empty(), "{kind:?} {window} returned no rows");
+                    total = next_total;
+                    if sample > 0 {
+                        elapsed.push(started.elapsed());
+                    }
+                }
+                elapsed.sort_unstable();
+                let p95 = elapsed[(elapsed.len() * 95).div_ceil(100) - 1];
+                let p99 = elapsed[(elapsed.len() * 99).div_ceil(100) - 1];
+                let maximum = *elapsed.last().expect("list benchmark samples");
+                println!(
+                    "list_benchmark window={} kind={} total={} p95_ms={} p99_ms={} max_ms={}",
+                    window,
+                    collection_record_kind_label(kind),
+                    total,
+                    p95.as_millis(),
+                    p99.as_millis(),
+                    maximum.as_millis()
+                );
+                assert!(
+                    p95 < Duration::from_secs(1),
+                    "{kind:?} {window} p95 was {p95:?}"
+                );
+                assert!(
+                    p99 < Duration::from_secs(2),
+                    "{kind:?} {window} p99 was {p99:?}"
+                );
+                assert!(
+                    maximum < Duration::from_secs(5),
+                    "{kind:?} {window} max was {maximum:?}"
+                );
+            }
         }
     }
 

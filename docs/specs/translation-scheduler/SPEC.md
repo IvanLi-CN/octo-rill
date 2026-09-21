@@ -27,6 +27,18 @@
 - VER-RUST-SCHEDULER: 覆盖: REQ-SCHEDULER, REQ-ATTEMPT-AUDIT。通过 Rust 单元与集成测试验证队列、单一 Release 润色所有者、批次、自动恢复、手动重试、精确调用归因和追加式事件写入。
 - VER-ADMIN-API: 覆盖: REQ-ATTEMPT-AUDIT, REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过管理员 API 测试验证时间筛选、分页、任务摘要、尝试历史、安全错误字段与诊断载荷过期语义。
 - VER-WEB-ADMIN: 覆盖: REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过 Web 构建、Playwright 回归与 Storybook canvas 视觉证据验证分组列表、桌面抽屉、移动详情路由、模型调用与输出契约的双状态，以及尝试列表直接可见的模型、错误和重入队状态。
+- REQ-COLLECTION-READ-PLAN: 采集记录检索窗口最大为三十一天。服务端必须先按各类型的规范来源时间和窗口边界选择唯一来源记录，再以来源时间表达式索引限界候选集，随后只为候选记录聚合处理状态并水合当前页；公告同时间来源使用稳定的唯一 tie-break。不得为了当前页或精确匹配总数扫描无界的处理工作集合。
+- REQ-COLLECTION-READ-CONSISTENCY: 精确匹配总数、当前页源记录和处理摘要必须来自同一个短只读 SQLite 快照。该快照不得持有 SQLite writer permit，也不得改变既有页码分页或响应形状。
+- REQ-COLLECTION-READ-AVAILABILITY: 相同采集记录查询键的并发读取必须合并为一次执行；新筛选请求必须使旧筛选读取失效。列表与活动图读取必须隔离，正常管理端操作不得因应用内读取并发返回 `admin_collection_records_busy`。共享读取任务 panic 时必须发布完整错误并释放查询键，使后续同键读取可重试。
+- REQ-COLLECTION-READ-FAILURE: 首次读取可以阻塞等待结果；仅当最后成功响应与当前规范化查询键相同时，刷新失败才保留列表并禁用旧行操作。查询键变化后，旧查询记录在新读取期间和失败后都不得显示为当前筛选结果。安全超时仅作为异常保护，失败时不得自动重试，管理员必须通过显式刷新重新读取。
+- REQ-CONTENT-PROCESSING-FAILURE-AUDIT: 内容处理的失败审计必须以与目标列对齐的持久化语句记录失败；审计持久化错误不得反复制造后台工作失败或放大 SQLite 写入压力。
+
+## Verification
+
+- VER-COLLECTION-READ-PLAN: 覆盖: REQ-COLLECTION-READ-PLAN, REQ-COLLECTION-READ-CONSISTENCY。通过生产结构的合成 fixture 与 `EXPLAIN QUERY PLAN` 验证时间谓词和排序命中同一表达式索引、处理状态只针对已限界候选集聚合，且精确匹配总数与当前页来自同一读取快照。
+- VER-COLLECTION-READ-AVAILABILITY: 覆盖: REQ-COLLECTION-READ-AVAILABILITY, REQ-COLLECTION-READ-FAILURE。通过 Rust 集成测试、Storybook 交互和管理员 Playwright 回归验证同键读取合并与重试、新筛选请求不被旧响应覆盖或显示旧行、列表与活动图可独立完成，以及同键失败刷新保留最后成功列表且不自动重试。
+- VER-COLLECTION-READ-PERFORMANCE: 覆盖: REQ-COLLECTION-READ-PLAN, REQ-COLLECTION-READ-AVAILABILITY。通过生产结构的合成 fixture 和有代表性的后台写压力测量 `24h`、`7d`、`30d` 读取；每种窗口的 `p95` 必须不超过一秒，`p99` 必须不超过两秒。
+- VER-CONTENT-PROCESSING-FAILURE-AUDIT: 覆盖: REQ-CONTENT-PROCESSING-FAILURE-AUDIT。通过失败工作项回归验证审计记录成功持久化，且不会产生列值数量不匹配的 SQL 错误。
 
 ## 目标 / 非目标
 
@@ -55,6 +67,7 @@
 - [ADR 0003: Collection Record Time and Attempt Filtering](../../adr/0003-collection-record-time-and-attempt-filtering.md)
 - [ADR 0004: AI Diagnostics Evidence Boundary](../../adr/0004-ai-diagnostics-evidence-boundary.md)
 - [ADR 0007: 全局翻译与润色工作模型](../../adr/0007-global-translation-and-polish-work-model.md)
+- [ADR 0013: 管理采集记录按查询键合并在途读取](../../adr/0013-admin-collection-read-singleflight.md)
 
 ## 接口契约（Interfaces & Contracts）
 
