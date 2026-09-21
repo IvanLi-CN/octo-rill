@@ -163,6 +163,10 @@ Admin views expose scheduler runtime status, request aggregates, batch aggregate
 
 A list row contains only the source record's type-specific identity and timestamps plus the translation and/or polish task summaries: status, retry count, started time, latest attempt, and completion time. The detail endpoint returns the same record summary and its ordered attempt history, including trigger, processing stage, provider and output-contract outcomes, stage-qualified model links, safe error classification/summary, retry eligibility, next retry time, and diagnostic evidence availability. It never returns source text, prompts, raw model output, or raw upstream errors.
 
+The maximum requested window is thirty-one days. `total` is the exact number of records matching the record kind and supplied filters in that window, not the number of returned rows.
+
+Identical concurrent list requests share one server execution. A newer filter request supersedes an older filter request for the same admin view. Normal list and activity refreshes do not fail with `admin_collection_records_busy` because of application-internal read contention. The service may retain a safety timeout for exceptional reads; callers treat it as a retryable failure without receiving partial data.
+
 
 ## Legacy endpoints
 

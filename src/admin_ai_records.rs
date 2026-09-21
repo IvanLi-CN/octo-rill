@@ -1,7 +1,8 @@
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
-    sync::Arc,
+    future::Future,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -22,7 +23,7 @@ use crate::{
 
 const PAGE_SIZE_DEFAULT: i64 = 20;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum CollectionRecordKind {
     Release,
     Announcement,
@@ -101,7 +102,7 @@ pub struct AdminCollectionRecordItem {
     pub polish: AdminCollectionTaskSummary,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AdminCollectionRecordsResponse {
     pub items: Vec<AdminCollectionRecordItem>,
     pub page: i64,
@@ -136,7 +137,7 @@ pub struct AdminCollectionActivitySummary {
     pub neutral_count: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AdminCollectionActivityResponse {
     pub kind: String,
     pub bucket_minutes: u8,
@@ -210,6 +211,8 @@ struct SourceRecordRow {
     occurred_at: Option<String>,
     detected_at: Option<String>,
     generated_at: Option<String>,
+    #[sqlx(default)]
+    total_count: i64,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -573,10 +576,29 @@ fn coverage_origin(
         .unwrap_or_else(|| "historical_unknown".to_owned())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct AttemptCountRange {
     min: i64,
     max: Option<i64>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct CollectionListKey {
+    kind: CollectionRecordKind,
+    from: String,
+    before: String,
+    attempts: AttemptCountRange,
+    translation_filter: Vec<String>,
+    polish_filter: Vec<String>,
+    page: i64,
+    page_size: i64,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct CollectionActivityKey {
+    kind: CollectionRecordKind,
+    window_started_at: String,
+    window_ended_at: String,
 }
 
 fn parse_attempt_count_range(
@@ -1224,7 +1246,7 @@ fn source_records_sql(kind: CollectionRecordKind) -> String {
                 FROM repo_release_work_items
                 GROUP BY repo_id
             ),
-            source_records AS (
+            raw_source_records AS (
                 SELECT
                     CAST(r.release_id AS TEXT) AS id,
                     COALESCE(rr.repository, '仓库 #' || CAST(r.repo_id AS TEXT)) AS repository,
@@ -1237,7 +1259,7 @@ fn source_records_sql(kind: CollectionRecordKind) -> String {
                 LEFT JOIN release_repositories rr ON rr.repo_id = r.repo_id
             )"
         .to_owned(),
-        CollectionRecordKind::Announcement => "source_records AS (
+        CollectionRecordKind::Announcement => "raw_source_records AS (
                 SELECT
                     lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id,
                     MAX(e.repo_full_name) AS repository,
@@ -1250,19 +1272,11 @@ fn source_records_sql(kind: CollectionRecordKind) -> String {
                 WHERE e.kind = 'announcement'
                   AND e.repo_full_name IS NOT NULL
                   AND e.discussion_number IS NOT NULL
+                  /*ANNOUNCEMENT_WINDOW*/
                 GROUP BY lower(e.repo_full_name), e.discussion_number
             )"
         .to_owned(),
-        CollectionRecordKind::Notification => "notification_rows AS (
-                SELECT
-                    n.*,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY n.thread_id
-                        ORDER BY n.updated_at DESC, n.id DESC
-                    ) AS source_rank
-                FROM notifications n
-            ),
-            source_records AS (
+        CollectionRecordKind::Notification => "raw_source_records AS (
                 SELECT
                     n.thread_id AS id,
                     n.repo_full_name AS repository,
@@ -1271,11 +1285,18 @@ fn source_records_sql(kind: CollectionRecordKind) -> String {
                     n.updated_at AS occurred_at,
                     NULL AS detected_at,
                     NULL AS generated_at
-                FROM notification_rows n
-                WHERE n.source_rank = 1
+                FROM notifications n
+                WHERE 1 = 1 /*NOTIFICATION_WINDOW*/
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM notifications newer
+                    WHERE newer.thread_id = n.thread_id
+                      AND (newer.updated_at > n.updated_at
+                        OR (newer.updated_at = n.updated_at AND newer.id > n.id))
+                  )
             )"
         .to_owned(),
-        CollectionRecordKind::Brief => "source_records AS (
+        CollectionRecordKind::Brief => "raw_source_records AS (
                 SELECT
                     b.id,
                     NULL AS repository,
@@ -1726,7 +1747,52 @@ fn collection_query_sql(
 ) -> (String, Vec<CollectionQueryBind>) {
     let mut binds = Vec::new();
     let mut sql = String::from("WITH ");
-    sql.push_str(&source_records_sql(kind));
+    let mut source_sql = source_records_sql(kind);
+    if kind == CollectionRecordKind::Announcement {
+        let mut window = String::new();
+        if from.is_some() {
+            window.push_str(" AND julianday(e.occurred_at) >= julianday(?)");
+            binds.push(CollectionQueryBind::Text(
+                from.unwrap_or_default().to_owned(),
+            ));
+        }
+        if before.is_some() {
+            window.push_str(" AND julianday(e.occurred_at) < julianday(?)");
+            binds.push(CollectionQueryBind::Text(
+                before.unwrap_or_default().to_owned(),
+            ));
+        }
+        source_sql = source_sql.replace("/*ANNOUNCEMENT_WINDOW*/", &window);
+    } else if kind == CollectionRecordKind::Notification {
+        let mut window = String::new();
+        if from.is_some() {
+            window.push_str(" AND julianday(n.updated_at) >= julianday(?)");
+            binds.push(CollectionQueryBind::Text(
+                from.unwrap_or_default().to_owned(),
+            ));
+        }
+        if before.is_some() {
+            window.push_str(" AND julianday(n.updated_at) < julianday(?)");
+            binds.push(CollectionQueryBind::Text(
+                before.unwrap_or_default().to_owned(),
+            ));
+        }
+        source_sql = source_sql.replace("/*NOTIFICATION_WINDOW*/", &window);
+    } else {
+        source_sql = source_sql.replace("/*ANNOUNCEMENT_WINDOW*/", "");
+        source_sql = source_sql.replace("/*NOTIFICATION_WINDOW*/", "");
+    }
+    sql.push_str(&source_sql);
+    sql.push_str(", source_records AS MATERIALIZED (SELECT * FROM raw_source_records WHERE 1 = 1");
+    if let Some(value) = from {
+        sql.push_str(" AND julianday(source_time) >= julianday(?)");
+        binds.push(CollectionQueryBind::Text(value.to_owned()));
+    }
+    if let Some(value) = before {
+        sql.push_str(" AND julianday(source_time) < julianday(?)");
+        binds.push(CollectionQueryBind::Text(value.to_owned()));
+    }
+    sql.push(')');
 
     if kind == CollectionRecordKind::Brief {
         sql.push_str(
@@ -1741,10 +1807,12 @@ fn collection_query_sql(
                         ORDER BY c.updated_at DESC, c.id DESC
                     ) AS row_rank
                 FROM llm_calls c
+                JOIN source_records s ON s.id = c.parent_brief_id
             ),
             brief_attempts AS (
                 SELECT parent_brief_id AS entity_id, MAX(attempt_count) AS attempt_count
-                FROM llm_calls
+                FROM llm_calls c
+                JOIN source_records s ON s.id = c.parent_brief_id
                 GROUP BY parent_brief_id
             ),
             status_projection AS (
@@ -1780,6 +1848,7 @@ fn collection_query_sql(
                         ORDER BY w.updated_at DESC, w.id DESC
                     ) AS row_rank
                 FROM translation_work_items w
+                JOIN source_records s ON s.id = w.entity_id
                 WHERE w.kind IN ('{translation_kind}', '{polish_kind}')
             ),
             legacy_latest AS (
@@ -1800,6 +1869,7 @@ fn collection_query_sql(
                     json_extract(observation_basis_json, '$.source_hash') AS source_hash,
                     classification
                 FROM content_legacy_observations
+                JOIN source_records s ON s.id = canonical_resource_id
                 WHERE canonical_resource_type = '{resource_type}'
                   AND json_extract(observation_basis_json, '$.source_hash') IS NOT NULL
             ),
@@ -1823,6 +1893,7 @@ fn collection_query_sql(
             coverage AS (
                 SELECT record_id AS entity_id, pipeline, status_origin
                 FROM admin_collection_processing_coverage
+                JOIN source_records s ON s.id = record_id
                 WHERE record_kind = '{resource_type}'
             )"
         );
@@ -1858,6 +1929,7 @@ fn collection_query_sql(
                                 w.id DESC
                         ) AS row_rank
                     FROM content_work_items w
+                    JOIN source_records s ON s.id = w.canonical_resource_id
                     WHERE w.canonical_resource_type = '{resource_type}'
                       AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
                         OR (w.pipeline = 'polishing' AND w.variant = 'smart'))
@@ -1869,7 +1941,8 @@ fn collection_query_sql(
                 ),
                 global_attempts AS (
                     SELECT canonical_resource_id AS entity_id, MAX(attempt_count) AS attempt_count
-                    FROM content_work_items
+                    FROM content_work_items w
+                    JOIN source_records s ON s.id = w.canonical_resource_id
                     WHERE canonical_resource_type = '{resource_type}'
                     GROUP BY canonical_resource_id
                 ),
@@ -1933,14 +2006,6 @@ fn collection_query_sql(
     }
 
     sql.push_str(", filtered_records AS (SELECT * FROM status_projection WHERE 1 = 1");
-    if let Some(value) = from {
-        sql.push_str(" AND datetime(source_time) >= datetime(?)");
-        binds.push(CollectionQueryBind::Text(value.to_owned()));
-    }
-    if let Some(value) = before {
-        sql.push_str(" AND datetime(source_time) < datetime(?)");
-        binds.push(CollectionQueryBind::Text(value.to_owned()));
-    }
     sql.push_str(" AND attempt_count >= ?");
     binds.push(CollectionQueryBind::Integer(attempts.min));
     if let Some(max) = attempts.max {
@@ -1981,7 +2046,7 @@ fn collection_query_sql(
         } else {
             "ORDER BY datetime(source_time) DESC, id DESC"
         };
-        sql.push_str(" SELECT id, repository, title, occurred_at, detected_at, generated_at FROM filtered_records ");
+        sql.push_str(" SELECT id, repository, title, occurred_at, detected_at, generated_at, COUNT(*) OVER () AS total_count FROM filtered_records ");
         sql.push_str(order);
         sql.push_str(" LIMIT ? OFFSET ?");
         binds.push(CollectionQueryBind::Integer(page_size));
@@ -2036,18 +2101,6 @@ async fn list_collection_page(
     page_size: i64,
     offset: i64,
 ) -> Result<(i64, Vec<SourceRecordRow>), ApiError> {
-    let (count_sql, count_binds) = collection_query_sql(
-        kind,
-        global_mode,
-        from,
-        before,
-        attempts,
-        translation_filter,
-        polish_filter,
-        None,
-    );
-    let count_sql = format!("{count_sql} SELECT COUNT(*) FROM filtered_records");
-    let total = execute_collection_scalar(pool, &count_sql, &count_binds).await?;
     let (page_sql, page_binds) = collection_query_sql(
         kind,
         global_mode,
@@ -2059,64 +2112,140 @@ async fn list_collection_page(
         Some((page_size, offset)),
     );
     let rows = execute_collection_query::<SourceRecordRow>(pool, &page_sql, &page_binds).await?;
+    let total = if let Some(row) = rows.first() {
+        row.total_count
+    } else {
+        let (count_sql, count_binds) = collection_query_sql(
+            kind,
+            global_mode,
+            from,
+            before,
+            attempts,
+            translation_filter,
+            polish_filter,
+            None,
+        );
+        let count_sql = format!("{count_sql} SELECT COUNT(*) FROM filtered_records");
+        execute_collection_scalar(pool, &count_sql, &count_binds).await?
+    };
     Ok((total, rows))
 }
 
-async fn run_bounded_collection_read<F, T>(
-    permit: tokio::sync::OwnedSemaphorePermit,
-    read: F,
-) -> Result<T, ApiError>
-where
-    F: std::future::Future<Output = Result<T, ApiError>> + Send + 'static,
-    T: Send + 'static,
-{
-    run_bounded_collection_read_with_budget(permit, read, Duration::from_secs(5)).await
+struct SharedRead<T> {
+    result: tokio::sync::Mutex<Option<Result<Arc<T>, ApiError>>>,
+    notify: tokio::sync::Notify,
 }
 
-async fn run_bounded_collection_read_with_budget<F, T>(
-    permit: tokio::sync::OwnedSemaphorePermit,
-    read: F,
-    budget: Duration,
-) -> Result<T, ApiError>
-where
-    F: std::future::Future<Output = Result<T, ApiError>> + Send + 'static,
-    T: Send + 'static,
-{
-    let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
-    let (cancel_sender, mut cancel_receiver) = tokio::sync::oneshot::channel();
-    let mut read_handle = tokio::spawn(read);
-    tokio::spawn(async move {
-        tokio::select! {
-            result = &mut read_handle => {
-                let result = match result {
-                    Ok(result) => result,
-                    Err(error) => Err(ApiError::internal(error)),
-                };
-                let _ = result_sender.send(result);
-            }
-            _ = &mut cancel_receiver => {
-                read_handle.abort();
-                let _ = read_handle.await;
-            }
-        }
-        drop(permit);
-    });
-    match tokio::time::timeout(budget, result_receiver).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err(ApiError::internal("collection read supervisor stopped")),
-        Err(_) => {
-            // Ask the supervisor to cancel and await the query task before it
-            // releases the permit. Caller cancellation follows the same path
-            // because the supervisor owns both resources independently.
-            let _ = cancel_sender.send(());
-            Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "admin_collection_records_timeout",
-                "admin collection records read timed out",
-            )
-            .with_retry_after(1))
+impl<T> SharedRead<T> {
+    fn new() -> Self {
+        Self {
+            result: tokio::sync::Mutex::new(None),
+            notify: tokio::sync::Notify::new(),
         }
     }
+}
+
+type CollectionListFlights =
+    tokio::sync::Mutex<HashMap<CollectionListKey, Arc<SharedRead<AdminCollectionRecordsResponse>>>>;
+type CollectionActivityFlights = tokio::sync::Mutex<
+    HashMap<CollectionActivityKey, Arc<SharedRead<AdminCollectionActivityResponse>>>,
+>;
+
+static COLLECTION_LIST_FLIGHTS: OnceLock<Arc<CollectionListFlights>> = OnceLock::new();
+static COLLECTION_ACTIVITY_FLIGHTS: OnceLock<Arc<CollectionActivityFlights>> = OnceLock::new();
+
+async fn bounded_collection_read<F, T>(read: F) -> Result<T, ApiError>
+where
+    F: Future<Output = Result<T, ApiError>> + Send,
+    T: Send,
+{
+    bounded_collection_read_with_budget(read, Duration::from_secs(5)).await
+}
+
+async fn bounded_collection_read_with_budget<F, T>(read: F, budget: Duration) -> Result<T, ApiError>
+where
+    F: Future<Output = Result<T, ApiError>> + Send,
+    T: Send,
+{
+    tokio::time::timeout(budget, read).await.map_err(|_| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admin_collection_records_timeout",
+            "admin collection records read timed out",
+        )
+        .with_retry_after(1)
+    })?
+}
+
+async fn await_shared_read<T: Clone>(flight: Arc<SharedRead<T>>) -> Result<Arc<T>, ApiError> {
+    loop {
+        let notified = flight.notify.notified();
+        if let Some(result) = flight.result.lock().await.clone() {
+            return result;
+        }
+        notified.await;
+    }
+}
+
+async fn run_keyed_singleflight<K, T, F>(
+    flights: Arc<tokio::sync::Mutex<HashMap<K, Arc<SharedRead<T>>>>>,
+    key: K,
+    read: F,
+) -> Result<T, ApiError>
+where
+    K: Clone + Eq + std::hash::Hash + Send + 'static,
+    T: Clone + Send + Sync + 'static,
+    F: Future<Output = Result<T, ApiError>> + Send + 'static,
+{
+    let (flight, leader) = {
+        let mut guard = flights.lock().await;
+        if let Some(flight) = guard.get(&key) {
+            (flight.clone(), false)
+        } else {
+            let flight = Arc::new(SharedRead::new());
+            guard.insert(key.clone(), flight.clone());
+            (flight, true)
+        }
+    };
+    if leader {
+        let task_flight = flight.clone();
+        let task_flights = flights.clone();
+        tokio::spawn(async move {
+            let result = bounded_collection_read(read).await.map(Arc::new);
+            *task_flight.result.lock().await = Some(result);
+            task_flight.notify.notify_waiters();
+            task_flights.lock().await.remove(&key);
+        });
+    }
+    await_shared_read(flight)
+        .await
+        .map(|value| (*value).clone())
+}
+
+async fn run_collection_list_singleflight<F>(
+    key: CollectionListKey,
+    read: F,
+) -> Result<AdminCollectionRecordsResponse, ApiError>
+where
+    F: Future<Output = Result<AdminCollectionRecordsResponse, ApiError>> + Send + 'static,
+{
+    let flights = COLLECTION_LIST_FLIGHTS
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(HashMap::new())))
+        .clone();
+    run_keyed_singleflight(flights, key, read).await
+}
+
+async fn run_collection_activity_singleflight<F>(
+    key: CollectionActivityKey,
+    read: F,
+) -> Result<AdminCollectionActivityResponse, ApiError>
+where
+    F: Future<Output = Result<AdminCollectionActivityResponse, ApiError>> + Send + 'static,
+{
+    let flights = COLLECTION_ACTIVITY_FLIGHTS
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(HashMap::new())))
+        .clone();
+    run_keyed_singleflight(flights, key, read).await
 }
 
 #[cfg(test)]
@@ -2262,18 +2391,16 @@ pub async fn admin_list_collection_records(
     let from = parse_timestamp(query.from, "from")?;
     let before = parse_timestamp(query.before, "before")?;
     let (from, before) = normalize_collection_window(from, before)?;
-    let _permit = state
-        .admin_collection_read_gate
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "admin_collection_records_busy",
-                "admin collection records are temporarily busy",
-            )
-            .with_retry_after(1)
-        })?;
+    let key = CollectionListKey {
+        kind,
+        from: from.clone(),
+        before: before.clone(),
+        attempts,
+        translation_filter: translation_filter.clone().unwrap_or_default(),
+        polish_filter: polish_filter.clone().unwrap_or_default(),
+        page,
+        page_size,
+    };
     let read_state = state.clone();
     let read = async move {
         let global_mode = content_processing::current_mode(&read_state.pool)
@@ -2306,15 +2433,14 @@ pub async fn admin_list_collection_records(
             .into_iter()
             .map(|row| source_record_item(kind, row, &task_summaries, &brief_summaries))
             .collect::<Vec<_>>();
-        Ok::<_, ApiError>((total, items))
+        Ok::<_, ApiError>(AdminCollectionRecordsResponse {
+            items,
+            page,
+            page_size,
+            total,
+        })
     };
-    let (total, items) = run_bounded_collection_read(_permit, read).await?;
-    Ok(Json(AdminCollectionRecordsResponse {
-        items,
-        page,
-        page_size,
-        total,
-    }))
+    Ok(Json(run_collection_list_singleflight(key, read).await?))
 }
 
 pub async fn admin_get_collection_activity(
@@ -2324,22 +2450,15 @@ pub async fn admin_get_collection_activity(
 ) -> Result<Json<AdminCollectionActivityResponse>, ApiError> {
     let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
     let kind = CollectionRecordKind::parse(record_kind.as_str())?;
-    let permit = state
-        .admin_collection_read_gate
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "admin_collection_records_busy",
-                "admin collection records are temporarily busy",
-            )
-            .with_retry_after(1)
-        })?;
     let now = Utc::now();
     let (window_started_at, window_ended_at) = {
         let (_, started_at, ended_at) = activity_window(now);
         (activity_timestamp(started_at), activity_timestamp(ended_at))
+    };
+    let key = CollectionActivityKey {
+        kind,
+        window_started_at: window_started_at.clone(),
+        window_ended_at: window_ended_at.clone(),
     };
     let read_state = state.clone();
     let read = async move {
@@ -2357,8 +2476,7 @@ pub async fn admin_get_collection_activity(
         .await?;
         Ok::<_, ApiError>(build_activity_response(kind, now, rows))
     };
-    let response = run_bounded_collection_read(permit, read).await?;
-    Ok(Json(response))
+    Ok(Json(run_collection_activity_singleflight(key, read).await?))
 }
 
 async fn load_source_record(
@@ -3435,28 +3553,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collection_read_gate_errors_are_retryable_and_release() {
-        let gate = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = gate.clone().acquire_owned().await.expect("first permit");
-        let error = ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "admin_collection_records_busy",
-            "admin collection records are temporarily busy",
-        )
-        .with_retry_after(1);
-        let response = axum::response::IntoResponse::into_response(error);
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
-        drop(permit);
-        assert!(gate.try_acquire().is_ok());
+    async fn identical_collection_list_reads_share_one_in_flight_execution() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let key = CollectionListKey {
+            kind: CollectionRecordKind::Release,
+            from: "singleflight-test-from".to_owned(),
+            before: "singleflight-test-before".to_owned(),
+            attempts: AttemptCountRange { min: 0, max: None },
+            translation_filter: Vec::new(),
+            polish_filter: Vec::new(),
+            page: 1,
+            page_size: 20,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let response = || {
+            Ok::<_, ApiError>(AdminCollectionRecordsResponse {
+                items: Vec::new(),
+                page: 1,
+                page_size: 20,
+                total: 0,
+            })
+        };
+        let first_calls = calls.clone();
+        let first_started = started.clone();
+        let first_release = release.clone();
+        let first_key = key.clone();
+        let first = tokio::spawn(async move {
+            run_collection_list_singleflight(first_key, async move {
+                first_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                first_started.notify_one();
+                first_release.notified().await;
+                response()
+            })
+            .await
+        });
+        started.notified().await;
+
+        let second_calls = calls.clone();
+        let second_key = key.clone();
+        let second = tokio::spawn(async move {
+            run_collection_list_singleflight(second_key, async move {
+                second_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                response()
+            })
+            .await
+        });
+        release.notify_waiters();
+
+        first
+            .await
+            .expect("first singleflight read")
+            .expect("first result");
+        second
+            .await
+            .expect("second singleflight read")
+            .expect("second result");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn collection_read_timeout_cancels_before_releasing_permit() {
-        let gate = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = gate.clone().try_acquire_owned().expect("read permit");
-        let error = run_bounded_collection_read_with_budget(
-            permit,
+    async fn collection_read_timeout_is_retryable_without_an_application_gate() {
+        let error = bounded_collection_read_with_budget(
             std::future::pending::<Result<(), ApiError>>(),
             Duration::from_millis(1),
         )
@@ -3465,25 +3625,6 @@ mod tests {
         let response = axum::response::IntoResponse::into_response(error);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
-        assert!(gate.try_acquire().is_err());
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(gate.try_acquire().is_ok());
-    }
-
-    #[tokio::test]
-    async fn collection_read_caller_cancellation_keeps_gate_until_cleanup() {
-        let gate = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = gate.clone().try_acquire_owned().expect("read permit");
-        let task = tokio::spawn(run_bounded_collection_read_with_budget(
-            permit,
-            std::future::pending::<Result<(), ApiError>>(),
-            Duration::from_secs(5),
-        ));
-        tokio::task::yield_now().await;
-        task.abort();
-        let _ = task.await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(gate.try_acquire().is_ok());
     }
 
     #[tokio::test]
@@ -3945,7 +4086,8 @@ mod tests {
                 tag_name TEXT,
                 published_at TEXT,
                 created_at TEXT,
-                updated_at TEXT
+                updated_at TEXT,
+                detected_at TEXT
             )",
         )
         .execute(&pool)
@@ -3976,8 +4118,8 @@ mod tests {
             )
             INSERT INTO repo_releases
             SELECT x, x % 100, 'Release ' || x, 'v' || x,
-                CASE WHEN x % 20 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-09-18T00:00:00Z' END,
-                NULL, NULL
+                CASE WHEN x % 20 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-08-18T00:00:00Z' END,
+                NULL, NULL, NULL
             FROM ids",
         )
         .execute(&pool)
@@ -4002,9 +4144,9 @@ mod tests {
                 VALUES(1) UNION ALL SELECT x + 1 FROM ids WHERE x < 100000
             )
             INSERT INTO social_activity_events
-            SELECT 'octo/repository-' || (x % 100), (x + 1) / 2,
+            SELECT 'octo/repository-' || ((x - 1) / 40 % 100), (x + 39) / 40,
                 'Announcement ' || x,
-                CASE WHEN x % 40 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-09-18T00:00:00Z' END,
+                CASE WHEN x % 40 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-08-18T00:00:00Z' END,
                 '2026-09-20T09:30:00Z', 'announcement'
             FROM ids",
         )
@@ -4038,7 +4180,7 @@ mod tests {
             INSERT INTO notifications
             SELECT 'notification-' || x, 'thread-' || ((x + 1) / 2),
                 'octo/repository-' || (x % 100), 'Notification ' || x,
-                CASE WHEN x % 40 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-09-18T00:00:00Z' END
+                CASE WHEN x % 40 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-08-18T00:00:00Z' END
             FROM ids",
         )
         .execute(&pool)
@@ -4054,7 +4196,9 @@ mod tests {
                 id TEXT PRIMARY KEY,
                 parent_brief_id TEXT,
                 status TEXT,
-                updated_at TEXT
+                updated_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT
             )",
         )
         .execute(&pool)
@@ -4066,15 +4210,15 @@ mod tests {
             )
             INSERT INTO briefs
             SELECT 'brief-' || x, '2026-09-20',
-                CASE WHEN x % 20 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-09-18T00:00:00Z' END
+                CASE WHEN x % 20 = 0 THEN '2026-09-20T09:20:00Z' ELSE '2026-08-18T00:00:00Z' END
             FROM ids",
         )
         .execute(&pool)
         .await
         .expect("seed benchmark briefs");
         sqlx::query(
-            "INSERT INTO llm_calls
-            SELECT 'call-' || id, id, 'succeeded', '2026-09-20T09:25:00Z'
+            "INSERT INTO llm_calls (id, parent_brief_id, status, updated_at, attempt_count, created_at)
+            SELECT 'call-' || id, id, 'succeeded', '2026-09-20T09:25:00Z', 1, '2026-09-20T09:25:00Z'
             FROM briefs WHERE CAST(substr(id, 7) AS INTEGER) % 20 = 0",
         )
         .execute(&pool)
@@ -4113,6 +4257,18 @@ mod tests {
         .await
         .expect("seed benchmark global work");
 
+        sqlx::raw_sql(include_str!(
+            "../migrations/0073_admin_collection_source_time_indexes.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("apply source-time indexes to the synthetic copy");
+        sqlx::raw_sql(include_str!(
+            "../migrations/0079_admin_collection_read_budget_indexes.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("apply read-budget indexes to the synthetic copy");
         sqlx::raw_sql(include_str!(
             "../migrations/0085_admin_collection_activity_indexes.sql"
         ))
@@ -4204,6 +4360,71 @@ mod tests {
                 maximum < Duration::from_secs(5),
                 "{kind:?} max was {maximum:?}"
             );
+        }
+
+        let list_windows = [
+            ("24h", "2026-09-19T12:00:00Z", "2026-09-20T12:00:00Z"),
+            ("7d", "2026-09-13T12:00:00Z", "2026-09-20T12:00:00Z"),
+            ("30d", "2026-08-21T12:00:00Z", "2026-09-20T12:00:00Z"),
+        ];
+        for (window, from, before) in list_windows {
+            for kind in [
+                CollectionRecordKind::Release,
+                CollectionRecordKind::Announcement,
+                CollectionRecordKind::Notification,
+                CollectionRecordKind::Brief,
+            ] {
+                // Keep the all-window list gate bounded; activity reads retain 30 samples above.
+                let mut elapsed = Vec::with_capacity(11);
+                let mut total = 0;
+                for sample in 0..12 {
+                    let started = Instant::now();
+                    let (next_total, rows) = list_collection_page(
+                        &pool,
+                        kind,
+                        false,
+                        Some(from),
+                        Some(before),
+                        AttemptCountRange { min: 0, max: None },
+                        None,
+                        None,
+                        20,
+                        0,
+                    )
+                    .await
+                    .expect("run bounded collection list query");
+                    assert!(!rows.is_empty(), "{kind:?} {window} returned no rows");
+                    total = next_total;
+                    if sample > 0 {
+                        elapsed.push(started.elapsed());
+                    }
+                }
+                elapsed.sort_unstable();
+                let p95 = elapsed[(elapsed.len() * 95).div_ceil(100) - 1];
+                let p99 = elapsed[(elapsed.len() * 99).div_ceil(100) - 1];
+                let maximum = *elapsed.last().expect("list benchmark samples");
+                println!(
+                    "list_benchmark window={} kind={} total={} p95_ms={} p99_ms={} max_ms={}",
+                    window,
+                    collection_record_kind_label(kind),
+                    total,
+                    p95.as_millis(),
+                    p99.as_millis(),
+                    maximum.as_millis()
+                );
+                assert!(
+                    p95 < Duration::from_secs(1),
+                    "{kind:?} {window} p95 was {p95:?}"
+                );
+                assert!(
+                    p99 < Duration::from_secs(2),
+                    "{kind:?} {window} p99 was {p99:?}"
+                );
+                assert!(
+                    maximum < Duration::from_secs(5),
+                    "{kind:?} {window} max was {maximum:?}"
+                );
+            }
         }
     }
 

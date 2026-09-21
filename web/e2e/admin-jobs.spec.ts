@@ -2901,6 +2901,69 @@ test("content processing empty state explains filter recovery", async ({
 	).toHaveCount(0);
 });
 
+test("content processing keeps the last list visible after a refresh timeout", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 900 });
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	const record = {
+		id: "release-stale-1",
+		kind: "release" as const,
+		repository: "octo-demo/release-lab",
+		title: "v2.32.0",
+		occurred_at: "2026-04-15T03:20:00Z",
+		detected_at: "2026-04-15T03:21:00Z",
+		generated_at: null,
+		translation: null,
+		polish: {
+			status: "ready",
+			display_status: "succeeded",
+			status_origin: "task",
+			retry_count: 0,
+			started_at: null,
+			last_attempt_at: null,
+			finished_at: null,
+		},
+	};
+	let listCalls = 0;
+	await page.route("**/api/admin/jobs/ai-records/**", async (route) => {
+		const pathname = new URL(route.request().url()).pathname;
+		if (pathname !== "/api/admin/jobs/ai-records/release") {
+			return route.fallback();
+		}
+		listCalls += 1;
+		if (listCalls <= 2) {
+			return json(route, { items: [record], page: 1, page_size: 20, total: 1 });
+		}
+		return json(
+			route,
+			{
+				error: {
+					code: "admin_collection_records_timeout",
+					message: "admin collection records read timed out",
+				},
+			},
+			503,
+		);
+	});
+
+	await page.goto("/admin/jobs/ai-records", { waitUntil: "domcontentloaded" });
+	const recordsTable = page.getByRole("table");
+	await expect(
+		recordsTable.getByText("v2.32.0", { exact: true }),
+	).toBeVisible();
+	await page.getByRole("button", { name: "刷新记录" }).first().click();
+	await expect(
+		page.getByRole("heading", { name: "记录暂时无法读取" }),
+	).toBeVisible();
+	await expect(
+		recordsTable.getByText("v2.32.0", { exact: true }),
+	).toBeVisible();
+	await expect(
+		recordsTable.getByRole("button", { name: "查看 v2.32.0 详情" }),
+	).toBeDisabled();
+});
+
 test("admin requests grouped LLM call ordering and renders the response", async ({
 	page,
 }) => {

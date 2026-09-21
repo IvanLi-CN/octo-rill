@@ -619,11 +619,13 @@ function Paging({
 	page,
 	total,
 	loading,
+	disabled = false,
 	onPage,
 }: {
 	page: number;
 	total: number;
 	loading: boolean;
+	disabled?: boolean;
 	onPage: (page: number) => void;
 }) {
 	const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
@@ -636,7 +638,7 @@ function Paging({
 				<Button
 					variant="outline"
 					size="sm"
-					disabled={loading || page <= 1}
+					disabled={loading || disabled || page <= 1}
 					onClick={() => onPage(page - 1)}
 				>
 					上一页
@@ -644,7 +646,7 @@ function Paging({
 				<Button
 					variant="outline"
 					size="sm"
-					disabled={loading || page >= totalPages}
+					disabled={loading || disabled || page >= totalPages}
 					onClick={() => onPage(page + 1)}
 				>
 					下一页
@@ -657,10 +659,12 @@ function Paging({
 function CollectionTable({
 	items,
 	tab,
+	disabled = false,
 	onOpen,
 }: {
 	items: AdminCollectionRecordItem[];
 	tab: CollectionTab;
+	disabled?: boolean;
 	onOpen: (item: AdminCollectionRecordItem) => void;
 }) {
 	const isBrief = tab === "brief";
@@ -715,10 +719,17 @@ function CollectionTable({
 					{items.map((item) => (
 						<TableRow
 							key={item.id}
-							className="cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-							tabIndex={0}
-							onClick={() => onOpen(item)}
+							className={cn(
+								"focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+								disabled ? "cursor-default opacity-70" : "cursor-pointer",
+							)}
+							tabIndex={disabled ? -1 : 0}
+							aria-disabled={disabled}
+							onClick={() => {
+								if (!disabled) onOpen(item);
+							}}
 							onKeyDown={(event) => {
+								if (disabled) return;
 								if (event.key === "Enter" || event.key === " ") {
 									event.preventDefault();
 									onOpen(item);
@@ -753,6 +764,7 @@ function CollectionTable({
 									size="icon"
 									className="size-9"
 									aria-label={`查看 ${item.title} 详情`}
+									disabled={disabled}
 									onClick={(event) => {
 										event.stopPropagation();
 										onOpen(item);
@@ -794,10 +806,12 @@ function CompactTask({
 function CompactRecordList({
 	items,
 	tab,
+	disabled = false,
 	onOpen,
 }: {
 	items: AdminCollectionRecordItem[];
 	tab: CollectionTab;
+	disabled?: boolean;
 	onOpen: (item: AdminCollectionRecordItem) => void;
 }) {
 	return (
@@ -806,7 +820,12 @@ function CompactRecordList({
 				<button
 					key={item.id}
 					type="button"
-					className="block w-full rounded-lg border p-4 text-left transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+					className={cn(
+						"block w-full rounded-lg border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+						disabled ? "cursor-default opacity-70" : "hover:bg-muted/50",
+					)}
+					disabled={disabled}
+					aria-disabled={disabled}
 					onClick={() => onOpen(item)}
 				>
 					<div className="flex items-start justify-between gap-3">
@@ -1641,7 +1660,7 @@ export function AiOperationsRecordsSection({
 							}}
 						/>
 					) : null}
-					{loading ? (
+					{loading && items.length === 0 ? (
 						<p className="text-muted-foreground py-8 text-sm">
 							正在加载记录...
 						</p>
@@ -1653,22 +1672,25 @@ export function AiOperationsRecordsSection({
 							onClear={clearFilters}
 						/>
 					) : null}
-					{!loading && !error && items.length > 0 ? (
+					{items.length > 0 ? (
 						<>
 							<CollectionTable
 								items={items}
 								tab={tab}
+								disabled={loading || Boolean(error)}
 								onOpen={(item) => onOpenRecord(item.kind, item.id)}
 							/>
 							<CompactRecordList
 								items={items}
 								tab={tab}
+								disabled={loading || Boolean(error)}
 								onOpen={(item) => onOpenRecord(item.kind, item.id)}
 							/>
 							<Paging
 								page={page}
 								total={total}
 								loading={loading}
+								disabled={Boolean(error)}
 								onPage={setPage}
 							/>
 						</>

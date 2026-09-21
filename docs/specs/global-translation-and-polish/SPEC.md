@@ -19,8 +19,8 @@
 - REQ-GTP-RETRY-COORDINATION: 对终态失败的授权重试必须由数据库唯一约束和事务串行化。工作项已在执行、排队或恢复时，服务端仍创建请求者关联，但返回 `409`、稳定错误码、当前工作项标识、当前状态、最近尝试状态和轮询地址；前端以该事实同步状态，而不将其显示为新的独立失败。
 - REQ-GTP-PROVIDER-GUARD: 持久化的提供方熔断与路由健康状态优先于人工重试。熔断打开时，授权请求仍创建请求者关联，但工作项保持或转入 `deferred_provider`；只有调度器拥有的受控探测可以恢复提供方调用，人工请求不得绕过熔断。
 - REQ-GTP-ADMIN-READS: 管理页和详情读取必须是纯读取，不得补覆盖范围、创建工作项、重试或写入缓存。它必须分别展示当前全局工作状态、当前结果投影和旧事实来源；只有旧缓存且没有全局工作或结果时显示 `legacy_cached`，旧工作与缓存无法一致解释时显示 `legacy_conflict`。不得以缓存回退伪造“已完成”“未开始”或尝试次数。
-- REQ-GTP-ADMIN-READ-BUDGET: 管理采集记录列表的查询窗最长三十一天，必须在数据库中以完全相同的筛选语义分别取得精确总数和当前页标识，并且只装载当前页的处理摘要。列表不得使用结果缓存、请求合并或内存全量分页；源站读取预算为五秒，同类并发读取容量耗尽时返回带 `Retry-After` 的 `503`。
-- REQ-GTP-ADMIN-ACTIVITY: 内容处理管理页的 Release、公告、通知、日报各 tab 必须提供独立的只读活动概览。活动窗固定为 UTC 当前整点及其之前连续十一个小时组成的半开区间，含当前未完整小时；以规范采集记录来源时间归桶，与列表筛选、分页无关。每条窗内规范记录必须表示为一个 cell，并提供标题、仓库（日报为空）、来源时间、适用 pipeline 的既有 `display_status` 和综合状态；摘要精确统计窗内内容总数、完成、处理中、异常，并提供中性数量。异常优先于处理中；无异常且至少一个适用 lane 排队或运行时为处理中；所有适用 lane 均为成功或不适用时为完成；其余为中性。活动读取不得补覆盖范围或派生处理事实，必须使用有界来源候选、既有管理员读取闸门及五秒预算；超限时完整失败，不得静默截断。
+- REQ-GTP-ADMIN-READ-BUDGET: 管理采集记录列表的查询窗最长三十一天，必须在数据库中以完全相同的筛选语义取得精确总数和当前页标识，并且只装载当前页的处理摘要。列表不得使用完成结果缓存或内存全量分页；同一规范化查询键的在途读取必须合并，不同查询键不得因应用内读取闸门互相拒绝。源站读取预算为五秒；超时返回带 `Retry-After` 的 `503`，不得返回部分数据。
+- REQ-GTP-ADMIN-ACTIVITY: 内容处理管理页的 Release、公告、通知、日报各 tab 必须提供独立的只读活动概览。活动窗固定为 UTC 当前整点及其之前连续十一个小时组成的半开区间，含当前未完整小时；以规范采集记录来源时间归桶，与列表筛选、分页无关。每条窗内规范记录必须表示为一个 cell，并提供标题、仓库（日报为空）、来源时间、适用 pipeline 的既有 `display_status` 和综合状态；摘要精确统计窗内内容总数、完成、处理中、异常，并提供中性数量。异常优先于处理中；无异常且至少一个适用 lane 排队或运行时为处理中；所有适用 lane 均为成功或不适用时为完成；其余为中性。活动读取不得补覆盖范围或派生处理事实，必须使用有界来源候选、独立的活动读取合并和五秒预算；超限时完整失败，不得静默截断。
 - REQ-GTP-LEGACY: 现有 `translation_work_items`、`translation_requests`、尝试事件和 `ai_translations` 行必须保留为只读历史事实；其中 `release_smart`、`announcement_smart` 等润色记录与翻译记录适用同一保留规则。迁移只能从其读取并记录可追溯的旧事实观察，绝不把旧缓存、旧状态或旧尝试合成为全局工作、全局结果或新的尝试历史。
 - REQ-GTP-CUTOVER: 全局模型必须经由单一写入者切换，不得长期双写。切换前必须停止旧写入路径并完成运行中旧批次的受控收口；切换后由全局调度器接收新的覆盖请求。转换期间内容处理请求返回带轮询信息的 `503`，而不是部分落入新旧两个模型。
 - REQ-GTP-COMPATIBILITY: 数据库演进必须使用扩展表、索引和控制记录。必须先发布含有该迁移且仍能安全运行旧行为的兼容版本，再发布不含新迁移的全局切换版本。兼容版本在检测到全局模式时禁用旧内容处理写入，允许降级后二进制继续打开数据库；不含该迁移版本的更旧应用不得作为回滚目标。
@@ -129,8 +129,8 @@
   image: ![Announcement retained smart projection](./assets/content-projection-retention-announcement-mobile.png)
 
 - source_type: storybook_canvas
-  story_id_or_title: Admin/AiOperationsRecordsSection/BusyReadState
-  state: desktop collection read busy state
+  story_id_or_title: Admin/AiOperationsRecordsSection/TimeoutRead
+  state: desktop collection read timeout state
   target_program: mock-only
   capture_scope: browser-viewport
   requested_viewport: 1072x488
@@ -139,12 +139,12 @@
   evidence_surface: component
   sensitive_exclusion: N/A (mock-only Storybook fixture)
   submission_gate: approved
-  evidence_note: 读取繁忙时使用与现有黑色“刷新记录”按钮协调的琥珀色告警块，错误区域不显示多余空白。
-  image: ![管理采集记录桌面端读取繁忙状态](./assets/busy-read-desktop.png)
+  evidence_note: 读取超时时使用与现有黑色“刷新记录”按钮协调的琥珀色告警块，错误区域不显示多余空白。
+  image: ![管理采集记录桌面端读取超时状态](./assets/timeout-read-desktop.png)
 
 - source_type: storybook_canvas
-  story_id_or_title: Admin/AiOperationsRecordsSection/BusyReadState
-  state: mobile collection read busy state
+  story_id_or_title: Admin/AiOperationsRecordsSection/TimeoutRead
+  state: mobile collection read timeout state
   target_program: mock-only
   capture_scope: browser-viewport
   requested_viewport: 361x792
@@ -154,7 +154,7 @@
   sensitive_exclusion: N/A (mock-only Storybook fixture)
   submission_gate: approved
   evidence_note: 移动宽度下告警内容、原有刷新按钮和保留筛选提示自然换行，无重叠或横向溢出。
-  image: ![管理采集记录移动端读取繁忙状态](./assets/busy-read-mobile.png)
+  image: ![管理采集记录移动端读取超时状态](./assets/timeout-read-mobile.png)
 
 - source_type: storybook_canvas
   target_program: mock-only
