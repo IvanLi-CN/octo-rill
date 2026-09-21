@@ -2494,13 +2494,11 @@ pub async fn admin_list_collection_records(
     let polish_filter = parse_status_filter(query.polish_status, "polish_status")?;
     let from = parse_timestamp(query.from, "from")?;
     let before = parse_timestamp(query.before, "before")?;
-    let requested_from = from.clone();
-    let requested_before = before.clone();
     let (from, before) = normalize_collection_window(from, before)?;
     let key = CollectionListKey {
         kind,
-        from: requested_from,
-        before: requested_before,
+        from: Some(from.clone()),
+        before: Some(before.clone()),
         attempts,
         translation_filter: translation_filter.clone().unwrap_or_default(),
         polish_filter: polish_filter.clone().unwrap_or_default(),
@@ -4032,7 +4030,9 @@ mod tests {
 
     #[tokio::test]
     async fn identical_collection_activity_reads_share_one_in_flight_execution() {
+        use std::future::Future;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::task::Poll;
 
         let key = CollectionActivityKey {
             kind: CollectionRecordKind::Release,
@@ -4077,6 +4077,13 @@ mod tests {
             })
             .await
         });
+        let mut second = Box::pin(second);
+        let second_joined = std::future::poll_fn(|context| match second.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(true),
+            Poll::Ready(_) => Poll::Ready(false),
+        })
+        .await;
+        assert!(second_joined, "second caller should join the active flight");
         release.notify_one();
 
         first
