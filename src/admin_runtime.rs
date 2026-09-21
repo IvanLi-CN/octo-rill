@@ -3,7 +3,7 @@ use std::env;
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveTime, Utc};
 use serde_json::Value;
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 
 use crate::{
     briefs,
@@ -1016,6 +1016,32 @@ pub async fn load_llm_models(pool: &SqlitePool) -> Result<Vec<String>> {
         .await?
         .map(|snapshot| snapshot.llm_models)
         .unwrap_or_default())
+}
+
+pub async fn load_llm_models_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    config: &AppConfig,
+) -> Result<Vec<String>> {
+    let settings_table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'admin_runtime_settings')",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if !settings_table_exists {
+        return Ok(default_llm_models(config));
+    }
+    let models = sqlx::query_scalar::<_, String>(
+        "SELECT llm_models_json FROM admin_runtime_settings WHERE id = 1",
+    )
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(|raw| parse_llm_models_json(&raw))
+    .unwrap_or_default();
+    Ok(if models.is_empty() {
+        default_llm_models(config)
+    } else {
+        models
+    })
 }
 
 pub async fn sync_persisted_runtime_settings(

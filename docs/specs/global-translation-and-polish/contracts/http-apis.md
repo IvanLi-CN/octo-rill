@@ -114,3 +114,19 @@ partial set of cells.
 ## Retry Authorization
 
 Any caller authorized to read the canonical resource may request retry of a terminal global failure. The service applies the same cooldown, lifecycle and access checks regardless of which authorized caller made the original request. `blocked_config` is not a terminal failure and is not manually retried; a relevant valid configuration update resumes it through the scheduler.
+
+## Identity Upgrade Operations
+
+The admin-only `GET /api/admin/jobs/content-processing/identity-upgrade` returns the migration-free identity upgrade generation, status, phase, last safe error code, timestamps, per-phase processed/total/completed counters, blocked-identity count and pending search-index refresh flag. It does not expose work payloads, credentials or model-call diagnostics.
+
+The admin-only `POST` endpoint accepts one of:
+
+```json
+{ "action": "pause" }
+```
+
+```json
+{ "action": "resume" }
+```
+
+Pause takes effect between committed SQLite batches. Resume continues from the persisted phase cursor; failed upgrades can also resume after an operator has addressed the cause. Actions outside the applicable state return `409 content_identity_upgrade_state_conflict`. The endpoint does not alter `content_processing_control` or enable/disable global content processing.

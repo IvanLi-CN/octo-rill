@@ -409,6 +409,45 @@ impl LlmScheduler {
         cooled.into_iter().take(1).map(|(model, _)| model).collect()
     }
 
+    pub async fn route_candidates_for_models(&self, ordered_snapshot: &[String]) -> Vec<String> {
+        let routing = self.routing.read().await;
+        let now = Utc::now();
+        let ordered_models = effective_routing_models(ordered_snapshot, None);
+        let mut ready = Vec::new();
+        let mut cooled = Vec::new();
+        for model in ordered_models {
+            let cooldown_until =
+                health_for_model(&routing.health, &model).and_then(|entry| entry.cooldown_until);
+            if cooldown_until.is_none_or(|until| until <= now) {
+                ready.push(model);
+            } else if let Some(until) = cooldown_until {
+                cooled.push((model, until));
+            }
+        }
+        if !ready.is_empty() {
+            return ready;
+        }
+        cooled.sort_by_key(|(_, until)| *until);
+        cooled.into_iter().take(1).map(|(model, _)| model).collect()
+    }
+
+    pub async fn all_routes_cooldown_until(&self, ordered_snapshot: &[String]) -> Option<String> {
+        let routing = self.routing.read().await;
+        let now = Utc::now();
+        let ordered_models = effective_routing_models(ordered_snapshot, None);
+        if ordered_models.is_empty() {
+            return None;
+        }
+        let mut cooldowns = Vec::with_capacity(ordered_models.len());
+        for model in &ordered_models {
+            let cooldown_until = health_for_model(&routing.health, model)
+                .and_then(|entry| entry.cooldown_until.filter(|until| *until > now));
+            let cooldown_until = cooldown_until?;
+            cooldowns.push(cooldown_until);
+        }
+        cooldowns.into_iter().min().map(|until| until.to_rfc3339())
+    }
+
     pub async fn record_model_success(&self, model: &str) {
         let normalized = normalize_model_name(model);
         if normalized.is_empty() {
@@ -2816,19 +2855,40 @@ pub async fn chat_completion_with_diagnostics(
     user: &str,
     max_tokens: u32,
 ) -> Result<ChatCompletionDiagnostic> {
+    chat_completion_with_diagnostics_for_route(state, system, user, max_tokens, None).await
+}
+
+pub async fn chat_completion_with_diagnostics_for_route(
+    state: &AppState,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    route_snapshot: Option<&[String]>,
+) -> Result<ChatCompletionDiagnostic> {
     let Some(base_ai) = state.config.ai.clone() else {
         return Err(anyhow::Error::new(LlmCallFailure {
             class: LlmFailureClass::Configuration,
             call_id: None,
         }));
     };
-    let selected_model = select_model_for_new_calls(state).await;
-    let mut candidates = state
-        .llm_scheduler
-        .route_candidates(Some(base_ai.model.as_str()))
-        .await;
-    if candidates.is_empty() && !selected_model.model.trim().is_empty() {
-        candidates.push(selected_model.model.clone());
+    let mut candidates = if let Some(route_snapshot) = route_snapshot {
+        state
+            .llm_scheduler
+            .route_candidates_for_models(route_snapshot)
+            .await
+    } else {
+        state
+            .llm_scheduler
+            .route_candidates(Some(base_ai.model.as_str()))
+            .await
+    };
+    if candidates.is_empty()
+        && let Some(model) = route_snapshot
+            .and_then(|models| models.first())
+            .map(String::as_str)
+            .filter(|model| !model.trim().is_empty())
+    {
+        candidates.push(model.to_owned());
     }
     if candidates.is_empty() {
         return Err(anyhow::Error::new(LlmCallFailure {

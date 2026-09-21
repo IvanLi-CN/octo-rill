@@ -40,8 +40,9 @@ use crate::runtime::SQLITE_BUSY_TIMEOUT;
 use crate::session_store::CoordinatedSqliteSessionStore;
 use crate::state::AppState;
 use crate::{
-    admin_ai_records, admin_runtime, ai, api, auth, config::AppConfig, content_processing, jobs,
-    observability, runtime, search_index, state, sync, translations, version, webhook_push,
+    admin_ai_records, admin_runtime, ai, api, auth, config::AppConfig, content_identity_upgrade,
+    content_processing, jobs, observability, runtime, search_index, state, sync, translations,
+    version, webhook_push,
 };
 
 const SESSION_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
@@ -168,6 +169,9 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .llm_scheduler
         .set_model_health(admin_runtime::load_llm_model_health(&pool).await?)
         .await;
+    content_processing::on_runtime_configuration_reload(app_state.as_ref())
+        .await
+        .context("failed to recover blocked content work on runtime configuration load")?;
 
     let addr: SocketAddr = config.bind_addr;
     let listener = tokio::net::TcpListener::bind(addr)
@@ -365,6 +369,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route(
             "/admin/jobs/content-processing/freeze",
             post(content_processing::admin_freeze),
+        )
+        .route(
+            "/admin/jobs/content-processing/identity-upgrade",
+            get(content_identity_upgrade::admin_get_status)
+                .post(content_identity_upgrade::admin_control),
         )
         .route(
             "/admin/jobs/translations/requests",
@@ -577,6 +586,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         translations::spawn_translation_scheduler(app_state.clone()).await;
         let global_content_processing_abort_handle =
             content_processing::spawn_global_scheduler(app_state.clone());
+        let content_identity_upgrade_abort_handle =
+            content_identity_upgrade::spawn_worker(app_state.clone());
         let translation_recovery_abort_handle =
             translations::spawn_translation_recovery_task(app_state.clone());
 
@@ -591,6 +602,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             repo_release_recovery_abort_handle,
             translation_recovery_abort_handle,
             global_content_processing_abort_handle,
+            content_identity_upgrade_abort_handle,
             search_index_abort_handle,
         ];
         if let Some(handle) = model_catalog_abort_handle {

@@ -1,4 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, within } from "storybook/test";
 
 import type { DashboardScope } from "@/dashboard/routeState";
@@ -11,6 +12,15 @@ const STORYBOOK_VIEWER: FeedViewer = {
 	avatar_url: "https://github.com/story-viewer.png?size=96",
 	html_url: "https://github.com/story-viewer",
 };
+
+const FEED_ITEM_VIEWPORTS = {
+	...INITIAL_VIEWPORTS,
+	feedItemMobile393: {
+		name: "Feed item mobile 393x852",
+		styles: { width: "393px", height: "852px" },
+		type: "mobile",
+	},
+} as const;
 
 function buildAnnouncementItem(
 	overrides?: Partial<AnnouncementFeedItem>,
@@ -82,8 +92,11 @@ function FeedItemCardPreview(props: {
 	} = props;
 
 	return (
-		<div className="bg-background min-h-screen px-4 py-8">
-			<div className="mx-auto max-w-3xl">
+		<div
+			className="bg-background mx-auto w-full max-w-[816px] px-6 py-8"
+			data-visual-evidence-surface
+		>
+			<div className="w-full max-w-3xl" data-visual-evidence-target>
 				<FeedItemCard
 					item={item}
 					currentViewer={STORYBOOK_VIEWER}
@@ -109,8 +122,10 @@ function FeedItemCardPreview(props: {
 const meta = {
 	title: "Feed/FeedItemCard",
 	component: FeedItemCardPreview,
+	tags: ["autodocs", "feed-blocked-config"],
 	parameters: {
 		layout: "fullscreen",
+		viewport: { options: FEED_ITEM_VIEWPORTS },
 		docs: {
 			description: {
 				component:
@@ -190,6 +205,84 @@ export const AnnouncementTranslatedError: Story = {
 		await expect(
 			canvas.getByRole("button", { name: "重试翻译" }),
 		).toBeVisible();
+	},
+};
+
+export const AnnouncementTranslatedBlockedConfig: Story = {
+	render: () => (
+		<FeedItemCardPreview
+			activeLane="translated"
+			item={buildAnnouncementItem({
+				translated: {
+					lang: "zh-CN",
+					status: "blocked_config",
+					title: "保留的译文标题",
+					summary: "已有有效译文仍然可读。",
+					error_code: "configuration",
+				},
+			})}
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"模型配置恢复前显示可恢复等待状态；已发布的匹配源版本译文继续可读，且不提供手动重试。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByText("等待模型配置恢复，恢复后会自动继续", {
+				exact: true,
+			}),
+		).toBeVisible();
+		await expect(canvas.getByText("已有有效译文仍然可读。")).toBeVisible();
+		expect(canvas.queryByRole("button", { name: "重试翻译" })).toBeNull();
+	},
+};
+
+export const AnnouncementSmartBlockedConfig: Story = {
+	globals: {
+		viewport: {
+			value: "feedItemMobile393",
+			isRotated: false,
+		},
+	},
+	render: () => (
+		<FeedItemCardPreview
+			activeLane="smart"
+			item={buildAnnouncementItem({
+				smart: {
+					lang: "zh-CN",
+					status: "blocked_config",
+					title: null,
+					summary: null,
+					error_code: "configuration",
+				},
+			})}
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"润色等待模型配置期间继续显示原文，并由原请求轮询状态；不显示失败或重试入口。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByText("等待模型配置恢复，恢复后会自动继续", {
+				exact: true,
+			}),
+		).toBeVisible();
+		await expect(
+			canvas.getByText("公告卡与 release 卡共享原文 / 翻译 / 润色三 lane"),
+		).toBeVisible();
+		expect(canvas.queryByRole("button", { name: "立即润色" })).toBeNull();
 	},
 };
 
