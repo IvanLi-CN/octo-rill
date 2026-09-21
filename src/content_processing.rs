@@ -2851,7 +2851,6 @@ mod tests {
             translation_scheduler: Arc::new(TranslationSchedulerController::new(
                 TranslationRuntimeConfig::default(),
             )),
-            admin_collection_read_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             runtime_owner_id: "content-processing-test-owner".to_owned(),
         })
     }

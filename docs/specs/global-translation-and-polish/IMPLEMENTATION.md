@@ -83,13 +83,15 @@ Feed 翻译与润色 hook 将 `blocked_config` 保持为原请求的 pending 状
 
 Release、公告、通知和日报的管理列表都先在 SQLite 中构造规范来源、旧事实／全局处理状态和筛选候选集，再精确计算总数并只读取当前页 ID。通知按 `updated_at DESC, id DESC` 选取每个 `thread_id` 的唯一来源；不存在可靠的首次发现时间时仍返回 `NULL`。
 
-列表请求把缺省或单边时间条件归一化为不超过 31 天的 UTC 窗口，完整读取（模式读取、候选查询、总数、当前页装载和摘要投影）共享一个容量为一的进程内闸门和五秒预算。闸门繁忙或读取超时分别返回 `admin_collection_records_busy`／`admin_collection_records_timeout`、HTTP 503 和 `Retry-After: 1`；超时会先取消并等待 SQL 任务清理，再释放许可。
+列表请求把缺省或单边时间条件归一化为不超过 31 天的 UTC 窗口，先物化窗口内来源候选，再限制处理状态聚合到候选 ID；当前页通过窗口总数取得精确匹配总数，越界空页才回退到计数查询。相同规范化查询键的在途读取由 keyed singleflight 合并，不缓存完成结果；五秒监督超时返回 `admin_collection_records_timeout`、HTTP 503 和 `Retry-After: 1`，不返回部分数据。
+
+生产形状合成 fixture 的 `24h`、`7d`、`30d` 列表预算验证覆盖 Release、公告、通知和日报；testbox 上最慢的 p95/p99 分别为日报 `111/111ms`、Release `94/94ms`、公告 `47/47ms`、通知 `46/46ms`，均低于 1s/2s 门槛。fixture 包含 100,000 条源行，其中大多数位于窗口之外，以验证来源候选先限界而非对全历史处理集合做分页。
 
 管理端客户端在切换种类、筛选或页码时取消失效请求，不自动重试；上述 503 显示既有页面内的人工刷新提示。线上形状副本验证了两项索引被选用，四类 31 天读取的三十次预热后测量均满足 p95 1 秒、p99 2 秒和单次 5 秒预算。
 
 ## Admin Collection Activity
 
-Release、公告、通知和日报活动读取在服务端按固定 UTC 十二小时半开窗先构造规范来源候选，再将 global、legacy、coverage 或 brief LLM 状态限制到这些候选。公告沿用 discussion 的 `MAX(occurred_at)` 聚合与全历史 canonical 校验；通知使用 `updated_at DESC, id DESC`；摘要计数由响应中的完整 cells 计算。活动 GET 复用列表的单许可、五秒监督器与 503 语义。
+Release、公告、通知和日报活动读取在服务端按固定 UTC 十二小时半开窗先构造规范来源候选，再将 global、legacy、coverage 或 brief LLM 状态限制到这些候选。公告沿用 discussion 的 `MAX(occurred_at)` 聚合与全历史 canonical 校验；通知使用 `updated_at DESC, id DESC`；摘要计数由响应中的完整 cells 计算。活动 GET 使用独立的 keyed singleflight 和五秒监督器，与列表读取互不阻塞。
 
 迁移 `0085` 在 Release、公告、通知、日报来源时间及日报最新 LLM call 上新增索引。100,000 条/类的无内容合成数据库副本上，EXPLAIN 确认了四类来源时间索引、公告 canonical 索引、通知 canonical 索引和日报最新 call 索引；每类预热后测 30 次。窗口返回数分别为 5,000、2,500、2,500、5,000；p95 为 894ms、456ms、251ms、384ms，p99 为 909ms、456ms、259ms、402ms，最大值为 909ms，均在读取预算内。每次采样均断言窗口返回数，完整命令和执行逻辑由忽略的 `admin_collection_activity_production_shape_budget` 测试承载。
 

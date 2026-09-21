@@ -502,7 +502,7 @@ export const ExpiredDiagnosticEvidence: Story = {
 	],
 };
 
-export const BusyRead: Story = {
+export const TimeoutRead: Story = {
 	tags: ["admin-collection-read-budget"],
 	args: {
 		detailRoute: null,
@@ -529,8 +529,8 @@ export const BusyRead: Story = {
 						JSON.stringify({
 							ok: false,
 							error: {
-								code: "admin_collection_records_busy",
-								message: "admin collection records are temporarily busy",
+								code: "admin_collection_records_timeout",
+								message: "admin collection records read timed out",
 							},
 						}),
 						{ status: 503, headers: { "content-type": "application/json" } },
@@ -541,8 +541,8 @@ export const BusyRead: Story = {
 						JSON.stringify({
 							ok: false,
 							error: {
-								code: "admin_collection_records_busy",
-								message: "admin collection records are temporarily busy",
+								code: "admin_collection_records_timeout",
+								message: "admin collection records read timed out",
 							},
 						}),
 						{ status: 503, headers: { "content-type": "application/json" } },
