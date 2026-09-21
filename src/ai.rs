@@ -2871,6 +2871,25 @@ pub async fn chat_completion_with_diagnostics_for_route(
             call_id: None,
         }));
     };
+    chat_completion_with_diagnostics_for_config_and_route(
+        state,
+        &base_ai,
+        system,
+        user,
+        max_tokens,
+        route_snapshot,
+    )
+    .await
+}
+
+pub async fn chat_completion_with_diagnostics_for_config_and_route(
+    state: &AppState,
+    base_ai: &AiConfig,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    route_snapshot: Option<&[String]>,
+) -> Result<ChatCompletionDiagnostic> {
     let mut candidates = if let Some(route_snapshot) = route_snapshot {
         state
             .llm_scheduler
