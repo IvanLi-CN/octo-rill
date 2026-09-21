@@ -27,7 +27,7 @@
 - VER-RUST-SCHEDULER: 覆盖: REQ-SCHEDULER, REQ-ATTEMPT-AUDIT。通过 Rust 单元与集成测试验证队列、单一 Release 润色所有者、批次、自动恢复、手动重试、精确调用归因和追加式事件写入。
 - VER-ADMIN-API: 覆盖: REQ-ATTEMPT-AUDIT, REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过管理员 API 测试验证时间筛选、分页、任务摘要、尝试历史、安全错误字段与诊断载荷过期语义。
 - VER-WEB-ADMIN: 覆盖: REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过 Web 构建、Playwright 回归与 Storybook canvas 视觉证据验证分组列表、桌面抽屉、移动详情路由、模型调用与输出契约的双状态，以及尝试列表直接可见的模型、错误和重入队状态。
-- REQ-COLLECTION-READ-PLAN: 采集记录检索窗口最大为三十一天。服务端必须先按窗口和排序边界限界源记录候选集，再聚合处理状态并水合当前页；不得为了当前页或精确匹配总数扫描无界的处理工作集合。
+- REQ-COLLECTION-READ-PLAN: 采集记录检索窗口最大为三十一天。服务端必须先按各类型的规范来源时间和窗口边界选择唯一来源记录，再以来源时间表达式索引限界候选集，随后只为候选记录聚合处理状态并水合当前页；公告同时间来源使用稳定的唯一 tie-break。不得为了当前页或精确匹配总数扫描无界的处理工作集合。
 - REQ-COLLECTION-READ-CONSISTENCY: 精确匹配总数、当前页源记录和处理摘要必须来自同一个短只读 SQLite 快照。该快照不得持有 SQLite writer permit，也不得改变既有页码分页或响应形状。
 - REQ-COLLECTION-READ-AVAILABILITY: 相同采集记录查询键的并发读取必须合并为一次执行；新筛选请求必须使旧筛选读取失效。列表与活动图读取必须隔离，正常管理端操作不得因应用内读取并发返回 `admin_collection_records_busy`。
 - REQ-COLLECTION-READ-FAILURE: 首次读取可以阻塞等待结果；后续刷新必须保留最后成功列表并使旧行不可操作。安全超时仅作为异常保护，失败时不得自动重试，管理员必须通过显式刷新重新读取。
