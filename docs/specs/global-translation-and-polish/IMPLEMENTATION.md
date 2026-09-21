@@ -89,6 +89,8 @@ Release、公告、通知和日报的管理列表都先在 SQLite 中构造规�
 
 管理端客户端在切换种类、筛选或页码时取消失效请求，不自动重试；上述 503 显示既有页面内的人工刷新提示。线上形状副本验证了两项索引被选用，四类 31 天读取的三十次预热后测量均满足 p95 1 秒、p99 2 秒和单次 5 秒预算。
 
+列表 keyed singleflight 使用规范化查询条件的稳定语义键：默认滚动窗口保留 `(from=None, before=None)` 标记，显式起点到当前和固定窗口分别保留可复现的边界；实际读取仍使用本次请求计算出的 31 天窗口。完成、超时或 panic 后先释放键再通知等待者，不缓存已完成结果。
+
 ## Admin Collection Activity
 
 Release、公告、通知和日报活动读取在服务端按固定 UTC 十二小时半开窗先构造规范来源候选，再将 global、legacy、coverage 或 brief LLM 状态限制到这些候选。公告按 discussion 选择全历史最新 `occurred_at` 行，同时间以 rowid 稳定去重；窗口候选通过 canonical 索引验证后才水合源字段。通知使用 `updated_at DESC, id DESC`；摘要计数由响应中的完整 cells 计算。活动 GET 使用独立的 keyed singleflight 和五秒监督器，与列表读取互不阻塞。
