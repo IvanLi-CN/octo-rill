@@ -3345,6 +3345,37 @@ mod tests {
             .unwrap();
     }
 
+    async fn assert_retryable_failure(pool: &SqlitePool, work_id: &str, attempt_no: i64) {
+        let (status, failure_class, work_next_retry, lease_owner): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, failure_class, next_retry_at, lease_owner FROM content_work_items WHERE id = ?",
+        )
+        .bind(work_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let (error_code, retry_eligible, event_next_retry): (Option<String>, i64, Option<String>) =
+            sqlx::query_as(
+                "SELECT error_code, retry_eligible, next_retry_at FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_completed'",
+            )
+            .bind(work_id)
+            .bind(attempt_no)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+        assert_eq!(status, "failed");
+        assert_eq!(failure_class.as_deref(), error_code.as_deref());
+        assert!(work_next_retry.is_some());
+        assert_eq!(work_next_retry, event_next_retry);
+        assert_eq!(lease_owner, None);
+        assert_eq!(retry_eligible, 1);
+    }
+
     async fn insert_test_work(
         pool: &SqlitePool,
         id: &str,
@@ -3577,6 +3608,7 @@ mod tests {
         assert_eq!(status, "failed");
         assert_eq!(failure_class, "output_contract_invalid");
         assert_eq!(error_code, "output_contract_invalid");
+        assert_retryable_failure(&pool, "unknown-wrapper-work", attempt_no).await;
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM content_result_projections WHERE work_item_id = 'unknown-wrapper-work'",
@@ -3701,6 +3733,7 @@ mod tests {
         assert_eq!(status, "failed");
         assert_eq!(failure_class, "output_truncated");
         assert_eq!(error_code, "output_truncated");
+        assert_retryable_failure(&pool, "length-failure-work", attempt_no).await;
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM content_attempt_llm_calls WHERE attempt_event_id = (SELECT id FROM content_attempt_events WHERE work_item_id = 'length-failure-work' AND attempt_no = ? AND event_type = 'attempt_started')",
