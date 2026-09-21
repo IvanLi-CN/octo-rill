@@ -13,7 +13,7 @@ use axum::{
 };
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Timelike, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, Sqlite, SqlitePool};
+use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 use tower_sessions::Session;
 
 use crate::{
@@ -541,6 +541,15 @@ async fn load_processing_coverage(
     kind: CollectionRecordKind,
     record_ids: &[String],
 ) -> Result<HashMap<(String, String), String>, ApiError> {
+    let mut connection = pool.acquire().await.map_err(ApiError::internal)?;
+    load_processing_coverage_in_connection(&mut connection, kind, record_ids).await
+}
+
+async fn load_processing_coverage_in_connection(
+    connection: &mut SqliteConnection,
+    kind: CollectionRecordKind,
+    record_ids: &[String],
+) -> Result<HashMap<(String, String), String>, ApiError> {
     if record_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -556,7 +565,7 @@ async fn load_processing_coverage(
     query.push(")");
     let rows = query
         .build_query_as::<ProcessingCoverageRow>()
-        .fetch_all(pool)
+        .fetch_all(&mut *connection)
         .await
         .map_err(ApiError::internal)?;
     Ok(rows
@@ -738,8 +747,8 @@ fn missing_table(error: &sqlx::Error) -> bool {
     matches!(error, sqlx::Error::Database(database) if database.message().contains("no such table"))
 }
 
-async fn load_global_task_rows(
-    state: &AppState,
+async fn load_global_task_rows_in_connection(
+    connection: &mut SqliteConnection,
     kind: CollectionRecordKind,
     entity_ids: &[String],
 ) -> Result<Vec<GlobalTaskRow>, ApiError> {
@@ -779,7 +788,7 @@ async fn load_global_task_rows(
     query.push(" ORDER BY julianday(w.created_at) DESC, w.created_at DESC, CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'ready' THEN 4 WHEN 'failed' THEN 5 WHEN 'superseded' THEN 9 ELSE 6 END, CASE WHEN w.pipeline = 'translation' AND w.variant = 'detail' THEN 0 ELSE 1 END, julianday(w.updated_at) DESC, w.updated_at DESC, w.id DESC");
     let rows = match query
         .build_query_as::<GlobalTaskRow>()
-        .fetch_all(&state.pool)
+        .fetch_all(&mut *connection)
         .await
     {
         Ok(rows) => rows,
@@ -842,8 +851,8 @@ fn compare_attempt_timestamps(left: &str, right: &str) -> Ordering {
     }
 }
 
-async fn load_legacy_observations(
-    state: &AppState,
+async fn load_legacy_observations_in_connection(
+    connection: &mut SqliteConnection,
     kind: CollectionRecordKind,
     entity_ids: &[String],
 ) -> Result<HashMap<(String, String), AdminContentProcessingEvidence>, ApiError> {
@@ -874,7 +883,7 @@ async fn load_legacy_observations(
     }
     let rows = match query
         .build_query_as::<LegacyObservationRow>()
-        .fetch_all(&state.pool)
+        .fetch_all(&mut *connection)
         .await
     {
         Ok(rows) => rows,
@@ -991,6 +1000,18 @@ async fn load_task_summaries(
     coverage: &HashMap<(String, String), String>,
     global_mode: bool,
 ) -> Result<HashMap<String, TaskSummaries>, ApiError> {
+    let mut connection = state.pool.acquire().await.map_err(ApiError::internal)?;
+    load_task_summaries_in_connection(&mut connection, kind, entity_ids, coverage, global_mode)
+        .await
+}
+
+async fn load_task_summaries_in_connection(
+    connection: &mut SqliteConnection,
+    kind: CollectionRecordKind,
+    entity_ids: &[String],
+    coverage: &HashMap<(String, String), String>,
+    global_mode: bool,
+) -> Result<HashMap<String, TaskSummaries>, ApiError> {
     let Some((translation_kind, polish_kind)) = kind.task_kinds() else {
         return Ok(HashMap::new());
     };
@@ -1018,11 +1039,11 @@ async fn load_task_summaries(
         query.push(")");
         query
             .build_query_as::<TaskWithEntityRow>()
-            .fetch_all(&state.pool)
+            .fetch_all(&mut *connection)
             .await
             .map_err(ApiError::internal)?
     };
-    let global_rows = load_global_task_rows(state, kind, entity_ids).await?;
+    let global_rows = load_global_task_rows_in_connection(connection, kind, entity_ids).await?;
     let global_by_key = global_rows.iter().fold(HashMap::new(), |mut by_key, row| {
         let pipeline = if row.pipeline == "polishing" {
             "polish"
@@ -1034,7 +1055,8 @@ async fn load_task_summaries(
             .or_insert(row);
         by_key
     });
-    let legacy_observations = load_legacy_observations(state, kind, entity_ids).await?;
+    let legacy_observations =
+        load_legacy_observations_in_connection(connection, kind, entity_ids).await?;
     let mut grouped = HashMap::<String, (Vec<TaskRow>, Vec<TaskRow>)>::new();
     for row in rows {
         let entry = grouped.entry(row.entity_id).or_default();
@@ -1108,6 +1130,15 @@ async fn load_brief_summaries(
     brief_ids: &[String],
     coverage: &HashMap<(String, String), String>,
 ) -> Result<HashMap<String, AdminCollectionTaskSummary>, ApiError> {
+    let mut connection = state.pool.acquire().await.map_err(ApiError::internal)?;
+    load_brief_summaries_in_connection(&mut connection, brief_ids, coverage).await
+}
+
+async fn load_brief_summaries_in_connection(
+    connection: &mut SqliteConnection,
+    brief_ids: &[String],
+    coverage: &HashMap<(String, String), String>,
+) -> Result<HashMap<String, AdminCollectionTaskSummary>, ApiError> {
     if brief_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -1129,7 +1160,7 @@ async fn load_brief_summaries(
     }
     let rows = query
         .build_query_as::<BriefCallWithParentRow>()
-        .fetch_all(&state.pool)
+        .fetch_all(&mut *connection)
         .await
         .map_err(ApiError::internal)?;
     let mut grouped = HashMap::<String, Vec<BriefCallRow>>::new();
@@ -1272,7 +1303,6 @@ fn source_records_sql(kind: CollectionRecordKind) -> String {
                 WHERE e.kind = 'announcement'
                   AND e.repo_full_name IS NOT NULL
                   AND e.discussion_number IS NOT NULL
-                  /*ANNOUNCEMENT_WINDOW*/
                 GROUP BY lower(e.repo_full_name), e.discussion_number
             )"
         .to_owned(),
@@ -1286,7 +1316,7 @@ fn source_records_sql(kind: CollectionRecordKind) -> String {
                     NULL AS detected_at,
                     NULL AS generated_at
                 FROM notifications n
-                WHERE 1 = 1 /*NOTIFICATION_WINDOW*/
+                WHERE 1 = 1
                   AND NOT EXISTS (
                     SELECT 1
                     FROM notifications newer
@@ -1747,41 +1777,7 @@ fn collection_query_sql(
 ) -> (String, Vec<CollectionQueryBind>) {
     let mut binds = Vec::new();
     let mut sql = String::from("WITH ");
-    let mut source_sql = source_records_sql(kind);
-    if kind == CollectionRecordKind::Announcement {
-        let mut window = String::new();
-        if from.is_some() {
-            window.push_str(" AND julianday(e.occurred_at) >= julianday(?)");
-            binds.push(CollectionQueryBind::Text(
-                from.unwrap_or_default().to_owned(),
-            ));
-        }
-        if before.is_some() {
-            window.push_str(" AND julianday(e.occurred_at) < julianday(?)");
-            binds.push(CollectionQueryBind::Text(
-                before.unwrap_or_default().to_owned(),
-            ));
-        }
-        source_sql = source_sql.replace("/*ANNOUNCEMENT_WINDOW*/", &window);
-    } else if kind == CollectionRecordKind::Notification {
-        let mut window = String::new();
-        if from.is_some() {
-            window.push_str(" AND julianday(n.updated_at) >= julianday(?)");
-            binds.push(CollectionQueryBind::Text(
-                from.unwrap_or_default().to_owned(),
-            ));
-        }
-        if before.is_some() {
-            window.push_str(" AND julianday(n.updated_at) < julianday(?)");
-            binds.push(CollectionQueryBind::Text(
-                before.unwrap_or_default().to_owned(),
-            ));
-        }
-        source_sql = source_sql.replace("/*NOTIFICATION_WINDOW*/", &window);
-    } else {
-        source_sql = source_sql.replace("/*ANNOUNCEMENT_WINDOW*/", "");
-        source_sql = source_sql.replace("/*NOTIFICATION_WINDOW*/", "");
-    }
+    let source_sql = source_records_sql(kind);
     sql.push_str(&source_sql);
     sql.push_str(", source_records AS MATERIALIZED (SELECT * FROM raw_source_records WHERE 1 = 1");
     if let Some(value) = from {
@@ -1944,6 +1940,8 @@ fn collection_query_sql(
                     FROM content_work_items w
                     JOIN source_records s ON s.id = w.canonical_resource_id
                     WHERE canonical_resource_type = '{resource_type}'
+                      AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
+                        OR (w.pipeline = 'polishing' AND w.variant = 'smart'))
                     GROUP BY canonical_resource_id
                 ),
                 status_projection AS (
@@ -2055,8 +2053,8 @@ fn collection_query_sql(
     (sql, binds)
 }
 
-async fn execute_collection_query<T>(
-    pool: &SqlitePool,
+async fn execute_collection_query_in_connection<T>(
+    connection: &mut SqliteConnection,
     sql: &str,
     binds: &[CollectionQueryBind],
 ) -> Result<Vec<T>, ApiError>
@@ -2070,11 +2068,14 @@ where
             CollectionQueryBind::Integer(value) => query.bind(*value),
         };
     }
-    query.fetch_all(pool).await.map_err(ApiError::internal)
+    query
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(ApiError::internal)
 }
 
-async fn execute_collection_scalar(
-    pool: &SqlitePool,
+async fn execute_collection_scalar_in_connection(
+    connection: &mut SqliteConnection,
     sql: &str,
     binds: &[CollectionQueryBind],
 ) -> Result<i64, ApiError> {
@@ -2085,12 +2086,45 @@ async fn execute_collection_scalar(
             CollectionQueryBind::Integer(value) => query.bind(*value),
         };
     }
-    query.fetch_one(pool).await.map_err(ApiError::internal)
+    query
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(ApiError::internal)
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn list_collection_page(
     pool: &SqlitePool,
+    kind: CollectionRecordKind,
+    global_mode: bool,
+    from: Option<&str>,
+    before: Option<&str>,
+    attempts: AttemptCountRange,
+    translation_filter: Option<&[String]>,
+    polish_filter: Option<&[String]>,
+    page_size: i64,
+    offset: i64,
+) -> Result<(i64, Vec<SourceRecordRow>), ApiError> {
+    let mut connection = pool.acquire().await.map_err(ApiError::internal)?;
+    list_collection_page_in_connection(
+        &mut connection,
+        kind,
+        global_mode,
+        from,
+        before,
+        attempts,
+        translation_filter,
+        polish_filter,
+        page_size,
+        offset,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn list_collection_page_in_connection(
+    connection: &mut SqliteConnection,
     kind: CollectionRecordKind,
     global_mode: bool,
     from: Option<&str>,
@@ -2111,7 +2145,12 @@ async fn list_collection_page(
         polish_filter,
         Some((page_size, offset)),
     );
-    let rows = execute_collection_query::<SourceRecordRow>(pool, &page_sql, &page_binds).await?;
+    let rows = execute_collection_query_in_connection::<SourceRecordRow>(
+        connection,
+        &page_sql,
+        &page_binds,
+    )
+    .await?;
     let total = if let Some(row) = rows.first() {
         row.total_count
     } else {
@@ -2126,7 +2165,7 @@ async fn list_collection_page(
             None,
         );
         let count_sql = format!("{count_sql} SELECT COUNT(*) FROM filtered_records");
-        execute_collection_scalar(pool, &count_sql, &count_binds).await?
+        execute_collection_scalar_in_connection(connection, &count_sql, &count_binds).await?
     };
     Ok((total, rows))
 }
@@ -2403,12 +2442,13 @@ pub async fn admin_list_collection_records(
     };
     let read_state = state.clone();
     let read = async move {
-        let global_mode = content_processing::current_mode(&read_state.pool)
+        let mut transaction = read_state.pool.begin().await.map_err(ApiError::internal)?;
+        let legacy_mode = content_processing::legacy_mode_in_transaction(&mut transaction)
             .await
-            .map_err(ApiError::internal)?
-            == content_processing::ContentProcessingMode::Global;
-        let (total, rows) = list_collection_page(
-            &read_state.pool,
+            .map_err(ApiError::internal)?;
+        let global_mode = !legacy_mode;
+        let (total, rows) = list_collection_page_in_connection(
+            &mut transaction,
             kind,
             global_mode,
             Some(&from),
@@ -2421,11 +2461,12 @@ pub async fn admin_list_collection_records(
         )
         .await?;
         let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
-        let coverage = load_processing_coverage(&read_state.pool, kind, &ids).await?;
+        let coverage = load_processing_coverage_in_connection(&mut transaction, kind, &ids).await?;
         let task_summaries =
-            load_task_summaries(read_state.as_ref(), kind, &ids, &coverage, global_mode).await?;
+            load_task_summaries_in_connection(&mut transaction, kind, &ids, &coverage, global_mode)
+                .await?;
         let brief_summaries = if kind == CollectionRecordKind::Brief {
-            load_brief_summaries(read_state.as_ref(), &ids, &coverage).await?
+            load_brief_summaries_in_connection(&mut transaction, &ids, &coverage).await?
         } else {
             HashMap::new()
         };
@@ -2433,12 +2474,14 @@ pub async fn admin_list_collection_records(
             .into_iter()
             .map(|row| source_record_item(kind, row, &task_summaries, &brief_summaries))
             .collect::<Vec<_>>();
-        Ok::<_, ApiError>(AdminCollectionRecordsResponse {
+        let response = AdminCollectionRecordsResponse {
             items,
             page,
             page_size,
             total,
-        })
+        };
+        transaction.commit().await.map_err(ApiError::internal)?;
+        Ok::<_, ApiError>(response)
     };
     Ok(Json(run_collection_list_singleflight(key, read).await?))
 }
@@ -3383,6 +3426,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn announcement_window_filters_after_canonicalization() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE social_activity_events (repo_full_name TEXT, discussion_number INTEGER, title TEXT, occurred_at TEXT, detected_at TEXT, kind TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create social events");
+        sqlx::query(
+            "INSERT INTO social_activity_events (repo_full_name, discussion_number, title, occurred_at, kind) VALUES ('octo/demo', 42, '旧公告', '2026-07-08T09:00:00Z', 'announcement'), ('octo/demo', 42, '新公告', '2026-07-08T10:01:00Z', 'announcement')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed announcement history");
+        sqlx::query(
+            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, entity_id TEXT, kind TEXT, status TEXT, result_status TEXT, attempt_count INTEGER, updated_at TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create announcement work items");
+        sqlx::query(
+            "CREATE TABLE content_legacy_observations (canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, legacy_table TEXT, observation_basis_json TEXT, classification TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create announcement legacy observations");
+        sqlx::query(
+            "CREATE TABLE admin_collection_processing_coverage (record_kind TEXT, record_id TEXT, pipeline TEXT, status_origin TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create announcement coverage");
+        let (total, rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Announcement,
+            false,
+            Some("2026-07-08T08:00:00Z"),
+            Some("2026-07-08T10:00:00Z"),
+            AttemptCountRange { min: 0, max: None },
+            None,
+            None,
+            20,
+            0,
+        )
+        .await
+        .expect("list canonical announcements");
+        assert_eq!(total, 0);
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
     async fn notification_source_rows_group_users_by_thread_id() {
         let pool = test_pool().await;
         create_notifications_fixture(&pool).await;
@@ -3392,6 +3486,18 @@ mod tests {
         .execute(&pool)
         .await
         .expect("create notification work items");
+        sqlx::query(
+            "CREATE TABLE content_legacy_observations (canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, legacy_table TEXT, observation_basis_json TEXT, classification TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create notification legacy observations");
+        sqlx::query(
+            "CREATE TABLE admin_collection_processing_coverage (record_kind TEXT, record_id TEXT, pipeline TEXT, status_origin TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create notification coverage");
         let rows = list_source_rows(
             &pool,
             CollectionRecordKind::Notification,
@@ -3406,6 +3512,52 @@ mod tests {
         assert_eq!(rows[0].id, "thread-1");
         assert_eq!(rows[0].occurred_at.as_deref(), Some("2026-07-08T09:05:00Z"));
         assert_eq!(rows[0].detected_at, None);
+    }
+
+    #[tokio::test]
+    async fn notification_window_filters_after_latest_thread_selection() {
+        let pool = test_pool().await;
+        create_notifications_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE notifications SET updated_at = '2026-07-08T10:01:00Z' WHERE id = 'notification-2'",
+        )
+        .execute(&pool)
+        .await
+        .expect("move latest notification outside window");
+        sqlx::query(
+            "CREATE TABLE translation_work_items (id TEXT PRIMARY KEY, entity_id TEXT, kind TEXT, status TEXT, result_status TEXT, attempt_count INTEGER, updated_at TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create notification work items");
+        sqlx::query(
+            "CREATE TABLE content_legacy_observations (canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, legacy_table TEXT, observation_basis_json TEXT, classification TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create notification legacy observations");
+        sqlx::query(
+            "CREATE TABLE admin_collection_processing_coverage (record_kind TEXT, record_id TEXT, pipeline TEXT, status_origin TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create notification coverage");
+        let (total, rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Notification,
+            false,
+            Some("2026-07-08T08:00:00Z"),
+            Some("2026-07-08T10:00:00Z"),
+            AttemptCountRange { min: 0, max: None },
+            None,
+            None,
+            20,
+            0,
+        )
+        .await
+        .expect("list canonical notifications");
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].id, "thread-2");
     }
 
     #[tokio::test]
@@ -3754,6 +3906,30 @@ mod tests {
         .expect("read global notification page");
         assert_eq!(global_total, 1);
         assert_eq!(global_rows[0].id, "thread-1");
+
+        sqlx::query(
+            "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, status, attempt_count, created_at, updated_at)
+             VALUES ('global-unrelated', 'notification', 'thread-1', 'translation', 'unrelated', 'zh-CN', 'hash-unrelated', 'v1', 'test', 'ready', 9, '2026-07-08T09:07:00Z', '2026-07-08T09:07:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed unrelated global work");
+        let (filtered_total, filtered_rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Notification,
+            true,
+            Some("2026-07-08T08:00:00Z"),
+            Some("2026-07-08T10:00:00Z"),
+            AttemptCountRange { min: 2, max: None },
+            None,
+            None,
+            20,
+            0,
+        )
+        .await
+        .expect("filter global attempts by supported variants");
+        assert_eq!(filtered_total, 0);
+        assert!(filtered_rows.is_empty());
     }
 
     fn event(trigger: &str, event_type: &str, created_at: &str) -> AttemptEventRow {
