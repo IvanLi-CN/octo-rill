@@ -1103,7 +1103,6 @@ export function AiOperationsRecordsSection({
 	const [activityLoading, setActivityLoading] = useState(false);
 	const [activityError, setActivityError] = useState<string | null>(null);
 	const [activityRetryNonce, setActivityRetryNonce] = useState(0);
-	const [listReadCycle, setListReadCycle] = useState(0);
 	const [error, setError] = useState<CollectionReadError | null>(null);
 	const [detail, setDetail] = useState<AdminCollectionRecordDetail | null>(
 		null,
@@ -1125,8 +1124,6 @@ export function AiOperationsRecordsSection({
 	);
 	const activityNeedsReadRef = useRef(true);
 	const activityForceReadRef = useRef(false);
-	const activityPendingRef = useRef(false);
-	const listReadActiveRef = useRef(false);
 	const activityTabRef = useRef(tab);
 	const handledReloadNonceRef = useRef(0);
 	const handledActivityRetryNonceRef = useRef(0);
@@ -1245,14 +1242,6 @@ export function AiOperationsRecordsSection({
 	useEffect(() => {
 		const requestId = listRequestRef.current + 1;
 		listRequestRef.current = requestId;
-		const interruptedActivityRequest = activityControllerRef.current;
-		interruptedActivityRequest?.abort();
-		activityControllerRef.current = null;
-		if (interruptedActivityRequest) {
-			activityNeedsReadRef.current = true;
-		}
-		activityPendingRef.current = false;
-		listReadActiveRef.current = true;
 		const abortController = new AbortController();
 		setLoading(true);
 		setError(null);
@@ -1308,14 +1297,10 @@ export function AiOperationsRecordsSection({
 			.finally(() => {
 				if (requestId === listRequestRef.current) {
 					setLoading(false);
-					listReadActiveRef.current = false;
-					setListReadCycle((current) => current + 1);
 				}
 			});
 		return () => {
 			abortController.abort();
-			if (requestId === listRequestRef.current)
-				listReadActiveRef.current = false;
 		};
 	}, [
 		page,
@@ -1329,7 +1314,7 @@ export function AiOperationsRecordsSection({
 		translationStatuses,
 	]);
 	useEffect(() => {
-		if (!activityNeedsReadRef.current || listReadActiveRef.current) return;
+		if (!activityNeedsReadRef.current) return;
 
 		const cached = activityCacheRef.current.get(tab);
 		const reloadRequested = reloadNonce > handledReloadNonceRef.current;
@@ -1357,7 +1342,6 @@ export function AiOperationsRecordsSection({
 		activityRequestRef.current = requestId;
 		const abortController = new AbortController();
 		activityControllerRef.current = abortController;
-		activityPendingRef.current = true;
 		setActivityLoading(
 			!cached || forceRead || Date.now() - cached.storedAt >= ACTIVITY_CACHE_MS,
 		);
@@ -1387,12 +1371,11 @@ export function AiOperationsRecordsSection({
 			})
 			.finally(() => {
 				if (requestId !== activityRequestRef.current) return;
-				activityPendingRef.current = false;
 				activityControllerRef.current = null;
 				setActivityLoading(false);
 			});
 		return () => abortController.abort();
-	}, [activityRetryNonce, listReadCycle, reloadNonce, tab]);
+	}, [activityRetryNonce, reloadNonce, tab]);
 	useEffect(() => {
 		if (!detailRoute) {
 			setDetail(null);
