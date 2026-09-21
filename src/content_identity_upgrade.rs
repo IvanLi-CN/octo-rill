@@ -847,7 +847,7 @@ pub(crate) async fn requeue_blocked_config(
             return Ok(requeued);
         }
         let identities = sqlx::query_scalar::<_, String>(
-            "SELECT DISTINCT m.identity_id FROM content_work_identity_members m JOIN content_work_items w ON w.id = m.work_item_id WHERE w.status = 'blocked_config' AND NOT EXISTS (SELECT 1 FROM content_current_result_projections p WHERE p.identity_id = m.identity_id) ORDER BY m.identity_id LIMIT ?",
+            "SELECT DISTINCT m.identity_id FROM content_work_identity_members m JOIN content_work_items w ON w.id = m.work_item_id WHERE w.status = 'blocked_config' AND NOT EXISTS (SELECT 1 FROM content_current_result_projections p WHERE p.identity_id = m.identity_id) AND NOT EXISTS (SELECT 1 FROM content_work_identity_members active_member JOIN content_work_items active_work ON active_work.id = active_member.work_item_id WHERE active_member.identity_id = m.identity_id AND active_work.status IN ('queued', 'running', 'deferred_provider')) ORDER BY m.identity_id LIMIT ?",
         )
         .bind(BATCH_SIZE)
         .fetch_all(&mut *tx)
@@ -1250,6 +1250,75 @@ mod tests {
                 .await
                 .expect("idempotent configuration reload recovery"),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_recovery_skips_full_batches_with_other_active_work() {
+        let pool = pool().await;
+        for index in 0..BATCH_SIZE {
+            let resource_id = format!("release-{index}");
+            let blocked_id = format!("blocked-{index}");
+            let active_id = format!("active-{index}");
+            let blocked_model = format!("blocked-model-{index}");
+            let active_model = format!("active-model-{index}");
+            insert_work(&pool, &blocked_id, &blocked_model, "blocked_config").await;
+            insert_work(&pool, &active_id, &active_model, "queued").await;
+            sqlx::query(
+                "UPDATE content_work_items SET canonical_resource_id = ? WHERE id IN (?, ?)",
+            )
+            .bind(resource_id)
+            .bind(blocked_id)
+            .bind(active_id)
+            .execute(&pool)
+            .await
+            .expect("assign one identity per blocked/active pair");
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mut tx = pool.begin().await.expect("begin identity mapping");
+        for index in 0..BATCH_SIZE {
+            for work_id in [format!("blocked-{index}"), format!("active-{index}")] {
+                ensure_identity_for_work(&mut tx, &work_id, &now)
+                    .await
+                    .expect("map work into its identity");
+            }
+        }
+        tx.commit().await.expect("commit identity mapping");
+        sqlx::query(
+            "UPDATE content_identity_upgrade_control SET status = 'completed', phase = 'complete' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("mark cutover complete");
+
+        let writer = SqliteWriteCoordinator::new();
+        let requeued = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            requeue_blocked_config(&pool, &writer, true),
+        )
+        .await
+        .expect("recovery must terminate when no identity is eligible")
+        .expect("configuration recovery");
+
+        assert_eq!(requeued, 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_work_items WHERE status = 'blocked_config'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            BATCH_SIZE
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_work_items WHERE status = 'queued'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            BATCH_SIZE
         );
     }
 

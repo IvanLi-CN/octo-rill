@@ -602,6 +602,27 @@ async fn has_valid_runtime_configuration(state: &AppState) -> bool {
     current_attempt_route_snapshot(state).await.is_some()
 }
 
+async fn refresh_model_routes_in_transaction(
+    state: &AppState,
+    tx: &mut Transaction<'_, Sqlite>,
+) -> Result<()> {
+    let persisted_models =
+        crate::admin_runtime::load_llm_models_in_transaction(tx, &state.config).await?;
+    state
+        .llm_scheduler
+        .set_model_routing(persisted_models)
+        .await;
+    Ok(())
+}
+
+async fn has_valid_runtime_configuration_in_transaction(
+    state: &AppState,
+    tx: &mut Transaction<'_, Sqlite>,
+) -> Result<bool> {
+    refresh_model_routes_in_transaction(state, tx).await?;
+    Ok(has_valid_runtime_configuration(state).await)
+}
+
 pub async fn on_runtime_configuration_reload(state: &AppState) -> Result<()> {
     let requeued = content_identity_upgrade::requeue_blocked_config(
         &state.pool,
@@ -921,8 +942,6 @@ pub async fn submit_item(
     }
     let (resource_type, pipeline) = canonical_identity(item);
     let hash = source_hash(item).map_err(ApiError::internal)?;
-    let model_profile = current_model_profile(state).await;
-    let configuration_valid = has_valid_runtime_configuration(state).await;
     let snapshot = serde_json::to_string(&json!({
         "source_blocks": item.source_blocks,
         "target_slots": item.target_slots,
@@ -937,6 +956,10 @@ pub async fn submit_item(
         .await
         .map_err(ApiError::internal)?;
     ensure_global_mode_in_transaction(&mut tx).await?;
+    let configuration_valid = has_valid_runtime_configuration_in_transaction(state, &mut tx)
+        .await
+        .map_err(ApiError::internal)?;
+    let model_profile = current_model_profile(state).await;
     let identity = content_identity_upgrade::ContentWorkIdentity {
         canonical_resource_type: resource_type.to_owned(),
         canonical_resource_id: item.entity_id.clone(),
@@ -1518,13 +1541,15 @@ pub async fn retry_request(
     // Manual retry is a scheduler command, serialized through the same writer
     // boundary as claims. The API layer delegates authorization and shaping.
     let breaker_open = provider_breaker_open(state).await;
-    let configuration_valid = has_valid_runtime_configuration(state).await;
     let (_lock, mut tx) = state
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_retry")
         .await
         .map_err(ApiError::internal)?;
     ensure_global_mode_in_transaction(&mut tx).await?;
+    let configuration_valid = has_valid_runtime_configuration_in_transaction(state, &mut tx)
+        .await
+        .map_err(ApiError::internal)?;
     let mut row = sqlx::query_as::<_, WorkRow>(
         "SELECT w.id, w.canonical_resource_type, w.canonical_resource_id, w.pipeline, w.variant, w.target_lang, w.source_hash, w.protocol_version, w.model_profile, w.source_snapshot_json, w.configuration_fingerprint, w.status, w.priority, w.cache_hit, w.token_estimate, w.batch_id, w.attempt_count, w.next_retry_at, w.retry_expires_at, w.retry_after_at, w.created_at FROM content_request_links l JOIN content_work_items w ON w.id = l.work_item_id WHERE l.request_id = ? AND l.requester_id = ? LIMIT 1",
     )
@@ -1675,12 +1700,7 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
         .begin_immediate(&state.pool, "content_processing_claim")
         .await?;
     ensure_global_mode_in_transaction(&mut tx).await?;
-    let persisted_models =
-        crate::admin_runtime::load_llm_models_in_transaction(&mut tx, &state.config).await?;
-    state
-        .llm_scheduler
-        .set_model_routing(persisted_models)
-        .await;
+    refresh_model_routes_in_transaction(state, &mut tx).await?;
     let attempt_snapshot = current_attempt_route_snapshot(state).await;
     let Some(row) = sqlx::query_as::<_, WorkRow>(
         "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE status = 'queued' AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime('now')) AND ((priority < 3 AND datetime(created_at) <= datetime('now', '-60 seconds')) OR (priority >= 3 AND EXISTS (SELECT 1 FROM content_attempt_events pending WHERE pending.work_item_id = content_work_items.id AND pending.event_type = 'attempt_queued' AND pending.trigger = 'manual_retry' AND NOT EXISTS (SELECT 1 FROM content_attempt_events started WHERE started.work_item_id = pending.work_item_id AND started.attempt_no = pending.attempt_no AND started.event_type = 'attempt_started')) AND (SELECT COUNT(*) FROM content_batches WHERE status = 'running' AND trigger_reason = 'manual_retry') < ?)) ORDER BY priority DESC, datetime(created_at) ASC, id ASC LIMIT 1",
@@ -3363,6 +3383,58 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn submission_uses_persisted_routes_when_the_local_scheduler_is_stale() {
+        let pool = global_pool().await;
+        sqlx::query(
+            "CREATE TABLE admin_runtime_settings (id INTEGER PRIMARY KEY, llm_models_json TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO admin_runtime_settings (id, llm_models_json) VALUES (1, '[\"persisted-route\"]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut state = global_state(pool.clone());
+        Arc::get_mut(&mut state)
+            .expect("state has a single owner")
+            .config
+            .ai
+            .as_mut()
+            .expect("AI configuration")
+            .model
+            .clear();
+        let item = translations::TranslationRequestItemInput {
+            producer_ref: "feed.auto_translate:release:release-1".to_owned(),
+            kind: "release_summary".to_owned(),
+            variant: "summary".to_owned(),
+            entity_id: "release-1".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 0,
+            source_blocks: vec![translations::TranslationSourceBlock {
+                slot: "title".to_owned(),
+                text: "A release title".to_owned(),
+            }],
+            target_slots: vec!["title_zh".to_owned()],
+        };
+
+        let (http_status, response) = submit_item(&state, "user-1", "async", &item).await.unwrap();
+        let (stored_status, model_profile): (String, String) =
+            sqlx::query_as("SELECT status, model_profile FROM content_work_items WHERE id = ?")
+                .bind(&response.work_item_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(http_status, StatusCode::ACCEPTED);
+        assert_eq!(response.status, "queued");
+        assert_eq!(stored_status, "queued");
+        assert_eq!(model_profile, "persisted-route");
     }
 
     #[tokio::test]
