@@ -2309,7 +2309,14 @@ where
     if let Some(result_sender) = result_sender {
         let task_flights = flights.clone();
         tokio::spawn(async move {
-            let result = bounded_collection_read(read).await.map(Arc::new);
+            let result = match tokio::spawn(async move {
+                bounded_collection_read(read).await.map(Arc::new)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(ApiError::internal("shared collection read task failed")),
+            };
             result_sender.send_replace(Some(result));
             task_flights.lock().await.remove(&key);
         });
@@ -3875,6 +3882,46 @@ mod tests {
             page_size: 20,
         };
         assert_eq!(key, default_window_key);
+    }
+
+    #[tokio::test]
+    async fn panicking_collection_read_does_not_poison_same_key_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let key = CollectionListKey {
+            kind: CollectionRecordKind::Release,
+            from: None,
+            before: None,
+            attempts: AttemptCountRange { min: 0, max: None },
+            translation_filter: Vec::new(),
+            polish_filter: Vec::new(),
+            page: 1,
+            page_size: 20,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_calls = calls.clone();
+        let first_result = run_collection_list_singleflight(key.clone(), async move {
+            first_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            panic!("collection read panic");
+        })
+        .await;
+
+        assert!(first_result.is_err());
+
+        let retry_calls = calls.clone();
+        let retry_result = run_collection_list_singleflight(key, async move {
+            retry_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok::<_, ApiError>(AdminCollectionRecordsResponse {
+                items: Vec::new(),
+                page: 1,
+                page_size: 20,
+                total: 0,
+            })
+        })
+        .await;
+
+        retry_result.expect("same-key retry succeeds after a panicking read");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
     }
 
     #[tokio::test]

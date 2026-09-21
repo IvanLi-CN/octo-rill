@@ -83,7 +83,7 @@ Feed 翻译与润色 hook 将 `blocked_config` 保持为原请求的 pending 状
 
 Release、公告、通知和日报的管理列表都先在 SQLite 中构造规范来源、旧事实／全局处理状态和筛选候选集，再精确计算总数并只读取当前页 ID。通知按 `updated_at DESC, id DESC` 选取每个 `thread_id` 的唯一来源；不存在可靠的首次发现时间时仍返回 `NULL`。
 
-列表请求把缺省或单边时间条件归一化为不超过 31 天的 UTC 窗口，先物化窗口内来源候选，再限制处理状态聚合到候选 ID；当前页通过窗口总数取得精确匹配总数，越界空页才回退到计数查询。相同规范化查询键的在途读取由 keyed singleflight 合并，不缓存完成结果；五秒监督超时返回 `admin_collection_records_timeout`、HTTP 503 和 `Retry-After: 1`，不返回部分数据。
+列表请求把缺省或单边时间条件归一化为不超过 31 天的 UTC 窗口，先物化窗口内来源候选，再限制处理状态聚合到候选 ID；当前页通过窗口总数取得精确匹配总数，越界空页才回退到计数查询。相同规范化查询键的在途读取由 keyed singleflight 合并，不缓存完成结果；panic 转换为完整内部错误并释放查询键，允许后续同键请求重新执行。五秒监督超时返回 `admin_collection_records_timeout`、HTTP 503 和 `Retry-After: 1`，不返回部分数据。
 
 生产形状合成 fixture 的 `24h`、`7d`、`30d` 列表预算验证覆盖 Release、公告、通知和日报，并以 global processing mode 执行。testbox 上各类窗口的最慢 p95/p99 分别为 Release `157/157ms`、公告 `102/102ms`、通知 `182/182ms`、日报 `178/178ms`，均低于 1s/2s 门槛。fixture 包含每类 100,000 条源行，大多数位于窗口之外；EXPLAIN 断言来源时间/canonical 索引，并确认 global work 状态从有界来源 ID 经复合索引点查。
 
