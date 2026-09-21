@@ -111,6 +111,10 @@ SQLx 默认会校验数据库中每一个已应用迁移是否存在于当前二
 - Admin read model joins the global work, result and legacy observation independently, rather than inferring any one from another.
 - Web clients treat active-retry `409` and transition `503` as status synchronization outcomes, then poll the supplied link. They do not optimistically invent a local attempt.
 
+## Failure Finalization
+
+Provider and output-validation failures finalize the failed call link, work item, batch item, batch, and `attempt_completed` event in the same SQLite transaction. The regression test `content_processing::tests::execute_persists_failure_finalization_atomically` drives this path with a local mock provider and verifies that the terminal state and audit records persist together while the worker lease is cleared.
+
 ## Completion Evidence
 
 Identity-upgrade implementation is complete only after the verification scenarios in [SPEC.md](./SPEC.md) pass against the migration-bearing compatibility build and the later migration-free identity cutover build. The release checklist must prove the database can start under the compatibility build after cutover, that migration-preceding binaries are rejected, and that compatibility migration 0084 performs no historical-data backfill.
