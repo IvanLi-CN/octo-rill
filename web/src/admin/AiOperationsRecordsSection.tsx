@@ -1097,6 +1097,7 @@ export function AiOperationsRecordsSection({
 	const [items, setItems] = useState<AdminCollectionRecordItem[]>([]);
 	const [total, setTotal] = useState(0);
 	const [loading, setLoading] = useState(false);
+	const [listReadCycle, setListReadCycle] = useState(0);
 	const [reloadNonce, setReloadNonce] = useState(0);
 	const [activity, setActivity] =
 		useState<AdminCollectionActivityResponse | null>(null);
@@ -1123,6 +1124,7 @@ export function AiOperationsRecordsSection({
 		>(),
 	);
 	const activityNeedsReadRef = useRef(true);
+	const listReadSettledRef = useRef(false);
 	const activityForceReadRef = useRef(false);
 	const activityTabRef = useRef(tab);
 	const handledReloadNonceRef = useRef(0);
@@ -1242,6 +1244,7 @@ export function AiOperationsRecordsSection({
 	useEffect(() => {
 		const requestId = listRequestRef.current + 1;
 		listRequestRef.current = requestId;
+		listReadSettledRef.current = false;
 		const abortController = new AbortController();
 		setLoading(true);
 		setError(null);
@@ -1297,6 +1300,8 @@ export function AiOperationsRecordsSection({
 			.finally(() => {
 				if (requestId === listRequestRef.current) {
 					setLoading(false);
+					listReadSettledRef.current = true;
+					setListReadCycle((current) => current + 1);
 				}
 			});
 		return () => {
@@ -1314,7 +1319,7 @@ export function AiOperationsRecordsSection({
 		translationStatuses,
 	]);
 	useEffect(() => {
-		if (!activityNeedsReadRef.current) return;
+		if (!activityNeedsReadRef.current || !listReadSettledRef.current) return;
 
 		const cached = activityCacheRef.current.get(tab);
 		const reloadRequested = reloadNonce > handledReloadNonceRef.current;
@@ -1375,7 +1380,7 @@ export function AiOperationsRecordsSection({
 				setActivityLoading(false);
 			});
 		return () => abortController.abort();
-	}, [activityRetryNonce, reloadNonce, tab]);
+	}, [activityRetryNonce, listReadCycle, reloadNonce, tab]);
 	useEffect(() => {
 		if (!detailRoute) {
 			setDetail(null);
