@@ -2235,17 +2235,7 @@ async fn list_collection_page_in_connection(
 }
 
 struct SharedRead<T> {
-    result: tokio::sync::Mutex<Option<Result<Arc<T>, ApiError>>>,
-    notify: tokio::sync::Notify,
-}
-
-impl<T> SharedRead<T> {
-    fn new() -> Self {
-        Self {
-            result: tokio::sync::Mutex::new(None),
-            notify: tokio::sync::Notify::new(),
-        }
-    }
+    result: tokio::sync::watch::Receiver<Option<Result<Arc<T>, ApiError>>>,
 }
 
 type CollectionListFlights =
@@ -2281,12 +2271,17 @@ where
 }
 
 async fn await_shared_read<T: Clone>(flight: Arc<SharedRead<T>>) -> Result<Arc<T>, ApiError> {
+    let mut result_receiver = flight.result.clone();
     loop {
-        let notified = flight.notify.notified();
-        if let Some(result) = flight.result.lock().await.clone() {
+        let result = result_receiver.borrow_and_update().clone();
+        if let Some(result) = result {
             return result;
         }
-        notified.await;
+        if result_receiver.changed().await.is_err() {
+            return Err(ApiError::internal(
+                "shared collection read ended without a result",
+            ));
+        }
     }
 }
 
@@ -2300,23 +2295,22 @@ where
     T: Clone + Send + Sync + 'static,
     F: Future<Output = Result<T, ApiError>> + Send + 'static,
 {
-    let (flight, leader) = {
+    let (flight, result_sender) = {
         let mut guard = flights.lock().await;
         if let Some(flight) = guard.get(&key) {
-            (flight.clone(), false)
+            (flight.clone(), None)
         } else {
-            let flight = Arc::new(SharedRead::new());
+            let (sender, receiver) = tokio::sync::watch::channel(None);
+            let flight = Arc::new(SharedRead { result: receiver });
             guard.insert(key.clone(), flight.clone());
-            (flight, true)
+            (flight, Some(sender))
         }
     };
-    if leader {
-        let task_flight = flight.clone();
+    if let Some(result_sender) = result_sender {
         let task_flights = flights.clone();
         tokio::spawn(async move {
             let result = bounded_collection_read(read).await.map(Arc::new);
-            *task_flight.result.lock().await = Some(result);
-            task_flight.notify.notify_waiters();
+            result_sender.send_replace(Some(result));
             task_flights.lock().await.remove(&key);
         });
     }
@@ -3881,6 +3875,147 @@ mod tests {
             page_size: 20,
         };
         assert_eq!(key, default_window_key);
+    }
+
+    #[tokio::test]
+    async fn shared_read_observes_result_published_before_waiter_starts() {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        sender.send_replace(Some(Ok(Arc::new(42_i64))));
+        let flight = Arc::new(SharedRead { result: receiver });
+
+        let value = await_shared_read(flight)
+            .await
+            .expect("published shared result");
+        assert_eq!(*value, 42);
+    }
+
+    #[tokio::test]
+    async fn identical_collection_activity_reads_share_one_in_flight_execution() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let key = CollectionActivityKey {
+            kind: CollectionRecordKind::Release,
+            window_started_at: "singleflight-activity-start".to_owned(),
+            window_ended_at: "singleflight-activity-end".to_owned(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let response = || {
+            Ok::<_, ApiError>(AdminCollectionActivityResponse {
+                kind: "release".to_owned(),
+                bucket_minutes: 60,
+                bucket_count: 0,
+                window_started_at: "singleflight-activity-start".to_owned(),
+                window_ended_at: "singleflight-activity-end".to_owned(),
+                summary: AdminCollectionActivitySummary::default(),
+                buckets: Vec::new(),
+            })
+        };
+        let first_calls = calls.clone();
+        let first_started = started.clone();
+        let first_release = release.clone();
+        let first_key = key.clone();
+        let first = tokio::spawn(async move {
+            run_collection_activity_singleflight(first_key, async move {
+                first_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                first_started.notify_one();
+                first_release.notified().await;
+                response()
+            })
+            .await
+        });
+        started.notified().await;
+
+        let second_calls = calls.clone();
+        let second_key = key;
+        let second = tokio::spawn(async move {
+            run_collection_activity_singleflight(second_key, async move {
+                second_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                response()
+            })
+            .await
+        });
+        release.notify_one();
+
+        first
+            .await
+            .expect("first activity read")
+            .expect("first activity result");
+        second
+            .await
+            .expect("second activity read")
+            .expect("second activity result");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn list_and_activity_reads_do_not_block_each_other() {
+        let list_started = Arc::new(tokio::sync::Notify::new());
+        let activity_started = Arc::new(tokio::sync::Notify::new());
+        let list_release = Arc::new(tokio::sync::Notify::new());
+        let activity_release = Arc::new(tokio::sync::Notify::new());
+        let list_key = CollectionListKey {
+            kind: CollectionRecordKind::Brief,
+            from: Some("isolation-list-start".to_owned()),
+            before: Some("isolation-list-end".to_owned()),
+            attempts: AttemptCountRange { min: 0, max: None },
+            translation_filter: Vec::new(),
+            polish_filter: Vec::new(),
+            page: 91,
+            page_size: 20,
+        };
+        let activity_key = CollectionActivityKey {
+            kind: CollectionRecordKind::Brief,
+            window_started_at: "isolation-activity-start".to_owned(),
+            window_ended_at: "isolation-activity-end".to_owned(),
+        };
+
+        let list_started_signal = list_started.clone();
+        let list_release_signal = list_release.clone();
+        let list_read = tokio::spawn(async move {
+            run_collection_list_singleflight(list_key, async move {
+                list_started_signal.notify_one();
+                list_release_signal.notified().await;
+                Ok::<_, ApiError>(AdminCollectionRecordsResponse {
+                    items: Vec::new(),
+                    page: 91,
+                    page_size: 20,
+                    total: 0,
+                })
+            })
+            .await
+        });
+        let activity_started_signal = activity_started.clone();
+        let activity_release_signal = activity_release.clone();
+        let activity_read = tokio::spawn(async move {
+            run_collection_activity_singleflight(activity_key, async move {
+                activity_started_signal.notify_one();
+                activity_release_signal.notified().await;
+                Ok::<_, ApiError>(AdminCollectionActivityResponse {
+                    kind: "brief".to_owned(),
+                    bucket_minutes: 60,
+                    bucket_count: 0,
+                    window_started_at: "isolation-activity-start".to_owned(),
+                    window_ended_at: "isolation-activity-end".to_owned(),
+                    summary: AdminCollectionActivitySummary::default(),
+                    buckets: Vec::new(),
+                })
+            })
+            .await
+        });
+
+        list_started.notified().await;
+        activity_started.notified().await;
+        activity_release.notify_one();
+        tokio::time::timeout(Duration::from_millis(100), activity_read)
+            .await
+            .expect("activity read must finish while list remains pending")
+            .expect("activity task")
+            .expect("activity response");
+
+        list_release.notify_one();
+        list_read.await.expect("list task").expect("list response");
     }
 
     #[tokio::test]
