@@ -1998,17 +1998,19 @@ fn next_retry_at_for_failure(
     retryable: bool,
     now: DateTime<Utc>,
 ) -> Option<String> {
-    let retry_window_open = retry_expires_at
-        .and_then(parse_storage_timestamp)
-        .is_none_or(|expires_at| expires_at > now);
-    if !retryable || !retry_window_open {
+    let expires_at = retry_expires_at.and_then(parse_storage_timestamp);
+    if !retryable || expires_at.is_some_and(|expires_at| expires_at <= now) {
         return None;
     }
     let delay_index = attempt_count
         .saturating_sub(1)
         .min(i64::try_from(RETRY_DELAYS_SECS.len() - 1).unwrap_or(0))
         as usize;
-    Some((now + chrono::Duration::seconds(RETRY_DELAYS_SECS[delay_index])).to_rfc3339())
+    let candidate = now + chrono::Duration::seconds(RETRY_DELAYS_SECS[delay_index]);
+    if expires_at.is_some_and(|expires_at| candidate >= expires_at) {
+        return None;
+    }
+    Some(candidate.to_rfc3339())
 }
 
 fn strip_single_json_code_fence(raw: &str) -> Result<(String, bool)> {
@@ -4987,5 +4989,10 @@ mod tests {
             .expect("sixth attempt remains retryable");
         assert_eq!(next, "2026-01-01T04:00:00+00:00");
         assert!(next_retry_at_for_failure(6, Some("2025-12-31T23:59:59Z"), true, now,).is_none());
+        assert!(next_retry_at_for_failure(6, Some("2026-01-01T04:00:00Z"), true, now,).is_none());
+        assert_eq!(
+            next_retry_at_for_failure(6, Some("2026-01-01T04:00:01Z"), true, now,),
+            Some("2026-01-01T04:00:00+00:00".to_owned())
+        );
     }
 }
