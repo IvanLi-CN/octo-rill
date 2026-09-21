@@ -106,8 +106,9 @@ precedence defined by `REQ-GTP-ADMIN-ACTIVITY`. The summary counts the same
 records as the cells and includes neutral records even though the UI presents
 their count in the legend.
 
-The read uses the existing single-permit admin collection gate and five-second
-budget. Saturation and timeout preserve the list endpoint's 503 error codes,
+The read uses an activity-specific keyed singleflight and a five-second budget.
+List reads and activity reads do not reject one another due to application
+contention. A safety timeout preserves the endpoint's 503 error code,
 `Retry-After: 1`, and complete-failure behavior; the endpoint never returns a
 partial set of cells.
 
