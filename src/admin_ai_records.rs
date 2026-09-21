@@ -1290,20 +1290,29 @@ fn source_records_sql(kind: CollectionRecordKind) -> String {
                 LEFT JOIN release_repositories rr ON rr.repo_id = r.repo_id
             )"
         .to_owned(),
-        CollectionRecordKind::Announcement => "raw_source_records AS (
+        CollectionRecordKind::Announcement => "announcement_rows AS (
                 SELECT
-                    lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id,
-                    MAX(e.repo_full_name) AS repository,
-                    COALESCE(MAX(NULLIF(e.title, '')), '公告') AS title,
-                    MAX(e.occurred_at) AS source_time,
-                    MAX(e.occurred_at) AS occurred_at,
-                    MIN(e.detected_at) AS detected_at,
-                    NULL AS generated_at
+                    e.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY lower(e.repo_full_name), e.discussion_number
+                        ORDER BY julianday(e.occurred_at) DESC, e.occurred_at DESC, e.rowid DESC
+                    ) AS source_rank
                 FROM social_activity_events e
                 WHERE e.kind = 'announcement'
                   AND e.repo_full_name IS NOT NULL
                   AND e.discussion_number IS NOT NULL
-                GROUP BY lower(e.repo_full_name), e.discussion_number
+            ),
+            raw_source_records AS (
+                SELECT
+                    lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id,
+                    e.repo_full_name AS repository,
+                    COALESCE(NULLIF(e.title, ''), '公告') AS title,
+                    e.occurred_at AS source_time,
+                    e.occurred_at AS occurred_at,
+                    e.detected_at,
+                    NULL AS generated_at
+                FROM announcement_rows e
+                WHERE e.source_rank = 1
             )"
         .to_owned(),
         CollectionRecordKind::Notification => "raw_source_records AS (
@@ -1387,15 +1396,23 @@ fn activity_source_ctes(kind: CollectionRecordKind) -> String {
             bounded_source_records AS MATERIALIZED (
                 SELECT
                     c.repo_key || '#' || CAST(c.discussion_number AS TEXT) AS id,
-                    MAX(e.repo_full_name) AS repository,
-                    COALESCE(MAX(NULLIF(e.title, '')), '公告') AS title,
-                    MAX(e.occurred_at) AS source_time
+                    e.repo_full_name AS repository,
+                    COALESCE(NULLIF(e.title, ''), '公告') AS title,
+                    e.occurred_at AS source_time
                 FROM canonical_announcement_keys c
                 JOIN social_activity_events e
                   ON e.kind = 'announcement'
                  AND lower(e.repo_full_name) = c.repo_key
                  AND e.discussion_number = c.discussion_number
-                GROUP BY c.repo_key, c.discussion_number
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM social_activity_events newer
+                    WHERE newer.kind = 'announcement'
+                      AND lower(newer.repo_full_name) = c.repo_key
+                      AND newer.discussion_number = c.discussion_number
+                      AND (newer.occurred_at > e.occurred_at
+                        OR (newer.occurred_at = e.occurred_at AND newer.rowid > e.rowid))
+                )
             )"
         .to_owned(),
         CollectionRecordKind::Notification => "bounded_source_records AS MATERIALIZED (
@@ -2532,7 +2549,7 @@ async fn load_source_record(
             "SELECT CAST(r.release_id AS TEXT) AS id, COALESCE((SELECT wi.repo_full_name FROM repo_release_work_items wi WHERE wi.repo_id = r.repo_id LIMIT 1), '仓库 #' || CAST(r.repo_id AS TEXT)) AS repository, COALESCE(NULLIF(r.name, ''), r.tag_name) AS title, COALESCE(r.published_at, r.created_at, r.updated_at) AS occurred_at, r.detected_at, NULL AS generated_at FROM repo_releases r WHERE r.release_id = ? LIMIT 1"
         }
         CollectionRecordKind::Announcement => {
-            "SELECT lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id, MAX(e.repo_full_name) AS repository, COALESCE(MAX(NULLIF(e.title, '')), '公告') AS title, MAX(e.occurred_at) AS occurred_at, MIN(e.detected_at) AS detected_at, NULL AS generated_at FROM social_activity_events e WHERE e.kind = 'announcement' AND lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) = ? GROUP BY lower(e.repo_full_name), e.discussion_number LIMIT 1"
+            "WITH ranked_announcements AS (SELECT e.*, ROW_NUMBER() OVER (PARTITION BY lower(e.repo_full_name), e.discussion_number ORDER BY julianday(e.occurred_at) DESC, e.occurred_at DESC, e.rowid DESC) AS source_rank FROM social_activity_events e WHERE e.kind = 'announcement' AND lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) = ?) SELECT lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id, e.repo_full_name AS repository, COALESCE(NULLIF(e.title, ''), '公告') AS title, e.occurred_at, e.detected_at, NULL AS generated_at FROM ranked_announcements e WHERE e.source_rank = 1 LIMIT 1"
         }
         CollectionRecordKind::Notification => {
             "WITH ranked_notifications AS (SELECT n.*, ROW_NUMBER() OVER (PARTITION BY n.thread_id ORDER BY n.updated_at DESC, n.id DESC) AS source_rank FROM notifications n WHERE n.thread_id = ?) SELECT n.thread_id AS id, n.repo_full_name AS repository, COALESCE(NULLIF(n.subject_title, ''), '通知') AS title, n.updated_at AS occurred_at, NULL AS detected_at, NULL AS generated_at FROM ranked_notifications n WHERE n.source_rank = 1 LIMIT 1"
@@ -2779,7 +2796,7 @@ async fn load_global_attempts(
         created_at: String,
     }
     let rows = match sqlx::query_as::<_, GlobalAttemptRow>(
-        "SELECT e.id AS event_id, e.work_item_id, w.pipeline, e.attempt_no, e.trigger, e.event_type, e.result_status, e.error_code, e.error_summary, e.failure_class, e.retry_eligible, e.next_retry_at, e.created_at FROM content_attempt_events e JOIN content_work_items w ON w.id = e.work_item_id WHERE w.canonical_resource_type = ? AND w.canonical_resource_id = ? ORDER BY julianday(e.created_at) ASC, e.created_at ASC, e.id ASC",
+        "SELECT e.id AS event_id, e.work_item_id, w.pipeline, e.attempt_no, e.trigger, e.event_type, e.result_status, e.error_code, e.error_summary, e.failure_class, e.retry_eligible, e.next_retry_at, e.created_at FROM content_attempt_events e JOIN content_work_items w ON w.id = e.work_item_id WHERE w.canonical_resource_type = ? AND w.canonical_resource_id = ? AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared')) OR (w.pipeline = 'polishing' AND w.variant = 'smart')) ORDER BY julianday(e.created_at) ASC, e.created_at ASC, e.id ASC",
     )
     .bind(collection_record_kind_label(kind))
     .bind(entity_id)
@@ -3435,7 +3452,7 @@ mod tests {
         .await
         .expect("create social events");
         sqlx::query(
-            "INSERT INTO social_activity_events (repo_full_name, discussion_number, title, occurred_at, kind) VALUES ('octo/demo', 42, '旧公告', '2026-07-08T09:00:00Z', 'announcement'), ('octo/demo', 42, '新公告', '2026-07-08T10:01:00Z', 'announcement')",
+            "INSERT INTO social_activity_events (repo_full_name, discussion_number, title, occurred_at, kind) VALUES ('octo/demo', 42, 'Zulu old title', '2026-07-08T09:00:00Z', 'announcement'), ('octo/demo', 42, 'Alpha latest title', '2026-07-08T10:01:00Z', 'announcement')",
         )
         .execute(&pool)
         .await
@@ -3474,6 +3491,23 @@ mod tests {
         .expect("list canonical announcements");
         assert_eq!(total, 0);
         assert!(rows.is_empty());
+
+        let (all_total, all_rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Announcement,
+            false,
+            Some("2026-07-08T08:00:00Z"),
+            Some("2026-07-08T11:00:00Z"),
+            AttemptCountRange { min: 0, max: None },
+            None,
+            None,
+            20,
+            0,
+        )
+        .await
+        .expect("list canonical announcement title");
+        assert_eq!(all_total, 1);
+        assert_eq!(all_rows[0].title, "Alpha latest title");
     }
 
     #[tokio::test]
@@ -4558,7 +4592,7 @@ mod tests {
                     let (next_total, rows) = list_collection_page(
                         &pool,
                         kind,
-                        false,
+                        true,
                         Some(from),
                         Some(before),
                         AttemptCountRange { min: 0, max: None },

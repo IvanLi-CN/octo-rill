@@ -2570,8 +2570,11 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             } else {
                 None
             };
-            sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, cost_microunits, error_code, error_summary, created_at) VALUES (?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?)")
-                .bind(linked_call_id.unwrap_or_else(|| local_id::generate_local_id().to_string()))
+            let audit_call_id = linked_call_id
+                .clone()
+                .unwrap_or_else(|| local_id::generate_local_id().to_string());
+            if let Err(audit_error) = sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, cost_microunits, error_code, error_summary, created_at) VALUES (?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?)")
+                .bind(audit_call_id)
                 .bind(&attempt_event_id)
                 .bind(linked_call_audit.as_ref().and_then(|(provider_id, _, _, _, _)| provider_id.as_deref()).unwrap_or("unknown"))
                 .bind(linked_call_audit.as_ref().map_or_else(|| route_snapshot.first().map(String::as_str).unwrap_or("unknown"), |(_, model, _, _, _)| model.as_str()))
@@ -2583,7 +2586,15 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(error_summary.as_deref())
                 .bind(now_text.as_str())
                 .execute(&mut *tx)
-                .await?;
+                .await
+            {
+                warn!(
+                    ?audit_error,
+                    work_item_id = %work.id,
+                    attempt_event_id = %attempt_event_id,
+                    "failed to persist content processing call audit"
+                );
+            }
             sqlx::query("UPDATE content_work_items SET status = 'failed', failure_class = ?, next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?")
                 .bind(&class)
                 .bind(&next_retry)
