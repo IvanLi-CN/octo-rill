@@ -501,6 +501,7 @@ struct AttemptRouteSnapshot {
 }
 
 const GLOBAL_PROTOCOL_VERSION: &str = "content-processing.v1";
+const GLOBAL_WORK_LEASE_SECS: i64 = 5 * 60;
 const GLOBAL_MAX_TOKENS: u32 = 3_000;
 const GLOBAL_LENGTH_RECOVERY_MAX_TOKENS: u32 = 6_000;
 const RETRY_COOLDOWN_SECS: i64 = 5 * 60;
@@ -1762,7 +1763,8 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
             )
         });
     let now = Utc::now().to_rfc3339();
-    let lease_expires_at = (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+    let lease_expires_at =
+        (Utc::now() + chrono::Duration::seconds(GLOBAL_WORK_LEASE_SECS)).to_rfc3339();
     let attempt_profile = attempt_snapshot
         .route_models
         .first()
@@ -1821,6 +1823,34 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
         attempt_configuration_fingerprint: Some(attempt_snapshot.configuration_fingerprint),
         ..row
     }))
+}
+
+async fn renew_global_work_lease(state: &AppState, work: &WorkRow) -> Result<bool> {
+    let now = Utc::now();
+    let now_text = now.to_rfc3339();
+    let lease_expires_at = (now + chrono::Duration::seconds(GLOBAL_WORK_LEASE_SECS)).to_rfc3339();
+    let (_lock, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "content_processing_lease_heartbeat")
+        .await?;
+    let mode =
+        sqlx::query_scalar::<_, String>("SELECT mode FROM content_processing_control WHERE id = 1")
+            .fetch_optional(&mut *tx)
+            .await?;
+    if mode.as_deref() != Some(ContentProcessingMode::Global.as_str()) {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let updated = sqlx::query("UPDATE content_work_items SET lease_expires_at = ?, updated_at = ? WHERE id = ? AND status = 'running' AND attempt_count = ? AND lease_owner = 'content-general-1' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(?)")
+        .bind(&lease_expires_at)
+        .bind(&now_text)
+        .bind(&work.id)
+        .bind(work.attempt_count)
+        .bind(&now_text)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(updated.rows_affected() == 1)
 }
 
 async fn recover_due(state: &AppState) -> Result<()> {
@@ -2360,6 +2390,12 @@ async fn request_global_completion(
     state: &AppState,
     spec: GlobalCallSpec<'_>,
 ) -> Result<ai::ChatCompletionDiagnostic> {
+    if !renew_global_work_lease(state, spec.work).await? {
+        return Err(anyhow::Error::new(ai::LlmCallFailure {
+            class: ai::LlmFailureClass::Transient,
+            call_id: None,
+        }));
+    }
     let call_context = ai::LlmCallContext {
         source: format!(
             "content_processing.global.{}.stage.content_output.role.{}",
@@ -3820,6 +3856,45 @@ mod tests {
             .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn global_work_lease_renews_only_for_the_current_live_claim() {
+        let pool = global_execution_pool().await;
+        seed_executable_work(&pool, "lease-renewal-work", &["title_zh"]).await;
+        let state = global_state(pool.clone());
+        let work = claim_next(&state, 1)
+            .await
+            .unwrap()
+            .expect("queued work should be claimed");
+        let short_expiry = (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
+        sqlx::query("UPDATE content_work_items SET lease_expires_at = ? WHERE id = ?")
+            .bind(&short_expiry)
+            .bind(&work.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(renew_global_work_lease(&state, &work).await.unwrap());
+        let renewed_expiry: String =
+            sqlx::query_scalar("SELECT lease_expires_at FROM content_work_items WHERE id = ?")
+                .bind(&work.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            parse_storage_timestamp(&renewed_expiry).unwrap()
+                > Utc::now() + chrono::Duration::minutes(4)
+        );
+
+        let expired = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        sqlx::query("UPDATE content_work_items SET lease_expires_at = ? WHERE id = ?")
+            .bind(expired)
+            .bind(&work.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!renew_global_work_lease(&state, &work).await.unwrap());
     }
 
     #[tokio::test]
