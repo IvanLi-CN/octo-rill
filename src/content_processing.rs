@@ -10,6 +10,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use chrono::{DateTime, NaiveDateTime, Utc};
+use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Error as SqlxError, Row, Sqlite, SqlitePool, Transaction};
@@ -1964,7 +1965,7 @@ fn build_prompt(snapshot: &SourceSnapshot, pipeline: &str) -> (String, String) {
             .filter(|block| block.slot != "source_observed_at")
             .collect::<Vec<_>>(),
         "target_slots": snapshot.target_slots,
-        "response_contract": "Return one JSON object whose top-level keys are exactly the declared target slots. Do not wrap it in output, result, or data. Do not use a Markdown code fence."
+        "response_contract": "Return one JSON object with every declared target slot directly at the top level. Do not wrap it in output, result, or data. Do not use a Markdown code fence. Only declared target slots are persisted; extra scalar metadata is ignored."
     })
         .to_string();
     (system.to_owned(), user)
@@ -2028,10 +2029,93 @@ fn strip_single_json_code_fence(raw: &str) -> Result<(String, bool)> {
     Ok((body.join("\n").trim().to_owned(), true))
 }
 
+struct UniqueJsonValue(Value);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonValueVisitor)
+    }
+}
+
+struct UniqueJsonValueVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonValueVisitor {
+    type Value = UniqueJsonValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value with unique object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(|number| UniqueJsonValue(Value::Number(number)))
+            .ok_or_else(|| E::custom("invalid JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::String(value)))
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<UniqueJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(UniqueJsonValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(A::Error::custom(
+                    "global content output has duplicate JSON keys",
+                ));
+            }
+            let value = object.next_value::<UniqueJsonValue>()?;
+            values.insert(key, value.0);
+        }
+        Ok(UniqueJsonValue(Value::Object(values)))
+    }
+}
+
 fn normalize_output(raw: &str, target_slots: &[String]) -> Result<Value> {
     let (json_text, fenced) = strip_single_json_code_fence(raw)?;
-    let output =
-        serde_json::from_str::<Value>(&json_text).context("global content output is not JSON")?;
+    let output = serde_json::from_str::<UniqueJsonValue>(&json_text)
+        .context("global content output is not JSON")?
+        .0;
     let object = output
         .as_object()
         .ok_or_else(|| anyhow!("global content output is not an object"))?;
@@ -4780,6 +4864,7 @@ mod tests {
         assert!(system.contains("顶层必须直接包含 target_slots"));
         assert!(user.contains("target_slots"));
         assert!(user.contains("response_contract"));
+        assert!(user.contains("extra scalar metadata is ignored"));
         assert!(!user.contains("\"output\": {"));
     }
 
@@ -4804,7 +4889,10 @@ mod tests {
         let source_blocks = [];
         for raw in [
             r#"{"title_zh":"标题","output":{"title_zh":"另一个标题"}}"#,
+            r#"{"title_zh":"第一个标题","title_zh":"第二个标题"}"#,
             r#"{"output":{"output":{"title_zh":"标题"}}}"#,
+            r#"{"output":{"title_zh":"第一个标题","title_zh":"第二个标题"}}"#,
+            r#"{"output":{"title_zh":"标题"},"output":{"title_zh":"另一个标题"}}"#,
             r#"{"title_zh":"标题","result":{"title_zh":"另一个标题"}}"#,
             r#"{"title_zh":"标题","data":[]}"#,
             r#"{"output":{"title_zh":"标题","result":{"title_zh":"另一个标题"}}}"#,
