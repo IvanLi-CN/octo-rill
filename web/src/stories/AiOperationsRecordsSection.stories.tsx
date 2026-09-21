@@ -283,14 +283,19 @@ const meta = {
 	tags: ["autodocs"],
 	parameters: {
 		viewport: {
-			viewports: {
+			options: {
 				...INITIAL_VIEWPORTS,
+				adminDesktop: {
+					name: "Admin desktop",
+					styles: { width: "1280px", height: "1200px" },
+					type: "desktop",
+				},
 				adminMobile: {
 					name: "Admin mobile",
 					styles: { width: "393px", height: "852px" },
+					type: "mobile",
 				},
 			},
-			defaultViewport: "desktop",
 		},
 		docs: {
 			description: {
@@ -502,7 +507,7 @@ export const ExpiredDiagnosticEvidence: Story = {
 	],
 };
 
-export const BusyRead: Story = {
+export const TimeoutRead: Story = {
 	tags: ["admin-collection-read-budget"],
 	args: {
 		detailRoute: null,
@@ -529,8 +534,8 @@ export const BusyRead: Story = {
 						JSON.stringify({
 							ok: false,
 							error: {
-								code: "admin_collection_records_busy",
-								message: "admin collection records are temporarily busy",
+								code: "admin_collection_records_timeout",
+								message: "admin collection records read timed out",
 							},
 						}),
 						{ status: 503, headers: { "content-type": "application/json" } },
@@ -541,8 +546,8 @@ export const BusyRead: Story = {
 						JSON.stringify({
 							ok: false,
 							error: {
-								code: "admin_collection_records_busy",
-								message: "admin collection records are temporarily busy",
+								code: "admin_collection_records_timeout",
+								message: "admin collection records read timed out",
 							},
 						}),
 						{ status: 503, headers: { "content-type": "application/json" } },
@@ -580,6 +585,93 @@ export const BusyRead: Story = {
 		expect(
 			within(errorPanel).getByRole("button", { name: "刷新记录" }),
 		).toBeVisible();
+	},
+};
+
+export const FilterChangeReadFailure: Story = {
+	tags: ["admin-collection-read-budget"],
+	args: {
+		detailRoute: null,
+		onFiltersChange: () => undefined,
+		onOpenRecord: () => undefined,
+		onOpenAttempt: () => undefined,
+		onOpenLlm: () => undefined,
+		onCloseRecord: () => undefined,
+	},
+	decorators: [
+		(Story) => {
+			const originalFetch = useRef(window.fetch);
+			const restoreFetch = originalFetch.current;
+			window.fetch = async (input, init) => {
+				const requestInput = input instanceof Request ? input.url : input;
+				const url = new URL(
+					typeof requestInput === "string"
+						? requestInput
+						: requestInput.toString(),
+					window.location.origin,
+				);
+				if (url.pathname.endsWith("/activity")) {
+					const kind = url.pathname
+						.split("/")
+						.at(-2) as AdminCollectionActivityResponse["kind"];
+					return new Response(JSON.stringify(activityResponse(kind)), {
+						status: 200,
+					});
+				}
+				if (url.pathname === "/api/admin/jobs/ai-records/release") {
+					if (url.searchParams.has("translation_status")) {
+						return new Response(
+							JSON.stringify({
+								ok: false,
+								error: {
+									code: "admin_collection_records_timeout",
+									message: "admin collection records read timed out",
+								},
+							}),
+							{
+								status: 503,
+								headers: { "content-type": "application/json" },
+							},
+						);
+					}
+					return new Response(JSON.stringify(listResponse), { status: 200 });
+				}
+				return restoreFetch(input, init);
+			};
+			useEffect(
+				() => () => {
+					window.fetch = restoreFetch;
+				},
+				[restoreFetch],
+			);
+			return (
+				<div
+					data-visual-evidence-surface
+					className="mx-auto box-border w-full max-w-[1072px] bg-background p-8 md:p-6"
+				>
+					<div data-visual-evidence-target className="mx-auto max-w-5xl p-6">
+						<Story />
+					</div>
+				</div>
+			);
+		},
+	],
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const page = within(canvasElement.ownerDocument.body);
+		await waitFor(() => expect(canvas.getByRole("table")).toBeVisible());
+		await userEvent.click(canvas.getByRole("button", { name: "翻译筛选" }));
+		await userEvent.click(page.getByRole("checkbox", { name: "失败" }));
+		await userEvent.click(canvas.getByRole("button", { name: "翻译筛选" }));
+		await waitFor(() =>
+			expect(
+				page.getByRole("heading", { name: "记录暂时无法读取" }),
+			).toBeVisible(),
+		);
+		expect(canvas.queryByRole("table")).toBeNull();
+		expect(
+			canvas.getByRole("button", { name: "翻译筛选" }).textContent,
+		).toContain("1 项已选");
 	},
 };
 
@@ -662,9 +754,10 @@ type ActivityRequestWindow = Window & {
 type ActivityCancellationWindow = ActivityRequestWindow & {
 	__collectionActivityAbortCount?: number;
 	__collectionActivityNowOffset?: number;
+	__resolveCollectionActivity?: () => void;
 };
 
-export const ResumesActivityReadAfterListCancellation: Story = {
+export const ActivityReadIsIndependentOfListPaging: Story = {
 	tags: ["admin-collection-activity"],
 	args: {
 		detailRoute: null,
@@ -699,8 +792,18 @@ export const ResumesActivityReadAfterListCancellation: Story = {
 					requestWindow.__collectionActivityPaths?.push(url.pathname);
 					activityCallCount.current += 1;
 					if (activityCallCount.current === 3) {
-						return await new Promise<Response>((_resolve, reject) => {
+						return await new Promise<Response>((resolve, reject) => {
 							const signal = init?.signal;
+							const kind = url.pathname
+								.split("/")
+								.at(-2) as AdminCollectionActivityResponse["kind"];
+							requestWindow.__resolveCollectionActivity = () => {
+								resolve(
+									new Response(JSON.stringify(activityResponse(kind)), {
+										status: 200,
+									}),
+								);
+							};
 							const rejectOnAbort = () => {
 								requestWindow.__collectionActivityAbortCount =
 									(requestWindow.__collectionActivityAbortCount ?? 0) + 1;
@@ -745,6 +848,7 @@ export const ResumesActivityReadAfterListCancellation: Story = {
 					delete requestWindow.__collectionActivityPaths;
 					delete requestWindow.__collectionActivityAbortCount;
 					delete requestWindow.__collectionActivityNowOffset;
+					delete requestWindow.__resolveCollectionActivity;
 				},
 				[originalNow, restoreFetch, requestWindow],
 			);
@@ -777,18 +881,13 @@ export const ResumesActivityReadAfterListCancellation: Story = {
 			expect(canvas.getByRole("button", { name: "下一页" })).toBeEnabled(),
 		);
 		await userEvent.click(canvas.getByRole("button", { name: "下一页" }));
+		await expect(canvas.getByText("共 40 条 · 第 2/2 页")).toBeVisible();
+		await expect(requestWindow.__collectionActivityAbortCount).toBe(0);
+		await expect(requestWindow.__collectionActivityPaths).toHaveLength(3);
+		requestWindow.__resolveCollectionActivity?.();
 		await waitFor(() =>
-			expect(requestWindow.__collectionActivityAbortCount).toBe(1),
+			expect(canvas.queryByText("正在更新")).not.toBeInTheDocument(),
 		);
-		await waitFor(() =>
-			expect(requestWindow.__collectionActivityPaths).toHaveLength(4),
-		);
-		await expect(requestWindow.__collectionActivityPaths).toEqual([
-			releasePath,
-			"/api/admin/jobs/ai-records/announcement/activity",
-			releasePath,
-			releasePath,
-		]);
 	},
 };
 

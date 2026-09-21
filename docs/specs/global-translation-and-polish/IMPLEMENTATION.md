@@ -83,15 +83,19 @@ Feed 翻译与润色 hook 将 `blocked_config` 保持为原请求的 pending 状
 
 Release、公告、通知和日报的管理列表都先在 SQLite 中构造规范来源、旧事实／全局处理状态和筛选候选集，再精确计算总数并只读取当前页 ID。通知按 `updated_at DESC, id DESC` 选取每个 `thread_id` 的唯一来源；不存在可靠的首次发现时间时仍返回 `NULL`。
 
-列表请求把缺省或单边时间条件归一化为不超过 31 天的 UTC 窗口，完整读取（模式读取、候选查询、总数、当前页装载和摘要投影）共享一个容量为一的进程内闸门和五秒预算。闸门繁忙或读取超时分别返回 `admin_collection_records_busy`／`admin_collection_records_timeout`、HTTP 503 和 `Retry-After: 1`；超时会先取消并等待 SQL 任务清理，再释放许可。
+列表请求把缺省或单边时间条件归一化为不超过 31 天的 UTC 窗口，先物化窗口内来源候选，再限制处理状态聚合到候选 ID；当前页通过窗口总数取得精确匹配总数，越界空页才回退到计数查询。相同规范化查询键的在途读取由 keyed singleflight 合并，不缓存完成结果；panic 转换为完整内部错误并释放查询键，允许后续同键请求重新执行。五秒监督超时返回 `admin_collection_records_timeout`、HTTP 503 和 `Retry-After: 1`，不返回部分数据。
+
+生产形状合成 fixture 的 `24h`、`7d`、`30d` 列表预算验证覆盖 Release、公告、通知和日报，并以 global processing mode 执行。testbox 上各类窗口的最慢 p95/p99 分别为 Release `157/157ms`、公告 `102/102ms`、通知 `182/182ms`、日报 `178/178ms`，均低于 1s/2s 门槛。fixture 包含每类 100,000 条源行，大多数位于窗口之外；EXPLAIN 断言来源时间/canonical 索引，并确认 global work 状态从有界来源 ID 经复合索引点查。
 
 管理端客户端在切换种类、筛选或页码时取消失效请求，不自动重试；上述 503 显示既有页面内的人工刷新提示。线上形状副本验证了两项索引被选用，四类 31 天读取的三十次预热后测量均满足 p95 1 秒、p99 2 秒和单次 5 秒预算。
 
+列表 keyed singleflight 使用规范化查询条件的稳定语义键：默认滚动窗口保留 `(from=None, before=None)` 标记，显式起点到当前和固定窗口分别保留可复现的边界；实际读取仍使用本次请求计算出的 31 天窗口。完成、超时或 panic 后先释放键再通知等待者，不缓存已完成结果。
+
 ## Admin Collection Activity
 
-Release、公告、通知和日报活动读取在服务端按固定 UTC 十二小时半开窗先构造规范来源候选，再将 global、legacy、coverage 或 brief LLM 状态限制到这些候选。公告沿用 discussion 的 `MAX(occurred_at)` 聚合与全历史 canonical 校验；通知使用 `updated_at DESC, id DESC`；摘要计数由响应中的完整 cells 计算。活动 GET 复用列表的单许可、五秒监督器与 503 语义。
+Release、公告、通知和日报活动读取在服务端按固定 UTC 十二小时半开窗先构造规范来源候选，再将 global、legacy、coverage 或 brief LLM 状态限制到这些候选。公告按 discussion 选择全历史最新 `occurred_at` 行，同时间以 rowid 稳定去重；窗口候选通过 canonical 索引验证后才水合源字段。通知使用 `updated_at DESC, id DESC`；摘要计数由响应中的完整 cells 计算。活动 GET 使用独立的 keyed singleflight 和五秒监督器，与列表读取互不阻塞。
 
-迁移 `0085` 在 Release、公告、通知、日报来源时间及日报最新 LLM call 上新增索引。100,000 条/类的无内容合成数据库副本上，EXPLAIN 确认了四类来源时间索引、公告 canonical 索引、通知 canonical 索引和日报最新 call 索引；每类预热后测 30 次。窗口返回数分别为 5,000、2,500、2,500、5,000；p95 为 894ms、456ms、251ms、384ms，p99 为 909ms、456ms、259ms、402ms，最大值为 909ms，均在读取预算内。每次采样均断言窗口返回数，完整命令和执行逻辑由忽略的 `admin_collection_activity_production_shape_budget` 测试承载。
+迁移 `0085` 在 Release、公告、通知、日报来源时间及日报最新 LLM call 上新增索引。100,000 条/类的无内容合成数据库副本上，EXPLAIN 确认了四类来源时间索引、公告 canonical 索引、通知 canonical 索引和日报最新 call 索引；global activity/list CTE 从窗口内来源 ID 经 `idx_content_work_items_resource` 点查；每类预热后测 30 次。活动窗口返回数分别为 5,000、2,500、2,500、5,000；p95 为 `203/116/119/131ms`，p99 为 `205/116/121/143ms`，最大值为 `205/116/121/143ms`。列表 `24h/7d/30d` 各覆盖四种记录；各类窗口最慢 p95/p99 分别为 Release `157/157ms`、公告 `102/102ms`、通知 `182/182ms`、日报 `178/178ms`。两组预算均低于 p95 1s、p99 2s 和单次 5s 门槛；完整执行逻辑由忽略的 `admin_collection_activity_production_shape_budget` 测试承载。
 
 管理端只请求当前 tab 的活动接口；tab 切换等待当前列表读取结束，随后按 kind 使用五秒内存缓存。筛选和翻页只更新列表；手动刷新或活动读取失败后的重试才会重新读取图表。DOM 与 Canvas 的活动格均为 24 CSS px；Canvas 仅命中格子边界内的指针输入，上下方向键按每小时独立视觉行移动并在小时边界保持列位置。超过 8,000 cells 时切换到固定视口 Canvas、滚动虚拟绘制和可访问 active gridcell；数据本身不截断。
 

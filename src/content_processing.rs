@@ -2255,6 +2255,40 @@ async fn cancel_deleted_work_in_transaction(
     Ok(())
 }
 
+struct FailedLlmCallAudit<'a> {
+    audit_call_id: &'a str,
+    attempt_event_id: &'a str,
+    provider_call_id: &'a str,
+    model: &'a str,
+    duration_ms: Option<i64>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    error_code: &'a str,
+    error_summary: Option<&'a str>,
+    created_at: &'a str,
+}
+
+async fn persist_failed_llm_call_audit(
+    tx: &mut Transaction<'_, Sqlite>,
+    audit: FailedLlmCallAudit<'_>,
+) -> std::result::Result<(), SqlxError> {
+    sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, cost_microunits, error_code, error_summary, created_at) VALUES (?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?)")
+        .bind(audit.audit_call_id)
+        .bind(audit.attempt_event_id)
+        .bind(audit.provider_call_id)
+        .bind(audit.model)
+        .bind(audit.duration_ms)
+        .bind(audit.input_tokens)
+        .bind(audit.output_tokens)
+        .bind(Option::<i64>::None)
+        .bind(audit.error_code)
+        .bind(audit.error_summary)
+        .bind(audit.created_at)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
     if !source_exists(state, &work).await? {
         cancel_deleted_work(state, &work).await?;
@@ -2570,20 +2604,46 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             } else {
                 None
             };
-            sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, cost_microunits, error_code, error_summary, created_at) VALUES (?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?)")
-                .bind(linked_call_id.unwrap_or_else(|| local_id::generate_local_id().to_string()))
-                .bind(&attempt_event_id)
-                .bind(linked_call_audit.as_ref().and_then(|(provider_id, _, _, _, _)| provider_id.as_deref()).unwrap_or("unknown"))
-                .bind(linked_call_audit.as_ref().map_or_else(|| route_snapshot.first().map(String::as_str).unwrap_or("unknown"), |(_, model, _, _, _)| model.as_str()))
-                .bind(linked_call_audit.as_ref().and_then(|(_, _, duration_ms, _, _)| *duration_ms))
-                .bind(linked_call_audit.as_ref().and_then(|(_, _, _, input_tokens, _)| *input_tokens))
-                .bind(linked_call_audit.as_ref().and_then(|(_, _, _, _, output_tokens)| *output_tokens))
-                .bind(Option::<i64>::None)
-                .bind(&class)
-                .bind(error_summary.as_deref())
-                .bind(now_text.as_str())
-                .execute(&mut *tx)
-                .await?;
+            let audit_call_id = linked_call_id
+                .clone()
+                .unwrap_or_else(|| local_id::generate_local_id().to_string());
+            if let Err(audit_error) = persist_failed_llm_call_audit(
+                &mut tx,
+                FailedLlmCallAudit {
+                    audit_call_id: &audit_call_id,
+                    attempt_event_id: &attempt_event_id,
+                    provider_call_id: linked_call_audit
+                        .as_ref()
+                        .and_then(|(provider_id, _, _, _, _)| provider_id.as_deref())
+                        .unwrap_or("unknown"),
+                    model: linked_call_audit
+                        .as_ref()
+                        .map_or(work.model_profile.as_str(), |(_, model, _, _, _)| {
+                            model.as_str()
+                        }),
+                    duration_ms: linked_call_audit
+                        .as_ref()
+                        .and_then(|(_, _, duration_ms, _, _)| *duration_ms),
+                    input_tokens: linked_call_audit
+                        .as_ref()
+                        .and_then(|(_, _, _, input_tokens, _)| *input_tokens),
+                    output_tokens: linked_call_audit
+                        .as_ref()
+                        .and_then(|(_, _, _, _, output_tokens)| *output_tokens),
+                    error_code: &class,
+                    error_summary: error_summary.as_deref(),
+                    created_at: now_text.as_str(),
+                },
+            )
+            .await
+            {
+                warn!(
+                    ?audit_error,
+                    work_item_id = %work.id,
+                    attempt_event_id = %attempt_event_id,
+                    "failed to persist content processing call audit"
+                );
+            }
             sqlx::query("UPDATE content_work_items SET status = 'failed', failure_class = ?, next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?")
                 .bind(&class)
                 .bind(&next_retry)
@@ -2804,6 +2864,51 @@ mod tests {
         pool
     }
 
+    #[tokio::test]
+    async fn failed_llm_call_audit_persists_classification_and_usage() {
+        let pool = global_pool().await;
+        insert_test_work(&pool, "audit-work", "running", 1, None).await;
+        sqlx::query(
+            "INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, created_at) VALUES ('audit-event', 'audit-work', 1, 'initial', 'attempt_started', CURRENT_TIMESTAMP)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut transaction = pool.begin().await.unwrap();
+        persist_failed_llm_call_audit(
+            &mut transaction,
+            FailedLlmCallAudit {
+                audit_call_id: "audit-call",
+                attempt_event_id: "audit-event",
+                provider_call_id: "provider-request-1",
+                model: "test-model",
+                duration_ms: Some(125),
+                input_tokens: Some(12),
+                output_tokens: Some(8),
+                error_code: "provider_unavailable",
+                error_summary: Some("provider request failed"),
+                created_at: "2026-09-20T12:00:00Z",
+            },
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+
+        let audit = sqlx::query_as::<_, (String, String, String, i64, i64, String)>(
+            "SELECT status, provider_call_id, error_code, duration_ms, input_tokens, error_summary FROM content_attempt_llm_calls WHERE id = 'audit-call'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit.0, "failed");
+        assert_eq!(audit.1, "provider-request-1");
+        assert_eq!(audit.2, "provider_unavailable");
+        assert_eq!(audit.3, 125);
+        assert_eq!(audit.4, 12);
+        assert_eq!(audit.5, "provider request failed");
+    }
+
     fn global_state(pool: SqlitePool) -> Arc<AppState> {
         let encryption_key =
             EncryptionKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
@@ -2851,7 +2956,6 @@ mod tests {
             translation_scheduler: Arc::new(TranslationSchedulerController::new(
                 TranslationRuntimeConfig::default(),
             )),
-            admin_collection_read_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             runtime_owner_id: "content-processing-test-owner".to_owned(),
         })
     }

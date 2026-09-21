@@ -619,11 +619,13 @@ function Paging({
 	page,
 	total,
 	loading,
+	disabled = false,
 	onPage,
 }: {
 	page: number;
 	total: number;
 	loading: boolean;
+	disabled?: boolean;
 	onPage: (page: number) => void;
 }) {
 	const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
@@ -636,7 +638,7 @@ function Paging({
 				<Button
 					variant="outline"
 					size="sm"
-					disabled={loading || page <= 1}
+					disabled={loading || disabled || page <= 1}
 					onClick={() => onPage(page - 1)}
 				>
 					上一页
@@ -644,7 +646,7 @@ function Paging({
 				<Button
 					variant="outline"
 					size="sm"
-					disabled={loading || page >= totalPages}
+					disabled={loading || disabled || page >= totalPages}
 					onClick={() => onPage(page + 1)}
 				>
 					下一页
@@ -657,10 +659,12 @@ function Paging({
 function CollectionTable({
 	items,
 	tab,
+	disabled = false,
 	onOpen,
 }: {
 	items: AdminCollectionRecordItem[];
 	tab: CollectionTab;
+	disabled?: boolean;
 	onOpen: (item: AdminCollectionRecordItem) => void;
 }) {
 	const isBrief = tab === "brief";
@@ -715,10 +719,17 @@ function CollectionTable({
 					{items.map((item) => (
 						<TableRow
 							key={item.id}
-							className="cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-							tabIndex={0}
-							onClick={() => onOpen(item)}
+							className={cn(
+								"focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+								disabled ? "cursor-default opacity-70" : "cursor-pointer",
+							)}
+							tabIndex={disabled ? -1 : 0}
+							aria-disabled={disabled}
+							onClick={() => {
+								if (!disabled) onOpen(item);
+							}}
 							onKeyDown={(event) => {
+								if (disabled) return;
 								if (event.key === "Enter" || event.key === " ") {
 									event.preventDefault();
 									onOpen(item);
@@ -753,6 +764,7 @@ function CollectionTable({
 									size="icon"
 									className="size-9"
 									aria-label={`查看 ${item.title} 详情`}
+									disabled={disabled}
 									onClick={(event) => {
 										event.stopPropagation();
 										onOpen(item);
@@ -794,10 +806,12 @@ function CompactTask({
 function CompactRecordList({
 	items,
 	tab,
+	disabled = false,
 	onOpen,
 }: {
 	items: AdminCollectionRecordItem[];
 	tab: CollectionTab;
+	disabled?: boolean;
 	onOpen: (item: AdminCollectionRecordItem) => void;
 }) {
 	return (
@@ -806,7 +820,12 @@ function CompactRecordList({
 				<button
 					key={item.id}
 					type="button"
-					className="block w-full rounded-lg border p-4 text-left transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+					className={cn(
+						"block w-full rounded-lg border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+						disabled ? "cursor-default opacity-70" : "hover:bg-muted/50",
+					)}
+					disabled={disabled}
+					aria-disabled={disabled}
 					onClick={() => onOpen(item)}
 				>
 					<div className="flex items-start justify-between gap-3">
@@ -1075,17 +1094,23 @@ export function AiOperationsRecordsSection({
 	const [appliedAttemptRange, setAppliedAttemptRange] =
 		useState<AttemptCountRange>(DEFAULT_ATTEMPT_RANGE);
 	const [page, setPage] = useState(1);
-	const [items, setItems] = useState<AdminCollectionRecordItem[]>([]);
-	const [total, setTotal] = useState(0);
-	const [loading, setLoading] = useState(false);
+	const [lastSuccessfulList, setLastSuccessfulList] = useState<{
+		queryKey: string;
+		items: AdminCollectionRecordItem[];
+		total: number;
+	} | null>(null);
+	const [listReadState, setListReadState] = useState<{
+		queryKey: string;
+		loading: boolean;
+		error: CollectionReadError | null;
+	} | null>(null);
+	const [listReadCycle, setListReadCycle] = useState(0);
 	const [reloadNonce, setReloadNonce] = useState(0);
 	const [activity, setActivity] =
 		useState<AdminCollectionActivityResponse | null>(null);
 	const [activityLoading, setActivityLoading] = useState(false);
 	const [activityError, setActivityError] = useState<string | null>(null);
 	const [activityRetryNonce, setActivityRetryNonce] = useState(0);
-	const [listReadCycle, setListReadCycle] = useState(0);
-	const [error, setError] = useState<CollectionReadError | null>(null);
 	const [detail, setDetail] = useState<AdminCollectionRecordDetail | null>(
 		null,
 	);
@@ -1105,9 +1130,8 @@ export function AiOperationsRecordsSection({
 		>(),
 	);
 	const activityNeedsReadRef = useRef(true);
+	const listReadSettledRef = useRef(false);
 	const activityForceReadRef = useRef(false);
-	const activityPendingRef = useRef(false);
-	const listReadActiveRef = useRef(false);
 	const activityTabRef = useRef(tab);
 	const handledReloadNonceRef = useRef(0);
 	const handledActivityRetryNonceRef = useRef(0);
@@ -1167,6 +1191,45 @@ export function AiOperationsRecordsSection({
 			before: end.toISOString(),
 		};
 	}, [preset, range]);
+	const listParams = useMemo(() => {
+		const params = new URLSearchParams({
+			page: String(page),
+			page_size: String(PAGE_SIZE),
+			from: selectedRange.from,
+			before: selectedRange.before,
+		});
+		if (appliedAttemptRange.min > 0) {
+			params.set("attempt_min", String(appliedAttemptRange.min));
+		}
+		if (appliedAttemptRange.max !== null) {
+			params.set("attempt_max", String(appliedAttemptRange.max));
+		}
+		if (translationStatuses.length > 0 && tab !== "brief") {
+			params.set("translation_status", translationStatuses.join(","));
+		}
+		if (polishStatuses.length > 0) {
+			params.set("polish_status", polishStatuses.join(","));
+		}
+		return params;
+	}, [
+		appliedAttemptRange.max,
+		appliedAttemptRange.min,
+		page,
+		polishStatuses,
+		selectedRange.before,
+		selectedRange.from,
+		tab,
+		translationStatuses,
+	]);
+	const listQueryKey = `${tab}?${listParams.toString()}`;
+	const currentList =
+		lastSuccessfulList?.queryKey === listQueryKey ? lastSuccessfulList : null;
+	const items = currentList?.items ?? [];
+	const total = currentList?.total ?? 0;
+	const currentReadState =
+		listReadState?.queryKey === listQueryKey ? listReadState : null;
+	const loading = currentReadState?.loading ?? true;
+	const error = currentReadState?.error ?? null;
 	const setRangePreset = useCallback(
 		(next: TimeRangePreset) => {
 			setPreset(next);
@@ -1226,40 +1289,17 @@ export function AiOperationsRecordsSection({
 	useEffect(() => {
 		const requestId = listRequestRef.current + 1;
 		listRequestRef.current = requestId;
-		const interruptedActivityRequest = activityControllerRef.current;
-		interruptedActivityRequest?.abort();
-		activityControllerRef.current = null;
-		if (interruptedActivityRequest) {
-			activityNeedsReadRef.current = true;
-		}
-		activityPendingRef.current = false;
-		listReadActiveRef.current = true;
+		listReadSettledRef.current = false;
 		const abortController = new AbortController();
-		setLoading(true);
-		setError(null);
-		const params = new URLSearchParams({
-			page: String(page),
-			page_size: String(PAGE_SIZE),
-			from: selectedRange.from,
-			before: selectedRange.before,
-		});
-		if (appliedAttemptRange.min > 0) {
-			params.set("attempt_min", String(appliedAttemptRange.min));
-		}
-		if (appliedAttemptRange.max !== null) {
-			params.set("attempt_max", String(appliedAttemptRange.max));
-		}
-		if (translationStatuses.length > 0 && tab !== "brief") {
-			params.set("translation_status", translationStatuses.join(","));
-		}
-		if (polishStatuses.length > 0) {
-			params.set("polish_status", polishStatuses.join(","));
-		}
-		void apiGetAdminCollectionRecords(tab, params, abortController.signal)
+		setListReadState({ queryKey: listQueryKey, loading: true, error: null });
+		void apiGetAdminCollectionRecords(tab, listParams, abortController.signal)
 			.then((response) => {
 				if (requestId !== listRequestRef.current) return;
-				setItems(response.items);
-				setTotal(response.total);
+				setLastSuccessfulList({
+					queryKey: listQueryKey,
+					items: response.items,
+					total: response.total,
+				});
 			})
 			.catch((cause: unknown) => {
 				if (requestId !== listRequestRef.current) return;
@@ -1270,47 +1310,50 @@ export function AiOperationsRecordsSection({
 					(cause.code === "admin_collection_records_busy" ||
 						cause.code === "admin_collection_records_timeout")
 				) {
-					setError({
-						title: "记录暂时无法读取",
-						message:
-							cause.code === "admin_collection_records_timeout"
-								? "这次读取超过了安全时间，数据没有被截断。请稍后重新读取。"
-								: "读取服务正在处理其他请求。请稍后重新读取，当前筛选条件会继续保留。",
-						code: cause.code,
+					setListReadState({
+						queryKey: listQueryKey,
+						loading: true,
+						error: {
+							title: "记录暂时无法读取",
+							message:
+								cause.code === "admin_collection_records_timeout"
+									? "这次读取超过了安全时间，数据没有被截断。请稍后重新读取。"
+									: "读取服务正在处理其他请求。请稍后重新读取，当前筛选条件会继续保留。",
+							code: cause.code,
+						},
 					});
 					return;
 				}
-				setError({
-					title: "无法读取采集记录",
-					message: "读取记录时发生错误，请稍后重试。",
-					code: cause instanceof ApiError ? cause.code : undefined,
+				setListReadState({
+					queryKey: listQueryKey,
+					loading: true,
+					error: {
+						title: "无法读取采集记录",
+						message: "读取记录时发生错误，请稍后重试。",
+						code: cause instanceof ApiError ? cause.code : undefined,
+					},
 				});
 			})
 			.finally(() => {
 				if (requestId === listRequestRef.current) {
-					setLoading(false);
-					listReadActiveRef.current = false;
+					setListReadState((current) =>
+						current?.queryKey === listQueryKey
+							? { ...current, loading: false }
+							: current,
+					);
+					listReadSettledRef.current = true;
 					setListReadCycle((current) => current + 1);
 				}
 			});
 		return () => {
 			abortController.abort();
-			if (requestId === listRequestRef.current)
-				listReadActiveRef.current = false;
 		};
-	}, [
-		page,
-		reloadNonce,
-		selectedRange.before,
-		selectedRange.from,
-		tab,
-		appliedAttemptRange.max,
-		appliedAttemptRange.min,
-		polishStatuses,
-		translationStatuses,
-	]);
+	}, [listParams, listQueryKey, reloadNonce, tab]);
 	useEffect(() => {
-		if (!activityNeedsReadRef.current || listReadActiveRef.current) return;
+		return () => activityControllerRef.current?.abort();
+	}, [activityRetryNonce, reloadNonce, tab]);
+	useEffect(() => {
+		if (!activityNeedsReadRef.current || !listReadSettledRef.current) return;
 
 		const cached = activityCacheRef.current.get(tab);
 		const reloadRequested = reloadNonce > handledReloadNonceRef.current;
@@ -1338,7 +1381,6 @@ export function AiOperationsRecordsSection({
 		activityRequestRef.current = requestId;
 		const abortController = new AbortController();
 		activityControllerRef.current = abortController;
-		activityPendingRef.current = true;
 		setActivityLoading(
 			!cached || forceRead || Date.now() - cached.storedAt >= ACTIVITY_CACHE_MS,
 		);
@@ -1368,11 +1410,9 @@ export function AiOperationsRecordsSection({
 			})
 			.finally(() => {
 				if (requestId !== activityRequestRef.current) return;
-				activityPendingRef.current = false;
 				activityControllerRef.current = null;
 				setActivityLoading(false);
 			});
-		return () => abortController.abort();
 	}, [activityRetryNonce, listReadCycle, reloadNonce, tab]);
 	useEffect(() => {
 		if (!detailRoute) {
@@ -1641,7 +1681,7 @@ export function AiOperationsRecordsSection({
 							}}
 						/>
 					) : null}
-					{loading ? (
+					{loading && items.length === 0 ? (
 						<p className="text-muted-foreground py-8 text-sm">
 							正在加载记录...
 						</p>
@@ -1653,22 +1693,25 @@ export function AiOperationsRecordsSection({
 							onClear={clearFilters}
 						/>
 					) : null}
-					{!loading && !error && items.length > 0 ? (
+					{items.length > 0 ? (
 						<>
 							<CollectionTable
 								items={items}
 								tab={tab}
+								disabled={loading || Boolean(error)}
 								onOpen={(item) => onOpenRecord(item.kind, item.id)}
 							/>
 							<CompactRecordList
 								items={items}
 								tab={tab}
+								disabled={loading || Boolean(error)}
 								onOpen={(item) => onOpenRecord(item.kind, item.id)}
 							/>
 							<Paging
 								page={page}
 								total={total}
 								loading={loading}
+								disabled={Boolean(error)}
 								onPage={setPage}
 							/>
 						</>
