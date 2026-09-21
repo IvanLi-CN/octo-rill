@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -2009,10 +2010,10 @@ fn next_retry_at_for_failure(
     Some((now + chrono::Duration::seconds(RETRY_DELAYS_SECS[delay_index])).to_rfc3339())
 }
 
-fn strip_single_json_code_fence(raw: &str) -> Result<String> {
+fn strip_single_json_code_fence(raw: &str) -> Result<(String, bool)> {
     let trimmed = raw.trim();
     if !trimmed.starts_with("```") {
-        return Ok(trimmed.to_owned());
+        return Ok((trimmed.to_owned(), false));
     }
 
     let mut lines = trimmed.lines();
@@ -2024,11 +2025,11 @@ fn strip_single_json_code_fence(raw: &str) -> Result<String> {
     if body.pop().map(str::trim) != Some("```") {
         anyhow::bail!("global content output has an unterminated code fence");
     }
-    Ok(body.join("\n").trim().to_owned())
+    Ok((body.join("\n").trim().to_owned(), true))
 }
 
 fn normalize_output(raw: &str, target_slots: &[String]) -> Result<Value> {
-    let json_text = strip_single_json_code_fence(raw)?;
+    let (json_text, fenced) = strip_single_json_code_fence(raw)?;
     let output =
         serde_json::from_str::<Value>(&json_text).context("global content output is not JSON")?;
     let object = output
@@ -2037,7 +2038,16 @@ fn normalize_output(raw: &str, target_slots: &[String]) -> Result<Value> {
     let has_direct_target = target_slots.iter().any(|slot| object.contains_key(slot));
     let has_all_direct_targets = target_slots.iter().all(|slot| object.contains_key(slot));
 
+    if object.iter().any(|(key, value)| {
+        !target_slots.contains(key) && key != "output" && (value.is_object() || value.is_array())
+    }) {
+        anyhow::bail!("global content output has an unknown wrapper");
+    }
+
     if object.contains_key("output") {
+        if fenced {
+            anyhow::bail!("global content output has multiple wrappers");
+        }
         if has_direct_target {
             anyhow::bail!("global content output has ambiguous direct and nested targets");
         }
@@ -2177,6 +2187,16 @@ struct GlobalCompletion {
     call_ids: Vec<String>,
 }
 
+struct GlobalCallSpec<'a> {
+    work: &'a WorkRow,
+    ai_config: &'a crate::config::AiConfig,
+    system: &'a str,
+    user: &'a str,
+    max_tokens: u32,
+    route_snapshot: &'a [String],
+    role: &'a str,
+}
+
 #[derive(Debug, Clone)]
 struct LlmCallAudit {
     provider_request_id: Option<String>,
@@ -2227,36 +2247,50 @@ fn unique_call_ids(mut call_ids: Vec<String>) -> Vec<String> {
     call_ids
 }
 
+fn unique_provider_call_id(
+    call_id: &str,
+    provider_request_id: Option<&str>,
+    used: &mut HashSet<String>,
+) -> String {
+    let base = provider_request_id
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("llm-call:{call_id}"));
+    if used.insert(base.clone()) {
+        base
+    } else {
+        let disambiguated = format!("{base}:{call_id}");
+        used.insert(disambiguated.clone());
+        disambiguated
+    }
+}
+
 async fn request_global_completion(
     state: &AppState,
-    work: &WorkRow,
-    system: &str,
-    user: &str,
-    max_tokens: u32,
-    route_snapshot: &[String],
-    role: &str,
+    spec: GlobalCallSpec<'_>,
 ) -> Result<ai::ChatCompletionDiagnostic> {
     let call_context = ai::LlmCallContext {
         source: format!(
-            "content_processing.global.{}.stage.content_output.role.{role}",
-            work.pipeline
+            "content_processing.global.{}.stage.content_output.role.{}",
+            spec.work.pipeline, spec.role
         ),
         requested_by: None,
         parent_task_id: None,
         parent_task_type: None,
-        parent_translation_batch_id: work.batch_id.clone(),
+        parent_translation_batch_id: spec.work.batch_id.clone(),
         parent_brief_id: None,
     };
     tokio::time::timeout(
         Duration::from_secs(4 * 60),
         ai::with_llm_call_context(
             call_context,
-            ai::chat_completion_with_diagnostics_for_route(
+            ai::chat_completion_with_diagnostics_for_config_and_route(
                 state,
-                system,
-                user,
-                max_tokens,
-                Some(route_snapshot),
+                spec.ai_config,
+                spec.system,
+                spec.user,
+                spec.max_tokens,
+                Some(spec.route_snapshot),
             ),
         ),
     )
@@ -2278,15 +2312,25 @@ async fn complete_global_output(
     user: &str,
     route_snapshot: &[String],
 ) -> Result<GlobalCompletion> {
+    let Some(ai_config) = state.config.ai.as_ref() else {
+        return Err(anyhow::Error::new(GlobalExecutionFailure {
+            call_ids: Vec::new(),
+            class: ai::LlmFailureClass::Configuration,
+            message: "AI configuration is missing".to_owned(),
+        }));
+    };
     let mut call_ids = Vec::new();
     let mut diagnostic = match request_global_completion(
         state,
-        work,
-        system,
-        user,
-        GLOBAL_MAX_TOKENS,
-        route_snapshot,
-        "primary",
+        GlobalCallSpec {
+            work,
+            ai_config,
+            system,
+            user,
+            max_tokens: GLOBAL_MAX_TOKENS,
+            route_snapshot,
+            role: "primary",
+        },
     )
     .await
     {
@@ -2310,12 +2354,15 @@ async fn complete_global_output(
     if diagnostic.finish_reason.as_deref() == Some("length") {
         diagnostic = match request_global_completion(
             state,
-            work,
-            system,
-            user,
-            GLOBAL_LENGTH_RECOVERY_MAX_TOKENS,
-            route_snapshot,
-            "length_recovery",
+            GlobalCallSpec {
+                work,
+                ai_config,
+                system,
+                user,
+                max_tokens: GLOBAL_LENGTH_RECOVERY_MAX_TOKENS,
+                route_snapshot,
+                role: "length_recovery",
+            },
         )
         .await
         {
@@ -2719,6 +2766,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                     .execute(&mut *tx)
                     .await?;
             } else {
+                let mut used_provider_call_ids = HashSet::new();
                 for (call_id, audit) in &call_audits {
                     let audit = audit.clone().unwrap_or_else(|| LlmCallAudit {
                         provider_request_id: None,
@@ -2728,10 +2776,15 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                         input_tokens: None,
                         output_tokens: None,
                     });
+                    let provider_call_id = unique_provider_call_id(
+                        call_id,
+                        audit.provider_request_id.as_deref(),
+                        &mut used_provider_call_ids,
+                    );
                     sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, cost_microunits, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
                         .bind(call_id)
                         .bind(&attempt_event_id)
-                        .bind(audit.provider_request_id.unwrap_or_else(|| "unknown".to_owned()))
+                        .bind(provider_call_id)
                         .bind(audit.model)
                         .bind(audit.status)
                         .bind(audit.duration_ms)
@@ -2879,6 +2932,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                     .execute(&mut *tx)
                     .await?;
             } else {
+                let mut used_provider_call_ids = HashSet::new();
                 for (call_id, audit) in &call_audits {
                     let audit = audit.clone().unwrap_or_else(|| LlmCallAudit {
                         provider_request_id: None,
@@ -2891,10 +2945,15 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                         input_tokens: None,
                         output_tokens: None,
                     });
+                    let provider_call_id = unique_provider_call_id(
+                        call_id,
+                        audit.provider_request_id.as_deref(),
+                        &mut used_provider_call_ids,
+                    );
                     sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, cost_microunits, error_code, error_summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
                         .bind(call_id)
                         .bind(&attempt_event_id)
-                        .bind(audit.provider_request_id.unwrap_or_else(|| "unknown".to_owned()))
+                        .bind(provider_call_id)
                         .bind(audit.model)
                         .bind(audit.status)
                         .bind(audit.duration_ms)
@@ -3228,14 +3287,10 @@ mod tests {
                         .expect("response state lock")
                         .pop_front()
                         .expect("mock response remains");
-                    let request_id = format!(
-                        "mock-provider-response-{}",
-                        request["max_tokens"].as_u64().unwrap_or_default()
-                    );
                     (
                         StatusCode::OK,
                         Json(json!({
-                            "id": request_id,
+                            "id": "mock-provider-response",
                             "choices": [{
                                 "message": {"content": content},
                                 "finish_reason": finish_reason
@@ -3419,7 +3474,7 @@ mod tests {
         let pool = global_execution_pool().await;
         seed_executable_work(&pool, "wrapped-output-work", &["title_zh"]).await;
         let base_url = spawn_sequenced_test_ai_server(vec![(
-            "```json\n{\"output\":{\"title_zh\":\"标题\",\"status\":\"ready\"}}\n```",
+            r#"{"output":{"title_zh":"标题","status":"ready"}}"#,
             "stop",
         )])
         .await
@@ -3470,6 +3525,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_rejects_unknown_output_wrapper_after_provider_success() {
+        let pool = global_execution_pool().await;
+        seed_executable_work(&pool, "unknown-wrapper-work", &["title_zh"]).await;
+        let base_url = spawn_sequenced_test_ai_server(vec![(
+            r#"{"title_zh":"标题","result":{"title_zh":"错误"}}"#,
+            "stop",
+        )])
+        .await
+        .0;
+        let mut state = global_state(pool.clone());
+        Arc::get_mut(&mut state)
+            .expect("state has a single owner")
+            .config
+            .ai
+            .as_mut()
+            .expect("AI configuration")
+            .base_url = base_url;
+
+        let work = claim_next(&state, 1)
+            .await
+            .unwrap()
+            .expect("queued work should be claimed");
+        let attempt_no = work.attempt_count;
+        execute(&state, work).await.unwrap();
+
+        let (status, failure_class, error_code): (String, String, String) = sqlx::query_as(
+            "SELECT w.status, w.failure_class, e.error_code FROM content_work_items w JOIN content_attempt_events e ON e.work_item_id = w.id AND e.attempt_no = ? AND e.event_type = 'attempt_completed' WHERE w.id = 'unknown-wrapper-work'",
+        )
+        .bind(attempt_no)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(failure_class, "output_contract_invalid");
+        assert_eq!(error_code, "output_contract_invalid");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_result_projections WHERE work_item_id = 'unknown-wrapper-work'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_llm_calls WHERE attempt_event_id = (SELECT id FROM content_attempt_events WHERE work_item_id = 'unknown-wrapper-work' AND attempt_no = ? AND event_type = 'attempt_started') AND status = 'succeeded'",
+            )
+            .bind(attempt_no)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn execute_performs_one_length_recovery_and_links_both_calls() {
         let pool = global_execution_pool().await;
         seed_executable_work(&pool, "length-recovery-work", &["title_zh"]).await;
@@ -3501,6 +3613,16 @@ mod tests {
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM content_attempt_llm_calls WHERE attempt_event_id = (SELECT id FROM content_attempt_events WHERE work_item_id = 'length-recovery-work' AND attempt_no = ? AND event_type = 'attempt_started')",
+            )
+            .bind(attempt_no)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(DISTINCT provider_call_id) FROM content_attempt_llm_calls WHERE attempt_event_id = (SELECT id FROM content_attempt_events WHERE work_item_id = 'length-recovery-work' AND attempt_no = ? AND event_type = 'attempt_started')",
             )
             .bind(attempt_no)
             .fetch_one(&pool)
@@ -4613,7 +4735,6 @@ mod tests {
             r#"{"title_zh":"标题"}"#,
             "```json\n{\"title_zh\":\"标题\"}\n```",
             r#"{"output":{"title_zh":"标题"}}"#,
-            "```json\n{\"output\":{\"title_zh\":\"标题\"}}\n```",
         ] {
             let output = validate_output(raw, &target_slots, &source_blocks)
                 .expect("supported output wrapper should normalize");
@@ -4628,6 +4749,9 @@ mod tests {
         for raw in [
             r#"{"title_zh":"标题","output":{"title_zh":"另一个标题"}}"#,
             r#"{"output":{"output":{"title_zh":"标题"}}}"#,
+            r#"{"title_zh":"标题","result":{"title_zh":"另一个标题"}}"#,
+            r#"{"title_zh":"标题","data":[]}"#,
+            "```json\n{\"output\":{\"title_zh\":\"标题\"}}\n```",
             "```json\n{\"title_zh\":\"标题\"}",
         ] {
             assert!(validate_output(raw, &target_slots, &source_blocks).is_err());
