@@ -143,28 +143,33 @@ function pendingStatusMessage(
 		| NonNullable<ReleaseDetailResponse["translated"]>["status"]
 		| undefined,
 ) {
-	return status === "deferred_provider"
-		? "翻译已提交，供应商暂缓处理。"
-		: status === "running"
-			? "翻译正在后台处理中。"
-			: "翻译已排队，正在后台处理中。";
+	return status === "blocked_config"
+		? "等待模型配置恢复，恢复后会自动继续"
+		: status === "deferred_provider"
+			? "翻译已提交，供应商暂缓处理。"
+			: status === "running"
+				? "翻译正在后台处理中。"
+				: "翻译已排队，正在后台处理中。";
 }
 
 function pendingPolishStatusMessage(
 	status: NonNullable<ReleaseDetailResponse["smart"]>["status"] | undefined,
 ) {
-	return status === "deferred_provider"
-		? "润色已提交，供应商暂缓处理。"
-		: status === "running"
-			? "润色正在后台处理中。"
-			: "润色已排队，正在后台处理中。";
+	return status === "blocked_config"
+		? "等待模型配置恢复，恢复后会自动继续"
+		: status === "deferred_provider"
+			? "润色已提交，供应商暂缓处理。"
+			: status === "running"
+				? "润色正在后台处理中。"
+				: "润色已排队，正在后台处理中。";
 }
 
 function isPendingDetailStatus(status: string | undefined) {
 	return (
 		status === "queued" ||
 		status === "running" ||
-		status === "deferred_provider"
+		status === "deferred_provider" ||
+		status === "blocked_config"
 	);
 }
 

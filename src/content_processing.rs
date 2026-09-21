@@ -15,7 +15,9 @@ use sqlx::{Error as SqlxError, Row, Sqlite, SqlitePool, Transaction};
 use tokio::{task::JoinSet, time::sleep};
 use tracing::warn;
 
-use crate::{ai, api, error::ApiError, local_id, state::AppState, translations};
+use crate::{
+    ai, api, content_identity_upgrade, error::ApiError, local_id, state::AppState, translations,
+};
 use tower_sessions::Session;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,6 +482,20 @@ struct WorkRow {
     lease_owner: Option<String>,
     #[sqlx(default)]
     lease_expires_at: Option<String>,
+    #[sqlx(default)]
+    attempt_configuration_snapshot_json: Option<String>,
+    #[sqlx(default)]
+    attempt_route_snapshot_json: Option<String>,
+    #[sqlx(default)]
+    attempt_configuration_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AttemptRouteSnapshot {
+    configuration_snapshot_json: String,
+    route_snapshot_json: String,
+    configuration_fingerprint: String,
+    route_models: Vec<String>,
 }
 
 const GLOBAL_PROTOCOL_VERSION: &str = "content-processing.v1";
@@ -541,20 +557,99 @@ pub(crate) fn source_hash_for_item(item: &translations::TranslationRequestItemIn
 }
 
 async fn runtime_configuration_fingerprint(state: &AppState, model_profile: &str) -> String {
-    let (base_url, api_key) = state
-        .config
-        .ai
-        .as_ref()
-        .map(|config| (config.base_url.to_string(), ai::sha256_hex(&config.api_key)))
-        .unwrap_or_default();
+    let Some(snapshot) = current_attempt_route_snapshot(state).await else {
+        return ai::sha256_hex(&format!(
+            "{GLOBAL_PROTOCOL_VERSION}\nmodel={model_profile}\nai-disabled"
+        ));
+    };
+    ai::sha256_hex(&format!(
+        "{GLOBAL_PROTOCOL_VERSION}\nmodel={model_profile}\n{}",
+        snapshot.configuration_fingerprint
+    ))
+}
+
+async fn current_attempt_route_snapshot(state: &AppState) -> Option<AttemptRouteSnapshot> {
+    let config = state.config.ai.as_ref()?;
+    if config.api_key.trim().is_empty() || config.base_url.as_str().trim().is_empty() {
+        return None;
+    }
     let routing = state
         .llm_scheduler
-        .routing_status(state.config.ai.as_ref().map(|config| config.model.as_str()))
+        .routing_status(Some(config.model.as_str()))
         .await;
-    ai::sha256_hex(&format!(
-        "{GLOBAL_PROTOCOL_VERSION}\nmodel={model_profile}\nbase_url={base_url}\napi_key_hash={api_key}\nroute={}",
-        routing.llm_models.join(",")
-    ))
+    if routing.llm_models.is_empty() {
+        return None;
+    }
+    let configuration_snapshot_json = json!({
+        "base_url_origin": config.base_url.origin().ascii_serialization(),
+        "base_url_sha256": ai::sha256_hex(config.base_url.as_str()),
+        "api_key_sha256": ai::sha256_hex(&config.api_key),
+    })
+    .to_string();
+    let route_snapshot_json = serde_json::to_string(&routing.llm_models).ok()?;
+    let configuration_fingerprint = ai::sha256_hex(&format!(
+        "{GLOBAL_PROTOCOL_VERSION}\n{configuration_snapshot_json}\n{route_snapshot_json}"
+    ));
+    Some(AttemptRouteSnapshot {
+        configuration_snapshot_json,
+        route_snapshot_json,
+        configuration_fingerprint,
+        route_models: routing.llm_models,
+    })
+}
+
+async fn has_valid_runtime_configuration(state: &AppState) -> bool {
+    current_attempt_route_snapshot(state).await.is_some()
+}
+
+async fn refresh_model_routes_in_transaction(
+    state: &AppState,
+    tx: &mut Transaction<'_, Sqlite>,
+) -> Result<()> {
+    let persisted_models =
+        crate::admin_runtime::load_llm_models_in_transaction(tx, &state.config).await?;
+    state
+        .llm_scheduler
+        .set_model_routing(persisted_models)
+        .await;
+    Ok(())
+}
+
+async fn has_valid_runtime_configuration_in_transaction(
+    state: &AppState,
+    tx: &mut Transaction<'_, Sqlite>,
+) -> Result<bool> {
+    refresh_model_routes_in_transaction(state, tx).await?;
+    Ok(has_valid_runtime_configuration(state).await)
+}
+
+pub async fn on_runtime_configuration_reload(state: &AppState) -> Result<()> {
+    let mut requeued = 0_i64;
+    loop {
+        let (_permit, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "content_identity_config_recovery")
+            .await?;
+        if !has_valid_runtime_configuration_in_transaction(state, &mut tx).await? {
+            tx.rollback().await?;
+            break;
+        }
+        let now = Utc::now().to_rfc3339();
+        let (batch_requeued, has_more) =
+            content_identity_upgrade::requeue_blocked_config_batch(&mut tx, &now).await?;
+        tx.commit().await?;
+        requeued = requeued.saturating_add(batch_requeued);
+        if !has_more {
+            break;
+        }
+    }
+    if requeued > 0 {
+        tracing::info!(
+            requeued,
+            "requeued blocked content work after configuration reload"
+        );
+    }
+    Ok(())
 }
 
 async fn current_model_profile(state: &AppState) -> String {
@@ -631,6 +726,36 @@ async fn load_projection(
     tx: &mut Transaction<'_, Sqlite>,
     work: &WorkRow,
 ) -> Result<Option<Value>> {
+    if content_identity_upgrade::is_complete_in_transaction(tx).await? {
+        let key = identity_from_work(work);
+        let identity_id = content_identity_upgrade::identity_id_for(&key)?;
+        let exact = sqlx::query_scalar::<_, String>(
+            "SELECT payload_json FROM content_current_result_projections WHERE identity_id = ?",
+        )
+        .bind(&identity_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let payload = if exact.is_some() {
+            exact
+        } else {
+            sqlx::query_scalar::<_, String>(
+                "SELECT p.payload_json FROM content_current_result_projections p JOIN content_work_identities i ON i.id = p.identity_id WHERE p.active_work_item_id = ? AND i.canonical_resource_type = ? AND i.canonical_resource_id = ? AND i.pipeline = ? AND i.variant = ? AND i.target_lang = ? AND i.protocol_version = ? AND i.source_hash <> ? ORDER BY julianday(p.published_at) DESC, p.published_at DESC, i.source_hash DESC LIMIT 1",
+            )
+            .bind(&work.id)
+            .bind(&work.canonical_resource_type)
+            .bind(&work.canonical_resource_id)
+            .bind(&work.pipeline)
+            .bind(&work.variant)
+            .bind(&work.target_lang)
+            .bind(&work.protocol_version)
+            .bind(&work.source_hash)
+            .fetch_optional(&mut **tx)
+            .await?
+        };
+        return payload
+            .map(|raw| serde_json::from_str(&raw).context("invalid current result projection"))
+            .transpose();
+    }
     let payload = sqlx::query_scalar::<_, String>(
         "SELECT payload_json FROM content_result_projections WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND model_profile = ? AND source_hash = ? LIMIT 1",
     )
@@ -647,6 +772,18 @@ async fn load_projection(
     payload
         .map(|raw| serde_json::from_str(&raw).context("invalid global result projection"))
         .transpose()
+}
+
+fn identity_from_work(work: &WorkRow) -> content_identity_upgrade::ContentWorkIdentity {
+    content_identity_upgrade::ContentWorkIdentity {
+        canonical_resource_type: work.canonical_resource_type.clone(),
+        canonical_resource_id: work.canonical_resource_id.clone(),
+        pipeline: work.pipeline.clone(),
+        variant: work.variant.clone(),
+        target_lang: work.target_lang.clone(),
+        source_hash: work.source_hash.clone(),
+        protocol_version: work.protocol_version.clone(),
+    }
 }
 
 async fn insert_request_link(
@@ -671,6 +808,87 @@ async fn insert_request_link(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+async fn load_work_by_id(tx: &mut Transaction<'_, Sqlite>, work_item_id: &str) -> Result<WorkRow> {
+    sqlx::query_as::<_, WorkRow>(
+        "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE id = ?",
+    )
+    .bind(work_item_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(Into::into)
+}
+
+async fn load_work_by_id_from_pool(
+    pool: &SqlitePool,
+    work_item_id: &str,
+) -> Result<WorkRow, ApiError> {
+    sqlx::query_as::<_, WorkRow>(
+        "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE id = ?",
+    )
+    .bind(work_item_id)
+    .fetch_one(pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+async fn work_for_identity(
+    pool: &SqlitePool,
+    key: &content_identity_upgrade::ContentWorkIdentity,
+) -> Result<Option<WorkRow>, ApiError> {
+    let identity_id = content_identity_upgrade::identity_id_for(key).map_err(ApiError::internal)?;
+    let projected_work_item_id = sqlx::query_scalar::<_, String>(
+        "SELECT work_item_id FROM content_current_result_projections WHERE identity_id = ?",
+    )
+    .bind(&identity_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if let Some(work_item_id) = projected_work_item_id {
+        return load_work_by_id_from_pool(pool, &work_item_id)
+            .await
+            .map(Some);
+    }
+    let work_item_id = sqlx::query_scalar::<_, String>(
+        "SELECT w.id FROM content_work_identity_members m JOIN content_work_items w ON w.id = m.work_item_id WHERE m.identity_id = ? ORDER BY CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'failed' THEN 4 WHEN 'ready' THEN 5 ELSE 6 END, w.attempt_count DESC, julianday(w.updated_at) DESC, w.updated_at DESC, w.id DESC LIMIT 1",
+    )
+    .bind(&identity_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(ApiError::internal)?;
+    match work_item_id {
+        Some(work_item_id) => load_work_by_id_from_pool(pool, &work_item_id)
+            .await
+            .map(Some),
+        None => Ok(None),
+    }
+}
+
+async fn work_for_identity_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    key: &content_identity_upgrade::ContentWorkIdentity,
+) -> Result<Option<WorkRow>> {
+    let identity_id = content_identity_upgrade::identity_id_for(key)?;
+    let projected_work_item_id = sqlx::query_scalar::<_, String>(
+        "SELECT work_item_id FROM content_current_result_projections WHERE identity_id = ?",
+    )
+    .bind(&identity_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(work_item_id) = projected_work_item_id {
+        return load_work_by_id(tx, &work_item_id).await.map(Some);
+    }
+    let work_item_id = sqlx::query_scalar::<_, String>(
+        "SELECT w.id FROM content_work_identity_members m JOIN content_work_items w ON w.id = m.work_item_id WHERE m.identity_id = ? ORDER BY CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'failed' THEN 4 WHEN 'ready' THEN 5 ELSE 6 END, w.attempt_count DESC, julianday(w.updated_at) DESC, w.updated_at DESC, w.id DESC LIMIT 1",
+    )
+    .bind(&identity_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match work_item_id {
+        Some(work_item_id) => load_work_by_id(tx, &work_item_id).await.map(Some),
+        None => Ok(None),
+    }
 }
 
 pub async fn submit_item(
@@ -737,7 +955,6 @@ pub async fn submit_item(
     }
     let (resource_type, pipeline) = canonical_identity(item);
     let hash = source_hash(item).map_err(ApiError::internal)?;
-    let model_profile = current_model_profile(state).await;
     let snapshot = serde_json::to_string(&json!({
         "source_blocks": item.source_blocks,
         "target_slots": item.target_slots,
@@ -752,88 +969,72 @@ pub async fn submit_item(
         .await
         .map_err(ApiError::internal)?;
     ensure_global_mode_in_transaction(&mut tx).await?;
-    let exact_existing = sqlx::query_as::<_, WorkRow>(
-        "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND source_hash = ? AND protocol_version = ? AND model_profile = ? LIMIT 1",
-    )
-    .bind(resource_type)
-    .bind(&item.entity_id)
-    .bind(pipeline)
-    .bind(&item.variant)
-    .bind(&item.target_lang)
-    .bind(&hash)
-    .bind(GLOBAL_PROTOCOL_VERSION)
-    .bind(&model_profile)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
-    // A model-profile change alone must not re-run an already published global
-    // result. Explicit refreshes create a new source hash; ordinary requests
-    // continue to use the best existing work for this unchanged source.
-    let existing = if exact_existing.is_some() {
-        exact_existing
+    let configuration_valid = has_valid_runtime_configuration_in_transaction(state, &mut tx)
+        .await
+        .map_err(ApiError::internal)?;
+    let model_profile = current_model_profile(state).await;
+    let identity = content_identity_upgrade::ContentWorkIdentity {
+        canonical_resource_type: resource_type.to_owned(),
+        canonical_resource_id: item.entity_id.clone(),
+        pipeline: pipeline.to_owned(),
+        variant: item.variant.clone(),
+        target_lang: item.target_lang.clone(),
+        source_hash: hash.clone(),
+        protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
+    };
+    let identity_id =
+        content_identity_upgrade::ensure_identity_registered(&mut tx, &identity, &now)
+            .await
+            .map_err(ApiError::internal)?;
+    content_identity_upgrade::ensure_all_identity_members(&mut tx, &identity, &identity_id, &now)
+        .await
+        .map_err(ApiError::internal)?;
+    let current_projection =
+        content_identity_upgrade::ensure_current_projection_for_key(&mut tx, &identity_id, &now)
+            .await
+            .map_err(ApiError::internal)?;
+    // The registry is authoritative for identity; model_profile only records
+    // the provenance of retained model-specific work rows.
+    let existing = if let Some(projection) = current_projection.as_ref() {
+        Some(
+            load_work_by_id(&mut tx, &projection.work_item_id)
+                .await
+                .map_err(ApiError::internal)?,
+        )
     } else {
         sqlx::query_as::<_, WorkRow>(
-            "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND source_hash = ? AND protocol_version = ? AND status IN ('queued', 'running', 'ready', 'deferred_provider', 'blocked_config') ORDER BY CASE status WHEN 'ready' THEN 0 WHEN 'queued' THEN 1 WHEN 'running' THEN 2 WHEN 'deferred_provider' THEN 3 WHEN 'blocked_config' THEN 4 ELSE 5 END, datetime(updated_at) DESC, id DESC LIMIT 1",
+            "SELECT w.id, w.canonical_resource_type, w.canonical_resource_id, w.pipeline, w.variant, w.target_lang, w.source_hash, w.protocol_version, w.model_profile, w.source_snapshot_json, w.configuration_fingerprint, w.status, w.priority, w.cache_hit, w.token_estimate, w.batch_id, w.attempt_count, w.next_retry_at, w.retry_expires_at, w.retry_after_at, w.created_at FROM content_work_identity_members m JOIN content_work_items w ON w.id = m.work_item_id WHERE m.identity_id = ? ORDER BY CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'failed' THEN 4 WHEN 'ready' THEN 5 ELSE 6 END, w.attempt_count DESC, julianday(w.updated_at) DESC, w.updated_at DESC, w.id DESC LIMIT 1",
         )
-        .bind(resource_type)
-        .bind(&item.entity_id)
-        .bind(pipeline)
-        .bind(&item.variant)
-        .bind(&item.target_lang)
-        .bind(&hash)
-        .bind(GLOBAL_PROTOCOL_VERSION)
+        .bind(&identity_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(ApiError::internal)?
     };
     let existing_work = existing.is_some();
     let work = if let Some(existing) = existing {
-        if matches!(
-            existing.status.as_str(),
-            "failed" | "cancelled" | "superseded" | "not_applicable"
-        ) {
-            let projection_exists = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM content_result_projections WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND model_profile = ? AND source_hash = ?",
+        if current_projection.is_none()
+            && matches!(
+                existing.status.as_str(),
+                "failed" | "cancelled" | "superseded" | "not_applicable" | "ready"
             )
-            .bind(resource_type)
-            .bind(&item.entity_id)
-            .bind(pipeline)
-            .bind(&item.variant)
-            .bind(&item.target_lang)
-            .bind(GLOBAL_PROTOCOL_VERSION)
-            .bind(&model_profile)
-            .bind(&hash)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(ApiError::internal)?
-                > 0;
-            let status = if model_profile == "ai-disabled" {
-                "blocked_config"
-            } else if projection_exists {
-                "ready"
-            } else {
+        {
+            let status = if configuration_valid {
                 "queued"
+            } else {
+                "blocked_config"
             };
             sqlx::query(
-                "UPDATE content_work_items SET model_profile = ?, source_snapshot_json = ?, configuration_fingerprint = ?, status = ?, priority = 0, cache_hit = ?, batch_id = NULL, lease_owner = NULL, lease_expires_at = NULL, next_retry_at = NULL, retry_expires_at = NULL, retry_after_at = NULL, failure_class = NULL, cancelled_at = NULL, finished_at = NULL, updated_at = ? WHERE id = ?",
+                "UPDATE content_work_items SET status = ?, priority = 0, cache_hit = 0, batch_id = NULL, lease_owner = NULL, lease_expires_at = NULL, next_retry_at = NULL, retry_expires_at = NULL, retry_after_at = NULL, failure_class = NULL, cancelled_at = NULL, finished_at = NULL, updated_at = ? WHERE id = ?",
             )
-            .bind(&model_profile)
-            .bind(&snapshot)
-            .bind(runtime_configuration_fingerprint(state, &model_profile).await)
             .bind(status)
-            .bind(if projection_exists { 1_i64 } else { 0_i64 })
             .bind(&now)
             .bind(&existing.id)
             .execute(&mut *tx)
             .await
             .map_err(ApiError::internal)?;
-            sqlx::query_as::<_, WorkRow>(
-                "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE id = ?",
-            )
-            .bind(&existing.id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(ApiError::internal)?
+            load_work_by_id(&mut tx, &existing.id)
+                .await
+                .map_err(ApiError::internal)?
         } else {
             existing
         }
@@ -851,27 +1052,10 @@ pub async fn submit_item(
         .fetch_optional(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
-        let projection_exists = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM content_result_projections WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND model_profile = ? AND source_hash = ?",
-        )
-        .bind(resource_type)
-        .bind(&item.entity_id)
-        .bind(pipeline)
-        .bind(&item.variant)
-        .bind(&item.target_lang)
-        .bind(GLOBAL_PROTOCOL_VERSION)
-        .bind(&model_profile)
-        .bind(&hash)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(ApiError::internal)?
-            > 0;
-        let status = if model_profile == "ai-disabled" {
-            "blocked_config"
-        } else if projection_exists {
-            "ready"
-        } else {
+        let status = if configuration_valid {
             "queued"
+        } else {
+            "blocked_config"
         };
         sqlx::query(
             "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, supersedes_work_item_id, attempt_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, 0, ?, ?)",
@@ -888,7 +1072,7 @@ pub async fn submit_item(
         .bind(&snapshot)
         .bind(runtime_configuration_fingerprint(state, &model_profile).await)
         .bind(status)
-        .bind(if projection_exists { 1_i64 } else { 0_i64 })
+        .bind(0_i64)
         .bind(i64::try_from(item.source_blocks.iter().map(|block| block.text.len()).sum::<usize>()).unwrap_or(i64::MAX))
         .bind(&supersedes_work_item_id)
         .bind(&now)
@@ -896,13 +1080,17 @@ pub async fn submit_item(
         .execute(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
-        sqlx::query_as::<_, WorkRow>(
-            "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE id = ?",
+        content_identity_upgrade::ensure_all_identity_members(
+            &mut tx,
+            &identity,
+            &identity_id,
+            &now,
         )
-        .bind(&work_id)
-        .fetch_one(&mut *tx)
         .await
-        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+        load_work_by_id(&mut tx, &work_id)
+            .await
+            .map_err(ApiError::internal)?
     };
     let supersedes_work_item_id = sqlx::query_scalar::<_, Option<String>>(
         "SELECT supersedes_work_item_id FROM content_work_items WHERE id = ?",
@@ -929,25 +1117,28 @@ pub async fn submit_item(
             .execute(&mut *tx)
             .await
             .map_err(ApiError::internal)?;
+        sqlx::query("UPDATE content_current_result_projections SET active_work_item_id = ?, updated_at = ? WHERE identity_id IN (SELECT id FROM content_work_identities WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND source_hash <> ?) AND (active_work_item_id IS NULL OR active_work_item_id <> ?)")
+            .bind(&work.id)
+            .bind(&now)
+            .bind(resource_type)
+            .bind(&item.entity_id)
+            .bind(pipeline)
+            .bind(&item.variant)
+            .bind(&item.target_lang)
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(&hash)
+            .bind(&work.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
     }
-    sqlx::query("UPDATE content_result_projections SET active_work_item_id = ?, updated_at = ? WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND model_profile = ? AND source_hash = ? AND (active_work_item_id IS NULL OR active_work_item_id <> ?)")
-        .bind(&work.id)
-        .bind(&now)
-        .bind(resource_type)
-        .bind(&item.entity_id)
-        .bind(pipeline)
-        .bind(&item.variant)
-        .bind(&item.target_lang)
-        .bind(GLOBAL_PROTOCOL_VERSION)
-        .bind(&model_profile)
-        .bind(&hash)
-        .bind(&work.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(ApiError::internal)?;
-    let projection = load_projection(&mut tx, &work)
-        .await
-        .map_err(ApiError::internal)?;
+    let projection = if let Some(projection) = current_projection {
+        serde_json::from_str(&projection.payload_json).ok()
+    } else {
+        load_projection(&mut tx, &work)
+            .await
+            .map_err(ApiError::internal)?
+    };
 
     if let Some(existing_request_id) = sqlx::query_scalar::<_, String>(
         "SELECT request_id FROM content_request_links WHERE work_item_id = ? AND requester_id = ? AND producer_ref = ? ORDER BY created_at DESC LIMIT 1",
@@ -1028,7 +1219,7 @@ pub async fn submit_item(
                 }
                 if !matches!(
                     body.status.as_str(),
-                    "queued" | "running" | "deferred_provider"
+                    "queued" | "running" | "deferred_provider" | "blocked_config"
                 ) {
                     status_code = StatusCode::OK;
                     break;
@@ -1083,6 +1274,9 @@ pub async fn get_request(
         created_at: row.get("created_at"),
         lease_owner: row.try_get("lease_owner").ok(),
         lease_expires_at: row.try_get("lease_expires_at").ok(),
+        attempt_configuration_snapshot_json: None,
+        attempt_route_snapshot_json: None,
+        attempt_configuration_fingerprint: None,
     };
     let authorization_probe = translations::TranslationRequestItemInput {
         producer_ref: row.get("producer_ref"),
@@ -1095,24 +1289,50 @@ pub async fn get_request(
         target_slots: Vec::new(),
     };
     api::canonical_global_translation_item(state, user_id, &authorization_probe).await?;
-    let projection = sqlx::query_scalar::<_, String>(
-        "SELECT payload_json FROM content_result_projections WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND model_profile = ? AND source_hash = ? ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
-    )
-    .bind(&work.canonical_resource_type)
-    .bind(&work.canonical_resource_id)
-    .bind(&work.pipeline)
-    .bind(&work.variant)
-    .bind(&work.target_lang)
-    .bind(&work.protocol_version)
-    .bind(&work.model_profile)
-    .bind(&work.source_hash)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(ApiError::internal)?
-    .and_then(|raw| serde_json::from_str(&raw).ok());
-    let mut response = public_response(&work, request_id, projection);
+    let identity_upgrade_complete = content_identity_upgrade::is_complete(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let response_work = if identity_upgrade_complete {
+        work_for_identity(&state.pool, &identity_from_work(&work))
+            .await?
+            .unwrap_or_else(|| work.clone())
+    } else {
+        work.clone()
+    };
+    let (visible_status, projection) = if identity_upgrade_complete {
+        read_global_resource(
+            state,
+            &work.canonical_resource_type,
+            &work.canonical_resource_id,
+            &work.pipeline,
+            &work.variant,
+            &work.source_hash,
+        )
+        .await?
+        .unwrap_or_else(|| (response_work.status.clone(), json!({})))
+    } else {
+        let projection = sqlx::query_scalar::<_, String>(
+            "SELECT payload_json FROM content_result_projections WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND model_profile = ? AND source_hash = ? ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
+        )
+        .bind(&work.canonical_resource_type)
+        .bind(&work.canonical_resource_id)
+        .bind(&work.pipeline)
+        .bind(&work.variant)
+        .bind(&work.target_lang)
+        .bind(&work.protocol_version)
+        .bind(&work.model_profile)
+        .bind(&work.source_hash)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+        (work.status.clone(), projection.unwrap_or_else(|| json!({})))
+    };
+    let mut response = public_response(&response_work, request_id, Some(projection));
+    response["status"] = Value::String(visible_status.clone());
+    response["result"]["status"] = Value::String(visible_status);
     response["result"]["producer_ref"] = authorization_probe.producer_ref.into();
-    response["result"]["kind"] = Value::String(kind_for_work(&work));
+    response["result"]["kind"] = Value::String(kind_for_work(&response_work));
     Ok(Some(response))
 }
 
@@ -1124,6 +1344,65 @@ pub async fn read_global_resource(
     variant: &str,
     expected_source_hash: &str,
 ) -> Result<Option<(String, Value)>, ApiError> {
+    if content_identity_upgrade::is_complete(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        let key = content_identity_upgrade::ContentWorkIdentity {
+            canonical_resource_type: resource_type.to_owned(),
+            canonical_resource_id: resource_id.to_owned(),
+            pipeline: pipeline.to_owned(),
+            variant: variant.to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            source_hash: expected_source_hash.to_owned(),
+            protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
+        };
+        let identity_id =
+            content_identity_upgrade::identity_id_for(&key).map_err(ApiError::internal)?;
+        let exact_payload = sqlx::query_scalar::<_, String>(
+            "SELECT payload_json FROM content_current_result_projections WHERE identity_id = ?",
+        )
+        .bind(&identity_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+        if let Some(raw) = exact_payload {
+            let payload = serde_json::from_str(&raw).map_err(ApiError::internal)?;
+            return Ok(Some(("ready".to_owned(), payload)));
+        }
+        let Some(current_work) = work_for_identity(&state.pool, &key).await? else {
+            return Ok(None);
+        };
+        let retained_payload: Option<Value> = sqlx::query_scalar::<_, String>(
+            "SELECT p.payload_json FROM content_current_result_projections p JOIN content_work_identities i ON i.id = p.identity_id WHERE p.active_work_item_id = ? AND i.canonical_resource_type = ? AND i.canonical_resource_id = ? AND i.pipeline = ? AND i.variant = ? AND i.target_lang = ? AND i.protocol_version = ? AND i.source_hash <> ? ORDER BY julianday(p.published_at) DESC, p.published_at DESC, i.source_hash DESC LIMIT 1",
+        )
+        .bind(&current_work.id)
+        .bind(resource_type)
+        .bind(resource_id)
+        .bind(pipeline)
+        .bind(variant)
+        .bind("zh-CN")
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .bind(expected_source_hash)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+        if current_work.status == "failed"
+            && retained_payload
+                .as_ref()
+                .is_some_and(|payload| payload.is_object())
+        {
+            return Ok(Some((
+                "ready".to_owned(),
+                retained_payload.unwrap_or_else(|| json!({})),
+            )));
+        }
+        return Ok(Some((
+            current_work.status,
+            retained_payload.unwrap_or_else(|| json!({})),
+        )));
+    }
     let model_profile = current_model_profile(state).await;
     let current = sqlx::query_as::<_, (String, String, Option<String>, String)>(
         "SELECT id, status, supersedes_work_item_id, model_profile FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = 'zh-CN' AND source_hash = ? AND protocol_version = ? AND model_profile = ? ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
@@ -1251,9 +1530,8 @@ pub async fn latest_request_id_for_resource(
     target_lang: &str,
     source_hash: &str,
 ) -> Result<Option<String>, ApiError> {
-    let model_profile = current_model_profile(state).await;
     sqlx::query_scalar::<_, String>(
-        "SELECT l.request_id FROM content_request_links l JOIN content_work_items w ON w.id = l.work_item_id WHERE l.requester_id = ? AND w.canonical_resource_type = ? AND w.canonical_resource_id = ? AND w.pipeline = ? AND w.variant = ? AND w.target_lang = ? AND w.source_hash = ? AND w.protocol_version = ? ORDER BY CASE WHEN w.model_profile = ? THEN 0 ELSE 1 END, datetime(l.created_at) DESC, l.request_id DESC LIMIT 1",
+        "SELECT l.request_id FROM content_request_links l JOIN content_work_items w ON w.id = l.work_item_id WHERE l.requester_id = ? AND w.canonical_resource_type = ? AND w.canonical_resource_id = ? AND w.pipeline = ? AND w.variant = ? AND w.target_lang = ? AND w.source_hash = ? AND w.protocol_version = ? ORDER BY datetime(l.created_at) DESC, l.request_id DESC LIMIT 1",
     )
     .bind(requester_id)
     .bind(resource_type)
@@ -1263,7 +1541,6 @@ pub async fn latest_request_id_for_resource(
     .bind(target_lang)
     .bind(source_hash)
     .bind(GLOBAL_PROTOCOL_VERSION)
-    .bind(model_profile)
     .fetch_optional(&state.pool)
     .await
     .map_err(ApiError::internal)
@@ -1283,7 +1560,10 @@ pub async fn retry_request(
         .await
         .map_err(ApiError::internal)?;
     ensure_global_mode_in_transaction(&mut tx).await?;
-    let row = sqlx::query_as::<_, WorkRow>(
+    let configuration_valid = has_valid_runtime_configuration_in_transaction(state, &mut tx)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut row = sqlx::query_as::<_, WorkRow>(
         "SELECT w.id, w.canonical_resource_type, w.canonical_resource_id, w.pipeline, w.variant, w.target_lang, w.source_hash, w.protocol_version, w.model_profile, w.source_snapshot_json, w.configuration_fingerprint, w.status, w.priority, w.cache_hit, w.token_estimate, w.batch_id, w.attempt_count, w.next_retry_at, w.retry_expires_at, w.retry_after_at, w.created_at FROM content_request_links l JOIN content_work_items w ON w.id = l.work_item_id WHERE l.request_id = ? AND l.requester_id = ? LIMIT 1",
     )
     .bind(request_id)
@@ -1292,6 +1572,23 @@ pub async fn retry_request(
     .await
     .map_err(ApiError::internal)?
     .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "translation request not found"))?;
+    let key = identity_from_work(&row);
+    let now = Utc::now().to_rfc3339();
+    let identity_id = content_identity_upgrade::ensure_identity_registered(&mut tx, &key, &now)
+        .await
+        .map_err(ApiError::internal)?;
+    content_identity_upgrade::ensure_all_identity_members(&mut tx, &key, &identity_id, &now)
+        .await
+        .map_err(ApiError::internal)?;
+    content_identity_upgrade::ensure_current_projection_for_key(&mut tx, &identity_id, &now)
+        .await
+        .map_err(ApiError::internal)?;
+    if let Some(current) = work_for_identity_in_transaction(&mut tx, &key)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        row = current;
+    }
     let projection = load_projection(&mut tx, &row)
         .await
         .map_err(ApiError::internal)?;
@@ -1350,12 +1647,14 @@ pub async fn retry_request(
         return Ok((StatusCode::TOO_MANY_REQUESTS, body));
     }
     let request_id = local_id::generate_local_id().to_string();
-    let retry_status = if breaker_open {
+    let retry_status = if !configuration_valid {
+        "blocked_config"
+    } else if breaker_open {
         "deferred_provider"
     } else {
         "queued"
     };
-    let next_retry_at = breaker_open
+    let next_retry_at = (configuration_valid && breaker_open)
         .then(|| (Utc::now() + chrono::Duration::seconds(PROVIDER_DEFER_SECS)).to_rfc3339());
     let retry_expires_at = (Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
     let previous_attempt_no = sqlx::query_scalar::<_, Option<i64>>(
@@ -1369,9 +1668,11 @@ pub async fn retry_request(
     .max(row.attempt_count)
     .max(0);
     let next_attempt_no = previous_attempt_no.saturating_add(1);
-    sqlx::query("UPDATE content_work_items SET status = ?, priority = 3, next_retry_at = ?, retry_expires_at = CASE WHEN retry_expires_at IS NULL OR julianday(retry_expires_at) <= julianday('now') THEN ? ELSE retry_expires_at END, retry_after_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    sqlx::query("UPDATE content_work_items SET status = ?, priority = 3, failure_class = CASE WHEN ? = 'blocked_config' THEN 'configuration' ELSE NULL END, next_retry_at = ?, retry_expires_at = CASE WHEN ? = 'blocked_config' THEN retry_expires_at WHEN retry_expires_at IS NULL OR julianday(retry_expires_at) <= julianday('now') THEN ? ELSE retry_expires_at END, retry_after_at = NULL, finished_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        .bind(retry_status)
         .bind(retry_status)
         .bind(&next_retry_at)
+        .bind(retry_status)
         .bind(&retry_expires_at)
         .bind(&row.id)
         .execute(&mut *tx)
@@ -1387,15 +1688,17 @@ pub async fn retry_request(
     )
     .await
     .map_err(ApiError::internal)?;
-    sqlx::query("INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, next_retry_at, created_at) VALUES (?, ?, ?, 'manual_retry', 'attempt_queued', ?, 1, ?, CURRENT_TIMESTAMP)")
-        .bind(local_id::generate_local_id().to_string())
-        .bind(&row.id)
-        .bind(next_attempt_no)
-        .bind(retry_status)
-        .bind(&next_retry_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(ApiError::internal)?;
+    if retry_status != "blocked_config" {
+        sqlx::query("INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, next_retry_at, created_at) VALUES (?, ?, ?, 'manual_retry', 'attempt_queued', ?, 1, ?, CURRENT_TIMESTAMP)")
+            .bind(local_id::generate_local_id().to_string())
+            .bind(&row.id)
+            .bind(next_attempt_no)
+            .bind(retry_status)
+            .bind(&next_retry_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
+    }
     tx.commit().await.map_err(ApiError::internal)?;
     let mut body = public_response(&row, &request_id, projection);
     body["status"] = Value::String(retry_status.to_owned());
@@ -1410,6 +1713,8 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
         .begin_immediate(&state.pool, "content_processing_claim")
         .await?;
     ensure_global_mode_in_transaction(&mut tx).await?;
+    refresh_model_routes_in_transaction(state, &mut tx).await?;
+    let attempt_snapshot = current_attempt_route_snapshot(state).await;
     let Some(row) = sqlx::query_as::<_, WorkRow>(
         "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE status = 'queued' AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime('now')) AND ((priority < 3 AND datetime(created_at) <= datetime('now', '-60 seconds')) OR (priority >= 3 AND EXISTS (SELECT 1 FROM content_attempt_events pending WHERE pending.work_item_id = content_work_items.id AND pending.event_type = 'attempt_queued' AND pending.trigger = 'manual_retry' AND NOT EXISTS (SELECT 1 FROM content_attempt_events started WHERE started.work_item_id = pending.work_item_id AND started.attempt_no = pending.attempt_no AND started.event_type = 'attempt_started')) AND (SELECT COUNT(*) FROM content_batches WHERE status = 'running' AND trigger_reason = 'manual_retry') < ?)) ORDER BY priority DESC, datetime(created_at) ASC, id ASC LIMIT 1",
     )
@@ -1417,6 +1722,18 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
     .fetch_optional(&mut *tx)
     .await?
     else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let Some(attempt_snapshot) = attempt_snapshot else {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE content_work_items SET status = 'blocked_config', failure_class = 'configuration', next_retry_at = NULL, retry_expires_at = NULL, retry_after_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'queued'",
+        )
+        .bind(&now)
+        .bind(&row.id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         return Ok(None);
     };
@@ -1442,12 +1759,17 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
         });
     let now = Utc::now().to_rfc3339();
     let lease_expires_at = (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+    let attempt_profile = attempt_snapshot
+        .route_models
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("valid attempt route snapshot has no models"))?;
     sqlx::query("INSERT INTO content_batches (id, partition_key, target_lang, protocol_version, model_profile, trigger_reason, worker_id, worker_kind, request_count, item_count, estimated_input_tokens, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'content-general-1', 'general', (SELECT COUNT(*) FROM content_request_links WHERE work_item_id = ?), 1, ?, 'running', ?, ?)")
         .bind(&batch_id)
-        .bind(format!("{}:{}", row.target_lang, row.model_profile))
+        .bind(format!("{}:{}", row.target_lang, attempt_profile))
         .bind(&row.target_lang)
     .bind(&row.protocol_version)
-    .bind(&row.model_profile)
+    .bind(&attempt_profile)
     .bind(trigger_reason.as_str())
         .bind(&row.id)
         .bind(row.token_estimate)
@@ -1474,11 +1796,14 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
         .bind(&row.id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, created_at) VALUES (?, ?, ?, ?, 'attempt_started', ?)")
+    sqlx::query("INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, configuration_snapshot_json, route_snapshot_json, configuration_fingerprint, created_at) VALUES (?, ?, ?, ?, 'attempt_started', ?, ?, ?, ?)")
         .bind(&attempt_id)
         .bind(&row.id)
         .bind(next_attempt_no)
         .bind(trigger_reason)
+        .bind(&attempt_snapshot.configuration_snapshot_json)
+        .bind(&attempt_snapshot.route_snapshot_json)
+        .bind(&attempt_snapshot.configuration_fingerprint)
         .bind(&now)
         .execute(&mut *tx)
         .await?;
@@ -1487,6 +1812,9 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
         status: "running".to_owned(),
         batch_id: Some(batch_id),
         attempt_count: next_attempt_no,
+        attempt_configuration_snapshot_json: Some(attempt_snapshot.configuration_snapshot_json),
+        attempt_route_snapshot_json: Some(attempt_snapshot.route_snapshot_json),
+        attempt_configuration_fingerprint: Some(attempt_snapshot.configuration_fingerprint),
         ..row
     }))
 }
@@ -1927,50 +2255,6 @@ async fn cancel_deleted_work_in_transaction(
     Ok(())
 }
 
-async fn block_config_work(state: &AppState, work: &WorkRow) -> Result<()> {
-    let now = Utc::now().to_rfc3339();
-    let (_lock, mut tx) = state
-        .sqlite_writer
-        .begin_immediate(&state.pool, "content_processing_block_config")
-        .await?;
-    ensure_global_mode_in_transaction(&mut tx)
-        .await
-        .map_err(|error| anyhow!(error.to_string()))?;
-    let updated = sqlx::query("UPDATE content_work_items SET status = 'blocked_config', failure_class = 'configuration', finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running' AND attempt_count = ? AND lease_owner = 'content-general-1' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(?)")
-        .bind(&now)
-        .bind(&now)
-        .bind(&work.id)
-        .bind(work.attempt_count)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
-    if updated.rows_affected() == 0 {
-        tx.commit().await?;
-        return Ok(());
-    }
-    sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'blocked_config', 'configuration', 'model configuration changed before execution', 'configuration', 0, ? FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started'")
-        .bind(local_id::generate_local_id().to_string())
-        .bind(&now)
-        .bind(&work.id)
-        .bind(work.attempt_count)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("UPDATE content_batch_items SET result_status = 'blocked_config', error_code = 'configuration', updated_at = ? WHERE work_item_id = ? AND batch_id = ?")
-        .bind(&now)
-        .bind(&work.id)
-        .bind(work.batch_id.as_deref().unwrap_or_default())
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("UPDATE content_batches SET status = 'completed', finished_at = ?, updated_at = ? WHERE id = ?")
-        .bind(&now)
-        .bind(&now)
-        .bind(work.batch_id.as_deref().unwrap_or_default())
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(())
-}
-
 async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
     if !source_exists(state, &work).await? {
         cancel_deleted_work(state, &work).await?;
@@ -1978,24 +2262,30 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
     }
     let snapshot = serde_json::from_str::<SourceSnapshot>(&work.source_snapshot_json)
         .context("invalid global source snapshot")?;
-    let selected_model = ai::select_model_for_new_calls(state).await;
-    let routing = state
+    let _configuration_snapshot = serde_json::from_str::<Value>(
+        work.attempt_configuration_snapshot_json
+            .as_deref()
+            .ok_or_else(|| anyhow!("attempt configuration snapshot is missing"))?,
+    )
+    .context("invalid attempt configuration snapshot")?;
+    let attempt_configuration_fingerprint = work
+        .attempt_configuration_fingerprint
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("attempt configuration fingerprint is missing"))?;
+    let route_snapshot = serde_json::from_str::<Vec<String>>(
+        work.attempt_route_snapshot_json
+            .as_deref()
+            .ok_or_else(|| anyhow!("attempt route snapshot is missing"))?,
+    )
+    .context("invalid attempt route snapshot")?;
+    let _ = attempt_configuration_fingerprint;
+    if let Some(next_retry_at) = state
         .llm_scheduler
-        .routing_status(state.config.ai.as_ref().map(|config| config.model.as_str()))
-        .await;
-    let model_is_cooling_down = routing
-        .model_statuses
-        .iter()
-        .find(|status| status.model == work.model_profile)
-        .is_some_and(|status| status.status == "cooldown");
-    if model_is_cooling_down {
+        .all_routes_cooldown_until(&route_snapshot)
+        .await
+    {
         let now = Utc::now();
-        let next_retry_at = routing
-            .model_statuses
-            .iter()
-            .find(|status| status.model == work.model_profile)
-            .and_then(|status| status.cooldown_until.clone())
-            .unwrap_or_else(|| (now + chrono::Duration::seconds(PROVIDER_DEFER_SECS)).to_rfc3339());
         let retry_expires_at = (now + chrono::Duration::hours(24)).to_rfc3339();
         let (_lock, mut tx) = state
             .sqlite_writer
@@ -2040,16 +2330,6 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
         tx.commit().await?;
         return Ok(());
     }
-    if selected_model.model != work.model_profile {
-        block_config_work(state, &work).await?;
-        return Ok(());
-    }
-    if runtime_configuration_fingerprint(state, &work.model_profile).await
-        != work.configuration_fingerprint
-    {
-        block_config_work(state, &work).await?;
-        return Ok(());
-    }
     let (system, user) = build_prompt(&snapshot, &work.pipeline);
     let call_context = ai::LlmCallContext {
         source: format!("content_processing.global.{}", work.pipeline),
@@ -2063,7 +2343,13 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
         Duration::from_secs(4 * 60),
         ai::with_llm_call_context(
             call_context,
-            ai::chat_completion_with_diagnostics(state, &system, &user, 3_000),
+            ai::chat_completion_with_diagnostics_for_route(
+                state,
+                &system,
+                &user,
+                3_000,
+                Some(&route_snapshot),
+            ),
         ),
     )
     .await
@@ -2194,7 +2480,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(&work.id)
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("INSERT INTO content_result_projections (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash, work_item_id, active_work_item_id, payload_json, published_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash) DO UPDATE SET work_item_id = excluded.work_item_id, active_work_item_id = excluded.active_work_item_id, payload_json = excluded.payload_json, published_at = excluded.published_at, updated_at = excluded.updated_at")
+            let projection_id = sqlx::query_scalar::<_, String>("INSERT INTO content_result_projections (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash, work_item_id, active_work_item_id, payload_json, published_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash) DO UPDATE SET work_item_id = excluded.work_item_id, active_work_item_id = excluded.active_work_item_id, payload_json = excluded.payload_json, published_at = excluded.published_at, updated_at = excluded.updated_at RETURNING id")
                 .bind(local_id::generate_local_id().to_string())
                 .bind(&work.canonical_resource_type)
                 .bind(&work.canonical_resource_id)
@@ -2202,10 +2488,22 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(&work.variant)
                 .bind(&work.target_lang)
                 .bind(&work.protocol_version)
-                .bind(&work.model_profile)
+                .bind(model)
                 .bind(&work.source_hash)
                 .bind(&work.id)
                 .bind(&work.id)
+                .bind(output.to_string())
+                .bind(&now)
+                .bind(&now)
+                .fetch_one(&mut *tx)
+                .await?;
+            let identity_id =
+                content_identity_upgrade::ensure_identity_for_work(&mut tx, &work.id, &now).await?;
+            sqlx::query("INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(identity_id) DO UPDATE SET work_item_id = excluded.work_item_id, active_work_item_id = excluded.active_work_item_id, source_projection_id = excluded.source_projection_id, payload_json = excluded.payload_json, published_at = excluded.published_at, updated_at = excluded.updated_at")
+                .bind(identity_id)
+                .bind(&work.id)
+                .bind(&work.id)
+                .bind(projection_id)
                 .bind(output.to_string())
                 .bind(&now)
                 .bind(&now)
@@ -2276,7 +2574,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(linked_call_id.unwrap_or_else(|| local_id::generate_local_id().to_string()))
                 .bind(&attempt_event_id)
                 .bind(linked_call_audit.as_ref().and_then(|(provider_id, _, _, _, _)| provider_id.as_deref()).unwrap_or("unknown"))
-                .bind(linked_call_audit.as_ref().map_or(work.model_profile.as_str(), |(_, model, _, _, _)| model.as_str()))
+                .bind(linked_call_audit.as_ref().map_or_else(|| route_snapshot.first().map(String::as_str).unwrap_or("unknown"), |(_, model, _, _, _)| model.as_str()))
                 .bind(linked_call_audit.as_ref().and_then(|(_, _, duration_ms, _, _)| *duration_ms))
                 .bind(linked_call_audit.as_ref().and_then(|(_, _, _, input_tokens, _)| *input_tokens))
                 .bind(linked_call_audit.as_ref().and_then(|(_, _, _, _, output_tokens)| *output_tokens))
@@ -2346,6 +2644,9 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
 
 pub async fn run_once(state: &AppState) -> Result<()> {
     if current_mode(&state.pool).await? != ContentProcessingMode::Global {
+        return Ok(());
+    }
+    if !content_identity_upgrade::is_complete(&state.pool).await? {
         return Ok(());
     }
     recover_due(state).await?;
@@ -2467,7 +2768,17 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/0084_content_processing_model_independent_identity.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query("UPDATE content_processing_control SET mode = 'global' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE content_identity_upgrade_control SET status = 'completed', phase = 'complete' WHERE id = 1")
             .execute(&pool)
             .await
             .unwrap();
@@ -2492,7 +2803,11 @@ mod tests {
                 redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback").unwrap(),
             },
             linuxdo: None,
-            ai: None,
+            ai: Some(crate::config::AiConfig {
+                base_url: Url::parse("https://ai.example.test/v1/").unwrap(),
+                model: "test-model".to_owned(),
+                api_key: "test-api-key".to_owned(),
+            }),
             ai_max_concurrency: 1,
             ai_daily_at_local: None,
             app_default_time_zone: "UTC".to_owned(),
@@ -2998,6 +3313,17 @@ mod tests {
         .await
         .unwrap();
 
+        let mut tx = pool.begin().await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        let identity_id =
+            content_identity_upgrade::ensure_identity_for_work(&mut tx, "model-a-work", &now)
+                .await
+                .unwrap();
+        content_identity_upgrade::ensure_current_projection_for_key(&mut tx, &identity_id, &now)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
         let state = global_state(pool);
         let (status, payload) = read_global_resource(
             &state,
@@ -3013,6 +3339,293 @@ mod tests {
         assert_eq!(status, "ready");
         assert_eq!(payload["title_zh"], "保留标题");
         assert_eq!(payload["body_md"], "保留摘要");
+    }
+
+    #[tokio::test]
+    async fn submission_reuses_a_ready_projection_created_by_another_model() {
+        let pool = global_pool().await;
+        let item = translations::TranslationRequestItemInput {
+            producer_ref: "feed.auto_translate:release:release-1".to_owned(),
+            kind: "release_summary".to_owned(),
+            variant: "summary".to_owned(),
+            entity_id: "release-1".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 0,
+            source_blocks: vec![translations::TranslationSourceBlock {
+                slot: "title".to_owned(),
+                text: "A release title".to_owned(),
+            }],
+            target_slots: vec!["title_zh".to_owned()],
+        };
+        let hash = source_hash(&item).unwrap();
+        sqlx::query(
+            "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, created_at, updated_at) VALUES ('old-model-work', 'release', 'release-1', 'translation', 'summary', 'zh-CN', ?, ?, 'retired-model', '{}', 'historical-config', 'ready', 0, 0, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(&hash)
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO content_result_projections (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, protocol_version, model_profile, source_hash, work_item_id, active_work_item_id, payload_json, published_at, updated_at) VALUES ('old-model-projection', 'release', 'release-1', 'translation', 'summary', 'zh-CN', ?, 'retired-model', ?, 'old-model-work', 'old-model-work', '{\"title_zh\":\"保留译文\",\"body_md\":\"保留正文\"}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = global_state(pool.clone());
+
+        let (status, response) = submit_item(&state, "user-1", "async", &item).await.unwrap();
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(response.work_item_id, "old-model-work");
+        assert_eq!(response.status, "ready");
+        assert_eq!(response.result["title_zh"], "保留译文");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM content_work_items")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM content_attempt_events")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn submission_uses_persisted_routes_when_the_local_scheduler_is_stale() {
+        let pool = global_pool().await;
+        sqlx::query(
+            "CREATE TABLE admin_runtime_settings (id INTEGER PRIMARY KEY, llm_models_json TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO admin_runtime_settings (id, llm_models_json) VALUES (1, '[\"persisted-route\"]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut state = global_state(pool.clone());
+        Arc::get_mut(&mut state)
+            .expect("state has a single owner")
+            .config
+            .ai
+            .as_mut()
+            .expect("AI configuration")
+            .model
+            .clear();
+        let item = translations::TranslationRequestItemInput {
+            producer_ref: "feed.auto_translate:release:release-1".to_owned(),
+            kind: "release_summary".to_owned(),
+            variant: "summary".to_owned(),
+            entity_id: "release-1".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 0,
+            source_blocks: vec![translations::TranslationSourceBlock {
+                slot: "title".to_owned(),
+                text: "A release title".to_owned(),
+            }],
+            target_slots: vec!["title_zh".to_owned()],
+        };
+
+        let (http_status, response) = submit_item(&state, "user-1", "async", &item).await.unwrap();
+        let (stored_status, model_profile): (String, String) =
+            sqlx::query_as("SELECT status, model_profile FROM content_work_items WHERE id = ?")
+                .bind(&response.work_item_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(http_status, StatusCode::ACCEPTED);
+        assert_eq!(response.status, "queued");
+        assert_eq!(stored_status, "queued");
+        assert_eq!(model_profile, "persisted-route");
+    }
+
+    #[tokio::test]
+    async fn runtime_configuration_reload_requeues_blocked_identity_once() {
+        let pool = global_pool().await;
+        insert_test_work(&pool, "blocked-work", "blocked_config", 1, None).await;
+        let mut state = global_state(pool.clone());
+        let valid_ai = state.config.ai.clone().unwrap();
+        Arc::get_mut(&mut state)
+            .expect("state has a single owner")
+            .config
+            .ai = None;
+        let now = Utc::now().to_rfc3339();
+        let mut tx = pool.begin().await.unwrap();
+        content_identity_upgrade::ensure_identity_for_work(&mut tx, "blocked-work", &now)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        on_runtime_configuration_reload(&state).await.unwrap();
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM content_work_items WHERE id = 'blocked-work'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "blocked_config");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_events WHERE work_item_id = 'blocked-work'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        Arc::get_mut(&mut state)
+            .expect("state has a single owner")
+            .config
+            .ai = Some(valid_ai);
+        on_runtime_configuration_reload(&state).await.unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM content_work_items WHERE id = 'blocked-work'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "queued");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_events WHERE work_item_id = 'blocked-work' AND event_type = 'attempt_queued' AND trigger = 'automatic_recovery'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_events WHERE work_item_id = 'blocked-work' AND event_type = 'attempt_started'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        on_runtime_configuration_reload(&state).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_events WHERE work_item_id = 'blocked-work' AND event_type = 'attempt_queued' AND trigger = 'automatic_recovery'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_configuration_reload_revalidates_persisted_routes_before_requeue() {
+        let pool = global_pool().await;
+        sqlx::query(
+            "CREATE TABLE admin_runtime_settings (id INTEGER PRIMARY KEY, llm_models_json TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO admin_runtime_settings (id, llm_models_json) VALUES (1, '[]')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_test_work(&pool, "blocked-work", "blocked_config", 1, None).await;
+        let now = Utc::now().to_rfc3339();
+        let mut tx = pool.begin().await.unwrap();
+        content_identity_upgrade::ensure_identity_for_work(&mut tx, "blocked-work", &now)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let mut state = global_state(pool.clone());
+        Arc::get_mut(&mut state)
+            .expect("state has a single owner")
+            .config
+            .ai
+            .as_mut()
+            .expect("AI configuration")
+            .model
+            .clear();
+        assert!(
+            crate::admin_runtime::default_llm_models(&state.config).is_empty(),
+            "test requires no legacy environment model override"
+        );
+        state
+            .llm_scheduler
+            .set_model_routing(vec!["stale-route".to_owned()])
+            .await;
+        assert!(has_valid_runtime_configuration(&state).await);
+
+        on_runtime_configuration_reload(&state).await.unwrap();
+
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM content_work_items WHERE id = 'blocked-work'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "blocked_config"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_events WHERE work_item_id = 'blocked-work' AND event_type = 'attempt_queued' AND trigger = 'automatic_recovery'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_snapshots_the_persisted_route_under_the_claim_transaction() {
+        let pool = global_pool().await;
+        sqlx::query(
+            "CREATE TABLE admin_runtime_settings (id INTEGER PRIMARY KEY, llm_models_json TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO admin_runtime_settings (id, llm_models_json) VALUES (1, '[\"current-route\"]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        insert_test_work(&pool, "route-work", "queued", 0, None).await;
+        sqlx::query(
+            "UPDATE content_work_items SET created_at = '2000-01-01T00:00:00Z' WHERE id = 'route-work'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = global_state(pool.clone());
+
+        let claimed = claim_next(&state, 1).await.unwrap().unwrap();
+
+        assert_eq!(
+            claimed.attempt_route_snapshot_json.as_deref(),
+            Some("[\"current-route\"]")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT route_snapshot_json FROM content_attempt_events WHERE work_item_id = 'route-work' AND attempt_no = 1 AND event_type = 'attempt_started'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            r#"["current-route"]"#
+        );
     }
 
     #[tokio::test]
@@ -3046,6 +3659,23 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        let identity_id =
+            content_identity_upgrade::ensure_identity_for_work(&mut tx, "refresh-w1", &now)
+                .await
+                .unwrap();
+        content_identity_upgrade::ensure_identity_for_work(&mut tx, "refresh-w2", &now)
+            .await
+            .unwrap();
+        content_identity_upgrade::ensure_identity_for_work(&mut tx, "refresh-w3", &now)
+            .await
+            .unwrap();
+        content_identity_upgrade::ensure_current_projection_for_key(&mut tx, &identity_id, &now)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
 
         let state = global_state(pool);
         let (status, payload) = read_global_resource(
@@ -3098,6 +3728,22 @@ mod tests {
 
         let claimed = claim_next(&state, 1).await.unwrap().unwrap();
         assert_eq!(claimed.attempt_count, 2);
+        let attempt_snapshot: (String, String, String) = sqlx::query_as(
+            "SELECT configuration_snapshot_json, route_snapshot_json, configuration_fingerprint FROM content_attempt_events WHERE work_item_id = 'work-1' AND attempt_no = 2 AND event_type = 'attempt_started'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let configuration: Value = serde_json::from_str(&attempt_snapshot.0).unwrap();
+        assert_eq!(configuration["base_url_origin"], "https://ai.example.test");
+        assert!(configuration.get("base_url").is_none());
+        assert!(configuration["api_key_sha256"].is_string());
+        assert!(!attempt_snapshot.0.contains("test-api-key"));
+        assert_eq!(attempt_snapshot.1, r#"["test-model"]"#);
+        assert_eq!(
+            claimed.attempt_configuration_fingerprint.as_deref(),
+            Some(attempt_snapshot.2.as_str())
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM content_attempt_events WHERE work_item_id = 'work-1' AND attempt_no = 2 AND event_type = 'attempt_started'")
                 .fetch_one(&pool)

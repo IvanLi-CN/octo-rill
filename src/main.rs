@@ -6,6 +6,7 @@ mod api_keys;
 mod auth;
 mod briefs;
 mod config;
+mod content_identity_upgrade;
 mod content_processing;
 mod crypto;
 mod database_migrations;

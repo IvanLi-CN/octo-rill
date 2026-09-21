@@ -23,6 +23,7 @@ export default defineConfig((env) =>
 									"readable-initial-loading",
 									"repo-identity-overflow",
 									"content-projection-retention",
+									"feed-blocked-config",
 									"admin-collection-read-budget",
 									"admin-collection-activity",
 									"dashboard-repository-sidebar-viewport",
