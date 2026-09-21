@@ -158,6 +158,38 @@
   image: ![管理采集记录移动端读取超时状态](./assets/timeout-read-mobile.png)
 
 - source_type: storybook_canvas
+  story_id_or_title: Admin/AiOperationsRecordsSection/FilterChangeReadFailure
+  state: desktop filter-change read failure
+  target_program: mock-only
+  capture_scope: element
+  requested_viewport: 1280x1200
+  viewport_strategy: storybook-viewport
+  margin_policy: require_margin
+  evidence_surface: component
+  surface_selector: "[data-visual-evidence-surface]"
+  target_selector: "[data-visual-evidence-target]"
+  sensitive_exclusion: N/A (mock-only Storybook fixture)
+  submission_gate: approved
+  evidence_note: 切换翻译失败筛选后，旧查询记录不再显示，读取错误和人工刷新操作完整可见。
+  image: ![管理采集记录桌面端筛选失败状态](./assets/filter-change-read-failure-desktop.png)
+
+- source_type: storybook_canvas
+  story_id_or_title: Admin/AiOperationsRecordsSection/FilterChangeReadFailure
+  state: mobile filter-change read failure
+  target_program: mock-only
+  capture_scope: browser-viewport
+  requested_viewport: 393x852
+  viewport_strategy: storybook-viewport
+  margin_policy: require_margin
+  evidence_surface: component
+  surface_selector: "[data-visual-evidence-surface]"
+  target_selector: "[data-visual-evidence-target]"
+  sensitive_exclusion: N/A (mock-only Storybook fixture)
+  submission_gate: approved
+  evidence_note: 移动宽度下已选筛选、错误提示和刷新操作保持可读，无横向溢出或遮挡。
+  image: ![管理采集记录移动端筛选失败状态](./assets/filter-change-read-failure-mobile-393x852.png)
+
+- source_type: storybook_canvas
   target_program: mock-only
   story_id_or_title: Admin/AdminCollectionActivity/Current Window Overview
   state: desktop current-window overview with selected record details

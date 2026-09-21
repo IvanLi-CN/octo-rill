@@ -2964,6 +2964,71 @@ test("content processing keeps the last list visible after a refresh timeout", a
 	).toBeDisabled();
 });
 
+test("content processing hides the previous query after a filter read failure", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 900 });
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	const record = {
+		id: "release-filter-failure-1",
+		kind: "release" as const,
+		repository: "octo-demo/release-lab",
+		title: "v2.33.0",
+		occurred_at: "2026-04-15T03:20:00Z",
+		detected_at: "2026-04-15T03:21:00Z",
+		generated_at: null,
+		translation: {
+			status: "running",
+			retry_count: 0,
+			started_at: "2026-04-15T03:23:00Z",
+			last_attempt_at: "2026-04-15T03:25:00Z",
+			finished_at: null,
+		},
+		polish: {
+			status: "ready",
+			retry_count: 0,
+			started_at: "2026-04-15T03:22:00Z",
+			last_attempt_at: "2026-04-15T03:22:01Z",
+			finished_at: "2026-04-15T03:22:01Z",
+		},
+	};
+	await page.route("**/api/admin/jobs/ai-records/**", async (route) => {
+		const url = new URL(route.request().url());
+		if (url.pathname !== "/api/admin/jobs/ai-records/release") {
+			return route.fallback();
+		}
+		if (url.searchParams.get("translation_status") === "failed") {
+			return json(
+				route,
+				{
+					error: {
+						code: "admin_collection_records_timeout",
+						message: "admin collection records read timed out",
+					},
+				},
+				503,
+			);
+		}
+		return json(route, { items: [record], page: 1, page_size: 20, total: 1 });
+	});
+
+	await page.goto("/admin/jobs/ai-records", { waitUntil: "domcontentloaded" });
+	const recordsTable = page.getByRole("table");
+	await expect(recordsTable.getByText("v2.33.0", { exact: true })).toHaveCount(
+		1,
+	);
+	await page.getByRole("button", { name: "翻译筛选" }).click();
+	await page.getByRole("checkbox", { name: "失败" }).check();
+
+	await expect(
+		page.getByRole("heading", { name: "记录暂时无法读取" }),
+	).toHaveCount(1);
+	await expect(page.getByRole("table")).toHaveCount(0);
+	await expect(page.getByRole("button", { name: "翻译筛选" })).toContainText(
+		"1 项已选",
+	);
+});
+
 test("admin requests grouped LLM call ordering and renders the response", async ({
 	page,
 }) => {

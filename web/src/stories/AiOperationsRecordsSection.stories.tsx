@@ -283,14 +283,19 @@ const meta = {
 	tags: ["autodocs"],
 	parameters: {
 		viewport: {
-			viewports: {
+			options: {
 				...INITIAL_VIEWPORTS,
+				adminDesktop: {
+					name: "Admin desktop",
+					styles: { width: "1280px", height: "1200px" },
+					type: "desktop",
+				},
 				adminMobile: {
 					name: "Admin mobile",
 					styles: { width: "393px", height: "852px" },
+					type: "mobile",
 				},
 			},
-			defaultViewport: "desktop",
 		},
 		docs: {
 			description: {
@@ -580,6 +585,93 @@ export const TimeoutRead: Story = {
 		expect(
 			within(errorPanel).getByRole("button", { name: "刷新记录" }),
 		).toBeVisible();
+	},
+};
+
+export const FilterChangeReadFailure: Story = {
+	tags: ["admin-collection-read-budget"],
+	args: {
+		detailRoute: null,
+		onFiltersChange: () => undefined,
+		onOpenRecord: () => undefined,
+		onOpenAttempt: () => undefined,
+		onOpenLlm: () => undefined,
+		onCloseRecord: () => undefined,
+	},
+	decorators: [
+		(Story) => {
+			const originalFetch = useRef(window.fetch);
+			const restoreFetch = originalFetch.current;
+			window.fetch = async (input, init) => {
+				const requestInput = input instanceof Request ? input.url : input;
+				const url = new URL(
+					typeof requestInput === "string"
+						? requestInput
+						: requestInput.toString(),
+					window.location.origin,
+				);
+				if (url.pathname.endsWith("/activity")) {
+					const kind = url.pathname
+						.split("/")
+						.at(-2) as AdminCollectionActivityResponse["kind"];
+					return new Response(JSON.stringify(activityResponse(kind)), {
+						status: 200,
+					});
+				}
+				if (url.pathname === "/api/admin/jobs/ai-records/release") {
+					if (url.searchParams.has("translation_status")) {
+						return new Response(
+							JSON.stringify({
+								ok: false,
+								error: {
+									code: "admin_collection_records_timeout",
+									message: "admin collection records read timed out",
+								},
+							}),
+							{
+								status: 503,
+								headers: { "content-type": "application/json" },
+							},
+						);
+					}
+					return new Response(JSON.stringify(listResponse), { status: 200 });
+				}
+				return restoreFetch(input, init);
+			};
+			useEffect(
+				() => () => {
+					window.fetch = restoreFetch;
+				},
+				[restoreFetch],
+			);
+			return (
+				<div
+					data-visual-evidence-surface
+					className="mx-auto box-border w-full max-w-[1072px] bg-background p-8 md:p-6"
+				>
+					<div data-visual-evidence-target className="mx-auto max-w-5xl p-6">
+						<Story />
+					</div>
+				</div>
+			);
+		},
+	],
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const page = within(canvasElement.ownerDocument.body);
+		await waitFor(() => expect(canvas.getByRole("table")).toBeVisible());
+		await userEvent.click(canvas.getByRole("button", { name: "翻译筛选" }));
+		await userEvent.click(page.getByRole("checkbox", { name: "失败" }));
+		await userEvent.click(canvas.getByRole("button", { name: "翻译筛选" }));
+		await waitFor(() =>
+			expect(
+				page.getByRole("heading", { name: "记录暂时无法读取" }),
+			).toBeVisible(),
+		);
+		expect(canvas.queryByRole("table")).toBeNull();
+		expect(
+			canvas.getByRole("button", { name: "翻译筛选" }).textContent,
+		).toContain("1 项已选");
 	},
 };
 
