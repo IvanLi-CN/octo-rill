@@ -2317,8 +2317,8 @@ where
                 Ok(result) => result,
                 Err(_) => Err(ApiError::internal("shared collection read task failed")),
             };
-            result_sender.send_replace(Some(result));
             task_flights.lock().await.remove(&key);
+            result_sender.send_replace(Some(result));
         });
     }
     await_shared_read(flight)
@@ -3812,7 +3812,9 @@ mod tests {
 
     #[tokio::test]
     async fn identical_collection_list_reads_share_one_in_flight_execution() {
+        use std::future::Future;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::task::Poll;
 
         let key = CollectionListKey {
             kind: CollectionRecordKind::Release,
@@ -3852,23 +3854,23 @@ mod tests {
 
         let second_calls = calls.clone();
         let second_key = key.clone();
-        let second = tokio::spawn(async move {
-            run_collection_list_singleflight(second_key, async move {
-                second_calls.fetch_add(1, AtomicOrdering::SeqCst);
-                response()
-            })
-            .await
-        });
-        release.notify_waiters();
+        let mut second = Box::pin(run_collection_list_singleflight(second_key, async move {
+            second_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            response()
+        }));
+        let second_joined = std::future::poll_fn(|context| match second.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(true),
+            Poll::Ready(_) => Poll::Ready(false),
+        })
+        .await;
+        assert!(second_joined, "second caller should join the active flight");
+        release.notify_one();
 
         first
             .await
             .expect("first singleflight read")
             .expect("first result");
-        second
-            .await
-            .expect("second singleflight read")
-            .expect("second result");
+        second.await.expect("second result");
         assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
 
         let default_window_key = CollectionListKey {
@@ -3885,42 +3887,134 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn panicking_collection_read_does_not_poison_same_key_retry() {
+    async fn completed_flight_is_removed_before_result_is_published() {
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-        let key = CollectionListKey {
-            kind: CollectionRecordKind::Release,
-            from: None,
-            before: None,
-            attempts: AttemptCountRange { min: 0, max: None },
-            translation_filter: Vec::new(),
-            polish_filter: Vec::new(),
-            page: 1,
-            page_size: 20,
-        };
+        let flights = Arc::new(tokio::sync::Mutex::new(HashMap::<
+            String,
+            Arc<SharedRead<i64>>,
+        >::new()));
+        let key = "completed-flight".to_owned();
         let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let read_finished = Arc::new(tokio::sync::Notify::new());
         let first_calls = calls.clone();
-        let first_result = run_collection_list_singleflight(key.clone(), async move {
-            first_calls.fetch_add(1, AtomicOrdering::SeqCst);
-            panic!("collection read panic");
-        })
-        .await;
+        let first_started = started.clone();
+        let first_release = release.clone();
+        let first_read_finished = read_finished.clone();
+        let first_flights = flights.clone();
+        let first_key = key.clone();
+        let first = tokio::spawn(async move {
+            run_keyed_singleflight(first_flights, first_key, async move {
+                first_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                first_started.notify_one();
+                first_release.notified().await;
+                first_read_finished.notify_one();
+                Ok::<_, ApiError>(41_i64)
+            })
+            .await
+        });
+        started.notified().await;
 
-        assert!(first_result.is_err());
+        let flight_guard = flights.lock().await;
+        let flight = flight_guard
+            .get(&key)
+            .expect("leader inserted its flight")
+            .clone();
+        let mut result_receiver = flight.result.clone();
+        release.notify_one();
+        read_finished.notified().await;
+
+        let published_while_key_was_locked =
+            tokio::time::timeout(Duration::from_millis(100), result_receiver.changed())
+                .await
+                .is_ok();
+        assert!(
+            !published_while_key_was_locked,
+            "the result must not be published while its key is still registered"
+        );
+        drop(flight_guard);
+
+        assert_eq!(
+            first.await.expect("leader task").expect("leader result"),
+            41
+        );
+        assert!(!flights.lock().await.contains_key(&key));
 
         let retry_calls = calls.clone();
-        let retry_result = run_collection_list_singleflight(key, async move {
+        let retry = run_keyed_singleflight(flights, key, async move {
             retry_calls.fetch_add(1, AtomicOrdering::SeqCst);
-            Ok::<_, ApiError>(AdminCollectionRecordsResponse {
-                items: Vec::new(),
-                page: 1,
-                page_size: 20,
-                total: 0,
+            Ok::<_, ApiError>(42_i64)
+        })
+        .await
+        .expect("same-key request starts a fresh read");
+
+        assert_eq!(retry, 42);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn panicking_collection_read_is_shared_and_same_key_retry_recovers() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::task::Poll;
+
+        let flights = Arc::new(tokio::sync::Mutex::new(HashMap::<
+            String,
+            Arc<SharedRead<i64>>,
+        >::new()));
+        let key = "panicking-flight".to_owned();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let panic_now = Arc::new(tokio::sync::Notify::new());
+        let first_calls = calls.clone();
+        let first_started = started.clone();
+        let first_panic_now = panic_now.clone();
+        let first_flights = flights.clone();
+        let first_key = key.clone();
+        let first = tokio::spawn(async move {
+            run_keyed_singleflight(first_flights, first_key, async move {
+                first_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                first_started.notify_one();
+                first_panic_now.notified().await;
+                panic!("collection read panic");
             })
+            .await
+        });
+        started.notified().await;
+
+        let waiter_calls = calls.clone();
+        let mut waiter = Box::pin(run_keyed_singleflight(
+            flights.clone(),
+            key.clone(),
+            async move {
+                waiter_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok::<_, ApiError>(1_i64)
+            },
+        ));
+        let waiter_joined = std::future::poll_fn(|context| match waiter.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(true),
+            Poll::Ready(_) => Poll::Ready(false),
+        })
+        .await;
+        assert!(
+            waiter_joined,
+            "second caller should await the shared result"
+        );
+        panic_now.notify_one();
+
+        assert!(first.await.expect("leader task").is_err());
+        assert!(waiter.await.is_err());
+
+        let retry_calls = calls.clone();
+        let retry = run_keyed_singleflight(flights, key, async move {
+            retry_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok::<_, ApiError>(42_i64)
         })
         .await;
 
-        retry_result.expect("same-key retry succeeds after a panicking read");
+        assert_eq!(retry.expect("same-key retry succeeds"), 42);
         assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
     }
 
