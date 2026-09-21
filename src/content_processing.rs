@@ -2058,6 +2058,11 @@ fn normalize_output(raw: &str, target_slots: &[String]) -> Result<Value> {
         if nested.contains_key("output") {
             anyhow::bail!("global content output has nested output envelopes");
         }
+        if nested.iter().any(|(key, value)| {
+            !target_slots.contains(key) && (value.is_object() || value.is_array())
+        }) {
+            anyhow::bail!("global content output envelope has an unknown wrapper");
+        }
         if !target_slots.iter().all(|slot| nested.contains_key(slot)) {
             anyhow::bail!("global content output envelope is missing target slots");
         }
@@ -2312,7 +2317,7 @@ async fn complete_global_output(
     user: &str,
     route_snapshot: &[String],
 ) -> Result<GlobalCompletion> {
-    let Some(ai_config) = state.config.ai.as_ref() else {
+    let Some(ai_config) = state.config.ai.clone() else {
         return Err(anyhow::Error::new(GlobalExecutionFailure {
             call_ids: Vec::new(),
             class: ai::LlmFailureClass::Configuration,
@@ -2324,7 +2329,7 @@ async fn complete_global_output(
         state,
         GlobalCallSpec {
             work,
-            ai_config,
+            ai_config: &ai_config,
             system,
             user,
             max_tokens: GLOBAL_MAX_TOKENS,
@@ -2352,15 +2357,16 @@ async fn complete_global_output(
     }
 
     if diagnostic.finish_reason.as_deref() == Some("length") {
+        let recovery_route_snapshot = [diagnostic.model.clone()];
         diagnostic = match request_global_completion(
             state,
             GlobalCallSpec {
                 work,
-                ai_config,
+                ai_config: &ai_config,
                 system,
                 user,
                 max_tokens: GLOBAL_LENGTH_RECOVERY_MAX_TOKENS,
-                route_snapshot,
+                route_snapshot: &recovery_route_snapshot,
                 role: "length_recovery",
             },
         )
@@ -3262,7 +3268,7 @@ mod tests {
 
     async fn spawn_sequenced_test_ai_server(
         responses: Vec<(&str, &str)>,
-    ) -> (Url, Arc<Mutex<Vec<u32>>>) {
+    ) -> (Url, Arc<Mutex<Vec<u32>>>, Arc<Mutex<Vec<String>>>) {
         let responses = Arc::new(Mutex::new(
             responses
                 .into_iter()
@@ -3270,18 +3276,25 @@ mod tests {
                 .collect::<VecDeque<_>>(),
         ));
         let requested_tokens = Arc::new(Mutex::new(Vec::new()));
+        let requested_models = Arc::new(Mutex::new(Vec::new()));
         let response_state = responses.clone();
         let token_state = requested_tokens.clone();
+        let model_state = requested_models.clone();
         let app = Router::new().route(
             "/v1/chat/completions",
             post(move |Json(request): Json<Value>| {
                 let response_state = response_state.clone();
                 let token_state = token_state.clone();
+                let model_state = model_state.clone();
                 async move {
                     token_state
                         .lock()
                         .expect("token state lock")
                         .push(request["max_tokens"].as_u64().unwrap_or_default() as u32);
+                    model_state
+                        .lock()
+                        .expect("model state lock")
+                        .push(request["model"].as_str().unwrap_or_default().to_owned());
                     let (content, finish_reason) = response_state
                         .lock()
                         .expect("response state lock")
@@ -3305,7 +3318,11 @@ mod tests {
                 }
             }),
         );
-        (spawn_test_ai_server(app).await, requested_tokens)
+        (
+            spawn_test_ai_server(app).await,
+            requested_tokens,
+            requested_models,
+        )
     }
 
     async fn seed_executable_work(pool: &SqlitePool, id: &str, target_slots: &[&str]) {
@@ -3585,7 +3602,7 @@ mod tests {
     async fn execute_performs_one_length_recovery_and_links_both_calls() {
         let pool = global_execution_pool().await;
         seed_executable_work(&pool, "length-recovery-work", &["title_zh"]).await;
-        let (base_url, requested_tokens) = spawn_sequenced_test_ai_server(vec![
+        let (base_url, requested_tokens, requested_models) = spawn_sequenced_test_ai_server(vec![
             (r#"{"title_zh":"截断但仍是 JSON"}"#, "length"),
             (r#"{"title_zh":"完整标题"}"#, "stop"),
         ])
@@ -3610,6 +3627,9 @@ mod tests {
             *requested_tokens.lock().expect("token state lock"),
             vec![GLOBAL_MAX_TOKENS, GLOBAL_LENGTH_RECOVERY_MAX_TOKENS]
         );
+        let requested_models = requested_models.lock().expect("model state lock").clone();
+        assert_eq!(requested_models.len(), 2);
+        assert_eq!(requested_models[0], requested_models[1]);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM content_attempt_llm_calls WHERE attempt_event_id = (SELECT id FROM content_attempt_events WHERE work_item_id = 'length-recovery-work' AND attempt_no = ? AND event_type = 'attempt_started')",
@@ -3643,7 +3663,7 @@ mod tests {
     async fn execute_marks_second_length_response_as_bounded_truncation_failure() {
         let pool = global_execution_pool().await;
         seed_executable_work(&pool, "length-failure-work", &["title_zh"]).await;
-        let (base_url, requested_tokens) = spawn_sequenced_test_ai_server(vec![
+        let (base_url, requested_tokens, requested_models) = spawn_sequenced_test_ai_server(vec![
             (r#"{"title_zh":"第一次截断"}"#, "length"),
             (r#"{"title_zh":"第二次截断"}"#, "length"),
         ])
@@ -3668,6 +3688,9 @@ mod tests {
             *requested_tokens.lock().expect("token state lock"),
             vec![GLOBAL_MAX_TOKENS, GLOBAL_LENGTH_RECOVERY_MAX_TOKENS]
         );
+        let requested_models = requested_models.lock().expect("model state lock").clone();
+        assert_eq!(requested_models.len(), 2);
+        assert_eq!(requested_models[0], requested_models[1]);
         let (status, failure_class, error_code): (String, String, String) = sqlx::query_as(
             "SELECT w.status, w.failure_class, e.error_code FROM content_work_items w JOIN content_attempt_events e ON e.work_item_id = w.id AND e.attempt_no = ? AND e.event_type = 'attempt_completed' WHERE w.id = 'length-failure-work'",
         )
@@ -4751,6 +4774,7 @@ mod tests {
             r#"{"output":{"output":{"title_zh":"标题"}}}"#,
             r#"{"title_zh":"标题","result":{"title_zh":"另一个标题"}}"#,
             r#"{"title_zh":"标题","data":[]}"#,
+            r#"{"output":{"title_zh":"标题","result":{"title_zh":"另一个标题"}}}"#,
             "```json\n{\"output\":{\"title_zh\":\"标题\"}}\n```",
             "```json\n{\"title_zh\":\"标题\"}",
         ] {
