@@ -2255,50 +2255,6 @@ async fn cancel_deleted_work_in_transaction(
     Ok(())
 }
 
-async fn block_config_work(state: &AppState, work: &WorkRow) -> Result<()> {
-    let now = Utc::now().to_rfc3339();
-    let (_lock, mut tx) = state
-        .sqlite_writer
-        .begin_immediate(&state.pool, "content_processing_block_config")
-        .await?;
-    ensure_global_mode_in_transaction(&mut tx)
-        .await
-        .map_err(|error| anyhow!(error.to_string()))?;
-    let updated = sqlx::query("UPDATE content_work_items SET status = 'blocked_config', failure_class = 'configuration', finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running' AND attempt_count = ? AND lease_owner = 'content-general-1' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(?)")
-        .bind(&now)
-        .bind(&now)
-        .bind(&work.id)
-        .bind(work.attempt_count)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
-    if updated.rows_affected() == 0 {
-        tx.commit().await?;
-        return Ok(());
-    }
-    sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, error_code, error_summary, failure_class, retry_eligible, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'blocked_config', 'configuration', 'model configuration changed before execution', 'configuration', 0, ? FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started'")
-        .bind(local_id::generate_local_id().to_string())
-        .bind(&now)
-        .bind(&work.id)
-        .bind(work.attempt_count)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("UPDATE content_batch_items SET result_status = 'blocked_config', error_code = 'configuration', updated_at = ? WHERE work_item_id = ? AND batch_id = ?")
-        .bind(&now)
-        .bind(&work.id)
-        .bind(work.batch_id.as_deref().unwrap_or_default())
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("UPDATE content_batches SET status = 'completed', finished_at = ?, updated_at = ? WHERE id = ?")
-        .bind(&now)
-        .bind(&now)
-        .bind(work.batch_id.as_deref().unwrap_or_default())
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(())
-}
-
 struct FailedLlmCallAudit<'a> {
     audit_call_id: &'a str,
     attempt_event_id: &'a str,

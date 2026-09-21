@@ -16,10 +16,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 use tower_sessions::Session;
 
-use crate::{
-    api, content_identity_upgrade, content_processing, error::ApiError, state::AppState,
-    translations,
-};
+use crate::{api, content_processing, error::ApiError, state::AppState, translations};
 
 const PAGE_SIZE_DEFAULT: i64 = 20;
 
@@ -786,20 +783,18 @@ async fn load_global_task_rows_in_connection(
     if entity_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let identity_control_exists = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'content_identity_upgrade_control'",
+    let identity_upgrade_state = match sqlx::query_as::<_, (String, String)>(
+        "SELECT status, phase FROM content_identity_upgrade_control WHERE id = 1",
     )
-    .fetch_one(&state.pool)
+    .fetch_optional(&mut *connection)
     .await
-    .map_err(ApiError::internal)?
-        > 0;
-    let identity_upgrade_complete = if identity_control_exists {
-        content_identity_upgrade::is_complete(&state.pool)
-            .await
-            .map_err(ApiError::internal)?
-    } else {
-        false
+    {
+        Ok(state) => state,
+        Err(error) if missing_table(&error) => None,
+        Err(error) => return Err(ApiError::internal(error)),
     };
+    let identity_upgrade_complete = identity_upgrade_state
+        .is_some_and(|(status, phase)| status == "completed" && phase == "complete");
     let source = if identity_upgrade_complete {
         "WITH ranked_members AS (SELECT m.identity_id, w.*, ROW_NUMBER() OVER (PARTITION BY m.identity_id ORDER BY CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'ready' THEN 4 WHEN 'failed' THEN 5 WHEN 'superseded' THEN 9 ELSE 6 END, w.attempt_count DESC, julianday(w.updated_at) DESC, w.updated_at DESC, w.id DESC) AS member_rank FROM content_work_identity_members m JOIN content_work_items w ON w.id = m.work_item_id), canonical_work AS (SELECT * FROM ranked_members WHERE member_rank = 1) SELECT w.pipeline, i.source_hash, w.status, w.attempt_count, w.started_at, w.finished_at, w.updated_at, (SELECT MAX(e.created_at) FROM content_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at, w.canonical_resource_id, p.work_item_id AS projection_work_item_id, i.source_hash AS projection_source_hash, p.updated_at AS projection_updated_at FROM canonical_work w JOIN content_work_identities i ON i.id = w.identity_id LEFT JOIN content_current_result_projections p ON p.identity_id = i.id WHERE w.canonical_resource_type = "
     } else {
