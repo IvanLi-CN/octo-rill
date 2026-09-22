@@ -59,6 +59,20 @@ OctoRill 当前由 4 个长期维护面组成：
 
 如果一个能力既需要配置、数据库又需要跨 handler 共享，通常会进入 `AppState` 或由它派生。
 
+## Rust web service contract
+
+OctoRill 的 Rust binary 是长期运行的 HTTP service；前端、Docker 和后台 worker 都是它的交付面，不改变服务进程的定义。
+
+- 本地默认监听 `127.0.0.1:58090`。Docker runtime 明确覆盖为 `0.0.0.0:3000`，公开部署的暴露责任交给部署边界和反向代理。
+- `DATABASE_URL` 默认指向 `.data/octo-rill.db`。文件数据库使用 SQLite WAL、foreign keys、busy timeout 和 migrations；session store、后台任务和派生状态都依赖该持久化边界。
+- `/api/health` 与 `/api/version` 是无缓存运行探针；health response 必须包含 `ok` 和 effective version。`/api/tasks/{task_id}/events` 是 SSE 事件流，不能只用普通 Cargo tests 代替运行时验证。
+- `web/dist` 由 Rust service 提供 SPA/static fallback。Docker build 必须同时验证 Web build、Rust binary、embedded assets、health endpoint 和版本一致性。
+- 启动顺序包含配置解析、数据库目录与 migrations、session/OAuth/WebAuthn/client 装配、运行状态恢复、worker 启动和 listener bind。Ctrl+C/SIGTERM 会停止后台 worker、结束 scheduler、flush 轻量状态并 unregister runtime owner。
+
+## Rust source-quality contract
+
+Rust 源码质量独立于服务业务测试，由 `scripts/check-rust-source-quality.sh` 统一入口维护四层合同：format、semantic lint、source shape 和 host/features coverage。source checker 只约束入口职责与 suppression 边界，不设置全仓文件长度门槛；现有 legacy suppressions 通过 `rust-source-quality.toml` 进行 ratchet，新增豁免必须经过同一 PR 的窄范围审查。
+
 ## 后端模块分工
 
 ### 入口与基础设施

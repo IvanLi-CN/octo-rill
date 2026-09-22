@@ -109,6 +109,7 @@ Optional local entry points:
 ## Common commands
 
 ```bash
+bash scripts/check-rust-source-quality.sh
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo check --locked --all-targets --all-features
@@ -117,7 +118,7 @@ cargo check --locked --all-targets --all-features
 (cd docs-site && bun run build)
 ```
 
-These commands are explicit local validation. An ordinary `git commit` is intentionally limited to fast formatting, applicable web lint, and commit-message checks; it does not run the Rust test suite or Clippy. The complete backend test command is:
+These commands are explicit local validation. `scripts/check-rust-source-quality.sh` is the canonical Rust source-quality entry and includes the application plus its AST-based source checker. An ordinary `git commit` is intentionally limited to fast formatting, applicable web lint, and commit-message checks; it does not run the Rust test suite or Clippy. The complete backend test command is:
 
 ```bash
 cargo test --locked --all-features

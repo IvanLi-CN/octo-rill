@@ -22,6 +22,7 @@ The `Main Branch Quality Gate` ruleset protects `main` with these guarantees:
 Required pull request checks:
 
 - `Release intent label gate`
+- `Rust Source Quality`
 - `Lint & Checks`
 - `Backend Tests`
 - `Frontend E2E`
@@ -33,6 +34,7 @@ Required pull request checks:
 The expected workflow owners are:
 
 - `PR Label Gate` owns `Release intent label gate`;
+- `Rust Source Quality` owns the Rust source-quality check;
 - `CI Pipeline` owns lint, backend, frontend, worktree bootstrap, and release build checks;
 - `Review Policy` owns `Review Policy Gate`.
 
@@ -43,16 +45,16 @@ The repository separates low-latency commit feedback from complete delivery evid
 | Stage | Responsibility | Boundary |
 | --- | --- | --- |
 | Ordinary `git commit` | `pre-commit` formats Rust and stages fixes, runs web lint when applicable, and `commit-msg` runs the existing commitlint. | No `cargo test`, no Clippy, and no full-test `pre-push` hook. |
-| Explicit local validation | A developer may run targeted tests or the host-equivalent complete checks: format check, Clippy, locked all-targets check, locked all-features tests, and applicable web lint/build/Storybook/E2E. | These checks run only when explicitly requested; a successful commit does not claim they ran. |
+| Explicit local validation | A developer may run `scripts/check-rust-source-quality.sh`, targeted tests, locked all-features tests, and applicable web lint/build/Storybook/E2E. | These checks run only when explicitly requested; a successful commit does not claim they ran. |
 | Topic branch push without a PR | No new complete-test workflow is required. | Do not add a topic-branch push workflow solely to compensate for removing commit-time full tests. |
 | Push updating a PR | The existing PR synchronization trigger starts the complete CI gate for the new PR head. | The gate is bound to the latest head SHA. |
 | PR or merge group | Required checks run through the existing PR/merge-group workflows. | Hook, workflow, and documentation changes use the same gate as product changes. |
 | `main` push after merge | CI runs again for the merged target SHA. | This is the release precondition; it is not a replacement for the PR gate. |
 | Release | `release.yml` waits for successful CI for the same target SHA before release metadata, GitHub Release, or Docker image publication. | A release must stop when that CI or a release-specific step fails. |
 
-The complete CI gate currently consists of `Release intent label gate`, `Lint & Checks`, `Backend Tests`, `Frontend E2E`, both `Worktree Bootstrap Smoke` checks, `Build (Release)`, and `Review Policy Gate`. Docker smoke, browser E2E, cross-platform bootstrap, and controlled performance acceptance are heavy validations owned by CI or `$shared-testbox`; none is an implicit ordinary-commit or local pre-push responsibility.
+The complete CI gate currently consists of `Release intent label gate`, `Rust Source Quality`, `Lint & Checks`, `Backend Tests`, `Frontend E2E`, both `Worktree Bootstrap Smoke` checks, `Build (Release)`, and `Review Policy Gate`. Docker smoke, browser E2E, cross-platform bootstrap, and controlled performance acceptance are heavy validations owned by CI or `$shared-testbox`; none is an implicit ordinary-commit or local pre-push responsibility.
 
-There is no path-based exemption for workflow, hook, governance, or documentation changes. They affect repository delivery behavior and therefore use the same PR gate. The existing CI and release workflow definitions, `.github/quality-gates.json`, GitHub ruleset, and hook installation script are not changed by this policy decision.
+There is no path-based exemption for workflow, hook, governance, or documentation changes. They affect repository delivery behavior and therefore use the same PR gate. Any change to CI job ownership or required-check names must update `.github/quality-gates.json`, its contract fixtures, and the live GitHub ruleset together.
 
 ## Failure handling
 
@@ -68,10 +70,11 @@ There is no path-based exemption for workflow, hook, governance, or documentatio
 The hook migration is implemented in `lefthook.yml`, and the resulting delivery contract is verified as follows:
 
 1. The checked-in hook removes only the `pre-commit` Clippy and Rust all-features test commands. Rust format auto-staging, web lint, commitlint, parallel execution, and hook installation behavior remain unchanged, and there is no `pre-push` hook.
-2. Static checks confirm that the hook has no `cargo test` or `cargo clippy` command and no `pre-push` section. Local verification is limited to the permitted fast checks and documentation checks; the Rust full suite, full Playwright, Docker, and Compose are not implicit workstation checks.
-3. Open a PR and require every current required check to pass for the latest head SHA. Confirm that hook, workflow, and documentation changes are covered without a path exemption.
-4. After merge, confirm that `main` push CI succeeds for the merged SHA and that `release.yml` waits for that same SHA before any release publication step.
-5. If a quick check fails, repair the quick-check change. If PR CI fails, distinguish code failures from transient infrastructure failures before retrying. If `main` CI or release fails, stop publication and continue only through the existing repair or authorized backfill path.
+2. `scripts/check-rust-source-quality.sh` passes locally and the source checker baseline contains only reviewed legacy suppressions. The Rust full suite, full Playwright, Docker, and Compose remain explicit or CI-owned validations.
+3. Static checks confirm that the hook has no `cargo test` or `cargo clippy` command and no `pre-push` section.
+4. Open a PR and require every current required check to pass for the latest head SHA. Confirm that hook, workflow, and documentation changes are covered without a path exemption.
+5. After merge, confirm that `main` push CI succeeds for the merged SHA and that `release.yml` waits for that same SHA before any release publication step.
+6. If a quick check fails, repair the quick-check change. If PR CI fails, distinguish code failures from transient infrastructure failures before retrying. If `main` CI or release fails, stop publication and continue only through the existing repair or authorized backfill path.
 
 The migration may be reverted or repaired if it causes a quick-hook regression. Restoring full tests to ordinary `pre-commit` is not the default rollback because it recreates the policy violation; any exception requires a new owner decision.
 
