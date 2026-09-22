@@ -8966,7 +8966,6 @@ struct AnnouncementDetailSource {
 
 #[derive(Debug, sqlx::FromRow)]
 struct AnnouncementDetailDbRow {
-    source_row_id: String,
     repo_full_name: Option<String>,
     owner_avatar_url: Option<String>,
     open_graph_image_url: Option<String>,
@@ -9020,7 +9019,6 @@ struct GraphQlAnnouncementRepositoryOwner {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphQlAnnouncementNode {
-    id: Option<String>,
     number: i64,
     title: String,
     body: Option<String>,
@@ -9077,7 +9075,6 @@ async fn fetch_announcement_detail_source_from_db(
     let row = sqlx::query_as::<_, AnnouncementDetailDbRow>(
         r#"
         SELECT
-          e.id AS source_row_id,
           e.repo_full_name,
           e.repo_owner_avatar_url AS owner_avatar_url,
           e.repo_open_graph_image_url AS open_graph_image_url,
@@ -9106,36 +9103,43 @@ async fn fetch_announcement_detail_source_from_db(
     .await
     .map_err(ApiError::internal)?;
 
-    Ok(row.map(|row| AnnouncementDetailSource {
-        repo_full_name: row.repo_full_name.unwrap_or(repo_full_name),
-        discussion_number: row
+    Ok(row.map(|row| {
+        let resolved_repo_full_name = row.repo_full_name.unwrap_or(repo_full_name);
+        let resolved_discussion_number = row
             .discussion_number
             .or_else(|| {
                 row.html_url
                     .as_deref()
                     .and_then(parse_discussion_number_from_github_url)
             })
-            .unwrap_or(discussion_number),
-        repo_visual: repo_visual_from_parts(
-            row.owner_avatar_url,
-            row.open_graph_image_url,
-            row.uses_custom_open_graph_image.unwrap_or(0) != 0,
-        ),
-        title: row
-            .title
-            .unwrap_or_else(|| format!("Discussion #{discussion_number}")),
-        body: row.body,
-        html_url: row.html_url.unwrap_or_else(|| {
-            format!("https://github.com/{owner}/{repo}/discussions/{discussion_number}")
-        }),
-        source_revision: row.occurred_at.clone(),
-        source_revision_tiebreak: Some(row.source_row_id),
-        occurred_at: row.occurred_at,
-        actor: row.actor_login.map(|login| FeedActor {
-            login,
-            avatar_url: row.actor_avatar_url,
-            html_url: row.actor_html_url,
-        }),
+            .unwrap_or(discussion_number);
+        AnnouncementDetailSource {
+            repo_full_name: resolved_repo_full_name.clone(),
+            discussion_number: resolved_discussion_number,
+            repo_visual: repo_visual_from_parts(
+                row.owner_avatar_url,
+                row.open_graph_image_url,
+                row.uses_custom_open_graph_image.unwrap_or(0) != 0,
+            ),
+            title: row
+                .title
+                .unwrap_or_else(|| format!("Discussion #{discussion_number}")),
+            body: row.body,
+            html_url: row.html_url.unwrap_or_else(|| {
+                format!("https://github.com/{owner}/{repo}/discussions/{discussion_number}")
+            }),
+            source_revision: row.occurred_at.clone(),
+            source_revision_tiebreak: Some(announcement_discussion_key(
+                &resolved_repo_full_name,
+                resolved_discussion_number,
+            )),
+            occurred_at: row.occurred_at,
+            actor: row.actor_login.map(|login| FeedActor {
+                login,
+                avatar_url: row.actor_avatar_url,
+                html_url: row.actor_html_url,
+            }),
+        }
     }))
 }
 
@@ -9156,7 +9160,6 @@ async fn fetch_live_announcement_detail_request(
               avatarUrl
             }}
             discussion(number: {discussion_number}) {{
-              id
               number
               title
               body
@@ -9244,10 +9247,11 @@ async fn fetch_live_announcement_detail_request(
         return Ok(None);
     }
 
+    let repo_full_name = repository
+        .name_with_owner
+        .unwrap_or_else(|| format!("{owner}/{repo}"));
     Ok(Some(AnnouncementDetailSource {
-        repo_full_name: repository
-            .name_with_owner
-            .unwrap_or_else(|| format!("{owner}/{repo}")),
+        repo_full_name: repo_full_name.clone(),
         discussion_number: discussion.number,
         repo_visual: repo_visual_from_parts(
             repository.owner.and_then(|owner| owner.avatar_url),
@@ -9261,7 +9265,10 @@ async fn fetch_live_announcement_detail_request(
             .updated_at
             .clone()
             .or(discussion.created_at.clone()),
-        source_revision_tiebreak: discussion.id,
+        source_revision_tiebreak: Some(announcement_discussion_key(
+            &repo_full_name,
+            discussion.number,
+        )),
         occurred_at: discussion.updated_at.or(discussion.created_at),
         actor: discussion.author.and_then(|author| {
             let login = author.login?.trim().to_owned();

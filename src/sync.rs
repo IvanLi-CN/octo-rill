@@ -12955,7 +12955,12 @@ async fn upsert_notifications(
               subject_title = excluded.subject_title,
               subject_type = excluded.subject_type,
               reason = excluded.reason,
-              updated_at = excluded.updated_at,
+              updated_at = CASE
+                WHEN excluded.updated_at IS NOT NULL
+                  AND (notifications.updated_at IS NULL OR excluded.updated_at > notifications.updated_at)
+                THEN excluded.updated_at
+                ELSE notifications.updated_at
+              END,
               unread = excluded.unread,
               url = excluded.url,
               html_url = excluded.html_url
@@ -13929,6 +13934,49 @@ mod tests {
         .expect("load notification unread");
 
         assert_eq!(unread, 0);
+    }
+
+    #[tokio::test]
+    async fn upsert_notifications_does_not_regress_source_revision() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("notifications-source-revision-monotonic");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+
+        let newer = "2026-04-13T10:00:00Z";
+        let older = "2026-04-13T09:00:00Z";
+        let notification = mock_notification(
+            "thread-source-revision-monotonic",
+            Some("https://api.github.com/repos/octo/rocket/issues/3"),
+            Some("octo/rocket"),
+            Some("Issue"),
+            newer,
+        );
+        super::upsert_notifications(state.as_ref(), user_id.as_str(), &[notification], newer)
+            .await
+            .expect("upsert newer notification");
+
+        let notification = mock_notification(
+            "thread-source-revision-monotonic",
+            Some("https://api.github.com/repos/octo/rocket/issues/3"),
+            Some("octo/rocket"),
+            Some("Issue"),
+            older,
+        );
+        super::upsert_notifications(state.as_ref(), user_id.as_str(), &[notification], newer)
+            .await
+            .expect("upsert older notification");
+
+        let updated_at = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT updated_at FROM notifications WHERE user_id = ? AND thread_id = ?",
+        )
+        .bind(user_id.as_str())
+        .bind("thread-source-revision-monotonic")
+        .fetch_one(&pool)
+        .await
+        .expect("load notification source revision");
+
+        assert_eq!(updated_at.as_deref(), Some(newer));
     }
 
     #[tokio::test]
