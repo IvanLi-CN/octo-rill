@@ -23127,16 +23127,15 @@ pub async fn translate_releases_batch(
                 } else {
                     "content_processing_active"
                 };
+                let mut details = response.error.unwrap_or_else(|| json!({}));
+                if let Some(object) = details.as_object_mut() {
+                    object.insert("request_id".to_owned(), json!(response.request_id));
+                    object.insert("work_item_id".to_owned(), json!(response.work_item_id));
+                    object.insert("status".to_owned(), json!(response.status));
+                    object.insert("poll_url".to_owned(), json!(response.poll_url));
+                }
                 return Err(
-                    ApiError::new(StatusCode::CONFLICT, code, message).with_details(
-                        response.error.unwrap_or_else(|| {
-                            json!({
-                                "work_item_id": response.work_item_id,
-                                "status": response.status,
-                                "poll_url": response.poll_url,
-                            })
-                        }),
-                    ),
+                    ApiError::new(StatusCode::CONFLICT, code, message).with_details(details)
                 );
             }
             let response_status = response.status.clone();
@@ -23218,16 +23217,15 @@ pub async fn translate_releases_batch_stream(
                 } else {
                     "content_processing_active"
                 };
+                let mut details = response.error.unwrap_or_else(|| json!({}));
+                if let Some(object) = details.as_object_mut() {
+                    object.insert("request_id".to_owned(), json!(response.request_id));
+                    object.insert("work_item_id".to_owned(), json!(response.work_item_id));
+                    object.insert("status".to_owned(), json!(response.status));
+                    object.insert("poll_url".to_owned(), json!(response.poll_url));
+                }
                 return Err(
-                    ApiError::new(StatusCode::CONFLICT, code, message).with_details(
-                        response.error.unwrap_or_else(|| {
-                            json!({
-                                "work_item_id": response.work_item_id,
-                                "status": response.status,
-                                "poll_url": response.poll_url,
-                            })
-                        }),
-                    ),
+                    ApiError::new(StatusCode::CONFLICT, code, message).with_details(details)
                 );
             }
             responses.push(response);
@@ -25016,13 +25014,13 @@ pub async fn translate_notifications_batch(
                 } else {
                     "content_processing_active"
                 };
-                let details = response.error.unwrap_or_else(|| {
-                    json!({
-                        "work_item_id": response.work_item_id,
-                        "status": response.status,
-                        "poll_url": response.poll_url,
-                    })
-                });
+                let mut details = response.error.unwrap_or_else(|| json!({}));
+                if let Some(object) = details.as_object_mut() {
+                    object.insert("request_id".to_owned(), json!(response.request_id));
+                    object.insert("work_item_id".to_owned(), json!(response.work_item_id));
+                    object.insert("status".to_owned(), json!(response.status));
+                    object.insert("poll_url".to_owned(), json!(response.poll_url));
+                }
                 return Err(
                     ApiError::new(StatusCode::CONFLICT, code, message).with_details(details)
                 );

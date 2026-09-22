@@ -9080,7 +9080,10 @@ async fn upsert_repo_releases(
               created_at = excluded.created_at,
               is_prerelease = excluded.is_prerelease,
               is_draft = excluded.is_draft,
-              updated_at = excluded.updated_at,
+              updated_at = CASE
+                WHEN excluded.updated_at > repo_releases.updated_at THEN excluded.updated_at
+                ELSE repo_releases.updated_at
+              END,
               react_plus1 = excluded.react_plus1,
               react_laugh = excluded.react_laugh,
               react_heart = excluded.react_heart,
