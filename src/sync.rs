@@ -3495,7 +3495,23 @@ async fn insert_social_activity_event_tx(
           updated_at
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT DO NOTHING
+        ON CONFLICT DO UPDATE SET
+          repo_id = excluded.repo_id,
+          repo_full_name = excluded.repo_full_name,
+          discussion_number = excluded.discussion_number,
+          repo_owner_avatar_url = excluded.repo_owner_avatar_url,
+          repo_open_graph_image_url = excluded.repo_open_graph_image_url,
+          repo_uses_custom_open_graph_image = excluded.repo_uses_custom_open_graph_image,
+          title = excluded.title,
+          body = excluded.body,
+          html_url = excluded.html_url,
+          actor_github_user_id = excluded.actor_github_user_id,
+          actor_login = excluded.actor_login,
+          actor_avatar_url = excluded.actor_avatar_url,
+          actor_html_url = excluded.actor_html_url,
+          occurred_at = excluded.occurred_at,
+          detected_at = excluded.detected_at,
+          updated_at = excluded.updated_at
         "#,
     )
     .bind(local_id::generate_local_id())

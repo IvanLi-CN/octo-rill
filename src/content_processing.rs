@@ -1099,6 +1099,61 @@ pub async fn submit_item(
         .map_err(ApiError::internal)?
     };
     let existing_work = existing.is_some();
+    if let Some(existing) = existing.as_ref()
+        && let Some(current) = newer_work_for_resource_in_transaction(&mut tx, existing)
+            .await
+            .map_err(ApiError::internal)?
+    {
+        record_work_admission_event(
+            &mut tx,
+            WorkAdmissionEvent {
+                work_item_id: &existing.id,
+                event_type: "admission_rejected_superseded",
+                replaced_by_work_item_id: Some(&current.id),
+                source_hash: &existing.source_hash,
+                source_snapshot_json: &existing.source_snapshot_json,
+                producer_ref: &item.producer_ref,
+                requester_id: Some(user_id),
+                reason_code: "older_source_projection_redirected",
+            },
+        )
+        .await
+        .map_err(ApiError::internal)?;
+        let current_projection = load_projection(&mut tx, &current)
+            .await
+            .map_err(ApiError::internal)?;
+        insert_request_link(
+            &mut tx,
+            &request_id,
+            &current.id,
+            user_id,
+            mode,
+            &item.producer_ref,
+        )
+        .await
+        .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
+        let mut result = request_result(&current, current_projection);
+        result["producer_ref"] = Value::String(item.producer_ref.clone());
+        result["kind"] = Value::String(item.kind.clone());
+        result["variant"] = Value::String(item.variant.clone());
+        return Ok((
+            StatusCode::CONFLICT,
+            GlobalSubmissionResponse {
+                request_id: request_id.clone(),
+                work_item_id: current.id.clone(),
+                status: current.status.clone(),
+                poll_url: format!("/api/translate/requests/{request_id}"),
+                result,
+                error: Some(json!({
+                    "code": "content_processing_superseded",
+                    "message": "the submitted source version was superseded; polling the current source version",
+                    "superseded_work_item_id": existing.id.clone(),
+                    "current_work_item_id": current.id,
+                })),
+            },
+        ));
+    }
     let work = if let Some(existing) = existing {
         existing
     } else {
@@ -3177,7 +3232,7 @@ async fn source_revision_is_current_in_transaction(
     }
     let Some(current_snapshot) = current_source_revision_snapshot_in_transaction(tx, work).await?
     else {
-        return Ok(true);
+        return Ok(source_observed_at(&work.source_snapshot_json).is_none());
     };
     Ok(!source_version_is_newer(
         &current_snapshot,
