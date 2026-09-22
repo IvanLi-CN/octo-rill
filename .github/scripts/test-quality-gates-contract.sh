@@ -185,7 +185,8 @@ repo = Path(sys.argv[1])
 path = repo / ".github/workflows/ci.yml"
 text = path.read_text()
 text = text.replace("runs-on: ${{ matrix.os }}", "runs-on: ${{ matrix.runner }}", 1)
-text = text.replace("          - os: ubuntu-24.04\n", "          - runner: ubuntu-latest\n", 1)
+text = text.replace("          - os: ", "          - runner: ")
+text = text.replace("          - runner: ubuntu-24.04\n", "          - runner: ubuntu-latest\n", 1)
 path.write_text(text)
 PY
 
@@ -194,7 +195,7 @@ if python3 "$repo_root/.github/scripts/check_quality_gates_contract.py" --repo-r
   exit 1
 fi
 
-grep -q "ci.yml.jobs.worktree-bootstrap.matrix runner values must declare runner" "$tmp_dir/dynamic-runner.log"
+grep -q "ci.yml.jobs.worktree-bootstrap.runs-on must use the supported Ubuntu baseline" "$tmp_dir/dynamic-runner.log"
 
 python3 - <<'PY' "$repo_root" "$tmp_dir"
 from pathlib import Path
