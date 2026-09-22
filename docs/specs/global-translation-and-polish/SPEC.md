@@ -73,6 +73,7 @@
 - [ADR 0012: 模型无关的全局内容工作身份](../../adr/0012-model-independent-content-work.md)
 - [ADR 0013: 管理采集记录按查询键合并在途读取](../../adr/0013-admin-collection-read-singleflight.md)
 - [ADR 0014: Global Content Output Contract Recovery](../../adr/0014-global-content-output-contract.md)
+- [ADR 0015: Content Work Admission and Supersession Boundary](../../adr/0015-content-work-admission-and-supersession.md)
 
 ## Visual Evidence
 
