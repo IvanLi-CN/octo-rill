@@ -23,7 +23,9 @@ python3 "$repo_root/.github/scripts/check_quality_gates_contract.py" \
   --metadata-script "$repo_root/.github/scripts/metadata_gate.py" \
   --profile final
 
-if grep -R -n -E '^[[:space:]]*runs-on:[[:space:]]+ubuntu-latest[[:space:]]*$' "$repo_root/.github/workflows"; then
+if grep -R -n -E '^[[:space:]]*runs-on:[[:space:]]+ubuntu-latest[[:space:]]*$' \
+  "$repo_root/.github/workflows" \
+  "$repo_root/.github/scripts/fixtures/quality-gates-contract"; then
   echo "workflow runner baseline must not use ubuntu-latest" >&2
   exit 1
 fi
