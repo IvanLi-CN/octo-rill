@@ -56,6 +56,8 @@ The complete CI gate currently consists of `Release intent label gate`, `Rust So
 
 Hosted Ubuntu jobs use the explicit `ubuntu-24.04` label. The Ubuntu worktree smoke job keeps the historical `Worktree Bootstrap Smoke (ubuntu-latest)` status context so the existing required-check ruleset remains unchanged while the runner image is pinned ahead of the Ubuntu 26.04 `ubuntu-latest` migration.
 
+All JavaScript-action workflows set `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true`. The PR quality-gate surfaces retain a small set of legacy action tags (`checkout@v4`, `cache@v4`, `upload-artifact@v4`, and `build-push-action@v6`) because the trusted `main`-branch contract checker must validate the candidate before this PR can update that checker; the checked-in contract accepts those tags only as this transition-compatible set. Other action surfaces use the current Node 24-compatible majors.
+
 There is no path-based exemption for workflow, hook, governance, or documentation changes. They affect repository delivery behavior and therefore use the same PR gate. Any change to CI job ownership or required-check names must update `.github/quality-gates.json`, its contract fixtures, and the live GitHub ruleset together.
 
 ## Failure handling

@@ -25,4 +25,4 @@
 
 - CI workflow and offline contract fixtures pin hosted Ubuntu jobs to `ubuntu-24.04`.
 - The Ubuntu smoke matrix exposes `ubuntu-24.04` at runtime while retaining the historical `Worktree Bootstrap Smoke (ubuntu-latest)` status context required by the existing ruleset.
-- GitHub Actions dependencies use the current Node.js 24-compatible major releases; Bun setup remains on `oven-sh/setup-bun@v2`, whose current release uses Node.js 24.
+- JavaScript-action workflows enforce Node.js 24 with `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true`; most dependencies use current Node 24-compatible majors, while PR quality-gate surfaces retain only the legacy tags required by the trusted-base checker transition.

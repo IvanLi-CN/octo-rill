@@ -22,6 +22,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   rust-source-quality:
     name: Rust Source Quality
@@ -29,7 +32,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ github.sha }}
@@ -44,7 +47,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo directories
-        uses: actions/cache@v6
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
