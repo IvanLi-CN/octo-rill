@@ -20183,22 +20183,24 @@ fn with_source_revision(
     revision: Option<&str>,
     revision_tiebreak: Option<&str>,
 ) -> Vec<translations::TranslationSourceBlock> {
-    if let Some(revision_tiebreak) = revision_tiebreak {
+    if let Some(revision) = revision.filter(|value| !value.trim().is_empty()) {
+        if let Some(revision_tiebreak) = revision_tiebreak {
+            source_blocks.insert(
+                0,
+                translations::TranslationSourceBlock {
+                    slot: "source_revision_tiebreak".to_owned(),
+                    text: revision_tiebreak.to_owned(),
+                },
+            );
+        }
         source_blocks.insert(
             0,
             translations::TranslationSourceBlock {
-                slot: "source_revision_tiebreak".to_owned(),
-                text: revision_tiebreak.to_owned(),
+                slot: "source_observed_at".to_owned(),
+                text: revision.to_owned(),
             },
         );
     }
-    source_blocks.insert(
-        0,
-        translations::TranslationSourceBlock {
-            slot: "source_observed_at".to_owned(),
-            text: revision.unwrap_or("1970-01-01T00:00:00Z").to_owned(),
-        },
-    );
     source_blocks
 }
 
@@ -23108,6 +23110,35 @@ pub async fn translate_releases_batch(
             .await?;
             let (status, response) =
                 content_processing::submit_item(state.as_ref(), &user_id, "async", &input).await?;
+            if status == StatusCode::CONFLICT {
+                let message = response
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.get("message").and_then(Value::as_str))
+                    .unwrap_or("content processing request conflicts with current work")
+                    .to_owned();
+                let code = if response
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.get("code").and_then(Value::as_str))
+                    == Some("content_processing_superseded")
+                {
+                    "content_processing_superseded"
+                } else {
+                    "content_processing_active"
+                };
+                return Err(
+                    ApiError::new(StatusCode::CONFLICT, code, message).with_details(
+                        response.error.unwrap_or_else(|| {
+                            json!({
+                                "work_item_id": response.work_item_id,
+                                "status": response.status,
+                                "poll_url": response.poll_url,
+                            })
+                        }),
+                    ),
+                );
+            }
             let response_status = response.status.clone();
             let result = response.result;
             items.push(TranslateBatchItem {
@@ -23168,8 +23199,37 @@ pub async fn translate_releases_batch_stream(
                 "api.translate_releases_batch_stream",
             )
             .await?;
-            let (_, response) =
+            let (status, response) =
                 content_processing::submit_item(state.as_ref(), &user_id, "stream", &input).await?;
+            if status == StatusCode::CONFLICT {
+                let message = response
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.get("message").and_then(Value::as_str))
+                    .unwrap_or("content processing request conflicts with current work")
+                    .to_owned();
+                let code = if response
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.get("code").and_then(Value::as_str))
+                    == Some("content_processing_superseded")
+                {
+                    "content_processing_superseded"
+                } else {
+                    "content_processing_active"
+                };
+                return Err(
+                    ApiError::new(StatusCode::CONFLICT, code, message).with_details(
+                        response.error.unwrap_or_else(|| {
+                            json!({
+                                "work_item_id": response.work_item_id,
+                                "status": response.status,
+                                "poll_url": response.poll_url,
+                            })
+                        }),
+                    ),
+                );
+            }
             responses.push(response);
         }
         let body = responses

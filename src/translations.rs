@@ -2150,6 +2150,9 @@ async fn submit_global_translation_request(
             let (status, response) =
                 content_processing::submit_item(state, user_id, mode, &item).await?;
             if mode == "stream" {
+                if status == StatusCode::CONFLICT {
+                    return Ok((status, Json(response)).into_response());
+                }
                 return Ok(stream_global_translation_request_response_for_api(
                     Arc::new(state.clone()),
                     user_id.to_owned(),
@@ -2161,19 +2164,28 @@ async fn submit_global_translation_request(
         NormalizedTranslationSubmit::Batch(items) => {
             let mut responses = Vec::with_capacity(items.len());
             let mut status = StatusCode::ACCEPTED;
+            let mut conflict_code = "content_processing_active";
             for item in items {
                 let item = api::canonical_global_translation_item(state, user_id, &item).await?;
                 let (item_status, response) =
                     content_processing::submit_item(state, user_id, mode, &item).await?;
                 if item_status == StatusCode::CONFLICT {
                     status = StatusCode::CONFLICT;
+                    if response
+                        .error
+                        .as_ref()
+                        .and_then(|error| error.get("code").and_then(Value::as_str))
+                        == Some("content_processing_superseded")
+                    {
+                        conflict_code = "content_processing_superseded";
+                    }
                 }
                 responses.push(response);
             }
             let mut body = json!({ "requests": responses });
             if status == StatusCode::CONFLICT {
                 body["error"] = json!({
-                    "code": "content_processing_active",
+                    "code": conflict_code,
                     "message": "one or more content-processing requests are already queued or running",
                 });
             }
