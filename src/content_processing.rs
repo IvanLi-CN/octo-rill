@@ -3529,11 +3529,24 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
     .fetch_one(&mut *tx)
     .await?;
     if claim_is_current == 0 {
-        tx.rollback().await?;
+        persist_superseded_provider_call_audits(&mut tx, &work, &result, &now).await?;
+        tx.commit().await?;
         return Ok(());
     }
     if !source_exists_in_transaction(&mut tx, &work).await? {
         cancel_deleted_work_in_transaction(&mut tx, &work).await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+    if !source_revision_is_current_in_transaction(&mut tx, &work).await? {
+        supersede_work_in_transaction(
+            &mut tx,
+            &work,
+            None,
+            "source_revision_changed_before_publication",
+        )
+        .await?;
+        persist_superseded_provider_call_audits(&mut tx, &work, &result, &now).await?;
         tx.commit().await?;
         return Ok(());
     }
