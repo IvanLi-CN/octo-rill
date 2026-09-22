@@ -117,7 +117,7 @@ SQLx 默认会校验数据库中每一个已应用迁移是否存在于当前二
 
 ## Failure Finalization
 
-Provider and output-validation failures finalize the failed call link, work item, batch item, batch, and `attempt_completed` event in the same SQLite transaction. The regression test `content_processing::tests::execute_persists_failure_finalization_atomically` drives this path with a local mock provider and verifies that the terminal state and audit records persist together while the worker lease is cleared.
+Provider, provider-admission and output-validation failures finalize the failed call link, work item, batch item, batch, and `attempt_completed` event in the same SQLite transaction. Admission rejection or admission persistence errors also clear the diagnostic running lease before returning a transient failure. The regressions `content_processing::tests::execute_persists_failure_finalization_atomically` and `ai::tests::provider_admission_error_finalizes_persisted_call_without_provider_request` cover the worker and direct provider-admission paths, including zero provider requests and cleared runtime lease fields.
 
 ## Content Work Admission and Supersession
 
