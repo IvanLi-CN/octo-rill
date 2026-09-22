@@ -1,5 +1,25 @@
 # LinuxDO 绑定与用户设置页改造
 
+## Related ADRs
+
+None
+
+## Context and Scope
+
+本主题覆盖普通用户 `/settings` 设置页及其 GitHub PAT 配置流程。当前变更只扩展 GitHub PAT 输入后的 checking 反馈，不改变 PAT 校验、保存接口、权限判断或 Dashboard fallback 的业务语义。
+
+## Requirements
+
+- REQ-SETTINGS-PAT-CHECKING-FEEDBACK: GitHub PAT 进入 checking 状态时，设置页保存按钮 MUST 保持禁用并提供稳定的单色扫描校验图标；图标尺寸 MUST 固定为 `18px × 18px`，动画 MUST 限制在图标内部。
+- REQ-SETTINGS-PAT-SAVE-SEPARATION: PAT 保存请求开始后，保存按钮 MUST 继续显示既有保存中 Loader，不得与 checking 动效混用。
+- REQ-SETTINGS-PAT-REDUCED-MOTION: 用户启用减少动态效果时，checking 图标 MUST 保留静态可辨识反馈并停止空间动画。
+
+## Verification
+
+- VER-SETTINGS-PAT-CHECKING-E2E: `web/e2e/settings.spec.ts` 覆盖 checking 状态下按钮禁用、`aria-busy`、图标固定尺寸和扫描路径挂载，covers: REQ-SETTINGS-PAT-CHECKING-FEEDBACK。
+- VER-SETTINGS-PAT-SAVE-SEPARATION: Settings PAT 保存分支保持 `patSaving` 优先使用既有 Loader，covers: REQ-SETTINGS-PAT-SAVE-SEPARATION。
+- VER-SETTINGS-PAT-REDUCED-MOTION: `web/src/index.css` 提供 `prefers-reduced-motion: reduce` 静态反馈分支，并通过桌面/`393×852` 视觉证据检查，covers: REQ-SETTINGS-PAT-REDUCED-MOTION。
+
 ## 背景 / 问题陈述
 
 - 当前普通用户设置分散在 Dashboard 顶部按钮与 Release reaction 的临时 PAT 对话框里，入口零散，后续难以扩展更多账号能力。
@@ -166,31 +186,30 @@
 
 ## Visual Evidence
 
-PR: include
+GitHub PAT 输入后的 checking 状态（保存按钮显示固定尺寸的扫描校验图标，桌面端）
+![Settings GitHub PAT checking desktop](./assets/settings-github-pat-checking-desktop.png)
+
+GitHub PAT 输入后的 checking 状态（保存按钮显示固定尺寸的扫描校验图标，移动端）
+![Settings GitHub PAT checking mobile](./assets/settings-github-pat-checking-mobile.png)
+
 设置页桌面端总览（LinuxDO / GitHub PAT / 日报设置）
 ![Settings page overview](./assets/settings-page-overview.png)
 
-PR: include
 GitHub PAT section 深链态（保留 masked token / 校验状态，输入框默认使用原生 secure-text 隐藏并支持显隐切换）
 ![Settings GitHub PAT section](./assets/settings-github-pat-section.png)
 
-PR: include
 GitHub PAT section 桌面宽版深链态（设置页内容宽度对齐 AppShell）
 ![Settings GitHub PAT wide desktop](./assets/settings-github-pat-wide-desktop.png)
 
-PR: include
 GitHub PAT section 移动端深链态（保持单列布局且无横向溢出）
 ![Settings GitHub PAT wide mobile](./assets/settings-github-pat-wide-mobile.png)
 
-PR: include
 设置页移动端总览
 ![Settings page mobile overview](./assets/settings-page-mobile-overview.png)
 
-PR: include
 账号菜单中的“设置”入口与 LinuxDO 绑定入口
 ![Dashboard account menu settings entry](./assets/dashboard-account-menu-settings.png)
 
-PR: include
 PAT fallback 快速补录弹层（默认使用原生 secure-text 隐藏、支持显隐切换，并保留完整设置入口）
 ![PAT fallback quick setup dialog](./assets/dashboard-pat-fallback-guide.png)
 

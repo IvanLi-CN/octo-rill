@@ -90,6 +90,46 @@
 	--color-ring: var(--ring);
 }
 
+.pat-validation-icon {
+	display: block;
+	overflow: visible;
+	stroke: currentColor;
+	stroke-linecap: round;
+	stroke-linejoin: round;
+	stroke-width: 1.8;
+}
+
+.pat-validation-icon-corners {
+	opacity: 0.84;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+	.pat-validation-icon-beam {
+		transform-box: fill-box;
+		transform-origin: center;
+		animation: pat-validation-scan 900ms cubic-bezier(0.4, 0, 0.2, 1) infinite;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.pat-validation-icon-beam {
+		opacity: 0.72;
+	}
+}
+
+@keyframes pat-validation-scan {
+	0%,
+	100% {
+		opacity: 0.25;
+		transform: translateY(-3px);
+	}
+
+	50% {
+		opacity: 1;
+		transform: translateY(3px);
+	}
+}
+
 @layer base {
 	html {
 		min-height: 100%;
