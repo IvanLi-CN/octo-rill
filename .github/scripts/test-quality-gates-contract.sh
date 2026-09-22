@@ -44,7 +44,7 @@ for expected_action in \
   'oven-sh/setup-bun@v2' \
   'softprops/action-gh-release@v3'; do
   action_name="${expected_action%@*}"
-  references="$(grep -RhoE "${action_name}@v[0-9]+" "$repo_root/.github" | sort -u || true)"
+  references="$(grep -RhoE --include='*.yml' --include='*.yaml' "${action_name}@v[0-9]+" "$repo_root/.github" | sort -u || true)"
   if [[ "${references}" != "${expected_action}" ]]; then
     echo "workflow action baseline drifted for ${action_name}: expected ${expected_action}, got ${references:-<none>}" >&2
     exit 1
