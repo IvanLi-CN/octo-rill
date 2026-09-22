@@ -13018,7 +13018,22 @@ async fn upsert_notifications(
             notification.repository.full_name.as_deref(),
             Some(notification.id.as_str()),
         );
-        sqlx::query(
+        let source_is_newer = r#"
+            excluded.updated_at IS NOT NULL
+              AND (
+                notifications.updated_at IS NULL
+                OR excluded.updated_at > notifications.updated_at
+                OR (
+                  excluded.updated_at = notifications.updated_at
+                  AND (
+                    ('thread=' || excluded.thread_id || char(10) || 'repo=' || COALESCE(excluded.repo_full_name, '') || char(10) || 'title=' || COALESCE(excluded.subject_title, '') || char(10) || 'reason=' || COALESCE(excluded.reason, '') || char(10) || 'subject_type=' || COALESCE(excluded.subject_type, ''))
+                    >
+                    ('thread=' || notifications.thread_id || char(10) || 'repo=' || COALESCE(notifications.repo_full_name, '') || char(10) || 'title=' || COALESCE(notifications.subject_title, '') || char(10) || 'reason=' || COALESCE(notifications.reason, '') || char(10) || 'subject_type=' || COALESCE(notifications.subject_type, ''))
+                  )
+                )
+              )
+        "#;
+        sqlx::query(&format!(
             r#"
             INSERT INTO notifications (
               id, user_id, thread_id, repo_full_name, subject_title, subject_type, reason,
@@ -13034,55 +13049,48 @@ async fn upsert_notifications(
               ?, ?, ?
             ON CONFLICT(user_id, thread_id) DO UPDATE SET
               repo_full_name = CASE
-                WHEN excluded.updated_at IS NOT NULL
-                  AND (notifications.updated_at IS NULL OR excluded.updated_at > notifications.updated_at)
+                WHEN {source_is_newer}
                 THEN excluded.repo_full_name
                 ELSE notifications.repo_full_name
               END,
               subject_title = CASE
-                WHEN excluded.updated_at IS NOT NULL
-                  AND (notifications.updated_at IS NULL OR excluded.updated_at > notifications.updated_at)
+                WHEN {source_is_newer}
                 THEN excluded.subject_title
                 ELSE notifications.subject_title
               END,
               subject_type = CASE
-                WHEN excluded.updated_at IS NOT NULL
-                  AND (notifications.updated_at IS NULL OR excluded.updated_at > notifications.updated_at)
+                WHEN {source_is_newer}
                 THEN excluded.subject_type
                 ELSE notifications.subject_type
               END,
               reason = CASE
-                WHEN excluded.updated_at IS NOT NULL
-                  AND (notifications.updated_at IS NULL OR excluded.updated_at > notifications.updated_at)
+                WHEN {source_is_newer}
                 THEN excluded.reason
                 ELSE notifications.reason
               END,
               updated_at = CASE
-                WHEN excluded.updated_at IS NOT NULL
-                  AND (notifications.updated_at IS NULL OR excluded.updated_at > notifications.updated_at)
+                WHEN {source_is_newer}
                 THEN excluded.updated_at
                 ELSE notifications.updated_at
               END,
               unread = CASE
-                WHEN excluded.updated_at IS NOT NULL
-                  AND (notifications.updated_at IS NULL OR excluded.updated_at > notifications.updated_at)
+                WHEN {source_is_newer}
                 THEN excluded.unread
                 ELSE notifications.unread
               END,
               url = CASE
-                WHEN excluded.updated_at IS NOT NULL
-                  AND (notifications.updated_at IS NULL OR excluded.updated_at > notifications.updated_at)
+                WHEN {source_is_newer}
                 THEN excluded.url
                 ELSE notifications.url
               END,
               html_url = CASE
-                WHEN excluded.updated_at IS NOT NULL
-                  AND (notifications.updated_at IS NULL OR excluded.updated_at > notifications.updated_at)
+                WHEN {source_is_newer}
                 THEN excluded.html_url
                 ELSE notifications.html_url
               END
             "#,
-        )
+            source_is_newer = source_is_newer
+        ))
         .bind(local_id::generate_local_id())
         .bind(user_id)
         .bind(&notification.id)
@@ -14085,6 +14093,18 @@ mod tests {
             .await
             .expect("upsert older notification");
 
+        let mut equal_timestamp = mock_notification(
+            "thread-source-revision-monotonic",
+            Some("https://api.github.com/repos/zoo/rocket/issues/3"),
+            Some("zoo/rocket"),
+            Some("Issue"),
+            newer,
+        );
+        equal_timestamp.subject.title = Some("Newer canonical payload".to_owned());
+        super::upsert_notifications(state.as_ref(), user_id.as_str(), &[equal_timestamp], newer)
+            .await
+            .expect("upsert equal-timestamp canonical notification");
+
         let stored = sqlx::query_as::<_, (Option<String>, Option<String>)>(
             "SELECT updated_at, subject_title FROM notifications WHERE user_id = ? AND thread_id = ?",
         )
@@ -14095,10 +14115,17 @@ mod tests {
         .expect("load notification source revision");
 
         assert_eq!(stored.0.as_deref(), Some(newer));
-        assert_eq!(
-            stored.1.as_deref(),
-            Some("Notification thread-source-revision-monotonic")
-        );
+        assert_eq!(stored.1.as_deref(), Some("Newer canonical payload"));
+
+        let stored_repo = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT repo_full_name FROM notifications WHERE user_id = ? AND thread_id = ?",
+        )
+        .bind(user_id.as_str())
+        .bind("thread-source-revision-monotonic")
+        .fetch_one(&pool)
+        .await
+        .expect("load equal-timestamp canonical repository");
+        assert_eq!(stored_repo.as_deref(), Some("zoo/rocket"));
     }
 
     #[tokio::test]

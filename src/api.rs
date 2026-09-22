@@ -9117,12 +9117,12 @@ async fn fetch_announcement_detail_source_from_db(
             .title
             .unwrap_or_else(|| format!("Discussion #{discussion_number}"));
         let body = row.body;
-        let source_revision_tiebreak = content_processing::source_revision_content_tiebreak(&[
-            &resolved_repo_full_name,
-            &resolved_discussion_number.to_string(),
+        let source_revision_tiebreak = content_processing::announcement_source_revision_tiebreak(
+            resolved_repo_full_name.as_str(),
+            resolved_discussion_number,
             title.as_str(),
             body.as_deref().unwrap_or_default(),
-        ]);
+        );
         AnnouncementDetailSource {
             repo_full_name: resolved_repo_full_name.clone(),
             discussion_number: resolved_discussion_number,
@@ -9255,12 +9255,12 @@ async fn fetch_live_announcement_detail_request(
     let repo_full_name = repository
         .name_with_owner
         .unwrap_or_else(|| format!("{owner}/{repo}"));
-    let source_revision_tiebreak = content_processing::source_revision_content_tiebreak(&[
-        &repo_full_name,
-        &discussion.number.to_string(),
-        &discussion.title,
+    let source_revision_tiebreak = content_processing::announcement_source_revision_tiebreak(
+        repo_full_name.as_str(),
+        discussion.number,
+        discussion.title.as_str(),
         discussion.body.as_deref().unwrap_or_default(),
-    ]);
+    );
     Ok(Some(AnnouncementDetailSource {
         repo_full_name: repo_full_name.clone(),
         discussion_number: discussion.number,
@@ -20257,6 +20257,7 @@ struct GlobalReleaseSourceRow {
     name: Option<String>,
     body: Option<String>,
     updated_at: String,
+    detected_at: Option<String>,
 }
 
 fn global_source_hash_from_fields(
@@ -20385,7 +20386,7 @@ pub(crate) async fn global_release_request_item(
 ) -> Result<translations::TranslationRequestItemInput, ApiError> {
     let row = sqlx::query_as::<_, GlobalReleaseSourceRow>(
         r#"
-        SELECT r.repo_id, sr.repo_id AS starred_repo_id, r.html_url, r.tag_name, r.name, r.body, r.updated_at
+        SELECT r.repo_id, sr.repo_id AS starred_repo_id, r.html_url, r.tag_name, r.name, r.body, r.updated_at, r.detected_at
         FROM repo_releases r
         LEFT JOIN user_release_visible_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
@@ -20466,7 +20467,10 @@ pub(crate) async fn global_release_request_item(
         max_wait_ms: 60_000,
         source_blocks: with_source_revision(
             source_blocks,
-            Some(row.updated_at.as_str()),
+            content_processing::authoritative_release_revision(
+                row.updated_at.as_str(),
+                row.detected_at.as_deref(),
+            ),
             Some(source_revision_tiebreak.as_str()),
         ),
         target_slots,
@@ -20515,7 +20519,7 @@ async fn global_notification_request_item(
         ));
     }
     let row = sqlx::query_as::<_, NotificationBatchSourceRow>(
-        "SELECT thread_id, repo_full_name, subject_title, reason, subject_type, updated_at FROM notifications WHERE thread_id = ? ORDER BY updated_at DESC, COALESCE(repo_full_name, '') DESC, COALESCE(subject_title, '') DESC, COALESCE(reason, '') DESC, COALESCE(subject_type, '') DESC, thread_id DESC LIMIT 1",
+        "SELECT thread_id, repo_full_name, subject_title, reason, subject_type, updated_at FROM notifications WHERE thread_id = ? ORDER BY updated_at DESC, COALESCE(repo_full_name, '') DESC, COALESCE(subject_title, '') DESC, COALESCE(reason, '') DESC, COALESCE(subject_type, '') DESC, id DESC LIMIT 1",
     )
     .bind(thread_id)
     .fetch_optional(&state.pool)
