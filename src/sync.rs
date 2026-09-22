@@ -1073,6 +1073,8 @@ struct ExistingRepoReleaseRow {
     html_url: String,
     published_at: Option<String>,
     created_at: Option<String>,
+    detected_at: String,
+    updated_at: String,
     is_prerelease: i64,
     is_draft: i64,
     react_plus1: i64,
@@ -9019,6 +9021,8 @@ async fn upsert_repo_releases(
               html_url,
               published_at,
               created_at,
+              detected_at,
+              updated_at,
               is_prerelease,
               is_draft,
               react_plus1,
@@ -9043,6 +9047,12 @@ async fn upsert_repo_releases(
                 let hooray = reactions.map(|value| value.hooray).unwrap_or(0);
                 let rocket = reactions.map(|value| value.rocket).unwrap_or(0);
                 let eyes = reactions.map(|value| value.eyes).unwrap_or(0);
+                let source_revision = release
+                    .updated_at
+                    .as_deref()
+                    .or(release.published_at.as_deref())
+                    .or(release.created_at.as_deref())
+                    .unwrap_or(now.as_str());
                 if let Some(existing) = existing.as_ref() {
                     let unchanged = existing.node_id == release.node_id
                         && existing.tag_name == release.tag_name
@@ -9058,7 +9068,9 @@ async fn upsert_repo_releases(
                         && existing.react_heart == heart
                         && existing.react_hooray == hooray
                         && existing.react_rocket == rocket
-                        && existing.react_eyes == eyes;
+                        && existing.react_eyes == eyes
+                        && existing.updated_at == source_revision
+                        && existing.updated_at != existing.detected_at;
                     if unchanged {
                         stats.unchanged_count += 1;
                         continue;
@@ -9095,26 +9107,75 @@ async fn upsert_repo_releases(
               react_eyes
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(release_id) DO UPDATE SET
-              repo_id = excluded.repo_id,
-              node_id = excluded.node_id,
-              tag_name = excluded.tag_name,
-              name = excluded.name,
-              body = excluded.body,
-              html_url = excluded.html_url,
-              published_at = excluded.published_at,
-              created_at = excluded.created_at,
-              is_prerelease = excluded.is_prerelease,
-              is_draft = excluded.is_draft,
+              repo_id = CASE
+                WHEN repo_releases.updated_at = repo_releases.detected_at OR excluded.updated_at >= repo_releases.updated_at THEN excluded.repo_id
+                ELSE repo_releases.repo_id
+              END,
+              node_id = CASE
+                WHEN repo_releases.updated_at = repo_releases.detected_at OR excluded.updated_at >= repo_releases.updated_at THEN excluded.node_id
+                ELSE repo_releases.node_id
+              END,
+              tag_name = CASE
+                WHEN repo_releases.updated_at = repo_releases.detected_at OR excluded.updated_at >= repo_releases.updated_at THEN excluded.tag_name
+                ELSE repo_releases.tag_name
+              END,
+              name = CASE
+                WHEN repo_releases.updated_at = repo_releases.detected_at OR excluded.updated_at >= repo_releases.updated_at THEN excluded.name
+                ELSE repo_releases.name
+              END,
+              body = CASE
+                WHEN repo_releases.updated_at = repo_releases.detected_at OR excluded.updated_at >= repo_releases.updated_at THEN excluded.body
+                ELSE repo_releases.body
+              END,
+              html_url = CASE
+                WHEN repo_releases.updated_at = repo_releases.detected_at OR excluded.updated_at >= repo_releases.updated_at THEN excluded.html_url
+                ELSE repo_releases.html_url
+              END,
+              published_at = CASE
+                WHEN repo_releases.updated_at = repo_releases.detected_at OR excluded.updated_at >= repo_releases.updated_at THEN excluded.published_at
+                ELSE repo_releases.published_at
+              END,
+              created_at = CASE
+                WHEN repo_releases.updated_at = repo_releases.detected_at OR excluded.updated_at >= repo_releases.updated_at THEN excluded.created_at
+                ELSE repo_releases.created_at
+              END,
+              is_prerelease = CASE
+                WHEN repo_releases.updated_at = repo_releases.detected_at OR excluded.updated_at >= repo_releases.updated_at THEN excluded.is_prerelease
+                ELSE repo_releases.is_prerelease
+              END,
+              is_draft = CASE
+                WHEN repo_releases.updated_at = repo_releases.detected_at OR excluded.updated_at >= repo_releases.updated_at THEN excluded.is_draft
+                ELSE repo_releases.is_draft
+              END,
               updated_at = CASE
-                WHEN excluded.updated_at > repo_releases.updated_at THEN excluded.updated_at
+                WHEN repo_releases.updated_at = repo_releases.detected_at THEN excluded.updated_at
+                WHEN excluded.updated_at >= repo_releases.updated_at THEN excluded.updated_at
                 ELSE repo_releases.updated_at
               END,
-              react_plus1 = excluded.react_plus1,
-              react_laugh = excluded.react_laugh,
-              react_heart = excluded.react_heart,
-              react_hooray = excluded.react_hooray,
-              react_rocket = excluded.react_rocket,
-              react_eyes = excluded.react_eyes
+              react_plus1 = CASE
+                WHEN repo_releases.updated_at = repo_releases.detected_at OR excluded.updated_at >= repo_releases.updated_at THEN excluded.react_plus1
+                ELSE repo_releases.react_plus1
+              END,
+              react_laugh = CASE
+                WHEN repo_releases.updated_at = repo_releases.detected_at OR excluded.updated_at >= repo_releases.updated_at THEN excluded.react_laugh
+                ELSE repo_releases.react_laugh
+              END,
+              react_heart = CASE
+                WHEN repo_releases.updated_at = repo_releases.detected_at OR excluded.updated_at >= repo_releases.updated_at THEN excluded.react_heart
+                ELSE repo_releases.react_heart
+              END,
+              react_hooray = CASE
+                WHEN repo_releases.updated_at = repo_releases.detected_at OR excluded.updated_at >= repo_releases.updated_at THEN excluded.react_hooray
+                ELSE repo_releases.react_hooray
+              END,
+              react_rocket = CASE
+                WHEN repo_releases.updated_at = repo_releases.detected_at OR excluded.updated_at >= repo_releases.updated_at THEN excluded.react_rocket
+                ELSE repo_releases.react_rocket
+              END,
+              react_eyes = CASE
+                WHEN repo_releases.updated_at = repo_releases.detected_at OR excluded.updated_at >= repo_releases.updated_at THEN excluded.react_eyes
+                ELSE repo_releases.react_eyes
+              END
             "#,
                 )
                 .bind(local_id::generate_local_id())
@@ -9130,14 +9191,7 @@ async fn upsert_repo_releases(
                 .bind(release.prerelease as i64)
                 .bind(release.draft as i64)
                 .bind(now.as_str())
-                .bind(
-                    release
-                        .updated_at
-                        .as_deref()
-                        .or(release.published_at.as_deref())
-                        .or(release.created_at.as_deref())
-                        .unwrap_or(now.as_str()),
-                )
+                .bind(source_revision)
                 .bind(plus1)
                 .bind(laugh)
                 .bind(heart)
@@ -12951,19 +13005,54 @@ async fn upsert_notifications(
               ), 0),
               ?, ?, ?
             ON CONFLICT(user_id, thread_id) DO UPDATE SET
-              repo_full_name = excluded.repo_full_name,
-              subject_title = excluded.subject_title,
-              subject_type = excluded.subject_type,
-              reason = excluded.reason,
+              repo_full_name = CASE
+                WHEN excluded.updated_at IS NOT NULL
+                  AND (notifications.updated_at IS NULL OR excluded.updated_at > notifications.updated_at)
+                THEN excluded.repo_full_name
+                ELSE notifications.repo_full_name
+              END,
+              subject_title = CASE
+                WHEN excluded.updated_at IS NOT NULL
+                  AND (notifications.updated_at IS NULL OR excluded.updated_at > notifications.updated_at)
+                THEN excluded.subject_title
+                ELSE notifications.subject_title
+              END,
+              subject_type = CASE
+                WHEN excluded.updated_at IS NOT NULL
+                  AND (notifications.updated_at IS NULL OR excluded.updated_at > notifications.updated_at)
+                THEN excluded.subject_type
+                ELSE notifications.subject_type
+              END,
+              reason = CASE
+                WHEN excluded.updated_at IS NOT NULL
+                  AND (notifications.updated_at IS NULL OR excluded.updated_at > notifications.updated_at)
+                THEN excluded.reason
+                ELSE notifications.reason
+              END,
               updated_at = CASE
                 WHEN excluded.updated_at IS NOT NULL
                   AND (notifications.updated_at IS NULL OR excluded.updated_at > notifications.updated_at)
                 THEN excluded.updated_at
                 ELSE notifications.updated_at
               END,
-              unread = excluded.unread,
-              url = excluded.url,
-              html_url = excluded.html_url
+              unread = CASE
+                WHEN excluded.updated_at IS NOT NULL
+                  AND (notifications.updated_at IS NULL OR excluded.updated_at > notifications.updated_at)
+                THEN excluded.unread
+                ELSE notifications.unread
+              END,
+              url = CASE
+                WHEN excluded.updated_at IS NOT NULL
+                  AND (notifications.updated_at IS NULL OR excluded.updated_at > notifications.updated_at)
+                THEN excluded.url
+                ELSE notifications.url
+              END,
+              html_url = CASE
+                WHEN excluded.updated_at IS NOT NULL
+                  AND (notifications.updated_at IS NULL OR excluded.updated_at > notifications.updated_at)
+                THEN excluded.html_url
+                ELSE notifications.html_url
+              END
             "#,
         )
         .bind(local_id::generate_local_id())
@@ -13956,19 +14045,20 @@ mod tests {
             .await
             .expect("upsert newer notification");
 
-        let notification = mock_notification(
+        let mut notification = mock_notification(
             "thread-source-revision-monotonic",
             Some("https://api.github.com/repos/octo/rocket/issues/3"),
             Some("octo/rocket"),
             Some("Issue"),
             older,
         );
+        notification.subject.title = Some("Older notification payload".to_owned());
         super::upsert_notifications(state.as_ref(), user_id.as_str(), &[notification], newer)
             .await
             .expect("upsert older notification");
 
-        let updated_at = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT updated_at FROM notifications WHERE user_id = ? AND thread_id = ?",
+        let stored = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT updated_at, subject_title FROM notifications WHERE user_id = ? AND thread_id = ?",
         )
         .bind(user_id.as_str())
         .bind("thread-source-revision-monotonic")
@@ -13976,7 +14066,11 @@ mod tests {
         .await
         .expect("load notification source revision");
 
-        assert_eq!(updated_at.as_deref(), Some(newer));
+        assert_eq!(stored.0.as_deref(), Some(newer));
+        assert_eq!(
+            stored.1.as_deref(),
+            Some("Notification thread-source-revision-monotonic")
+        );
     }
 
     #[tokio::test]
@@ -21712,12 +21806,29 @@ mod tests {
 
         let mut edited = release;
         edited.body = Some("edited body".to_owned());
-        let updated = upsert_repo_releases(state.as_ref(), 42, &[edited], None)
+        let updated = upsert_repo_releases(state.as_ref(), 42, std::slice::from_ref(&edited), None)
             .await
             .expect("update release");
         assert_eq!(updated.inserted_count, 0);
         assert_eq!(updated.updated_count, 1);
         assert_eq!(updated.unchanged_count, 0);
+
+        let mut stale = edited;
+        stale.body = Some("stale body".to_owned());
+        stale.updated_at = Some("2026-03-06T10:15:00Z".to_owned());
+        upsert_repo_releases(state.as_ref(), 42, &[stale], None)
+            .await
+            .expect("ignore stale release payload");
+
+        let stored = sqlx::query_as::<_, (Option<String>, String)>(
+            "SELECT body, updated_at FROM repo_releases WHERE release_id = ?",
+        )
+        .bind(9_001_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("load release after stale payload");
+        assert_eq!(stored.0.as_deref(), Some("edited body"));
+        assert_eq!(stored.1, "2026-03-06T10:30:00Z");
     }
 
     #[tokio::test]

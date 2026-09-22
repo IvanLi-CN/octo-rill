@@ -128,8 +128,11 @@ authoritative source revision timestamp and canonical resource tie-break value
 in the frozen source snapshot; revision metadata is excluded from
 `source_hash`. Announcement cache and live GraphQL adapters both use the
 normalized `repo#discussion_number` key, while notification synchronization
-advances `updated_at` monotonically so an older upstream page cannot regress
-the canonical source row.
+advances `updated_at` monotonically and rejects stale payload fields so an
+older upstream page cannot regress the canonical source row. Release rows
+created by the legacy sync path are recognized by their ingest timestamp and
+upgraded to the first authoritative upstream revision; a revision-bearing
+worker fails closed when the live source has no usable revision.
 Legacy snapshots without revision metadata use a fail-closed compatibility
 fallback: a revision-bearing candidate may supersede an unknown legacy source,
 while two unknown revisions are never ordered by synchronization arrival.

@@ -19286,6 +19286,121 @@ fn translate_batch_items_for_public(items: Vec<TranslateBatchItem>) -> Vec<Trans
         .collect()
 }
 
+fn global_release_batch_item_from_snapshot(
+    release_id: i64,
+    snapshot: &Value,
+) -> (bool, TranslateBatchItem) {
+    let status = snapshot
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("queued");
+    let result = snapshot.get("result").cloned().unwrap_or_else(|| json!({}));
+    let title = result
+        .get("title_zh")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let summary = result
+        .get("summary_md")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let terminal = matches!(
+        status,
+        "ready" | "failed" | "cancelled" | "superseded" | "not_applicable"
+    );
+    let (public_status, error) = match status {
+        "ready" => ("ready", None),
+        "not_applicable" => ("missing", None),
+        "failed" | "cancelled" | "superseded" => (
+            "error",
+            result
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .or(Some("translation failed"))
+                .map(str::to_owned),
+        ),
+        _ => ("processing", None),
+    };
+    (
+        terminal,
+        translate_batch_item_for_public(TranslateBatchItem {
+            id: release_id.to_string(),
+            lang: "zh-CN".to_owned(),
+            status: public_status.to_owned(),
+            title,
+            summary,
+            error,
+            failure_class: None,
+        }),
+    )
+}
+
+fn stream_global_release_batch_response(
+    state: Arc<AppState>,
+    user_id: String,
+    requests: Vec<(i64, String)>,
+) -> Response {
+    let stream = async_stream::stream! {
+        for (release_id, request_id) in requests {
+            loop {
+                match content_processing::get_request(state.as_ref(), &user_id, &request_id).await {
+                    Ok(Some(snapshot)) => {
+                        let (terminal, item) = global_release_batch_item_from_snapshot(release_id, &snapshot);
+                        if terminal {
+                            let event = TranslateBatchStreamEvent {
+                                event: "item",
+                                item: Some(item),
+                                error: None,
+                            };
+                            let mut payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_owned());
+                            payload.push('\n');
+                            yield Ok::<Bytes, Infallible>(Bytes::from(payload));
+                            break;
+                        }
+                    }
+                    Ok(None) | Err(_) => {
+                        let event = TranslateBatchStreamEvent {
+                            event: "item",
+                            item: Some(TranslateBatchItem {
+                                id: release_id.to_string(),
+                                lang: "zh-CN".to_owned(),
+                                status: "error".to_owned(),
+                                title: None,
+                                summary: None,
+                                error: Some("translation request not found".to_owned()),
+                                failure_class: None,
+                            }),
+                            error: None,
+                        };
+                        let mut payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_owned());
+                        payload.push('\n');
+                        yield Ok::<Bytes, Infallible>(Bytes::from(payload));
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+        let mut payload = serde_json::to_string(&TranslateBatchStreamEvent {
+            event: "done",
+            item: None,
+            error: None,
+        }).unwrap_or_else(|_| "{}".to_owned());
+        payload.push('\n');
+        yield Ok::<Bytes, Infallible>(Bytes::from(payload));
+    };
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
+}
+
 #[allow(dead_code)]
 fn accumulate_batch_item_stats(
     item: &TranslateBatchItem,
@@ -20387,7 +20502,7 @@ async fn global_notification_request_item(
         ));
     }
     let row = sqlx::query_as::<_, NotificationBatchSourceRow>(
-        "SELECT id AS source_row_id, thread_id, repo_full_name, subject_title, reason, subject_type, updated_at FROM notifications WHERE thread_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
+        "SELECT thread_id, repo_full_name, subject_title, reason, subject_type, updated_at FROM notifications WHERE thread_id = ? ORDER BY updated_at DESC, COALESCE(repo_full_name, '') DESC, COALESCE(subject_title, '') DESC, COALESCE(reason, '') DESC, COALESCE(subject_type, '') DESC, thread_id DESC LIMIT 1",
     )
     .bind(thread_id)
     .fetch_optional(&state.pool)
@@ -20399,6 +20514,13 @@ async fn global_notification_request_item(
         .unwrap_or_else(|| "(unknown repo)".to_owned());
     let title = row.subject_title.unwrap_or_else(|| "(no title)".to_owned());
     let subject_type = row.subject_type.unwrap_or_default();
+    let source_revision_tiebreak = content_processing::notification_source_revision_tiebreak(
+        row.thread_id.as_str(),
+        Some(repo.as_str()),
+        Some(title.as_str()),
+        row.reason.as_deref(),
+        Some(subject_type.as_str()),
+    );
     Ok(translations::TranslationRequestItemInput {
         producer_ref: "api.translate_notification".to_owned(),
         kind: "notification".to_owned(),
@@ -20409,7 +20531,7 @@ async fn global_notification_request_item(
         source_blocks: with_source_revision(
             global_notification_source_blocks(&repo, &title, &subject_type),
             row.updated_at.as_deref(),
-            Some(row.source_row_id.as_str()),
+            Some(source_revision_tiebreak.as_str()),
         ),
         target_slots: vec!["title_zh".to_owned(), "summary_md".to_owned()],
     })
@@ -23195,7 +23317,7 @@ pub async fn translate_releases_batch_stream(
         .map_err(ApiError::internal)?
         == content_processing::ContentProcessingMode::Global
     {
-        let mut responses = Vec::with_capacity(release_ids.len());
+        let mut requests = Vec::with_capacity(release_ids.len());
         for release_id in release_ids {
             let input = global_release_request_item(
                 state.as_ref(),
@@ -23205,49 +23327,15 @@ pub async fn translate_releases_batch_stream(
                 "api.translate_releases_batch_stream",
             )
             .await?;
-            let (status, response) =
+            let (_status, response) =
                 content_processing::submit_item(state.as_ref(), &user_id, "stream", &input).await?;
-            if status == StatusCode::CONFLICT {
-                let message = response
-                    .error
-                    .as_ref()
-                    .and_then(|error| error.get("message").and_then(Value::as_str))
-                    .unwrap_or("content processing request conflicts with current work")
-                    .to_owned();
-                let code = if response
-                    .error
-                    .as_ref()
-                    .and_then(|error| error.get("code").and_then(Value::as_str))
-                    == Some("content_processing_superseded")
-                {
-                    "content_processing_superseded"
-                } else {
-                    "content_processing_active"
-                };
-                let mut details = response.error.unwrap_or_else(|| json!({}));
-                if let Some(object) = details.as_object_mut() {
-                    object.insert("request_id".to_owned(), json!(response.request_id));
-                    object.insert("work_item_id".to_owned(), json!(response.work_item_id));
-                    object.insert("status".to_owned(), json!(response.status));
-                    object.insert("poll_url".to_owned(), json!(response.poll_url));
-                }
-                return Err(
-                    ApiError::new(StatusCode::CONFLICT, code, message).with_details(details)
-                );
-            }
-            responses.push(response);
+            requests.push((release_id, response.request_id));
         }
-        let body = responses
-            .into_iter()
-            .map(|response| serde_json::to_string(&response).map(|line| format!("{line}\n")))
-            .collect::<Result<String, _>>()
-            .map_err(ApiError::internal)?;
-        let mut response = Response::new(Body::from(body));
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
-        );
-        return Ok(response);
+        return Ok(stream_global_release_batch_response(
+            state.clone(),
+            user_id,
+            requests,
+        ));
     }
     content_processing::ensure_legacy_writer(&state.pool).await?;
     let tracking_task = jobs::start_inline_task(
@@ -23975,8 +24063,36 @@ pub async fn translate_release_detail_batch(
                 "api.translate_release_detail_batch",
             )
             .await?;
-            let (_, response) =
+            let (status, response) =
                 content_processing::submit_item(state.as_ref(), &user_id, "async", &input).await?;
+            if status == StatusCode::CONFLICT {
+                let message = response
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.get("message").and_then(Value::as_str))
+                    .unwrap_or("content processing request conflicts with current work")
+                    .to_owned();
+                let code = if response
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.get("code").and_then(Value::as_str))
+                    == Some("content_processing_superseded")
+                {
+                    "content_processing_superseded"
+                } else {
+                    "content_processing_active"
+                };
+                let mut details = response.error.unwrap_or_else(|| json!({}));
+                if let Some(object) = details.as_object_mut() {
+                    object.insert("request_id".to_owned(), json!(response.request_id));
+                    object.insert("work_item_id".to_owned(), json!(response.work_item_id));
+                    object.insert("status".to_owned(), json!(response.status));
+                    object.insert("poll_url".to_owned(), json!(response.poll_url));
+                }
+                return Err(
+                    ApiError::new(StatusCode::CONFLICT, code, message).with_details(details)
+                );
+            }
             let response_status = response.status.clone();
             let result = response.result;
             items.push(TranslateBatchItem {
@@ -24726,7 +24842,6 @@ async fn translate_notification_candidates_with_ai(
 
 #[derive(Debug, sqlx::FromRow)]
 struct NotificationBatchSourceRow {
-    source_row_id: String,
     thread_id: String,
     repo_full_name: Option<String>,
     subject_title: Option<String>,
@@ -24758,7 +24873,7 @@ async fn translate_notifications_batch_internal(
     let requested_at = chrono::Utc::now().to_rfc3339();
     let mut source_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         r#"
-        SELECT id AS source_row_id, thread_id, repo_full_name, subject_title, reason, subject_type, updated_at
+        SELECT thread_id, repo_full_name, subject_title, reason, subject_type, updated_at
         FROM notifications
         WHERE user_id = "#,
     );
