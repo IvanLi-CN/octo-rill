@@ -19,3 +19,4 @@
 - Source revision ties are resolved consistently across synchronization, API, scheduler and admin reads; legacy release ingest timestamps remain non-authoritative until upstream revision metadata is available.
 - Announcement synchronization now rejects stale or older equal-timestamp payloads, and post-admission mode transitions retain provider attribution while closing the superseded attempt.
 - Legacy active work without a verified source revision is now superseded before provider admission, and retention cleanup commits all audit-table changes atomically.
+- Global batch adapters now retain per-item conflict facts and stream initial progress without changing the existing async/wait/stream wire shapes.

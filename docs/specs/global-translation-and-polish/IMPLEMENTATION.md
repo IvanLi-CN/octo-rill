@@ -181,6 +181,12 @@ work details instead of converting it into a successful item. Global Release
 batch streams retain the existing NDJSON `item`/`done` shape while polling the
 admitted request links to terminal state; single-stream conflicts likewise
 remain stream-shaped rather than switching to a JSON error response.
+Global release and notification batch adapters preserve every per-item
+submission fact when one item conflicts, returning an aggregate conflict after
+all inputs have been associated. Release batch streams emit an initial
+processing item for every request and poll terminal states concurrently so a
+slow item cannot suppress progress for later items. Global release detail
+batches use the same conflict aggregation behavior.
 
 Startup and recovery reconciliation close queued, failed, deferred-provider,
 blocked-config and ready stale work without provider calls; running work with a
