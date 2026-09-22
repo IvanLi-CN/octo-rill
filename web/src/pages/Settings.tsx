@@ -95,6 +95,7 @@ import {
 } from "@/settings/routeState";
 import { GitHubPatGuideCard } from "@/settings/GitHubPatGuideCard";
 import { GitHubPatInput } from "@/settings/GitHubPatInput";
+import { GitHubPatValidationIcon } from "@/settings/GitHubPatValidationIcon";
 import { useReactionTokenEditor } from "@/settings/reactionTokenEditor";
 
 const SECTION_META: Record<
@@ -2128,10 +2129,13 @@ export function SettingsPage(props: {
 										<Button
 											size="sm"
 											disabled={patSaving || !canSavePat}
+											aria-busy={patCheckState === "checking" || patSaving}
 											onClick={onSavePat}
 										>
 											{patSaving ? (
 												<LoaderCircle className="size-4 animate-spin" />
+											) : patCheckState === "checking" ? (
+												<GitHubPatValidationIcon />
 											) : (
 												<KeyRound className="size-4" />
 											)}
