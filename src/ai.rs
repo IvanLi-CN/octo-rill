@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -2895,6 +2896,30 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route(
     max_tokens: u32,
     route_snapshot: Option<&[String]>,
 ) -> Result<ChatCompletionDiagnostic> {
+    chat_completion_with_diagnostics_for_config_and_route_with_admission(
+        state,
+        base_ai,
+        system,
+        user,
+        max_tokens,
+        route_snapshot,
+        None,
+    )
+    .await
+}
+
+pub type ProviderAdmissionGuard =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<bool>> + Send>> + Send + Sync>;
+
+pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admission(
+    state: &AppState,
+    base_ai: &AiConfig,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    route_snapshot: Option<&[String]>,
+    provider_admission: Option<ProviderAdmissionGuard>,
+) -> Result<ChatCompletionDiagnostic> {
     let mut candidates = if let Some(route_snapshot) = route_snapshot {
         state
             .llm_scheduler
@@ -3033,6 +3058,17 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route(
             }
         }
 
+        if let Some(provider_admission) = provider_admission.as_ref()
+            && !provider_admission().await?
+        {
+            in_flight_guard.release_permit();
+            drop(in_flight_guard);
+            heartbeat.stop().await;
+            return Err(anyhow::Error::new(LlmCallFailure {
+                class: LlmFailureClass::Transient,
+                call_id: None,
+            }));
+        }
         let attempt_result = chat_completion_once(state, &ai, system, user, max_tokens).await;
         match attempt_result {
             Ok(output) => {

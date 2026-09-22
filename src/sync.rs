@@ -9052,7 +9052,7 @@ async fn upsert_repo_releases(
                     .as_deref()
                     .or(release.published_at.as_deref())
                     .or(release.created_at.as_deref())
-                    .unwrap_or(now.as_str());
+                    .unwrap_or("");
                 if let Some(existing) = existing.as_ref() {
                     let unchanged = existing.node_id == release.node_id
                         && existing.tag_name == release.tag_name

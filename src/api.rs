@@ -9113,6 +9113,16 @@ async fn fetch_announcement_detail_source_from_db(
                     .and_then(parse_discussion_number_from_github_url)
             })
             .unwrap_or(discussion_number);
+        let title = row
+            .title
+            .unwrap_or_else(|| format!("Discussion #{discussion_number}"));
+        let body = row.body;
+        let source_revision_tiebreak = content_processing::source_revision_content_tiebreak(&[
+            &resolved_repo_full_name,
+            &resolved_discussion_number.to_string(),
+            title.as_str(),
+            body.as_deref().unwrap_or_default(),
+        ]);
         AnnouncementDetailSource {
             repo_full_name: resolved_repo_full_name.clone(),
             discussion_number: resolved_discussion_number,
@@ -9121,18 +9131,13 @@ async fn fetch_announcement_detail_source_from_db(
                 row.open_graph_image_url,
                 row.uses_custom_open_graph_image.unwrap_or(0) != 0,
             ),
-            title: row
-                .title
-                .unwrap_or_else(|| format!("Discussion #{discussion_number}")),
-            body: row.body,
+            title,
+            body,
             html_url: row.html_url.unwrap_or_else(|| {
                 format!("https://github.com/{owner}/{repo}/discussions/{discussion_number}")
             }),
             source_revision: row.occurred_at.clone(),
-            source_revision_tiebreak: Some(announcement_discussion_key(
-                &resolved_repo_full_name,
-                resolved_discussion_number,
-            )),
+            source_revision_tiebreak: Some(source_revision_tiebreak),
             occurred_at: row.occurred_at,
             actor: row.actor_login.map(|login| FeedActor {
                 login,
@@ -9250,6 +9255,12 @@ async fn fetch_live_announcement_detail_request(
     let repo_full_name = repository
         .name_with_owner
         .unwrap_or_else(|| format!("{owner}/{repo}"));
+    let source_revision_tiebreak = content_processing::source_revision_content_tiebreak(&[
+        &repo_full_name,
+        &discussion.number.to_string(),
+        &discussion.title,
+        discussion.body.as_deref().unwrap_or_default(),
+    ]);
     Ok(Some(AnnouncementDetailSource {
         repo_full_name: repo_full_name.clone(),
         discussion_number: discussion.number,
@@ -9265,10 +9276,7 @@ async fn fetch_live_announcement_detail_request(
             .updated_at
             .clone()
             .or(discussion.created_at.clone()),
-        source_revision_tiebreak: Some(announcement_discussion_key(
-            &repo_full_name,
-            discussion.number,
-        )),
+        source_revision_tiebreak: Some(source_revision_tiebreak),
         occurred_at: discussion.updated_at.or(discussion.created_at),
         actor: discussion.author.and_then(|author| {
             let login = author.login?.trim().to_owned();
@@ -20242,7 +20250,6 @@ struct ReleaseBatchSourceRow {
 
 #[derive(Debug, sqlx::FromRow)]
 struct GlobalReleaseSourceRow {
-    source_row_id: String,
     repo_id: i64,
     starred_repo_id: Option<i64>,
     html_url: String,
@@ -20267,7 +20274,7 @@ fn global_source_hash_from_fields(
         },
         translations::TranslationSourceBlock {
             slot: "title".to_owned(),
-            text: title,
+            text: title.clone(),
         },
     ];
     let has_body = body
@@ -20378,7 +20385,7 @@ pub(crate) async fn global_release_request_item(
 ) -> Result<translations::TranslationRequestItemInput, ApiError> {
     let row = sqlx::query_as::<_, GlobalReleaseSourceRow>(
         r#"
-        SELECT r.id AS source_row_id, r.repo_id, sr.repo_id AS starred_repo_id, r.html_url, r.tag_name, r.name, r.body, r.updated_at
+        SELECT r.repo_id, sr.repo_id AS starred_repo_id, r.html_url, r.tag_name, r.name, r.body, r.updated_at
         FROM repo_releases r
         LEFT JOIN user_release_visible_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
@@ -20421,7 +20428,7 @@ pub(crate) async fn global_release_request_item(
         },
         translations::TranslationSourceBlock {
             slot: "title".to_owned(),
-            text: title,
+            text: title.clone(),
         },
     ];
     if has_body {
@@ -20444,6 +20451,12 @@ pub(crate) async fn global_release_request_item(
     } else {
         "summary"
     };
+    let source_revision_tiebreak = content_processing::source_revision_content_tiebreak(&[
+        repo_full_name.as_str(),
+        row.tag_name.as_str(),
+        title.as_str(),
+        body.as_str(),
+    ]);
     Ok(translations::TranslationRequestItemInput {
         producer_ref: producer_ref.to_owned(),
         kind: kind.to_owned(),
@@ -20454,7 +20467,7 @@ pub(crate) async fn global_release_request_item(
         source_blocks: with_source_revision(
             source_blocks,
             Some(row.updated_at.as_str()),
-            Some(row.source_row_id.as_str()),
+            Some(source_revision_tiebreak.as_str()),
         ),
         target_slots,
     })
@@ -25209,9 +25222,6 @@ pub async fn translate_notification(
         )
         .await?;
         if matches!(mode, ReturnMode::Sse) {
-            if status == StatusCode::CONFLICT {
-                return Ok((status, Json(response)).into_response());
-            }
             return Ok(
                 translations::stream_global_translation_request_response_for_api(
                     state,
