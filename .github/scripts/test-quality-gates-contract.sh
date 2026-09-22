@@ -23,6 +23,31 @@ python3 "$repo_root/.github/scripts/check_quality_gates_contract.py" \
   --metadata-script "$repo_root/.github/scripts/metadata_gate.py" \
   --profile final
 
+if grep -R -n -E '^[[:space:]]*runs-on:[[:space:]]+ubuntu-latest[[:space:]]*$' "$repo_root/.github/workflows"; then
+  echo "workflow runner baseline must not use ubuntu-latest" >&2
+  exit 1
+fi
+
+for obsolete_action in \
+  'actions/checkout@v4' \
+  'actions/cache@v4' \
+  'actions/upload-artifact@v4' \
+  'actions/download-artifact@v4' \
+  'actions/github-script@v7' \
+  'actions/configure-pages@v5' \
+  'actions/upload-pages-artifact@v3' \
+  'actions/deploy-pages@v4' \
+  'docker/setup-buildx-action@v3' \
+  'docker/build-push-action@v6' \
+  'docker/setup-qemu-action@v3' \
+  'docker/login-action@v3' \
+  'softprops/action-gh-release@v2'; do
+  if grep -R -n -F "$obsolete_action" "$repo_root/.github/workflows"; then
+    echo "workflow action baseline still uses obsolete $obsolete_action" >&2
+    exit 1
+  fi
+done
+
 if python3 "$repo_root/.github/scripts/check_quality_gates_contract.py" \
   --repo-root "$repo_root" \
   --declaration "$repo_root/.github/quality-gates.json" \

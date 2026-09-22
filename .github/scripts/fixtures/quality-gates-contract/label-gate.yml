@@ -37,6 +37,7 @@ jobs:
           fetch-depth: 1
           path: candidate
           persist-credentials: false
+          allow-unsafe-pr-checkout: true
 
       - name: Validate trusted label-gate contract
         run: |
