@@ -153,7 +153,10 @@ reduce them by the authoritative revision tuple rather than SQLite row order.
 Repeated admission of an already superseded source follows the same current
 work redirect. Stream responses keep `blocked_config` pending, and the global
 notification batch adapter propagates a superseded conflict with its current
-work details instead of converting it into a successful item.
+work details instead of converting it into a successful item. Global Release
+batch streams retain the existing NDJSON `item`/`done` shape while polling the
+admitted request links to terminal state; single-stream conflicts likewise
+remain stream-shaped rather than switching to a JSON error response.
 
 Startup and recovery reconciliation close queued, failed, deferred-provider,
 blocked-config and ready stale work without provider calls; running work with a
