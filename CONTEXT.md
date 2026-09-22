@@ -245,3 +245,15 @@ _Avoid_: 发布前本地测试, 标签即验证
 **重型验证**:
 需要浏览器、Docker、跨平台 runner 或受控性能环境的验证，例如完整 Playwright、发布镜像 smoke、worktree bootstrap 和性能验收；它不属于普通提交或本机 pre-push 的隐式职责。
 _Avoid_: 本地提交检查, 快速检查
+
+**Rust 源码质量契约**:
+Rust 源码在格式、语义 lint、源码结构和 host/features 覆盖四个层面上的可重复质量边界。它描述源码是否可维护和可审阅，不等同于服务业务测试或发布成功。
+_Avoid_: cargo check 通过, 单个 Clippy 命令, 发布门禁
+
+**服务运行时契约**:
+长期运行的 Rust service 对监听地址、认证与会话、SQLite 持久化、HTTP/SSE 端点、静态资产、后台 worker、健康探针和关闭行为承担的稳定边界。
+_Avoid_: 后端 API 列表, 前端运行时, Docker build 成功
+
+**遗留 suppression 基线**:
+当前源码中已存在、经过明确记录并允许暂时保留的 lint 豁免集合。它不是新增豁免的默认授权；新增或扩大豁免必须以窄范围和可审查理由更新基线。
+_Avoid_: 全局关闭 lint, zero-debt 已完成, 静默 allow
