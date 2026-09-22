@@ -1,0 +1,22 @@
+# Existing item-level suppressions are tracked as a ratcheted baseline. New
+# suppressions require a narrow scope, a reviewable reason, and a baseline
+# update in the same change.
+
+[legacy_suppressions]
+"src/admin_ai_records.rs|allow|clippy::too_many_arguments" = 3
+"src/admin_runtime.rs|allow|clippy::await_holding_lock" = 4
+"src/ai.rs|allow|clippy::too_many_arguments" = 2
+"src/ai.rs|allow|dead_code" = 20
+"src/api.rs|allow|clippy::too_many_arguments" = 4
+"src/api.rs|allow|dead_code" = 25
+"src/auth.rs|allow|clippy::too_many_arguments" = 1
+"src/briefs.rs|allow|clippy::too_many_arguments" = 1
+"src/briefs.rs|allow|dead_code" = 1
+"src/content_processing.rs|allow|clippy::too_many_arguments" = 1
+"src/content_processing.rs|allow|dead_code" = 2
+"src/jobs.rs|allow|dead_code" = 2
+"src/sync.rs|allow|clippy::too_many_arguments" = 1
+"src/sync.rs|allow|dead_code" = 14
+"src/translations.rs|allow|clippy::too_many_arguments" = 1
+"src/translations.rs|allow|dead_code" = 5
+"src/webhook_push.rs|allow|clippy::too_many_arguments" = 3

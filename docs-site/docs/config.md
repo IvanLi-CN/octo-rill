@@ -12,6 +12,7 @@ description: OctoRill 运行时、AI 与文档预览相关配置项。
 ## 核心运行时
 
 - `OCTORILL_BIND_ADDR`：后端监听地址。默认 `127.0.0.1:58090`。
+- Docker image 默认将它覆盖为 `0.0.0.0:3000` 并暴露 container port `3000`；本地开发不要为了模拟 Docker 而改变 loopback 默认值。
 - `OCTORILL_PUBLIC_BASE_URL`：前端、OAuth 与 Passkey RP origin 共用的基础 URL。默认根据 `OCTORILL_BIND_ADDR` 推导；本地默认是 `http://127.0.0.1:58090`，模板里通常改成实际浏览器打开的前端地址（例如 `http://127.0.0.1:55174`）以便本地联调。Passkey 要求这里与浏览器实际访问的 origin 一致；生产环境必须是 HTTPS，本地可使用 `localhost` 或 `127.0.0.1` 这类 loopback origin。
 - Session cookie 名不再提供运行时配置入口：根路径公网部署固定为 `octo_rill_sid`；本地多实例、非默认端口或非根路径部署会自动派生隔离后缀，避免不同实例互相覆盖登录态。
 - `DATABASE_URL`：数据库连接串。默认 `sqlite:./.data/octo-rill.db`。
@@ -23,6 +24,8 @@ description: OctoRill 运行时、AI 与文档预览相关配置项。
 - `OCTORILL_TASK_WORKERS`：后台任务 worker 数量。默认 `4`，必须是正整数。
 - `OCTORILL_ENCRYPTION_KEY_BASE64`：32 字节 base64 密钥。**必填**；用于本地敏感信息加密。
 - `APP_DEFAULT_TIME_ZONE`：默认时区。未设置时会优先尝试系统时区，再回退到内置日报时区；必须是整点偏移的 IANA time zone。
+
+服务提供 `/api/health` 和 `/api/version` 作为运行探针。健康检查返回 effective version；部署验证应同时确认数据库持久卷、静态前端和这两个端点，而不是只确认 Docker image build 成功。
 
 ## GitHub OAuth
 

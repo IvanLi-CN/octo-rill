@@ -109,6 +109,7 @@ bun run dev
 ## 常用命令
 
 ```bash
+bash scripts/check-rust-source-quality.sh
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo check --locked --all-targets --all-features
@@ -117,7 +118,7 @@ cargo check --locked --all-targets --all-features
 (cd docs-site && bun run build)
 ```
 
-这些命令属于显式本地验证。普通 `git commit` 有意只保留快速格式化、适用的前端 lint 和提交消息检查，不运行 Rust 全量测试或 Clippy。完整后端测试命令为：
+这些命令属于显式本地验证。`scripts/check-rust-source-quality.sh` 是 Rust 源码质量的标准入口，同时检查应用和 AST source checker。普通 `git commit` 有意只保留快速格式化、适用的前端 lint 和提交消息检查，不运行 Rust 全量测试或 Clippy。完整后端测试命令为：
 
 ```bash
 cargo test --locked --all-features

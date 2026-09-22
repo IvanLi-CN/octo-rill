@@ -19,6 +19,7 @@
         "strict": true,
         "integrations": {
           "Release intent label gate": 15368,
+          "Rust Source Quality": 15368,
           "Lint & Checks": 15368,
           "Backend Tests": 15368,
           "Frontend E2E": 15368,
@@ -50,6 +51,7 @@
   },
   "required_checks": [
     "Release intent label gate",
+    "Rust Source Quality",
     "Lint & Checks",
     "Backend Tests",
     "Frontend E2E",
@@ -76,6 +78,12 @@
         "Worktree Bootstrap Smoke (ubuntu-latest)",
         "Worktree Bootstrap Smoke (macos-latest)",
         "Build (Release)"
+      ]
+    },
+    {
+      "workflow": "Rust Source Quality",
+      "jobs": [
+        "Rust Source Quality"
       ]
     },
     {
