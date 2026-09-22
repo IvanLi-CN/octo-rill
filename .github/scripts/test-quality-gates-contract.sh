@@ -177,8 +177,8 @@ workflow_cases = (
     (
         "build-needs",
         lambda text: text.replace(
-            "    runs-on: ubuntu-latest\n    if: github.event_name ==",
-            "    runs-on: ubuntu-latest\n    needs: []\n    if: github.event_name ==",
+            "    runs-on: ubuntu-24.04\n    if: github.event_name ==",
+            "    runs-on: ubuntu-24.04\n    needs: []\n    if: github.event_name ==",
             1,
         ),
         "ci.yml.jobs.build must not wait on unrelated jobs",

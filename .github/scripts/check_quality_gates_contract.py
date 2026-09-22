@@ -390,7 +390,7 @@ def command_option_map(command: list[str], where: str) -> dict[str, str]:
 
 
 def checkout_step(job: dict[str, Any], step_name: str, where: str) -> dict[str, Any]:
-    step = uses_step_config(job, step_name, "actions/checkout@v4", where)
+    step = uses_step_config(job, step_name, "actions/checkout@v7", where)
     return require_mapping(step.get("with"), f"{where}.steps[{step_name!r}].with")
 
 
@@ -655,7 +655,7 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
     docker_step = uses_step_config(
         build_job,
         "Build Docker smoke image (linux/amd64)",
-        "docker/build-push-action@v6",
+        "docker/build-push-action@v7",
         "ci.yml.jobs.build",
     )
     docker_with = require_mapping(
@@ -708,7 +708,7 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
     tooling_checkout = uses_step_config(
         frontend_job,
         "Checkout acceptance E2E tooling",
-        "actions/checkout@v4",
+        "actions/checkout@v7",
         "ci.yml.jobs.frontend-e2e",
     )
     require(
@@ -743,7 +743,7 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
     artifact_step = uses_step_config(
         frontend_job,
         "Upload Playwright results",
-        "actions/upload-artifact@v4",
+        "actions/upload-artifact@v7",
         "ci.yml.jobs.frontend-e2e",
     )
     require(artifact_step.get("if") == "${{ always() }}", "ci.yml: Playwright artifact upload must run with always()")
@@ -775,7 +775,7 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
     lint_job = named_job_config(workflow, "lint", expected_jobs, "ci.yml")
     require_no_if(lint_job, "ci.yml.jobs.lint")
     require_fail_closed(lint_job, "ci.yml.jobs.lint")
-    checkout = uses_step_config(lint_job, "Checkout", "actions/checkout@v4", "ci.yml.jobs.lint")
+    checkout = uses_step_config(lint_job, "Checkout", "actions/checkout@v7", "ci.yml.jobs.lint")
     checkout_with = require_mapping(checkout.get("with"), "ci.yml.jobs.lint.steps['Checkout'].with")
     require(checkout_with.get("fetch-depth") == 0, "ci.yml.jobs.lint Checkout must fetch full history for trusted source resolution")
     check_scripts = step_config(lint_job, "Check quality-gates scripts", "ci.yml.jobs.lint")
@@ -1178,7 +1178,7 @@ def validate_bootstrap_label_gate(path: Path, contract: ContractModel) -> None:
     require(job.get("name") == contract.label_check_name, "label-gate.yml: required label check name drifted")
     require_no_if(job, "label-gate.yml.jobs.label-gate")
     require_fail_closed(job, "label-gate.yml.jobs.label-gate")
-    step = uses_step_config(job, "Validate release intent labels", "actions/github-script@v7", "label-gate.yml.jobs.label-gate")
+    step = uses_step_config(job, "Validate release intent labels", "actions/github-script@v9", "label-gate.yml.jobs.label-gate")
     require("script" in step.get("with", {}), "label-gate.yml: github-script step must keep the inline script")
 
 
@@ -1213,7 +1213,7 @@ def validate_bootstrap_review_policy(path: Path, contract: ContractModel) -> Non
     job = named_job_config(workflow, "review-policy", expected_jobs, "review-policy.yml")
     require_no_if(job, "review-policy.yml.jobs.review-policy")
     require_fail_closed(job, "review-policy.yml.jobs.review-policy")
-    step = uses_step_config(job, "Evaluate review policy", "actions/github-script@v7", "review-policy.yml.jobs.review-policy")
+    step = uses_step_config(job, "Evaluate review policy", "actions/github-script@v9", "review-policy.yml.jobs.review-policy")
     step_with = require_mapping(step.get("with"), "review-policy.yml.jobs.review-policy.steps['Evaluate review policy'].with")
     script = step_with.get("script")
     require(isinstance(script, str) and script, "review-policy.yml: github-script body must stay non-empty")

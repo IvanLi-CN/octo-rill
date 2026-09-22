@@ -20,3 +20,9 @@
 - [x] M1: 增加 repo-local hook 安装入口与 `post-checkout` wiring。
 - [x] M2: 落地 worktree 同步脚本与资源清单。
 - [x] M3: 增加 smoke test 与 CI matrix 校验，并同步文档与规格状态。
+
+## CI 基线
+
+- CI workflow and offline contract fixtures pin hosted Ubuntu jobs to `ubuntu-24.04`.
+- The Ubuntu smoke matrix exposes `ubuntu-24.04` at runtime while retaining the historical `Worktree Bootstrap Smoke (ubuntu-latest)` status context required by the existing ruleset.
+- GitHub Actions dependencies use the current Node.js 24-compatible major releases; Bun setup remains on `oven-sh/setup-bun@v2`, whose current release uses Node.js 24.

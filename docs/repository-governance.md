@@ -54,6 +54,8 @@ The repository separates low-latency commit feedback from complete delivery evid
 
 The complete CI gate currently consists of `Release intent label gate`, `Rust Source Quality`, `Lint & Checks`, `Backend Tests`, `Frontend E2E`, both `Worktree Bootstrap Smoke` checks, `Build (Release)`, and `Review Policy Gate`. Docker smoke, browser E2E, cross-platform bootstrap, and controlled performance acceptance are heavy validations owned by CI or `$shared-testbox`; none is an implicit ordinary-commit or local pre-push responsibility.
 
+Hosted Ubuntu jobs use the explicit `ubuntu-24.04` label. The Ubuntu worktree smoke job keeps the historical `Worktree Bootstrap Smoke (ubuntu-latest)` status context so the existing required-check ruleset remains unchanged while the runner image is pinned ahead of the Ubuntu 26.04 `ubuntu-latest` migration.
+
 There is no path-based exemption for workflow, hook, governance, or documentation changes. They affect repository delivery behavior and therefore use the same PR gate. Any change to CI job ownership or required-check names must update `.github/quality-gates.json`, its contract fixtures, and the live GitHub ruleset together.
 
 ## Failure handling
