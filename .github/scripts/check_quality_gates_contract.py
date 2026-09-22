@@ -317,12 +317,18 @@ def validate_runner_baseline(path: Path) -> None:
             continue
         require(isinstance(runs_on, str) and runs_on, f"{path.name}.jobs.{job_id}.runs-on must be a non-empty string")
 
-        if runs_on == "${{ matrix.os }}":
+        matrix_match = re.fullmatch(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}", runs_on)
+        if matrix_match:
+            matrix_key = matrix_match.group(1)
             combinations = static_matrix_axes(job, f"{path.name}.jobs.{job_id}")
             require(combinations is not None, f"{path.name}.jobs.{job_id}.matrix runner values must be statically declared")
-            runner_labels = [str(item.get("os", "")) for item in combinations or []]
-            require(all(runner_labels), f"{path.name}.jobs.{job_id}.matrix runner values must declare os")
+            runner_labels = [str(item.get(matrix_key, "")) for item in combinations or []]
+            require(
+                all(runner_labels),
+                f"{path.name}.jobs.{job_id}.matrix runner values must declare {matrix_key}",
+            )
         else:
+            require("${{" not in runs_on, f"{path.name}.jobs.{job_id}.runs-on contains an unsupported expression")
             runner_labels = [runs_on]
 
         for runner_label in runner_labels:
