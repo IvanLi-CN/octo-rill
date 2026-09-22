@@ -29,6 +29,9 @@ CREATE INDEX idx_content_work_admission_events_work_item
 CREATE INDEX idx_content_work_admission_events_retention
   ON content_work_admission_events(created_at ASC, id ASC);
 
+CREATE UNIQUE INDEX idx_content_attempt_events_identity
+  ON content_attempt_events(id, work_item_id, attempt_no);
+
 CREATE TABLE content_attempt_provider_admissions (
   id TEXT PRIMARY KEY,
   attempt_event_id TEXT NOT NULL,
@@ -40,7 +43,9 @@ CREATE TABLE content_attempt_provider_admissions (
   source_revision_json TEXT NOT NULL DEFAULT '{}',
   admitted_at TEXT NOT NULL,
   UNIQUE (attempt_event_id, call_ordinal),
-  FOREIGN KEY (attempt_event_id) REFERENCES content_attempt_events(id) ON DELETE CASCADE,
+  FOREIGN KEY (attempt_event_id, work_item_id, attempt_no)
+    REFERENCES content_attempt_events(id, work_item_id, attempt_no)
+    ON DELETE CASCADE,
   FOREIGN KEY (work_item_id) REFERENCES content_work_items(id) ON DELETE CASCADE
 );
 

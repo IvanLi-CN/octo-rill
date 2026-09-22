@@ -2323,6 +2323,8 @@ fn source_version_is_newer(candidate_snapshot: &str, current_snapshot: &str) -> 
         (Some(_), Some(_)) => source_revision_tiebreak(candidate_snapshot)
             .cmp(&source_revision_tiebreak(current_snapshot))
             .is_gt(),
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
         _ => false,
     }
 }
@@ -6325,6 +6327,9 @@ mod tests {
         assert!(source_version_is_newer(&newer, &older,));
         assert!(!source_version_is_newer(&older, &newer,));
         assert!(!source_version_is_newer(&newer, &newer,));
+        let legacy = json!({"source_blocks": [{"slot": "title", "text": "legacy"}]}).to_string();
+        assert!(source_version_is_newer(&newer, &legacy));
+        assert!(!source_version_is_newer(&legacy, &newer));
     }
 
     #[test]
