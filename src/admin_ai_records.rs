@@ -1376,7 +1376,7 @@ fn source_records_sql(
                     WHERE latest.kind = 'announcement'
                       AND lower(latest.repo_full_name) = lower(e.repo_full_name)
                       AND latest.discussion_number = e.discussion_number
-                    ORDER BY latest.occurred_at DESC, COALESCE(latest.title, '') DESC, COALESCE(latest.body, '') DESC, latest.rowid DESC
+                    ORDER BY latest.occurred_at DESC, COALESCE(latest.title, '') DESC, latest.rowid DESC
                     LIMIT 1
                   )
             )"
@@ -1462,7 +1462,7 @@ fn activity_source_ctes(kind: CollectionRecordKind) -> String {
                     WHERE latest.kind = 'announcement'
                       AND lower(latest.repo_full_name) = lower(e.repo_full_name)
                       AND latest.discussion_number = e.discussion_number
-                    ORDER BY latest.occurred_at DESC, COALESCE(latest.title, '') DESC, COALESCE(latest.body, '') DESC, latest.rowid DESC
+                    ORDER BY latest.occurred_at DESC, COALESCE(latest.title, '') DESC, latest.rowid DESC
                     LIMIT 1
                 )
             ),
@@ -2614,7 +2614,7 @@ async fn load_source_record(
             "SELECT CAST(r.release_id AS TEXT) AS id, COALESCE((SELECT wi.repo_full_name FROM repo_release_work_items wi WHERE wi.repo_id = r.repo_id LIMIT 1), '仓库 #' || CAST(r.repo_id AS TEXT)) AS repository, COALESCE(NULLIF(r.name, ''), r.tag_name) AS title, COALESCE(r.published_at, r.created_at, r.updated_at) AS occurred_at, r.detected_at, NULL AS generated_at FROM repo_releases r WHERE r.release_id = ? LIMIT 1"
         }
         CollectionRecordKind::Announcement => {
-            "WITH ranked_announcements AS (SELECT e.*, ROW_NUMBER() OVER (PARTITION BY lower(e.repo_full_name), e.discussion_number ORDER BY e.occurred_at DESC, COALESCE(e.title, '') DESC, COALESCE(e.body, '') DESC, e.rowid DESC) AS source_rank FROM social_activity_events e WHERE e.kind = 'announcement' AND lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) = ?) SELECT lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id, e.repo_full_name AS repository, COALESCE(NULLIF(e.title, ''), '公告') AS title, e.occurred_at, e.detected_at, NULL AS generated_at FROM ranked_announcements e WHERE e.source_rank = 1 LIMIT 1"
+            "WITH ranked_announcements AS (SELECT e.*, ROW_NUMBER() OVER (PARTITION BY lower(e.repo_full_name), e.discussion_number ORDER BY e.occurred_at DESC, COALESCE(e.title, '') DESC, e.rowid DESC) AS source_rank FROM social_activity_events e WHERE e.kind = 'announcement' AND lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) = ?) SELECT lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id, e.repo_full_name AS repository, COALESCE(NULLIF(e.title, ''), '公告') AS title, e.occurred_at, e.detected_at, NULL AS generated_at FROM ranked_announcements e WHERE e.source_rank = 1 LIMIT 1"
         }
         CollectionRecordKind::Notification => {
             "WITH ranked_notifications AS (SELECT n.*, ROW_NUMBER() OVER (PARTITION BY n.thread_id ORDER BY n.updated_at DESC, COALESCE(n.repo_full_name, '') DESC, COALESCE(n.subject_title, '') DESC, COALESCE(n.reason, '') DESC, COALESCE(n.subject_type, '') DESC, n.thread_id DESC) AS source_rank FROM notifications n WHERE n.thread_id = ?) SELECT n.thread_id AS id, n.repo_full_name AS repository, COALESCE(NULLIF(n.subject_title, ''), '通知') AS title, n.updated_at AS occurred_at, NULL AS detected_at, NULL AS generated_at FROM ranked_notifications n WHERE n.source_rank = 1 LIMIT 1"
