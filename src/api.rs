@@ -8960,11 +8960,13 @@ struct AnnouncementDetailSource {
     html_url: String,
     occurred_at: Option<String>,
     source_revision: Option<String>,
+    source_revision_tiebreak: Option<String>,
     actor: Option<FeedActor>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
 struct AnnouncementDetailDbRow {
+    source_row_id: String,
     repo_full_name: Option<String>,
     owner_avatar_url: Option<String>,
     open_graph_image_url: Option<String>,
@@ -9018,6 +9020,7 @@ struct GraphQlAnnouncementRepositoryOwner {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphQlAnnouncementNode {
+    id: Option<String>,
     number: i64,
     title: String,
     body: Option<String>,
@@ -9074,6 +9077,7 @@ async fn fetch_announcement_detail_source_from_db(
     let row = sqlx::query_as::<_, AnnouncementDetailDbRow>(
         r#"
         SELECT
+          e.id AS source_row_id,
           e.repo_full_name,
           e.repo_owner_avatar_url AS owner_avatar_url,
           e.repo_open_graph_image_url AS open_graph_image_url,
@@ -9125,6 +9129,7 @@ async fn fetch_announcement_detail_source_from_db(
             format!("https://github.com/{owner}/{repo}/discussions/{discussion_number}")
         }),
         source_revision: row.occurred_at.clone(),
+        source_revision_tiebreak: Some(row.source_row_id),
         occurred_at: row.occurred_at,
         actor: row.actor_login.map(|login| FeedActor {
             login,
@@ -9151,6 +9156,7 @@ async fn fetch_live_announcement_detail_request(
               avatarUrl
             }}
             discussion(number: {discussion_number}) {{
+              id
               number
               title
               body
@@ -9255,6 +9261,7 @@ async fn fetch_live_announcement_detail_request(
             .updated_at
             .clone()
             .or(discussion.created_at.clone()),
+        source_revision_tiebreak: discussion.id,
         occurred_at: discussion.updated_at.or(discussion.created_at),
         actor: discussion.author.and_then(|author| {
             let login = author.login?.trim().to_owned();
@@ -20113,6 +20120,7 @@ struct ReleaseBatchSourceRow {
 
 #[derive(Debug, sqlx::FromRow)]
 struct GlobalReleaseSourceRow {
+    source_row_id: String,
     repo_id: i64,
     starred_repo_id: Option<i64>,
     html_url: String,
@@ -20246,7 +20254,7 @@ pub(crate) async fn global_release_request_item(
 ) -> Result<translations::TranslationRequestItemInput, ApiError> {
     let row = sqlx::query_as::<_, GlobalReleaseSourceRow>(
         r#"
-        SELECT r.repo_id, sr.repo_id AS starred_repo_id, r.html_url, r.tag_name, r.name, r.body, r.updated_at
+        SELECT r.id AS source_row_id, r.repo_id, sr.repo_id AS starred_repo_id, r.html_url, r.tag_name, r.name, r.body, r.updated_at
         FROM repo_releases r
         LEFT JOIN user_release_visible_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
@@ -20322,7 +20330,7 @@ pub(crate) async fn global_release_request_item(
         source_blocks: with_source_revision(
             source_blocks,
             Some(row.updated_at.as_str()),
-            Some(release_id.to_string().as_str()),
+            Some(row.source_row_id.as_str()),
         ),
         target_slots,
     })
@@ -20370,7 +20378,7 @@ async fn global_notification_request_item(
         ));
     }
     let row = sqlx::query_as::<_, NotificationBatchSourceRow>(
-        "SELECT thread_id, repo_full_name, subject_title, reason, subject_type, updated_at FROM notifications WHERE thread_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
+        "SELECT id AS source_row_id, thread_id, repo_full_name, subject_title, reason, subject_type, updated_at FROM notifications WHERE thread_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
     )
     .bind(thread_id)
     .fetch_optional(&state.pool)
@@ -20382,7 +20390,6 @@ async fn global_notification_request_item(
         .unwrap_or_else(|| "(unknown repo)".to_owned());
     let title = row.subject_title.unwrap_or_else(|| "(no title)".to_owned());
     let subject_type = row.subject_type.unwrap_or_default();
-    let source_revision_tiebreak = row.thread_id.clone();
     Ok(translations::TranslationRequestItemInput {
         producer_ref: "api.translate_notification".to_owned(),
         kind: "notification".to_owned(),
@@ -20393,7 +20400,7 @@ async fn global_notification_request_item(
         source_blocks: with_source_revision(
             global_notification_source_blocks(&repo, &title, &subject_type),
             row.updated_at.as_deref(),
-            Some(source_revision_tiebreak.as_str()),
+            Some(row.source_row_id.as_str()),
         ),
         target_slots: vec!["title_zh".to_owned(), "summary_md".to_owned()],
     })
@@ -20500,6 +20507,7 @@ async fn global_announcement_request_item(
     let source =
         resolve_announcement_detail_source_for_user(state, user_id, discussion_key).await?;
     let source_revision = source.source_revision.clone();
+    let source_revision_tiebreak = source.source_revision_tiebreak.clone();
     let body = source.body.unwrap_or_default().replace("\r\n", "\n");
     let has_body = !body.trim().is_empty();
     let mut source_blocks = vec![
@@ -20541,7 +20549,7 @@ async fn global_announcement_request_item(
         source_blocks: with_source_revision(
             source_blocks,
             source_revision.as_deref(),
-            Some(discussion_key),
+            source_revision_tiebreak.as_deref(),
         ),
         target_slots: if kind.ends_with("_smart") {
             vec!["title_zh".to_owned(), "summary_md".to_owned()]
@@ -24653,6 +24661,7 @@ async fn translate_notification_candidates_with_ai(
 
 #[derive(Debug, sqlx::FromRow)]
 struct NotificationBatchSourceRow {
+    source_row_id: String,
     thread_id: String,
     repo_full_name: Option<String>,
     subject_title: Option<String>,
@@ -24684,7 +24693,7 @@ async fn translate_notifications_batch_internal(
     let requested_at = chrono::Utc::now().to_rfc3339();
     let mut source_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         r#"
-        SELECT thread_id, repo_full_name, subject_title, reason, subject_type
+        SELECT id AS source_row_id, thread_id, repo_full_name, subject_title, reason, subject_type, updated_at
         FROM notifications
         WHERE user_id = "#,
     );
@@ -24926,8 +24935,38 @@ pub async fn translate_notifications_batch(
         for thread_id in thread_ids {
             let input =
                 global_notification_request_item(state.as_ref(), &user_id, &thread_id).await?;
-            let (_, response) =
+            let (item_status, response) =
                 content_processing::submit_item(state.as_ref(), &user_id, "async", &input).await?;
+            if item_status == StatusCode::CONFLICT {
+                let message = response
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.get("message").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        "content processing request conflicts with current work".to_owned()
+                    });
+                let code = if response
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.get("code").and_then(Value::as_str))
+                    == Some("content_processing_superseded")
+                {
+                    "content_processing_superseded"
+                } else {
+                    "content_processing_active"
+                };
+                let details = response.error.unwrap_or_else(|| {
+                    json!({
+                        "work_item_id": response.work_item_id,
+                        "status": response.status,
+                        "poll_url": response.poll_url,
+                    })
+                });
+                return Err(
+                    ApiError::new(StatusCode::CONFLICT, code, message).with_details(details)
+                );
+            }
             let response_status = response.status.clone();
             let result = response.result;
             items.push(TranslateBatchItem {

@@ -961,9 +961,21 @@ async fn newer_work_for_source_in_transaction(
     .bind(resource.protocol_version)
     .fetch_all(&mut **tx)
     .await?;
-    Ok(candidates.into_iter().find(|candidate| {
-        source_version_is_newer(&candidate.source_snapshot_json, source.snapshot_json)
-    }))
+    Ok(candidates
+        .into_iter()
+        .filter(|candidate| {
+            source_version_is_newer(&candidate.source_snapshot_json, source.snapshot_json)
+        })
+        .reduce(|current, candidate| {
+            if source_version_is_newer(
+                &candidate.source_snapshot_json,
+                &current.source_snapshot_json,
+            ) {
+                candidate
+            } else {
+                current
+            }
+        }))
 }
 
 pub async fn submit_item(
@@ -1218,6 +1230,17 @@ pub async fn submit_item(
             .await
             .map_err(ApiError::internal)?
     };
+    let superseded_replacement_id = if work.status == "superseded" {
+        match supersedes_work_item_id.clone() {
+            Some(work_item_id) => Some(work_item_id),
+            None => newer_work_for_resource_in_transaction(&mut tx, &work)
+                .await
+                .map_err(ApiError::internal)?
+                .map(|current| current.id),
+        }
+    } else {
+        None
+    };
 
     let admission_event = if work.status == "superseded" {
         "admission_rejected_superseded"
@@ -1231,9 +1254,7 @@ pub async fn submit_item(
         WorkAdmissionEvent {
             work_item_id: &work.id,
             event_type: admission_event,
-            replaced_by_work_item_id: supersedes_work_item_id
-                .as_deref()
-                .filter(|_| work.status == "superseded"),
+            replaced_by_work_item_id: superseded_replacement_id.as_deref(),
             source_hash: &work.source_hash,
             source_snapshot_json: &work.source_snapshot_json,
             producer_ref: &item.producer_ref,
@@ -1248,9 +1269,7 @@ pub async fn submit_item(
     .await
     .map_err(ApiError::internal)?;
 
-    if work.status == "superseded"
-        && let Some(current_work_item_id) = supersedes_work_item_id.as_deref()
-    {
+    if let Some(current_work_item_id) = superseded_replacement_id.as_deref() {
         let current = load_work_by_id(&mut tx, current_work_item_id)
             .await
             .map_err(ApiError::internal)?;
@@ -2771,17 +2790,17 @@ async fn request_global_completion(
     state: &AppState,
     spec: GlobalCallSpec<'_>,
 ) -> Result<ai::ChatCompletionDiagnostic> {
+    if !renew_global_work_lease(state, spec.work).await? {
+        return Err(anyhow::Error::new(ai::LlmCallFailure {
+            class: ai::LlmFailureClass::Transient,
+            call_id: None,
+        }));
+    }
     if !admit_provider_call(state, spec.work, spec.call_ordinal, spec.role).await? {
         return Err(anyhow::Error::new(GlobalExecutionFailure {
             call_ids: Vec::new(),
             class: ai::LlmFailureClass::Transient,
             message: "content work was superseded before provider admission".to_owned(),
-        }));
-    }
-    if !renew_global_work_lease(state, spec.work).await? {
-        return Err(anyhow::Error::new(ai::LlmCallFailure {
-            class: ai::LlmFailureClass::Transient,
-            call_id: None,
         }));
     }
     let call_context = ai::LlmCallContext {
@@ -3075,9 +3094,15 @@ async fn supersede_replaced_work_in_transaction(
     .fetch_all(&mut **tx)
     .await?;
     let Some((replaced_by_work_item_id, _)) = candidates
-        .iter()
-        .find(|(_, snapshot)| source_version_is_newer(snapshot, &work.source_snapshot_json))
-        .cloned()
+        .into_iter()
+        .filter(|(_, snapshot)| source_version_is_newer(snapshot, &work.source_snapshot_json))
+        .reduce(|current, candidate| {
+            if source_version_is_newer(&candidate.1, &current.1) {
+                candidate
+            } else {
+                current
+            }
+        })
     else {
         return Ok(false);
     };
@@ -5172,6 +5197,16 @@ mod tests {
             .unwrap(),
             1
         );
+
+        let (repeated_status, repeated_response) = submit_item(&state, "user-1", "async", &older)
+            .await
+            .unwrap();
+        assert_eq!(repeated_status, StatusCode::CONFLICT);
+        assert_eq!(repeated_response.work_item_id, newer_response.work_item_id);
+        assert_eq!(
+            repeated_response.error.as_ref().unwrap()["code"],
+            "content_processing_superseded"
+        );
     }
 
     #[tokio::test]
@@ -5266,9 +5301,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(response.work_item_id, "superseded-old");
-        assert_eq!(response.status, "superseded");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(response.work_item_id, "superseded-new");
+        assert_eq!(response.status, "queued");
+        assert_eq!(
+            response.error.as_ref().unwrap()["code"],
+            "content_processing_superseded"
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM content_attempt_events WHERE work_item_id = 'superseded-old' AND event_type = 'attempt_queued'",

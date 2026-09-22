@@ -138,6 +138,13 @@ source replacement after that fact may finish the provider call, but the call
 audit remains linked while the attempt is finalized as `superseded` without
 publishing output or scheduling retry.
 
+When several newer retained work rows exist, admission and provider guards
+reduce them by the authoritative revision tuple rather than SQLite row order.
+Repeated admission of an already superseded source follows the same current
+work redirect. Stream responses keep `blocked_config` pending, and the global
+notification batch adapter propagates a superseded conflict with its current
+work details instead of converting it into a successful item.
+
 Startup and recovery reconciliation close queued, failed, deferred-provider,
 blocked-config and ready stale work without provider calls; running work with a
 live lease is left to the worker guard. Admission events are retained for seven

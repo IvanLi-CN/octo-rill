@@ -2200,7 +2200,8 @@ pub(crate) fn stream_global_translation_request_response_for_api(
                         "queued" => "queued",
                         "running" => "running",
                         "deferred_provider" => "queued",
-                        "failed" | "cancelled" | "superseded" | "blocked_config" => "failed",
+                        "failed" | "cancelled" | "superseded" => "failed",
+                        "blocked_config" => "queued",
                         _ => "completed",
                     };
                     let event_key = format!("{phase}:{status}");
