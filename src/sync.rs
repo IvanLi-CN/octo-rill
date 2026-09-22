@@ -1047,6 +1047,7 @@ struct GitHubRelease {
     html_url: String,
     published_at: Option<String>,
     created_at: Option<String>,
+    updated_at: Option<String>,
     prerelease: bool,
     draft: bool,
     reactions: Option<GitHubReleaseReactions>,
@@ -9101,7 +9102,14 @@ async fn upsert_repo_releases(
                 .bind(release.prerelease as i64)
                 .bind(release.draft as i64)
                 .bind(now.as_str())
-                .bind(now.as_str())
+                .bind(
+                    release
+                        .updated_at
+                        .as_deref()
+                        .or(release.published_at.as_deref())
+                        .or(release.created_at.as_deref())
+                        .unwrap_or(now.as_str()),
+                )
                 .bind(plus1)
                 .bind(laugh)
                 .bind(heart)
@@ -21603,6 +21611,7 @@ mod tests {
             html_url: "https://github.com/octo/app/releases/tag/v1.0.0".to_owned(),
             published_at: Some("2026-03-06T10:00:00Z".to_owned()),
             created_at: Some("2026-03-06T09:00:00Z".to_owned()),
+            updated_at: Some("2026-03-06T10:30:00Z".to_owned()),
             prerelease: false,
             draft: false,
             reactions: None,
