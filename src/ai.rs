@@ -3058,54 +3058,65 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
             }
         }
 
-        if let Some(provider_admission) = provider_admission.as_ref()
-            && !provider_admission(candidate_index).await?
-        {
-            let admission_error = "provider admission rejected before request";
-            let duration_ms = started_at
-                .map(|started| i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
-            if llm_call_persisted {
-                reconcile_admin_override_after_persist(
-                    state,
-                    log_record.id.as_str(),
-                    finalize_llm_call(
+        if let Some(provider_admission) = provider_admission.as_ref() {
+            let admission_failure = match provider_admission(candidate_index).await {
+                Ok(true) => None,
+                Ok(false) => Some((
+                    "provider admission rejected before request".to_owned(),
+                    LlmFailureClass::Transient,
+                )),
+                Err(error) => Some((
+                    error.to_string(),
+                    llm_failure_class(&error).unwrap_or(LlmFailureClass::Transient),
+                )),
+            };
+            if let Some((admission_error, failure_class)) = admission_failure {
+                let duration_ms = started_at.map(|started| {
+                    i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
+                });
+                if llm_call_persisted {
+                    reconcile_admin_override_after_persist(
                         state,
                         log_record.id.as_str(),
-                        FinalizeLlmCallUpdate {
-                            status: "failed",
-                            attempt_count,
-                            scheduler_wait_ms: total_wait_ms,
-                            first_token_wait_ms: None,
-                            duration_ms,
-                            output_messages_json: None,
-                            response_text: None,
-                            error_text: Some(admission_error),
-                            input_tokens: None,
-                            output_tokens: None,
-                            finish_reason: None,
-                            provider_request_id: None,
-                            provider_http_status: None,
-                            cached_input_tokens: None,
-                            total_tokens: None,
-                            failure_class: Some(LlmFailureClass::Transient.as_str()),
-                            final_model: Some(model_for_call.as_str()),
-                            fallback_count,
-                            retry_scheduled_at: None,
-                            recovery_attempt_count: 0,
-                        },
+                        finalize_llm_call(
+                            state,
+                            log_record.id.as_str(),
+                            FinalizeLlmCallUpdate {
+                                status: "failed",
+                                attempt_count,
+                                scheduler_wait_ms: total_wait_ms,
+                                first_token_wait_ms: None,
+                                duration_ms,
+                                output_messages_json: None,
+                                response_text: None,
+                                error_text: Some(admission_error.as_str()),
+                                input_tokens: None,
+                                output_tokens: None,
+                                finish_reason: None,
+                                provider_request_id: None,
+                                provider_http_status: None,
+                                cached_input_tokens: None,
+                                total_tokens: None,
+                                failure_class: Some(failure_class.as_str()),
+                                final_model: Some(model_for_call.as_str()),
+                                fallback_count,
+                                retry_scheduled_at: None,
+                                recovery_attempt_count: 0,
+                            },
+                        )
+                        .await,
+                        "llm call admission rejection finalization failed",
                     )
-                    .await,
-                    "llm call admission rejection finalization failed",
-                )
-                .await;
+                    .await;
+                }
+                in_flight_guard.release_permit();
+                drop(in_flight_guard);
+                heartbeat.stop().await;
+                return Err(anyhow::Error::new(LlmCallFailure {
+                    class: failure_class,
+                    call_id: llm_call_persisted.then(|| log_record.id.clone()),
+                }));
             }
-            in_flight_guard.release_permit();
-            drop(in_flight_guard);
-            heartbeat.stop().await;
-            return Err(anyhow::Error::new(LlmCallFailure {
-                class: LlmFailureClass::Transient,
-                call_id: llm_call_persisted.then(|| log_record.id.clone()),
-            }));
         }
         let attempt_result = chat_completion_once(state, &ai, system, user, max_tokens).await;
         match attempt_result {
@@ -7781,6 +7792,71 @@ mod tests {
                 .to_string()
                 .contains("AppChatReverse: Chat failed, 401")
         );
+    }
+
+    #[tokio::test]
+    async fn provider_admission_error_finalizes_persisted_call_without_provider_request() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let observed_requests = Arc::clone(&request_count);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let observed_requests = Arc::clone(&observed_requests);
+                async move {
+                    observed_requests.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "choices": [{"message": {"content": "unexpected"}}]
+                        })),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let ai = state.config.ai.clone().expect("test ai config");
+        let provider_admission: ProviderAdmissionGuard =
+            Arc::new(|_| Box::pin(async { Err(anyhow!("provider admission database failure")) }));
+
+        let err = chat_completion_with_diagnostics_for_config_and_route_with_admission(
+            state.as_ref(),
+            &ai,
+            "system",
+            "user",
+            128,
+            None,
+            Some(provider_admission),
+        )
+        .await
+        .expect_err("provider admission failure should stop the call");
+
+        assert_eq!(err.to_string(), "LLM upstream temporarily unavailable");
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, error_text, failure_class, runtime_owner_id,
+                   lease_heartbeat_at
+            FROM llm_calls
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&state.pool)
+        .await
+        .expect("load finalized llm call");
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            row.get::<Option<String>, _>("error_text").as_deref(),
+            Some("provider admission database failure")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("failure_class").as_deref(),
+            Some("transient")
+        );
+        assert_eq!(row.get::<Option<String>, _>("runtime_owner_id"), None);
+        assert_eq!(row.get::<Option<String>, _>("lease_heartbeat_at"), None);
     }
 
     #[tokio::test]
