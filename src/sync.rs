@@ -3469,6 +3469,31 @@ async fn insert_social_activity_event_tx(
             0_i64
         }
     });
+    if event.kind == "announcement"
+        && let Some(github_event_id) = event.github_event_id
+    {
+        let updated = sqlx::query(
+            "UPDATE social_activity_events SET title = ?, body = ?, html_url = ?, actor_login = ?, actor_avatar_url = ?, actor_html_url = ?, occurred_at = ?, detected_at = ?, updated_at = ? WHERE user_id = ? AND kind = ? AND github_event_id = ?",
+        )
+        .bind(event.title)
+        .bind(event.body)
+        .bind(event.html_url)
+        .bind(event.actor.login.as_str())
+        .bind(event.actor.avatar_url.as_deref())
+        .bind(event.actor.html_url.as_deref())
+        .bind(event.occurred_at)
+        .bind(event.detected_at)
+        .bind(event.detected_at)
+        .bind(event.user_id)
+        .bind(event.kind)
+        .bind(github_event_id)
+        .execute(&mut **tx)
+        .await
+        .context("update social activity event")?;
+        if updated.rows_affected() > 0 {
+            return Ok(false);
+        }
+    }
     let result = sqlx::query(
         r#"
         INSERT INTO social_activity_events (
@@ -3495,23 +3520,7 @@ async fn insert_social_activity_event_tx(
           updated_at
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT DO UPDATE SET
-          repo_id = excluded.repo_id,
-          repo_full_name = excluded.repo_full_name,
-          discussion_number = excluded.discussion_number,
-          repo_owner_avatar_url = excluded.repo_owner_avatar_url,
-          repo_open_graph_image_url = excluded.repo_open_graph_image_url,
-          repo_uses_custom_open_graph_image = excluded.repo_uses_custom_open_graph_image,
-          title = excluded.title,
-          body = excluded.body,
-          html_url = excluded.html_url,
-          actor_github_user_id = excluded.actor_github_user_id,
-          actor_login = excluded.actor_login,
-          actor_avatar_url = excluded.actor_avatar_url,
-          actor_html_url = excluded.actor_html_url,
-          occurred_at = excluded.occurred_at,
-          detected_at = excluded.detected_at,
-          updated_at = excluded.updated_at
+        ON CONFLICT DO NOTHING
         "#,
     )
     .bind(local_id::generate_local_id())
