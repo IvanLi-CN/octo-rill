@@ -3474,6 +3474,52 @@ async fn insert_social_activity_event_tx(
     if event.kind == "announcement"
         && let Some(github_event_id) = event.github_event_id
     {
+        let existing = sqlx::query_as::<_, (
+            Option<String>,
+            Option<i64>,
+            String,
+            Option<String>,
+            Option<String>,
+        )>(
+            "SELECT repo_full_name, discussion_number, occurred_at, title, body FROM social_activity_events WHERE user_id = ? AND kind = ? AND github_event_id = ? LIMIT 1",
+        )
+        .bind(event.user_id)
+        .bind(event.kind)
+        .bind(github_event_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .context("load existing social activity event")?;
+        if let Some((
+            existing_repo_full_name,
+            existing_discussion_number,
+            existing_occurred_at,
+            existing_title,
+            existing_body,
+        )) = existing
+        {
+            let candidate_tiebreak = content_processing::announcement_source_revision_tiebreak(
+                event.repo_full_name.unwrap_or_default(),
+                event.discussion_number.unwrap_or_default(),
+                event.title.unwrap_or_default(),
+                event.body.unwrap_or_default(),
+            );
+            let current_tiebreak = content_processing::announcement_source_revision_tiebreak(
+                existing_repo_full_name.as_deref().unwrap_or_default(),
+                existing_discussion_number.unwrap_or_default(),
+                existing_title.as_deref().unwrap_or_default(),
+                existing_body.as_deref().unwrap_or_default(),
+            );
+            let is_newer = content_processing::compare_announcement_source_revisions(
+                event.occurred_at,
+                &candidate_tiebreak,
+                &existing_occurred_at,
+                &current_tiebreak,
+            )
+            .is_some_and(|ordering| ordering.is_gt());
+            if !is_newer {
+                return Ok(false);
+            }
+        }
         let updated = sqlx::query(
             "UPDATE social_activity_events SET title = ?, body = ?, html_url = ?, actor_login = ?, actor_avatar_url = ?, actor_html_url = ?, occurred_at = ?, detected_at = ?, updated_at = ? WHERE user_id = ? AND kind = ? AND github_event_id = ?",
         )
@@ -18608,6 +18654,67 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn announcement_event_updates_reject_stale_source_revision() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("announcement-source-order");
+        seed_user(&pool, user_id.as_str()).await;
+        let actor = GitHubActor {
+            id: 601,
+            login: "announcement-author".to_owned(),
+            avatar_url: None,
+            html_url: None,
+        };
+
+        let insert = {
+            let user_id = user_id.clone();
+            let actor = actor.clone();
+            move |pool: SqlitePool, occurred_at: &'static str, title: &'static str| {
+                let user_id = user_id.clone();
+                let actor = actor.clone();
+                async move {
+                    let mut tx = pool.begin().await.expect("begin announcement revision tx");
+                    let inserted = insert_social_activity_event_tx(
+                        &mut tx,
+                        SocialActivityEventInsert {
+                            user_id: user_id.as_str(),
+                            kind: "announcement",
+                            repo_id: Some(42),
+                            repo_full_name: Some("octo/alpha"),
+                            discussion_number: Some(7),
+                            repo_visual: None,
+                            title: Some(title),
+                            body: Some("announcement body"),
+                            html_url: Some("https://github.com/octo/alpha/discussions/7"),
+                            github_event_id: Some("announcement-revision"),
+                            actor: &actor,
+                            occurred_at,
+                            detected_at: "2026-03-06T12:10:00Z",
+                        },
+                    )
+                    .await
+                    .expect("upsert announcement revision");
+                    tx.commit().await.expect("commit announcement revision tx");
+                    inserted
+                }
+            }
+        };
+
+        assert!(insert(pool.clone(), "2026-03-06T12:00:00Z", "Current announcement").await);
+        assert!(!insert(pool.clone(), "2026-03-06T11:00:00Z", "Stale announcement").await);
+        assert!(!insert(pool.clone(), "2026-03-06T12:00:00Z", "A tie-break").await);
+
+        let row: (String, Option<String>) = sqlx::query_as(
+            "SELECT title, body FROM social_activity_events WHERE github_event_id = ?",
+        )
+        .bind("announcement-revision")
+        .fetch_one(&pool)
+        .await
+        .expect("load announcement revision");
+        assert_eq!(row.0, "Current announcement");
+        assert_eq!(row.1.as_deref(), Some("announcement body"));
     }
 
     #[tokio::test]

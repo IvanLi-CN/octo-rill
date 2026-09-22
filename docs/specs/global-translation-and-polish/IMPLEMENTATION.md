@@ -132,12 +132,17 @@ advances `updated_at` monotonically and rejects stale payload fields so an
 older upstream page cannot regress the canonical source row. Release rows
 created by the legacy sync path are recognized by their ingest timestamp and
 upgraded to the first authoritative upstream revision; a revision-bearing
-worker fails closed when the live source has no usable revision.
+worker fails closed when the live source has no usable revision. Malformed
+revision metadata and equal timestamps without an authoritative tie-break are
+also rejected rather than treated as an ordering signal.
 Release and announcement canonical content tuples provide the stable tie-break
 domain when the upstream timestamp is equal, and the same tuple is recomputed
 from the stored canonical source during provider admission. Announcement
 snapshots normalize their `repo#discussion_number` key before both persistence
-and live comparison. Notification synchronization and admin/API canonical reads
+and live comparison. Announcement synchronization rejects stale or older
+equal-timestamp event payloads by the same authoritative timestamp/content
+ordering, and admin/API canonical reads use the same stable event identifier as
+their final tie-break. Notification synchronization and admin/API canonical reads
 use the same timestamp, repository, title, reason and subject-type ordering;
 equal source tuples are idempotent. A release revision is authoritative only
 after upstream synchronization has recorded a `detected_at` distinct from its
@@ -146,7 +151,10 @@ provider admissions retain the `fallback` relation role for audit consumers.
 An admission rejected after its diagnostic row is created finalizes that row as
 a transient failed call rather than leaving a running diagnostic behind. If a
 source disappears after a provider response, the call-to-attempt audit link is
-retained while the work is cancelled without publishing output.
+retained while the work is cancelled without publishing output. If processing
+mode changes after provider admission, the worker records the provider audit,
+closes the attempt as `reconciliation_superseded`, and clears the live work
+lease before returning.
 Legacy snapshots without revision metadata use a fail-closed compatibility
 fallback: a revision-bearing candidate may supersede an unknown legacy source,
 while two unknown revisions are never ordered by synchronization arrival.

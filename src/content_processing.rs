@@ -2357,6 +2357,40 @@ fn source_revision_tiebreak(raw_snapshot: &str) -> Option<String> {
         .map(|block| block.text)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SourceRevisionMetadata {
+    Missing,
+    Valid {
+        observed_at: DateTime<Utc>,
+        tiebreak: Option<String>,
+    },
+    Malformed,
+}
+
+fn source_revision_metadata(raw_snapshot: &str) -> SourceRevisionMetadata {
+    let Ok(snapshot) = serde_json::from_str::<SourceSnapshot>(raw_snapshot) else {
+        return SourceRevisionMetadata::Malformed;
+    };
+    let Some(observed_block) = snapshot
+        .source_blocks
+        .iter()
+        .find(|block| block.slot == "source_observed_at")
+    else {
+        return SourceRevisionMetadata::Missing;
+    };
+    let Some(observed_at) = parse_storage_timestamp(&observed_block.text) else {
+        return SourceRevisionMetadata::Malformed;
+    };
+    SourceRevisionMetadata::Valid {
+        observed_at,
+        tiebreak: snapshot
+            .source_blocks
+            .into_iter()
+            .find(|block| block.slot == "source_revision_tiebreak")
+            .map(|block| block.text),
+    }
+}
+
 fn source_revision_json(item: &translations::TranslationRequestItemInput) -> Value {
     json!({
         "source_observed_at": item
@@ -2399,21 +2433,33 @@ fn compare_source_revision_tiebreak(
 
 fn source_version_is_newer(candidate_snapshot: &str, current_snapshot: &str) -> bool {
     match (
-        source_observed_at(candidate_snapshot),
-        source_observed_at(current_snapshot),
+        source_revision_metadata(candidate_snapshot),
+        source_revision_metadata(current_snapshot),
     ) {
-        (Some(candidate), Some(current)) if candidate != current => candidate > current,
-        (Some(_), Some(_)) => match (
-            source_revision_tiebreak(candidate_snapshot),
-            source_revision_tiebreak(current_snapshot),
-        ) {
-            (Some(candidate), Some(current)) => {
-                compare_source_revision_tiebreak(Some(candidate), Some(current)).is_gt()
-            }
-            _ => false,
-        },
-        (Some(_), None) => true,
-        (None, Some(_)) => false,
+        (
+            SourceRevisionMetadata::Valid {
+                observed_at: candidate,
+                ..
+            },
+            SourceRevisionMetadata::Valid {
+                observed_at: current,
+                ..
+            },
+        ) if candidate != current => candidate > current,
+        (
+            SourceRevisionMetadata::Valid {
+                observed_at: candidate,
+                tiebreak: candidate_tiebreak,
+            },
+            SourceRevisionMetadata::Valid {
+                observed_at: current,
+                tiebreak: current_tiebreak,
+            },
+        ) if candidate == current && candidate_tiebreak.is_some() && current_tiebreak.is_some() => {
+            compare_source_revision_tiebreak(candidate_tiebreak, current_tiebreak).is_gt()
+        }
+        (SourceRevisionMetadata::Valid { .. }, SourceRevisionMetadata::Missing) => true,
+        (SourceRevisionMetadata::Valid { .. }, SourceRevisionMetadata::Malformed) => true,
         _ => false,
     }
 }
@@ -3230,6 +3276,21 @@ pub(crate) fn announcement_source_revision_tiebreak(
     source_revision_content_tiebreak(&[discussion_key.as_str(), title, body])
 }
 
+pub(crate) fn compare_announcement_source_revisions(
+    candidate_observed_at: &str,
+    candidate_tiebreak: &str,
+    current_observed_at: &str,
+    current_tiebreak: &str,
+) -> Option<std::cmp::Ordering> {
+    let candidate_observed_at = parse_storage_timestamp(candidate_observed_at)?;
+    let current_observed_at = parse_storage_timestamp(current_observed_at)?;
+    Some(
+        candidate_observed_at
+            .cmp(&current_observed_at)
+            .then_with(|| candidate_tiebreak.cmp(current_tiebreak)),
+    )
+}
+
 pub(crate) fn authoritative_release_revision<'a>(
     updated_at: &'a str,
     detected_at: Option<&str>,
@@ -3345,13 +3406,36 @@ async fn source_revision_is_current_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     work: &WorkRow,
 ) -> Result<bool> {
-    if source_observed_at(&work.source_snapshot_json).is_none() {
+    let work_revision = source_revision_metadata(&work.source_snapshot_json);
+    if matches!(work_revision, SourceRevisionMetadata::Missing) {
         return Ok(true);
+    }
+    if matches!(work_revision, SourceRevisionMetadata::Malformed) {
+        return Ok(false);
     }
     let Some(current_snapshot) = current_source_revision_snapshot_in_transaction(tx, work).await?
     else {
         return Ok(false);
     };
+    let current_revision = source_revision_metadata(&current_snapshot);
+    let (
+        SourceRevisionMetadata::Valid {
+            observed_at: work_observed_at,
+            tiebreak: work_tiebreak,
+        },
+        SourceRevisionMetadata::Valid {
+            observed_at: current_observed_at,
+            tiebreak: current_tiebreak,
+        },
+    ) = (work_revision, current_revision)
+    else {
+        return Ok(false);
+    };
+    if work_observed_at == current_observed_at
+        && (work_tiebreak.is_none() || current_tiebreak.is_none())
+    {
+        return Ok(false);
+    }
     Ok(!source_version_is_newer(
         &current_snapshot,
         &work.source_snapshot_json,
@@ -3362,6 +3446,23 @@ async fn supersede_work_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     work: &WorkRow,
     replaced_by_work_item_id: Option<&str>,
+    reason_code: &str,
+) -> Result<()> {
+    supersede_work_with_event_in_transaction(
+        tx,
+        work,
+        replaced_by_work_item_id,
+        "source_superseded",
+        reason_code,
+    )
+    .await
+}
+
+async fn supersede_work_with_event_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    work: &WorkRow,
+    replaced_by_work_item_id: Option<&str>,
+    event_type: &str,
     reason_code: &str,
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
@@ -3375,7 +3476,7 @@ async fn supersede_work_in_transaction(
         tx,
         WorkAdmissionEvent {
             work_item_id: &work.id,
-            event_type: "source_superseded",
+            event_type,
             replaced_by_work_item_id,
             source_hash: &work.source_hash,
             source_snapshot_json: &work.source_snapshot_json,
@@ -3689,7 +3790,16 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             .fetch_optional(&mut *tx)
             .await?;
     if mode.as_deref() != Some(ContentProcessingMode::Global.as_str()) {
-        tx.rollback().await?;
+        supersede_work_with_event_in_transaction(
+            &mut tx,
+            &work,
+            None,
+            "reconciliation_superseded",
+            "processing_mode_changed_after_provider",
+        )
+        .await?;
+        persist_superseded_provider_call_audits(&mut tx, &work, &result, &now).await?;
+        tx.commit().await?;
         return Ok(());
     }
     let now_for_lease = Utc::now().to_rfc3339();
@@ -5648,7 +5758,11 @@ mod tests {
         )
         .bind(
             json!({
-                "source_blocks": [{"slot": "source_observed_at", "text": "2026-01-01T00:00:00Z"}, {"slot": "title", "text": "Old title"}],
+                "source_blocks": [
+                    {"slot": "source_observed_at", "text": "2026-01-01T00:00:00Z"},
+                    {"slot": "source_revision_tiebreak", "text": "https://example.test/releases/12345\nv1\nv1\n"},
+                    {"slot": "title", "text": "Old title"}
+                ],
                 "target_slots": ["title_zh"]
             })
             .to_string(),
@@ -5841,7 +5955,11 @@ mod tests {
         )
         .bind(
             json!({
-                "source_blocks": [{"slot": "source_observed_at", "text": "2026-01-01T00:00:00Z"}, {"slot": "title", "text": "Old title"}],
+                "source_blocks": [
+                    {"slot": "source_observed_at", "text": "2026-01-01T00:00:00Z"},
+                    {"slot": "source_revision_tiebreak", "text": "https://example.test/releases/12345\nv1\nv1\n"},
+                    {"slot": "title", "text": "Old title"}
+                ],
                 "target_slots": ["title_zh"]
             })
             .to_string(),
@@ -6654,6 +6772,15 @@ mod tests {
         .to_string();
         let numeric_9 = numeric_10.replace("\"10\"", "\"9\"");
         assert!(source_version_is_newer(&numeric_10, &numeric_9));
+        let malformed = json!({
+            "source_blocks": [
+                {"slot": "source_observed_at", "text": "not-a-timestamp"},
+                {"slot": "source_revision_tiebreak", "text": "0003"},
+            ]
+        })
+        .to_string();
+        assert!(!source_version_is_newer(&malformed, &older));
+        assert!(source_version_is_newer(&newer, &malformed));
     }
 
     #[test]
@@ -6672,6 +6799,33 @@ mod tests {
         );
         assert_eq!(
             authoritative_release_revision("2026-01-01T00:00:00Z", None),
+            None
+        );
+        assert_eq!(
+            compare_announcement_source_revisions(
+                "2026-01-01T00:00:01Z",
+                "new",
+                "2026-01-01T00:00:00Z",
+                "old",
+            ),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert_eq!(
+            compare_announcement_source_revisions(
+                "2026-01-01T00:00:00Z",
+                "z-new",
+                "2026-01-01T00:00:00Z",
+                "old",
+            ),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert_eq!(
+            compare_announcement_source_revisions(
+                "malformed",
+                "new",
+                "2026-01-01T00:00:00Z",
+                "old",
+            ),
             None
         );
     }
