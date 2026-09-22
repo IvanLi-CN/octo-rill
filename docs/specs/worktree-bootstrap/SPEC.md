@@ -161,3 +161,7 @@
 - 风险：若开发者原本依赖 repo-local 自定义 `core.hooksPath` 承载其他 hook 管理逻辑，当前方案通过共享目录链式保留旧 hook；若旧 hook 本身依赖固定相对路径，仍需开发者自行确认。
 - 开放问题：无。
 - 假设：团队接受把 `.env.local` 作为推荐的 per-developer secrets 文件。
+
+## Related ADRs
+
+None
