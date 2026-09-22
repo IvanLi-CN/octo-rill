@@ -28,10 +28,10 @@ concurrency:
 
 jobs:
   build-docs:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
@@ -61,7 +61,7 @@ jobs:
           DOCS_BASE="${DOCS_BASE}" bun run build
 
       - name: Upload docs artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: docs-site-build
           path: docs-site/doc_build
@@ -69,10 +69,10 @@ jobs:
           if-no-files-found: error
 
   build-storybook:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
@@ -90,7 +90,7 @@ jobs:
           bun run storybook:build -- --quiet
 
       - name: Upload Storybook artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: storybook-static-build
           path: web/storybook-static
@@ -98,10 +98,10 @@ jobs:
           if-no-files-found: error
 
   build-demo:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
@@ -131,7 +131,7 @@ jobs:
           DOCS_BASE="${DOCS_BASE}" bun run build:demo
 
       - name: Upload demo artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: demo-static-build
           path: web/dist-demo
@@ -139,11 +139,11 @@ jobs:
           if-no-files-found: error
 
   assemble-pages:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [build-docs, build-storybook, build-demo]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Compute DOCS_BASE
         shell: bash
@@ -158,19 +158,19 @@ jobs:
           fi
 
       - name: Download docs artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: docs-site-build
           path: .tmp/docs-site
 
       - name: Download Storybook artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: storybook-static-build
           path: .tmp/storybook-static
 
       - name: Download demo artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: demo-static-build
           path: .tmp/demo-static
@@ -210,7 +210,7 @@ jobs:
           fi
 
       - name: Upload assembled Pages site artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pages-site-build
           path: .tmp/pages-site
@@ -219,7 +219,7 @@ jobs:
 
   deploy:
     if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [assemble-pages]
     permissions:
       contents: read
@@ -230,19 +230,19 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Download assembled Pages site artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: pages-site-build
           path: .tmp/pages-site
 
       - name: Setup Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: .tmp/pages-site
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

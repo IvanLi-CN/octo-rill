@@ -507,7 +507,7 @@ await_ci_checkout_with = contract.require_mapping(
     await_ci_checkout.get("with"),
     "release.yml.jobs.await-ci.steps['Checkout workflow revision'].with",
 )
-assert await_ci_checkout.get("uses") == "actions/checkout@v4"
+assert await_ci_checkout.get("uses") == "actions/checkout@v7"
 assert await_ci_checkout_with.get("ref") == "${{ github.workflow_sha }}"
 await_ci_step = contract.step_config(await_ci_job, "Gate current push release against CI", "release.yml.jobs.await-ci")
 await_ci_run = contract.step_run(
@@ -542,7 +542,7 @@ docker_release_checkout_with = contract.require_mapping(
     docker_release_checkout.get("with"),
     "release.yml.jobs.docker-release.steps['Checkout release revision'].with",
 )
-assert docker_release_checkout.get("uses") == "actions/checkout@v4"
+assert docker_release_checkout.get("uses") == "actions/checkout@v7"
 assert docker_release_checkout_with.get("ref") == "${{ env.RELEASE_HEAD_SHA }}"
 docker_overlay_step = contract.step_config(
     docker_release_job,
