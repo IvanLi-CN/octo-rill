@@ -119,6 +119,10 @@ SQLx 默认会校验数据库中每一个已应用迁移是否存在于当前二
 
 Provider and output-validation failures finalize the failed call link, work item, batch item, batch, and `attempt_completed` event in the same SQLite transaction. The regression test `content_processing::tests::execute_persists_failure_finalization_atomically` drives this path with a local mock provider and verifies that the terminal state and audit records persist together while the worker lease is cleared.
 
+## Global Output Contract
+
+The content-processing worker prompts for declared target fields at the JSON top level. It accepts only one optional Markdown JSON fence or one `output` object envelope before applying the existing field and Markdown validation; unknown, nested, ambiguous, duplicate-key or incomplete wrappers remain `output_contract_invalid`. A first `finish_reason=length` response receives one same-attempt recovery call with the same route and configuration snapshot and a 6,000-token limit. Before each provider call, the worker verifies and extends the current attempt lease in a SQLite writer transaction, so the primary and recovery calls each have a full execution window; an expired or superseded claim does not issue another model request. A second truncation records `output_truncated` without a third call. Every primary and recovery call is linked to the attempt, including provider-success call links for business-contract failures. The focused tests cover prompt shape, normalization, wrapped-output publication, lease renewal, bounded recovery, truncation classification and call-link persistence.
+
 ## Completion Evidence
 
 Identity-upgrade implementation is complete only after the verification scenarios in [SPEC.md](./SPEC.md) pass against the migration-bearing compatibility build and the later migration-free identity cutover build. The release checklist must prove the database can start under the compatibility build after cutover, that migration-preceding binaries are rejected, and that compatibility migration 0084 performs no historical-data backfill.

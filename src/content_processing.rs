@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -9,6 +10,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use chrono::{DateTime, NaiveDateTime, Utc};
+use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Error as SqlxError, Row, Sqlite, SqlitePool, Transaction};
@@ -499,6 +501,9 @@ struct AttemptRouteSnapshot {
 }
 
 const GLOBAL_PROTOCOL_VERSION: &str = "content-processing.v1";
+const GLOBAL_WORK_LEASE_SECS: i64 = 5 * 60;
+const GLOBAL_MAX_TOKENS: u32 = 3_000;
+const GLOBAL_LENGTH_RECOVERY_MAX_TOKENS: u32 = 6_000;
 const RETRY_COOLDOWN_SECS: i64 = 5 * 60;
 const RETRY_DELAYS_SECS: [i64; 5] = [60, 300, 900, 3600, 14_400];
 const PROVIDER_DEFER_SECS: i64 = 10 * 60;
@@ -1758,7 +1763,8 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
             )
         });
     let now = Utc::now().to_rfc3339();
-    let lease_expires_at = (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+    let lease_expires_at =
+        (Utc::now() + chrono::Duration::seconds(GLOBAL_WORK_LEASE_SECS)).to_rfc3339();
     let attempt_profile = attempt_snapshot
         .route_models
         .first()
@@ -1817,6 +1823,34 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
         attempt_configuration_fingerprint: Some(attempt_snapshot.configuration_fingerprint),
         ..row
     }))
+}
+
+async fn renew_global_work_lease(state: &AppState, work: &WorkRow) -> Result<bool> {
+    let now = Utc::now();
+    let now_text = now.to_rfc3339();
+    let lease_expires_at = (now + chrono::Duration::seconds(GLOBAL_WORK_LEASE_SECS)).to_rfc3339();
+    let (_lock, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "content_processing_lease_heartbeat")
+        .await?;
+    let mode =
+        sqlx::query_scalar::<_, String>("SELECT mode FROM content_processing_control WHERE id = 1")
+            .fetch_optional(&mut *tx)
+            .await?;
+    if mode.as_deref() != Some(ContentProcessingMode::Global.as_str()) {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let updated = sqlx::query("UPDATE content_work_items SET lease_expires_at = ?, updated_at = ? WHERE id = ? AND status = 'running' AND attempt_count = ? AND lease_owner = 'content-general-1' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(?)")
+        .bind(&lease_expires_at)
+        .bind(&now_text)
+        .bind(&work.id)
+        .bind(work.attempt_count)
+        .bind(&now_text)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(updated.rows_affected() == 1)
 }
 
 async fn recover_due(state: &AppState) -> Result<()> {
@@ -1950,9 +1984,9 @@ async fn defer_queued_for_provider(state: &AppState) -> Result<()> {
 
 fn build_prompt(snapshot: &SourceSnapshot, pipeline: &str) -> (String, String) {
     let system = if pipeline == "polishing" {
-        "你是严谨的技术内容润色助手。只输出 JSON，不要解释。保留事实、链接、代码和 Markdown 结构。"
+        "你是严谨的技术内容润色助手。只输出一个 JSON 对象，不要解释。JSON 顶层必须直接包含 target_slots 列出的字段；不要使用 output、result 或 data 包装，也不要输出 Markdown 代码围栏。保留事实、链接、代码和 Markdown 结构。"
     } else {
-        "你是严谨的技术文档翻译助手。只输出 JSON，不要解释。保留事实、链接、代码和 Markdown 结构。"
+        "你是严谨的技术文档翻译助手。只输出一个 JSON 对象，不要解释。JSON 顶层必须直接包含 target_slots 列出的字段；不要使用 output、result 或 data 包装，也不要输出 Markdown 代码围栏。保留事实、链接、代码和 Markdown 结构。"
     };
     let user = json!({
         "source_blocks": snapshot
@@ -1961,9 +1995,9 @@ fn build_prompt(snapshot: &SourceSnapshot, pipeline: &str) -> (String, String) {
             .filter(|block| block.slot != "source_observed_at")
             .collect::<Vec<_>>(),
         "target_slots": snapshot.target_slots,
-        "output": {"title_zh": "string|null", "summary_md": "string|null", "body_md": "string|null"}
+        "response_contract": "Return one JSON object with every declared target slot directly at the top level. Do not wrap it in output, result, or data. Do not use a Markdown code fence. Only declared target slots are persisted; extra scalar metadata is ignored."
     })
-    .to_string();
+        .to_string();
     (system.to_owned(), user)
 }
 
@@ -1994,17 +2028,167 @@ fn next_retry_at_for_failure(
     retryable: bool,
     now: DateTime<Utc>,
 ) -> Option<String> {
-    let retry_window_open = retry_expires_at
-        .and_then(parse_storage_timestamp)
-        .is_none_or(|expires_at| expires_at > now);
-    if !retryable || !retry_window_open {
+    let expires_at = retry_expires_at.and_then(parse_storage_timestamp);
+    if !retryable || expires_at.is_some_and(|expires_at| expires_at <= now) {
         return None;
     }
     let delay_index = attempt_count
         .saturating_sub(1)
         .min(i64::try_from(RETRY_DELAYS_SECS.len() - 1).unwrap_or(0))
         as usize;
-    Some((now + chrono::Duration::seconds(RETRY_DELAYS_SECS[delay_index])).to_rfc3339())
+    let candidate = now + chrono::Duration::seconds(RETRY_DELAYS_SECS[delay_index]);
+    if expires_at.is_some_and(|expires_at| candidate >= expires_at) {
+        return None;
+    }
+    Some(candidate.to_rfc3339())
+}
+
+fn strip_single_json_code_fence(raw: &str) -> Result<(String, bool)> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("```") {
+        return Ok((trimmed.to_owned(), false));
+    }
+
+    let mut lines = trimmed.lines();
+    let opening = lines.next().unwrap_or_default().trim();
+    if opening != "```" && !opening.eq_ignore_ascii_case("```json") {
+        anyhow::bail!("global content output uses an unsupported code fence");
+    }
+    let mut body = lines.collect::<Vec<_>>();
+    if body.pop().map(str::trim) != Some("```") {
+        anyhow::bail!("global content output has an unterminated code fence");
+    }
+    Ok((body.join("\n").trim().to_owned(), true))
+}
+
+struct UniqueJsonValue(Value);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonValueVisitor)
+    }
+}
+
+struct UniqueJsonValueVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonValueVisitor {
+    type Value = UniqueJsonValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value with unique object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(|number| UniqueJsonValue(Value::Number(number)))
+            .ok_or_else(|| E::custom("invalid JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::String(value)))
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<UniqueJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(UniqueJsonValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(A::Error::custom(
+                    "global content output has duplicate JSON keys",
+                ));
+            }
+            let value = object.next_value::<UniqueJsonValue>()?;
+            values.insert(key, value.0);
+        }
+        Ok(UniqueJsonValue(Value::Object(values)))
+    }
+}
+
+fn normalize_output(raw: &str, target_slots: &[String]) -> Result<Value> {
+    let (json_text, fenced) = strip_single_json_code_fence(raw)?;
+    let output = serde_json::from_str::<UniqueJsonValue>(&json_text)
+        .context("global content output is not JSON")?
+        .0;
+    let object = output
+        .as_object()
+        .ok_or_else(|| anyhow!("global content output is not an object"))?;
+    let has_direct_target = target_slots.iter().any(|slot| object.contains_key(slot));
+    let has_all_direct_targets = target_slots.iter().all(|slot| object.contains_key(slot));
+
+    if object.iter().any(|(key, value)| {
+        !target_slots.contains(key) && key != "output" && (value.is_object() || value.is_array())
+    }) {
+        anyhow::bail!("global content output has an unknown wrapper");
+    }
+
+    if object.contains_key("output") {
+        if fenced {
+            anyhow::bail!("global content output has multiple wrappers");
+        }
+        if has_direct_target {
+            anyhow::bail!("global content output has ambiguous direct and nested targets");
+        }
+        let nested = object
+            .get("output")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("global content output envelope is not an object"))?;
+        if nested.contains_key("output") {
+            anyhow::bail!("global content output has nested output envelopes");
+        }
+        if nested.iter().any(|(key, value)| {
+            !target_slots.contains(key) && (value.is_object() || value.is_array())
+        }) {
+            anyhow::bail!("global content output envelope has an unknown wrapper");
+        }
+        if !target_slots.iter().all(|slot| nested.contains_key(slot)) {
+            anyhow::bail!("global content output envelope is missing target slots");
+        }
+        return Ok(Value::Object(nested.clone()));
+    }
+
+    if !has_all_direct_targets {
+        anyhow::bail!("global content output is missing target slots");
+    }
+    Ok(output)
 }
 
 fn validate_output(
@@ -2012,7 +2196,7 @@ fn validate_output(
     target_slots: &[String],
     source_blocks: &[translations::TranslationSourceBlock],
 ) -> Result<Value> {
-    let output = serde_json::from_str::<Value>(raw).context("global content output is not JSON")?;
+    let output = normalize_output(raw, target_slots)?;
     let object = output
         .as_object()
         .ok_or_else(|| anyhow!("global content output is not an object"))?;
@@ -2064,7 +2248,8 @@ fn validate_output(
 
 #[derive(Debug)]
 struct OutputValidationFailure {
-    call_id: Option<String>,
+    call_ids: Vec<String>,
+    code: &'static str,
     message: String,
 }
 
@@ -2076,10 +2261,285 @@ impl std::fmt::Display for OutputValidationFailure {
 
 impl std::error::Error for OutputValidationFailure {}
 
-fn output_validation_call_id(error: &anyhow::Error) -> Option<String> {
+fn output_validation_call_ids(error: &anyhow::Error) -> Vec<String> {
     error
         .downcast_ref::<OutputValidationFailure>()
-        .and_then(|failure| failure.call_id.clone())
+        .map(|failure| failure.call_ids.clone())
+        .unwrap_or_default()
+}
+
+fn output_validation_error_code(error: &anyhow::Error) -> Option<&'static str> {
+    error
+        .downcast_ref::<OutputValidationFailure>()
+        .map(|failure| failure.code)
+}
+
+#[derive(Debug)]
+struct GlobalExecutionFailure {
+    call_ids: Vec<String>,
+    class: ai::LlmFailureClass,
+    message: String,
+}
+
+impl std::fmt::Display for GlobalExecutionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for GlobalExecutionFailure {}
+
+fn global_execution_failure_class(error: &anyhow::Error) -> Option<ai::LlmFailureClass> {
+    error
+        .downcast_ref::<GlobalExecutionFailure>()
+        .map(|failure| failure.class)
+}
+
+fn global_execution_call_ids(error: &anyhow::Error) -> Vec<String> {
+    error
+        .downcast_ref::<GlobalExecutionFailure>()
+        .map(|failure| failure.call_ids.clone())
+        .unwrap_or_default()
+}
+
+struct GlobalCompletion {
+    diagnostic: ai::ChatCompletionDiagnostic,
+    output: Value,
+    call_ids: Vec<String>,
+}
+
+struct GlobalCallSpec<'a> {
+    work: &'a WorkRow,
+    ai_config: &'a crate::config::AiConfig,
+    system: &'a str,
+    user: &'a str,
+    max_tokens: u32,
+    route_snapshot: &'a [String],
+    role: &'a str,
+}
+
+#[derive(Debug, Clone)]
+struct LlmCallAudit {
+    provider_request_id: Option<String>,
+    model: String,
+    status: String,
+    duration_ms: Option<i64>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+}
+
+async fn load_llm_call_audit(
+    tx: &mut Transaction<'_, Sqlite>,
+    call_id: &str,
+) -> Result<Option<LlmCallAudit>> {
+    sqlx::query_as::<_, (Option<String>, String, String, Option<i64>, Option<i64>, Option<i64>)>(
+        "SELECT provider_request_id, COALESCE(final_model, model), status, duration_ms, input_tokens, output_tokens FROM llm_calls WHERE id = ? LIMIT 1",
+    )
+    .bind(call_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map(|row| {
+        row.map(
+            |(provider_request_id, model, status, duration_ms, input_tokens, output_tokens)| {
+                LlmCallAudit {
+                    provider_request_id,
+                    model,
+                    status,
+                    duration_ms,
+                    input_tokens,
+                    output_tokens,
+                }
+            },
+        )
+    })
+    .map_err(Into::into)
+}
+
+fn unique_call_ids(mut call_ids: Vec<String>) -> Vec<String> {
+    let mut unique = Vec::with_capacity(call_ids.len());
+    call_ids.retain(|call_id| {
+        if unique.iter().any(|existing| existing == call_id) {
+            false
+        } else {
+            unique.push(call_id.clone());
+            true
+        }
+    });
+    call_ids
+}
+
+fn unique_provider_call_id(
+    call_id: &str,
+    provider_request_id: Option<&str>,
+    used: &mut HashSet<String>,
+) -> String {
+    let base = provider_request_id
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("llm-call:{call_id}"));
+    if used.insert(base.clone()) {
+        base
+    } else {
+        let disambiguated = format!("{base}:{call_id}");
+        used.insert(disambiguated.clone());
+        disambiguated
+    }
+}
+
+async fn request_global_completion(
+    state: &AppState,
+    spec: GlobalCallSpec<'_>,
+) -> Result<ai::ChatCompletionDiagnostic> {
+    if !renew_global_work_lease(state, spec.work).await? {
+        return Err(anyhow::Error::new(ai::LlmCallFailure {
+            class: ai::LlmFailureClass::Transient,
+            call_id: None,
+        }));
+    }
+    let call_context = ai::LlmCallContext {
+        source: format!(
+            "content_processing.global.{}.stage.content_output.role.{}",
+            spec.work.pipeline, spec.role
+        ),
+        requested_by: None,
+        parent_task_id: None,
+        parent_task_type: None,
+        parent_translation_batch_id: spec.work.batch_id.clone(),
+        parent_brief_id: None,
+    };
+    tokio::time::timeout(
+        Duration::from_secs(4 * 60),
+        ai::with_llm_call_context(
+            call_context,
+            ai::chat_completion_with_diagnostics_for_config_and_route(
+                state,
+                spec.ai_config,
+                spec.system,
+                spec.user,
+                spec.max_tokens,
+                Some(spec.route_snapshot),
+            ),
+        ),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::Error::new(ai::LlmCallFailure {
+            class: ai::LlmFailureClass::Transient,
+            call_id: None,
+        })
+    })
+    .and_then(|result| result)
+}
+
+async fn complete_global_output(
+    state: &AppState,
+    work: &WorkRow,
+    snapshot: &SourceSnapshot,
+    system: &str,
+    user: &str,
+    route_snapshot: &[String],
+) -> Result<GlobalCompletion> {
+    let Some(ai_config) = state.config.ai.clone() else {
+        return Err(anyhow::Error::new(GlobalExecutionFailure {
+            call_ids: Vec::new(),
+            class: ai::LlmFailureClass::Configuration,
+            message: "AI configuration is missing".to_owned(),
+        }));
+    };
+    let mut call_ids = Vec::new();
+    let mut diagnostic = match request_global_completion(
+        state,
+        GlobalCallSpec {
+            work,
+            ai_config: &ai_config,
+            system,
+            user,
+            max_tokens: GLOBAL_MAX_TOKENS,
+            route_snapshot,
+            role: "primary",
+        },
+    )
+    .await
+    {
+        Ok(diagnostic) => diagnostic,
+        Err(error) => {
+            if let Some(call_id) = ai::llm_call_id(&error) {
+                call_ids.push(call_id);
+            }
+            let class = ai::llm_failure_class(&error).unwrap_or(ai::LlmFailureClass::Transient);
+            return Err(anyhow::Error::new(GlobalExecutionFailure {
+                call_ids,
+                class,
+                message: error.to_string(),
+            }));
+        }
+    };
+    if let Some(call_id) = diagnostic.call_id.clone() {
+        call_ids.push(call_id);
+    }
+
+    if diagnostic.finish_reason.as_deref() == Some("length") {
+        let recovery_route_snapshot = [diagnostic.model.clone()];
+        diagnostic = match request_global_completion(
+            state,
+            GlobalCallSpec {
+                work,
+                ai_config: &ai_config,
+                system,
+                user,
+                max_tokens: GLOBAL_LENGTH_RECOVERY_MAX_TOKENS,
+                route_snapshot: &recovery_route_snapshot,
+                role: "length_recovery",
+            },
+        )
+        .await
+        {
+            Ok(diagnostic) => diagnostic,
+            Err(error) => {
+                if let Some(call_id) = ai::llm_call_id(&error) {
+                    call_ids.push(call_id);
+                }
+                let class = ai::llm_failure_class(&error).unwrap_or(ai::LlmFailureClass::Transient);
+                return Err(anyhow::Error::new(GlobalExecutionFailure {
+                    call_ids,
+                    class,
+                    message: error.to_string(),
+                }));
+            }
+        };
+        if let Some(call_id) = diagnostic.call_id.clone() {
+            call_ids.push(call_id);
+        }
+    }
+
+    if diagnostic.finish_reason.as_deref() == Some("length") {
+        return Err(anyhow::Error::new(OutputValidationFailure {
+            call_ids,
+            code: "output_truncated",
+            message: "global content output was truncated".to_owned(),
+        }));
+    }
+
+    let output = match validate_output(
+        &diagnostic.content,
+        &snapshot.target_slots,
+        &snapshot.source_blocks,
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(anyhow::Error::new(OutputValidationFailure {
+                call_ids,
+                code: "output_contract_invalid",
+                message: error.to_string(),
+            }));
+        }
+    };
+
+    Ok(GlobalCompletion {
+        diagnostic,
+        output,
+        call_ids,
+    })
 }
 
 async fn source_exists(state: &AppState, work: &WorkRow) -> Result<bool> {
@@ -2255,11 +2715,12 @@ async fn cancel_deleted_work_in_transaction(
     Ok(())
 }
 
-struct FailedLlmCallAudit<'a> {
+struct AttemptLlmCallAudit<'a> {
     audit_call_id: &'a str,
     attempt_event_id: &'a str,
     provider_call_id: &'a str,
     model: &'a str,
+    status: &'a str,
     duration_ms: Option<i64>,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
@@ -2268,15 +2729,16 @@ struct FailedLlmCallAudit<'a> {
     created_at: &'a str,
 }
 
-async fn persist_failed_llm_call_audit(
+async fn persist_attempt_llm_call_audit(
     tx: &mut Transaction<'_, Sqlite>,
-    audit: FailedLlmCallAudit<'_>,
+    audit: AttemptLlmCallAudit<'_>,
 ) -> std::result::Result<(), SqlxError> {
-    sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, cost_microunits, error_code, error_summary, created_at) VALUES (?, ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, cost_microunits, error_code, error_summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(audit.audit_call_id)
         .bind(audit.attempt_event_id)
         .bind(audit.provider_call_id)
         .bind(audit.model)
+        .bind(audit.status)
         .bind(audit.duration_ms)
         .bind(audit.input_tokens)
         .bind(audit.output_tokens)
@@ -2365,50 +2827,8 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
         return Ok(());
     }
     let (system, user) = build_prompt(&snapshot, &work.pipeline);
-    let call_context = ai::LlmCallContext {
-        source: format!("content_processing.global.{}", work.pipeline),
-        requested_by: None,
-        parent_task_id: None,
-        parent_task_type: None,
-        parent_translation_batch_id: work.batch_id.clone(),
-        parent_brief_id: None,
-    };
-    let result = tokio::time::timeout(
-        Duration::from_secs(4 * 60),
-        ai::with_llm_call_context(
-            call_context,
-            ai::chat_completion_with_diagnostics_for_route(
-                state,
-                &system,
-                &user,
-                3_000,
-                Some(&route_snapshot),
-            ),
-        ),
-    )
-    .await
-    .map_err(|_| {
-        anyhow::Error::new(ai::LlmCallFailure {
-            class: ai::LlmFailureClass::Transient,
-            call_id: None,
-        })
-    })
-    .and_then(|result| result)
-    .and_then(|diagnostic| {
-        let call_id = diagnostic.call_id.clone();
-        validate_output(
-            &diagnostic.content,
-            &snapshot.target_slots,
-            &snapshot.source_blocks,
-        )
-        .map(|output| (diagnostic, output))
-        .map_err(|error| {
-            anyhow::Error::new(OutputValidationFailure {
-                call_id,
-                message: error.to_string(),
-            })
-        })
-    });
+    let result =
+        complete_global_output(state, &work, &snapshot, &system, &user, &route_snapshot).await;
     let now = Utc::now().to_rfc3339();
     let (_lock, mut tx) = state
         .sqlite_writer
@@ -2445,56 +2865,101 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
         return Ok(());
     }
     match result {
-        Ok((diagnostic, output)) => {
+        Ok(completion) => {
+            let diagnostic = completion.diagnostic;
+            let output = completion.output;
             let attempt_event_id = sqlx::query_scalar::<_, String>("SELECT id FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started' LIMIT 1")
                 .bind(&work.id)
                 .bind(work.attempt_count)
                 .fetch_one(&mut *tx)
                 .await?;
-            let linked_call_audit = if let Some(call_id) = diagnostic.call_id.as_deref() {
-                sqlx::query_as::<_, (Option<String>, String, Option<i64>, Option<i64>, Option<i64>)>(
-                    "SELECT provider_request_id, COALESCE(final_model, model), duration_ms, input_tokens, output_tokens FROM llm_calls WHERE id = ? LIMIT 1",
-                )
-                .bind(call_id)
-                .fetch_optional(&mut *tx)
-                .await?
+            let call_ids = if completion.call_ids.is_empty() {
+                diagnostic
+                    .call_id
+                    .clone()
+                    .map(|call_id| vec![call_id])
+                    .unwrap_or_default()
             } else {
-                None
+                completion.call_ids
             };
-            let provider_call_id = linked_call_audit
+            let mut call_audits = Vec::with_capacity(call_ids.len());
+            for call_id in &call_ids {
+                call_audits.push((
+                    call_id.clone(),
+                    load_llm_call_audit(&mut tx, call_id).await?,
+                ));
+            }
+            let final_audit = call_audits
+                .last()
+                .and_then(|(_, audit)| audit.as_ref())
+                .cloned();
+            let provider_call_id = final_audit
                 .as_ref()
-                .and_then(|(provider_id, _, _, _, _)| provider_id.as_deref())
+                .and_then(|audit| audit.provider_request_id.as_deref())
                 .or(diagnostic.provider_request_id.as_deref())
                 .unwrap_or("unknown");
-            let model = linked_call_audit
+            let model = final_audit
                 .as_ref()
-                .map_or(diagnostic.model.as_str(), |(_, model, _, _, _)| {
-                    model.as_str()
-                });
-            let duration_ms = linked_call_audit
-                .as_ref()
-                .and_then(|(_, _, duration_ms, _, _)| *duration_ms);
-            let input_tokens = linked_call_audit
-                .as_ref()
-                .and_then(|(_, _, _, input_tokens, _)| *input_tokens);
-            let output_tokens = linked_call_audit
-                .as_ref()
-                .and_then(|(_, _, _, _, output_tokens)| *output_tokens)
+                .map_or(diagnostic.model.as_str(), |audit| audit.model.as_str());
+            let duration_ms = call_audits
+                .iter()
+                .filter_map(|(_, audit)| audit.as_ref().and_then(|audit| audit.duration_ms))
+                .reduce(i64::saturating_add);
+            let input_tokens = call_audits
+                .iter()
+                .filter_map(|(_, audit)| audit.as_ref().and_then(|audit| audit.input_tokens))
+                .reduce(i64::saturating_add);
+            let output_tokens = call_audits
+                .iter()
+                .filter_map(|(_, audit)| audit.as_ref().and_then(|audit| audit.output_tokens))
+                .reduce(i64::saturating_add)
                 .or(diagnostic.output_tokens);
             // Provider pricing is not part of the existing llm_calls contract; persist an explicit
             // unknown cost instead of deriving a value from model names or token counts.
-            sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, cost_microunits, created_at) VALUES (?, ?, ?, ?, 'succeeded', ?, ?, ?, ?, ?)")
-                .bind(diagnostic.call_id.clone().unwrap_or_else(|| local_id::generate_local_id().to_string()))
-                .bind(&attempt_event_id)
-                .bind(provider_call_id)
-                .bind(model)
-                .bind(duration_ms)
-                .bind(input_tokens)
-                .bind(output_tokens)
-                .bind(Option::<i64>::None)
-                .bind(&now)
-                .execute(&mut *tx)
-                .await?;
+            if call_audits.is_empty() {
+                sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, cost_microunits, created_at) VALUES (?, ?, ?, ?, 'succeeded', ?, ?, ?, ?, ?)")
+                    .bind(local_id::generate_local_id().to_string())
+                    .bind(&attempt_event_id)
+                    .bind(provider_call_id)
+                    .bind(model)
+                    .bind(duration_ms)
+                    .bind(input_tokens)
+                    .bind(output_tokens)
+                    .bind(Option::<i64>::None)
+                    .bind(&now)
+                    .execute(&mut *tx)
+                    .await?;
+            } else {
+                let mut used_provider_call_ids = HashSet::new();
+                for (call_id, audit) in &call_audits {
+                    let audit = audit.clone().unwrap_or_else(|| LlmCallAudit {
+                        provider_request_id: None,
+                        model: model.to_owned(),
+                        status: "succeeded".to_owned(),
+                        duration_ms: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                    let provider_call_id = unique_provider_call_id(
+                        call_id,
+                        audit.provider_request_id.as_deref(),
+                        &mut used_provider_call_ids,
+                    );
+                    sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, duration_ms, input_tokens, output_tokens, cost_microunits, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                        .bind(call_id)
+                        .bind(&attempt_event_id)
+                        .bind(provider_call_id)
+                        .bind(audit.model)
+                        .bind(audit.status)
+                        .bind(audit.duration_ms)
+                        .bind(audit.input_tokens)
+                        .bind(audit.output_tokens)
+                        .bind(Option::<i64>::None)
+                        .bind(&now)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
             let token_count = match (input_tokens, output_tokens) {
                 (Some(input), Some(output)) => Some(input.saturating_add(output)),
                 _ => None,
@@ -2558,21 +3023,24 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
         }
         Err(error) => {
             let error_text = error.to_string();
-            let llm_class = ai::llm_failure_class(&error);
-            let output_validation_failed = output_validation_call_id(&error).is_some();
-            let class = if output_validation_failed {
-                "output_contract_invalid".to_owned()
-            } else {
-                llm_class
-                    .map(|value| value.as_str().to_owned())
-                    .or_else(|| {
-                        translations::classify_translation_error(Some(error_text.as_str()))
-                            .map(|value| value.code.to_owned())
-                    })
-                    .unwrap_or_else(|| "unknown_internal_error".to_owned())
-            };
+            let llm_class =
+                ai::llm_failure_class(&error).or_else(|| global_execution_failure_class(&error));
+            let class = output_validation_error_code(&error)
+                .map(str::to_owned)
+                .or_else(|| {
+                    llm_class
+                        .map(|value| value.as_str().to_owned())
+                        .or_else(|| {
+                            translations::classify_translation_error(Some(error_text.as_str()))
+                                .map(|value| value.code.to_owned())
+                        })
+                })
+                .unwrap_or_else(|| "unknown_internal_error".to_owned());
             let retryable = llm_class.is_some_and(ai::LlmFailureClass::is_recoverable)
-                || class == "output_contract_invalid";
+                || matches!(
+                    class.as_str(),
+                    "output_contract_invalid" | "output_truncated"
+                );
             let now = Utc::now();
             let next_retry = next_retry_at_for_failure(
                 work.attempt_count,
@@ -2592,57 +3060,101 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             .fetch_one(&mut *tx)
             .await?;
             let error_summary = translations::translation_error_summary(Some(error_text.as_str()));
-            let linked_call_id =
-                ai::llm_call_id(&error).or_else(|| output_validation_call_id(&error));
-            let linked_call_audit = if let Some(call_id) = linked_call_id.as_deref() {
-                sqlx::query_as::<_, (Option<String>, String, Option<i64>, Option<i64>, Option<i64>)>(
-                    "SELECT provider_request_id, COALESCE(final_model, model), duration_ms, input_tokens, output_tokens FROM llm_calls WHERE id = ? LIMIT 1",
-                )
-                .bind(call_id)
-                .fetch_optional(&mut *tx)
-                .await?
+            let linked_call_ids = unique_call_ids(
+                output_validation_call_ids(&error)
+                    .into_iter()
+                    .chain(global_execution_call_ids(&error))
+                    .chain(ai::llm_call_id(&error))
+                    .collect(),
+            );
+            let mut call_audits = Vec::with_capacity(linked_call_ids.len());
+            for call_id in &linked_call_ids {
+                call_audits.push((
+                    call_id.clone(),
+                    load_llm_call_audit(&mut tx, call_id).await?,
+                ));
+            }
+            let link_status = if output_validation_error_code(&error).is_some() {
+                "succeeded"
             } else {
-                None
+                "failed"
             };
-            let audit_call_id = linked_call_id
-                .clone()
-                .unwrap_or_else(|| local_id::generate_local_id().to_string());
-            if let Err(audit_error) = persist_failed_llm_call_audit(
-                &mut tx,
-                FailedLlmCallAudit {
-                    audit_call_id: &audit_call_id,
-                    attempt_event_id: &attempt_event_id,
-                    provider_call_id: linked_call_audit
-                        .as_ref()
-                        .and_then(|(provider_id, _, _, _, _)| provider_id.as_deref())
-                        .unwrap_or("unknown"),
-                    model: linked_call_audit
-                        .as_ref()
-                        .map_or(work.model_profile.as_str(), |(_, model, _, _, _)| {
-                            model.as_str()
-                        }),
-                    duration_ms: linked_call_audit
-                        .as_ref()
-                        .and_then(|(_, _, duration_ms, _, _)| *duration_ms),
-                    input_tokens: linked_call_audit
-                        .as_ref()
-                        .and_then(|(_, _, _, input_tokens, _)| *input_tokens),
-                    output_tokens: linked_call_audit
-                        .as_ref()
-                        .and_then(|(_, _, _, _, output_tokens)| *output_tokens),
-                    error_code: &class,
-                    error_summary: error_summary.as_deref(),
-                    created_at: now_text.as_str(),
-                },
-            )
-            .await
-            {
-                warn!(
-                    ?audit_error,
-                    work_item_id = %work.id,
-                    attempt_event_id = %attempt_event_id,
-                    "failed to persist content processing call audit"
-                );
+            if call_audits.is_empty() {
+                let audit_call_id = local_id::generate_local_id().to_string();
+                if let Err(audit_error) = persist_attempt_llm_call_audit(
+                    &mut tx,
+                    AttemptLlmCallAudit {
+                        audit_call_id: &audit_call_id,
+                        attempt_event_id: &attempt_event_id,
+                        provider_call_id: "unknown",
+                        model: route_snapshot
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("unknown"),
+                        status: link_status,
+                        duration_ms: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        error_code: &class,
+                        error_summary: error_summary.as_deref(),
+                        created_at: now_text.as_str(),
+                    },
+                )
+                .await
+                {
+                    warn!(
+                        ?audit_error,
+                        work_item_id = %work.id,
+                        attempt_event_id = %attempt_event_id,
+                        "failed to persist content processing call audit"
+                    );
+                }
+            } else {
+                let mut used_provider_call_ids = HashSet::new();
+                for (call_id, audit) in &call_audits {
+                    let audit = audit.clone().unwrap_or_else(|| LlmCallAudit {
+                        provider_request_id: None,
+                        model: route_snapshot
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        status: link_status.to_owned(),
+                        duration_ms: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                    });
+                    let provider_call_id = unique_provider_call_id(
+                        call_id,
+                        audit.provider_request_id.as_deref(),
+                        &mut used_provider_call_ids,
+                    );
+                    if let Err(audit_error) = persist_attempt_llm_call_audit(
+                        &mut tx,
+                        AttemptLlmCallAudit {
+                            audit_call_id: call_id,
+                            attempt_event_id: &attempt_event_id,
+                            provider_call_id: &provider_call_id,
+                            model: &audit.model,
+                            status: &audit.status,
+                            duration_ms: audit.duration_ms,
+                            input_tokens: audit.input_tokens,
+                            output_tokens: audit.output_tokens,
+                            error_code: &class,
+                            error_summary: error_summary.as_deref(),
+                            created_at: now_text.as_str(),
+                        },
+                    )
+                    .await
+                    {
+                        warn!(
+                            ?audit_error,
+                            work_item_id = %work.id,
+                            attempt_event_id = %attempt_event_id,
+                            call_id = %call_id,
+                            "failed to persist content processing call audit"
+                        );
+                    }
+                }
             }
             sqlx::query("UPDATE content_work_items SET status = 'failed', failure_class = ?, next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?")
                 .bind(&class)
@@ -2663,12 +3175,14 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .execute(&mut *tx)
                 .await?;
             let token_count = match (
-                linked_call_audit
-                    .as_ref()
-                    .and_then(|(_, _, _, input_tokens, _)| *input_tokens),
-                linked_call_audit
-                    .as_ref()
-                    .and_then(|(_, _, _, _, output_tokens)| *output_tokens),
+                call_audits
+                    .iter()
+                    .filter_map(|(_, audit)| audit.as_ref().and_then(|audit| audit.input_tokens))
+                    .reduce(i64::saturating_add),
+                call_audits
+                    .iter()
+                    .filter_map(|(_, audit)| audit.as_ref().and_then(|audit| audit.output_tokens))
+                    .reduce(i64::saturating_add),
             ) {
                 (Some(input), Some(output)) => Some(input.saturating_add(output)),
                 _ => None,
@@ -2680,7 +3194,12 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(&class)
                 .bind(i64::from(next_retry.is_some()))
                 .bind(&next_retry)
-                .bind(linked_call_audit.as_ref().and_then(|(_, _, duration_ms, _, _)| *duration_ms))
+                .bind(
+                    call_audits
+                        .iter()
+                        .filter_map(|(_, audit)| audit.as_ref().and_then(|audit| audit.duration_ms))
+                        .reduce(i64::saturating_add),
+                )
                 .bind(token_count)
                 .bind(Option::<i64>::None)
                 .bind(now_text.as_str())
@@ -2779,9 +3298,12 @@ pub fn spawn_global_scheduler(state: Arc<AppState>) -> tokio::task::AbortHandle 
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
     use std::net::SocketAddr;
-    use std::sync::Arc;
+    use std::{
+        borrow::Cow,
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
 
     use super::*;
     use crate::config::AppConfig;
@@ -2876,13 +3398,14 @@ mod tests {
         .unwrap();
 
         let mut transaction = pool.begin().await.unwrap();
-        persist_failed_llm_call_audit(
+        persist_attempt_llm_call_audit(
             &mut transaction,
-            FailedLlmCallAudit {
+            AttemptLlmCallAudit {
                 audit_call_id: "audit-call",
                 attempt_event_id: "audit-event",
                 provider_call_id: "provider-request-1",
                 model: "test-model",
+                status: "failed",
                 duration_ms: Some(125),
                 input_tokens: Some(12),
                 output_tokens: Some(8),
@@ -2969,6 +3492,116 @@ mod tests {
             axum::serve(listener, app).await.expect("serve test ai app");
         });
         Url::parse(&format!("http://{addr}/v1/")).expect("parse test ai base url")
+    }
+
+    async fn spawn_sequenced_test_ai_server(
+        responses: Vec<(&str, &str)>,
+    ) -> (Url, Arc<Mutex<Vec<u32>>>, Arc<Mutex<Vec<String>>>) {
+        let responses = Arc::new(Mutex::new(
+            responses
+                .into_iter()
+                .map(|(content, finish_reason)| (content.to_owned(), finish_reason.to_owned()))
+                .collect::<VecDeque<_>>(),
+        ));
+        let requested_tokens = Arc::new(Mutex::new(Vec::new()));
+        let requested_models = Arc::new(Mutex::new(Vec::new()));
+        let response_state = responses.clone();
+        let token_state = requested_tokens.clone();
+        let model_state = requested_models.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(request): Json<Value>| {
+                let response_state = response_state.clone();
+                let token_state = token_state.clone();
+                let model_state = model_state.clone();
+                async move {
+                    token_state
+                        .lock()
+                        .expect("token state lock")
+                        .push(request["max_tokens"].as_u64().unwrap_or_default() as u32);
+                    model_state
+                        .lock()
+                        .expect("model state lock")
+                        .push(request["model"].as_str().unwrap_or_default().to_owned());
+                    let (content, finish_reason) = response_state
+                        .lock()
+                        .expect("response state lock")
+                        .pop_front()
+                        .expect("mock response remains");
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "mock-provider-response",
+                            "choices": [{
+                                "message": {"content": content},
+                                "finish_reason": finish_reason
+                            }],
+                            "usage": {
+                                "prompt_tokens": 10,
+                                "completion_tokens": 5,
+                                "total_tokens": 15
+                            }
+                        })),
+                    )
+                }
+            }),
+        );
+        (
+            spawn_test_ai_server(app).await,
+            requested_tokens,
+            requested_models,
+        )
+    }
+
+    async fn seed_executable_work(pool: &SqlitePool, id: &str, target_slots: &[&str]) {
+        sqlx::query("INSERT INTO repo_releases (id, repo_id, release_id, tag_name, html_url, updated_at) VALUES (?, 1, 12345, 'v1', 'https://example.test/releases/12345', CURRENT_TIMESTAMP)")
+            .bind(format!("release-row-{id}"))
+            .execute(pool)
+            .await
+            .unwrap();
+        let source_snapshot = json!({
+            "source_blocks": [{"slot": "title", "text": "A release title"}],
+            "target_slots": target_slots
+        });
+        sqlx::query("INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, created_at, updated_at) VALUES (?, 'release', '12345', 'translation', 'summary', 'zh-CN', ?, ?, 'test-model', ?, 'test-fingerprint', 'queued', 0, 0, 1, 0, '2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z')")
+            .bind(id)
+            .bind(format!("source-hash-{id}"))
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(source_snapshot.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn assert_retryable_failure(pool: &SqlitePool, work_id: &str, attempt_no: i64) {
+        let (status, failure_class, work_next_retry, lease_owner): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, failure_class, next_retry_at, lease_owner FROM content_work_items WHERE id = ?",
+        )
+        .bind(work_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let (error_code, retry_eligible, event_next_retry): (Option<String>, i64, Option<String>) =
+            sqlx::query_as(
+                "SELECT error_code, retry_eligible, next_retry_at FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_completed'",
+            )
+            .bind(work_id)
+            .bind(attempt_no)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+
+        assert_eq!(status, "failed");
+        assert_eq!(failure_class.as_deref(), error_code.as_deref());
+        assert!(work_next_retry.is_some());
+        assert_eq!(work_next_retry, event_next_retry);
+        assert_eq!(lease_owner, None);
+        assert_eq!(retry_eligible, 1);
     }
 
     async fn insert_test_work(
@@ -3110,6 +3743,284 @@ mod tests {
                 .unwrap();
         assert_eq!(batch_item_status, "failed");
         assert_eq!(batch_status, "failed");
+    }
+
+    #[tokio::test]
+    async fn execute_normalizes_wrapped_output_and_persists_declared_projection() {
+        let pool = global_execution_pool().await;
+        seed_executable_work(&pool, "wrapped-output-work", &["title_zh"]).await;
+        let base_url = spawn_sequenced_test_ai_server(vec![(
+            r#"{"output":{"title_zh":"标题","status":"ready"}}"#,
+            "stop",
+        )])
+        .await
+        .0;
+        let mut state = global_state(pool.clone());
+        Arc::get_mut(&mut state)
+            .expect("state has a single owner")
+            .config
+            .ai
+            .as_mut()
+            .expect("AI configuration")
+            .base_url = base_url;
+
+        let work = claim_next(&state, 1)
+            .await
+            .unwrap()
+            .expect("queued work should be claimed");
+        let attempt_no = work.attempt_count;
+        execute(&state, work).await.unwrap();
+
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM content_work_items WHERE id = 'wrapped-output-work'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "ready");
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload_json FROM content_result_projections WHERE work_item_id = 'wrapped-output-work'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload).unwrap(),
+            json!({"title_zh": "标题"})
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_llm_calls WHERE attempt_event_id = (SELECT id FROM content_attempt_events WHERE work_item_id = 'wrapped-output-work' AND attempt_no = ? AND event_type = 'attempt_started') AND status = 'succeeded'",
+            )
+            .bind(attempt_no)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_unknown_output_wrapper_after_provider_success() {
+        let pool = global_execution_pool().await;
+        seed_executable_work(&pool, "unknown-wrapper-work", &["title_zh"]).await;
+        let base_url = spawn_sequenced_test_ai_server(vec![(
+            r#"{"title_zh":"标题","result":{"title_zh":"错误"}}"#,
+            "stop",
+        )])
+        .await
+        .0;
+        let mut state = global_state(pool.clone());
+        Arc::get_mut(&mut state)
+            .expect("state has a single owner")
+            .config
+            .ai
+            .as_mut()
+            .expect("AI configuration")
+            .base_url = base_url;
+
+        let work = claim_next(&state, 1)
+            .await
+            .unwrap()
+            .expect("queued work should be claimed");
+        let attempt_no = work.attempt_count;
+        execute(&state, work).await.unwrap();
+
+        let (status, failure_class, error_code): (String, String, String) = sqlx::query_as(
+            "SELECT w.status, w.failure_class, e.error_code FROM content_work_items w JOIN content_attempt_events e ON e.work_item_id = w.id AND e.attempt_no = ? AND e.event_type = 'attempt_completed' WHERE w.id = 'unknown-wrapper-work'",
+        )
+        .bind(attempt_no)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(failure_class, "output_contract_invalid");
+        assert_eq!(error_code, "output_contract_invalid");
+        assert_retryable_failure(&pool, "unknown-wrapper-work", attempt_no).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_result_projections WHERE work_item_id = 'unknown-wrapper-work'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_llm_calls WHERE attempt_event_id = (SELECT id FROM content_attempt_events WHERE work_item_id = 'unknown-wrapper-work' AND attempt_no = ? AND event_type = 'attempt_started') AND status = 'succeeded'",
+            )
+            .bind(attempt_no)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn global_work_lease_renews_only_for_the_current_live_claim() {
+        let pool = global_execution_pool().await;
+        seed_executable_work(&pool, "lease-renewal-work", &["title_zh"]).await;
+        let state = global_state(pool.clone());
+        let work = claim_next(&state, 1)
+            .await
+            .unwrap()
+            .expect("queued work should be claimed");
+        let short_expiry = (Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
+        sqlx::query("UPDATE content_work_items SET lease_expires_at = ? WHERE id = ?")
+            .bind(&short_expiry)
+            .bind(&work.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(renew_global_work_lease(&state, &work).await.unwrap());
+        let renewed_expiry: String =
+            sqlx::query_scalar("SELECT lease_expires_at FROM content_work_items WHERE id = ?")
+                .bind(&work.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            parse_storage_timestamp(&renewed_expiry).unwrap()
+                > Utc::now() + chrono::Duration::minutes(4)
+        );
+
+        let expired = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        sqlx::query("UPDATE content_work_items SET lease_expires_at = ? WHERE id = ?")
+            .bind(expired)
+            .bind(&work.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!renew_global_work_lease(&state, &work).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn execute_performs_one_length_recovery_and_links_both_calls() {
+        let pool = global_execution_pool().await;
+        seed_executable_work(&pool, "length-recovery-work", &["title_zh"]).await;
+        let (base_url, requested_tokens, requested_models) = spawn_sequenced_test_ai_server(vec![
+            (r#"{"title_zh":"截断但仍是 JSON"}"#, "length"),
+            (r#"{"title_zh":"完整标题"}"#, "stop"),
+        ])
+        .await;
+        let mut state = global_state(pool.clone());
+        Arc::get_mut(&mut state)
+            .expect("state has a single owner")
+            .config
+            .ai
+            .as_mut()
+            .expect("AI configuration")
+            .base_url = base_url;
+
+        let work = claim_next(&state, 1)
+            .await
+            .unwrap()
+            .expect("queued work should be claimed");
+        let attempt_no = work.attempt_count;
+        execute(&state, work).await.unwrap();
+
+        assert_eq!(
+            *requested_tokens.lock().expect("token state lock"),
+            vec![GLOBAL_MAX_TOKENS, GLOBAL_LENGTH_RECOVERY_MAX_TOKENS]
+        );
+        let requested_models = requested_models.lock().expect("model state lock").clone();
+        assert_eq!(requested_models.len(), 2);
+        assert_eq!(requested_models[0], requested_models[1]);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_llm_calls WHERE attempt_event_id = (SELECT id FROM content_attempt_events WHERE work_item_id = 'length-recovery-work' AND attempt_no = ? AND event_type = 'attempt_started')",
+            )
+            .bind(attempt_no)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(DISTINCT provider_call_id) FROM content_attempt_llm_calls WHERE attempt_event_id = (SELECT id FROM content_attempt_events WHERE work_item_id = 'length-recovery-work' AND attempt_no = ? AND event_type = 'attempt_started')",
+            )
+            .bind(attempt_no)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            2
+        );
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM content_work_items WHERE id = 'length-recovery-work'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "ready");
+    }
+
+    #[tokio::test]
+    async fn execute_marks_second_length_response_as_bounded_truncation_failure() {
+        let pool = global_execution_pool().await;
+        seed_executable_work(&pool, "length-failure-work", &["title_zh"]).await;
+        let (base_url, requested_tokens, requested_models) = spawn_sequenced_test_ai_server(vec![
+            (r#"{"title_zh":"第一次截断"}"#, "length"),
+            (r#"{"title_zh":"第二次截断"}"#, "length"),
+        ])
+        .await;
+        let mut state = global_state(pool.clone());
+        Arc::get_mut(&mut state)
+            .expect("state has a single owner")
+            .config
+            .ai
+            .as_mut()
+            .expect("AI configuration")
+            .base_url = base_url;
+
+        let work = claim_next(&state, 1)
+            .await
+            .unwrap()
+            .expect("queued work should be claimed");
+        let attempt_no = work.attempt_count;
+        execute(&state, work).await.unwrap();
+
+        assert_eq!(
+            *requested_tokens.lock().expect("token state lock"),
+            vec![GLOBAL_MAX_TOKENS, GLOBAL_LENGTH_RECOVERY_MAX_TOKENS]
+        );
+        let requested_models = requested_models.lock().expect("model state lock").clone();
+        assert_eq!(requested_models.len(), 2);
+        assert_eq!(requested_models[0], requested_models[1]);
+        let (status, failure_class, error_code): (String, String, String) = sqlx::query_as(
+            "SELECT w.status, w.failure_class, e.error_code FROM content_work_items w JOIN content_attempt_events e ON e.work_item_id = w.id AND e.attempt_no = ? AND e.event_type = 'attempt_completed' WHERE w.id = 'length-failure-work'",
+        )
+        .bind(attempt_no)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(failure_class, "output_truncated");
+        assert_eq!(error_code, "output_truncated");
+        assert_retryable_failure(&pool, "length-failure-work", attempt_no).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_llm_calls WHERE attempt_event_id = (SELECT id FROM content_attempt_events WHERE work_item_id = 'length-failure-work' AND attempt_no = ? AND event_type = 'attempt_started')",
+            )
+            .bind(attempt_no)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_llm_calls WHERE attempt_event_id = (SELECT id FROM content_attempt_events WHERE work_item_id = 'length-failure-work' AND attempt_no = ? AND event_type = 'attempt_started') AND status = 'succeeded'",
+            )
+            .bind(attempt_no)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -4127,6 +5038,55 @@ mod tests {
     }
 
     #[test]
+    fn build_prompt_requires_direct_declared_slots() {
+        let snapshot = SourceSnapshot {
+            source_blocks: vec![],
+            target_slots: vec!["title_zh".to_owned()],
+        };
+        let (system, user) = build_prompt(&snapshot, "translation");
+        assert!(system.contains("顶层必须直接包含 target_slots"));
+        assert!(user.contains("target_slots"));
+        assert!(user.contains("response_contract"));
+        assert!(user.contains("extra scalar metadata is ignored"));
+        assert!(!user.contains("\"output\": {"));
+    }
+
+    #[test]
+    fn output_normalization_accepts_one_fence_or_envelope() {
+        let target_slots = ["title_zh".to_owned()];
+        let source_blocks = [];
+        for raw in [
+            r#"{"title_zh":"标题"}"#,
+            "```json\n{\"title_zh\":\"标题\"}\n```",
+            r#"{"output":{"title_zh":"标题"}}"#,
+        ] {
+            let output = validate_output(raw, &target_slots, &source_blocks)
+                .expect("supported output wrapper should normalize");
+            assert_eq!(output, json!({"title_zh": "标题"}));
+        }
+    }
+
+    #[test]
+    fn output_normalization_rejects_ambiguous_or_nested_envelopes() {
+        let target_slots = ["title_zh".to_owned()];
+        let source_blocks = [];
+        for raw in [
+            r#"{"title_zh":"标题","output":{"title_zh":"另一个标题"}}"#,
+            r#"{"title_zh":"第一个标题","title_zh":"第二个标题"}"#,
+            r#"{"output":{"output":{"title_zh":"标题"}}}"#,
+            r#"{"output":{"title_zh":"第一个标题","title_zh":"第二个标题"}}"#,
+            r#"{"output":{"title_zh":"标题"},"output":{"title_zh":"另一个标题"}}"#,
+            r#"{"title_zh":"标题","result":{"title_zh":"另一个标题"}}"#,
+            r#"{"title_zh":"标题","data":[]}"#,
+            r#"{"output":{"title_zh":"标题","result":{"title_zh":"另一个标题"}}}"#,
+            "```json\n{\"output\":{\"title_zh\":\"标题\"}}\n```",
+            "```json\n{\"title_zh\":\"标题\"}",
+        ] {
+            assert!(validate_output(raw, &target_slots, &source_blocks).is_err());
+        }
+    }
+
+    #[test]
     fn bodyless_detail_output_rejects_non_text_body() {
         let error = validate_output(
             r#"{"title_zh":"标题","body_md":{}}"#,
@@ -4210,5 +5170,10 @@ mod tests {
             .expect("sixth attempt remains retryable");
         assert_eq!(next, "2026-01-01T04:00:00+00:00");
         assert!(next_retry_at_for_failure(6, Some("2025-12-31T23:59:59Z"), true, now,).is_none());
+        assert!(next_retry_at_for_failure(6, Some("2026-01-01T04:00:00Z"), true, now,).is_none());
+        assert_eq!(
+            next_retry_at_for_failure(6, Some("2026-01-01T04:00:01Z"), true, now,),
+            Some("2026-01-01T04:00:00+00:00".to_owned())
+        );
     }
 }
