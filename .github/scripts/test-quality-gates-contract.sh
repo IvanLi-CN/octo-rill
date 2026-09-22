@@ -137,6 +137,29 @@ fi
 
 grep -q "review-policy.yml: trusted-source fetch drifted" "$tmp_dir/review.log"
 
+runner_repo="$tmp_dir/runner-repo"
+mkdir -p "$runner_repo"
+cp -R "$repo_root/.github" "$runner_repo/.github"
+python3 - <<'PY' "$runner_repo"
+from pathlib import Path
+import sys
+
+repo = Path(sys.argv[1])
+path = repo / ".github/workflows/ci.yml"
+text = path.read_text()
+needle = "          - os: ubuntu-24.04\n"
+if needle not in text:
+    raise SystemExit("failed to locate worktree Ubuntu matrix runner")
+path.write_text(text.replace(needle, "          - os: ubuntu-latest\n", 1))
+PY
+
+if python3 "$repo_root/.github/scripts/check_quality_gates_contract.py" --repo-root "$runner_repo" --profile final >/dev/null 2>"$tmp_dir/runner.log"; then
+  echo "expected worktree matrix runner drift to fail" >&2
+  exit 1
+fi
+
+grep -q "ci.yml.jobs.worktree-bootstrap.runs-on must use the supported Ubuntu baseline" "$tmp_dir/runner.log"
+
 python3 - <<'PY' "$repo_root" "$tmp_dir"
 from pathlib import Path
 import re

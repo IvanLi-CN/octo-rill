@@ -308,6 +308,33 @@ def expand_job_names(name: str, job: dict[str, Any], where: str) -> set[str]:
     return expanded
 
 
+def validate_runner_baseline(path: Path) -> None:
+    workflow = load_yaml(path)
+    for job_id, raw_job in workflow_jobs(workflow, path.name).items():
+        job = require_mapping(raw_job, f"{path.name}.jobs.{job_id}")
+        runs_on = job.get("runs-on")
+        if runs_on is None and "uses" in job:
+            continue
+        require(isinstance(runs_on, str) and runs_on, f"{path.name}.jobs.{job_id}.runs-on must be a non-empty string")
+
+        if runs_on == "${{ matrix.os }}":
+            combinations = static_matrix_axes(job, f"{path.name}.jobs.{job_id}")
+            require(combinations is not None, f"{path.name}.jobs.{job_id}.matrix runner values must be statically declared")
+            runner_labels = [str(item.get("os", "")) for item in combinations or []]
+            require(all(runner_labels), f"{path.name}.jobs.{job_id}.matrix runner values must declare os")
+        else:
+            runner_labels = [runs_on]
+
+        for runner_label in runner_labels:
+            if runner_label == "ubuntu-latest" or (
+                runner_label.startswith("ubuntu-")
+                and runner_label not in {"ubuntu-24.04", "ubuntu-24.04-arm"}
+            ):
+                raise ContractError(
+                    f"{path.name}.jobs.{job_id}.runs-on must use the supported Ubuntu baseline, got {runner_label!r}"
+                )
+
+
 def require_exact_named_jobs(workflow: dict[str, Any], expected_jobs: set[str], where: str) -> None:
     actual_jobs = workflow_named_job_names(workflow, where)
     require(
@@ -1311,6 +1338,15 @@ def main() -> int:
             f"quality-gates.json: implementation_profile={contract.implementation_profile!r} does not match workflow profile {profile!r}",
         )
         if profile == "final":
+            for workflow_name in (
+                "ci.yml",
+                "docs-pages.yml",
+                "label-gate.yml",
+                "release.yml",
+                "review-policy.yml",
+                "rust-source-quality.yml",
+            ):
+                validate_runner_baseline(repo_root / ".github" / "workflows" / workflow_name)
             validate_ci(repo_root / ".github" / "workflows" / "ci.yml", contract)
             if "Rust Source Quality" in contract.required_checks:
                 validate_rust_source_quality_workflow(
