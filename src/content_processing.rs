@@ -2314,15 +2314,34 @@ fn source_revision_json_from_snapshot(raw_snapshot: &str) -> String {
     .unwrap_or_else(|_| "{}".to_owned())
 }
 
+fn compare_source_revision_tiebreak(
+    candidate: Option<String>,
+    current: Option<String>,
+) -> std::cmp::Ordering {
+    match (candidate, current) {
+        (Some(candidate), Some(current)) => {
+            match (candidate.parse::<u128>(), current.parse::<u128>()) {
+                (Ok(candidate), Ok(current)) => candidate.cmp(&current),
+                _ => candidate.cmp(&current),
+            }
+        }
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
 fn source_version_is_newer(candidate_snapshot: &str, current_snapshot: &str) -> bool {
     match (
         source_observed_at(candidate_snapshot),
         source_observed_at(current_snapshot),
     ) {
         (Some(candidate), Some(current)) if candidate != current => candidate > current,
-        (Some(_), Some(_)) => source_revision_tiebreak(candidate_snapshot)
-            .cmp(&source_revision_tiebreak(current_snapshot))
-            .is_gt(),
+        (Some(_), Some(_)) => compare_source_revision_tiebreak(
+            source_revision_tiebreak(candidate_snapshot),
+            source_revision_tiebreak(current_snapshot),
+        )
+        .is_gt(),
         (Some(_), None) => true,
         (None, Some(_)) => false,
         _ => false,
@@ -6330,6 +6349,15 @@ mod tests {
         let legacy = json!({"source_blocks": [{"slot": "title", "text": "legacy"}]}).to_string();
         assert!(source_version_is_newer(&newer, &legacy));
         assert!(!source_version_is_newer(&legacy, &newer));
+        let numeric_10 = json!({
+            "source_blocks": [
+                {"slot": "source_observed_at", "text": "2026-01-01T00:00:00Z"},
+                {"slot": "source_revision_tiebreak", "text": "10"},
+            ]
+        })
+        .to_string();
+        let numeric_9 = numeric_10.replace("\"10\"", "\"9\"");
+        assert!(source_version_is_newer(&numeric_10, &numeric_9));
     }
 
     #[test]
