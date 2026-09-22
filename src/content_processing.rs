@@ -3230,12 +3230,12 @@ async fn current_source_revision_snapshot_in_transaction(
             Option<String>,
             Option<String>,
         )>(
-            "SELECT updated_at, html_url, repo_id, tag_name, name, body FROM repo_releases WHERE release_id = ? LIMIT 1",
+        "SELECT updated_at, html_url, tag_name, name, body FROM repo_releases WHERE release_id = ? LIMIT 1",
         )
         .bind(&work.canonical_resource_id)
         .fetch_optional(&mut **tx)
         .await?
-        .map(|(updated_at, html_url, repo_id, tag_name, name, body)| {
+        .map(|(updated_at, html_url, tag_name, name, body)| {
             let title = name
                 .as_deref()
                 .map(str::trim)
