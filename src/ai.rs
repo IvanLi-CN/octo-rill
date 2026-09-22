@@ -2909,7 +2909,7 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route(
 }
 
 pub type ProviderAdmissionGuard =
-    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<bool>> + Send>> + Send + Sync>;
+    Arc<dyn Fn(usize) -> Pin<Box<dyn Future<Output = Result<bool>> + Send>> + Send + Sync>;
 
 pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admission(
     state: &AppState,
@@ -3059,7 +3059,7 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
         }
 
         if let Some(provider_admission) = provider_admission.as_ref()
-            && !provider_admission().await?
+            && !provider_admission(candidate_index).await?
         {
             in_flight_guard.release_permit();
             drop(in_flight_guard);
