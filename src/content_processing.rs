@@ -3225,7 +3225,6 @@ async fn current_source_revision_snapshot_in_transaction(
         "release" => sqlx::query_as::<_, (
             String,
             String,
-            i64,
             String,
             Option<String>,
             Option<String>,
