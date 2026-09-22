@@ -35,6 +35,8 @@ The model-independent result projection has the same complete identity, includin
 | `content_request_links` | API adapter | requester/system producer, authorization snapshot, request source, delivery mode, global work item and returned response fact |
 | `content_attempt_events` | scheduler | append-only attempt number, trigger, nullable safe attempt-start configuration/route snapshots and fingerprint, state transition, safe error, retry disposition and timing |
 | `content_attempt_llm_calls` | scheduler | exact attempt-to-call relation, call identifier and safe metrics |
+| `content_work_admission_events` | scheduler | append-only admission/no-op/rejection/supersession facts, source revision, producer/requester and reason; admission facts expire after seven days |
+| `content_attempt_provider_admissions` | scheduler | exact provider-admission linearization facts for each primary or bounded recovery call |
 | `content_legacy_observations` | migration/read model | old table, old primary key, canonical resource facts where known, classification and immutable observation basis |
 | `content_identity_upgrade_control` | migration/scheduler | singleton generation, backfill phase and cursor, pause/failure state and completion facts |
 
@@ -59,6 +61,10 @@ projections; those writes remain worker-owned.
 - Each state transition and attempt event is written transactionally. The provider call may be delivered at least once through an idempotency key; result publication is exactly once in the database.
 - One content attempt may link multiple exact provider calls only for the bounded primary plus `length_recovery` sequence. There is at most one length recovery per attempt; all call links, their safe metrics, and the terminal `attempt_completed` event are committed in the same SQLite transaction. `output_contract_invalid` and `output_truncated` are stable internal error codes and follow the existing retry-window and authorized-retry rules.
 - The unique identity registry and SQLite writer transaction serialize model-independent work admission. An active item cannot gain a second concurrent manual attempt.
+- `superseded` is a strict terminal state. Admission, automatic recovery, claim and manual retry cannot reopen it; a manual retry must associate with the current source-version work item instead.
+- Work admission records `admission_accepted`, `admission_noop`, `admission_rejected_superseded`, `source_superseded` or `reconciliation_superseded` independently from attempt events. Duplicate admission facts are idempotent by work item, event type, replacement work item and source hash.
+- Each provider request has a provider-admission fact written in the same SQLite writer boundary that validates the live lease and source currentness. A source change after admission may supersede the attempt, but the provider call remains attributable and its output cannot publish or schedule old-source recovery.
+- Startup and recovery reconciliation may mark queued, failed, deferred-provider, blocked-config or ready old-source work as superseded without invoking a provider. Running work with a live lease is left to the worker's provider-admission guard.
 
 ## Identity Compatibility Schema
 

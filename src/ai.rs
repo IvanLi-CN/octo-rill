@@ -1118,6 +1118,11 @@ async fn cleanup_expired_llm_calls(state: &AppState) -> Result<u64> {
                 .execute(&state.pool)
                 .await
                 .context("delete expired llm diagnostic audits failed")?;
+            sqlx::query(r#"DELETE FROM content_work_admission_events WHERE created_at < ?"#)
+                .bind(cutoff.as_str())
+                .execute(&state.pool)
+                .await
+                .context("delete expired content admission events failed")?;
             sqlx::query(
                 r#"
                 UPDATE translation_attempt_llm_calls
@@ -11195,6 +11200,81 @@ mod tests {
             .await
             .expect("count preserved llm call");
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn admission_events_are_retained_for_seven_days_only() {
+        let state = setup_llm_state_with_ai(None).await;
+        let recent_at = chrono::Utc::now().to_rfc3339();
+        for (work_id, source_hash) in [
+            ("retention-work-old", "retention-old"),
+            ("retention-work-recent", "retention-recent"),
+        ] {
+            sqlx::query(
+                "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, created_at, updated_at) VALUES (?, 'release', ?, 'translation', 'summary', 'zh-CN', ?, 'content-processing.v1', 'test-model', '{}', 'test-fingerprint', 'ready', ?, ?)",
+            )
+            .bind(work_id)
+            .bind(work_id)
+            .bind(source_hash)
+            .bind(if work_id.ends_with("old") {
+                "2025-01-01T00:00:00Z"
+            } else {
+                recent_at.as_str()
+            })
+            .bind(if work_id.ends_with("old") {
+                "2025-01-01T00:00:00Z"
+            } else {
+                recent_at.as_str()
+            })
+            .execute(&state.pool)
+            .await
+            .expect("seed retention work");
+        }
+        sqlx::query("INSERT INTO content_work_admission_events (id, work_item_id, event_type, source_hash, created_at) VALUES ('admission-retention-old', 'retention-work-old', 'admission_accepted', 'retention-old', '2025-01-01T00:00:00Z'), ('admission-retention-recent', 'retention-work-recent', 'admission_accepted', 'retention-recent', ?)")
+            .bind(&recent_at)
+            .execute(&state.pool)
+            .await
+            .expect("seed admission retention events");
+        sqlx::query("INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, created_at) VALUES ('retention-attempt-event', 'retention-work-old', 1, 'initial', 'attempt_started', '2025-01-01T00:00:00Z')")
+            .execute(&state.pool)
+            .await
+            .expect("seed retained attempt event");
+        sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, created_at) VALUES ('retention-attempt-call', 'retention-attempt-event', 'provider-retained', 'test-model', 'succeeded', '2025-01-01T00:00:00Z')")
+            .execute(&state.pool)
+            .await
+            .expect("seed retained attempt audit");
+
+        cleanup_expired_llm_calls(state.as_ref())
+            .await
+            .expect("cleanup admission retention");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_work_admission_events WHERE id = 'admission-retention-old'",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .expect("count expired admission event"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_work_admission_events WHERE id = 'admission-retention-recent'",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .expect("count recent admission event"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_llm_calls WHERE id = 'retention-attempt-call'",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .expect("count retained attempt audit"),
+            1
+        );
     }
 
     #[tokio::test]

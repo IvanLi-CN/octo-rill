@@ -8959,6 +8959,7 @@ struct AnnouncementDetailSource {
     body: Option<String>,
     html_url: String,
     occurred_at: Option<String>,
+    source_revision: Option<String>,
     actor: Option<FeedActor>,
 }
 
@@ -9123,6 +9124,7 @@ async fn fetch_announcement_detail_source_from_db(
         html_url: row.html_url.unwrap_or_else(|| {
             format!("https://github.com/{owner}/{repo}/discussions/{discussion_number}")
         }),
+        source_revision: row.occurred_at.clone(),
         occurred_at: row.occurred_at,
         actor: row.actor_login.map(|login| FeedActor {
             login,
@@ -9249,6 +9251,10 @@ async fn fetch_live_announcement_detail_request(
         title: discussion.title,
         body: discussion.body,
         html_url: discussion.url,
+        source_revision: discussion
+            .updated_at
+            .clone()
+            .or(discussion.created_at.clone()),
         occurred_at: discussion.updated_at.or(discussion.created_at),
         actor: discussion.author.and_then(|author| {
             let login = author.login?.trim().to_owned();
@@ -20113,6 +20119,7 @@ struct GlobalReleaseSourceRow {
     tag_name: String,
     name: Option<String>,
     body: Option<String>,
+    updated_at: String,
 }
 
 fn global_source_hash_from_fields(
@@ -20163,14 +20170,25 @@ fn global_source_hash_from_fields(
     })
 }
 
-fn with_source_observed_at(
+fn with_source_revision(
     mut source_blocks: Vec<translations::TranslationSourceBlock>,
+    revision: Option<&str>,
+    revision_tiebreak: Option<&str>,
 ) -> Vec<translations::TranslationSourceBlock> {
+    if let Some(revision_tiebreak) = revision_tiebreak {
+        source_blocks.insert(
+            0,
+            translations::TranslationSourceBlock {
+                slot: "source_revision_tiebreak".to_owned(),
+                text: revision_tiebreak.to_owned(),
+            },
+        );
+    }
     source_blocks.insert(
         0,
         translations::TranslationSourceBlock {
             slot: "source_observed_at".to_owned(),
-            text: Utc::now().to_rfc3339(),
+            text: revision.unwrap_or("1970-01-01T00:00:00Z").to_owned(),
         },
     );
     source_blocks
@@ -20228,7 +20246,7 @@ pub(crate) async fn global_release_request_item(
 ) -> Result<translations::TranslationRequestItemInput, ApiError> {
     let row = sqlx::query_as::<_, GlobalReleaseSourceRow>(
         r#"
-        SELECT r.repo_id, sr.repo_id AS starred_repo_id, r.html_url, r.tag_name, r.name, r.body
+        SELECT r.repo_id, sr.repo_id AS starred_repo_id, r.html_url, r.tag_name, r.name, r.body, r.updated_at
         FROM repo_releases r
         LEFT JOIN user_release_visible_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
@@ -20301,7 +20319,11 @@ pub(crate) async fn global_release_request_item(
         entity_id: release_id.to_string(),
         target_lang: "zh-CN".to_owned(),
         max_wait_ms: 60_000,
-        source_blocks: with_source_observed_at(source_blocks),
+        source_blocks: with_source_revision(
+            source_blocks,
+            Some(row.updated_at.as_str()),
+            Some(release_id.to_string().as_str()),
+        ),
         target_slots,
     })
 }
@@ -20348,7 +20370,7 @@ async fn global_notification_request_item(
         ));
     }
     let row = sqlx::query_as::<_, NotificationBatchSourceRow>(
-        "SELECT thread_id, repo_full_name, subject_title, reason, subject_type FROM notifications WHERE thread_id = ? ORDER BY COALESCE(repo_full_name, ''), COALESCE(subject_title, ''), COALESCE(subject_type, ''), id LIMIT 1",
+        "SELECT thread_id, repo_full_name, subject_title, reason, subject_type, updated_at FROM notifications WHERE thread_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
     )
     .bind(thread_id)
     .fetch_optional(&state.pool)
@@ -20360,6 +20382,7 @@ async fn global_notification_request_item(
         .unwrap_or_else(|| "(unknown repo)".to_owned());
     let title = row.subject_title.unwrap_or_else(|| "(no title)".to_owned());
     let subject_type = row.subject_type.unwrap_or_default();
+    let source_revision_tiebreak = row.thread_id.clone();
     Ok(translations::TranslationRequestItemInput {
         producer_ref: "api.translate_notification".to_owned(),
         kind: "notification".to_owned(),
@@ -20367,11 +20390,11 @@ async fn global_notification_request_item(
         entity_id: row.thread_id,
         target_lang: "zh-CN".to_owned(),
         max_wait_ms: 60_000,
-        source_blocks: with_source_observed_at(global_notification_source_blocks(
-            &repo,
-            &title,
-            &subject_type,
-        )),
+        source_blocks: with_source_revision(
+            global_notification_source_blocks(&repo, &title, &subject_type),
+            row.updated_at.as_deref(),
+            Some(source_revision_tiebreak.as_str()),
+        ),
         target_slots: vec!["title_zh".to_owned(), "summary_md".to_owned()],
     })
 }
@@ -20476,6 +20499,7 @@ async fn global_announcement_request_item(
 ) -> Result<translations::TranslationRequestItemInput, ApiError> {
     let source =
         resolve_announcement_detail_source_for_user(state, user_id, discussion_key).await?;
+    let source_revision = source.source_revision.clone();
     let body = source.body.unwrap_or_default().replace("\r\n", "\n");
     let has_body = !body.trim().is_empty();
     let mut source_blocks = vec![
@@ -20514,7 +20538,11 @@ async fn global_announcement_request_item(
         ),
         target_lang: "zh-CN".to_owned(),
         max_wait_ms: 60_000,
-        source_blocks: with_source_observed_at(source_blocks),
+        source_blocks: with_source_revision(
+            source_blocks,
+            source_revision.as_deref(),
+            Some(discussion_key),
+        ),
         target_slots: if kind.ends_with("_smart") {
             vec!["title_zh".to_owned(), "summary_md".to_owned()]
         } else if !has_body {
@@ -24630,6 +24658,7 @@ struct NotificationBatchSourceRow {
     subject_title: Option<String>,
     reason: Option<String>,
     subject_type: Option<String>,
+    updated_at: Option<String>,
 }
 
 async fn translate_notifications_batch_internal(
