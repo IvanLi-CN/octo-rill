@@ -1376,7 +1376,7 @@ fn source_records_sql(
                     WHERE latest.kind = 'announcement'
                       AND lower(latest.repo_full_name) = lower(e.repo_full_name)
                       AND latest.discussion_number = e.discussion_number
-                    ORDER BY latest.occurred_at DESC, COALESCE(latest.title, '') DESC, latest.rowid DESC
+                    ORDER BY latest.occurred_at DESC, lower(COALESCE(latest.repo_full_name, '')) DESC, latest.discussion_number DESC, COALESCE(latest.title, '') DESC, COALESCE(latest.body, '') DESC, latest.rowid DESC
                     LIMIT 1
                   )
             )"
@@ -1385,7 +1385,18 @@ fn source_records_sql(
         CollectionRecordKind::Notification => {
             let window = source_window_sql("n.updated_at", from, before, binds);
             format!(
-                "raw_source_records AS (
+                "ranked_notifications AS (
+                SELECT
+                    n.*,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY n.thread_id
+                      ORDER BY n.updated_at DESC, COALESCE(n.repo_full_name, '') DESC,
+                        COALESCE(n.subject_title, '') DESC, COALESCE(n.reason, '') DESC,
+                        COALESCE(n.subject_type, '') DESC, n.id DESC
+                    ) AS source_rank
+                FROM notifications n
+            ),
+            raw_source_records AS (
                 SELECT
                     n.thread_id AS id,
                     n.repo_full_name AS repository,
@@ -1394,15 +1405,9 @@ fn source_records_sql(
                     n.updated_at AS occurred_at,
                     NULL AS detected_at,
                     NULL AS generated_at
-                FROM notifications n
+                FROM ranked_notifications n
                 WHERE {window}
-                  AND NOT EXISTS (
-                    SELECT 1
-                    FROM notifications newer
-                    WHERE newer.thread_id = n.thread_id
-                      AND (newer.updated_at > n.updated_at
-                        OR (newer.updated_at = n.updated_at AND newer.id > n.id))
-                  )
+                  AND n.source_rank = 1
             )"
             )
         }
@@ -1462,7 +1467,7 @@ fn activity_source_ctes(kind: CollectionRecordKind) -> String {
                     WHERE latest.kind = 'announcement'
                       AND lower(latest.repo_full_name) = lower(e.repo_full_name)
                       AND latest.discussion_number = e.discussion_number
-                    ORDER BY latest.occurred_at DESC, COALESCE(latest.title, '') DESC, latest.rowid DESC
+                    ORDER BY latest.occurred_at DESC, lower(COALESCE(latest.repo_full_name, '')) DESC, latest.discussion_number DESC, COALESCE(latest.title, '') DESC, COALESCE(latest.body, '') DESC, latest.rowid DESC
                     LIMIT 1
                 )
             ),
@@ -1478,21 +1483,26 @@ fn activity_source_ctes(kind: CollectionRecordKind) -> String {
             )"
         .to_owned(),
         CollectionRecordKind::Notification => "bounded_source_records AS MATERIALIZED (
+                WITH ranked_notifications AS (
+                  SELECT
+                    n.*,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY n.thread_id
+                      ORDER BY n.updated_at DESC, COALESCE(n.repo_full_name, '') DESC,
+                        COALESCE(n.subject_title, '') DESC, COALESCE(n.reason, '') DESC,
+                        COALESCE(n.subject_type, '') DESC, n.id DESC
+                    ) AS source_rank
+                  FROM notifications n
+                )
                 SELECT
                     n.thread_id AS id,
                     n.repo_full_name AS repository,
                     COALESCE(NULLIF(n.subject_title, ''), '通知') AS title,
                     n.updated_at AS source_time
-                FROM notifications n
+                FROM ranked_notifications n
                 WHERE julianday(n.updated_at) >= julianday(?)
                   AND julianday(n.updated_at) < julianday(?)
-                  AND NOT EXISTS (
-                    SELECT 1
-                    FROM notifications newer
-                    WHERE newer.thread_id = n.thread_id
-                      AND (newer.updated_at > n.updated_at
-                        OR (newer.updated_at = n.updated_at AND newer.id > n.id))
-                  )
+                  AND n.source_rank = 1
             )"
         .to_owned(),
         CollectionRecordKind::Brief => "bounded_source_records AS MATERIALIZED (
@@ -2614,10 +2624,10 @@ async fn load_source_record(
             "SELECT CAST(r.release_id AS TEXT) AS id, COALESCE((SELECT wi.repo_full_name FROM repo_release_work_items wi WHERE wi.repo_id = r.repo_id LIMIT 1), '仓库 #' || CAST(r.repo_id AS TEXT)) AS repository, COALESCE(NULLIF(r.name, ''), r.tag_name) AS title, COALESCE(r.published_at, r.created_at, r.updated_at) AS occurred_at, r.detected_at, NULL AS generated_at FROM repo_releases r WHERE r.release_id = ? LIMIT 1"
         }
         CollectionRecordKind::Announcement => {
-            "WITH ranked_announcements AS (SELECT e.*, ROW_NUMBER() OVER (PARTITION BY lower(e.repo_full_name), e.discussion_number ORDER BY e.occurred_at DESC, COALESCE(e.title, '') DESC, e.rowid DESC) AS source_rank FROM social_activity_events e WHERE e.kind = 'announcement' AND lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) = ?) SELECT lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id, e.repo_full_name AS repository, COALESCE(NULLIF(e.title, ''), '公告') AS title, e.occurred_at, e.detected_at, NULL AS generated_at FROM ranked_announcements e WHERE e.source_rank = 1 LIMIT 1"
+            "WITH ranked_announcements AS (SELECT e.*, ROW_NUMBER() OVER (PARTITION BY lower(e.repo_full_name), e.discussion_number ORDER BY e.occurred_at DESC, lower(COALESCE(e.repo_full_name, '')) DESC, e.discussion_number DESC, COALESCE(e.title, '') DESC, COALESCE(e.body, '') DESC, e.rowid DESC) AS source_rank FROM social_activity_events e WHERE e.kind = 'announcement' AND lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) = ?) SELECT lower(e.repo_full_name) || '#' || CAST(e.discussion_number AS TEXT) AS id, e.repo_full_name AS repository, COALESCE(NULLIF(e.title, ''), '公告') AS title, e.occurred_at, e.detected_at, NULL AS generated_at FROM ranked_announcements e WHERE e.source_rank = 1 LIMIT 1"
         }
         CollectionRecordKind::Notification => {
-            "WITH ranked_notifications AS (SELECT n.*, ROW_NUMBER() OVER (PARTITION BY n.thread_id ORDER BY n.updated_at DESC, COALESCE(n.repo_full_name, '') DESC, COALESCE(n.subject_title, '') DESC, COALESCE(n.reason, '') DESC, COALESCE(n.subject_type, '') DESC, n.thread_id DESC) AS source_rank FROM notifications n WHERE n.thread_id = ?) SELECT n.thread_id AS id, n.repo_full_name AS repository, COALESCE(NULLIF(n.subject_title, ''), '通知') AS title, n.updated_at AS occurred_at, NULL AS detected_at, NULL AS generated_at FROM ranked_notifications n WHERE n.source_rank = 1 LIMIT 1"
+            "WITH ranked_notifications AS (SELECT n.*, ROW_NUMBER() OVER (PARTITION BY n.thread_id ORDER BY n.updated_at DESC, COALESCE(n.repo_full_name, '') DESC, COALESCE(n.subject_title, '') DESC, COALESCE(n.reason, '') DESC, COALESCE(n.subject_type, '') DESC, n.id DESC) AS source_rank FROM notifications n WHERE n.thread_id = ?) SELECT n.thread_id AS id, n.repo_full_name AS repository, COALESCE(NULLIF(n.subject_title, ''), '通知') AS title, n.updated_at AS occurred_at, NULL AS detected_at, NULL AS generated_at FROM ranked_notifications n WHERE n.source_rank = 1 LIMIT 1"
         }
         CollectionRecordKind::Brief => {
             "SELECT b.id, NULL AS repository, b.date AS title, NULL AS occurred_at, NULL AS detected_at, b.created_at AS generated_at FROM briefs b WHERE b.id = ? LIMIT 1"
@@ -3418,7 +3428,7 @@ mod tests {
     async fn announcement_and_brief_use_source_time_for_window() {
         let pool = test_pool().await;
         sqlx::query(
-            "CREATE TABLE social_activity_events (repo_full_name TEXT, discussion_number INTEGER, title TEXT, occurred_at TEXT, detected_at TEXT, kind TEXT)",
+            "CREATE TABLE social_activity_events (repo_full_name TEXT, discussion_number INTEGER, title TEXT, body TEXT, occurred_at TEXT, detected_at TEXT, kind TEXT)",
         )
         .execute(&pool)
             .await
@@ -3495,7 +3505,7 @@ mod tests {
     async fn announcement_window_filters_after_canonicalization() {
         let pool = test_pool().await;
         sqlx::query(
-            "CREATE TABLE social_activity_events (repo_full_name TEXT, discussion_number INTEGER, title TEXT, occurred_at TEXT, detected_at TEXT, kind TEXT)",
+            "CREATE TABLE social_activity_events (repo_full_name TEXT, discussion_number INTEGER, title TEXT, body TEXT, occurred_at TEXT, detected_at TEXT, kind TEXT)",
         )
         .execute(&pool)
         .await
@@ -4464,7 +4474,7 @@ mod tests {
 
         sqlx::query(
             "CREATE TABLE social_activity_events (
-                repo_full_name TEXT, discussion_number INTEGER, title TEXT,
+                repo_full_name TEXT, discussion_number INTEGER, title TEXT, body TEXT,
                 occurred_at TEXT, detected_at TEXT, kind TEXT
             )",
         )
@@ -4473,11 +4483,11 @@ mod tests {
         .expect("create activity announcements");
         sqlx::query(
             "INSERT INTO social_activity_events VALUES
-                ('octo/announce', 42, 'Announcement', '2026-07-08T08:40:00Z', NULL, 'announcement'),
-                ('octo/announce', 42, 'Zulu title', '2026-07-08T09:10:00Z', NULL, 'announcement'),
-                ('octo/announce', 42, 'Alpha title tie-break', '2026-07-08T09:10:00Z', NULL, 'announcement'),
-                ('octo/announce', 43, 'Older in window', '2026-07-08T09:00:00Z', NULL, 'announcement'),
-                ('octo/announce', 43, 'Canonical outside window', '2026-07-08T10:01:00Z', NULL, 'announcement')",
+                ('octo/announce', 42, 'Announcement', NULL, '2026-07-08T08:40:00Z', NULL, 'announcement'),
+                ('octo/announce', 42, 'Zulu title', NULL, '2026-07-08T09:10:00Z', NULL, 'announcement'),
+                ('octo/announce', 42, 'Alpha title tie-break', NULL, '2026-07-08T09:10:00Z', NULL, 'announcement'),
+                ('octo/announce', 43, 'Older in window', NULL, '2026-07-08T09:00:00Z', NULL, 'announcement'),
+                ('octo/announce', 43, 'Canonical outside window', NULL, '2026-07-08T10:01:00Z', NULL, 'announcement')",
         )
         .execute(&pool)
         .await
@@ -4752,6 +4762,7 @@ mod tests {
                 repo_full_name TEXT,
                 discussion_number INTEGER,
                 title TEXT,
+                body TEXT,
                 occurred_at TEXT,
                 detected_at TEXT,
                 kind TEXT
@@ -4781,6 +4792,8 @@ mod tests {
                 thread_id TEXT NOT NULL,
                 repo_full_name TEXT,
                 subject_title TEXT,
+                reason TEXT,
+                subject_type TEXT,
                 updated_at TEXT
             )",
         )

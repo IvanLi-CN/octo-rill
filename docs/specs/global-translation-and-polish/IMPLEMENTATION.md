@@ -135,7 +135,13 @@ upgraded to the first authoritative upstream revision; a revision-bearing
 worker fails closed when the live source has no usable revision.
 Release and announcement canonical content tuples provide the stable tie-break
 domain when the upstream timestamp is equal, and the same tuple is recomputed
-from the stored canonical source during provider admission. Route fallback
+from the stored canonical source during provider admission. Announcement
+snapshots normalize their `repo#discussion_number` key before both persistence
+and live comparison. Notification synchronization and admin/API canonical reads
+use the same timestamp, repository, title, reason and subject-type ordering;
+equal source tuples are idempotent. A release revision is authoritative only
+after upstream synchronization has recorded a `detected_at` distinct from its
+upstream `updated_at`; legacy ingest timestamps fail closed. Route fallback
 provider admissions retain the `fallback` relation role for audit consumers.
 An admission rejected after its diagnostic row is created finalizes that row as
 a transient failed call rather than leaving a running diagnostic behind. If a

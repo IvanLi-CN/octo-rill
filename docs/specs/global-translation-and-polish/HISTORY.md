@@ -16,3 +16,4 @@
 - Model-specific global work and projection rows are reconciled to model-independent identities without discarding attempt, model-call or requester-link history. The latest published valid projection is the current result; existing blocked work is requeued only when no matching valid projection exists.
 - The model-independent identity upgrade is separate from the already completed global cutover: its compatibility release adds schema only, and its later identity cutover adds no new migration.
 - Provider admission is now a terminal boundary for persisted diagnostic calls: both an explicit rejection and an admission-check failure finalize the call as transient before returning, so no provider request or dangling `running` diagnostic remains.
+- Source revision ties are resolved consistently across synchronization, API, scheduler and admin reads; legacy release ingest timestamps remain non-authoritative until upstream revision metadata is available.

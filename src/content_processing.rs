@@ -3217,6 +3217,29 @@ pub(crate) fn source_revision_content_tiebreak(parts: &[&str]) -> String {
     parts.join("\n")
 }
 
+pub(crate) fn announcement_source_revision_tiebreak(
+    repo_full_name: &str,
+    discussion_number: i64,
+    title: &str,
+    body: &str,
+) -> String {
+    let discussion_key = format!(
+        "{}#{discussion_number}",
+        repo_full_name.trim().to_ascii_lowercase()
+    );
+    source_revision_content_tiebreak(&[discussion_key.as_str(), title, body])
+}
+
+pub(crate) fn authoritative_release_revision<'a>(
+    updated_at: &'a str,
+    detected_at: Option<&str>,
+) -> Option<&'a str> {
+    let updated_at = updated_at.trim();
+    detected_at
+        .filter(|detected_at| !detected_at.trim().is_empty() && *detected_at != updated_at)
+        .and((!updated_at.is_empty()).then_some(updated_at))
+}
+
 async fn current_source_revision_snapshot_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     work: &WorkRow,
@@ -3224,17 +3247,18 @@ async fn current_source_revision_snapshot_in_transaction(
     let revision = match work.canonical_resource_type.as_str() {
         "release" => sqlx::query_as::<_, (
             String,
+            Option<String>,
             String,
             String,
             Option<String>,
             Option<String>,
         )>(
-        "SELECT updated_at, html_url, tag_name, name, body FROM repo_releases WHERE release_id = ? LIMIT 1",
+        "SELECT updated_at, detected_at, html_url, tag_name, name, body FROM repo_releases WHERE release_id = ? LIMIT 1",
         )
         .bind(&work.canonical_resource_id)
         .fetch_optional(&mut **tx)
         .await?
-        .map(|(updated_at, html_url, tag_name, name, body)| {
+        .map(|(updated_at, detected_at, html_url, tag_name, name, body)| {
             let title = name
                 .as_deref()
                 .map(str::trim)
@@ -3242,11 +3266,8 @@ async fn current_source_revision_snapshot_in_transaction(
                 .unwrap_or(tag_name.as_str());
             let body = body.unwrap_or_default().replace("\r\n", "\n");
             (
-                if updated_at.trim().is_empty() {
-                    None
-                } else {
-                    Some(updated_at)
-                },
+                authoritative_release_revision(&updated_at, detected_at.as_deref())
+                    .map(str::to_owned),
                 source_revision_content_tiebreak(&[
                     html_url.as_str(),
                     tag_name.as_str(),
@@ -3263,7 +3284,7 @@ async fn current_source_revision_snapshot_in_transaction(
             Option<String>,
             Option<String>,
         )>(
-            "SELECT updated_at, thread_id, repo_full_name, subject_title, reason, subject_type FROM notifications WHERE thread_id = ? ORDER BY updated_at DESC, COALESCE(repo_full_name, '') DESC, COALESCE(subject_title, '') DESC, COALESCE(reason, '') DESC, COALESCE(subject_type, '') DESC, thread_id DESC LIMIT 1",
+            "SELECT updated_at, thread_id, repo_full_name, subject_title, reason, subject_type FROM notifications WHERE thread_id = ? ORDER BY updated_at DESC, COALESCE(repo_full_name, '') DESC, COALESCE(subject_title, '') DESC, COALESCE(reason, '') DESC, COALESCE(subject_type, '') DESC, id DESC LIMIT 1",
         )
         .bind(&work.canonical_resource_id)
         .fetch_optional(&mut **tx)
@@ -3293,16 +3314,16 @@ async fn current_source_revision_snapshot_in_transaction(
             .fetch_optional(&mut **tx)
             .await?
             .map(|(occurred_at, repo_full_name, discussion_number, title, body)| {
-                let discussion_key = format!("{repo_full_name}#{discussion_number}");
                 let title = title.unwrap_or_else(|| format!("Discussion #{discussion_number}"));
                 let body = body.unwrap_or_default();
                 (
                     occurred_at,
-                    source_revision_content_tiebreak(&[
-                        discussion_key.as_str(),
+                    announcement_source_revision_tiebreak(
+                        repo_full_name.as_str(),
+                        discussion_number,
                         title.as_str(),
                         body.as_str(),
-                    ]),
+                    ),
                 )
             })
         }
@@ -4405,7 +4426,7 @@ mod tests {
     }
 
     async fn seed_executable_work(pool: &SqlitePool, id: &str, target_slots: &[&str]) {
-        sqlx::query("INSERT INTO repo_releases (id, repo_id, release_id, tag_name, html_url, updated_at) VALUES (?, 1, 12345, 'v1', 'https://example.test/releases/12345', CURRENT_TIMESTAMP)")
+        sqlx::query("INSERT INTO repo_releases (id, repo_id, release_id, tag_name, html_url, detected_at, updated_at) VALUES (?, 1, 12345, 'v1', 'https://example.test/releases/12345', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
             .bind(format!("release-row-{id}"))
             .execute(pool)
             .await
@@ -6633,6 +6654,26 @@ mod tests {
         .to_string();
         let numeric_9 = numeric_10.replace("\"10\"", "\"9\"");
         assert!(source_version_is_newer(&numeric_10, &numeric_9));
+    }
+
+    #[test]
+    fn canonical_source_revision_helpers_use_authoritative_shapes() {
+        assert_eq!(
+            announcement_source_revision_tiebreak("Octo/Demo", 42, "Title", "Body"),
+            "octo/demo#42\nTitle\nBody"
+        );
+        assert_eq!(
+            authoritative_release_revision("2026-01-01T00:00:00Z", Some("2026-01-01T00:00:01Z")),
+            Some("2026-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            authoritative_release_revision("2026-01-01T00:00:00Z", Some("2026-01-01T00:00:00Z")),
+            None
+        );
+        assert_eq!(
+            authoritative_release_revision("2026-01-01T00:00:00Z", None),
+            None
+        );
     }
 
     #[test]
