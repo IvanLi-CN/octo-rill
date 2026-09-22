@@ -25,7 +25,7 @@
 
 ## Existing Database Migration
 
-当前实现使用迁移 `0078_content_processing_global_model.sql` 和追加迁移 `0079_admin_collection_read_budget_indexes.sql` 创建全局表、索引和控制记录：
+当前实现使用迁移 `0078_content_processing_global_model.sql` 和追加迁移 `0079_admin_collection_read_budget_indexes.sql` 创建全局表、索引和控制记录；内容准入审计由追加迁移 `0086_content_work_admission_events.sql` 提供：
 
 - `content_processing_control`：单行模式栅栏，取值为 `legacy`、`rollback_freeze` 或 `global`；记录切换代号和更新时间。它是旧新写入者共同读取的唯一切换事实。
 - `content_work_items`：包含全局身份、不可变来源快照、工作级配置指纹、优先级、调度状态、租约关联、恢复元数据和取消／替代关系。当前唯一索引仍包含 `model_profile`，这与新批准的身份合同不一致。
@@ -118,6 +118,31 @@ SQLx 默认会校验数据库中每一个已应用迁移是否存在于当前二
 ## Failure Finalization
 
 Provider and output-validation failures finalize the failed call link, work item, batch item, batch, and `attempt_completed` event in the same SQLite transaction. The regression test `content_processing::tests::execute_persists_failure_finalization_atomically` drives this path with a local mock provider and verifies that the terminal state and audit records persist together while the worker lease is cleared.
+
+## Content Work Admission and Supersession
+
+Migration `0086_content_work_admission_events.sql` adds append-only work
+admission facts and per-attempt provider-admission facts without rewriting
+existing work, attempt, call or result history. Global source adapters place an
+authoritative source revision timestamp and tie-break value in the frozen
+source snapshot; revision metadata is excluded from `source_hash`.
+
+The scheduler serializes source admission, claim and provider admission through
+the SQLite writer. Repeated same-source submission is an idempotent no-op;
+older source revisions are retained as `superseded` and their requests point to
+the current work. A superseded work item cannot be reopened by admission,
+automatic recovery, claim or manual retry. Before every primary or bounded
+length-recovery provider request, the worker validates the live lease, source
+existence and source currentness, then records a provider-admission fact. A
+source replacement after that fact may finish the provider call, but the call
+audit remains linked while the attempt is finalized as `superseded` without
+publishing output or scheduling retry.
+
+Startup and recovery reconciliation close queued, failed, deferred-provider,
+blocked-config and ready stale work without provider calls; running work with a
+live lease is left to the worker guard. Admission events are retained for seven
+days by the existing LLM diagnostic cleanup path, while attempt/provider-call
+audit retention remains unchanged.
 
 ## Global Output Contract
 
