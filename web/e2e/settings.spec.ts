@@ -614,6 +614,28 @@ test("settings deep link focuses github pat section", async ({ page }) => {
 	await expect(page.getByText("@storybook-ops", { exact: true })).toBeVisible();
 });
 
+test("settings github pat save button shows a fixed scan icon while checking", async ({
+	page,
+}) => {
+	await installSettingsMocks(page);
+
+	await page.goto("/settings?section=github-pat");
+
+	const input = page.locator("#settings-reaction-pat");
+	const saveButton = page.getByRole("button", { name: "保存 GitHub PAT" });
+	await input.fill("ghp_waiting_token_1234");
+
+	const validationIcon = saveButton.locator("[data-pat-validation-icon]");
+	await expect(saveButton).toBeDisabled();
+	await expect(saveButton).toHaveAttribute("aria-busy", "true");
+	await expect(validationIcon).toBeVisible();
+	await expect(validationIcon).toHaveCSS("width", "18px");
+	await expect(validationIcon).toHaveCSS("height", "18px");
+	await expect(
+		validationIcon.locator("[data-pat-validation-beam]"),
+	).toBeAttached();
+});
+
 test("settings github pat section does not fetch plaintext api keys", async ({
 	page,
 }) => {
