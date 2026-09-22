@@ -109,6 +109,7 @@ grep -q "review-policy.yml: trusted-source fetch drifted" "$tmp_dir/review.log"
 
 python3 - <<'PY' "$repo_root" "$tmp_dir"
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -161,6 +162,17 @@ for workflow, expected, replacement, failure in cases:
     if failure not in result.stderr:
         raise SystemExit(f"missing {workflow} concurrency drift assertion: {result.stderr}")
 
+def replace_in_job(text, job_id, expected, replacement):
+    marker = f"  {job_id}:\n"
+    start = text.index(marker)
+    next_job = re.search(r"\n  [A-Za-z0-9_-]+:\n", text[start + len(marker) :])
+    end = len(text) if next_job is None else start + len(marker) + next_job.start()
+    block = text[start:end]
+    if expected not in block:
+        raise SystemExit(f"failed to locate {job_id} checkout ref")
+    return text[:start] + block.replace(expected, replacement, 1) + text[end:]
+
+
 workflow_cases = (
     (
         "build-needs",
@@ -201,10 +213,11 @@ workflow_cases = (
     ),
     (
         "acceptance-checkout-ref",
-        lambda text: text.replace(
+        lambda text: replace_in_job(
+            text,
+            "lint",
             "          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ci_performance_acceptance && inputs.ci_performance_target_sha || github.sha }}\n",
             "          ref: ${{ github.sha }}\n",
-            1,
         ),
         "ci.yml.jobs.lint: controlled checkout ref drifted",
     ),

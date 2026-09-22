@@ -3,6 +3,7 @@ Thumbs.db
 
 # Rust
 /target/
+/tools/rust-source-check/target/
 **/*.rs.bk
 
 # Environment

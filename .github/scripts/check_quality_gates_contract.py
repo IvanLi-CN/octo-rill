@@ -681,8 +681,12 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
         "DATABASE_URL=sqlite::memory:",
         "OCTORILL_ENCRYPTION_KEY_BASE64",
         "/api/health",
+        "/api/version",
+        "id=\"root\"",
         "jq -e",
         ".ok == true and .version == $version",
+        ".source != null",
+        "docker stop --time 10",
         "docker rm -f",
         "rm -rf",
     ):
@@ -837,6 +841,66 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
         and "test-ci-performance-acceptance.sh" in run
         and "test-live-quality-gates.sh" in run,
         "ci.yml.jobs.lint: self-tests step drifted",
+    )
+
+
+def validate_rust_source_quality_workflow(path: Path, contract: ContractModel) -> None:
+    workflow = load_yaml(path)
+    workflow_name = workflow.get("name")
+    require(workflow_name == "Rust Source Quality", "rust-source-quality.yml: workflow name drifted")
+    expected_jobs = set(contract.expected_workflows.get(workflow_name, ()))
+    require(
+        expected_jobs == {"Rust Source Quality"},
+        "quality-gates.json: Rust Source Quality workflow declaration drifted",
+    )
+    require_exact_named_jobs(workflow, expected_jobs, "rust-source-quality.yml")
+
+    push_config = event_config(workflow, "push", "rust-source-quality.yml")
+    assert_event_branches(push_config, {"main"}, "rust-source-quality.yml.on.push")
+    pull_request_config = event_config(workflow, "pull_request", "rust-source-quality.yml")
+    assert_event_branches(pull_request_config, {"main"}, "rust-source-quality.yml.on.pull_request")
+    assert_event_types(
+        pull_request_config,
+        CI_PULL_REQUEST_TYPES,
+        "rust-source-quality.yml.on.pull_request",
+    )
+    merge_group_config = event_config(workflow, "merge_group", "rust-source-quality.yml")
+    assert_event_types(merge_group_config, {"checks_requested"}, "rust-source-quality.yml.on.merge_group")
+    assert_concurrency_contract(
+        workflow,
+        "rust-source-quality-${{ github.event_name == 'pull_request' && github.event.action == 'edited' && format('metadata-{0}', github.run_id) || github.ref }}",
+        "${{ github.event_name == 'pull_request' }}",
+        "rust-source-quality.yml",
+    )
+
+    permissions = require_mapping(workflow.get("permissions"), "rust-source-quality.yml.permissions")
+    require(permissions.get("contents") == "read", "rust-source-quality.yml.permissions.contents must stay read")
+    require("statuses" not in permissions, "rust-source-quality.yml.permissions.statuses must stay unset")
+
+    job = named_job_config(
+        workflow,
+        "rust-source-quality",
+        expected_jobs,
+        "rust-source-quality.yml",
+    )
+    require_no_if(job, "rust-source-quality.yml.jobs.rust-source-quality")
+    require_fail_closed(job, "rust-source-quality.yml.jobs.rust-source-quality")
+    source_step = step_config(
+        job,
+        "Run Rust source-quality contract",
+        "rust-source-quality.yml.jobs.rust-source-quality",
+    )
+    require_no_if(
+        source_step,
+        "rust-source-quality.yml.jobs.rust-source-quality.steps['Run Rust source-quality contract']",
+    )
+    require_fail_closed(
+        source_step,
+        "rust-source-quality.yml.jobs.rust-source-quality.steps['Run Rust source-quality contract']",
+    )
+    require(
+        "bash ./scripts/check-rust-source-quality.sh" in str(source_step.get("run", "")),
+        "rust-source-quality.yml: source-quality step drifted",
     )
 
 
@@ -1244,6 +1308,11 @@ def main() -> int:
         )
         if profile == "final":
             validate_ci(repo_root / ".github" / "workflows" / "ci.yml", contract)
+            if "Rust Source Quality" in contract.required_checks:
+                validate_rust_source_quality_workflow(
+                    repo_root / ".github" / "workflows" / "rust-source-quality.yml",
+                    contract,
+                )
             validate_label_gate(repo_root / ".github" / "workflows" / "label-gate.yml", contract)
             validate_review_policy(repo_root / ".github" / "workflows" / "review-policy.yml", contract)
         else:
