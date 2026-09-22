@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout trusted base
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.ref }}
           fetch-depth: 1
@@ -30,14 +30,13 @@ jobs:
           persist-credentials: false
 
       - name: Checkout candidate pull request
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
           path: candidate
           persist-credentials: false
-          allow-unsafe-pr-checkout: true
 
       - name: Validate trusted label-gate contract
         run: |
