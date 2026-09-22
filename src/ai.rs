@@ -1114,14 +1114,19 @@ async fn cleanup_expired_llm_calls(state: &AppState) -> Result<u64> {
     match state
         .sqlite_writer
         .try_write("llm_call_retention_cleanup", || async {
+            let mut tx = state
+                .pool
+                .begin()
+                .await
+                .context("begin llm retention cleanup transaction failed")?;
             sqlx::query(r#"DELETE FROM llm_diagnostic_access_audit WHERE created_at < ?"#)
                 .bind(cutoff.as_str())
-                .execute(&state.pool)
+                .execute(&mut *tx)
                 .await
                 .context("delete expired llm diagnostic audits failed")?;
             sqlx::query(r#"DELETE FROM content_work_admission_events WHERE created_at < ?"#)
                 .bind(cutoff.as_str())
-                .execute(&state.pool)
+                .execute(&mut *tx)
                 .await
                 .context("delete expired content admission events failed")?;
             sqlx::query(
@@ -1132,17 +1137,19 @@ async fn cleanup_expired_llm_calls(state: &AppState) -> Result<u64> {
                 "#,
             )
             .bind(cutoff.as_str())
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await
             .context("mark expired llm diagnostic links failed")?;
-            Ok::<_, anyhow::Error>(
-                sqlx::query(r#"DELETE FROM llm_calls WHERE created_at < ?"#)
-                    .bind(cutoff.as_str())
-                    .execute(&state.pool)
-                    .await
-                    .context("delete expired llm_calls failed")?
-                    .rows_affected(),
-            )
+            let deleted = sqlx::query(r#"DELETE FROM llm_calls WHERE created_at < ?"#)
+                .bind(cutoff.as_str())
+                .execute(&mut *tx)
+                .await
+                .context("delete expired llm_calls failed")?
+                .rows_affected();
+            tx.commit()
+                .await
+                .context("commit llm retention cleanup transaction failed")?;
+            Ok::<_, anyhow::Error>(deleted)
         })
         .await
     {
