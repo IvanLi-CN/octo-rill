@@ -43,7 +43,7 @@
 - 主工作区执行 hook、普通 checkout、缺失源路径、重复执行必须安全 no-op 或 skip。
 - 仓库内必须提供无需全局 `lefthook` 的安装入口，并把共享 hooks 固定到仓库内解析出的 `lefthook` 二进制。
 - 安装入口必须把 repo-local `core.hooksPath` 收敛到共享 hook 目录，避免已有自定义 hooksPath 让安装失败或把 hooks 分散到单个 worktree。
-- CI 必须在 `ubuntu-latest` 与 `macos-latest` 上验证 smoke flow。
+- CI 必须在显式固定的 `ubuntu-24.04` 与 `macos-latest` 上验证 smoke flow；Ubuntu job 为保持既有远端 ruleset 兼容，继续发布历史 status context `Worktree Bootstrap Smoke (ubuntu-latest)`。
 
 ### SHOULD
 
@@ -140,7 +140,8 @@
 
 - Shell syntax: `sh -n scripts/sync-worktree-resources.sh`
 - Smoke test: `bun run test:worktree-bootstrap`
-- CI smoke matrix: `ubuntu-latest` + `macos-latest`
+- CI smoke matrix: `ubuntu-24.04` + `macos-latest`; the Ubuntu entry keeps the historical `ubuntu-latest` status context for ruleset compatibility.
+- JavaScript-action workflows MUST set `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true`; any legacy action tags retained for the trusted-base checker transition MUST be limited to the checked-in compatibility set and validated by the quality-gates contract.
 
 ### Quality checks
 
@@ -161,3 +162,7 @@
 - 风险：若开发者原本依赖 repo-local 自定义 `core.hooksPath` 承载其他 hook 管理逻辑，当前方案通过共享目录链式保留旧 hook；若旧 hook 本身依赖固定相对路径，仍需开发者自行确认。
 - 开放问题：无。
 - 假设：团队接受把 `.env.local` 作为推荐的 per-developer secrets 文件。
+
+## Related ADRs
+
+None

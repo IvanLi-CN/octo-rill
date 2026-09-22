@@ -20,6 +20,7 @@ env:
   REGISTRY: ghcr.io
   PLATFORMS: linux/amd64
   REQUESTED_HEAD_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || github.sha }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 concurrency:
   group: release-main
@@ -28,7 +29,7 @@ concurrency:
 jobs:
   plan:
     name: Plan release target
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
       release_head_sha: ${{ steps.plan.outputs.release_head_sha }}
@@ -43,7 +44,7 @@ jobs:
       pending_repair_count: ${{ steps.plan.outputs.pending_repair_count }}
     steps:
       - name: Checkout main history
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: main
@@ -78,7 +79,7 @@ jobs:
 
   await-ci:
     name: Await current push CI
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     needs: [plan]
     outputs:
@@ -91,7 +92,7 @@ jobs:
       ci_reason: ${{ steps.gate.outputs.ci_reason }}
     steps:
       - name: Checkout workflow revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.workflow_sha }}
 
@@ -141,7 +142,7 @@ jobs:
 
   prepare:
     name: Prepare release metadata
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs: [plan, await-ci]
     if: ${{ needs.await-ci.outputs.allow_release == 'true' }}
@@ -161,7 +162,7 @@ jobs:
       app_is_prerelease: ${{ steps.export.outputs.app_is_prerelease }}
     steps:
       - name: Checkout main history
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: main
@@ -233,7 +234,7 @@ jobs:
 
       - name: Create GitHub Release for existing tag
         if: ${{ steps.intent.outputs.should_release == 'true' && steps.release-auth.outputs.tag_exists == 'true' }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.export.outputs.app_release_tag }}
           name: ${{ steps.export.outputs.app_release_tag }}
@@ -243,7 +244,7 @@ jobs:
 
       - name: Create GitHub Release for missing tag
         if: ${{ steps.intent.outputs.should_release == 'true' && steps.release-auth.outputs.tag_exists != 'true' }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.export.outputs.app_release_tag }}
           target_commitish: ${{ env.RELEASE_HEAD_SHA }}
@@ -278,7 +279,7 @@ jobs:
 
   docker-release:
     name: Build and push Docker image
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [plan, prepare]
     if: ${{ needs.prepare.outputs.should_release == 'true' }}
@@ -292,7 +293,7 @@ jobs:
       APP_IS_PRERELEASE: ${{ needs.prepare.outputs.app_is_prerelease }}
     steps:
       - name: Checkout release revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_HEAD_SHA }}
 
@@ -318,10 +319,10 @@ jobs:
           done
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Compute lowercase image name
         id: image
@@ -350,14 +351,14 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -371,7 +372,7 @@ jobs:
 
   audit-backfill:
     name: Dispatch next backfill
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     needs: [plan, await-ci, prepare, docker-release]
     if: >-
@@ -388,7 +389,7 @@ jobs:
       actions: write
     steps:
       - name: Checkout main history
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: main
