@@ -65,6 +65,7 @@ projections; those writes remain worker-owned.
 - Work admission records `admission_accepted`, `admission_noop`, `admission_rejected_superseded`, `source_superseded` or `reconciliation_superseded` independently from attempt events. Duplicate admission facts are idempotent by work item, event type, replacement work item and source hash.
 - Each provider request has a provider-admission fact written in the same SQLite writer boundary that validates the live lease and source currentness. A source change after admission may supersede the attempt, but the provider call remains attributable and its output cannot publish or schedule old-source recovery.
 - Startup and recovery reconciliation may mark queued, failed, deferred-provider, blocked-config or ready old-source work as superseded without invoking a provider. Running work with a live lease is left to the worker's provider-admission guard.
+- Canonical source adapters use the resource identity as the revision tie-break domain. Announcement cache and live reads therefore use the normalized `repo#discussion_number` key, and notification synchronization must not replace a newer `updated_at` with an older upstream observation.
 
 ## Identity Compatibility Schema
 
@@ -85,7 +86,7 @@ projections; those writes remain worker-owned.
 
 - No migration modifies `translation_work_items`, `translation_requests`, their attempts or `ai_translations`.
 - `content_legacy_observations` can identify legacy evidence but cannot be used as a foreign-key source for a global result or work state.
-- `legacy_cached` means a displayable old cache lacks matching work evidence. `legacy_conflict` means old evidence cannot be safely reconciled. Neither classification creates an attempt count or current status.
+- `legacy_cached` means a displayable old cache lacks matching work evidence. Blank title and summary fields are not displayable. `legacy_conflict` means old evidence cannot be safely reconciled, including work evidence without an available cache table. Neither classification creates an attempt count or current status.
 
 ## Admin Activity Read Indexes
 

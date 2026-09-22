@@ -124,8 +124,12 @@ Provider and output-validation failures finalize the failed call link, work item
 Migration `0086_content_work_admission_events.sql` adds append-only work
 admission facts and per-attempt provider-admission facts without rewriting
 existing work, attempt, call or result history. Global source adapters place an
-authoritative source revision timestamp and tie-break value in the frozen
-source snapshot; revision metadata is excluded from `source_hash`.
+authoritative source revision timestamp and canonical resource tie-break value
+in the frozen source snapshot; revision metadata is excluded from
+`source_hash`. Announcement cache and live GraphQL adapters both use the
+normalized `repo#discussion_number` key, while notification synchronization
+advances `updated_at` monotonically so an older upstream page cannot regress
+the canonical source row.
 Legacy snapshots without revision metadata use a fail-closed compatibility
 fallback: a revision-bearing candidate may supersede an unknown legacy source,
 while two unknown revisions are never ordered by synchronization arrival.
@@ -152,7 +156,10 @@ Startup and recovery reconciliation close queued, failed, deferred-provider,
 blocked-config and ready stale work without provider calls; running work with a
 live lease is left to the worker guard. Admission events are retained for seven
 days by the existing LLM diagnostic cleanup path, while attempt/provider-call
-audit retention remains unchanged.
+audit retention remains unchanged. Legacy observation classification treats
+blank cached fields as non-displayable, and a work observation is classified as
+`legacy_conflict` when the cache table is unavailable rather than inventing a
+cache match.
 
 ## Global Output Contract
 
