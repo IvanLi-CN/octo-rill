@@ -18,3 +18,4 @@
 - Provider admission is now a terminal boundary for persisted diagnostic calls: both an explicit rejection and an admission-check failure finalize the call as transient before returning, so no provider request or dangling `running` diagnostic remains.
 - Source revision ties are resolved consistently across synchronization, API, scheduler and admin reads; legacy release ingest timestamps remain non-authoritative until upstream revision metadata is available.
 - Announcement synchronization now rejects stale or older equal-timestamp payloads, and post-admission mode transitions retain provider attribution while closing the superseded attempt.
+- Legacy active work without a verified source revision is now superseded before provider admission, and retention cleanup commits all audit-table changes atomically.

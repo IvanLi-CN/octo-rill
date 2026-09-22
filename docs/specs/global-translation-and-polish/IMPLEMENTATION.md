@@ -157,7 +157,9 @@ closes the attempt as `reconciliation_superseded`, and clears the live work
 lease before returning.
 Legacy snapshots without revision metadata use a fail-closed compatibility
 fallback: a revision-bearing candidate may supersede an unknown legacy source,
-while two unknown revisions are never ordered by synchronization arrival.
+while two unknown revisions are never ordered by synchronization arrival. An
+unknown active work item is superseded before provider admission and cannot
+publish a result without a verified source revision.
 
 The scheduler serializes source admission, claim and provider admission through
 the SQLite writer. Repeated same-source submission is an idempotent no-op;

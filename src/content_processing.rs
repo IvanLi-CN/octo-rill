@@ -3408,7 +3408,7 @@ async fn source_revision_is_current_in_transaction(
 ) -> Result<bool> {
     let work_revision = source_revision_metadata(&work.source_snapshot_json);
     if matches!(work_revision, SourceRevisionMetadata::Missing) {
-        return Ok(true);
+        return Ok(false);
     }
     if matches!(work_revision, SourceRevisionMetadata::Malformed) {
         return Ok(false);
@@ -4536,13 +4536,17 @@ mod tests {
     }
 
     async fn seed_executable_work(pool: &SqlitePool, id: &str, target_slots: &[&str]) {
-        sqlx::query("INSERT INTO repo_releases (id, repo_id, release_id, tag_name, html_url, detected_at, updated_at) VALUES (?, 1, 12345, 'v1', 'https://example.test/releases/12345', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+        sqlx::query("INSERT INTO repo_releases (id, repo_id, release_id, tag_name, html_url, detected_at, updated_at) VALUES (?, 1, 12345, 'v1', 'https://example.test/releases/12345', '2026-01-01T00:00:01Z', '2026-01-01T00:00:00Z')")
             .bind(format!("release-row-{id}"))
             .execute(pool)
             .await
             .unwrap();
         let source_snapshot = json!({
-            "source_blocks": [{"slot": "title", "text": "A release title"}],
+            "source_blocks": [
+                {"slot": "source_observed_at", "text": "2026-01-01T00:00:00Z"},
+                {"slot": "source_revision_tiebreak", "text": "https://example.test/releases/12345\nv1\nv1\n"},
+                {"slot": "title", "text": "A release title"}
+            ],
             "target_slots": target_slots
         });
         sqlx::query("INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, created_at, updated_at) VALUES (?, 'release', '12345', 'translation', 'summary', 'zh-CN', ?, ?, 'test-model', ?, 'test-fingerprint', 'queued', 0, 0, 1, 0, '2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z')")
@@ -4609,12 +4613,16 @@ mod tests {
     #[tokio::test]
     async fn execute_persists_failure_finalization_atomically() {
         let pool = global_execution_pool().await;
-        sqlx::query("INSERT INTO repo_releases (id, repo_id, release_id, tag_name, html_url, updated_at) VALUES ('test-release', 1, 12345, 'v1', 'https://example.test/releases/12345', CURRENT_TIMESTAMP)")
+        sqlx::query("INSERT INTO repo_releases (id, repo_id, release_id, tag_name, html_url, detected_at, updated_at) VALUES ('test-release', 1, 12345, 'v1', 'https://example.test/releases/12345', '2026-01-01T00:00:01Z', '2026-01-01T00:00:00Z')")
             .execute(&pool)
             .await
             .unwrap();
         let source_snapshot = json!({
-            "source_blocks": [{"slot": "title", "text": "A release title"}],
+            "source_blocks": [
+                {"slot": "source_observed_at", "text": "2026-01-01T00:00:00Z"},
+                {"slot": "source_revision_tiebreak", "text": "https://example.test/releases/12345\nv1\nv1\n"},
+                {"slot": "title", "text": "A release title"}
+            ],
             "target_slots": ["title_zh"]
         });
         sqlx::query("INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, created_at, updated_at) VALUES ('execute-failure-work', 'release', '12345', 'translation', 'summary', 'zh-CN', 'source-hash', ?, 'test-model', ?, 'test-fingerprint', 'queued', 0, 0, 1, 0, '2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z')")
@@ -5831,6 +5839,60 @@ mod tests {
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM content_attempt_provider_admissions WHERE work_item_id = 'stale-execution-old'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshot_is_superseded_before_provider_call() {
+        let pool = global_execution_pool().await;
+        seed_executable_work(&pool, "legacy-source-work", &["title_zh"]).await;
+        sqlx::query("UPDATE content_work_items SET source_snapshot_json = ? WHERE id = ?")
+            .bind(
+                json!({
+                    "source_blocks": [{"slot": "title", "text": "Legacy title"}],
+                    "target_slots": ["title_zh"]
+                })
+                .to_string(),
+            )
+            .bind("legacy-source-work")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (base_url, requested_tokens, _) = spawn_sequenced_test_ai_server(vec![(
+            r#"{"title_zh":"should not be called"}"#,
+            "stop",
+        )])
+        .await;
+        let mut state = global_state(pool.clone());
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .ai
+            .as_mut()
+            .unwrap()
+            .base_url = base_url;
+
+        let work = claim_next(&state, 1).await.unwrap().unwrap();
+        execute(&state, work).await.unwrap();
+
+        assert!(requested_tokens.lock().unwrap().is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM content_work_items WHERE id = 'legacy-source-work'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "superseded"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_provider_admissions WHERE work_item_id = 'legacy-source-work'",
             )
             .fetch_one(&pool)
             .await
