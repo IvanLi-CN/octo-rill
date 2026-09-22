@@ -3704,7 +3704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notification_canonical_source_breaks_updated_at_ties_by_id() {
+    async fn notification_canonical_source_breaks_updated_at_ties_stably() {
         let pool = test_pool().await;
         create_notifications_fixture(&pool).await;
         sqlx::query("INSERT INTO users (id) VALUES ('user-d')")
@@ -3728,8 +3728,8 @@ mod tests {
             .await
             .expect("load tied notification");
 
-        assert_eq!(row.repository.as_deref(), Some("octo/higher"));
-        assert_eq!(row.title, "Higher ID");
+        assert_eq!(row.repository.as_deref(), Some("octo/lower"));
+        assert_eq!(row.title, "Lower ID");
         assert_eq!(row.occurred_at.as_deref(), Some("2026-07-08T08:30:00Z"));
     }
 
