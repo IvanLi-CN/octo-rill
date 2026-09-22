@@ -30,28 +30,42 @@ if grep -R -n -E '^[[:space:]]*runs-on:[[:space:]]+ubuntu-latest[[:space:]]*$' \
   exit 1
 fi
 
-for expected_action in \
-  'actions/checkout@v7' \
-  'actions/cache@v6' \
-  'actions/upload-artifact@v7' \
-  'actions/download-artifact@v8' \
-  'actions/github-script@v9' \
-  'actions/configure-pages@v6' \
-  'actions/upload-pages-artifact@v5' \
-  'actions/deploy-pages@v5' \
-  'docker/setup-buildx-action@v4' \
-  'docker/build-push-action@v7' \
-  'docker/setup-qemu-action@v4' \
-  'docker/login-action@v4' \
-  'oven-sh/setup-bun@v2' \
-  'softprops/action-gh-release@v3'; do
-  action_name="${expected_action%@*}"
-  references="$(grep -RhoE --include='*.yml' --include='*.yaml' "${action_name}@v[0-9]+" "$repo_root/.github" | sort -u || true)"
-  if [[ "${references}" != "${expected_action}" ]]; then
-    echo "workflow action baseline drifted for ${action_name}: expected ${expected_action}, got ${references:-<none>}" >&2
+for workflow in ci.yml docs-pages.yml label-gate.yml release.yml review-policy.yml rust-source-quality.yml; do
+  if ! grep -q -F 'FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true' "$repo_root/.github/workflows/$workflow"; then
+    echo "workflow $workflow must force JavaScript actions onto Node24" >&2
     exit 1
   fi
 done
+
+while IFS='|' read -r action_name legacy_action current_action; do
+  references="$(grep -RhoE --include='*.yml' --include='*.yaml' "${action_name}@v[0-9]+" "$repo_root/.github" | sort -u || true)"
+  if [[ -z "${references}" ]]; then
+    echo "workflow action baseline missing for ${action_name}" >&2
+    exit 1
+  fi
+  while IFS= read -r reference; do
+    [[ -z "${reference}" ]] && continue
+    if [[ "${reference}" != "${legacy_action}" && "${reference}" != "${current_action}" ]]; then
+      echo "workflow action baseline drifted for ${action_name}: allowed ${legacy_action} or ${current_action}, got ${reference}" >&2
+      exit 1
+    fi
+  done <<< "${references}"
+done <<'EOF'
+actions/checkout|actions/checkout@v4|actions/checkout@v7
+actions/cache|actions/cache@v4|actions/cache@v6
+actions/upload-artifact|actions/upload-artifact@v4|actions/upload-artifact@v7
+actions/download-artifact|actions/download-artifact@v8|actions/download-artifact@v8
+actions/github-script|actions/github-script@v7|actions/github-script@v9
+actions/configure-pages|actions/configure-pages@v6|actions/configure-pages@v6
+actions/upload-pages-artifact|actions/upload-pages-artifact@v5|actions/upload-pages-artifact@v5
+actions/deploy-pages|actions/deploy-pages@v5|actions/deploy-pages@v5
+docker/setup-buildx-action|docker/setup-buildx-action@v4|docker/setup-buildx-action@v4
+docker/build-push-action|docker/build-push-action@v6|docker/build-push-action@v7
+docker/setup-qemu-action|docker/setup-qemu-action@v4|docker/setup-qemu-action@v4
+docker/login-action|docker/login-action@v4|docker/login-action@v4
+oven-sh/setup-bun|oven-sh/setup-bun@v2|oven-sh/setup-bun@v2
+softprops/action-gh-release|softprops/action-gh-release@v3|softprops/action-gh-release@v3
+EOF
 
 if python3 "$repo_root/.github/scripts/check_quality_gates_contract.py" \
   --repo-root "$repo_root" \

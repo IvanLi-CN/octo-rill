@@ -358,6 +358,15 @@ def uses_step_config(job: dict[str, Any], step_name: str, expected_uses: str, wh
     return step
 
 
+def uses_step_config_one_of(job: dict[str, Any], step_name: str, expected_uses: set[str], where: str) -> dict[str, Any]:
+    step = step_config(job, step_name, where)
+    require(
+        step.get("uses") in expected_uses,
+        f"{where}.steps[{step_name!r}].uses must stay one of {sorted(expected_uses)!r}",
+    )
+    return step
+
+
 def step_run(step: dict[str, Any], where: str) -> str:
     run = step.get("run")
     require(isinstance(run, str) and run.strip(), f"{where}.run must be a non-empty string")
@@ -417,7 +426,7 @@ def command_option_map(command: list[str], where: str) -> dict[str, str]:
 
 
 def checkout_step(job: dict[str, Any], step_name: str, where: str) -> dict[str, Any]:
-    step = uses_step_config(job, step_name, "actions/checkout@v7", where)
+    step = uses_step_config_one_of(job, step_name, {"actions/checkout@v4", "actions/checkout@v7"}, where)
     return require_mapping(step.get("with"), f"{where}.steps[{step_name!r}].with")
 
 
@@ -679,10 +688,10 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
             not ("cargo build" in step_text and "--release" in step_text),
             f"ci.yml.jobs.build.steps[{index}] must not repeat a host release compilation",
         )
-    docker_step = uses_step_config(
+    docker_step = uses_step_config_one_of(
         build_job,
         "Build Docker smoke image (linux/amd64)",
-        "docker/build-push-action@v7",
+        {"docker/build-push-action@v6", "docker/build-push-action@v7"},
         "ci.yml.jobs.build",
     )
     docker_with = require_mapping(
@@ -732,10 +741,10 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
         and "--reporter=list,json" in playwright_run,
         "ci.yml: controlled E2E must force a JSON reporter for immutable historical targets",
     )
-    tooling_checkout = uses_step_config(
+    tooling_checkout = uses_step_config_one_of(
         frontend_job,
         "Checkout acceptance E2E tooling",
-        "actions/checkout@v7",
+        {"actions/checkout@v4", "actions/checkout@v7"},
         "ci.yml.jobs.frontend-e2e",
     )
     require(
@@ -767,10 +776,10 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
         and "playwright-summary.json" in summary_run,
         "ci.yml: Playwright summary step must consume the JSON report and write the JSON summary",
     )
-    artifact_step = uses_step_config(
+    artifact_step = uses_step_config_one_of(
         frontend_job,
         "Upload Playwright results",
-        "actions/upload-artifact@v7",
+        {"actions/upload-artifact@v4", "actions/upload-artifact@v7"},
         "ci.yml.jobs.frontend-e2e",
     )
     require(artifact_step.get("if") == "${{ always() }}", "ci.yml: Playwright artifact upload must run with always()")
@@ -802,7 +811,12 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
     lint_job = named_job_config(workflow, "lint", expected_jobs, "ci.yml")
     require_no_if(lint_job, "ci.yml.jobs.lint")
     require_fail_closed(lint_job, "ci.yml.jobs.lint")
-    checkout = uses_step_config(lint_job, "Checkout", "actions/checkout@v7", "ci.yml.jobs.lint")
+    checkout = uses_step_config_one_of(
+        lint_job,
+        "Checkout",
+        {"actions/checkout@v4", "actions/checkout@v7"},
+        "ci.yml.jobs.lint",
+    )
     checkout_with = require_mapping(checkout.get("with"), "ci.yml.jobs.lint.steps['Checkout'].with")
     require(checkout_with.get("fetch-depth") == 0, "ci.yml.jobs.lint Checkout must fetch full history for trusted source resolution")
     check_scripts = step_config(lint_job, "Check quality-gates scripts", "ci.yml.jobs.lint")

@@ -141,6 +141,7 @@
 - Shell syntax: `sh -n scripts/sync-worktree-resources.sh`
 - Smoke test: `bun run test:worktree-bootstrap`
 - CI smoke matrix: `ubuntu-24.04` + `macos-latest`; the Ubuntu entry keeps the historical `ubuntu-latest` status context for ruleset compatibility.
+- JavaScript-action workflows MUST set `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true`; any legacy action tags retained for the trusted-base checker transition MUST be limited to the checked-in compatibility set and validated by the quality-gates contract.
 
 ### Quality checks
 
