@@ -13,8 +13,9 @@
 - REQ-GTP-OWNERSHIP: 调度器拥有全局持久化边界：授权后的请求只能通过调度器 admission/retry command 在同一 SQLite writer 事务中创建或重新排队工作项；调度 worker 是尝试事件、模型调用和结果投影的唯一写入者。所有既有翻译或润色入口必须成为调度请求适配器，保留 `async`、`wait`、`stream` 交付语义；遗留 `sync` 入口映射为有界 `wait`，到期返回可轮询的 pending 快照。全局 worker 只能消费冻结源快照，不得使用任一请求者的 OAuth 身份或可变用户上下文；任何直接模型调用或直接终态缓存写入都不得绕过调度器。
 - REQ-GTP-AUTHORIZATION: 请求者关联必须记录调用者或系统生产者、授权时刻、请求来源和关联的全局工作项。资源访问控制始终在请求、轮询、读取结果和重试时检查；全局共享不得向未获授权者暴露私有资源、输出、请求关联或诊断信息。
 - REQ-GTP-RESULTS: 只有通过输出契约和业务校验的内容可以发布为结果投影。工作与结果投影都按 `(canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version)` 保持唯一身份，且不区分模型；结果投影的发布源哈希必须与身份中的 `source_hash` 一致。来源更新创建新工作项并在六十秒去抖后提交；旧的已发布结果在刷新期间保持可读，直到新投影原子替换。删除的来源必须取消或抑制未完成工作，且不得发布结果。
+- REQ-GTP-OUTPUT: 全局内容处理的规范模型响应是一个 JSON 对象，声明的 `target_slots` 必须直接位于顶层，并通过既有非空字段与 Markdown 结构校验后才能发布。未声明的标量元数据会被忽略且不持久化；未知对象/数组包装、重复 JSON key、多层、歧义、缺字段和非法 JSON 必须记录为 `output_contract_invalid`。运行时最多归一化一层 Markdown JSON 代码围栏或一层 `output` 对象包装。首次 `finish_reason=length` 只在同一尝试内使用同一路由与配置快照追加一次 `max_tokens=6000` 的 `length_recovery` 调用；再次截断记录 `output_truncated`，不在本次尝试内追加调用。provider 成功不等于业务输出成功，API wire shape 不变。
 - REQ-GTP-CACHE-HIT: 命中源哈希与全局工作身份一致的当前有效结果投影时，不论其由哪个模型生成，若没有保留的当前工作项，调度器必须创建状态为 `ready`、`cache_hit=true`、尝试次数为零的全局工作项并关联请求者。该工作项只记录真实缓存命中，不得由旧事实或无效输出创建。
-- REQ-GTP-LIFECYCLE: 工作项状态限定为 `queued`、`running`、`ready`、`failed`、`not_applicable`、`deferred_provider`、`blocked_config`、`cancelled` 或 `superseded`，并且每个状态转换必须符合数据库合同。`blocked_config` 是可恢复的等待状态，不是永久失败；配置更新后由调度器重新验证并在有效时排队。客户端将其显示为 pending，继续轮询原请求并显示“等待模型配置恢复，恢复后会自动继续”；不得将其作为终态错误提供手动重试入口，API wire shape 不变。手动重试复用原工作项、追加新尝试并受五分钟冷却限制；仅结构化瞬态失败按一、五、十五、六十、二百四十分钟间隔自动恢复，最长二十四小时。调度器维持既有租约和并发边界，手动重试优先级为三，同时至少保留一个后台执行名额。
+- REQ-GTP-LIFECYCLE: 工作项状态限定为 `queued`、`running`、`ready`、`failed`、`not_applicable`、`deferred_provider`、`blocked_config`、`cancelled` 或 `superseded`，并且每个状态转换必须符合数据库合同。`blocked_config` 是可恢复的等待状态，不是永久失败；配置更新后由调度器重新验证并在有效时排队。客户端将其显示为 pending，继续轮询原请求并显示“等待模型配置恢复，恢复后会自动继续”；不得将其作为终态错误提供手动重试入口，API wire shape 不变。手动重试复用原工作项、追加新尝试并受五分钟冷却限制；结构化瞬态失败、`output_contract_invalid` 和 `output_truncated` 在 retry window 内按既有一、五、十五、六十、二百四十分钟间隔自动恢复，最长二十四小时；每次尝试最多执行一次截断恢复。调度器维持既有租约和并发边界，手动重试优先级为三，同时至少保留一个后台执行名额。
 - REQ-GTP-CONFIGURATION: 每次内容处理尝试开始时，必须按当时有效的全局模型路由与运行配置建立尝试级快照，并在该尝试期间固定使用它；持久化模型路由必须在 claim 与 `attempt_started` 共用的 SQLite 写事务内读取，使配置更新与尝试开始有单一先后顺序，不允许其他运行实例仅因本地 runtime 尚未 heartbeat 而快照旧路由。新 admission 与手动重试也必须在创建或重新排队工作的同一 SQLite 写事务内读取持久化模型路由，并据此判定配置有效性；配置更新先提交时，新工作采用更新后的路由，配置更新后提交时，其恢复扫描必须能看到本事务留下的 `blocked_config` 工作。快照记录安全配置指纹和有序路由，不得保存密钥原文，实际调用模型记录在调用归因中。工作项不冻结模型配置；后续尝试使用其开始时的当前配置。若尝试开始前当前配置无效，工作项进入 `blocked_config`，不调用 provider，也不按计时器反复重试。相关全局配置更新或运行时配置重载触发重新验证；配置有效时由调度器自动排队，随后尝试采用新快照。配置变更本身不得重跑已有有效结果；同源内容没有显式强制重生成入口，只有源版本变化创建新工作。
 - REQ-GTP-RETRY-COORDINATION: 对终态失败的授权重试必须由数据库唯一约束和事务串行化。工作项已在执行、排队或恢复时，服务端仍创建请求者关联，但返回 `409`、稳定错误码、当前工作项标识、当前状态、最近尝试状态和轮询地址；前端以该事实同步状态，而不将其显示为新的独立失败。
 - REQ-GTP-PROVIDER-GUARD: 持久化的提供方熔断与路由健康状态优先于人工重试。熔断打开时，授权请求仍创建请求者关联，但工作项保持或转入 `deferred_provider`；只有调度器拥有的受控探测可以恢复提供方调用，人工请求不得绕过熔断。
@@ -41,6 +42,7 @@
 - VER-GTP-GLOBAL-DEDUP: covers: REQ-GTP-IDENTITY, REQ-GTP-OWNERSHIP, REQ-GTP-AUTHORIZATION。以同一规范资源的多用户并发请求、不同资源、不同来源快照和无权访问者组合验证：只有一个全局工作与结果，worker 不使用请求者身份，且每个请求者关联和访问边界都正确。
 - VER-GTP-NOTIFICATION-SOURCE: covers: REQ-GTP-NOTIFICATION-SOURCE。以跨用户同一线程的不同标题、仓库和更新时间组合验证：最新行决定规范来源与源快照；相同更新时间始终由稳定平局规则选出同一来源；访问控制不因来源选择而改变。
 - VER-GTP-LIFECYCLE: covers: REQ-GTP-RESULTS, REQ-GTP-CACHE-HIT, REQ-GTP-LIFECYCLE, REQ-GTP-CONFIGURATION, REQ-GTP-RETRY-COORDINATION, REQ-GTP-PROVIDER-GUARD。验证来源变更、删除、有效与无效输出、跨模型当前结果命中生成零次尝试的 `ready` 工作项、持久路由更新先于 claim 时 `attempt_started` 记录新路由且与 claim 同事务排序、路由更新先于 admission 时新工作使用当前配置、运行中尝试固定其配置快照、后续尝试使用新配置、无效配置进入 `blocked_config` 后只由配置更新事件唤醒、已有有效结果不因配置变化重跑、完整批次中存在其他活动工作的 blocked identity 不导致恢复扫描空转、五分钟冷却、并发手动重试 `409`、熔断下的 `deferred_provider`、优先级与至少一个后台名额。
+- VER-GTP-OUTPUT: covers: REQ-GTP-OUTPUT, REQ-GTP-RESULTS, REQ-GTP-OBSERVABILITY。以 prompt 审计和真实内容处理执行路径验证顶层声明字段、裸 JSON、单层代码围栏、单层 `output` 包装、未知或多层包装拒绝、缺字段与歧义拒绝、非空字段与 Markdown 校验；以顺序 mock provider 验证首次截断只追加一次 6000-token recovery、两次调用均进入精确审计关联、再次截断记录 `output_truncated` 且不发生第三次调用。
 - VER-GTP-ADMIN: covers: REQ-GTP-ADMIN-READS, REQ-GTP-LEGACY, REQ-GTP-NAMING, REQ-GTP-OBSERVABILITY。验证管理 GET 无写入，旧缓存不会被伪造成工作项，`legacy_cached` 与 `legacy_conflict` 有可追溯来源，诊断安全字段正确，界面始终显示“翻译”和“润色”。
 - VER-GTP-ADMIN-READ-BUDGET: covers: REQ-GTP-ADMIN-READ-BUDGET, REQ-GTP-NOTIFICATION-SOURCE。以生产形状的通知、遗留工作项和全局工作项夹具验证四类列表：总数与页码精确、状态筛选在分页前完成、跨用户同一通知线程使用规范来源、超过三十一天被拒绝、超时与并发饱和返回可重试 `503`，且释放读取容量。
 - VER-GTP-ADMIN-ACTIVITY: covers: REQ-GTP-ADMIN-ACTIVITY, REQ-GTP-ADMIN-READS, REQ-GTP-NOTIFICATION-SOURCE。验证四种来源时间和规范化、UTC 十二小时边界、单格与 summary 数量一致、既有 lane 显示状态及综合状态优先级、无读写副作用，以及生产形状查询计划和读取延迟预算。
@@ -70,6 +72,7 @@
 - [ADR 0009: 管理采集记录读取预算](../../adr/0009-admin-collection-record-read-budget.md)
 - [ADR 0012: 模型无关的全局内容工作身份](../../adr/0012-model-independent-content-work.md)
 - [ADR 0013: 管理采集记录按查询键合并在途读取](../../adr/0013-admin-collection-read-singleflight.md)
+- [ADR 0014: Global Content Output Contract Recovery](../../adr/0014-global-content-output-contract.md)
 
 ## Visual Evidence
 

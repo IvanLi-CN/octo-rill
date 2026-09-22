@@ -150,6 +150,9 @@ pub fn classify_translation_error(error_text: Option<&str>) -> Option<Classified
             && normalized.contains("too long"))
     {
         ("body_too_long", "正文超过 3000 字符")
+    } else if normalized.contains("output_truncated") || normalized.contains("output was truncated")
+    {
+        ("output_truncated", "模型输出被截断")
     } else if normalized.contains("empty summary") || normalized.contains("empty translation") {
         ("empty_translation", "模型输出为空")
     } else if normalized.contains("ai output did not satisfy")
