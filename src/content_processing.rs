@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -17,6 +17,7 @@ use sqlx::{Error as SqlxError, Row, Sqlite, SqlitePool, Transaction};
 use tokio::{task::JoinSet, time::sleep};
 use tracing::warn;
 
+use crate::release_links::parse_repo_full_name_from_release_url;
 use crate::{
     ai, api, content_identity_upgrade, error::ApiError, local_id, state::AppState, translations,
 };
@@ -2439,7 +2440,7 @@ async fn record_work_admission_event(
     .bind(local_id::generate_local_id().to_string())
     .bind(event.work_item_id)
     .bind(event.event_type)
-    .bind(event.replaced_by_work_item_id.unwrap_or_default())
+    .bind(event.replaced_by_work_item_id)
     .bind(event.source_hash)
     .bind(source_revision_json_from_snapshot(event.source_snapshot_json))
     .bind(event.producer_ref)
@@ -2806,7 +2807,7 @@ struct GlobalCallSpec<'a> {
     max_tokens: u32,
     route_snapshot: &'a [String],
     role: &'a str,
-    call_ordinal: i64,
+    call_ordinal_counter: Arc<AtomicI64>,
 }
 
 #[derive(Debug, Clone)]
@@ -2881,19 +2882,22 @@ async fn request_global_completion(
     state: &AppState,
     spec: GlobalCallSpec<'_>,
 ) -> Result<ai::ChatCompletionDiagnostic> {
-    if !renew_global_work_lease(state, spec.work).await? {
-        return Err(anyhow::Error::new(ai::LlmCallFailure {
-            class: ai::LlmFailureClass::Transient,
-            call_id: None,
-        }));
-    }
-    if !admit_provider_call(state, spec.work, spec.call_ordinal, spec.role).await? {
-        return Err(anyhow::Error::new(GlobalExecutionFailure {
-            call_ids: Vec::new(),
-            class: ai::LlmFailureClass::Transient,
-            message: "content work was superseded before provider admission".to_owned(),
-        }));
-    }
+    let admission_state = Arc::new(state.clone());
+    let admission_work = spec.work.clone();
+    let admission_role = spec.role.to_owned();
+    let admission_ordinals = spec.call_ordinal_counter.clone();
+    let provider_admission: ai::ProviderAdmissionGuard = Arc::new(move || {
+        let state = admission_state.clone();
+        let work = admission_work.clone();
+        let role = admission_role.clone();
+        let call_ordinal = admission_ordinals.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if !renew_global_work_lease(&state, &work).await? {
+                return Ok(false);
+            }
+            admit_provider_call(&state, &work, call_ordinal, &role).await
+        })
+    });
     let call_context = ai::LlmCallContext {
         source: format!(
             "content_processing.global.{}.stage.content_output.role.{}",
@@ -2909,13 +2913,14 @@ async fn request_global_completion(
         Duration::from_secs(4 * 60),
         ai::with_llm_call_context(
             call_context,
-            ai::chat_completion_with_diagnostics_for_config_and_route(
+            ai::chat_completion_with_diagnostics_for_config_and_route_with_admission(
                 state,
                 spec.ai_config,
                 spec.system,
                 spec.user,
                 spec.max_tokens,
                 Some(spec.route_snapshot),
+                Some(provider_admission),
             ),
         ),
     )
@@ -3015,6 +3020,7 @@ async fn complete_global_output(
         }));
     };
     let mut call_ids = Vec::new();
+    let call_ordinal_counter = Arc::new(AtomicI64::new(0));
     let mut diagnostic = match request_global_completion(
         state,
         GlobalCallSpec {
@@ -3025,7 +3031,7 @@ async fn complete_global_output(
             max_tokens: GLOBAL_MAX_TOKENS,
             route_snapshot,
             role: "primary",
-            call_ordinal: 0,
+            call_ordinal_counter: call_ordinal_counter.clone(),
         },
     )
     .await
@@ -3059,7 +3065,7 @@ async fn complete_global_output(
                 max_tokens: GLOBAL_LENGTH_RECOVERY_MAX_TOKENS,
                 route_snapshot: &recovery_route_snapshot,
                 role: "length_recovery",
-                call_ordinal: 1,
+                call_ordinal_counter: call_ordinal_counter.clone(),
             },
         )
         .await
@@ -3204,18 +3210,51 @@ pub(crate) fn notification_source_revision_tiebreak(
     )
 }
 
+pub(crate) fn source_revision_content_tiebreak(parts: &[&str]) -> String {
+    ai::sha256_hex(&parts.join("\n"))
+}
+
 async fn current_source_revision_snapshot_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     work: &WorkRow,
 ) -> Result<Option<String>> {
     let revision = match work.canonical_resource_type.as_str() {
-        "release" => sqlx::query_as::<_, (String, String)>(
-            "SELECT updated_at, id FROM repo_releases WHERE release_id = ? LIMIT 1",
+        "release" => sqlx::query_as::<_, (
+            String,
+            String,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+        )>(
+            "SELECT updated_at, html_url, repo_id, tag_name, name, body FROM repo_releases WHERE release_id = ? LIMIT 1",
         )
         .bind(&work.canonical_resource_id)
         .fetch_optional(&mut **tx)
         .await?
-        .map(|(updated_at, id)| (Some(updated_at), id)),
+        .map(|(updated_at, html_url, repo_id, tag_name, name, body)| {
+            let repo_full_name = parse_repo_full_name_from_release_url(&html_url)
+                .unwrap_or_else(|| format!("unknown/{repo_id}"));
+            let title = name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(tag_name.as_str());
+            let body = body.unwrap_or_default().replace("\r\n", "\n");
+            (
+                if updated_at.trim().is_empty() {
+                    None
+                } else {
+                    Some(updated_at)
+                },
+                source_revision_content_tiebreak(&[
+                    repo_full_name.as_str(),
+                    tag_name.as_str(),
+                    title,
+                    body.as_str(),
+                ]),
+            )
+        }),
         "notification" => sqlx::query_as::<_, (
             Option<String>,
             String,
@@ -3246,14 +3285,26 @@ async fn current_source_revision_snapshot_in_transaction(
                 return Ok(None);
             };
             let number = number.parse::<i64>().unwrap_or_default();
-            sqlx::query_as::<_, (Option<String>,)>(
-                "SELECT occurred_at FROM social_activity_events WHERE kind = 'announcement' AND lower(repo_full_name) = lower(?) AND discussion_number = ? ORDER BY occurred_at DESC LIMIT 1",
+            sqlx::query_as::<_, (Option<String>, String, i64, Option<String>, Option<String>)>(
+                "SELECT occurred_at, lower(repo_full_name), discussion_number, title, body FROM social_activity_events WHERE kind = 'announcement' AND lower(repo_full_name) = lower(?) AND discussion_number = ? ORDER BY occurred_at DESC LIMIT 1",
             )
             .bind(repo)
             .bind(number)
             .fetch_optional(&mut **tx)
             .await?
-            .map(|(occurred_at,)| (occurred_at, work.canonical_resource_id.clone()))
+            .map(|(occurred_at, repo_full_name, discussion_number, title, body)| {
+                let discussion_key = format!("{repo_full_name}#{discussion_number}");
+                let title = title.unwrap_or_else(|| format!("Discussion #{discussion_number}"));
+                let body = body.unwrap_or_default();
+                (
+                    occurred_at,
+                    source_revision_content_tiebreak(&[
+                        discussion_key.as_str(),
+                        title.as_str(),
+                        body.as_str(),
+                    ]),
+                )
+            })
         }
         _ => None,
     };

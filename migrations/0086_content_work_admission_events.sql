@@ -13,15 +13,24 @@ CREATE TABLE content_work_admission_events (
       'reconciliation_superseded'
     )
   ),
-  replaced_by_work_item_id TEXT NOT NULL DEFAULT '',
+  replaced_by_work_item_id TEXT,
   source_hash TEXT NOT NULL,
   source_revision_json TEXT NOT NULL DEFAULT '{}',
   producer_ref TEXT NOT NULL DEFAULT '',
   requester_id TEXT,
   reason_code TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
-  UNIQUE (work_item_id, event_type, replaced_by_work_item_id, source_hash)
+  FOREIGN KEY (work_item_id) REFERENCES content_work_items(id),
+  FOREIGN KEY (replaced_by_work_item_id) REFERENCES content_work_items(id)
 );
+
+CREATE UNIQUE INDEX idx_content_work_admission_events_identity
+  ON content_work_admission_events(
+    work_item_id,
+    event_type,
+    COALESCE(replaced_by_work_item_id, ''),
+    source_hash
+  );
 
 CREATE INDEX idx_content_work_admission_events_work_item
   ON content_work_admission_events(work_item_id, created_at ASC, id ASC);
@@ -38,7 +47,9 @@ CREATE TABLE content_attempt_provider_admissions (
   work_item_id TEXT NOT NULL,
   attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
   call_ordinal INTEGER NOT NULL CHECK (call_ordinal >= 0),
-  relation_role TEXT NOT NULL,
+  relation_role TEXT NOT NULL CHECK (
+    relation_role IN ('primary', 'length_recovery', 'fallback')
+  ),
   source_hash TEXT NOT NULL,
   source_revision_json TEXT NOT NULL DEFAULT '{}',
   admitted_at TEXT NOT NULL,
