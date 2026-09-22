@@ -17,7 +17,6 @@ use sqlx::{Error as SqlxError, Row, Sqlite, SqlitePool, Transaction};
 use tokio::{task::JoinSet, time::sleep};
 use tracing::warn;
 
-use crate::release_links::parse_repo_full_name_from_release_url;
 use crate::{
     ai, api, content_identity_upgrade, error::ApiError, local_id, state::AppState, translations,
 };
@@ -3237,8 +3236,6 @@ async fn current_source_revision_snapshot_in_transaction(
         .fetch_optional(&mut **tx)
         .await?
         .map(|(updated_at, html_url, repo_id, tag_name, name, body)| {
-            let repo_full_name = parse_repo_full_name_from_release_url(&html_url)
-                .unwrap_or_else(|| format!("unknown/{repo_id}"));
             let title = name
                 .as_deref()
                 .map(str::trim)
@@ -3252,7 +3249,7 @@ async fn current_source_revision_snapshot_in_transaction(
                     Some(updated_at)
                 },
                 source_revision_content_tiebreak(&[
-                    repo_full_name.as_str(),
+                    html_url.as_str(),
                     tag_name.as_str(),
                     title,
                     body.as_str(),
@@ -3691,6 +3688,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
     }
     if !source_exists_in_transaction(&mut tx, &work).await? {
         cancel_deleted_work_in_transaction(&mut tx, &work).await?;
+        persist_superseded_provider_call_audits(&mut tx, &work, &result, &now).await?;
         tx.commit().await?;
         return Ok(());
     }

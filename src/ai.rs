@@ -3061,12 +3061,50 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
         if let Some(provider_admission) = provider_admission.as_ref()
             && !provider_admission(candidate_index).await?
         {
+            let admission_error = "provider admission rejected before request";
+            let duration_ms = started_at
+                .map(|started| i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX));
+            if llm_call_persisted {
+                reconcile_admin_override_after_persist(
+                    state,
+                    log_record.id.as_str(),
+                    finalize_llm_call(
+                        state,
+                        log_record.id.as_str(),
+                        FinalizeLlmCallUpdate {
+                            status: "failed",
+                            attempt_count,
+                            scheduler_wait_ms: total_wait_ms,
+                            first_token_wait_ms: None,
+                            duration_ms,
+                            output_messages_json: None,
+                            response_text: None,
+                            error_text: Some(admission_error),
+                            input_tokens: None,
+                            output_tokens: None,
+                            finish_reason: None,
+                            provider_request_id: None,
+                            provider_http_status: None,
+                            cached_input_tokens: None,
+                            total_tokens: None,
+                            failure_class: Some(LlmFailureClass::Transient.as_str()),
+                            final_model: Some(model_for_call.as_str()),
+                            fallback_count,
+                            retry_scheduled_at: None,
+                            recovery_attempt_count: 0,
+                        },
+                    )
+                    .await,
+                    "llm call admission rejection finalization failed",
+                )
+                .await;
+            }
             in_flight_guard.release_permit();
             drop(in_flight_guard);
             heartbeat.stop().await;
             return Err(anyhow::Error::new(LlmCallFailure {
                 class: LlmFailureClass::Transient,
-                call_id: None,
+                call_id: llm_call_persisted.then(|| log_record.id.clone()),
             }));
         }
         let attempt_result = chat_completion_once(state, &ai, system, user, max_tokens).await;
