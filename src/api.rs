@@ -18,7 +18,7 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sqlx::{QueryBuilder, Row, Sqlite, Transaction};
-use tokio::{io::AsyncReadExt, sync::mpsc};
+use tokio::{io::AsyncReadExt, sync::mpsc, task::JoinSet};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
 
@@ -19343,33 +19343,89 @@ fn global_release_batch_item_from_snapshot(
     )
 }
 
+fn global_batch_conflict_item(
+    input: &translations::TranslationRequestItemInput,
+    response: content_processing::GlobalSubmissionResponse,
+) -> (TranslateBatchItem, Value, &'static str, String) {
+    let message = response
+        .error
+        .as_ref()
+        .and_then(|error| error.get("message").and_then(Value::as_str))
+        .unwrap_or("content processing request conflicts with current work")
+        .to_owned();
+    let code = if response
+        .error
+        .as_ref()
+        .and_then(|error| error.get("code").and_then(Value::as_str))
+        == Some("content_processing_superseded")
+    {
+        "content_processing_superseded"
+    } else {
+        "content_processing_active"
+    };
+    let mut details = response.error.unwrap_or_else(|| json!({}));
+    if let Some(object) = details.as_object_mut() {
+        object.insert("request_id".to_owned(), json!(response.request_id));
+        object.insert("work_item_id".to_owned(), json!(response.work_item_id));
+        object.insert("status".to_owned(), json!(response.status));
+        object.insert("poll_url".to_owned(), json!(response.poll_url));
+    }
+    (
+        TranslateBatchItem {
+            id: input.entity_id.clone(),
+            lang: input.target_lang.clone(),
+            status: "processing".to_owned(),
+            title: None,
+            summary: None,
+            error: Some(message.clone()),
+            failure_class: None,
+        },
+        details,
+        code,
+        message,
+    )
+}
+
 fn stream_global_release_batch_response(
     state: Arc<AppState>,
     user_id: String,
     requests: Vec<(i64, String)>,
 ) -> Response {
     let stream = async_stream::stream! {
+        for (release_id, _) in &requests {
+            let event = TranslateBatchStreamEvent {
+                event: "item",
+                item: Some(TranslateBatchItem {
+                    id: release_id.to_string(),
+                    lang: "zh-CN".to_owned(),
+                    status: "processing".to_owned(),
+                    title: None,
+                    summary: None,
+                    error: None,
+                    failure_class: None,
+                }),
+                error: None,
+            };
+            let mut payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_owned());
+            payload.push('\n');
+            yield Ok::<Bytes, Infallible>(Bytes::from(payload));
+        }
+
+        let mut pending = JoinSet::new();
         for (release_id, request_id) in requests {
-            loop {
-                match content_processing::get_request(state.as_ref(), &user_id, &request_id).await {
-                    Ok(Some(snapshot)) => {
-                        let (terminal, item) = global_release_batch_item_from_snapshot(release_id, &snapshot);
-                        if terminal {
-                            let event = TranslateBatchStreamEvent {
-                                event: "item",
-                                item: Some(item),
-                                error: None,
-                            };
-                            let mut payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_owned());
-                            payload.push('\n');
-                            yield Ok::<Bytes, Infallible>(Bytes::from(payload));
-                            break;
+            let state = state.clone();
+            let user_id = user_id.clone();
+            pending.spawn(async move {
+                loop {
+                    match content_processing::get_request(state.as_ref(), &user_id, &request_id).await {
+                        Ok(Some(snapshot)) => {
+                            let (terminal, item) = global_release_batch_item_from_snapshot(release_id, &snapshot);
+                            if terminal {
+                                break item;
+                            }
                         }
-                    }
-                    Ok(None) | Err(_) => {
-                        let event = TranslateBatchStreamEvent {
-                            event: "item",
-                            item: Some(TranslateBatchItem {
+                        Ok(None) | Err(_) => {
+                            break TranslateBatchItem {
                                 id: release_id.to_string(),
                                 lang: "zh-CN".to_owned(),
                                 status: "error".to_owned(),
@@ -19377,17 +19433,34 @@ fn stream_global_release_batch_response(
                                 summary: None,
                                 error: Some("translation request not found".to_owned()),
                                 failure_class: None,
-                            }),
-                            error: None,
-                        };
-                        let mut payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_owned());
-                        payload.push('\n');
-                        yield Ok::<Bytes, Infallible>(Bytes::from(payload));
-                        break;
+                            };
+                        }
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
+            });
+        }
+        while let Some(result) = pending.join_next().await {
+            let item = match result {
+                Ok(item) => item,
+                Err(_) => TranslateBatchItem {
+                    id: "unknown".to_owned(),
+                    lang: "zh-CN".to_owned(),
+                    status: "error".to_owned(),
+                    title: None,
+                    summary: None,
+                    error: Some("translation stream worker failed".to_owned()),
+                    failure_class: None,
+                },
+            };
+            let event = TranslateBatchStreamEvent {
+                event: "item",
+                item: Some(item),
+                error: None,
+            };
+            let mut payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_owned());
+            payload.push('\n');
+            yield Ok::<Bytes, Infallible>(Bytes::from(payload));
         }
         let mut payload = serde_json::to_string(&TranslateBatchStreamEvent {
             event: "done",
@@ -23245,6 +23318,8 @@ pub async fn translate_releases_batch(
         == content_processing::ContentProcessingMode::Global
     {
         let mut items = Vec::with_capacity(release_ids.len());
+        let mut conflicts = Vec::new();
+        let mut first_conflict = None;
         for release_id in release_ids {
             let input = global_release_request_item(
                 state.as_ref(),
@@ -23257,32 +23332,13 @@ pub async fn translate_releases_batch(
             let (status, response) =
                 content_processing::submit_item(state.as_ref(), &user_id, "async", &input).await?;
             if status == StatusCode::CONFLICT {
-                let message = response
-                    .error
-                    .as_ref()
-                    .and_then(|error| error.get("message").and_then(Value::as_str))
-                    .unwrap_or("content processing request conflicts with current work")
-                    .to_owned();
-                let code = if response
-                    .error
-                    .as_ref()
-                    .and_then(|error| error.get("code").and_then(Value::as_str))
-                    == Some("content_processing_superseded")
-                {
-                    "content_processing_superseded"
-                } else {
-                    "content_processing_active"
-                };
-                let mut details = response.error.unwrap_or_else(|| json!({}));
-                if let Some(object) = details.as_object_mut() {
-                    object.insert("request_id".to_owned(), json!(response.request_id));
-                    object.insert("work_item_id".to_owned(), json!(response.work_item_id));
-                    object.insert("status".to_owned(), json!(response.status));
-                    object.insert("poll_url".to_owned(), json!(response.poll_url));
+                let (item, details, code, message) = global_batch_conflict_item(&input, response);
+                if first_conflict.is_none() {
+                    first_conflict = Some((code, message));
                 }
-                return Err(
-                    ApiError::new(StatusCode::CONFLICT, code, message).with_details(details)
-                );
+                conflicts.push(json!({"item": item.clone(), "details": details}));
+                items.push(item);
+                continue;
             }
             let response_status = response.status.clone();
             let result = response.result;
@@ -23305,6 +23361,14 @@ pub async fn translate_releases_batch(
                 error: None,
                 failure_class: None,
             });
+        }
+        if let Some((code, message)) = first_conflict {
+            return Err(
+                ApiError::new(StatusCode::CONFLICT, code, message).with_details(json!({
+                    "items": items,
+                    "conflicts": conflicts,
+                })),
+            );
         }
         return Ok(Json(TranslateBatchResponse { items }));
     }
@@ -24071,6 +24135,8 @@ pub async fn translate_release_detail_batch(
         == content_processing::ContentProcessingMode::Global
     {
         let mut items = Vec::with_capacity(release_ids.len());
+        let mut conflicts = Vec::new();
+        let mut first_conflict = None;
         for release_id in release_ids {
             let input = global_release_request_item(
                 state.as_ref(),
@@ -24083,32 +24149,13 @@ pub async fn translate_release_detail_batch(
             let (status, response) =
                 content_processing::submit_item(state.as_ref(), &user_id, "async", &input).await?;
             if status == StatusCode::CONFLICT {
-                let message = response
-                    .error
-                    .as_ref()
-                    .and_then(|error| error.get("message").and_then(Value::as_str))
-                    .unwrap_or("content processing request conflicts with current work")
-                    .to_owned();
-                let code = if response
-                    .error
-                    .as_ref()
-                    .and_then(|error| error.get("code").and_then(Value::as_str))
-                    == Some("content_processing_superseded")
-                {
-                    "content_processing_superseded"
-                } else {
-                    "content_processing_active"
-                };
-                let mut details = response.error.unwrap_or_else(|| json!({}));
-                if let Some(object) = details.as_object_mut() {
-                    object.insert("request_id".to_owned(), json!(response.request_id));
-                    object.insert("work_item_id".to_owned(), json!(response.work_item_id));
-                    object.insert("status".to_owned(), json!(response.status));
-                    object.insert("poll_url".to_owned(), json!(response.poll_url));
+                let (item, details, code, message) = global_batch_conflict_item(&input, response);
+                if first_conflict.is_none() {
+                    first_conflict = Some((code, message));
                 }
-                return Err(
-                    ApiError::new(StatusCode::CONFLICT, code, message).with_details(details)
-                );
+                conflicts.push(json!({"item": item.clone(), "details": details}));
+                items.push(item);
+                continue;
             }
             let response_status = response.status.clone();
             let result = response.result;
@@ -24127,6 +24174,14 @@ pub async fn translate_release_detail_batch(
                 error: None,
                 failure_class: None,
             });
+        }
+        if let Some((code, message)) = first_conflict {
+            return Err(
+                ApiError::new(StatusCode::CONFLICT, code, message).with_details(json!({
+                    "items": items,
+                    "conflicts": conflicts,
+                })),
+            );
         }
         return Ok(Json(TranslateBatchResponse { items }));
     }
@@ -25129,40 +25184,21 @@ pub async fn translate_notifications_batch(
         == content_processing::ContentProcessingMode::Global
     {
         let mut items = Vec::with_capacity(thread_ids.len());
+        let mut conflicts = Vec::new();
+        let mut first_conflict = None;
         for thread_id in thread_ids {
             let input =
                 global_notification_request_item(state.as_ref(), &user_id, &thread_id).await?;
             let (item_status, response) =
                 content_processing::submit_item(state.as_ref(), &user_id, "async", &input).await?;
             if item_status == StatusCode::CONFLICT {
-                let message = response
-                    .error
-                    .as_ref()
-                    .and_then(|error| error.get("message").and_then(Value::as_str))
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| {
-                        "content processing request conflicts with current work".to_owned()
-                    });
-                let code = if response
-                    .error
-                    .as_ref()
-                    .and_then(|error| error.get("code").and_then(Value::as_str))
-                    == Some("content_processing_superseded")
-                {
-                    "content_processing_superseded"
-                } else {
-                    "content_processing_active"
-                };
-                let mut details = response.error.unwrap_or_else(|| json!({}));
-                if let Some(object) = details.as_object_mut() {
-                    object.insert("request_id".to_owned(), json!(response.request_id));
-                    object.insert("work_item_id".to_owned(), json!(response.work_item_id));
-                    object.insert("status".to_owned(), json!(response.status));
-                    object.insert("poll_url".to_owned(), json!(response.poll_url));
+                let (item, details, code, message) = global_batch_conflict_item(&input, response);
+                if first_conflict.is_none() {
+                    first_conflict = Some((code, message));
                 }
-                return Err(
-                    ApiError::new(StatusCode::CONFLICT, code, message).with_details(details)
-                );
+                conflicts.push(json!({"item": item.clone(), "details": details}));
+                items.push(item);
+                continue;
             }
             let response_status = response.status.clone();
             let result = response.result;
@@ -25181,6 +25217,14 @@ pub async fn translate_notifications_batch(
                 error: None,
                 failure_class: None,
             });
+        }
+        if let Some((code, message)) = first_conflict {
+            return Err(
+                ApiError::new(StatusCode::CONFLICT, code, message).with_details(json!({
+                    "items": items,
+                    "conflicts": conflicts,
+                })),
+            );
         }
         return Ok(Json(TranslateBatchResponse { items }));
     }
