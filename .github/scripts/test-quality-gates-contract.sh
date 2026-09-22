@@ -28,22 +28,25 @@ if grep -R -n -E '^[[:space:]]*runs-on:[[:space:]]+ubuntu-latest[[:space:]]*$' "
   exit 1
 fi
 
-for obsolete_action in \
-  'actions/checkout@v4' \
-  'actions/cache@v4' \
-  'actions/upload-artifact@v4' \
-  'actions/download-artifact@v4' \
-  'actions/github-script@v7' \
-  'actions/configure-pages@v5' \
-  'actions/upload-pages-artifact@v3' \
-  'actions/deploy-pages@v4' \
-  'docker/setup-buildx-action@v3' \
-  'docker/build-push-action@v6' \
-  'docker/setup-qemu-action@v3' \
-  'docker/login-action@v3' \
-  'softprops/action-gh-release@v2'; do
-  if grep -R -n -F "$obsolete_action" "$repo_root/.github/workflows"; then
-    echo "workflow action baseline still uses obsolete $obsolete_action" >&2
+for expected_action in \
+  'actions/checkout@v7' \
+  'actions/cache@v6' \
+  'actions/upload-artifact@v7' \
+  'actions/download-artifact@v8' \
+  'actions/github-script@v9' \
+  'actions/configure-pages@v6' \
+  'actions/upload-pages-artifact@v5' \
+  'actions/deploy-pages@v5' \
+  'docker/setup-buildx-action@v4' \
+  'docker/build-push-action@v7' \
+  'docker/setup-qemu-action@v4' \
+  'docker/login-action@v4' \
+  'oven-sh/setup-bun@v2' \
+  'softprops/action-gh-release@v3'; do
+  action_name="${expected_action%@*}"
+  references="$(grep -RhoE "${action_name}@v[0-9]+" "$repo_root/.github" | sort -u || true)"
+  if [[ "${references}" != "${expected_action}" ]]; then
+    echo "workflow action baseline drifted for ${action_name}: expected ${expected_action}, got ${references:-<none>}" >&2
     exit 1
   fi
 done
