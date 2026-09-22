@@ -20452,7 +20452,7 @@ pub(crate) async fn global_release_request_item(
         "summary"
     };
     let source_revision_tiebreak = content_processing::source_revision_content_tiebreak(&[
-        repo_full_name.as_str(),
+        row.html_url.as_str(),
         row.tag_name.as_str(),
         title.as_str(),
         body.as_str(),

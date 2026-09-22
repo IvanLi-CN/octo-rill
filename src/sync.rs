@@ -9053,7 +9053,35 @@ async fn upsert_repo_releases(
                     .or(release.published_at.as_deref())
                     .or(release.created_at.as_deref())
                     .unwrap_or("");
+                let incoming_source_tiebreak = content_processing::source_revision_content_tiebreak(&[
+                    release.html_url.as_str(),
+                    release.tag_name.as_str(),
+                    release
+                        .name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or(release.tag_name.as_str()),
+                    release.body.as_deref().unwrap_or_default(),
+                ]);
                 if let Some(existing) = existing.as_ref() {
+                    let existing_source_tiebreak = content_processing::source_revision_content_tiebreak(&[
+                        existing.html_url.as_str(),
+                        existing.tag_name.as_str(),
+                        existing
+                            .name
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or(existing.tag_name.as_str()),
+                        existing.body.as_deref().unwrap_or_default(),
+                    ]);
+                    if existing.updated_at == source_revision
+                        && incoming_source_tiebreak < existing_source_tiebreak
+                    {
+                        stats.unchanged_count += 1;
+                        continue;
+                    }
                     let unchanged = existing.node_id == release.node_id
                         && existing.tag_name == release.tag_name
                         && existing.name == release.name
@@ -21805,7 +21833,7 @@ mod tests {
         assert_eq!(unchanged.unchanged_count, 1);
 
         let mut edited = release;
-        edited.body = Some("edited body".to_owned());
+        edited.body = Some("updated body".to_owned());
         let updated = upsert_repo_releases(state.as_ref(), 42, std::slice::from_ref(&edited), None)
             .await
             .expect("update release");
@@ -21827,7 +21855,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("load release after stale payload");
-        assert_eq!(stored.0.as_deref(), Some("edited body"));
+        assert_eq!(stored.0.as_deref(), Some("updated body"));
         assert_eq!(stored.1, "2026-03-06T10:30:00Z");
     }
 

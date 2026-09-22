@@ -137,6 +137,10 @@ Release and announcement canonical content tuples provide the stable tie-break
 domain when the upstream timestamp is equal, and the same tuple is recomputed
 from the stored canonical source during provider admission. Route fallback
 provider admissions retain the `fallback` relation role for audit consumers.
+An admission rejected after its diagnostic row is created finalizes that row as
+a transient failed call rather than leaving a running diagnostic behind. If a
+source disappears after a provider response, the call-to-attempt audit link is
+retained while the work is cancelled without publishing output.
 Legacy snapshots without revision metadata use a fail-closed compatibility
 fallback: a revision-bearing candidate may supersede an unknown legacy source,
 while two unknown revisions are never ordered by synchronization arrival.
