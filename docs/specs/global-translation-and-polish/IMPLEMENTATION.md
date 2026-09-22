@@ -133,9 +133,10 @@ older upstream page cannot regress the canonical source row. Release rows
 created by the legacy sync path are recognized by their ingest timestamp and
 upgraded to the first authoritative upstream revision; a revision-bearing
 worker fails closed when the live source has no usable revision.
-Release and announcement content digests provide the stable tie-break domain
-when the upstream timestamp is equal, and the same digest is recomputed from
-the stored canonical source during provider admission.
+Release and announcement canonical content tuples provide the stable tie-break
+domain when the upstream timestamp is equal, and the same tuple is recomputed
+from the stored canonical source during provider admission. Route fallback
+provider admissions retain the `fallback` relation role for audit consumers.
 Legacy snapshots without revision metadata use a fail-closed compatibility
 fallback: a revision-bearing candidate may supersede an unknown legacy source,
 while two unknown revisions are never ordered by synchronization arrival.
