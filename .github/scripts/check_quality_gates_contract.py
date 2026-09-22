@@ -1002,8 +1002,8 @@ def validate_label_gate(path: Path, contract: ContractModel) -> None:
         "label-gate.yml: candidate checkout must disable persisted credentials",
     )
     require(
-        candidate_checkout.get("allow-unsafe-pr-checkout") is True,
-        "label-gate.yml: candidate checkout must explicitly allow trusted fork checkout",
+        "allow-unsafe-pr-checkout" not in candidate_checkout,
+        "label-gate.yml: checkout@v4 candidate path must not declare a newer-action-only input",
     )
     contract_step = step_config(job, "Validate trusted label-gate contract", "label-gate.yml.jobs.validate-pr-labels")
     require_no_if(contract_step, "label-gate.yml.jobs.validate-pr-labels.steps['Validate trusted label-gate contract']")

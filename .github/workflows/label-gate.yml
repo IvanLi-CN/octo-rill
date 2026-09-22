@@ -40,8 +40,6 @@ jobs:
           fetch-depth: 1
           path: candidate
           persist-credentials: false
-          # The trusted workflow reads fork files as data; it never executes candidate code.
-          allow-unsafe-pr-checkout: true
 
       - name: Validate trusted label-gate contract
         run: |
