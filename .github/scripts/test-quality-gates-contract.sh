@@ -23,6 +23,50 @@ python3 "$repo_root/.github/scripts/check_quality_gates_contract.py" \
   --metadata-script "$repo_root/.github/scripts/metadata_gate.py" \
   --profile final
 
+if grep -R -n -E '^[[:space:]]*runs-on:[[:space:]]+ubuntu-latest[[:space:]]*$' \
+  "$repo_root/.github/workflows" \
+  "$repo_root/.github/scripts/fixtures/quality-gates-contract"; then
+  echo "workflow runner baseline must not use ubuntu-latest" >&2
+  exit 1
+fi
+
+for workflow in ci.yml docs-pages.yml label-gate.yml release.yml review-policy.yml rust-source-quality.yml; do
+  if ! grep -q -F 'FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true' "$repo_root/.github/workflows/$workflow"; then
+    echo "workflow $workflow must force JavaScript actions onto Node24" >&2
+    exit 1
+  fi
+done
+
+while IFS='|' read -r action_name legacy_action current_action; do
+  references="$(grep -RhoE --include='*.yml' --include='*.yaml' "${action_name}@v[0-9]+" "$repo_root/.github" | sort -u || true)"
+  if [[ -z "${references}" ]]; then
+    echo "workflow action baseline missing for ${action_name}" >&2
+    exit 1
+  fi
+  while IFS= read -r reference; do
+    [[ -z "${reference}" ]] && continue
+    if [[ "${reference}" != "${legacy_action}" && "${reference}" != "${current_action}" ]]; then
+      echo "workflow action baseline drifted for ${action_name}: allowed ${legacy_action} or ${current_action}, got ${reference}" >&2
+      exit 1
+    fi
+  done <<< "${references}"
+done <<'EOF'
+actions/checkout|actions/checkout@v4|actions/checkout@v7
+actions/cache|actions/cache@v4|actions/cache@v6
+actions/upload-artifact|actions/upload-artifact@v4|actions/upload-artifact@v7
+actions/download-artifact|actions/download-artifact@v8|actions/download-artifact@v8
+actions/github-script|actions/github-script@v7|actions/github-script@v9
+actions/configure-pages|actions/configure-pages@v6|actions/configure-pages@v6
+actions/upload-pages-artifact|actions/upload-pages-artifact@v5|actions/upload-pages-artifact@v5
+actions/deploy-pages|actions/deploy-pages@v5|actions/deploy-pages@v5
+docker/setup-buildx-action|docker/setup-buildx-action@v4|docker/setup-buildx-action@v4
+docker/build-push-action|docker/build-push-action@v6|docker/build-push-action@v7
+docker/setup-qemu-action|docker/setup-qemu-action@v4|docker/setup-qemu-action@v4
+docker/login-action|docker/login-action@v4|docker/login-action@v4
+oven-sh/setup-bun|oven-sh/setup-bun@v2|oven-sh/setup-bun@v2
+softprops/action-gh-release|softprops/action-gh-release@v3|softprops/action-gh-release@v3
+EOF
+
 if python3 "$repo_root/.github/scripts/check_quality_gates_contract.py" \
   --repo-root "$repo_root" \
   --declaration "$repo_root/.github/quality-gates.json" \
@@ -107,6 +151,52 @@ fi
 
 grep -q "review-policy.yml: trusted-source fetch drifted" "$tmp_dir/review.log"
 
+runner_repo="$tmp_dir/runner-repo"
+mkdir -p "$runner_repo"
+cp -R "$repo_root/.github" "$runner_repo/.github"
+python3 - <<'PY' "$runner_repo"
+from pathlib import Path
+import sys
+
+repo = Path(sys.argv[1])
+path = repo / ".github/workflows/ci.yml"
+text = path.read_text()
+needle = "          - os: ubuntu-24.04\n"
+if needle not in text:
+    raise SystemExit("failed to locate worktree Ubuntu matrix runner")
+path.write_text(text.replace(needle, "          - os: ubuntu-latest\n", 1))
+PY
+
+if python3 "$repo_root/.github/scripts/check_quality_gates_contract.py" --repo-root "$runner_repo" --profile final >/dev/null 2>"$tmp_dir/runner.log"; then
+  echo "expected worktree matrix runner drift to fail" >&2
+  exit 1
+fi
+
+grep -q "ci.yml.jobs.worktree-bootstrap.runs-on must use the supported Ubuntu baseline" "$tmp_dir/runner.log"
+
+dynamic_runner_repo="$tmp_dir/dynamic-runner-repo"
+mkdir -p "$dynamic_runner_repo"
+cp -R "$repo_root/.github" "$dynamic_runner_repo/.github"
+python3 - <<'PY' "$dynamic_runner_repo"
+from pathlib import Path
+import sys
+
+repo = Path(sys.argv[1])
+path = repo / ".github/workflows/ci.yml"
+text = path.read_text()
+text = text.replace("runs-on: ${{ matrix.os }}", "runs-on: ${{ matrix.runner }}", 1)
+text = text.replace("          - os: ", "          - runner: ")
+text = text.replace("          - runner: ubuntu-24.04\n", "          - runner: ubuntu-latest\n", 1)
+path.write_text(text)
+PY
+
+if python3 "$repo_root/.github/scripts/check_quality_gates_contract.py" --repo-root "$dynamic_runner_repo" --profile final >/dev/null 2>"$tmp_dir/dynamic-runner.log"; then
+  echo "expected dynamic matrix runner drift to fail" >&2
+  exit 1
+fi
+
+grep -q "ci.yml.jobs.worktree-bootstrap.runs-on must use the supported Ubuntu baseline" "$tmp_dir/dynamic-runner.log"
+
 python3 - <<'PY' "$repo_root" "$tmp_dir"
 from pathlib import Path
 import re
@@ -177,8 +267,8 @@ workflow_cases = (
     (
         "build-needs",
         lambda text: text.replace(
-            "    runs-on: ubuntu-latest\n    if: github.event_name ==",
-            "    runs-on: ubuntu-latest\n    needs: []\n    if: github.event_name ==",
+            "    runs-on: ubuntu-24.04\n    if: github.event_name ==",
+            "    runs-on: ubuntu-24.04\n    needs: []\n    if: github.event_name ==",
             1,
         ),
         "ci.yml.jobs.build must not wait on unrelated jobs",

@@ -308,6 +308,39 @@ def expand_job_names(name: str, job: dict[str, Any], where: str) -> set[str]:
     return expanded
 
 
+def validate_runner_baseline(path: Path) -> None:
+    workflow = load_yaml(path)
+    for job_id, raw_job in workflow_jobs(workflow, path.name).items():
+        job = require_mapping(raw_job, f"{path.name}.jobs.{job_id}")
+        runs_on = job.get("runs-on")
+        if runs_on is None and "uses" in job:
+            continue
+        require(isinstance(runs_on, str) and runs_on, f"{path.name}.jobs.{job_id}.runs-on must be a non-empty string")
+
+        matrix_match = re.fullmatch(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}", runs_on)
+        if matrix_match:
+            matrix_key = matrix_match.group(1)
+            combinations = static_matrix_axes(job, f"{path.name}.jobs.{job_id}")
+            require(combinations is not None, f"{path.name}.jobs.{job_id}.matrix runner values must be statically declared")
+            runner_labels = [str(item.get(matrix_key, "")) for item in combinations or []]
+            require(
+                all(runner_labels),
+                f"{path.name}.jobs.{job_id}.matrix runner values must declare {matrix_key}",
+            )
+        else:
+            require("${{" not in runs_on, f"{path.name}.jobs.{job_id}.runs-on contains an unsupported expression")
+            runner_labels = [runs_on]
+
+        for runner_label in runner_labels:
+            if runner_label == "ubuntu-latest" or (
+                runner_label.startswith("ubuntu-")
+                and runner_label not in {"ubuntu-24.04", "ubuntu-24.04-arm"}
+            ):
+                raise ContractError(
+                    f"{path.name}.jobs.{job_id}.runs-on must use the supported Ubuntu baseline, got {runner_label!r}"
+                )
+
+
 def require_exact_named_jobs(workflow: dict[str, Any], expected_jobs: set[str], where: str) -> None:
     actual_jobs = workflow_named_job_names(workflow, where)
     require(
@@ -328,6 +361,15 @@ def step_config(job: dict[str, Any], step_name: str, where: str) -> dict[str, An
 def uses_step_config(job: dict[str, Any], step_name: str, expected_uses: str, where: str) -> dict[str, Any]:
     step = step_config(job, step_name, where)
     require(step.get("uses") == expected_uses, f"{where}.steps[{step_name!r}].uses must stay {expected_uses!r}")
+    return step
+
+
+def uses_step_config_one_of(job: dict[str, Any], step_name: str, expected_uses: set[str], where: str) -> dict[str, Any]:
+    step = step_config(job, step_name, where)
+    require(
+        step.get("uses") in expected_uses,
+        f"{where}.steps[{step_name!r}].uses must stay one of {sorted(expected_uses)!r}",
+    )
     return step
 
 
@@ -390,7 +432,7 @@ def command_option_map(command: list[str], where: str) -> dict[str, str]:
 
 
 def checkout_step(job: dict[str, Any], step_name: str, where: str) -> dict[str, Any]:
-    step = uses_step_config(job, step_name, "actions/checkout@v4", where)
+    step = uses_step_config_one_of(job, step_name, {"actions/checkout@v4", "actions/checkout@v7"}, where)
     return require_mapping(step.get("with"), f"{where}.steps[{step_name!r}].with")
 
 
@@ -652,10 +694,10 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
             not ("cargo build" in step_text and "--release" in step_text),
             f"ci.yml.jobs.build.steps[{index}] must not repeat a host release compilation",
         )
-    docker_step = uses_step_config(
+    docker_step = uses_step_config_one_of(
         build_job,
         "Build Docker smoke image (linux/amd64)",
-        "docker/build-push-action@v6",
+        {"docker/build-push-action@v6", "docker/build-push-action@v7"},
         "ci.yml.jobs.build",
     )
     docker_with = require_mapping(
@@ -705,10 +747,10 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
         and "--reporter=list,json" in playwright_run,
         "ci.yml: controlled E2E must force a JSON reporter for immutable historical targets",
     )
-    tooling_checkout = uses_step_config(
+    tooling_checkout = uses_step_config_one_of(
         frontend_job,
         "Checkout acceptance E2E tooling",
-        "actions/checkout@v4",
+        {"actions/checkout@v4", "actions/checkout@v7"},
         "ci.yml.jobs.frontend-e2e",
     )
     require(
@@ -740,10 +782,10 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
         and "playwright-summary.json" in summary_run,
         "ci.yml: Playwright summary step must consume the JSON report and write the JSON summary",
     )
-    artifact_step = uses_step_config(
+    artifact_step = uses_step_config_one_of(
         frontend_job,
         "Upload Playwright results",
-        "actions/upload-artifact@v4",
+        {"actions/upload-artifact@v4", "actions/upload-artifact@v7"},
         "ci.yml.jobs.frontend-e2e",
     )
     require(artifact_step.get("if") == "${{ always() }}", "ci.yml: Playwright artifact upload must run with always()")
@@ -775,7 +817,12 @@ def validate_ci(path: Path, contract: ContractModel) -> None:
     lint_job = named_job_config(workflow, "lint", expected_jobs, "ci.yml")
     require_no_if(lint_job, "ci.yml.jobs.lint")
     require_fail_closed(lint_job, "ci.yml.jobs.lint")
-    checkout = uses_step_config(lint_job, "Checkout", "actions/checkout@v4", "ci.yml.jobs.lint")
+    checkout = uses_step_config_one_of(
+        lint_job,
+        "Checkout",
+        {"actions/checkout@v4", "actions/checkout@v7"},
+        "ci.yml.jobs.lint",
+    )
     checkout_with = require_mapping(checkout.get("with"), "ci.yml.jobs.lint.steps['Checkout'].with")
     require(checkout_with.get("fetch-depth") == 0, "ci.yml.jobs.lint Checkout must fetch full history for trusted source resolution")
     check_scripts = step_config(lint_job, "Check quality-gates scripts", "ci.yml.jobs.lint")
@@ -959,6 +1006,10 @@ def validate_label_gate(path: Path, contract: ContractModel) -> None:
     require(
         candidate_checkout.get("persist-credentials") is False,
         "label-gate.yml: candidate checkout must disable persisted credentials",
+    )
+    require(
+        "allow-unsafe-pr-checkout" not in candidate_checkout,
+        "label-gate.yml: checkout@v4 candidate path must not declare a newer-action-only input",
     )
     contract_step = step_config(job, "Validate trusted label-gate contract", "label-gate.yml.jobs.validate-pr-labels")
     require_no_if(contract_step, "label-gate.yml.jobs.validate-pr-labels.steps['Validate trusted label-gate contract']")
@@ -1178,7 +1229,7 @@ def validate_bootstrap_label_gate(path: Path, contract: ContractModel) -> None:
     require(job.get("name") == contract.label_check_name, "label-gate.yml: required label check name drifted")
     require_no_if(job, "label-gate.yml.jobs.label-gate")
     require_fail_closed(job, "label-gate.yml.jobs.label-gate")
-    step = uses_step_config(job, "Validate release intent labels", "actions/github-script@v7", "label-gate.yml.jobs.label-gate")
+    step = uses_step_config(job, "Validate release intent labels", "actions/github-script@v9", "label-gate.yml.jobs.label-gate")
     require("script" in step.get("with", {}), "label-gate.yml: github-script step must keep the inline script")
 
 
@@ -1213,7 +1264,7 @@ def validate_bootstrap_review_policy(path: Path, contract: ContractModel) -> Non
     job = named_job_config(workflow, "review-policy", expected_jobs, "review-policy.yml")
     require_no_if(job, "review-policy.yml.jobs.review-policy")
     require_fail_closed(job, "review-policy.yml.jobs.review-policy")
-    step = uses_step_config(job, "Evaluate review policy", "actions/github-script@v7", "review-policy.yml.jobs.review-policy")
+    step = uses_step_config(job, "Evaluate review policy", "actions/github-script@v9", "review-policy.yml.jobs.review-policy")
     step_with = require_mapping(step.get("with"), "review-policy.yml.jobs.review-policy.steps['Evaluate review policy'].with")
     script = step_with.get("script")
     require(isinstance(script, str) and script, "review-policy.yml: github-script body must stay non-empty")
@@ -1307,6 +1358,15 @@ def main() -> int:
             f"quality-gates.json: implementation_profile={contract.implementation_profile!r} does not match workflow profile {profile!r}",
         )
         if profile == "final":
+            for workflow_name in (
+                "ci.yml",
+                "docs-pages.yml",
+                "label-gate.yml",
+                "release.yml",
+                "review-policy.yml",
+                "rust-source-quality.yml",
+            ):
+                validate_runner_baseline(repo_root / ".github" / "workflows" / workflow_name)
             validate_ci(repo_root / ".github" / "workflows" / "ci.yml", contract)
             if "Rust Source Quality" in contract.required_checks:
                 validate_rust_source_quality_workflow(

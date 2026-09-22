@@ -41,10 +41,13 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   lint:
     name: Lint & Checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -296,7 +299,7 @@ jobs:
 
   unit-tests:
     name: Backend Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - name: Checkout
@@ -328,7 +331,7 @@ jobs:
 
   frontend-e2e:
     name: Frontend E2E
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
@@ -457,13 +460,18 @@ jobs:
           retention-days: 14
 
   worktree-bootstrap:
-    name: Worktree Bootstrap Smoke (${{ matrix.os }})
+    name: Worktree Bootstrap Smoke (${{ matrix.check_name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Keep the required status context stable while pinning the hosted runner.
+        include:
+          - os: ubuntu-24.04
+            check_name: ubuntu-latest
+          - os: macos-latest
+            check_name: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -493,7 +501,7 @@ jobs:
 
   build:
     name: Build (Release)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.ci_performance_acceptance == true)
     timeout-minutes: 25
     env:
@@ -506,7 +514,7 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ci_performance_acceptance && inputs.ci_performance_target_sha || github.sha }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build Docker smoke image (linux/amd64)
         uses: docker/build-push-action@v6
