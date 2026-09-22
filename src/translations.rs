@@ -2150,9 +2150,6 @@ async fn submit_global_translation_request(
             let (status, response) =
                 content_processing::submit_item(state, user_id, mode, &item).await?;
             if mode == "stream" {
-                if status == StatusCode::CONFLICT {
-                    return Ok((status, Json(response)).into_response());
-                }
                 return Ok(stream_global_translation_request_response_for_api(
                     Arc::new(state.clone()),
                     user_id.to_owned(),
@@ -2166,12 +2163,21 @@ async fn submit_global_translation_request(
             let mut status = StatusCode::ACCEPTED;
             let mut saw_active_conflict = false;
             let mut saw_superseded_conflict = false;
+            let mut first_conflict_details = None;
             for item in items {
                 let item = api::canonical_global_translation_item(state, user_id, &item).await?;
                 let (item_status, response) =
                     content_processing::submit_item(state, user_id, mode, &item).await?;
                 if item_status == StatusCode::CONFLICT {
                     status = StatusCode::CONFLICT;
+                    let mut details = response.error.clone().unwrap_or_else(|| json!({}));
+                    if let Some(object) = details.as_object_mut() {
+                        object.insert("request_id".to_owned(), json!(response.request_id));
+                        object.insert("work_item_id".to_owned(), json!(response.work_item_id));
+                        object.insert("status".to_owned(), json!(response.status));
+                        object.insert("poll_url".to_owned(), json!(response.poll_url));
+                    }
+                    first_conflict_details.get_or_insert(details);
                     if response
                         .error
                         .as_ref()
@@ -2192,10 +2198,18 @@ async fn submit_global_translation_request(
                     (false, true) => "content_processing_superseded",
                     _ => "content_processing_active",
                 };
-                body["error"] = json!({
-                    "code": conflict_code,
-                    "message": "one or more content-processing requests are already queued or running",
-                });
+                let mut error = first_conflict_details.unwrap_or_else(|| json!({}));
+                if let Some(object) = error.as_object_mut() {
+                    object.insert("code".to_owned(), Value::String(conflict_code.to_owned()));
+                    object.insert(
+                        "message".to_owned(),
+                        Value::String(
+                            "one or more content-processing requests are already queued or running"
+                                .to_owned(),
+                        ),
+                    );
+                }
+                body["error"] = error;
             }
             Ok((status, Json(body)).into_response())
         }

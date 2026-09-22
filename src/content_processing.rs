@@ -3188,6 +3188,22 @@ fn source_revision_snapshot_json(observed_at: Option<String>, tiebreak: String) 
     json!({"source_blocks": blocks}).to_string()
 }
 
+pub(crate) fn notification_source_revision_tiebreak(
+    thread_id: &str,
+    repo_full_name: Option<&str>,
+    subject_title: Option<&str>,
+    reason: Option<&str>,
+    subject_type: Option<&str>,
+) -> String {
+    format!(
+        "thread={thread_id}\nrepo={}\ntitle={}\nreason={}\nsubject_type={}",
+        repo_full_name.unwrap_or_default(),
+        subject_title.unwrap_or_default(),
+        reason.unwrap_or_default(),
+        subject_type.unwrap_or_default(),
+    )
+}
+
 async fn current_source_revision_snapshot_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     work: &WorkRow,
@@ -3200,28 +3216,57 @@ async fn current_source_revision_snapshot_in_transaction(
         .fetch_optional(&mut **tx)
         .await?
         .map(|(updated_at, id)| (Some(updated_at), id)),
-        "notification" => sqlx::query_as::<_, (Option<String>, String)>(
-            "SELECT updated_at, id FROM notifications WHERE thread_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
+        "notification" => sqlx::query_as::<_, (
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>(
+            "SELECT updated_at, thread_id, repo_full_name, subject_title, reason, subject_type FROM notifications WHERE thread_id = ? ORDER BY updated_at DESC, COALESCE(repo_full_name, '') DESC, COALESCE(subject_title, '') DESC, COALESCE(reason, '') DESC, COALESCE(subject_type, '') DESC, thread_id DESC LIMIT 1",
         )
         .bind(&work.canonical_resource_id)
         .fetch_optional(&mut **tx)
-        .await?,
+        .await?
+        .map(|(updated_at, thread_id, repo, title, reason, subject_type)| {
+            (
+                updated_at,
+                notification_source_revision_tiebreak(
+                    &thread_id,
+                    repo.as_deref(),
+                    title.as_deref(),
+                    reason.as_deref(),
+                    subject_type.as_deref(),
+                ),
+            )
+        }),
         "announcement" => {
             let Some((repo, number)) = work.canonical_resource_id.rsplit_once('#') else {
                 return Ok(None);
             };
             let number = number.parse::<i64>().unwrap_or_default();
-            sqlx::query_as::<_, (Option<String>, String)>(
-                "SELECT occurred_at, id FROM social_activity_events WHERE kind = 'announcement' AND lower(repo_full_name) = lower(?) AND discussion_number = ? ORDER BY occurred_at DESC, id DESC LIMIT 1",
+            sqlx::query_as::<_, (Option<String>,)>(
+                "SELECT occurred_at FROM social_activity_events WHERE kind = 'announcement' AND lower(repo_full_name) = lower(?) AND discussion_number = ? ORDER BY occurred_at DESC LIMIT 1",
             )
             .bind(repo)
             .bind(number)
             .fetch_optional(&mut **tx)
             .await?
+            .map(|(occurred_at,)| (occurred_at, work.canonical_resource_id.clone()))
         }
         _ => None,
     };
-    Ok(revision.map(|(observed_at, id)| source_revision_snapshot_json(observed_at, id)))
+    let Some((observed_at, tiebreak)) = revision else {
+        return Ok(None);
+    };
+    let Some(observed_at) = observed_at else {
+        return Ok(None);
+    };
+    Ok(Some(source_revision_snapshot_json(
+        Some(observed_at),
+        tiebreak,
+    )))
 }
 
 async fn source_revision_is_current_in_transaction(
@@ -3233,7 +3278,7 @@ async fn source_revision_is_current_in_transaction(
     }
     let Some(current_snapshot) = current_source_revision_snapshot_in_transaction(tx, work).await?
     else {
-        return Ok(source_observed_at(&work.source_snapshot_json).is_none());
+        return Ok(false);
     };
     Ok(!source_version_is_newer(
         &current_snapshot,
