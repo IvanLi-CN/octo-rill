@@ -2886,10 +2886,14 @@ async fn request_global_completion(
     let admission_work = spec.work.clone();
     let admission_role = spec.role.to_owned();
     let admission_ordinals = spec.call_ordinal_counter.clone();
-    let provider_admission: ai::ProviderAdmissionGuard = Arc::new(move || {
+    let provider_admission: ai::ProviderAdmissionGuard = Arc::new(move |candidate_index| {
         let state = admission_state.clone();
         let work = admission_work.clone();
-        let role = admission_role.clone();
+        let role = if candidate_index > 0 {
+            "fallback".to_owned()
+        } else {
+            admission_role.clone()
+        };
         let call_ordinal = admission_ordinals.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             if !renew_global_work_lease(&state, &work).await? {
@@ -3211,7 +3215,7 @@ pub(crate) fn notification_source_revision_tiebreak(
 }
 
 pub(crate) fn source_revision_content_tiebreak(parts: &[&str]) -> String {
-    ai::sha256_hex(&parts.join("\n"))
+    parts.join("\n")
 }
 
 async fn current_source_revision_snapshot_in_transaction(
@@ -3286,7 +3290,7 @@ async fn current_source_revision_snapshot_in_transaction(
             };
             let number = number.parse::<i64>().unwrap_or_default();
             sqlx::query_as::<_, (Option<String>, String, i64, Option<String>, Option<String>)>(
-                "SELECT occurred_at, lower(repo_full_name), discussion_number, title, body FROM social_activity_events WHERE kind = 'announcement' AND lower(repo_full_name) = lower(?) AND discussion_number = ? ORDER BY occurred_at DESC LIMIT 1",
+                "SELECT occurred_at, lower(repo_full_name), discussion_number, title, body FROM social_activity_events WHERE kind = 'announcement' AND lower(repo_full_name) = lower(?) AND discussion_number = ? ORDER BY occurred_at DESC, COALESCE(title, '') DESC, COALESCE(body, '') DESC, id DESC LIMIT 1",
             )
             .bind(repo)
             .bind(number)

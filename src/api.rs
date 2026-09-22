@@ -9092,7 +9092,7 @@ async fn fetch_announcement_detail_source_from_db(
           AND e.kind = 'announcement'
           AND lower(e.repo_full_name) = lower(?)
           AND e.discussion_number = ?
-        ORDER BY e.occurred_at DESC, e.id DESC
+        ORDER BY e.occurred_at DESC, COALESCE(e.title, '') DESC, COALESCE(e.body, '') DESC, e.id DESC
         LIMIT 1
         "#,
     )
