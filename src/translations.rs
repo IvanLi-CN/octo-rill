@@ -2164,7 +2164,8 @@ async fn submit_global_translation_request(
         NormalizedTranslationSubmit::Batch(items) => {
             let mut responses = Vec::with_capacity(items.len());
             let mut status = StatusCode::ACCEPTED;
-            let mut conflict_code = "content_processing_active";
+            let mut saw_active_conflict = false;
+            let mut saw_superseded_conflict = false;
             for item in items {
                 let item = api::canonical_global_translation_item(state, user_id, &item).await?;
                 let (item_status, response) =
@@ -2177,13 +2178,20 @@ async fn submit_global_translation_request(
                         .and_then(|error| error.get("code").and_then(Value::as_str))
                         == Some("content_processing_superseded")
                     {
-                        conflict_code = "content_processing_superseded";
+                        saw_superseded_conflict = true;
+                    } else {
+                        saw_active_conflict = true;
                     }
                 }
                 responses.push(response);
             }
             let mut body = json!({ "requests": responses });
             if status == StatusCode::CONFLICT {
+                let conflict_code = match (saw_active_conflict, saw_superseded_conflict) {
+                    (true, true) => "content_processing_conflict",
+                    (false, true) => "content_processing_superseded",
+                    _ => "content_processing_active",
+                };
                 body["error"] = json!({
                     "code": conflict_code,
                     "message": "one or more content-processing requests are already queued or running",

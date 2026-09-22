@@ -25089,6 +25089,9 @@ pub async fn translate_notification(
         )
         .await?;
         if matches!(mode, ReturnMode::Sse) {
+            if status == StatusCode::CONFLICT {
+                return Ok((status, Json(response)).into_response());
+            }
             return Ok(
                 translations::stream_global_translation_request_response_for_api(
                     state,
