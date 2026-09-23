@@ -89,6 +89,16 @@ const collectionActivityCache = new Map<
 	string,
 	{ data: AdminCollectionActivityResponse; storedAt: number }
 >();
+const collectionListCacheHandoff = new Set<string>();
+const collectionActivityCacheHandoff = new Set<string>();
+let collectionListCacheHandoffPending = false;
+let collectionActivityCacheHandoffPending = false;
+const DETAIL_LIST_CACHE_HANDOFF_KEY = "octo-rill:ai-records:list-handoff";
+const DETAIL_ACTIVITY_CACHE_HANDOFF_KEY =
+	"octo-rill:ai-records:activity-handoff";
+const DETAIL_LIST_CACHE_DATA_KEY = "octo-rill:ai-records:list-handoff-data";
+const DETAIL_ACTIVITY_CACHE_DATA_KEY =
+	"octo-rill:ai-records:activity-handoff-data";
 const ATTEMPT_RANGE_MAX = 10;
 const ATTEMPT_UNBOUNDED_VALUE = ATTEMPT_RANGE_MAX + 1;
 const DEFAULT_ATTEMPT_RANGE: AttemptCountRange = { min: 0, max: null };
@@ -1204,12 +1214,6 @@ export function AiOperationsRecordsSection({
 			translationStatuses,
 		],
 	);
-	const navigateToRecord = useCallback(
-		(kind: CollectionTab, id: string) => {
-			onOpenRecord(kind, id);
-		},
-		[onOpenRecord],
-	);
 	const routeFiltersKey = aiRecordFiltersKey(routeFilters);
 	const appliedRouteFiltersKeyRef = useRef(routeFiltersKey);
 	useEffect(() => {
@@ -1270,6 +1274,33 @@ export function AiOperationsRecordsSection({
 	const listParamsKey = listParams.toString();
 	const listQueryKey = `${tab}?${listParamsKey}&demo_case=${demoDataCacheKey}`;
 	const activityCacheKey = `${tab}:${demoDataCacheKey}`;
+	const activityCacheKeyRef = useRef(activityCacheKey);
+	const navigateToRecord = useCallback(
+		(kind: CollectionTab, id: string) => {
+			collectionListCacheHandoff.add(listQueryKey);
+			collectionActivityCacheHandoff.add(activityCacheKey);
+			collectionListCacheHandoffPending = true;
+			collectionActivityCacheHandoffPending = true;
+			window.sessionStorage.setItem(DETAIL_LIST_CACHE_HANDOFF_KEY, "1");
+			window.sessionStorage.setItem(DETAIL_ACTIVITY_CACHE_HANDOFF_KEY, "1");
+			const listEntry = collectionListCache.get(listQueryKey);
+			if (listEntry) {
+				window.sessionStorage.setItem(
+					DETAIL_LIST_CACHE_DATA_KEY,
+					JSON.stringify({ queryKey: listQueryKey, ...listEntry }),
+				);
+			}
+			const activityEntry = collectionActivityCache.get(activityCacheKey);
+			if (activityEntry) {
+				window.sessionStorage.setItem(
+					DETAIL_ACTIVITY_CACHE_DATA_KEY,
+					JSON.stringify(activityEntry),
+				);
+			}
+			onOpenRecord(kind, id);
+		},
+		[activityCacheKey, listQueryKey, onOpenRecord],
+	);
 	const currentList =
 		lastSuccessfulList?.queryKey === listQueryKey ? lastSuccessfulList : null;
 	const items = currentList?.items ?? [];
@@ -1325,7 +1356,18 @@ export function AiOperationsRecordsSection({
 		translationStatuses,
 	]);
 	useEffect(() => {
-		if (activityTabRef.current !== tab) {
+		if (!detailRoute) return;
+		collectionListCacheHandoff.add(listQueryKey);
+		collectionActivityCacheHandoff.add(activityCacheKey);
+		return () => {
+			collectionListCacheHandoff.add(listQueryKey);
+			collectionActivityCacheHandoff.add(activityCacheKey);
+		};
+	}, [activityCacheKey, detailRoute, listQueryKey]);
+	useEffect(() => {
+		const cacheKeyChanged = activityCacheKeyRef.current !== activityCacheKey;
+		activityCacheKeyRef.current = activityCacheKey;
+		if (activityTabRef.current !== tab || cacheKeyChanged) {
 			activityTabRef.current = tab;
 			activityNeedsReadRef.current = true;
 			activityForceReadRef.current = true;
@@ -1342,6 +1384,55 @@ export function AiOperationsRecordsSection({
 		const cachedList = collectionListCache.get(listQueryKey);
 		const isInitialMount = listInitialMountRef.current;
 		listInitialMountRef.current = false;
+		if (detailRoute) {
+			if (cachedList) {
+				setLastSuccessfulList({
+					queryKey: listQueryKey,
+					items: cachedList.items,
+					total: cachedList.total,
+				});
+			}
+			setListReadState({ queryKey: listQueryKey, loading: false, error: null });
+			return;
+		}
+		const storageHandoff =
+			window.sessionStorage.getItem(DETAIL_LIST_CACHE_HANDOFF_KEY) === "1";
+		if (storageHandoff)
+			window.sessionStorage.removeItem(DETAIL_LIST_CACHE_HANDOFF_KEY);
+		const storedList = storageHandoff
+			? window.sessionStorage.getItem(DETAIL_LIST_CACHE_DATA_KEY)
+			: null;
+		if (storedList)
+			window.sessionStorage.removeItem(DETAIL_LIST_CACHE_DATA_KEY);
+		const handoff =
+			storageHandoff ||
+			collectionListCacheHandoffPending ||
+			collectionListCacheHandoff.delete(listQueryKey);
+		collectionListCacheHandoffPending = false;
+		let handoffList = cachedList;
+		if (!handoffList && storedList) {
+			try {
+				const parsed = JSON.parse(storedList) as typeof cachedList & {
+					queryKey: string;
+				};
+				if (parsed.queryKey === listQueryKey) handoffList = parsed;
+			} catch {
+				// Ignore invalid session handoff data and fall back to a normal read.
+			}
+		}
+		if (
+			handoff &&
+			handoffList &&
+			Date.now() - handoffList.storedAt < ACTIVITY_CACHE_MS
+		) {
+			setLastSuccessfulList({
+				queryKey: listQueryKey,
+				items: handoffList.items,
+				total: handoffList.total,
+			});
+			setListReadState({ queryKey: listQueryKey, loading: false, error: null });
+			return;
+		}
 		if (
 			!isInitialMount &&
 			!hasIssuedListReadRef.current &&
@@ -1376,6 +1467,19 @@ export function AiOperationsRecordsSection({
 					total: response.total,
 					storedAt: Date.now(),
 				});
+				try {
+					window.sessionStorage.setItem(
+						DETAIL_LIST_CACHE_DATA_KEY,
+						JSON.stringify({
+							queryKey: listQueryKey,
+							items: response.items,
+							total: response.total,
+							storedAt: Date.now(),
+						}),
+					);
+				} catch {
+					// Session storage is an optional handoff optimization.
+				}
 			})
 			.catch((cause: unknown) => {
 				if (requestId !== listRequestRef.current) return;
@@ -1422,17 +1526,47 @@ export function AiOperationsRecordsSection({
 		return () => {
 			abortController.abort();
 		};
-	}, [listParamsKey, listQueryKey, reloadNonce, tab]);
+	}, [detailRoute, listParamsKey, listQueryKey, reloadNonce, tab]);
 	useEffect(() => {
-		return () => activityControllerRef.current?.abort();
-	}, [activityRetryNonce, reloadNonce, tab]);
-	useEffect(() => {
-		if (!detailRoute) activityNeedsReadRef.current = true;
-	}, [detailRoute, tab]);
-	useEffect(() => {
-		if (detailRoute || !activityNeedsReadRef.current) return;
+		if (detailRoute) return;
+		const storageHandoff =
+			window.sessionStorage.getItem(DETAIL_ACTIVITY_CACHE_HANDOFF_KEY) === "1";
+		if (storageHandoff)
+			window.sessionStorage.removeItem(DETAIL_ACTIVITY_CACHE_HANDOFF_KEY);
+		const storedActivity = storageHandoff
+			? window.sessionStorage.getItem(DETAIL_ACTIVITY_CACHE_DATA_KEY)
+			: null;
+		if (storedActivity)
+			window.sessionStorage.removeItem(DETAIL_ACTIVITY_CACHE_DATA_KEY);
+		const handoff =
+			storageHandoff ||
+			collectionActivityCacheHandoffPending ||
+			collectionActivityCacheHandoff.delete(activityCacheKey);
+		collectionActivityCacheHandoffPending = false;
 
+		let handoffActivity = activityCacheRef.current.get(activityCacheKey);
+		if (!handoffActivity && storedActivity) {
+			try {
+				const parsed = JSON.parse(storedActivity) as typeof handoffActivity;
+				if (parsed) handoffActivity = parsed;
+			} catch {
+				// Ignore invalid session handoff data and fall back to a normal read.
+			}
+		}
 		const cached = activityCacheRef.current.get(activityCacheKey);
+		if (handoff) {
+			if (
+				handoffActivity &&
+				Date.now() - handoffActivity.storedAt < ACTIVITY_CACHE_MS
+			) {
+				setActivity(handoffActivity.data);
+				setActivityError(null);
+			}
+			setActivityLoading(false);
+			activityNeedsReadRef.current = false;
+			return;
+		}
+		if (!activityNeedsReadRef.current) return;
 		const isInitialMount = activityInitialMountRef.current;
 		activityInitialMountRef.current = false;
 		const reloadRequested = reloadNonce > handledReloadNonceRef.current;
@@ -1470,6 +1604,14 @@ export function AiOperationsRecordsSection({
 				if (requestId !== activityRequestRef.current) return;
 				const entry = { data: response, storedAt: Date.now() };
 				activityCacheRef.current.set(activityCacheKey, entry);
+				try {
+					window.sessionStorage.setItem(
+						DETAIL_ACTIVITY_CACHE_DATA_KEY,
+						JSON.stringify(entry),
+					);
+				} catch {
+					// Session storage is an optional handoff optimization.
+				}
 				setActivity(response);
 			})
 			.catch((cause: unknown) => {
@@ -1493,6 +1635,12 @@ export function AiOperationsRecordsSection({
 				activityControllerRef.current = null;
 				setActivityLoading(false);
 			});
+		return () => {
+			if (activityControllerRef.current !== abortController) return;
+			abortController.abort();
+			activityControllerRef.current = null;
+			activityNeedsReadRef.current = true;
+		};
 	}, [activityCacheKey, activityRetryNonce, detailRoute, reloadNonce, tab]);
 	useEffect(() => {
 		if (!detailRoute) {

@@ -320,32 +320,77 @@ function ActivityGridSkeleton({ model }: { model: ActivityGridModel }) {
 	const cellSize = model.cellSize ?? 12;
 	const gap = model.cellGap ?? 2;
 	if (model.layout === "matrix") {
+		const isDesktop = useMediaQuery("(min-width: 1024px)");
+		const isTablet = useMediaQuery("(min-width: 640px)");
+		const labelWidth = isDesktop
+			? (model.rowLabelWidth ?? 152)
+			: isTablet
+				? (model.rowLabelWidth ?? 112)
+				: (model.mobileRowLabelWidth ?? 28);
+		const responsiveCellSize = isDesktop
+			? cellSize
+			: isTablet
+				? Math.min(cellSize, 11)
+				: Math.min(cellSize, 9);
+		const surfaceRef = useRef<HTMLDivElement>(null);
+		const [width, setWidth] = useState(0);
+		useLayoutEffect(() => {
+			const surface = surfaceRef.current;
+			if (!surface) return;
+			const update = () =>
+				setWidth(Math.round(surface.getBoundingClientRect().width));
+			update();
+			const observer = new ResizeObserver(update);
+			observer.observe(surface);
+			return () => observer.disconnect();
+		}, []);
+		const visibleCount =
+			width > 0
+				? Math.max(
+						1,
+						Math.floor((width - labelWidth + gap) / (responsiveCellSize + gap)),
+					)
+				: Math.min(
+						model.columns.length || 12,
+						isDesktop ? 50 : isTablet ? 36 : 25,
+					);
+		const columns = Math.min(model.columns.length || 12, visibleCount);
+		const matrixGap =
+			width > 0 && columns > 0
+				? Math.max(
+						gap,
+						(width - labelWidth - columns * responsiveCellSize) / columns,
+					)
+				: gap;
 		return (
 			<div
+				ref={surfaceRef}
 				aria-hidden="true"
-				className="grid animate-pulse gap-y-2"
-				style={{
-					gridTemplateColumns: `${model.rowLabelWidth ?? 152}px repeat(${Math.min(model.columns.length || 12, 24)}, minmax(0, 1fr))`,
-				}}
+				className="min-w-0 max-h-[min(30vh,12rem)] overflow-y-auto"
 			>
-				<div className="h-5 rounded bg-muted" />
-				{Array.from(
-					{ length: Math.min(model.columns.length || 12, 24) },
-					(_, index) => (
-						<div key={index} className="h-5 rounded bg-muted" />
-					),
-				)}
-				{Array.from(
-					{ length: Math.max(model.rows.length, 3) },
-					(_, rowIndex) => (
-						<FragmentRow
-							key={rowIndex}
-							count={Math.min(model.columns.length || 12, 24)}
-							cellSize={cellSize}
-							gap={gap}
-						/>
-					),
-				)}
+				<div
+					className="grid animate-pulse items-end"
+					style={{
+						gridTemplateColumns: `${labelWidth}px repeat(${columns}, ${responsiveCellSize}px)`,
+						columnGap: matrixGap,
+					}}
+				>
+					<div className="h-6 rounded bg-muted" />
+					{Array.from({ length: columns }, (_, index) => (
+						<div key={`header-${index}`} className="h-6 rounded bg-muted" />
+					))}
+					{Array.from(
+						{ length: Math.max(model.rows.length, 3) },
+						(_, rowIndex) => (
+							<FragmentRow
+								key={rowIndex}
+								count={columns}
+								cellSize={responsiveCellSize}
+								gap={matrixGap}
+							/>
+						),
+					)}
+				</div>
 			</div>
 		);
 	}
@@ -538,7 +583,17 @@ function MatrixGrid({
 					),
 				)
 			: Math.min(model.columns.length, isDesktop ? 50 : isTablet ? 36 : 25);
-	const visibleStart = Math.max(0, model.columns.length - visibleCount);
+	const activeColumnIndex = activeId
+		? model.rows.reduce((found, row) => {
+				if (found >= 0) return found;
+				return row.cells.findIndex((cell) => cell.id === activeId);
+			}, -1)
+		: -1;
+	const maxVisibleStart = Math.max(0, model.columns.length - visibleCount);
+	const visibleStart =
+		activeColumnIndex >= 0
+			? clamp(activeColumnIndex - visibleCount + 1, 0, maxVisibleStart)
+			: maxVisibleStart;
 	const columns = model.columns.slice(visibleStart);
 	const matrixGap =
 		width > 0 && columns.length > 0
@@ -675,6 +730,15 @@ function DenseCanvasGrid({
 		[model.rows],
 	);
 	const canvasRefs = useRef(new Map<number, HTMLCanvasElement>());
+	const longPressTimer = useRef<number | null>(null);
+	const touchStart = useRef<{
+		x: number;
+		y: number;
+		activated: boolean;
+		cell: ActivityGridCell;
+		rowIndex: number;
+	} | null>(null);
+	const suppressTouchClickRef = useRef(false);
 
 	useLayoutEffect(() => {
 		const root = rootRef.current;
@@ -762,6 +826,23 @@ function DenseCanvasGrid({
 		},
 		[cellSize, columns, labelWidth, model.rows, step],
 	);
+	const getCellAnchor = useCallback(
+		(cellIndex: number, canvas: HTMLCanvasElement): Rect => {
+			const rect = canvas.getBoundingClientRect();
+			const x = rect.left + labelWidth + (cellIndex % columns) * step;
+			const y = rect.top + 24 + Math.floor(cellIndex / columns) * step;
+			return { left: x, top: y, right: x + cellSize, bottom: y + cellSize };
+		},
+		[cellSize, columns, labelWidth, step],
+	);
+	const clearTouch = useCallback(() => {
+		if (longPressTimer.current !== null) {
+			window.clearTimeout(longPressTimer.current);
+			longPressTimer.current = null;
+		}
+		touchStart.current = null;
+	}, []);
+	useEffect(() => clearTouch, [clearTouch]);
 	const onGridKeyDown = useCallback(
 		(event: ReactKeyboardEvent<HTMLButtonElement>) => {
 			if (flatCells.length === 0) return;
@@ -802,6 +883,7 @@ function DenseCanvasGrid({
 			data-testid={model.testId ?? "activity-grid-canvas-grid"}
 			style={{ minHeight: contentHeight }}
 			aria-label={model.ariaLabel}
+			aria-describedby={activeId ? "activity-grid-canvas-active" : undefined}
 			tabIndex={0}
 			onKeyDown={onGridKeyDown}
 			onFocus={() => {
@@ -824,15 +906,100 @@ function DenseCanvasGrid({
 							className="block text-muted-foreground"
 							onPointerMove={(event) => {
 								const cell = hitTest(event, rowIndex);
+								if (event.pointerType === "touch") {
+									const start = touchStart.current;
+									if (!start) return;
+									const moved = Math.hypot(
+										event.clientX - start.x,
+										event.clientY - start.y,
+									);
+									if (!start.activated && moved > TOUCH_MOVE_THRESHOLD) {
+										clearTouch();
+										setActiveId(null);
+										return;
+									}
+									if (start.activated && cell) {
+										event.preventDefault();
+										setActiveId(cell.id);
+										setAnchor(
+											getCellAnchor(
+												model.rows[rowIndex].cells.indexOf(cell),
+												event.currentTarget,
+											),
+										);
+									}
+									return;
+								}
 								if (!cell) return;
 								setActiveId(cell.id);
-								setAnchor(event.currentTarget.getBoundingClientRect());
+								setAnchor(
+									getCellAnchor(
+										model.rows[rowIndex].cells.indexOf(cell),
+										event.currentTarget,
+									),
+								);
+							}}
+							onPointerDown={(event) => {
+								if (event.pointerType !== "touch") return;
+								const cell = hitTest(event, rowIndex);
+								if (!cell) return;
+								suppressTouchClickRef.current = false;
+								clearTouch();
+								touchStart.current = {
+									x: event.clientX,
+									y: event.clientY,
+									activated: false,
+									cell,
+									rowIndex,
+								};
+								longPressTimer.current = window.setTimeout(() => {
+									const start = touchStart.current;
+									if (!start) return;
+									start.activated = true;
+									setActiveId(cell.id);
+									setAnchor({
+										left: event.clientX,
+										top: event.clientY,
+										right: event.clientX,
+										bottom: event.clientY,
+									});
+								}, LONG_PRESS_MS);
+							}}
+							onPointerUp={(event) => {
+								if (event.pointerType !== "touch") return;
+								const start = touchStart.current;
+								const cell = hitTest(event, rowIndex) ?? start?.cell;
+								clearTouch();
+								suppressTouchClickRef.current = true;
+								window.setTimeout(() => {
+									suppressTouchClickRef.current = false;
+								}, 500);
+								if (start?.activated && cell) {
+									setActiveId(cell.id);
+									onActivate(cell);
+								}
+							}}
+							onPointerCancel={(event) => {
+								if (event.pointerType === "touch") {
+									clearTouch();
+									setActiveId(null);
+								}
 							}}
 							onPointerLeave={() => setActiveId(null)}
 							onClick={(event) => {
+								if (suppressTouchClickRef.current) {
+									suppressTouchClickRef.current = false;
+									return;
+								}
 								const cell = hitTest(event, rowIndex);
 								if (cell) {
 									setActiveId(cell.id);
+									setAnchor(
+										getCellAnchor(
+											model.rows[rowIndex].cells.indexOf(cell),
+											event.currentTarget,
+										),
+									);
 									onActivate(cell);
 								}
 							}}
@@ -841,7 +1008,11 @@ function DenseCanvasGrid({
 				);
 			})}
 			{activeId ? (
-				<span className="sr-only" aria-live="polite">
+				<span
+					id="activity-grid-canvas-active"
+					className="sr-only"
+					aria-live="polite"
+				>
 					{flatCells.find((cell) => cell.id === activeId)?.ariaLabel}
 				</span>
 			) : null}
@@ -981,7 +1152,9 @@ export function ActivityGrid({
 			const next = cells[nextIndex]?.cell ?? null;
 			if (!next) return;
 			setActiveId(next.id);
-			cellRefs.current.get(next.id)?.focus();
+			window.requestAnimationFrame(() => {
+				cellRefs.current.get(next.id)?.focus();
+			});
 		},
 		[cells, model],
 	);
