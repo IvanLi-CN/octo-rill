@@ -1366,11 +1366,12 @@ export function AiOperationsRecordsSection({
 	}, [activityCacheKey, detailRoute, listQueryKey]);
 	useEffect(() => {
 		const cacheKeyChanged = activityCacheKeyRef.current !== activityCacheKey;
+		const tabChanged = activityTabRef.current !== tab;
 		activityCacheKeyRef.current = activityCacheKey;
-		if (activityTabRef.current !== tab || cacheKeyChanged) {
+		if (tabChanged || cacheKeyChanged) {
 			activityTabRef.current = tab;
 			activityNeedsReadRef.current = true;
-			activityForceReadRef.current = true;
+			if (tabChanged) activityForceReadRef.current = true;
 		}
 		const cached = activityCacheRef.current.get(activityCacheKey);
 		setActivity(cached?.data ?? null);
@@ -1555,10 +1556,7 @@ export function AiOperationsRecordsSection({
 		}
 		const cached = activityCacheRef.current.get(activityCacheKey);
 		if (handoff) {
-			if (
-				handoffActivity &&
-				Date.now() - handoffActivity.storedAt < ACTIVITY_CACHE_MS
-			) {
+			if (handoffActivity) {
 				setActivity(handoffActivity.data);
 				setActivityError(null);
 			}

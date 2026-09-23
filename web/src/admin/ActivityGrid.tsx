@@ -432,7 +432,15 @@ function FragmentRow({
 	return (
 		<>
 			<div className="h-4 rounded bg-muted" />
-			<div className="flex min-w-0 flex-wrap content-start" style={{ gap }}>
+			<div
+				className="grid min-w-0 content-start"
+				style={{
+					gridColumn: "2 / -1",
+					gridTemplateColumns: `repeat(${count}, ${cellSize}px)`,
+					gap,
+					paddingBottom: gap,
+				}}
+			>
 				{Array.from({ length: count }, (_, index) => (
 					<span
 						key={index}
@@ -835,6 +843,24 @@ function DenseCanvasGrid({
 		},
 		[cellSize, columns, labelWidth, step],
 	);
+	const selectCanvasCell = useCallback(
+		(cell: ActivityGridCell | null) => {
+			if (!cell) return;
+			setActiveId(cell.id);
+			const rowIndex = model.rows.findIndex((row) =>
+				row.cells.some((candidate) => candidate.id === cell.id),
+			);
+			const cellIndex =
+				rowIndex >= 0
+					? model.rows[rowIndex].cells.findIndex(
+							(candidate) => candidate.id === cell.id,
+						)
+					: -1;
+			const canvas = rowIndex >= 0 ? canvasRefs.current.get(rowIndex) : null;
+			if (canvas && cellIndex >= 0) setAnchor(getCellAnchor(cellIndex, canvas));
+		},
+		[getCellAnchor, model.rows, setActiveId, setAnchor],
+	);
 	const clearTouch = useCallback(() => {
 		if (longPressTimer.current !== null) {
 			window.clearTimeout(longPressTimer.current);
@@ -861,18 +887,20 @@ function DenseCanvasGrid({
 			if (event.key === "End") next = flatCells.length - 1;
 			if (event.key === "Enter") {
 				event.preventDefault();
+				selectCanvasCell(flatCells[current]);
 				onActivate(flatCells[current]);
 				return;
 			}
 			if (event.key === "Escape") {
 				setActiveId(null);
+				setAnchor(null);
 				return;
 			}
 			if (next === current && !["Home", "End"].includes(event.key)) return;
 			event.preventDefault();
-			setActiveId(flatCells[next].id);
+			selectCanvasCell(flatCells[next]);
 		},
-		[activeId, columns, flatCells, onActivate, setActiveId],
+		[activeId, columns, flatCells, onActivate, selectCanvasCell],
 	);
 
 	return (
@@ -887,7 +915,7 @@ function DenseCanvasGrid({
 			tabIndex={0}
 			onKeyDown={onGridKeyDown}
 			onFocus={() => {
-				if (!activeId && flatCells[0]) setActiveId(flatCells[0].id);
+				if (!activeId && flatCells[0]) selectCanvasCell(flatCells[0]);
 			}}
 		>
 			{model.rows.map((row, rowIndex) => {
