@@ -3,7 +3,7 @@ use std::env;
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveTime, Utc};
 use serde_json::Value;
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{Executor, Row, Sqlite, SqlitePool, Transaction};
 
 use crate::{
     briefs,
@@ -32,6 +32,17 @@ pub struct AdminRuntimeSettingsSnapshot {
 pub struct LlmRecoveryRuntimeConfig {
     pub enabled: bool,
     pub rollout_percent: u8,
+}
+
+pub enum SyncRuntimeSettingUpdate {
+    SyncAutoFetchIntervalMinutes(i64),
+    StarSyncDeltaIntervalMinutes(i64),
+    StarSyncFullSweepIntervalMinutes(i64),
+    RetryRecentFailuresIntervalMinutes(i64),
+    RepoReleaseWorkerConcurrency(i64),
+    RepoRefreshSystemBudgetPerWindow(i64),
+    DashboardReleaseFreshnessProfile(String),
+    DailyBriefScheduleLocalTime(NaiveTime),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,36 +328,256 @@ pub async fn update_daily_brief_schedule_local_time(
     config: &AppConfig,
     local_time: NaiveTime,
 ) -> Result<NaiveTime> {
-    let now = Utc::now().to_rfc3339();
-    let local_time = briefs::format_daily_brief_local_time(local_time);
-    sqlx::query(
-        r#"
-        INSERT INTO admin_runtime_settings (
-          id,
-          llm_max_concurrency,
-          translation_general_worker_concurrency,
-          translation_dedicated_worker_concurrency,
-          sync_auto_fetch_interval_minutes,
-          daily_brief_schedule_local_time,
-          created_at,
-          updated_at
-        )
-        VALUES (1, 1, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          daily_brief_schedule_local_time = excluded.daily_brief_schedule_local_time,
-          updated_at = excluded.updated_at
-        "#,
+    persist_sync_runtime_setting(
+        pool,
+        SyncRuntimeSettingUpdate::DailyBriefScheduleLocalTime(local_time),
     )
-    .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
-    .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
-    .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
-    .bind(local_time.as_str())
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(pool)
     .await?;
-
     load_daily_brief_schedule_local_time(pool, config).await
+}
+
+pub async fn persist_sync_runtime_setting<'e, E>(
+    executor: E,
+    update: SyncRuntimeSettingUpdate,
+) -> Result<()>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    match update {
+        SyncRuntimeSettingUpdate::SyncAutoFetchIntervalMinutes(interval_minutes) => {
+            let interval_minutes = normalize_sync_auto_fetch_interval_minutes(interval_minutes);
+            let now_dt = Utc::now();
+            let now = now_dt.to_rfc3339();
+            let effective_at =
+                next_sync_auto_fetch_effective_at(now_dt, interval_minutes).to_rfc3339();
+            sqlx::query(
+                r#"
+                INSERT INTO admin_runtime_settings (
+                  id,
+                  llm_max_concurrency,
+                  translation_general_worker_concurrency,
+                  translation_dedicated_worker_concurrency,
+                  sync_auto_fetch_interval_minutes,
+                  sync_auto_fetch_effective_at,
+                  created_at,
+                  updated_at
+                )
+                VALUES (1, 1, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  sync_auto_fetch_interval_minutes = excluded.sync_auto_fetch_interval_minutes,
+                  sync_auto_fetch_effective_at = excluded.sync_auto_fetch_effective_at,
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
+            .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
+            .bind(interval_minutes)
+            .bind(effective_at.as_str())
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(executor)
+            .await?;
+        }
+        SyncRuntimeSettingUpdate::StarSyncDeltaIntervalMinutes(interval_minutes) => {
+            let interval_minutes = normalize_star_sync_delta_interval_minutes(interval_minutes);
+            let now = Utc::now().to_rfc3339();
+            sqlx::query(
+                r#"
+                INSERT INTO admin_runtime_settings (
+                  id,
+                  llm_max_concurrency,
+                  translation_general_worker_concurrency,
+                  translation_dedicated_worker_concurrency,
+                  sync_auto_fetch_interval_minutes,
+                  star_sync_delta_interval_minutes,
+                  created_at,
+                  updated_at
+                )
+                VALUES (1, 1, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  star_sync_delta_interval_minutes = excluded.star_sync_delta_interval_minutes,
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
+            .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
+            .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
+            .bind(interval_minutes)
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(executor)
+            .await?;
+        }
+        SyncRuntimeSettingUpdate::StarSyncFullSweepIntervalMinutes(interval_minutes) => {
+            let interval_minutes =
+                normalize_star_sync_full_sweep_interval_minutes(interval_minutes);
+            let now = Utc::now().to_rfc3339();
+            sqlx::query(
+                r#"
+                INSERT INTO admin_runtime_settings (
+                  id,
+                  llm_max_concurrency,
+                  translation_general_worker_concurrency,
+                  translation_dedicated_worker_concurrency,
+                  sync_auto_fetch_interval_minutes,
+                  star_sync_full_sweep_interval_minutes,
+                  created_at,
+                  updated_at
+                )
+                VALUES (1, 1, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  star_sync_full_sweep_interval_minutes = excluded.star_sync_full_sweep_interval_minutes,
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
+            .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
+            .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
+            .bind(interval_minutes)
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(executor)
+            .await?;
+        }
+        SyncRuntimeSettingUpdate::RetryRecentFailuresIntervalMinutes(interval_minutes) => {
+            let interval_minutes =
+                normalize_retry_recent_failures_interval_minutes(interval_minutes);
+            let now = Utc::now().to_rfc3339();
+            sqlx::query(
+                r#"
+                INSERT INTO admin_runtime_settings (
+                  id,
+                  llm_max_concurrency,
+                  translation_general_worker_concurrency,
+                  translation_dedicated_worker_concurrency,
+                  sync_auto_fetch_interval_minutes,
+                  retry_recent_failures_interval_minutes,
+                  created_at,
+                  updated_at
+                )
+                VALUES (1, 1, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  retry_recent_failures_interval_minutes = excluded.retry_recent_failures_interval_minutes,
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
+            .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
+            .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
+            .bind(interval_minutes)
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(executor)
+            .await?;
+        }
+        SyncRuntimeSettingUpdate::RepoReleaseWorkerConcurrency(concurrency) => {
+            let concurrency = normalize_repo_release_worker_concurrency(concurrency);
+            let now = Utc::now().to_rfc3339();
+            sqlx::query(
+                r#"
+                INSERT INTO admin_runtime_settings (
+                  id,
+                  llm_max_concurrency,
+                  translation_general_worker_concurrency,
+                  translation_dedicated_worker_concurrency,
+                  sync_auto_fetch_interval_minutes,
+                  repo_release_worker_concurrency,
+                  created_at,
+                  updated_at
+                )
+                VALUES (1, 1, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  repo_release_worker_concurrency = excluded.repo_release_worker_concurrency,
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
+            .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
+            .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
+            .bind(i64::try_from(concurrency).unwrap_or(5))
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(executor)
+            .await?;
+        }
+        SyncRuntimeSettingUpdate::RepoRefreshSystemBudgetPerWindow(budget_per_window) => {
+            let budget_per_window =
+                normalize_repo_refresh_system_budget_per_window(budget_per_window);
+            let now = Utc::now().to_rfc3339();
+            sqlx::query(
+                r#"
+                INSERT INTO admin_runtime_settings (
+                  id,
+                  llm_max_concurrency,
+                  translation_general_worker_concurrency,
+                  translation_dedicated_worker_concurrency,
+                  sync_auto_fetch_interval_minutes,
+                  repo_refresh_system_budget_per_window,
+                  created_at,
+                  updated_at
+                )
+                VALUES (1, 1, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  repo_refresh_system_budget_per_window = excluded.repo_refresh_system_budget_per_window,
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
+            .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
+            .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
+            .bind(budget_per_window)
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(executor)
+            .await?;
+        }
+        SyncRuntimeSettingUpdate::DashboardReleaseFreshnessProfile(profile) => {
+            let profile = normalize_dashboard_release_freshness_profile(profile.as_str());
+            let now = Utc::now().to_rfc3339();
+            sqlx::query(
+                r#"
+                UPDATE admin_runtime_settings
+                SET dashboard_release_freshness_profile = ?, updated_at = ?
+                WHERE id = 1
+                "#,
+            )
+            .bind(profile)
+            .bind(now.as_str())
+            .execute(executor)
+            .await?;
+        }
+        SyncRuntimeSettingUpdate::DailyBriefScheduleLocalTime(local_time) => {
+            let now = Utc::now().to_rfc3339();
+            let local_time = briefs::format_daily_brief_local_time(local_time);
+            sqlx::query(
+                r#"
+                INSERT INTO admin_runtime_settings (
+                  id,
+                  llm_max_concurrency,
+                  translation_general_worker_concurrency,
+                  translation_dedicated_worker_concurrency,
+                  sync_auto_fetch_interval_minutes,
+                  daily_brief_schedule_local_time,
+                  created_at,
+                  updated_at
+                )
+                VALUES (1, 1, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  daily_brief_schedule_local_time = excluded.daily_brief_schedule_local_time,
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
+            .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
+            .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
+            .bind(local_time.as_str())
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(executor)
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 pub async fn load_repo_release_worker_concurrency(pool: &SqlitePool) -> Result<usize> {
@@ -397,98 +628,6 @@ pub async fn load_dashboard_release_freshness_profile(pool: &SqlitePool) -> Resu
     Ok(normalize_dashboard_release_freshness_profile(profile.as_str()).to_owned())
 }
 
-pub async fn update_dashboard_release_freshness_profile(
-    pool: &SqlitePool,
-    profile: &str,
-) -> Result<String> {
-    let profile = normalize_dashboard_release_freshness_profile(profile);
-    let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE admin_runtime_settings
-        SET dashboard_release_freshness_profile = ?, updated_at = ?
-        WHERE id = 1
-        "#,
-    )
-    .bind(profile)
-    .bind(now.as_str())
-    .execute(pool)
-    .await?;
-    load_dashboard_release_freshness_profile(pool).await
-}
-
-pub async fn update_repo_release_worker_concurrency(
-    pool: &SqlitePool,
-    concurrency: i64,
-) -> Result<usize> {
-    let concurrency = normalize_repo_release_worker_concurrency(concurrency);
-    let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO admin_runtime_settings (
-          id,
-          llm_max_concurrency,
-          translation_general_worker_concurrency,
-          translation_dedicated_worker_concurrency,
-          sync_auto_fetch_interval_minutes,
-          repo_release_worker_concurrency,
-          created_at,
-          updated_at
-        )
-        VALUES (1, 1, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          repo_release_worker_concurrency = excluded.repo_release_worker_concurrency,
-          updated_at = excluded.updated_at
-        "#,
-    )
-    .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
-    .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
-    .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
-    .bind(i64::try_from(concurrency).unwrap_or(5))
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(pool)
-    .await?;
-
-    load_repo_release_worker_concurrency(pool).await
-}
-
-pub async fn update_repo_refresh_system_budget_per_window(
-    pool: &SqlitePool,
-    budget_per_window: i64,
-) -> Result<i64> {
-    let budget_per_window = normalize_repo_refresh_system_budget_per_window(budget_per_window);
-    let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO admin_runtime_settings (
-          id,
-          llm_max_concurrency,
-          translation_general_worker_concurrency,
-          translation_dedicated_worker_concurrency,
-          sync_auto_fetch_interval_minutes,
-          repo_refresh_system_budget_per_window,
-          created_at,
-          updated_at
-        )
-        VALUES (1, 1, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          repo_refresh_system_budget_per_window = excluded.repo_refresh_system_budget_per_window,
-          updated_at = excluded.updated_at
-        "#,
-    )
-    .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
-    .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
-    .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
-    .bind(budget_per_window)
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(pool)
-    .await?;
-
-    load_repo_refresh_system_budget_per_window(pool).await
-}
-
 pub async fn load_sync_auto_fetch_interval_minutes(pool: &SqlitePool) -> Result<i64> {
     let interval = sqlx::query_scalar::<_, i64>(
         r#"
@@ -537,114 +676,15 @@ pub async fn load_star_sync_full_sweep_interval_minutes(pool: &SqlitePool) -> Re
     Ok(normalize_star_sync_full_sweep_interval_minutes(interval))
 }
 
-pub async fn update_star_sync_delta_interval_minutes(
-    pool: &SqlitePool,
-    interval_minutes: i64,
-) -> Result<i64> {
-    let interval_minutes = normalize_star_sync_delta_interval_minutes(interval_minutes);
-    let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO admin_runtime_settings (
-          id,
-          llm_max_concurrency,
-          translation_general_worker_concurrency,
-          translation_dedicated_worker_concurrency,
-          sync_auto_fetch_interval_minutes,
-          star_sync_delta_interval_minutes,
-          created_at,
-          updated_at
-        )
-        VALUES (1, 1, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          star_sync_delta_interval_minutes = excluded.star_sync_delta_interval_minutes,
-          updated_at = excluded.updated_at
-        "#,
-    )
-    .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
-    .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
-    .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
-    .bind(interval_minutes)
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(pool)
-    .await?;
-
-    load_star_sync_delta_interval_minutes(pool).await
-}
-
-pub async fn update_star_sync_full_sweep_interval_minutes(
-    pool: &SqlitePool,
-    interval_minutes: i64,
-) -> Result<i64> {
-    let interval_minutes = normalize_star_sync_full_sweep_interval_minutes(interval_minutes);
-    let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO admin_runtime_settings (
-          id,
-          llm_max_concurrency,
-          translation_general_worker_concurrency,
-          translation_dedicated_worker_concurrency,
-          sync_auto_fetch_interval_minutes,
-          star_sync_full_sweep_interval_minutes,
-          created_at,
-          updated_at
-        )
-        VALUES (1, 1, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          star_sync_full_sweep_interval_minutes = excluded.star_sync_full_sweep_interval_minutes,
-          updated_at = excluded.updated_at
-        "#,
-    )
-    .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
-    .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
-    .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
-    .bind(interval_minutes)
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(pool)
-    .await?;
-
-    load_star_sync_full_sweep_interval_minutes(pool).await
-}
-
 pub async fn update_sync_auto_fetch_interval_minutes(
     pool: &SqlitePool,
     interval_minutes: i64,
 ) -> Result<i64> {
-    let interval_minutes = normalize_sync_auto_fetch_interval_minutes(interval_minutes);
-    let now_dt = Utc::now();
-    let now = now_dt.to_rfc3339();
-    let effective_at = next_sync_auto_fetch_effective_at(now_dt, interval_minutes).to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO admin_runtime_settings (
-          id,
-          llm_max_concurrency,
-          translation_general_worker_concurrency,
-          translation_dedicated_worker_concurrency,
-          sync_auto_fetch_interval_minutes,
-          sync_auto_fetch_effective_at,
-          created_at,
-          updated_at
-        )
-        VALUES (1, 1, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          sync_auto_fetch_interval_minutes = excluded.sync_auto_fetch_interval_minutes,
-          sync_auto_fetch_effective_at = excluded.sync_auto_fetch_effective_at,
-          updated_at = excluded.updated_at
-        "#,
+    persist_sync_runtime_setting(
+        pool,
+        SyncRuntimeSettingUpdate::SyncAutoFetchIntervalMinutes(interval_minutes),
     )
-    .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
-    .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
-    .bind(interval_minutes)
-    .bind(effective_at.as_str())
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(pool)
     .await?;
-
     load_sync_auto_fetch_interval_minutes(pool).await
 }
 
@@ -691,42 +731,6 @@ pub async fn load_retry_recent_failures_interval_minutes(pool: &SqlitePool) -> R
     .unwrap_or(DEFAULT_RETRY_RECENT_FAILURES_INTERVAL_MINUTES);
 
     Ok(normalize_retry_recent_failures_interval_minutes(interval))
-}
-
-pub async fn update_retry_recent_failures_interval_minutes(
-    pool: &SqlitePool,
-    interval_minutes: i64,
-) -> Result<i64> {
-    let interval_minutes = normalize_retry_recent_failures_interval_minutes(interval_minutes);
-    let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO admin_runtime_settings (
-          id,
-          llm_max_concurrency,
-          translation_general_worker_concurrency,
-          translation_dedicated_worker_concurrency,
-          sync_auto_fetch_interval_minutes,
-          retry_recent_failures_interval_minutes,
-          created_at,
-          updated_at
-        )
-        VALUES (1, 1, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          retry_recent_failures_interval_minutes = excluded.retry_recent_failures_interval_minutes,
-          updated_at = excluded.updated_at
-        "#,
-    )
-    .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
-    .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
-    .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
-    .bind(interval_minutes)
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(pool)
-    .await?;
-
-    load_retry_recent_failures_interval_minutes(pool).await
 }
 
 fn load_legacy_ai_model_context_limit_from_env() -> Result<Option<u32>> {

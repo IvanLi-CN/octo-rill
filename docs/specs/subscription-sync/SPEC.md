@@ -2,6 +2,10 @@
 
 > Star 的独立 delta/full reconciliation 与频率设置由 [star-sync-reconciliation](../star-sync-reconciliation/SPEC.md) 接管。本 topic 保留 Release、social、Inbox 与访问刷新编排。
 
+## Context and Scope
+
+This topic owns the global subscription-sync runtime configuration and Admin Jobs behavior. The detailed background, goals, scope, and exclusions remain in the corresponding Chinese sections below.
+
 ## 背景 / 问题陈述
 
 旧实现把 Release 同步和存储都绑定在用户维度：
@@ -120,6 +124,8 @@
   - 链路用时从根 `sync.subscriptions` 创建时间开始，到根任务及其直接触发的 `translate.release.batch` / `summarize.release.smart.batch` 子任务全部完成时结束
 - 点击任一用时项打开对应的订阅同步详情页面，页面展示该任务详情、阶段摘要和最近事件。
 - `GET /api/admin/jobs/sync/runtime-config` / `PATCH /api/admin/jobs/sync/runtime-config` 负责读取和保存该全局设置。
+- 每次 PATCH 对所有已提供的运行时设置执行一次 foreground `BEGIN IMMEDIATE` SQLite 写事务；成功时原子提交，失败时不得部分应用，省略字段保持原值。
+- 若 SQLite `BUSY/LOCKED` 在 writer coordinator 的重试后仍未解除，PATCH 返回 HTTP `503`、错误码 `database_busy` 和 `Retry-After: 1`，客户端可安全重试。
 - 同一接口同时返回和保存 `repo_release_worker_concurrency`，合法范围为 `1-32`，默认 `8`。
 - `repo_release_worker_concurrency` 保存后当前进程热生效；缩容不取消已领取的 work item，新增 worker 会在后续轮询中参与 claim。
 
@@ -245,6 +251,10 @@
 - 当 access sync 进行中且 feed 为空时，空态显示“正在同步你的 Star / Release”。
 - 当 access sync 不在进行中且 feed 为空时，空态显示“还没有缓存内容”。
 
+## Requirements
+
+- REQ-SUBSYNC-RUNTIME-CONFIG-ATOMIC: A PATCH to `/api/admin/jobs/sync/runtime-config` MUST persist all submitted settings atomically through the foreground SQLite writer coordinator; exhausted `BUSY/LOCKED` contention MUST leave settings unchanged and return HTTP `503` with `database_busy` and `Retry-After: 1`.
+
 ## 验收标准（Acceptance Criteria）
 
 - Given 用户首次访问或超过 1 小时未访问
@@ -254,6 +264,10 @@
 - Given 管理员在 Admin Jobs 定时任务页配置 `1-120` 分钟自动获取间隔
   When 保存设置
   Then 后端持久化全局 `sync_auto_fetch_interval_minutes` 与严格大于保存时刻的 `sync_auto_fetch_effective_at`，后续 scheduler 在边界后按该间隔判断是否触发 `sync.subscriptions`。
+
+- Given 管理员一次提交多个订阅同步运行时设置
+  When 同一 SQLite 数据库仍被其它 writer 占用，或后续字段写入失败
+  Then 接口在锁重试耗尽时返回 HTTP `503`、`database_busy` 与 `Retry-After: 1`，且整批设置不发生部分提交。
 
 - Given 当前存在活动治理 cycle
   When 管理员保存新的同步间隔或预算
@@ -564,4 +578,8 @@ evidence_note=验证 Release 抓取并发与系统预算可清空并保留非法
 
 ## Related ADRs
 
-- [ADR 0005: Unify Subscription and Governance Windows](../../adr/0005-subscription-governance-window.md)
+- [ADR 0006: Decouple Star Synchronization from Subscription Governance](../../adr/0006-decouple-star-sync-schedules.md)
+
+## Verification
+
+- VER-SUBSYNC-RUNTIME-CONFIG-ATOMIC: Regression tests cover writer-lock exhaustion, the retryable HTTP response, full rollback after a later field write fails, and successful save compatibility; covers: REQ-SUBSYNC-RUNTIME-CONFIG-ATOMIC.

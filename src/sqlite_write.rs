@@ -500,7 +500,7 @@ fn sqlx_error_is_busy(err: &sqlx::Error) -> bool {
     match err {
         sqlx::Error::Database(db_err) => {
             let code = db_err.code().map(|code| code.into_owned());
-            matches!(code.as_deref(), Some("5" | "517" | "261"))
+            code.as_deref().is_some_and(sqlite_code_is_busy_or_locked)
                 || db_err
                     .message()
                     .to_ascii_lowercase()
@@ -508,6 +508,11 @@ fn sqlx_error_is_busy(err: &sqlx::Error) -> bool {
         }
         _ => false,
     }
+}
+
+fn sqlite_code_is_busy_or_locked(code: &str) -> bool {
+    code.parse::<u32>()
+        .is_ok_and(|code| matches!(code & 0xff, 5 | 6))
 }
 
 #[cfg(test)]
@@ -643,6 +648,15 @@ mod tests {
     fn busy_detection_matches_sqlite_locked_messages() {
         let err = anyhow::anyhow!("error returned from database: (code: 5) database is locked");
         assert!(is_sqlite_busy_error(err.as_ref()));
+    }
+
+    #[test]
+    fn sqlite_busy_detection_matches_primary_and_extended_codes() {
+        assert!(sqlite_code_is_busy_or_locked("5"));
+        assert!(sqlite_code_is_busy_or_locked("6"));
+        assert!(sqlite_code_is_busy_or_locked("261"));
+        assert!(sqlite_code_is_busy_or_locked("517"));
+        assert!(!sqlite_code_is_busy_or_locked("19"));
     }
 
     #[tokio::test]
