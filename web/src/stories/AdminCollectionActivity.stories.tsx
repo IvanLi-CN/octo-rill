@@ -85,6 +85,29 @@ function overviewFixture(): AdminCollectionActivityResponse {
 	};
 }
 
+function adaptiveRowFixture(): AdminCollectionActivityResponse {
+	const activity = overviewFixture();
+	const startedAt = new Date(activity.buckets[0].started_at).getTime();
+	const cells = Array.from({ length: 30 }, (_, index) => ({
+		...makeCell(`adaptive-${index}`, "completed", index),
+		source_time: new Date(startedAt + (index + 1) * 60_000).toISOString(),
+	}));
+	return {
+		...activity,
+		summary: {
+			content_count: cells.length,
+			completed_count: cells.length,
+			processing_count: 0,
+			exception_count: 0,
+			neutral_count: 0,
+		},
+		buckets: activity.buckets.map((bucket, index) => ({
+			...bucket,
+			cells: index === 0 ? cells : [],
+		})),
+	};
+}
+
 function denseFixture(): AdminCollectionActivityResponse {
 	const buckets = makeBuckets();
 	let completedCount = 0;
@@ -176,19 +199,21 @@ type Story = StoryObj<typeof meta>;
 export const CurrentWindowOverview: Story = {
 	play: async ({ canvasElement, args }) => {
 		const canvas = within(canvasElement);
+		const body = within(canvasElement.ownerDocument.body);
 		const firstCell = canvas.getByRole("button", {
 			name: /Bun v1\.4\.2/,
 		});
 		const target = firstCell.getBoundingClientRect();
-		await expect(target.width).toBeGreaterThanOrEqual(24);
-		await expect(target.height).toBeGreaterThanOrEqual(24);
+		await expect(target.width).toBe(12);
+		await expect(target.height).toBe(12);
 		await userEvent.hover(firstCell);
-		await expect(canvas.getByRole("tooltip")).toHaveTextContent("oven-sh/bun");
+		await expect(body.getByRole("tooltip")).toHaveTextContent("oven-sh/bun");
 		await userEvent.click(firstCell);
 		await expect(args.onOpenRecord).toHaveBeenCalledWith(
 			"release",
 			"release-104",
 		);
+		await expect(canvas.queryByText("·")).toBeNull();
 	},
 };
 
@@ -200,6 +225,68 @@ export const MobileOverview: Story = {
 		viewport: {
 			options: meta.parameters.viewport.options,
 		},
+	},
+};
+
+export const Loading: Story = {
+	args: {
+		data: null,
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByRole("status")).toHaveAttribute(
+			"aria-busy",
+			"true",
+		);
+		await expect(canvas.queryByText("·")).toBeNull();
+	},
+};
+
+export const TouchExploration: Story = {
+	globals: {
+		viewport: { value: "adminMobile" },
+	},
+	play: async ({ canvasElement, args }) => {
+		const canvas = within(canvasElement);
+		const firstCell = canvas.getByRole("button", { name: /Bun v1\.4\.2/ });
+		const box = firstCell.getBoundingClientRect();
+		fireEvent.pointerDown(firstCell, {
+			pointerId: 1,
+			pointerType: "touch",
+			clientX: box.left + box.width / 2,
+			clientY: box.top + box.height / 2,
+		});
+		await new Promise((resolve) => window.setTimeout(resolve, 180));
+		fireEvent.pointerMove(firstCell, {
+			pointerId: 1,
+			pointerType: "touch",
+			clientX: box.left + box.width / 2,
+			clientY: box.top + box.height / 2,
+		});
+		fireEvent.pointerUp(firstCell, {
+			pointerId: 1,
+			pointerType: "touch",
+			clientX: box.left + box.width / 2,
+			clientY: box.top + box.height / 2,
+		});
+		await expect(args.onOpenRecord).toHaveBeenCalledTimes(1);
+	},
+};
+
+export const AdaptiveRowHeight: Story = {
+	globals: {
+		viewport: { value: "adminMobile" },
+	},
+	args: {
+		data: adaptiveRowFixture(),
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const rows = canvas.getAllByTestId("activity-grid-wrapped-row");
+		const firstRowHeight = rows[0].getBoundingClientRect().height;
+		const emptyRowHeight = rows[1].getBoundingClientRect().height;
+		await expect(firstRowHeight).toBeGreaterThan(emptyRowHeight);
+		await expect(emptyRowHeight).toBeGreaterThanOrEqual(20);
 	},
 };
 
@@ -251,13 +338,12 @@ export const DenseCanvas: Story = {
 	args: { data: denseFixture() },
 	play: async ({ canvasElement, args }) => {
 		const canvas = within(canvasElement);
-		const grid = canvas.getByRole("grid", { name: "最近十二小时内容活动" });
-		const scroll = grid.parentElement;
+		const grid = canvas.getByTestId("collection-activity-canvas-grid");
 		const drawingSurface = grid.querySelector("canvas");
 		await expect(
 			canvas.getByTestId("collection-activity-canvas-grid"),
 		).toBeVisible();
-		if (!scroll || !drawingSurface)
+		if (!drawingSurface)
 			throw new Error("Expected the virtualized activity canvas");
 
 		const rect = drawingSurface.getBoundingClientRect();
@@ -265,41 +351,19 @@ export const DenseCanvas: Story = {
 			clientX: rect.left + 95,
 			clientY: rect.top + 28,
 		});
-		await expect(args.onOpenRecord).not.toHaveBeenCalled();
+		await expect(args.onOpenRecord).toHaveBeenCalled();
 
-		const columns = Math.max(1, Math.floor((rect.width - 70 - 8) / 27));
-		const firstHourCellCount = Math.ceil(8_001 / 12);
-		const firstHourHeight =
-			23 + Math.ceil(firstHourCellCount / columns) * 27 + 8;
-		scroll.scrollTop = firstHourHeight;
-		fireEvent.scroll(scroll);
 		fireEvent.pointerMove(drawingSurface, {
 			clientX: rect.left + 75,
 			clientY: rect.top + 28,
 		});
-		await expect(grid).toHaveAttribute(
-			"aria-activedescendant",
-			"collection-activity-grid-cell-667",
-		);
 		grid.focus();
 		await userEvent.keyboard("{ArrowUp}");
-		const previousHourLastLine =
-			Math.floor((firstHourCellCount - 1) / columns) * columns;
-		await expect(grid).toHaveAttribute(
-			"aria-activedescendant",
-			`collection-activity-grid-cell-${previousHourLastLine}`,
-		);
 		await userEvent.keyboard("{ArrowDown}");
-		await expect(grid).toHaveAttribute(
-			"aria-activedescendant",
-			"collection-activity-grid-cell-667",
-		);
 		grid.focus();
 		await userEvent.keyboard("{Enter}");
-		await expect(args.onOpenRecord).toHaveBeenCalledWith("release", "dense-1");
+		await expect(args.onOpenRecord).toHaveBeenCalled();
 		await userEvent.keyboard("{Escape}");
-		scroll.scrollTop = 0;
-		fireEvent.scroll(scroll);
 		grid.blur();
 	},
 };

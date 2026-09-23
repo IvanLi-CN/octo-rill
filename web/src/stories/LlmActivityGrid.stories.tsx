@@ -62,8 +62,13 @@ const meta = {
 	},
 	decorators: [
 		(Story) => (
-			<div className="mx-auto min-h-80 w-full max-w-3xl rounded-md bg-zinc-200 p-6">
-				<Story />
+			<div
+				data-visual-evidence-surface
+				className="mx-auto w-full max-w-3xl bg-background p-6"
+			>
+				<div data-visual-evidence-target>
+					<Story />
+				</div>
 			</div>
 		),
 	],
@@ -122,8 +127,8 @@ export const DrilldownMenu: Story = {
 		const firstCellBox = firstCell.getBoundingClientRect();
 		const secondCellBox = secondCell.getBoundingClientRect();
 		await expect(
-			Math.abs(firstCellBox.right - secondCellBox.left),
-		).toBeLessThan(0.5);
+			secondCellBox.left - firstCellBox.right,
+		).toBeGreaterThanOrEqual(2);
 		await userEvent.pointer({ target: firstCell, keys: "[MouseRight]" });
 		await userEvent.click(body.getByRole("menuitem", { name: "查看失败调用" }));
 		await expect(args.onOpenCalls).toHaveBeenCalledWith(
@@ -142,7 +147,15 @@ export const DrilldownMenu: Story = {
 };
 
 export const Loading: Story = {
-	args: { data: null, loading: true },
+	args: { data: null },
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByRole("status")).toHaveAttribute(
+			"aria-busy",
+			"true",
+		);
+		await expect(canvas.queryByText("·")).toBeNull();
+	},
 };
 
 export const Empty: Story = {

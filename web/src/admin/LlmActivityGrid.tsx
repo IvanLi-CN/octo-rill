@@ -1,24 +1,25 @@
 import { AlertCircle, LoaderCircle, RefreshCw } from "lucide-react";
 import {
-	type CSSProperties,
-	type KeyboardEvent,
-	useCallback,
-	useEffect,
-	useLayoutEffect,
+	memo,
+	type KeyboardEvent as ReactKeyboardEvent,
+	type ReactElement,
 	useMemo,
-	useRef,
-	useState,
 } from "react";
-import { createPortal } from "react-dom";
 
 import type { AdminLlmActivityResponse } from "@/api";
+import {
+	ActivityGrid,
+	type ActivityGridCell,
+	type ActivityGridMatrixColumn,
+	type ActivityGridMatrixRow,
+	type ActivityGridModel,
+} from "@/admin/ActivityGrid";
 import {
 	LlmCallActionsMenu,
 	LlmCallContextMenu,
 	type LlmCallDrilldown,
 } from "@/admin/LlmCallContextMenu";
 import { Button } from "@/components/ui/button";
-import { useMediaQuery } from "@/lib/useMediaQuery";
 
 type LlmActivityGridProps = {
 	data: AdminLlmActivityResponse | null;
@@ -31,47 +32,6 @@ type LlmActivityGridProps = {
 	) => void;
 };
 
-type ActivityRect = {
-	bottom: number;
-	height: number;
-	left: number;
-	right: number;
-	top: number;
-	width: number;
-};
-
-type TooltipAnchor = {
-	x: number;
-	y: number;
-};
-
-type TooltipPosition = {
-	left: number;
-	top: number;
-};
-
-const ACTIVITY_SUMMARY_ID = "llm-activity-summary";
-const ACTIVITY_SUMMARY_LABEL_ID = "llm-activity-summary-label";
-const MAX_BUCKET_COUNT = 50;
-const TOOLTIP_GAP = 12;
-const TOOLTIP_VIEWPORT_MARGIN = 12;
-
-const ACTIVITY_VOLUME_CLASSES = [
-	"bg-sky-200 ring-sky-300/50 dark:bg-sky-950 dark:ring-sky-800/60",
-	"bg-cyan-300 ring-cyan-400/50 dark:bg-cyan-800 dark:ring-cyan-700/70",
-	"bg-emerald-400 ring-emerald-500/50 dark:bg-emerald-700 dark:ring-emerald-600/70",
-	"bg-green-500 ring-green-600/50 dark:bg-green-500 dark:ring-green-400/70",
-] as const;
-const ACTIVITY_IDLE_CLASS = "bg-muted/80 ring-border/50";
-const ACTIVITY_DEGRADED_CLASS =
-	"bg-amber-400 ring-amber-500/70 dark:bg-amber-500 dark:ring-amber-300/70";
-const ACTIVITY_FAILED_CLASS = "bg-destructive ring-destructive/70";
-
-type ActivityOutcome = "idle" | "healthy" | "degraded" | "failed";
-
-const percent = (numerator: number, denominator: number) =>
-	denominator === 0 ? "--" : `${Math.round((100 * numerator) / denominator)}%`;
-
 const localTime = (value: string) =>
 	new Intl.DateTimeFormat(undefined, {
 		month: "2-digit",
@@ -81,67 +41,69 @@ const localTime = (value: string) =>
 		hour12: false,
 	}).format(new Date(value));
 
-const activityOutcome = (
-	succeeded: number,
-	failed: number,
-): ActivityOutcome => {
+type ActivityOutcome = "idle" | "healthy" | "degraded" | "failed";
+
+function activityOutcome(succeeded: number, failed: number): ActivityOutcome {
 	const total = succeeded + failed;
 	if (total === 0) return "idle";
 	if (failed === total) return "failed";
 	if (failed > 0) return "degraded";
 	return "healthy";
-};
+}
 
-const activityClass = (succeeded: number, failed: number, maximum: number) => {
-	const total = succeeded + failed;
-	switch (activityOutcome(succeeded, failed)) {
-		case "idle":
-			return ACTIVITY_IDLE_CLASS;
-		case "failed":
-			return ACTIVITY_FAILED_CLASS;
-		case "degraded":
-			return ACTIVITY_DEGRADED_CLASS;
-		case "healthy": {
-			const level = Math.ceil((4 * total) / maximum);
-			return ACTIVITY_VOLUME_CLASSES[Math.max(0, level - 1)];
-		}
-	}
-};
+function activityClass(succeeded: number, failed: number, maximum: number) {
+	const outcome = activityOutcome(succeeded, failed);
+	if (outcome === "idle") return "bg-muted/80 ring-border/50";
+	if (outcome === "failed") return "bg-destructive ring-destructive/70";
+	if (outcome === "degraded")
+		return "bg-amber-400 ring-amber-500/70 dark:bg-amber-500";
+	const level = Math.ceil((4 * (succeeded + failed)) / Math.max(1, maximum));
+	return [
+		"bg-sky-200 ring-sky-300/50 dark:bg-sky-950 dark:ring-sky-800/60",
+		"bg-cyan-300 ring-cyan-400/50 dark:bg-cyan-800 dark:ring-cyan-700/70",
+		"bg-emerald-400 ring-emerald-500/50 dark:bg-emerald-700 dark:ring-emerald-600/70",
+		"bg-green-500 ring-green-600/50 dark:bg-green-500 dark:ring-green-400/70",
+	][Math.max(0, Math.min(3, level - 1))];
+}
+
+function percent(numerator: number, denominator: number) {
+	return denominator === 0
+		? "--"
+		: `${Math.round((100 * numerator) / denominator)}%`;
+}
 
 function ActivityColorLegend() {
 	return (
 		<ul
-			className="text-muted-foreground flex flex-wrap items-center gap-x-3 gap-y-1 text-xs"
+			className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground"
 			aria-label="活动图颜色图例"
 		>
 			<li className="inline-flex items-center gap-1.5">
 				<span
-					className={`size-2.5 rounded-[2px] ring-1 ${ACTIVITY_IDLE_CLASS}`}
+					className="size-2.5 rounded-[2px] bg-muted/80 ring-1 ring-border/50"
 					aria-hidden="true"
 				/>
 				<span>无调用</span>
 			</li>
 			<li className="inline-flex items-center gap-1.5">
 				<span className="inline-flex gap-0.5" aria-hidden="true">
-					{ACTIVITY_VOLUME_CLASSES.map((className) => (
-						<span
-							key={className}
-							className={`size-2.5 rounded-[2px] ring-1 ${className}`}
-						/>
-					))}
+					<span className="size-2.5 rounded-[2px] bg-sky-200 ring-1 ring-sky-300/50 dark:bg-sky-950" />
+					<span className="size-2.5 rounded-[2px] bg-cyan-300 ring-1 ring-cyan-400/50 dark:bg-cyan-800" />
+					<span className="size-2.5 rounded-[2px] bg-emerald-400 ring-1 ring-emerald-500/50 dark:bg-emerald-700" />
+					<span className="size-2.5 rounded-[2px] bg-green-500 ring-1 ring-green-600/50 dark:bg-green-500" />
 				</span>
 				<span>调用量低至高</span>
 			</li>
 			<li className="inline-flex items-center gap-1.5">
 				<span
-					className={`size-2.5 rounded-[2px] ring-1 ${ACTIVITY_DEGRADED_CLASS}`}
+					className="size-2.5 rounded-[2px] bg-amber-400 ring-1 ring-amber-500/70"
 					aria-hidden="true"
 				/>
 				<span>含失败</span>
 			</li>
 			<li className="inline-flex items-center gap-1.5">
 				<span
-					className={`size-2.5 rounded-[2px] ring-1 ${ACTIVITY_FAILED_CLASS}`}
+					className="size-2.5 rounded-[2px] bg-destructive ring-1 ring-destructive/70"
 					aria-hidden="true"
 				/>
 				<span>全部失败</span>
@@ -150,80 +112,163 @@ function ActivityColorLegend() {
 	);
 }
 
-const toActivityRect = (rect: DOMRect): ActivityRect => ({
-	bottom: rect.bottom,
-	height: rect.height,
-	left: rect.left,
-	right: rect.right,
-	top: rect.top,
-	width: rect.width,
-});
-
-const containsPoint = (rect: ActivityRect, x: number, y: number) =>
-	x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
-
-const isInTransitionCorridor = (
-	from: ActivityRect,
-	to: ActivityRect,
-	gap: number,
-	x: number,
-	y: number,
-) => {
-	const horizontalOverlap =
-		x >= Math.max(from.left, to.left) - gap &&
-		x <= Math.min(from.right, to.right) + gap;
-	const verticalOverlap =
-		y >= Math.max(from.top, to.top) - gap &&
-		y <= Math.min(from.bottom, to.bottom) + gap;
-	if (to.top >= from.bottom) {
-		return horizontalOverlap && y >= from.bottom - gap && y <= to.top + gap;
-	}
-	if (to.bottom <= from.top) {
-		return horizontalOverlap && y >= to.bottom - gap && y <= from.top + gap;
-	}
-	if (to.left >= from.right) {
-		return verticalOverlap && x >= from.right - gap && x <= to.left + gap;
-	}
-	if (to.right <= from.left) {
-		return verticalOverlap && x >= to.right - gap && x <= from.left + gap;
-	}
-	return false;
-};
-
-const overlaps = (
-	left: number,
-	top: number,
-	width: number,
-	height: number,
-	rect: ActivityRect,
-) =>
-	left < rect.right &&
-	left + width > rect.left &&
-	top < rect.bottom &&
-	top + height > rect.top;
-
-const overlapArea = (
-	left: number,
-	top: number,
-	width: number,
-	height: number,
-	rect: ActivityRect,
-) => {
-	const overlapWidth = Math.max(
-		0,
-		Math.min(left + width, rect.right) - Math.max(left, rect.left),
+function ModelLegend({ data }: { data: AdminLlmActivityResponse }) {
+	return (
+		<ul
+			className="grid gap-1 text-xs text-muted-foreground sm:hidden"
+			aria-label="模型图例"
+		>
+			{data.models.map((model) => (
+				<li key={model.model} className="flex min-w-0 items-center gap-2">
+					<span className="w-5 shrink-0 text-center font-mono text-[10px]">
+						{model.priority || "·"}
+					</span>
+					<span className="min-w-0 truncate font-mono">{model.model}</span>
+				</li>
+			))}
+		</ul>
 	);
-	const overlapHeight = Math.max(
-		0,
-		Math.min(top + height, rect.bottom) - Math.max(top, rect.top),
+}
+
+function SkeletonModel(): ActivityGridModel {
+	const columns: ActivityGridMatrixColumn[] = Array.from(
+		{ length: 12 },
+		(_, index) => ({ id: `skeleton-${index}`, label: "" }),
 	);
-	return overlapWidth * overlapHeight;
-};
+	const rows: ActivityGridMatrixRow[] = Array.from(
+		{ length: 3 },
+		(_, index) => ({
+			id: `skeleton-row-${index}`,
+			label: "",
+			cells: columns.map((column) => ({
+				id: `${column.id}:${index}`,
+				ariaLabel: "加载中",
+				className: "bg-muted",
+				preview: { title: "加载中", lines: [] },
+			})),
+		}),
+	);
+	return {
+		layout: "matrix",
+		scrollPolicy: "panel",
+		ariaLabel: "模型活动",
+		columns,
+		rows,
+		cellSize: 12,
+		cellGap: 2,
+		testId: "llm-activity-surface",
+	};
+}
 
-const clamp = (value: number, minimum: number, maximum: number) =>
-	Math.min(Math.max(value, minimum), maximum);
+function makeModel(
+	data: AdminLlmActivityResponse,
+	onOpenCalls?: LlmActivityGridProps["onOpenCalls"],
+): ActivityGridModel {
+	const maximum = Math.max(
+		0,
+		...data.buckets.flatMap((bucket) =>
+			bucket.counts.map((count) => count.succeeded + count.failed),
+		),
+	);
+	const columns: ActivityGridMatrixColumn[] = data.buckets.map((bucket) => ({
+		id: bucket.started_at,
+		label: localTime(bucket.started_at).slice(0, 5),
+		title: localTime(bucket.started_at),
+	}));
+	const rows: ActivityGridMatrixRow[] = data.models.map((model) => ({
+		id: model.model,
+		label: `${model.configured && model.priority ? `${model.priority}. ` : ""}${model.model}`,
+		mobileLabel: model.priority ? String(model.priority) : "·",
+		cells: data.buckets.map((bucket, index): ActivityGridCell => {
+			const count = bucket.counts.find(
+				(item) => item.model === model.model,
+			) ?? { succeeded: 0, failed: 0 };
+			const outcome = activityOutcome(count.succeeded, count.failed);
+			const bucketSucceeded = bucket.counts.reduce(
+				(sum, item) => sum + item.succeeded,
+				0,
+			);
+			const target: LlmCallDrilldown = {
+				model: model.model,
+				finishedFrom: bucket.started_at,
+				finishedBefore: bucket.ended_at,
+			};
+			return {
+				id: `${model.model}:${bucket.started_at}`,
+				ariaLabel: `${localTime(bucket.started_at)}，${model.model}，成功 ${count.succeeded}，失败 ${count.failed}`,
+				ariaControls: "llm-activity-summary",
+				dataOutcome: outcome,
+				className: activityClass(count.succeeded, count.failed, maximum),
+				data: { model: model.model, column: index },
+				preview: {
+					title: `${model.model} 在 ${localTime(bucket.started_at)} 的调用摘要`,
+					lines: [],
+					content: (
+						<div className="mt-2 grid grid-cols-[minmax(0,1fr)_auto_auto_auto_auto] gap-x-3 gap-y-1 text-xs">
+							<span className="text-muted-foreground">模型</span>
+							<span className="text-right text-muted-foreground">成功</span>
+							<span className="text-right text-muted-foreground">失败</span>
+							<span className="text-right text-muted-foreground">成功率</span>
+							<span className="text-right text-muted-foreground">使用率</span>
+							{bucket.counts.map((item) => (
+								<div key={item.model} className="contents">
+									<span className="truncate font-mono" title={item.model}>
+										{item.model}
+									</span>
+									<span className="text-right tabular-nums">
+										{item.succeeded}
+									</span>
+									<span className="text-right tabular-nums">{item.failed}</span>
+									<span className="text-right tabular-nums">
+										{percent(item.succeeded, item.succeeded + item.failed)}
+									</span>
+									<span className="text-right tabular-nums">
+										{percent(item.succeeded, bucketSucceeded)}
+									</span>
+								</div>
+							))}
+							{onOpenCalls ? (
+								<div className="col-span-full mt-2 flex justify-end">
+									<LlmCallActionsMenu
+										target={target}
+										onOpen={onOpenCalls}
+										label={`${model.model} 的调用操作`}
+									/>
+								</div>
+							) : null}
+						</div>
+					),
+				},
+				decorate: (element) =>
+					onOpenCalls ? (
+						<LlmCallContextMenu target={target} onOpen={onOpenCalls}>
+							{
+								element as ReactElement<{
+									onKeyDown?: (event: ReactKeyboardEvent<HTMLElement>) => void;
+								}>
+							}
+						</LlmCallContextMenu>
+					) : (
+						element
+					),
+			};
+		}),
+	}));
+	return {
+		layout: "matrix",
+		scrollPolicy: "panel",
+		ariaLabel: "模型活动",
+		columns,
+		rows,
+		cellSize: 12,
+		cellGap: 2,
+		rowLabelWidth: 152,
+		mobileRowLabelWidth: 28,
+		testId: "llm-activity-surface",
+	};
+}
 
-export function LlmActivityGrid({
+export const LlmActivityGrid = memo(function LlmActivityGrid({
 	data,
 	loading = false,
 	refreshing = false,
@@ -231,419 +276,10 @@ export function LlmActivityGrid({
 	onRetry,
 	onOpenCalls,
 }: LlmActivityGridProps) {
-	const rootRef = useRef<HTMLDivElement>(null);
-	const gridSurfaceRef = useRef<HTMLDivElement>(null);
-	const tooltipRef = useRef<HTMLDivElement>(null);
-	const tooltipAnchorElementRef = useRef<HTMLButtonElement | null>(null);
-	const focusedCellRef = useRef<HTMLButtonElement | null>(null);
-	const focusedColumnRef = useRef<number | null>(null);
-	const tooltipAnchorRef = useRef<TooltipAnchor | null>(null);
-	const tooltipRafRef = useRef<number | null>(null);
-	const cellRefs = useRef(new Map<string, HTMLButtonElement>());
-	const [hoveredColumn, setHoveredColumn] = useState<number | null>(null);
-	const [pinnedColumn, setPinnedColumn] = useState<number | null>(null);
-	const [pinnedBucketStartedAt, setPinnedBucketStartedAt] = useState<
-		string | null
-	>(null);
-	const [pinnedModel, setPinnedModel] = useState<string | null>(null);
-	const [tooltipAnchor, setTooltipAnchor] = useState<TooltipAnchor | null>(
-		null,
+	const model = useMemo(
+		() => (data ? makeModel(data, onOpenCalls) : SkeletonModel()),
+		[data, onOpenCalls],
 	);
-	const [tooltipPosition, setTooltipPosition] =
-		useState<TooltipPosition | null>(null);
-	const [gridSurfaceWidth, setGridSurfaceWidth] = useState(0);
-	const isDesktop = useMediaQuery("(min-width: 1024px)");
-	const isTablet = useMediaQuery("(min-width: 640px)");
-	const isMobile = !isTablet;
-	const resolvedPinnedColumn =
-		pinnedBucketStartedAt && data
-			? data.buckets.findIndex(
-					(bucket) => bucket.started_at === pinnedBucketStartedAt,
-				)
-			: pinnedColumn;
-	const activeColumn =
-		pinnedBucketStartedAt !== null
-			? resolvedPinnedColumn !== null && resolvedPinnedColumn >= 0
-				? resolvedPinnedColumn
-				: null
-			: (pinnedColumn ?? hoveredColumn);
-	const gridLabelWidth = isDesktop ? 152 : isTablet ? 112 : 28;
-	const minimumCellSize = isDesktop ? 12 : isTablet ? 11 : 9;
-	const visualCellGap = isMobile ? 2 : 3;
-	const fallbackBucketCount = isDesktop ? MAX_BUCKET_COUNT : isTablet ? 36 : 25;
-	const bucketCapacity =
-		gridSurfaceWidth > 0
-			? Math.floor(
-					Math.max(0, gridSurfaceWidth - gridLabelWidth) /
-						(minimumCellSize + visualCellGap),
-				)
-			: fallbackBucketCount;
-	const visibleBucketCount = Math.min(
-		MAX_BUCKET_COUNT,
-		data?.buckets.length ?? MAX_BUCKET_COUNT,
-		Math.max(1, bucketCapacity),
-	);
-	const visibleBucketStart = Math.max(
-		0,
-		(data?.buckets.length ?? 0) - visibleBucketCount,
-	);
-	const visibleBuckets = data?.buckets.slice(visibleBucketStart) ?? [];
-
-	useLayoutEffect(() => {
-		const surface = gridSurfaceRef.current;
-		if (!surface) return;
-		const updateWidth = () => {
-			const width = Math.round(surface.getBoundingClientRect().width);
-			setGridSurfaceWidth((current) => (current === width ? current : width));
-		};
-		updateWidth();
-		const observer = new ResizeObserver(updateWidth);
-		observer.observe(surface);
-		return () => observer.disconnect();
-	}, [data]);
-
-	const visibleMax = useMemo(
-		() =>
-			Math.max(
-				0,
-				...visibleBuckets.flatMap((bucket) =>
-					bucket.counts.map((count) => count.succeeded + count.failed),
-				),
-			),
-		[visibleBuckets],
-	);
-
-	const setAnchorFromElement = useCallback((element: HTMLButtonElement) => {
-		tooltipAnchorElementRef.current = element;
-		const rect = toActivityRect(element.getBoundingClientRect());
-		const anchor = {
-			x: rect.left + rect.width / 2,
-			y: rect.top + rect.height / 2,
-		};
-		tooltipAnchorRef.current = anchor;
-		setTooltipAnchor(anchor);
-	}, []);
-
-	const closeActivityTooltip = useCallback(() => {
-		tooltipAnchorElementRef.current = null;
-		tooltipAnchorRef.current = null;
-		setHoveredColumn(null);
-		setPinnedColumn(null);
-		setPinnedBucketStartedAt(null);
-		setPinnedModel(null);
-		setTooltipAnchor(null);
-		setTooltipPosition(null);
-	}, []);
-
-	useEffect(() => {
-		if (activeColumn === null) return;
-		const closeOutside = (event: MouseEvent) => {
-			const target = event.target as Node;
-			if (
-				pinnedColumn !== null &&
-				!rootRef.current?.contains(target) &&
-				!tooltipRef.current?.contains(target)
-			) {
-				closeActivityTooltip();
-			}
-		};
-		const closeOnEscape = (event: globalThis.KeyboardEvent) => {
-			if (event.key === "Escape") closeActivityTooltip();
-		};
-		document.addEventListener("mousedown", closeOutside);
-		document.addEventListener("keydown", closeOnEscape);
-		return () => {
-			document.removeEventListener("mousedown", closeOutside);
-			document.removeEventListener("keydown", closeOnEscape);
-		};
-	}, [activeColumn, closeActivityTooltip, pinnedColumn]);
-
-	useEffect(() => {
-		if (pinnedColumn !== null || activeColumn === null) return;
-		const closeWhenOutsideSafeZone = (event: PointerEvent) => {
-			const gridSurface = gridSurfaceRef.current;
-			const tooltip = tooltipRef.current;
-			if (!gridSurface) return;
-			const gridRect = toActivityRect(gridSurface.getBoundingClientRect());
-			const inGrid = containsPoint(gridRect, event.clientX, event.clientY);
-			const tooltipRect = tooltip
-				? toActivityRect(tooltip.getBoundingClientRect())
-				: null;
-			const inTooltip = tooltipRect
-				? containsPoint(tooltipRect, event.clientX, event.clientY)
-				: false;
-			const inTransitionGap = tooltipRect
-				? isInTransitionCorridor(
-						gridRect,
-						tooltipRect,
-						TOOLTIP_GAP,
-						event.clientX,
-						event.clientY,
-					)
-				: false;
-			if (!inGrid && !inTooltip && !inTransitionGap) {
-				const focusedCell = focusedCellRef.current;
-				if (
-					focusedCell &&
-					document.activeElement === focusedCell &&
-					focusedColumnRef.current !== null
-				) {
-					setHoveredColumn(focusedColumnRef.current);
-					setAnchorFromElement(focusedCell);
-					return;
-				}
-				setHoveredColumn(null);
-				tooltipAnchorElementRef.current = null;
-				tooltipAnchorRef.current = null;
-				setTooltipAnchor(null);
-				setTooltipPosition(null);
-			}
-		};
-		document.addEventListener("pointermove", closeWhenOutsideSafeZone);
-		return () =>
-			document.removeEventListener("pointermove", closeWhenOutsideSafeZone);
-	}, [activeColumn, pinnedColumn, setAnchorFromElement]);
-
-	useEffect(() => {
-		if (
-			pinnedBucketStartedAt !== null &&
-			data &&
-			!data.buckets.some(
-				(bucket) => bucket.started_at === pinnedBucketStartedAt,
-			)
-		) {
-			closeActivityTooltip();
-			return;
-		}
-		if (
-			activeColumn !== null &&
-			(activeColumn < visibleBucketStart ||
-				activeColumn >= (data?.buckets.length ?? 0))
-		) {
-			closeActivityTooltip();
-		}
-	}, [
-		activeColumn,
-		closeActivityTooltip,
-		data,
-		pinnedBucketStartedAt,
-		visibleBucketStart,
-	]);
-
-	const selectedBucket =
-		activeColumn === null ? null : (data?.buckets[activeColumn] ?? null);
-
-	const updateTooltipPosition = useCallback(() => {
-		const tooltip = tooltipRef.current;
-		const gridSurface = gridSurfaceRef.current;
-		const anchor = tooltipAnchorRef.current ?? tooltipAnchor;
-		if (!tooltip || !gridSurface || !anchor) return;
-
-		const tooltipRect = toActivityRect(tooltip.getBoundingClientRect());
-		const gridRect = toActivityRect(gridSurface.getBoundingClientRect());
-		const siblingRects = rootRef.current?.parentElement
-			? Array.from(rootRef.current.parentElement.children)
-					.filter((element) => element !== rootRef.current)
-					.map((element) => toActivityRect(element.getBoundingClientRect()))
-					.filter((rect) => rect.width > 0 && rect.height > 0)
-			: [];
-		const contentRects = rootRef.current
-			? Array.from(
-					rootRef.current.querySelectorAll<HTMLElement>(
-						'[data-testid="llm-activity-mobile-range"], ul[aria-label="模型图例"], [role="alert"]',
-					),
-				)
-					.map((element) => toActivityRect(element.getBoundingClientRect()))
-					.filter((rect) => rect.width > 0 && rect.height > 0)
-			: [];
-		const avoidRects = [gridRect, ...siblingRects, ...contentRects];
-		const minimumLeft = TOOLTIP_VIEWPORT_MARGIN;
-		const maximumLeft = Math.max(
-			minimumLeft,
-			window.innerWidth - tooltipRect.width - TOOLTIP_VIEWPORT_MARGIN,
-		);
-		const minimumTop = TOOLTIP_VIEWPORT_MARGIN;
-		const maximumTop = Math.max(
-			minimumTop,
-			window.innerHeight - tooltipRect.height - TOOLTIP_VIEWPORT_MARGIN,
-		);
-		const candidates = [
-			{
-				left: anchor.x - tooltipRect.width / 2,
-				top: gridRect.bottom + TOOLTIP_GAP,
-			},
-			{
-				left: anchor.x - tooltipRect.width / 2,
-				top: gridRect.top - tooltipRect.height - TOOLTIP_GAP,
-			},
-			{
-				left: gridRect.right + TOOLTIP_GAP,
-				top: anchor.y - tooltipRect.height / 2,
-			},
-			{
-				left: gridRect.left - tooltipRect.width - TOOLTIP_GAP,
-				top: anchor.y - tooltipRect.height / 2,
-			},
-		].map((candidate) => ({
-			left: clamp(candidate.left, minimumLeft, maximumLeft),
-			top: clamp(candidate.top, minimumTop, maximumTop),
-		}));
-		const placementCandidates = [
-			...candidates,
-			{ left: minimumLeft, top: minimumTop },
-			{ left: maximumLeft, top: minimumTop },
-			{ left: minimumLeft, top: maximumTop },
-			{ left: maximumLeft, top: maximumTop },
-		];
-		const candidateOverlap = (candidate: TooltipPosition) =>
-			avoidRects.reduce(
-				(total, rect) =>
-					total +
-					overlapArea(
-						candidate.left,
-						candidate.top,
-						tooltipRect.width,
-						tooltipRect.height,
-						rect,
-					),
-				0,
-			);
-		const position =
-			placementCandidates.find(
-				(candidate) =>
-					!avoidRects.some((rect) =>
-						overlaps(
-							candidate.left,
-							candidate.top,
-							tooltipRect.width,
-							tooltipRect.height,
-							rect,
-						),
-					),
-			) ??
-			[...placementCandidates].sort(
-				(left, right) => candidateOverlap(left) - candidateOverlap(right),
-			)[0];
-		setTooltipPosition((current) =>
-			current?.left === position.left && current.top === position.top
-				? current
-				: position,
-		);
-	}, [tooltipAnchor]);
-
-	useLayoutEffect(() => {
-		if (!selectedBucket || !tooltipAnchor) return;
-		const scheduleUpdate = () => {
-			if (tooltipRafRef.current !== null) {
-				window.cancelAnimationFrame(tooltipRafRef.current);
-			}
-			tooltipRafRef.current = window.requestAnimationFrame(() => {
-				tooltipRafRef.current = null;
-				updateTooltipPosition();
-			});
-		};
-		const update = () => {
-			const pinnedCell =
-				pinnedColumn !== null &&
-				pinnedModel !== null &&
-				resolvedPinnedColumn !== null &&
-				resolvedPinnedColumn >= 0
-					? cellRefs.current.get(`${pinnedModel}:${resolvedPinnedColumn}`)
-					: null;
-			if (pinnedCell) tooltipAnchorElementRef.current = pinnedCell;
-			const anchorElement = pinnedCell ?? tooltipAnchorElementRef.current;
-			if (pinnedColumn !== null || anchorElement) {
-				if (!anchorElement) return;
-				const rect = anchorElement.getBoundingClientRect();
-				const isVisible =
-					rect.bottom > 0 &&
-					rect.top < window.innerHeight &&
-					rect.right > 0 &&
-					rect.left < window.innerWidth;
-				if (isVisible) {
-					const anchor = {
-						x: rect.left + rect.width / 2,
-						y: rect.top + rect.height / 2,
-					};
-					tooltipAnchorRef.current = anchor;
-					setTooltipAnchor((current) =>
-						current?.x === anchor.x && current.y === anchor.y
-							? current
-							: anchor,
-					);
-				}
-			}
-			scheduleUpdate();
-		};
-		// Resolve the pinned cell before positioning so refreshes re-anchor immediately.
-		update();
-		window.addEventListener("resize", update);
-		window.addEventListener("scroll", update, true);
-		const observer = new ResizeObserver(update);
-		if (tooltipRef.current) observer.observe(tooltipRef.current);
-		if (gridSurfaceRef.current) observer.observe(gridSurfaceRef.current);
-		return () => {
-			window.removeEventListener("resize", update);
-			window.removeEventListener("scroll", update, true);
-			if (tooltipRafRef.current !== null) {
-				window.cancelAnimationFrame(tooltipRafRef.current);
-				tooltipRafRef.current = null;
-			}
-			observer.disconnect();
-		};
-	}, [
-		closeActivityTooltip,
-		pinnedColumn,
-		pinnedModel,
-		resolvedPinnedColumn,
-		selectedBucket,
-		tooltipAnchor,
-		updateTooltipPosition,
-	]);
-
-	const handleKeyDown = (
-		event: KeyboardEvent<HTMLButtonElement>,
-		model: string,
-		column: number,
-	) => {
-		if (event.key === "Escape") {
-			closeActivityTooltip();
-			return;
-		}
-		if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-		event.preventDefault();
-		const direction = event.key === "ArrowLeft" ? -1 : 1;
-		const firstVisibleColumn = Math.max(
-			0,
-			(data?.buckets.length ?? 0) - visibleBucketCount,
-		);
-		const next = Math.min(
-			(data?.buckets.length ?? 1) - 1,
-			Math.max(firstVisibleColumn, column + direction),
-		);
-		setHoveredColumn(next);
-		setPinnedColumn((current) => (current === null ? null : next));
-		setPinnedBucketStartedAt((current) =>
-			current === null ? null : (data?.buckets[next]?.started_at ?? current),
-		);
-		const nextCell = cellRefs.current.get(`${model}:${next}`);
-		if (nextCell) {
-			nextCell.focus();
-			setAnchorFromElement(nextCell);
-		}
-	};
-
-	if (!data && loading) {
-		return (
-			<div
-				className="text-muted-foreground flex min-h-44 items-center justify-center gap-2 rounded-md border border-dashed text-sm"
-				role="status"
-			>
-				<LoaderCircle className="size-4 animate-spin" />
-				正在加载模型活动
-			</div>
-		);
-	}
 
 	if (!data && error) {
 		return (
@@ -652,8 +288,8 @@ export function LlmActivityGrid({
 				role="alert"
 				aria-live="assertive"
 			>
-				<AlertCircle className="text-destructive size-5" />
-				<p className="text-muted-foreground max-w-md text-sm">{error}</p>
+				<AlertCircle className="size-5 text-destructive" />
+				<p className="max-w-md text-sm text-muted-foreground">{error}</p>
 				{onRetry ? (
 					<Button type="button" variant="outline" size="sm" onClick={onRetry}>
 						<RefreshCw />
@@ -664,95 +300,16 @@ export function LlmActivityGrid({
 		);
 	}
 
-	if (!data) return null;
-
-	const bucketSucceeded =
-		selectedBucket?.counts.reduce((sum, count) => sum + count.succeeded, 0) ??
-		0;
-	const gridStyle = {
-		gridTemplateColumns: `${gridLabelWidth}px repeat(${visibleBuckets.length}, minmax(0, 1fr))`,
-	} as CSSProperties;
-
-	const tooltip = selectedBucket
-		? createPortal(
-				<div
-					ref={tooltipRef}
-					id={ACTIVITY_SUMMARY_ID}
-					className={`bg-popover text-popover-foreground fixed z-50 max-h-[min(30vh,12rem)] w-[min(28rem,calc(100vw-1.5rem))] overflow-y-auto rounded-md border p-3 shadow-lg ${pinnedColumn !== null ? "pointer-events-auto" : "pointer-events-none"}`}
-					style={
-						tooltipPosition
-							? { left: tooltipPosition.left, top: tooltipPosition.top }
-							: { left: 0, top: 0, visibility: "hidden" }
-					}
-					role={pinnedColumn !== null && pinnedModel ? "dialog" : "tooltip"}
-					{...(pinnedColumn !== null && pinnedModel
-						? { "aria-labelledby": ACTIVITY_SUMMARY_LABEL_ID }
-						: {})}
-					tabIndex={pinnedColumn !== null ? 0 : -1}
-					aria-live="polite"
-					aria-atomic="true"
-					data-testid="llm-activity-summary"
-				>
-					{pinnedColumn !== null && pinnedModel ? (
-						<span id={ACTIVITY_SUMMARY_LABEL_ID} className="sr-only">
-							{pinnedModel} 在 {localTime(selectedBucket.started_at)} 的调用摘要
-						</span>
-					) : null}
-					<div className="flex items-center justify-between gap-2">
-						<p className="text-sm font-medium">
-							{localTime(selectedBucket.started_at)}
-						</p>
-						{pinnedModel && onOpenCalls ? (
-							<LlmCallActionsMenu
-								target={{
-									model: pinnedModel,
-									finishedFrom: selectedBucket.started_at,
-									finishedBefore: selectedBucket.ended_at,
-								}}
-								onOpen={onOpenCalls}
-								label={`${pinnedModel} 的调用操作`}
-							/>
-						) : null}
-					</div>
-					<div className="mt-2 grid grid-cols-[minmax(0,1fr)_auto_auto_auto_auto] gap-x-3 gap-y-1 text-xs">
-						<span className="text-muted-foreground">模型</span>
-						<span className="text-muted-foreground text-right">成功</span>
-						<span className="text-muted-foreground text-right">失败</span>
-						<span className="text-muted-foreground text-right">成功率</span>
-						<span className="text-muted-foreground text-right">使用率</span>
-						{selectedBucket.counts.map((count) => (
-							<div key={count.model} className="contents">
-								<span className="truncate font-mono" title={count.model}>
-									{count.model}
-								</span>
-								<span className="text-right tabular-nums">
-									{count.succeeded}
-								</span>
-								<span className="text-right tabular-nums">{count.failed}</span>
-								<span className="text-right tabular-nums">
-									{percent(count.succeeded, count.succeeded + count.failed)}
-								</span>
-								<span className="text-right tabular-nums">
-									{percent(count.succeeded, bucketSucceeded)}
-								</span>
-							</div>
-						))}
-					</div>
-				</div>,
-				document.body,
-			)
-		: null;
-
 	return (
-		<div ref={rootRef} className="min-w-0" data-testid="llm-activity-grid">
+		<div className="min-w-0" data-testid="llm-activity-grid">
 			<div className="mb-2 flex min-h-8 flex-col items-start justify-between gap-2 sm:flex-row sm:items-center sm:gap-3">
 				<div className="flex shrink-0 items-center gap-2">
-					<p className="text-muted-foreground text-xs">
-						最近 {visibleBuckets.length} 小时 · 本地时间
+					<p className="text-xs text-muted-foreground">
+						最近 {data?.buckets.length ?? 12} 小时 · 本地时间
 					</p>
 					{refreshing ? (
 						<span
-							className="text-muted-foreground inline-flex items-center gap-1 text-xs"
+							className="inline-flex items-center gap-1 text-xs text-muted-foreground"
 							role="status"
 						>
 							<LoaderCircle className="size-3 animate-spin" />
@@ -762,215 +319,33 @@ export function LlmActivityGrid({
 				</div>
 				<ActivityColorLegend />
 			</div>
-			{isMobile && visibleBuckets.length > 0 ? (
+			{data && data.buckets.length > 0 ? (
 				<div
-					className="text-muted-foreground mb-2 flex items-center justify-between font-mono text-[10px] tabular-nums"
+					className="mb-2 flex items-center justify-between font-mono text-[10px] tabular-nums text-muted-foreground sm:hidden"
 					data-testid="llm-activity-mobile-range"
 				>
-					<span>{localTime(visibleBuckets[0].started_at)}</span>
+					<span>{localTime(data.buckets[0].started_at)}</span>
 					<span aria-hidden="true">至</span>
 					<span>
-						{localTime(visibleBuckets[visibleBuckets.length - 1].ended_at)}
+						{localTime(data.buckets.at(-1)?.ended_at ?? data.window_ended_at)}
 					</span>
 				</div>
 			) : null}
-			<div
-				ref={gridSurfaceRef}
-				className="min-w-0 max-h-[min(30vh,12rem)] overflow-y-auto"
-				data-testid="llm-activity-surface"
-			>
-				<div className="grid w-full gap-0" style={gridStyle}>
-					<div className="bg-card sticky left-0 z-20 h-0 sm:h-auto" />
-					{visibleBuckets.map((bucket, index) => {
-						const isFirstBucket = index === 0;
-						const isLastBucket = index === visibleBuckets.length - 1;
-						const isTooCloseToLastBucket =
-							!isLastBucket && visibleBuckets.length - 1 - index < 3;
-						const timeLabelPosition = isFirstBucket
-							? "left-0"
-							: isLastBucket
-								? "right-0"
-								: "left-1/2 -translate-x-1/2";
-						return (
-							<div
-								key={bucket.started_at}
-								className="text-muted-foreground relative h-0 text-xs sm:h-6"
-								title={localTime(bucket.started_at)}
-							>
-								{(index % 6 === 0 && !isTooCloseToLastBucket) ||
-								isLastBucket ? (
-									<span
-										className={`absolute bottom-0 hidden whitespace-nowrap sm:inline-block ${timeLabelPosition}`}
-										data-testid="llm-activity-time-label"
-									>
-										{localTime(bucket.started_at).slice(0, 5)}
-									</span>
-								) : null}
-							</div>
-						);
-					})}
-					{data.models.length === 0 ? (
-						<div className="text-muted-foreground col-span-full py-10 text-center text-sm">
-							窗口内暂无模型活动
-						</div>
-					) : null}
-					{data.models.map((model) => [
-						<div
-							key={`${model.model}:label`}
-							className="bg-card sticky left-0 z-10 flex min-w-0 items-center pr-1 sm:h-4 sm:pr-2"
-						>
-							{isMobile ? (
-								<span
-									className="text-muted-foreground w-full text-center font-mono text-[10px] tabular-nums"
-									aria-hidden="true"
-								>
-									{model.priority || "·"}
-								</span>
-							) : (
-								<span
-									className="truncate font-mono text-xs"
-									title={model.model}
-								>
-									{model.configured ? `${model.priority}. ` : ""}
-									{model.model}
-								</span>
-							)}
-							<span className="sr-only">{model.model}</span>
-						</div>,
-						...visibleBuckets.map((bucket, visibleIndex) => {
-							const column = visibleBucketStart + visibleIndex;
-							const count = bucket.counts.find(
-								(item) => item.model === model.model,
-							) ?? {
-								succeeded: 0,
-								failed: 0,
-							};
-							const outcome = activityOutcome(count.succeeded, count.failed);
-							const key = `${model.model}:${column}`;
-							const cell = (
-								<button
-									key={key}
-									ref={(node) => {
-										if (node) cellRefs.current.set(key, node);
-										else cellRefs.current.delete(key);
-									}}
-									type="button"
-									className="group relative aspect-square w-full min-w-0 focus-visible:outline-none"
-									aria-label={`${localTime(bucket.started_at)}，${model.model}，成功 ${count.succeeded}，失败 ${count.failed}`}
-									aria-controls={ACTIVITY_SUMMARY_ID}
-									aria-describedby={
-										activeColumn === column ? ACTIVITY_SUMMARY_ID : undefined
-									}
-									aria-expanded={activeColumn === column}
-									data-activity-outcome={outcome}
-									onPointerMove={(event) => {
-										if (pinnedColumn !== null) return;
-										tooltipAnchorElementRef.current = null;
-										setHoveredColumn(column);
-										const anchor = { x: event.clientX, y: event.clientY };
-										tooltipAnchorRef.current = anchor;
-										setTooltipAnchor(anchor);
-									}}
-									onFocus={(event) => {
-										if (pinnedColumn === null) {
-											focusedCellRef.current = event.currentTarget;
-											focusedColumnRef.current = column;
-											setHoveredColumn(column);
-											setAnchorFromElement(event.currentTarget);
-										}
-									}}
-									onBlur={(event) => {
-										if (focusedCellRef.current === event.currentTarget) {
-											focusedCellRef.current = null;
-											focusedColumnRef.current = null;
-										}
-										if (pinnedColumn === null) {
-											tooltipAnchorElementRef.current = null;
-											setHoveredColumn(null);
-										}
-									}}
-									onPointerDown={(event) => {
-										setHoveredColumn(column);
-										setPinnedColumn(column);
-										setPinnedBucketStartedAt(bucket.started_at);
-										setPinnedModel(model.model);
-										tooltipAnchorElementRef.current = event.currentTarget;
-										const anchor = { x: event.clientX, y: event.clientY };
-										tooltipAnchorRef.current = anchor;
-										setTooltipAnchor(anchor);
-									}}
-									onClick={(event) => {
-										setPinnedColumn(column);
-										setPinnedBucketStartedAt(bucket.started_at);
-										setPinnedModel(model.model);
-										setAnchorFromElement(event.currentTarget);
-									}}
-									onKeyDown={(event) =>
-										handleKeyDown(event, model.model, column)
-									}
-								>
-									<span
-										aria-hidden="true"
-										className={`pointer-events-none absolute rounded-[2px] ring-1 transition-[filter] group-hover:brightness-95 group-focus-visible:ring-ring sm:rounded-[3px] ${isMobile ? "inset-x-px inset-y-0.5" : "inset-x-[1.5px] inset-y-0.5"} ${activityClass(count.succeeded, count.failed, visibleMax)} ${activeColumn === column ? "brightness-90 ring-foreground/60" : ""}`}
-									/>
-								</button>
-							);
-							return onOpenCalls ? (
-								<LlmCallContextMenu
-									key={key}
-									target={{
-										model: model.model,
-										finishedFrom: bucket.started_at,
-										finishedBefore: bucket.ended_at,
-									}}
-									onOpen={onOpenCalls}
-								>
-									{cell}
-								</LlmCallContextMenu>
-							) : (
-								cell
-							);
-						}),
-					])}
-				</div>
-			</div>
-			{isMobile && data.models.length > 0 ? (
-				<ul
-					className="mt-3 grid gap-x-4 gap-y-1 text-xs sm:hidden"
-					aria-label="模型图例"
+			<ActivityGrid
+				model={model}
+				loading={loading || (!data && !error)}
+				onActivate={() => undefined}
+				previewTestId="llm-activity-summary"
+			/>
+			{data ? <ModelLegend data={data} /> : null}
+			{error && data ? (
+				<p
+					className="mt-2 text-xs text-amber-700 dark:text-amber-300"
+					role="status"
 				>
-					{data.models.map((model) => (
-						<li key={model.model} className="flex min-w-0 items-center gap-2">
-							<span className="bg-muted text-muted-foreground inline-flex size-5 shrink-0 items-center justify-center rounded font-mono text-[10px] tabular-nums">
-								{model.priority || "·"}
-							</span>
-							<span className="truncate font-mono">{model.model}</span>
-						</li>
-					))}
-				</ul>
+					{error}
+				</p>
 			) : null}
-			{error ? (
-				<div
-					className="text-destructive mt-2 flex flex-wrap items-center gap-2 text-xs"
-					role="alert"
-					aria-live="polite"
-				>
-					<span>更新失败：{error}</span>
-					{onRetry ? (
-						<Button
-							type="button"
-							variant="ghost"
-							size="sm"
-							onClick={onRetry}
-							className="h-6 px-2 text-xs"
-						>
-							<RefreshCw />
-							重试
-						</Button>
-					) : null}
-				</div>
-			) : null}
-			{tooltip}
 		</div>
 	);
-}
+});

@@ -1,5 +1,4 @@
 import {
-	ArrowLeft,
 	ChevronDown,
 	ChevronRight,
 	CircleAlert,
@@ -81,9 +80,42 @@ type CollectionReadError = {
 };
 const PAGE_SIZE = 20;
 const ACTIVITY_CACHE_MS = 5_000;
+const collectionListCache = new Map<
+	string,
+	{ items: AdminCollectionRecordItem[]; total: number; storedAt: number }
+>();
+const collectionActivityCache = new Map<
+	string,
+	{ data: AdminCollectionActivityResponse; storedAt: number }
+>();
+const collectionListCacheHandoff = new Set<string>();
+const collectionActivityCacheHandoff = new Set<string>();
+let collectionListCacheHandoffPending = false;
+let collectionActivityCacheHandoffPending = false;
+const DETAIL_LIST_CACHE_HANDOFF_KEY = "octo-rill:ai-records:list-handoff";
+const DETAIL_ACTIVITY_CACHE_HANDOFF_KEY =
+	"octo-rill:ai-records:activity-handoff";
+const DETAIL_LIST_CACHE_DATA_KEY = "octo-rill:ai-records:list-handoff-data";
+const DETAIL_ACTIVITY_CACHE_DATA_KEY =
+	"octo-rill:ai-records:activity-handoff-data";
 const ATTEMPT_RANGE_MAX = 10;
 const ATTEMPT_UNBOUNDED_VALUE = ATTEMPT_RANGE_MAX + 1;
 const DEFAULT_ATTEMPT_RANGE: AttemptCountRange = { min: 0, max: null };
+const SESSION_RECORD_NOW = new Date();
+
+function aiRecordFiltersKey(filters: AiRecordRouteFilters | undefined) {
+	if (!filters) return "";
+	return JSON.stringify([
+		filters.kind,
+		filters.preset,
+		filters.from,
+		filters.before,
+		filters.translationStatus,
+		filters.polishStatus,
+		filters.attemptMin,
+		filters.attemptMax,
+	]);
+}
 
 function recordNow() {
 	const demoUrl =
@@ -92,7 +124,7 @@ function recordNow() {
 		new URL(window.location.href).searchParams.has("demo");
 	return __OCTO_RILL_DEMO_APP__ || demoUrl
 		? new Date("2026-07-08T10:30:00+08:00")
-		: new Date();
+		: SESSION_RECORD_NOW;
 }
 
 function initialRange() {
@@ -1104,7 +1136,6 @@ export function AiOperationsRecordsSection({
 		loading: boolean;
 		error: CollectionReadError | null;
 	} | null>(null);
-	const [listReadCycle, setListReadCycle] = useState(0);
 	const [reloadNonce, setReloadNonce] = useState(0);
 	const [activity, setActivity] =
 		useState<AdminCollectionActivityResponse | null>(null);
@@ -1120,17 +1151,14 @@ export function AiOperationsRecordsSection({
 	const [detailLoading, setDetailLoading] = useState(false);
 	const [detailError, setDetailError] = useState<string | null>(null);
 	const listRequestRef = useRef(0);
+	const hasIssuedListReadRef = useRef(false);
+	const listInitialMountRef = useRef(true);
 	const detailRequestRef = useRef(0);
 	const activityRequestRef = useRef(0);
 	const activityControllerRef = useRef<AbortController | null>(null);
-	const activityCacheRef = useRef(
-		new Map<
-			CollectionTab,
-			{ data: AdminCollectionActivityResponse; storedAt: number }
-		>(),
-	);
+	const activityCacheRef = useRef(collectionActivityCache);
 	const activityNeedsReadRef = useRef(true);
-	const listReadSettledRef = useRef(false);
+	const activityInitialMountRef = useRef(true);
 	const activityForceReadRef = useRef(false);
 	const activityTabRef = useRef(tab);
 	const handledReloadNonceRef = useRef(0);
@@ -1168,8 +1196,12 @@ export function AiOperationsRecordsSection({
 			translationStatuses,
 		],
 	);
+	const routeFiltersKey = aiRecordFiltersKey(routeFilters);
+	const appliedRouteFiltersKeyRef = useRef(routeFiltersKey);
 	useEffect(() => {
 		if (!routeFilters) return;
+		if (appliedRouteFiltersKeyRef.current === routeFiltersKey) return;
+		appliedRouteFiltersKeyRef.current = routeFiltersKey;
 		setTab(routeFilters.kind);
 		setPreset(routeFilters.preset);
 		if (routeFilters.from && routeFilters.before) {
@@ -1181,7 +1213,7 @@ export function AiOperationsRecordsSection({
 			min: routeFilters.attemptMin,
 			max: routeFilters.attemptMax,
 		});
-	}, [routeFilters]);
+	}, [routeFilters, routeFiltersKey]);
 	const selectedRange = useMemo(() => {
 		if (preset === "custom") return range;
 		const end = recordNow();
@@ -1221,7 +1253,36 @@ export function AiOperationsRecordsSection({
 		tab,
 		translationStatuses,
 	]);
-	const listQueryKey = `${tab}?${listParams.toString()}`;
+	const listParamsKey = listParams.toString();
+	const listQueryKey = `${tab}?${listParamsKey}`;
+	const activityCacheKey = tab;
+	const activityCacheKeyRef = useRef(activityCacheKey);
+	const navigateToRecord = useCallback(
+		(kind: CollectionTab, id: string) => {
+			collectionListCacheHandoff.add(listQueryKey);
+			collectionActivityCacheHandoff.add(activityCacheKey);
+			collectionListCacheHandoffPending = true;
+			collectionActivityCacheHandoffPending = true;
+			window.sessionStorage.setItem(DETAIL_LIST_CACHE_HANDOFF_KEY, "1");
+			window.sessionStorage.setItem(DETAIL_ACTIVITY_CACHE_HANDOFF_KEY, "1");
+			const listEntry = collectionListCache.get(listQueryKey);
+			if (listEntry) {
+				window.sessionStorage.setItem(
+					DETAIL_LIST_CACHE_DATA_KEY,
+					JSON.stringify({ queryKey: listQueryKey, ...listEntry }),
+				);
+			}
+			const activityEntry = collectionActivityCache.get(activityCacheKey);
+			if (activityEntry) {
+				window.sessionStorage.setItem(
+					DETAIL_ACTIVITY_CACHE_DATA_KEY,
+					JSON.stringify(activityEntry),
+				);
+			}
+			onOpenRecord(kind, id);
+		},
+		[activityCacheKey, listQueryKey, onOpenRecord],
+	);
 	const currentList =
 		lastSuccessfulList?.queryKey === listQueryKey ? lastSuccessfulList : null;
 	const items = currentList?.items ?? [];
@@ -1277,22 +1338,106 @@ export function AiOperationsRecordsSection({
 		translationStatuses,
 	]);
 	useEffect(() => {
-		if (activityTabRef.current !== tab) {
+		if (!detailRoute) return;
+		collectionListCacheHandoff.add(listQueryKey);
+		collectionActivityCacheHandoff.add(activityCacheKey);
+		return () => {
+			collectionListCacheHandoff.add(listQueryKey);
+			collectionActivityCacheHandoff.add(activityCacheKey);
+		};
+	}, [activityCacheKey, detailRoute, listQueryKey]);
+	useEffect(() => {
+		const cacheKeyChanged = activityCacheKeyRef.current !== activityCacheKey;
+		const tabChanged = activityTabRef.current !== tab;
+		activityCacheKeyRef.current = activityCacheKey;
+		if (tabChanged || cacheKeyChanged) {
 			activityTabRef.current = tab;
 			activityNeedsReadRef.current = true;
+			if (tabChanged) activityForceReadRef.current = true;
 		}
-		const cached = activityCacheRef.current.get(tab);
+		const cached = activityCacheRef.current.get(activityCacheKey);
 		setActivity(cached?.data ?? null);
 		setActivityError(null);
-		setActivityLoading(!cached);
-	}, [tab]);
+		setActivityLoading(true);
+	}, [activityCacheKey, tab]);
 	useEffect(() => {
 		const requestId = listRequestRef.current + 1;
 		listRequestRef.current = requestId;
-		listReadSettledRef.current = false;
 		const abortController = new AbortController();
+		const cachedList = collectionListCache.get(listQueryKey);
+		const isInitialMount = listInitialMountRef.current;
+		listInitialMountRef.current = false;
+		if (detailRoute) {
+			if (cachedList) {
+				setLastSuccessfulList({
+					queryKey: listQueryKey,
+					items: cachedList.items,
+					total: cachedList.total,
+				});
+			}
+			setListReadState({ queryKey: listQueryKey, loading: false, error: null });
+			return;
+		}
+		const storageHandoff =
+			window.sessionStorage.getItem(DETAIL_LIST_CACHE_HANDOFF_KEY) === "1";
+		if (storageHandoff)
+			window.sessionStorage.removeItem(DETAIL_LIST_CACHE_HANDOFF_KEY);
+		const storedList = storageHandoff
+			? window.sessionStorage.getItem(DETAIL_LIST_CACHE_DATA_KEY)
+			: null;
+		if (storedList)
+			window.sessionStorage.removeItem(DETAIL_LIST_CACHE_DATA_KEY);
+		const handoff =
+			storageHandoff ||
+			collectionListCacheHandoffPending ||
+			collectionListCacheHandoff.delete(listQueryKey);
+		collectionListCacheHandoffPending = false;
+		let handoffList = cachedList;
+		if (!handoffList && storedList) {
+			try {
+				const parsed = JSON.parse(storedList) as typeof cachedList & {
+					queryKey: string;
+				};
+				if (parsed.queryKey === listQueryKey) handoffList = parsed;
+			} catch {
+				// Ignore invalid session handoff data and fall back to a normal read.
+			}
+		}
+		if (
+			handoff &&
+			handoffList &&
+			Date.now() - handoffList.storedAt < ACTIVITY_CACHE_MS
+		) {
+			setLastSuccessfulList({
+				queryKey: listQueryKey,
+				items: handoffList.items,
+				total: handoffList.total,
+			});
+			setListReadState({ queryKey: listQueryKey, loading: false, error: null });
+			return;
+		}
+		if (
+			!isInitialMount &&
+			!hasIssuedListReadRef.current &&
+			cachedList &&
+			reloadNonce === 0 &&
+			Date.now() - cachedList.storedAt < ACTIVITY_CACHE_MS
+		) {
+			setLastSuccessfulList({
+				queryKey: listQueryKey,
+				items: cachedList.items,
+				total: cachedList.total,
+			});
+			setListReadState({ queryKey: listQueryKey, loading: false, error: null });
+			return;
+		}
+		hasIssuedListReadRef.current = true;
 		setListReadState({ queryKey: listQueryKey, loading: true, error: null });
-		void apiGetAdminCollectionRecords(tab, listParams, abortController.signal)
+		void apiGetAdminCollectionRecords(
+			tab,
+			new URLSearchParams(listParamsKey),
+			abortController.signal,
+		)
 			.then((response) => {
 				if (requestId !== listRequestRef.current) return;
 				setLastSuccessfulList({
@@ -1300,6 +1445,24 @@ export function AiOperationsRecordsSection({
 					items: response.items,
 					total: response.total,
 				});
+				collectionListCache.set(listQueryKey, {
+					items: response.items,
+					total: response.total,
+					storedAt: Date.now(),
+				});
+				try {
+					window.sessionStorage.setItem(
+						DETAIL_LIST_CACHE_DATA_KEY,
+						JSON.stringify({
+							queryKey: listQueryKey,
+							items: response.items,
+							total: response.total,
+							storedAt: Date.now(),
+						}),
+					);
+				} catch {
+					// Session storage is an optional handoff optimization.
+				}
 			})
 			.catch((cause: unknown) => {
 				if (requestId !== listRequestRef.current) return;
@@ -1341,21 +1504,51 @@ export function AiOperationsRecordsSection({
 							? { ...current, loading: false }
 							: current,
 					);
-					listReadSettledRef.current = true;
-					setListReadCycle((current) => current + 1);
 				}
 			});
 		return () => {
 			abortController.abort();
 		};
-	}, [listParams, listQueryKey, reloadNonce, tab]);
+	}, [detailRoute, listParamsKey, listQueryKey, reloadNonce, tab]);
 	useEffect(() => {
-		return () => activityControllerRef.current?.abort();
-	}, [activityRetryNonce, reloadNonce, tab]);
-	useEffect(() => {
-		if (!activityNeedsReadRef.current || !listReadSettledRef.current) return;
+		if (detailRoute) return;
+		const storageHandoff =
+			window.sessionStorage.getItem(DETAIL_ACTIVITY_CACHE_HANDOFF_KEY) === "1";
+		if (storageHandoff)
+			window.sessionStorage.removeItem(DETAIL_ACTIVITY_CACHE_HANDOFF_KEY);
+		const storedActivity = storageHandoff
+			? window.sessionStorage.getItem(DETAIL_ACTIVITY_CACHE_DATA_KEY)
+			: null;
+		if (storedActivity)
+			window.sessionStorage.removeItem(DETAIL_ACTIVITY_CACHE_DATA_KEY);
+		const handoff =
+			storageHandoff ||
+			collectionActivityCacheHandoffPending ||
+			collectionActivityCacheHandoff.delete(activityCacheKey);
+		collectionActivityCacheHandoffPending = false;
 
-		const cached = activityCacheRef.current.get(tab);
+		let handoffActivity = activityCacheRef.current.get(activityCacheKey);
+		if (!handoffActivity && storedActivity) {
+			try {
+				const parsed = JSON.parse(storedActivity) as typeof handoffActivity;
+				if (parsed) handoffActivity = parsed;
+			} catch {
+				// Ignore invalid session handoff data and fall back to a normal read.
+			}
+		}
+		const cached = activityCacheRef.current.get(activityCacheKey);
+		if (handoff) {
+			if (handoffActivity) {
+				setActivity(handoffActivity.data);
+				setActivityError(null);
+			}
+			setActivityLoading(false);
+			activityNeedsReadRef.current = false;
+			return;
+		}
+		if (!activityNeedsReadRef.current) return;
+		const isInitialMount = activityInitialMountRef.current;
+		activityInitialMountRef.current = false;
 		const reloadRequested = reloadNonce > handledReloadNonceRef.current;
 		const retryRequested =
 			activityRetryNonce > handledActivityRetryNonceRef.current;
@@ -1369,6 +1562,7 @@ export function AiOperationsRecordsSection({
 		if (
 			!forceRead &&
 			cached &&
+			!isInitialMount &&
 			Date.now() - cached.storedAt < ACTIVITY_CACHE_MS
 		) {
 			setActivity(cached.data);
@@ -1389,7 +1583,15 @@ export function AiOperationsRecordsSection({
 			.then((response) => {
 				if (requestId !== activityRequestRef.current) return;
 				const entry = { data: response, storedAt: Date.now() };
-				activityCacheRef.current.set(tab, entry);
+				activityCacheRef.current.set(activityCacheKey, entry);
+				try {
+					window.sessionStorage.setItem(
+						DETAIL_ACTIVITY_CACHE_DATA_KEY,
+						JSON.stringify(entry),
+					);
+				} catch {
+					// Session storage is an optional handoff optimization.
+				}
 				setActivity(response);
 			})
 			.catch((cause: unknown) => {
@@ -1413,7 +1615,13 @@ export function AiOperationsRecordsSection({
 				activityControllerRef.current = null;
 				setActivityLoading(false);
 			});
-	}, [activityRetryNonce, listReadCycle, reloadNonce, tab]);
+		return () => {
+			if (activityControllerRef.current !== abortController) return;
+			abortController.abort();
+			activityControllerRef.current = null;
+			activityNeedsReadRef.current = true;
+		};
+	}, [activityCacheKey, activityRetryNonce, detailRoute, reloadNonce, tab]);
 	useEffect(() => {
 		if (!detailRoute) {
 			setDetail(null);
@@ -1500,29 +1708,6 @@ export function AiOperationsRecordsSection({
 		});
 		setPage(1);
 	};
-	if (compact && detailRoute)
-		return (
-			<section aria-label="采集记录详情" className="space-y-4">
-				<div className="flex items-center gap-2 border-b pb-3">
-					<Button
-						variant="ghost"
-						size="icon"
-						className="size-11"
-						onClick={closeOrBack}
-						aria-label="返回"
-					>
-						<ArrowLeft className="size-5" />
-					</Button>
-					<div className="min-w-0">
-						<h2 className="font-semibold text-base">{detailTitle}</h2>
-						<p className="text-muted-foreground truncate text-xs">
-							{detail?.record.title ?? "正在加载"}
-						</p>
-					</div>
-				</div>
-				{detailContent}
-			</section>
-		);
 	return (
 		<>
 			<Card>
@@ -1603,7 +1788,7 @@ export function AiOperationsRecordsSection({
 							activityForceReadRef.current = true;
 							setActivityRetryNonce((current) => current + 1);
 						}}
-						onOpenRecord={onOpenRecord}
+						onOpenRecord={navigateToRecord}
 					/>
 					<fieldset className="flex flex-wrap items-center gap-3 rounded-lg border border-border/70 bg-muted/30 p-2 sm:p-3">
 						<legend className="sr-only">处理状态筛选</legend>
@@ -1699,13 +1884,13 @@ export function AiOperationsRecordsSection({
 								items={items}
 								tab={tab}
 								disabled={loading || Boolean(error)}
-								onOpen={(item) => onOpenRecord(item.kind, item.id)}
+								onOpen={(item) => navigateToRecord(item.kind, item.id)}
 							/>
 							<CompactRecordList
 								items={items}
 								tab={tab}
 								disabled={loading || Boolean(error)}
-								onOpen={(item) => onOpenRecord(item.kind, item.id)}
+								onOpen={(item) => navigateToRecord(item.kind, item.id)}
 							/>
 							<Paging
 								page={page}
@@ -1721,13 +1906,18 @@ export function AiOperationsRecordsSection({
 			<Sheet
 				open={Boolean(detailRoute)}
 				onOpenChange={(open) => {
-					if (!open) onCloseRecord();
+					if (!open) {
+						onCloseRecord();
+					}
 				}}
 			>
 				<SheetContent
-					side="right"
+					side={compact ? "bottom" : "right"}
 					showCloseButton={false}
-					className="w-full gap-0 overflow-y-auto p-0 sm:max-w-3xl"
+					className={cn(
+						"w-full gap-0 overflow-y-auto p-0 sm:max-w-3xl",
+						compact ? "max-h-[min(86dvh,48rem)] rounded-t-xl" : "h-full",
+					)}
 				>
 					<SheetHeader className="gap-3 border-b px-5 py-4 text-left">
 						<div className="flex items-start justify-between gap-3">
