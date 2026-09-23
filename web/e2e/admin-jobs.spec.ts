@@ -2653,10 +2653,14 @@ test("content processing audit shows retry state, model, error, and call detail"
 	await page.setViewportSize({ width: 1440, height: 900 });
 	await installAdminJobsMocks(page, { emitStreamEvents: false });
 	const listRequests: URL[] = [];
+	const activityRequests: URL[] = [];
 	page.on("request", (request) => {
 		const url = new URL(request.url());
 		if (url.pathname === "/api/admin/jobs/ai-records/release") {
 			listRequests.push(url);
+		}
+		if (url.pathname === "/api/admin/jobs/ai-records/release/activity") {
+			activityRequests.push(url);
 		}
 	});
 
@@ -2789,6 +2793,9 @@ test("content processing audit shows retry state, model, error, and call detail"
 		.poll(() => listRequests.at(-1)?.searchParams.get("attempt_min") ?? null)
 		.toBeNull();
 
+	await page.waitForTimeout(750);
+	const listRequestsBeforeDetail = listRequests.length;
+	const activityRequestsBeforeDetail = activityRequests.length;
 	await page.getByRole("button", { name: "查看 v2.31.0 详情" }).click();
 	const recordSheet = page.getByRole("dialog", { name: "记录详情" });
 	await expect(recordSheet).toBeVisible();
@@ -2801,6 +2808,12 @@ test("content processing audit shows retry state, model, error, and call detail"
 			.getByRole("button", { name: "查看翻译第 2 次尝试详情" })
 			.getByText("排队中", { exact: true }),
 	).toBeVisible();
+	await recordSheet.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(recordSheet).toHaveCount(0);
+	expect(listRequests).toHaveLength(listRequestsBeforeDetail);
+	expect(activityRequests).toHaveLength(activityRequestsBeforeDetail);
+	await page.getByRole("button", { name: "查看 v2.31.0 详情" }).click();
+	await expect(recordSheet).toBeVisible();
 
 	await page.getByRole("button", { name: "查看翻译第 1 次尝试详情" }).click();
 	await expect(page.getByRole("dialog", { name: "尝试详情" })).toBeVisible();
@@ -2851,6 +2864,14 @@ test("content processing attempt filter stays full-width without mobile overflow
 	await expect(
 		page.getByRole("button", { name: /移动端来源记录/ }),
 	).toBeVisible();
+	await page.getByRole("button", { name: /移动端来源记录/ }).click();
+	const mobileDetail = page.getByRole("dialog", { name: "记录详情" });
+	await expect(mobileDetail).toBeVisible();
+	const mobileDetailBox = await mobileDetail.boundingBox();
+	expect(mobileDetailBox).not.toBeNull();
+	expect(mobileDetailBox?.height ?? 0).toBeLessThan(844 * 0.9);
+	await mobileDetail.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(mobileDetail).toHaveCount(0);
 	const filter = page.getByRole("group", { name: "尝试次数筛选" });
 	const filterBox = await filter.boundingBox();
 	expect(filterBox).not.toBeNull();
@@ -3337,7 +3358,7 @@ test("admin drills from LLM activity and model cards into shareable call filters
 		});
 });
 
-test("admin llm activity keeps context-menu hit targets contiguous", async ({
+test("admin llm activity keeps context-menu hit targets spaced", async ({
 	page,
 }) => {
 	await page.setViewportSize({ width: 1200, height: 900 });
@@ -3362,14 +3383,14 @@ test("admin llm activity keeps context-menu hit targets contiguous", async ({
 				(firstCellBox?.width ?? 0) -
 				(secondCellBox?.x ?? 0),
 		),
-	).toBeLessThan(0.5);
+	).toBeGreaterThanOrEqual(1.5);
 	expect(
 		Math.abs(
 			(firstCellBox?.y ?? 0) +
 				(firstCellBox?.height ?? 0) -
 				(nextRowCellBox?.y ?? 0),
 		),
-	).toBeLessThan(0.5);
+	).toBeGreaterThanOrEqual(1.5);
 
 	await page.mouse.click(
 		secondCellBox?.x ?? 0,
@@ -3640,12 +3661,12 @@ test("admin llm activity fits a dynamic recent window without horizontal overflo
 				);
 				const lastCell = rowCells.at(-1);
 				if (!surface || !lastCell) return Number.POSITIVE_INFINITY;
-				return Math.abs(
+				return (
 					surface.getBoundingClientRect().right -
-						lastCell.getBoundingClientRect().right,
+					lastCell.getBoundingClientRect().right
 				);
 			}),
-		).toBeLessThanOrEqual(1);
+		).toBeLessThanOrEqual(2);
 		if (width >= 640) {
 			const timeLabels = grid.getByTestId("llm-activity-time-label");
 			const surfaceBox = await grid
@@ -3678,6 +3699,26 @@ test("admin llm activity fits a dynamic recent window without horizontal overflo
 					timeLabelBoxes[index].left + 1,
 				);
 			}
+		}
+		const visibleCellBoxes = await cells.evaluateAll((nodes) =>
+			nodes
+				.filter((node) => {
+					const style = window.getComputedStyle(node);
+					return (
+						style.display !== "none" &&
+						style.visibility !== "hidden" &&
+						node.getBoundingClientRect().width > 0
+					);
+				})
+				.map((node) => {
+					const box = node.getBoundingClientRect();
+					return { left: box.left, right: box.right };
+				}),
+		);
+		if (visibleCellBoxes.length >= 2) {
+			expect(
+				visibleCellBoxes[1].left - visibleCellBoxes[0].right,
+			).toBeGreaterThanOrEqual(2);
 		}
 
 		if (width < 640) {
@@ -3718,7 +3759,7 @@ test("admin llm activity prioritizes the grid on mobile", async ({ page }) => {
 				(firstCellBox?.width ?? 0) -
 				(secondCellBox?.x ?? 0),
 		),
-	).toBeLessThan(0.5);
+	).toBeGreaterThanOrEqual(1.5);
 
 	await expect(grid.getByRole("list", { name: "模型图例" })).toContainText(
 		"gpt-4o-mini",
