@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -1113,11 +1114,21 @@ async fn cleanup_expired_llm_calls(state: &AppState) -> Result<u64> {
     match state
         .sqlite_writer
         .try_write("llm_call_retention_cleanup", || async {
+            let mut tx = state
+                .pool
+                .begin()
+                .await
+                .context("begin llm retention cleanup transaction failed")?;
             sqlx::query(r#"DELETE FROM llm_diagnostic_access_audit WHERE created_at < ?"#)
                 .bind(cutoff.as_str())
-                .execute(&state.pool)
+                .execute(&mut *tx)
                 .await
                 .context("delete expired llm diagnostic audits failed")?;
+            sqlx::query(r#"DELETE FROM content_work_admission_events WHERE created_at < ?"#)
+                .bind(cutoff.as_str())
+                .execute(&mut *tx)
+                .await
+                .context("delete expired content admission events failed")?;
             sqlx::query(
                 r#"
                 UPDATE translation_attempt_llm_calls
@@ -1126,17 +1137,19 @@ async fn cleanup_expired_llm_calls(state: &AppState) -> Result<u64> {
                 "#,
             )
             .bind(cutoff.as_str())
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await
             .context("mark expired llm diagnostic links failed")?;
-            Ok::<_, anyhow::Error>(
-                sqlx::query(r#"DELETE FROM llm_calls WHERE created_at < ?"#)
-                    .bind(cutoff.as_str())
-                    .execute(&state.pool)
-                    .await
-                    .context("delete expired llm_calls failed")?
-                    .rows_affected(),
-            )
+            let deleted = sqlx::query(r#"DELETE FROM llm_calls WHERE created_at < ?"#)
+                .bind(cutoff.as_str())
+                .execute(&mut *tx)
+                .await
+                .context("delete expired llm_calls failed")?
+                .rows_affected();
+            tx.commit()
+                .await
+                .context("commit llm retention cleanup transaction failed")?;
+            Ok::<_, anyhow::Error>(deleted)
         })
         .await
     {
@@ -2890,6 +2903,30 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route(
     max_tokens: u32,
     route_snapshot: Option<&[String]>,
 ) -> Result<ChatCompletionDiagnostic> {
+    chat_completion_with_diagnostics_for_config_and_route_with_admission(
+        state,
+        base_ai,
+        system,
+        user,
+        max_tokens,
+        route_snapshot,
+        None,
+    )
+    .await
+}
+
+pub type ProviderAdmissionGuard =
+    Arc<dyn Fn(usize) -> Pin<Box<dyn Future<Output = Result<bool>> + Send>> + Send + Sync>;
+
+pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admission(
+    state: &AppState,
+    base_ai: &AiConfig,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    route_snapshot: Option<&[String]>,
+    provider_admission: Option<ProviderAdmissionGuard>,
+) -> Result<ChatCompletionDiagnostic> {
     let mut candidates = if let Some(route_snapshot) = route_snapshot {
         state
             .llm_scheduler
@@ -3028,6 +3065,66 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route(
             }
         }
 
+        if let Some(provider_admission) = provider_admission.as_ref() {
+            let admission_failure = match provider_admission(candidate_index).await {
+                Ok(true) => None,
+                Ok(false) => Some((
+                    "provider admission rejected before request".to_owned(),
+                    LlmFailureClass::Transient,
+                )),
+                Err(error) => Some((
+                    error.to_string(),
+                    llm_failure_class(&error).unwrap_or(LlmFailureClass::Transient),
+                )),
+            };
+            if let Some((admission_error, failure_class)) = admission_failure {
+                let duration_ms = started_at.map(|started| {
+                    i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
+                });
+                if llm_call_persisted {
+                    reconcile_admin_override_after_persist(
+                        state,
+                        log_record.id.as_str(),
+                        finalize_llm_call(
+                            state,
+                            log_record.id.as_str(),
+                            FinalizeLlmCallUpdate {
+                                status: "failed",
+                                attempt_count,
+                                scheduler_wait_ms: total_wait_ms,
+                                first_token_wait_ms: None,
+                                duration_ms,
+                                output_messages_json: None,
+                                response_text: None,
+                                error_text: Some(admission_error.as_str()),
+                                input_tokens: None,
+                                output_tokens: None,
+                                finish_reason: None,
+                                provider_request_id: None,
+                                provider_http_status: None,
+                                cached_input_tokens: None,
+                                total_tokens: None,
+                                failure_class: Some(failure_class.as_str()),
+                                final_model: Some(model_for_call.as_str()),
+                                fallback_count,
+                                retry_scheduled_at: None,
+                                recovery_attempt_count: 0,
+                            },
+                        )
+                        .await,
+                        "llm call admission rejection finalization failed",
+                    )
+                    .await;
+                }
+                in_flight_guard.release_permit();
+                drop(in_flight_guard);
+                heartbeat.stop().await;
+                return Err(anyhow::Error::new(LlmCallFailure {
+                    class: failure_class,
+                    call_id: llm_call_persisted.then(|| log_record.id.clone()),
+                }));
+            }
+        }
         let attempt_result = chat_completion_once(state, &ai, system, user, max_tokens).await;
         match attempt_result {
             Ok(output) => {
@@ -7705,6 +7802,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_admission_error_finalizes_persisted_call_without_provider_request() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let observed_requests = Arc::clone(&request_count);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let observed_requests = Arc::clone(&observed_requests);
+                async move {
+                    observed_requests.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "choices": [{"message": {"content": "unexpected"}}]
+                        })),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let ai = state.config.ai.clone().expect("test ai config");
+        let provider_admission: ProviderAdmissionGuard =
+            Arc::new(|_| Box::pin(async { Err(anyhow!("provider admission database failure")) }));
+
+        let err = chat_completion_with_diagnostics_for_config_and_route_with_admission(
+            state.as_ref(),
+            &ai,
+            "system",
+            "user",
+            128,
+            None,
+            Some(provider_admission),
+        )
+        .await
+        .expect_err("provider admission failure should stop the call");
+
+        assert_eq!(err.to_string(), "LLM upstream temporarily unavailable");
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, error_text, failure_class, runtime_owner_id,
+                   lease_heartbeat_at
+            FROM llm_calls
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&state.pool)
+        .await
+        .expect("load finalized llm call");
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            row.get::<Option<String>, _>("error_text").as_deref(),
+            Some("provider admission database failure")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("failure_class").as_deref(),
+            Some("transient")
+        );
+        assert_eq!(row.get::<Option<String>, _>("runtime_owner_id"), None);
+        assert_eq!(row.get::<Option<String>, _>("lease_heartbeat_at"), None);
+    }
+
+    #[tokio::test]
     async fn chat_completion_once_redacts_plain_text_error_response_body() {
         let base_url = spawn_test_ai_server(Router::new().route(
             "/chat/completions",
@@ -11195,6 +11357,81 @@ mod tests {
             .await
             .expect("count preserved llm call");
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn admission_events_are_retained_for_seven_days_only() {
+        let state = setup_llm_state_with_ai(None).await;
+        let recent_at = chrono::Utc::now().to_rfc3339();
+        for (work_id, source_hash) in [
+            ("retention-work-old", "retention-old"),
+            ("retention-work-recent", "retention-recent"),
+        ] {
+            sqlx::query(
+                "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, created_at, updated_at) VALUES (?, 'release', ?, 'translation', 'summary', 'zh-CN', ?, 'content-processing.v1', 'test-model', '{}', 'test-fingerprint', 'ready', ?, ?)",
+            )
+            .bind(work_id)
+            .bind(work_id)
+            .bind(source_hash)
+            .bind(if work_id.ends_with("old") {
+                "2025-01-01T00:00:00Z"
+            } else {
+                recent_at.as_str()
+            })
+            .bind(if work_id.ends_with("old") {
+                "2025-01-01T00:00:00Z"
+            } else {
+                recent_at.as_str()
+            })
+            .execute(&state.pool)
+            .await
+            .expect("seed retention work");
+        }
+        sqlx::query("INSERT INTO content_work_admission_events (id, work_item_id, event_type, source_hash, created_at) VALUES ('admission-retention-old', 'retention-work-old', 'admission_accepted', 'retention-old', '2025-01-01T00:00:00Z'), ('admission-retention-recent', 'retention-work-recent', 'admission_accepted', 'retention-recent', ?)")
+            .bind(&recent_at)
+            .execute(&state.pool)
+            .await
+            .expect("seed admission retention events");
+        sqlx::query("INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, created_at) VALUES ('retention-attempt-event', 'retention-work-old', 1, 'initial', 'attempt_started', '2025-01-01T00:00:00Z')")
+            .execute(&state.pool)
+            .await
+            .expect("seed retained attempt event");
+        sqlx::query("INSERT INTO content_attempt_llm_calls (id, attempt_event_id, provider_call_id, model, status, created_at) VALUES ('retention-attempt-call', 'retention-attempt-event', 'provider-retained', 'test-model', 'succeeded', '2025-01-01T00:00:00Z')")
+            .execute(&state.pool)
+            .await
+            .expect("seed retained attempt audit");
+
+        cleanup_expired_llm_calls(state.as_ref())
+            .await
+            .expect("cleanup admission retention");
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_work_admission_events WHERE id = 'admission-retention-old'",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .expect("count expired admission event"),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_work_admission_events WHERE id = 'admission-retention-recent'",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .expect("count recent admission event"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_llm_calls WHERE id = 'retention-attempt-call'",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .expect("count retained attempt audit"),
+            1
+        );
     }
 
     #[tokio::test]

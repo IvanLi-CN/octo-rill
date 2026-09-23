@@ -35,6 +35,8 @@ The model-independent result projection has the same complete identity, includin
 | `content_request_links` | API adapter | requester/system producer, authorization snapshot, request source, delivery mode, global work item and returned response fact |
 | `content_attempt_events` | scheduler | append-only attempt number, trigger, nullable safe attempt-start configuration/route snapshots and fingerprint, state transition, safe error, retry disposition and timing |
 | `content_attempt_llm_calls` | scheduler | exact attempt-to-call relation, call identifier and safe metrics |
+| `content_work_admission_events` | scheduler | append-only admission/no-op/rejection/supersession facts, source revision, producer/requester and reason; admission facts expire after seven days |
+| `content_attempt_provider_admissions` | scheduler | exact provider-admission linearization facts for each primary or bounded recovery call |
 | `content_legacy_observations` | migration/read model | old table, old primary key, canonical resource facts where known, classification and immutable observation basis |
 | `content_identity_upgrade_control` | migration/scheduler | singleton generation, backfill phase and cursor, pause/failure state and completion facts |
 
@@ -59,6 +61,13 @@ projections; those writes remain worker-owned.
 - Each state transition and attempt event is written transactionally. The provider call may be delivered at least once through an idempotency key; result publication is exactly once in the database.
 - One content attempt may link multiple exact provider calls only for the bounded primary plus `length_recovery` sequence. There is at most one length recovery per attempt; all call links, their safe metrics, and the terminal `attempt_completed` event are committed in the same SQLite transaction. `output_contract_invalid` and `output_truncated` are stable internal error codes and follow the existing retry-window and authorized-retry rules.
 - The unique identity registry and SQLite writer transaction serialize model-independent work admission. An active item cannot gain a second concurrent manual attempt.
+- `superseded` is a strict terminal state. Admission, automatic recovery, claim and manual retry cannot reopen it; a manual retry must associate with the current source-version work item instead.
+- Work admission records `admission_accepted`, `admission_noop`, `admission_rejected_superseded`, `source_superseded` or `reconciliation_superseded` independently from attempt events. Duplicate admission facts are idempotent by work item, event type, replacement work item and source hash; requester and producer remain in the retained fact but do not split the same idempotent event into duplicate rows.
+- Each provider request has a provider-admission fact written in the same SQLite writer boundary that validates the live lease and source currentness. A source change after admission may supersede the attempt, but the provider call remains attributable and its output cannot publish or schedule old-source recovery.
+- Internal provider retries and route fallbacks repeat that admission boundary and receive distinct call ordinals; only admitted calls may reach the provider.
+- Startup and recovery reconciliation may mark queued, failed, deferred-provider, blocked-config or ready old-source work as superseded without invoking a provider. Running work with a live lease is left to the worker's provider-admission guard.
+- Canonical source adapters use the resource identity as the revision tie-break domain. Announcement cache and live reads therefore use the normalized `repo#discussion_number` key, and notification synchronization must not replace a newer `updated_at` with an older upstream observation.
+- Admission and provider-audit rows reference their work and replacement work items with foreign keys; provider-admission roles are limited to the scheduler's primary, length-recovery and fallback relations.
 
 ## Identity Compatibility Schema
 
@@ -79,7 +88,7 @@ projections; those writes remain worker-owned.
 
 - No migration modifies `translation_work_items`, `translation_requests`, their attempts or `ai_translations`.
 - `content_legacy_observations` can identify legacy evidence but cannot be used as a foreign-key source for a global result or work state.
-- `legacy_cached` means a displayable old cache lacks matching work evidence. `legacy_conflict` means old evidence cannot be safely reconciled. Neither classification creates an attempt count or current status.
+- `legacy_cached` means a displayable old cache lacks matching work evidence. Blank title and summary fields are not displayable. `legacy_conflict` means old evidence cannot be safely reconciled, including work evidence without an available cache table. Neither classification creates an attempt count or current status.
 
 ## Admin Activity Read Indexes
 

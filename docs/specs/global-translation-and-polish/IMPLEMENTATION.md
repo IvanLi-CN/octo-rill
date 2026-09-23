@@ -25,7 +25,7 @@
 
 ## Existing Database Migration
 
-当前实现使用迁移 `0078_content_processing_global_model.sql` 和追加迁移 `0079_admin_collection_read_budget_indexes.sql` 创建全局表、索引和控制记录：
+当前实现使用迁移 `0078_content_processing_global_model.sql` 和追加迁移 `0079_admin_collection_read_budget_indexes.sql` 创建全局表、索引和控制记录；内容准入审计由追加迁移 `0086_content_work_admission_events.sql` 提供：
 
 - `content_processing_control`：单行模式栅栏，取值为 `legacy`、`rollback_freeze` 或 `global`；记录切换代号和更新时间。它是旧新写入者共同读取的唯一切换事实。
 - `content_work_items`：包含全局身份、不可变来源快照、工作级配置指纹、优先级、调度状态、租约关联、恢复元数据和取消／替代关系。当前唯一索引仍包含 `model_profile`，这与新批准的身份合同不一致。
@@ -117,7 +117,85 @@ SQLx 默认会校验数据库中每一个已应用迁移是否存在于当前二
 
 ## Failure Finalization
 
-Provider and output-validation failures finalize the failed call link, work item, batch item, batch, and `attempt_completed` event in the same SQLite transaction. The regression test `content_processing::tests::execute_persists_failure_finalization_atomically` drives this path with a local mock provider and verifies that the terminal state and audit records persist together while the worker lease is cleared.
+Provider, provider-admission and output-validation failures finalize the failed call link, work item, batch item, batch, and `attempt_completed` event in the same SQLite transaction. Admission rejection or admission persistence errors also clear the diagnostic running lease before returning a transient failure. The regressions `content_processing::tests::execute_persists_failure_finalization_atomically` and `ai::tests::provider_admission_error_finalizes_persisted_call_without_provider_request` cover the worker and direct provider-admission paths, including zero provider requests and cleared runtime lease fields.
+
+## Content Work Admission and Supersession
+
+Migration `0086_content_work_admission_events.sql` adds append-only work
+admission facts and per-attempt provider-admission facts without rewriting
+existing work, attempt, call or result history. Global source adapters place an
+authoritative source revision timestamp and canonical resource tie-break value
+in the frozen source snapshot; revision metadata is excluded from
+`source_hash`. Announcement cache and live GraphQL adapters both use the
+normalized `repo#discussion_number` key, while notification synchronization
+advances `updated_at` monotonically and rejects stale payload fields so an
+older upstream page cannot regress the canonical source row. Release rows
+created by the legacy sync path are recognized by their ingest timestamp and
+upgraded to the first authoritative upstream revision; a revision-bearing
+worker fails closed when the live source has no usable revision. Malformed
+revision metadata and equal timestamps without an authoritative tie-break are
+also rejected rather than treated as an ordering signal.
+Release and announcement canonical content tuples provide the stable tie-break
+domain when the upstream timestamp is equal, and the same tuple is recomputed
+from the stored canonical source during provider admission. Announcement
+snapshots normalize their `repo#discussion_number` key before both persistence
+and live comparison. Announcement synchronization rejects stale or older
+equal-timestamp event payloads by the same authoritative timestamp/content
+ordering, and admin/API canonical reads use the same stable event identifier as
+their final tie-break. Notification synchronization and admin/API canonical reads
+use the same timestamp, repository, title, reason and subject-type ordering;
+equal source tuples are idempotent. A release revision is authoritative only
+after upstream synchronization has recorded a `detected_at` distinct from its
+upstream `updated_at`; legacy ingest timestamps fail closed. Route fallback
+provider admissions retain the `fallback` relation role for audit consumers.
+An admission rejected after its diagnostic row is created finalizes that row as
+a transient failed call rather than leaving a running diagnostic behind. If a
+source disappears after a provider response, the call-to-attempt audit link is
+retained while the work is cancelled without publishing output. If processing
+mode changes after provider admission, the worker records the provider audit,
+closes the attempt as `reconciliation_superseded`, and clears the live work
+lease before returning.
+Legacy snapshots without revision metadata use a fail-closed compatibility
+fallback: a revision-bearing candidate may supersede an unknown legacy source,
+while two unknown revisions are never ordered by synchronization arrival. An
+unknown active work item is superseded before provider admission and cannot
+publish a result without a verified source revision.
+
+The scheduler serializes source admission, claim and provider admission through
+the SQLite writer. Repeated same-source submission is an idempotent no-op;
+older source revisions are retained as `superseded` and their requests point to
+the current work. A superseded work item cannot be reopened by admission,
+automatic recovery, claim or manual retry. Before every primary or bounded
+length-recovery provider request, the worker validates the live lease, source
+existence and source currentness, then records a provider-admission fact. A
+source replacement after that fact may finish the provider call, but the call
+audit remains linked while the attempt is finalized as `superseded` without
+publishing output or scheduling retry.
+
+When several newer retained work rows exist, admission and provider guards
+reduce them by the authoritative revision tuple rather than SQLite row order.
+Repeated admission of an already superseded source follows the same current
+work redirect. Stream responses keep `blocked_config` pending, and the global
+notification batch adapter propagates a superseded conflict with its current
+work details instead of converting it into a successful item. Global Release
+batch streams retain the existing NDJSON `item`/`done` shape while polling the
+admitted request links to terminal state; single-stream conflicts likewise
+remain stream-shaped rather than switching to a JSON error response.
+Global release and notification batch adapters preserve every per-item
+submission fact when one item conflicts, returning an aggregate conflict after
+all inputs have been associated. Release batch streams emit an initial
+processing item for every request and poll terminal states concurrently so a
+slow item cannot suppress progress for later items. Global release detail
+batches use the same conflict aggregation behavior.
+
+Startup and recovery reconciliation close queued, failed, deferred-provider,
+blocked-config and ready stale work without provider calls; running work with a
+live lease is left to the worker guard. Admission events are retained for seven
+days by the existing LLM diagnostic cleanup path, while attempt/provider-call
+audit retention remains unchanged. Legacy observation classification treats
+blank cached fields as non-displayable, and a work observation is classified as
+`legacy_conflict` when the cache table is unavailable rather than inventing a
+cache match.
 
 ## Global Output Contract
 

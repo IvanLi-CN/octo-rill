@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -364,7 +364,7 @@ async fn record_legacy_observations(tx: &mut Transaction<'_, Sqlite>) -> Result<
         > 0;
     if has_ai_translations {
         sqlx::query(
-            "INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT 'legacy-cache-' || id, 'ai_translations', id, CASE WHEN entity_type LIKE 'release%' THEN 'release' WHEN entity_type LIKE 'announcement%' THEN 'announcement' WHEN entity_type IN ('notification', 'notification_smart') THEN 'notification' ELSE NULL END, entity_id, CASE WHEN entity_type LIKE '%smart' THEN 'polishing' ELSE 'translation' END, CASE WHEN status = 'ready' AND (title IS NOT NULL OR summary IS NOT NULL) THEN 'legacy_cached' ELSE 'legacy_conflict' END, '{\"source\":\"ai_translations\",\"status\":\"' || replace(status, '\"', '') || '\",\"source_hash\":\"' || replace(source_hash, '\"', '') || '\"}' , CURRENT_TIMESTAMP FROM ai_translations",
+            "INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT 'legacy-cache-' || id, 'ai_translations', id, CASE WHEN entity_type LIKE 'release%' THEN 'release' WHEN entity_type LIKE 'announcement%' THEN 'announcement' WHEN entity_type IN ('notification', 'notification_smart') THEN 'notification' ELSE NULL END, entity_id, CASE WHEN entity_type LIKE '%smart' THEN 'polishing' ELSE 'translation' END, CASE WHEN status = 'ready' AND (NULLIF(trim(title), '') IS NOT NULL OR NULLIF(trim(summary), '') IS NOT NULL) THEN 'legacy_cached' ELSE 'legacy_conflict' END, '{\"source\":\"ai_translations\",\"status\":\"' || replace(status, '\"', '') || '\",\"source_hash\":\"' || replace(source_hash, '\"', '') || '\"}' , CURRENT_TIMESTAMP FROM ai_translations",
         )
         .execute(&mut **tx)
         .await?;
@@ -377,11 +377,12 @@ async fn record_legacy_observations(tx: &mut Transaction<'_, Sqlite>) -> Result<
     .await?
         > 0;
     if has_translation_work_items {
-        sqlx::query(
-            "INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT 'legacy-work-' || w.id, 'translation_work_items', w.id, CASE WHEN w.kind LIKE 'release%' THEN 'release' WHEN w.kind LIKE 'announcement%' THEN 'announcement' WHEN w.kind IN ('notification', 'notification_smart') THEN 'notification' ELSE NULL END, w.entity_id, CASE WHEN w.kind LIKE '%smart' THEN 'polishing' ELSE 'translation' END, CASE WHEN w.status = 'completed' AND COALESCE(w.result_status, '') = 'ready' AND EXISTS (SELECT 1 FROM ai_translations c WHERE c.user_id = w.scope_user_id AND c.entity_id = w.entity_id AND c.lang = w.target_lang AND c.source_hash = w.source_hash AND c.status = 'ready' AND (c.title IS NOT NULL OR c.summary IS NOT NULL)) THEN 'legacy_cached' ELSE 'legacy_conflict' END, '{\"source\":\"translation_work_items\",\"status\":\"' || replace(COALESCE(w.status, ''), '\"', '') || '\",\"source_hash\":\"' || replace(COALESCE(w.source_hash, ''), '\"', '') || '\"}' , CURRENT_TIMESTAMP FROM translation_work_items w",
-        )
-        .execute(&mut **tx)
-        .await?;
+        let query = if has_ai_translations {
+            "INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT 'legacy-work-' || w.id, 'translation_work_items', w.id, CASE WHEN w.kind LIKE 'release%' THEN 'release' WHEN w.kind LIKE 'announcement%' THEN 'announcement' WHEN w.kind IN ('notification', 'notification_smart') THEN 'notification' ELSE NULL END, w.entity_id, CASE WHEN w.kind LIKE '%smart' THEN 'polishing' ELSE 'translation' END, CASE WHEN w.status = 'completed' AND COALESCE(w.result_status, '') = 'ready' AND EXISTS (SELECT 1 FROM ai_translations c WHERE c.user_id = w.scope_user_id AND c.entity_id = w.entity_id AND c.lang = w.target_lang AND c.source_hash = w.source_hash AND c.status = 'ready' AND (NULLIF(trim(c.title), '') IS NOT NULL OR NULLIF(trim(c.summary), '') IS NOT NULL)) THEN 'legacy_cached' ELSE 'legacy_conflict' END, '{\"source\":\"translation_work_items\",\"status\":\"' || replace(COALESCE(w.status, ''), '\"', '') || '\",\"source_hash\":\"' || replace(COALESCE(w.source_hash, ''), '\"', '') || '\"}' , CURRENT_TIMESTAMP FROM translation_work_items w"
+        } else {
+            "INSERT OR IGNORE INTO content_legacy_observations (id, legacy_table, legacy_primary_key, canonical_resource_type, canonical_resource_id, pipeline, classification, observation_basis_json, observed_at) SELECT 'legacy-work-' || w.id, 'translation_work_items', w.id, CASE WHEN w.kind LIKE 'release%' THEN 'release' WHEN w.kind LIKE 'announcement%' THEN 'announcement' WHEN w.kind IN ('notification', 'notification_smart') THEN 'notification' ELSE NULL END, w.entity_id, CASE WHEN w.kind LIKE '%smart' THEN 'polishing' ELSE 'translation' END, 'legacy_conflict', '{\"source\":\"translation_work_items\",\"status\":\"' || replace(COALESCE(w.status, ''), '\"', '') || '\",\"source_hash\":\"' || replace(COALESCE(w.source_hash, ''), '\"', '') || '\"}' , CURRENT_TIMESTAMP FROM translation_work_items w"
+        };
+        sqlx::query(query).execute(&mut **tx).await?;
     }
     Ok(())
 }
@@ -542,7 +543,9 @@ fn source_hash(item: &translations::TranslationRequestItemInput) -> Result<Strin
     let source_blocks = item
         .source_blocks
         .iter()
-        .filter(|block| block.slot != "source_observed_at")
+        .filter(|block| {
+            block.slot != "source_observed_at" && block.slot != "source_revision_tiebreak"
+        })
         .collect::<Vec<_>>();
     let source = serde_json::to_string(&json!({
         "kind": item.kind,
@@ -629,6 +632,16 @@ async fn has_valid_runtime_configuration_in_transaction(
 }
 
 pub async fn on_runtime_configuration_reload(state: &AppState) -> Result<()> {
+    if current_mode(&state.pool).await? == ContentProcessingMode::Global
+        && content_identity_upgrade::is_complete(&state.pool).await?
+    {
+        let (_permit, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "content_processing_startup_reconciliation")
+            .await?;
+        supersede_stale_work_in_transaction(&mut tx).await?;
+        tx.commit().await?;
+    }
     let mut requeued = 0_i64;
     loop {
         let (_permit, mut tx) = state
@@ -896,6 +909,76 @@ async fn work_for_identity_in_transaction(
     }
 }
 
+async fn newer_work_for_resource_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    work: &WorkRow,
+) -> Result<Option<WorkRow>> {
+    newer_work_for_source_in_transaction(
+        tx,
+        WorkResourceKey {
+            canonical_resource_type: &work.canonical_resource_type,
+            canonical_resource_id: &work.canonical_resource_id,
+            pipeline: &work.pipeline,
+            variant: &work.variant,
+            target_lang: &work.target_lang,
+            protocol_version: &work.protocol_version,
+        },
+        WorkSourceKey {
+            snapshot_json: &work.source_snapshot_json,
+            work_item_id: &work.id,
+        },
+    )
+    .await
+}
+
+struct WorkResourceKey<'a> {
+    canonical_resource_type: &'a str,
+    canonical_resource_id: &'a str,
+    pipeline: &'a str,
+    variant: &'a str,
+    target_lang: &'a str,
+    protocol_version: &'a str,
+}
+
+struct WorkSourceKey<'a> {
+    snapshot_json: &'a str,
+    work_item_id: &'a str,
+}
+
+async fn newer_work_for_source_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    resource: WorkResourceKey<'_>,
+    source: WorkSourceKey<'_>,
+) -> Result<Option<WorkRow>> {
+    let candidates = sqlx::query_as::<_, WorkRow>(
+        "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE id <> ? AND canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND status NOT IN ('cancelled', 'superseded') ORDER BY datetime(created_at) DESC, id DESC",
+    )
+    .bind(source.work_item_id)
+    .bind(resource.canonical_resource_type)
+    .bind(resource.canonical_resource_id)
+    .bind(resource.pipeline)
+    .bind(resource.variant)
+    .bind(resource.target_lang)
+    .bind(resource.protocol_version)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(candidates
+        .into_iter()
+        .filter(|candidate| {
+            source_version_is_newer(&candidate.source_snapshot_json, source.snapshot_json)
+        })
+        .reduce(|current, candidate| {
+            if source_version_is_newer(
+                &candidate.source_snapshot_json,
+                &current.source_snapshot_json,
+            ) {
+                candidate
+            } else {
+                current
+            }
+        }))
+}
+
 pub async fn submit_item(
     state: &AppState,
     user_id: &str,
@@ -963,6 +1046,7 @@ pub async fn submit_item(
     let snapshot = serde_json::to_string(&json!({
         "source_blocks": item.source_blocks,
         "target_slots": item.target_slots,
+        "source_revision": source_revision_json(item),
     }))
     .map_err(ApiError::internal)?;
     let now = Utc::now().to_rfc3339();
@@ -1016,48 +1100,101 @@ pub async fn submit_item(
         .map_err(ApiError::internal)?
     };
     let existing_work = existing.is_some();
-    let work = if let Some(existing) = existing {
-        if current_projection.is_none()
-            && matches!(
-                existing.status.as_str(),
-                "failed" | "cancelled" | "superseded" | "not_applicable" | "ready"
-            )
-        {
-            let status = if configuration_valid {
-                "queued"
-            } else {
-                "blocked_config"
-            };
-            sqlx::query(
-                "UPDATE content_work_items SET status = ?, priority = 0, cache_hit = 0, batch_id = NULL, lease_owner = NULL, lease_expires_at = NULL, next_retry_at = NULL, retry_expires_at = NULL, retry_after_at = NULL, failure_class = NULL, cancelled_at = NULL, finished_at = NULL, updated_at = ? WHERE id = ?",
-            )
-            .bind(status)
-            .bind(&now)
-            .bind(&existing.id)
-            .execute(&mut *tx)
+    if let Some(existing) = existing.as_ref()
+        && let Some(current) = newer_work_for_resource_in_transaction(&mut tx, existing)
             .await
-            .map_err(ApiError::internal)?;
-            load_work_by_id(&mut tx, &existing.id)
-                .await
-                .map_err(ApiError::internal)?
-        } else {
-            existing
-        }
-    } else {
-        let supersedes_work_item_id = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND source_hash <> ? AND status NOT IN ('cancelled', 'superseded') ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
+            .map_err(ApiError::internal)?
+    {
+        record_work_admission_event(
+            &mut tx,
+            WorkAdmissionEvent {
+                work_item_id: &existing.id,
+                event_type: "admission_rejected_superseded",
+                replaced_by_work_item_id: Some(&current.id),
+                source_hash: &existing.source_hash,
+                source_snapshot_json: &existing.source_snapshot_json,
+                producer_ref: &item.producer_ref,
+                requester_id: Some(user_id),
+                reason_code: "older_source_projection_redirected",
+            },
         )
-        .bind(resource_type)
-        .bind(&item.entity_id)
-        .bind(pipeline)
-        .bind(&item.variant)
-        .bind(&item.target_lang)
-        .bind(GLOBAL_PROTOCOL_VERSION)
-        .bind(&hash)
-        .fetch_optional(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
-        let status = if configuration_valid {
+        let current_projection = load_projection(&mut tx, &current)
+            .await
+            .map_err(ApiError::internal)?;
+        insert_request_link(
+            &mut tx,
+            &request_id,
+            &current.id,
+            user_id,
+            mode,
+            &item.producer_ref,
+        )
+        .await
+        .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
+        let mut result = request_result(&current, current_projection);
+        result["producer_ref"] = Value::String(item.producer_ref.clone());
+        result["kind"] = Value::String(item.kind.clone());
+        result["variant"] = Value::String(item.variant.clone());
+        return Ok((
+            StatusCode::CONFLICT,
+            GlobalSubmissionResponse {
+                request_id: request_id.clone(),
+                work_item_id: current.id.clone(),
+                status: current.status.clone(),
+                poll_url: format!("/api/translate/requests/{request_id}"),
+                result,
+                error: Some(json!({
+                    "code": "content_processing_superseded",
+                    "message": "the submitted source version was superseded; polling the current source version",
+                    "superseded_work_item_id": existing.id.clone(),
+                    "current_work_item_id": current.id,
+                })),
+            },
+        ));
+    }
+    let work = if let Some(existing) = existing {
+        existing
+    } else {
+        let newer_source = newer_work_for_source_in_transaction(
+            &mut tx,
+            WorkResourceKey {
+                canonical_resource_type: resource_type,
+                canonical_resource_id: &item.entity_id,
+                pipeline,
+                variant: &item.variant,
+                target_lang: &item.target_lang,
+                protocol_version: GLOBAL_PROTOCOL_VERSION,
+            },
+            WorkSourceKey {
+                snapshot_json: &snapshot,
+                work_item_id: &work_id,
+            },
+        )
+        .await
+        .map_err(ApiError::internal)?;
+        let supersedes_work_item_id = if let Some(newer_source) = newer_source.as_ref() {
+            Some(newer_source.id.clone())
+        } else {
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM content_work_items WHERE canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND source_hash <> ? AND status NOT IN ('cancelled', 'superseded') ORDER BY datetime(updated_at) DESC, id DESC LIMIT 1",
+            )
+            .bind(resource_type)
+            .bind(&item.entity_id)
+            .bind(pipeline)
+            .bind(&item.variant)
+            .bind(&item.target_lang)
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(&hash)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?
+        };
+        let status = if newer_source.is_some() {
+            "superseded"
+        } else if configuration_valid {
             "queued"
         } else {
             "blocked_config"
@@ -1097,6 +1234,11 @@ pub async fn submit_item(
             .await
             .map_err(ApiError::internal)?
     };
+    if !existing_work {
+        supersede_older_work_in_transaction(&mut tx, &work)
+            .await
+            .map_err(ApiError::internal)?;
+    }
     let supersedes_work_item_id = sqlx::query_scalar::<_, Option<String>>(
         "SELECT supersedes_work_item_id FROM content_work_items WHERE id = ?",
     )
@@ -1104,7 +1246,7 @@ pub async fn submit_item(
     .fetch_one(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
-    if supersedes_work_item_id.is_some() {
+    if supersedes_work_item_id.is_some() && work.status != "superseded" {
         // Advance every retained projection for this resource. This keeps the
         // pointer transitive when a second refresh arrives before the first
         // replacement has published.
@@ -1144,6 +1286,84 @@ pub async fn submit_item(
             .await
             .map_err(ApiError::internal)?
     };
+    let superseded_replacement_id = if work.status == "superseded" {
+        match supersedes_work_item_id.clone() {
+            Some(work_item_id) => Some(work_item_id),
+            None => newer_work_for_resource_in_transaction(&mut tx, &work)
+                .await
+                .map_err(ApiError::internal)?
+                .map(|current| current.id),
+        }
+    } else {
+        None
+    };
+
+    let admission_event = if work.status == "superseded" {
+        "admission_rejected_superseded"
+    } else if existing_work {
+        "admission_noop"
+    } else {
+        "admission_accepted"
+    };
+    record_work_admission_event(
+        &mut tx,
+        WorkAdmissionEvent {
+            work_item_id: &work.id,
+            event_type: admission_event,
+            replaced_by_work_item_id: superseded_replacement_id.as_deref(),
+            source_hash: &work.source_hash,
+            source_snapshot_json: &work.source_snapshot_json,
+            producer_ref: &item.producer_ref,
+            requester_id: Some(user_id),
+            reason_code: if work.status == "superseded" {
+                "older_source_rejected_at_admission"
+            } else {
+                "source_current"
+            },
+        },
+    )
+    .await
+    .map_err(ApiError::internal)?;
+
+    if let Some(current_work_item_id) = superseded_replacement_id.as_deref() {
+        let current = load_work_by_id(&mut tx, current_work_item_id)
+            .await
+            .map_err(ApiError::internal)?;
+        let current_projection = load_projection(&mut tx, &current)
+            .await
+            .map_err(ApiError::internal)?;
+        insert_request_link(
+            &mut tx,
+            &request_id,
+            &current.id,
+            user_id,
+            mode,
+            &item.producer_ref,
+        )
+        .await
+        .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
+        let mut result = request_result(&current, current_projection);
+        result["producer_ref"] = Value::String(item.producer_ref.clone());
+        result["kind"] = Value::String(item.kind.clone());
+        result["variant"] = Value::String(item.variant.clone());
+        return Ok((
+            StatusCode::CONFLICT,
+            GlobalSubmissionResponse {
+                request_id: request_id.clone(),
+                work_item_id: current.id,
+                status: current.status,
+                poll_url: format!("/api/translate/requests/{request_id}"),
+                result,
+                error: Some(json!({
+                    "code": "content_processing_superseded",
+                    "message": "the submitted source version was superseded; polling the current source version",
+                    "superseded_work_item_id": work.id,
+                    "current_work_item_id": current_work_item_id,
+                })),
+            },
+        ));
+    }
 
     if let Some(existing_request_id) = sqlx::query_scalar::<_, String>(
         "SELECT request_id FROM content_request_links WHERE work_item_id = ? AND requester_id = ? AND producer_ref = ? ORDER BY created_at DESC LIMIT 1",
@@ -1577,6 +1797,7 @@ pub async fn retry_request(
     .await
     .map_err(ApiError::internal)?
     .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "translation request not found"))?;
+    let requested_row = row.clone();
     let key = identity_from_work(&row);
     let now = Utc::now().to_rfc3339();
     let identity_id = content_identity_upgrade::ensure_identity_registered(&mut tx, &key, &now)
@@ -1588,6 +1809,68 @@ pub async fn retry_request(
     content_identity_upgrade::ensure_current_projection_for_key(&mut tx, &identity_id, &now)
         .await
         .map_err(ApiError::internal)?;
+    let producer_ref = sqlx::query_scalar::<_, String>(
+        "SELECT producer_ref FROM content_request_links WHERE request_id = ? LIMIT 1",
+    )
+    .bind(request_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    if let Some(current) = newer_work_for_resource_in_transaction(&mut tx, &requested_row)
+        .await
+        .map_err(ApiError::internal)?
+    {
+        if requested_row.status != "superseded" {
+            supersede_work_in_transaction(
+                &mut tx,
+                &requested_row,
+                Some(&current.id),
+                "newer_source_detected_before_manual_retry",
+            )
+            .await
+            .map_err(ApiError::internal)?;
+        }
+        let new_request_id = local_id::generate_local_id().to_string();
+        insert_request_link(
+            &mut tx,
+            &new_request_id,
+            &current.id,
+            user_id,
+            "async",
+            &producer_ref,
+        )
+        .await
+        .map_err(ApiError::internal)?;
+        record_work_admission_event(
+            &mut tx,
+            WorkAdmissionEvent {
+                work_item_id: &requested_row.id,
+                event_type: "admission_rejected_superseded",
+                replaced_by_work_item_id: Some(&current.id),
+                source_hash: &requested_row.source_hash,
+                source_snapshot_json: &requested_row.source_snapshot_json,
+                producer_ref: &producer_ref,
+                requester_id: Some(user_id),
+                reason_code: "manual_retry_redirected_to_current_source",
+            },
+        )
+        .await
+        .map_err(ApiError::internal)?;
+        let current_projection = load_projection(&mut tx, &current)
+            .await
+            .map_err(ApiError::internal)?;
+        tx.commit().await.map_err(ApiError::internal)?;
+        let mut body = public_response(&current, &new_request_id, current_projection);
+        body["status"] = Value::String(current.status.clone());
+        body["result"]["status"] = Value::String(current.status.clone());
+        body["error"] = json!({
+            "code": "content_processing_superseded",
+            "message": "the requested source version was superseded; polling the current source version",
+            "superseded_work_item_id": requested_row.id,
+            "current_work_item_id": current.id,
+        });
+        return Ok((StatusCode::CONFLICT, body));
+    }
     if let Some(current) = work_for_identity_in_transaction(&mut tx, &key)
         .await
         .map_err(ApiError::internal)?
@@ -1597,13 +1880,6 @@ pub async fn retry_request(
     let projection = load_projection(&mut tx, &row)
         .await
         .map_err(ApiError::internal)?;
-    let producer_ref = sqlx::query_scalar::<_, String>(
-        "SELECT producer_ref FROM content_request_links WHERE request_id = ? LIMIT 1",
-    )
-    .bind(request_id)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
     if matches!(
         row.status.as_str(),
         "queued" | "running" | "deferred_provider"
@@ -1730,6 +2006,28 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
         tx.commit().await?;
         return Ok(None);
     };
+    if let Some(current) = newer_work_for_resource_in_transaction(&mut tx, &row).await? {
+        sqlx::query("UPDATE content_work_items SET status = 'superseded', next_retry_at = NULL, retry_after_at = NULL, finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'queued'")
+            .bind(&row.id)
+            .execute(&mut *tx)
+            .await?;
+        record_work_admission_event(
+            &mut tx,
+            WorkAdmissionEvent {
+                work_item_id: &row.id,
+                event_type: "reconciliation_superseded",
+                replaced_by_work_item_id: Some(&current.id),
+                source_hash: &row.source_hash,
+                source_snapshot_json: &row.source_snapshot_json,
+                producer_ref: "",
+                requester_id: None,
+                reason_code: "newer_source_exists_at_claim",
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(None);
+    }
     let Some(attempt_snapshot) = attempt_snapshot else {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
@@ -1860,6 +2158,7 @@ async fn recover_due(state: &AppState) -> Result<()> {
         .begin_immediate(&state.pool, "content_processing_recover")
         .await?;
     ensure_global_mode_in_transaction(&mut tx).await?;
+    supersede_stale_work_in_transaction(&mut tx).await?;
     sqlx::query(
         "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), id, CASE WHEN attempt_count < 1 THEN 1 ELSE attempt_count + 1 END, 'automatic_recovery', 'attempt_queued', 'queued', 1, ? FROM content_work_items WHERE status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(?) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(?))",
     )
@@ -1949,6 +2248,43 @@ async fn recover_due(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+async fn supersede_stale_work_in_transaction(tx: &mut Transaction<'_, Sqlite>) -> Result<u64> {
+    let rows = sqlx::query_as::<_, WorkRow>(
+        "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE status IN ('queued', 'failed', 'deferred_provider', 'blocked_config', 'ready')",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    let now = Utc::now().to_rfc3339();
+    let mut changed = 0;
+    for work in rows {
+        let Some(current) = newer_work_for_resource_in_transaction(tx, &work).await? else {
+            continue;
+        };
+        sqlx::query("UPDATE content_work_items SET status = 'superseded', next_retry_at = NULL, retry_after_at = NULL, finished_at = COALESCE(finished_at, ?), updated_at = ? WHERE id = ? AND status NOT IN ('cancelled', 'superseded', 'running')")
+            .bind(&now)
+            .bind(&now)
+            .bind(&work.id)
+            .execute(&mut **tx)
+            .await?;
+        record_work_admission_event(
+            tx,
+            WorkAdmissionEvent {
+                work_item_id: &work.id,
+                event_type: "reconciliation_superseded",
+                replaced_by_work_item_id: Some(&current.id),
+                source_hash: &work.source_hash,
+                source_snapshot_json: &work.source_snapshot_json,
+                producer_ref: "",
+                requester_id: None,
+                reason_code: "newer_source_exists",
+            },
+        )
+        .await?;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
 async fn defer_queued_for_provider(state: &AppState) -> Result<()> {
     let routing = state
         .llm_scheduler
@@ -1992,7 +2328,9 @@ fn build_prompt(snapshot: &SourceSnapshot, pipeline: &str) -> (String, String) {
         "source_blocks": snapshot
             .source_blocks
             .iter()
-            .filter(|block| block.slot != "source_observed_at")
+            .filter(|block| {
+                block.slot != "source_observed_at" && block.slot != "source_revision_tiebreak"
+            })
             .collect::<Vec<_>>(),
         "target_slots": snapshot.target_slots,
         "response_contract": "Return one JSON object with every declared target slot directly at the top level. Do not wrap it in output, result, or data. Do not use a Markdown code fence. Only declared target slots are persisted; extra scalar metadata is ignored."
@@ -2008,6 +2346,204 @@ fn source_observed_at(raw_snapshot: &str) -> Option<DateTime<Utc>> {
         .into_iter()
         .find(|block| block.slot == "source_observed_at")
         .and_then(|block| parse_storage_timestamp(&block.text))
+}
+
+fn source_revision_tiebreak(raw_snapshot: &str) -> Option<String> {
+    serde_json::from_str::<SourceSnapshot>(raw_snapshot)
+        .ok()?
+        .source_blocks
+        .into_iter()
+        .find(|block| block.slot == "source_revision_tiebreak")
+        .map(|block| block.text)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SourceRevisionMetadata {
+    Missing,
+    Valid {
+        observed_at: DateTime<Utc>,
+        tiebreak: Option<String>,
+    },
+    Malformed,
+}
+
+fn source_revision_metadata(raw_snapshot: &str) -> SourceRevisionMetadata {
+    let Ok(snapshot) = serde_json::from_str::<SourceSnapshot>(raw_snapshot) else {
+        return SourceRevisionMetadata::Malformed;
+    };
+    let Some(observed_block) = snapshot
+        .source_blocks
+        .iter()
+        .find(|block| block.slot == "source_observed_at")
+    else {
+        return SourceRevisionMetadata::Missing;
+    };
+    let Some(observed_at) = parse_storage_timestamp(&observed_block.text) else {
+        return SourceRevisionMetadata::Malformed;
+    };
+    SourceRevisionMetadata::Valid {
+        observed_at,
+        tiebreak: snapshot
+            .source_blocks
+            .into_iter()
+            .find(|block| block.slot == "source_revision_tiebreak")
+            .map(|block| block.text),
+    }
+}
+
+fn source_revision_json(item: &translations::TranslationRequestItemInput) -> Value {
+    json!({
+        "source_observed_at": item
+            .source_blocks
+            .iter()
+            .find(|block| block.slot == "source_observed_at")
+            .map(|block| block.text.clone()),
+        "source_revision_tiebreak": item
+            .source_blocks
+            .iter()
+            .find(|block| block.slot == "source_revision_tiebreak")
+            .map(|block| block.text.clone()),
+    })
+}
+
+fn source_revision_json_from_snapshot(raw_snapshot: &str) -> String {
+    serde_json::to_string(&json!({
+        "source_observed_at": source_observed_at(raw_snapshot).map(|value| value.to_rfc3339()),
+        "source_revision_tiebreak": source_revision_tiebreak(raw_snapshot),
+    }))
+    .unwrap_or_else(|_| "{}".to_owned())
+}
+
+fn compare_source_revision_tiebreak(
+    candidate: Option<String>,
+    current: Option<String>,
+) -> std::cmp::Ordering {
+    match (candidate, current) {
+        (Some(candidate), Some(current)) => {
+            match (candidate.parse::<u128>(), current.parse::<u128>()) {
+                (Ok(candidate), Ok(current)) => candidate.cmp(&current),
+                _ => candidate.cmp(&current),
+            }
+        }
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn source_version_is_newer(candidate_snapshot: &str, current_snapshot: &str) -> bool {
+    match (
+        source_revision_metadata(candidate_snapshot),
+        source_revision_metadata(current_snapshot),
+    ) {
+        (
+            SourceRevisionMetadata::Valid {
+                observed_at: candidate,
+                ..
+            },
+            SourceRevisionMetadata::Valid {
+                observed_at: current,
+                ..
+            },
+        ) if candidate != current => candidate > current,
+        (
+            SourceRevisionMetadata::Valid {
+                observed_at: candidate,
+                tiebreak: candidate_tiebreak,
+            },
+            SourceRevisionMetadata::Valid {
+                observed_at: current,
+                tiebreak: current_tiebreak,
+            },
+        ) if candidate == current && candidate_tiebreak.is_some() && current_tiebreak.is_some() => {
+            compare_source_revision_tiebreak(candidate_tiebreak, current_tiebreak).is_gt()
+        }
+        (SourceRevisionMetadata::Valid { .. }, SourceRevisionMetadata::Missing) => true,
+        (SourceRevisionMetadata::Valid { .. }, SourceRevisionMetadata::Malformed) => true,
+        _ => false,
+    }
+}
+
+struct WorkAdmissionEvent<'a> {
+    work_item_id: &'a str,
+    event_type: &'a str,
+    replaced_by_work_item_id: Option<&'a str>,
+    source_hash: &'a str,
+    source_snapshot_json: &'a str,
+    producer_ref: &'a str,
+    requester_id: Option<&'a str>,
+    reason_code: &'a str,
+}
+
+async fn record_work_admission_event(
+    tx: &mut Transaction<'_, Sqlite>,
+    event: WorkAdmissionEvent<'_>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO content_work_admission_events (id, work_item_id, event_type, replaced_by_work_item_id, source_hash, source_revision_json, producer_ref, requester_id, reason_code, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(local_id::generate_local_id().to_string())
+    .bind(event.work_item_id)
+    .bind(event.event_type)
+    .bind(event.replaced_by_work_item_id)
+    .bind(event.source_hash)
+    .bind(source_revision_json_from_snapshot(event.source_snapshot_json))
+    .bind(event.producer_ref)
+    .bind(event.requester_id)
+    .bind(event.reason_code)
+    .bind(Utc::now().to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn supersede_older_work_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    current: &WorkRow,
+) -> Result<()> {
+    let candidates = sqlx::query_as::<_, (String, String, String, String)>(
+        "SELECT id, source_snapshot_json, source_hash, status FROM content_work_items WHERE id <> ? AND canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND source_hash <> ? AND status NOT IN ('cancelled', 'superseded')",
+    )
+    .bind(&current.id)
+    .bind(&current.canonical_resource_type)
+    .bind(&current.canonical_resource_id)
+    .bind(&current.pipeline)
+    .bind(&current.variant)
+    .bind(&current.target_lang)
+    .bind(&current.protocol_version)
+    .bind(&current.source_hash)
+    .fetch_all(&mut **tx)
+    .await?;
+    let now = Utc::now().to_rfc3339();
+    for (id, snapshot, source_hash, status) in candidates {
+        if !source_version_is_newer(&current.source_snapshot_json, &snapshot) {
+            continue;
+        }
+        record_work_admission_event(
+            tx,
+            WorkAdmissionEvent {
+                work_item_id: &id,
+                event_type: "source_superseded",
+                replaced_by_work_item_id: Some(&current.id),
+                source_hash: &source_hash,
+                source_snapshot_json: &snapshot,
+                producer_ref: "",
+                requester_id: None,
+                reason_code: "newer_source_admitted",
+            },
+        )
+        .await?;
+        if status == "running" {
+            continue;
+        }
+        sqlx::query("UPDATE content_work_items SET status = 'superseded', next_retry_at = NULL, retry_after_at = NULL, finished_at = COALESCE(finished_at, ?), updated_at = ? WHERE id = ? AND status NOT IN ('cancelled', 'superseded', 'running')")
+            .bind(&now)
+            .bind(&now)
+            .bind(&id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
 }
 
 fn parse_storage_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -2316,6 +2852,7 @@ struct GlobalCallSpec<'a> {
     max_tokens: u32,
     route_snapshot: &'a [String],
     role: &'a str,
+    call_ordinal_counter: Arc<AtomicI64>,
 }
 
 #[derive(Debug, Clone)]
@@ -2390,12 +2927,26 @@ async fn request_global_completion(
     state: &AppState,
     spec: GlobalCallSpec<'_>,
 ) -> Result<ai::ChatCompletionDiagnostic> {
-    if !renew_global_work_lease(state, spec.work).await? {
-        return Err(anyhow::Error::new(ai::LlmCallFailure {
-            class: ai::LlmFailureClass::Transient,
-            call_id: None,
-        }));
-    }
+    let admission_state = Arc::new(state.clone());
+    let admission_work = spec.work.clone();
+    let admission_role = spec.role.to_owned();
+    let admission_ordinals = spec.call_ordinal_counter.clone();
+    let provider_admission: ai::ProviderAdmissionGuard = Arc::new(move |candidate_index| {
+        let state = admission_state.clone();
+        let work = admission_work.clone();
+        let role = if candidate_index > 0 {
+            "fallback".to_owned()
+        } else {
+            admission_role.clone()
+        };
+        let call_ordinal = admission_ordinals.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if !renew_global_work_lease(&state, &work).await? {
+                return Ok(false);
+            }
+            admit_provider_call(&state, &work, call_ordinal, &role).await
+        })
+    });
     let call_context = ai::LlmCallContext {
         source: format!(
             "content_processing.global.{}.stage.content_output.role.{}",
@@ -2411,13 +2962,14 @@ async fn request_global_completion(
         Duration::from_secs(4 * 60),
         ai::with_llm_call_context(
             call_context,
-            ai::chat_completion_with_diagnostics_for_config_and_route(
+            ai::chat_completion_with_diagnostics_for_config_and_route_with_admission(
                 state,
                 spec.ai_config,
                 spec.system,
                 spec.user,
                 spec.max_tokens,
                 Some(spec.route_snapshot),
+                Some(provider_admission),
             ),
         ),
     )
@@ -2429,6 +2981,76 @@ async fn request_global_completion(
         })
     })
     .and_then(|result| result)
+}
+
+async fn admit_provider_call(
+    state: &AppState,
+    work: &WorkRow,
+    call_ordinal: i64,
+    relation_role: &str,
+) -> Result<bool> {
+    let (_lock, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "content_processing_provider_admission")
+        .await?;
+    if ensure_global_mode_in_transaction(&mut tx).await.is_err() {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let now = Utc::now().to_rfc3339();
+    let claim_is_current = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM content_work_items WHERE id = ? AND status = 'running' AND attempt_count = ? AND lease_owner = 'content-general-1' AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(?)",
+    )
+    .bind(&work.id)
+    .bind(work.attempt_count)
+    .bind(&now)
+    .fetch_one(&mut *tx)
+    .await?;
+    if claim_is_current == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    if !source_exists_in_transaction(&mut tx, work).await? {
+        cancel_deleted_work_in_transaction(&mut tx, work).await?;
+        tx.commit().await?;
+        return Ok(false);
+    }
+    if !source_revision_is_current_in_transaction(&mut tx, work).await? {
+        supersede_work_in_transaction(
+            &mut tx,
+            work,
+            None,
+            "source_revision_changed_before_provider",
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(false);
+    }
+    if supersede_replaced_work_in_transaction(&mut tx, work).await? {
+        tx.commit().await?;
+        return Ok(false);
+    }
+    let attempt_event_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started' LIMIT 1",
+    )
+    .bind(&work.id)
+    .bind(work.attempt_count)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query("INSERT OR IGNORE INTO content_attempt_provider_admissions (id, attempt_event_id, work_item_id, attempt_no, call_ordinal, relation_role, source_hash, source_revision_json, admitted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(local_id::generate_local_id().to_string())
+        .bind(&attempt_event_id)
+        .bind(&work.id)
+        .bind(work.attempt_count)
+        .bind(call_ordinal)
+        .bind(relation_role)
+        .bind(&work.source_hash)
+        .bind(source_revision_json_from_snapshot(&work.source_snapshot_json))
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 async fn complete_global_output(
@@ -2447,6 +3069,7 @@ async fn complete_global_output(
         }));
     };
     let mut call_ids = Vec::new();
+    let call_ordinal_counter = Arc::new(AtomicI64::new(0));
     let mut diagnostic = match request_global_completion(
         state,
         GlobalCallSpec {
@@ -2457,6 +3080,7 @@ async fn complete_global_output(
             max_tokens: GLOBAL_MAX_TOKENS,
             route_snapshot,
             role: "primary",
+            call_ordinal_counter: call_ordinal_counter.clone(),
         },
     )
     .await
@@ -2490,6 +3114,7 @@ async fn complete_global_output(
                 max_tokens: GLOBAL_LENGTH_RECOVERY_MAX_TOKENS,
                 route_snapshot: &recovery_route_snapshot,
                 role: "length_recovery",
+                call_ordinal_counter: call_ordinal_counter.clone(),
             },
         )
         .await
@@ -2609,32 +3234,237 @@ async fn source_exists_in_transaction(
     Ok(count > 0)
 }
 
-async fn supersede_replaced_work_in_transaction(
+fn source_revision_snapshot_json(observed_at: Option<String>, tiebreak: String) -> String {
+    let mut blocks = Vec::new();
+    if let Some(observed_at) = observed_at {
+        blocks.push(json!({"slot": "source_observed_at", "text": observed_at}));
+        blocks.push(json!({"slot": "source_revision_tiebreak", "text": tiebreak}));
+    }
+    json!({"source_blocks": blocks}).to_string()
+}
+
+pub(crate) fn notification_source_revision_tiebreak(
+    thread_id: &str,
+    repo_full_name: Option<&str>,
+    subject_title: Option<&str>,
+    reason: Option<&str>,
+    subject_type: Option<&str>,
+) -> String {
+    format!(
+        "thread={thread_id}\nrepo={}\ntitle={}\nreason={}\nsubject_type={}",
+        repo_full_name.unwrap_or_default(),
+        subject_title.unwrap_or_default(),
+        reason.unwrap_or_default(),
+        subject_type.unwrap_or_default(),
+    )
+}
+
+pub(crate) fn source_revision_content_tiebreak(parts: &[&str]) -> String {
+    parts.join("\n")
+}
+
+pub(crate) fn announcement_source_revision_tiebreak(
+    repo_full_name: &str,
+    discussion_number: i64,
+    title: &str,
+    body: &str,
+) -> String {
+    let discussion_key = format!(
+        "{}#{discussion_number}",
+        repo_full_name.trim().to_ascii_lowercase()
+    );
+    source_revision_content_tiebreak(&[discussion_key.as_str(), title, body])
+}
+
+pub(crate) fn compare_announcement_source_revisions(
+    candidate_observed_at: &str,
+    candidate_tiebreak: &str,
+    current_observed_at: &str,
+    current_tiebreak: &str,
+) -> Option<std::cmp::Ordering> {
+    let candidate_observed_at = parse_storage_timestamp(candidate_observed_at)?;
+    let current_observed_at = parse_storage_timestamp(current_observed_at)?;
+    Some(
+        candidate_observed_at
+            .cmp(&current_observed_at)
+            .then_with(|| candidate_tiebreak.cmp(current_tiebreak)),
+    )
+}
+
+pub(crate) fn authoritative_release_revision<'a>(
+    updated_at: &'a str,
+    detected_at: Option<&str>,
+) -> Option<&'a str> {
+    let updated_at = updated_at.trim();
+    detected_at
+        .filter(|detected_at| !detected_at.trim().is_empty() && *detected_at != updated_at)
+        .and((!updated_at.is_empty()).then_some(updated_at))
+}
+
+async fn current_source_revision_snapshot_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    work: &WorkRow,
+) -> Result<Option<String>> {
+    let revision = match work.canonical_resource_type.as_str() {
+        "release" => sqlx::query_as::<_, (
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        )>(
+        "SELECT updated_at, detected_at, html_url, tag_name, name, body FROM repo_releases WHERE release_id = ? LIMIT 1",
+        )
+        .bind(&work.canonical_resource_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(|(updated_at, detected_at, html_url, tag_name, name, body)| {
+            let title = name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(tag_name.as_str());
+            let body = body.unwrap_or_default().replace("\r\n", "\n");
+            (
+                authoritative_release_revision(&updated_at, detected_at.as_deref())
+                    .map(str::to_owned),
+                source_revision_content_tiebreak(&[
+                    html_url.as_str(),
+                    tag_name.as_str(),
+                    title,
+                    body.as_str(),
+                ]),
+            )
+        }),
+        "notification" => sqlx::query_as::<_, (
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>(
+            "SELECT updated_at, thread_id, repo_full_name, subject_title, reason, subject_type FROM notifications WHERE thread_id = ? ORDER BY updated_at DESC, COALESCE(repo_full_name, '') DESC, COALESCE(subject_title, '') DESC, COALESCE(reason, '') DESC, COALESCE(subject_type, '') DESC, id DESC LIMIT 1",
+        )
+        .bind(&work.canonical_resource_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(|(updated_at, thread_id, repo, title, reason, subject_type)| {
+            (
+                updated_at,
+                notification_source_revision_tiebreak(
+                    &thread_id,
+                    repo.as_deref(),
+                    title.as_deref(),
+                    reason.as_deref(),
+                    subject_type.as_deref(),
+                ),
+            )
+        }),
+        "announcement" => {
+            let Some((repo, number)) = work.canonical_resource_id.rsplit_once('#') else {
+                return Ok(None);
+            };
+            let number = number.parse::<i64>().unwrap_or_default();
+            sqlx::query_as::<_, (Option<String>, String, i64, Option<String>, Option<String>)>(
+                "SELECT occurred_at, lower(repo_full_name), discussion_number, title, body FROM social_activity_events WHERE kind = 'announcement' AND lower(repo_full_name) = lower(?) AND discussion_number = ? ORDER BY occurred_at DESC, COALESCE(title, '') DESC, COALESCE(body, '') DESC, id DESC LIMIT 1",
+            )
+            .bind(repo)
+            .bind(number)
+            .fetch_optional(&mut **tx)
+            .await?
+            .map(|(occurred_at, repo_full_name, discussion_number, title, body)| {
+                let title = title.unwrap_or_else(|| format!("Discussion #{discussion_number}"));
+                let body = body.unwrap_or_default();
+                (
+                    occurred_at,
+                    announcement_source_revision_tiebreak(
+                        repo_full_name.as_str(),
+                        discussion_number,
+                        title.as_str(),
+                        body.as_str(),
+                    ),
+                )
+            })
+        }
+        _ => None,
+    };
+    let Some((observed_at, tiebreak)) = revision else {
+        return Ok(None);
+    };
+    let Some(observed_at) = observed_at else {
+        return Ok(None);
+    };
+    Ok(Some(source_revision_snapshot_json(
+        Some(observed_at),
+        tiebreak,
+    )))
+}
+
+async fn source_revision_is_current_in_transaction(
     tx: &mut Transaction<'_, Sqlite>,
     work: &WorkRow,
 ) -> Result<bool> {
-    let candidates = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT id, source_snapshot_json, created_at FROM content_work_items WHERE id <> ? AND canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND status NOT IN ('cancelled', 'superseded')",
-    )
-    .bind(&work.id)
-    .bind(&work.canonical_resource_type)
-    .bind(&work.canonical_resource_id)
-    .bind(&work.pipeline)
-    .bind(&work.variant)
-    .bind(&work.target_lang)
-    .bind(&work.protocol_version)
-    .fetch_all(&mut **tx)
-    .await?;
-    let work_revision = source_observed_at(&work.source_snapshot_json);
-    let replaced = candidates.into_iter().any(|(id, snapshot, created_at)| {
-        match (work_revision, source_observed_at(&snapshot)) {
-            (Some(work_revision), Some(candidate_revision)) => candidate_revision > work_revision,
-            _ => created_at > work.created_at || (created_at == work.created_at && id > work.id),
-        }
-    });
-    if !replaced {
+    let work_revision = source_revision_metadata(&work.source_snapshot_json);
+    if matches!(work_revision, SourceRevisionMetadata::Missing) {
         return Ok(false);
     }
+    if matches!(work_revision, SourceRevisionMetadata::Malformed) {
+        return Ok(false);
+    }
+    let Some(current_snapshot) = current_source_revision_snapshot_in_transaction(tx, work).await?
+    else {
+        return Ok(false);
+    };
+    let current_revision = source_revision_metadata(&current_snapshot);
+    let (
+        SourceRevisionMetadata::Valid {
+            observed_at: work_observed_at,
+            tiebreak: work_tiebreak,
+        },
+        SourceRevisionMetadata::Valid {
+            observed_at: current_observed_at,
+            tiebreak: current_tiebreak,
+        },
+    ) = (work_revision, current_revision)
+    else {
+        return Ok(false);
+    };
+    if work_observed_at == current_observed_at
+        && (work_tiebreak.is_none() || current_tiebreak.is_none())
+    {
+        return Ok(false);
+    }
+    Ok(!source_version_is_newer(
+        &current_snapshot,
+        &work.source_snapshot_json,
+    ))
+}
+
+async fn supersede_work_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    work: &WorkRow,
+    replaced_by_work_item_id: Option<&str>,
+    reason_code: &str,
+) -> Result<()> {
+    supersede_work_with_event_in_transaction(
+        tx,
+        work,
+        replaced_by_work_item_id,
+        "source_superseded",
+        reason_code,
+    )
+    .await
+}
+
+async fn supersede_work_with_event_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    work: &WorkRow,
+    replaced_by_work_item_id: Option<&str>,
+    event_type: &str,
+    reason_code: &str,
+) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query("UPDATE content_work_items SET status = 'superseded', finished_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?")
         .bind(&now)
@@ -2642,6 +3472,20 @@ async fn supersede_replaced_work_in_transaction(
         .bind(&work.id)
         .execute(&mut **tx)
         .await?;
+    record_work_admission_event(
+        tx,
+        WorkAdmissionEvent {
+            work_item_id: &work.id,
+            event_type,
+            replaced_by_work_item_id,
+            source_hash: &work.source_hash,
+            source_snapshot_json: &work.source_snapshot_json,
+            producer_ref: "",
+            requester_id: None,
+            reason_code,
+        },
+    )
+    .await?;
     sqlx::query("INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, created_at) SELECT ?, work_item_id, attempt_no, trigger, 'attempt_completed', 'superseded', 0, ? FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started'")
         .bind(local_id::generate_local_id().to_string())
         .bind(&now)
@@ -2661,6 +3505,45 @@ async fn supersede_replaced_work_in_transaction(
         .bind(work.batch_id.as_deref().unwrap_or_default())
         .execute(&mut **tx)
         .await?;
+    Ok(())
+}
+
+async fn supersede_replaced_work_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    work: &WorkRow,
+) -> Result<bool> {
+    let candidates = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, source_snapshot_json FROM content_work_items WHERE id <> ? AND canonical_resource_type = ? AND canonical_resource_id = ? AND pipeline = ? AND variant = ? AND target_lang = ? AND protocol_version = ? AND status NOT IN ('cancelled', 'superseded')",
+    )
+    .bind(&work.id)
+    .bind(&work.canonical_resource_type)
+    .bind(&work.canonical_resource_id)
+    .bind(&work.pipeline)
+    .bind(&work.variant)
+    .bind(&work.target_lang)
+    .bind(&work.protocol_version)
+    .fetch_all(&mut **tx)
+    .await?;
+    let Some((replaced_by_work_item_id, _)) = candidates
+        .into_iter()
+        .filter(|(_, snapshot)| source_version_is_newer(snapshot, &work.source_snapshot_json))
+        .reduce(|current, candidate| {
+            if source_version_is_newer(&candidate.1, &current.1) {
+                candidate
+            } else {
+                current
+            }
+        })
+    else {
+        return Ok(false);
+    };
+    supersede_work_in_transaction(
+        tx,
+        work,
+        Some(&replaced_by_work_item_id),
+        "newer_source_detected_before_provider",
+    )
+    .await?;
     Ok(true)
 }
 
@@ -2748,6 +3631,74 @@ async fn persist_attempt_llm_call_audit(
         .bind(audit.created_at)
         .execute(&mut **tx)
         .await?;
+    Ok(())
+}
+
+async fn persist_superseded_provider_call_audits(
+    tx: &mut Transaction<'_, Sqlite>,
+    work: &WorkRow,
+    result: &Result<GlobalCompletion>,
+    now: &str,
+) -> Result<()> {
+    let attempt_event_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM content_attempt_events WHERE work_item_id = ? AND attempt_no = ? AND event_type = 'attempt_started' LIMIT 1",
+    )
+    .bind(&work.id)
+    .bind(work.attempt_count)
+    .fetch_one(&mut **tx)
+    .await?;
+    let linked_call_ids = match result {
+        Ok(completion) => unique_call_ids(
+            completion
+                .call_ids
+                .iter()
+                .cloned()
+                .chain(completion.diagnostic.call_id.clone())
+                .collect(),
+        ),
+        Err(error) => unique_call_ids(
+            output_validation_call_ids(error)
+                .into_iter()
+                .chain(global_execution_call_ids(error))
+                .chain(ai::llm_call_id(error))
+                .collect(),
+        ),
+    };
+    let mut used_provider_call_ids = HashSet::new();
+    for call_id in linked_call_ids {
+        let audit = load_llm_call_audit(tx, &call_id)
+            .await?
+            .unwrap_or_else(|| LlmCallAudit {
+                provider_request_id: None,
+                model: "unknown".to_owned(),
+                status: "succeeded".to_owned(),
+                duration_ms: None,
+                input_tokens: None,
+                output_tokens: None,
+            });
+        let provider_call_id = unique_provider_call_id(
+            &call_id,
+            audit.provider_request_id.as_deref(),
+            &mut used_provider_call_ids,
+        );
+        persist_attempt_llm_call_audit(
+            tx,
+            AttemptLlmCallAudit {
+                audit_call_id: &call_id,
+                attempt_event_id: &attempt_event_id,
+                provider_call_id: &provider_call_id,
+                model: &audit.model,
+                status: &audit.status,
+                duration_ms: audit.duration_ms,
+                input_tokens: audit.input_tokens,
+                output_tokens: audit.output_tokens,
+                error_code: "superseded",
+                error_summary: Some("source superseded after provider admission"),
+                created_at: now,
+            },
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -2839,7 +3790,16 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             .fetch_optional(&mut *tx)
             .await?;
     if mode.as_deref() != Some(ContentProcessingMode::Global.as_str()) {
-        tx.rollback().await?;
+        supersede_work_with_event_in_transaction(
+            &mut tx,
+            &work,
+            None,
+            "reconciliation_superseded",
+            "processing_mode_changed_after_provider",
+        )
+        .await?;
+        persist_superseded_provider_call_audits(&mut tx, &work, &result, &now).await?;
+        tx.commit().await?;
         return Ok(());
     }
     let now_for_lease = Utc::now().to_rfc3339();
@@ -2852,15 +3812,30 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
     .fetch_one(&mut *tx)
     .await?;
     if claim_is_current == 0 {
-        tx.rollback().await?;
+        persist_superseded_provider_call_audits(&mut tx, &work, &result, &now).await?;
+        tx.commit().await?;
         return Ok(());
     }
     if !source_exists_in_transaction(&mut tx, &work).await? {
         cancel_deleted_work_in_transaction(&mut tx, &work).await?;
+        persist_superseded_provider_call_audits(&mut tx, &work, &result, &now).await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+    if !source_revision_is_current_in_transaction(&mut tx, &work).await? {
+        supersede_work_in_transaction(
+            &mut tx,
+            &work,
+            None,
+            "source_revision_changed_before_publication",
+        )
+        .await?;
+        persist_superseded_provider_call_audits(&mut tx, &work, &result, &now).await?;
         tx.commit().await?;
         return Ok(());
     }
     if supersede_replaced_work_in_transaction(&mut tx, &work).await? {
+        persist_superseded_provider_call_audits(&mut tx, &work, &result, &now).await?;
         tx.commit().await?;
         return Ok(());
     }
@@ -3313,6 +4288,7 @@ mod tests {
     use crate::translations::{TranslationRuntimeConfig, TranslationSchedulerController};
     use axum::{Router, routing::post};
     use sqlx::sqlite::SqlitePoolOptions;
+    use tokio::sync::Notify;
     use url::Url;
 
     async fn pool(mode: &str) -> SqlitePool {
@@ -3353,6 +4329,12 @@ mod tests {
         .unwrap();
         sqlx::raw_sql(include_str!(
             "../migrations/0084_content_processing_model_independent_identity.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/0086_content_work_admission_events.sql"
         ))
         .execute(&pool)
         .await
@@ -3554,13 +4536,17 @@ mod tests {
     }
 
     async fn seed_executable_work(pool: &SqlitePool, id: &str, target_slots: &[&str]) {
-        sqlx::query("INSERT INTO repo_releases (id, repo_id, release_id, tag_name, html_url, updated_at) VALUES (?, 1, 12345, 'v1', 'https://example.test/releases/12345', CURRENT_TIMESTAMP)")
+        sqlx::query("INSERT INTO repo_releases (id, repo_id, release_id, tag_name, html_url, detected_at, updated_at) VALUES (?, 1, 12345, 'v1', 'https://example.test/releases/12345', '2026-01-01T00:00:01Z', '2026-01-01T00:00:00Z')")
             .bind(format!("release-row-{id}"))
             .execute(pool)
             .await
             .unwrap();
         let source_snapshot = json!({
-            "source_blocks": [{"slot": "title", "text": "A release title"}],
+            "source_blocks": [
+                {"slot": "source_observed_at", "text": "2026-01-01T00:00:00Z"},
+                {"slot": "source_revision_tiebreak", "text": "https://example.test/releases/12345\nv1\nv1\n"},
+                {"slot": "title", "text": "A release title"}
+            ],
             "target_slots": target_slots
         });
         sqlx::query("INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, created_at, updated_at) VALUES (?, 'release', '12345', 'translation', 'summary', 'zh-CN', ?, ?, 'test-model', ?, 'test-fingerprint', 'queued', 0, 0, 1, 0, '2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z')")
@@ -3627,12 +4613,16 @@ mod tests {
     #[tokio::test]
     async fn execute_persists_failure_finalization_atomically() {
         let pool = global_execution_pool().await;
-        sqlx::query("INSERT INTO repo_releases (id, repo_id, release_id, tag_name, html_url, updated_at) VALUES ('test-release', 1, 12345, 'v1', 'https://example.test/releases/12345', CURRENT_TIMESTAMP)")
+        sqlx::query("INSERT INTO repo_releases (id, repo_id, release_id, tag_name, html_url, detected_at, updated_at) VALUES ('test-release', 1, 12345, 'v1', 'https://example.test/releases/12345', '2026-01-01T00:00:01Z', '2026-01-01T00:00:00Z')")
             .execute(&pool)
             .await
             .unwrap();
         let source_snapshot = json!({
-            "source_blocks": [{"slot": "title", "text": "A release title"}],
+            "source_blocks": [
+                {"slot": "source_observed_at", "text": "2026-01-01T00:00:00Z"},
+                {"slot": "source_revision_tiebreak", "text": "https://example.test/releases/12345\nv1\nv1\n"},
+                {"slot": "title", "text": "A release title"}
+            ],
             "target_slots": ["title_zh"]
         });
         sqlx::query("INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, created_at, updated_at) VALUES ('execute-failure-work', 'release', '12345', 'translation', 'summary', 'zh-CN', 'source-hash', ?, 'test-model', ?, 'test-fingerprint', 'queued', 0, 0, 1, 0, '2000-01-01T00:00:00Z', '2000-01-01T00:00:00Z')")
@@ -4565,6 +5555,658 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn older_source_cannot_displace_newer_source() {
+        let pool = global_pool().await;
+        let make_item = |producer_ref: &str, revision: &str, title: &str| {
+            translations::TranslationRequestItemInput {
+                producer_ref: producer_ref.to_owned(),
+                kind: "release_summary".to_owned(),
+                variant: "summary".to_owned(),
+                entity_id: "ordered-release".to_owned(),
+                target_lang: "zh-CN".to_owned(),
+                max_wait_ms: 0,
+                source_blocks: vec![
+                    translations::TranslationSourceBlock {
+                        slot: "source_observed_at".to_owned(),
+                        text: revision.to_owned(),
+                    },
+                    translations::TranslationSourceBlock {
+                        slot: "title".to_owned(),
+                        text: title.to_owned(),
+                    },
+                ],
+                target_slots: vec!["title_zh".to_owned()],
+            }
+        };
+        let newer = make_item("feed.newer", "2026-01-02T00:00:00Z", "New title");
+        let older = make_item("feed.older", "2026-01-01T00:00:00Z", "Old title");
+        let state = global_state(pool.clone());
+        let (newer_status, newer_response) = submit_item(&state, "user-1", "async", &newer)
+            .await
+            .unwrap();
+        assert_eq!(newer_status, StatusCode::ACCEPTED);
+        let (older_status, older_response) = submit_item(&state, "user-1", "async", &older)
+            .await
+            .unwrap();
+
+        assert_eq!(older_status, StatusCode::CONFLICT);
+        assert_eq!(older_response.work_item_id, newer_response.work_item_id);
+        assert_eq!(older_response.status, "queued");
+        assert_eq!(
+            older_response.error.as_ref().unwrap()["code"],
+            "content_processing_superseded"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM content_work_items WHERE source_hash = ?",
+            )
+            .bind(source_hash(&older).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "superseded"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_events e JOIN content_work_items w ON w.id = e.work_item_id WHERE w.source_hash = ? AND e.event_type = 'attempt_queued'",
+            )
+            .bind(source_hash(&older).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_work_admission_events e JOIN content_work_items w ON w.id = e.work_item_id WHERE w.source_hash = ? AND e.event_type = 'admission_rejected_superseded'",
+            )
+            .bind(source_hash(&older).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+
+        let (repeated_status, repeated_response) = submit_item(&state, "user-1", "async", &older)
+            .await
+            .unwrap();
+        assert_eq!(repeated_status, StatusCode::CONFLICT);
+        assert_eq!(repeated_response.work_item_id, newer_response.work_item_id);
+        assert_eq!(
+            repeated_response.error.as_ref().unwrap()["code"],
+            "content_processing_superseded"
+        );
+    }
+
+    #[tokio::test]
+    async fn submission_does_not_requeue_superseded_work() {
+        let pool = global_pool().await;
+        let old_item = translations::TranslationRequestItemInput {
+            producer_ref: "sync.global.release:release-1:summary".to_owned(),
+            kind: "release_summary".to_owned(),
+            variant: "summary".to_owned(),
+            entity_id: "release-1".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 0,
+            source_blocks: vec![
+                translations::TranslationSourceBlock {
+                    slot: "source_observed_at".to_owned(),
+                    text: "2026-01-01T00:00:00Z".to_owned(),
+                },
+                translations::TranslationSourceBlock {
+                    slot: "title".to_owned(),
+                    text: "Old title".to_owned(),
+                },
+            ],
+            target_slots: vec!["title_zh".to_owned()],
+        };
+        let mut new_item = old_item.clone();
+        new_item.source_blocks[1].text = "New title".to_owned();
+        new_item.source_blocks[0].text = "2026-01-02T00:00:00Z".to_owned();
+        let old_snapshot = serde_json::to_string(&json!({
+            "source_blocks": old_item.source_blocks,
+            "target_slots": old_item.target_slots,
+        }))
+        .unwrap();
+        let new_snapshot = serde_json::to_string(&json!({
+            "source_blocks": new_item.source_blocks,
+            "target_slots": new_item.target_slots,
+        }))
+        .unwrap();
+        let old_hash = source_hash(&old_item).unwrap();
+        let new_hash = source_hash(&new_item).unwrap();
+        for (id, hash, snapshot, status, retry_expires_at, created_at) in [
+            (
+                "superseded-old",
+                old_hash.as_str(),
+                old_snapshot.as_str(),
+                "superseded",
+                Some("2026-01-03T00:00:00Z"),
+                "2026-01-01T00:00:00Z",
+            ),
+            (
+                "superseded-new",
+                new_hash.as_str(),
+                new_snapshot.as_str(),
+                "queued",
+                None,
+                "2026-01-02T00:00:00Z",
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, retry_expires_at, created_at, updated_at) VALUES (?, 'release', 'release-1', 'translation', 'summary', 'zh-CN', ?, ?, 'test-model', ?, 'config-1', ?, 0, 0, 1, 0, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(hash)
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(snapshot)
+            .bind(status)
+            .bind(retry_expires_at)
+            .bind(created_at)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let mut tx = pool.begin().await.unwrap();
+        content_identity_upgrade::ensure_identity_for_work(
+            &mut tx,
+            "superseded-old",
+            "2026-01-02T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        content_identity_upgrade::ensure_identity_for_work(
+            &mut tx,
+            "superseded-new",
+            "2026-01-02T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let state = global_state(pool.clone());
+        let (status, response) = submit_item(&state, "user-1", "async", &old_item)
+            .await
+            .unwrap();
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(response.work_item_id, "superseded-new");
+        assert_eq!(response.status, "queued");
+        assert_eq!(
+            response.error.as_ref().unwrap()["code"],
+            "content_processing_superseded"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_events WHERE work_item_id = 'superseded-old' AND event_type = 'attempt_queued'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT retry_expires_at FROM content_work_items WHERE id = 'superseded-old'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "2026-01-03T00:00:00Z"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_checks_supersession_before_provider_call() {
+        let pool = global_execution_pool().await;
+        seed_executable_work(&pool, "stale-execution-old", &["title_zh"]).await;
+        sqlx::query(
+            "UPDATE content_work_items SET source_snapshot_json = ?, created_at = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(
+            json!({
+                "source_blocks": [
+                    {"slot": "source_observed_at", "text": "2026-01-01T00:00:00Z"},
+                    {"slot": "source_revision_tiebreak", "text": "https://example.test/releases/12345\nv1\nv1\n"},
+                    {"slot": "title", "text": "Old title"}
+                ],
+                "target_slots": ["title_zh"]
+            })
+            .to_string(),
+        )
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .bind("stale-execution-old")
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (base_url, requested_tokens, _) = spawn_sequenced_test_ai_server(vec![(
+            r#"{"title_zh":"should not be called"}"#,
+            "stop",
+        )])
+        .await;
+        let mut state = global_state(pool.clone());
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .ai
+            .as_mut()
+            .unwrap()
+            .base_url = base_url;
+
+        let work = claim_next(&state, 1).await.unwrap().unwrap();
+        assert_eq!(work.id, "stale-execution-old");
+        sqlx::query(
+            "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, supersedes_work_item_id, created_at, updated_at) VALUES ('stale-execution-new', 'release', '12345', 'translation', 'summary', 'zh-CN', 'new-source-hash', ?, 'test-model', ?, 'test-fingerprint', 'queued', 0, 0, 1, 0, 'stale-execution-old', ?, ?)",
+        )
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .bind(
+            json!({
+                "source_blocks": [{"slot": "source_observed_at", "text": "2026-01-02T00:00:00Z"}, {"slot": "title", "text": "New title"}],
+                "target_slots": ["title_zh"]
+            })
+            .to_string(),
+        )
+        .bind("2026-01-02T00:00:00Z")
+        .bind("2026-01-02T00:00:00Z")
+        .execute(&pool)
+        .await
+        .unwrap();
+        let attempt_no = work.attempt_count;
+        execute(&state, work).await.unwrap();
+
+        assert!(requested_tokens.lock().unwrap().is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM content_work_items WHERE id = 'stale-execution-old'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "superseded"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT result_status FROM content_attempt_events WHERE work_item_id = 'stale-execution-old' AND attempt_no = ? AND event_type = 'attempt_completed'",
+            )
+            .bind(attempt_no)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "superseded"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_provider_admissions WHERE work_item_id = 'stale-execution-old'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshot_is_superseded_before_provider_call() {
+        let pool = global_execution_pool().await;
+        seed_executable_work(&pool, "legacy-source-work", &["title_zh"]).await;
+        sqlx::query("UPDATE content_work_items SET source_snapshot_json = ? WHERE id = ?")
+            .bind(
+                json!({
+                    "source_blocks": [{"slot": "title", "text": "Legacy title"}],
+                    "target_slots": ["title_zh"]
+                })
+                .to_string(),
+            )
+            .bind("legacy-source-work")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (base_url, requested_tokens, _) = spawn_sequenced_test_ai_server(vec![(
+            r#"{"title_zh":"should not be called"}"#,
+            "stop",
+        )])
+        .await;
+        let mut state = global_state(pool.clone());
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .ai
+            .as_mut()
+            .unwrap()
+            .base_url = base_url;
+
+        let work = claim_next(&state, 1).await.unwrap().unwrap();
+        execute(&state, work).await.unwrap();
+
+        assert!(requested_tokens.lock().unwrap().is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM content_work_items WHERE id = 'legacy-source-work'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "superseded"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_provider_admissions WHERE work_item_id = 'legacy-source-work'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_of_superseded_work_points_to_current_work() {
+        let pool = global_pool().await;
+        for (id, hash, revision, status) in [
+            (
+                "retry-superseded-old",
+                "retry-old-hash",
+                "2026-01-01T00:00:00Z",
+                "superseded",
+            ),
+            (
+                "retry-superseded-new",
+                "retry-new-hash",
+                "2026-01-02T00:00:00Z",
+                "queued",
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, retry_after_at, retry_expires_at, created_at, updated_at) VALUES (?, 'release', 'retry-release', 'translation', 'summary', 'zh-CN', ?, ?, 'test-model', ?, ?, ?, 0, 0, 1, 0, '2099-01-01T00:00:00Z', '2099-01-02T00:00:00Z', ?, ?)",
+            )
+            .bind(id)
+            .bind(hash)
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(
+                json!({
+                    "source_blocks": [{"slot": "source_observed_at", "text": revision}, {"slot": "title", "text": id}],
+                    "target_slots": ["title_zh"]
+                })
+                .to_string(),
+            )
+            .bind("test-fingerprint")
+            .bind(status)
+            .bind(revision)
+            .bind(revision)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let mut tx = pool.begin().await.unwrap();
+        content_identity_upgrade::ensure_identity_for_work(
+            &mut tx,
+            "retry-superseded-old",
+            "2026-01-02T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        content_identity_upgrade::ensure_identity_for_work(
+            &mut tx,
+            "retry-superseded-new",
+            "2026-01-02T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        insert_request_link(
+            &mut tx,
+            "retry-superseded-request",
+            "retry-superseded-old",
+            "user-1",
+            "async",
+            "global.release.summary",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let state = global_state(pool.clone());
+        let (status, response) = retry_request(&state, "user-1", "retry-superseded-request")
+            .await
+            .unwrap();
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(response["error"]["code"], "content_processing_superseded");
+        assert_eq!(
+            response["error"]["superseded_work_item_id"],
+            "retry-superseded-old"
+        );
+        assert_eq!(
+            response["error"]["current_work_item_id"],
+            "retry-superseded-new"
+        );
+        assert_eq!(response["work_item_id"], "retry-superseded-new");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_events WHERE work_item_id = 'retry-superseded-old' AND event_type = 'attempt_queued'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_work_admission_events WHERE work_item_id = 'retry-superseded-old' AND event_type = 'admission_rejected_superseded' AND replaced_by_work_item_id = 'retry-superseded-new'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_call_finishes_without_publishing_superseded_output() {
+        let pool = global_execution_pool().await;
+        seed_executable_work(&pool, "admitted-race-old", &["title_zh"]).await;
+        sqlx::query(
+            "UPDATE repo_releases SET updated_at = '2026-01-01T00:00:00Z' WHERE release_id = 12345",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE content_work_items SET source_snapshot_json = ?, created_at = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(
+            json!({
+                "source_blocks": [
+                    {"slot": "source_observed_at", "text": "2026-01-01T00:00:00Z"},
+                    {"slot": "source_revision_tiebreak", "text": "https://example.test/releases/12345\nv1\nv1\n"},
+                    {"slot": "title", "text": "Old title"}
+                ],
+                "target_slots": ["title_zh"]
+            })
+            .to_string(),
+        )
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2026-01-01T00:00:00Z")
+        .bind("admitted-race-old")
+        .execute(&pool)
+        .await
+        .unwrap();
+        let request_seen = Arc::new(Notify::new());
+        let server_request_seen = request_seen.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(_request): Json<Value>| {
+                let request_seen = server_request_seen.clone();
+                async move {
+                    request_seen.notify_one();
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "admitted-race-provider-call",
+                            "choices": [{
+                                "message": {"content": "{\"title_zh\":\"old result\"}"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                        })),
+                    )
+                }
+            }),
+        );
+        let base_url = spawn_test_ai_server(app).await;
+        let mut state = global_state(pool.clone());
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .ai
+            .as_mut()
+            .unwrap()
+            .base_url = base_url;
+        let work = claim_next(&state, 1).await.unwrap().unwrap();
+        let attempt_no = work.attempt_count;
+        let execution = tokio::spawn({
+            let state = state.clone();
+            async move { execute(&state, work).await }
+        });
+        request_seen.notified().await;
+        sqlx::query(
+            "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, supersedes_work_item_id, created_at, updated_at) VALUES ('admitted-race-new', 'release', '12345', 'translation', 'summary', 'zh-CN', 'admitted-new-hash', ?, 'test-model', ?, 'test-fingerprint', 'queued', 0, 0, 1, 0, 'admitted-race-old', ?, ?)",
+        )
+        .bind(GLOBAL_PROTOCOL_VERSION)
+        .bind(
+            json!({
+                "source_blocks": [{"slot": "source_observed_at", "text": "2026-01-02T00:00:00Z"}, {"slot": "title", "text": "New title"}],
+                "target_slots": ["title_zh"]
+            })
+            .to_string(),
+        )
+        .bind("2026-01-02T00:00:00Z")
+        .bind("2026-01-02T00:00:00Z")
+        .execute(&pool)
+        .await
+        .unwrap();
+        execution.await.unwrap().unwrap();
+
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM content_work_items WHERE id = 'admitted-race-old'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "superseded"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_provider_admissions WHERE work_item_id = 'admitted-race-old' AND call_ordinal = 0",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_attempt_llm_calls c JOIN content_attempt_events e ON e.id = c.attempt_event_id WHERE e.work_item_id = 'admitted-race-old' AND e.attempt_no = ?",
+            )
+            .bind(attempt_no)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_result_projections WHERE work_item_id = 'admitted-race-old'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT retry_eligible FROM content_attempt_events WHERE work_item_id = 'admitted-race-old' AND attempt_no = ? AND event_type = 'attempt_completed'",
+            )
+            .bind(attempt_no)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_is_idempotent_and_provider_free() {
+        let pool = global_pool().await;
+        for (id, hash, revision, status, created_at) in [
+            (
+                "startup-old",
+                "startup-old-hash",
+                "2026-01-01T00:00:00Z",
+                "queued",
+                "2026-01-01T00:00:00Z",
+            ),
+            (
+                "startup-new",
+                "startup-new-hash",
+                "2026-01-02T00:00:00Z",
+                "ready",
+                "2026-01-02T00:00:00Z",
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO content_work_items (id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, attempt_count, created_at, updated_at) VALUES (?, 'release', 'startup-release', 'translation', 'summary', 'zh-CN', ?, ?, 'test-model', ?, 'test-fingerprint', ?, 0, 0, 1, 0, ?, ?)",
+            )
+            .bind(id)
+            .bind(hash)
+            .bind(GLOBAL_PROTOCOL_VERSION)
+            .bind(json!({
+                "source_blocks": [{"slot": "source_observed_at", "text": revision}, {"slot": "title", "text": id}],
+                "target_slots": ["title_zh"]
+            }).to_string())
+            .bind(status)
+            .bind(created_at)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let mut tx = pool.begin().await.unwrap();
+        assert_eq!(
+            supersede_stale_work_in_transaction(&mut tx).await.unwrap(),
+            1
+        );
+        tx.commit().await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        assert_eq!(
+            supersede_stale_work_in_transaction(&mut tx).await.unwrap(),
+            0
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM content_work_items WHERE id = 'startup-old'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "superseded"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM content_work_admission_events WHERE work_item_id = 'startup-old' AND event_type = 'reconciliation_superseded'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn submission_uses_persisted_routes_when_the_local_scheduler_is_stale() {
         let pool = global_pool().await;
         sqlx::query(
@@ -5158,6 +6800,95 @@ mod tests {
                 .unwrap()
             )
             .is_some()
+        );
+    }
+
+    #[test]
+    fn equal_source_revision_timestamp_uses_authoritative_tiebreak() {
+        let older = json!({
+            "source_blocks": [
+                {"slot": "source_observed_at", "text": "2026-01-01T00:00:00Z"},
+                {"slot": "source_revision_tiebreak", "text": "0001"},
+            ]
+        })
+        .to_string();
+        let newer = json!({
+            "source_blocks": [
+                {"slot": "source_observed_at", "text": "2026-01-01T00:00:00Z"},
+                {"slot": "source_revision_tiebreak", "text": "0002"},
+            ]
+        })
+        .to_string();
+        assert!(source_version_is_newer(&newer, &older,));
+        assert!(!source_version_is_newer(&older, &newer,));
+        assert!(!source_version_is_newer(&newer, &newer,));
+        let legacy = json!({"source_blocks": [{"slot": "title", "text": "legacy"}]}).to_string();
+        assert!(source_version_is_newer(&newer, &legacy));
+        assert!(!source_version_is_newer(&legacy, &newer));
+        let numeric_10 = json!({
+            "source_blocks": [
+                {"slot": "source_observed_at", "text": "2026-01-01T00:00:00Z"},
+                {"slot": "source_revision_tiebreak", "text": "10"},
+            ]
+        })
+        .to_string();
+        let numeric_9 = numeric_10.replace("\"10\"", "\"9\"");
+        assert!(source_version_is_newer(&numeric_10, &numeric_9));
+        let malformed = json!({
+            "source_blocks": [
+                {"slot": "source_observed_at", "text": "not-a-timestamp"},
+                {"slot": "source_revision_tiebreak", "text": "0003"},
+            ]
+        })
+        .to_string();
+        assert!(!source_version_is_newer(&malformed, &older));
+        assert!(source_version_is_newer(&newer, &malformed));
+    }
+
+    #[test]
+    fn canonical_source_revision_helpers_use_authoritative_shapes() {
+        assert_eq!(
+            announcement_source_revision_tiebreak("Octo/Demo", 42, "Title", "Body"),
+            "octo/demo#42\nTitle\nBody"
+        );
+        assert_eq!(
+            authoritative_release_revision("2026-01-01T00:00:00Z", Some("2026-01-01T00:00:01Z")),
+            Some("2026-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            authoritative_release_revision("2026-01-01T00:00:00Z", Some("2026-01-01T00:00:00Z")),
+            None
+        );
+        assert_eq!(
+            authoritative_release_revision("2026-01-01T00:00:00Z", None),
+            None
+        );
+        assert_eq!(
+            compare_announcement_source_revisions(
+                "2026-01-01T00:00:01Z",
+                "new",
+                "2026-01-01T00:00:00Z",
+                "old",
+            ),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert_eq!(
+            compare_announcement_source_revisions(
+                "2026-01-01T00:00:00Z",
+                "z-new",
+                "2026-01-01T00:00:00Z",
+                "old",
+            ),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert_eq!(
+            compare_announcement_source_revisions(
+                "malformed",
+                "new",
+                "2026-01-01T00:00:00Z",
+                "old",
+            ),
+            None
         );
     }
 
