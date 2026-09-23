@@ -2642,12 +2642,17 @@ test("dashboard keeps access sync details closed until interaction", async ({
 							this.dispatch("task.progress", {
 								task_id: taskId,
 								stage: "release_summary",
-								releases: 2,
+								releases: 10,
 							});
 						}, releaseDelayMs),
 					);
 					this.timers.push(
 						window.setTimeout(() => {
+							this.dispatch("task.progress", {
+								task_id: taskId,
+								stage: "release_summary",
+								releases: 2,
+							});
 							this.dispatch("task.progress", {
 								task_id: taskId,
 								stage: "star_refreshed",
@@ -2822,6 +2827,7 @@ test("dashboard keeps access sync details closed until interaction", async ({
 	await expect(page.getByText("Release 已同步").first()).toBeVisible({
 		timeout: 3000,
 	});
+	await expect(page.getByText("写入 10 条 Release").first()).toBeVisible();
 	const stageProgressBeforeStaleEvent = Number(
 		await syncButton.getAttribute("data-dashboard-sync-progress"),
 	);

@@ -1546,14 +1546,6 @@ function accessSyncProgressFromStage(
 	}
 }
 
-function mergeAccessSyncProgress(
-	current: DashboardSyncProgress | null,
-	next: DashboardSyncProgress,
-) {
-	if (!current || next.currentStep >= current.currentStep) return next;
-	return current;
-}
-
 function formatDateTime(value: string | null | undefined) {
 	if (!value) return "—";
 	const date = new Date(value);
@@ -1684,6 +1676,9 @@ export function Dashboard(props: {
 		useState<DashboardSyncProgress | null>(
 			initialAccessTask ? accessSyncProgressFromStage("waiting") : null,
 		);
+	const accessSyncProgressRef = useRef<DashboardSyncProgress | null>(
+		initialAccessTask ? accessSyncProgressFromStage("waiting") : null,
+	);
 	const refreshTaskSourcesRef = useRef<Map<string, EventSource>>(new Map());
 	const refreshTaskReconnectTimersRef = useRef<Map<string, number>>(new Map());
 	const refreshTaskLifecyclesRef = useRef<
@@ -3077,7 +3072,9 @@ export function Dashboard(props: {
 				);
 				setAccessSyncStage("waiting");
 				setAccessSyncLifecycle("running");
-				setAccessSyncProgress(accessSyncProgressFromStage("waiting"));
+				const waitingProgress = accessSyncProgressFromStage("waiting");
+				accessSyncProgressRef.current = waitingProgress;
+				setAccessSyncProgress(waitingProgress);
 				return promise;
 			}
 			setRefreshTaskStreams((current) =>
@@ -3430,13 +3427,19 @@ export function Dashboard(props: {
 			const payload = parsePayload(event as MessageEvent<string>);
 			const stage = payload.stage;
 			if (stage === "star_refreshed") {
-				setAccessSyncStage("star_refreshed");
-				setAccessSyncProgress((current) =>
-					mergeAccessSyncProgress(
-						current,
-						accessSyncProgressFromStage("star_refreshed", payload),
-					),
+				const nextProgress = accessSyncProgressFromStage(
+					"star_refreshed",
+					payload,
 				);
+				if (
+					accessSyncProgressRef.current &&
+					nextProgress.currentStep <= accessSyncProgressRef.current.currentStep
+				) {
+					return;
+				}
+				accessSyncProgressRef.current = nextProgress;
+				setAccessSyncStage("star_refreshed");
+				setAccessSyncProgress(nextProgress);
 				refreshOnUi();
 				return;
 			}
@@ -3445,12 +3448,15 @@ export function Dashboard(props: {
 				stage === "social_summary" ||
 				stage === "notifications_summary"
 			) {
-				setAccessSyncProgress((current) =>
-					mergeAccessSyncProgress(
-						current,
-						accessSyncProgressFromStage(stage, payload),
-					),
-				);
+				const nextProgress = accessSyncProgressFromStage(stage, payload);
+				if (
+					accessSyncProgressRef.current &&
+					nextProgress.currentStep <= accessSyncProgressRef.current.currentStep
+				) {
+					return;
+				}
+				accessSyncProgressRef.current = nextProgress;
+				setAccessSyncProgress(nextProgress);
 			}
 		};
 
