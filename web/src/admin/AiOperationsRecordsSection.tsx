@@ -1,5 +1,4 @@
 import {
-	ArrowLeft,
 	ChevronDown,
 	ChevronRight,
 	CircleAlert,
@@ -69,6 +68,7 @@ import {
 	TooltipContent,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useDemoSnapshot } from "@/demo/runtime";
 import { cn } from "@/lib/utils";
 
 type CollectionTab = AdminCollectionRecordItem["kind"];
@@ -81,9 +81,32 @@ type CollectionReadError = {
 };
 const PAGE_SIZE = 20;
 const ACTIVITY_CACHE_MS = 5_000;
+const collectionListCache = new Map<
+	string,
+	{ items: AdminCollectionRecordItem[]; total: number; storedAt: number }
+>();
+const collectionActivityCache = new Map<
+	string,
+	{ data: AdminCollectionActivityResponse; storedAt: number }
+>();
 const ATTEMPT_RANGE_MAX = 10;
 const ATTEMPT_UNBOUNDED_VALUE = ATTEMPT_RANGE_MAX + 1;
 const DEFAULT_ATTEMPT_RANGE: AttemptCountRange = { min: 0, max: null };
+const SESSION_RECORD_NOW = new Date();
+
+function aiRecordFiltersKey(filters: AiRecordRouteFilters | undefined) {
+	if (!filters) return "";
+	return JSON.stringify([
+		filters.kind,
+		filters.preset,
+		filters.from,
+		filters.before,
+		filters.translationStatus,
+		filters.polishStatus,
+		filters.attemptMin,
+		filters.attemptMax,
+	]);
+}
 
 function recordNow() {
 	const demoUrl =
@@ -92,7 +115,7 @@ function recordNow() {
 		new URL(window.location.href).searchParams.has("demo");
 	return __OCTO_RILL_DEMO_APP__ || demoUrl
 		? new Date("2026-07-08T10:30:00+08:00")
-		: new Date();
+		: SESSION_RECORD_NOW;
 }
 
 function initialRange() {
@@ -1073,6 +1096,13 @@ export function AiOperationsRecordsSection({
 	onCloseRecord: () => void;
 }) {
 	const compact = useCompactLayout();
+	const demoSnapshot = useDemoSnapshot();
+	const demoAdminJobsDataCase = demoSnapshot.active
+		? demoSnapshot.shareState.adminJobsDataCase
+		: "many";
+	const demoDataCacheKey = demoSnapshot.active
+		? `${demoSnapshot.shareState.networkMode}:${demoAdminJobsDataCase}`
+		: "live";
 	const initialFilters = routeFilters ?? DEFAULT_AI_RECORD_ROUTE_FILTERS;
 	const [tab, setTab] = useState<CollectionTab>(initialFilters.kind);
 	const [preset, setPreset] = useState<TimeRangePreset>(initialFilters.preset);
@@ -1104,7 +1134,6 @@ export function AiOperationsRecordsSection({
 		loading: boolean;
 		error: CollectionReadError | null;
 	} | null>(null);
-	const [listReadCycle, setListReadCycle] = useState(0);
 	const [reloadNonce, setReloadNonce] = useState(0);
 	const [activity, setActivity] =
 		useState<AdminCollectionActivityResponse | null>(null);
@@ -1120,21 +1149,28 @@ export function AiOperationsRecordsSection({
 	const [detailLoading, setDetailLoading] = useState(false);
 	const [detailError, setDetailError] = useState<string | null>(null);
 	const listRequestRef = useRef(0);
+	const hasIssuedListReadRef = useRef(false);
+	const listInitialMountRef = useRef(true);
 	const detailRequestRef = useRef(0);
 	const activityRequestRef = useRef(0);
 	const activityControllerRef = useRef<AbortController | null>(null);
-	const activityCacheRef = useRef(
-		new Map<
-			CollectionTab,
-			{ data: AdminCollectionActivityResponse; storedAt: number }
-		>(),
-	);
+	const activityCacheRef = useRef(collectionActivityCache);
 	const activityNeedsReadRef = useRef(true);
-	const listReadSettledRef = useRef(false);
+	const activityInitialMountRef = useRef(true);
 	const activityForceReadRef = useRef(false);
 	const activityTabRef = useRef(tab);
 	const handledReloadNonceRef = useRef(0);
 	const handledActivityRetryNonceRef = useRef(0);
+	const previousDemoAdminJobsDataCaseRef = useRef(demoAdminJobsDataCase);
+	useEffect(() => {
+		if (previousDemoAdminJobsDataCaseRef.current === demoAdminJobsDataCase) {
+			return;
+		}
+		previousDemoAdminJobsDataCaseRef.current = demoAdminJobsDataCase;
+		activityNeedsReadRef.current = true;
+		activityForceReadRef.current = true;
+		setReloadNonce((current) => current + 1);
+	}, [demoAdminJobsDataCase]);
 	const commitFilters = useCallback(
 		(next: Partial<AiRecordRouteFilters>) => {
 			if (!onFiltersChange) return;
@@ -1168,8 +1204,18 @@ export function AiOperationsRecordsSection({
 			translationStatuses,
 		],
 	);
+	const navigateToRecord = useCallback(
+		(kind: CollectionTab, id: string) => {
+			onOpenRecord(kind, id);
+		},
+		[onOpenRecord],
+	);
+	const routeFiltersKey = aiRecordFiltersKey(routeFilters);
+	const appliedRouteFiltersKeyRef = useRef(routeFiltersKey);
 	useEffect(() => {
 		if (!routeFilters) return;
+		if (appliedRouteFiltersKeyRef.current === routeFiltersKey) return;
+		appliedRouteFiltersKeyRef.current = routeFiltersKey;
 		setTab(routeFilters.kind);
 		setPreset(routeFilters.preset);
 		if (routeFilters.from && routeFilters.before) {
@@ -1181,7 +1227,7 @@ export function AiOperationsRecordsSection({
 			min: routeFilters.attemptMin,
 			max: routeFilters.attemptMax,
 		});
-	}, [routeFilters]);
+	}, [routeFilters, routeFiltersKey]);
 	const selectedRange = useMemo(() => {
 		if (preset === "custom") return range;
 		const end = recordNow();
@@ -1221,7 +1267,9 @@ export function AiOperationsRecordsSection({
 		tab,
 		translationStatuses,
 	]);
-	const listQueryKey = `${tab}?${listParams.toString()}`;
+	const listParamsKey = listParams.toString();
+	const listQueryKey = `${tab}?${listParamsKey}&demo_case=${demoDataCacheKey}`;
+	const activityCacheKey = `${tab}:${demoDataCacheKey}`;
 	const currentList =
 		lastSuccessfulList?.queryKey === listQueryKey ? lastSuccessfulList : null;
 	const items = currentList?.items ?? [];
@@ -1280,25 +1328,53 @@ export function AiOperationsRecordsSection({
 		if (activityTabRef.current !== tab) {
 			activityTabRef.current = tab;
 			activityNeedsReadRef.current = true;
+			activityForceReadRef.current = true;
 		}
-		const cached = activityCacheRef.current.get(tab);
+		const cached = activityCacheRef.current.get(activityCacheKey);
 		setActivity(cached?.data ?? null);
 		setActivityError(null);
-		setActivityLoading(!cached);
-	}, [tab]);
+		setActivityLoading(true);
+	}, [activityCacheKey, tab]);
 	useEffect(() => {
 		const requestId = listRequestRef.current + 1;
 		listRequestRef.current = requestId;
-		listReadSettledRef.current = false;
 		const abortController = new AbortController();
+		const cachedList = collectionListCache.get(listQueryKey);
+		const isInitialMount = listInitialMountRef.current;
+		listInitialMountRef.current = false;
+		if (
+			!isInitialMount &&
+			!hasIssuedListReadRef.current &&
+			cachedList &&
+			reloadNonce === 0 &&
+			Date.now() - cachedList.storedAt < ACTIVITY_CACHE_MS
+		) {
+			setLastSuccessfulList({
+				queryKey: listQueryKey,
+				items: cachedList.items,
+				total: cachedList.total,
+			});
+			setListReadState({ queryKey: listQueryKey, loading: false, error: null });
+			return;
+		}
+		hasIssuedListReadRef.current = true;
 		setListReadState({ queryKey: listQueryKey, loading: true, error: null });
-		void apiGetAdminCollectionRecords(tab, listParams, abortController.signal)
+		void apiGetAdminCollectionRecords(
+			tab,
+			new URLSearchParams(listParamsKey),
+			abortController.signal,
+		)
 			.then((response) => {
 				if (requestId !== listRequestRef.current) return;
 				setLastSuccessfulList({
 					queryKey: listQueryKey,
 					items: response.items,
 					total: response.total,
+				});
+				collectionListCache.set(listQueryKey, {
+					items: response.items,
+					total: response.total,
+					storedAt: Date.now(),
 				});
 			})
 			.catch((cause: unknown) => {
@@ -1341,21 +1417,24 @@ export function AiOperationsRecordsSection({
 							? { ...current, loading: false }
 							: current,
 					);
-					listReadSettledRef.current = true;
-					setListReadCycle((current) => current + 1);
 				}
 			});
 		return () => {
 			abortController.abort();
 		};
-	}, [listParams, listQueryKey, reloadNonce, tab]);
+	}, [listParamsKey, listQueryKey, reloadNonce, tab]);
 	useEffect(() => {
 		return () => activityControllerRef.current?.abort();
 	}, [activityRetryNonce, reloadNonce, tab]);
 	useEffect(() => {
-		if (!activityNeedsReadRef.current || !listReadSettledRef.current) return;
+		if (!detailRoute) activityNeedsReadRef.current = true;
+	}, [detailRoute, tab]);
+	useEffect(() => {
+		if (detailRoute || !activityNeedsReadRef.current) return;
 
-		const cached = activityCacheRef.current.get(tab);
+		const cached = activityCacheRef.current.get(activityCacheKey);
+		const isInitialMount = activityInitialMountRef.current;
+		activityInitialMountRef.current = false;
 		const reloadRequested = reloadNonce > handledReloadNonceRef.current;
 		const retryRequested =
 			activityRetryNonce > handledActivityRetryNonceRef.current;
@@ -1369,6 +1448,7 @@ export function AiOperationsRecordsSection({
 		if (
 			!forceRead &&
 			cached &&
+			!isInitialMount &&
 			Date.now() - cached.storedAt < ACTIVITY_CACHE_MS
 		) {
 			setActivity(cached.data);
@@ -1389,7 +1469,7 @@ export function AiOperationsRecordsSection({
 			.then((response) => {
 				if (requestId !== activityRequestRef.current) return;
 				const entry = { data: response, storedAt: Date.now() };
-				activityCacheRef.current.set(tab, entry);
+				activityCacheRef.current.set(activityCacheKey, entry);
 				setActivity(response);
 			})
 			.catch((cause: unknown) => {
@@ -1413,7 +1493,7 @@ export function AiOperationsRecordsSection({
 				activityControllerRef.current = null;
 				setActivityLoading(false);
 			});
-	}, [activityRetryNonce, listReadCycle, reloadNonce, tab]);
+	}, [activityCacheKey, activityRetryNonce, detailRoute, reloadNonce, tab]);
 	useEffect(() => {
 		if (!detailRoute) {
 			setDetail(null);
@@ -1500,29 +1580,6 @@ export function AiOperationsRecordsSection({
 		});
 		setPage(1);
 	};
-	if (compact && detailRoute)
-		return (
-			<section aria-label="采集记录详情" className="space-y-4">
-				<div className="flex items-center gap-2 border-b pb-3">
-					<Button
-						variant="ghost"
-						size="icon"
-						className="size-11"
-						onClick={closeOrBack}
-						aria-label="返回"
-					>
-						<ArrowLeft className="size-5" />
-					</Button>
-					<div className="min-w-0">
-						<h2 className="font-semibold text-base">{detailTitle}</h2>
-						<p className="text-muted-foreground truncate text-xs">
-							{detail?.record.title ?? "正在加载"}
-						</p>
-					</div>
-				</div>
-				{detailContent}
-			</section>
-		);
 	return (
 		<>
 			<Card>
@@ -1535,7 +1592,9 @@ export function AiOperationsRecordsSection({
 								const nextTab = value as CollectionTab;
 								activityNeedsReadRef.current = true;
 								activityForceReadRef.current = false;
-								const cached = activityCacheRef.current.get(nextTab);
+								const cached = activityCacheRef.current.get(
+									`${nextTab}:${demoDataCacheKey}`,
+								);
 								setActivity(cached?.data ?? null);
 								setActivityLoading(!cached);
 								setActivityError(null);
@@ -1603,7 +1662,7 @@ export function AiOperationsRecordsSection({
 							activityForceReadRef.current = true;
 							setActivityRetryNonce((current) => current + 1);
 						}}
-						onOpenRecord={onOpenRecord}
+						onOpenRecord={navigateToRecord}
 					/>
 					<fieldset className="flex flex-wrap items-center gap-3 rounded-lg border border-border/70 bg-muted/30 p-2 sm:p-3">
 						<legend className="sr-only">处理状态筛选</legend>
@@ -1699,13 +1758,13 @@ export function AiOperationsRecordsSection({
 								items={items}
 								tab={tab}
 								disabled={loading || Boolean(error)}
-								onOpen={(item) => onOpenRecord(item.kind, item.id)}
+								onOpen={(item) => navigateToRecord(item.kind, item.id)}
 							/>
 							<CompactRecordList
 								items={items}
 								tab={tab}
 								disabled={loading || Boolean(error)}
-								onOpen={(item) => onOpenRecord(item.kind, item.id)}
+								onOpen={(item) => navigateToRecord(item.kind, item.id)}
 							/>
 							<Paging
 								page={page}
@@ -1721,13 +1780,18 @@ export function AiOperationsRecordsSection({
 			<Sheet
 				open={Boolean(detailRoute)}
 				onOpenChange={(open) => {
-					if (!open) onCloseRecord();
+					if (!open) {
+						onCloseRecord();
+					}
 				}}
 			>
 				<SheetContent
-					side="right"
+					side={compact ? "bottom" : "right"}
 					showCloseButton={false}
-					className="w-full gap-0 overflow-y-auto p-0 sm:max-w-3xl"
+					className={cn(
+						"w-full gap-0 overflow-y-auto p-0 sm:max-w-3xl",
+						compact ? "max-h-[min(86dvh,48rem)] rounded-t-xl" : "h-full",
+					)}
 				>
 					<SheetHeader className="gap-3 border-b px-5 py-4 text-left">
 						<div className="flex items-start justify-between gap-3">

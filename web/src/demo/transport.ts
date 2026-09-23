@@ -9,6 +9,7 @@ import type { AdminUserItem } from "@/admin/UserManagement";
 import type {
 	AdminDashboardResponse,
 	AdminCollectionAttempt,
+	AdminCollectionActivityResponse,
 	AdminCollectionRecordDetail,
 	AdminCollectionRecordItem,
 	AdminCollectionTaskSummary,
@@ -67,6 +68,7 @@ const DEMO_CREATED_API_KEY_VALUE = [
 	"plaintext",
 ].join("_");
 const DEMO_READABLE_INITIAL_LOADING_DELAY_MS = 6_000;
+const DEMO_ADMIN_JOBS_LOADING_DELAY_MS = 6_000;
 
 type DemoRuntimeAccess = {
 	getSnapshot: () => DemoSnapshot;
@@ -314,6 +316,17 @@ async function applyNetworkProfile(request: Request) {
 	}
 	await delay(80);
 	return null;
+}
+
+async function applyAdminJobsDataProfile(request: Request) {
+	const snapshot = currentSnapshot();
+	const pathname = new URL(request.url).pathname;
+	if (
+		snapshot.shareState.adminJobsDataCase === "loading" &&
+		pathname.startsWith("/api/admin/jobs/ai-records/")
+	) {
+		await delay(DEMO_ADMIN_JOBS_LOADING_DELAY_MS);
+	}
 }
 
 function json(data: unknown, init?: ResponseInit) {
@@ -862,7 +875,7 @@ function paginateItems<T>(items: T[], searchParams: URLSearchParams) {
 	};
 }
 
-function demoCollectionRecords() {
+function buildDemoCollectionRecords() {
 	const completed = {
 		status: "ready",
 		display_status: "succeeded",
@@ -889,6 +902,15 @@ function demoCollectionRecords() {
 		started_at: "2026-07-08T10:02:00+08:00",
 		last_attempt_at: "2026-07-08T10:02:00+08:00",
 		finished_at: null,
+	};
+	const failed = {
+		status: "failed",
+		display_status: "failed",
+		status_origin: "task",
+		retry_count: 1,
+		started_at: "2026-07-08T07:10:00+08:00",
+		last_attempt_at: "2026-07-08T07:12:00+08:00",
+		finished_at: "2026-07-08T07:12:00+08:00",
 	};
 	const notRecorded = {
 		status: "not_recorded",
@@ -919,6 +941,94 @@ function demoCollectionRecords() {
 				title: "v2.31.0",
 				occurred_at: "2026-07-08T09:08:00+08:00",
 				detected_at: "2026-07-08T09:10:00+08:00",
+				generated_at: null,
+				translation: completed,
+				polish: recovered,
+			},
+			{
+				id: "291058020",
+				kind: "release",
+				repository: "octo-demo/release-lab",
+				title: "v2.30.9",
+				occurred_at: "2026-07-08T08:52:00+08:00",
+				detected_at: "2026-07-08T08:54:00+08:00",
+				generated_at: null,
+				translation: completed,
+				polish: pending,
+			},
+			{
+				id: "291058021",
+				kind: "release",
+				repository: "octo-demo/release-lab",
+				title: "v2.30.8",
+				occurred_at: "2026-07-08T07:36:00+08:00",
+				detected_at: "2026-07-08T07:38:00+08:00",
+				generated_at: null,
+				translation: failed,
+				polish: failed,
+			},
+			{
+				id: "291058022",
+				kind: "release",
+				repository: "octo-demo/release-lab",
+				title: "v2.30.7",
+				occurred_at: "2026-07-08T06:18:00+08:00",
+				detected_at: "2026-07-08T06:20:00+08:00",
+				generated_at: null,
+				translation: completed,
+				polish: completed,
+			},
+			{
+				id: "291058023",
+				kind: "release",
+				repository: "octo-demo/release-lab",
+				title: "v2.30.6",
+				occurred_at: "2026-07-08T05:04:00+08:00",
+				detected_at: "2026-07-08T05:06:00+08:00",
+				generated_at: null,
+				translation: completed,
+				polish: recovered,
+			},
+			{
+				id: "291058024",
+				kind: "release",
+				repository: "octo-demo/release-lab",
+				title: "v2.30.5",
+				occurred_at: "2026-07-08T03:48:00+08:00",
+				detected_at: "2026-07-08T03:50:00+08:00",
+				generated_at: null,
+				translation: completed,
+				polish: pending,
+			},
+			{
+				id: "291058025",
+				kind: "release",
+				repository: "octo-demo/release-lab",
+				title: "v2.30.4",
+				occurred_at: "2026-07-08T02:27:00+08:00",
+				detected_at: "2026-07-08T02:29:00+08:00",
+				generated_at: null,
+				translation: completed,
+				polish: completed,
+			},
+			{
+				id: "291058026",
+				kind: "release",
+				repository: "octo-demo/release-lab",
+				title: "v2.30.3",
+				occurred_at: "2026-07-08T01:15:00+08:00",
+				detected_at: "2026-07-08T01:17:00+08:00",
+				generated_at: null,
+				translation: completed,
+				polish: completed,
+			},
+			{
+				id: "291058027",
+				kind: "release",
+				repository: "octo-demo/release-lab",
+				title: "v2.30.2",
+				occurred_at: "2026-07-08T00:22:00+08:00",
+				detected_at: "2026-07-08T00:24:00+08:00",
 				generated_at: null,
 				translation: completed,
 				polish: recovered,
@@ -969,6 +1079,41 @@ function demoCollectionRecords() {
 	>;
 }
 
+function buildDenseDemoCollectionRecords(
+	records: ReturnType<typeof buildDemoCollectionRecords>,
+) {
+	const denseCount = 128;
+	const denseStart = new Date("2026-07-08T09:01:00+08:00").getTime();
+	const denseInterval = 20 * 1000;
+
+	const buildKind = <T extends AdminCollectionRecordItem["kind"]>(
+		kind: T,
+		templates: AdminCollectionRecordItem[],
+	) =>
+		Array.from({ length: denseCount }, (_, index) => {
+			const template = templates[index % templates.length];
+			const sourceTime = new Date(
+				denseStart + index * denseInterval,
+			).toISOString();
+			const isBrief = kind === "brief";
+			return {
+				...template,
+				id: `demo-dense-${kind}-${String(index + 1).padStart(3, "0")}`,
+				title: `同一小时活动样例 ${String(index + 1).padStart(3, "0")}`,
+				occurred_at: isBrief ? null : sourceTime,
+				detected_at: isBrief ? null : sourceTime,
+				generated_at: isBrief ? sourceTime : null,
+			};
+		}) satisfies AdminCollectionRecordItem[];
+
+	return {
+		release: buildKind("release", records.release),
+		announcement: buildKind("announcement", records.announcement),
+		notification: buildKind("notification", records.notification),
+		brief: buildKind("brief", records.brief),
+	};
+}
+
 function demoSummaryAttemptCount(summary: AdminCollectionTaskSummary | null) {
 	if (!summary || summary.status === "not_recorded") return 0;
 	return Math.max(1, summary.retry_count + 1);
@@ -980,6 +1125,122 @@ function demoRecordAttemptCount(item: AdminCollectionRecordItem) {
 		demoSummaryAttemptCount(item.translation),
 		demoSummaryAttemptCount(item.polish),
 	);
+}
+
+function demoCollectionActivity(
+	kind: AdminCollectionRecordItem["kind"],
+): AdminCollectionActivityResponse {
+	const bucketMinutes = 60;
+	const bucketCount = 12;
+	const bucketMs = bucketMinutes * 60 * 1000;
+	const windowEnded = new Date("2026-07-08T12:00:00+08:00");
+	const windowStarted = new Date(
+		windowEnded.getTime() - bucketCount * bucketMs,
+	);
+	const buckets: AdminCollectionActivityResponse["buckets"] = Array.from(
+		{ length: bucketCount },
+		(_, index) => {
+			const ended = new Date(windowEnded.getTime() - index * bucketMs);
+			const started = new Date(ended.getTime() - bucketMs);
+			return {
+				started_at: started.toISOString(),
+				ended_at: ended.toISOString(),
+				cells: [],
+			};
+		},
+	);
+	const summary = {
+		content_count: 0,
+		completed_count: 0,
+		processing_count: 0,
+		exception_count: 0,
+		neutral_count: 0,
+	};
+
+	for (const record of demoCollectionRecords()[kind]) {
+		const sourceTime = new Date(
+			record.kind === "brief"
+				? (record.generated_at ?? windowStarted.toISOString())
+				: (record.occurred_at ?? windowStarted.toISOString()),
+		);
+		const bucketIndex = Math.min(
+			bucketCount - 1,
+			Math.max(
+				0,
+				Math.floor((windowEnded.getTime() - sourceTime.getTime()) / bucketMs),
+			),
+		);
+		const translationStatus = record.translation?.display_status ?? null;
+		const polishStatus = record.polish?.display_status ?? "not_applicable";
+		const statuses = [translationStatus, polishStatus].filter(
+			(status): status is string => Boolean(status),
+		);
+		const compositeStatus = statuses.some((status) =>
+			["failed", "error", "exception"].includes(status),
+		)
+			? "exception"
+			: statuses.some((status) =>
+						["running", "queued", "processing"].includes(status),
+					)
+				? "processing"
+				: statuses.every((status) =>
+							["historical_unknown", "not_recorded", "legacy_cached"].includes(
+								status,
+							),
+						)
+					? "neutral"
+					: "completed";
+
+		buckets[bucketIndex].cells.push({
+			id: record.id,
+			title: record.title,
+			repository: record.repository,
+			source_time: sourceTime.toISOString(),
+			translation_status: translationStatus,
+			polish_status: polishStatus,
+			composite_status: compositeStatus,
+		});
+		summary.content_count += 1;
+		if (compositeStatus === "completed") summary.completed_count += 1;
+		else if (compositeStatus === "processing") summary.processing_count += 1;
+		else if (compositeStatus === "exception") summary.exception_count += 1;
+		else summary.neutral_count += 1;
+	}
+
+	return {
+		kind,
+		bucket_minutes: bucketMinutes,
+		bucket_count: bucketCount,
+		window_started_at: windowStarted.toISOString(),
+		window_ended_at: windowEnded.toISOString(),
+		summary,
+		buckets,
+	};
+}
+
+function demoCollectionRecords() {
+	const records = buildDemoCollectionRecords();
+	const dataCase = currentSnapshot().shareState.adminJobsDataCase;
+	if (dataCase === "empty") {
+		return {
+			release: [],
+			announcement: [],
+			notification: [],
+			brief: [],
+		};
+	}
+	if (dataCase === "loaded") {
+		return {
+			release: records.release.slice(0, 4),
+			announcement: records.announcement.slice(0, 4),
+			notification: records.notification.slice(0, 4),
+			brief: records.brief.slice(0, 4),
+		};
+	}
+	if (dataCase === "many") {
+		return buildDenseDemoCollectionRecords(records);
+	}
+	return records;
 }
 
 function demoCollectionDetail(
@@ -2831,6 +3092,7 @@ export const demoHandlers = [
 	http.get("/api/admin/jobs/ai-records/:kind", async ({ params, request }) => {
 		const network = await applyNetworkProfile(request);
 		if (network) return network;
+		await applyAdminJobsDataProfile(request);
 		const kind = String(params.kind);
 		if (
 			kind !== "release" &&
@@ -2896,10 +3158,29 @@ export const demoHandlers = [
 		return json(paginateItems(items, url.searchParams));
 	}),
 	http.get(
+		"/api/admin/jobs/ai-records/:kind/activity",
+		async ({ params, request }) => {
+			const network = await applyNetworkProfile(request);
+			if (network) return network;
+			await applyAdminJobsDataProfile(request);
+			const kind = String(params.kind) as AdminCollectionRecordItem["kind"];
+			if (
+				kind !== "release" &&
+				kind !== "announcement" &&
+				kind !== "notification" &&
+				kind !== "brief"
+			) {
+				return badRequest("invalid collection record kind");
+			}
+			return json(demoCollectionActivity(kind));
+		},
+	),
+	http.get(
 		"/api/admin/jobs/ai-records/:kind/:recordId",
 		async ({ params, request }) => {
 			const network = await applyNetworkProfile(request);
 			if (network) return network;
+			await applyAdminJobsDataProfile(request);
 			const kind = String(params.kind);
 			if (
 				kind !== "release" &&
