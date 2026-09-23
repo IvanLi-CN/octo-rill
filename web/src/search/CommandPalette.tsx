@@ -61,7 +61,6 @@ export type CommandPaletteProps = {
 	isAdmin?: boolean;
 	busy?: string | null;
 	onSyncAll?: () => void;
-	onSyncInbox?: () => void;
 	onGenerateBrief?: () => void | Promise<void>;
 	searchTransport?: (
 		query: string,
@@ -79,7 +78,6 @@ type ActionId =
 	| "settings"
 	| "admin"
 	| "sync-all"
-	| "sync-inbox"
 	| "generate-brief";
 
 type PaletteAction = {
@@ -413,7 +411,6 @@ export function CommandPalette({
 	isAdmin = false,
 	busy = null,
 	onSyncAll,
-	onSyncInbox,
 	onGenerateBrief,
 	searchTransport = apiSearch,
 	restoreFocusRef,
@@ -460,14 +457,6 @@ export function CommandPalette({
 				icon: RefreshCcw,
 			});
 		}
-		if (onSyncInbox) {
-			next.push({
-				id: "sync-inbox",
-				label: "同步 Inbox",
-				description: "只刷新 GitHub Inbox 通知",
-				icon: Inbox,
-			});
-		}
 		if (onGenerateBrief) {
 			next.push({
 				id: "generate-brief",
@@ -477,7 +466,7 @@ export function CommandPalette({
 			});
 		}
 		return next;
-	}, [isAdmin, onGenerateBrief, onSyncAll, onSyncInbox]);
+	}, [isAdmin, onGenerateBrief, onSyncAll]);
 
 	const actionMode = query.trimStart().startsWith(">");
 	const visibleActions = useMemo(() => {
@@ -495,9 +484,7 @@ export function CommandPalette({
 	const isActionDisabled = useCallback(
 		(action: PaletteAction) =>
 			Boolean(busy) &&
-			(action.id === "sync-all" ||
-				action.id === "sync-inbox" ||
-				action.id === "generate-brief"),
+			(action.id === "sync-all" || action.id === "generate-brief"),
 		[busy],
 	);
 	const entries =
@@ -685,10 +672,9 @@ export function CommandPalette({
 				return;
 			}
 			if (action.id === "sync-all") onSyncAll?.();
-			if (action.id === "sync-inbox") onSyncInbox?.();
 			close();
 		},
-		[close, isActionDisabled, onSyncAll, onSyncInbox, openTarget],
+		[close, isActionDisabled, onSyncAll, openTarget],
 	);
 
 	const confirmBrief = useCallback(async () => {

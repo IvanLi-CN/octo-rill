@@ -136,6 +136,13 @@ export function useDashboardSyncPrediction(options: {
 			confirmedRef.current = bounds.confirmed;
 		} else {
 			confirmedRef.current = Math.max(confirmedRef.current, bounds.confirmed);
+			if (lifecycle === "failed" && !isActiveLifecycle(previousLifecycle)) {
+				percentageRef.current = Math.max(
+					percentageRef.current,
+					confirmedRef.current,
+				);
+				setPercentage(percentageRef.current);
+			}
 		}
 
 		targetRef.current = resolveTarget(

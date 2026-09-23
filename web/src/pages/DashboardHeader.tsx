@@ -53,11 +53,9 @@ export type DashboardHeaderProps = {
 	aiDisabledHint?: boolean;
 	busy?: boolean;
 	syncingAll?: boolean;
-	syncingInbox?: boolean;
 	syncLifecycle?: DashboardSyncLifecycle;
 	syncProgress?: DashboardSyncProgress | null;
 	onSyncAll?: () => void;
-	onSyncInbox?: () => void;
 	onGenerateBrief?: () => void | Promise<void>;
 	logoutHref?: string;
 	mobileControlBand?: React.ReactNode;
@@ -609,7 +607,6 @@ export function DashboardHeader({
 	syncLifecycle,
 	syncProgress = null,
 	onSyncAll,
-	onSyncInbox,
 	onGenerateBrief,
 	logoutHref = "/auth/logout",
 	mobileControlBand = null,
@@ -1044,6 +1041,9 @@ export function DashboardHeader({
 								data-dashboard-sync-progress={syncPrediction.percentage.toFixed(
 									4,
 								)}
+								data-dashboard-sync-progress-ceiling={syncPrediction.ceilingPercentage.toFixed(
+									4,
+								)}
 								className={cn(
 									"relative overflow-hidden",
 									!disableHeaderMotion &&
@@ -1147,7 +1147,6 @@ export function DashboardHeader({
 				isAdmin={isAdmin}
 				busy={busy ? "busy" : null}
 				onSyncAll={onSyncAll}
-				onSyncInbox={onSyncInbox}
 				onGenerateBrief={onGenerateBrief}
 				restoreFocusRef={searchTriggerRef}
 			/>

@@ -4128,22 +4128,6 @@ export function Dashboard(props: {
 		},
 		[checkDashboardUpdates, notifyGlobalError, refreshSidebar],
 	);
-	const onSyncInbox = useCallback(() => {
-		void run(
-			"Sync inbox",
-			async () => {
-				const task = await apiPost<TaskAcceptedResponse>(
-					"/api/sync/notifications?return_mode=task_id",
-				);
-				await trackTaskStream(task, "refresh");
-			},
-			{
-				errorTitle: "Inbox 同步失败",
-				fallback: "Inbox 同步失败，请稍后重试。",
-			},
-		);
-	}, [run, trackTaskStream]);
-
 	const accessSyncRunning =
 		accessTaskStream !== null &&
 		accessSyncStage !== "completed" &&
@@ -4196,8 +4180,6 @@ export function Dashboard(props: {
 		return () => window.clearTimeout(resetTimer);
 	}, [accessSyncLifecycle]);
 	const syncingAll = busy === SYNC_ALL_LABEL || accessSyncRunning;
-	const syncingInbox = busy === "Sync inbox";
-
 	const aiDisabledHint = useMemo(() => {
 		const any = activeFeedItems.find(
 			(it) =>
@@ -4798,11 +4780,9 @@ export function Dashboard(props: {
 					aiDisabledHint={aiDisabledHint}
 					busy={Boolean(busy)}
 					syncingAll={syncingAll}
-					syncingInbox={syncingInbox}
 					syncLifecycle={accessSyncLifecycle}
 					syncProgress={accessSyncProgress}
 					onSyncAll={onSyncAll}
-					onSyncInbox={onSyncInbox}
 					onGenerateBrief={onGenerateBrief}
 					mineHref={buildDashboardScopeHref({ kind: "mine" })}
 					mineLabel={DASHBOARD_MINE_ENTRY_LABEL}
@@ -4977,14 +4957,12 @@ export function Dashboard(props: {
 											notifications={notifications}
 											loading={notificationsLoading}
 											busy={Boolean(busy)}
-											syncing={syncingInbox}
 											freshKeys={freshNotificationKeys}
 											error={
 												notificationsError?.phase === "initial"
 													? notificationsError.message
 													: null
 											}
-											onSync={tab === "inbox" ? onSyncInbox : undefined}
 											onRetry={() =>
 												void refreshNotifications({ background: false })
 											}

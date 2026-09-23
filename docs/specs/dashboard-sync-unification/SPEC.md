@@ -90,6 +90,7 @@
 
 - `DashboardHeaderProps`：收敛为单一 `onSyncAll` 入口，并增加显式全量同步渲染态 `syncingAll` 与前端内部 `syncLifecycle`；同步进度作为内部 UI props 传入，不改变后端接口契约。
 - `FeedList` / `FeedItemCard`：移除 `onSyncReleases` 透传，`sync_required` 仅保留提示文案。
+- `InboxList` / `CommandPalette`：不得提供局部 Inbox 同步 callback 或 `同步 Inbox` action；空态只引导顶部 `同步`。
 
 ## Related ADRs
 
@@ -97,7 +98,7 @@ None
 
 ## Verification
 
-- VER-SYNC-ENTRY: covers: REQ-SYNC-ENTRY; Storybook Default and Dashboard E2E assert the single top-level sync action and absence of legacy labels.
+- VER-SYNC-ENTRY: covers: REQ-SYNC-ENTRY; Storybook Default/CommandPalette actions and Dashboard E2E assert the single top-level sync action and absence of legacy labels and local Inbox sync actions.
 - VER-SYNC-DETAIL-DISCLOSURE: covers: REQ-SYNC-DETAIL-DISCLOSURE; Storybook Warmup/Syncing/SyncingMobile and Dashboard E2E assert default closed, hover/focus/click recovery, outside-click, and Escape dismissal.
 - VER-SYNC-CONFIRMED-PROGRESS: covers: REQ-SYNC-CONFIRMED-PROGRESS; tooltip progressbar and task stream fixtures assert displayed `currentStep/totalSteps` remains confirmed SSE data.
 - VER-SYNC-PREDICTION: covers: REQ-SYNC-PREDICTION; Storybook DOM probe and Dashboard E2E assert monotonic button fill, stage-boundary cap, smooth event interpolation, and no ETA text.
