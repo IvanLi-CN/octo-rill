@@ -155,6 +155,49 @@ function DashboardHeaderGallery() {
 	);
 }
 
+function DashboardSyncLifecycleGallery() {
+	const progress = {
+		currentStep: 4,
+		totalSteps: 4,
+		stageLabel: "Inbox 已同步",
+		detail: "页面内容已刷新",
+	};
+	return (
+		<div className="grid gap-4 bg-background p-6" data-visual-evidence-surface>
+			<div data-visual-evidence-target className="grid gap-3">
+				<DashboardHeader
+					avatarUrl={STORYBOOK_AVATAR}
+					isAdmin={false}
+					login="storybook-running"
+					name="Running"
+					syncLifecycle="refreshing"
+					syncingAll
+					syncProgress={progress}
+					onSyncAll={() => {}}
+				/>
+				<DashboardHeader
+					avatarUrl={STORYBOOK_AVATAR}
+					isAdmin={false}
+					login="storybook-succeeded"
+					name="Succeeded"
+					syncLifecycle="succeeded"
+					syncProgress={progress}
+					onSyncAll={() => {}}
+				/>
+				<DashboardHeader
+					avatarUrl={STORYBOOK_AVATAR}
+					isAdmin={false}
+					login="storybook-failed"
+					name="Failed"
+					syncLifecycle="failed"
+					syncProgress={{ ...progress, currentStep: 2 }}
+					onSyncAll={() => {}}
+				/>
+			</div>
+		</div>
+	);
+}
+
 function DashboardHeaderMobileShellPreview(
 	args: React.ComponentProps<typeof DashboardHeader>,
 ) {
@@ -179,19 +222,23 @@ function DashboardHeaderMobileShellPreview(
 	return (
 		<AppShell
 			header={
-				<DashboardHeader
-					{...args}
-					mobileControlBand={
-						<DashboardMobileControlBand
-							tab={tab}
-							onSelectTab={setTab}
-							showPageLaneSelector={showPageLaneSelector}
-							pageLane={lane}
-							onSelectPageLane={setLane}
-							layout="stacked"
+				<div className="bg-background px-4 py-4" data-visual-evidence-surface>
+					<div data-visual-evidence-target>
+						<DashboardHeader
+							{...args}
+							mobileControlBand={
+								<DashboardMobileControlBand
+									tab={tab}
+									onSelectTab={setTab}
+									showPageLaneSelector={showPageLaneSelector}
+									pageLane={lane}
+									onSelectPageLane={setLane}
+									layout="stacked"
+								/>
+							}
 						/>
-					}
-				/>
+					</div>
+				</div>
 			}
 			footer={<AppMetaFooter />}
 			mobileChrome
@@ -261,6 +308,7 @@ const meta = {
 		aiDisabledHint: false,
 		busy: false,
 		syncingAll: false,
+		syncLifecycle: "idle",
 		syncProgress: null,
 		onSyncAll: () => {},
 		logoutHref: "#",
@@ -378,6 +426,7 @@ export const Warmup: Story = {
 	args: {
 		busy: true,
 		syncingAll: true,
+		syncLifecycle: "running",
 		syncProgress: {
 			currentStep: 0,
 			totalSteps: 4,
@@ -390,6 +439,10 @@ export const Warmup: Story = {
 		const body = within(canvasElement.ownerDocument.body);
 		const syncButton = canvas.getByRole("button", { name: "同步" });
 		await expect(syncButton).toBeEnabled();
+		await expect(
+			body.queryByText("正在后台同步你的 GitHub 数据"),
+		).not.toBeInTheDocument();
+		await userEvent.hover(syncButton);
 		await expect(body.getAllByText("后台任务已启动")[0]).toBeInTheDocument();
 		await expect(body.getAllByText("0/4")[0]).toBeInTheDocument();
 		await expect(
@@ -410,6 +463,7 @@ export const Syncing: Story = {
 	args: {
 		busy: true,
 		syncingAll: true,
+		syncLifecycle: "running",
 		syncProgress: {
 			currentStep: 2,
 			totalSteps: 4,
@@ -417,12 +471,35 @@ export const Syncing: Story = {
 			detail: "写入 42 条 Release · 覆盖 18 个仓库",
 		},
 	},
+	render: (args) => (
+		<div className="min-h-40 bg-background p-6" data-visual-evidence-surface>
+			<div data-visual-evidence-target>
+				<DashboardHeader {...args} />
+			</div>
+		</div>
+	),
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		const syncButton = canvas.getByRole("button", { name: "同步" });
 		await expect(syncButton).toBeEnabled();
 		const icon = syncButton.querySelector("svg");
-		expect(icon?.classList.contains("animate-spin")).toBe(true);
+		expect(icon?.classList.contains("motion-safe:animate-spin")).toBe(true);
+		await expect(
+			within(canvasElement.ownerDocument.body).queryByText(
+				"正在后台同步你的 GitHub 数据",
+			),
+		).not.toBeInTheDocument();
+		await userEvent.hover(syncButton);
+		const initialPrediction = Number(
+			syncButton.getAttribute("data-dashboard-sync-progress"),
+		);
+		await waitFor(() => {
+			const nextPrediction = Number(
+				syncButton.getAttribute("data-dashboard-sync-progress"),
+			);
+			expect(nextPrediction).toBeGreaterThan(initialPrediction);
+			expect(nextPrediction).toBeLessThanOrEqual(74.5);
+		});
 		const tooltipTitles = await screen.findAllByText(
 			"正在后台同步你的 GitHub 数据",
 		);
@@ -488,6 +565,7 @@ export const SyncingMobile: Story = {
 	args: {
 		busy: true,
 		syncingAll: true,
+		syncLifecycle: "running",
 		syncProgress: {
 			currentStep: 2,
 			totalSteps: 4,
@@ -506,19 +584,11 @@ export const SyncingMobile: Story = {
 		const syncButton = canvas.getByRole("button", { name: "同步" });
 		await expect(syncButton).toBeEnabled();
 		await expect(
-			within(canvasElement.ownerDocument.body).getAllByText(
+			within(canvasElement.ownerDocument.body).queryByText(
 				"正在后台同步你的 GitHub 数据",
-			)[0],
-		).toBeInTheDocument();
+			),
+		).not.toBeInTheDocument();
 
-		await userEvent.click(canvasElement);
-		await waitFor(() => {
-			expect(
-				canvasElement.ownerDocument.body.querySelector(
-					"[data-dashboard-sync-tooltip-content]",
-				),
-			).toBeNull();
-		});
 		await userEvent.click(syncButton);
 		await expect(
 			within(canvasElement.ownerDocument.body).getAllByText(
@@ -546,6 +616,39 @@ export const StateGallery: Story = {
 					"把默认、AI 未配置与紧凑宽度三种状态放进同一审阅面，便于确认品牌位独立、右侧账号入口收敛，以及窄宽度下同步/头像的排列。",
 			},
 		},
+	},
+};
+
+export const LifecycleStates: Story = {
+	name: "Regression / Lifecycle terminal states",
+	render: () => <DashboardSyncLifecycleGallery />,
+	play: async ({ canvasElement }) => {
+		const buttons = Array.from(
+			canvasElement.querySelectorAll<HTMLElement>(
+				"[data-dashboard-sync-progress]",
+			),
+		);
+		expect(buttons).toHaveLength(3);
+		const [refreshing, succeeded, failed] = buttons;
+		if (!refreshing || !succeeded || !failed) {
+			throw new Error("Expected all sync lifecycle states");
+		}
+		await expect(refreshing).toHaveAttribute(
+			"data-dashboard-sync-progress-ceiling",
+			"0.9850",
+		);
+		await waitFor(
+			() =>
+				expect(
+					Number(succeeded.getAttribute("data-dashboard-sync-progress")),
+				).toBeGreaterThanOrEqual(0.99),
+			{ timeout: 3000 },
+		);
+		await waitFor(() =>
+			expect(failed.getAttribute("data-dashboard-sync-progress")).toBe(
+				"0.5000",
+			),
+		);
 	},
 };
 

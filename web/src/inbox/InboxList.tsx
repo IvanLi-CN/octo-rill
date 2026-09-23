@@ -1,4 +1,4 @@
-import { ArrowUpRight, Inbox, RefreshCcw } from "lucide-react";
+import { ArrowUpRight, Inbox } from "lucide-react";
 
 import {
 	ListBlockingErrorState,
@@ -25,25 +25,20 @@ export function InboxList(props: {
 	notifications: NotificationItem[];
 	loading?: boolean;
 	busy?: boolean;
-	syncing?: boolean;
 	error?: string | null;
 	freshKeys?: Set<string>;
-	onSync?: () => void;
 	onRetry?: () => void;
 }) {
 	const {
 		notifications,
 		loading = false,
 		busy = false,
-		syncing = false,
 		error = null,
 		freshKeys = new Set<string>(),
-		onSync,
 		onRetry,
 	} = props;
-	const showSync = Boolean(onSync);
 	const listSurface = useListSurfaceState({
-		loading: loading || syncing,
+		loading,
 		hasData: notifications.length > 0,
 		hasError: error !== null,
 	});
@@ -62,20 +57,6 @@ export function InboxList(props: {
 						</CardDescription>
 					</div>
 					<div className="flex items-center gap-2">
-						{showSync ? (
-							<Button
-								variant="outline"
-								size="sm"
-								className="h-8 w-8 px-0 font-mono text-xs sm:w-auto sm:px-3"
-								disabled={busy}
-								onClick={onSync}
-							>
-								<RefreshCcw
-									className={syncing ? "size-4 animate-spin" : "size-4"}
-								/>
-								<span className="sr-only sm:not-sr-only">Sync inbox</span>
-							</Button>
-						) : null}
 						<Button
 							asChild
 							variant="outline"
@@ -141,17 +122,10 @@ export function InboxList(props: {
 						<ListEmptyState
 							title="暂无通知"
 							description={
-								showSync ? (
-									<>
-										可以点击 <span className="font-mono">Sync inbox</span>{" "}
-										拉取最新数据。
-									</>
-								) : (
-									<>
-										请点击顶部的 <span className="font-mono">同步</span>{" "}
-										拉取最新数据。
-									</>
-								)
+								<>
+									请点击顶部的 <span className="font-mono">同步</span>{" "}
+									拉取最新数据。
+								</>
 							}
 						/>
 					) : (
