@@ -2722,7 +2722,7 @@ test("dashboard keeps access sync details closed until interaction", async ({
 			releaseDelayMs: 1800,
 			staleStarDelayMs: 2200,
 			errorDelayMs: 1200,
-			completeDelayMs: 4300,
+			completeDelayMs: 9000,
 		},
 	);
 
