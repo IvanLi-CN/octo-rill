@@ -32,6 +32,10 @@ import { useAppShellChrome } from "@/layout/AppShell";
 import { InternalLink } from "@/lib/internalNavigation";
 import { cn } from "@/lib/utils";
 import { CommandPalette } from "@/search/CommandPalette";
+import {
+	type DashboardSyncLifecycle,
+	useDashboardSyncPrediction,
+} from "@/pages/dashboardSyncProgress";
 
 export type DashboardSyncProgress = {
 	currentStep: number;
@@ -50,6 +54,7 @@ export type DashboardHeaderProps = {
 	busy?: boolean;
 	syncingAll?: boolean;
 	syncingInbox?: boolean;
+	syncLifecycle?: DashboardSyncLifecycle;
 	syncProgress?: DashboardSyncProgress | null;
 	onSyncAll?: () => void;
 	onSyncInbox?: () => void;
@@ -113,7 +118,14 @@ function DashboardSyncTooltipContent(props: {
 						{currentStep}/{totalSteps}
 					</span>
 				</div>
-				<div className="h-1.5 overflow-hidden rounded-full bg-background/20">
+				<div
+					className="h-1.5 overflow-hidden rounded-full bg-background/20"
+					role="progressbar"
+					aria-label="已确认的同步阶段进度"
+					aria-valuemin={0}
+					aria-valuemax={totalSteps}
+					aria-valuenow={Math.max(0, Math.min(totalSteps, currentStep))}
+				>
 					<div
 						className="h-full rounded-full bg-background"
 						style={{ width: `${progressValue}%` }}
@@ -594,6 +606,7 @@ export function DashboardHeader({
 	aiDisabledHint = false,
 	busy = false,
 	syncingAll = false,
+	syncLifecycle,
 	syncProgress = null,
 	onSyncAll,
 	onSyncInbox,
@@ -634,6 +647,12 @@ export function DashboardHeader({
 	const actionScale = mix(1, 0.9, mobileHeaderProgress);
 	const hideSubtitle = mobileChromeEnabled && isMobileViewport;
 	const useSingleLineHeader = hideSubtitle;
+	const effectiveSyncLifecycle =
+		syncLifecycle ?? (syncingAll ? "running" : "idle");
+	const syncPrediction = useDashboardSyncPrediction({
+		progress: syncProgress,
+		lifecycle: effectiveSyncLifecycle,
+	});
 	const shouldRenderMobileControlBand = Boolean(
 		mobileControlBand && mobileChromeEnabled && isMobileViewport,
 	);
@@ -643,7 +662,7 @@ export function DashboardHeader({
 	const initialPaletteKeyRef = useRef<string | null>(null);
 	const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
 	const [headerSearchQuery, setHeaderSearchQuery] = useState("");
-	const [syncTooltipDismissed, setSyncTooltipDismissed] = useState(false);
+	const [syncTooltipDismissed, setSyncTooltipDismissed] = useState(true);
 	const showSyncTooltip = syncingAll && !syncTooltipDismissed;
 	const demoPalettePreset = demoSnapshot.active
 		? (() => {
@@ -741,7 +760,7 @@ export function DashboardHeader({
 
 	useEffect(() => {
 		if (!syncingAll) {
-			setSyncTooltipDismissed(false);
+			setSyncTooltipDismissed(true);
 		}
 	}, [syncingAll]);
 
@@ -776,9 +795,9 @@ export function DashboardHeader({
 	}, [showSyncTooltip]);
 
 	const handleSyncClick = useCallback(() => {
-		setSyncTooltipDismissed(false);
+		setSyncTooltipDismissed(!syncingAll);
 		onSyncAll?.();
-	}, [onSyncAll]);
+	}, [onSyncAll, syncingAll]);
 	const revealSyncTooltip = useCallback(() => {
 		if (syncingAll) {
 			setSyncTooltipDismissed(false);
@@ -1019,7 +1038,14 @@ export function DashboardHeader({
 								onFocus={revealSyncTooltip}
 								size={hideSubtitle ? "sm" : "default"}
 								data-app-shell-gesture-guard
+								aria-busy={
+									syncingAll || effectiveSyncLifecycle === "refreshing"
+								}
+								data-dashboard-sync-progress={syncPrediction.percentage.toFixed(
+									4,
+								)}
 								className={cn(
+									"relative overflow-hidden",
 									!disableHeaderMotion &&
 										"motion-safe:transition-[height,padding,border-radius,transform] motion-safe:duration-200 motion-safe:ease-out",
 									disableHeaderMotion && "transition-none",
@@ -1035,10 +1061,25 @@ export function DashboardHeader({
 										: undefined
 								}
 							>
-								<RefreshCcw
-									className={syncingAll ? "size-4 animate-spin" : "size-4"}
-								/>
-								同步
+								<span
+									aria-hidden="true"
+									className="pointer-events-none absolute inset-y-0 left-0 overflow-hidden rounded-[inherit] bg-primary-foreground/25"
+									data-dashboard-sync-progress-fill
+									style={{ width: `${syncPrediction.percentage * 100}%` }}
+								>
+									<span className="dashboard-sync-progress-sheen" />
+								</span>
+								<span className="relative z-10 inline-flex items-center gap-2">
+									<RefreshCcw
+										className={cn(
+											"size-4",
+											syncingAll &&
+												!syncPrediction.complete &&
+												"motion-safe:animate-spin",
+										)}
+									/>
+									同步
+								</span>
 							</Button>
 						</TooltipTrigger>
 						{showSyncTooltip ? (

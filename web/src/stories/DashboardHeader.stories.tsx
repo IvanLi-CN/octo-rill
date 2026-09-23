@@ -179,19 +179,23 @@ function DashboardHeaderMobileShellPreview(
 	return (
 		<AppShell
 			header={
-				<DashboardHeader
-					{...args}
-					mobileControlBand={
-						<DashboardMobileControlBand
-							tab={tab}
-							onSelectTab={setTab}
-							showPageLaneSelector={showPageLaneSelector}
-							pageLane={lane}
-							onSelectPageLane={setLane}
-							layout="stacked"
+				<div className="bg-background px-4 py-4" data-visual-evidence-surface>
+					<div data-visual-evidence-target>
+						<DashboardHeader
+							{...args}
+							mobileControlBand={
+								<DashboardMobileControlBand
+									tab={tab}
+									onSelectTab={setTab}
+									showPageLaneSelector={showPageLaneSelector}
+									pageLane={lane}
+									onSelectPageLane={setLane}
+									layout="stacked"
+								/>
+							}
 						/>
-					}
-				/>
+					</div>
+				</div>
 			}
 			footer={<AppMetaFooter />}
 			mobileChrome
@@ -261,6 +265,7 @@ const meta = {
 		aiDisabledHint: false,
 		busy: false,
 		syncingAll: false,
+		syncLifecycle: "idle",
 		syncProgress: null,
 		onSyncAll: () => {},
 		logoutHref: "#",
@@ -378,6 +383,7 @@ export const Warmup: Story = {
 	args: {
 		busy: true,
 		syncingAll: true,
+		syncLifecycle: "running",
 		syncProgress: {
 			currentStep: 0,
 			totalSteps: 4,
@@ -390,6 +396,10 @@ export const Warmup: Story = {
 		const body = within(canvasElement.ownerDocument.body);
 		const syncButton = canvas.getByRole("button", { name: "同步" });
 		await expect(syncButton).toBeEnabled();
+		await expect(
+			body.queryByText("正在后台同步你的 GitHub 数据"),
+		).not.toBeInTheDocument();
+		await userEvent.hover(syncButton);
 		await expect(body.getAllByText("后台任务已启动")[0]).toBeInTheDocument();
 		await expect(body.getAllByText("0/4")[0]).toBeInTheDocument();
 		await expect(
@@ -410,6 +420,7 @@ export const Syncing: Story = {
 	args: {
 		busy: true,
 		syncingAll: true,
+		syncLifecycle: "running",
 		syncProgress: {
 			currentStep: 2,
 			totalSteps: 4,
@@ -417,12 +428,35 @@ export const Syncing: Story = {
 			detail: "写入 42 条 Release · 覆盖 18 个仓库",
 		},
 	},
+	render: (args) => (
+		<div className="min-h-40 bg-background p-6" data-visual-evidence-surface>
+			<div data-visual-evidence-target>
+				<DashboardHeader {...args} />
+			</div>
+		</div>
+	),
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		const syncButton = canvas.getByRole("button", { name: "同步" });
 		await expect(syncButton).toBeEnabled();
 		const icon = syncButton.querySelector("svg");
-		expect(icon?.classList.contains("animate-spin")).toBe(true);
+		expect(icon?.classList.contains("motion-safe:animate-spin")).toBe(true);
+		await expect(
+			within(canvasElement.ownerDocument.body).queryByText(
+				"正在后台同步你的 GitHub 数据",
+			),
+		).not.toBeInTheDocument();
+		await userEvent.hover(syncButton);
+		const initialPrediction = Number(
+			syncButton.getAttribute("data-dashboard-sync-progress"),
+		);
+		await waitFor(() => {
+			const nextPrediction = Number(
+				syncButton.getAttribute("data-dashboard-sync-progress"),
+			);
+			expect(nextPrediction).toBeGreaterThan(initialPrediction);
+			expect(nextPrediction).toBeLessThanOrEqual(74.5);
+		});
 		const tooltipTitles = await screen.findAllByText(
 			"正在后台同步你的 GitHub 数据",
 		);
@@ -488,6 +522,7 @@ export const SyncingMobile: Story = {
 	args: {
 		busy: true,
 		syncingAll: true,
+		syncLifecycle: "running",
 		syncProgress: {
 			currentStep: 2,
 			totalSteps: 4,
@@ -506,19 +541,11 @@ export const SyncingMobile: Story = {
 		const syncButton = canvas.getByRole("button", { name: "同步" });
 		await expect(syncButton).toBeEnabled();
 		await expect(
-			within(canvasElement.ownerDocument.body).getAllByText(
+			within(canvasElement.ownerDocument.body).queryByText(
 				"正在后台同步你的 GitHub 数据",
-			)[0],
-		).toBeInTheDocument();
+			),
+		).not.toBeInTheDocument();
 
-		await userEvent.click(canvasElement);
-		await waitFor(() => {
-			expect(
-				canvasElement.ownerDocument.body.querySelector(
-					"[data-dashboard-sync-tooltip-content]",
-				),
-			).toBeNull();
-		});
 		await userEvent.click(syncButton);
 		await expect(
 			within(canvasElement.ownerDocument.body).getAllByText(

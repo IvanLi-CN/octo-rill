@@ -2024,7 +2024,9 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 
 		await page.goto("/");
 
-		await page.getByRole("button", { name: "同步" }).hover();
+		const syncButton = page.getByRole("button", { name: "同步" });
+		await syncButton.hover();
+		await syncButton.focus();
 		const tooltip = page.locator('[data-slot="tooltip-content"]').first();
 		await expect(tooltip).toBeVisible();
 		await expect(tooltip).toContainText("后台任务已启动");
@@ -2583,7 +2585,7 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 	expect(updatesCalls).toBeGreaterThanOrEqual(2);
 });
 
-test("dashboard opens access sync warmup bubble immediately after clicking sync", async ({
+test("dashboard keeps access sync details closed until interaction", async ({
 	page,
 }) => {
 	let feedCalls = 0;
@@ -2774,11 +2776,22 @@ test("dashboard opens access sync warmup bubble immediately after clicking sync"
 	await syncButton.click();
 
 	const tooltip = page.locator('[data-slot="tooltip-content"]').first();
+	await expect(page.locator('[data-slot="tooltip-content"]')).toHaveCount(0);
+	await syncButton.hover();
 	await expect(tooltip).toBeVisible();
 	await page.waitForTimeout(500);
 	await expect(tooltip).toContainText("后台任务已启动");
 	await expect(tooltip).toContainText("0/4");
 	await expect(tooltip).toContainText("正在准备 Star 阶段");
+	const progressBefore = Number(
+		await syncButton.getAttribute("data-dashboard-sync-progress"),
+	);
+	await page.waitForTimeout(400);
+	const progressAfter = Number(
+		await syncButton.getAttribute("data-dashboard-sync-progress"),
+	);
+	expect(progressAfter).toBeGreaterThanOrEqual(progressBefore);
+	expect(progressAfter).toBeLessThan(25);
 
 	await page.locator("body").click({ position: { x: 20, y: 320 } });
 	await expect(page.locator('[data-slot="tooltip-content"]')).toHaveCount(0);
