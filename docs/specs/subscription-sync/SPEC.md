@@ -125,6 +125,7 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
 - 点击任一用时项打开对应的订阅同步详情页面，页面展示该任务详情、阶段摘要和最近事件。
 - `GET /api/admin/jobs/sync/runtime-config` / `PATCH /api/admin/jobs/sync/runtime-config` 负责读取和保存该全局设置。
 - 每次 PATCH 对所有已提供的运行时设置执行一次 foreground `BEGIN IMMEDIATE` SQLite 写事务；成功时原子提交，失败时不得部分应用，省略字段保持原值。
+- 成功响应中的设置字段来自该事务内捕获的同一提交快照，必须包含本次 PATCH 的值及对应 `sync_auto_fetch_effective_at`，不得混入并发 PATCH 的后续值。
 - 若 SQLite `BUSY/LOCKED` 在 writer coordinator 的重试后仍未解除，PATCH 返回 HTTP `503`、错误码 `database_busy` 和 `Retry-After: 1`，客户端可安全重试。
 - 同一接口同时返回和保存 `repo_release_worker_concurrency`，合法范围为 `1-32`，默认 `8`。
 - `repo_release_worker_concurrency` 保存后当前进程热生效；缩容不取消已领取的 work item，新增 worker 会在后续轮询中参与 claim。
@@ -253,7 +254,7 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
 
 ## Requirements
 
-- REQ-SUBSYNC-RUNTIME-CONFIG-ATOMIC: A PATCH to `/api/admin/jobs/sync/runtime-config` MUST persist all submitted settings atomically through the foreground SQLite writer coordinator; exhausted `BUSY/LOCKED` contention MUST leave settings unchanged and return HTTP `503` with `database_busy` and `Retry-After: 1`.
+- REQ-SUBSYNC-RUNTIME-CONFIG-ATOMIC: A PATCH to `/api/admin/jobs/sync/runtime-config` MUST persist all submitted settings atomically through the foreground SQLite writer coordinator and return its committed settings snapshot; exhausted `BUSY/LOCKED` contention MUST leave settings unchanged and return HTTP `503` with `database_busy` and `Retry-After: 1`.
 
 ## 验收标准（Acceptance Criteria）
 
@@ -268,6 +269,10 @@ This topic owns the global subscription-sync runtime configuration and Admin Job
 - Given 管理员一次提交多个订阅同步运行时设置
   When 同一 SQLite 数据库仍被其它 writer 占用，或后续字段写入失败
   Then 接口在锁重试耗尽时返回 HTTP `503`、`database_busy` 与 `Retry-After: 1`，且整批设置不发生部分提交。
+
+- Given 管理员并发提交运行时设置 PATCH
+  When 一个 PATCH 已提交而另一个 PATCH 随后提交
+  Then 每个成功响应中的设置字段都与各自提交的事务快照一致，且 `sync_auto_fetch_effective_at` 与对应间隔来自同一快照。
 
 - Given 当前存在活动治理 cycle
   When 管理员保存新的同步间隔或预算
@@ -582,4 +587,4 @@ evidence_note=验证 Release 抓取并发与系统预算可清空并保留非法
 
 ## Verification
 
-- VER-SUBSYNC-RUNTIME-CONFIG-ATOMIC: Regression tests cover writer-lock exhaustion, the retryable HTTP response, full rollback after a later field write fails, and successful save compatibility; covers: REQ-SUBSYNC-RUNTIME-CONFIG-ATOMIC.
+- VER-SUBSYNC-RUNTIME-CONFIG-ATOMIC: Regression tests cover writer-lock exhaustion, the exact retryable HTTP response, full rollback after a later field write fails, successful save compatibility, and response settings captured from one committed transaction snapshot; covers: REQ-SUBSYNC-RUNTIME-CONFIG-ATOMIC.

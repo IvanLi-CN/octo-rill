@@ -7,7 +7,7 @@
 
 ## 历史摘要
 
-- 2026-09-23: Admin Jobs 订阅同步运行时配置 PATCH 改为经 SQLite foreground writer coordinator 在单一事务中原子保存；`BUSY/LOCKED` 重试耗尽时返回带 `Retry-After: 1` 的 `503 database_busy`，并覆盖写锁竞争、后续写失败回滚及成功回填回归测试。
+- 2026-09-23: Admin Jobs 订阅同步运行时配置 PATCH 改为经 SQLite foreground writer coordinator 在单一事务中原子保存，并从同一事务快照返回设置值；`BUSY/LOCKED` 重试耗尽时返回带 `Retry-After: 1` 的 `503 database_busy`，并覆盖写锁竞争、后续写失败回滚及成功回填回归测试。
 - 2026-09-07: 订阅同步间隔成为 Release 治理窗口的唯一长度；保存后按 UTC 对齐边界生效，活动周期冻结实际 `N+B`，任务间隔弹窗改为只读摘要，管理员重试限定为原任务失败或未完成 watcher 范围。
 
 - 2026-06-29: 原本写在本 spec non-goals/out-of-scope 中的“**不新增专门的 repo release 管理后台页面**”已被 [#rap6f](../repo-refresh-governance/SPEC.md) 显式 supersede；仓库治理页、budget 调度与全量闭环状态改由新 topic spec 负责。

@@ -1166,7 +1166,7 @@ struct DailyBriefProfileRow {
 
 async fn load_recent_sync_auto_fetch_tasks(
     state: &AppState,
-) -> Result<Vec<SyncAutoFetchTaskItem>, ApiError> {
+) -> anyhow::Result<Vec<SyncAutoFetchTaskItem>> {
     sqlx::query_as::<_, SyncAutoFetchTaskItem>(
         r#"
         WITH recent_roots AS (
@@ -1234,7 +1234,7 @@ async fn load_recent_sync_auto_fetch_tasks(
     .bind(jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
     .fetch_all(&state.pool)
     .await
-    .map_err(ApiError::internal)
+    .map_err(anyhow::Error::from)
 }
 
 async fn load_daily_brief_profile(
@@ -1846,59 +1846,29 @@ fn validate_admin_repo_urgency_range(
 }
 
 async fn load_sync_runtime_config(state: &AppState) -> Result<SyncRuntimeConfigResponse, ApiError> {
-    let interval = admin_runtime::load_sync_auto_fetch_interval_minutes(&state.pool)
+    let settings = admin_runtime::load_sync_runtime_config_settings(&state.pool, &state.config)
         .await
-        .map_err(ApiError::internal)?;
-    let sync_auto_fetch_effective_at =
-        admin_runtime::load_sync_auto_fetch_effective_at(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-    let star_sync_delta_interval_minutes =
-        admin_runtime::load_star_sync_delta_interval_minutes(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-    let star_sync_full_sweep_interval_minutes =
-        admin_runtime::load_star_sync_full_sweep_interval_minutes(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
+        .map_err(sync_runtime_config_database_error)?;
     let star_sync = sync::load_star_sync_runtime_status(state)
         .await
-        .map_err(ApiError::internal)?;
-    let repo_release_worker_concurrency =
-        admin_runtime::load_repo_release_worker_concurrency(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-    let retry_recent_failures_interval_minutes =
-        admin_runtime::load_retry_recent_failures_interval_minutes(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-    let repo_refresh_system_budget_per_window =
-        admin_runtime::load_repo_refresh_system_budget_per_window(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-    let dashboard_release_freshness_profile =
-        admin_runtime::load_dashboard_release_freshness_profile(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-    let daily_brief_schedule_local_time =
-        admin_runtime::load_daily_brief_schedule_local_time(&state.pool, &state.config)
-            .await
-            .map_err(ApiError::internal)?;
+        .map_err(sync_runtime_config_database_error)?;
 
     Ok(SyncRuntimeConfigResponse {
-        sync_auto_fetch_interval_minutes: interval,
-        sync_auto_fetch_effective_at,
-        star_sync_delta_interval_minutes,
-        star_sync_full_sweep_interval_minutes,
+        sync_auto_fetch_interval_minutes: settings.sync_auto_fetch_interval_minutes,
+        sync_auto_fetch_effective_at: settings.sync_auto_fetch_effective_at,
+        star_sync_delta_interval_minutes: settings.star_sync_delta_interval_minutes,
+        star_sync_full_sweep_interval_minutes: settings.star_sync_full_sweep_interval_minutes,
         star_sync,
-        retry_recent_failures_interval_minutes,
-        repo_release_worker_concurrency,
-        repo_refresh_system_budget_per_window,
-        dashboard_release_freshness_profile,
+        retry_recent_failures_interval_minutes: settings.retry_recent_failures_interval_minutes,
+        repo_release_worker_concurrency: settings.repo_release_worker_concurrency,
+        repo_refresh_system_budget_per_window: settings.repo_refresh_system_budget_per_window,
+        dashboard_release_freshness_profile: settings.dashboard_release_freshness_profile,
         daily_brief_schedule_local_time: briefs::format_daily_brief_local_time(
-            daily_brief_schedule_local_time,
+            settings.daily_brief_schedule_local_time,
         ),
-        recent_sync_tasks: load_recent_sync_auto_fetch_tasks(state).await?,
+        recent_sync_tasks: load_recent_sync_auto_fetch_tasks(state)
+            .await
+            .map_err(sync_runtime_config_database_error)?,
     })
 }
 
@@ -1959,7 +1929,7 @@ async fn validate_daily_brief_schedule_against_enabled_slots(
     )))
 }
 
-fn sync_runtime_config_write_error(error: anyhow::Error) -> ApiError {
+fn sync_runtime_config_database_error(error: anyhow::Error) -> ApiError {
     if crate::sqlite_write::is_sqlite_busy_error(error.as_ref()) {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2047,6 +2017,7 @@ async fn persist_sync_runtime_config(
         return load_sync_runtime_config(state).await;
     }
 
+    let mut response = load_sync_runtime_config(state).await?;
     let (writer, mut tx) = state
         .sqlite_writer
         .begin_immediate_with_priority(
@@ -2055,7 +2026,7 @@ async fn persist_sync_runtime_config(
             crate::sqlite_write::SqliteWritePriority::Foreground,
         )
         .await
-        .map_err(sync_runtime_config_write_error)?;
+        .map_err(sync_runtime_config_database_error)?;
 
     if let Some(interval) = req.sync_auto_fetch_interval_minutes {
         admin_runtime::persist_sync_runtime_setting(
@@ -2063,7 +2034,7 @@ async fn persist_sync_runtime_config(
             admin_runtime::SyncRuntimeSettingUpdate::SyncAutoFetchIntervalMinutes(interval),
         )
         .await
-        .map_err(sync_runtime_config_write_error)?;
+        .map_err(sync_runtime_config_database_error)?;
     }
     if let Some(interval) = req.star_sync_delta_interval_minutes {
         admin_runtime::persist_sync_runtime_setting(
@@ -2071,7 +2042,7 @@ async fn persist_sync_runtime_config(
             admin_runtime::SyncRuntimeSettingUpdate::StarSyncDeltaIntervalMinutes(interval),
         )
         .await
-        .map_err(sync_runtime_config_write_error)?;
+        .map_err(sync_runtime_config_database_error)?;
     }
     if let Some(interval) = req.star_sync_full_sweep_interval_minutes {
         admin_runtime::persist_sync_runtime_setting(
@@ -2079,7 +2050,7 @@ async fn persist_sync_runtime_config(
             admin_runtime::SyncRuntimeSettingUpdate::StarSyncFullSweepIntervalMinutes(interval),
         )
         .await
-        .map_err(sync_runtime_config_write_error)?;
+        .map_err(sync_runtime_config_database_error)?;
     }
     if let Some(interval) = req.retry_recent_failures_interval_minutes {
         admin_runtime::persist_sync_runtime_setting(
@@ -2087,7 +2058,7 @@ async fn persist_sync_runtime_config(
             admin_runtime::SyncRuntimeSettingUpdate::RetryRecentFailuresIntervalMinutes(interval),
         )
         .await
-        .map_err(sync_runtime_config_write_error)?;
+        .map_err(sync_runtime_config_database_error)?;
     }
     if let Some(concurrency) = req.repo_release_worker_concurrency {
         admin_runtime::persist_sync_runtime_setting(
@@ -2095,7 +2066,7 @@ async fn persist_sync_runtime_config(
             admin_runtime::SyncRuntimeSettingUpdate::RepoReleaseWorkerConcurrency(concurrency),
         )
         .await
-        .map_err(sync_runtime_config_write_error)?;
+        .map_err(sync_runtime_config_database_error)?;
     }
     if let Some(budget) = req.repo_refresh_system_budget_per_window {
         admin_runtime::persist_sync_runtime_setting(
@@ -2103,7 +2074,7 @@ async fn persist_sync_runtime_config(
             admin_runtime::SyncRuntimeSettingUpdate::RepoRefreshSystemBudgetPerWindow(budget),
         )
         .await
-        .map_err(sync_runtime_config_write_error)?;
+        .map_err(sync_runtime_config_database_error)?;
     }
     if let Some(profile) = req.dashboard_release_freshness_profile.as_deref() {
         admin_runtime::persist_sync_runtime_setting(
@@ -2113,7 +2084,7 @@ async fn persist_sync_runtime_config(
             ),
         )
         .await
-        .map_err(sync_runtime_config_write_error)?;
+        .map_err(sync_runtime_config_database_error)?;
     }
     if let Some(local_time) = daily_brief_schedule_local_time {
         admin_runtime::persist_sync_runtime_setting(
@@ -2121,16 +2092,30 @@ async fn persist_sync_runtime_config(
             admin_runtime::SyncRuntimeSettingUpdate::DailyBriefScheduleLocalTime(local_time),
         )
         .await
-        .map_err(sync_runtime_config_write_error)?;
+        .map_err(sync_runtime_config_database_error)?;
     }
 
+    let settings = admin_runtime::load_sync_runtime_config_settings(&mut *tx, &state.config)
+        .await
+        .map_err(sync_runtime_config_database_error)?;
     tx.commit()
         .await
         .map_err(anyhow::Error::from)
-        .map_err(sync_runtime_config_write_error)?;
+        .map_err(sync_runtime_config_database_error)?;
     drop(writer);
 
-    load_sync_runtime_config(state).await
+    response.sync_auto_fetch_interval_minutes = settings.sync_auto_fetch_interval_minutes;
+    response.sync_auto_fetch_effective_at = settings.sync_auto_fetch_effective_at;
+    response.star_sync_delta_interval_minutes = settings.star_sync_delta_interval_minutes;
+    response.star_sync_full_sweep_interval_minutes = settings.star_sync_full_sweep_interval_minutes;
+    response.retry_recent_failures_interval_minutes =
+        settings.retry_recent_failures_interval_minutes;
+    response.repo_release_worker_concurrency = settings.repo_release_worker_concurrency;
+    response.repo_refresh_system_budget_per_window = settings.repo_refresh_system_budget_per_window;
+    response.dashboard_release_freshness_profile = settings.dashboard_release_freshness_profile;
+    response.daily_brief_schedule_local_time =
+        briefs::format_daily_brief_local_time(settings.daily_brief_schedule_local_time);
+    Ok(response)
 }
 
 pub async fn admin_get_sync_runtime_config(
@@ -39848,7 +39833,17 @@ echo should_not_be_in_excerpt
             .await
             .expect("read retryable error response body");
         let body: Value = serde_json::from_slice(&body).expect("parse retryable error response");
-        assert_eq!(body["error"]["code"], "database_busy");
+        assert_eq!(
+            body,
+            json!({
+                "ok": false,
+                "error": {
+                    "code": "database_busy",
+                    "message": "The settings database is busy. Retry the save.",
+                    "failure_class": null
+                }
+            })
+        );
 
         sqlx::query("ROLLBACK")
             .execute(&mut lock_connection)
@@ -39868,7 +39863,7 @@ echo should_not_be_in_excerpt
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
 
-        let initial = super::persist_sync_runtime_config(
+        super::persist_sync_runtime_config(
             state.as_ref(),
             super::SyncRuntimeConfigPatchRequest {
                 sync_auto_fetch_interval_minutes: Some(11),
@@ -39877,12 +39872,21 @@ echo should_not_be_in_excerpt
                 retry_recent_failures_interval_minutes: None,
                 repo_release_worker_concurrency: Some(4),
                 repo_refresh_system_budget_per_window: Some(200),
-                dashboard_release_freshness_profile: Some("balanced".to_owned()),
+                dashboard_release_freshness_profile: Some("latest".to_owned()),
                 daily_brief_schedule_local_time: None,
             },
         )
         .await
         .expect("initial settings should save");
+        sqlx::query(
+            "UPDATE admin_runtime_settings SET daily_brief_schedule_local_time = '07:30' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed a non-default omitted daily brief time");
+        let initial = super::load_sync_runtime_config(state.as_ref())
+            .await
+            .expect("load seeded settings");
 
         sqlx::query(
             r#"
@@ -39926,7 +39930,7 @@ echo should_not_be_in_excerpt
         );
         assert_eq!(settings.repo_release_worker_concurrency, 4);
         assert_eq!(settings.repo_refresh_system_budget_per_window, 200);
-        assert_eq!(settings.dashboard_release_freshness_profile, "balanced");
+        assert_eq!(settings.dashboard_release_freshness_profile, "latest");
         assert_eq!(
             settings.star_sync_delta_interval_minutes,
             initial.star_sync_delta_interval_minutes

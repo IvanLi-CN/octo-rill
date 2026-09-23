@@ -529,6 +529,46 @@ mod tests {
     use super::*;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
+    #[derive(Debug)]
+    struct TestDatabaseError {
+        code: &'static str,
+        message: &'static str,
+    }
+
+    impl std::fmt::Display for TestDatabaseError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{}", self.message)
+        }
+    }
+
+    impl std::error::Error for TestDatabaseError {}
+
+    impl sqlx::error::DatabaseError for TestDatabaseError {
+        fn message(&self) -> &str {
+            self.message
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.code.into())
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
     #[tokio::test]
     async fn write_coordinator_serializes_concurrent_operations() {
         let coordinator = SqliteWriteCoordinator::new();
@@ -657,6 +697,18 @@ mod tests {
         assert!(sqlite_code_is_busy_or_locked("261"));
         assert!(sqlite_code_is_busy_or_locked("517"));
         assert!(!sqlite_code_is_busy_or_locked("19"));
+    }
+
+    #[test]
+    fn busy_detection_matches_sqlx_primary_and_extended_codes() {
+        for code in ["5", "6", "261", "262", "517", "19"] {
+            let error = sqlx::Error::Database(Box::new(TestDatabaseError {
+                code,
+                message: "generic database failure",
+            }));
+
+            assert_eq!(is_sqlite_busy_error(&error), code != "19");
+        }
     }
 
     #[tokio::test]

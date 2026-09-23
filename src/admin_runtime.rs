@@ -34,6 +34,32 @@ pub struct LlmRecoveryRuntimeConfig {
     pub rollout_percent: u8,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncRuntimeConfigSettings {
+    pub sync_auto_fetch_interval_minutes: i64,
+    pub sync_auto_fetch_effective_at: Option<String>,
+    pub star_sync_delta_interval_minutes: i64,
+    pub star_sync_full_sweep_interval_minutes: i64,
+    pub retry_recent_failures_interval_minutes: i64,
+    pub repo_release_worker_concurrency: usize,
+    pub repo_refresh_system_budget_per_window: i64,
+    pub dashboard_release_freshness_profile: String,
+    pub daily_brief_schedule_local_time: NaiveTime,
+}
+
+#[derive(sqlx::FromRow)]
+struct SyncRuntimeConfigSettingsRow {
+    sync_auto_fetch_interval_minutes: i64,
+    sync_auto_fetch_effective_at: Option<String>,
+    star_sync_delta_interval_minutes: i64,
+    star_sync_full_sweep_interval_minutes: i64,
+    retry_recent_failures_interval_minutes: i64,
+    repo_release_worker_concurrency: i64,
+    repo_refresh_system_budget_per_window: i64,
+    dashboard_release_freshness_profile: String,
+    daily_brief_schedule_local_time: String,
+}
+
 pub enum SyncRuntimeSettingUpdate {
     SyncAutoFetchIntervalMinutes(i64),
     StarSyncDeltaIntervalMinutes(i64),
@@ -321,6 +347,79 @@ pub async fn load_daily_brief_schedule_local_time(
         local_time.as_str(),
         config,
     ))
+}
+
+pub async fn load_sync_runtime_config_settings<'e, E>(
+    executor: E,
+    config: &AppConfig,
+) -> Result<SyncRuntimeConfigSettings>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let row = sqlx::query_as::<_, SyncRuntimeConfigSettingsRow>(
+        r#"
+        SELECT
+          sync_auto_fetch_interval_minutes,
+          sync_auto_fetch_effective_at,
+          star_sync_delta_interval_minutes,
+          star_sync_full_sweep_interval_minutes,
+          retry_recent_failures_interval_minutes,
+          repo_release_worker_concurrency,
+          repo_refresh_system_budget_per_window,
+          dashboard_release_freshness_profile,
+          daily_brief_schedule_local_time
+        FROM admin_runtime_settings
+        WHERE id = 1
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(match row {
+        Some(row) => SyncRuntimeConfigSettings {
+            sync_auto_fetch_interval_minutes: normalize_sync_auto_fetch_interval_minutes(
+                row.sync_auto_fetch_interval_minutes,
+            ),
+            sync_auto_fetch_effective_at: row.sync_auto_fetch_effective_at,
+            star_sync_delta_interval_minutes: normalize_star_sync_delta_interval_minutes(
+                row.star_sync_delta_interval_minutes,
+            ),
+            star_sync_full_sweep_interval_minutes: normalize_star_sync_full_sweep_interval_minutes(
+                row.star_sync_full_sweep_interval_minutes,
+            ),
+            retry_recent_failures_interval_minutes:
+                normalize_retry_recent_failures_interval_minutes(
+                    row.retry_recent_failures_interval_minutes,
+                ),
+            repo_release_worker_concurrency: normalize_repo_release_worker_concurrency(
+                row.repo_release_worker_concurrency,
+            ),
+            repo_refresh_system_budget_per_window: normalize_repo_refresh_system_budget_per_window(
+                row.repo_refresh_system_budget_per_window,
+            ),
+            dashboard_release_freshness_profile: normalize_dashboard_release_freshness_profile(
+                row.dashboard_release_freshness_profile.as_str(),
+            )
+            .to_owned(),
+            daily_brief_schedule_local_time: parse_daily_brief_schedule_local_time(
+                row.daily_brief_schedule_local_time.as_str(),
+                config,
+            ),
+        },
+        None => SyncRuntimeConfigSettings {
+            sync_auto_fetch_interval_minutes: DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES,
+            sync_auto_fetch_effective_at: None,
+            star_sync_delta_interval_minutes: DEFAULT_STAR_SYNC_DELTA_INTERVAL_MINUTES,
+            star_sync_full_sweep_interval_minutes: DEFAULT_STAR_SYNC_FULL_SWEEP_INTERVAL_MINUTES,
+            retry_recent_failures_interval_minutes: DEFAULT_RETRY_RECENT_FAILURES_INTERVAL_MINUTES,
+            repo_release_worker_concurrency: DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY,
+            repo_refresh_system_budget_per_window: DEFAULT_REPO_REFRESH_SYSTEM_BUDGET_PER_WINDOW,
+            dashboard_release_freshness_profile: DEFAULT_DASHBOARD_RELEASE_FRESHNESS_PROFILE
+                .to_owned(),
+            daily_brief_schedule_local_time: default_daily_brief_schedule_local_time(config),
+        },
+    })
 }
 
 pub async fn update_daily_brief_schedule_local_time(
