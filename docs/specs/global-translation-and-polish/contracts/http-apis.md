@@ -36,6 +36,26 @@ The client treats this as synchronization with the active work, immediately rend
 
 When provider health has opened the persistent circuit, an authorized retry records the association but receives the current `deferred_provider` state and a polling URL. Only the scheduler's controlled probe may initiate another provider call.
 
+If the request points to a source version that is already `superseded`, the
+retry does not reopen that work or create an attempt for it. The scheduler
+associates the retry with the current source-version work item and returns
+`409 Conflict`:
+
+```json
+{
+  "code": "content_processing_superseded",
+  "superseded_work_item_id": "global_work_old",
+  "current_work_item_id": "global_work_current",
+  "work_item_id": "global_work_current",
+  "status": "queued | running | ready | failed | deferred_provider | blocked_config | superseded",
+  "poll_url": "/api/translate/requests/request_xxx"
+}
+```
+
+The same conflict fact is returned when a source adapter submits an older
+revision after a newer revision has already been admitted. The old work is
+retained as a superseded audit row and never reaches provider admission.
+
 ## Transition Response
 
 During `rollback_freeze`, every content-processing submission returns `503 Service Unavailable` with the same `request_id`, `work_item_id` when known, current mode and a polling URL. It neither falls back to old direct writes nor creates a partially switched work item.
