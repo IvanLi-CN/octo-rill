@@ -422,6 +422,7 @@ where
     })
 }
 
+#[cfg(test)]
 pub async fn update_daily_brief_schedule_local_time(
     pool: &SqlitePool,
     config: &AppConfig,
@@ -775,6 +776,7 @@ pub async fn load_star_sync_full_sweep_interval_minutes(pool: &SqlitePool) -> Re
     Ok(normalize_star_sync_full_sweep_interval_minutes(interval))
 }
 
+#[cfg(test)]
 pub async fn update_sync_auto_fetch_interval_minutes(
     pool: &SqlitePool,
     interval_minutes: i64,
