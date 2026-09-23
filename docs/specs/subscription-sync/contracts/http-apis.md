@@ -85,6 +85,9 @@ Behavior:
 - When present, `sync_auto_fetch_interval_minutes` becomes effective only at the returned `sync_auto_fetch_effective_at` boundary; the scheduler does not catch up before it.
 - `retry_recent_failures_interval_minutes`, when present, must be between `1` and `120`.
 - `repo_release_worker_concurrency`, when present, must be between `1` and `32`.
+- All fields present in one PATCH are persisted atomically in one foreground SQLite write transaction; omitted fields remain unchanged, and a failed write leaves the entire patch unapplied.
+- The successful response's setting fields are read from that same transaction before commit, so the submitted values and `sync_auto_fetch_effective_at` cannot be replaced by or mixed with a concurrent PATCH.
+- If SQLite `BUSY/LOCKED` remains after writer coordinator retries, the response is HTTP `503` with `error.code = "database_busy"` and `Retry-After: 1`.
 - The response uses the same shape as `GET /api/admin/jobs/sync/runtime-config`.
 - Task detail links reuse `GET /api/admin/jobs/realtime/{task_id}`.
 - Response shape matches the admin realtime task detail contract used by Admin Jobs.

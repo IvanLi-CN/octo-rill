@@ -1166,7 +1166,7 @@ struct DailyBriefProfileRow {
 
 async fn load_recent_sync_auto_fetch_tasks(
     state: &AppState,
-) -> Result<Vec<SyncAutoFetchTaskItem>, ApiError> {
+) -> anyhow::Result<Vec<SyncAutoFetchTaskItem>> {
     sqlx::query_as::<_, SyncAutoFetchTaskItem>(
         r#"
         WITH recent_roots AS (
@@ -1234,7 +1234,7 @@ async fn load_recent_sync_auto_fetch_tasks(
     .bind(jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
     .fetch_all(&state.pool)
     .await
-    .map_err(ApiError::internal)
+    .map_err(anyhow::Error::from)
 }
 
 async fn load_daily_brief_profile(
@@ -1846,59 +1846,29 @@ fn validate_admin_repo_urgency_range(
 }
 
 async fn load_sync_runtime_config(state: &AppState) -> Result<SyncRuntimeConfigResponse, ApiError> {
-    let interval = admin_runtime::load_sync_auto_fetch_interval_minutes(&state.pool)
+    let settings = admin_runtime::load_sync_runtime_config_settings(&state.pool, &state.config)
         .await
-        .map_err(ApiError::internal)?;
-    let sync_auto_fetch_effective_at =
-        admin_runtime::load_sync_auto_fetch_effective_at(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-    let star_sync_delta_interval_minutes =
-        admin_runtime::load_star_sync_delta_interval_minutes(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-    let star_sync_full_sweep_interval_minutes =
-        admin_runtime::load_star_sync_full_sweep_interval_minutes(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
+        .map_err(sync_runtime_config_database_error)?;
     let star_sync = sync::load_star_sync_runtime_status(state)
         .await
-        .map_err(ApiError::internal)?;
-    let repo_release_worker_concurrency =
-        admin_runtime::load_repo_release_worker_concurrency(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-    let retry_recent_failures_interval_minutes =
-        admin_runtime::load_retry_recent_failures_interval_minutes(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-    let repo_refresh_system_budget_per_window =
-        admin_runtime::load_repo_refresh_system_budget_per_window(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-    let dashboard_release_freshness_profile =
-        admin_runtime::load_dashboard_release_freshness_profile(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
-    let daily_brief_schedule_local_time =
-        admin_runtime::load_daily_brief_schedule_local_time(&state.pool, &state.config)
-            .await
-            .map_err(ApiError::internal)?;
+        .map_err(sync_runtime_config_database_error)?;
 
     Ok(SyncRuntimeConfigResponse {
-        sync_auto_fetch_interval_minutes: interval,
-        sync_auto_fetch_effective_at,
-        star_sync_delta_interval_minutes,
-        star_sync_full_sweep_interval_minutes,
+        sync_auto_fetch_interval_minutes: settings.sync_auto_fetch_interval_minutes,
+        sync_auto_fetch_effective_at: settings.sync_auto_fetch_effective_at,
+        star_sync_delta_interval_minutes: settings.star_sync_delta_interval_minutes,
+        star_sync_full_sweep_interval_minutes: settings.star_sync_full_sweep_interval_minutes,
         star_sync,
-        retry_recent_failures_interval_minutes,
-        repo_release_worker_concurrency,
-        repo_refresh_system_budget_per_window,
-        dashboard_release_freshness_profile,
+        retry_recent_failures_interval_minutes: settings.retry_recent_failures_interval_minutes,
+        repo_release_worker_concurrency: settings.repo_release_worker_concurrency,
+        repo_refresh_system_budget_per_window: settings.repo_refresh_system_budget_per_window,
+        dashboard_release_freshness_profile: settings.dashboard_release_freshness_profile,
         daily_brief_schedule_local_time: briefs::format_daily_brief_local_time(
-            daily_brief_schedule_local_time,
+            settings.daily_brief_schedule_local_time,
         ),
-        recent_sync_tasks: load_recent_sync_auto_fetch_tasks(state).await?,
+        recent_sync_tasks: load_recent_sync_auto_fetch_tasks(state)
+            .await
+            .map_err(sync_runtime_config_database_error)?,
     })
 }
 
@@ -1957,6 +1927,19 @@ async fn validate_daily_brief_schedule_against_enabled_slots(
     Err(ApiError::bad_request(format!(
         "invalid daily brief schedule for current scheduler configuration (missing enabled UTC slots for one or more user time zones: {missing_hours})"
     )))
+}
+
+fn sync_runtime_config_database_error(error: anyhow::Error) -> ApiError {
+    if crate::sqlite_write::is_sqlite_busy_error(error.as_ref()) {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database_busy",
+            "The settings database is busy. Retry the save.",
+        )
+        .with_retry_after(1)
+    } else {
+        ApiError::internal(error)
+    }
 }
 
 async fn persist_sync_runtime_config(
@@ -2022,52 +2005,117 @@ async fn persist_sync_runtime_config(
         validate_daily_brief_schedule_against_enabled_slots(state, local_time).await?;
     }
 
-    if let Some(interval) = req.sync_auto_fetch_interval_minutes {
-        admin_runtime::update_sync_auto_fetch_interval_minutes(&state.pool, interval)
-            .await
-            .map_err(ApiError::internal)?;
-    }
-    if let Some(interval) = req.star_sync_delta_interval_minutes {
-        admin_runtime::update_star_sync_delta_interval_minutes(&state.pool, interval)
-            .await
-            .map_err(ApiError::internal)?;
-    }
-    if let Some(interval) = req.star_sync_full_sweep_interval_minutes {
-        admin_runtime::update_star_sync_full_sweep_interval_minutes(&state.pool, interval)
-            .await
-            .map_err(ApiError::internal)?;
-    }
-    if let Some(interval) = req.retry_recent_failures_interval_minutes {
-        admin_runtime::update_retry_recent_failures_interval_minutes(&state.pool, interval)
-            .await
-            .map_err(ApiError::internal)?;
-    }
-    if let Some(concurrency) = req.repo_release_worker_concurrency {
-        admin_runtime::update_repo_release_worker_concurrency(&state.pool, concurrency)
-            .await
-            .map_err(ApiError::internal)?;
-    }
-    if let Some(budget) = req.repo_refresh_system_budget_per_window {
-        admin_runtime::update_repo_refresh_system_budget_per_window(&state.pool, budget)
-            .await
-            .map_err(ApiError::internal)?;
-    }
-    if let Some(profile) = req.dashboard_release_freshness_profile.as_deref() {
-        admin_runtime::update_dashboard_release_freshness_profile(&state.pool, profile)
-            .await
-            .map_err(ApiError::internal)?;
-    }
-    if let Some(local_time) = daily_brief_schedule_local_time {
-        admin_runtime::update_daily_brief_schedule_local_time(
-            &state.pool,
-            &state.config,
-            local_time,
-        )
-        .await
-        .map_err(ApiError::internal)?;
+    if req.sync_auto_fetch_interval_minutes.is_none()
+        && req.star_sync_delta_interval_minutes.is_none()
+        && req.star_sync_full_sweep_interval_minutes.is_none()
+        && req.retry_recent_failures_interval_minutes.is_none()
+        && req.repo_release_worker_concurrency.is_none()
+        && req.repo_refresh_system_budget_per_window.is_none()
+        && req.dashboard_release_freshness_profile.is_none()
+        && daily_brief_schedule_local_time.is_none()
+    {
+        return load_sync_runtime_config(state).await;
     }
 
-    load_sync_runtime_config(state).await
+    let mut response = load_sync_runtime_config(state).await?;
+    let (writer, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "admin_sync_runtime_config",
+            crate::sqlite_write::SqliteWritePriority::Foreground,
+        )
+        .await
+        .map_err(sync_runtime_config_database_error)?;
+
+    if let Some(interval) = req.sync_auto_fetch_interval_minutes {
+        admin_runtime::persist_sync_runtime_setting(
+            &mut *tx,
+            admin_runtime::SyncRuntimeSettingUpdate::SyncAutoFetchIntervalMinutes(interval),
+        )
+        .await
+        .map_err(sync_runtime_config_database_error)?;
+    }
+    if let Some(interval) = req.star_sync_delta_interval_minutes {
+        admin_runtime::persist_sync_runtime_setting(
+            &mut *tx,
+            admin_runtime::SyncRuntimeSettingUpdate::StarSyncDeltaIntervalMinutes(interval),
+        )
+        .await
+        .map_err(sync_runtime_config_database_error)?;
+    }
+    if let Some(interval) = req.star_sync_full_sweep_interval_minutes {
+        admin_runtime::persist_sync_runtime_setting(
+            &mut *tx,
+            admin_runtime::SyncRuntimeSettingUpdate::StarSyncFullSweepIntervalMinutes(interval),
+        )
+        .await
+        .map_err(sync_runtime_config_database_error)?;
+    }
+    if let Some(interval) = req.retry_recent_failures_interval_minutes {
+        admin_runtime::persist_sync_runtime_setting(
+            &mut *tx,
+            admin_runtime::SyncRuntimeSettingUpdate::RetryRecentFailuresIntervalMinutes(interval),
+        )
+        .await
+        .map_err(sync_runtime_config_database_error)?;
+    }
+    if let Some(concurrency) = req.repo_release_worker_concurrency {
+        admin_runtime::persist_sync_runtime_setting(
+            &mut *tx,
+            admin_runtime::SyncRuntimeSettingUpdate::RepoReleaseWorkerConcurrency(concurrency),
+        )
+        .await
+        .map_err(sync_runtime_config_database_error)?;
+    }
+    if let Some(budget) = req.repo_refresh_system_budget_per_window {
+        admin_runtime::persist_sync_runtime_setting(
+            &mut *tx,
+            admin_runtime::SyncRuntimeSettingUpdate::RepoRefreshSystemBudgetPerWindow(budget),
+        )
+        .await
+        .map_err(sync_runtime_config_database_error)?;
+    }
+    if let Some(profile) = req.dashboard_release_freshness_profile.as_deref() {
+        admin_runtime::persist_sync_runtime_setting(
+            &mut *tx,
+            admin_runtime::SyncRuntimeSettingUpdate::DashboardReleaseFreshnessProfile(
+                profile.to_owned(),
+            ),
+        )
+        .await
+        .map_err(sync_runtime_config_database_error)?;
+    }
+    if let Some(local_time) = daily_brief_schedule_local_time {
+        admin_runtime::persist_sync_runtime_setting(
+            &mut *tx,
+            admin_runtime::SyncRuntimeSettingUpdate::DailyBriefScheduleLocalTime(local_time),
+        )
+        .await
+        .map_err(sync_runtime_config_database_error)?;
+    }
+
+    let settings = admin_runtime::load_sync_runtime_config_settings(&mut *tx, &state.config)
+        .await
+        .map_err(sync_runtime_config_database_error)?;
+    tx.commit()
+        .await
+        .map_err(anyhow::Error::from)
+        .map_err(sync_runtime_config_database_error)?;
+    drop(writer);
+
+    response.sync_auto_fetch_interval_minutes = settings.sync_auto_fetch_interval_minutes;
+    response.sync_auto_fetch_effective_at = settings.sync_auto_fetch_effective_at;
+    response.star_sync_delta_interval_minutes = settings.star_sync_delta_interval_minutes;
+    response.star_sync_full_sweep_interval_minutes = settings.star_sync_full_sweep_interval_minutes;
+    response.retry_recent_failures_interval_minutes =
+        settings.retry_recent_failures_interval_minutes;
+    response.repo_release_worker_concurrency = settings.repo_release_worker_concurrency;
+    response.repo_refresh_system_budget_per_window = settings.repo_refresh_system_budget_per_window;
+    response.dashboard_release_freshness_profile = settings.dashboard_release_freshness_profile;
+    response.daily_brief_schedule_local_time =
+        briefs::format_daily_brief_local_time(settings.daily_brief_schedule_local_time);
+    Ok(response)
 }
 
 pub async fn admin_get_sync_runtime_config(
@@ -25538,6 +25586,7 @@ mod tests {
 
     use axum::body::{Body, Bytes};
     use hmac::Mac;
+    use sqlx::Connection;
 
     use crate::webhook_push;
 
@@ -39716,6 +39765,188 @@ echo should_not_be_in_excerpt
 
         assert_eq!(row.0.as_deref(), Some("America/New_York"));
         assert_eq!(row.1, 0);
+    }
+
+    #[tokio::test]
+    async fn sync_runtime_config_busy_response_is_retryable_and_does_not_change_settings() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        super::persist_sync_runtime_config(
+            state.as_ref(),
+            super::SyncRuntimeConfigPatchRequest {
+                sync_auto_fetch_interval_minutes: Some(11),
+                star_sync_delta_interval_minutes: None,
+                star_sync_full_sweep_interval_minutes: None,
+                retry_recent_failures_interval_minutes: None,
+                repo_release_worker_concurrency: Some(4),
+                repo_refresh_system_budget_per_window: None,
+                dashboard_release_freshness_profile: None,
+                daily_brief_schedule_local_time: None,
+            },
+        )
+        .await
+        .expect("initial settings should save");
+
+        sqlx::query("PRAGMA busy_timeout = 50")
+            .execute(&pool)
+            .await
+            .expect("set short busy timeout for deterministic lock test");
+        let database_row = sqlx::query("PRAGMA database_list")
+            .fetch_one(&pool)
+            .await
+            .expect("load test database path");
+        let database_path: String =
+            sqlx::Row::try_get(&database_row, "file").expect("database path should be present");
+        let lock_options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(database_path)
+            .busy_timeout(std::time::Duration::from_millis(50));
+        let mut lock_connection = sqlx::SqliteConnection::connect_with(&lock_options)
+            .await
+            .expect("open competing SQLite connection");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut lock_connection)
+            .await
+            .expect("hold SQLite writer lock");
+
+        let error = super::persist_sync_runtime_config(
+            state.as_ref(),
+            super::SyncRuntimeConfigPatchRequest {
+                sync_auto_fetch_interval_minutes: Some(17),
+                star_sync_delta_interval_minutes: None,
+                star_sync_full_sweep_interval_minutes: None,
+                retry_recent_failures_interval_minutes: None,
+                repo_release_worker_concurrency: Some(12),
+                repo_refresh_system_budget_per_window: Some(300),
+                dashboard_release_freshness_profile: Some("capacity".to_owned()),
+                daily_brief_schedule_local_time: None,
+            },
+        )
+        .await
+        .expect_err("held writer should return a retryable error");
+
+        assert_eq!(error.code(), "database_busy");
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read retryable error response body");
+        let body: Value = serde_json::from_slice(&body).expect("parse retryable error response");
+        assert_eq!(
+            body,
+            json!({
+                "ok": false,
+                "error": {
+                    "code": "database_busy",
+                    "message": "The settings database is busy. Retry the save.",
+                    "failure_class": null
+                }
+            })
+        );
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut lock_connection)
+            .await
+            .expect("release held SQLite writer lock");
+        let settings = super::load_sync_runtime_config(state.as_ref())
+            .await
+            .expect("load settings after failed save");
+        assert_eq!(settings.sync_auto_fetch_interval_minutes, 11);
+        assert_eq!(settings.repo_release_worker_concurrency, 4);
+        assert_ne!(settings.repo_refresh_system_budget_per_window, 300);
+        assert_ne!(settings.dashboard_release_freshness_profile, "capacity");
+    }
+
+    #[tokio::test]
+    async fn sync_runtime_config_rolls_back_on_late_write_failure() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        super::persist_sync_runtime_config(
+            state.as_ref(),
+            super::SyncRuntimeConfigPatchRequest {
+                sync_auto_fetch_interval_minutes: Some(11),
+                star_sync_delta_interval_minutes: None,
+                star_sync_full_sweep_interval_minutes: None,
+                retry_recent_failures_interval_minutes: None,
+                repo_release_worker_concurrency: Some(4),
+                repo_refresh_system_budget_per_window: Some(200),
+                dashboard_release_freshness_profile: Some("latest".to_owned()),
+                daily_brief_schedule_local_time: None,
+            },
+        )
+        .await
+        .expect("initial settings should save");
+        sqlx::query(
+            "UPDATE admin_runtime_settings SET daily_brief_schedule_local_time = '07:30' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed a non-default omitted daily brief time");
+        let initial = super::load_sync_runtime_config(state.as_ref())
+            .await
+            .expect("load seeded settings");
+
+        sqlx::query(
+            r#"
+            CREATE TRIGGER fail_sync_runtime_config_profile
+            BEFORE UPDATE OF dashboard_release_freshness_profile
+            ON admin_runtime_settings
+            WHEN NEW.dashboard_release_freshness_profile = 'capacity'
+            BEGIN
+              SELECT RAISE(ABORT, 'injected profile write failure');
+            END
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("install deterministic late-write failure");
+
+        let error = super::persist_sync_runtime_config(
+            state.as_ref(),
+            super::SyncRuntimeConfigPatchRequest {
+                sync_auto_fetch_interval_minutes: Some(17),
+                star_sync_delta_interval_minutes: None,
+                star_sync_full_sweep_interval_minutes: None,
+                retry_recent_failures_interval_minutes: None,
+                repo_release_worker_concurrency: Some(12),
+                repo_refresh_system_budget_per_window: Some(300),
+                dashboard_release_freshness_profile: Some("capacity".to_owned()),
+                daily_brief_schedule_local_time: None,
+            },
+        )
+        .await
+        .expect_err("injected late write failure should fail the patch");
+
+        assert_eq!(error.code(), "internal_error");
+        let settings = super::load_sync_runtime_config(state.as_ref())
+            .await
+            .expect("load settings after rollback");
+        assert_eq!(settings.sync_auto_fetch_interval_minutes, 11);
+        assert_eq!(
+            settings.sync_auto_fetch_effective_at,
+            initial.sync_auto_fetch_effective_at
+        );
+        assert_eq!(settings.repo_release_worker_concurrency, 4);
+        assert_eq!(settings.repo_refresh_system_budget_per_window, 200);
+        assert_eq!(settings.dashboard_release_freshness_profile, "latest");
+        assert_eq!(
+            settings.star_sync_delta_interval_minutes,
+            initial.star_sync_delta_interval_minutes
+        );
+        assert_eq!(
+            settings.star_sync_full_sweep_interval_minutes,
+            initial.star_sync_full_sweep_interval_minutes
+        );
+        assert_eq!(
+            settings.retry_recent_failures_interval_minutes,
+            initial.retry_recent_failures_interval_minutes
+        );
+        assert_eq!(
+            settings.daily_brief_schedule_local_time,
+            initial.daily_brief_schedule_local_time
+        );
     }
 
     #[tokio::test]

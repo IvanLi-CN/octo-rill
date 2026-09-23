@@ -500,7 +500,7 @@ fn sqlx_error_is_busy(err: &sqlx::Error) -> bool {
     match err {
         sqlx::Error::Database(db_err) => {
             let code = db_err.code().map(|code| code.into_owned());
-            matches!(code.as_deref(), Some("5" | "517" | "261"))
+            code.as_deref().is_some_and(sqlite_code_is_busy_or_locked)
                 || db_err
                     .message()
                     .to_ascii_lowercase()
@@ -508,6 +508,11 @@ fn sqlx_error_is_busy(err: &sqlx::Error) -> bool {
         }
         _ => false,
     }
+}
+
+fn sqlite_code_is_busy_or_locked(code: &str) -> bool {
+    code.parse::<u32>()
+        .is_ok_and(|code| matches!(code & 0xff, 5 | 6))
 }
 
 #[cfg(test)]
@@ -523,6 +528,46 @@ mod tests {
 
     use super::*;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+
+    #[derive(Debug)]
+    struct TestDatabaseError {
+        code: &'static str,
+        message: &'static str,
+    }
+
+    impl std::fmt::Display for TestDatabaseError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{}", self.message)
+        }
+    }
+
+    impl std::error::Error for TestDatabaseError {}
+
+    impl sqlx::error::DatabaseError for TestDatabaseError {
+        fn message(&self) -> &str {
+            self.message
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.code.into())
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
 
     #[tokio::test]
     async fn write_coordinator_serializes_concurrent_operations() {
@@ -643,6 +688,27 @@ mod tests {
     fn busy_detection_matches_sqlite_locked_messages() {
         let err = anyhow::anyhow!("error returned from database: (code: 5) database is locked");
         assert!(is_sqlite_busy_error(err.as_ref()));
+    }
+
+    #[test]
+    fn sqlite_busy_detection_matches_primary_and_extended_codes() {
+        assert!(sqlite_code_is_busy_or_locked("5"));
+        assert!(sqlite_code_is_busy_or_locked("6"));
+        assert!(sqlite_code_is_busy_or_locked("261"));
+        assert!(sqlite_code_is_busy_or_locked("517"));
+        assert!(!sqlite_code_is_busy_or_locked("19"));
+    }
+
+    #[test]
+    fn busy_detection_matches_sqlx_primary_and_extended_codes() {
+        for code in ["5", "6", "261", "262", "517", "19"] {
+            let error = sqlx::Error::Database(Box::new(TestDatabaseError {
+                code,
+                message: "generic database failure",
+            }));
+
+            assert_eq!(is_sqlite_busy_error(&error), code != "19");
+        }
     }
 
     #[tokio::test]
