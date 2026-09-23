@@ -68,7 +68,6 @@ import {
 	TooltipContent,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { useDemoSnapshot } from "@/demo/runtime";
 import { cn } from "@/lib/utils";
 
 type CollectionTab = AdminCollectionRecordItem["kind"];
@@ -1106,13 +1105,6 @@ export function AiOperationsRecordsSection({
 	onCloseRecord: () => void;
 }) {
 	const compact = useCompactLayout();
-	const demoSnapshot = useDemoSnapshot();
-	const demoAdminJobsDataCase = demoSnapshot.active
-		? demoSnapshot.shareState.adminJobsDataCase
-		: "many";
-	const demoDataCacheKey = demoSnapshot.active
-		? `${demoSnapshot.shareState.networkMode}:${demoAdminJobsDataCase}`
-		: "live";
 	const initialFilters = routeFilters ?? DEFAULT_AI_RECORD_ROUTE_FILTERS;
 	const [tab, setTab] = useState<CollectionTab>(initialFilters.kind);
 	const [preset, setPreset] = useState<TimeRangePreset>(initialFilters.preset);
@@ -1171,16 +1163,6 @@ export function AiOperationsRecordsSection({
 	const activityTabRef = useRef(tab);
 	const handledReloadNonceRef = useRef(0);
 	const handledActivityRetryNonceRef = useRef(0);
-	const previousDemoAdminJobsDataCaseRef = useRef(demoAdminJobsDataCase);
-	useEffect(() => {
-		if (previousDemoAdminJobsDataCaseRef.current === demoAdminJobsDataCase) {
-			return;
-		}
-		previousDemoAdminJobsDataCaseRef.current = demoAdminJobsDataCase;
-		activityNeedsReadRef.current = true;
-		activityForceReadRef.current = true;
-		setReloadNonce((current) => current + 1);
-	}, [demoAdminJobsDataCase]);
 	const commitFilters = useCallback(
 		(next: Partial<AiRecordRouteFilters>) => {
 			if (!onFiltersChange) return;
@@ -1272,8 +1254,8 @@ export function AiOperationsRecordsSection({
 		translationStatuses,
 	]);
 	const listParamsKey = listParams.toString();
-	const listQueryKey = `${tab}?${listParamsKey}&demo_case=${demoDataCacheKey}`;
-	const activityCacheKey = `${tab}:${demoDataCacheKey}`;
+	const listQueryKey = `${tab}?${listParamsKey}`;
+	const activityCacheKey = tab;
 	const activityCacheKeyRef = useRef(activityCacheKey);
 	const navigateToRecord = useCallback(
 		(kind: CollectionTab, id: string) => {
@@ -1738,9 +1720,7 @@ export function AiOperationsRecordsSection({
 								const nextTab = value as CollectionTab;
 								activityNeedsReadRef.current = true;
 								activityForceReadRef.current = false;
-								const cached = activityCacheRef.current.get(
-									`${nextTab}:${demoDataCacheKey}`,
-								);
+								const cached = activityCacheRef.current.get(nextTab);
 								setActivity(cached?.data ?? null);
 								setActivityLoading(!cached);
 								setActivityError(null);

@@ -5,7 +5,6 @@ import {
 import { buildSettingsHref } from "@/settings/routeState";
 import type {
 	DemoAppShellState,
-	DemoAdminJobsDataCase,
 	DemoLandingAuthAction,
 	DemoLandingBootState,
 	DemoLandingCase,
@@ -36,16 +35,6 @@ export const LANDING_CASE_OPTIONS = [
 	{ value: "auth-network-unavailable", label: "Auth network unavailable" },
 ] as const satisfies ReadonlyArray<{
 	value: DemoLandingCase;
-	label: string;
-}>;
-
-export const ADMIN_JOBS_DATA_CASE_OPTIONS = [
-	{ value: "loaded", label: "有数据（代表性示例）" },
-	{ value: "empty", label: "无数据" },
-	{ value: "many", label: "多行活动（同一小时 128 格）" },
-	{ value: "loading", label: "加载中" },
-] as const satisfies ReadonlyArray<{
-	value: DemoAdminJobsDataCase;
 	label: string;
 }>;
 
@@ -390,14 +379,6 @@ export function normalizeNetworkMode(
 	return "normal";
 }
 
-export function normalizeAdminJobsDataCase(
-	value: string | null | undefined,
-): DemoAdminJobsDataCase {
-	return value === "loaded" || value === "empty" || value === "loading"
-		? value
-		: "many";
-}
-
 export function normalizeLandingCase(
 	value: string | null | undefined,
 ): DemoLandingCase {
@@ -478,9 +459,6 @@ export function readDemoShareState(url: URL, basepath: string): DemoShareState {
 			defaults.personaId,
 		),
 		networkMode: normalizeNetworkMode(url.searchParams.get("d_net")),
-		adminJobsDataCase: normalizeAdminJobsDataCase(
-			url.searchParams.get("d_jobs"),
-		),
 		includeOwnReleases:
 			url.searchParams.get("d_own") === "1" ||
 			(sceneId === "settings-my-releases" && webhookScenario !== "deleted"),
@@ -512,7 +490,6 @@ export function buildDefaultDemoShareState(
 		sceneId,
 		personaId: scene.defaultPersona,
 		networkMode: "normal",
-		adminJobsDataCase: "many",
 		includeOwnReleases: false,
 		webhookScenario:
 			sceneId === "settings-my-releases" ? "deleted" : "waiting-registration",
@@ -539,9 +516,6 @@ export function applyDemoShareStateToSearchParams(
 	target.set("d_persona", state.personaId);
 	if (state.networkMode !== "normal") {
 		target.set("d_net", state.networkMode);
-	}
-	if (state.adminJobsDataCase !== "many") {
-		target.set("d_jobs", state.adminJobsDataCase);
 	}
 	if (state.includeOwnReleases) {
 		target.set("d_own", "1");

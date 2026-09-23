@@ -860,60 +860,6 @@ test("demo admin jobs status filters stay inside the mock runtime", async ({
 	).toBeVisible();
 });
 
-test("demo admin jobs inspector switches data cases", async ({ page }) => {
-	await page.setViewportSize({ width: 1440, height: 900 });
-	await page.goto(
-		"/admin/jobs/ai-records?demo=admin-jobs-running&d_persona=admin",
-	);
-
-	await expect(page.getByText("Demo Inspector", { exact: true })).toBeVisible({
-		timeout: 30_000,
-	});
-	const dataCase = page.getByLabel("Data case");
-	const populatedActivityRow = page.locator(
-		'[data-testid="activity-grid-wrapped-row"]:has([data-activity-cell-id])',
-	);
-	await expect(dataCase).toHaveValue("many", { timeout: 30_000 });
-	await expect(page.getByRole("table").getByRole("row")).toHaveCount(21, {
-		timeout: 15_000,
-	});
-	await expect
-		.poll(async () =>
-			populatedActivityRow.first().evaluate((row) => ({
-				cellCount: row.querySelectorAll("[data-activity-cell-id]").length,
-				height: row.getBoundingClientRect().height,
-			})),
-		)
-		.toEqual(expect.objectContaining({ cellCount: 128 }));
-	await expect
-		.poll(async () =>
-			populatedActivityRow
-				.first()
-				.evaluate((row) => row.getBoundingClientRect().height),
-		)
-		.toBeGreaterThan(30);
-
-	await dataCase.selectOption("loaded");
-	await expect(page).toHaveURL(/d_jobs=loaded/);
-	await expect(page.getByRole("table").getByRole("row")).toHaveCount(5, {
-		timeout: 15_000,
-	});
-
-	await dataCase.selectOption("empty");
-	await expect(page).toHaveURL(/d_jobs=empty/);
-	await expect(
-		page.getByRole("heading", { name: "当前时间范围暂无采集记录" }),
-	).toBeVisible();
-	await expect(page.getByRole("table")).toHaveCount(0);
-
-	await dataCase.selectOption("loading");
-	await expect(page).toHaveURL(/d_jobs=loading/);
-	await expect(page.getByText("正在加载记录...")).toBeVisible();
-	await expect(
-		page.locator('[aria-label="内容处理活动"][aria-busy="true"]'),
-	).toBeVisible();
-});
-
 test("demo worker ignores unmarked live requests in regular dev builds", async ({
 	page,
 }) => {

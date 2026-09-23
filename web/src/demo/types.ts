@@ -65,8 +65,6 @@ export type DemoPersonaId = "guest" | "member" | "admin";
 
 export type DemoNetworkMode = "normal" | "slow" | "faulty" | "readable-loading";
 
-export type DemoAdminJobsDataCase = "loaded" | "empty" | "many" | "loading";
-
 export type DemoPublicationState = "published" | "unpublished";
 
 export type DemoWebhookScenario =
@@ -191,7 +189,6 @@ export type DemoShareState = {
 	sceneId: DemoSceneId;
 	personaId: DemoPersonaId;
 	networkMode: DemoNetworkMode;
-	adminJobsDataCase: DemoAdminJobsDataCase;
 	includeOwnReleases: boolean;
 	webhookScenario: DemoWebhookScenario;
 	publicationState: DemoPublicationState;

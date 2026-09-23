@@ -93,7 +93,6 @@ const runtimeState: DemoSnapshot = {
 		sceneId: "landing-welcome",
 		personaId: "guest",
 		networkMode: "normal",
-		adminJobsDataCase: "many",
 		includeOwnReleases: false,
 		webhookScenario: "deleted",
 		publicationState: "unpublished",
@@ -132,7 +131,6 @@ function modelAffectingShareStateChanged(
 	return (
 		current.sceneId !== next.sceneId ||
 		current.personaId !== next.personaId ||
-		current.adminJobsDataCase !== next.adminJobsDataCase ||
 		current.includeOwnReleases !== next.includeOwnReleases ||
 		current.webhookScenario !== next.webhookScenario ||
 		current.publicationState !== next.publicationState ||

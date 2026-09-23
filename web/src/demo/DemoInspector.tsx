@@ -38,7 +38,6 @@ import { useMediaQuery } from "@/lib/useMediaQuery";
 import { cn } from "@/lib/utils";
 import {
 	buildDefaultDemoShareState,
-	ADMIN_JOBS_DATA_CASE_OPTIONS,
 	DEMO_SCENES,
 	getLandingCaseControls,
 	LANDING_AUTH_ACTION_OPTIONS,
@@ -52,7 +51,6 @@ import type {
 	DemoLandingBootState,
 	DemoLandingCase,
 	DemoLandingPasskeySupport,
-	DemoAdminJobsDataCase,
 	DemoNetworkMode,
 	DemoWebhookScenario,
 } from "@/demo/types";
@@ -543,8 +541,6 @@ export function DemoInspector(props: {
 						snapshot.shareState.networkMode === "readable-loading",
 				},
 			),
-		onAdminJobsDataCaseChange: (adminJobsDataCase: DemoAdminJobsDataCase) =>
-			navigateWithShareState({ adminJobsDataCase }, { reseed: true }),
 		onIncludeOwnReleasesChange: (includeOwnReleases: boolean) =>
 			navigateWithShareState(
 				{
@@ -1021,7 +1017,6 @@ export type DemoInspectorPanelProps = {
 	onLandingBootStateChange: (bootState: DemoLandingBootState) => void;
 	onPersonaChange: (personaId: "guest" | "member" | "admin") => void;
 	onNetworkChange: (networkMode: DemoNetworkMode) => void;
-	onAdminJobsDataCaseChange: (dataCase: DemoAdminJobsDataCase) => void;
 	onIncludeOwnReleasesChange: (checked: boolean) => void;
 	onWebhookScenarioChange: (scenario: DemoWebhookScenario) => void;
 	onPublicationStateChange: (state: "published" | "unpublished") => void;
@@ -1039,7 +1034,6 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 	const landingBootStateSelectId = useId();
 	const personaSelectId = useId();
 	const networkSelectId = useId();
-	const adminJobsDataCaseSelectId = useId();
 	const includeOwnReleasesSwitchId = useId();
 	const webhookScenarioSelectId = useId();
 	const publicationStateSelectId = useId();
@@ -1109,23 +1103,6 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 							/>
 						</div>
 					</section>
-
-					{snapshot.shareState.sceneId === "admin-jobs-running" ? (
-						<section className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
-							<Label htmlFor={adminJobsDataCaseSelectId}>Data case</Label>
-							<InspectorSelect
-								id={adminJobsDataCaseSelectId}
-								value={snapshot.shareState.adminJobsDataCase}
-								onValueChange={(value) =>
-									props.onAdminJobsDataCaseChange(
-										value as DemoAdminJobsDataCase,
-									)
-								}
-								options={ADMIN_JOBS_DATA_CASE_OPTIONS}
-								compact={isCompact}
-							/>
-						</section>
-					) : null}
 				</CardContent>
 			</Card>
 
