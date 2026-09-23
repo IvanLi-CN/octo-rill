@@ -176,7 +176,7 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 const generateBriefAction = fn();
-const busySyncInboxAction = fn();
+const busySyncAllAction = fn();
 
 export const Empty: Story = {
 	render: () => (
@@ -184,7 +184,6 @@ export const Empty: Story = {
 			initialOpen
 			isAdmin={false}
 			onSyncAll={() => {}}
-			onSyncInbox={() => {}}
 			onGenerateBrief={() => {}}
 			searchTransport={mockSearchTransport}
 		/>
@@ -272,7 +271,6 @@ export const Actions: Story = {
 			initialOpen
 			isAdmin={false}
 			onSyncAll={() => {}}
-			onSyncInbox={() => {}}
 			onGenerateBrief={() => {}}
 			searchTransport={mockSearchTransport}
 		/>
@@ -285,27 +283,27 @@ export const Actions: Story = {
 		await expect(
 			canvas.queryByText("v2.31.0 · 稳定的命令面板"),
 		).not.toBeInTheDocument();
-		await expect(canvas.getByText("同步 Inbox")).toBeVisible();
+		await expect(canvas.queryByText("同步 Inbox")).not.toBeInTheDocument();
 	},
 };
 
-export const BusyActionsIgnoreKeyboardEnter: Story = {
+export const BusyAllSyncIgnoresKeyboardEnter: Story = {
 	render: () => (
 		<PalettePreview
 			initialOpen
 			isAdmin={false}
-			busy="Sync inbox"
-			onSyncInbox={busySyncInboxAction}
+			busy="busy"
+			onSyncAll={busySyncAllAction}
 			searchTransport={mockSearchTransport}
 		/>
 	),
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement.ownerDocument.body);
 		const input = canvas.getByRole("combobox", { name: "搜索内容或执行动作" });
-		await userEvent.type(input, "> 同步 Inbox");
+		await userEvent.type(input, "> 全量同步");
 		await userEvent.keyboard("{ArrowDown}{Enter}");
-		await expect(canvas.getByText("同步 Inbox")).toBeVisible();
-		await expect(busySyncInboxAction).not.toHaveBeenCalled();
+		await expect(canvas.getByText("全量同步")).toBeVisible();
+		await expect(busySyncAllAction).not.toHaveBeenCalled();
 	},
 };
 

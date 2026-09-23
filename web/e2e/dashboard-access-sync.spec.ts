@@ -1172,11 +1172,11 @@ test.describe("mobile dashboard shell", () => {
 			page.locator("[data-dashboard-sidebar-inbox='true']"),
 		).toHaveCount(0);
 		await expect(page.getByText("Build failed on main")).toBeVisible();
-		const syncInboxButton = page.getByRole("button", { name: "Sync inbox" });
 		const githubLink = page.getByRole("link", { name: "GitHub" }).first();
-		const syncInboxBox = await syncInboxButton.boundingBox();
 		const githubBox = await githubLink.boundingBox();
-		expect(syncInboxBox?.width ?? 0).toBeLessThanOrEqual(36);
+		await expect(page.getByRole("button", { name: "Sync inbox" })).toHaveCount(
+			0,
+		);
 		expect(githubBox?.width ?? 0).toBeLessThanOrEqual(36);
 		expect(notificationCalls).toBe(1);
 	});
@@ -2024,7 +2024,9 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 
 		await page.goto("/");
 
-		await page.getByRole("button", { name: "同步" }).hover();
+		const syncButton = page.getByRole("button", { name: "同步" });
+		await syncButton.hover();
+		await syncButton.focus();
 		const tooltip = page.locator('[data-slot="tooltip-content"]').first();
 		await expect(tooltip).toBeVisible();
 		await expect(tooltip).toContainText("后台任务已启动");
@@ -2583,7 +2585,7 @@ test("dashboard keeps readable content and exposes refresh retry after a transie
 	expect(updatesCalls).toBeGreaterThanOrEqual(2);
 });
 
-test("dashboard opens access sync warmup bubble immediately after clicking sync", async ({
+test("dashboard keeps access sync details closed until interaction", async ({
 	page,
 }) => {
 	let feedCalls = 0;
@@ -2593,7 +2595,14 @@ test("dashboard opens access sync warmup bubble immediately after clicking sync"
 	let syncAllCalls = 0;
 
 	await page.addInitScript(
-		({ taskId, runningDelayMs, starDelayMs, completeDelayMs }) => {
+		({
+			taskId,
+			runningDelayMs,
+			releaseDelayMs,
+			staleStarDelayMs,
+			errorDelayMs,
+			completeDelayMs,
+		}) => {
 			class MockEventSource {
 				url: string;
 				readyState = 1;
@@ -2632,10 +2641,32 @@ test("dashboard opens access sync warmup bubble immediately after clicking sync"
 						window.setTimeout(() => {
 							this.dispatch("task.progress", {
 								task_id: taskId,
+								stage: "release_summary",
+								releases: 10,
+							});
+						}, releaseDelayMs),
+					);
+					this.timers.push(
+						window.setTimeout(() => {
+							this.dispatch("task.progress", {
+								task_id: taskId,
+								stage: "release_summary",
+								releases: 2,
+							});
+							this.dispatch("task.progress", {
+								task_id: taskId,
 								stage: "star_refreshed",
 								repos: 1,
 							});
-						}, starDelayMs),
+						}, staleStarDelayMs),
+					);
+					this.timers.push(
+						window.setTimeout(() => {
+							this.onerror?.call(
+								this as unknown as EventSource,
+								new Event("error"),
+							);
+						}, errorDelayMs),
 					);
 					this.timers.push(
 						window.setTimeout(() => {
@@ -2688,8 +2719,10 @@ test("dashboard opens access sync warmup bubble immediately after clicking sync"
 		{
 			taskId: "task-access-click",
 			runningDelayMs: 60,
-			starDelayMs: 2200,
-			completeDelayMs: 4300,
+			releaseDelayMs: 1800,
+			staleStarDelayMs: 2200,
+			errorDelayMs: 1200,
+			completeDelayMs: 9000,
 		},
 	);
 
@@ -2774,11 +2807,57 @@ test("dashboard opens access sync warmup bubble immediately after clicking sync"
 	await syncButton.click();
 
 	const tooltip = page.locator('[data-slot="tooltip-content"]').first();
+	await expect(page.locator('[data-slot="tooltip-content"]')).toHaveCount(0);
+	await syncButton.hover();
 	await expect(tooltip).toBeVisible();
 	await page.waitForTimeout(500);
 	await expect(tooltip).toContainText("后台任务已启动");
 	await expect(tooltip).toContainText("0/4");
 	await expect(tooltip).toContainText("正在准备 Star 阶段");
+	const progressBefore = Number(
+		await syncButton.getAttribute("data-dashboard-sync-progress"),
+	);
+	await page.waitForTimeout(400);
+	const progressAfter = Number(
+		await syncButton.getAttribute("data-dashboard-sync-progress"),
+	);
+	expect(progressAfter).toBeGreaterThanOrEqual(progressBefore);
+	expect(progressAfter).toBeLessThan(25);
+
+	await expect(page.getByText("Release 已同步").first()).toBeVisible({
+		timeout: 3000,
+	});
+	await expect(page.getByText("写入 10 条 Release").first()).toBeVisible();
+	const stageProgressBeforeStaleEvent = Number(
+		await syncButton.getAttribute("data-dashboard-sync-progress"),
+	);
+	await page.waitForTimeout(500);
+	const stageProgressAfterStaleEvent = Number(
+		await syncButton.getAttribute("data-dashboard-sync-progress"),
+	);
+	expect(stageProgressAfterStaleEvent).toBeGreaterThanOrEqual(
+		stageProgressBeforeStaleEvent,
+	);
+
+	await page.emulateMedia({ reducedMotion: "reduce" });
+	const reducedMotionBefore = Number(
+		await syncButton.getAttribute("data-dashboard-sync-progress"),
+	);
+	await page.waitForTimeout(400);
+	const reducedMotionAfter = Number(
+		await syncButton.getAttribute("data-dashboard-sync-progress"),
+	);
+	expect(reducedMotionAfter).toBeGreaterThanOrEqual(reducedMotionBefore);
+	await page.waitForTimeout(400);
+	const reducedMotionStable = Number(
+		await syncButton.getAttribute("data-dashboard-sync-progress"),
+	);
+	expect(reducedMotionStable).toBe(reducedMotionAfter);
+	expect(
+		await syncButton
+			.locator("svg")
+			.evaluate((element) => getComputedStyle(element).animationName),
+	).toBe("none");
 
 	await page.locator("body").click({ position: { x: 20, y: 320 } });
 	await expect(page.locator('[data-slot="tooltip-content"]')).toHaveCount(0);
@@ -2803,9 +2882,7 @@ test("dashboard opens access sync warmup bubble immediately after clicking sync"
 	expect(briefCalls).toBeGreaterThanOrEqual(1);
 });
 
-test("dashboard keeps inbox sync busy through transient task stream errors", async ({
-	page,
-}) => {
+test("dashboard keeps Inbox free of a local sync action", async ({ page }) => {
 	let feedCalls = 0;
 	let notificationCalls = 0;
 	let syncInboxCalls = 0;
@@ -3027,25 +3104,15 @@ test("dashboard keeps inbox sync busy through transient task stream errors", asy
 
 		await page.goto("/?tab=inbox");
 
-		const syncInboxButton = page.getByRole("button", { name: "Sync inbox" });
-		await expect(syncInboxButton).toBeVisible();
+		await expect(page.getByRole("button", { name: "Sync inbox" })).toHaveCount(
+			0,
+		);
 		await page.getByRole("tab", { name: "收件箱" }).click();
 		await expect(page.getByText("Cached inbox thread").first()).toBeVisible();
-
-		await syncInboxButton.click();
-		await expect(syncInboxButton).toBeDisabled();
-		await page.waitForTimeout(120);
-		await expect(syncInboxButton).toBeDisabled();
-
-		await expect(page.getByText("Fresh inbox thread").first()).toBeVisible();
-		await expect(
-			page.getByRole("link", { name: /Fresh inbox thread/i }).first(),
-		).toHaveAttribute("href", "https://github.com/owner/repo/pull/77");
-		await expect(syncInboxButton).toBeEnabled();
-
-		expect(syncInboxCalls).toBe(1);
+		await expect(page.getByText("Fresh inbox thread").first()).toHaveCount(0);
+		expect(syncInboxCalls).toBe(0);
 		expect(feedCalls).toBeGreaterThanOrEqual(2);
-		expect(notificationCalls).toBeGreaterThanOrEqual(2);
+		expect(notificationCalls).toBeGreaterThanOrEqual(1);
 	} finally {
 		if (freshTimer) {
 			clearTimeout(freshTimer);
@@ -3240,20 +3307,16 @@ test("dashboard keeps inbox sync reachable when inbox is empty", async ({
 
 	await page.goto("/?tab=inbox");
 
-	const syncInboxButton = page.getByRole("button", { name: "Sync inbox" });
 	const inboxEmptyState = page.locator('[data-list-empty-state="true"]');
-	await expect(syncInboxButton).toBeVisible();
+	await expect(page.getByRole("button", { name: "Sync inbox" })).toHaveCount(0);
 	await expect(inboxEmptyState.getByText("暂无通知")).toBeVisible();
-	await expect(inboxEmptyState.getByText("可以点击")).toBeVisible();
+	await expect(inboxEmptyState.getByText("请点击顶部的")).toBeVisible();
 	await expect(inboxEmptyState.getByText("拉取最新数据。")).toBeVisible();
 	await expect(
 		page.getByRole("link", { name: "GitHub" }).first(),
 	).toHaveAttribute("href", "https://github.com/notifications");
 
-	await syncInboxButton.click();
-	await expect(syncInboxButton).toBeDisabled();
-	await expect(syncInboxButton).toBeEnabled();
-	expect(syncInboxCalls).toBe(1);
+	expect(syncInboxCalls).toBe(0);
 });
 
 test("dashboard inbox cards fall back to GitHub per-thread pages when html_url is missing", async ({

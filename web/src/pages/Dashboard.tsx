@@ -120,6 +120,7 @@ import {
 	DashboardHeader,
 	type DashboardSyncProgress,
 } from "@/pages/DashboardHeader";
+import type { DashboardSyncLifecycle } from "@/pages/dashboardSyncProgress";
 import { buildSettingsHref, buildSettingsSearch } from "@/settings/routeState";
 import {
 	isReactionTokenUsable,
@@ -1669,10 +1670,15 @@ export function Dashboard(props: {
 	const [accessSyncStage, setAccessSyncStage] = useState<
 		"idle" | "waiting" | "running" | "star_refreshed" | "completed" | "failed"
 	>(initialAccessTask ? "waiting" : "idle");
+	const [accessSyncLifecycle, setAccessSyncLifecycle] =
+		useState<DashboardSyncLifecycle>(initialAccessTask ? "running" : "idle");
 	const [accessSyncProgress, setAccessSyncProgress] =
 		useState<DashboardSyncProgress | null>(
 			initialAccessTask ? accessSyncProgressFromStage("waiting") : null,
 		);
+	const accessSyncProgressRef = useRef<DashboardSyncProgress | null>(
+		initialAccessTask ? accessSyncProgressFromStage("waiting") : null,
+	);
 	const refreshTaskSourcesRef = useRef<Map<string, EventSource>>(new Map());
 	const refreshTaskReconnectTimersRef = useRef<Map<string, number>>(new Map());
 	const refreshTaskLifecyclesRef = useRef<
@@ -3065,7 +3071,10 @@ export function Dashboard(props: {
 					current?.taskId === next.taskId ? current : next,
 				);
 				setAccessSyncStage("waiting");
-				setAccessSyncProgress(accessSyncProgressFromStage("waiting"));
+				setAccessSyncLifecycle("running");
+				const waitingProgress = accessSyncProgressFromStage("waiting");
+				accessSyncProgressRef.current = waitingProgress;
+				setAccessSyncProgress(waitingProgress);
 				return promise;
 			}
 			setRefreshTaskStreams((current) =>
@@ -3394,6 +3403,7 @@ export function Dashboard(props: {
 			setAccessSyncStage((current) =>
 				current === "completed" ? current : "failed",
 			);
+			setAccessSyncLifecycle("failed");
 			setAccessSyncProgress((current) =>
 				current
 					? {
@@ -3413,27 +3423,45 @@ export function Dashboard(props: {
 
 		const onProgress = (event: Event) => {
 			if (streamSettled || completionInFlight) return;
+			setAccessSyncLifecycle("running");
 			const payload = parsePayload(event as MessageEvent<string>);
-			if (payload.stage === "star_refreshed") {
-				setAccessSyncStage("star_refreshed");
-				setAccessSyncProgress(
-					accessSyncProgressFromStage("star_refreshed", payload),
+			const stage = payload.stage;
+			if (stage === "star_refreshed") {
+				const nextProgress = accessSyncProgressFromStage(
+					"star_refreshed",
+					payload,
 				);
+				if (
+					accessSyncProgressRef.current &&
+					nextProgress.currentStep <= accessSyncProgressRef.current.currentStep
+				) {
+					return;
+				}
+				accessSyncProgressRef.current = nextProgress;
+				setAccessSyncStage("star_refreshed");
+				setAccessSyncProgress(nextProgress);
 				refreshOnUi();
 				return;
 			}
 			if (
-				payload.stage === "release_summary" ||
-				payload.stage === "social_summary" ||
-				payload.stage === "notifications_summary"
+				stage === "release_summary" ||
+				stage === "social_summary" ||
+				stage === "notifications_summary"
 			) {
-				setAccessSyncProgress(
-					accessSyncProgressFromStage(payload.stage, payload),
-				);
+				const nextProgress = accessSyncProgressFromStage(stage, payload);
+				if (
+					accessSyncProgressRef.current &&
+					nextProgress.currentStep <= accessSyncProgressRef.current.currentStep
+				) {
+					return;
+				}
+				accessSyncProgressRef.current = nextProgress;
+				setAccessSyncProgress(nextProgress);
 			}
 		};
 
 		const onRunning = () => {
+			setAccessSyncLifecycle("running");
 			setAccessSyncStage((current) =>
 				current === "waiting" ? "running" : current,
 			);
@@ -3486,6 +3514,7 @@ export function Dashboard(props: {
 						? new Error(payload.error ?? "后台同步失败")
 						: undefined;
 				if (payload.status === "succeeded") {
+					setAccessSyncLifecycle("refreshing");
 					startQueuedCompletionTimer();
 					setAccessSyncProgress((current) => ({
 						currentStep: current?.currentStep ?? ACCESS_SYNC_TOTAL_STEPS,
@@ -3506,6 +3535,7 @@ export function Dashboard(props: {
 					} catch (error) {
 						if (streamSettled) return;
 						setAccessSyncStage("failed");
+						setAccessSyncLifecycle("failed");
 						setAccessSyncProgress((current) => ({
 							currentStep: current?.currentStep ?? 0,
 							totalSteps: ACCESS_SYNC_TOTAL_STEPS,
@@ -3530,6 +3560,7 @@ export function Dashboard(props: {
 						return;
 					}
 					setAccessSyncStage("completed");
+					setAccessSyncLifecycle("succeeded");
 					setAccessSyncProgress(() => ({
 						currentStep: ACCESS_SYNC_TOTAL_STEPS,
 						totalSteps: ACCESS_SYNC_TOTAL_STEPS,
@@ -3538,6 +3569,7 @@ export function Dashboard(props: {
 					}));
 				} else {
 					setAccessSyncStage("failed");
+					setAccessSyncLifecycle("failed");
 					setAccessSyncProgress((current) => ({
 						currentStep: current?.currentStep ?? 0,
 						totalSteps: ACCESS_SYNC_TOTAL_STEPS,
@@ -4102,22 +4134,6 @@ export function Dashboard(props: {
 		},
 		[checkDashboardUpdates, notifyGlobalError, refreshSidebar],
 	);
-	const onSyncInbox = useCallback(() => {
-		void run(
-			"Sync inbox",
-			async () => {
-				const task = await apiPost<TaskAcceptedResponse>(
-					"/api/sync/notifications?return_mode=task_id",
-				);
-				await trackTaskStream(task, "refresh");
-			},
-			{
-				errorTitle: "Inbox 同步失败",
-				fallback: "Inbox 同步失败，请稍后重试。",
-			},
-		);
-	}, [run, trackTaskStream]);
-
 	const accessSyncRunning =
 		accessTaskStream !== null &&
 		accessSyncStage !== "completed" &&
@@ -4131,6 +4147,7 @@ export function Dashboard(props: {
 			return;
 		}
 		syncAllInFlightRef.current = true;
+		setAccessSyncLifecycle("running");
 		setAccessSyncProgress(accessSyncProgressFromStage("waiting"));
 		void run(
 			SYNC_ALL_LABEL,
@@ -4144,13 +4161,31 @@ export function Dashboard(props: {
 				errorTitle: "全量同步失败",
 				fallback: "全量同步失败，请稍后重试。",
 			},
-		).finally(() => {
-			syncAllInFlightRef.current = false;
-		});
+		)
+			.then((result) => {
+				if (result === null) setAccessSyncLifecycle("failed");
+			})
+			.finally(() => {
+				syncAllInFlightRef.current = false;
+			});
 	}, [accessSyncRunning, busy, run, trackTaskStream]);
+	useEffect(() => {
+		if (
+			accessSyncLifecycle !== "succeeded" &&
+			accessSyncLifecycle !== "failed"
+		) {
+			return;
+		}
+		const resetTimer = window.setTimeout(
+			() => {
+				setAccessSyncLifecycle("idle");
+				setAccessSyncProgress(null);
+			},
+			accessSyncLifecycle === "succeeded" ? 1600 : 2600,
+		);
+		return () => window.clearTimeout(resetTimer);
+	}, [accessSyncLifecycle]);
 	const syncingAll = busy === SYNC_ALL_LABEL || accessSyncRunning;
-	const syncingInbox = busy === "Sync inbox";
-
 	const aiDisabledHint = useMemo(() => {
 		const any = activeFeedItems.find(
 			(it) =>
@@ -4751,10 +4786,9 @@ export function Dashboard(props: {
 					aiDisabledHint={aiDisabledHint}
 					busy={Boolean(busy)}
 					syncingAll={syncingAll}
-					syncingInbox={syncingInbox}
+					syncLifecycle={accessSyncLifecycle}
 					syncProgress={accessSyncProgress}
 					onSyncAll={onSyncAll}
-					onSyncInbox={onSyncInbox}
 					onGenerateBrief={onGenerateBrief}
 					mineHref={buildDashboardScopeHref({ kind: "mine" })}
 					mineLabel={DASHBOARD_MINE_ENTRY_LABEL}
@@ -4929,14 +4963,12 @@ export function Dashboard(props: {
 											notifications={notifications}
 											loading={notificationsLoading}
 											busy={Boolean(busy)}
-											syncing={syncingInbox}
 											freshKeys={freshNotificationKeys}
 											error={
 												notificationsError?.phase === "initial"
 													? notificationsError.message
 													: null
 											}
-											onSync={tab === "inbox" ? onSyncInbox : undefined}
 											onRetry={() =>
 												void refreshNotifications({ background: false })
 											}

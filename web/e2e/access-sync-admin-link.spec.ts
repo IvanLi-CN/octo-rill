@@ -484,6 +484,8 @@ test("dashboard sync click creates the same access-refresh task visible in admin
 	await syncButton.click();
 
 	const tooltip = page.locator('[data-slot="tooltip-content"]').first();
+	await expect(tooltip).toHaveCount(0);
+	await syncButton.hover();
 	await expect(tooltip).toBeVisible();
 	await expect(tooltip).toContainText("后台任务已启动");
 	await captureRawEvidence(page, "access-sync-dashboard-started-raw.png");
