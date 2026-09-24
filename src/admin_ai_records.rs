@@ -352,14 +352,12 @@ struct BriefCallRow {
     id: String,
     status: String,
     source: String,
-    model: String,
     attempt_count: i64,
     started_at: Option<String>,
     finished_at: Option<String>,
     updated_at: String,
     last_attempt_at: Option<String>,
     error_text: Option<String>,
-    failure_class: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1215,9 +1213,9 @@ async fn load_brief_summaries_in_connection(
         return Ok(HashMap::new());
     }
     let mut query = QueryBuilder::<Sqlite>::new(
-        "SELECT c.id, c.status, c.source, c.model, c.attempt_count, c.started_at, c.finished_at, c.updated_at,
+        "SELECT c.id, c.status, c.source, c.attempt_count, c.started_at, c.finished_at, c.updated_at,
             (SELECT MAX(e.created_at) FROM llm_call_events e WHERE e.call_id = c.id AND e.event_type IN ('llm.running', 'llm.attempt_failed', 'llm.succeeded', 'llm.failed')) AS last_attempt_at,
-            c.error_text, c.failure_class, c.parent_brief_id FROM llm_calls c WHERE c.parent_brief_id IN (",
+            c.error_text, c.parent_brief_id FROM llm_calls c WHERE c.parent_brief_id IN (",
     );
     {
         let mut separated = query.separated(", ");
@@ -1689,10 +1687,11 @@ fn activity_query_sql(kind: CollectionRecordKind, global_mode: bool) -> String {
                                     WHEN 'queued' THEN 0
                                     WHEN 'running' THEN 1
                                     WHEN 'deferred_provider' THEN 2
-                                    WHEN 'ready' THEN 3
-                                    WHEN 'failed' THEN 4
+                                    WHEN 'blocked_config' THEN 3
+                                    WHEN 'ready' THEN 4
+                                    WHEN 'failed' THEN 5
                                     WHEN 'superseded' THEN 9
-                                    ELSE 5
+                                    ELSE 6
                                 END,
                                 CASE WHEN w.pipeline = 'translation' AND w.variant = 'detail' THEN 0 ELSE 1 END,
                                 julianday(w.updated_at) DESC,
@@ -2053,10 +2052,11 @@ fn collection_query_sql(
                                     WHEN 'queued' THEN 0
                                     WHEN 'running' THEN 1
                                     WHEN 'deferred_provider' THEN 2
-                                    WHEN 'ready' THEN 3
-                                    WHEN 'failed' THEN 4
+                                    WHEN 'blocked_config' THEN 3
+                                    WHEN 'ready' THEN 4
+                                    WHEN 'failed' THEN 5
                                     WHEN 'superseded' THEN 9
-                                    ELSE 5
+                                    ELSE 6
                                 END,
                                 CASE WHEN w.pipeline = 'translation' AND w.variant = 'detail' THEN 0 ELSE 1 END,
                                 julianday(w.updated_at) DESC,
@@ -3097,9 +3097,9 @@ async fn load_brief_attempts(
     brief_id: &str,
 ) -> Result<Vec<AdminCollectionAttempt>, ApiError> {
     let calls = sqlx::query_as::<_, BriefCallRow>(
-        "SELECT c.id, c.status, c.source, c.model, c.attempt_count, c.started_at, c.finished_at, c.updated_at,
+        "SELECT c.id, c.status, c.source, c.attempt_count, c.started_at, c.finished_at, c.updated_at,
             (SELECT MAX(e.created_at) FROM llm_call_events e WHERE e.call_id = c.id AND e.event_type IN ('llm.running', 'llm.attempt_failed', 'llm.succeeded', 'llm.failed')) AS last_attempt_at,
-            c.error_text, c.failure_class FROM llm_calls c WHERE c.parent_brief_id = ? ORDER BY datetime(c.created_at) ASC, c.id ASC",
+            c.error_text FROM llm_calls c WHERE c.parent_brief_id = ? ORDER BY datetime(c.created_at) ASC, c.id ASC",
     )
     .bind(brief_id)
     .fetch_all(&state.pool)
@@ -3167,17 +3167,11 @@ fn build_brief_attempts(
                 .map(|event| event.status.clone())
                 .or_else(|| failed.map(|_| "failed".to_owned()))
                 .or_else(|| running.map(|event| event.status.clone()))
-                .unwrap_or_else(|| {
-                    if !is_latest {
-                        "not_recorded".to_owned()
-                    } else {
-                        call.status.clone()
-                    }
-                });
+                .unwrap_or_else(|| "not_recorded".to_owned());
             let failure_class = failed
                 .and_then(|event| event.failure_class.clone())
-                .or_else(|| is_latest.then(|| call.failure_class.clone()).flatten());
-            let classified = is_latest
+                .or_else(|| terminal.and_then(|event| event.failure_class.clone()));
+            let classified = (is_latest && status == "failed")
                 .then(|| translations::classify_translation_error(call.error_text.as_deref()))
                 .flatten();
             let retry_eligible = status == "failed"
@@ -3186,19 +3180,16 @@ fn build_brief_attempts(
             let last_attempt_at = terminal
                 .map(|event| event.created_at.clone())
                 .or_else(|| failed.map(|event| event.created_at.clone()))
-                .or_else(|| running.map(|event| event.created_at.clone()))
-                .or_else(|| (attempt_no == 1).then(|| call.started_at.clone()).flatten())
-                .or_else(|| is_latest.then(|| call.finished_at.clone()).flatten());
-            let started_at = running
-                .map(|event| event.created_at.clone())
-                .or_else(|| (attempt_no == 1).then(|| call.started_at.clone()).flatten());
+                .or_else(|| running.map(|event| event.created_at.clone()));
+            let started_at = running.map(|event| event.created_at.clone());
             let finished_at = terminal
                 .map(|event| event.created_at.clone())
-                .or_else(|| failed.map(|event| event.created_at.clone()))
-                .or_else(|| is_latest.then(|| call.finished_at.clone()).flatten());
+                .or_else(|| failed.map(|event| event.created_at.clone()));
             let model = running
                 .and_then(|event| event.model.clone())
-                .unwrap_or_else(|| call.model.clone());
+                .or_else(|| failed.and_then(|event| event.model.clone()))
+                .or_else(|| terminal.and_then(|event| event.model.clone()))
+                .unwrap_or_else(|| "unknown".to_owned());
             attempts.push(AdminCollectionAttempt {
                 id: format!("{}:{attempt_no}", call.id),
                 pipeline: "polish".to_owned(),
@@ -3225,7 +3216,7 @@ fn build_brief_attempts(
                 next_retry_at: None,
                 llm_calls: vec![AdminCollectionLlmLink {
                     id: call.id.clone(),
-                    status,
+                    status: status.clone(),
                     source: call.source.clone(),
                     model,
                     stage: None,
@@ -4277,53 +4268,37 @@ mod tests {
                 id: "call-1".to_owned(),
                 status: "succeeded".to_owned(),
                 source: "brief".to_owned(),
-                model: "model-b".to_owned(),
                 attempt_count: 3,
                 started_at: Some("2026-07-08T00:00:00Z".to_owned()),
                 finished_at: Some("2026-07-08T00:00:05Z".to_owned()),
                 updated_at: "2026-07-08T00:00:05Z".to_owned(),
                 last_attempt_at: Some("2026-07-08T00:00:04Z".to_owned()),
                 error_text: None,
-                failure_class: None,
             },
             BriefCallRow {
                 id: "call-2".to_owned(),
                 status: "succeeded".to_owned(),
                 source: "brief".to_owned(),
-                model: "model-c".to_owned(),
                 attempt_count: 1,
                 started_at: Some("2026-07-08T00:00:06Z".to_owned()),
                 finished_at: Some("2026-07-08T00:00:07Z".to_owned()),
                 updated_at: "2026-07-08T00:00:07Z".to_owned(),
                 last_attempt_at: Some("2026-07-08T00:00:06Z".to_owned()),
                 error_text: None,
-                failure_class: None,
             },
             BriefCallRow {
                 id: "call-3".to_owned(),
                 status: "succeeded".to_owned(),
                 source: "brief".to_owned(),
-                model: "model-d".to_owned(),
                 attempt_count: 3,
                 started_at: Some("2026-07-08T00:00:08Z".to_owned()),
                 finished_at: Some("2026-07-08T00:00:12Z".to_owned()),
                 updated_at: "2026-07-08T00:00:12Z".to_owned(),
                 last_attempt_at: None,
                 error_text: None,
-                failure_class: None,
             },
         ];
         let events = vec![
-            BriefAttemptEventRow {
-                call_id: "call-1".to_owned(),
-                event_type: "llm.running".to_owned(),
-                status: "running".to_owned(),
-                model: Some("model-a".to_owned()),
-                attempt: Some(1),
-                terminal_attempt_count: None,
-                failure_class: None,
-                created_at: "2026-07-08T00:00:00Z".to_owned(),
-            },
             BriefAttemptEventRow {
                 call_id: "call-1".to_owned(),
                 event_type: "llm.attempt_failed".to_owned(),
@@ -4407,6 +4382,8 @@ mod tests {
         );
         assert_eq!(attempts[0].status, "failed");
         assert_eq!(attempts[0].failure_class.as_deref(), Some("transient"));
+        assert_eq!(attempts[0].started_at, None);
+        assert_eq!(attempts[0].llm_calls[0].model, "model-a");
         assert_eq!(attempts[1].status, "failed");
         assert_eq!(attempts[1].failure_class.as_deref(), Some("rate_limited"));
         assert_eq!(attempts[2].status, "succeeded");
@@ -4414,32 +4391,36 @@ mod tests {
             attempts[2].last_attempt_at.as_deref(),
             Some("2026-07-08T00:00:05Z")
         );
-        assert_eq!(attempts[0].llm_calls[0].model, "model-a");
         assert_eq!(attempts[3].llm_calls[0].id, "call-2");
         assert_eq!(attempts[4].status, "not_recorded");
-        assert_eq!(
-            attempts[4].last_attempt_at.as_deref(),
-            Some("2026-07-08T00:00:08Z")
-        );
+        assert_eq!(attempts[4].started_at, None);
+        assert_eq!(attempts[4].last_attempt_at, None);
+        assert_eq!(attempts[4].finished_at, None);
+        assert_eq!(attempts[4].llm_calls[0].status, "not_recorded");
+        assert_eq!(attempts[4].llm_calls[0].model, "unknown");
         assert_eq!(attempts[5].status, "not_recorded");
+        assert_eq!(attempts[5].started_at, None);
         assert_eq!(attempts[5].last_attempt_at, None);
-        assert_eq!(attempts[5].retry_eligible, false);
+        assert_eq!(attempts[5].finished_at, None);
+        assert!(!attempts[5].retry_eligible);
         assert_eq!(attempts[5].retry_disposition, None);
-        assert_eq!(attempts[6].status, "succeeded");
-        assert_eq!(
-            attempts[6].last_attempt_at.as_deref(),
-            Some("2026-07-08T00:00:12Z")
-        );
+        assert_eq!(attempts[6].status, "not_recorded");
+        assert_eq!(attempts[6].started_at, None);
+        assert_eq!(attempts[6].last_attempt_at, None);
+        assert_eq!(attempts[6].finished_at, None);
+        assert_eq!(attempts[6].llm_calls[0].status, "not_recorded");
     }
 
     #[test]
     fn global_attempt_history_falls_back_to_legacy_per_pipeline() {
-        let mut translation = AdminCollectionTaskSummary::default();
-        translation.global_work = Some(AdminContentProcessingEvidence {
-            status: "ready".to_owned(),
-            status_origin: "global_work".to_owned(),
+        let translation = AdminCollectionTaskSummary {
+            global_work: Some(AdminContentProcessingEvidence {
+                status: "ready".to_owned(),
+                status_origin: "global_work".to_owned(),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         let summaries = TaskSummaries {
             translation,
             polish: AdminCollectionTaskSummary::default(),
@@ -4578,6 +4559,23 @@ mod tests {
         .await
         .expect("seed global translation work");
         sqlx::query(
+            "INSERT INTO content_work_items (
+                id, pipeline, source_hash, status, attempt_count, started_at,
+                finished_at, updated_at, canonical_resource_type,
+                canonical_resource_id, variant, created_at, target_lang,
+                protocol_version, model_profile
+             ) VALUES (
+                'global-translation-blocked', 'translation', 'blocked-hash',
+                'blocked_config', 2, '2026-07-08T00:00:01Z',
+                '2026-07-08T00:00:04Z', '2026-07-08T00:00:04Z', 'release',
+                '101', 'detail', '2026-07-08T00:00:00Z', 'zh-CN', 'v1',
+                'default'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed equally ranked blocked global translation work");
+        sqlx::query(
             "INSERT INTO translation_work_items (
                 id, kind, status, result_status, attempt_count, started_at,
                 finished_at, updated_at, entity_id
@@ -4622,7 +4620,8 @@ mod tests {
         )
         .await
         .expect("load global rows");
-        assert_eq!(global_rows.len(), 1, "{global_rows:#?}");
+        assert_eq!(global_rows.len(), 2, "{global_rows:#?}");
+        assert_eq!(global_rows[0].status, "blocked_config");
         let summaries = load_task_summaries_in_connection(
             &mut connection,
             CollectionRecordKind::Release,
@@ -4634,7 +4633,7 @@ mod tests {
         .expect("load mixed-mode summaries");
         let summary = summaries.get("101").expect("record summary");
         assert_eq!(
-            summary.translation.display_status, "succeeded",
+            summary.translation.display_status, "blocked_config",
             "{:#?}",
             summary.translation
         );
@@ -4666,6 +4665,23 @@ mod tests {
         .expect("filter the mixed-mode release by its legacy polish summary");
         assert_eq!(total, 1);
         assert_eq!(rows[0].id, "101");
+
+        let (blocked_total, blocked_rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Release,
+            true,
+            Some("2026-07-07T00:00:00Z"),
+            Some("2026-07-09T00:00:00Z"),
+            AttemptCountRange { min: 0, max: None },
+            Some(&["blocked_config".to_owned()]),
+            None,
+            20,
+            0,
+        )
+        .await
+        .expect("filter mixed-mode release by selected global translation status");
+        assert_eq!(blocked_total, 1);
+        assert_eq!(blocked_rows[0].id, "101");
     }
 
     #[tokio::test]
@@ -5438,7 +5454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn global_activity_statuses_use_the_existing_display_mapping() {
+    async fn global_activity_prefers_blocked_config_over_ready_with_same_created_at() {
         let pool = test_pool().await;
         create_activity_status_tables(&pool).await;
         sqlx::query(
@@ -5472,7 +5488,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO content_work_items VALUES
                 ('translation-detail', 'release', '101', 'translation', 'detail', 'ready', '2026-07-08T08:40:00Z', '2026-07-08T08:41:00Z'),
-                ('translation-summary', 'release', '101', 'translation', 'summary', 'running', '2026-07-08T08:50:00Z', '2026-07-08T08:51:00Z'),
+                ('translation-summary', 'release', '101', 'translation', 'summary', 'ready', '2026-07-08T08:40:00Z', '2026-07-08T08:51:00Z'),
+                ('translation-blocked', 'release', '101', 'translation', 'detail', 'blocked_config', '2026-07-08T08:40:00Z', '2026-07-08T08:52:00Z'),
                 ('polish-smart', 'release', '101', 'polishing', 'smart', 'blocked_config', '2026-07-08T08:55:00Z', '2026-07-08T08:56:00Z')",
         )
         .execute(&pool)
@@ -5489,7 +5506,10 @@ mod tests {
         .await
         .expect("read global release activity");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].translation_status.as_deref(), Some("running"));
+        assert_eq!(
+            rows[0].translation_status.as_deref(),
+            Some("blocked_config")
+        );
         assert_eq!(rows[0].polish_status, "blocked_config");
         assert_eq!(
             composite_activity_status(
