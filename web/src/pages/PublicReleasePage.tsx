@@ -614,14 +614,34 @@ export function PublicReleasePage(props: {
 	const initialLoadKeyRef = useRef<string | null>(null);
 	const isHighlightMode = highlight !== null;
 	const initialLoadKey = JSON.stringify({ owner, repo, tag, highlight });
+	const requestKeyRef = useRef(initialLoadKey);
+	if (requestKeyRef.current !== initialLoadKey) {
+		requestKeyRef.current = initialLoadKey;
+	}
+	const loadedTimelineCacheKeyRef = useRef(timelineCacheKey);
+	const previousTimelineCacheKeyRef = useRef(timelineCacheKey);
 	const reactionControls = usePublicReleaseReactionControls(
 		state.status === "list" ? state.data.items : [],
 	);
 	useEffect(() => {
-		if (state.status === "list") {
+		if (previousTimelineCacheKeyRef.current === timelineCacheKey) return;
+		previousTimelineCacheKeyRef.current = timelineCacheKey;
+		setState({ status: "loading" });
+		setLoadingMore(false);
+		setLoadingNewer(false);
+		setLoadingGap(null);
+		setAppendError(null);
+	}, [timelineCacheKey]);
+	useEffect(() => {
+		if (
+			state.status === "list" &&
+			!tag &&
+			!highlight &&
+			loadedTimelineCacheKeyRef.current === timelineCacheKey
+		) {
 			publicReleaseTimelineCache.set(timelineCacheKey, state.data);
 		}
-	}, [state, timelineCacheKey]);
+	}, [highlight, state, tag, timelineCacheKey]);
 
 	const highlightRequest = useMemo(() => {
 		if (!highlight) return {};
@@ -670,6 +690,7 @@ export function PublicReleasePage(props: {
 	);
 
 	const load = useCallback(async () => {
+		const requestKey = initialLoadKey;
 		try {
 			setState((current) =>
 				current.status === "error" ? { status: "loading" } : current,
@@ -678,6 +699,7 @@ export function PublicReleasePage(props: {
 			const data = await apiGetPublicRepoReleases({
 				...buildHighlightRequest(),
 			});
+			if (requestKeyRef.current !== requestKey) return;
 			if (isPendingResponse(data)) {
 				setState({ status: "pending", pending: data });
 			} else {
@@ -685,7 +707,9 @@ export function PublicReleasePage(props: {
 					PublicReleaseResponse,
 					{ status: "ready" }
 				>;
+				loadedTimelineCacheKeyRef.current = timelineCacheKey;
 				setState((current) => {
+					if (requestKeyRef.current !== requestKey) return current;
 					if (current.status !== "list" || !tag) {
 						return { status: "list", data: nextData };
 					}
@@ -715,13 +739,14 @@ export function PublicReleasePage(props: {
 				});
 			}
 		} catch (err) {
+			if (requestKeyRef.current !== requestKey) return;
 			if (err instanceof ApiError) {
 				setState({ status: "error", message: err.message, code: err.code });
 				return;
 			}
 			setState({ status: "error", message: "公开 Release 加载失败" });
 		}
-	}, [buildHighlightRequest, owner, repo, tag]);
+	}, [buildHighlightRequest, initialLoadKey, repo, tag, timelineCacheKey]);
 
 	const mergeItems = useCallback(
 		(current: PublicReleaseListItem[], incoming: PublicReleaseListItem[]) => {
@@ -736,6 +761,7 @@ export function PublicReleasePage(props: {
 		}
 		setLoadingMore(true);
 		setAppendError(null);
+		const requestKey = initialLoadKey;
 		try {
 			const data = await apiGetPublicRepoReleases({
 				...buildHighlightRequest(
@@ -744,11 +770,13 @@ export function PublicReleasePage(props: {
 					activeHighlightSelector(state.data.highlight),
 				),
 			});
+			if (requestKeyRef.current !== requestKey) return;
 			if (isPendingResponse(data)) {
 				setState({ status: "pending", pending: data });
 				return;
 			}
 			setState((current) => {
+				if (requestKeyRef.current !== requestKey) return current;
 				if (current.status !== "list") {
 					return current;
 				}
@@ -771,11 +799,12 @@ export function PublicReleasePage(props: {
 				};
 			});
 		} catch (err) {
+			if (requestKeyRef.current !== requestKey) return;
 			setAppendError(err instanceof Error ? err.message : String(err));
 		} finally {
-			setLoadingMore(false);
+			if (requestKeyRef.current === requestKey) setLoadingMore(false);
 		}
-	}, [buildHighlightRequest, loadingMore, mergeItems, state]);
+	}, [buildHighlightRequest, initialLoadKey, loadingMore, mergeItems, state]);
 
 	const loadNewer = useCallback(async () => {
 		if (
@@ -787,6 +816,7 @@ export function PublicReleasePage(props: {
 		}
 		setLoadingNewer(true);
 		setAppendError(null);
+		const requestKey = initialLoadKey;
 		try {
 			const data = await apiGetPublicRepoReleases({
 				...buildHighlightRequest(
@@ -795,11 +825,13 @@ export function PublicReleasePage(props: {
 					activeHighlightSelector(state.data.highlight),
 				),
 			});
+			if (requestKeyRef.current !== requestKey) return;
 			if (isPendingResponse(data)) {
 				setState({ status: "pending", pending: data });
 				return;
 			}
 			setState((current) => {
+				if (requestKeyRef.current !== requestKey) return current;
 				if (current.status !== "list") return current;
 				const highlight = mergePaginatedHighlight(
 					current.data.highlight,
@@ -820,17 +852,19 @@ export function PublicReleasePage(props: {
 				};
 			});
 		} catch (err) {
+			if (requestKeyRef.current !== requestKey) return;
 			setAppendError(err instanceof Error ? err.message : String(err));
 		} finally {
-			setLoadingNewer(false);
+			if (requestKeyRef.current === requestKey) setLoadingNewer(false);
 		}
-	}, [buildHighlightRequest, loadingNewer, mergeItems, state]);
+	}, [buildHighlightRequest, initialLoadKey, loadingNewer, mergeItems, state]);
 
 	const loadGap = useCallback(
 		async (gap: PublicReleaseGap) => {
 			if (loadingGap || state.status !== "list") return;
 			setLoadingGap(gap.newer_cursor);
 			setAppendError(null);
+			const requestKey = initialLoadKey;
 			try {
 				const data = await apiGetPublicRepoReleases({
 					...buildHighlightRequest(
@@ -840,8 +874,10 @@ export function PublicReleasePage(props: {
 					),
 					until_cursor: gap.older_cursor,
 				});
+				if (requestKeyRef.current !== requestKey) return;
 				if (isPendingResponse(data)) return;
 				setState((current) => {
+					if (requestKeyRef.current !== requestKey) return current;
 					if (current.status !== "list") return current;
 					const highlight = mergePaginatedHighlight(
 						current.data.highlight,
@@ -884,12 +920,19 @@ export function PublicReleasePage(props: {
 					};
 				});
 			} catch (err) {
+				if (requestKeyRef.current !== requestKey) return;
 				setAppendError(err instanceof Error ? err.message : String(err));
 			} finally {
-				setLoadingGap(null);
+				if (requestKeyRef.current === requestKey) setLoadingGap(null);
 			}
 		},
-		[buildHighlightRequest, loadingGap, mergeItems, state.status],
+		[
+			buildHighlightRequest,
+			initialLoadKey,
+			loadingGap,
+			mergeItems,
+			state.status,
+		],
 	);
 
 	const hydrateItems = useCallback(
@@ -957,14 +1000,31 @@ export function PublicReleasePage(props: {
 	const repoFullName = useMemo(() => `${owner}/${repo}`, [owner, repo]);
 	const repoVisual =
 		state.status === "list" ? state.data.items[0]?.repo_visual : null;
+	const currentHighlightSelector =
+		state.status === "list" && state.data.highlight
+			? state.data.highlight.resolved.find(
+					(target) =>
+						target.release_id === state.data.highlight?.active_release_id,
+				)?.selector
+			: undefined;
+	const highlightedListSearch = useMemo(() => {
+		const search = publicReleaseHighlightSearch(highlight);
+		return currentHighlightSelector
+			? { ...search, highlight_active: currentHighlightSelector }
+			: search;
+	}, [currentHighlightSelector, highlight]);
 	const highlightedListHref = useMemo(() => {
 		if (!tag || !highlight) return null;
-		const params = appendPublicReleaseHighlightParams(
-			new URLSearchParams(),
-			highlight,
-		);
+		const params = new URLSearchParams();
+		for (const [key, value] of Object.entries(highlightedListSearch)) {
+			if (Array.isArray(value)) {
+				for (const entry of value) params.append(key, entry);
+			} else if (value !== undefined) {
+				params.set(key, value);
+			}
+		}
 		return `${publicReleasePathPrefix()}/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases?${params.toString()}`;
-	}, [highlight, owner, repo, tag]);
+	}, [highlight, highlightedListSearch, owner, repo, tag]);
 
 	return (
 		<main className="min-h-dvh bg-background text-foreground">
@@ -996,7 +1056,7 @@ export function PublicReleasePage(props: {
 								href={highlightedListHref}
 								to="/$owner/$repo/releases"
 								params={{ owner, repo }}
-								search={publicReleaseHighlightSearch(highlight)}
+								search={highlightedListSearch}
 								className="inline-flex items-center gap-2 text-sm text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
 							>
 								<ArrowLeft className="size-4" />
@@ -3109,7 +3169,7 @@ function ReleaseVirtualRow(props: {
 			}
 			onFocus={props.onFocusCurrent}
 			className={cn(
-				"scroll-mt-5 rounded-xl outline-none",
+				"scroll-mt-5 rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
 				props.isPulse ? "public-release-focus-pulse" : undefined,
 			)}
 			onPointerEnter={props.onHoverCurrent}

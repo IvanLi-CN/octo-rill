@@ -1601,6 +1601,75 @@ test("public release typed discrete highlight keeps partial targets and replaces
 	await expectNoHorizontalOverflow(page);
 });
 
+test("public release detail returns with the current active highlight", async ({
+	page,
+}) => {
+	const items = Array.from({ length: 4 }, (_, index) => releaseItem(index));
+	const resolved = [
+		{
+			selector: "id:public-release-0",
+			release_id: "public-release-0",
+			tag_name: items[0].tag_name,
+			ordinal: 1,
+		},
+		{
+			selector: "id:public-release-1",
+			release_id: "public-release-1",
+			tag_name: items[1].tag_name,
+			ordinal: 2,
+		},
+	];
+	await installBaseApiMocks(page, (route, url) => {
+		const activeSelector =
+			url.searchParams.get("highlight_active") ?? resolved[0].selector;
+		const active =
+			resolved.find((target) => target.selector === activeSelector) ??
+			resolved[0];
+		return json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items: items.map((item) => ({
+				...item,
+				is_highlighted: resolved.some(
+					(target) => target.release_id === item.release_id,
+				),
+				is_active_highlight: item.release_id === active.release_id,
+			})),
+			highlight: {
+				mode: "discrete",
+				status: "complete",
+				requested: resolved.map((target) => target.selector),
+				resolved,
+				unresolved: [],
+				total: resolved.length,
+				active_release_id: active.release_id,
+				active_index: resolved.indexOf(active) + 1,
+			},
+			segments: [],
+			gaps: [],
+		});
+	});
+
+	await page.goto(
+		"/public/octo-rill/example/releases/tag/v2.7.0?highlight=id%3Apublic-release-0&highlight=id%3Apublic-release-1",
+	);
+	await expect(page.getByText("返回高亮列表")).toHaveAttribute(
+		"href",
+		/.*highlight_active=id%3Apublic-release-0/,
+	);
+	await page.getByTitle("下一条高亮记录").click();
+	await expect(page).toHaveURL(/highlight_active=id%3Apublic-release-1/);
+	await expect(page.getByText("返回高亮列表")).toHaveAttribute(
+		"href",
+		/.*highlight_active=id%3Apublic-release-1/,
+	);
+	await page.getByText("返回高亮列表").click();
+	await expect(page).toHaveURL(
+		/\/releases\?.*highlight_active=id%3Apublic-release-1/,
+	);
+});
+
 test("public release pagination preserves the user-selected active highlight", async ({
 	page,
 }) => {
