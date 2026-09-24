@@ -737,20 +737,6 @@ fn legacy_evidence_summary(evidence: AdminContentProcessingEvidence) -> AdminCol
     }
 }
 
-fn legacy_conflict_summary() -> AdminCollectionTaskSummary {
-    AdminCollectionTaskSummary {
-        status: "legacy_conflict".to_owned(),
-        display_status: "legacy_conflict".to_owned(),
-        status_origin: "legacy_conflict".to_owned(),
-        legacy_evidence: Some(AdminContentProcessingEvidence {
-            status: "legacy_conflict".to_owned(),
-            status_origin: "legacy_conflict".to_owned(),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-}
-
 #[derive(Debug, sqlx::FromRow)]
 struct GlobalTaskRow {
     pipeline: String,
@@ -867,6 +853,26 @@ fn global_summary(row: &GlobalTaskRow) -> AdminCollectionTaskSummary {
         }),
         ..Default::default()
     }
+}
+
+fn global_summary_from_rows(rows: &[&GlobalTaskRow]) -> AdminCollectionTaskSummary {
+    let Some(latest) = rows.first() else {
+        return not_recorded_summary();
+    };
+    let mut summary = global_summary(latest);
+    summary.attempt_count = rows
+        .iter()
+        .map(|row| row.attempt_count.max(0))
+        .max()
+        .unwrap_or(0);
+    summary.started_at = rows.iter().filter_map(|row| row.started_at.clone()).min();
+    summary.last_attempt_at = rows
+        .iter()
+        .filter(|row| row.attempt_count > 0)
+        .filter_map(|row| row.last_attempt_at.clone())
+        .max();
+    summary.finished_at = rows.iter().filter_map(|row| row.finished_at.clone()).max();
+    summary
 }
 
 fn compare_attempt_timestamps(left: &str, right: &str) -> Ordering {
@@ -1032,6 +1038,38 @@ fn merge_summary(rows: &[TaskRow], status_origin: &str) -> AdminCollectionTaskSu
     }
 }
 
+fn legacy_summary_with_evidence(
+    evidence: &AdminContentProcessingEvidence,
+    rows: &[TaskRow],
+) -> AdminCollectionTaskSummary {
+    let mut summary = if rows.is_empty() {
+        legacy_evidence_summary(evidence.clone())
+    } else {
+        let mut summary = merge_summary(rows, "task");
+        summary.status = evidence.status.clone();
+        summary.display_status = evidence.status.clone();
+        summary.legacy_evidence = Some(evidence.clone());
+        summary
+    };
+    if !rows.is_empty() {
+        summary.status_origin = "task".to_owned();
+    }
+    summary
+}
+
+fn legacy_conflict_summary_with_tasks(rows: &[TaskRow]) -> AdminCollectionTaskSummary {
+    let mut summary = merge_summary(rows, "task");
+    summary.status = "legacy_conflict".to_owned();
+    summary.display_status = "legacy_conflict".to_owned();
+    summary.status_origin = "task".to_owned();
+    summary.legacy_evidence = Some(AdminContentProcessingEvidence {
+        status: "legacy_conflict".to_owned(),
+        status_origin: "legacy_conflict".to_owned(),
+        ..Default::default()
+    });
+    summary
+}
+
 async fn load_task_summaries(
     state: &AppState,
     kind: CollectionRecordKind,
@@ -1057,31 +1095,27 @@ async fn load_task_summaries_in_connection(
     if entity_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let rows = if global_mode {
-        Vec::new()
-    } else {
-        let mut query = QueryBuilder::<Sqlite>::new(
-            "SELECT w.id, w.kind, w.status, w.result_status, w.attempt_count, w.started_at, w.finished_at, w.updated_at, (SELECT MAX(e.created_at) FROM translation_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at, w.entity_id FROM translation_work_items w WHERE w.kind IN (",
-        );
-        {
-            let mut separated = query.separated(", ");
-            separated.push_bind(translation_kind);
-            separated.push_bind(polish_kind);
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "SELECT w.id, w.kind, w.status, w.result_status, w.attempt_count, w.started_at, w.finished_at, w.updated_at, (SELECT MAX(e.created_at) FROM translation_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at, w.entity_id FROM translation_work_items w WHERE w.kind IN (",
+    );
+    {
+        let mut separated = query.separated(", ");
+        separated.push_bind(translation_kind);
+        separated.push_bind(polish_kind);
+    }
+    query.push(") AND w.entity_id IN (");
+    {
+        let mut separated = query.separated(", ");
+        for id in entity_ids {
+            separated.push_bind(id);
         }
-        query.push(") AND w.entity_id IN (");
-        {
-            let mut separated = query.separated(", ");
-            for id in entity_ids {
-                separated.push_bind(id);
-            }
-        }
-        query.push(")");
-        query
-            .build_query_as::<TaskWithEntityRow>()
-            .fetch_all(&mut *connection)
-            .await
-            .map_err(ApiError::internal)?
-    };
+    }
+    query.push(")");
+    let rows = query
+        .build_query_as::<TaskWithEntityRow>()
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(ApiError::internal)?;
     let global_rows = load_global_task_rows_in_connection(connection, kind, entity_ids).await?;
     let global_by_key = global_rows.iter().fold(HashMap::new(), |mut by_key, row| {
         let pipeline = if row.pipeline == "polishing" {
@@ -1091,7 +1125,8 @@ async fn load_task_summaries_in_connection(
         };
         by_key
             .entry((row.canonical_resource_id.clone(), pipeline.to_owned()))
-            .or_insert(row);
+            .or_insert_with(Vec::new)
+            .push(row);
         by_key
     });
     let legacy_observations =
@@ -1111,8 +1146,8 @@ async fn load_task_summaries_in_connection(
             let (translation, polish) = grouped.remove(id).unwrap_or_default();
             let translation_summary = global_by_key
                 .get(&(id.clone(), "translation".to_owned()))
-                .map(|row| {
-                    let mut summary = global_summary(row);
+                .map(|rows| {
+                    let mut summary = global_summary_from_rows(rows);
                     summary.legacy_evidence = legacy_observations
                         .get(&(id.clone(), "translation".to_owned()))
                         .cloned();
@@ -1121,20 +1156,19 @@ async fn load_task_summaries_in_connection(
                 .or_else(|| {
                     legacy_observations
                         .get(&(id.clone(), "translation".to_owned()))
-                        .cloned()
-                        .map(legacy_evidence_summary)
+                        .map(|evidence| legacy_summary_with_evidence(evidence, &translation))
                 })
                 .unwrap_or_else(|| {
                     if global_mode && !translation.is_empty() {
-                        legacy_conflict_summary()
+                        legacy_conflict_summary_with_tasks(&translation)
                     } else {
                         merge_summary(&translation, &coverage_origin(coverage, id, "translation"))
                     }
                 });
             let polish_summary = global_by_key
                 .get(&(id.clone(), "polish".to_owned()))
-                .map(|row| {
-                    let mut summary = global_summary(row);
+                .map(|rows| {
+                    let mut summary = global_summary_from_rows(rows);
                     summary.legacy_evidence = legacy_observations
                         .get(&(id.clone(), "polish".to_owned()))
                         .cloned();
@@ -1143,12 +1177,11 @@ async fn load_task_summaries_in_connection(
                 .or_else(|| {
                     legacy_observations
                         .get(&(id.clone(), "polish".to_owned()))
-                        .cloned()
-                        .map(legacy_evidence_summary)
+                        .map(|evidence| legacy_summary_with_evidence(evidence, &polish))
                 })
                 .unwrap_or_else(|| {
                     if global_mode && !polish.is_empty() {
-                        legacy_conflict_summary()
+                        legacy_conflict_summary_with_tasks(&polish)
                     } else {
                         merge_summary(&polish, &coverage_origin(coverage, id, "polish"))
                     }
@@ -1914,9 +1947,10 @@ fn collection_query_sql(
                     s.*,
                     NULL AS translation_status,
                     CASE
-                        WHEN b.raw_status IS NULL THEN 'historical_unknown'
-                        ELSE b.raw_status
-                        END AS polish_status,
+                        WHEN b.raw_status IS NOT NULL THEN b.raw_status
+                        WHEN bc.status_origin = 'never_started' THEN 'not_started'
+                        ELSE 'historical_unknown'
+                    END AS polish_status,
                     COALESCE(ba.attempt_count, 0) AS attempt_count,
                     CASE
                         WHEN ba.attempt_count IS NOT NULL THEN 1
@@ -3132,9 +3166,10 @@ fn build_brief_attempts(
             let status = terminal
                 .map(|event| event.status.clone())
                 .or_else(|| failed.map(|_| "failed".to_owned()))
+                .or_else(|| running.map(|event| event.status.clone()))
                 .unwrap_or_else(|| {
                     if !is_latest {
-                        "failed".to_owned()
+                        "not_recorded".to_owned()
                     } else {
                         call.status.clone()
                     }
@@ -3145,7 +3180,9 @@ fn build_brief_attempts(
             let classified = is_latest
                 .then(|| translations::classify_translation_error(call.error_text.as_deref()))
                 .flatten();
-            let retry_eligible = status == "failed" && attempt_no < latest_attempt;
+            let retry_eligible = status == "failed"
+                && attempt_no < latest_attempt
+                && (failed.is_some() || terminal.is_some());
             let last_attempt_at = terminal
                 .map(|event| event.created_at.clone())
                 .or_else(|| failed.map(|event| event.created_at.clone()))
@@ -3177,11 +3214,13 @@ fn build_brief_attempts(
                 processing_stage: Some("brief".to_owned()),
                 provider_status: Some(status.clone()),
                 output_contract_status: None,
-                retry_disposition: Some(if retry_eligible {
-                    "retry_scheduled".to_owned()
+                retry_disposition: if status == "not_recorded" {
+                    None
+                } else if retry_eligible {
+                    Some("retry_scheduled".to_owned())
                 } else {
-                    "not_needed".to_owned()
-                }),
+                    Some("not_needed".to_owned())
+                },
                 retry_eligible,
                 next_retry_at: None,
                 llm_calls: vec![AdminCollectionLlmLink {
@@ -3196,6 +3235,32 @@ fn build_brief_attempts(
             });
         }
     }
+    attempts
+}
+
+fn select_attempt_history(
+    global_mode: bool,
+    summaries: &TaskSummaries,
+    global_attempts: Vec<AdminCollectionAttempt>,
+    legacy_attempts: Vec<AdminCollectionAttempt>,
+) -> Vec<AdminCollectionAttempt> {
+    if !global_mode {
+        return legacy_attempts;
+    }
+    let has_global_work = |pipeline: &str| match pipeline {
+        "translation" => summaries.translation.global_work.is_some(),
+        "polish" => summaries.polish.global_work.is_some(),
+        _ => false,
+    };
+    let mut attempts = global_attempts
+        .into_iter()
+        .filter(|attempt| has_global_work(&attempt.pipeline))
+        .chain(
+            legacy_attempts
+                .into_iter()
+                .filter(|attempt| !has_global_work(&attempt.pipeline)),
+        )
+        .collect::<Vec<_>>();
     attempts.sort_by(|left, right| {
         compare_attempt_timestamps(
             left.last_attempt_at.as_deref().unwrap_or_default(),
@@ -3203,9 +3268,6 @@ fn build_brief_attempts(
         )
         .then_with(|| left.id.cmp(&right.id))
     });
-    for (index, attempt) in attempts.iter_mut().enumerate() {
-        attempt.attempt_no = i64::try_from(index + 1).unwrap_or(i64::MAX);
-    }
     attempts
 }
 
@@ -3234,16 +3296,21 @@ pub async fn admin_get_collection_record_detail(
     let attempts = if kind == CollectionRecordKind::Brief {
         load_brief_attempts(state.as_ref(), &record.id).await?
     } else {
-        let global = load_global_attempts(state.as_ref(), kind, &record.id).await?;
-        if global.is_empty() && !global_mode {
-            load_task_attempts(
-                state.as_ref(),
-                &load_record_tasks(state.as_ref(), kind, &record.id).await?,
-            )
-            .await?
+        let global_attempts = if global_mode {
+            load_global_attempts(state.as_ref(), kind, &record.id).await?
         } else {
-            global
-        }
+            Vec::new()
+        };
+        let legacy_tasks = load_record_tasks(state.as_ref(), kind, &record.id).await?;
+        let legacy_attempts = load_task_attempts(state.as_ref(), &legacy_tasks).await?;
+        let summaries = task_summaries
+            .get(&record.id)
+            .cloned()
+            .unwrap_or_else(|| TaskSummaries {
+                translation: not_recorded_summary(),
+                polish: not_recorded_summary(),
+            });
+        select_attempt_history(global_mode, &summaries, global_attempts, legacy_attempts)
     };
     Ok(Json(AdminCollectionRecordDetail { record, attempts }))
 }
@@ -4167,6 +4234,40 @@ mod tests {
         .expect("filter known zero-attempt briefs");
         assert_eq!(zero_total, 1);
         assert_eq!(zero_rows[0].id, "brief-new");
+
+        let (not_started_total, not_started_rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Brief,
+            false,
+            Some("2026-07-06T00:00:00Z"),
+            Some("2026-07-09T00:00:00Z"),
+            AttemptCountRange { min: 0, max: None },
+            None,
+            Some(&["not_started".to_owned()]),
+            20,
+            0,
+        )
+        .await
+        .expect("filter not-started briefs");
+        assert_eq!(not_started_total, 1);
+        assert_eq!(not_started_rows[0].id, "brief-new");
+
+        let (unknown_total, unknown_rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Brief,
+            false,
+            Some("2026-07-06T00:00:00Z"),
+            Some("2026-07-09T00:00:00Z"),
+            AttemptCountRange { min: 0, max: None },
+            None,
+            Some(&["historical_unknown".to_owned()]),
+            20,
+            0,
+        )
+        .await
+        .expect("filter historically unknown briefs");
+        assert_eq!(unknown_total, 1);
+        assert_eq!(unknown_rows[0].id, "brief-unknown");
     }
 
     #[test]
@@ -4195,6 +4296,19 @@ mod tests {
                 finished_at: Some("2026-07-08T00:00:07Z".to_owned()),
                 updated_at: "2026-07-08T00:00:07Z".to_owned(),
                 last_attempt_at: Some("2026-07-08T00:00:06Z".to_owned()),
+                error_text: None,
+                failure_class: None,
+            },
+            BriefCallRow {
+                id: "call-3".to_owned(),
+                status: "succeeded".to_owned(),
+                source: "brief".to_owned(),
+                model: "model-d".to_owned(),
+                attempt_count: 3,
+                started_at: Some("2026-07-08T00:00:08Z".to_owned()),
+                finished_at: Some("2026-07-08T00:00:12Z".to_owned()),
+                updated_at: "2026-07-08T00:00:12Z".to_owned(),
+                last_attempt_at: None,
                 error_text: None,
                 failure_class: None,
             },
@@ -4283,13 +4397,13 @@ mod tests {
         ];
 
         let attempts = build_brief_attempts(calls, events);
-        assert_eq!(attempts.len(), 4);
+        assert_eq!(attempts.len(), 7);
         assert_eq!(
             attempts
                 .iter()
                 .map(|attempt| attempt.attempt_no)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4]
+            vec![1, 2, 3, 1, 1, 2, 3]
         );
         assert_eq!(attempts[0].status, "failed");
         assert_eq!(attempts[0].failure_class.as_deref(), Some("transient"));
@@ -4302,6 +4416,256 @@ mod tests {
         );
         assert_eq!(attempts[0].llm_calls[0].model, "model-a");
         assert_eq!(attempts[3].llm_calls[0].id, "call-2");
+        assert_eq!(attempts[4].status, "not_recorded");
+        assert_eq!(
+            attempts[4].last_attempt_at.as_deref(),
+            Some("2026-07-08T00:00:08Z")
+        );
+        assert_eq!(attempts[5].status, "not_recorded");
+        assert_eq!(attempts[5].last_attempt_at, None);
+        assert_eq!(attempts[5].retry_eligible, false);
+        assert_eq!(attempts[5].retry_disposition, None);
+        assert_eq!(attempts[6].status, "succeeded");
+        assert_eq!(
+            attempts[6].last_attempt_at.as_deref(),
+            Some("2026-07-08T00:00:12Z")
+        );
+    }
+
+    #[test]
+    fn global_attempt_history_falls_back_to_legacy_per_pipeline() {
+        let mut translation = AdminCollectionTaskSummary::default();
+        translation.global_work = Some(AdminContentProcessingEvidence {
+            status: "ready".to_owned(),
+            status_origin: "global_work".to_owned(),
+            ..Default::default()
+        });
+        let summaries = TaskSummaries {
+            translation,
+            polish: AdminCollectionTaskSummary::default(),
+        };
+        let attempt = |id: &str, pipeline: &str, at: &str| AdminCollectionAttempt {
+            id: id.to_owned(),
+            pipeline: pipeline.to_owned(),
+            attempt_no: 1,
+            trigger: "initial".to_owned(),
+            status: "succeeded".to_owned(),
+            started_at: None,
+            last_attempt_at: Some(at.to_owned()),
+            finished_at: None,
+            error_code: None,
+            error_summary: None,
+            failure_class: None,
+            processing_stage: None,
+            provider_status: None,
+            output_contract_status: None,
+            retry_disposition: None,
+            retry_eligible: false,
+            next_retry_at: None,
+            llm_calls: Vec::new(),
+        };
+
+        let selected = select_attempt_history(
+            true,
+            &summaries,
+            vec![
+                attempt("global-translation", "translation", "2026-07-08T00:00:02Z"),
+                attempt("global-polish", "polish", "2026-07-08T00:00:03Z"),
+            ],
+            vec![
+                attempt("legacy-translation", "translation", "2026-07-08T00:00:01Z"),
+                attempt("legacy-polish", "polish", "2026-07-08T00:00:01Z"),
+            ],
+        );
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|attempt| attempt.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["legacy-polish", "global-translation"]
+        );
+    }
+
+    #[tokio::test]
+    async fn global_summary_uses_legacy_rows_for_the_pipeline_without_global_work() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE repo_releases (
+                release_id INTEGER, repo_id INTEGER, name TEXT, tag_name TEXT,
+                published_at TEXT, created_at TEXT, updated_at TEXT, detected_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create release sources");
+        sqlx::query("CREATE TABLE repo_release_work_items (repo_id INTEGER, repo_full_name TEXT)")
+            .execute(&pool)
+            .await
+            .expect("create release repositories");
+        sqlx::query(
+            "CREATE TABLE translation_work_items (
+                id TEXT, kind TEXT, status TEXT, result_status TEXT,
+                attempt_count INTEGER, started_at TEXT, finished_at TEXT,
+                updated_at TEXT, entity_id TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create legacy work items");
+        sqlx::query("CREATE TABLE translation_attempt_events (work_item_id TEXT, created_at TEXT)")
+            .execute(&pool)
+            .await
+            .expect("create legacy attempt events");
+        sqlx::query(
+            "CREATE TABLE admin_collection_processing_coverage (
+                record_kind TEXT, record_id TEXT, pipeline TEXT, status_origin TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create processing coverage");
+        sqlx::query(
+            "CREATE TABLE content_work_items (
+                id TEXT, pipeline TEXT, source_hash TEXT, status TEXT,
+                attempt_count INTEGER, started_at TEXT, finished_at TEXT,
+                updated_at TEXT, canonical_resource_type TEXT,
+                canonical_resource_id TEXT, variant TEXT, created_at TEXT,
+                target_lang TEXT, protocol_version TEXT, model_profile TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create global work items");
+        sqlx::query("CREATE TABLE content_attempt_events (work_item_id TEXT, created_at TEXT)")
+            .execute(&pool)
+            .await
+            .expect("create global attempt events");
+        sqlx::query(
+            "CREATE TABLE content_result_projections (
+                id TEXT, canonical_resource_type TEXT, canonical_resource_id TEXT,
+                pipeline TEXT, variant TEXT, target_lang TEXT, protocol_version TEXT,
+                model_profile TEXT, source_hash TEXT, work_item_id TEXT, updated_at TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create result projections");
+        sqlx::query(
+            "CREATE TABLE content_legacy_observations (
+                canonical_resource_type TEXT, canonical_resource_id TEXT,
+                pipeline TEXT, classification TEXT, legacy_table TEXT,
+                legacy_primary_key TEXT, observed_at TEXT, observation_basis_json TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create legacy observations");
+        sqlx::query(
+            "INSERT INTO content_work_items (
+                id, pipeline, source_hash, status, attempt_count, started_at,
+                finished_at, updated_at, canonical_resource_type,
+                canonical_resource_id, variant, created_at, target_lang,
+                protocol_version, model_profile
+             ) VALUES (
+                'global-translation', 'translation', 'global-hash', 'ready', 2,
+                '2026-07-08T00:00:01Z', '2026-07-08T00:00:04Z',
+                '2026-07-08T00:00:04Z', 'release', '101', 'detail',
+                '2026-07-08T00:00:00Z', 'zh-CN', 'v1', 'default'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed global translation work");
+        sqlx::query(
+            "INSERT INTO translation_work_items (
+                id, kind, status, result_status, attempt_count, started_at,
+                finished_at, updated_at, entity_id
+             ) VALUES (
+                'legacy-polish', 'release_smart', 'completed', 'ready', 3,
+                '2026-07-08T00:00:05Z', '2026-07-08T00:00:09Z',
+                '2026-07-08T00:00:09Z', '101'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed legacy polish work");
+        sqlx::query(
+            "INSERT INTO translation_attempt_events (work_item_id, created_at)
+             VALUES ('legacy-polish', '2026-07-08T00:00:09Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed legacy polish attempt");
+        sqlx::query(
+            "INSERT INTO repo_releases (
+                release_id, repo_id, name, tag_name, published_at, created_at,
+                updated_at, detected_at
+             ) VALUES (101, 1, 'Release', 'v1', '2026-07-08T00:00:00Z',
+                '2026-07-08T00:00:00Z', '2026-07-08T00:00:00Z', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed release source");
+        sqlx::query(
+            "INSERT INTO repo_release_work_items (repo_id, repo_full_name) VALUES (1, 'octo/demo')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed release repository");
+
+        let mut connection = pool.acquire().await.expect("acquire connection");
+        let global_rows = load_global_task_rows_in_connection(
+            &mut connection,
+            CollectionRecordKind::Release,
+            &["101".to_owned()],
+        )
+        .await
+        .expect("load global rows");
+        assert_eq!(global_rows.len(), 1, "{global_rows:#?}");
+        let summaries = load_task_summaries_in_connection(
+            &mut connection,
+            CollectionRecordKind::Release,
+            &["101".to_owned()],
+            &HashMap::new(),
+            true,
+        )
+        .await
+        .expect("load mixed-mode summaries");
+        let summary = summaries.get("101").expect("record summary");
+        assert_eq!(
+            summary.translation.display_status, "succeeded",
+            "{:#?}",
+            summary.translation
+        );
+        assert_eq!(summary.translation.attempt_count, 2);
+        assert_eq!(summary.polish.display_status, "legacy_conflict");
+        assert_eq!(summary.polish.attempt_count, 3);
+        assert_eq!(
+            summary.polish.last_attempt_at.as_deref(),
+            Some("2026-07-08T00:00:09Z")
+        );
+        drop(connection);
+
+        let (total, rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Release,
+            true,
+            Some("2026-07-07T00:00:00Z"),
+            Some("2026-07-09T00:00:00Z"),
+            AttemptCountRange {
+                min: 3,
+                max: Some(3),
+            },
+            None,
+            Some(&["legacy_conflict".to_owned()]),
+            20,
+            0,
+        )
+        .await
+        .expect("filter the mixed-mode release by its legacy polish summary");
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].id, "101");
     }
 
     #[tokio::test]
