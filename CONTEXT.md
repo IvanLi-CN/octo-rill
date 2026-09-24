@@ -92,6 +92,22 @@ _Avoid_: 尝试审计, 公开错误详情, 永久日志
 管理端“内容处理”中按 Release、公告或日报呈现的源记录及其处理摘要。它不是任务、处理工作项、尝试事件或 LLM 逻辑调用。
 _Avoid_: 任务记录, work item, attempt
 
+**Demo 场景**:
+mock-only Web Demo 的页面级路由预设，由 `demo` share state 选择。它定义页面上下文，不定义 Admin Jobs 内的读取 surface 或 fixture 数据。
+_Avoid_: Admin Jobs surface, data case, tab
+
+**Admin Jobs surface**:
+Admin Jobs 中可独立验收的只读读取面：内容处理（采集记录）或 LLM 调度。它由正式 Admin Jobs 子路由表达；每个 surface 拥有互不重叠的 endpoint family 和 Demo Inspector share state。
+_Avoid_: Demo 场景, 内容处理尝试, LLM 逻辑调用
+
+**Surface data case**:
+一个 Admin Jobs surface 的 URL-shareable mock 响应选择：`loaded`、`empty`、`many` 或 `loading`。`loading` 保持该 surface 的读取请求 pending，其他值定义该 surface 返回的 fixture。
+_Avoid_: network profile, Demo 场景, 全局数据状态
+
+**Surface network profile**:
+一个 Admin Jobs surface 的 URL-shareable 传输行为选择：`normal`、`slow` 或 `faulty`。它独立于 Surface data case；`faulty` 产生该 surface 的读取错误，`slow` 延迟非 `loading` fixture。
+_Avoid_: Surface data case, 全局 `d_net`, 数据缓存
+
 **采集记录检索窗口**:
 管理员读取采集记录时以含 `from`、不含 `before` 定义的时间范围；产品支持的最大跨度为三十一天。
 _Avoid_: 读取超时, 分页范围, 数据保留期

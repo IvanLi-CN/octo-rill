@@ -28,6 +28,7 @@ export default defineConfig((env) =>
 									"admin-collection-activity",
 									"dashboard-repository-sidebar-viewport",
 									"command-palette-search",
+									"demo-inspector",
 								],
 								exclude: [],
 								skip: [],

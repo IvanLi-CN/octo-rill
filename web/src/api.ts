@@ -1612,11 +1612,19 @@ export async function apiPatchAdminSyncRuntimeConfig(
 		body,
 	);
 }
-export async function apiGetAdminLlmSchedulerStatus(): Promise<AdminLlmSchedulerStatusResponse> {
-	return apiGet<AdminLlmSchedulerStatusResponse>("/api/admin/jobs/llm/status");
+export async function apiGetAdminLlmSchedulerStatus(
+	signal?: AbortSignal,
+): Promise<AdminLlmSchedulerStatusResponse> {
+	return apiGet<AdminLlmSchedulerStatusResponse>("/api/admin/jobs/llm/status", {
+		signal,
+	});
 }
-export async function apiGetAdminLlmActivity(): Promise<AdminLlmActivityResponse> {
-	return apiGet<AdminLlmActivityResponse>("/api/admin/jobs/llm/activity");
+export async function apiGetAdminLlmActivity(
+	signal?: AbortSignal,
+): Promise<AdminLlmActivityResponse> {
+	return apiGet<AdminLlmActivityResponse>("/api/admin/jobs/llm/activity", {
+		signal,
+	});
 }
 export async function apiPatchAdminLlmRuntimeConfig(
 	body: AdminLlmRuntimeConfigUpdateRequest,
@@ -1628,16 +1636,20 @@ export async function apiPatchAdminLlmRuntimeConfig(
 }
 export async function apiGetAdminLlmCalls(
 	params: URLSearchParams,
+	signal?: AbortSignal,
 ): Promise<AdminLlmCallsResponse> {
 	return apiGet<AdminLlmCallsResponse>(
 		`/api/admin/jobs/llm/calls?${params.toString()}`,
+		{ signal },
 	);
 }
 export async function apiGetAdminLlmCallDetail(
 	callId: string,
+	signal?: AbortSignal,
 ): Promise<AdminLlmCallDetailResponse> {
 	return apiGet<AdminLlmCallDetailResponse>(
 		`/api/admin/jobs/llm/calls/${encodeURIComponent(callId)}`,
+		{ signal },
 	);
 }
 export async function apiAuditAdminLlmDiagnosticAccess(
@@ -2584,9 +2596,11 @@ export async function apiGetAdminCollectionActivity(
 export async function apiGetAdminCollectionRecordDetail(
 	kind: AdminCollectionRecordItem["kind"],
 	id: string,
+	signal?: AbortSignal,
 ): Promise<AdminCollectionRecordDetail> {
 	return apiGet<AdminCollectionRecordDetail>(
 		`/api/admin/jobs/ai-records/${kind}/${encodeURIComponent(id)}`,
+		{ signal },
 	);
 }
 export async function apiGetAdminTranslationRequestDetail(

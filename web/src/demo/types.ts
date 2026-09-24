@@ -65,6 +65,10 @@ export type DemoPersonaId = "guest" | "member" | "admin";
 
 export type DemoNetworkMode = "normal" | "slow" | "faulty" | "readable-loading";
 
+export type DemoAdminJobsDataCase = "loaded" | "empty" | "many" | "loading";
+
+export type DemoAdminJobsNetworkProfile = "normal" | "slow" | "faulty";
+
 export type DemoPublicationState = "published" | "unpublished";
 
 export type DemoWebhookScenario =
@@ -198,6 +202,10 @@ export type DemoShareState = {
 	landingBootState: DemoLandingBootState;
 	appShellState: DemoAppShellState;
 	controlsHidden: boolean;
+	contentDataCase: DemoAdminJobsDataCase;
+	contentNetworkProfile: DemoAdminJobsNetworkProfile;
+	llmDataCase: DemoAdminJobsDataCase;
+	llmNetworkProfile: DemoAdminJobsNetworkProfile;
 };
 
 export type DemoShareStatePatch = Partial<DemoShareState>;

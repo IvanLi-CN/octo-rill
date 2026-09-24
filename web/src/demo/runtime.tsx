@@ -102,6 +102,10 @@ const runtimeState: DemoSnapshot = {
 		landingBootState: "ready",
 		appShellState: "steady",
 		controlsHidden: false,
+		contentDataCase: "loaded",
+		contentNetworkProfile: "normal",
+		llmDataCase: "loaded",
+		llmNetworkProfile: "normal",
 	},
 	model: null,
 	mutations: [],
@@ -135,7 +139,11 @@ function modelAffectingShareStateChanged(
 		current.webhookScenario !== next.webhookScenario ||
 		current.publicationState !== next.publicationState ||
 		current.networkMode === "readable-loading" ||
-		next.networkMode === "readable-loading"
+		next.networkMode === "readable-loading" ||
+		current.contentDataCase !== next.contentDataCase ||
+		current.contentNetworkProfile !== next.contentNetworkProfile ||
+		current.llmDataCase !== next.llmDataCase ||
+		current.llmNetworkProfile !== next.llmNetworkProfile
 	);
 }
 
