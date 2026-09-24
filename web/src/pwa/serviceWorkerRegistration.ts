@@ -48,8 +48,8 @@ function applyWaitingWorker(registration: ServiceWorkerRegistration) {
 		resolveAttempt = resolve;
 		timeoutId = window.setTimeout(() => {
 			if (pendingActivation?.promise !== promise) return;
-			pendingActivation = null;
-			resolve(false);
+			shouldReloadOnControllerChange = false;
+			finishActivation(false);
 		}, ACTIVATION_TIMEOUT_MS);
 	});
 	pendingActivation = { promise, resolve: resolveAttempt, timeoutId };
