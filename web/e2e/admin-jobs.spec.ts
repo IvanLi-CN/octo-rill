@@ -47,6 +47,42 @@ function json(route: Route, payload: unknown, status = 200) {
 	});
 }
 
+function collectionActivityFixture(recordId: string, title: string) {
+	const sourceTime = "2026-09-24T11:30:00.000Z";
+	const cell = {
+		id: recordId,
+		title,
+		repository: "octo-demo/release-lab",
+		source_time: sourceTime,
+		translation_status: "queued",
+		polish_status: "ready",
+		composite_status: "processing",
+	};
+	const buckets = Array.from({ length: 12 }, (_, index) => {
+		const startedAt = new Date(Date.UTC(2026, 8, 24, index));
+		return {
+			started_at: startedAt.toISOString(),
+			ended_at: new Date(startedAt.getTime() + 60 * 60 * 1000).toISOString(),
+			cells: index === 11 ? [cell] : [],
+		};
+	});
+	return {
+		kind: "release",
+		bucket_minutes: 60,
+		bucket_count: 12,
+		window_started_at: buckets[0].started_at,
+		window_ended_at: buckets[11].ended_at,
+		summary: {
+			content_count: 1,
+			completed_count: 0,
+			processing_count: 1,
+			exception_count: 0,
+			neutral_count: 0,
+		},
+		buckets,
+	};
+}
+
 async function installAdminJobsMocks(
 	page: Page,
 	options: AdminJobsMockOptions = {},
@@ -2830,6 +2866,277 @@ test("content processing audit shows retry state, model, error, and call detail"
 	);
 });
 
+test("collection activity handoff keeps the selected map and list state", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 900 });
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	const listRequests: URL[] = [];
+	const activityRequests: URL[] = [];
+	page.on("request", (request) => {
+		const url = new URL(request.url());
+		if (url.pathname === "/api/admin/jobs/ai-records/release")
+			listRequests.push(url);
+		if (url.pathname === "/api/admin/jobs/ai-records/release/activity")
+			activityRequests.push(url);
+	});
+	const records = Array.from({ length: 21 }, (_, index) => ({
+		id: `release-grid-${index + 1}`,
+		kind: "release" as const,
+		repository: "octo-demo/release-lab",
+		title: `Grid record ${index + 1}`,
+		occurred_at: "2026-09-24T11:30:00.000Z",
+		detected_at: null,
+		generated_at: null,
+		translation: {
+			status: "queued",
+			retry_count: 0,
+			started_at: null,
+			last_attempt_at: "2026-09-24T11:30:00.000Z",
+			finished_at: null,
+		},
+		polish: {
+			status: "ready",
+			retry_count: 0,
+			started_at: null,
+			last_attempt_at: "2026-09-24T11:30:00.000Z",
+			finished_at: null,
+		},
+	}));
+	const selectedRecord = records[20];
+	const activity = collectionActivityFixture(
+		selectedRecord.id,
+		selectedRecord.title,
+	);
+	const activityCellId = `${selectedRecord.id}:2026-09-24T11:30:00.000Z`;
+	await page.route("**/api/admin/jobs/ai-records/**", async (route) => {
+		const url = new URL(route.request().url());
+		if (url.pathname === "/api/admin/jobs/ai-records/release") {
+			const currentPage = Number(url.searchParams.get("page") ?? "1");
+			const offset = (currentPage - 1) * 20;
+			return json(route, {
+				items: records.slice(offset, offset + 20),
+				page: currentPage,
+				page_size: 20,
+				total: records.length,
+			});
+		}
+		if (url.pathname === "/api/admin/jobs/ai-records/release/activity")
+			return json(route, activity);
+		if (
+			url.pathname === `/api/admin/jobs/ai-records/release/${selectedRecord.id}`
+		)
+			return json(route, { record: selectedRecord, attempts: [] });
+		return route.fallback();
+	});
+
+	await page.goto("/admin/jobs/ai-records", { waitUntil: "domcontentloaded" });
+	const activityCell = page.locator(
+		`[data-activity-cell-id="${activityCellId}"]`,
+	);
+	await expect(activityCell).toBeVisible();
+	await page.getByRole("button", { name: "翻译筛选" }).click();
+	await page.getByRole("checkbox", { name: "排队中" }).check();
+	await expect
+		.poll(() => listRequests.at(-1)?.searchParams.get("translation_status"))
+		.toBe("queued");
+	await page.keyboard.press("Escape");
+	await page.getByRole("button", { name: "下一页" }).click();
+	await expect
+		.poll(() => listRequests.at(-1)?.searchParams.get("page"))
+		.toBe("2");
+	await expect(
+		page.getByRole("row").filter({ hasText: selectedRecord.title }),
+	).toBeVisible();
+	await page.evaluate(() => window.scrollTo(0, 180));
+	const scrollBeforeDetail = await page.evaluate(() => window.scrollY);
+	const listRequestsBeforeDetail = listRequests.length;
+	const activityRequestsBeforeDetail = activityRequests.length;
+
+	await activityCell.click();
+	const recordSheet = page.getByRole("dialog", { name: "记录详情" });
+	await expect(recordSheet).toBeVisible();
+	await expect(page).toHaveURL(
+		/\/admin\/jobs\/ai-records\/release\/release-grid-21/,
+	);
+	await page.mouse.move(5, 5);
+	await expect(page.locator("[data-activity-grid-root]")).toBeVisible();
+	await expect(activityCell).toHaveAttribute("aria-pressed", "true");
+	await expect(
+		page.locator("[data-activity-grid-root] [aria-busy='true']"),
+	).toHaveCount(0);
+	await page.waitForTimeout(500);
+	await expect
+		.poll(() => page.evaluate(() => window.scrollY))
+		.toBe(scrollBeforeDetail);
+	expect(listRequests).toHaveLength(listRequestsBeforeDetail);
+	expect(activityRequests).toHaveLength(activityRequestsBeforeDetail);
+	await page.screenshot({
+		path: "test-results/collection-activity-detail-handoff.png",
+	});
+
+	await recordSheet.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(recordSheet).toHaveCount(0);
+	await expect(activityCell).toBeVisible();
+	await expect(activityCell).toHaveAttribute("aria-pressed", "true");
+	await expect
+		.poll(() => listRequests.at(-1)?.searchParams.get("page"))
+		.toBe("2");
+	await expect(page.getByRole("button", { name: "翻译筛选" })).toContainText(
+		"1 项已选",
+	);
+	await expect
+		.poll(() => page.evaluate(() => window.scrollY))
+		.toBe(scrollBeforeDetail);
+	expect(listRequests).toHaveLength(listRequestsBeforeDetail);
+	expect(activityRequests).toHaveLength(activityRequestsBeforeDetail);
+});
+
+test("cold collection detail renders one activity read before loading the list", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	const listRequests: URL[] = [];
+	const activityRequests: URL[] = [];
+	page.on("request", (request) => {
+		const url = new URL(request.url());
+		if (url.pathname === "/api/admin/jobs/ai-records/release")
+			listRequests.push(url);
+		if (url.pathname === "/api/admin/jobs/ai-records/release/activity")
+			activityRequests.push(url);
+	});
+	const record = {
+		id: "release-cold-success-1",
+		kind: "release" as const,
+		repository: "octo-demo/release-lab",
+		title: "Cold detail success record",
+		occurred_at: "2026-09-24T11:30:00.000Z",
+		detected_at: null,
+		generated_at: null,
+		translation: null,
+		polish: {
+			status: "ready",
+			retry_count: 0,
+			started_at: null,
+			last_attempt_at: "2026-09-24T11:30:00.000Z",
+			finished_at: null,
+		},
+	};
+	const activity = collectionActivityFixture(record.id, record.title);
+	await page.route("**/api/admin/jobs/ai-records/**", async (route) => {
+		const pathname = new URL(route.request().url()).pathname;
+		if (pathname === "/api/admin/jobs/ai-records/release")
+			return json(route, { items: [record], page: 1, page_size: 20, total: 1 });
+		if (pathname === "/api/admin/jobs/ai-records/release/activity")
+			return json(route, activity);
+		if (pathname === `/api/admin/jobs/ai-records/release/${record.id}`)
+			return json(route, { record, attempts: [] });
+		return route.fallback();
+	});
+
+	await page.goto(`/admin/jobs/ai-records/release/${record.id}`, {
+		waitUntil: "domcontentloaded",
+	});
+	const recordSheet = page.getByRole("dialog", { name: "记录详情" });
+	await expect(recordSheet).toBeVisible();
+	const activityCell = page.locator(
+		`[data-activity-cell-id="${record.id}:2026-09-24T11:30:00.000Z"]`,
+	);
+	await expect(activityCell).toBeVisible();
+	await expect.poll(() => activityRequests.length).toBe(1);
+	await expect(
+		page.locator("[data-activity-grid-root] [aria-busy='true']"),
+	).toHaveCount(0);
+	expect(listRequests).toHaveLength(0);
+
+	await recordSheet.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(recordSheet).toHaveCount(0);
+	await expect(page.getByRole("table")).toBeVisible();
+	await expect.poll(() => listRequests.length).toBe(1);
+	await expect(activityCell).toBeVisible();
+	expect(activityRequests).toHaveLength(1);
+});
+
+test("cold collection detail reads activity once and retries only after failure", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	const listRequests: URL[] = [];
+	const activityRequests: URL[] = [];
+	let activityResponseCount = 0;
+	page.on("request", (request) => {
+		const url = new URL(request.url());
+		if (url.pathname === "/api/admin/jobs/ai-records/release")
+			listRequests.push(url);
+		if (url.pathname === "/api/admin/jobs/ai-records/release/activity")
+			activityRequests.push(url);
+	});
+	const record = {
+		id: "release-cold-1",
+		kind: "release" as const,
+		repository: "octo-demo/release-lab",
+		title: "Cold detail record",
+		occurred_at: "2026-09-24T11:30:00.000Z",
+		detected_at: null,
+		generated_at: null,
+		translation: null,
+		polish: {
+			status: "ready",
+			retry_count: 0,
+			started_at: null,
+			last_attempt_at: "2026-09-24T11:30:00.000Z",
+			finished_at: null,
+		},
+	};
+	const activity = collectionActivityFixture(record.id, record.title);
+	await page.route("**/api/admin/jobs/ai-records/**", async (route) => {
+		const pathname = new URL(route.request().url()).pathname;
+		if (pathname === "/api/admin/jobs/ai-records/release")
+			return json(route, { items: [record], page: 1, page_size: 20, total: 1 });
+		if (pathname === "/api/admin/jobs/ai-records/release/activity") {
+			activityResponseCount += 1;
+			if (activityResponseCount === 1) {
+				return json(
+					route,
+					{ error: { code: "mock_activity_failure", message: "temporary" } },
+					503,
+				);
+			}
+			return json(route, activity);
+		}
+		if (pathname === `/api/admin/jobs/ai-records/release/${record.id}`)
+			return json(route, { record, attempts: [] });
+		return route.fallback();
+	});
+
+	await page.goto(`/admin/jobs/ai-records/release/${record.id}`, {
+		waitUntil: "domcontentloaded",
+	});
+	const recordSheet = page.getByRole("dialog", { name: "记录详情" });
+	await expect(recordSheet).toBeVisible();
+	await expect.poll(() => activityRequests.length).toBe(1);
+	await expect(
+		page.locator('section[aria-label="内容处理活动"] h3'),
+	).toHaveText("最近 12 小时活动暂不可用");
+	expect(listRequests).toHaveLength(0);
+
+	await recordSheet.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(recordSheet).toHaveCount(0);
+	await expect(page.getByRole("table")).toBeVisible();
+	await expect(
+		page.locator('section[aria-label="内容处理活动"] h3'),
+	).toHaveText("最近 12 小时活动暂不可用");
+	expect(activityRequests).toHaveLength(1);
+	expect(listRequests).toHaveLength(1);
+	await page.locator('section[aria-label="内容处理活动"] button').click();
+	const activityCell = page.locator(
+		`[data-activity-cell-id="${record.id}:2026-09-24T11:30:00.000Z"]`,
+	);
+	await expect(activityCell).toBeVisible();
+	expect(activityRequests).toHaveLength(2);
+	expect(listRequests).toHaveLength(1);
+});
+
 test("content processing attempt filter stays full-width without mobile overflow", async ({
 	page,
 }) => {
@@ -2953,7 +3260,7 @@ test("content processing keeps the last list visible after a refresh timeout", a
 			return route.fallback();
 		}
 		listCalls += 1;
-		if (listCalls <= 2) {
+		if (listCalls === 1) {
 			return json(route, { items: [record], page: 1, page_size: 20, total: 1 });
 		}
 		return json(
@@ -2973,7 +3280,9 @@ test("content processing keeps the last list visible after a refresh timeout", a
 	await expect(
 		recordsTable.getByText("v2.32.0", { exact: true }),
 	).toBeVisible();
+	await expect.poll(() => listCalls).toBe(1);
 	await page.getByRole("button", { name: "刷新记录" }).first().click();
+	await expect.poll(() => listCalls).toBe(2);
 	await expect(
 		page.getByRole("heading", { name: "记录暂时无法读取" }),
 	).toBeVisible();

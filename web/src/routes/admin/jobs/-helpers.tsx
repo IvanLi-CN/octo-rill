@@ -204,6 +204,7 @@ export function AdminJobsRoutePage(props: {
 				void router.navigate({
 					href: routeUrl,
 					replace: options?.replace,
+					resetScroll: options?.resetScroll,
 				});
 			}}
 		/>

@@ -1548,6 +1548,7 @@ type JobManagementProps = {
 		nextRoute: AdminJobsRouteState,
 		options?: {
 			replace?: boolean;
+			resetScroll?: boolean;
 		},
 	) => void;
 	taskIntervalSettingsDialogDefaultOpen?: boolean;
@@ -4677,6 +4678,7 @@ export function JobManagement({
 			nextRoute: AdminJobsRouteState,
 			options?: {
 				replace?: boolean;
+				resetScroll?: boolean;
 			},
 		) => {
 			if (onNavigateRoute) {
@@ -7972,62 +7974,74 @@ export function JobManagement({
 							})
 						}
 						onOpenRecord={(kind, id) =>
-							navigateAdminJobsRoute({
-								primaryTab: "ai_records",
-								translationView,
-								taskDrawerRoute: null,
-								drawerFromTab: null,
-								subscriptionDetailTaskId: null,
-								aiRecordFilters,
-								aiRecordDetailRoute: {
-									kind,
-									id,
-									attemptId: null,
-									llmCallId: null,
+							navigateAdminJobsRoute(
+								{
+									primaryTab: "ai_records",
+									translationView,
+									taskDrawerRoute: null,
+									drawerFromTab: null,
+									subscriptionDetailTaskId: null,
+									aiRecordFilters,
+									aiRecordDetailRoute: {
+										kind,
+										id,
+										attemptId: null,
+										llmCallId: null,
+									},
 								},
-							})
+								{ resetScroll: false },
+							)
 						}
 						onOpenAttempt={(attemptId) => {
 							if (!aiRecordDetailRoute) return;
-							navigateAdminJobsRoute({
-								primaryTab: "ai_records",
-								translationView,
-								taskDrawerRoute: null,
-								drawerFromTab: null,
-								subscriptionDetailTaskId: null,
-								aiRecordFilters,
-								aiRecordDetailRoute: {
-									...aiRecordDetailRoute,
-									attemptId: attemptId || null,
-									llmCallId: null,
+							navigateAdminJobsRoute(
+								{
+									primaryTab: "ai_records",
+									translationView,
+									taskDrawerRoute: null,
+									drawerFromTab: null,
+									subscriptionDetailTaskId: null,
+									aiRecordFilters,
+									aiRecordDetailRoute: {
+										...aiRecordDetailRoute,
+										attemptId: attemptId || null,
+										llmCallId: null,
+									},
 								},
-							});
+								{ resetScroll: false },
+							);
 						}}
 						onOpenLlm={(llmCallId) => {
 							if (!aiRecordDetailRoute) return;
-							navigateAdminJobsRoute({
-								primaryTab: "ai_records",
-								translationView,
-								taskDrawerRoute: null,
-								drawerFromTab: null,
-								subscriptionDetailTaskId: null,
-								aiRecordFilters,
-								aiRecordDetailRoute: {
-									...aiRecordDetailRoute,
-									llmCallId,
+							navigateAdminJobsRoute(
+								{
+									primaryTab: "ai_records",
+									translationView,
+									taskDrawerRoute: null,
+									drawerFromTab: null,
+									subscriptionDetailTaskId: null,
+									aiRecordFilters,
+									aiRecordDetailRoute: {
+										...aiRecordDetailRoute,
+										llmCallId,
+									},
 								},
-							});
+								{ resetScroll: false },
+							);
 						}}
 						onCloseRecord={() =>
-							navigateAdminJobsRoute({
-								primaryTab: "ai_records",
-								translationView,
-								taskDrawerRoute: null,
-								drawerFromTab: null,
-								subscriptionDetailTaskId: null,
-								aiRecordFilters,
-								aiRecordDetailRoute: null,
-							})
+							navigateAdminJobsRoute(
+								{
+									primaryTab: "ai_records",
+									translationView,
+									taskDrawerRoute: null,
+									drawerFromTab: null,
+									subscriptionDetailTaskId: null,
+									aiRecordFilters,
+									aiRecordDetailRoute: null,
+								},
+								{ resetScroll: false },
+							)
 						}
 					/>
 				</TabsContent>

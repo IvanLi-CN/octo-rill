@@ -23,7 +23,7 @@
 
 ## Verification Coverage
 
-The implementation provides the verification evidence named in `SPEC.md`: unified rendering, density and scroll behavior, loading geometry, desktop interaction, touch interaction, request isolation, and Demo data-case switching. The dense same-hour Demo case is also captured from Ego Lite in `assets/admin-jobs-many-dense-ego.png` and copied to owner-inline assets.
+The implementation provides the verification evidence named in `SPEC.md`: unified rendering, density and scroll behavior, loading geometry, desktop interaction, touch interaction, hot-navigation cache handoff, cold-detail activity read/retry isolation, and Demo data-case switching. The dense same-hour Demo case is also captured from Ego Lite in `assets/admin-jobs-many-dense-ego.png` and copied to owner-inline assets.
 
 ## Remaining Gaps
 

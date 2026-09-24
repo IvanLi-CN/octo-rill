@@ -8,8 +8,9 @@ import {
 import type { AdminUserItem } from "@/admin/UserManagement";
 import type {
 	AdminDashboardResponse,
-	AdminCollectionAttempt,
 	AdminCollectionActivityResponse,
+	AdminCollectionActivityStatus,
+	AdminCollectionAttempt,
 	AdminCollectionRecordDetail,
 	AdminCollectionRecordItem,
 	AdminCollectionTaskSummary,
@@ -1042,9 +1043,18 @@ function demoCollectionRecordsForCase(
 			...template,
 			id: `${kind}-many-${String(index + 1).padStart(3, "0")}`,
 			title: `${template.title} · dense ${index + 1}`,
-			occurred_at: new Date(
-				Date.parse("2026-07-08T10:00:00+08:00") + index * 20_000,
-			).toISOString(),
+			occurred_at:
+				kind === "brief"
+					? null
+					: new Date(
+							Date.parse("2026-07-08T10:00:00+08:00") + index * 20_000,
+						).toISOString(),
+			generated_at:
+				kind === "brief"
+					? new Date(
+							Date.parse("2026-07-08T10:00:00+08:00") + index * 20_000,
+						).toISOString()
+					: null,
 			polish: isFailure
 				? { ...template.polish, status: "failed", display_status: "failed" }
 				: template.polish,
@@ -1058,52 +1068,67 @@ function demoCollectionActivity(
 ): AdminCollectionActivityResponse {
 	const records = demoCollectionRecordsForCase(kind, dataCase);
 	const windowStartedAt = new Date("2026-07-07T23:00:00+08:00");
-	const buckets = Array.from({ length: 12 }, (_, index) => {
-		const started = new Date(
-			windowStartedAt.getTime() + index * 60 * 60 * 1000,
+	const windowEndedAt = new Date("2026-07-08T11:00:00+08:00");
+	const buckets: AdminCollectionActivityResponse["buckets"] = Array.from(
+		{ length: 12 },
+		(_, index) => {
+			const startedAt = new Date(
+				windowStartedAt.getTime() + index * 60 * 60 * 1000,
+			);
+			return {
+				started_at: startedAt.toISOString(),
+				ended_at: new Date(startedAt.getTime() + 60 * 60 * 1000).toISOString(),
+				cells: [],
+			};
+		},
+	);
+	for (const record of records) {
+		const sourceTime =
+			record.kind === "brief" ? record.generated_at : record.occurred_at;
+		if (!sourceTime) continue;
+		const time = Date.parse(sourceTime);
+		const bucketIndex = Math.floor(
+			(time - windowStartedAt.getTime()) / (60 * 60 * 1000),
 		);
-		const ended = new Date(started.getTime() + 60 * 60 * 1000);
-		const cells = records
-			.filter((record) => {
-				const source = record.occurred_at ?? record.generated_at;
-				if (!source) return false;
-				const time = Date.parse(source);
-				return time >= started.getTime() && time < ended.getTime();
-			})
-			.map((record) => ({
-				id: record.id,
-				title: record.title,
-				repository: record.repository,
-				source_time:
-					record.occurred_at ?? record.generated_at ?? started.toISOString(),
-				translation_status: record.translation?.display_status ?? null,
-				polish_status: record.polish.display_status,
-				composite_status: (record.polish.display_status === "succeeded"
-					? "completed"
-					: record.polish.display_status === "running"
-						? "processing"
-						: record.polish.display_status === "failed" ||
-								record.polish.status === "failed"
-							? "exception"
-							: "neutral") as AdminCollectionActivityResponse["buckets"][number]["cells"][number]["composite_status"],
-			}));
-		return {
-			started_at: started.toISOString(),
-			ended_at: ended.toISOString(),
-			cells,
-		};
-	});
+		if (bucketIndex < 0 || bucketIndex >= buckets.length) continue;
+		const statuses = [
+			record.translation?.display_status,
+			record.polish.display_status,
+		].filter((status): status is string => status !== undefined);
+		let compositeStatus: AdminCollectionActivityStatus = "neutral";
+		if (statuses.some((status) => ["failed", "missing"].includes(status))) {
+			compositeStatus = "exception";
+		} else if (
+			statuses.some((status) => ["queued", "running"].includes(status))
+		) {
+			compositeStatus = "processing";
+		} else if (
+			statuses.length > 0 &&
+			statuses.every((status) =>
+				["succeeded", "disabled", "not_applicable"].includes(status),
+			)
+		) {
+			compositeStatus = "completed";
+		}
+		buckets[bucketIndex].cells.push({
+			id: record.id,
+			title: record.title,
+			repository: record.repository,
+			source_time: sourceTime,
+			translation_status: record.translation?.display_status ?? null,
+			polish_status: record.polish.display_status,
+			composite_status: compositeStatus,
+		});
+	}
 	const cells = buckets.flatMap((bucket) => bucket.cells);
 	return {
 		kind,
 		bucket_minutes: 60,
 		bucket_count: 12,
 		window_started_at: windowStartedAt.toISOString(),
-		window_ended_at: new Date(
-			windowStartedAt.getTime() + 12 * 60 * 60 * 1000,
-		).toISOString(),
+		window_ended_at: windowEndedAt.toISOString(),
 		summary: {
-			content_count: records.length,
+			content_count: cells.length,
 			completed_count: cells.filter(
 				(cell) => cell.composite_status === "completed",
 			).length,
@@ -1284,7 +1309,6 @@ function demoLlmData(dataCase: DemoAdminJobsDataCase) {
 		details: callDetails,
 	};
 }
-
 function demoSummaryAttemptCount(summary: AdminCollectionTaskSummary | null) {
 	if (!summary || summary.status === "not_recorded") return 0;
 	return Math.max(1, summary.retry_count + 1);

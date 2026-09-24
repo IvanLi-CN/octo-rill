@@ -212,8 +212,21 @@ export const CurrentWindowOverview: Story = {
 		await expect(args.onOpenRecord).toHaveBeenCalledWith(
 			"release",
 			"release-104",
+			"release-104:2026-09-20T11:15:00.000Z",
 		);
 		await expect(canvas.queryByText("·")).toBeNull();
+	},
+};
+
+export const SelectedCellState: Story = {
+	args: {
+		selectedCellId: "release-104:2026-09-20T11:15:00.000Z",
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("button", { name: /Bun v1\.4\.2/ }),
+		).toHaveAttribute("aria-pressed", "true");
 	},
 };
 
