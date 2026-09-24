@@ -30,3 +30,4 @@
 - [x] M1: 前端共享版本监视、AppShell notice 槽位与顶部轻提示完成。
 - [x] M2: footer 共享版本语义、后端 no-store 保护与 Storybook 覆盖完成。
 - [x] M3: Playwright / build / visual evidence / review-loop 收敛完成。
+- The shared notice distinguishes a backend release change from a Worker-only resource update; the footer remains tied to the loaded page build. Worker activation reloads once after `controllerchange` and offers retry after a 15-second timeout.

@@ -29,6 +29,7 @@ export default defineConfig((env) =>
 									"dashboard-repository-sidebar-viewport",
 									"command-palette-search",
 									"demo-inspector",
+									"version-update-notice",
 								],
 								exclude: [],
 								skip: [],

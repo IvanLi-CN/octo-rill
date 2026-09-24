@@ -784,6 +784,14 @@ test.describe("mock-only page demo scenes", () => {
 		await expect(page.locator("[data-pwa-install-action]")).toBeVisible();
 
 		await page.goto(
+			"/focus/repo/octo-demo/release-lab?demo=app-shell&d_shell=resource-update&d_controls=hidden",
+		);
+		await expect(page.locator("[data-version-update-message]")).toHaveText(
+			"应用资源更新已准备好，刷新后完成切换",
+		);
+		await expect(page.getByRole("button", { name: "刷新" })).toBeVisible();
+
+		await page.goto(
 			"/focus/repo/octo-demo/release-lab?demo=app-shell&d_shell=unknown&d_controls=hidden",
 		);
 		await expect(page.getByText("Version unknown")).toBeVisible({

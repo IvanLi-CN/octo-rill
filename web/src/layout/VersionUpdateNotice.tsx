@@ -12,8 +12,15 @@ export function VersionUpdateNotice() {
 		isPwaInstalled = false,
 		promptInstallPwa,
 		refreshPage,
+		serviceWorkerUpdatePhase,
 	} = useVersionMonitor();
 	const showInstallAction = canInstallPwa && !isPwaInstalled;
+	const refreshLabel =
+		serviceWorkerUpdatePhase === "activating"
+			? "更新中"
+			: serviceWorkerUpdatePhase === "failed"
+				? "重试"
+				: "刷新";
 
 	if (!hasUpdate && !hasServiceWorkerUpdate && !showInstallAction) {
 		return null;
@@ -26,7 +33,7 @@ export function VersionUpdateNotice() {
 			，按需刷新即可。
 		</>
 	) : hasServiceWorkerUpdate ? (
-		"检测到新前端版本，按需刷新即可。"
+		"应用资源更新已准备好，刷新后完成切换"
 	) : (
 		"检测到新版本，按需刷新即可。"
 	);
@@ -38,8 +45,10 @@ export function VersionUpdateNotice() {
 					<span className="font-mono font-medium">{availableVersion}</span>
 					，也可安装为独立应用。
 				</>
+			) : hasServiceWorkerUpdate ? (
+				"应用资源更新已准备好，也可安装为独立应用"
 			) : (
-				"检测到新前端版本，也可安装为独立应用。"
+				"检测到新版本，也可安装为独立应用。"
 			)
 		) : hasUpdate || hasServiceWorkerUpdate ? (
 			updateMessage
@@ -87,10 +96,11 @@ export function VersionUpdateNotice() {
 							variant="ghost"
 							size="sm"
 							className="relative h-7 before:pointer-events-auto before:absolute before:inset-x-0 before:-inset-y-1 before:content-[''] px-2.5 text-xs text-amber-950 hover:bg-amber-100 hover:text-amber-950 dark:text-amber-50 dark:hover:bg-amber-500/20 dark:hover:text-amber-50"
+							disabled={serviceWorkerUpdatePhase === "activating"}
 							onClick={refreshPage}
 						>
 							<RefreshCcw className="size-3.5" />
-							刷新
+							{refreshLabel}
 						</Button>
 					) : null}
 				</div>
