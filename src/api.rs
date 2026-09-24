@@ -12319,7 +12319,7 @@ fn select_public_release_focus_rows(
         left_ordinal
             .abs_diff(active_ordinal)
             .cmp(&right_ordinal.abs_diff(active_ordinal))
-            .then_with(|| left_ordinal.cmp(&right_ordinal))
+            .then_with(|| right_ordinal.cmp(&left_ordinal))
             .then_with(|| right.sort_ts.cmp(&left.sort_ts))
             .then_with(|| right.release_id.cmp(&left.release_id))
     });
@@ -12890,11 +12890,13 @@ async fn public_list_repo_releases_impl(
             Some(PublicReleaseHighlightSpec::Ids(ids)) => ids.iter().copied().collect(),
             _ => HashSet::new(),
         };
+        let mut required_focus_ids = required_highlight_ids.clone();
+        required_focus_ids.insert(focus_position.release_id);
         let focus_limit = query
             .limit
             .unwrap_or(limit)
             .clamp(1, 30)
-            .max(required_highlight_ids.len() as i64);
+            .max(required_focus_ids.len() as i64);
         let newer_limit = (focus_limit.saturating_sub(1)) / 2;
         let older_limit = focus_limit.saturating_sub(1 + newer_limit);
         let mut focused_rows = load_public_release_rows(
@@ -12963,39 +12965,30 @@ async fn public_list_repo_releases_impl(
         rows = dedupe_public_release_rows(focused_rows);
         sort_public_release_rows(&mut rows);
         if rows.len() > focus_limit as usize {
-            let focus_index = rows
+            let selectors = rows
                 .iter()
-                .position(|row| row.release_id == focus_position.release_id)
+                .map(|row| PublicReleaseTypedSelector::Id(row.release_id))
+                .collect::<Vec<_>>();
+            let ordinal_by_id =
+                load_public_release_selector_rows(state.as_ref(), repo_id, &selectors)
+                    .await?
+                    .into_iter()
+                    .map(|row| (row.release_id, row.ordinal))
+                    .collect::<HashMap<_, _>>();
+            let active_ordinal = ordinal_by_id
+                .get(&focus_position.release_id)
+                .copied()
                 .unwrap_or(0);
-            let required_start = rows
-                .iter()
-                .position(|row| required_highlight_ids.contains(&row.release_id))
-                .unwrap_or(focus_index);
-            let required_end = rows
-                .iter()
-                .rposition(|row| required_highlight_ids.contains(&row.release_id))
-                .unwrap_or(focus_index);
-            let effective_limit = (focus_limit as usize).max(
-                required_end
-                    .saturating_sub(required_start)
-                    .saturating_add(1),
+            rows = select_public_release_focus_rows(
+                rows,
+                &required_focus_ids,
+                &ordinal_by_id,
+                active_ordinal,
+                focus_limit as usize,
             );
-            let mut start = focus_index.saturating_sub(effective_limit.saturating_sub(1) / 2);
-            if start + effective_limit > rows.len() {
-                start = rows.len().saturating_sub(effective_limit);
-            }
-            if required_start < start {
-                start = required_start;
-            }
-            if required_end >= start + effective_limit {
-                start = required_end + 1 - effective_limit;
-            }
-            rows = rows.into_iter().skip(start).take(effective_limit).collect();
         }
         sort_public_release_rows(&mut rows);
-        if !required_highlight_ids.is_empty() {
-            limit = limit.max(rows.len() as i64);
-        }
+        limit = limit.max(focus_limit);
         if has_more_newer {
             recommended_previous_cursor = rows.first().map(public_release_cursor);
         }
@@ -37083,10 +37076,12 @@ line two",
     async fn public_release_focus_keeps_all_discrete_highlight_targets() {
         let pool = setup_pool().await;
         seed_public_release_usage(&pool, Some(42), "ready").await;
-        for idx in 0..8_i64 {
+        for idx in 0..40_i64 {
             let release_id = 120 + idx;
             let tag = format!("v1.3.{idx}");
-            let published_at = format!("2026-02-2{}T00:00:00Z", 8 - idx);
+            let month = 2 + idx / 28;
+            let day = 1 + idx % 28;
+            let published_at = format!("2026-{month:02}-{day:02}T00:00:00Z");
             sqlx::query(
                 r#"
 				INSERT INTO repo_releases (
@@ -37118,7 +37113,7 @@ line two",
             State(setup_state(pool)),
             Path(("openai".to_owned(), "codex".to_owned())),
             RawQuery(Some(
-                "limit=1&focus=tag%3Av1.3.4&highlight=id%3A120&highlight=id%3A127".to_owned(),
+                "limit=1&focus=tag%3Av1.3.20&highlight=id%3A120&highlight=id%3A159".to_owned(),
             )),
             HeaderMap::new(),
         )
@@ -37132,7 +37127,8 @@ line two",
             .map(|item| item["release_id"].as_str().unwrap())
             .collect::<std::collections::HashSet<_>>();
         assert!(ids.contains("120"));
-        assert!(ids.contains("127"));
+        assert!(ids.contains("159"));
+        assert!(body["items"].as_array().unwrap().len() <= 30);
         assert_eq!(body["highlight"]["total"], json!(2));
     }
 

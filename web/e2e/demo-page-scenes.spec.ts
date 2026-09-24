@@ -81,6 +81,45 @@ test.describe("mock-only page demo scenes", () => {
 		);
 	});
 
+	test("focused public release demo keeps far discrete targets in the first response", async ({
+		page,
+	}) => {
+		const responsePromise = page.waitForResponse(
+			(response) =>
+				response
+					.url()
+					.includes("/api/public/repos/octo-demo/release-lab/releases") &&
+				!response.url().includes("/content"),
+		);
+		await page.goto(
+			"/public/octo-demo/release-lab/releases/tag/v1.50.0?demo=public-release-ready&highlight=id%3A291058027&highlight=id%3A291057928&d_controls=hidden",
+		);
+		const response = (await responsePromise).json() as Promise<{
+			items: Array<{ release_id: string }>;
+		}>;
+		const data = await response;
+		const ids = new Set(data.items.map((item) => item.release_id));
+		expect(ids.has("291058027")).toBe(true);
+		expect(ids.has("291057928")).toBe(true);
+		expect(data.items.length).toBeLessThanOrEqual(30);
+	});
+
+	test("highlight navigation moves keyboard focus to the selected release card", async ({
+		page,
+	}) => {
+		await page.setViewportSize({ width: 1440, height: 900 });
+		await page.goto(
+			"/public/octo-demo/release-lab/releases/tag/v1.50.0?demo=public-release-ready&highlight=id%3A291058027&highlight=id%3A291057928&d_controls=hidden",
+		);
+
+		const navigation = page.getByTestId("public-release-highlight-navigation");
+		await expect(navigation).toBeVisible({ timeout: 15_000 });
+		await navigation.getByTitle("下一条高亮记录").click();
+		await expect(page.locator("[data-release-id='291057928']")).toBeFocused({
+			timeout: 8_000,
+		});
+	});
+
 	test("focused public release demo does not leave estimated gaps between cards", async ({
 		page,
 	}) => {

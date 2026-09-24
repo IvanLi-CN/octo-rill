@@ -1565,10 +1565,29 @@ function buildDemoPublicReleaseList(request: Request) {
 			return item ? [item] : [];
 		});
 		const centered = centeredItems();
-		if (centered) pageItems = centered;
+		if (centered) {
+			const targetIds = new Set(pageItems.map((item) => item.release_id));
+			const contextIds = new Set(
+				centered
+					.filter((item) => !targetIds.has(item.release_id))
+					.slice(0, Math.max(0, 30 - targetIds.size))
+					.map((item) => item.release_id),
+			);
+			const selectedIds = new Set([...targetIds, ...contextIds]);
+			pageItems = sourceItems.filter((item) =>
+				selectedIds.has(item.release_id),
+			);
+		}
 		if (cursorIndex >= 0) {
-			const end = untilIndex >= 0 ? untilIndex + 1 : cursorIndex + 1 + limit;
-			pageItems = sourceItems.slice(cursorIndex + 1, end);
+			if (direction === "newer") {
+				const end = cursorIndex;
+				const start = untilIndex >= 0 ? untilIndex : Math.max(0, end - limit);
+				pageItems = sourceItems.slice(start, end);
+			} else {
+				const start = cursorIndex + 1;
+				const end = untilIndex >= 0 ? untilIndex + 1 : start + limit;
+				pageItems = sourceItems.slice(start, Math.min(sourceItems.length, end));
+			}
 		}
 		const highlightedIds = new Set(resolved.map((target) => target.release_id));
 		const items = pageItems.map((item) => ({

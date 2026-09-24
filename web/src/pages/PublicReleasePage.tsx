@@ -111,10 +111,7 @@ function isVisibleEnough(
 	const elementRect = element.getBoundingClientRect();
 	const viewportRect = scrollElement.getBoundingClientRect();
 	if (elementRect.height > viewportRect.height) {
-		return (
-			elementRect.bottom > viewportRect.top &&
-			elementRect.top < viewportRect.bottom
-		);
+		return Math.abs(elementRect.top - viewportRect.top) <= 1;
 	}
 	return (
 		elementRect.top >= viewportRect.top &&
@@ -265,9 +262,6 @@ type LoadState =
 			data: Extract<PublicReleaseResponse, { status: "ready" }>;
 	  }
 	| { status: "error"; message: string; code?: string };
-
-type ReadyReleaseData = Extract<PublicReleaseResponse, { status: "ready" }>;
-const publicReleaseTimelineCache = new Map<string, ReadyReleaseData>();
 
 function isPendingResponse(
 	value: unknown,
@@ -602,23 +596,20 @@ export function PublicReleasePage(props: {
 }) {
 	const { owner, repo, tag = null, highlight = null } = props;
 	const timelineCacheKey = `${owner}/${repo}`;
-	const [state, setState] = useState<LoadState>(() => {
-		const cached = publicReleaseTimelineCache.get(timelineCacheKey);
-		return cached ? { status: "list", data: cached } : { status: "loading" };
-	});
+	const [state, setState] = useState<LoadState>({ status: "loading" });
 	const [loadingMore, setLoadingMore] = useState(false);
 	const [loadingNewer, setLoadingNewer] = useState(false);
 	const [loadingGap, setLoadingGap] = useState<string | null>(null);
 	const [appendError, setAppendError] = useState<string | null>(null);
 	const [selectedLane, setSelectedLane] = useState<FeedLane>("smart");
 	const initialLoadKeyRef = useRef<string | null>(null);
+	const initialLoadPendingRef = useRef<string | null>(null);
 	const isHighlightMode = highlight !== null;
 	const initialLoadKey = JSON.stringify({ owner, repo, tag, highlight });
 	const requestKeyRef = useRef(initialLoadKey);
 	if (requestKeyRef.current !== initialLoadKey) {
 		requestKeyRef.current = initialLoadKey;
 	}
-	const loadedTimelineCacheKeyRef = useRef(timelineCacheKey);
 	const previousTimelineCacheKeyRef = useRef(timelineCacheKey);
 	const reactionControls = usePublicReleaseReactionControls(
 		state.status === "list" ? state.data.items : [],
@@ -633,15 +624,11 @@ export function PublicReleasePage(props: {
 		setAppendError(null);
 	}, [timelineCacheKey]);
 	useEffect(() => {
-		if (
-			state.status === "list" &&
-			!tag &&
-			!highlight &&
-			loadedTimelineCacheKeyRef.current === timelineCacheKey
-		) {
-			publicReleaseTimelineCache.set(timelineCacheKey, state.data);
-		}
-	}, [highlight, state, tag, timelineCacheKey]);
+		setLoadingMore(false);
+		setLoadingNewer(false);
+		setLoadingGap(null);
+		setAppendError(null);
+	}, [initialLoadKey]);
 
 	const highlightRequest = useMemo(() => {
 		if (!highlight) return {};
@@ -691,6 +678,7 @@ export function PublicReleasePage(props: {
 
 	const load = useCallback(async () => {
 		const requestKey = initialLoadKey;
+		initialLoadPendingRef.current = requestKey;
 		try {
 			setState((current) =>
 				current.status === "error" ? { status: "loading" } : current,
@@ -707,7 +695,6 @@ export function PublicReleasePage(props: {
 					PublicReleaseResponse,
 					{ status: "ready" }
 				>;
-				loadedTimelineCacheKeyRef.current = timelineCacheKey;
 				setState((current) => {
 					if (requestKeyRef.current !== requestKey) return current;
 					if (current.status !== "list" || !tag) {
@@ -745,6 +732,10 @@ export function PublicReleasePage(props: {
 				return;
 			}
 			setState({ status: "error", message: "公开 Release 加载失败" });
+		} finally {
+			if (initialLoadPendingRef.current === requestKey) {
+				initialLoadPendingRef.current = null;
+			}
 		}
 	}, [buildHighlightRequest, initialLoadKey, repo, tag, timelineCacheKey]);
 
@@ -756,7 +747,12 @@ export function PublicReleasePage(props: {
 	);
 
 	const loadMore = useCallback(async () => {
-		if (loadingMore || state.status !== "list" || !state.data.next_cursor) {
+		if (
+			loadingMore ||
+			initialLoadPendingRef.current === initialLoadKey ||
+			state.status !== "list" ||
+			!state.data.next_cursor
+		) {
 			return;
 		}
 		setLoadingMore(true);
@@ -809,6 +805,7 @@ export function PublicReleasePage(props: {
 	const loadNewer = useCallback(async () => {
 		if (
 			loadingNewer ||
+			initialLoadPendingRef.current === initialLoadKey ||
 			state.status !== "list" ||
 			!state.data.previous_cursor
 		) {
@@ -861,7 +858,12 @@ export function PublicReleasePage(props: {
 
 	const loadGap = useCallback(
 		async (gap: PublicReleaseGap) => {
-			if (loadingGap || state.status !== "list") return;
+			if (
+				loadingGap ||
+				initialLoadPendingRef.current === initialLoadKey ||
+				state.status !== "list"
+			)
+				return;
 			setLoadingGap(gap.newer_cursor);
 			setAppendError(null);
 			const requestKey = initialLoadKey;
@@ -1347,6 +1349,8 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 	const hydratedTranslatedRef = useRef(new Set<string>());
 	const programmaticUntilRef = useRef(0);
 	const pendingFocusIdRef = useRef<string | null>(null);
+	const pendingDomFocusIdRef = useRef<string | null>(null);
+	const programmaticDomFocusRef = useRef<string | null>(null);
 	const pendingFocusRetryTimerRef = useRef<number | null>(null);
 	const pendingFocusScheduledIdRef = useRef<string | null>(null);
 	const pendingFocusSeekStartedRef = useRef<string | null>(null);
@@ -1687,6 +1691,8 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 		routeFocusSuppressedRef.current = true;
 		routeFocusLockRef.current = null;
 		pendingFocusIdRef.current = null;
+		pendingDomFocusIdRef.current = null;
+		programmaticDomFocusRef.current = null;
 		pendingFocusRevealAppliedRef.current = null;
 		cancelPendingFocusRetry();
 		cancelDirectoryFocusRetry();
@@ -2065,7 +2071,7 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 	}, [props.items, restoreSavedDirectoryScroll, routeKey, scrollPositionKey]);
 
 	const focusRelease = useCallback(
-		(releaseId: string) => {
+		(releaseId: string, { moveDomFocus = false } = {}) => {
 			if (detailScrollRef.current) {
 				cancelSmoothScroll(detailScrollRef.current);
 				releaseScrollGuards.delete(detailScrollRef.current);
@@ -2078,10 +2084,15 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 			pendingFocusIdRef.current = null;
 			pendingFocusRevealAppliedRef.current = null;
 			routeFocusLockRef.current = releaseId;
+			pendingDomFocusIdRef.current = moveDomFocus ? releaseId : null;
+			markCurrent(releaseId, { replaceUrl: false });
 			const index = rows.findIndex(
 				(row) => row.kind === "release" && row.item.release_id === releaseId,
 			);
-			if (index < 0) return;
+			if (index < 0) {
+				pendingDomFocusIdRef.current = null;
+				return;
+			}
 			programmaticUntilRef.current = performance.now() + 5_000;
 			setPulseReleaseId(releaseId);
 			window.setTimeout(
@@ -2100,7 +2111,6 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 				releaseScrollPositions.has(scrollPositionKey);
 			if (!preserveDirectoryPosition) focusDirectoryRelease(releaseId);
 			else cancelDirectoryFocusRetry();
-			markCurrent(releaseId, { replaceUrl: false });
 			restoreSavedDirectoryScroll();
 		},
 		[
@@ -2149,9 +2159,11 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 			routeFocusLockRef.current = null;
 			focusSignatureRef.current = null;
 		}
-		const targetId = props.tag
-			? props.items.find((item) => item.tag_name === props.tag)?.release_id
-			: props.highlight?.active_release_id;
+		const targetId =
+			props.highlight?.active_release_id ??
+			(props.tag
+				? props.items.find((item) => item.tag_name === props.tag)?.release_id
+				: undefined);
 		if (!targetId) {
 			focusSignatureRef.current = props.tag ? null : "list";
 			return;
@@ -2208,6 +2220,18 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 	}, [rows, schedulePendingFocusRetry, virtualItems]);
 
 	useLayoutEffect(() => {
+		const targetId = pendingDomFocusIdRef.current;
+		if (!targetId || !detailScrollRef.current) return;
+		const target = detailScrollRef.current.querySelector<HTMLElement>(
+			`[data-release-id="${CSS.escape(targetId)}"]`,
+		);
+		if (target?.dataset.currentRelease !== "true") return;
+		programmaticDomFocusRef.current = targetId;
+		target.focus({ preventScroll: true });
+		pendingDomFocusIdRef.current = null;
+	}, [focusedReleaseId, rows, virtualItems]);
+
+	useLayoutEffect(() => {
 		const targetId = pendingDirectoryFocusIdRef.current;
 		if (!targetId || !directoryScrollRef.current) return;
 		const virtualItem = directoryVirtualItems.find(
@@ -2221,9 +2245,11 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 		const targetId = routeFocusLockRef.current;
 		const scrollElement = detailScrollRef.current;
 		if (!targetId || !scrollElement) return;
-		const routeTargetId = props.tag
-			? props.items.find((item) => item.tag_name === props.tag)?.release_id
-			: props.highlight?.active_release_id;
+		const routeTargetId =
+			props.highlight?.active_release_id ??
+			(props.tag
+				? props.items.find((item) => item.tag_name === props.tag)?.release_id
+				: undefined);
 		if (routeTargetId !== targetId) return;
 		if (pendingFocusIdRef.current === targetId) return;
 		if (pendingFocusRevealAppliedRef.current === targetId) return;
@@ -2424,7 +2450,7 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 					Math.max(1, absoluteIndex),
 				),
 			);
-			focusRelease(target.release_id);
+			focusRelease(target.release_id, { moveDomFocus: true });
 		},
 		[
 			focusRelease,
@@ -2551,7 +2577,12 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 							const id = (event.target as HTMLElement).closest<HTMLElement>(
 								"[data-release-id]",
 							)?.dataset.releaseId;
-							if (id) focusDetailInteraction(id, { replaceUrl: true });
+							if (!id) return;
+							if (programmaticDomFocusRef.current === id) {
+								programmaticDomFocusRef.current = null;
+								return;
+							}
+							focusDetailInteraction(id, { replaceUrl: true });
 						}}
 					>
 						<AutoLoadSentinel
