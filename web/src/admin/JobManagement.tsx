@@ -21,6 +21,7 @@ import {
 
 import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
 import { AiOperationsRecordsSection } from "@/admin/AiOperationsRecordsSection";
+import { useDemoSnapshot } from "@/demo/runtime";
 import { LlmActivityGrid } from "@/admin/LlmActivityGrid";
 import {
 	LlmCallActionsMenu,
@@ -4237,6 +4238,12 @@ export function JobManagement({
 			parseAdminJobsRoute(window.location.pathname, window.location.search),
 		);
 	const routeState = controlledRouteState ?? uncontrolledRouteState;
+	const demoSnapshot = useDemoSnapshot();
+	const llmDemoIdentity =
+		demoSnapshot.active &&
+		demoSnapshot.shareState.sceneId === "admin-jobs-running"
+			? `llm:${demoSnapshot.shareState.llmDataCase}:${demoSnapshot.shareState.llmNetworkProfile}`
+			: "live:llm";
 	const routeLlmCallFilters =
 		routeState.llmCallFilters ?? DEFAULT_LLM_CALL_ROUTE_FILTERS;
 	const latestLlmCallRouteFiltersRef = useRef(routeLlmCallFilters);
@@ -4477,6 +4484,11 @@ export function JobManagement({
 	const llmCallsLoadedOnceRef = useRef(false);
 	const llmCallsInitialRequestInFlightRef = useRef(false);
 	const llmCallsRequestIdRef = useRef(0);
+	const llmStatusControllerRef = useRef<AbortController | null>(null);
+	const llmActivityControllerRef = useRef<AbortController | null>(null);
+	const llmCallsControllerRef = useRef<AbortController | null>(null);
+	const llmDetailControllerRef = useRef<AbortController | null>(null);
+	const taskRelatedLlmControllerRef = useRef<AbortController | null>(null);
 	const llmCallResultsRef = useRef<HTMLElement>(null);
 	const focusLlmCallResults = useCallback(() => {
 		window.setTimeout(() => {
@@ -4499,6 +4511,32 @@ export function JobManagement({
 	const streamPendingLlmRefreshRef = useRef(false);
 	const streamPendingLlmDetailCallIdRef = useRef<string | null>(null);
 	const streamPendingTranslationRefreshRef = useRef(false);
+
+	useEffect(() => {
+		llmStatusControllerRef.current?.abort();
+		llmActivityControllerRef.current?.abort();
+		llmCallsControllerRef.current?.abort();
+		llmDetailControllerRef.current?.abort();
+		taskRelatedLlmControllerRef.current?.abort();
+		llmStatusRequestIdRef.current += 1;
+		llmActivityRequestIdRef.current += 1;
+		llmCallsRequestIdRef.current += 1;
+		llmStatusLoadedOnceRef.current = false;
+		llmActivityLoadedOnceRef.current = false;
+		llmCallsLoadedOnceRef.current = false;
+		llmStatusInitialRequestInFlightRef.current = false;
+		llmActivityInitialRequestInFlightRef.current = false;
+		llmCallsInitialRequestInFlightRef.current = false;
+		setLlmStatus(null);
+		setLlmActivity(null);
+		setLlmCalls([]);
+		setLlmCallTotal(0);
+		setTaskRelatedLlmCalls([]);
+		setTaskRelatedLlmLoading(false);
+		setLlmActivityError(null);
+		setLlmStatusLoading(true);
+		setLlmCallsLoadPhase("initial");
+	}, [llmDemoIdentity]);
 
 	const taskTotalPages = useMemo(
 		() => Math.max(1, Math.ceil(taskTotal / TASK_PAGE_SIZE)),
@@ -5312,69 +5350,89 @@ export function JobManagement({
 		subscriptionSyncSettingsDialogDefaultOpen,
 	]);
 
-	const loadLlmSchedulerStatus = useCallback(async (options?: LoadOptions) => {
-		if (
-			options?.background &&
-			!llmStatusLoadedOnceRef.current &&
-			llmStatusInitialRequestInFlightRef.current
-		) {
-			return;
-		}
-		const requestId = llmStatusRequestIdRef.current + 1;
-		llmStatusRequestIdRef.current = requestId;
-		llmStatusInitialRequestInFlightRef.current =
-			!llmStatusLoadedOnceRef.current;
-		setLlmStatusLoading(true);
-		try {
-			const res = await apiGetAdminLlmSchedulerStatus();
-			if (requestId !== llmStatusRequestIdRef.current) {
+	const loadLlmSchedulerStatus = useCallback(
+		async (options?: LoadOptions) => {
+			if (
+				options?.background &&
+				!llmStatusLoadedOnceRef.current &&
+				llmStatusInitialRequestInFlightRef.current
+			) {
 				return;
 			}
-			setLlmStatus(res);
-			llmStatusLoadedOnceRef.current = true;
-		} catch (err) {
-			if (requestId !== llmStatusRequestIdRef.current) {
-				return;
+			const requestId = llmStatusRequestIdRef.current + 1;
+			llmStatusRequestIdRef.current = requestId;
+			llmStatusInitialRequestInFlightRef.current =
+				!llmStatusLoadedOnceRef.current;
+			setLlmStatusLoading(true);
+			llmStatusControllerRef.current?.abort();
+			const abortController = new AbortController();
+			llmStatusControllerRef.current = abortController;
+			try {
+				const res = await apiGetAdminLlmSchedulerStatus(abortController.signal);
+				if (requestId !== llmStatusRequestIdRef.current) {
+					return;
+				}
+				setLlmStatus(res);
+				llmStatusLoadedOnceRef.current = true;
+			} catch (err) {
+				if (requestId !== llmStatusRequestIdRef.current) {
+					return;
+				}
+				if (err instanceof DOMException && err.name === "AbortError") return;
+				throw err;
+			} finally {
+				if (requestId === llmStatusRequestIdRef.current) {
+					setLlmStatusLoading(false);
+					llmStatusInitialRequestInFlightRef.current = false;
+					if (llmStatusControllerRef.current === abortController) {
+						llmStatusControllerRef.current = null;
+					}
+				}
 			}
-			throw err;
-		} finally {
-			if (requestId === llmStatusRequestIdRef.current) {
-				setLlmStatusLoading(false);
-				llmStatusInitialRequestInFlightRef.current = false;
-			}
-		}
-	}, []);
+		},
+		[llmDemoIdentity],
+	);
 
-	const loadLlmActivity = useCallback(async (options?: LoadOptions) => {
-		if (
-			options?.background &&
-			!llmActivityLoadedOnceRef.current &&
-			llmActivityInitialRequestInFlightRef.current
-		) {
-			return;
-		}
-		const requestId = llmActivityRequestIdRef.current + 1;
-		llmActivityRequestIdRef.current = requestId;
-		llmActivityInitialRequestInFlightRef.current =
-			!llmActivityLoadedOnceRef.current;
-		setLlmActivityLoading(true);
-		setLlmActivityError(null);
-		try {
-			const response = await apiGetAdminLlmActivity();
-			if (requestId !== llmActivityRequestIdRef.current) return;
-			setLlmActivity(response);
-			llmActivityLoadedOnceRef.current = true;
-		} catch (err) {
-			if (requestId === llmActivityRequestIdRef.current) {
-				setLlmActivityError(normalizeErrorMessage(err));
+	const loadLlmActivity = useCallback(
+		async (options?: LoadOptions) => {
+			if (
+				options?.background &&
+				!llmActivityLoadedOnceRef.current &&
+				llmActivityInitialRequestInFlightRef.current
+			) {
+				return;
 			}
-		} finally {
-			if (requestId === llmActivityRequestIdRef.current) {
-				setLlmActivityLoading(false);
-				llmActivityInitialRequestInFlightRef.current = false;
+			const requestId = llmActivityRequestIdRef.current + 1;
+			llmActivityRequestIdRef.current = requestId;
+			llmActivityInitialRequestInFlightRef.current =
+				!llmActivityLoadedOnceRef.current;
+			setLlmActivityLoading(true);
+			setLlmActivityError(null);
+			llmActivityControllerRef.current?.abort();
+			const abortController = new AbortController();
+			llmActivityControllerRef.current = abortController;
+			try {
+				const response = await apiGetAdminLlmActivity(abortController.signal);
+				if (requestId !== llmActivityRequestIdRef.current) return;
+				setLlmActivity(response);
+				llmActivityLoadedOnceRef.current = true;
+			} catch (err) {
+				if (err instanceof DOMException && err.name === "AbortError") return;
+				if (requestId === llmActivityRequestIdRef.current) {
+					setLlmActivityError(normalizeErrorMessage(err));
+				}
+			} finally {
+				if (requestId === llmActivityRequestIdRef.current) {
+					setLlmActivityLoading(false);
+					llmActivityInitialRequestInFlightRef.current = false;
+					if (llmActivityControllerRef.current === abortController) {
+						llmActivityControllerRef.current = null;
+					}
+				}
 			}
-		}
-	}, []);
+		},
+		[llmDemoIdentity],
+	);
 
 	const openLlmSettingsDialog = useCallback(() => {
 		setLlmSettingsSaveError(null);
@@ -5473,6 +5531,9 @@ export function JobManagement({
 			setLlmCallsLoadPhase(
 				resolveListLoadPhase(llmCallsLoadedOnceRef.current, options),
 			);
+			llmCallsControllerRef.current?.abort();
+			const abortController = new AbortController();
+			llmCallsControllerRef.current = abortController;
 			try {
 				const params = new URLSearchParams();
 				params.set("status", llmStatusFilter);
@@ -5499,7 +5560,7 @@ export function JobManagement({
 				if (finishedBeforeUtc) {
 					params.set("finished_before", finishedBeforeUtc);
 				}
-				const res = await apiGetAdminLlmCalls(params);
+				const res = await apiGetAdminLlmCalls(params, abortController.signal);
 				if (requestId !== llmCallsRequestIdRef.current) {
 					return;
 				}
@@ -5510,11 +5571,15 @@ export function JobManagement({
 				if (requestId !== llmCallsRequestIdRef.current) {
 					return;
 				}
+				if (err instanceof DOMException && err.name === "AbortError") return;
 				throw err;
 			} finally {
 				if (requestId === llmCallsRequestIdRef.current) {
 					setLlmCallsLoadPhase("idle");
 					llmCallsInitialRequestInFlightRef.current = false;
+					if (llmCallsControllerRef.current === abortController) {
+						llmCallsControllerRef.current = null;
+					}
 				}
 			}
 		},
@@ -5528,6 +5593,7 @@ export function JobManagement({
 			llmStartedToFilter,
 			llmFinishedFromFilter,
 			llmFinishedBeforeFilter,
+			llmDemoIdentity,
 		],
 	);
 
@@ -5568,28 +5634,52 @@ export function JobManagement({
 		setDetailTask(detail);
 	}, []);
 
-	const refreshLlmDetail = useCallback(async (callId: string) => {
-		const detail = await apiGetAdminLlmCallDetail(callId);
-		if (activeTaskDrawerLlmCallIdRef.current === callId) {
-			setTaskDrawerLlmDetail(detail);
-			return;
-		}
-		setLlmDetail(detail);
-	}, []);
+	const refreshLlmDetail = useCallback(
+		async (callId: string) => {
+			llmDetailControllerRef.current?.abort();
+			const abortController = new AbortController();
+			llmDetailControllerRef.current = abortController;
+			const detail = await apiGetAdminLlmCallDetail(
+				callId,
+				abortController.signal,
+			);
+			if (activeTaskDrawerLlmCallIdRef.current === callId) {
+				setTaskDrawerLlmDetail(detail);
+				return;
+			}
+			setLlmDetail(detail);
+		},
+		[llmDemoIdentity],
+	);
 
-	const loadTaskRelatedLlmCalls = useCallback(async (taskId: string) => {
-		const params = new URLSearchParams();
-		params.set("status", "all");
-		params.set("sort", "created_desc");
-		params.set("page", "1");
-		params.set("page_size", "50");
-		params.set("parent_task_id", taskId);
-		const res = await apiGetAdminLlmCalls(params);
-		setTaskRelatedLlmCalls(res.items);
-	}, []);
+	const loadTaskRelatedLlmCalls = useCallback(
+		async (taskId: string) => {
+			taskRelatedLlmControllerRef.current?.abort();
+			const abortController = new AbortController();
+			taskRelatedLlmControllerRef.current = abortController;
+			const params = new URLSearchParams();
+			params.set("status", "all");
+			params.set("sort", "created_desc");
+			params.set("page", "1");
+			params.set("page_size", "50");
+			params.set("parent_task_id", taskId);
+			try {
+				const res = await apiGetAdminLlmCalls(params, abortController.signal);
+				setTaskRelatedLlmCalls(res.items);
+			} finally {
+				if (taskRelatedLlmControllerRef.current === abortController) {
+					taskRelatedLlmControllerRef.current = null;
+				}
+			}
+		},
+		[llmDemoIdentity],
+	);
 
 	const loadTaskDrawerLlmDetail = useCallback(async (callId: string) => {
-		const detail = await apiGetAdminLlmCallDetail(callId);
+		const detail = await apiGetAdminLlmCallDetail(
+			callId,
+			llmDetailControllerRef.current?.signal,
+		);
 		setTaskDrawerLlmDetail(detail);
 	}, []);
 
@@ -5830,7 +5920,10 @@ export function JobManagement({
 		setTaskRelatedLlmLoading(true);
 		void loadTaskRelatedLlmCalls(activeRouteTaskId)
 			.catch((err) => {
-				if (!canceled) {
+				if (
+					!canceled &&
+					!(err instanceof DOMException && err.name === "AbortError")
+				) {
 					setError(normalizeErrorMessage(err));
 				}
 			})

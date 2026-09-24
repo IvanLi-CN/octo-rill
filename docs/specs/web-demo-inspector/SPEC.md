@@ -88,6 +88,23 @@
   - Share
 - raw JSON 仅作为折叠式调试入口。
 
+### Admin Jobs surface state
+
+- `Scene` 继续是页面级 route preset。它选择 `admin-jobs-running` 等 Demo 场景，不能承担 Admin Jobs 内部读取面的选择。
+- Admin Jobs Inspector 提供一个独立的 `Surface` 选择器：
+  - 内容处理：采集记录的列表、活动格和记录详情读取面。
+  - LLM 调度：scheduler status、活动格、调用列表和调用详情读取面。
+- `Surface` 从正式 Admin Jobs 子路由派生；Inspector 选择内容处理时导航到 `/admin/jobs/ai-records`，选择 LLM 调度时导航到 `/admin/jobs/llm`。不得新增 `d_surface` 或以 share-state 重复表达 pathname。
+- 两个 surface 的 state 独立存在。Inspector 只显示当前 surface 的 data case 与 network profile 控件；切换 surface 不重置另一面的 state。
+- 每个 surface 都有 `loaded`、`empty`、`many` 与 `loading` data case：
+  - `loaded` 返回代表性、相互一致的 fixture。
+  - `empty` 返回空的集合和活动数据。LLM 调度仍返回有效 scheduler status，因为 status 是配置与容量事实，不是 LLM 逻辑调用集合。
+  - `many` 是密度 fixture：内容处理在所选 tab 的同一小时包含至少 128 个采集记录，且列表超过 20 条；LLM 调度至少有三个模型覆盖完整十二小时活动窗，且 calls 列表超过 20 条。
+  - `loading` 保持请求 pending；只有改选 `loaded`、`empty` 或 `many`、离开兼容 surface 或卸载页面才会取消该请求。
+- 每个 surface 都有 `normal`、`slow` 与 `faulty` network profile。`slow` 延迟非 `loading` fixture 后再返回；`faulty` 优先于 data case 并返回可重试读取错误。
+- 选择 data case 或 network profile、切换 surface、离开 Admin Jobs 或卸载页面时，必须 abort 旧请求并递增该 surface 的 request epoch。旧响应不得渲染到新配置。
+- 离开 Admin Jobs 的全局 Scene 时，两个 surface state 复位到 `loaded` / `normal` 并从 URL 移除。既有全局 `d_net` 保持非 Admin Jobs scene 的网络合同，不替代 surface network profile。
+
 ### Pages 装配
 
 - GitHub Pages 根路径继续由 docs-site 占用。
@@ -112,7 +129,30 @@
 - `d_own=1`
 - `d_pub=published`
 - `d_shell=steady|update|install|update-install|unknown`
+- `d_content_case=loaded|empty|many|loading`
+- `d_content_net=normal|slow|faulty`
+- `d_llm_case=loaded|empty|many|loading`
+- `d_llm_net=normal|slow|faulty`
 - `d_restore=<encoded-path>`：仅供 404 recovery 内部回跳使用
+
+### Admin Jobs demo endpoint mapping
+
+| Surface state | Route | Read endpoints |
+| --- | --- |
+| `d_content_case` / `d_content_net` | `/admin/jobs/ai-records` | `GET /api/admin/jobs/ai-records/:kind`、`GET /api/admin/jobs/ai-records/:kind/activity`、`GET /api/admin/jobs/ai-records/:kind/:recordId` |
+| `d_llm_case` / `d_llm_net` | `/admin/jobs/llm` | `GET /api/admin/jobs/llm/status`、`GET /api/admin/jobs/llm/activity`、`GET /api/admin/jobs/llm/calls`、`GET /api/admin/jobs/llm/calls/:callId` |
+
+`empty` fixture 中不存在的详情 deep link 返回 `404`。每个 data case 与 network profile 只影响同一行的 endpoint family；翻译 worker 的 `translations/*` 和其他 Admin Jobs API 不受这些 controls 影响。
+
+### Request and cache isolation
+
+- 请求、内存缓存与 session handoff 至少按 `surface + data case + network profile + endpoint + filters/page` 区分。
+- 只有 `normal` 下的 `loaded`、`empty`、`many` 可以按完整 identity 短暂缓存或 handoff。
+- `loading`、`slow`、`faulty` 从不读取或写入缓存。切换配置时当前可见数据必须清空，不能用先前 case 的成功结果垫底。
+
+## Related ADRs
+
+- [ADR 0016: Demo Inspector Admin Jobs Surface State Isolation](../../adr/0016-demo-inspector-admin-jobs-surface-state-isolation.md)
 
 ## 验收标准（Acceptance Criteria）
 
@@ -121,6 +161,8 @@
 3. Given demo 处于移动端，When 点击 bubble，Then inspector 以 drawer 打开。
 4. Given Settings / Dashboard / Admin 页面触发保存、发布、取消、重试等动作，When 操作完成，Then UI 立即回显 mock-only 结果，且 recent mutations 中留下 simulated 记录。
 5. Given GitHub Pages 直接访问 `/demo/**` 深链，When GitHub Pages 回落到根 `404.html`，Then 404 shim 会恢复到对应 demo route，而 docs-site 其它 404 路径保持普通文档站行为。
+6. Given Admin Jobs demo，When 对任一 surface 选择 `loaded`、`empty`、`many` 或 `loading`，Then 该 surface 的完整 endpoint family 与可见列表、活动格、详情保持一致；另一 surface 不受影响。
+7. Given Admin Jobs demo，When 复制含两个 surface state 的 share URL 并在新页面加载或刷新，Then 两面均恢复相同 case/profile。When 在 `loading`、`slow`、`faulty` 与正常 fixture 间双向切换，Then 旧请求和缓存均不渲染；desktop 与 mobile 各保留一个 mock-only browser evidence 截图，并由自动化断言 URL、请求与关键可见状态。
 
 ## 非功能性验收 / 质量门槛（Quality Gates）
 
@@ -249,6 +291,34 @@
   evidence_note: 同一 App Shell 场景在默认移动验收视口 `393x852` 下保持更新提示、安装按钮、刷新入口与仓库卡片可读，无真实认证或后端依赖。
 
 ![App Shell update and install mobile demo](./assets/app-shell-update-install-mobile.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  submission_gate: `captured`
+  visual_comparison: `current-only`
+  captured_at: `2026-09-24`
+  requested_viewport: `desktop`
+  viewport_strategy: `playwright-controlled`
+  route: `/admin/jobs/ai-records?demo=admin-jobs-running&d_persona=admin&d_content_case=empty&d_llm_case=many`
+  state: `Admin Jobs Inspector / content empty`
+  evidence_note: `Admin Jobs Inspector 在 content surface 选择 empty 时只显示当前 surface 的 case/profile 控件，share URL 同时保留 LLM surface 的 many 状态。`
+
+![Admin Jobs Inspector desktop](./assets/admin-jobs-inspector-desktop.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  submission_gate: `captured`
+  visual_comparison: `current-only`
+  captured_at: `2026-09-24`
+  requested_viewport: `393x852`
+  viewport_strategy: `playwright-controlled`
+  route: `/admin/jobs/ai-records?demo=admin-jobs-running&d_persona=admin&d_content_case=empty&d_llm_case=many`
+  state: `Admin Jobs Inspector / mobile drawer`
+  evidence_note: `393x852 CSS px 下 Inspector drawer 的 surface、data case 与 network profile 控件保持可读且无横向溢出。`
+
+![Admin Jobs Inspector mobile](./assets/admin-jobs-inspector-mobile.png)
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 

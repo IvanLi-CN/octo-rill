@@ -9,11 +9,13 @@ import type { AdminUserItem } from "@/admin/UserManagement";
 import type {
 	AdminDashboardResponse,
 	AdminCollectionAttempt,
+	AdminCollectionActivityResponse,
 	AdminCollectionRecordDetail,
 	AdminCollectionRecordItem,
 	AdminCollectionTaskSummary,
 	AccountResumeResponse,
 	AdminLlmCallDetailResponse,
+	AdminLlmCallItem,
 	AdminRealtimeTaskDetailResponse,
 	AdminRealtimeTaskItem,
 	AdminSyncRuntimeConfigResponse,
@@ -51,6 +53,8 @@ import type {
 import type { BriefItem } from "@/sidebar/ReleaseDailyCard";
 import type {
 	DemoEventFrame,
+	DemoAdminJobsDataCase,
+	DemoAdminJobsNetworkProfile,
 	DemoModel,
 	DemoShareStatePatch,
 	DemoSnapshot,
@@ -282,13 +286,68 @@ function redirectToDemoAuth(
 	);
 }
 
-async function applyNetworkProfile(request: Request) {
+type ScopedAdminJobsConfig = {
+	surface: "content" | "llm";
+	dataCase: DemoAdminJobsDataCase;
+	networkProfile: DemoAdminJobsNetworkProfile;
+};
+
+function scopedAdminJobsConfig(request: Request): ScopedAdminJobsConfig | null {
+	const snapshot = currentSnapshot();
+	if (snapshot.shareState.sceneId !== "admin-jobs-running") return null;
+	const pathname = new URL(request.url).pathname;
+	if (pathname.startsWith("/api/admin/jobs/ai-records/")) {
+		return {
+			surface: "content",
+			dataCase: snapshot.shareState.contentDataCase,
+			networkProfile: snapshot.shareState.contentNetworkProfile,
+		};
+	}
+	if (
+		pathname.startsWith("/api/admin/jobs/llm/") &&
+		(pathname.endsWith("/status") ||
+			pathname.endsWith("/activity") ||
+			pathname.includes("/calls"))
+	) {
+		return {
+			surface: "llm",
+			dataCase: snapshot.shareState.llmDataCase,
+			networkProfile: snapshot.shareState.llmNetworkProfile,
+		};
+	}
+	return null;
+}
+
+async function applyNetworkProfile(
+	request: Request,
+	config = scopedAdminJobsConfig(request),
+) {
 	const snapshot = currentSnapshot();
 	if (!snapshot.demoBuild && !hasDemoRuntimeRequestMarker(request)) {
 		return passthrough();
 	}
 	const { shareState } = snapshot;
 	const pathname = new URL(request.url).pathname;
+	if (config?.networkProfile === "faulty") {
+		await delay(220);
+		return HttpResponse.json(
+			{
+				error: {
+					code: "demo_network_fault",
+					message: "Demo network fault injected by inspector.",
+				},
+			},
+			{ status: 503 },
+		);
+	}
+	if (config?.dataCase === "loading") {
+		await delay("infinite");
+		return null;
+	}
+	if (config?.networkProfile === "slow") {
+		await delay(850);
+		return null;
+	}
 	if (
 		shareState.networkMode === "readable-loading" &&
 		pathname === "/api/dashboard/feed"
@@ -969,6 +1028,189 @@ function demoCollectionRecords() {
 	>;
 }
 
+function demoCollectionRecordsForCase(
+	kind: AdminCollectionRecordItem["kind"],
+	dataCase: DemoAdminJobsDataCase,
+) {
+	if (dataCase === "empty") return [] as AdminCollectionRecordItem[];
+	const base = demoCollectionRecords()[kind];
+	if (dataCase !== "many") return base;
+	return Array.from({ length: 128 }, (_, index) => {
+		const template = base[index % base.length] ?? base[0];
+		return {
+			...template,
+			id: `${kind}-many-${String(index + 1).padStart(3, "0")}`,
+			title: `${template.title} · dense ${index + 1}`,
+			occurred_at: new Date(
+				Date.parse("2026-07-08T10:00:00+08:00") - index * 60_000,
+			).toISOString(),
+		};
+	});
+}
+
+function demoCollectionActivity(
+	kind: AdminCollectionRecordItem["kind"],
+	dataCase: DemoAdminJobsDataCase,
+): AdminCollectionActivityResponse {
+	const records = demoCollectionRecordsForCase(kind, dataCase);
+	const windowStartedAt = new Date("2026-07-07T23:00:00+08:00");
+	const buckets = Array.from({ length: 12 }, (_, index) => {
+		const started = new Date(
+			windowStartedAt.getTime() + index * 60 * 60 * 1000,
+		);
+		const ended = new Date(started.getTime() + 60 * 60 * 1000);
+		const cells = records
+			.filter((record) => {
+				const source = record.occurred_at ?? record.generated_at;
+				if (!source) return false;
+				const time = Date.parse(source);
+				return time >= started.getTime() && time < ended.getTime();
+			})
+			.slice(0, 32)
+			.map((record) => ({
+				id: record.id,
+				title: record.title,
+				repository: record.repository,
+				source_time:
+					record.occurred_at ?? record.generated_at ?? started.toISOString(),
+				translation_status: record.translation?.display_status ?? null,
+				polish_status: record.polish.display_status,
+				composite_status: (record.polish.display_status === "succeeded"
+					? "completed"
+					: record.polish.display_status === "running"
+						? "processing"
+						: "neutral") as AdminCollectionActivityResponse["buckets"][number]["cells"][number]["composite_status"],
+			}));
+		return {
+			started_at: started.toISOString(),
+			ended_at: ended.toISOString(),
+			cells,
+		};
+	});
+	const cells = buckets.flatMap((bucket) => bucket.cells);
+	return {
+		kind,
+		bucket_minutes: 60,
+		bucket_count: 12,
+		window_started_at: windowStartedAt.toISOString(),
+		window_ended_at: new Date(
+			windowStartedAt.getTime() + 12 * 60 * 60 * 1000,
+		).toISOString(),
+		summary: {
+			content_count: records.length,
+			completed_count: cells.filter(
+				(cell) => cell.composite_status === "completed",
+			).length,
+			processing_count: cells.filter(
+				(cell) => cell.composite_status === "processing",
+			).length,
+			exception_count: cells.filter(
+				(cell) => cell.composite_status === "exception",
+			).length,
+			neutral_count: cells.filter((cell) => cell.composite_status === "neutral")
+				.length,
+		},
+		buckets,
+	};
+}
+
+function demoLlmData(dataCase: DemoAdminJobsDataCase) {
+	const jobs = currentModel().adminJobs;
+	if (dataCase === "loaded") {
+		return {
+			status: jobs.llmStatus,
+			activity: jobs.llmActivity,
+			calls: jobs.llmCalls,
+			details: jobs.llmCallDetails,
+		};
+	}
+	const models = ["gpt-4.1-mini", "gpt-5-mini", "demo-many-model"];
+	const activityModels = models.map((model, index) => ({
+		model,
+		priority: index + 1,
+		configured: true,
+	}));
+	if (dataCase === "empty") {
+		const activity = buildLlmActivityFromCalls(
+			[],
+			new Date("2026-07-07T23:00:00+08:00"),
+			new Date("2026-07-08T11:00:00+08:00"),
+			activityModels,
+		);
+		return {
+			status: {
+				...jobs.llmStatus,
+				in_flight_calls: 0,
+				calls_24h: 0,
+				failed_24h: 0,
+				available_slots: jobs.llmStatus.max_concurrency,
+				llm_models: models,
+				model_statuses: models.map((model, index) => ({
+					...jobs.llmStatus.model_statuses[
+						index % jobs.llmStatus.model_statuses.length
+					],
+					model,
+					priority: index + 1,
+				})),
+			},
+			activity,
+			calls: [] as AdminLlmCallItem[],
+			details: {},
+		};
+	}
+	const templates = jobs.llmCalls;
+	const details = jobs.llmCallDetails;
+	const calls = Array.from({ length: 36 }, (_, index) => {
+		const template = templates[index % templates.length];
+		const model = models[index % models.length];
+		const createdAt = new Date(
+			Date.parse("2026-07-08T00:10:00+08:00") + index * 18 * 60_000,
+		).toISOString();
+		return {
+			...template,
+			id: `demo-many-call-${String(index + 1).padStart(3, "0")}`,
+			model,
+			status: index % 7 === 0 ? "failed" : "succeeded",
+			created_at: createdAt,
+			started_at: createdAt,
+			finished_at: new Date(Date.parse(createdAt) + 4_000).toISOString(),
+			updated_at: new Date(Date.parse(createdAt) + 4_000).toISOString(),
+		};
+	});
+	const activity = buildLlmActivityFromCalls(
+		calls,
+		new Date("2026-07-07T23:00:00+08:00"),
+		new Date("2026-07-08T11:00:00+08:00"),
+		activityModels,
+	);
+	const callDetails = Object.fromEntries(
+		calls.map((call, index) => {
+			const template = details[templates[index % templates.length].id];
+			return [call.id, { ...template, ...call, id: call.id }];
+		}),
+	);
+	return {
+		status: {
+			...jobs.llmStatus,
+			in_flight_calls: 0,
+			calls_24h: calls.length,
+			failed_24h: calls.filter((call) => call.status === "failed").length,
+			available_slots: jobs.llmStatus.max_concurrency,
+			llm_models: models,
+			model_statuses: models.map((model, index) => ({
+				...jobs.llmStatus.model_statuses[
+					index % jobs.llmStatus.model_statuses.length
+				],
+				model,
+				priority: index + 1,
+			})),
+		},
+		activity,
+		calls,
+		details: callDetails,
+	};
+}
+
 function demoSummaryAttemptCount(summary: AdminCollectionTaskSummary | null) {
 	if (!summary || summary.status === "not_recorded") return 0;
 	return Math.max(1, summary.retry_count + 1);
@@ -985,8 +1227,11 @@ function demoRecordAttemptCount(item: AdminCollectionRecordItem) {
 function demoCollectionDetail(
 	kind: AdminCollectionRecordItem["kind"],
 	id: string,
+	dataCase: DemoAdminJobsDataCase = "loaded",
 ): AdminCollectionRecordDetail | null {
-	const record = demoCollectionRecords()[kind].find((item) => item.id === id);
+	const record = demoCollectionRecordsForCase(kind, dataCase).find(
+		(item) => item.id === id,
+	);
 	if (!record) return null;
 	const call = currentModel().adminJobs.llmCalls[0];
 	const llmCalls = call
@@ -2829,7 +3074,8 @@ export const demoHandlers = [
 		},
 	),
 	http.get("/api/admin/jobs/ai-records/:kind", async ({ params, request }) => {
-		const network = await applyNetworkProfile(request);
+		const config = scopedAdminJobsConfig(request);
+		const network = await applyNetworkProfile(request, config);
 		if (network) return network;
 		const kind = String(params.kind);
 		if (
@@ -2872,7 +3118,10 @@ export const demoHandlers = [
 				"attempt_max must be greater than or equal to attempt_min",
 			);
 		}
-		const items = demoCollectionRecords()[kind].filter((item) => {
+		const items = demoCollectionRecordsForCase(
+			kind,
+			config?.dataCase ?? "loaded",
+		).filter((item) => {
 			const timestamp =
 				item.kind === "brief" ? item.generated_at : item.occurred_at;
 			const value = timestamp ? new Date(timestamp).getTime() : Number.NaN;
@@ -2896,9 +3145,28 @@ export const demoHandlers = [
 		return json(paginateItems(items, url.searchParams));
 	}),
 	http.get(
+		"/api/admin/jobs/ai-records/:kind/activity",
+		async ({ params, request }) => {
+			const config = scopedAdminJobsConfig(request);
+			const network = await applyNetworkProfile(request, config);
+			if (network) return network;
+			const kind = String(params.kind) as AdminCollectionRecordItem["kind"];
+			if (
+				kind !== "release" &&
+				kind !== "announcement" &&
+				kind !== "notification" &&
+				kind !== "brief"
+			) {
+				return badRequest("invalid collection record kind");
+			}
+			return json(demoCollectionActivity(kind, config?.dataCase ?? "loaded"));
+		},
+	),
+	http.get(
 		"/api/admin/jobs/ai-records/:kind/:recordId",
 		async ({ params, request }) => {
-			const network = await applyNetworkProfile(request);
+			const config = scopedAdminJobsConfig(request);
+			const network = await applyNetworkProfile(request, config);
 			if (network) return network;
 			const kind = String(params.kind);
 			if (
@@ -2909,7 +3177,11 @@ export const demoHandlers = [
 			) {
 				return badRequest("invalid collection record kind");
 			}
-			const detail = demoCollectionDetail(kind, String(params.recordId));
+			const detail = demoCollectionDetail(
+				kind,
+				String(params.recordId),
+				config?.dataCase ?? "loaded",
+			);
 			return detail
 				? json(detail)
 				: json(
@@ -3133,14 +3405,16 @@ export const demoHandlers = [
 		return json(currentModel().adminJobs.syncRuntimeConfig);
 	}),
 	http.get("/api/admin/jobs/llm/status", async ({ request }) => {
-		const network = await applyNetworkProfile(request);
+		const config = scopedAdminJobsConfig(request);
+		const network = await applyNetworkProfile(request, config);
 		if (network) return network;
-		return json(currentModel().adminJobs.llmStatus);
+		return json(demoLlmData(config?.dataCase ?? "loaded").status);
 	}),
 	http.get("/api/admin/jobs/llm/activity", async ({ request }) => {
-		const network = await applyNetworkProfile(request);
+		const config = scopedAdminJobsConfig(request);
+		const network = await applyNetworkProfile(request, config);
 		if (network) return network;
-		return json(currentModel().adminJobs.llmActivity);
+		return json(demoLlmData(config?.dataCase ?? "loaded").activity);
 	}),
 	http.patch("/api/admin/jobs/llm/runtime-config", async ({ request }) => {
 		const network = await applyNetworkProfile(request);
@@ -3327,9 +3601,10 @@ export const demoHandlers = [
 	}),
 	http.get("/api/admin/jobs/llm/calls", async ({ request }) => {
 		const url = new URL(request.url);
-		const network = await applyNetworkProfile(request);
+		const config = scopedAdminJobsConfig(request);
+		const network = await applyNetworkProfile(request, config);
 		if (network) return network;
-		let items = currentModel().adminJobs.llmCalls;
+		let items = demoLlmData(config?.dataCase ?? "loaded").calls;
 		const status = url.searchParams.get("status") ?? "all";
 		if (!["all", "queued", "running", "succeeded", "failed"].includes(status)) {
 			return badRequest("invalid status filter");
@@ -3418,10 +3693,12 @@ export const demoHandlers = [
 		});
 	}),
 	http.get("/api/admin/jobs/llm/calls/:callId", async ({ params, request }) => {
-		const network = await applyNetworkProfile(request);
+		const config = scopedAdminJobsConfig(request);
+		const network = await applyNetworkProfile(request, config);
 		if (network) return network;
-		const detail =
-			currentModel().adminJobs.llmCallDetails[String(params.callId)];
+		const detail = demoLlmData(config?.dataCase ?? "loaded").details[
+			String(params.callId)
+		];
 		if (!detail) {
 			return json(
 				{ error: { code: "not_found", message: "LLM call not found." } },

@@ -44,9 +44,13 @@ import {
 	LANDING_BOOT_STATE_OPTIONS,
 	LANDING_CASE_OPTIONS,
 	LANDING_PASSKEY_SUPPORT_OPTIONS,
+	ADMIN_JOBS_DATA_CASE_OPTIONS,
+	ADMIN_JOBS_NETWORK_PROFILE_OPTIONS,
 	WEBHOOK_SCENARIO_OPTIONS,
 } from "@/demo/registry";
 import type {
+	DemoAdminJobsDataCase,
+	DemoAdminJobsNetworkProfile,
 	DemoLandingAuthAction,
 	DemoLandingBootState,
 	DemoLandingCase,
@@ -340,6 +344,14 @@ export function DemoInspector(props: {
 	const scene = resolveCurrentDemoScene();
 	const isMobile = useMediaQuery("(max-width: 767px)");
 	const [mobileOpen, setMobileOpen] = useState(false);
+	const [activeAdminJobsSurface, setActiveAdminJobsSurface] = useState<
+		"content" | "llm"
+	>(() =>
+		typeof window !== "undefined" &&
+		window.location.pathname.startsWith("/admin/jobs/llm")
+			? "llm"
+			: "content",
+	);
 
 	const routeLocationKey = useRouterState({
 		select: (state) =>
@@ -356,6 +368,14 @@ export function DemoInspector(props: {
 			`${window.location.pathname}${window.location.search}${window.location.hash}`,
 		);
 	}, [routeLocationKey, snapshot.active]);
+
+	useEffect(() => {
+		setActiveAdminJobsSurface(
+			window.location.pathname.startsWith("/admin/jobs/llm")
+				? "llm"
+				: "content",
+		);
+	}, [routeLocationKey]);
 
 	const shareHref = useMemo(
 		() => buildCurrentDemoShareHref(),
@@ -384,6 +404,7 @@ export function DemoInspector(props: {
 		next: Partial<typeof snapshot.shareState>,
 		options?: {
 			reseed?: boolean;
+			canonicalize?: boolean;
 		},
 	) => {
 		if (!router) {
@@ -400,6 +421,17 @@ export function DemoInspector(props: {
 				href,
 				replace: true,
 			});
+			if (options?.canonicalize) {
+				const resolvedHref = new URL(href, window.location.origin);
+				window.history.replaceState(
+					window.history.state,
+					"",
+					`${resolvedHref.pathname}${resolvedHref.search}${resolvedHref.hash}`,
+				);
+				syncDemoRuntimeWithHref(
+					`${resolvedHref.pathname}${resolvedHref.search}${resolvedHref.hash}`,
+				);
+			}
 		} catch (error) {
 			setPendingDemoRouteSyncHref(null);
 			patchDemoShareState(previousShareState, { reseed: options?.reseed });
@@ -411,6 +443,7 @@ export function DemoInspector(props: {
 		next: Partial<typeof snapshot.shareState>,
 		options?: {
 			reseed?: boolean;
+			canonicalize?: boolean;
 		},
 	) => {
 		const nextSceneId = next.sceneId ?? snapshot.shareState.sceneId;
@@ -426,6 +459,7 @@ export function DemoInspector(props: {
 		if (options?.reseed !== false) {
 			void navigateDemoHref(buildCurrentDemoHref(next), next, {
 				reseed: true,
+				canonicalize: options?.canonicalize,
 			});
 		} else {
 			applyDemoShareStateInPlace(next, { reseed: false });
@@ -462,6 +496,7 @@ export function DemoInspector(props: {
 		snapshot,
 		sceneTitle: scene.title,
 		shareHref,
+		activeAdminJobsSurface,
 		onSceneChange: (sceneId: (typeof DEMO_SCENES)[number]["id"]) =>
 			navigateWithShareState(
 				{
@@ -471,8 +506,31 @@ export function DemoInspector(props: {
 					publicationState: snapshot.shareState.publicationState,
 					controlsHidden: snapshot.shareState.controlsHidden,
 				},
+				{ canonicalize: true, reseed: true },
+			),
+		onSurfaceChange: (surface: "content" | "llm") => {
+			const targetPath =
+				surface === "llm" ? "/admin/jobs/llm" : "/admin/jobs/ai-records";
+			const nextUrl = new URL(
+				buildCurrentDemoShareHref(),
+				window.location.origin,
+			);
+			nextUrl.pathname = targetPath;
+			replaceDemoLocation(
+				`${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`,
+			);
+		},
+		onContentDataCaseChange: (value: DemoAdminJobsDataCase) =>
+			navigateWithShareState({ contentDataCase: value }, { reseed: true }),
+		onContentNetworkProfileChange: (value: DemoAdminJobsNetworkProfile) =>
+			navigateWithShareState(
+				{ contentNetworkProfile: value },
 				{ reseed: true },
 			),
+		onLlmDataCaseChange: (value: DemoAdminJobsDataCase) =>
+			navigateWithShareState({ llmDataCase: value }, { reseed: true }),
+		onLlmNetworkProfileChange: (value: DemoAdminJobsNetworkProfile) =>
+			navigateWithShareState({ llmNetworkProfile: value }, { reseed: true }),
 		onLandingCaseChange: (landingCase: DemoLandingCase) =>
 			navigateWithShareState(
 				{
@@ -1009,8 +1067,14 @@ export type DemoInspectorPanelProps = {
 	snapshot: ReturnType<typeof useDemoSnapshot>;
 	sceneTitle: string;
 	shareHref: string;
+	activeAdminJobsSurface?: "content" | "llm";
 	density?: "default" | "compact";
 	onSceneChange: (sceneId: (typeof DEMO_SCENES)[number]["id"]) => void;
+	onSurfaceChange?: (surface: "content" | "llm") => void;
+	onContentDataCaseChange?: (value: DemoAdminJobsDataCase) => void;
+	onContentNetworkProfileChange?: (value: DemoAdminJobsNetworkProfile) => void;
+	onLlmDataCaseChange?: (value: DemoAdminJobsDataCase) => void;
+	onLlmNetworkProfileChange?: (value: DemoAdminJobsNetworkProfile) => void;
 	onLandingCaseChange: (landingCase: DemoLandingCase) => void;
 	onLandingAuthActionChange: (action: DemoLandingAuthAction) => void;
 	onLandingPasskeySupportChange: (support: DemoLandingPasskeySupport) => void;
@@ -1028,6 +1092,9 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 	const { snapshot } = props;
 	const isCompact = props.density === "compact";
 	const sceneSelectId = useId();
+	const surfaceSelectId = useId();
+	const dataCaseSelectId = useId();
+	const surfaceNetworkSelectId = useId();
 	const landingCaseSelectId = useId();
 	const landingAuthActionSelectId = useId();
 	const landingPasskeySupportSelectId = useId();
@@ -1038,6 +1105,16 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 	const webhookScenarioSelectId = useId();
 	const publicationStateSelectId = useId();
 	const shareInputId = useId();
+	const isAdminJobs = snapshot.shareState.sceneId === "admin-jobs-running";
+	const activeSurface = props.activeAdminJobsSurface ?? "content";
+	const surfaceDataCase =
+		activeSurface === "llm"
+			? snapshot.shareState.llmDataCase
+			: snapshot.shareState.contentDataCase;
+	const surfaceNetworkProfile =
+		activeSurface === "llm"
+			? snapshot.shareState.llmNetworkProfile
+			: snapshot.shareState.contentNetworkProfile;
 
 	return (
 		<div className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
@@ -1103,6 +1180,67 @@ export function DemoInspectorPanel(props: DemoInspectorPanelProps) {
 							/>
 						</div>
 					</section>
+
+					{isAdminJobs ? (
+						<section
+							className={cn("space-y-1.5", isCompact && "space-y-0.5")}
+							data-demo-admin-jobs-controls="true"
+						>
+							<Label htmlFor={surfaceSelectId}>Surface</Label>
+							<InspectorSelect
+								id={surfaceSelectId}
+								value={activeSurface}
+								onValueChange={(value) =>
+									props.onSurfaceChange?.(value as "content" | "llm")
+								}
+								options={[
+									{ value: "content" as const, label: "Content processing" },
+									{ value: "llm" as const, label: "LLM scheduling" },
+								]}
+								compact={isCompact}
+							/>
+							<div className="grid gap-2.5 sm:grid-cols-2">
+								<div className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
+									<Label htmlFor={dataCaseSelectId}>Data case</Label>
+									<InspectorSelect
+										id={dataCaseSelectId}
+										value={surfaceDataCase}
+										onValueChange={(value) =>
+											activeSurface === "llm"
+												? props.onLlmDataCaseChange?.(
+														value as DemoAdminJobsDataCase,
+													)
+												: props.onContentDataCaseChange?.(
+														value as DemoAdminJobsDataCase,
+													)
+										}
+										options={ADMIN_JOBS_DATA_CASE_OPTIONS}
+										compact={isCompact}
+									/>
+								</div>
+								<div className={cn("space-y-1.5", isCompact && "space-y-0.5")}>
+									<Label htmlFor={surfaceNetworkSelectId}>
+										Network profile
+									</Label>
+									<InspectorSelect
+										id={surfaceNetworkSelectId}
+										value={surfaceNetworkProfile}
+										onValueChange={(value) =>
+											activeSurface === "llm"
+												? props.onLlmNetworkProfileChange?.(
+														value as DemoAdminJobsNetworkProfile,
+													)
+												: props.onContentNetworkProfileChange?.(
+														value as DemoAdminJobsNetworkProfile,
+													)
+										}
+										options={ADMIN_JOBS_NETWORK_PROFILE_OPTIONS}
+										compact={isCompact}
+									/>
+								</div>
+							</div>
+						</section>
+					) : null}
 				</CardContent>
 			</Card>
 

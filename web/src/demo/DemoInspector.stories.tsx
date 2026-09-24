@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, fn, within } from "storybook/test";
+import { expect, fn, userEvent, within } from "storybook/test";
 
 import { buildDemoModel } from "@/demo/fixtures";
 import {
@@ -25,6 +25,10 @@ const baseSnapshot = {
 		landingBootState: "ready" as const,
 		appShellState: "steady" as const,
 		controlsHidden: false,
+		contentDataCase: "loaded" as const,
+		contentNetworkProfile: "normal" as const,
+		llmDataCase: "loaded" as const,
+		llmNetworkProfile: "normal" as const,
 	},
 	model: buildDemoModel({
 		sceneId: "dashboard-repo-publish",
@@ -64,6 +68,11 @@ const meta = {
 		shareHref:
 			"/demo/focus/repo/octo-demo/release-lab?demo=dashboard-repo-publish&d_persona=member&d_own=1&d_pub=published",
 		onSceneChange: fn(),
+		onSurfaceChange: fn(),
+		onContentDataCaseChange: fn(),
+		onContentNetworkProfileChange: fn(),
+		onLlmDataCaseChange: fn(),
+		onLlmNetworkProfileChange: fn(),
 		onLandingCaseChange: fn(),
 		onLandingAuthActionChange: fn(),
 		onLandingPasskeySupportChange: fn(),
@@ -79,6 +88,7 @@ const meta = {
 	parameters: {
 		layout: "centered",
 	},
+	tags: ["autodocs"],
 } satisfies Meta<typeof DemoInspectorPanel>;
 
 export default meta;
@@ -128,6 +138,57 @@ export const LandingCases: Story = {
 		);
 		await expect(canvas.getByText("GitHub OAuth pending")).toBeInTheDocument();
 		await expect(canvas.getByText("Landing Controls")).toBeInTheDocument();
+	},
+};
+
+export const AdminJobsSurfaceStates: Story = {
+	args: {
+		snapshot: {
+			...baseSnapshot,
+			shareState: {
+				...baseSnapshot.shareState,
+				sceneId: "admin-jobs-running",
+				personaId: "admin",
+				contentDataCase: "empty",
+				contentNetworkProfile: "normal",
+				llmDataCase: "many",
+				llmNetworkProfile: "slow",
+			},
+			model: buildDemoModel({
+				sceneId: "admin-jobs-running",
+				personaId: "admin",
+				includeOwnReleases: true,
+				publicationState: "published",
+			}),
+		},
+		sceneTitle: "Admin Jobs",
+		activeAdminJobsSurface: "content",
+		shareHref:
+			"/admin/jobs/ai-records?demo=admin-jobs-running&d_persona=admin&d_content_case=empty&d_llm_case=many&d_llm_net=slow",
+	},
+	render: (args) => (
+		<div
+			data-visual-evidence-surface="admin-jobs-inspector-story"
+			className="bg-background p-6"
+		>
+			<div data-visual-evidence-target="admin-jobs-inspector-story">
+				<DemoInspectorPanel {...args} />
+			</div>
+		</div>
+	),
+	play: async ({ args, canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("Admin Jobs")).toBeInTheDocument();
+		await expect(canvas.getByLabelText("Surface")).toHaveValue("content");
+		await expect(canvas.getByLabelText("Data case")).toHaveValue("empty");
+		await userEvent.selectOptions(canvas.getByLabelText("Surface"), "llm");
+		await expect(args.onSurfaceChange).toHaveBeenCalledWith("llm");
+		await expect(canvas.getByLabelText("Data case")).toHaveValue("many");
+		await userEvent.selectOptions(
+			canvas.getByLabelText("Data case"),
+			"loading",
+		);
+		await expect(args.onLlmDataCaseChange).toHaveBeenCalledWith("loading");
 	},
 };
 
