@@ -9777,6 +9777,22 @@ enum PublicReleaseRefreshRequest {
     IfStale,
 }
 
+struct PublicReleaseHttpQuery {
+    query: PublicReleaseQuery,
+    highlight_request: PublicReleaseHighlightRequest,
+    focus: Option<String>,
+    until_cursor: Option<String>,
+    refresh: Option<PublicReleaseRefreshRequest>,
+}
+
+struct PublicReleaseListRequest {
+    query: PublicReleaseQuery,
+    highlight_request: Option<PublicReleaseHighlightRequest>,
+    focus: Option<String>,
+    until_cursor: Option<String>,
+    refresh_request: Option<PublicReleaseRefreshRequest>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PublicReleaseListItem {
     release_id: String,
@@ -10059,16 +10075,7 @@ fn parse_public_release_typed_selector(raw: &str) -> Result<PublicReleaseTypedSe
 
 fn parse_public_release_http_query(
     raw_query: Option<&str>,
-) -> Result<
-    (
-        PublicReleaseQuery,
-        PublicReleaseHighlightRequest,
-        Option<String>,
-        Option<String>,
-        Option<PublicReleaseRefreshRequest>,
-    ),
-    ApiError,
-> {
+) -> Result<PublicReleaseHttpQuery, ApiError> {
     let mut query = PublicReleaseQuery {
         content: None,
         lang: None,
@@ -10121,7 +10128,13 @@ fn parse_public_release_http_query(
             _ => {}
         }
     }
-    Ok((query, highlight, focus, until_cursor, refresh))
+    Ok(PublicReleaseHttpQuery {
+        query,
+        highlight_request: highlight,
+        focus,
+        until_cursor,
+        refresh,
+    })
 }
 
 async fn require_public_release_refresh_api_key(
@@ -12430,7 +12443,19 @@ pub async fn public_list_repo_releases(
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<PublicReleaseQuery>,
 ) -> Result<Response, ApiError> {
-    public_list_repo_releases_impl(state, owner, repo, query, None, None, None, None).await
+    public_list_repo_releases_impl(
+        state,
+        owner,
+        repo,
+        PublicReleaseListRequest {
+            query,
+            highlight_request: None,
+            focus: None,
+            until_cursor: None,
+            refresh_request: None,
+        },
+    )
+    .await
 }
 
 pub async fn public_list_repo_releases_http(
@@ -12439,8 +12464,13 @@ pub async fn public_list_repo_releases_http(
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let (query, highlight_request, focus, until_cursor, refresh) =
-        parse_public_release_http_query(raw_query.as_deref())?;
+    let PublicReleaseHttpQuery {
+        query,
+        highlight_request,
+        focus,
+        until_cursor,
+        refresh,
+    } = parse_public_release_http_query(raw_query.as_deref())?;
     if refresh.is_some()
         && (query
             .cursor
@@ -12461,11 +12491,13 @@ pub async fn public_list_repo_releases_http(
         state,
         owner,
         repo,
-        query,
-        Some(highlight_request),
-        focus,
-        until_cursor,
-        refresh,
+        PublicReleaseListRequest {
+            query,
+            highlight_request: Some(highlight_request),
+            focus,
+            until_cursor,
+            refresh_request: refresh,
+        },
     )
     .await
 }
@@ -12474,12 +12506,15 @@ async fn public_list_repo_releases_impl(
     state: Arc<AppState>,
     owner: String,
     repo: String,
-    query: PublicReleaseQuery,
-    highlight_request: Option<PublicReleaseHighlightRequest>,
-    focus: Option<String>,
-    until_cursor: Option<String>,
-    refresh_request: Option<PublicReleaseRefreshRequest>,
+    request: PublicReleaseListRequest,
 ) -> Result<Response, ApiError> {
+    let PublicReleaseListRequest {
+        query,
+        highlight_request,
+        focus,
+        until_cursor,
+        refresh_request,
+    } = request;
     validate_public_release_query(&query)?;
     let usage = upsert_public_release_usage(
         state.as_ref(),
@@ -37778,11 +37813,16 @@ line two",
 
     #[test]
     fn public_release_http_query_keeps_focus_separate_from_highlight() {
-        let (query, highlight, focus, until_cursor, refresh) =
-            super::parse_public_release_http_query(Some(
-                "content=all&focus=tag%3Av2.7.0&highlight=id%3A120&highlight_active=id%3A120",
-            ))
-            .expect("parse focus query");
+        let super::PublicReleaseHttpQuery {
+            query,
+            highlight_request: highlight,
+            focus,
+            until_cursor,
+            refresh,
+        } = super::parse_public_release_http_query(Some(
+            "content=all&focus=tag%3Av2.7.0&highlight=id%3A120&highlight_active=id%3A120",
+        ))
+        .expect("parse focus query");
 
         assert_eq!(query.content.as_deref(), Some("all"));
         assert_eq!(focus.as_deref(), Some("tag:v2.7.0"));
