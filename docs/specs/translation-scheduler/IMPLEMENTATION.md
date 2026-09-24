@@ -30,6 +30,7 @@
 ![内容处理记录列表](./assets/content-processing-records.jpg)
 ![内容处理记录详情](./assets/content-processing-record-detail.jpg)
 ![内容处理移动端详情](./assets/content-processing-mobile-detail.jpg)
+![历史记录尝试状态未知](./assets/content-processing-historical-unknown.jpg)
 
 ## 实现里程碑（Milestones / Delivery checklist）
 
