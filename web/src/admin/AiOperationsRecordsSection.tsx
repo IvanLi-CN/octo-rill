@@ -69,6 +69,7 @@ import {
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { useDemoSnapshot } from "@/demo/runtime";
 
 type CollectionTab = AdminCollectionRecordItem["kind"];
 type TimeRangePreset = "24h" | "7d" | "30d" | "custom";
@@ -80,14 +81,16 @@ type CollectionReadError = {
 };
 const PAGE_SIZE = 20;
 const ACTIVITY_CACHE_MS = 5_000;
+type ActivityCacheEntry = {
+	data: AdminCollectionActivityResponse;
+	storedAt: number;
+};
+type ActivitySessionHandoff = ActivityCacheEntry & { cacheKey: string };
 const collectionListCache = new Map<
 	string,
 	{ items: AdminCollectionRecordItem[]; total: number; storedAt: number }
 >();
-const collectionActivityCache = new Map<
-	string,
-	{ data: AdminCollectionActivityResponse; storedAt: number }
->();
+const collectionActivityCache = new Map<string, ActivityCacheEntry>();
 const collectionListCacheHandoff = new Set<string>();
 const collectionActivityCacheHandoff = new Set<string>();
 let collectionListCacheHandoffPending = false;
@@ -1105,6 +1108,22 @@ export function AiOperationsRecordsSection({
 	onCloseRecord: () => void;
 }) {
 	const compact = useCompactLayout();
+	const demoSnapshot = useDemoSnapshot();
+	const scopedDemoState =
+		demoSnapshot.active &&
+		demoSnapshot.shareState.sceneId === "admin-jobs-running"
+			? {
+					dataCase: demoSnapshot.shareState.contentDataCase,
+					networkProfile: demoSnapshot.shareState.contentNetworkProfile,
+				}
+			: null;
+	const contentDemoIdentity = scopedDemoState
+		? `content:${scopedDemoState.dataCase}:${scopedDemoState.networkProfile}`
+		: "live:content";
+	const contentDemoCacheable =
+		!scopedDemoState ||
+		(scopedDemoState.dataCase !== "loading" &&
+			scopedDemoState.networkProfile === "normal");
 	const initialFilters = routeFilters ?? DEFAULT_AI_RECORD_ROUTE_FILTERS;
 	const [tab, setTab] = useState<CollectionTab>(initialFilters.kind);
 	const [preset, setPreset] = useState<TimeRangePreset>(initialFilters.preset);
@@ -1254,11 +1273,15 @@ export function AiOperationsRecordsSection({
 		translationStatuses,
 	]);
 	const listParamsKey = listParams.toString();
-	const listQueryKey = `${tab}?${listParamsKey}`;
-	const activityCacheKey = tab;
+	const listQueryKey = `${contentDemoIdentity}|${tab}?${listParamsKey}`;
+	const activityCacheKey = `${contentDemoIdentity}|${tab}`;
 	const activityCacheKeyRef = useRef(activityCacheKey);
 	const navigateToRecord = useCallback(
 		(kind: CollectionTab, id: string) => {
+			if (!contentDemoCacheable) {
+				onOpenRecord(kind, id);
+				return;
+			}
 			collectionListCacheHandoff.add(listQueryKey);
 			collectionActivityCacheHandoff.add(activityCacheKey);
 			collectionListCacheHandoffPending = true;
@@ -1276,12 +1299,12 @@ export function AiOperationsRecordsSection({
 			if (activityEntry) {
 				window.sessionStorage.setItem(
 					DETAIL_ACTIVITY_CACHE_DATA_KEY,
-					JSON.stringify(activityEntry),
+					JSON.stringify({ cacheKey: activityCacheKey, ...activityEntry }),
 				);
 			}
 			onOpenRecord(kind, id);
 		},
-		[activityCacheKey, listQueryKey, onOpenRecord],
+		[activityCacheKey, contentDemoCacheable, listQueryKey, onOpenRecord],
 	);
 	const currentList =
 		lastSuccessfulList?.queryKey === listQueryKey ? lastSuccessfulList : null;
@@ -1338,14 +1361,14 @@ export function AiOperationsRecordsSection({
 		translationStatuses,
 	]);
 	useEffect(() => {
-		if (!detailRoute) return;
+		if (!detailRoute || !contentDemoCacheable) return;
 		collectionListCacheHandoff.add(listQueryKey);
 		collectionActivityCacheHandoff.add(activityCacheKey);
 		return () => {
 			collectionListCacheHandoff.add(listQueryKey);
 			collectionActivityCacheHandoff.add(activityCacheKey);
 		};
-	}, [activityCacheKey, detailRoute, listQueryKey]);
+	}, [activityCacheKey, contentDemoCacheable, detailRoute, listQueryKey]);
 	useEffect(() => {
 		const cacheKeyChanged = activityCacheKeyRef.current !== activityCacheKey;
 		const tabChanged = activityTabRef.current !== tab;
@@ -1355,7 +1378,9 @@ export function AiOperationsRecordsSection({
 			activityNeedsReadRef.current = true;
 			if (tabChanged) activityForceReadRef.current = true;
 		}
-		const cached = activityCacheRef.current.get(activityCacheKey);
+		const cached = contentDemoCacheable
+			? activityCacheRef.current.get(activityCacheKey)
+			: undefined;
 		setActivity(cached?.data ?? null);
 		setActivityError(null);
 		setActivityLoading(true);
@@ -1364,7 +1389,9 @@ export function AiOperationsRecordsSection({
 		const requestId = listRequestRef.current + 1;
 		listRequestRef.current = requestId;
 		const abortController = new AbortController();
-		const cachedList = collectionListCache.get(listQueryKey);
+		const cachedList = contentDemoCacheable
+			? collectionListCache.get(listQueryKey)
+			: undefined;
 		const isInitialMount = listInitialMountRef.current;
 		listInitialMountRef.current = false;
 		if (detailRoute) {
@@ -1379,6 +1406,7 @@ export function AiOperationsRecordsSection({
 			return;
 		}
 		const storageHandoff =
+			contentDemoCacheable &&
 			window.sessionStorage.getItem(DETAIL_LIST_CACHE_HANDOFF_KEY) === "1";
 		if (storageHandoff)
 			window.sessionStorage.removeItem(DETAIL_LIST_CACHE_HANDOFF_KEY);
@@ -1388,9 +1416,10 @@ export function AiOperationsRecordsSection({
 		if (storedList)
 			window.sessionStorage.removeItem(DETAIL_LIST_CACHE_DATA_KEY);
 		const handoff =
-			storageHandoff ||
-			collectionListCacheHandoffPending ||
-			collectionListCacheHandoff.delete(listQueryKey);
+			contentDemoCacheable &&
+			(storageHandoff ||
+				collectionListCacheHandoffPending ||
+				collectionListCacheHandoff.delete(listQueryKey));
 		collectionListCacheHandoffPending = false;
 		let handoffList = cachedList;
 		if (!handoffList && storedList) {
@@ -1445,11 +1474,13 @@ export function AiOperationsRecordsSection({
 					items: response.items,
 					total: response.total,
 				});
-				collectionListCache.set(listQueryKey, {
-					items: response.items,
-					total: response.total,
-					storedAt: Date.now(),
-				});
+				if (contentDemoCacheable)
+					collectionListCache.set(listQueryKey, {
+						items: response.items,
+						total: response.total,
+						storedAt: Date.now(),
+					});
+				if (!contentDemoCacheable) return;
 				try {
 					window.sessionStorage.setItem(
 						DETAIL_LIST_CACHE_DATA_KEY,
@@ -1509,10 +1540,18 @@ export function AiOperationsRecordsSection({
 		return () => {
 			abortController.abort();
 		};
-	}, [detailRoute, listParamsKey, listQueryKey, reloadNonce, tab]);
+	}, [
+		contentDemoCacheable,
+		detailRoute,
+		listParamsKey,
+		listQueryKey,
+		reloadNonce,
+		tab,
+	]);
 	useEffect(() => {
 		if (detailRoute) return;
 		const storageHandoff =
+			contentDemoCacheable &&
 			window.sessionStorage.getItem(DETAIL_ACTIVITY_CACHE_HANDOFF_KEY) === "1";
 		if (storageHandoff)
 			window.sessionStorage.removeItem(DETAIL_ACTIVITY_CACHE_HANDOFF_KEY);
@@ -1522,21 +1561,37 @@ export function AiOperationsRecordsSection({
 		if (storedActivity)
 			window.sessionStorage.removeItem(DETAIL_ACTIVITY_CACHE_DATA_KEY);
 		const handoff =
-			storageHandoff ||
-			collectionActivityCacheHandoffPending ||
-			collectionActivityCacheHandoff.delete(activityCacheKey);
+			contentDemoCacheable &&
+			(storageHandoff ||
+				collectionActivityCacheHandoffPending ||
+				collectionActivityCacheHandoff.delete(activityCacheKey));
 		collectionActivityCacheHandoffPending = false;
 
-		let handoffActivity = activityCacheRef.current.get(activityCacheKey);
+		let handoffActivity = contentDemoCacheable
+			? activityCacheRef.current.get(activityCacheKey)
+			: undefined;
 		if (!handoffActivity && storedActivity) {
 			try {
-				const parsed = JSON.parse(storedActivity) as typeof handoffActivity;
-				if (parsed) handoffActivity = parsed;
+				const parsed = JSON.parse(
+					storedActivity,
+				) as Partial<ActivitySessionHandoff>;
+				if (
+					parsed?.cacheKey === activityCacheKey &&
+					parsed.data &&
+					typeof parsed.storedAt === "number"
+				) {
+					handoffActivity = {
+						data: parsed.data,
+						storedAt: parsed.storedAt,
+					};
+				}
 			} catch {
 				// Ignore invalid session handoff data and fall back to a normal read.
 			}
 		}
-		const cached = activityCacheRef.current.get(activityCacheKey);
+		const cached = contentDemoCacheable
+			? activityCacheRef.current.get(activityCacheKey)
+			: undefined;
 		if (handoff) {
 			if (handoffActivity) {
 				setActivity(handoffActivity.data);
@@ -1583,11 +1638,16 @@ export function AiOperationsRecordsSection({
 			.then((response) => {
 				if (requestId !== activityRequestRef.current) return;
 				const entry = { data: response, storedAt: Date.now() };
-				activityCacheRef.current.set(activityCacheKey, entry);
+				if (contentDemoCacheable)
+					activityCacheRef.current.set(activityCacheKey, entry);
+				if (!contentDemoCacheable) {
+					setActivity(response);
+					return;
+				}
 				try {
 					window.sessionStorage.setItem(
 						DETAIL_ACTIVITY_CACHE_DATA_KEY,
-						JSON.stringify(entry),
+						JSON.stringify({ cacheKey: activityCacheKey, ...entry }),
 					);
 				} catch {
 					// Session storage is an optional handoff optimization.
@@ -1621,7 +1681,14 @@ export function AiOperationsRecordsSection({
 			activityControllerRef.current = null;
 			activityNeedsReadRef.current = true;
 		};
-	}, [activityCacheKey, activityRetryNonce, detailRoute, reloadNonce, tab]);
+	}, [
+		activityCacheKey,
+		activityRetryNonce,
+		contentDemoCacheable,
+		detailRoute,
+		reloadNonce,
+		tab,
+	]);
 	useEffect(() => {
 		if (!detailRoute) {
 			setDetail(null);
@@ -1633,12 +1700,20 @@ export function AiOperationsRecordsSection({
 		detailRequestRef.current = requestId;
 		setDetailLoading(true);
 		setDetailError(null);
-		void apiGetAdminCollectionRecordDetail(detailRoute.kind, detailRoute.id)
+		const abortController = new AbortController();
+		void apiGetAdminCollectionRecordDetail(
+			detailRoute.kind,
+			detailRoute.id,
+			abortController.signal,
+		)
 			.then(async (recordDetail) => {
 				if (requestId !== detailRequestRef.current) return;
 				setDetail(recordDetail);
 				if (detailRoute.llmCallId) {
-					const call = await apiGetAdminLlmCallDetail(detailRoute.llmCallId);
+					const call = await apiGetAdminLlmCallDetail(
+						detailRoute.llmCallId,
+						abortController.signal,
+					);
 					if (requestId === detailRequestRef.current) setLlmDetail(call);
 				} else {
 					setLlmDetail(null);
@@ -1653,7 +1728,8 @@ export function AiOperationsRecordsSection({
 			.finally(() => {
 				if (requestId === detailRequestRef.current) setDetailLoading(false);
 			});
-	}, [detailRoute]);
+		return () => abortController.abort();
+	}, [contentDemoIdentity, detailRoute]);
 	const selectedAttempt = detailRoute?.attemptId
 		? (detail?.attempts.find(
 				(attempt) => attempt.id === detailRoute.attemptId,

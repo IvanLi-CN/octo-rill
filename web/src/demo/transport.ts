@@ -9,11 +9,13 @@ import type { AdminUserItem } from "@/admin/UserManagement";
 import type {
 	AdminDashboardResponse,
 	AdminCollectionAttempt,
+	AdminCollectionActivityResponse,
 	AdminCollectionRecordDetail,
 	AdminCollectionRecordItem,
 	AdminCollectionTaskSummary,
 	AccountResumeResponse,
 	AdminLlmCallDetailResponse,
+	AdminLlmCallItem,
 	AdminRealtimeTaskDetailResponse,
 	AdminRealtimeTaskItem,
 	AdminSyncRuntimeConfigResponse,
@@ -51,6 +53,8 @@ import type {
 import type { BriefItem } from "@/sidebar/ReleaseDailyCard";
 import type {
 	DemoEventFrame,
+	DemoAdminJobsDataCase,
+	DemoAdminJobsNetworkProfile,
 	DemoModel,
 	DemoShareStatePatch,
 	DemoSnapshot,
@@ -282,13 +286,68 @@ function redirectToDemoAuth(
 	);
 }
 
-async function applyNetworkProfile(request: Request) {
+type ScopedAdminJobsConfig = {
+	surface: "content" | "llm";
+	dataCase: DemoAdminJobsDataCase;
+	networkProfile: DemoAdminJobsNetworkProfile;
+};
+
+function scopedAdminJobsConfig(request: Request): ScopedAdminJobsConfig | null {
+	const snapshot = currentSnapshot();
+	if (snapshot.shareState.sceneId !== "admin-jobs-running") return null;
+	const pathname = new URL(request.url).pathname;
+	if (pathname.startsWith("/api/admin/jobs/ai-records/")) {
+		return {
+			surface: "content",
+			dataCase: snapshot.shareState.contentDataCase,
+			networkProfile: snapshot.shareState.contentNetworkProfile,
+		};
+	}
+	if (
+		pathname.startsWith("/api/admin/jobs/llm/") &&
+		(pathname.endsWith("/status") ||
+			pathname.endsWith("/activity") ||
+			pathname.includes("/calls"))
+	) {
+		return {
+			surface: "llm",
+			dataCase: snapshot.shareState.llmDataCase,
+			networkProfile: snapshot.shareState.llmNetworkProfile,
+		};
+	}
+	return null;
+}
+
+async function applyNetworkProfile(
+	request: Request,
+	config = scopedAdminJobsConfig(request),
+) {
 	const snapshot = currentSnapshot();
 	if (!snapshot.demoBuild && !hasDemoRuntimeRequestMarker(request)) {
 		return passthrough();
 	}
 	const { shareState } = snapshot;
 	const pathname = new URL(request.url).pathname;
+	if (config?.networkProfile === "faulty") {
+		await delay(220);
+		return HttpResponse.json(
+			{
+				error: {
+					code: "demo_network_fault",
+					message: "Demo network fault injected by inspector.",
+				},
+			},
+			{ status: 503 },
+		);
+	}
+	if (config?.dataCase === "loading") {
+		await delay("infinite");
+		return null;
+	}
+	if (config?.networkProfile === "slow") {
+		await delay(850);
+		return null;
+	}
 	if (
 		shareState.networkMode === "readable-loading" &&
 		pathname === "/api/dashboard/feed"
@@ -969,6 +1028,263 @@ function demoCollectionRecords() {
 	>;
 }
 
+function demoCollectionRecordsForCase(
+	kind: AdminCollectionRecordItem["kind"],
+	dataCase: DemoAdminJobsDataCase,
+) {
+	if (dataCase === "empty") return [] as AdminCollectionRecordItem[];
+	const base = demoCollectionRecords()[kind];
+	if (dataCase !== "many") return base;
+	return Array.from({ length: 128 }, (_, index) => {
+		const template = base[index % base.length] ?? base[0];
+		const isFailure = index % 11 === 0;
+		return {
+			...template,
+			id: `${kind}-many-${String(index + 1).padStart(3, "0")}`,
+			title: `${template.title} · dense ${index + 1}`,
+			occurred_at: new Date(
+				Date.parse("2026-07-08T10:00:00+08:00") + index * 20_000,
+			).toISOString(),
+			polish: isFailure
+				? { ...template.polish, status: "failed", display_status: "failed" }
+				: template.polish,
+		};
+	});
+}
+
+function demoCollectionActivity(
+	kind: AdminCollectionRecordItem["kind"],
+	dataCase: DemoAdminJobsDataCase,
+): AdminCollectionActivityResponse {
+	const records = demoCollectionRecordsForCase(kind, dataCase);
+	const windowStartedAt = new Date("2026-07-07T23:00:00+08:00");
+	const buckets = Array.from({ length: 12 }, (_, index) => {
+		const started = new Date(
+			windowStartedAt.getTime() + index * 60 * 60 * 1000,
+		);
+		const ended = new Date(started.getTime() + 60 * 60 * 1000);
+		const cells = records
+			.filter((record) => {
+				const source = record.occurred_at ?? record.generated_at;
+				if (!source) return false;
+				const time = Date.parse(source);
+				return time >= started.getTime() && time < ended.getTime();
+			})
+			.map((record) => ({
+				id: record.id,
+				title: record.title,
+				repository: record.repository,
+				source_time:
+					record.occurred_at ?? record.generated_at ?? started.toISOString(),
+				translation_status: record.translation?.display_status ?? null,
+				polish_status: record.polish.display_status,
+				composite_status: (record.polish.display_status === "succeeded"
+					? "completed"
+					: record.polish.display_status === "running"
+						? "processing"
+						: record.polish.display_status === "failed" ||
+								record.polish.status === "failed"
+							? "exception"
+							: "neutral") as AdminCollectionActivityResponse["buckets"][number]["cells"][number]["composite_status"],
+			}));
+		return {
+			started_at: started.toISOString(),
+			ended_at: ended.toISOString(),
+			cells,
+		};
+	});
+	const cells = buckets.flatMap((bucket) => bucket.cells);
+	return {
+		kind,
+		bucket_minutes: 60,
+		bucket_count: 12,
+		window_started_at: windowStartedAt.toISOString(),
+		window_ended_at: new Date(
+			windowStartedAt.getTime() + 12 * 60 * 60 * 1000,
+		).toISOString(),
+		summary: {
+			content_count: records.length,
+			completed_count: cells.filter(
+				(cell) => cell.composite_status === "completed",
+			).length,
+			processing_count: cells.filter(
+				(cell) => cell.composite_status === "processing",
+			).length,
+			exception_count: cells.filter(
+				(cell) => cell.composite_status === "exception",
+			).length,
+			neutral_count: cells.filter((cell) => cell.composite_status === "neutral")
+				.length,
+		},
+		buckets,
+	};
+}
+
+function demoLlmData(dataCase: DemoAdminJobsDataCase) {
+	const jobs = currentModel().adminJobs;
+	if (dataCase === "loaded") {
+		return {
+			status: jobs.llmStatus,
+			activity: jobs.llmActivity,
+			calls: jobs.llmCalls,
+			details: jobs.llmCallDetails,
+		};
+	}
+	const models = ["gpt-4.1-mini", "gpt-5-mini", "demo-many-model"];
+	const activityModels = models.map((model, index) => ({
+		model,
+		priority: index + 1,
+		configured: true,
+	}));
+	if (dataCase === "empty") {
+		const activity = buildLlmActivityFromCalls(
+			[],
+			new Date("2026-07-07T23:00:00+08:00"),
+			new Date("2026-07-08T11:00:00+08:00"),
+			activityModels,
+		);
+		return {
+			status: {
+				...jobs.llmStatus,
+				waiting_calls: 0,
+				in_flight_calls: 0,
+				calls_24h: 0,
+				failed_24h: 0,
+				available_slots: jobs.llmStatus.max_concurrency,
+				avg_wait_ms_24h: null,
+				avg_duration_ms_24h: null,
+				last_success_at: null,
+				last_failure_at: null,
+				llm_models: models,
+				model_statuses: models.map((model, index) => ({
+					...jobs.llmStatus.model_statuses[
+						index % jobs.llmStatus.model_statuses.length
+					],
+					model,
+					priority: index + 1,
+				})),
+			},
+			activity,
+			calls: [] as AdminLlmCallItem[],
+			details: {},
+		};
+	}
+	const templates = jobs.llmCalls;
+	const details = jobs.llmCallDetails;
+	const calls = Array.from({ length: 36 }, (_, index) => {
+		const template = templates[index % templates.length];
+		const model = models[index % models.length];
+		const failed = index % 7 === 0;
+		const createdAt = new Date(
+			Date.parse("2026-07-08T00:10:00+08:00") + index * 18 * 60_000,
+		).toISOString();
+		return {
+			...template,
+			id: `demo-many-call-${String(index + 1).padStart(3, "0")}`,
+			model,
+			status: failed ? "failed" : "succeeded",
+			output_tokens: failed ? null : template.output_tokens,
+			total_tokens: failed ? null : template.total_tokens,
+			finish_reason: failed ? "error" : template.finish_reason,
+			duration_ms: failed ? null : template.duration_ms,
+			created_at: createdAt,
+			started_at: createdAt,
+			finished_at: new Date(Date.parse(createdAt) + 4_000).toISOString(),
+			updated_at: new Date(Date.parse(createdAt) + 4_000).toISOString(),
+		};
+	});
+	const activity = buildLlmActivityFromCalls(
+		calls,
+		new Date("2026-07-07T23:00:00+08:00"),
+		new Date("2026-07-08T11:00:00+08:00"),
+		activityModels,
+	);
+	const callDetails = Object.fromEntries(
+		calls.map((call, index) => {
+			const template = details[templates[index % templates.length].id];
+			const failed = call.status === "failed";
+			return [
+				call.id,
+				{
+					...template,
+					...call,
+					id: call.id,
+					failure_class: failed ? "transient" : null,
+					error_text: failed ? "Demo many fixture failed this call." : null,
+					response_text: failed
+						? null
+						: (template?.response_text ?? `Demo response for ${call.id}`),
+					output_messages_json: failed
+						? null
+						: (template?.output_messages_json ??
+							JSON.stringify({ content: `Demo response for ${call.id}` })),
+					attempt_history: [
+						{
+							event_type: failed ? "failed" : "succeeded",
+							status: call.status,
+							model: call.model,
+							attempt: call.attempt_count,
+							failure_class: failed ? "transient" : null,
+							retry_after_ms: null,
+							from_model: null,
+							to_model: null,
+							fallback_count: call.fallback_count,
+							created_at: call.created_at,
+						},
+					],
+				},
+			];
+		}),
+	);
+	const average = (values: number[]) =>
+		values.length > 0
+			? Math.round(
+					values.reduce((total, value) => total + value, 0) / values.length,
+				)
+			: null;
+	const finishedCalls = calls.filter(
+		(call): call is typeof call & { finished_at: string } =>
+			typeof call.finished_at === "string",
+	);
+	const latestFinishedAt = (status: string) =>
+		finishedCalls
+			.filter((call) => call.status === status)
+			.map((call) => call.finished_at)
+			.sort()
+			.at(-1) ?? null;
+	return {
+		status: {
+			...jobs.llmStatus,
+			waiting_calls: calls.filter(
+				(call) => call.status === "queued" || call.status === "running",
+			).length,
+			in_flight_calls: 0,
+			calls_24h: calls.length,
+			failed_24h: calls.filter((call) => call.status === "failed").length,
+			available_slots: jobs.llmStatus.max_concurrency,
+			avg_wait_ms_24h: average(calls.map((call) => call.scheduler_wait_ms)),
+			avg_duration_ms_24h: average(
+				finishedCalls
+					.map((call) => call.duration_ms)
+					.filter((value): value is number => typeof value === "number"),
+			),
+			last_success_at: latestFinishedAt("succeeded"),
+			last_failure_at: latestFinishedAt("failed"),
+			llm_models: models,
+			model_statuses: models.map((model, index) => ({
+				...jobs.llmStatus.model_statuses[
+					index % jobs.llmStatus.model_statuses.length
+				],
+				model,
+				priority: index + 1,
+			})),
+		},
+		activity,
+		calls,
+		details: callDetails,
+	};
+}
+
 function demoSummaryAttemptCount(summary: AdminCollectionTaskSummary | null) {
 	if (!summary || summary.status === "not_recorded") return 0;
 	return Math.max(1, summary.retry_count + 1);
@@ -985,8 +1301,11 @@ function demoRecordAttemptCount(item: AdminCollectionRecordItem) {
 function demoCollectionDetail(
 	kind: AdminCollectionRecordItem["kind"],
 	id: string,
+	dataCase: DemoAdminJobsDataCase = "loaded",
 ): AdminCollectionRecordDetail | null {
-	const record = demoCollectionRecords()[kind].find((item) => item.id === id);
+	const record = demoCollectionRecordsForCase(kind, dataCase).find(
+		(item) => item.id === id,
+	);
 	if (!record) return null;
 	const call = currentModel().adminJobs.llmCalls[0];
 	const llmCalls = call
@@ -1010,6 +1329,27 @@ function demoCollectionDetail(
 		next_retry_at: null,
 		llm_calls: llmCalls,
 	};
+	const attemptStatus = (summary: AdminCollectionTaskSummary | null) => {
+		if (!summary) return "not_recorded";
+		if (summary.status === "not_recorded") return "not_recorded";
+		if (summary.display_status === "failed" || summary.status === "failed") {
+			return "failed";
+		}
+		if (summary.display_status === "running" || summary.status === "running") {
+			return "running";
+		}
+		return "ready";
+	};
+	const attemptError = (summary: AdminCollectionTaskSummary | null) =>
+		attemptStatus(summary) === "failed"
+			? {
+					error_code: "demo_fixture_failed",
+					error_summary: "Demo fixture intentionally failed this attempt.",
+					failure_class: "transient",
+				}
+			: {};
+	const translationStatus = attemptStatus(record.translation);
+	const polishStatus = attemptStatus(record.polish);
 	const attempts: AdminCollectionAttempt[] =
 		kind === "brief"
 			? [
@@ -1018,8 +1358,9 @@ function demoCollectionDetail(
 						pipeline: "polish",
 						attempt_no: 1,
 						trigger: "daily_brief_generation",
-						status: "ready",
+						status: polishStatus,
 						...common,
+						...attemptError(record.polish),
 					},
 				]
 			: [
@@ -1028,16 +1369,18 @@ function demoCollectionDetail(
 						pipeline: "translation",
 						attempt_no: 1,
 						trigger: "initial",
-						status: "ready",
+						status: translationStatus,
 						...common,
+						...attemptError(record.translation),
 					},
 					{
 						id: `${id}:polish:2`,
 						pipeline: "polish",
 						attempt_no: 2,
 						trigger: "automatic_recovery",
-						status: "ready",
+						status: polishStatus,
 						...common,
+						...attemptError(record.polish),
 						last_attempt_at: "2026-07-08T09:25:08+08:00",
 						finished_at: "2026-07-08T09:25:08+08:00",
 						error_code: "release_smart_body_summary_json_decode_failed",
@@ -2829,7 +3172,8 @@ export const demoHandlers = [
 		},
 	),
 	http.get("/api/admin/jobs/ai-records/:kind", async ({ params, request }) => {
-		const network = await applyNetworkProfile(request);
+		const config = scopedAdminJobsConfig(request);
+		const network = await applyNetworkProfile(request, config);
 		if (network) return network;
 		const kind = String(params.kind);
 		if (
@@ -2872,7 +3216,10 @@ export const demoHandlers = [
 				"attempt_max must be greater than or equal to attempt_min",
 			);
 		}
-		const items = demoCollectionRecords()[kind].filter((item) => {
+		const items = demoCollectionRecordsForCase(
+			kind,
+			config?.dataCase ?? "loaded",
+		).filter((item) => {
 			const timestamp =
 				item.kind === "brief" ? item.generated_at : item.occurred_at;
 			const value = timestamp ? new Date(timestamp).getTime() : Number.NaN;
@@ -2896,9 +3243,28 @@ export const demoHandlers = [
 		return json(paginateItems(items, url.searchParams));
 	}),
 	http.get(
+		"/api/admin/jobs/ai-records/:kind/activity",
+		async ({ params, request }) => {
+			const config = scopedAdminJobsConfig(request);
+			const network = await applyNetworkProfile(request, config);
+			if (network) return network;
+			const kind = String(params.kind) as AdminCollectionRecordItem["kind"];
+			if (
+				kind !== "release" &&
+				kind !== "announcement" &&
+				kind !== "notification" &&
+				kind !== "brief"
+			) {
+				return badRequest("invalid collection record kind");
+			}
+			return json(demoCollectionActivity(kind, config?.dataCase ?? "loaded"));
+		},
+	),
+	http.get(
 		"/api/admin/jobs/ai-records/:kind/:recordId",
 		async ({ params, request }) => {
-			const network = await applyNetworkProfile(request);
+			const config = scopedAdminJobsConfig(request);
+			const network = await applyNetworkProfile(request, config);
 			if (network) return network;
 			const kind = String(params.kind);
 			if (
@@ -2909,7 +3275,11 @@ export const demoHandlers = [
 			) {
 				return badRequest("invalid collection record kind");
 			}
-			const detail = demoCollectionDetail(kind, String(params.recordId));
+			const detail = demoCollectionDetail(
+				kind,
+				String(params.recordId),
+				config?.dataCase ?? "loaded",
+			);
 			return detail
 				? json(detail)
 				: json(
@@ -3133,14 +3503,16 @@ export const demoHandlers = [
 		return json(currentModel().adminJobs.syncRuntimeConfig);
 	}),
 	http.get("/api/admin/jobs/llm/status", async ({ request }) => {
-		const network = await applyNetworkProfile(request);
+		const config = scopedAdminJobsConfig(request);
+		const network = await applyNetworkProfile(request, config);
 		if (network) return network;
-		return json(currentModel().adminJobs.llmStatus);
+		return json(demoLlmData(config?.dataCase ?? "loaded").status);
 	}),
 	http.get("/api/admin/jobs/llm/activity", async ({ request }) => {
-		const network = await applyNetworkProfile(request);
+		const config = scopedAdminJobsConfig(request);
+		const network = await applyNetworkProfile(request, config);
 		if (network) return network;
-		return json(currentModel().adminJobs.llmActivity);
+		return json(demoLlmData(config?.dataCase ?? "loaded").activity);
 	}),
 	http.patch("/api/admin/jobs/llm/runtime-config", async ({ request }) => {
 		const network = await applyNetworkProfile(request);
@@ -3327,9 +3699,10 @@ export const demoHandlers = [
 	}),
 	http.get("/api/admin/jobs/llm/calls", async ({ request }) => {
 		const url = new URL(request.url);
-		const network = await applyNetworkProfile(request);
+		const config = scopedAdminJobsConfig(request);
+		const network = await applyNetworkProfile(request, config);
 		if (network) return network;
-		let items = currentModel().adminJobs.llmCalls;
+		let items = demoLlmData(config?.dataCase ?? "loaded").calls;
 		const status = url.searchParams.get("status") ?? "all";
 		if (!["all", "queued", "running", "succeeded", "failed"].includes(status)) {
 			return badRequest("invalid status filter");
@@ -3418,10 +3791,12 @@ export const demoHandlers = [
 		});
 	}),
 	http.get("/api/admin/jobs/llm/calls/:callId", async ({ params, request }) => {
-		const network = await applyNetworkProfile(request);
+		const config = scopedAdminJobsConfig(request);
+		const network = await applyNetworkProfile(request, config);
 		if (network) return network;
-		const detail =
-			currentModel().adminJobs.llmCallDetails[String(params.callId)];
+		const detail = demoLlmData(config?.dataCase ?? "loaded").details[
+			String(params.callId)
+		];
 		if (!detail) {
 			return json(
 				{ error: { code: "not_found", message: "LLM call not found." } },

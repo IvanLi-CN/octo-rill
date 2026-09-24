@@ -5,6 +5,8 @@ import {
 import { buildSettingsHref } from "@/settings/routeState";
 import type {
 	DemoAppShellState,
+	DemoAdminJobsDataCase,
+	DemoAdminJobsNetworkProfile,
 	DemoLandingAuthAction,
 	DemoLandingBootState,
 	DemoLandingCase,
@@ -73,6 +75,25 @@ export const APP_SHELL_STATE_OPTIONS = [
 	{ value: "unknown", label: "Unknown version" },
 ] as const satisfies ReadonlyArray<{
 	value: DemoAppShellState;
+	label: string;
+}>;
+
+export const ADMIN_JOBS_DATA_CASE_OPTIONS = [
+	{ value: "loaded", label: "Loaded" },
+	{ value: "empty", label: "Empty" },
+	{ value: "many", label: "Many" },
+	{ value: "loading", label: "Loading" },
+] as const satisfies ReadonlyArray<{
+	value: DemoAdminJobsDataCase;
+	label: string;
+}>;
+
+export const ADMIN_JOBS_NETWORK_PROFILE_OPTIONS = [
+	{ value: "normal", label: "Normal" },
+	{ value: "slow", label: "Slow" },
+	{ value: "faulty", label: "Faulty" },
+] as const satisfies ReadonlyArray<{
+	value: DemoAdminJobsNetworkProfile;
 	label: string;
 }>;
 
@@ -379,6 +400,20 @@ export function normalizeNetworkMode(
 	return "normal";
 }
 
+export function normalizeAdminJobsDataCase(
+	value: string | null | undefined,
+): DemoAdminJobsDataCase {
+	return value === "empty" || value === "many" || value === "loading"
+		? value
+		: "loaded";
+}
+
+export function normalizeAdminJobsNetworkProfile(
+	value: string | null | undefined,
+): DemoAdminJobsNetworkProfile {
+	return value === "slow" || value === "faulty" ? value : "normal";
+}
+
 export function normalizeLandingCase(
 	value: string | null | undefined,
 ): DemoLandingCase {
@@ -479,6 +514,24 @@ export function readDemoShareState(url: URL, basepath: string): DemoShareState {
 		),
 		appShellState: normalizeAppShellState(url.searchParams.get("d_shell")),
 		controlsHidden: url.searchParams.get("d_controls") === "hidden",
+		contentDataCase:
+			sceneId === "admin-jobs-running"
+				? normalizeAdminJobsDataCase(url.searchParams.get("d_content_case"))
+				: "loaded",
+		contentNetworkProfile:
+			sceneId === "admin-jobs-running"
+				? normalizeAdminJobsNetworkProfile(
+						url.searchParams.get("d_content_net"),
+					)
+				: "normal",
+		llmDataCase:
+			sceneId === "admin-jobs-running"
+				? normalizeAdminJobsDataCase(url.searchParams.get("d_llm_case"))
+				: "loaded",
+		llmNetworkProfile:
+			sceneId === "admin-jobs-running"
+				? normalizeAdminJobsNetworkProfile(url.searchParams.get("d_llm_net"))
+				: "normal",
 	};
 }
 
@@ -498,6 +551,10 @@ export function buildDefaultDemoShareState(
 		...DEFAULT_LANDING_CONTROLS,
 		appShellState: "steady",
 		controlsHidden: false,
+		contentDataCase: "loaded",
+		contentNetworkProfile: "normal",
+		llmDataCase: "loaded",
+		llmNetworkProfile: "normal",
 	};
 }
 
@@ -549,6 +606,20 @@ export function applyDemoShareStateToSearchParams(
 	}
 	if (state.controlsHidden) {
 		target.set("d_controls", "hidden");
+	}
+	if (state.sceneId === "admin-jobs-running") {
+		if (state.contentDataCase !== "loaded") {
+			target.set("d_content_case", state.contentDataCase);
+		}
+		if (state.contentNetworkProfile !== "normal") {
+			target.set("d_content_net", state.contentNetworkProfile);
+		}
+		if (state.llmDataCase !== "loaded") {
+			target.set("d_llm_case", state.llmDataCase);
+		}
+		if (state.llmNetworkProfile !== "normal") {
+			target.set("d_llm_net", state.llmNetworkProfile);
+		}
 	}
 	return target;
 }
