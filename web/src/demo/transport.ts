@@ -1197,7 +1197,32 @@ function demoLlmData(dataCase: DemoAdminJobsDataCase) {
 	const callDetails = Object.fromEntries(
 		calls.map((call, index) => {
 			const template = details[templates[index % templates.length].id];
-			return [call.id, { ...template, ...call, id: call.id }];
+			const failed = call.status === "failed";
+			return [
+				call.id,
+				{
+					...template,
+					...call,
+					id: call.id,
+					failure_class: failed ? "transient" : null,
+					error_text: failed ? "Demo many fixture failed this call." : null,
+					response_text: failed ? null : (template?.response_text ?? null),
+					attempt_history: [
+						{
+							event_type: failed ? "failed" : "succeeded",
+							status: call.status,
+							model: call.model,
+							attempt: call.attempt_count,
+							failure_class: failed ? "transient" : null,
+							retry_after_ms: null,
+							from_model: null,
+							to_model: null,
+							fallback_count: call.fallback_count,
+							created_at: call.created_at,
+						},
+					],
+				},
+			];
 		}),
 	);
 	const average = (values: number[]) =>
@@ -1293,6 +1318,26 @@ function demoCollectionDetail(
 		next_retry_at: null,
 		llm_calls: llmCalls,
 	};
+	const attemptStatus = (summary: AdminCollectionTaskSummary | null) => {
+		if (!summary) return "not_recorded";
+		if (summary.display_status === "failed" || summary.status === "failed") {
+			return "failed";
+		}
+		if (summary.display_status === "running" || summary.status === "running") {
+			return "running";
+		}
+		return "ready";
+	};
+	const attemptError = (summary: AdminCollectionTaskSummary | null) =>
+		attemptStatus(summary) === "failed"
+			? {
+					error_code: "demo_fixture_failed",
+					error_summary: "Demo fixture intentionally failed this attempt.",
+					failure_class: "transient",
+				}
+			: {};
+	const translationStatus = attemptStatus(record.translation);
+	const polishStatus = attemptStatus(record.polish);
 	const attempts: AdminCollectionAttempt[] =
 		kind === "brief"
 			? [
@@ -1301,8 +1346,9 @@ function demoCollectionDetail(
 						pipeline: "polish",
 						attempt_no: 1,
 						trigger: "daily_brief_generation",
-						status: "ready",
+						status: polishStatus,
 						...common,
+						...attemptError(record.polish),
 					},
 				]
 			: [
@@ -1311,16 +1357,18 @@ function demoCollectionDetail(
 						pipeline: "translation",
 						attempt_no: 1,
 						trigger: "initial",
-						status: "ready",
+						status: translationStatus,
 						...common,
+						...attemptError(record.translation),
 					},
 					{
 						id: `${id}:polish:2`,
 						pipeline: "polish",
 						attempt_no: 2,
 						trigger: "automatic_recovery",
-						status: "ready",
+						status: polishStatus,
 						...common,
+						...attemptError(record.polish),
 						last_attempt_at: "2026-07-08T09:25:08+08:00",
 						finished_at: "2026-07-08T09:25:08+08:00",
 						error_code: "release_smart_body_summary_json_decode_failed",
