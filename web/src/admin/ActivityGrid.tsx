@@ -89,6 +89,7 @@ type ActivityGridProps = {
 	model: ActivityGridModel;
 	loading?: boolean;
 	refreshing?: boolean;
+	selectedCellId?: string | null;
 	onActivate: (cell: ActivityGridCell) => void;
 	onSelectionChange?: (cell: ActivityGridCell | null) => void;
 	showPreview?: boolean;
@@ -480,11 +481,13 @@ function useActivityCells(model: ActivityGridModel) {
 function WrappedRowsGrid({
 	model,
 	activeId,
+	selectedCellId,
 	setCellRef,
 	getHandlers,
 }: {
 	model: Extract<ActivityGridModel, { layout: "wrapped-rows" }>;
 	activeId: string | null;
+	selectedCellId?: string | null;
 	setCellRef: (id: string, element: HTMLButtonElement | null) => void;
 	getHandlers: (
 		cell: ActivityGridCell,
@@ -528,7 +531,9 @@ function WrappedRowsGrid({
 									<ActivityCellButton
 										{...handlers}
 										cell={cell}
-										selected={activeId === cell.id}
+										selected={
+											activeId === cell.id || selectedCellId === cell.id
+										}
 										setRef={(element) => setCellRef(cell.id, element)}
 									/>
 								</div>
@@ -544,11 +549,13 @@ function WrappedRowsGrid({
 function MatrixGrid({
 	model,
 	activeId,
+	selectedCellId,
 	setCellRef,
 	getHandlers,
 }: {
 	model: Extract<ActivityGridModel, { layout: "matrix" }>;
 	activeId: string | null;
+	selectedCellId?: string | null;
 	setCellRef: (id: string, element: HTMLButtonElement | null) => void;
 	getHandlers: (
 		cell: ActivityGridCell,
@@ -684,7 +691,9 @@ function MatrixGrid({
 									<ActivityCellButton
 										{...handlers}
 										cell={cell}
-										selected={activeId === cell.id}
+										selected={
+											activeId === cell.id || selectedCellId === cell.id
+										}
 										setRef={(element) => setCellRef(cell.id, element)}
 									/>
 								</div>
@@ -1052,6 +1061,7 @@ export function ActivityGrid({
 	model,
 	loading = false,
 	refreshing = false,
+	selectedCellId,
 	onActivate,
 	onSelectionChange,
 	showPreview = true,
@@ -1350,7 +1360,7 @@ export function ActivityGrid({
 			{useCanvas ? (
 				<DenseCanvasGrid
 					model={{ ...model, testId: "collection-activity-canvas-grid" }}
-					activeId={activeId}
+					activeId={activeId ?? selectedCellId ?? null}
 					setActiveId={setActiveId}
 					onActivate={onActivate}
 					setAnchor={setAnchor}
@@ -1359,6 +1369,7 @@ export function ActivityGrid({
 				<WrappedRowsGrid
 					model={model}
 					activeId={activeId}
+					selectedCellId={selectedCellId}
 					setCellRef={(id, element) => {
 						if (element) cellRefs.current.set(id, element);
 						else cellRefs.current.delete(id);
@@ -1369,6 +1380,7 @@ export function ActivityGrid({
 				<MatrixGrid
 					model={model}
 					activeId={activeId}
+					selectedCellId={selectedCellId}
 					setCellRef={(id, element) => {
 						if (element) cellRefs.current.set(id, element);
 						else cellRefs.current.delete(id);

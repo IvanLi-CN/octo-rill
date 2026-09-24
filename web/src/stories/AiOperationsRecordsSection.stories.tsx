@@ -343,11 +343,11 @@ export const FailedResponseWithDiagnostics: Story = {
 						status: 200,
 					});
 				}
-				if (url.pathname.includes("/ai-records/release")) {
-					return new Response(JSON.stringify(listResponse), { status: 200 });
-				}
 				if (url.pathname.endsWith("/ai-records/release/383114065")) {
 					return new Response(JSON.stringify(recordDetail), { status: 200 });
+				}
+				if (url.pathname === "/api/admin/jobs/ai-records/release") {
+					return new Response(JSON.stringify(listResponse), { status: 200 });
 				}
 				if (url.pathname.endsWith(`/llm/calls/${failedCall.id}`)) {
 					return new Response(JSON.stringify(failedCall), { status: 200 });
@@ -375,6 +375,10 @@ export const FailedResponseWithDiagnostics: Story = {
 };
 
 export const GlobalEvidenceOverview: Story = {
+	tags: ["admin-collection-activity"],
+	globals: {
+		viewport: { value: "adminDesktop" },
+	},
 	args: {
 		detailRoute: {
 			kind: "release",
@@ -390,6 +394,14 @@ export const GlobalEvidenceOverview: Story = {
 		(Story) => {
 			const originalFetch = useRef(window.fetch);
 			const restoreFetch = originalFetch.current;
+			try {
+				window.sessionStorage.setItem(
+					"octo-rill:ai-records:activity-grid-selection",
+					JSON.stringify({ cellId: "383114065:2026-09-20T11:55:00Z" }),
+				);
+			} catch {
+				return <Story />;
+			}
 			window.fetch = async (input, init) => {
 				const requestInput = input instanceof Request ? input.url : input;
 				const url = new URL(
@@ -406,17 +418,20 @@ export const GlobalEvidenceOverview: Story = {
 						status: 200,
 					});
 				}
-				if (url.pathname.includes("/ai-records/release")) {
-					return new Response(JSON.stringify(listResponse), { status: 200 });
-				}
 				if (url.pathname.endsWith("/ai-records/release/383114065")) {
 					return new Response(JSON.stringify(recordDetail), { status: 200 });
+				}
+				if (url.pathname === "/api/admin/jobs/ai-records/release") {
+					return new Response(JSON.stringify(listResponse), { status: 200 });
 				}
 				return restoreFetch(input, init);
 			};
 			useEffect(
 				() => () => {
 					window.fetch = restoreFetch;
+					window.sessionStorage.removeItem(
+						"octo-rill:ai-records:activity-grid-selection",
+					);
 				},
 				[restoreFetch],
 			);
@@ -432,6 +447,17 @@ export const GlobalEvidenceOverview: Story = {
 			);
 		},
 	],
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("button", { name: /Bun v1\.4\.2/ }),
+		).toHaveAttribute("aria-pressed", "true");
+		await expect(
+			within(canvasElement.ownerDocument.body).getByRole("dialog", {
+				name: "记录详情",
+			}),
+		).toBeVisible();
+	},
 };
 
 export const ExpiredDiagnosticEvidence: Story = {

@@ -211,14 +211,20 @@ export const AdminCollectionActivity = memo(function AdminCollectionActivity({
 	data,
 	loading = false,
 	error = null,
+	selectedCellId,
 	onRetry,
 	onOpenRecord,
 }: {
 	data: AdminCollectionActivityResponse | null;
 	loading?: boolean;
 	error?: string | null;
+	selectedCellId?: string | null;
 	onRetry: () => void;
-	onOpenRecord: (kind: AdminCollectionRecordItem["kind"], id: string) => void;
+	onOpenRecord: (
+		kind: AdminCollectionRecordItem["kind"],
+		id: string,
+		cellId: string,
+	) => void;
 }) {
 	const model = useMemo(
 		() => (data ? makeGridModel(data) : skeletonModel()),
@@ -306,9 +312,10 @@ export const AdminCollectionActivity = memo(function AdminCollectionActivity({
 			<ActivityGrid
 				model={model}
 				loading={loading || (!data && !error)}
+				selectedCellId={selectedCellId}
 				onActivate={(cell) => {
 					const record = cell.data as AdminCollectionActivityCell | undefined;
-					if (record) onOpenRecord(data?.kind ?? "release", record.id);
+					if (record) onOpenRecord(data?.kind ?? "release", record.id, cell.id);
 				}}
 				previewTestId="collection-activity-preview"
 			/>

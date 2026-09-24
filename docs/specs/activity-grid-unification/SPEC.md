@@ -16,7 +16,7 @@
 - REQ-ACTIVITY-GRID-006: 桌面端指针悬浮某个可用格子时，必须显示其简要信息浮层；点击格子必须触发该视图的激活动作。键盘焦点必须显示同一预览，方向键在逻辑相邻格子之间移动焦点，Enter 触发激活动作。DOM 与 Canvas 渲染路径必须提供等价的选择、键盘和辅助技术语义。
 - REQ-ACTIVITY-GRID-007: 采集记录图在触摸设备上必须以 150ms 长按进入探索模式。按下后在激活前移动超过 8px 时，手势必须继续作为原生页面滚动；进入探索后，手指移动必须更新当前格子。预览浮层必须跟随触点上方、不可接收指针事件，并通过偏移、翻转和边界偏移始终完整留在视口内。松手必须打开当前采集记录详情；快速拖动不得误开详情。
 - REQ-ACTIVITY-GRID-008: 采集记录预览必须展示标题、仓库、来源时间、综合处理状态、翻译状态和润色状态。预览位置必须随视口滚动与尺寸变化重新计算。LLM 适配器必须继续提供现有的可固定、可操作调用摘要，但由共享组件的预览与定位能力承载。
-- REQ-ACTIVITY-GRID-009: 打开、关闭或在详情内切换采集记录的尝试与 LLM 调用信息时，只允许读取所需的详情数据。不得重新读取活动图或下方列表，不得重置已加载的活动数据、列表数据、筛选、分页、页面滚动位置或当前网格选择。
+- REQ-ACTIVITY-GRID-009: 热导航打开采集记录详情时，必须同步恢复已缓存的活动图、列表、筛选、分页、页面滚动位置及被点击格子的稳定 ID；打开、关闭或在详情内切换尝试与 LLM 调用信息不得重读活动图或列表，不得丢失上述状态。无缓存的详情深链在抽屉打开期间必须只首读一次活动图且不读取列表；活动图读取失败必须显示可重试错误态，重试仅重读活动图。关闭冷详情时，只有此前从未加载列表才允许首次读取列表，活动图不得因关闭详情而自动重读。
 - REQ-ACTIVITY-GRID-010: 采集记录活动图必须继续覆盖 Release、公告、通知和日报四个 tab；LLM 活动图必须继续保留模型行、时间桶、状态图例、调用选中态与既有可操作性。组件复用不得改变既有活动读模型的状态含义、时间边界或统计口径。
 - REQ-ACTIVITY-GRID-011: Admin Jobs Web Demo 的 Inspector 必须提供可分享的 Data case 控制，至少支持 `有数据（代表性示例）`、`无数据`、`多行活动（同一小时 128 格）` 和 `加载中`。代表性示例必须覆盖中性、已完成、处理中和异常状态；多行活动必须让至少一个小时桶的格子在当前桌面宽度下换成两行或以上；切换后必须让活动图与列表读取对应数据；加载中必须保持最终几何的活动图骨架和列表加载态，且 Data case 与 Network 状态不得复用其他状态的缓存响应。
 
@@ -34,7 +34,7 @@
 - VER-ACTIVITY-GRID-LOADING: covers: REQ-ACTIVITY-GRID-005。比较初始 loading、无缓存 tab 与已缓存刷新状态的布局边界：前两者使用等尺寸骨架且完成后无结构性位移，后者保留真实内容并显示就地更新状态。
 - VER-ACTIVITY-GRID-DESKTOP-INTERACTION: covers: REQ-ACTIVITY-GRID-006, REQ-ACTIVITY-GRID-008。验证桌面悬浮、点击、焦点、方向键和 Enter 在 DOM 与 Canvas 路径下的同等行为，浮层在滚动和调整视口后仍完整可见；验证 LLM 的固定调用摘要继续可操作。
 - VER-ACTIVITY-GRID-TOUCH-INTERACTION: covers: REQ-ACTIVITY-GRID-007。以触摸序列验证 150ms/8px 判定、页面滚动让渡、连续格子探索、视口内跟手预览、松手打开详情和快速拖动不误开。
-- VER-ACTIVITY-GRID-DATA-ISOLATION: covers: REQ-ACTIVITY-GRID-009。拦截活动、列表和详情读取，验证打开、关闭及详情内导航只产生详情读取，并完整保留活动图、列表、筛选、分页、页面滚动与当前选择。
+- VER-ACTIVITY-GRID-DATA-ISOLATION: covers: REQ-ACTIVITY-GRID-009。热导航场景拦截活动、列表和详情读取，验证详情开关及详情内导航不增加活动或列表读取，并保留真实活动格、选中格、列表、筛选、分页和滚动位置；无缓存冷深链分别验证活动图只首读一次、抽屉期间列表读取为零、失败错误与重试只增加一次活动图读取，以及关闭后仅在列表尚未加载时允许列表首次读取。
 - VER-ACTIVITY-GRID-DEMO-DATA-CASES: covers: REQ-ACTIVITY-GRID-011。通过 Demo Inspector 切换四种 Data case，验证 URL share state、列表行数、活动图统计、空状态和同几何骨架；验证 Network 状态变化不会复用正常响应缓存。
 
 ## Interfaces & Contracts
@@ -54,3 +54,4 @@ None
 ## Visual Evidence
 
 - `assets/admin-jobs-many-dense-ego.png`: Ego Lite Web Demo 在桌面视口中展示 `多行活动（同一小时 128 格）`；`09时` 桶实际换成两行方块。
+- `assets/admin-jobs-activity-detail-handoff.png`: 受控 Storybook 画布展示详情抽屉打开时活动图仍显示真实格子，已点击的格子保留选中态。

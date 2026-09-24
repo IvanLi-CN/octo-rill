@@ -217,6 +217,18 @@ export const CurrentWindowOverview: Story = {
 	},
 };
 
+export const SelectedCellState: Story = {
+	args: {
+		selectedCellId: "release-104:2026-09-20T11:15:00.000Z",
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("button", { name: /Bun v1\.4\.2/ }),
+		).toHaveAttribute("aria-pressed", "true");
+	},
+};
+
 export const MobileOverview: Story = {
 	globals: {
 		viewport: { value: "adminMobile" },

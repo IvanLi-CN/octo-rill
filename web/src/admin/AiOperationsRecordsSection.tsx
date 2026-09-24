@@ -7,7 +7,14 @@ import {
 	RotateCcw,
 	SearchX,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 
 import {
 	AI_RECORD_STATUS_VALUES,
@@ -91,6 +98,7 @@ const collectionListCache = new Map<
 	{ items: AdminCollectionRecordItem[]; total: number; storedAt: number }
 >();
 const collectionActivityCache = new Map<string, ActivityCacheEntry>();
+const collectionActivityReadErrors = new Map<string, string>();
 const collectionListCacheHandoff = new Set<string>();
 const collectionActivityCacheHandoff = new Set<string>();
 let collectionListCacheHandoffPending = false;
@@ -101,10 +109,83 @@ const DETAIL_ACTIVITY_CACHE_HANDOFF_KEY =
 const DETAIL_LIST_CACHE_DATA_KEY = "octo-rill:ai-records:list-handoff-data";
 const DETAIL_ACTIVITY_CACHE_DATA_KEY =
 	"octo-rill:ai-records:activity-handoff-data";
+const DETAIL_ACTIVITY_GRID_SELECTION_KEY =
+	"octo-rill:ai-records:activity-grid-selection";
 const ATTEMPT_RANGE_MAX = 10;
 const ATTEMPT_UNBOUNDED_VALUE = ATTEMPT_RANGE_MAX + 1;
 const DEFAULT_ATTEMPT_RANGE: AttemptCountRange = { min: 0, max: null };
 const SESSION_RECORD_NOW = new Date();
+
+function readSessionValue(key: string) {
+	if (typeof window === "undefined") return null;
+	try {
+		return window.sessionStorage.getItem(key);
+	} catch {
+		return null;
+	}
+}
+
+function readInitialActivityEntry(cacheKey: string) {
+	const cached = collectionActivityCache.get(cacheKey);
+	const freshCached =
+		cached && Date.now() - cached.storedAt < ACTIVITY_CACHE_MS ? cached : null;
+	const hasHandoff =
+		readSessionValue(DETAIL_ACTIVITY_CACHE_HANDOFF_KEY) === "1";
+	if (!hasHandoff) return freshCached;
+	const stored = readSessionValue(DETAIL_ACTIVITY_CACHE_DATA_KEY);
+	if (stored) {
+		try {
+			const parsed = JSON.parse(stored) as Partial<ActivitySessionHandoff>;
+			if (
+				parsed.cacheKey === cacheKey &&
+				parsed.data &&
+				typeof parsed.storedAt === "number" &&
+				Date.now() - parsed.storedAt < ACTIVITY_CACHE_MS
+			) {
+				return {
+					data: parsed.data,
+					storedAt: parsed.storedAt,
+				};
+			}
+		} catch {
+			return freshCached;
+		}
+	}
+	return freshCached;
+}
+
+function readInitialListHandoff() {
+	if (readSessionValue(DETAIL_LIST_CACHE_HANDOFF_KEY) !== "1") return null;
+	const stored = readSessionValue(DETAIL_LIST_CACHE_DATA_KEY);
+	if (!stored) return null;
+	try {
+		const parsed = JSON.parse(stored) as {
+			queryKey?: string;
+			items?: AdminCollectionRecordItem[];
+			total?: number;
+			storedAt?: number;
+		};
+		if (
+			!parsed.queryKey ||
+			!Array.isArray(parsed.items) ||
+			typeof parsed.total !== "number" ||
+			typeof parsed.storedAt !== "number"
+		) {
+			return null;
+		}
+		const query = parsed.queryKey.split("?")[1] ?? "";
+		const page = Number(new URLSearchParams(query).get("page") ?? "1");
+		return {
+			queryKey: parsed.queryKey,
+			items: parsed.items,
+			total: parsed.total,
+			storedAt: parsed.storedAt,
+			page: Number.isInteger(page) && page > 0 ? page : 1,
+		};
+	} catch {
+		return null;
+	}
+}
 
 function aiRecordFiltersKey(filters: AiRecordRouteFilters | undefined) {
 	if (!filters) return "";
@@ -1125,6 +1206,13 @@ export function AiOperationsRecordsSection({
 		(scopedDemoState.dataCase !== "loading" &&
 			scopedDemoState.networkProfile === "normal");
 	const initialFilters = routeFilters ?? DEFAULT_AI_RECORD_ROUTE_FILTERS;
+	const initialActivityCacheKey = `${contentDemoIdentity}|${initialFilters.kind}`;
+	const initialActivityEntry = contentDemoCacheable
+		? readInitialActivityEntry(initialActivityCacheKey)
+		: null;
+	const initialActivityReadError = contentDemoCacheable
+		? collectionActivityReadErrors.get(initialActivityCacheKey)
+		: undefined;
 	const [tab, setTab] = useState<CollectionTab>(initialFilters.kind);
 	const [preset, setPreset] = useState<TimeRangePreset>(initialFilters.preset);
 	const [range, setRange] = useState(() =>
@@ -1143,13 +1231,25 @@ export function AiOperationsRecordsSection({
 		max: initialFilters.attemptMax,
 	});
 	const [appliedAttemptRange, setAppliedAttemptRange] =
-		useState<AttemptCountRange>(DEFAULT_ATTEMPT_RANGE);
-	const [page, setPage] = useState(1);
+		useState<AttemptCountRange>({
+			min: initialFilters.attemptMin,
+			max: initialFilters.attemptMax,
+		});
+	const initialListHandoff = readInitialListHandoff();
+	const [page, setPage] = useState(initialListHandoff?.page ?? 1);
 	const [lastSuccessfulList, setLastSuccessfulList] = useState<{
 		queryKey: string;
 		items: AdminCollectionRecordItem[];
 		total: number;
-	} | null>(null);
+	} | null>(() =>
+		initialListHandoff
+			? {
+					queryKey: initialListHandoff.queryKey,
+					items: initialListHandoff.items,
+					total: initialListHandoff.total,
+				}
+			: null,
+	);
 	const [listReadState, setListReadState] = useState<{
 		queryKey: string;
 		loading: boolean;
@@ -1157,10 +1257,36 @@ export function AiOperationsRecordsSection({
 	} | null>(null);
 	const [reloadNonce, setReloadNonce] = useState(0);
 	const [activity, setActivity] =
-		useState<AdminCollectionActivityResponse | null>(null);
-	const [activityLoading, setActivityLoading] = useState(false);
-	const [activityError, setActivityError] = useState<string | null>(null);
+		useState<AdminCollectionActivityResponse | null>(
+			() => initialActivityEntry?.data ?? null,
+		);
+	const [activityLoading, setActivityLoading] = useState(
+		() =>
+			!contentDemoCacheable ||
+			(initialActivityEntry === null && initialActivityReadError === undefined),
+	);
+	const [activityError, setActivityError] = useState<string | null>(
+		() => initialActivityReadError ?? null,
+	);
 	const [activityRetryNonce, setActivityRetryNonce] = useState(0);
+	const [selectedGridCellId, setSelectedGridCellId] = useState<string | null>(
+		() => {
+			const stored = readSessionValue(DETAIL_ACTIVITY_GRID_SELECTION_KEY);
+			if (!stored) return null;
+			try {
+				const parsed = JSON.parse(stored) as {
+					cacheKey?: unknown;
+					cellId?: unknown;
+				};
+				return parsed.cacheKey === initialActivityCacheKey &&
+					typeof parsed.cellId === "string"
+					? parsed.cellId
+					: null;
+			} catch {
+				return null;
+			}
+		},
+	);
 	const [detail, setDetail] = useState<AdminCollectionRecordDetail | null>(
 		null,
 	);
@@ -1176,7 +1302,7 @@ export function AiOperationsRecordsSection({
 	const activityRequestRef = useRef(0);
 	const activityControllerRef = useRef<AbortController | null>(null);
 	const activityCacheRef = useRef(collectionActivityCache);
-	const activityNeedsReadRef = useRef(true);
+	const activityNeedsReadRef = useRef(initialActivityReadError === undefined);
 	const activityInitialMountRef = useRef(true);
 	const activityForceReadRef = useRef(false);
 	const activityTabRef = useRef(tab);
@@ -1242,6 +1368,16 @@ export function AiOperationsRecordsSection({
 			before: end.toISOString(),
 		};
 	}, [preset, range]);
+	const pageFilterKey = JSON.stringify([
+		tab,
+		selectedRange.from,
+		selectedRange.before,
+		appliedAttemptRange.min,
+		appliedAttemptRange.max,
+		polishStatuses,
+		translationStatuses,
+	]);
+	const appliedPageFilterKeyRef = useRef(pageFilterKey);
 	const listParams = useMemo(() => {
 		const params = new URLSearchParams({
 			page: String(page),
@@ -1277,19 +1413,24 @@ export function AiOperationsRecordsSection({
 	const activityCacheKey = `${contentDemoIdentity}|${tab}`;
 	const activityCacheKeyRef = useRef(activityCacheKey);
 	const navigateToRecord = useCallback(
-		(kind: CollectionTab, id: string) => {
+		(kind: CollectionTab, id: string, cellId?: string) => {
 			if (!contentDemoCacheable) {
+				window.sessionStorage.setItem(
+					DETAIL_ACTIVITY_GRID_SELECTION_KEY,
+					JSON.stringify({
+						cacheKey: activityCacheKey,
+						cellId: cellId ?? null,
+					}),
+				);
+				setSelectedGridCellId(cellId ?? null);
 				onOpenRecord(kind, id);
 				return;
 			}
-			collectionListCacheHandoff.add(listQueryKey);
-			collectionActivityCacheHandoff.add(activityCacheKey);
-			collectionListCacheHandoffPending = true;
-			collectionActivityCacheHandoffPending = true;
-			window.sessionStorage.setItem(DETAIL_LIST_CACHE_HANDOFF_KEY, "1");
-			window.sessionStorage.setItem(DETAIL_ACTIVITY_CACHE_HANDOFF_KEY, "1");
 			const listEntry = collectionListCache.get(listQueryKey);
 			if (listEntry) {
+				collectionListCacheHandoff.add(listQueryKey);
+				collectionListCacheHandoffPending = true;
+				window.sessionStorage.setItem(DETAIL_LIST_CACHE_HANDOFF_KEY, "1");
 				window.sessionStorage.setItem(
 					DETAIL_LIST_CACHE_DATA_KEY,
 					JSON.stringify({ queryKey: listQueryKey, ...listEntry }),
@@ -1297,11 +1438,22 @@ export function AiOperationsRecordsSection({
 			}
 			const activityEntry = collectionActivityCache.get(activityCacheKey);
 			if (activityEntry) {
+				collectionActivityCacheHandoff.add(activityCacheKey);
+				collectionActivityCacheHandoffPending = true;
+				window.sessionStorage.setItem(DETAIL_ACTIVITY_CACHE_HANDOFF_KEY, "1");
 				window.sessionStorage.setItem(
 					DETAIL_ACTIVITY_CACHE_DATA_KEY,
 					JSON.stringify({ cacheKey: activityCacheKey, ...activityEntry }),
 				);
 			}
+			window.sessionStorage.setItem(
+				DETAIL_ACTIVITY_GRID_SELECTION_KEY,
+				JSON.stringify({
+					cacheKey: activityCacheKey,
+					cellId: cellId ?? null,
+				}),
+			);
+			setSelectedGridCellId(cellId ?? null);
 			onOpenRecord(kind, id);
 		},
 		[activityCacheKey, contentDemoCacheable, listQueryKey, onOpenRecord],
@@ -1312,7 +1464,7 @@ export function AiOperationsRecordsSection({
 	const total = currentList?.total ?? 0;
 	const currentReadState =
 		listReadState?.queryKey === listQueryKey ? listReadState : null;
-	const loading = currentReadState?.loading ?? true;
+	const loading = currentReadState?.loading ?? currentList === null;
 	const error = currentReadState?.error ?? null;
 	const setRangePreset = useCallback(
 		(next: TimeRangePreset) => {
@@ -1335,7 +1487,13 @@ export function AiOperationsRecordsSection({
 	);
 	useEffect(() => {
 		const timeout = window.setTimeout(() => {
-			setAppliedAttemptRange(attemptRange);
+			if (
+				appliedAttemptRange.min !== attemptRange.min ||
+				appliedAttemptRange.max !== attemptRange.max
+			) {
+				setAppliedAttemptRange(attemptRange);
+				setPage(1);
+			}
 			if (
 				routeFilters?.attemptMin !== attemptRange.min ||
 				routeFilters?.attemptMax !== attemptRange.max
@@ -1345,30 +1503,42 @@ export function AiOperationsRecordsSection({
 					attemptMax: attemptRange.max,
 				});
 			}
-			setPage(1);
 		}, 250);
 		return () => window.clearTimeout(timeout);
-	}, [attemptRange, commitFilters, routeFilters]);
+	}, [appliedAttemptRange, attemptRange, commitFilters, routeFilters]);
 	useEffect(() => {
+		if (appliedPageFilterKeyRef.current === pageFilterKey) return;
+		appliedPageFilterKeyRef.current = pageFilterKey;
 		setPage(1);
-	}, [
-		tab,
-		selectedRange.before,
-		selectedRange.from,
-		appliedAttemptRange.max,
-		appliedAttemptRange.min,
-		polishStatuses,
-		translationStatuses,
-	]);
+	}, [pageFilterKey]);
 	useEffect(() => {
 		if (!detailRoute || !contentDemoCacheable) return;
-		collectionListCacheHandoff.add(listQueryKey);
-		collectionActivityCacheHandoff.add(activityCacheKey);
-		return () => {
+		const listEntry =
+			lastSuccessfulList?.queryKey === listQueryKey
+				? lastSuccessfulList
+				: collectionListCache.get(listQueryKey);
+		const activityEntry =
+			activity ?? collectionActivityCache.get(activityCacheKey)?.data ?? null;
+		if (listEntry) {
 			collectionListCacheHandoff.add(listQueryKey);
+			collectionListCacheHandoffPending = true;
+		}
+		if (activityEntry) {
 			collectionActivityCacheHandoff.add(activityCacheKey);
+			collectionActivityCacheHandoffPending = true;
+		}
+		return () => {
+			if (listEntry) collectionListCacheHandoff.add(listQueryKey);
+			if (activityEntry) collectionActivityCacheHandoff.add(activityCacheKey);
 		};
-	}, [activityCacheKey, contentDemoCacheable, detailRoute, listQueryKey]);
+	}, [
+		activity,
+		activityCacheKey,
+		contentDemoCacheable,
+		detailRoute,
+		lastSuccessfulList,
+		listQueryKey,
+	]);
 	useEffect(() => {
 		const cacheKeyChanged = activityCacheKeyRef.current !== activityCacheKey;
 		const tabChanged = activityTabRef.current !== tab;
@@ -1378,13 +1548,16 @@ export function AiOperationsRecordsSection({
 			activityNeedsReadRef.current = true;
 			if (tabChanged) activityForceReadRef.current = true;
 		}
-		const cached = contentDemoCacheable
-			? activityCacheRef.current.get(activityCacheKey)
+		const initialEntry = contentDemoCacheable
+			? readInitialActivityEntry(activityCacheKey)
+			: null;
+		const cachedError = contentDemoCacheable
+			? collectionActivityReadErrors.get(activityCacheKey)
 			: undefined;
-		setActivity(cached?.data ?? null);
-		setActivityError(null);
-		setActivityLoading(true);
-	}, [activityCacheKey, tab]);
+		setActivity(initialEntry?.data ?? null);
+		setActivityError(cachedError ?? null);
+		setActivityLoading(initialEntry === null && cachedError === undefined);
+	}, [activityCacheKey, contentDemoCacheable, tab]);
 	useEffect(() => {
 		const requestId = listRequestRef.current + 1;
 		listRequestRef.current = requestId;
@@ -1432,11 +1605,7 @@ export function AiOperationsRecordsSection({
 				// Ignore invalid session handoff data and fall back to a normal read.
 			}
 		}
-		if (
-			handoff &&
-			handoffList &&
-			Date.now() - handoffList.storedAt < ACTIVITY_CACHE_MS
-		) {
+		if (handoff && handoffList) {
 			setLastSuccessfulList({
 				queryKey: listQueryKey,
 				items: handoffList.items,
@@ -1460,84 +1629,95 @@ export function AiOperationsRecordsSection({
 			setListReadState({ queryKey: listQueryKey, loading: false, error: null });
 			return;
 		}
-		hasIssuedListReadRef.current = true;
 		setListReadState({ queryKey: listQueryKey, loading: true, error: null });
-		void apiGetAdminCollectionRecords(
-			tab,
-			new URLSearchParams(listParamsKey),
-			abortController.signal,
-		)
-			.then((response) => {
-				if (requestId !== listRequestRef.current) return;
-				setLastSuccessfulList({
-					queryKey: listQueryKey,
-					items: response.items,
-					total: response.total,
-				});
-				if (contentDemoCacheable)
-					collectionListCache.set(listQueryKey, {
+		let requestStarted = false;
+		const requestStartTimer = window.setTimeout(() => {
+			requestStarted = true;
+			hasIssuedListReadRef.current = true;
+			void apiGetAdminCollectionRecords(
+				tab,
+				new URLSearchParams(listParamsKey),
+				abortController.signal,
+			)
+				.then((response) => {
+					if (requestId !== listRequestRef.current) return;
+					setLastSuccessfulList({
+						queryKey: listQueryKey,
 						items: response.items,
 						total: response.total,
-						storedAt: Date.now(),
 					});
-				if (!contentDemoCacheable) return;
-				try {
-					window.sessionStorage.setItem(
-						DETAIL_LIST_CACHE_DATA_KEY,
-						JSON.stringify({
-							queryKey: listQueryKey,
+					if (contentDemoCacheable)
+						collectionListCache.set(listQueryKey, {
 							items: response.items,
 							total: response.total,
 							storedAt: Date.now(),
-						}),
-					);
-				} catch {
-					// Session storage is an optional handoff optimization.
-				}
-			})
-			.catch((cause: unknown) => {
-				if (requestId !== listRequestRef.current) return;
-				if (cause instanceof DOMException && cause.name === "AbortError")
-					return;
-				if (
-					cause instanceof ApiError &&
-					(cause.code === "admin_collection_records_busy" ||
-						cause.code === "admin_collection_records_timeout")
-				) {
+						});
+					if (!contentDemoCacheable) return;
+					try {
+						window.sessionStorage.setItem(
+							DETAIL_LIST_CACHE_DATA_KEY,
+							JSON.stringify({
+								queryKey: listQueryKey,
+								items: response.items,
+								total: response.total,
+								storedAt: Date.now(),
+							}),
+						);
+					} catch {
+						// Session storage is an optional handoff optimization.
+					}
+				})
+				.catch((cause: unknown) => {
+					if (requestId !== listRequestRef.current) return;
+					if (cause instanceof DOMException && cause.name === "AbortError")
+						return;
+					if (
+						cause instanceof ApiError &&
+						(cause.code === "admin_collection_records_busy" ||
+							cause.code === "admin_collection_records_timeout")
+					) {
+						setListReadState({
+							queryKey: listQueryKey,
+							loading: true,
+							error: {
+								title: "记录暂时无法读取",
+								message:
+									cause.code === "admin_collection_records_timeout"
+										? "这次读取超过了安全时间，数据没有被截断。请稍后重新读取。"
+										: "读取服务正在处理其他请求。请稍后重新读取，当前筛选条件会继续保留。",
+								code: cause.code,
+							},
+						});
+						return;
+					}
 					setListReadState({
 						queryKey: listQueryKey,
 						loading: true,
 						error: {
-							title: "记录暂时无法读取",
-							message:
-								cause.code === "admin_collection_records_timeout"
-									? "这次读取超过了安全时间，数据没有被截断。请稍后重新读取。"
-									: "读取服务正在处理其他请求。请稍后重新读取，当前筛选条件会继续保留。",
-							code: cause.code,
+							title: "无法读取采集记录",
+							message: "读取记录时发生错误，请稍后重试。",
+							code: cause instanceof ApiError ? cause.code : undefined,
 						},
 					});
-					return;
-				}
-				setListReadState({
-					queryKey: listQueryKey,
-					loading: true,
-					error: {
-						title: "无法读取采集记录",
-						message: "读取记录时发生错误，请稍后重试。",
-						code: cause instanceof ApiError ? cause.code : undefined,
-					},
+				})
+				.finally(() => {
+					if (requestId === listRequestRef.current) {
+						setListReadState((current) =>
+							current?.queryKey === listQueryKey
+								? { ...current, loading: false }
+								: current,
+						);
+					}
 				});
-			})
-			.finally(() => {
-				if (requestId === listRequestRef.current) {
-					setListReadState((current) =>
-						current?.queryKey === listQueryKey
-							? { ...current, loading: false }
-							: current,
-					);
-				}
-			});
+		}, 0);
 		return () => {
+			if (!requestStarted) {
+				window.clearTimeout(requestStartTimer);
+				abortController.abort();
+				if (requestId === listRequestRef.current)
+					hasIssuedListReadRef.current = false;
+				return;
+			}
 			abortController.abort();
 		};
 	}, [
@@ -1549,7 +1729,6 @@ export function AiOperationsRecordsSection({
 		tab,
 	]);
 	useEffect(() => {
-		if (detailRoute) return;
 		const storageHandoff =
 			contentDemoCacheable &&
 			window.sessionStorage.getItem(DETAIL_ACTIVITY_CACHE_HANDOFF_KEY) === "1";
@@ -1592,11 +1771,9 @@ export function AiOperationsRecordsSection({
 		const cached = contentDemoCacheable
 			? activityCacheRef.current.get(activityCacheKey)
 			: undefined;
-		if (handoff) {
-			if (handoffActivity) {
-				setActivity(handoffActivity.data);
-				setActivityError(null);
-			}
+		if (handoff && handoffActivity) {
+			setActivity(handoffActivity.data);
+			setActivityError(null);
 			setActivityLoading(false);
 			activityNeedsReadRef.current = false;
 			return;
@@ -1613,6 +1790,14 @@ export function AiOperationsRecordsSection({
 		handledActivityRetryNonceRef.current = activityRetryNonce;
 		activityNeedsReadRef.current = false;
 		activityForceReadRef.current = false;
+		const cachedError = contentDemoCacheable
+			? collectionActivityReadErrors.get(activityCacheKey)
+			: undefined;
+		if (!forceRead && cachedError) {
+			setActivityError(cachedError);
+			setActivityLoading(false);
+			return;
+		}
 
 		if (
 			!forceRead &&
@@ -1634,61 +1819,75 @@ export function AiOperationsRecordsSection({
 			!cached || forceRead || Date.now() - cached.storedAt >= ACTIVITY_CACHE_MS,
 		);
 		setActivityError(null);
-		void apiGetAdminCollectionActivity(tab, abortController.signal)
-			.then((response) => {
-				if (requestId !== activityRequestRef.current) return;
-				const entry = { data: response, storedAt: Date.now() };
-				if (contentDemoCacheable)
-					activityCacheRef.current.set(activityCacheKey, entry);
-				if (!contentDemoCacheable) {
+		let requestStarted = false;
+		const requestStartTimer = window.setTimeout(() => {
+			requestStarted = true;
+			void apiGetAdminCollectionActivity(tab, abortController.signal)
+				.then((response) => {
+					if (requestId !== activityRequestRef.current) return;
+					const entry = { data: response, storedAt: Date.now() };
+					if (contentDemoCacheable) {
+						activityCacheRef.current.set(activityCacheKey, entry);
+						collectionActivityReadErrors.delete(activityCacheKey);
+						try {
+							window.sessionStorage.setItem(
+								DETAIL_ACTIVITY_CACHE_DATA_KEY,
+								JSON.stringify({ cacheKey: activityCacheKey, ...entry }),
+							);
+						} catch {
+							// Session storage is an optional handoff optimization.
+						}
+					}
 					setActivity(response);
-					return;
-				}
-				try {
-					window.sessionStorage.setItem(
-						DETAIL_ACTIVITY_CACHE_DATA_KEY,
-						JSON.stringify({ cacheKey: activityCacheKey, ...entry }),
-					);
-				} catch {
-					// Session storage is an optional handoff optimization.
-				}
-				setActivity(response);
-			})
-			.catch((cause: unknown) => {
-				if (requestId !== activityRequestRef.current) return;
-				if (cause instanceof DOMException && cause.name === "AbortError")
-					return;
-				if (cause instanceof ApiError) {
-					setActivityError(
-						cause.code === "admin_collection_records_busy"
-							? "读取服务正忙，请稍后重试。"
-							: cause.code === "admin_collection_records_timeout"
-								? "活动读取超过安全时间，数据未被截断。"
-								: "读取活动数据失败，请稍后重试。",
-					);
-					return;
-				}
-				setActivityError("读取活动数据失败，请稍后重试。");
-			})
-			.finally(() => {
-				if (requestId !== activityRequestRef.current) return;
-				activityControllerRef.current = null;
-				setActivityLoading(false);
-			});
+				})
+				.catch((cause: unknown) => {
+					if (requestId !== activityRequestRef.current) return;
+					if (cause instanceof DOMException && cause.name === "AbortError")
+						return;
+					const message =
+						cause instanceof ApiError
+							? cause.code === "admin_collection_records_busy"
+								? "读取服务正忙，请稍后重试。"
+								: cause.code === "admin_collection_records_timeout"
+									? "活动读取超过安全时间，数据未被截断。"
+									: "读取活动数据失败，请稍后重试。"
+							: "读取活动数据失败，请稍后重试。";
+					if (contentDemoCacheable)
+						collectionActivityReadErrors.set(activityCacheKey, message);
+					setActivityError(message);
+				})
+				.finally(() => {
+					if (requestId !== activityRequestRef.current) return;
+					activityControllerRef.current = null;
+					setActivityLoading(false);
+				});
+		}, 0);
 		return () => {
 			if (activityControllerRef.current !== abortController) return;
-			abortController.abort();
-			activityControllerRef.current = null;
-			activityNeedsReadRef.current = true;
+			if (!requestStarted) {
+				window.clearTimeout(requestStartTimer);
+				abortController.abort();
+				activityControllerRef.current = null;
+				activityNeedsReadRef.current = true;
+			}
 		};
 	}, [
 		activityCacheKey,
 		activityRetryNonce,
 		contentDemoCacheable,
-		detailRoute,
 		reloadNonce,
 		tab,
 	]);
+	const isDetailRouteOpen = detailRoute !== null;
+	useLayoutEffect(() => {
+		if (!isDetailRouteOpen) {
+			try {
+				window.sessionStorage.removeItem(DETAIL_ACTIVITY_GRID_SELECTION_KEY);
+			} catch {
+				return;
+			}
+		}
+	}, [isDetailRouteOpen]);
 	useEffect(() => {
 		if (!detailRoute) {
 			setDetail(null);
@@ -1859,6 +2058,7 @@ export function AiOperationsRecordsSection({
 						data={activity}
 						loading={activityLoading}
 						error={activityError}
+						selectedCellId={selectedGridCellId}
 						onRetry={() => {
 							activityNeedsReadRef.current = true;
 							activityForceReadRef.current = true;

@@ -13,6 +13,7 @@ export function AdminJobs(props: {
 		nextRoute: AdminJobsRouteState,
 		options?: {
 			replace?: boolean;
+			resetScroll?: boolean;
 		},
 	) => void;
 	taskIntervalSettingsDialogDefaultOpen?: boolean;
