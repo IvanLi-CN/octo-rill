@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, fn, userEvent, within } from "storybook/test";
+import { useState } from "react";
 
 import { buildDemoModel } from "@/demo/fixtures";
 import {
@@ -166,19 +167,56 @@ export const AdminJobsSurfaceStates: Story = {
 		shareHref:
 			"/admin/jobs/ai-records?demo=admin-jobs-running&d_persona=admin&d_content_case=empty&d_llm_case=many&d_llm_net=slow",
 	},
-	render: (args) => (
-		<div
-			data-visual-evidence-surface="admin-jobs-inspector-story"
-			className="bg-background p-6"
-		>
-			<div data-visual-evidence-target="admin-jobs-inspector-story">
-				<DemoInspectorPanel {...args} />
+	render: (args) => {
+		const [surface, setSurface] = useState<"content" | "llm">(
+			args.activeAdminJobsSurface ?? "content",
+		);
+		const [contentDataCase, setContentDataCase] = useState(
+			args.snapshot.shareState.contentDataCase,
+		);
+		const [llmDataCase, setLlmDataCase] = useState(
+			args.snapshot.shareState.llmDataCase,
+		);
+		return (
+			<div
+				data-visual-evidence-surface="admin-jobs-inspector-story"
+				className="bg-background p-6"
+			>
+				<div data-visual-evidence-target="admin-jobs-inspector-story">
+					<DemoInspectorPanel
+						{...args}
+						activeAdminJobsSurface={surface}
+						snapshot={{
+							...args.snapshot,
+							shareState: {
+								...args.snapshot.shareState,
+								contentDataCase,
+								llmDataCase,
+							},
+						}}
+						onSurfaceChange={(value) => {
+							setSurface(value);
+							args.onSurfaceChange?.(value);
+						}}
+						onContentDataCaseChange={(value) => {
+							setContentDataCase(value);
+							args.onContentDataCaseChange?.(value);
+						}}
+						onLlmDataCaseChange={(value) => {
+							setLlmDataCase(value);
+							args.onLlmDataCaseChange?.(value);
+						}}
+					/>
+				</div>
 			</div>
-		</div>
-	),
+		);
+	},
+	tags: ["demo-inspector"],
 	play: async ({ args, canvasElement }) => {
 		const canvas = within(canvasElement);
-		await expect(canvas.getByText("Admin Jobs")).toBeInTheDocument();
+		await expect(
+			canvas.getByRole("heading", { name: /Admin Jobs/ }),
+		).toBeInTheDocument();
 		await expect(canvas.getByLabelText("Surface")).toHaveValue("content");
 		await expect(canvas.getByLabelText("Data case")).toHaveValue("empty");
 		await userEvent.selectOptions(canvas.getByLabelText("Surface"), "llm");

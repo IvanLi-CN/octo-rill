@@ -81,14 +81,16 @@ type CollectionReadError = {
 };
 const PAGE_SIZE = 20;
 const ACTIVITY_CACHE_MS = 5_000;
+type ActivityCacheEntry = {
+	data: AdminCollectionActivityResponse;
+	storedAt: number;
+};
+type ActivitySessionHandoff = ActivityCacheEntry & { cacheKey: string };
 const collectionListCache = new Map<
 	string,
 	{ items: AdminCollectionRecordItem[]; total: number; storedAt: number }
 >();
-const collectionActivityCache = new Map<
-	string,
-	{ data: AdminCollectionActivityResponse; storedAt: number }
->();
+const collectionActivityCache = new Map<string, ActivityCacheEntry>();
 const collectionListCacheHandoff = new Set<string>();
 const collectionActivityCacheHandoff = new Set<string>();
 let collectionListCacheHandoffPending = false;
@@ -1297,7 +1299,7 @@ export function AiOperationsRecordsSection({
 			if (activityEntry) {
 				window.sessionStorage.setItem(
 					DETAIL_ACTIVITY_CACHE_DATA_KEY,
-					JSON.stringify(activityEntry),
+					JSON.stringify({ cacheKey: activityCacheKey, ...activityEntry }),
 				);
 			}
 			onOpenRecord(kind, id);
@@ -1570,8 +1572,19 @@ export function AiOperationsRecordsSection({
 			: undefined;
 		if (!handoffActivity && storedActivity) {
 			try {
-				const parsed = JSON.parse(storedActivity) as typeof handoffActivity;
-				if (parsed) handoffActivity = parsed;
+				const parsed = JSON.parse(
+					storedActivity,
+				) as Partial<ActivitySessionHandoff>;
+				if (
+					parsed?.cacheKey === activityCacheKey &&
+					parsed.data &&
+					typeof parsed.storedAt === "number"
+				) {
+					handoffActivity = {
+						data: parsed.data,
+						storedAt: parsed.storedAt,
+					};
+				}
 			} catch {
 				// Ignore invalid session handoff data and fall back to a normal read.
 			}
@@ -1634,7 +1647,7 @@ export function AiOperationsRecordsSection({
 				try {
 					window.sessionStorage.setItem(
 						DETAIL_ACTIVITY_CACHE_DATA_KEY,
-						JSON.stringify(entry),
+						JSON.stringify({ cacheKey: activityCacheKey, ...entry }),
 					);
 				} catch {
 					// Session storage is an optional handoff optimization.

@@ -4489,6 +4489,10 @@ export function JobManagement({
 	const llmCallsControllerRef = useRef<AbortController | null>(null);
 	const llmDetailControllerRef = useRef<AbortController | null>(null);
 	const taskRelatedLlmControllerRef = useRef<AbortController | null>(null);
+	const taskDrawerLlmControllerRef = useRef<AbortController | null>(null);
+	const llmDetailRequestIdRef = useRef(0);
+	const taskRelatedLlmRequestIdRef = useRef(0);
+	const taskDrawerLlmRequestIdRef = useRef(0);
 	const llmCallResultsRef = useRef<HTMLElement>(null);
 	const focusLlmCallResults = useCallback(() => {
 		window.setTimeout(() => {
@@ -4518,9 +4522,13 @@ export function JobManagement({
 		llmCallsControllerRef.current?.abort();
 		llmDetailControllerRef.current?.abort();
 		taskRelatedLlmControllerRef.current?.abort();
+		taskDrawerLlmControllerRef.current?.abort();
 		llmStatusRequestIdRef.current += 1;
 		llmActivityRequestIdRef.current += 1;
 		llmCallsRequestIdRef.current += 1;
+		llmDetailRequestIdRef.current += 1;
+		taskRelatedLlmRequestIdRef.current += 1;
+		taskDrawerLlmRequestIdRef.current += 1;
 		llmStatusLoadedOnceRef.current = false;
 		llmActivityLoadedOnceRef.current = false;
 		llmCallsLoadedOnceRef.current = false;
@@ -4531,6 +4539,10 @@ export function JobManagement({
 		setLlmActivity(null);
 		setLlmCalls([]);
 		setLlmCallTotal(0);
+		setLlmDetail(null);
+		setLlmDetailLoading(false);
+		setTaskDrawerLlmDetail(null);
+		setTaskDrawerLlmLoading(false);
 		setTaskRelatedLlmCalls([]);
 		setTaskRelatedLlmLoading(false);
 		setLlmActivityError(null);
@@ -5639,10 +5651,13 @@ export function JobManagement({
 			llmDetailControllerRef.current?.abort();
 			const abortController = new AbortController();
 			llmDetailControllerRef.current = abortController;
+			const requestId = llmDetailRequestIdRef.current + 1;
+			llmDetailRequestIdRef.current = requestId;
 			const detail = await apiGetAdminLlmCallDetail(
 				callId,
 				abortController.signal,
 			);
+			if (requestId !== llmDetailRequestIdRef.current) return;
 			if (activeTaskDrawerLlmCallIdRef.current === callId) {
 				setTaskDrawerLlmDetail(detail);
 				return;
@@ -5657,6 +5672,8 @@ export function JobManagement({
 			taskRelatedLlmControllerRef.current?.abort();
 			const abortController = new AbortController();
 			taskRelatedLlmControllerRef.current = abortController;
+			const requestId = taskRelatedLlmRequestIdRef.current + 1;
+			taskRelatedLlmRequestIdRef.current = requestId;
 			const params = new URLSearchParams();
 			params.set("status", "all");
 			params.set("sort", "created_desc");
@@ -5665,6 +5682,7 @@ export function JobManagement({
 			params.set("parent_task_id", taskId);
 			try {
 				const res = await apiGetAdminLlmCalls(params, abortController.signal);
+				if (requestId !== taskRelatedLlmRequestIdRef.current) return;
 				setTaskRelatedLlmCalls(res.items);
 			} finally {
 				if (taskRelatedLlmControllerRef.current === abortController) {
@@ -5675,13 +5693,32 @@ export function JobManagement({
 		[llmDemoIdentity],
 	);
 
-	const loadTaskDrawerLlmDetail = useCallback(async (callId: string) => {
-		const detail = await apiGetAdminLlmCallDetail(
-			callId,
-			llmDetailControllerRef.current?.signal,
-		);
-		setTaskDrawerLlmDetail(detail);
-	}, []);
+	const loadTaskDrawerLlmDetail = useCallback(
+		async (callId: string) => {
+			taskDrawerLlmControllerRef.current?.abort();
+			const abortController = new AbortController();
+			taskDrawerLlmControllerRef.current = abortController;
+			const requestId = taskDrawerLlmRequestIdRef.current + 1;
+			taskDrawerLlmRequestIdRef.current = requestId;
+			try {
+				const detail = await apiGetAdminLlmCallDetail(
+					callId,
+					abortController.signal,
+				);
+				if (
+					requestId !== taskDrawerLlmRequestIdRef.current ||
+					activeTaskDrawerLlmCallIdRef.current !== callId
+				)
+					return;
+				setTaskDrawerLlmDetail(detail);
+			} finally {
+				if (taskDrawerLlmControllerRef.current === abortController) {
+					taskDrawerLlmControllerRef.current = null;
+				}
+			}
+		},
+		[llmDemoIdentity],
+	);
 
 	const drainStreamRefreshQueue = useCallback(async () => {
 		if (streamRefreshInFlightRef.current) {
@@ -5912,6 +5949,8 @@ export function JobManagement({
 
 	useEffect(() => {
 		if (!activeRouteTaskId) {
+			taskRelatedLlmControllerRef.current?.abort();
+			taskRelatedLlmRequestIdRef.current += 1;
 			setTaskRelatedLlmCalls([]);
 			setTaskRelatedLlmLoading(false);
 			return;
@@ -5934,11 +5973,15 @@ export function JobManagement({
 			});
 		return () => {
 			canceled = true;
+			taskRelatedLlmControllerRef.current?.abort();
+			taskRelatedLlmRequestIdRef.current += 1;
 		};
 	}, [activeRouteTaskId, loadTaskRelatedLlmCalls]);
 
 	useEffect(() => {
 		if (!activeTaskDrawerLlmCallId) {
+			taskDrawerLlmControllerRef.current?.abort();
+			taskDrawerLlmRequestIdRef.current += 1;
 			setTaskDrawerLlmDetail(null);
 			setTaskDrawerLlmLoading(false);
 			return;
@@ -5951,7 +5994,10 @@ export function JobManagement({
 		setError(null);
 		void loadTaskDrawerLlmDetail(activeTaskDrawerLlmCallId)
 			.catch((err) => {
-				if (!canceled) {
+				if (
+					!canceled &&
+					!(err instanceof DOMException && err.name === "AbortError")
+				) {
 					setError(normalizeErrorMessage(err));
 				}
 			})
@@ -6170,18 +6216,22 @@ export function JobManagement({
 		});
 	}, [navigateAdminJobsRoute, translationView]);
 
-	const onOpenLlmCallDetail = useCallback(async (callId: string) => {
-		setLlmDetailLoading(true);
-		setError(null);
-		try {
-			const detail = await apiGetAdminLlmCallDetail(callId);
-			setLlmDetail(detail);
-		} catch (err) {
-			setError(normalizeErrorMessage(err));
-		} finally {
-			setLlmDetailLoading(false);
-		}
-	}, []);
+	const onOpenLlmCallDetail = useCallback(
+		async (callId: string) => {
+			setLlmDetailLoading(true);
+			setError(null);
+			try {
+				await refreshLlmDetail(callId);
+			} catch (err) {
+				if (!(err instanceof DOMException && err.name === "AbortError")) {
+					setError(normalizeErrorMessage(err));
+				}
+			} finally {
+				setLlmDetailLoading(false);
+			}
+		},
+		[refreshLlmDetail],
+	);
 
 	const onOpenTaskLlmDetail = useCallback(
 		(callId: string) => {

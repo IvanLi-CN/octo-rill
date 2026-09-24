@@ -1037,13 +1037,17 @@ function demoCollectionRecordsForCase(
 	if (dataCase !== "many") return base;
 	return Array.from({ length: 128 }, (_, index) => {
 		const template = base[index % base.length] ?? base[0];
+		const isFailure = index % 11 === 0;
 		return {
 			...template,
 			id: `${kind}-many-${String(index + 1).padStart(3, "0")}`,
 			title: `${template.title} · dense ${index + 1}`,
 			occurred_at: new Date(
-				Date.parse("2026-07-08T10:00:00+08:00") - index * 60_000,
+				Date.parse("2026-07-08T10:00:00+08:00") + index * 20_000,
 			).toISOString(),
+			polish: isFailure
+				? { ...template.polish, status: "failed", display_status: "failed" }
+				: template.polish,
 		};
 	});
 }
@@ -1066,7 +1070,6 @@ function demoCollectionActivity(
 				const time = Date.parse(source);
 				return time >= started.getTime() && time < ended.getTime();
 			})
-			.slice(0, 32)
 			.map((record) => ({
 				id: record.id,
 				title: record.title,
@@ -1079,7 +1082,10 @@ function demoCollectionActivity(
 					? "completed"
 					: record.polish.display_status === "running"
 						? "processing"
-						: "neutral") as AdminCollectionActivityResponse["buckets"][number]["cells"][number]["composite_status"],
+						: record.polish.display_status === "failed" ||
+								record.polish.status === "failed"
+							? "exception"
+							: "neutral") as AdminCollectionActivityResponse["buckets"][number]["cells"][number]["composite_status"],
 			}));
 		return {
 			started_at: started.toISOString(),
@@ -1140,10 +1146,15 @@ function demoLlmData(dataCase: DemoAdminJobsDataCase) {
 		return {
 			status: {
 				...jobs.llmStatus,
+				waiting_calls: 0,
 				in_flight_calls: 0,
 				calls_24h: 0,
 				failed_24h: 0,
 				available_slots: jobs.llmStatus.max_concurrency,
+				avg_wait_ms_24h: null,
+				avg_duration_ms_24h: null,
+				last_success_at: null,
+				last_failure_at: null,
 				llm_models: models,
 				model_statuses: models.map((model, index) => ({
 					...jobs.llmStatus.model_statuses[
@@ -1189,13 +1200,40 @@ function demoLlmData(dataCase: DemoAdminJobsDataCase) {
 			return [call.id, { ...template, ...call, id: call.id }];
 		}),
 	);
+	const average = (values: number[]) =>
+		values.length > 0
+			? Math.round(
+					values.reduce((total, value) => total + value, 0) / values.length,
+				)
+			: null;
+	const finishedCalls = calls.filter(
+		(call): call is typeof call & { finished_at: string } =>
+			typeof call.finished_at === "string",
+	);
+	const latestFinishedAt = (status: string) =>
+		finishedCalls
+			.filter((call) => call.status === status)
+			.map((call) => call.finished_at)
+			.sort()
+			.at(-1) ?? null;
 	return {
 		status: {
 			...jobs.llmStatus,
+			waiting_calls: calls.filter(
+				(call) => call.status === "queued" || call.status === "running",
+			).length,
 			in_flight_calls: 0,
 			calls_24h: calls.length,
 			failed_24h: calls.filter((call) => call.status === "failed").length,
 			available_slots: jobs.llmStatus.max_concurrency,
+			avg_wait_ms_24h: average(calls.map((call) => call.scheduler_wait_ms)),
+			avg_duration_ms_24h: average(
+				finishedCalls
+					.map((call) => call.duration_ms)
+					.filter((value): value is number => typeof value === "number"),
+			),
+			last_success_at: latestFinishedAt("succeeded"),
+			last_failure_at: latestFinishedAt("failed"),
 			llm_models: models,
 			model_statuses: models.map((model, index) => ({
 				...jobs.llmStatus.model_statuses[

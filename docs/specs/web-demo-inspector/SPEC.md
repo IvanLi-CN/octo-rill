@@ -298,7 +298,7 @@
   submission_gate: `captured`
   visual_comparison: `current-only`
   captured_at: `2026-09-24`
-  requested_viewport: `desktop`
+  requested_viewport: `1280x720`
   viewport_strategy: `playwright-controlled`
   route: `/admin/jobs/ai-records?demo=admin-jobs-running&d_persona=admin&d_content_case=empty&d_llm_case=many`
   state: `Admin Jobs Inspector / content empty`

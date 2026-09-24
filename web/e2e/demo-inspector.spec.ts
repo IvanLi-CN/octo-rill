@@ -905,10 +905,7 @@ test("admin jobs inspector replays independent content and llm surface state", a
 	await expect(
 		page.locator('[data-collection-empty-state="true"]'),
 	).toBeVisible();
-	await captureDemoInspectorEvidence(
-		inspector,
-		"admin-jobs-inspector-desktop.png",
-	);
+	await captureDemoViewportEvidence(page, "admin-jobs-inspector-desktop.png");
 
 	await page.setViewportSize({ width: 393, height: 852 });
 	await page.reload();
@@ -932,10 +929,8 @@ test("admin jobs inspector cancels loading and exposes slow and faulty transport
 	);
 
 	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
-	const dataCase = inspector.getByLabel("Data case");
-	const networkProfile = inspector.getByLabel("Network profile");
 
-	await dataCase.selectOption("loading");
+	await inspector.getByLabel("Data case").selectOption("loading");
 	await expect(
 		page.getByText("正在加载记录...", { exact: true }),
 	).toBeVisible();
@@ -943,19 +938,19 @@ test("admin jobs inspector cancels loading and exposes slow and faulty transport
 		page.locator('[data-collection-empty-state="true"]'),
 	).toHaveCount(0);
 
-	await dataCase.selectOption("empty");
+	await inspector.getByLabel("Data case").selectOption("empty");
 	await expect(
 		page.locator('[data-collection-empty-state="true"]'),
 	).toBeVisible();
 
-	await networkProfile.selectOption("slow");
-	await dataCase.selectOption("loaded");
+	await inspector.getByLabel("Network profile").selectOption("slow");
+	await inspector.getByLabel("Data case").selectOption("loaded");
 	await expect(
 		page.getByText("正在加载记录...", { exact: true }),
 	).toBeVisible();
 	await expect(page.getByRole("table")).toBeVisible({ timeout: 15_000 });
 
-	await networkProfile.selectOption("faulty");
+	await inspector.getByLabel("Network profile").selectOption("faulty");
 	await expect(page.getByText("无法读取采集记录", { exact: true })).toBeVisible(
 		{
 			timeout: 15_000,
@@ -964,6 +959,94 @@ test("admin jobs inspector cancels loading and exposes slow and faulty transport
 	await expect(
 		page.locator('[data-collection-empty-state="true"]'),
 	).toHaveCount(0);
+});
+
+test("admin jobs content detail stays stable when llm case changes", async ({
+	page,
+}) => {
+	await page.goto(
+		"/admin/jobs/ai-records?demo=admin-jobs-running&d_persona=admin&d_content_case=loaded&d_llm_case=loaded",
+	);
+	const before = await page.evaluate(async () => {
+		const response = await fetch(
+			"/api/admin/jobs/ai-records/release/291058019?__demo_runtime=1",
+		);
+		return (await response.json()) as {
+			attempts: Array<{ llm_calls: unknown }>;
+		};
+	});
+
+	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
+	await inspector.getByLabel("Surface").selectOption("llm");
+	await inspector.getByLabel("Data case").selectOption("empty");
+	const after = await page.evaluate(async () => {
+		const response = await fetch(
+			"/api/admin/jobs/ai-records/release/291058019?__demo_runtime=1",
+		);
+		return (await response.json()) as {
+			attempts: Array<{ llm_calls: unknown }>;
+		};
+	});
+	expect(after.attempts[0]?.llm_calls).toEqual(before.attempts[0]?.llm_calls);
+});
+
+test("admin jobs llm inspector isolates its endpoint family and transport states", async ({
+	page,
+}) => {
+	const observedRequests = new Set<string>();
+	page.on("request", (request) => {
+		if (request.url().includes("/api/admin/jobs/")) {
+			observedRequests.add(new URL(request.url()).pathname);
+		}
+	});
+	await page.goto(
+		"/admin/jobs/llm?demo=admin-jobs-running&d_persona=admin&d_llm_case=loaded",
+	);
+
+	const inspector = page.locator('[data-demo-inspector-chrome="desktop"]');
+	const results = page.getByRole("region", { name: "LLM 调用记录结果" });
+
+	await expect(results).toContainText("共 164 条调用");
+	await inspector.getByLabel("Data case").selectOption("loading");
+	await expect(results).toContainText("共 0 条调用");
+	await expect(results.locator(".animate-pulse")).toHaveCount(4);
+	await expect(results.getByText("暂无调用记录", { exact: true })).toHaveCount(
+		0,
+	);
+
+	await inspector.getByLabel("Data case").selectOption("empty");
+	await expect(
+		results.getByText("暂无调用记录", { exact: true }),
+	).toBeVisible();
+	const emptyDetailStatus = await page.evaluate(async () => {
+		const response = await fetch(
+			"/api/admin/jobs/llm/calls/demo-many-call-001?__demo_runtime=1",
+		);
+		return response.status;
+	});
+	expect(emptyDetailStatus).toBe(404);
+
+	await inspector.getByLabel("Network profile").selectOption("slow");
+	await inspector.getByLabel("Data case").selectOption("many");
+	await expect(results).toContainText("共 0 条调用");
+	await expect(results).toContainText("共 36 条调用", { timeout: 15_000 });
+
+	await inspector.getByLabel("Network profile").selectOption("faulty");
+	await expect(
+		results.getByText("LLM 调用加载失败", { exact: true }),
+	).toBeVisible({
+		timeout: 15_000,
+	});
+	expect(
+		[...observedRequests].some((path) =>
+			path.startsWith("/api/admin/jobs/llm/"),
+		),
+	).toBe(true);
+	expect(
+		[...observedRequests].some((path) =>
+			path.startsWith("/api/admin/jobs/ai-records/"),
+		),
+	).toBe(false);
 });
 
 test("demo worker ignores unmarked live requests in regular dev builds", async ({

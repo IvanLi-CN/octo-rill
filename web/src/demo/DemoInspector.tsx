@@ -46,6 +46,7 @@ import {
 	LANDING_PASSKEY_SUPPORT_OPTIONS,
 	ADMIN_JOBS_DATA_CASE_OPTIONS,
 	ADMIN_JOBS_NETWORK_PROFILE_OPTIONS,
+	resolveDemoNativeHref,
 	WEBHOOK_SCENARIO_OPTIONS,
 } from "@/demo/registry";
 import type {
@@ -98,6 +99,18 @@ const PUBLICATION_OPTIONS = [
 	{ value: "unpublished", label: "Unpublished" },
 	{ value: "published", label: "Published" },
 ] as const;
+
+function demoPathname(pathname: string) {
+	const basepath = (__OCTO_RILL_ROUTER_BASEPATH__ || "/").replace(/\/$/, "");
+	if (basepath && pathname.startsWith(`${basepath}/`)) {
+		return pathname.slice(basepath.length) || "/";
+	}
+	return pathname || "/";
+}
+
+function isLlmAdminJobsPath(pathname: string) {
+	return demoPathname(pathname).startsWith("/admin/jobs/llm");
+}
 
 function InspectorSelect<Value extends string>(props: {
 	id: string;
@@ -348,7 +361,7 @@ export function DemoInspector(props: {
 		"content" | "llm"
 	>(() =>
 		typeof window !== "undefined" &&
-		window.location.pathname.startsWith("/admin/jobs/llm")
+		isLlmAdminJobsPath(window.location.pathname)
 			? "llm"
 			: "content",
 	);
@@ -371,9 +384,7 @@ export function DemoInspector(props: {
 
 	useEffect(() => {
 		setActiveAdminJobsSurface(
-			window.location.pathname.startsWith("/admin/jobs/llm")
-				? "llm"
-				: "content",
+			isLlmAdminJobsPath(window.location.pathname) ? "llm" : "content",
 		);
 	}, [routeLocationKey]);
 
@@ -517,7 +528,9 @@ export function DemoInspector(props: {
 			);
 			nextUrl.pathname = targetPath;
 			replaceDemoLocation(
-				`${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`,
+				resolveDemoNativeHref(
+					`${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`,
+				),
 			);
 		},
 		onContentDataCaseChange: (value: DemoAdminJobsDataCase) =>
