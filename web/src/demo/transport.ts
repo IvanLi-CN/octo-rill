@@ -1206,7 +1206,9 @@ function demoLlmData(dataCase: DemoAdminJobsDataCase) {
 					id: call.id,
 					failure_class: failed ? "transient" : null,
 					error_text: failed ? "Demo many fixture failed this call." : null,
-					response_text: failed ? null : (template?.response_text ?? null),
+					response_text: failed
+						? null
+						: (template?.response_text ?? `Demo response for ${call.id}`),
 					attempt_history: [
 						{
 							event_type: failed ? "failed" : "succeeded",
@@ -1320,6 +1322,7 @@ function demoCollectionDetail(
 	};
 	const attemptStatus = (summary: AdminCollectionTaskSummary | null) => {
 		if (!summary) return "not_recorded";
+		if (summary.status === "not_recorded") return "not_recorded";
 		if (summary.display_status === "failed" || summary.status === "failed") {
 			return "failed";
 		}
