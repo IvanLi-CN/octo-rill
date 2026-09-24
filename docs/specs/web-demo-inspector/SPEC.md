@@ -320,6 +320,8 @@
 
 ![Admin Jobs Inspector mobile](./assets/admin-jobs-inspector-mobile.png)
 
+- fixture_consistency: `Admin Jobs many fixtures derive list, activity, status, detail attempts, and LLM output payloads from the same generated record/call status; failed calls and not-recorded content attempts do not expose contradictory success payloads.`
+
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
 - 风险：Admin Jobs 页面请求面较宽，若后续新增 tab 初始加载逻辑，demo handler 需要同步补齐。
