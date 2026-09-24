@@ -83,6 +83,17 @@ const PUBLIC_RELEASE_ESTIMATED_CARD_HEIGHT = 148;
 const PUBLIC_RELEASE_FOCUS_LEAD_PX = 72;
 
 function publicReleasePathPrefix() {
+	const configuredBase = (__OCTO_RILL_ROUTER_BASEPATH__ || "/").replace(
+		/\/+$/,
+		"",
+	);
+	if (
+		configuredBase &&
+		configuredBase !== "/" &&
+		window.location.pathname.startsWith(`${configuredBase}/`)
+	) {
+		return configuredBase;
+	}
 	return window.location.pathname.startsWith("/demo/") ? "/demo" : "";
 }
 
@@ -1431,6 +1442,15 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 				: [{ kind: "release" as const, item }];
 		});
 	}, [props.gaps, props.items]);
+	const rowIndexByReleaseId = useMemo(() => {
+		const indexByReleaseId = new Map<string, number>();
+		rows.forEach((row, index) => {
+			if (row.kind === "release") {
+				indexByReleaseId.set(row.item.release_id, index);
+			}
+		});
+		return indexByReleaseId;
+	}, [rows]);
 
 	const detailVirtualizer = useVirtualizer({
 		count: rows.length,
@@ -1444,16 +1464,11 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 			const indexes = new Set(defaultRangeExtractor(range));
 			const pendingId = pendingFocusIdRef.current;
 			if (pendingId) {
-				const pendingIndex = rows.findIndex(
-					(row) => row.kind === "release" && row.item.release_id === pendingId,
-				);
+				const pendingIndex = rowIndexByReleaseId.get(pendingId) ?? -1;
 				if (pendingIndex >= 0) indexes.add(pendingIndex);
 			}
 			if (focusedReleaseId) {
-				const focusedIndex = rows.findIndex(
-					(row) =>
-						row.kind === "release" && row.item.release_id === focusedReleaseId,
-				);
+				const focusedIndex = rowIndexByReleaseId.get(focusedReleaseId) ?? -1;
 				if (focusedIndex >= 0) indexes.add(focusedIndex);
 			}
 			return Array.from(indexes).sort((left, right) => left - right);
@@ -1469,6 +1484,8 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 				? `release-${row.item.release_id}`
 				: `gap-${row?.gap.newer_cursor ?? index}`;
 		},
+		// The focused rows are indexed once per timeline update so range recalculation
+		// stays constant-time while the virtualized list is scrolling.
 	});
 	const directoryVirtualizer = useVirtualizer({
 		count: props.items.length,
@@ -2533,7 +2550,9 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 										resetScroll={false}
 										onPointerDown={preserveTimelineScroll}
 										onClick={preserveTimelineScroll}
-										aria-current={active ? "page" : undefined}
+										aria-current={
+											active ? (props.tag ? "page" : "true") : undefined
+										}
 										data-release-directory-id={item.release_id}
 										className={cn(
 											"absolute top-0 left-0 w-full border-l-2 px-4 py-3 transition-colors",
