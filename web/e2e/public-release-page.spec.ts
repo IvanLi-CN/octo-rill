@@ -717,30 +717,6 @@ test("public release typed discrete highlight keeps partial targets and replaces
 	).toContainText("1 / 2");
 	await page.getByTitle("下一条高亮记录").click();
 	await expect(page).toHaveURL(/highlight_active=tag%3Av2.2.0/);
-	const activeRelease = page.getByTestId(
-		"public-release-item-public-release-1",
-	);
-	await activeRelease.evaluate((element) => {
-		element.scrollIntoView({ block: "start", behavior: "auto" });
-	});
-	await page.evaluate(() => {
-		document
-			.querySelector<HTMLButtonElement>('[data-feed-page-lane="original"]')
-			?.click();
-	});
-	await expect
-		.poll(() =>
-			page.evaluate(() => {
-				const element = document.querySelector<HTMLElement>(
-					'[data-testid="public-release-item-public-release-1"]',
-				);
-				const rect = element?.getBoundingClientRect();
-				return Boolean(
-					rect && rect.top >= 0 && rect.bottom <= window.innerHeight,
-				);
-			}),
-		)
-		.toBe(true);
 	await page
 		.getByTestId("public-release-page-lane")
 		.getByRole("button", { name: "翻译" })

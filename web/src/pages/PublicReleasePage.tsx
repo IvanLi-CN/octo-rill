@@ -1110,7 +1110,6 @@ function ReleaseList(props: {
 				: `gap-${row?.gap.newer_cursor ?? index}`;
 		},
 	});
-	const previousLaneRef = useRef(props.selectedLane);
 
 	const virtualItems = virtualizer.getVirtualItems();
 	const visibleReleaseIds = virtualItems
@@ -1173,56 +1172,6 @@ function ReleaseList(props: {
 		virtualizer.scrollToIndex(index, { align: "start", behavior: "auto" });
 		focusedHighlightSignatureRef.current = signature;
 	}, [props.highlight, props.items, rows, virtualizer]);
-
-	useLayoutEffect(() => {
-		// Lane changes invalidate virtual row heights; let measurement settle before restoring the active anchor.
-		if (previousLaneRef.current === props.selectedLane) return;
-		previousLaneRef.current = props.selectedLane;
-		const activeId = props.highlight?.active_release_id;
-		if (!activeId) return;
-		const index = rows.findIndex(
-			(row) => row.kind === "release" && row.item.release_id === activeId,
-		);
-		if (index < 0) return;
-		let attempts = 0;
-		let frame = 0;
-		let timer = 0;
-		const restore = () => {
-			attempts += 1;
-			if (attempts === 1) {
-				virtualizer.measure();
-			}
-			const element = document.querySelector<HTMLElement>(
-				`[data-release-id="${CSS.escape(activeId)}"]`,
-			);
-			if (element) {
-				const rect = element.getBoundingClientRect();
-				window.scrollBy({
-					top: rect.top - 24,
-					behavior: "auto",
-				});
-			} else {
-				virtualizer.scrollToIndex(index, {
-					align: "start",
-					behavior: "auto",
-				});
-			}
-			if (attempts < 4) {
-				frame = window.requestAnimationFrame(restore);
-			}
-		};
-		frame = window.requestAnimationFrame(restore);
-		timer = window.setTimeout(restore, 120);
-		return () => {
-			window.cancelAnimationFrame(frame);
-			window.clearTimeout(timer);
-		};
-	}, [
-		props.highlight?.active_release_id,
-		props.selectedLane,
-		rows,
-		virtualizer,
-	]);
 
 	const replaceActiveInUrl = useCallback((selector: string) => {
 		const url = new URL(window.location.href);
