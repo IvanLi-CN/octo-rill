@@ -1,5 +1,6 @@
 import { Github } from "lucide-react";
 
+import { resolveDemoNativeHref } from "@/demo/registry";
 import { useAppShellChrome } from "@/layout/AppShell";
 import { buildVersionReleaseHref } from "@/version/versionReleaseLink";
 import { useVersionMonitor } from "@/version/versionMonitor";
@@ -54,7 +55,7 @@ export function AppMetaFooter() {
 					{versionReleaseHref ? (
 						<a
 							className="text-muted-foreground hover:text-foreground font-mono underline-offset-4 hover:underline"
-							href={versionReleaseHref}
+							href={resolveDemoNativeHref(versionReleaseHref)}
 						>
 							Version {loadedVersion}
 						</a>

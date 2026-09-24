@@ -51,6 +51,7 @@ import {
 import { ReleaseFeedCard } from "@/feed/FeedItemCard";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
 import { InternalLink } from "@/lib/internalNavigation";
+import { resolveDemoNativeHref } from "@/demo/registry";
 import type {
 	FeedLane,
 	FeedReactionRefreshResponse,
@@ -1274,7 +1275,7 @@ function PublicReleaseFooter(props: { owner: string; repo: string }) {
 				</a>
 				{versionReleaseHref ? (
 					<a
-						href={versionReleaseHref}
+						href={resolveDemoNativeHref(versionReleaseHref)}
 						className="underline-offset-4 hover:text-foreground hover:underline"
 					>
 						Version {loadedVersion}
