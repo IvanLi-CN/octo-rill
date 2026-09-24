@@ -3260,7 +3260,7 @@ test("content processing keeps the last list visible after a refresh timeout", a
 			return route.fallback();
 		}
 		listCalls += 1;
-		if (listCalls <= 2) {
+		if (listCalls === 1) {
 			return json(route, { items: [record], page: 1, page_size: 20, total: 1 });
 		}
 		return json(
@@ -3280,7 +3280,9 @@ test("content processing keeps the last list visible after a refresh timeout", a
 	await expect(
 		recordsTable.getByText("v2.32.0", { exact: true }),
 	).toBeVisible();
+	await expect.poll(() => listCalls).toBe(1);
 	await page.getByRole("button", { name: "刷新记录" }).first().click();
+	await expect.poll(() => listCalls).toBe(2);
 	await expect(
 		page.getByRole("heading", { name: "记录暂时无法读取" }),
 	).toBeVisible();

@@ -212,6 +212,7 @@ export const CurrentWindowOverview: Story = {
 		await expect(args.onOpenRecord).toHaveBeenCalledWith(
 			"release",
 			"release-104",
+			"release-104:2026-09-20T11:15:00.000Z",
 		);
 		await expect(canvas.queryByText("·")).toBeNull();
 	},

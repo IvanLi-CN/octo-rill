@@ -397,7 +397,10 @@ export const GlobalEvidenceOverview: Story = {
 			try {
 				window.sessionStorage.setItem(
 					"octo-rill:ai-records:activity-grid-selection",
-					JSON.stringify({ cellId: "383114065:2026-09-20T11:55:00Z" }),
+					JSON.stringify({
+						cacheKey: "live:content|release",
+						cellId: "383114065:2026-09-20T11:55:00Z",
+					}),
 				);
 			} catch {
 				return <Story />;
@@ -449,9 +452,13 @@ export const GlobalEvidenceOverview: Story = {
 	],
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		await expect(
-			canvas.getByRole("button", { name: /Bun v1\.4\.2/ }),
-		).toHaveAttribute("aria-pressed", "true");
+		const activityCell = await waitFor(() =>
+			canvas.getByRole("button", {
+				name: /Bun v1\.4\.2/,
+				hidden: true,
+			}),
+		);
+		await expect(activityCell).toHaveAttribute("aria-pressed", "true");
 		await expect(
 			within(canvasElement.ownerDocument.body).getByRole("dialog", {
 				name: "记录详情",
