@@ -19,14 +19,8 @@
 
 - REQ-SCHEDULER: 调度器必须把翻译或润色请求、work item、批次和结果扇出保持为独立领域模型，生产者只提交需求而不拥有组批策略；全局工作身份依照[全局翻译与润色工作模型](../global-translation-and-polish/SPEC.md)，Release 润色只能由调度器执行和写入终态缓存。
 - REQ-ATTEMPT-AUDIT: 每次初始执行、自动恢复、手动重试及其状态转换必须在同一事务追加元数据专用的尝试事件；已到期并重新入队时，当前尝试状态必须呈现为 `queued` 而非保留过期的重试安排；事件不得保存源文本、prompt、原始模型响应或原始上游错误。每个尝试必须记录处理阶段、稳定错误代码、安全摘要、重试处置以及精确的模型调用归因链接。
-- REQ-COLLECTION-RECORDS: 管理端必须按 Release、公告、日报分组、分页并以最近 24 小时为默认时间范围展示采集记录；筛选和排序使用各类型来源时间，历史空发现时间仍保留并显示为“未知”；行数据必须包含该类型的基础区分信息、发现时间和翻译或润色任务摘要，并支持在计数和分页前按记录级总尝试次数筛选。
+- REQ-COLLECTION-RECORDS: 管理端必须按 Release、公告、日报分组、分页并以最近 24 小时为默认时间范围展示采集记录；筛选和排序使用各类型来源时间，历史空发现时间仍保留并显示为“未知”；行数据必须包含该类型的基础区分信息、发现时间和翻译或润色任务摘要。任务摘要必须显示包含首次执行的总尝试次数，未开始为 `0` 次，历史证据不足时显示“未知”；记录级总尝试次数筛选必须在计数和分页前执行。
 - REQ-RECORD-DETAIL: 桌面端必须在抽屉展示记录详情与尝试历史，移动端必须导航至详情路由；详情必须暴露处理阶段、模型调用与输出契约的独立结果、错误分类、重试信息和可用下钻链接。诊断载荷过期时必须明确呈现为过期，不得显示为未关联模型调用。
-
-## Verification
-
-- VER-RUST-SCHEDULER: 覆盖: REQ-SCHEDULER, REQ-ATTEMPT-AUDIT。通过 Rust 单元与集成测试验证队列、单一 Release 润色所有者、批次、自动恢复、手动重试、精确调用归因和追加式事件写入。
-- VER-ADMIN-API: 覆盖: REQ-ATTEMPT-AUDIT, REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过管理员 API 测试验证时间筛选、分页、任务摘要、尝试历史、安全错误字段与诊断载荷过期语义。
-- VER-WEB-ADMIN: 覆盖: REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过 Web 构建、Playwright 回归与 Storybook canvas 视觉证据验证分组列表、桌面抽屉、移动详情路由、模型调用与输出契约的双状态，以及尝试列表直接可见的模型、错误和重入队状态。
 - REQ-COLLECTION-READ-PLAN: 采集记录检索窗口最大为三十一天。服务端必须先按各类型的规范来源时间和窗口边界选择唯一来源记录，再以来源时间表达式索引限界候选集，随后只为候选记录聚合处理状态并水合当前页；公告同时间来源使用稳定的唯一 tie-break。不得为了当前页或精确匹配总数扫描无界的处理工作集合。
 - REQ-COLLECTION-READ-CONSISTENCY: 精确匹配总数、当前页源记录和处理摘要必须来自同一个短只读 SQLite 快照。该快照不得持有 SQLite writer permit，也不得改变既有页码分页或响应形状。
 - REQ-COLLECTION-READ-AVAILABILITY: 相同采集记录查询键的并发读取必须合并为一次执行；新筛选请求必须使旧筛选读取失效。列表与活动图读取必须隔离，正常管理端操作不得因应用内读取并发返回 `admin_collection_records_busy`。共享读取任务 panic 时必须发布完整错误并释放查询键，使后续同键读取可重试。
@@ -35,6 +29,9 @@
 
 ## Verification
 
+- VER-RUST-SCHEDULER: 覆盖: REQ-SCHEDULER, REQ-ATTEMPT-AUDIT。通过 Rust 单元与集成测试验证队列、单一 Release 润色所有者、批次、自动恢复、手动重试、精确调用归因和追加式事件写入。
+- VER-ADMIN-API: 覆盖: REQ-ATTEMPT-AUDIT, REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过管理员 API 测试验证时间筛选、分页、任务摘要、尝试历史、安全错误字段与诊断载荷过期语义。
+- VER-WEB-ADMIN: 覆盖: REQ-COLLECTION-RECORDS, REQ-RECORD-DETAIL。通过 Web 构建、Playwright 回归与 Storybook canvas 视觉证据验证分组列表、桌面抽屉、移动详情路由、模型调用与输出契约的双状态，以及尝试列表直接可见的模型、错误和重入队状态。
 - VER-COLLECTION-READ-PLAN: 覆盖: REQ-COLLECTION-READ-PLAN, REQ-COLLECTION-READ-CONSISTENCY。通过生产结构的合成 fixture 与 `EXPLAIN QUERY PLAN` 验证时间谓词和排序命中同一表达式索引、处理状态只针对已限界候选集聚合，且精确匹配总数与当前页来自同一读取快照。
 - VER-COLLECTION-READ-AVAILABILITY: 覆盖: REQ-COLLECTION-READ-AVAILABILITY, REQ-COLLECTION-READ-FAILURE。通过 Rust 集成测试、Storybook 交互和管理员 Playwright 回归验证同键读取合并与重试、新筛选请求不被旧响应覆盖或显示旧行、列表与活动图可独立完成，以及同键失败刷新保留最后成功列表且不自动重试。
 - VER-COLLECTION-READ-PERFORMANCE: 覆盖: REQ-COLLECTION-READ-PLAN, REQ-COLLECTION-READ-AVAILABILITY。通过生产结构的合成 fixture 和有代表性的后台写压力测量 `24h`、`7d`、`30d` 读取；每种窗口的 `p95` 必须不超过一秒，`p99` 必须不超过两秒。
@@ -125,7 +122,7 @@
 
 - Given 管理员打开“内容处理”
   When 选择 Release、公告或日报并保留默认时间范围
-  Then 分页列表按 Release 来源时间 `COALESCE(published_at, created_at, updated_at)`、公告聚合 `occurred_at` 或日报 `created_at` 显示最近 24 小时内的该类采集记录；即使 `detected_at` 为空也不得遗漏，并将其显示为“未知”；每行展示该类型需要区分记录的基础信息、发现时间，以及翻译或润色的重试次数、开始、上次尝试和完成时间。
+  Then 分页列表按 Release 来源时间 `COALESCE(published_at, created_at, updated_at)`、公告聚合 `occurred_at` 或日报 `created_at` 显示最近 24 小时内的该类采集记录；即使 `detected_at` 为空也不得遗漏，并将其显示为“未知”；每行展示该类型需要区分记录的基础信息、发现时间，以及翻译或润色的总尝试次数、开始、上次尝试和完成时间。总尝试次数包含首次执行，尚未开始为 `0` 次；历史证据无法确定次数或时间时显示“未知”。
 
 - Given 管理员设置总尝试次数范围
   When 范围为 `0..10` 的闭区间或省略上限

@@ -927,7 +927,7 @@ function demoCollectionRecords() {
 		status: "ready",
 		display_status: "succeeded",
 		status_origin: "task",
-		retry_count: 0,
+		attempt_count: 1,
 		started_at: "2026-07-08T09:11:00+08:00",
 		last_attempt_at: "2026-07-08T09:11:05+08:00",
 		finished_at: "2026-07-08T09:11:05+08:00",
@@ -936,25 +936,25 @@ function demoCollectionRecords() {
 		status: "ready",
 		display_status: "succeeded",
 		status_origin: "task",
-		retry_count: 1,
+		attempt_count: 2,
 		started_at: "2026-07-08T09:23:01+08:00",
 		last_attempt_at: "2026-07-08T09:25:08+08:00",
 		finished_at: "2026-07-08T09:25:08+08:00",
 	};
-	const pending = {
-		status: "running",
-		display_status: "running",
+	const queued = {
+		status: "queued",
+		display_status: "queued",
 		status_origin: "task",
-		retry_count: 0,
-		started_at: "2026-07-08T10:02:00+08:00",
-		last_attempt_at: "2026-07-08T10:02:00+08:00",
+		attempt_count: 0,
+		started_at: null,
+		last_attempt_at: null,
 		finished_at: null,
 	};
 	const notRecorded = {
 		status: "not_recorded",
 		display_status: "historical_unknown",
 		status_origin: "historical_unknown",
-		retry_count: 0,
+		attempt_count: 0,
 		started_at: null,
 		last_attempt_at: null,
 		finished_at: null,
@@ -994,7 +994,7 @@ function demoCollectionRecords() {
 				detected_at: "2026-07-08T08:44:00+08:00",
 				generated_at: null,
 				translation: completed,
-				polish: pending,
+				polish: queued,
 			},
 		],
 		notification: [
@@ -1007,7 +1007,7 @@ function demoCollectionRecords() {
 				detected_at: "2026-07-08T08:21:00+08:00",
 				generated_at: null,
 				translation: completed,
-				polish: pending,
+				polish: queued,
 			},
 		],
 		brief: [
@@ -1311,7 +1311,7 @@ function demoLlmData(dataCase: DemoAdminJobsDataCase) {
 }
 function demoSummaryAttemptCount(summary: AdminCollectionTaskSummary | null) {
 	if (!summary || summary.status === "not_recorded") return 0;
-	return Math.max(1, summary.retry_count + 1);
+	return summary.attempt_count;
 }
 
 function demoRecordAttemptCount(item: AdminCollectionRecordItem) {
@@ -1374,43 +1374,77 @@ function demoCollectionDetail(
 			: {};
 	const translationStatus = attemptStatus(record.translation);
 	const polishStatus = attemptStatus(record.polish);
+	const translationCount = demoSummaryAttemptCount(record.translation);
+	const polishCount = demoSummaryAttemptCount(record.polish);
 	const attempts: AdminCollectionAttempt[] =
 		kind === "brief"
-			? [
-					{
-						id: `${id}:1`,
-						pipeline: "polish",
-						attempt_no: 1,
-						trigger: "daily_brief_generation",
-						status: polishStatus,
-						...common,
-						...attemptError(record.polish),
-					},
-				]
+			? polishCount > 0
+				? [
+						{
+							id: `${id}:1`,
+							pipeline: "polish",
+							attempt_no: 1,
+							trigger: "daily_brief_generation",
+							status: polishStatus,
+							...common,
+							...attemptError(record.polish),
+						},
+					]
+				: []
 			: [
-					{
-						id: `${id}:translation:1`,
-						pipeline: "translation",
-						attempt_no: 1,
-						trigger: "initial",
-						status: translationStatus,
-						...common,
-						...attemptError(record.translation),
-					},
-					{
-						id: `${id}:polish:2`,
-						pipeline: "polish",
-						attempt_no: 2,
-						trigger: "automatic_recovery",
-						status: polishStatus,
-						...common,
-						...attemptError(record.polish),
-						last_attempt_at: "2026-07-08T09:25:08+08:00",
-						finished_at: "2026-07-08T09:25:08+08:00",
-						error_code: "release_smart_body_summary_json_decode_failed",
-						error_summary: "Release smart 正文摘要 JSON 解码失败后已自动恢复",
-						failure_class: "transient",
-					},
+					...(translationCount > 0
+						? [
+								{
+									id: `${id}:translation:1`,
+									pipeline: "translation" as const,
+									attempt_no: 1,
+									trigger: "initial",
+									status: translationStatus,
+									...common,
+									...attemptError(record.translation),
+								},
+							]
+						: []),
+					...(polishCount > 1
+						? [
+								{
+									id: `${id}:polish:1`,
+									pipeline: "polish" as const,
+									attempt_no: 1,
+									trigger: "initial",
+									status: "failed",
+									...common,
+									started_at: record.polish.started_at,
+									last_attempt_at:
+										record.polish.started_at ?? common.last_attempt_at,
+									finished_at: record.polish.started_at,
+									retry_eligible: true,
+									error_code: "release_smart_body_summary_json_decode_failed",
+									error_summary: "Release smart 正文摘要 JSON 解码失败",
+									failure_class: "transient",
+								},
+							]
+						: []),
+					...(polishCount > 0
+						? [
+								{
+									id: `${id}:polish:${polishCount}`,
+									pipeline: "polish" as const,
+									attempt_no: polishCount,
+									trigger: polishCount > 1 ? "automatic_recovery" : "initial",
+									status: polishStatus,
+									...common,
+									started_at:
+										polishCount > 1
+											? record.polish.last_attempt_at
+											: record.polish.started_at,
+									last_attempt_at:
+										record.polish.last_attempt_at ?? common.last_attempt_at,
+									finished_at: record.polish.finished_at,
+									...attemptError(record.polish),
+								},
+							]
+						: []),
 				];
 	return { record, attempts };
 }

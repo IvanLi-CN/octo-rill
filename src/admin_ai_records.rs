@@ -77,7 +77,7 @@ pub struct AdminCollectionTaskSummary {
     pub status: String,
     pub display_status: String,
     pub status_origin: String,
-    pub retry_count: i64,
+    pub attempt_count: i64,
     pub started_at: Option<String>,
     pub last_attempt_at: Option<String>,
     pub finished_at: Option<String>,
@@ -829,12 +829,13 @@ fn global_summary(row: &GlobalTaskRow) -> AdminCollectionTaskSummary {
         status: row.status.clone(),
         display_status: display_status_for(&row.status, "global_work"),
         status_origin: "global_work".to_owned(),
-        retry_count: row.attempt_count.saturating_sub(1),
+        attempt_count: row.attempt_count.max(0),
         started_at: row.started_at.clone(),
-        last_attempt_at: row
-            .last_attempt_at
-            .clone()
-            .or_else(|| Some(row.updated_at.clone())),
+        last_attempt_at: (row.attempt_count > 0).then(|| {
+            row.last_attempt_at
+                .clone()
+                .unwrap_or_else(|| row.updated_at.clone())
+        }),
         finished_at: row.finished_at.clone(),
         global_work: Some(AdminContentProcessingEvidence {
             status: row.status.clone(),
@@ -1004,14 +1005,15 @@ fn merge_summary(rows: &[TaskRow], status_origin: &str) -> AdminCollectionTaskSu
         display_status: display_status_for(&status, "task"),
         status,
         status_origin: "task".to_owned(),
-        retry_count: rows
+        attempt_count: rows
             .iter()
-            .map(|row| row.attempt_count.saturating_sub(1))
+            .map(|row| row.attempt_count.max(0))
             .max()
             .unwrap_or(0),
         started_at: rows.iter().filter_map(|row| row.started_at.clone()).min(),
         last_attempt_at: rows
             .iter()
+            .filter(|row| row.attempt_count > 0)
             .filter_map(|row| row.last_attempt_at.clone())
             .max(),
         finished_at: rows.iter().filter_map(|row| row.finished_at.clone()).max(),
@@ -1207,16 +1209,20 @@ async fn load_brief_summaries_in_connection(
                     status: call.status.clone(),
                     display_status: display_status_for(&call.status, "task"),
                     status_origin: "task".to_owned(),
-                    retry_count: calls
+                    attempt_count: calls
                         .iter()
-                        .map(|call| call.attempt_count.saturating_sub(1))
+                        .map(|call| call.attempt_count.max(0))
                         .max()
                         .unwrap_or(0),
                     started_at: calls
                         .iter()
                         .filter_map(|call| call.started_at.clone())
                         .min(),
-                    last_attempt_at: calls.iter().map(|call| call.updated_at.clone()).max(),
+                    last_attempt_at: calls
+                        .iter()
+                        .filter(|call| call.attempt_count > 0)
+                        .map(|call| call.updated_at.clone())
+                        .max(),
                     finished_at: calls
                         .iter()
                         .filter_map(|call| call.finished_at.clone())
@@ -3096,6 +3102,50 @@ pub async fn admin_get_collection_record_detail(
 mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[test]
+    fn task_summaries_report_total_attempts_from_zero() {
+        let mut global = GlobalTaskRow {
+            pipeline: "polishing".to_owned(),
+            source_hash: "source".to_owned(),
+            status: "queued".to_owned(),
+            attempt_count: 0,
+            started_at: None,
+            finished_at: None,
+            updated_at: "2026-09-24T21:04:00Z".to_owned(),
+            last_attempt_at: None,
+            canonical_resource_id: "release-1".to_owned(),
+            projection_work_item_id: None,
+            projection_source_hash: None,
+            projection_updated_at: None,
+        };
+        let queued = global_summary(&global);
+        assert_eq!(queued.attempt_count, 0);
+        assert_eq!(queued.last_attempt_at, None);
+        let serialized = serde_json::to_value(&queued).expect("serialize summary");
+        assert_eq!(serialized["attempt_count"], 0);
+        assert!(serialized.get("retry_count").is_none());
+
+        global.status = "ready".to_owned();
+        global.attempt_count = 1;
+        global.last_attempt_at = Some("2026-09-24T21:05:00Z".to_owned());
+        let completed = global_summary(&global);
+        assert_eq!(completed.attempt_count, 1);
+        assert_eq!(completed.last_attempt_at, global.last_attempt_at);
+
+        let legacy = TaskRow {
+            id: "legacy-work".to_owned(),
+            kind: "release_smart".to_owned(),
+            status: "completed".to_owned(),
+            result_status: Some("ready".to_owned()),
+            attempt_count: 2,
+            started_at: Some("2026-09-24T21:04:00Z".to_owned()),
+            finished_at: Some("2026-09-24T21:06:00Z".to_owned()),
+            updated_at: "2026-09-24T21:06:00Z".to_owned(),
+            last_attempt_at: Some("2026-09-24T21:06:00Z".to_owned()),
+        };
+        assert_eq!(merge_summary(&[legacy], "task").attempt_count, 2);
+    }
 
     async fn test_pool() -> SqlitePool {
         SqlitePoolOptions::new()

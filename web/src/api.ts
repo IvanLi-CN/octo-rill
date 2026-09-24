@@ -2335,7 +2335,7 @@ export type AdminCollectionTaskSummary = {
 	status: string;
 	display_status: string;
 	status_origin: string;
-	retry_count: number;
+	attempt_count: number;
 	started_at: string | null;
 	last_attempt_at: string | null;
 	finished_at: string | null;
