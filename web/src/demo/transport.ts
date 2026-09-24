@@ -1174,6 +1174,7 @@ function demoLlmData(dataCase: DemoAdminJobsDataCase) {
 	const calls = Array.from({ length: 36 }, (_, index) => {
 		const template = templates[index % templates.length];
 		const model = models[index % models.length];
+		const failed = index % 7 === 0;
 		const createdAt = new Date(
 			Date.parse("2026-07-08T00:10:00+08:00") + index * 18 * 60_000,
 		).toISOString();
@@ -1181,7 +1182,11 @@ function demoLlmData(dataCase: DemoAdminJobsDataCase) {
 			...template,
 			id: `demo-many-call-${String(index + 1).padStart(3, "0")}`,
 			model,
-			status: index % 7 === 0 ? "failed" : "succeeded",
+			status: failed ? "failed" : "succeeded",
+			output_tokens: failed ? null : template.output_tokens,
+			total_tokens: failed ? null : template.total_tokens,
+			finish_reason: failed ? "error" : template.finish_reason,
+			duration_ms: failed ? null : template.duration_ms,
 			created_at: createdAt,
 			started_at: createdAt,
 			finished_at: new Date(Date.parse(createdAt) + 4_000).toISOString(),
@@ -1209,6 +1214,10 @@ function demoLlmData(dataCase: DemoAdminJobsDataCase) {
 					response_text: failed
 						? null
 						: (template?.response_text ?? `Demo response for ${call.id}`),
+					output_messages_json: failed
+						? null
+						: (template?.output_messages_json ??
+							JSON.stringify({ content: `Demo response for ${call.id}` })),
 					attempt_history: [
 						{
 							event_type: failed ? "failed" : "succeeded",
