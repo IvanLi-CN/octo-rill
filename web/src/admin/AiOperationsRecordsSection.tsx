@@ -672,6 +672,15 @@ function summaryTime(
 	);
 }
 
+function lastAttemptTime(summary: AdminCollectionTaskSummary) {
+	return formatDateTime(
+		summary.last_attempt_at,
+		hasUnknownAttemptHistory(summary) || summary.attempt_count > 0
+			? "未知"
+			: "未尝试",
+	);
+}
+
 function RecordStatus({ status }: { status: string }) {
 	return (
 		<Badge className={statusTone(status)} variant="outline">
@@ -724,7 +733,7 @@ function TaskSummaryCell({ summary }: { summary: AdminCollectionTaskSummary }) {
 				</div>
 				<div className="grid grid-cols-3 gap-2 text-xs tabular-nums">
 					<span>{summaryTime(summary, summary.started_at, "未开始")}</span>
-					<span>{summaryTime(summary, summary.last_attempt_at, "未尝试")}</span>
+					<span>{lastAttemptTime(summary)}</span>
 					<span>{summaryTime(summary, summary.finished_at, "未完成")}</span>
 				</div>
 				<EvidenceLines summary={summary} />
@@ -936,8 +945,7 @@ function CompactTask({
 				<RecordStatus status={normalizedDisplayStatus(summary)} />
 			</div>
 			<p className="text-muted-foreground mt-2 text-xs">
-				尝试 {attemptCountLabel(summary)} · 上次{" "}
-				{summaryTime(summary, summary.last_attempt_at, "未尝试")}
+				尝试 {attemptCountLabel(summary)} · 上次 {lastAttemptTime(summary)}
 			</p>
 			<EvidenceLines summary={summary} />
 		</div>
@@ -1018,9 +1026,7 @@ function ProcessingSummary({
 			<div className="text-muted-foreground grid grid-cols-2 gap-x-3 gap-y-2 text-xs">
 				<span>尝试 {attemptCountLabel(summary)}</span>
 				<span>开始 {summaryTime(summary, summary.started_at, "未开始")}</span>
-				<span>
-					上次尝试 {summaryTime(summary, summary.last_attempt_at, "未尝试")}
-				</span>
+				<span>上次尝试 {lastAttemptTime(summary)}</span>
 				<span>完成 {summaryTime(summary, summary.finished_at, "未完成")}</span>
 			</div>
 			<EvidenceLines summary={summary} />
@@ -1046,7 +1052,7 @@ function AttemptDetail({
 			</div>
 			<div className="text-muted-foreground grid gap-2 border-y py-3 text-sm sm:grid-cols-2">
 				<p>触发：{attempt.trigger}</p>
-				<p>上次尝试：{formatDateTime(attempt.last_attempt_at)}</p>
+				<p>上次尝试：{formatDateTime(attempt.last_attempt_at, "未知")}</p>
 				<p>开始：{formatDateTime(attempt.started_at, "未开始")}</p>
 				<p>完成：{formatDateTime(attempt.finished_at, "未完成")}</p>
 				{attempt.next_retry_at ? (
@@ -1174,7 +1180,7 @@ function RecordDetail({
 										</span>
 										<span className="text-muted-foreground mt-1 block text-xs">
 											{attempt.trigger} ·{" "}
-											{formatDateTime(attempt.last_attempt_at)}
+											{formatDateTime(attempt.last_attempt_at, "未知")}
 										</span>
 										{error ? (
 											<span className="text-destructive mt-1 line-clamp-2 block text-xs">

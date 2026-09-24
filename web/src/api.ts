@@ -2419,7 +2419,7 @@ export type AdminCollectionAttempt = {
 	trigger: string;
 	status: string;
 	started_at: string | null;
-	last_attempt_at: string;
+	last_attempt_at: string | null;
 	finished_at: string | null;
 	error_code: string | null;
 	error_summary: string | null;

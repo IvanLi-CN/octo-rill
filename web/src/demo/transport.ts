@@ -1314,6 +1314,18 @@ function demoSummaryAttemptCount(summary: AdminCollectionTaskSummary | null) {
 	return summary.attempt_count;
 }
 
+function demoAttemptCountKnown(item: AdminCollectionRecordItem) {
+	const summaries =
+		item.kind === "brief" ? [item.polish] : [item.translation, item.polish];
+	return summaries.every(
+		(summary) =>
+			summary !== null &&
+			!["historical_unknown", "legacy_evidence", "legacy_conflict"].includes(
+				summary.status_origin,
+			),
+	);
+}
+
 function demoRecordAttemptCount(item: AdminCollectionRecordItem) {
 	if (item.kind === "brief") return demoSummaryAttemptCount(item.polish);
 	return Math.max(
@@ -3370,6 +3382,7 @@ export const demoHandlers = [
 				.filter(Boolean);
 		const translationStatuses = parseStatuses("translation_status");
 		const polishStatuses = parseStatuses("polish_status");
+		const attemptCountFiltered = attemptMin > 0 || attemptMax !== null;
 		if (!Number.isInteger(attemptMin) || attemptMin < 0 || attemptMin > 10) {
 			return badRequest("attempt_min must be between 0 and 10");
 		}
@@ -3399,6 +3412,7 @@ export const demoHandlers = [
 					(Number.isFinite(value) && value >= new Date(from).getTime())) &&
 				(!before ||
 					(Number.isFinite(value) && value < new Date(before).getTime())) &&
+				(!attemptCountFiltered || demoAttemptCountKnown(item)) &&
 				attemptCount >= attemptMin &&
 				(attemptMax === null || attemptCount <= attemptMax) &&
 				(kind === "brief" ||
