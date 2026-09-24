@@ -171,6 +171,36 @@ async function expectNoHorizontalOverflow(page: Page) {
 	expect(overflow).toBeLessThanOrEqual(1);
 }
 
+async function isDirectoryItemVisible(page: Page, releaseId: string) {
+	return page.evaluate((id) => {
+		const scroll = document.querySelector<HTMLElement>(
+			"[data-testid='public-release-directory-scroll']",
+		);
+		const target = scroll?.querySelector<HTMLElement>(
+			`[data-release-directory-id="${CSS.escape(id)}"]`,
+		);
+		if (!scroll || !target) return false;
+		const viewport = scroll.getBoundingClientRect();
+		const rect = target.getBoundingClientRect();
+		return rect.top >= viewport.top && rect.bottom <= viewport.bottom + 1;
+	}, releaseId);
+}
+
+async function isDetailItemFullyVisible(page: Page, releaseId: string) {
+	return page.evaluate((id) => {
+		const scroll = document.querySelector<HTMLElement>(
+			"[data-testid='public-release-detail-scroll']",
+		);
+		const target = scroll?.querySelector<HTMLElement>(
+			`[data-release-id="${CSS.escape(id)}"]`,
+		);
+		if (!scroll || !target) return false;
+		const viewport = scroll.getBoundingClientRect();
+		const rect = target.getBoundingClientRect();
+		return rect.top >= viewport.top && rect.bottom <= viewport.bottom + 1;
+	}, releaseId);
+}
+
 test("public release pending page hides backend retry details", async ({
 	page,
 }) => {
@@ -379,6 +409,843 @@ test("public release header keeps the title and global lane selector responsive"
 		(mobileTitle?.y ?? 0) + (mobileTitle?.height ?? 0),
 	);
 	await expectNoHorizontalOverflow(page);
+});
+
+test("public release directory navigation stays inside the SPA", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 1000 });
+	const documentRequests: string[] = [];
+	page.on("request", (request) => {
+		if (request.resourceType() === "document") {
+			documentRequests.push(request.url());
+		}
+	});
+	const items = Array.from({ length: 6 }, (_, index) => releaseItem(index));
+	await installBaseApiMocks(page, (route) =>
+		json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items,
+		}),
+	);
+
+	await page.goto("/octo-rill/example/releases");
+	await expect(page.getByTestId("public-release-directory")).toBeVisible();
+	await expect(page.getByTestId("public-release-reader")).toBeVisible();
+	await page
+		.getByTestId("public-release-directory")
+		.getByRole("link", { name: /v2\.6\.0/ })
+		.click();
+	await expect(page).toHaveURL(
+		/\/public\/octo-rill\/example\/releases\/tag\/v2\.6\.0$/,
+	);
+	await expect(page.getByTestId("public-release-reader")).toBeVisible();
+	expect(documentRequests).toHaveLength(1);
+});
+
+test("public release tag directory fills the viewport past the first page", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 1000 });
+	const items = Array.from({ length: 8 }, (_, index) => releaseItem(index));
+	const seenQueries: URL[] = [];
+	await installBaseApiMocks(page, (route, url) => {
+		seenQueries.push(url);
+		const cursor = url.searchParams.get("cursor");
+		return json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: cursor ? null : "next|6",
+			items: cursor ? items.slice(6) : items.slice(0, 6),
+		});
+	});
+
+	await page.goto("/octo-rill/example/releases/tag/v2.7.0");
+	await expect(
+		page
+			.getByTestId("public-release-directory")
+			.getByRole("link", { name: /v2\.0\.0/ }),
+	).toBeVisible();
+	await expect.poll(() => seenQueries.length).toBeGreaterThanOrEqual(2);
+	expect(seenQueries[0]?.searchParams.get("focus")).toBe("tag:v2.7.0");
+	expect(seenQueries[1]?.searchParams.get("cursor")).toBe("next|6");
+	expect(seenQueries[1]?.searchParams.has("focus")).toBe(false);
+});
+
+test("public release visible selection does not reposition either list", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 1000 });
+	const items = Array.from({ length: 8 }, (_, index) => releaseItem(index));
+	await installBaseApiMocks(page, (route) =>
+		json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items,
+		}),
+	);
+
+	await page.goto("/octo-rill/example/releases/tag/v2.7.0");
+	const directoryScroll = page.getByTestId("public-release-directory-scroll");
+	const detailScroll = page.getByTestId("public-release-detail-scroll");
+	await expect(directoryScroll).toBeVisible();
+	await expect(
+		page
+			.getByTestId("public-release-directory")
+			.getByRole("link", { name: /v2\.7\.0/ }),
+	).toBeVisible();
+	const before = await page.evaluate(() => ({
+		directory: document.querySelector<HTMLElement>(
+			"[data-testid='public-release-directory-scroll']",
+		)?.scrollTop,
+		detail: document.querySelector<HTMLElement>(
+			"[data-testid='public-release-detail-scroll']",
+		)?.scrollTop,
+	}));
+	await page
+		.getByTestId("public-release-directory")
+		.getByRole("link", { name: /v2\.6\.0/ })
+		.click();
+	await expect(page).toHaveURL(/\/releases\/tag\/v2\.6\.0$/);
+	await page.waitForTimeout(250);
+	const after = await page.evaluate(() => ({
+		directory: document.querySelector<HTMLElement>(
+			"[data-testid='public-release-directory-scroll']",
+		)?.scrollTop,
+		detail: document.querySelector<HTMLElement>(
+			"[data-testid='public-release-detail-scroll']",
+		)?.scrollTop,
+	}));
+	expect(after).toEqual(before);
+	await expect(directoryScroll).toHaveCSS("scroll-behavior", "smooth");
+	await expect(detailScroll).toHaveCSS("scroll-behavior", "smooth");
+});
+
+test("clicking a visible directory target does not jiggle the detail timeline", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 720 });
+	const items = Array.from({ length: 8 }, (_, index) =>
+		releaseItem(index, {
+			tag_name: `v2.${7 - index}.0`,
+			previous_tag_name: `v2.${6 - index}.0`,
+			name: `v2.${7 - index}.0 public release endpoints`,
+		}),
+	);
+	await installBaseApiMocks(page, (route) =>
+		json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items,
+		}),
+	);
+
+	await page.goto("/octo-rill/example/releases/tag/v2.7.0");
+	const directory = page.getByTestId("public-release-directory");
+	const detailScroll = page.getByTestId("public-release-detail-scroll");
+	await expect(directory).toBeVisible();
+	await expect(detailScroll).toBeVisible();
+	const target = directory.getByRole("link", { name: /v2\.6\.0/ });
+	await expect(target).toBeVisible();
+	await page.waitForTimeout(900);
+	const before = await page.evaluate(() => {
+		const detail = document.querySelector<HTMLElement>(
+			"[data-testid='public-release-detail-scroll']",
+		);
+		const card = document.querySelector<HTMLElement>(
+			"[data-release-id='public-release-1']",
+		);
+		if (!detail || !card) return null;
+		const view = detail.getBoundingClientRect();
+		const rect = card.getBoundingClientRect();
+		return {
+			scrollTop: detail.scrollTop,
+			fullyVisible: rect.top >= view.top && rect.bottom <= view.bottom + 1,
+		};
+	});
+	expect(before?.fullyVisible).toBe(true);
+	await page.evaluate(() => {
+		const detail = document.querySelector<HTMLElement>(
+			"[data-testid='public-release-detail-scroll']",
+		);
+		if (!detail) throw new Error("detail scroll missing");
+		const samples: number[] = [];
+		(
+			window as unknown as { __publicReleaseScrollSamples?: number[] }
+		).__publicReleaseScrollSamples = samples;
+		detail.addEventListener("scroll", () => samples.push(detail.scrollTop), {
+			passive: true,
+		});
+	});
+	await target.click();
+	await expect(page).toHaveURL(/\/releases\/tag\/v2\.6\.0$/);
+	await page.waitForTimeout(1_000);
+	const after = await page.evaluate(() => {
+		const detail = document.querySelector<HTMLElement>(
+			"[data-testid='public-release-detail-scroll']",
+		);
+		const samples =
+			(window as unknown as { __publicReleaseScrollSamples?: number[] })
+				.__publicReleaseScrollSamples ?? [];
+		const changes = samples.filter(
+			(value, index) => index === 0 || value !== samples[index - 1],
+		);
+		return { scrollTop: detail?.scrollTop ?? null, changes };
+	});
+	expect(after.scrollTop).toBe(before?.scrollTop ?? null);
+	expect(after.changes).toEqual([]);
+});
+
+test("public release tag focus keeps its URL during automatic pagination", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 720 });
+	const items = Array.from({ length: 18 }, (_, index) =>
+		releaseItem(index, {
+			tag_name: `v2.${31 - index}.0`,
+			previous_tag_name: `v2.${30 - index}.0`,
+			name: `v2.${31 - index}.0 public release endpoints`,
+		}),
+	);
+	await installBaseApiMocks(page, (route) =>
+		json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items,
+		}),
+	);
+
+	await page.goto("/octo-rill/example/releases/tag/v2.21.0");
+	await expect(
+		page.getByTestId("public-release-item-public-release-10"),
+	).toBeVisible();
+	await page.waitForTimeout(1_200);
+	await expect(page).toHaveURL(/\/releases\/tag\/v2\.21\.0$/);
+	await expect
+		.poll(async () =>
+			page.evaluate(() => {
+				const scroll = document.querySelector<HTMLElement>(
+					"[data-testid='public-release-detail-scroll']",
+				);
+				const card = document.querySelector<HTMLElement>(
+					"[data-release-id='public-release-10']",
+				);
+				if (!scroll || !card) return false;
+				const view = scroll.getBoundingClientRect();
+				const rect = card.getBoundingClientRect();
+				return rect.top >= view.top && rect.bottom <= view.bottom + 1;
+			}),
+		)
+		.toBe(true);
+});
+
+test("public release focuses an offscreen tag in both virtual lists", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 720 });
+	const items = Array.from({ length: 30 }, (_, index) =>
+		releaseItem(index, {
+			tag_name: `v2.${31 - index}.0`,
+			previous_tag_name: `v2.${30 - index}.0`,
+			name: `v2.${31 - index}.0 public release endpoints`,
+		}),
+	);
+	await installBaseApiMocks(page, (route) =>
+		json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items,
+		}),
+	);
+
+	await page.goto("/octo-rill/example/releases/tag/v2.20.0");
+	const directoryTarget = page.locator(
+		"[data-release-directory-id='public-release-11']",
+	);
+	const detailTarget = page.getByTestId(
+		"public-release-item-public-release-11",
+	);
+	await expect(directoryTarget).toBeVisible({ timeout: 5_000 });
+	await expect(detailTarget).toBeVisible({ timeout: 5_000 });
+	await expect
+		.poll(async () =>
+			page.evaluate(() => {
+				const directory = document.querySelector<HTMLElement>(
+					"[data-testid='public-release-directory-scroll']",
+				);
+				const detail = document.querySelector<HTMLElement>(
+					"[data-testid='public-release-detail-scroll']",
+				);
+				const directoryItem = document.querySelector<HTMLElement>(
+					"[data-release-directory-id='public-release-11']",
+				);
+				const detailItem = document.querySelector<HTMLElement>(
+					"[data-release-id='public-release-11']",
+				);
+				if (!directory || !detail || !directoryItem || !detailItem)
+					return false;
+				const directoryView = directory.getBoundingClientRect();
+				const directoryRect = directoryItem.getBoundingClientRect();
+				const detailView = detail.getBoundingClientRect();
+				const detailRect = detailItem.getBoundingClientRect();
+				return (
+					directoryRect.top >= directoryView.top &&
+					directoryRect.bottom <= directoryView.bottom + 1 &&
+					detailRect.top >= detailView.top &&
+					detailRect.bottom <= detailView.bottom + 1
+				);
+			}),
+		)
+		.toBe(true);
+});
+
+test("public release detail focus leaves roughly three lines before an offscreen card", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 720 });
+	const items = Array.from({ length: 30 }, (_, index) =>
+		releaseItem(index, {
+			tag_name: `v2.${31 - index}.0`,
+			previous_tag_name: `v2.${30 - index}.0`,
+			name: `v2.${31 - index}.0 public release endpoints`,
+		}),
+	);
+	await installBaseApiMocks(page, (route) =>
+		json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items,
+		}),
+	);
+
+	await page.goto("/octo-rill/example/releases/tag/v2.27.0");
+	await expect
+		.poll(async () =>
+			page.evaluate(() => {
+				const scroll = document.querySelector<HTMLElement>(
+					"[data-testid='public-release-detail-scroll']",
+				);
+				const target = document.querySelector<HTMLElement>(
+					"[data-release-id='public-release-4']",
+				);
+				if (!scroll || !target) return false;
+				const view = scroll.getBoundingClientRect();
+				const rect = target.getBoundingClientRect();
+				const lineHeight = Number.parseFloat(
+					window.getComputedStyle(target).lineHeight,
+				);
+				const resolvedLineHeight = Number.isFinite(lineHeight)
+					? lineHeight
+					: 24;
+				return (
+					rect.top >= view.top &&
+					rect.bottom <= view.bottom + 1 &&
+					Math.abs(rect.top - view.top - resolvedLineHeight * 3) <= 12
+				);
+			}),
+		)
+		.toBe(true);
+	const metrics = await page.evaluate(() => {
+		const scroll = document.querySelector<HTMLElement>(
+			"[data-testid='public-release-detail-scroll']",
+		);
+		const target = document.querySelector<HTMLElement>(
+			"[data-release-id='public-release-4']",
+		);
+		if (!scroll || !target) return null;
+		const view = scroll.getBoundingClientRect();
+		const rect = target.getBoundingClientRect();
+		const lineHeight = Number.parseFloat(
+			window.getComputedStyle(target).lineHeight,
+		);
+		return {
+			topOffset: rect.top - view.top,
+			lineHeight: Number.isFinite(lineHeight) ? lineHeight : 24,
+		};
+	});
+	expect(metrics).not.toBeNull();
+	expect(
+		Math.abs(metrics!.topOffset - metrics!.lineHeight * 3),
+	).toBeLessThanOrEqual(12);
+});
+
+test("public release natural tag selection replaces the URL without adding history", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 720 });
+	const items = Array.from({ length: 30 }, (_, index) =>
+		releaseItem(index, {
+			tag_name: `v2.${31 - index}.0`,
+			previous_tag_name: `v2.${30 - index}.0`,
+			name: `v2.${31 - index}.0 public release endpoints`,
+		}),
+	);
+	await installBaseApiMocks(page, (route) =>
+		json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items,
+		}),
+	);
+
+	await page.goto("/octo-rill/example/releases/tag/v2.31.0");
+	const historyBefore = await page.evaluate(() => window.history.length);
+	const detailScroll = page.getByTestId("public-release-detail-scroll");
+	await detailScroll.evaluate((element) => {
+		element.dispatchEvent(
+			new WheelEvent("wheel", { bubbles: true, deltaY: 700 }),
+		);
+		element.scrollTop = 700;
+		element.dispatchEvent(new Event("scroll", { bubbles: true }));
+	});
+	await expect
+		.poll(() => new URL(page.url()).pathname)
+		.not.toBe("/octo-rill/example/releases/tag/v2.31.0");
+	expect(await page.evaluate(() => window.history.length)).toBe(historyBefore);
+});
+
+test("public release focus pulse is disabled for reduced motion", async ({
+	page,
+}) => {
+	await page.emulateMedia({ reducedMotion: "reduce" });
+	await page.setViewportSize({ width: 1440, height: 720 });
+	const items = Array.from({ length: 30 }, (_, index) =>
+		releaseItem(index, {
+			tag_name: `v2.${31 - index}.0`,
+			previous_tag_name: `v2.${30 - index}.0`,
+			name: `v2.${31 - index}.0 public release endpoints`,
+		}),
+	);
+	await installBaseApiMocks(page, (route) =>
+		json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items,
+		}),
+	);
+
+	await page.goto("/octo-rill/example/releases/tag/v2.20.0");
+	const target = page.getByTestId("public-release-item-public-release-11");
+	await expect(target).toBeVisible({ timeout: 5_000 });
+	await expect
+		.poll(() =>
+			target.evaluate((element) => getComputedStyle(element).animationName),
+		)
+		.toBe("none");
+});
+
+test("public release directory click preserves its current scroll position", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 720 });
+	const items = Array.from({ length: 30 }, (_, index) =>
+		releaseItem(index, {
+			tag_name: `v2.${31 - index}.0`,
+			previous_tag_name: `v2.${30 - index}.0`,
+			name: `v2.${31 - index}.0 public release endpoints`,
+		}),
+	);
+	let listRequests = 0;
+	await installBaseApiMocks(page, (route) => {
+		listRequests += 1;
+		return json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items: listRequests === 1 ? items : items.slice(3, 9),
+		});
+	});
+
+	await page.goto("/octo-rill/example/releases/tag/v2.29.0");
+	const directoryScroll = page.getByTestId("public-release-directory-scroll");
+	await expect(directoryScroll).toBeVisible();
+	await page.waitForTimeout(1200);
+	const detailScroll = page.getByTestId("public-release-detail-scroll");
+	await detailScroll.evaluate((element) => {
+		element.dispatchEvent(
+			new WheelEvent("wheel", { bubbles: true, deltaY: 650 }),
+		);
+		element.scrollTop = 650;
+		element.dispatchEvent(new Event("scroll", { bubbles: true }));
+	});
+	const before = await directoryScroll.evaluate((element) => element.scrollTop);
+	const targetLink = page
+		.getByTestId("public-release-directory")
+		.getByRole("link", { name: /v2\.28\.0/ });
+	const targetBox = await targetLink.boundingBox();
+	expect(targetBox).not.toBeNull();
+	await page.mouse.click(
+		targetBox!.x + targetBox!.width / 2,
+		targetBox!.y + targetBox!.height / 2,
+	);
+	await expect(page).toHaveURL(/\/releases\/tag\/v2\.28\.0$/);
+	await expect
+		.poll(async () =>
+			page.evaluate(() => {
+				const scroll = document.querySelector<HTMLElement>(
+					"[data-testid='public-release-detail-scroll']",
+				);
+				const card = [
+					...document.querySelectorAll<HTMLElement>("[data-release-id]"),
+				].find((element) => element.textContent?.includes("v2.28.0"));
+				if (!scroll || !card) return false;
+				const view = scroll.getBoundingClientRect();
+				const rect = card.getBoundingClientRect();
+				return rect.top >= view.top && rect.bottom <= view.bottom + 1;
+			}),
+		)
+		.toBe(true);
+	const after = await directoryScroll.evaluate((element) => element.scrollTop);
+	expect(Math.abs(after - before)).toBeLessThanOrEqual(4);
+	const selectedDetail = await page.evaluate(() => {
+		const scroll = document.querySelector<HTMLElement>(
+			"[data-testid='public-release-detail-scroll']",
+		);
+		const card = [
+			...document.querySelectorAll<HTMLElement>("[data-release-id]"),
+		].find((element) => element.textContent?.includes("v2.28.0"));
+		if (!scroll || !card) return null;
+		const view = scroll.getBoundingClientRect();
+		const rect = card.getBoundingClientRect();
+		return {
+			top: rect.top,
+			bottom: rect.bottom,
+			viewTop: view.top,
+			viewBottom: view.bottom,
+		};
+	});
+	expect(selectedDetail).not.toBeNull();
+	expect(selectedDetail!.top).toBeGreaterThanOrEqual(selectedDetail!.viewTop);
+	expect(selectedDetail!.bottom).toBeLessThanOrEqual(
+		selectedDetail!.viewBottom + 1,
+	);
+});
+
+test("public release alternates visible directory targets without losing detail focus", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 720 });
+	const items = Array.from({ length: 30 }, (_, index) =>
+		releaseItem(index, {
+			tag_name: `v2.${31 - index}.0`,
+			previous_tag_name: `v2.${30 - index}.0`,
+			name: `v2.${31 - index}.0 public release endpoints`,
+		}),
+	);
+	await installBaseApiMocks(page, (route) =>
+		json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items,
+		}),
+	);
+
+	await page.goto("/octo-rill/example/releases/tag/v2.29.0");
+	const directoryScroll = page.getByTestId("public-release-directory-scroll");
+	const detailScroll = page.getByTestId("public-release-detail-scroll");
+	await expect(directoryScroll).toBeVisible({ timeout: 15_000 });
+	await expect(detailScroll).toBeVisible({ timeout: 15_000 });
+	await page.waitForTimeout(1_200);
+	await directoryScroll.hover();
+	await page.mouse.wheel(0, 186);
+	await expect
+		.poll(() => directoryScroll.evaluate((element) => element.scrollTop))
+		.toBeGreaterThan(100);
+
+	const targets = await directoryScroll.evaluate((scroll) => {
+		const viewport = scroll.getBoundingClientRect();
+		const visible = [
+			...scroll.querySelectorAll<HTMLAnchorElement>(
+				"[data-release-directory-id]",
+			),
+		]
+			.map((element) => ({
+				releaseId: element.dataset.releaseDirectoryId,
+				tag: element.querySelector("span")?.textContent?.trim(),
+				rect: element.getBoundingClientRect(),
+			}))
+			.filter(
+				(item) =>
+					item.rect.top >= viewport.top && item.rect.bottom <= viewport.bottom,
+			);
+		if (visible.length < 4) return [];
+		return [visible[1], visible[visible.length - 2]].map(
+			({ releaseId, tag }) => ({
+				releaseId,
+				tag,
+			}),
+		);
+	});
+	if (targets.length !== 2) {
+		throw new Error("expected at least four fully visible directory targets");
+	}
+
+	for (const [index, target] of [
+		targets[0],
+		targets[1],
+		targets[0],
+		targets[1],
+		targets[0],
+		targets[1],
+	].entries()) {
+		const link = directoryScroll.locator(
+			`[data-release-directory-id="${target.releaseId}"]`,
+		);
+		const box = await link.boundingBox();
+		expect(box, `target ${index} should stay mounted`).not.toBeNull();
+		await page.mouse.click(box!.x + box!.width / 2, box!.y + box!.height / 2);
+		await expect(page).toHaveURL(
+			new RegExp(`/releases/tag/${target.tag!.replaceAll(".", "\\.")}$`),
+		);
+		await page.waitForTimeout(index === 5 ? 1200 : 120);
+		if (index === 5) {
+			await expect
+				.poll(() => isDetailItemFullyVisible(page, target.releaseId))
+				.toBe(true);
+		}
+		const selected = await page.evaluate((releaseId) => {
+			const scroll = document.querySelector<HTMLElement>(
+				"[data-testid='public-release-detail-scroll']",
+			);
+			const card = document.querySelector<HTMLElement>(
+				`[data-release-id="${releaseId}"]`,
+			);
+			if (!scroll || !card) return null;
+			const view = scroll.getBoundingClientRect();
+			const rect = card.getBoundingClientRect();
+			return {
+				top: rect.top,
+				bottom: rect.bottom,
+				viewTop: view.top,
+				viewBottom: view.bottom,
+			};
+		}, target.releaseId);
+		if (index === 5) {
+			expect(selected, `target ${index} should be mounted`).not.toBeNull();
+			expect(
+				selected!.top,
+				`target ${index} should be fully visible`,
+			).toBeGreaterThanOrEqual(selected!.viewTop);
+			expect(
+				selected!.bottom,
+				`target ${index} should be fully visible`,
+			).toBeLessThanOrEqual(selected!.viewBottom + 1);
+		}
+	}
+});
+
+test("public release detail hover reveals and selects its offscreen directory item", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 720 });
+	const items = Array.from({ length: 30 }, (_, index) =>
+		releaseItem(index, {
+			tag_name: `v2.${31 - index}.0`,
+			previous_tag_name: `v2.${30 - index}.0`,
+			name: `v2.${31 - index}.0 public release endpoints`,
+		}),
+	);
+	await installBaseApiMocks(page, (route) =>
+		json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items,
+		}),
+	);
+
+	await page.goto("/octo-rill/example/releases/tag/v2.31.0");
+	const directory = page.getByTestId("public-release-directory-scroll");
+	const detail = page.getByTestId("public-release-detail-scroll");
+	const detailTarget = page.getByTestId(
+		"public-release-item-public-release-11",
+	);
+	await expect(directory).toBeVisible();
+	await page.waitForTimeout(5_500);
+	await detail.evaluate((element) => {
+		element.scrollTop = 1_650;
+		element.dispatchEvent(new Event("scroll", { bubbles: true }));
+	});
+	await expect(detailTarget).toBeVisible();
+	await detailTarget.evaluate((element) => {
+		element.scrollIntoView({ block: "center", inline: "nearest" });
+	});
+	await expect(detailTarget).toBeVisible();
+	await page.waitForTimeout(300);
+	await directory.evaluate((element) => {
+		element.scrollTop = 0;
+		element.dispatchEvent(new Event("scroll", { bubbles: true }));
+	});
+	await expect
+		.poll(() => isDirectoryItemVisible(page, "public-release-11"))
+		.toBe(false);
+
+	const urlBeforeHover = page.url();
+	await detailTarget.hover();
+	await expect
+		.poll(() => isDirectoryItemVisible(page, "public-release-11"))
+		.toBe(true);
+	await expect(
+		directory.locator('[data-release-directory-id="public-release-11"]'),
+	).toHaveAttribute("aria-current", "page");
+	await expect(page).toHaveURL(urlBeforeHover);
+});
+
+test("clicking a detail title reveals its offscreen directory item", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 720 });
+	const items = Array.from({ length: 30 }, (_, index) =>
+		releaseItem(index, {
+			tag_name: `v2.${31 - index}.0`,
+			previous_tag_name: `v2.${30 - index}.0`,
+			name: `v2.${31 - index}.0 public release endpoints`,
+		}),
+	);
+	await installBaseApiMocks(page, (route) =>
+		json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items,
+		}),
+	);
+
+	await page.goto("/octo-rill/example/releases/tag/v2.31.0");
+	const directory = page.getByTestId("public-release-directory-scroll");
+	const detail = page.getByTestId("public-release-detail-scroll");
+	const detailTarget = page.getByTestId(
+		"public-release-item-public-release-11",
+	);
+	await expect(directory).toBeVisible();
+	await page.waitForTimeout(5_500);
+	await detail.evaluate((element) => {
+		element.scrollTop = 1_650;
+		element.dispatchEvent(new Event("scroll", { bubbles: true }));
+	});
+	await expect(detailTarget).toBeVisible();
+	await detailTarget.evaluate((element) => {
+		element.scrollIntoView({ block: "center", inline: "nearest" });
+	});
+	await page.waitForTimeout(300);
+	await directory.evaluate((element) => {
+		element.scrollTop = 0;
+		element.dispatchEvent(new Event("scroll", { bubbles: true }));
+	});
+	await expect
+		.poll(() => isDirectoryItemVisible(page, "public-release-11"))
+		.toBe(false);
+
+	await detailTarget.locator("h3 a").click();
+	await expect(page).toHaveURL(/\/releases\/tag\/v2\.20\.0$/);
+	await expect
+		.poll(() => isDirectoryItemVisible(page, "public-release-11"))
+		.toBe(true);
+	await expect(
+		directory.locator('[data-release-directory-id="public-release-11"]'),
+	).toHaveAttribute("aria-current", "page");
+});
+
+test("public release detail pagination does not refocus the URL release", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 720 });
+	await page.addInitScript(() => {
+		class InertIntersectionObserver {
+			observe() {}
+			disconnect() {}
+		}
+		window.IntersectionObserver =
+			InertIntersectionObserver as unknown as typeof IntersectionObserver;
+	});
+	const items = Array.from({ length: 40 }, (_, index) => releaseItem(index));
+	const seenQueries: URL[] = [];
+	await installBaseApiMocks(page, (route, url) => {
+		seenQueries.push(url);
+		const cursor = url.searchParams.get("cursor");
+		return json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: cursor ? null : "older|30",
+			items: cursor ? items.slice(30) : items.slice(0, 30),
+		});
+	});
+
+	await page.goto("/octo-rill/example/releases/tag/v2.7.0");
+	const detailScroll = page.getByTestId("public-release-detail-scroll");
+	await expect(detailScroll).toBeVisible();
+	await expect(
+		page.getByTestId("public-release-item-public-release-0"),
+	).toBeVisible();
+	await page.waitForTimeout(1200);
+	await detailScroll.evaluate((element) => {
+		element.dispatchEvent(
+			new WheelEvent("wheel", { bubbles: true, deltaY: 650 }),
+		);
+		element.scrollTop = Math.min(
+			700,
+			element.scrollHeight - element.clientHeight,
+		);
+		element.dispatchEvent(new Event("scroll", { bubbles: true }));
+	});
+	await page
+		.getByRole("button", { name: "更多" })
+		.evaluate((element) => (element as HTMLButtonElement).click());
+	await expect
+		.poll(() =>
+			seenQueries.some(
+				(query) => query.searchParams.get("direction") === "older",
+			),
+		)
+		.toBe(true);
+	await page.waitForTimeout(500);
+	const position = await detailScroll.evaluate((element) => ({
+		top: element.scrollTop,
+	}));
+	expect(position.top).toBeGreaterThan(500);
+});
+
+test("public release detail user scrolling is not pulled back to the URL release", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 1440, height: 720 });
+	const items = Array.from({ length: 30 }, (_, index) => releaseItem(index));
+	await installBaseApiMocks(page, (route) =>
+		json(route, {
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items,
+		}),
+	);
+
+	await page.goto("/octo-rill/example/releases/tag/v2.7.0");
+	const detailScroll = page.getByTestId("public-release-detail-scroll");
+	await expect(detailScroll).toBeVisible();
+	await expect(
+		page.getByTestId("public-release-item-public-release-0"),
+	).toBeVisible();
+	await detailScroll.evaluate((element) => {
+		element.dispatchEvent(
+			new WheelEvent("wheel", { bubbles: true, deltaY: 700 }),
+		);
+		element.scrollTop = 700;
+		element.dispatchEvent(new Event("scroll", { bubbles: true }));
+	});
+	await page.waitForTimeout(800);
+	await expect
+		.poll(() => detailScroll.evaluate((element) => element.scrollTop))
+		.toBeGreaterThan(500);
 });
 
 test("public release reactions require an authenticated session with a usable PAT", async ({
@@ -922,11 +1789,25 @@ test("public release typed range uses virtual rows and loads both directions", a
 		items.length,
 	);
 
-	await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+	await page.getByTestId("public-release-detail-scroll").evaluate((element) => {
+		element.dispatchEvent(
+			new WheelEvent("wheel", { bubbles: true, deltaY: 1000 }),
+		);
+		element.scrollTop = element.scrollHeight;
+		element.dispatchEvent(new Event("scroll", { bubbles: true }));
+	});
 	await expect.poll(() => seenQueries.length).toBeGreaterThan(1);
 	await expect
 		.poll(async () => {
-			await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+			await page
+				.getByTestId("public-release-detail-scroll")
+				.evaluate((element) => {
+					element.dispatchEvent(
+						new WheelEvent("wheel", { bubbles: true, deltaY: 1000 }),
+					);
+					element.scrollTop = element.scrollHeight;
+					element.dispatchEvent(new Event("scroll", { bubbles: true }));
+				});
 			return await page
 				.getByTestId("public-release-item-public-release-19")
 				.count();
@@ -944,7 +1825,13 @@ test("public release typed range uses virtual rows and loads both directions", a
 		}),
 	).toBe(true);
 
-	await page.evaluate(() => window.scrollTo(0, 0));
+	await page.getByTestId("public-release-detail-scroll").evaluate((element) => {
+		element.dispatchEvent(
+			new WheelEvent("wheel", { bubbles: true, deltaY: -1000 }),
+		);
+		element.scrollTop = 0;
+		element.dispatchEvent(new Event("scroll", { bubbles: true }));
+	});
 	await expect
 		.poll(() =>
 			seenQueries.some((url) => url.searchParams.get("direction") === "newer"),
@@ -1028,48 +1915,54 @@ test("centered range navigation preserves the absolute highlight index", async (
 	await expect(page).toHaveURL(/highlight_active=id%3Apublic-release-20/);
 });
 
-test("public release detail keeps the shared chrome stable", async ({
+test("public release tag keeps the shared timeline chrome stable", async ({
 	page,
 }) => {
-	const detailRequests: URL[] = [];
+	const listRequests: URL[] = [];
 	await page.setViewportSize({ width: 390, height: 844 });
 	await installBaseApiMocks(page, (route, url) => {
-		detailRequests.push(url);
+		listRequests.push(url);
+		const target = releaseItem(0, {
+			name: "公开更新记录入口",
+			body: "这次版本把公开仓库的 Release 列表与详情开放为可直接分享的页面，并提供可重试的 REST API。",
+			translated: {
+				lang: "zh-CN",
+				status: "ready",
+				title: "公开更新记录入口",
+				summary:
+					"这次版本把公开仓库的 Release 列表与详情开放为可直接分享的页面，并提供可重试的 REST API。",
+			},
+			smart: {
+				lang: "zh-CN",
+				status: "ready",
+				title: "公开更新记录入口",
+				summary:
+					"这次版本把公开仓库的 Release 列表与详情开放为可直接分享的页面，并提供可重试的 REST API。",
+			},
+		});
 		return json(route, {
-			...releaseItem(0, {
-				name: "公开更新记录入口",
-				body: "这次版本把公开仓库的 Release 列表与详情开放为可直接分享的页面，并提供可重试的 REST API。",
-				translated: {
-					lang: "zh-CN",
-					status: "ready",
-					title: "公开更新记录入口",
-					summary:
-						"这次版本把公开仓库的 Release 列表与详情开放为可直接分享的页面，并提供可重试的 REST API。",
-				},
-				smart: {
-					lang: "zh-CN",
-					status: "ready",
-					title: "公开更新记录入口",
-					summary:
-						"这次版本把公开仓库的 Release 列表与详情开放为可直接分享的页面，并提供可重试的 REST API。",
-				},
-			}),
+			status: "ready",
+			repo_full_name: "octo-rill/example",
+			next_cursor: null,
+			items: [target, releaseItem(1), releaseItem(2)],
 		});
 	});
 
 	await page.goto("/octo-rill/example/releases/tag/v2.7.0");
 
 	await expect(
-		page.getByRole("heading", { name: "公开更新记录入口" }),
+		page.getByRole("heading", { name: "公开更新记录入口" }).first(),
 	).toBeVisible();
-	await expect(page.getByRole("tab", { name: "润色" })).toBeVisible();
-	expect(detailRequests).toHaveLength(1);
-	expect(detailRequests[0]?.searchParams.get("content")).toBe("all");
-	await page.getByRole("tab", { name: "翻译" }).click();
-	await expect(page.getByRole("tab", { name: "翻译" })).toHaveAttribute(
-		"aria-selected",
-		"true",
-	);
+	await expect(
+		page.getByRole("button", { name: "润色" }).first(),
+	).toBeVisible();
+	expect(listRequests).toHaveLength(1);
+	expect(listRequests[0]?.pathname).toContain("/releases");
+	expect(listRequests[0]?.searchParams.get("focus")).toBe("tag:v2.7.0");
+	await page.getByRole("button", { name: "翻译" }).first().click();
+	await expect(
+		page.getByRole("button", { name: "翻译" }).first(),
+	).toHaveAttribute("aria-pressed", "true");
 	await expectPublicChrome(page, "octo-rill", "example");
 	await expectNoHorizontalOverflow(page);
 });
@@ -1083,24 +1976,28 @@ test("authenticated footer version link opens the public-only release page", asy
 		page,
 		(route, url) => {
 			publicRequests.push(`${url.pathname}${url.search}`);
+			const target = releaseItem(0, {
+				repo_full_name: "IvanLi-CN/octo-rill",
+				tag_name: EMBEDDED_FRONTEND_VERSION,
+				name: "Footer public release target",
+				translated: {
+					lang: "zh-CN",
+					status: "ready",
+					title: "Footer public release target",
+					summary: "Footer version links must stay on the public page.",
+				},
+				smart: {
+					lang: "zh-CN",
+					status: "ready",
+					title: "Footer public release target",
+					summary: "Footer version links must stay on the public page.",
+				},
+			});
 			return json(route, {
-				...releaseItem(0, {
-					repo_full_name: "IvanLi-CN/octo-rill",
-					tag_name: EMBEDDED_FRONTEND_VERSION,
-					name: "Footer public release target",
-					translated: {
-						lang: "zh-CN",
-						status: "ready",
-						title: "Footer public release target",
-						summary: "Footer version links must stay on the public page.",
-					},
-					smart: {
-						lang: "zh-CN",
-						status: "ready",
-						title: "Footer public release target",
-						summary: "Footer version links must stay on the public page.",
-					},
-				}),
+				status: "ready",
+				repo_full_name: "IvanLi-CN/octo-rill",
+				next_cursor: null,
+				items: [target],
 			});
 		},
 		{ authenticated: true },
@@ -1134,9 +2031,7 @@ test("authenticated footer version link opens the public-only release page", asy
 	).toBeVisible();
 	expect(
 		publicRequests.some((request) =>
-			request.startsWith(
-				`/api/public/repos/IvanLi-CN/octo-rill/releases/tag/${EMBEDDED_FRONTEND_VERSION}`,
-			),
+			request.startsWith(`/api/public/repos/IvanLi-CN/octo-rill/releases`),
 		),
 	).toBe(true);
 	expect(privateDetailRequests).toEqual([]);
