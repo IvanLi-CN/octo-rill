@@ -46,7 +46,7 @@
 - `cd web && PLAYWRIGHT_WEB_PORT=50734 bunx playwright test e2e/public-release-page.spec.ts e2e/demo-page-scenes.spec.ts --workers=1 --timeout=60000 --reporter=line` (`46 passed`，包含 v1.40.0 首次定位完成后连续切换 lane 时保持当前聚焦卡片可见)
 - `cd web && PLAYWRIGHT_WEB_PORT=50718 bunx playwright test e2e/demo-page-scenes.spec.ts --grep "switching public release lanes keeps the focused card in view" --workers=1 --repeat-each=3` (`3 passed`)
 - `cd web && PLAYWRIGHT_WEB_PORT=50732 bunx playwright test e2e/demo-page-scenes.spec.ts --grep "stale scroll guard" --project=chromium --repeat-each=3` (`3 passed`，覆盖 v1.40.0 首次定位完成后连续切换三种 lane、3.2 秒逐帧滚动稳定性与当前 `release_id` 不漂移)
-- `cargo test --all-targets -q` (`904 passed; 0 failed; 1 ignored`，当前候选基线)
+- `cargo test --all-targets -q` (`905 passed; 0 failed; 1 ignored`，当前候选基线)
 - `cd web && PLAYWRIGHT_WEB_PORT=50752 bunx playwright test e2e/public-release-page.spec.ts e2e/demo-page-scenes.spec.ts --workers=1 --timeout=60000 --reporter=line` (`47 passed`，包含高亮详情返回、分页 newer、focus+highlight 目标保留与 lane 事务回归)
 - `cd web && bun run storybook:build`
 - `cd web && PLAYWRIGHT_WEB_PORT=15300 bunx playwright test e2e/public-release-page.spec.ts --project=chromium` (`10 passed`)
