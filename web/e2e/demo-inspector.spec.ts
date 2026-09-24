@@ -967,6 +967,9 @@ test("admin jobs content detail stays stable when llm case changes", async ({
 	await page.goto(
 		"/admin/jobs/ai-records?demo=admin-jobs-running&d_persona=admin&d_content_case=loaded&d_llm_case=loaded",
 	);
+	await expect(
+		page.locator('[data-demo-inspector-chrome="desktop"]'),
+	).toBeVisible();
 	const before = await page.evaluate(async () => {
 		const response = await fetch(
 			"/api/admin/jobs/ai-records/release/291058019?__demo_runtime=1",
