@@ -7,7 +7,6 @@ import {
 } from "react";
 import {
 	createRootRoute,
-	Outlet,
 	useLocation,
 	useRouter,
 } from "@tanstack/react-router";
@@ -28,6 +27,7 @@ import { useMediaQuery } from "@/lib/useMediaQuery";
 import { AppBoot } from "@/pages/AppBoot";
 import { NotFoundPage } from "@/pages/NotFound";
 import { PausedAccountPage } from "@/pages/PausedAccount";
+import { PublicReleaseRouteSlot } from "@/routes/-PublicReleaseRouteSlot";
 
 const LazyDemoInspector = lazy(async () => {
 	const module = await import("@/demo/DemoInspector");
@@ -81,7 +81,7 @@ function RootRouteComponent() {
 					) : null
 				}
 			>
-				<Outlet />
+				<PublicReleaseRouteSlot />
 			</DemoRootFrame>
 			{showWideDockedLayout || demoControlsHidden ? null : (
 				<DemoInspectorMount />
