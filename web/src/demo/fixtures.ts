@@ -896,22 +896,79 @@ function buildPublicReleaseDetail(): ReleaseDetailResponse {
 }
 
 function buildPublicReleaseList(): PublicReleaseListResponse {
+	const releaseTagAt = (index: number) => {
+		if (index <= 31) return `v2.${31 - index}.0`;
+		return `v1.${131 - index}.0`;
+	};
+	const releaseBodyAt = (tagName: string, index: number) => {
+		const focus = [
+			"公开时间线的首屏定位与分页窗口",
+			"目录与详情列表的滚动锚点",
+			"翻译、润色和原文 lane 的一致性",
+			"缓存数据在网络抖动下的恢复路径",
+		][index % 4];
+		const validation = [
+			"Playwright desktop and mobile smoke flow",
+			"cursor pagination and focus restoration",
+			"reduced-motion and keyboard navigation",
+			"API cache fallback and empty-state handling",
+		][index % 4];
+		const lines = [
+			`## What's changed`,
+			`- Improved ${focus}.`,
+			`- Kept the original GitHub release content available as a fallback.`,
+			"",
+			"### Reader notes",
+			`This ${tagName} fixture represents a release with a measurable content shape, so long-range navigation can be inspected without hiding layout shifts.`,
+			`The change is intentionally scoped to the ${index % 2 === 0 ? "desktop reader" : "responsive reader"} path and keeps the public URL contract stable.`,
+			"",
+			"### Validation",
+			`- ${validation}`,
+			`- Focus target: ${index + 1} / 100 in the demo timeline.`,
+		];
+		if (index % 3 === 0) {
+			lines.push(
+				"",
+				"### Compatibility",
+				"| Surface | Result |",
+				"| --- | --- |",
+				"| Original | available |",
+				"| Translated | ready or on demand |",
+				"| Polished | ready or on demand |",
+			);
+		}
+		if (index % 5 === 0) {
+			lines.push(
+				"",
+				"> The important part is that the card remains readable while its neighbors are virtualized.",
+			);
+		}
+		if (index % 7 === 0) {
+			lines.push(
+				"",
+				"### Follow-up",
+				"- Continue watching the measured card height during pagination.",
+				"- Keep URL focus and reader focus independent.",
+			);
+		}
+		return `${lines.join("\n")}\n`;
+	};
 	const items: PublicReleaseListResponse["items"] = Array.from(
-		{ length: 18 },
+		{ length: 100 },
 		(_, index) => {
-			const version = 31 - index;
 			const releaseId = String(291058027 - index);
-			const tagName = `v2.${version}.0`;
+			const tagName = releaseTagAt(index);
+			const publishedAt = new Date(Date.UTC(2026, 6, 8 - index)).toISOString();
 			return {
 				release_id: releaseId,
 				repo_full_name: OWNER_REPO_FULL_NAME,
 				repo_visual: OWNER_REPO_VISUAL,
 				tag_name: tagName,
-				previous_tag_name: index === 17 ? null : `v2.${version - 1}.0`,
+				previous_tag_name: index === 99 ? null : releaseTagAt(index + 1),
 				name: `${tagName} release window`,
-				body: `## ${tagName}\n\n- Stable public Release history\n- Original content remains available as an immediate fallback\n`,
+				body: releaseBodyAt(tagName, index),
 				html_url: `https://github.com/octo-demo/release-lab/releases/tag/${tagName}`,
-				published_at: `2026-06-${String(30 - index).padStart(2, "0")}T08:00:00Z`,
+				published_at: publishedAt,
 				is_prerelease: index === 7 ? 1 : 0,
 				is_draft: 0,
 				is_highlighted: false,

@@ -1265,6 +1265,10 @@ export function ReleaseFeedCard(props: {
 	showHeaderActions?: boolean;
 	surface?: "card" | "article";
 	titleHref?: string | null;
+	titleTo?: string | null;
+	titleParams?: Record<string, string>;
+	titleSearch?: Record<string, unknown>;
+	onTitleActivate?: () => void;
 	emphasis?: ReleaseCardEmphasis;
 	onSelectLane: (lane: FeedLane) => void;
 	onTranslateNow: () => void;
@@ -1287,6 +1291,10 @@ export function ReleaseFeedCard(props: {
 		showHeaderActions = true,
 		surface = "card",
 		titleHref = null,
+		titleTo = null,
+		titleParams,
+		titleSearch,
+		onTitleActivate,
 		emphasis = "default",
 		onSelectLane,
 		onTranslateNow,
@@ -1434,9 +1442,26 @@ export function ReleaseFeedCard(props: {
 
 							<CardTitle className={cardTitleClassName}>
 								{titleHref ? (
-									<a href={titleHref} className="hover:underline">
-										{displayTitle}
-									</a>
+									titleTo ? (
+										<InternalLink
+											href={titleHref}
+											to={titleTo}
+											params={titleParams}
+											search={titleSearch}
+											onClick={onTitleActivate}
+											className="hover:underline"
+										>
+											{displayTitle}
+										</InternalLink>
+									) : (
+										<a
+											href={titleHref}
+											onClick={onTitleActivate}
+											className="hover:underline"
+										>
+											{displayTitle}
+										</a>
+									)
 								) : (
 									displayTitle
 								)}

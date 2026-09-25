@@ -32,6 +32,10 @@
 - 高亮卡片层级现在由 `ReleaseFeedCard` 统一接管：普通态保持原列表权重，`subdued` 通过文字与边界降权退后，`highlighted` 与 `active-highlight` 通过更干净的轮廓和柔和阴影抬起；用于审阅这三档差异的 Storybook `Highlight state gallery` 作为本轮唯一新增视觉证据。
 - 公开列表页将页面级 lane 状态提升到 owner/avatar 加仓库名的标题带：宽度足够时同行，窄屏时 selector 整块换行；列表卡片不再重复仓库身份、lane 或 GitHub 操作，翻译 hydration 继续由页面级 lane 驱动。
 - 公开列表复用现有 `AuthBootstrap` 和 reaction token 查询键：匿名会话不发起 PAT 状态查询；认证会话的 PAT 为 `configured + valid` 后，按最多 100 条一批刷新反应，且只有接口确认可操作的 Release 显示控件。列表窗口在刷新途中变化时仍合并已发出的有效响应，避免控件因 pagination、gap 或高亮加载竞态而永久隐藏；非 PAT 的失败批次独立重试最多三次，成功批次仍立即合并。刷新和切换请求均绑定认证会话 generation，用户切换后的旧响应直接丢弃。`pat_required` / `pat_invalid` / `not_found` 会即时撤下相关控件，避免提供无法提交的操作。
+- 公开双栏阅读器将详情卡片的 `pointerenter`、键盘 `focus` 与标题激活统一接入当前 Release 协调器：目录项未挂载时按共享 `release_id` 顺序挂载并以最小滚动露出，悬浮不改写 URL；标题激活先建立目录聚焦事务，再交给 SPA 内部导航。滚轮、按下、键盘、卡片进入/聚焦和标题激活等真实用户事件优先取消当前程序化详情与目录动画、重试和待执行 RAF，再沿同一事件链更新当前版本；浏览器重挂载造成的静态指针重排不会覆盖明确路由目标，只有新的卡片进入事件才会重新触发悬浮选择。新定位事务会先取消旧详情/目录动画与重试，再等待虚拟行几何稳定，防止估算高度变化或连续点击把目标重新拉离视口。
+- 页面级 lane 切换沿用户事件链进入详情协调器；动态高度重测期间，当前 `focusedReleaseId` 会作为额外挂载项保留，并以切换前的目标 offset 在短稳定窗口内逐帧校正，直到目标高度与位置稳定或达到超时，避免原文/翻译/润色切换把当前卡片推出视口。
+- 程序化详情滚动的方向 guard 只在当前动画/定位事务存续期间生效；动画完成或被用户事件取消时立即清理，lane 重测事务期间暂不执行自然阅读线判定，避免旧极值与异步高度事件互相抢写 `scrollTop`。
+- 公开列表的 newer cursor 会沿请求方向查询；首次 `focus` 窗口与离散 highlight 合并时在 30 条首屏预算内保留全部已解析目标与焦点版本，超出上下文通过 segment/gap 继续补齐。分页、首屏定位、lane 切换和同仓库 tag 导航均绑定当前 route transaction，旧响应不会覆盖新路由；首载请求完成前会抑制自动分页，并在路由事务切换时清理旧 loading 状态，不在浏览器端缓存未经访问证明的 Release 时间线。
 
 ## Verification
 
@@ -39,6 +43,11 @@
 - `cd web && bun run lint`
 - `cd web && bun run build`
 - `cd web && bun run build:demo`
+- `cd web && PLAYWRIGHT_WEB_PORT=50734 bunx playwright test e2e/public-release-page.spec.ts e2e/demo-page-scenes.spec.ts --workers=1 --timeout=60000 --reporter=line` (`46 passed`，包含 v1.40.0 首次定位完成后连续切换 lane 时保持当前聚焦卡片可见)
+- `cd web && PLAYWRIGHT_WEB_PORT=50718 bunx playwright test e2e/demo-page-scenes.spec.ts --grep "switching public release lanes keeps the focused card in view" --workers=1 --repeat-each=3` (`3 passed`)
+- `cd web && PLAYWRIGHT_WEB_PORT=50732 bunx playwright test e2e/demo-page-scenes.spec.ts --grep "stale scroll guard" --project=chromium --repeat-each=3` (`3 passed`，覆盖 v1.40.0 首次定位完成后连续切换三种 lane、3.2 秒逐帧滚动稳定性与当前 `release_id` 不漂移)
+- `cargo test --all-targets -q` (`905 passed; 0 failed; 1 ignored`，当前候选基线)
+- `cd web && PLAYWRIGHT_WEB_PORT=53640 bunx playwright test e2e/public-release-page.spec.ts e2e/demo-page-scenes.spec.ts --workers=1 --timeout=60000 --reporter=line` (`49 passed`，包含高亮详情返回、分页 newer、focus+highlight 目标保留、键盘焦点与 lane 事务回归)
 - `cd web && bun run storybook:build`
 - `cd web && PLAYWRIGHT_WEB_PORT=15300 bunx playwright test e2e/public-release-page.spec.ts --project=chromium` (`10 passed`)
 - `cd web && bun run lint`

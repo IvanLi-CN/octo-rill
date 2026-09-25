@@ -1491,6 +1491,7 @@ function buildDemoPublicReleaseList(request: Request) {
 	const startSelector = url.searchParams.get("highlight_start");
 	const endSelector = url.searchParams.get("highlight_end");
 	const activeSelector = url.searchParams.get("highlight_active");
+	const focusSelector = url.searchParams.get("focus");
 	const cursor = url.searchParams.get("cursor");
 	const untilCursor = url.searchParams.get("until_cursor");
 	const direction = url.searchParams.get("direction") ?? "older";
@@ -1506,6 +1507,37 @@ function buildDemoPublicReleaseList(request: Request) {
 				(item) => demoPublicReleaseCursor(item) === untilCursor,
 			)
 		: -1;
+	const focusItem = findDemoPublicRelease(sourceItems, focusSelector);
+	if (focusSelector && !focusItem) {
+		return {
+			...currentModel().publicReleaseList,
+			items: [],
+			next_cursor: null,
+		};
+	}
+	// The demo exposes the complete 100-item fixture in one transport response so
+	// the virtualizers can exercise long-range positioning without making the
+	// visual test depend on a chain of network sentinels. DOM rendering remains
+	// virtualized; production pagination behavior is covered by API-backed tests.
+	const completeDemoTimeline =
+		!cursor && selectors.length === 0 && !startSelector && !endSelector;
+	if (completeDemoTimeline) {
+		return {
+			...currentModel().publicReleaseList,
+			items: sourceItems,
+			next_cursor: null,
+			previous_cursor: null,
+		};
+	}
+	const centeredItems = () => {
+		if (!focusItem || cursorIndex >= 0) return null;
+		const focusIndex = sourceItems.indexOf(focusItem);
+		const start = Math.max(0, focusIndex - Math.floor((limit - 1) / 2));
+		return sourceItems.slice(
+			start,
+			Math.min(sourceItems.length, start + limit),
+		);
+	};
 
 	if (selectors.length > 0) {
 		const seen = new Set<string>();
@@ -1532,9 +1564,30 @@ function buildDemoPublicReleaseList(request: Request) {
 			);
 			return item ? [item] : [];
 		});
+		const centered = centeredItems();
+		if (centered) {
+			const targetIds = new Set(pageItems.map((item) => item.release_id));
+			const contextIds = new Set(
+				centered
+					.filter((item) => !targetIds.has(item.release_id))
+					.slice(0, Math.max(0, 30 - targetIds.size))
+					.map((item) => item.release_id),
+			);
+			const selectedIds = new Set([...targetIds, ...contextIds]);
+			pageItems = sourceItems.filter((item) =>
+				selectedIds.has(item.release_id),
+			);
+		}
 		if (cursorIndex >= 0) {
-			const end = untilIndex >= 0 ? untilIndex + 1 : cursorIndex + 1 + limit;
-			pageItems = sourceItems.slice(cursorIndex + 1, end);
+			if (direction === "newer") {
+				const end = cursorIndex;
+				const start = untilIndex >= 0 ? untilIndex : Math.max(0, end - limit);
+				pageItems = sourceItems.slice(start, end);
+			} else {
+				const start = cursorIndex + 1;
+				const end = untilIndex >= 0 ? untilIndex + 1 : start + limit;
+				pageItems = sourceItems.slice(start, Math.min(sourceItems.length, end));
+			}
 		}
 		const highlightedIds = new Set(resolved.map((target) => target.release_id));
 		const items = pageItems.map((item) => ({
@@ -1629,6 +1682,14 @@ function buildDemoPublicReleaseList(request: Request) {
 		);
 		let pageStart = rangeStart;
 		let pageEnd = Math.min(rangeEnd + 1, pageStart + limit);
+		if (focusItem && cursorIndex < 0) {
+			const focusIndex = sourceItems.indexOf(focusItem);
+			pageStart = Math.max(
+				rangeStart,
+				focusIndex - Math.floor((limit - 1) / 2),
+			);
+			pageEnd = Math.min(rangeEnd + 1, pageStart + limit);
+		}
 		if (cursorIndex >= 0) {
 			if (direction === "newer") {
 				pageEnd = cursorIndex;
@@ -1683,13 +1744,46 @@ function buildDemoPublicReleaseList(request: Request) {
 		};
 	}
 
-	const start = cursorIndex >= 0 ? cursorIndex + 1 : 0;
-	const items = sourceItems.slice(start, start + limit);
+	if (cursorIndex >= 0) {
+		if (direction === "newer") {
+			const end = cursorIndex;
+			const start = Math.max(0, end - limit);
+			const items = sourceItems.slice(start, end);
+			return {
+				...currentModel().publicReleaseList,
+				items,
+				previous_cursor:
+					start > 0 && items.length > 0
+						? demoPublicReleaseCursor(items[0])
+						: null,
+				next_cursor: null,
+			};
+		}
+
+		const start = cursorIndex + 1;
+		const items = sourceItems.slice(start, start + limit);
+		return {
+			...currentModel().publicReleaseList,
+			items,
+			previous_cursor: null,
+			next_cursor:
+				start + items.length < sourceItems.length && items.length > 0
+					? demoPublicReleaseCursor(items.at(-1)!)
+					: null,
+		};
+	}
+
+	const centered = centeredItems();
+	const start = centered ? sourceItems.indexOf(centered[0]) : 0;
+	const items = centered ?? sourceItems.slice(start, start + limit);
+	const end = start + items.length;
 	return {
 		...currentModel().publicReleaseList,
 		items,
+		previous_cursor:
+			start > 0 && items.length > 0 ? demoPublicReleaseCursor(items[0]) : null,
 		next_cursor:
-			start + items.length < sourceItems.length
+			end < sourceItems.length && items.length > 0
 				? demoPublicReleaseCursor(items.at(-1)!)
 				: null,
 	};
@@ -2571,6 +2665,22 @@ export const demoHandlers = [
 	http.get("/api/public/repos/:owner/:repo/releases", async ({ request }) => {
 		const network = await applyNetworkProfile(request);
 		if (network) return network;
+		const url = new URL(request.url);
+		const focus = url.searchParams.get("focus");
+		if (
+			focus &&
+			!findDemoPublicRelease(currentModel().publicReleaseList.items, focus)
+		) {
+			return json(
+				{
+					error: {
+						code: "release_not_found_or_not_cached",
+						message: "release not found or not cached",
+					},
+				},
+				{ status: 404 },
+			);
+		}
 		return json(buildDemoPublicReleaseList(request));
 	}),
 	http.get(

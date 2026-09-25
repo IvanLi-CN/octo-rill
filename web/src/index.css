@@ -130,6 +130,36 @@
 	}
 }
 
+@media (prefers-reduced-motion: no-preference) {
+	.public-release-focus-pulse {
+		animation: public-release-focus-pulse 3s ease-out both;
+	}
+}
+
+.public-release-focus-pulse {
+	border-radius: 0.9rem;
+	box-shadow:
+		0 0 0 1px color-mix(in srgb, var(--primary) 48%, transparent),
+		0 0 0.9rem color-mix(in srgb, var(--primary) 18%, transparent);
+}
+
+.public-release-virtual-scroll {
+	overflow-anchor: none;
+}
+
+@keyframes public-release-focus-pulse {
+	0% {
+		box-shadow:
+			0 0 0 2px color-mix(in srgb, var(--primary) 58%, transparent),
+			0 0 1.2rem color-mix(in srgb, var(--primary) 25%, transparent);
+	}
+	100% {
+		box-shadow:
+			0 0 0 1px color-mix(in srgb, var(--primary) 38%, transparent),
+			0 0 0.65rem color-mix(in srgb, var(--primary) 12%, transparent);
+	}
+}
+
 @layer base {
 	html {
 		min-height: 100%;
