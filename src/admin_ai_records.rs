@@ -793,7 +793,7 @@ async fn load_global_task_rows_in_connection(
     let identity_upgrade_complete = identity_upgrade_state
         .is_some_and(|(status, phase)| status == "completed" && phase == "complete");
     let source = if identity_upgrade_complete {
-        "WITH ranked_members AS (SELECT m.identity_id, w.*, ROW_NUMBER() OVER (PARTITION BY m.identity_id ORDER BY CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'ready' THEN 4 WHEN 'failed' THEN 5 WHEN 'superseded' THEN 9 ELSE 6 END, w.attempt_count DESC, julianday(w.updated_at) DESC, w.updated_at DESC, w.id DESC) AS member_rank FROM content_work_identity_members m JOIN content_work_items w ON w.id = m.work_item_id), canonical_work AS (SELECT * FROM ranked_members WHERE member_rank = 1) SELECT w.pipeline, i.source_hash, w.status, w.attempt_count, w.started_at, w.finished_at, w.updated_at, (SELECT MAX(e.created_at) FROM content_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at, w.canonical_resource_id, p.work_item_id AS projection_work_item_id, i.source_hash AS projection_source_hash, p.updated_at AS projection_updated_at FROM canonical_work w JOIN content_work_identities i ON i.id = w.identity_id LEFT JOIN content_current_result_projections p ON p.identity_id = i.id WHERE w.canonical_resource_type = "
+        "WITH ranked_members AS (SELECT m.identity_id, w.*, ROW_NUMBER() OVER (PARTITION BY m.identity_id ORDER BY CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'failed' THEN 4 WHEN 'ready' THEN 5 WHEN 'superseded' THEN 9 ELSE 6 END, w.attempt_count DESC, julianday(w.updated_at) DESC, w.updated_at DESC, w.id DESC) AS member_rank FROM content_work_identity_members m JOIN content_work_items w ON w.id = m.work_item_id), canonical_work AS (SELECT * FROM ranked_members WHERE member_rank = 1) SELECT w.pipeline, i.source_hash, w.status, w.attempt_count, w.started_at, w.finished_at, w.updated_at, (SELECT MAX(e.created_at) FROM content_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at, w.canonical_resource_id, p.work_item_id AS projection_work_item_id, i.source_hash AS projection_source_hash, p.updated_at AS projection_updated_at FROM canonical_work w JOIN content_work_identities i ON i.id = w.identity_id LEFT JOIN content_current_result_projections p ON p.identity_id = i.id WHERE w.canonical_resource_type = "
     } else {
         "SELECT w.pipeline, w.source_hash, w.status, w.attempt_count, w.started_at, w.finished_at, w.updated_at, (SELECT MAX(e.created_at) FROM content_attempt_events e WHERE e.work_item_id = w.id) AS last_attempt_at, w.canonical_resource_id, (SELECT p.work_item_id FROM content_result_projections p WHERE p.canonical_resource_type = w.canonical_resource_type AND p.canonical_resource_id = w.canonical_resource_id AND p.pipeline = w.pipeline AND p.variant = w.variant AND p.target_lang = w.target_lang AND p.protocol_version = w.protocol_version AND p.model_profile = w.model_profile AND p.source_hash = w.source_hash ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_work_item_id, (SELECT p.source_hash FROM content_result_projections p WHERE p.canonical_resource_type = w.canonical_resource_type AND p.canonical_resource_id = w.canonical_resource_id AND p.pipeline = w.pipeline AND p.variant = w.variant AND p.target_lang = w.target_lang AND p.protocol_version = w.protocol_version AND p.model_profile = w.model_profile AND p.source_hash = w.source_hash ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_source_hash, (SELECT p.updated_at FROM content_result_projections p WHERE p.canonical_resource_type = w.canonical_resource_type AND p.canonical_resource_id = w.canonical_resource_id AND p.pipeline = w.pipeline AND p.variant = w.variant AND p.target_lang = w.target_lang AND p.protocol_version = w.protocol_version AND p.model_profile = w.model_profile AND p.source_hash = w.source_hash ORDER BY julianday(p.updated_at) DESC, p.updated_at DESC, p.id DESC LIMIT 1) AS projection_updated_at FROM content_work_items w WHERE w.canonical_resource_type = "
     };
@@ -808,7 +808,7 @@ async fn load_global_task_rows_in_connection(
     }
     query.push(")");
     query.push(" AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared')) OR (w.pipeline = 'polishing' AND w.variant = 'smart'))");
-    query.push(" ORDER BY julianday(w.created_at) DESC, w.created_at DESC, CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'ready' THEN 4 WHEN 'failed' THEN 5 WHEN 'superseded' THEN 9 ELSE 6 END, CASE WHEN w.pipeline = 'translation' AND w.variant = 'detail' THEN 0 ELSE 1 END, julianday(w.updated_at) DESC, w.updated_at DESC, w.id DESC");
+    query.push(" ORDER BY julianday(w.created_at) DESC, w.created_at DESC, CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'failed' THEN 4 WHEN 'ready' THEN 5 WHEN 'superseded' THEN 9 ELSE 6 END, CASE WHEN w.pipeline = 'translation' AND w.variant = 'detail' THEN 0 ELSE 1 END, julianday(w.updated_at) DESC, w.updated_at DESC, w.id DESC");
     let rows = match query
         .build_query_as::<GlobalTaskRow>()
         .fetch_all(&mut *connection)
@@ -1067,7 +1067,7 @@ fn legacy_summary_with_evidence(
         summary
     };
     if !rows.is_empty() {
-        summary.status_origin = "task".to_owned();
+        summary.status_origin = "legacy_evidence".to_owned();
     }
     summary
 }
@@ -1076,7 +1076,7 @@ fn legacy_conflict_summary_with_tasks(rows: &[TaskRow]) -> AdminCollectionTaskSu
     let mut summary = merge_summary(rows, "task");
     summary.status = "legacy_conflict".to_owned();
     summary.display_status = "legacy_conflict".to_owned();
-    summary.status_origin = "task".to_owned();
+    summary.status_origin = "legacy_conflict".to_owned();
     summary.legacy_evidence = Some(AdminContentProcessingEvidence {
         status: "legacy_conflict".to_owned(),
         status_origin: "legacy_conflict".to_owned(),
@@ -1598,7 +1598,7 @@ fn global_work_candidates_ctes(
                         ORDER BY CASE w.status
                             WHEN 'queued' THEN 0 WHEN 'running' THEN 1
                             WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3
-                            WHEN 'ready' THEN 4 WHEN 'failed' THEN 5
+                            WHEN 'failed' THEN 4 WHEN 'ready' THEN 5
                             WHEN 'superseded' THEN 9 ELSE 6 END,
                             w.attempt_count DESC, julianday(w.updated_at) DESC,
                             w.updated_at DESC, w.id DESC
@@ -1759,8 +1759,8 @@ fn activity_query_sql(
                                     WHEN 'running' THEN 1
                                     WHEN 'deferred_provider' THEN 2
                                     WHEN 'blocked_config' THEN 3
-                                    WHEN 'ready' THEN 4
-                                    WHEN 'failed' THEN 5
+                                    WHEN 'failed' THEN 4
+                                    WHEN 'ready' THEN 5
                                     WHEN 'superseded' THEN 9
                                     ELSE 6
                                 END,
@@ -2138,8 +2138,8 @@ fn collection_query_sql(
                                     WHEN 'running' THEN 1
                                     WHEN 'deferred_provider' THEN 2
                                     WHEN 'blocked_config' THEN 3
-                                    WHEN 'ready' THEN 4
-                                    WHEN 'failed' THEN 5
+                                    WHEN 'failed' THEN 4
+                                    WHEN 'ready' THEN 5
                                     WHEN 'superseded' THEN 9
                                     ELSE 6
                                 END,
@@ -2180,8 +2180,10 @@ fn collection_query_sql(
                             END
                         ) AS attempt_count,
                         CASE
-                            WHEN (gt.entity_id IS NOT NULL OR lt.entity_id IS NOT NULL OR ct.status_origin = 'never_started')
-                             AND (gp.entity_id IS NOT NULL OR lp.entity_id IS NOT NULL OR cp.status_origin = 'never_started')
+                            WHEN (gt.entity_id IS NOT NULL OR ct.status_origin = 'never_started')
+                             AND ot.entity_id IS NULL
+                             AND (gp.entity_id IS NOT NULL OR cp.status_origin = 'never_started')
+                             AND op.entity_id IS NULL
                             THEN 1 ELSE 0
                         END AS attempt_count_known
                     FROM source_records s
@@ -2228,8 +2230,8 @@ fn collection_query_sql(
                         {polish_status} AS polish_status,
                         MAX(COALESCE(lat.attempt_count, 0), COALESCE(lap.attempt_count, 0)) AS attempt_count,
                         CASE
-                            WHEN (lt.entity_id IS NOT NULL OR ct.status_origin = 'never_started')
-                             AND (lp.entity_id IS NOT NULL OR cp.status_origin = 'never_started')
+                            WHEN ((lt.entity_id IS NOT NULL AND ot.entity_id IS NULL) OR ct.status_origin = 'never_started')
+                             AND ((lp.entity_id IS NOT NULL AND op.entity_id IS NULL) OR cp.status_origin = 'never_started')
                             THEN 1 ELSE 0
                         END AS attempt_count_known
                     FROM source_records s
@@ -3022,21 +3024,36 @@ async fn load_task_attempts(
     Ok(attempts)
 }
 
+async fn load_global_attempt_rows_in_connection(
+    connection: &mut SqliteConnection,
+    kind: CollectionRecordKind,
+    entity_id: &str,
+) -> Result<Vec<GlobalAttemptRow>, ApiError> {
+    let identity_upgrade_complete = identity_upgrade_complete_in_connection(connection).await?;
+    let sql = if identity_upgrade_complete {
+        GLOBAL_CANONICAL_ATTEMPT_ROWS_SQL
+    } else {
+        GLOBAL_ATTEMPT_ROWS_SQL
+    };
+    match sqlx::query_as::<_, GlobalAttemptRow>(sql)
+        .bind(collection_record_kind_label(kind))
+        .bind(entity_id)
+        .fetch_all(&mut *connection)
+        .await
+    {
+        Ok(rows) => Ok(rows),
+        Err(error) if missing_table(&error) => Ok(Vec::new()),
+        Err(error) => Err(ApiError::internal(error)),
+    }
+}
+
 async fn load_global_attempts(
     state: &AppState,
     kind: CollectionRecordKind,
     entity_id: &str,
 ) -> Result<Vec<AdminCollectionAttempt>, ApiError> {
-    let rows = match sqlx::query_as::<_, GlobalAttemptRow>(GLOBAL_ATTEMPT_ROWS_SQL)
-        .bind(collection_record_kind_label(kind))
-        .bind(entity_id)
-        .fetch_all(&state.pool)
-        .await
-    {
-        Ok(rows) => rows,
-        Err(error) if missing_table(&error) => return Ok(Vec::new()),
-        Err(error) => return Err(ApiError::internal(error)),
-    };
+    let mut connection = state.pool.acquire().await.map_err(ApiError::internal)?;
+    let rows = load_global_attempt_rows_in_connection(&mut connection, kind, entity_id).await?;
     let mut call_query = QueryBuilder::<Sqlite>::new(
         "SELECT id, attempt_event_id, status, model FROM content_attempt_llm_calls WHERE attempt_event_id IN (",
     );
@@ -3173,6 +3190,8 @@ async fn load_global_attempts(
 }
 
 const GLOBAL_ATTEMPT_ROWS_SQL: &str = "SELECT e.id AS event_id, e.work_item_id, w.pipeline, e.attempt_no, e.trigger, e.event_type, e.result_status, e.error_code, e.error_summary, e.failure_class, e.retry_eligible, e.next_retry_at, e.created_at FROM content_attempt_events e JOIN content_work_items w ON w.id = e.work_item_id WHERE w.canonical_resource_type = ? AND w.canonical_resource_id = ? AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared')) OR (w.pipeline = 'polishing' AND w.variant = 'smart')) ORDER BY julianday(e.created_at) ASC, e.created_at ASC, e.id ASC";
+
+const GLOBAL_CANONICAL_ATTEMPT_ROWS_SQL: &str = "WITH ranked_members AS (SELECT m.identity_id, w.id AS work_item_id, ROW_NUMBER() OVER (PARTITION BY m.identity_id ORDER BY CASE w.status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3 WHEN 'failed' THEN 4 WHEN 'ready' THEN 5 WHEN 'superseded' THEN 9 ELSE 6 END, w.attempt_count DESC, julianday(w.updated_at) DESC, w.updated_at DESC, w.id DESC) AS member_rank FROM content_work_identity_members m JOIN content_work_items w ON w.id = m.work_item_id WHERE w.canonical_resource_type = ? AND w.canonical_resource_id = ? AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared')) OR (w.pipeline = 'polishing' AND w.variant = 'smart'))), canonical_work AS (SELECT work_item_id FROM ranked_members WHERE member_rank = 1) SELECT e.id AS event_id, e.work_item_id, w.pipeline, e.attempt_no, e.trigger, e.event_type, e.result_status, e.error_code, e.error_summary, e.failure_class, e.retry_eligible, e.next_retry_at, e.created_at FROM content_attempt_events e JOIN canonical_work cw ON cw.work_item_id = e.work_item_id JOIN content_work_items w ON w.id = e.work_item_id ORDER BY julianday(e.created_at) ASC, e.created_at ASC, e.id ASC";
 
 async fn load_brief_attempts(
     state: &AppState,
@@ -4750,6 +4769,7 @@ mod tests {
         );
         assert_eq!(summary.translation.attempt_count, 2);
         assert_eq!(summary.polish.display_status, "legacy_conflict");
+        assert_eq!(summary.polish.status_origin, "legacy_conflict");
         assert_eq!(summary.polish.attempt_count, 3);
         assert_eq!(
             summary.polish.last_attempt_at.as_deref(),
@@ -4774,8 +4794,8 @@ mod tests {
         )
         .await
         .expect("filter the mixed-mode release by its legacy polish summary");
-        assert_eq!(total, 1);
-        assert_eq!(rows[0].id, "101");
+        assert_eq!(total, 0);
+        assert!(rows.is_empty());
 
         let (blocked_total, blocked_rows) = list_collection_page(
             &pool,
@@ -5684,7 +5704,7 @@ mod tests {
             .await
             .expect("create historical projections");
         sqlx::query(
-            "CREATE TABLE content_attempt_events (id TEXT, work_item_id TEXT, created_at TEXT)",
+            "CREATE TABLE content_attempt_events (id TEXT, work_item_id TEXT, attempt_no INTEGER, trigger TEXT, event_type TEXT, result_status TEXT, error_code TEXT, error_summary TEXT, failure_class TEXT, retry_eligible INTEGER, next_retry_at TEXT, created_at TEXT)",
         )
         .execute(&pool)
         .await
@@ -5701,16 +5721,24 @@ mod tests {
             .expect("seed work identity");
         sqlx::query(
             "INSERT INTO content_work_items VALUES
-                ('queued-old', 'release', '101', 'translation', 'detail', 'zh-CN', 'hash-1', 'v1', 'test', 'queued', 1, NULL, NULL, '2026-07-08T08:30:00Z', '2026-07-08T08:31:00Z'),
+                ('ready-old', 'release', '101', 'translation', 'detail', 'zh-CN', 'hash-1', 'v1', 'test', 'ready', 4, NULL, '2026-07-08T08:50:00Z', '2026-07-08T08:30:00Z', '2026-07-08T08:50:00Z'),
                 ('failed-new', 'release', '101', 'translation', 'detail', 'zh-CN', 'hash-1', 'v1', 'test', 'failed', 3, '2026-07-08T08:40:00Z', '2026-07-08T08:41:00Z', '2026-07-08T08:40:00Z', '2026-07-08T08:41:00Z')",
         )
         .execute(&pool)
         .await
         .expect("seed identity members");
-        sqlx::query("INSERT INTO content_work_identity_members VALUES ('identity-1', 'queued-old'), ('identity-1', 'failed-new')")
+        sqlx::query("INSERT INTO content_work_identity_members VALUES ('identity-1', 'ready-old'), ('identity-1', 'failed-new')")
             .execute(&pool)
             .await
             .expect("link identity members");
+        sqlx::query(
+            "INSERT INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, retry_eligible, created_at)
+             VALUES ('ready-event', 'ready-old', 1, 'initial', 'attempt_completed', 0, '2026-07-08T08:35:00Z'),
+                    ('failed-event', 'failed-new', 3, 'automatic_recovery', 'attempt_completed', 0, '2026-07-08T08:41:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed attempts for both identity members");
 
         let (total, rows) = list_collection_page(
             &pool,
@@ -5735,7 +5763,7 @@ mod tests {
             true,
             Some("2026-07-08T08:00:00Z"),
             Some("2026-07-08T10:00:00Z"),
-            AttemptCountRange { min: 2, max: None },
+            AttemptCountRange { min: 4, max: None },
             None,
             None,
             20,
@@ -5755,7 +5783,7 @@ mod tests {
         )
         .await
         .expect("read activity with completed identity upgrade");
-        assert_eq!(activity[0].translation_status.as_deref(), Some("queued"));
+        assert_eq!(activity[0].translation_status.as_deref(), Some("failed"));
 
         let mut connection = pool.acquire().await.expect("acquire test connection");
         let detail_rows = load_global_task_rows_in_connection(
@@ -5766,8 +5794,18 @@ mod tests {
         .await
         .expect("load canonical detail work");
         assert_eq!(detail_rows.len(), 1);
-        assert_eq!(detail_rows[0].status, "queued");
-        assert_eq!(detail_rows[0].attempt_count, 1);
+        assert_eq!(detail_rows[0].status, "failed");
+        assert_eq!(detail_rows[0].attempt_count, 3);
+
+        let attempts = load_global_attempt_rows_in_connection(
+            &mut connection,
+            CollectionRecordKind::Release,
+            "101",
+        )
+        .await
+        .expect("load only canonical member attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].event_id, "failed-event");
     }
 
     #[test]

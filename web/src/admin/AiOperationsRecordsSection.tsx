@@ -1142,7 +1142,7 @@ function RecordDetail({
 				<div className="flex items-center justify-between gap-3">
 					<h3 className="font-semibold text-sm">尝试记录</h3>
 					<span className="text-muted-foreground text-xs">
-						{attempts.length} 次
+						{attempts.length} 条
 					</span>
 				</div>
 				{attempts.length === 0 ? (
