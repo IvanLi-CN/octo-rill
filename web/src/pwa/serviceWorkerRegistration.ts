@@ -1,5 +1,5 @@
 type PwaServiceWorkerUpdateController = {
-	applyUpdate: () => void;
+	applyUpdate: () => Promise<boolean>;
 };
 
 type PwaServiceWorkerRegistrationController = {
@@ -13,9 +13,56 @@ type RegisterPwaServiceWorkerOptions = {
 };
 
 const SW_URL = "/sw.js";
+const ACTIVATION_TIMEOUT_MS = 15_000;
 let registered = false;
 let reloadingForControllerChange = false;
 let shouldReloadOnControllerChange = false;
+let pendingActivation: {
+	promise: Promise<boolean>;
+	resolve: (activated: boolean) => void;
+	timeoutId: number;
+} | null = null;
+
+function finishActivation(activated: boolean) {
+	const attempt = pendingActivation;
+	if (!attempt) return;
+
+	pendingActivation = null;
+	window.clearTimeout(attempt.timeoutId);
+	attempt.resolve(activated);
+}
+
+function applyWaitingWorker(registration: ServiceWorkerRegistration) {
+	if (pendingActivation) return pendingActivation.promise;
+
+	const worker = registration.waiting;
+	if (!worker) {
+		window.location.reload();
+		return Promise.resolve(true);
+	}
+
+	shouldReloadOnControllerChange = true;
+	let timeoutId = 0;
+	let resolveAttempt!: (activated: boolean) => void;
+	const promise = new Promise<boolean>((resolve) => {
+		resolveAttempt = resolve;
+		timeoutId = window.setTimeout(() => {
+			if (pendingActivation?.promise !== promise) return;
+			shouldReloadOnControllerChange = false;
+			finishActivation(false);
+		}, ACTIVATION_TIMEOUT_MS);
+	});
+	pendingActivation = { promise, resolve: resolveAttempt, timeoutId };
+
+	try {
+		worker.postMessage({ type: "SKIP_WAITING" });
+	} catch {
+		shouldReloadOnControllerChange = false;
+		finishActivation(false);
+	}
+
+	return promise;
+}
 
 function isPwaServiceWorkerSupported() {
 	return (
@@ -45,17 +92,14 @@ export function registerPwaServiceWorker(
 					},
 				});
 
-				const notify = (worker: ServiceWorker) => {
+				const notify = () => {
 					options.onNeedRefresh({
-						applyUpdate: () => {
-							shouldReloadOnControllerChange = true;
-							worker.postMessage({ type: "SKIP_WAITING" });
-						},
+						applyUpdate: () => applyWaitingWorker(registration),
 					});
 				};
 
 				if (registration.waiting) {
-					notify(registration.waiting);
+					notify();
 				}
 
 				registration.addEventListener("updatefound", () => {
@@ -67,7 +111,7 @@ export function registerPwaServiceWorker(
 							installingWorker.state === "installed" &&
 							navigator.serviceWorker.controller
 						) {
-							notify(installingWorker);
+							notify();
 						}
 					});
 				});
@@ -87,6 +131,8 @@ export function registerPwaServiceWorker(
 		if (!shouldReloadOnControllerChange) return;
 		if (reloadingForControllerChange) return;
 		reloadingForControllerChange = true;
+		shouldReloadOnControllerChange = false;
+		finishActivation(true);
 		window.location.reload();
 	});
 }

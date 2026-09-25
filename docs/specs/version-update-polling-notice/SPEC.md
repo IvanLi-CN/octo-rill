@@ -1,6 +1,6 @@
 # 服务器版本变更后的 Web 轻提示
 
-## 背景 / 问题陈述
+## Context and Scope
 
 - 现有 Web 端只在 footer 显示当前版本；服务端部署新版本后，已打开页面的用户没有任何温和反馈。
 - 当前前台/管理页没有长期在线的版本 SSE 通道，不适合为这个单点能力额外维护一条持续连接。
@@ -10,9 +10,10 @@
 
 ### Goals
 
-- 在统一 Web 壳层增加一个低打扰的顶部轻提示：当服务端版本变化时提示“有新版本可用”。
+- 在统一 Web 壳层增加一个低打扰的顶部轻提示：服务端发布版本变化时提示新版本号，只有 Service Worker 资源变化时说明应用资源已准备更新。
 - 使用前端轮询而不是长期 SSE；默认只在页面可见时轮询，发现新版本后停止继续轮询。
 - 明确区分“当前页已加载版本”和“服务端最新版本”，避免 footer 直接跳成尚未刷新的未来版本。
+- Worker-only 更新不伪造服务端发布号；footer 仍只展示当前页面嵌入的发布版本。
 - 复用现有 `GET /api/version`，失败时回退 `GET /api/health`，并补齐请求/响应两侧的防缓存保护。
 - 为 Landing、Dashboard、Admin 三类共享壳层页面统一生效。
 
@@ -40,26 +41,35 @@
 - 页面内部局部热替换。
 - 移动端/桌面端独立提示策略。
 
-## 需求（Requirements）
+## Requirements
 
 ### MUST
 
-- 当首次加载页面成功拿到版本后，footer 持续展示该“已加载版本”，直到用户主动刷新整页。
-- 轮询间隔固定为 60 秒；页面不可见时暂停常规轮询，重新可见时可立即补一次检查。
-- 检测到新版本后必须显示顶部轻提示，并停止后续版本轮询。
-- 轻提示必须提供低打扰“刷新”动作，并触发整页 reload。
-- `/api/version` 请求失败时必须自动回退 `/api/health`。
-- 版本检查请求与响应都必须显式禁用缓存，避免部署后读到旧值。
+- `REQ-VERSION-LOADED`: 首次加载页面成功拿到版本后，footer MUST 持续展示该“已加载版本”，直到用户主动刷新整页。
+- `REQ-VERSION-POLLING`: 轮询间隔 MUST 固定为 60 秒；页面不可见时暂停常规轮询，重新可见时可立即补一次检查。
+- `REQ-VERSION-NOTICE`: 检测到新版本后 MUST 显示顶部轻提示，并停止后续版本轮询。
+- `REQ-VERSION-REFRESH`: 轻提示 MUST 提供低打扰“刷新”动作，并触发整页 reload。
+- `REQ-VERSION-WORKER`: Worker-only 提示点击后 MUST 激活当前 waiting Worker，并在 controller 切换后仅 reload 一次；15 秒内没有切换时显示可再次执行的“重试”动作。
+- `REQ-VERSION-FALLBACK`: `/api/version` 请求失败时 MUST 自动回退 `/api/health`。
+- `REQ-VERSION-NO-CACHE`: 版本检查请求与响应都 MUST 显式禁用缓存，避免部署后读到旧值。
 
 ### SHOULD
 
-- 轻提示视觉上与现有壳层风格一致，弱于 destructive/warning 级别提醒。
-- Storybook 需要提供稳定的 app-shell 状态覆盖与交互校验。
-- Playwright 需要覆盖“无提示 / 检出更新 / health fallback / 刷新后稳态”四类行为。
+- `REQ-VERSION-STYLE`: 轻提示视觉上 SHOULD 与现有壳层风格一致，弱于 destructive/warning 级别提醒。
+- `REQ-VERSION-STORYBOOK`: Storybook SHOULD 提供稳定的 app-shell 状态覆盖与交互校验。
+- `REQ-VERSION-E2E`: Playwright SHOULD 覆盖“无提示 / 检出更新 / health fallback / 刷新后稳态”四类行为。
 
 ### COULD
 
 - 在 Storybook docs 中额外提供状态总览，便于后续复用为 PR/owner 视觉验收入口。
+
+## Verification
+
+- `VER-VERSION-STATE`: Browser checks for loaded-version display and polling cover: `REQ-VERSION-LOADED`, `REQ-VERSION-POLLING`, `REQ-VERSION-NOTICE`.
+- `VER-VERSION-REFRESH`: Browser checks for page refresh after server version drift cover: `REQ-VERSION-REFRESH`.
+- `VER-VERSION-WORKER`: Chromium lifecycle checks for waiting Worker activation, one reload, retry after timeout, and stable footer version cover: `REQ-VERSION-WORKER`.
+- `VER-VERSION-NETWORK`: Version monitor and server cache-control checks cover: `REQ-VERSION-FALLBACK`, `REQ-VERSION-NO-CACHE`.
+- `VER-VERSION-UI`: Storybook and Playwright app-shell update-state checks cover: `REQ-VERSION-STYLE`, `REQ-VERSION-STORYBOOK`, `REQ-VERSION-E2E`.
 
 ## 功能与行为规格（Functional/Behavior Spec）
 
@@ -68,6 +78,7 @@
 - 首次进入任一共享壳层页面时，前端先解析当前服务端版本并记录为 `loadedVersion`；footer 只展示这个值。
 - 前端在后台按 60 秒节奏检查最新版本；页面隐藏时不继续常规轮询，页面重新可见后补一次版本检查。
 - 当新检查结果与 `loadedVersion` 不一致时，页面显示一条细窄顶部轻提示，文案包含新版本号，并提供“刷新”按钮。
+- 当发布号没有变化但存在 waiting Service Worker 时，文案为“应用资源更新已准备好，刷新后完成切换”；此时 footer 保持原先嵌入版本。
 - 用户点击“刷新”后触发整页 reload；页面重新初始化后，footer 改为展示最新加载到的版本，轻提示消失。
 
 ### Edge cases / errors
@@ -108,6 +119,14 @@
 - Given 页面已经显示新版本轻提示
   When 用户点击“刷新”
   Then 页面执行整页 reload，重新加载后 footer 显示最新版本，且轻提示消失。
+
+- Given 只有应用资源更新，服务端发布号没有变化
+  When 用户点击“刷新”
+  Then 当前 waiting Worker 激活，旧预缓存删除，页面只 reload 一次，提示不再出现，footer 仍显示嵌入页面的发布号。
+
+- Given Worker 激活在 15 秒内没有完成
+  When 等待时间结束
+  Then 更新提示保留，并提供可再次执行的“重试”动作，不触发刷新循环。
 
 - Given 部署切换后存在代理/浏览器缓存
   When 前端轮询版本接口
@@ -165,3 +184,7 @@
 
 - `docs/specs/effective-version-surfacing/SPEC.md`
 - `web/src/layout/AppMetaFooter.tsx`
+
+## Related ADRs
+
+None
