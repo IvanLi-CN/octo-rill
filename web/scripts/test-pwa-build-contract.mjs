@@ -318,5 +318,6 @@ assert(
 );
 assert(serviceWorker.includes('event.data?.type === "SKIP_WAITING"'));
 assert(serviceWorker.includes("self.skipWaiting()"));
+assert(serviceWorker.includes("event.waitUntil(self.skipWaiting())"));
 
 console.log("PWA build contract tests passed");

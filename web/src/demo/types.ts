@@ -110,6 +110,7 @@ export type DemoLandingBootState = "ready" | "network-unavailable";
 export type DemoAppShellState =
 	| "steady"
 	| "update"
+	| "resource-update"
 	| "install"
 	| "update-install"
 	| "unknown";

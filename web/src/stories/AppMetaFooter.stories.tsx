@@ -38,6 +38,7 @@ function FooterPreview(props: FooterPreviewProps) {
 		availableVersion: props.availableVersion,
 		hasUpdate: props.hasUpdate,
 		hasServiceWorkerUpdate: false,
+		serviceWorkerUpdatePhase: "idle",
 		refreshPage: () => undefined,
 	};
 

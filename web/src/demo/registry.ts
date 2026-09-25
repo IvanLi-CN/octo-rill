@@ -70,6 +70,7 @@ export const LANDING_BOOT_STATE_OPTIONS = [
 export const APP_SHELL_STATE_OPTIONS = [
 	{ value: "steady", label: "Steady" },
 	{ value: "update", label: "Update available" },
+	{ value: "resource-update", label: "App resources updated" },
 	{ value: "install", label: "Installable" },
 	{ value: "update-install", label: "Update and install" },
 	{ value: "unknown", label: "Unknown version" },

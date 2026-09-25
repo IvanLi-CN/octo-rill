@@ -29,6 +29,7 @@ export type VersionMonitorValue = {
 	availableVersion: string | null;
 	hasUpdate: boolean;
 	hasServiceWorkerUpdate: boolean;
+	serviceWorkerUpdatePhase: "idle" | "activating" | "failed";
 	canInstallPwa?: boolean;
 	isPwaInstalled?: boolean;
 	refreshPage: () => void;
@@ -64,6 +65,7 @@ const defaultValue: VersionMonitorValue = {
 	availableVersion: null,
 	hasUpdate: false,
 	hasServiceWorkerUpdate: false,
+	serviceWorkerUpdatePhase: "idle",
 	canInstallPwa: false,
 	isPwaInstalled: false,
 	refreshPage: defaultRefreshPage,
@@ -73,6 +75,7 @@ const defaultValue: VersionMonitorValue = {
 function readDemoAppShellState():
 	| "steady"
 	| "update"
+	| "resource-update"
 	| "install"
 	| "update-install"
 	| "unknown"
@@ -82,6 +85,7 @@ function readDemoAppShellState():
 	if (params.get("demo") !== "app-shell") return null;
 	const value = params.get("d_shell");
 	return value === "update" ||
+		value === "resource-update" ||
 		value === "install" ||
 		value === "update-install" ||
 		value === "unknown"
@@ -174,13 +178,16 @@ function useVersionMonitorController(
 	const [availableVersion, setAvailableVersion] = useState<string | null>(null);
 	const [hasUpdate, setHasUpdate] = useState(false);
 	const [hasServiceWorkerUpdate, setHasServiceWorkerUpdate] = useState(false);
+	const [serviceWorkerUpdatePhase, setServiceWorkerUpdatePhase] = useState<
+		"idle" | "activating" | "failed"
+	>("idle");
 	const [canInstallPwa, setCanInstallPwa] = useState(false);
 	const [isPwaInstalled, setIsPwaInstalled] = useState(() =>
 		isStandalonePwaDisplayMode(),
 	);
 	const baselineVersionRef = useRef(EMBEDDED_APP_VERSION);
 	const hasUpdateRef = useRef(false);
-	const serviceWorkerRefreshRef = useRef<(() => void) | null>(null);
+	const serviceWorkerRefreshRef = useRef<(() => Promise<boolean>) | null>(null);
 	const serviceWorkerUpdateCheckRef = useRef<(() => void) | null>(null);
 	const pendingServiceWorkerUpdateCheckRef = useRef(false);
 	const pwaInstallPromptRef = useRef<BeforeInstallPromptEvent | null>(null);
@@ -208,6 +215,9 @@ function useVersionMonitorController(
 		registerPwaServiceWorker({
 			onNeedRefresh(controller) {
 				serviceWorkerRefreshRef.current = controller.applyUpdate;
+				setServiceWorkerUpdatePhase((phase) =>
+					phase === "activating" ? phase : "idle",
+				);
 				setHasServiceWorkerUpdate(true);
 				setHasUpdate(true);
 			},
@@ -342,6 +352,20 @@ function useVersionMonitorController(
 		requestServiceWorkerUpdateCheck,
 	]);
 
+	const refreshPage = useCallback(() => {
+		const applyServiceWorkerUpdate = serviceWorkerRefreshRef.current;
+		if (hasServiceWorkerUpdate && applyServiceWorkerUpdate) {
+			setServiceWorkerUpdatePhase("activating");
+			void applyServiceWorkerUpdate()
+				.then((activated) => {
+					if (!activated) setServiceWorkerUpdatePhase("failed");
+				})
+				.catch(() => setServiceWorkerUpdatePhase("failed"));
+			return;
+		}
+		defaultRefreshPage();
+	}, [hasServiceWorkerUpdate]);
+
 	return useMemo(() => {
 		if (demoAppShellState && demoAppShellState !== "steady") {
 			const hasDemoUpdate =
@@ -355,7 +379,8 @@ function useVersionMonitorController(
 					demoAppShellState === "unknown" ? VERSION_UNKNOWN : loadedVersion,
 				availableVersion: hasDemoUpdate ? "v2.32.0" : null,
 				hasUpdate: hasDemoUpdate,
-				hasServiceWorkerUpdate: false,
+				hasServiceWorkerUpdate: demoAppShellState === "resource-update",
+				serviceWorkerUpdatePhase: "idle",
 				canInstallPwa: hasDemoInstall,
 				isPwaInstalled: false,
 				refreshPage: () => {},
@@ -368,16 +393,10 @@ function useVersionMonitorController(
 			availableVersion,
 			hasUpdate,
 			hasServiceWorkerUpdate,
+			serviceWorkerUpdatePhase,
 			canInstallPwa,
 			isPwaInstalled,
-			refreshPage: () => {
-				const applyServiceWorkerUpdate = serviceWorkerRefreshRef.current;
-				if (applyServiceWorkerUpdate) {
-					applyServiceWorkerUpdate();
-					return;
-				}
-				defaultRefreshPage();
-			},
+			refreshPage,
 			promptInstallPwa,
 		};
 	}, [
@@ -385,9 +404,11 @@ function useVersionMonitorController(
 		canInstallPwa,
 		hasServiceWorkerUpdate,
 		hasUpdate,
+		serviceWorkerUpdatePhase,
 		isPwaInstalled,
 		loadedVersion,
 		promptInstallPwa,
+		refreshPage,
 		demoAppShellState,
 	]);
 }

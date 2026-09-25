@@ -23,6 +23,7 @@ type StaticPwaServer = {
 	origin: string;
 	setApiVersion: (version: string) => void;
 	setServiceWorkerRevision: (revision: number) => void;
+	setSkipWaitingSuppressed: (suppressed: boolean) => void;
 	setPwaRelease: (release: "v1" | "v2") => void;
 	getApiMeRequests: () => number;
 	getManifestRequests: () => number;
@@ -151,6 +152,7 @@ async function startStaticPwaServer(): Promise<StaticPwaServer> {
 	const releases = await createPwaReleases();
 	let apiVersion = "0.1.0";
 	let serviceWorkerRevision = 1;
+	let skipWaitingSuppressed = false;
 	let activeRelease: PwaRelease = releases.v1;
 	let apiMeRequests = 0;
 	let manifestRequests = 0;
@@ -217,14 +219,34 @@ async function startStaticPwaServer(): Promise<StaticPwaServer> {
 				}
 				if (requestUrl.pathname === "/sw.js") {
 					serviceWorkerRequests += 1;
+					const cacheRevision = String(serviceWorkerRevision).padStart(16, "0");
+					body = Buffer.from(
+						body
+							.toString("utf8")
+							.replace(
+								/const PRECACHE_CACHE = "octo-rill-precache-[^"]+";/,
+								`const PRECACHE_CACHE = ${JSON.stringify(`octo-rill-precache-${cacheRevision}`)};`,
+							)
+							.replace(
+								"self.skipWaiting()",
+								"self.__OCTORILL_TEST_SUPPRESS_SKIP_WAITING ? Promise.resolve() : self.skipWaiting()",
+							),
+					);
 					body = Buffer.concat([
 						body,
 						Buffer.from(
 							`
 self.__OCTORILL_TEST_SW_REVISION = ${JSON.stringify(serviceWorkerRevision)};
+self.__OCTORILL_TEST_SUPPRESS_SKIP_WAITING = ${JSON.stringify(skipWaitingSuppressed)};
 self.addEventListener("message", (event) => {
 	if (event.data?.type === "SKIP_WAITING") {
 		fetch("/__sw-skip-waiting", { method: "POST" }).catch(() => {});
+	}
+	if (event.data?.type === "TEST_RELEASE_SKIP_WAITING") {
+		event.waitUntil(self.skipWaiting());
+	}
+	if (event.data?.type === "GET_TEST_SW_REVISION") {
+		event.ports?.[0]?.postMessage(self.__OCTORILL_TEST_SW_REVISION);
 	}
 });
 `,
@@ -272,6 +294,9 @@ self.addEventListener("message", (event) => {
 		setServiceWorkerRevision(revision: number) {
 			serviceWorkerRevision = revision;
 		},
+		setSkipWaitingSuppressed(suppressed: boolean) {
+			skipWaitingSuppressed = suppressed;
+		},
 		setPwaRelease(release: "v1" | "v2") {
 			activeRelease = releases[release];
 		},
@@ -298,6 +323,14 @@ self.addEventListener("message", (event) => {
 				server.close((error) => (error ? reject(error) : resolve()));
 			}),
 	};
+}
+
+function buildFrontendWithVersion(version: string) {
+	execFileSync("bun", ["run", "build"], {
+		cwd: path.resolve(import.meta.dirname, ".."),
+		env: { ...process.env, APP_EFFECTIVE_VERSION: version },
+		stdio: "inherit",
+	});
 }
 
 function resolveDistPath(pathname: string): string {
@@ -332,6 +365,42 @@ async function waitForServiceWorkerControl(page: Page) {
 				() => resolve(),
 				{ once: true },
 			);
+		});
+	});
+}
+
+async function trackDocumentNavigations(page: Page) {
+	let navigations = 0;
+	await page.exposeFunction("__octoRillTestDocumentNavigated", () => {
+		navigations += 1;
+	});
+	await page.addInitScript(() => {
+		if (window.top !== window.self) return;
+		const testWindow = window as Window & {
+			__octoRillTestDocumentNavigated?: () => Promise<void>;
+		};
+		void testWindow.__octoRillTestDocumentNavigated?.();
+	});
+	return () => navigations;
+}
+
+async function readActiveWorkerRevision(page: Page) {
+	return page.evaluate(async () => {
+		const worker = navigator.serviceWorker.controller;
+		if (!worker) return null;
+
+		const channel = new MessageChannel();
+		return new Promise<number>((resolve, reject) => {
+			const timeoutId = window.setTimeout(
+				() => reject(new Error("timed out reading active service worker")),
+				3_000,
+			);
+			channel.port1.addEventListener("message", (event) => {
+				window.clearTimeout(timeoutId);
+				resolve(Number(event.data));
+			});
+			channel.port1.start();
+			worker.postMessage({ type: "GET_TEST_SW_REVISION" }, [channel.port2]);
 		});
 	});
 }
@@ -930,16 +999,209 @@ test("offline authenticated boot shows an offline empty state when the active pa
 	}
 });
 
-test("version drift checks for a waiting service worker and activates only after refresh", async ({
+test("same-version service worker update activates once and clears its previous precache", async ({
 	page,
 }) => {
 	const server = await startStaticPwaServer();
 	try {
+		const getDocumentNavigationCount = await trackDocumentNavigations(page);
 		await page.goto(server.origin);
 		await waitForServiceWorkerControl(page);
+		await expect.poll(getDocumentNavigationCount).toBe(1);
+		const initialServiceWorkerRequests = server.getServiceWorkerRequests();
+		const initialCacheNames = await page.evaluate(() => caches.keys());
+		const initialPrecache = initialCacheNames.find((name) =>
+			name.startsWith("octo-rill-precache-"),
+		);
+		expect(initialPrecache).toBeTruthy();
+		expect(await readActiveWorkerRevision(page)).toBe(1);
+		await expect(
+			page.getByRole("link", { name: "Version v0.1.0" }),
+		).toBeVisible();
+
+		server.setServiceWorkerRevision(2);
+		await page.evaluate(() => {
+			document.dispatchEvent(new Event("visibilitychange"));
+		});
+
+		await expect
+			.poll(() => server.getServiceWorkerRequests())
+			.toBeGreaterThan(initialServiceWorkerRequests);
+		await expect
+			.poll(async () =>
+				page.evaluate(async () => {
+					const registration = await navigator.serviceWorker.ready;
+					return registration.waiting !== null;
+				}),
+			)
+			.toBe(true);
+		const updateNoticeMessage = await page
+			.locator("[data-version-update-message]")
+			.innerText();
+		await expect(
+			page.getByRole("link", { name: "Version v0.1.0" }),
+		).toBeVisible();
+		expect(await readActiveWorkerRevision(page)).toBe(1);
+		const waitingCacheNames = await page.evaluate(() => caches.keys());
+		expect(waitingCacheNames).toContain(initialPrecache);
+		expect(waitingCacheNames).toContain("octo-rill-precache-0000000000000002");
+
+		await page.getByRole("button", { name: "刷新" }).click();
+		await expect
+			.poll(async () => {
+				await page.waitForTimeout(500);
+				return getDocumentNavigationCount();
+			})
+			.toBe(2);
+		await expect(
+			page.getByRole("link", { name: "Version v0.1.0" }),
+		).toBeVisible();
+		await expect.poll(() => readActiveWorkerRevision(page)).toBe(2);
+		await expect
+			.poll(async () =>
+				page.evaluate(async () => {
+					const registration = await navigator.serviceWorker.ready;
+					return registration.waiting === null;
+				}),
+			)
+			.toBe(true);
+		await expect(page.locator("[data-version-update-notice]")).toHaveCount(0);
+		await expect.poll(getDocumentNavigationCount).toBe(2);
+		await expect
+			.poll(() => page.evaluate(() => caches.keys()))
+			.toEqual(["octo-rill-precache-0000000000000002"]);
+
+		const requestsAfterReload = server.getServiceWorkerRequests();
+		await page.evaluate(() => {
+			document.dispatchEvent(new Event("visibilitychange"));
+		});
+		await expect
+			.poll(() => server.getServiceWorkerRequests())
+			.toBeGreaterThan(requestsAfterReload);
+		await expect(page.locator("[data-version-update-notice]")).toHaveCount(0);
+		await expect.poll(getDocumentNavigationCount).toBe(2);
+		expect(updateNoticeMessage).toBe("应用资源更新已准备好，刷新后完成切换");
+	} finally {
+		await server.close();
+	}
+});
+
+test("service worker activation timeout leaves a retry action without reloading", async ({
+	page,
+}) => {
+	const server = await startStaticPwaServer();
+	try {
+		const getDocumentNavigationCount = await trackDocumentNavigations(page);
+		await page.goto(server.origin);
+		await waitForServiceWorkerControl(page);
+		await expect.poll(getDocumentNavigationCount).toBe(1);
+		const initialServiceWorkerRequests = server.getServiceWorkerRequests();
+		server.setSkipWaitingSuppressed(true);
+		server.setServiceWorkerRevision(2);
+		await page.evaluate(() => {
+			document.dispatchEvent(new Event("visibilitychange"));
+		});
+
+		await expect
+			.poll(() => server.getServiceWorkerRequests())
+			.toBeGreaterThan(initialServiceWorkerRequests);
+		await expect
+			.poll(async () =>
+				page.evaluate(async () => {
+					const registration = await navigator.serviceWorker.ready;
+					return registration.waiting !== null;
+				}),
+			)
+			.toBe(true);
+
+		const refreshButton = page.getByRole("button", { name: "刷新" });
+		await refreshButton.click();
+		await expect(page.getByRole("button", { name: "更新中" })).toBeDisabled();
+		await expect
+			.poll(() => server.getSkipWaitingMessages())
+			.toBeGreaterThanOrEqual(1);
+		await expect(page.getByRole("button", { name: "重试" })).toBeEnabled({
+			timeout: 20_000,
+		});
+		expect(getDocumentNavigationCount()).toBe(1);
+
+		await page.getByRole("button", { name: "重试" }).click();
+		await expect(page.getByRole("button", { name: "更新中" })).toBeDisabled();
+		await expect
+			.poll(() => server.getSkipWaitingMessages())
+			.toBeGreaterThanOrEqual(2);
+		expect(getDocumentNavigationCount()).toBe(1);
+	} finally {
+		await server.close();
+	}
+});
+
+test("late service worker activation after timeout does not reload the page", async ({
+	page,
+}) => {
+	const server = await startStaticPwaServer();
+	try {
+		const getDocumentNavigationCount = await trackDocumentNavigations(page);
+		await page.goto(server.origin);
+		await waitForServiceWorkerControl(page);
+		await expect.poll(getDocumentNavigationCount).toBe(1);
+
+		server.setSkipWaitingSuppressed(true);
+		server.setServiceWorkerRevision(2);
+		await page.evaluate(() => {
+			document.dispatchEvent(new Event("visibilitychange"));
+		});
+		await expect
+			.poll(async () =>
+				page.evaluate(async () => {
+					const registration = await navigator.serviceWorker.ready;
+					return registration.waiting !== null;
+				}),
+			)
+			.toBe(true);
+
+		await page.getByRole("button", { name: "刷新" }).click();
+		await expect(page.getByRole("button", { name: "重试" })).toBeEnabled({
+			timeout: 20_000,
+		});
+		expect(getDocumentNavigationCount()).toBe(1);
+
+		await page.evaluate(async () => {
+			const registration = await navigator.serviceWorker.ready;
+			registration.waiting?.postMessage({ type: "TEST_RELEASE_SKIP_WAITING" });
+		});
+		await expect
+			.poll(async () =>
+				page.evaluate(async () => {
+					const registration = await navigator.serviceWorker.ready;
+					return registration.waiting === null;
+				}),
+			)
+			.toBe(true);
+		await expect.poll(() => readActiveWorkerRevision(page)).toBe(2);
+		await expect(page.getByRole("button", { name: "重试" })).toBeEnabled();
+		expect(getDocumentNavigationCount()).toBe(1);
+	} finally {
+		await server.close();
+	}
+});
+
+test("version drift checks for a waiting service worker and activates only after refresh", async ({
+	page,
+}) => {
+	test.setTimeout(60_000);
+	const server = await startStaticPwaServer();
+	let restoreBaseFrontendBuild = false;
+	try {
+		const getDocumentNavigationCount = await trackDocumentNavigations(page);
+		await page.goto(server.origin);
+		await waitForServiceWorkerControl(page);
+		await expect.poll(getDocumentNavigationCount).toBe(1);
 		const initialServiceWorkerRequests = server.getServiceWorkerRequests();
 
 		server.setApiVersion("0.2.0");
+		restoreBaseFrontendBuild = true;
+		buildFrontendWithVersion("0.2.0");
 		server.setServiceWorkerRevision(2);
 		await page.evaluate(() => {
 			document.dispatchEvent(new Event("visibilitychange"));
@@ -957,16 +1219,24 @@ test("version drift checks for a waiting service worker and activates only after
 			)
 			.toBe(true);
 		await expect(page.locator("[data-version-update-notice]")).toContainText(
-			"检测到新版本",
+			"检测到新版本 v0.2.0",
 		);
+		await expect(
+			page.getByRole("link", { name: "Version v0.1.0" }),
+		).toBeVisible();
 		await expect.poll(() => server.getSkipWaitingMessages()).toBe(0);
 
 		await page.getByRole("button", { name: "刷新" }).click();
-		await expect
-			.poll(() => server.getSkipWaitingMessages())
-			.toBeGreaterThanOrEqual(1);
+		await expect.poll(() => getDocumentNavigationCount()).toBe(2);
+		await expect(
+			page.getByRole("link", { name: "Version v0.2.0" }),
+		).toBeVisible();
+		await expect(page.locator("[data-version-update-notice]")).toHaveCount(0);
+		await expect.poll(() => readActiveWorkerRevision(page)).toBe(2);
+		await expect.poll(getDocumentNavigationCount).toBe(2);
 	} finally {
 		await server.close();
+		if (restoreBaseFrontendBuild) buildFrontendWithVersion("0.1.0");
 	}
 });
 
