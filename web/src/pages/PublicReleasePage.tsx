@@ -1580,11 +1580,6 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 			}
 			return Array.from(indexes).sort((left, right) => left - right);
 		},
-		// The row anchor and focused-lane effects below own scroll preservation. Letting the
-		// virtualizer compensate estimate-to-measure deltas here would move the
-		// reader while a target is being revealed and can create a visible rebound.
-		// @ts-expect-error @tanstack/react-virtual omits this core option from its adapter type.
-		shouldAdjustScrollPositionOnItemSizeChange: () => false,
 		getItemKey: (index) => {
 			const row = rows[index];
 			return row?.kind === "release"
@@ -1594,6 +1589,15 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 		// The focused rows are indexed once per timeline update so range recalculation
 		// stays constant-time while the virtualized list is scrolling.
 	});
+	const measureDetailElement = useCallback(
+		(element: HTMLDivElement | null) => {
+			// resizeItem reads this instance hook, so install it before the first measurement.
+			detailVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () =>
+				false;
+			detailVirtualizer.measureElement(element);
+		},
+		[detailVirtualizer],
+	);
 	const directoryVirtualizer = useVirtualizer({
 		count: props.items.length,
 		getScrollElement: () => directoryScrollRef.current,
@@ -2730,7 +2734,7 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 								return (
 									<div
 										key={virtualItem.key}
-										ref={detailVirtualizer.measureElement}
+										ref={measureDetailElement}
 										data-index={virtualItem.index}
 										className="absolute top-0 left-0 w-full pb-3 sm:pb-4"
 										style={{ transform: `translateY(${virtualItem.start}px)` }}
