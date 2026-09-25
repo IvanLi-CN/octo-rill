@@ -1,10 +1,4 @@
-import {
-	ArrowLeft,
-	ChevronDown,
-	ChevronUp,
-	ExternalLink,
-	RefreshCcw,
-} from "lucide-react";
+import { ArrowLeft, ChevronDown, ChevronUp, RefreshCcw } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { useRouter } from "@tanstack/react-router";
 import {
@@ -36,9 +30,6 @@ import {
 	apiPostJson,
 } from "@/api";
 import { useAuthBootstrap } from "@/auth/AuthBootstrap";
-import { AuthProviderIcon } from "@/components/brand/AuthProviderIcon";
-import { BrandLogo } from "@/components/brand/BrandLogo";
-import { RepoIdentity } from "@/components/repo/RepoIdentity";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -51,7 +42,6 @@ import {
 import { ReleaseFeedCard } from "@/feed/FeedItemCard";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
 import { InternalLink } from "@/lib/internalNavigation";
-import { resolveDemoNativeHref } from "@/demo/registry";
 import type {
 	FeedLane,
 	FeedReactionRefreshResponse,
@@ -66,13 +56,16 @@ import {
 	type PublicReleaseHighlightSelection,
 } from "@/publicRelease/routeState";
 import {
+	PublicReleasePageFrame,
+	PublicReleaseTitleBand,
+} from "@/pages/PublicReleasePageFrame";
+import { PublicReleaseLoadingSkeleton } from "@/pages/PublicReleaseLoadingSkeleton";
+import {
 	DASHBOARD_QUERY_STALE_MS,
 	dashboardReactionTokenQueryKey,
 } from "@/query/dashboardQueryKeys";
 import { isReactionTokenUsable } from "@/settings/reactionTokenEditor";
 import { cn } from "@/lib/utils";
-import { buildVersionReleaseHref } from "@/version/versionReleaseLink";
-import { useVersionMonitor } from "@/version/versionMonitor";
 
 const PUBLIC_RELEASE_LIST_BODY_MAX_CHARS = 2800;
 const PUBLIC_RELEASE_PAGE_SIZE = 6;
@@ -274,6 +267,11 @@ type LoadState =
 			data: Extract<PublicReleaseResponse, { status: "ready" }>;
 	  }
 	| { status: "error"; message: string; code?: string };
+
+type TargetLoadState =
+	| { tag: string; status: "loading" }
+	| { tag: string; status: "pending"; retryAfterSeconds: number }
+	| { tag: string; status: "error"; message: string; code?: string };
 
 function isPendingResponse(
 	value: unknown,
@@ -590,14 +588,33 @@ function applyActiveHighlight(
 	}));
 }
 
-function PulseBlock(props: { className?: string; rounded?: string }) {
-	const { className, rounded = "rounded-2xl" } = props;
-	return (
-		<div
-			className={cn("bg-muted/70 animate-pulse", rounded, className)}
-			data-testid="public-release-skeleton-block"
-		/>
+function mergeFocusedPublicReleaseData(
+	current: Extract<PublicReleaseResponse, { status: "ready" }>,
+	incoming: Extract<PublicReleaseResponse, { status: "ready" }>,
+) {
+	const highlight = mergePaginatedHighlight(
+		current.highlight,
+		incoming.highlight,
 	);
+	const gapsByBoundary = new Map<string, PublicReleaseGap>();
+	for (const gap of [...(current.gaps ?? []), ...(incoming.gaps ?? [])]) {
+		gapsByBoundary.set(`${gap.newer_cursor}|${gap.older_cursor}`, gap);
+	}
+	const gaps = Array.from(gapsByBoundary.values());
+
+	return {
+		...incoming,
+		...current,
+		items: applyActiveHighlight(
+			mergePublicReleaseItems(current.items, incoming.items),
+			highlight,
+		),
+		next_cursor: current.next_cursor ?? incoming.next_cursor,
+		previous_cursor: current.previous_cursor ?? incoming.previous_cursor,
+		highlight,
+		segments: current.segments ?? incoming.segments,
+		gaps: gaps.length > 0 ? gaps : undefined,
+	};
 }
 
 export function PublicReleasePage(props: {
@@ -614,10 +631,21 @@ export function PublicReleasePage(props: {
 	const [loadingGap, setLoadingGap] = useState<string | null>(null);
 	const [appendError, setAppendError] = useState<string | null>(null);
 	const [selectedLane, setSelectedLane] = useState<FeedLane>("smart");
+	const [targetLoadState, setTargetLoadState] =
+		useState<TargetLoadState | null>(null);
 	const initialLoadKeyRef = useRef<string | null>(null);
+	const loadResetKeyRef = useRef<string | null>(null);
 	const initialLoadPendingRef = useRef<string | null>(null);
+	const targetRequestGenerationRef = useRef(0);
+	const handledRouteTagRef = useRef(tag);
+	const routeTagRef = useRef(tag);
+	routeTagRef.current = tag;
 	const isHighlightMode = highlight !== null;
-	const initialLoadKey = JSON.stringify({ owner, repo, tag, highlight });
+	const initialLoadKey = JSON.stringify({
+		owner,
+		repo,
+		highlight: highlight ? { ...highlight, active: undefined } : null,
+	});
 	const requestKeyRef = useRef(initialLoadKey);
 	if (requestKeyRef.current !== initialLoadKey) {
 		requestKeyRef.current = initialLoadKey;
@@ -636,6 +664,10 @@ export function PublicReleasePage(props: {
 		setAppendError(null);
 	}, [timelineCacheKey]);
 	useEffect(() => {
+		if (loadResetKeyRef.current === initialLoadKey) return;
+		loadResetKeyRef.current = initialLoadKey;
+		targetRequestGenerationRef.current += 1;
+		setTargetLoadState(null);
 		setLoadingMore(false);
 		setLoadingNewer(false);
 		setLoadingGap(null);
@@ -670,6 +702,7 @@ export function PublicReleasePage(props: {
 			direction?: "older" | "newer",
 			cursor?: string | null,
 			activeSelector?: string,
+			focusTag: string | null = tag,
 		) => ({
 			owner,
 			repo,
@@ -683,13 +716,15 @@ export function PublicReleasePage(props: {
 			include_original: true,
 			...highlightRequest,
 			...(activeSelector ? { highlight_active: activeSelector } : {}),
-			...(tag && !cursor ? { focus: `tag:${tag}` } : {}),
+			...(focusTag && !cursor ? { focus: `tag:${focusTag}` } : {}),
 		}),
 		[highlightRequest, isHighlightMode, owner, repo, tag],
 	);
 
 	const load = useCallback(async () => {
 		const requestKey = initialLoadKey;
+		const routeTag = tag;
+		const targetGeneration = targetRequestGenerationRef.current;
 		initialLoadPendingRef.current = requestKey;
 		try {
 			setState((current) =>
@@ -699,7 +734,12 @@ export function PublicReleasePage(props: {
 			const data = await apiGetPublicRepoReleases({
 				...buildHighlightRequest(),
 			});
-			if (requestKeyRef.current !== requestKey) return;
+			if (
+				requestKeyRef.current !== requestKey ||
+				targetRequestGenerationRef.current !== targetGeneration ||
+				routeTagRef.current !== routeTag
+			)
+				return;
 			if (isPendingResponse(data)) {
 				setState({ status: "pending", pending: data });
 			} else {
@@ -708,7 +748,12 @@ export function PublicReleasePage(props: {
 					{ status: "ready" }
 				>;
 				setState((current) => {
-					if (requestKeyRef.current !== requestKey) return current;
+					if (
+						requestKeyRef.current !== requestKey ||
+						targetRequestGenerationRef.current !== targetGeneration ||
+						routeTagRef.current !== routeTag
+					)
+						return current;
 					if (current.status !== "list" || !tag) {
 						return { status: "list", data: nextData };
 					}
@@ -738,7 +783,12 @@ export function PublicReleasePage(props: {
 				});
 			}
 		} catch (err) {
-			if (requestKeyRef.current !== requestKey) return;
+			if (
+				requestKeyRef.current !== requestKey ||
+				targetRequestGenerationRef.current !== targetGeneration ||
+				routeTagRef.current !== routeTag
+			)
+				return;
 			if (err instanceof ApiError) {
 				setState({ status: "error", message: err.message, code: err.code });
 				return;
@@ -749,7 +799,135 @@ export function PublicReleasePage(props: {
 				initialLoadPendingRef.current = null;
 			}
 		}
-	}, [buildHighlightRequest, initialLoadKey, repo, tag, timelineCacheKey]);
+	}, [buildHighlightRequest, initialLoadKey, tag]);
+
+	const requestFocusWindow = useCallback(
+		async (targetTag: string, generation: number) => {
+			const requestKey = requestKeyRef.current;
+			setTargetLoadState({ tag: targetTag, status: "loading" });
+			try {
+				const data = await apiGetPublicRepoReleases({
+					...buildHighlightRequest(undefined, null, undefined, targetTag),
+				});
+				if (
+					requestKeyRef.current !== requestKey ||
+					targetRequestGenerationRef.current !== generation ||
+					routeTagRef.current !== targetTag
+				)
+					return;
+				if (isPendingResponse(data)) {
+					setTargetLoadState({
+						tag: targetTag,
+						status: "pending",
+						retryAfterSeconds: data.retry_after_seconds,
+					});
+					setState((current) =>
+						current.status === "loading"
+							? { status: "pending", pending: data }
+							: current,
+					);
+					return;
+				}
+
+				const nextData = data as Extract<
+					PublicReleaseResponse,
+					{ status: "ready" }
+				>;
+				if (!nextData.items.some((item) => item.tag_name === targetTag)) {
+					setTargetLoadState({
+						tag: targetTag,
+						status: "error",
+						message: "目标版本未出现在返回的 Release 窗口中。",
+					});
+					setState((current) =>
+						current.status === "loading"
+							? {
+									status: "error",
+									message: "目标版本未出现在返回的 Release 窗口中。",
+								}
+							: current,
+					);
+					return;
+				}
+				setState((current) => {
+					if (
+						requestKeyRef.current !== requestKey ||
+						targetRequestGenerationRef.current !== generation ||
+						routeTagRef.current !== targetTag
+					)
+						return current;
+					return current.status === "list"
+						? {
+								status: "list",
+								data: mergeFocusedPublicReleaseData(current.data, nextData),
+							}
+						: { status: "list", data: nextData };
+				});
+				setTargetLoadState(null);
+			} catch (err) {
+				if (
+					requestKeyRef.current !== requestKey ||
+					targetRequestGenerationRef.current !== generation ||
+					routeTagRef.current !== targetTag
+				)
+					return;
+				setTargetLoadState({
+					tag: targetTag,
+					status: "error",
+					message:
+						err instanceof Error ? err.message : "目标版本加载失败，请重试。",
+					...(err instanceof ApiError ? { code: err.code } : {}),
+				});
+				setState((current) =>
+					current.status === "loading"
+						? {
+								status: "error",
+								message:
+									err instanceof Error
+										? err.message
+										: "目标版本加载失败，请重试。",
+								...(err instanceof ApiError ? { code: err.code } : {}),
+							}
+						: current,
+				);
+			}
+		},
+		[buildHighlightRequest],
+	);
+
+	const targetAlreadyLoaded = Boolean(
+		tag &&
+			state.status === "list" &&
+			state.data.items.some((item) => item.tag_name === tag),
+	);
+	useEffect(() => {
+		if (handledRouteTagRef.current === tag) return;
+		handledRouteTagRef.current = tag;
+		const generation = ++targetRequestGenerationRef.current;
+		setTargetLoadState(null);
+		if (!tag || targetAlreadyLoaded) return;
+		void requestFocusWindow(tag, generation);
+	}, [requestFocusWindow, tag, targetAlreadyLoaded]);
+
+	useEffect(() => {
+		if (targetLoadState?.status !== "pending" || tag !== targetLoadState.tag) {
+			return;
+		}
+		const generation = targetRequestGenerationRef.current;
+		const timer = window.setTimeout(
+			() => void requestFocusWindow(targetLoadState.tag, generation),
+			Math.max(15, targetLoadState.retryAfterSeconds) * 1000,
+		);
+		return () => window.clearTimeout(timer);
+	}, [requestFocusWindow, tag, targetLoadState]);
+
+	const retryTargetLoad = useCallback(
+		(targetTag: string) => {
+			const generation = ++targetRequestGenerationRef.current;
+			void requestFocusWindow(targetTag, generation);
+		},
+		[requestFocusWindow],
+	);
 
 	const mergeItems = useCallback(
 		(current: PublicReleaseListItem[], incoming: PublicReleaseListItem[]) => {
@@ -1011,16 +1189,73 @@ export function PublicReleasePage(props: {
 		return () => window.clearTimeout(timer);
 	}, [load, state]);
 
-	const repoFullName = useMemo(() => `${owner}/${repo}`, [owner, repo]);
 	const repoVisual =
 		state.status === "list" ? state.data.items[0]?.repo_visual : null;
-	const currentHighlightSelector =
-		state.status === "list" && state.data.highlight
-			? state.data.highlight.resolved.find(
-					(target) =>
-						target.release_id === state.data.highlight?.active_release_id,
-				)?.selector
-			: undefined;
+	const listItems = state.status === "list" ? state.data.items : [];
+	const currentHighlight =
+		state.status === "list" ? state.data.highlight : undefined;
+	const routeActiveSelector = highlight?.active;
+	const routeActiveTarget = currentHighlight?.resolved.find(
+		(target) => target.selector === routeActiveSelector,
+	);
+	const routeActiveIdFromSelector = routeActiveSelector?.startsWith("id:")
+		? routeActiveSelector.slice(3)
+		: null;
+	const routeActiveTagFromSelector = routeActiveSelector?.startsWith("tag:")
+		? routeActiveSelector.slice(4)
+		: null;
+	const routeActiveItem = listItems.find(
+		(item) =>
+			item.is_highlighted &&
+			(item.release_id === routeActiveIdFromSelector ||
+				item.tag_name === routeActiveTagFromSelector),
+	);
+	const routeActiveReleaseId =
+		routeActiveTarget?.release_id ?? routeActiveItem?.release_id;
+	const effectiveHighlight = useMemo(() => {
+		if (!currentHighlight || !routeActiveReleaseId) return currentHighlight;
+		if (currentHighlight.active_release_id === routeActiveReleaseId) {
+			return currentHighlight;
+		}
+		let activeIndex = currentHighlight.active_index;
+		if (currentHighlight.mode === "discrete") {
+			const index = currentHighlight.resolved.findIndex(
+				(target) => target.release_id === routeActiveReleaseId,
+			);
+			if (index >= 0) activeIndex = index + 1;
+		} else if (activeIndex !== null) {
+			const previousIndex = listItems.findIndex(
+				(item) => item.release_id === currentHighlight.active_release_id,
+			);
+			const nextIndex = listItems.findIndex(
+				(item) => item.release_id === routeActiveReleaseId,
+			);
+			if (previousIndex >= 0 && nextIndex >= 0) {
+				activeIndex = Math.min(
+					currentHighlight.total,
+					Math.max(1, activeIndex + nextIndex - previousIndex),
+				);
+			}
+		}
+		return {
+			...currentHighlight,
+			active_release_id: routeActiveReleaseId,
+			active_index: activeIndex,
+		};
+	}, [currentHighlight, listItems, routeActiveReleaseId]);
+	const timelineItems = useMemo(
+		() =>
+			effectiveHighlight?.active_release_id !==
+			currentHighlight?.active_release_id
+				? applyActiveHighlight(listItems, effectiveHighlight)
+				: listItems,
+		[listItems, currentHighlight?.active_release_id, effectiveHighlight],
+	);
+	const currentHighlightSelector = effectiveHighlight
+		? effectiveHighlight.resolved.find(
+				(target) => target.release_id === effectiveHighlight.active_release_id,
+			)?.selector
+		: undefined;
 	const highlightedListSearch = useMemo(() => {
 		const search = publicReleaseHighlightSearch(highlight);
 		return currentHighlightSelector
@@ -1040,251 +1275,122 @@ export function PublicReleasePage(props: {
 		return `${publicReleasePathPrefix()}/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases?${params.toString()}`;
 	}, [highlight, highlightedListSearch, owner, repo, tag]);
 
-	return (
-		<main className="min-h-dvh bg-background text-foreground">
-			<div className="mx-auto flex min-h-dvh w-full max-w-5xl flex-col px-4 py-5 sm:px-6 lg:px-8">
-				<div className="flex min-h-full flex-col">
-					<header className="flex flex-wrap items-center justify-between gap-3 border-b pb-4">
-						<InternalLink
-							href="/"
-							to="/"
-							className="inline-flex items-center gap-3"
-						>
-							<BrandLogo variant="wordmark" className="h-7 sm:h-8" />
-						</InternalLink>
-						<Button asChild variant="outline" size="sm">
-							<a
-								href={`https://github.com/${owner}/${repo}/releases`}
-								target="_blank"
-								rel="noreferrer"
-							>
-								<ExternalLink className="size-4" />
-								GitHub
-							</a>
-						</Button>
-					</header>
-
-					{highlightedListHref ? (
-						<div className="pt-4">
-							<InternalLink
-								href={highlightedListHref}
-								to="/$owner/$repo/releases"
-								params={{ owner, repo }}
-								search={highlightedListSearch}
-								className="inline-flex items-center gap-2 text-sm text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
-							>
-								<ArrowLeft className="size-4" />
-								返回高亮列表
-							</InternalLink>
-						</div>
-					) : null}
-
-					<section className="py-6" data-testid="public-release-title-band">
-						<div className="flex flex-wrap items-center gap-x-6 gap-y-3">
-							<RepoIdentity
-								repoFullName={repoFullName}
-								repoVisual={repoVisual}
-								labelAs="h1"
-								className="min-w-0 max-w-full flex-[1_1_100%] sm:flex-1"
-								labelClassName="break-words text-3xl font-semibold tracking-normal"
-								visualClassName="size-10"
-							/>
-							{state.status === "list" ? (
-								<div
-									className="ml-auto shrink-0"
-									data-testid="public-release-page-lane"
-								>
-									<FeedPageLaneSelector
-										value={selectedLane}
-										onValueChange={setSelectedLane}
-									/>
-								</div>
-							) : null}
-						</div>
-					</section>
-
-					{state.status === "loading" ? (
-						<PublicReleaseLoadingSkeleton hasTag={Boolean(tag)} />
-					) : null}
-
-					{state.status === "pending" ? (
-						<WaitingCard
-							title="Release 数据同步中"
-							description="这个仓库的 Release 数据还在同步中，稍后会自动重试。"
-							retryAfter={state.pending.retry_after_seconds}
-							statusLabel="同步中"
-							onRetry={load}
-						/>
-					) : null}
-
-					{state.status === "error" ? (
-						<Card>
-							<CardHeader>
-								<CardTitle>暂时无法展示</CardTitle>
-								<CardDescription>
-									{state.code ? `${state.code}: ` : ""}
-									{state.message || "请求失败，请稍后重试。"}
-								</CardDescription>
-							</CardHeader>
-							<CardContent>
-								<Button type="button" onClick={() => void load()}>
-									<RefreshCcw className="size-4" />
-									重试
-								</Button>
-							</CardContent>
-						</Card>
-					) : null}
-
-					{state.status === "list" ? (
-						<ReleaseTimeline
-							tag={tag}
-							owner={owner}
-							repo={repo}
-							items={state.data.items}
-							highlight={state.data.highlight}
-							gaps={state.data.gaps}
-							hasMore={Boolean(state.data.next_cursor)}
-							hasNewer={Boolean(state.data.previous_cursor)}
-							loadingMore={loadingMore}
-							loadingNewer={loadingNewer}
-							appendError={appendError}
-							onLoadMore={loadMore}
-							onLoadNewer={loadNewer}
-							onLoadGap={loadGap}
-							loadingGap={loadingGap}
-							highlightSelection={highlight}
-							selectedLane={selectedLane}
-							onHydrateItems={hydrateItems}
-							onActivateHighlight={activateHighlight}
-							reactionControls={reactionControls}
-						/>
-					) : null}
-
-					<PublicReleaseFooter owner={owner} repo={repo} />
-				</div>
+	const laneSelector =
+		state.status === "list" ? (
+			<div className="ml-auto shrink-0" data-testid="public-release-page-lane">
+				<FeedPageLaneSelector
+					value={selectedLane}
+					onValueChange={setSelectedLane}
+				/>
 			</div>
-		</main>
-	);
-}
-
-function PublicReleaseLoadingSkeleton(props: { hasTag: boolean }) {
-	const { hasTag } = props;
-
-	if (hasTag) {
-		return (
-			<section
-				className="space-y-4"
-				aria-label="Release loading skeleton"
-				data-testid="public-release-loading-skeleton"
-			>
-				<div className="rounded-[28px] border border-border/70 bg-card/82 p-5 shadow-sm sm:p-6">
-					<div className="flex flex-wrap items-start justify-between gap-4">
-						<div className="min-w-0 flex-1 space-y-3">
-							<PulseBlock className="h-5 w-28 rounded-full" />
-							<PulseBlock className="h-9 w-3/4 max-w-xl rounded-3xl" />
-							<PulseBlock className="h-4 w-48 rounded-full" />
-						</div>
-						<div className="flex gap-2">
-							<PulseBlock className="h-10 w-20 rounded-xl" />
-							<PulseBlock className="h-10 w-20 rounded-xl" />
-							<PulseBlock className="h-10 w-20 rounded-xl" />
-						</div>
-					</div>
-					<div className="mt-6 space-y-3">
-						<PulseBlock className="h-4 w-full rounded-full" />
-						<PulseBlock className="h-4 w-[94%] rounded-full" />
-						<PulseBlock className="h-4 w-[88%] rounded-full" />
-						<PulseBlock className="h-4 w-[76%] rounded-full" />
-						<PulseBlock className="h-40 w-full rounded-[24px]" />
-					</div>
-				</div>
-			</section>
-		);
-	}
+		) : null;
 
 	return (
-		<section
-			className="space-y-4"
-			aria-label="Release loading skeleton"
-			data-testid="public-release-loading-skeleton"
-		>
-			<div className="flex flex-wrap items-center justify-between gap-3 rounded-[28px] border border-border/70 bg-card/82 p-5 shadow-sm sm:p-6">
-				<div className="space-y-3">
-					<PulseBlock className="h-4 w-24 rounded-full" />
-					<PulseBlock className="h-8 w-48 rounded-3xl" />
-				</div>
-				<div className="flex gap-2">
-					<PulseBlock className="h-10 w-20 rounded-xl" />
-					<PulseBlock className="h-10 w-20 rounded-xl" />
-					<PulseBlock className="h-10 w-20 rounded-xl" />
-				</div>
-			</div>
-
-			{Array.from({ length: 3 }, (_, index) => (
-				<div
-					key={`public-release-loading-card-${index}`}
-					className="rounded-[28px] border border-border/70 bg-card/82 p-5 shadow-sm sm:p-6"
-				>
-					<div className="flex flex-wrap items-start justify-between gap-4">
-						<div className="min-w-0 flex-1 space-y-3">
-							<div className="flex items-center gap-3">
-								<PulseBlock className="size-11 rounded-full" />
-								<div className="min-w-0 flex-1 space-y-2">
-									<PulseBlock className="h-4 w-44 rounded-full" />
-									<PulseBlock className="h-3 w-28 rounded-full" />
-								</div>
-							</div>
-							<PulseBlock className="h-8 w-3/4 rounded-3xl" />
-						</div>
-						<div className="flex gap-2">
-							<PulseBlock className="h-9 w-16 rounded-xl" />
-							<PulseBlock className="h-9 w-16 rounded-xl" />
-							<PulseBlock className="h-9 w-16 rounded-xl" />
-						</div>
-					</div>
-					<div className="mt-6 space-y-3">
-						<PulseBlock className="h-4 w-full rounded-full" />
-						<PulseBlock className="h-4 w-[95%] rounded-full" />
-						<PulseBlock className="h-4 w-[82%] rounded-full" />
-						<PulseBlock className="h-24 w-full rounded-[22px]" />
-					</div>
-				</div>
-			))}
-		</section>
-	);
-}
-
-function PublicReleaseFooter(props: { owner: string; repo: string }) {
-	const year = new Date().getFullYear();
-	const repositoryHref = `https://github.com/${props.owner}/${props.repo}`;
-	const { loadedVersion } = useVersionMonitor();
-	const versionReleaseHref = buildVersionReleaseHref(loadedVersion);
-
-	return (
-		<footer className="mt-auto flex flex-wrap items-center justify-between gap-3 border-t pt-4 pb-1 font-mono text-[11px] text-muted-foreground">
-			<span>© {year} Ivan Li</span>
-			<div className="flex flex-wrap items-center justify-end gap-x-4 gap-y-1">
-				<a
-					href={repositoryHref}
-					target="_blank"
-					rel="noreferrer"
-					className="inline-flex items-center gap-1.5 underline-offset-4 hover:text-foreground hover:underline"
-				>
-					<AuthProviderIcon provider="github" className="size-3" />
-					GitHub
-				</a>
-				{versionReleaseHref ? (
-					<a
-						href={resolveDemoNativeHref(versionReleaseHref)}
-						className="underline-offset-4 hover:text-foreground hover:underline"
+		<PublicReleasePageFrame owner={owner} repo={repo}>
+			{highlightedListHref ? (
+				<div className="pt-4">
+					<InternalLink
+						href={highlightedListHref}
+						to="/$owner/$repo/releases"
+						params={{ owner, repo }}
+						search={highlightedListSearch}
+						className="inline-flex items-center gap-2 text-sm text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
 					>
-						Version {loadedVersion}
-					</a>
-				) : (
-					<span>Version {loadedVersion}</span>
-				)}
-			</div>
-		</footer>
+						<ArrowLeft className="size-4" />
+						返回高亮列表
+					</InternalLink>
+				</div>
+			) : null}
+
+			<PublicReleaseTitleBand owner={owner} repo={repo} repoVisual={repoVisual}>
+				{laneSelector}
+			</PublicReleaseTitleBand>
+
+			{state.status === "loading" ? <PublicReleaseLoadingSkeleton /> : null}
+
+			{state.status === "pending" ? (
+				<WaitingCard
+					title="Release 数据同步中"
+					description="这个仓库的 Release 数据还在同步中，稍后会自动重试。"
+					retryAfter={state.pending.retry_after_seconds}
+					statusLabel="同步中"
+					onRetry={load}
+				/>
+			) : null}
+
+			{state.status === "error" ? (
+				<Card>
+					<CardHeader>
+						<CardTitle>暂时无法展示</CardTitle>
+						<CardDescription>
+							{state.code ? `${state.code}: ` : ""}
+							{state.message || "请求失败，请稍后重试。"}
+						</CardDescription>
+					</CardHeader>
+					<CardContent>
+						<Button type="button" onClick={() => void load()}>
+							<RefreshCcw className="size-4" />
+							重试
+						</Button>
+					</CardContent>
+				</Card>
+			) : null}
+
+			{state.status === "list" && targetLoadState?.tag === tag ? (
+				<div
+					className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border/70 bg-card/70 px-3 py-2 text-sm"
+					data-testid="public-release-target-load-state"
+					role={targetLoadState.status === "error" ? "alert" : "status"}
+					aria-live={
+						targetLoadState.status === "error" ? "assertive" : "polite"
+					}
+				>
+					<span>
+						{targetLoadState.status === "loading"
+							? `正在读取 ${tag} 的版本窗口...`
+							: targetLoadState.status === "pending"
+								? `Release 数据同步中，${tag} 将在稍后重试。`
+								: `${targetLoadState.code ? `${targetLoadState.code}: ` : ""}${targetLoadState.message}`}
+					</span>
+					{targetLoadState.status === "error" ? (
+						<Button
+							type="button"
+							variant="outline"
+							size="sm"
+							onClick={() => retryTargetLoad(targetLoadState.tag)}
+						>
+							<RefreshCcw className="size-4" />
+							重试
+						</Button>
+					) : null}
+				</div>
+			) : null}
+
+			{state.status === "list" ? (
+				<ReleaseTimeline
+					tag={tag}
+					owner={owner}
+					repo={repo}
+					items={timelineItems}
+					highlight={effectiveHighlight}
+					gaps={state.data.gaps}
+					hasMore={Boolean(state.data.next_cursor)}
+					hasNewer={Boolean(state.data.previous_cursor)}
+					loadingMore={loadingMore}
+					loadingNewer={loadingNewer}
+					appendError={appendError}
+					onLoadMore={loadMore}
+					onLoadNewer={loadNewer}
+					onLoadGap={loadGap}
+					loadingGap={loadingGap}
+					highlightSelection={highlight}
+					selectedLane={selectedLane}
+					onHydrateItems={hydrateItems}
+					onActivateHighlight={activateHighlight}
+					reactionControls={reactionControls}
+				/>
+			) : null}
+		</PublicReleasePageFrame>
 	);
 }
 
@@ -1474,11 +1580,6 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 			}
 			return Array.from(indexes).sort((left, right) => left - right);
 		},
-		// The row anchor and focused-lane effects below own scroll preservation. Letting the
-		// virtualizer compensate estimate-to-measure deltas here would move the
-		// reader while a target is being revealed and can create a visible rebound.
-		// @ts-expect-error @tanstack/react-virtual omits this core option from its adapter type.
-		shouldAdjustScrollPositionOnItemSizeChange: () => false,
 		getItemKey: (index) => {
 			const row = rows[index];
 			return row?.kind === "release"
@@ -1488,6 +1589,15 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 		// The focused rows are indexed once per timeline update so range recalculation
 		// stays constant-time while the virtualized list is scrolling.
 	});
+	const measureDetailElement = useCallback(
+		(element: HTMLDivElement | null) => {
+			// resizeItem reads this instance hook, so install it before the first measurement.
+			detailVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = () =>
+				false;
+			detailVirtualizer.measureElement(element);
+		},
+		[detailVirtualizer],
+	);
 	const directoryVirtualizer = useVirtualizer({
 		count: props.items.length,
 		getScrollElement: () => directoryScrollRef.current,
@@ -2624,7 +2734,7 @@ function ReleaseTimeline(props: ReleaseTimelineProps) {
 								return (
 									<div
 										key={virtualItem.key}
-										ref={detailVirtualizer.measureElement}
+										ref={measureDetailElement}
 										data-index={virtualItem.index}
 										className="absolute top-0 left-0 w-full pb-3 sm:pb-4"
 										style={{ transform: `translateY(${virtualItem.start}px)` }}

@@ -14,6 +14,7 @@
 - [x] M8: 完成 typed 高亮 URL、服务端分段/gap 窗口、双向虚拟列表、浮动导航与前后端回归覆盖。
 - [x] M9: 公开列表页头字标、owner/avatar 仓库身份与页面级 lane 响应式布局完成；列表卡片去除重复身份和操作，并补齐桌面与移动端 mock-only 视觉证据。
 - [x] M10: 公开列表表情反应仅在已登录且 PAT 有效时启用；匿名不请求反应凭据或数据，并补齐反应切换回归与 member mock-only 视觉证据。
+- [x] M11: 同仓库列表与公开 tag 路由复用持续挂载的阅读器；已加载目标只更新 SPA URL 与焦点，未加载目标合并定位且失败保留旧内容；冷启动骨架与桌面双栏、移动单栏布局一致。
 
 ## Current Notes
 
@@ -36,6 +37,7 @@
 - 页面级 lane 切换沿用户事件链进入详情协调器；动态高度重测期间，当前 `focusedReleaseId` 会作为额外挂载项保留，并以切换前的目标 offset 在短稳定窗口内逐帧校正，直到目标高度与位置稳定或达到超时，避免原文/翻译/润色切换把当前卡片推出视口。
 - 程序化详情滚动的方向 guard 只在当前动画/定位事务存续期间生效；动画完成或被用户事件取消时立即清理，lane 重测事务期间暂不执行自然阅读线判定，避免旧极值与异步高度事件互相抢写 `scrollTop`。
 - 公开列表的 newer cursor 会沿请求方向查询；首次 `focus` 窗口与离散 highlight 合并时在 30 条首屏预算内保留全部已解析目标与焦点版本，超出上下文通过 segment/gap 继续补齐。分页、首屏定位、lane 切换和同仓库 tag 导航均绑定当前 route transaction，旧响应不会覆盖新路由；首载请求完成前会抑制自动分页，并在路由事务切换时清理旧 loading 状态，不在浏览器端缓存未经访问证明的 Release 时间线。
+- 根路由的公开阅读器宿主按 owner/repo 保持挂载，并以结构化匹配结果在无 tag 与公开 tag URL 间切换；已加载目标不请求额外 `focus` 窗口，未加载目标以事务 token 防止过时响应覆盖新选择，失败保留旧时间线并提供原 URL 下的重试。仅首次无可展示数据时使用共享响应式骨架，桌面呈现视口高度目录与多卡详情轮廓，移动端呈现单栏轮廓。
 
 ## Verification
 
@@ -59,3 +61,8 @@
 - Chrome mock-only `ui_demo`: `public-release-highlight-discrete` at `1440x1000` and `390x844`; title band has the sole owner/avatar repository identity and lane selector, while cards have no repo identity, lane, or GitHub controls.
 - `codex review --base origin/main`: 五轮审查已逐项修复 legacy redirect 重复参数、居中窗口顺序、详情翻译、范围绝对序号、hydration 字段覆盖与双向 cursor 边界问题。
 - Chrome mock-only `ui_demo`: `public-release-highlight-discrete` at `1440x1000`; `public-release-highlight-range` at requested `390x844`.
+- `cd web && bun run lint`、`bun run build`、`bun run build:demo` 均通过；完整 Chromium E2E 在 `codex-testbox` 单 worker 执行，`333 passed, 7 skipped`。
+- 本仓库不包含 `bin/spec_contract_check.py`；该专项结构检查无法运行，Spec 漂移检查已验证关联 Spec 与 ADR 声明。
+- `cd web && PLAYWRIGHT_WEB_PORT=55179 bunx playwright test e2e/public-release-page.spec.ts --project=chromium --workers=1 --timeout=60000 --reporter=line` (`35 passed`，覆盖同仓库无 tag/tag 连续导航、Back/Forward、冷启动骨架、旧路由 SPA 跳转、未加载目标竞态及失败重试)。
+- `cd web && PLAYWRIGHT_WEB_PORT=55179 bunx playwright test e2e/demo-page-scenes.spec.ts --project=chromium --workers=1 --timeout=60000 --reporter=line` (`17 passed`，覆盖目标定位与跨 lane 页面场景)。
+- mock-only `ui_demo` 使用 Ego 对 `1440x1000` 与 `390x844` 的列表、tag 冷启动和热切换进行浏览器检查；桌面目录与详情容器均占满可用视口高度，移动端无横向溢出，热切换保留阅读器与滚动容器且未插入骨架。四张确认快照已登记到 Spec。

@@ -13,16 +13,20 @@
 - GitHub public repo 默认可通过 `/:owner/:repo/releases` 访问，不需要用户发布。
 - 当前 GitHub viewer-owned personal private repo 可由拥有者登录后显式发布，发布后复用同一个公开 Release 落地页 `/:owner/:repo/releases`；取消发布后匿名访问不得继续暴露该私有仓库内容。
 - `/public/:owner/:repo/releases` 作为旧列表路径兼容入口，必须 replace 跳转到 `/:owner/:repo/releases`。
+- 未登录用户访问旧 `/:owner/:repo/releases/tag/:tag` 路径时必须通过 SPA replace 跳转到 `/public/:owner/:repo/releases/tag/:tag`；已登录用户仍进入 Dashboard Release 详情。
 - 公开 Release 页面页脚展示当前 OctoRill 前端加载版本，并链接到 OctoRill 自身 public-only Release 详情页，登录态不得把该链接切到 Dashboard。
 - 首次访问先登记仓库 usage；若本地已有近期刷新且带真实 privacy proof 的公开仓库 metadata 与非草稿 Release 缓存，则直接复用共享缓存返回 ready；若只有近期公开 metadata 但尚无 Release 缓存，则回填 `repo_id` 并返回可重试 pending 响应；若本地无法确认近期公开 metadata，则返回 metadata pending。
 - 公开端点与登录用户视图复用同一份仓库级 `repo_releases` 主数据。
 - 公开列表页支持 URL 高亮深链：离散模式使用重复的 `highlight=tag:<tag_name>|id:<release_id>`，范围模式使用 `highlight_start` 与 `highlight_end` typed selector 表示当前时间倒序列表中的闭区间；两种模式互斥，端点允许反写，重复目标按同一 Release 去重。
 - 单个 URL 最多包含 20 个离散目标。后端一次解析 tag / ID 并返回最多 30 条推荐数据，包含全部已解析目标、连续 segment、内部 gap、双向 cursor、精确命中数与当前 active 序号；前端不得从第一页逐页探测目标。
 - `highlight_active` 表示当前导航目标。页面默认聚焦时间线上较新的目标，通过 replace 更新 active URL；显式导航后刷新或详情返回仍定位同一目标。
-- 列表 API 支持仅用于首载窗口的内部 `focus=id:<release_id>` 或 `focus=tag:<tag>`；它必须独立于 highlight 参数解析，保证目标周边窗口和分页 cursor 可直接返回。分页请求不得继续携带 focus，未知目标沿用 `release_not_found_or_not_cached`。
+- 列表 API 支持仅用于无 cursor 目标窗口查询的内部 `focus=id:<release_id>` 或 `focus=tag:<tag>`，供深链首载或同仓库尚未加载目标的显式选择使用；它必须独立于 highlight 参数解析，保证目标周边窗口和分页 cursor 可直接返回。分页请求不得继续携带 focus，未知目标沿用 `release_not_found_or_not_cached`。
 - 公开列表统一使用动态高度 window virtualization。内部 gap 接近视口时按方向自动请求并逐步填满，prepend、gap 合并及内容 lane 高度变化必须保持当前阅读锚点。
 - 公开 Release 阅读器在 `lg` 及以上视口展示左侧版本目录与右侧详情时间线；窄于 `lg` 时保留单栏公开列表或详情阅读路径，不以横向滚动压缩双栏内容。
 - 版本目录与详情时间线呈现同一仓库、同一时间倒序 Release 序列并以同一 `release_id` 对应。两栏各自虚拟化和懒加载可见窗口，但不得建立独立顺序、重复数据缓存或彼此无关的分页序列。
+- 同一仓库的无 tag 列表入口与显式 tag 链接属于同一公开 Release 阅读会话。目录选择、详情标题激活及浏览器后退/前进在这些 URL 间切换时，阅读器与当前布局中的滚动列表保持挂载，保留已加载时间线、阅读模式和滚动锚点；已加载目标由现有数据直接定位，不以整块骨架屏或冗余的 `focus` 目标窗口请求重新开始阅读。没有新 document 请求不足以证明该连续性。
+- 目录明确选择尚未加载的目标时，立即进入目标 tag URL，保持现有阅读器可见并异步取得目标窗口；数据到达后并入共享序列，再完成同一定位事务。请求失败时保留目标 URL 和已有阅读内容，在阅读器内给出目标加载错误与重试入口；过时响应不得覆盖后续用户选择。
+- 仅在首次进入仓库且没有可展示的时间线数据时显示初始骨架。桌面列表与 tag 直达共用与就绪态一致的双栏轮廓：左侧为接近视口高度的目录行，右侧为不同正文高度的多张详情卡片占位；移动端保持对应的单栏轮廓。标题带、阅读器占位与就绪态应保持稳定的空间关系，不以单卡详情或纵向列表骨架冒充桌面阅读器。
 - `阅读当前版本` 是目录选中项、详情时间线焦点和显式版本链接的唯一语义。无 tag 的 `/:owner/:repo/releases` 是从最新 Release 开始的稳定浏览入口；首次加载和自然阅读不得改写它。目录的明确选择进入 `/public/:owner/:repo/releases/tag/:tag`；在显式版本链接内，详情时间线的自然阅读可以 replace 当前 tag，使可分享 URL 保持对应当前版本而不累积滚动历史。
 - 阅读当前版本的变化由路由变更、目录的明确选择和详情滚动事件驱动；虚拟列表的测量/加载完成只能继续收敛已经由这些事件启动的定位事务，不得自行创建新的选中项或滚动事务。详情时间线优先选择视口内从上到下第一张完整展示的卡片；不存在完整卡片时，选择经过可视区域约 30% 阅读线的卡片。程序化定位期间，目标卡片在落定前不得被经过视口的中间卡片替换为当前版本。
 - 页面级原文、翻译和润色切换是用户事件；lane 重渲染造成动态高度重测时，必须以当前阅读版本的稳定 `release_id` 作为详情滚动锚点，保护该卡片继续挂载并在测量稳定前保持其相对视口位置，不得因前方卡片高度变化而把当前版本推出视口。
@@ -45,6 +49,10 @@
 - 不复制 Release 主数据到 public-only 表。
 - 删除公开登记记录时不清理仍被登录用户视图或其他公开登记使用的共享缓存。
 - 不新增除 `zh-CN` 以外的翻译语言。
+
+## Related ADRs
+
+None
 
 ## 接口契约
 
@@ -132,6 +140,10 @@
   When 前端路由加载
   Then replace 跳转到 `/:owner/:repo/releases`；`/public/:owner/:repo/releases/tag/:tag` 详情路径不被该跳转拦截。
 
+- Given 未登录用户通过旧 `/:owner/:repo/releases/tag/:tag` 路径打开 Release
+  When 路由确认当前访问者未认证
+  Then SPA replace 到 `/public/:owner/:repo/releases/tag/:tag`，保留 highlight 与 demo 查询参数且不发起第二次 document 请求；已登录用户继续进入 Dashboard Release 详情。
+
 - Given 未登录用户在移动端访问公开 Release 列表或详情页
   When 页脚可见
   Then 页脚展示 `Version <loadedVersion>`，有效版本号链接到 `/public/IvanLi-CN/octo-rill/releases/tag/<loadedVersion>`，且页面无横向溢出。
@@ -175,6 +187,18 @@
 - Given 用户以窄于 `lg` 的视口打开同一公开 Release 页面
   When 页面渲染
   Then 页面保留单栏列表或详情阅读路径，没有双栏横向挤压或横向滚动。
+
+- Given 用户首次进入无缓存的公开列表或 tag 链接
+  When 首批 Release 请求仍未完成
+  Then 桌面端显示与实际阅读器宽度、高度和双栏比例相符的目录与多卡片骨架；窄于 `lg` 时显示单栏骨架，两种入口不因是否有 tag 而切换到不同布局。
+
+- Given 同一仓库的公开列表或 tag 阅读器已经就绪
+  When 用户从目录点击已加载版本、从详情标题激活版本，或在浏览器历史中返回相邻的列表/tag URL
+  Then URL 按导航语义更新，原阅读器和当前布局中的滚动列表 DOM 保持挂载，已加载时间线、阅读模式及滚动锚点连续；切换期间不出现初始骨架，已加载目标不再发起冗余的 `focus` 目标窗口请求，并按既有定位规则完成聚焦。
+
+- Given 用户从版本目录选择尚未加载的目标
+  When 目标窗口请求仍在进行、失败或晚于另一项选择返回
+  Then 目标 tag URL 立即生效，旧时间线持续可读；成功响应并入同一序列后定位，失败时在阅读器内提供目标错误和重试且保留 URL 与已有内容，过时响应不覆盖较新的选择。
 
 - Given 用户打开 `/public/:owner/:repo/releases/tag/:tag`
   When 目标 Release 与其周边窗口加载完成
@@ -443,3 +467,59 @@
   evidence_note: 验证旧 `/public/:owner/:repo/releases` 列表路径不再进入前端 404，而是 replace 到 canonical `/:owner/:repo/releases` 并展示公开 Release 落地页；public-only tag 详情路由语义不受此截图覆盖，由路由测试覆盖。
   image:
   ![公开 Release 旧列表路径跳转到 canonical 落地页](./assets/public-release-legacy-redirect-browser-1440x1000.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `1440x1000`
+  captured_viewport: `1440x1000`
+  viewport_strategy: `browser-viewport-override`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  route: `/public/octo-demo/release-lab/releases/tag/v2.30.0?demo=public-release-ready&d_controls=hidden`
+  state: `public-release-same-repo-hot-switch-desktop`
+  evidence_note: 展示同仓库公开 tag 热切换后的目录与详情双栏布局及选中版本；跨路由 Playwright 和 MutationObserver 验证阅读器/滚动容器 DOM 连续、未插入初始骨架，且已加载目标未发出冗余 focus 请求。
+  image:
+  ![公开 Release 同仓库热切换桌面状态](./assets/public-release-reader-hot-desktop-1440x1000.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `390x844`
+  captured_viewport: `390x844`
+  viewport_strategy: `browser-viewport-override`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  route: `/public/octo-demo/release-lab/releases/tag/v2.30.0?demo=public-release-ready&d_controls=hidden`
+  state: `public-release-same-repo-hot-switch-mobile`
+  evidence_note: 展示热切换后的移动端单栏 Release 时间线与阅读模式标题带；浏览器验证页面无横向溢出，路由切换连续性由同仓库导航回归覆盖。
+  image:
+  ![公开 Release 同仓库热切换移动状态](./assets/public-release-reader-hot-mobile-390x844.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `1440x1000`
+  captured_viewport: `1440x1000`
+  viewport_strategy: `browser-viewport-override`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  route: `/public/octo-demo/release-lab/releases/tag/v2.30.0?demo=public-release-ready&d_controls=hidden`
+  state: `public-release-cold-skeleton-desktop`
+  evidence_note: 展示冷启动骨架与桌面就绪态一致的双栏比例、接近视口高度的版本目录和多张不同内容高度的详情占位。
+  image:
+  ![公开 Release 桌面端冷启动骨架](./assets/public-release-cold-skeleton-desktop-1440x1000.png)
+
+- source_type: `ui_demo`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `390x844`
+  captured_viewport: `390x844`
+  viewport_strategy: `browser-viewport-override`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  route: `/public/octo-demo/release-lab/releases/tag/v2.30.0?demo=public-release-ready&d_controls=hidden`
+  state: `public-release-cold-skeleton-mobile`
+  evidence_note: 展示移动端单栏冷启动卡片骨架与就绪阅读路径一致，视口内无横向溢出。
+  image:
+  ![公开 Release 移动端冷启动骨架](./assets/public-release-cold-skeleton-mobile-390x844.png)
