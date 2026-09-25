@@ -821,6 +821,23 @@ async fn load_global_task_rows_in_connection(
     Ok(rows)
 }
 
+async fn identity_upgrade_complete_in_connection(
+    connection: &mut SqliteConnection,
+) -> Result<bool, ApiError> {
+    match sqlx::query_as::<_, (String, String)>(
+        "SELECT status, phase FROM content_identity_upgrade_control WHERE id = 1",
+    )
+    .fetch_optional(&mut *connection)
+    .await
+    {
+        Ok(state) => {
+            Ok(state.is_some_and(|(status, phase)| status == "completed" && phase == "complete"))
+        }
+        Err(error) if missing_table(&error) => Ok(false),
+        Err(error) => Err(ApiError::internal(error)),
+    }
+}
+
 fn global_summary(row: &GlobalTaskRow) -> AdminCollectionTaskSummary {
     AdminCollectionTaskSummary {
         status: row.status.clone(),
@@ -1567,7 +1584,56 @@ fn activity_source_ctes(kind: CollectionRecordKind) -> String {
     }
 }
 
-fn activity_query_sql(kind: CollectionRecordKind, global_mode: bool) -> String {
+fn global_work_candidates_ctes(
+    source_cte: &str,
+    resource_type: &str,
+    identity_upgrade_complete: bool,
+) -> String {
+    if identity_upgrade_complete {
+        format!(
+            "ranked_identity_members AS MATERIALIZED (
+                SELECT m.identity_id, w.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY m.identity_id
+                        ORDER BY CASE w.status
+                            WHEN 'queued' THEN 0 WHEN 'running' THEN 1
+                            WHEN 'deferred_provider' THEN 2 WHEN 'blocked_config' THEN 3
+                            WHEN 'ready' THEN 4 WHEN 'failed' THEN 5
+                            WHEN 'superseded' THEN 9 ELSE 6 END,
+                            w.attempt_count DESC, julianday(w.updated_at) DESC,
+                            w.updated_at DESC, w.id DESC
+                    ) AS member_rank
+                FROM {source_cte} s
+                CROSS JOIN content_work_identity_members m
+                JOIN content_work_items w ON w.id = m.work_item_id
+                WHERE w.canonical_resource_type = '{resource_type}'
+                  AND w.canonical_resource_id = s.id
+                  AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
+                    OR (w.pipeline = 'polishing' AND w.variant = 'smart'))
+            ),
+            global_work_candidates AS MATERIALIZED (
+                SELECT * FROM ranked_identity_members WHERE member_rank = 1
+            )"
+        )
+    } else {
+        format!(
+            "global_work_candidates AS MATERIALIZED (
+                SELECT w.* FROM {source_cte} s
+                CROSS JOIN content_work_items w
+                WHERE w.canonical_resource_type = '{resource_type}'
+                  AND w.canonical_resource_id = s.id
+                  AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
+                    OR (w.pipeline = 'polishing' AND w.variant = 'smart'))
+            )"
+        )
+    }
+}
+
+fn activity_query_sql(
+    kind: CollectionRecordKind,
+    global_mode: bool,
+    identity_upgrade_complete: bool,
+) -> String {
     let mut sql = String::from("WITH ");
     sql.push_str(&activity_source_ctes(kind));
 
@@ -1671,8 +1737,13 @@ fn activity_query_sql(kind: CollectionRecordKind, global_mode: bool) -> String {
         ));
 
         if global_mode {
+            let global_work_candidates = global_work_candidates_ctes(
+                "bounded_source_records",
+                resource_type,
+                identity_upgrade_complete,
+            );
             sql.push_str(&format!(
-                ", global_task_rows AS MATERIALIZED (
+                ", {global_work_candidates}, global_task_rows AS MATERIALIZED (
                     SELECT
                         w.canonical_resource_id AS entity_id,
                         CASE WHEN w.pipeline = 'polishing' THEN 'polish' ELSE 'translation' END AS pipeline,
@@ -1698,12 +1769,7 @@ fn activity_query_sql(kind: CollectionRecordKind, global_mode: bool) -> String {
                                 w.updated_at DESC,
                                 w.id DESC
                         ) AS row_rank
-                    FROM bounded_source_records s
-                    CROSS JOIN content_work_items w
-                    WHERE w.canonical_resource_type = '{resource_type}'
-                      AND w.canonical_resource_id = s.id
-                      AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
-                        OR (w.pipeline = 'polishing' AND w.variant = 'smart'))
+                    FROM global_work_candidates w
                 ),
                 global_latest AS (
                     SELECT entity_id, pipeline, raw_status
@@ -1725,6 +1791,7 @@ fn activity_query_sql(kind: CollectionRecordKind, global_mode: bool) -> String {
                     LEFT JOIN coverage ct ON ct.entity_id = s.id AND ct.pipeline = 'translation'
                     LEFT JOIN coverage cp ON cp.entity_id = s.id AND cp.pipeline = 'polish'
                 )",
+                global_work_candidates = global_work_candidates,
                 translation_status = sql_global_status(
                     "gt.raw_status",
                     "ot.raw_status",
@@ -1783,12 +1850,22 @@ async fn load_activity_rows(
     window_started_at: &str,
     window_ended_at: &str,
 ) -> Result<Vec<AdminCollectionActivityRow>, ApiError> {
-    sqlx::query_as::<_, AdminCollectionActivityRow>(&activity_query_sql(kind, global_mode))
-        .bind(window_started_at)
-        .bind(window_ended_at)
-        .fetch_all(pool)
-        .await
-        .map_err(ApiError::internal)
+    let identity_upgrade_complete = if global_mode {
+        let mut connection = pool.acquire().await.map_err(ApiError::internal)?;
+        identity_upgrade_complete_in_connection(&mut connection).await?
+    } else {
+        false
+    };
+    sqlx::query_as::<_, AdminCollectionActivityRow>(&activity_query_sql(
+        kind,
+        global_mode,
+        identity_upgrade_complete,
+    ))
+    .bind(window_started_at)
+    .bind(window_ended_at)
+    .fetch_all(pool)
+    .await
+    .map_err(ApiError::internal)
 }
 
 fn composite_activity_status(translation: Option<&str>, polish: &str) -> &'static str {
@@ -1907,6 +1984,7 @@ fn build_activity_response(
 fn collection_query_sql(
     kind: CollectionRecordKind,
     global_mode: bool,
+    identity_upgrade_complete: bool,
     from: Option<&str>,
     before: Option<&str>,
     attempts: AttemptCountRange,
@@ -2034,6 +2112,13 @@ fn collection_query_sql(
         sql.push_str(", ");
         sql.push_str(&legacy_task_rows);
         if global_mode {
+            let global_work_candidates = global_work_candidates_ctes(
+                "source_records",
+                resource_type,
+                identity_upgrade_complete,
+            );
+            sql.push_str(", ");
+            sql.push_str(&global_work_candidates);
             sql.push_str(
                 ",
                 global_task_rows AS (
@@ -2063,12 +2148,7 @@ fn collection_query_sql(
                                 w.updated_at DESC,
                                 w.id DESC
                         ) AS row_rank
-                FROM source_records s
-                CROSS JOIN content_work_items w
-                WHERE w.canonical_resource_type = '{resource_type}'
-                  AND w.canonical_resource_id = s.id
-                      AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
-                        OR (w.pipeline = 'polishing' AND w.variant = 'smart'))
+                FROM global_work_candidates w
                 ),
                 global_latest AS (
                     SELECT entity_id, pipeline, raw_status, attempt_count
@@ -2080,12 +2160,7 @@ fn collection_query_sql(
                         w.canonical_resource_id AS entity_id,
                         CASE WHEN w.pipeline = 'polishing' THEN 'polish' ELSE 'translation' END AS pipeline,
                         MAX(w.attempt_count) AS attempt_count
-                    FROM source_records s
-                    CROSS JOIN content_work_items w
-                    WHERE w.canonical_resource_type = '{resource_type}'
-                      AND w.canonical_resource_id = s.id
-                      AND ((w.pipeline = 'translation' AND w.variant IN ('detail', 'summary', 'shared'))
-                        OR (w.pipeline = 'polishing' AND w.variant = 'smart'))
+                    FROM global_work_candidates w
                     GROUP BY w.canonical_resource_id,
                         CASE WHEN w.pipeline = 'polishing' THEN 'polish' ELSE 'translation' END
                 ),
@@ -2306,9 +2381,15 @@ async fn list_collection_page_in_connection(
     page_size: i64,
     offset: i64,
 ) -> Result<(i64, Vec<SourceRecordRow>), ApiError> {
+    let identity_upgrade_complete = if global_mode {
+        identity_upgrade_complete_in_connection(connection).await?
+    } else {
+        false
+    };
     let (page_sql, page_binds) = collection_query_sql(
         kind,
         global_mode,
+        identity_upgrade_complete,
         from,
         before,
         attempts,
@@ -2328,6 +2409,7 @@ async fn list_collection_page_in_connection(
         let (count_sql, count_binds) = collection_query_sql(
             kind,
             global_mode,
+            identity_upgrade_complete,
             from,
             before,
             attempts,
@@ -3190,6 +3272,7 @@ fn build_brief_attempts(
                 .or_else(|| failed.and_then(|event| event.model.clone()))
                 .or_else(|| terminal.and_then(|event| event.model.clone()))
                 .unwrap_or_else(|| "unknown".to_owned());
+            let has_attempt_evidence = running.is_some() || failed.is_some() || terminal.is_some();
             attempts.push(AdminCollectionAttempt {
                 id: format!("{}:{attempt_no}", call.id),
                 pipeline: "polish".to_owned(),
@@ -3219,9 +3302,13 @@ fn build_brief_attempts(
                     status: status.clone(),
                     source: call.source.clone(),
                     model,
-                    stage: None,
-                    relation_role: None,
-                    evidence_availability: None,
+                    stage: Some("provider_call".to_owned()),
+                    relation_role: Some("primary".to_owned()),
+                    evidence_availability: Some(if has_attempt_evidence {
+                        "available".to_owned()
+                    } else {
+                        "not_captured".to_owned()
+                    }),
                 }],
             });
         }
@@ -4384,6 +4471,18 @@ mod tests {
         assert_eq!(attempts[0].failure_class.as_deref(), Some("transient"));
         assert_eq!(attempts[0].started_at, None);
         assert_eq!(attempts[0].llm_calls[0].model, "model-a");
+        assert_eq!(
+            attempts[0].llm_calls[0].stage.as_deref(),
+            Some("provider_call")
+        );
+        assert_eq!(
+            attempts[0].llm_calls[0].relation_role.as_deref(),
+            Some("primary")
+        );
+        assert_eq!(
+            attempts[0].llm_calls[0].evidence_availability.as_deref(),
+            Some("available")
+        );
         assert_eq!(attempts[1].status, "failed");
         assert_eq!(attempts[1].failure_class.as_deref(), Some("rate_limited"));
         assert_eq!(attempts[2].status, "succeeded");
@@ -4398,6 +4497,18 @@ mod tests {
         assert_eq!(attempts[4].finished_at, None);
         assert_eq!(attempts[4].llm_calls[0].status, "not_recorded");
         assert_eq!(attempts[4].llm_calls[0].model, "unknown");
+        assert_eq!(
+            attempts[4].llm_calls[0].stage.as_deref(),
+            Some("provider_call")
+        );
+        assert_eq!(
+            attempts[4].llm_calls[0].relation_role.as_deref(),
+            Some("primary")
+        );
+        assert_eq!(
+            attempts[4].llm_calls[0].evidence_availability.as_deref(),
+            Some("not_captured")
+        );
         assert_eq!(attempts[5].status, "not_recorded");
         assert_eq!(attempts[5].started_at, None);
         assert_eq!(attempts[5].last_attempt_at, None);
@@ -5520,6 +5631,145 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn completed_identity_upgrade_uses_canonical_member_for_list_activity_and_detail() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "CREATE TABLE repo_releases (release_id INTEGER, repo_id INTEGER, name TEXT, tag_name TEXT, published_at TEXT, created_at TEXT, updated_at TEXT, detected_at TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create release source");
+        sqlx::query("CREATE TABLE repo_release_work_items (repo_id INTEGER, repo_full_name TEXT)")
+            .execute(&pool)
+            .await
+            .expect("create release repository");
+        sqlx::query("INSERT INTO repo_releases VALUES (101, 1, 'Release', 'v1', '2026-07-08T08:30:00Z', NULL, NULL, NULL)")
+            .execute(&pool)
+            .await
+            .expect("seed release");
+        sqlx::query("INSERT INTO repo_release_work_items VALUES (1, 'octo/releases')")
+            .execute(&pool)
+            .await
+            .expect("seed repository");
+        create_activity_status_tables(&pool).await;
+        sqlx::query("CREATE TABLE content_work_identities (id TEXT, source_hash TEXT)")
+            .execute(&pool)
+            .await
+            .expect("create work identities");
+        sqlx::query(
+            "CREATE TABLE content_work_identity_members (identity_id TEXT, work_item_id TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create identity members");
+        sqlx::query(
+            "CREATE TABLE content_identity_upgrade_control (id INTEGER, status TEXT, phase TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create identity upgrade control");
+        sqlx::query(
+            "INSERT INTO content_identity_upgrade_control VALUES (1, 'completed', 'complete')",
+        )
+        .execute(&pool)
+        .await
+        .expect("complete identity upgrade");
+        sqlx::query("CREATE TABLE content_current_result_projections (identity_id TEXT, work_item_id TEXT, source_hash TEXT, updated_at TEXT)")
+            .execute(&pool)
+            .await
+            .expect("create current projections");
+        sqlx::query("CREATE TABLE content_result_projections (id TEXT, canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, variant TEXT, target_lang TEXT, protocol_version TEXT, model_profile TEXT, source_hash TEXT, work_item_id TEXT, updated_at TEXT)")
+            .execute(&pool)
+            .await
+            .expect("create historical projections");
+        sqlx::query(
+            "CREATE TABLE content_attempt_events (id TEXT, work_item_id TEXT, created_at TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create global attempt events");
+        sqlx::query(
+            "CREATE TABLE content_work_items (id TEXT, canonical_resource_type TEXT, canonical_resource_id TEXT, pipeline TEXT, variant TEXT, target_lang TEXT, source_hash TEXT, protocol_version TEXT, model_profile TEXT, status TEXT, attempt_count INTEGER, started_at TEXT, finished_at TEXT, created_at TEXT, updated_at TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .expect("create global work items");
+        sqlx::query("INSERT INTO content_work_identities VALUES ('identity-1', 'hash-1')")
+            .execute(&pool)
+            .await
+            .expect("seed work identity");
+        sqlx::query(
+            "INSERT INTO content_work_items VALUES
+                ('queued-old', 'release', '101', 'translation', 'detail', 'zh-CN', 'hash-1', 'v1', 'test', 'queued', 1, NULL, NULL, '2026-07-08T08:30:00Z', '2026-07-08T08:31:00Z'),
+                ('failed-new', 'release', '101', 'translation', 'detail', 'zh-CN', 'hash-1', 'v1', 'test', 'failed', 3, '2026-07-08T08:40:00Z', '2026-07-08T08:41:00Z', '2026-07-08T08:40:00Z', '2026-07-08T08:41:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed identity members");
+        sqlx::query("INSERT INTO content_work_identity_members VALUES ('identity-1', 'queued-old'), ('identity-1', 'failed-new')")
+            .execute(&pool)
+            .await
+            .expect("link identity members");
+
+        let (total, rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Release,
+            true,
+            Some("2026-07-08T08:00:00Z"),
+            Some("2026-07-08T10:00:00Z"),
+            AttemptCountRange { min: 0, max: None },
+            None,
+            None,
+            20,
+            0,
+        )
+        .await
+        .expect("list release with completed identity upgrade");
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].id, "101");
+        assert_eq!(rows[0].total_count, 1);
+        let (attempt_filtered_total, attempt_filtered_rows) = list_collection_page(
+            &pool,
+            CollectionRecordKind::Release,
+            true,
+            Some("2026-07-08T08:00:00Z"),
+            Some("2026-07-08T10:00:00Z"),
+            AttemptCountRange { min: 2, max: None },
+            None,
+            None,
+            20,
+            0,
+        )
+        .await
+        .expect("filter using canonical member attempt count");
+        assert_eq!(attempt_filtered_total, 0);
+        assert!(attempt_filtered_rows.is_empty());
+
+        let activity = load_activity_rows(
+            &pool,
+            CollectionRecordKind::Release,
+            true,
+            "2026-07-08T08:00:00Z",
+            "2026-07-08T10:00:00Z",
+        )
+        .await
+        .expect("read activity with completed identity upgrade");
+        assert_eq!(activity[0].translation_status.as_deref(), Some("queued"));
+
+        let mut connection = pool.acquire().await.expect("acquire test connection");
+        let detail_rows = load_global_task_rows_in_connection(
+            &mut connection,
+            CollectionRecordKind::Release,
+            &["101".to_owned()],
+        )
+        .await
+        .expect("load canonical detail work");
+        assert_eq!(detail_rows.len(), 1);
+        assert_eq!(detail_rows[0].status, "queued");
+        assert_eq!(detail_rows[0].attempt_count, 1);
+    }
+
     #[test]
     fn activity_window_and_composite_status_rules_are_exact() {
         let now = DateTime::parse_from_rfc3339("2026-07-08T09:37:00Z")
@@ -5827,7 +6077,10 @@ mod tests {
                 CollectionRecordKind::Notification => 2_500,
                 CollectionRecordKind::Brief => 5_000,
             };
-            let explain = format!("EXPLAIN QUERY PLAN {}", activity_query_sql(kind, true));
+            let explain = format!(
+                "EXPLAIN QUERY PLAN {}",
+                activity_query_sql(kind, true, false)
+            );
             let plan = sqlx::query_as::<_, ExplainPlanRow>(&explain)
                 .bind(WINDOW_FROM)
                 .bind(WINDOW_BEFORE)
@@ -5925,6 +6178,7 @@ mod tests {
                 let (list_sql, list_binds) = collection_query_sql(
                     kind,
                     true,
+                    false,
                     Some(from),
                     Some(before),
                     AttemptCountRange { min: 0, max: None },
