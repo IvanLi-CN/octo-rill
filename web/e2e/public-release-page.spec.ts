@@ -516,6 +516,37 @@ test("anonymous legacy release tags replace-navigate to the public reader", asyn
 	]);
 });
 
+test("anonymous legacy release tags preserve demo query state", async ({
+	page,
+}) => {
+	const documentRequests: string[] = [];
+	page.on("request", (request) => {
+		if (request.resourceType() === "document") {
+			documentRequests.push(request.url());
+		}
+	});
+
+	await page.goto(
+		"/octo-demo/release-lab/releases/tag/v2.30.0?demo=public-release-ready&d_controls=hidden",
+	);
+	await expect
+		.poll(() => {
+			const url = new URL(page.url());
+			return {
+				pathname: url.pathname,
+				demo: url.searchParams.get("demo"),
+				controls: url.searchParams.get("d_controls"),
+			};
+		})
+		.toEqual({
+			pathname: "/public/octo-demo/release-lab/releases/tag/v2.30.0",
+			demo: "public-release-ready",
+			controls: "hidden",
+		});
+	await expect(page.getByTestId("public-release-reader")).toBeVisible();
+	expect(documentRequests).toHaveLength(1);
+});
+
 test("public release reader stays mounted across same-repository route history", async ({
 	page,
 }) => {
