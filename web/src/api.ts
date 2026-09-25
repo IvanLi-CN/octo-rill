@@ -1864,6 +1864,7 @@ export async function apiGetPublicRepoReleases(input: {
 	highlight_start?: string;
 	highlight_end?: string;
 	highlight_active?: string;
+	focus?: string;
 	direction?: "older" | "newer";
 	content?: "original" | "translated" | "polished" | "all";
 	include_original?: boolean;
@@ -1887,6 +1888,7 @@ export async function apiGetPublicRepoReleases(input: {
 	if (input.highlight_active !== undefined) {
 		params.set("highlight_active", input.highlight_active);
 	}
+	if (input.focus !== undefined) params.set("focus", input.focus);
 	if (input.direction) params.set("direction", input.direction);
 	if (input.include_original) params.set("include_original", "true");
 	const path = `/api/public/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases?${params.toString()}`;

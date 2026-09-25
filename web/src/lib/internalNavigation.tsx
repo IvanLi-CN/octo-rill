@@ -10,6 +10,7 @@ type NavigationTarget = {
 	search?: Record<string, unknown>;
 	params?: Record<string, string>;
 	replace?: boolean;
+	resetScroll?: boolean;
 };
 
 type InternalLinkProps = AnchorHTMLAttributes<HTMLAnchorElement> &
@@ -34,7 +35,14 @@ export function useInternalNavigate() {
 	const router = useOptionalRouter();
 
 	return useCallback(
-		async ({ href, to, search, params, replace }: NavigationTarget) => {
+		async ({
+			href,
+			to,
+			search,
+			params,
+			replace,
+			resetScroll,
+		}: NavigationTarget) => {
 			const resolvedHref = resolveDemoNativeHref(href);
 			if (!router) {
 				if (replace) {
@@ -50,6 +58,7 @@ export function useInternalNavigate() {
 				search: search as never,
 				params: params as never,
 				replace,
+				resetScroll,
 			});
 		},
 		[router],
@@ -57,7 +66,17 @@ export function useInternalNavigate() {
 }
 
 export function InternalLink(props: InternalLinkProps) {
-	const { href, to, search, params, replace, onClick, target, ...rest } = props;
+	const {
+		href,
+		to,
+		search,
+		params,
+		replace,
+		resetScroll,
+		onClick,
+		target,
+		...rest
+	} = props;
 	const router = useOptionalRouter();
 	const resolvedHref = resolveDemoNativeHref(href);
 
@@ -77,6 +96,7 @@ export function InternalLink(props: InternalLinkProps) {
 					search: search as never,
 					params: params as never,
 					replace,
+					resetScroll,
 				});
 			}}
 		/>
