@@ -337,6 +337,7 @@ function RepoIdentityContent(props: {
 						}}
 						className={cn(
 							"block min-w-0 max-w-full flex-1 whitespace-normal [overflow-wrap:anywhere]",
+							labelSuffix && "sm:flex-[0_1_auto]",
 							labelClassName,
 						)}
 						title={repoFullName}

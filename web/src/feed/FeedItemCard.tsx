@@ -218,7 +218,7 @@ function FeedItemTypeIcon(props: {
 		<span
 			aria-hidden="true"
 			className={cn(
-				"hidden shrink-0 items-center justify-center text-muted-foreground sm:inline-flex",
+				"hidden shrink-0 self-center items-center justify-center text-muted-foreground sm:inline-flex",
 				className,
 			)}
 			data-feed-item-type-icon={type}

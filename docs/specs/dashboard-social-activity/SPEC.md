@@ -232,9 +232,14 @@
 
 ### Release and announcement type icons
 
-PR: include
 
 ![Dashboard release and announcement type icons](./assets/dashboard-release-announcement-type-icons.png)
+
+### Release type icon alignment
+
+![Release type icon aligned with the repository name on desktop](assets/release-type-icon-desktop-storybook.png)
+
+![Mobile release card keeps the repository name readable and hides the type icon](assets/release-type-icon-mobile-storybook.png)
 
 ## 方案概述（Approach, high-level）
 
