@@ -1,6 +1,34 @@
 import { expect, test } from "@playwright/test";
 
 test.describe("mock-only page demo scenes", () => {
+	test("admin jobs demo keeps unobserved earlier attempts unknown", async ({
+		page,
+	}) => {
+		await page.goto("/admin/jobs?demo=admin-jobs-running&d_controls=hidden");
+		await page.getByRole("tab", { name: "内容处理" }).click();
+		await page.getByRole("button", { name: "查看 v2.31.0 详情" }).click();
+
+		const recordDetail = page.getByRole("dialog", { name: "记录详情" });
+		await expect(recordDetail).toBeVisible();
+		const earlierAttempt = recordDetail.getByRole("button", {
+			name: "查看润色第 1 次尝试详情",
+		});
+		await expect(earlierAttempt).toContainText("历史未记录");
+		await expect(earlierAttempt).not.toContainText("失败");
+		await earlierAttempt.click();
+
+		const attemptDetail = page.getByRole("dialog", { name: "尝试详情" });
+		await expect(attemptDetail).toContainText("上次尝试：未知");
+		await expect(attemptDetail).toContainText("开始：未开始");
+		await expect(attemptDetail).toContainText("完成：未完成");
+		await expect(attemptDetail).toContainText(
+			"此尝试没有可关联的模型调用记录。",
+		);
+		await expect(attemptDetail).not.toContainText(
+			"release_smart_body_summary_json_decode_failed",
+		);
+	});
+
 	test("admin dashboard and repo governance scenes are deep-linkable", async ({
 		page,
 	}) => {

@@ -647,6 +647,40 @@ function normalizedDisplayStatus(summary: AdminCollectionTaskSummary) {
 	}
 }
 
+function hasUnknownAttemptHistory(summary: AdminCollectionTaskSummary) {
+	return (
+		summary.status_origin === "historical_unknown" ||
+		summary.status_origin === "legacy_evidence" ||
+		summary.status_origin === "legacy_conflict"
+	);
+}
+
+function attemptCountLabel(summary: AdminCollectionTaskSummary) {
+	return hasUnknownAttemptHistory(summary)
+		? "未知"
+		: `${summary.attempt_count} 次`;
+}
+
+function summaryTime(
+	summary: AdminCollectionTaskSummary,
+	value: string | null,
+	fallback: string,
+) {
+	return formatDateTime(
+		value,
+		hasUnknownAttemptHistory(summary) ? "未知" : fallback,
+	);
+}
+
+function lastAttemptTime(summary: AdminCollectionTaskSummary) {
+	return formatDateTime(
+		summary.last_attempt_at,
+		hasUnknownAttemptHistory(summary) || summary.attempt_count > 0
+			? "未知"
+			: "未尝试",
+	);
+}
+
 function RecordStatus({ status }: { status: string }) {
 	return (
 		<Badge className={statusTone(status)} variant="outline">
@@ -661,7 +695,7 @@ function TaskSummaryHeader({ label }: { label: string }) {
 			<div className="space-y-0.5">
 				<span className="block">{label}</span>
 				<span className="text-muted-foreground block font-mono text-xs font-medium">
-					状态 · 重试 / 开始 · 上次 · 完成
+					状态 · 尝试 / 开始 · 上次 · 完成
 				</span>
 			</div>
 		</TableHead>
@@ -694,13 +728,13 @@ function TaskSummaryCell({ summary }: { summary: AdminCollectionTaskSummary }) {
 				<div className="flex flex-wrap items-center gap-x-2 gap-y-1">
 					<RecordStatus status={normalizedDisplayStatus(summary)} />
 					<span className="text-muted-foreground text-xs">
-						{summary.retry_count} 次
+						{attemptCountLabel(summary)}
 					</span>
 				</div>
 				<div className="grid grid-cols-3 gap-2 text-xs tabular-nums">
-					<span>{formatDateTime(summary.started_at, "未开始")}</span>
-					<span>{formatDateTime(summary.last_attempt_at, "未尝试")}</span>
-					<span>{formatDateTime(summary.finished_at, "未完成")}</span>
+					<span>{summaryTime(summary, summary.started_at, "未开始")}</span>
+					<span>{lastAttemptTime(summary)}</span>
+					<span>{summaryTime(summary, summary.finished_at, "未完成")}</span>
 				</div>
 				<EvidenceLines summary={summary} />
 			</div>
@@ -911,8 +945,7 @@ function CompactTask({
 				<RecordStatus status={normalizedDisplayStatus(summary)} />
 			</div>
 			<p className="text-muted-foreground mt-2 text-xs">
-				重试 {summary.retry_count} · 上次{" "}
-				{formatDateTime(summary.last_attempt_at, "未尝试")}
+				尝试 {attemptCountLabel(summary)} · 上次 {lastAttemptTime(summary)}
 			</p>
 			<EvidenceLines summary={summary} />
 		</div>
@@ -991,12 +1024,10 @@ function ProcessingSummary({
 				<RecordStatus status={normalizedDisplayStatus(summary)} />
 			</div>
 			<div className="text-muted-foreground grid grid-cols-2 gap-x-3 gap-y-2 text-xs">
-				<span>重试 {summary.retry_count} 次</span>
-				<span>开始 {formatDateTime(summary.started_at, "未开始")}</span>
-				<span>
-					上次尝试 {formatDateTime(summary.last_attempt_at, "未尝试")}
-				</span>
-				<span>完成 {formatDateTime(summary.finished_at, "未完成")}</span>
+				<span>尝试 {attemptCountLabel(summary)}</span>
+				<span>开始 {summaryTime(summary, summary.started_at, "未开始")}</span>
+				<span>上次尝试 {lastAttemptTime(summary)}</span>
+				<span>完成 {summaryTime(summary, summary.finished_at, "未完成")}</span>
 			</div>
 			<EvidenceLines summary={summary} />
 		</div>
@@ -1021,7 +1052,7 @@ function AttemptDetail({
 			</div>
 			<div className="text-muted-foreground grid gap-2 border-y py-3 text-sm sm:grid-cols-2">
 				<p>触发：{attempt.trigger}</p>
-				<p>上次尝试：{formatDateTime(attempt.last_attempt_at)}</p>
+				<p>上次尝试：{formatDateTime(attempt.last_attempt_at, "未知")}</p>
 				<p>开始：{formatDateTime(attempt.started_at, "未开始")}</p>
 				<p>完成：{formatDateTime(attempt.finished_at, "未完成")}</p>
 				{attempt.next_retry_at ? (
@@ -1111,7 +1142,7 @@ function RecordDetail({
 				<div className="flex items-center justify-between gap-3">
 					<h3 className="font-semibold text-sm">尝试记录</h3>
 					<span className="text-muted-foreground text-xs">
-						{attempts.length} 次
+						{attempts.length} 条
 					</span>
 				</div>
 				{attempts.length === 0 ? (
@@ -1149,7 +1180,7 @@ function RecordDetail({
 										</span>
 										<span className="text-muted-foreground mt-1 block text-xs">
 											{attempt.trigger} ·{" "}
-											{formatDateTime(attempt.last_attempt_at)}
+											{formatDateTime(attempt.last_attempt_at, "未知")}
 										</span>
 										{error ? (
 											<span className="text-destructive mt-1 line-clamp-2 block text-xs">

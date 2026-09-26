@@ -2403,8 +2403,8 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(llmSheet).toBeVisible();
 	await expect(page.getByText("Conversation Timeline")).toBeVisible();
 	await expect(page.getByText("Input Messages")).toHaveCount(0);
-	await expect(page.getByText("耗时 / 重试")).toBeVisible();
-	await expect(page.getByText("等待 / 首字 / 耗时 / 重试")).toHaveCount(0);
+	await expect(page.getByText("耗时 / 尝试")).toBeVisible();
+	await expect(page.getByText("等待 / 首字 / 耗时 / 尝试")).toHaveCount(0);
 	await expect(
 		page.getByText("等待 1.20s · 首字 860ms", { exact: true }),
 	).toBeVisible();
@@ -2710,14 +2710,14 @@ test("content processing audit shows retry state, model, error, and call detail"
 		generated_at: null,
 		translation: {
 			status: "queued",
-			retry_count: 1,
+			attempt_count: 2,
 			started_at: "2026-04-15T03:23:00Z",
 			last_attempt_at: "2026-04-15T03:25:00Z",
 			finished_at: null,
 		},
 		polish: {
 			status: "ready",
-			retry_count: 0,
+			attempt_count: 1,
 			started_at: "2026-04-15T03:22:00Z",
 			last_attempt_at: "2026-04-15T03:22:01Z",
 			finished_at: "2026-04-15T03:22:01Z",
@@ -2835,6 +2835,8 @@ test("content processing audit shows retry state, model, error, and call detail"
 	await page.getByRole("button", { name: "查看 v2.31.0 详情" }).click();
 	const recordSheet = page.getByRole("dialog", { name: "记录详情" });
 	await expect(recordSheet).toBeVisible();
+	await expect(recordSheet.getByText("尝试 2 次")).toBeVisible();
+	await expect(recordSheet.getByText("尝试 1 次")).toBeVisible();
 	await expect(
 		recordSheet.getByText("gpt-4o-mini", { exact: true }),
 	).toBeVisible();
@@ -2890,14 +2892,14 @@ test("collection activity handoff keeps the selected map and list state", async 
 		generated_at: null,
 		translation: {
 			status: "queued",
-			retry_count: 0,
+			attempt_count: 0,
 			started_at: null,
-			last_attempt_at: "2026-09-24T11:30:00.000Z",
+			last_attempt_at: null,
 			finished_at: null,
 		},
 		polish: {
 			status: "ready",
-			retry_count: 0,
+			attempt_count: 1,
 			started_at: null,
 			last_attempt_at: "2026-09-24T11:30:00.000Z",
 			finished_at: null,
@@ -2956,6 +2958,8 @@ test("collection activity handoff keeps the selected map and list state", async 
 	await activityCell.click();
 	const recordSheet = page.getByRole("dialog", { name: "记录详情" });
 	await expect(recordSheet).toBeVisible();
+	await expect(recordSheet.getByText("尝试 0 次")).toBeVisible();
+	await expect(recordSheet.getByText("上次尝试 未尝试")).toBeVisible();
 	await expect(page).toHaveURL(
 		/\/admin\/jobs\/ai-records\/release\/release-grid-21/,
 	);
@@ -3016,7 +3020,7 @@ test("cold collection detail renders one activity read before loading the list",
 		translation: null,
 		polish: {
 			status: "ready",
-			retry_count: 0,
+			attempt_count: 1,
 			started_at: null,
 			last_attempt_at: "2026-09-24T11:30:00.000Z",
 			finished_at: null,
@@ -3082,7 +3086,7 @@ test("cold collection detail reads activity once and retries only after failure"
 		translation: null,
 		polish: {
 			status: "ready",
-			retry_count: 0,
+			attempt_count: 1,
 			started_at: null,
 			last_attempt_at: "2026-09-24T11:30:00.000Z",
 			finished_at: null,
@@ -3153,7 +3157,7 @@ test("content processing attempt filter stays full-width without mobile overflow
 		translation: null,
 		polish: {
 			status: "not_recorded",
-			retry_count: 0,
+			attempt_count: 0,
 			started_at: null,
 			last_attempt_at: null,
 			finished_at: null,
@@ -3247,7 +3251,7 @@ test("content processing keeps the last list visible after a refresh timeout", a
 			status: "ready",
 			display_status: "succeeded",
 			status_origin: "task",
-			retry_count: 0,
+			attempt_count: 1,
 			started_at: null,
 			last_attempt_at: null,
 			finished_at: null,
@@ -3309,14 +3313,14 @@ test("content processing hides the previous query after a filter read failure", 
 		generated_at: null,
 		translation: {
 			status: "running",
-			retry_count: 0,
+			attempt_count: 1,
 			started_at: "2026-04-15T03:23:00Z",
 			last_attempt_at: "2026-04-15T03:25:00Z",
 			finished_at: null,
 		},
 		polish: {
 			status: "ready",
-			retry_count: 0,
+			attempt_count: 1,
 			started_at: "2026-04-15T03:22:00Z",
 			last_attempt_at: "2026-04-15T03:22:01Z",
 			finished_at: "2026-04-15T03:22:01Z",
