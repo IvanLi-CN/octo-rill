@@ -4,8 +4,15 @@ import { expect, within } from "storybook/test";
 
 import type { DashboardScope } from "@/dashboard/routeState";
 import { FeedItemCard } from "@/feed/FeedItemCard";
-import type { AnnouncementFeedItem, FeedLane, FeedViewer } from "@/feed/types";
+import type {
+	AnnouncementFeedItem,
+	FeedLane,
+	FeedViewer,
+	ReleaseFeedItem,
+} from "@/feed/types";
 import type { DashboardTab } from "@/pages/DashboardControlBand";
+
+type ReadableFeedItem = AnnouncementFeedItem | ReleaseFeedItem;
 
 const STORYBOOK_VIEWER: FeedViewer = {
 	login: "story-viewer",
@@ -15,6 +22,11 @@ const STORYBOOK_VIEWER: FeedViewer = {
 
 const FEED_ITEM_VIEWPORTS = {
 	...INITIAL_VIEWPORTS,
+	feedItemDesktop923: {
+		name: "Feed item desktop 923x633",
+		styles: { width: "923px", height: "633px" },
+		type: "desktop",
+	},
 	feedItemMobile393: {
 		name: "Feed item mobile 393x852",
 		styles: { width: "393px", height: "852px" },
@@ -70,8 +82,30 @@ function buildAnnouncementItem(
 	};
 }
 
+function buildReleaseItem(): ReleaseFeedItem {
+	return {
+		kind: "release",
+		ts: "2026-09-26T14:21:38Z",
+		id: "release-story-159",
+		repo_full_name: "openai/codex",
+		repo_visual: null,
+		title: "0.159.0-alpha.4",
+		body: "0.159.0-alpha.4 版本发布",
+		body_truncated: false,
+		subtitle: null,
+		reason: null,
+		subject_type: null,
+		html_url: "https://github.com/openai/codex/releases/tag/0.159.0-alpha.4",
+		unread: null,
+		actor: null,
+		translated: null,
+		smart: null,
+		reactions: null,
+	};
+}
+
 function FeedItemCardPreview(props: {
-	item?: AnnouncementFeedItem;
+	item?: ReadableFeedItem;
 	activeLane?: FeedLane;
 	sourceTab?: DashboardTab | null;
 	currentScope?: DashboardScope | null;
@@ -129,7 +163,7 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"公告卡沿用 release 内容卡阅读语汇，但标题跳转到站内 discussion 详情页；这组 stories 固定公告 lane 的 missing / error / pending 与 deep link 合同。",
+					"Release 与公告卡共享内容卡阅读语汇；Release 类型图标紧邻仓库名，公告标题跳转到站内 discussion 详情页。",
 			},
 		},
 	},
@@ -138,6 +172,58 @@ const meta = {
 export default meta;
 
 type Story = StoryObj<typeof meta>;
+
+export const ReleaseTypeIconAligned: Story = {
+	render: () => <FeedItemCardPreview item={buildReleaseItem()} />,
+	globals: {
+		theme: "dark",
+		viewport: { value: "feedItemDesktop923" },
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const label = canvasElement.querySelector<HTMLElement>(
+			'[data-repo-identity-label="true"]',
+		);
+		const icon = canvasElement.querySelector<HTMLElement>(
+			'[data-feed-item-type-icon="release"]',
+		);
+
+		await expect(canvas.getByText("openai/codex")).toBeVisible();
+		await expect(icon).toBeVisible();
+		if (!label || !icon) {
+			throw new Error("Release type icon or repository name is missing.");
+		}
+
+		const labelRect = label.getBoundingClientRect();
+		const iconRect = icon.getBoundingClientRect();
+		expect(iconRect.left - labelRect.right).toBeGreaterThanOrEqual(0);
+		expect(iconRect.left - labelRect.right).toBeLessThanOrEqual(8);
+		expect(
+			Math.abs(
+				iconRect.top +
+					iconRect.height / 2 -
+					labelRect.top -
+					labelRect.height / 2,
+			),
+		).toBeLessThanOrEqual(1);
+	},
+};
+
+export const ReleaseTypeIconHiddenOnMobile: Story = {
+	render: () => <FeedItemCardPreview item={buildReleaseItem()} />,
+	globals: {
+		theme: "dark",
+		viewport: { value: "feedItemMobile393" },
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const icon = canvasElement.querySelector<HTMLElement>(
+			'[data-feed-item-type-icon="release"]',
+		);
+		await expect(canvas.getByText("openai/codex")).toBeVisible();
+		await expect(icon).not.toBeVisible();
+	},
+};
 
 export const AnnouncementTranslatedMissing: Story = {
 	render: () => (
