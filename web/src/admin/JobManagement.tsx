@@ -628,7 +628,7 @@ function LlmCallDetailSection(props: {
 					</p>
 				</div>
 				<div className="rounded-lg border p-3">
-					<p className="text-muted-foreground text-xs">耗时 / 重试</p>
+					<p className="text-muted-foreground text-xs">耗时 / 尝试</p>
 					<p className="mt-1 font-medium">
 						{formatDurationMs(detail.duration_ms)} /{" "}
 						{formatCount(detail.attempt_count)}
@@ -7846,7 +7846,7 @@ export function JobManagement({
 																) : null}
 															</p>
 															<p className="text-muted-foreground mt-1 text-xs">
-																用户：{call.requested_by ?? "-"} · 重试次数：
+																用户：{call.requested_by ?? "-"} · 尝试次数：
 																{formatCount(call.attempt_count)}
 															</p>
 															<p className="text-muted-foreground mt-1 text-xs">

@@ -228,6 +228,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_collection_coverage_preserves_old_records_and_tracks_new_ones() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE admin_collection_processing_coverage (
+              record_kind TEXT NOT NULL,
+              record_id TEXT NOT NULL,
+              pipeline TEXT NOT NULL,
+              status_origin TEXT NOT NULL,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY (record_kind, record_id, pipeline)
+            );
+            CREATE TABLE repo_releases (release_id INTEGER);
+            CREATE TABLE social_activity_events (
+              kind TEXT,
+              repo_full_name TEXT,
+              discussion_number INTEGER
+            );
+            CREATE TABLE notifications (thread_id TEXT);
+            CREATE TABLE briefs (id TEXT);
+            INSERT INTO notifications (thread_id) VALUES ('old-thread');
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create coverage migration fixture");
+
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == 87)
+            .expect("admin collection coverage migration");
+        sqlx::raw_sql(&migration.sql)
+            .execute(&pool)
+            .await
+            .expect("apply admin collection coverage migration");
+
+        let old_origin = sqlx::query_scalar::<_, String>(
+            "SELECT status_origin FROM admin_collection_processing_coverage
+             WHERE record_kind = 'notification' AND record_id = 'old-thread' AND pipeline = 'polish'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read old notification coverage");
+        assert_eq!(old_origin, "historical_unknown");
+
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO repo_releases (release_id) VALUES (101);
+            INSERT INTO social_activity_events (kind, repo_full_name, discussion_number)
+              VALUES ('announcement', 'Octo/Demo', 42);
+            INSERT INTO notifications (thread_id) VALUES ('new-thread');
+            INSERT INTO briefs (id) VALUES ('new-brief');
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("insert new source records");
+
+        let rows = sqlx::query_as::<_, (String, String, String, String)>(
+            "SELECT record_kind, record_id, pipeline, status_origin
+             FROM admin_collection_processing_coverage
+             WHERE status_origin = 'never_started'
+             ORDER BY record_kind, record_id, pipeline",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read new record coverage");
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "announcement".to_owned(),
+                    "octo/demo#42".to_owned(),
+                    "polish".to_owned(),
+                    "never_started".to_owned()
+                ),
+                (
+                    "announcement".to_owned(),
+                    "octo/demo#42".to_owned(),
+                    "translation".to_owned(),
+                    "never_started".to_owned()
+                ),
+                (
+                    "brief".to_owned(),
+                    "new-brief".to_owned(),
+                    "polish".to_owned(),
+                    "never_started".to_owned()
+                ),
+                (
+                    "notification".to_owned(),
+                    "new-thread".to_owned(),
+                    "polish".to_owned(),
+                    "never_started".to_owned()
+                ),
+                (
+                    "notification".to_owned(),
+                    "new-thread".to_owned(),
+                    "translation".to_owned(),
+                    "never_started".to_owned()
+                ),
+                (
+                    "release".to_owned(),
+                    "101".to_owned(),
+                    "polish".to_owned(),
+                    "never_started".to_owned()
+                ),
+                (
+                    "release".to_owned(),
+                    "101".to_owned(),
+                    "translation".to_owned(),
+                    "never_started".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn full_0082_history_upgrades_to_reconcile_demands_without_losing_observations() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
