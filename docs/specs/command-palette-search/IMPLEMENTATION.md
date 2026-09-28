@@ -13,7 +13,7 @@
 - `REQ-CPS-001` 至 `REQ-CPS-006`: 后端搜索文档投影、查询解析、权限过滤、统一响应和用户级窗口计数器。
 - `REQ-CPS-007` 至 `REQ-CPS-010`: Dashboard 阅读壳层、响应式页头入口、Dialog 命令面板、受控 actions 与 lane deep link。
 - `REQ-CPS-011` 至 `REQ-CPS-012`: 只读边界、稳定去重排序、Web Demo、Storybook 和交互/视觉回归。
-- `REQ-CPS-013`: 历史 `0081` 已移入 `migrations/legacy/` 并由严格 checksum 兼容路径读取；`0082` 只建 schema，`0089_association_search_update_repair.sql` 将关联触发器限制到 repository identity/metadata projection 更新并增加 `(resource_type, repo_id)` 索引，`0090_search_fts_rowid_recovery.sql` 将旧 FTS cache 替换为 rowid mapping + v2 corpus、保留 point-update compatibility views，并将 repository metadata fanout 放入可去重队列；`src/search_index.rs` 以持久化阶段游标、每事务最多 100 个 source/release rows、`Background` writer、`statvfs` 水位和 foreground yield 执行可恢复回填，未 ready 或 metadata queue 未清空时由搜索回退到 `LIKE`。
+- `REQ-CPS-013`: 历史 `0081` 已移入 `migrations/legacy/` 并由严格 checksum 兼容路径读取；`0082` 只建 schema，`0089_association_search_update_repair.sql` 将关联触发器限制到 repository identity/metadata projection 更新并增加 `(resource_type, repo_id)` 索引，`0090_search_fts_rowid_recovery.sql` 将旧 FTS cache 替换为 rowid mapping + v2 corpus、保留 point-update compatibility views，并将 repository metadata fanout 放入可去重队列；metadata source deletion 会入队，新的 metadata event 会重置 per-repo cursor；`src/search_index.rs` 以持久化阶段游标、每事务最多 100 个 source/release rows、`Background` writer、`statvfs` 水位和 foreground yield 执行可恢复回填，未 ready 或 metadata queue 未清空时由搜索回退到 `LIKE`。
 - Web Demo 额外提供 `Command Palette · Search`、`Command Palette · Indexing`、`Command Palette · Low Disk`、`Command Palette · Actions` 与 `Command Palette · Admin` 五个可选场景；进入场景后分别自动打开搜索结果、渐进索引状态、低磁盘降级、actions 模式和管理员受控 action。
 - Verification commands: `cargo test --all-features`、`cargo test database_migrations::tests`、`cargo test search::tests`、`cargo test api::tests::search_`、`web/bun run lint`、`web/bun run build`、`web/bun run test:storybook -- CommandPalette`。
 
@@ -35,6 +35,8 @@
 - `search::tests::projection_backfill_resumes_in_bounded_batches`：覆盖可恢复索引的阶段推进、公告回填和结果可见性。
 - `search::tests::projection_backfill_recovers_persisted_cursor_after_restart`：覆盖 FTS cache 恢复时持久化 cursor 在重建 AppState 后继续推进。
 - `search::tests::metadata_fanout_resumes_in_release_row_batches`：覆盖单仓库 250 条 release metadata fanout 的 100/100/50 分批、队列 drain 与 FTS 一致性。
+- `search::tests::work_item_deletion_repairs_release_metadata`：覆盖删除最后一个 release work item metadata source 后的队列入队与 metadata 清理。
+- `search::tests::metadata_change_restarts_release_cursor`：覆盖 metadata fanout 进行中变更 repository identity 后 cursor 重置并重新刷新前段 rows。
 - `search::tests::fts_doc_id_maintenance_uses_indexed_point_updates`：覆盖 global 与 user-lane FTS `doc_id` 维护均走 mapping rowid point lookup，且不出现旧 virtual-table scan plan。
 - `search::tests::production_sized_fts_maintenance_benchmark`：手动 ignored 基准，覆盖 397 associations、39,700 release documents、397 lanes、旧/新 plan、writer batch 和并发 search/GET/session workload。
 - `search::tests::backfill_prefers_ready_projection_over_newer_running_projection`：覆盖恢复回填与触发器一致的 ready 投影优先级。

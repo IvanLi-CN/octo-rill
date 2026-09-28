@@ -249,6 +249,7 @@ END;
 -- let the Background worker refresh at most 100 release rows per transaction.
 DROP TRIGGER IF EXISTS search_repo_release_work_items_ai;
 DROP TRIGGER IF EXISTS search_repo_release_work_items_au;
+DROP TRIGGER IF EXISTS search_repo_release_work_items_ad;
 DROP TRIGGER IF EXISTS search_repo_associations_ai;
 DROP TRIGGER IF EXISTS search_repo_associations_au;
 DROP TRIGGER IF EXISTS search_repo_associations_ad;
@@ -265,7 +266,7 @@ AFTER INSERT ON repo_release_work_items
 WHEN NEW.repo_id IS NOT NULL BEGIN
   INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
   VALUES (NEW.repo_id, CURRENT_TIMESTAMP)
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
 END;
 
 CREATE TRIGGER search_repo_release_work_items_au
@@ -273,11 +274,19 @@ AFTER UPDATE OF repo_id, repo_full_name ON repo_release_work_items BEGIN
   INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
   SELECT NEW.repo_id, CURRENT_TIMESTAMP
   WHERE NEW.repo_id IS NOT NULL
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
   INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
   SELECT OLD.repo_id, CURRENT_TIMESTAMP
   WHERE OLD.repo_id IS NOT NULL AND OLD.repo_id IS NOT NEW.repo_id
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
+END;
+
+CREATE TRIGGER search_repo_release_work_items_ad
+AFTER DELETE ON repo_release_work_items
+WHEN OLD.repo_id IS NOT NULL BEGIN
+  INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
+  VALUES (OLD.repo_id, CURRENT_TIMESTAMP)
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
 END;
 
 CREATE TRIGGER search_repo_associations_ai
@@ -310,7 +319,7 @@ AFTER INSERT ON user_repo_associations BEGIN
   INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
   SELECT NEW.repo_id, CURRENT_TIMESTAMP
   WHERE NEW.repo_id IS NOT NULL
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
 END;
 
 CREATE TRIGGER search_repo_associations_au
@@ -360,11 +369,11 @@ BEGIN
   INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
   SELECT NEW.repo_id, CURRENT_TIMESTAMP
   WHERE NEW.repo_id IS NOT NULL
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
   INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
   SELECT OLD.repo_id, CURRENT_TIMESTAMP
   WHERE OLD.repo_id IS NOT NULL AND OLD.repo_id IS NOT NEW.repo_id
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
 END;
 
 CREATE TRIGGER search_repo_associations_ad
@@ -379,7 +388,7 @@ AFTER DELETE ON user_repo_associations BEGIN
   INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
   SELECT OLD.repo_id, CURRENT_TIMESTAMP
   WHERE OLD.repo_id IS NOT NULL
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
 END;
 
 CREATE TRIGGER search_owned_repo_star_baselines_ai
@@ -387,7 +396,7 @@ AFTER INSERT ON owned_repo_star_baselines
 WHEN NEW.repo_id IS NOT NULL BEGIN
   INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
   VALUES (NEW.repo_id, CURRENT_TIMESTAMP)
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
 END;
 
 CREATE TRIGGER search_owned_repo_star_baselines_au
@@ -395,11 +404,11 @@ AFTER UPDATE ON owned_repo_star_baselines BEGIN
   INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
   SELECT NEW.repo_id, CURRENT_TIMESTAMP
   WHERE NEW.repo_id IS NOT NULL
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
   INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
   SELECT OLD.repo_id, CURRENT_TIMESTAMP
   WHERE OLD.repo_id IS NOT NULL AND OLD.repo_id IS NOT NEW.repo_id
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
 END;
 
 CREATE TRIGGER search_owned_repo_star_baselines_ad
@@ -407,7 +416,7 @@ AFTER DELETE ON owned_repo_star_baselines
 WHEN OLD.repo_id IS NOT NULL BEGIN
   INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
   VALUES (OLD.repo_id, CURRENT_TIMESTAMP)
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
 END;
 
 CREATE TRIGGER search_users_include_own_releases_au
@@ -416,13 +425,13 @@ AFTER UPDATE OF include_own_releases ON users BEGIN
   SELECT repo_id, CURRENT_TIMESTAMP
   FROM user_repo_associations
   WHERE user_id = NEW.id AND repo_id IS NOT NULL
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
   INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
   SELECT repo_id, CURRENT_TIMESTAMP FROM starred_repos WHERE user_id = NEW.id
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
   INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
   SELECT repo_id, CURRENT_TIMESTAMP FROM owned_repo_star_baselines WHERE user_id = NEW.id
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
 END;
 
 CREATE TRIGGER search_starred_repos_ai
@@ -459,7 +468,7 @@ AFTER INSERT ON starred_repos BEGIN
   INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
   SELECT NEW.repo_id, CURRENT_TIMESTAMP
   WHERE NEW.repo_id IS NOT NULL
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
 END;
 
 CREATE TRIGGER search_starred_repos_au
@@ -504,11 +513,11 @@ AFTER UPDATE ON starred_repos BEGIN
   INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
   SELECT NEW.repo_id, CURRENT_TIMESTAMP
   WHERE NEW.repo_id IS NOT NULL
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
   INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
   SELECT OLD.repo_id, CURRENT_TIMESTAMP
   WHERE OLD.repo_id IS NOT NULL AND OLD.repo_id IS NOT NEW.repo_id
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
 END;
 
 CREATE TRIGGER search_starred_repos_ad
@@ -523,7 +532,7 @@ AFTER DELETE ON starred_repos BEGIN
   INSERT INTO search_metadata_backfill_queue (repo_id, updated_at)
   SELECT OLD.repo_id, CURRENT_TIMESTAMP
   WHERE OLD.repo_id IS NOT NULL
-  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at;
+  ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at, release_cursor = 0;
 END;
 
 -- A database already marked ready has an old FTS corpus. Make the rebuild

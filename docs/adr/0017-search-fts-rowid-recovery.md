@@ -13,7 +13,7 @@ The command-palette search projection stores `doc_id` as an `UNINDEXED` FTS5 col
 - Treat both FTS corpora as rebuildable caches rather than migration-owned source of truth. Migration `0090` creates v2 FTS tables and stable mapping tables from logical document identity to FTS rowid, then leaves the new cache empty for the background worker to populate.
 - Preserve the old FTS table names as writable views with `INSTEAD OF` triggers. Existing source triggers continue to work, but every compatibility operation resolves the logical identity through the mapping table and mutates the v2 FTS row by explicit rowid.
 - Gate FTS query optimization on a `ready` projection state with an empty metadata queue. During migration, historical rebuild, low-disk pause, or metadata lag, search uses the existing authorization predicates and `LIKE` fallback while the current metadata view supplies rename and canonical-target values.
-- Represent repository metadata fanout as a deduplicated queue with a per-repository release rowid cursor. Each Background writer transaction updates at most 100 release rows, persists progress, yields between batches, and continues polling after the initial projection reaches `ready`.
+- Represent repository metadata fanout as a deduplicated queue with a per-repository release rowid cursor. Metadata source deletion enqueues the affected repository, and every new metadata event resets that cursor to 0 so a changed prefix cannot remain stale. Each Background writer transaction updates at most 100 release rows, persists progress, yields between batches, and continues polling after the initial projection reaches `ready`.
 
 ## Considered Options
 

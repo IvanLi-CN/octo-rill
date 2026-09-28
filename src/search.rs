@@ -1647,6 +1647,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn work_item_deletion_repairs_release_metadata() {
+        let pool = setup_pool().await;
+        seed_release(&pool).await;
+        sqlx::query(
+            "UPDATE search_projection_backfill_state SET phase = 'translations', cursor = 0, status = 'ready' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("mark search projection ready before work item metadata event");
+        sqlx::query(
+            r#"
+            INSERT INTO repo_release_work_items (
+              id, repo_id, repo_full_name, status, request_origin, priority,
+              has_new_repo_watchers, deadline_at, last_release_count,
+              last_candidate_failures, last_success_at, error_text,
+              created_at, started_at, finished_at, updated_at
+            ) VALUES ('search-work-delete', 42, 'octo/rill', 'succeeded', 'test', 0,
+                      0, '2026-02-23T00:00:00Z', 1, 0, NULL, NULL,
+                      '2026-02-23T00:00:00Z', NULL, NULL, '2026-02-23T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed release work item metadata");
+
+        let state = setup_state(pool.clone());
+        crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
+            .await
+            .expect("apply work item metadata");
+        let before_delete = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT repo_full_name, target_path FROM search_documents WHERE id = 'release:4201'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read release metadata before work item deletion");
+        assert_eq!(
+            before_delete,
+            (
+                Some("octo/rill".to_owned()),
+                Some("/octo/rill/releases/tag/v1.0.0".to_owned())
+            )
+        );
+
+        sqlx::query("DELETE FROM repo_release_work_items WHERE id = 'search-work-delete'")
+            .execute(&pool)
+            .await
+            .expect("delete release work item metadata source");
+        let queued = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM search_metadata_backfill_queue WHERE repo_id = 42",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read queued metadata repair after work item deletion");
+        assert_eq!(queued, 1);
+
+        crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
+            .await
+            .expect("repair metadata after work item deletion");
+        let after_delete = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT repo_full_name, target_path FROM search_documents WHERE id = 'release:4201'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read release metadata after work item deletion");
+        assert_eq!(after_delete, (None, None));
+    }
+
+    #[tokio::test]
     async fn metadata_fanout_resumes_in_release_row_batches() {
         let pool = setup_pool().await;
         for index in 0..250 {
@@ -1696,6 +1764,69 @@ mod tests {
         .await
         .expect("count refreshed FTS metadata");
         assert_eq!(indexed, 250);
+    }
+
+    #[tokio::test]
+    async fn metadata_change_restarts_release_cursor() {
+        let pool = setup_pool().await;
+        for index in 0..250 {
+            let document_id = format!("release:metadata-restart-{index}");
+            let resource_id = format!("metadata-restart-{index}");
+            sqlx::query(
+                "INSERT INTO search_documents (id,resource_type,resource_id,repo_id,repo_full_name,owner_login,title,body,source_time,created_at,updated_at) VALUES (?,'release',?,42,'stale/repo','stale','metadata title','metadata body','2026-02-23T00:00:00Z','2026-02-23T00:00:00Z','2026-02-23T00:00:00Z')",
+            )
+            .bind(document_id)
+            .bind(resource_id)
+            .execute(&pool)
+            .await
+            .expect("seed release projection rows for cursor restart");
+        }
+        sqlx::query(
+            "UPDATE search_projection_backfill_state SET phase = 'translations', cursor = 0, status = 'ready' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("mark search projection ready before cursor restart");
+        seed_repo_association(&pool).await;
+
+        let state = setup_state(pool.clone());
+        crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
+            .await
+            .expect("run first metadata cursor batch");
+        let first_batch = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM search_documents WHERE resource_type = 'release' AND repo_id = 42 AND repo_full_name = 'octo/rill'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count first metadata cursor batch");
+        assert_eq!(first_batch, 100);
+
+        sqlx::query(
+            "UPDATE user_repo_associations SET repo_full_name = 'next/rill', repo_full_name_lower = 'next/rill', owner_login = 'next' WHERE id = 'search-association'",
+        )
+        .execute(&pool)
+        .await
+        .expect("change repository metadata during queued fanout");
+        let cursor = sqlx::query_scalar::<_, i64>(
+            "SELECT release_cursor FROM search_metadata_backfill_queue WHERE repo_id = 42",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read reset metadata cursor");
+        assert_eq!(cursor, 0);
+
+        for _ in 0..3 {
+            crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
+                .await
+                .expect("run restarted metadata cursor batch");
+        }
+        let refreshed = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM search_documents WHERE resource_type = 'release' AND repo_id = 42 AND repo_full_name = 'next/rill'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count refreshed metadata after cursor restart");
+        assert_eq!(refreshed, 250);
     }
 
     #[tokio::test]
