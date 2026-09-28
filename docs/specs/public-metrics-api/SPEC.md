@@ -69,3 +69,13 @@ None
 - Given 请求未携带登录 cookie
   When 命中公开指标接口
   Then 返回公开汇总；允许 origin 收到无 credential CORS 响应，未允许 origin 不获得 CORS 授权头。
+
+## Visual Evidence
+
+- Source: Rspress local preview at `/public-metrics-api.html`, captured in Ego Browser.
+- Desktop (`1440x900`): public metrics page and endpoint are visible without page-level horizontal overflow.
+- Mobile (`393x852`): content wraps within the viewport; the long code sample scrolls within its code block.
+
+![Public metrics API desktop](./assets/public-metrics-api-desktop.png)
+
+![Public metrics API mobile](./assets/public-metrics-api-mobile.png)

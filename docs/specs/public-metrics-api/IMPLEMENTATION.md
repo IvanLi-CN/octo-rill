@@ -3,7 +3,7 @@
 ## 当前状态
 
 - Lifecycle: active
-- Implementation: committed locally; PR publication is waiting on owner confirmation of current visual evidence.
+- Implementation: committed locally; visual evidence is owner-confirmed and persisted; PR publication is next.
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -34,5 +34,4 @@ Focused Rust tests cover the public field set, metrics, freshness order, partial
 
 ## Remaining Gaps
 
-- The current-only screenshots have no exact-path baseline; owner confirmation is pending before persisting them into the spec or starting PR publication.
 - Remote CI and review convergence have not started.
