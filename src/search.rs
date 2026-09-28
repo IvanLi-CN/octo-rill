@@ -326,6 +326,26 @@ pub async fn query(
     parsed: &ParsedSearchQuery,
 ) -> Result<Vec<SearchResult>, ApiError> {
     let use_fts = parsed.terms.iter().any(|term| term.chars().count() >= 3);
+    let use_fts = if use_fts {
+        let ready = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM search_projection_backfill_state WHERE id = 1",
+        )
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        .as_deref()
+            == Some("ready");
+        let metadata_pending = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM search_metadata_backfill_queue)",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+            != 0;
+        ready && !metadata_pending
+    } else {
+        false
+    };
     let fts_match_query = parsed
         .terms
         .iter()
@@ -334,11 +354,11 @@ pub async fn query(
         .collect::<Vec<_>>()
         .join(" OR ");
     let mut builder = QueryBuilder::<Sqlite>::new(
-        "WITH ranked AS (SELECT d.id, d.resource_type, d.title, d.body, d.repo_full_name, COALESCE(ul.translated_text, d.translated_text) AS translated_text, COALESCE(ul.smart_text, d.smart_text) AS smart_text, d.source_time, d.updated_at, d.unread, CASE WHEN d.resource_type = 'repository' THEN EXISTS (SELECT 1 FROM user_repo_associations ura WHERE ura.user_id = d.user_id AND lower(ura.repo_full_name_lower) = lower(d.resource_id) AND ura.is_following != 0) ELSE NULL END AS is_following, d.target_path, d.target_url, ROW_NUMBER() OVER (PARTITION BY CASE WHEN d.resource_type = 'announcement' THEN COALESCE(d.resource_id, '') ELSE d.id END ORDER BY CASE WHEN d.resource_type = 'announcement' AND d.user_id = ",
+        "WITH ranked AS (SELECT d.id, d.resource_type, d.title, d.body, COALESCE(rm.repo_full_name, d.repo_full_name) AS repo_full_name, COALESCE(ul.translated_text, d.translated_text) AS translated_text, COALESCE(ul.smart_text, d.smart_text) AS smart_text, d.source_time, d.updated_at, d.unread, CASE WHEN d.resource_type = 'repository' THEN EXISTS (SELECT 1 FROM user_repo_associations ura WHERE ura.user_id = d.user_id AND lower(ura.repo_full_name_lower) = lower(d.resource_id) AND ura.is_following != 0) ELSE NULL END AS is_following, COALESCE(rm.target_path, d.target_path) AS target_path, d.target_url, ROW_NUMBER() OVER (PARTITION BY CASE WHEN d.resource_type = 'announcement' THEN COALESCE(d.resource_id, '') ELSE d.id END ORDER BY CASE WHEN d.resource_type = 'announcement' AND d.user_id = ",
     );
     builder.push_bind(user_id);
     builder.push(
-        " THEN 0 ELSE 1 END, COALESCE(d.source_time, d.updated_at) DESC, d.id DESC) AS search_rank FROM search_documents d LEFT JOIN search_document_user_lanes ul ON ul.document_id = d.id AND ul.user_id = ",
+        " THEN 0 ELSE 1 END, COALESCE(d.source_time, d.updated_at) DESC, d.id DESC) AS search_rank FROM search_documents d LEFT JOIN search_release_metadata rm ON rm.id = d.id LEFT JOIN search_document_user_lanes ul ON ul.document_id = d.id AND ul.user_id = ",
     );
     builder.push_bind(user_id);
     builder.push(" WHERE ((d.resource_type IN ('release', 'announcement') AND EXISTS (SELECT 1 FROM user_release_visible_repos vr WHERE vr.user_id = ");
@@ -353,12 +373,12 @@ pub async fn query(
         builder.push_bind(resource_type);
     }
     if let Some(owner) = &parsed.owner {
-        builder.push(" AND lower(COALESCE(d.owner_login, '')) = lower(");
+        builder.push(" AND lower(COALESCE(rm.owner_login, d.owner_login, '')) = lower(");
         builder.push_bind(owner);
         builder.push(")");
     }
     if let Some(repo) = &parsed.repo {
-        builder.push(" AND (lower(COALESCE(d.repo_full_name, '')) = lower(");
+        builder.push(" AND (lower(COALESCE(rm.repo_full_name, d.repo_full_name, '')) = lower(");
         builder.push_bind(repo);
         builder.push(") OR lower(COALESCE(d.repo_full_name, '')) LIKE '%/' || lower(");
         builder.push_bind(escape_like(repo));
@@ -378,11 +398,11 @@ pub async fn query(
 
     if use_fts {
         builder.push(" AND (");
-        builder.push("d.id IN (SELECT f.doc_id FROM search_documents_fts AS f WHERE search_documents_fts MATCH ");
+        builder.push("d.id IN (SELECT m.document_id FROM search_documents_fts_v2 AS f JOIN search_fts_document_rows AS m ON m.fts_rowid = f.rowid WHERE search_documents_fts_v2 MATCH ");
         builder.push_bind(fts_match_query.clone());
-        builder.push(") OR d.id IN (SELECT uf.doc_id FROM search_document_user_lanes_fts AS uf WHERE uf.user_id = ");
+        builder.push(") OR d.id IN (SELECT m.document_id FROM search_document_user_lanes_fts_v2 AS uf JOIN search_fts_user_lane_rows AS m ON m.fts_rowid = uf.rowid WHERE m.user_id = ");
         builder.push_bind(user_id);
-        builder.push(" AND search_document_user_lanes_fts MATCH ");
+        builder.push(" AND search_document_user_lanes_fts_v2 MATCH ");
         builder.push_bind(fts_match_query);
         builder.push(") OR ");
         builder.push("(");
@@ -408,7 +428,7 @@ pub async fn query(
         builder.push(" OR lower(COALESCE(d.body, '')) LIKE lower(");
         builder.push_bind(pattern.clone());
         builder.push(") ESCAPE char(92)");
-        builder.push(" OR lower(COALESCE(d.repo_full_name, '')) LIKE lower(");
+        builder.push(" OR lower(COALESCE(rm.repo_full_name, d.repo_full_name, '')) LIKE lower(");
         builder.push_bind(pattern.clone());
         builder.push(") ESCAPE char(92)");
         builder.push(" OR lower(COALESCE(d.translated_text, '')) LIKE lower(");
@@ -447,8 +467,14 @@ pub async fn index_status(state: &AppState) -> Result<String, ApiError> {
     .fetch_optional(&state.pool)
     .await
     .map_err(ApiError::internal)?;
+    let metadata_pending =
+        sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM search_metadata_backfill_queue)")
+            .fetch_one(&state.pool)
+            .await
+            .map_err(ApiError::internal)?
+            != 0;
     Ok(match status.as_deref() {
-        Some("ready") => "ready".to_owned(),
+        Some("ready") if !metadata_pending => "ready".to_owned(),
         Some("paused_low_disk") => "paused_low_disk".to_owned(),
         _ => "building".to_owned(),
     })
@@ -1234,6 +1260,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn projection_backfill_recovers_persisted_cursor_after_restart() {
+        let pool = setup_pool().await;
+        for index in 0..205 {
+            sqlx::query(
+                "INSERT INTO search_documents (id,resource_type,resource_id,title,body,created_at,updated_at) VALUES (?,'release',?,'restart title','restart body','2026-02-23T00:00:00Z','2026-02-23T00:00:00Z')",
+            )
+            .bind(format!("release:restart-{index}"))
+            .bind(format!("restart-{index}"))
+            .execute(&pool)
+            .await
+            .expect("seed restart projection");
+        }
+        sqlx::query("DELETE FROM search_documents_fts_v2")
+            .execute(&pool)
+            .await
+            .expect("clear FTS cache before restart recovery");
+        sqlx::query(
+            "UPDATE search_projection_backfill_state SET phase = 'fts_documents', cursor = 0, status = 'building' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed persisted FTS cursor state");
+
+        let first_state = setup_state(pool.clone());
+        crate::search_index::run_batch_for_test(first_state.as_ref(), u64::MAX)
+            .await
+            .expect("run first FTS recovery batch");
+        drop(first_state);
+        let first_cursor = sqlx::query_scalar::<_, i64>(
+            "SELECT cursor FROM search_projection_backfill_state WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read persisted FTS cursor");
+        assert!(first_cursor > 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents_fts_v2")
+                .fetch_one(&pool)
+                .await
+                .expect("count first recovered FTS batch"),
+            100
+        );
+
+        let restarted_state = setup_state(pool.clone());
+        crate::search_index::run_batch_for_test(restarted_state.as_ref(), u64::MAX)
+            .await
+            .expect("resume FTS recovery after restart");
+        let second_cursor = sqlx::query_scalar::<_, i64>(
+            "SELECT cursor FROM search_projection_backfill_state WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read resumed FTS cursor");
+        assert!(second_cursor > first_cursor);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents_fts_v2")
+                .fetch_one(&pool)
+                .await
+                .expect("count resumed FTS batches"),
+            200
+        );
+    }
+
+    #[tokio::test]
     async fn projection_backfill_pauses_below_disk_watermark() {
         let pool = setup_pool().await;
         seed_repo_association(&pool).await;
@@ -1243,6 +1333,11 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("count existing search documents");
+        let fts_before =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents_fts_v2")
+                .fetch_one(&pool)
+                .await
+                .expect("count existing global FTS rows");
         crate::search_index::run_batch_for_test(state.as_ref(), 0)
             .await
             .expect("record low disk status");
@@ -1258,6 +1353,18 @@ mod tests {
             .await
             .expect("count search documents");
         assert_eq!(count, before);
+        let fts_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents_fts_v2")
+                .fetch_one(&pool)
+                .await
+                .expect("count global FTS rows after pause");
+        assert_eq!(fts_count, fts_before);
+        let queued =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_metadata_backfill_queue")
+                .fetch_one(&pool)
+                .await
+                .expect("count metadata queue after pause");
+        assert!(queued > 0);
     }
 
     #[tokio::test]
@@ -1500,18 +1607,95 @@ mod tests {
         assert_eq!(before_association.0, None);
         assert_eq!(before_association.1, None);
 
+        sqlx::query(
+            "UPDATE search_projection_backfill_state SET phase = 'translations', cursor = 0, status = 'ready' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("mark search projection ready before metadata event");
         seed_repo_association(&pool).await;
+        let queued = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM search_metadata_backfill_queue WHERE repo_id = 42",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read queued release metadata refresh");
+        assert_eq!(queued, 1);
         let after_association = sqlx::query_as::<_, (Option<String>, Option<String>)>(
             "SELECT repo_full_name, target_path FROM search_documents WHERE id = 'release:4201'",
         )
         .fetch_one(&pool)
         .await
         .expect("read release after association");
-        assert_eq!(after_association.0.as_deref(), Some("octo/rill"));
+        assert_eq!(after_association, (None, None));
+
+        let state = setup_state(pool.clone());
+        crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
+            .await
+            .expect("run bounded release metadata refresh");
+        let after_backfill = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT repo_full_name, target_path FROM search_documents WHERE id = 'release:4201'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read release after metadata backfill");
+        assert_eq!(after_backfill.0.as_deref(), Some("octo/rill"));
         assert_eq!(
-            after_association.1.as_deref(),
+            after_backfill.1.as_deref(),
             Some("/octo/rill/releases/tag/v1.0.0")
         );
+    }
+
+    #[tokio::test]
+    async fn metadata_fanout_resumes_in_release_row_batches() {
+        let pool = setup_pool().await;
+        for index in 0..250 {
+            let document_id = format!("release:metadata-{index}");
+            let resource_id = format!("metadata-{index}");
+            sqlx::query(
+                "INSERT INTO search_documents (id,resource_type,resource_id,repo_id,repo_full_name,owner_login,title,body,source_time,created_at,updated_at) VALUES (?,'release',?,42,'stale/repo','stale','metadata title','metadata body','2026-02-23T00:00:00Z','2026-02-23T00:00:00Z','2026-02-23T00:00:00Z')",
+            )
+            .bind(document_id)
+            .bind(resource_id)
+            .execute(&pool)
+            .await
+            .expect("seed release projection rows");
+        }
+        sqlx::query(
+            "UPDATE search_projection_backfill_state SET phase = 'translations', cursor = 0, status = 'ready' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("mark search projection ready before metadata fanout");
+        seed_repo_association(&pool).await;
+
+        let state = setup_state(pool.clone());
+        for expected in [100_i64, 200, 250] {
+            crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
+                .await
+                .expect("run bounded metadata batch");
+            let refreshed = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM search_documents WHERE resource_type = 'release' AND repo_id = 42 AND repo_full_name = 'octo/rill'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count refreshed release metadata");
+            assert_eq!(refreshed, expected);
+        }
+        let queued = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM search_metadata_backfill_queue WHERE repo_id = 42",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count remaining metadata queue");
+        assert_eq!(queued, 0);
+        let indexed = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM search_documents_fts WHERE doc_id LIKE 'release:%' AND repo_full_name = 'octo/rill'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count refreshed FTS metadata");
+        assert_eq!(indexed, 250);
     }
 
     #[tokio::test]
@@ -1814,6 +1998,321 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "manual production-shaped search maintenance benchmark"]
+    async fn production_sized_fts_maintenance_benchmark() {
+        use std::time::Instant;
+
+        use time::OffsetDateTime;
+        use tower_sessions::{
+            SessionStore,
+            session::{Id, Record},
+        };
+
+        let pool = setup_pool().await;
+        const ASSOCIATION_COUNT: i64 = 397;
+        const RELEASE_COUNT: i64 = 39_700;
+        const MAINTENANCE_ROUNDS: usize = 32;
+
+        for index in 0..ASSOCIATION_COUNT {
+            let user_id = format!("search-bench-user-{index}");
+            sqlx::query(
+                "INSERT INTO users (id, github_user_id, login, created_at, updated_at) VALUES (?, ?, ?, '2026-02-23T00:00:00Z', '2026-02-23T00:00:00Z')",
+            )
+            .bind(&user_id)
+            .bind(50_000_000 + index)
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("seed benchmark user");
+            let repo_name = format!("repo-{index}");
+            let full_name = format!("bench/{repo_name}");
+            sqlx::query(
+                r#"
+                INSERT INTO user_repo_associations (
+                  id, user_id, repo_id, repo_full_name, repo_full_name_lower,
+                  owner_login, repo_name, html_url, description, is_private,
+                  first_source, first_associated_at, last_seen_at, is_following,
+                  follow_state_source, has_personal_owned_source, has_github_star_source,
+                  has_manual_feed_source, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'bench', ?, ?, 'benchmark association', 0,
+                          'github_star', '2026-02-23T00:00:00Z', '2026-02-23T00:00:00Z', 1,
+                          'system_default', 0, 1, 0, '2026-02-23T00:00:00Z', '2026-02-23T00:00:00Z')
+                "#,
+            )
+            .bind(format!("search-bench-association-{index}"))
+            .bind(&user_id)
+            .bind(10_000 + index)
+            .bind(&full_name)
+            .bind(&full_name)
+            .bind(&repo_name)
+            .bind(format!("https://github.com/{full_name}"))
+            .execute(&pool)
+            .await
+            .expect("seed benchmark association");
+        }
+
+        for index in 0..RELEASE_COUNT {
+            let document_id = format!("release:search-bench-{index}");
+            let resource_id = format!("search-bench-{index}");
+            sqlx::query(
+                "INSERT INTO search_documents (id,resource_type,resource_id,repo_id,repo_full_name,owner_login,title,body,source_time,created_at,updated_at) VALUES (?,'release',?,?,'bench/stale','bench','benchmark title','benchmark body','2026-02-23T00:00:00Z','2026-02-23T00:00:00Z','2026-02-23T00:00:00Z')",
+            )
+            .bind(document_id)
+            .bind(resource_id)
+            .bind(10_000 + index % ASSOCIATION_COUNT)
+            .execute(&pool)
+            .await
+            .expect("seed benchmark release document");
+        }
+        for index in 0..ASSOCIATION_COUNT {
+            sqlx::query(
+                "INSERT INTO search_document_user_lanes (document_id,user_id,translated_text,updated_at) VALUES (?,'search-user','benchmark translated lane','2026-02-23T00:00:00Z')",
+            )
+            .bind(format!("release:search-bench-{index}"))
+            .execute(&pool)
+            .await
+            .expect("seed benchmark user lane");
+        }
+
+        sqlx::query(
+            r#"
+            CREATE VIRTUAL TABLE bench_search_documents_fts_before USING fts5(
+              doc_id UNINDEXED, title, body, repo_full_name, translated_text, smart_text,
+              tokenize = 'trigram'
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create old global FTS reproduction");
+        sqlx::query(
+            r#"
+            CREATE VIRTUAL TABLE bench_search_user_lanes_fts_before USING fts5(
+              doc_id UNINDEXED, user_id UNINDEXED, translated_text, smart_text,
+              tokenize = 'trigram'
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create old lane FTS reproduction");
+        sqlx::query(
+            "INSERT INTO bench_search_documents_fts_before SELECT id,COALESCE(title,''),COALESCE(body,''),COALESCE(repo_full_name,''),COALESCE(translated_text,''),COALESCE(smart_text,'') FROM search_documents WHERE id LIKE 'release:search-bench-%'",
+        )
+        .execute(&pool)
+        .await
+        .expect("populate old global FTS reproduction");
+        sqlx::query(
+            "INSERT INTO bench_search_user_lanes_fts_before SELECT document_id,user_id,COALESCE(translated_text,''),COALESCE(smart_text,'') FROM search_document_user_lanes WHERE user_id = 'search-user'",
+        )
+        .execute(&pool)
+        .await
+        .expect("populate old lane FTS reproduction");
+
+        let old_global_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN DELETE FROM bench_search_documents_fts_before WHERE doc_id = 'release:search-bench-396'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("explain old global FTS maintenance")
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+        let old_lane_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN DELETE FROM bench_search_user_lanes_fts_before WHERE doc_id = 'release:search-bench-396' AND user_id = 'search-user'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("explain old lane FTS maintenance")
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+        let new_global_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN DELETE FROM search_documents_fts WHERE doc_id = 'release:search-bench-396'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("explain new global FTS maintenance")
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+        let new_lane_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN DELETE FROM search_document_user_lanes_fts WHERE doc_id = 'release:search-bench-396' AND user_id = 'search-user'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("explain new lane FTS maintenance")
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+
+        let old_global_started = Instant::now();
+        for _ in 0..MAINTENANCE_ROUNDS {
+            sqlx::query(
+                "DELETE FROM bench_search_documents_fts_before WHERE doc_id = 'release:search-bench-396'",
+            )
+            .execute(&pool)
+            .await
+            .expect("delete old global FTS row");
+            sqlx::query(
+                "INSERT INTO bench_search_documents_fts_before VALUES ('release:search-bench-396','benchmark title','benchmark body','bench/stale','','')",
+            )
+            .execute(&pool)
+            .await
+            .expect("restore old global FTS row");
+        }
+        let old_global_elapsed = old_global_started.elapsed();
+
+        let new_global_started = Instant::now();
+        for _ in 0..MAINTENANCE_ROUNDS {
+            sqlx::query(
+                "DELETE FROM search_documents_fts WHERE doc_id = 'release:search-bench-396'",
+            )
+            .execute(&pool)
+            .await
+            .expect("delete new global FTS row");
+            sqlx::query(
+                "INSERT INTO search_documents_fts VALUES ('release:search-bench-396','benchmark title','benchmark body','bench/stale','','')",
+            )
+            .execute(&pool)
+            .await
+            .expect("restore new global FTS row");
+        }
+        let new_global_elapsed = new_global_started.elapsed();
+
+        let old_lane_started = Instant::now();
+        for _ in 0..MAINTENANCE_ROUNDS {
+            sqlx::query(
+                "DELETE FROM bench_search_user_lanes_fts_before WHERE doc_id = 'release:search-bench-396' AND user_id = 'search-user'",
+            )
+            .execute(&pool)
+            .await
+            .expect("delete old lane FTS row");
+            sqlx::query(
+                "INSERT INTO bench_search_user_lanes_fts_before VALUES ('release:search-bench-396','search-user','benchmark translated lane','')",
+            )
+            .execute(&pool)
+            .await
+            .expect("restore old lane FTS row");
+        }
+        let old_lane_elapsed = old_lane_started.elapsed();
+
+        let new_lane_started = Instant::now();
+        for _ in 0..MAINTENANCE_ROUNDS {
+            sqlx::query(
+                "DELETE FROM search_document_user_lanes_fts WHERE doc_id = 'release:search-bench-396' AND user_id = 'search-user'",
+            )
+            .execute(&pool)
+            .await
+            .expect("delete new lane FTS row");
+            sqlx::query(
+                "INSERT INTO search_document_user_lanes_fts VALUES ('release:search-bench-396','search-user','benchmark translated lane','')",
+            )
+            .execute(&pool)
+            .await
+            .expect("restore new lane FTS row");
+        }
+        let new_lane_elapsed = new_lane_started.elapsed();
+
+        let state = setup_state(pool.clone());
+        sqlx::query(
+            "UPDATE search_projection_backfill_state SET phase = 'metadata', cursor = 0, status = 'building' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("set metadata benchmark phase");
+        let metadata_started = Instant::now();
+        crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
+            .await
+            .expect("run metadata benchmark batch");
+        let metadata_elapsed = metadata_started.elapsed();
+        let metadata_remaining =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_metadata_backfill_queue")
+                .fetch_one(&pool)
+                .await
+                .expect("count remaining benchmark metadata work");
+
+        let session_store = crate::session_store::CoordinatedSqliteSessionStore::new(
+            tower_sessions_sqlx_store::SqliteStore::new(pool.clone()),
+            state.sqlite_writer.clone(),
+        );
+        session_store
+            .migrate()
+            .await
+            .expect("migrate benchmark session store");
+        let parsed = parse_query("benchmark").expect("parse benchmark query");
+        let mut get_tasks = Vec::new();
+        for _ in 0..32 {
+            let state = state.clone();
+            let parsed = parsed.clone();
+            get_tasks.push(tokio::spawn(async move {
+                consume_quota(&state, "search-user")
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                query(&state, "search-user", &parsed)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                Ok::<_, anyhow::Error>(())
+            }));
+        }
+        let mut search_tasks = Vec::new();
+        for _ in 0..32 {
+            let state = state.clone();
+            let parsed = parsed.clone();
+            search_tasks.push(tokio::spawn(async move {
+                for _ in 0..8 {
+                    query(&state, "search-user", &parsed)
+                        .await
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    tokio::task::yield_now().await;
+                }
+                Ok::<_, anyhow::Error>(())
+            }));
+        }
+        let mut session_tasks = Vec::new();
+        for _ in 0..32 {
+            let session_store = session_store.clone();
+            session_tasks.push(tokio::spawn(async move {
+                let mut record = Record {
+                    id: Id::default(),
+                    data: Default::default(),
+                    expiry_date: OffsetDateTime::now_utc(),
+                };
+                session_store
+                    .create(&mut record)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                Ok::<_, anyhow::Error>(())
+            }));
+        }
+        for task in search_tasks {
+            task.await
+                .expect("join benchmark search task")
+                .expect("benchmark search task");
+        }
+        for task in get_tasks {
+            task.await
+                .expect("join benchmark GET task")
+                .expect("benchmark GET task");
+        }
+        for task in session_tasks {
+            task.await
+                .expect("join benchmark session task")
+                .expect("benchmark session task");
+        }
+
+        println!(
+            "SEARCH_FTS_BENCHMARK associations={ASSOCIATION_COUNT} releases={RELEASE_COUNT} old_global_plan={old_global_plan:?} new_global_plan={new_global_plan:?} old_lane_plan={old_lane_plan:?} new_lane_plan={new_lane_plan:?} old_global_ms={} new_global_ms={} old_lane_ms={} new_lane_ms={} rounds={MAINTENANCE_ROUNDS} metadata_batch_ms={} metadata_remaining={} concurrent_search_tasks=32 concurrent_get_tasks=32 concurrent_session_writes=32",
+            old_global_elapsed.as_secs_f64() * 1000.0,
+            new_global_elapsed.as_secs_f64() * 1000.0,
+            old_lane_elapsed.as_secs_f64() * 1000.0,
+            new_lane_elapsed.as_secs_f64() * 1000.0,
+            metadata_elapsed.as_secs_f64() * 1000.0,
+            metadata_remaining,
+        );
+    }
+
+    #[tokio::test]
     async fn filtered_results_apply_predicates_before_limit() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -1897,5 +2396,56 @@ mod tests {
         .await
         .expect("read concurrent quota");
         assert_eq!(count, SEARCH_RATE_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn fts_doc_id_maintenance_uses_indexed_point_updates() {
+        let pool = setup_pool().await;
+
+        let global_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN DELETE FROM search_documents_fts WHERE doc_id = 'release:4201'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("explain global FTS maintenance")
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+        let lane_plan = sqlx::query(
+            "EXPLAIN QUERY PLAN DELETE FROM search_document_user_lanes_fts WHERE doc_id = 'release:4201' AND user_id = 'search-user'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("explain user-lane FTS maintenance")
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+
+        assert!(
+            global_plan
+                .iter()
+                .any(|detail| detail.contains("VIRTUAL TABLE INDEX 0:=")),
+            "global FTS maintenance must use an indexed rowid lookup: {global_plan:?}"
+        );
+        assert!(
+            !global_plan.iter().any(|detail| {
+                detail.contains("VIRTUAL TABLE INDEX 0:")
+                    && !detail.contains("VIRTUAL TABLE INDEX 0:=")
+            }),
+            "global FTS maintenance must not scan the FTS corpus: {global_plan:?}"
+        );
+        assert!(
+            lane_plan
+                .iter()
+                .any(|detail| detail.contains("VIRTUAL TABLE INDEX 0:=")),
+            "user-lane FTS maintenance must use an indexed rowid lookup: {lane_plan:?}"
+        );
+        assert!(
+            !lane_plan.iter().any(|detail| {
+                detail.contains("VIRTUAL TABLE INDEX 0:")
+                    && !detail.contains("VIRTUAL TABLE INDEX 0:=")
+            }),
+            "user-lane FTS maintenance must not scan the FTS corpus: {lane_plan:?}"
+        );
     }
 }

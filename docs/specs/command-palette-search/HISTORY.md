@@ -20,6 +20,8 @@
 - The search response exposes `index_status` so partially indexed or low-disk workspaces remain usable without implying full historical coverage.
 - Release projections refresh their repository metadata when owned-release visibility is discovered, renamed, or toggled, keeping repository filters and deep links aligned with the visibility view.
 - Migration `0089_association_search_update_repair.sql` narrows association-triggered search refreshes to repository projection changes and adds a `(resource_type, repo_id)` lookup for the retained release refresh path; source/follow/observation-only updates remain outside the FTS rebuild path.
+- Migration `0090_search_fts_rowid_recovery.sql` replaces the unindexed `doc_id` FTS maintenance path with rowid mapping tables and rebuildable v2 corpora, keeps compatibility view names for existing source triggers, and queues repository metadata fanout for resumable 100-release-row Background batches.
+- The recovery worker now persists both historical projection cursors and per-repository metadata cursors, continues polling after reaching `ready`, and keeps search usable through `LIKE` fallback while FTS rebuild or metadata repair is pending.
 
 ## References
 
