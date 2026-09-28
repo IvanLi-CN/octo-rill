@@ -13,7 +13,7 @@
 - `REQ-CPS-001` 至 `REQ-CPS-006`: 后端搜索文档投影、查询解析、权限过滤、统一响应和用户级窗口计数器。
 - `REQ-CPS-007` 至 `REQ-CPS-010`: Dashboard 阅读壳层、响应式页头入口、Dialog 命令面板、受控 actions 与 lane deep link。
 - `REQ-CPS-011` 至 `REQ-CPS-012`: 只读边界、稳定去重排序、Web Demo、Storybook 和交互/视觉回归。
-- `REQ-CPS-013`: 历史 `0081` 已移入 `migrations/legacy/` 并由严格 checksum 兼容路径读取；`0082` 只建 schema，`src/search_index.rs` 以持久化阶段游标、100 行上限、`Background` writer 和 `statvfs` 水位执行可恢复回填。
+- `REQ-CPS-013`: 历史 `0081` 已移入 `migrations/legacy/` 并由严格 checksum 兼容路径读取；`0082` 只建 schema，`0089_association_search_update_repair.sql` 将关联触发器限制到 repository identity/metadata projection 更新并增加 `(resource_type, repo_id)` 索引，`src/search_index.rs` 以持久化阶段游标、100 行上限、`Background` writer 和 `statvfs` 水位执行可恢复回填。
 - Web Demo 额外提供 `Command Palette · Search`、`Command Palette · Indexing`、`Command Palette · Low Disk`、`Command Palette · Actions` 与 `Command Palette · Admin` 五个可选场景；进入场景后分别自动打开搜索结果、渐进索引状态、低磁盘降级、actions 模式和管理员受控 action。
 - Verification commands: `cargo test --all-features`、`cargo test database_migrations::tests`、`cargo test search::tests`、`cargo test api::tests::search_`、`web/bun run lint`、`web/bun run build`、`web/bun run test:storybook -- CommandPalette`。
 
@@ -36,6 +36,13 @@
 - `search::tests::backfill_prefers_ready_projection_over_newer_running_projection`：覆盖恢复回填与触发器一致的 ready 投影优先级。
 - `search::tests::owned_release_visibility_repairs_cached_release_metadata`：覆盖历史 Release 投影在自有仓库可见性启用、仓库改名和回填恢复后的元数据与深链。
 - `search::tests::repository_rename_deduplicates_star_and_association_projection`：覆盖 star 同步先改名、association 随后写入时按 `repo_id` 清理旧 projection。
+- `search::tests::association_non_projection_updates_do_not_rebuild_release_fts`：通过真实迁移触发器验证 source flag、follow state 和 `updated_at`-only association updates 不重建 Release FTS。
+- `api::tests::repo_association_upsert_skips_timestamp_only_noop`：验证有效值不变时 association upsert 不因新的 `updated_at` 产生写入，并保留显式 follow state。
+- `api::tests::association_source_clear_preserves_explicit_unfollow`：验证单仓库 source 清理保留显式取消关注。
+- `sync::tests::repeated_social_snapshot_only_updates_association_observation_once`：验证重复 production-shaped owned-repository snapshot 不清除再重建当前 association。
+- `sync::tests::social_snapshot_clears_stale_associations_and_preserves_explicit_unfollow`：验证 NULL-ID/过期 association 清理、空快照和显式取消关注在仓库重新出现时的状态保持。
+- `sync::tests::replace_starred_repos_preserves_explicit_unfollow`：验证完整 starred-repository replacement 路径清理旧 source 时保留显式取消关注。
+- Synthetic SQLite benchmark: 397 associations and 39,700 release documents measured the broad pre-repair trigger at 15.098 s with a `SCAN search_documents` plan; the guarded/indexed repair path kept the fixture unchanged and used `SEARCH search_documents USING INDEX idx_search_documents_resource_repo`, below the benchmark timer's 1 ms resolution.
 - `web/src/search/CommandPalette.stories.tsx`：覆盖空态、搜索结果、动作、日报确认、busy 键盘保护、错误、限流、管理员及 393px 视口。
 - `web/src/search/CommandPalette.stories.tsx`：追加 `IndexBuilding` 与 `IndexPausedLowDisk`，验证渐进索引的可见降级提示。
 
@@ -47,6 +54,7 @@
 ## Related Changes
 
 - Repository rename projection cleanup keeps one canonical repository result when star synchronization updates the name before the user association projection.
+- Association source/follow/observation updates no longer rebuild repository/release search projections; repository metadata changes retain the existing rename and deduplication repair path.
 
 ## References
 

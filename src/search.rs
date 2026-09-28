@@ -1515,6 +1515,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn association_non_projection_updates_do_not_rebuild_release_fts() {
+        let pool = setup_pool().await;
+        seed_repo_association(&pool).await;
+        seed_release(&pool).await;
+        let expected_release_document = sqlx::query_as::<
+            _,
+            (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                String,
+            ),
+        >(
+            "SELECT repo_full_name, owner_login, title, body, target_path, target_url, updated_at FROM search_documents WHERE id = 'release:4201'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read release search document sentinel");
+        let expected_repository_document = sqlx::query_as::<
+            _,
+            (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                String,
+            ),
+        >(
+            "SELECT repo_full_name, owner_login, title, body, target_path, target_url, updated_at FROM search_documents WHERE id = 'repository:search-user:octo/rill'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read repository search document sentinel");
+
+        let updates = [
+            (
+                "source flag",
+                "UPDATE user_repo_associations SET has_github_star_source = 0, updated_at = '2026-02-24T00:00:00Z' WHERE id = 'search-association'",
+            ),
+            (
+                "follow state",
+                "UPDATE user_repo_associations SET is_following = 0, updated_at = '2026-02-24T00:00:01Z' WHERE id = 'search-association'",
+            ),
+            (
+                "timestamp",
+                "UPDATE user_repo_associations SET updated_at = '2026-02-24T00:00:02Z' WHERE id = 'search-association'",
+            ),
+        ];
+
+        for (label, update) in updates {
+            sqlx::query("UPDATE search_documents_fts SET body = 'fts-sentinel' WHERE doc_id IN ('release:4201', 'repository:search-user:octo/rill')")
+                .execute(&pool)
+                .await
+                .expect("seed release FTS sentinel");
+            sqlx::query(update)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("apply {label} association update: {error}"));
+
+            let release_document = sqlx::query_as::<
+                _,
+                (
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                ),
+            >(
+                "SELECT repo_full_name, owner_login, title, body, target_path, target_url, updated_at FROM search_documents WHERE id = 'release:4201'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read release search document");
+            assert_eq!(
+                release_document, expected_release_document,
+                "{label} update changed release search document"
+            );
+            let repository_document = sqlx::query_as::<
+                _,
+                (
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                ),
+            >(
+                "SELECT repo_full_name, owner_login, title, body, target_path, target_url, updated_at FROM search_documents WHERE id = 'repository:search-user:octo/rill'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read repository search document");
+            assert_eq!(
+                repository_document, expected_repository_document,
+                "{label} update changed repository search document"
+            );
+            let release_fts_body = sqlx::query_scalar::<_, String>(
+                "SELECT body FROM search_documents_fts WHERE doc_id = 'release:4201'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read release FTS sentinel");
+            assert_eq!(
+                release_fts_body, "fts-sentinel",
+                "{label} update rebuilt release FTS"
+            );
+            let repository_fts_body = sqlx::query_scalar::<_, String>(
+                "SELECT body FROM search_documents_fts WHERE doc_id = 'repository:search-user:octo/rill'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read repository FTS sentinel");
+            assert_eq!(
+                repository_fts_body, "fts-sentinel",
+                "{label} update rebuilt repository FTS"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn owned_release_visibility_repairs_cached_release_metadata() {
         let pool = setup_pool().await;
         seed_release(&pool).await;
