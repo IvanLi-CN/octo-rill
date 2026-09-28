@@ -107,6 +107,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     warn_if_runtime_concurrency_exceeds_sqlite_pool(&config, &runtime_settings);
 
     let sqlite_writer = crate::sqlite_write::SqliteWriteCoordinator::new();
+    let public_metrics_service = Arc::new(crate::public_metrics::PublicMetricsService::new(
+        pool.clone(),
+        sqlite_writer.clone(),
+    ));
     let session_store = CoordinatedSqliteSessionStore::new(
         tower_sessions_sqlx_store::SqliteStore::new(pool.clone()),
         sqlite_writer.clone(),
@@ -528,14 +532,20 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .on_request(())
         .on_response(())
         .on_failure(());
-    let app = app.layer(
-        ServiceBuilder::new()
-            .layer(set_request_id)
-            .layer(trace_layer)
-            .layer(access_log)
-            .layer(cors)
-            .layer(propagate_request_id),
+    let public_metrics_router = crate::public_metrics::router(
+        public_metrics_service.clone(),
+        crate::config::public_metrics_cors_origins_from_env()?,
     );
+    let app = Router::new()
+        .merge(app.layer(cors))
+        .merge(public_metrics_router)
+        .layer(
+            ServiceBuilder::new()
+                .layer(set_request_id)
+                .layer(trace_layer)
+                .layer(access_log)
+                .layer(propagate_request_id),
+        );
 
     runtime::register_runtime_owner(app_state.as_ref()).await?;
     let runtime_owner_heartbeat = runtime::spawn_runtime_owner_heartbeat(app_state.clone());
@@ -581,6 +591,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         let llm_call_retention_abort_handle = ai::spawn_llm_call_retention_task(app_state.clone());
         let repo_governance_retention_abort_handle =
             sync::spawn_repo_refresh_governance_retention_task(app_state.clone());
+        let public_metrics_refresh_abort_handle =
+            crate::public_metrics::spawn_refresh_worker(public_metrics_service.clone());
         let llm_call_recovery_abort_handle = ai::spawn_llm_call_recovery_task(app_state.clone());
         translations::spawn_translation_scheduler(app_state.clone()).await;
         let global_content_processing_abort_handle =
@@ -596,6 +608,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             deletion_abort_handle,
             llm_call_retention_abort_handle,
             repo_governance_retention_abort_handle,
+            public_metrics_refresh_abort_handle,
             llm_call_recovery_abort_handle,
             task_recovery_abort_handle,
             repo_release_recovery_abort_handle,
@@ -608,10 +621,13 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             abort_handles.push(handle);
         }
 
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal(app_state.clone(), abort_handles))
-            .await
-            .context("http server exited")
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal(app_state.clone(), abort_handles))
+        .await
+        .context("http server exited")
     }
     .await;
 

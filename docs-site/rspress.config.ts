@@ -54,6 +54,7 @@ export default defineConfig({
 						{ text: "配置参考", link: "/config" },
 						{ text: "Web Demo", link: "/web-demo" },
 						{ text: "公开 Release 接入", link: "/public-releases" },
+						{ text: "公开指标 API", link: "/public-metrics-api" },
 						{ text: "API Key 与外部 API", link: "/api-key" },
 					],
 				},
