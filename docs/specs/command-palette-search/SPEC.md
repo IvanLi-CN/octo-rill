@@ -105,6 +105,8 @@
 ### REQ-CPS-013
 
 - 数据库迁移 MUST 将历史 `0081_command_palette_search.sql` 视为兼容证据，不得在新部署中重新执行其全量回填；新的 `0082_command_palette_search_recovery.sql` 只创建搜索 schema、触发器和持久化索引状态。
+- 仓库关联只更新 source flags、system-default follow state 或 observation timestamps 时 MUST NOT 重建 repository/release search documents 或 FTS；只有 repository identity/metadata projection fields 发生变化时才允许刷新关联的搜索投影。
+- 关联快照同步 MUST 保留当前快照中的 repo IDs，只清理已过期 source associations；重复的有效快照不得通过清除再写入制造冗余 association updates。显式用户 follow state MUST 保持权威，不得被 system-default reconciliation 覆盖。
 - 服务 MUST 在 TCP listener 绑定后通过可中断的后台 worker 分阶段建立本地投影。每个 `Background` SQLite 事务最多处理 100 个源 rowid，并提交阶段游标，使重启后可以继续且重复执行保持幂等。
 - worker MUST 在写入前检查数据库目录的 `statvfs` 可用空间；低于 `OCTORILL_SEARCH_INDEX_MIN_FREE_BYTES`（默认 20 GiB）时暂停并将搜索状态标记为 `paused_low_disk`，不得继续写入 FTS/WAL。索引状态 MUST 以 `building`、`ready` 或 `paused_low_disk` 出现在搜索响应中。
 - 迁移运行器 MUST 只对白名单历史版本 `81` 接受精确 SHA-384 checksum；dirty、缺失、未知或 checksum 不匹配的迁移历史 MUST 终止启动。
@@ -150,9 +152,9 @@
 
 ### VER-CPS-007
 
-- Method: migration compatibility, schema-only recovery migration, bounded worker and startup fixtures, plus Demo/Storybook status scenes.
+- Method: migration compatibility, schema-only recovery migration, bounded worker and startup fixtures, real association-trigger fixtures for source/follow/timestamp-only updates, repeated social snapshots, plus Demo/Storybook status scenes.
 - covers: `REQ-CPS-013`
-- Pass condition: historical `0081` is accepted only with its exact checksum, fresh databases apply schema-only `0082`, listener startup does not wait for full indexing, worker resumes at persisted cursors in batches of at most 100 rows, low disk pauses without FTS writes, and `index_status` is visible in `building`/`paused_low_disk` demo states.
+- Pass condition: historical `0081` is accepted only with its exact checksum, fresh databases apply schema-only `0082`, source/follow/timestamp-only association updates leave repository/release search documents and FTS unchanged, repeated snapshots do not clear and re-add current associations, listener startup does not wait for full indexing, worker resumes at persisted cursors in batches of at most 100 rows, low disk pauses without FTS writes, and `index_status` is visible in `building`/`paused_low_disk` demo states.
 
 ## Related ADRs
 
