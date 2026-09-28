@@ -25,8 +25,10 @@ use sqlx::{QueryBuilder, Row, Sqlite};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex, task::JoinSet};
 
 use crate::{
-    admin_runtime, content_processing, jobs, local_id, runtime, sqlite_write::SqliteWritePriority,
-    state::AppState, translations,
+    admin_runtime, content_processing, jobs, local_id, runtime,
+    sqlite_write::{SqliteWritePermit, SqliteWritePriority},
+    state::AppState,
+    translations,
 };
 
 const REST_API_BASE: &str = "https://api.github.com";
@@ -81,6 +83,7 @@ const STARRED_WATERMARK_KEY: &str = "starred_sync_watermark";
 const STARRED_FULL_SYNC_KEY: &str = "starred_full_sync_at";
 const REPO_REFRESH_URGENCY_CAP: f64 = 4.0;
 const REPO_REFRESH_GOVERNANCE_REBUILD_CHUNK_SIZE: usize = 500;
+const SOCIAL_ACTIVITY_SNAPSHOT_WRITE_CHUNK_SIZE: usize = 64;
 const REPO_REFRESH_GOVERNANCE_RETENTION_BATCH_SIZE: i64 = 500;
 const REPO_REFRESH_GOVERNANCE_RETENTION_MAX_ROWS_PER_MINUTE: u64 = 50_000;
 const REPO_REFRESH_GOVERNANCE_RETENTION_MAX_BATCHES: usize =
@@ -108,6 +111,19 @@ struct InstalledSocialActivitySnapshotAfterReadsHook {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+struct SocialActivitySnapshotAfterFirstChunkHook {
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    resume: tokio::sync::watch::Receiver<bool>,
+}
+
+#[cfg(test)]
+struct InstalledSocialActivitySnapshotAfterFirstChunkHook {
+    reached: tokio::sync::mpsc::UnboundedReceiver<()>,
+    resume: tokio::sync::watch::Sender<bool>,
+}
+
+#[cfg(test)]
 impl Drop for InstalledSocialActivitySnapshotAfterReadsHook {
     fn drop(&mut self) {
         let _ = self.resume.send(true);
@@ -118,11 +134,35 @@ impl Drop for InstalledSocialActivitySnapshotAfterReadsHook {
 }
 
 #[cfg(test)]
+impl Drop for InstalledSocialActivitySnapshotAfterFirstChunkHook {
+    fn drop(&mut self) {
+        let _ = self.resume.send(true);
+        *social_activity_snapshot_after_first_chunk_hook_slot()
+            .lock()
+            .expect("lock social activity first chunk hook slot") = None;
+    }
+}
+
+#[cfg(test)]
 fn social_activity_snapshot_after_reads_hook_slot()
 -> &'static std::sync::Mutex<Option<SocialActivitySnapshotAfterReadsHook>> {
     static HOOK: OnceLock<std::sync::Mutex<Option<SocialActivitySnapshotAfterReadsHook>>> =
         OnceLock::new();
     HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn social_activity_snapshot_after_first_chunk_hook_slot()
+-> &'static std::sync::Mutex<Option<SocialActivitySnapshotAfterFirstChunkHook>> {
+    static HOOK: OnceLock<std::sync::Mutex<Option<SocialActivitySnapshotAfterFirstChunkHook>>> =
+        OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn social_activity_snapshot_hook_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 #[cfg(test)]
@@ -144,10 +184,43 @@ fn install_social_activity_snapshot_after_reads_hook()
 }
 
 #[cfg(test)]
+fn install_social_activity_snapshot_after_first_chunk_hook()
+-> InstalledSocialActivitySnapshotAfterFirstChunkHook {
+    let (reached_tx, reached_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (resume_tx, resume_rx) = tokio::sync::watch::channel(false);
+    *social_activity_snapshot_after_first_chunk_hook_slot()
+        .lock()
+        .expect("lock social activity first chunk hook slot") =
+        Some(SocialActivitySnapshotAfterFirstChunkHook {
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+    InstalledSocialActivitySnapshotAfterFirstChunkHook {
+        reached: reached_rx,
+        resume: resume_tx,
+    }
+}
+
+#[cfg(test)]
 async fn wait_for_social_activity_snapshot_after_reads_hook() {
     let hook = social_activity_snapshot_after_reads_hook_slot()
         .lock()
         .expect("lock social activity snapshot hook slot")
+        .clone();
+    if let Some(hook) = hook {
+        let _ = hook.reached.send(());
+        let mut resume = hook.resume;
+        if !*resume.borrow() {
+            let _ = resume.changed().await;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn wait_for_social_activity_snapshot_after_first_chunk_hook() {
+    let hook = social_activity_snapshot_after_first_chunk_hook_slot()
+        .lock()
+        .expect("lock social activity first chunk hook slot")
         .clone();
     if let Some(hook) = hook {
         let _ = hook.reached.send(());
@@ -1003,18 +1076,15 @@ struct GitHubEventRepoTarget {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct RepoStarCurrentMemberRow {
-    actor_github_user_id: i64,
-}
-
-#[derive(Debug, Clone, sqlx::FromRow)]
-struct RepoStarCurrentMemberEventRow {
+struct RepoStarCurrentMemberSnapshotRow {
+    repo_id: i64,
     actor_github_user_id: i64,
     actor_login: String,
     actor_avatar_url: Option<String>,
     actor_html_url: Option<String>,
     starred_at: Option<String>,
     created_at: Option<String>,
+    history_event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1024,17 +1094,34 @@ struct OwnedRepoStarBaselineRow {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct FollowerCurrentMemberRow {
-    actor_github_user_id: i64,
-}
-
-#[derive(Debug, Clone, sqlx::FromRow)]
-struct FollowerCurrentMemberEventRow {
+struct FollowerCurrentMemberSnapshotRow {
     actor_github_user_id: i64,
     actor_login: String,
     actor_avatar_url: Option<String>,
     actor_html_url: Option<String>,
     created_at: Option<String>,
+    history_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FollowerHistoryCandidate {
+    actor: GitHubActor,
+    occurred_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct RepoStarHistoryCandidate {
+    repo: OwnedRepoSnapshot,
+    actor: GitHubActor,
+    occurred_at: String,
+}
+
+#[derive(Debug, Default)]
+struct SocialActivitySnapshotWriteMetrics {
+    chunk_count: usize,
+    max_chunk_elapsed_ms: u128,
+    max_query_elapsed_ms: u128,
+    max_writer_wait_ms: u128,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2939,12 +3026,7 @@ async fn apply_social_activity_snapshot_with_options(
     debug_assert_eq!(owned_repos.is_some(), repo_members.is_some());
 
     let now = Utc::now().to_rfc3339();
-    let (_sqlite_write, mut tx) = state
-        .sqlite_writer
-        .begin_immediate(&state.pool, "social_activity_snapshot")
-        .await
-        .context("begin social activity snapshot tx")?;
-    let mut events_written = 0usize;
+    let read_started = Instant::now();
 
     let follower_baseline_exists = sqlx::query_scalar::<_, i64>(
         r#"
@@ -2954,7 +3036,7 @@ async fn apply_social_activity_snapshot_with_options(
         "#,
     )
     .bind(user_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&state.pool)
     .await
     .context("query follower sync baseline")?
         > 0;
@@ -2966,7 +3048,7 @@ async fn apply_social_activity_snapshot_with_options(
         "#,
     )
     .bind(user_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&state.pool)
     .await
     .context("query repo star sync baseline")?
         > 0;
@@ -2978,7 +3060,7 @@ async fn apply_social_activity_snapshot_with_options(
         "#,
     )
     .bind(user_id)
-    .fetch_all(&mut *tx)
+    .fetch_all(&state.pool)
     .await
     .context("query repo star baselines")?;
     let repo_tracking_initialized = repo_tracking_baseline_exists;
@@ -2991,46 +3073,354 @@ async fn apply_social_activity_snapshot_with_options(
         .iter()
         .map(|row| row.repo_id)
         .collect::<HashSet<_>>();
-    let newly_discovered_repo_ids = owned_repos
-        .unwrap_or(&[])
+    let owned_repos_slice = owned_repos.unwrap_or(&[]);
+    let repo_members_slice = repo_members.unwrap_or(&[]);
+    let current_owned_repo_ids = owned_repos_slice
+        .iter()
+        .map(|repo| repo.repo_id)
+        .collect::<HashSet<_>>();
+    let target_owned_repo_name_lowers = owned_repos_slice
+        .iter()
+        .map(|repo| repo.full_name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let newly_discovered_repo_ids = owned_repos_slice
         .iter()
         .filter(|repo| !known_repo_ids.contains(&repo.repo_id))
         .map(|repo| repo.repo_id)
         .collect::<HashSet<_>>();
-    let successful_repo_snapshot_ids = repo_members
-        .unwrap_or(&[])
+    let successful_repo_snapshot_ids = repo_members_slice
         .iter()
         .map(|(repo, _)| repo.repo_id)
         .collect::<HashSet<_>>();
-    let mut newly_persisted_repo_baseline = false;
+
+    let next_follower_ids = followers
+        .unwrap_or(&[])
+        .iter()
+        .map(|item| item.actor.id)
+        .collect::<HashSet<_>>();
+    let mut current_follower_ids = HashSet::new();
+    let mut follower_history_candidates = Vec::new();
+    if followers.is_some() {
+        let rows = sqlx::query_as::<_, FollowerCurrentMemberSnapshotRow>(
+            r#"
+            SELECT
+              cm.actor_github_user_id,
+              cm.actor_login,
+              cm.actor_avatar_url,
+              cm.actor_html_url,
+              cm.created_at,
+              e.id AS history_event_id
+            FROM follower_current_members cm
+            LEFT JOIN social_activity_events e
+              ON e.user_id = cm.user_id
+             AND e.kind = 'follower_received'
+             AND e.repo_id IS NULL
+             AND e.actor_github_user_id = cm.actor_github_user_id
+             AND e.occurred_at = COALESCE(cm.created_at, ?)
+            WHERE cm.user_id = ?
+            ORDER BY cm.actor_github_user_id ASC
+            "#,
+        )
+        .bind(&now)
+        .bind(user_id)
+        .fetch_all(&state.pool)
+        .await
+        .context("query follower current members and social history")?;
+        for row in rows {
+            current_follower_ids.insert(row.actor_github_user_id);
+            if row.history_event_id.is_none() {
+                follower_history_candidates.push(FollowerHistoryCandidate {
+                    actor: GitHubActor {
+                        id: row.actor_github_user_id,
+                        login: row.actor_login,
+                        avatar_url: row.actor_avatar_url,
+                        html_url: row.actor_html_url,
+                    },
+                    occurred_at: row.created_at.unwrap_or_else(|| now.clone()),
+                });
+            }
+        }
+    }
+    let mut stale_follower_ids = if delete_stale_followers {
+        current_follower_ids
+            .difference(&next_follower_ids)
+            .copied()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    stale_follower_ids.sort_unstable();
+
+    let successful_repo_visuals = repo_members_slice
+        .iter()
+        .map(|(repo, _)| (repo.repo_id, repo))
+        .collect::<HashMap<_, _>>();
+    let mut current_repo_member_ids = HashMap::<i64, HashSet<i64>>::new();
+    let mut repo_history_candidates = HashMap::<i64, Vec<RepoStarHistoryCandidate>>::new();
+    if owned_repos.is_some() {
+        let rows = sqlx::query_as::<_, RepoStarCurrentMemberSnapshotRow>(
+            r#"
+            SELECT
+              cm.repo_id,
+              cm.actor_github_user_id,
+              cm.actor_login,
+              cm.actor_avatar_url,
+              cm.actor_html_url,
+              cm.starred_at,
+              cm.created_at,
+              e.id AS history_event_id
+            FROM repo_star_current_members cm
+            LEFT JOIN social_activity_events e
+              ON e.user_id = cm.user_id
+             AND e.kind = 'repo_star_received'
+             AND e.repo_id = cm.repo_id
+             AND e.actor_github_user_id = cm.actor_github_user_id
+             AND e.occurred_at = COALESCE(cm.starred_at, cm.created_at, ?)
+            WHERE cm.user_id = ?
+            ORDER BY cm.repo_id ASC, cm.actor_github_user_id ASC
+            "#,
+        )
+        .bind(&now)
+        .bind(user_id)
+        .fetch_all(&state.pool)
+        .await
+        .context("query repo star current members and social history")?;
+        for row in rows {
+            current_repo_member_ids
+                .entry(row.repo_id)
+                .or_default()
+                .insert(row.actor_github_user_id);
+            if row.history_event_id.is_none()
+                && let Some(repo) = successful_repo_visuals.get(&row.repo_id)
+            {
+                repo_history_candidates
+                    .entry(row.repo_id)
+                    .or_default()
+                    .push(RepoStarHistoryCandidate {
+                        repo: (*repo).clone(),
+                        actor: GitHubActor {
+                            id: row.actor_github_user_id,
+                            login: row.actor_login,
+                            avatar_url: row.actor_avatar_url,
+                            html_url: row.actor_html_url,
+                        },
+                        occurred_at: row
+                            .starred_at
+                            .or(row.created_at)
+                            .unwrap_or_else(|| now.clone()),
+                    });
+            }
+        }
+    }
+
+    let mut stale_repo_member_ids = HashMap::<i64, Vec<i64>>::new();
+    if delete_stale_repo_members {
+        for (repo, members) in repo_members_slice {
+            let next_ids = members
+                .iter()
+                .map(|member| member.actor.id)
+                .collect::<HashSet<_>>();
+            let mut stale_ids = current_repo_member_ids
+                .get(&repo.repo_id)
+                .into_iter()
+                .flat_map(|ids| ids.difference(&next_ids).copied())
+                .collect::<Vec<_>>();
+            stale_ids.sort_unstable();
+            stale_repo_member_ids.insert(repo.repo_id, stale_ids);
+        }
+    }
+
+    let mut stale_repo_ids = if owned_repos.is_some() {
+        repo_baselines
+            .iter()
+            .map(|row| row.repo_id)
+            .chain(current_repo_member_ids.keys().copied())
+            .filter(|repo_id| !current_owned_repo_ids.contains(repo_id))
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
+    let mut stale_repo_ids = stale_repo_ids.drain().collect::<Vec<_>>();
+    stale_repo_ids.sort_unstable();
+
+    let mut stale_association_keys = Vec::<(Option<i64>, String)>::new();
+    if owned_repos.is_some() {
+        let association_rows = sqlx::query_as::<_, (Option<i64>, String)>(
+            r#"
+            SELECT repo_id, repo_full_name
+            FROM user_repo_associations
+            WHERE user_id = ?
+            ORDER BY repo_id ASC, repo_full_name_lower ASC
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&state.pool)
+        .await
+        .context("query owned repo associations for stale cleanup")?;
+        for (repo_id, repo_full_name) in association_rows {
+            let is_stale = match repo_id {
+                Some(repo_id) => !current_owned_repo_ids.contains(&repo_id),
+                None => {
+                    !target_owned_repo_name_lowers.contains(&repo_full_name.to_ascii_lowercase())
+                }
+            };
+            if is_stale {
+                stale_association_keys.push((repo_id, repo_full_name));
+            }
+        }
+        stale_association_keys
+            .sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        stale_association_keys.dedup();
+    }
+
+    let candidate_read_elapsed_ms = read_started.elapsed().as_millis();
 
     #[cfg(test)]
     wait_for_social_activity_snapshot_after_reads_hook().await;
 
-    if let Some(followers) = followers {
-        let current_follower_rows = sqlx::query_as::<_, FollowerCurrentMemberRow>(
-            r#"
-            SELECT actor_github_user_id
-            FROM follower_current_members
-            WHERE user_id = ?
-            "#,
-        )
-        .bind(user_id)
-        .fetch_all(&mut *tx)
-        .await
-        .context("query follower current members")?;
-        let current_follower_ids = current_follower_rows
-            .into_iter()
-            .map(|row| row.actor_github_user_id)
-            .collect::<HashSet<_>>();
-        let next_follower_ids = followers
-            .iter()
-            .map(|item| item.actor.id)
-            .collect::<HashSet<_>>();
+    let mut metrics = SocialActivitySnapshotWriteMetrics::default();
+    let mut events_written = 0usize;
+    let mut should_dispatch_webhook_reconcile = false;
+    let mut webhook_demand_evaluated = false;
 
-        for follower in followers {
-            if !current_follower_ids.contains(&follower.actor.id) {
-                let inserted = insert_social_activity_event_tx(
+    for (chunk_index, chunk) in stale_association_keys
+        .chunks(SOCIAL_ACTIVITY_SNAPSHOT_WRITE_CHUNK_SIZE)
+        .enumerate()
+    {
+        let chunk_started = Instant::now();
+        let (permit, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "social_activity_snapshot.association_cleanup")
+            .await
+            .context("begin social activity association cleanup tx")?;
+        let query_started = Instant::now();
+        for (repo_id, repo_full_name) in chunk {
+            clear_stale_personal_owned_association_tx(
+                &mut tx,
+                user_id,
+                *repo_id,
+                repo_full_name,
+                now.as_str(),
+            )
+            .await
+            .context("clear stale personal_owned repo association")?;
+        }
+        tx.commit()
+            .await
+            .context("commit social activity association cleanup tx")?;
+        record_social_activity_write_chunk(
+            &mut metrics,
+            "association_cleanup",
+            chunk_index,
+            chunk.len(),
+            &permit,
+            chunk_started,
+            query_started,
+        );
+    }
+
+    for (chunk_index, chunk) in stale_repo_ids
+        .chunks(SOCIAL_ACTIVITY_SNAPSHOT_WRITE_CHUNK_SIZE)
+        .enumerate()
+    {
+        let chunk_started = Instant::now();
+        let (permit, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "social_activity_snapshot.repo_cleanup")
+            .await
+            .context("begin social activity repo cleanup tx")?;
+        let query_started = Instant::now();
+        delete_repo_star_rows_for_ids_tx(&mut tx, user_id, chunk)
+            .await
+            .context("delete stale repo star snapshot rows")?;
+        tx.commit()
+            .await
+            .context("commit social activity repo cleanup tx")?;
+        record_social_activity_write_chunk(
+            &mut metrics,
+            "repo_cleanup",
+            chunk_index,
+            chunk.len(),
+            &permit,
+            chunk_started,
+            query_started,
+        );
+    }
+
+    if let Some(followers) = followers {
+        for (chunk_index, chunk) in followers
+            .chunks(SOCIAL_ACTIVITY_SNAPSHOT_WRITE_CHUNK_SIZE)
+            .enumerate()
+        {
+            let chunk_started = Instant::now();
+            let (permit, mut tx) = state
+                .sqlite_writer
+                .begin_immediate(&state.pool, "social_activity_snapshot.follower_members")
+                .await
+                .context("begin social activity follower member tx")?;
+            let query_started = Instant::now();
+            let mut chunk_events_written = 0usize;
+            for follower in chunk {
+                if !current_follower_ids.contains(&follower.actor.id)
+                    && insert_social_activity_event_tx(
+                        &mut tx,
+                        SocialActivityEventInsert {
+                            user_id,
+                            kind: "follower_received",
+                            repo_id: None,
+                            repo_full_name: None,
+                            discussion_number: None,
+                            repo_visual: None,
+                            title: None,
+                            body: None,
+                            html_url: None,
+                            github_event_id: None,
+                            actor: &follower.actor,
+                            occurred_at: now.as_str(),
+                            detected_at: now.as_str(),
+                        },
+                    )
+                    .await?
+                {
+                    chunk_events_written += 1;
+                }
+                upsert_follower_current_member_tx(&mut tx, user_id, follower, now.as_str()).await?;
+            }
+            tx.commit()
+                .await
+                .context("commit social activity follower member tx")?;
+            events_written += chunk_events_written;
+            record_social_activity_write_chunk(
+                &mut metrics,
+                "follower_members",
+                chunk_index,
+                chunk.len(),
+                &permit,
+                chunk_started,
+                query_started,
+            );
+        }
+
+        let follower_history_candidates = follower_history_candidates
+            .iter()
+            .filter(|candidate| {
+                !delete_stale_followers || next_follower_ids.contains(&candidate.actor.id)
+            })
+            .collect::<Vec<_>>();
+        for (chunk_index, chunk) in follower_history_candidates
+            .chunks(SOCIAL_ACTIVITY_SNAPSHOT_WRITE_CHUNK_SIZE)
+            .enumerate()
+        {
+            let chunk_started = Instant::now();
+            let (permit, mut tx) = state
+                .sqlite_writer
+                .begin_immediate(&state.pool, "social_activity_snapshot.follower_history")
+                .await
+                .context("begin social activity follower history tx")?;
+            let query_started = Instant::now();
+            let mut chunk_events_written = 0usize;
+            for candidate in chunk {
+                if insert_social_activity_event_tx(
                     &mut tx,
                     SocialActivityEventInsert {
                         user_id,
@@ -3043,37 +3433,67 @@ async fn apply_social_activity_snapshot_with_options(
                         body: None,
                         html_url: None,
                         github_event_id: None,
-                        actor: &follower.actor,
-                        occurred_at: now.as_str(),
+                        actor: &candidate.actor,
+                        occurred_at: candidate.occurred_at.as_str(),
                         detected_at: now.as_str(),
                     },
                 )
-                .await?;
-                if inserted {
-                    events_written += 1;
+                .await?
+                {
+                    chunk_events_written += 1;
                 }
             }
-
-            upsert_follower_current_member_tx(&mut tx, user_id, follower, now.as_str()).await?;
+            tx.commit()
+                .await
+                .context("commit social activity follower history tx")?;
+            events_written += chunk_events_written;
+            record_social_activity_write_chunk(
+                &mut metrics,
+                "follower_history",
+                chunk_index,
+                chunk.len(),
+                &permit,
+                chunk_started,
+                query_started,
+            );
         }
 
-        if delete_stale_followers {
-            for current_id in current_follower_ids.difference(&next_follower_ids) {
-                sqlx::query(
-                    r#"
-                    DELETE FROM follower_current_members
-                    WHERE user_id = ? AND actor_github_user_id = ?
-                    "#,
-                )
-                .bind(user_id)
-                .bind(*current_id)
-                .execute(&mut *tx)
+        for (chunk_index, chunk) in stale_follower_ids
+            .chunks(SOCIAL_ACTIVITY_SNAPSHOT_WRITE_CHUNK_SIZE)
+            .enumerate()
+        {
+            let chunk_started = Instant::now();
+            let (permit, mut tx) = state
+                .sqlite_writer
+                .begin_immediate(&state.pool, "social_activity_snapshot.follower_cleanup")
                 .await
-                .context("delete stale follower current member")?;
-            }
+                .context("begin social activity follower cleanup tx")?;
+            let query_started = Instant::now();
+            delete_follower_current_members_for_ids_tx(&mut tx, user_id, chunk)
+                .await
+                .context("delete stale follower current members")?;
+            tx.commit()
+                .await
+                .context("commit social activity follower cleanup tx")?;
+            record_social_activity_write_chunk(
+                &mut metrics,
+                "follower_cleanup",
+                chunk_index,
+                chunk.len(),
+                &permit,
+                chunk_started,
+                query_started,
+            );
         }
 
         if !follower_baseline_exists {
+            let chunk_started = Instant::now();
+            let (permit, mut tx) = state
+                .sqlite_writer
+                .begin_immediate(&state.pool, "social_activity_snapshot.follower_baseline")
+                .await
+                .context("begin social activity follower baseline tx")?;
+            let query_started = Instant::now();
             sqlx::query(
                 r#"
                 INSERT INTO follower_sync_baselines (id, user_id, initialized_at, updated_at)
@@ -3089,140 +3509,135 @@ async fn apply_social_activity_snapshot_with_options(
             .execute(&mut *tx)
             .await
             .context("upsert follower sync baseline")?;
+            tx.commit()
+                .await
+                .context("commit social activity follower baseline tx")?;
+            record_social_activity_write_chunk(
+                &mut metrics,
+                "follower_baseline",
+                0,
+                1,
+                &permit,
+                chunk_started,
+                query_started,
+            );
         }
-
-        events_written +=
-            materialize_follower_current_members_tx(&mut tx, user_id, now.as_str()).await?;
     }
 
-    if let Some(owned_repos) = owned_repos {
-        let current_owned_repo_ids = owned_repos
+    if owned_repos.is_some() {
+        let baseline_repos = owned_repos_slice
             .iter()
-            .map(|repo| repo.repo_id)
-            .collect::<HashSet<_>>();
-        let keep_repo_ids = current_owned_repo_ids.iter().copied().collect::<Vec<_>>();
-        let keep_repo_full_name_lowers = owned_repos
-            .iter()
-            .map(|repo| repo.full_name.to_ascii_lowercase())
+            .filter(|repo| {
+                let was_known_repo = known_repo_ids.contains(&repo.repo_id);
+                let fetched_snapshot_this_run =
+                    successful_repo_snapshot_ids.contains(&repo.repo_id);
+                !repo_tracking_initialized || was_known_repo || fetched_snapshot_this_run
+            })
             .collect::<Vec<_>>();
-        crate::api::clear_user_repo_association_source_except_repo_ids_tx(
-            &mut tx,
-            user_id,
-            crate::api::UserRepoAssociationSource::PersonalOwned,
-            keep_repo_ids.as_slice(),
-            keep_repo_full_name_lowers.as_slice(),
-            now.as_str(),
-        )
-        .await
-        .context("clear personal_owned repo associations before owned snapshot refresh")?;
 
-        if current_owned_repo_ids.is_empty() {
-            sqlx::query(
-                r#"
-                DELETE FROM repo_star_current_members
-                WHERE user_id = ?
-                "#,
-            )
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await
-            .context("delete repo star current members for no-longer-owned repos")?;
-
-            sqlx::query(
-                r#"
-                DELETE FROM owned_repo_star_baselines
-                WHERE user_id = ?
-                "#,
-            )
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await
-            .context("delete repo star baselines for no-longer-owned repos")?;
-        } else {
-            let mut delete_members = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-                r#"
-                    DELETE FROM repo_star_current_members
-                    WHERE user_id = 
-                    "#,
-            );
-            delete_members.push_bind(user_id);
-            delete_members.push(" AND repo_id NOT IN (");
-            {
-                let mut separated = delete_members.separated(", ");
-                for repo_id in &current_owned_repo_ids {
-                    separated.push_bind(repo_id);
-                }
-            }
-            delete_members.push(")");
-            delete_members
-                .build()
-                .execute(&mut *tx)
+        for (chunk_index, chunk) in baseline_repos
+            .chunks(SOCIAL_ACTIVITY_SNAPSHOT_WRITE_CHUNK_SIZE)
+            .enumerate()
+        {
+            let chunk_started = Instant::now();
+            let (permit, mut tx) = state
+                .sqlite_writer
+                .begin_immediate(&state.pool, "social_activity_snapshot.repo_baselines")
                 .await
-                .context("delete stale repo star current members")?;
-
-            let mut delete_baselines = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-                r#"
-                    DELETE FROM owned_repo_star_baselines
-                    WHERE user_id = 
-                    "#,
-            );
-            delete_baselines.push_bind(user_id);
-            delete_baselines.push(" AND repo_id NOT IN (");
-            {
-                let mut separated = delete_baselines.separated(", ");
-                for repo_id in &current_owned_repo_ids {
-                    separated.push_bind(repo_id);
-                }
-            }
-            delete_baselines.push(")");
-            delete_baselines
-                .build()
-                .execute(&mut *tx)
-                .await
-                .context("delete stale repo star baselines")?;
-        }
-
-        for repo in owned_repos {
-            let was_known_repo = known_repo_ids.contains(&repo.repo_id);
-            let fetched_snapshot_this_run = successful_repo_snapshot_ids.contains(&repo.repo_id);
-            let should_persist_baseline =
-                !repo_tracking_initialized || was_known_repo || fetched_snapshot_this_run;
-
-            if !should_persist_baseline {
-                continue;
-            }
-
-            newly_persisted_repo_baseline |= !was_known_repo;
-
-            let snapshot_initialized =
-                repo_snapshot_initialized_ids.contains(&repo.repo_id) || fetched_snapshot_this_run;
-            upsert_owned_repo_star_baseline_tx(
-                &mut tx,
-                user_id,
-                repo,
-                snapshot_initialized,
-                now.as_str(),
-            )
-            .await
-            .with_context(|| format!("upsert repo star baseline for {}", repo.full_name))?;
-
-            let association = user_repo_association_from_owned_snapshot(repo, now.as_str());
-            crate::api::upsert_user_repo_association_tx(
-                &mut tx,
-                user_id,
-                &association,
-                now.as_str(),
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to upsert user repo association for owned repo {}",
-                    repo.full_name
+                .context("begin social activity repo baseline tx")?;
+            let query_started = Instant::now();
+            for repo in chunk {
+                let fetched_snapshot_this_run =
+                    successful_repo_snapshot_ids.contains(&repo.repo_id);
+                let snapshot_initialized = repo_snapshot_initialized_ids.contains(&repo.repo_id)
+                    || fetched_snapshot_this_run;
+                upsert_owned_repo_star_baseline_tx(
+                    &mut tx,
+                    user_id,
+                    repo,
+                    snapshot_initialized,
+                    now.as_str(),
                 )
-            })?;
+                .await
+                .with_context(|| format!("upsert repo star baseline for {}", repo.full_name))?;
+
+                let association = user_repo_association_from_owned_snapshot(repo, now.as_str());
+                crate::api::upsert_user_repo_association_tx(
+                    &mut tx,
+                    user_id,
+                    &association,
+                    now.as_str(),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to upsert user repo association for owned repo {}",
+                        repo.full_name
+                    )
+                })?;
+            }
+
+            let chunk_has_newly_discovered_repo = chunk
+                .iter()
+                .any(|repo| !known_repo_ids.contains(&repo.repo_id));
+            if chunk_has_newly_discovered_repo && !webhook_demand_evaluated {
+                let webhook_enabled = sqlx::query_scalar::<_, i64>(
+                    r#"
+                    SELECT COUNT(*)
+                    FROM users
+                    WHERE id = ?
+                      AND include_own_releases != 0
+                      AND webhook_push_enabled != 0
+                      AND webhook_push_desired_state = 'enabled'
+                    "#,
+                )
+                .bind(user_id)
+                .fetch_one(&mut *tx)
+                .await
+                .context("check webhook push target before advancing reconcile demand")?
+                    != 0;
+                if webhook_enabled {
+                    sqlx::query(
+                        r#"
+                        INSERT INTO webhook_push_reconcile_demands (
+                          user_id, requested_generation, completed_generation, requested_at, updated_at
+                        ) VALUES (?, 1, 0, ?, ?)
+                        ON CONFLICT(user_id) DO UPDATE SET
+                          requested_generation = webhook_push_reconcile_demands.requested_generation + 1,
+                          requested_at = excluded.requested_at,
+                          updated_at = excluded.updated_at
+                        "#,
+                    )
+                    .bind(user_id)
+                    .bind(&now)
+                    .bind(&now)
+                    .execute(&mut *tx)
+                    .await
+                    .context("advance webhook push reconcile demand")?;
+                    should_dispatch_webhook_reconcile = true;
+                }
+                webhook_demand_evaluated = true;
+            }
+            tx.commit()
+                .await
+                .context("commit social activity repo baseline tx")?;
+            record_social_activity_write_chunk(
+                &mut metrics,
+                "repo_baselines",
+                chunk_index,
+                chunk.len(),
+                &permit,
+                chunk_started,
+                query_started,
+            );
+            drop(permit);
+            #[cfg(test)]
+            if metrics.chunk_count == 1 {
+                wait_for_social_activity_snapshot_after_first_chunk_hook().await;
+            }
         }
 
-        for (repo, members) in repo_members.unwrap_or(&[]) {
+        for (repo, members) in repo_members_slice {
             let repo_snapshot_initialized = repo_snapshot_initialized_ids.contains(&repo.repo_id);
             let repo_waiting_for_first_success =
                 known_repo_ids.contains(&repo.repo_id) && !repo_snapshot_initialized;
@@ -3230,90 +3645,233 @@ async fn apply_social_activity_snapshot_with_options(
                 || !repo_tracking_initialized
                 || newly_discovered_repo_ids.contains(&repo.repo_id)
                 || repo_waiting_for_first_success;
-            let current_rows = sqlx::query_as::<_, RepoStarCurrentMemberRow>(
-                r#"
-                SELECT actor_github_user_id
-                FROM repo_star_current_members
-                WHERE user_id = ? AND repo_id = ?
-                "#,
-            )
-            .bind(user_id)
-            .bind(repo.repo_id)
-            .fetch_all(&mut *tx)
-            .await
-            .with_context(|| format!("query repo star members for {}", repo.full_name))?;
-            let current_ids = current_rows
-                .into_iter()
-                .map(|row| row.actor_github_user_id)
-                .collect::<HashSet<_>>();
-            let next_ids = members
-                .iter()
-                .map(|item| item.actor.id)
-                .collect::<HashSet<_>>();
+            let current_ids = current_repo_member_ids
+                .get(&repo.repo_id)
+                .cloned()
+                .unwrap_or_default();
 
-            for member in members {
-                if emit_current_members && !current_ids.contains(&member.actor.id) {
-                    let occurred_at = member.starred_at.as_deref().unwrap_or(now.as_str());
-                    let inserted = insert_social_activity_event_tx(
+            for (chunk_index, chunk) in members
+                .chunks(SOCIAL_ACTIVITY_SNAPSHOT_WRITE_CHUNK_SIZE)
+                .enumerate()
+            {
+                let chunk_started = Instant::now();
+                let (permit, mut tx) = state
+                    .sqlite_writer
+                    .begin_immediate(&state.pool, "social_activity_snapshot.repo_members")
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "begin social activity repo member tx for {}",
+                            repo.full_name
+                        )
+                    })?;
+                let query_started = Instant::now();
+                let mut chunk_events_written = 0usize;
+                for member in chunk {
+                    if emit_current_members
+                        && !current_ids.contains(&member.actor.id)
+                        && insert_social_activity_event_tx(
+                            &mut tx,
+                            SocialActivityEventInsert {
+                                user_id,
+                                kind: "repo_star_received",
+                                repo_id: Some(repo.repo_id),
+                                repo_full_name: Some(repo.full_name.as_str()),
+                                discussion_number: None,
+                                repo_visual: Some(repo),
+                                title: None,
+                                body: None,
+                                html_url: None,
+                                github_event_id: None,
+                                actor: &member.actor,
+                                occurred_at: member.starred_at.as_deref().unwrap_or(now.as_str()),
+                                detected_at: now.as_str(),
+                            },
+                        )
+                        .await?
+                    {
+                        chunk_events_written += 1;
+                    }
+                    upsert_repo_star_current_member_tx(&mut tx, user_id, member, now.as_str())
+                        .await?;
+                }
+                tx.commit().await.with_context(|| {
+                    format!(
+                        "commit social activity repo member tx for {}",
+                        repo.full_name
+                    )
+                })?;
+                events_written += chunk_events_written;
+                record_social_activity_write_chunk(
+                    &mut metrics,
+                    "repo_members",
+                    chunk_index,
+                    chunk.len(),
+                    &permit,
+                    chunk_started,
+                    query_started,
+                );
+            }
+
+            let repo_history_candidates = repo_history_candidates
+                .get(&repo.repo_id)
+                .map(|candidates| {
+                    candidates
+                        .iter()
+                        .filter(|candidate| {
+                            !delete_stale_repo_members
+                                || members
+                                    .iter()
+                                    .any(|member| member.actor.id == candidate.actor.id)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for (chunk_index, chunk) in repo_history_candidates
+                .chunks(SOCIAL_ACTIVITY_SNAPSHOT_WRITE_CHUNK_SIZE)
+                .enumerate()
+            {
+                let chunk_started = Instant::now();
+                let (permit, mut tx) = state
+                    .sqlite_writer
+                    .begin_immediate(&state.pool, "social_activity_snapshot.repo_history")
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "begin social activity repo history tx for {}",
+                            repo.full_name
+                        )
+                    })?;
+                let query_started = Instant::now();
+                let mut chunk_events_written = 0usize;
+                for candidate in chunk {
+                    if insert_social_activity_event_tx(
                         &mut tx,
                         SocialActivityEventInsert {
                             user_id,
                             kind: "repo_star_received",
-                            repo_id: Some(repo.repo_id),
-                            repo_full_name: Some(repo.full_name.as_str()),
+                            repo_id: Some(candidate.repo.repo_id),
+                            repo_full_name: Some(candidate.repo.full_name.as_str()),
                             discussion_number: None,
-                            repo_visual: Some(repo),
+                            repo_visual: Some(&candidate.repo),
                             title: None,
                             body: None,
                             html_url: None,
                             github_event_id: None,
-                            actor: &member.actor,
-                            occurred_at,
+                            actor: &candidate.actor,
+                            occurred_at: candidate.occurred_at.as_str(),
                             detected_at: now.as_str(),
                         },
                     )
-                    .await?;
-                    if inserted {
-                        events_written += 1;
+                    .await?
+                    {
+                        chunk_events_written += 1;
                     }
                 }
-
-                upsert_repo_star_current_member_tx(&mut tx, user_id, member, now.as_str()).await?;
+                tx.commit().await.with_context(|| {
+                    format!(
+                        "commit social activity repo history tx for {}",
+                        repo.full_name
+                    )
+                })?;
+                events_written += chunk_events_written;
+                record_social_activity_write_chunk(
+                    &mut metrics,
+                    "repo_history",
+                    chunk_index,
+                    chunk.len(),
+                    &permit,
+                    chunk_started,
+                    query_started,
+                );
             }
 
-            if delete_stale_repo_members {
-                for current_id in current_ids.difference(&next_ids) {
-                    sqlx::query(
-                        r#"
-                        DELETE FROM repo_star_current_members
-                        WHERE user_id = ? AND repo_id = ? AND actor_github_user_id = ?
-                        "#,
-                    )
-                    .bind(user_id)
-                    .bind(repo.repo_id)
-                    .bind(*current_id)
-                    .execute(&mut *tx)
-                    .await
-                    .with_context(|| {
+            if let Some(stale_ids) = stale_repo_member_ids.get(&repo.repo_id) {
+                for (chunk_index, chunk) in stale_ids
+                    .chunks(SOCIAL_ACTIVITY_SNAPSHOT_WRITE_CHUNK_SIZE)
+                    .enumerate()
+                {
+                    let chunk_started = Instant::now();
+                    let (permit, mut tx) = state
+                        .sqlite_writer
+                        .begin_immediate(
+                            &state.pool,
+                            "social_activity_snapshot.repo_member_cleanup",
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "begin social activity repo member cleanup tx for {}",
+                                repo.full_name
+                            )
+                        })?;
+                    let query_started = Instant::now();
+                    delete_repo_star_members_for_ids_tx(&mut tx, user_id, repo.repo_id, chunk)
+                        .await
+                        .with_context(|| {
+                            format!("delete stale repo star members for {}", repo.full_name)
+                        })?;
+                    tx.commit().await.with_context(|| {
                         format!(
-                            "delete stale repo star current member for {}",
+                            "commit social activity repo member cleanup tx for {}",
                             repo.full_name
                         )
                     })?;
+                    record_social_activity_write_chunk(
+                        &mut metrics,
+                        "repo_member_cleanup",
+                        chunk_index,
+                        chunk.len(),
+                        &permit,
+                        chunk_started,
+                        query_started,
+                    );
                 }
             }
-
-            events_written +=
-                materialize_repo_star_current_members_tx(&mut tx, user_id, repo, now.as_str())
-                    .await?;
-
-            upsert_owned_repo_star_baseline_tx(&mut tx, user_id, repo, true, now.as_str())
-                .await
-                .with_context(|| {
-                    format!("mark repo star snapshot initialized for {}", repo.full_name)
-                })?;
         }
 
+        for (chunk_index, chunk) in repo_members_slice
+            .chunks(SOCIAL_ACTIVITY_SNAPSHOT_WRITE_CHUNK_SIZE)
+            .enumerate()
+        {
+            let chunk_started = Instant::now();
+            let (permit, mut tx) = state
+                .sqlite_writer
+                .begin_immediate(
+                    &state.pool,
+                    "social_activity_snapshot.repo_member_baselines",
+                )
+                .await
+                .context("begin social activity repo member baseline tx")?;
+            let query_started = Instant::now();
+            for (repo, _) in chunk {
+                upsert_owned_repo_star_baseline_tx(&mut tx, user_id, repo, true, now.as_str())
+                    .await
+                    .with_context(|| {
+                        format!("mark repo star snapshot initialized for {}", repo.full_name)
+                    })?;
+            }
+            tx.commit()
+                .await
+                .context("commit social activity repo member baseline tx")?;
+            record_social_activity_write_chunk(
+                &mut metrics,
+                "repo_member_baselines",
+                chunk_index,
+                chunk.len(),
+                &permit,
+                chunk_started,
+                query_started,
+            );
+        }
+
+        let chunk_started = Instant::now();
+        let (permit, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "social_activity_snapshot.repo_sync_baseline")
+            .await
+            .context("begin social activity repo sync baseline tx")?;
+        let query_started = Instant::now();
         sqlx::query(
             r#"
             INSERT INTO repo_star_sync_baselines (id, user_id, initialized_at, updated_at)
@@ -3329,48 +3887,44 @@ async fn apply_social_activity_snapshot_with_options(
         .execute(&mut *tx)
         .await
         .context("upsert repo star sync baseline")?;
+        tx.commit()
+            .await
+            .context("commit social activity repo sync baseline tx")?;
+        record_social_activity_write_chunk(
+            &mut metrics,
+            "repo_sync_baseline",
+            0,
+            1,
+            &permit,
+            chunk_started,
+            query_started,
+        );
     }
 
-    let should_dispatch_webhook_reconcile = newly_persisted_repo_baseline
-        && sqlx::query_scalar::<_, i64>(
-            r#"
-            SELECT COUNT(*)
-            FROM users
-            WHERE id = ?
-              AND include_own_releases != 0
-              AND webhook_push_enabled != 0
-              AND webhook_push_desired_state = 'enabled'
-            "#,
-        )
-        .bind(user_id)
-        .fetch_one(&mut *tx)
-        .await
-        .context("check webhook push target before advancing reconcile demand")?
-            != 0;
-    if should_dispatch_webhook_reconcile {
-        sqlx::query(
-            r#"
-            INSERT INTO webhook_push_reconcile_demands (
-              user_id, requested_generation, completed_generation, requested_at, updated_at
-            ) VALUES (?, 1, 0, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-              requested_generation = webhook_push_reconcile_demands.requested_generation + 1,
-              requested_at = excluded.requested_at,
-              updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(user_id)
-        .bind(&now)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await
-        .context("advance webhook push reconcile demand")?;
-    }
+    tracing::info!(
+        event = "sqlite.write",
+        operation = "sync.social_activity_snapshot",
+        user_id,
+        candidate_read_elapsed_ms,
+        chunk_count = metrics.chunk_count,
+        max_chunk_elapsed_ms = metrics.max_chunk_elapsed_ms,
+        max_query_elapsed_ms = metrics.max_query_elapsed_ms,
+        max_writer_wait_ms = metrics.max_writer_wait_ms,
+        events_written,
+        "social activity snapshot persisted in bounded writer chunks"
+    );
+    #[cfg(test)]
+    eprintln!(
+        "social_activity_snapshot_metrics user={} chunks={} max_chunk_ms={} max_query_ms={} max_writer_wait_ms={} read_ms={} events={}",
+        user_id,
+        metrics.chunk_count,
+        metrics.max_chunk_elapsed_ms,
+        metrics.max_query_elapsed_ms,
+        metrics.max_writer_wait_ms,
+        candidate_read_elapsed_ms,
+        events_written,
+    );
 
-    tx.commit()
-        .await
-        .context("commit social activity snapshot tx")?;
-    drop(_sqlite_write);
     if should_dispatch_webhook_reconcile
         && let Err(error) =
             crate::webhook_push::dispatch_pending_reconcile_demands(state, user_id).await
@@ -3382,6 +3936,232 @@ async fn apply_social_activity_snapshot_with_options(
         );
     }
     Ok(events_written)
+}
+
+fn record_social_activity_write_chunk(
+    metrics: &mut SocialActivitySnapshotWriteMetrics,
+    phase: &'static str,
+    chunk_index: usize,
+    chunk_size: usize,
+    permit: &SqliteWritePermit,
+    chunk_started: Instant,
+    query_started: Instant,
+) {
+    let query_elapsed_ms = query_started.elapsed().as_millis();
+    let chunk_elapsed_ms = chunk_started.elapsed().as_millis();
+    let writer_wait_ms = permit.writer_wait_ms();
+    metrics.chunk_count += 1;
+    metrics.max_chunk_elapsed_ms = metrics.max_chunk_elapsed_ms.max(chunk_elapsed_ms);
+    metrics.max_query_elapsed_ms = metrics.max_query_elapsed_ms.max(query_elapsed_ms);
+    metrics.max_writer_wait_ms = metrics.max_writer_wait_ms.max(writer_wait_ms);
+    tracing::debug!(
+        event = "sqlite.write",
+        operation = "sync.social_activity_snapshot",
+        phase,
+        chunk_index,
+        chunk_size,
+        writer_wait_ms,
+        query_elapsed_ms,
+        chunk_elapsed_ms,
+        "social activity snapshot writer chunk committed"
+    );
+}
+
+fn push_association_key_match(
+    query: &mut QueryBuilder<'_, Sqlite>,
+    user_id: &str,
+    repo_id: Option<i64>,
+    repo_full_name: &str,
+) {
+    query.push("user_id = ").push_bind(user_id.to_owned());
+    match repo_id {
+        Some(repo_id) => {
+            query
+                .push(" AND (repo_id = ")
+                .push_bind(repo_id)
+                .push(" OR repo_full_name_lower = lower(")
+                .push_bind(repo_full_name.to_owned())
+                .push(") )");
+        }
+        None => {
+            query
+                .push(" AND repo_id IS NULL AND repo_full_name_lower = lower(")
+                .push_bind(repo_full_name.to_owned())
+                .push(")");
+        }
+    }
+}
+
+async fn clear_stale_personal_owned_association_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    user_id: &str,
+    repo_id: Option<i64>,
+    repo_full_name: &str,
+    now: &str,
+) -> Result<()> {
+    let mut source_update = QueryBuilder::<Sqlite>::new(
+        "UPDATE user_repo_associations SET has_personal_owned_source = 0, updated_at = ",
+    );
+    source_update.push_bind(now).push(" WHERE ");
+    push_association_key_match(&mut source_update, user_id, repo_id, repo_full_name);
+    source_update
+        .push(" AND has_personal_owned_source != 0")
+        .build()
+        .execute(&mut **tx)
+        .await
+        .context("clear stale personal_owned association source")?;
+
+    let mut follow_update = QueryBuilder::<Sqlite>::new(
+        r#"
+        UPDATE user_repo_associations
+        SET is_following = CASE
+              WHEN has_personal_owned_source != 0 OR has_github_star_source != 0 THEN 1
+              ELSE 0
+            END,
+            updated_at =
+        "#,
+    );
+    follow_update.push_bind(now).push(" WHERE ");
+    push_association_key_match(&mut follow_update, user_id, repo_id, repo_full_name);
+    follow_update.push(
+        r#"
+          AND follow_state_source = 'system_default'
+          AND is_following IS NOT (CASE
+                WHEN has_personal_owned_source != 0 OR has_github_star_source != 0 THEN 1
+                ELSE 0
+              END)
+        "#,
+    );
+    follow_update
+        .build()
+        .execute(&mut **tx)
+        .await
+        .context("recalculate stale association follow state")?;
+
+    let mut delete = QueryBuilder::<Sqlite>::new(
+        r#"
+        DELETE FROM user_repo_associations WHERE
+        "#,
+    );
+    push_association_key_match(&mut delete, user_id, repo_id, repo_full_name);
+    delete.push(
+        r#"
+          AND has_personal_owned_source = 0
+          AND has_github_star_source = 0
+          AND has_manual_feed_source = 0
+          AND follow_state_source = 'system_default'
+          AND is_following = 0
+        "#,
+    );
+    delete
+        .build()
+        .execute(&mut **tx)
+        .await
+        .context("delete stale default repo association")?;
+    Ok(())
+}
+
+async fn delete_repo_star_rows_for_ids_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    user_id: &str,
+    repo_ids: &[i64],
+) -> Result<()> {
+    if repo_ids.is_empty() {
+        return Ok(());
+    }
+    let mut delete_members =
+        QueryBuilder::<Sqlite>::new("DELETE FROM repo_star_current_members WHERE user_id = ");
+    delete_members.push_bind(user_id).push(" AND repo_id IN (");
+    {
+        let mut separated = delete_members.separated(", ");
+        for repo_id in repo_ids {
+            separated.push_bind(repo_id);
+        }
+    }
+    delete_members.push(")");
+    delete_members
+        .build()
+        .execute(&mut **tx)
+        .await
+        .context("delete stale repo star current members")?;
+
+    let mut delete_baselines =
+        QueryBuilder::<Sqlite>::new("DELETE FROM owned_repo_star_baselines WHERE user_id = ");
+    delete_baselines
+        .push_bind(user_id)
+        .push(" AND repo_id IN (");
+    {
+        let mut separated = delete_baselines.separated(", ");
+        for repo_id in repo_ids {
+            separated.push_bind(repo_id);
+        }
+    }
+    delete_baselines.push(")");
+    delete_baselines
+        .build()
+        .execute(&mut **tx)
+        .await
+        .context("delete stale repo star baselines")?;
+    Ok(())
+}
+
+async fn delete_repo_star_members_for_ids_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    user_id: &str,
+    repo_id: i64,
+    actor_ids: &[i64],
+) -> Result<()> {
+    if actor_ids.is_empty() {
+        return Ok(());
+    }
+    let mut delete =
+        QueryBuilder::<Sqlite>::new("DELETE FROM repo_star_current_members WHERE user_id = ");
+    delete
+        .push_bind(user_id)
+        .push(" AND repo_id = ")
+        .push_bind(repo_id)
+        .push(" AND actor_github_user_id IN (");
+    {
+        let mut separated = delete.separated(", ");
+        for actor_id in actor_ids {
+            separated.push_bind(actor_id);
+        }
+    }
+    delete.push(")");
+    delete
+        .build()
+        .execute(&mut **tx)
+        .await
+        .context("delete stale repo star current members")?;
+    Ok(())
+}
+
+async fn delete_follower_current_members_for_ids_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    user_id: &str,
+    actor_ids: &[i64],
+) -> Result<()> {
+    if actor_ids.is_empty() {
+        return Ok(());
+    }
+    let mut delete =
+        QueryBuilder::<Sqlite>::new("DELETE FROM follower_current_members WHERE user_id = ");
+    delete
+        .push_bind(user_id)
+        .push(" AND actor_github_user_id IN (");
+    {
+        let mut separated = delete.separated(", ");
+        for actor_id in actor_ids {
+            separated.push_bind(actor_id);
+        }
+    }
+    delete.push(")");
+    delete
+        .build()
+        .execute(&mut **tx)
+        .await
+        .context("delete stale follower current members")?;
+    Ok(())
 }
 
 async fn upsert_owned_repo_star_baseline_tx(
@@ -3691,153 +4471,6 @@ async fn upsert_repo_star_current_member_tx(
     .await
     .context("upsert repo star current member")?;
     Ok(())
-}
-
-async fn materialize_follower_current_members_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    user_id: &str,
-    now: &str,
-) -> Result<usize> {
-    let rows = sqlx::query_as::<_, FollowerCurrentMemberEventRow>(
-        r#"
-        SELECT
-          cm.actor_github_user_id,
-          cm.actor_login,
-          cm.actor_avatar_url,
-          cm.actor_html_url,
-          cm.created_at
-        FROM follower_current_members cm
-        LEFT JOIN social_activity_events e
-          ON e.user_id = cm.user_id
-         AND e.kind = 'follower_received'
-         AND e.repo_id IS NULL
-         AND e.actor_github_user_id = cm.actor_github_user_id
-         AND e.occurred_at = COALESCE(cm.created_at, ?)
-        WHERE cm.user_id = ?
-          AND e.id IS NULL
-        ORDER BY cm.actor_github_user_id ASC
-        "#,
-    )
-    .bind(now)
-    .bind(user_id)
-    .fetch_all(&mut **tx)
-    .await
-    .context("query follower members for social history materialization")?;
-    let mut inserted = 0usize;
-
-    for row in rows {
-        let actor = GitHubActor {
-            id: row.actor_github_user_id,
-            login: row.actor_login,
-            avatar_url: row.actor_avatar_url,
-            html_url: row.actor_html_url,
-        };
-        let occurred_at = row.created_at.as_deref().unwrap_or(now);
-        if insert_social_activity_event_tx(
-            tx,
-            SocialActivityEventInsert {
-                user_id,
-                kind: "follower_received",
-                repo_id: None,
-                repo_full_name: None,
-                discussion_number: None,
-                repo_visual: None,
-                title: None,
-                body: None,
-                html_url: None,
-                github_event_id: None,
-                actor: &actor,
-                occurred_at,
-                detected_at: now,
-            },
-        )
-        .await?
-        {
-            inserted += 1;
-        }
-    }
-
-    Ok(inserted)
-}
-
-async fn materialize_repo_star_current_members_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    user_id: &str,
-    repo: &OwnedRepoSnapshot,
-    now: &str,
-) -> Result<usize> {
-    let rows = sqlx::query_as::<_, RepoStarCurrentMemberEventRow>(
-        r#"
-        SELECT
-          cm.actor_github_user_id,
-          cm.actor_login,
-          cm.actor_avatar_url,
-          cm.actor_html_url,
-          cm.starred_at,
-          cm.created_at
-        FROM repo_star_current_members cm
-        LEFT JOIN social_activity_events e
-          ON e.user_id = cm.user_id
-         AND e.kind = 'repo_star_received'
-         AND e.repo_id = cm.repo_id
-         AND e.actor_github_user_id = cm.actor_github_user_id
-         AND e.occurred_at = COALESCE(cm.starred_at, cm.created_at, ?)
-        WHERE cm.user_id = ?
-          AND cm.repo_id = ?
-          AND e.id IS NULL
-        ORDER BY cm.actor_github_user_id ASC
-        "#,
-    )
-    .bind(now)
-    .bind(user_id)
-    .bind(repo.repo_id)
-    .fetch_all(&mut **tx)
-    .await
-    .with_context(|| {
-        format!(
-            "query repo star members for social history materialization for {}",
-            repo.full_name
-        )
-    })?;
-    let mut inserted = 0usize;
-
-    for row in rows {
-        let actor = GitHubActor {
-            id: row.actor_github_user_id,
-            login: row.actor_login,
-            avatar_url: row.actor_avatar_url,
-            html_url: row.actor_html_url,
-        };
-        let occurred_at = row
-            .starred_at
-            .as_deref()
-            .or(row.created_at.as_deref())
-            .unwrap_or(now);
-        if insert_social_activity_event_tx(
-            tx,
-            SocialActivityEventInsert {
-                user_id,
-                kind: "repo_star_received",
-                repo_id: Some(repo.repo_id),
-                repo_full_name: Some(repo.full_name.as_str()),
-                discussion_number: None,
-                repo_visual: Some(repo),
-                title: None,
-                body: None,
-                html_url: None,
-                github_event_id: None,
-                actor: &actor,
-                occurred_at,
-                detected_at: now,
-            },
-        )
-        .await?
-        {
-            inserted += 1;
-        }
-    }
-
-    Ok(inserted)
 }
 
 async fn load_release_updated_at_for_user(
@@ -13612,7 +14245,7 @@ fn fallback_notification_open_url(thread_id: Option<&str>, repo_full_name: Optio
 
 #[cfg(test)]
 mod tests {
-    use crate::content_processing;
+    use crate::{content_processing, session_store::CoordinatedSqliteSessionStore};
     use anyhow::{Context, anyhow};
     use chrono::{DateTime, Utc};
     use sqlx::Row;
@@ -13628,10 +14261,12 @@ mod tests {
 
     use serde_json::{Value, json};
     use sqlx::{
-        SqlitePool,
+        QueryBuilder, SqlitePool,
         sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     };
     use std::time::Duration;
+    use tower_sessions::{MemoryStore, Session};
+    use tower_sessions_sqlx_store::SqliteStore;
     use url::Url;
 
     use super::{
@@ -13660,6 +14295,7 @@ mod tests {
         fail_repo_release_work_item, feed_activity_event_from_github,
         fetch_repo_releases_with_optional_token, hydrate_repo_refresh_candidates,
         insert_feed_activity_events, insert_social_activity_event_tx,
+        install_social_activity_snapshot_after_first_chunk_hook,
         install_social_activity_snapshot_after_reads_hook, is_terminal_notification_thread_error,
         load_dashboard_release_freshness_policy, load_dashboard_release_freshness_snapshots,
         load_public_release_usage_sync_access, load_repo_release_candidate_users,
@@ -13668,8 +14304,8 @@ mod tests {
         record_repo_refresh_governance_attempt, record_repo_release_sync_success,
         recover_repo_release_runtime_state_on_startup, refresh_public_repo_release_if_stale,
         replace_starred_repos, repo_release_deadline_at, repo_release_timestamp_is_fresh,
-        resolve_notification_open_url, store_sync_state_value,
-        subscription_event_counts_as_critical, subscription_timeout_error,
+        resolve_notification_open_url, social_activity_snapshot_hook_test_lock,
+        store_sync_state_value, subscription_event_counts_as_critical, subscription_timeout_error,
         sync_notifications_with_fetch, sync_starred_for_user_with_fetch, upsert_notifications,
         upsert_repo_releases, upsert_starred_repos, wait_for_release_demand,
     };
@@ -18759,6 +19395,7 @@ mod tests {
 
     #[tokio::test]
     async fn social_activity_snapshot_waits_for_sqlite_write_lock_under_concurrent_commit() {
+        let _hook_test_lock = social_activity_snapshot_hook_test_lock().lock().await;
         let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
         let state = setup_state(pool.clone());
         let user_id = test_user_id("social-busy-snapshot");
@@ -18844,6 +19481,327 @@ mod tests {
         .await
         .expect("count social activity history");
         assert_eq!(history_count, 1);
+    }
+
+    #[tokio::test]
+    async fn social_activity_snapshot_releases_writer_before_first_write_chunk() {
+        let _hook_test_lock = social_activity_snapshot_hook_test_lock().lock().await;
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-chunk-yield");
+        seed_user(&pool, user_id.as_str()).await;
+
+        let mut hook = install_social_activity_snapshot_after_reads_hook();
+        let follower = FollowerSnapshot {
+            actor: GitHubActor {
+                id: 402,
+                login: "chunk-yield-cat".to_owned(),
+                avatar_url: Some("https://avatars.example/chunk-yield-cat.png".to_owned()),
+                html_url: Some("https://github.com/chunk-yield-cat".to_owned()),
+            },
+        };
+
+        let snapshot_task = {
+            let state = state.clone();
+            let user_id = user_id.clone();
+            tokio::spawn(async move {
+                apply_social_activity_snapshot_partial(
+                    state.as_ref(),
+                    user_id.as_str(),
+                    None,
+                    None,
+                    Some(&[follower]),
+                )
+                .await
+            })
+        };
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), hook.reached.recv())
+                .await
+                .expect("wait for social activity snapshot read hook")
+                .is_some(),
+            "expected social activity snapshot to reach post-read test hook"
+        );
+
+        let enqueue_state = state.clone();
+        let enqueue = tokio::spawn(async move {
+            jobs::enqueue_task(
+                enqueue_state.as_ref(),
+                jobs::NewTask {
+                    task_type: jobs::TASK_SYNC_ALL.to_owned(),
+                    payload: json!({"trigger": "social_snapshot_chunk_yield"}),
+                    source: "test".to_owned(),
+                    requested_by: None,
+                    parent_task_id: None,
+                },
+            )
+            .await
+        });
+        let mut enqueue = enqueue;
+        let enqueue_result = tokio::time::timeout(Duration::from_millis(100), &mut enqueue).await;
+        assert!(
+            enqueue_result.is_ok(),
+            "foreground task enqueue should proceed while snapshot candidate writes are paused"
+        );
+        enqueue_result
+            .expect("foreground enqueue should finish before snapshot resumes")
+            .expect("join foreground enqueue")
+            .expect("foreground enqueue should succeed before snapshot resumes");
+
+        let _ = hook.resume.send(true);
+        snapshot_task
+            .await
+            .expect("join social activity snapshot task")
+            .expect("social activity snapshot should succeed after foreground enqueue");
+    }
+
+    #[tokio::test]
+    async fn social_activity_snapshot_production_shape_keeps_dashboard_session_and_enqueue_live() {
+        let _hook_test_lock = social_activity_snapshot_hook_test_lock().lock().await;
+        let pool = setup_pool_with_max_connections_and_wal(4, Duration::from_millis(25)).await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-production-shape");
+        seed_user(&pool, user_id.as_str()).await;
+
+        let owner_login = format!("user-{user_id}");
+        let encrypted = state
+            .encryption_key
+            .encrypt_str("production-shape-token")
+            .expect("encrypt production shape github token");
+        sqlx::query(
+            r#"
+            INSERT INTO github_connections (
+              id,
+              user_id,
+              github_user_id,
+              login,
+              access_token_ciphertext,
+              access_token_nonce,
+              scopes,
+              linked_at,
+              updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind(30_215_105_i64)
+        .bind(owner_login.as_str())
+        .bind(encrypted.ciphertext)
+        .bind(encrypted.nonce)
+        .bind("read:user")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("2026-03-06T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed production shape github connection");
+
+        let repos = (0..397_i64)
+            .map(|index| OwnedRepoSnapshot {
+                repo_id: 10_000 + index,
+                full_name: format!("{owner_login}/repo-{index}"),
+                is_private: false,
+                repo_stargazer_count: Some(index),
+                owner_avatar_url: None,
+                open_graph_image_url: None,
+                uses_custom_open_graph_image: false,
+            })
+            .collect::<Vec<_>>();
+        let repo_members = repos
+            .iter()
+            .cloned()
+            .map(|repo| (repo, Vec::new()))
+            .collect::<Vec<_>>();
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id, repo_id, release_id, tag_name, name, html_url,
+              published_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("production-shape-release")
+        .bind(10_000_i64)
+        .bind(900_001_i64)
+        .bind("v1.0.0")
+        .bind("Production shape release")
+        .bind("https://github.com/example/production-shape/releases/tag/v1.0.0")
+        .bind("2026-03-06T12:00:00Z")
+        .bind("2026-03-06T12:00:00Z")
+        .bind("2026-03-06T12:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed production shape release");
+        seed_search_documents(&pool, 100_000).await;
+
+        let mut hook = install_social_activity_snapshot_after_first_chunk_hook();
+        let snapshot_task = {
+            let state = state.clone();
+            let user_id = user_id.clone();
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                let result = apply_social_activity_snapshot_partial(
+                    state.as_ref(),
+                    user_id.as_str(),
+                    Some(repos.as_slice()),
+                    Some(repo_members.as_slice()),
+                    None,
+                )
+                .await;
+                (result, started.elapsed())
+            })
+        };
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), hook.reached.recv())
+                .await
+                .expect("wait for social activity first chunk hook")
+                .is_some(),
+            "expected social activity snapshot to pause between bounded write chunks"
+        );
+
+        let dashboard_session = {
+            let store = Arc::new(MemoryStore::default());
+            let session = Session::new(None, store, None);
+            session
+                .insert("user_id", user_id.clone())
+                .await
+                .expect("seed dashboard session");
+            session
+        };
+        let session_store = Arc::new(CoordinatedSqliteSessionStore::new(
+            SqliteStore::new(pool.clone()),
+            state.sqlite_writer.clone(),
+        ));
+        session_store
+            .migrate()
+            .await
+            .expect("migrate production shape session store");
+        let session = Session::new(None, session_store, None);
+        session
+            .insert("user_id", user_id.clone())
+            .await
+            .expect("seed persisted session");
+        session
+            .save()
+            .await
+            .expect("create persisted session before concurrent save");
+        session
+            .insert("load_probe", "ready".to_owned())
+            .await
+            .expect("update persisted session before concurrent save");
+
+        let dashboard_state = state.clone();
+        let dashboard_task = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let query = serde_json::from_value::<crate::api::DashboardUpdatesQuery>(json!({
+                "feed_type": "releases",
+                "include": "feed",
+                "scope": "mine"
+            }))
+            .expect("build dashboard updates query");
+            let result = crate::api::dashboard_updates(
+                axum::extract::State(dashboard_state),
+                dashboard_session,
+                HeaderMap::new(),
+                Query(query),
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "dashboard updates should not return a 500 or busy error: {result:?}"
+            );
+            started.elapsed()
+        });
+
+        let session_save_task = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = session.save().await;
+            assert!(
+                result.is_ok(),
+                "coordinated session save should not return a busy error: {result:?}"
+            );
+            started.elapsed()
+        });
+
+        let enqueue_state = state.clone();
+        let enqueue_user_id = user_id.clone();
+        let enqueue_task = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = jobs::enqueue_task(
+                enqueue_state.as_ref(),
+                jobs::NewTask {
+                    task_type: jobs::TASK_SYNC_ALL.to_owned(),
+                    payload: json!({
+                        "trigger": "social_production_shape",
+                        "search_documents": 100_000,
+                        "owned_repos": 397
+                    }),
+                    source: "production-shape-test".to_owned(),
+                    requested_by: Some(enqueue_user_id),
+                    parent_task_id: None,
+                },
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "task enqueue should not return a busy error: {result:?}"
+            );
+            started.elapsed()
+        });
+
+        let (dashboard_latency, session_latency, enqueue_latency) =
+            tokio::join!(dashboard_task, session_save_task, enqueue_task,);
+        let dashboard_latency = dashboard_latency.expect("join dashboard updates");
+        let session_latency = session_latency.expect("join session save");
+        let enqueue_latency = enqueue_latency.expect("join task enqueue");
+        let max_request_latency = [dashboard_latency, session_latency, enqueue_latency]
+            .into_iter()
+            .max()
+            .expect("request latency samples");
+        eprintln!(
+            "social_activity_production_shape dashboard_ms={} session_save_ms={} enqueue_ms={} max_request_ms={} busy_or_500=0",
+            dashboard_latency.as_millis(),
+            session_latency.as_millis(),
+            enqueue_latency.as_millis(),
+            max_request_latency.as_millis(),
+        );
+        assert!(
+            max_request_latency < Duration::from_secs(5),
+            "foreground request latency exceeded the bounded-chunk test budget: {} ms",
+            max_request_latency.as_millis()
+        );
+
+        let _ = hook.resume.send(true);
+        let (snapshot_result, snapshot_latency) = snapshot_task
+            .await
+            .expect("join production shape social snapshot");
+        assert_eq!(
+            snapshot_result.expect("production shape social snapshot should succeed"),
+            0
+        );
+        eprintln!(
+            "social_activity_production_shape snapshot_ms={} associations=397 search_documents>=100000",
+            snapshot_latency.as_millis(),
+        );
+
+        let association_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM user_repo_associations WHERE user_id = ? AND has_personal_owned_source != 0",
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("count production shape associations");
+        assert_eq!(association_count, 397);
+
+        let search_document_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM search_documents")
+                .fetch_one(&pool)
+                .await
+                .expect("count production shape search documents");
+        assert!(search_document_count >= 100_000);
     }
 
     #[tokio::test]
@@ -23426,6 +24384,33 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed user");
+    }
+
+    async fn seed_search_documents(pool: &SqlitePool, count: usize) {
+        let mut tx = pool.begin().await.expect("begin search document seed tx");
+        for start in (0..count).step_by(500) {
+            let end = (start + 500).min(count);
+            let mut query = QueryBuilder::<sqlx::Sqlite>::new(
+                "INSERT INTO search_documents (id, user_id, resource_type, resource_id, title, body, source_time, created_at, updated_at) ",
+            );
+            query.push_values(start..end, |mut row, index| {
+                row.push_bind(format!("load-test-document-{index}"))
+                    .push_bind(Option::<String>::None)
+                    .push_bind("brief")
+                    .push_bind(format!("load-test-resource-{index}"))
+                    .push_bind("load test")
+                    .push_bind("load test body")
+                    .push_bind("2026-03-06T00:00:00Z")
+                    .push_bind("2026-03-06T00:00:00Z")
+                    .push_bind("2026-03-06T00:00:00Z");
+            });
+            query
+                .build()
+                .execute(&mut *tx)
+                .await
+                .expect("seed search documents");
+        }
+        tx.commit().await.expect("commit search document seed tx");
     }
 
     async fn seed_starred_repo_row(
