@@ -14347,6 +14347,7 @@ pub(crate) async fn clear_user_repo_association_source_except_repo_ids_tx(
     user_id: &str,
     source: UserRepoAssociationSource,
     keep_repo_ids: &[i64],
+    keep_repo_full_name_lowers: &[String],
     now: &str,
 ) -> Result<(), sqlx::Error> {
     let column = match source {
@@ -14365,7 +14366,11 @@ pub(crate) async fn clear_user_repo_association_source_except_repo_ids_tx(
         .push(" AND ")
         .push(column)
         .push(" != 0");
-    push_association_repo_exclusion(&mut source_update, keep_repo_ids);
+    push_association_stale_repo_filter(
+        &mut source_update,
+        keep_repo_ids,
+        keep_repo_full_name_lowers,
+    );
     source_update.build().execute(&mut **tx).await?;
 
     let mut follow_update = QueryBuilder::<Sqlite>::new(
@@ -14391,7 +14396,11 @@ pub(crate) async fn clear_user_repo_association_source_except_repo_ids_tx(
               END)
         "#,
         );
-    push_association_repo_exclusion(&mut follow_update, keep_repo_ids);
+    push_association_stale_repo_filter(
+        &mut follow_update,
+        keep_repo_ids,
+        keep_repo_full_name_lowers,
+    );
     follow_update.build().execute(&mut **tx).await?;
 
     let mut delete = QueryBuilder::<Sqlite>::new(
@@ -14405,25 +14414,49 @@ pub(crate) async fn clear_user_repo_association_source_except_repo_ids_tx(
           AND has_personal_owned_source = 0
           AND has_github_star_source = 0
           AND has_manual_feed_source = 0
+          AND follow_state_source = 'system_default'
           AND is_following = 0
         "#,
     );
-    push_association_repo_exclusion(&mut delete, keep_repo_ids);
+    push_association_stale_repo_filter(&mut delete, keep_repo_ids, keep_repo_full_name_lowers);
     delete.build().execute(&mut **tx).await?;
 
     Ok(())
 }
 
-fn push_association_repo_exclusion(query: &mut QueryBuilder<'_, Sqlite>, keep_repo_ids: &[i64]) {
-    if keep_repo_ids.is_empty() {
+fn push_association_stale_repo_filter(
+    query: &mut QueryBuilder<'_, Sqlite>,
+    keep_repo_ids: &[i64],
+    keep_repo_full_name_lowers: &[String],
+) {
+    if keep_repo_ids.is_empty() && keep_repo_full_name_lowers.is_empty() {
         return;
     }
-    query.push(" AND (repo_id IS NULL OR repo_id NOT IN (");
-    for (index, repo_id) in keep_repo_ids.iter().enumerate() {
-        if index > 0 {
-            query.push(", ");
+    query.push(" AND ((repo_id IS NOT NULL AND ");
+    if keep_repo_ids.is_empty() {
+        query.push("1 = 1");
+    } else {
+        query.push("repo_id NOT IN (");
+        for (index, repo_id) in keep_repo_ids.iter().enumerate() {
+            if index > 0 {
+                query.push(", ");
+            }
+            query.push_bind(*repo_id);
         }
-        query.push_bind(*repo_id);
+        query.push(")");
+    }
+    query.push(") OR (repo_id IS NULL AND ");
+    if keep_repo_full_name_lowers.is_empty() {
+        query.push("1 = 1");
+    } else {
+        query.push("repo_full_name_lower NOT IN (");
+        for (index, repo_full_name_lower) in keep_repo_full_name_lowers.iter().enumerate() {
+            if index > 0 {
+                query.push(", ");
+            }
+            query.push_bind(repo_full_name_lower.clone());
+        }
+        query.push(")");
     }
     query.push("))");
 }
@@ -14484,6 +14517,7 @@ pub(crate) async fn clear_user_repo_association_source_for_repo_tx(
           AND has_personal_owned_source = 0
           AND has_github_star_source = 0
           AND has_manual_feed_source = 0
+          AND follow_state_source = 'system_default'
           AND is_following = 0
         "#
     );
@@ -26697,6 +26731,45 @@ mod tests {
         .await
         .expect("read explicit follow choice");
         assert_eq!(follow_state, (0, "user_explicit".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn association_source_clear_preserves_explicit_unfollow() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(2);
+        seed_user(&pool, 2, "search-user-2", 0, 0).await;
+        seed_search_repo_association(&pool, 2, 42, "openai/codex", true).await;
+        sqlx::query(
+            "UPDATE user_repo_associations SET is_following = 0, follow_state_source = 'user_explicit' WHERE user_id = ? AND repo_id = ?",
+        )
+        .bind(user_id.as_str())
+        .bind(42_i64)
+        .execute(&pool)
+        .await
+        .expect("set explicit unfollow");
+
+        let mut tx = pool.begin().await.expect("begin source clear");
+        super::clear_user_repo_association_source_for_repo_tx(
+            &mut tx,
+            user_id.as_str(),
+            super::UserRepoAssociationSource::GitHubStar,
+            42,
+            "openai/codex",
+            "2026-02-24T00:00:00Z",
+        )
+        .await
+        .expect("clear association source");
+        tx.commit().await.expect("commit source clear");
+
+        let state = sqlx::query_as::<_, (i64, String, i64)>(
+            "SELECT is_following, follow_state_source, has_github_star_source FROM user_repo_associations WHERE user_id = ? AND repo_id = ?",
+        )
+        .bind(user_id.as_str())
+        .bind(42_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("read explicit unfollow after source clear");
+        assert_eq!(state, (0, "user_explicit".to_owned(), 0));
     }
 
     #[tokio::test]

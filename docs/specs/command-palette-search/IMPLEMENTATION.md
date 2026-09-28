@@ -38,7 +38,10 @@
 - `search::tests::repository_rename_deduplicates_star_and_association_projection`：覆盖 star 同步先改名、association 随后写入时按 `repo_id` 清理旧 projection。
 - `search::tests::association_non_projection_updates_do_not_rebuild_release_fts`：通过真实迁移触发器验证 source flag、follow state 和 `updated_at`-only association updates 不重建 Release FTS。
 - `api::tests::repo_association_upsert_skips_timestamp_only_noop`：验证有效值不变时 association upsert 不因新的 `updated_at` 产生写入，并保留显式 follow state。
+- `api::tests::association_source_clear_preserves_explicit_unfollow`：验证单仓库 source 清理保留显式取消关注。
 - `sync::tests::repeated_social_snapshot_only_updates_association_observation_once`：验证重复 production-shaped owned-repository snapshot 不清除再重建当前 association。
+- `sync::tests::social_snapshot_clears_stale_associations_and_preserves_explicit_unfollow`：验证 NULL-ID/过期 association 清理、空快照和显式取消关注在仓库重新出现时的状态保持。
+- `sync::tests::replace_starred_repos_preserves_explicit_unfollow`：验证完整 starred-repository replacement 路径清理旧 source 时保留显式取消关注。
 - Synthetic SQLite benchmark: 397 associations and 39,700 release documents measured the broad pre-repair trigger at 15.098 s with a `SCAN search_documents` plan; the guarded/indexed repair path kept the fixture unchanged and used `SEARCH search_documents USING INDEX idx_search_documents_resource_repo`, below the benchmark timer's 1 ms resolution.
 - `web/src/search/CommandPalette.stories.tsx`：覆盖空态、搜索结果、动作、日报确认、busy 键盘保护、错误、限流、管理员及 393px 视口。
 - `web/src/search/CommandPalette.stories.tsx`：追加 `IndexBuilding` 与 `IndexPausedLowDisk`，验证渐进索引的可见降级提示。
