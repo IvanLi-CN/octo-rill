@@ -17,6 +17,7 @@ mod linuxdo;
 mod local_id;
 mod observability;
 mod passkeys;
+mod public_metrics;
 mod release_links;
 mod runtime;
 mod search;
