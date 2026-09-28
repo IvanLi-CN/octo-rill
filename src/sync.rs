@@ -3096,18 +3096,20 @@ async fn apply_social_activity_snapshot_with_options(
     }
 
     if let Some(owned_repos) = owned_repos {
-        crate::api::clear_user_repo_association_source_tx(
-            &mut tx,
-            user_id,
-            crate::api::UserRepoAssociationSource::PersonalOwned,
-            now.as_str(),
-        )
-        .await
-        .context("clear personal_owned repo associations before owned snapshot refresh")?;
         let current_owned_repo_ids = owned_repos
             .iter()
             .map(|repo| repo.repo_id)
             .collect::<HashSet<_>>();
+        let keep_repo_ids = current_owned_repo_ids.iter().copied().collect::<Vec<_>>();
+        crate::api::clear_user_repo_association_source_except_repo_ids_tx(
+            &mut tx,
+            user_id,
+            crate::api::UserRepoAssociationSource::PersonalOwned,
+            keep_repo_ids.as_slice(),
+            now.as_str(),
+        )
+        .await
+        .context("clear personal_owned repo associations before owned snapshot refresh")?;
 
         if current_owned_repo_ids.is_empty() {
             sqlx::query(
@@ -12418,10 +12420,12 @@ async fn replace_starred_repos_with_priority(
         .begin_immediate_with_priority(&state.pool, lane, priority)
         .await
         .context("begin replace starred_repos tx")?;
-    crate::api::clear_user_repo_association_source_tx(
+    let keep_repo_ids = repos.iter().map(|repo| repo.repo_id).collect::<Vec<_>>();
+    crate::api::clear_user_repo_association_source_except_repo_ids_tx(
         &mut tx,
         user_id,
         crate::api::UserRepoAssociationSource::GitHubStar,
+        keep_repo_ids.as_slice(),
         now.as_str(),
     )
     .await
@@ -17267,6 +17271,69 @@ mod tests {
         assert_eq!(history_rows[1].1.as_deref(), Some("octo/alpha"));
         assert_eq!(history_rows[1].2, "octocat");
         assert_eq!(history_rows[1].3, "2026-03-06T10:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn repeated_social_snapshot_only_updates_association_observation_once() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-association-delta");
+        seed_user(&pool, user_id.as_str()).await;
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE association_update_audit (
+              id INTEGER PRIMARY KEY
+            );
+            CREATE TRIGGER test_association_update_audit
+            AFTER UPDATE ON user_repo_associations BEGIN
+              INSERT INTO association_update_audit (id) VALUES (NULL);
+            END;
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("install association update audit trigger");
+
+        let repo = OwnedRepoSnapshot {
+            repo_id: 42,
+            full_name: "octo/alpha".to_owned(),
+            is_private: false,
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
+            repo_stargazer_count: None,
+        };
+        apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            std::slice::from_ref(&repo),
+            &[(repo.clone(), vec![])],
+            &[],
+        )
+        .await
+        .expect("apply initial association snapshot");
+        let first_audit_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM association_update_audit")
+                .fetch_one(&pool)
+                .await
+                .expect("count initial association updates");
+        assert_eq!(first_audit_count, 0);
+
+        apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            std::slice::from_ref(&repo),
+            &[(repo.clone(), vec![])],
+            &[],
+        )
+        .await
+        .expect("apply repeated association snapshot");
+        let repeated_audit_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM association_update_audit")
+                .fetch_one(&pool)
+                .await
+                .expect("count repeated association updates");
+        assert_eq!(repeated_audit_count, 1);
     }
 
     #[tokio::test]

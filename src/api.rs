@@ -14258,6 +14258,59 @@ pub(crate) async fn upsert_user_repo_association_tx(
           has_github_star_source = MAX(user_repo_associations.has_github_star_source, excluded.has_github_star_source),
           has_manual_feed_source = MAX(user_repo_associations.has_manual_feed_source, excluded.has_manual_feed_source),
           updated_at = excluded.updated_at
+        WHERE COALESCE(excluded.repo_id, user_repo_associations.repo_id) IS NOT user_repo_associations.repo_id
+           OR excluded.repo_full_name IS NOT user_repo_associations.repo_full_name
+           OR excluded.owner_login IS NOT user_repo_associations.owner_login
+           OR excluded.repo_name IS NOT user_repo_associations.repo_name
+           OR COALESCE(excluded.html_url, user_repo_associations.html_url) IS NOT user_repo_associations.html_url
+           OR COALESCE(excluded.description, user_repo_associations.description) IS NOT user_repo_associations.description
+           OR COALESCE(excluded.is_private, user_repo_associations.is_private) IS NOT user_repo_associations.is_private
+           OR COALESCE(excluded.owner_avatar_url, user_repo_associations.owner_avatar_url) IS NOT user_repo_associations.owner_avatar_url
+           OR COALESCE(excluded.open_graph_image_url, user_repo_associations.open_graph_image_url) IS NOT user_repo_associations.open_graph_image_url
+           OR CASE
+                WHEN excluded.owner_avatar_url IS NOT NULL
+                  OR excluded.open_graph_image_url IS NOT NULL
+                  OR excluded.uses_custom_open_graph_image != 0
+                  THEN excluded.uses_custom_open_graph_image
+                ELSE user_repo_associations.uses_custom_open_graph_image
+              END IS NOT user_repo_associations.uses_custom_open_graph_image
+           OR CASE
+                WHEN excluded.first_associated_at < user_repo_associations.first_associated_at
+                  OR (
+                    excluded.first_associated_at = user_repo_associations.first_associated_at
+                    AND CASE excluded.first_source
+                      WHEN 'personal_owned' THEN 0
+                      WHEN 'github_star' THEN 1
+                      ELSE 2
+                    END < CASE user_repo_associations.first_source
+                      WHEN 'personal_owned' THEN 0
+                      WHEN 'github_star' THEN 1
+                      ELSE 2
+                    END
+                  )
+                  THEN excluded.first_source
+                ELSE user_repo_associations.first_source
+              END IS NOT user_repo_associations.first_source
+           OR CASE
+                WHEN excluded.first_associated_at < user_repo_associations.first_associated_at
+                  THEN excluded.first_associated_at
+                ELSE user_repo_associations.first_associated_at
+              END IS NOT user_repo_associations.first_associated_at
+           OR CASE
+                WHEN excluded.last_seen_at > user_repo_associations.last_seen_at
+                  THEN excluded.last_seen_at
+                ELSE user_repo_associations.last_seen_at
+              END IS NOT user_repo_associations.last_seen_at
+           OR CASE
+                WHEN user_repo_associations.follow_state_source = 'user_explicit'
+                  THEN user_repo_associations.is_following
+                WHEN excluded.is_following != 0
+                  THEN 1
+                ELSE user_repo_associations.is_following
+              END IS NOT user_repo_associations.is_following
+           OR MAX(user_repo_associations.has_personal_owned_source, excluded.has_personal_owned_source) IS NOT user_repo_associations.has_personal_owned_source
+           OR MAX(user_repo_associations.has_github_star_source, excluded.has_github_star_source) IS NOT user_repo_associations.has_github_star_source
+           OR MAX(user_repo_associations.has_manual_feed_source, excluded.has_manual_feed_source) IS NOT user_repo_associations.has_manual_feed_source
         "#,
     )
     .bind(local_id::generate_local_id())
@@ -14289,10 +14342,11 @@ pub(crate) async fn upsert_user_repo_association_tx(
     Ok(())
 }
 
-pub(crate) async fn clear_user_repo_association_source_tx(
+pub(crate) async fn clear_user_repo_association_source_except_repo_ids_tx(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     user_id: &str,
     source: UserRepoAssociationSource,
+    keep_repo_ids: &[i64],
     now: &str,
 ) -> Result<(), sqlx::Error> {
     let column = match source {
@@ -14300,46 +14354,78 @@ pub(crate) async fn clear_user_repo_association_source_tx(
         UserRepoAssociationSource::GitHubStar => "has_github_star_source",
         UserRepoAssociationSource::ManualFeed => "has_manual_feed_source",
     };
-    let sql =
-        format!("UPDATE user_repo_associations SET {column} = 0, updated_at = ? WHERE user_id = ?");
-    sqlx::query(sql.as_str())
-        .bind(now)
-        .bind(user_id)
-        .execute(&mut **tx)
-        .await?;
 
-    sqlx::query(
+    let mut source_update = QueryBuilder::<Sqlite>::new(format!(
+        "UPDATE user_repo_associations SET {column} = 0, updated_at = "
+    ));
+    source_update
+        .push_bind(now)
+        .push(" WHERE user_id = ")
+        .push_bind(user_id)
+        .push(" AND ")
+        .push(column)
+        .push(" != 0");
+    push_association_repo_exclusion(&mut source_update, keep_repo_ids);
+    source_update.build().execute(&mut **tx).await?;
+
+    let mut follow_update = QueryBuilder::<Sqlite>::new(
         r#"
         UPDATE user_repo_associations
         SET is_following = CASE
               WHEN has_personal_owned_source != 0 OR has_github_star_source != 0 THEN 1
               ELSE 0
             END,
-            updated_at = ?
-        WHERE user_id = ?
-          AND follow_state_source = 'system_default'
+            updated_at =
         "#,
-    )
-    .bind(now)
-    .bind(user_id)
-    .execute(&mut **tx)
-    .await?;
+    );
+    follow_update
+        .push_bind(now)
+        .push(" WHERE user_id = ")
+        .push_bind(user_id)
+        .push(
+            r#"
+          AND follow_state_source = 'system_default'
+          AND is_following IS NOT (CASE
+                WHEN has_personal_owned_source != 0 OR has_github_star_source != 0 THEN 1
+                ELSE 0
+              END)
+        "#,
+        );
+    push_association_repo_exclusion(&mut follow_update, keep_repo_ids);
+    follow_update.build().execute(&mut **tx).await?;
 
-    sqlx::query(
+    let mut delete = QueryBuilder::<Sqlite>::new(
         r#"
         DELETE FROM user_repo_associations
-        WHERE user_id = ?
+        WHERE user_id =
+        "#,
+    );
+    delete.push_bind(user_id).push(
+        r#"
           AND has_personal_owned_source = 0
           AND has_github_star_source = 0
           AND has_manual_feed_source = 0
           AND is_following = 0
         "#,
-    )
-    .bind(user_id)
-    .execute(&mut **tx)
-    .await?;
+    );
+    push_association_repo_exclusion(&mut delete, keep_repo_ids);
+    delete.build().execute(&mut **tx).await?;
 
     Ok(())
+}
+
+fn push_association_repo_exclusion(query: &mut QueryBuilder<'_, Sqlite>, keep_repo_ids: &[i64]) {
+    if keep_repo_ids.is_empty() {
+        return;
+    }
+    query.push(" AND (repo_id IS NULL OR repo_id NOT IN (");
+    for (index, repo_id) in keep_repo_ids.iter().enumerate() {
+        if index > 0 {
+            query.push(", ");
+        }
+        query.push_bind(*repo_id);
+    }
+    query.push("))");
 }
 
 pub(crate) async fn clear_user_repo_association_source_for_repo_tx(
@@ -14356,8 +14442,9 @@ pub(crate) async fn clear_user_repo_association_source_for_repo_tx(
         UserRepoAssociationSource::ManualFeed => "has_manual_feed_source",
     };
     let matching = "user_id = ? AND (repo_id = ? OR repo_full_name_lower = lower(?))";
-    let sql =
-        format!("UPDATE user_repo_associations SET {column} = 0, updated_at = ? WHERE {matching}");
+    let sql = format!(
+        "UPDATE user_repo_associations SET {column} = 0, updated_at = ? WHERE {matching} AND {column} != 0"
+    );
     sqlx::query(sql.as_str())
         .bind(now)
         .bind(user_id)
@@ -14376,6 +14463,10 @@ pub(crate) async fn clear_user_repo_association_source_for_repo_tx(
             updated_at = ?
         WHERE {matching}
           AND follow_state_source = 'system_default'
+          AND is_following IS NOT (CASE
+                WHEN has_personal_owned_source != 0 OR has_github_star_source != 0 THEN 1
+                ELSE 0
+              END)
         "#
     );
     sqlx::query(sql.as_str())
@@ -26514,6 +26605,98 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed search repo association");
+    }
+
+    #[tokio::test]
+    async fn repo_association_upsert_skips_timestamp_only_noop() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        let input = super::UserRepoAssociationUpsert {
+            repo_id: Some(42),
+            repo_full_name: "openai/codex".to_owned(),
+            owner_login: "openai".to_owned(),
+            repo_name: "codex".to_owned(),
+            html_url: Some("https://github.com/openai/codex".to_owned()),
+            description: Some("association fixture".to_owned()),
+            is_private: Some(false),
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
+            first_associated_at: "2026-02-23T00:00:00Z".to_owned(),
+            last_seen_at: "2026-02-23T00:00:00Z".to_owned(),
+            source: super::UserRepoAssociationSource::GitHubStar,
+        };
+
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin initial association upsert");
+        super::upsert_user_repo_association_tx(
+            &mut tx,
+            user_id.as_str(),
+            &input,
+            "2026-02-23T00:00:00Z",
+        )
+        .await
+        .expect("insert association fixture");
+        tx.commit()
+            .await
+            .expect("commit initial association upsert");
+
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin repeated association upsert");
+        super::upsert_user_repo_association_tx(
+            &mut tx,
+            user_id.as_str(),
+            &input,
+            "2026-02-24T00:00:00Z",
+        )
+        .await
+        .expect("repeat association fixture");
+        tx.commit()
+            .await
+            .expect("commit repeated association upsert");
+
+        let updated_at = sqlx::query_scalar::<_, String>(
+            "SELECT updated_at FROM user_repo_associations WHERE user_id = ? AND repo_id = ?",
+        )
+        .bind(user_id.as_str())
+        .bind(42_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("read repeated association timestamp");
+        assert_eq!(updated_at, "2026-02-23T00:00:00Z");
+
+        sqlx::query(
+            "UPDATE user_repo_associations SET is_following = 0, follow_state_source = 'user_explicit', updated_at = '2026-02-24T00:00:01Z' WHERE user_id = ? AND repo_id = ?",
+        )
+        .bind(user_id.as_str())
+        .bind(42_i64)
+        .execute(&pool)
+        .await
+        .expect("set explicit follow choice");
+        let mut tx = pool.begin().await.expect("begin explicit-choice upsert");
+        super::upsert_user_repo_association_tx(
+            &mut tx,
+            user_id.as_str(),
+            &input,
+            "2026-02-25T00:00:00Z",
+        )
+        .await
+        .expect("repeat explicit-choice association fixture");
+        tx.commit().await.expect("commit explicit-choice upsert");
+
+        let follow_state = sqlx::query_as::<_, (i64, String)>(
+            "SELECT is_following, follow_state_source FROM user_repo_associations WHERE user_id = ? AND repo_id = ?",
+        )
+        .bind(user_id.as_str())
+        .bind(42_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("read explicit follow choice");
+        assert_eq!(follow_state, (0, "user_explicit".to_owned()));
     }
 
     #[tokio::test]
