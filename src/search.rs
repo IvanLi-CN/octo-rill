@@ -326,26 +326,6 @@ pub async fn query(
     parsed: &ParsedSearchQuery,
 ) -> Result<Vec<SearchResult>, ApiError> {
     let use_fts = parsed.terms.iter().any(|term| term.chars().count() >= 3);
-    let use_fts = if use_fts {
-        let ready = sqlx::query_scalar::<_, String>(
-            "SELECT status FROM search_projection_backfill_state WHERE id = 1",
-        )
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(ApiError::internal)?
-        .as_deref()
-            == Some("ready");
-        let metadata_pending = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS(SELECT 1 FROM search_metadata_backfill_queue)",
-        )
-        .fetch_one(&state.pool)
-        .await
-        .map_err(ApiError::internal)?
-            != 0;
-        ready && !metadata_pending
-    } else {
-        false
-    };
     let fts_match_query = parsed
         .terms
         .iter()
@@ -380,7 +360,9 @@ pub async fn query(
     if let Some(repo) = &parsed.repo {
         builder.push(" AND (lower(COALESCE(rm.repo_full_name, d.repo_full_name, '')) = lower(");
         builder.push_bind(repo);
-        builder.push(") OR lower(COALESCE(d.repo_full_name, '')) LIKE '%/' || lower(");
+        builder.push(
+            ") OR lower(COALESCE(rm.repo_full_name, d.repo_full_name, '')) LIKE '%/' || lower(",
+        );
         builder.push_bind(escape_like(repo));
         builder.push(") ESCAPE char(92))");
     }
@@ -397,7 +379,10 @@ pub async fn query(
     }
 
     if use_fts {
+        // Keep the readiness gate in the same snapshot as the FTS match so a
+        // concurrent metadata event cannot produce a false negative.
         builder.push(" AND (");
+        builder.push("NOT EXISTS (SELECT 1 FROM search_projection_backfill_state s WHERE s.id = 1 AND s.status = 'ready' AND NOT EXISTS (SELECT 1 FROM search_metadata_backfill_queue)) OR ");
         builder.push("d.id IN (SELECT m.document_id FROM search_documents_fts_v2 AS f JOIN search_fts_document_rows AS m ON m.fts_rowid = f.rowid WHERE search_documents_fts_v2 MATCH ");
         builder.push_bind(fts_match_query.clone());
         builder.push(") OR d.id IN (SELECT m.document_id FROM search_document_user_lanes_fts_v2 AS uf JOIN search_fts_user_lane_rows AS m ON m.fts_rowid = uf.rowid WHERE m.user_id = ");
@@ -1712,6 +1697,31 @@ mod tests {
         .await
         .expect("read release metadata after work item deletion");
         assert_eq!(after_delete, (None, None));
+    }
+
+    #[tokio::test]
+    async fn metadata_fallback_matches_current_short_repo_name() {
+        let pool = setup_pool().await;
+        seed_release(&pool).await;
+        sqlx::query(
+            "UPDATE search_projection_backfill_state SET phase = 'translations', cursor = 0, status = 'ready' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("mark search projection ready before metadata fallback");
+        seed_repo_association(&pool).await;
+
+        let results = query(
+            &setup_state(pool.clone()),
+            "search-user",
+            &parse_query("repo:rill").expect("parse short repository filter"),
+        )
+        .await
+        .expect("query current metadata short repository filter");
+        assert!(
+            results.iter().any(|result| result.id == "release:4201"),
+            "current metadata should match a short repository filter before fanout completes"
+        );
     }
 
     #[tokio::test]
