@@ -190,7 +190,7 @@ impl PublicMetricsService {
         let oldest_hour =
             hour_bucket(sampled_at - chrono::Duration::hours(SAMPLE_WINDOW_HOURS - 1));
         let retention_cutoff =
-            hour_bucket(sampled_at - chrono::Duration::hours(SAMPLE_RETENTION_HOURS));
+            hour_bucket(sampled_at - chrono::Duration::hours(SAMPLE_RETENTION_HOURS - 1));
         let observed_at = sampled_at.to_rfc3339_opts(SecondsFormat::Secs, true);
         let repository_count = aggregate.deduplicated_repositories;
         let pressure = aggregate.pressure;
@@ -313,7 +313,8 @@ async fn get_public_snapshot(
     }
 
     let Some(snapshot) = service.snapshot().await else {
-        let mut response = Response::new(Body::empty());
+        let mut response =
+            Response::new(Body::from(r#"{"error":"metrics_unavailable"}"#.to_owned()));
         *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
         response
             .headers_mut()
@@ -321,6 +322,10 @@ async fn get_public_snapshot(
         response
             .headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        );
         return response;
     };
 
@@ -545,6 +550,43 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn migrated_hourly_snapshot_table_supports_public_metrics_refresh() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        crate::database_migrations::run(&pool)
+            .await
+            .expect("apply database migrations");
+        sqlx::query(
+            r#"
+            INSERT INTO repo_refresh_governance_snapshots (
+              repo_id, repo_full_name, watcher_user_count, watcher_repo_total_sum,
+              priority_rank, target_window, target_interval_minutes, updated_at
+            ) VALUES (1, 'owner/repo', 1, 1, 1, 1, 60, '2026-01-01T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed migrated governance snapshot");
+
+        let service = PublicMetricsService::new(pool.clone(), SqliteWriteCoordinator::new());
+        let snapshot = service
+            .snapshot()
+            .await
+            .expect("refresh against migrated schema");
+        assert_eq!(snapshot.payload.deduplicated_repositories.value, 1);
+        assert_eq!(snapshot.payload.deduplicated_repositories.trend, [1]);
+        let hourly_sample_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM public_metrics_hourly_snapshots")
+                .fetch_one(&pool)
+                .await
+                .expect("count migrated hourly snapshots");
+        assert_eq!(hourly_sample_count, 1);
+    }
+
     async fn insert_repo(
         pool: &SqlitePool,
         repo_id: i64,
@@ -661,6 +703,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hourly_snapshot_retention_keeps_at_most_24_hour_buckets() {
+        let (service, pool) = test_service().await;
+        let hour_timestamp = Utc::now().timestamp().div_euclid(3600) * 3600;
+        let sampled_at = DateTime::from_timestamp(hour_timestamp, 0).expect("valid hour");
+        for hours_ago in (0..=SAMPLE_RETENTION_HOURS).rev() {
+            let observed_at = sampled_at - chrono::Duration::hours(hours_ago);
+            sqlx::query(
+                "INSERT INTO public_metrics_hourly_snapshots (sampled_hour, observed_at, deduplicated_repositories, pressure) VALUES (?, ?, 1, 0.5)",
+            )
+            .bind(hour_bucket(observed_at))
+            .bind(observed_at.to_rfc3339_opts(SecondsFormat::Secs, true))
+            .execute(&pool)
+            .await
+            .expect("seed hourly retention boundary");
+        }
+
+        service
+            .store_hourly_sample(
+                &CurrentAggregate {
+                    deduplicated_repositories: 1,
+                    pressure: 0.5,
+                    freshness: vec![4],
+                },
+                sampled_at,
+            )
+            .await
+            .expect("store current hour sample");
+
+        let sample_count =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM public_metrics_hourly_snapshots")
+                .fetch_one(&pool)
+                .await
+                .expect("count retained samples");
+        let oldest_sample = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT MIN(sampled_hour) FROM public_metrics_hourly_snapshots",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read oldest retained sample");
+
+        assert_eq!(sample_count, SAMPLE_RETENTION_HOURS);
+        assert_eq!(
+            oldest_sample,
+            Some(hour_bucket(
+                sampled_at - chrono::Duration::hours(SAMPLE_RETENTION_HOURS - 1)
+            ))
+        );
+    }
+
+    #[tokio::test]
     async fn cached_snapshot_is_reused_and_refresh_failure_keeps_last_good_data() {
         let (service, pool) = test_service().await;
         insert_repo(&pool, 1, 1, 1.0, None).await;
@@ -685,6 +777,53 @@ mod tests {
             .expect("last-known-good snapshot available");
         assert_eq!(stale.payload.deduplicated_repositories.value, 1);
         assert_eq!(stale.etag, first.etag);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_start_refreshes_write_one_hourly_sample() {
+        let (service, pool) = test_service().await;
+        insert_repo(&pool, 1, 1, 1.0, None).await;
+        sqlx::query(
+            r#"
+            CREATE TABLE public_metrics_test_writes (count INTEGER NOT NULL);
+            INSERT INTO public_metrics_test_writes (count) VALUES (0);
+            CREATE TRIGGER count_public_metrics_inserts
+            AFTER INSERT ON public_metrics_hourly_snapshots
+            BEGIN
+              UPDATE public_metrics_test_writes SET count = count + 1;
+            END;
+            CREATE TRIGGER count_public_metrics_updates
+            AFTER UPDATE ON public_metrics_hourly_snapshots
+            BEGIN
+              UPDATE public_metrics_test_writes SET count = count + 1;
+            END;
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("install refresh counter");
+
+        const REQUESTS: usize = 16;
+        let barrier = Arc::new(tokio::sync::Barrier::new(REQUESTS));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..REQUESTS {
+            let service = service.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                service.snapshot().await.expect("snapshot available")
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.expect("refresh task completes");
+        }
+
+        let refresh_writes =
+            sqlx::query_scalar::<_, i64>("SELECT count FROM public_metrics_test_writes")
+                .fetch_one(&pool)
+                .await
+                .expect("read refresh count");
+        assert_eq!(refresh_writes, 1);
     }
 
     #[tokio::test]
@@ -800,6 +939,44 @@ mod tests {
                 .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn cold_start_failure_returns_retryable_json_error() {
+        let (service, pool) = test_service().await;
+        sqlx::query("DROP TABLE repo_refresh_governance_snapshots")
+            .execute(&pool)
+            .await
+            .expect("remove aggregate source");
+        let app = router(service, Vec::new())
+            .layer(MockConnectInfo(SocketAddr::from(([192, 0, 2, 12], 8080))));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(PUBLIC_ROUTE)
+                    .body(Body::empty())
+                    .expect("build cold-start request"),
+            )
+            .await
+            .expect("cold-start response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("5"))
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/json; charset=utf-8"))
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read error response body");
+        assert_eq!(body.as_ref(), br#"{"error":"metrics_unavailable"}"#);
     }
 
     #[tokio::test]

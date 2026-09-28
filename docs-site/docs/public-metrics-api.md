@@ -45,7 +45,11 @@ GET /api/public/metrics/v1/octo-rill
 
 ## 缓存与条件请求
 
-响应带有 `ETag` 和 `Cache-Control`。后续请求可发送 `If-None-Match: <etag>`；数据未变化时返回 `304 Not Modified`。服务按需刷新并每 5 分钟后台刷新；刷新失败时继续返回最后一次成功数据。服务启动初期若尚无成功聚合结果，暂时返回 `503` 和 `Retry-After`。
+响应带有 `ETag` 和 `Cache-Control`。后续请求可发送 `If-None-Match: <etag>`；数据未变化时返回 `304 Not Modified`。服务按需刷新并每 5 分钟后台刷新；刷新失败时继续返回最后一次成功数据。首次成功聚合前若刷新失败，返回 `503`、`Retry-After: 5` 与 `Cache-Control: no-store`，响应体为不含内部错误详情的 JSON 错误码：
+
+```json
+{"error":"metrics_unavailable"}
+```
 
 每个客户端 IP 每分钟最多请求 120 次；超限返回 `429` 和 `Retry-After`。
 

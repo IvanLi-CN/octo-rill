@@ -3,7 +3,7 @@
 ## 当前状态
 
 - Lifecycle: active
-- Implementation: committed locally; visual evidence is owner-confirmed and persisted; PR publication is next.
+- Implementation: review repairs are applied, local validation passes, and refreshed visual evidence is owner-confirmed and persisted.
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -22,16 +22,16 @@
 
 ## Verification Coverage
 
-Focused Rust tests cover the public field set, metrics, freshness order, partial warm-up, 12-point ordering, stale cache fallback, CORS, ETag, GET-only behavior and rate limiting.
+Focused Rust tests cover the public field set, metrics, freshness order, partial warm-up, 12-point ordering, exact 24-hour retention, concurrent refresh coalescing, migration-backed sampling, cold-start retryable errors, stale cache fallback, CORS, ETag, GET-only behavior, rate limiting and authenticated-router isolation.
 
 - `cargo fmt --all -- --check`
 - `bash ./scripts/check-rust-source-quality.sh` on `codex-testbox` (pass)
 - `cargo check --locked` on `codex-testbox`
-- `cargo test --locked public_metrics -- --nocapture` on `codex-testbox` (`8 passed`)
+- `cargo test --locked public_metrics -- --nocapture` (`13 passed`)
 - `cd docs-site && bun run build`
-- Ego Browser: navigated from the docs home to the public metrics page and captured `1440x900` and `393x852` candidates; neither viewport has page-level horizontal overflow.
+- Ego Browser: owner-confirmed captures are persisted at `1440x900` and `393x852`; the locked base commit had no same-path image baseline.
 - `git diff --check`
 
 ## Remaining Gaps
 
-- Remote CI and review convergence have not started.
+- Remote CI/review convergence has not started.

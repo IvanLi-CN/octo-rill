@@ -28,7 +28,7 @@
 - REQ-PUBLIC-METRICS-002: `deduplicatedRepositories.value` 必须等于 `repo_refresh_governance_snapshots` 当前行数。`pressure.value` 必须沿用治理页口径 `sum(max(0, min(urgency_score, 4) - 1)) / repo_refresh_system_budget_per_window`。预算不可用或源数据无效时不得伪造成功值。
 - REQ-PUBLIC-METRICS-003: `freshness` 必须按 `priority_rank ASC, repo_id ASC` 排列；每项仅为 0 到 4 的 JSON 整数，分别表示不超过 4 小时、不超过 12 小时、不超过 24 小时、超过 24 小时和无成功记录。
 - REQ-PUBLIC-METRICS-004: 第一次成功实时聚合必须立即返回当前值并写入一个真实趋势点。每个 UTC 小时最多保留一个最新观测值；趋势最多返回 12 点，按时间升序排列。历史不足 12 点时必须返回当前真实点及已有历史点，点数可以少于 12；不得补零、插值或阻塞响应等待样本增长。样本表最多保留 24 小时。
-- REQ-PUBLIC-METRICS-005: 5 分钟缓存内复用序列化响应和 ETag；同一进程的并发过期请求只执行一次刷新。刷新预算最多 3 秒。刷新失败时返回过期 last-known-good 数据；首次刷新失败时返回无数据错误和重试提示。
+- REQ-PUBLIC-METRICS-005: 5 分钟缓存内复用序列化响应和 ETag；同一进程的并发过期请求只执行一次刷新。刷新预算最多 3 秒。刷新失败时返回过期 last-known-good 数据；首次刷新失败时返回 HTTP 503、`{"error":"metrics_unavailable"}`、`Retry-After: 5` 与 `Cache-Control: no-store`。
 - REQ-PUBLIC-METRICS-006: 支持强 ETag 与 `If-None-Match` 的 304 响应。正常响应的 HTTP 缓存策略允许 60 秒新鲜缓存与 300 秒 stale-while-revalidate。
 - REQ-PUBLIC-METRICS-007: 路由只接受 GET；HEAD 显式返回 405。匿名路由不得经过 session cookie middleware 或返回凭据，并按源 IP 限制每分钟 120 次。
 - REQ-PUBLIC-METRICS-008: 新接口 CORS 只允许 `GET` 与 `If-None-Match`，不允许 credentials；origin 来自 `OCTORILL_PUBLIC_METRICS_CORS_ORIGINS`，默认 `https://ivanli.cc,http://127.0.0.1:12620`。该策略不得放宽既有登录接口 CORS。
