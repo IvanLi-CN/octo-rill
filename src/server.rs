@@ -107,6 +107,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     warn_if_runtime_concurrency_exceeds_sqlite_pool(&config, &runtime_settings);
 
     let sqlite_writer = crate::sqlite_write::SqliteWriteCoordinator::new();
+    let public_metrics_service = Arc::new(crate::public_metrics::PublicMetricsService::new(
+        pool.clone(),
+        sqlite_writer.clone(),
+    ));
     let session_store = CoordinatedSqliteSessionStore::new(
         tower_sessions_sqlx_store::SqliteStore::new(pool.clone()),
         sqlite_writer.clone(),
@@ -528,12 +532,15 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .on_request(())
         .on_response(())
         .on_failure(());
-    let app = app.layer(
+    let public_metrics_router = crate::public_metrics::router(
+        public_metrics_service.clone(),
+        crate::config::public_metrics_cors_origins_from_env()?,
+    );
+    let app = merge_public_metrics_routes(app.layer(cors), public_metrics_router).layer(
         ServiceBuilder::new()
             .layer(set_request_id)
             .layer(trace_layer)
             .layer(access_log)
-            .layer(cors)
             .layer(propagate_request_id),
     );
 
@@ -581,6 +588,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         let llm_call_retention_abort_handle = ai::spawn_llm_call_retention_task(app_state.clone());
         let repo_governance_retention_abort_handle =
             sync::spawn_repo_refresh_governance_retention_task(app_state.clone());
+        let public_metrics_refresh_abort_handle =
+            crate::public_metrics::spawn_refresh_worker(public_metrics_service.clone());
         let llm_call_recovery_abort_handle = ai::spawn_llm_call_recovery_task(app_state.clone());
         translations::spawn_translation_scheduler(app_state.clone()).await;
         let global_content_processing_abort_handle =
@@ -596,6 +605,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             deletion_abort_handle,
             llm_call_retention_abort_handle,
             repo_governance_retention_abort_handle,
+            public_metrics_refresh_abort_handle,
             llm_call_recovery_abort_handle,
             task_recovery_abort_handle,
             repo_release_recovery_abort_handle,
@@ -608,10 +618,13 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             abort_handles.push(handle);
         }
 
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal(app_state.clone(), abort_handles))
-            .await
-            .context("http server exited")
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal(app_state.clone(), abort_handles))
+        .await
+        .context("http server exited")
     }
     .await;
 
@@ -628,6 +641,12 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     serve_result?;
 
     Ok(())
+}
+
+fn merge_public_metrics_routes(authenticated_app: Router, public_metrics_router: Router) -> Router {
+    Router::new()
+        .merge(authenticated_app)
+        .merge(public_metrics_router)
 }
 
 fn ensure_dir_exists(path: &Path) -> Result<()> {
@@ -1040,12 +1059,13 @@ mod tests {
         AppConfig, SESSION_COOKIE_MAX_AGE_SECS, SameSite, accepts_html_document, api_health,
         api_version, apply_no_store_headers, attach_static_site_routes, build_session_cookie_name,
         build_sqlite_connect_options, build_sqlite_pool_options, is_hashed_pwa_asset_path,
-        looks_like_static_asset_path, read_sqlite_runtime_pragmas, session_inactivity_expiry,
-        should_serve_spa_shell,
+        looks_like_static_asset_path, merge_public_metrics_routes, read_sqlite_runtime_pragmas,
+        session_inactivity_expiry, should_serve_spa_shell,
     };
     use axum::{
         Router,
         body::Body,
+        extract::connect_info::MockConnectInfo,
         http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri, header},
         middleware,
         routing::get,
@@ -1058,6 +1078,7 @@ mod tests {
         time::SystemTime,
     };
     use tower::{ServiceBuilder, ServiceExt};
+    use tower_http::cors::CorsLayer;
     use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -1084,6 +1105,18 @@ mod tests {
             }
             None => StatusCode::UNAUTHORIZED,
         }
+    }
+
+    async fn mark_authenticated_router(
+        request: Request<Body>,
+        next: middleware::Next,
+    ) -> axum::response::Response {
+        let mut response = next.run(request).await;
+        response.headers_mut().insert(
+            "x-test-authenticated-router",
+            HeaderValue::from_static("entered"),
+        );
+        response
     }
 
     fn test_session_layer(cookie_name: &'static str) -> SessionManagerLayer<MemoryStore> {
@@ -1445,6 +1478,64 @@ mod tests {
             .expect("clear set-cookie header");
         assert!(clear_cookie.contains("octo_rill_sid_test="));
         assert!(clear_cookie.contains("Max-Age=0"));
+    }
+
+    #[tokio::test]
+    async fn public_metrics_route_is_outside_authenticated_session_and_credential_cors() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        let service = Arc::new(crate::public_metrics::PublicMetricsService::new(
+            pool,
+            crate::sqlite_write::SqliteWriteCoordinator::new(),
+        ));
+        let origin = HeaderValue::from_static("https://metrics.example.com");
+        let authenticated_app = Router::new()
+            .route("/api/private", get(|| async { StatusCode::OK }))
+            .layer(test_session_layer("octo_rill_sid_test"))
+            .layer(middleware::from_fn(mark_authenticated_router))
+            .layer(
+                CorsLayer::new()
+                    .allow_origin(origin.clone())
+                    .allow_credentials(true),
+            );
+        let public_metrics_router = crate::public_metrics::router(service, vec![origin.clone()]);
+        let app = merge_public_metrics_routes(authenticated_app, public_metrics_router).layer(
+            MockConnectInfo(std::net::SocketAddr::from(([192, 0, 2, 13], 8080))),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::public_metrics::PUBLIC_ROUTE)
+                    .header(header::ORIGIN, origin)
+                    .header(header::COOKIE, "octo_rill_sid_test=unknown-session")
+                    .body(Body::empty())
+                    .expect("build public metrics request"),
+            )
+            .await
+            .expect("public metrics response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("https://metrics.example.com"))
+        );
+        assert!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .is_none()
+        );
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+        assert!(
+            response
+                .headers()
+                .get("x-test-authenticated-router")
+                .is_none()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

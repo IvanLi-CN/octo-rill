@@ -6,10 +6,58 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use axum::http::HeaderValue;
 use url::Url;
 
 use crate::crypto::EncryptionKey;
 use crate::observability::LoggingThresholds;
+
+const DEFAULT_PUBLIC_METRICS_CORS_ORIGINS: &str = "https://ivanli.cc,http://127.0.0.1:12620";
+
+pub fn public_metrics_cors_origins_from_env() -> Result<Vec<HeaderValue>> {
+    let configured = env::var("OCTORILL_PUBLIC_METRICS_CORS_ORIGINS")
+        .unwrap_or_else(|_| DEFAULT_PUBLIC_METRICS_CORS_ORIGINS.to_owned());
+    parse_public_metrics_cors_origins(&configured)
+}
+
+fn parse_public_metrics_cors_origins(configured: &str) -> Result<Vec<HeaderValue>> {
+    let entries = configured.split(',').map(str::trim).collect::<Vec<_>>();
+    if entries.is_empty() || entries.iter().any(|origin| origin.is_empty()) {
+        anyhow::bail!(
+            "invalid OCTORILL_PUBLIC_METRICS_CORS_ORIGINS (expected comma-separated HTTP origins)"
+        );
+    }
+
+    let mut origins = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry == "*" {
+            anyhow::bail!(
+                "invalid OCTORILL_PUBLIC_METRICS_CORS_ORIGINS (wildcard origins are not allowed)"
+            );
+        }
+        let url = Url::parse(entry)
+            .context("invalid OCTORILL_PUBLIC_METRICS_CORS_ORIGINS (expected URL origin)")?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            anyhow::bail!(
+                "invalid OCTORILL_PUBLIC_METRICS_CORS_ORIGINS (expected bare HTTP origin)"
+            );
+        }
+        let normalized = url.origin().ascii_serialization();
+        let header_value = HeaderValue::from_str(&normalized)
+            .context("invalid OCTORILL_PUBLIC_METRICS_CORS_ORIGINS header value")?;
+        if !origins.contains(&header_value) {
+            origins.push(header_value);
+        }
+    }
+    Ok(origins)
+}
 
 fn ensure_trailing_slash(mut url: Url) -> Url {
     if !url.path().ends_with('/') {
@@ -372,6 +420,36 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    #[test]
+    fn public_metrics_cors_origins_accept_bare_http_origins_and_reject_wildcards() {
+        let origins = parse_public_metrics_cors_origins(
+            " https://ivanli.cc/ ,http://127.0.0.1:12620,https://ivanli.cc ",
+        )
+        .expect("valid CORS origins");
+        assert_eq!(
+            origins
+                .iter()
+                .map(|origin| origin.to_str().expect("ASCII origin"))
+                .collect::<Vec<_>>(),
+            ["https://ivanli.cc", "http://127.0.0.1:12620"]
+        );
+        assert!(parse_public_metrics_cors_origins("*").is_err());
+        assert!(parse_public_metrics_cors_origins("https://ivanli.cc/path").is_err());
+    }
+
+    #[test]
+    fn public_metrics_cors_origins_use_documented_defaults() {
+        let _guard = env_lock().lock().expect("lock env");
+        unsafe {
+            env::remove_var("OCTORILL_PUBLIC_METRICS_CORS_ORIGINS");
+        }
+
+        let origins = public_metrics_cors_origins_from_env().expect("default CORS origins");
+        assert_eq!(origins.len(), 2);
+        assert_eq!(origins[0], "https://ivanli.cc");
+        assert_eq!(origins[1], "http://127.0.0.1:12620");
+    }
+
     fn set_required_env() {
         unsafe {
             env::set_var(
@@ -393,6 +471,7 @@ mod tests {
             env::remove_var("OCTORILL_HTTP_SLOW_MS");
             env::remove_var("OCTORILL_UPSTREAM_SLOW_MS");
             env::remove_var("OCTORILL_SQLITE_WRITE_SLOW_MS");
+            env::remove_var("OCTORILL_PUBLIC_METRICS_CORS_ORIGINS");
             env::remove_var("LINUXDO_CLIENT_ID");
             env::remove_var("LINUXDO_CLIENT_SECRET");
             env::remove_var("LINUXDO_OAUTH_REDIRECT_URL");
