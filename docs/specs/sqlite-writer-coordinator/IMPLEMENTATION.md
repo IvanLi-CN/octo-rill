@@ -33,7 +33,7 @@
 - admin runtime settings 的 seed/backfill/update、LLM recovery flags 与 model health、translation runtime settings 均通过共享 `AppState.sqlite_writer` 写入；生产启动和 runtime heartbeat 不再调用 raw pool writer。
 - translation worker runtime slot reconciliation 与 worker removal 的 production internal helpers 现在要求非可选 `&SqliteWriteCoordinator`，删除了 `Option<&SqliteWriteCoordinator>` 的 raw `BEGIN IMMEDIATE` fallback；仅 test-only convenience wrappers 创建局部 coordinator。
 - reaction PAT state、dashboard daily rollup、scheduled slot patch 与 public release usage metadata refresh 均进入明确的 foreground/background writer lane，补齐 API 与高频 sync metadata 的遗漏写路径。
-- `tools/rust-source-check` 为 `src/admin_runtime.rs`、`src/ai.rs`、`src/api.rs`、`src/jobs.rs`、`src/sync.rs` 与 `src/translations.rs` 增加 AST guard：生产 direct pool execute/raw `BEGIN IMMEDIATE` 失败，`cfg(test)`、bootstrap/read-only 范围和经过 review 的窄例外保持显式边界；已知的 subscription prune coordinator wrapper 作为结构化安全边界处理。
+- `tools/rust-source-check` 为 `src/admin_runtime.rs`、`src/ai.rs`、`src/api.rs`、`src/jobs.rs`、`src/sync.rs` 与 `src/translations.rs` 增加 AST guard：生产 direct pool execute/raw `BEGIN IMMEDIATE` 失败，`cfg(test)`、bootstrap/read-only 范围保持显式边界；subscription prune facade 只有在 marker 与 coordinator 调用同时通过 AST 验证时才作为结构化安全边界处理。
 - 网络、GitHub API、AI 调用与长耗时处理仍留在 writer permit 外；permit 只包住 SQLite 写入段。
 
 ## Validation
@@ -54,6 +54,7 @@
 - `src/translations.rs` 新增 batch 启动写段在 writer 压力下串行化回归，以及结果聚合在 writer 背压下直接复用 pending 快照的回归。
 - `src/sync.rs` 新增 social activity snapshot 与 feed activity event 在 competing writer 下等待并成功提交的并发回归。
 - `src/api.rs` 新增 feed reaction refresh 在 SQLite writer 压力下跳过持久化但继续返回 live item 的回归。
+- `src/api.rs` 新增 reaction PAT check result 在 foreground writer 压力下等待 coordinator 后提交的回归，并为 best-effort PAT state persistence 失败保留结构化 warning。
 - `src/sync.rs` 新增 governance rebuild 对超过 500 个候选 repo 的 chunk stats 回归，并保留 active member reconciliation 语义回归。
 - `src/sync.rs` 新增 social snapshot 在第一个 writer chunk 后释放 permit 的回归，以及 397 个 owned repo association、100000 条 search document 共存时 dashboard updates、session save、task enqueue 与 snapshot chunk 指标的生产形验证。
 - `src/jobs.rs` 新增后台 writer 压力下 `enqueue_task` 等待 coordinator 而不是绕过写入背压的回归测试。

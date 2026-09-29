@@ -15593,6 +15593,25 @@ async fn persist_reaction_pat_check_result(
     Ok(())
 }
 
+async fn persist_reaction_pat_check_result_best_effort(
+    state: &AppState,
+    user_id: &str,
+    check_state: &str,
+    check_message: Option<&str>,
+) {
+    if let Err(err) =
+        persist_reaction_pat_check_result(state, user_id, check_state, check_message).await
+    {
+        tracing::warn!(
+            event = "sqlite.write",
+            operation = "reaction_pat_check_result_update",
+            downgrade_reason = "persistence_failed",
+            error = %err,
+            "failed to persist reaction PAT check result"
+        );
+    }
+}
+
 async fn clear_reaction_pat_scope_observation(
     state: &AppState,
     user_id: &str,
@@ -19194,7 +19213,7 @@ pub async fn refresh_feed_reactions(
             return Ok(Json(FeedReactionRefreshResponse { items: Vec::new() }));
         }
         Err(err) if err.code() == "pat_invalid" => {
-            let _ = persist_reaction_pat_check_result(
+            persist_reaction_pat_check_result_best_effort(
                 state.as_ref(),
                 &user_id,
                 "invalid",
@@ -19210,7 +19229,7 @@ pub async fn refresh_feed_reactions(
     let live = match fetch_live_release_reactions(state.as_ref(), &token, &node_ids).await {
         Ok(live) => live,
         Err(err) if err.code() == "reauth_required" => {
-            let _ = persist_reaction_pat_check_result(
+            persist_reaction_pat_check_result_best_effort(
                 state.as_ref(),
                 &user_id,
                 "invalid",
@@ -19473,7 +19492,7 @@ pub async fn toggle_release_reaction(
             ));
         }
         Err(err) if err.code() == "pat_invalid" => {
-            let _ = persist_reaction_pat_check_result(
+            persist_reaction_pat_check_result_best_effort(
                 state.as_ref(),
                 &user_id,
                 "invalid",
@@ -19525,7 +19544,7 @@ pub async fn toggle_release_reaction(
         match fetch_live_release_reactions(state.as_ref(), &token, &[node_id.to_owned()]).await {
             Ok(v) => v,
             Err(err) if err.code() == "reauth_required" => {
-                let _ = persist_reaction_pat_check_result(
+                persist_reaction_pat_check_result_best_effort(
                     state.as_ref(),
                     &user_id,
                     "invalid",
@@ -19562,7 +19581,7 @@ pub async fn toggle_release_reaction(
         {
             Ok(v) => v,
             Err(err) if err.code() == "reauth_required" => {
-                let _ = persist_reaction_pat_check_result(
+                persist_reaction_pat_check_result_best_effort(
                     state.as_ref(),
                     &user_id,
                     "invalid",
@@ -19577,9 +19596,13 @@ pub async fn toggle_release_reaction(
             }
             Err(err) => return Err(err),
         };
-    let _ =
-        persist_reaction_pat_check_result(state.as_ref(), &user_id, "valid", Some("PAT is valid"))
-            .await;
+    persist_reaction_pat_check_result_best_effort(
+        state.as_ref(),
+        &user_id,
+        "valid",
+        Some("PAT is valid"),
+    )
+    .await;
     persist_release_reaction_counts(state.as_ref(), row.release_id, &updated.counts).await?;
 
     Ok(Json(ToggleReleaseReactionResponse {
@@ -26168,6 +26191,7 @@ mod tests {
 
     use chrono::{Datelike, TimeZone};
 
+    #[rustfmt::skip]
     use super::{
         ACCESS_SYNC_REASON_INACTIVE_OVER_1H, ADMIN_DASHBOARD_PREAGGREGATE_DAYS,
         ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT, ADMIN_TASK_DETAIL_EVENT_LIMIT, AdminDashboardQuery,
@@ -26215,12 +26239,12 @@ mod tests {
         parse_feed_types, parse_llm_models, parse_positive_admin_concurrency,
         parse_release_id_param, parse_release_smart_summary_payload,
         parse_repo_full_name_from_release_url, parse_translation_json, parse_unique_release_ids,
-        parse_unique_thread_ids, prepare_release_batch, prepare_repo_scope_public_repo_access,
-        preserve_chunk_edge_newlines, public_get_repo_release_detail, public_list_repo_releases,
-        public_list_repo_releases_http, publish_repo_public_release,
-        refresh_admin_dashboard_rollups, refresh_feed_reactions, release_cache_entry_reusable,
-        release_detail_source_hash, release_detail_translation_ready, release_excerpt,
-        release_feed_body, release_reactions_status, release_smart_body_prompt,
+        parse_unique_thread_ids, persist_reaction_pat_check_result, prepare_release_batch,
+        prepare_repo_scope_public_repo_access, preserve_chunk_edge_newlines,
+        public_get_repo_release_detail, public_list_repo_releases, public_list_repo_releases_http,
+        publish_repo_public_release, refresh_admin_dashboard_rollups, refresh_feed_reactions,
+        release_cache_entry_reusable, release_detail_source_hash, release_detail_translation_ready,
+        release_excerpt, release_feed_body, release_reactions_status, release_smart_body_prompt,
         release_smart_diff_prompt, require_active_user_id, require_business_user_id,
         resolve_release_full_name, search, should_retry_public_compare_without_auth,
         smart_error_is_retryable, split_markdown_chunks, summarize_release_smart_candidate_with_ai,
@@ -36240,6 +36264,70 @@ line two",
                 .await
                 .expect("load stored reaction count");
         assert_eq!(stored_plus1, 0);
+    }
+
+    #[tokio::test]
+    async fn reaction_pat_check_result_waits_for_foreground_writer() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        sqlx::query(
+            r#"
+            INSERT INTO reaction_pat_tokens (
+              user_id, token_ciphertext, token_nonce, masked_token,
+              last_check_state, updated_at
+            ) VALUES (?, ?, ?, ?, 'unknown', ?)
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(vec![0_u8])
+        .bind(vec![0_u8])
+        .bind("ghp_...oken")
+        .bind("2026-02-23T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed reaction PAT");
+        let state = setup_state(pool.clone());
+        let held_writer = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "test_reaction_pat_foreground_pressure",
+                crate::sqlite_write::SqliteWritePriority::Background,
+            )
+            .await
+            .expect("hold sqlite writer");
+        let persist_state = state.clone();
+        let persist_user_id = user_id.clone();
+        let persist = tokio::spawn(async move {
+            persist_reaction_pat_check_result(
+                persist_state.as_ref(),
+                &persist_user_id,
+                "invalid",
+                Some("PAT is invalid or expired"),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !persist.is_finished(),
+            "reaction PAT check result bypassed foreground coordinator"
+        );
+        drop(held_writer);
+        tokio::time::timeout(std::time::Duration::from_secs(1), persist)
+            .await
+            .expect("reaction PAT persistence should finish after writer release")
+            .expect("join reaction PAT persistence")
+            .expect("persist reaction PAT check result");
+
+        let state_row: (String, Option<String>) = sqlx::query_as(
+            "SELECT last_check_state, last_check_message FROM reaction_pat_tokens WHERE user_id = ?",
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load reaction PAT check result");
+        assert_eq!(state_row.0, "invalid");
+        assert_eq!(state_row.1.as_deref(), Some("PAT is invalid or expired"));
     }
 
     #[tokio::test]

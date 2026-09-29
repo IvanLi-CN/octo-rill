@@ -24,7 +24,7 @@
 - 大集合重建类写入不得把全量 delete/upsert/reconcile 包在单个 writer permit 内；必须先完成读侧候选聚合，再用固定 chunk 的短事务提交写入，并记录 chunk count 与最大 chunk elapsed。
 - coordinator 必须区分 `foreground`、`background`、`best_effort` 语义，保证用户可见写入不会长期排在后台 heartbeat/finalize 后面。
 - 生产高竞争写入必须通过共享 `SqliteWriteCoordinator` 或明确的内部协调 facade；运行时配置、LLM health/recovery、translation worker runtime slot、jobs lifecycle、repo release sync state 与高频 sync metadata 不得保留直接池写入或可选 writer fallback。
-- 源代码质量检查必须在已审计生产模块中拒绝绕过 coordinator 的 `SqlitePool::execute` 与 raw `BEGIN IMMEDIATE`；测试专用、迁移/bootstrap 与纯读代码不属于该写入守门范围，任何受保护模块中的 direct-write 例外必须有窄范围审查标记。
+- 源代码质量检查必须在已审计生产模块中拒绝绕过 coordinator 的 `SqlitePool::execute` 与 raw `BEGIN IMMEDIATE`；测试专用、迁移/bootstrap 与纯读代码不属于该写入守门范围，coordinator facade callback 只有在声明 marker 且实现被 AST 验证确实调用 coordinator 时才可放行。
 - SQLite busy/locked 必须作为可恢复背压处理，经过有界退避重试后再决定是否失败。
 - `last_active_at` 等用户热路径 best-effort 写入不得等待后台 writer 排队，也不得把 `/api/me` 类请求打成 500。
 - 对已有 pending 合同的读取接口，若结果表已经存在当前 source hash 的 `queued/running` 状态，则允许在 writer 压力下直接复用该快照，不得为了重复 resolve 再强制进入新的写事务。
@@ -95,7 +95,7 @@
 
 ### REQ-SQLITE-WRITER-010
 
-- `scripts/check-rust-source-quality.sh` 使用 AST source guard 检查受保护生产模块；新增 direct pool write 必须失败，除非属于 test-only/bootstrap/read-only 语义或带有经过 review 的窄范围例外标记。
+- `scripts/check-rust-source-quality.sh` 使用 AST source guard 检查受保护生产模块；新增 direct pool write 必须失败，除非属于 test-only/bootstrap/read-only 语义，或位于经过 AST 验证的 coordinator facade callback 内。
 
 ### SHOULD
 
@@ -177,7 +177,7 @@
 
 - Given production code adds a direct `SqlitePool::execute` or raw `BEGIN IMMEDIATE` in an audited module
   When `scripts/check-rust-source-quality.sh` runs
-  Then the AST guard fails with the source location until the write is moved behind the coordinator or a reviewed narrow exception is documented.
+  Then the AST guard fails with the source location until the write is moved behind the coordinator or a verified coordinator facade boundary is declared.
 
 - Given translation runtime reconciliation runs in production or in a test fixture
   When it updates running batch worker slots
@@ -199,7 +199,7 @@
 
 ### VER-SQLITE-WRITER-003
 
-- Method: source checker unit tests plus a full AST scan of the audited production modules, and targeted runtime tests for admin settings, LLM health/recovery, translation worker slots, and high-frequency metadata writes.
+- Method: source checker unit tests plus a full AST scan of the audited production modules, targeted runtime tests for admin settings (`admin_patch_llm_runtime_config_preserves_saved_model_limit_when_field_is_omitted`), LLM health/recovery (`llm_model_health_round_trips_and_rejects_unknown_failure_classes`), translation worker slots (`runtime_resize_updates_running_batch_slot_metadata`), and high-frequency metadata (`reaction_pat_check_result_waits_for_foreground_writer`, `refresh_feed_reactions_skips_persist_failure_under_sqlite_write_pressure`).
 - covers: REQ-SQLITE-WRITER-008, REQ-SQLITE-WRITER-009, REQ-SQLITE-WRITER-010
 - Pass condition: production writes use the shared coordinator with an explicit lane, the translation runtime has no optional writer fallback, direct pool writes are rejected by the checker, and test-only/bootstrap/read-only exceptions remain documented and bounded.
 

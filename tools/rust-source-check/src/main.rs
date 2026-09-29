@@ -1,12 +1,14 @@
 use std::{
     collections::BTreeMap,
+    collections::BTreeSet,
     env, fs,
     path::{Path, PathBuf},
 };
 
 use serde::Deserialize;
 use syn::{
-    Attribute, Expr, ExprCall, ExprMethodCall, File, Item, ItemFn, ItemMod, Meta,
+    Attribute, Block, Expr, ExprCall, ExprMethodCall, File, Item, ItemFn, ItemMod, Local, Meta,
+    Pat,
     spanned::Spanned,
     visit::{self, Visit},
 };
@@ -24,9 +26,10 @@ struct SourceVisitor {
     suppressions: Vec<String>,
     structural_issues: Vec<String>,
     sqlite_write_issues: Vec<String>,
-    source_lines: Vec<String>,
     test_only_depth: usize,
     sqlite_writer_closure_depth: usize,
+    pool_aliases: BTreeSet<String>,
+    coordinator_facade_functions: BTreeSet<String>,
 }
 
 impl<'ast> Visit<'ast> for SourceVisitor {
@@ -53,6 +56,27 @@ impl<'ast> Visit<'ast> for SourceVisitor {
         self.test_only_depth = previous_test_only_depth;
     }
 
+    fn visit_block(&mut self, block: &'ast Block) {
+        let previous_pool_aliases = self.pool_aliases.clone();
+        visit::visit_block(self, block);
+        self.pool_aliases = previous_pool_aliases;
+    }
+
+    fn visit_local(&mut self, local: &'ast Local) {
+        let is_pool_alias = local
+            .init
+            .as_ref()
+            .is_some_and(|init| expression_mentions_pool(&init.expr, &self.pool_aliases));
+        visit::visit_local(self, local);
+        if let Pat::Ident(pattern) = &local.pat {
+            if is_pool_alias {
+                self.pool_aliases.insert(pattern.ident.to_string());
+            } else {
+                self.pool_aliases.remove(&pattern.ident.to_string());
+            }
+        }
+    }
+
     fn visit_expr_method_call(&mut self, expression: &'ast ExprMethodCall) {
         let method = expression.method.to_string();
         let is_sqlite_writer_call = is_sqlite_writer_expression(&expression.receiver)
@@ -62,9 +86,8 @@ impl<'ast> Visit<'ast> for SourceVisitor {
             );
 
         if self.test_only_depth == 0
-            && is_direct_pool_write(expression)
+            && is_direct_pool_write(expression, &self.pool_aliases)
             && self.sqlite_writer_closure_depth == 0
-            && !self.has_sqlite_guard_exception(expression)
         {
             self.sqlite_write_issues.push(format!(
                 "{}:{}: direct SQLite pool write must use SqliteWriteCoordinator",
@@ -100,7 +123,10 @@ impl<'ast> Visit<'ast> for SourceVisitor {
                     .path
                     .segments
                     .last()
-                    .is_some_and(|segment| segment.ident == "run_subscription_prune_phase")
+                    .is_some_and(|segment| {
+                        self.coordinator_facade_functions
+                            .contains(&segment.ident.to_string())
+                    })
         );
 
         if is_sqlite_writer_wrapper {
@@ -233,20 +259,28 @@ fn has_cfg_test(attributes: &[Attribute]) -> bool {
         else {
             return false;
         };
-        predicates.iter().any(cfg_predicate_contains_test)
+        predicates.iter().any(cfg_predicate_is_test_only)
     })
 }
 
-fn cfg_predicate_contains_test(predicate: &Meta) -> bool {
+fn cfg_predicate_is_test_only(predicate: &Meta) -> bool {
     match predicate {
         Meta::Path(path) => path.is_ident("test"),
-        Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => {
+        Meta::List(list) if list.path.is_ident("all") => {
             let Ok(predicates) = list.parse_args_with(
                 syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
             ) else {
                 return false;
             };
-            predicates.iter().any(cfg_predicate_contains_test)
+            predicates.iter().any(cfg_predicate_is_test_only)
+        }
+        Meta::List(list) if list.path.is_ident("any") => {
+            let Ok(predicates) = list.parse_args_with(
+                syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated,
+            ) else {
+                return false;
+            };
+            !predicates.is_empty() && predicates.iter().all(cfg_predicate_is_test_only)
         }
         Meta::List(_) | Meta::NameValue(_) => false,
     }
@@ -269,30 +303,36 @@ fn is_sqlite_writer_expression(expression: &Expr) -> bool {
     }
 }
 
-fn expression_mentions_pool(expression: &Expr) -> bool {
+fn expression_mentions_pool(expression: &Expr, pool_aliases: &BTreeSet<String>) -> bool {
     match expression {
         Expr::Field(field) => {
             matches!(&field.member, syn::Member::Named(member) if member == "pool")
-                || expression_mentions_pool(&field.base)
+                || expression_mentions_pool(&field.base, pool_aliases)
         }
-        Expr::Path(path) => path
-            .path
-            .segments
-            .last()
-            .is_some_and(|segment| segment.ident == "pool"),
-        Expr::Reference(reference) => expression_mentions_pool(&reference.expr),
-        Expr::Paren(paren) => expression_mentions_pool(&paren.expr),
+        Expr::Path(path) => path.path.segments.last().is_some_and(|segment| {
+            segment.ident == "pool" || pool_aliases.contains(&segment.ident.to_string())
+        }),
+        Expr::MethodCall(call) => expression_mentions_pool(&call.receiver, pool_aliases),
+        Expr::Reference(reference) => expression_mentions_pool(&reference.expr, pool_aliases),
+        Expr::Paren(paren) => expression_mentions_pool(&paren.expr, pool_aliases),
+        Expr::Group(group) => expression_mentions_pool(&group.expr, pool_aliases),
+        Expr::Cast(cast) => expression_mentions_pool(&cast.expr, pool_aliases),
+        Expr::Unary(unary) => expression_mentions_pool(&unary.expr, pool_aliases),
+        Expr::Try(try_expression) => expression_mentions_pool(&try_expression.expr, pool_aliases),
         _ => false,
     }
 }
 
-fn is_direct_pool_write(expression: &ExprMethodCall) -> bool {
+fn is_direct_pool_write(expression: &ExprMethodCall, pool_aliases: &BTreeSet<String>) -> bool {
     if expression.method == "execute" {
-        return expression.args.last().is_some_and(expression_mentions_pool);
+        return expression
+            .args
+            .last()
+            .is_some_and(|argument| expression_mentions_pool(argument, pool_aliases));
     }
 
     expression.method == "begin_with"
-        && expression_mentions_pool(&expression.receiver)
+        && expression_mentions_pool(&expression.receiver, pool_aliases)
         && expression.args.first().is_some_and(|argument| {
             matches!(
                 argument,
@@ -302,13 +342,66 @@ fn is_direct_pool_write(expression: &ExprMethodCall) -> bool {
         })
 }
 
-impl SourceVisitor {
-    fn has_sqlite_guard_exception(&self, expression: &ExprMethodCall) -> bool {
-        let line_index = expression.span().start().line.saturating_sub(1);
-        self.source_lines
-            .get(line_index.saturating_sub(1))
-            .is_some_and(|line| line.contains("sqlite-write-guard: allow-direct-pool-write"))
+#[derive(Default)]
+struct CoordinatorFacadeVisitor {
+    uses_sqlite_writer: bool,
+}
+
+impl<'ast> Visit<'ast> for CoordinatorFacadeVisitor {
+    fn visit_expr_method_call(&mut self, expression: &'ast ExprMethodCall) {
+        if is_sqlite_writer_expression(&expression.receiver)
+            && matches!(
+                expression.method.to_string().as_str(),
+                "write" | "write_foreground" | "write_with_priority" | "try_write"
+            )
+        {
+            self.uses_sqlite_writer = true;
+        }
+        visit::visit_expr_method_call(self, expression);
     }
+}
+
+#[derive(Default)]
+struct CoordinatorFacadeDeclarations {
+    functions: BTreeSet<String>,
+    issues: Vec<String>,
+    source_lines: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for CoordinatorFacadeDeclarations {
+    fn visit_item_fn(&mut self, item: &'ast ItemFn) {
+        let line_index = item.span().start().line.saturating_sub(1);
+        let has_marker = self
+            .source_lines
+            .get(line_index.saturating_sub(1))
+            .is_some_and(|line| line.contains("sqlite-write-guard: coordinator-facade"));
+        if has_marker {
+            let mut verifier = CoordinatorFacadeVisitor::default();
+            verifier.visit_item_fn(item);
+            if verifier.uses_sqlite_writer {
+                self.functions.insert(item.sig.ident.to_string());
+            } else {
+                self.issues.push(format!(
+                    "{}:{}: coordinator facade marker requires a SqliteWriteCoordinator call",
+                    "source",
+                    item.span().start().line
+                ));
+            }
+        }
+        visit::visit_item_fn(self, item);
+    }
+}
+
+fn coordinator_facade_declarations(
+    file: &File,
+    source_lines: Vec<String>,
+) -> CoordinatorFacadeDeclarations {
+    let mut declarations = CoordinatorFacadeDeclarations {
+        source_lines,
+        ..CoordinatorFacadeDeclarations::default()
+    };
+    declarations.visit_file(file);
+    declarations
 }
 
 fn validate_main_entrypoint(file: &File) -> Vec<String> {
@@ -333,12 +426,15 @@ fn scan_source(path: &Path, source: &str) -> Result<SourceVisitor, String> {
     let relative_path = path.to_string_lossy().replace('\\', "/");
     let file = syn::parse_file(source)
         .map_err(|error| format!("{relative_path}: Rust source parse failed: {error}"))?;
+    let source_lines = source.lines().map(str::to_owned).collect::<Vec<_>>();
+    let facades = coordinator_facade_declarations(&file, source_lines.clone());
     let mut visitor = SourceVisitor {
         path: relative_path.clone(),
-        source_lines: source.lines().map(str::to_owned).collect(),
+        coordinator_facade_functions: facades.functions,
         ..SourceVisitor::default()
     };
     visitor.visit_file(&file);
+    visitor.structural_issues.extend(facades.issues);
     if SQLITE_WRITE_GUARD_PATHS.contains(&relative_path.as_str()) {
         visitor
             .structural_issues
@@ -503,6 +599,12 @@ mod tests {
     #[test]
     fn sqlite_write_guard_accepts_known_coordinator_wrapper_callbacks() {
         let source = r#"
+            // sqlite-write-guard: coordinator-facade
+            async fn run_subscription_prune_phase(state: &AppState, query: impl FnOnce()) {
+                state.sqlite_writer.try_write("prune", |_| async { Ok(()) }).await;
+                query();
+            }
+
             async fn persist(state: &AppState) {
                 run_subscription_prune_phase(
                     state,
@@ -525,6 +627,22 @@ mod tests {
         let visitor =
             scan_source(Path::new("src/sync.rs"), source).expect("test source should parse");
         assert!(visitor.sqlite_write_issues.is_empty());
+    }
+
+    #[test]
+    fn sqlite_write_guard_rejects_pool_aliases() {
+        let source = r#"
+            async fn persist(state: &AppState) {
+                let db = &state.pool;
+                sqlx::query("UPDATE settings SET value = 1")
+                    .execute(db)
+                    .await
+                    .unwrap();
+            }
+        "#;
+        let visitor = scan_source(Path::new("src/admin_runtime.rs"), source)
+            .expect("test source should parse");
+        assert_eq!(visitor.sqlite_write_issues.len(), 1);
     }
 
     #[test]
@@ -564,18 +682,61 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_write_guard_accepts_reviewed_direct_write_exception() {
+    fn sqlite_write_guard_does_not_treat_cfg_any_test_as_test_only() {
         let source = r#"
-            async fn persist(pool: &SqlitePool) {
-                // sqlite-write-guard: allow-direct-pool-write
-                sqlx::query("UPDATE settings SET value = 1")
-                    .execute(pool)
-                    .await
-                    .unwrap();
+            #[cfg(any(test, feature = "production"))]
+            mod production {
+                async fn persist(pool: &SqlitePool) {
+                    sqlx::query("UPDATE settings SET value = 1")
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                }
+            }
+        "#;
+        let visitor = scan_source(Path::new("src/admin_runtime.rs"), source)
+            .expect("test source should parse");
+        assert_eq!(visitor.sqlite_write_issues.len(), 1);
+    }
+
+    #[test]
+    fn sqlite_write_guard_accepts_cfg_all_test_as_test_only() {
+        let source = r#"
+            #[cfg(all(test, feature = "fixture"))]
+            mod tests {
+                async fn persist(pool: &SqlitePool) {
+                    sqlx::query("UPDATE settings SET value = 1")
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                }
             }
         "#;
         let visitor = scan_source(Path::new("src/admin_runtime.rs"), source)
             .expect("test source should parse");
         assert!(visitor.sqlite_write_issues.is_empty());
+    }
+
+    #[test]
+    fn sqlite_write_guard_rejects_unvalidated_coordinator_facade_callbacks() {
+        let source = r#"
+            // sqlite-write-guard: coordinator-facade
+            async fn run_subscription_prune_phase(state: &AppState, query: impl FnOnce()) {
+                query();
+            }
+
+            async fn persist(state: &AppState) {
+                run_subscription_prune_phase(state, || async {
+                    sqlx::query("DELETE FROM settings")
+                        .execute(&state.pool)
+                        .await
+                        .unwrap();
+                });
+            }
+        "#;
+        let visitor =
+            scan_source(Path::new("src/sync.rs"), source).expect("test source should parse");
+        assert_eq!(visitor.sqlite_write_issues.len(), 1);
+        assert!(!visitor.structural_issues.is_empty());
     }
 }

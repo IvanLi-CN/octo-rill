@@ -10627,6 +10627,7 @@ enum SubscriptionPrunePhaseOutcome {
     Skipped,
 }
 
+// sqlite-write-guard: coordinator-facade
 async fn run_subscription_prune_phase<F, Fut>(
     state: &AppState,
     writer_lane: &'static str,
