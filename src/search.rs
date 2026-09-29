@@ -334,7 +334,7 @@ pub async fn query(
         .collect::<Vec<_>>()
         .join(" OR ");
     let mut builder = QueryBuilder::<Sqlite>::new(
-        "WITH ranked AS (SELECT d.id, d.resource_type, d.title, d.body, CASE WHEN d.resource_type = 'release' THEN rm.repo_full_name ELSE d.repo_full_name END AS repo_full_name, COALESCE(ul.translated_text, d.translated_text) AS translated_text, COALESCE(ul.smart_text, d.smart_text) AS smart_text, d.source_time, d.updated_at, d.unread, CASE WHEN d.resource_type = 'repository' THEN EXISTS (SELECT 1 FROM user_repo_associations ura WHERE ura.user_id = d.user_id AND lower(ura.repo_full_name_lower) = lower(d.resource_id) AND ura.is_following != 0) ELSE NULL END AS is_following, CASE WHEN d.resource_type = 'release' THEN rm.target_path ELSE d.target_path END AS target_path, d.target_url, ROW_NUMBER() OVER (PARTITION BY CASE WHEN d.resource_type = 'announcement' THEN COALESCE(d.resource_id, '') ELSE d.id END ORDER BY CASE WHEN d.resource_type = 'announcement' AND d.user_id = ",
+        "WITH ranked AS (SELECT d.id, d.resource_type, d.title, d.body, CASE WHEN d.resource_type = 'release' THEN rm.repo_full_name ELSE d.repo_full_name END AS repo_full_name, COALESCE(ul.translated_text, d.translated_text) AS translated_text, COALESCE(ul.smart_text, d.smart_text) AS smart_text, d.source_time, d.updated_at, d.unread, CASE WHEN d.resource_type = 'repository' THEN EXISTS (SELECT 1 FROM user_repo_associations ura WHERE ura.user_id = d.user_id AND lower(ura.repo_full_name_lower) = lower(d.resource_id) AND ura.is_following != 0) ELSE NULL END AS is_following, CASE WHEN d.resource_type = 'release' THEN rm.target_path ELSE d.target_path END AS target_path, CASE WHEN d.resource_type = 'release' AND rm.target_path IS NULL THEN NULL ELSE d.target_url END AS target_url, ROW_NUMBER() OVER (PARTITION BY CASE WHEN d.resource_type = 'announcement' THEN COALESCE(d.resource_id, '') ELSE d.id END ORDER BY CASE WHEN d.resource_type = 'announcement' AND d.user_id = ",
     );
     builder.push_bind(user_id);
     builder.push(
@@ -1729,7 +1729,7 @@ mod tests {
         let pool = setup_pool().await;
         seed_release(&pool).await;
         sqlx::query(
-            "UPDATE search_documents SET repo_full_name = 'stale/legacy', owner_login = 'stale', target_path = '/stale/legacy/releases/tag/old' WHERE id = 'release:4201'",
+            "UPDATE search_documents SET repo_full_name = 'stale/legacy', owner_login = 'stale', target_path = '/stale/legacy/releases/tag/old', target_url = 'https://github.com/stale/legacy/releases/tag/old' WHERE id = 'release:4201'",
         )
         .execute(&pool)
         .await
@@ -1756,10 +1756,7 @@ mod tests {
         .expect("query release with missing current metadata");
         assert_eq!(visible.len(), 1);
         assert!(visible[0].repository.is_none());
-        assert_eq!(
-            visible[0].target.href,
-            "https://github.com/octo/rill/releases/tag/v1.0.0"
-        );
+        assert_eq!(visible[0].target.href, "/");
 
         assert!(
             query(

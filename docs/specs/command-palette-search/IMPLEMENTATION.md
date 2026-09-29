@@ -37,7 +37,7 @@
 - `search::tests::metadata_fanout_resumes_in_release_row_batches`：覆盖单仓库 250 条 release metadata fanout 的 100/100/50 分批、队列 drain 与 FTS 一致性。
 - `search::tests::work_item_deletion_repairs_release_metadata`：覆盖删除最后一个 release work item metadata source 后的队列入队与 metadata 清理。
 - `search::tests::metadata_fallback_matches_current_short_repo_name`：覆盖 metadata fanout 尚未完成时，当前 metadata view 仍能匹配短 repository filter。
-- `search::tests::release_query_does_not_fallback_to_stale_metadata`：覆盖 current metadata 缺失时，release 查询不从旧缓存回填仓库字段、过滤器或 target。
+- `search::tests::release_query_does_not_fallback_to_stale_metadata`：覆盖 current metadata 缺失时，release 查询不从旧缓存回填仓库字段、过滤器、target path 或 target URL；无法从当前 metadata 解析 canonical target 时返回无目标回退值。
 - `search::tests::metadata_change_restarts_release_cursor`：覆盖 metadata fanout 进行中变更 repository identity 后 cursor 重置并重新刷新前段 rows。
 - `search::tests::fts_doc_id_maintenance_uses_indexed_point_updates`：覆盖 global 与 user-lane FTS `doc_id` 维护均走 mapping rowid point lookup，且不出现旧 virtual-table scan plan。
 - `search::tests::production_sized_fts_maintenance_benchmark`：手动 ignored 基准，覆盖 397 associations、39,700 release documents、397 lanes、旧/新 plan、writer batch 和并发 search/GET/session workload。
