@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     future::Future,
     sync::{Arc, Mutex},
     time::Duration,
@@ -339,6 +340,7 @@ impl SqliteWriteCoordinator {
         Ok(SqliteWritePermit {
             lane,
             priority,
+            waited,
             acquired_at: Instant::now(),
             coordinator: self.clone(),
         })
@@ -362,19 +364,29 @@ impl SqliteWriteCoordinator {
         let mut attempt = 1usize;
         loop {
             let permit = self.acquire_with_priority(lane, priority).await?;
-            let started = Instant::now();
-            let result = pool
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .with_context(|| format!("begin sqlite write tx ({lane})"));
-            let elapsed = started.elapsed();
+            let pool_wait_started = Instant::now();
+            let connection = pool.acquire().await;
+            let pool_wait = pool_wait_started.elapsed();
+            let begin_started = Instant::now();
+            let result = match connection {
+                Ok(connection) => {
+                    Transaction::begin(connection, Some(Cow::Borrowed("BEGIN IMMEDIATE")))
+                        .await
+                        .with_context(|| format!("begin sqlite write tx ({lane})"))
+                }
+                Err(error) => Err(anyhow::Error::new(error))
+                    .with_context(|| format!("acquire sqlite write connection ({lane})")),
+            };
+            let begin_elapsed = begin_started.elapsed();
 
             match result {
                 Ok(tx) => {
                     debug!(
                         sqlite_write_lane = lane,
                         sqlite_write_priority = priority.as_str(),
-                        elapsed_ms = elapsed.as_millis(),
+                        writer_wait_ms = permit.writer_wait_ms(),
+                        pool_wait_ms = pool_wait.as_millis(),
+                        begin_ms = begin_elapsed.as_millis(),
                         attempt,
                         "sqlite write transaction started"
                     );
@@ -384,11 +396,14 @@ impl SqliteWriteCoordinator {
                     if is_sqlite_busy_error(err.as_ref()) && attempt < self.retry.max_attempts =>
                 {
                     let delay = self.retry_delay(attempt);
+                    let writer_wait_ms = permit.writer_wait_ms();
                     drop(permit);
                     warn!(
                         sqlite_write_lane = lane,
                         sqlite_write_priority = priority.as_str(),
-                        elapsed_ms = elapsed.as_millis(),
+                        writer_wait_ms,
+                        pool_wait_ms = pool_wait.as_millis(),
+                        begin_ms = begin_elapsed.as_millis(),
                         attempt,
                         retry_after_ms = delay.as_millis(),
                         err = %err,
@@ -398,12 +413,15 @@ impl SqliteWriteCoordinator {
                     attempt += 1;
                 }
                 Err(err) => {
+                    let writer_wait_ms = permit.writer_wait_ms();
                     drop(permit);
                     if is_sqlite_busy_error(err.as_ref()) {
                         warn!(
                             sqlite_write_lane = lane,
                             sqlite_write_priority = priority.as_str(),
-                            elapsed_ms = elapsed.as_millis(),
+                            writer_wait_ms,
+                            pool_wait_ms = pool_wait.as_millis(),
+                            begin_ms = begin_elapsed.as_millis(),
                             attempt,
                             err = %err,
                             "sqlite write transaction exhausted busy retries"
@@ -443,6 +461,7 @@ impl SqliteWriteCoordinator {
         Some(SqliteWritePermit {
             lane,
             priority,
+            waited: Duration::ZERO,
             acquired_at: Instant::now(),
             coordinator: self.clone(),
         })
@@ -459,8 +478,15 @@ impl SqliteWriteCoordinator {
 pub struct SqliteWritePermit {
     lane: &'static str,
     priority: SqliteWritePriority,
+    waited: Duration,
     acquired_at: Instant,
     coordinator: SqliteWriteCoordinator,
+}
+
+impl SqliteWritePermit {
+    pub(crate) fn writer_wait_ms(&self) -> u128 {
+        self.waited.as_millis()
+    }
 }
 
 impl Drop for SqliteWritePermit {
