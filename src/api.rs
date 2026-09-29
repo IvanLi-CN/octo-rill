@@ -29965,13 +29965,16 @@ mod tests {
             )
             .await
             .expect("hold background writer");
+        let start_barrier = Arc::new(tokio::sync::Barrier::new(4));
         let requests = (0..4)
             .map(|index| {
                 let state = state.clone();
+                let start_barrier = start_barrier.clone();
                 let (headers, body) =
                     signed_release_receiver_request(&format!("pressure-delivery-{index}"));
                 let body = body.clone();
                 tokio::spawn(async move {
+                    start_barrier.wait().await;
                     webhook_push::receive(
                         State(state),
                         Query(webhook_push::ReceiverQuery {
@@ -29985,9 +29988,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while state.sqlite_writer.runtime_status().waiting_foreground < 4 {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
         .await
@@ -30143,6 +30146,23 @@ mod tests {
         .await
         .expect("pending delivery should be claimable after enqueue recovers");
         assert!(retried["accepted"].as_bool().unwrap_or(false));
+        let (processing_state, queued_task_id) = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT processing_state, queued_task_id FROM webhook_push_deliveries WHERE delivery_id = 'enqueue-failure-delivery'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read delivery after successful enqueue retry");
+        assert_eq!(processing_state, "queued");
+        assert_eq!(queued_task_id.as_deref(), Some("repo-release:202"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM repo_release_work_items WHERE repo_id = 202",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count recovered release work item"),
+            1
+        );
     }
 
     struct RepoGovernanceSnapshotSeed<'a> {

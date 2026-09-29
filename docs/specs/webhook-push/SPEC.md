@@ -134,7 +134,7 @@
 - `VER-WP-009` (covers: `REQ-WP-004`, `REQ-WP-010`, `REQ-WP-011`): mocked multi-repository worker tests prove archived and repository-local failures do not skip later targets, healthy repositories are not retried, and a completed sweep updates the completion timestamp.
 - `VER-WP-010` (covers: `REQ-WP-010`, `REQ-WP-012`, `REQ-WP-014`): API and Settings tests prove archived repositories, PAT-scope exclusions, and ownership-scope exits are distinct from waiting registration and permission pauses.
 - `VER-WP-011` (covers: `REQ-WP-013`): transaction and restart tests prove a newly persisted baseline and its reconciliation demand commit atomically, active work produces exactly one follow-up pass, and an unconsumed demand is dispatched after restart.
-- `VER-WP-012` (covers: webhook receiver): concurrent deliveries under a held background writer, followed by a duplicate delivery, create one release work item; a held writer exceeding the receiver deadline returns retryable `503`; and a simulated enqueue failure restores `pending` so the same delivery can be retried.
+- `VER-WP-012` (covers: webhook receiver): concurrent deliveries under a held background writer, followed by a duplicate delivery, create one release work item; a held writer exceeding the receiver deadline returns retryable `503`; and a simulated enqueue failure restores `pending`, after which retry persists a queued delivery and one release work item.
 - `VER-WP-013` (covers: `REQ-WP-009`): API snapshot tests prove pending counts and the latest terminal failure are exposed, and newer queued/running or successful work hides the older failure.
 
 ## Related ADRs

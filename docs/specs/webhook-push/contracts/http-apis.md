@@ -29,3 +29,4 @@ audit 在部分用户派发失败时继续处理其余用户，并将同一 audi
 - `POST /api/webhooks/github/releases`
 - 必需 headers：`X-GitHub-Delivery`、`X-GitHub-Event`、`X-GitHub-Hook-ID`、`X-Hub-Signature-256`；`ping` 不要求已存在 release payload。
 - 成功响应 `{ "accepted": true, "queued": boolean, "reason": string }`。
+- SQLite busy 或 receiver 写入 deadline 超时时返回 HTTP `503`，错误体 `error.code` 为 `webhook_receiver_retryable`，并带 `Retry-After: 1`。发送方可使用相同 `X-GitHub-Delivery` 重试；enqueue 失败时 delivery 会恢复为 `pending`，恢复写入失败时 processing claim 最迟五分钟后可重新领取。
