@@ -30,6 +30,10 @@
 - `starred_repos` 的增量 upsert、通知 inbox upsert / open-url repair，以及 `public_repo_release_usage` 元数据刷新也已收回 writer coordinator；其中 notification open-url repair 的 GitHub thread lookup 保持在 writer permit 外，只把最终批量更新放进短事务，避免后台修复路径长时间占住 SQLite writer。
 - notification open-url repair 在短事务里会先按 `thread_id` 重读当前行，再决定是否回写修复结果；这样既保留 lookup 在 permit 外的短锁收益，也不会让较早的 repair lookup 覆盖并发 notification sync 刚写入的更新标题、`updated_at`、`unread` 或目标 URL。若 refresh 拿到的 thread metadata 时间戳更新，则 repair 仍会覆盖旧的标题/类型/reason/目标 URL，避免“当前行非空但已过时”把修复永久卡住。
 - jobs scheduler 的 `daily_brief_hour_slots.last_dispatch_at`、`scheduled_task_dispatch_state` 写入，以及 brief history/content refresh 失败标记也已收回 writer coordinator，避免 20s/45s 周期调度写和失败补偿写继续绕过协调层挤占 task claim / heartbeat。
+- admin runtime settings 的 seed/backfill/update、LLM recovery flags 与 model health、translation runtime settings 均通过共享 `AppState.sqlite_writer` 写入；生产启动和 runtime heartbeat 不再调用 raw pool writer。
+- translation worker runtime slot reconciliation 与 worker removal 的 production internal helpers 现在要求非可选 `&SqliteWriteCoordinator`，删除了 `Option<&SqliteWriteCoordinator>` 的 raw `BEGIN IMMEDIATE` fallback；仅 test-only convenience wrappers 创建局部 coordinator。
+- reaction PAT state、dashboard daily rollup、scheduled slot patch 与 public release usage metadata refresh 均进入明确的 foreground/background writer lane，补齐 API 与高频 sync metadata 的遗漏写路径。
+- `tools/rust-source-check` 为 `src/admin_runtime.rs`、`src/ai.rs`、`src/api.rs`、`src/jobs.rs`、`src/sync.rs` 与 `src/translations.rs` 增加 AST guard：生产 direct pool execute/raw `BEGIN IMMEDIATE` 失败，`cfg(test)`、bootstrap/read-only 范围和经过 review 的窄例外保持显式边界；已知的 subscription prune coordinator wrapper 作为结构化安全边界处理。
 - 网络、GitHub API、AI 调用与长耗时处理仍留在 writer permit 外；permit 只包住 SQLite 写入段。
 
 ## Validation
@@ -37,6 +41,7 @@
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --locked --all-features`
+- `bash scripts/check-rust-source-quality.sh`（含应用/源检查器 fmt、全 feature Clippy/check、checker 单测和全仓 guard scan）
 
 ## Remaining Gaps
 
@@ -56,6 +61,7 @@
 - `src/sync.rs` 新增 subscription event 写入在 competing writer 下等待成功提交，以及 subscription history prune 在 writer permit 不可得或 SQLite busy 时降级跳过的回归测试。
 - `src/sync.rs` 新增 `starred_repos` 增量 upsert 与通知 upsert 在 competing writer 下等待成功提交的并发回归测试。
 - `src/ai.rs` 新增 LLM retention cleanup 在 writer permit 不可得或 SQLite busy 时降级跳过的回归测试。
+- `tools/rust-source-check/src/main.rs` 新增 coordinator bypass AST guard 及 direct write、coordinator closure、test-only、wrapper 与 `cfg(not(test))` 回归测试。
 
 ## References
 

@@ -6,12 +6,12 @@
 
 - OctoRill 继续使用单个 SQLite 数据库承载 HTTP 请求、后台任务、repo release worker、translation worker 与 LLM 调度状态。
 - SQLite WAL 允许读写并发，但仍只有一个 writer；当高并发 worker 直接争抢写事务时，`database is locked` 会外溢到用户请求并造成 500。
-- 既有修复已把部分 read-then-write 事务改为 `BEGIN IMMEDIATE`，但如果写协调只覆盖少数后台 claim/finalize 路径，登录/session、job enqueue、LLM lifecycle、translation batch 启动状态切换、repo release reaction refresh 持久化与 repo release recovery 等路径仍会在高 worker 并发下直接争抢 SQLite writer。
+- 既有修复已把部分 read-then-write 事务改为 `BEGIN IMMEDIATE`，但如果写协调只覆盖少数后台 claim/finalize 路径，登录/session、job enqueue、LLM lifecycle、translation batch 启动状态切换、translation worker runtime slot、admin runtime settings、repo release reaction refresh 持久化与 repo release recovery 等路径仍会在高 worker 并发下直接争抢 SQLite writer。
 
 ## Context and Scope
 
 - Context: OctoRill 的 HTTP 请求、后台 worker 与调度状态共享 SQLite；应用内 writer coordinator 负责把短 SQLite 写段排队，同时保留网络和 AI 阶段的并发。
-- In scope: SQLite writer permit、`BEGIN IMMEDIATE` bounded retry、session/job enqueue 热路径、social activity snapshot 分块持久化与并发回归验证。
+- In scope: SQLite writer permit、`BEGIN IMMEDIATE` bounded retry、session/job enqueue 热路径、admin/translation/LLM runtime state、social activity snapshot 分块持久化、源代码守门与并发回归验证。
 - Out of scope: 数据库迁移到其他引擎、降低业务 worker 并发、生产部署和 API 响应结构变更。
 
 ## 目标 / 非目标
@@ -23,6 +23,8 @@
 - 高竞争写路径必须通过统一 coordinator 获取 writer permit，并记录 lane、priority、等待时长、attempt 与写入耗时。
 - 大集合重建类写入不得把全量 delete/upsert/reconcile 包在单个 writer permit 内；必须先完成读侧候选聚合，再用固定 chunk 的短事务提交写入，并记录 chunk count 与最大 chunk elapsed。
 - coordinator 必须区分 `foreground`、`background`、`best_effort` 语义，保证用户可见写入不会长期排在后台 heartbeat/finalize 后面。
+- 生产高竞争写入必须通过共享 `SqliteWriteCoordinator` 或明确的内部协调 facade；运行时配置、LLM health/recovery、translation worker runtime slot、jobs lifecycle、repo release sync state 与高频 sync metadata 不得保留直接池写入或可选 writer fallback。
+- 源代码质量检查必须在已审计生产模块中拒绝绕过 coordinator 的 `SqlitePool::execute` 与 raw `BEGIN IMMEDIATE`；测试专用、迁移/bootstrap 与纯读代码不属于该写入守门范围，任何受保护模块中的 direct-write 例外必须有窄范围审查标记。
 - SQLite busy/locked 必须作为可恢复背压处理，经过有界退避重试后再决定是否失败。
 - `last_active_at` 等用户热路径 best-effort 写入不得等待后台 writer 排队，也不得把 `/api/me` 类请求打成 500。
 - 对已有 pending 合同的读取接口，若结果表已经存在当前 source hash 的 `queued/running` 状态，则允许在 writer 压力下直接复用该快照，不得为了重复 resolve 再强制进入新的写事务。
@@ -40,8 +42,10 @@
 
 - 后端 runtime 内的 SQLite write coordinator。
 - `job_tasks` enqueue/event/cancel/claim/heartbeat/finalize、session create/save/delete、repo release attach/claim/finalize/heartbeat/recovery/sync-state、translation request/batch/recovery/finalize、LLM call lifecycle、`touch_user_last_active_at` 等热写路径。
+- admin runtime settings seed/backfill/update、LLM recovery flags/model health、translation worker runtime slots、reaction PAT state、dashboard rollup、scheduled slot 与 release usage metadata 等高竞争运行时写入。
 - `translation_batches queued -> running`、`translation_work_items batched -> running` 与 feed reaction refresh counts 持久化等短写段。
 - 针对 SQLite WAL + 多连接 pool 的并发回归测试。
+- `tools/rust-source-check` 中针对受保护生产模块的 coordinator bypass guard。
 
 ### Out of scope
 
@@ -81,6 +85,18 @@
 
 - 生产量级 social activity snapshot 必须在 writer permit 外聚合候选，并以固定 64 行 chunk 独立提交；chunk 之间必须释放 permit，且 stale cleanup 必须保留显式 follow 选择与可中断恢复语义。
 
+### REQ-SQLITE-WRITER-008
+
+- admin runtime settings、translation worker runtime slot、LLM recovery/model health、jobs lifecycle、repo release sync-state 与高频 sync metadata 的生产写入必须通过共享 `SqliteWriteCoordinator` 或其内部协调 facade；调用方不得通过 `Option<&SqliteWriteCoordinator>` 在生产路径回退到 raw pool transaction。
+
+### REQ-SQLITE-WRITER-009
+
+- 高竞争运行时写入必须选择并保留明确 lane：用户可见状态使用 `foreground`，worker lifecycle 与 runtime metadata 使用 `background`，非关键 cleanup/touch 使用 `best_effort`；每个 lane 的降级结果必须通过结构化 `sqlite.write` telemetry 可区分。
+
+### REQ-SQLITE-WRITER-010
+
+- `scripts/check-rust-source-quality.sh` 使用 AST source guard 检查受保护生产模块；新增 direct pool write 必须失败，除非属于 test-only/bootstrap/read-only 语义或带有经过 review 的窄范围例外标记。
+
 ### SHOULD
 
 - 事务仍应尽量短小；小批量写可以在单次 permit 内完成，生产量级全量重建必须拆成多个短 permit。
@@ -101,6 +117,9 @@
 - repo refresh governance rebuild 属于生产量级集合重建路径：候选聚合留在 writer permit 外，stale cleanup、snapshot upsert、member reconciliation、snapshot completion 与 cycle reconciliation 分阶段提交；snapshot/member 写入固定 500 行 chunk。
 - social activity snapshot 属于生产量级集合重建路径：follower、owned-repo/member、history 与 association cleanup 的候选必须在 writer permit 外聚合；持久化使用固定 64 行 chunk，每个 chunk 独立取得并释放 writer permit，且 chunk 之间允许前台写入插入。snapshot baseline 与幂等 history materialization 必须保持可中断恢复，stale cleanup 不得删除当前 target 之外的显式 follow 选择。
 - HTTP 请求读取数据时不需要 writer permit；更新用户活跃时间等 best-effort 写入使用非阻塞 writer 尝试，拿不到 permit 时直接跳过。
+- admin runtime seed/backfill/update、LLM recovery/model health 与 translation worker slot reconciliation 只在短 SQLite 段内持有 writer permit；配置加载和 worker/AI/network 阶段留在 permit 外。
+- translation runtime 的 production internal helper 必须接收非可选 `&SqliteWriteCoordinator`；仅 `#[cfg(test)]` wrapper 可以为独立 unit fixture 创建局部 coordinator。
+- reaction PAT、dashboard rollup、scheduled slot 与 public release usage metadata 等高频 API/sync metadata 写入使用明确 foreground/background lane，不能因为写入对象较小而直接调用 pool。
 - 如果 SQLite 返回 busy/locked，coordinator 使用短退避重试，并在耗尽后返回原始错误上下文。
 
 ### Edge cases / errors
@@ -115,7 +134,8 @@
 
 | 接口（Name） | 类型（Kind） | 范围（Scope） | 变更（Change） | 契约文档（Contract Doc） | 负责人（Owner） | 使用方（Consumers） | 备注（Notes） |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `SqliteWriteCoordinator` | Rust runtime API | internal | New | None | backend | backend runtime | 单 writer permit、busy retry、tracing |
+| `SqliteWriteCoordinator` | Rust runtime API | internal | Existing / extended | None | backend | backend runtime | 单 writer permit、priority lanes、busy retry、tracing |
+| `rust-source-check` SQLite guard | source-quality contract | internal | New | `scripts/check-rust-source-quality.sh` | backend | protected production modules | AST 检查 direct pool write 与 raw `BEGIN IMMEDIATE` |
 
 ### 契约文档（按 Kind 拆分）
 
@@ -155,6 +175,14 @@
   When snapshot 写入运行并暂停在第一个 chunk 之后
   Then `GET /api/dashboard/updates`、session save 与 `jobs::enqueue_task` 仍能完成；日志或测试证据分别报告候选读取耗时、writer wait、query/write chunk 耗时及 busy/500 结果，且每个 social snapshot writer chunk 不超过固定 64 行。
 
+- Given production code adds a direct `SqlitePool::execute` or raw `BEGIN IMMEDIATE` in an audited module
+  When `scripts/check-rust-source-quality.sh` runs
+  Then the AST guard fails with the source location until the write is moved behind the coordinator or a reviewed narrow exception is documented.
+
+- Given translation runtime reconciliation runs in production or in a test fixture
+  When it updates running batch worker slots
+  Then the production helper always receives a coordinator and the test-only wrapper uses a local coordinator; no optional writer fallback can execute a raw pool transaction.
+
 ## Verification
 
 ### VER-SQLITE-WRITER-001
@@ -168,6 +196,12 @@
 - Method: social activity snapshot regression and production-shaped concurrency test with 397 owned-repo associations, at least 100000 search documents, dashboard updates, persisted session save and task enqueue.
 - covers: REQ-SQLITE-WRITER-001, REQ-SQLITE-WRITER-002, REQ-SQLITE-WRITER-004, REQ-SQLITE-WRITER-006, REQ-SQLITE-WRITER-007
 - Pass condition: candidate reads happen outside the writer permit, every write transaction is bounded to 64 candidates or a single baseline row, the first chunk releases the permit before the foreground operations run, no busy/500 result occurs, explicit follow state remains intact, and the snapshot can finish after resumption.
+
+### VER-SQLITE-WRITER-003
+
+- Method: source checker unit tests plus a full AST scan of the audited production modules, and targeted runtime tests for admin settings, LLM health/recovery, translation worker slots, and high-frequency metadata writes.
+- covers: REQ-SQLITE-WRITER-008, REQ-SQLITE-WRITER-009, REQ-SQLITE-WRITER-010
+- Pass condition: production writes use the shared coordinator with an explicit lane, the translation runtime has no optional writer fallback, direct pool writes are rejected by the checker, and test-only/bootstrap/read-only exceptions remain documented and bounded.
 
 ## 验收清单（Acceptance checklist）
 
@@ -193,6 +227,7 @@
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --locked --all-features`
+- `bash scripts/check-rust-source-quality.sh`
 
 ## Visual Evidence
 

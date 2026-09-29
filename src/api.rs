@@ -3364,8 +3364,11 @@ async fn upsert_admin_dashboard_rollup_for_day(
             end_at.as_str(),
         )
         .await?;
-        sqlx::query(
-            r#"
+        state
+            .sqlite_writer
+            .write("admin_dashboard_daily_rollup_upsert", |_| async {
+                sqlx::query(
+                    r#"
             INSERT INTO admin_dashboard_daily_rollups (
               rollup_date,
               time_zone,
@@ -3398,26 +3401,29 @@ async fn upsert_admin_dashboard_rollup_for_day(
               business_failed_count = excluded.business_failed_count,
               business_disabled_count = excluded.business_disabled_count,
               updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(day_value.as_str())
-        .bind(time_zone_value.as_str())
-        .bind(task_type)
-        .bind(total_users)
-        .bind(active_users)
-        .bind(counts.queued_count)
-        .bind(counts.running_count)
-        .bind(counts.succeeded_count)
-        .bind(counts.failed_count)
-        .bind(counts.canceled_count)
-        .bind(counts.business_ok_count)
-        .bind(counts.business_partial_count)
-        .bind(counts.business_failed_count)
-        .bind(counts.business_disabled_count)
-        .bind(updated_at.as_str())
-        .execute(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
+                    "#,
+                )
+                .bind(day_value.as_str())
+                .bind(time_zone_value.as_str())
+                .bind(task_type)
+                .bind(total_users)
+                .bind(active_users)
+                .bind(counts.queued_count)
+                .bind(counts.running_count)
+                .bind(counts.succeeded_count)
+                .bind(counts.failed_count)
+                .bind(counts.canceled_count)
+                .bind(counts.business_ok_count)
+                .bind(counts.business_partial_count)
+                .bind(counts.business_failed_count)
+                .bind(counts.business_disabled_count)
+                .bind(updated_at.as_str())
+                .execute(&state.pool)
+                .await
+                .map_err(anyhow::Error::from)
+            })
+            .await
+            .map_err(ApiError::internal)?;
     }
 
     Ok(())
@@ -6897,19 +6903,25 @@ pub async fn admin_patch_scheduled_slot(
     }
 
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE daily_brief_hour_slots
-        SET enabled = ?, updated_at = ?
-        WHERE hour_utc = ?
-        "#,
-    )
-    .bind(if req.enabled { 1_i64 } else { 0_i64 })
-    .bind(now.as_str())
-    .bind(hour_utc)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    state
+        .sqlite_writer
+        .write_foreground("admin_scheduled_slot_update", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE daily_brief_hour_slots
+                SET enabled = ?, updated_at = ?
+                WHERE hour_utc = ?
+                "#,
+            )
+            .bind(if req.enabled { 1_i64 } else { 0_i64 })
+            .bind(now.as_str())
+            .bind(hour_utc)
+            .execute(&state.pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await
+        .map_err(ApiError::internal)?;
 
     let item = sqlx::query_as::<_, AdminScheduledSlotItem>(
         r#"
@@ -7557,6 +7569,7 @@ pub async fn admin_patch_llm_runtime_config(
     };
     admin_runtime::update_llm_runtime_settings(
         &state.pool,
+        &state.sqlite_writer,
         max_concurrency,
         ai_model_context_limit,
         &llm_models,
@@ -7565,6 +7578,7 @@ pub async fn admin_patch_llm_runtime_config(
     .map_err(ApiError::internal)?;
     admin_runtime::update_llm_recovery_runtime_config(
         &state.pool,
+        &state.sqlite_writer,
         recovery_enabled,
         recovery_rollout_percent,
     )
@@ -10522,31 +10536,37 @@ async fn resolve_public_release_usage_from_local_metadata(
         "pending"
     };
 
-    sqlx::query(
-        r#"
-        UPDATE public_repo_release_usage
-        SET repo_id = ?,
-            owner_login = ?,
-            repo_name = ?,
-            full_name = ?,
-            full_name_lower = ?,
-            last_sync_status = ?,
-            last_sync_error = NULL,
-            updated_at = ?
-        WHERE full_name_lower = ?
-        "#,
-    )
-    .bind(repo.repo_id)
-    .bind(owner)
-    .bind(repo_name)
-    .bind(repo.full_name.as_str())
-    .bind(full_name_lower)
-    .bind(next_status)
-    .bind(now.as_str())
-    .bind(full_name_lower)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    state
+        .sqlite_writer
+        .write("public_release_usage_metadata_refresh", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE public_repo_release_usage
+                SET repo_id = ?,
+                    owner_login = ?,
+                    repo_name = ?,
+                    full_name = ?,
+                    full_name_lower = ?,
+                    last_sync_status = ?,
+                    last_sync_error = NULL,
+                    updated_at = ?
+                WHERE full_name_lower = ?
+                "#,
+            )
+            .bind(repo.repo_id)
+            .bind(owner)
+            .bind(repo_name)
+            .bind(repo.full_name.as_str())
+            .bind(full_name_lower)
+            .bind(next_status)
+            .bind(now.as_str())
+            .bind(full_name_lower)
+            .execute(&state.pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await
+        .map_err(ApiError::internal)?;
 
     if release_count == 0
         && sync::enqueue_public_repo_release_sync(state, repo.repo_id, repo.full_name.as_str())
@@ -15540,29 +15560,36 @@ async fn persist_reaction_pat_check_result(
     check_state: &str,
     check_message: Option<&str>,
 ) -> Result<(), ApiError> {
-    sqlx::query(
-        r#"
-        UPDATE reaction_pat_tokens
-        SET last_check_state = ?,
-            last_check_message = ?,
-            last_checked_at = ?,
-            webhook_push_allows_private_repos = CASE
-              WHEN ? = 'valid' THEN webhook_push_allows_private_repos
-              ELSE NULL
-            END,
-            updated_at = ?
-        WHERE user_id = ?
-        "#,
-    )
-    .bind(check_state)
-    .bind(check_message)
-    .bind(chrono::Utc::now().to_rfc3339())
-    .bind(check_state)
-    .bind(chrono::Utc::now().to_rfc3339())
-    .bind(user_id)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    state
+        .sqlite_writer
+        .write_foreground("reaction_pat_check_result_update", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE reaction_pat_tokens
+                SET last_check_state = ?,
+                    last_check_message = ?,
+                    last_checked_at = ?,
+                    webhook_push_allows_private_repos = CASE
+                      WHEN ? = 'valid' THEN webhook_push_allows_private_repos
+                      ELSE NULL
+                    END,
+                    updated_at = ?
+                WHERE user_id = ?
+                "#,
+            )
+            .bind(check_state)
+            .bind(check_message)
+            .bind(now.as_str())
+            .bind(check_state)
+            .bind(now.as_str())
+            .bind(user_id)
+            .execute(&state.pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await
+        .map_err(ApiError::internal)?;
     Ok(())
 }
 
@@ -15570,14 +15597,21 @@ async fn clear_reaction_pat_scope_observation(
     state: &AppState,
     user_id: &str,
 ) -> Result<(), ApiError> {
-    sqlx::query(
-        "UPDATE reaction_pat_tokens SET webhook_push_allows_private_repos = NULL, updated_at = ? WHERE user_id = ?",
-    )
-    .bind(chrono::Utc::now().to_rfc3339())
-    .bind(user_id)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    state
+        .sqlite_writer
+        .write_foreground("reaction_pat_scope_observation_clear", |_| async {
+            sqlx::query(
+                "UPDATE reaction_pat_tokens SET webhook_push_allows_private_repos = NULL, updated_at = ? WHERE user_id = ?",
+            )
+            .bind(now.as_str())
+            .bind(user_id)
+            .execute(&state.pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await
+        .map_err(ApiError::internal)?;
     Ok(())
 }
 
@@ -15681,44 +15715,50 @@ pub async fn upsert_reaction_token(
         .map_err(ApiError::internal)?;
     let masked = mask_pat_token(token);
 
-    sqlx::query(
-        r#"
-        INSERT INTO reaction_pat_tokens (
-          user_id, token_ciphertext, token_nonce, masked_token,
-          last_check_state, last_check_message, last_checked_at, updated_at,
-          owner_github_connection_id, owner_github_user_id, owner_login,
-          webhook_push_allows_private_repos
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-          token_ciphertext = excluded.token_ciphertext,
-          token_nonce = excluded.token_nonce,
-          masked_token = excluded.masked_token,
-          last_check_state = excluded.last_check_state,
-          last_check_message = excluded.last_check_message,
-          last_checked_at = excluded.last_checked_at,
-          updated_at = excluded.updated_at,
-          owner_github_connection_id = excluded.owner_github_connection_id,
-          owner_github_user_id = excluded.owner_github_user_id,
-          owner_login = excluded.owner_login,
-          webhook_push_allows_private_repos = excluded.webhook_push_allows_private_repos
-        "#,
-    )
-    .bind(user_id.as_str())
-    .bind(encrypted.ciphertext)
-    .bind(encrypted.nonce)
-    .bind(&masked)
-    .bind("valid")
-    .bind("token is valid")
-    .bind(&now)
-    .bind(&now)
-    .bind(owner.github_connection_id.as_str())
-    .bind(owner.github_user_id)
-    .bind(owner.login.as_str())
-    .bind(checked.allows_private_repos)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    state
+        .sqlite_writer
+        .write_foreground("reaction_pat_upsert", |_| async {
+            sqlx::query(
+                r#"
+                INSERT INTO reaction_pat_tokens (
+                  user_id, token_ciphertext, token_nonce, masked_token,
+                  last_check_state, last_check_message, last_checked_at, updated_at,
+                  owner_github_connection_id, owner_github_user_id, owner_login,
+                  webhook_push_allows_private_repos
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                  token_ciphertext = excluded.token_ciphertext,
+                  token_nonce = excluded.token_nonce,
+                  masked_token = excluded.masked_token,
+                  last_check_state = excluded.last_check_state,
+                  last_check_message = excluded.last_check_message,
+                  last_checked_at = excluded.last_checked_at,
+                  updated_at = excluded.updated_at,
+                  owner_github_connection_id = excluded.owner_github_connection_id,
+                  owner_github_user_id = excluded.owner_github_user_id,
+                  owner_login = excluded.owner_login,
+                  webhook_push_allows_private_repos = excluded.webhook_push_allows_private_repos
+                "#,
+            )
+            .bind(user_id.as_str())
+            .bind(&encrypted.ciphertext)
+            .bind(&encrypted.nonce)
+            .bind(&masked)
+            .bind("valid")
+            .bind("token is valid")
+            .bind(&now)
+            .bind(&now)
+            .bind(owner.github_connection_id.as_str())
+            .bind(owner.github_user_id)
+            .bind(owner.login.as_str())
+            .bind(checked.allows_private_repos)
+            .execute(&state.pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await
+        .map_err(ApiError::internal)?;
 
     Ok(Json(ReactionTokenStatusResponse {
         configured: true,

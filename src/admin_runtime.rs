@@ -8,6 +8,7 @@ use sqlx::{Executor, Row, Sqlite, SqlitePool, Transaction};
 use crate::{
     briefs,
     config::AppConfig,
+    sqlite_write::SqliteWriteCoordinator,
     state::AppState,
     translations::{
         DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
@@ -198,33 +199,39 @@ pub async fn load_llm_recovery_runtime_config(
 
 pub async fn update_llm_recovery_runtime_config(
     pool: &SqlitePool,
+    sqlite_writer: &SqliteWriteCoordinator,
     enabled: bool,
     rollout_percent: i64,
 ) -> Result<LlmRecoveryRuntimeConfig> {
     let rollout_percent = normalize_llm_recovery_rollout_percent(rollout_percent);
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO llm_recovery_flags (
-          id,
-          llm_recovery_enabled,
-          llm_recovery_rollout_percent,
-          created_at,
-          updated_at
-        )
-        VALUES (1, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          llm_recovery_enabled = excluded.llm_recovery_enabled,
-          llm_recovery_rollout_percent = excluded.llm_recovery_rollout_percent,
-          updated_at = excluded.updated_at
-        "#,
-    )
-    .bind(if enabled { 1_i64 } else { 0_i64 })
-    .bind(i64::from(rollout_percent))
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(pool)
-    .await?;
+    sqlite_writer
+        .write_foreground("admin_llm_recovery_runtime_settings", |_| async {
+            sqlx::query(
+                r#"
+                INSERT INTO llm_recovery_flags (
+                  id,
+                  llm_recovery_enabled,
+                  llm_recovery_rollout_percent,
+                  created_at,
+                  updated_at
+                )
+                VALUES (1, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  llm_recovery_enabled = excluded.llm_recovery_enabled,
+                  llm_recovery_rollout_percent = excluded.llm_recovery_rollout_percent,
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(if enabled { 1_i64 } else { 0_i64 })
+            .bind(i64::from(rollout_percent))
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await?;
 
     load_llm_recovery_runtime_config(pool).await
 }
@@ -262,7 +269,11 @@ pub async fn load_llm_model_health(pool: &SqlitePool) -> Result<Vec<LlmModelHeal
         .collect())
 }
 
-pub async fn upsert_llm_model_health(pool: &SqlitePool, health: &LlmModelHealth) -> Result<()> {
+pub async fn upsert_llm_model_health(
+    pool: &SqlitePool,
+    sqlite_writer: &SqliteWriteCoordinator,
+    health: &LlmModelHealth,
+) -> Result<()> {
     let model = health.model.trim();
     if model.is_empty() {
         anyhow::bail!("llm model health requires a non-empty model");
@@ -276,38 +287,43 @@ pub async fn upsert_llm_model_health(pool: &SqlitePool, health: &LlmModelHealth)
     }
 
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO llm_model_health (
-          model,
-          relevant_failure_count,
-          window_started_at,
-          cooldown_until,
-          last_failure_class,
-          last_failure_at,
-          created_at,
-          updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(model) DO UPDATE SET
-          relevant_failure_count = excluded.relevant_failure_count,
-          window_started_at = excluded.window_started_at,
-          cooldown_until = excluded.cooldown_until,
-          last_failure_class = excluded.last_failure_class,
-          last_failure_at = excluded.last_failure_at,
-          updated_at = excluded.updated_at
-        "#,
-    )
-    .bind(model)
-    .bind(health.relevant_failure_count.max(0))
-    .bind(health.window_started_at.as_deref())
-    .bind(health.cooldown_until.as_deref())
-    .bind(health.last_failure_class.as_deref())
-    .bind(health.last_failure_at.as_deref())
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(pool)
-    .await?;
+    sqlite_writer
+        .write("llm_model_health_upsert", |_| async {
+            sqlx::query(
+                r#"
+                INSERT INTO llm_model_health (
+                  model,
+                  relevant_failure_count,
+                  window_started_at,
+                  cooldown_until,
+                  last_failure_class,
+                  last_failure_at,
+                  created_at,
+                  updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(model) DO UPDATE SET
+                  relevant_failure_count = excluded.relevant_failure_count,
+                  window_started_at = excluded.window_started_at,
+                  cooldown_until = excluded.cooldown_until,
+                  last_failure_class = excluded.last_failure_class,
+                  last_failure_at = excluded.last_failure_at,
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(model)
+            .bind(health.relevant_failure_count.max(0))
+            .bind(health.window_started_at.as_deref())
+            .bind(health.cooldown_until.as_deref())
+            .bind(health.last_failure_class.as_deref())
+            .bind(health.last_failure_at.as_deref())
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await?;
 
     Ok(())
 }
@@ -803,18 +819,26 @@ pub async fn load_sync_auto_fetch_effective_at(pool: &SqlitePool) -> Result<Opti
     .flatten())
 }
 
-pub async fn clear_sync_auto_fetch_effective_at(pool: &SqlitePool) -> Result<()> {
-    sqlx::query(
-        r#"
-        UPDATE admin_runtime_settings
-        SET sync_auto_fetch_effective_at = NULL,
-            updated_at = ?
-        WHERE id = 1
-        "#,
-    )
-    .bind(Utc::now().to_rfc3339())
-    .execute(pool)
-    .await?;
+pub async fn clear_sync_auto_fetch_effective_at(
+    pool: &SqlitePool,
+    sqlite_writer: &SqliteWriteCoordinator,
+) -> Result<()> {
+    sqlite_writer
+        .write("sync_runtime_effective_at_clear", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE admin_runtime_settings
+                SET sync_auto_fetch_effective_at = NULL,
+                    updated_at = ?
+                WHERE id = 1
+                "#,
+            )
+            .bind(Utc::now().to_rfc3339())
+            .execute(pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await?;
     Ok(())
 }
 
@@ -926,34 +950,46 @@ fn parse_llm_models_json(raw: &str) -> Vec<String> {
     }
 }
 
-async fn maybe_backfill_legacy_ai_model_context_limit(pool: &SqlitePool) -> Result<bool> {
+async fn maybe_backfill_legacy_ai_model_context_limit(
+    pool: &SqlitePool,
+    sqlite_writer: &SqliteWriteCoordinator,
+) -> Result<bool> {
     let Some(limit) = load_legacy_ai_model_context_limit_from_env()? else {
         return Ok(false);
     };
 
     let now = Utc::now().to_rfc3339();
-    let result = sqlx::query(
-        r#"
-        UPDATE admin_runtime_settings
-        SET
-          ai_model_context_limit = ?,
-          ai_model_context_limit_migrated_at = ?,
-          updated_at = ?
-        WHERE
-          id = 1
-          AND ai_model_context_limit IS NULL
-          AND ai_model_context_limit_migrated_at IS NULL
-        "#,
-    )
-    .bind(i64::from(limit))
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(pool)
-    .await?;
+    let result = sqlite_writer
+        .write("admin_runtime_context_limit_backfill", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE admin_runtime_settings
+                SET
+                  ai_model_context_limit = ?,
+                  ai_model_context_limit_migrated_at = ?,
+                  updated_at = ?
+                WHERE
+                  id = 1
+                  AND ai_model_context_limit IS NULL
+                  AND ai_model_context_limit_migrated_at IS NULL
+                "#,
+            )
+            .bind(i64::from(limit))
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await?;
     Ok(result.rows_affected() > 0)
 }
 
-async fn maybe_backfill_legacy_llm_models(pool: &SqlitePool, config: &AppConfig) -> Result<bool> {
+async fn maybe_backfill_legacy_llm_models(
+    pool: &SqlitePool,
+    sqlite_writer: &SqliteWriteCoordinator,
+    config: &AppConfig,
+) -> Result<bool> {
     let models = default_llm_models(config);
     if models.is_empty() {
         return Ok(false);
@@ -961,35 +997,41 @@ async fn maybe_backfill_legacy_llm_models(pool: &SqlitePool, config: &AppConfig)
 
     let now = Utc::now().to_rfc3339();
     let serialized = serialize_llm_models_json(&models);
-    let result = sqlx::query(
-        r#"
-        UPDATE admin_runtime_settings
-        SET
-          llm_models_json = ?,
-          updated_at = ?
-        WHERE
-          id = 1
-          AND TRIM(COALESCE(llm_models_json, '')) IN ('', '[]')
-        "#,
-    )
-    .bind(serialized.as_str())
-    .bind(now.as_str())
-    .execute(pool)
-    .await?;
+    let result = sqlite_writer
+        .write("admin_runtime_models_backfill", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE admin_runtime_settings
+                SET
+                  llm_models_json = ?,
+                  updated_at = ?
+                WHERE
+                  id = 1
+                  AND TRIM(COALESCE(llm_models_json, '')) IN ('', '[]')
+                "#,
+            )
+            .bind(serialized.as_str())
+            .bind(now.as_str())
+            .execute(pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await?;
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn load_or_seed_runtime_settings(
+pub async fn load_or_seed_runtime_settings_with_writer(
     pool: &SqlitePool,
+    sqlite_writer: &SqliteWriteCoordinator,
     config: &AppConfig,
 ) -> Result<AdminRuntimeSettingsSnapshot> {
     if let Some(snapshot) = fetch_runtime_settings(pool).await? {
         let mut backfilled = false;
         if snapshot.ai_model_context_limit.is_none() {
-            backfilled |= maybe_backfill_legacy_ai_model_context_limit(pool).await?;
+            backfilled |= maybe_backfill_legacy_ai_model_context_limit(pool, sqlite_writer).await?;
         }
         if snapshot.llm_models.is_empty() {
-            backfilled |= maybe_backfill_legacy_llm_models(pool, config).await?;
+            backfilled |= maybe_backfill_legacy_llm_models(pool, sqlite_writer, config).await?;
         }
         if backfilled {
             return fetch_runtime_settings(pool).await?.ok_or_else(|| {
@@ -1014,71 +1056,96 @@ pub async fn load_or_seed_runtime_settings(
         daily_brief_schedule_local_time: default_daily_brief_schedule_local_time(config),
     };
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO admin_runtime_settings (
-          id,
-          llm_max_concurrency,
-          ai_model_context_limit,
-          ai_model_context_limit_migrated_at,
-          llm_models_json,
-          translation_general_worker_concurrency,
-          translation_dedicated_worker_concurrency,
-          repo_release_worker_concurrency,
-          daily_brief_schedule_local_time,
-          created_at,
-          updated_at
-        )
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO NOTHING
-        "#,
-    )
-    .bind(i64::try_from(snapshot.llm_max_concurrency).unwrap_or(i64::MAX))
-    .bind(snapshot.ai_model_context_limit.map(i64::from))
-    .bind(Option::<&str>::None)
-    .bind(serialize_llm_models_json(&snapshot.llm_models))
-    .bind(i64::try_from(snapshot.translation_general_worker_concurrency).unwrap_or(i64::MAX))
-    .bind(i64::try_from(snapshot.translation_dedicated_worker_concurrency).unwrap_or(i64::MAX))
-    .bind(i64::try_from(snapshot.repo_release_worker_concurrency).unwrap_or(i64::MAX))
-    .bind(briefs::format_daily_brief_local_time(
-        snapshot.daily_brief_schedule_local_time,
-    ))
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(pool)
-    .await?;
+    sqlite_writer
+        .write("admin_runtime_settings_seed", |_| async {
+            sqlx::query(
+                r#"
+                INSERT INTO admin_runtime_settings (
+                  id,
+                  llm_max_concurrency,
+                  ai_model_context_limit,
+                  ai_model_context_limit_migrated_at,
+                  llm_models_json,
+                  translation_general_worker_concurrency,
+                  translation_dedicated_worker_concurrency,
+                  repo_release_worker_concurrency,
+                  daily_brief_schedule_local_time,
+                  created_at,
+                  updated_at
+                )
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+                "#,
+            )
+            .bind(i64::try_from(snapshot.llm_max_concurrency).unwrap_or(i64::MAX))
+            .bind(snapshot.ai_model_context_limit.map(i64::from))
+            .bind(Option::<&str>::None)
+            .bind(serialize_llm_models_json(&snapshot.llm_models))
+            .bind(
+                i64::try_from(snapshot.translation_general_worker_concurrency).unwrap_or(i64::MAX),
+            )
+            .bind(
+                i64::try_from(snapshot.translation_dedicated_worker_concurrency)
+                    .unwrap_or(i64::MAX),
+            )
+            .bind(i64::try_from(snapshot.repo_release_worker_concurrency).unwrap_or(i64::MAX))
+            .bind(briefs::format_daily_brief_local_time(
+                snapshot.daily_brief_schedule_local_time,
+            ))
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await?;
     fetch_runtime_settings(pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("admin runtime settings row missing after seed"))
 }
 
+#[cfg(test)]
+pub async fn load_or_seed_runtime_settings(
+    pool: &SqlitePool,
+    config: &AppConfig,
+) -> Result<AdminRuntimeSettingsSnapshot> {
+    let sqlite_writer = SqliteWriteCoordinator::new();
+    load_or_seed_runtime_settings_with_writer(pool, &sqlite_writer, config).await
+}
+
 pub async fn update_llm_runtime_settings(
     pool: &SqlitePool,
+    sqlite_writer: &SqliteWriteCoordinator,
     llm_max_concurrency: usize,
     ai_model_context_limit: Option<u32>,
     llm_models: &[String],
 ) -> Result<AdminRuntimeSettingsSnapshot> {
     let now = Utc::now().to_rfc3339();
     let serialized_llm_models = serialize_llm_models_json(llm_models);
-    sqlx::query(
-        r#"
-        UPDATE admin_runtime_settings
-        SET
-          llm_max_concurrency = ?,
-          ai_model_context_limit = ?,
-          llm_models_json = ?,
-          ai_model_context_limit_migrated_at = COALESCE(ai_model_context_limit_migrated_at, ?),
-          updated_at = ?
-        WHERE id = 1
-        "#,
-    )
-    .bind(i64::try_from(llm_max_concurrency).unwrap_or(i64::MAX))
-    .bind(ai_model_context_limit.map(i64::from))
-    .bind(serialized_llm_models.as_str())
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(pool)
-    .await?;
+    sqlite_writer
+        .write_foreground("admin_llm_runtime_settings", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE admin_runtime_settings
+                SET
+                  llm_max_concurrency = ?,
+                  ai_model_context_limit = ?,
+                  llm_models_json = ?,
+                  ai_model_context_limit_migrated_at = COALESCE(ai_model_context_limit_migrated_at, ?),
+                  updated_at = ?
+                WHERE id = 1
+                "#,
+            )
+            .bind(i64::try_from(llm_max_concurrency).unwrap_or(i64::MAX))
+            .bind(ai_model_context_limit.map(i64::from))
+            .bind(serialized_llm_models.as_str())
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await?;
     fetch_runtime_settings(pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("admin runtime settings row missing after llm update"))
@@ -1086,25 +1153,31 @@ pub async fn update_llm_runtime_settings(
 
 pub async fn update_translation_runtime_settings(
     pool: &SqlitePool,
+    sqlite_writer: &SqliteWriteCoordinator,
     general_worker_concurrency: usize,
     dedicated_worker_concurrency: usize,
 ) -> Result<AdminRuntimeSettingsSnapshot> {
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE admin_runtime_settings
-        SET
-          translation_general_worker_concurrency = ?,
-          translation_dedicated_worker_concurrency = ?,
-          updated_at = ?
-        WHERE id = 1
-        "#,
-    )
-    .bind(i64::try_from(general_worker_concurrency).unwrap_or(i64::MAX))
-    .bind(i64::try_from(dedicated_worker_concurrency).unwrap_or(i64::MAX))
-    .bind(now.as_str())
-    .execute(pool)
-    .await?;
+    sqlite_writer
+        .write_foreground("admin_translation_runtime_settings", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE admin_runtime_settings
+                SET
+                  translation_general_worker_concurrency = ?,
+                  translation_dedicated_worker_concurrency = ?,
+                  updated_at = ?
+                WHERE id = 1
+                "#,
+            )
+            .bind(i64::try_from(general_worker_concurrency).unwrap_or(i64::MAX))
+            .bind(i64::try_from(dedicated_worker_concurrency).unwrap_or(i64::MAX))
+            .bind(now.as_str())
+            .execute(pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await?;
     fetch_runtime_settings(pool).await?.ok_or_else(|| {
         anyhow::anyhow!("admin runtime settings row missing after translation update")
     })
@@ -1152,7 +1225,9 @@ pub async fn load_llm_models_in_transaction(
 pub async fn sync_persisted_runtime_settings(
     state: std::sync::Arc<AppState>,
 ) -> Result<AdminRuntimeSettingsSnapshot> {
-    let snapshot = load_or_seed_runtime_settings(&state.pool, &state.config).await?;
+    let snapshot =
+        load_or_seed_runtime_settings_with_writer(&state.pool, &state.sqlite_writer, &state.config)
+            .await?;
 
     state
         .llm_scheduler
@@ -1406,8 +1481,9 @@ mod tests {
     #[tokio::test]
     async fn update_llm_recovery_runtime_config_persists_normalized_values() {
         let pool = setup_pool().await;
+        let sqlite_writer = SqliteWriteCoordinator::new();
 
-        let updated = update_llm_recovery_runtime_config(&pool, true, 140)
+        let updated = update_llm_recovery_runtime_config(&pool, &sqlite_writer, true, 140)
             .await
             .expect("update recovery runtime config");
         assert_eq!(
@@ -1427,6 +1503,7 @@ mod tests {
     #[tokio::test]
     async fn llm_model_health_round_trips_and_rejects_unknown_failure_classes() {
         let pool = setup_pool().await;
+        let sqlite_writer = SqliteWriteCoordinator::new();
         let health = LlmModelHealth {
             model: "configured-model".to_owned(),
             relevant_failure_count: 2,
@@ -1436,7 +1513,7 @@ mod tests {
             last_failure_at: Some("2026-08-30T00:01:00+00:00".to_owned()),
         };
 
-        upsert_llm_model_health(&pool, &health)
+        upsert_llm_model_health(&pool, &sqlite_writer, &health)
             .await
             .expect("upsert health");
         assert_eq!(
@@ -1448,7 +1525,11 @@ mod tests {
             last_failure_class: Some("upstream_response".to_owned()),
             ..health.clone()
         };
-        assert!(upsert_llm_model_health(&pool, &invalid).await.is_err());
+        assert!(
+            upsert_llm_model_health(&pool, &sqlite_writer, &invalid)
+                .await
+                .is_err()
+        );
 
         delete_llm_model_health(&pool, health.model.as_str())
             .await
@@ -1475,13 +1556,14 @@ mod tests {
 
         update_llm_runtime_settings(
             &pool,
+            &state.sqlite_writer,
             4,
             Some(32_768),
             &["gpt-4o-mini".to_owned(), "gpt-4.1-mini".to_owned()],
         )
         .await
         .expect("update llm settings");
-        update_translation_runtime_settings(&pool, 5, 2)
+        update_translation_runtime_settings(&pool, &state.sqlite_writer, 5, 2)
             .await
             .expect("update translation settings");
 

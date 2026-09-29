@@ -1426,7 +1426,8 @@ impl TranslationSchedulerController {
         pool: &SqlitePool,
         config: TranslationRuntimeConfig,
     ) -> Result<TranslationRuntimeConfig> {
-        self.sync_runtime_with_config_internal(pool, None, config)
+        let sqlite_writer = SqliteWriteCoordinator::new();
+        self.sync_runtime_with_config_internal(pool, &sqlite_writer, config)
             .await
     }
 
@@ -1435,14 +1436,14 @@ impl TranslationSchedulerController {
         state: &AppState,
         config: TranslationRuntimeConfig,
     ) -> Result<TranslationRuntimeConfig> {
-        self.sync_runtime_with_config_internal(&state.pool, Some(&state.sqlite_writer), config)
+        self.sync_runtime_with_config_internal(&state.pool, &state.sqlite_writer, config)
             .await
     }
 
     async fn sync_runtime_with_config_internal(
         &self,
         pool: &SqlitePool,
-        sqlite_writer: Option<&SqliteWriteCoordinator>,
+        sqlite_writer: &SqliteWriteCoordinator,
         config: TranslationRuntimeConfig,
     ) -> Result<TranslationRuntimeConfig> {
         let config = TranslationRuntimeConfig::new(
@@ -1619,7 +1620,8 @@ impl TranslationSchedulerController {
 
     #[cfg(test)]
     async fn remove_worker_runtime(&self, pool: &SqlitePool, worker_id: &str) -> Result<()> {
-        self.remove_worker_runtime_internal(pool, None, worker_id)
+        let sqlite_writer = SqliteWriteCoordinator::new();
+        self.remove_worker_runtime_internal(pool, &sqlite_writer, worker_id)
             .await
     }
 
@@ -1628,14 +1630,14 @@ impl TranslationSchedulerController {
         state: &AppState,
         worker_id: &str,
     ) -> Result<()> {
-        self.remove_worker_runtime_internal(&state.pool, Some(&state.sqlite_writer), worker_id)
+        self.remove_worker_runtime_internal(&state.pool, &state.sqlite_writer, worker_id)
             .await
     }
 
     async fn remove_worker_runtime_internal(
         &self,
         pool: &SqlitePool,
-        sqlite_writer: Option<&SqliteWriteCoordinator>,
+        sqlite_writer: &SqliteWriteCoordinator,
         worker_id: &str,
     ) -> Result<()> {
         let desired_config = self.desired_config().await;
@@ -1921,30 +1923,14 @@ fn collect_running_batch_slot_updates(
         .collect()
 }
 
-async fn sync_running_batch_slot_updates(
-    pool: &SqlitePool,
-    updates: &[RunningBatchSlotUpdate],
-) -> Result<()> {
-    if updates.is_empty() {
-        return Ok(());
-    }
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    sync_running_batch_slot_updates_in_transaction(&mut tx, updates).await?;
-    tx.commit().await?;
-    Ok(())
-}
-
 async fn sync_running_batch_slot_updates_with_writer(
-    sqlite_writer: Option<&SqliteWriteCoordinator>,
+    sqlite_writer: &SqliteWriteCoordinator,
     pool: &SqlitePool,
     updates: &[RunningBatchSlotUpdate],
 ) -> Result<()> {
     if updates.is_empty() {
         return Ok(());
     }
-    let Some(sqlite_writer) = sqlite_writer else {
-        return sync_running_batch_slot_updates(pool, updates).await;
-    };
     let (_permit, mut tx) = sqlite_writer
         .begin_immediate(pool, "translation_worker_runtime_slots")
         .await?;
@@ -2541,6 +2527,7 @@ pub async fn admin_patch_translation_runtime_config(
 
     admin_runtime::update_translation_runtime_settings(
         &state.pool,
+        &state.sqlite_writer,
         general_worker_concurrency,
         dedicated_worker_concurrency,
     )
@@ -10346,9 +10333,14 @@ mod tests {
         .await
         .expect("mark work item due for recovery");
 
-        crate::admin_runtime::update_llm_recovery_runtime_config(&pool, true, 100)
-            .await
-            .expect("enable full recovery rollout");
+        crate::admin_runtime::update_llm_recovery_runtime_config(
+            &pool,
+            &state.sqlite_writer,
+            true,
+            100,
+        )
+        .await
+        .expect("enable full recovery rollout");
         recover_due_translation_work_items(state.as_ref())
             .await
             .expect("recover due work item");

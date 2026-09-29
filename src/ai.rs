@@ -2469,7 +2469,9 @@ async fn persist_model_failure_health(
     else {
         return;
     };
-    if let Err(err) = admin_runtime::upsert_llm_model_health(&state.pool, &health).await {
+    if let Err(err) =
+        admin_runtime::upsert_llm_model_health(&state.pool, &state.sqlite_writer, &health).await
+    {
         tracing::warn!(
             event = "sqlite.write",
             operation = "ai.llm_model_health_upsert",

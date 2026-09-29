@@ -516,7 +516,7 @@ pub async fn enqueue_subscription_run_if_due(
         &task.task_id,
     )
     .await?;
-    admin_runtime::clear_sync_auto_fetch_effective_at(&state.pool).await?;
+    admin_runtime::clear_sync_auto_fetch_effective_at(&state.pool, &state.sqlite_writer).await?;
     Ok(Some(task.task_id))
 }
 

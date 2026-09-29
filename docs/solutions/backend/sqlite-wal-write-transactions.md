@@ -63,6 +63,7 @@ Keep this targeted to write-intent paths such as:
 - incremental sync writes such as `starred_repos` upsert batches, notification inbox upsert / open-url repair, and `public_repo_release_usage` metadata refresh, which may look harmless in isolation but still bypass the single-writer contract when they run per page, per user, or per background worker
 - scheduler bookkeeping such as `daily_brief_hour_slots.last_dispatch_at`, `scheduled_task_dispatch_state`, or brief retry failure marks, because these low-payload writes still run on periodic background cadences and can starve claim / heartbeat paths if they bypass the coordinator
 - materialized governance or scheduler-pool rebuilds such as `repo_refresh_governance_snapshots`, where candidate aggregation may be large but the SQLite writer permit must cover only short cleanup/upsert/reconcile chunks
+- admin runtime settings seed/backfill/update, LLM recovery flags/model health, translation worker runtime slots, reaction PAT state, dashboard rollups, scheduled slot patches, and public release usage metadata; small rows are still writer contention when they run on startup, per request, or per worker tick
 
 ## Guardrails / Reuse Notes
 
@@ -74,6 +75,8 @@ Keep this targeted to write-intent paths such as:
 - Do not solve this by forcing `OCTORILL_SQLITE_POOL_MAX_CONNECTIONS=1`; that hides the race by serializing the whole app and can starve HTTP reads.
 - Do not lower worker/LLM concurrency as the durable database fix. Keep network and AI concurrency high; coordinate only the SQLite write section.
 - Do not preserve direct high-frequency writes to the pool in worker lifecycle paths. If a path can run per worker or per heartbeat, it needs a coordinator lane.
+- Do not make the writer dependency optional in production helpers. A test-only wrapper may construct a local coordinator for an isolated pool, but production code must require the shared coordinator so a missing argument cannot silently fall back to raw `BEGIN IMMEDIATE` or pool writes.
+- Keep a source-quality guard over audited production modules. It should reject direct pool writes and raw `BEGIN IMMEDIATE`, while limiting exceptions to test-only/bootstrap/read-only code or a narrowly reviewed marker with an explanation at the write site.
 - Do not assume “claim path already uses coordinator” is enough. Any follow-up state transition that runs per claimed batch or per work item start can still leak `database is locked` if it writes straight to the pool.
 - Do not convert pure read transactions to `BEGIN IMMEDIATE`; that would unnecessarily block writers.
 - Do not hold the writer permit around GitHub API, AI calls, HTTP calls, or long computation. Prepare data first, including notification-thread refreshes or other repair lookups, then acquire the permit, write quickly, and release it. If the repair writes back into rows that other sync paths can update concurrently, re-read the current row inside the writer transaction before applying the repair so stale lookup results do not overwrite fresher fields, and prefer the refreshed thread metadata only when its timestamp is at least as new as the current row.
