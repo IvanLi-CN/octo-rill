@@ -107,11 +107,11 @@
 - 数据库迁移 MUST 将历史 `0081_command_palette_search.sql` 视为兼容证据，不得在新部署中重新执行其全量回填；新的 `0082_command_palette_search_recovery.sql` 只创建搜索 schema、触发器和持久化索引状态。
 - 仓库关联只更新 source flags、system-default follow state 或 observation timestamps 时 MUST NOT 重建 repository/release search documents 或 FTS；只有 repository identity/metadata projection fields 发生变化时才允许刷新关联的搜索投影。
 - 关联快照同步 MUST 保留当前快照中的 repo IDs，只清理已过期 source associations；重复的有效快照不得通过清除再写入制造冗余 association updates。显式用户 follow state MUST 保持权威，不得被 system-default reconciliation 覆盖。
-- 服务 MUST 在 TCP listener 绑定后通过可中断的后台 worker 分阶段建立本地投影。每个 `Background` SQLite 事务最多处理 100 个源 rowid，并提交阶段游标，使重启后可以继续且重复执行保持幂等。
+- 服务 MUST 在 TCP listener 绑定后通过可中断的后台 worker 分阶段建立本地投影。每个 `Background` SQLite 事务最多处理 25 个源 rowid，并提交阶段游标，使重启后可以继续且重复执行保持幂等。事务提交后必须给前台 writer 优先机会，后台连续批次间至少等待 10 ms。
 - FTS MUST 作为可重建缓存维护：FTS corpus 的 document identity MUST 通过本地 mapping table 映射到 FTS rowid，source、lane 和 metadata 维护 MUST 使用 document-specific rowid point update，不得按 `doc_id` 对 FTS corpus 做全表扫描；兼容的旧 FTS 名称可以保留为 point-update view。
 - 新 FTS corpus 在迁移后 MUST 允许为空；索引状态未达到 `ready`，或 repository metadata backfill queue 非空时，搜索 MUST 使用相同授权谓词约束下的 `LIKE` 回退，并通过当前用户的 visible-repository metadata 保持 repository rename、owner 和 canonical target 的可见性。对于 release，查询 MUST 使用当前用户对应 repo 的最新可见 metadata，不得从其他用户的 metadata 行选择名称；current metadata 为空或缺少 canonical target path 时 MUST NOT 回退到旧的 `search_documents` repository、owner、target path 或 target URL projection，canonical target 不可由当前 metadata 解析时必须省略，服务不得为了完成迁移同步重建整个 corpus。
-- repository visibility/identity/metadata 变化 MUST 进入可去重的 metadata queue；source deletion 也 MUST enqueue the affected repo，且每次新的 metadata event MUST 将该 repo 的 release rowid cursor 重置为 0；每个 `Background` SQLite 事务最多刷新 100 个 release projection rows。队列必须在进程重启、低磁盘暂停和前台 writer 竞争后继续处理；worker 在每个完成的 batch 后让出执行权，并在 ready 后继续轮询新队列。
-- worker MUST 在写入前检查数据库目录的 `statvfs` 可用空间；低于 `OCTORILL_SEARCH_INDEX_MIN_FREE_BYTES`（默认 20 GiB）时暂停并将搜索状态标记为 `paused_low_disk`，不得继续写入 FTS/WAL。索引状态 MUST 以 `building`、`ready` 或 `paused_low_disk` 出现在搜索响应中。
+- repository visibility/identity/metadata 变化 MUST 进入可去重的 metadata queue；source deletion 也 MUST enqueue the affected repo，且每次新的 metadata event MUST 将该 repo 的 release rowid cursor 重置为 0；每个 `Background` SQLite 事务最多刷新 25 个 release projection rows。队列必须在进程重启、低磁盘暂停和前台 writer 竞争后继续处理；worker 在每个完成的 batch 后让出执行权，并在 ready 后继续轮询新队列。
+- worker MUST 在写入前检查数据库目录的 `statvfs` 可用空间；低于 `OCTORILL_SEARCH_INDEX_MIN_FREE_BYTES`（默认 20 GiB）时暂停并将搜索状态标记为 `paused_low_disk`，不得继续写入 FTS/WAL。低磁盘状态只在状态转换时写入；暂停和恢复的结构化日志必须包含观测空闲字节数与配置水位。索引状态 MUST 以 `building`、`ready` 或 `paused_low_disk` 出现在搜索响应中。
 - 迁移运行器 MUST 只对白名单历史版本 `81` 接受精确 SHA-384 checksum；dirty、缺失、未知或 checksum 不匹配的迁移历史 MUST 终止启动。
 - covers: 启动可用性、可恢复索引、资源保护与迁移兼容性。
 
@@ -157,7 +157,7 @@
 
 - Method: migration compatibility, schema-only recovery migration, bounded worker and startup fixtures, real association-trigger fixtures for source/follow/timestamp-only updates, repeated social snapshots, plus Demo/Storybook status scenes.
 - covers: `REQ-CPS-013`
-- Pass condition: historical `0081` is accepted only with its exact checksum, fresh databases apply schema-only `0082`, source/follow/timestamp-only association updates leave repository/release search documents and FTS unchanged, repeated snapshots do not clear and re-add current associations, listener startup does not wait for full indexing, worker resumes at persisted cursors in batches of at most 100 rows, metadata fanout resumes from a per-repo release rowid cursor, low disk pauses without FTS writes, and `index_status` is visible in `building`/`paused_low_disk` demo states.
+- Pass condition: historical `0081` is accepted only with its exact checksum, fresh databases apply schema-only `0082`, and an existing corpus upgrade leaves the new FTS cache empty for the background worker; source/follow/timestamp-only association updates leave repository/release search documents and FTS unchanged, repeated snapshots do not clear and re-add current associations, listener startup does not wait for full indexing, worker resumes at persisted cursors in batches of at most 25 rows, metadata fanout resumes from a per-repo release rowid cursor, low disk pauses without FTS writes or repeated status writes and logs the free-space watermark, and `index_status` is visible in `building`/`paused_low_disk` demo states.
 
 ### VER-CPS-008
 
