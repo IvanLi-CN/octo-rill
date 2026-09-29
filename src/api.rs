@@ -26837,7 +26837,13 @@ mod tests {
         assert_eq!(response.items[0].result_type, "release");
         assert_eq!(response.items[0].matched_lane, "translated");
         assert_eq!(response.items[0].matched_lanes, vec!["translated"]);
-        assert_eq!(response.items[0].target.lane.as_deref(), Some("translated"));
+        assert_eq!(
+            response.items[0]
+                .target
+                .as_ref()
+                .and_then(|target| target.lane.as_deref()),
+            Some("translated")
+        );
         assert_eq!(response.remaining_requests, 49);
 
         let Json(filtered) = search(

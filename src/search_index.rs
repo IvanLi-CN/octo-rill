@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use sqlx::{QueryBuilder, Row, Sqlite, Transaction};
 use tokio::task::AbortHandle;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::{sqlite_write::SqliteWritePriority, state::AppState};
 
@@ -26,6 +26,9 @@ const PHASES: &[&str] = &[
     "starred_repos",
     "content_projections",
     "translations",
+    "metadata",
+    "fts_documents",
+    "fts_user_lanes",
 ];
 
 #[cfg(test)]
@@ -51,7 +54,7 @@ pub fn spawn_worker(state: Arc<AppState>) -> AbortHandle {
         tokio::time::sleep(Duration::from_secs(1)).await;
         loop {
             match run_batch(state.as_ref()).await {
-                Ok(BatchOutcome::Ready) => break,
+                Ok(BatchOutcome::Ready) => tokio::time::sleep(RETRY_DELAY).await,
                 Ok(BatchOutcome::Progress) => tokio::task::yield_now().await,
                 Ok(BatchOutcome::Idle | BatchOutcome::Paused) => {
                     tokio::time::sleep(RETRY_DELAY).await;
@@ -63,7 +66,6 @@ pub fn spawn_worker(state: Arc<AppState>) -> AbortHandle {
                 }
             }
         }
-        info!("search projection backfill completed");
     })
     .abort_handle()
 }
@@ -94,7 +96,16 @@ async fn run_batch_with_free_bytes(
     .fetch_optional(&state.pool)
     .await
     .context("read search projection backfill status")?;
-    if current_status.as_deref() == Some("ready") {
+    let ready_queue_pending = if current_status.as_deref() == Some("ready") {
+        sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM search_metadata_backfill_queue)")
+            .fetch_one(&state.pool)
+            .await
+            .context("check pending search metadata work")?
+            != 0
+    } else {
+        false
+    };
+    if current_status.as_deref() == Some("ready") && !ready_queue_pending {
         return Ok(BatchOutcome::Ready);
     }
     if free_bytes < minimum_free_bytes {
@@ -112,20 +123,34 @@ async fn run_batch_with_free_bytes(
         .await?;
     let state_row = load_state(&mut tx).await?;
     if state_row.status == "ready" {
-        tx.rollback().await.ok();
+        let rowids = load_rowids(&mut tx, "metadata", 0).await?;
+        if rowids.is_empty() {
+            tx.rollback().await.ok();
+            drop(permit);
+            return Ok(BatchOutcome::Ready);
+        }
+        process_phase(&mut tx, "metadata", &rowids).await?;
+        tx.commit().await?;
         drop(permit);
-        return Ok(BatchOutcome::Ready);
+        return Ok(BatchOutcome::Progress);
     }
     let phase = phase_index(&state_row.phase)?;
     let rowids = load_rowids(&mut tx, state_row.phase.as_str(), state_row.cursor).await?;
     if rowids.is_empty() {
-        if phase + 1 >= PHASES.len() {
+        let next_phase = if phase + 1 >= PHASES.len() {
+            if !load_rowids(&mut tx, "metadata", 0).await?.is_empty() {
+                Some("metadata")
+            } else {
+                None
+            }
+        } else {
+            Some(PHASES[phase + 1])
+        };
+        if let Some(next_phase) = next_phase {
+            update_state(&mut tx, next_phase, 0, "building", None).await?;
+        } else {
             update_state(&mut tx, "translations", 0, "ready", None).await?;
-            tx.commit().await?;
-            drop(permit);
-            return Ok(BatchOutcome::Ready);
         }
-        update_state(&mut tx, PHASES[phase + 1], 0, "building", None).await?;
         tx.commit().await?;
         drop(permit);
         return Ok(BatchOutcome::Idle);
@@ -140,7 +165,11 @@ async fn run_batch_with_free_bytes(
     )
     .await?;
     process_phase(&mut tx, state_row.phase.as_str(), &rowids).await?;
-    let next_cursor = *rowids.last().expect("non-empty batch");
+    let next_cursor = if state_row.phase == "metadata" {
+        0
+    } else {
+        *rowids.last().expect("non-empty batch")
+    };
     update_state(
         &mut tx,
         state_row.phase.as_str(),
@@ -276,14 +305,27 @@ async fn load_rowids(
         "translations" => {
             "SELECT rowid FROM ai_translations WHERE lang = 'zh-CN' AND status IN ('ready', 'disabled', 'missing') AND (title IS NOT NULL OR summary IS NOT NULL) AND rowid > ? ORDER BY rowid LIMIT ?"
         }
+        "metadata" => {
+            "SELECT repo_id AS rowid FROM search_metadata_backfill_queue ORDER BY updated_at, repo_id LIMIT 1"
+        }
+        "fts_documents" => {
+            "SELECT rowid FROM search_documents WHERE rowid > ? ORDER BY rowid LIMIT ?"
+        }
+        "fts_user_lanes" => {
+            "SELECT rowid FROM search_document_user_lanes WHERE rowid > ? ORDER BY rowid LIMIT ?"
+        }
         _ => bail!("unknown search projection phase {phase}"),
     };
-    let rows = sqlx::query(query)
-        .bind(cursor)
-        .bind(INDEX_BATCH_SIZE)
-        .fetch_all(&mut **tx)
-        .await
-        .with_context(|| format!("load rowids for search phase {phase}"))?;
+    let rows = if phase == "metadata" {
+        sqlx::query(query).fetch_all(&mut **tx).await
+    } else {
+        sqlx::query(query)
+            .bind(cursor)
+            .bind(INDEX_BATCH_SIZE)
+            .fetch_all(&mut **tx)
+            .await
+    }
+    .with_context(|| format!("load rowids for search phase {phase}"))?;
     Ok(rows.into_iter().map(|row| row.get("rowid")).collect())
 }
 
@@ -343,10 +385,64 @@ async fn process_phase(
         }
         "content_projections" => apply_content_projection_batch(tx, rowids).await?,
         "translations" => apply_translation_batch(tx, rowids).await?,
+        "metadata" => apply_metadata_batch(tx, rowids).await?,
+        "fts_documents" | "fts_user_lanes" => {}
         _ => bail!("unknown search projection phase {phase}"),
     }
 
     refresh_phase_fts(tx, phase, rowids).await?;
+    Ok(())
+}
+
+async fn apply_metadata_batch(tx: &mut Transaction<'_, Sqlite>, repo_ids: &[i64]) -> Result<()> {
+    for repo_id in repo_ids {
+        let cursor = sqlx::query_scalar::<_, i64>(
+            "SELECT release_cursor FROM search_metadata_backfill_queue WHERE repo_id = ?",
+        )
+        .bind(repo_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .unwrap_or_default();
+        let rowids = sqlx::query(
+            "SELECT rowid FROM search_documents WHERE resource_type = 'release' AND repo_id = ? AND rowid > ? ORDER BY rowid LIMIT ?",
+        )
+        .bind(repo_id)
+        .bind(cursor)
+        .bind(INDEX_BATCH_SIZE)
+        .fetch_all(&mut **tx)
+        .await?
+        .into_iter()
+        .map(|row| row.get::<i64, _>("rowid"))
+        .collect::<Vec<_>>();
+        if rowids.is_empty() {
+            sqlx::query("DELETE FROM search_metadata_backfill_queue WHERE repo_id = ?")
+                .bind(repo_id)
+                .execute(&mut **tx)
+                .await?;
+            continue;
+        }
+        let mut update = QueryBuilder::<Sqlite>::new(
+            "UPDATE search_documents SET repo_full_name = (SELECT repo_full_name FROM search_release_metadata WHERE id = search_documents.id), owner_login = (SELECT owner_login FROM search_release_metadata WHERE id = search_documents.id), target_path = (SELECT target_path FROM search_release_metadata WHERE id = search_documents.id) WHERE rowid IN (",
+        );
+        push_rowids(&mut update, &rowids);
+        update.push(")");
+        update.build().execute(&mut **tx).await?;
+        let next_cursor = *rowids.last().expect("non-empty metadata batch");
+        if rowids.len() < INDEX_BATCH_SIZE as usize {
+            sqlx::query("DELETE FROM search_metadata_backfill_queue WHERE repo_id = ?")
+                .bind(repo_id)
+                .execute(&mut **tx)
+                .await?;
+        } else {
+            sqlx::query(
+                "UPDATE search_metadata_backfill_queue SET release_cursor = ? WHERE repo_id = ?",
+            )
+            .bind(next_cursor)
+            .bind(repo_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
     Ok(())
 }
 
@@ -476,6 +572,27 @@ async fn refresh_phase_fts(
     phase: &str,
     rowids: &[i64],
 ) -> Result<()> {
+    if phase == "metadata" {
+        return Ok(());
+    }
+    if phase == "fts_documents" {
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "INSERT INTO search_documents_fts (doc_id,title,body,repo_full_name,translated_text,smart_text) SELECT id,COALESCE(title,''),COALESCE(body,''),COALESCE(repo_full_name,''),COALESCE(translated_text,''),COALESCE(smart_text,'') FROM search_documents WHERE rowid IN (",
+        );
+        push_rowids(&mut query, rowids);
+        query.push(")");
+        query.build().execute(&mut **tx).await?;
+        return Ok(());
+    }
+    if phase == "fts_user_lanes" {
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "INSERT INTO search_document_user_lanes_fts (doc_id,user_id,translated_text,smart_text) SELECT document_id,user_id,COALESCE(translated_text,''),COALESCE(smart_text,'') FROM search_document_user_lanes WHERE rowid IN (",
+        );
+        push_rowids(&mut query, rowids);
+        query.push(")");
+        query.build().execute(&mut **tx).await?;
+        return Ok(());
+    }
     let (query, lane) = match phase {
         "releases" => (
             "SELECT 'release:'||release_id AS id FROM repo_releases WHERE rowid IN (",
@@ -522,14 +639,6 @@ async fn refresh_phase_fts(
     if ids.is_empty() {
         return Ok(());
     }
-    let mut delete = QueryBuilder::<Sqlite>::new(if lane {
-        "DELETE FROM search_document_user_lanes_fts WHERE doc_id IN ("
-    } else {
-        "DELETE FROM search_documents_fts WHERE doc_id IN ("
-    });
-    push_ids(&mut delete, &ids);
-    delete.push(")");
-    delete.build().execute(&mut **tx).await?;
     let mut insert = QueryBuilder::<Sqlite>::new(if lane {
         "INSERT INTO search_document_user_lanes_fts (doc_id,user_id,translated_text,smart_text) SELECT document_id,user_id,COALESCE(translated_text,''),COALESCE(smart_text,'') FROM search_document_user_lanes WHERE document_id IN ("
     } else {

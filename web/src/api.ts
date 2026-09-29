@@ -294,7 +294,7 @@ export type SearchResult = {
 	matched_lanes?: SearchLane[];
 	target_path?: string;
 	target_url?: string | null;
-	target?: { href: string; lane?: SearchLane | null };
+	target?: { href?: string | null; lane?: SearchLane | null };
 };
 
 export type SearchResponse = {
