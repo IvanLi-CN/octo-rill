@@ -14342,6 +14342,7 @@ pub(crate) async fn upsert_user_repo_association_tx(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn clear_user_repo_association_source_except_repo_ids_tx(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     user_id: &str,
@@ -14424,6 +14425,7 @@ pub(crate) async fn clear_user_repo_association_source_except_repo_ids_tx(
     Ok(())
 }
 
+#[cfg(test)]
 fn push_association_stale_repo_filter(
     query: &mut QueryBuilder<'_, Sqlite>,
     keep_repo_ids: &[i64],

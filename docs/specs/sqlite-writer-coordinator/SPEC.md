@@ -8,6 +8,12 @@
 - SQLite WAL 允许读写并发，但仍只有一个 writer；当高并发 worker 直接争抢写事务时，`database is locked` 会外溢到用户请求并造成 500。
 - 既有修复已把部分 read-then-write 事务改为 `BEGIN IMMEDIATE`，但如果写协调只覆盖少数后台 claim/finalize 路径，登录/session、job enqueue、LLM lifecycle、translation batch 启动状态切换、repo release reaction refresh 持久化与 repo release recovery 等路径仍会在高 worker 并发下直接争抢 SQLite writer。
 
+## Context and Scope
+
+- Context: OctoRill 的 HTTP 请求、后台 worker 与调度状态共享 SQLite；应用内 writer coordinator 负责把短 SQLite 写段排队，同时保留网络和 AI 阶段的并发。
+- In scope: SQLite writer permit、`BEGIN IMMEDIATE` bounded retry、session/job enqueue 热路径、social activity snapshot 分块持久化与并发回归验证。
+- Out of scope: 数据库迁移到其他引擎、降低业务 worker 并发、生产部署和 API 响应结构变更。
+
 ## 目标 / 非目标
 
 ### Goals
@@ -43,16 +49,37 @@
 - 改变现有 API 响应结构。
 - 生产部署操作。
 
-## 需求（Requirements）
+## Requirements
 
 ### MUST
 
+### REQ-SQLITE-WRITER-001
+
 - 写协调层必须以应用内单 writer permit 串行化 SQLite 写入段。
+
+### REQ-SQLITE-WRITER-002
+
 - 前台写入必须能在当前 writer 释放后优先于已排队后台写入运行。
+
+### REQ-SQLITE-WRITER-003
+
 - best-effort 写入不得因为后台 writer backlog 破坏用户主要流程。
+
+### REQ-SQLITE-WRITER-004
+
 - 网络请求、GitHub API、AI 调用与长耗时计算不得在 writer permit 内执行。
+
+### REQ-SQLITE-WRITER-005
+
 - busy/locked retry 必须有上限，避免无限等待。
+
+### REQ-SQLITE-WRITER-006
+
 - 关键写入 lane 必须有结构化 tracing 字段。
+
+### REQ-SQLITE-WRITER-007
+
+- 生产量级 social activity snapshot 必须在 writer permit 外聚合候选，并以固定 64 行 chunk 独立提交；chunk 之间必须释放 permit，且 stale cleanup 必须保留显式 follow 选择与可中断恢复语义。
 
 ### SHOULD
 
@@ -72,6 +99,7 @@
 - translation batch 的启动状态切换必须在单个短事务内完成：`translation_batches` 的 `queued -> running`、关联 `translation_work_items` 的 `running` 标记与 lease 元数据更新都要在 writer permit 内提交，AI 调用与后续长计算继续留在 permit 外。
 - feed reaction refresh 的 counts 持久化属于非关键后台写入；当 writer permit 不可得或 SQLite busy 时允许跳过持久化，但必须保留 live payload 返回与结构化降级证据。
 - repo refresh governance rebuild 属于生产量级集合重建路径：候选聚合留在 writer permit 外，stale cleanup、snapshot upsert、member reconciliation、snapshot completion 与 cycle reconciliation 分阶段提交；snapshot/member 写入固定 500 行 chunk。
+- social activity snapshot 属于生产量级集合重建路径：follower、owned-repo/member、history 与 association cleanup 的候选必须在 writer permit 外聚合；持久化使用固定 64 行 chunk，每个 chunk 独立取得并释放 writer permit，且 chunk 之间允许前台写入插入。snapshot baseline 与幂等 history materialization 必须保持可中断恢复，stale cleanup 不得删除当前 target 之外的显式 follow 选择。
 - HTTP 请求读取数据时不需要 writer permit；更新用户活跃时间等 best-effort 写入使用非阻塞 writer 尝试，拿不到 permit 时直接跳过。
 - 如果 SQLite 返回 busy/locked，coordinator 使用短退避重试，并在耗尽后返回原始错误上下文。
 
@@ -123,6 +151,24 @@
   When 重建 governance snapshots 与 reconciliation
   Then 单个 writer permit 只覆盖一个短阶段或一个 500 行 chunk，日志包含 `snapshot_upsert_chunks`、member reconciliation chunk count 与 `max_writer_chunk_elapsed_ms`。
 
+- Given social activity snapshot 需要处理数百个 owned repo/member association 与至少 100000 条 search documents 共存的数据库
+  When snapshot 写入运行并暂停在第一个 chunk 之后
+  Then `GET /api/dashboard/updates`、session save 与 `jobs::enqueue_task` 仍能完成；日志或测试证据分别报告候选读取耗时、writer wait、query/write chunk 耗时及 busy/500 结果，且每个 social snapshot writer chunk 不超过固定 64 行。
+
+## Verification
+
+### VER-SQLITE-WRITER-001
+
+- Method: SQLite WAL tests with multiple pool connections, competing foreground/background writes, busy retry fixtures, and coordinator telemetry assertions.
+- covers: REQ-SQLITE-WRITER-001, REQ-SQLITE-WRITER-002, REQ-SQLITE-WRITER-003, REQ-SQLITE-WRITER-004, REQ-SQLITE-WRITER-005, REQ-SQLITE-WRITER-006
+- Pass condition: writer sections are serialized, foreground work is admitted ahead of queued background work, best-effort work may skip without breaking the main request, retry is bounded, and logs expose lane, priority, wait, attempt and elapsed fields.
+
+### VER-SQLITE-WRITER-002
+
+- Method: social activity snapshot regression and production-shaped concurrency test with 397 owned-repo associations, at least 100000 search documents, dashboard updates, persisted session save and task enqueue.
+- covers: REQ-SQLITE-WRITER-001, REQ-SQLITE-WRITER-002, REQ-SQLITE-WRITER-004, REQ-SQLITE-WRITER-006, REQ-SQLITE-WRITER-007
+- Pass condition: candidate reads happen outside the writer permit, every write transaction is bounded to 64 candidates or a single baseline row, the first chunk releases the permit before the foreground operations run, no busy/500 result occurs, explicit follow state remains intact, and the snapshot can finish after resumption.
+
 ## 验收清单（Acceptance checklist）
 
 - 核心路径的长期行为已被明确描述。
@@ -150,7 +196,7 @@
 
 ## Visual Evidence
 
-PR: none
+- None
 
 Not applicable。
 
@@ -158,6 +204,10 @@ Not applicable。
 
 - 风险：单 writer permit 内如果保留长事务，会把锁竞争从 SQLite 转移成应用排队长尾；实现必须保持写入段短小。
 - 假设：SQLite 继续作为当前主数据库，生产部署另行确认。
+
+## Related ADRs
+
+None
 
 ## 参考（References）
 

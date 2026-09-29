@@ -19,10 +19,17 @@
 
 ## Key Reasons / Replacements
 
+- 2026-09-29：social activity snapshot 的完整 owned-repo/member/follower 重建仍把大量候选处理放在单个 writer permit 内，导致前台 dashboard、session 与 task enqueue 只能等待整个快照；决定把候选聚合移到 permit 外，并以固定 64 行 chunk 分阶段提交，保留 explicit follow、stale cleanup、幂等 history 与 baseline recovery 语义。
+
 - SQLite WAL 的单 writer 约束需要在应用内显式建模，否则高并发后台任务会把写锁竞争暴露到用户请求。
 - 既有 `BEGIN IMMEDIATE` 修复解决 read-then-write stale snapshot 问题，但不足以提供全局写入背压与可观测排队。
 - worker 数主要缓解网络 IO 吞吐，不能作为 SQLite 写入背压的长期旋钮；数据库写段必须集中排队，网络/AI 阶段继续并发。
 - writer permit 不覆盖 GitHub / AI / 网络阶段，避免把数据库单 writer 约束扩大成业务并发降级。
+- 大集合快照的读侧候选聚合不需要占用 SQLite writer；固定短 chunk 能让前台写入在快照进行期间获得调度机会，同时把 interruption recovery 边界落在已提交 chunk 与 baseline 上。
+
+## Related Changes
+
+- `src/sync.rs` 与 `src/sqlite_write.rs` 增加 social snapshot 分块 writer telemetry、writer wait/query/chunk 分离计时，以及 397 associations + 100000 search documents 下 dashboard/session/enqueue 并发验证。
 
 ## References
 

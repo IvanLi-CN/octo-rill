@@ -15,7 +15,7 @@
 - `job_tasks` enqueue/event/cancel/claim/finalize/heartbeat 已接入 writer coordinator；enqueue/event/cancel 使用 foreground lane。
 - session create/save/delete 使用 foreground lane 与短 busy retry；过期 session 清理使用 best-effort lane。
 - repo release attach/claim/finalize/watchers/heartbeat/fail/upsert/sync-state 已接入 writer coordinator。
-- social activity snapshot 与 feed activity event 持久化已接入 writer coordinator；读取 current-member / 去重快照后再写入 `social_activity_events` 的事务现在也通过 `BEGIN IMMEDIATE` 串行进入 SQLite writer。
+- social activity snapshot 与 feed activity event 持久化已接入 writer coordinator；social snapshot 先在 permit 外读取 current-member、history、stale association 与 stale repo/member 候选，再按固定 64 行 chunk 分阶段执行 `BEGIN IMMEDIATE`，chunk 之间释放 permit。current-member/history materialization、baseline、stale cleanup 与 association source 清理保持幂等和可中断恢复，并记录候选读取、writer wait、query elapsed、chunk elapsed 与 chunk count。
 - translation request/batch claim/finalize/recovery/heartbeat 已接入 writer coordinator。
 - translation batch 启动写段已补齐到 writer coordinator：`translation_batches` 的 `queued -> running` 与 `translation_work_items` 的 `running` 标记在单个短事务内串行提交，AI 调用继续留在 permit 外。
 - LLM call insert/event/running/requeue/finalize/heartbeat/recovery 已接入 writer coordinator。
@@ -50,6 +50,7 @@
 - `src/sync.rs` 新增 social activity snapshot 与 feed activity event 在 competing writer 下等待并成功提交的并发回归。
 - `src/api.rs` 新增 feed reaction refresh 在 SQLite writer 压力下跳过持久化但继续返回 live item 的回归。
 - `src/sync.rs` 新增 governance rebuild 对超过 500 个候选 repo 的 chunk stats 回归，并保留 active member reconciliation 语义回归。
+- `src/sync.rs` 新增 social snapshot 在第一个 writer chunk 后释放 permit 的回归，以及 397 个 owned repo association、100000 条 search document 共存时 dashboard updates、session save、task enqueue 与 snapshot chunk 指标的生产形验证。
 - `src/jobs.rs` 新增后台 writer 压力下 `enqueue_task` 等待 coordinator 而不是绕过写入背压的回归测试。
 - `src/jobs.rs` 新增 daily slot dispatch、scheduled dispatch state 与 brief failure mark 在 competing writer 下等待成功提交的并发回归测试。
 - `src/sync.rs` 新增 subscription event 写入在 competing writer 下等待成功提交，以及 subscription history prune 在 writer permit 不可得或 SQLite busy 时降级跳过的回归测试。
