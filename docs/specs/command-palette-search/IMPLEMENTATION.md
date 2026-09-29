@@ -13,7 +13,7 @@
 - `REQ-CPS-001` 至 `REQ-CPS-006`: 后端搜索文档投影、查询解析、权限过滤、统一响应和用户级窗口计数器。
 - `REQ-CPS-007` 至 `REQ-CPS-010`: Dashboard 阅读壳层、响应式页头入口、Dialog 命令面板、受控 actions 与 lane deep link。
 - `REQ-CPS-011` 至 `REQ-CPS-012`: 只读边界、稳定去重排序、Web Demo、Storybook 和交互/视觉回归。
-- `REQ-CPS-013`: 历史 `0081` 已移入 `migrations/legacy/` 并由严格 checksum 兼容路径读取；`0082` 只建 schema，`0089_association_search_update_repair.sql` 将关联触发器限制到 repository identity/metadata projection 更新并增加 `(resource_type, repo_id)` 索引，`0090_search_fts_rowid_recovery.sql` 将旧 FTS cache 替换为 rowid mapping + v2 corpus、保留 point-update compatibility views，并将 repository metadata fanout 放入可去重队列；metadata source deletion 会入队，新的 metadata event 会重置 per-repo cursor；`src/search_index.rs` 以持久化阶段游标、每事务最多 100 个 source/release rows、`Background` writer、`statvfs` 水位和 foreground yield 执行可恢复回填，未 ready 或 metadata queue 未清空时由搜索回退到 `LIKE`。
+- `REQ-CPS-013`: 历史 `0081` 已移入 `migrations/legacy/` 并由严格 checksum 兼容路径读取；`0082` 只建 schema，`0089_association_search_update_repair.sql` 将关联触发器限制到 repository identity/metadata projection 更新并增加 `(resource_type, repo_id)` 索引，`0090_search_fts_rowid_recovery.sql` 将旧 FTS cache 替换为 rowid mapping + v2 corpus、保留 point-update compatibility views，并将 repository metadata fanout 放入可去重队列；metadata source deletion 会入队，新的 metadata event 会重置 per-repo cursor；`src/search_index.rs` 以持久化阶段游标、每事务最多 25 个 source/release rows、`Background` writer、10 ms 批间等待和 `statvfs` 水位执行可恢复回填，投影触发器负责普通 source 阶段的 FTS 更新，未 ready 或 metadata queue 未清空时由搜索回退到 `LIKE`。
 - Web Demo 额外提供 `Command Palette · Search`、`Command Palette · Indexing`、`Command Palette · Low Disk`、`Command Palette · Actions` 与 `Command Palette · Admin` 五个可选场景；进入场景后分别自动打开搜索结果、渐进索引状态、低磁盘降级、actions 模式和管理员受控 action。
 - Verification commands: `cargo test --all-features`、`cargo test database_migrations::tests`、`cargo test search::tests`、`cargo test api::tests::search_`、`web/bun run lint`、`web/bun run build`、`web/bun run test:storybook -- CommandPalette`。
 
@@ -22,7 +22,8 @@
 - 搜索必须以本地缓存为唯一数据源；GitHub Search API 不属于本主题的运行时依赖。
 - 配额状态必须与 SQLite writer 事务一致，服务重启和多标签页共享同一用户窗口。
 - actions 仅复用既有导航、同步、日报生成和仓库关注边界，不新增任意命令执行器。
-- 迁移启动不再扫描历史内容；后台 worker 在 listener 绑定后按阶段恢复投影，索引状态通过 `GET /api/search` 的 `index_status` 暴露给命令面板。
+- 启动迁移只调整 schema 和恢复状态；已有 FTS corpus 由 listener 绑定后的 worker 按阶段恢复，25 行一批持久化游标并在批间让出 writer。磁盘低于 `OCTORILL_SEARCH_INDEX_MIN_FREE_BYTES`（默认 20 GiB）时状态转为 `paused_low_disk`，只在暂停/恢复转换时写状态；结构化日志 `search.index.paused_low_disk` 与 `search.index.resumed` 包含观测空闲字节数和阈值，`GET /api/search` 的 `index_status` 同时向命令面板暴露暂停状态。
+- Rollout: 升级不需要新增数据库迁移，已存储的阶段与 metadata 游标会继续使用；确认空闲空间高于配置水位后，索引必须自行离开 `paused_low_disk` 并最终达到 `ready`。PR4 历史回填只应在索引状态为 `ready` 且生产磁盘容量满足水位后启动。
 
 ## Verification Coverage
 
@@ -34,7 +35,9 @@
 - `search::tests::late_global_projection_cannot_replace_newer_ready_projection`：覆盖晚到旧投影不覆盖较新的 ready 投影。
 - `search::tests::projection_backfill_resumes_in_bounded_batches`：覆盖可恢复索引的阶段推进、公告回填和结果可见性。
 - `search::tests::projection_backfill_recovers_persisted_cursor_after_restart`：覆盖 FTS cache 恢复时持久化 cursor 在重建 AppState 后继续推进。
-- `search::tests::metadata_fanout_resumes_in_release_row_batches`：覆盖单仓库 250 条 release metadata fanout 的 100/100/50 分批、队列 drain 与 FTS 一致性。
+- `search::tests::projection_backfill_pauses_below_disk_watermark`：覆盖低磁盘暂停时不写 FTS，重复低磁盘轮询不再刷新持久化状态。
+- `database_migrations::tests::search_fts_upgrade_defers_existing_corpus_rebuild`：覆盖已有 FTS 数据升级时保留投影、清空可重建 FTS cache 并排队后台恢复。
+- `search::tests::metadata_fanout_resumes_in_release_row_batches`：覆盖单仓库 250 条 release metadata fanout 的 25 行提交、队列 drain 与 FTS 一致性。
 - `search::tests::work_item_deletion_repairs_release_metadata`：覆盖删除最后一个 release work item metadata source 后的队列入队与 metadata 清理。
 - `search::tests::metadata_fallback_matches_current_short_repo_name`：覆盖 metadata fanout 尚未完成时，当前 metadata view 仍能匹配短 repository filter。
 - `search::tests::release_query_does_not_fallback_to_stale_metadata`：覆盖 current metadata 缺失或其他用户保留 stale 名称时，release 查询不从旧缓存或其他用户 metadata 回填仓库字段、过滤器、target path 或 target URL；无法从当前 metadata 解析 canonical target 时省略 `target`。
@@ -50,7 +53,7 @@
 - `sync::tests::repeated_social_snapshot_only_updates_association_observation_once`：验证重复 production-shaped owned-repository snapshot 不清除再重建当前 association。
 - `sync::tests::social_snapshot_clears_stale_associations_and_preserves_explicit_unfollow`：验证 NULL-ID/过期 association 清理、空快照和显式取消关注在仓库重新出现时的状态保持。
 - `sync::tests::replace_starred_repos_preserves_explicit_unfollow`：验证完整 starred-repository replacement 路径清理旧 source 时保留显式取消关注。
-- Latest candidate synthetic SQLite benchmark: the old global and lane FTS tables both produced `SCAN ... VIRTUAL TABLE INDEX 0:` plans; the new compatibility views produced mapping-index lookups plus `SCAN f VIRTUAL TABLE INDEX 0:=` (the `SCAN f` row is the rowid point lookup, not an FTS corpus scan). With 397 associations, 39,700 release documents and 397 user lanes, 32 maintenance rounds measured global FTS `1537.824 ms -> 48.350 ms` and lane FTS `60.933 ms -> 55.069 ms`; one metadata Background batch held the writer for `40.942 ms` and left 397 queued repos. The same run completed 32 concurrent search tasks, 32 authenticated GET/quota tasks and 32 coordinated session writes. The benchmark is intentionally ignored by the normal suite because the latest local run takes about 38 seconds and timings vary with host load; it uses a temporary real-schema SQLite database and is not a production deployment measurement.
+- Before the 25-row bound, the ignored synthetic SQLite benchmark on this workspace measured old/new global FTS maintenance at `830.051 ms -> 85.472 ms`, old/new lane maintenance at `110.462 ms -> 81.101 ms`, and one 100-row metadata Background batch at `47.062 ms`. It completed 32 concurrent search tasks, 32 authenticated GET/quota tasks and 32 coordinated session writes. The full run took `125.16 s`; timings vary with host load, it uses a temporary real-schema database, and it is not a production deployment measurement.
 - `web/src/search/CommandPalette.stories.tsx`：覆盖空态、搜索结果、动作、日报确认、busy 键盘保护、错误、限流、管理员及 393px 视口。
 - `web/src/search/CommandPalette.stories.tsx`：追加 `IndexBuilding` 与 `IndexPausedLowDisk`，验证渐进索引的可见降级提示。
 

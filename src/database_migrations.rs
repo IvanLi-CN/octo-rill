@@ -228,6 +228,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_fts_upgrade_defers_existing_corpus_rebuild() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite");
+
+        let pre_0090 = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version < 90)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: true,
+            locking: true,
+            no_tx: false,
+        };
+        pre_0090
+            .run(&pool)
+            .await
+            .expect("apply schema before rowid recovery");
+
+        for index in 0..3 {
+            let document_id = format!("release:upgrade-{index}");
+            sqlx::query(
+                "INSERT INTO search_documents (id,resource_type,resource_id,title,body,created_at,updated_at) VALUES (?,'release',?,'upgrade title','upgrade body',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            )
+            .bind(&document_id)
+            .bind(format!("upgrade-{index}"))
+            .execute(&pool)
+            .await
+            .expect("seed existing search projection");
+            sqlx::query(
+                "INSERT INTO search_documents_fts (doc_id,title,body,repo_full_name,translated_text,smart_text) VALUES (?,'upgrade title','upgrade body','','','')",
+            )
+            .bind(document_id)
+            .execute(&pool)
+            .await
+            .expect("seed existing FTS corpus");
+        }
+        sqlx::query(
+            "UPDATE search_projection_backfill_state SET phase = 'translations', cursor = 0, status = 'ready' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("mark existing search corpus ready");
+        let old_fts_rows =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents_fts")
+                .fetch_one(&pool)
+                .await
+                .expect("count old FTS corpus");
+        assert!(old_fts_rows > 0);
+
+        run(&pool).await.expect("apply rowid recovery migration");
+
+        let state = sqlx::query_as::<_, (String, i64, String)>(
+            "SELECT phase, cursor, status FROM search_projection_backfill_state WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read resumable recovery state");
+        assert_eq!(state, ("fts_documents".to_owned(), 0, "pending".to_owned()));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents")
+                .fetch_one(&pool)
+                .await
+                .expect("count retained search projections"),
+            3
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents_fts_v2")
+                .fetch_one(&pool)
+                .await
+                .expect("count new FTS corpus before background recovery"),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn admin_collection_coverage_preserves_old_records_and_tracks_new_ones() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
