@@ -24,6 +24,7 @@
 - Metadata source deletion also queues the affected repository, and a new metadata event resets its persisted release cursor so an in-flight fanout cannot leave the already-processed prefix stale.
 - The recovery worker now persists both historical projection cursors and per-repository metadata cursors, continues polling after reaching `ready`, and keeps search usable through `LIKE` fallback while FTS rebuild or metadata repair is pending.
 - Recovery commits at most 25 source rows per writer transaction, relies on projection triggers for ordinary FTS updates, and pauses repeated background acquisition between batches. Low-disk pause and resume events report observed free space and the configured watermark; an already-paused poll does not write the state row again.
+- PR #315 tracks the bounded recovery writer-pressure fix and its resumable migration coverage.
 
 ## References
 
