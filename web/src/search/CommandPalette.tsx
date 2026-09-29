@@ -179,7 +179,7 @@ function formatIndexStatus(status: SearchIndexStatus | null) {
 
 function buildSearchResultTarget(result: SearchResult) {
 	const targetPath =
-		result.target_path ?? result.target?.href ?? result.target_url ?? "/";
+		result.target_path ?? result.target?.href ?? result.target_url ?? null;
 	const lane =
 		result.matched_lane ??
 		result.matched_lanes?.[0] ??
@@ -195,6 +195,7 @@ function buildSearchResultTarget(result: SearchResult) {
 				result.repo_full_name ?? result.repository?.full_name ?? null,
 		});
 	}
+	if (!targetPath) return null;
 	if (
 		!lane ||
 		(resourceType !== "release" && resourceType !== "announcement")
@@ -299,10 +300,11 @@ function SearchResultRow(props: {
 	id: string;
 	result: SearchResult;
 	active: boolean;
+	disabled?: boolean;
 	onSelect: () => void;
 	onOpen: () => void;
 }) {
-	const { id, result, active, onSelect, onOpen } = props;
+	const { id, result, active, disabled, onSelect, onOpen } = props;
 	const repository = resultType(result) === "repository";
 	return (
 		<button
@@ -311,8 +313,10 @@ function SearchResultRow(props: {
 			tabIndex={-1}
 			role="option"
 			aria-selected={active}
+			aria-disabled={disabled}
+			disabled={disabled}
 			className={cn(
-				"group flex w-full items-start gap-3 px-4 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-inset",
+				"group flex w-full items-start gap-3 px-4 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-inset disabled:cursor-not-allowed disabled:opacity-60",
 				active ? "bg-muted/60" : "hover:bg-muted/35",
 			)}
 			onMouseEnter={onSelect}
@@ -633,7 +637,8 @@ export function CommandPalette({
 	}, [onOpenChange]);
 
 	const openTarget = useCallback(
-		async (target: string) => {
+		async (target: string | null) => {
+			if (!target) return;
 			close();
 			try {
 				const resolved = new URL(target, window.location.origin);
@@ -738,7 +743,8 @@ export function CommandPalette({
 					if (isActionDisabled(selected as PaletteAction)) return;
 					void executeAction(selected as PaletteAction);
 				} else {
-					void openTarget(buildSearchResultTarget(selected as SearchResult));
+					const target = buildSearchResultTarget(selected as SearchResult);
+					if (target) void openTarget(target);
 				}
 			}
 		},
@@ -982,18 +988,22 @@ export function CommandPalette({
 					) : results.length > 0 ? (
 						<>
 							<div {...contentRegionProps} id="command-palette-results">
-								{results.map((result, index) => (
-									<SearchResultRow
-										key={`${resultType(result)}:${result.id}`}
-										id={`command-palette-entry-${index}`}
-										result={result}
-										active={index === activeIndex}
-										onSelect={() => setActiveIndex(index)}
-										onOpen={() =>
-											void openTarget(buildSearchResultTarget(result))
-										}
-									/>
-								))}
+								{results.map((result, index) => {
+									const target = buildSearchResultTarget(result);
+									return (
+										<SearchResultRow
+											key={`${resultType(result)}:${result.id}`}
+											id={`command-palette-entry-${index}`}
+											result={result}
+											active={index === activeIndex}
+											disabled={!target}
+											onSelect={() => setActiveIndex(index)}
+											onOpen={() =>
+												target ? void openTarget(target) : undefined
+											}
+										/>
+									);
+								})}
 							</div>
 							{activeRepository ? (
 								<fieldset className="flex justify-end border-t border-border/60 px-4 py-2">
