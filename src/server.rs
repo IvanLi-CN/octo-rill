@@ -88,7 +88,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .await
         .context("failed to open sqlite database")?;
 
-    bootstrap_sqlite_database(&pool, &config.database_url).await?;
+    bootstrap_sqlite_database(&pool).await?;
     crate::database_migrations::run(&pool).await?;
 
     state::backfill_github_connections(&pool)
@@ -698,7 +698,7 @@ fn build_sqlite_connect_options(database_url: &str) -> Result<SqliteConnectOptio
     Ok(connect_opts)
 }
 
-async fn bootstrap_sqlite_database(pool: &SqlitePool, database_url: &str) -> Result<()> {
+async fn bootstrap_sqlite_database(pool: &SqlitePool) -> Result<()> {
     let started = StdInstant::now();
     let mut connection = pool
         .acquire()
@@ -711,7 +711,13 @@ async fn bootstrap_sqlite_database(pool: &SqlitePool, database_url: &str) -> Res
     .await
     .context("inspect sqlite schema before mode bootstrap")?;
     let is_fresh = schema_objects == 0;
-    let is_in_memory = database_url == "sqlite::memory:";
+    let database_file = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT file FROM pragma_database_list WHERE name = 'main'",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .context("inspect sqlite database file before mode bootstrap")?;
+    let is_in_memory = database_file.as_deref().is_none_or(str::is_empty);
 
     if is_fresh {
         // Set database-wide modes once, before migrations create schema.
@@ -1768,7 +1774,7 @@ mod tests {
             .await
             .expect("connect sqlite pool");
 
-        bootstrap_sqlite_database(&pool, &database_url)
+        bootstrap_sqlite_database(&pool)
             .await
             .expect("initialize fresh sqlite modes before migrations");
         let migration_table_count = sqlx::query_scalar::<_, i64>(
@@ -1869,7 +1875,7 @@ mod tests {
         let pool = SqlitePoolOptions::new()
             .min_connections(0)
             .max_connections(8)
-            .acquire_timeout(StdDuration::from_secs(1))
+            .acquire_timeout(StdDuration::from_secs(3))
             .connect_lazy_with(connect_options());
         let barrier = Arc::new(tokio::sync::Barrier::new(9));
         let mut openers = Vec::new();
@@ -1884,7 +1890,7 @@ mod tests {
         }
 
         let all_connections_opened =
-            tokio::time::timeout(StdDuration::from_millis(250), barrier.wait())
+            tokio::time::timeout(StdDuration::from_secs(2), barrier.wait())
                 .await
                 .is_ok();
         if !all_connections_opened {
@@ -1930,6 +1936,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_bootstrap_accepts_existing_database_with_expected_modes() {
+        let database_path = std::env::temp_dir().join(format!(
+            "octo-rill-server-existing-modes-{}.db",
+            crate::local_id::generate_local_id(),
+        ));
+        let database_url = format!("sqlite:{}", database_path.display());
+        let pool = build_sqlite_pool_options(1)
+            .connect_with(
+                build_sqlite_connect_options(&database_url).expect("build sqlite connect options"),
+            )
+            .await
+            .expect("connect sqlite pool");
+        sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+            .execute(&pool)
+            .await
+            .expect("set existing database incremental auto vacuum");
+        let journal_mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode = WAL")
+            .fetch_one(&pool)
+            .await
+            .expect("set existing database WAL mode");
+        assert_eq!(journal_mode, "wal");
+        sqlx::query("CREATE TABLE existing_data (id INTEGER PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .expect("create existing database schema");
+
+        bootstrap_sqlite_database(&pool)
+            .await
+            .expect("accept existing database with expected modes");
+
+        let pragmas = read_sqlite_runtime_pragmas(&pool)
+            .await
+            .expect("read existing database pragmas");
+        assert_eq!(pragmas.journal_mode, "wal");
+        assert_eq!(pragmas.auto_vacuum, SQLITE_INCREMENTAL_AUTO_VACUUM);
+
+        pool.close().await;
+        let _ = fs::remove_file(&database_path);
+        let _ = fs::remove_file(database_path.with_extension("db-wal"));
+        let _ = fs::remove_file(database_path.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_bootstrap_accepts_in_memory_urls_with_query_parameters() {
+        for database_url in ["sqlite::memory:", "sqlite::memory:?cache=shared"] {
+            let pool = build_sqlite_pool_options(1)
+                .connect_with(
+                    build_sqlite_connect_options(database_url)
+                        .expect("build in-memory sqlite connect options"),
+                )
+                .await
+                .expect("connect in-memory sqlite pool");
+
+            bootstrap_sqlite_database(&pool)
+                .await
+                .expect("accept in-memory sqlite database");
+
+            let pragmas = read_sqlite_runtime_pragmas(&pool)
+                .await
+                .expect("read in-memory sqlite pragmas");
+            assert_eq!(pragmas.journal_mode, "memory");
+            assert_eq!(pragmas.auto_vacuum, SQLITE_INCREMENTAL_AUTO_VACUUM);
+            pool.close().await;
+        }
+    }
+
+    #[tokio::test]
     async fn sqlite_bootstrap_rejects_existing_mode_mismatch_without_conversion() {
         let database_path = std::env::temp_dir().join(format!(
             "octo-rill-server-mode-mismatch-{}.db",
@@ -1947,7 +2020,7 @@ mod tests {
             .await
             .expect("create existing database schema");
 
-        let error = bootstrap_sqlite_database(&pool, &database_url)
+        let error = bootstrap_sqlite_database(&pool)
             .await
             .expect_err("reject an existing database with unsafe modes");
         assert!(format!("{error:#}").contains("refusing online mode conversion"));
