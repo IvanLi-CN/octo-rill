@@ -9,12 +9,13 @@ use std::{
 use anyhow::{Context, Result, bail};
 use sqlx::{QueryBuilder, Row, Sqlite, Transaction};
 use tokio::task::AbortHandle;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{sqlite_write::SqliteWritePriority, state::AppState};
 
-const INDEX_BATCH_SIZE: i64 = 100;
+const INDEX_BATCH_SIZE: i64 = 25;
 const DEFAULT_MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+const BACKGROUND_BATCH_DELAY: Duration = Duration::from_millis(10);
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 
 const PHASES: &[&str] = &[
@@ -55,7 +56,7 @@ pub fn spawn_worker(state: Arc<AppState>) -> AbortHandle {
         loop {
             match run_batch(state.as_ref()).await {
                 Ok(BatchOutcome::Ready) => tokio::time::sleep(RETRY_DELAY).await,
-                Ok(BatchOutcome::Progress) => tokio::task::yield_now().await,
+                Ok(BatchOutcome::Progress) => tokio::time::sleep(BACKGROUND_BATCH_DELAY).await,
                 Ok(BatchOutcome::Idle | BatchOutcome::Paused) => {
                     tokio::time::sleep(RETRY_DELAY).await;
                 }
@@ -109,9 +110,20 @@ async fn run_batch_with_free_bytes(
         return Ok(BatchOutcome::Ready);
     }
     if free_bytes < minimum_free_bytes {
-        mark_status(state, "paused_low_disk", None).await?;
+        if current_status.as_deref() != Some("paused_low_disk") {
+            mark_status(state, "paused_low_disk", None).await?;
+            warn!(
+                event = "search.index.paused_low_disk",
+                status = "paused_low_disk",
+                free_bytes,
+                minimum_free_bytes,
+                retry_after_seconds = RETRY_DELAY.as_secs(),
+                "search projection recovery paused below the free-space watermark"
+            );
+        }
         return Ok(BatchOutcome::Paused);
     }
+    let was_paused = current_status.as_deref() == Some("paused_low_disk");
 
     let (permit, mut tx) = state
         .sqlite_writer
@@ -153,6 +165,15 @@ async fn run_batch_with_free_bytes(
         }
         tx.commit().await?;
         drop(permit);
+        if was_paused {
+            info!(
+                event = "search.index.resumed",
+                phase = next_phase.unwrap_or("translations"),
+                free_bytes,
+                minimum_free_bytes,
+                "search projection recovery resumed above the free-space watermark"
+            );
+        }
         return Ok(BatchOutcome::Idle);
     }
 
@@ -180,6 +201,16 @@ async fn run_batch_with_free_bytes(
     .await?;
     tx.commit().await?;
     drop(permit);
+    if was_paused {
+        info!(
+            event = "search.index.resumed",
+            phase = state_row.phase,
+            cursor = next_cursor,
+            free_bytes,
+            minimum_free_bytes,
+            "search projection recovery resumed above the free-space watermark"
+        );
+    }
     Ok(BatchOutcome::Progress)
 }
 
@@ -390,7 +421,9 @@ async fn process_phase(
         _ => bail!("unknown search projection phase {phase}"),
     }
 
-    refresh_phase_fts(tx, phase, rowids).await?;
+    if matches!(phase, "fts_documents" | "fts_user_lanes") {
+        refresh_fts_recovery_batch(tx, phase, rowids).await?;
+    }
     Ok(())
 }
 
@@ -567,96 +600,24 @@ async fn apply_translation_batch(tx: &mut Transaction<'_, Sqlite>, rowids: &[i64
     Ok(())
 }
 
-async fn refresh_phase_fts(
+async fn refresh_fts_recovery_batch(
     tx: &mut Transaction<'_, Sqlite>,
     phase: &str,
     rowids: &[i64],
 ) -> Result<()> {
-    if phase == "metadata" {
-        return Ok(());
-    }
-    if phase == "fts_documents" {
-        let mut query = QueryBuilder::<Sqlite>::new(
+    let mut query = match phase {
+        "fts_documents" => QueryBuilder::<Sqlite>::new(
             "INSERT INTO search_documents_fts (doc_id,title,body,repo_full_name,translated_text,smart_text) SELECT id,COALESCE(title,''),COALESCE(body,''),COALESCE(repo_full_name,''),COALESCE(translated_text,''),COALESCE(smart_text,'') FROM search_documents WHERE rowid IN (",
-        );
-        push_rowids(&mut query, rowids);
-        query.push(")");
-        query.build().execute(&mut **tx).await?;
-        return Ok(());
-    }
-    if phase == "fts_user_lanes" {
-        let mut query = QueryBuilder::<Sqlite>::new(
+        ),
+        "fts_user_lanes" => QueryBuilder::<Sqlite>::new(
             "INSERT INTO search_document_user_lanes_fts (doc_id,user_id,translated_text,smart_text) SELECT document_id,user_id,COALESCE(translated_text,''),COALESCE(smart_text,'') FROM search_document_user_lanes WHERE rowid IN (",
-        );
-        push_rowids(&mut query, rowids);
-        query.push(")");
-        query.build().execute(&mut **tx).await?;
-        return Ok(());
-    }
-    let (query, lane) = match phase {
-        "releases" => (
-            "SELECT 'release:'||release_id AS id FROM repo_releases WHERE rowid IN (",
-            false,
         ),
-        "announcements" => (
-            "SELECT 'announcement:'||id AS id FROM social_activity_events WHERE kind='announcement' AND rowid IN (",
-            false,
-        ),
-        "notifications" => (
-            "SELECT 'notification:'||user_id||':'||thread_id AS id FROM notifications WHERE rowid IN (",
-            false,
-        ),
-        "briefs" => (
-            "SELECT 'brief:'||id AS id FROM briefs WHERE rowid IN (",
-            false,
-        ),
-        "repo_associations" => (
-            "SELECT 'repository:'||user_id||':'||repo_full_name_lower AS id FROM user_repo_associations WHERE rowid IN (",
-            false,
-        ),
-        "starred_repos" => (
-            "SELECT 'repository:'||user_id||':'||lower(full_name) AS id FROM starred_repos WHERE rowid IN (",
-            false,
-        ),
-        "content_projections" => (
-            "SELECT DISTINCT d.id FROM content_result_projections p JOIN search_documents d ON d.resource_type=p.canonical_resource_type AND d.resource_id=p.canonical_resource_id WHERE p.rowid IN (",
-            false,
-        ),
-        "translations" => (
-            "SELECT DISTINCT d.id FROM ai_translations t JOIN search_documents d ON ((d.resource_type='release' AND lower(t.entity_type) LIKE 'release%' AND d.resource_id=t.entity_id) OR (d.resource_type='announcement' AND lower(t.entity_type) LIKE 'announcement%' AND d.resource_id=lower(t.entity_id)) OR (d.resource_type='notification' AND lower(t.entity_type) LIKE 'notification%' AND d.resource_id=t.entity_id)) WHERE t.rowid IN (",
-            true,
-        ),
-        _ => bail!("unknown search projection phase {phase}"),
+        _ => bail!("unknown FTS recovery phase {phase}"),
     };
-    let mut ids_query = QueryBuilder::<Sqlite>::new(query);
-    push_rowids(&mut ids_query, rowids);
-    ids_query.push(")");
-    let ids = ids_query.build().fetch_all(&mut **tx).await?;
-    let ids = ids
-        .into_iter()
-        .map(|row| row.get::<String, _>("id"))
-        .collect::<Vec<_>>();
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let mut insert = QueryBuilder::<Sqlite>::new(if lane {
-        "INSERT INTO search_document_user_lanes_fts (doc_id,user_id,translated_text,smart_text) SELECT document_id,user_id,COALESCE(translated_text,''),COALESCE(smart_text,'') FROM search_document_user_lanes WHERE document_id IN ("
-    } else {
-        "INSERT INTO search_documents_fts (doc_id,title,body,repo_full_name,translated_text,smart_text) SELECT id,COALESCE(title,''),COALESCE(body,''),COALESCE(repo_full_name,''),COALESCE(translated_text,''),COALESCE(smart_text,'') FROM search_documents WHERE id IN ("
-    });
-    push_ids(&mut insert, &ids);
-    insert.push(")");
-    insert.build().execute(&mut **tx).await?;
+    push_rowids(&mut query, rowids);
+    query.push(")");
+    query.build().execute(&mut **tx).await?;
     Ok(())
-}
-
-fn push_ids(query: &mut QueryBuilder<'_, Sqlite>, ids: &[String]) {
-    for (index, id) in ids.iter().enumerate() {
-        if index > 0 {
-            query.push(",");
-        }
-        query.push_bind(id.clone());
-    }
 }
 
 fn database_directory(database_url: &str) -> PathBuf {

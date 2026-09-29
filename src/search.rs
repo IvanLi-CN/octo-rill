@@ -1287,13 +1287,13 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("read persisted FTS cursor");
-        assert!(first_cursor > 0);
+        assert_eq!(first_cursor, 25);
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents_fts_v2")
                 .fetch_one(&pool)
                 .await
                 .expect("count first recovered FTS batch"),
-            100
+            25
         );
 
         let restarted_state = setup_state(pool.clone());
@@ -1306,13 +1306,13 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("read resumed FTS cursor");
-        assert!(second_cursor > first_cursor);
+        assert_eq!(second_cursor, 50);
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM search_documents_fts_v2")
                 .fetch_one(&pool)
                 .await
                 .expect("count resumed FTS batches"),
-            200
+            50
         );
     }
 
@@ -1358,6 +1358,29 @@ mod tests {
                 .await
                 .expect("count metadata queue after pause");
         assert!(queued > 0);
+
+        sqlx::query(
+            "UPDATE search_projection_backfill_state SET updated_at = '2000-01-01T00:00:00Z' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("set stable low-disk status timestamp");
+        crate::search_index::run_batch_for_test(state.as_ref(), 0)
+            .await
+            .expect("keep backfill paused while disk remains low");
+        let paused_state = sqlx::query_as::<_, (String, String)>(
+            "SELECT status, updated_at FROM search_projection_backfill_state WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read repeated low-disk state");
+        assert_eq!(
+            paused_state,
+            (
+                "paused_low_disk".to_owned(),
+                "2000-01-01T00:00:00Z".to_owned()
+            )
+        );
     }
 
     #[tokio::test]
@@ -1815,7 +1838,7 @@ mod tests {
         seed_repo_association(&pool).await;
 
         let state = setup_state(pool.clone());
-        for expected in [100_i64, 200, 250] {
+        for expected in [25_i64, 50, 75, 100, 125, 150, 175, 200, 225, 250] {
             crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
                 .await
                 .expect("run bounded metadata batch");
@@ -1827,6 +1850,9 @@ mod tests {
             .expect("count refreshed release metadata");
             assert_eq!(refreshed, expected);
         }
+        crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
+            .await
+            .expect("confirm metadata cursor exhaustion");
         let queued = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM search_metadata_backfill_queue WHERE repo_id = 42",
         )
@@ -1876,7 +1902,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("count first metadata cursor batch");
-        assert_eq!(first_batch, 100);
+        assert_eq!(first_batch, 25);
 
         sqlx::query(
             "UPDATE user_repo_associations SET repo_full_name = 'next/rill', repo_full_name_lower = 'next/rill', owner_login = 'next' WHERE id = 'search-association'",
@@ -1892,7 +1918,7 @@ mod tests {
         .expect("read reset metadata cursor");
         assert_eq!(cursor, 0);
 
-        for _ in 0..3 {
+        for _ in 0..10 {
             crate::search_index::run_batch_for_test(state.as_ref(), u64::MAX)
                 .await
                 .expect("run restarted metadata cursor batch");
