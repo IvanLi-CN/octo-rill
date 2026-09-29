@@ -1,9 +1,13 @@
 use std::{
-    net::SocketAddr, path::Path, path::PathBuf, str::FromStr, sync::Arc,
-    time::Duration as StdDuration,
+    net::SocketAddr,
+    path::Path,
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration as StdDuration, Instant as StdInstant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use axum::{
     Router,
     body::Body,
@@ -16,10 +20,7 @@ use axum::{
 use serde_json::json;
 use sqlx::{
     SqlitePool,
-    sqlite::{
-        SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions,
-        SqliteSynchronous,
-    },
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous},
 };
 use time::Duration;
 use tokio::task::AbortHandle;
@@ -46,6 +47,7 @@ use crate::{
 };
 
 const SESSION_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
+const SQLITE_INCREMENTAL_AUTO_VACUUM: i64 = 2;
 const STATIC_ASSET_EXTENSIONS: &[&str] = &[
     "avif",
     "bmp",
@@ -86,6 +88,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .await
         .context("failed to open sqlite database")?;
 
+    bootstrap_sqlite_database(&pool, &config.database_url).await?;
     crate::database_migrations::run(&pool).await?;
 
     state::backfill_github_connections(&pool)
@@ -99,6 +102,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let pragmas = read_sqlite_runtime_pragmas(&pool).await?;
     info!(
         journal_mode = %pragmas.journal_mode,
+        auto_vacuum = pragmas.auto_vacuum,
         busy_timeout_ms = pragmas.busy_timeout_ms,
         synchronous = pragmas.synchronous,
         pool_max_connections = config.sqlite_pool_max_connections,
@@ -685,19 +689,73 @@ fn ensure_sqlite_dir(database_url: &str) -> Result<()> {
 }
 
 fn build_sqlite_connect_options(database_url: &str) -> Result<SqliteConnectOptions> {
-    let mut connect_opts = SqliteConnectOptions::from_str(database_url)
+    let connect_opts = SqliteConnectOptions::from_str(database_url)
         .context("invalid DATABASE_URL for sqlite")?
         .create_if_missing(true)
         .foreign_keys(true)
         .busy_timeout(SQLITE_BUSY_TIMEOUT)
-        .auto_vacuum(SqliteAutoVacuum::Incremental)
         .synchronous(SqliteSynchronous::Normal);
+    Ok(connect_opts)
+}
 
-    if database_url != "sqlite::memory:" {
-        connect_opts = connect_opts.journal_mode(SqliteJournalMode::Wal);
+async fn bootstrap_sqlite_database(pool: &SqlitePool, database_url: &str) -> Result<()> {
+    let started = StdInstant::now();
+    let mut connection = pool
+        .acquire()
+        .await
+        .context("acquire sqlite connection for mode bootstrap")?;
+    let schema_objects = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' AND type IN ('table', 'index', 'view', 'trigger')",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .context("inspect sqlite schema before mode bootstrap")?;
+    let is_fresh = schema_objects == 0;
+    let is_in_memory = database_url == "sqlite::memory:";
+
+    if is_fresh {
+        // Set database-wide modes once, before migrations create schema.
+        sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+            .execute(&mut *connection)
+            .await
+            .context("initialize fresh sqlite incremental auto_vacuum")?;
+        if !is_in_memory {
+            let journal_mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode = WAL")
+                .fetch_one(&mut *connection)
+                .await
+                .context("initialize fresh sqlite WAL journal mode")?;
+            if !journal_mode.eq_ignore_ascii_case("wal") {
+                bail!("fresh sqlite database refused WAL mode; received {journal_mode:?}");
+            }
+        }
     }
 
-    Ok(connect_opts)
+    let journal_mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode")
+        .fetch_one(&mut *connection)
+        .await
+        .context("verify sqlite journal_mode")?;
+    let auto_vacuum = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
+        .fetch_one(&mut *connection)
+        .await
+        .context("verify sqlite auto_vacuum")?;
+    let expected_journal_mode = if is_in_memory { "memory" } else { "wal" };
+    if !journal_mode.eq_ignore_ascii_case(expected_journal_mode)
+        || auto_vacuum != SQLITE_INCREMENTAL_AUTO_VACUUM
+    {
+        let database_kind = if is_fresh { "fresh" } else { "existing" };
+        bail!(
+            "{database_kind} sqlite database has journal_mode={journal_mode:?} and auto_vacuum={auto_vacuum}; expected journal_mode={expected_journal_mode:?} and auto_vacuum={SQLITE_INCREMENTAL_AUTO_VACUUM}; refusing online mode conversion"
+        );
+    }
+
+    info!(
+        database_kind = if is_fresh { "fresh" } else { "existing" },
+        journal_mode = %journal_mode,
+        auto_vacuum,
+        sqlite_mode_bootstrap_ms = started.elapsed().as_millis(),
+        "sqlite database modes verified"
+    );
+    Ok(())
 }
 
 fn build_sqlite_pool_options(max_connections: usize) -> SqlitePoolOptions {
@@ -741,6 +799,7 @@ fn warn_if_runtime_concurrency_exceeds_sqlite_pool(
 #[derive(Debug, PartialEq, Eq)]
 struct SqliteRuntimePragmas {
     journal_mode: String,
+    auto_vacuum: i64,
     busy_timeout_ms: i64,
     synchronous: i64,
 }
@@ -750,6 +809,10 @@ async fn read_sqlite_runtime_pragmas(pool: &SqlitePool) -> Result<SqliteRuntimeP
         .fetch_one(pool)
         .await
         .context("read sqlite journal_mode failed")?;
+    let auto_vacuum = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
+        .fetch_one(pool)
+        .await
+        .context("read sqlite auto_vacuum failed")?;
     let busy_timeout_ms = sqlx::query_scalar::<_, i64>("PRAGMA busy_timeout")
         .fetch_one(pool)
         .await
@@ -761,6 +824,7 @@ async fn read_sqlite_runtime_pragmas(pool: &SqlitePool) -> Result<SqliteRuntimeP
 
     Ok(SqliteRuntimePragmas {
         journal_mode,
+        auto_vacuum,
         busy_timeout_ms,
         synchronous,
     })
@@ -1056,8 +1120,9 @@ fn session_inactivity_expiry() -> Expiry {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, SESSION_COOKIE_MAX_AGE_SECS, SameSite, accepts_html_document, api_health,
-        api_version, apply_no_store_headers, attach_static_site_routes, build_session_cookie_name,
+        AppConfig, SESSION_COOKIE_MAX_AGE_SECS, SQLITE_INCREMENTAL_AUTO_VACUUM, SameSite,
+        accepts_html_document, api_health, api_version, apply_no_store_headers,
+        attach_static_site_routes, bootstrap_sqlite_database, build_session_cookie_name,
         build_sqlite_connect_options, build_sqlite_pool_options, is_hashed_pwa_asset_path,
         looks_like_static_asset_path, merge_public_metrics_routes, read_sqlite_runtime_pragmas,
         session_inactivity_expiry, should_serve_spa_shell,
@@ -1072,10 +1137,11 @@ mod tests {
     };
     use serde_json::Value;
     use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::{Connection, SqliteConnection};
     use std::{
         fs, io,
         sync::{Arc, Mutex as StdMutex, OnceLock},
-        time::SystemTime,
+        time::{Duration as StdDuration, SystemTime},
     };
     use tower::{ServiceBuilder, ServiceExt};
     use tower_http::cors::CorsLayer;
@@ -1702,22 +1768,205 @@ mod tests {
             .await
             .expect("connect sqlite pool");
 
+        bootstrap_sqlite_database(&pool, &database_url)
+            .await
+            .expect("initialize fresh sqlite modes before migrations");
+        let migration_table_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("check migration table before migrations");
+        assert_eq!(migration_table_count, 0);
+
         let pragmas = read_sqlite_runtime_pragmas(&pool)
             .await
             .expect("read sqlite pragmas");
+        assert_eq!(pragmas.journal_mode, "wal");
+        assert_eq!(pragmas.auto_vacuum, SQLITE_INCREMENTAL_AUTO_VACUUM);
+        assert_eq!(pragmas.busy_timeout_ms, 5000);
+        assert_eq!(pragmas.synchronous, 1);
 
         crate::database_migrations::run(&pool)
             .await
-            .expect("run migrations after configuring a new database");
+            .expect("run migrations after bootstrapping a new database");
 
+        let _first_connection = pool.acquire().await.expect("hold first pooled connection");
+        let mut second_connection = pool.acquire().await.expect("open second pooled connection");
+        let second_journal_mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode")
+            .fetch_one(&mut *second_connection)
+            .await
+            .expect("read second connection journal mode");
+        let second_auto_vacuum = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
+            .fetch_one(&mut *second_connection)
+            .await
+            .expect("read second connection auto vacuum");
+        let second_busy_timeout = sqlx::query_scalar::<_, i64>("PRAGMA busy_timeout")
+            .fetch_one(&mut *second_connection)
+            .await
+            .expect("read second connection busy timeout");
+        let second_foreign_keys = sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+            .fetch_one(&mut *second_connection)
+            .await
+            .expect("read second connection foreign key mode");
+        let second_synchronous = sqlx::query_scalar::<_, i64>("PRAGMA synchronous")
+            .fetch_one(&mut *second_connection)
+            .await
+            .expect("read second connection synchronous mode");
+        assert_eq!(second_journal_mode, "wal");
+        assert_eq!(second_auto_vacuum, SQLITE_INCREMENTAL_AUTO_VACUUM);
+        assert_eq!(second_busy_timeout, 5000);
+        assert_eq!(second_foreign_keys, 1);
+        assert_eq!(second_synchronous, 1);
+
+        drop(second_connection);
+        drop(_first_connection);
+        pool.close().await;
+        let _ = fs::remove_file(&database_path);
+        let _ = fs::remove_file(database_path.with_extension("db-wal"));
+        let _ = fs::remove_file(database_path.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_pool_opens_connections_while_writer_is_active() {
+        let database_path = std::env::temp_dir().join(format!(
+            "octo-rill-server-connection-open-{}.db",
+            crate::local_id::generate_local_id(),
+        ));
+        let database_url = format!("sqlite:{}", database_path.display());
+        let connect_options = || {
+            build_sqlite_connect_options(&database_url)
+                .expect("build sqlite connect options")
+                .busy_timeout(StdDuration::from_millis(50))
+        };
+
+        let mut bootstrap = SqliteConnection::connect_with(&connect_options())
+            .await
+            .expect("create sqlite database");
+        sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+            .execute(&mut bootstrap)
+            .await
+            .expect("set test database incremental auto vacuum");
+        let journal_mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode = WAL")
+            .fetch_one(&mut bootstrap)
+            .await
+            .expect("set test database WAL mode");
+        assert_eq!(journal_mode, "wal");
+        sqlx::query("CREATE TABLE writer_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&mut bootstrap)
+            .await
+            .expect("create writer probe table");
+        drop(bootstrap);
+
+        let mut writer = SqliteConnection::connect_with(&connect_options())
+            .await
+            .expect("open writer connection");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut writer)
+            .await
+            .expect("hold sqlite writer lock");
+
+        let pool = SqlitePoolOptions::new()
+            .min_connections(0)
+            .max_connections(8)
+            .acquire_timeout(StdDuration::from_secs(1))
+            .connect_lazy_with(connect_options());
+        let barrier = Arc::new(tokio::sync::Barrier::new(9));
+        let mut openers = Vec::new();
+        for _ in 0..8 {
+            let pool = pool.clone();
+            let barrier = barrier.clone();
+            openers.push(tokio::spawn(async move {
+                let connection = pool.acquire().await.expect("open pooled connection");
+                barrier.wait().await;
+                drop(connection);
+            }));
+        }
+
+        let all_connections_opened =
+            tokio::time::timeout(StdDuration::from_millis(250), barrier.wait())
+                .await
+                .is_ok();
+        if !all_connections_opened {
+            for opener in &openers {
+                opener.abort();
+            }
+        }
+
+        let read_result = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM writer_probe")
+            .fetch_one(&pool)
+            .await;
+        sqlx::query("ROLLBACK")
+            .execute(&mut writer)
+            .await
+            .expect("release sqlite writer lock");
+        for opener in openers {
+            let _ = opener.await;
+        }
+
+        assert!(
+            all_connections_opened,
+            "pool connection initialization waited on the active writer"
+        );
+        assert_eq!(read_result.expect("read while writer is active"), 0);
+        sqlx::query("INSERT INTO writer_probe (id, value) VALUES (1, 'foreground')")
+            .execute(&pool)
+            .await
+            .expect("write after releasing active writer");
+        sqlx::query("INSERT INTO writer_probe (id, value) VALUES (2, 'background')")
+            .execute(&pool)
+            .await
+            .expect("background write after releasing active writer");
+        let row_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM writer_probe")
+            .fetch_one(&pool)
+            .await
+            .expect("read foreground and background writes");
+        assert_eq!(row_count, 2);
+
+        pool.close().await;
+        let _ = fs::remove_file(&database_path);
+        let _ = fs::remove_file(database_path.with_extension("db-wal"));
+        let _ = fs::remove_file(database_path.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_bootstrap_rejects_existing_mode_mismatch_without_conversion() {
+        let database_path = std::env::temp_dir().join(format!(
+            "octo-rill-server-mode-mismatch-{}.db",
+            crate::local_id::generate_local_id(),
+        ));
+        let database_url = format!("sqlite:{}", database_path.display());
+        let pool = build_sqlite_pool_options(1)
+            .connect_with(
+                build_sqlite_connect_options(&database_url).expect("build sqlite connect options"),
+            )
+            .await
+            .expect("connect sqlite pool");
+        sqlx::query("CREATE TABLE existing_data (id INTEGER PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .expect("create existing database schema");
+
+        let error = bootstrap_sqlite_database(&pool, &database_url)
+            .await
+            .expect_err("reject an existing database with unsafe modes");
+        assert!(format!("{error:#}").contains("refusing online mode conversion"));
+
+        let journal_mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode")
+            .fetch_one(&pool)
+            .await
+            .expect("read journal mode after rejected bootstrap");
         let auto_vacuum = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
             .fetch_one(&pool)
             .await
-            .expect("read auto vacuum after migrations");
-        assert_eq!(auto_vacuum, 2);
-        assert_eq!(pragmas.journal_mode, "wal");
-        assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.synchronous, 1);
+            .expect("read auto vacuum after rejected bootstrap");
+        assert_eq!(journal_mode, "delete");
+        assert_eq!(auto_vacuum, 0);
+
+        pool.close().await;
+        let _ = fs::remove_file(&database_path);
+        let _ = fs::remove_file(database_path.with_extension("db-wal"));
+        let _ = fs::remove_file(database_path.with_extension("db-shm"));
     }
 
     #[tokio::test]
