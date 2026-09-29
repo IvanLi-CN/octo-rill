@@ -334,7 +334,7 @@ pub async fn query(
         .collect::<Vec<_>>()
         .join(" OR ");
     let mut builder = QueryBuilder::<Sqlite>::new(
-        "WITH ranked AS (SELECT d.id, d.resource_type, d.title, d.body, COALESCE(rm.repo_full_name, d.repo_full_name) AS repo_full_name, COALESCE(ul.translated_text, d.translated_text) AS translated_text, COALESCE(ul.smart_text, d.smart_text) AS smart_text, d.source_time, d.updated_at, d.unread, CASE WHEN d.resource_type = 'repository' THEN EXISTS (SELECT 1 FROM user_repo_associations ura WHERE ura.user_id = d.user_id AND lower(ura.repo_full_name_lower) = lower(d.resource_id) AND ura.is_following != 0) ELSE NULL END AS is_following, COALESCE(rm.target_path, d.target_path) AS target_path, d.target_url, ROW_NUMBER() OVER (PARTITION BY CASE WHEN d.resource_type = 'announcement' THEN COALESCE(d.resource_id, '') ELSE d.id END ORDER BY CASE WHEN d.resource_type = 'announcement' AND d.user_id = ",
+        "WITH ranked AS (SELECT d.id, d.resource_type, d.title, d.body, CASE WHEN d.resource_type = 'release' THEN rm.repo_full_name ELSE d.repo_full_name END AS repo_full_name, COALESCE(ul.translated_text, d.translated_text) AS translated_text, COALESCE(ul.smart_text, d.smart_text) AS smart_text, d.source_time, d.updated_at, d.unread, CASE WHEN d.resource_type = 'repository' THEN EXISTS (SELECT 1 FROM user_repo_associations ura WHERE ura.user_id = d.user_id AND lower(ura.repo_full_name_lower) = lower(d.resource_id) AND ura.is_following != 0) ELSE NULL END AS is_following, CASE WHEN d.resource_type = 'release' THEN rm.target_path ELSE d.target_path END AS target_path, d.target_url, ROW_NUMBER() OVER (PARTITION BY CASE WHEN d.resource_type = 'announcement' THEN COALESCE(d.resource_id, '') ELSE d.id END ORDER BY CASE WHEN d.resource_type = 'announcement' AND d.user_id = ",
     );
     builder.push_bind(user_id);
     builder.push(
@@ -353,15 +353,15 @@ pub async fn query(
         builder.push_bind(resource_type);
     }
     if let Some(owner) = &parsed.owner {
-        builder.push(" AND lower(COALESCE(rm.owner_login, d.owner_login, '')) = lower(");
+        builder.push(" AND lower(COALESCE(CASE WHEN d.resource_type = 'release' THEN rm.owner_login ELSE d.owner_login END, '')) = lower(");
         builder.push_bind(owner);
         builder.push(")");
     }
     if let Some(repo) = &parsed.repo {
-        builder.push(" AND (lower(COALESCE(rm.repo_full_name, d.repo_full_name, '')) = lower(");
+        builder.push(" AND (lower(COALESCE(CASE WHEN d.resource_type = 'release' THEN rm.repo_full_name ELSE d.repo_full_name END, '')) = lower(");
         builder.push_bind(repo);
         builder.push(
-            ") OR lower(COALESCE(rm.repo_full_name, d.repo_full_name, '')) LIKE '%/' || lower(",
+            ") OR lower(COALESCE(CASE WHEN d.resource_type = 'release' THEN rm.repo_full_name ELSE d.repo_full_name END, '')) LIKE '%/' || lower(",
         );
         builder.push_bind(escape_like(repo));
         builder.push(") ESCAPE char(92))");
@@ -413,7 +413,7 @@ pub async fn query(
         builder.push(" OR lower(COALESCE(d.body, '')) LIKE lower(");
         builder.push_bind(pattern.clone());
         builder.push(") ESCAPE char(92)");
-        builder.push(" OR lower(COALESCE(rm.repo_full_name, d.repo_full_name, '')) LIKE lower(");
+        builder.push(" OR lower(COALESCE(CASE WHEN d.resource_type = 'release' THEN rm.repo_full_name ELSE d.repo_full_name END, '')) LIKE lower(");
         builder.push_bind(pattern.clone());
         builder.push(") ESCAPE char(92)");
         builder.push(" OR lower(COALESCE(d.translated_text, '')) LIKE lower(");
@@ -1721,6 +1721,65 @@ mod tests {
         assert!(
             results.iter().any(|result| result.id == "release:4201"),
             "current metadata should match a short repository filter before fanout completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_query_does_not_fallback_to_stale_metadata() {
+        let pool = setup_pool().await;
+        seed_release(&pool).await;
+        sqlx::query(
+            "UPDATE search_documents SET repo_full_name = 'stale/legacy', owner_login = 'stale', target_path = '/stale/legacy/releases/tag/old' WHERE id = 'release:4201'",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed stale release metadata");
+
+        sqlx::query("DROP VIEW user_release_visible_repos")
+            .execute(&pool)
+            .await
+            .expect("replace release visibility view");
+        sqlx::query(
+            "CREATE VIEW user_release_visible_repos AS SELECT 'search-user' AS user_id, 42 AS repo_id, NULL AS full_name, NULL AS owner_login",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed visible release with missing current metadata");
+
+        let state = setup_state(pool.clone());
+        let visible = query(
+            &state,
+            "search-user",
+            &parse_query("type:release").expect("parse release type filter"),
+        )
+        .await
+        .expect("query release with missing current metadata");
+        assert_eq!(visible.len(), 1);
+        assert!(visible[0].repository.is_none());
+        assert_eq!(
+            visible[0].target.href,
+            "https://github.com/octo/rill/releases/tag/v1.0.0"
+        );
+
+        assert!(
+            query(
+                &state,
+                "search-user",
+                &parse_query("stale").expect("parse stale metadata term"),
+            )
+            .await
+            .expect("query stale release metadata")
+            .is_empty()
+        );
+        assert!(
+            query(
+                &state,
+                "search-user",
+                &parse_query("repo:legacy").expect("parse stale repository filter"),
+            )
+            .await
+            .expect("query stale repository filter")
+            .is_empty()
         );
     }
 
