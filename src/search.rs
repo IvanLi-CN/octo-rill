@@ -49,7 +49,8 @@ pub struct SearchResult {
     pub is_following: Option<bool>,
     pub matched_lane: String,
     pub matched_lanes: Vec<String>,
-    pub target: SearchTarget,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<SearchTarget>,
 }
 
 #[derive(Debug, Serialize)]
@@ -334,11 +335,15 @@ pub async fn query(
         .collect::<Vec<_>>()
         .join(" OR ");
     let mut builder = QueryBuilder::<Sqlite>::new(
-        "WITH ranked AS (SELECT d.id, d.resource_type, d.title, d.body, CASE WHEN d.resource_type = 'release' THEN rm.repo_full_name ELSE d.repo_full_name END AS repo_full_name, COALESCE(ul.translated_text, d.translated_text) AS translated_text, COALESCE(ul.smart_text, d.smart_text) AS smart_text, d.source_time, d.updated_at, d.unread, CASE WHEN d.resource_type = 'repository' THEN EXISTS (SELECT 1 FROM user_repo_associations ura WHERE ura.user_id = d.user_id AND lower(ura.repo_full_name_lower) = lower(d.resource_id) AND ura.is_following != 0) ELSE NULL END AS is_following, CASE WHEN d.resource_type = 'release' THEN rm.target_path ELSE d.target_path END AS target_path, CASE WHEN d.resource_type = 'release' AND rm.target_path IS NULL THEN NULL ELSE d.target_url END AS target_url, ROW_NUMBER() OVER (PARTITION BY CASE WHEN d.resource_type = 'announcement' THEN COALESCE(d.resource_id, '') ELSE d.id END ORDER BY CASE WHEN d.resource_type = 'announcement' AND d.user_id = ",
+        "WITH current_release_metadata AS (SELECT repo_id, full_name, owner_login, ROW_NUMBER() OVER (PARTITION BY repo_id ORDER BY updated_at DESC, full_name ASC) AS metadata_rank FROM user_release_visible_repos WHERE user_id = ",
     );
     builder.push_bind(user_id);
     builder.push(
-        " THEN 0 ELSE 1 END, COALESCE(d.source_time, d.updated_at) DESC, d.id DESC) AS search_rank FROM search_documents d LEFT JOIN search_release_metadata rm ON rm.id = d.id LEFT JOIN search_document_user_lanes ul ON ul.document_id = d.id AND ul.user_id = ",
+        "), ranked AS (SELECT d.id, d.resource_type, d.title, d.body, CASE WHEN d.resource_type = 'release' THEN rm.full_name ELSE d.repo_full_name END AS repo_full_name, COALESCE(ul.translated_text, d.translated_text) AS translated_text, COALESCE(ul.smart_text, d.smart_text) AS smart_text, d.source_time, d.updated_at, d.unread, CASE WHEN d.resource_type = 'repository' THEN EXISTS (SELECT 1 FROM user_repo_associations ura WHERE ura.user_id = d.user_id AND lower(ura.repo_full_name_lower) = lower(d.resource_id) AND ura.is_following != 0) ELSE NULL END AS is_following, CASE WHEN d.resource_type = 'release' AND rm.full_name IS NOT NULL AND rr.tag_name IS NOT NULL THEN '/' || rm.full_name || '/releases/tag/' || rr.tag_name ELSE CASE WHEN d.resource_type = 'release' THEN NULL ELSE d.target_path END END AS target_path, CASE WHEN d.resource_type = 'release' AND (rm.full_name IS NULL OR rr.tag_name IS NULL) THEN NULL ELSE d.target_url END AS target_url, ROW_NUMBER() OVER (PARTITION BY CASE WHEN d.resource_type = 'announcement' THEN COALESCE(d.resource_id, '') ELSE d.id END ORDER BY CASE WHEN d.resource_type = 'announcement' AND d.user_id = ",
+    );
+    builder.push_bind(user_id);
+    builder.push(
+        " THEN 0 ELSE 1 END, COALESCE(d.source_time, d.updated_at) DESC, d.id DESC) AS search_rank FROM search_documents d LEFT JOIN current_release_metadata rm ON rm.repo_id = d.repo_id AND rm.metadata_rank = 1 LEFT JOIN repo_releases rr ON rr.release_id = CAST(d.resource_id AS INTEGER) LEFT JOIN search_document_user_lanes ul ON ul.document_id = d.id AND ul.user_id = ",
     );
     builder.push_bind(user_id);
     builder.push(" WHERE ((d.resource_type IN ('release', 'announcement') AND EXISTS (SELECT 1 FROM user_release_visible_repos vr WHERE vr.user_id = ");
@@ -358,10 +363,10 @@ pub async fn query(
         builder.push(")");
     }
     if let Some(repo) = &parsed.repo {
-        builder.push(" AND (lower(COALESCE(CASE WHEN d.resource_type = 'release' THEN rm.repo_full_name ELSE d.repo_full_name END, '')) = lower(");
+        builder.push(" AND (lower(COALESCE(CASE WHEN d.resource_type = 'release' THEN rm.full_name ELSE d.repo_full_name END, '')) = lower(");
         builder.push_bind(repo);
         builder.push(
-            ") OR lower(COALESCE(CASE WHEN d.resource_type = 'release' THEN rm.repo_full_name ELSE d.repo_full_name END, '')) LIKE '%/' || lower(",
+            ") OR lower(COALESCE(CASE WHEN d.resource_type = 'release' THEN rm.full_name ELSE d.repo_full_name END, '')) LIKE '%/' || lower(",
         );
         builder.push_bind(escape_like(repo));
         builder.push(") ESCAPE char(92))");
@@ -413,7 +418,7 @@ pub async fn query(
         builder.push(" OR lower(COALESCE(d.body, '')) LIKE lower(");
         builder.push_bind(pattern.clone());
         builder.push(") ESCAPE char(92)");
-        builder.push(" OR lower(COALESCE(CASE WHEN d.resource_type = 'release' THEN rm.repo_full_name ELSE d.repo_full_name END, '')) LIKE lower(");
+        builder.push(" OR lower(COALESCE(CASE WHEN d.resource_type = 'release' THEN rm.full_name ELSE d.repo_full_name END, '')) LIKE lower(");
         builder.push_bind(pattern.clone());
         builder.push(") ESCAPE char(92)");
         builder.push(" OR lower(COALESCE(d.translated_text, '')) LIKE lower(");
@@ -527,12 +532,15 @@ fn to_result(row: SearchDocumentRow, terms: &[String]) -> SearchResult {
             full_name: full_name.to_owned(),
         })
     });
-    let href = row
+    let target = row
         .target_path
         .clone()
         .or(row.target_url.clone())
         .map(|target| canonicalize_target_path(&row.resource_type, &target))
-        .unwrap_or_else(|| "/".to_owned());
+        .map(|href| SearchTarget {
+            href,
+            lane: Some(matched_lane.clone()),
+        });
     let source_time = row.source_time.clone();
     SearchResult {
         id: row.id,
@@ -546,10 +554,7 @@ fn to_result(row: SearchDocumentRow, terms: &[String]) -> SearchResult {
         is_following: row.is_following.map(|value| value != 0),
         matched_lane: matched_lane.clone(),
         matched_lanes,
-        target: SearchTarget {
-            href,
-            lane: Some(matched_lane),
-        },
+        target,
     }
 }
 
@@ -1041,7 +1046,10 @@ mod tests {
         assert_eq!(announcement.len(), 1);
         assert_eq!(announcement[0].id, "announcement:search-announcement");
         assert_eq!(announcement[0].matched_lane, "translated");
-        assert_eq!(announcement[0].target.href, "/octo/rill/discussions/7");
+        assert_eq!(
+            announcement[0].target.as_ref().unwrap().href,
+            "/octo/rill/discussions/7"
+        );
 
         let notification = query(&state, "search-user", &parse_query("通知翻译").unwrap())
             .await
@@ -1425,7 +1433,10 @@ mod tests {
         .expect("query migrated announcement lane");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].matched_lane, "translated");
-        assert_eq!(results[0].target.href, "/octo/rill/discussions/9");
+        assert_eq!(
+            results[0].target.as_ref().unwrap().href,
+            "/octo/rill/discussions/9"
+        );
     }
 
     #[tokio::test]
@@ -1740,7 +1751,7 @@ mod tests {
             .await
             .expect("replace release visibility view");
         sqlx::query(
-            "CREATE VIEW user_release_visible_repos AS SELECT 'search-user' AS user_id, 42 AS repo_id, NULL AS full_name, NULL AS owner_login",
+            "CREATE VIEW user_release_visible_repos AS SELECT 'other-user' AS user_id, 42 AS repo_id, 'stale/other' AS full_name, 'stale' AS owner_login, '2026-02-24T00:00:00Z' AS updated_at UNION ALL SELECT 'search-user' AS user_id, 42 AS repo_id, NULL AS full_name, NULL AS owner_login, NULL AS updated_at",
         )
         .execute(&pool)
         .await
@@ -1756,7 +1767,7 @@ mod tests {
         .expect("query release with missing current metadata");
         assert_eq!(visible.len(), 1);
         assert!(visible[0].repository.is_none());
-        assert_eq!(visible[0].target.href, "/");
+        assert!(visible[0].target.is_none());
 
         assert!(
             query(
@@ -2062,7 +2073,10 @@ mod tests {
         .await
         .expect("query owned release after baseline");
         assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].target.href, "/octo/rill/releases/tag/v1.0.0");
+        assert_eq!(
+            visible[0].target.as_ref().unwrap().href,
+            "/octo/rill/releases/tag/v1.0.0"
+        );
 
         sqlx::query("UPDATE search_documents SET target_path = NULL WHERE id = 'release:4201'")
             .execute(&pool)
@@ -2087,7 +2101,10 @@ mod tests {
         .await
         .expect("query repaired legacy release");
         assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].target.href, "/octo/rill/releases/tag/v1.0.0");
+        assert_eq!(
+            recovered[0].target.as_ref().unwrap().href,
+            "/octo/rill/releases/tag/v1.0.0"
+        );
 
         sqlx::query(
             "UPDATE owned_repo_star_baselines SET repo_full_name = 'octo/renamed', updated_at = '2026-02-24T00:00:00Z' WHERE id = 'search-owned-baseline'",
@@ -2103,7 +2120,10 @@ mod tests {
         .await
         .expect("query renamed owned release");
         assert_eq!(renamed.len(), 1);
-        assert_eq!(renamed[0].target.href, "/octo/renamed/releases/tag/v1.0.0");
+        assert_eq!(
+            renamed[0].target.as_ref().unwrap().href,
+            "/octo/renamed/releases/tag/v1.0.0"
+        );
     }
 
     #[tokio::test]
