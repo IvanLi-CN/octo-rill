@@ -7334,6 +7334,7 @@ pub async fn admin_get_llm_scheduler_status(
     session: Session,
 ) -> Result<Json<AdminLlmSchedulerStatusResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let _runtime_settings_guard = admin_runtime::runtime_settings_update_lock().lock().await;
     admin_runtime::sync_persisted_runtime_settings(state.clone())
         .await
         .map_err(ApiError::internal)?;
@@ -7347,6 +7348,7 @@ pub async fn admin_get_llm_activity(
     session: Session,
 ) -> Result<Json<AdminLlmActivityResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let _runtime_settings_guard = admin_runtime::runtime_settings_update_lock().lock().await;
     admin_runtime::sync_persisted_runtime_settings(state.clone())
         .await
         .map_err(ApiError::internal)?;
@@ -15608,17 +15610,6 @@ async fn persist_reaction_pat_check_result(
     Ok(())
 }
 
-fn log_reaction_pat_check_persistence_failure(error: &ApiError) {
-    tracing::warn!(
-        event = "sqlite.write",
-        operation = "reaction_pat_check_result_update",
-        priority = "foreground",
-        downgrade_reason = "persistence_failed",
-        error_chain = %crate::observability::error_chain_summary(error),
-        "failed to persist reaction PAT check result"
-    );
-}
-
 async fn clear_reaction_pat_scope_observation(
     state: &AppState,
     user_id: &str,
@@ -19220,16 +19211,13 @@ pub async fn refresh_feed_reactions(
             return Ok(Json(FeedReactionRefreshResponse { items: Vec::new() }));
         }
         Err(err) if err.code() == "pat_invalid" => {
-            if let Err(persist_error) = persist_reaction_pat_check_result(
+            persist_reaction_pat_check_result(
                 state.as_ref(),
                 &user_id,
                 "invalid",
                 Some("PAT is invalid or expired"),
             )
-            .await
-            {
-                log_reaction_pat_check_persistence_failure(&persist_error);
-            }
+            .await?;
             return Err(err);
         }
         Err(err) => return Err(err),
@@ -19239,16 +19227,13 @@ pub async fn refresh_feed_reactions(
     let live = match fetch_live_release_reactions(state.as_ref(), &token, &node_ids).await {
         Ok(live) => live,
         Err(err) if err.code() == "reauth_required" => {
-            if let Err(persist_error) = persist_reaction_pat_check_result(
+            persist_reaction_pat_check_result(
                 state.as_ref(),
                 &user_id,
                 "invalid",
                 Some("PAT is invalid or expired"),
             )
-            .await
-            {
-                log_reaction_pat_check_persistence_failure(&persist_error);
-            }
+            .await?;
             return Err(ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "pat_invalid",
@@ -19505,16 +19490,13 @@ pub async fn toggle_release_reaction(
             ));
         }
         Err(err) if err.code() == "pat_invalid" => {
-            if let Err(persist_error) = persist_reaction_pat_check_result(
+            persist_reaction_pat_check_result(
                 state.as_ref(),
                 &user_id,
                 "invalid",
                 Some("PAT is invalid or expired"),
             )
-            .await
-            {
-                log_reaction_pat_check_persistence_failure(&persist_error);
-            }
+            .await?;
             return Err(err);
         }
         Err(err) => return Err(err),
@@ -19560,16 +19542,13 @@ pub async fn toggle_release_reaction(
         match fetch_live_release_reactions(state.as_ref(), &token, &[node_id.to_owned()]).await {
             Ok(v) => v,
             Err(err) if err.code() == "reauth_required" => {
-                if let Err(persist_error) = persist_reaction_pat_check_result(
+                persist_reaction_pat_check_result(
                     state.as_ref(),
                     &user_id,
                     "invalid",
                     Some("PAT is invalid or expired"),
                 )
-                .await
-                {
-                    log_reaction_pat_check_persistence_failure(&persist_error);
-                }
+                .await?;
                 return Err(ApiError::new(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "pat_invalid",
@@ -19600,16 +19579,13 @@ pub async fn toggle_release_reaction(
         {
             Ok(v) => v,
             Err(err) if err.code() == "reauth_required" => {
-                if let Err(persist_error) = persist_reaction_pat_check_result(
+                persist_reaction_pat_check_result(
                     state.as_ref(),
                     &user_id,
                     "invalid",
                     Some("PAT is invalid or expired"),
                 )
-                .await
-                {
-                    log_reaction_pat_check_persistence_failure(&persist_error);
-                }
+                .await?;
                 return Err(ApiError::new(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "pat_invalid",
@@ -19618,12 +19594,8 @@ pub async fn toggle_release_reaction(
             }
             Err(err) => return Err(err),
         };
-    if let Err(persist_error) =
-        persist_reaction_pat_check_result(state.as_ref(), &user_id, "valid", Some("PAT is valid"))
-            .await
-    {
-        log_reaction_pat_check_persistence_failure(&persist_error);
-    }
+    persist_reaction_pat_check_result(state.as_ref(), &user_id, "valid", Some("PAT is valid"))
+        .await?;
     persist_release_reaction_counts(state.as_ref(), row.release_id, &updated.counts).await?;
 
     Ok(Json(ToggleReleaseReactionResponse {
@@ -36668,6 +36640,26 @@ line two",
         .expect("load reaction PAT check result");
         assert_eq!(state_row.0, "invalid");
         assert_eq!(state_row.1.as_deref(), Some("PAT is invalid or expired"));
+    }
+
+    #[tokio::test]
+    async fn reaction_pat_check_result_surfaces_terminal_write_failure() {
+        let pool = setup_pool().await;
+        sqlx::query("DROP TABLE reaction_pat_tokens")
+            .execute(&pool)
+            .await
+            .expect("drop reaction PAT table");
+        let state = setup_state(pool);
+
+        let error = persist_reaction_pat_check_result(
+            state.as_ref(),
+            test_user_id(1).as_str(),
+            "invalid",
+            Some("PAT is invalid or expired"),
+        )
+        .await
+        .expect_err("terminal PAT write failure should reach the caller");
+        assert_eq!(error.code(), "internal_error");
     }
 
     #[tokio::test]

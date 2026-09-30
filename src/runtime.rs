@@ -139,6 +139,8 @@ pub fn spawn_runtime_owner_heartbeat(state: Arc<AppState>) -> LeaseHeartbeat {
             let state = state.clone();
             async move {
                 touch_runtime_owner_lease(state.as_ref()).await?;
+                let _runtime_settings_guard =
+                    admin_runtime::runtime_settings_update_lock().lock().await;
                 admin_runtime::sync_persisted_runtime_settings(state.clone()).await?;
                 Ok(())
             }

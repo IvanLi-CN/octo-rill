@@ -22,8 +22,11 @@ use tower_sessions::Session;
 use tracing::warn;
 
 use crate::{
-    admin_runtime, ai, api, content_processing, error::ApiError, runtime,
-    sqlite_write::SqliteWriteCoordinator, state::AppState,
+    admin_runtime, ai, api, content_processing,
+    error::ApiError,
+    runtime,
+    sqlite_write::{SqliteWriteCoordinator, SqliteWritePriority},
+    state::AppState,
 };
 
 const TRANSLATION_PROTOCOL_VERSION: &str = "translation-request.v1";
@@ -2528,6 +2531,7 @@ pub async fn admin_get_translation_status(
     session: Session,
 ) -> Result<Json<AdminTranslationStatusResponse>, ApiError> {
     let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
+    let _runtime_settings_guard = admin_runtime::runtime_settings_update_lock().lock().await;
     admin_runtime::sync_persisted_runtime_settings(state.clone())
         .await
         .map_err(ApiError::internal)?;
@@ -3381,7 +3385,11 @@ async fn create_translation_request_with_origin(
     let now = Utc::now().to_rfc3339();
     let (sqlite_write, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "translation_request")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "translation_request",
+            SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     ensure_legacy_writer_transaction(&mut tx).await?;
@@ -3416,7 +3424,11 @@ async fn resolve_translation_results_for_user(
     let now = Utc::now().to_rfc3339();
     let (_sqlite_write, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "translation_result_resolve")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "translation_result_resolve",
+            SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     ensure_legacy_writer_transaction(&mut tx).await?;
@@ -3514,7 +3526,11 @@ async fn create_translation_requests_batch_with_origin(
     let now = Utc::now().to_rfc3339();
     let (sqlite_write, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "translation_request_batch")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "translation_request_batch",
+            SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     ensure_legacy_writer_transaction(&mut tx).await?;
