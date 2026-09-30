@@ -390,7 +390,7 @@ async fn clear_pat_scope_observation(state: &AppState, user_id: &str) -> Result<
             )
             .bind(Utc::now().to_rfc3339())
             .bind(user_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("clear webhook PAT scope observation")
         })
@@ -514,7 +514,7 @@ async fn validate_pat_with_github(
                 .bind(&github_user.login)
                 .bind(&now)
                 .bind(user_id)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("persist webhook PAT owner login")
             })
@@ -534,7 +534,7 @@ async fn validate_pat_with_github(
             .bind(scope_observation)
             .bind(&now)
             .bind(user_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("persist webhook PAT scope observation")
         })
@@ -1050,7 +1050,7 @@ pub async fn patch_settings(
                 .bind(&user_id)
                 .bind(&config.webhook_push_desired_state)
                 .bind(config.webhook_push_enabled)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await?;
             Ok::<_, anyhow::Error>(updated.rows_affected())
         })
@@ -1107,7 +1107,7 @@ pub async fn patch_settings(
                     .bind(&user_id)
                     .bind(jobs::STATUS_QUEUED)
                     .bind(jobs::STATUS_RUNNING)
-                    .execute(&state.pool)
+                    .execute(state.sqlite_writer.write_pool_or(&state.pool))
                     .await?;
                     Ok::<_, anyhow::Error>(())
                 })
@@ -1382,7 +1382,7 @@ async fn acknowledge_reconcile_generation(
             .bind(Utc::now().to_rfc3339())
             .bind(user_id)
             .bind(generation)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("acknowledge webhook reconcile generation")
             .map(|_| ())
@@ -1877,7 +1877,7 @@ async fn pause_user_repos_for_permission_error(
             .bind(&message)
             .bind(&now)
             .bind(user_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("persist webhook permission pause")
         })
@@ -1951,7 +1951,7 @@ async fn persist_repo_state(
             .bind(registered_at.as_deref())
             .bind(&now)
             .bind(clear_permission_pause)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("persist webhook repo state")
         })
@@ -2102,7 +2102,7 @@ async fn run_repo_operation(
                         )
                         .bind(user_id)
                         .bind(repo.repo_id)
-                        .execute(&state.pool)
+                        .execute(state.sqlite_writer.write_pool_or(&state.pool))
                         .await
                         .context("delete already absent webhook repo state")
                     })
@@ -2131,7 +2131,7 @@ async fn run_repo_operation(
                     .bind(&now)
                     .bind(user_id)
                     .bind(repo.repo_id)
-                    .execute(&state.pool)
+                    .execute(state.sqlite_writer.write_pool_or(&state.pool))
                     .await
                     .context("persist missing webhook repo")
                 })
@@ -2188,7 +2188,7 @@ async fn run_repo_operation(
                         )
                         .bind(user_id)
                         .bind(repo.repo_id)
-                        .execute(&state.pool)
+                        .execute(state.sqlite_writer.write_pool_or(&state.pool))
                         .await
                         .context("delete webhook repo state")
                     })
@@ -2326,7 +2326,7 @@ async fn try_acquire_user_operation_lease(
             .bind(task_id)
             .bind(&expires_at)
             .bind(&now_rfc3339)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("acquire webhook operation lease")
         })
@@ -2345,7 +2345,7 @@ async fn renew_user_operation_lease(state: &AppState, user_id: &str, task_id: &s
             .bind(&expires_at)
             .bind(user_id)
             .bind(task_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("renew webhook operation lease")
         })
@@ -2369,7 +2369,7 @@ async fn release_user_operation_lease(
             )
             .bind(user_id)
             .bind(task_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("release webhook operation lease")
         })
@@ -2639,7 +2639,7 @@ async fn execute_for_user_locked(
                             .bind(&now)
                             .bind(user_id)
                             .bind(repo.repo_id)
-                            .execute(&state.pool)
+                            .execute(state.sqlite_writer.write_pool_or(&state.pool))
                             .await
                             .context("persist webhook repo error")
                         })
@@ -2762,7 +2762,7 @@ async fn execute_for_user_locked(
                 .bind(&now)
                 .bind(&now)
                 .bind(user_id)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("persist webhook push last completed check")
             })
@@ -2961,7 +2961,7 @@ pub async fn execute_audit_task(state: &AppState, task_id: &str, payload: &Value
         .write("webhook_push_delivery_retention", |_| async {
             sqlx::query("DELETE FROM webhook_push_deliveries WHERE received_at < ?")
                 .bind(&cutoff)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("prune webhook delivery history")
         })
@@ -3006,7 +3006,7 @@ pub async fn execute_audit_task(state: &AppState, task_id: &str, payload: &Value
             sqlx::query("UPDATE admin_runtime_settings SET webhook_push_audit_last_started_at = ?, updated_at = ? WHERE id = 1")
                 .bind(&now)
                 .bind(&now)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("persist webhook push audit completion")
         })
@@ -3068,7 +3068,7 @@ pub async fn admin_patch_runtime_config(
             sqlx::query("UPDATE admin_runtime_settings SET webhook_push_audit_interval_days = ?, updated_at = ? WHERE id = 1")
                 .bind(request.audit_interval_days)
                 .bind(&now)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("persist webhook push audit interval")
         })
@@ -3179,7 +3179,7 @@ async fn reset_delivery_to_pending(
     deadline: tokio::time::Instant,
 ) -> Result<(), ApiError> {
     let delivery = delivery.to_owned();
-    let pool = state.pool.clone();
+    let pool = state.sqlite_writer.write_pool_or(&state.pool).clone();
     let write = state
         .sqlite_writer
         .write_foreground("webhook_receiver_delivery_rollback", |_| {
@@ -3430,7 +3430,7 @@ pub async fn receive(
         };
     let delivery = delivery.to_owned();
     let queued_task_id = format!("repo-release:{}", repo.id);
-    let pool = state.pool.clone();
+    let pool = state.sqlite_writer.write_pool_or(&state.pool).clone();
     let queued_update = state
         .sqlite_writer
         .write_foreground("webhook_receiver_delivery_queued", |_| {

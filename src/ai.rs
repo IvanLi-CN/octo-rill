@@ -1125,7 +1125,8 @@ async fn cleanup_expired_llm_calls(state: &AppState) -> Result<u64> {
         .sqlite_writer
         .try_write("llm_call_retention_cleanup", || async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin()
                 .await
                 .context("begin llm retention cleanup transaction failed")?;
@@ -2202,7 +2203,8 @@ async fn insert_llm_call(
         .sqlite_writer
         .write("llm_call_insert", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin llm_call insert transaction failed")?;
@@ -2353,8 +2355,7 @@ async fn append_llm_call_event_if_owned(
     let inserted = state
         .sqlite_writer
         .write("llm_call_event_insert", |_| async {
-            let mut tx = state
-                .pool
+            let mut tx = state.sqlite_writer.write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin llm_call event transaction failed")?;
@@ -2407,7 +2408,8 @@ async fn update_llm_call_running(
         .sqlite_writer
         .write("llm_call_running", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin llm_call running transaction failed")?;
@@ -2504,7 +2506,8 @@ async fn requeue_llm_call_for_retry(
         .sqlite_writer
         .write("llm_call_requeue", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin llm_call requeue transaction failed")?;
@@ -2688,7 +2691,8 @@ async fn finalize_llm_call(
         .sqlite_writer
         .write("llm_call_finalize", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin llm_call finalize transaction failed")?;
@@ -2813,7 +2817,7 @@ async fn set_llm_admin_override_if_owned(state: &AppState, snapshot: LlmCallAdmi
                 )
                 .bind(call_id.as_str())
                 .bind(state.runtime_owner_id.as_str())
-                .fetch_optional(&state.pool)
+                .fetch_optional(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("load llm_call ownership for admin override failed")?
                 .is_some(),
@@ -3755,7 +3759,7 @@ async fn heartbeat_llm_call_lease(state: &AppState, call_id: &str) -> Result<()>
             .bind(now.as_str())
             .bind(call_id)
             .bind(state.runtime_owner_id.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("heartbeat llm_call lease failed")?;
             Ok::<_, anyhow::Error>(())
@@ -3790,7 +3794,8 @@ async fn recover_llm_call_with_message(
         .sqlite_writer
         .write("llm_call_recover", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin llm_call recovery transaction failed")?;

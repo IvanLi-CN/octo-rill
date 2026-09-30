@@ -860,7 +860,7 @@ async fn upsert_dispatch_state(
             .bind(schedule_key)
             .bind(task_id)
             .bind(now.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to upsert subscription dispatch state")?;
             Ok::<_, anyhow::Error>(())
@@ -887,7 +887,7 @@ async fn update_daily_brief_hour_slot_dispatch(
             .bind(dispatch_at)
             .bind(dispatch_at)
             .bind(hour_utc)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to update slot last_dispatch_at")?;
             Ok::<_, anyhow::Error>(())
@@ -917,7 +917,7 @@ async fn mark_brief_generation_source(
             .bind(generation_source)
             .bind(updated_at)
             .bind(brief_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .with_context(|| format!("failed to mark brief {brief_id} as {generation_source}"))?;
             Ok::<_, anyhow::Error>(())
@@ -1188,7 +1188,7 @@ async fn insert_task_record(
             .bind(runtime_owner_id)
             .bind(lease_heartbeat_at)
             .bind(now.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to insert job task")?;
             Ok::<_, anyhow::Error>(())
@@ -1382,7 +1382,7 @@ pub async fn enqueue_singleton_task_for_requester_if_generation_pending(
             .bind(&requested_by)
             .bind(generation)
             .bind(generation)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("insert generation-gated job task")?;
             Ok::<_, anyhow::Error>(result.rows_affected() != 0)
@@ -1669,7 +1669,7 @@ async fn reschedule_task_inner(
                 .bind(&now)
                 .bind(task_id)
                 .bind(STATUS_RUNNING)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("failed to reschedule task with payload")
             } else if let Some(retry_count) = retry_count {
@@ -1688,7 +1688,7 @@ async fn reschedule_task_inner(
                 .bind(&now)
                 .bind(task_id)
                 .bind(STATUS_RUNNING)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("failed to reschedule task")
             } else {
@@ -1706,7 +1706,7 @@ async fn reschedule_task_inner(
                 .bind(&now)
                 .bind(task_id)
                 .bind(STATUS_RUNNING)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("failed to reschedule task")
             }
@@ -1813,7 +1813,7 @@ pub async fn cancel_task(state: &AppState, task_id: &str) -> Result<String> {
             .bind(STATUS_QUEUED)
             .bind(TASK_WEBHOOK_PUSH_MANAGE)
             .bind(TASK_WEBHOOK_PUSH_AUDIT)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to request queued webhook cancellation")
         })
@@ -1848,7 +1848,7 @@ pub async fn cancel_task(state: &AppState, task_id: &str) -> Result<String> {
             .bind(STATUS_QUEUED)
             .bind(TASK_WEBHOOK_PUSH_MANAGE)
             .bind(TASK_WEBHOOK_PUSH_AUDIT)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to cancel queued task")
         })
@@ -1878,7 +1878,7 @@ pub async fn cancel_task(state: &AppState, task_id: &str) -> Result<String> {
             .bind(now.as_str())
             .bind(task_id)
             .bind(STATUS_RUNNING)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to request cancellation")
         })
@@ -1928,7 +1928,7 @@ pub async fn append_task_event(
             .bind(event_type)
             .bind(payload_json.as_str())
             .bind(now.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to insert task event")?;
             Ok::<_, anyhow::Error>(())
@@ -4491,7 +4491,7 @@ async fn finalize_task_if_owned(
             .bind(task_id)
             .bind(STATUS_RUNNING)
             .bind(runtime_owner_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to finalize owned task")?;
             Ok(updated.rows_affected() > 0)
@@ -4518,7 +4518,7 @@ async fn heartbeat_task_lease(state: &AppState, task_id: &str) -> Result<()> {
             .bind(task_id)
             .bind(STATUS_RUNNING)
             .bind(state.runtime_owner_id.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to heartbeat task lease")?;
             Ok(())
@@ -4636,7 +4636,8 @@ async fn recover_task_if_stale(
         .sqlite_writer
         .write("job_task_recover", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("failed to begin stale task recovery transaction")?;

@@ -25,7 +25,7 @@ use crate::{
     admin_runtime, ai, api, content_processing,
     error::ApiError,
     runtime,
-    sqlite_write::{SqliteWriteCoordinator, SqliteWritePriority},
+    sqlite_write::{SqliteWriteCoordinator, SqliteWritePriority, is_sqlite_write_deadline_error},
     state::AppState,
 };
 
@@ -5816,25 +5816,34 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
                 Ok(()) => Ok(()),
                 Err(finalize_error) => {
                     let finalize_error_text = finalize_error.to_string();
-                    tracing::error!(
-                        event = "translation.batch_finalize_failed",
-                        batch_id = batch.id.as_str(),
-                        error_kind = "finalize_failed",
-                        error = finalize_error_text.as_str(),
-                        "translation batch success finalization failed; attempting owner fallback"
-                    );
-                    match force_fail_translation_batch_if_owned(
-                        state,
-                        &batch,
-                        finalize_error_text.as_str(),
-                    )
-                    .await
-                    {
-                        Ok(true) => Err(finalize_error),
-                        Ok(false) => Err(finalize_error),
-                        Err(fallback_error) => Err(anyhow!(
-                            "translation batch finalization failed: {finalize_error_text}; owner fallback failed: {fallback_error}"
-                        )),
+                    if is_sqlite_write_deadline_error(finalize_error.as_ref()) {
+                        match defer_translation_batch_after_finalize_deadline(state, &batch).await {
+                            Ok(_) => Err(finalize_error),
+                            Err(defer_error) => Err(anyhow!(
+                                "translation batch finalization deadline exceeded: {finalize_error_text}; deferral failed: {defer_error}"
+                            )),
+                        }
+                    } else {
+                        tracing::error!(
+                            event = "translation.batch_finalize_failed",
+                            batch_id = batch.id.as_str(),
+                            error_kind = "finalize_failed",
+                            error = finalize_error_text.as_str(),
+                            "translation batch success finalization failed; attempting owner fallback"
+                        );
+                        match force_fail_translation_batch_if_owned(
+                            state,
+                            &batch,
+                            finalize_error_text.as_str(),
+                        )
+                        .await
+                        {
+                            Ok(true) => Err(finalize_error),
+                            Ok(false) => Err(finalize_error),
+                            Err(fallback_error) => Err(anyhow!(
+                                "translation batch finalization failed: {finalize_error_text}; owner fallback failed: {fallback_error}"
+                            )),
+                        }
                     }
                 }
             };
@@ -5864,24 +5873,33 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
                 Ok(()) => Ok(()),
                 Err(finalize_error) => {
                     let finalize_error_text = finalize_error.to_string();
-                    tracing::error!(
-                        event = "translation.batch_finalize_failed",
-                        batch_id = batch.id.as_str(),
-                        error_kind = "failure_finalize_failed",
-                        error = finalize_error_text.as_str(),
-                        "translation batch failure finalization failed; attempting owner fallback"
-                    );
-                    match force_fail_translation_batch_if_owned(
-                        state,
-                        &batch,
-                        finalize_error_text.as_str(),
-                    )
-                    .await
-                    {
-                        Ok(true) | Ok(false) => Err(anyhow!(finalize_error_text)),
-                        Err(fallback_error) => Err(anyhow!(
-                            "translation batch failure finalization failed: {finalize_error_text}; owner fallback failed: {fallback_error}"
-                        )),
+                    if is_sqlite_write_deadline_error(finalize_error.as_ref()) {
+                        match defer_translation_batch_after_finalize_deadline(state, &batch).await {
+                            Ok(_) => Err(anyhow!(finalize_error_text)),
+                            Err(defer_error) => Err(anyhow!(
+                                "translation batch finalization deadline exceeded: {finalize_error_text}; deferral failed: {defer_error}"
+                            )),
+                        }
+                    } else {
+                        tracing::error!(
+                            event = "translation.batch_finalize_failed",
+                            batch_id = batch.id.as_str(),
+                            error_kind = "failure_finalize_failed",
+                            error = finalize_error_text.as_str(),
+                            "translation batch failure finalization failed; attempting owner fallback"
+                        );
+                        match force_fail_translation_batch_if_owned(
+                            state,
+                            &batch,
+                            finalize_error_text.as_str(),
+                        )
+                        .await
+                        {
+                            Ok(true) | Ok(false) => Err(anyhow!(finalize_error_text)),
+                            Err(fallback_error) => Err(anyhow!(
+                                "translation batch failure finalization failed: {finalize_error_text}; owner fallback failed: {fallback_error}"
+                            )),
+                        }
                     }
                 }
             };
@@ -6605,6 +6623,112 @@ async fn finalize_batch_failure(
     Ok(())
 }
 
+async fn defer_translation_batch_after_finalize_deadline(
+    state: &AppState,
+    batch: &ClaimedBatch,
+) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "translation_batch_finalize_defer")
+        .await?;
+    if !content_processing::legacy_mode_in_transaction(tx.as_transaction_mut()).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    if !legacy_batch_claim_is_current(tx.as_transaction_mut(), state, batch).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+
+    for item in &batch.items {
+        let request_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM translation_requests WHERE work_item_id = ?",
+        )
+        .bind(item.id.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        for request_id in request_ids {
+            reset_request_for_retry(tx.as_transaction_mut(), request_id.as_str(), now.as_str())
+                .await?;
+        }
+        record_translation_attempt_queued(
+            tx.as_transaction_mut(),
+            item.id.as_str(),
+            None,
+            TranslationAttemptTrigger::SystemRequeue,
+            now.as_str(),
+        )
+        .await?;
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE translation_work_items
+        SET status = 'batched',
+            result_status = NULL,
+            title_zh = NULL,
+            summary_md = NULL,
+            body_md = NULL,
+            error_text = NULL,
+            started_at = NULL,
+            finished_at = NULL,
+            updated_at = ?
+        WHERE batch_id = ? AND status = 'running'
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(batch.id.as_str())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE ai_translations
+        SET status = 'queued', updated_at = ?
+        WHERE status = 'running'
+          AND active_work_item_id IN (
+            SELECT work_item_id FROM translation_batch_items WHERE batch_id = ?
+          )
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(batch.id.as_str())
+    .execute(&mut *tx)
+    .await?;
+    let batch_update = sqlx::query(
+        r#"
+        UPDATE translation_batches
+        SET status = 'queued',
+            started_at = NULL,
+            finished_at = NULL,
+            error_text = NULL,
+            runtime_owner_id = NULL,
+            lease_heartbeat_at = NULL,
+            updated_at = ?
+        WHERE id = ?
+          AND status = 'running'
+          AND runtime_owner_id = ?
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(batch.id.as_str())
+    .bind(state.runtime_owner_id.as_str())
+    .execute(&mut *tx)
+    .await?;
+    if batch_update.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    tx.commit().await?;
+    tracing::warn!(
+        event = "translation.batch_finalize_deferred",
+        batch_id = batch.id.as_str(),
+        cooldown_ms = runtime::RUNTIME_LEASE_STALE_AFTER.as_millis(),
+        "translation batch finalization exceeded its write deadline; batch requeued"
+    );
+    Ok(true)
+}
+
 async fn force_fail_translation_batch_if_owned(
     state: &AppState,
     batch: &ClaimedBatch,
@@ -6882,7 +7006,7 @@ async fn heartbeat_translation_batch_lease(state: &AppState, batch_id: &str) -> 
             let has_control_table = sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'content_processing_control'",
             )
-            .fetch_one(&state.pool)
+            .fetch_one(state.sqlite_writer.write_pool_or(&state.pool))
             .await?
                 > 0;
             if has_control_table {
@@ -6903,7 +7027,7 @@ async fn heartbeat_translation_batch_lease(state: &AppState, batch_id: &str) -> 
                 .bind(now.as_str())
                 .bind(batch_id)
                 .bind(state.runtime_owner_id.as_str())
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await?;
             } else {
                 sqlx::query(
@@ -6919,7 +7043,7 @@ async fn heartbeat_translation_batch_lease(state: &AppState, batch_id: &str) -> 
                 .bind(now.as_str())
                 .bind(batch_id)
                 .bind(state.runtime_owner_id.as_str())
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await?;
             }
             Ok::<(), anyhow::Error>(())
@@ -12327,6 +12451,114 @@ mod tests {
                     "[]".to_owned(),
                 ),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_deadline_requeues_batch_with_reclaim_cooldown() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let mut item = sample_release_item("finalize-deadline-defer");
+        item.max_wait_ms = 0;
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim batch")
+            .expect("batch exists");
+        let work_item_id = batch.items[0].id.as_str();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            UPDATE translation_batches
+            SET status = 'running', started_at = ?, runtime_owner_id = ?,
+                lease_heartbeat_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(state.runtime_owner_id.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(batch.id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark batch running");
+        sqlx::query(
+            "UPDATE translation_work_items SET status = 'running', started_at = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(work_item_id)
+        .execute(&pool)
+        .await
+        .expect("mark work item running");
+        sqlx::query(
+            "UPDATE translation_requests SET status = 'running', started_at = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(created.request_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark request running");
+        sqlx::query(
+            "UPDATE ai_translations SET status = 'running', updated_at = ? WHERE active_work_item_id = ?",
+        )
+        .bind(now.as_str())
+        .bind(work_item_id)
+        .execute(&pool)
+        .await
+        .expect("mark translation state running");
+
+        assert!(
+            defer_translation_batch_after_finalize_deadline(state.as_ref(), &batch)
+                .await
+                .expect("defer timed-out batch")
+        );
+
+        let batch_row = sqlx::query(
+            "SELECT status, runtime_owner_id, updated_at FROM translation_batches WHERE id = ?",
+        )
+        .bind(batch.id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load deferred batch");
+        assert_eq!(batch_row.get::<String, _>("status"), "queued");
+        assert_eq!(batch_row.get::<Option<String>, _>("runtime_owner_id"), None);
+        assert!(batch_row.get::<String, _>("updated_at") > now);
+
+        let work_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ?")
+                .bind(work_item_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load deferred work item");
+        let request_row =
+            sqlx::query("SELECT status, started_at FROM translation_requests WHERE id = ?")
+                .bind(created.request_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load deferred request");
+        let translation_state: String =
+            sqlx::query_scalar("SELECT status FROM ai_translations WHERE active_work_item_id = ?")
+                .bind(work_item_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load deferred translation state");
+        assert_eq!(work_status, "batched");
+        assert_eq!(request_row.get::<String, _>("status"), "queued");
+        assert_eq!(request_row.get::<Option<String>, _>("started_at"), None);
+        assert_eq!(translation_state, "queued");
+
+        assert!(
+            claim_existing_queued_batch(state.as_ref(), &test_worker_profile(2, "general"))
+                .await
+                .expect("freshly deferred batch stays in cooldown")
+                .is_none()
         );
     }
 

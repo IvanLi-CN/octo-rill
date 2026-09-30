@@ -234,7 +234,7 @@ pub async fn update_llm_recovery_runtime_config(
             .bind(i64::from(rollout_percent))
             .bind(now.as_str())
             .bind(now.as_str())
-            .execute(pool)
+            .execute(sqlite_writer.write_pool_or(pool))
             .await
             .map_err(anyhow::Error::from)
         })
@@ -326,7 +326,7 @@ pub async fn upsert_llm_model_health(
             .bind(health.last_failure_at.as_deref())
             .bind(now.as_str())
             .bind(now.as_str())
-            .execute(pool)
+            .execute(sqlite_writer.write_pool_or(pool))
             .await
             .map_err(anyhow::Error::from)
         })
@@ -841,7 +841,7 @@ pub async fn clear_sync_auto_fetch_effective_at(
                 "#,
             )
             .bind(Utc::now().to_rfc3339())
-            .execute(pool)
+            .execute(sqlite_writer.write_pool_or(pool))
             .await
             .map_err(anyhow::Error::from)
         })
@@ -984,7 +984,7 @@ async fn maybe_backfill_legacy_ai_model_context_limit(
             .bind(i64::from(limit))
             .bind(now.as_str())
             .bind(now.as_str())
-            .execute(pool)
+            .execute(sqlite_writer.write_pool_or(pool))
             .await
             .map_err(anyhow::Error::from)
         })
@@ -1019,7 +1019,7 @@ async fn maybe_backfill_legacy_llm_models(
             )
             .bind(serialized.as_str())
             .bind(now.as_str())
-            .execute(pool)
+            .execute(sqlite_writer.write_pool_or(pool))
             .await
             .map_err(anyhow::Error::from)
         })
@@ -1101,7 +1101,7 @@ pub async fn load_or_seed_runtime_settings_with_writer(
             ))
             .bind(now.as_str())
             .bind(now.as_str())
-            .execute(pool)
+            .execute(sqlite_writer.write_pool_or(pool))
             .await
             .map_err(anyhow::Error::from)
         })
@@ -1149,7 +1149,7 @@ pub async fn update_llm_runtime_settings(
             .bind(serialized_llm_models.as_str())
             .bind(now.as_str())
             .bind(now.as_str())
-            .execute(pool)
+            .execute(sqlite_writer.write_pool_or(pool))
             .await
             .map_err(anyhow::Error::from)
         })
@@ -1251,7 +1251,7 @@ pub async fn update_translation_runtime_settings(
             .bind(i64::try_from(general_worker_concurrency).unwrap_or(i64::MAX))
             .bind(i64::try_from(dedicated_worker_concurrency).unwrap_or(i64::MAX))
             .bind(now.as_str())
-            .execute(pool)
+            .execute(sqlite_writer.write_pool_or(pool))
             .await
             .map_err(anyhow::Error::from)
         })
@@ -1373,7 +1373,8 @@ pub async fn restore_persisted_runtime_settings(
         .sqlite_writer
         .write_foreground("admin_runtime_settings_restore", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin admin runtime settings restore transaction failed")?;

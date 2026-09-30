@@ -4660,7 +4660,7 @@ async fn mark_release_content_enqueue_pending(state: &AppState, release_ids: &[i
                 query_builder = query_builder.bind(release_id);
             }
             query_builder
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("failed to mark pending release content enqueue")?;
             Ok::<_, anyhow::Error>(())
@@ -4689,7 +4689,7 @@ async fn clear_release_content_enqueue_pending(
                 query_builder = query_builder.bind(release_id);
             }
             query_builder
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("failed to clear pending release content enqueue")?;
             Ok::<_, anyhow::Error>(())
@@ -6369,7 +6369,8 @@ async fn retry_subscription_release_watchers(
         .write("subscription_retry_release_watchers", |_| async {
             let mut tx = context
                 .state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&context.state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin subscription retry release tx")?;
@@ -7286,7 +7287,8 @@ async fn prune_completed_repo_refresh_governance_cycle_members(
             let now_rfc3339 = now_rfc3339.clone();
             async move {
                 let mut tx = state
-                    .pool
+                    .sqlite_writer
+                    .write_pool_or(&state.pool)
                     .begin_with("BEGIN IMMEDIATE")
                     .await
                     .context("begin repo refresh governance retention tx")?;
@@ -7658,7 +7660,8 @@ async fn rebuild_repo_refresh_governance_snapshots(
         .sqlite_writer
         .write("repo_refresh_governance_rebuild_cleanup", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo refresh governance cleanup tx")?;
@@ -7710,7 +7713,8 @@ async fn rebuild_repo_refresh_governance_snapshots(
                 "repo_refresh_governance_rebuild_snapshots_chunk",
                 |_| async {
                     let mut tx = state
-                        .pool
+                        .sqlite_writer
+                        .write_pool_or(&state.pool)
                         .begin_with("BEGIN IMMEDIATE")
                         .await
                         .context("begin repo refresh governance snapshot chunk tx")?;
@@ -7750,7 +7754,8 @@ async fn rebuild_repo_refresh_governance_snapshots(
                 "repo_refresh_governance_reconcile_members_chunk",
                 |_| async {
                     let mut tx = state
-                        .pool
+                        .sqlite_writer
+                        .write_pool_or(&state.pool)
                         .begin_with("BEGIN IMMEDIATE")
                         .await
                         .context("begin repo refresh governance member reconcile tx")?;
@@ -7782,7 +7787,8 @@ async fn rebuild_repo_refresh_governance_snapshots(
                 "repo_refresh_governance_backfill_members_chunk",
                 |_| async {
                     let mut tx = state
-                        .pool
+                        .sqlite_writer
+                        .write_pool_or(&state.pool)
                         .begin_with("BEGIN IMMEDIATE")
                         .await
                         .context("begin legacy repo refresh governance member backfill tx")?;
@@ -7810,7 +7816,8 @@ async fn rebuild_repo_refresh_governance_snapshots(
         .sqlite_writer
         .write("repo_refresh_governance_reconcile_snapshots", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo refresh governance snapshot completion tx")?;
@@ -7904,7 +7911,8 @@ async fn rebuild_repo_refresh_governance_snapshots(
         .sqlite_writer
         .write("repo_refresh_governance_reconcile_cycles", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo refresh governance cycle reconcile tx")?;
@@ -8097,7 +8105,8 @@ async fn ensure_active_repo_refresh_cycle(
         .sqlite_writer
         .write("repo_refresh_cycle_create", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo refresh cycle create tx")?;
@@ -8203,8 +8212,7 @@ async fn select_budgeted_system_release_repos(
     let selected_rows = state
         .sqlite_writer
         .write("repo_refresh_selection_mark", |_| async {
-            let mut tx = state
-                .pool
+            let mut tx = state.sqlite_writer.write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo refresh selection mark tx")?;
@@ -9081,7 +9089,8 @@ async fn process_repo_release_work_item(
                 .sqlite_writer
                 .write("repo_release_finalize", |_| async {
                     let mut tx = state
-                        .pool
+                        .sqlite_writer
+                        .write_pool_or(&state.pool)
                         .begin_with("BEGIN IMMEDIATE")
                         .await
                         .context("begin repo release success finalization tx")?;
@@ -9175,7 +9184,8 @@ async fn process_repo_release_work_item(
                 .sqlite_writer
                 .write("repo_release_finalize", |_| async {
                     let mut tx = state
-                        .pool
+                        .sqlite_writer
+                        .write_pool_or(&state.pool)
                         .begin_with("BEGIN IMMEDIATE")
                         .await
                         .context("begin repo release failure finalization tx")?;
@@ -9576,7 +9586,8 @@ async fn mark_public_release_usage_sync_success(
         .sqlite_writer
         .write("public_release_usage_success", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin public release usage success tx")?;
@@ -9626,7 +9637,8 @@ async fn mark_public_release_usage_sync_failure(
         .sqlite_writer
         .write("public_release_usage_failure", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin public release usage failure tx")?;
@@ -9720,8 +9732,7 @@ async fn record_repo_release_sync_success(
     state
         .sqlite_writer
         .write("repo_release_sync_success", |_| async {
-            let mut tx = state
-                .pool
+            let mut tx = state.sqlite_writer.write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo release sync success tx")?;
@@ -9805,7 +9816,8 @@ async fn record_repo_release_sync_failure(
         .sqlite_writer
         .write("repo_release_sync_failure", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo release sync failure tx")?;
@@ -9855,8 +9867,7 @@ async fn upsert_repo_releases(
     state
         .sqlite_writer
         .write("repo_release_upsert", |_| async {
-            let mut tx = state
-                .pool
+            let mut tx = state.sqlite_writer.write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo release snapshot write tx")?;
@@ -10475,7 +10486,8 @@ async fn record_repo_refresh_governance_attempt(
         .sqlite_writer
         .write("repo_refresh_governance_attempt", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo refresh governance attempt tx")?;
@@ -10517,7 +10529,7 @@ async fn heartbeat_repo_release_work_item_lease(
             .bind(work_item_id)
             .bind(jobs::STATUS_RUNNING)
             .bind(state.runtime_owner_id.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to heartbeat repo release work item")?;
             Ok::<(), anyhow::Error>(())
@@ -10548,7 +10560,8 @@ async fn fail_repo_release_work_item(
         .sqlite_writer
         .write("repo_release_fail", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo release failure tx")?;
@@ -10631,7 +10644,8 @@ async fn fail_repo_release_work_item_if_stale(
         .sqlite_writer
         .write("repo_release_recover", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo release recovery tx")?;
@@ -11002,7 +11016,7 @@ async fn append_subscription_event(
             .bind(event.repo_full_name)
             .bind(payload_json.as_str())
             .bind(now.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to insert sync_subscription_event")?;
             Ok::<_, anyhow::Error>(())
@@ -11117,7 +11131,7 @@ async fn prune_subscription_sync_history(state: &AppState) -> Result<()> {
                         .bind(succeeded_cutoff.as_str())
                         .bind(failed_cutoff.as_str())
                         .bind(SUBSCRIPTION_PRUNE_WATCHERS_BATCH_SIZE)
-                        .execute(&state.pool)
+                        .execute(state.sqlite_writer.write_pool_or(&state.pool))
                         .await
                         .context("prune repo release watchers")?
                         .rows_affected(),
@@ -11147,7 +11161,7 @@ async fn prune_subscription_sync_history(state: &AppState) -> Result<()> {
                         )
                         .bind(event_cutoff.as_str())
                         .bind(SUBSCRIPTION_PRUNE_EVENTS_BATCH_SIZE)
-                        .execute(&state.pool)
+                        .execute(state.sqlite_writer.write_pool_or(&state.pool))
                         .await
                         .context("prune sync subscription events")?
                         .rows_affected(),
@@ -13004,7 +13018,7 @@ async fn fail_star_reconciliation_epoch(
             .bind(reason)
             .bind(now.as_str())
             .bind(epoch_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("mark star epoch failed")?;
             Ok::<_, anyhow::Error>(())
@@ -13068,7 +13082,7 @@ async fn schedule_next_star_reconciliation_slice(
             .bind(now_rfc3339.as_str())
             .bind(epoch.id.as_str())
             .bind(state.runtime_owner_id.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("schedule next star reconciliation slice")?;
             if update.rows_affected() != 1 {
@@ -19861,7 +19875,7 @@ mod tests {
                         sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
                             .bind("2026-03-07T00:00:00Z")
                             .bind(user_id.as_str())
-                            .execute(&state.pool)
+                            .execute(state.sqlite_writer.write_pool_or(&state.pool))
                             .await
                             .context("update competing user row")?;
                         Ok::<_, anyhow::Error>(())
@@ -20378,7 +20392,11 @@ mod tests {
                     sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
                         .bind("2026-03-07T00:00:00Z")
                         .bind(user_id_for_write.as_str())
-                        .execute(&state_for_write.pool)
+                        .execute(
+                            state_for_write
+                                .sqlite_writer
+                                .write_pool_or(&state_for_write.pool),
+                        )
                         .await
                         .context("update competing user row")?;
                     Ok::<_, anyhow::Error>(())
