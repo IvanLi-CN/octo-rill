@@ -7576,17 +7576,12 @@ pub async fn admin_patch_llm_runtime_config(
         None => i64::from(current_recovery.rollout_percent),
     };
     let apply_result = async {
-        admin_runtime::update_llm_runtime_settings(
+        admin_runtime::update_llm_runtime_settings_and_recovery_config(
             &state.pool,
             &state.sqlite_writer,
             max_concurrency,
             ai_model_context_limit,
             &llm_models,
-        )
-        .await?;
-        admin_runtime::update_llm_recovery_runtime_config(
-            &state.pool,
-            &state.sqlite_writer,
             recovery_enabled,
             recovery_rollout_percent,
         )

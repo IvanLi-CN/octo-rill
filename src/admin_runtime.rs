@@ -8,7 +8,7 @@ use sqlx::{Executor, Row, Sqlite, SqlitePool, Transaction};
 use crate::{
     briefs,
     config::AppConfig,
-    sqlite_write::SqliteWriteCoordinator,
+    sqlite_write::{SqliteWriteCoordinator, SqliteWritePriority},
     state::AppState,
     translations::{
         DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
@@ -203,6 +203,7 @@ pub async fn load_llm_recovery_runtime_config(
         }))
 }
 
+#[cfg(test)]
 pub async fn update_llm_recovery_runtime_config(
     pool: &SqlitePool,
     sqlite_writer: &SqliteWriteCoordinator,
@@ -1119,6 +1120,7 @@ pub async fn load_or_seed_runtime_settings(
     load_or_seed_runtime_settings_with_writer(pool, &sqlite_writer, config).await
 }
 
+#[cfg(test)]
 pub async fn update_llm_runtime_settings(
     pool: &SqlitePool,
     sqlite_writer: &SqliteWriteCoordinator,
@@ -1152,6 +1154,76 @@ pub async fn update_llm_runtime_settings(
             .map_err(anyhow::Error::from)
         })
         .await?;
+    fetch_runtime_settings(pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("admin runtime settings row missing after llm update"))
+}
+
+pub async fn update_llm_runtime_settings_and_recovery_config(
+    pool: &SqlitePool,
+    sqlite_writer: &SqliteWriteCoordinator,
+    llm_max_concurrency: usize,
+    ai_model_context_limit: Option<u32>,
+    llm_models: &[String],
+    recovery_enabled: bool,
+    recovery_rollout_percent: i64,
+) -> Result<AdminRuntimeSettingsSnapshot> {
+    let recovery_rollout_percent = normalize_llm_recovery_rollout_percent(recovery_rollout_percent);
+    let now = Utc::now().to_rfc3339();
+    let serialized_llm_models = serialize_llm_models_json(llm_models);
+    let (_permit, mut tx) = sqlite_writer
+        .begin_immediate_with_priority(
+            pool,
+            "admin_llm_runtime_settings",
+            SqliteWritePriority::Foreground,
+        )
+        .await?;
+    sqlx::query(
+        r#"
+        UPDATE admin_runtime_settings
+        SET
+          llm_max_concurrency = ?,
+          ai_model_context_limit = ?,
+          llm_models_json = ?,
+          ai_model_context_limit_migrated_at = COALESCE(ai_model_context_limit_migrated_at, ?),
+          updated_at = ?
+        WHERE id = 1
+        "#,
+    )
+    .bind(i64::try_from(llm_max_concurrency).unwrap_or(i64::MAX))
+    .bind(ai_model_context_limit.map(i64::from))
+    .bind(serialized_llm_models.as_str())
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .execute(&mut *tx)
+    .await
+    .context("update admin llm runtime settings failed")?;
+    sqlx::query(
+        r#"
+        INSERT INTO llm_recovery_flags (
+          id,
+          llm_recovery_enabled,
+          llm_recovery_rollout_percent,
+          created_at,
+          updated_at
+        )
+        VALUES (1, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          llm_recovery_enabled = excluded.llm_recovery_enabled,
+          llm_recovery_rollout_percent = excluded.llm_recovery_rollout_percent,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(if recovery_enabled { 1_i64 } else { 0_i64 })
+    .bind(i64::from(recovery_rollout_percent))
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .execute(&mut *tx)
+    .await
+    .context("update admin llm recovery runtime settings failed")?;
+    tx.commit()
+        .await
+        .context("commit admin llm runtime settings failed")?;
     fetch_runtime_settings(pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("admin runtime settings row missing after llm update"))
@@ -1523,6 +1595,46 @@ mod tests {
                 rollout_percent: 0,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn llm_runtime_and_recovery_update_rolls_back_as_one_transaction() {
+        let pool = setup_pool().await;
+        let config = test_config(1);
+        let sqlite_writer = SqliteWriteCoordinator::new();
+        let before = load_or_seed_runtime_settings(&pool, &config)
+            .await
+            .expect("seed runtime settings");
+
+        sqlx::query("DROP TABLE llm_recovery_flags")
+            .execute(&pool)
+            .await
+            .expect("drop recovery flags table for rollback test");
+
+        let result = update_llm_runtime_settings_and_recovery_config(
+            &pool,
+            &sqlite_writer,
+            4,
+            Some(32_768),
+            &["gpt-4.1-mini".to_owned()],
+            true,
+            50,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "missing recovery table should fail the transaction"
+        );
+
+        let stored: (i64, Option<i64>, String) = sqlx::query_as(
+            "SELECT llm_max_concurrency, ai_model_context_limit, llm_models_json FROM admin_runtime_settings WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load runtime settings after rollback");
+        assert_eq!(stored.0, i64::try_from(before.llm_max_concurrency).unwrap());
+        assert_eq!(stored.1, before.ai_model_context_limit.map(i64::from));
+        assert_eq!(stored.2, serialize_llm_models_json(&before.llm_models));
     }
 
     #[tokio::test]

@@ -1690,15 +1690,21 @@ impl TranslationSchedulerController {
         profile: &TranslationWorkerProfile,
         update: TranslationWorkerRuntimeUpdate<'_>,
     ) {
-        let desired_config = self.desired_config().await;
         let mut runtime = self.runtime.write().await;
+        let desired_config = *self.desired_config.read().await;
+        let desired_profile = translation_worker_profiles(desired_config)
+            .into_iter()
+            .find(|candidate| candidate.worker_id == profile.worker_id);
         let entry = if let Some(index) = runtime
             .iter()
             .position(|entry| entry.worker_id == profile.worker_id)
         {
             &mut runtime[index]
         } else {
-            runtime.push(TranslationWorkerRuntimeState::idle(profile));
+            let Some(desired_profile) = desired_profile.as_ref() else {
+                return;
+            };
+            runtime.push(TranslationWorkerRuntimeState::idle(desired_profile));
             runtime
                 .last_mut()
                 .expect("translation worker runtime entry should exist after insert")
@@ -1719,8 +1725,10 @@ impl TranslationSchedulerController {
             return;
         }
 
-        entry.worker_slot = profile.worker_slot;
-        entry.worker_kind = profile.worker_kind.clone();
+        if let Some(desired_profile) = desired_profile {
+            entry.worker_slot = desired_profile.worker_slot;
+            entry.worker_kind = desired_profile.worker_kind;
+        }
         entry.status = update.status.to_owned();
         entry.current_batch_id = next_batch_id;
         entry.request_count = update.request_count;
@@ -13576,6 +13584,29 @@ mod tests {
                 .translation_scheduler
                 .worker_is_desired("translation-worker-general-3")
                 .await
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_worker_runtime_update_does_not_reinsert_removed_worker() {
+        let pool = setup_pool().await;
+        let scheduler = TranslationSchedulerController::new(TranslationRuntimeConfig::default());
+        let stale_profile = test_worker_profile(3, "general");
+
+        scheduler
+            .sync_runtime_with_config(&pool, TranslationRuntimeConfig::new(2, 1))
+            .await
+            .expect("shrink runtime");
+        scheduler
+            .update_worker_runtime(&stale_profile, TranslationWorkerRuntimeUpdate::idle())
+            .await;
+
+        assert!(
+            !scheduler
+                .runtime_statuses()
+                .await
+                .iter()
+                .any(|worker| worker.worker_id == stale_profile.worker_id)
         );
     }
 
