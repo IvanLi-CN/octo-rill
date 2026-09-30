@@ -44,6 +44,7 @@ The owned-baseline transaction increments `requested_generation` only when it fi
 
 - 主键：`delivery_id`
 - `hook_id`, `repo_id`, `event`, `action`, `received_at`, `queued_task_id`
+- `processing_state`: `pending|processing|ignored|queued`; processing claims older than five minutes may be reclaimed. Receiver transitions are short SQLite foreground-writer operations, and enqueue failure returns the claim to `pending` when the recovery write succeeds.
 - 保留最近 30 天；清理由后台任务 best-effort 执行。
 
 ## `admin_runtime_settings`

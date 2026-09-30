@@ -103,6 +103,8 @@
 - 接收端必须先要求提供格式有效的 `X-Hub-Signature-256`；对于能匹配 hook 记录的请求，必须使用该用户的 secret 验证签名并拒绝签名错误请求。hook 记录不存在时没有可用 secret，按下述忽略语义返回接受但不入队。
 - `X-GitHub-Delivery` 全局去重；`ping` 安全返回成功。
 - 只处理 `X-GitHub-Event: release` 且 `action=published`、`release.draft=false` 的 payload。
+- delivery 插入、claim、ignored、queued 和 rollback 状态写入必须通过应用内 SQLite foreground writer lane。签名校验、payload 解析与 Release demand enqueue 不得在该写入 permit 或 SQLite 事务内执行。
+- delivery 写路径必须有 750ms deadline，并保留有界 rollback 时间。writer 超时或 SQLite busy 时返回 HTTP `503`、错误码 `webhook_receiver_retryable` 和 `Retry-After: 1`。enqueue 失败必须尽力将 delivery 恢复为 `pending`；恢复写入超时后，过期的 `processing` claim 仍可在五分钟后重新 claim。
 - 有效事件通过 repo ID 挂入现有共享 Release 队列；HTTP 请求不得等待 GitHub Release 拉取完成。
 - 用户或子开关关闭、hook 记录不存在、repo 不匹配、其他 action 均返回接受但不入队。
 
@@ -129,9 +131,11 @@
 - `VER-WP-006` (covers: `REQ-WP-006`): HTTP contract tests prove the new GET/PATCH/reconcile routes return operation snapshots, derived states, check timestamps, and Owner groups without the old flat management contract.
 - `VER-WP-007` (covers: `REQ-WP-007`): Settings Playwright and mock-only visual tests prove Owner grouping, waiting/working/error states, healthy colors, the close-choice dialog, and direct delete submission on desktop and mobile.
 - `VER-WP-008` (covers: `REQ-WP-008`): audit scheduling and Settings tests prove the last completed check is shown with relative/local-time detail and manual retry is blocked while the prior operation is active.
-- `VER-WP-009` (covers: `REQ-WP-004`, `REQ-WP-011`): mocked multi-repository worker tests prove archived and repository-local failures do not skip later targets, healthy repositories are not retried, and a completed sweep updates the completion timestamp.
-- `VER-WP-010` (covers: `REQ-WP-012`, `REQ-WP-014`): API and Settings tests prove PAT-scope exclusions and ownership-scope exits are distinct from waiting registration, permission pauses, and archived repositories.
+- `VER-WP-009` (covers: `REQ-WP-004`, `REQ-WP-010`, `REQ-WP-011`): mocked multi-repository worker tests prove archived and repository-local failures do not skip later targets, healthy repositories are not retried, and a completed sweep updates the completion timestamp.
+- `VER-WP-010` (covers: `REQ-WP-010`, `REQ-WP-012`, `REQ-WP-014`): API and Settings tests prove archived repositories, PAT-scope exclusions, and ownership-scope exits are distinct from waiting registration and permission pauses.
 - `VER-WP-011` (covers: `REQ-WP-013`): transaction and restart tests prove a newly persisted baseline and its reconciliation demand commit atomically, active work produces exactly one follow-up pass, and an unconsumed demand is dispatched after restart.
+- `VER-WP-012` (covers: webhook receiver): concurrent deliveries under a held background writer, followed by a duplicate delivery, create one release work item; a held writer exceeding the receiver deadline returns retryable `503`; and a simulated enqueue failure restores `pending`, after which retry persists a queued delivery and one release work item.
+- `VER-WP-013` (covers: `REQ-WP-009`): API snapshot tests prove pending counts and the latest terminal failure are exposed, and newer queued/running or successful work hides the older failure.
 
 ## Related ADRs
 

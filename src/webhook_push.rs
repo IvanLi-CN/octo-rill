@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -23,10 +24,11 @@ use crate::{
     api,
     error::ApiError,
     jobs::{self, EnqueuedTask, NewTask},
-    sqlite_write::is_sqlite_busy_error,
+    sqlite_write::{SqliteWritePriority, is_sqlite_busy_error},
     state::AppState,
     sync,
 };
+use tracing::warn;
 
 const OP_REGISTER: &str = "register";
 const OP_CHECK: &str = "check";
@@ -45,6 +47,9 @@ const STATUS_OUT_OF_SCOPE: &str = "out_of_scope";
 const STATUS_ERROR: &str = "error";
 const STATUS_CONFLICT: &str = "conflict";
 const DELIVERY_RETENTION_DAYS: i64 = 30;
+const RECEIVER_WRITE_DEADLINE: Duration = Duration::from_millis(750);
+const RECEIVER_RECOVERY_RESERVE: Duration = Duration::from_millis(250);
+const RECEIVER_RETRY_AFTER_SECONDS: u64 = 1;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -3127,6 +3132,78 @@ fn private_repo_scope_allows(is_private: Option<i64>, allows_private: Option<i64
     !(is_private == Some(1) && allows_private == Some(0))
 }
 
+fn receiver_retryable_error(operation: &'static str, error_kind: &'static str) -> ApiError {
+    warn!(
+        event = "webhook.receiver_write",
+        operation,
+        error_kind,
+        retry_after_seconds = RECEIVER_RETRY_AFTER_SECONDS,
+        "GitHub release delivery needs to be retried"
+    );
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "webhook_receiver_retryable",
+        "Webhook delivery could not be recorded; retry the delivery",
+    )
+    .with_retry_after(RECEIVER_RETRY_AFTER_SECONDS)
+}
+
+async fn run_receiver_stage<T, Fut>(
+    operation: &'static str,
+    deadline: tokio::time::Instant,
+    future: Fut,
+) -> Result<T, ApiError>
+where
+    Fut: Future<Output = Result<T>>,
+{
+    match tokio::time::timeout_at(deadline, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) if is_sqlite_busy_error(error.as_ref()) => {
+            warn!(
+                event = "webhook.receiver_write",
+                operation,
+                error_kind = "sqlite_busy",
+                error_chain = %crate::observability::error_chain_summary(error.as_ref()),
+                "GitHub release delivery write encountered SQLite contention"
+            );
+            Err(receiver_retryable_error(operation, "sqlite_busy"))
+        }
+        Ok(Err(error)) => Err(ApiError::internal(error)),
+        Err(_) => Err(receiver_retryable_error(operation, "deadline_exceeded")),
+    }
+}
+
+async fn reset_delivery_to_pending(
+    state: &AppState,
+    delivery: &str,
+    deadline: tokio::time::Instant,
+) -> Result<(), ApiError> {
+    let delivery = delivery.to_owned();
+    let pool = state.pool.clone();
+    let write = state
+        .sqlite_writer
+        .write_foreground("webhook_receiver_delivery_rollback", |_| {
+            let delivery = delivery.clone();
+            let pool = pool.clone();
+            async move {
+                let mut transaction = pool.begin().await?;
+                sqlx::query(
+                    "UPDATE webhook_push_deliveries SET processing_state = 'pending', processing_started_at = NULL WHERE delivery_id = ? AND processing_state = 'processing'",
+                )
+                .bind(delivery)
+                .execute(&mut *transaction)
+                .await
+                .context("reset GitHub release delivery to pending")?;
+                transaction
+                    .commit()
+                    .await
+                    .context("commit GitHub release delivery rollback")?;
+                Ok(())
+            }
+        });
+    run_receiver_stage("webhook_receiver_delivery_rollback", deadline, write).await
+}
+
 pub async fn receive(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ReceiverQuery>,
@@ -3250,62 +3327,155 @@ pub async fn receive(
         &row.7,
     ) && private_repo_scope_allows(row.8, row.9);
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        "INSERT OR IGNORE INTO webhook_push_deliveries (delivery_id, hook_id, repo_id, event, action, received_at) VALUES (?, ?, ?, ?, ?, ?)",
-    ).bind(delivery).bind(hook_id).bind(repo.map(|item| item.id)).bind(event).bind(action).bind(&now)
-        .execute(&state.pool).await.map_err(ApiError::internal)?;
-    let claimed = sqlx::query(
-        "UPDATE webhook_push_deliveries SET processing_state = 'processing', processing_started_at = ? WHERE delivery_id = ? AND (processing_state = 'pending' OR (processing_state = 'processing' AND processing_started_at < ?))",
-    )
-    .bind(&now)
-    .bind(delivery)
-    .bind((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339())
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
-    if claimed.rows_affected() == 0 {
+    let recovery_deadline =
+        tokio::time::Instant::now() + RECEIVER_WRITE_DEADLINE + RECEIVER_RECOVERY_RESERVE;
+    let write_deadline = recovery_deadline - RECEIVER_RECOVERY_RESERVE;
+    let stale_processing_cutoff = (Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+    let delivery_for_claim = delivery.to_owned();
+    let event = event.to_owned();
+    let action = action.to_owned();
+    let repo_id = repo.map(|item| item.id);
+    let state_for_claim = state.clone();
+    let claim = async move {
+        let (permit, mut transaction) = state_for_claim
+            .sqlite_writer
+            .begin_immediate_with_priority(
+                &state_for_claim.pool,
+                "webhook_receiver_delivery_claim",
+                SqliteWritePriority::Foreground,
+            )
+            .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO webhook_push_deliveries (delivery_id, hook_id, repo_id, event, action, received_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&delivery_for_claim)
+        .bind(hook_id)
+        .bind(repo_id)
+        .bind(&event)
+        .bind(&action)
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await
+        .context("insert GitHub release delivery")?;
+        let claimed = sqlx::query(
+            "UPDATE webhook_push_deliveries SET processing_state = 'processing', processing_started_at = ? WHERE delivery_id = ? AND (processing_state = 'pending' OR (processing_state = 'processing' AND processing_started_at < ?))",
+        )
+        .bind(&now)
+        .bind(&delivery_for_claim)
+        .bind(&stale_processing_cutoff)
+        .execute(&mut *transaction)
+        .await
+        .context("claim GitHub release delivery")?;
+        if claimed.rows_affected() == 0 {
+            transaction
+                .commit()
+                .await
+                .context("commit duplicate GitHub release delivery")?;
+            drop(permit);
+            return Ok(false);
+        }
+        if !should_queue {
+            sqlx::query(
+                "UPDATE webhook_push_deliveries SET processing_state = 'ignored', processing_started_at = NULL WHERE delivery_id = ?",
+            )
+            .bind(&delivery_for_claim)
+            .execute(&mut *transaction)
+            .await
+            .context("mark GitHub release delivery ignored")?;
+        }
+        transaction
+            .commit()
+            .await
+            .context("commit GitHub release delivery claim")?;
+        drop(permit);
+        Ok(true)
+    };
+    let claimed =
+        run_receiver_stage("webhook_receiver_delivery_claim", write_deadline, claim).await?;
+    if !claimed {
         return Ok(Json(
             json!({"accepted": true, "queued": false, "reason": "duplicate"}),
         ));
     }
     if !should_queue {
-        sqlx::query(
-            "UPDATE webhook_push_deliveries SET processing_state = 'ignored', processing_started_at = NULL WHERE delivery_id = ?",
-        )
-        .bind(delivery)
-        .execute(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
         return Ok(Json(
             json!({"accepted": true, "queued": false, "reason": "ignored"}),
         ));
     }
     let repo = repo.expect("repo checked above");
-    let reused_fresh = match sync::enqueue_user_repo_release_sync(
-        state.as_ref(),
-        &row.0,
-        repo.id,
-        &repo.full_name,
+    let enqueue =
+        sync::enqueue_user_repo_release_sync(state.as_ref(), &row.0, repo.id, &repo.full_name);
+    let reused_fresh =
+        match run_receiver_stage("webhook_receiver_release_enqueue", write_deadline, enqueue).await
+        {
+            Ok(reused_fresh) => reused_fresh,
+            Err(error) => {
+                if let Err(rollback_error) =
+                    reset_delivery_to_pending(state.as_ref(), delivery, recovery_deadline).await
+                {
+                    warn!(
+                        event = "webhook.receiver_write",
+                        operation = "webhook_receiver_delivery_rollback",
+                        error = %rollback_error,
+                        recovery = "processing_lease_expiry",
+                        "GitHub release delivery rollback failed after enqueue failure"
+                    );
+                    return Err(receiver_retryable_error(
+                        "webhook_receiver_delivery_rollback",
+                        "rollback_failed",
+                    ));
+                }
+                return Err(error);
+            }
+        };
+    let delivery = delivery.to_owned();
+    let queued_task_id = format!("repo-release:{}", repo.id);
+    let pool = state.pool.clone();
+    let queued_update = state
+        .sqlite_writer
+        .write_foreground("webhook_receiver_delivery_queued", |_| {
+            let delivery = delivery.clone();
+            let queued_task_id = queued_task_id.clone();
+            let pool = pool.clone();
+            async move {
+                let mut transaction = pool.begin().await?;
+                sqlx::query("UPDATE webhook_push_deliveries SET queued_task_id = ?, processing_state = 'queued', processing_started_at = NULL WHERE delivery_id = ?")
+                    .bind(queued_task_id)
+                    .bind(delivery)
+                    .execute(&mut *transaction)
+                    .await
+                    .context("mark GitHub release delivery queued")?;
+                transaction
+                    .commit()
+                    .await
+                    .context("commit GitHub release delivery queued state")?;
+                Ok(())
+            }
+        });
+    if let Err(error) = run_receiver_stage(
+        "webhook_receiver_delivery_queued",
+        write_deadline,
+        queued_update,
     )
     .await
     {
-        Ok(reused_fresh) => reused_fresh,
-        Err(error) => {
-            let _ = sqlx::query(
-                "UPDATE webhook_push_deliveries SET processing_state = 'pending', processing_started_at = NULL WHERE delivery_id = ? AND processing_state = 'processing'",
-            )
-            .bind(delivery)
-            .execute(&state.pool)
-            .await;
-            return Err(ApiError::internal(error));
+        if let Err(rollback_error) =
+            reset_delivery_to_pending(state.as_ref(), &delivery, recovery_deadline).await
+        {
+            warn!(
+                event = "webhook.receiver_write",
+                operation = "webhook_receiver_delivery_rollback",
+                error = %rollback_error,
+                recovery = "processing_lease_expiry",
+                "GitHub release delivery rollback failed after queue-state failure"
+            );
+            return Err(receiver_retryable_error(
+                "webhook_receiver_delivery_rollback",
+                "rollback_failed",
+            ));
         }
-    };
-    sqlx::query("UPDATE webhook_push_deliveries SET queued_task_id = ?, processing_state = 'queued', processing_started_at = NULL WHERE delivery_id = ?")
-        .bind(format!("repo-release:{}", repo.id))
-        .bind(delivery)
-        .execute(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
+        return Err(error);
+    }
     Ok(Json(json!({
         "accepted": true, "queued": !reused_fresh, "reason": if reused_fresh { "fresh_cache" } else { "release_sync_queued" },
         "release_id": release.map(|item| item.id),
