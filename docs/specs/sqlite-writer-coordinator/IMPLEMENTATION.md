@@ -4,13 +4,17 @@
 
 ## Current Status
 
-- Implementation: 已实现，本地验证通过
+- Implementation: PR3.9 deadline 与 writer-pool 改动已实现；all-features 测试与 source-quality 质量门通过，等待 review/merge
 - Lifecycle: active
 - Catalog note: fast-track / SQLite writer coordinator
 
 ## Coverage / rollout summary
 
 - 新增 `src/sqlite_write.rs`，提供 `SqliteWriteCoordinator`、单 writer permit、foreground/background/best-effort priority、`BEGIN IMMEDIATE` 事务入口、busy/locked 分类、bounded retry 与 tracing telemetry。
+- PR3.9 为生产文件型 SQLite 配置独立单连接 writer pool，读池保留原容量；foreground/background 共用单调 deadline，best-effort 立即尝试且不排队，取得 permit 后限于 2500 ms；SQLite busy timeout 为 100 ms，最多 4 次尝试并按 25/50/100 ms 退避。
+- deadline 超时不会提交，事务优先在 150 ms cleanup budget 内回滚；长 SQL statement 由 SQLite progress handler 在 deadline 中断。前台超时映射为 retryable 503，后台 job 持久化延迟重试，best-effort 超时跳过。
+- deadline telemetry 区分 writer queue、write-pool acquisition、`BEGIN IMMEDIATE` 与 transaction 阶段，并记录 `writer_wait_ms`、`pool_wait_ms`、`begin_ms`、`transaction_ms` 和 `deadline_ms`。
+- 内容提交的模型档案选择仅读取已刷新的 scheduler routing；模型目录刷新不会在持有 SQLite writer transaction 时发生。
 - `AppState` 持有共享 coordinator；生产启动与测试 state 初始化均注入同一运行时组件。
 - `job_tasks` enqueue/event/cancel/claim/finalize/heartbeat 已接入 writer coordinator；enqueue/event/cancel 使用 foreground lane。
 - session create/save/delete 使用 foreground lane 与短 busy retry；过期 session 清理使用 best-effort lane。
@@ -43,7 +47,7 @@
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test --locked --all-features`
+- `cargo test --locked --all-features --bin octo-rill -- --test-threads=4`（974 passed, 2 ignored）
 - `bash scripts/check-rust-source-quality.sh`（含应用/源检查器 fmt、全 feature Clippy/check、checker 单测和全仓 guard scan）
 
 ## Remaining Gaps

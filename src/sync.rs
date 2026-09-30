@@ -3298,7 +3298,7 @@ async fn apply_social_activity_snapshot_with_options(
         let query_started = Instant::now();
         for (repo_id, repo_full_name) in chunk {
             clear_stale_personal_owned_association_tx(
-                &mut tx,
+                tx.as_transaction_mut(),
                 user_id,
                 *repo_id,
                 repo_full_name,
@@ -3332,7 +3332,7 @@ async fn apply_social_activity_snapshot_with_options(
             .await
             .context("begin social activity repo cleanup tx")?;
         let query_started = Instant::now();
-        delete_repo_star_rows_for_ids_tx(&mut tx, user_id, chunk)
+        delete_repo_star_rows_for_ids_tx(tx.as_transaction_mut(), user_id, chunk)
             .await
             .context("delete stale repo star snapshot rows")?;
         tx.commit()
@@ -3365,7 +3365,7 @@ async fn apply_social_activity_snapshot_with_options(
             for follower in chunk {
                 if !current_follower_ids.contains(&follower.actor.id)
                     && insert_social_activity_event_tx(
-                        &mut tx,
+                        tx.as_transaction_mut(),
                         SocialActivityEventInsert {
                             user_id,
                             kind: "follower_received",
@@ -3386,7 +3386,13 @@ async fn apply_social_activity_snapshot_with_options(
                 {
                     chunk_events_written += 1;
                 }
-                upsert_follower_current_member_tx(&mut tx, user_id, follower, now.as_str()).await?;
+                upsert_follower_current_member_tx(
+                    tx.as_transaction_mut(),
+                    user_id,
+                    follower,
+                    now.as_str(),
+                )
+                .await?;
             }
             tx.commit()
                 .await
@@ -3423,7 +3429,7 @@ async fn apply_social_activity_snapshot_with_options(
             let mut chunk_events_written = 0usize;
             for candidate in chunk {
                 if insert_social_activity_event_tx(
-                    &mut tx,
+                    tx.as_transaction_mut(),
                     SocialActivityEventInsert {
                         user_id,
                         kind: "follower_received",
@@ -3471,7 +3477,7 @@ async fn apply_social_activity_snapshot_with_options(
                 .await
                 .context("begin social activity follower cleanup tx")?;
             let query_started = Instant::now();
-            delete_follower_current_members_for_ids_tx(&mut tx, user_id, chunk)
+            delete_follower_current_members_for_ids_tx(tx.as_transaction_mut(), user_id, chunk)
                 .await
                 .context("delete stale follower current members")?;
             tx.commit()
@@ -3554,7 +3560,7 @@ async fn apply_social_activity_snapshot_with_options(
                 let snapshot_initialized = repo_snapshot_initialized_ids.contains(&repo.repo_id)
                     || fetched_snapshot_this_run;
                 upsert_owned_repo_star_baseline_tx(
-                    &mut tx,
+                    tx.as_transaction_mut(),
                     user_id,
                     repo,
                     snapshot_initialized,
@@ -3565,7 +3571,7 @@ async fn apply_social_activity_snapshot_with_options(
 
                 let association = user_repo_association_from_owned_snapshot(repo, now.as_str());
                 crate::api::upsert_user_repo_association_tx(
-                    &mut tx,
+                    tx.as_transaction_mut(),
                     user_id,
                     &association,
                     now.as_str(),
@@ -3673,7 +3679,7 @@ async fn apply_social_activity_snapshot_with_options(
                     if emit_current_members
                         && !current_ids.contains(&member.actor.id)
                         && insert_social_activity_event_tx(
-                            &mut tx,
+                            tx.as_transaction_mut(),
                             SocialActivityEventInsert {
                                 user_id,
                                 kind: "repo_star_received",
@@ -3694,8 +3700,13 @@ async fn apply_social_activity_snapshot_with_options(
                     {
                         chunk_events_written += 1;
                     }
-                    upsert_repo_star_current_member_tx(&mut tx, user_id, member, now.as_str())
-                        .await?;
+                    upsert_repo_star_current_member_tx(
+                        tx.as_transaction_mut(),
+                        user_id,
+                        member,
+                        now.as_str(),
+                    )
+                    .await?;
                 }
                 tx.commit().await.with_context(|| {
                     format!(
@@ -3748,7 +3759,7 @@ async fn apply_social_activity_snapshot_with_options(
                 let mut chunk_events_written = 0usize;
                 for candidate in chunk {
                     if insert_social_activity_event_tx(
-                        &mut tx,
+                        tx.as_transaction_mut(),
                         SocialActivityEventInsert {
                             user_id,
                             kind: "repo_star_received",
@@ -3808,11 +3819,16 @@ async fn apply_social_activity_snapshot_with_options(
                             )
                         })?;
                     let query_started = Instant::now();
-                    delete_repo_star_members_for_ids_tx(&mut tx, user_id, repo.repo_id, chunk)
-                        .await
-                        .with_context(|| {
-                            format!("delete stale repo star members for {}", repo.full_name)
-                        })?;
+                    delete_repo_star_members_for_ids_tx(
+                        tx.as_transaction_mut(),
+                        user_id,
+                        repo.repo_id,
+                        chunk,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("delete stale repo star members for {}", repo.full_name)
+                    })?;
                     tx.commit().await.with_context(|| {
                         format!(
                             "commit social activity repo member cleanup tx for {}",
@@ -3847,11 +3863,17 @@ async fn apply_social_activity_snapshot_with_options(
                 .context("begin social activity repo member baseline tx")?;
             let query_started = Instant::now();
             for (repo, _) in chunk {
-                upsert_owned_repo_star_baseline_tx(&mut tx, user_id, repo, true, now.as_str())
-                    .await
-                    .with_context(|| {
-                        format!("mark repo star snapshot initialized for {}", repo.full_name)
-                    })?;
+                upsert_owned_repo_star_baseline_tx(
+                    tx.as_transaction_mut(),
+                    user_id,
+                    repo,
+                    true,
+                    now.as_str(),
+                )
+                .await
+                .with_context(|| {
+                    format!("mark repo star snapshot initialized for {}", repo.full_name)
+                })?;
             }
             tx.commit()
                 .await
@@ -5405,7 +5427,7 @@ async fn attach_release_demand_with_freshness(
             if is_fresh && existing.status == jobs::STATUS_SUCCEEDED {
                 if let Some(task_id) = task_id {
                     upsert_repo_release_watcher(
-                        &mut tx,
+                        tx.as_transaction_mut(),
                         RepoReleaseWatcherUpsert {
                             work_item_id: &existing.id,
                             task_id,
@@ -5493,7 +5515,7 @@ async fn attach_release_demand_with_freshness(
                 .with_context(|| format!("failed to update repo release work item {}", repo.full_name))?;
                 if let Some(task_id) = task_id {
                     upsert_repo_release_watcher(
-                        &mut tx,
+                        tx.as_transaction_mut(),
                         RepoReleaseWatcherUpsert {
                             work_item_id: &existing.id,
                             task_id,
@@ -5570,7 +5592,7 @@ async fn attach_release_demand_with_freshness(
             })?;
             if let Some(task_id) = task_id {
                 upsert_repo_release_watcher(
-                    &mut tx,
+                    tx.as_transaction_mut(),
                     RepoReleaseWatcherUpsert {
                         work_item_id: &work_item_id,
                         task_id,
@@ -12100,7 +12122,7 @@ async fn insert_feed_activity_events(
             uses_custom_open_graph_image: false,
         });
         let inserted = insert_social_activity_event_tx(
-            &mut tx,
+            tx.as_transaction_mut(),
             SocialActivityEventInsert {
                 user_id,
                 kind: event.kind,
@@ -12704,7 +12726,7 @@ async fn apply_starred_membership_page(
         .await
         .with_context(|| format!("upsert star connection membership {}", repo.full_name))?;
         upsert_user_starred_repo_from_memberships_tx(
-            &mut tx,
+            tx.as_transaction_mut(),
             user_id,
             repo.repo_id,
             repo.full_name.as_str(),
@@ -13126,7 +13148,7 @@ async fn finalize_star_reconciliation_epoch(
     .context("delete stale star memberships")?;
     for stale_repo in &stale {
         upsert_user_starred_repo_from_memberships_tx(
-            &mut tx,
+            tx.as_transaction_mut(),
             epoch.user_id.as_str(),
             stale_repo.repo_id,
             stale_repo.full_name.as_str(),
@@ -13433,7 +13455,7 @@ async fn replace_starred_repos_with_priority(
         .map(|repo| repo.full_name.to_ascii_lowercase())
         .collect::<Vec<_>>();
     crate::api::clear_user_repo_association_source_except_repo_ids_tx(
-        &mut tx,
+        tx.as_transaction_mut(),
         user_id,
         crate::api::UserRepoAssociationSource::GitHubStar,
         keep_repo_ids.as_slice(),
@@ -13479,14 +13501,19 @@ async fn replace_starred_repos_with_priority(
         .with_context(|| format!("failed to insert starred repo {}", repo.full_name))?;
 
         let association = user_repo_association_from_starred_snapshot(repo, now.as_str());
-        crate::api::upsert_user_repo_association_tx(&mut tx, user_id, &association, now.as_str())
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to upsert user repo association for starred repo {}",
-                    repo.full_name
-                )
-            })?;
+        crate::api::upsert_user_repo_association_tx(
+            tx.as_transaction_mut(),
+            user_id,
+            &association,
+            now.as_str(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to upsert user repo association for starred repo {}",
+                repo.full_name
+            )
+        })?;
     }
 
     tx.commit()
@@ -13556,14 +13583,19 @@ async fn upsert_starred_repos(
         .with_context(|| format!("failed to upsert starred repo {}", repo.full_name))?;
 
         let association = user_repo_association_from_starred_snapshot(repo, now.as_str());
-        crate::api::upsert_user_repo_association_tx(&mut tx, user_id, &association, now.as_str())
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to upsert user repo association for starred repo {}",
-                    repo.full_name
-                )
-            })?;
+        crate::api::upsert_user_repo_association_tx(
+            tx.as_transaction_mut(),
+            user_id,
+            &association,
+            now.as_str(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to upsert user repo association for starred repo {}",
+                repo.full_name
+            )
+        })?;
     }
     tx.commit()
         .await

@@ -226,7 +226,6 @@ struct ModelRouteHealthState {
 
 #[derive(Debug, Clone)]
 pub struct SelectedLlmModel {
-    pub model: String,
     pub model_input_limit: u32,
     pub fallback_source: &'static str,
 }
@@ -958,29 +957,8 @@ pub(crate) async fn resolve_model_input_limit_for_status(
     (limit, source)
 }
 
-pub async fn select_model_for_new_calls(state: &AppState) -> SelectedLlmModel {
-    if let Ok(Some(limit)) = admin_runtime::load_ai_model_context_limit(&state.pool).await {
-        let model = state
-            .llm_scheduler
-            .select_model_for_new_calls(state.config.ai.as_ref().map(|cfg| cfg.model.as_str()))
-            .await
-            .or_else(|| {
-                state
-                    .config
-                    .ai
-                    .as_ref()
-                    .map(|cfg| cfg.model.trim().to_owned())
-                    .filter(|model| !model.is_empty())
-            })
-            .unwrap_or_default();
-        return SelectedLlmModel {
-            model,
-            model_input_limit: limit.max(1),
-            fallback_source: MODEL_LIMIT_RESOLUTION_ADMIN_OVERRIDE,
-        };
-    }
-
-    let model = state
+pub(crate) async fn model_for_new_calls(state: &AppState) -> String {
+    state
         .llm_scheduler
         .select_model_for_new_calls(state.config.ai.as_ref().map(|cfg| cfg.model.as_str()))
         .await
@@ -992,7 +970,17 @@ pub async fn select_model_for_new_calls(state: &AppState) -> SelectedLlmModel {
                 .map(|cfg| cfg.model.trim().to_owned())
                 .filter(|model| !model.is_empty())
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+pub async fn select_model_for_new_calls(state: &AppState) -> SelectedLlmModel {
+    let model = model_for_new_calls(state).await;
+    if let Ok(Some(limit)) = admin_runtime::load_ai_model_context_limit(&state.pool).await {
+        return SelectedLlmModel {
+            model_input_limit: limit.max(1),
+            fallback_source: MODEL_LIMIT_RESOLUTION_ADMIN_OVERRIDE,
+        };
+    }
 
     if let Err(err) = refresh_model_limits(state, false).await {
         tracing::warn!(
@@ -1020,7 +1008,6 @@ pub async fn select_model_for_new_calls(state: &AppState) -> SelectedLlmModel {
         }
     };
     SelectedLlmModel {
-        model,
         model_input_limit,
         fallback_source,
     }
@@ -6069,7 +6056,7 @@ async fn upsert_daily_brief_snapshot(
             .await
             .context("failed to begin refresh brief tx")?;
         overwrite_brief_snapshot(
-            &mut tx,
+            tx.as_transaction_mut(),
             &existing_id,
             window,
             built,
@@ -6165,7 +6152,7 @@ async fn upsert_daily_brief_snapshot(
             && existing.effective_time_zone.is_some()
             && existing.effective_local_boundary.is_some();
         overwrite_brief_snapshot(
-            &mut tx,
+            tx.as_transaction_mut(),
             &existing.id,
             window,
             built,
@@ -6202,7 +6189,7 @@ async fn upsert_daily_brief_snapshot(
         });
     };
 
-    replace_brief_memberships(&mut tx, &brief_id, &built.releases, &now).await?;
+    replace_brief_memberships(tx.as_transaction_mut(), &brief_id, &built.releases, &now).await?;
     tx.commit()
         .await
         .context("failed to commit brief snapshot")?;
@@ -6762,9 +6749,16 @@ async fn refresh_existing_brief_snapshot(
         .begin_immediate(&state.pool, "ai_brief_targeted_refresh")
         .await
         .context("failed to begin targeted brief refresh tx")?;
-    overwrite_brief_snapshot(&mut tx, brief_id, &window, &built, generation_source, &now)
-        .await
-        .with_context(|| format!("failed to refresh targeted brief snapshot {brief_id}"))?;
+    overwrite_brief_snapshot(
+        tx.as_transaction_mut(),
+        brief_id,
+        &window,
+        &built,
+        generation_source,
+        &now,
+    )
+    .await
+    .with_context(|| format!("failed to refresh targeted brief snapshot {brief_id}"))?;
     tx.commit()
         .await
         .context("failed to commit targeted brief refresh")?;
@@ -7295,7 +7289,7 @@ pub async fn recompute_legacy_brief_snapshot(
             && existing.effective_local_boundary.is_some();
         if !is_normalized_snapshot {
             overwrite_brief_snapshot(
-                &mut tx,
+                tx.as_transaction_mut(),
                 &existing.id,
                 &target_window,
                 &built,
@@ -7338,7 +7332,7 @@ pub async fn recompute_legacy_brief_snapshot(
         });
     }
     overwrite_brief_snapshot(
-        &mut tx,
+        tx.as_transaction_mut(),
         &legacy.id,
         &target_window,
         &built,

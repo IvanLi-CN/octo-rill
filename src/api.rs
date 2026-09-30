@@ -2100,7 +2100,6 @@ async fn persist_sync_runtime_config(
         .map_err(sync_runtime_config_database_error)?;
     tx.commit()
         .await
-        .map_err(anyhow::Error::from)
         .map_err(sync_runtime_config_database_error)?;
     drop(writer);
 
@@ -11274,9 +11273,12 @@ pub async fn unpublish_repo_public_release(
         .execute(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
-        let cleanup =
-            cleanup_public_release_repo_cache_if_unused_in_transaction(&mut tx, repo_id, full_name)
-                .await?;
+        let cleanup = cleanup_public_release_repo_cache_if_unused_in_transaction(
+            tx.as_transaction_mut(),
+            repo_id,
+            full_name,
+        )
+        .await?;
         tx.commit().await.map_err(ApiError::internal)?;
         drop(_sqlite_write);
         Some(cleanup)
@@ -13471,9 +13473,12 @@ pub async fn admin_delete_public_release_repo(
         ));
     }
 
-    let cache_cleanup =
-        cleanup_public_release_repo_cache_if_unused_in_transaction(&mut tx, repo_id, full_name)
-            .await?;
+    let cache_cleanup = cleanup_public_release_repo_cache_if_unused_in_transaction(
+        tx.as_transaction_mut(),
+        repo_id,
+        full_name,
+    )
+    .await?;
     tx.commit().await.map_err(ApiError::internal)?;
     drop(_sqlite_write);
 
@@ -20563,7 +20568,7 @@ async fn upsert_translation(
         .begin_immediate(&state.pool, "legacy_translation_upsert")
         .await
         .map_err(ApiError::internal)?;
-    translations::ensure_legacy_writer_transaction(&mut tx).await?;
+    translations::ensure_legacy_writer_transaction(tx.as_transaction_mut()).await?;
     sqlx::query(
         r#"
         INSERT INTO ai_translations (
@@ -20612,7 +20617,7 @@ async fn mark_translation_requested(
         .begin_immediate(&state.pool, "legacy_translation_request")
         .await
         .map_err(ApiError::internal)?;
-    translations::ensure_legacy_writer_transaction(&mut tx).await?;
+    translations::ensure_legacy_writer_transaction(tx.as_transaction_mut()).await?;
     sqlx::query(
         r#"
         INSERT INTO ai_translations (
@@ -21911,7 +21916,7 @@ async fn upsert_translation_terminal_status(
         .begin_immediate(&state.pool, "legacy_translation_terminal_status")
         .await
         .map_err(ApiError::internal)?;
-    translations::ensure_legacy_writer_transaction(&mut tx).await?;
+    translations::ensure_legacy_writer_transaction(tx.as_transaction_mut()).await?;
     sqlx::query(
         r#"
         INSERT INTO ai_translations (
