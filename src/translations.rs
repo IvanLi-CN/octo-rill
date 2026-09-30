@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use axum::{
     Json,
     body::Body,
@@ -5792,7 +5792,32 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
 
     match result {
         Ok(results) => {
-            let res = finalize_batch_success(state, &batch, results).await;
+            let res = match finalize_batch_success(state, &batch, results).await {
+                Ok(()) => Ok(()),
+                Err(finalize_error) => {
+                    let finalize_error_text = finalize_error.to_string();
+                    tracing::error!(
+                        event = "translation.batch_finalize_failed",
+                        batch_id = batch.id.as_str(),
+                        error_kind = "finalize_failed",
+                        error = finalize_error_text.as_str(),
+                        "translation batch success finalization failed; attempting owner fallback"
+                    );
+                    match force_fail_translation_batch_if_owned(
+                        state,
+                        &batch,
+                        finalize_error_text.as_str(),
+                    )
+                    .await
+                    {
+                        Ok(true) => Err(finalize_error),
+                        Ok(false) => Err(finalize_error),
+                        Err(fallback_error) => Err(anyhow!(
+                            "translation batch finalization failed: {finalize_error_text}; owner fallback failed: {fallback_error}"
+                        )),
+                    }
+                }
+            };
             heartbeat.stop().await;
             if state
                 .translation_scheduler
@@ -5815,7 +5840,31 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
         }
         Err(err) => {
             let error = err.to_string();
-            let res = finalize_batch_failure(state, &batch, err.into()).await;
+            let res = match finalize_batch_failure(state, &batch, err.into()).await {
+                Ok(()) => Ok(()),
+                Err(finalize_error) => {
+                    let finalize_error_text = finalize_error.to_string();
+                    tracing::error!(
+                        event = "translation.batch_finalize_failed",
+                        batch_id = batch.id.as_str(),
+                        error_kind = "failure_finalize_failed",
+                        error = finalize_error_text.as_str(),
+                        "translation batch failure finalization failed; attempting owner fallback"
+                    );
+                    match force_fail_translation_batch_if_owned(
+                        state,
+                        &batch,
+                        finalize_error_text.as_str(),
+                    )
+                    .await
+                    {
+                        Ok(true) | Ok(false) => Err(anyhow!(finalize_error_text)),
+                        Err(fallback_error) => Err(anyhow!(
+                            "translation batch failure finalization failed: {finalize_error_text}; owner fallback failed: {fallback_error}"
+                        )),
+                    }
+                }
+            };
             heartbeat.stop().await;
             if state
                 .translation_scheduler
@@ -6223,7 +6272,9 @@ async fn finalize_batch_success(
         .await?;
     if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
         tx.rollback().await?;
-        return Ok(());
+        return Err(anyhow!(
+            "translation batch success finalization skipped because legacy mode is disabled"
+        ));
     }
     if !legacy_batch_claim_is_current(&mut tx, state, batch).await? {
         tx.rollback().await?;
@@ -6511,7 +6562,9 @@ async fn finalize_batch_failure(
         .await?;
     if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
         tx.rollback().await?;
-        return Ok(());
+        return Err(anyhow!(
+            "translation batch failure finalization skipped because legacy mode is disabled"
+        ));
     }
     if !legacy_batch_claim_is_current(&mut tx, state, batch).await? {
         tx.rollback().await?;
@@ -6528,6 +6581,111 @@ async fn finalize_batch_failure(
     .await?;
     tx.commit().await?;
     Ok(())
+}
+
+async fn force_fail_translation_batch_if_owned(
+    state: &AppState,
+    batch: &ClaimedBatch,
+    message: &str,
+) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "translation_batch_force_failure")
+        .await?;
+    let owned = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM translation_batches WHERE id = ? AND status = 'running' AND runtime_owner_id = ? LIMIT 1",
+    )
+    .bind(batch.id.as_str())
+    .bind(state.runtime_owner_id.as_str())
+    .fetch_optional(&mut *tx)
+    .await?
+    .is_some();
+    if !owned {
+        tx.rollback().await.ok();
+        return Ok(false);
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE translation_work_items
+        SET status = 'failed',
+            result_status = 'error',
+            error_text = ?,
+            error_code = ?,
+            provider_status = 'failed',
+            output_contract_status = 'not_run',
+            retry_disposition = 'not_needed',
+            next_retry_at = NULL,
+            retry_expires_at = NULL,
+            finished_at = ?,
+            updated_at = ?
+        WHERE id IN (
+          SELECT work_item_id FROM translation_batch_items WHERE batch_id = ?
+        )
+          AND status IN ('running', 'batched')
+        "#,
+    )
+    .bind(message)
+    .bind(classify_translation_error(Some(message)).map(|value| value.code))
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(batch.id.as_str())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE translation_batch_items
+        SET result_status = 'error', error_text = ?, updated_at = ?
+        WHERE batch_id = ?
+        "#,
+    )
+    .bind(message)
+    .bind(now.as_str())
+    .bind(batch.id.as_str())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE translation_requests
+        SET status = 'failed',
+            result_status = 'error',
+            error_text = ?,
+            finished_at = ?,
+            updated_at = ?
+        WHERE work_item_id IN (
+          SELECT work_item_id FROM translation_batch_items WHERE batch_id = ?
+        )
+          AND status IN ('queued', 'running')
+        "#,
+    )
+    .bind(message)
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(batch.id.as_str())
+    .execute(&mut *tx)
+    .await?;
+    let updated = sqlx::query(
+        r#"
+        UPDATE translation_batches
+        SET status = 'failed',
+            error_text = ?,
+            finished_at = ?,
+            runtime_owner_id = NULL,
+            lease_heartbeat_at = NULL,
+            updated_at = ?
+        WHERE id = ? AND status = 'running' AND runtime_owner_id = ?
+        "#,
+    )
+    .bind(message)
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(batch.id.as_str())
+    .bind(state.runtime_owner_id.as_str())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(updated.rows_affected() > 0)
 }
 
 async fn legacy_batch_claim_is_current(
@@ -12217,6 +12375,74 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn force_fail_translation_batch_closes_owned_running_batch() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let mut item = sample_release_item("force-fail-owned-batch");
+        item.max_wait_ms = 0;
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim batch")
+            .expect("batch exists");
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            UPDATE translation_batches
+            SET status = 'running',
+                started_at = ?,
+                runtime_owner_id = ?,
+                lease_heartbeat_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(state.runtime_owner_id.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(batch.id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark batch running");
+
+        let forced = force_fail_translation_batch_if_owned(
+            state.as_ref(),
+            &batch,
+            "translation batch finalization failed",
+        )
+        .await
+        .expect("force failure should succeed");
+        assert!(forced);
+
+        let batch_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_batches WHERE id = ?")
+                .bind(batch.id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load failed batch status");
+        let work_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ?")
+                .bind(batch.items[0].id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load failed work item status");
+        let request_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_requests WHERE id = ?")
+                .bind(created.request_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load failed request status");
+        assert_eq!(batch_status, "failed");
+        assert_eq!(work_status, "failed");
+        assert_eq!(request_status, "failed");
     }
 
     #[tokio::test]

@@ -9228,6 +9228,7 @@ async fn execute_repo_release_work_item(
     state: &AppState,
     work_item: &RepoReleaseWorkItemRow,
 ) -> Result<(RepoReleaseWriteStats, usize)> {
+    let lease = (work_item.status == jobs::STATUS_RUNNING).then_some(work_item);
     let public_usage = load_public_release_usage_sync_access(state, work_item.repo_id).await?;
     let candidates =
         load_repo_release_candidate_users(state, work_item.repo_id, &work_item.repo_full_name)
@@ -9250,6 +9251,7 @@ async fn execute_repo_release_work_item(
                 candidate.user_id.as_str(),
                 work_item.repo_id,
                 work_item.repo_full_name.as_str(),
+                lease,
             )
             .await
             {
@@ -9258,19 +9260,25 @@ async fn execute_repo_release_work_item(
                         state,
                         work_item.repo_id,
                         &fetch_result.releases,
-                        Some(work_item),
+                        lease,
                     )
                     .await?;
                     stats.pages_fetched = fetch_result.pages_fetched;
                     stats.stopped_reason = fetch_result.stopped_reason;
-                    record_repo_release_sync_success(
+                    if !record_repo_release_sync_success(
                         state,
                         work_item.repo_id,
                         fetch_result.http_state,
                         false,
                         &stats,
+                        lease,
                     )
-                    .await?;
+                    .await?
+                    {
+                        return Err(anyhow!(
+                            "repo release work item lease lost before sync state success"
+                        ));
+                    }
                     if public_usage.exists {
                         authenticated_stats = Some(stats);
                         break 'candidate_users;
@@ -9282,14 +9290,20 @@ async fn execute_repo_release_work_item(
                         stopped_reason: "not_modified".to_owned(),
                         ..RepoReleaseWriteStats::default()
                     };
-                    record_repo_release_sync_success(
+                    if !record_repo_release_sync_success(
                         state,
                         work_item.repo_id,
                         http_state,
                         true,
                         &stats,
+                        lease,
                     )
-                    .await?;
+                    .await?
+                    {
+                        return Err(anyhow!(
+                            "repo release work item lease lost before sync state success"
+                        ));
+                    }
                     if public_usage.exists {
                         authenticated_stats = Some(stats);
                         break 'candidate_users;
@@ -9315,28 +9329,35 @@ async fn execute_repo_release_work_item(
             state,
             work_item.repo_id,
             work_item.repo_full_name.as_str(),
+            lease,
         )
         .await
         {
             Ok(RepoReleaseFetchOutcome::Updated(fetch_result)) => {
-                let mut stats = upsert_repo_releases(
-                    state,
-                    work_item.repo_id,
-                    &fetch_result.releases,
-                    Some(work_item),
-                )
-                .await?;
+                let mut stats =
+                    upsert_repo_releases(state, work_item.repo_id, &fetch_result.releases, lease)
+                        .await?;
                 stats.pages_fetched = fetch_result.pages_fetched;
                 stats.stopped_reason = fetch_result.stopped_reason;
-                record_repo_release_sync_success(
+                if !record_repo_release_sync_success(
                     state,
                     work_item.repo_id,
                     fetch_result.http_state,
                     false,
                     &stats,
+                    lease,
                 )
-                .await?;
-                mark_public_release_usage_sync_success(state, work_item.repo_id).await?;
+                .await?
+                {
+                    return Err(anyhow!(
+                        "repo release work item lease lost before sync state success"
+                    ));
+                }
+                if !mark_public_release_usage_sync_success(state, work_item.repo_id, lease).await? {
+                    return Err(anyhow!(
+                        "repo release work item lease lost before public usage success"
+                    ));
+                }
                 if let Some(authenticated) = authenticated_stats
                     && authenticated.inserted_count + authenticated.updated_count
                         > stats.inserted_count + stats.updated_count
@@ -9350,30 +9371,55 @@ async fn execute_repo_release_work_item(
                     stopped_reason: "not_modified".to_owned(),
                     ..RepoReleaseWriteStats::default()
                 };
-                record_repo_release_sync_success(
+                if !record_repo_release_sync_success(
                     state,
                     work_item.repo_id,
                     http_state,
                     true,
                     &stats,
+                    lease,
                 )
-                .await?;
-                mark_public_release_usage_sync_success(state, work_item.repo_id).await?;
+                .await?
+                {
+                    return Err(anyhow!(
+                        "repo release work item lease lost before sync state success"
+                    ));
+                }
+                if !mark_public_release_usage_sync_success(state, work_item.repo_id, lease).await? {
+                    return Err(anyhow!(
+                        "repo release work item lease lost before public usage success"
+                    ));
+                }
                 return Ok((authenticated_stats.unwrap_or(stats), candidate_failures));
             }
             Err(err) => {
-                if authenticated_stats.is_none()
-                    && let Err(record_err) =
-                        record_repo_release_sync_failure(state, work_item.repo_id, &err).await
-                {
-                    tracing::warn!(
-                        ?record_err,
-                        repo_id = work_item.repo_id,
-                        repo = work_item.repo_full_name.as_str(),
-                        "sync releases: record public repo release failure failed"
-                    );
+                if authenticated_stats.is_none() {
+                    match record_repo_release_sync_failure(state, work_item.repo_id, &err, lease)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Err(anyhow!(
+                                "repo release work item lease lost before sync state failure"
+                            ));
+                        }
+                        Err(record_err) => {
+                            tracing::warn!(
+                                ?record_err,
+                                repo_id = work_item.repo_id,
+                                repo = work_item.repo_full_name.as_str(),
+                                "sync releases: record public repo release failure failed"
+                            );
+                        }
+                    }
                 }
-                mark_public_release_usage_sync_failure(state, work_item.repo_id, &err).await?;
+                if !mark_public_release_usage_sync_failure(state, work_item.repo_id, &err, lease)
+                    .await?
+                {
+                    return Err(anyhow!(
+                        "repo release work item lease lost before public usage failure"
+                    ));
+                }
                 if let Some(stats) = authenticated_stats {
                     return Ok((stats, candidate_failures));
                 }
@@ -9382,7 +9428,11 @@ async fn execute_repo_release_work_item(
     }
 
     if let Some(stats) = authenticated_stats {
-        mark_public_release_usage_sync_success(state, work_item.repo_id).await?;
+        if !mark_public_release_usage_sync_success(state, work_item.repo_id, lease).await? {
+            return Err(anyhow!(
+                "repo release work item lease lost before public usage success"
+            ));
+        }
         return Ok((stats, candidate_failures));
     }
 
@@ -9397,7 +9447,11 @@ async fn execute_repo_release_work_item(
                 None,
             )
         });
-        mark_public_release_usage_sync_failure(state, work_item.repo_id, &error).await?;
+        if !mark_public_release_usage_sync_failure(state, work_item.repo_id, &error, lease).await? {
+            return Err(anyhow!(
+                "repo release work item lease lost before public usage failure"
+            ));
+        }
     }
 
     Err(anyhow!(
@@ -9490,11 +9544,27 @@ async fn load_public_release_usage_sync_access(
     })
 }
 
-async fn mark_public_release_usage_sync_success(state: &AppState, repo_id: i64) -> Result<()> {
+async fn mark_public_release_usage_sync_success(
+    state: &AppState,
+    repo_id: i64,
+    lease: Option<&RepoReleaseWorkItemRow>,
+) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     state
         .sqlite_writer
         .write("public_release_usage_success", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin public release usage success tx")?;
+            if let Some(work_item) = lease
+                && !repo_release_lease_is_current_tx(&mut tx, state, work_item, now.as_str())
+                    .await?
+            {
+                tx.rollback().await.ok();
+                return Ok(false);
+            }
             sqlx::query(
                 r#"
                 UPDATE public_repo_release_usage
@@ -9506,20 +9576,23 @@ async fn mark_public_release_usage_sync_success(state: &AppState, repo_id: i64) 
             )
             .bind(now.as_str())
             .bind(repo_id)
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await
             .context("failed to mark public release usage sync success")?;
-            Ok::<_, anyhow::Error>(())
+            tx.commit()
+                .await
+                .context("commit public release usage success tx")?;
+            Ok(true)
         })
-        .await?;
-    Ok(())
+        .await
 }
 
 async fn mark_public_release_usage_sync_failure(
     state: &AppState,
     repo_id: i64,
     err: &SyncRequestError,
-) -> Result<()> {
+    lease: Option<&RepoReleaseWorkItemRow>,
+) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     let status = if err.reason_code == "repo_inaccessible" {
         "inaccessible"
@@ -9530,6 +9603,18 @@ async fn mark_public_release_usage_sync_failure(
     state
         .sqlite_writer
         .write("public_release_usage_failure", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin public release usage failure tx")?;
+            if let Some(work_item) = lease
+                && !repo_release_lease_is_current_tx(&mut tx, state, work_item, now.as_str())
+                    .await?
+            {
+                tx.rollback().await.ok();
+                return Ok(false);
+            }
             sqlx::query(
                 r#"
                 UPDATE public_repo_release_usage
@@ -9543,13 +9628,15 @@ async fn mark_public_release_usage_sync_failure(
             .bind(error_message.as_str())
             .bind(now.as_str())
             .bind(repo_id)
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await
             .context("failed to mark public release usage sync failure")?;
-            Ok::<_, anyhow::Error>(())
+            tx.commit()
+                .await
+                .context("commit public release usage failure tx")?;
+            Ok(true)
         })
-        .await?;
-    Ok(())
+        .await
 }
 
 async fn load_repo_release_sync_state(
@@ -9570,17 +9657,58 @@ async fn load_repo_release_sync_state(
     .context("failed to load repo release sync state")
 }
 
+async fn repo_release_lease_is_current_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    state: &AppState,
+    work_item: &RepoReleaseWorkItemRow,
+    now: &str,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT 1
+        FROM repo_release_work_items
+        WHERE id = ?
+          AND status = ?
+          AND runtime_owner_id = ?
+          AND started_at = ?
+          AND julianday(deadline_at) > julianday(?)
+        LIMIT 1
+        "#,
+    )
+    .bind(work_item.id.as_str())
+    .bind(jobs::STATUS_RUNNING)
+    .bind(state.runtime_owner_id.as_str())
+    .bind(work_item.started_at.as_deref().unwrap_or_default())
+    .bind(now)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("failed to validate repo release work item lease")?
+    .is_some())
+}
+
 async fn record_repo_release_sync_success(
     state: &AppState,
     repo_id: i64,
     http_state: RepoReleaseHttpState,
     not_modified: bool,
     stats: &RepoReleaseWriteStats,
-) -> Result<()> {
+    lease: Option<&RepoReleaseWorkItemRow>,
+) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     state
         .sqlite_writer
         .write("repo_release_sync_success", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin repo release sync success tx")?;
+            if let Some(work_item) = lease
+                && !repo_release_lease_is_current_tx(&mut tx, state, work_item, now.as_str()).await?
+            {
+                tx.rollback().await.ok();
+                return Ok(false);
+            }
             sqlx::query(
                 r#"
                 INSERT INTO repo_release_sync_state (
@@ -9626,20 +9754,23 @@ async fn record_repo_release_sync_success(
             .bind(i64::try_from(stats.unchanged_count).unwrap_or(i64::MAX))
             .bind(stats.stopped_reason.as_str())
             .bind(now.as_str())
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await
             .context("failed to record repo release sync success")?;
-            Ok::<_, anyhow::Error>(())
+            tx.commit()
+                .await
+                .context("commit repo release sync success tx")?;
+            Ok(true)
         })
-        .await?;
-    Ok(())
+        .await
 }
 
 async fn record_repo_release_sync_failure(
     state: &AppState,
     repo_id: i64,
     error: &SyncRequestError,
-) -> Result<()> {
+    lease: Option<&RepoReleaseWorkItemRow>,
+) -> Result<bool> {
     let now = Utc::now();
     let backoff_until = if error.retryable {
         Some((now + chrono::Duration::minutes(10)).to_rfc3339())
@@ -9651,6 +9782,18 @@ async fn record_repo_release_sync_failure(
     state
         .sqlite_writer
         .write("repo_release_sync_failure", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin repo release sync failure tx")?;
+            if let Some(work_item) = lease
+                && !repo_release_lease_is_current_tx(&mut tx, state, work_item, now.as_str())
+                    .await?
+            {
+                tx.rollback().await.ok();
+                return Ok(false);
+            }
             sqlx::query(
                 r#"
                 INSERT INTO repo_release_sync_state (
@@ -9670,13 +9813,15 @@ async fn record_repo_release_sync_failure(
             .bind(error_message.as_str())
             .bind(backoff_until.as_deref())
             .bind(now.as_str())
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await
             .context("failed to record repo release sync failure")?;
-            Ok::<_, anyhow::Error>(())
+            tx.commit()
+                .await
+                .context("commit repo release sync failure tx")?;
+            Ok(true)
         })
-        .await?;
-    Ok(())
+        .await
 }
 
 async fn upsert_repo_releases(
@@ -13408,6 +13553,7 @@ async fn fetch_repo_releases_for_user(
     user_id: &str,
     repo_id: i64,
     repo_full_name: &str,
+    lease: Option<&RepoReleaseWorkItemRow>,
 ) -> Result<RepoReleaseFetchOutcome, SyncRequestError> {
     let connections = load_sync_github_connections(state, user_id).await?;
     let sync_state = load_repo_release_sync_state(state, repo_id)
@@ -13432,15 +13578,25 @@ async fn fetch_repo_releases_for_user(
         {
             Ok(outcome) => return Ok(outcome),
             Err(err) => {
-                if let Err(record_err) =
-                    record_repo_release_sync_failure(state, repo_id, &err).await
-                {
-                    tracing::warn!(
-                        ?record_err,
-                        repo_id,
-                        repo = repo_full_name,
-                        "sync releases: record repo release failure failed"
-                    );
+                match record_repo_release_sync_failure(state, repo_id, &err, lease).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(SyncRequestError::non_retryable(
+                            "repo_release_lease_lost",
+                            format!(
+                                "repo release work item lease lost while syncing {repo_full_name}"
+                            ),
+                            None,
+                        ));
+                    }
+                    Err(record_err) => {
+                        tracing::warn!(
+                            ?record_err,
+                            repo_id,
+                            repo = repo_full_name,
+                            "sync releases: record repo release failure failed"
+                        );
+                    }
                 }
                 tracing::warn!(
                     event = "upstream.call",
@@ -13469,6 +13625,7 @@ async fn fetch_repo_releases_public(
     state: &AppState,
     repo_id: i64,
     repo_full_name: &str,
+    _lease: Option<&RepoReleaseWorkItemRow>,
 ) -> Result<RepoReleaseFetchOutcome, SyncRequestError> {
     let sync_state = load_repo_release_sync_state(state, repo_id)
         .await
@@ -23500,6 +23657,7 @@ mod tests {
                 stopped_reason: "page_budget".to_owned(),
                 ..RepoReleaseWriteStats::default()
             },
+            None,
         )
         .await
         .expect("seed release sync state");
@@ -23513,6 +23671,7 @@ mod tests {
                 stopped_reason: "not_modified".to_owned(),
                 ..RepoReleaseWriteStats::default()
             },
+            None,
         )
         .await
         .expect("record not modified state");
@@ -23529,6 +23688,97 @@ mod tests {
         .await
         .expect("load page count");
         assert_eq!(page_count, 12);
+    }
+
+    #[tokio::test]
+    async fn repo_release_sync_state_write_rejects_a_recovered_work_item() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-recovered-sync-state",
+                repo_id: 43,
+                repo_full_name: "octo/recovered-sync-state",
+                status: jobs::STATUS_RUNNING,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 0,
+                last_candidate_failures: 0,
+                runtime_owner_id: Some(state.runtime_owner_id.as_str()),
+                lease_heartbeat_at: Some("2999-01-01T00:00:00Z"),
+            },
+        )
+        .await;
+        sqlx::query(
+            r#"
+            INSERT INTO repo_release_sync_state (
+              repo_id, etag, last_success_at, last_attempt_at, last_page_count, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(43_i64)
+        .bind("stable-etag")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("2026-03-06T00:00:00Z")
+        .bind(7_i64)
+        .bind("2026-03-06T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed release sync state");
+        sqlx::query(
+            r#"
+            UPDATE repo_release_work_items
+            SET status = ?, runtime_owner_id = NULL, lease_heartbeat_at = NULL, finished_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(jobs::STATUS_SUCCEEDED)
+        .bind("2026-03-06T00:01:00Z")
+        .bind("repo-work-recovered-sync-state")
+        .execute(&pool)
+        .await
+        .expect("recover repo release work item");
+
+        let lease = RepoReleaseWorkItemRow {
+            id: "repo-work-recovered-sync-state".to_owned(),
+            repo_id: 43,
+            repo_full_name: "octo/recovered-sync-state".to_owned(),
+            status: jobs::STATUS_RUNNING.to_owned(),
+            request_origin: RepoReleaseOrigin::System.as_str().to_owned(),
+            priority: RepoReleaseOrigin::System.priority(),
+            has_new_repo_watchers: 0,
+            deadline_at: "2999-01-01T00:00:00Z".to_owned(),
+            last_success_at: None,
+            started_at: Some("2026-03-06T00:00:00Z".to_owned()),
+        };
+        let updated = record_repo_release_sync_success(
+            state.as_ref(),
+            43,
+            RepoReleaseHttpState {
+                etag: Some("stale-etag".to_owned()),
+                last_modified: None,
+            },
+            false,
+            &RepoReleaseWriteStats {
+                pages_fetched: 2,
+                fetched_count: 20,
+                ..RepoReleaseWriteStats::default()
+            },
+            Some(&lease),
+        )
+        .await
+        .expect("stale sync state write should be handled");
+
+        assert!(!updated);
+        let stored: (Option<String>, i64) = sqlx::query_as(
+            "SELECT etag, last_page_count FROM repo_release_sync_state WHERE repo_id = ?",
+        )
+        .bind(43_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("load preserved release sync state");
+        assert_eq!(stored.0.as_deref(), Some("stable-etag"));
+        assert_eq!(stored.1, 7);
     }
 
     #[tokio::test]

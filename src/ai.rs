@@ -282,6 +282,7 @@ impl LlmScheduler {
         self.status_overrides.read().await.clone()
     }
 
+    #[cfg(test)]
     pub(crate) async fn set_admin_override(&self, snapshot: LlmCallAdminOverride) {
         self.status_overrides
             .write()
@@ -2354,13 +2355,13 @@ async fn insert_llm_call_event_in_transaction(
     .context("insert llm_call event failed")
 }
 
-async fn append_llm_call_event(
+async fn append_llm_call_event_if_owned(
     state: &AppState,
     call_id: &str,
     event_type: &str,
     status: &str,
     payload: Value,
-) -> Result<()> {
+) -> Result<bool> {
     let now = chrono::Utc::now().to_rfc3339();
     let inserted = state
         .sqlite_writer
@@ -2370,6 +2371,19 @@ async fn append_llm_call_event(
                 .begin()
                 .await
                 .context("begin llm_call event transaction failed")?;
+            let owned = sqlx::query_scalar::<_, i64>(
+                "SELECT 1 FROM llm_calls WHERE id = ? AND status = 'running' AND runtime_owner_id = ? LIMIT 1",
+            )
+            .bind(call_id)
+            .bind(state.runtime_owner_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await
+            .context("load llm_call ownership for event failed")?
+            .is_some();
+            if !owned {
+                tx.rollback().await.ok();
+                return Ok::<_, anyhow::Error>(false);
+            }
             let inserted = insert_llm_call_event_in_transaction(
                 &mut tx,
                 call_id,
@@ -2382,13 +2396,10 @@ async fn append_llm_call_event(
             tx.commit()
                 .await
                 .context("commit llm_call event transaction failed")?;
-            Ok::<_, anyhow::Error>(inserted)
+            Ok::<_, anyhow::Error>(inserted.rows_affected() > 0)
         })
         .await?;
-    if inserted.rows_affected() == 0 {
-        return Err(anyhow!("insert llm_call event failed: call not found"));
-    }
-    Ok(())
+    Ok(inserted)
 }
 
 async fn update_llm_call_running(
@@ -2604,7 +2615,7 @@ async fn append_llm_attempt_failure_event(
     retry_after: Option<Duration>,
     fallback_count: i64,
 ) {
-    if let Err(err) = append_llm_call_event(
+    match append_llm_call_event_if_owned(
         state,
         call_id,
         "llm.attempt_failed",
@@ -2619,14 +2630,15 @@ async fn append_llm_attempt_failure_event(
     )
     .await
     {
-        tracing::warn!(
+        Ok(true) | Ok(false) => {}
+        Err(err) => tracing::warn!(
             event = "sqlite.write",
             operation = "ai.llm_call_attempt_event",
             call_id,
             error_kind = "persist_failed",
             error_chain = %observability::error_chain_summary(err.as_ref()),
             "llm attempt audit event persistence failed"
-        );
+        ),
     }
 }
 
@@ -2774,6 +2786,44 @@ async fn reconcile_admin_override_after_persist(
                 "llm call persist update failed"
             );
         }
+    }
+}
+
+async fn set_llm_admin_override_if_owned(state: &AppState, snapshot: LlmCallAdminOverride) {
+    let call_id = snapshot.id.clone();
+    let mut overrides = state.llm_scheduler.status_overrides.write().await;
+    let owned = match state
+        .sqlite_writer
+        .write("llm_admin_override_guard", |_| async {
+                Ok::<_, anyhow::Error>(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT 1 FROM llm_calls WHERE id = ? AND ((status = 'running' AND runtime_owner_id = ?) OR (status = 'queued' AND runtime_owner_id IS NULL)) LIMIT 1",
+                )
+                .bind(call_id.as_str())
+                .bind(state.runtime_owner_id.as_str())
+                .fetch_optional(&state.pool)
+                .await
+                .context("load llm_call ownership for admin override failed")?
+                .is_some(),
+            )
+        })
+        .await
+    {
+        Ok(owned) => owned,
+        Err(error) => {
+            tracing::warn!(
+                event = "sqlite.write",
+                operation = "ai.llm_admin_override_guard",
+                call_id = call_id.as_str(),
+                error_kind = "persist_failed",
+                error_chain = %observability::error_chain_summary(error.as_ref()),
+                "llm admin override ownership check failed"
+            );
+            return;
+        }
+    };
+    if owned {
+        overrides.insert(call_id, snapshot);
     }
 }
 
@@ -3150,9 +3200,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
 
         if llm_call_persisted {
             let running_updated_at = chrono::Utc::now().to_rfc3339();
-            state
-                .llm_scheduler
-                .set_admin_override(LlmCallAdminOverride {
+            set_llm_admin_override_if_owned(
+                state,
+                LlmCallAdminOverride {
                     id: log_record.id.clone(),
                     status: "running".to_owned(),
                     attempt_count,
@@ -3177,8 +3227,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                     started_at: started_at_timestamp.clone(),
                     finished_at: None,
                     updated_at: running_updated_at,
-                })
-                .await;
+                },
+            )
+            .await;
             let persist_result = update_llm_call_running(
                 state,
                 log_record.id.as_str(),
@@ -3276,9 +3327,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                 });
                 let finished_at = chrono::Utc::now().to_rfc3339();
                 if llm_call_persisted {
-                    state
-                        .llm_scheduler
-                        .set_admin_override(LlmCallAdminOverride {
+                    set_llm_admin_override_if_owned(
+                        state,
+                        LlmCallAdminOverride {
                             id: log_record.id.clone(),
                             status: "succeeded".to_owned(),
                             attempt_count,
@@ -3303,8 +3354,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                             started_at: started_at_timestamp.clone(),
                             finished_at: Some(finished_at.clone()),
                             updated_at: finished_at.clone(),
-                        })
-                        .await;
+                        },
+                    )
+                    .await;
                 }
                 in_flight_guard.release_permit();
                 drop(in_flight_guard);
@@ -3391,9 +3443,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                     let retry_delay = next_retry_delay(candidate_attempts, retry_after);
                     let requeued_at = chrono::Utc::now().to_rfc3339();
                     if llm_call_persisted {
-                        state
-                            .llm_scheduler
-                            .set_admin_override(LlmCallAdminOverride {
+                        set_llm_admin_override_if_owned(
+                            state,
+                            LlmCallAdminOverride {
                                 id: log_record.id.clone(),
                                 status: "queued".to_owned(),
                                 attempt_count,
@@ -3423,8 +3475,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                                 started_at: started_at_timestamp.clone(),
                                 finished_at: None,
                                 updated_at: requeued_at,
-                            })
-                            .await;
+                            },
+                        )
+                        .await;
                     }
                     in_flight_guard.release_permit();
                     drop(in_flight_guard);
@@ -3479,9 +3532,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                     fallback_count = fallback_count.saturating_add(1);
                     let requeued_at = chrono::Utc::now().to_rfc3339();
                     if llm_call_persisted {
-                        state
-                            .llm_scheduler
-                            .set_admin_override(LlmCallAdminOverride {
+                        set_llm_admin_override_if_owned(
+                            state,
+                            LlmCallAdminOverride {
                                 id: log_record.id.clone(),
                                 status: "queued".to_owned(),
                                 attempt_count,
@@ -3506,10 +3559,11 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                                 started_at: started_at_timestamp.clone(),
                                 finished_at: None,
                                 updated_at: requeued_at,
-                            })
-                            .await;
+                            },
+                        )
+                        .await;
                     }
-                    if let Err(err) = append_llm_call_event(
+                    match append_llm_call_event_if_owned(
                         state,
                         log_record.id.as_str(),
                         "llm.route_switched",
@@ -3525,14 +3579,15 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                     )
                     .await
                     {
-                        tracing::warn!(
+                        Ok(true) | Ok(false) => {}
+                        Err(err) => tracing::warn!(
                             event = "sqlite.write",
                             operation = "ai.llm_route_switch_event",
                             call_id = log_record.id.as_str(),
                             error_kind = "persist_failed",
                             error_chain = %observability::error_chain_summary(err.as_ref()),
                             "llm route switch audit event persistence failed"
-                        );
+                        ),
                     }
                     in_flight_guard.release_permit();
                     drop(in_flight_guard);
@@ -3565,9 +3620,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                 let safe_message = failure_class.safe_message();
                 let finished_at = chrono::Utc::now().to_rfc3339();
                 if llm_call_persisted {
-                    state
-                        .llm_scheduler
-                        .set_admin_override(LlmCallAdminOverride {
+                    set_llm_admin_override_if_owned(
+                        state,
+                        LlmCallAdminOverride {
                             id: log_record.id.clone(),
                             status: "failed".to_owned(),
                             attempt_count,
@@ -3592,8 +3647,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                             started_at: started_at_timestamp.clone(),
                             finished_at: Some(finished_at.clone()),
                             updated_at: finished_at.clone(),
-                        })
-                        .await;
+                        },
+                    )
+                    .await;
                 }
                 in_flight_guard.release_permit();
                 drop(in_flight_guard);
@@ -3863,6 +3919,9 @@ async fn recover_llm_call_with_message(
             Ok::<_, anyhow::Error>(true)
         })
         .await?;
+    if updated {
+        state.llm_scheduler.clear_admin_override(call_id).await;
+    }
     Ok(updated)
 }
 
@@ -8787,6 +8846,15 @@ mod tests {
         .execute(&state.pool)
         .await
         .expect("mark llm call stale");
+        state
+            .llm_scheduler
+            .set_admin_override(LlmCallAdminOverride {
+                id: log.id.clone(),
+                status: "succeeded".to_owned(),
+                updated_at: "2026-03-06T00:00:00Z".to_owned(),
+                ..Default::default()
+            })
+            .await;
 
         recover_runtime_state(state.as_ref())
             .await
@@ -8811,6 +8879,68 @@ mod tests {
         );
         assert_eq!(row.get::<Option<String>, _>("runtime_owner_id"), None);
         assert_eq!(row.get::<Option<String>, _>("lease_heartbeat_at"), None);
+        assert!(
+            !state
+                .llm_scheduler
+                .admin_overrides()
+                .await
+                .contains_key(log.id.as_str())
+        );
+        set_llm_admin_override_if_owned(
+            state.as_ref(),
+            LlmCallAdminOverride {
+                id: log.id.clone(),
+                status: "queued".to_owned(),
+                updated_at: Utc::now().to_rfc3339(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            !state
+                .llm_scheduler
+                .admin_overrides()
+                .await
+                .contains_key(log.id.as_str())
+        );
+
+        append_llm_attempt_failure_event(
+            state.as_ref(),
+            log.id.as_str(),
+            "gpt-test",
+            2,
+            LlmFailureClass::Transient,
+            None,
+            0,
+        )
+        .await;
+        let inserted = append_llm_call_event_if_owned(
+            state.as_ref(),
+            log.id.as_str(),
+            "llm.route_switched",
+            "queued",
+            serde_json::json!({"from_model": "gpt-test", "to_model": "gpt-test-2"}),
+        )
+        .await
+        .expect("stale llm event append should be ignored");
+        assert!(!inserted);
+
+        let attempt_failed_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM llm_call_events WHERE call_id = ? AND event_type = 'llm.attempt_failed'",
+        )
+        .bind(log.id.as_str())
+        .fetch_one(&state.pool)
+        .await
+        .expect("count stale attempt events");
+        let route_switched_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM llm_call_events WHERE call_id = ? AND event_type = 'llm.route_switched'",
+        )
+        .bind(log.id.as_str())
+        .fetch_one(&state.pool)
+        .await
+        .expect("count stale route events");
+        assert_eq!(attempt_failed_events, 0);
+        assert_eq!(route_switched_events, 0);
     }
 
     #[tokio::test]

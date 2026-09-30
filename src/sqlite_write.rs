@@ -546,6 +546,7 @@ fn sqlite_code_is_busy_or_locked(code: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::{
+        io,
         path::PathBuf,
         sync::{
             Arc, Mutex as StdMutex,
@@ -555,7 +556,54 @@ mod tests {
     };
 
     use super::*;
+    use serde_json::Value;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct SharedLogBuffer {
+        inner: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    struct SharedLogWriter {
+        inner: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl io::Write for SharedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.inner
+                .lock()
+                .expect("log buffer lock poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedLogBuffer {
+        type Writer = SharedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogWriter {
+                inner: Arc::clone(&self.inner),
+            }
+        }
+    }
+
+    impl SharedLogBuffer {
+        fn json_events(&self) -> Vec<Value> {
+            let bytes = self.inner.lock().expect("log buffer lock poisoned").clone();
+            String::from_utf8(bytes)
+                .expect("captured logs should be utf-8")
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| serde_json::from_str(line).expect("captured line should be valid json"))
+                .collect()
+        }
+    }
 
     #[derive(Debug)]
     struct TestDatabaseError {
@@ -710,6 +758,39 @@ mod tests {
             order.lock().expect("order lock").as_slice(),
             ["foreground", "background"]
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinator_telemetry_includes_lane_priority_wait_attempt_and_elapsed() {
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_target(false)
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _default_guard = tracing::subscriber::set_default(subscriber);
+
+        SqliteWriteCoordinator::new()
+            .write_foreground("telemetry", |_| async { Ok::<_, anyhow::Error>(()) })
+            .await
+            .expect("coordinated telemetry write");
+
+        let events = buffer.json_events();
+        assert!(events.iter().any(|event| {
+            event.get("sqlite_write_lane") == Some(&Value::String("telemetry".to_owned()))
+                && event.get("sqlite_write_priority")
+                    == Some(&Value::String("foreground".to_owned()))
+                && event.get("wait_ms").is_some()
+        }));
+        assert!(events.iter().any(|event| {
+            event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                && event.get("operation") == Some(&Value::String("telemetry".to_owned()))
+                && event.get("priority") == Some(&Value::String("foreground".to_owned()))
+                && event.get("attempt").is_some()
+                && event.get("elapsed_ms").is_some()
+        }));
     }
 
     #[test]

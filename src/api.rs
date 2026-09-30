@@ -17779,45 +17779,6 @@ async fn fetch_live_release_reactions(
     Ok(out)
 }
 
-async fn persist_release_reaction_counts(
-    state: &AppState,
-    release_id: i64,
-    counts: &ReleaseReactionCounts,
-) -> Result<(), ApiError> {
-    state
-        .sqlite_writer
-        .write_foreground("feed_reaction_counts_persist", |_| async move {
-            sqlx::query(
-                r#"
-                    UPDATE repo_releases
-                    SET react_plus1 = ?,
-                        react_laugh = ?,
-                        react_heart = ?,
-                        react_hooray = ?,
-                        react_rocket = ?,
-                        react_eyes = ?,
-                        updated_at = ?
-                    WHERE release_id = ?
-                    "#,
-            )
-            .bind(counts.plus1)
-            .bind(counts.laugh)
-            .bind(counts.heart)
-            .bind(counts.hooray)
-            .bind(counts.rocket)
-            .bind(counts.eyes)
-            .bind(chrono::Utc::now().to_rfc3339())
-            .bind(release_id)
-            .execute(&state.pool)
-            .await
-            .map(|_| ())
-            .map_err(anyhow::Error::from)
-        })
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(())
-}
-
 async fn persist_release_reaction_counts_best_effort(
     state: &AppState,
     release_id: i64,
@@ -17875,6 +17836,31 @@ async fn persist_release_reaction_counts_best_effort(
             Ok(false)
         }
         Err(err) => Err(ApiError::internal(err)),
+    }
+}
+
+async fn persist_release_reaction_counts_after_remote_mutation(
+    state: &AppState,
+    release_id: i64,
+    counts: &ReleaseReactionCounts,
+) {
+    match persist_release_reaction_counts_best_effort(state, release_id, counts).await {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            event = "feed.reactions.remote_mutation_succeeded_local_persist_failed",
+            release_id,
+            error_kind = "downgraded",
+            downgrade_reason = "sqlite_writer_busy",
+            "remote reaction mutation succeeded but local reaction counts were not persisted"
+        ),
+        Err(error) => tracing::warn!(
+            event = "feed.reactions.remote_mutation_succeeded_local_persist_failed",
+            release_id,
+            error_kind = "persist_failed",
+            api_error_code = error.code(),
+            error = %error,
+            "remote reaction mutation succeeded but local reaction counts were not persisted"
+        ),
     }
 }
 
@@ -19599,7 +19585,12 @@ pub async fn toggle_release_reaction(
             }
             Err(err) => return Err(err),
         };
-    persist_release_reaction_counts(state.as_ref(), row.release_id, &updated.counts).await?;
+    persist_release_reaction_counts_after_remote_mutation(
+        state.as_ref(),
+        row.release_id,
+        &updated.counts,
+    )
+    .await;
 
     Ok(Json(ToggleReleaseReactionResponse {
         release_id: row.release_id.to_string(),
@@ -26261,7 +26252,8 @@ mod tests {
         parse_feed_types, parse_llm_models, parse_positive_admin_concurrency,
         parse_release_id_param, parse_release_smart_summary_payload,
         parse_repo_full_name_from_release_url, parse_translation_json, parse_unique_release_ids,
-        parse_unique_thread_ids, persist_reaction_pat_check_result, prepare_release_batch,
+        parse_unique_thread_ids, persist_reaction_pat_check_result,
+        persist_release_reaction_counts_after_remote_mutation, prepare_release_batch,
         prepare_repo_scope_public_repo_access, preserve_chunk_edge_newlines,
         public_get_repo_release_detail, public_list_repo_releases, public_list_repo_releases_http,
         publish_repo_public_release, refresh_admin_dashboard_rollups, refresh_feed_reactions,
@@ -36580,6 +36572,12 @@ line two",
         let (item, persisted) = build_feed_reaction_refresh_item(state.as_ref(), &row, &reaction)
             .await
             .expect("build refresh item under write pressure");
+        persist_release_reaction_counts_after_remote_mutation(
+            state.as_ref(),
+            row.release_id,
+            &reaction.counts,
+        )
+        .await;
 
         held_tx.commit().await.expect("commit held tx");
         drop(writer_guard);
