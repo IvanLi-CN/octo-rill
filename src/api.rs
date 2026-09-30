@@ -29980,6 +29980,316 @@ mod tests {
         assert_eq!(out_of_scope_result["reason"], "unknown_hook");
     }
 
+    async fn setup_public_webhook_receiver(pool: &SqlitePool) -> Arc<AppState> {
+        set_include_own_releases(pool, true).await;
+        sqlx::query(
+            "UPDATE users SET webhook_push_desired_state = 'enabled', webhook_push_enabled = 1 WHERE id = ?",
+        )
+        .bind(test_user_id(1))
+        .execute(pool)
+        .await
+        .expect("enable public receiver test");
+        seed_owned_repo_baseline_with_privacy(pool, 202, "IvanLi-CN/receiver-test", false).await;
+
+        let state = setup_state(pool.clone());
+        let pat = state
+            .encryption_key
+            .encrypt_str("ghp_receiver_test_token")
+            .expect("encrypt receiver PAT");
+        let secret = state
+            .encryption_key
+            .encrypt_str("receiver-secret")
+            .expect("encrypt receiver secret");
+        sqlx::query(
+            r#"
+            INSERT INTO reaction_pat_tokens (
+              user_id, token_ciphertext, token_nonce, masked_token,
+              last_check_state, last_check_message, last_checked_at, updated_at,
+              owner_github_user_id, owner_login, webhook_push_allows_private_repos
+            ) VALUES (?, ?, ?, ?, 'valid', 'token is valid', ?, ?, ?, ?, 1)
+            "#,
+        )
+        .bind(test_user_id(1))
+        .bind(pat.ciphertext)
+        .bind(pat.nonce)
+        .bind("ghp_...oken")
+        .bind("2026-02-23T00:00:00Z")
+        .bind("2026-02-23T00:00:00Z")
+        .bind(30215105_i64)
+        .bind("IvanLi-CN")
+        .execute(pool)
+        .await
+        .expect("seed receiver PAT");
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET webhook_push_secret_ciphertext = ?, webhook_push_secret_nonce = ?,
+                webhook_push_callback_key = 'receiver-key'
+            WHERE id = ?
+            "#,
+        )
+        .bind(secret.ciphertext)
+        .bind(secret.nonce)
+        .bind(test_user_id(1))
+        .execute(pool)
+        .await
+        .expect("seed receiver secret");
+        sqlx::query(
+            r#"
+            INSERT INTO webhook_push_repos (
+              user_id, repo_id, owner_github_user_id, owner_login, repo_name,
+              repo_full_name, hook_id, callback_url, status, updated_at
+            ) VALUES (?, 202, 30215105, 'IvanLi-CN', 'receiver-test',
+                      'IvanLi-CN/receiver-test', 9202, 'https://example.test/webhook', 'registered', ?)
+            "#,
+        )
+        .bind(test_user_id(1))
+        .bind("2026-02-23T00:00:00Z")
+        .execute(pool)
+        .await
+        .expect("seed receiver hook");
+        state
+    }
+
+    fn signed_release_receiver_request(delivery_id: &str) -> (HeaderMap, Bytes) {
+        let body = r#"{"action":"published","release":{"id":7,"draft":false},"repository":{"id":202,"full_name":"IvanLi-CN/receiver-test"}}"#;
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"receiver-secret")
+            .expect("create receiver signature");
+        mac.update(body.as_bytes());
+        let signature = format!(
+            "sha256={}",
+            mac.finalize()
+                .into_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-github-delivery",
+            HeaderValue::from_str(delivery_id).expect("build delivery header"),
+        );
+        headers.insert("x-github-event", HeaderValue::from_static("release"));
+        headers.insert("x-github-hook-id", HeaderValue::from_static("9202"));
+        headers.insert(
+            "x-hub-signature-256",
+            HeaderValue::from_str(&signature).expect("build receiver signature header"),
+        );
+        (headers, Bytes::from(body))
+    }
+
+    #[tokio::test]
+    async fn webhook_receiver_serializes_concurrent_deliveries_under_background_writer_pressure() {
+        let pool = setup_pool().await;
+        let state = setup_public_webhook_receiver(&pool).await;
+        let held_writer = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "test_webhook_receiver_background_pressure",
+                crate::sqlite_write::SqliteWritePriority::Background,
+            )
+            .await
+            .expect("hold background writer");
+        let start_barrier = Arc::new(tokio::sync::Barrier::new(4));
+        let requests = (0..4)
+            .map(|index| {
+                let state = state.clone();
+                let start_barrier = start_barrier.clone();
+                let (headers, body) =
+                    signed_release_receiver_request(&format!("pressure-delivery-{index}"));
+                let body = body.clone();
+                tokio::spawn(async move {
+                    start_barrier.wait().await;
+                    webhook_push::receive(
+                        State(state),
+                        Query(webhook_push::ReceiverQuery {
+                            key: "receiver-key".to_owned(),
+                        }),
+                        headers,
+                        body,
+                    )
+                    .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while state.sqlite_writer.runtime_status().waiting_foreground < 4 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("webhook receiver should queue on the foreground writer lane");
+        drop(held_writer);
+
+        for request in requests {
+            let Json(result) = tokio::time::timeout(std::time::Duration::from_secs(3), request)
+                .await
+                .expect("webhook receiver should finish after writer release")
+                .expect("join webhook receiver")
+                .expect("webhook receiver should not return a writer error");
+            assert!(result["accepted"].as_bool().unwrap_or(false));
+            assert!(result["reason"] == "release_sync_queued" || result["reason"] == "fresh_cache");
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM webhook_push_deliveries WHERE delivery_id LIKE 'pressure-delivery-%' AND processing_state = 'queued'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read queued webhook delivery"),
+            4
+        );
+
+        let (duplicate_headers, duplicate_body) =
+            signed_release_receiver_request("pressure-delivery-0");
+        let Json(duplicate) = webhook_push::receive(
+            State(state.clone()),
+            Query(webhook_push::ReceiverQuery {
+                key: "receiver-key".to_owned(),
+            }),
+            duplicate_headers,
+            duplicate_body,
+        )
+        .await
+        .expect("repeat webhook delivery should be accepted");
+        assert_eq!(duplicate["reason"], "duplicate");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM repo_release_work_items WHERE repo_id = 202",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count release work items"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_receiver_write_deadline_is_retryable_and_preserves_delivery_recovery() {
+        let pool = setup_pool().await;
+        let state = setup_public_webhook_receiver(&pool).await;
+        let (headers, body) = signed_release_receiver_request("deadline-delivery");
+        let held_writer = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "test_webhook_receiver_deadline_pressure",
+                crate::sqlite_write::SqliteWritePriority::Background,
+            )
+            .await
+            .expect("hold background writer");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            webhook_push::receive(
+                State(state.clone()),
+                Query(webhook_push::ReceiverQuery {
+                    key: "receiver-key".to_owned(),
+                }),
+                headers.clone(),
+                body.clone(),
+            ),
+        )
+        .await
+        .expect("webhook receiver should honor its write deadline");
+        let error = result.expect_err("writer pressure should request a retry");
+        assert_eq!(error.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code(), "webhook_receiver_retryable");
+        let response = axum::response::IntoResponse::into_response(error);
+        assert_eq!(response.headers().get("retry-after").unwrap(), "1");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM webhook_push_deliveries WHERE delivery_id = 'deadline-delivery'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read delivery after write timeout"),
+            0
+        );
+        drop(held_writer);
+
+        let Json(retried) = webhook_push::receive(
+            State(state),
+            Query(webhook_push::ReceiverQuery {
+                key: "receiver-key".to_owned(),
+            }),
+            headers,
+            body,
+        )
+        .await
+        .expect("the same delivery should succeed after writer pressure clears");
+        assert!(retried["accepted"].as_bool().unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn webhook_receiver_enqueue_failure_returns_delivery_to_pending_for_retry() {
+        let pool = setup_pool().await;
+        let state = setup_public_webhook_receiver(&pool).await;
+        let (headers, body) = signed_release_receiver_request("enqueue-failure-delivery");
+        sqlx::query(
+            "CREATE TRIGGER fail_webhook_release_enqueue BEFORE INSERT ON repo_release_work_items BEGIN SELECT RAISE(ABORT, 'simulated release enqueue failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .expect("install simulated release enqueue failure");
+
+        let error = webhook_push::receive(
+            State(state.clone()),
+            Query(webhook_push::ReceiverQuery {
+                key: "receiver-key".to_owned(),
+            }),
+            headers.clone(),
+            body.clone(),
+        )
+        .await
+        .expect_err("simulated enqueue failure should be returned");
+        assert_eq!(
+            error.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let processing_state = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT processing_state, processing_started_at FROM webhook_push_deliveries WHERE delivery_id = 'enqueue-failure-delivery'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read delivery after enqueue failure");
+        assert_eq!(processing_state.0, "pending");
+        assert!(processing_state.1.is_none());
+
+        sqlx::query("DROP TRIGGER fail_webhook_release_enqueue")
+            .execute(&pool)
+            .await
+            .expect("remove simulated release enqueue failure");
+        let Json(retried) = webhook_push::receive(
+            State(state),
+            Query(webhook_push::ReceiverQuery {
+                key: "receiver-key".to_owned(),
+            }),
+            headers,
+            body,
+        )
+        .await
+        .expect("pending delivery should be claimable after enqueue recovers");
+        assert!(retried["accepted"].as_bool().unwrap_or(false));
+        let (processing_state, queued_task_id) = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT processing_state, queued_task_id FROM webhook_push_deliveries WHERE delivery_id = 'enqueue-failure-delivery'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read delivery after successful enqueue retry");
+        assert_eq!(processing_state, "queued");
+        assert_eq!(queued_task_id.as_deref(), Some("repo-release:202"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM repo_release_work_items WHERE repo_id = 202",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count recovered release work item"),
+            1
+        );
+    }
+
     struct RepoGovernanceSnapshotSeed<'a> {
         repo_id: i64,
         repo_full_name: &'a str,

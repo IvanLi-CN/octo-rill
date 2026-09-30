@@ -16,4 +16,5 @@
 - [x] M4: Settings/Admin UI、Web Demo、E2E 与视觉证据。
 - [x] M4b: 目标状态、异步对齐、持久退避重试和 Owner 分组整改。
 - [x] M4c: SQLite busy 恢复、每用户 audit dispatch、失败快照和归档错误分类。
+- [x] M4d: Release receiver delivery 写入使用 foreground writer lane、bounded deadline 与 pending recovery。
 - [ ] M5: 完整验证、PR 与 review convergence。
