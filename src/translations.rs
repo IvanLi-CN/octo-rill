@@ -6605,99 +6605,29 @@ async fn force_fail_translation_batch_if_owned(
         .sqlite_writer
         .begin_immediate(&state.pool, "translation_batch_force_failure")
         .await?;
-    let owned = sqlx::query_scalar::<_, i64>(
-        "SELECT 1 FROM translation_batches WHERE id = ? AND status = 'running' AND runtime_owner_id = ? LIMIT 1",
-    )
-    .bind(batch.id.as_str())
-    .bind(state.runtime_owner_id.as_str())
-    .fetch_optional(&mut *tx)
-    .await?
-    .is_some();
-    if !owned {
+    if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
+        tx.rollback().await?;
+        return Err(anyhow!(
+            "translation batch force failure skipped because legacy mode is disabled"
+        ));
+    }
+    if !legacy_batch_claim_is_current(&mut tx, state, batch).await? {
         tx.rollback().await.ok();
         return Ok(false);
     }
 
-    sqlx::query(
-        r#"
-        UPDATE translation_work_items
-        SET status = 'failed',
-            result_status = 'error',
-            error_text = ?,
-            error_code = ?,
-            provider_status = 'failed',
-            output_contract_status = 'not_run',
-            retry_disposition = 'not_needed',
-            next_retry_at = NULL,
-            retry_expires_at = NULL,
-            finished_at = ?,
-            updated_at = ?
-        WHERE id IN (
-          SELECT work_item_id FROM translation_batch_items WHERE batch_id = ?
-        )
-          AND status IN ('running', 'batched')
-        "#,
+    fail_batch_with_message(
+        &mut tx,
+        batch.id.as_str(),
+        &batch.items,
+        message,
+        None,
+        now.as_str(),
     )
-    .bind(message)
-    .bind(classify_translation_error(Some(message)).map(|value| value.code))
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(batch.id.as_str())
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        r#"
-        UPDATE translation_batch_items
-        SET result_status = 'error', error_text = ?, updated_at = ?
-        WHERE batch_id = ?
-        "#,
-    )
-    .bind(message)
-    .bind(now.as_str())
-    .bind(batch.id.as_str())
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        r#"
-        UPDATE translation_requests
-        SET status = 'failed',
-            result_status = 'error',
-            error_text = ?,
-            finished_at = ?,
-            updated_at = ?
-        WHERE work_item_id IN (
-          SELECT work_item_id FROM translation_batch_items WHERE batch_id = ?
-        )
-          AND status IN ('queued', 'running')
-        "#,
-    )
-    .bind(message)
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(batch.id.as_str())
-    .execute(&mut *tx)
-    .await?;
-    let updated = sqlx::query(
-        r#"
-        UPDATE translation_batches
-        SET status = 'failed',
-            error_text = ?,
-            finished_at = ?,
-            runtime_owner_id = NULL,
-            lease_heartbeat_at = NULL,
-            updated_at = ?
-        WHERE id = ? AND status = 'running' AND runtime_owner_id = ?
-        "#,
-    )
-    .bind(message)
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(batch.id.as_str())
-    .bind(state.runtime_owner_id.as_str())
-    .execute(&mut *tx)
-    .await?;
+    .await
+    .map_err(|error| anyhow!("persist translation batch force failure: {error}"))?;
     tx.commit().await?;
-    Ok(updated.rows_affected() > 0)
+    Ok(true)
 }
 
 async fn legacy_batch_claim_is_current(
@@ -12446,6 +12376,20 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("load failed work item status");
+        let active_work_item_id: Option<String> = sqlx::query_scalar(
+            "SELECT active_work_item_id FROM ai_translations WHERE entity_id = ? AND lang = 'zh-CN'",
+        )
+        .bind(item.entity_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load terminal translation projection");
+        let completed_attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM translation_attempt_events WHERE work_item_id = ? AND event_type = 'attempt_completed'",
+        )
+        .bind(batch.items[0].id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load completed translation attempts");
         let request_status: String =
             sqlx::query_scalar("SELECT status FROM translation_requests WHERE id = ?")
                 .bind(created.request_id.as_str())
@@ -12455,6 +12399,8 @@ mod tests {
         assert_eq!(batch_status, "failed");
         assert_eq!(work_status, "failed");
         assert_eq!(request_status, "failed");
+        assert_eq!(active_work_item_id, None);
+        assert_eq!(completed_attempts, 1);
     }
 
     #[tokio::test]

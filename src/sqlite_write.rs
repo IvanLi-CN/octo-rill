@@ -166,6 +166,7 @@ impl SqliteWriteCoordinator {
             let op_started = Instant::now();
             let result = operation(attempt).await;
             let elapsed = op_started.elapsed();
+            let writer_wait_ms = permit.writer_wait_ms();
             drop(permit);
 
             match result {
@@ -178,6 +179,7 @@ impl SqliteWriteCoordinator {
                             priority = priority.as_str(),
                             elapsed_ms,
                             attempt,
+                            writer_wait_ms,
                             threshold_ms = self.slow_threshold_ms,
                             "sqlite write completed slowly"
                         );
@@ -188,6 +190,7 @@ impl SqliteWriteCoordinator {
                             priority = priority.as_str(),
                             elapsed_ms,
                             attempt,
+                            writer_wait_ms,
                             "sqlite write completed"
                         );
                     }
@@ -203,6 +206,7 @@ impl SqliteWriteCoordinator {
                         priority = priority.as_str(),
                         elapsed_ms = elapsed.as_millis(),
                         attempt,
+                        writer_wait_ms,
                         retry_after_ms = delay.as_millis(),
                         error_kind = "sqlite_busy",
                         error_chain = %observability::error_chain_summary(err.as_ref()),
@@ -219,6 +223,7 @@ impl SqliteWriteCoordinator {
                             priority = priority.as_str(),
                             elapsed_ms = elapsed.as_millis(),
                             attempt,
+                            writer_wait_ms,
                             error_kind = "sqlite_busy",
                             error_chain = %observability::error_chain_summary(err.as_ref()),
                             "sqlite write exhausted busy retries"
@@ -572,6 +577,7 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use tokio::sync::oneshot;
     use tracing_subscriber::fmt::MakeWriter;
 
     #[derive(Clone, Default)]
@@ -803,6 +809,7 @@ mod tests {
                 && event.get("operation") == Some(&Value::String("telemetry".to_owned()))
                 && event.get("priority") == Some(&Value::String("foreground".to_owned()))
                 && event.get("attempt").is_some()
+                && event.get("writer_wait_ms").is_some()
                 && event.get("elapsed_ms").is_some()
         }));
     }
@@ -890,6 +897,99 @@ mod tests {
             .await
             .expect("count writer probes");
         assert_eq!(count, 32);
+
+        pool.close().await;
+        let _ = std::fs::remove_file(&database_path);
+        let _ = std::fs::remove_file(database_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(database_path.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn coordinator_retries_against_a_real_sqlite_busy_lock() {
+        let database_path = test_database_path();
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_millis(1));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .expect("create sqlite busy fixture db");
+        sqlx::query("CREATE TABLE busy_probe (value INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("create busy probe table");
+
+        let mut holder = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin external writer transaction");
+        sqlx::query("INSERT INTO busy_probe (value) VALUES (1)")
+            .execute(&mut *holder)
+            .await
+            .expect("seed external writer transaction");
+
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_target(false)
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _default_guard = tracing::subscriber::set_default(subscriber);
+
+        let coordinator = SqliteWriteCoordinator::new();
+        let (started_tx, started_rx) = oneshot::channel();
+        let writer_pool = pool.clone();
+        let writer = tokio::spawn(async move {
+            let mut started_tx = Some(started_tx);
+            coordinator
+                .write("busy_fixture", move |_attempt| {
+                    if let Some(started_tx) = started_tx.take() {
+                        let _ = started_tx.send(());
+                    }
+                    let writer_pool = writer_pool.clone();
+                    async move {
+                        sqlx::query("INSERT INTO busy_probe (value) VALUES (2)")
+                            .execute(&writer_pool)
+                            .await
+                            .map(|_| ())
+                            .map_err(anyhow::Error::from)
+                    }
+                })
+                .await
+        });
+
+        started_rx.await.expect("writer should start first attempt");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        holder.commit().await.expect("release external writer lock");
+        writer
+            .await
+            .expect("join busy fixture writer")
+            .expect("coordinator should retry after sqlite busy");
+
+        let events = buffer.json_events();
+        assert!(events.iter().any(|event| {
+            event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                && event.get("operation") == Some(&Value::String("busy_fixture".to_owned()))
+                && event.get("error_kind") == Some(&Value::String("sqlite_busy".to_owned()))
+                && event.get("attempt").and_then(Value::as_u64) == Some(1)
+                && event.get("writer_wait_ms").is_some()
+        }));
+        assert!(events.iter().any(|event| {
+            event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                && event.get("operation") == Some(&Value::String("busy_fixture".to_owned()))
+                && event.get("attempt").and_then(Value::as_u64) == Some(2)
+                && event.get("elapsed_ms").is_some()
+        }));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM busy_probe")
+            .fetch_one(&pool)
+            .await
+            .expect("count busy probe rows");
+        assert_eq!(count, 2);
 
         pool.close().await;
         let _ = std::fs::remove_file(&database_path);

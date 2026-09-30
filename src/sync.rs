@@ -9830,7 +9830,6 @@ async fn upsert_repo_releases(
     releases: &[GitHubRelease],
     lease: Option<&RepoReleaseWorkItemRow>,
 ) -> Result<RepoReleaseWriteStats> {
-    let now = Utc::now().to_rfc3339();
     state
         .sqlite_writer
         .write("repo_release_upsert", |_| async {
@@ -9839,6 +9838,7 @@ async fn upsert_repo_releases(
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo release snapshot write tx")?;
+            let now = Utc::now().to_rfc3339();
             if let Some(work_item) = lease {
                 let lease_is_current = sqlx::query_scalar::<_, i64>(
                     r#"
@@ -10092,12 +10092,20 @@ async fn upsert_repo_releases(
                 .await
                 .with_context(|| format!("failed to upsert shared release {}", release.tag_name))?;
             }
-            if let Some(work_item) = lease
-                && !repo_release_lease_is_current_tx(&mut tx, state, work_item, now.as_str()).await?
-            {
-                return Err(anyhow!(
-                    "repo release work item lease lost during release snapshot write"
-                ));
+            if let Some(work_item) = lease {
+                let final_lease_now = Utc::now().to_rfc3339();
+                if !repo_release_lease_is_current_tx(
+                    &mut tx,
+                    state,
+                    work_item,
+                    final_lease_now.as_str(),
+                )
+                .await?
+                {
+                    return Err(anyhow!(
+                        "repo release work item lease lost during release snapshot write"
+                    ));
+                }
             }
             tx.commit()
                 .await

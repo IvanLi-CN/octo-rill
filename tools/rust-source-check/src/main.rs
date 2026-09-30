@@ -299,11 +299,12 @@ fn path_name(path: &syn::Path) -> String {
         .join("::")
 }
 
-const SQLITE_WRITE_GUARD_PATHS: [&str; 6] = [
+const SQLITE_WRITE_GUARD_PATHS: [&str; 7] = [
     "src/admin_runtime.rs",
     "src/ai.rs",
     "src/api.rs",
     "src/jobs.rs",
+    "src/runtime.rs",
     "src/sync.rs",
     "src/translations.rs",
 ];
@@ -507,7 +508,22 @@ fn is_direct_pool_write(
     connection_aliases: &BTreeSet<String>,
     transaction_aliases: &BTreeSet<String>,
 ) -> bool {
-    if expression.method == "execute" {
+    if matches!(
+        expression.method.to_string().as_str(),
+        "execute" | "execute_many"
+    ) {
+        return expression.args.last().is_some_and(|argument| {
+            expression_mentions_pool(argument, pool_aliases)
+                || expression_mentions_connection(argument, connection_aliases)
+                || expression_mentions_transaction(argument, transaction_aliases)
+        });
+    }
+
+    if matches!(
+        expression.method.to_string().as_str(),
+        "fetch" | "fetch_all" | "fetch_optional" | "fetch_one" | "fetch_many"
+    ) && expression_is_write_query(&expression.receiver)
+    {
         return expression.args.last().is_some_and(|argument| {
             expression_mentions_pool(argument, pool_aliases)
                 || expression_mentions_connection(argument, connection_aliases)
@@ -518,6 +534,58 @@ fn is_direct_pool_write(
     (expression.method == "begin" && expression_mentions_pool(&expression.receiver, pool_aliases))
         || (expression.method == "begin_with"
             && expression_mentions_pool(&expression.receiver, pool_aliases))
+}
+
+fn expression_is_write_query(expression: &Expr) -> bool {
+    match expression {
+        Expr::Call(call) => {
+            let is_query_constructor = path_name_from_expr(&call.func).is_some_and(|name| {
+                matches!(
+                    name.as_str(),
+                    "query"
+                        | "query_as"
+                        | "query_as_unchecked"
+                        | "query_scalar"
+                        | "query_scalar_unchecked"
+                        | "query_unchecked"
+                )
+            });
+            is_query_constructor
+                && call.args.first().is_some_and(|argument| {
+                    let Expr::Lit(expr_lit) = argument else {
+                        return false;
+                    };
+                    let syn::Lit::Str(sql) = &expr_lit.lit else {
+                        return false;
+                    };
+                    sql.value()
+                        .trim_start()
+                        .split_ascii_whitespace()
+                        .next()
+                        .is_some_and(|keyword| {
+                            matches!(
+                                keyword.to_ascii_uppercase().as_str(),
+                                "INSERT" | "UPDATE" | "DELETE" | "REPLACE"
+                            )
+                        })
+                })
+        }
+        Expr::MethodCall(call) => expression_is_write_query(&call.receiver),
+        Expr::Paren(paren) => expression_is_write_query(&paren.expr),
+        Expr::Group(group) => expression_is_write_query(&group.expr),
+        Expr::Try(try_expression) => expression_is_write_query(&try_expression.expr),
+        _ => false,
+    }
+}
+
+fn path_name_from_expr(expression: &Expr) -> Option<String> {
+    let Expr::Path(path) = expression else {
+        return None;
+    };
+    path.path
+        .segments
+        .last()
+        .map(|segment| segment.ident.to_string())
 }
 
 fn expression_mentions_connection(
@@ -869,6 +937,41 @@ mod tests {
         let visitor = scan_source(Path::new("src/admin_runtime.rs"), source)
             .expect("test source should parse");
         assert_eq!(visitor.sqlite_write_issues.len(), 1);
+    }
+
+    #[test]
+    fn sqlite_write_guard_rejects_write_query_fetches_and_execute_many() {
+        let source = r#"
+            async fn persist(pool: &SqlitePool) {
+                sqlx::query("UPDATE settings SET value = 1")
+                    .execute_many(pool)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE settings SET value = 2 RETURNING id")
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            }
+        "#;
+        let visitor = scan_source(Path::new("src/admin_runtime.rs"), source)
+            .expect("test source should parse");
+        assert_eq!(visitor.sqlite_write_issues.len(), 2);
+    }
+
+    #[test]
+    fn sqlite_write_guard_covers_runtime_module() {
+        let source = r#"
+            async fn persist(pool: &SqlitePool) {
+                sqlx::query("UPDATE runtime_owners SET updated_at = ?")
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+        "#;
+        let visitor =
+            scan_source(Path::new("src/runtime.rs"), source).expect("test source should parse");
+        assert_eq!(visitor.sqlite_write_issues.len(), 1);
+        assert_eq!(visitor.structural_issues.len(), 1);
     }
 
     #[test]

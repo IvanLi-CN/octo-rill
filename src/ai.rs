@@ -3264,6 +3264,7 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
             )
             .await;
             let heartbeat_enabled = persist_result.is_ok();
+            let persist_failed = persist_result.is_err();
             reconcile_admin_override_after_persist(
                 state,
                 log_record.id.as_str(),
@@ -3271,6 +3272,14 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                 "llm call log running update failed",
             )
             .await;
+            if persist_failed {
+                in_flight_guard.release_permit();
+                drop(in_flight_guard);
+                return Err(anyhow::Error::new(LlmCallFailure {
+                    class: LlmFailureClass::Transient,
+                    call_id: Some(log_record.id.clone()),
+                }));
+            }
             if heartbeat_enabled {
                 heartbeat =
                     spawn_llm_call_lease_heartbeat(Arc::new(state.clone()), log_record.id.clone());
@@ -8062,6 +8071,52 @@ mod tests {
             serde_json::from_str(&event.get::<String, _>("payload_json"))
                 .expect("parse event payload");
         assert_eq!(payload["retry_delay_ms"], serde_json::json!(3000));
+    }
+
+    #[tokio::test]
+    async fn update_llm_call_running_rejects_a_recovered_call() {
+        let state = setup_llm_state().await;
+        let log = LlmCallLogRecord {
+            id: "call-running-recovered".to_owned(),
+            source: "tests.llm.recovery".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+            parent_task_type: None,
+            parent_translation_batch_id: None,
+            parent_brief_id: None,
+        };
+
+        insert_llm_call(state.as_ref(), &log, "gpt-test", 512, "prompt", Some("[]"))
+            .await
+            .expect("seed llm call");
+        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 10, "gpt-test")
+            .await
+            .expect("mark llm call running");
+        sqlx::query(
+            "UPDATE llm_calls SET status = 'failed', runtime_owner_id = NULL, lease_heartbeat_at = NULL WHERE id = ?",
+        )
+        .bind(log.id.as_str())
+        .execute(&state.pool)
+        .await
+        .expect("recover llm call");
+
+        let error = update_llm_call_running(state.as_ref(), log.id.as_str(), 2, 20, "gpt-test")
+            .await
+            .expect_err("recovered llm call must not be claimed again");
+        assert!(
+            error
+                .to_string()
+                .contains("no longer available for running update")
+        );
+
+        let running_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM llm_call_events WHERE call_id = ? AND event_type = 'llm.running'",
+        )
+        .bind(log.id.as_str())
+        .fetch_one(&state.pool)
+        .await
+        .expect("count llm running events");
+        assert_eq!(running_events, 1);
     }
 
     #[tokio::test]
