@@ -1,4 +1,11 @@
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -14,6 +21,7 @@ pub const RUNTIME_LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 pub const RUNTIME_LEASE_STALE_AFTER: Duration = Duration::from_secs(90);
 pub const RUNTIME_LEASE_EXPIRED_ERROR: &str = "runtime_lease_expired";
 pub const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const RUNTIME_SETTINGS_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeRecoveryMode {
@@ -132,14 +140,42 @@ pub async fn unregister_runtime_owner(state: &AppState) -> Result<()> {
 }
 
 pub fn spawn_runtime_owner_heartbeat(state: Arc<AppState>) -> LeaseHeartbeat {
+    let settings_sync_in_flight = Arc::new(AtomicBool::new(false));
     spawn_lease_heartbeat(
         "runtime_owner",
         RUNTIME_LEASE_HEARTBEAT_INTERVAL,
         move || {
             let state = state.clone();
+            let settings_sync_in_flight = settings_sync_in_flight.clone();
             async move {
                 touch_runtime_owner_lease(state.as_ref()).await?;
-                admin_runtime::sync_persisted_runtime_settings(state.clone()).await?;
+                if settings_sync_in_flight
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    tokio::spawn(async move {
+                        let result = time::timeout(RUNTIME_SETTINGS_SYNC_TIMEOUT, async {
+                            let _runtime_settings_guard =
+                                admin_runtime::runtime_settings_update_lock().lock().await;
+                            admin_runtime::sync_persisted_runtime_settings(state).await
+                        })
+                        .await;
+                        settings_sync_in_flight.store(false, Ordering::Release);
+                        match result {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(err)) => tracing::warn!(
+                                event = "runtime.settings_sync",
+                                error_chain = %crate::observability::error_chain_summary(err.as_ref()),
+                                "runtime settings reconciliation failed"
+                            ),
+                            Err(_) => tracing::warn!(
+                                event = "runtime.settings_sync",
+                                timeout_ms = RUNTIME_SETTINGS_SYNC_TIMEOUT.as_millis(),
+                                "runtime settings reconciliation timed out"
+                            ),
+                        }
+                    });
+                }
                 Ok(())
             }
         },
