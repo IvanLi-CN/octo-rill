@@ -1425,6 +1425,7 @@ pub async fn restore_persisted_runtime_settings(
             Ok::<_, anyhow::Error>(())
         })
         .await?;
+    // Keep the live schedulers aligned with the transactionally restored snapshot.
     sync_persisted_runtime_settings(state).await?;
     Ok(())
 }
@@ -1798,6 +1799,66 @@ mod tests {
         assert_eq!(
             state.translation_scheduler.runtime_statuses().await.len(),
             7
+        );
+
+        state.translation_scheduler.abort_all().await;
+    }
+
+    #[tokio::test]
+    async fn restore_persisted_runtime_settings_reconciles_live_schedulers() {
+        let pool = setup_pool().await;
+        let config = test_config(1);
+        let state = setup_state(pool.clone(), config.clone());
+        let previous = load_or_seed_runtime_settings(&pool, &config)
+            .await
+            .expect("seed runtime settings");
+
+        update_llm_runtime_settings_and_recovery_config(
+            &pool,
+            &state.sqlite_writer,
+            4,
+            Some(32_768),
+            &["gpt-4.1-mini".to_owned()],
+            true,
+            50,
+        )
+        .await
+        .expect("update runtime settings");
+        sync_persisted_runtime_settings(state.clone())
+            .await
+            .expect("apply updated runtime settings");
+        assert_eq!(state.llm_scheduler.max_concurrency(), 4);
+        assert_eq!(
+            state
+                .llm_scheduler
+                .routing_status(config.ai.as_ref().map(|value| value.model.as_str()))
+                .await
+                .llm_models,
+            vec!["gpt-4.1-mini".to_owned()]
+        );
+
+        restore_persisted_runtime_settings(state.clone(), &previous)
+            .await
+            .expect("restore runtime settings");
+
+        assert_eq!(
+            state.llm_scheduler.max_concurrency(),
+            previous.llm_max_concurrency
+        );
+        assert_eq!(
+            state
+                .llm_scheduler
+                .routing_status(config.ai.as_ref().map(|value| value.model.as_str()))
+                .await
+                .llm_models,
+            previous.llm_models
+        );
+        assert_eq!(
+            state.translation_scheduler.desired_config().await,
+            TranslationRuntimeConfig::new(
+                previous.translation_general_worker_concurrency,
+                previous.translation_dedicated_worker_concurrency,
+            )
         );
 
         state.translation_scheduler.abort_all().await;
