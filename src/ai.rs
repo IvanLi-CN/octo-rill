@@ -282,6 +282,7 @@ impl LlmScheduler {
         self.status_overrides.read().await.clone()
     }
 
+    #[cfg(test)]
     pub(crate) async fn set_admin_override(&self, snapshot: LlmCallAdminOverride) {
         self.status_overrides
             .write()
@@ -338,6 +339,28 @@ impl LlmScheduler {
                 },
             );
         }
+    }
+
+    pub async fn model_health_snapshot(&self) -> Vec<admin_runtime::LlmModelHealth> {
+        let routing = self.routing.read().await;
+        let mut health = routing
+            .health
+            .iter()
+            .map(|(model, value)| admin_runtime::LlmModelHealth {
+                model: model.clone(),
+                relevant_failure_count: i64::from(value.relevant_failure_count),
+                window_started_at: value
+                    .window_started_at
+                    .map(|timestamp| timestamp.to_rfc3339()),
+                cooldown_until: value.cooldown_until.map(|timestamp| timestamp.to_rfc3339()),
+                last_failure_class: value.last_failure_class.clone(),
+                last_failure_at: value
+                    .last_failure_at
+                    .map(|timestamp| timestamp.to_rfc3339()),
+            })
+            .collect::<Vec<_>>();
+        health.sort_by(|left, right| left.model.cmp(&right.model));
+        health
     }
 
     pub async fn routing_status(
@@ -2184,9 +2207,18 @@ async fn insert_llm_call(
     let now = chrono::Utc::now().to_rfc3339();
     let prompt_text = redact_llm_diagnostic_text(prompt_text);
     let input_messages_json = input_messages_json.map(redact_llm_diagnostic_text);
+    let event_payload = serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+    });
     state
         .sqlite_writer
         .write("llm_call_insert", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin llm_call insert transaction failed")?;
             sqlx::query(
                 r#"
                 INSERT INTO llm_calls (
@@ -2220,35 +2252,41 @@ async fn insert_llm_call(
             .bind(input_messages_json.as_deref())
             .bind(now.as_str())
             .bind(now.as_str())
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await
             .context("insert llm_call failed")?;
+            let inserted = insert_llm_call_event_in_transaction(
+                &mut tx,
+                log.id.as_str(),
+                "llm.queued",
+                "queued",
+                event_payload.clone(),
+                now.as_str(),
+            )
+            .await
+            .context("append llm_call queued event failed")?;
+            if inserted.rows_affected() == 0 {
+                return Err(anyhow!(
+                    "insert llm_call queued event failed: call not found"
+                ));
+            }
+            tx.commit()
+                .await
+                .context("commit llm_call insert transaction failed")?;
             Ok::<_, anyhow::Error>(())
         })
         .await?;
-    append_llm_call_event(
-        state,
-        log.id.as_str(),
-        "llm.queued",
-        "queued",
-        serde_json::json!({
-            "model": model,
-            "max_tokens": max_tokens,
-        }),
-    )
-    .await
-    .context("append llm_call queued event failed")?;
     Ok(())
 }
 
-async fn append_llm_call_event(
-    state: &AppState,
+async fn insert_llm_call_event_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     call_id: &str,
     event_type: &str,
     status: &str,
     payload: Value,
-) -> Result<()> {
-    let now = chrono::Utc::now().to_rfc3339();
+    created_at: &str,
+) -> Result<sqlx::sqlite::SqliteQueryResult> {
     let failure_class = payload.get("failure_class").and_then(Value::as_str);
     let model = payload.get("model").and_then(Value::as_str);
     let attempt = payload.get("attempt").and_then(Value::as_i64);
@@ -2257,73 +2295,111 @@ async fn append_llm_call_event(
     let to_model = payload.get("to_model").and_then(Value::as_str);
     let fallback_count = payload.get("fallback_count").and_then(Value::as_i64);
     let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned());
+    sqlx::query(
+        r#"
+            INSERT INTO llm_call_events (
+              id,
+              call_id,
+              event_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              failure_class,
+              model,
+              attempt,
+              retry_after_ms,
+              from_model,
+              to_model,
+              fallback_count,
+              payload_json,
+              created_at
+            )
+            SELECT
+              ?,
+              id,
+              ?,
+              ?,
+              source,
+              requested_by,
+              parent_task_id,
+              ?,
+              ?,
+              ?,
+              ?,
+              ?,
+              ?,
+              ?,
+              ?,
+              ?
+            FROM llm_calls
+            WHERE id = ?
+            LIMIT 1
+            "#,
+    )
+    .bind(local_id::generate_local_id())
+    .bind(event_type)
+    .bind(status)
+    .bind(failure_class)
+    .bind(model)
+    .bind(attempt)
+    .bind(retry_after_ms)
+    .bind(from_model)
+    .bind(to_model)
+    .bind(fallback_count)
+    .bind(payload_json.as_str())
+    .bind(created_at)
+    .bind(call_id)
+    .execute(&mut **tx)
+    .await
+    .context("insert llm_call event failed")
+}
+
+async fn append_llm_call_event_if_owned(
+    state: &AppState,
+    call_id: &str,
+    event_type: &str,
+    status: &str,
+    payload: Value,
+) -> Result<bool> {
+    let now = chrono::Utc::now().to_rfc3339();
     let inserted = state
         .sqlite_writer
         .write("llm_call_event_insert", |_| async {
-            sqlx::query(
-                r#"
-                    INSERT INTO llm_call_events (
-                      id,
-                      call_id,
-                      event_type,
-                      status,
-                      source,
-                      requested_by,
-                      parent_task_id,
-                      failure_class,
-                      model,
-                      attempt,
-                      retry_after_ms,
-                      from_model,
-                      to_model,
-                      fallback_count,
-                      payload_json,
-                      created_at
-                    )
-                    SELECT
-                      ?,
-                      id,
-                      ?,
-                      ?,
-                      source,
-                      requested_by,
-                      parent_task_id,
-                      ?,
-                      ?,
-                      ?,
-                      ?,
-                      ?,
-                      ?,
-                      ?,
-                      ?,
-                      ?
-                    FROM llm_calls
-                    WHERE id = ?
-                    LIMIT 1
-                    "#,
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin llm_call event transaction failed")?;
+            let owned = sqlx::query_scalar::<_, i64>(
+                "SELECT 1 FROM llm_calls WHERE id = ? AND status = 'running' AND runtime_owner_id = ? LIMIT 1",
             )
-            .bind(local_id::generate_local_id())
-            .bind(event_type)
-            .bind(status)
-            .bind(failure_class)
-            .bind(model)
-            .bind(attempt)
-            .bind(retry_after_ms)
-            .bind(from_model)
-            .bind(to_model)
-            .bind(fallback_count)
-            .bind(payload_json.as_str())
-            .bind(now.as_str())
             .bind(call_id)
-            .execute(&state.pool)
+            .bind(state.runtime_owner_id.as_str())
+            .fetch_optional(&mut *tx)
             .await
-            .context("insert llm_call event failed")
+            .context("load llm_call ownership for event failed")?
+            .is_some();
+            if !owned {
+                tx.rollback().await.ok();
+                return Ok::<_, anyhow::Error>(false);
+            }
+            let inserted = insert_llm_call_event_in_transaction(
+                &mut tx,
+                call_id,
+                event_type,
+                status,
+                payload.clone(),
+                now.as_str(),
+            )
+            .await?;
+            tx.commit()
+                .await
+                .context("commit llm_call event transaction failed")?;
+            Ok::<_, anyhow::Error>(inserted.rows_affected() > 0)
         })
         .await?;
-    if inserted.rows_affected() == 0 {
-        return Err(anyhow!("insert llm_call event failed: call not found"));
-    }
-    Ok(())
+    Ok(inserted)
 }
 
 async fn update_llm_call_running(
@@ -2334,10 +2410,21 @@ async fn update_llm_call_running(
     model: &str,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
+    let event_payload = serde_json::json!({
+        "model": model,
+        "attempt": attempt_count,
+        "attempt_count": attempt_count,
+        "scheduler_wait_ms": scheduler_wait_ms,
+    });
     state
         .sqlite_writer
         .write("llm_call_running", |_| async {
-            sqlx::query(
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin llm_call running transaction failed")?;
+            let updated = sqlx::query(
                 r#"
                 UPDATE llm_calls
                 SET status = 'running',
@@ -2352,6 +2439,8 @@ async fn update_llm_call_running(
                     lease_heartbeat_at = ?,
                     updated_at = ?
                 WHERE id = ?
+                  AND status IN ('queued', 'running')
+                  AND (runtime_owner_id IS NULL OR runtime_owner_id = ?)
                 "#,
             )
             .bind(model)
@@ -2362,26 +2451,37 @@ async fn update_llm_call_running(
             .bind(now.as_str())
             .bind(now.as_str())
             .bind(call_id)
-            .execute(&state.pool)
+            .bind(state.runtime_owner_id.as_str())
+            .execute(&mut *tx)
             .await
             .context("update llm_call running failed")?;
+            if updated.rows_affected() == 0 {
+                tx.rollback().await.ok();
+                return Err(anyhow!(
+                    "llm_call is no longer available for running update"
+                ));
+            }
+            let inserted = insert_llm_call_event_in_transaction(
+                &mut tx,
+                call_id,
+                "llm.running",
+                "running",
+                event_payload.clone(),
+                now.as_str(),
+            )
+            .await
+            .context("append llm_call running event failed")?;
+            if inserted.rows_affected() == 0 {
+                return Err(anyhow!(
+                    "insert llm_call running event failed: call not found"
+                ));
+            }
+            tx.commit()
+                .await
+                .context("commit llm_call running transaction failed")?;
             Ok::<_, anyhow::Error>(())
         })
         .await?;
-    append_llm_call_event(
-        state,
-        call_id,
-        "llm.running",
-        "running",
-        serde_json::json!({
-            "model": model,
-            "attempt": attempt_count,
-            "attempt_count": attempt_count,
-            "scheduler_wait_ms": scheduler_wait_ms,
-        }),
-    )
-    .await
-    .context("append llm_call running event failed")?;
     Ok(())
 }
 
@@ -2395,6 +2495,7 @@ async fn requeue_llm_call_for_retry(
     next_model: &str,
     failure_class: Option<&str>,
     fallback_count: i64,
+    route_switch: Option<(&str, &str)>,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     let retry_scheduled_at = (!retry_delay.is_zero()).then(|| {
@@ -2402,10 +2503,25 @@ async fn requeue_llm_call_for_retry(
             + chrono::Duration::from_std(retry_delay).unwrap_or_else(|_| chrono::Duration::zero()))
         .to_rfc3339()
     });
+    let event_payload = serde_json::json!({
+        "model": next_model,
+        "failure_class": failure_class,
+        "attempt": attempt_count,
+        "attempt_count": attempt_count,
+        "scheduler_wait_ms": scheduler_wait_ms,
+        "retry_delay_ms": i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
+        "retry_after_ms": i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
+        "fallback_count": fallback_count,
+    });
     state
         .sqlite_writer
         .write("llm_call_requeue", |_| async {
-            sqlx::query(
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin llm_call requeue transaction failed")?;
+            let updated = sqlx::query(
                 r#"
                 UPDATE llm_calls
                 SET status = 'queued',
@@ -2420,6 +2536,8 @@ async fn requeue_llm_call_for_retry(
                     retry_scheduled_at = ?,
                     updated_at = ?
                 WHERE id = ?
+                  AND status = 'running'
+                  AND runtime_owner_id = ?
                 "#,
             )
             .bind(next_model)
@@ -2430,30 +2548,59 @@ async fn requeue_llm_call_for_retry(
             .bind(retry_scheduled_at.as_deref())
             .bind(now.as_str())
             .bind(call_id)
-            .execute(&state.pool)
+            .bind(state.runtime_owner_id.as_str())
+            .execute(&mut *tx)
             .await
             .context("requeue llm_call failed")?;
+            if updated.rows_affected() == 0 {
+                tx.rollback().await.ok();
+                return Err(anyhow!("llm_call is no longer owned for retry requeue"));
+            }
+            if let Some((from_model, to_model)) = route_switch {
+                let route_event = insert_llm_call_event_in_transaction(
+                    &mut tx,
+                    call_id,
+                    "llm.route_switched",
+                    "queued",
+                    serde_json::json!({
+                        "failure_class": failure_class,
+                        "from_model": from_model,
+                        "to_model": to_model,
+                        "model": to_model,
+                        "attempt": attempt_count,
+                        "fallback_count": fallback_count,
+                    }),
+                    now.as_str(),
+                )
+                .await
+                .context("append llm route switch event failed")?;
+                if route_event.rows_affected() == 0 {
+                    return Err(anyhow!(
+                        "insert llm route switch event failed: call not found"
+                    ));
+                }
+            }
+            let inserted = insert_llm_call_event_in_transaction(
+                &mut tx,
+                call_id,
+                "llm.retry_queued",
+                "queued",
+                event_payload.clone(),
+                now.as_str(),
+            )
+            .await
+            .context("append llm_call retry queued event failed")?;
+            if inserted.rows_affected() == 0 {
+                return Err(anyhow!(
+                    "insert llm_call retry queued event failed: call not found"
+                ));
+            }
+            tx.commit()
+                .await
+                .context("commit llm_call requeue transaction failed")?;
             Ok::<_, anyhow::Error>(())
         })
         .await?;
-    append_llm_call_event(
-        state,
-        call_id,
-        "llm.retry_queued",
-        "queued",
-        serde_json::json!({
-            "model": next_model,
-            "failure_class": failure_class,
-            "attempt": attempt_count,
-            "attempt_count": attempt_count,
-            "scheduler_wait_ms": scheduler_wait_ms,
-            "retry_delay_ms": i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
-            "retry_after_ms": i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
-            "fallback_count": fallback_count,
-        }),
-    )
-    .await
-    .context("append llm_call retry queued event failed")?;
     Ok(())
 }
 
@@ -2469,7 +2616,9 @@ async fn persist_model_failure_health(
     else {
         return;
     };
-    if let Err(err) = admin_runtime::upsert_llm_model_health(&state.pool, &health).await {
+    if let Err(err) =
+        admin_runtime::upsert_llm_model_health(&state.pool, &state.sqlite_writer, &health).await
+    {
         tracing::warn!(
             event = "sqlite.write",
             operation = "ai.llm_model_health_upsert",
@@ -2491,7 +2640,7 @@ async fn append_llm_attempt_failure_event(
     retry_after: Option<Duration>,
     fallback_count: i64,
 ) {
-    if let Err(err) = append_llm_call_event(
+    match append_llm_call_event_if_owned(
         state,
         call_id,
         "llm.attempt_failed",
@@ -2506,14 +2655,15 @@ async fn append_llm_attempt_failure_event(
     )
     .await
     {
-        tracing::warn!(
+        Ok(true) | Ok(false) => {}
+        Err(err) => tracing::warn!(
             event = "sqlite.write",
             operation = "ai.llm_call_attempt_event",
             call_id,
             error_kind = "persist_failed",
             error_chain = %observability::error_chain_summary(err.as_ref()),
             "llm attempt audit event persistence failed"
-        );
+        ),
     }
 }
 
@@ -2523,10 +2673,39 @@ async fn finalize_llm_call(
     update: FinalizeLlmCallUpdate<'_>,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
+    let event_type = if update.status == "succeeded" {
+        "llm.succeeded"
+    } else {
+        "llm.failed"
+    };
+    let event_payload = serde_json::json!({
+        "attempt_count": update.attempt_count,
+        "scheduler_wait_ms": update.scheduler_wait_ms,
+        "first_token_wait_ms": update.first_token_wait_ms,
+        "duration_ms": update.duration_ms,
+        "input_tokens": update.input_tokens,
+        "output_tokens": update.output_tokens,
+        "finish_reason": update.finish_reason,
+        "provider_request_id": update.provider_request_id,
+        "provider_http_status": update.provider_http_status,
+        "cached_input_tokens": update.cached_input_tokens,
+        "total_tokens": update.total_tokens,
+        "has_output": update.response_text.is_some(),
+        "failure_class": update.failure_class,
+        "final_model": update.final_model,
+        "fallback_count": update.fallback_count,
+        "retry_scheduled_at": update.retry_scheduled_at,
+        "recovery_attempt_count": update.recovery_attempt_count,
+    });
     state
         .sqlite_writer
         .write("llm_call_finalize", |_| async {
-            sqlx::query(
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin llm_call finalize transaction failed")?;
+            let updated = sqlx::query(
                 r#"
                 UPDATE llm_calls
                 SET status = ?,
@@ -2554,6 +2733,8 @@ async fn finalize_llm_call(
                     lease_heartbeat_at = NULL,
                     updated_at = ?
                 WHERE id = ?
+                  AND status = 'running'
+                  AND runtime_owner_id = ?
                 "#,
             )
             .bind(update.status)
@@ -2579,43 +2760,35 @@ async fn finalize_llm_call(
             .bind(now.as_str())
             .bind(now.as_str())
             .bind(call_id)
-            .execute(&state.pool)
+            .bind(state.runtime_owner_id.as_str())
+            .execute(&mut *tx)
             .await
             .context("finalize llm_call failed")?;
+            if updated.rows_affected() == 0 {
+                tx.rollback().await.ok();
+                return Err(anyhow!("llm_call is no longer owned for finalization"));
+            }
+            let inserted = insert_llm_call_event_in_transaction(
+                &mut tx,
+                call_id,
+                event_type,
+                update.status,
+                event_payload.clone(),
+                now.as_str(),
+            )
+            .await
+            .context("append llm_call finalized event failed")?;
+            if inserted.rows_affected() == 0 {
+                return Err(anyhow!(
+                    "insert llm_call finalized event failed: call not found"
+                ));
+            }
+            tx.commit()
+                .await
+                .context("commit llm_call finalize transaction failed")?;
             Ok::<_, anyhow::Error>(())
         })
         .await?;
-    append_llm_call_event(
-        state,
-        call_id,
-        if update.status == "succeeded" {
-            "llm.succeeded"
-        } else {
-            "llm.failed"
-        },
-        update.status,
-        serde_json::json!({
-            "attempt_count": update.attempt_count,
-            "scheduler_wait_ms": update.scheduler_wait_ms,
-            "first_token_wait_ms": update.first_token_wait_ms,
-            "duration_ms": update.duration_ms,
-            "input_tokens": update.input_tokens,
-            "output_tokens": update.output_tokens,
-            "finish_reason": update.finish_reason,
-            "provider_request_id": update.provider_request_id,
-            "provider_http_status": update.provider_http_status,
-            "cached_input_tokens": update.cached_input_tokens,
-            "total_tokens": update.total_tokens,
-            "has_output": update.response_text.is_some(),
-            "failure_class": update.failure_class,
-            "final_model": update.final_model,
-            "fallback_count": update.fallback_count,
-            "retry_scheduled_at": update.retry_scheduled_at,
-            "recovery_attempt_count": update.recovery_attempt_count,
-        }),
-    )
-    .await
-    .context("append llm_call finalized event failed")?;
     Ok(())
 }
 
@@ -2638,6 +2811,44 @@ async fn reconcile_admin_override_after_persist(
                 "llm call persist update failed"
             );
         }
+    }
+}
+
+async fn set_llm_admin_override_if_owned(state: &AppState, snapshot: LlmCallAdminOverride) {
+    let call_id = snapshot.id.clone();
+    let mut overrides = state.llm_scheduler.status_overrides.write().await;
+    let owned = match state
+        .sqlite_writer
+        .write("llm_admin_override_guard", |_| async {
+                Ok::<_, anyhow::Error>(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT 1 FROM llm_calls WHERE id = ? AND ((status = 'running' AND runtime_owner_id = ?) OR (status = 'queued' AND runtime_owner_id IS NULL)) LIMIT 1",
+                )
+                .bind(call_id.as_str())
+                .bind(state.runtime_owner_id.as_str())
+                .fetch_optional(&state.pool)
+                .await
+                .context("load llm_call ownership for admin override failed")?
+                .is_some(),
+            )
+        })
+        .await
+    {
+        Ok(owned) => owned,
+        Err(error) => {
+            tracing::warn!(
+                event = "sqlite.write",
+                operation = "ai.llm_admin_override_guard",
+                call_id = call_id.as_str(),
+                error_kind = "persist_failed",
+                error_chain = %observability::error_chain_summary(error.as_ref()),
+                "llm admin override ownership check failed"
+            );
+            return;
+        }
+    };
+    if owned {
+        overrides.insert(call_id, snapshot);
     }
 }
 
@@ -3014,9 +3225,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
 
         if llm_call_persisted {
             let running_updated_at = chrono::Utc::now().to_rfc3339();
-            state
-                .llm_scheduler
-                .set_admin_override(LlmCallAdminOverride {
+            set_llm_admin_override_if_owned(
+                state,
+                LlmCallAdminOverride {
                     id: log_record.id.clone(),
                     status: "running".to_owned(),
                     attempt_count,
@@ -3041,8 +3252,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                     started_at: started_at_timestamp.clone(),
                     finished_at: None,
                     updated_at: running_updated_at,
-                })
-                .await;
+                },
+            )
+            .await;
             let persist_result = update_llm_call_running(
                 state,
                 log_record.id.as_str(),
@@ -3052,6 +3264,7 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
             )
             .await;
             let heartbeat_enabled = persist_result.is_ok();
+            let persist_failed = persist_result.is_err();
             reconcile_admin_override_after_persist(
                 state,
                 log_record.id.as_str(),
@@ -3059,6 +3272,14 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                 "llm call log running update failed",
             )
             .await;
+            if persist_failed {
+                in_flight_guard.release_permit();
+                drop(in_flight_guard);
+                return Err(anyhow::Error::new(LlmCallFailure {
+                    class: LlmFailureClass::Transient,
+                    call_id: Some(log_record.id.clone()),
+                }));
+            }
             if heartbeat_enabled {
                 heartbeat =
                     spawn_llm_call_lease_heartbeat(Arc::new(state.clone()), log_record.id.clone());
@@ -3140,9 +3361,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                 });
                 let finished_at = chrono::Utc::now().to_rfc3339();
                 if llm_call_persisted {
-                    state
-                        .llm_scheduler
-                        .set_admin_override(LlmCallAdminOverride {
+                    set_llm_admin_override_if_owned(
+                        state,
+                        LlmCallAdminOverride {
                             id: log_record.id.clone(),
                             status: "succeeded".to_owned(),
                             attempt_count,
@@ -3167,8 +3388,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                             started_at: started_at_timestamp.clone(),
                             finished_at: Some(finished_at.clone()),
                             updated_at: finished_at.clone(),
-                        })
-                        .await;
+                        },
+                    )
+                    .await;
                 }
                 in_flight_guard.release_permit();
                 drop(in_flight_guard);
@@ -3255,9 +3477,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                     let retry_delay = next_retry_delay(candidate_attempts, retry_after);
                     let requeued_at = chrono::Utc::now().to_rfc3339();
                     if llm_call_persisted {
-                        state
-                            .llm_scheduler
-                            .set_admin_override(LlmCallAdminOverride {
+                        set_llm_admin_override_if_owned(
+                            state,
+                            LlmCallAdminOverride {
                                 id: log_record.id.clone(),
                                 status: "queued".to_owned(),
                                 attempt_count,
@@ -3287,8 +3509,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                                 started_at: started_at_timestamp.clone(),
                                 finished_at: None,
                                 updated_at: requeued_at,
-                            })
-                            .await;
+                            },
+                        )
+                        .await;
                     }
                     in_flight_guard.release_permit();
                     drop(in_flight_guard);
@@ -3305,6 +3528,7 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                                 model_for_call.as_str(),
                                 Some(failure_class.as_str()),
                                 fallback_count,
+                                None,
                             )
                             .await,
                             "llm call requeue update failed",
@@ -3343,9 +3567,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                     fallback_count = fallback_count.saturating_add(1);
                     let requeued_at = chrono::Utc::now().to_rfc3339();
                     if llm_call_persisted {
-                        state
-                            .llm_scheduler
-                            .set_admin_override(LlmCallAdminOverride {
+                        set_llm_admin_override_if_owned(
+                            state,
+                            LlmCallAdminOverride {
                                 id: log_record.id.clone(),
                                 status: "queued".to_owned(),
                                 attempt_count,
@@ -3370,33 +3594,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                                 started_at: started_at_timestamp.clone(),
                                 finished_at: None,
                                 updated_at: requeued_at,
-                            })
-                            .await;
-                    }
-                    if let Err(err) = append_llm_call_event(
-                        state,
-                        log_record.id.as_str(),
-                        "llm.route_switched",
-                        "queued",
-                        serde_json::json!({
-                            "failure_class": failure_class.as_str(),
-                            "from_model": previous_model,
-                            "to_model": next_model,
-                            "model": next_model,
-                            "attempt": attempt_count,
-                            "fallback_count": fallback_count,
-                        }),
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            event = "sqlite.write",
-                            operation = "ai.llm_route_switch_event",
-                            call_id = log_record.id.as_str(),
-                            error_kind = "persist_failed",
-                            error_chain = %observability::error_chain_summary(err.as_ref()),
-                            "llm route switch audit event persistence failed"
-                        );
+                            },
+                        )
+                        .await;
                     }
                     in_flight_guard.release_permit();
                     drop(in_flight_guard);
@@ -3413,6 +3613,7 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                                 next_model.as_str(),
                                 Some(failure_class.as_str()),
                                 fallback_count,
+                                Some((previous_model.as_str(), next_model.as_str())),
                             )
                             .await,
                             "llm route switch persistence failed",
@@ -3429,9 +3630,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                 let safe_message = failure_class.safe_message();
                 let finished_at = chrono::Utc::now().to_rfc3339();
                 if llm_call_persisted {
-                    state
-                        .llm_scheduler
-                        .set_admin_override(LlmCallAdminOverride {
+                    set_llm_admin_override_if_owned(
+                        state,
+                        LlmCallAdminOverride {
                             id: log_record.id.clone(),
                             status: "failed".to_owned(),
                             attempt_count,
@@ -3456,8 +3657,9 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                             started_at: started_at_timestamp.clone(),
                             finished_at: Some(finished_at.clone()),
                             updated_at: finished_at.clone(),
-                        })
-                        .await;
+                        },
+                    )
+                    .await;
                 }
                 in_flight_guard.release_permit();
                 drop(in_flight_guard);
@@ -3575,20 +3777,39 @@ async fn heartbeat_llm_call_lease(state: &AppState, call_id: &str) -> Result<()>
     Ok(())
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct RecoverableLlmCallRow {
+    id: String,
+    runtime_owner_id: Option<String>,
+    lease_heartbeat_at: Option<String>,
+}
+
 async fn recover_llm_call_with_message(
     state: &AppState,
     call_id: &str,
     message: &str,
     previous_runtime_owner_id: Option<&str>,
     previous_lease_heartbeat_at: Option<&str>,
-    event_type: &str,
-) -> Result<()> {
+    recovery_mode: Option<runtime::RuntimeRecoveryMode>,
+    recovery_cutoff: Option<&str>,
+) -> Result<bool> {
     let now = chrono::Utc::now().to_rfc3339();
-    state
+    let event_payload = serde_json::json!({
+        "error_kind": "runtime_lease_expired",
+        "previous_runtime_owner_id": previous_runtime_owner_id,
+        "previous_lease_heartbeat_at": previous_lease_heartbeat_at,
+    });
+    let updated = state
         .sqlite_writer
         .write("llm_call_recover", |_| async {
-            sqlx::query(
-                r#"
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin llm_call recovery transaction failed")?;
+            let updated = match recovery_mode {
+                Some(runtime::RuntimeRecoveryMode::Startup) => sqlx::query(
+                    r#"
                 UPDATE llm_calls
                 SET status = 'failed',
                     error_text = ?,
@@ -3598,44 +3819,130 @@ async fn recover_llm_call_with_message(
                     updated_at = ?
                 WHERE id = ?
                   AND status IN ('queued', 'running')
+                  AND runtime_owner_id IS ?
+                  AND lease_heartbeat_at IS ?
+                  AND (
+                    runtime_owner_id IS NULL
+                    OR lease_heartbeat_at IS NULL
+                    OR julianday(lease_heartbeat_at) <= julianday(?)
+                    OR (
+                      runtime_owner_id != ?
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM runtime_owners
+                        WHERE runtime_owner_id = llm_calls.runtime_owner_id
+                          AND julianday(lease_heartbeat_at) > julianday(?)
+                      )
+                    )
+                  )
                 "#,
+                )
+                .bind(message)
+                .bind(now.as_str())
+                .bind(now.as_str())
+                .bind(call_id)
+                .bind(previous_runtime_owner_id)
+                .bind(previous_lease_heartbeat_at)
+                .bind(recovery_cutoff)
+                .bind(state.runtime_owner_id.as_str())
+                .bind(recovery_cutoff)
+                .execute(&mut *tx)
+                .await
+                .context("recover llm_call failed")?,
+                Some(runtime::RuntimeRecoveryMode::Sweep) => sqlx::query(
+                    r#"
+                UPDATE llm_calls
+                SET status = 'failed',
+                    error_text = ?,
+                    finished_at = ?,
+                    runtime_owner_id = NULL,
+                    lease_heartbeat_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN ('queued', 'running')
+                  AND runtime_owner_id IS ?
+                  AND lease_heartbeat_at IS ?
+                  AND (
+                    runtime_owner_id IS NULL
+                    OR lease_heartbeat_at IS NULL
+                    OR julianday(lease_heartbeat_at) <= julianday(?)
+                  )
+                "#,
+                )
+                .bind(message)
+                .bind(now.as_str())
+                .bind(now.as_str())
+                .bind(call_id)
+                .bind(previous_runtime_owner_id)
+                .bind(previous_lease_heartbeat_at)
+                .bind(recovery_cutoff)
+                .execute(&mut *tx)
+                .await
+                .context("recover llm_call failed")?,
+                None => sqlx::query(
+                    r#"
+                UPDATE llm_calls
+                SET status = 'failed',
+                    error_text = ?,
+                    finished_at = ?,
+                    runtime_owner_id = NULL,
+                    lease_heartbeat_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN ('queued', 'running')
+                  AND runtime_owner_id IS ?
+                  AND lease_heartbeat_at IS ?
+                "#,
+                )
+                .bind(message)
+                .bind(now.as_str())
+                .bind(now.as_str())
+                .bind(call_id)
+                .bind(previous_runtime_owner_id)
+                .bind(previous_lease_heartbeat_at)
+                .execute(&mut *tx)
+                .await
+                .context("recover llm_call failed")?,
+            };
+            if updated.rows_affected() == 0 {
+                tx.rollback().await.ok();
+                return Ok(false);
+            }
+            let inserted = insert_llm_call_event_in_transaction(
+                &mut tx,
+                call_id,
+                "llm.recovered_failed",
+                "failed",
+                event_payload.clone(),
+                now.as_str(),
             )
-            .bind(message)
-            .bind(now.as_str())
-            .bind(now.as_str())
-            .bind(call_id)
-            .execute(&state.pool)
             .await
-            .context("recover llm_call failed")?;
-            Ok::<_, anyhow::Error>(())
+            .context("append llm_call recovery event failed")?;
+            if inserted.rows_affected() == 0 {
+                return Err(anyhow!(
+                    "insert llm_call recovery event failed: call not found"
+                ));
+            }
+            tx.commit()
+                .await
+                .context("commit llm_call recovery transaction failed")?;
+            Ok::<_, anyhow::Error>(true)
         })
         .await?;
-    append_llm_call_event(
-        state,
-        call_id,
-        event_type,
-        "failed",
-        serde_json::json!({
-            "error_kind": "runtime_lease_expired",
-            "previous_runtime_owner_id": previous_runtime_owner_id,
-            "previous_lease_heartbeat_at": previous_lease_heartbeat_at,
-        }),
-    )
-    .await
-    .context("append llm_call recovery event failed")?;
-    Ok(())
+    if updated {
+        state.llm_scheduler.clear_admin_override(call_id).await;
+    }
+    Ok(updated)
 }
 
 pub async fn recover_linked_llm_calls_for_batch(
     state: &AppState,
     batch_id: &str,
     message: &str,
-    previous_runtime_owner_id: Option<&str>,
-    previous_lease_heartbeat_at: Option<&str>,
 ) -> Result<()> {
-    let call_ids = sqlx::query_scalar::<_, String>(
+    let calls = sqlx::query_as::<_, RecoverableLlmCallRow>(
         r#"
-        SELECT id
+        SELECT id, runtime_owner_id, lease_heartbeat_at
         FROM llm_calls
         WHERE parent_translation_batch_id = ?
           AND status IN ('queued', 'running')
@@ -3647,14 +3954,15 @@ pub async fn recover_linked_llm_calls_for_batch(
     .await
     .context("load linked llm calls for recovery failed")?;
 
-    for call_id in call_ids {
+    for call in calls {
         recover_llm_call_with_message(
             state,
-            call_id.as_str(),
+            call.id.as_str(),
             message,
-            previous_runtime_owner_id,
-            previous_lease_heartbeat_at,
-            "llm.recovered_failed",
+            call.runtime_owner_id.as_deref(),
+            call.lease_heartbeat_at.as_deref(),
+            None,
+            None,
         )
         .await?;
     }
@@ -3669,17 +3977,10 @@ async fn recover_runtime_state_with_mode(
     state: &AppState,
     mode: runtime::RuntimeRecoveryMode,
 ) -> Result<()> {
-    #[derive(Debug, sqlx::FromRow)]
-    struct StaleLlmCallRow {
-        id: String,
-        runtime_owner_id: Option<String>,
-        lease_heartbeat_at: Option<String>,
-    }
-
     let cutoff = runtime::stale_cutoff_timestamp(chrono::Utc::now());
     let stale_calls = match mode {
         runtime::RuntimeRecoveryMode::Startup => {
-            sqlx::query_as::<_, StaleLlmCallRow>(
+            sqlx::query_as::<_, RecoverableLlmCallRow>(
                 r#"
                 SELECT id, runtime_owner_id, lease_heartbeat_at
                 FROM llm_calls
@@ -3709,7 +4010,7 @@ async fn recover_runtime_state_with_mode(
             .await
         }
         runtime::RuntimeRecoveryMode::Sweep => {
-            sqlx::query_as::<_, StaleLlmCallRow>(
+            sqlx::query_as::<_, RecoverableLlmCallRow>(
                 r#"
                 SELECT id, runtime_owner_id, lease_heartbeat_at
                 FROM llm_calls
@@ -3737,7 +4038,8 @@ async fn recover_runtime_state_with_mode(
             runtime::RUNTIME_LEASE_EXPIRED_ERROR,
             call.runtime_owner_id.as_deref(),
             call.lease_heartbeat_at.as_deref(),
-            "llm.recovered_failed",
+            Some(mode),
+            Some(cutoff.as_str()),
         )
         .await?;
     }
@@ -5761,9 +6063,9 @@ async fn upsert_daily_brief_snapshot(
     )
     .await?
     {
-        let mut tx = state
-            .pool
-            .begin()
+        let (_sqlite_write, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "ai_brief_snapshot_refresh")
             .await
             .context("failed to begin refresh brief tx")?;
         overwrite_brief_snapshot(
@@ -5795,9 +6097,9 @@ async fn upsert_daily_brief_snapshot(
         });
     }
 
-    let mut tx = state
-        .pool
-        .begin()
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "ai_brief_snapshot_upsert")
         .await
         .context("failed to begin brief tx")?;
     let inserted = sqlx::query_as::<_, UpsertedBriefRow>(
@@ -6455,9 +6757,9 @@ async fn refresh_existing_brief_snapshot(
     )
     .await?;
     let now = chrono::Utc::now().to_rfc3339();
-    let mut tx = state
-        .pool
-        .begin()
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "ai_brief_targeted_refresh")
         .await
         .context("failed to begin targeted brief refresh tx")?;
     overwrite_brief_snapshot(&mut tx, brief_id, &window, &built, generation_source, &now)
@@ -6959,9 +7261,9 @@ pub async fn recompute_legacy_brief_snapshot(
             .await?;
     let built = build_brief_content_from_digests(state, &legacy.user_id, releases, social).await?;
 
-    let mut tx = state
-        .pool
-        .begin()
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "ai_brief_legacy_recompute")
         .await
         .context("failed to begin legacy brief tx")?;
     let existing = sqlx::query_as::<_, ExistingBriefRow>(
@@ -7720,6 +8022,7 @@ mod tests {
             "gpt-4o-mini",
             Some("transient"),
             0,
+            None,
         )
         .await
         .expect("requeue llm call");
@@ -7768,6 +8071,52 @@ mod tests {
             serde_json::from_str(&event.get::<String, _>("payload_json"))
                 .expect("parse event payload");
         assert_eq!(payload["retry_delay_ms"], serde_json::json!(3000));
+    }
+
+    #[tokio::test]
+    async fn update_llm_call_running_rejects_a_recovered_call() {
+        let state = setup_llm_state().await;
+        let log = LlmCallLogRecord {
+            id: "call-running-recovered".to_owned(),
+            source: "tests.llm.recovery".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+            parent_task_type: None,
+            parent_translation_batch_id: None,
+            parent_brief_id: None,
+        };
+
+        insert_llm_call(state.as_ref(), &log, "gpt-test", 512, "prompt", Some("[]"))
+            .await
+            .expect("seed llm call");
+        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 10, "gpt-test")
+            .await
+            .expect("mark llm call running");
+        sqlx::query(
+            "UPDATE llm_calls SET status = 'failed', runtime_owner_id = NULL, lease_heartbeat_at = NULL WHERE id = ?",
+        )
+        .bind(log.id.as_str())
+        .execute(&state.pool)
+        .await
+        .expect("recover llm call");
+
+        let error = update_llm_call_running(state.as_ref(), log.id.as_str(), 2, 20, "gpt-test")
+            .await
+            .expect_err("recovered llm call must not be claimed again");
+        assert!(
+            error
+                .to_string()
+                .contains("no longer available for running update")
+        );
+
+        let running_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM llm_call_events WHERE call_id = ? AND event_type = 'llm.running'",
+        )
+        .bind(log.id.as_str())
+        .fetch_one(&state.pool)
+        .await
+        .expect("count llm running events");
+        assert_eq!(running_events, 1);
     }
 
     #[tokio::test]
@@ -8554,6 +8903,15 @@ mod tests {
         .execute(&state.pool)
         .await
         .expect("mark llm call stale");
+        state
+            .llm_scheduler
+            .set_admin_override(LlmCallAdminOverride {
+                id: log.id.clone(),
+                status: "succeeded".to_owned(),
+                updated_at: "2026-03-06T00:00:00Z".to_owned(),
+                ..Default::default()
+            })
+            .await;
 
         recover_runtime_state(state.as_ref())
             .await
@@ -8578,6 +8936,134 @@ mod tests {
         );
         assert_eq!(row.get::<Option<String>, _>("runtime_owner_id"), None);
         assert_eq!(row.get::<Option<String>, _>("lease_heartbeat_at"), None);
+        assert!(
+            !state
+                .llm_scheduler
+                .admin_overrides()
+                .await
+                .contains_key(log.id.as_str())
+        );
+        set_llm_admin_override_if_owned(
+            state.as_ref(),
+            LlmCallAdminOverride {
+                id: log.id.clone(),
+                status: "queued".to_owned(),
+                updated_at: Utc::now().to_rfc3339(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            !state
+                .llm_scheduler
+                .admin_overrides()
+                .await
+                .contains_key(log.id.as_str())
+        );
+
+        append_llm_attempt_failure_event(
+            state.as_ref(),
+            log.id.as_str(),
+            "gpt-test",
+            2,
+            LlmFailureClass::Transient,
+            None,
+            0,
+        )
+        .await;
+        let inserted = append_llm_call_event_if_owned(
+            state.as_ref(),
+            log.id.as_str(),
+            "llm.route_switched",
+            "queued",
+            serde_json::json!({"from_model": "gpt-test", "to_model": "gpt-test-2"}),
+        )
+        .await
+        .expect("stale llm event append should be ignored");
+        assert!(!inserted);
+
+        let attempt_failed_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM llm_call_events WHERE call_id = ? AND event_type = 'llm.attempt_failed'",
+        )
+        .bind(log.id.as_str())
+        .fetch_one(&state.pool)
+        .await
+        .expect("count stale attempt events");
+        let route_switched_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM llm_call_events WHERE call_id = ? AND event_type = 'llm.route_switched'",
+        )
+        .bind(log.id.as_str())
+        .fetch_one(&state.pool)
+        .await
+        .expect("count stale route events");
+        assert_eq!(attempt_failed_events, 0);
+        assert_eq!(route_switched_events, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_llm_recovery_requires_the_original_lease_snapshot() {
+        let state = setup_llm_state().await;
+        let log = LlmCallLogRecord {
+            id: "call-revived-runtime-lease".to_owned(),
+            source: "tests.llm.recovery".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+            parent_task_type: None,
+            parent_translation_batch_id: None,
+            parent_brief_id: None,
+        };
+
+        insert_llm_call(state.as_ref(), &log, "gpt-test", 512, "prompt", Some("[]"))
+            .await
+            .expect("seed llm call");
+        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 10, "gpt-test")
+            .await
+            .expect("mark llm call running");
+        sqlx::query(
+            r#"
+            UPDATE llm_calls
+            SET runtime_owner_id = ?, lease_heartbeat_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("old-runtime-owner")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("2026-03-06T00:00:00Z")
+        .bind(log.id.as_str())
+        .execute(&state.pool)
+        .await
+        .expect("seed stale llm lease");
+        sqlx::query("UPDATE llm_calls SET lease_heartbeat_at = ? WHERE id = ?")
+            .bind("2026-03-06T00:02:00Z")
+            .bind(log.id.as_str())
+            .execute(&state.pool)
+            .await
+            .expect("revive llm lease");
+
+        let recovered = recover_llm_call_with_message(
+            state.as_ref(),
+            log.id.as_str(),
+            runtime::RUNTIME_LEASE_EXPIRED_ERROR,
+            Some("old-runtime-owner"),
+            Some("2026-03-06T00:00:00Z"),
+            Some(runtime::RuntimeRecoveryMode::Sweep),
+            Some("2026-03-06T00:01:00Z"),
+        )
+        .await
+        .expect("recover revived llm lease");
+        assert!(!recovered);
+
+        let row = sqlx::query("SELECT status, lease_heartbeat_at FROM llm_calls WHERE id = ?")
+            .bind(log.id.as_str())
+            .fetch_one(&state.pool)
+            .await
+            .expect("load revived llm lease");
+        assert_eq!(row.get::<String, _>("status"), "running");
+        assert_eq!(
+            row.get::<Option<String>, _>("lease_heartbeat_at")
+                .as_deref(),
+            Some("2026-03-06T00:02:00Z")
+        );
     }
 
     #[tokio::test]

@@ -666,7 +666,7 @@ async fn touch_user_last_active_at(state: &AppState, user_id: &str) -> Result<()
         })
         .await;
     match result {
-        Ok(Some(())) => {}
+        Ok(Some(_)) => {}
         Ok(None) => {
             tracing::debug!(
                 user_id,
@@ -3364,8 +3364,11 @@ async fn upsert_admin_dashboard_rollup_for_day(
             end_at.as_str(),
         )
         .await?;
-        sqlx::query(
-            r#"
+        state
+            .sqlite_writer
+            .write("admin_dashboard_daily_rollup_upsert", |_| async {
+                sqlx::query(
+                    r#"
             INSERT INTO admin_dashboard_daily_rollups (
               rollup_date,
               time_zone,
@@ -3398,26 +3401,29 @@ async fn upsert_admin_dashboard_rollup_for_day(
               business_failed_count = excluded.business_failed_count,
               business_disabled_count = excluded.business_disabled_count,
               updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(day_value.as_str())
-        .bind(time_zone_value.as_str())
-        .bind(task_type)
-        .bind(total_users)
-        .bind(active_users)
-        .bind(counts.queued_count)
-        .bind(counts.running_count)
-        .bind(counts.succeeded_count)
-        .bind(counts.failed_count)
-        .bind(counts.canceled_count)
-        .bind(counts.business_ok_count)
-        .bind(counts.business_partial_count)
-        .bind(counts.business_failed_count)
-        .bind(counts.business_disabled_count)
-        .bind(updated_at.as_str())
-        .execute(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
+                    "#,
+                )
+                .bind(day_value.as_str())
+                .bind(time_zone_value.as_str())
+                .bind(task_type)
+                .bind(total_users)
+                .bind(active_users)
+                .bind(counts.queued_count)
+                .bind(counts.running_count)
+                .bind(counts.succeeded_count)
+                .bind(counts.failed_count)
+                .bind(counts.canceled_count)
+                .bind(counts.business_ok_count)
+                .bind(counts.business_partial_count)
+                .bind(counts.business_failed_count)
+                .bind(counts.business_disabled_count)
+                .bind(updated_at.as_str())
+                .execute(&state.pool)
+                .await
+                .map_err(anyhow::Error::from)
+            })
+            .await
+            .map_err(ApiError::internal)?;
     }
 
     Ok(())
@@ -6897,19 +6903,25 @@ pub async fn admin_patch_scheduled_slot(
     }
 
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE daily_brief_hour_slots
-        SET enabled = ?, updated_at = ?
-        WHERE hour_utc = ?
-        "#,
-    )
-    .bind(if req.enabled { 1_i64 } else { 0_i64 })
-    .bind(now.as_str())
-    .bind(hour_utc)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    state
+        .sqlite_writer
+        .write_foreground("admin_scheduled_slot_update", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE daily_brief_hour_slots
+                SET enabled = ?, updated_at = ?
+                WHERE hour_utc = ?
+                "#,
+            )
+            .bind(if req.enabled { 1_i64 } else { 0_i64 })
+            .bind(now.as_str())
+            .bind(hour_utc)
+            .execute(&state.pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await
+        .map_err(ApiError::internal)?;
 
     let item = sqlx::query_as::<_, AdminScheduledSlotItem>(
         r#"
@@ -7322,6 +7334,7 @@ pub async fn admin_get_llm_scheduler_status(
     session: Session,
 ) -> Result<Json<AdminLlmSchedulerStatusResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let _runtime_settings_guard = admin_runtime::runtime_settings_update_lock().lock().await;
     admin_runtime::sync_persisted_runtime_settings(state.clone())
         .await
         .map_err(ApiError::internal)?;
@@ -7335,6 +7348,7 @@ pub async fn admin_get_llm_activity(
     session: Session,
 ) -> Result<Json<AdminLlmActivityResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let _runtime_settings_guard = admin_runtime::runtime_settings_update_lock().lock().await;
     admin_runtime::sync_persisted_runtime_settings(state.clone())
         .await
         .map_err(ApiError::internal)?;
@@ -7519,6 +7533,14 @@ pub async fn admin_patch_llm_runtime_config(
     Json(req): Json<AdminLlmRuntimeConfigUpdateRequest>,
 ) -> Result<Json<AdminLlmSchedulerStatusResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let _runtime_settings_guard = admin_runtime::runtime_settings_update_lock().lock().await;
+    let previous_settings = admin_runtime::load_or_seed_runtime_settings_with_writer(
+        &state.pool,
+        &state.sqlite_writer,
+        &state.config,
+    )
+    .await
+    .map_err(ApiError::internal)?;
     let max_concurrency = parse_positive_admin_concurrency(req.max_concurrency, "max_concurrency")?;
     let ai_model_context_limit = match req.ai_model_context_limit {
         Some(Some(value)) => Some(parse_positive_runtime_limit(
@@ -7555,28 +7577,37 @@ pub async fn admin_patch_llm_runtime_config(
         Some(value) => value,
         None => i64::from(current_recovery.rollout_percent),
     };
-    admin_runtime::update_llm_runtime_settings(
-        &state.pool,
-        max_concurrency,
-        ai_model_context_limit,
-        &llm_models,
-    )
-    .await
-    .map_err(ApiError::internal)?;
-    admin_runtime::update_llm_recovery_runtime_config(
-        &state.pool,
-        recovery_enabled,
-        recovery_rollout_percent,
-    )
-    .await
-    .map_err(ApiError::internal)?;
-    admin_runtime::sync_persisted_runtime_settings(state.clone())
-        .await
-        .map_err(ApiError::internal)?;
-    if route_changed {
-        content_processing::on_runtime_configuration_reload(state.as_ref())
-            .await
-            .map_err(ApiError::internal)?;
+    let apply_result = async {
+        admin_runtime::update_llm_runtime_settings_and_recovery_config(
+            &state.pool,
+            &state.sqlite_writer,
+            max_concurrency,
+            ai_model_context_limit,
+            &llm_models,
+            recovery_enabled,
+            recovery_rollout_percent,
+        )
+        .await?;
+        admin_runtime::sync_persisted_runtime_settings(state.clone()).await?;
+        if route_changed {
+            content_processing::on_runtime_configuration_reload(state.as_ref()).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = apply_result {
+        if let Err(rollback_error) =
+            admin_runtime::restore_persisted_runtime_settings(state.clone(), &previous_settings)
+                .await
+        {
+            tracing::error!(
+                event = "sqlite.write",
+                operation = "admin_runtime_settings_rollback",
+                error_chain = %crate::observability::error_chain_summary(rollback_error.as_ref()),
+                "failed to roll back admin runtime settings after apply failure"
+            );
+        }
+        return Err(ApiError::internal(error));
     }
 
     Ok(Json(
@@ -10522,31 +10553,37 @@ async fn resolve_public_release_usage_from_local_metadata(
         "pending"
     };
 
-    sqlx::query(
-        r#"
-        UPDATE public_repo_release_usage
-        SET repo_id = ?,
-            owner_login = ?,
-            repo_name = ?,
-            full_name = ?,
-            full_name_lower = ?,
-            last_sync_status = ?,
-            last_sync_error = NULL,
-            updated_at = ?
-        WHERE full_name_lower = ?
-        "#,
-    )
-    .bind(repo.repo_id)
-    .bind(owner)
-    .bind(repo_name)
-    .bind(repo.full_name.as_str())
-    .bind(full_name_lower)
-    .bind(next_status)
-    .bind(now.as_str())
-    .bind(full_name_lower)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    state
+        .sqlite_writer
+        .write("public_release_usage_metadata_refresh", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE public_repo_release_usage
+                SET repo_id = ?,
+                    owner_login = ?,
+                    repo_name = ?,
+                    full_name = ?,
+                    full_name_lower = ?,
+                    last_sync_status = ?,
+                    last_sync_error = NULL,
+                    updated_at = ?
+                WHERE full_name_lower = ?
+                "#,
+            )
+            .bind(repo.repo_id)
+            .bind(owner)
+            .bind(repo_name)
+            .bind(repo.full_name.as_str())
+            .bind(full_name_lower)
+            .bind(next_status)
+            .bind(now.as_str())
+            .bind(full_name_lower)
+            .execute(&state.pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await
+        .map_err(ApiError::internal)?;
 
     if release_count == 0
         && sync::enqueue_public_repo_release_sync(state, repo.repo_id, repo.full_name.as_str())
@@ -15540,29 +15577,36 @@ async fn persist_reaction_pat_check_result(
     check_state: &str,
     check_message: Option<&str>,
 ) -> Result<(), ApiError> {
-    sqlx::query(
-        r#"
-        UPDATE reaction_pat_tokens
-        SET last_check_state = ?,
-            last_check_message = ?,
-            last_checked_at = ?,
-            webhook_push_allows_private_repos = CASE
-              WHEN ? = 'valid' THEN webhook_push_allows_private_repos
-              ELSE NULL
-            END,
-            updated_at = ?
-        WHERE user_id = ?
-        "#,
-    )
-    .bind(check_state)
-    .bind(check_message)
-    .bind(chrono::Utc::now().to_rfc3339())
-    .bind(check_state)
-    .bind(chrono::Utc::now().to_rfc3339())
-    .bind(user_id)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    state
+        .sqlite_writer
+        .write_foreground("reaction_pat_check_result_update", |_| async {
+            let now = chrono::Utc::now().to_rfc3339();
+            sqlx::query(
+                r#"
+            UPDATE reaction_pat_tokens
+            SET last_check_state = ?,
+                last_check_message = ?,
+                last_checked_at = ?,
+                webhook_push_allows_private_repos = CASE
+                  WHEN ? = 'valid' THEN webhook_push_allows_private_repos
+                  ELSE NULL
+                END,
+                updated_at = ?
+            WHERE user_id = ?
+            "#,
+            )
+            .bind(check_state)
+            .bind(check_message)
+            .bind(now.as_str())
+            .bind(check_state)
+            .bind(now.as_str())
+            .bind(user_id)
+            .execute(&state.pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await
+        .map_err(ApiError::internal)?;
     Ok(())
 }
 
@@ -15570,14 +15614,21 @@ async fn clear_reaction_pat_scope_observation(
     state: &AppState,
     user_id: &str,
 ) -> Result<(), ApiError> {
-    sqlx::query(
-        "UPDATE reaction_pat_tokens SET webhook_push_allows_private_repos = NULL, updated_at = ? WHERE user_id = ?",
-    )
-    .bind(chrono::Utc::now().to_rfc3339())
-    .bind(user_id)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    state
+        .sqlite_writer
+        .write_foreground("reaction_pat_scope_observation_clear", |_| async {
+            sqlx::query(
+                "UPDATE reaction_pat_tokens SET webhook_push_allows_private_repos = NULL, updated_at = ? WHERE user_id = ?",
+            )
+            .bind(now.as_str())
+            .bind(user_id)
+            .execute(&state.pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await
+        .map_err(ApiError::internal)?;
     Ok(())
 }
 
@@ -15681,44 +15732,50 @@ pub async fn upsert_reaction_token(
         .map_err(ApiError::internal)?;
     let masked = mask_pat_token(token);
 
-    sqlx::query(
-        r#"
-        INSERT INTO reaction_pat_tokens (
-          user_id, token_ciphertext, token_nonce, masked_token,
-          last_check_state, last_check_message, last_checked_at, updated_at,
-          owner_github_connection_id, owner_github_user_id, owner_login,
-          webhook_push_allows_private_repos
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-          token_ciphertext = excluded.token_ciphertext,
-          token_nonce = excluded.token_nonce,
-          masked_token = excluded.masked_token,
-          last_check_state = excluded.last_check_state,
-          last_check_message = excluded.last_check_message,
-          last_checked_at = excluded.last_checked_at,
-          updated_at = excluded.updated_at,
-          owner_github_connection_id = excluded.owner_github_connection_id,
-          owner_github_user_id = excluded.owner_github_user_id,
-          owner_login = excluded.owner_login,
-          webhook_push_allows_private_repos = excluded.webhook_push_allows_private_repos
-        "#,
-    )
-    .bind(user_id.as_str())
-    .bind(encrypted.ciphertext)
-    .bind(encrypted.nonce)
-    .bind(&masked)
-    .bind("valid")
-    .bind("token is valid")
-    .bind(&now)
-    .bind(&now)
-    .bind(owner.github_connection_id.as_str())
-    .bind(owner.github_user_id)
-    .bind(owner.login.as_str())
-    .bind(checked.allows_private_repos)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    state
+        .sqlite_writer
+        .write_foreground("reaction_pat_upsert", |_| async {
+            sqlx::query(
+                r#"
+                INSERT INTO reaction_pat_tokens (
+                  user_id, token_ciphertext, token_nonce, masked_token,
+                  last_check_state, last_check_message, last_checked_at, updated_at,
+                  owner_github_connection_id, owner_github_user_id, owner_login,
+                  webhook_push_allows_private_repos
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                  token_ciphertext = excluded.token_ciphertext,
+                  token_nonce = excluded.token_nonce,
+                  masked_token = excluded.masked_token,
+                  last_check_state = excluded.last_check_state,
+                  last_check_message = excluded.last_check_message,
+                  last_checked_at = excluded.last_checked_at,
+                  updated_at = excluded.updated_at,
+                  owner_github_connection_id = excluded.owner_github_connection_id,
+                  owner_github_user_id = excluded.owner_github_user_id,
+                  owner_login = excluded.owner_login,
+                  webhook_push_allows_private_repos = excluded.webhook_push_allows_private_repos
+                "#,
+            )
+            .bind(user_id.as_str())
+            .bind(&encrypted.ciphertext)
+            .bind(&encrypted.nonce)
+            .bind(&masked)
+            .bind("valid")
+            .bind("token is valid")
+            .bind(&now)
+            .bind(&now)
+            .bind(owner.github_connection_id.as_str())
+            .bind(owner.github_user_id)
+            .bind(owner.login.as_str())
+            .bind(checked.allows_private_repos)
+            .execute(&state.pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await
+        .map_err(ApiError::internal)?;
 
     Ok(Json(ReactionTokenStatusResponse {
         configured: true,
@@ -17722,45 +17779,6 @@ async fn fetch_live_release_reactions(
     Ok(out)
 }
 
-async fn persist_release_reaction_counts(
-    state: &AppState,
-    release_id: i64,
-    counts: &ReleaseReactionCounts,
-) -> Result<(), ApiError> {
-    state
-        .sqlite_writer
-        .write_foreground("feed_reaction_counts_persist", |_| async move {
-            sqlx::query(
-                r#"
-                    UPDATE repo_releases
-                    SET react_plus1 = ?,
-                        react_laugh = ?,
-                        react_heart = ?,
-                        react_hooray = ?,
-                        react_rocket = ?,
-                        react_eyes = ?,
-                        updated_at = ?
-                    WHERE release_id = ?
-                    "#,
-            )
-            .bind(counts.plus1)
-            .bind(counts.laugh)
-            .bind(counts.heart)
-            .bind(counts.hooray)
-            .bind(counts.rocket)
-            .bind(counts.eyes)
-            .bind(chrono::Utc::now().to_rfc3339())
-            .bind(release_id)
-            .execute(&state.pool)
-            .await
-            .map(|_| ())
-            .map_err(anyhow::Error::from)
-        })
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(())
-}
-
 async fn persist_release_reaction_counts_best_effort(
     state: &AppState,
     release_id: i64,
@@ -17818,6 +17836,31 @@ async fn persist_release_reaction_counts_best_effort(
             Ok(false)
         }
         Err(err) => Err(ApiError::internal(err)),
+    }
+}
+
+async fn persist_release_reaction_counts_after_remote_mutation(
+    state: &AppState,
+    release_id: i64,
+    counts: &ReleaseReactionCounts,
+) {
+    match persist_release_reaction_counts_best_effort(state, release_id, counts).await {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            event = "feed.reactions.remote_mutation_succeeded_local_persist_failed",
+            release_id,
+            error_kind = "downgraded",
+            downgrade_reason = "sqlite_writer_busy",
+            "remote reaction mutation succeeded but local reaction counts were not persisted"
+        ),
+        Err(error) => tracing::warn!(
+            event = "feed.reactions.remote_mutation_succeeded_local_persist_failed",
+            release_id,
+            error_kind = "persist_failed",
+            api_error_code = error.code(),
+            error = %error,
+            "remote reaction mutation succeeded but local reaction counts were not persisted"
+        ),
     }
 }
 
@@ -19154,13 +19197,13 @@ pub async fn refresh_feed_reactions(
             return Ok(Json(FeedReactionRefreshResponse { items: Vec::new() }));
         }
         Err(err) if err.code() == "pat_invalid" => {
-            let _ = persist_reaction_pat_check_result(
+            persist_reaction_pat_check_result(
                 state.as_ref(),
                 &user_id,
                 "invalid",
                 Some("PAT is invalid or expired"),
             )
-            .await;
+            .await?;
             return Err(err);
         }
         Err(err) => return Err(err),
@@ -19170,13 +19213,13 @@ pub async fn refresh_feed_reactions(
     let live = match fetch_live_release_reactions(state.as_ref(), &token, &node_ids).await {
         Ok(live) => live,
         Err(err) if err.code() == "reauth_required" => {
-            let _ = persist_reaction_pat_check_result(
+            persist_reaction_pat_check_result(
                 state.as_ref(),
                 &user_id,
                 "invalid",
                 Some("PAT is invalid or expired"),
             )
-            .await;
+            .await?;
             return Err(ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "pat_invalid",
@@ -19433,13 +19476,13 @@ pub async fn toggle_release_reaction(
             ));
         }
         Err(err) if err.code() == "pat_invalid" => {
-            let _ = persist_reaction_pat_check_result(
+            persist_reaction_pat_check_result(
                 state.as_ref(),
                 &user_id,
                 "invalid",
                 Some("PAT is invalid or expired"),
             )
-            .await;
+            .await?;
             return Err(err);
         }
         Err(err) => return Err(err),
@@ -19485,13 +19528,13 @@ pub async fn toggle_release_reaction(
         match fetch_live_release_reactions(state.as_ref(), &token, &[node_id.to_owned()]).await {
             Ok(v) => v,
             Err(err) if err.code() == "reauth_required" => {
-                let _ = persist_reaction_pat_check_result(
+                persist_reaction_pat_check_result(
                     state.as_ref(),
                     &user_id,
                     "invalid",
                     Some("PAT is invalid or expired"),
                 )
-                .await;
+                .await?;
                 return Err(ApiError::new(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "pat_invalid",
@@ -19516,19 +19559,24 @@ pub async fn toggle_release_reaction(
         ReleaseReactionContent::Eyes => current_reactions.viewer.eyes,
     };
 
+    // The live read already proved the PAT, so persist that state before the
+    // remote mutation. A failed local write must not turn a completed mutation
+    // into an ambiguous client-visible error.
+    persist_reaction_pat_check_result(state.as_ref(), &user_id, "valid", Some("PAT is valid"))
+        .await?;
     let updated =
         match mutate_release_reaction(state.as_ref(), &token, node_id, content, currently_reacted)
             .await
         {
             Ok(v) => v,
             Err(err) if err.code() == "reauth_required" => {
-                let _ = persist_reaction_pat_check_result(
+                persist_reaction_pat_check_result(
                     state.as_ref(),
                     &user_id,
                     "invalid",
                     Some("PAT is invalid or expired"),
                 )
-                .await;
+                .await?;
                 return Err(ApiError::new(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "pat_invalid",
@@ -19537,10 +19585,12 @@ pub async fn toggle_release_reaction(
             }
             Err(err) => return Err(err),
         };
-    let _ =
-        persist_reaction_pat_check_result(state.as_ref(), &user_id, "valid", Some("PAT is valid"))
-            .await;
-    persist_release_reaction_counts(state.as_ref(), row.release_id, &updated.counts).await?;
+    persist_release_reaction_counts_after_remote_mutation(
+        state.as_ref(),
+        row.release_id,
+        &updated.counts,
+    )
+    .await;
 
     Ok(Json(ToggleReleaseReactionResponse {
         release_id: row.release_id.to_string(),
@@ -23586,18 +23636,6 @@ async fn translate_releases_batch_stream_worker(
             }
         }
 
-        if !send_batch_stream_event(
-            &tx,
-            TranslateBatchStreamEvent {
-                event: "done",
-                item: None,
-                error: None,
-            },
-        )
-        .await
-        {
-            return Err(ApiError::internal("stream client disconnected"));
-        }
         Ok::<(), ApiError>(())
     })
     .await;
@@ -23611,48 +23649,100 @@ async fn translate_releases_batch_stream_worker(
                 "missing": missing_count,
                 "error": error_count,
             });
-            let _ = jobs::complete_task(
+            let finalized = match jobs::complete_task(
                 state.as_ref(),
                 task_id.as_str(),
                 jobs::STATUS_SUCCEEDED,
                 Some(summary.clone()),
                 None,
             )
-            .await;
+            .await
+            {
+                Ok(finalized) => finalized,
+                Err(error) => {
+                    tracing::warn!(
+                        task_id = task_id.as_str(),
+                        ?error,
+                        "failed to finalize translation stream task"
+                    );
+                    false
+                }
+            };
             heartbeat.stop().await;
-            let _ = jobs::append_task_event(
-                state.as_ref(),
-                task_id.as_str(),
-                "task.completed",
-                json!({
-                    "task_id": task_id.as_str(),
-                    "status": jobs::STATUS_SUCCEEDED,
-                    "summary": summary,
-                }),
-            )
-            .await;
+            if finalized {
+                if let Err(error) = jobs::append_task_event(
+                    state.as_ref(),
+                    task_id.as_str(),
+                    "task.completed",
+                    json!({
+                        "task_id": task_id.as_str(),
+                        "status": jobs::STATUS_SUCCEEDED,
+                        "summary": summary,
+                    }),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        task_id = task_id.as_str(),
+                        ?error,
+                        "failed to append completed translation stream task event"
+                    );
+                }
+                let _ = send_batch_stream_event(
+                    &tx,
+                    TranslateBatchStreamEvent {
+                        event: "done",
+                        item: None,
+                        error: None,
+                    },
+                )
+                .await;
+            } else {
+                let _ = send_batch_stream_event(
+                    &tx,
+                    TranslateBatchStreamEvent {
+                        event: "error",
+                        item: None,
+                        error: Some("translation stream task was not finalized".to_owned()),
+                    },
+                )
+                .await;
+            }
         }
         Err(err) => {
             let error_message = format!("{}: stream worker failed", err.code());
-            let _ = jobs::complete_task(
+            let finalized = match jobs::complete_task(
                 state.as_ref(),
                 task_id.as_str(),
                 jobs::STATUS_FAILED,
                 None,
                 Some(error_message.clone()),
             )
-            .await;
-            let _ = jobs::append_task_event(
-                state.as_ref(),
-                task_id.as_str(),
-                "task.completed",
-                json!({
-                    "task_id": task_id.as_str(),
-                    "status": jobs::STATUS_FAILED,
-                    "error": error_message,
-                }),
-            )
-            .await;
+            .await
+            {
+                Ok(finalized) => finalized,
+                Err(error) => {
+                    tracing::warn!(
+                        task_id = task_id.as_str(),
+                        ?error,
+                        "failed to finalize failed translation stream task"
+                    );
+                    false
+                }
+            };
+            if finalized {
+                let _ = jobs::append_task_event(
+                    state.as_ref(),
+                    task_id.as_str(),
+                    "task.completed",
+                    json!({
+                        "task_id": task_id.as_str(),
+                        "status": jobs::STATUS_FAILED,
+                        "error": error_message,
+                    }),
+                )
+                .await;
+            }
             heartbeat.stop().await;
             let _ = send_batch_stream_event(
                 &tx,
@@ -26128,6 +26218,7 @@ mod tests {
 
     use chrono::{Datelike, TimeZone};
 
+    #[rustfmt::skip]
     use super::{
         ACCESS_SYNC_REASON_INACTIVE_OVER_1H, ADMIN_DASHBOARD_PREAGGREGATE_DAYS,
         ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT, ADMIN_TASK_DETAIL_EVENT_LIMIT, AdminDashboardQuery,
@@ -26175,12 +26266,13 @@ mod tests {
         parse_feed_types, parse_llm_models, parse_positive_admin_concurrency,
         parse_release_id_param, parse_release_smart_summary_payload,
         parse_repo_full_name_from_release_url, parse_translation_json, parse_unique_release_ids,
-        parse_unique_thread_ids, prepare_release_batch, prepare_repo_scope_public_repo_access,
-        preserve_chunk_edge_newlines, public_get_repo_release_detail, public_list_repo_releases,
-        public_list_repo_releases_http, publish_repo_public_release,
-        refresh_admin_dashboard_rollups, refresh_feed_reactions, release_cache_entry_reusable,
-        release_detail_source_hash, release_detail_translation_ready, release_excerpt,
-        release_feed_body, release_reactions_status, release_smart_body_prompt,
+        parse_unique_thread_ids, persist_reaction_pat_check_result,
+        persist_release_reaction_counts_after_remote_mutation, prepare_release_batch,
+        prepare_repo_scope_public_repo_access, preserve_chunk_edge_newlines,
+        public_get_repo_release_detail, public_list_repo_releases, public_list_repo_releases_http,
+        publish_repo_public_release, refresh_admin_dashboard_rollups, refresh_feed_reactions,
+        release_cache_entry_reusable, release_detail_source_hash, release_detail_translation_ready,
+        release_excerpt, release_feed_body, release_reactions_status, release_smart_body_prompt,
         release_smart_diff_prompt, require_active_user_id, require_business_user_id,
         resolve_release_full_name, search, should_retry_public_compare_without_auth,
         smart_error_is_retryable, split_markdown_chunks, summarize_release_smart_candidate_with_ai,
@@ -36494,6 +36586,12 @@ line two",
         let (item, persisted) = build_feed_reaction_refresh_item(state.as_ref(), &row, &reaction)
             .await
             .expect("build refresh item under write pressure");
+        persist_release_reaction_counts_after_remote_mutation(
+            state.as_ref(),
+            row.release_id,
+            &reaction.counts,
+        )
+        .await;
 
         held_tx.commit().await.expect("commit held tx");
         drop(writer_guard);
@@ -36510,6 +36608,99 @@ line two",
                 .await
                 .expect("load stored reaction count");
         assert_eq!(stored_plus1, 0);
+    }
+
+    #[tokio::test]
+    async fn reaction_pat_check_result_waits_for_foreground_writer() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        sqlx::query(
+            r#"
+            INSERT INTO reaction_pat_tokens (
+              user_id, token_ciphertext, token_nonce, masked_token,
+              last_check_state, updated_at
+            ) VALUES (?, ?, ?, ?, 'unknown', ?)
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(vec![0_u8])
+        .bind(vec![0_u8])
+        .bind("ghp_...oken")
+        .bind("2026-02-23T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed reaction PAT");
+        let state = setup_state(pool.clone());
+        let held_writer = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "test_reaction_pat_foreground_pressure",
+                crate::sqlite_write::SqliteWritePriority::Background,
+            )
+            .await
+            .expect("hold sqlite writer");
+        let persist_state = state.clone();
+        let persist_user_id = user_id.clone();
+        let persist = tokio::spawn(async move {
+            persist_reaction_pat_check_result(
+                persist_state.as_ref(),
+                &persist_user_id,
+                "invalid",
+                Some("PAT is invalid or expired"),
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_foreground > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reaction PAT persistence should queue behind held writer");
+        assert!(
+            !persist.is_finished(),
+            "reaction PAT check result bypassed foreground coordinator"
+        );
+        drop(held_writer);
+        tokio::time::timeout(std::time::Duration::from_secs(1), persist)
+            .await
+            .expect("reaction PAT persistence should finish after writer release")
+            .expect("join reaction PAT persistence")
+            .expect("persist reaction PAT check result");
+
+        let state_row: (String, Option<String>) = sqlx::query_as(
+            "SELECT last_check_state, last_check_message FROM reaction_pat_tokens WHERE user_id = ?",
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load reaction PAT check result");
+        assert_eq!(state_row.0, "invalid");
+        assert_eq!(state_row.1.as_deref(), Some("PAT is invalid or expired"));
+    }
+
+    #[tokio::test]
+    async fn reaction_pat_check_result_surfaces_terminal_write_failure() {
+        let pool = setup_pool().await;
+        sqlx::query("DROP TABLE reaction_pat_tokens")
+            .execute(&pool)
+            .await
+            .expect("drop reaction PAT table");
+        let state = setup_state(pool);
+
+        let error = persist_reaction_pat_check_result(
+            state.as_ref(),
+            test_user_id(1).as_str(),
+            "invalid",
+            Some("PAT is invalid or expired"),
+        )
+        .await
+        .expect_err("terminal PAT write failure should reach the caller");
+        assert_eq!(error.code(), "internal_error");
     }
 
     #[tokio::test]

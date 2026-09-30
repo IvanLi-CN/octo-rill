@@ -95,9 +95,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .await
         .context("failed to backfill github connections")?;
 
-    let runtime_settings = admin_runtime::load_or_seed_runtime_settings(&pool, &config)
-        .await
-        .context("failed to load admin runtime settings")?;
+    let sqlite_writer = crate::sqlite_write::SqliteWriteCoordinator::new();
+    let runtime_settings =
+        admin_runtime::load_or_seed_runtime_settings_with_writer(&pool, &sqlite_writer, &config)
+            .await
+            .context("failed to load admin runtime settings")?;
 
     let pragmas = read_sqlite_runtime_pragmas(&pool).await?;
     info!(
@@ -110,7 +112,6 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     );
     warn_if_runtime_concurrency_exceeds_sqlite_pool(&config, &runtime_settings);
 
-    let sqlite_writer = crate::sqlite_write::SqliteWriteCoordinator::new();
     let public_metrics_service = Arc::new(crate::public_metrics::PublicMetricsService::new(
         pool.clone(),
         sqlite_writer.clone(),

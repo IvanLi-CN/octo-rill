@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use axum::{
     Json,
     body::Body,
@@ -22,8 +22,11 @@ use tower_sessions::Session;
 use tracing::warn;
 
 use crate::{
-    admin_runtime, ai, api, content_processing, error::ApiError, runtime,
-    sqlite_write::SqliteWriteCoordinator, state::AppState,
+    admin_runtime, ai, api, content_processing,
+    error::ApiError,
+    runtime,
+    sqlite_write::{SqliteWriteCoordinator, SqliteWritePriority},
+    state::AppState,
 };
 
 const TRANSLATION_PROTOCOL_VERSION: &str = "translation-request.v1";
@@ -571,7 +574,7 @@ pub struct AdminTranslationRequestResultItem {
     pub error_detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AdminTranslationWorkerStatus {
     pub worker_id: String,
     pub worker_slot: i64,
@@ -702,7 +705,10 @@ impl<'a> TranslationWorkerRuntimeUpdate<'a> {
 pub struct TranslationSchedulerController {
     desired_config: tokio::sync::RwLock<TranslationRuntimeConfig>,
     runtime: tokio::sync::RwLock<Vec<TranslationWorkerRuntimeState>>,
+    runtime_reconcile_lock: tokio::sync::Mutex<()>,
     worker_abort_handles: tokio::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>,
+    #[cfg(test)]
+    runtime_sync_started: tokio::sync::Notify,
 }
 
 #[allow(dead_code)]
@@ -1376,7 +1382,10 @@ impl TranslationSchedulerController {
         Self {
             desired_config: tokio::sync::RwLock::new(config),
             runtime: tokio::sync::RwLock::new(runtime),
+            runtime_reconcile_lock: tokio::sync::Mutex::new(()),
             worker_abort_handles: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            runtime_sync_started: tokio::sync::Notify::new(),
         }
     }
 
@@ -1421,12 +1430,18 @@ impl TranslationSchedulerController {
     }
 
     #[cfg(test)]
+    async fn wait_for_runtime_sync_start(&self) {
+        self.runtime_sync_started.notified().await;
+    }
+
+    #[cfg(test)]
     async fn sync_runtime_with_config(
         &self,
         pool: &SqlitePool,
         config: TranslationRuntimeConfig,
     ) -> Result<TranslationRuntimeConfig> {
-        self.sync_runtime_with_config_internal(pool, None, config)
+        let sqlite_writer = SqliteWriteCoordinator::new();
+        self.sync_runtime_with_config_internal(pool, &sqlite_writer, config)
             .await
     }
 
@@ -1435,64 +1450,75 @@ impl TranslationSchedulerController {
         state: &AppState,
         config: TranslationRuntimeConfig,
     ) -> Result<TranslationRuntimeConfig> {
-        self.sync_runtime_with_config_internal(&state.pool, Some(&state.sqlite_writer), config)
+        self.sync_runtime_with_config_internal(&state.pool, &state.sqlite_writer, config)
             .await
     }
 
     async fn sync_runtime_with_config_internal(
         &self,
         pool: &SqlitePool,
-        sqlite_writer: Option<&SqliteWriteCoordinator>,
+        sqlite_writer: &SqliteWriteCoordinator,
         config: TranslationRuntimeConfig,
     ) -> Result<TranslationRuntimeConfig> {
+        #[cfg(test)]
+        self.runtime_sync_started.notify_one();
         let config = TranslationRuntimeConfig::new(
             config.general_worker_concurrency,
             config.dedicated_worker_concurrency,
         );
+        let _claim_guard = translation_batch_claim_lock().lock().await;
+        let _runtime_reconcile_guard = self.runtime_reconcile_lock.lock().await;
         if *self.desired_config.read().await == config {
             return Ok(config);
         }
-        let _claim_guard = translation_batch_claim_lock().lock().await;
-        *self.desired_config.write().await = config;
 
-        let desired_profiles = translation_worker_profiles(config);
-        let desired_worker_ids = desired_profiles
-            .iter()
-            .map(|profile| profile.worker_id.as_str())
-            .collect::<HashSet<_>>();
-        let mut runtime = self.runtime.write().await;
-        let previous_topology = runtime
-            .iter()
-            .map(|entry| {
-                (
-                    entry.worker_id.clone(),
-                    (entry.worker_slot, entry.worker_kind.clone()),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        runtime.retain(|entry| {
-            desired_worker_ids.contains(entry.worker_id.as_str())
-                || entry.current_batch_id.is_some()
-        });
-        for profile in &desired_profiles {
-            if let Some(entry) = runtime
-                .iter_mut()
-                .find(|entry| entry.worker_id == profile.worker_id)
-            {
-                entry.worker_kind = profile.worker_kind.clone();
-            } else {
-                runtime.push(TranslationWorkerRuntimeState::idle(profile));
+        let (previous_runtime, batch_slot_updates) = {
+            let mut runtime = self.runtime.write().await;
+            let desired_profiles = translation_worker_profiles(config);
+            let desired_worker_ids = desired_profiles
+                .iter()
+                .map(|profile| profile.worker_id.as_str())
+                .collect::<HashSet<_>>();
+            let previous_topology = runtime
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.worker_id.clone(),
+                        (entry.worker_slot, entry.worker_kind.clone()),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let previous_runtime = runtime.clone();
+            runtime.retain(|entry| {
+                desired_worker_ids.contains(entry.worker_id.as_str())
+                    || entry.current_batch_id.is_some()
+            });
+            for profile in &desired_profiles {
+                if let Some(entry) = runtime
+                    .iter_mut()
+                    .find(|entry| entry.worker_id == profile.worker_id)
+                {
+                    entry.worker_kind = profile.worker_kind.clone();
+                } else {
+                    runtime.push(TranslationWorkerRuntimeState::idle(profile));
+                }
             }
+            reconcile_worker_runtime_slots(&mut runtime, config);
+            let batch_slot_updates =
+                collect_running_batch_slot_updates(&runtime, &previous_topology);
+            if translation_runtime_topology_changed(&runtime, &previous_topology) {
+                refresh_translation_runtime_updated_at(&mut runtime);
+            }
+            (previous_runtime, batch_slot_updates)
+        };
+        if let Err(error) =
+            sync_running_batch_slot_updates_with_writer(sqlite_writer, pool, &batch_slot_updates)
+                .await
+        {
+            *self.runtime.write().await = previous_runtime;
+            return Err(error);
         }
-        reconcile_worker_runtime_slots(&mut runtime, config);
-        let batch_slot_updates = collect_running_batch_slot_updates(&runtime, &previous_topology);
-        let topology_changed = translation_runtime_topology_changed(&runtime, &previous_topology);
-        if topology_changed {
-            refresh_translation_runtime_updated_at(&mut runtime);
-        }
-        drop(runtime);
-        sync_running_batch_slot_updates_with_writer(sqlite_writer, pool, &batch_slot_updates)
-            .await?;
+        *self.desired_config.write().await = config;
         Ok(config)
     }
 
@@ -1619,7 +1645,8 @@ impl TranslationSchedulerController {
 
     #[cfg(test)]
     async fn remove_worker_runtime(&self, pool: &SqlitePool, worker_id: &str) -> Result<()> {
-        self.remove_worker_runtime_internal(pool, None, worker_id)
+        let sqlite_writer = SqliteWriteCoordinator::new();
+        self.remove_worker_runtime_internal(pool, &sqlite_writer, worker_id)
             .await
     }
 
@@ -1628,36 +1655,47 @@ impl TranslationSchedulerController {
         state: &AppState,
         worker_id: &str,
     ) -> Result<()> {
-        self.remove_worker_runtime_internal(&state.pool, Some(&state.sqlite_writer), worker_id)
+        self.remove_worker_runtime_internal(&state.pool, &state.sqlite_writer, worker_id)
             .await
     }
 
     async fn remove_worker_runtime_internal(
         &self,
         pool: &SqlitePool,
-        sqlite_writer: Option<&SqliteWriteCoordinator>,
+        sqlite_writer: &SqliteWriteCoordinator,
         worker_id: &str,
     ) -> Result<()> {
+        let _claim_guard = translation_batch_claim_lock().lock().await;
+        let _runtime_reconcile_guard = self.runtime_reconcile_lock.lock().await;
         let desired_config = self.desired_config().await;
-        let mut runtime = self.runtime.write().await;
-        let previous_topology = runtime
-            .iter()
-            .map(|entry| {
-                (
-                    entry.worker_id.clone(),
-                    (entry.worker_slot, entry.worker_kind.clone()),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        runtime.retain(|entry| entry.worker_id != worker_id);
-        reconcile_worker_runtime_slots(&mut runtime, desired_config);
-        let batch_slot_updates = collect_running_batch_slot_updates(&runtime, &previous_topology);
-        if translation_runtime_topology_changed(&runtime, &previous_topology) {
-            refresh_translation_runtime_updated_at(&mut runtime);
+        let (previous_runtime, batch_slot_updates) = {
+            let mut runtime = self.runtime.write().await;
+            let previous_runtime = runtime.clone();
+            let previous_topology = runtime
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.worker_id.clone(),
+                        (entry.worker_slot, entry.worker_kind.clone()),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            runtime.retain(|entry| entry.worker_id != worker_id);
+            reconcile_worker_runtime_slots(&mut runtime, desired_config);
+            let batch_slot_updates =
+                collect_running_batch_slot_updates(&runtime, &previous_topology);
+            if translation_runtime_topology_changed(&runtime, &previous_topology) {
+                refresh_translation_runtime_updated_at(&mut runtime);
+            }
+            (previous_runtime, batch_slot_updates)
+        };
+        if let Err(error) =
+            sync_running_batch_slot_updates_with_writer(sqlite_writer, pool, &batch_slot_updates)
+                .await
+        {
+            *self.runtime.write().await = previous_runtime;
+            return Err(error);
         }
-        drop(runtime);
-        sync_running_batch_slot_updates_with_writer(sqlite_writer, pool, &batch_slot_updates)
-            .await?;
         Ok(())
     }
 
@@ -1666,15 +1704,22 @@ impl TranslationSchedulerController {
         profile: &TranslationWorkerProfile,
         update: TranslationWorkerRuntimeUpdate<'_>,
     ) {
-        let desired_config = self.desired_config().await;
+        let _runtime_reconcile_guard = self.runtime_reconcile_lock.lock().await;
         let mut runtime = self.runtime.write().await;
+        let desired_config = *self.desired_config.read().await;
+        let desired_profile = translation_worker_profiles(desired_config)
+            .into_iter()
+            .find(|candidate| candidate.worker_id == profile.worker_id);
         let entry = if let Some(index) = runtime
             .iter()
             .position(|entry| entry.worker_id == profile.worker_id)
         {
             &mut runtime[index]
         } else {
-            runtime.push(TranslationWorkerRuntimeState::idle(profile));
+            let Some(desired_profile) = desired_profile.as_ref() else {
+                return;
+            };
+            runtime.push(TranslationWorkerRuntimeState::idle(desired_profile));
             runtime
                 .last_mut()
                 .expect("translation worker runtime entry should exist after insert")
@@ -1695,8 +1740,10 @@ impl TranslationSchedulerController {
             return;
         }
 
-        entry.worker_slot = profile.worker_slot;
-        entry.worker_kind = profile.worker_kind.clone();
+        if let Some(desired_profile) = desired_profile {
+            entry.worker_slot = desired_profile.worker_slot;
+            entry.worker_kind = desired_profile.worker_kind;
+        }
         entry.status = update.status.to_owned();
         entry.current_batch_id = next_batch_id;
         entry.request_count = update.request_count;
@@ -1921,30 +1968,14 @@ fn collect_running_batch_slot_updates(
         .collect()
 }
 
-async fn sync_running_batch_slot_updates(
-    pool: &SqlitePool,
-    updates: &[RunningBatchSlotUpdate],
-) -> Result<()> {
-    if updates.is_empty() {
-        return Ok(());
-    }
-    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    sync_running_batch_slot_updates_in_transaction(&mut tx, updates).await?;
-    tx.commit().await?;
-    Ok(())
-}
-
 async fn sync_running_batch_slot_updates_with_writer(
-    sqlite_writer: Option<&SqliteWriteCoordinator>,
+    sqlite_writer: &SqliteWriteCoordinator,
     pool: &SqlitePool,
     updates: &[RunningBatchSlotUpdate],
 ) -> Result<()> {
     if updates.is_empty() {
         return Ok(());
     }
-    let Some(sqlite_writer) = sqlite_writer else {
-        return sync_running_batch_slot_updates(pool, updates).await;
-    };
     let (_permit, mut tx) = sqlite_writer
         .begin_immediate(pool, "translation_worker_runtime_slots")
         .await?;
@@ -2512,6 +2543,7 @@ pub async fn admin_get_translation_status(
     session: Session,
 ) -> Result<Json<AdminTranslationStatusResponse>, ApiError> {
     let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
+    let _runtime_settings_guard = admin_runtime::runtime_settings_update_lock().lock().await;
     admin_runtime::sync_persisted_runtime_settings(state.clone())
         .await
         .map_err(ApiError::internal)?;
@@ -2526,6 +2558,14 @@ pub async fn admin_patch_translation_runtime_config(
     Json(req): Json<AdminTranslationRuntimeConfigUpdateRequest>,
 ) -> Result<Json<AdminTranslationStatusResponse>, ApiError> {
     let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
+    let _runtime_settings_guard = admin_runtime::runtime_settings_update_lock().lock().await;
+    let previous_settings = admin_runtime::load_or_seed_runtime_settings_with_writer(
+        &state.pool,
+        &state.sqlite_writer,
+        &state.config,
+    )
+    .await
+    .map_err(ApiError::internal)?;
     let general_worker_concurrency = parse_positive_worker_concurrency(
         req.general_worker_concurrency,
         "general_worker_concurrency",
@@ -2539,16 +2579,32 @@ pub async fn admin_patch_translation_runtime_config(
         dedicated_worker_concurrency,
     )?;
 
-    admin_runtime::update_translation_runtime_settings(
-        &state.pool,
-        general_worker_concurrency,
-        dedicated_worker_concurrency,
-    )
-    .await
-    .map_err(ApiError::internal)?;
-    admin_runtime::sync_persisted_runtime_settings(state.clone())
-        .await
-        .map_err(ApiError::internal)?;
+    let apply_result = async {
+        admin_runtime::update_translation_runtime_settings(
+            &state.pool,
+            &state.sqlite_writer,
+            general_worker_concurrency,
+            dedicated_worker_concurrency,
+        )
+        .await?;
+        admin_runtime::sync_persisted_runtime_settings(state.clone()).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = apply_result {
+        if let Err(rollback_error) =
+            admin_runtime::restore_persisted_runtime_settings(state.clone(), &previous_settings)
+                .await
+        {
+            tracing::error!(
+                event = "sqlite.write",
+                operation = "admin_runtime_settings_rollback",
+                error_chain = %crate::observability::error_chain_summary(rollback_error.as_ref()),
+                "failed to roll back admin runtime settings after apply failure"
+            );
+        }
+        return Err(ApiError::internal(error));
+    }
 
     Ok(Json(
         load_admin_translation_status_response(state.as_ref()).await?,
@@ -3341,7 +3397,11 @@ async fn create_translation_request_with_origin(
     let now = Utc::now().to_rfc3339();
     let (sqlite_write, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "translation_request")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "translation_request",
+            SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     ensure_legacy_writer_transaction(&mut tx).await?;
@@ -3376,7 +3436,11 @@ async fn resolve_translation_results_for_user(
     let now = Utc::now().to_rfc3339();
     let (_sqlite_write, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "translation_result_resolve")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "translation_result_resolve",
+            SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     ensure_legacy_writer_transaction(&mut tx).await?;
@@ -3399,6 +3463,7 @@ async fn resolve_translation_results_for_user(
     Ok(out)
 }
 
+// sqlite-write-guard: read-only-transaction
 async fn try_resolve_translation_results_without_write(
     state: &AppState,
     user_id: &str,
@@ -3473,7 +3538,11 @@ async fn create_translation_requests_batch_with_origin(
     let now = Utc::now().to_rfc3339();
     let (sqlite_write, mut tx) = state
         .sqlite_writer
-        .begin_immediate(&state.pool, "translation_request_batch")
+        .begin_immediate_with_priority(
+            &state.pool,
+            "translation_request_batch",
+            SqliteWritePriority::Foreground,
+        )
         .await
         .map_err(ApiError::internal)?;
     ensure_legacy_writer_transaction(&mut tx).await?;
@@ -5553,6 +5622,7 @@ async fn requeue_ineligible_queued_batch_items(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+// sqlite-write-guard: read-only-transaction
 async fn claim_existing_queued_batch(
     state: &AppState,
     worker: &TranslationWorkerProfile,
@@ -5734,7 +5804,32 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
 
     match result {
         Ok(results) => {
-            let res = finalize_batch_success(state, &batch, results).await;
+            let res = match finalize_batch_success(state, &batch, results).await {
+                Ok(()) => Ok(()),
+                Err(finalize_error) => {
+                    let finalize_error_text = finalize_error.to_string();
+                    tracing::error!(
+                        event = "translation.batch_finalize_failed",
+                        batch_id = batch.id.as_str(),
+                        error_kind = "finalize_failed",
+                        error = finalize_error_text.as_str(),
+                        "translation batch success finalization failed; attempting owner fallback"
+                    );
+                    match force_fail_translation_batch_if_owned(
+                        state,
+                        &batch,
+                        finalize_error_text.as_str(),
+                    )
+                    .await
+                    {
+                        Ok(true) => Err(finalize_error),
+                        Ok(false) => Err(finalize_error),
+                        Err(fallback_error) => Err(anyhow!(
+                            "translation batch finalization failed: {finalize_error_text}; owner fallback failed: {fallback_error}"
+                        )),
+                    }
+                }
+            };
             heartbeat.stop().await;
             if state
                 .translation_scheduler
@@ -5757,7 +5852,31 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
         }
         Err(err) => {
             let error = err.to_string();
-            let res = finalize_batch_failure(state, &batch, err.into()).await;
+            let res = match finalize_batch_failure(state, &batch, err.into()).await {
+                Ok(()) => Ok(()),
+                Err(finalize_error) => {
+                    let finalize_error_text = finalize_error.to_string();
+                    tracing::error!(
+                        event = "translation.batch_finalize_failed",
+                        batch_id = batch.id.as_str(),
+                        error_kind = "failure_finalize_failed",
+                        error = finalize_error_text.as_str(),
+                        "translation batch failure finalization failed; attempting owner fallback"
+                    );
+                    match force_fail_translation_batch_if_owned(
+                        state,
+                        &batch,
+                        finalize_error_text.as_str(),
+                    )
+                    .await
+                    {
+                        Ok(true) | Ok(false) => Err(anyhow!(finalize_error_text)),
+                        Err(fallback_error) => Err(anyhow!(
+                            "translation batch failure finalization failed: {finalize_error_text}; owner fallback failed: {fallback_error}"
+                        )),
+                    }
+                }
+            };
             heartbeat.stop().await;
             if state
                 .translation_scheduler
@@ -6165,7 +6284,9 @@ async fn finalize_batch_success(
         .await?;
     if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
         tx.rollback().await?;
-        return Ok(());
+        return Err(anyhow!(
+            "translation batch success finalization skipped because legacy mode is disabled"
+        ));
     }
     if !legacy_batch_claim_is_current(&mut tx, state, batch).await? {
         tx.rollback().await?;
@@ -6453,7 +6574,9 @@ async fn finalize_batch_failure(
         .await?;
     if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
         tx.rollback().await?;
-        return Ok(());
+        return Err(anyhow!(
+            "translation batch failure finalization skipped because legacy mode is disabled"
+        ));
     }
     if !legacy_batch_claim_is_current(&mut tx, state, batch).await? {
         tx.rollback().await?;
@@ -6470,6 +6593,41 @@ async fn finalize_batch_failure(
     .await?;
     tx.commit().await?;
     Ok(())
+}
+
+async fn force_fail_translation_batch_if_owned(
+    state: &AppState,
+    batch: &ClaimedBatch,
+    message: &str,
+) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "translation_batch_force_failure")
+        .await?;
+    if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
+        tx.rollback().await?;
+        return Err(anyhow!(
+            "translation batch force failure skipped because legacy mode is disabled"
+        ));
+    }
+    if !legacy_batch_claim_is_current(&mut tx, state, batch).await? {
+        tx.rollback().await.ok();
+        return Ok(false);
+    }
+
+    fail_batch_with_message(
+        &mut tx,
+        batch.id.as_str(),
+        &batch.items,
+        message,
+        None,
+        now.as_str(),
+    )
+    .await
+    .map_err(|error| anyhow!("persist translation batch force failure: {error}"))?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 async fn legacy_batch_claim_is_current(
@@ -6976,8 +7134,6 @@ async fn recover_runtime_state_with_mode(
             state,
             batch_id.as_str(),
             runtime::RUNTIME_LEASE_EXPIRED_ERROR,
-            None,
-            None,
         )
         .await
         {
@@ -7080,8 +7236,6 @@ async fn recover_runtime_state_with_mode(
             state,
             batch.id.as_str(),
             runtime::RUNTIME_LEASE_EXPIRED_ERROR,
-            batch.runtime_owner_id.as_deref(),
-            batch.lease_heartbeat_at.as_deref(),
         )
         .await?;
     }
@@ -10346,9 +10500,14 @@ mod tests {
         .await
         .expect("mark work item due for recovery");
 
-        crate::admin_runtime::update_llm_recovery_runtime_config(&pool, true, 100)
-            .await
-            .expect("enable full recovery rollout");
+        crate::admin_runtime::update_llm_recovery_runtime_config(
+            &pool,
+            &state.sqlite_writer,
+            true,
+            100,
+        )
+        .await
+        .expect("enable full recovery rollout");
         recover_due_translation_work_items(state.as_ref())
             .await
             .expect("recover due work item");
@@ -12161,6 +12320,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn force_fail_translation_batch_closes_owned_running_batch() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let mut item = sample_release_item("force-fail-owned-batch");
+        item.max_wait_ms = 0;
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim batch")
+            .expect("batch exists");
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            UPDATE translation_batches
+            SET status = 'running',
+                started_at = ?,
+                runtime_owner_id = ?,
+                lease_heartbeat_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(state.runtime_owner_id.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(batch.id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark batch running");
+
+        let forced = force_fail_translation_batch_if_owned(
+            state.as_ref(),
+            &batch,
+            "translation batch finalization failed",
+        )
+        .await
+        .expect("force failure should succeed");
+        assert!(forced);
+
+        let batch_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_batches WHERE id = ?")
+                .bind(batch.id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load failed batch status");
+        let work_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ?")
+                .bind(batch.items[0].id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load failed work item status");
+        let active_work_item_id: Option<String> = sqlx::query_scalar(
+            "SELECT active_work_item_id FROM ai_translations WHERE entity_id = ? AND lang = 'zh-CN'",
+        )
+        .bind(item.entity_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load terminal translation projection");
+        let completed_attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM translation_attempt_events WHERE work_item_id = ? AND event_type = 'attempt_completed'",
+        )
+        .bind(batch.items[0].id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load completed translation attempts");
+        let request_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_requests WHERE id = ?")
+                .bind(created.request_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load failed request status");
+        assert_eq!(batch_status, "failed");
+        assert_eq!(work_status, "failed");
+        assert_eq!(request_status, "failed");
+        assert_eq!(active_work_item_id, None);
+        assert_eq!(completed_attempts, 1);
+    }
+
+    #[tokio::test]
     async fn execute_claimed_batch_serializes_start_writes_under_sqlite_write_pressure() {
         let pool = setup_pool_with_busy_timeout(4, Duration::from_millis(25)).await;
         let state = setup_state(pool.clone());
@@ -13519,7 +13762,10 @@ mod tests {
                 .expect("apply runtime config")
         });
 
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        state
+            .translation_scheduler
+            .wait_for_runtime_sync_start()
+            .await;
         assert_eq!(
             state
                 .translation_scheduler
@@ -13539,6 +13785,65 @@ mod tests {
                 .worker_is_desired("translation-worker-general-3")
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn stale_worker_runtime_update_does_not_reinsert_removed_worker() {
+        let pool = setup_pool().await;
+        let scheduler = TranslationSchedulerController::new(TranslationRuntimeConfig::default());
+        let stale_profile = test_worker_profile(3, "general");
+
+        scheduler
+            .sync_runtime_with_config(&pool, TranslationRuntimeConfig::new(2, 1))
+            .await
+            .expect("shrink runtime");
+        scheduler
+            .update_worker_runtime(&stale_profile, TranslationWorkerRuntimeUpdate::idle())
+            .await;
+
+        assert!(
+            !scheduler
+                .runtime_statuses()
+                .await
+                .iter()
+                .any(|worker| worker.worker_id == stale_profile.worker_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_resize_rolls_back_memory_when_slot_persistence_fails() {
+        let scheduler = TranslationSchedulerController::new(TranslationRuntimeConfig::default());
+        {
+            let mut runtime = scheduler.runtime.write().await;
+            let worker = runtime
+                .get_mut(2)
+                .expect("default scheduler should have a third general worker");
+            worker.status = "running".to_owned();
+            worker.worker_slot = 99;
+            worker.current_batch_id = Some("batch-missing-from-test-db".to_owned());
+        }
+        let before_config = scheduler.desired_config().await;
+        let before_runtime = scheduler.runtime_statuses().await;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create empty sqlite pool");
+
+        let result = scheduler
+            .sync_runtime_with_config_internal(
+                &pool,
+                &SqliteWriteCoordinator::new(),
+                TranslationRuntimeConfig::new(2, 1),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "missing translation tables should fail the slot write"
+        );
+        assert_eq!(scheduler.desired_config().await, before_config);
+        assert_eq!(scheduler.runtime_statuses().await, before_runtime);
     }
 
     #[tokio::test]
