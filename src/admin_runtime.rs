@@ -1229,6 +1229,15 @@ pub async fn sync_persisted_runtime_settings(
         load_or_seed_runtime_settings_with_writer(&state.pool, &state.sqlite_writer, &state.config)
             .await?;
 
+    let previous_max_concurrency = state.llm_scheduler.max_concurrency();
+    let previous_routing = state
+        .llm_scheduler
+        .routing_status(state.config.ai.as_ref().map(|cfg| cfg.model.as_str()))
+        .await
+        .llm_models;
+    let previous_health = state.llm_scheduler.model_health_snapshot().await;
+    let next_health = load_llm_model_health(&state.pool).await?;
+
     state
         .llm_scheduler
         .set_max_concurrency(snapshot.llm_max_concurrency)
@@ -1237,11 +1246,8 @@ pub async fn sync_persisted_runtime_settings(
         .llm_scheduler
         .set_model_routing(snapshot.llm_models.clone())
         .await;
-    state
-        .llm_scheduler
-        .set_model_health(load_llm_model_health(&state.pool).await?)
-        .await;
-    state
+    state.llm_scheduler.set_model_health(next_health).await;
+    if let Err(error) = state
         .translation_scheduler
         .apply_runtime_config(
             state.clone(),
@@ -1250,9 +1256,51 @@ pub async fn sync_persisted_runtime_settings(
                 snapshot.translation_dedicated_worker_concurrency,
             ),
         )
-        .await?;
+        .await
+    {
+        state
+            .llm_scheduler
+            .set_max_concurrency(previous_max_concurrency)
+            .await;
+        state
+            .llm_scheduler
+            .set_model_routing(previous_routing)
+            .await;
+        state.llm_scheduler.set_model_health(previous_health).await;
+        return Err(error);
+    }
 
     Ok(snapshot)
+}
+
+pub async fn restore_persisted_runtime_settings(
+    state: std::sync::Arc<AppState>,
+    snapshot: &AdminRuntimeSettingsSnapshot,
+) -> Result<()> {
+    update_llm_runtime_settings(
+        &state.pool,
+        &state.sqlite_writer,
+        snapshot.llm_max_concurrency,
+        snapshot.ai_model_context_limit,
+        &snapshot.llm_models,
+    )
+    .await?;
+    update_llm_recovery_runtime_config(
+        &state.pool,
+        &state.sqlite_writer,
+        snapshot.llm_recovery.enabled,
+        i64::from(snapshot.llm_recovery.rollout_percent),
+    )
+    .await?;
+    update_translation_runtime_settings(
+        &state.pool,
+        &state.sqlite_writer,
+        snapshot.translation_general_worker_concurrency,
+        snapshot.translation_dedicated_worker_concurrency,
+    )
+    .await?;
+    sync_persisted_runtime_settings(state).await?;
+    Ok(())
 }
 
 async fn fetch_runtime_settings(pool: &SqlitePool) -> Result<Option<AdminRuntimeSettingsSnapshot>> {

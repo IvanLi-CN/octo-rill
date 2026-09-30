@@ -9008,6 +9008,8 @@ async fn process_repo_release_work_item(
         REPO_RELEASE_DEADLINE_EXPIRED_ERROR,
         now.as_str(),
         true,
+        Some(state.runtime_owner_id.as_str()),
+        work_item.started_at.as_deref(),
     )
     .await?
     {
@@ -9041,6 +9043,8 @@ async fn process_repo_release_work_item(
         REPO_RELEASE_DEADLINE_EXPIRED_ERROR,
         now.as_str(),
         true,
+        Some(state.runtime_owner_id.as_str()),
+        work_item.started_at.as_deref(),
     )
     .await?
     {
@@ -9051,12 +9055,16 @@ async fn process_repo_release_work_item(
         Ok((stats, candidate_failures)) => {
             let new_release_ids_json = serde_json::to_string(&stats.new_release_ids)
                 .context("serialize repo release new ids payload")?;
-            let updated = state
+            let _updated = state
                 .sqlite_writer
                 .write("repo_release_finalize", |_| async {
-                    Ok::<_, anyhow::Error>(
-                        sqlx::query(
-                            r#"
+                    let mut tx = state
+                        .pool
+                        .begin_with("BEGIN IMMEDIATE")
+                        .await
+                        .context("begin repo release success finalization tx")?;
+                    let updated = sqlx::query(
+                        r#"
                         UPDATE repo_release_work_items
                         SET
                           status = ?,
@@ -9084,60 +9092,73 @@ async fn process_repo_release_work_item(
                           AND started_at = ?
                           AND julianday(deadline_at) > julianday(?)
                         "#,
-                        )
-                        .bind(jobs::STATUS_SUCCEEDED)
-                        .bind(now.as_str())
-                        .bind(
-                            i64::try_from(stats.inserted_count + stats.updated_count)
-                                .unwrap_or(i64::MAX),
-                        )
-                        .bind(i64::try_from(stats.fetched_count).unwrap_or(i64::MAX))
-                        .bind(i64::try_from(stats.inserted_count).unwrap_or(i64::MAX))
-                        .bind(i64::try_from(stats.updated_count).unwrap_or(i64::MAX))
-                        .bind(i64::try_from(stats.unchanged_count).unwrap_or(i64::MAX))
-                        .bind(new_release_ids_json.as_str())
-                        .bind(i64::try_from(stats.pages_fetched).unwrap_or(i64::MAX))
-                        .bind(stats.stopped_reason.as_str())
-                        .bind(i64::try_from(candidate_failures).unwrap_or(i64::MAX))
-                        .bind(now.as_str())
-                        .bind(now.as_str())
-                        .bind(now.as_str())
-                        .bind(&work_item.id)
-                        .bind(jobs::STATUS_RUNNING)
-                        .bind(state.runtime_owner_id.as_str())
-                        .bind(work_item.started_at.as_deref().unwrap_or_default())
-                        .bind(now.as_str())
-                        .execute(&state.pool)
-                        .await
-                        .with_context(|| {
-                            format!("failed to finalize repo release work item {}", work_item.id)
-                        })?
-                        .rows_affected(),
                     )
+                    .bind(jobs::STATUS_SUCCEEDED)
+                    .bind(now.as_str())
+                    .bind(
+                        i64::try_from(stats.inserted_count + stats.updated_count)
+                            .unwrap_or(i64::MAX),
+                    )
+                    .bind(i64::try_from(stats.fetched_count).unwrap_or(i64::MAX))
+                    .bind(i64::try_from(stats.inserted_count).unwrap_or(i64::MAX))
+                    .bind(i64::try_from(stats.updated_count).unwrap_or(i64::MAX))
+                    .bind(i64::try_from(stats.unchanged_count).unwrap_or(i64::MAX))
+                    .bind(new_release_ids_json.as_str())
+                    .bind(i64::try_from(stats.pages_fetched).unwrap_or(i64::MAX))
+                    .bind(stats.stopped_reason.as_str())
+                    .bind(i64::try_from(candidate_failures).unwrap_or(i64::MAX))
+                    .bind(now.as_str())
+                    .bind(now.as_str())
+                    .bind(now.as_str())
+                    .bind(&work_item.id)
+                    .bind(jobs::STATUS_RUNNING)
+                    .bind(state.runtime_owner_id.as_str())
+                    .bind(work_item.started_at.as_deref().unwrap_or_default())
+                    .bind(now.as_str())
+                    .execute(&mut *tx)
+                    .await
+                    .with_context(|| {
+                        format!("failed to finalize repo release work item {}", work_item.id)
+                    })?
+                    .rows_affected();
+                    if updated > 0 {
+                        mark_repo_release_watchers_tx(
+                            &mut tx,
+                            &work_item.id,
+                            "succeeded",
+                            None,
+                            &now,
+                        )
+                        .await?;
+                        record_repo_refresh_governance_attempt_tx(
+                            &mut tx,
+                            &work_item.id,
+                            "succeeded",
+                            None,
+                            Some(now.as_str()),
+                            now.as_str(),
+                        )
+                        .await?;
+                    }
+                    tx.commit()
+                        .await
+                        .context("commit repo release success finalization tx")?;
+                    Ok::<_, anyhow::Error>(updated)
                 })
                 .await?;
-            if updated > 0 {
-                mark_repo_release_watchers(state.as_ref(), &work_item.id, "succeeded", None, &now)
-                    .await?;
-                record_repo_refresh_governance_attempt(
-                    state.as_ref(),
-                    &work_item.id,
-                    "succeeded",
-                    None,
-                    Some(now.as_str()),
-                    now.as_str(),
-                )
-                .await?;
-            }
         }
         Err(err) => {
             let error_message = err.to_string();
-            let updated = state
+            let _updated = state
                 .sqlite_writer
                 .write("repo_release_finalize", |_| async {
-                    Ok::<_, anyhow::Error>(
-                        sqlx::query(
-                            r#"
+                    let mut tx = state
+                        .pool
+                        .begin_with("BEGIN IMMEDIATE")
+                        .await
+                        .context("begin repo release failure finalization tx")?;
+                    let updated = sqlx::query(
+                        r#"
                         UPDATE repo_release_work_items
                         SET
                           status = ?,
@@ -9155,45 +9176,48 @@ async fn process_repo_release_work_item(
                           AND started_at = ?
                           AND julianday(deadline_at) > julianday(?)
                         "#,
-                        )
-                        .bind(jobs::STATUS_FAILED)
-                        .bind(now.as_str())
-                        .bind(error_message.as_str())
-                        .bind(now.as_str())
-                        .bind(now.as_str())
-                        .bind(&work_item.id)
-                        .bind(jobs::STATUS_RUNNING)
-                        .bind(state.runtime_owner_id.as_str())
-                        .bind(work_item.started_at.as_deref().unwrap_or_default())
-                        .bind(now.as_str())
-                        .execute(&state.pool)
-                        .await
-                        .with_context(|| {
-                            format!("failed to fail repo release work item {}", work_item.id)
-                        })?
-                        .rows_affected(),
                     )
+                    .bind(jobs::STATUS_FAILED)
+                    .bind(now.as_str())
+                    .bind(error_message.as_str())
+                    .bind(now.as_str())
+                    .bind(now.as_str())
+                    .bind(&work_item.id)
+                    .bind(jobs::STATUS_RUNNING)
+                    .bind(state.runtime_owner_id.as_str())
+                    .bind(work_item.started_at.as_deref().unwrap_or_default())
+                    .bind(now.as_str())
+                    .execute(&mut *tx)
+                    .await
+                    .with_context(|| {
+                        format!("failed to fail repo release work item {}", work_item.id)
+                    })?
+                    .rows_affected();
+                    if updated > 0 {
+                        mark_repo_release_watchers_tx(
+                            &mut tx,
+                            &work_item.id,
+                            "failed",
+                            Some(error_message.as_str()),
+                            &now,
+                        )
+                        .await?;
+                        record_repo_refresh_governance_attempt_tx(
+                            &mut tx,
+                            &work_item.id,
+                            "failed",
+                            Some(error_message.as_str()),
+                            None,
+                            now.as_str(),
+                        )
+                        .await?;
+                    }
+                    tx.commit()
+                        .await
+                        .context("commit repo release failure finalization tx")?;
+                    Ok::<_, anyhow::Error>(updated)
                 })
                 .await?;
-            if updated > 0 {
-                mark_repo_release_watchers(
-                    state.as_ref(),
-                    &work_item.id,
-                    "failed",
-                    Some(error_message.as_str()),
-                    &now,
-                )
-                .await?;
-                record_repo_refresh_governance_attempt(
-                    state.as_ref(),
-                    &work_item.id,
-                    "failed",
-                    Some(error_message.as_str()),
-                    None,
-                    now.as_str(),
-                )
-                .await?;
-            }
         }
     }
 
@@ -9923,78 +9947,64 @@ async fn upsert_repo_releases(
         .await
 }
 
-async fn mark_repo_release_watchers(
-    state: &AppState,
+async fn mark_repo_release_watchers_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
     work_item_id: &str,
     status: &str,
     error_text: Option<&str>,
     now_rfc3339: &str,
 ) -> Result<()> {
-    state
-        .sqlite_writer
-        .write("repo_release_watchers", |_| async {
-            sqlx::query(
-                r#"
-                UPDATE repo_release_watchers
-                SET status = ?, error_text = ?, updated_at = ?
-                WHERE work_item_id = ? AND status = 'pending'
-                "#,
-            )
-            .bind(status)
-            .bind(error_text)
-            .bind(now_rfc3339)
-            .bind(work_item_id)
-            .execute(&state.pool)
-            .await
-            .context("failed to update repo release watchers")?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .await?;
+    sqlx::query(
+        r#"
+        UPDATE repo_release_watchers
+        SET status = ?, error_text = ?, updated_at = ?
+        WHERE work_item_id = ? AND status = 'pending'
+        "#,
+    )
+    .bind(status)
+    .bind(error_text)
+    .bind(now_rfc3339)
+    .bind(work_item_id)
+    .execute(&mut **tx)
+    .await
+    .context("failed to update repo release watchers")?;
     Ok(())
 }
 
-async fn record_repo_refresh_governance_attempt(
-    state: &AppState,
+async fn record_repo_refresh_governance_attempt_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
     work_item_id: &str,
     attempt_status: &str,
     attempt_error: Option<&str>,
     actual_success_at: Option<&str>,
     now_rfc3339: &str,
 ) -> Result<()> {
-    state
-        .sqlite_writer
-        .write("repo_refresh_governance_attempt", |_| async {
-            let mut tx = state
-                .pool
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .context("begin repo refresh governance attempt tx")?;
+    let tx = &mut **tx;
 
-            let repo_row = sqlx::query(
-                r#"
+    let repo_row = sqlx::query(
+        r#"
                 SELECT repo_id, request_origin
                 FROM repo_release_work_items
                 WHERE id = ?
                 LIMIT 1
                 "#,
-            )
-            .bind(work_item_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .context("load repo release work item for governance attempt")?;
+    )
+    .bind(work_item_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("load repo release work item for governance attempt")?;
 
-            let Some(repo_row) = repo_row else {
-                tx.rollback().await.ok();
-                return Ok::<_, anyhow::Error>(());
-            };
+    let Some(repo_row) = repo_row else {
+        return Ok(());
+    };
 
-            let repo_id: i64 = repo_row.get("repo_id");
-            let request_origin: String = repo_row.get("request_origin");
-            let attempt_succeeded = attempt_status == jobs::STATUS_SUCCEEDED;
-            let actual_succeeded = actual_success_at.is_some();
+    let repo_id: i64 = repo_row.get("repo_id");
+    let request_origin: String = repo_row.get("request_origin");
+    let attempt_succeeded = attempt_status == jobs::STATUS_SUCCEEDED;
+    let actual_succeeded = actual_success_at.is_some();
 
-            sqlx::query(
-                r#"
+    sqlx::query(
+        r#"
                 UPDATE repo_refresh_governance_snapshots
                 SET actual_last_success_at = CASE
                       WHEN ? = 1 THEN ?
@@ -10084,24 +10094,24 @@ async fn record_repo_refresh_governance_attempt(
                     updated_at = ?
                 WHERE repo_id = ?
                 "#,
-            )
-            .bind(if actual_succeeded { 1_i64 } else { 0_i64 })
-            .bind(actual_success_at)
-            .bind(if actual_succeeded { 1_i64 } else { 0_i64 })
-            .bind(request_origin.as_str())
-            .bind(if attempt_succeeded { 1_i64 } else { 0_i64 })
-            .bind(now_rfc3339)
-            .bind(now_rfc3339)
-            .bind(attempt_status)
-            .bind(attempt_error)
-            .bind(now_rfc3339)
-            .bind(repo_id)
-            .execute(&mut *tx)
-            .await
-            .context("update repo refresh governance snapshot attempt state")?;
+    )
+    .bind(if actual_succeeded { 1_i64 } else { 0_i64 })
+    .bind(actual_success_at)
+    .bind(if actual_succeeded { 1_i64 } else { 0_i64 })
+    .bind(request_origin.as_str())
+    .bind(if attempt_succeeded { 1_i64 } else { 0_i64 })
+    .bind(now_rfc3339)
+    .bind(now_rfc3339)
+    .bind(attempt_status)
+    .bind(attempt_error)
+    .bind(now_rfc3339)
+    .bind(repo_id)
+    .execute(&mut *tx)
+    .await
+    .context("update repo refresh governance snapshot attempt state")?;
 
-            let active_cycle_id: Option<String> = sqlx::query_scalar(
-                r#"
+    let active_cycle_id: Option<String> = sqlx::query_scalar(
+        r#"
                 SELECT active_cycle_id
                 FROM repo_refresh_governance_snapshots
                 WHERE repo_id = ?
@@ -10123,16 +10133,16 @@ async fn record_repo_refresh_governance_attempt(
                   )
                 LIMIT 1
                 "#,
-            )
-            .bind(repo_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .context("load repo refresh active cycle id")?
-            .flatten();
+    )
+    .bind(repo_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("load repo refresh active cycle id")?
+    .flatten();
 
-            if let Some(active_cycle_id) = active_cycle_id {
-                sqlx::query(
-                    r#"
+    if let Some(active_cycle_id) = active_cycle_id {
+        sqlx::query(
+            r#"
                         UPDATE repo_refresh_governance_cycle_members
                         SET completed_at = COALESCE(completed_at, ?),
                             attempt_status = COALESCE(attempt_status, ?),
@@ -10146,19 +10156,19 @@ async fn record_repo_refresh_governance_attempt(
                               AND cycles.status = 'active'
                           )
                         "#,
-                )
-                .bind(now_rfc3339)
-                .bind(attempt_status)
-                .bind(attempt_error)
-                .bind(now_rfc3339)
-                .bind(active_cycle_id.as_str())
-                .bind(repo_id)
-                .execute(&mut *tx)
-                .await
-                .context("mark repo refresh cycle member completed")?;
+        )
+        .bind(now_rfc3339)
+        .bind(attempt_status)
+        .bind(attempt_error)
+        .bind(now_rfc3339)
+        .bind(active_cycle_id.as_str())
+        .bind(repo_id)
+        .execute(&mut *tx)
+        .await
+        .context("mark repo refresh cycle member completed")?;
 
-                sqlx::query(
-                    r#"
+        sqlx::query(
+            r#"
                         UPDATE repo_refresh_governance_snapshots
                         SET active_cycle_completed = 1,
                             system_last_attempt_at = COALESCE(system_last_attempt_at, ?),
@@ -10174,52 +10184,52 @@ async fn record_repo_refresh_governance_attempt(
                               AND cycles.status = 'active'
                           )
                         "#,
-                )
-                .bind(now_rfc3339)
-                .bind(attempt_status)
-                .bind(attempt_error)
-                .bind(now_rfc3339)
-                .bind(repo_id)
-                .bind(active_cycle_id.as_str())
-                .execute(&mut *tx)
-                .await
-                .context("mark repo refresh snapshot cycle completion")?;
+        )
+        .bind(now_rfc3339)
+        .bind(attempt_status)
+        .bind(attempt_error)
+        .bind(now_rfc3339)
+        .bind(repo_id)
+        .bind(active_cycle_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .context("mark repo refresh snapshot cycle completion")?;
 
-                let completed_repo_count: i64 = sqlx::query_scalar(
-                    r#"
+        let completed_repo_count: i64 = sqlx::query_scalar(
+            r#"
                         SELECT COUNT(*)
                         FROM repo_refresh_governance_cycle_members
                         WHERE cycle_id = ?
                           AND completed_at IS NOT NULL
                         "#,
-                )
-                .bind(active_cycle_id.as_str())
-                .fetch_one(&mut *tx)
-                .await
-                .context("count completed repo refresh cycle members")?;
-                let frozen_repo_count: i64 = sqlx::query_scalar(
-                    r#"
+        )
+        .bind(active_cycle_id.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .context("count completed repo refresh cycle members")?;
+        let frozen_repo_count: i64 = sqlx::query_scalar(
+            r#"
                         SELECT frozen_repo_count
                         FROM repo_refresh_governance_cycles
                         WHERE id = ?
                         LIMIT 1
                         "#,
-                )
-                .bind(active_cycle_id.as_str())
-                .fetch_one(&mut *tx)
-                .await
-                .context("load repo refresh cycle frozen repo count")?;
+        )
+        .bind(active_cycle_id.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .context("load repo refresh cycle frozen repo count")?;
 
-                if completed_repo_count >= frozen_repo_count {
-                    let cycle_window_minutes: i64 = sqlx::query_scalar(
-                        "SELECT window_minutes FROM repo_refresh_governance_cycles WHERE id = ? LIMIT 1",
-                    )
-                    .bind(active_cycle_id.as_str())
-                    .fetch_one(&mut *tx)
-                    .await
-                    .context("load repo refresh cycle window minutes")?;
-                    sqlx::query(
-                        r#"
+        if completed_repo_count >= frozen_repo_count {
+            let cycle_window_minutes: i64 = sqlx::query_scalar(
+                "SELECT window_minutes FROM repo_refresh_governance_cycles WHERE id = ? LIMIT 1",
+            )
+            .bind(active_cycle_id.as_str())
+            .fetch_one(&mut *tx)
+            .await
+            .context("load repo refresh cycle window minutes")?;
+            sqlx::query(
+                r#"
                             UPDATE repo_refresh_governance_cycles
                             SET status = 'completed',
                                 completed_repo_count = ?,
@@ -10229,44 +10239,71 @@ async fn record_repo_refresh_governance_attempt(
                             WHERE id = ?
                               AND status = 'active'
                             "#,
-                    )
-                    .bind(completed_repo_count)
-                    .bind(current_repo_refresh_window_index(
-                        Utc::now(),
-                        cycle_window_minutes,
-                    ))
-                    .bind(now_rfc3339)
-                    .bind(now_rfc3339)
-                    .bind(active_cycle_id.as_str())
-                    .execute(&mut *tx)
-                    .await
-                    .context("complete repo refresh governance cycle")?;
-                } else {
-                    sqlx::query(
-                        r#"
+            )
+            .bind(completed_repo_count)
+            .bind(current_repo_refresh_window_index(
+                Utc::now(),
+                cycle_window_minutes,
+            ))
+            .bind(now_rfc3339)
+            .bind(now_rfc3339)
+            .bind(active_cycle_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .context("complete repo refresh governance cycle")?;
+        } else {
+            sqlx::query(
+                r#"
                             UPDATE repo_refresh_governance_cycles
                             SET completed_repo_count = ?,
                                 updated_at = ?
                             WHERE id = ?
                               AND status = 'active'
                             "#,
-                    )
-                    .bind(completed_repo_count)
-                    .bind(now_rfc3339)
-                    .bind(active_cycle_id.as_str())
-                    .execute(&mut *tx)
-                    .await
-                    .context("update repo refresh governance cycle progress")?;
-                }
-            }
+            )
+            .bind(completed_repo_count)
+            .bind(now_rfc3339)
+            .bind(active_cycle_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .context("update repo refresh governance cycle progress")?;
+        }
+    }
 
+    Ok(())
+}
+
+async fn record_repo_refresh_governance_attempt(
+    state: &AppState,
+    work_item_id: &str,
+    attempt_status: &str,
+    attempt_error: Option<&str>,
+    actual_success_at: Option<&str>,
+    now_rfc3339: &str,
+) -> Result<()> {
+    state
+        .sqlite_writer
+        .write("repo_refresh_governance_attempt", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin repo refresh governance attempt tx")?;
+            record_repo_refresh_governance_attempt_tx(
+                &mut tx,
+                work_item_id,
+                attempt_status,
+                attempt_error,
+                actual_success_at,
+                now_rfc3339,
+            )
+            .await?;
             tx.commit()
                 .await
                 .context("commit repo refresh governance attempt tx")?;
             Ok::<_, anyhow::Error>(())
         })
         .await?;
-
     Ok(())
 }
 
@@ -10309,6 +10346,8 @@ async fn fail_repo_release_work_item(
     error_text: &str,
     now: &str,
     require_expired_deadline: bool,
+    runtime_owner_id: Option<&str>,
+    started_at: Option<&str>,
 ) -> Result<bool> {
     let require_expired_deadline = if require_expired_deadline {
         1_i64
@@ -10318,9 +10357,13 @@ async fn fail_repo_release_work_item(
     let updated = state
         .sqlite_writer
         .write("repo_release_fail", |_| async {
-            Ok::<_, anyhow::Error>(
-                sqlx::query(
-                    r#"
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin repo release failure tx")?;
+            let updated = sqlx::query(
+                r#"
                 UPDATE repo_release_work_items
                 SET
                   status = ?,
@@ -10334,39 +10377,54 @@ async fn fail_repo_release_work_item(
                   lease_heartbeat_at = NULL
                 WHERE id = ?
                   AND status IN (?, ?)
+                  AND (? IS NULL OR runtime_owner_id = ?)
+                  AND (? IS NULL OR started_at = ?)
                   AND (? = 0 OR julianday(deadline_at) <= julianday(?))
                 "#,
-                )
-                .bind(jobs::STATUS_FAILED)
-                .bind(now)
-                .bind(error_text)
-                .bind(now)
-                .bind(now)
-                .bind(work_item_id)
-                .bind(jobs::STATUS_QUEUED)
-                .bind(jobs::STATUS_RUNNING)
-                .bind(require_expired_deadline)
-                .bind(now)
-                .execute(&state.pool)
-                .await
-                .with_context(|| format!("failed to fail repo release work item {work_item_id}"))?
-                .rows_affected(),
             )
+            .bind(jobs::STATUS_FAILED)
+            .bind(now)
+            .bind(error_text)
+            .bind(now)
+            .bind(now)
+            .bind(work_item_id)
+            .bind(jobs::STATUS_QUEUED)
+            .bind(jobs::STATUS_RUNNING)
+            .bind(runtime_owner_id)
+            .bind(runtime_owner_id)
+            .bind(started_at)
+            .bind(started_at)
+            .bind(require_expired_deadline)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("failed to fail repo release work item {work_item_id}"))?
+            .rows_affected();
+            if updated > 0 {
+                mark_repo_release_watchers_tx(
+                    &mut tx,
+                    work_item_id,
+                    "failed",
+                    Some(error_text),
+                    now,
+                )
+                .await?;
+                record_repo_refresh_governance_attempt_tx(
+                    &mut tx,
+                    work_item_id,
+                    "failed",
+                    Some(error_text),
+                    None,
+                    now,
+                )
+                .await?;
+            }
+            tx.commit()
+                .await
+                .context("commit repo release failure tx")?;
+            Ok::<_, anyhow::Error>(updated)
         })
         .await?;
-
-    if updated > 0 {
-        mark_repo_release_watchers(state, work_item_id, "failed", Some(error_text), now).await?;
-        record_repo_refresh_governance_attempt(
-            state,
-            work_item_id,
-            "failed",
-            Some(error_text),
-            None,
-            now,
-        )
-        .await?;
-    }
 
     Ok(updated > 0)
 }
@@ -10382,6 +10440,11 @@ async fn fail_repo_release_work_item_if_stale(
     let updated = state
         .sqlite_writer
         .write("repo_release_recover", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin repo release recovery tx")?;
             let updated = match mode {
                 runtime::RuntimeRecoveryMode::Startup => sqlx::query(
                     r#"
@@ -10428,7 +10491,7 @@ async fn fail_repo_release_work_item_if_stale(
                 .bind(cutoff)
                 .bind(state.runtime_owner_id.as_str())
                 .bind(cutoff)
-                .execute(&state.pool)
+                .execute(&mut *tx)
                 .await
                 .with_context(|| {
                     format!("failed to recover stale repo release work item {}", row.id)
@@ -10467,28 +10530,38 @@ async fn fail_repo_release_work_item_if_stale(
                 .bind(row.runtime_owner_id.as_deref())
                 .bind(row.lease_heartbeat_at.as_deref())
                 .bind(cutoff)
-                .execute(&state.pool)
+                .execute(&mut *tx)
                 .await
                 .with_context(|| {
                     format!("failed to recover stale repo release work item {}", row.id)
                 })?,
             };
-            Ok::<_, anyhow::Error>(updated.rows_affected() > 0)
+            let updated = updated.rows_affected() > 0;
+            if updated {
+                mark_repo_release_watchers_tx(
+                    &mut tx,
+                    row.id.as_str(),
+                    "failed",
+                    Some(error_text),
+                    now,
+                )
+                .await?;
+                record_repo_refresh_governance_attempt_tx(
+                    &mut tx,
+                    row.id.as_str(),
+                    "failed",
+                    Some(error_text),
+                    None,
+                    now,
+                )
+                .await?;
+            }
+            tx.commit()
+                .await
+                .context("commit repo release recovery tx")?;
+            Ok::<_, anyhow::Error>(updated)
         })
         .await?;
-
-    if updated {
-        mark_repo_release_watchers(state, row.id.as_str(), "failed", Some(error_text), now).await?;
-        record_repo_refresh_governance_attempt(
-            state,
-            row.id.as_str(),
-            "failed",
-            Some(error_text),
-            None,
-            now,
-        )
-        .await?;
-    }
 
     Ok(updated)
 }
@@ -10510,6 +10583,8 @@ async fn expire_repo_release_work_item_ids(
             REPO_RELEASE_DEADLINE_EXPIRED_ERROR,
             now.as_str(),
             true,
+            None,
+            None,
         )
         .await?
         {
@@ -22015,6 +22090,8 @@ mod tests {
             REPO_RELEASE_DEADLINE_EXPIRED_ERROR,
             chrono::Utc::now().to_rfc3339().as_str(),
             true,
+            None,
+            None,
         )
         .await
         .expect("skip refreshed deadline");

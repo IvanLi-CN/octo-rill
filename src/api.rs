@@ -666,7 +666,7 @@ async fn touch_user_last_active_at(state: &AppState, user_id: &str) -> Result<()
         })
         .await;
     match result {
-        Ok(Some(())) => {}
+        Ok(Some(_)) => {}
         Ok(None) => {
             tracing::debug!(
                 user_id,
@@ -7531,6 +7531,13 @@ pub async fn admin_patch_llm_runtime_config(
     Json(req): Json<AdminLlmRuntimeConfigUpdateRequest>,
 ) -> Result<Json<AdminLlmSchedulerStatusResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let previous_settings = admin_runtime::load_or_seed_runtime_settings_with_writer(
+        &state.pool,
+        &state.sqlite_writer,
+        &state.config,
+    )
+    .await
+    .map_err(ApiError::internal)?;
     let max_concurrency = parse_positive_admin_concurrency(req.max_concurrency, "max_concurrency")?;
     let ai_model_context_limit = match req.ai_model_context_limit {
         Some(Some(value)) => Some(parse_positive_runtime_limit(
@@ -7567,30 +7574,42 @@ pub async fn admin_patch_llm_runtime_config(
         Some(value) => value,
         None => i64::from(current_recovery.rollout_percent),
     };
-    admin_runtime::update_llm_runtime_settings(
-        &state.pool,
-        &state.sqlite_writer,
-        max_concurrency,
-        ai_model_context_limit,
-        &llm_models,
-    )
-    .await
-    .map_err(ApiError::internal)?;
-    admin_runtime::update_llm_recovery_runtime_config(
-        &state.pool,
-        &state.sqlite_writer,
-        recovery_enabled,
-        recovery_rollout_percent,
-    )
-    .await
-    .map_err(ApiError::internal)?;
-    admin_runtime::sync_persisted_runtime_settings(state.clone())
-        .await
-        .map_err(ApiError::internal)?;
-    if route_changed {
-        content_processing::on_runtime_configuration_reload(state.as_ref())
-            .await
-            .map_err(ApiError::internal)?;
+    let apply_result = async {
+        admin_runtime::update_llm_runtime_settings(
+            &state.pool,
+            &state.sqlite_writer,
+            max_concurrency,
+            ai_model_context_limit,
+            &llm_models,
+        )
+        .await?;
+        admin_runtime::update_llm_recovery_runtime_config(
+            &state.pool,
+            &state.sqlite_writer,
+            recovery_enabled,
+            recovery_rollout_percent,
+        )
+        .await?;
+        admin_runtime::sync_persisted_runtime_settings(state.clone()).await?;
+        if route_changed {
+            content_processing::on_runtime_configuration_reload(state.as_ref()).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = apply_result {
+        if let Err(rollback_error) =
+            admin_runtime::restore_persisted_runtime_settings(state.clone(), &previous_settings)
+                .await
+        {
+            tracing::error!(
+                event = "sqlite.write",
+                operation = "admin_runtime_settings_rollback",
+                error_chain = %crate::observability::error_chain_summary(rollback_error.as_ref()),
+                "failed to roll back admin runtime settings after apply failure"
+            );
+        }
+        return Err(ApiError::internal(error));
     }
 
     Ok(Json(
@@ -15554,29 +15573,30 @@ async fn load_reaction_pat_token(
     .transpose()
 }
 
+#[cfg(test)]
 async fn persist_reaction_pat_check_result(
     state: &AppState,
     user_id: &str,
     check_state: &str,
     check_message: Option<&str>,
 ) -> Result<(), ApiError> {
-    let now = chrono::Utc::now().to_rfc3339();
     state
         .sqlite_writer
         .write_foreground("reaction_pat_check_result_update", |_| async {
+            let now = chrono::Utc::now().to_rfc3339();
             sqlx::query(
                 r#"
-                UPDATE reaction_pat_tokens
-                SET last_check_state = ?,
-                    last_check_message = ?,
-                    last_checked_at = ?,
-                    webhook_push_allows_private_repos = CASE
-                      WHEN ? = 'valid' THEN webhook_push_allows_private_repos
-                      ELSE NULL
-                    END,
-                    updated_at = ?
-                WHERE user_id = ?
-                "#,
+            UPDATE reaction_pat_tokens
+            SET last_check_state = ?,
+                last_check_message = ?,
+                last_checked_at = ?,
+                webhook_push_allows_private_repos = CASE
+                  WHEN ? = 'valid' THEN webhook_push_allows_private_repos
+                  ELSE NULL
+                END,
+                updated_at = ?
+            WHERE user_id = ?
+            "#,
             )
             .bind(check_state)
             .bind(check_message)
@@ -15599,16 +15619,56 @@ async fn persist_reaction_pat_check_result_best_effort(
     check_state: &str,
     check_message: Option<&str>,
 ) {
-    if let Err(err) =
-        persist_reaction_pat_check_result(state, user_id, check_state, check_message).await
+    match state
+        .sqlite_writer
+        .try_write("reaction_pat_check_result_update", || async {
+            let now = chrono::Utc::now().to_rfc3339();
+            sqlx::query(
+                r#"
+            UPDATE reaction_pat_tokens
+            SET last_check_state = ?,
+                last_check_message = ?,
+                last_checked_at = ?,
+                webhook_push_allows_private_repos = CASE
+                  WHEN ? = 'valid' THEN webhook_push_allows_private_repos
+                  ELSE NULL
+                END,
+                updated_at = ?
+            WHERE user_id = ?
+            "#,
+            )
+            .bind(check_state)
+            .bind(check_message)
+            .bind(now.as_str())
+            .bind(check_state)
+            .bind(now.as_str())
+            .bind(user_id)
+            .execute(&state.pool)
+            .await
+            .map_err(anyhow::Error::from)
+        })
+        .await
     {
-        tracing::warn!(
-            event = "sqlite.write",
-            operation = "reaction_pat_check_result_update",
-            downgrade_reason = "persistence_failed",
-            error = %err,
-            "failed to persist reaction PAT check result"
-        );
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tracing::debug!(
+                event = "sqlite.write",
+                operation = "reaction_pat_check_result_update",
+                priority = "best_effort",
+                downgrade_reason = "sqlite_writer_busy",
+                "skipped reaction PAT check result persistence under writer pressure"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                event = "sqlite.write",
+                operation = "reaction_pat_check_result_update",
+                priority = "best_effort",
+                downgrade_reason = "persistence_failed",
+                error = %err,
+                "failed to persist reaction PAT check result"
+            );
+        }
     }
 }
 

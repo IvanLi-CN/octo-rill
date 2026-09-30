@@ -245,6 +245,8 @@ impl SqliteWriteCoordinator {
                 debug!(
                     event = "sqlite.write",
                     operation = lane,
+                    priority = SqliteWritePriority::BestEffort.as_str(),
+                    downgrade_reason = "sqlite_writer_busy",
                     "sqlite writer permit unavailable; skipping best-effort write"
                 );
                 return Ok(None);

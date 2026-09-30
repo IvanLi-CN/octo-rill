@@ -30,6 +30,7 @@ struct SourceVisitor {
     sqlite_writer_closure_depth: usize,
     read_only_transaction_depth: usize,
     pool_aliases: BTreeSet<String>,
+    transaction_aliases: BTreeSet<String>,
     coordinator_facade_functions: BTreeSet<String>,
     read_only_transaction_functions: BTreeSet<String>,
 }
@@ -43,6 +44,7 @@ impl<'ast> Visit<'ast> for SourceVisitor {
     fn visit_item_fn(&mut self, item: &'ast ItemFn) {
         let previous_test_only_depth = self.test_only_depth;
         let previous_pool_aliases = self.pool_aliases.clone();
+        let previous_transaction_aliases = self.transaction_aliases.clone();
         let previous_read_only_transaction_depth = self.read_only_transaction_depth;
         if has_cfg_test(&item.attrs) {
             self.test_only_depth += 1;
@@ -64,6 +66,7 @@ impl<'ast> Visit<'ast> for SourceVisitor {
         visit::visit_item_fn(self, item);
         self.test_only_depth = previous_test_only_depth;
         self.pool_aliases = previous_pool_aliases;
+        self.transaction_aliases = previous_transaction_aliases;
         self.read_only_transaction_depth = previous_read_only_transaction_depth;
     }
 
@@ -78,8 +81,10 @@ impl<'ast> Visit<'ast> for SourceVisitor {
 
     fn visit_block(&mut self, block: &'ast Block) {
         let previous_pool_aliases = self.pool_aliases.clone();
+        let previous_transaction_aliases = self.transaction_aliases.clone();
         visit::visit_block(self, block);
         self.pool_aliases = previous_pool_aliases;
+        self.transaction_aliases = previous_transaction_aliases;
     }
 
     fn visit_local(&mut self, local: &'ast Local) {
@@ -88,12 +93,21 @@ impl<'ast> Visit<'ast> for SourceVisitor {
                 .init
                 .as_ref()
                 .is_some_and(|init| expression_mentions_pool(&init.expr, &self.pool_aliases));
+        let is_transaction_alias = local
+            .init
+            .as_ref()
+            .is_some_and(|init| is_pool_transaction_expression(&init.expr, &self.pool_aliases));
         visit::visit_local(self, local);
         if let Some(pattern) = pattern_identifier(&local.pat) {
             if is_pool_alias {
                 self.pool_aliases.insert(pattern.ident.to_string());
             } else {
                 self.pool_aliases.remove(&pattern.ident.to_string());
+            }
+            if is_transaction_alias {
+                self.transaction_aliases.insert(pattern.ident.to_string());
+            } else {
+                self.transaction_aliases.remove(&pattern.ident.to_string());
             }
         }
     }
@@ -109,7 +123,7 @@ impl<'ast> Visit<'ast> for SourceVisitor {
         let is_explicit_read_only_transaction =
             self.read_only_transaction_depth > 0 && expression.method == "begin";
         if self.test_only_depth == 0
-            && is_direct_pool_write(expression, &self.pool_aliases)
+            && is_direct_pool_write(expression, &self.pool_aliases, &self.transaction_aliases)
             && self.sqlite_writer_closure_depth == 0
             && !is_explicit_read_only_transaction
         {
@@ -332,14 +346,30 @@ fn type_mentions_sqlite_pool(ty: &Type) -> bool {
         Type::Array(array) => type_mentions_sqlite_pool(&array.elem),
         Type::Group(group) => type_mentions_sqlite_pool(&group.elem),
         Type::Paren(paren) => type_mentions_sqlite_pool(&paren.elem),
+        Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
+            segment.ident == "SqlitePool"
+                || (segment.ident == "Pool"
+                    && matches!(&segment.arguments, syn::PathArguments::AngleBracketed(arguments) if arguments.args.iter().any(|argument| {
+                        matches!(argument, syn::GenericArgument::Type(ty) if type_is_sqlite(ty))
+                    })) )
+        }),
+        Type::Reference(reference) => type_mentions_sqlite_pool(&reference.elem),
+        Type::Slice(slice) => type_mentions_sqlite_pool(&slice.elem),
+        Type::Tuple(tuple) => tuple.elems.iter().any(type_mentions_sqlite_pool),
+        _ => false,
+    }
+}
+
+fn type_is_sqlite(ty: &Type) -> bool {
+    match ty {
+        Type::Group(group) => type_is_sqlite(&group.elem),
+        Type::Paren(paren) => type_is_sqlite(&paren.elem),
         Type::Path(path) => path
             .path
             .segments
             .last()
-            .is_some_and(|segment| segment.ident == "SqlitePool"),
-        Type::Reference(reference) => type_mentions_sqlite_pool(&reference.elem),
-        Type::Slice(slice) => type_mentions_sqlite_pool(&slice.elem),
-        Type::Tuple(tuple) => tuple.elems.iter().any(type_mentions_sqlite_pool),
+            .is_some_and(|segment| segment.ident == "Sqlite"),
+        Type::Reference(reference) => type_is_sqlite(&reference.elem),
         _ => false,
     }
 }
@@ -362,6 +392,9 @@ fn expression_mentions_pool(expression: &Expr, pool_aliases: &BTreeSet<String>) 
             segment.ident == "pool" || pool_aliases.contains(&segment.ident.to_string())
         }),
         Expr::MethodCall(call) => expression_mentions_pool(&call.receiver, pool_aliases),
+        Expr::Await(await_expression) => {
+            expression_mentions_pool(&await_expression.base, pool_aliases)
+        }
         Expr::Reference(reference) => expression_mentions_pool(&reference.expr, pool_aliases),
         Expr::Paren(paren) => expression_mentions_pool(&paren.expr, pool_aliases),
         Expr::Group(group) => expression_mentions_pool(&group.expr, pool_aliases),
@@ -372,24 +405,60 @@ fn expression_mentions_pool(expression: &Expr, pool_aliases: &BTreeSet<String>) 
     }
 }
 
-fn is_direct_pool_write(expression: &ExprMethodCall, pool_aliases: &BTreeSet<String>) -> bool {
-    if expression.method == "execute" {
-        return expression
-            .args
+fn is_pool_transaction_expression(expression: &Expr, pool_aliases: &BTreeSet<String>) -> bool {
+    match expression {
+        Expr::Await(await_expression) => {
+            is_pool_transaction_expression(&await_expression.base, pool_aliases)
+        }
+        Expr::MethodCall(call) => {
+            matches!(call.method.to_string().as_str(), "begin" | "begin_with")
+                && expression_mentions_pool(&call.receiver, pool_aliases)
+        }
+        Expr::Paren(paren) => is_pool_transaction_expression(&paren.expr, pool_aliases),
+        Expr::Group(group) => is_pool_transaction_expression(&group.expr, pool_aliases),
+        Expr::Try(try_expression) => {
+            is_pool_transaction_expression(&try_expression.expr, pool_aliases)
+        }
+        _ => false,
+    }
+}
+
+fn expression_mentions_transaction(
+    expression: &Expr,
+    transaction_aliases: &BTreeSet<String>,
+) -> bool {
+    match expression {
+        Expr::Path(path) => path
+            .path
+            .segments
             .last()
-            .is_some_and(|argument| expression_mentions_pool(argument, pool_aliases));
+            .is_some_and(|segment| transaction_aliases.contains(&segment.ident.to_string())),
+        Expr::Reference(reference) => {
+            expression_mentions_transaction(&reference.expr, transaction_aliases)
+        }
+        Expr::Paren(paren) => expression_mentions_transaction(&paren.expr, transaction_aliases),
+        Expr::Group(group) => expression_mentions_transaction(&group.expr, transaction_aliases),
+        Expr::Unary(unary) => expression_mentions_transaction(&unary.expr, transaction_aliases),
+        Expr::Cast(cast) => expression_mentions_transaction(&cast.expr, transaction_aliases),
+        _ => false,
+    }
+}
+
+fn is_direct_pool_write(
+    expression: &ExprMethodCall,
+    pool_aliases: &BTreeSet<String>,
+    transaction_aliases: &BTreeSet<String>,
+) -> bool {
+    if expression.method == "execute" {
+        return expression.args.last().is_some_and(|argument| {
+            expression_mentions_pool(argument, pool_aliases)
+                || expression_mentions_transaction(argument, transaction_aliases)
+        });
     }
 
     (expression.method == "begin" && expression_mentions_pool(&expression.receiver, pool_aliases))
         || (expression.method == "begin_with"
-            && expression_mentions_pool(&expression.receiver, pool_aliases)
-            && expression.args.first().is_some_and(|argument| {
-                matches!(
-                    argument,
-                    Expr::Lit(literal)
-                        if matches!(&literal.lit, syn::Lit::Str(value) if value.value().contains("BEGIN IMMEDIATE"))
-                )
-            }))
+            && expression_mentions_pool(&expression.receiver, pool_aliases))
 }
 
 #[derive(Default)]
@@ -397,24 +466,6 @@ struct CoordinatorFacadeVisitor {
     uses_sqlite_writer: bool,
     forwards_callback: bool,
     callback_parameters: BTreeSet<String>,
-}
-
-struct CallbackReferenceVisitor<'a> {
-    callback_parameters: &'a BTreeSet<String>,
-    found: bool,
-}
-
-impl<'ast> Visit<'ast> for CallbackReferenceVisitor<'_> {
-    fn visit_expr_path(&mut self, expression: &'ast syn::ExprPath) {
-        if expression
-            .path
-            .get_ident()
-            .is_some_and(|ident| self.callback_parameters.contains(&ident.to_string()))
-        {
-            self.found = true;
-        }
-        visit::visit_expr_path(self, expression);
-    }
 }
 
 fn trait_path_is_callback(path: &syn::Path) -> bool {
@@ -481,18 +532,29 @@ impl<'ast> Visit<'ast> for CoordinatorFacadeVisitor {
             )
         {
             self.uses_sqlite_writer = true;
-            for argument in &expression.args {
-                let mut callback_reference = CallbackReferenceVisitor {
-                    callback_parameters: &self.callback_parameters,
-                    found: false,
-                };
-                callback_reference.visit_expr(argument);
-                if callback_reference.found {
-                    self.forwards_callback = true;
-                }
-            }
+            self.forwards_callback = expression.args.last().is_some_and(|argument| {
+                expression_is_callback_reference(argument, &self.callback_parameters)
+            });
         }
         visit::visit_expr_method_call(self, expression);
+    }
+}
+
+fn expression_is_callback_reference(
+    expression: &Expr,
+    callback_parameters: &BTreeSet<String>,
+) -> bool {
+    match expression {
+        Expr::Path(path) => path
+            .path
+            .get_ident()
+            .is_some_and(|ident| callback_parameters.contains(&ident.to_string())),
+        Expr::Reference(reference) => {
+            expression_is_callback_reference(&reference.expr, callback_parameters)
+        }
+        Expr::Paren(paren) => expression_is_callback_reference(&paren.expr, callback_parameters),
+        Expr::Group(group) => expression_is_callback_reference(&group.expr, callback_parameters),
+        _ => false,
     }
 }
 
@@ -814,6 +876,37 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_write_guard_rejects_generic_sqlite_pool_parameters() {
+        let source = r#"
+            async fn persist(db: &sqlx::Pool<sqlx::Sqlite>) {
+                sqlx::query("UPDATE settings SET value = 1")
+                    .execute(db)
+                    .await
+                    .unwrap();
+            }
+        "#;
+        let visitor = scan_source(Path::new("src/admin_runtime.rs"), source)
+            .expect("test source should parse");
+        assert_eq!(visitor.sqlite_write_issues.len(), 1);
+    }
+
+    #[test]
+    fn sqlite_write_guard_rejects_acquired_sqlite_connections() {
+        let source = r#"
+            async fn persist(db: &SqlitePool) {
+                let mut connection = db.acquire().await.unwrap();
+                sqlx::query("UPDATE settings SET value = 1")
+                    .execute(&mut *connection)
+                    .await
+                    .unwrap();
+            }
+        "#;
+        let visitor = scan_source(Path::new("src/admin_runtime.rs"), source)
+            .expect("test source should parse");
+        assert_eq!(visitor.sqlite_write_issues.len(), 1);
+    }
+
+    #[test]
     fn sqlite_write_guard_allows_test_only_pool_writes() {
         let source = r#"
             #[cfg(test)]
@@ -922,6 +1015,18 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_write_guard_rejects_all_raw_pool_begin_with_forms() {
+        let source = r#"
+            async fn inspect(db: &SqlitePool) {
+                let _tx = db.begin_with("begin immediate").await.unwrap();
+            }
+        "#;
+        let visitor = scan_source(Path::new("src/translations.rs"), source)
+            .expect("test source should parse");
+        assert_eq!(visitor.sqlite_write_issues.len(), 1);
+    }
+
+    #[test]
     fn sqlite_write_guard_allows_marked_read_only_pool_transactions() {
         let source = r#"
             // sqlite-write-guard: read-only-transaction
@@ -932,5 +1037,22 @@ mod tests {
         let visitor = scan_source(Path::new("src/translations.rs"), source)
             .expect("test source should parse");
         assert!(visitor.sqlite_write_issues.is_empty());
+    }
+
+    #[test]
+    fn sqlite_write_guard_rejects_writes_inside_marked_read_only_transactions() {
+        let source = r#"
+            // sqlite-write-guard: read-only-transaction
+            async fn inspect(db: &SqlitePool) {
+                let mut tx = db.begin().await.unwrap();
+                sqlx::query("UPDATE settings SET value = 1")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+        "#;
+        let visitor = scan_source(Path::new("src/translations.rs"), source)
+            .expect("test source should parse");
+        assert_eq!(visitor.sqlite_write_issues.len(), 1);
     }
 }

@@ -703,6 +703,8 @@ pub struct TranslationSchedulerController {
     desired_config: tokio::sync::RwLock<TranslationRuntimeConfig>,
     runtime: tokio::sync::RwLock<Vec<TranslationWorkerRuntimeState>>,
     worker_abort_handles: tokio::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>,
+    #[cfg(test)]
+    runtime_sync_started: tokio::sync::Notify,
 }
 
 #[allow(dead_code)]
@@ -1377,6 +1379,8 @@ impl TranslationSchedulerController {
             desired_config: tokio::sync::RwLock::new(config),
             runtime: tokio::sync::RwLock::new(runtime),
             worker_abort_handles: tokio::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            runtime_sync_started: tokio::sync::Notify::new(),
         }
     }
 
@@ -1421,6 +1425,11 @@ impl TranslationSchedulerController {
     }
 
     #[cfg(test)]
+    async fn wait_for_runtime_sync_start(&self) {
+        self.runtime_sync_started.notified().await;
+    }
+
+    #[cfg(test)]
     async fn sync_runtime_with_config(
         &self,
         pool: &SqlitePool,
@@ -1446,6 +1455,8 @@ impl TranslationSchedulerController {
         sqlite_writer: &SqliteWriteCoordinator,
         config: TranslationRuntimeConfig,
     ) -> Result<TranslationRuntimeConfig> {
+        #[cfg(test)]
+        self.runtime_sync_started.notify_waiters();
         let config = TranslationRuntimeConfig::new(
             config.general_worker_concurrency,
             config.dedicated_worker_concurrency,
@@ -2523,6 +2534,13 @@ pub async fn admin_patch_translation_runtime_config(
     Json(req): Json<AdminTranslationRuntimeConfigUpdateRequest>,
 ) -> Result<Json<AdminTranslationStatusResponse>, ApiError> {
     let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
+    let previous_settings = admin_runtime::load_or_seed_runtime_settings_with_writer(
+        &state.pool,
+        &state.sqlite_writer,
+        &state.config,
+    )
+    .await
+    .map_err(ApiError::internal)?;
     let general_worker_concurrency = parse_positive_worker_concurrency(
         req.general_worker_concurrency,
         "general_worker_concurrency",
@@ -2536,17 +2554,32 @@ pub async fn admin_patch_translation_runtime_config(
         dedicated_worker_concurrency,
     )?;
 
-    admin_runtime::update_translation_runtime_settings(
-        &state.pool,
-        &state.sqlite_writer,
-        general_worker_concurrency,
-        dedicated_worker_concurrency,
-    )
-    .await
-    .map_err(ApiError::internal)?;
-    admin_runtime::sync_persisted_runtime_settings(state.clone())
-        .await
-        .map_err(ApiError::internal)?;
+    let apply_result = async {
+        admin_runtime::update_translation_runtime_settings(
+            &state.pool,
+            &state.sqlite_writer,
+            general_worker_concurrency,
+            dedicated_worker_concurrency,
+        )
+        .await?;
+        admin_runtime::sync_persisted_runtime_settings(state.clone()).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = apply_result {
+        if let Err(rollback_error) =
+            admin_runtime::restore_persisted_runtime_settings(state.clone(), &previous_settings)
+                .await
+        {
+            tracing::error!(
+                event = "sqlite.write",
+                operation = "admin_runtime_settings_rollback",
+                error_chain = %crate::observability::error_chain_summary(rollback_error.as_ref()),
+                "failed to roll back admin runtime settings after apply failure"
+            );
+        }
+        return Err(ApiError::internal(error));
+    }
 
     Ok(Json(
         load_admin_translation_status_response(state.as_ref()).await?,
@@ -13520,7 +13553,10 @@ mod tests {
                 .expect("apply runtime config")
         });
 
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        state
+            .translation_scheduler
+            .wait_for_runtime_sync_start()
+            .await;
         assert_eq!(
             state
                 .translation_scheduler
