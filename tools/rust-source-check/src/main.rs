@@ -7,8 +7,8 @@ use std::{
 
 use serde::Deserialize;
 use syn::{
-    Attribute, Block, Expr, ExprCall, ExprMethodCall, File, Item, ItemFn, ItemMod, Local, Meta,
-    Pat,
+    Attribute, Block, Expr, ExprCall, ExprMethodCall, File, FnArg, Item, ItemFn, ItemMod, Local,
+    Meta, Pat, Type, TypeParamBound,
     spanned::Spanned,
     visit::{self, Visit},
 };
@@ -28,8 +28,10 @@ struct SourceVisitor {
     sqlite_write_issues: Vec<String>,
     test_only_depth: usize,
     sqlite_writer_closure_depth: usize,
+    read_only_transaction_depth: usize,
     pool_aliases: BTreeSet<String>,
     coordinator_facade_functions: BTreeSet<String>,
+    read_only_transaction_functions: BTreeSet<String>,
 }
 
 impl<'ast> Visit<'ast> for SourceVisitor {
@@ -40,11 +42,29 @@ impl<'ast> Visit<'ast> for SourceVisitor {
 
     fn visit_item_fn(&mut self, item: &'ast ItemFn) {
         let previous_test_only_depth = self.test_only_depth;
+        let previous_pool_aliases = self.pool_aliases.clone();
+        let previous_read_only_transaction_depth = self.read_only_transaction_depth;
         if has_cfg_test(&item.attrs) {
             self.test_only_depth += 1;
         }
+        for input in &item.sig.inputs {
+            if let FnArg::Typed(pattern) = input
+                && type_mentions_sqlite_pool(&pattern.ty)
+                && let Pat::Ident(pattern) = &*pattern.pat
+            {
+                self.pool_aliases.insert(pattern.ident.to_string());
+            }
+        }
+        if self
+            .read_only_transaction_functions
+            .contains(&item.sig.ident.to_string())
+        {
+            self.read_only_transaction_depth += 1;
+        }
         visit::visit_item_fn(self, item);
         self.test_only_depth = previous_test_only_depth;
+        self.pool_aliases = previous_pool_aliases;
+        self.read_only_transaction_depth = previous_read_only_transaction_depth;
     }
 
     fn visit_item_mod(&mut self, item: &'ast ItemMod) {
@@ -63,12 +83,13 @@ impl<'ast> Visit<'ast> for SourceVisitor {
     }
 
     fn visit_local(&mut self, local: &'ast Local) {
-        let is_pool_alias = local
-            .init
-            .as_ref()
-            .is_some_and(|init| expression_mentions_pool(&init.expr, &self.pool_aliases));
+        let is_pool_alias = matches!(&local.pat, Pat::Type(pattern) if type_mentions_sqlite_pool(&pattern.ty))
+            || local
+                .init
+                .as_ref()
+                .is_some_and(|init| expression_mentions_pool(&init.expr, &self.pool_aliases));
         visit::visit_local(self, local);
-        if let Pat::Ident(pattern) = &local.pat {
+        if let Some(pattern) = pattern_identifier(&local.pat) {
             if is_pool_alias {
                 self.pool_aliases.insert(pattern.ident.to_string());
             } else {
@@ -85,9 +106,12 @@ impl<'ast> Visit<'ast> for SourceVisitor {
                 "write" | "write_foreground" | "write_with_priority" | "try_write"
             );
 
+        let is_explicit_read_only_transaction =
+            self.read_only_transaction_depth > 0 && expression.method == "begin";
         if self.test_only_depth == 0
             && is_direct_pool_write(expression, &self.pool_aliases)
             && self.sqlite_writer_closure_depth == 0
+            && !is_explicit_read_only_transaction
         {
             self.sqlite_write_issues.push(format!(
                 "{}:{}: direct SQLite pool write must use SqliteWriteCoordinator",
@@ -303,6 +327,31 @@ fn is_sqlite_writer_expression(expression: &Expr) -> bool {
     }
 }
 
+fn type_mentions_sqlite_pool(ty: &Type) -> bool {
+    match ty {
+        Type::Array(array) => type_mentions_sqlite_pool(&array.elem),
+        Type::Group(group) => type_mentions_sqlite_pool(&group.elem),
+        Type::Paren(paren) => type_mentions_sqlite_pool(&paren.elem),
+        Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "SqlitePool"),
+        Type::Reference(reference) => type_mentions_sqlite_pool(&reference.elem),
+        Type::Slice(slice) => type_mentions_sqlite_pool(&slice.elem),
+        Type::Tuple(tuple) => tuple.elems.iter().any(type_mentions_sqlite_pool),
+        _ => false,
+    }
+}
+
+fn pattern_identifier(pattern: &Pat) -> Option<&syn::PatIdent> {
+    match pattern {
+        Pat::Ident(pattern) => Some(pattern),
+        Pat::Type(pattern) => pattern_identifier(&pattern.pat),
+        _ => None,
+    }
+}
+
 fn expression_mentions_pool(expression: &Expr, pool_aliases: &BTreeSet<String>) -> bool {
     match expression {
         Expr::Field(field) => {
@@ -331,20 +380,96 @@ fn is_direct_pool_write(expression: &ExprMethodCall, pool_aliases: &BTreeSet<Str
             .is_some_and(|argument| expression_mentions_pool(argument, pool_aliases));
     }
 
-    expression.method == "begin_with"
-        && expression_mentions_pool(&expression.receiver, pool_aliases)
-        && expression.args.first().is_some_and(|argument| {
-            matches!(
-                argument,
-                Expr::Lit(literal)
-                    if matches!(&literal.lit, syn::Lit::Str(value) if value.value().contains("BEGIN IMMEDIATE"))
-            )
-        })
+    (expression.method == "begin" && expression_mentions_pool(&expression.receiver, pool_aliases))
+        || (expression.method == "begin_with"
+            && expression_mentions_pool(&expression.receiver, pool_aliases)
+            && expression.args.first().is_some_and(|argument| {
+                matches!(
+                    argument,
+                    Expr::Lit(literal)
+                        if matches!(&literal.lit, syn::Lit::Str(value) if value.value().contains("BEGIN IMMEDIATE"))
+                )
+            }))
 }
 
 #[derive(Default)]
 struct CoordinatorFacadeVisitor {
     uses_sqlite_writer: bool,
+    forwards_callback: bool,
+    callback_parameters: BTreeSet<String>,
+}
+
+struct CallbackReferenceVisitor<'a> {
+    callback_parameters: &'a BTreeSet<String>,
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for CallbackReferenceVisitor<'_> {
+    fn visit_expr_path(&mut self, expression: &'ast syn::ExprPath) {
+        if expression
+            .path
+            .get_ident()
+            .is_some_and(|ident| self.callback_parameters.contains(&ident.to_string()))
+        {
+            self.found = true;
+        }
+        visit::visit_expr_path(self, expression);
+    }
+}
+
+fn trait_path_is_callback(path: &syn::Path) -> bool {
+    path.segments.last().is_some_and(|segment| {
+        matches!(
+            segment.ident.to_string().as_str(),
+            "Fn" | "FnMut" | "FnOnce"
+        )
+    })
+}
+
+fn type_bound_is_callback(bound: &TypeParamBound) -> bool {
+    matches!(bound, TypeParamBound::Trait(bound) if trait_path_is_callback(&bound.path))
+}
+
+fn callback_parameter_names(item: &ItemFn) -> BTreeSet<String> {
+    let mut callback_type_parameters = BTreeSet::new();
+    for parameter in &item.sig.generics.params {
+        if let syn::GenericParam::Type(parameter) = parameter
+            && parameter.bounds.iter().any(type_bound_is_callback)
+        {
+            callback_type_parameters.insert(parameter.ident.to_string());
+        }
+    }
+    if let Some(where_clause) = &item.sig.generics.where_clause {
+        for predicate in &where_clause.predicates {
+            if let syn::WherePredicate::Type(predicate) = predicate
+                && predicate.bounds.iter().any(type_bound_is_callback)
+                && let Type::Path(path) = &predicate.bounded_ty
+                && let Some(segment) = path.path.segments.last()
+            {
+                callback_type_parameters.insert(segment.ident.to_string());
+            }
+        }
+    }
+
+    item.sig
+        .inputs
+        .iter()
+        .filter_map(|input| {
+            let FnArg::Typed(pattern) = input else {
+                return None;
+            };
+            let pattern_ident = pattern_identifier(&pattern.pat)?;
+            let is_callback = match pattern.ty.as_ref() {
+                Type::ImplTrait(ty) => ty.bounds.iter().any(type_bound_is_callback),
+                Type::TraitObject(ty) => ty.bounds.iter().any(type_bound_is_callback),
+                Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
+                    callback_type_parameters.contains(&segment.ident.to_string())
+                }),
+                _ => false,
+            };
+            is_callback.then(|| pattern_ident.ident.to_string())
+        })
+        .collect()
 }
 
 impl<'ast> Visit<'ast> for CoordinatorFacadeVisitor {
@@ -356,14 +481,34 @@ impl<'ast> Visit<'ast> for CoordinatorFacadeVisitor {
             )
         {
             self.uses_sqlite_writer = true;
+            for argument in &expression.args {
+                let mut callback_reference = CallbackReferenceVisitor {
+                    callback_parameters: &self.callback_parameters,
+                    found: false,
+                };
+                callback_reference.visit_expr(argument);
+                if callback_reference.found {
+                    self.forwards_callback = true;
+                }
+            }
         }
         visit::visit_expr_method_call(self, expression);
+    }
+}
+
+impl CoordinatorFacadeVisitor {
+    fn for_item(item: &ItemFn) -> Self {
+        Self {
+            callback_parameters: callback_parameter_names(item),
+            ..Self::default()
+        }
     }
 }
 
 #[derive(Default)]
 struct CoordinatorFacadeDeclarations {
     functions: BTreeSet<String>,
+    read_only_transaction_functions: BTreeSet<String>,
     issues: Vec<String>,
     source_lines: Vec<String>,
 }
@@ -375,14 +520,22 @@ impl<'ast> Visit<'ast> for CoordinatorFacadeDeclarations {
             .source_lines
             .get(line_index.saturating_sub(1))
             .is_some_and(|line| line.contains("sqlite-write-guard: coordinator-facade"));
+        let has_read_only_transaction_marker = self
+            .source_lines
+            .get(line_index.saturating_sub(1))
+            .is_some_and(|line| line.contains("sqlite-write-guard: read-only-transaction"));
+        if has_read_only_transaction_marker {
+            self.read_only_transaction_functions
+                .insert(item.sig.ident.to_string());
+        }
         if has_marker {
-            let mut verifier = CoordinatorFacadeVisitor::default();
+            let mut verifier = CoordinatorFacadeVisitor::for_item(item);
             verifier.visit_item_fn(item);
-            if verifier.uses_sqlite_writer {
+            if verifier.uses_sqlite_writer && verifier.forwards_callback {
                 self.functions.insert(item.sig.ident.to_string());
             } else {
                 self.issues.push(format!(
-                    "{}:{}: coordinator facade marker requires a SqliteWriteCoordinator call",
+                    "{}:{}: coordinator facade marker requires a SqliteWriteCoordinator call that forwards a callback parameter",
                     "source",
                     item.span().start().line
                 ));
@@ -431,6 +584,7 @@ fn scan_source(path: &Path, source: &str) -> Result<SourceVisitor, String> {
     let mut visitor = SourceVisitor {
         path: relative_path.clone(),
         coordinator_facade_functions: facades.functions,
+        read_only_transaction_functions: facades.read_only_transaction_functions,
         ..SourceVisitor::default()
     };
     visitor.visit_file(&file);
@@ -576,6 +730,21 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_write_guard_rejects_nonstandard_pool_parameters() {
+        let source = r#"
+            async fn persist(db: &SqlitePool) {
+                sqlx::query("UPDATE settings SET value = 1")
+                    .execute(db)
+                    .await
+                    .unwrap();
+            }
+        "#;
+        let visitor = scan_source(Path::new("src/admin_runtime.rs"), source)
+            .expect("test source should parse");
+        assert_eq!(visitor.sqlite_write_issues.len(), 1);
+    }
+
+    #[test]
     fn sqlite_write_guard_accepts_coordinator_pool_writes() {
         let source = r#"
             async fn persist(pool: &SqlitePool, sqlite_writer: &SqliteWriteCoordinator) {
@@ -601,8 +770,7 @@ mod tests {
         let source = r#"
             // sqlite-write-guard: coordinator-facade
             async fn run_subscription_prune_phase(state: &AppState, query: impl FnOnce()) {
-                state.sqlite_writer.try_write("prune", |_| async { Ok(()) }).await;
-                query();
+                state.sqlite_writer.try_write("prune", query).await;
             }
 
             async fn persist(state: &AppState) {
@@ -722,6 +890,7 @@ mod tests {
         let source = r#"
             // sqlite-write-guard: coordinator-facade
             async fn run_subscription_prune_phase(state: &AppState, query: impl FnOnce()) {
+                state.sqlite_writer.try_write("prune", |_| async { Ok(()) }).await;
                 query();
             }
 
@@ -738,5 +907,30 @@ mod tests {
             scan_source(Path::new("src/sync.rs"), source).expect("test source should parse");
         assert_eq!(visitor.sqlite_write_issues.len(), 1);
         assert!(!visitor.structural_issues.is_empty());
+    }
+
+    #[test]
+    fn sqlite_write_guard_rejects_uncoordinated_pool_transactions() {
+        let source = r#"
+            async fn inspect(db: &SqlitePool) {
+                let _tx = db.begin().await.unwrap();
+            }
+        "#;
+        let visitor = scan_source(Path::new("src/translations.rs"), source)
+            .expect("test source should parse");
+        assert_eq!(visitor.sqlite_write_issues.len(), 1);
+    }
+
+    #[test]
+    fn sqlite_write_guard_allows_marked_read_only_pool_transactions() {
+        let source = r#"
+            // sqlite-write-guard: read-only-transaction
+            async fn inspect(db: &SqlitePool) {
+                let _tx = db.begin().await.unwrap();
+            }
+        "#;
+        let visitor = scan_source(Path::new("src/translations.rs"), source)
+            .expect("test source should parse");
+        assert!(visitor.sqlite_write_issues.is_empty());
     }
 }

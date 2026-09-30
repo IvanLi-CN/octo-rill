@@ -571,7 +571,7 @@ pub struct AdminTranslationRequestResultItem {
     pub error_detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AdminTranslationWorkerStatus {
     pub worker_id: String,
     pub worker_slot: i64,
@@ -1450,11 +1450,10 @@ impl TranslationSchedulerController {
             config.general_worker_concurrency,
             config.dedicated_worker_concurrency,
         );
+        let _claim_guard = translation_batch_claim_lock().lock().await;
         if *self.desired_config.read().await == config {
             return Ok(config);
         }
-        let _claim_guard = translation_batch_claim_lock().lock().await;
-        *self.desired_config.write().await = config;
 
         let desired_profiles = translation_worker_profiles(config);
         let desired_worker_ids = desired_profiles
@@ -1471,6 +1470,7 @@ impl TranslationSchedulerController {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let previous_runtime = runtime.clone();
         runtime.retain(|entry| {
             desired_worker_ids.contains(entry.worker_id.as_str())
                 || entry.current_batch_id.is_some()
@@ -1491,9 +1491,14 @@ impl TranslationSchedulerController {
         if topology_changed {
             refresh_translation_runtime_updated_at(&mut runtime);
         }
-        drop(runtime);
-        sync_running_batch_slot_updates_with_writer(sqlite_writer, pool, &batch_slot_updates)
-            .await?;
+        if let Err(error) =
+            sync_running_batch_slot_updates_with_writer(sqlite_writer, pool, &batch_slot_updates)
+                .await
+        {
+            *runtime = previous_runtime;
+            return Err(error);
+        }
+        *self.desired_config.write().await = config;
         Ok(config)
     }
 
@@ -1640,8 +1645,10 @@ impl TranslationSchedulerController {
         sqlite_writer: &SqliteWriteCoordinator,
         worker_id: &str,
     ) -> Result<()> {
+        let _claim_guard = translation_batch_claim_lock().lock().await;
         let desired_config = self.desired_config().await;
         let mut runtime = self.runtime.write().await;
+        let previous_runtime = runtime.clone();
         let previous_topology = runtime
             .iter()
             .map(|entry| {
@@ -1657,9 +1664,13 @@ impl TranslationSchedulerController {
         if translation_runtime_topology_changed(&runtime, &previous_topology) {
             refresh_translation_runtime_updated_at(&mut runtime);
         }
-        drop(runtime);
-        sync_running_batch_slot_updates_with_writer(sqlite_writer, pool, &batch_slot_updates)
-            .await?;
+        if let Err(error) =
+            sync_running_batch_slot_updates_with_writer(sqlite_writer, pool, &batch_slot_updates)
+                .await
+        {
+            *runtime = previous_runtime;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -3386,6 +3397,7 @@ async fn resolve_translation_results_for_user(
     Ok(out)
 }
 
+// sqlite-write-guard: read-only-transaction
 async fn try_resolve_translation_results_without_write(
     state: &AppState,
     user_id: &str,
@@ -5540,6 +5552,7 @@ async fn requeue_ineligible_queued_batch_items(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+// sqlite-write-guard: read-only-transaction
 async fn claim_existing_queued_batch(
     state: &AppState,
     worker: &TranslationWorkerProfile,
@@ -6963,8 +6976,6 @@ async fn recover_runtime_state_with_mode(
             state,
             batch_id.as_str(),
             runtime::RUNTIME_LEASE_EXPIRED_ERROR,
-            None,
-            None,
         )
         .await
         {
@@ -7067,8 +7078,6 @@ async fn recover_runtime_state_with_mode(
             state,
             batch.id.as_str(),
             runtime::RUNTIME_LEASE_EXPIRED_ERROR,
-            batch.runtime_owner_id.as_deref(),
-            batch.lease_heartbeat_at.as_deref(),
         )
         .await?;
     }
@@ -13531,6 +13540,42 @@ mod tests {
                 .worker_is_desired("translation-worker-general-3")
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_resize_rolls_back_memory_when_slot_persistence_fails() {
+        let scheduler = TranslationSchedulerController::new(TranslationRuntimeConfig::default());
+        {
+            let mut runtime = scheduler.runtime.write().await;
+            let worker = runtime
+                .get_mut(2)
+                .expect("default scheduler should have a third general worker");
+            worker.status = "running".to_owned();
+            worker.worker_slot = 99;
+            worker.current_batch_id = Some("batch-missing-from-test-db".to_owned());
+        }
+        let before_config = scheduler.desired_config().await;
+        let before_runtime = scheduler.runtime_statuses().await;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create empty sqlite pool");
+
+        let result = scheduler
+            .sync_runtime_with_config_internal(
+                &pool,
+                &SqliteWriteCoordinator::new(),
+                TranslationRuntimeConfig::new(2, 1),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "missing translation tables should fail the slot write"
+        );
+        assert_eq!(scheduler.desired_config().await, before_config);
+        assert_eq!(scheduler.runtime_statuses().await, before_runtime);
     }
 
     #[tokio::test]

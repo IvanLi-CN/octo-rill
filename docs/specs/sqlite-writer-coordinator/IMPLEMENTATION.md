@@ -33,7 +33,7 @@
 - admin runtime settings 的 seed/backfill/update、LLM recovery flags 与 model health、translation runtime settings 均通过共享 `AppState.sqlite_writer` 写入；生产启动和 runtime heartbeat 不再调用 raw pool writer。
 - translation worker runtime slot reconciliation 与 worker removal 的 production internal helpers 现在要求非可选 `&SqliteWriteCoordinator`，删除了 `Option<&SqliteWriteCoordinator>` 的 raw `BEGIN IMMEDIATE` fallback；仅 test-only convenience wrappers 创建局部 coordinator。
 - reaction PAT state、dashboard daily rollup、scheduled slot patch 与 public release usage metadata refresh 均进入明确的 foreground/background writer lane，补齐 API 与高频 sync metadata 的遗漏写路径。
-- `tools/rust-source-check` 为 `src/admin_runtime.rs`、`src/ai.rs`、`src/api.rs`、`src/jobs.rs`、`src/sync.rs` 与 `src/translations.rs` 增加 AST guard：生产 direct pool execute/raw `BEGIN IMMEDIATE` 失败，`cfg(test)`、bootstrap/read-only 范围保持显式边界；subscription prune facade 只有在 marker 与 coordinator 调用同时通过 AST 验证时才作为结构化安全边界处理。
+- `tools/rust-source-check` 为 `src/admin_runtime.rs`、`src/ai.rs`、`src/api.rs`、`src/jobs.rs`、`src/sync.rs` 与 `src/translations.rs` 增加 AST guard：生产 direct pool write、未协调的 pool transaction 与 raw `BEGIN IMMEDIATE` 失败，`cfg(test)`、bootstrap/read-only 范围保持显式边界；subscription prune facade 只有在 marker、callback 转发与 coordinator 调用同时通过 AST 验证时才作为结构化安全边界处理。
 - 网络、GitHub API、AI 调用与长耗时处理仍留在 writer permit 外；permit 只包住 SQLite 写入段。
 
 ## Validation
@@ -62,7 +62,8 @@
 - `src/sync.rs` 新增 subscription event 写入在 competing writer 下等待成功提交，以及 subscription history prune 在 writer permit 不可得或 SQLite busy 时降级跳过的回归测试。
 - `src/sync.rs` 新增 `starred_repos` 增量 upsert 与通知 upsert 在 competing writer 下等待成功提交的并发回归测试。
 - `src/ai.rs` 新增 LLM retention cleanup 在 writer permit 不可得或 SQLite busy 时降级跳过的回归测试。
-- `tools/rust-source-check/src/main.rs` 新增 coordinator bypass AST guard 及 direct write、coordinator closure、test-only、wrapper 与 `cfg(not(test))` 回归测试。
+- `tools/rust-source-check/src/main.rs` 新增 coordinator bypass AST guard 及 direct write、未协调 transaction、coordinator closure、test-only、read-only marker、wrapper 与 `cfg(not(test))` 回归测试。
+- `src/ai.rs` 与 `src/sync.rs` 的 stale recovery update 对 selected owner/heartbeat 做 CAS；`src/translations.rs` 的 runtime resize/remove 在 slot 持久化失败时恢复内存状态，避免恢复竞争或部分提交造成状态漂移。
 
 ## References
 

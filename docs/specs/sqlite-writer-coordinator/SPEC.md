@@ -95,7 +95,7 @@
 
 ### REQ-SQLITE-WRITER-010
 
-- `scripts/check-rust-source-quality.sh` 使用 AST source guard 检查受保护生产模块；新增 direct pool write 必须失败，除非属于 test-only/bootstrap/read-only 语义，或位于经过 AST 验证的 coordinator facade callback 内。
+- `scripts/check-rust-source-quality.sh` 使用 AST source guard 检查受保护生产模块；新增 direct pool write 或未协调的 pool transaction 必须失败，除非属于 test-only/bootstrap，带有明确且受审计的 read-only transaction marker，或位于经过 AST 验证并转发 callback 的 coordinator facade 内。
 
 ### SHOULD
 
@@ -135,7 +135,7 @@
 | 接口（Name） | 类型（Kind） | 范围（Scope） | 变更（Change） | 契约文档（Contract Doc） | 负责人（Owner） | 使用方（Consumers） | 备注（Notes） |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `SqliteWriteCoordinator` | Rust runtime API | internal | Existing / extended | None | backend | backend runtime | 单 writer permit、priority lanes、busy retry、tracing |
-| `rust-source-check` SQLite guard | source-quality contract | internal | New | `scripts/check-rust-source-quality.sh` | backend | protected production modules | AST 检查 direct pool write 与 raw `BEGIN IMMEDIATE` |
+| `rust-source-check` SQLite guard | source-quality contract | internal | New | `scripts/check-rust-source-quality.sh` | backend | protected production modules | AST 检查 direct pool write、未协调 pool transaction 与 raw `BEGIN IMMEDIATE` |
 
 ### 契约文档（按 Kind 拆分）
 
@@ -175,7 +175,7 @@
   When snapshot 写入运行并暂停在第一个 chunk 之后
   Then `GET /api/dashboard/updates`、session save 与 `jobs::enqueue_task` 仍能完成；日志或测试证据分别报告候选读取耗时、writer wait、query/write chunk 耗时及 busy/500 结果，且每个 social snapshot writer chunk 不超过固定 64 行。
 
-- Given production code adds a direct `SqlitePool::execute` or raw `BEGIN IMMEDIATE` in an audited module
+- Given production code adds a direct `SqlitePool` write, an uncoordinated pool transaction, or raw `BEGIN IMMEDIATE` in an audited module
   When `scripts/check-rust-source-quality.sh` runs
   Then the AST guard fails with the source location until the write is moved behind the coordinator or a verified coordinator facade boundary is declared.
 
@@ -199,9 +199,9 @@
 
 ### VER-SQLITE-WRITER-003
 
-- Method: source checker unit tests plus a full AST scan of the audited production modules, targeted runtime tests for admin settings (`admin_patch_llm_runtime_config_preserves_saved_model_limit_when_field_is_omitted`), LLM health/recovery (`llm_model_health_round_trips_and_rejects_unknown_failure_classes`), translation worker slots (`runtime_resize_updates_running_batch_slot_metadata`), and high-frequency metadata (`reaction_pat_check_result_waits_for_foreground_writer`, `refresh_feed_reactions_skips_persist_failure_under_sqlite_write_pressure`).
+- Method: source checker unit tests plus a full AST scan of the audited production modules, targeted runtime tests for admin settings (`admin_patch_llm_runtime_config_preserves_saved_model_limit_when_field_is_omitted`), LLM health/recovery (`llm_model_health_round_trips_and_rejects_unknown_failure_classes`, `stale_llm_recovery_requires_the_original_lease_snapshot`), translation worker slots (`runtime_resize_updates_running_batch_slot_metadata`, `runtime_resize_rolls_back_memory_when_slot_persistence_fails`), repo release recovery (`stale_repo_release_recovery_requires_the_original_lease_snapshot`), and high-frequency metadata (`reaction_pat_check_result_waits_for_foreground_writer`, `refresh_feed_reactions_skips_persist_failure_under_sqlite_write_pressure`).
 - covers: REQ-SQLITE-WRITER-008, REQ-SQLITE-WRITER-009, REQ-SQLITE-WRITER-010
-- Pass condition: production writes use the shared coordinator with an explicit lane, the translation runtime has no optional writer fallback, direct pool writes are rejected by the checker, and test-only/bootstrap/read-only exceptions remain documented and bounded.
+- Pass condition: production writes use the shared coordinator with an explicit lane, the translation runtime has no optional writer fallback, direct pool writes and uncoordinated transactions are rejected by the checker, and test-only/bootstrap/read-only exceptions remain documented and bounded. Recovery updates must compare the selected lease snapshot before failing a row, and runtime configuration must restore in-memory state when slot persistence fails.
 
 ## 验收清单（Acceptance checklist）
 

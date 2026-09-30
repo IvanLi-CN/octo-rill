@@ -3577,20 +3577,29 @@ async fn heartbeat_llm_call_lease(state: &AppState, call_id: &str) -> Result<()>
     Ok(())
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct RecoverableLlmCallRow {
+    id: String,
+    runtime_owner_id: Option<String>,
+    lease_heartbeat_at: Option<String>,
+}
+
 async fn recover_llm_call_with_message(
     state: &AppState,
     call_id: &str,
     message: &str,
     previous_runtime_owner_id: Option<&str>,
     previous_lease_heartbeat_at: Option<&str>,
-    event_type: &str,
-) -> Result<()> {
+    recovery_mode: Option<runtime::RuntimeRecoveryMode>,
+    recovery_cutoff: Option<&str>,
+) -> Result<bool> {
     let now = chrono::Utc::now().to_rfc3339();
-    state
+    let updated = state
         .sqlite_writer
         .write("llm_call_recover", |_| async {
-            sqlx::query(
-                r#"
+            let updated = match recovery_mode {
+                Some(runtime::RuntimeRecoveryMode::Startup) => sqlx::query(
+                    r#"
                 UPDATE llm_calls
                 SET status = 'failed',
                     error_text = ?,
@@ -3600,22 +3609,101 @@ async fn recover_llm_call_with_message(
                     updated_at = ?
                 WHERE id = ?
                   AND status IN ('queued', 'running')
+                  AND runtime_owner_id IS ?
+                  AND lease_heartbeat_at IS ?
+                  AND (
+                    runtime_owner_id IS NULL
+                    OR lease_heartbeat_at IS NULL
+                    OR julianday(lease_heartbeat_at) <= julianday(?)
+                    OR (
+                      runtime_owner_id != ?
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM runtime_owners
+                        WHERE runtime_owner_id = llm_calls.runtime_owner_id
+                          AND julianday(lease_heartbeat_at) > julianday(?)
+                      )
+                    )
+                  )
                 "#,
-            )
-            .bind(message)
-            .bind(now.as_str())
-            .bind(now.as_str())
-            .bind(call_id)
-            .execute(&state.pool)
-            .await
-            .context("recover llm_call failed")?;
-            Ok::<_, anyhow::Error>(())
+                )
+                .bind(message)
+                .bind(now.as_str())
+                .bind(now.as_str())
+                .bind(call_id)
+                .bind(previous_runtime_owner_id)
+                .bind(previous_lease_heartbeat_at)
+                .bind(recovery_cutoff)
+                .bind(state.runtime_owner_id.as_str())
+                .bind(recovery_cutoff)
+                .execute(&state.pool)
+                .await
+                .context("recover llm_call failed")?,
+                Some(runtime::RuntimeRecoveryMode::Sweep) => sqlx::query(
+                    r#"
+                UPDATE llm_calls
+                SET status = 'failed',
+                    error_text = ?,
+                    finished_at = ?,
+                    runtime_owner_id = NULL,
+                    lease_heartbeat_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN ('queued', 'running')
+                  AND runtime_owner_id IS ?
+                  AND lease_heartbeat_at IS ?
+                  AND (
+                    runtime_owner_id IS NULL
+                    OR lease_heartbeat_at IS NULL
+                    OR julianday(lease_heartbeat_at) <= julianday(?)
+                  )
+                "#,
+                )
+                .bind(message)
+                .bind(now.as_str())
+                .bind(now.as_str())
+                .bind(call_id)
+                .bind(previous_runtime_owner_id)
+                .bind(previous_lease_heartbeat_at)
+                .bind(recovery_cutoff)
+                .execute(&state.pool)
+                .await
+                .context("recover llm_call failed")?,
+                None => sqlx::query(
+                    r#"
+                UPDATE llm_calls
+                SET status = 'failed',
+                    error_text = ?,
+                    finished_at = ?,
+                    runtime_owner_id = NULL,
+                    lease_heartbeat_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN ('queued', 'running')
+                  AND runtime_owner_id IS ?
+                  AND lease_heartbeat_at IS ?
+                "#,
+                )
+                .bind(message)
+                .bind(now.as_str())
+                .bind(now.as_str())
+                .bind(call_id)
+                .bind(previous_runtime_owner_id)
+                .bind(previous_lease_heartbeat_at)
+                .execute(&state.pool)
+                .await
+                .context("recover llm_call failed")?,
+            };
+            Ok::<_, anyhow::Error>(updated.rows_affected() > 0)
         })
         .await?;
+    if !updated {
+        return Ok(false);
+    }
     append_llm_call_event(
         state,
         call_id,
-        event_type,
+        "llm.recovered_failed",
         "failed",
         serde_json::json!({
             "error_kind": "runtime_lease_expired",
@@ -3625,19 +3713,17 @@ async fn recover_llm_call_with_message(
     )
     .await
     .context("append llm_call recovery event failed")?;
-    Ok(())
+    Ok(true)
 }
 
 pub async fn recover_linked_llm_calls_for_batch(
     state: &AppState,
     batch_id: &str,
     message: &str,
-    previous_runtime_owner_id: Option<&str>,
-    previous_lease_heartbeat_at: Option<&str>,
 ) -> Result<()> {
-    let call_ids = sqlx::query_scalar::<_, String>(
+    let calls = sqlx::query_as::<_, RecoverableLlmCallRow>(
         r#"
-        SELECT id
+        SELECT id, runtime_owner_id, lease_heartbeat_at
         FROM llm_calls
         WHERE parent_translation_batch_id = ?
           AND status IN ('queued', 'running')
@@ -3649,14 +3735,15 @@ pub async fn recover_linked_llm_calls_for_batch(
     .await
     .context("load linked llm calls for recovery failed")?;
 
-    for call_id in call_ids {
+    for call in calls {
         recover_llm_call_with_message(
             state,
-            call_id.as_str(),
+            call.id.as_str(),
             message,
-            previous_runtime_owner_id,
-            previous_lease_heartbeat_at,
-            "llm.recovered_failed",
+            call.runtime_owner_id.as_deref(),
+            call.lease_heartbeat_at.as_deref(),
+            None,
+            None,
         )
         .await?;
     }
@@ -3671,17 +3758,10 @@ async fn recover_runtime_state_with_mode(
     state: &AppState,
     mode: runtime::RuntimeRecoveryMode,
 ) -> Result<()> {
-    #[derive(Debug, sqlx::FromRow)]
-    struct StaleLlmCallRow {
-        id: String,
-        runtime_owner_id: Option<String>,
-        lease_heartbeat_at: Option<String>,
-    }
-
     let cutoff = runtime::stale_cutoff_timestamp(chrono::Utc::now());
     let stale_calls = match mode {
         runtime::RuntimeRecoveryMode::Startup => {
-            sqlx::query_as::<_, StaleLlmCallRow>(
+            sqlx::query_as::<_, RecoverableLlmCallRow>(
                 r#"
                 SELECT id, runtime_owner_id, lease_heartbeat_at
                 FROM llm_calls
@@ -3711,7 +3791,7 @@ async fn recover_runtime_state_with_mode(
             .await
         }
         runtime::RuntimeRecoveryMode::Sweep => {
-            sqlx::query_as::<_, StaleLlmCallRow>(
+            sqlx::query_as::<_, RecoverableLlmCallRow>(
                 r#"
                 SELECT id, runtime_owner_id, lease_heartbeat_at
                 FROM llm_calls
@@ -3739,7 +3819,8 @@ async fn recover_runtime_state_with_mode(
             runtime::RUNTIME_LEASE_EXPIRED_ERROR,
             call.runtime_owner_id.as_deref(),
             call.lease_heartbeat_at.as_deref(),
-            "llm.recovered_failed",
+            Some(mode),
+            Some(cutoff.as_str()),
         )
         .await?;
     }
@@ -5763,9 +5844,9 @@ async fn upsert_daily_brief_snapshot(
     )
     .await?
     {
-        let mut tx = state
-            .pool
-            .begin()
+        let (_sqlite_write, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "ai_brief_snapshot_refresh")
             .await
             .context("failed to begin refresh brief tx")?;
         overwrite_brief_snapshot(
@@ -5797,9 +5878,9 @@ async fn upsert_daily_brief_snapshot(
         });
     }
 
-    let mut tx = state
-        .pool
-        .begin()
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "ai_brief_snapshot_upsert")
         .await
         .context("failed to begin brief tx")?;
     let inserted = sqlx::query_as::<_, UpsertedBriefRow>(
@@ -6457,9 +6538,9 @@ async fn refresh_existing_brief_snapshot(
     )
     .await?;
     let now = chrono::Utc::now().to_rfc3339();
-    let mut tx = state
-        .pool
-        .begin()
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "ai_brief_targeted_refresh")
         .await
         .context("failed to begin targeted brief refresh tx")?;
     overwrite_brief_snapshot(&mut tx, brief_id, &window, &built, generation_source, &now)
@@ -6961,9 +7042,9 @@ pub async fn recompute_legacy_brief_snapshot(
             .await?;
     let built = build_brief_content_from_digests(state, &legacy.user_id, releases, social).await?;
 
-    let mut tx = state
-        .pool
-        .begin()
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "ai_brief_legacy_recompute")
         .await
         .context("failed to begin legacy brief tx")?;
     let existing = sqlx::query_as::<_, ExistingBriefRow>(
@@ -8580,6 +8661,72 @@ mod tests {
         );
         assert_eq!(row.get::<Option<String>, _>("runtime_owner_id"), None);
         assert_eq!(row.get::<Option<String>, _>("lease_heartbeat_at"), None);
+    }
+
+    #[tokio::test]
+    async fn stale_llm_recovery_requires_the_original_lease_snapshot() {
+        let state = setup_llm_state().await;
+        let log = LlmCallLogRecord {
+            id: "call-revived-runtime-lease".to_owned(),
+            source: "tests.llm.recovery".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+            parent_task_type: None,
+            parent_translation_batch_id: None,
+            parent_brief_id: None,
+        };
+
+        insert_llm_call(state.as_ref(), &log, "gpt-test", 512, "prompt", Some("[]"))
+            .await
+            .expect("seed llm call");
+        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 10, "gpt-test")
+            .await
+            .expect("mark llm call running");
+        sqlx::query(
+            r#"
+            UPDATE llm_calls
+            SET runtime_owner_id = ?, lease_heartbeat_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("old-runtime-owner")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("2026-03-06T00:00:00Z")
+        .bind(log.id.as_str())
+        .execute(&state.pool)
+        .await
+        .expect("seed stale llm lease");
+        sqlx::query("UPDATE llm_calls SET lease_heartbeat_at = ? WHERE id = ?")
+            .bind("2026-03-06T00:02:00Z")
+            .bind(log.id.as_str())
+            .execute(&state.pool)
+            .await
+            .expect("revive llm lease");
+
+        let recovered = recover_llm_call_with_message(
+            state.as_ref(),
+            log.id.as_str(),
+            runtime::RUNTIME_LEASE_EXPIRED_ERROR,
+            Some("old-runtime-owner"),
+            Some("2026-03-06T00:00:00Z"),
+            Some(runtime::RuntimeRecoveryMode::Sweep),
+            Some("2026-03-06T00:01:00Z"),
+        )
+        .await
+        .expect("recover revived llm lease");
+        assert!(!recovered);
+
+        let row = sqlx::query("SELECT status, lease_heartbeat_at FROM llm_calls WHERE id = ?")
+            .bind(log.id.as_str())
+            .fetch_one(&state.pool)
+            .await
+            .expect("load revived llm lease");
+        assert_eq!(row.get::<String, _>("status"), "running");
+        assert_eq!(
+            row.get::<Option<String>, _>("lease_heartbeat_at")
+                .as_deref(),
+            Some("2026-03-06T00:02:00Z")
+        );
     }
 
     #[tokio::test]

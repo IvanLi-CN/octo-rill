@@ -36307,7 +36307,16 @@ line two",
             .await
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.sqlite_writer.runtime_status().waiting_foreground > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reaction PAT persistence should queue behind held writer");
         assert!(
             !persist.is_finished(),
             "reaction PAT check result bypassed foreground coordinator"

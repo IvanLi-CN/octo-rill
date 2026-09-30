@@ -805,6 +805,8 @@ struct ReleaseCandidateUserRow {
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct StaleRepoReleaseWorkRow {
     id: String,
+    runtime_owner_id: Option<String>,
+    lease_heartbeat_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -10369,6 +10371,128 @@ async fn fail_repo_release_work_item(
     Ok(updated > 0)
 }
 
+async fn fail_repo_release_work_item_if_stale(
+    state: &AppState,
+    row: &StaleRepoReleaseWorkRow,
+    cutoff: &str,
+    mode: runtime::RuntimeRecoveryMode,
+    error_text: &str,
+    now: &str,
+) -> Result<bool> {
+    let updated = state
+        .sqlite_writer
+        .write("repo_release_recover", |_| async {
+            let updated = match mode {
+                runtime::RuntimeRecoveryMode::Startup => sqlx::query(
+                    r#"
+                UPDATE repo_release_work_items
+                SET
+                  status = ?,
+                  priority = 0,
+                  has_new_repo_watchers = 0,
+                  deadline_at = ?,
+                  error_text = ?,
+                  finished_at = ?,
+                  updated_at = ?,
+                  runtime_owner_id = NULL,
+                  lease_heartbeat_at = NULL
+                WHERE id = ?
+                  AND status = ?
+                  AND runtime_owner_id IS ?
+                  AND lease_heartbeat_at IS ?
+                  AND (
+                    runtime_owner_id IS NULL
+                    OR lease_heartbeat_at IS NULL
+                    OR julianday(lease_heartbeat_at) <= julianday(?)
+                    OR (
+                      runtime_owner_id != ?
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM runtime_owners
+                        WHERE runtime_owner_id = repo_release_work_items.runtime_owner_id
+                          AND julianday(lease_heartbeat_at) > julianday(?)
+                      )
+                    )
+                  )
+                "#,
+                )
+                .bind(jobs::STATUS_FAILED)
+                .bind(now)
+                .bind(error_text)
+                .bind(now)
+                .bind(now)
+                .bind(row.id.as_str())
+                .bind(jobs::STATUS_RUNNING)
+                .bind(row.runtime_owner_id.as_deref())
+                .bind(row.lease_heartbeat_at.as_deref())
+                .bind(cutoff)
+                .bind(state.runtime_owner_id.as_str())
+                .bind(cutoff)
+                .execute(&state.pool)
+                .await
+                .with_context(|| {
+                    format!("failed to recover stale repo release work item {}", row.id)
+                })?,
+                runtime::RuntimeRecoveryMode::Sweep => sqlx::query(
+                    r#"
+                UPDATE repo_release_work_items
+                SET
+                  status = ?,
+                  priority = 0,
+                  has_new_repo_watchers = 0,
+                  deadline_at = ?,
+                  error_text = ?,
+                  finished_at = ?,
+                  updated_at = ?,
+                  runtime_owner_id = NULL,
+                  lease_heartbeat_at = NULL
+                WHERE id = ?
+                  AND status = ?
+                  AND runtime_owner_id IS ?
+                  AND lease_heartbeat_at IS ?
+                  AND (
+                    runtime_owner_id IS NULL
+                    OR lease_heartbeat_at IS NULL
+                    OR julianday(lease_heartbeat_at) <= julianday(?)
+                  )
+                "#,
+                )
+                .bind(jobs::STATUS_FAILED)
+                .bind(now)
+                .bind(error_text)
+                .bind(now)
+                .bind(now)
+                .bind(row.id.as_str())
+                .bind(jobs::STATUS_RUNNING)
+                .bind(row.runtime_owner_id.as_deref())
+                .bind(row.lease_heartbeat_at.as_deref())
+                .bind(cutoff)
+                .execute(&state.pool)
+                .await
+                .with_context(|| {
+                    format!("failed to recover stale repo release work item {}", row.id)
+                })?,
+            };
+            Ok::<_, anyhow::Error>(updated.rows_affected() > 0)
+        })
+        .await?;
+
+    if updated {
+        mark_repo_release_watchers(state, row.id.as_str(), "failed", Some(error_text), now).await?;
+        record_repo_refresh_governance_attempt(
+            state,
+            row.id.as_str(),
+            "failed",
+            Some(error_text),
+            None,
+            now,
+        )
+        .await?;
+    }
+
+    Ok(updated)
+}
+
 async fn expire_repo_release_work_item_ids(
     state: &AppState,
     work_item_ids: Vec<String>,
@@ -10464,7 +10588,7 @@ async fn recover_repo_release_runtime_state_with_mode(
         runtime::RuntimeRecoveryMode::Startup => {
             sqlx::query_as::<_, StaleRepoReleaseWorkRow>(
                 r#"
-                SELECT id
+                SELECT id, runtime_owner_id, lease_heartbeat_at
                 FROM repo_release_work_items
                 WHERE status = ?
                   AND (
@@ -10494,7 +10618,7 @@ async fn recover_repo_release_runtime_state_with_mode(
         runtime::RuntimeRecoveryMode::Sweep => {
             sqlx::query_as::<_, StaleRepoReleaseWorkRow>(
                 r#"
-                SELECT id
+                SELECT id, runtime_owner_id, lease_heartbeat_at
                 FROM repo_release_work_items
                 WHERE status = ?
                   AND (
@@ -10515,12 +10639,13 @@ async fn recover_repo_release_runtime_state_with_mode(
 
     let now = Utc::now().to_rfc3339();
     for row in stale_rows {
-        fail_repo_release_work_item(
+        fail_repo_release_work_item_if_stale(
             state,
-            row.id.as_str(),
+            &row,
+            cutoff.as_str(),
+            mode,
             runtime::RUNTIME_LEASE_EXPIRED_ERROR,
             now.as_str(),
-            false,
         )
         .await?;
     }
@@ -14283,20 +14408,21 @@ mod tests {
         ReleaseDemandRepo, RepoOwner, RepoRefreshCandidate, RepoReleaseFetchOutcome,
         RepoReleaseHttpState, RepoReleaseOrigin, RepoReleaseWorkItemRow, RepoReleaseWriteStats,
         RepoStargazerFetchResult, RepoStargazerSnapshot, SocialActivityEventInsert,
-        StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot, SubscriptionEventRecord,
-        SubscriptionPrunePhaseOutcome, SubscriptionRunContext, SyncRequestError,
-        aggregate_release_visible_repos, aggregate_repos, announcement_category_id_from_repo_value,
-        append_subscription_event, apply_social_activity_snapshot,
-        apply_social_activity_snapshot_partial, apply_social_activity_snapshot_with_options,
+        StaleRepoReleaseWorkRow, StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot,
+        SubscriptionEventRecord, SubscriptionPrunePhaseOutcome, SubscriptionRunContext,
+        SyncRequestError, aggregate_release_visible_repos, aggregate_repos,
+        announcement_category_id_from_repo_value, append_subscription_event,
+        apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
+        apply_social_activity_snapshot_with_options,
         attach_and_wait_for_user_release_demand_with_freshness, attach_release_demand,
         attach_release_demand_with_freshness, claim_next_repo_release_work_item,
         classify_github_http_error, cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
         discussion_announcement_from_node, execute_repo_release_work_item,
         execute_subscription_prune_phases, expire_repo_release_deadlines,
-        fail_repo_release_work_item, feed_activity_event_from_github,
-        fetch_repo_releases_with_optional_token, hydrate_repo_refresh_candidates,
-        insert_feed_activity_events, insert_social_activity_event_tx,
-        install_social_activity_snapshot_after_first_chunk_hook,
+        fail_repo_release_work_item, fail_repo_release_work_item_if_stale,
+        feed_activity_event_from_github, fetch_repo_releases_with_optional_token,
+        hydrate_repo_refresh_candidates, insert_feed_activity_events,
+        insert_social_activity_event_tx, install_social_activity_snapshot_after_first_chunk_hook,
         install_social_activity_snapshot_after_reads_hook, is_terminal_notification_thread_error,
         load_dashboard_release_freshness_policy, load_dashboard_release_freshness_snapshots,
         load_public_release_usage_sync_access, load_repo_release_candidate_users,
@@ -21947,6 +22073,60 @@ mod tests {
         .expect("load stale lease work item");
         assert_eq!(row.0, jobs::STATUS_FAILED);
         assert_eq!(row.1.as_deref(), Some(runtime::RUNTIME_LEASE_EXPIRED_ERROR));
+    }
+
+    #[tokio::test]
+    async fn stale_repo_release_recovery_requires_the_original_lease_snapshot() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let stale_heartbeat = "2026-03-06T00:00:00Z";
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-revived-lease",
+                repo_id: 46,
+                repo_full_name: "octo/revived-lease",
+                status: jobs::STATUS_RUNNING,
+                deadline_at: "2026-03-06T01:00:00Z",
+                last_release_count: 0,
+                last_candidate_failures: 0,
+                runtime_owner_id: Some("worker-a"),
+                lease_heartbeat_at: Some(stale_heartbeat),
+            },
+        )
+        .await;
+        sqlx::query("UPDATE repo_release_work_items SET lease_heartbeat_at = ? WHERE id = ?")
+            .bind("2026-03-06T00:02:00Z")
+            .bind("repo-work-revived-lease")
+            .execute(&pool)
+            .await
+            .expect("revive repo release lease");
+
+        let recovered = fail_repo_release_work_item_if_stale(
+            state.as_ref(),
+            &StaleRepoReleaseWorkRow {
+                id: "repo-work-revived-lease".to_owned(),
+                runtime_owner_id: Some("worker-a".to_owned()),
+                lease_heartbeat_at: Some(stale_heartbeat.to_owned()),
+            },
+            "2026-03-06T00:01:00Z",
+            runtime::RuntimeRecoveryMode::Sweep,
+            runtime::RUNTIME_LEASE_EXPIRED_ERROR,
+            "2026-03-06T00:03:00Z",
+        )
+        .await
+        .expect("recover revived repo release lease");
+        assert!(!recovered);
+
+        let row = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT status, lease_heartbeat_at FROM repo_release_work_items WHERE id = ?",
+        )
+        .bind("repo-work-revived-lease")
+        .fetch_one(&pool)
+        .await
+        .expect("load revived repo release lease");
+        assert_eq!(row.0, jobs::STATUS_RUNNING);
+        assert_eq!(row.1.as_deref(), Some("2026-03-06T00:02:00Z"));
     }
 
     #[tokio::test]
