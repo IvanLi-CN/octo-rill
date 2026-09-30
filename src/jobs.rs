@@ -971,7 +971,7 @@ async fn record_skipped_subscription_run(state: &AppState, payload: Value) -> Re
     )
     .await?;
 
-    complete_task(
+    let finalized = complete_task(
         state,
         &task.task_id,
         STATUS_SUCCEEDED,
@@ -982,6 +982,9 @@ async fn record_skipped_subscription_run(state: &AppState, payload: Value) -> Re
         None,
     )
     .await?;
+    if !finalized {
+        return Ok(task);
+    }
     append_task_event(
         state,
         &task.task_id,
@@ -1036,7 +1039,7 @@ async fn record_skipped_recent_failures_retry(
     )
     .await?;
 
-    complete_task(
+    let finalized = complete_task(
         state,
         &task.task_id,
         STATUS_SUCCEEDED,
@@ -1052,6 +1055,9 @@ async fn record_skipped_recent_failures_retry(
         None,
     )
     .await?;
+    if !finalized {
+        return Ok(task);
+    }
     append_task_event(
         state,
         &task.task_id,
@@ -1575,8 +1581,16 @@ pub async fn complete_task(
     status: &str,
     result: Option<Value>,
     error_message: Option<String>,
-) -> Result<()> {
-    finalize_task(state, task_id, status, result, error_message).await
+) -> Result<bool> {
+    finalize_task_if_owned(
+        state,
+        task_id,
+        status,
+        result,
+        error_message,
+        state.runtime_owner_id.as_str(),
+    )
+    .await
 }
 
 pub async fn reschedule_task(
@@ -4394,52 +4408,6 @@ async fn execute_recent_failures_retry_task(
     }))
 }
 
-async fn finalize_task(
-    state: &AppState,
-    task_id: &str,
-    status: &str,
-    result: Option<Value>,
-    error_message: Option<String>,
-) -> Result<()> {
-    let now = Utc::now().to_rfc3339();
-    let result_json = result
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()
-        .context("serialize task result")?;
-
-    state
-        .sqlite_writer
-        .write("job_task_finalize", |_| async {
-            sqlx::query(
-                r#"
-                UPDATE job_tasks
-                SET status = ?,
-                    result_json = ?,
-                    error_message = ?,
-                    finished_at = ?,
-                    runtime_owner_id = NULL,
-                    lease_heartbeat_at = NULL,
-                    updated_at = ?
-                WHERE id = ?
-                "#,
-            )
-            .bind(status)
-            .bind(result_json.as_deref())
-            .bind(error_message.as_deref())
-            .bind(now.as_str())
-            .bind(now.as_str())
-            .bind(task_id)
-            .execute(&state.pool)
-            .await
-            .context("failed to finalize task")?;
-            Ok(())
-        })
-        .await?;
-
-    Ok(())
-}
-
 async fn finalize_task_if_owned(
     state: &AppState,
     task_id: &str,
@@ -4890,7 +4858,7 @@ mod tests {
         TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_RELEASES,
         TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE, TASK_SYNC_SUBSCRIPTIONS,
         TASK_WEBHOOK_PUSH_AUDIT, TASK_WEBHOOK_PUSH_MANAGE, TranslationStreamCursor, cancel_task,
-        claim_next_queued_task, current_recent_failures_retry_schedule_key,
+        claim_next_queued_task, complete_task, current_recent_failures_retry_schedule_key,
         current_subscription_schedule_key, enqueue_brief_history_recompute_if_needed,
         enqueue_brief_refresh_content_if_needed, enqueue_hour_slot_if_due,
         enqueue_recent_failures_retry_if_due, enqueue_singleton_task_for_requester,
@@ -6214,6 +6182,50 @@ mod tests {
             "#,
         )
         .bind("stale-worker-task")
+        .fetch_all(&pool)
+        .await
+        .expect("load recovered task events");
+        assert_eq!(event_types, vec!["task.recovered_failed"]);
+    }
+
+    #[tokio::test]
+    async fn recovered_task_cannot_be_completed_by_stale_worker() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_task(
+            &pool,
+            "stale-complete-task",
+            TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+
+        recover_runtime_state(state.as_ref())
+            .await
+            .expect("recover runtime state");
+
+        let completed = complete_task(
+            state.as_ref(),
+            "stale-complete-task",
+            STATUS_SUCCEEDED,
+            Some(json!({"stale": true})),
+            None,
+        )
+        .await
+        .expect("complete stale worker task");
+
+        assert!(!completed);
+        let status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM job_tasks WHERE id = 'stale-complete-task'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered task status");
+        assert_eq!(status, STATUS_FAILED);
+        let event_types = sqlx::query_scalar::<_, String>(
+            "SELECT event_type FROM job_task_events WHERE task_id = 'stale-complete-task' ORDER BY rowid ASC",
+        )
         .fetch_all(&pool)
         .await
         .expect("load recovered task events");

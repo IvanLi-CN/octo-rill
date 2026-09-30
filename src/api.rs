@@ -19573,6 +19573,11 @@ pub async fn toggle_release_reaction(
         ReleaseReactionContent::Eyes => current_reactions.viewer.eyes,
     };
 
+    // The live read already proved the PAT, so persist that state before the
+    // remote mutation. A failed local write must not turn a completed mutation
+    // into an ambiguous client-visible error.
+    persist_reaction_pat_check_result(state.as_ref(), &user_id, "valid", Some("PAT is valid"))
+        .await?;
     let updated =
         match mutate_release_reaction(state.as_ref(), &token, node_id, content, currently_reacted)
             .await
@@ -19594,8 +19599,6 @@ pub async fn toggle_release_reaction(
             }
             Err(err) => return Err(err),
         };
-    persist_reaction_pat_check_result(state.as_ref(), &user_id, "valid", Some("PAT is valid"))
-        .await?;
     persist_release_reaction_counts(state.as_ref(), row.release_id, &updated.counts).await?;
 
     Ok(Json(ToggleReleaseReactionResponse {
@@ -23667,48 +23670,74 @@ async fn translate_releases_batch_stream_worker(
                 "missing": missing_count,
                 "error": error_count,
             });
-            let _ = jobs::complete_task(
+            let finalized = match jobs::complete_task(
                 state.as_ref(),
                 task_id.as_str(),
                 jobs::STATUS_SUCCEEDED,
                 Some(summary.clone()),
                 None,
             )
-            .await;
+            .await
+            {
+                Ok(finalized) => finalized,
+                Err(error) => {
+                    tracing::warn!(
+                        task_id = task_id.as_str(),
+                        ?error,
+                        "failed to finalize translation stream task"
+                    );
+                    false
+                }
+            };
             heartbeat.stop().await;
-            let _ = jobs::append_task_event(
-                state.as_ref(),
-                task_id.as_str(),
-                "task.completed",
-                json!({
-                    "task_id": task_id.as_str(),
-                    "status": jobs::STATUS_SUCCEEDED,
-                    "summary": summary,
-                }),
-            )
-            .await;
+            if finalized {
+                let _ = jobs::append_task_event(
+                    state.as_ref(),
+                    task_id.as_str(),
+                    "task.completed",
+                    json!({
+                        "task_id": task_id.as_str(),
+                        "status": jobs::STATUS_SUCCEEDED,
+                        "summary": summary,
+                    }),
+                )
+                .await;
+            }
         }
         Err(err) => {
             let error_message = format!("{}: stream worker failed", err.code());
-            let _ = jobs::complete_task(
+            let finalized = match jobs::complete_task(
                 state.as_ref(),
                 task_id.as_str(),
                 jobs::STATUS_FAILED,
                 None,
                 Some(error_message.clone()),
             )
-            .await;
-            let _ = jobs::append_task_event(
-                state.as_ref(),
-                task_id.as_str(),
-                "task.completed",
-                json!({
-                    "task_id": task_id.as_str(),
-                    "status": jobs::STATUS_FAILED,
-                    "error": error_message,
-                }),
-            )
-            .await;
+            .await
+            {
+                Ok(finalized) => finalized,
+                Err(error) => {
+                    tracing::warn!(
+                        task_id = task_id.as_str(),
+                        ?error,
+                        "failed to finalize failed translation stream task"
+                    );
+                    false
+                }
+            };
+            if finalized {
+                let _ = jobs::append_task_event(
+                    state.as_ref(),
+                    task_id.as_str(),
+                    "task.completed",
+                    json!({
+                        "task_id": task_id.as_str(),
+                        "status": jobs::STATUS_FAILED,
+                        "error": error_message,
+                    }),
+                )
+                .await;
+            }
             heartbeat.stop().await;
             let _ = send_batch_stream_event(
                 &tx,
