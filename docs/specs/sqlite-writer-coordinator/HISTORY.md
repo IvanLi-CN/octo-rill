@@ -4,7 +4,7 @@
 
 ## Decision Trace
 
-- 2026-09-30：复核 stale worker、运行时配置失败回滚与 repo release terminal transition 后，决定把 LLM owner/status CAS、recovery event 与状态更新、repo release work item/watchers/governance 终态更新统一收进同一 coordinator transaction，并让 admin runtime PATCH 在 live apply 失败时恢复持久化快照。
+- 2026-09-30：复核 stale worker、运行时配置失败回滚与 repo release terminal transition 后，决定把 LLM owner/status CAS、recovery/finalize event 与状态更新、repo release work item/watchers/governance 终态更新统一收进同一 coordinator transaction；admin runtime PATCH 由共享 lock 串行化，并在 live apply 失败时用单事务恢复持久化快照。
 - 2026-09-29：PR3.8 复核高竞争 SQLite 生产写入边界后，决定把 admin runtime settings、LLM recovery/model health、translation worker runtime slots、reaction PAT 与高频 API/sync metadata 写入统一接入共享 coordinator，并用 AST source guard 防止后续 direct pool write 回退；translation runtime production helper 同时移除可选 writer fallback。
 - 2026-05-09：线上 `octo-rill` 容器在高 worker 并发下出现 `database is locked`、慢 SQL 与 500；决定保留业务并发，不通过降低 worker 数量或 SQLite pool=1 解决。
 - 2026-05-09：实现选择为应用内 `SqliteWriteCoordinator` 单 writer permit；显式写事务返回原生 SQLx transaction，避免破坏 SQLx executor 行为，同时让 permit 覆盖 `BEGIN IMMEDIATE` 到 `commit` 的完整事务段。

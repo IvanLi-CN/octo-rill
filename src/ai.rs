@@ -2206,9 +2206,18 @@ async fn insert_llm_call(
     let now = chrono::Utc::now().to_rfc3339();
     let prompt_text = redact_llm_diagnostic_text(prompt_text);
     let input_messages_json = input_messages_json.map(redact_llm_diagnostic_text);
+    let event_payload = serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+    });
     state
         .sqlite_writer
         .write("llm_call_insert", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin llm_call insert transaction failed")?;
             sqlx::query(
                 r#"
                 INSERT INTO llm_calls (
@@ -2242,24 +2251,30 @@ async fn insert_llm_call(
             .bind(input_messages_json.as_deref())
             .bind(now.as_str())
             .bind(now.as_str())
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await
             .context("insert llm_call failed")?;
+            let inserted = insert_llm_call_event_in_transaction(
+                &mut tx,
+                log.id.as_str(),
+                "llm.queued",
+                "queued",
+                event_payload.clone(),
+                now.as_str(),
+            )
+            .await
+            .context("append llm_call queued event failed")?;
+            if inserted.rows_affected() == 0 {
+                return Err(anyhow!(
+                    "insert llm_call queued event failed: call not found"
+                ));
+            }
+            tx.commit()
+                .await
+                .context("commit llm_call insert transaction failed")?;
             Ok::<_, anyhow::Error>(())
         })
         .await?;
-    append_llm_call_event(
-        state,
-        log.id.as_str(),
-        "llm.queued",
-        "queued",
-        serde_json::json!({
-            "model": model,
-            "max_tokens": max_tokens,
-        }),
-    )
-    .await
-    .context("append llm_call queued event failed")?;
     Ok(())
 }
 
@@ -2384,9 +2399,20 @@ async fn update_llm_call_running(
     model: &str,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
+    let event_payload = serde_json::json!({
+        "model": model,
+        "attempt": attempt_count,
+        "attempt_count": attempt_count,
+        "scheduler_wait_ms": scheduler_wait_ms,
+    });
     state
         .sqlite_writer
         .write("llm_call_running", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin llm_call running transaction failed")?;
             let updated = sqlx::query(
                 r#"
                 UPDATE llm_calls
@@ -2415,31 +2441,36 @@ async fn update_llm_call_running(
             .bind(now.as_str())
             .bind(call_id)
             .bind(state.runtime_owner_id.as_str())
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await
             .context("update llm_call running failed")?;
             if updated.rows_affected() == 0 {
+                tx.rollback().await.ok();
                 return Err(anyhow!(
                     "llm_call is no longer available for running update"
                 ));
             }
+            let inserted = insert_llm_call_event_in_transaction(
+                &mut tx,
+                call_id,
+                "llm.running",
+                "running",
+                event_payload.clone(),
+                now.as_str(),
+            )
+            .await
+            .context("append llm_call running event failed")?;
+            if inserted.rows_affected() == 0 {
+                return Err(anyhow!(
+                    "insert llm_call running event failed: call not found"
+                ));
+            }
+            tx.commit()
+                .await
+                .context("commit llm_call running transaction failed")?;
             Ok::<_, anyhow::Error>(())
         })
         .await?;
-    append_llm_call_event(
-        state,
-        call_id,
-        "llm.running",
-        "running",
-        serde_json::json!({
-            "model": model,
-            "attempt": attempt_count,
-            "attempt_count": attempt_count,
-            "scheduler_wait_ms": scheduler_wait_ms,
-        }),
-    )
-    .await
-    .context("append llm_call running event failed")?;
     Ok(())
 }
 
@@ -2460,9 +2491,24 @@ async fn requeue_llm_call_for_retry(
             + chrono::Duration::from_std(retry_delay).unwrap_or_else(|_| chrono::Duration::zero()))
         .to_rfc3339()
     });
+    let event_payload = serde_json::json!({
+        "model": next_model,
+        "failure_class": failure_class,
+        "attempt": attempt_count,
+        "attempt_count": attempt_count,
+        "scheduler_wait_ms": scheduler_wait_ms,
+        "retry_delay_ms": i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
+        "retry_after_ms": i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
+        "fallback_count": fallback_count,
+    });
     state
         .sqlite_writer
         .write("llm_call_requeue", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin llm_call requeue transaction failed")?;
             let updated = sqlx::query(
                 r#"
                 UPDATE llm_calls
@@ -2491,33 +2537,34 @@ async fn requeue_llm_call_for_retry(
             .bind(now.as_str())
             .bind(call_id)
             .bind(state.runtime_owner_id.as_str())
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await
             .context("requeue llm_call failed")?;
             if updated.rows_affected() == 0 {
+                tx.rollback().await.ok();
                 return Err(anyhow!("llm_call is no longer owned for retry requeue"));
             }
+            let inserted = insert_llm_call_event_in_transaction(
+                &mut tx,
+                call_id,
+                "llm.retry_queued",
+                "queued",
+                event_payload.clone(),
+                now.as_str(),
+            )
+            .await
+            .context("append llm_call retry queued event failed")?;
+            if inserted.rows_affected() == 0 {
+                return Err(anyhow!(
+                    "insert llm_call retry queued event failed: call not found"
+                ));
+            }
+            tx.commit()
+                .await
+                .context("commit llm_call requeue transaction failed")?;
             Ok::<_, anyhow::Error>(())
         })
         .await?;
-    append_llm_call_event(
-        state,
-        call_id,
-        "llm.retry_queued",
-        "queued",
-        serde_json::json!({
-            "model": next_model,
-            "failure_class": failure_class,
-            "attempt": attempt_count,
-            "attempt_count": attempt_count,
-            "scheduler_wait_ms": scheduler_wait_ms,
-            "retry_delay_ms": i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
-            "retry_after_ms": i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
-            "fallback_count": fallback_count,
-        }),
-    )
-    .await
-    .context("append llm_call retry queued event failed")?;
     Ok(())
 }
 
@@ -2589,9 +2636,38 @@ async fn finalize_llm_call(
     update: FinalizeLlmCallUpdate<'_>,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
+    let event_type = if update.status == "succeeded" {
+        "llm.succeeded"
+    } else {
+        "llm.failed"
+    };
+    let event_payload = serde_json::json!({
+        "attempt_count": update.attempt_count,
+        "scheduler_wait_ms": update.scheduler_wait_ms,
+        "first_token_wait_ms": update.first_token_wait_ms,
+        "duration_ms": update.duration_ms,
+        "input_tokens": update.input_tokens,
+        "output_tokens": update.output_tokens,
+        "finish_reason": update.finish_reason,
+        "provider_request_id": update.provider_request_id,
+        "provider_http_status": update.provider_http_status,
+        "cached_input_tokens": update.cached_input_tokens,
+        "total_tokens": update.total_tokens,
+        "has_output": update.response_text.is_some(),
+        "failure_class": update.failure_class,
+        "final_model": update.final_model,
+        "fallback_count": update.fallback_count,
+        "retry_scheduled_at": update.retry_scheduled_at,
+        "recovery_attempt_count": update.recovery_attempt_count,
+    });
     state
         .sqlite_writer
         .write("llm_call_finalize", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin llm_call finalize transaction failed")?;
             let updated = sqlx::query(
                 r#"
                 UPDATE llm_calls
@@ -2648,46 +2724,34 @@ async fn finalize_llm_call(
             .bind(now.as_str())
             .bind(call_id)
             .bind(state.runtime_owner_id.as_str())
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await
             .context("finalize llm_call failed")?;
             if updated.rows_affected() == 0 {
+                tx.rollback().await.ok();
                 return Err(anyhow!("llm_call is no longer owned for finalization"));
             }
+            let inserted = insert_llm_call_event_in_transaction(
+                &mut tx,
+                call_id,
+                event_type,
+                update.status,
+                event_payload.clone(),
+                now.as_str(),
+            )
+            .await
+            .context("append llm_call finalized event failed")?;
+            if inserted.rows_affected() == 0 {
+                return Err(anyhow!(
+                    "insert llm_call finalized event failed: call not found"
+                ));
+            }
+            tx.commit()
+                .await
+                .context("commit llm_call finalize transaction failed")?;
             Ok::<_, anyhow::Error>(())
         })
         .await?;
-    append_llm_call_event(
-        state,
-        call_id,
-        if update.status == "succeeded" {
-            "llm.succeeded"
-        } else {
-            "llm.failed"
-        },
-        update.status,
-        serde_json::json!({
-            "attempt_count": update.attempt_count,
-            "scheduler_wait_ms": update.scheduler_wait_ms,
-            "first_token_wait_ms": update.first_token_wait_ms,
-            "duration_ms": update.duration_ms,
-            "input_tokens": update.input_tokens,
-            "output_tokens": update.output_tokens,
-            "finish_reason": update.finish_reason,
-            "provider_request_id": update.provider_request_id,
-            "provider_http_status": update.provider_http_status,
-            "cached_input_tokens": update.cached_input_tokens,
-            "total_tokens": update.total_tokens,
-            "has_output": update.response_text.is_some(),
-            "failure_class": update.failure_class,
-            "final_model": update.final_model,
-            "fallback_count": update.fallback_count,
-            "retry_scheduled_at": update.retry_scheduled_at,
-            "recovery_attempt_count": update.recovery_attempt_count,
-        }),
-    )
-    .await
-    .context("append llm_call finalized event failed")?;
     Ok(())
 }
 

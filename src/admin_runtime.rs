@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, sync::OnceLock};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveTime, Utc};
@@ -93,6 +93,12 @@ pub const MAX_REPO_REFRESH_SYSTEM_BUDGET_PER_WINDOW: i64 = 20_000;
 pub const DEFAULT_DASHBOARD_RELEASE_FRESHNESS_PROFILE: &str = "balanced";
 pub const DEFAULT_LLM_RECOVERY_ENABLED: bool = false;
 pub const DEFAULT_LLM_RECOVERY_ROLLOUT_PERCENT: u8 = 0;
+
+static RUNTIME_SETTINGS_UPDATE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+pub(crate) fn runtime_settings_update_lock() -> &'static tokio::sync::Mutex<()> {
+    RUNTIME_SETTINGS_UPDATE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 pub fn is_llm_recovery_failure_class(value: &str) -> bool {
     matches!(
@@ -1277,28 +1283,76 @@ pub async fn restore_persisted_runtime_settings(
     state: std::sync::Arc<AppState>,
     snapshot: &AdminRuntimeSettingsSnapshot,
 ) -> Result<()> {
-    update_llm_runtime_settings(
-        &state.pool,
-        &state.sqlite_writer,
-        snapshot.llm_max_concurrency,
-        snapshot.ai_model_context_limit,
-        &snapshot.llm_models,
-    )
-    .await?;
-    update_llm_recovery_runtime_config(
-        &state.pool,
-        &state.sqlite_writer,
-        snapshot.llm_recovery.enabled,
-        i64::from(snapshot.llm_recovery.rollout_percent),
-    )
-    .await?;
-    update_translation_runtime_settings(
-        &state.pool,
-        &state.sqlite_writer,
-        snapshot.translation_general_worker_concurrency,
-        snapshot.translation_dedicated_worker_concurrency,
-    )
-    .await?;
+    let now = Utc::now().to_rfc3339();
+    let serialized_llm_models = serialize_llm_models_json(&snapshot.llm_models);
+    state
+        .sqlite_writer
+        .write_foreground("admin_runtime_settings_restore", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin admin runtime settings restore transaction failed")?;
+            sqlx::query(
+                r#"
+                UPDATE admin_runtime_settings
+                SET
+                  llm_max_concurrency = ?,
+                  ai_model_context_limit = ?,
+                  llm_models_json = ?,
+                  translation_general_worker_concurrency = ?,
+                  translation_dedicated_worker_concurrency = ?,
+                  updated_at = ?
+                WHERE id = 1
+                "#,
+            )
+            .bind(i64::try_from(snapshot.llm_max_concurrency).unwrap_or(i64::MAX))
+            .bind(snapshot.ai_model_context_limit.map(i64::from))
+            .bind(serialized_llm_models.as_str())
+            .bind(
+                i64::try_from(snapshot.translation_general_worker_concurrency).unwrap_or(i64::MAX),
+            )
+            .bind(
+                i64::try_from(snapshot.translation_dedicated_worker_concurrency)
+                    .unwrap_or(i64::MAX),
+            )
+            .bind(now.as_str())
+            .execute(&mut *tx)
+            .await
+            .context("restore admin runtime settings failed")?;
+            sqlx::query(
+                r#"
+                INSERT INTO llm_recovery_flags (
+                  id,
+                  llm_recovery_enabled,
+                  llm_recovery_rollout_percent,
+                  created_at,
+                  updated_at
+                )
+                VALUES (1, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  llm_recovery_enabled = excluded.llm_recovery_enabled,
+                  llm_recovery_rollout_percent = excluded.llm_recovery_rollout_percent,
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(if snapshot.llm_recovery.enabled {
+                1_i64
+            } else {
+                0_i64
+            })
+            .bind(i64::from(snapshot.llm_recovery.rollout_percent))
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(&mut *tx)
+            .await
+            .context("restore llm recovery runtime settings failed")?;
+            tx.commit()
+                .await
+                .context("commit admin runtime settings restore transaction failed")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
     sync_persisted_runtime_settings(state).await?;
     Ok(())
 }

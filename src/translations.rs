@@ -1456,7 +1456,7 @@ impl TranslationSchedulerController {
         config: TranslationRuntimeConfig,
     ) -> Result<TranslationRuntimeConfig> {
         #[cfg(test)]
-        self.runtime_sync_started.notify_waiters();
+        self.runtime_sync_started.notify_one();
         let config = TranslationRuntimeConfig::new(
             config.general_worker_concurrency,
             config.dedicated_worker_concurrency,
@@ -2534,6 +2534,7 @@ pub async fn admin_patch_translation_runtime_config(
     Json(req): Json<AdminTranslationRuntimeConfigUpdateRequest>,
 ) -> Result<Json<AdminTranslationStatusResponse>, ApiError> {
     let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
+    let _runtime_settings_guard = admin_runtime::runtime_settings_update_lock().lock().await;
     let previous_settings = admin_runtime::load_or_seed_runtime_settings_with_writer(
         &state.pool,
         &state.sqlite_writer,

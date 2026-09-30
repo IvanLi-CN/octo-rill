@@ -7042,7 +7042,7 @@ fn current_repo_refresh_window_index(now: DateTime<Utc>, window_minutes: i64) ->
 }
 
 async fn upsert_repo_refresh_governance_snapshot(
-    tx: &mut sqlx::SqliteConnection,
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
     candidate: &RepoRefreshCandidate,
     priority_rank: i64,
     budget: i64,
@@ -7191,7 +7191,7 @@ async fn upsert_repo_refresh_governance_snapshot(
     .bind(target_interval_minutes_real)
     .bind(2.0_f64)
     .bind(now_rfc3339)
-    .execute(tx)
+    .execute(&mut **tx)
     .await
     .with_context(|| {
         format!(

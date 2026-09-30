@@ -7531,6 +7531,7 @@ pub async fn admin_patch_llm_runtime_config(
     Json(req): Json<AdminLlmRuntimeConfigUpdateRequest>,
 ) -> Result<Json<AdminLlmSchedulerStatusResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let _runtime_settings_guard = admin_runtime::runtime_settings_update_lock().lock().await;
     let previous_settings = admin_runtime::load_or_seed_runtime_settings_with_writer(
         &state.pool,
         &state.sqlite_writer,
