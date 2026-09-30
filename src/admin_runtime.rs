@@ -1314,6 +1314,7 @@ pub async fn sync_persisted_runtime_settings(
         .await
         .llm_models;
     let previous_health = state.llm_scheduler.model_health_snapshot().await;
+    let previous_translation_config = state.translation_scheduler.desired_config().await;
     let next_health = load_llm_model_health(&state.pool).await?;
 
     state
@@ -1345,6 +1346,17 @@ pub async fn sync_persisted_runtime_settings(
             .set_model_routing(previous_routing)
             .await;
         state.llm_scheduler.set_model_health(previous_health).await;
+        if let Err(rollback_error) = state
+            .translation_scheduler
+            .apply_runtime_config(state.clone(), previous_translation_config)
+            .await
+        {
+            tracing::error!(
+                event = "runtime.settings_sync",
+                error_chain = %crate::observability::error_chain_summary(rollback_error.as_ref()),
+                "failed to roll back translation runtime settings after sync failure"
+            );
+        }
         return Err(error);
     }
 

@@ -384,12 +384,16 @@ impl SqliteWriteCoordinator {
             match result {
                 Ok(tx) => {
                     debug!(
+                        event = "sqlite.write",
+                        operation = lane,
+                        priority = priority.as_str(),
+                        elapsed_ms = begin_elapsed.as_millis(),
+                        attempt,
                         sqlite_write_lane = lane,
                         sqlite_write_priority = priority.as_str(),
                         writer_wait_ms = permit.writer_wait_ms(),
                         pool_wait_ms = pool_wait.as_millis(),
                         begin_ms = begin_elapsed.as_millis(),
-                        attempt,
                         "sqlite write transaction started"
                     );
                     return Ok((permit, tx));
@@ -401,6 +405,11 @@ impl SqliteWriteCoordinator {
                     let writer_wait_ms = permit.writer_wait_ms();
                     drop(permit);
                     warn!(
+                        event = "sqlite.write",
+                        operation = lane,
+                        priority = priority.as_str(),
+                        elapsed_ms = begin_elapsed.as_millis(),
+                        error_kind = "sqlite_busy",
                         sqlite_write_lane = lane,
                         sqlite_write_priority = priority.as_str(),
                         writer_wait_ms,
@@ -408,7 +417,7 @@ impl SqliteWriteCoordinator {
                         begin_ms = begin_elapsed.as_millis(),
                         attempt,
                         retry_after_ms = delay.as_millis(),
-                        err = %err,
+                        error_chain = %observability::error_chain_summary(err.as_ref()),
                         "sqlite write transaction hit busy state; retrying"
                     );
                     tokio::time::sleep(delay).await;
@@ -419,13 +428,18 @@ impl SqliteWriteCoordinator {
                     drop(permit);
                     if is_sqlite_busy_error(err.as_ref()) {
                         warn!(
+                            event = "sqlite.write",
+                            operation = lane,
+                            priority = priority.as_str(),
+                            elapsed_ms = begin_elapsed.as_millis(),
+                            error_kind = "sqlite_busy",
                             sqlite_write_lane = lane,
                             sqlite_write_priority = priority.as_str(),
                             writer_wait_ms,
                             pool_wait_ms = pool_wait.as_millis(),
                             begin_ms = begin_elapsed.as_millis(),
                             attempt,
-                            err = %err,
+                            error_chain = %observability::error_chain_summary(err.as_ref()),
                             "sqlite write transaction exhausted busy retries"
                         );
                     }

@@ -23636,18 +23636,6 @@ async fn translate_releases_batch_stream_worker(
             }
         }
 
-        if !send_batch_stream_event(
-            &tx,
-            TranslateBatchStreamEvent {
-                event: "done",
-                item: None,
-                error: None,
-            },
-        )
-        .await
-        {
-            return Err(ApiError::internal("stream client disconnected"));
-        }
         Ok::<(), ApiError>(())
     })
     .await;
@@ -23682,7 +23670,7 @@ async fn translate_releases_batch_stream_worker(
             };
             heartbeat.stop().await;
             if finalized {
-                let _ = jobs::append_task_event(
+                if let Err(error) = jobs::append_task_event(
                     state.as_ref(),
                     task_id.as_str(),
                     "task.completed",
@@ -23691,6 +23679,32 @@ async fn translate_releases_batch_stream_worker(
                         "status": jobs::STATUS_SUCCEEDED,
                         "summary": summary,
                     }),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        task_id = task_id.as_str(),
+                        ?error,
+                        "failed to append completed translation stream task event"
+                    );
+                }
+                let _ = send_batch_stream_event(
+                    &tx,
+                    TranslateBatchStreamEvent {
+                        event: "done",
+                        item: None,
+                        error: None,
+                    },
+                )
+                .await;
+            } else {
+                let _ = send_batch_stream_event(
+                    &tx,
+                    TranslateBatchStreamEvent {
+                        event: "error",
+                        item: None,
+                        error: Some("translation stream task was not finalized".to_owned()),
+                    },
                 )
                 .await;
             }

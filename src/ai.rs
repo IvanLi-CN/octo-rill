@@ -2368,7 +2368,7 @@ async fn append_llm_call_event_if_owned(
         .write("llm_call_event_insert", |_| async {
             let mut tx = state
                 .pool
-                .begin()
+                .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin llm_call event transaction failed")?;
             let owned = sqlx::query_scalar::<_, i64>(
@@ -2495,6 +2495,7 @@ async fn requeue_llm_call_for_retry(
     next_model: &str,
     failure_class: Option<&str>,
     fallback_count: i64,
+    route_switch: Option<(&str, &str)>,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     let retry_scheduled_at = (!retry_delay.is_zero()).then(|| {
@@ -2554,6 +2555,30 @@ async fn requeue_llm_call_for_retry(
             if updated.rows_affected() == 0 {
                 tx.rollback().await.ok();
                 return Err(anyhow!("llm_call is no longer owned for retry requeue"));
+            }
+            if let Some((from_model, to_model)) = route_switch {
+                let route_event = insert_llm_call_event_in_transaction(
+                    &mut tx,
+                    call_id,
+                    "llm.route_switched",
+                    "queued",
+                    serde_json::json!({
+                        "failure_class": failure_class,
+                        "from_model": from_model,
+                        "to_model": to_model,
+                        "model": to_model,
+                        "attempt": attempt_count,
+                        "fallback_count": fallback_count,
+                    }),
+                    now.as_str(),
+                )
+                .await
+                .context("append llm route switch event failed")?;
+                if route_event.rows_affected() == 0 {
+                    return Err(anyhow!(
+                        "insert llm route switch event failed: call not found"
+                    ));
+                }
             }
             let inserted = insert_llm_call_event_in_transaction(
                 &mut tx,
@@ -3494,6 +3519,7 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                                 model_for_call.as_str(),
                                 Some(failure_class.as_str()),
                                 fallback_count,
+                                None,
                             )
                             .await,
                             "llm call requeue update failed",
@@ -3563,32 +3589,6 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                         )
                         .await;
                     }
-                    match append_llm_call_event_if_owned(
-                        state,
-                        log_record.id.as_str(),
-                        "llm.route_switched",
-                        "queued",
-                        serde_json::json!({
-                            "failure_class": failure_class.as_str(),
-                            "from_model": previous_model,
-                            "to_model": next_model,
-                            "model": next_model,
-                            "attempt": attempt_count,
-                            "fallback_count": fallback_count,
-                        }),
-                    )
-                    .await
-                    {
-                        Ok(true) | Ok(false) => {}
-                        Err(err) => tracing::warn!(
-                            event = "sqlite.write",
-                            operation = "ai.llm_route_switch_event",
-                            call_id = log_record.id.as_str(),
-                            error_kind = "persist_failed",
-                            error_chain = %observability::error_chain_summary(err.as_ref()),
-                            "llm route switch audit event persistence failed"
-                        ),
-                    }
                     in_flight_guard.release_permit();
                     drop(in_flight_guard);
                     if llm_call_persisted {
@@ -3604,6 +3604,7 @@ pub async fn chat_completion_with_diagnostics_for_config_and_route_with_admissio
                                 next_model.as_str(),
                                 Some(failure_class.as_str()),
                                 fallback_count,
+                                Some((previous_model.as_str(), next_model.as_str())),
                             )
                             .await,
                             "llm route switch persistence failed",
@@ -8012,6 +8013,7 @@ mod tests {
             "gpt-4o-mini",
             Some("transient"),
             0,
+            None,
         )
         .await
         .expect("requeue llm call");

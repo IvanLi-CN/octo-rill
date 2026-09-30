@@ -4568,19 +4568,6 @@ async fn recover_runtime_state_with_mode(
         {
             continue;
         }
-        append_task_event(
-            state,
-            task.id.as_str(),
-            "task.recovered_failed",
-            json!({
-                "task_id": task.id,
-                "status": STATUS_FAILED,
-                "error": runtime::RUNTIME_LEASE_EXPIRED_ERROR,
-                "previous_runtime_owner_id": task.runtime_owner_id,
-                "previous_lease_heartbeat_at": task.lease_heartbeat_at,
-            }),
-        )
-        .await?;
     }
 
     Ok(())
@@ -4595,12 +4582,20 @@ async fn recover_task_if_stale(
     mode: runtime::RuntimeRecoveryMode,
 ) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
+    let recovery_payload = serde_json::to_string(&json!({
+        "task_id": task_id,
+        "status": STATUS_FAILED,
+        "error": runtime::RUNTIME_LEASE_EXPIRED_ERROR,
+        "previous_runtime_owner_id": previous_runtime_owner_id,
+        "previous_lease_heartbeat_at": previous_lease_heartbeat_at,
+    }))
+    .context("serialize stale task recovery event")?;
     state
         .sqlite_writer
         .write("job_task_recover", |_| async {
             let mut tx = state
                 .pool
-                .begin()
+                .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("failed to begin stale task recovery transaction")?;
             let updated = match mode {
@@ -4687,6 +4682,20 @@ async fn recover_task_if_stale(
                     .execute(&mut *tx)
                     .await
                     .context("failed to release stale webhook operation lease")?;
+                sqlx::query(
+                    r#"
+                    INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    "#,
+                )
+                .bind(local_id::generate_local_id())
+                .bind(task_id)
+                .bind("task.recovered_failed")
+                .bind(recovery_payload.as_str())
+                .bind(now.as_str())
+                .execute(&mut *tx)
+                .await
+                .context("failed to insert stale task recovery event")?;
             }
             tx.commit()
                 .await

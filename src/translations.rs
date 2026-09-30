@@ -705,6 +705,7 @@ impl<'a> TranslationWorkerRuntimeUpdate<'a> {
 pub struct TranslationSchedulerController {
     desired_config: tokio::sync::RwLock<TranslationRuntimeConfig>,
     runtime: tokio::sync::RwLock<Vec<TranslationWorkerRuntimeState>>,
+    runtime_reconcile_lock: tokio::sync::Mutex<()>,
     worker_abort_handles: tokio::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>,
     #[cfg(test)]
     runtime_sync_started: tokio::sync::Notify,
@@ -1381,6 +1382,7 @@ impl TranslationSchedulerController {
         Self {
             desired_config: tokio::sync::RwLock::new(config),
             runtime: tokio::sync::RwLock::new(runtime),
+            runtime_reconcile_lock: tokio::sync::Mutex::new(()),
             worker_abort_handles: tokio::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             runtime_sync_started: tokio::sync::Notify::new(),
@@ -1465,51 +1467,55 @@ impl TranslationSchedulerController {
             config.dedicated_worker_concurrency,
         );
         let _claim_guard = translation_batch_claim_lock().lock().await;
+        let _runtime_reconcile_guard = self.runtime_reconcile_lock.lock().await;
         if *self.desired_config.read().await == config {
             return Ok(config);
         }
 
-        let desired_profiles = translation_worker_profiles(config);
-        let desired_worker_ids = desired_profiles
-            .iter()
-            .map(|profile| profile.worker_id.as_str())
-            .collect::<HashSet<_>>();
-        let mut runtime = self.runtime.write().await;
-        let previous_topology = runtime
-            .iter()
-            .map(|entry| {
-                (
-                    entry.worker_id.clone(),
-                    (entry.worker_slot, entry.worker_kind.clone()),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let previous_runtime = runtime.clone();
-        runtime.retain(|entry| {
-            desired_worker_ids.contains(entry.worker_id.as_str())
-                || entry.current_batch_id.is_some()
-        });
-        for profile in &desired_profiles {
-            if let Some(entry) = runtime
-                .iter_mut()
-                .find(|entry| entry.worker_id == profile.worker_id)
-            {
-                entry.worker_kind = profile.worker_kind.clone();
-            } else {
-                runtime.push(TranslationWorkerRuntimeState::idle(profile));
+        let (previous_runtime, batch_slot_updates) = {
+            let mut runtime = self.runtime.write().await;
+            let desired_profiles = translation_worker_profiles(config);
+            let desired_worker_ids = desired_profiles
+                .iter()
+                .map(|profile| profile.worker_id.as_str())
+                .collect::<HashSet<_>>();
+            let previous_topology = runtime
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.worker_id.clone(),
+                        (entry.worker_slot, entry.worker_kind.clone()),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let previous_runtime = runtime.clone();
+            runtime.retain(|entry| {
+                desired_worker_ids.contains(entry.worker_id.as_str())
+                    || entry.current_batch_id.is_some()
+            });
+            for profile in &desired_profiles {
+                if let Some(entry) = runtime
+                    .iter_mut()
+                    .find(|entry| entry.worker_id == profile.worker_id)
+                {
+                    entry.worker_kind = profile.worker_kind.clone();
+                } else {
+                    runtime.push(TranslationWorkerRuntimeState::idle(profile));
+                }
             }
-        }
-        reconcile_worker_runtime_slots(&mut runtime, config);
-        let batch_slot_updates = collect_running_batch_slot_updates(&runtime, &previous_topology);
-        let topology_changed = translation_runtime_topology_changed(&runtime, &previous_topology);
-        if topology_changed {
-            refresh_translation_runtime_updated_at(&mut runtime);
-        }
+            reconcile_worker_runtime_slots(&mut runtime, config);
+            let batch_slot_updates =
+                collect_running_batch_slot_updates(&runtime, &previous_topology);
+            if translation_runtime_topology_changed(&runtime, &previous_topology) {
+                refresh_translation_runtime_updated_at(&mut runtime);
+            }
+            (previous_runtime, batch_slot_updates)
+        };
         if let Err(error) =
             sync_running_batch_slot_updates_with_writer(sqlite_writer, pool, &batch_slot_updates)
                 .await
         {
-            *runtime = previous_runtime;
+            *self.runtime.write().await = previous_runtime;
             return Err(error);
         }
         *self.desired_config.write().await = config;
@@ -1660,29 +1666,34 @@ impl TranslationSchedulerController {
         worker_id: &str,
     ) -> Result<()> {
         let _claim_guard = translation_batch_claim_lock().lock().await;
+        let _runtime_reconcile_guard = self.runtime_reconcile_lock.lock().await;
         let desired_config = self.desired_config().await;
-        let mut runtime = self.runtime.write().await;
-        let previous_runtime = runtime.clone();
-        let previous_topology = runtime
-            .iter()
-            .map(|entry| {
-                (
-                    entry.worker_id.clone(),
-                    (entry.worker_slot, entry.worker_kind.clone()),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        runtime.retain(|entry| entry.worker_id != worker_id);
-        reconcile_worker_runtime_slots(&mut runtime, desired_config);
-        let batch_slot_updates = collect_running_batch_slot_updates(&runtime, &previous_topology);
-        if translation_runtime_topology_changed(&runtime, &previous_topology) {
-            refresh_translation_runtime_updated_at(&mut runtime);
-        }
+        let (previous_runtime, batch_slot_updates) = {
+            let mut runtime = self.runtime.write().await;
+            let previous_runtime = runtime.clone();
+            let previous_topology = runtime
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.worker_id.clone(),
+                        (entry.worker_slot, entry.worker_kind.clone()),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            runtime.retain(|entry| entry.worker_id != worker_id);
+            reconcile_worker_runtime_slots(&mut runtime, desired_config);
+            let batch_slot_updates =
+                collect_running_batch_slot_updates(&runtime, &previous_topology);
+            if translation_runtime_topology_changed(&runtime, &previous_topology) {
+                refresh_translation_runtime_updated_at(&mut runtime);
+            }
+            (previous_runtime, batch_slot_updates)
+        };
         if let Err(error) =
             sync_running_batch_slot_updates_with_writer(sqlite_writer, pool, &batch_slot_updates)
                 .await
         {
-            *runtime = previous_runtime;
+            *self.runtime.write().await = previous_runtime;
             return Err(error);
         }
         Ok(())
@@ -1693,6 +1704,7 @@ impl TranslationSchedulerController {
         profile: &TranslationWorkerProfile,
         update: TranslationWorkerRuntimeUpdate<'_>,
     ) {
+        let _runtime_reconcile_guard = self.runtime_reconcile_lock.lock().await;
         let mut runtime = self.runtime.write().await;
         let desired_config = *self.desired_config.read().await;
         let desired_profile = translation_worker_profiles(desired_config)

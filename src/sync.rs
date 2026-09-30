@@ -9834,6 +9834,11 @@ async fn upsert_repo_releases(
     state
         .sqlite_writer
         .write("repo_release_upsert", |_| async {
+            let mut tx = state
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context("begin repo release snapshot write tx")?;
             if let Some(work_item) = lease {
                 let lease_is_current = sqlx::query_scalar::<_, i64>(
                     r#"
@@ -9852,7 +9857,7 @@ async fn upsert_repo_releases(
                 .bind(state.runtime_owner_id.as_str())
                 .bind(work_item.started_at.as_deref().unwrap_or_default())
                 .bind(now.as_str())
-                .fetch_optional(&state.pool)
+                .fetch_optional(&mut *tx)
                 .await
                 .context("failed to validate repo release work item lease")?
                 .is_some();
@@ -9894,7 +9899,7 @@ async fn upsert_repo_releases(
             "#,
                 )
                 .bind(release.id)
-                .fetch_optional(&state.pool)
+                .fetch_optional(&mut *tx)
                 .await
                 .with_context(|| format!("failed to load shared release {}", release.tag_name))?;
                 let reactions = release.reactions.as_ref();
@@ -10083,10 +10088,20 @@ async fn upsert_repo_releases(
                 .bind(hooray)
                 .bind(rocket)
                 .bind(eyes)
-                .execute(&state.pool)
+                .execute(&mut *tx)
                 .await
                 .with_context(|| format!("failed to upsert shared release {}", release.tag_name))?;
             }
+            if let Some(work_item) = lease
+                && !repo_release_lease_is_current_tx(&mut tx, state, work_item, now.as_str()).await?
+            {
+                return Err(anyhow!(
+                    "repo release work item lease lost during release snapshot write"
+                ));
+            }
+            tx.commit()
+                .await
+                .context("commit repo release snapshot write tx")?;
             Ok::<_, anyhow::Error>(stats)
         })
         .await
