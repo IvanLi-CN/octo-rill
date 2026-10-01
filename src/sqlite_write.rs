@@ -308,6 +308,17 @@ impl SqliteWriteCoordinator {
                 {
                     let delay = self.retry_delay(attempt);
                     let remaining = deadline_at.saturating_duration_since(Instant::now());
+                    let can_retry = remaining > delay;
+                    let error_kind = if can_retry {
+                        "sqlite_busy"
+                    } else {
+                        "write_deadline"
+                    };
+                    let message = if can_retry {
+                        "sqlite write hit busy state; retrying"
+                    } else {
+                        "sqlite write deadline expired before the next retry"
+                    };
                     warn!(
                         event = "sqlite.write",
                         operation = lane,
@@ -320,11 +331,11 @@ impl SqliteWriteCoordinator {
                         transaction_ms = elapsed.as_millis(),
                         deadline_ms = deadline.as_millis(),
                         retry_after_ms = delay.as_millis(),
-                        error_kind = "sqlite_busy",
+                        error_kind,
                         error_chain = %observability::error_chain_summary(err.as_ref()),
-                        "sqlite write hit busy state; retrying"
+                        "{message}"
                     );
-                    if remaining <= delay {
+                    if !can_retry {
                         return Err(self.deadline_error(lane, priority, "retry_backoff", deadline));
                     }
                     tokio::time::sleep_until(Instant::now() + delay).await;
@@ -783,13 +794,24 @@ impl SqliteWriteCoordinator {
                 {
                     let delay = self.retry_delay(attempt);
                     let remaining = deadline_at.saturating_duration_since(Instant::now());
+                    let can_retry = remaining > delay;
                     drop(permit);
+                    let error_kind = if can_retry {
+                        "sqlite_busy"
+                    } else {
+                        "write_deadline"
+                    };
+                    let message = if can_retry {
+                        "sqlite write transaction hit busy state; retrying"
+                    } else {
+                        "sqlite write deadline expired before the next transaction retry"
+                    };
                     warn!(
                         event = "sqlite.write",
                         operation = lane,
                         priority = priority.as_str(),
                         elapsed_ms = begin_elapsed.as_millis(),
-                        error_kind = "sqlite_busy",
+                        error_kind,
                         sqlite_write_lane = lane,
                         sqlite_write_priority = priority.as_str(),
                         writer_wait_ms,
@@ -800,9 +822,9 @@ impl SqliteWriteCoordinator {
                         attempt,
                         retry_after_ms = delay.as_millis(),
                         error_chain = %observability::error_chain_summary(err.as_ref()),
-                        "sqlite write transaction hit busy state; retrying"
+                        "{message}"
                     );
-                    if remaining <= delay {
+                    if !can_retry {
                         return Err(self.deadline_error(lane, priority, "retry_backoff", deadline));
                     }
                     tokio::time::sleep_until(Instant::now() + delay).await;
@@ -1419,13 +1441,22 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn foreground_deadline_bounds_wait_for_writer_permit() {
         let deadline = Duration::from_millis(60);
         let coordinator = SqliteWriteCoordinator::with_write_pool_and_settings(
             None,
             test_deadlines(deadline, deadline, Duration::from_millis(20)),
         );
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_target(false)
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _default_guard = tracing::subscriber::set_default(subscriber);
         let _held = coordinator
             .acquire_with_priority("held", SqliteWritePriority::Background)
             .await
@@ -1448,6 +1479,18 @@ mod tests {
             .expect("typed deadline error");
         assert_eq!(deadline_error.phase, "writer_queue");
         assert_eq!(callback_started.load(Ordering::SeqCst), 0);
+        let events = buffer.json_events();
+        assert!(events.iter().any(|event| {
+            event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                && event.get("operation") == Some(&Value::String("queue_timeout".to_owned()))
+                && event.get("error_kind")
+                    == Some(&Value::String("writer_queue_timeout".to_owned()))
+                && event.get("writer_wait_ms").is_some()
+                && event.get("pool_wait_ms").is_some()
+                && event.get("begin_ms").is_some()
+                && event.get("transaction_ms").is_some()
+                && event.get("deadline_ms").is_some()
+        }));
     }
 
     #[tokio::test]
@@ -1706,6 +1749,67 @@ mod tests {
         assert!(is_commit_deadline_error(&busy_error, deadline_at));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn busy_write_logs_deadline_when_retry_delay_will_not_fit() {
+        let deadline = Duration::from_millis(250);
+        let coordinator = SqliteWriteCoordinator::with_write_pool_and_settings(
+            None,
+            test_deadlines(deadline, deadline, deadline),
+        );
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_target(false)
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _default_guard = tracing::subscriber::set_default(subscriber);
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let write = tokio::spawn(async move {
+            let mut started_tx = Some(started_tx);
+            coordinator
+                .write_foreground("busy_deadline", move |_| {
+                    if let Some(started_tx) = started_tx.take() {
+                        let _ = started_tx.send(());
+                    }
+                    async {
+                        tokio::time::sleep(Duration::from_millis(230)).await;
+                        Err::<(), _>(anyhow::Error::new(sqlx::Error::Database(Box::new(
+                            TestDatabaseError {
+                                code: "5",
+                                message: "database is locked",
+                            },
+                        ))))
+                    }
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("busy callback should start before its deadline")
+            .expect("receive busy callback start signal");
+        let error = write
+            .await
+            .expect("join busy deadline write")
+            .expect_err("deadline should prevent an undersized busy retry");
+
+        assert!(is_sqlite_write_deadline_error(error.as_ref()));
+        let events = buffer.json_events();
+        assert!(events.iter().any(|event| {
+            event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                && event.get("operation") == Some(&Value::String("busy_deadline".to_owned()))
+                && event.get("error_kind") == Some(&Value::String("write_deadline".to_owned()))
+                && event.get("attempt").and_then(Value::as_u64) == Some(1)
+        }));
+        assert!(!events.iter().any(|event| {
+            event.get("operation") == Some(&Value::String("busy_deadline".to_owned()))
+                && event.get("error_kind") == Some(&Value::String("sqlite_busy".to_owned()))
+                && event.get("attempt").and_then(Value::as_u64) == Some(1)
+        }));
+    }
+
     #[test]
     fn busy_detection_matches_sqlx_primary_and_extended_codes() {
         for code in ["5", "6", "261", "262", "517", "19"] {
@@ -1860,7 +1964,7 @@ mod tests {
         remove_test_database(read_pool, &database_path).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn writer_pool_acquisition_has_its_own_deadline_phase() {
         let database_path = test_database_path();
         let read_pool = open_test_pool(&database_path, 1, Duration::from_millis(20)).await;
@@ -1877,6 +1981,15 @@ mod tests {
                 Duration::from_millis(20),
             ),
         );
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_target(false)
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _default_guard = tracing::subscriber::set_default(subscriber);
         let started = Instant::now();
 
         let error = match coordinator
@@ -1895,6 +2008,17 @@ mod tests {
                 .phase,
             "write_pool"
         );
+        let events = buffer.json_events();
+        assert!(events.iter().any(|event| {
+            event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                && event.get("operation") == Some(&Value::String("pool_timeout".to_owned()))
+                && event.get("error_kind") == Some(&Value::String("write_pool_timeout".to_owned()))
+                && event.get("writer_wait_ms").is_some()
+                && event.get("pool_wait_ms").is_some()
+                && event.get("begin_ms").is_some()
+                && event.get("transaction_ms").is_some()
+                && event.get("deadline_ms").is_some()
+        }));
         drop(held_writer);
         remove_test_database(writer_pool, &database_path).await;
         remove_test_database(read_pool, &database_path).await;
@@ -2228,6 +2352,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn begin_retry_logs_deadline_when_retry_delay_will_not_fit() {
+        let database_path = test_database_path();
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_millis(1));
+        let read_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .expect("create busy deadline reader pool");
+        let writer_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("create busy deadline writer pool");
+        sqlx::query("CREATE TABLE busy_deadline_probe (value INTEGER NOT NULL)")
+            .execute(&read_pool)
+            .await
+            .expect("create busy deadline probe");
+        let holder = read_pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("hold external writer lock");
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_target(false)
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _default_guard = tracing::subscriber::set_default(subscriber);
+        let deadline = Duration::from_millis(170);
+        let coordinator = SqliteWriteCoordinator::with_write_pool_and_settings(
+            Some(writer_pool.clone()),
+            test_deadlines(deadline, deadline, Duration::from_millis(20)),
+        );
+
+        let error = match coordinator
+            .begin_immediate(&read_pool, "begin_busy_deadline")
+            .await
+        {
+            Ok(_) => panic!("deadline should prevent an undersized begin retry"),
+            Err(error) => error,
+        };
+
+        assert!(is_sqlite_write_deadline_error(error.as_ref()));
+        let events = buffer.json_events();
+        assert!(events.iter().any(|event| {
+            event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                && event.get("operation") == Some(&Value::String("begin_busy_deadline".to_owned()))
+                && event.get("error_kind") == Some(&Value::String("write_deadline".to_owned()))
+                && event
+                    .get("attempt")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+                    >= 2
+        }));
+        holder
+            .rollback()
+            .await
+            .expect("release external writer lock");
+
+        remove_test_database(writer_pool, &database_path).await;
+        remove_test_database(read_pool, &database_path).await;
+    }
+
+    #[tokio::test]
     async fn coordinator_reports_bounded_busy_retry_exhaustion() {
         let database_path = test_database_path();
         let read_pool = open_test_pool(&database_path, 1, Duration::from_millis(20)).await;
@@ -2398,7 +2592,7 @@ mod tests {
         assert!(p99 < FOREGROUND_DEADLINE, "foreground p99 was {p99:?}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn coordinator_retries_against_a_real_sqlite_busy_lock() {
         let database_path = test_database_path();
         let options = SqliteConnectOptions::new()
@@ -2436,15 +2630,10 @@ mod tests {
         let _default_guard = tracing::subscriber::set_default(subscriber);
 
         let coordinator = SqliteWriteCoordinator::new();
-        let (started_tx, started_rx) = oneshot::channel();
         let writer_pool = pool.clone();
         let writer = tokio::spawn(async move {
-            let mut started_tx = Some(started_tx);
             coordinator
                 .write("busy_fixture", move |_attempt| {
-                    if let Some(started_tx) = started_tx.take() {
-                        let _ = started_tx.send(());
-                    }
                     let writer_pool = writer_pool.clone();
                     async move {
                         sqlx::query("INSERT INTO busy_probe (value) VALUES (2)")
@@ -2457,8 +2646,21 @@ mod tests {
                 .await
         });
 
-        started_rx.await.expect("writer should start first attempt");
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if buffer.json_events().iter().any(|event| {
+                    event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
+                        && event.get("operation") == Some(&Value::String("busy_fixture".to_owned()))
+                        && event.get("error_kind") == Some(&Value::String("sqlite_busy".to_owned()))
+                        && event.get("attempt").and_then(Value::as_u64) == Some(1)
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first SQLite insert should report its busy result");
         holder.commit().await.expect("release external writer lock");
         writer
             .await

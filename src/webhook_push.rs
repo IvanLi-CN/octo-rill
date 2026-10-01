@@ -24,7 +24,7 @@ use crate::{
     api,
     error::ApiError,
     jobs::{self, EnqueuedTask, NewTask},
-    sqlite_write::{SqliteWritePriority, is_sqlite_busy_error},
+    sqlite_write::{SqliteWritePriority, is_sqlite_busy_error, is_sqlite_write_deadline_error},
     state::AppState,
     sync,
 };
@@ -3156,9 +3156,13 @@ async fn run_receiver_stage<T, Fut>(
 where
     Fut: Future<Output = Result<T>>,
 {
-    match tokio::time::timeout_at(deadline, future).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) if is_sqlite_busy_error(error.as_ref()) => {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(receiver_retryable_error(operation, "deadline_exceeded"));
+    }
+
+    match future.await {
+        Ok(value) => Ok(value),
+        Err(error) if is_sqlite_busy_error(error.as_ref()) => {
             warn!(
                 event = "webhook.receiver_write",
                 operation,
@@ -3168,8 +3172,10 @@ where
             );
             Err(receiver_retryable_error(operation, "sqlite_busy"))
         }
-        Ok(Err(error)) => Err(ApiError::internal(error)),
-        Err(_) => Err(receiver_retryable_error(operation, "deadline_exceeded")),
+        Err(error) if is_sqlite_write_deadline_error(error.as_ref()) => {
+            Err(receiver_retryable_error(operation, "deadline_exceeded"))
+        }
+        Err(error) => Err(ApiError::internal(error)),
     }
 }
 
@@ -3486,6 +3492,52 @@ pub async fn receive(
 mod tests {
     use super::*;
     use axum::{body::Body, extract::FromRequest, http::Request};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receiver_stage_started_before_deadline_finishes_with_actual_result() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let stage = tokio::spawn(async move {
+            run_receiver_stage("receiver_stage_probe", deadline, async move {
+                let _ = started_tx.send(());
+                finish_rx.await.expect("finish receiver stage");
+                Ok::<_, anyhow::Error>(7)
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("receiver stage should start before its deadline")
+            .expect("receive stage start signal");
+        tokio::time::sleep_until(deadline + Duration::from_millis(10)).await;
+        finish_tx.send(()).expect("release started receiver stage");
+        let result = stage
+            .await
+            .expect("join receiver stage")
+            .expect("started receiver stage should return its actual result");
+
+        assert_eq!(result, 7);
+    }
+
+    #[tokio::test]
+    async fn expired_receiver_stage_does_not_start_its_future() {
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stage_started = started.clone();
+        let error = run_receiver_stage(
+            "receiver_stage_probe",
+            tokio::time::Instant::now() - Duration::from_millis(1),
+            async move {
+                stage_started.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, anyhow::Error>(())
+            },
+        )
+        .await
+        .expect_err("expired receiver stage should be retryable");
+
+        assert_eq!(error.code(), "webhook_receiver_retryable");
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[tokio::test]
     async fn reconcile_accepts_empty_body_as_full_reconcile() {

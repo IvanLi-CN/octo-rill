@@ -13,7 +13,7 @@
 - 新增 `src/sqlite_write.rs`，提供 `SqliteWriteCoordinator`、单 writer permit、foreground/background/best-effort priority、`BEGIN IMMEDIATE` 事务入口、busy/locked 分类、bounded retry 与 tracing telemetry。
 - PR3.9 为生产文件型 SQLite 配置独立单连接 writer pool，读池保留原容量；foreground/background 共用单调 deadline，best-effort 立即尝试且不排队，取得 permit 后最多使用 2500 ms 启动预算；SQLite busy timeout 为 100 ms，最多 4 次尝试并按 25/50/100 ms 退避。
 - 普通 coordinator callback 的 SQL 查询显式使用专用 writer pool；`BEGIN IMMEDIATE` 入口也会选择专用池，未配置独立池的内存数据库继续使用传入池。
-- deadline 限制 writer queue、write-pool acquisition、事务启动、callback 启动和重试启动；callback 一旦启动就持有 permit 直到真实结果返回，并记录 deadline overrun。SQLite progress handler 只约束事务语句与 COMMIT 派发前的阶段；COMMIT 派发前过期会在 150 ms cleanup budget 内尝试回滚，COMMIT 派发后关闭 progress handler 并等待 SQLite 的实际结果，late completion telemetry 记录完成状态与超期毫秒。已知 busy 在预算外返回时按 deadline 结束且不再重试；其他提交错误保留实际错误。前台 deadline 映射为 retryable 503，后台 job 持久化延迟重试，未启动的 best-effort 写入跳过。
+- deadline 限制 writer queue、write-pool acquisition、事务启动、callback 启动和重试启动；callback 一旦启动就持有 permit 直到真实结果返回，并记录 deadline overrun。Webhook receiver 阶段只在首次 poll 前拒绝已过期工作，启动后等待实际结果并把 coordinator deadline 映射为 retryable 响应。SQLite progress handler 只约束事务语句与 COMMIT 派发前的阶段；COMMIT 派发前过期会在 150 ms cleanup budget 内尝试回滚，COMMIT 派发后关闭 progress handler 并等待 SQLite 的实际结果，late completion telemetry 记录完成状态与超期毫秒。退避无法在剩余 deadline 内开始时记录为 deadline，而非 retry。已知 busy 在预算外返回时按 deadline 结束且不再重试；其他提交错误保留实际错误。前台 deadline 映射为 retryable 503，后台 job 持久化延迟重试，未启动的 best-effort 写入跳过。
 - deadline telemetry 区分 writer queue、write-pool acquisition、`BEGIN IMMEDIATE` 与 transaction 阶段，并记录 `writer_wait_ms`、`pool_wait_ms`、`begin_ms`、`transaction_ms` 和 `deadline_ms`。
 - 内容提交的模型档案选择仅读取已刷新的 scheduler routing；模型目录刷新不会在持有 SQLite writer transaction 时发生。
 - `AppState` 持有共享 coordinator；生产启动与测试 state 初始化均注入同一运行时组件。
@@ -49,7 +49,7 @@
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test --locked --all-features --bin octo-rill -- --test-threads=4`（983 passed, 2 ignored）
+- `cargo test --locked --all-features --bin octo-rill -- --test-threads=4`（987 passed, 2 ignored）
 - `bash scripts/check-rust-source-quality.sh`（含应用/源检查器 fmt、全 feature Clippy/check、checker 单测和全仓 guard scan）
 
 ## Remaining Gaps
@@ -59,7 +59,7 @@
 ## Related Changes
 
 - `docs/solutions/backend/sqlite-wal-write-transactions.md` 更新为 writer coordinator + `BEGIN IMMEDIATE` 的复用方案。
-- `src/sqlite_write.rs` 覆盖 WAL + 多连接并发写入、foreground 优先级、独立 writer pool callback、内存库 fallback、callback deadline overrun 与 permit 保持、COMMIT 跨过 deadline 后的真实成功/非 busy 错误、提交前过期回滚与 writer 连接复用、busy 重试耗尽，以及提交阶段 busy/deadline telemetry 分类。
+- `src/sqlite_write.rs` 覆盖 WAL + 多连接并发写入、foreground 优先级、独立 writer pool callback、内存库 fallback、callback deadline overrun 与 permit 保持、COMMIT 跨过 deadline 后的真实成功/非 busy 错误、提交前过期回滚与 writer 连接复用、busy 重试耗尽，以及队列、连接池、重试和提交阶段的 busy/deadline telemetry 分类；`src/webhook_push.rs` 覆盖已启动 receiver 阶段在 deadline 后等待实际结果。
 - `src/translations.rs` 新增 batch 启动写段在 writer 压力下串行化回归，以及结果聚合在 writer 背压下直接复用 pending 快照的回归。
 - `src/sync.rs` 新增 social activity snapshot 与 feed activity event 在 competing writer 下等待并成功提交的并发回归。
 - `src/api.rs` 新增 feed reaction refresh 在 SQLite writer 压力下跳过持久化但继续返回 live item 的回归。
