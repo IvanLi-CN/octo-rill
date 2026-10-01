@@ -251,11 +251,13 @@ impl SqliteWriteCoordinator {
                 .acquire_until(lane, priority, deadline_at, deadline)
                 .await?;
 
+            if Instant::now() >= deadline_at {
+                drop(permit);
+                return Err(self.deadline_error(lane, priority, "callback_start", deadline));
+            }
+
             let op_started = Instant::now();
-            let result = match tokio::time::timeout_at(deadline_at, operation(attempt)).await {
-                Ok(result) => result,
-                Err(_) => Err(self.deadline_error(lane, priority, "transaction", deadline)),
-            };
+            let result = operation(attempt).await;
             let elapsed = op_started.elapsed();
             let writer_wait_ms = permit.writer_wait_ms();
             drop(permit);
@@ -263,12 +265,18 @@ impl SqliteWriteCoordinator {
             match result {
                 Ok(value) => {
                     let elapsed_ms = elapsed.as_millis();
-                    if elapsed_ms >= self.slow_threshold_ms as u128 {
+                    let completed_after_deadline = Instant::now() >= deadline_at;
+                    let deadline_overrun_ms = Instant::now()
+                        .saturating_duration_since(deadline_at)
+                        .as_millis();
+                    if completed_after_deadline || elapsed_ms >= self.slow_threshold_ms as u128 {
                         warn!(
                             event = "sqlite.write",
                             operation = lane,
                             priority = priority.as_str(),
                             elapsed_ms,
+                            completed_after_deadline,
+                            deadline_overrun_ms,
                             attempt,
                             writer_wait_ms,
                             pool_wait_ms = 0_u128,
@@ -276,7 +284,7 @@ impl SqliteWriteCoordinator {
                             transaction_ms = elapsed_ms,
                             deadline_ms = deadline.as_millis(),
                             threshold_ms = self.slow_threshold_ms,
-                            "sqlite write completed slowly"
+                            "sqlite write completed slowly or after its deadline"
                         );
                     } else {
                         debug!(
@@ -321,6 +329,24 @@ impl SqliteWriteCoordinator {
                     }
                     tokio::time::sleep_until(Instant::now() + delay).await;
                     attempt += 1;
+                }
+                Err(err) if is_sqlite_busy_error(err.as_ref()) && Instant::now() >= deadline_at => {
+                    warn!(
+                        event = "sqlite.write",
+                        operation = lane,
+                        priority = priority.as_str(),
+                        elapsed_ms = elapsed.as_millis(),
+                        attempt,
+                        writer_wait_ms,
+                        pool_wait_ms = 0_u128,
+                        begin_ms = 0_u128,
+                        transaction_ms = elapsed.as_millis(),
+                        deadline_ms = deadline.as_millis(),
+                        error_kind = "write_deadline",
+                        error_chain = %observability::error_chain_summary(err.as_ref()),
+                        "sqlite write returned busy after its retry deadline"
+                    );
+                    return Err(self.deadline_error(lane, priority, "retry_backoff", deadline));
                 }
                 Err(err) if is_sqlite_write_deadline_error(err.as_ref()) => {
                     warn!(
@@ -373,6 +399,7 @@ impl SqliteWriteCoordinator {
         Fut: Future<Output = Result<T>>,
     {
         let deadline = self.deadline_for(SqliteWritePriority::BestEffort);
+        let deadline_at = Instant::now() + deadline;
         let permit = match self.try_acquire(lane, SqliteWritePriority::BestEffort) {
             Some(permit) => permit,
             None => {
@@ -392,16 +419,13 @@ impl SqliteWriteCoordinator {
             }
         };
 
+        if Instant::now() >= deadline_at {
+            drop(permit);
+            return Ok(None);
+        }
+
         let op_started = Instant::now();
-        let result = match tokio::time::timeout(deadline, operation()).await {
-            Ok(result) => result,
-            Err(_) => Err(self.deadline_error(
-                lane,
-                SqliteWritePriority::BestEffort,
-                "best_effort_operation",
-                deadline,
-            )),
-        };
+        let result = operation().await;
         let elapsed = op_started.elapsed();
         let writer_wait_ms = permit.writer_wait_ms();
         drop(permit);
@@ -409,19 +433,25 @@ impl SqliteWriteCoordinator {
         match result {
             Ok(value) => {
                 let elapsed_ms = elapsed.as_millis();
-                if elapsed_ms >= self.slow_threshold_ms as u128 {
+                let completed_after_deadline = Instant::now() >= deadline_at;
+                let deadline_overrun_ms = Instant::now()
+                    .saturating_duration_since(deadline_at)
+                    .as_millis();
+                if completed_after_deadline || elapsed_ms >= self.slow_threshold_ms as u128 {
                     warn!(
                         event = "sqlite.write",
                         operation = lane,
                         priority = SqliteWritePriority::BestEffort.as_str(),
                         elapsed_ms,
+                        completed_after_deadline,
+                        deadline_overrun_ms,
                         writer_wait_ms,
                         pool_wait_ms = 0_u128,
                         begin_ms = 0_u128,
                         transaction_ms = elapsed_ms,
                         deadline_ms = deadline.as_millis(),
                         threshold_ms = self.slow_threshold_ms,
-                        "sqlite best-effort write completed slowly"
+                        "sqlite best-effort write completed slowly or after its deadline"
                     );
                 } else {
                     debug!(
@@ -438,6 +468,24 @@ impl SqliteWriteCoordinator {
                     );
                 }
                 Ok(Some(value))
+            }
+            Err(err) if is_sqlite_busy_error(err.as_ref()) && Instant::now() >= deadline_at => {
+                warn!(
+                    event = "sqlite.write",
+                    operation = lane,
+                    priority = SqliteWritePriority::BestEffort.as_str(),
+                    elapsed_ms = elapsed.as_millis(),
+                    writer_wait_ms,
+                    pool_wait_ms = 0_u128,
+                    begin_ms = 0_u128,
+                    transaction_ms = elapsed.as_millis(),
+                    deadline_ms = deadline.as_millis(),
+                    error_kind = "write_deadline",
+                    error_chain = %observability::error_chain_summary(err.as_ref()),
+                    downgrade_reason = "deadline_overrun",
+                    "sqlite best-effort write returned busy after its deadline"
+                );
+                Ok(None)
             }
             Err(err) => {
                 let error_kind = if is_sqlite_write_deadline_error(err.as_ref()) {
@@ -876,63 +924,69 @@ impl<'a> SqliteWriteTransaction<'a> {
             )));
         }
 
-        let deadline_std = self.deadline_at.into_std();
-        let handler_active = Arc::clone(&self.progress_handler_active);
-        let setup_progress_handler = async {
+        let disable_progress_handler = async {
             let mut handle = tx.lock_handle().await?;
-            handle.set_progress_handler(1, move || {
-                !handler_active.load(Ordering::Relaxed) || std::time::Instant::now() < deadline_std
-            });
+            handle.set_progress_handler(0, || true);
             Ok::<_, sqlx::Error>(())
         };
-        match tokio::time::timeout_at(self.deadline_at, setup_progress_handler).await {
+        match tokio::time::timeout_at(self.deadline_at, disable_progress_handler).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 self.progress_handler_active.store(false, Ordering::Relaxed);
                 cleanup_sqlite_write_transaction(tx, self.lane).await;
                 self.log_transaction_end(
                     "transaction_error",
-                    "sqlite write commit deadline handler setup failed",
+                    "sqlite write progress handler could not be disabled before commit",
                 );
-                return Err(
-                    anyhow::Error::new(error).context("prepare sqlite commit deadline handler")
-                );
+                return Err(anyhow::Error::new(error)
+                    .context("disable sqlite write progress handler before commit"));
             }
             Err(_) => {
                 self.progress_handler_active.store(false, Ordering::Relaxed);
                 cleanup_sqlite_write_transaction(tx, self.lane).await;
                 self.log_transaction_end(
                     "write_deadline",
-                    "sqlite write commit deadline handler setup exceeded deadline",
+                    "sqlite write progress handler disable exceeded deadline",
                 );
                 return Err(anyhow::Error::new(SqliteWriteDeadlineError::new(
                     self.lane,
                     self.priority,
-                    "commit_setup",
+                    "commit_prepare",
                     self.deadline,
                 )));
             }
         }
+        self.progress_handler_active.store(false, Ordering::Relaxed);
 
-        // Do not cancel COMMIT: SQLite may have committed before its acknowledgement arrives.
-        // Keeping the transaction owned lets us confirm the result and explicitly roll back
-        // when COMMIT is interrupted by the connection progress handler.
+        if Instant::now() >= self.deadline_at {
+            cleanup_sqlite_write_transaction(tx, self.lane).await;
+            self.log_transaction_end(
+                "write_deadline",
+                "sqlite write transaction rolled back before commit dispatch",
+            );
+            return Err(anyhow::Error::new(SqliteWriteDeadlineError::new(
+                self.lane,
+                self.priority,
+                "commit_prepare",
+                self.deadline,
+            )));
+        }
+
+        // Once COMMIT is dispatched, wait for SQLite's actual outcome.
         match SqliteTransactionManager::commit(&mut *tx).await {
             Ok(()) => {
-                self.progress_handler_active.store(false, Ordering::Relaxed);
                 drop(tx);
                 self.log_transaction_end("ok", "sqlite write transaction committed");
                 Ok(())
             }
             Err(error) => {
                 let deadline_error =
-                    is_sqlite_write_deadline_error(&error) || Instant::now() >= self.deadline_at;
-                self.progress_handler_active.store(false, Ordering::Relaxed);
+                    is_sqlite_busy_error(&error) && Instant::now() >= self.deadline_at;
                 cleanup_sqlite_write_transaction(tx, self.lane).await;
                 if deadline_error {
                     self.log_transaction_end(
                         "write_deadline",
-                        "sqlite write commit was interrupted at deadline",
+                        "sqlite write commit returned busy after deadline and was rolled back",
                     );
                     Err(anyhow::Error::new(SqliteWriteDeadlineError::new(
                         self.lane,
@@ -1362,9 +1416,14 @@ mod tests {
             .await
             .expect("acquire held permit");
         let started = Instant::now();
+        let callback_started = Arc::new(AtomicUsize::new(0));
+        let callback_started_for_write = callback_started.clone();
 
         let error = coordinator
-            .write_foreground("queue_timeout", |_| async { Ok::<_, anyhow::Error>(()) })
+            .write_foreground("queue_timeout", move |_| {
+                callback_started_for_write.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, anyhow::Error>(()) }
+            })
             .await
             .expect_err("foreground write should hit its queue deadline");
 
@@ -1373,10 +1432,66 @@ mod tests {
             .downcast_ref::<SqliteWriteDeadlineError>()
             .expect("typed deadline error");
         assert_eq!(deadline_error.phase, "writer_queue");
+        assert_eq!(callback_started.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn best_effort_write_timeout_is_skipped_without_propagating_error() {
+    async fn write_callback_finishes_after_deadline_and_keeps_writer_permit() {
+        let deadline = Duration::from_millis(60);
+        let coordinator = SqliteWriteCoordinator::with_write_pool_and_settings(
+            None,
+            test_deadlines(deadline, deadline, deadline),
+        );
+        let (started_tx, started_rx) = oneshot::channel();
+        let first = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                let mut started_tx = Some(started_tx);
+                coordinator
+                    .write_foreground("callback_deadline_overrun", move |_| {
+                        let started_tx = started_tx.take();
+                        async move {
+                            if let Some(started_tx) = started_tx {
+                                let _ = started_tx.send(());
+                            }
+                            tokio::time::sleep(Duration::from_millis(120)).await;
+                            Ok::<_, anyhow::Error>(7)
+                        }
+                    })
+                    .await
+            })
+        };
+        started_rx.await.expect("first callback started");
+
+        let second_callback_started = Arc::new(AtomicUsize::new(0));
+        let second_callback_started_for_write = second_callback_started.clone();
+        let second_error = coordinator
+            .write_foreground("callback_waits_for_first", move |_| {
+                second_callback_started_for_write.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, anyhow::Error>(()) }
+            })
+            .await
+            .expect_err("second write should expire while waiting for the first callback");
+        assert_eq!(
+            second_error
+                .downcast_ref::<SqliteWriteDeadlineError>()
+                .expect("typed queue deadline")
+                .phase,
+            "writer_queue"
+        );
+        assert_eq!(second_callback_started.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            first
+                .await
+                .expect("join first write")
+                .expect("late success"),
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn best_effort_callback_started_before_deadline_returns_actual_result() {
         let coordinator = SqliteWriteCoordinator::with_write_pool_and_settings(
             None,
             test_deadlines(
@@ -1390,13 +1505,13 @@ mod tests {
         let result = coordinator
             .try_write("best_effort_timeout", || async {
                 tokio::time::sleep(Duration::from_millis(200)).await;
-                Ok::<_, anyhow::Error>(())
+                Ok::<_, anyhow::Error>(7)
             })
             .await
-            .expect("best-effort timeout must not propagate");
+            .expect("best-effort callback result");
 
-        assert!(result.is_none());
-        assert!(started.elapsed() < Duration::from_millis(150));
+        assert_eq!(result, Some(7));
+        assert!(started.elapsed() >= Duration::from_millis(200));
     }
 
     #[tokio::test]
@@ -1807,13 +1922,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_deadline_rolls_back_when_a_reader_blocks_commit() {
+    async fn commit_dispatched_before_deadline_can_succeed_after_reader_releases() {
         let database_path = test_database_path();
         let options = SqliteConnectOptions::new()
             .filename(&database_path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Delete)
-            .busy_timeout(Duration::from_millis(100));
+            .busy_timeout(Duration::from_millis(250));
         let read_pool = SqlitePoolOptions::new()
             .max_connections(2)
             .connect_with(options.clone())
@@ -1848,35 +1963,34 @@ mod tests {
             .execute(&mut *tx)
             .await
             .expect("write before commit deadline");
+        let release_reader = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            reader.rollback().await.expect("release reader transaction");
+        });
         let started = Instant::now();
-        let error = tx
-            .commit()
+        tx.commit()
             .await
-            .expect_err("commit must not succeed after its deadline");
+            .expect("commit should report SQLite success after the reader releases");
+        let commit_elapsed = started.elapsed();
         drop(permit);
-
-        let deadline_error = error
-            .downcast_ref::<SqliteWriteDeadlineError>()
-            .expect("typed commit deadline error");
-        assert_eq!(deadline_error.phase, "commit");
-        assert!(started.elapsed() < Duration::from_millis(300));
-        reader.rollback().await.expect("release reader transaction");
+        release_reader.await.expect("join reader release");
+        assert!(commit_elapsed >= deadline);
 
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM commit_deadline_probe")
             .fetch_one(&read_pool)
             .await
-            .expect("count after interrupted commit");
-        assert_eq!(count, 0);
+            .expect("count after late successful commit");
+        assert_eq!(count, 1);
 
         let (_permit, mut next_tx) = coordinator
-            .begin_immediate(&read_pool, "commit_after_rollback")
+            .begin_immediate(&read_pool, "commit_after_late_success")
             .await
-            .expect("writer connection is reusable after commit rollback");
+            .expect("writer connection is reusable after late successful commit");
         sqlx::query("INSERT INTO commit_deadline_probe (value) VALUES (2)")
             .execute(&mut *next_tx)
             .await
-            .expect("write after commit rollback");
-        next_tx.commit().await.expect("commit after rollback");
+            .expect("write after late successful commit");
+        next_tx.commit().await.expect("commit after late success");
 
         remove_test_database(writer_pool, &database_path).await;
         remove_test_database(read_pool, &database_path).await;

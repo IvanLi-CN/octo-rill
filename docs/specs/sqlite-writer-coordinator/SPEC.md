@@ -100,9 +100,10 @@
 ### REQ-SQLITE-WRITER-011
 
 - 生产写入必须使用隔离于普通读池的专用 SQLite write pool，连接数为 1；普通读池维持现有可配置容量。
-- coordinator 对 writer permit、write-pool acquisition、`BEGIN IMMEDIATE`、事务执行与重试使用同一个单调时钟总 deadline：foreground 为 900 ms，background 为 2500 ms；best-effort 不排队，取得 permit 后沿用 2500 ms 操作预算。
-- SQLite write connection 的 `busy_timeout` 不得超过 100 ms；每次操作最多 4 次尝试，退避为 25/50/100 ms。busy timeout 与退避的最大累计时长为 575 ms，剩余队列、连接池和事务预算由总 deadline 截断，不得在重试后重新开始 deadline。
-- deadline 到期时不得提交事务；必须在 150 ms cleanup budget 内尝试回滚。回滚超时或失败时丢弃事务并依赖 SQLx rollback-on-drop 清理，不得继续提交；验证连接完成清理后可被 writer pool 复用。
+- coordinator 对 writer permit、write-pool acquisition、`BEGIN IMMEDIATE`、事务 setup、callback 启动与重试使用同一个单调时钟总 deadline：foreground 为 900 ms，background 为 2500 ms；best-effort 不排队，取得 permit 后沿用 2500 ms 操作预算。deadline 到期后不得启动新的 callback 或重试。
+- SQLite write connection 的 `busy_timeout` 不得超过 100 ms；每次操作最多 4 次尝试，退避为 25/50/100 ms。busy timeout 与退避的最大累计时长为 575 ms，队列、连接池、事务启动和重试开始受总 deadline 限制，不得在重试后重新开始 deadline。
+- callback 在 deadline 前启动后不得由 coordinator 的异步 timeout 取消；它必须持有 writer permit 直到返回 SQLite 的实际结果。事务中的 SQLite 语句仍可由 progress handler 在 deadline 后中断。
+- transaction deadline 到期且 COMMIT 尚未派发时，必须在 150 ms cleanup budget 内尝试回滚，不得继续提交。COMMIT 派发前关闭 progress handler；COMMIT 一旦派发，不得因 deadline 取消或中断，必须等待 SQLite 的实际成功或错误结果，即使耗时超过 deadline。已知 `SQLITE_BUSY` 在 deadline 后返回时先回滚并报告 deadline，不得开始重试；其他 COMMIT 错误按实际错误返回，不得仅因当前时间已过 deadline 将其改报为可重试超时。回滚超时或失败时丢弃事务并依赖 SQLx rollback-on-drop 清理；验证连接完成清理后可被 writer pool 复用。
 
 ### REQ-SQLITE-WRITER-012
 
@@ -133,7 +134,7 @@
 - translation runtime 的 production internal helper 必须接收非可选 `&SqliteWriteCoordinator`；仅 `#[cfg(test)]` wrapper 可以为独立 unit fixture 创建局部 coordinator。
 - reaction PAT、dashboard rollup、scheduled slot 与 public release usage metadata 等高频 API/sync metadata 写入使用明确 foreground/background lane，不能因为写入对象较小而直接调用 pool。
 - 如果 SQLite 返回 busy/locked，coordinator 使用短退避重试，并在耗尽后返回原始错误上下文。
-- foreground 与 background 使用各自有界总 deadline；deadline 覆盖 writer permit、专用 write pool 获取、`BEGIN IMMEDIATE`、事务执行与重试退避。
+- foreground 与 background 使用各自有界总 deadline；deadline 限制 writer permit、专用 write pool 获取、`BEGIN IMMEDIATE`、事务 setup、callback 启动与重试开始。已经启动的 callback 可以完成在 deadline 之后；COMMIT 一旦派发，deadline 不再中断它。
 - 专用 write pool 只供协调写入使用，普通读请求继续共享多连接 reader pool；因 reader pool 耗尽不应阻塞 writer pool 获取。
 
 ### Edge cases / errors
@@ -143,7 +144,7 @@
 - 外部进程持有 SQLite writer lock 时，coordinator retry 后仍可失败，但失败必须可观测。
 - foreground deadline 超时必须返回 retryable 状态与 `Retry-After`，而不是内部 500。
 - background deadline 超时由持久化 worker/job 状态延后处理；一个失败尝试结束后不得在同一调用栈立即重试。
-- best-effort 在 writer backlog、write-pool 忙或 deadline 时都跳过持久化，主请求保持成功路径。
+- best-effort 在 writer backlog 或 deadline 前无法启动 callback 时跳过持久化，主请求保持成功路径；已经启动的 callback 保持 writer permit 并返回实际结果。
 
 ## 接口契约（Interfaces & Contracts）
 
@@ -204,9 +205,13 @@
   When foreground/background writer 获取连接
   Then writer 从独立单连接 write pool 获取连接，且不等待 reader pool 释放连接。
 
-- Given writer queue、write pool 或外部 SQLite writer lock 持续超过 lane deadline
-  When coordinator 执行写入
-  Then foreground 在 900 ms 内返回 retryable 503，background 在 2500 ms 内结束并持久化延后，best-effort 不阻塞主请求；事务不提交，连接回滚后可再次成功使用。
+- Given writer queue、write pool 或事务 setup 在 lane deadline 前没有完成
+  When coordinator 准备启动 callback 或 COMMIT
+  Then 不得启动新的 callback、重试或 COMMIT；事务必须回滚，foreground 返回 retryable 503，background 持久化延后，best-effort 跳过写入。
+
+- Given callback 或 COMMIT 在 lane deadline 前已经启动
+  When SQLite 在 deadline 之后返回结果
+  Then callback 持有 writer permit 直到结束，COMMIT 不被取消或 progress handler 中断，调用方获得 SQLite 的实际成功或错误结果；成功的晚完成必须记录 deadline overrun，连接可继续复用。
 
 - Given 多个写请求排队并遇到 SQLite busy
   When 查看结构化 `sqlite.write` telemetry
@@ -234,9 +239,9 @@
 
 ### VER-SQLITE-WRITER-004
 
-- Method: coordinator contention tests with independent reader and writer pools, held writer permits, an exhausted reader pool, external `BEGIN IMMEDIATE`, delayed transaction callbacks, captured tracing events, and repeated deadline expiry followed by a successful write.
+- Method: coordinator contention tests with independent reader and writer pools, held writer permits, an exhausted reader pool, external `BEGIN IMMEDIATE`, delayed transaction callbacks, a rollback-journal reader that releases after COMMIT dispatch, captured tracing events, and repeated deadline expiry followed by a successful write.
 - covers: REQ-SQLITE-WRITER-011, REQ-SQLITE-WRITER-012
-- Pass condition: foreground p99 stays within 900 ms under bounded contention; writer acquisition succeeds while the reader pool is exhausted; background deadlines persist one delayed retry; best-effort writes never block the primary operation; expired transactions roll back and return a reusable connection; telemetry separates writer queue, pool acquisition, and SQLite busy time.
+- Pass condition: foreground p99 stays within 900 ms under bounded contention; writer acquisition succeeds while the reader pool is exhausted; background deadlines persist one delayed retry; callbacks are not started after queue expiry and started callbacks retain the permit until returning; COMMIT dispatched before expiry may succeed after the deadline and reports its actual result; transactions expired before COMMIT roll back and return a reusable connection; telemetry separates writer queue, pool acquisition, SQLite busy time, and late completion.
 
 ## 验收清单（Acceptance checklist）
 
