@@ -95,7 +95,23 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .await
         .context("failed to backfill github connections")?;
 
-    let sqlite_writer = crate::sqlite_write::SqliteWriteCoordinator::new();
+    let database_file = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT file FROM pragma_database_list WHERE name = 'main'",
+    )
+    .fetch_one(&pool)
+    .await
+    .context("inspect sqlite database before creating write pool")?;
+    let sqlite_writer = if database_file.as_deref().is_none_or(str::is_empty) {
+        crate::sqlite_write::SqliteWriteCoordinator::new()
+    } else {
+        let write_options = build_sqlite_connect_options(&config.database_url)?
+            .busy_timeout(crate::sqlite_write::SQLITE_WRITE_BUSY_TIMEOUT);
+        let write_pool = build_sqlite_write_pool_options()
+            .connect_with(write_options)
+            .await
+            .context("failed to open dedicated sqlite write pool")?;
+        crate::sqlite_write::SqliteWriteCoordinator::with_write_pool(write_pool)
+    };
     let runtime_settings =
         admin_runtime::load_or_seed_runtime_settings_with_writer(&pool, &sqlite_writer, &config)
             .await
@@ -775,6 +791,12 @@ fn build_sqlite_pool_options(max_connections: usize) -> SqlitePoolOptions {
         .min_connections(1)
 }
 
+fn build_sqlite_write_pool_options() -> SqlitePoolOptions {
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .min_connections(1)
+}
+
 fn warn_if_runtime_concurrency_exceeds_sqlite_pool(
     config: &AppConfig,
     runtime_settings: &admin_runtime::AdminRuntimeSettingsSnapshot,
@@ -1130,9 +1152,9 @@ mod tests {
         AppConfig, SESSION_COOKIE_MAX_AGE_SECS, SQLITE_INCREMENTAL_AUTO_VACUUM, SameSite,
         accepts_html_document, api_health, api_version, apply_no_store_headers,
         attach_static_site_routes, bootstrap_sqlite_database, build_session_cookie_name,
-        build_sqlite_connect_options, build_sqlite_pool_options, is_hashed_pwa_asset_path,
-        looks_like_static_asset_path, merge_public_metrics_routes, read_sqlite_runtime_pragmas,
-        session_inactivity_expiry, should_serve_spa_shell,
+        build_sqlite_connect_options, build_sqlite_pool_options, build_sqlite_write_pool_options,
+        is_hashed_pwa_asset_path, looks_like_static_asset_path, merge_public_metrics_routes,
+        read_sqlite_runtime_pragmas, session_inactivity_expiry, should_serve_spa_shell,
     };
     use axum::{
         Router,
@@ -2068,9 +2090,13 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_pool_accepts_configurable_connection_budget() {
-        let _ = build_sqlite_pool_options(8);
-        let _ = build_sqlite_pool_options(1);
+    fn sqlite_pool_options_preserve_reader_budget_and_bound_writer_pool() {
+        let reader_options = build_sqlite_pool_options(8);
+        let writer_options = build_sqlite_write_pool_options();
+
+        assert_eq!(reader_options.get_max_connections(), 8);
+        assert_eq!(writer_options.get_min_connections(), 1);
+        assert_eq!(writer_options.get_max_connections(), 1);
     }
 
     #[test]

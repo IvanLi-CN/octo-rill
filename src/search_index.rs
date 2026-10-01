@@ -133,24 +133,32 @@ async fn run_batch_with_free_bytes(
             SqliteWritePriority::Background,
         )
         .await?;
-    let state_row = load_state(&mut tx).await?;
+    let state_row = load_state(tx.as_transaction_mut()).await?;
     if state_row.status == "ready" {
-        let rowids = load_rowids(&mut tx, "metadata", 0).await?;
+        let rowids = load_rowids(tx.as_transaction_mut(), "metadata", 0).await?;
         if rowids.is_empty() {
             tx.rollback().await.ok();
             drop(permit);
             return Ok(BatchOutcome::Ready);
         }
-        process_phase(&mut tx, "metadata", &rowids).await?;
+        process_phase(tx.as_transaction_mut(), "metadata", &rowids).await?;
         tx.commit().await?;
         drop(permit);
         return Ok(BatchOutcome::Progress);
     }
     let phase = phase_index(&state_row.phase)?;
-    let rowids = load_rowids(&mut tx, state_row.phase.as_str(), state_row.cursor).await?;
+    let rowids = load_rowids(
+        tx.as_transaction_mut(),
+        state_row.phase.as_str(),
+        state_row.cursor,
+    )
+    .await?;
     if rowids.is_empty() {
         let next_phase = if phase + 1 >= PHASES.len() {
-            if !load_rowids(&mut tx, "metadata", 0).await?.is_empty() {
+            if !load_rowids(tx.as_transaction_mut(), "metadata", 0)
+                .await?
+                .is_empty()
+            {
                 Some("metadata")
             } else {
                 None
@@ -159,9 +167,9 @@ async fn run_batch_with_free_bytes(
             Some(PHASES[phase + 1])
         };
         if let Some(next_phase) = next_phase {
-            update_state(&mut tx, next_phase, 0, "building", None).await?;
+            update_state(tx.as_transaction_mut(), next_phase, 0, "building", None).await?;
         } else {
-            update_state(&mut tx, "translations", 0, "ready", None).await?;
+            update_state(tx.as_transaction_mut(), "translations", 0, "ready", None).await?;
         }
         tx.commit().await?;
         drop(permit);
@@ -178,21 +186,21 @@ async fn run_batch_with_free_bytes(
     }
 
     update_state(
-        &mut tx,
+        tx.as_transaction_mut(),
         state_row.phase.as_str(),
         state_row.cursor,
         "building",
         None,
     )
     .await?;
-    process_phase(&mut tx, state_row.phase.as_str(), &rowids).await?;
+    process_phase(tx.as_transaction_mut(), state_row.phase.as_str(), &rowids).await?;
     let next_cursor = if state_row.phase == "metadata" {
         0
     } else {
         *rowids.last().expect("non-empty batch")
     };
     update_state(
-        &mut tx,
+        tx.as_transaction_mut(),
         state_row.phase.as_str(),
         next_cursor,
         "building",
@@ -223,8 +231,15 @@ async fn mark_status(state: &AppState, status: &str, error: Option<&str>) -> Res
             SqliteWritePriority::Background,
         )
         .await?;
-    let current = load_state(&mut tx).await?;
-    update_state(&mut tx, &current.phase, current.cursor, status, error).await?;
+    let current = load_state(tx.as_transaction_mut()).await?;
+    update_state(
+        tx.as_transaction_mut(),
+        &current.phase,
+        current.cursor,
+        status,
+        error,
+    )
+    .await?;
     tx.commit().await?;
     drop(permit);
     Ok(())
@@ -239,9 +254,9 @@ async fn mark_failed(state: &AppState, error: &str) -> Result<()> {
             SqliteWritePriority::Background,
         )
         .await?;
-    let current = load_state(&mut tx).await?;
+    let current = load_state(tx.as_transaction_mut()).await?;
     update_state(
-        &mut tx,
+        tx.as_transaction_mut(),
         &current.phase,
         current.cursor,
         "failed",
@@ -262,7 +277,7 @@ pub(crate) async fn refresh_content_projection_phase(state: &AppState) -> Result
             SqliteWritePriority::Background,
         )
         .await?;
-    let current = load_state(&mut tx).await?;
+    let current = load_state(tx.as_transaction_mut()).await?;
     let current_phase = phase_index(&current.phase)?;
     let content_phase = phase_index("content_projections")?;
     if current_phase < content_phase {
@@ -273,7 +288,14 @@ pub(crate) async fn refresh_content_projection_phase(state: &AppState) -> Result
         tx.rollback().await?;
         return Ok(false);
     }
-    update_state(&mut tx, "content_projections", 0, "building", None).await?;
+    update_state(
+        tx.as_transaction_mut(),
+        "content_projections",
+        0,
+        "building",
+        None,
+    )
+    .await?;
     tx.commit().await?;
     Ok(true)
 }

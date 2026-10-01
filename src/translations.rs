@@ -25,7 +25,7 @@ use crate::{
     admin_runtime, ai, api, content_processing,
     error::ApiError,
     runtime,
-    sqlite_write::{SqliteWriteCoordinator, SqliteWritePriority},
+    sqlite_write::{SqliteWriteCoordinator, SqliteWritePriority, is_sqlite_write_deadline_error},
     state::AppState,
 };
 
@@ -1979,7 +1979,7 @@ async fn sync_running_batch_slot_updates_with_writer(
     let (_permit, mut tx) = sqlite_writer
         .begin_immediate(pool, "translation_worker_runtime_slots")
         .await?;
-    sync_running_batch_slot_updates_in_transaction(&mut tx, updates).await?;
+    sync_running_batch_slot_updates_in_transaction(tx.as_transaction_mut(), updates).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -3404,10 +3404,10 @@ async fn create_translation_request_with_origin(
         )
         .await
         .map_err(ApiError::internal)?;
-    ensure_legacy_writer_transaction(&mut tx).await?;
+    ensure_legacy_writer_transaction(tx.as_transaction_mut()).await?;
     let created = insert_translation_request(
         state,
-        &mut tx,
+        tx.as_transaction_mut(),
         user_id,
         mode,
         item,
@@ -3443,13 +3443,14 @@ async fn resolve_translation_results_for_user(
         )
         .await
         .map_err(ApiError::internal)?;
-    ensure_legacy_writer_transaction(&mut tx).await?;
+    ensure_legacy_writer_transaction(tx.as_transaction_mut()).await?;
     let mut out = Vec::with_capacity(items.len());
     for item in items {
-        let canonical_item = canonicalize_translation_result_item(&mut tx, user_id, item).await?;
+        let canonical_item =
+            canonicalize_translation_result_item(tx.as_transaction_mut(), user_id, item).await?;
         let result = ensure_translation_result_for_item(
             state,
-            &mut tx,
+            tx.as_transaction_mut(),
             user_id,
             &canonical_item,
             "user",
@@ -3545,13 +3546,13 @@ async fn create_translation_requests_batch_with_origin(
         )
         .await
         .map_err(ApiError::internal)?;
-    ensure_legacy_writer_transaction(&mut tx).await?;
+    ensure_legacy_writer_transaction(tx.as_transaction_mut()).await?;
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         out.push(
             insert_translation_request(
                 state,
-                &mut tx,
+                tx.as_transaction_mut(),
                 user_id,
                 mode,
                 item,
@@ -5372,7 +5373,7 @@ async fn claim_next_batch(
         .sqlite_writer
         .begin_immediate(&state.pool, "translation_batch_claim")
         .await?;
-    if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
+    if !content_processing::legacy_mode_in_transaction(tx.as_transaction_mut()).await? {
         tx.rollback().await?;
         return Ok(None);
     }
@@ -5473,7 +5474,7 @@ async fn claim_next_batch(
         .await?;
     }
     mark_requests_running_for_work_items_in_tx(
-        &mut tx,
+        tx.as_transaction_mut(),
         selected.iter().map(|item| item.id.as_str()).collect(),
         now_str.as_str(),
     )
@@ -5505,7 +5506,7 @@ async fn requeue_ineligible_queued_batch_items(state: &AppState) -> Result<()> {
         .sqlite_writer
         .begin_immediate(&state.pool, "translation_batch_ineligible_requeue")
         .await?;
-    if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
+    if !content_processing::legacy_mode_in_transaction(tx.as_transaction_mut()).await? {
         tx.rollback().await?;
         return Ok(());
     }
@@ -5537,10 +5538,11 @@ async fn requeue_ineligible_queued_batch_items(state: &AppState) -> Result<()> {
         .fetch_all(&mut *tx)
         .await?;
         for request_id in request_ids {
-            reset_request_for_retry(&mut tx, request_id.as_str(), now.as_str()).await?;
+            reset_request_for_retry(tx.as_transaction_mut(), request_id.as_str(), now.as_str())
+                .await?;
         }
         reset_retryable_terminal_work_item(
-            &mut tx,
+            tx.as_transaction_mut(),
             work_item_id.as_str(),
             TranslationAttemptTrigger::SystemRequeue,
             None,
@@ -5702,7 +5704,7 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
         .sqlite_writer
         .begin_immediate(&state.pool, "translation_batch_start")
         .await?;
-    if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
+    if !content_processing::legacy_mode_in_transaction(tx.as_transaction_mut()).await? {
         tx.rollback().await?;
         drop(sqlite_write);
         return Ok(());
@@ -5770,7 +5772,13 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
         return Ok(());
     }
     for item in &batch.items {
-        mark_translation_attempt_started(&mut tx, item, batch.id.as_str(), now.as_str()).await?;
+        mark_translation_attempt_started(
+            tx.as_transaction_mut(),
+            item,
+            batch.id.as_str(),
+            now.as_str(),
+        )
+        .await?;
     }
     tx.commit().await?;
     drop(sqlite_write);
@@ -5808,25 +5816,34 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
                 Ok(()) => Ok(()),
                 Err(finalize_error) => {
                     let finalize_error_text = finalize_error.to_string();
-                    tracing::error!(
-                        event = "translation.batch_finalize_failed",
-                        batch_id = batch.id.as_str(),
-                        error_kind = "finalize_failed",
-                        error = finalize_error_text.as_str(),
-                        "translation batch success finalization failed; attempting owner fallback"
-                    );
-                    match force_fail_translation_batch_if_owned(
-                        state,
-                        &batch,
-                        finalize_error_text.as_str(),
-                    )
-                    .await
-                    {
-                        Ok(true) => Err(finalize_error),
-                        Ok(false) => Err(finalize_error),
-                        Err(fallback_error) => Err(anyhow!(
-                            "translation batch finalization failed: {finalize_error_text}; owner fallback failed: {fallback_error}"
-                        )),
+                    if is_sqlite_write_deadline_error(finalize_error.as_ref()) {
+                        match defer_translation_batch_after_finalize_deadline(state, &batch).await {
+                            Ok(_) => Err(finalize_error),
+                            Err(defer_error) => Err(anyhow!(
+                                "translation batch finalization deadline exceeded: {finalize_error_text}; deferral failed: {defer_error}"
+                            )),
+                        }
+                    } else {
+                        tracing::error!(
+                            event = "translation.batch_finalize_failed",
+                            batch_id = batch.id.as_str(),
+                            error_kind = "finalize_failed",
+                            error = finalize_error_text.as_str(),
+                            "translation batch success finalization failed; attempting owner fallback"
+                        );
+                        match force_fail_translation_batch_if_owned(
+                            state,
+                            &batch,
+                            finalize_error_text.as_str(),
+                        )
+                        .await
+                        {
+                            Ok(true) => Err(finalize_error),
+                            Ok(false) => Err(finalize_error),
+                            Err(fallback_error) => Err(anyhow!(
+                                "translation batch finalization failed: {finalize_error_text}; owner fallback failed: {fallback_error}"
+                            )),
+                        }
                     }
                 }
             };
@@ -5856,24 +5873,33 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
                 Ok(()) => Ok(()),
                 Err(finalize_error) => {
                     let finalize_error_text = finalize_error.to_string();
-                    tracing::error!(
-                        event = "translation.batch_finalize_failed",
-                        batch_id = batch.id.as_str(),
-                        error_kind = "failure_finalize_failed",
-                        error = finalize_error_text.as_str(),
-                        "translation batch failure finalization failed; attempting owner fallback"
-                    );
-                    match force_fail_translation_batch_if_owned(
-                        state,
-                        &batch,
-                        finalize_error_text.as_str(),
-                    )
-                    .await
-                    {
-                        Ok(true) | Ok(false) => Err(anyhow!(finalize_error_text)),
-                        Err(fallback_error) => Err(anyhow!(
-                            "translation batch failure finalization failed: {finalize_error_text}; owner fallback failed: {fallback_error}"
-                        )),
+                    if is_sqlite_write_deadline_error(finalize_error.as_ref()) {
+                        match defer_translation_batch_after_finalize_deadline(state, &batch).await {
+                            Ok(_) => Err(anyhow!(finalize_error_text)),
+                            Err(defer_error) => Err(anyhow!(
+                                "translation batch finalization deadline exceeded: {finalize_error_text}; deferral failed: {defer_error}"
+                            )),
+                        }
+                    } else {
+                        tracing::error!(
+                            event = "translation.batch_finalize_failed",
+                            batch_id = batch.id.as_str(),
+                            error_kind = "failure_finalize_failed",
+                            error = finalize_error_text.as_str(),
+                            "translation batch failure finalization failed; attempting owner fallback"
+                        );
+                        match force_fail_translation_batch_if_owned(
+                            state,
+                            &batch,
+                            finalize_error_text.as_str(),
+                        )
+                        .await
+                        {
+                            Ok(true) | Ok(false) => Err(anyhow!(finalize_error_text)),
+                            Err(fallback_error) => Err(anyhow!(
+                                "translation batch failure finalization failed: {finalize_error_text}; owner fallback failed: {fallback_error}"
+                            )),
+                        }
                     }
                 }
             };
@@ -6282,13 +6308,13 @@ async fn finalize_batch_success(
         .sqlite_writer
         .begin_immediate(&state.pool, "translation_batch_finalize")
         .await?;
-    if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
+    if !content_processing::legacy_mode_in_transaction(tx.as_transaction_mut()).await? {
         tx.rollback().await?;
         return Err(anyhow!(
             "translation batch success finalization skipped because legacy mode is disabled"
         ));
     }
-    if !legacy_batch_claim_is_current(&mut tx, state, batch).await? {
+    if !legacy_batch_claim_is_current(tx.as_transaction_mut(), state, batch).await? {
         tx.rollback().await?;
         return Ok(());
     }
@@ -6304,13 +6330,14 @@ async fn finalize_batch_success(
         let contract_failed =
             result.result_status == "error" && output_contract_failed(result.error.as_deref());
         let llm_call_ids = load_translation_work_item_llm_call_ids(
-            &mut tx,
+            tx.as_transaction_mut(),
             batch.id.as_str(),
             result.work_item_id.as_str(),
         )
         .await?;
         let contract_recovered = result.result_status != "error"
-            && llm_call_ids_include_role(&mut tx, &llm_call_ids, "schema_repair").await?;
+            && llm_call_ids_include_role(tx.as_transaction_mut(), &llm_call_ids, "schema_repair")
+                .await?;
         let retry_state = sqlx::query(
             "SELECT retry_count, retry_expires_at FROM translation_work_items WHERE id = ? LIMIT 1",
         )
@@ -6415,7 +6442,7 @@ async fn finalize_batch_success(
         .await?;
 
         record_translation_attempt_completed(
-            &mut tx,
+            tx.as_transaction_mut(),
             work_item,
             TranslationAttemptCompletion {
                 batch_id: batch.id.as_str(),
@@ -6429,11 +6456,12 @@ async fn finalize_batch_success(
             now.as_str(),
         )
         .await?;
-        let attempt_no = load_translation_attempt_state(&mut tx, work_item.id.as_str())
-            .await?
-            .attempt_count;
+        let attempt_no =
+            load_translation_attempt_state(tx.as_transaction_mut(), work_item.id.as_str())
+                .await?
+                .attempt_count;
         persist_translation_attempt_llm_call_links(
-            &mut tx,
+            tx.as_transaction_mut(),
             work_item,
             attempt_no,
             &llm_call_ids,
@@ -6443,7 +6471,7 @@ async fn finalize_batch_success(
         .await?;
         if let Some(next_retry_at) = retry_scheduled_at.as_deref() {
             record_translation_retry_scheduled(
-                &mut tx,
+                tx.as_transaction_mut(),
                 work_item,
                 TranslationRetrySchedule {
                     batch_id: batch.id.as_str(),
@@ -6510,7 +6538,7 @@ async fn finalize_batch_success(
                 Some(batch.id.clone()),
             );
             apply_request_result(
-                &mut tx,
+                tx.as_transaction_mut(),
                 request_id.as_str(),
                 Some(result.work_item_id.as_str()),
                 &request_result,
@@ -6520,7 +6548,7 @@ async fn finalize_batch_success(
         }
 
         persist_translation_terminal_state(
-            &mut tx,
+            tx.as_transaction_mut(),
             &work_item.scope_user_id,
             work_item.kind.as_str(),
             work_item.variant.as_str(),
@@ -6572,18 +6600,18 @@ async fn finalize_batch_failure(
         .sqlite_writer
         .begin_immediate(&state.pool, "translation_batch_finalize")
         .await?;
-    if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
+    if !content_processing::legacy_mode_in_transaction(tx.as_transaction_mut()).await? {
         tx.rollback().await?;
         return Err(anyhow!(
             "translation batch failure finalization skipped because legacy mode is disabled"
         ));
     }
-    if !legacy_batch_claim_is_current(&mut tx, state, batch).await? {
+    if !legacy_batch_claim_is_current(tx.as_transaction_mut(), state, batch).await? {
         tx.rollback().await?;
         return Ok(());
     }
     fail_batch_with_message(
-        &mut tx,
+        tx.as_transaction_mut(),
         batch.id.as_str(),
         &batch.items,
         message.as_str(),
@@ -6593,6 +6621,112 @@ async fn finalize_batch_failure(
     .await?;
     tx.commit().await?;
     Ok(())
+}
+
+async fn defer_translation_batch_after_finalize_deadline(
+    state: &AppState,
+    batch: &ClaimedBatch,
+) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "translation_batch_finalize_defer")
+        .await?;
+    if !content_processing::legacy_mode_in_transaction(tx.as_transaction_mut()).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    if !legacy_batch_claim_is_current(tx.as_transaction_mut(), state, batch).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+
+    for item in &batch.items {
+        let request_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM translation_requests WHERE work_item_id = ?",
+        )
+        .bind(item.id.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        for request_id in request_ids {
+            reset_request_for_retry(tx.as_transaction_mut(), request_id.as_str(), now.as_str())
+                .await?;
+        }
+        record_translation_attempt_queued(
+            tx.as_transaction_mut(),
+            item.id.as_str(),
+            None,
+            TranslationAttemptTrigger::SystemRequeue,
+            now.as_str(),
+        )
+        .await?;
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE translation_work_items
+        SET status = 'batched',
+            result_status = NULL,
+            title_zh = NULL,
+            summary_md = NULL,
+            body_md = NULL,
+            error_text = NULL,
+            started_at = NULL,
+            finished_at = NULL,
+            updated_at = ?
+        WHERE batch_id = ? AND status = 'running'
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(batch.id.as_str())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"
+        UPDATE ai_translations
+        SET status = 'queued', updated_at = ?
+        WHERE status = 'running'
+          AND active_work_item_id IN (
+            SELECT work_item_id FROM translation_batch_items WHERE batch_id = ?
+          )
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(batch.id.as_str())
+    .execute(&mut *tx)
+    .await?;
+    let batch_update = sqlx::query(
+        r#"
+        UPDATE translation_batches
+        SET status = 'queued',
+            started_at = NULL,
+            finished_at = NULL,
+            error_text = NULL,
+            runtime_owner_id = NULL,
+            lease_heartbeat_at = NULL,
+            updated_at = ?
+        WHERE id = ?
+          AND status = 'running'
+          AND runtime_owner_id = ?
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(batch.id.as_str())
+    .bind(state.runtime_owner_id.as_str())
+    .execute(&mut *tx)
+    .await?;
+    if batch_update.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    tx.commit().await?;
+    tracing::warn!(
+        event = "translation.batch_finalize_deferred",
+        batch_id = batch.id.as_str(),
+        cooldown_ms = runtime::RUNTIME_LEASE_STALE_AFTER.as_millis(),
+        "translation batch finalization exceeded its write deadline; batch requeued"
+    );
+    Ok(true)
 }
 
 async fn force_fail_translation_batch_if_owned(
@@ -6605,19 +6739,19 @@ async fn force_fail_translation_batch_if_owned(
         .sqlite_writer
         .begin_immediate(&state.pool, "translation_batch_force_failure")
         .await?;
-    if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
+    if !content_processing::legacy_mode_in_transaction(tx.as_transaction_mut()).await? {
         tx.rollback().await?;
         return Err(anyhow!(
             "translation batch force failure skipped because legacy mode is disabled"
         ));
     }
-    if !legacy_batch_claim_is_current(&mut tx, state, batch).await? {
+    if !legacy_batch_claim_is_current(tx.as_transaction_mut(), state, batch).await? {
         tx.rollback().await.ok();
         return Ok(false);
     }
 
     fail_batch_with_message(
-        &mut tx,
+        tx.as_transaction_mut(),
         batch.id.as_str(),
         &batch.items,
         message,
@@ -6696,7 +6830,7 @@ async fn recover_due_translation_work_items(state: &AppState) -> Result<()> {
             .sqlite_writer
             .begin_immediate(&state.pool, "translation_work_item_recovery")
             .await?;
-        if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
+        if !content_processing::legacy_mode_in_transaction(tx.as_transaction_mut()).await? {
             tx.rollback().await?;
             return Ok(());
         }
@@ -6805,7 +6939,7 @@ async fn recover_due_translation_work_items(state: &AppState) -> Result<()> {
         }
 
         record_translation_attempt_queued(
-            &mut tx,
+            tx.as_transaction_mut(),
             item.id.as_str(),
             None,
             TranslationAttemptTrigger::AutomaticRecovery,
@@ -6848,9 +6982,10 @@ async fn recover_due_translation_work_items(state: &AppState) -> Result<()> {
         .fetch_all(&mut *tx)
         .await?;
         for request_id in requests {
-            reset_request_for_retry(&mut tx, request_id.as_str(), now.as_str()).await?;
+            reset_request_for_retry(tx.as_transaction_mut(), request_id.as_str(), now.as_str())
+                .await?;
             attach_request_to_work_item(
-                &mut tx,
+                tx.as_transaction_mut(),
                 request_id.as_str(),
                 item.id.as_str(),
                 "queued",
@@ -6871,7 +7006,7 @@ async fn heartbeat_translation_batch_lease(state: &AppState, batch_id: &str) -> 
             let has_control_table = sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'content_processing_control'",
             )
-            .fetch_one(&state.pool)
+            .fetch_one(state.sqlite_writer.write_pool_or(&state.pool))
             .await?
                 > 0;
             if has_control_table {
@@ -6892,7 +7027,7 @@ async fn heartbeat_translation_batch_lease(state: &AppState, batch_id: &str) -> 
                 .bind(now.as_str())
                 .bind(batch_id)
                 .bind(state.runtime_owner_id.as_str())
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await?;
             } else {
                 sqlx::query(
@@ -6908,7 +7043,7 @@ async fn heartbeat_translation_batch_lease(state: &AppState, batch_id: &str) -> 
                 .bind(now.as_str())
                 .bind(batch_id)
                 .bind(state.runtime_owner_id.as_str())
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await?;
             }
             Ok::<(), anyhow::Error>(())
@@ -7199,7 +7334,7 @@ async fn recover_runtime_state_with_mode(
             .sqlite_writer
             .begin_immediate(&state.pool, "translation_batch_recovery")
             .await?;
-        if !content_processing::legacy_mode_in_transaction(&mut tx).await? {
+        if !content_processing::legacy_mode_in_transaction(tx.as_transaction_mut()).await? {
             tx.rollback().await?;
             return Ok(());
         }
@@ -7219,10 +7354,10 @@ async fn recover_runtime_state_with_mode(
             tx.rollback().await?;
             continue;
         }
-        let items = load_batch_work_items(&mut tx, batch.id.as_str()).await?;
+        let items = load_batch_work_items(tx.as_transaction_mut(), batch.id.as_str()).await?;
         let now = Utc::now().to_rfc3339();
         fail_batch_with_message(
-            &mut tx,
+            tx.as_transaction_mut(),
             batch.id.as_str(),
             &items,
             runtime::RUNTIME_LEASE_EXPIRED_ERROR,
@@ -8940,13 +9075,13 @@ mod tests {
             .begin_immediate(&state.pool, "test_retry_schedule_attempt")
             .await
             .expect("begin test transaction");
-        let work_item = load_work_item_by_id(&mut tx, work_item_id.as_str())
+        let work_item = load_work_item_by_id(tx.as_transaction_mut(), work_item_id.as_str())
             .await
             .expect("load work item")
             .expect("work item should exist");
         let llm_call_ids = vec!["llm-call-for-failed-attempt".to_owned()];
         record_translation_retry_scheduled(
-            &mut tx,
+            tx.as_transaction_mut(),
             &work_item,
             TranslationRetrySchedule {
                 batch_id: "batch-failed-attempt",
@@ -12316,6 +12451,114 @@ mod tests {
                     "[]".to_owned(),
                 ),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_deadline_requeues_batch_with_reclaim_cooldown() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let mut item = sample_release_item("finalize-deadline-defer");
+        item.max_wait_ms = 0;
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim batch")
+            .expect("batch exists");
+        let work_item_id = batch.items[0].id.as_str();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            UPDATE translation_batches
+            SET status = 'running', started_at = ?, runtime_owner_id = ?,
+                lease_heartbeat_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(state.runtime_owner_id.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(batch.id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark batch running");
+        sqlx::query(
+            "UPDATE translation_work_items SET status = 'running', started_at = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(work_item_id)
+        .execute(&pool)
+        .await
+        .expect("mark work item running");
+        sqlx::query(
+            "UPDATE translation_requests SET status = 'running', started_at = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(created.request_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark request running");
+        sqlx::query(
+            "UPDATE ai_translations SET status = 'running', updated_at = ? WHERE active_work_item_id = ?",
+        )
+        .bind(now.as_str())
+        .bind(work_item_id)
+        .execute(&pool)
+        .await
+        .expect("mark translation state running");
+
+        assert!(
+            defer_translation_batch_after_finalize_deadline(state.as_ref(), &batch)
+                .await
+                .expect("defer timed-out batch")
+        );
+
+        let batch_row = sqlx::query(
+            "SELECT status, runtime_owner_id, updated_at FROM translation_batches WHERE id = ?",
+        )
+        .bind(batch.id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load deferred batch");
+        assert_eq!(batch_row.get::<String, _>("status"), "queued");
+        assert_eq!(batch_row.get::<Option<String>, _>("runtime_owner_id"), None);
+        assert!(batch_row.get::<String, _>("updated_at") > now);
+
+        let work_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ?")
+                .bind(work_item_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load deferred work item");
+        let request_row =
+            sqlx::query("SELECT status, started_at FROM translation_requests WHERE id = ?")
+                .bind(created.request_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load deferred request");
+        let translation_state: String =
+            sqlx::query_scalar("SELECT status FROM ai_translations WHERE active_work_item_id = ?")
+                .bind(work_item_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load deferred translation state");
+        assert_eq!(work_status, "batched");
+        assert_eq!(request_row.get::<String, _>("status"), "queued");
+        assert_eq!(request_row.get::<Option<String>, _>("started_at"), None);
+        assert_eq!(translation_state, "queued");
+
+        assert!(
+            claim_existing_queued_batch(state.as_ref(), &test_worker_profile(2, "general"))
+                .await
+                .expect("freshly deferred batch stays in cooldown")
+                .is_none()
         );
     }
 

@@ -22,8 +22,9 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
 use crate::{
-    admin_runtime, ai, api, briefs, content_processing, local_id, runtime, state::AppState, sync,
-    translations, webhook_push,
+    admin_runtime, ai, api, briefs, content_processing, local_id, runtime,
+    sqlite_write::is_sqlite_write_deadline_error, state::AppState, sync, translations,
+    webhook_push,
 };
 
 pub const STATUS_QUEUED: &str = "queued";
@@ -859,7 +860,7 @@ async fn upsert_dispatch_state(
             .bind(schedule_key)
             .bind(task_id)
             .bind(now.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to upsert subscription dispatch state")?;
             Ok::<_, anyhow::Error>(())
@@ -886,7 +887,7 @@ async fn update_daily_brief_hour_slot_dispatch(
             .bind(dispatch_at)
             .bind(dispatch_at)
             .bind(hour_utc)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to update slot last_dispatch_at")?;
             Ok::<_, anyhow::Error>(())
@@ -916,7 +917,7 @@ async fn mark_brief_generation_source(
             .bind(generation_source)
             .bind(updated_at)
             .bind(brief_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .with_context(|| format!("failed to mark brief {brief_id} as {generation_source}"))?;
             Ok::<_, anyhow::Error>(())
@@ -1187,7 +1188,7 @@ async fn insert_task_record(
             .bind(runtime_owner_id)
             .bind(lease_heartbeat_at)
             .bind(now.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to insert job task")?;
             Ok::<_, anyhow::Error>(())
@@ -1381,7 +1382,7 @@ pub async fn enqueue_singleton_task_for_requester_if_generation_pending(
             .bind(&requested_by)
             .bind(generation)
             .bind(generation)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("insert generation-gated job task")?;
             Ok::<_, anyhow::Error>(result.rows_affected() != 0)
@@ -1668,7 +1669,7 @@ async fn reschedule_task_inner(
                 .bind(&now)
                 .bind(task_id)
                 .bind(STATUS_RUNNING)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("failed to reschedule task with payload")
             } else if let Some(retry_count) = retry_count {
@@ -1687,7 +1688,7 @@ async fn reschedule_task_inner(
                 .bind(&now)
                 .bind(task_id)
                 .bind(STATUS_RUNNING)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("failed to reschedule task")
             } else {
@@ -1705,7 +1706,7 @@ async fn reschedule_task_inner(
                 .bind(&now)
                 .bind(task_id)
                 .bind(STATUS_RUNNING)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("failed to reschedule task")
             }
@@ -1812,7 +1813,7 @@ pub async fn cancel_task(state: &AppState, task_id: &str) -> Result<String> {
             .bind(STATUS_QUEUED)
             .bind(TASK_WEBHOOK_PUSH_MANAGE)
             .bind(TASK_WEBHOOK_PUSH_AUDIT)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to request queued webhook cancellation")
         })
@@ -1847,7 +1848,7 @@ pub async fn cancel_task(state: &AppState, task_id: &str) -> Result<String> {
             .bind(STATUS_QUEUED)
             .bind(TASK_WEBHOOK_PUSH_MANAGE)
             .bind(TASK_WEBHOOK_PUSH_AUDIT)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to cancel queued task")
         })
@@ -1877,7 +1878,7 @@ pub async fn cancel_task(state: &AppState, task_id: &str) -> Result<String> {
             .bind(now.as_str())
             .bind(task_id)
             .bind(STATUS_RUNNING)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to request cancellation")
         })
@@ -1927,7 +1928,7 @@ pub async fn append_task_event(
             .bind(event_type)
             .bind(payload_json.as_str())
             .bind(now.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to insert task event")?;
             Ok::<_, anyhow::Error>(())
@@ -2596,7 +2597,7 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
 
     let context = ai::LlmCallContext {
         source: format!("job.{}", task.source),
-        requested_by: task.requested_by,
+        requested_by: task.requested_by.clone(),
         parent_task_id: Some(task.id.clone()),
         parent_task_type: Some(task.task_type.clone()),
         parent_translation_batch_id: None,
@@ -2683,6 +2684,12 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
             }
         }
         Err(err) => {
+            if is_sqlite_write_deadline_error(err.as_ref()) {
+                heartbeat.stop().await;
+                defer_task_after_sqlite_write_deadline(state.as_ref(), &task, &payload).await?;
+                return Ok(());
+            }
+
             let message = err.to_string();
             let finalized = finalize_task_if_owned(
                 state.as_ref(),
@@ -2720,6 +2727,41 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn defer_task_after_sqlite_write_deadline(
+    state: &AppState,
+    task: &TaskRow,
+    payload: &Value,
+) -> Result<bool> {
+    let previous_retry_count = payload
+        .get("retry_count")
+        .and_then(Value::as_u64)
+        .map(|value| value.min(u64::from(u8::MAX)) as u8)
+        .unwrap_or(0);
+    let retry_count = previous_retry_count.saturating_add(1);
+    let available_at = Utc::now() + chrono::Duration::seconds(15);
+    let rescheduled = reschedule_task_with_retry_count(
+        state,
+        &task.id,
+        available_at,
+        retry_count,
+        json!({
+            "reason": "sqlite_write_deadline",
+            "retry_count": retry_count,
+        }),
+    )
+    .await?;
+    if rescheduled {
+        tracing::warn!(
+            task_id = task.id,
+            task_type = task.task_type,
+            retry_count,
+            available_at = %available_at.to_rfc3339(),
+            "background task deferred after sqlite write deadline"
+        );
+    }
+    Ok(rescheduled)
 }
 
 async fn execute_task(
@@ -4449,7 +4491,7 @@ async fn finalize_task_if_owned(
             .bind(task_id)
             .bind(STATUS_RUNNING)
             .bind(runtime_owner_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to finalize owned task")?;
             Ok(updated.rows_affected() > 0)
@@ -4476,7 +4518,7 @@ async fn heartbeat_task_lease(state: &AppState, task_id: &str) -> Result<()> {
             .bind(task_id)
             .bind(STATUS_RUNNING)
             .bind(state.runtime_owner_id.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to heartbeat task lease")?;
             Ok(())
@@ -4594,7 +4636,8 @@ async fn recover_task_if_stale(
         .sqlite_writer
         .write("job_task_recover", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("failed to begin stale task recovery transaction")?;
@@ -4866,9 +4909,10 @@ mod tests {
         TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT, TASK_RETRY_RECENT_FAILURES,
         TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_RELEASES,
         TASK_SYNC_STARRED_DELTA, TASK_SYNC_STARRED_RECONCILE, TASK_SYNC_SUBSCRIPTIONS,
-        TASK_WEBHOOK_PUSH_AUDIT, TASK_WEBHOOK_PUSH_MANAGE, TranslationStreamCursor, cancel_task,
-        claim_next_queued_task, complete_task, current_recent_failures_retry_schedule_key,
-        current_subscription_schedule_key, enqueue_brief_history_recompute_if_needed,
+        TASK_WEBHOOK_PUSH_AUDIT, TASK_WEBHOOK_PUSH_MANAGE, TaskRow, TranslationStreamCursor,
+        cancel_task, claim_next_queued_task, complete_task,
+        current_recent_failures_retry_schedule_key, current_subscription_schedule_key,
+        defer_task_after_sqlite_write_deadline, enqueue_brief_history_recompute_if_needed,
         enqueue_brief_refresh_content_if_needed, enqueue_hour_slot_if_due,
         enqueue_recent_failures_retry_if_due, enqueue_singleton_task_for_requester,
         enqueue_singleton_task_for_requester_if_generation_pending, enqueue_star_sync_runs_if_due,
@@ -6742,6 +6786,63 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed user");
+    }
+
+    #[tokio::test]
+    async fn sqlite_write_deadline_persists_background_task_deferral() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_task(
+            &pool,
+            "sqlite-deadline-task",
+            TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+        let payload = json!({"retry_count": 3});
+        sqlx::query("UPDATE job_tasks SET payload_json = ? WHERE id = ?")
+            .bind(payload.to_string())
+            .bind("sqlite-deadline-task")
+            .execute(&pool)
+            .await
+            .expect("set deferred task retry count");
+        let task = TaskRow {
+            id: "sqlite-deadline-task".to_owned(),
+            task_type: TASK_SYNC_RELEASES.to_owned(),
+            source: "scheduler".to_owned(),
+            requested_by: None,
+            payload_json: payload.to_string(),
+            cancel_requested: 0,
+        };
+        let before = Utc::now();
+
+        let rescheduled = defer_task_after_sqlite_write_deadline(state.as_ref(), &task, &payload)
+            .await
+            .expect("defer task after sqlite deadline");
+
+        assert!(rescheduled);
+        let (status, retry_count, available_at): (String, i64, String) = sqlx::query_as(
+            "SELECT status, json_extract(payload_json, '$.retry_count'), available_at FROM job_tasks WHERE id = ?",
+        )
+        .bind(&task.id)
+        .fetch_one(&pool)
+        .await
+        .expect("load deferred task state");
+        assert_eq!(status, STATUS_QUEUED);
+        assert_eq!(retry_count, 4);
+        let available_at = chrono::DateTime::parse_from_rfc3339(&available_at)
+            .expect("parse deferred task deadline");
+        assert!(available_at > before + Duration::seconds(14));
+
+        let event_type = sqlx::query_scalar::<_, String>(
+            "SELECT event_type FROM job_task_events WHERE task_id = ? ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind(&task.id)
+        .fetch_one(&pool)
+        .await
+        .expect("load task deferral event");
+        assert_eq!(event_type, "task.rescheduled");
     }
 
     #[tokio::test]

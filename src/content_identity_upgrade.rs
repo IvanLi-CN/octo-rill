@@ -795,7 +795,8 @@ pub(crate) async fn run_one_batch(
             SqliteWritePriority::Background,
         )
         .await?;
-    let progressed = process_upgrade_batch(&mut tx, configuration_valid, batch_size).await?;
+    let progressed =
+        process_upgrade_batch(tx.as_transaction_mut(), configuration_valid, batch_size).await?;
     tx.commit().await?;
     Ok(progressed)
 }
@@ -943,7 +944,7 @@ async fn refresh_search_index_if_pending(state: &AppState) -> Result<bool> {
             SqliteWritePriority::Background,
         )
         .await?;
-    let mut control = load_control(&mut tx).await?;
+    let mut control = load_control(tx.as_transaction_mut()).await?;
     control.cursor.search_index_refresh_pending = false;
     sqlx::query(
         "UPDATE content_identity_upgrade_control SET cursor = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1 AND status = 'completed'",
@@ -1125,7 +1126,7 @@ mod tests {
             )
             .await?;
         let now = Utc::now().to_rfc3339();
-        let result = requeue_blocked_config_batch(&mut tx, &now).await?;
+        let result = requeue_blocked_config_batch(tx.as_transaction_mut(), &now).await?;
         tx.commit().await?;
         Ok(result)
     }

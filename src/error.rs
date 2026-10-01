@@ -69,7 +69,25 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", message)
     }
 
-    pub fn internal(err: impl std::fmt::Display) -> Self {
+    pub fn internal(err: impl std::fmt::Display + std::fmt::Debug) -> Self {
+        let error_chain = format!("{err:?}");
+        let error_chain_lower = error_chain.to_ascii_lowercase();
+        let display_lower = err.to_string().to_ascii_lowercase();
+        let is_write_deadline = display_lower
+            .starts_with("retryable sqlite write deadline exceeded")
+            || error_chain_lower.contains("retryable sqlite write deadline exceeded")
+            || ((error_chain_lower.contains("code: \"9\"")
+                || error_chain_lower.contains("code: 9"))
+                && error_chain_lower.contains("interrupted"));
+        if is_write_deadline {
+            return Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "sqlite_write_retryable",
+                "SQLite write capacity is busy; retry the request.",
+            )
+            .with_retry_after(1);
+        }
+
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
@@ -110,5 +128,41 @@ impl IntoResponse for ApiError {
             response.headers_mut().insert(header::RETRY_AFTER, value);
         }
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_write_deadline_maps_to_retryable_service_unavailable() {
+        let error = crate::sqlite_write::SqliteWriteDeadlineError {
+            lane: "test",
+            priority: "foreground",
+            phase: "writer_queue",
+            deadline_ms: 900,
+        };
+        let response = ApiError::internal(error).into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    }
+
+    #[test]
+    fn ordinary_internal_error_remains_internal_server_error() {
+        let response = ApiError::internal(anyhow::anyhow!("database unavailable")).into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn sqlite_interruption_maps_to_retryable_service_unavailable() {
+        let response = ApiError::internal(anyhow::anyhow!(
+            "error returned from database: (code: 9) interrupted"
+        ))
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
