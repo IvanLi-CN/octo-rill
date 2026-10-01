@@ -18,7 +18,9 @@ use tokio::{task::JoinSet, time::sleep};
 use tracing::warn;
 
 use crate::{
-    ai, api, content_identity_upgrade, error::ApiError, local_id, state::AppState, translations,
+    ai, api, content_identity_upgrade, error::ApiError, local_id,
+    sqlite_write::is_sqlite_database_error, state::AppState, translations,
+    worker_backoff::WorkerBackoff,
 };
 use tower_sessions::Session;
 
@@ -3587,7 +3589,7 @@ async fn cancel_deleted_work(state: &AppState, work: &WorkRow) -> Result<()> {
         .await?;
     ensure_global_mode_in_transaction(tx.as_transaction_mut())
         .await
-        .map_err(|error| anyhow!(error.to_string()))?;
+        .map_err(anyhow::Error::new)?;
     cancel_deleted_work_in_transaction(tx.as_transaction_mut(), work).await?;
     tx.commit().await
 }
@@ -3773,7 +3775,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             .await?;
         ensure_global_mode_in_transaction(tx.as_transaction_mut())
             .await
-            .map_err(|error| anyhow!(error.to_string()))?;
+            .map_err(anyhow::Error::new)?;
         let updated = sqlx::query("UPDATE content_work_items SET status = 'deferred_provider', next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running' AND attempt_count = ?")
                 .bind(&next_retry_at)
                 .bind(&retry_expires_at)
@@ -4238,17 +4240,23 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_once(state: &AppState) -> Result<()> {
+enum GlobalSchedulerAttempt {
+    Idle,
+    Claimed,
+    ClaimedDatabaseFailure(anyhow::Error),
+}
+
+async fn run_once_with_outcome(state: &AppState) -> Result<GlobalSchedulerAttempt> {
     if current_mode(&state.pool).await? != ContentProcessingMode::Global {
-        return Ok(());
+        return Ok(GlobalSchedulerAttempt::Idle);
     }
     if !content_identity_upgrade::is_complete(&state.pool).await? {
-        return Ok(());
+        return Ok(GlobalSchedulerAttempt::Idle);
     }
     recover_due(state).await?;
     if provider_breaker_open(state).await {
         defer_queued_for_provider(state).await?;
-        return Ok(());
+        return Ok(GlobalSchedulerAttempt::Idle);
     }
     let worker_count = state
         .translation_scheduler
@@ -4264,12 +4272,19 @@ pub async fn run_once(state: &AppState) -> Result<()> {
     } else {
         1
     };
-    if let Some(work) = claim_next(state, manual_limit).await?
-        && let Err(error) = execute(state, work).await
-    {
-        warn!(?error, "global content processing execution failed");
+    let Some(work) = claim_next(state, manual_limit).await? else {
+        return Ok(GlobalSchedulerAttempt::Idle);
+    };
+    match execute(state, work).await {
+        Ok(()) => Ok(GlobalSchedulerAttempt::Claimed),
+        Err(error) if is_sqlite_database_error(error.as_ref()) => {
+            Ok(GlobalSchedulerAttempt::ClaimedDatabaseFailure(error))
+        }
+        Err(error) => {
+            warn!(?error, "global content processing execution failed");
+            Ok(GlobalSchedulerAttempt::Claimed)
+        }
     }
-    Ok(())
 }
 
 pub fn spawn_global_scheduler(state: Arc<AppState>) -> tokio::task::AbortHandle {
@@ -4294,14 +4309,49 @@ pub fn spawn_global_scheduler(state: Arc<AppState>) -> tokio::task::AbortHandle 
                     let worker_state = state.clone();
                     let worker_target = desired_workers.clone();
                     workers.spawn(async move {
+                        let mut claim_backoff = WorkerBackoff::default();
+                        let mut execution_backoff = WorkerBackoff::default();
                         loop {
                             if worker_index >= worker_target.load(Ordering::Acquire) {
                                 break;
                             }
-                            if let Err(error) = run_once(worker_state.as_ref()).await {
-                                warn!(?error, "global content processing scheduler failed");
+                            match run_once_with_outcome(worker_state.as_ref()).await {
+                                Ok(GlobalSchedulerAttempt::Idle) => {
+                                    claim_backoff.reset();
+                                    execution_backoff.reset();
+                                    sleep(Duration::from_millis(250)).await;
+                                }
+                                Ok(GlobalSchedulerAttempt::Claimed) => {
+                                    claim_backoff.reset();
+                                    execution_backoff.reset();
+                                    sleep(Duration::from_millis(250)).await;
+                                }
+                                Ok(GlobalSchedulerAttempt::ClaimedDatabaseFailure(error)) => {
+                                    claim_backoff.reset();
+                                    let retry_after = execution_backoff.next_delay();
+                                    warn!(
+                                        lane = "content_processing_execute",
+                                        error_kind = "database_attempt",
+                                        failure_count = execution_backoff.failure_count(),
+                                        ?error,
+                                        retry_after_ms = retry_after.as_millis(),
+                                        "global content processing execution failed; backing off"
+                                    );
+                                    sleep(retry_after).await;
+                                }
+                                Err(error) => {
+                                    let retry_after = claim_backoff.next_delay();
+                                    warn!(
+                                        lane = "content_processing_recovery_claim",
+                                        error_kind = "database_attempt",
+                                        failure_count = claim_backoff.failure_count(),
+                                        ?error,
+                                        retry_after_ms = retry_after.as_millis(),
+                                        "global content processing scheduler failed; backing off"
+                                    );
+                                    sleep(retry_after).await;
+                                }
                             }
-                            sleep(Duration::from_millis(250)).await;
                         }
                     });
                 }

@@ -24,7 +24,7 @@ use tokio::io::AsyncWriteExt;
 use crate::{
     admin_runtime, ai, api, briefs, content_processing, local_id, runtime,
     sqlite_write::is_sqlite_write_deadline_error, state::AppState, sync, translations,
-    webhook_push,
+    webhook_push, worker_backoff::WorkerBackoff,
 };
 
 pub const STATUS_QUEUED: &str = "queued";
@@ -196,19 +196,30 @@ pub async fn recover_runtime_state_on_startup(state: &AppState) -> Result<()> {
 
 pub fn spawn_task_worker(state: Arc<AppState>) {
     tokio::spawn(async move {
+        let mut claim_backoff = WorkerBackoff::default();
         loop {
             match claim_next_queued_task(state.as_ref()).await {
                 Ok(Some(task)) => {
+                    claim_backoff.reset();
                     if let Err(err) = process_task(Arc::clone(&state), task).await {
                         tracing::warn!(?err, "task worker: process task failed");
                     }
                 }
                 Ok(None) => {
+                    claim_backoff.reset();
                     tokio::time::sleep(Duration::from_millis(450)).await;
                 }
                 Err(err) => {
-                    tracing::warn!(?err, "task worker: claim task failed");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let retry_after = claim_backoff.next_delay();
+                    tracing::warn!(
+                        lane = "job_task_claim",
+                        error_kind = "database_attempt",
+                        failure_count = claim_backoff.failure_count(),
+                        ?err,
+                        retry_after_ms = retry_after.as_millis(),
+                        "task worker: claim task failed; backing off"
+                    );
+                    tokio::time::sleep(retry_after).await;
                 }
             }
         }
@@ -2544,16 +2555,28 @@ async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
     .await
     .context("reload claimed task")?;
 
+    let running_event_payload = serde_json::to_string(&json!({
+        "task_id": task.id,
+        "status": STATUS_RUNNING,
+    }))
+    .context("serialize task running event payload")?;
+    sqlx::query(
+        r#"
+        INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(local_id::generate_local_id())
+    .bind(&task.id)
+    .bind("task.running")
+    .bind(running_event_payload)
+    .bind(now.as_str())
+    .execute(&mut *tx)
+    .await
+    .context("insert task running event")?;
+
     tx.commit().await.context("commit claim tx")?;
     drop(sqlite_write);
-
-    append_task_event(
-        state,
-        &task.id,
-        "task.running",
-        json!({"task_id": task.id, "status": STATUS_RUNNING}),
-    )
-    .await?;
 
     Ok(Some(task))
 }

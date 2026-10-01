@@ -77,6 +77,8 @@
 
 - busy/locked retry 必须有上限，避免无限等待。
 
+- `BEGIN IMMEDIATE` 遇到连接恢复期间的 busy/locked 时，重试必须继续共享同一个单调 deadline；固定尝试次数不得在 deadline 尚未到达时提前放弃恢复窗口。
+
 ### REQ-SQLITE-WRITER-006
 
 - 关键写入 lane 必须有结构化 tracing 字段。
@@ -101,13 +103,14 @@
 
 - 生产写入必须使用隔离于普通读池的专用 SQLite write pool，连接数为 1；普通读池维持现有可配置容量。
 - coordinator 对 writer permit、write-pool acquisition、`BEGIN IMMEDIATE`、事务 setup、callback 启动与重试使用同一个单调时钟总 deadline：foreground 为 900 ms，background 为 2500 ms；best-effort 不排队，取得 permit 后沿用 2500 ms 操作预算。deadline 到期后不得启动新的 callback 或重试。
-- SQLite write connection 的 `busy_timeout` 不得超过 100 ms；每次操作最多 4 次尝试，退避为 25/50/100 ms。busy timeout 与退避的最大累计时长为 575 ms，队列、连接池、事务启动和重试开始受总 deadline 限制，不得在重试后重新开始 deadline。
+- SQLite write connection 的 `busy_timeout` 不得超过 100 ms；普通 coordinator callback 最多 4 次尝试，退避为 25/50/100 ms。`BEGIN IMMEDIATE` 在连接恢复期间可在同一个总 deadline 内继续使用 25/50/100 ms 退避，不得被固定尝试次数提前截断。busy timeout 与退避、队列、连接池、事务启动和重试开始都受总 deadline 限制，不得在重试后重新开始 deadline。
 - callback 在 deadline 前启动后不得由 coordinator 的异步 timeout 取消；它必须持有 writer permit 直到返回 SQLite 的实际结果。事务中的 SQLite 语句仍可由 progress handler 在 deadline 后中断。
-- transaction deadline 到期且 COMMIT 尚未派发时，必须在 150 ms cleanup budget 内尝试回滚，不得继续提交。COMMIT 派发前关闭 progress handler；COMMIT 一旦派发，不得因 deadline 取消或中断，必须等待 SQLite 的实际成功或错误结果，即使耗时超过 deadline。已知 `SQLITE_BUSY` 在 deadline 后返回时先回滚并报告 deadline，不得开始重试；其他 COMMIT 错误按实际错误返回，不得仅因当前时间已过 deadline 将其改报为可重试超时。回滚超时或失败时丢弃事务并依赖 SQLx rollback-on-drop 清理；验证连接完成清理后可被 writer pool 复用。
+- transaction deadline 到期且 COMMIT 尚未派发时，必须在 150 ms cleanup budget 内尝试回滚，不得继续提交。COMMIT 派发前关闭 progress handler；COMMIT 一旦派发，不得因 deadline 取消或中断，必须等待 SQLite 的实际成功或错误结果，即使耗时超过 deadline。已知 `SQLITE_BUSY` 在 deadline 后返回时先回滚并报告 deadline，不得开始重试；其他 COMMIT 错误按实际错误返回，不得仅因当前时间已过 deadline 将其改报为可重试超时。事务 future 被取消时必须中断活动 SQLite 语句；专用 writer pool 连接归还时若 transaction depth 仍非零，必须立即硬驱逐不确定连接；普通读池/内存 fallback 则可在同一个 150 ms budget 内完成 queued rollback，只有 transaction depth 已清零且 progress handler 已移除并确认成功的连接才可复用。回滚或连接清理失败/超时时不得复用不确定连接，必须由对应 pool 补建。
 
 ### REQ-SQLITE-WRITER-012
 
 - deadline 到期必须按 lane 语义处理：foreground 返回可识别的 retryable 503；background 将工作延后或持久化重试后结束本次尝试，不得立即自旋；best-effort 跳过写入且不得改变主要用户请求结果。
+- content processing recovery/claim、普通 job claim 与 repo release claim worker 在数据库尝试失败时必须使用有界内存退避，基础等待依次为 1/2/4/8/16/30 秒并封顶 30 秒；抖动只能增加当次等待。每个 worker 同时最多执行一笔同类 claim，成功完成对应 recovery/claim DB 尝试后复位退避；等待期间不得由 tick、notify 或其他循环信号提前绕过。
 - 结构化 `sqlite.write` telemetry 必须包含 `writer_wait_ms`、`pool_wait_ms`、`begin_ms`、`transaction_ms` 与 `deadline_ms`，并可区分 `writer_queue_timeout`、`write_pool_timeout` 与 `sqlite_busy`。
 
 ### SHOULD
@@ -217,6 +220,10 @@
   When 查看结构化 `sqlite.write` telemetry
   Then `writer_wait_ms`、`pool_wait_ms`、`begin_ms`、`transaction_ms` 与 `deadline_ms` 可用，且 writer 队列超时、write-pool 耗尽与 SQLite busy 使用不同原因字段。
 
+- Given content processing recovery/claim、job claim 或 repo release claim 连续遇到 deadline、busy 或连接状态错误
+  When worker 进入下一次 claim loop
+  Then 同类 claim 使用 1/2/4/8/16/30 秒基础退避和不提前的抖动等待；成功 DB 尝试后退避复位，故障解除后任务继续领取且 lease/幂等状态保持正确。
+
 ## Verification
 
 ### VER-SQLITE-WRITER-001
@@ -241,7 +248,7 @@
 
 - Method: coordinator contention tests with independent reader and writer pools, held writer permits, an exhausted reader pool, external `BEGIN IMMEDIATE`, delayed transaction callbacks, a rollback-journal reader that releases after COMMIT dispatch, captured tracing events, and repeated deadline expiry followed by a successful write.
 - covers: REQ-SQLITE-WRITER-011, REQ-SQLITE-WRITER-012
-- Pass condition: foreground p99 stays within 900 ms under bounded contention; writer acquisition succeeds while the reader pool is exhausted; background deadlines persist one delayed retry; callbacks are not started after queue expiry and started callbacks retain the permit until returning; COMMIT dispatched before expiry may succeed after the deadline and reports its actual result; transactions expired before COMMIT roll back and return a reusable connection; telemetry separates writer queue, pool acquisition, SQLite busy time, and late completion.
+- Pass condition: foreground p99 stays within 900 ms under bounded contention; writer acquisition succeeds while the reader pool is exhausted; background deadlines persist one delayed retry; callbacks are not started after queue expiry and started callbacks retain the permit until returning; COMMIT dispatched before expiry may succeed after the deadline and reports its actual result; transactions expired before COMMIT roll back and return a reusable connection or hard-evict an unconfirmed connection; telemetry separates writer queue, pool acquisition, SQLite busy time, connection recovery, and late completion. Fake-clock worker tests prove the required bounded backoff floors without early retry.
 
 ## 验收清单（Acceptance checklist）
 
