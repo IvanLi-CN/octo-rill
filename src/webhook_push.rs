@@ -3185,33 +3185,30 @@ async fn reset_delivery_to_pending(
     deadline: tokio::time::Instant,
 ) -> Result<(), ApiError> {
     let delivery = delivery.to_owned();
-    let pool = state.sqlite_writer.write_pool_or(&state.pool).clone();
-    let write = state
-        .sqlite_writer
-        .write_with_priority_until(
-            "webhook_receiver_delivery_rollback",
-            SqliteWritePriority::Foreground,
-            deadline,
-            |_| {
-            let delivery = delivery.clone();
-            let pool = pool.clone();
-            async move {
-                let mut transaction = pool.begin().await?;
-                sqlx::query(
-                    "UPDATE webhook_push_deliveries SET processing_state = 'pending', processing_started_at = NULL WHERE delivery_id = ? AND processing_state = 'processing'",
-                )
-                .bind(delivery)
-                .execute(&mut *transaction)
-                .await
-                .context("reset GitHub release delivery to pending")?;
-                transaction
-                    .commit()
-                    .await
-                    .context("commit GitHub release delivery rollback")?;
-                Ok(())
-            }
-        },
-        );
+    let write = async {
+        let (permit, mut transaction) = state
+            .sqlite_writer
+            .begin_immediate_with_priority_until(
+                &state.pool,
+                "webhook_receiver_delivery_rollback",
+                SqliteWritePriority::Foreground,
+                deadline,
+            )
+            .await?;
+        sqlx::query(
+            "UPDATE webhook_push_deliveries SET processing_state = 'pending', processing_started_at = NULL WHERE delivery_id = ? AND processing_state = 'processing'",
+        )
+        .bind(delivery)
+        .execute(&mut *transaction)
+        .await
+        .context("reset GitHub release delivery to pending")?;
+        transaction
+            .commit()
+            .await
+            .context("commit GitHub release delivery rollback")?;
+        drop(permit);
+        Ok::<_, anyhow::Error>(())
+    };
     run_receiver_stage("webhook_receiver_delivery_rollback", deadline, write).await
 }
 
@@ -3447,33 +3444,30 @@ pub async fn receive(
         };
     let delivery = delivery.to_owned();
     let queued_task_id = format!("repo-release:{}", repo.id);
-    let pool = state.sqlite_writer.write_pool_or(&state.pool).clone();
-    let queued_update = state
-        .sqlite_writer
-        .write_with_priority_until(
-            "webhook_receiver_delivery_queued",
-            SqliteWritePriority::Foreground,
-            write_deadline,
-            |_| {
-            let delivery = delivery.clone();
-            let queued_task_id = queued_task_id.clone();
-            let pool = pool.clone();
-            async move {
-                let mut transaction = pool.begin().await?;
-                sqlx::query("UPDATE webhook_push_deliveries SET queued_task_id = ?, processing_state = 'queued', processing_started_at = NULL WHERE delivery_id = ?")
-                    .bind(queued_task_id)
-                    .bind(delivery)
-                    .execute(&mut *transaction)
-                    .await
-                    .context("mark GitHub release delivery queued")?;
-                transaction
-                    .commit()
-                    .await
-                    .context("commit GitHub release delivery queued state")?;
-                Ok(())
-            }
-        },
-        );
+    let queued_delivery = delivery.clone();
+    let queued_update = async {
+        let (permit, mut transaction) = state
+            .sqlite_writer
+            .begin_immediate_with_priority_until(
+                &state.pool,
+                "webhook_receiver_delivery_queued",
+                SqliteWritePriority::Foreground,
+                write_deadline,
+            )
+            .await?;
+        sqlx::query("UPDATE webhook_push_deliveries SET queued_task_id = ?, processing_state = 'queued', processing_started_at = NULL WHERE delivery_id = ?")
+            .bind(queued_task_id)
+            .bind(queued_delivery)
+            .execute(&mut *transaction)
+            .await
+            .context("mark GitHub release delivery queued")?;
+        transaction
+            .commit()
+            .await
+            .context("commit GitHub release delivery queued state")?;
+        drop(permit);
+        Ok::<_, anyhow::Error>(())
+    };
     if let Err(error) = run_receiver_stage(
         "webhook_receiver_delivery_queued",
         write_deadline,

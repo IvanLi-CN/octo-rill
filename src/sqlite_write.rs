@@ -249,22 +249,6 @@ impl SqliteWriteCoordinator {
             .await
     }
 
-    pub async fn write_with_priority_until<T, Fut, Op>(
-        &self,
-        lane: &'static str,
-        priority: SqliteWritePriority,
-        deadline_at: Instant,
-        operation: Op,
-    ) -> Result<T>
-    where
-        Op: FnMut(usize) -> Fut,
-        Fut: Future<Output = Result<T>>,
-    {
-        let deadline = deadline_at.saturating_duration_since(Instant::now());
-        self.write_with_deadline(lane, priority, deadline_at, deadline, operation)
-            .await
-    }
-
     async fn write_with_deadline<T, Fut, Op>(
         &self,
         lane: &'static str,
@@ -2162,9 +2146,15 @@ mod tests {
             .finish();
         let _default_guard = tracing::subscriber::set_default(subscriber);
         let started = Instant::now();
+        let deadline_at = Instant::now() + Duration::from_millis(50);
 
         let error = match coordinator
-            .begin_immediate(&read_pool, "pool_timeout")
+            .begin_immediate_with_priority_until(
+                &read_pool,
+                "pool_timeout",
+                SqliteWritePriority::Foreground,
+                deadline_at,
+            )
             .await
         {
             Ok(_) => panic!("writer pool acquisition should time out"),
