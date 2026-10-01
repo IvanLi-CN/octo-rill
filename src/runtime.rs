@@ -108,7 +108,7 @@ pub async fn register_runtime_owner(state: &AppState) -> Result<()> {
             .bind(now.as_str())
             .bind(now.as_str())
             .bind(now.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to register runtime owner")?;
             Ok::<(), anyhow::Error>(())
@@ -130,7 +130,7 @@ pub async fn unregister_runtime_owner(state: &AppState) -> Result<()> {
                 "#,
             )
             .bind(state.runtime_owner_id.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to unregister runtime owner")?;
             Ok::<(), anyhow::Error>(())
@@ -198,7 +198,7 @@ async fn touch_runtime_owner_lease(state: &AppState) -> Result<()> {
                 .bind(now.as_str())
                 .bind(now.as_str())
                 .bind(state.runtime_owner_id.as_str())
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("failed to heartbeat runtime owner")?
                 .rows_affected(),
@@ -227,7 +227,7 @@ async fn prune_stale_runtime_owners(state: &AppState) -> Result<()> {
             )
             .bind(state.runtime_owner_id.as_str())
             .bind(cutoff.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to prune stale runtime owners")?;
             Ok::<(), anyhow::Error>(())

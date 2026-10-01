@@ -135,7 +135,7 @@ impl ApiKeyLastUsedTouchQueue {
                     .bind(touch.used_at.as_str())
                     .bind(api_key_id.as_str())
                     .bind(touch.used_at.as_str())
-                    .execute(&touch.pool)
+                    .execute(touch.sqlite_writer.write_pool_or(&touch.pool))
                     .await?;
                     Ok::<(), anyhow::Error>(())
                 })

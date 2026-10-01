@@ -4,6 +4,8 @@
 
 ## Decision Trace
 
+- 2026-10-01：PR3.9 收紧 SQLite 写入总时限，新增独立单连接 writer pool、foreground/background deadline、best-effort 不排队和分阶段 telemetry；deadline transaction 使用 SQLite progress handler 中断长 SQL，并限制回滚清理预算，后台 job 超时持久化延后重试。内容提交保留事务内的持久化路由刷新，但模型档案只读已加载的 scheduler 状态，避免模型目录网络刷新占用 writer。
+- 2026-10-01：复核发现异步取消可能丢失已派发 COMMIT 的真实结果并误报可重试 deadline；确认采用“派发前受 deadline 限制、派发后等待 SQLite 结果”的合约，callback/COMMIT 晚完成保留真实结果并记录超期，提交前过期仍显式回滚。
 - 2026-09-30：复核 stale worker、运行时配置失败回滚与 repo release terminal transition 后，决定把 LLM owner/status CAS、recovery/finalize event 与状态更新、repo release work item/watchers/governance 终态更新统一收进同一 coordinator transaction；admin runtime PATCH 由共享 lock 串行化，并在 live apply 失败时用单事务恢复持久化快照。
 - 2026-09-29：PR3.8 复核高竞争 SQLite 生产写入边界后，决定把 admin runtime settings、LLM recovery/model health、translation worker runtime slots、reaction PAT 与高频 API/sync metadata 写入统一接入共享 coordinator，并用 AST source guard 防止后续 direct pool write 回退；translation runtime production helper 同时移除可选 writer fallback。
 - 2026-05-09：线上 `octo-rill` 容器在高 worker 并发下出现 `database is locked`、慢 SQL 与 500；决定保留业务并发，不通过降低 worker 数量或 SQLite pool=1 解决。

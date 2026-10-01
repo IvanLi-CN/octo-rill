@@ -247,7 +247,8 @@ pub async fn transition_to_global_state(state: &AppState, switch_token: &str) ->
         .begin_immediate(&state.pool, "content_processing_cutover")
         .await
         .context("failed to begin serialized content mode transition")?;
-    let changed = transition_to_global_in_transaction(&mut tx, switch_token).await?;
+    let changed =
+        transition_to_global_in_transaction(tx.as_transaction_mut(), switch_token).await?;
     tx.commit()
         .await
         .context("failed to commit content mode transition")?;
@@ -263,7 +264,8 @@ pub async fn transition_to_rollback_freeze_state(
         .begin_immediate(&state.pool, "content_processing_freeze")
         .await
         .context("failed to begin serialized content freeze")?;
-    let changed = transition_to_rollback_freeze_in_transaction(&mut tx, switch_token).await?;
+    let changed =
+        transition_to_rollback_freeze_in_transaction(tx.as_transaction_mut(), switch_token).await?;
     tx.commit()
         .await
         .context("failed to commit content freeze")?;
@@ -639,7 +641,7 @@ pub async fn on_runtime_configuration_reload(state: &AppState) -> Result<()> {
             .sqlite_writer
             .begin_immediate(&state.pool, "content_processing_startup_reconciliation")
             .await?;
-        supersede_stale_work_in_transaction(&mut tx).await?;
+        supersede_stale_work_in_transaction(tx.as_transaction_mut()).await?;
         tx.commit().await?;
     }
     let mut requeued = 0_i64;
@@ -648,13 +650,14 @@ pub async fn on_runtime_configuration_reload(state: &AppState) -> Result<()> {
             .sqlite_writer
             .begin_immediate(&state.pool, "content_identity_config_recovery")
             .await?;
-        if !has_valid_runtime_configuration_in_transaction(state, &mut tx).await? {
+        if !has_valid_runtime_configuration_in_transaction(state, tx.as_transaction_mut()).await? {
             tx.rollback().await?;
             break;
         }
         let now = Utc::now().to_rfc3339();
         let (batch_requeued, has_more) =
-            content_identity_upgrade::requeue_blocked_config_batch(&mut tx, &now).await?;
+            content_identity_upgrade::requeue_blocked_config_batch(tx.as_transaction_mut(), &now)
+                .await?;
         tx.commit().await?;
         requeued = requeued.saturating_add(batch_requeued);
         if !has_more {
@@ -671,11 +674,11 @@ pub async fn on_runtime_configuration_reload(state: &AppState) -> Result<()> {
 }
 
 async fn current_model_profile(state: &AppState) -> String {
-    let selected = ai::select_model_for_new_calls(state).await;
-    if selected.model.trim().is_empty() {
+    let selected = ai::model_for_new_calls(state).await;
+    if selected.trim().is_empty() {
         "ai-disabled".to_owned()
     } else {
-        selected.model
+        selected
     }
 }
 
@@ -1057,10 +1060,11 @@ pub async fn submit_item(
         .begin_immediate(&state.pool, "content_processing_submit")
         .await
         .map_err(ApiError::internal)?;
-    ensure_global_mode_in_transaction(&mut tx).await?;
-    let configuration_valid = has_valid_runtime_configuration_in_transaction(state, &mut tx)
-        .await
-        .map_err(ApiError::internal)?;
+    ensure_global_mode_in_transaction(tx.as_transaction_mut()).await?;
+    let configuration_valid =
+        has_valid_runtime_configuration_in_transaction(state, tx.as_transaction_mut())
+            .await
+            .map_err(ApiError::internal)?;
     let model_profile = current_model_profile(state).await;
     let identity = content_identity_upgrade::ContentWorkIdentity {
         canonical_resource_type: resource_type.to_owned(),
@@ -1071,22 +1075,33 @@ pub async fn submit_item(
         source_hash: hash.clone(),
         protocol_version: GLOBAL_PROTOCOL_VERSION.to_owned(),
     };
-    let identity_id =
-        content_identity_upgrade::ensure_identity_registered(&mut tx, &identity, &now)
-            .await
-            .map_err(ApiError::internal)?;
-    content_identity_upgrade::ensure_all_identity_members(&mut tx, &identity, &identity_id, &now)
-        .await
-        .map_err(ApiError::internal)?;
-    let current_projection =
-        content_identity_upgrade::ensure_current_projection_for_key(&mut tx, &identity_id, &now)
-            .await
-            .map_err(ApiError::internal)?;
+    let identity_id = content_identity_upgrade::ensure_identity_registered(
+        tx.as_transaction_mut(),
+        &identity,
+        &now,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    content_identity_upgrade::ensure_all_identity_members(
+        tx.as_transaction_mut(),
+        &identity,
+        &identity_id,
+        &now,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    let current_projection = content_identity_upgrade::ensure_current_projection_for_key(
+        tx.as_transaction_mut(),
+        &identity_id,
+        &now,
+    )
+    .await
+    .map_err(ApiError::internal)?;
     // The registry is authoritative for identity; model_profile only records
     // the provenance of retained model-specific work rows.
     let existing = if let Some(projection) = current_projection.as_ref() {
         Some(
-            load_work_by_id(&mut tx, &projection.work_item_id)
+            load_work_by_id(tx.as_transaction_mut(), &projection.work_item_id)
                 .await
                 .map_err(ApiError::internal)?,
         )
@@ -1101,12 +1116,13 @@ pub async fn submit_item(
     };
     let existing_work = existing.is_some();
     if let Some(existing) = existing.as_ref()
-        && let Some(current) = newer_work_for_resource_in_transaction(&mut tx, existing)
-            .await
-            .map_err(ApiError::internal)?
+        && let Some(current) =
+            newer_work_for_resource_in_transaction(tx.as_transaction_mut(), existing)
+                .await
+                .map_err(ApiError::internal)?
     {
         record_work_admission_event(
-            &mut tx,
+            tx.as_transaction_mut(),
             WorkAdmissionEvent {
                 work_item_id: &existing.id,
                 event_type: "admission_rejected_superseded",
@@ -1120,11 +1136,11 @@ pub async fn submit_item(
         )
         .await
         .map_err(ApiError::internal)?;
-        let current_projection = load_projection(&mut tx, &current)
+        let current_projection = load_projection(tx.as_transaction_mut(), &current)
             .await
             .map_err(ApiError::internal)?;
         insert_request_link(
-            &mut tx,
+            tx.as_transaction_mut(),
             &request_id,
             &current.id,
             user_id,
@@ -1159,7 +1175,7 @@ pub async fn submit_item(
         existing
     } else {
         let newer_source = newer_work_for_source_in_transaction(
-            &mut tx,
+            tx.as_transaction_mut(),
             WorkResourceKey {
                 canonical_resource_type: resource_type,
                 canonical_resource_id: &item.entity_id,
@@ -1223,19 +1239,19 @@ pub async fn submit_item(
         .await
         .map_err(ApiError::internal)?;
         content_identity_upgrade::ensure_all_identity_members(
-            &mut tx,
+            tx.as_transaction_mut(),
             &identity,
             &identity_id,
             &now,
         )
         .await
         .map_err(ApiError::internal)?;
-        load_work_by_id(&mut tx, &work_id)
+        load_work_by_id(tx.as_transaction_mut(), &work_id)
             .await
             .map_err(ApiError::internal)?
     };
     if !existing_work {
-        supersede_older_work_in_transaction(&mut tx, &work)
+        supersede_older_work_in_transaction(tx.as_transaction_mut(), &work)
             .await
             .map_err(ApiError::internal)?;
     }
@@ -1282,14 +1298,14 @@ pub async fn submit_item(
     let projection = if let Some(projection) = current_projection {
         serde_json::from_str(&projection.payload_json).ok()
     } else {
-        load_projection(&mut tx, &work)
+        load_projection(tx.as_transaction_mut(), &work)
             .await
             .map_err(ApiError::internal)?
     };
     let superseded_replacement_id = if work.status == "superseded" {
         match supersedes_work_item_id.clone() {
             Some(work_item_id) => Some(work_item_id),
-            None => newer_work_for_resource_in_transaction(&mut tx, &work)
+            None => newer_work_for_resource_in_transaction(tx.as_transaction_mut(), &work)
                 .await
                 .map_err(ApiError::internal)?
                 .map(|current| current.id),
@@ -1306,7 +1322,7 @@ pub async fn submit_item(
         "admission_accepted"
     };
     record_work_admission_event(
-        &mut tx,
+        tx.as_transaction_mut(),
         WorkAdmissionEvent {
             work_item_id: &work.id,
             event_type: admission_event,
@@ -1326,14 +1342,14 @@ pub async fn submit_item(
     .map_err(ApiError::internal)?;
 
     if let Some(current_work_item_id) = superseded_replacement_id.as_deref() {
-        let current = load_work_by_id(&mut tx, current_work_item_id)
+        let current = load_work_by_id(tx.as_transaction_mut(), current_work_item_id)
             .await
             .map_err(ApiError::internal)?;
-        let current_projection = load_projection(&mut tx, &current)
+        let current_projection = load_projection(tx.as_transaction_mut(), &current)
             .await
             .map_err(ApiError::internal)?;
         insert_request_link(
-            &mut tx,
+            tx.as_transaction_mut(),
             &request_id,
             &current.id,
             user_id,
@@ -1394,7 +1410,7 @@ pub async fn submit_item(
         ));
     }
     insert_request_link(
-        &mut tx,
+        tx.as_transaction_mut(),
         &request_id,
         &work.id,
         user_id,
@@ -1784,10 +1800,11 @@ pub async fn retry_request(
         .begin_immediate(&state.pool, "content_processing_retry")
         .await
         .map_err(ApiError::internal)?;
-    ensure_global_mode_in_transaction(&mut tx).await?;
-    let configuration_valid = has_valid_runtime_configuration_in_transaction(state, &mut tx)
-        .await
-        .map_err(ApiError::internal)?;
+    ensure_global_mode_in_transaction(tx.as_transaction_mut()).await?;
+    let configuration_valid =
+        has_valid_runtime_configuration_in_transaction(state, tx.as_transaction_mut())
+            .await
+            .map_err(ApiError::internal)?;
     let mut row = sqlx::query_as::<_, WorkRow>(
         "SELECT w.id, w.canonical_resource_type, w.canonical_resource_id, w.pipeline, w.variant, w.target_lang, w.source_hash, w.protocol_version, w.model_profile, w.source_snapshot_json, w.configuration_fingerprint, w.status, w.priority, w.cache_hit, w.token_estimate, w.batch_id, w.attempt_count, w.next_retry_at, w.retry_expires_at, w.retry_after_at, w.created_at FROM content_request_links l JOIN content_work_items w ON w.id = l.work_item_id WHERE l.request_id = ? AND l.requester_id = ? LIMIT 1",
     )
@@ -1800,15 +1817,25 @@ pub async fn retry_request(
     let requested_row = row.clone();
     let key = identity_from_work(&row);
     let now = Utc::now().to_rfc3339();
-    let identity_id = content_identity_upgrade::ensure_identity_registered(&mut tx, &key, &now)
-        .await
-        .map_err(ApiError::internal)?;
-    content_identity_upgrade::ensure_all_identity_members(&mut tx, &key, &identity_id, &now)
-        .await
-        .map_err(ApiError::internal)?;
-    content_identity_upgrade::ensure_current_projection_for_key(&mut tx, &identity_id, &now)
-        .await
-        .map_err(ApiError::internal)?;
+    let identity_id =
+        content_identity_upgrade::ensure_identity_registered(tx.as_transaction_mut(), &key, &now)
+            .await
+            .map_err(ApiError::internal)?;
+    content_identity_upgrade::ensure_all_identity_members(
+        tx.as_transaction_mut(),
+        &key,
+        &identity_id,
+        &now,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    content_identity_upgrade::ensure_current_projection_for_key(
+        tx.as_transaction_mut(),
+        &identity_id,
+        &now,
+    )
+    .await
+    .map_err(ApiError::internal)?;
     let producer_ref = sqlx::query_scalar::<_, String>(
         "SELECT producer_ref FROM content_request_links WHERE request_id = ? LIMIT 1",
     )
@@ -1816,13 +1843,14 @@ pub async fn retry_request(
     .fetch_one(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
-    if let Some(current) = newer_work_for_resource_in_transaction(&mut tx, &requested_row)
-        .await
-        .map_err(ApiError::internal)?
+    if let Some(current) =
+        newer_work_for_resource_in_transaction(tx.as_transaction_mut(), &requested_row)
+            .await
+            .map_err(ApiError::internal)?
     {
         if requested_row.status != "superseded" {
             supersede_work_in_transaction(
-                &mut tx,
+                tx.as_transaction_mut(),
                 &requested_row,
                 Some(&current.id),
                 "newer_source_detected_before_manual_retry",
@@ -1832,7 +1860,7 @@ pub async fn retry_request(
         }
         let new_request_id = local_id::generate_local_id().to_string();
         insert_request_link(
-            &mut tx,
+            tx.as_transaction_mut(),
             &new_request_id,
             &current.id,
             user_id,
@@ -1842,7 +1870,7 @@ pub async fn retry_request(
         .await
         .map_err(ApiError::internal)?;
         record_work_admission_event(
-            &mut tx,
+            tx.as_transaction_mut(),
             WorkAdmissionEvent {
                 work_item_id: &requested_row.id,
                 event_type: "admission_rejected_superseded",
@@ -1856,7 +1884,7 @@ pub async fn retry_request(
         )
         .await
         .map_err(ApiError::internal)?;
-        let current_projection = load_projection(&mut tx, &current)
+        let current_projection = load_projection(tx.as_transaction_mut(), &current)
             .await
             .map_err(ApiError::internal)?;
         tx.commit().await.map_err(ApiError::internal)?;
@@ -1871,13 +1899,13 @@ pub async fn retry_request(
         });
         return Ok((StatusCode::CONFLICT, body));
     }
-    if let Some(current) = work_for_identity_in_transaction(&mut tx, &key)
+    if let Some(current) = work_for_identity_in_transaction(tx.as_transaction_mut(), &key)
         .await
         .map_err(ApiError::internal)?
     {
         row = current;
     }
-    let projection = load_projection(&mut tx, &row)
+    let projection = load_projection(tx.as_transaction_mut(), &row)
         .await
         .map_err(ApiError::internal)?;
     if matches!(
@@ -1886,7 +1914,7 @@ pub async fn retry_request(
     ) {
         let new_request_id = local_id::generate_local_id().to_string();
         insert_request_link(
-            &mut tx,
+            tx.as_transaction_mut(),
             &new_request_id,
             &row.id,
             user_id,
@@ -1912,7 +1940,7 @@ pub async fn retry_request(
     {
         let new_request_id = local_id::generate_local_id().to_string();
         insert_request_link(
-            &mut tx,
+            tx.as_transaction_mut(),
             &new_request_id,
             &row.id,
             user_id,
@@ -1960,7 +1988,7 @@ pub async fn retry_request(
         .await
         .map_err(ApiError::internal)?;
     insert_request_link(
-        &mut tx,
+        tx.as_transaction_mut(),
         &request_id,
         &row.id,
         user_id,
@@ -1993,8 +2021,8 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_claim")
         .await?;
-    ensure_global_mode_in_transaction(&mut tx).await?;
-    refresh_model_routes_in_transaction(state, &mut tx).await?;
+    ensure_global_mode_in_transaction(tx.as_transaction_mut()).await?;
+    refresh_model_routes_in_transaction(state, tx.as_transaction_mut()).await?;
     let attempt_snapshot = current_attempt_route_snapshot(state).await;
     let Some(row) = sqlx::query_as::<_, WorkRow>(
         "SELECT id, canonical_resource_type, canonical_resource_id, pipeline, variant, target_lang, source_hash, protocol_version, model_profile, source_snapshot_json, configuration_fingerprint, status, priority, cache_hit, token_estimate, batch_id, attempt_count, next_retry_at, retry_expires_at, retry_after_at, created_at FROM content_work_items WHERE status = 'queued' AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now')) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime('now')) AND ((priority < 3 AND datetime(created_at) <= datetime('now', '-60 seconds')) OR (priority >= 3 AND EXISTS (SELECT 1 FROM content_attempt_events pending WHERE pending.work_item_id = content_work_items.id AND pending.event_type = 'attempt_queued' AND pending.trigger = 'manual_retry' AND NOT EXISTS (SELECT 1 FROM content_attempt_events started WHERE started.work_item_id = pending.work_item_id AND started.attempt_no = pending.attempt_no AND started.event_type = 'attempt_started')) AND (SELECT COUNT(*) FROM content_batches WHERE status = 'running' AND trigger_reason = 'manual_retry') < ?)) ORDER BY priority DESC, datetime(created_at) ASC, id ASC LIMIT 1",
@@ -2006,13 +2034,15 @@ async fn claim_next(state: &AppState, manual_limit: i64) -> Result<Option<WorkRo
         tx.commit().await?;
         return Ok(None);
     };
-    if let Some(current) = newer_work_for_resource_in_transaction(&mut tx, &row).await? {
+    if let Some(current) =
+        newer_work_for_resource_in_transaction(tx.as_transaction_mut(), &row).await?
+    {
         sqlx::query("UPDATE content_work_items SET status = 'superseded', next_retry_at = NULL, retry_after_at = NULL, finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'queued'")
             .bind(&row.id)
             .execute(&mut *tx)
             .await?;
         record_work_admission_event(
-            &mut tx,
+            tx.as_transaction_mut(),
             WorkAdmissionEvent {
                 work_item_id: &row.id,
                 event_type: "reconciliation_superseded",
@@ -2157,8 +2187,8 @@ async fn recover_due(state: &AppState) -> Result<()> {
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_recover")
         .await?;
-    ensure_global_mode_in_transaction(&mut tx).await?;
-    supersede_stale_work_in_transaction(&mut tx).await?;
+    ensure_global_mode_in_transaction(tx.as_transaction_mut()).await?;
+    supersede_stale_work_in_transaction(tx.as_transaction_mut()).await?;
     sqlx::query(
         "INSERT OR IGNORE INTO content_attempt_events (id, work_item_id, attempt_no, trigger, event_type, result_status, retry_eligible, created_at) SELECT lower(hex(randomblob(16))), id, CASE WHEN attempt_count < 1 THEN 1 ELSE attempt_count + 1 END, 'automatic_recovery', 'attempt_queued', 'queued', 1, ? FROM content_work_items WHERE status IN ('failed', 'deferred_provider') AND next_retry_at IS NOT NULL AND datetime(next_retry_at) <= datetime(?) AND (retry_expires_at IS NULL OR datetime(retry_expires_at) > datetime(?))",
     )
@@ -2303,7 +2333,7 @@ async fn defer_queued_for_provider(state: &AppState) -> Result<()> {
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_defer_provider")
         .await?;
-    ensure_global_mode_in_transaction(&mut tx).await?;
+    ensure_global_mode_in_transaction(tx.as_transaction_mut()).await?;
     sqlx::query("UPDATE content_work_items SET status = 'deferred_provider', priority = 0, next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), updated_at = CURRENT_TIMESTAMP WHERE status = 'queued'")
         .bind(&retry_at)
         .bind((Utc::now() + chrono::Duration::hours(24)).to_rfc3339())
@@ -2993,7 +3023,10 @@ async fn admit_provider_call(
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_provider_admission")
         .await?;
-    if ensure_global_mode_in_transaction(&mut tx).await.is_err() {
+    if ensure_global_mode_in_transaction(tx.as_transaction_mut())
+        .await
+        .is_err()
+    {
         tx.rollback().await?;
         return Ok(false);
     }
@@ -3010,14 +3043,14 @@ async fn admit_provider_call(
         tx.rollback().await?;
         return Ok(false);
     }
-    if !source_exists_in_transaction(&mut tx, work).await? {
-        cancel_deleted_work_in_transaction(&mut tx, work).await?;
+    if !source_exists_in_transaction(tx.as_transaction_mut(), work).await? {
+        cancel_deleted_work_in_transaction(tx.as_transaction_mut(), work).await?;
         tx.commit().await?;
         return Ok(false);
     }
-    if !source_revision_is_current_in_transaction(&mut tx, work).await? {
+    if !source_revision_is_current_in_transaction(tx.as_transaction_mut(), work).await? {
         supersede_work_in_transaction(
-            &mut tx,
+            tx.as_transaction_mut(),
             work,
             None,
             "source_revision_changed_before_provider",
@@ -3026,7 +3059,7 @@ async fn admit_provider_call(
         tx.commit().await?;
         return Ok(false);
     }
-    if supersede_replaced_work_in_transaction(&mut tx, work).await? {
+    if supersede_replaced_work_in_transaction(tx.as_transaction_mut(), work).await? {
         tx.commit().await?;
         return Ok(false);
     }
@@ -3552,11 +3585,11 @@ async fn cancel_deleted_work(state: &AppState, work: &WorkRow) -> Result<()> {
         .sqlite_writer
         .begin_immediate(&state.pool, "content_processing_cancel_deleted")
         .await?;
-    ensure_global_mode_in_transaction(&mut tx)
+    ensure_global_mode_in_transaction(tx.as_transaction_mut())
         .await
         .map_err(|error| anyhow!(error.to_string()))?;
-    cancel_deleted_work_in_transaction(&mut tx, work).await?;
-    tx.commit().await.map_err(Into::into)
+    cancel_deleted_work_in_transaction(tx.as_transaction_mut(), work).await?;
+    tx.commit().await
 }
 
 async fn cancel_deleted_work_in_transaction(
@@ -3738,7 +3771,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             .sqlite_writer
             .begin_immediate(&state.pool, "content_processing_defer_model")
             .await?;
-        ensure_global_mode_in_transaction(&mut tx)
+        ensure_global_mode_in_transaction(tx.as_transaction_mut())
             .await
             .map_err(|error| anyhow!(error.to_string()))?;
         let updated = sqlx::query("UPDATE content_work_items SET status = 'deferred_provider', next_retry_at = ?, retry_expires_at = COALESCE(retry_expires_at, ?), retry_after_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND status = 'running' AND attempt_count = ?")
@@ -3791,14 +3824,15 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             .await?;
     if mode.as_deref() != Some(ContentProcessingMode::Global.as_str()) {
         supersede_work_with_event_in_transaction(
-            &mut tx,
+            tx.as_transaction_mut(),
             &work,
             None,
             "reconciliation_superseded",
             "processing_mode_changed_after_provider",
         )
         .await?;
-        persist_superseded_provider_call_audits(&mut tx, &work, &result, &now).await?;
+        persist_superseded_provider_call_audits(tx.as_transaction_mut(), &work, &result, &now)
+            .await?;
         tx.commit().await?;
         return Ok(());
     }
@@ -3812,30 +3846,34 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
     .fetch_one(&mut *tx)
     .await?;
     if claim_is_current == 0 {
-        persist_superseded_provider_call_audits(&mut tx, &work, &result, &now).await?;
+        persist_superseded_provider_call_audits(tx.as_transaction_mut(), &work, &result, &now)
+            .await?;
         tx.commit().await?;
         return Ok(());
     }
-    if !source_exists_in_transaction(&mut tx, &work).await? {
-        cancel_deleted_work_in_transaction(&mut tx, &work).await?;
-        persist_superseded_provider_call_audits(&mut tx, &work, &result, &now).await?;
+    if !source_exists_in_transaction(tx.as_transaction_mut(), &work).await? {
+        cancel_deleted_work_in_transaction(tx.as_transaction_mut(), &work).await?;
+        persist_superseded_provider_call_audits(tx.as_transaction_mut(), &work, &result, &now)
+            .await?;
         tx.commit().await?;
         return Ok(());
     }
-    if !source_revision_is_current_in_transaction(&mut tx, &work).await? {
+    if !source_revision_is_current_in_transaction(tx.as_transaction_mut(), &work).await? {
         supersede_work_in_transaction(
-            &mut tx,
+            tx.as_transaction_mut(),
             &work,
             None,
             "source_revision_changed_before_publication",
         )
         .await?;
-        persist_superseded_provider_call_audits(&mut tx, &work, &result, &now).await?;
+        persist_superseded_provider_call_audits(tx.as_transaction_mut(), &work, &result, &now)
+            .await?;
         tx.commit().await?;
         return Ok(());
     }
-    if supersede_replaced_work_in_transaction(&mut tx, &work).await? {
-        persist_superseded_provider_call_audits(&mut tx, &work, &result, &now).await?;
+    if supersede_replaced_work_in_transaction(tx.as_transaction_mut(), &work).await? {
+        persist_superseded_provider_call_audits(tx.as_transaction_mut(), &work, &result, &now)
+            .await?;
         tx.commit().await?;
         return Ok(());
     }
@@ -3861,7 +3899,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             for call_id in &call_ids {
                 call_audits.push((
                     call_id.clone(),
-                    load_llm_call_audit(&mut tx, call_id).await?,
+                    load_llm_call_audit(tx.as_transaction_mut(), call_id).await?,
                 ));
             }
             let final_audit = call_audits
@@ -3971,8 +4009,12 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                 .bind(&now)
                 .fetch_one(&mut *tx)
                 .await?;
-            let identity_id =
-                content_identity_upgrade::ensure_identity_for_work(&mut tx, &work.id, &now).await?;
+            let identity_id = content_identity_upgrade::ensure_identity_for_work(
+                tx.as_transaction_mut(),
+                &work.id,
+                &now,
+            )
+            .await?;
             sqlx::query("INSERT INTO content_current_result_projections (identity_id, work_item_id, active_work_item_id, source_projection_id, payload_json, published_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(identity_id) DO UPDATE SET work_item_id = excluded.work_item_id, active_work_item_id = excluded.active_work_item_id, source_projection_id = excluded.source_projection_id, payload_json = excluded.payload_json, published_at = excluded.published_at, updated_at = excluded.updated_at")
                 .bind(identity_id)
                 .bind(&work.id)
@@ -4046,7 +4088,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             for call_id in &linked_call_ids {
                 call_audits.push((
                     call_id.clone(),
-                    load_llm_call_audit(&mut tx, call_id).await?,
+                    load_llm_call_audit(tx.as_transaction_mut(), call_id).await?,
                 ));
             }
             let link_status = if output_validation_error_code(&error).is_some() {
@@ -4057,7 +4099,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
             if call_audits.is_empty() {
                 let audit_call_id = local_id::generate_local_id().to_string();
                 if let Err(audit_error) = persist_attempt_llm_call_audit(
-                    &mut tx,
+                    tx.as_transaction_mut(),
                     AttemptLlmCallAudit {
                         audit_call_id: &audit_call_id,
                         attempt_event_id: &attempt_event_id,
@@ -4104,7 +4146,7 @@ async fn execute(state: &AppState, work: WorkRow) -> Result<()> {
                         &mut used_provider_call_ids,
                     );
                     if let Err(audit_error) = persist_attempt_llm_call_audit(
-                        &mut tx,
+                        tx.as_transaction_mut(),
                         AttemptLlmCallAudit {
                             audit_call_id: call_id,
                             attempt_event_id: &attempt_event_id,

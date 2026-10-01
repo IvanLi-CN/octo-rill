@@ -24,7 +24,7 @@ use crate::{
     api,
     error::ApiError,
     jobs::{self, EnqueuedTask, NewTask},
-    sqlite_write::{SqliteWritePriority, is_sqlite_busy_error},
+    sqlite_write::{SqliteWritePriority, is_sqlite_busy_error, is_sqlite_write_deadline_error},
     state::AppState,
     sync,
 };
@@ -390,7 +390,7 @@ async fn clear_pat_scope_observation(state: &AppState, user_id: &str) -> Result<
             )
             .bind(Utc::now().to_rfc3339())
             .bind(user_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("clear webhook PAT scope observation")
         })
@@ -514,7 +514,7 @@ async fn validate_pat_with_github(
                 .bind(&github_user.login)
                 .bind(&now)
                 .bind(user_id)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("persist webhook PAT owner login")
             })
@@ -534,7 +534,7 @@ async fn validate_pat_with_github(
             .bind(scope_observation)
             .bind(&now)
             .bind(user_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("persist webhook PAT scope observation")
         })
@@ -1050,7 +1050,7 @@ pub async fn patch_settings(
                 .bind(&user_id)
                 .bind(&config.webhook_push_desired_state)
                 .bind(config.webhook_push_enabled)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await?;
             Ok::<_, anyhow::Error>(updated.rows_affected())
         })
@@ -1107,7 +1107,7 @@ pub async fn patch_settings(
                     .bind(&user_id)
                     .bind(jobs::STATUS_QUEUED)
                     .bind(jobs::STATUS_RUNNING)
-                    .execute(&state.pool)
+                    .execute(state.sqlite_writer.write_pool_or(&state.pool))
                     .await?;
                     Ok::<_, anyhow::Error>(())
                 })
@@ -1382,7 +1382,7 @@ async fn acknowledge_reconcile_generation(
             .bind(Utc::now().to_rfc3339())
             .bind(user_id)
             .bind(generation)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("acknowledge webhook reconcile generation")
             .map(|_| ())
@@ -1877,7 +1877,7 @@ async fn pause_user_repos_for_permission_error(
             .bind(&message)
             .bind(&now)
             .bind(user_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("persist webhook permission pause")
         })
@@ -1951,7 +1951,7 @@ async fn persist_repo_state(
             .bind(registered_at.as_deref())
             .bind(&now)
             .bind(clear_permission_pause)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("persist webhook repo state")
         })
@@ -2102,7 +2102,7 @@ async fn run_repo_operation(
                         )
                         .bind(user_id)
                         .bind(repo.repo_id)
-                        .execute(&state.pool)
+                        .execute(state.sqlite_writer.write_pool_or(&state.pool))
                         .await
                         .context("delete already absent webhook repo state")
                     })
@@ -2131,7 +2131,7 @@ async fn run_repo_operation(
                     .bind(&now)
                     .bind(user_id)
                     .bind(repo.repo_id)
-                    .execute(&state.pool)
+                    .execute(state.sqlite_writer.write_pool_or(&state.pool))
                     .await
                     .context("persist missing webhook repo")
                 })
@@ -2188,7 +2188,7 @@ async fn run_repo_operation(
                         )
                         .bind(user_id)
                         .bind(repo.repo_id)
-                        .execute(&state.pool)
+                        .execute(state.sqlite_writer.write_pool_or(&state.pool))
                         .await
                         .context("delete webhook repo state")
                     })
@@ -2326,7 +2326,7 @@ async fn try_acquire_user_operation_lease(
             .bind(task_id)
             .bind(&expires_at)
             .bind(&now_rfc3339)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("acquire webhook operation lease")
         })
@@ -2345,7 +2345,7 @@ async fn renew_user_operation_lease(state: &AppState, user_id: &str, task_id: &s
             .bind(&expires_at)
             .bind(user_id)
             .bind(task_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("renew webhook operation lease")
         })
@@ -2369,7 +2369,7 @@ async fn release_user_operation_lease(
             )
             .bind(user_id)
             .bind(task_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("release webhook operation lease")
         })
@@ -2639,7 +2639,7 @@ async fn execute_for_user_locked(
                             .bind(&now)
                             .bind(user_id)
                             .bind(repo.repo_id)
-                            .execute(&state.pool)
+                            .execute(state.sqlite_writer.write_pool_or(&state.pool))
                             .await
                             .context("persist webhook repo error")
                         })
@@ -2762,7 +2762,7 @@ async fn execute_for_user_locked(
                 .bind(&now)
                 .bind(&now)
                 .bind(user_id)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("persist webhook push last completed check")
             })
@@ -2961,7 +2961,7 @@ pub async fn execute_audit_task(state: &AppState, task_id: &str, payload: &Value
         .write("webhook_push_delivery_retention", |_| async {
             sqlx::query("DELETE FROM webhook_push_deliveries WHERE received_at < ?")
                 .bind(&cutoff)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("prune webhook delivery history")
         })
@@ -3006,7 +3006,7 @@ pub async fn execute_audit_task(state: &AppState, task_id: &str, payload: &Value
             sqlx::query("UPDATE admin_runtime_settings SET webhook_push_audit_last_started_at = ?, updated_at = ? WHERE id = 1")
                 .bind(&now)
                 .bind(&now)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("persist webhook push audit completion")
         })
@@ -3068,7 +3068,7 @@ pub async fn admin_patch_runtime_config(
             sqlx::query("UPDATE admin_runtime_settings SET webhook_push_audit_interval_days = ?, updated_at = ? WHERE id = 1")
                 .bind(request.audit_interval_days)
                 .bind(&now)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("persist webhook push audit interval")
         })
@@ -3156,9 +3156,13 @@ async fn run_receiver_stage<T, Fut>(
 where
     Fut: Future<Output = Result<T>>,
 {
-    match tokio::time::timeout_at(deadline, future).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) if is_sqlite_busy_error(error.as_ref()) => {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(receiver_retryable_error(operation, "deadline_exceeded"));
+    }
+
+    match future.await {
+        Ok(value) => Ok(value),
+        Err(error) if is_sqlite_busy_error(error.as_ref()) => {
             warn!(
                 event = "webhook.receiver_write",
                 operation,
@@ -3168,8 +3172,10 @@ where
             );
             Err(receiver_retryable_error(operation, "sqlite_busy"))
         }
-        Ok(Err(error)) => Err(ApiError::internal(error)),
-        Err(_) => Err(receiver_retryable_error(operation, "deadline_exceeded")),
+        Err(error) if is_sqlite_write_deadline_error(error.as_ref()) => {
+            Err(receiver_retryable_error(operation, "deadline_exceeded"))
+        }
+        Err(error) => Err(ApiError::internal(error)),
     }
 }
 
@@ -3179,28 +3185,30 @@ async fn reset_delivery_to_pending(
     deadline: tokio::time::Instant,
 ) -> Result<(), ApiError> {
     let delivery = delivery.to_owned();
-    let pool = state.pool.clone();
-    let write = state
-        .sqlite_writer
-        .write_foreground("webhook_receiver_delivery_rollback", |_| {
-            let delivery = delivery.clone();
-            let pool = pool.clone();
-            async move {
-                let mut transaction = pool.begin().await?;
-                sqlx::query(
-                    "UPDATE webhook_push_deliveries SET processing_state = 'pending', processing_started_at = NULL WHERE delivery_id = ? AND processing_state = 'processing'",
-                )
-                .bind(delivery)
-                .execute(&mut *transaction)
-                .await
-                .context("reset GitHub release delivery to pending")?;
-                transaction
-                    .commit()
-                    .await
-                    .context("commit GitHub release delivery rollback")?;
-                Ok(())
-            }
-        });
+    let write = async {
+        let (permit, mut transaction) = state
+            .sqlite_writer
+            .begin_immediate_with_priority_until(
+                &state.pool,
+                "webhook_receiver_delivery_rollback",
+                SqliteWritePriority::Foreground,
+                deadline,
+            )
+            .await?;
+        sqlx::query(
+            "UPDATE webhook_push_deliveries SET processing_state = 'pending', processing_started_at = NULL WHERE delivery_id = ? AND processing_state = 'processing'",
+        )
+        .bind(delivery)
+        .execute(&mut *transaction)
+        .await
+        .context("reset GitHub release delivery to pending")?;
+        transaction
+            .commit()
+            .await
+            .context("commit GitHub release delivery rollback")?;
+        drop(permit);
+        Ok::<_, anyhow::Error>(())
+    };
     run_receiver_stage("webhook_receiver_delivery_rollback", deadline, write).await
 }
 
@@ -3339,10 +3347,11 @@ pub async fn receive(
     let claim = async move {
         let (permit, mut transaction) = state_for_claim
             .sqlite_writer
-            .begin_immediate_with_priority(
+            .begin_immediate_with_priority_until(
                 &state_for_claim.pool,
                 "webhook_receiver_delivery_claim",
                 SqliteWritePriority::Foreground,
+                write_deadline,
             )
             .await?;
         sqlx::query(
@@ -3403,8 +3412,13 @@ pub async fn receive(
         ));
     }
     let repo = repo.expect("repo checked above");
-    let enqueue =
-        sync::enqueue_user_repo_release_sync(state.as_ref(), &row.0, repo.id, &repo.full_name);
+    let enqueue = sync::enqueue_user_repo_release_sync_until(
+        state.as_ref(),
+        &row.0,
+        repo.id,
+        &repo.full_name,
+        write_deadline,
+    );
     let reused_fresh =
         match run_receiver_stage("webhook_receiver_release_enqueue", write_deadline, enqueue).await
         {
@@ -3430,28 +3444,30 @@ pub async fn receive(
         };
     let delivery = delivery.to_owned();
     let queued_task_id = format!("repo-release:{}", repo.id);
-    let pool = state.pool.clone();
-    let queued_update = state
-        .sqlite_writer
-        .write_foreground("webhook_receiver_delivery_queued", |_| {
-            let delivery = delivery.clone();
-            let queued_task_id = queued_task_id.clone();
-            let pool = pool.clone();
-            async move {
-                let mut transaction = pool.begin().await?;
-                sqlx::query("UPDATE webhook_push_deliveries SET queued_task_id = ?, processing_state = 'queued', processing_started_at = NULL WHERE delivery_id = ?")
-                    .bind(queued_task_id)
-                    .bind(delivery)
-                    .execute(&mut *transaction)
-                    .await
-                    .context("mark GitHub release delivery queued")?;
-                transaction
-                    .commit()
-                    .await
-                    .context("commit GitHub release delivery queued state")?;
-                Ok(())
-            }
-        });
+    let queued_delivery = delivery.clone();
+    let queued_update = async {
+        let (permit, mut transaction) = state
+            .sqlite_writer
+            .begin_immediate_with_priority_until(
+                &state.pool,
+                "webhook_receiver_delivery_queued",
+                SqliteWritePriority::Foreground,
+                write_deadline,
+            )
+            .await?;
+        sqlx::query("UPDATE webhook_push_deliveries SET queued_task_id = ?, processing_state = 'queued', processing_started_at = NULL WHERE delivery_id = ?")
+            .bind(queued_task_id)
+            .bind(queued_delivery)
+            .execute(&mut *transaction)
+            .await
+            .context("mark GitHub release delivery queued")?;
+        transaction
+            .commit()
+            .await
+            .context("commit GitHub release delivery queued state")?;
+        drop(permit);
+        Ok::<_, anyhow::Error>(())
+    };
     if let Err(error) = run_receiver_stage(
         "webhook_receiver_delivery_queued",
         write_deadline,
@@ -3486,6 +3502,52 @@ pub async fn receive(
 mod tests {
     use super::*;
     use axum::{body::Body, extract::FromRequest, http::Request};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receiver_stage_started_before_deadline_finishes_with_actual_result() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let stage = tokio::spawn(async move {
+            run_receiver_stage("receiver_stage_probe", deadline, async move {
+                let _ = started_tx.send(());
+                finish_rx.await.expect("finish receiver stage");
+                Ok::<_, anyhow::Error>(7)
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("receiver stage should start before its deadline")
+            .expect("receive stage start signal");
+        tokio::time::sleep_until(deadline + Duration::from_millis(10)).await;
+        finish_tx.send(()).expect("release started receiver stage");
+        let result = stage
+            .await
+            .expect("join receiver stage")
+            .expect("started receiver stage should return its actual result");
+
+        assert_eq!(result, 7);
+    }
+
+    #[tokio::test]
+    async fn expired_receiver_stage_does_not_start_its_future() {
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stage_started = started.clone();
+        let error = run_receiver_stage(
+            "receiver_stage_probe",
+            tokio::time::Instant::now() - Duration::from_millis(1),
+            async move {
+                stage_started.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, anyhow::Error>(())
+            },
+        )
+        .await
+        .expect_err("expired receiver stage should be retryable");
+
+        assert_eq!(error.code(), "webhook_receiver_retryable");
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[tokio::test]
     async fn reconcile_accepts_empty_body_as_full_reconcile() {

@@ -194,7 +194,7 @@ impl PublicMetricsService {
         let observed_at = sampled_at.to_rfc3339_opts(SecondsFormat::Secs, true);
         let repository_count = aggregate.deduplicated_repositories;
         let pressure = aggregate.pressure;
-        let pool = self.pool.clone();
+        let pool = self.sqlite_writer.write_pool_or(&self.pool).clone();
 
         self.sqlite_writer
             .write("public_metrics_hourly_snapshot", move |_| {

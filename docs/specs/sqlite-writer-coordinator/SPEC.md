@@ -97,6 +97,19 @@
 
 - `scripts/check-rust-source-quality.sh` 使用 AST source guard 检查受保护生产模块；新增 direct pool write 或未协调的 pool transaction 必须失败，除非属于 test-only/bootstrap，带有明确且受审计的 read-only transaction marker，或位于经过 AST 验证并转发 callback 的 coordinator facade 内。
 
+### REQ-SQLITE-WRITER-011
+
+- 生产写入必须使用隔离于普通读池的专用 SQLite write pool，连接数为 1；普通读池维持现有可配置容量。
+- coordinator 对 writer permit、write-pool acquisition、`BEGIN IMMEDIATE`、事务 setup、callback 启动与重试使用同一个单调时钟总 deadline：foreground 为 900 ms，background 为 2500 ms；best-effort 不排队，取得 permit 后沿用 2500 ms 操作预算。deadline 到期后不得启动新的 callback 或重试。
+- SQLite write connection 的 `busy_timeout` 不得超过 100 ms；每次操作最多 4 次尝试，退避为 25/50/100 ms。busy timeout 与退避的最大累计时长为 575 ms，队列、连接池、事务启动和重试开始受总 deadline 限制，不得在重试后重新开始 deadline。
+- callback 在 deadline 前启动后不得由 coordinator 的异步 timeout 取消；它必须持有 writer permit 直到返回 SQLite 的实际结果。事务中的 SQLite 语句仍可由 progress handler 在 deadline 后中断。
+- transaction deadline 到期且 COMMIT 尚未派发时，必须在 150 ms cleanup budget 内尝试回滚，不得继续提交。COMMIT 派发前关闭 progress handler；COMMIT 一旦派发，不得因 deadline 取消或中断，必须等待 SQLite 的实际成功或错误结果，即使耗时超过 deadline。已知 `SQLITE_BUSY` 在 deadline 后返回时先回滚并报告 deadline，不得开始重试；其他 COMMIT 错误按实际错误返回，不得仅因当前时间已过 deadline 将其改报为可重试超时。回滚超时或失败时丢弃事务并依赖 SQLx rollback-on-drop 清理；验证连接完成清理后可被 writer pool 复用。
+
+### REQ-SQLITE-WRITER-012
+
+- deadline 到期必须按 lane 语义处理：foreground 返回可识别的 retryable 503；background 将工作延后或持久化重试后结束本次尝试，不得立即自旋；best-effort 跳过写入且不得改变主要用户请求结果。
+- 结构化 `sqlite.write` telemetry 必须包含 `writer_wait_ms`、`pool_wait_ms`、`begin_ms`、`transaction_ms` 与 `deadline_ms`，并可区分 `writer_queue_timeout`、`write_pool_timeout` 与 `sqlite_busy`。
+
 ### SHOULD
 
 - 事务仍应尽量短小；小批量写可以在单次 permit 内完成，生产量级全量重建必须拆成多个短 permit。
@@ -121,12 +134,17 @@
 - translation runtime 的 production internal helper 必须接收非可选 `&SqliteWriteCoordinator`；仅 `#[cfg(test)]` wrapper 可以为独立 unit fixture 创建局部 coordinator。
 - reaction PAT、dashboard rollup、scheduled slot 与 public release usage metadata 等高频 API/sync metadata 写入使用明确 foreground/background lane，不能因为写入对象较小而直接调用 pool。
 - 如果 SQLite 返回 busy/locked，coordinator 使用短退避重试，并在耗尽后返回原始错误上下文。
+- foreground 与 background 使用各自有界总 deadline；deadline 限制 writer permit、专用 write pool 获取、`BEGIN IMMEDIATE`、事务 setup、callback 启动与重试开始。已经启动的 callback 可以完成在 deadline 之后；COMMIT 一旦派发，deadline 不再中断它。
+- 专用 write pool 只供协调写入使用，普通读请求继续共享多连接 reader pool；因 reader pool 耗尽不应阻塞 writer pool 获取。
 
 ### Edge cases / errors
 
 - coordinator 自身 permit 不可用时，写入返回内部错误并带上下文。
 - `last_active_at` best-effort 写入拿不到 writer permit 时只记录 debug 并跳过；若已取得 permit 但 SQLite busy/locked，则记录 warning，请求继续返回。
 - 外部进程持有 SQLite writer lock 时，coordinator retry 后仍可失败，但失败必须可观测。
+- foreground deadline 超时必须返回 retryable 状态与 `Retry-After`，而不是内部 500。
+- background deadline 超时由持久化 worker/job 状态延后处理；一个失败尝试结束后不得在同一调用栈立即重试。
+- best-effort 在 writer backlog 或 deadline 前无法启动 callback 时跳过持久化，主请求保持成功路径；已经启动的 callback 保持 writer permit 并返回实际结果。
 
 ## 接口契约（Interfaces & Contracts）
 
@@ -183,6 +201,22 @@
   When it updates running batch worker slots
   Then the production helper always receives a coordinator and the test-only wrapper uses a local coordinator; no optional writer fallback can execute a raw pool transaction.
 
+- Given reader pool 的所有连接都被只读查询占用
+  When foreground/background writer 获取连接
+  Then writer 从独立单连接 write pool 获取连接，且不等待 reader pool 释放连接。
+
+- Given writer queue、write pool 或事务 setup 在 lane deadline 前没有完成
+  When coordinator 准备启动 callback 或 COMMIT
+  Then 不得启动新的 callback、重试或 COMMIT；事务必须回滚，foreground 返回 retryable 503，background 持久化延后，best-effort 跳过写入。
+
+- Given callback 或 COMMIT 在 lane deadline 前已经启动
+  When SQLite 在 deadline 之后返回结果
+  Then callback 持有 writer permit 直到结束，COMMIT 不被取消或 progress handler 中断，调用方获得 SQLite 的实际成功或错误结果；成功的晚完成必须记录 deadline overrun，连接可继续复用。
+
+- Given 多个写请求排队并遇到 SQLite busy
+  When 查看结构化 `sqlite.write` telemetry
+  Then `writer_wait_ms`、`pool_wait_ms`、`begin_ms`、`transaction_ms` 与 `deadline_ms` 可用，且 writer 队列超时、write-pool 耗尽与 SQLite busy 使用不同原因字段。
+
 ## Verification
 
 ### VER-SQLITE-WRITER-001
@@ -202,6 +236,12 @@
 - Method: source checker unit tests plus a full AST scan of the audited production modules, targeted runtime tests for admin settings (`admin_patch_llm_runtime_config_preserves_saved_model_limit_when_field_is_omitted`), LLM health/recovery (`llm_model_health_round_trips_and_rejects_unknown_failure_classes`, `stale_llm_recovery_requires_the_original_lease_snapshot`), translation worker slots (`runtime_resize_updates_running_batch_slot_metadata`, `runtime_resize_rolls_back_memory_when_slot_persistence_fails`), repo release recovery (`stale_repo_release_recovery_requires_the_original_lease_snapshot`), and high-frequency metadata (`reaction_pat_check_result_waits_for_foreground_writer`, `refresh_feed_reactions_skips_persist_failure_under_sqlite_write_pressure`).
 - covers: REQ-SQLITE-WRITER-008, REQ-SQLITE-WRITER-009, REQ-SQLITE-WRITER-010
 - Pass condition: production writes use the shared coordinator with an explicit lane, the translation runtime has no optional writer fallback, direct pool writes and uncoordinated transactions are rejected by the checker, and test-only/bootstrap/read-only exceptions remain documented and bounded. Recovery updates must compare the selected lease snapshot before failing a row, and runtime configuration must restore in-memory state when slot persistence fails.
+
+### VER-SQLITE-WRITER-004
+
+- Method: coordinator contention tests with independent reader and writer pools, held writer permits, an exhausted reader pool, external `BEGIN IMMEDIATE`, delayed transaction callbacks, a rollback-journal reader that releases after COMMIT dispatch, captured tracing events, and repeated deadline expiry followed by a successful write.
+- covers: REQ-SQLITE-WRITER-011, REQ-SQLITE-WRITER-012
+- Pass condition: foreground p99 stays within 900 ms under bounded contention; writer acquisition succeeds while the reader pool is exhausted; background deadlines persist one delayed retry; callbacks are not started after queue expiry and started callbacks retain the permit until returning; COMMIT dispatched before expiry may succeed after the deadline and reports its actual result; transactions expired before COMMIT roll back and return a reusable connection; telemetry separates writer queue, pool acquisition, SQLite busy time, and late completion.
 
 ## 验收清单（Acceptance checklist）
 

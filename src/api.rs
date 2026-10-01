@@ -659,7 +659,7 @@ async fn touch_user_last_active_at(state: &AppState, user_id: &str) -> Result<()
             )
             .bind(now.as_str())
             .bind(user_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to touch user last_active_at")?;
             Ok(())
@@ -1384,7 +1384,7 @@ async fn persist_daily_brief_profile(
             .bind(user_id)
             .bind(current_webhook.0)
             .bind(&current_webhook.1)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await?;
             Ok::<u64, anyhow::Error>(updated.rows_affected())
         })
@@ -1441,7 +1441,7 @@ async fn persist_daily_brief_profile(
                 .bind(user_id)
                 .bind(jobs::STATUS_QUEUED)
                 .bind(jobs::STATUS_RUNNING)
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await?;
                 Ok::<(), anyhow::Error>(())
             })
@@ -1566,7 +1566,7 @@ pub async fn me_create_api_key(
             .bind(key_prefix.as_str())
             .bind(masked_key.as_str())
             .bind(now.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await?;
             Ok::<(), anyhow::Error>(())
         })
@@ -1601,7 +1601,7 @@ pub async fn me_delete_api_key(
                 .bind(now.as_str())
                 .bind(api_key_id.as_str())
                 .bind(user_id.as_str())
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await?,
             )
         })
@@ -2100,7 +2100,6 @@ async fn persist_sync_runtime_config(
         .map_err(sync_runtime_config_database_error)?;
     tx.commit()
         .await
-        .map_err(anyhow::Error::from)
         .map_err(sync_runtime_config_database_error)?;
     drop(writer);
 
@@ -2534,7 +2533,7 @@ pub async fn me_delete_linuxdo(
         "#,
             )
             .bind(user_id.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await?;
             Ok::<(), anyhow::Error>(())
         })
@@ -3418,7 +3417,7 @@ async fn upsert_admin_dashboard_rollup_for_day(
                 .bind(counts.business_failed_count)
                 .bind(counts.business_disabled_count)
                 .bind(updated_at.as_str())
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .map_err(anyhow::Error::from)
             })
@@ -6916,7 +6915,7 @@ pub async fn admin_patch_scheduled_slot(
             .bind(if req.enabled { 1_i64 } else { 0_i64 })
             .bind(now.as_str())
             .bind(hour_utc)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .map_err(anyhow::Error::from)
         })
@@ -8374,7 +8373,7 @@ pub async fn admin_audit_llm_diagnostic_access(
             .bind(actor_user_id.as_str())
             .bind(request.action.as_str())
             .bind(now.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("insert llm diagnostic access audit failed")
         })
@@ -10578,7 +10577,7 @@ async fn resolve_public_release_usage_from_local_metadata(
             .bind(next_status)
             .bind(now.as_str())
             .bind(full_name_lower)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .map_err(anyhow::Error::from)
         })
@@ -10781,7 +10780,11 @@ async fn register_manual_feed_repo_association(
             let input = input.clone();
             let now = now.clone();
             async move {
-                let mut tx = state.pool.begin().await?;
+                let mut tx = state
+                    .sqlite_writer
+                    .write_pool_or(&state.pool)
+                    .begin()
+                    .await?;
                 upsert_user_repo_association_tx(&mut tx, user_id, &input, now.as_str()).await?;
                 tx.commit().await?;
                 Ok::<(), anyhow::Error>(())
@@ -10888,7 +10891,7 @@ async fn set_repo_following_state(
                 .bind(now.as_str())
                 .bind(user_id)
                 .bind(full_name_lower.as_str())
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await?;
                 Ok::<(), anyhow::Error>(())
             }
@@ -11274,9 +11277,12 @@ pub async fn unpublish_repo_public_release(
         .execute(&mut *tx)
         .await
         .map_err(ApiError::internal)?;
-        let cleanup =
-            cleanup_public_release_repo_cache_if_unused_in_transaction(&mut tx, repo_id, full_name)
-                .await?;
+        let cleanup = cleanup_public_release_repo_cache_if_unused_in_transaction(
+            tx.as_transaction_mut(),
+            repo_id,
+            full_name,
+        )
+        .await?;
         tx.commit().await.map_err(ApiError::internal)?;
         drop(_sqlite_write);
         Some(cleanup)
@@ -13471,9 +13477,12 @@ pub async fn admin_delete_public_release_repo(
         ));
     }
 
-    let cache_cleanup =
-        cleanup_public_release_repo_cache_if_unused_in_transaction(&mut tx, repo_id, full_name)
-            .await?;
+    let cache_cleanup = cleanup_public_release_repo_cache_if_unused_in_transaction(
+        tx.as_transaction_mut(),
+        repo_id,
+        full_name,
+    )
+    .await?;
     tx.commit().await.map_err(ApiError::internal)?;
     drop(_sqlite_write);
 
@@ -15601,7 +15610,7 @@ async fn persist_reaction_pat_check_result(
             .bind(check_state)
             .bind(now.as_str())
             .bind(user_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .map_err(anyhow::Error::from)
         })
@@ -15623,7 +15632,7 @@ async fn clear_reaction_pat_scope_observation(
             )
             .bind(now.as_str())
             .bind(user_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .map_err(anyhow::Error::from)
         })
@@ -15770,7 +15779,7 @@ pub async fn upsert_reaction_token(
             .bind(owner.github_user_id)
             .bind(owner.login.as_str())
             .bind(checked.allows_private_repos)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .map_err(anyhow::Error::from)
         })
@@ -17808,7 +17817,7 @@ async fn persist_release_reaction_counts_best_effort(
             .bind(counts.eyes)
             .bind(chrono::Utc::now().to_rfc3339())
             .bind(release_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .map(|_| ())
             .map_err(anyhow::Error::from)
@@ -20563,7 +20572,7 @@ async fn upsert_translation(
         .begin_immediate(&state.pool, "legacy_translation_upsert")
         .await
         .map_err(ApiError::internal)?;
-    translations::ensure_legacy_writer_transaction(&mut tx).await?;
+    translations::ensure_legacy_writer_transaction(tx.as_transaction_mut()).await?;
     sqlx::query(
         r#"
         INSERT INTO ai_translations (
@@ -20612,7 +20621,7 @@ async fn mark_translation_requested(
         .begin_immediate(&state.pool, "legacy_translation_request")
         .await
         .map_err(ApiError::internal)?;
-    translations::ensure_legacy_writer_transaction(&mut tx).await?;
+    translations::ensure_legacy_writer_transaction(tx.as_transaction_mut()).await?;
     sqlx::query(
         r#"
         INSERT INTO ai_translations (
@@ -21911,7 +21920,7 @@ async fn upsert_translation_terminal_status(
         .begin_immediate(&state.pool, "legacy_translation_terminal_status")
         .await
         .map_err(ApiError::internal)?;
-    translations::ensure_legacy_writer_transaction(&mut tx).await?;
+    translations::ensure_legacy_writer_transaction(tx.as_transaction_mut()).await?;
     sqlx::query(
         r#"
         INSERT INTO ai_translations (

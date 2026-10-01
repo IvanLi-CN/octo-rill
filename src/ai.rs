@@ -226,7 +226,6 @@ struct ModelRouteHealthState {
 
 #[derive(Debug, Clone)]
 pub struct SelectedLlmModel {
-    pub model: String,
     pub model_input_limit: u32,
     pub fallback_source: &'static str,
 }
@@ -958,29 +957,8 @@ pub(crate) async fn resolve_model_input_limit_for_status(
     (limit, source)
 }
 
-pub async fn select_model_for_new_calls(state: &AppState) -> SelectedLlmModel {
-    if let Ok(Some(limit)) = admin_runtime::load_ai_model_context_limit(&state.pool).await {
-        let model = state
-            .llm_scheduler
-            .select_model_for_new_calls(state.config.ai.as_ref().map(|cfg| cfg.model.as_str()))
-            .await
-            .or_else(|| {
-                state
-                    .config
-                    .ai
-                    .as_ref()
-                    .map(|cfg| cfg.model.trim().to_owned())
-                    .filter(|model| !model.is_empty())
-            })
-            .unwrap_or_default();
-        return SelectedLlmModel {
-            model,
-            model_input_limit: limit.max(1),
-            fallback_source: MODEL_LIMIT_RESOLUTION_ADMIN_OVERRIDE,
-        };
-    }
-
-    let model = state
+pub(crate) async fn model_for_new_calls(state: &AppState) -> String {
+    state
         .llm_scheduler
         .select_model_for_new_calls(state.config.ai.as_ref().map(|cfg| cfg.model.as_str()))
         .await
@@ -992,7 +970,17 @@ pub async fn select_model_for_new_calls(state: &AppState) -> SelectedLlmModel {
                 .map(|cfg| cfg.model.trim().to_owned())
                 .filter(|model| !model.is_empty())
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+pub async fn select_model_for_new_calls(state: &AppState) -> SelectedLlmModel {
+    let model = model_for_new_calls(state).await;
+    if let Ok(Some(limit)) = admin_runtime::load_ai_model_context_limit(&state.pool).await {
+        return SelectedLlmModel {
+            model_input_limit: limit.max(1),
+            fallback_source: MODEL_LIMIT_RESOLUTION_ADMIN_OVERRIDE,
+        };
+    }
 
     if let Err(err) = refresh_model_limits(state, false).await {
         tracing::warn!(
@@ -1020,7 +1008,6 @@ pub async fn select_model_for_new_calls(state: &AppState) -> SelectedLlmModel {
         }
     };
     SelectedLlmModel {
-        model,
         model_input_limit,
         fallback_source,
     }
@@ -1138,7 +1125,8 @@ async fn cleanup_expired_llm_calls(state: &AppState) -> Result<u64> {
         .sqlite_writer
         .try_write("llm_call_retention_cleanup", || async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin()
                 .await
                 .context("begin llm retention cleanup transaction failed")?;
@@ -2215,7 +2203,8 @@ async fn insert_llm_call(
         .sqlite_writer
         .write("llm_call_insert", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin llm_call insert transaction failed")?;
@@ -2366,8 +2355,7 @@ async fn append_llm_call_event_if_owned(
     let inserted = state
         .sqlite_writer
         .write("llm_call_event_insert", |_| async {
-            let mut tx = state
-                .pool
+            let mut tx = state.sqlite_writer.write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin llm_call event transaction failed")?;
@@ -2420,7 +2408,8 @@ async fn update_llm_call_running(
         .sqlite_writer
         .write("llm_call_running", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin llm_call running transaction failed")?;
@@ -2517,7 +2506,8 @@ async fn requeue_llm_call_for_retry(
         .sqlite_writer
         .write("llm_call_requeue", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin llm_call requeue transaction failed")?;
@@ -2701,7 +2691,8 @@ async fn finalize_llm_call(
         .sqlite_writer
         .write("llm_call_finalize", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin llm_call finalize transaction failed")?;
@@ -2826,7 +2817,7 @@ async fn set_llm_admin_override_if_owned(state: &AppState, snapshot: LlmCallAdmi
                 )
                 .bind(call_id.as_str())
                 .bind(state.runtime_owner_id.as_str())
-                .fetch_optional(&state.pool)
+                .fetch_optional(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("load llm_call ownership for admin override failed")?
                 .is_some(),
@@ -3768,7 +3759,7 @@ async fn heartbeat_llm_call_lease(state: &AppState, call_id: &str) -> Result<()>
             .bind(now.as_str())
             .bind(call_id)
             .bind(state.runtime_owner_id.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("heartbeat llm_call lease failed")?;
             Ok::<_, anyhow::Error>(())
@@ -3803,7 +3794,8 @@ async fn recover_llm_call_with_message(
         .sqlite_writer
         .write("llm_call_recover", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin llm_call recovery transaction failed")?;
@@ -6069,7 +6061,7 @@ async fn upsert_daily_brief_snapshot(
             .await
             .context("failed to begin refresh brief tx")?;
         overwrite_brief_snapshot(
-            &mut tx,
+            tx.as_transaction_mut(),
             &existing_id,
             window,
             built,
@@ -6165,7 +6157,7 @@ async fn upsert_daily_brief_snapshot(
             && existing.effective_time_zone.is_some()
             && existing.effective_local_boundary.is_some();
         overwrite_brief_snapshot(
-            &mut tx,
+            tx.as_transaction_mut(),
             &existing.id,
             window,
             built,
@@ -6202,7 +6194,7 @@ async fn upsert_daily_brief_snapshot(
         });
     };
 
-    replace_brief_memberships(&mut tx, &brief_id, &built.releases, &now).await?;
+    replace_brief_memberships(tx.as_transaction_mut(), &brief_id, &built.releases, &now).await?;
     tx.commit()
         .await
         .context("failed to commit brief snapshot")?;
@@ -6762,9 +6754,16 @@ async fn refresh_existing_brief_snapshot(
         .begin_immediate(&state.pool, "ai_brief_targeted_refresh")
         .await
         .context("failed to begin targeted brief refresh tx")?;
-    overwrite_brief_snapshot(&mut tx, brief_id, &window, &built, generation_source, &now)
-        .await
-        .with_context(|| format!("failed to refresh targeted brief snapshot {brief_id}"))?;
+    overwrite_brief_snapshot(
+        tx.as_transaction_mut(),
+        brief_id,
+        &window,
+        &built,
+        generation_source,
+        &now,
+    )
+    .await
+    .with_context(|| format!("failed to refresh targeted brief snapshot {brief_id}"))?;
     tx.commit()
         .await
         .context("failed to commit targeted brief refresh")?;
@@ -7295,7 +7294,7 @@ pub async fn recompute_legacy_brief_snapshot(
             && existing.effective_local_boundary.is_some();
         if !is_normalized_snapshot {
             overwrite_brief_snapshot(
-                &mut tx,
+                tx.as_transaction_mut(),
                 &existing.id,
                 &target_window,
                 &built,
@@ -7338,7 +7337,7 @@ pub async fn recompute_legacy_brief_snapshot(
         });
     }
     overwrite_brief_snapshot(
-        &mut tx,
+        tx.as_transaction_mut(),
         &legacy.id,
         &target_window,
         &built,

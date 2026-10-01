@@ -3298,7 +3298,7 @@ async fn apply_social_activity_snapshot_with_options(
         let query_started = Instant::now();
         for (repo_id, repo_full_name) in chunk {
             clear_stale_personal_owned_association_tx(
-                &mut tx,
+                tx.as_transaction_mut(),
                 user_id,
                 *repo_id,
                 repo_full_name,
@@ -3332,7 +3332,7 @@ async fn apply_social_activity_snapshot_with_options(
             .await
             .context("begin social activity repo cleanup tx")?;
         let query_started = Instant::now();
-        delete_repo_star_rows_for_ids_tx(&mut tx, user_id, chunk)
+        delete_repo_star_rows_for_ids_tx(tx.as_transaction_mut(), user_id, chunk)
             .await
             .context("delete stale repo star snapshot rows")?;
         tx.commit()
@@ -3365,7 +3365,7 @@ async fn apply_social_activity_snapshot_with_options(
             for follower in chunk {
                 if !current_follower_ids.contains(&follower.actor.id)
                     && insert_social_activity_event_tx(
-                        &mut tx,
+                        tx.as_transaction_mut(),
                         SocialActivityEventInsert {
                             user_id,
                             kind: "follower_received",
@@ -3386,7 +3386,13 @@ async fn apply_social_activity_snapshot_with_options(
                 {
                     chunk_events_written += 1;
                 }
-                upsert_follower_current_member_tx(&mut tx, user_id, follower, now.as_str()).await?;
+                upsert_follower_current_member_tx(
+                    tx.as_transaction_mut(),
+                    user_id,
+                    follower,
+                    now.as_str(),
+                )
+                .await?;
             }
             tx.commit()
                 .await
@@ -3423,7 +3429,7 @@ async fn apply_social_activity_snapshot_with_options(
             let mut chunk_events_written = 0usize;
             for candidate in chunk {
                 if insert_social_activity_event_tx(
-                    &mut tx,
+                    tx.as_transaction_mut(),
                     SocialActivityEventInsert {
                         user_id,
                         kind: "follower_received",
@@ -3471,7 +3477,7 @@ async fn apply_social_activity_snapshot_with_options(
                 .await
                 .context("begin social activity follower cleanup tx")?;
             let query_started = Instant::now();
-            delete_follower_current_members_for_ids_tx(&mut tx, user_id, chunk)
+            delete_follower_current_members_for_ids_tx(tx.as_transaction_mut(), user_id, chunk)
                 .await
                 .context("delete stale follower current members")?;
             tx.commit()
@@ -3554,7 +3560,7 @@ async fn apply_social_activity_snapshot_with_options(
                 let snapshot_initialized = repo_snapshot_initialized_ids.contains(&repo.repo_id)
                     || fetched_snapshot_this_run;
                 upsert_owned_repo_star_baseline_tx(
-                    &mut tx,
+                    tx.as_transaction_mut(),
                     user_id,
                     repo,
                     snapshot_initialized,
@@ -3565,7 +3571,7 @@ async fn apply_social_activity_snapshot_with_options(
 
                 let association = user_repo_association_from_owned_snapshot(repo, now.as_str());
                 crate::api::upsert_user_repo_association_tx(
-                    &mut tx,
+                    tx.as_transaction_mut(),
                     user_id,
                     &association,
                     now.as_str(),
@@ -3673,7 +3679,7 @@ async fn apply_social_activity_snapshot_with_options(
                     if emit_current_members
                         && !current_ids.contains(&member.actor.id)
                         && insert_social_activity_event_tx(
-                            &mut tx,
+                            tx.as_transaction_mut(),
                             SocialActivityEventInsert {
                                 user_id,
                                 kind: "repo_star_received",
@@ -3694,8 +3700,13 @@ async fn apply_social_activity_snapshot_with_options(
                     {
                         chunk_events_written += 1;
                     }
-                    upsert_repo_star_current_member_tx(&mut tx, user_id, member, now.as_str())
-                        .await?;
+                    upsert_repo_star_current_member_tx(
+                        tx.as_transaction_mut(),
+                        user_id,
+                        member,
+                        now.as_str(),
+                    )
+                    .await?;
                 }
                 tx.commit().await.with_context(|| {
                     format!(
@@ -3748,7 +3759,7 @@ async fn apply_social_activity_snapshot_with_options(
                 let mut chunk_events_written = 0usize;
                 for candidate in chunk {
                     if insert_social_activity_event_tx(
-                        &mut tx,
+                        tx.as_transaction_mut(),
                         SocialActivityEventInsert {
                             user_id,
                             kind: "repo_star_received",
@@ -3808,11 +3819,16 @@ async fn apply_social_activity_snapshot_with_options(
                             )
                         })?;
                     let query_started = Instant::now();
-                    delete_repo_star_members_for_ids_tx(&mut tx, user_id, repo.repo_id, chunk)
-                        .await
-                        .with_context(|| {
-                            format!("delete stale repo star members for {}", repo.full_name)
-                        })?;
+                    delete_repo_star_members_for_ids_tx(
+                        tx.as_transaction_mut(),
+                        user_id,
+                        repo.repo_id,
+                        chunk,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("delete stale repo star members for {}", repo.full_name)
+                    })?;
                     tx.commit().await.with_context(|| {
                         format!(
                             "commit social activity repo member cleanup tx for {}",
@@ -3847,11 +3863,17 @@ async fn apply_social_activity_snapshot_with_options(
                 .context("begin social activity repo member baseline tx")?;
             let query_started = Instant::now();
             for (repo, _) in chunk {
-                upsert_owned_repo_star_baseline_tx(&mut tx, user_id, repo, true, now.as_str())
-                    .await
-                    .with_context(|| {
-                        format!("mark repo star snapshot initialized for {}", repo.full_name)
-                    })?;
+                upsert_owned_repo_star_baseline_tx(
+                    tx.as_transaction_mut(),
+                    user_id,
+                    repo,
+                    true,
+                    now.as_str(),
+                )
+                .await
+                .with_context(|| {
+                    format!("mark repo star snapshot initialized for {}", repo.full_name)
+                })?;
             }
             tx.commit()
                 .await
@@ -4638,7 +4660,7 @@ async fn mark_release_content_enqueue_pending(state: &AppState, release_ids: &[i
                 query_builder = query_builder.bind(release_id);
             }
             query_builder
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("failed to mark pending release content enqueue")?;
             Ok::<_, anyhow::Error>(())
@@ -4667,7 +4689,7 @@ async fn clear_release_content_enqueue_pending(
                 query_builder = query_builder.bind(release_id);
             }
             query_builder
-                .execute(&state.pool)
+                .execute(state.sqlite_writer.write_pool_or(&state.pool))
                 .await
                 .context("failed to clear pending release content enqueue")?;
             Ok::<_, anyhow::Error>(())
@@ -5068,6 +5090,7 @@ async fn attach_and_wait_for_user_release_demand_with_freshness(
         &snapshots,
         false,
         None,
+        None,
     )
     .await?;
 
@@ -5172,6 +5195,7 @@ pub async fn refresh_public_repo_release_if_stale(
         &HashMap::new(),
         false,
         Some(PUBLIC_RELEASE_READ_FRESHNESS_WINDOW),
+        None,
     )
     .await?;
     let snapshot = load_public_repo_release_refresh_snapshot(state, repo_id)
@@ -5231,11 +5255,12 @@ async fn load_public_repo_release_refresh_snapshot(
     Ok(snapshot)
 }
 
-pub async fn enqueue_user_repo_release_sync(
+pub async fn enqueue_user_repo_release_sync_until(
     state: &AppState,
     user_id: &str,
     repo_id: i64,
     full_name: &str,
+    stage_deadline_at: tokio::time::Instant,
 ) -> Result<bool> {
     let repos = [ReleaseDemandRepo {
         repo_id,
@@ -5253,6 +5278,7 @@ pub async fn enqueue_user_repo_release_sync(
         &HashMap::new(),
         true,
         None,
+        Some(stage_deadline_at),
     )
     .await?;
     Ok(attached.reused_fresh > 0)
@@ -5277,6 +5303,7 @@ async fn attach_release_demand(
         &HashMap::new(),
         false,
         None,
+        None,
     )
     .await
 }
@@ -5293,6 +5320,7 @@ async fn attach_release_demand_with_freshness(
     snapshots: &HashMap<i64, usize>,
     force_refresh: bool,
     freshness_window: Option<Duration>,
+    stage_deadline_at: Option<tokio::time::Instant>,
 ) -> Result<AttachReleaseDemandResult> {
     let mut result = AttachReleaseDemandResult {
         repos: repos.len(),
@@ -5302,7 +5330,10 @@ async fn attach_release_demand_with_freshness(
         return Ok(result);
     }
 
-    expire_repo_release_deadlines(state).await?;
+    // Keep the webhook's short admission budget bounded by skipping this separate sweep.
+    if stage_deadline_at.is_none() {
+        expire_repo_release_deadlines(state).await?;
+    }
 
     let now = Utc::now();
     let now_rfc3339 = now.to_rfc3339();
@@ -5313,11 +5344,23 @@ async fn attach_release_demand_with_freshness(
     let mut reused_fresh_system_work_items = Vec::new();
 
     for repo in repos {
-        let (_sqlite_write, mut tx) = state
-            .sqlite_writer
-            .begin_immediate(&state.pool, "repo_release_attach")
-            .await
-            .context("begin repo release attach tx")?;
+        let (_sqlite_write, mut tx) = if let Some(stage_deadline_at) = stage_deadline_at {
+            state
+                .sqlite_writer
+                .begin_immediate_with_priority_until(
+                    &state.pool,
+                    "repo_release_attach",
+                    SqliteWritePriority::Foreground,
+                    stage_deadline_at,
+                )
+                .await
+        } else {
+            state
+                .sqlite_writer
+                .begin_immediate(&state.pool, "repo_release_attach")
+                .await
+        }
+        .context("begin repo release attach tx")?;
         let existing = sqlx::query_as::<_, RepoReleaseWorkItemRow>(
             r#"
             SELECT
@@ -5405,7 +5448,7 @@ async fn attach_release_demand_with_freshness(
             if is_fresh && existing.status == jobs::STATUS_SUCCEEDED {
                 if let Some(task_id) = task_id {
                     upsert_repo_release_watcher(
-                        &mut tx,
+                        tx.as_transaction_mut(),
                         RepoReleaseWatcherUpsert {
                             work_item_id: &existing.id,
                             task_id,
@@ -5493,7 +5536,7 @@ async fn attach_release_demand_with_freshness(
                 .with_context(|| format!("failed to update repo release work item {}", repo.full_name))?;
                 if let Some(task_id) = task_id {
                     upsert_repo_release_watcher(
-                        &mut tx,
+                        tx.as_transaction_mut(),
                         RepoReleaseWatcherUpsert {
                             work_item_id: &existing.id,
                             task_id,
@@ -5570,7 +5613,7 @@ async fn attach_release_demand_with_freshness(
             })?;
             if let Some(task_id) = task_id {
                 upsert_repo_release_watcher(
-                    &mut tx,
+                    tx.as_transaction_mut(),
                     RepoReleaseWatcherUpsert {
                         work_item_id: &work_item_id,
                         task_id,
@@ -6347,7 +6390,8 @@ async fn retry_subscription_release_watchers(
         .write("subscription_retry_release_watchers", |_| async {
             let mut tx = context
                 .state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&context.state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin subscription retry release tx")?;
@@ -7264,7 +7308,8 @@ async fn prune_completed_repo_refresh_governance_cycle_members(
             let now_rfc3339 = now_rfc3339.clone();
             async move {
                 let mut tx = state
-                    .pool
+                    .sqlite_writer
+                    .write_pool_or(&state.pool)
                     .begin_with("BEGIN IMMEDIATE")
                     .await
                     .context("begin repo refresh governance retention tx")?;
@@ -7636,7 +7681,8 @@ async fn rebuild_repo_refresh_governance_snapshots(
         .sqlite_writer
         .write("repo_refresh_governance_rebuild_cleanup", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo refresh governance cleanup tx")?;
@@ -7688,7 +7734,8 @@ async fn rebuild_repo_refresh_governance_snapshots(
                 "repo_refresh_governance_rebuild_snapshots_chunk",
                 |_| async {
                     let mut tx = state
-                        .pool
+                        .sqlite_writer
+                        .write_pool_or(&state.pool)
                         .begin_with("BEGIN IMMEDIATE")
                         .await
                         .context("begin repo refresh governance snapshot chunk tx")?;
@@ -7728,7 +7775,8 @@ async fn rebuild_repo_refresh_governance_snapshots(
                 "repo_refresh_governance_reconcile_members_chunk",
                 |_| async {
                     let mut tx = state
-                        .pool
+                        .sqlite_writer
+                        .write_pool_or(&state.pool)
                         .begin_with("BEGIN IMMEDIATE")
                         .await
                         .context("begin repo refresh governance member reconcile tx")?;
@@ -7760,7 +7808,8 @@ async fn rebuild_repo_refresh_governance_snapshots(
                 "repo_refresh_governance_backfill_members_chunk",
                 |_| async {
                     let mut tx = state
-                        .pool
+                        .sqlite_writer
+                        .write_pool_or(&state.pool)
                         .begin_with("BEGIN IMMEDIATE")
                         .await
                         .context("begin legacy repo refresh governance member backfill tx")?;
@@ -7788,7 +7837,8 @@ async fn rebuild_repo_refresh_governance_snapshots(
         .sqlite_writer
         .write("repo_refresh_governance_reconcile_snapshots", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo refresh governance snapshot completion tx")?;
@@ -7882,7 +7932,8 @@ async fn rebuild_repo_refresh_governance_snapshots(
         .sqlite_writer
         .write("repo_refresh_governance_reconcile_cycles", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo refresh governance cycle reconcile tx")?;
@@ -8075,7 +8126,8 @@ async fn ensure_active_repo_refresh_cycle(
         .sqlite_writer
         .write("repo_refresh_cycle_create", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo refresh cycle create tx")?;
@@ -8181,8 +8233,7 @@ async fn select_budgeted_system_release_repos(
     let selected_rows = state
         .sqlite_writer
         .write("repo_refresh_selection_mark", |_| async {
-            let mut tx = state
-                .pool
+            let mut tx = state.sqlite_writer.write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo refresh selection mark tx")?;
@@ -9059,7 +9110,8 @@ async fn process_repo_release_work_item(
                 .sqlite_writer
                 .write("repo_release_finalize", |_| async {
                     let mut tx = state
-                        .pool
+                        .sqlite_writer
+                        .write_pool_or(&state.pool)
                         .begin_with("BEGIN IMMEDIATE")
                         .await
                         .context("begin repo release success finalization tx")?;
@@ -9153,7 +9205,8 @@ async fn process_repo_release_work_item(
                 .sqlite_writer
                 .write("repo_release_finalize", |_| async {
                     let mut tx = state
-                        .pool
+                        .sqlite_writer
+                        .write_pool_or(&state.pool)
                         .begin_with("BEGIN IMMEDIATE")
                         .await
                         .context("begin repo release failure finalization tx")?;
@@ -9554,7 +9607,8 @@ async fn mark_public_release_usage_sync_success(
         .sqlite_writer
         .write("public_release_usage_success", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin public release usage success tx")?;
@@ -9604,7 +9658,8 @@ async fn mark_public_release_usage_sync_failure(
         .sqlite_writer
         .write("public_release_usage_failure", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin public release usage failure tx")?;
@@ -9698,8 +9753,7 @@ async fn record_repo_release_sync_success(
     state
         .sqlite_writer
         .write("repo_release_sync_success", |_| async {
-            let mut tx = state
-                .pool
+            let mut tx = state.sqlite_writer.write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo release sync success tx")?;
@@ -9783,7 +9837,8 @@ async fn record_repo_release_sync_failure(
         .sqlite_writer
         .write("repo_release_sync_failure", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo release sync failure tx")?;
@@ -9833,8 +9888,7 @@ async fn upsert_repo_releases(
     state
         .sqlite_writer
         .write("repo_release_upsert", |_| async {
-            let mut tx = state
-                .pool
+            let mut tx = state.sqlite_writer.write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo release snapshot write tx")?;
@@ -10453,7 +10507,8 @@ async fn record_repo_refresh_governance_attempt(
         .sqlite_writer
         .write("repo_refresh_governance_attempt", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo refresh governance attempt tx")?;
@@ -10495,7 +10550,7 @@ async fn heartbeat_repo_release_work_item_lease(
             .bind(work_item_id)
             .bind(jobs::STATUS_RUNNING)
             .bind(state.runtime_owner_id.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to heartbeat repo release work item")?;
             Ok::<(), anyhow::Error>(())
@@ -10526,7 +10581,8 @@ async fn fail_repo_release_work_item(
         .sqlite_writer
         .write("repo_release_fail", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo release failure tx")?;
@@ -10609,7 +10665,8 @@ async fn fail_repo_release_work_item_if_stale(
         .sqlite_writer
         .write("repo_release_recover", |_| async {
             let mut tx = state
-                .pool
+                .sqlite_writer
+                .write_pool_or(&state.pool)
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context("begin repo release recovery tx")?;
@@ -10980,7 +11037,7 @@ async fn append_subscription_event(
             .bind(event.repo_full_name)
             .bind(payload_json.as_str())
             .bind(now.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("failed to insert sync_subscription_event")?;
             Ok::<_, anyhow::Error>(())
@@ -11095,7 +11152,7 @@ async fn prune_subscription_sync_history(state: &AppState) -> Result<()> {
                         .bind(succeeded_cutoff.as_str())
                         .bind(failed_cutoff.as_str())
                         .bind(SUBSCRIPTION_PRUNE_WATCHERS_BATCH_SIZE)
-                        .execute(&state.pool)
+                        .execute(state.sqlite_writer.write_pool_or(&state.pool))
                         .await
                         .context("prune repo release watchers")?
                         .rows_affected(),
@@ -11125,7 +11182,7 @@ async fn prune_subscription_sync_history(state: &AppState) -> Result<()> {
                         )
                         .bind(event_cutoff.as_str())
                         .bind(SUBSCRIPTION_PRUNE_EVENTS_BATCH_SIZE)
-                        .execute(&state.pool)
+                        .execute(state.sqlite_writer.write_pool_or(&state.pool))
                         .await
                         .context("prune sync subscription events")?
                         .rows_affected(),
@@ -12100,7 +12157,7 @@ async fn insert_feed_activity_events(
             uses_custom_open_graph_image: false,
         });
         let inserted = insert_social_activity_event_tx(
-            &mut tx,
+            tx.as_transaction_mut(),
             SocialActivityEventInsert {
                 user_id,
                 kind: event.kind,
@@ -12704,7 +12761,7 @@ async fn apply_starred_membership_page(
         .await
         .with_context(|| format!("upsert star connection membership {}", repo.full_name))?;
         upsert_user_starred_repo_from_memberships_tx(
-            &mut tx,
+            tx.as_transaction_mut(),
             user_id,
             repo.repo_id,
             repo.full_name.as_str(),
@@ -12982,7 +13039,7 @@ async fn fail_star_reconciliation_epoch(
             .bind(reason)
             .bind(now.as_str())
             .bind(epoch_id)
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("mark star epoch failed")?;
             Ok::<_, anyhow::Error>(())
@@ -13046,7 +13103,7 @@ async fn schedule_next_star_reconciliation_slice(
             .bind(now_rfc3339.as_str())
             .bind(epoch.id.as_str())
             .bind(state.runtime_owner_id.as_str())
-            .execute(&state.pool)
+            .execute(state.sqlite_writer.write_pool_or(&state.pool))
             .await
             .context("schedule next star reconciliation slice")?;
             if update.rows_affected() != 1 {
@@ -13126,7 +13183,7 @@ async fn finalize_star_reconciliation_epoch(
     .context("delete stale star memberships")?;
     for stale_repo in &stale {
         upsert_user_starred_repo_from_memberships_tx(
-            &mut tx,
+            tx.as_transaction_mut(),
             epoch.user_id.as_str(),
             stale_repo.repo_id,
             stale_repo.full_name.as_str(),
@@ -13433,7 +13490,7 @@ async fn replace_starred_repos_with_priority(
         .map(|repo| repo.full_name.to_ascii_lowercase())
         .collect::<Vec<_>>();
     crate::api::clear_user_repo_association_source_except_repo_ids_tx(
-        &mut tx,
+        tx.as_transaction_mut(),
         user_id,
         crate::api::UserRepoAssociationSource::GitHubStar,
         keep_repo_ids.as_slice(),
@@ -13479,14 +13536,19 @@ async fn replace_starred_repos_with_priority(
         .with_context(|| format!("failed to insert starred repo {}", repo.full_name))?;
 
         let association = user_repo_association_from_starred_snapshot(repo, now.as_str());
-        crate::api::upsert_user_repo_association_tx(&mut tx, user_id, &association, now.as_str())
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to upsert user repo association for starred repo {}",
-                    repo.full_name
-                )
-            })?;
+        crate::api::upsert_user_repo_association_tx(
+            tx.as_transaction_mut(),
+            user_id,
+            &association,
+            now.as_str(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to upsert user repo association for starred repo {}",
+                repo.full_name
+            )
+        })?;
     }
 
     tx.commit()
@@ -13556,14 +13618,19 @@ async fn upsert_starred_repos(
         .with_context(|| format!("failed to upsert starred repo {}", repo.full_name))?;
 
         let association = user_repo_association_from_starred_snapshot(repo, now.as_str());
-        crate::api::upsert_user_repo_association_tx(&mut tx, user_id, &association, now.as_str())
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to upsert user repo association for starred repo {}",
-                    repo.full_name
-                )
-            })?;
+        crate::api::upsert_user_repo_association_tx(
+            tx.as_transaction_mut(),
+            user_id,
+            &association,
+            now.as_str(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to upsert user repo association for starred repo {}",
+                repo.full_name
+            )
+        })?;
     }
     tx.commit()
         .await
@@ -19829,7 +19896,7 @@ mod tests {
                         sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
                             .bind("2026-03-07T00:00:00Z")
                             .bind(user_id.as_str())
-                            .execute(&state.pool)
+                            .execute(state.sqlite_writer.write_pool_or(&state.pool))
                             .await
                             .context("update competing user row")?;
                         Ok::<_, anyhow::Error>(())
@@ -20346,7 +20413,11 @@ mod tests {
                     sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
                         .bind("2026-03-07T00:00:00Z")
                         .bind(user_id_for_write.as_str())
-                        .execute(&state_for_write.pool)
+                        .execute(
+                            state_for_write
+                                .sqlite_writer
+                                .write_pool_or(&state_for_write.pool),
+                        )
                         .await
                         .context("update competing user row")?;
                     Ok::<_, anyhow::Error>(())
@@ -22780,6 +22851,7 @@ mod tests {
             Some(&mut policy),
             &snapshots,
             false,
+            None,
             None,
         )
         .await
