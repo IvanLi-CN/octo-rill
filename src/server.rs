@@ -789,12 +789,24 @@ fn build_sqlite_pool_options(max_connections: usize) -> SqlitePoolOptions {
     SqlitePoolOptions::new()
         .max_connections(max_connections)
         .min_connections(1)
+        .after_release(|connection, _metadata| {
+            Box::pin(async move {
+                crate::sqlite_write::cleanup_sqlite_pool_connection(connection).await?;
+                Ok(true)
+            })
+        })
 }
 
 fn build_sqlite_write_pool_options() -> SqlitePoolOptions {
     SqlitePoolOptions::new()
         .max_connections(1)
         .min_connections(1)
+        .after_release(|connection, _metadata| {
+            Box::pin(async move {
+                crate::sqlite_write::cleanup_sqlite_write_connection(connection).await?;
+                Ok(true)
+            })
+        })
 }
 
 fn warn_if_runtime_concurrency_exceeds_sqlite_pool(

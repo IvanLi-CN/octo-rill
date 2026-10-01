@@ -29,6 +29,7 @@ use crate::{
     sqlite_write::{SqliteWritePermit, SqliteWritePriority},
     state::AppState,
     translations,
+    worker_backoff::WorkerBackoff,
 };
 
 const REST_API_BASE: &str = "https://api.github.com";
@@ -401,31 +402,53 @@ pub fn spawn_repo_release_workers(state: Arc<AppState>) {
     for worker_index in 0..REPO_RELEASE_WORKERS_MAX.max(1) {
         let state = state.clone();
         tokio::spawn(async move {
+            let mut claim_backoff = WorkerBackoff::default();
             loop {
                 match admin_runtime::load_repo_release_worker_concurrency(&state.pool).await {
                     Ok(target) if worker_index >= target => {
+                        claim_backoff.reset();
                         tokio::time::sleep(REPO_RELEASE_QUEUE_POLL_INTERVAL).await;
                         continue;
                     }
                     Err(err) => {
-                        tracing::warn!(?err, "repo release worker: load concurrency failed");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        let retry_after = claim_backoff.next_delay();
+                        tracing::warn!(
+                            lane = "repo_release_claim",
+                            error_kind = "database_attempt",
+                            failure_count = claim_backoff.failure_count(),
+                            ?err,
+                            retry_after_ms = retry_after.as_millis(),
+                            "repo release worker: load concurrency failed; backing off"
+                        );
+                        tokio::time::sleep(retry_after).await;
                         continue;
                     }
                     _ => {}
                 }
                 match claim_next_repo_release_work_item(state.as_ref()).await {
                     Ok(Some(work_item)) => {
+                        claim_backoff.reset();
                         if let Err(err) =
                             process_repo_release_work_item(state.clone(), work_item).await
                         {
                             tracing::warn!(?err, "repo release worker: process work item failed");
                         }
                     }
-                    Ok(None) => tokio::time::sleep(REPO_RELEASE_QUEUE_POLL_INTERVAL).await,
+                    Ok(None) => {
+                        claim_backoff.reset();
+                        tokio::time::sleep(REPO_RELEASE_QUEUE_POLL_INTERVAL).await;
+                    }
                     Err(err) => {
-                        tracing::warn!(?err, "repo release worker: claim failed");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        let retry_after = claim_backoff.next_delay();
+                        tracing::warn!(
+                            lane = "repo_release_claim",
+                            error_kind = "database_attempt",
+                            failure_count = claim_backoff.failure_count(),
+                            ?err,
+                            retry_after_ms = retry_after.as_millis(),
+                            "repo release worker: claim failed; backing off"
+                        );
+                        tokio::time::sleep(retry_after).await;
                     }
                 }
             }

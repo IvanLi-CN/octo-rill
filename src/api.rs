@@ -1930,7 +1930,9 @@ async fn validate_daily_brief_schedule_against_enabled_slots(
 }
 
 fn sync_runtime_config_database_error(error: anyhow::Error) -> ApiError {
-    if crate::sqlite_write::is_sqlite_busy_error(error.as_ref()) {
+    if crate::sqlite_write::is_sqlite_busy_error(error.as_ref())
+        || crate::sqlite_write::is_sqlite_write_deadline_error(error.as_ref())
+    {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "database_busy",

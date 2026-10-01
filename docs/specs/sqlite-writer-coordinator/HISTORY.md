@@ -4,6 +4,11 @@
 
 ## Decision Trace
 
+- 2026-10-02：复核连接归还的失败边界后，确认专用 writer 连接的事务深度仍非零时不能再取得第二个清理预算；`after_release` 立即返回错误让 SQLx hard-close/evict，普通读池/内存 fallback 则在同一个 150 ms budget 内完成 queued rollback，只有清理确认成功的连接才允许复用。
+- 2026-10-01：PR3.9.1 复现确认，事务 future 取消时原 progress handler 把 `active=false` 解释为“继续执行”，长 SQL 因此继续占用 SQLite worker，连接归还无法在 cleanup budget 内完成；改为独立 interrupt 标志，归还时显式清理 handler/事务，清理不确定则 hard-evict 连接并允许 pool 重建。
+- 2026-10-01：PR3.9.1 将 content processing recovery/claim、job claim 与 repo release claim 的失败重试统一为 1/2/4/8/16/30 秒有界退避，抖动只增加等待，成功 DB 尝试后复位；保留持久化 task/work/lease 状态，不在数据库不可用时立即自旋。
+- 2026-10-01：PR3.9.1 验收发现连接驱逐后的 SQLite worker 可能在短时间内继续持有文件锁；`BEGIN IMMEDIATE` 改为在同一 foreground/background deadline 内继续 busy 重试，避免固定尝试上限提前把可恢复窗口暴露为后端错误。
+- 2026-10-01：复核清理边界后，writer pool 归还路径即使事务深度已清零也会移除残留 progress handler；显式 rollback 的 handler 清理与回滚共享 150ms 总预算；已提交的 job claim 不再因 running 事件追加失败而丢失处理机会，content processing 的 SQLx 执行失败进入同一有界退避。
 - 2026-10-01：PR3.9 收紧 SQLite 写入总时限，新增独立单连接 writer pool、foreground/background deadline、best-effort 不排队和分阶段 telemetry；deadline transaction 使用 SQLite progress handler 中断长 SQL，并限制回滚清理预算，后台 job 超时持久化延后重试。内容提交保留事务内的持久化路由刷新，但模型档案只读已加载的 scheduler 状态，避免模型目录网络刷新占用 writer。
 - 2026-10-01：复核发现异步取消可能丢失已派发 COMMIT 的真实结果并误报可重试 deadline；确认采用“派发前受 deadline 限制、派发后等待 SQLite 结果”的合约，callback/COMMIT 晚完成保留真实结果并记录超期，提交前过期仍显式回滚。
 - 2026-09-30：复核 stale worker、运行时配置失败回滚与 repo release terminal transition 后，决定把 LLM owner/status CAS、recovery/finalize event 与状态更新、repo release work item/watchers/governance 终态更新统一收进同一 coordinator transaction；admin runtime PATCH 由共享 lock 串行化，并在 live apply 失败时用单事务恢复持久化快照。

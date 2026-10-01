@@ -33,6 +33,8 @@ pub struct SqliteWriteCoordinator {
     deadlines: SqliteWriteDeadlines,
     retry: SqliteWriteRetryConfig,
     slow_threshold_ms: usize,
+    #[cfg(test)]
+    progress_handler_started: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -190,7 +192,18 @@ impl SqliteWriteCoordinator {
                 max_delay: Duration::from_millis(100),
             },
             slow_threshold_ms: observability::logging_thresholds().sqlite_write_slow_ms,
+            #[cfg(test)]
+            progress_handler_started: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_progress_handler_started_sender(
+        mut self,
+        sender: tokio::sync::mpsc::UnboundedSender<()>,
+    ) -> Self {
+        self.progress_handler_started = Some(sender);
+        self
     }
 
     pub(crate) fn write_pool_or<'a>(&'a self, fallback: &'a SqlitePool) -> &'a SqlitePool {
@@ -828,11 +841,23 @@ impl SqliteWriteCoordinator {
                     let deadline_std = deadline_at.into_std();
                     let progress_handler_active = Arc::new(AtomicBool::new(true));
                     let handler_active = Arc::clone(&progress_handler_active);
+                    let progress_handler_interrupt = Arc::new(AtomicBool::new(false));
+                    let handler_interrupt = Arc::clone(&progress_handler_interrupt);
+                    #[cfg(test)]
+                    let mut progress_handler_started = self.progress_handler_started.clone();
                     let setup_handler = async {
                         let mut handle = tx.lock_handle().await?;
                         handle.set_progress_handler(1000, move || {
-                            !handler_active.load(Ordering::Relaxed)
-                                || std::time::Instant::now() < deadline_std
+                            #[cfg(test)]
+                            if let Some(sender) = progress_handler_started.take() {
+                                let _ = sender.send(());
+                            }
+                            if handler_interrupt.load(Ordering::Relaxed) {
+                                false
+                            } else {
+                                !handler_active.load(Ordering::Relaxed)
+                                    || std::time::Instant::now() < deadline_std
+                            }
                         });
                         Ok::<_, sqlx::Error>(())
                     };
@@ -840,6 +865,7 @@ impl SqliteWriteCoordinator {
                         Ok(Ok(handle)) if Instant::now() < deadline_at => handle,
                         Ok(Ok(_)) => {
                             let begin_elapsed = begin_started.elapsed();
+                            progress_handler_interrupt.store(true, Ordering::Relaxed);
                             progress_handler_active.store(false, Ordering::Relaxed);
                             cleanup_sqlite_write_transaction(tx, lane).await;
                             warn!(
@@ -864,6 +890,7 @@ impl SqliteWriteCoordinator {
                         }
                         Ok(Err(error)) => {
                             let begin_elapsed = begin_started.elapsed();
+                            progress_handler_interrupt.store(true, Ordering::Relaxed);
                             progress_handler_active.store(false, Ordering::Relaxed);
                             cleanup_sqlite_write_transaction(tx, lane).await;
                             warn!(
@@ -885,6 +912,7 @@ impl SqliteWriteCoordinator {
                         }
                         Err(_) => {
                             let begin_elapsed = begin_started.elapsed();
+                            progress_handler_interrupt.store(true, Ordering::Relaxed);
                             progress_handler_active.store(false, Ordering::Relaxed);
                             cleanup_sqlite_write_transaction(tx, lane).await;
                             warn!(
@@ -933,13 +961,12 @@ impl SqliteWriteCoordinator {
                         deadline_at,
                         deadline,
                         progress_handler_active,
+                        progress_handler_interrupt,
                         slow_threshold_ms: self.slow_threshold_ms,
                     };
                     return Ok((permit, transaction));
                 }
-                Err(err)
-                    if is_sqlite_busy_error(err.as_ref()) && attempt < self.retry.max_attempts =>
-                {
+                Err(err) if is_sqlite_busy_error(err.as_ref()) => {
                     let delay = self.retry_delay(attempt);
                     let remaining = deadline_at.saturating_duration_since(Instant::now());
                     let can_retry = remaining > delay;
@@ -1071,6 +1098,7 @@ pub struct SqliteWriteTransaction<'a> {
     deadline_at: Instant,
     deadline: Duration,
     progress_handler_active: Arc<AtomicBool>,
+    progress_handler_interrupt: Arc<AtomicBool>,
     slow_threshold_ms: usize,
 }
 
@@ -1087,7 +1115,7 @@ impl<'a> SqliteWriteTransaction<'a> {
             .take()
             .expect("sqlite write transaction already completed");
         if Instant::now() >= self.deadline_at {
-            self.progress_handler_active.store(false, Ordering::Relaxed);
+            self.request_progress_interrupt();
             cleanup_sqlite_write_transaction(tx, self.lane).await;
             self.log_transaction_end(
                 "write_deadline",
@@ -1101,15 +1129,12 @@ impl<'a> SqliteWriteTransaction<'a> {
             )));
         }
 
-        let disable_progress_handler = async {
-            let mut handle = tx.lock_handle().await?;
-            handle.set_progress_handler(0, || true);
-            Ok::<_, sqlx::Error>(())
-        };
-        match tokio::time::timeout_at(self.deadline_at, disable_progress_handler).await {
+        match tokio::time::timeout_at(self.deadline_at, disable_sqlite_progress_handler(&mut tx))
+            .await
+        {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                self.progress_handler_active.store(false, Ordering::Relaxed);
+                self.request_progress_interrupt();
                 cleanup_sqlite_write_transaction(tx, self.lane).await;
                 self.log_transaction_end(
                     "transaction_error",
@@ -1119,7 +1144,7 @@ impl<'a> SqliteWriteTransaction<'a> {
                     .context("disable sqlite write progress handler before commit"));
             }
             Err(_) => {
-                self.progress_handler_active.store(false, Ordering::Relaxed);
+                self.request_progress_interrupt();
                 cleanup_sqlite_write_transaction(tx, self.lane).await;
                 self.log_transaction_end(
                     "write_deadline",
@@ -1191,30 +1216,61 @@ impl<'a> SqliteWriteTransaction<'a> {
     }
 
     pub async fn rollback(mut self) -> Result<()> {
-        self.progress_handler_active.store(false, Ordering::Relaxed);
-        let tx = self
+        self.request_progress_interrupt();
+        let mut tx = self
             .inner
             .take()
             .expect("sqlite write transaction already completed");
-        let result = tokio::time::timeout(ROLLBACK_CLEANUP_TIMEOUT, tx.rollback()).await;
-        match result {
-            Ok(Ok(())) => {
+        let cleanup_deadline = Instant::now() + ROLLBACK_CLEANUP_TIMEOUT;
+        let disable_error = match tokio::time::timeout_at(
+            cleanup_deadline,
+            disable_sqlite_progress_handler(&mut tx),
+        )
+        .await
+        {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(
+                anyhow::Error::new(error)
+                    .context("disable sqlite write progress handler before rollback"),
+            ),
+            Err(error) => Some(
+                anyhow::Error::new(error)
+                    .context("disable sqlite write progress handler before rollback"),
+            ),
+        };
+        let rollback_result = if Instant::now() >= cleanup_deadline {
+            Err(anyhow::anyhow!(
+                "sqlite write rollback cleanup budget exhausted before rollback"
+            ))
+        } else {
+            match tokio::time::timeout_at(cleanup_deadline, tx.rollback()).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => {
+                    Err(anyhow::Error::new(error).context("rollback sqlite write transaction"))
+                }
+                Err(error) => {
+                    Err(anyhow::Error::new(error).context("rollback sqlite write transaction"))
+                }
+            }
+        };
+        if let Some(error) = disable_error {
+            self.log_transaction_end(
+                "rollback_error",
+                "sqlite write progress handler could not be disabled before rollback",
+            );
+            return Err(error);
+        }
+        match rollback_result {
+            Ok(()) => {
                 self.log_transaction_end("rollback", "sqlite write transaction rolled back");
                 Ok(())
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 self.log_transaction_end(
                     "rollback_error",
                     "sqlite write transaction rollback failed",
                 );
-                Err(anyhow::Error::new(error).context("rollback sqlite write transaction"))
-            }
-            Err(error) => {
-                self.log_transaction_end(
-                    "rollback_timeout",
-                    "sqlite write rollback exceeded cleanup timeout",
-                );
-                Err(anyhow::Error::new(error).context("rollback sqlite write transaction"))
+                Err(error)
             }
         }
     }
@@ -1260,10 +1316,21 @@ impl<'a> SqliteWriteTransaction<'a> {
             );
         }
     }
+
+    fn request_progress_interrupt(&self) {
+        self.progress_handler_interrupt
+            .store(true, Ordering::Relaxed);
+        self.progress_handler_active.store(false, Ordering::Relaxed);
+    }
 }
 
 async fn cleanup_sqlite_write_transaction(tx: Transaction<'_, Sqlite>, lane: &'static str) {
-    match tokio::time::timeout(ROLLBACK_CLEANUP_TIMEOUT, tx.rollback()).await {
+    let mut tx = tx;
+    let cleanup = async {
+        disable_sqlite_progress_handler(&mut tx).await?;
+        tx.rollback().await
+    };
+    match tokio::time::timeout(ROLLBACK_CLEANUP_TIMEOUT, cleanup).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!(
             event = "sqlite.write",
@@ -1278,6 +1345,118 @@ async fn cleanup_sqlite_write_transaction(tx: Transaction<'_, Sqlite>, lane: &'s
             "sqlite write rollback cleanup timed out"
         ),
     }
+}
+
+async fn disable_sqlite_progress_handler(
+    tx: &mut Transaction<'_, Sqlite>,
+) -> std::result::Result<(), sqlx::Error> {
+    let mut handle = tx.lock_handle().await?;
+    handle.remove_progress_handler();
+    Ok(())
+}
+
+async fn disable_sqlite_connection_progress_handler(
+    connection: &mut SqliteConnection,
+) -> std::result::Result<(), sqlx::Error> {
+    let mut handle = connection.lock_handle().await?;
+    handle.remove_progress_handler();
+    Ok(())
+}
+
+async fn cleanup_sqlite_connection(
+    connection: &mut SqliteConnection,
+    evict_open_transaction: bool,
+) -> Result<(), sqlx::Error> {
+    if evict_open_transaction && SqliteTransactionManager::get_transaction_depth(connection) != 0 {
+        warn!(
+            event = "sqlite.write",
+            operation = "writer_pool_after_release",
+            error_kind = "transaction_cleanup_pending",
+            recovery = "evict",
+            "sqlite writer connection still has an open transaction; evicting before reuse"
+        );
+        let error = sqlx::Error::Protocol(
+            "sqlite writer connection returned with an open transaction".to_owned(),
+        );
+        tracing::warn!(
+            event = "sqlite.write",
+            operation = "writer_pool_after_release",
+            connection_recovery = "evict",
+            error = %error,
+            "sqlite writer connection cleanup evicted an open transaction"
+        );
+        return Err(error);
+    }
+
+    let cleanup = async {
+        disable_sqlite_connection_progress_handler(connection).await?;
+        while !evict_open_transaction
+            && SqliteTransactionManager::get_transaction_depth(connection) != 0
+        {
+            SqliteTransactionManager::rollback(connection).await?;
+        }
+        Ok::<(), sqlx::Error>(())
+    };
+
+    match tokio::time::timeout(ROLLBACK_CLEANUP_TIMEOUT, cleanup).await {
+        Ok(Ok(())) if SqliteTransactionManager::get_transaction_depth(connection) == 0 => {
+            tracing::debug!(
+                event = "sqlite.write",
+                operation = "writer_pool_after_release",
+                connection_recovery = "reused",
+                "sqlite writer connection cleanup completed before reuse"
+            );
+            Ok(())
+        }
+        Ok(Ok(())) => {
+            let error = sqlx::Error::Protocol(
+                "sqlite writer transaction depth remained non-zero after cleanup".to_owned(),
+            );
+            tracing::warn!(
+                event = "sqlite.write",
+                operation = "writer_pool_after_release",
+                connection_recovery = "evict",
+                error = %error,
+                "sqlite writer connection cleanup left an open transaction"
+            );
+            Err(error)
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                event = "sqlite.write",
+                operation = "writer_pool_after_release",
+                connection_recovery = "evict",
+                error = %error,
+                "sqlite writer connection cleanup failed"
+            );
+            Err(error)
+        }
+        Err(_) => {
+            let error = sqlx::Error::Protocol(
+                "sqlite writer transaction cleanup exceeded 150ms".to_owned(),
+            );
+            tracing::warn!(
+                event = "sqlite.write",
+                operation = "writer_pool_after_release",
+                connection_recovery = "evict",
+                error = %error,
+                "sqlite writer connection cleanup timed out"
+            );
+            Err(error)
+        }
+    }
+}
+
+pub(crate) async fn cleanup_sqlite_write_connection(
+    connection: &mut SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    cleanup_sqlite_connection(connection, true).await
+}
+
+pub(crate) async fn cleanup_sqlite_pool_connection(
+    connection: &mut SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    cleanup_sqlite_connection(connection, false).await
 }
 
 impl<'a> Deref for SqliteWriteTransaction<'a> {
@@ -1300,7 +1479,7 @@ impl DerefMut for SqliteWriteTransaction<'_> {
 
 impl Drop for SqliteWriteTransaction<'_> {
     fn drop(&mut self) {
-        self.progress_handler_active.store(false, Ordering::Relaxed);
+        self.request_progress_interrupt();
         if self.inner.is_some() && Instant::now() >= self.deadline_at {
             self.log_transaction_end(
                 "write_deadline",
@@ -1319,6 +1498,33 @@ pub fn is_sqlite_write_deadline_error(err: &(dyn std::error::Error + 'static)) -
         if let Some(sqlx::Error::Database(database_error)) = err.downcast_ref::<sqlx::Error>()
             && database_error.code().as_deref() == Some("9")
             && database_error.message().eq_ignore_ascii_case("interrupted")
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
+pub fn is_sqlite_database_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(err) = current {
+        if err.downcast_ref::<sqlx::Error>().is_some()
+            || err.downcast_ref::<SqliteWriteDeadlineError>().is_some()
+        {
+            return true;
+        }
+        let normalized = err.to_string().to_ascii_lowercase();
+        if normalized.contains("database is locked")
+            || normalized.contains("database table is locked")
+            || normalized.contains("sqlite_busy")
+            || normalized.contains("retryable sqlite write deadline exceeded")
+            || normalized.contains("sqlite write capacity is busy")
+            || normalized.contains("error returned from database")
+            || normalized.contains("error communicating with database")
+            || normalized.contains("pool timed out")
+            || normalized.contains("pool closed")
+            || (normalized.contains("code: 9") && normalized.contains("interrupted"))
         {
             return true;
         }
@@ -1404,7 +1610,7 @@ mod tests {
         path::PathBuf,
         sync::{
             Arc, Mutex as StdMutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -1412,7 +1618,7 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
     use tracing_subscriber::fmt::MakeWriter;
 
     fn test_deadlines(
@@ -1434,6 +1640,12 @@ mod tests {
     ) -> SqlitePool {
         SqlitePoolOptions::new()
             .max_connections(max_connections)
+            .after_release(|connection, _metadata| {
+                Box::pin(async move {
+                    cleanup_sqlite_write_connection(connection).await?;
+                    Ok(true)
+                })
+            })
             .connect_with(
                 SqliteConnectOptions::new()
                     .filename(database_path)
@@ -1867,6 +2079,29 @@ mod tests {
     fn busy_detection_matches_sqlite_locked_messages() {
         let err = anyhow::anyhow!("error returned from database: (code: 5) database is locked");
         assert!(is_sqlite_busy_error(err.as_ref()));
+    }
+
+    #[test]
+    fn database_error_detection_survives_api_error_string_conversion() {
+        let err = crate::error::ApiError::internal(anyhow::anyhow!(
+            "error returned from database: (code: 5) database is locked"
+        ));
+        assert!(is_sqlite_database_error(&err));
+
+        let deadline = crate::error::ApiError::internal(anyhow::anyhow!(
+            "retryable sqlite write deadline exceeded: lane=content, priority=background"
+        ));
+        assert!(is_sqlite_database_error(&deadline));
+
+        let pool_timeout = crate::error::ApiError::internal(anyhow::anyhow!(
+            "pool timed out while waiting for an open connection"
+        ));
+        assert!(is_sqlite_database_error(&pool_timeout));
+
+        let connection_error = crate::error::ApiError::internal(anyhow::anyhow!(
+            "error communicating with database: connection closed"
+        ));
+        assert!(is_sqlite_database_error(&connection_error));
     }
 
     #[test]
@@ -2767,16 +3002,19 @@ mod tests {
         };
         let elapsed = started.elapsed();
 
-        assert!(is_sqlite_busy_error(error.as_ref()));
-        assert!(elapsed >= Duration::from_millis(100));
-        assert!(elapsed < Duration::from_millis(500));
+        assert!(is_sqlite_write_deadline_error(error.as_ref()));
+        assert!(elapsed >= Duration::from_millis(500));
+        assert!(elapsed < Duration::from_millis(750));
         let events = buffer.json_events();
         assert!(events.iter().any(|event| {
             event.get("event") == Some(&Value::String("sqlite.write".to_owned()))
                 && event.get("operation")
                     == Some(&Value::String("busy_retry_exhaustion".to_owned()))
-                && event.get("error_kind") == Some(&Value::String("sqlite_busy".to_owned()))
-                && event.get("attempt").and_then(Value::as_u64) == Some(4)
+                && event.get("error_kind") == Some(&Value::String("write_deadline".to_owned()))
+                && event
+                    .get("attempt")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|attempt| attempt >= 4)
         }));
 
         holder
@@ -2795,10 +3033,100 @@ mod tests {
         remove_test_database(read_pool, &database_path).await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn begin_busy_retry_can_recover_after_the_fourth_attempt_before_deadline() {
+        let database_path = test_database_path();
+        let read_pool = open_test_pool(&database_path, 1, Duration::from_millis(20)).await;
+        let writer_pool = open_test_pool(&database_path, 1, Duration::from_millis(20)).await;
+        sqlx::query("CREATE TABLE begin_recovery_window_probe (value INTEGER NOT NULL)")
+            .execute(&read_pool)
+            .await
+            .expect("create begin recovery window probe");
+        let holder = read_pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("hold external writer lock");
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_target(false)
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _default_guard = tracing::subscriber::set_default(subscriber);
+        let coordinator = SqliteWriteCoordinator::with_write_pool_and_settings(
+            Some(writer_pool.clone()),
+            test_deadlines(
+                Duration::from_millis(800),
+                Duration::from_millis(800),
+                Duration::from_millis(20),
+            ),
+        );
+        let begin = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let read_pool = read_pool.clone();
+            async move {
+                let (permit, tx) = coordinator
+                    .begin_immediate(&read_pool, "begin_recovery_window")
+                    .await?;
+                tx.commit().await?;
+                drop(permit);
+                Ok::<_, anyhow::Error>(())
+            }
+        });
+
+        tokio::time::timeout(Duration::from_millis(700), async {
+            loop {
+                if buffer.json_events().iter().any(|event| {
+                    event.get("operation")
+                        == Some(&Value::String("begin_recovery_window".to_owned()))
+                        && event.get("error_kind") == Some(&Value::String("sqlite_busy".to_owned()))
+                        && event
+                            .get("attempt")
+                            .and_then(Value::as_u64)
+                            .is_some_and(|attempt| attempt >= 4)
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("begin should report at least four busy attempts before release");
+        holder
+            .rollback()
+            .await
+            .expect("release external writer lock after several retries");
+        begin
+            .await
+            .expect("join begin recovery window task")
+            .expect("begin should recover before the shared deadline");
+
+        let events = buffer.json_events();
+        assert!(events.iter().any(|event| {
+            event.get("operation") == Some(&Value::String("begin_recovery_window".to_owned()))
+                && event.get("error_kind") == Some(&Value::String("sqlite_busy".to_owned()))
+                && event
+                    .get("attempt")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|attempt| attempt >= 4)
+        }));
+
+        remove_test_database(writer_pool, &database_path).await;
+        remove_test_database(read_pool, &database_path).await;
+    }
+
     #[tokio::test]
     async fn coordinator_uses_fallback_pool_for_in_memory_transactions() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
+            .after_release(|connection, _metadata| {
+                Box::pin(async move {
+                    cleanup_sqlite_write_connection(connection).await?;
+                    Ok(true)
+                })
+            })
             .connect_with(
                 SqliteConnectOptions::new()
                     .filename(":memory:")
@@ -2828,6 +3156,76 @@ mod tests {
             .await
             .expect("read in-memory writer probe");
         assert_eq!(value, 9);
+        pool.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn in_memory_fallback_preserves_schema_after_cancelled_transaction() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .min_connections(1)
+            .after_release(|connection, _metadata| {
+                Box::pin(async move {
+                    cleanup_sqlite_pool_connection(connection).await?;
+                    Ok(true)
+                })
+            })
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true)
+                    .busy_timeout(Duration::from_millis(20)),
+            )
+            .await
+            .expect("create in-memory fallback pool");
+        sqlx::query("CREATE TABLE memory_cancel_probe (value INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("create in-memory cancellation probe");
+        let (progress_started_tx, mut progress_started_rx) = mpsc::unbounded_channel();
+        let coordinator =
+            SqliteWriteCoordinator::new().with_progress_handler_started_sender(progress_started_tx);
+        let task = {
+            let coordinator = coordinator.clone();
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let (_permit, mut tx) = coordinator
+                    .begin_immediate(&pool, "in_memory_cancelled_transaction")
+                    .await
+                    .expect("begin in-memory cancellation transaction");
+                let _ = sqlx::query_scalar::<_, i64>(
+                    "WITH RECURSIVE sequence(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 100000000) SELECT SUM(value) FROM sequence",
+                )
+                .fetch_one(&mut *tx)
+                .await;
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), progress_started_rx.recv())
+            .await
+            .expect("in-memory transaction should enter SQLite")
+            .expect("in-memory transaction progress signal should arrive");
+        task.abort();
+        let _ = task.await;
+
+        let (permit, mut tx) = coordinator
+            .begin_immediate(&pool, "after_in_memory_cancelled_transaction")
+            .await
+            .expect("in-memory pool should recover without losing its schema");
+        sqlx::query("INSERT INTO memory_cancel_probe (value) VALUES (11)")
+            .execute(&mut *tx)
+            .await
+            .expect("write after in-memory cancellation");
+        tx.commit()
+            .await
+            .expect("commit after in-memory cancellation");
+        drop(permit);
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_cancel_probe")
+            .fetch_one(&pool)
+            .await
+            .expect("read in-memory cancellation probe");
+        assert_eq!(count, 1);
         pool.close().await;
     }
 
@@ -2869,6 +3267,294 @@ mod tests {
 
         remove_test_database(writer_pool, &database_path).await;
         remove_test_database(read_pool, &database_path).await;
+    }
+
+    #[tokio::test]
+    async fn aborted_transaction_future_does_not_reuse_connection_with_open_transaction() {
+        let database_path = test_database_path();
+        let pool = open_test_pool(&database_path, 1, Duration::from_millis(100)).await;
+        sqlx::query("CREATE TABLE cancelled_transaction_probe (value INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("create cancelled transaction probe");
+        let (progress_started_tx, mut progress_started_rx) = mpsc::unbounded_channel();
+        let coordinator = SqliteWriteCoordinator::with_write_pool(pool.clone())
+            .with_progress_handler_started_sender(progress_started_tx);
+
+        for round in 0..101 {
+            let task = {
+                let coordinator = coordinator.clone();
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    let (permit, mut tx) = coordinator
+                        .begin_immediate(&pool, "cancelled_transaction")
+                        .await
+                        .expect("begin cancelled transaction probe");
+                    let _ = sqlx::query_scalar::<_, i64>(
+                        "WITH RECURSIVE sequence(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 100000000) SELECT SUM(value) FROM sequence",
+                    )
+                    .fetch_one(&mut *tx)
+                    .await;
+                    drop(tx);
+                    drop(permit);
+                })
+            };
+
+            tokio::time::timeout(Duration::from_secs(1), progress_started_rx.recv())
+                .await
+                .expect("transaction probe should enter SQLite")
+                .expect("transaction progress signal should arrive");
+            task.abort();
+            let _ = task.await;
+
+            if round == 0 {
+                let direct_probe: i64 = sqlx::query_scalar(
+                    "WITH RECURSIVE sequence(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 500000) SELECT SUM(value) FROM sequence",
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("direct writer-pool query after cancellation");
+                assert!(direct_probe > 0);
+            }
+
+            let (permit, mut next_tx) = coordinator
+                .begin_immediate(&pool, "after_cancelled_transaction")
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "round {round}: connection was not reusable after future cancellation: {error:#}"
+                    )
+                });
+            sqlx::query("INSERT INTO cancelled_transaction_probe (value) VALUES (?)")
+                .bind(round)
+                .execute(&mut *next_tx)
+                .await
+                .expect("write after cancelled transaction");
+            next_tx
+                .commit()
+                .await
+                .expect("commit after cancelled transaction");
+            drop(permit);
+        }
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cancelled_transaction_probe")
+            .fetch_one(&pool)
+            .await
+            .expect("count writes after cancelled transactions");
+        assert_eq!(count, 101);
+
+        remove_test_database(pool, &database_path).await;
+    }
+
+    #[tokio::test]
+    async fn failed_writer_cleanup_rebuilds_pool_after_hook_error() {
+        let database_path = test_database_path();
+        let fail_first_cleanup = Arc::new(AtomicBool::new(true));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .min_connections(1)
+            .after_release({
+                let fail_first_cleanup = Arc::clone(&fail_first_cleanup);
+                move |connection, _metadata| {
+                    let fail_cleanup = fail_first_cleanup.swap(false, Ordering::AcqRel);
+                    Box::pin(async move {
+                        if fail_cleanup {
+                            return Err(sqlx::Error::Protocol(
+                                "forced sqlite writer cleanup failure".to_owned(),
+                            ));
+                        }
+                        cleanup_sqlite_write_connection(connection).await?;
+                        Ok(true)
+                    })
+                }
+            })
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&database_path)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .busy_timeout(Duration::from_millis(20)),
+            )
+            .await
+            .expect("create sqlite cleanup failure pool");
+        let coordinator = SqliteWriteCoordinator::with_write_pool(pool.clone());
+
+        let (permit, tx) = coordinator
+            .begin_immediate(&pool, "forced_cleanup_failure")
+            .await
+            .expect("begin transaction for forced cleanup failure");
+        drop(tx);
+        drop(permit);
+
+        let (permit, next_tx) = coordinator
+            .begin_immediate(&pool, "after_forced_cleanup_failure")
+            .await
+            .expect("writer pool should rebuild after cleanup failure");
+        next_tx
+            .commit()
+            .await
+            .expect("commit after writer connection rebuild");
+        drop(permit);
+        assert!(!fail_first_cleanup.load(Ordering::Acquire));
+
+        remove_test_database(pool, &database_path).await;
+    }
+
+    #[tokio::test]
+    async fn writer_connection_cleanup_removes_progress_handler_without_open_transaction() {
+        let database_path = test_database_path();
+        let pool = open_test_pool(&database_path, 1, Duration::from_millis(20)).await;
+        let mut connection = pool
+            .acquire()
+            .await
+            .expect("acquire connection for progress handler cleanup");
+        let mut handle = connection
+            .lock_handle()
+            .await
+            .expect("lock connection handle for progress handler cleanup");
+        handle.set_progress_handler(1000, || false);
+        drop(handle);
+        drop(connection);
+
+        let direct_probe: i64 = sqlx::query_scalar(
+            "WITH RECURSIVE sequence(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 500000) SELECT SUM(value) FROM sequence",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("writer pool should remove a stale progress handler");
+        assert!(direct_probe > 0);
+
+        remove_test_database(pool, &database_path).await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_writer_cleanup_evicts_connection_before_rebuild() {
+        let database_path = test_database_path();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .min_connections(1)
+            .after_release(|connection, _metadata| {
+                Box::pin(async move {
+                    cleanup_sqlite_write_connection(connection).await?;
+                    Ok(true)
+                })
+            })
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&database_path)
+                    .create_if_missing(true)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .busy_timeout(Duration::from_millis(20)),
+            )
+            .await
+            .expect("create sqlite cleanup timeout pool");
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_target(false)
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _default_guard = tracing::subscriber::set_default(subscriber);
+        let coordinator = SqliteWriteCoordinator::with_write_pool(pool.clone());
+        let (progress_started_tx, mut progress_started_rx) = mpsc::unbounded_channel();
+        let query_task = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let connection = pool
+                    .acquire()
+                    .await
+                    .expect("acquire raw connection for cleanup timeout");
+                let mut tx = Transaction::begin(connection, Some(Cow::Borrowed("BEGIN IMMEDIATE")))
+                    .await
+                    .expect("begin raw transaction for cleanup timeout");
+                let mut progress_started_tx = Some(progress_started_tx);
+                let mut first_progress_callback = true;
+                let mut handle = tx
+                    .lock_handle()
+                    .await
+                    .expect("lock raw transaction handle for cleanup timeout");
+                handle.set_progress_handler(1000, move || {
+                    if let Some(sender) = progress_started_tx.take() {
+                        let _ = sender.send(());
+                    }
+                    if first_progress_callback {
+                        first_progress_callback = false;
+                        std::thread::sleep(Duration::from_millis(300));
+                    }
+                    false
+                });
+                drop(handle);
+                let _ = sqlx::query_scalar::<_, i64>(
+                    "WITH RECURSIVE sequence(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM sequence WHERE value < 2000000) SELECT SUM(value) FROM sequence",
+                )
+                .fetch_one(&mut *tx)
+                .await;
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), progress_started_rx.recv())
+            .await
+            .expect("raw transaction query should enter SQLite")
+            .expect("raw transaction progress signal should arrive");
+        query_task.abort();
+        let _ = query_task.await;
+        let probe_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&database_path)
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .busy_timeout(Duration::from_millis(1)),
+            )
+            .await
+            .expect("create sqlite lock probe pool");
+        let mut probe_connection = probe_pool
+            .acquire()
+            .await
+            .expect("acquire sqlite lock probe connection");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match sqlx::query("BEGIN IMMEDIATE")
+                    .execute(&mut *probe_connection)
+                    .await
+                {
+                    Ok(_) => {
+                        sqlx::query("ROLLBACK")
+                            .execute(&mut *probe_connection)
+                            .await
+                            .expect("rollback sqlite lock probe transaction");
+                        break;
+                    }
+                    Err(error) if is_sqlite_busy_error(&error) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("sqlite lock probe failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("cancelled sqlite worker should eventually release its database lock");
+        drop(probe_connection);
+        probe_pool.close().await;
+
+        let (permit, next_tx) = coordinator
+            .begin_immediate(&pool, "after_timed_out_cleanup")
+            .await
+            .expect("writer pool should rebuild after cleanup timeout");
+        next_tx
+            .commit()
+            .await
+            .expect("commit after cleanup timeout rebuild");
+        drop(permit);
+
+        let events = buffer.json_events();
+        assert!(events.iter().any(|event| {
+            event.get("operation") == Some(&Value::String("writer_pool_after_release".to_owned()))
+                && event.get("connection_recovery") == Some(&Value::String("evict".to_owned()))
+        }));
+
+        remove_test_database(pool, &database_path).await;
     }
 
     #[tokio::test]
